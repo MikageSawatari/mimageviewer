@@ -429,6 +429,9 @@ Fullでcaptionのある本を足す経路と、caption反映で画像・本を�
 実在する同一論理pathの大小文字を復元して候補を作る。ingestがそのpathをTantivyの
 `display_path`（STORED）へ保存する。`path` termとcaption DBのキーは変更しない。
 未公開INDEX_VERSION=11に同梱し、追加の版上げはしない。schema不足は共通ownerで再構築する。
+独立レビュー追補: caption反映の表記復元は共通候補生成`build_candidate_from_path`が所有する。
+サイドカー逆引きやwatcherの通知も同じ境界を通し、caption反映以外の再投入で表示pathを
+小文字に戻さない。Fullでcaptionのある本を足す経路はwalker側の復元を維持する。
 詳細と回帰は [検索設計 §4.11](search-architecture.md#411-ai-生成メタデータと保存済み-ai-説明文-index_version11)。
 
 - Tantivy に `ai_caption_text` (説明文 + 画像内の文字 + 検索語) を足し、検索対象の種類に「AI 説明」(`SourceKind::AiCaption`) を足す。

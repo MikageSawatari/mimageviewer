@@ -12139,7 +12139,7 @@ mod tests {
         app.reapply_local_search_after_smart_folder_prepare(&ctx);
         assert_eq!(app.search_query, "new child draft");
         assert_eq!(
-            app.search_pending.as_ref().unwrap().submitted.query,
+            app.search_pending.as_ref().unwrap().request.submitted.query,
             "root submission"
         );
     }

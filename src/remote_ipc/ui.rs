@@ -2908,6 +2908,7 @@ impl crate::app::App {
                 position_secs,
                 duration_secs,
                 ended,
+                has_video,
                 ..
             } => {
                 self.apply_remote_media_resume_update(
@@ -2915,6 +2916,7 @@ impl crate::app::App {
                     *position_secs,
                     *duration_secs,
                     *ended,
+                    *has_video,
                 );
                 RemoteWriteResponse::Success(RemoteWriteResult::applied())
             }
@@ -6673,6 +6675,7 @@ mod tests {
                 position_secs: 19.5,
                 duration_secs: 120.0,
                 ended: false,
+                has_video: true,
             }
         ));
     }
@@ -6699,6 +6702,7 @@ mod tests {
                     position_secs: position,
                     duration_secs: 100.0,
                     ended: false,
+                    has_video: true,
                 },
             );
             app.apply_pending_remote_write(pending, &ctx);
@@ -6716,11 +6720,77 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn remote_progress_after_stream_stop_uses_reported_source_video_capability() {
+        let (handle, owner, _) = active_session();
+        let ctx = egui::Context::default();
+        for (name, has_video, expected_thumbnail) in [
+            ("audio-only.mp4", false, false),
+            ("movie.mp4", true, true),
+            ("covered-audio.mp3", false, false),
+        ] {
+            let mut app = crate::app::setup_app_for_test();
+            let path = app.tmp.path().join(name);
+            let key = crate::adjustment_db::normalize_path(&path);
+            assert!(app.remote_session_ui.video_stream.is_none());
+            app.video_tile_cache
+                .as_ref()
+                .unwrap()
+                .store_resume_webp(
+                    &path,
+                    crate::settings::VIDEO_RESUME_PREVIEW_EXTRACT_WIDTH,
+                    15_000,
+                    0,
+                    1,
+                    &[1],
+                )
+                .unwrap();
+            let operation = handle
+                .begin_operation(&owner, "final video progress".to_owned())
+                .unwrap();
+            let (pending, response) = ClaimedRemoteWrite::for_test(
+                operation,
+                RemoteWriteRequest::RecordVideoProgress {
+                    address: mimageviewer_ipc::RemoteAddress::file(
+                        path.to_string_lossy().into_owned(),
+                    ),
+                    sequence: 1,
+                    position_secs: 15.0,
+                    duration_secs: 60.0,
+                    ended: false,
+                    has_video,
+                },
+            );
+            app.apply_pending_remote_write(pending, &ctx);
+            assert!(matches!(
+                response
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .unwrap(),
+                UiWriteOutcome::Write(RemoteWriteResponse::Success(_))
+            ));
+            assert_eq!(
+                app.settings.video_resume_positions.get(&key),
+                Some(&15.0),
+                "{name}"
+            );
+            assert_eq!(
+                app.video_resume_thumb_last_request.contains_key(&key),
+                expected_thumbnail,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn video_watched_to_end_remote_progress_uses_shared_rules_and_rejects_stale_writes() {
         let (handle, owner, _) = active_session();
         let mut app = crate::app::setup_app_for_test();
         let ctx = egui::Context::default();
-        for name in ["watched.mp4", "watched.flac"] {
+        for (name, has_video) in [
+            ("watched.mp4", true),
+            ("watched.flac", false),
+            ("audio-only.mp4", false),
+        ] {
             let path = app.tmp.path().join(name);
             std::fs::write(&path, b"fixture").unwrap();
             let key = crate::adjustment_db::normalize_path(&path);
@@ -6746,6 +6816,7 @@ mod tests {
                         position_secs: position,
                         duration_secs: 100.0,
                         ended,
+                        has_video,
                     },
                 );
                 app.apply_pending_remote_write(pending, &ctx);

@@ -45,6 +45,8 @@
 - 修正: filter・origin・未完了検索の終了を可視列構築の前へ移す。世代追加の採否と他入口の監査は [検索設計 §5.2](search-architecture.md#52-ctrlf--現在地フィルタ-現グリッドの表示中アイテムのみ)。固定入力の寿命は変更しない。
 - 検証: 修正前の状態遷移テストで `[2]` 対 全12件の失敗を確認。修正後は下記関連425件で成功。実機ではCtrl+F「cole」のまま別フォルダへ移り、全件と入力欄の終了を確認する。
 
+- 独立レビュー追補（`1ab6992b8`、P2、ソース指摘）: Collection再採用がfilterだけを解除し、未完了要求を残すことを確認。修正前回帰は旧cancel tokenが終了しないため失敗した（`target/review-a-red.log`）。世代を見送った判断を撤回し、要求と結果の単一ownerに既存viewer context ID＋items_generationを捕捉する。受信時の不一致はXMP/filter/cursorへ適用せず破棄する。再採用では旧要求を終了し、新一覧で同じ提出済み条件を再実行する。未提出draft、確定済みfilterのstable ID remap、snapshot復帰は維持する。回帰は`review_a_collection_reorder_retires_pending_search_and_reapplies_submission`と`review_a_search_completion_requires_current_list_and_request_identity`。実機では検索中にCollectionを並べ替え、旧indexの別項目が絞り込み結果にならないことを確認する。
+
 ### 1.699 v5 受入 B: AI連携の初回「書き換える」が効かない (2026-11-04)
 
 - 観測: サブPC担当（同受入記録）。v5新機能の不具合。
@@ -66,6 +68,8 @@
 - 修正: `display_path`をSTOREDへ追加し、結果・openは元の表記、照合・削除は従来のkeyを使う。Fullの本追加とcaption反映はworkerで表記を復元。集約mapの親キー、Drillの包含・相対位置・件数・DFS・帰路も表示pathとは分けて正規化する。追加回帰では同じ場所の表記違いが4つの集約になることを確認してから修正した（`target/acceptance-d-spelling-before.log`）。INDEX_VERSIONは未公開11のまま、schema不足は既存ownerで再構築する。
 - 検証: 元の大小文字の画像・フォルダ本・説明文のあるZIP本をFull／caption反映の両方から検索し、Flat／Drillの一覧とopen dispatchのpath保持が成功。実機では索引再構築後に検索→開く→履歴／ブックマークから再表示して名前を確認する。
 
+- 独立レビュー追補（P2、ソース指摘）: full形式sidecarの逆引きはstemの表記を返すため、`MixedPhoto.JPG`と`mixedphoto.jpg.json`の組で更新後の表示pathが小文字になった。修正前回帰で検索結果の不一致を確認（`target/review-d-red.log`）。復元をworkerの共通候補生成`build_candidate_from_path`へ集約し、watcher・sidecar追加/削除・caption反映を対象にした。通常FS列挙とFullのcaption本追加の契約、照合key、INDEX_VERSION=11は維持する。回帰`acceptance_d_sidecar_watch_preserves_physical_path_casing`はsidecar追加/削除と画像の小文字通知から実検索まで検査する。実機では大小文字の異なるsidecarを編集後、Ctrl+Gの名前・開くpathを確認する。
+
 ### 1.702 v5 受入 E: PDF/EPUBページ内でCtrl+Fが無反応 (2026-11-04)
 
 - 観測: サブPC担当（同受入記録）。v4.11.0にもある不具合。
@@ -73,12 +77,16 @@
 - 修正: 仕様を維持し、menu／固定欄／shortcutで同じ可否・理由を共有する。「本のページ表示中は現在地を絞り込めません」に統一し、shortcutは既存KeyAction経由でInfo通知する。
 - 検証: PDF／EPUBで実メニューの無効化と、入力所有者を設定したCtrl+F発火・理由通知が成功。実機では各本のページ一覧でCtrl+Fとファイルメニューの理由を確認する。
 
+- 独立レビュー追補（P3、文書）: 検索設計§5.2に残った「PDF限定・ショートカット無反応」の旧記述を、PDF/EPUB共通の無効メニュー＋理由tooltip・KeyAction経由の理由通知へ置き換えた。実装・keymapは変更していない。
+
 ### 1.703 v5 受入 F: 音声を閉じるたびに動画の続き画像を作ろうとする (2026-11-04)
 
 - 観測: サブPC担当（同受入記録）、FFmpegが`video stream not found`。v4.11.0にもある不具合。
 - 原因: 音声もVideo player cacheに入り、resume flushが映像有無を問わずthumbnailを要求する。コードで確認。
 - 修正: 通常flushとcontext終了時の退避保存で、プレイヤー生存中の映像能力を確認／捕捉してからthumbnailを要求する。共通受付も音声拡張子を除外し、Remote音声の位置保存からの要求も防ぐ。位置保存の条件は変更しない。
 - 検証: 音声・表紙あり音声・映像なしMP4・通常動画・動画の音声モードについて、通常flush／退避保存の位置と要求有無が成功。Remote音声の位置保存・画像なしも成功。実機では音声を途中で閉じて再開でき、`video stream not found`が増えず、動画の続き画像が従来どおり出るか確認する。
+
+- 独立レビュー追補（P2、ソース指摘）: Remoteの位置保存が`has_video:false`を渡しながら画像生成を別途呼び、拡張子除外だけでは映像なしMP4が通過することを確認。Webのサーバー由来の映像能力を進捗snapshot→必須IPC field→UI→画像受付へ渡した。停止後に遅着する進捗も捕捉済み能力を使い、動画の音声モードと位置保存は維持する。wire変更のためprotocolは72→73。修正前のWeb回帰で能力の欠落を確認し、修正後のsnapshot/queue/keepalive回帰は成功。実機ではRemoteで映像なしMP4を途中で閉じ、位置保存され画像要求が出ず、通常動画では続き画像が維持されることを確認する。
 
 #### A〜F の開発検証台帳 (2026-11-04、実装担当)
 
@@ -91,6 +99,20 @@
 - `cargo test -p mimageviewer --test search_metadata_e2e`: **17/17成功、exit 0、0.99秒**。`target/acceptance-search-e2e.log`。旧テスト1件が返却pathを正規化キーと比較していたため、元の大小文字を持つpathとの厳密比較に改めた。旧結果は`target/acceptance-search-e2e-before-display-contract.log`。
 - snapshotは`UPDATE_SNAPSHOTS=1`を新規`agent_registration_confirmation_small_light`の生成だけに指定し、目視後に更新指定なしで`cargo test --test ui_snapshot agent_`: **11/11成功、exit 0、1.80秒**。`target/acceptance-snapshot-generate.log`／`target/acceptance-snapshot-compare.log`。新規PNG1枚70,109 bytes、既存PNGの変更なし。
 - lib全件・build-devは利用者の指定どおり設計担当へ引き継ぐ。製品起動・WebView2試験・実機受入・commitは未実施。
+
+#### 独立レビュー4件の修正・検証台帳 (2026-11-04、実装担当)
+
+- 対象: `v5-integration` / HEAD `1ab6992b8`からの未コミット差分。Windows、`CARGO_BUILD_JOBS=6`、`MSBUILDDISABLENODEREUSE=1`、既定feature。ソース指摘をコードで確認したもので、実機再現とは区別する。B/C・Eの判定とkeymap・Dの旧schema再構築には変更なし。
+- 修正前: Aは`target/review-a-red.log`で旧要求のcancel未実行、Dは`target/review-d-red.log`でsidecar更新後の小文字pathを確認。FはWebのsnapshot・queue・最終keepaliveテストで`hasVideo`/`has_video`の欠落を確認してから修正した。
+- Aの新規回帰2件: **2/2成功**（`target/review-a-green.log`）。Collection再採用後の旧receiver廃棄と提出済み条件再実行、generation/context/request不一致の破棄、現在要求の採用を検査した。
+- `test-focused.ps1`: 索引管理 **34/34成功、2.492秒**（`target/test-focused/runs/20261104T060117524Z-6a84db2c`）、IPC **68/68成功、exit 0、0.753秒**（`target/review-ipc-focused.log`）。IPCには必須能力fieldのfalse/true往復・欠落拒否を含む。引数なしは共有App・文書・Web資産を広域対象として**exit 2／未実行**（`target/review-focused-plan.log`）。
+- Collection全122件の広域確認は、既定CPU数並列で111成功/11待機timeout、6並列で115成功/7待機timeoutとなり、scriptは両方exit 100。全件成功とは扱わない（`target/test-focused/runs/20261104T060123672Z-bfb7ffde`、`target/review-focused-six.log`）。失敗したケースの和集合15件を、同じソース・元の待機期限のまま**1並列で15/15成功、exit 0、46.303秒**（`target/review-collection-serial.log`）。この条件差を設計担当へ引き継ぐ。EPUBの該当fixtureは変換済みcacheまたはtest backendを使い、WebView2は呼ばない。
+- 関連filter: **470/470成功、1並列、exit 0、232.483秒**（`target/review-related.log`、正確なfilterは`target/review-related-filter.txt`）。A/D/F新規回帰、既存A〜F、検索の提出済み条件・起動復元・履歴・索引・検索結果・Remote進捗・位置保存を対象にした。Collection/索引管理のmodule全体は上記結果を再利用する。WebView2使用試験は選ばない。
+- Web: **62/62、179/179成功**（`target/acceptance-f-video-stream-js-green.log`、`target/acceptance-f-app-runtime-js-green.log`）。映像能力のsnapshot値、queue投入後の不変性、stop前の最終keepaliveを検査。sandboxの子process制約があるため、各test fileをnodeで直接実行した。
+- `cargo check -p mimageviewer --bin mimageviewer-core`: **exit 0、1分00秒**（`target/review-core-check.log`、既存警告あり）。
+- snapshotは更新指定なしの`cargo test -p mimageviewer --test ui_snapshot agent_`: **11/11成功、exit 0、3.06秒**（`target/review-snapshot.log`）。既存画像の変更なし。検索E2Eは`cargo test -p mimageviewer --test search_metadata_e2e`: **17/17成功、exit 0、1.00秒**（`target/review-search-e2e.log`）。
+- `cargo fmt`（引数なし）・`cargo fmt --check`・`git diff --check`はexit 0。`python scripts/check_ui_glyphs.py`もexit 0、危険glyphなし。
+- 独立した`gpt-6.1-sol` / `xhigh`のread-onlyレビューは追加の修正必須指摘なし。要求identity、Collectionの条件引継ぎ、共通候補生成、stop後のRemote進捗まで確認した。lib全件・本体とRemoteを含むbuild-dev・実機受入は設計担当へ引き継ぐ。製品起動・commitは実施しない。
 
 ### v4.11.0 で出荷した 5ch・X 由来の項目と、報告者への案内 (2026-11-02)
 

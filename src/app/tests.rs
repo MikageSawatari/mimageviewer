@@ -3,6 +3,73 @@ use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, Pre
 use super::*;
 
 #[test]
+fn review_a_search_completion_requires_current_list_and_request_identity() {
+    for case in ["generation", "context", "request", "current"] {
+        let mut app = setup_app_for_test();
+        app.items = vec![
+            GridItem::Image("a.jpg".into()),
+            GridItem::Image("b.jpg".into()),
+        ];
+        app.rebuild_visible_indices();
+        app.move_grid_cursor(Some(0), GridCursorIntent::ExplicitKeep);
+        let mut identity = app.local_search_list_identity();
+        match case {
+            "generation" => identity.items_generation = identity.items_generation.wrapping_sub(1),
+            "context" => {
+                identity.context_id = ViewerContextId::for_test(identity.context_id.serial() + 1)
+            }
+            _ => {}
+        }
+        let submitted = Arc::new(LocalSearchSubmission {
+            query: "b".into(),
+            target: Default::default(),
+            or_mode: false,
+        });
+        let request = Arc::new(LocalSearchRequest {
+            submitted: submitted.clone(),
+            list_identity: identity,
+        });
+        let result_request = if case == "request" {
+            Arc::new(LocalSearchRequest {
+                submitted,
+                list_identity: identity,
+            })
+        } else {
+            request.clone()
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        app.search_pending = Some(SearchPending {
+            request,
+            cancel: cancel.clone(),
+            progress: Arc::new(SearchProgressShared::new(2)),
+            rx,
+        });
+        tx.send(LocalSearchCompletion {
+            request: result_request,
+            result: SearchThreadResult::Done {
+                matches: [1].into_iter().collect(),
+                xmp_additions: vec![("worker-xmp".into(), None)],
+            },
+        })
+        .ok()
+        .unwrap();
+        app.poll_search(&egui::Context::default());
+        assert!(app.search_pending.is_none(), "{case}");
+        if case == "current" {
+            assert_eq!(app.visible_indices, vec![1]);
+            assert!(app.xmp_cache.contains_key("worker-xmp"));
+        } else {
+            assert!(cancel.load(Ordering::Relaxed), "{case}");
+            assert!(app.search_filter.is_none(), "{case}");
+            assert_eq!(app.visible_indices, vec![0, 1], "{case}");
+            assert_eq!(app.selected, Some(0), "{case}");
+            assert!(!app.xmp_cache.contains_key("worker-xmp"), "{case}");
+        }
+    }
+}
+
+#[test]
 #[cfg(windows)]
 fn acceptance_f_resume_thumbnails_require_a_video_stream_and_keep_audio_positions() {
     for (name, has_video, audio_mode, expected) in [
@@ -71,7 +138,7 @@ fn acceptance_f_remote_audio_progress_saves_position_without_thumbnail() {
     let mut app = setup_app_for_test();
     let path = app.tmp.path().join("RemoteAudio.MP3");
     let key = crate::adjustment_db::normalize_path(&path);
-    app.apply_remote_media_resume_update(path, 15.0, 60.0, false);
+    app.apply_remote_media_resume_update(path, 15.0, 60.0, false, false);
     assert_eq!(app.settings.video_resume_positions.get(&key), Some(&15.0));
     assert!(!app.video_resume_thumb_last_request.contains_key(&key));
 }
@@ -32416,17 +32483,17 @@ mod phase_c_drill_nav_tests {
         assert!(app.items.is_empty());
 
         app.record_reading_history_path(path.clone(), ReadingHistoryKind::Video, None, None, None);
-        app.apply_remote_media_resume_update(path.clone(), 20.0, 100.0, false);
+        app.apply_remote_media_resume_update(path.clone(), 20.0, 100.0, false, true);
         assert_eq!(app.settings.video_resume_positions.get(&key), Some(&20.0));
         #[cfg(windows)]
         assert_eq!(app.video_resume_thumb_last_request.get(&key), Some(&20_000));
-        app.apply_remote_media_resume_update(path.clone(), 2.0, 100.0, false);
+        app.apply_remote_media_resume_update(path.clone(), 2.0, 100.0, false, true);
         assert!(!app.settings.video_resume_positions.contains_key(&key));
-        app.apply_remote_media_resume_update(path.clone(), 50.0, 100.0, false);
-        app.apply_remote_media_resume_update(path.clone(), 96.0, 100.0, false);
+        app.apply_remote_media_resume_update(path.clone(), 50.0, 100.0, false, true);
+        app.apply_remote_media_resume_update(path.clone(), 96.0, 100.0, false, true);
         assert!(!app.settings.video_resume_positions.contains_key(&key));
-        app.apply_remote_media_resume_update(path.clone(), 50.0, 100.0, false);
-        app.apply_remote_media_resume_update(path.clone(), 50.0, 100.0, true);
+        app.apply_remote_media_resume_update(path.clone(), 50.0, 100.0, false, true);
+        app.apply_remote_media_resume_update(path.clone(), 50.0, 100.0, true, true);
         assert!(!app.settings.video_resume_positions.contains_key(&key));
         drop(app.reading_history_writer.take());
         let history = ReadingHistoryDb::open_readonly()

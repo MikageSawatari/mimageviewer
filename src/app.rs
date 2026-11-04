@@ -8103,20 +8103,33 @@ impl FromIterator<usize> for LocalSearchFilter {
     }
 }
 
-/// 非同期メタデータ検索 (Ctrl+F) の状態。
-///
-/// 背景: 検索マッチの判定には `png_metadata::build_searchable_from_path` や
-/// `xmp_reader::read_tweet_info` など、ファイル I/O を伴う読み取りが必要。
-/// フォルダに数百〜数千枚の画像があると UI スレッドで数秒ブロックしていたため、
-/// バックグラウンドスレッドで実行して結果を `poll_search` で受け取る構造に変更した。
-pub(crate) struct SearchPending {
+/// The context and ordered item list searched by one immutable request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LocalSearchListIdentity {
+    context_id: ViewerContextId,
+    items_generation: u64,
+}
+
+struct LocalSearchRequest {
     submitted: Arc<LocalSearchSubmission>,
+    list_identity: LocalSearchListIdentity,
+}
+
+struct LocalSearchCompletion {
+    request: Arc<LocalSearchRequest>,
+    result: SearchThreadResult,
+}
+
+/// 非同期メタデータ検索 (Ctrl+F) の状態。
+/// メタデータI/Oはworkerで実行し、要求の一覧identityと共に`poll_search`へ返す。
+pub(crate) struct SearchPending {
+    request: Arc<LocalSearchRequest>,
     /// 検索キャンセル用トークン。新クエリ / 検索バー閉じ / フォルダ切替で立てる。
     cancel: Arc<AtomicBool>,
     /// UI が毎フレーム読む検索進捗。worker は item 完了ごとに更新する。
     progress: Arc<SearchProgressShared>,
     /// ワーカースレッドから結果を受け取るチャネル。
-    rx: mpsc::Receiver<SearchThreadResult>,
+    rx: mpsc::Receiver<LocalSearchCompletion>,
 }
 
 impl SearchPending {
@@ -28540,7 +28553,7 @@ impl App {
         let pending_submission = self
             .search_pending
             .as_ref()
-            .map(|pending| pending.submitted.clone());
+            .map(|pending| pending.request.submitted.clone());
         self.zip_nav_show_current_level(crate::app::StartupListIntent::PreservePresentation);
         self.move_grid_cursor(
             selected.filter(|index| *index < self.items.len()),
@@ -75188,10 +75201,17 @@ impl App {
         self.execute_submitted_local_search(ctx, submitted);
     }
 
+    fn local_search_list_identity(&self) -> LocalSearchListIdentity {
+        LocalSearchListIdentity {
+            context_id: self.projected_viewer_context_id(),
+            items_generation: self.items_generation,
+        }
+    }
+
     fn submitted_local_search(&self) -> Option<Arc<LocalSearchSubmission>> {
         self.search_pending
             .as_ref()
-            .map(|pending| &pending.submitted)
+            .map(|pending| &pending.request.submitted)
             .or_else(|| self.search_filter.as_ref().map(|filter| &filter.submitted))
             .cloned()
     }
@@ -75201,6 +75221,13 @@ impl App {
         ctx: &egui::Context,
         submitted: Arc<LocalSearchSubmission>,
     ) {
+        self.start_submitted_local_search(submitted);
+        if self.search_pending.is_none() {
+            self.refresh_color_filter_for_scope_change(ctx);
+        }
+    }
+
+    fn start_submitted_local_search(&mut self, submitted: Arc<LocalSearchSubmission>) {
         // 既存の in-flight 検索をキャンセル (新クエリ / 再 Enter)。
         if let Some(pending) = self.search_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
@@ -75213,7 +75240,6 @@ impl App {
             self.search_filter_origin_folder = None;
             self.search_tag_bridge.clear();
             self.rebuild_visible_indices();
-            self.refresh_color_filter_for_scope_change(ctx);
             return;
         }
         self.search_filter_origin_folder = self.effective_folder();
@@ -75262,6 +75288,11 @@ impl App {
             smart_rule_membership.as_deref(),
         )));
         let progress_w = Arc::clone(&progress);
+        let request = Arc::new(LocalSearchRequest {
+            submitted: submitted.clone(),
+            list_identity: self.local_search_list_identity(),
+        });
+        let worker_request = request.clone();
         let (tx, rx) = mpsc::channel();
         // perf 計装上、検索開始を input イベントとして記録する (input_seq は副作用で更新)。
         self.bump_input_seq("search", Some(&submitted.query.clone()));
@@ -75281,12 +75312,15 @@ impl App {
                     &cancel_w,
                     Some(progress_w.as_ref()),
                 );
-                let _ = tx.send(result);
+                let _ = tx.send(LocalSearchCompletion {
+                    request: worker_request,
+                    result,
+                });
             })
             .ok();
 
         self.search_pending = Some(SearchPending {
-            submitted,
+            request,
             cancel,
             progress,
             rx,
@@ -75337,9 +75371,8 @@ impl App {
     }
 
     /// in-flight 検索の結果を非同期に受信する。
-    /// フォルダ切替 / 検索バー閉じ / 新検索で旧スレッドはキャンセルされるため、
-    /// 受信時は「まだ同じ検索コンテキストか」の追加チェックは不要 (cancel されれば
-    /// スレッドは結果を送らない)。
+    /// キャンセルはworkerの早期終了用。送信との競合があるため、受信時には要求と
+    /// 現在の一覧identityを照合し、旧一覧のindex集合やXMPを別の一覧へ採用しない。
     ///
     /// 検索 in-flight 中は毎フレーム repaint を要求する必要がある (egui はアイドルで
     /// 寝るため、ワーカーが送信しても UI が拾いに来ない)。呼び出し元の update() が
@@ -75348,11 +75381,23 @@ impl App {
         let Some(pending) = self.search_pending.as_ref() else {
             return;
         };
+        let identity = self.local_search_list_identity();
+        if pending.request.list_identity != identity {
+            self.cancel_search_pending();
+            return;
+        }
         match pending.rx.try_recv() {
-            Ok(SearchThreadResult::Done {
-                matches,
-                xmp_additions,
-            }) => {
+            Ok(completion) => {
+                if completion.request.list_identity != identity
+                    || !Arc::ptr_eq(&completion.request, &pending.request)
+                {
+                    self.cancel_search_pending();
+                    return;
+                }
+                let SearchThreadResult::Done {
+                    matches,
+                    xmp_additions,
+                } = completion.result;
                 // ワーカーが新規に読み取った XMP をキャッシュにマージする。
                 // 既存キーは上書きしない (並行して別スレッドが先に書き込んだケースを尊重)。
                 for (key, xmp) in xmp_additions {
@@ -75360,7 +75405,7 @@ impl App {
                 }
                 self.search_filter = Some(LocalSearchFilter {
                     matches,
-                    submitted: pending.submitted.clone(),
+                    submitted: pending.request.submitted.clone(),
                 });
                 self.search_filter_origin_folder = self.effective_folder();
                 self.rebuild_visible_indices();
@@ -96780,6 +96825,7 @@ impl App {
         position: f64,
         duration: f64,
         ended: bool,
+        has_video: bool,
     ) {
         let key = crate::adjustment_db::normalize_path(&path);
         self.apply_media_resume_updates(vec![MediaResumeUpdate {
@@ -96789,11 +96835,11 @@ impl App {
             position,
             duration,
             at_eof: ended,
-            has_video: false,
+            has_video,
             audio_track_choice: None,
         }]);
         #[cfg(windows)]
-        if self.settings.video_resume_positions.contains_key(&key) {
+        if has_video && self.settings.video_resume_positions.contains_key(&key) {
             self.maybe_schedule_video_resume_thumbnail(&path, &key, position);
         }
     }

@@ -1808,6 +1808,25 @@ test("progress snapshots use the browser timeline and reject invalid clocks", ()
   assert.equal(VideoStreamViewer.prototype.snapshotProgress.call(viewer), null);
 });
 
+test("progress snapshots retain actual source video capability for audio-only MP4", () => {
+  const viewer = {
+    destroyed: false,
+    session: 1,
+    progressRemoteSessionId: "source-owner",
+    duration: 100,
+    address: { path: "C:/audio-only.mp4", subresource: { kind: "file" } },
+    hasVideo: false,
+    video: { ended: false },
+    currentPosition: () => 31.25,
+  };
+  const audioOnly = VideoStreamViewer.prototype.snapshotProgress.call(viewer);
+  assert.equal(audioOnly.hasVideo, false);
+  viewer.hasVideo = true;
+  const videoSource = VideoStreamViewer.prototype.snapshotProgress.call(viewer);
+  assert.equal(videoSource.hasVideo, true);
+  assert.equal(audioOnly.hasVideo, false, "captured progress must survive a later viewer change");
+});
+
 test("quality and track switches snapshot before control requests", async () => {
   const events = [];
   const viewer = {

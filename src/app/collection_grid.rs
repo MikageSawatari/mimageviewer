@@ -3458,6 +3458,14 @@ impl App {
             .search_filter
             .as_ref()
             .map(|filter| filter.submitted.clone());
+        let pending_submission = self
+            .search_pending
+            .as_ref()
+            .filter(|pending| {
+                old_binding_is_current
+                    && pending.request.list_identity == self.local_search_list_identity()
+            })
+            .map(|pending| pending.request.submitted.clone());
         let old_search_query = old_binding_is_current.then(|| self.search_query.clone());
         let old_search_origin = old_binding_is_current
             .then(|| self.search_filter_origin_folder.clone())
@@ -3572,6 +3580,9 @@ impl App {
         // can resume without leaking an old Standard choice into Manual or Shuffle.
         if self.settings.details_sort_key != crate::settings::DetailsSortKey::Toolbar {
             self.rebuild_details_order();
+        }
+        if let Some(submitted) = pending_submission {
+            self.start_submitted_local_search(submitted);
         }
         if let Some(start) = perf_start {
             crate::perf::event(
@@ -3756,6 +3767,7 @@ impl App {
         self.folder_pin_map = folder_pin_map;
         self.initialize_converted_archive_cache_paths();
         self.video_thumb_overrides = video_sidecars;
+        self.cancel_search_pending();
         self.search_filter = None;
         self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
 
@@ -7297,6 +7309,93 @@ mod tests {
             app.collection_root_delete_resolution(Some(folder_index), false),
             CollectionRootDeleteResolution::NotCollectionRoot
         ));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn review_a_collection_reorder_retires_pending_search_and_reapplies_submission() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("a.png");
+        let second = temp.path().join("b.png");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot = collection_with_sources(
+            &client,
+            &[
+                (first.clone(), CollectionResolvedKind::Image),
+                (second, CollectionResolvedKind::Image),
+            ],
+        );
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let previous = app
+            .top_level_grid_view
+            .collection_session()
+            .and_then(CollectionGridSession::prepared)
+            .cloned()
+            .unwrap();
+        let submitted = Arc::new(super::super::LocalSearchSubmission {
+            query: "a.png".into(),
+            target: crate::fts_index::SearchTarget::Only(vec![
+                crate::fts_index::SourceKind::Filename,
+            ]),
+            or_mode: false,
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.search_query = "unsubmitted draft".into();
+        let request = Arc::new(super::super::LocalSearchRequest {
+            submitted,
+            list_identity: app.local_search_list_identity(),
+        });
+        app.search_pending = Some(super::super::SearchPending {
+            request: request.clone(),
+            cancel: cancel.clone(),
+            progress: Arc::new(super::super::SearchProgressShared::new(2)),
+            rx,
+        });
+        let mut reordered = (*previous).clone();
+        let mut entries = previous.entries.to_vec();
+        entries.reverse();
+        reordered.entries = Arc::from(entries.into_boxed_slice());
+        reordered.collection_revision += 1;
+        app.apply_collection_grid_prepared(Arc::new(reordered), Some(previous));
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "old request must be retired"
+        );
+        let obsolete = super::super::LocalSearchCompletion {
+            request,
+            result: super::super::SearchThreadResult::Done {
+                matches: [0].into_iter().collect(),
+                xmp_additions: Default::default(),
+            },
+        };
+        assert!(
+            tx.send(obsolete).is_err(),
+            "old receiver must be gone before result delivery"
+        );
+        assert_eq!(app.search_query, "unsubmitted draft");
+        assert_eq!(app.submitted_local_search().unwrap().query, "a.png");
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while app.search_pending.is_some() && Instant::now() < deadline {
+            app.poll_search(&ctx);
+            std::thread::yield_now();
+        }
+        let expected = app
+            .items
+            .iter()
+            .position(|item| matches!(item, GridItem::Image(path) if path == &first))
+            .unwrap();
+        assert_eq!(
+            app.search_filter
+                .as_ref()
+                .map(|filter| filter.matches.clone()),
+            Some([expected].into_iter().collect())
+        );
         app.shutdown_collection_runtime_for_exit();
     }
 

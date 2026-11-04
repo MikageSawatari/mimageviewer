@@ -702,9 +702,10 @@ catalogは保持し、v1.0〜v1.3から直接更新する旧タグは取り込�
 必須STORED fieldのschema検査にも加え、開発途中の旧版11は既存の共通ownerで再構築する。
 版12・移行処理・UIでのstatや文字列の大小文字推測は追加しない。
 
-caption DBのkeyから候補を作るFullの本追加とcaption reflection（画像・PDF/EPUBも含む）は、
-既存worker用`restore_existing_path_casing`で実在する同じ論理pathの表記を復元してから
-通常の候補生成へ渡す。watcherと通常FS列挙は元のpathを保持する。
+watcher・サイドカー逆引き・caption reflection（画像・PDF/EPUBも含む）は、共通の
+`build_candidate_from_path`が既存worker用`restore_existing_path_casing`で実在する
+同じ論理pathの表記を復元する。通知やsidecar stemの表記を実ファイルの表記とみなさない。
+通常FS列挙は実pathを保持し、caption DBのkeyから候補を作るFullの本追加はwalkerで復元する。
 Flat/DrillのGridItem・開く操作は結果pathを保持し、履歴・ブックマークへ渡す元pathも
 そこから導く。キーを作る境界だけがnormalizeする。旧ZIP memberの比較もkeyへ正規化する。
 集約の`containers`は正規化した親pathをキー、`ContainerHit.path`を表示/open用の値として
@@ -716,6 +717,8 @@ DFS・戻る/次の本・facet帰路は、正規化キーで同一性とcomponen
 混在させ、集約2件・Drill3行・子の件数2件・ページ2件・DFS2箇所を検査する。
 `acceptance_d_search_preserves_physical_path_casing_for_scan_and_reflection`が、実ファイルの
 画像・フォルダ本・説明文のあるZIP本をFullとcaption反映の両方で検索する。
+`acceptance_d_sidecar_watch_preserves_physical_path_casing`は大小文字の異なるfull形式の
+サイドカー追加・削除と画像の小文字通知から再投入し、検索結果の元の表記を検査する。
 
 版の履歴:
 - **10**: 生成前テンプレートを検索へ入れない typed provenance による再構築。
@@ -796,9 +799,14 @@ Tantivy は通さない。SQLite LIKE の方が対象件数 (フォルダ構造�
 入力の固定表示／終了時消去の規則は維持する。実フォルダ（履歴・再読込を含む）、
 PDF/EPUB、書庫初回、検索結果はこの境界を共有する。ZIP内階層、検索の再投影、
 Collection の別入口も解除後に可視列を作り、snapshot復帰は対応するitemsとfilterを対で戻す。
-世代付きfilterも検討したが今回は採らない。同じ一覧の削除・再配置・snapshotでは
-membershipを明示転送する既存経路があり、世代だけを追加するとその契約も変更するため。
-一覧採用の既存終了境界を先に確定する順序へ揃え、旧index集合を新しい可視列へ使う機会を除く。
+独立レビュー追補: 終了順序だけで十分として世代を見送った判断を撤回する。
+Collection再採用で未完了要求が残る経路があり、入口ごとのcancel網羅に依存していた。
+`LocalSearchRequest`が提出済み条件と一覧identity（viewer context ID＋既存items_generation）を
+一体で所有し、workerの結果にも同じ要求を添える。`poll_search`は現在のidentityとの一致を
+確認してからXMP・filter・cursorを変更し、不一致の要求と結果を破棄する。
+Collection再採用は旧要求を終了し、新しい一覧の採用完了後に同じ提出済み条件で再検索する。
+未提出の入力欄を条件として採用しない。新たな世代カウンタやpending状態は追加しない。
+確定済みfilterの同一項目への明示remap・itemsとfilterを対で戻すsnapshotの契約は維持する。
 回帰: `acceptance_a_list_replacement_retires_local_filter_before_visibility`。
 
 受入 E: PDF/EPUBのページ内は従来どおり現在地フィルタ対象外。
@@ -834,9 +842,10 @@ UI (render_search_bar)
   スマートフォルダ等の一覧でも同じ worker を通り、説明文を検索する。子や本の中身は走査しない。
   DB の open/SELECT は Pass 1 前に worker で完了し、Pass 2 の並列処理は文字列 snapshot だけを読む。
   開けない・読めないときはログを残し、その説明文なしで評価する。UI では DB を読まない。
-- **PDF のページ表示中は Ctrl+F 自体を無効化** (`grid_is_pdf_pages`): 連番の
-  合成ページ名を絞っても意味が無いため、ショートカットを無反応にし開いた
-  バーも閉じる。
+- **PDF/EPUB のページ表示中は現在地フィルタ対象外** (`grid_is_pdf_pages`):
+  メニューを無効化し、ツールチップに「本のページ表示中は現在地を絞り込めません」を示す。
+  ショートカットは既存KeyAction経由で同じ理由を短く通知する。
+  ページ一覧への移動時に既存の検索バーを閉じる処理も維持する。
 - **ZIP 表示中は検索対象をファイル名に固定** (`grid_is_zip_entries`): ZIP 内
   画像のメタ検索は行わない (§4.6)。
 - 検索中表示は処理済み item 数 / 総 item 数を出す。1 item 内のメタ読み取り中は、その item が完了するまで

@@ -10,6 +10,16 @@ thumbnail受付でも除外し、Remoteからの音声位置保存も画像生�
 映像なしMP4・通常動画・動画の音声モードで位置保存と要求有無を検査する。
 音声の表紙があっても除外し、Remote音声も別の回帰で位置保存を確認する。
 
+独立レビュー追補: Remoteの進捗保存は拡張子だけで画像生成を除外していたため、
+映像なしMP4が通過していた。Web viewerはサーバーのstart/stateが返した元ソースの
+`has_video`を進捗snapshotへ捕捉し、IPCの`RecordVideoProgress.has_video`から
+`apply_remote_media_resume_update`へ渡す。位置保存は共通規則を維持し、画像要求だけを
+映像能力で判定する。停止後に遅着する進捗もあるため、破棄済みのplayerや別の再生項目から
+能力を引き直さない。動画の音声モードでも元ソースの映像能力を使う。
+必須IPC field追加に伴いprotocolを72→73へ更新し、本体・Remoteを同時に再buildする。
+回帰は`remote_progress_after_stream_stop_uses_reported_source_video_capability`、
+IPC roundtrip、Webのsnapshot・queue・最終keepaliveを対象とする。
+
 mimageviewer の動画インライン再生機能の設計指針と内部構造をまとめる。
 NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終構成** を記述する。
 撤回経緯は本書末尾の「Appendix: Phase 2 撤回理由」を参照。

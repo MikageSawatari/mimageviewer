@@ -5265,8 +5265,10 @@ test("video progress writer serializes ordinary snapshots with session-bound seq
   try {
     applyRemoteSessionId("progress-owner-a", () => {});
     const address = { path: testPath("movie.mp4"), subresource: { kind: "file" } };
-    const first = enqueueVideoProgress({ address, remoteSessionId: "progress-owner-a", positionSecs: 12, durationSecs: 90, ended: false });
-    const second = enqueueVideoProgress({ address, remoteSessionId: "progress-owner-a", positionSecs: 18, durationSecs: 90, ended: false });
+    const first = enqueueVideoProgress({ address, remoteSessionId: "progress-owner-a", positionSecs: 12, durationSecs: 90, ended: false, hasVideo: false });
+    const secondSnapshot = { address, remoteSessionId: "progress-owner-a", positionSecs: 18, durationSecs: 90, ended: false, hasVideo: true };
+    const second = enqueueVideoProgress(secondSnapshot);
+    secondSnapshot.hasVideo = false;
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.equal(calls.length, 1);
     applyRemoteSessionId("progress-owner-b", () => {});
@@ -5277,6 +5279,7 @@ test("video progress writer serializes ordinary snapshots with session-bound seq
     assert.deepEqual(calls.map(({ options }) => options.headers.get("X-mIV-Remote-Session")),
       ["progress-owner-a", "progress-owner-a"]);
     assert.deepEqual(calls.map(({ options }) => JSON.parse(options.body).sequence), [1, 2]);
+    assert.deepEqual(calls.map(({ options }) => JSON.parse(options.body).has_video), [false, true]);
   } finally {
     applyRemoteSessionId(TEST_SESSION_ID, () => {});
     globalThis.fetch = originalFetch;
@@ -5397,11 +5400,12 @@ test("viewer cleanup starts final keepalive before destroy even when prior repor
       isVideoStreamViewer: true,
       snapshotProgress() {
         events.push("snapshot");
-        return { address, remoteSessionId: "progress-cleanup-owner", positionSecs: 20, durationSecs: 90, ended: false };
+        return { address, remoteSessionId: "progress-cleanup-owner", positionSecs: 20, durationSecs: 90, ended: false, hasVideo: false };
       },
       destroy() {
         assert.equal(calls.length, 2);
         assert.equal(calls[1].options.keepalive, true);
+        assert.equal(JSON.parse(calls[1].options.body).has_video, false);
         events.push("destroy");
       },
     });

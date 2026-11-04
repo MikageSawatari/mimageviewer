@@ -17478,13 +17478,14 @@ pub(super) mod tests {
             std::fs::write(path, b"fixture").unwrap();
         }
         let engine = ContainerEngine::new(crate::settings::Settings::default());
-        for path in [&movie, &audio] {
+        for (path, has_video) in [(&movie, true), (&audio, false)] {
             let mut request = RemoteWriteRequest::RecordVideoProgress {
                 address: RemoteAddress::file(path.to_string_lossy().into_owned()),
                 sequence: 1,
                 position_secs: 11.0,
                 duration_secs: 10.0,
                 ended: false,
+                has_video,
             };
             assert!(engine.validate_write_request(&mut request).is_ok());
         }
@@ -17502,6 +17503,7 @@ pub(super) mod tests {
                 position_secs: position,
                 duration_secs: duration,
                 ended: false,
+                has_video: true,
             };
             assert_eq!(
                 engine
@@ -17517,6 +17519,7 @@ pub(super) mod tests {
             position_secs: 5.0,
             duration_secs: 10.0,
             ended: false,
+            has_video: true,
         };
         assert_eq!(
             engine
@@ -17542,6 +17545,7 @@ pub(super) mod tests {
             position_secs: 20.0,
             duration_secs: 100.0,
             ended: false,
+            has_video: true,
         };
         engine.validate_write_request(&mut request).unwrap();
         let RemoteWriteRequest::RecordVideoProgress { address, .. } = request else {

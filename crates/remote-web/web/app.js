@@ -5891,6 +5891,7 @@ export function enqueueVideoProgress(snapshot, { keepalive = false, immediate = 
     position_secs: snapshot.positionSecs,
     duration_secs: snapshot.durationSecs,
     ended: snapshot.ended,
+    has_video: snapshot.hasVideo,
   });
   const headers = remoteHeaders({ Accept: "application/json", "Content-Type": "application/json" });
   headers.set("X-mIV-Remote-Session", sessionId);

@@ -562,7 +562,7 @@ fn saved_position_media_clear_fences_teardown_and_track_updates_but_keeps_histor
         app.reading_history_rows[&history_key].media_position_ms,
         Some(23_000)
     );
-    app.apply_remote_media_resume_update(path, 31.0, 120.0, false);
+    app.apply_remote_media_resume_update(path, 31.0, 120.0, false, true);
     assert_eq!(app.settings.video_resume_positions.get(&key), Some(&31.0));
 }
 

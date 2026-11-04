@@ -3226,6 +3226,9 @@ export class VideoStreamViewer {
       positionSecs,
       durationSecs: this.duration,
       ended: ended || this.video.ended,
+      // Successful start/state metadata owns source capability, independently of
+      // playback presentation. Retain it even when this report arrives after stop.
+      hasVideo: this.hasVideo,
     };
   }
 

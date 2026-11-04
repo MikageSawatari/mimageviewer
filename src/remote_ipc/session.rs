@@ -2946,6 +2946,7 @@ mod tests {
                 position_secs: 19.5,
                 duration_secs: 120.0,
                 ended: false,
+                has_video: true,
             },
             RemoteWriteRequest::SetRating {
                 address: page.clone(),

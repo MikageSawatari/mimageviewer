@@ -376,6 +376,13 @@ if !is_video_sidecar {
    サイドカーイベントを受けたら §4 命名規則の逆引きで対応画像を求めて再 ingest 要求に変換する。
    notify の rename は `From`/`To`/`Both` に分かれて届く (search_watcher の `absorb_event`) ので、
    旧名・新名の双方について影響画像を再 ingest する。
+   逆引きした画像pathの大小文字はサイドカー名に由来し、実ファイル名とは異なり得る。
+   例: `MixedPhoto.JPG` の隣の `mixedphoto.jpg.json`。watcher・サイドカー逆引き・caption反映で
+   共有する `build_candidate_from_path` が、workerで実在する同一論理pathの表記を復元してから
+   候補を作り、ingestが検索結果の表示/open用 `display_path` へ保存する。正規化した照合keyは
+   変更しない。symlink解決などで論理pathが変わる場合は元のpathを維持する。
+   Windows回帰 `acceptance_d_sidecar_watch_preserves_physical_path_casing` は、上記full形式の
+   サイドカー追加・削除と、小文字の画像path通知を実検索まで通して実ファイル名の保持を検査する。
 
 3. **削除・古いサイドカー・優先順位切替の差分検出 (P1 + Codex 実装 P3)**: 実効 mtime =
    `max(画像, サイドカー)` **だけでは不十分**。サイドカー mtime が画像 mtime 以下のとき、サイドカーを

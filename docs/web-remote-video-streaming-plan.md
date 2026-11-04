@@ -535,6 +535,14 @@ thumbnail を含めない。
 
 ### 6.2 IPC (動画 API v15、timeout v17、thumbnail v18、時計なし v19、終端 v20、VST 状態 v21、audio-only v39、seek preview 幅 v51、音声トラック v62)
 
+2026-11-04 受入 F の strict IPC v73 は `RecordVideoProgress` に必須の `has_video` を追加する。
+端末は成功した start / state の映像能力を再生位置 snapshot に固定して送り、本体は位置保存の
+共通規則を維持したまま、映像ありの場合だけ続きの画像を要求する。拡張子や音声表示モードからは
+推測しない。音声のみの MP4 や表紙付き音声も位置を保存するが画像は要求せず、映像ありの
+ソースは音声モードでも画像を保持する。stop と最終 keepalive の到着順は保証されないため、
+本体は終了済み player や現在の別ファイルを再参照せず、同じ報告に捕捉された能力を使う。
+本体と remote-web は同じ版で再ビルド・再起動する。
+
 既存の長寿命 duplex 多重化接続 ([web-remote-plan.md](web-remote-plan.md) §9.5-9.6) に
 `ClientMessage` / `ServerMessage` の variant を追加する。**セグメントは pull 型**とし、
 remote-web が HTTP 要求を受けた時に取りに行く。push 型の非同期メッセージを新設しない
@@ -1029,7 +1037,8 @@ CPU に戻さず GPU scale して NVENC へ渡す経路が次の性能投資候�
 - **位置**: server は generation、source origin、生成済み範囲、ring の earliest/latest、duration、
   再生 intent を所有する。実 playhead は端末の media element が source of truth であり、
   `/api/video/state` の本体位置を端末位置として返さない。resume/history が必要なときだけ端末が
-  playhead を報告する
+  playhead を報告する。報告 snapshot は start / state の `has_video` も固定し、遅れて届いた
+  位置保存でも同じソースの映像能力によって続きの画像の受付を決める
 - **一時停止 / seek / 終端**: 一時停止中も ring 上限まで生成して park する。seek は現在の
   generation 交換規約を再利用し、旧 worker を段境界 cancel、新 generation は独立 open + seek
   で開始する。終端は decoder、resampler、音声 DSP tail、H.264/AAC encoder、A/V mux、既存

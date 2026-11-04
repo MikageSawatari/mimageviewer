@@ -799,11 +799,8 @@ fn reflect_captions(
             if !keys.insert(key) {
                 continue;
             }
-            let restored = crate::path_key::restore_existing_path_casing(std::path::Path::new(key));
             match build_candidate_from_path(
-                restored
-                    .as_deref()
-                    .unwrap_or_else(|| std::path::Path::new(key)),
+                std::path::Path::new(key),
                 key.clone(),
                 session.caption_db(),
             ) {
@@ -1370,6 +1367,10 @@ fn build_candidate_from_path(
     if crate::folder_tree::is_apple_double(abs_path) {
         return Ok(None);
     }
+    // notify やサイドカー逆引き、caption の保存キーは実ファイルと大小文字が異なり得る。
+    // 表示/open 用 path の復元は候補生成で共有し、照合 key と論理 path は保持する。
+    let restored = crate::path_key::restore_existing_path_casing(abs_path);
+    let abs_path = restored.as_deref().unwrap_or(abs_path);
     if let Some(captions) = captions
         && let search_walker::BookCandidateDecision::Include(kind) =
             search_walker::caption_book_candidate(abs_path, captions)?
@@ -2730,6 +2731,64 @@ mod tests {
                     "{phase}: {path:?}, {hits:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn acceptance_d_sidecar_watch_preserves_physical_path_casing() {
+        let (tmp, meta, fts, writer, sem, _) = setup();
+        let root = tmp.path().join("MixedShelf");
+        fs::create_dir(&root).unwrap();
+        let image = root.join("MixedPhoto.JPG");
+        write_image(&root, "MixedPhoto.JPG");
+        let sidecar = root.join("mixedphoto.jpg.json");
+        fs::write(&sidecar, r#"{"description":"sidecar text"}"#).unwrap();
+        let favorite = Uuid::new_v4();
+        let session = IngestSession::new(favorite, root.clone(), &meta, &fts);
+        let cancel = AtomicBool::new(false);
+        let stats = Mutex::new(SupervisorStats::default());
+        let progress = ProgressReporter::new();
+
+        for phase in ["sidecar_upsert", "sidecar_remove", "image_upsert"] {
+            let (path, kind) = match phase {
+                "sidecar_remove" => {
+                    fs::remove_file(&sidecar).unwrap();
+                    (sidecar.clone(), ChangeKind::Remove)
+                }
+                "image_upsert" => (root.join("mixedphoto.jpg"), ChangeKind::Upsert),
+                _ => (sidecar.clone(), ChangeKind::Upsert),
+            };
+            apply_single_change(
+                &session,
+                &writer,
+                &sem,
+                &[],
+                &cancel,
+                &stats,
+                &progress,
+                path,
+                kind,
+            );
+            let (tx, rx) = crossbeam_channel::unbounded();
+            crate::global_search::run(
+                "mixed",
+                &[favorite],
+                &Default::default(),
+                &fts,
+                &cancel,
+                &tx,
+                None,
+            );
+            let hits = rx
+                .try_iter()
+                .flat_map(|event| match event {
+                    crate::global_search::SearchStreamEvent::Batch { hits, .. } => hits,
+                    _ => Vec::new(),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(hits.len(), 1, "{phase}: {hits:?}");
+            assert_eq!(PathBuf::from(&hits[0].path), image, "{phase}");
         }
     }
 
