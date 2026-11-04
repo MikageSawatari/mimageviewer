@@ -65,6 +65,18 @@
 - 検証用build: `build-dev.ps1 -PreserveRuntime` が成功。normal feature setのcore・Remote・EPUB worker・MCP adapter・音楽ビデオeditorを `target/dev-runtime/` に作成し、VC runtime／PE検査も成功（runtime=4、pe=5）。製品は起動していない。確認は場所5項目の順、ビデオ／ミュージックへの移動、右クリックの個別ON/OFF。通常 `%APPDATA%\mimageviewer` を使い実設定・データを更新し得るため、利用者がインストール版／常駐tray版を終了してから `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe` で起動する。
 - 製品は起動せず、実機での移動確認と設計担当の検収は未実施。CHANGELOGは設計担当が更新する。
 
+#### 独立レビュー P2: 場所▼の候補解決をopen時だけにする（2026-11-04）
+
+- 指摘（ソース確認）: 開いている場所▼の描画callbackが毎フレーム `location_menu_entries` を呼び、5種のKnown Folder API・実在判定とドライブ列挙をUIスレッドで繰り返す。ネットワーク先等で再描画ごとに待ち得る。実機での待ち時間の観測ではない。
+- 対応: `folder_menu_button_with_snapshot` に保持結果を1か所だけ置く。既存menu rendererのcallbackが最初に走るときに解決し、以後の描画は保持結果を使う。実際のpopup IDの `Popup::is_id_open` を描画の前後で照合し、項目選択・Esc・外側クリック・ボタン再クリック、描画後に別popupへ切り替わった場合も次回へ持ち越さない。独立したopen boolやworker／pendingは追加しない。初回の同期解決は今回の利用者指示に従い維持する。
+- callback内の監査: 本棚tooltipの `book_root_path` は既定時に `capture::pictures_root` のKnown Folder APIへ到達するため、同じopen時の保持対象にした。整理先は設定値の複製と文字列描画だけで、存在確認は従来どおり選択時だけ。`main_clipboard_capture_location` は `DestinationResolution::resolved` の在メモリ結果と設定値だけを読むため、毎フレーム参照を維持する。開いている途中で既定保存先workerが完了した場合に項目が出る既存の挙動を保つ。
+- 設定変更の監査・判断: 表示設定はフォルダバーの右クリック／ツールバー初期化、本棚・整理先は環境設定OKが変更入口。設定取込の非同期完了はdraftを作るだけで、Appへの反映は同じOK経路。通常の右クリックpopup切替や環境設定クリックは場所popupを閉じるが、適用と描画が同じupdate内で前後しても保持結果の再構築は行わず、次に開いた時点の設定・OSの状態を反映する。移動先を選択時に再検証する既存処理は維持し、専用のlive更新／非同期状態を作らない。
+- 他の呼び出し元: `build_gamepad_location_entries` の製品側呼び出しは `open_gamepad_location_picker` の1か所だけで、`GamepadLocationPickerState.entries` に保持して描画・選択する。`quick_locations` / `available_drives` の毎フレーム呼び出しは無く変更不要。Remoteの `visible_places` は `CollectionEngine::home` の要求ごとに呼び、IPCの `WorkLane::Home` → `home_worker_loop`（専用thread）で実行するため、UI描画のホットパスではなく変更不要。
+- 回帰: resolverを注入できる実際のmenu helperをheadlessで複数フレーム描き、閉じている間は0回、open中は設定相当値を変えても1回、閉じて再openすると2回目で新しい値を描くことを検査する。callback内のcloseに加え、Esc・外側クリック・ボタン再クリック・別popupへの切替を検査する。
+- 自動検証（HEAD `19f601855` 上の未コミット差分、通常feature set）: `cargo nextest run -p mimageviewer --lib -E 'test(/known_folders|location|gamepad_location|visible_places/)' --no-fail-fast` は117件成功・失敗0（9.309秒、対象外16,220件、exit 0）。`cargo check -p mimageviewer --bin mimageviewer-core`、`cargo test -p mimageviewer --test ui_snapshot folder_location_menu_dark` の通常比較1件（PNG更新なし）、`cargo fmt`／`cargo fmt --check`、UI glyph 0件、`git diff --check` も成功。ログは `target/location-menu-nextest-final.log`、`target/location-menu-check.log`、`target/location-menu-snapshot.log`。本体lib全件は依頼の指定どおり実行しない。
+- 途中検証: 追加テストの旧egui API呼出しを現行の `run_ui` へ修正。次の実行は116成功・追加回帰1失敗で、Esc直後の再openを同じpassの押下・解放で作るテスト入力が、eguiの閉じたばかりのArea応答により即時closeされていた。再openの入力を実操作と同じ押下／解放の別passへ直し、上記117件がすべて成功した。製品のpopup挙動や期待値は変更していない。
+- 確認用build: `build-dev.ps1 -PreserveRuntime` が成功（exit 0）。normal feature setのcore・Remote・EPUB worker・MCP adapter・音楽ビデオeditorを `target/dev-runtime/` に用意し、VC runtime／PE検査も成功（runtime=4、pe=5、`target/vcrt-pe-reports/dev-runtime.json`）。製品は起動せず、実機の応答性は未測定。手動確認は場所▼を開いたままの再描画、閉じて再open、表示設定変更の次回openへの反映。起動は利用者がインストール版／常駐tray版を閉じてから `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe` を実行する。通常の `%APPDATA%\mimageviewer` を使い実設定・データを更新し得る。`config/miv-sound.rs` は `0.15.0-miv.3` のまま変更せず、コミットは設計担当へ引き継ぐ。
+
 ### 1.698 v5 受入 A: フォルダ移動後に見えない現在地フィルタが残る (2026-11-04)
 
 - 観測: サブPC担当 `C:\miv-subpc\results-11\<部>\notes.md`、利用者の実装指示に引用された結果。移動元のindex 2だけが移動先12件でも表示され、×で全件に戻る。v4.11.0にもある不具合。

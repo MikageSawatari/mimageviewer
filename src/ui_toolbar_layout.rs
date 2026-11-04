@@ -203,6 +203,46 @@ pub fn folder_menu_button(
     .inner
 }
 
+#[derive(Clone)]
+struct FolderMenuSnapshot<T> {
+    popup_id: egui::Id,
+    value: T,
+}
+
+/// Resolve once per open menu, using egui's actual popup state for both reuse
+/// and disposal. `source` lets resolution and rendering borrow the same owner
+/// sequentially without cloning its settings on every closed frame.
+pub(crate) fn folder_menu_button_with_snapshot<S, T: Clone + Send + Sync + 'static>(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    text: impl Into<egui::WidgetText>,
+    source: &mut S,
+    resolve: impl FnOnce(&mut S) -> T,
+    contents: impl FnOnce(&mut S, &mut egui::Ui, &T),
+) -> egui::Response {
+    let snapshot_id = ui.next_auto_id().with("folder_menu_snapshot");
+    let ctx = ui.ctx().clone();
+    // A different popup may have closed this one after it was drawn last pass.
+    // Check before the button can reopen it, as well as after its close handling.
+    let mut snapshot = ctx
+        .data(|data| data.get_temp::<FolderMenuSnapshot<T>>(snapshot_id))
+        .filter(|snapshot| egui::Popup::is_id_open(&ctx, snapshot.popup_id))
+        .map(|snapshot| snapshot.value);
+    let response = folder_menu_button(ui, enabled, text, |ui| {
+        let value = snapshot.get_or_insert_with(|| resolve(source));
+        contents(source, ui, value);
+    });
+    let popup_id = egui::Popup::default_response_id(&response);
+    let is_open = egui::Popup::is_id_open(&ctx, popup_id);
+    ctx.data_mut(|data| {
+        data.remove::<FolderMenuSnapshot<T>>(snapshot_id);
+        if is_open && let Some(value) = snapshot {
+            data.insert_temp(snapshot_id, FolderMenuSnapshot { popup_id, value });
+        }
+    });
+    response
+}
+
 /// Visual order is always left controls, input, right controls. Decide whether
 /// the tail shares the current row, gets one new row, or needs two rows before
 /// allocating any right-to-left widgets. A full row includes the input's margin.
@@ -312,6 +352,154 @@ pub fn address_input<R>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct LocationMenuFixture {
+        resolutions: usize,
+        current_value: usize,
+        rendered: Vec<usize>,
+        close_from_contents: bool,
+    }
+
+    fn location_menu_frame(
+        ctx: &egui::Context,
+        source: &mut LocationMenuFixture,
+        events: Vec<egui::Event>,
+    ) -> egui::Response {
+        let mut response = None;
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(500.0, 400.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |root_ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
+                    response = Some(folder_menu_button_with_snapshot(
+                        ui,
+                        true,
+                        "場所▼",
+                        source,
+                        |source| {
+                            source.resolutions += 1;
+                            source.current_value
+                        },
+                        |source, ui, value| {
+                            source.rendered.push(*value);
+                            ui.label(value.to_string());
+                            if source.close_from_contents {
+                                ui.close();
+                            }
+                        },
+                    ));
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+        response.unwrap()
+    }
+
+    fn location_menu_click(pos: egui::Pos2) -> Vec<egui::Event> {
+        let mut events = vec![egui::Event::PointerMoved(pos)];
+        for pressed in [true, false] {
+            events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        events
+    }
+
+    #[test]
+    fn location_menu_resolves_once_while_open_and_refreshes_after_contents_close() {
+        let ctx = egui::Context::default();
+        let mut source = LocationMenuFixture::default();
+        let response = location_menu_frame(&ctx, &mut source, vec![]);
+        let popup_id = egui::Popup::default_response_id(&response);
+        assert_eq!(source.resolutions, 0, "closed menus must not resolve");
+
+        egui::Popup::open_id(&ctx, popup_id);
+        location_menu_frame(&ctx, &mut source, vec![]);
+        source.current_value = 1; // Settings/OS changes apply on the next open.
+        for _ in 0..12 {
+            location_menu_frame(&ctx, &mut source, vec![]);
+        }
+        assert_eq!(source.resolutions, 1);
+        assert!(source.rendered.len() >= 13);
+        assert!(source.rendered.iter().all(|value| *value == 0));
+
+        source.close_from_contents = true;
+        location_menu_frame(&ctx, &mut source, vec![]);
+        assert!(!egui::Popup::is_id_open(&ctx, popup_id));
+        source.close_from_contents = false;
+        source.rendered.clear();
+        egui::Popup::open_id(&ctx, popup_id);
+        location_menu_frame(&ctx, &mut source, vec![]);
+        assert_eq!(source.resolutions, 2);
+        assert!(source.rendered.iter().all(|value| *value == 1));
+    }
+
+    #[test]
+    fn location_menu_discards_snapshot_on_escape_outside_click_and_button_toggle() {
+        for close in ["escape", "outside", "toggle", "other_popup"] {
+            let ctx = egui::Context::default();
+            let mut source = LocationMenuFixture::default();
+            let response = location_menu_frame(&ctx, &mut source, vec![]);
+            let popup_id = egui::Popup::default_response_id(&response);
+            egui::Popup::open_id(&ctx, popup_id);
+            location_menu_frame(&ctx, &mut source, vec![]);
+            location_menu_frame(&ctx, &mut source, vec![]);
+            assert_eq!(source.resolutions, 1);
+
+            match close {
+                "escape" => {
+                    location_menu_frame(
+                        &ctx,
+                        &mut source,
+                        vec![egui::Event::Key {
+                            key: egui::Key::Escape,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        }],
+                    );
+                }
+                "outside" | "toggle" => {
+                    let pos = if close == "toggle" {
+                        response.rect.center()
+                    } else {
+                        egui::pos2(450.0, 350.0)
+                    };
+                    location_menu_frame(&ctx, &mut source, location_menu_click(pos));
+                }
+                _ => {
+                    // Closed after this button's last draw: no closed frame of
+                    // this helper runs before the user's next opening click.
+                    egui::Popup::open_id(&ctx, egui::Id::unique("other_popup"));
+                }
+            }
+            assert!(!egui::Popup::is_id_open(&ctx, popup_id), "{close}");
+            source.current_value = 1;
+            source.rendered.clear();
+            // A real opening click has a press pass before its release. In
+            // particular, egui must retire the just-closed popup's Area response
+            // before classifying the release as a fresh opening click.
+            let mut press = location_menu_click(response.rect.center());
+            let release = press.pop().unwrap();
+            location_menu_frame(&ctx, &mut source, press);
+            location_menu_frame(&ctx, &mut source, vec![release]);
+            assert!(egui::Popup::is_id_open(&ctx, popup_id), "{close}");
+            assert_eq!(source.resolutions, 2, "{close}");
+            assert!(!source.rendered.is_empty(), "{close}");
+            assert!(source.rendered.iter().all(|value| *value == 1), "{close}");
+        }
+    }
 
     #[test]
     fn address_label_yields_a_row_at_the_input_minimum_boundary() {

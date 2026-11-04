@@ -16065,19 +16065,25 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     }
 
                     let place_nav_enabled = !search_active && !snapshot_active;
-                    let place_response = crate::ui_toolbar_layout::folder_menu_button(
+                    let place_response = crate::ui_toolbar_layout::folder_menu_button_with_snapshot(
                         ui,
                         place_nav_enabled,
                         "場所▼",
-                        |ui| {
+                        self,
+                        |app| {
+                            (
+                                crate::known_folders::location_menu_entries(&app.settings),
+                                app.settings.show_location_bookshelf.then(|| app.book_root_path()),
+                            )
+                        },
+                        |app, ui, (location_entries, bookshelf_path)| {
                             ui.set_min_width(220.0);
-                            let location_entries =
-                                crate::known_folders::location_menu_entries(&self.settings);
+                            let location_entries = location_entries.clone();
                             // Main-window only (not part of the shared list used by mIV Remote):
                             // shown right below 本棚フォルダ (before 整理先 and the quick locations).
                             let mut clipboard_capture_location =
                                 crate::known_folders::main_clipboard_capture_location(
-                                    &self.settings,
+                                    &app.settings,
                                 );
                             for entry in location_entries {
                                 if matches!(
@@ -16087,7 +16093,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         | crate::known_folders::LocationMenuEntry::QuickLocation(_)
                                         | crate::known_folders::LocationMenuEntry::DriveRoot(_)
                                 ) && let Some(destination) = clipboard_capture_location.take()
-                                    && self.draw_clipboard_capture_location_button(ui, destination)
+                                    && app.draw_clipboard_capture_location_button(ui, destination)
                                 {
                                     ui.close();
                                 }
@@ -16106,7 +16112,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     }
                                     crate::known_folders::LocationMenuEntry::Bookmarks => {
                                         if ui.button("ブックマーク").clicked() {
-                                            self.open_bookmark_browser();
+                                            app.open_bookmark_browser();
                                             ui.close();
                                         }
                                     }
@@ -16122,7 +16128,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                                     crate::test_script::register_clickable_widget("rating-three", &rating_response);
                                                 }
                                                 if rating_response.clicked() {
-                                                    self.enter_rating_view_from_menu(stars);
+                                                    app.enter_rating_view_from_menu(stars);
                                                     ui.close();
                                                 }
                                             }
@@ -16134,7 +16140,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         if ui
                                             .button("本棚フォルダ")
                                             .hover_tip(
-                                                self.book_root_path().to_string_lossy().to_string(),
+                                                bookshelf_path.as_ref().expect("visible bookshelf path").to_string_lossy().to_string(),
                                             )
                                             .clicked()
                                         {
@@ -16216,7 +16222,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 }
                             }
                             if let Some(destination) = clipboard_capture_location.take()
-                                && self.draw_clipboard_capture_location_button(ui, destination)
+                                && app.draw_clipboard_capture_location_button(ui, destination)
                             {
                                 ui.close();
                             }
