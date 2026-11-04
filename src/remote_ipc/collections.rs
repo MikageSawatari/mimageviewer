@@ -2437,6 +2437,8 @@ mod tests {
         settings.show_location_desktop = false;
         settings.show_location_pictures = false;
         settings.show_location_downloads = false;
+        settings.show_location_videos = false;
+        settings.show_location_music = false;
         settings.show_location_drive_roots = false;
         let places = visible_places(&settings);
         assert_eq!(

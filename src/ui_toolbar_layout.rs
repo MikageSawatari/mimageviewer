@@ -1,5 +1,15 @@
 //! Layout shared by the toolbar's flexible folder section and its snapshots.
 
+/// Shared rendering for Known Folder destinations; resolving paths stays outside the UI.
+pub fn quick_location_button(
+    ui: &mut egui::Ui,
+    location: &crate::known_folders::QuickLocation,
+) -> egui::Response {
+    use crate::ui_helpers::HoverTipExt;
+    ui.button(location.label)
+        .hover_tip(location.path.to_string_lossy().as_ref())
+}
+
 /// Logical points; DPI scaling is applied by egui, not by the layout policy.
 pub const ADDRESS_INPUT_MIN_WIDTH: f32 = 160.0;
 

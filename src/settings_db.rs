@@ -6923,6 +6923,38 @@ mod tests {
     }
 
     #[test]
+    fn media_location_settings_load_v411_missing_keys_and_roundtrip() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let original = Settings {
+            startup_folder_mode: crate::settings::StartupFolderMode::Specific,
+            startup_folder_path: Some(PathBuf::from("D:/chosen")),
+            show_location_desktop: false,
+            show_location_pictures: false,
+            show_location_downloads: false,
+            show_location_videos: false,
+            show_location_music: false,
+            ..Settings::default()
+        };
+        db.save_full(&original).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert!(!loaded.show_location_videos && !loaded.show_location_music);
+        // v4.11.0 stores the same settings_kv schema without these two new keys.
+        db.inner.lock().unwrap().conn.execute(
+            "DELETE FROM settings_kv WHERE key IN ('show_location_videos', 'show_location_music')",
+            [],
+        ).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert!(loaded.show_location_videos && loaded.show_location_music);
+        assert!(
+            !loaded.show_location_desktop
+                && !loaded.show_location_pictures
+                && !loaded.show_location_downloads
+        );
+        assert_eq!(loaded.startup_folder_mode, original.startup_folder_mode);
+        assert_eq!(loaded.startup_folder_path, original.startup_folder_path);
+    }
+
+    #[test]
     fn missing_grid_display_order_uses_additive_settings_default() {
         let db = SettingsDb::open_in_memory_for_test().unwrap();
         db.save_full(&Settings::default()).unwrap();

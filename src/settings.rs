@@ -5037,6 +5037,12 @@ pub struct Settings {
     /// フォルダバーの「場所▼」にダウンロードを表示する。
     #[serde(default = "default_true")]
     pub show_location_downloads: bool,
+    /// フォルダバーの「場所▼」にビデオを表示する。
+    #[serde(default = "default_true")]
+    pub show_location_videos: bool,
+    /// フォルダバーの「場所▼」にミュージックを表示する。
+    #[serde(default = "default_true")]
+    pub show_location_music: bool,
     /// フォルダバーの「場所▼」に利用可能な各ドライブ (`C:\` など) を表示する。
     #[serde(default = "default_true")]
     pub show_location_drive_roots: bool,
@@ -7992,6 +7998,8 @@ impl Default for Settings {
             show_location_desktop: true,
             show_location_pictures: true,
             show_location_downloads: true,
+            show_location_videos: true,
+            show_location_music: true,
             show_location_drive_roots: true,
             use_native_shell_context_menu: true,
             show_windows_context_menu_inline: false,
@@ -10668,6 +10676,8 @@ impl Settings {
         self.show_location_desktop = src.show_location_desktop;
         self.show_location_pictures = src.show_location_pictures;
         self.show_location_downloads = src.show_location_downloads;
+        self.show_location_videos = src.show_location_videos;
+        self.show_location_music = src.show_location_music;
         self.show_location_drive_roots = src.show_location_drive_roots;
         // ── サムネイル画質 (A/B 比較ダイアログで編集) ──
         self.thumb_px = src.thumb_px;
@@ -12644,9 +12654,56 @@ mod tests {
                 && s.show_location_desktop
                 && s.show_location_pictures
                 && s.show_location_downloads
+                && s.show_location_videos
+                && s.show_location_music
                 && s.show_location_drive_roots,
             "場所メニュー項目は旧 settings 欠落時に全表示"
         );
+    }
+
+    #[test]
+    fn media_location_settings_preserve_v411_startup_and_visibility() {
+        // These are the unchanged v4.11.0 enum spellings and location flags.
+        // Missing new fields must not alter an existing startup choice or hidden destination.
+        for mode in [
+            "previous",
+            "desktop",
+            "specific",
+            "drives",
+            "reading_history",
+        ] {
+            let old = serde_json::json!({
+                "startup_folder_mode": mode,
+                "startup_folder_path": "D:/chosen",
+                "last_folder": "D:/last",
+                "show_location_desktop": false,
+                "show_location_pictures": false,
+                "show_location_downloads": false,
+                "show_location_drive_roots": false,
+                "grid_cols": 7
+            });
+            let loaded: Settings = serde_json::from_value(old.clone()).unwrap();
+            let current = serde_json::to_value(&loaded).unwrap();
+            for (key, value) in old.as_object().unwrap() {
+                assert_eq!(&current[key], value, "{mode}: {key}");
+            }
+            assert!(loaded.show_location_videos && loaded.show_location_music);
+        }
+        for (videos, music) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut source = Settings {
+                show_location_videos: videos,
+                show_location_music: music,
+                ..Settings::default()
+            };
+            let mut draft = Settings::default();
+            draft.overwrite_non_preferences_from(&mut source);
+            let loaded: Settings =
+                serde_json::from_str(&serde_json::to_string(&draft).unwrap()).unwrap();
+            assert_eq!(
+                (loaded.show_location_videos, loaded.show_location_music),
+                (videos, music)
+            );
+        }
     }
 
     #[test]
@@ -15272,6 +15329,8 @@ mod tests {
         assert!(s.show_location_desktop);
         assert!(s.show_location_pictures);
         assert!(s.show_location_downloads);
+        assert!(s.show_location_videos);
+        assert!(s.show_location_music);
         assert!(s.show_location_drive_roots);
         assert_eq!(
             s.toolbar_facet_filter_items,
@@ -19644,6 +19703,8 @@ mod tests {
             s.show_location_reading_history = false;
             s.show_location_rating = false;
             s.show_location_downloads = false;
+            s.show_location_videos = false;
+            s.show_location_music = false;
             s.show_location_drive_roots = false;
             s.toolbar_section_new_row = vec![ToolbarSectionId::Tags, ToolbarSectionId::Favorites];
             s.ring_shortcuts.mouse_flick_enabled = true;
@@ -19917,6 +19978,8 @@ mod tests {
                 !loaded.show_location_reading_history
                     && !loaded.show_location_rating
                     && !loaded.show_location_downloads
+                    && !loaded.show_location_videos
+                    && !loaded.show_location_music
                     && !loaded.show_location_drive_roots,
                 "location menu false overrides should survive roundtrip"
             );

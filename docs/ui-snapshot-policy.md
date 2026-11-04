@@ -1,5 +1,16 @@
 # UI スナップショットテスト運用方針
 
+§1.704 の場所メニューは、本体共通のメニューボタン／既知フォルダ行rendererを固定pathの
+fixtureから描く `folder_location_menu_dark`（260×230、10,055 bytes）を追加する。
+デスクトップ・ピクチャ・ダウンロード・ビデオ・ミュージックの順と文字を目視確認した。
+既存 `folder_bar_organize_destinations_toggle`（480×700、82,453 bytes）だけを更新し、
+新しい2項目のチェック表示と本文のscrollbarを目視確認した。2枚は計92,508 bytes。
+既存のApp fixtureを更新するが、新しいメニューPNGはApp・OSの実フォルダ・workerを使わない。
+実際の設定popupの614pt／900ptで、必要なときだけscrollし、wheelで末尾へ到達して
+「フォルダバーを隠す」を操作できることと背面へのwheel非伝播をheadless検査する。
+並び順・欠損・重複・表示OFFは共通列挙のstateテスト、実フォルダ取得はKnown Folder APIの
+専用テストで分ける。更新指定なしの対象PNG比較は成功。製品起動・実機検収の証拠とはしない。
+
 v5受入B（2026-11-04）の登録確認は`agent_registration_confirmation_small_light`
 （1093×614、70,109 bytes）を1枚追加する。実環境・設定ファイル・登録workerを使わない
 固定fixtureで製品と共通の確認Windowを描く。本文・設定path・追加する内容・backupの説明・

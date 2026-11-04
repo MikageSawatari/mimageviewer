@@ -1,6 +1,6 @@
 //! Windows の既知フォルダとドライブ一覧を取得する小さなヘルパー。
 //!
-//! Desktop / Pictures / Downloads は OneDrive や管理者設定によるリダイレクトを
+//! Desktop / Pictures / Downloads / Videos / Music は OneDrive や管理者設定によるリダイレクトを
 //! 正しく扱うため Known Folder API を優先し、失敗時だけ USERPROFILE 配下へ
 //! フォールバックする。
 
@@ -42,11 +42,15 @@ pub fn location_menu_entries(settings: &Settings) -> Vec<LocationMenuEntry> {
         .show_location_downloads
         .then(downloads_dir)
         .flatten();
+    let videos = settings.show_location_videos.then(videos_dir).flatten();
+    let music = settings.show_location_music.then(music_dir).flatten();
     let drives = settings
         .show_location_drive_roots
         .then(available_drives)
         .unwrap_or_default();
-    location_menu_entries_from(settings, desktop, pictures, downloads, drives)
+    location_menu_entries_from(
+        settings, desktop, pictures, downloads, videos, music, drives,
+    )
 }
 
 /// Main-only destination; never changes the shared Remote location enumeration.
@@ -73,6 +77,8 @@ fn location_menu_entries_from(
     desktop: Option<PathBuf>,
     pictures: Option<PathBuf>,
     downloads: Option<PathBuf>,
+    videos: Option<PathBuf>,
+    music: Option<PathBuf>,
     drives: Vec<PathBuf>,
 ) -> Vec<LocationMenuEntry> {
     let mut entries = Vec::new();
@@ -110,6 +116,12 @@ fn location_menu_entries_from(
     if settings.show_location_downloads {
         push_unique_location(&mut quick_locations, "ダウンロード", downloads);
     }
+    if settings.show_location_videos {
+        push_unique_location(&mut quick_locations, "ビデオ", videos);
+    }
+    if settings.show_location_music {
+        push_unique_location(&mut quick_locations, "ミュージック", music);
+    }
     if !quick_locations.is_empty() {
         entries.push(LocationMenuEntry::Separator);
         entries.extend(
@@ -138,11 +150,21 @@ pub fn downloads_dir() -> Option<PathBuf> {
     known_folder_or_userprofile("Downloads", KnownFolder::Downloads)
 }
 
+pub fn videos_dir() -> Option<PathBuf> {
+    known_folder_or_userprofile("Videos", KnownFolder::Videos)
+}
+
+pub fn music_dir() -> Option<PathBuf> {
+    known_folder_or_userprofile("Music", KnownFolder::Music)
+}
+
 pub fn quick_locations() -> Vec<QuickLocation> {
     let mut locations = Vec::new();
     push_unique_location(&mut locations, "デスクトップ", desktop_dir());
     push_unique_location(&mut locations, "ピクチャ", pictures_dir());
     push_unique_location(&mut locations, "ダウンロード", downloads_dir());
+    push_unique_location(&mut locations, "ビデオ", videos_dir());
+    push_unique_location(&mut locations, "ミュージック", music_dir());
     locations
 }
 
@@ -237,12 +259,23 @@ enum KnownFolder {
     Desktop,
     Pictures,
     Downloads,
+    Videos,
+    Music,
 }
 
 fn known_folder_or_userprofile(fallback_name: &str, folder: KnownFolder) -> Option<PathBuf> {
-    platform_known_folder(folder)
+    existing_folder_or_fallback(platform_known_folder(folder), || {
+        userprofile_child(fallback_name)
+    })
+}
+
+fn existing_folder_or_fallback(
+    known: Option<PathBuf>,
+    fallback: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    known
         .filter(|p| p.is_dir())
-        .or_else(|| userprofile_child(fallback_name).filter(|p| p.is_dir()))
+        .or_else(|| fallback().filter(|p| p.is_dir()))
 }
 
 fn userprofile_child(name: &str) -> Option<PathBuf> {
@@ -255,14 +288,16 @@ fn userprofile_child(name: &str) -> Option<PathBuf> {
 fn platform_known_folder(folder: KnownFolder) -> Option<PathBuf> {
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::UI::Shell::{
-        FOLDERID_Desktop, FOLDERID_Downloads, FOLDERID_Pictures, KF_FLAG_DEFAULT,
-        SHGetKnownFolderPath,
+        FOLDERID_Desktop, FOLDERID_Downloads, FOLDERID_Music, FOLDERID_Pictures, FOLDERID_Videos,
+        KF_FLAG_DEFAULT, SHGetKnownFolderPath,
     };
 
     let folder_id = match folder {
         KnownFolder::Desktop => &FOLDERID_Desktop,
         KnownFolder::Pictures => &FOLDERID_Pictures,
         KnownFolder::Downloads => &FOLDERID_Downloads,
+        KnownFolder::Videos => &FOLDERID_Videos,
+        KnownFolder::Music => &FOLDERID_Music,
     };
 
     unsafe {
@@ -279,6 +314,8 @@ fn platform_known_folder(folder: KnownFolder) -> Option<PathBuf> {
         KnownFolder::Desktop => "Desktop",
         KnownFolder::Pictures => "Pictures",
         KnownFolder::Downloads => "Downloads",
+        KnownFolder::Videos => "Videos",
+        KnownFolder::Music => "Music",
     };
     userprofile_child(name)
 }
@@ -319,12 +356,14 @@ mod tests {
     #[test]
     fn clipboard_capture_location_is_main_only_and_either_switch_enables_it() {
         let mut settings = crate::settings::Settings::default();
-        let shared = super::location_menu_entries_from(&settings, None, None, None, vec![]);
+        let shared =
+            super::location_menu_entries_from(&settings, None, None, None, None, None, vec![]);
         for (image, html) in [(false, false), (true, false), (false, true), (true, true)] {
             settings.clipboard_capture_image_enabled = image;
             settings.clipboard_capture_html_enabled = html;
             settings.clipboard_capture_output_dir = Some(PathBuf::from("C:/clipboard"));
-            let remote = super::location_menu_entries_from(&settings, None, None, None, vec![]);
+            let remote =
+                super::location_menu_entries_from(&settings, None, None, None, None, None, vec![]);
             assert_eq!(
                 remote, shared,
                 "Remote locations must not depend on capture switches"
@@ -390,6 +429,8 @@ mod tests {
             Some(PathBuf::from(r"C:\Users\me\Desktop")),
             Some(PathBuf::from(r"C:\Users\me\Pictures")),
             Some(PathBuf::from(r"C:\Users\me\Downloads")),
+            Some(PathBuf::from(r"C:\Users\me\Videos")),
+            Some(PathBuf::from(r"C:\Users\me\Music")),
             vec![PathBuf::from(r"C:\"), PathBuf::from(r"D:\")],
         );
         assert_eq!(
@@ -415,6 +456,14 @@ mod tests {
                     label: "ダウンロード",
                     path: PathBuf::from(r"C:\Users\me\Downloads"),
                 }),
+                LocationMenuEntry::QuickLocation(QuickLocation {
+                    label: "ビデオ",
+                    path: PathBuf::from(r"C:\Users\me\Videos"),
+                }),
+                LocationMenuEntry::QuickLocation(QuickLocation {
+                    label: "ミュージック",
+                    path: PathBuf::from(r"C:\Users\me\Music"),
+                }),
                 LocationMenuEntry::Separator,
                 LocationMenuEntry::DriveRoot(PathBuf::from(r"C:\")),
                 LocationMenuEntry::DriveRoot(PathBuf::from(r"D:\")),
@@ -437,6 +486,8 @@ mod tests {
             Some(duplicate.clone()),
             None,
             Some(duplicate.clone()),
+            None,
+            Some(duplicate.clone()),
             vec![PathBuf::from(r"C:\")],
         );
         assert_eq!(
@@ -453,11 +504,24 @@ mod tests {
     }
 
     #[test]
+    fn missing_quick_locations_do_not_leave_a_separator() {
+        let settings = Settings {
+            show_location_drive_roots: false,
+            ..Settings::default()
+        };
+        let entries = location_menu_entries_from(&settings, None, None, None, None, None, vec![]);
+        assert!(!entries.iter().any(|entry| matches!(
+            entry,
+            LocationMenuEntry::Separator | LocationMenuEntry::QuickLocation(_)
+        )));
+    }
+
+    #[test]
     fn every_location_setting_removes_its_shared_menu_entry() {
         type DisableSetting = fn(&mut Settings);
         type MatchesEntry = fn(&LocationMenuEntry) -> bool;
 
-        let cases: [(&str, DisableSetting, MatchesEntry); 8] = [
+        let cases: [(&str, DisableSetting, MatchesEntry); 10] = [
             (
                 "show_location_drive_list",
                 |settings| settings.show_location_drive_list = false,
@@ -494,6 +558,16 @@ mod tests {
                 |entry| matches!(entry, LocationMenuEntry::QuickLocation(location) if location.label == "ダウンロード"),
             ),
             (
+                "show_location_videos",
+                |settings| settings.show_location_videos = false,
+                |entry| matches!(entry, LocationMenuEntry::QuickLocation(location) if location.label == "ビデオ"),
+            ),
+            (
+                "show_location_music",
+                |settings| settings.show_location_music = false,
+                |entry| matches!(entry, LocationMenuEntry::QuickLocation(location) if location.label == "ミュージック"),
+            ),
+            (
                 "show_location_drive_roots",
                 |settings| settings.show_location_drive_roots = false,
                 |entry| matches!(entry, LocationMenuEntry::DriveRoot(_)),
@@ -507,6 +581,8 @@ mod tests {
                 Some(PathBuf::from(r"C:\Users\me\Desktop")),
                 Some(PathBuf::from(r"C:\Users\me\Pictures")),
                 Some(PathBuf::from(r"C:\Users\me\Downloads")),
+                Some(PathBuf::from(r"C:\Users\me\Videos")),
+                Some(PathBuf::from(r"C:\Users\me\Music")),
                 vec![PathBuf::from(r"C:\")],
             );
             assert!(
@@ -520,11 +596,70 @@ mod tests {
                 Some(PathBuf::from(r"C:\Users\me\Desktop")),
                 Some(PathBuf::from(r"C:\Users\me\Pictures")),
                 Some(PathBuf::from(r"C:\Users\me\Downloads")),
+                Some(PathBuf::from(r"C:\Users\me\Videos")),
+                Some(PathBuf::from(r"C:\Users\me\Music")),
                 vec![PathBuf::from(r"C:\")],
             );
             assert!(
                 !hidden.iter().any(matches_entry),
                 "{name} must hide the shared entry"
+            );
+        }
+    }
+
+    #[test]
+    fn known_folder_resolution_prefers_redirect_and_falls_back_only_to_existing_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let redirected = temp.path().join("redirected");
+        let fallback = temp.path().join("fallback");
+        let file = temp.path().join("file");
+        let missing = temp.path().join("missing");
+        std::fs::create_dir(&redirected).unwrap();
+        std::fs::create_dir(&fallback).unwrap();
+        std::fs::write(&file, b"not a directory").unwrap();
+        assert_eq!(
+            super::existing_folder_or_fallback(Some(redirected.clone()), || {
+                panic!("a valid Known Folder must not use USERPROFILE")
+            }),
+            Some(redirected)
+        );
+        for known in [None, Some(missing.clone()), Some(file.clone())] {
+            assert_eq!(
+                super::existing_folder_or_fallback(known.clone(), || Some(fallback.clone())),
+                Some(fallback.clone())
+            );
+            for fallback in [None, Some(missing.clone()), Some(file.clone())] {
+                assert_eq!(
+                    super::existing_folder_or_fallback(known.clone(), || fallback),
+                    None
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn media_known_folders_match_windows_shell_and_existing_fallbacks() {
+        use windows::Win32::System::Com::CoTaskMemFree;
+        use windows::Win32::UI::Shell::{
+            FOLDERID_Music, FOLDERID_Videos, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
+        };
+        for (id, name, resolved) in [
+            (FOLDERID_Videos, "Videos", super::videos_dir()),
+            (FOLDERID_Music, "Music", super::music_dir()),
+        ] {
+            let known = unsafe {
+                SHGetKnownFolderPath(&id, KF_FLAG_DEFAULT, None)
+                    .ok()
+                    .and_then(|value| {
+                        let path = value.to_string().ok().map(PathBuf::from);
+                        CoTaskMemFree(Some(value.0 as *const core::ffi::c_void));
+                        path
+                    })
+            };
+            assert_eq!(
+                resolved,
+                super::existing_folder_or_fallback(known, || super::userprofile_child(name))
             );
         }
     }
@@ -653,7 +788,7 @@ mod tests {
         use crate::settings::FileOrganizeDestination;
         let mut settings = Settings::default();
         let entries = |settings: &Settings| {
-            location_menu_entries_from(settings, None, None, None, Vec::new())
+            location_menu_entries_from(settings, None, None, None, None, None, Vec::new())
         };
         let is_destinations = |entry: &LocationMenuEntry| {
             matches!(entry, LocationMenuEntry::FileOrganizeDestinations { .. })

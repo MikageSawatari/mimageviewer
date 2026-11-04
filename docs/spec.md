@@ -479,12 +479,15 @@ Windows でのダブルクリック判定間隔はアプリ起動時の Windows 
   `Ctrl+↑/↓` と `Ctrl+PageUp/PageDown` は実フォルダ DFS へ落とさず no-op にする。
   展開後は `スタック` トグルでフォルダをまたいだ一覧を親フォルダ単位のスタック集約にできる
 - **場所▼ メニュー**: ドライブ一覧 / 閲覧履歴 / ブックマーク / レーティング / 本棚フォルダ / 整理先 / デスクトップ /
-  ピクチャ / ダウンロード / 利用可能なドライブ (`C:\` など) へ移動する。
+  ピクチャ / ダウンロード / ビデオ / ミュージック / 利用可能なドライブ (`C:\` など) へ移動する。
+  既知フォルダはこの順で表示し、取得不能・実在しない場合は USERPROFILE 配下へ
+  フォールバックする。それも無ければ非表示。同一パスの重複は先の項目を残す。
   既知フォルダは Windows Known Folder API を優先し、
   OneDrive やリダイレクトされた Desktop に追従する。検索中と ★固定中は disabled。
   場所▼ボタンまたはフォルダバー左端の `フォルダ:` ラベルを右クリックすると、
   場所▼に表示する項目 (ドライブ一覧 / 閲覧履歴 / 本棚フォルダ / 整理先 / レーティング /
-  デスクトップ / ピクチャ / ダウンロード / 各ドライブ) を切り替えられる。
+  デスクトップ / ピクチャ / ダウンロード / ビデオ / ミュージック / 各ドライブ) を切り替えられる。
+  この設定メニューは見出しを固定し、高さが足りない場合だけ本文をスクロールする。
   整理先の表示チェックは環境設定「フォルダ・ファイル」の登録欄でも編集でき、OK／Cancel に従う。
   「整理先 ▶」は登録順の名称を表示し、パスを tooltip で確認できる。登録なし／表示 OFF なら非表示。
   多件数は高さ制限つきサブメニュー内でスクロールする。ホイールを背面一覧へ通さない。
@@ -2761,7 +2764,7 @@ typed event の送信だけを行い、前面化しない。受付できない�
 | `show_address_bar_favorite_button` | bool | true | フォルダバーにお気に入り追加/設定 (♡/♥) を表示 |
 | `show_address_bar_history_menu` | bool | true | フォルダバーに最近開いたフォルダ履歴メニューを表示 |
 | `show_address_bar_folder_pin` | bool | true | フォルダバーに代表サムネ固定 (📌) を表示 |
-| `show_location_{drive_list,reading_history,rating,bookshelf,file_organize_destinations,desktop,pictures,downloads,drive_roots}` | bool | true | フォルダバーの場所▼に表示する項目を個別に切り替える。フォルダバー左端の `フォルダ:` ラベルまたは場所▼を右クリックして変更。整理先は環境設定の登録欄でも変更できる |
+| `show_location_{drive_list,reading_history,rating,bookshelf,file_organize_destinations,desktop,pictures,downloads,videos,music,drive_roots}` | bool | true | フォルダバーの場所▼に表示する項目を個別に切り替える。フォルダバー左端の `フォルダ:` ラベルまたは場所▼を右クリックして変更。整理先は環境設定の登録欄でも変更できる。Remote Homeにも反映し、旧設定で欠けた項目は表示ON |
 | `show_toolbar_rating` | bool | true | ツールバーにレーティング（★）フィルタを表示 |
 | `show_toolbar_cols` / `show_toolbar_aspect` / `show_toolbar_sort` | bool | true（ソートの生成・リセット既定は false、旧設定の省略は true） | ツールバーに列 / 比率 / ソートセクションを表示 (v2.0.0)。空き領域右クリックで切替。項目が無くてもセクションのラベルは残す |
 | `show_facet_sort` | bool | true（旧設定の省略は false） | 絞り込みバー右側の独立したソートドロップダウン。上部表示とは独立、ソート状態と候補は共通。生成・リセット既定は ON、上部ソートは OFF。旧設定の省略時は OFF を維持する |

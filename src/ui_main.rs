@@ -12674,6 +12674,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         s.show_location_desktop = true;
         s.show_location_pictures = true;
         s.show_location_downloads = true;
+        s.show_location_videos = true;
+        s.show_location_music = true;
         s.show_location_drive_roots = true;
         // 並び順 / 行頭 / ドラッグ許可
         s.toolbar_section_order = Vec::new();
@@ -13003,6 +13005,39 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
     fn draw_folder_bar_settings_menu(&mut self, ui: &mut egui::Ui) {
         draw_sticky_settings_menu_header(ui, "フォルダバー", true);
         ui.separator();
+        let max_height = (ui.ctx().content_rect().bottom()
+            - ui.cursor().top()
+            - egui::Frame::popup(ui.style()).total_margin().bottom)
+            .max(0.0);
+        // Popup Area starts with a provisional height. Give the scroll parent the
+        // actual screen budget, then let its natural content height shrink it.
+        let body_rect = egui::Rect::from_min_size(
+            ui.cursor().min,
+            egui::vec2(ui.available_width(), max_height),
+        );
+        let output = ui
+            .scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
+                ui.spacing_mut().scroll.floating_allocated_width =
+                    ui.spacing().scroll.bar_inner_margin + ui.spacing().scroll.bar_width;
+                egui::ScrollArea::vertical()
+                    .id_salt("folder_bar_settings_body")
+                    .max_height(max_height)
+                    .auto_shrink([true, true])
+                    .show(ui, |ui| self.draw_folder_bar_settings_contents(ui))
+            })
+            .inner;
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                egui::Id::unique("folder_bar_settings_scroll_layout"),
+                crate::test_ui::scroll_layout::ScrollLayout::from_output(&output),
+            );
+        });
+        let _ = output;
+        consume_wheel_input(ui.ctx());
+    }
+
+    fn draw_folder_bar_settings_contents(&mut self, ui: &mut egui::Ui) {
         let mut changed = false;
         changed |= ui
             .checkbox(
@@ -13106,6 +13141,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             .changed();
         changed |= ui
             .checkbox(&mut self.settings.show_location_downloads, "ダウンロード")
+            .changed();
+        changed |= ui
+            .checkbox(&mut self.settings.show_location_videos, "ビデオ")
+            .changed();
+        changed |= ui
+            .checkbox(&mut self.settings.show_location_music, "ミュージック")
             .changed();
         changed |= ui
             .checkbox(&mut self.settings.show_location_drive_roots, "各ドライブ")
@@ -16142,8 +16183,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     crate::known_folders::LocationMenuEntry::QuickLocation(
                                         location,
                                     ) => {
-                                        let full = location.path.to_string_lossy().to_string();
-                                        if ui.button(location.label).hover_tip(&full).clicked() {
+                                        if crate::ui_toolbar_layout::quick_location_button(ui, &location).clicked() {
                                             if let Some(resolved) =
                                                 resolve_folder_bar_nav_path(&location.path)
                                             {
@@ -34486,6 +34526,8 @@ mod section207_tests {
         env.settings.show_location_desktop = false;
         env.settings.show_location_pictures = false;
         env.settings.show_location_downloads = false;
+        env.settings.show_location_videos = false;
+        env.settings.show_location_music = false;
         env.settings.show_location_drive_roots = false;
         env.settings.file_organize_destinations = vec![
             FileOrganizeDestination {
@@ -34566,6 +34608,8 @@ mod section207_tests {
         env.settings.show_location_desktop = false;
         env.settings.show_location_pictures = false;
         env.settings.show_location_downloads = false;
+        env.settings.show_location_videos = false;
+        env.settings.show_location_music = false;
         env.settings.show_location_drive_roots = false;
         env.settings.file_organize_destinations = (0..100)
             .map(|index| crate::settings::FileOrganizeDestination {
@@ -34659,6 +34703,75 @@ mod section207_tests {
     }
 
     #[test]
+    fn folder_bar_settings_menu_keeps_last_control_reachable() {
+        use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+        for (height, expected) in [
+            (614.0, HeightExpectation::Scrolls),
+            (900.0, HeightExpectation::Fits),
+        ] {
+            let mut app = crate::app::setup_app_for_test();
+            let wheel_after = Rc::new(Cell::new(false));
+            let observed = Rc::clone(&wheel_after);
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_max_steps(8)
+                .with_size(egui::vec2(480.0, height))
+                .build_ui(move |ui| {
+                    let response = ui.button("設定を開く");
+                    show_sticky_context_menu(&response, |ui| app.draw_folder_bar_settings_menu(ui));
+                    observed.set(ui.ctx().input(|input| {
+                        input
+                            .events
+                            .iter()
+                            .any(|event| matches!(event, egui::Event::MouseWheel { .. }))
+                    }));
+                });
+            harness.run();
+            harness.get_by_label("設定を開く").click_secondary();
+            harness.run();
+            let layout = |ctx: &egui::Context| {
+                ctx.data(|data| {
+                    data.get_temp::<ScrollLayout>(egui::Id::unique(
+                        "folder_bar_settings_scroll_layout",
+                    ))
+                })
+                .unwrap()
+            };
+            let before = layout(&harness.ctx);
+            before.assert_height(
+                expected,
+                harness.ctx.content_rect(),
+                harness.ctx.pixels_per_point(),
+            );
+            harness.hover_at(before.inner.center());
+            harness.event(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -10000.0),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+            });
+            harness.step();
+            assert!(
+                !wheel_after.get(),
+                "settings menu wheel must not reach the grid"
+            );
+            harness.run();
+            if matches!(expected, HeightExpectation::Scrolls) {
+                layout(&harness.ctx).assert_scrolled_to_end(before, harness.ctx.pixels_per_point());
+            }
+            let last = harness.get_by_label("フォルダバーを隠す").rect();
+            assert!(harness.ctx.content_rect().contains_rect(last));
+            harness.get_by_label("フォルダバーを隠す").click();
+            harness.run();
+            assert!(
+                harness.query_by_label("ミュージック").is_none(),
+                "last control must close the popup"
+            );
+        }
+    }
+
+    #[test]
     fn file_organize_destinations_location_toggle_snapshot() {
         let env = crate::app::setup_app_for_test();
         let app = Rc::new(RefCell::new(env));
@@ -34692,7 +34805,15 @@ mod section207_tests {
         let persisted: crate::settings::Settings =
             serde_json::from_str(&serde_json::to_string(&app.borrow().settings).unwrap()).unwrap();
         assert!(!persisted.show_location_file_organize_destinations);
+        for label in ["ビデオ", "ミュージック"] {
+            harness.get_by_label(label).click();
+            harness.run();
+        }
+        assert!(!app.borrow().settings.show_location_videos);
+        assert!(!app.borrow().settings.show_location_music);
         app.borrow_mut().reset_toolbar_customization();
+        assert!(app.borrow().settings.show_location_videos);
+        assert!(app.borrow().settings.show_location_music);
         assert!(
             app.borrow()
                 .settings

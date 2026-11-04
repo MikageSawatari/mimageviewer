@@ -28,6 +28,46 @@
 use egui_kittest::kittest::NodeT;
 use egui_kittest::{Harness, kittest::Queryable};
 
+#[test]
+fn folder_location_menu_dark() {
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        "folder_location_menu_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::Standard,
+        egui::vec2(260.0, 230.0),
+        |ui| {
+            mimageviewer::ui_toolbar_layout::folder_menu_button(ui, true, "場所▼", |ui| {
+                for (label, folder) in [
+                    ("デスクトップ", "Desktop"),
+                    ("ピクチャ", "Pictures"),
+                    ("ダウンロード", "Downloads"),
+                    ("ビデオ", "Videos"),
+                    ("ミュージック", "Music"),
+                ] {
+                    let location = mimageviewer::known_folders::QuickLocation {
+                        label,
+                        path: std::path::PathBuf::from("C:/Users/example").join(folder),
+                    };
+                    mimageviewer::ui_toolbar_layout::quick_location_button(ui, &location);
+                }
+            });
+        },
+        |harness| {
+            harness.get_by_label("場所▼").click();
+            harness.run();
+            for label in [
+                "デスクトップ",
+                "ピクチャ",
+                "ダウンロード",
+                "ビデオ",
+                "ミュージック",
+            ] {
+                assert!(harness.query_by_label(label).is_some());
+            }
+        },
+    );
+}
+
 fn agent_integration_snapshot(name: &str, theme: mimageviewer::os_theme::ResolvedTheme, level: u8) {
     snapshot_with_theme_at_size(name, theme, egui::vec2(1000.0, 1150.0), None, move |ui| {
         mimageviewer::draw_agent_integration_snapshot_fixture(ui, level)

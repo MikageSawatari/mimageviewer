@@ -38,6 +38,33 @@
 
 ## 1. 優先候補
 
+### 1.704 場所▼へビデオ・ミュージックを追加 (2026-11-04、v5.0.0)
+
+- 利用者の観測: ツールバーの場所▼にビデオとミュージックが無い。
+- 実装: `FOLDERID_Videos` / `FOLDERID_Music` を既存の Known Folder 解決へ追加。デスクトップ・ピクチャ・ダウンロード・ビデオ・ミュージックの順。取得失敗・実在しない既知フォルダは USERPROFILE 配下へ落とし、それも無ければ出さない。同一パスは先の項目を残す。
+- 利用箇所の監査（8系統）:
+
+  | 箇所 | 判断 |
+  | --- | --- |
+  | 本体フォルダバーの場所▼ | 追加。共通 `location_menu_entries` を使い、既存の直接移動経路へ渡す |
+  | 場所▼／フォルダ: 右クリックの表示設定・ツールバー初期化 | 追加。個別ON/OFFと既定ONへの初期化。環境設定OK時の非環境設定値の引継ぎも追加 |
+  | ゲームパッドの場所選択一覧 | `quick_locations` 経由で追加。既存どおり場所▼の非表示設定から独立 |
+  | フォルダバーの履歴候補・パス入力 | 変更なし。既知フォルダ列挙の利用者ではなく、訪問履歴・入力pathを使う。履歴へ未訪問の場所を注入しない |
+  | Remote Homeの場所 | 共通列挙経由で追加。本体の表示設定・順序に従う。既存FolderレスポンスのためIPC形式は不変 |
+  | MCPの場所／ライブラリ | 変更なし。既知フォルダの場所一覧は存在せず、`list_library` はお気に入り・閲覧履歴・本棚・ブックマーク・評価の5種。新APIや索引対象は追加しない |
+  | 環境設定の起動時フォルダ選択・起動resolver | 変更なし。既定Previous、Desktopへのfallback、指定フォルダと全5種の保存enumを維持。ビデオ／ミュージックは既存の指定フォルダで指定可能 |
+  | キー／リング／マウス／パッドの場所への一発操作・保存先既定 | 変更なし。今回の範囲は選択一覧の追加で、既存の割当・ピクチャ配下の本棚／capture等の意味を変えない |
+
+- 永続データ: 新規bool `show_location_videos` / `show_location_music` のみ追加。欠落はtrue。既存enum・SQLite schemaを変更しない。v4.11.0タグの保存名を照合し、既存5種の起動設定・表示OFF・pathを保つ回帰と、新規値の引継ぎ／往復保存を追加。
+- 設計: 新しい非同期状態や割り込みの組合せを作らず、既存の解決・描画・移動をそのまま使う。走査・decode・worker追加なし。まれな失敗は既存の取得失敗時処理に従う。表示設定の2行追加により700pt高では既存の末尾操作がはみ出すため、見出しを固定し本文だけ高さ制限つきScrollAreaに入れる。末尾の「フォルダバーを隠す」とwheel非伝播を小画面で、不要なscrollが出ないことを十分な高さで検査する。
+- ドライブ専用の一覧（本体・フォルダツリー・Remote）は `available_drives` の利用者で、既知フォルダの列挙ではないため不変。
+- 自動検証: core check、関連nextest 23件、対象integration snapshotの通常比較1件、`cargo fmt`／`cargo fmt --check`、UI glyph 0件、サイトカード52件・超過0件が成功。PNGは新規 `folder_location_menu_dark`（260×230）と既存の設定メニュー1枚（480×700）だけを生成・目視し、設定の切替・保存・既定への初期化も検査した。
+- 本体lib全件は16,264件実行、16,261成功・3失敗・71 skip（863.835秒）。ログ: `target/test-lib-full/runs/20261104T111712671Z-cb4bc596/`。全件成功とは扱わない。
+- うち分類件数の1件は、この変更で増えた2項目のテスト更新漏れ。486→488／除外331→333に修正し、`test-focused.ps1 -Path src/settings_transfer.rs` の設定転送module全35件が成功（`target/test-focused/runs/20261104T113152650Z-76698746/`）。最後の修正はテストの件数だけなので、他の16,261件の成功結果と関連23件・PNG比較を再利用する。再度の `cargo fmt`／`cargo fmt --check` と `git diff --check` も成功。
+- 残る2件は未変更の `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry` と `agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers` で、名前付きパイプの接続／fixture作成時にOS error 5（アクセス拒否）。本実行環境での失敗として記録し、原因の追加切り分けとMCP製品コードの変更は行わない。
+- 検証用build: `build-dev.ps1 -PreserveRuntime` が成功。normal feature setのcore・Remote・EPUB worker・MCP adapter・音楽ビデオeditorを `target/dev-runtime/` に作成し、VC runtime／PE検査も成功（runtime=4、pe=5）。製品は起動していない。確認は場所5項目の順、ビデオ／ミュージックへの移動、右クリックの個別ON/OFF。通常 `%APPDATA%\mimageviewer` を使い実設定・データを更新し得るため、利用者がインストール版／常駐tray版を終了してから `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe` で起動する。
+- 製品は起動せず、実機での移動確認と設計担当の検収は未実施。CHANGELOGは設計担当が更新する。
+
 ### 1.698 v5 受入 A: フォルダ移動後に見えない現在地フィルタが残る (2026-11-04)
 
 - 観測: サブPC担当 `C:\miv-subpc\results-11\<部>\notes.md`、利用者の実装指示に引用された結果。移動元のindex 2だけが移動先12件でも表示され、×で全件に戻る。v4.11.0にもある不具合。

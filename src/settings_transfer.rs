@@ -582,6 +582,8 @@ preferences_policy! {
         show_location_desktop => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_location_pictures => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_location_downloads => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        show_location_videos => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        show_location_music => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_location_drive_roots => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         use_native_shell_context_menu => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         ring_shortcuts => "既存の操作カスタマイズ共有が正本";
@@ -2022,7 +2024,7 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 486);
+        assert_eq!(entries.len(), 488);
         assert_eq!(
             entries
                 .iter()
@@ -2035,7 +2037,7 @@ mod tests {
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            331
+            333
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
