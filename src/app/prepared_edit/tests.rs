@@ -651,6 +651,90 @@ fn local_conceal_final_and_comic_use_the_same_cumulative_cpu_chain() {
 }
 
 #[test]
+fn prepared_edit_original_source_acceptance_unblocks_all_stages_after_erase() {
+    let ctx = egui::Context::default();
+    let mut app = app(&ctx);
+    // The paint-only fixture seeds sources directly after changing its scalar
+    // generation. This handler test must also initialize the load/cache owners.
+    let sources = app.fs_cache.drain().collect::<Vec<_>>();
+    let generation = app.items_generation;
+    app.set_items_generation(generation);
+    for (idx, source) in sources {
+        app.fs_cache.insert(idx, source);
+    }
+    local(&mut app, 1, true);
+    annotation(&mut app, 1);
+    app.conceal_pages.insert(1);
+    app.mask_pages.insert(1);
+    let page_key = app.page_path_key(1).unwrap();
+    app.mask_page_keys.insert(page_key.clone());
+    app.mask_db = Some(crate::mask_db::MaskDb::open().unwrap());
+    let pixels = app.current_raw_source_pixels(1).unwrap();
+    let [w, h] = pixels.size;
+    let mut mask = vec![false; w * h];
+    mask[0] = true;
+    app.mask_db
+        .as_ref()
+        .unwrap()
+        .set(&page_key, &mask, &[], w, h)
+        .unwrap();
+    let conceal_db = crate::conceal_db::ConcealDb::open().unwrap();
+    conceal_db.set(&page_key, &mask, &[], w, h).unwrap();
+    drop(conceal_db);
+    app.ai_runtime_init = crate::ai::runtime::AiRuntimeInitOwner::failed_for_test("B erase input");
+    app.fs_cache.remove(&1);
+    assert!(app.prepared_edit_input(1).is_none());
+    let generation = app.items_generation;
+    app.fs_upload_backlog.push_for_generation(
+        generation,
+        FsUploadResult::new(
+            1,
+            FsLoadResult::Static {
+                ci: pixels.as_ref().clone(),
+                source_dims: [w, h],
+                animation: StaticAnimationState::Still,
+            },
+            91,
+            FsLoadPurpose::Original {
+                entry: OriginalMaterialEntry::MaterialOnly,
+            },
+        ),
+    );
+    app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+    assert!(
+        app.current_raw_source_pixels(1).is_some(),
+        "source must be accepted before checking its producer"
+    );
+    assert!(app.commit_pending_matches_current_erase_key(1));
+    assert!(
+        app.prepared_edit_input(1).is_none(),
+        "B must wait for exact erase"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !app.erase_inpaint_pending.is_empty() {
+        app.poll_erase_inpaint(&ctx);
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let input = app
+        .prepared_edit_input(1)
+        .expect("Original purpose must not block B");
+    assert!(matches!(input.stage, InputStage::Erase));
+    assert!(input.local.is_some() && input.conceal.is_some() && input.comic.is_some());
+    assert!(Arc::ptr_eq(
+        &input.source,
+        &app.current_erase_result_pixels(1).unwrap()
+    ));
+    let key = ready(&mut app, &ctx, input);
+    app.resolve_prepared_edit_for_display(&ctx, 1);
+    assert!(app.local_adjust_is_materialized(1));
+    assert!(app.conceal_cache.contains_key(&1));
+    assert!(app.final_composite_cache[&key].complete);
+    assert!(app.comic_cache.contains_key(&1));
+    assert_eq!(app.page_turn_resident_quality_for_test(1), Some("comic"));
+}
+
+#[test]
 fn font_requirements_include_name_plate_and_recheck_when_loaded_keys_change() {
     let fonts = Some(Arc::new(comic_core::FontSet::new()));
     let mut window = comic_core::MessageWindowObject::default();

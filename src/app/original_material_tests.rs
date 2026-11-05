@@ -6,6 +6,315 @@ use super::composite_pixels_revision_tests::{
 use super::*;
 use crate::page_dims::{CanonicalPageDimensions, PagePixelDimensions};
 
+/// The real legacy AI prefetch handler issues Original/MaterialOnly for every
+/// missing input before any AI job can start. Feed deterministic decoder results
+/// through its existing pending/upload owner; no PDF process or GPU AI is needed.
+#[test]
+fn erase_prefetch_original_sources_start_saved_stage_before_page_turn() {
+    let ctx = egui::Context::default();
+    let mut app = super::paged_prefetch_tests::pdf_book(&ctx);
+    app.fullscreen_idx = Some(0);
+    app.spread_mode = crate::settings::SpreadMode::Single;
+    app.settings.prefetch_forward = 12;
+    app.settings.ai_upscale_prefetch_forward = 10;
+    app.settings.ai_feature_mode = crate::settings::AiFeatureMode::HighQuality;
+    app.settings.ai_upscale_enabled = false; // obsolete flag does not gate this handler
+    app.settings.global_preset.upscale_model = Some("realesr_general_v3".into());
+    app.settings.global_preset.post_filter = crate::adjustment::PostFilter::UpscaleAnime;
+    // Like the reported 2376px-wide raster exceeding the configured 2048px
+    // short-edge limit: once resident, AI's size gate no longer asks edit ensure.
+    app.settings.ai_upscale_size_limit = Some(crate::ai::upscale::AiProcessSizeLimit {
+        long_edge_px: 4,
+        short_edge_px: 2,
+    });
+    app.viewer_navigation_caches.invalidate();
+    app.ai_runtime_init =
+        crate::ai::runtime::AiRuntimeInitOwner::failed_for_test("erase regression uses diffusion");
+    app.mask_db = Some(crate::mask_db::MaskDb::open().unwrap());
+    for idx in 1..=10 {
+        app.fs_cache.remove(&idx);
+        // Exercise the shared handler with disposable still files so the real
+        // demand cannot launch a PDF worker before deterministic completion.
+        let path = app.tmp.path().join(format!("erase-prefetch-{idx}.png"));
+        image::RgbaImage::from_pixel(4, 6, image::Rgba([0, 0, 255, 255]))
+            .save(&path)
+            .unwrap();
+        app.items[idx] = GridItem::Image(path);
+        let page_key = app.page_path_key(idx).unwrap();
+        let mut mask = vec![false; 24];
+        mask[9] = true;
+        app.mask_db
+            .as_ref()
+            .unwrap()
+            .set(&page_key, &mask, &[], 4, 6)
+            .unwrap();
+        app.mask_pages.insert(idx);
+        app.mask_page_keys.insert(page_key);
+    }
+    app.prefetch_final_ai(&ctx, 0);
+    assert!(
+        app.final_ai_pending.is_empty(),
+        "missing inputs cannot start AI"
+    );
+    for idx in 1..=10 {
+        let pending = app
+            .fs_pending
+            .remove(&idx)
+            .expect("AI handler must request input");
+        assert_eq!(
+            pending.purpose,
+            FsLoadPurpose::Original {
+                entry: OriginalMaterialEntry::MaterialOnly
+            }
+        );
+        let purpose = pending.purpose;
+        pending.cancel();
+        let generation = app.items_generation;
+        let seq = app.input_seq;
+        app.fs_upload_backlog.push_for_generation(
+            generation,
+            FsUploadResult::new(idx, original_result(), seq, purpose),
+        );
+    }
+    for _ in 0..10 {
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+    }
+    app.prefetch_final_ai(&ctx, 0);
+    for idx in 1..=10 {
+        assert!(app.current_raw_source_pixels(idx).is_some());
+        assert!(
+            app.commit_pending_matches_current_erase_key(idx),
+            "accepted Original source idx={idx} must start saved erase producer"
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !app.erase_inpaint_pending.is_empty() {
+        app.poll_erase_inpaint(&ctx);
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    for idx in 1..=10 {
+        assert!(app.current_erase_result_pixels(idx).is_some());
+        assert_eq!(app.page_turn_resident_quality_for_test(idx), Some("erase"));
+    }
+}
+
+#[test]
+fn erase_prefetch_source_acceptance_is_purpose_independent_and_idempotent() {
+    for purpose in [
+        FsLoadPurpose::Display,
+        FsLoadPurpose::Prefetch,
+        FsLoadPurpose::Original {
+            entry: OriginalMaterialEntry::MaterialOnly,
+        },
+        FsLoadPurpose::ResumeAfterNormalLoad {
+            normal: FsNormalLoadPurpose::Prefetch,
+            entry: OriginalMaterialEntry::MaterialOnly,
+        },
+        FsLoadPurpose::ResumeAfterNormalLoad {
+            normal: FsNormalLoadPurpose::Display,
+            entry: OriginalMaterialEntry::MaterialOnly,
+        },
+        FsLoadPurpose::AnimationPromotion {
+            target_idx: 0,
+            started_at: Instant::now(),
+        },
+        FsLoadPurpose::ResumeAfterNormalLoad {
+            normal: FsNormalLoadPurpose::AnimationPromotion {
+                target_idx: 0,
+                started_at: Instant::now(),
+            },
+            entry: OriginalMaterialEntry::MaterialOnly,
+        },
+    ] {
+        let ctx = egui::Context::default();
+        let (mut app, final_key) = completed_only(&ctx);
+        app.ai_runtime_init =
+            crate::ai::runtime::AiRuntimeInitOwner::failed_for_test("erase acceptance");
+        let page_key = app.page_path_key(0).unwrap();
+        let mut mask = vec![false; 24];
+        mask[9] = true;
+        app.mask_db = Some(crate::mask_db::MaskDb::open().unwrap());
+        app.mask_db
+            .as_ref()
+            .unwrap()
+            .set(&page_key, &mask, &[], 4, 6)
+            .unwrap();
+        app.mask_pages.insert(0);
+        app.mask_page_keys.insert(page_key);
+        let before = app.current_edit_result_key(0);
+        let final_pixels = Arc::clone(&app.final_composite_cache[&final_key].pixels);
+        let final_texture = app.final_composite_cache[&final_key].texture.id();
+        let result = if purpose.promotion_started_at_for(0).is_some() {
+            FsLoadResult::Animated(vec![(
+                egui::ColorImage::filled([4, 6], egui::Color32::BLUE),
+                0.1,
+            )])
+        } else {
+            let mut result = original_result();
+            if let FsLoadResult::Static { ci, .. } = &mut result {
+                ci.pixels[0] = egui::Color32::TRANSPARENT;
+            }
+            result
+        };
+        let generation = app.items_generation;
+        app.fs_upload_backlog
+            .push_for_generation(generation, FsUploadResult::new(0, result, 99, purpose));
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+        assert!(
+            app.commit_pending_matches_current_erase_key(0),
+            "{purpose:?}"
+        );
+        let pending_key = crate::ui_erase::EraseInpaintPendingKey {
+            idx: 0,
+            kind: crate::ui_erase::EraseInpaintKind::Commit,
+        };
+        let cancel = app.erase_inpaint_pending[&pending_key].cancel.clone();
+        // An editor may have joined before a duplicate source notification.
+        let continuation = crate::ui_erase::EraseInpaintPurpose::MaterializeForEntry {
+            entry: OriginalMaterialEntry::AutoCrop,
+        };
+        app.erase_inpaint_pending
+            .get_mut(&pending_key)
+            .unwrap()
+            .purpose = continuation;
+        app.auto_apply_saved_mask(&ctx, 0);
+        assert!(Arc::ptr_eq(
+            &cancel,
+            &app.erase_inpaint_pending[&pending_key].cancel
+        ));
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert_eq!(
+            app.erase_inpaint_pending[&pending_key].purpose,
+            continuation
+        );
+        app.erase_inpaint_pending
+            .get_mut(&pending_key)
+            .unwrap()
+            .purpose = crate::ui_erase::EraseInpaintPurpose::MaterializeForEntry {
+            entry: OriginalMaterialEntry::MaterialOnly,
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !app.erase_inpaint_pending.is_empty() {
+            app.poll_erase_inpaint(&ctx);
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let pixels = app.current_erase_result_pixels(0).unwrap();
+        if !app.fs_entry_is_animated(0) {
+            assert_eq!(
+                app.current_raw_source_pixels(0).unwrap().pixels[0],
+                egui::Color32::TRANSPARENT
+            );
+            assert_eq!(
+                pixels.pixels[0],
+                egui::Color32::BLACK,
+                "Saved worker must flatten transparency before inpaint without mutating raw"
+            );
+        }
+        app.auto_apply_saved_mask(&ctx, 0);
+        assert!(
+            app.erase_inpaint_pending.is_empty(),
+            "completed key must not restart"
+        );
+        assert!(Arc::ptr_eq(
+            &pixels,
+            &app.current_erase_result_pixels(0).unwrap()
+        ));
+        if matches!(purpose, FsLoadPurpose::Original { .. }) {
+            assert_eq!(app.current_edit_result_key(0), before);
+            assert!(Arc::ptr_eq(
+                &final_pixels,
+                &app.final_composite_cache[&final_key].pixels
+            ));
+            assert_eq!(
+                app.final_composite_cache[&final_key].texture.id(),
+                final_texture
+            );
+            assert_eq!(app.page_turn_resident_quality_for_test(0), Some("final"));
+        } else {
+            assert_ne!(app.current_edit_result_key(0).source_gen, before.source_gen);
+            assert!(!app.final_composite_cache.contains_key(&final_key));
+            if !app.fs_entry_is_animated(0) {
+                assert_eq!(app.page_turn_resident_quality_for_test(0), Some("erase"));
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn erase_prefetch_original_acceptance_changes_only_the_owning_context() {
+    let ctx = egui::Context::default();
+    let mut app = setup_app_for_test();
+    app.ai_runtime_init = crate::ai::runtime::AiRuntimeInitOwner::failed_for_test("context erase");
+    let seed = |owner: &mut App| {
+        owner.items = vec![GridItem::Image("C:/erase/same-page.png".into())];
+        owner.mask_pages.insert(0);
+        owner.mask_page_keys.insert(owner.page_path_key(0).unwrap());
+    };
+    let a = app.build_window_context_for_test(71901, seed);
+    let b = app.build_window_context_for_test(71902, seed);
+    let accept = |owner: &mut App| {
+        owner.fs_upload_backlog.push_for_generation(
+            owner.items_generation,
+            FsUploadResult::new(
+                0,
+                original_result(),
+                92,
+                FsLoadPurpose::Original {
+                    entry: OriginalMaterialEntry::MaterialOnly,
+                },
+            ),
+        );
+        owner.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+        assert!(owner.commit_pending_matches_current_erase_key(0));
+    };
+    let pending_key = crate::ui_erase::EraseInpaintPendingKey {
+        idx: 0,
+        kind: crate::ui_erase::EraseInpaintKind::Commit,
+    };
+    app.with_viewer_context(b, accept).unwrap();
+    let before = app
+        .with_viewer_context(b, |owner| {
+            (
+                owner.current_edit_result_key(0),
+                owner.page_turn_gpu_fingerprint_for_test(),
+                owner.fs_pending.len(),
+                owner.erase_inpaint_pending.len(),
+                owner.current_raw_source_pixels(0).unwrap(),
+                owner.erase_inpaint_pending[&pending_key].cancel.clone(),
+            )
+        })
+        .unwrap();
+    app.with_viewer_context(a, accept).unwrap();
+    app.with_viewer_context(b, |owner| {
+        assert_eq!(
+            (
+                owner.current_edit_result_key(0),
+                owner.page_turn_gpu_fingerprint_for_test(),
+                owner.fs_pending.len(),
+                owner.erase_inpaint_pending.len()
+            ),
+            (before.0, before.1.clone(), before.2, before.3)
+        );
+        assert!(Arc::ptr_eq(
+            &owner.current_raw_source_pixels(0).unwrap(),
+            &before.4
+        ));
+        assert!(Arc::ptr_eq(
+            &owner.erase_inpaint_pending[&pending_key].cancel,
+            &before.5
+        ));
+        assert!(
+            !before.5.load(Ordering::Relaxed),
+            "sibling pending must not be cancelled"
+        );
+        assert!(owner.erase_result_cache.is_empty());
+    })
+    .unwrap();
+}
+
 #[test]
 fn source_texture_sharing_survives_source_eviction_and_normal_reload_invalidates() {
     let ctx = egui::Context::default();

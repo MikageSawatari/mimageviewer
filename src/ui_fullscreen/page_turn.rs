@@ -1997,6 +1997,12 @@ impl App {
 
     /// Resident-only counterpart of ordinary processed + fallback selection.
     /// Incomplete final output is displayable; this never invokes a producer.
+    #[cfg(test)]
+    pub(crate) fn page_turn_resident_quality_for_test(&self, idx: usize) -> Option<&'static str> {
+        self.page_turn_resident_source(idx)
+            .map(|(_, quality)| quality)
+    }
+
     fn page_turn_resident_source(
         &self,
         idx: usize,

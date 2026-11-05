@@ -149,6 +149,14 @@ slideshow の still-only unit 計算は表示 cache を置換しない。詳細�
 
 ### 次unitの編集素材の一括準備（§28 段階B、2026-10-28〜29、実装済み・検証結果は別記）
 
+保存済み消しゴムの開始はsource受理境界の`auto_apply_saved_mask`が所有する（§1.719）。
+通常ロード／Original素材取得／RAW現像で共用し、読み込み目的に依存させない。
+現在keyのCommit pending／完成eraseがあれば保持し、同じ入力の実体化完了では上段を失効しない。
+マスク読取・リサイズ・図形展開・黒背景合成と色調判定は既存の`EraseInpaintMaskSource::Saved` workerで行う。
+Originalの完成final保持と通常reloadの世代更新は維持する。段階Bは目的を参照せず、
+必要なeraseの完成後に既存Next ownerから進む。めくり受付は引き続きresident-only。
+観測・原因・検証と製品未確認の範囲は[紙めくり計画§28.8](page-turn-animation-plan.md)を参照。
+
 段階BはON／pagedの現unit提示後、Nextだけで局所補正→隠蔽→final→注釈を先回りして作る。
 完成erase画素を入力にする場合はMI-GANや黒背景合成を再適用しない。after-AIは`used_upscale`に従い、
 注釈はclamp前のfinal正本へ合成する。finalと注釈のupload画素はそれぞれ通常と同じTriangle clampで作る。
