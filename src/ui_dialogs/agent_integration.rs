@@ -707,6 +707,7 @@ fn draw_window(
         egui::Popup::close_all(ctx);
     }
     let mut open = true;
+    let mut close = false;
     let screen = ctx.content_rect();
     egui::Window::new("AI 連携")
         .id(egui::Id::new("agent_integration_dialog"))
@@ -721,8 +722,11 @@ fn draw_window(
         .open(&mut open)
         .show(ctx, |ui| {
             ui.spacing_mut().scroll = panel_scroll_style();
+            let footer = super::startup_dialog_footer_height(ui, &["閉じる"], 6.0);
+            let body_height = (ui.available_height() - footer).max(1.0);
             let output = egui::ScrollArea::vertical()
                 .id_salt("agent_integration_body")
+                .max_height(body_height)
                 .scroll_source(egui::scroll_area::ScrollSource {
                     drag: egui::scroll_area::DragScroll::Always,
                     ..Default::default()
@@ -740,8 +744,12 @@ fn draw_window(
             }
             #[cfg(not(test))]
             let _ = output;
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                close = ui.button("閉じる").clicked();
+            });
         });
-    blocked || state.operation.is_some() || (open && !escape)
+    blocked || state.operation.is_some() || (open && !escape && !close)
 }
 
 fn draw_registration_dialog(
@@ -772,7 +780,6 @@ fn draw_registration_dialog(
         .order(egui::Order::Foreground)
         .default_pos(screen.min + egui::vec2(24.0, 24.0))
         .default_width((screen.width() - 80.0).clamp(160.0, 540.0))
-        .default_height((screen.height() - 100.0).max(100.0))
         .max_size((screen.size() - egui::vec2(48.0, 48.0)).max(egui::vec2(100.0, 100.0)))
         .collapsible(false)
         .resizable(true)
@@ -797,30 +804,18 @@ fn draw_registration_dialog(
                     ui.set_width(ui.available_width());
                     match operation {
                         RegistrationOperation::Confirming { request, .. } => {
+                            ui.add(egui::Label::new(match request.change {
+                                backend::RegistrationChange::Add => "mIV の登録項目 (mimageviewer) を追加します。ほかの設定の値は変えません。",
+                                backend::RegistrationChange::Replace => "mIV の登録項目 (mimageviewer) を、今の mIV の場所に書き換えます。ほかの設定の値は変えません。",
+                                backend::RegistrationChange::Remove => "mIV の登録項目 (mimageviewer) を削除します。ほかの設定の値は変えません。",
+                                backend::RegistrationChange::Unchanged => "登録内容の変更はありません。",
+                            }).wrap());
                             ui.label(format!(
-                                "{} の設定を書き換えます。アプリを終了してから進めてください。",
+                                "{} を終了してから進めてください。",
                                 request.target.name()
                             ));
                             selectable_copy(ui, &request.path.display().to_string());
-                            if request.action == Action::Remove {
-                                ui.label(
-                                    "mimageviewer の登録項目を消します。他の項目は変更しません。",
-                                );
-                            }
-                            if !request.preview.removed.is_empty() {
-                                ui.label("次の内容を削除します。");
-                                selectable_copy(ui, &request.preview.removed);
-                            }
-                            if !request.preview.added.is_empty() {
-                                ui.label("次の内容を登録します。");
-                                selectable_copy(ui, &request.preview.added);
-                            }
-                            if request.preview.removed.is_empty()
-                                && request.preview.added.is_empty()
-                            {
-                                ui.label("登録内容の変更はありません。");
-                            }
-                            ui.label("書き換え前の内容は .mimageviewer.bak に残します。");
+                            ui.label("書き換え前の内容は、同じ場所に .mimageviewer.bak を付けた名前で残します。");
                         }
                         RegistrationOperation::Writing { .. } => {
                             ui.label("設定を書き換えています...");
@@ -883,14 +878,17 @@ fn registration_action_requested(
         || (keyboard_allowed && focus_allows_action && dialog_key)
 }
 
-/// Fixed confirmation preview; no environment capture, filesystem access or workers.
+/// Fixed confirmation summary; no environment capture, filesystem access or workers.
 #[doc(hidden)]
 pub fn draw_agent_registration_snapshot_fixture(ui: &mut egui::Ui) {
     let mut state = AgentIntegrationState::new();
     state.operation = Some(RegistrationOperation::Confirming {
         env: backend::RegistrationEnvironment {
-            local_app_data: None, app_data: None, user_profile: None,
-            codex_home: None, launcher_exe: None,
+            local_app_data: None,
+            app_data: None,
+            user_profile: None,
+            codex_home: None,
+            launcher_exe: None,
             current_exe: r"C:\mImageViewer\mimageviewer-core.exe".into(),
             data_dir: r"C:\mImageViewer\data".into(),
             working_dir: r"C:\mImageViewer".into(),
@@ -899,11 +897,11 @@ pub fn draw_agent_registration_snapshot_fixture(ui: &mut egui::Ui) {
             target: AppTarget::ClaudeDesktop,
             path: r"C:\Users\User\AppData\Roaming\Claude\claude_desktop_config.json".into(),
             action: Action::Register,
-            command: backend::RegistrationCommand { command: String::new(), args: Vec::new() },
-            preview: backend::RegistrationPreview {
-                removed: String::new(),
-                added: "{\n  \"mcpServers\": {\n    \"mimageviewer\": {\n      \"command\": \"C:/mImageViewer/mimageviewer-mcp.exe\"\n    }\n  }\n}".into(),
+            command: backend::RegistrationCommand {
+                command: String::new(),
+                args: Vec::new(),
             },
+            change: backend::RegistrationChange::Add,
         },
         opened_frame: ui.ctx().cumulative_frame_nr(),
     });
@@ -953,7 +951,7 @@ pub fn draw_agent_integration_snapshot_fixture(ui: &mut egui::Ui, level: u8) {
                         r"C:\Users\User\AppData\Roaming\Claude\claude_desktop_config.json",
                     )],
                     message: None,
-                    previews: backend::RegistrationPreviews::from_config(
+                    changes: backend::RegistrationChanges::from_config(
                         AppTarget::ClaudeDesktop,
                         &command.snippet(AppTarget::ClaudeDesktop),
                         Some(&command),
@@ -965,7 +963,7 @@ pub fn draw_agent_integration_snapshot_fixture(ui: &mut egui::Ui, level: u8) {
                     state: RegistrationState::Unregistered,
                     config_paths: vec![PathBuf::from(r"C:\Users\User\.codex\config.toml")],
                     message: None,
-                    previews: backend::RegistrationPreviews::from_config(
+                    changes: backend::RegistrationChanges::from_config(
                         AppTarget::ChatGpt,
                         "",
                         Some(&command),

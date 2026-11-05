@@ -1,5 +1,5 @@
 //! Local ordered JSON representation avoids enabling serde_json/preserve_order globally.
-use super::{Action, AppTarget, RegistrationCommand, RegistrationPreview, RegistrationState};
+use super::{Action, AppTarget, RegistrationChange, RegistrationCommand, RegistrationState};
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -200,6 +200,9 @@ pub(super) fn edit(
             });
             let servers = top[pos].1.object_mut()?;
             let existing = servers.iter().position(|(k, _)| k == "mimageviewer");
+            if existing.is_none() && action == Action::Remove {
+                return Ok(text.into());
+            }
             match action {
                 Action::Remove => {
                     servers.retain(|(k, _)| k != "mimageviewer");
@@ -228,9 +231,28 @@ pub(super) fn edit(
                     }
                 }
             }
-            let mut output =
-                serde_json::to_string_pretty(&root).map_err(|_| "JSON の設定を作れません")?;
-            output.push('\n');
+            let indent = text
+                .lines()
+                .find_map(|line| {
+                    let len = line
+                        .bytes()
+                        .take_while(|b| matches!(*b, b' ' | b'\t'))
+                        .count();
+                    (len > 0 && !line.trim().is_empty()).then_some(&line.as_bytes()[..len])
+                })
+                .unwrap_or(b"  ");
+            let formatter = serde_json::ser::PrettyFormatter::with_indent(indent);
+            let mut serializer = serde_json::Serializer::with_formatter(Vec::new(), formatter);
+            root.serialize(&mut serializer)
+                .map_err(|_| "JSON の設定を作れません")?;
+            let mut output = String::from_utf8(serializer.into_inner())
+                .map_err(|_| "JSON の設定を作れません")?;
+            if text.trim().is_empty() || text.ends_with('\n') {
+                output.push('\n');
+            }
+            if text.contains("\r\n") {
+                output = output.replace('\n', "\r\n");
+            }
             Ok(output)
         }
         AppTarget::ChatGpt => {
@@ -276,35 +298,20 @@ pub(super) fn edit(
     }
 }
 
-pub(super) fn preview(
+pub(super) fn change(
     target: AppTarget,
     text: &str,
     action: Action,
     command: &RegistrationCommand,
-) -> Result<RegistrationPreview, String> {
+) -> Result<RegistrationChange, String> {
     let edited = edit(target, text, action, command)?;
-    Ok(replacement_preview(text, &edited))
-}
-
-/// Trim only whole equal lines so indentation and line endings remain verbatim.
-/// The remaining ranges describe one exact replacement, including any JSON
-/// reformatting done by the editor; no registration block is reconstructed.
-fn replacement_preview(original: &str, edited: &str) -> RegistrationPreview {
-    let before: Vec<_> = original.split_inclusive('\n').collect();
-    let after: Vec<_> = edited.split_inclusive('\n').collect();
-    let prefix = before
-        .iter()
-        .zip(&after)
-        .take_while(|(before, after)| before == after)
-        .count();
-    let suffix = before[prefix..]
-        .iter()
-        .rev()
-        .zip(after[prefix..].iter().rev())
-        .take_while(|(before, after)| before == after)
-        .count();
-    RegistrationPreview {
-        removed: before[prefix..before.len() - suffix].concat(),
-        added: after[prefix..after.len() - suffix].concat(),
-    }
+    Ok(if edited == text {
+        RegistrationChange::Unchanged
+    } else if action == Action::Remove {
+        RegistrationChange::Remove
+    } else if state(target, text, Some(command))? == RegistrationState::Unregistered {
+        RegistrationChange::Add
+    } else {
+        RegistrationChange::Replace
+    })
 }

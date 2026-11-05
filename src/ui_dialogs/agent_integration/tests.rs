@@ -215,7 +215,7 @@ fn injected(_settings: &Settings) -> AgentIntegrationState {
                     target.name()
                 ))],
                 message: None,
-                previews: {
+                changes: {
                     let mut text = command.snippet(target);
                     if target == AppTarget::ClaudeDesktop {
                         // Existing registered JSON may need formatting on rewrite.
@@ -223,7 +223,7 @@ fn injected(_settings: &Settings) -> AgentIntegrationState {
                             .unwrap()
                             .to_string();
                     }
-                    backend::RegistrationPreviews::from_config(target, &text, Some(&command))
+                    backend::RegistrationChanges::from_config(target, &text, Some(&command))
                         .unwrap()
                 },
             })
@@ -524,41 +524,112 @@ fn agent_registration_real_row_enter_opens_confirmation_without_writing() {
 }
 
 #[test]
-fn agent_registration_confirmation_shows_the_worker_prepared_replacement() {
-    let mut harness = app_harness();
-    let preview = backend::RegistrationPreview {
-        removed: "# actual previous registration\n".into(),
-        added: "# actual edited registration\n".into(),
-    };
-    let integration = harness
-        .state_mut()
-        .agent_integration_dialog
-        .as_mut()
-        .unwrap();
-    let DetectionState::Ready(_, detection) = &mut integration.detection else {
-        panic!("injected detection is ready");
-    };
-    detection.apps[0].previews.register = Some(preview.clone());
-    activate_confirmation_with_enter(&mut harness, "登録する");
-    assert!(harness.query_by_label(&preview.removed).is_some());
-    assert!(harness.query_by_label(&preview.added).is_some());
-    assert_confirming(&harness);
+fn agent_registration_confirmation_shows_worker_summary_and_path_without_config_details() {
+    use backend::RegistrationChange::{Add, Remove, Replace, Unchanged};
+    for target in [AppTarget::ClaudeDesktop, AppTarget::ChatGpt] {
+        for (change, action, summary) in [
+            (
+                Add,
+                Action::Register,
+                "mIV の登録項目 (mimageviewer) を追加します。ほかの設定の値は変えません。",
+            ),
+            (
+                Replace,
+                Action::Register,
+                "mIV の登録項目 (mimageviewer) を、今の mIV の場所に書き換えます。ほかの設定の値は変えません。",
+            ),
+            (
+                Remove,
+                Action::Remove,
+                "mIV の登録項目 (mimageviewer) を削除します。ほかの設定の値は変えません。",
+            ),
+            (Unchanged, Action::Register, "登録内容の変更はありません。"),
+        ] {
+            let mut state = injected(&Settings::default());
+            let DetectionState::Ready(_, detection) = &mut state.detection else {
+                panic!("injected detection is ready");
+            };
+            let command = detection.command.as_ref().unwrap();
+            let original = match change {
+                Add => String::new(),
+                Replace => backend::RegistrationCommand {
+                    command: "old-secret-location".into(),
+                    args: vec!["secret-config-value".into()],
+                }
+                .snippet(target),
+                Remove | Unchanged => command.snippet(target),
+            };
+            let row = detection
+                .apps
+                .iter_mut()
+                .find(|row| row.target == target)
+                .unwrap();
+            row.changes =
+                backend::RegistrationChanges::from_config(target, &original, Some(command))
+                    .unwrap();
+            let path = row.config_paths[0].display().to_string();
+            state.confirm(target, action, 0);
+            assert!(
+                matches!(&state.operation, Some(RegistrationOperation::Confirming { request, .. }) if request.change == change)
+            );
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(1093.0, 614.0))
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .build_ui_state(
+                    |root, state| draw_registration_dialog(root.ctx(), state, false, false, false),
+                    state,
+                );
+            harness.run_steps(5);
+            let summary_rect = harness.get_by_label(summary).rect();
+            let instruction = harness
+                .get_by_label(&format!("{} を終了してから進めてください。", target.name()))
+                .rect();
+            let path_rect = harness.get_by_label(&path).rect();
+            let backup = harness
+                .get_by_label(
+                    "書き換え前の内容は、同じ場所に .mimageviewer.bak を付けた名前で残します。",
+                )
+                .rect();
+            assert!(summary_rect.bottom() <= instruction.top());
+            assert!(instruction.bottom() <= path_rect.top());
+            assert!(path_rect.bottom() <= backup.top());
+            assert_eq!(
+                harness.get_all_by_label("コピー").count(),
+                1,
+                "only the path has a copy button"
+            );
+            for text in painted_text(harness.output()) {
+                assert!(
+                    ![
+                        "mcpServers",
+                        "mcp_servers",
+                        "command",
+                        "secret-config-value",
+                        "old-secret-location"
+                    ]
+                    .iter()
+                    .any(|fragment| text.galley.job.text.contains(fragment)),
+                    "config contents must not be displayed: {}",
+                    text.galley.job.text
+                );
+            }
+            harness.get_by_label("コピー").click();
+            harness.run_steps(1);
+            assert!(harness.output().platform_output.commands.iter().any(
+                |command| matches!(command, egui::OutputCommand::CopyText(text) if text == &path)
+            ));
+        }
+    }
 }
 
 #[test]
 fn agent_registration_focused_copy_enter_does_not_write() {
     let mut harness = open_confirmation_with_enter("登録する");
-    for index in 0..2 {
-        harness
-            .get_all_by_label("コピー")
-            .nth(index)
-            .unwrap()
-            .focus();
-        harness.run_steps(2);
-        harness.key_press(egui::Key::Enter);
-        harness.run_steps(3);
-        assert_confirming(&harness);
-    }
+    harness.get_by_label("コピー").focus();
+    harness.run_steps(2);
+    harness.key_press(egui::Key::Enter);
+    harness.run_steps(3);
+    assert_confirming(&harness);
     // egui uses Escape to clear widget focus before drawing the dialog. It can
     // then cancel the confirmation, but must never invoke a write.
     harness.key_press(egui::Key::Escape);
@@ -660,6 +731,7 @@ fn agent_registration_confirmation_and_writing_block_backdrop_settings_and_x() {
         .rect()
         .center();
     let close = harness.get_by_label("Close window").rect().center();
+    let footer_close = harness.get_by_label("閉じる").rect().center();
     harness
         .state_mut()
         .agent_integration_dialog
@@ -708,11 +780,17 @@ fn agent_registration_confirmation_and_writing_block_backdrop_settings_and_x() {
                 .get_all_by_label("Close window")
                 .any(|node| node.accesskit_node().is_disabled() && node.rect().center() == close)
         );
+        assert!(
+            harness
+                .get_by_label("閉じる")
+                .accesskit_node()
+                .is_disabled()
+        );
         let foreground = harness
             .ctx
             .memory(|memory| memory.area_rect(modal_id))
             .unwrap();
-        for position in [thumbnail, close] {
+        for position in [thumbnail, close, footer_close] {
             assert!(!foreground.contains(position), "backdrop must be uncovered");
             click_at(&mut harness, position);
             assert!(harness.state().agent_registration_dialog_open());
@@ -723,6 +801,105 @@ fn agent_registration_confirmation_and_writing_block_backdrop_settings_and_x() {
     harness.run_steps(4);
     assert!(!harness.state().agent_registration_dialog_open());
     assert!(harness.state().agent_integration_dialog.is_some());
+}
+
+#[test]
+fn agent_integration_footer_close_stays_visible_after_scroll_and_preserves_saved_settings() {
+    use crate::test_ui::scroll_layout::HeightExpectation;
+    for size in [egui::vec2(1093.0, 614.0), egui::vec2(1366.0, 728.0)] {
+        for scale in [1.0, 2.0] {
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.agent_level = AgentLevel::Organize;
+            app.settings.agent_show_thumbnails = true;
+            app.settings.agent_show_gps = true;
+            app.settings.agent_show_ai_captions = true;
+            assert!(app.settings.save_checked());
+            app.open_agent_integration_dialog();
+            app.agent_integration_dialog = Some(injected(&app.settings));
+            let read_saved = || {
+                crate::settings_db::with_db_result(|db| {
+                    Ok((
+                        serde_json::to_value(db.load_into_settings()?).unwrap(),
+                        db.load_agent_permission()?,
+                    ))
+                })
+                .unwrap()
+            };
+            let saved_before = read_saved();
+            let settings_before = serde_json::to_value(&app.settings).unwrap();
+            let mut harness = crate::test_ui::builder()
+                .with_size(size)
+                .with_context_setup(move |ctx| {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    crate::settings::apply_ui_scale_factor(ctx, scale);
+                })
+                .build_ui_state(
+                    |root, app| app.show_agent_integration_dialog(&root.ctx().clone()),
+                    app,
+                );
+            harness.run_steps(8);
+            assert!((harness.ctx.pixels_per_point() - scale).abs() < 0.01);
+            let read_scroll =
+                |harness: &egui_kittest::Harness<'_, crate::app::AppTestEnvForTest>| {
+                    harness
+                        .state()
+                        .agent_integration_dialog
+                        .as_ref()
+                        .unwrap()
+                        .page_scroll
+                        .unwrap()
+                };
+            let before = read_scroll(&harness);
+            let viewport = harness.ctx.content_rect();
+            before.assert_height(
+                HeightExpectation::Scrolls,
+                viewport,
+                harness.ctx.pixels_per_point(),
+            );
+            let footer = harness.get_by_label("閉じる").rect();
+            let window = harness
+                .ctx
+                .memory(|memory| memory.area_rect(egui::Id::new("agent_integration_dialog")))
+                .unwrap();
+            assert!(viewport.contains_rect(footer) && window.contains_rect(footer));
+            assert!(
+                footer.top() >= before.inner.bottom(),
+                "footer must be outside the scroll body"
+            );
+            harness.event(egui::Event::PointerMoved(before.inner.center()));
+            harness.event(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -100000.0),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+            });
+            harness.run_steps(40);
+            let after = read_scroll(&harness);
+            after.assert_scrolled_to_end(before, harness.ctx.pixels_per_point());
+            let close_button = harness.get_by_label("閉じる");
+            assert!(!close_button.accesskit_node().is_disabled());
+            assert_eq!(
+                close_button.rect(),
+                footer,
+                "scrolling must not move the action row"
+            );
+            assert!(viewport.contains_rect(footer) && window.contains_rect(footer));
+            assert!(footer.top() >= after.inner.bottom());
+            click_at(&mut harness, footer.center());
+            harness.run_steps(2);
+            assert!(harness.state().agent_integration_dialog.is_none());
+            assert_eq!(
+                serde_json::to_value(&harness.state().settings).unwrap(),
+                settings_before
+            );
+            assert_eq!(
+                read_saved(),
+                saved_before,
+                "closing must preserve saved values and permission epoch"
+            );
+        }
+    }
 }
 
 #[test]
@@ -788,6 +965,18 @@ fn acceptance_b_registration_geometry_is_stable_across_frames() {
             .ctx
             .memory(|memory| memory.area_rect(egui::Id::new("agent_registration_confirmation")))
             .expect("confirmation window");
+        if scale == 1.0 {
+            let scroll = harness.state().dialog_scroll.unwrap();
+            scroll.assert_height(
+                crate::test_ui::scroll_layout::HeightExpectation::Fits,
+                harness.ctx.content_rect(),
+                harness.ctx.pixels_per_point(),
+            );
+            assert!(
+                window.height() < 300.0,
+                "short summary must open at its natural height: {window:?}"
+            );
+        }
         for frame in 0..40 {
             harness.run_steps(1);
             assert_eq!(

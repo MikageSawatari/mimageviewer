@@ -4993,6 +4993,8 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 
 ### 29.2 実装と判断
 
+登録確認の preview 方針は、§37 の平文の要約表示で置き換える。
+
 - Codex homeは設定済み `CODEX_HOME` を優先し、なければ `%USERPROFILE%/.codex`。
   separator/case/extended prefix/dot成分を正規化したcomponent列で、homeの `packages/app-server-daemon` 配下だけを除外する。
   directory名の文字列prefix比較は使わない。別profile/類似名/CLI/アプリbin/WindowsAppsは従来どおり数える。
@@ -5681,3 +5683,74 @@ reader で、ストリームの最初の行の先頭にある UTF-8 BOM (U+FEFF�
 最初の行が空でも許可を使い切り、2 行目以降や空白の後・JSON の途中の BOM は取り除かず従来どおり JSON として扱う。
 行のサイズ上限・FIFO・取消経路は維持する。BOM あり／なし (read の境界で分割される場合も含む)、
 2 行目の BOM、行途中の BOM、空の最初の行の後の BOM を実 reader 経由の回帰で検査する。
+
+## 37. AI アプリへの登録確認を要約にする (2026-11-05)
+
+利用者のスクリーンショットでは、Claude Desktop の登録確認に preferences の設定まで含む長い JSON が表示され、
+内容を確認できなかった。JSON を見ても一般の利用者には妥当性を判断しにくいという指摘と提案に沿い、
+§29.2 の置換範囲の詳細表示をやめ、追加・登録し直し・削除・変更なしの平文の要約にする。折りたたみを含め詳細は出さない。
+
+- 検出 worker が同じ editor で編集できることを確かめ、小さな typed 値だけを保持する。
+  編集結果と元の文字列が同一なら変更なしとし、それ以外は対象項目の有無と操作から追加・登録し直し・削除を求める。
+  UI は要約の段落、AI アプリの終了案内、選択・コピーできる対象ファイルのパス、同じ場所の `.mimageviewer.bak` の案内を示す。
+  長い preview の保持・clone・差分計算をなくし、ボタンの有効判定に編集成功が必要なことは保つ。
+- 窓は本文に合う自然な高さで開く。長いパスや小画面・200% 表示では本文をスクロールさせ、確定・キャンセルは常に表示する。
+  既存の modal と Enter / Escape / IME / 開いた frame の入力所有を維持する。
+  すでに登録処理は modal で組み合わせを制限しているため、新しい非同期状態や再開経路は足さない。
+- Claude Desktop の JSON はキー順序を維持し、元に CRLF があれば CRLF、最初の字下げ行の先頭空白を
+  `PrettyFormatter::with_indent` に使う。字下げ行がなければ 2 スペースとし、末尾改行の有無も維持する。
+  空ファイル・新規作成は末尾改行ありとする。minified は整形を許容する。Claude Desktop 自身も設定を書き直すため、
+  それ以上の部分的な文字列差し込みは行わない。数値やエスケープの字面は serializer の表現になり、
+  任意の JSON の全 token を元のバイトのまま保持する保証はしない。
+- JSON の値保全は、入れ子・空のオブジェクトと配列・null・日本語・エスケープ・小数・大きな整数を含む fixture で、
+  書式と対象項目の有無を変えて登録・登録し直し・削除の前後を比較する。指定した小数を含む整形済みの fixture では、
+  2 / 4 スペース・タブ、LF / CRLF、末尾改行の有無について、対象項目と直前のカンマの行以外のバイトの一致も検査する。
+  TOML は引き続き `toml_edit` を使い、他の表・値とコメント・空行・CRLF の保持を検査する。
+- 書く直前の再読・同じ editor・バックアップ・atomic replace は変えない。実際の AI アプリの設定をテストに使わず、
+  fixture と使い捨てのファイルだけで検証する。まれな失敗は既定の割り切り (ログ + 通知)。
+
+検証記録 (実装担当、`v5-integration` / `fdd417874` 上の未コミット差分):
+
+| 検査 | 結果 |
+|---|---|
+| 変更前 editor の値保全 | 2 件成功。JSON 48 入力 × 6 遷移と raw escape 入力、TOML の値・書式を検査し、値の欠落・変化は未検出。`target/registration-preservation-baseline.log` |
+| 指定 focused nextest | exit 0、239 / 239 成功。値・書式・要約・入力・小画面の回帰を含む。`target/registration-summary-focused.log` |
+| 登録確認 snapshot 更新 | exit 0、指定の `agent_registration_confirmation_small_light.png` 1 枚だけ更新。自然高・本文・パス・操作行・×を目視。`target/registration-summary-snapshot.log` |
+| 更新指定なしの関連 snapshot 比較 | exit 0、11 / 11 成功。他の AI 連携 10 枚は変更なし。`target/registration-summary-snapshot-compare.log` |
+| glyph / `cargo fmt` / `cargo fmt --check` / 差分の空白検査 | 成功。危険な glyph 0 件 |
+| 独立レビュー | 指摘なし、ACCEPT。上記の成功結果を再利用 |
+| `build-dev.ps1 -PreserveRuntime` | 未更新。同じ出力先の core が稼働中 (PID 8248) のため保護で中止。稼働中アプリは停止していない |
+
+製品・AI アプリは起動せず、実設定ファイルにはアクセスしていない。現在の `target/dev-runtime` の core は
+この差分を含む検証用バイナリとして扱わない。稼働中の開発版を利用者が終了した後、同じ build コマンドで更新できる。
+
+## 38. AI 連携窓の下端に「閉じる」を置く (2026-11-05)
+
+利用者から、他の窓には「閉じる」または OK / キャンセルがあるのに、AI 連携窓の下端には操作がなく、
+UI をそろえてほしいとの指摘があった。下端に「閉じる」を 1 つ置く。§25 の設定は変更時に保存・反映済みで、
+取り消す下書きがないため OK / キャンセルにはしない。
+
+共通の footer 計測で操作行を予約し、本文の ScrollArea の外に区切り線と左寄せの操作行を置く。
+本文は既存のドラッグスクロール・scroll style・全幅/全高の割り当て・page_scroll の計測を保ち、長文でも操作行は常に見える。
+ボタンはタイトルバーの × / Esc と同じ窓の終了結果を返して state を落とす。保存待ちや追加の保存は行わない。
+登録の確認・書き込み中は既存の窓全体の無効化に従い、「閉じる」も押せない。新しい状態や非同期経路は追加しない。
+
+1093×614 / 1366×728 と 100% / 200% で本文末尾へのスクロール、操作行の矩形不変・窓/画面内配置、
+実入力のクリックによる終了、保存済みの設定と許可 epoch の不変を回帰検査する。登録処理中の無効化も既存の検査に加える。
+
+検証記録 (実装担当、§37 の未コミット差分を保持した同じ作業ツリー):
+
+- 初回 focused は 239 / 240 成功。区切り線の予約不足で窓が少しずつ伸び、操作行の位置不変検査が失敗した。
+  共通お知らせ窓と同じく footer 計測へ区切り線分の 6pt を渡すよう修正し、期待値は緩めていない。
+- 最終の指定 focused は exit 0、240 / 240 成功。`target/agent-close-focused-final.log`。
+  1093×614 / 1366×728 × pixels_per_point 1 / 2 の全条件で、スクロール後も操作行は同じ位置にあり、
+  クリックで閉じ、保存済み設定・許可 epoch・メモリ上の設定が変わらない。登録の確認/書き込み中は操作できない。
+- `agent_integration_window_*` の明暗 10 枚だけ更新し、全て目視した。`target/agent-close-snapshot.log`。
+  操作行の追加に伴い本文の表示領域とスクロールバーが短くなり、下端の本文のクリップ/フェードが変わる。
+  共通 footer 計測の余白により、今回の 100% の PNG では窓下端も 5px 上がる。上側の本文・見出し・配色は変わらない。
+  更新指定なしの関連比較は登録確認を含め 11 / 11 成功。`target/agent-close-snapshot-compare.log`。
+- glyph 検査 (0 件)、`cargo fmt`、`cargo fmt --check`、差分の空白検査は成功。独立レビューは指摘なし、ACCEPT。
+- §37 の backend 3 ファイル・マニュアル・登録確認 PNG の SHA256 は着手時と一致し、登録確認関数以降のソースも不変。
+  先行差分は消していない。マニュアルには AI 連携窓の閉じ方の記述がないため、この作業では変更しない。
+- `build-dev.ps1 -PreserveRuntime` は同じ出力先の core (PID 8248) が稼働中のため保護で中止し、検証用バイナリは未更新。
+  稼働中アプリの停止・製品の起動・commit は行っていない。

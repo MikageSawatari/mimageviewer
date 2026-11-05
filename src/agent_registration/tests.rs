@@ -1,5 +1,339 @@
 use super::*;
 
+fn without_json_registration(mut value: serde_json::Value) -> serde_json::Value {
+    if let Some(servers) = value
+        .get_mut("mcpServers")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        servers.remove("mimageviewer");
+        if servers.is_empty() {
+            value.as_object_mut().unwrap().remove("mcpServers");
+        }
+    }
+    value
+}
+
+#[test]
+fn registration_preservation_json_values_across_formats_and_lifecycle() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    let fixture = r#"{"preferences":{"chromeExtension":{"enabled":true,"epitaxyPrefs":{"label":"日本語","emptyObject":{},"emptyArray":[],"none":null,"false":false,"integer":42}},"strings":["quote: \"","backslash: \\","newline: \n","é","escaped: \/"],"numbers":[0.1,1.1,1e-7,-2.5,9007199254740991,9007199254740992,9007199254740993,-9223372036854775808]},"tail":[true,3,"keep",{},[],null]}"#;
+    let base: serde_json::Value = serde_json::from_str(fixture).unwrap();
+    for servers in [
+        None,
+        Some(serde_json::json!({"other":{"command":"keep","args":["日本語"],"env":{"A":"B"}}})),
+        Some(
+            serde_json::json!({"other":{"command":"keep"},"mimageviewer":{"command":"old","extra":true}}),
+        ),
+    ] {
+        let mut value = base.clone();
+        if let Some(servers) = servers {
+            value["mcpServers"] = servers;
+        }
+        for indent in ["  ", "    ", "\t", ""] {
+            let mut bytes = Vec::new();
+            if indent.is_empty() {
+                serde_json::to_writer(&mut bytes, &value).unwrap();
+            } else {
+                let formatter = serde_json::ser::PrettyFormatter::with_indent(indent.as_bytes());
+                let mut serializer = serde_json::Serializer::with_formatter(&mut bytes, formatter);
+                serde::Serialize::serialize(&value, &mut serializer).unwrap();
+            }
+            let formatted = String::from_utf8(bytes).unwrap();
+            for newline in ["\n", "\r\n"] {
+                for trailing in [false, true] {
+                    let mut original = formatted.replace('\n', newline);
+                    if trailing {
+                        original.push_str(newline);
+                    }
+                    let expected = without_json_registration(value.clone());
+                    let mut text = original;
+                    for action in [
+                        Action::Register,
+                        Action::Register,
+                        Action::Remove,
+                        Action::Register,
+                        Action::Remove,
+                        Action::Remove,
+                    ] {
+                        text = config::edit(AppTarget::ClaudeDesktop, &text, action, &command)
+                            .unwrap();
+                        let actual: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        assert_eq!(
+                            without_json_registration(actual),
+                            expected,
+                            "indent={indent:?}, newline={newline:?}, trailing={trailing}, action={action:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // Keep the escaped spellings and exponent form in the input too; the
+    // formatting matrix above deliberately starts from parsed JSON values.
+    for action in [Action::Register, Action::Remove] {
+        let edited = config::edit(AppTarget::ClaudeDesktop, fixture, action, &command).unwrap();
+        assert_eq!(
+            without_json_registration(serde_json::from_str(&edited).unwrap()),
+            base
+        );
+    }
+}
+
+fn toml_semantic_value(item: &toml_edit::Item) -> serde_json::Value {
+    if let Some(tables) = item.as_array_of_tables() {
+        return serde_json::Value::Array(
+            tables
+                .iter()
+                .map(|table| {
+                    serde_json::Value::Object(
+                        table
+                            .iter()
+                            .map(|(key, item)| (key.to_owned(), toml_semantic_value(item)))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        );
+    }
+    if let Some(table) = item.as_table_like() {
+        return serde_json::Value::Object(
+            table
+                .iter()
+                .map(|(key, item)| (key.to_owned(), toml_semantic_value(item)))
+                .collect(),
+        );
+    }
+    fn convert(value: &toml_edit::Value) -> serde_json::Value {
+        match value {
+            toml_edit::Value::String(v) => serde_json::json!(v.value()),
+            toml_edit::Value::Integer(v) => serde_json::json!(v.value()),
+            toml_edit::Value::Float(v) => serde_json::json!(v.value()),
+            toml_edit::Value::Boolean(v) => serde_json::json!(v.value()),
+            toml_edit::Value::Datetime(v) => serde_json::json!(v.value().to_string()),
+            toml_edit::Value::Array(v) => serde_json::Value::Array(v.iter().map(convert).collect()),
+            toml_edit::Value::InlineTable(v) => serde_json::Value::Object(
+                v.iter().map(|(k, v)| (k.to_owned(), convert(v))).collect(),
+            ),
+        }
+    }
+    if let Some(v) = item.as_value() {
+        convert(v)
+    } else {
+        serde_json::Value::Null
+    }
+}
+
+fn without_toml_registration(text: &str) -> serde_json::Value {
+    let mut doc: toml_edit::DocumentMut = text.parse().unwrap();
+    if let Some(servers) = doc
+        .get_mut("mcp_servers")
+        .and_then(toml_edit::Item::as_table_like_mut)
+    {
+        servers.remove("mimageviewer");
+        if servers.is_empty() {
+            doc.remove("mcp_servers");
+        }
+    }
+    toml_semantic_value(doc.as_item())
+}
+
+#[test]
+fn registration_preservation_toml_values_comments_blank_lines_and_crlf() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    let prefix = "# retained top\nmodel = '日本語' # retained model\n\n[preferences]\nenabled = true\ninteger = -9223372036854775808\nfloat = 0.1\nvalues = ['é', 9007199254740993, false, { empty = [] }]\n\n# retained other\n[mcp_servers.other]\ncommand = 'keep' # retained command\nargs = ['quote: \"', 'backslash: \\']\n\n";
+    let suffix = "[tail]\nvalue = 42 # retained tail\nnumbers = [0.1, 1.1, 1e-7, -2.5, 9007199254740991, 9007199254740992]\n\n[[skills.config]]\nname = '日本語é'\nenabled = true\n\n[[skills.config]]\nname = 'second'\nenabled = false\n\n";
+    for existing in [
+        "",
+        "[mcp_servers.mimageviewer]\ncommand = 'old'\nargs = []\n\n",
+    ] {
+        for newline in ["\n", "\r\n"] {
+            let original = format!("{prefix}{existing}{suffix}").replace('\n', newline);
+            let expected = without_toml_registration(&original);
+            let mut text = original;
+            for action in [
+                Action::Register,
+                Action::Register,
+                Action::Remove,
+                Action::Remove,
+            ] {
+                text = config::edit(AppTarget::ChatGpt, &text, action, &command).unwrap();
+                assert_eq!(without_toml_registration(&text), expected);
+                assert!(text.starts_with(&prefix.replace('\n', newline)), "{text}");
+                assert!(text.contains(&suffix.replace('\n', newline)), "{text}");
+                if newline == "\r\n" {
+                    assert!(!text.replace("\r\n", "").contains('\n'));
+                }
+            }
+        }
+    }
+    for original in [
+        "",
+        "# no MCP parent\nmodel = 'keep'\n\n",
+        "mcp_servers = { other = { command = 'keep' } } # inline\n",
+    ] {
+        let registered =
+            config::edit(AppTarget::ChatGpt, original, Action::Register, &command).unwrap();
+        let removed =
+            config::edit(AppTarget::ChatGpt, &registered, Action::Remove, &command).unwrap();
+        assert_eq!(
+            without_toml_registration(original),
+            without_toml_registration(&registered)
+        );
+        assert_eq!(
+            without_toml_registration(original),
+            without_toml_registration(&removed)
+        );
+    }
+}
+
+#[test]
+fn json_registration_preserves_pretty_indentation_line_endings_and_other_bytes() {
+    let command = RegistrationCommand {
+        command: r"C:\日本語\mimageviewer.exe".into(),
+        args: vec!["--mcp".into(), "--data-dir".into(), r"C:\profile".into()],
+    };
+    // Canonical JSON.stringify-style scalar spellings: compare complete text so
+    // unrelated values, number spellings, order and whitespace must all survive.
+    let base = r#"{
+  "preferences": {
+    "chromeExtension": true,
+    "epitaxyPrefs": {
+      "name": "日本語é",
+      "values": [
+        0.1,
+        1.1,
+        1e-7,
+        -2.5,
+        9007199254740991,
+        9007199254740992,
+        "quote: \" backslash: \\ newline: \n",
+        {},
+        [],
+        null
+      ]
+    }
+  },
+  "mcpServers": {
+    "other": {
+      "command": "keep",
+      "args": []
+    }
+  },
+  "tail": true
+}"#;
+    let registration = format!(
+        "    \"mimageviewer\": {{\n      \"command\": {},\n      \"args\": [\n{}\n      ]\n    }}",
+        serde_json::to_string(&command.command).unwrap(),
+        command
+            .args
+            .iter()
+            .map(|arg| format!("        {}", serde_json::to_string(arg).unwrap()))
+            .collect::<Vec<_>>()
+            .join(",\n"),
+    );
+    let parent = "  \"mcpServers\": {\n    \"other\": {\n      \"command\": \"keep\",\n      \"args\": []\n    }\n  },\n";
+    let with_registration = base.replace(
+        "      \"args\": []\n    }\n  },",
+        &format!("      \"args\": []\n    }},\n{registration}\n  }},"),
+    );
+    let old_registration =
+        "    \"mimageviewer\": {\n      \"command\": \"old\",\n      \"args\": []\n    }";
+    for indent in ["  ", "    ", "\t"] {
+        for newline in ["\n", "\r\n"] {
+            for trailing in [false, true] {
+                let render = |text: &str| {
+                    let mut output = text
+                        .lines()
+                        .map(|line| {
+                            let spaces = line.bytes().take_while(|b| *b == b' ').count();
+                            format!("{}{}", indent.repeat(spaces / 2), &line[spaces..])
+                        })
+                        .collect::<Vec<_>>()
+                        .join(newline);
+                    if trailing {
+                        output.push_str(newline);
+                    }
+                    output
+                };
+                for existing in [false, true] {
+                    let original = if existing {
+                        with_registration.replace(&registration, old_registration)
+                    } else {
+                        base.to_owned()
+                    };
+                    let edited = config::edit(
+                        AppTarget::ClaudeDesktop,
+                        &render(&original),
+                        Action::Register,
+                        &command,
+                    )
+                    .unwrap();
+                    assert_eq!(edited, render(&with_registration));
+                    assert_eq!(
+                        config::edit(
+                            AppTarget::ClaudeDesktop,
+                            &edited,
+                            Action::Register,
+                            &command
+                        )
+                        .unwrap(),
+                        edited
+                    );
+                    let removed =
+                        config::edit(AppTarget::ClaudeDesktop, &edited, Action::Remove, &command)
+                            .unwrap();
+                    assert_eq!(removed, render(base));
+                    if existing {
+                        assert_eq!(
+                            config::edit(
+                                AppTarget::ClaudeDesktop,
+                                &render(&original),
+                                Action::Remove,
+                                &command
+                            )
+                            .unwrap(),
+                            render(base)
+                        );
+                    }
+                }
+                let no_parent = base.replace(parent, "");
+                let added_parent = no_parent.replace(
+                    "  \"tail\": true\n}",
+                    &format!("  \"tail\": true,\n  \"mcpServers\": {{\n{registration}\n  }}\n}}"),
+                );
+                let edited = config::edit(
+                    AppTarget::ClaudeDesktop,
+                    &render(&no_parent),
+                    Action::Register,
+                    &command,
+                )
+                .unwrap();
+                assert_eq!(edited, render(&added_parent));
+                let empty_parent = no_parent.replace(
+                    "  \"tail\": true\n}",
+                    "  \"tail\": true,\n  \"mcpServers\": {}\n}",
+                );
+                assert_eq!(
+                    config::edit(AppTarget::ClaudeDesktop, &edited, Action::Remove, &command)
+                        .unwrap(),
+                    render(&empty_parent)
+                );
+            }
+        }
+    }
+    for empty in ["", " \r\n\t"] {
+        let added =
+            config::edit(AppTarget::ClaudeDesktop, empty, Action::Register, &command).unwrap();
+        assert!(added.ends_with(if empty.contains("\r\n") { "\r\n" } else { "\n" }));
+    }
+    let minified =
+        config::edit(AppTarget::ClaudeDesktop, "{}", Action::Register, &command).unwrap();
+    assert!(minified.starts_with("{\n  \"mcpServers\""));
+    assert!(!minified.ends_with('\n'));
+}
+
 fn fixture() -> (tempfile::TempDir, RegistrationEnvironment) {
     let temp = tempfile::tempdir().unwrap();
     let env = RegistrationEnvironment {
@@ -277,130 +611,90 @@ fn codex_daemon_exclusion_uses_normalized_components_under_the_current_home_only
     ));
 }
 
-fn assert_preview_reconstructs(original: &str, edited: &str, preview: &RegistrationPreview) {
-    // Every displayed byte comes from the actual before/after text. The omitted
-    // prefix and suffix remain identical, including line endings and indentation.
-    let is_exact_replacement = if preview.removed.is_empty() {
-        edited.match_indices(&preview.added).any(|(offset, _)| {
-            format!(
-                "{}{}",
-                &edited[..offset],
-                &edited[offset + preview.added.len()..]
-            ) == original
-        })
-    } else {
-        original.match_indices(&preview.removed).any(|(offset, _)| {
-            format!(
-                "{}{}{}",
-                &original[..offset],
-                preview.added,
-                &original[offset + preview.removed.len()..]
-            ) == edited
-        })
-    };
-    assert!(is_exact_replacement, "{preview:?}");
-}
-
 #[test]
-fn codex_previews_are_exact_edited_spans_for_absent_implicit_and_explicit_tables() {
+fn registration_changes_match_editor_for_add_replace_remove_and_unchanged() {
     let (_temp, env) = fixture();
     let command = env.resolve_command().unwrap();
-    for original in [
-        "",
-        "# keep\nmodel = 'x'\n",
-        "# keep\r\n[mcp_servers.other]\r\ncommand = 'other' # retain\r\n",
-        "[mcp_servers]\n# explicit parent\n[mcp_servers.other]\ncommand = 'other'\n",
-        "mcp_servers = { other = { command = 'other' } } # inline\n",
+    for (target, originals) in [
+        (
+            AppTarget::ChatGpt,
+            vec![
+                "",
+                "# keep\nmodel = 'x'\n",
+                "# keep\r\n[mcp_servers.other]\r\ncommand = 'other' # retain\r\n",
+                "[mcp_servers]\n# explicit parent\n[mcp_servers.other]\ncommand = 'other'\n",
+                "mcp_servers = { other = { command = 'other' } } # inline\n",
+            ],
+        ),
+        (
+            AppTarget::ClaudeDesktop,
+            vec![
+                "",
+                "{}",
+                r#"{"other":42,"mcpServers":{"another":{"command":"keep"}}}"#,
+            ],
+        ),
     ] {
-        let edited =
-            config::edit(AppTarget::ChatGpt, original, Action::Register, &command).unwrap();
-        let preview =
-            RegistrationPreviews::from_config(AppTarget::ChatGpt, original, Some(&command))
-                .unwrap()
-                .register
-                .unwrap();
-        assert_preview_reconstructs(original, &edited, &preview);
-        assert_eq!(
-            preview
-                .added
-                .lines()
-                .filter(|line| *line == "[mcp_servers]")
-                .count(),
-            edited
-                .lines()
-                .filter(|line| *line == "[mcp_servers]")
-                .count()
-                - original
-                    .lines()
-                    .filter(|line| *line == "[mcp_servers]")
-                    .count(),
-            "a parent header must only appear if the editor actually adds one"
-        );
-        if original.contains("[mcp_servers.other]") {
-            assert!(!preview.added.contains("[mcp_servers]\n"));
-            assert!(!preview.added.contains("[mcp_servers]\r\n"));
-        }
-        if let Some(added) = edited.strip_prefix(original) {
-            assert_eq!(preview.added, added);
-            assert!(preview.removed.is_empty());
-        }
-
-        let removed = config::edit(AppTarget::ChatGpt, &edited, Action::Remove, &command).unwrap();
-        let preview = RegistrationPreviews::from_config(AppTarget::ChatGpt, &edited, None)
-            .unwrap()
-            .remove
-            .unwrap();
-        assert_preview_reconstructs(&edited, &removed, &preview);
-        assert!(preview.removed.contains("mimageviewer"));
-        // Parse the actual removed block/inline-table line: toml_edit may use
-        // either a basic string or a literal string for the Windows path.
-        let removed_config: toml_edit::DocumentMut = preview.removed.parse().unwrap();
-        assert_eq!(
-            removed_config["mcp_servers"]["mimageviewer"]["command"].as_str(),
-            Some(command.command.as_str())
-        );
-        if !original.contains("# inline") {
-            assert!(preview.added.is_empty());
+        for original in originals {
+            let added = config::edit(target, original, Action::Register, &command).unwrap();
+            let changes =
+                RegistrationChanges::from_config(target, original, Some(&command)).unwrap();
+            assert_eq!(changes.register, Some(RegistrationChange::Add));
+            assert_eq!(changes.remove, Some(RegistrationChange::Unchanged));
+            assert_eq!(
+                config::state(target, &added, Some(&command)).unwrap(),
+                RegistrationState::Registered
+            );
+            assert_eq!(
+                config::edit(target, &added, Action::Register, &command).unwrap(),
+                added
+            );
+            let changes = RegistrationChanges::from_config(target, &added, Some(&command)).unwrap();
+            assert_eq!(changes.register, Some(RegistrationChange::Unchanged));
+            assert_eq!(changes.remove, Some(RegistrationChange::Remove));
+            let changes = RegistrationChanges::from_config(target, &added, None).unwrap();
+            assert_eq!(changes.register, None);
+            assert_eq!(changes.remove, Some(RegistrationChange::Remove));
+            let removed = config::edit(target, &added, Action::Remove, &command).unwrap();
+            assert_eq!(
+                config::state(target, &removed, Some(&command)).unwrap(),
+                RegistrationState::Unregistered
+            );
+            assert_eq!(
+                config::edit(target, &removed, Action::Remove, &command).unwrap(),
+                removed
+            );
+            assert_eq!(
+                config::change(target, &removed, Action::Remove, &command).unwrap(),
+                RegistrationChange::Unchanged
+            );
         }
     }
-}
-
-#[test]
-fn replacement_and_claude_add_remove_previews_use_actual_before_and_after_text() {
-    let (_temp, env) = fixture();
-    let command = env.resolve_command().unwrap();
     for (target, original) in [
         (
             AppTarget::ChatGpt,
             "[mcp_servers.mimageviewer]\ncommand = 'old' # removed\nargs = []\n[other]\nvalue = 42 # keep\n",
         ),
-        (AppTarget::ClaudeDesktop, ""),
         (
             AppTarget::ClaudeDesktop,
-            "{\"other\":42,\"mcpServers\":{\"another\":{\"command\":\"keep\"}}}",
-        ),
-        (
-            AppTarget::ClaudeDesktop,
-            "{\"mcpServers\":{\"mimageviewer\":{\"command\":\"old\",\"extra\":true},\"other\":{}},\"tail\":42}",
+            r#"{"mcpServers":{"mimageviewer":{"command":"old","extra":true},"other":{}},"tail":42}"#,
         ),
     ] {
-        let edited = config::edit(target, original, Action::Register, &command).unwrap();
-        let previews = RegistrationPreviews::from_config(target, original, Some(&command)).unwrap();
-        assert_preview_reconstructs(original, &edited, &previews.register.unwrap());
-        if original.contains("mimageviewer") {
-            let removed = config::edit(target, original, Action::Remove, &command).unwrap();
-            let preview = previews.remove.unwrap();
-            assert_preview_reconstructs(original, &removed, &preview);
-            assert!(preview.removed.contains("old"));
-            assert!(!preview.removed.contains(&command.command));
-        }
-        let removed = config::edit(target, &edited, Action::Remove, &command).unwrap();
-        let previews = RegistrationPreviews::from_config(target, &edited, None).unwrap();
-        assert!(previews.register.is_none());
-        let preview = previews.remove.unwrap();
-        assert_preview_reconstructs(&edited, &removed, &preview);
-        assert!(preview.removed.contains("mimageviewer"));
-        assert!(!preview.added.contains("mimageviewer"));
+        let changes = RegistrationChanges::from_config(target, original, Some(&command)).unwrap();
+        assert_eq!(changes.register, Some(RegistrationChange::Replace));
+        assert_eq!(changes.remove, Some(RegistrationChange::Remove));
+        let replaced = config::edit(target, original, Action::Register, &command).unwrap();
+        assert_eq!(
+            config::state(target, &replaced, Some(&command)).unwrap(),
+            RegistrationState::Registered
+        );
+    }
+    for (target, invalid) in [
+        (AppTarget::ChatGpt, "[invalid"),
+        (AppTarget::ClaudeDesktop, "{invalid"),
+    ] {
+        assert!(RegistrationChanges::from_config(target, invalid, Some(&command)).is_err());
+        assert!(config::change(target, invalid, Action::Remove, &command).is_err());
     }
 }
 
@@ -420,8 +714,11 @@ fn daemon_images_allow_writes_but_a_cli_image_in_the_same_snapshot_still_blocks(
         .join(".codex/packages/app-server-daemon/1/codex.exe");
     write_with_processes(&env, &request, || Ok(vec![(10, daemon.clone())])).unwrap();
     let written = fs::read_to_string(&request.path).unwrap();
-    assert_eq!(request.preview.added, written);
-    assert!(request.preview.removed.is_empty());
+    assert_eq!(request.change, RegistrationChange::Add);
+    assert_eq!(
+        config::state(AppTarget::ChatGpt, &written, Some(&request.command)).unwrap(),
+        RegistrationState::Registered
+    );
     let detection = detect(&env);
     let remove = app(&detection, AppTarget::ChatGpt)
         .remove_request()
@@ -437,10 +734,15 @@ fn daemon_images_allow_writes_but_a_cli_image_in_the_same_snapshot_still_blocks(
     );
     assert_eq!(fs::read_to_string(&request.path).unwrap(), written);
     write_with_processes(&env, &remove, || Ok(vec![(10, daemon)])).unwrap();
-    assert_preview_reconstructs(
-        &written,
-        &fs::read_to_string(&request.path).unwrap(),
-        &remove.preview,
+    assert_eq!(remove.change, RegistrationChange::Remove);
+    assert_eq!(
+        config::state(
+            AppTarget::ChatGpt,
+            &fs::read_to_string(&request.path).unwrap(),
+            None
+        )
+        .unwrap(),
+        RegistrationState::Unregistered
     );
 }
 
@@ -623,7 +925,7 @@ fn invalid_files_and_running_processes_never_change_config_or_backup() {
             path: path.clone(),
             action: Action::Register,
             command: env.resolve_command().unwrap(),
-            preview: RegistrationPreview::default(),
+            change: RegistrationChange::Add,
         };
         let error = write_with_processes(&env, &request, || Ok(vec![])).unwrap_err();
         assert!(!error.contains("SECRET"));

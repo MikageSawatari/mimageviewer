@@ -124,23 +124,25 @@ pub(crate) struct AppRegistration {
     pub(crate) state: RegistrationState,
     pub(crate) config_paths: Vec<PathBuf>,
     pub(crate) message: Option<String>,
-    pub(crate) previews: RegistrationPreviews,
+    pub(crate) changes: RegistrationChanges,
 }
 
-/// Exact replacement text, prepared alongside detection on its worker.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct RegistrationPreview {
-    pub(crate) removed: String,
-    pub(crate) added: String,
+/// Small edit summary prepared on the detection worker, without config contents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RegistrationChange {
+    Add,
+    Replace,
+    Remove,
+    Unchanged,
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct RegistrationPreviews {
-    pub(crate) register: Option<RegistrationPreview>,
-    pub(crate) remove: Option<RegistrationPreview>,
+pub(crate) struct RegistrationChanges {
+    pub(crate) register: Option<RegistrationChange>,
+    pub(crate) remove: Option<RegistrationChange>,
 }
 
-impl RegistrationPreviews {
+impl RegistrationChanges {
     pub(crate) fn from_config(
         target: AppTarget,
         text: &str,
@@ -152,9 +154,9 @@ impl RegistrationPreviews {
         };
         Ok(Self {
             register: command
-                .map(|command| config::preview(target, text, Action::Register, command))
+                .map(|command| config::change(target, text, Action::Register, command))
                 .transpose()?,
-            remove: Some(config::preview(
+            remove: Some(config::change(
                 target,
                 text,
                 Action::Remove,
@@ -165,7 +167,7 @@ impl RegistrationPreviews {
 }
 
 impl AppRegistration {
-    /// Drawing availability must not clone the potentially long preview each frame.
+    /// Availability requires an edit that succeeded on the detection worker.
     pub(crate) fn can_write(&self, action: Action) -> bool {
         !matches!(
             self.state,
@@ -174,8 +176,8 @@ impl AppRegistration {
                 | RegistrationState::Ambiguous
         ) && self.config_paths.len() == 1
             && match action {
-                Action::Register => self.previews.register.is_some(),
-                Action::Remove => self.previews.remove.is_some(),
+                Action::Register => self.changes.register.is_some(),
+                Action::Remove => self.changes.remove.is_some(),
             }
     }
 
@@ -213,9 +215,9 @@ impl AppRegistration {
             path: self.config_paths[0].clone(),
             action,
             command: command.clone(),
-            preview: match action {
-                Action::Register => self.previews.register.clone()?,
-                Action::Remove => self.previews.remove.clone()?,
+            change: match action {
+                Action::Register => self.changes.register?,
+                Action::Remove => self.changes.remove?,
             },
         })
     }
@@ -240,7 +242,7 @@ pub(crate) struct WriteRequest {
     pub(crate) path: PathBuf,
     pub(crate) action: Action,
     pub(crate) command: RegistrationCommand,
-    pub(crate) preview: RegistrationPreview,
+    pub(crate) change: RegistrationChange,
 }
 
 fn packages(env: &RegistrationEnvironment, prefix: &str) -> io::Result<Vec<PathBuf>> {
@@ -276,7 +278,7 @@ fn packages(env: &RegistrationEnvironment, prefix: &str) -> io::Result<Vec<PathB
 pub(crate) fn detect(env: &RegistrationEnvironment) -> Detection {
     let command = env.resolve_command();
     let apps = [AppTarget::ClaudeDesktop, AppTarget::ChatGpt].into_iter().map(|target| {
-        let mut row = AppRegistration { target, state: RegistrationState::NotFound, config_paths: Vec::new(), message: None, previews: RegistrationPreviews::default() };
+        let mut row = AppRegistration { target, state: RegistrationState::NotFound, config_paths: Vec::new(), message: None, changes: RegistrationChanges::default() };
         let result = (|| -> Result<(), String> {
             match target {
                 AppTarget::ClaudeDesktop => {
@@ -304,7 +306,7 @@ pub(crate) fn detect(env: &RegistrationEnvironment) -> Detection {
             let Some(path) = row.config_paths.first() else { return Ok(()); };
             let text = read_config(path)?;
             row.state = config::state(target, &text, command.as_ref().ok())?;
-            row.previews = RegistrationPreviews::from_config(target, &text, command.as_ref().ok())?;
+            row.changes = RegistrationChanges::from_config(target, &text, command.as_ref().ok())?;
             Ok(())
         })();
         if let Err(error) = result { row.state = RegistrationState::Unreadable; row.message = Some(error); }
