@@ -718,3 +718,11 @@ git add / commit / merge等のgit書き込みも行わない。
 - worker 本体: `vendor/vlm-worker/mimageviewer-vlm.exe` を新しいソースの identity `9159b4a1…` に更新し、`scripts/vlm-worker-identity.ps1 -ValidateRepo` で照合した。`C:\home\mimageviewer_vendor_backup\vlm-worker\` も更新し、旧版 (`79c6482a…`) は `C:\home\mimageviewer_vendor_backup\vlm-worker-79c6482a-before-dry.exe` に残した。
 - 保存前に合計30 scalar以上の連続反復を切る処理 (§1.716) は、取りこぼしへの保険として別に入れる。
 - 実機確認: 未確認 (rc3 で利用者・サブ PC が確認する)。
+
+## 16. mIV Sound 0.15.0-miv.6 (候補 38cabd5b…) の承認 (2026-11-05)
+
+- 内容: About の「Close」・説明文・版表示と、サードパーティーのライセンスの見出し・「Close」・読み込み失敗の文を翻訳に通した (miv-sound `6e46f60`、利用者決定「miv.6 で訳す」)。
+- 候補ビルドの ctest で `effetune_webview_smoke` が失敗した。smoke は About を開く前に UI を日本語へ切り替えるのに、英語の版表示・説明文を期待していたため About 以降の段が未到達だった。テストの期待を翻訳後の表示に合わせた (`d49ada5`、テストのみ。製品の変更なし)。修正後の ctest は 117/117 成功。
+- 独立レビュー (xhigh): `6e46f60` ACCEPT、`d49ada5` ACCEPT。日本語の期待値が辞書と一致することを確認。P3 として、`tests/esm/vst-upstream-ui.test.mjs` の再入テストが、実装に無い「既存の About があれば戻る」ガードを前提にしている点の指摘があった。About を開いたまま再び開く呼び出しで About が 2 つできる既存挙動 (`413c1eb` から、今回の回帰ではない) を隠しているため、後で実装とテストを揃える。
+- `miv` ブランチを `d49ada5` まで push した。`.\scripts\build-miv-sound.ps1 -Approve -Candidate 38cabd5b…` で `third_party/miv-sound/0.15.0-miv.6/` を作成。バックアップは `C:\home\mimageviewer_vendor_backup\miv-sound-0.15.0-miv.6\`。マニュアルを `manual/sound/v0.15.0-miv.6/` へ作り直した (旧 URL は 301 転送)。
+- 実機確認: 未確認 (利用者の手元確認待ち)。
