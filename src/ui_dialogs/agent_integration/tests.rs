@@ -1,38 +1,145 @@
 use super::*;
 use egui_kittest::kittest::{NodeT, Queryable};
 
-#[test]
-fn exposure_descriptions_are_left_aligned_without_justification_and_still_wrap() {
-    fn check_text(shape: &egui::Shape, found: &mut bool) {
+fn painted_text(output: &egui::FullOutput) -> Vec<&egui::epaint::TextShape> {
+    fn collect<'a>(shape: &'a egui::Shape, texts: &mut Vec<&'a egui::epaint::TextShape>) {
         match shape {
             egui::Shape::Vec(shapes) => {
                 for shape in shapes {
-                    check_text(shape, found);
+                    collect(shape, texts);
                 }
             }
-            egui::Shape::Text(text) if text.galley.job.text.contains("UserComment") => {
-                *found = true;
-                assert!(!text.galley.job.justify);
-                assert_eq!(text.galley.job.halign, egui::Align::Min);
-                assert!(text.galley.rows.len() > 1, "description must still wrap");
-            }
+            egui::Shape::Text(text) => texts.push(text),
             _ => {}
         }
     }
+    let mut texts = Vec::new();
+    for shape in &output.shapes {
+        collect(&shape.shape, &mut texts);
+    }
+    texts
+}
+
+#[test]
+fn exposure_descriptions_are_left_aligned_without_justification_and_still_wrap() {
+    for theme in [
+        crate::os_theme::ResolvedTheme::Light,
+        crate::os_theme::ResolvedTheme::Dark,
+    ] {
+        for width in [860.0, 400.0, 240.0] {
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            crate::os_theme::apply_resolved(&ctx, theme);
+            let settings = PermissionSelection {
+                level: AgentLevel::Organize,
+                thumbnails: true,
+                gps: true,
+                ai_captions: true,
+            };
+            let mut bounds = egui::Rect::NOTHING;
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 3000.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    bounds = ui.available_rect_before_wrap();
+                    draw_exposure(ui, &settings);
+                },
+            );
+            let texts = painted_text(&output);
+            let headings = ["AI に見せるもの", "見せないもの", "AI に許す操作"].map(|title| {
+                texts
+                    .iter()
+                    .find(|text| text.galley.job.text == title)
+                    .unwrap()
+            });
+            for pair in headings.windows(2) {
+                assert!(pair[0].pos.y < pair[1].pos.y, "sections must be vertical");
+                assert!((pair[0].pos.x - pair[1].pos.x).abs() <= 1.0);
+            }
+            for text in &texts {
+                let rect = text.visual_bounding_rect();
+                assert!(
+                    rect.left() >= bounds.left() - 1.0 && rect.right() <= bounds.right() + 1.0,
+                    "text escaped width={width}: {} {rect:?} / {bounds:?}",
+                    text.galley.job.text,
+                );
+            }
+            let summary = exposure(settings);
+            let lines: Vec<_> = summary
+                .shown
+                .iter()
+                .chain(&summary.hidden)
+                .chain(&summary.actions)
+                .collect();
+            assert_eq!(
+                texts
+                    .iter()
+                    .filter(|text| text.galley.job.text == "・")
+                    .count(),
+                lines.len()
+            );
+            for line in lines {
+                let text = texts
+                    .iter()
+                    .find(|text| text.galley.job.text == *line)
+                    .unwrap();
+                assert!(!text.galley.job.justify);
+                assert_eq!(text.galley.job.halign, egui::Align::Min);
+                for row in &text.galley.rows {
+                    assert!(
+                        row.pos.x.abs() <= 1.0,
+                        "wrapped lines must keep their hanging indent"
+                    );
+                }
+                let bullet = texts
+                    .iter()
+                    .find(|bullet| {
+                        bullet.galley.job.text == "・" && (bullet.pos.y - text.pos.y).abs() <= 1.0
+                    })
+                    .expect("each item must start with a bullet");
+                assert!(bullet.pos.x < text.pos.x);
+                assert!((text.pos.x - headings[0].pos.x - bullet.galley.size().x).abs() <= 1.0);
+            }
+            let description = texts
+                .iter()
+                .find(|text| text.galley.job.text.contains("UserComment"))
+                .unwrap();
+            if width <= 400.0 {
+                assert!(
+                    description.galley.rows.len() > 1,
+                    "description must still wrap"
+                );
+            }
+            output.drop_without_applying_deltas();
+        }
+    }
+}
+
+#[test]
+fn ai_caption_description_is_one_indented_wrapping_paragraph() {
     let ctx = egui::Context::default();
     crate::ui_fonts::configure_fonts(&ctx);
+    let mut bounds = egui::Rect::NOTHING;
+    let mut normal_color = egui::Color32::PLACEHOLDER;
     let output = ctx.run_ui(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(600.0, 1000.0),
+                egui::vec2(400.0, 1000.0),
             )),
             ..Default::default()
         },
         |ui| {
-            draw_exposure(
+            bounds = ui.available_rect_before_wrap();
+            normal_color = ui.visuals().text_color();
+            draw_images(
                 ui,
-                &PermissionSelection {
+                &mut PermissionSelection {
                     level: AgentLevel::ReadOnly,
                     thumbnails: false,
                     gps: false,
@@ -41,14 +148,43 @@ fn exposure_descriptions_are_left_aligned_without_justification_and_still_wrap()
             );
         },
     );
-    let mut found = false;
-    for shape in &output.shapes {
-        check_text(&shape.shape, &mut found);
-    }
-    assert!(
-        found,
-        "the actual generation-info description must be drawn"
+    let texts = painted_text(&output);
+    let sentences = [
+        "ON にすると、AI アプリが AI 説明文 (説明文・画像内の文字・検索語) で検索でき、内容も受け取ります。",
+        "画像内の文字には、氏名・連絡先などが含まれる場合があります。",
+        "OFF でも、名前での検索結果から、本に AI 説明文があることを推測できる場合があります。",
+    ];
+    let paragraphs: Vec<_> = texts
+        .iter()
+        .filter(|text| {
+            sentences
+                .iter()
+                .any(|sentence| text.galley.job.text.contains(sentence))
+        })
+        .collect();
+    assert_eq!(
+        paragraphs.len(),
+        1,
+        "all three sentences must share one galley"
     );
+    let paragraph = paragraphs[0];
+    assert_eq!(paragraph.galley.job.text, sentences.concat());
+    assert!(paragraph.galley.rows.len() > 1);
+    assert_eq!(
+        paragraph.fallback_color, normal_color,
+        "privacy notice must use normal text color"
+    );
+    let checkbox = texts
+        .iter()
+        .find(|text| text.galley.job.text == "AI 説明文を AI に見せる")
+        .unwrap();
+    assert!(
+        (paragraph.pos.x - checkbox.pos.x).abs() <= 1.0,
+        "paragraph should align with checkbox text: {paragraph:?} / {checkbox:?}"
+    );
+    assert!(paragraph.pos.y > checkbox.pos.y);
+    let rect = paragraph.visual_bounding_rect();
+    assert!(rect.left() >= bounds.left() && rect.right() <= bounds.right() + 1.0);
     output.drop_without_applying_deltas();
 }
 

@@ -247,11 +247,17 @@ fn draw_images(ui: &mut egui::Ui, settings: &mut PermissionSelection) {
     ui.checkbox(&mut settings.thumbnails, "縮小画像を AI に見せる");
     ui.checkbox(&mut settings.gps, "撮影位置 (GPS) を AI に見せる");
     ui.checkbox(&mut settings.ai_captions, "AI 説明文を AI に見せる");
-    ui.label("ON にすると、AI アプリが AI 説明文 (説明文・画像内の文字・検索語) で検索でき、内容も受け取ります");
-    ui.label("画像内の文字には、氏名・連絡先などが含まれる場合があります。");
-    ui.label(
-        "OFF でも、名前での検索結果から、本に AI 説明文があることを推測できる場合があります。",
-    );
+    ui.scope(|ui| {
+        // Match the checkbox's icon + text gap, including custom UI spacing.
+        ui.spacing_mut().indent = ui.spacing().icon_width + ui.spacing().icon_spacing;
+        ui.indent("ai_caption_description", |ui| {
+            ui.add(egui::Label::new(concat!(
+                "ON にすると、AI アプリが AI 説明文 (説明文・画像内の文字・検索語) で検索でき、内容も受け取ります。",
+                "画像内の文字には、氏名・連絡先などが含まれる場合があります。",
+                "OFF でも、名前での検索結果から、本に AI 説明文があることを推測できる場合があります。",
+            )).wrap());
+        });
+    });
     ui.add_space(8.0);
 }
 
@@ -314,26 +320,31 @@ fn exposure(draft: PermissionSelection) -> Exposure {
 
 fn draw_exposure(ui: &mut egui::Ui, settings: &PermissionSelection) {
     let summary = exposure(*settings);
-    ui.columns(3, |columns| {
-        for (column, (title, lines)) in columns.iter_mut().zip([
+    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+        for (title, lines) in [
             ("AI に見せるもの", &summary.shown),
             ("見せないもの", &summary.hidden),
             ("AI に許す操作", &summary.actions),
-        ]) {
-            column.with_layout(egui::Layout::top_down(egui::Align::Min), |column| {
-                column.label(egui::RichText::new(title).strong());
+        ] {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.label(egui::RichText::new(title).strong());
                 for line in lines {
-                    column.add(egui::Label::new(*line).wrap().selectable(true));
-                    column.add_space(4.0);
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.label("・");
+                        ui.add(egui::Label::new(*line).wrap().selectable(true));
+                    });
                 }
             });
+            ui.add_space(4.0);
         }
     });
     ui.add_space(6.0);
-    ui.label("この情報は、お使いの AI アプリ (Claude / ChatGPT) の提供元へ送られます。各社のプライバシーポリシーに従って扱われます。mIV の開発者には送られません");
+    ui.label("この情報は、お使いの AI アプリ (Claude / ChatGPT) の提供元へ送られます。各社のプライバシーポリシーに従って扱われます。mIV の開発者には送られません。");
     ui.colored_label(
         ui.visuals().warn_fg_color,
-        "許可の範囲の中の操作は、AI アプリの確認なしで実行されます。ここで選ぶ範囲が唯一の上限です",
+        "許可の範囲の中の操作は、AI アプリの確認なしで実行されます。ここで選ぶ範囲が唯一の上限です。",
     );
     ui.add_space(12.0);
 }
