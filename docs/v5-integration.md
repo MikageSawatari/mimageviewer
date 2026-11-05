@@ -726,3 +726,11 @@ git add / commit / merge等のgit書き込みも行わない。
 - 独立レビュー (xhigh): `6e46f60` ACCEPT、`d49ada5` ACCEPT。日本語の期待値が辞書と一致することを確認。P3 として、`tests/esm/vst-upstream-ui.test.mjs` の再入テストが、実装に無い「既存の About があれば戻る」ガードを前提にしている点の指摘があった。About を開いたまま再び開く呼び出しで About が 2 つできる既存挙動 (`413c1eb` から、今回の回帰ではない) を隠しているため、後で実装とテストを揃える。
 - `miv` ブランチを `d49ada5` まで push した。`.\scripts\build-miv-sound.ps1 -Approve -Candidate 38cabd5b…` で `third_party/miv-sound/0.15.0-miv.6/` を作成。バックアップは `C:\home\mimageviewer_vendor_backup\miv-sound-0.15.0-miv.6\`。マニュアルを `manual/sound/v0.15.0-miv.6/` へ作り直した (旧 URL は 301 転送)。
 - 実機確認: 未確認 (利用者の手元確認待ち)。
+
+## 17. mIV Sound 0.15.0-miv.7 (候補 f165dcd0…) の承認 (2026-11-05)
+
+- 内容: miv.6 の rc で、About の 3 つのボタンの文字が語の途中で 2 行に折り返した (利用者の画面写真)。About を 520px に広げ (上流の max-width は維持)、各ボタンの文字を 1 行に保ち、狭いときはボタン単位で次の行へ送る (miv-sound `1c71181`)。WebView smoke に日本語・英語・幅 720/360/320px の配置検査を足した。
+- 経緯: 最初の幅の規則は `html.effetune-vst-host` に依存していたが、About を開いた時点で html にこのクラスが無く (検査で実測、init script が document element の生成前に走るためとみられる)、440px のままだった。`body .about-dialog` に改めた (`6657990`)。その際のコメントのバッククォートで bootstrap 全体が構文エラーになったのを直した (`1daaafb`、独立レビューの P1)。
+- 独立レビュー (xhigh): `1c71181` ACCEPT、`6657990` REJECT (P1 構文エラー)、`1daaafb` ACCEPT。既存の問題として、`vst-bootstrap.js` 25 行目の min-width の規則も同じクラスに依存していて効いていない (P3、今回は直さない)。
+- ctest 117/117 成功。`miv` ブランチを `1daaafb` まで push。`third_party/miv-sound/0.15.0-miv.7/` を作成、バックアップは `C:\home\mimageviewer_vendor_backup\miv-sound-0.15.0-miv.7\`。マニュアルを `manual/sound/v0.15.0-miv.7/` へ作り直した。
+- 実機確認: 未確認 (利用者の手元確認待ち)。
