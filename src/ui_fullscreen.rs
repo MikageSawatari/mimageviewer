@@ -53098,6 +53098,14 @@ impl App {
         labels.join(" + ")
     }
 
+    pub(crate) fn fs_erase_complete(&self, idx: usize) -> bool {
+        // Preserve the master's base-based indication across retained-PDF eviction
+        // and pending inpaint. MaskAbsent clears presence without deleting edit bases.
+        !self.erase_mode
+            && self.erase_base_cache.contains_key(&idx)
+            && self.mask_pages.contains(&idx)
+    }
+
     /// フルスクリーン左下に AI 処理ステータスを表示する。
     fn draw_fs_ai_status(&mut self, ui: &mut egui::Ui, fs_idx: usize) {
         let has_ai_pending = !self.final_ai_pending.is_empty();
@@ -53134,7 +53142,7 @@ impl App {
                 is_upscaling,
                 is_prefetching_ai,
                 is_upscaled,
-                erase_complete: self.erase_base_cache.contains_key(&fs_idx) && !self.erase_mode,
+                erase_complete: self.fs_erase_complete(fs_idx),
                 has_prefetch_indicator: prefetch_indicator.is_some(),
             },
         );

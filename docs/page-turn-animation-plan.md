@@ -6754,3 +6754,88 @@ spawn失敗も同じ入口で1回だけ記録し、その後のpollで重複ロ�
 - `cargo test --test ui_snapshot`: 213/213成功（30.98秒、`ui-snapshot.log`）。基準画像の更新なし。
 - 最後の`scripts/test-lib-full.ps1`: 14,674/14,674成功・既存除外65件・失敗0（509.343秒、`lib-full.log`）。ログ／JUnit／commandは`target/test-lib-full/runs/20261029T044527493Z-ea987a18/`、実行時source識別子は`af04a77774644cceb14d1d66f778e04b98c7cb565a2f1367a05894f60f7f182c`。全件・関連とも単独補完や自動再試行なし。
 - 独立静的レビューACCEPT、P1／P2／P3の未解決指摘なし。テストは実装担当のみが実行し、全テスト後に引数なしの`cargo fmt`が成功、`git diff --check`も成功した。利用者指定によりbuild-dev・製品起動・コミットは行わない。
+
+### 28.8 保存済み消しゴムのsource受理時の開始漏れ（§1.719、2026-11-05）
+
+**観測の出どころ。** 利用者は、演出ONで保存マスクのあるPDFを数秒ずつ待って読んでも、
+未消去画像でめくって着地後に消しゴムが反映されると報告した。設計担当のログ読みでは、
+Home直後310.418〜310.873sのidx 1〜10に通常prefetch開始／retained missとauto-applyがなく、
+その後の表示時に`ensure-result`が開始した。実装担当も指定ログとperfを読み取り専用で照合した。
+修正後の製品での実行結果は**未確認**。
+
+**コードと設定で特定した経路。** 現行設定は`ai_feature_mode=high_quality`、globalの
+`upscale_model=realesr_general_v3`、AI先読み前方10頁。旧`ai_upscale_enabled=false`は
+現行`effective_upscale_request`のgateではない。`anime_upscale`のstashは実行時post-filterへ
+復元されるが、Original要求は後段フィルタだけの先読みではなく、
+`prefetch_final_ai → ensure_edit_result_pixels_cpu → assemble_edit_result_pixels →
+ensure_original_material_for_entry(MaterialOnly)`が出す。
+入力寸法が未知の初回は範囲内の全欠落sourceへOriginalを要求する。
+受理後は`final_ai_prefetch_input_size`がraw寸法を返す。報告時の短辺約2376pxは保存設定の
+AI短辺上限2048pxを超えるため、`final_ai_key_for_pixels=None`のcontinueでedit ensureを
+再訪しない。旧`poll_prefetch`はsource挿入後の`preserve_completed`（Original）で、
+入力世代更新だけでなく`auto_apply_saved_mask`の手前でもcontinueしていた。
+sourceだけresidentになり、消しゴムproducerが一度も起動されない。
+段階Aの素材選択漏れの再発ではなく、producerをsource受理へ結び付ける境界の欠落である。
+過去ログにはcaller記録がないため、歴史的な呼出stackの直接観測とは区別する。
+同じ条件のhandler回帰で、この要求経路と漏れを検査する。
+
+**修正の所有境界。** source受理後の`auto_apply_saved_mask`が、目的に関係なく保存eraseを
+既存Commit ownerへ一度だけ接続する。通常reloadは先に既存の入力世代更新を行い、Originalは
+入力世代と完成finalを保持してから同じ境界へ通す。開始しない理由を型付きログへ残し、
+Original新規要求にはcallerも記録する。source受理時だけで、毎frameのlookupには追加しない。
+同keyのpending（受信済み未採用も含む）／完成結果を保持し、参加済みの編集continuationを
+書き換えない。新規jobは既存`MaterializeForEntry(MaterialOnly)`を使う。
+同じ入力の実体化完了で上段を消さず、実際のsource／mask変更は既存の世代更新と取消で扱う。
+独立レビューの空マスク指摘への対応では、縮小で空になった保存maskの存在情報だけを外し、編集用base／textureは保持する。
+再レビューでは保持PDFのfinal-AI復元時にerase結果だけが退去済みとなるため、HUDはmasterのbase有無と編集モード外の判定に`mask_pages`の存在条件だけを足す形へ戻した。
+補完pending中もmasterどおり表示し、`MaskAbsent`後や無描画で編集を終えた頁では表示しない。古いerase keyだけを理由にHUDを消す検査はこの契約に合わないため外した。
+実装担当の回帰はkeep-set退去→保持final復元→raw読込省略と空mask後のbase／texture保持を検査する。手動確定は存在情報を同期更新してから編集モードを解除する（製品実行は未確認）。
+
+組み合わせの簡素化として、目的別の呼出し追加や新pending／queueを作らず、source受理と
+既存Commitのkey照合へ集約した。閲覧のmodal化は入力や演出を制限するため採らない。
+UI応答性§4に照らし、増えるOriginal頁のmask DB読取・リサイズ・図形展開・透明部の黒flattenは
+`EraseInpaintMaskSource::Saved`でworkerへ渡す。UIはraw Arcとdisplay basisを捕捉し、
+色調判定も要求時のtoleranceをsnapshotしてworkerで行う。まれなMI-GAN／DB失敗はログ＋既存通知で、
+retry／回復stateを追加しない。めくり受付でのproducer開始・待機・delay・追加repaintはない。
+
+| 同型の入口 | 扱い |
+| --- | --- |
+| Display／Prefetch／PDF再描画／保持Raster復元 | pollのsource受理→世代更新→共通owner |
+| Original／MaterialOnly／編集・書出し用の素材取得 | 同じ受理→世代を維持→共通owner。完成finalは完了後も保持 |
+| ResumeAfterNormalLoad | 元の通常load契約で世代更新し、共通owner後に既存continuationを再開 |
+| RAW現像 | developed受理から同じowner。preview／情報だけは編集用sourceではない |
+| AnimationPromotion | 同じpollとownerを通す。frame pixelsと保存maskがあれば開始する。動画像の通常描画が編集段をbypassする既存契約は変更しない |
+| 見開き相方／連結読み | idxごとに同じ受理。可視・keep範囲／upload pacingは維持 |
+| detached／park・fork | mountされたcontextの既存ownerだけを更新。述語／viewport／F12移譲は変更せず、park中の新規pollも増やさない |
+
+**段階Bの監査。** `prepared_edit_input`／`prepared_edit_conflict`はFsLoadPurposeを見ない。
+maskのある頁はexact erase完成まで待ち、完成後はNextのlocal→conceal→final→comicを同じownerで
+作れる。Originalのcontinueにより直接飛ばされるB呼出しはないが、erase未開始では入力gateを
+満たせないため、この修正が下流も解放する。Previous resident-only、font不足、final AI必要、
+VRAM予算、MI-GANが受付に間に合わない場合は従来の§28.5 B8の差を残す。
+
+**実装担当の自動テスト。** 複数sourceを実AI先読みhandlerからOriginalで要求し、
+受理後のAIサイズgateを再訪しても各頁のeraseがpending／完成済みになること、完了後の
+`page_turn_resident_source`がeraseを選ぶことを検査する。要求は使い捨て静止画で実行し、
+decoder結果だけは制御したbacklog入力とする。実MI-GAN／PDFプロセスを起動せず既存diffusionで完了する。
+目的別受理、同key重複、編集continuation維持、Originalの完成finalのkey／Arc／texture保持、
+RAW現像、兄弟context不変、erase完了後のB全段とcomic受付も回帰対象とする。
+修正前の同handlerテストは1件実行・1件失敗（`accepted Original source idx=1 must start saved erase producer`）。
+先にOriginalの早期continueへ型付き`OriginalPreservesCompleted`の診断を加えて確認し、修正でその分岐を撤去した。
+証跡は`target/erase-prefetch-red.log`。現コードのskip理由はEditing／RemoteControlled／NoSavedMask／
+Completed／CommitPending／SourceUnavailable／InvalidDimensions／PageIdentityUnavailable／ProducerNotStarted。
+Editing／RemoteControlledの既存排他は維持し、目的だけによるskipをなくす。
+修正後の指定検証は`target/erase-prefetch-green.log`、`target/erase-prefetch-related.log`、
+`target/erase-prefetch-check.log`、`target/test-lib-full/runs/`の台帳と最終引継ぎに記録する。
+追加回帰5件は全件成功（3.156秒）。Bの初回1失敗はpaint-only fixtureのscalar世代41と
+cache owner世代0の不一致でsourceを拒否したもの。新テスト内だけで既存setterへ世代を揃え、
+受理sourceをassertしてからproducerを検査する形に直した。製品の世代gateは変更していない。
+独立したGPT-6.1 Sol／xhighの設計・完成差分の静的レビューはACCEPT、未解決指摘なし。
+指定関連filter（erase／page_turn／prefetch／final_prepare／prepared_edit／viewer_context_audit）は
+645件すべて成功（84.535秒、兄弟のresident Arc／pending token保持の強化を含む）。
+通常core check、引数なしcargo fmtと最終fmt --check、diff --check、UIグリフ検査（0件）も成功。
+TEMP／TMPは開始時に空で作成した`target/tmp-test-env`を使用。cold native buildのMSBuild失敗は
+プロセスローカル`CARGO_BUILD_JOBS=1`／`_CL_=/Z7`で対応し、ビルド設定ファイルは変更していない。
+この後のlib全件1回の結果・source識別子・確認用ビルドは、上記台帳と
+`target/erase-prefetch-implementation-report.md`へ記録する。
+製品起動・commitは行わず、検収は設計担当へ残す。
