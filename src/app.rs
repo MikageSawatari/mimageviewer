@@ -78323,16 +78323,20 @@ impl App {
         if self.is_raw_page(idx) {
             return false;
         }
-        crate::logger::log(format!(
-            "[fs] original material requested idx={idx} entry={entry:?} caller={}",
-            std::panic::Location::caller()
-        ));
         self.start_fs_load_with_purpose(
             idx,
             purpose,
             FsPageLoadContract::Sequential,
             crate::video::PlaybackStartOrigin::NewSource,
         );
+        // A PDF without viewport/canonical dimensions has not been admitted yet.
+        // Re-evaluating that demand must not emit a caller record every frame.
+        if self.fs_pending.contains_key(&idx) {
+            crate::logger::log(format!(
+                "[fs] original material requested idx={idx} entry={entry:?} caller={}",
+                std::panic::Location::caller()
+            ));
+        }
         false
     }
 

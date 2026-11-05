@@ -53098,6 +53098,15 @@ impl App {
         labels.join(" + ")
     }
 
+    pub(crate) fn fs_erase_complete(&self, idx: usize) -> bool {
+        // The edit base can exist before inpaint, including when a resized saved
+        // mask turns out empty. Only a current committed result proves completion.
+        !self.erase_mode
+            && self
+                .erase_result_cache
+                .contains_key(&self.current_erase_result_key(idx))
+    }
+
     /// フルスクリーン左下に AI 処理ステータスを表示する。
     fn draw_fs_ai_status(&mut self, ui: &mut egui::Ui, fs_idx: usize) {
         let has_ai_pending = !self.final_ai_pending.is_empty();
@@ -53134,7 +53143,7 @@ impl App {
                 is_upscaling,
                 is_prefetching_ai,
                 is_upscaled,
-                erase_complete: self.erase_base_cache.contains_key(&fs_idx) && !self.erase_mode,
+                erase_complete: self.fs_erase_complete(fs_idx),
                 has_prefetch_indicator: prefetch_indicator.is_some(),
             },
         );

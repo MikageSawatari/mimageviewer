@@ -100,6 +100,77 @@ fn erase_prefetch_original_sources_start_saved_stage_before_page_turn() {
 }
 
 #[test]
+fn erase_prefetch_resized_empty_mask_never_reports_hud_completion_or_removes_edit_base() {
+    for preserve_edit_base in [false, true] {
+        let ctx = egui::Context::default();
+        let (mut app, _) = completed_only(&ctx);
+        app.ai_runtime_init =
+            crate::ai::runtime::AiRuntimeInitOwner::failed_for_test("empty saved mask");
+        let page_key = app.page_path_key(0).unwrap();
+        let mut mask = vec![false; 16];
+        mask[5] = true; // (1, 1) disappears when the 4x4 bitmap is sampled at 2x2.
+        app.mask_db = Some(crate::mask_db::MaskDb::open().unwrap());
+        app.mask_db
+            .as_ref()
+            .unwrap()
+            .set(&page_key, &mask, &[], 4, 4)
+            .unwrap();
+        app.mask_pages.insert(0);
+        app.mask_page_keys.insert(page_key.clone());
+        let generation = app.items_generation;
+        app.fs_upload_backlog.push_for_generation(
+            generation,
+            FsUploadResult::new(
+                0,
+                FsLoadResult::Static {
+                    ci: egui::ColorImage::filled([2, 2], egui::Color32::BLUE),
+                    source_dims: [4, 4],
+                    animation: StaticAnimationState::Still,
+                },
+                99,
+                FsLoadPurpose::Original {
+                    entry: OriginalMaterialEntry::MaterialOnly,
+                },
+            ),
+        );
+        app.poll_prefetch(&ctx, PollPrefetchOrigin::TopLevel);
+        assert!(app.commit_pending_matches_current_erase_key(0));
+        // A base prepared for editing/display while the saved job is pending
+        // belongs to that consumer, not to MaskAbsent cleanup.
+        if preserve_edit_base {
+            let manual_base = app.capture_erase_base_source(
+                0,
+                Arc::new(egui::ColorImage::filled([2, 2], egui::Color32::RED)),
+            );
+            app.erase_base_cache.insert(0, manual_base);
+        }
+        let edit_material =
+            preserve_edit_base.then(|| app.ensure_erase_base_material(&ctx, 0).unwrap());
+        let base_pixels = Arc::clone(&app.erase_base_cache[&0].pixels);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !app.erase_inpaint_pending.is_empty() {
+            app.poll_erase_inpaint(&ctx);
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(!app.mask_pages.contains(&0));
+        assert!(!app.mask_page_keys.contains(&page_key));
+        assert!(app.current_erase_result_pixels(0).is_none());
+        assert!(Arc::ptr_eq(&base_pixels, &app.erase_base_cache[&0].pixels));
+        if let Some(material) = edit_material {
+            assert_eq!(
+                app.erase_base_tex_cache[&0].source_texture().id(),
+                material.source_texture().id()
+            );
+        }
+        assert!(
+            !app.fs_erase_complete(0),
+            "an edit base without a completed erase result must not light the HUD"
+        );
+    }
+}
+
+#[test]
 fn erase_prefetch_source_acceptance_is_purpose_independent_and_idempotent() {
     for purpose in [
         FsLoadPurpose::Display,
@@ -221,6 +292,15 @@ fn erase_prefetch_source_acceptance_is_purpose_independent_and_idempotent() {
             &pixels,
             &app.current_erase_result_pixels(0).unwrap()
         ));
+        assert!(app.fs_erase_complete(0));
+        app.erase_mode = true;
+        assert!(!app.fs_erase_complete(0));
+        app.erase_mode = false;
+        // A retained entry for a previous key is not a current completion.
+        let input_generation = app.input_generation.get(&0).copied().unwrap_or(0);
+        app.input_generation.insert(0, input_generation + 1);
+        assert!(!app.fs_erase_complete(0));
+        app.input_generation.insert(0, input_generation);
         if matches!(purpose, FsLoadPurpose::Original { .. }) {
             assert_eq!(app.current_edit_result_key(0), before);
             assert!(Arc::ptr_eq(
