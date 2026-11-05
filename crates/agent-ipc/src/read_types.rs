@@ -162,7 +162,7 @@ pub struct AiCaptionInfo {
     pub model: String,
     /// UTC Unix milliseconds, matching the caption store.
     pub created_at: i64,
-    /// Books require cover resolution and intentionally do not report staleness.
+    /// Compares the current source and rotation; None when the source cannot be resolved.
     pub stale: Option<bool>,
 }
 

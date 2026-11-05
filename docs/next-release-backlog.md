@@ -106,6 +106,148 @@
   今回の規則変更に含めた。合計30 scalar未満を残す条件を追加した（下記§1.716）。
   設計担当が更新した `startup_whats_new_1093x614.png`／`startup_whats_new_1366x728.png` は保持し、snapshotを実行・更新しない。
 
+<a id="caption-rotation-1717"></a>
+
+### 1.717 AI 説明文を mIV の回転に追従させる (2026-11-05)
+
+- 観測・判断の出どころ: 設計担当のコード調査で、作成後の回転が作成済み／古いの照合に含まれず、ZIP・PDF の本の表紙には回転が適用されないことを確認。利用者が現在の向きで作り直せる仕様を決定した。製品での実行結果は未確認。
+- 所有者: 作成 worker が入力に適用した回転を行へ保存し、作成済み判定・表示・MCP は共通の入力照合を使う。ZIP・PDF のキーは App のページ回転と共有する。
+- 既存行: v5 は未リリースだが利用者の開発機に約 1000 行あるため、列が無ければ既定値 0 で追加し、説明文を残す。旧行は回転なし扱いで、一度だけ古くなる場合があることを利用者が了承した。
+- 表示・失効: 署名／表紙位置の不一致は従来の案内を優先し、回転だけ違えば「向きが変わっています」と案内。現在の回転は表示 worker で読み、回転を書いたキーを入力に使う項目だけを失効させる。無関係なキャッシュと viewer context は保持する。
+- まれな失敗は既定の割り切り。回復の仕組みや閲覧の制限を追加しない。生成された説明文の本文は記載しない。
+- 正本: [ローカル AI 説明文計画 §21.22](local-vlm-caption-plan.md#caption-rotation-1717)。実装・自動検証・独立レビュー済み、製品での実機確認は未実施。コミットは設計担当が行う。
+
+#### §1.717 実装・検証記録（2026-11-05）
+
+- 保存・照合: `ai_caption_db` の `SaveRequest`／`CaptionRow` が生成時の `Rotation` を保持し、SQL は 0/90/180/270 を保存する。
+  旧 DB は列が無いときだけ追加し、read-only と旧 DB の書き出しは列無しを 0 として読む。
+  `CaptionRow::matches_source` に署名・表紙参照・回転を集約し、作成の飛ばす判定・表示・MCP が使う。
+- 入力: `edit_source::caption_rotation_key` が `ReadLocation` を既存の `GridItem` へ写し、`page_key_for_grid_item` へ委譲する。
+  worker は回転を飛ばす判定前に一度読み、その同じ値でデコード後の画像を回して保存する。ZIP・PDF にも適用し、compiled 物理ページは本棚 root の既存判定で 0。
+- 失効: `App::apply_rotation` は実変更だけを通知し、単体・一括・取り消しを共通化。全解除は成功時に既存の非0キー集合を通知して空にする。
+  `STORES` の付け替え・コピー・削除・孤児整理は `RotationMutationSnapshot` の対象範囲の前後比較を commit 後の `StoreMutationEffects.rotation_keys` へ載せる。
+  内容による復元の完了点もこの集合を採用する。取り込みは `ImportCommittedChanges.rotation_keys` を batch commit 後に公開する。
+- 表示: `CaptionDisplayCache` は既存の世代に加えて解決した入力キーを保持する。未解決の Pending は共有された変更キー集合を要求寿命で持ち、
+  返ってきた入力キーに一致する場合だけ棄却する。無関係な読み込み・値は保持し、次の通常需要で対象だけ読み直す。
+  再読込中の以前の表示は従来の非同期 refresh と同じく一時保持する判断とした。UI の新規同期読取りはない。
+- MCP: 許可済みの成功行にだけ worker で必要な4設定と固定表紙等を読み、本も既存 resolver で照合する。
+  今の入力を読めない場合は `stale=null`。tool の説明と IPC 型コメントも揃え、protocol の形と版は変更しない。
+- 追加回帰21件（既存2件の名前・期待も新仕様へ変更）: 旧 DB の1000行保持／列追加前の read-only と書き出し、4方向の保存・画像とZIP/PDF入力・飛ばす判定・compiled 0、
+  署名優先の文言と回転警告、読み込み中の変更と兄弟保持、worker 再読込、2回の全解除で以前の項目保持、
+  MCP画像／本／ZIP部分指定、STORESのrename/copy/book操作/purge/cleanupの実変更・rollback、取り込みの実変更／同値／解除／savepoint rollback。
+  PDF は raster 取得だけを注入し、製品と同じデコード後の回転・縮小を通す。実モデル生成や製品起動の結果ではない。
+- 独立レビュー: GPT-6.1 Sol / xhigh が完成差分を ACCEPT。指摘した旧DB書き出し・復元通知・全解除キー残留・同値通知・PDF回帰・MCP説明は修正後に再確認済み。
+  実行検証は統合担当が所有する。利用者の「関係するものに絞る」指定に従い、全体 gate は実施しない。
+- 変更ファイル（本項目の差分）:
+  - 保存・入力: `src/ai_caption_db.rs`、`src/ai/caption_job_worker.rs`、`src/edit_source.rs`、`src/app/book_cover.rs`、`src/rotation_db.rs`。
+  - 表示・通知: `src/caption_display_cache.rs`、`src/ui_metadata_panel.rs`、`src/app.rs`、`src/app/caption_display_tests.rs`、
+    `src/app/content_identity_detection.rs`、`src/app/content_identity_restore.rs`、`src/content_identity/restore.rs`、
+    `src/rename_key_migration.rs`、`src/metadata_cleanup.rs`、`src/ui_dialogs/metadata_cleanup.rs`、`src/ui_dialogs/rotation_reset.rs`。
+  - MCP・転送: `src/agent_ipc/item_info.rs`、`src/agent_ipc/item_info_tests.rs`、`src/settings_db.rs`、`src/metadata_transfer.rs`、
+    `crates/agent-ipc/src/read_types.rs`、`crates/mcp-server/src/schema.rs`。
+  - 既存テストfixtureの新フィールド追従: `src/app/collection_grid.rs`、`src/ingest_text.rs`、`src/ingest_worker.rs`。
+  - 文書: `docs/local-vlm-caption-plan.md`、`docs/next-release-backlog.md`、`docs/spec.md`、`docs/mcp-integration-plan.md`、
+    `docs/architecture-overview.md`、`docs/async-architecture.md`、`docs/ui-responsiveness.md`、
+    `htdocs/mimageviewer/manual/tut-ai-caption.html`、`htdocs/mimageviewer/index.html`。
+- スナップショット: `tests/snapshots/caption_panel_rotation_stale.png` を1枚追加（38,472 bytes）。
+  指定の回転警告が欠けずに収まることを統合担当が生成PNGで確認した。既存PNGの更新はない。設計担当の目視検収は別途。
+- 検証途中の修正記録: 統合checkの `StoreMutationEffects` Clone化による所有権エラー2件と、test compileの同じ前提1件を修正。
+  初回focusedは322件中316成功・6失敗（50.455秒、exit100）。失敗は新15列へ旧14値を入れる既存test用SQLの2か所と、
+  旧DB exportの追加testがroot行にも説明文を期待したもの。列名と回転を明記し、画像1件とrootを区別する回帰へ修正した。
+  製品コードの期待値は変更せず、コピー時の回転90度保持の検査も追加した。独立レビューは追補後も ACCEPT。
+- `cargo check -p mimageviewer --bin mimageviewer-core` は修正後成功（57.12秒、exit0）。
+  `cargo fmt`（引数なし）／`cargo fmt --check`／`git diff --check` は成功、UI glyphは0件、site cardsは52件中上限超過0件。
+  snapshot生成は `cargo nextest run -p mimageviewer --lib -E 'test(=ui_metadata_panel::caption_panel_tests::caption_panel_snapshot_rotation_stale)'`
+  に `UPDATE_SNAPSHOTS=1` を指定して1/1成功（1.481秒、compile 6分37秒）。
+  ログは `target/caption-rotation-check-final.*.log`、`target/caption-rotation-snapshot-final.*.log`、
+  初回focusedは `target/caption-rotation-tests.*.log`。
+- 修正・整形後の focused: `cargo nextest run -p mimageviewer --lib --test-threads 4 -E 'test(/caption|rotation/)'` は
+  **322/322成功、exit0、48.991秒**（compile 2分54秒、default feature／test profile／nextest default）。
+  run `913145f8-acda-45e2-8a78-550a415a57f9`、ログ `target/caption-rotation-tests-final.*.log`。
+  `UPDATE_SNAPSHOTS` は外し、新しい1枚と既存の説明欄も通常比較で成功した。
+- MCPのtool説明を含むschema検査: `cargo nextest run -p mimageviewer-mcp --lib --test-threads 4 -E 'test(schema::tests)'` は
+  **2/2成功、exit0、0.032秒**（compile 3.95秒、default feature／test profile／nextest default）。
+  run `6555cb0c-586c-475c-a898-23e0520c4c7e`、ログ `target/caption-rotation-mcp-schema-final.*.log`。
+  最初の `--bin mimageviewer-mcp` 指定は0件でexit4となったため成功に数えず、libへ指定し直した。
+- 全コマンドのTEMP/TMPは `G:\home\mimageviewer-badge-1663\target\tmp-test-env`、`MSBUILDDISABLENODEREUSE=1`。
+  テスト前の既存一時領域は同じtarget内の `tmp-test-env-before-caption-rotation-b35da2a95b74492586f3e64c40ddcba1` へ改名して保持し、空の指定先を作った。
+- 確認用ビルド: `.\scripts\build-dev.ps1` は **exit0**。通常feature／`dev-runtime` profileでcoreと付属4本を生成し、
+  配置後のVCRT/PE検査は `runtime=4 pe=5` で成功した。core buildは4分36秒。
+  出力は `target/dev-runtime/mimageviewer-core.exe`、ログ `target/caption-rotation-build-dev.log`、検査記録 `target/vcrt-pe-reports/dev-runtime.json`。
+  通常の `%APPDATA%\mimageviewer` を使う構成であり、製品起動・画面操作は行っていない。
+- 保護対象の `config/miv-sound.rs` は開始時SHA256と一致し、`target/miv-sound-candidates/` は変更していない。
+  コミット・stage・ブランチ切替は行っていない。
+
+#### §1.717 独立レビュー P2 の追補（2026-11-05、改名後の全解除）
+
+- 利用者から共有された別の xhigh 独立レビューは REJECT。90度の説明文を持つAをBへ改名した後、Bを表示したまま全解除すると、
+  `rotation_page_keys` が旧AのままでBの表示cacheが失効しない。旧Aを別画像で再利用した場合は、その無関係なcacheも失効し得る。
+  前回の担当レビューは改名完了からhelperへの到達確認に留まり、helperの集合列挙から回転だけが漏れていることを見落とした。
+- 修正: `App::rewrite_page_edit_presence_for_rename` の既存の付け替えへ回転集合を追加（計7集合）。
+  Shell成功直後とgeneric DB移行完了（起動journalの再実行を含む）の両入口を同じ修正で覆い、新しい通知・DB読取りは加えない。
+- 同型監査: 補正・ローカル調整・マスク・隠蔽・注釈・切り取りは同helperに既に含まれていた。
+  製本の改名／並べ替え／移動は `adopt_book_path_metadata` がsnapshotから回転集合を付け替え、copy先は初期化する。
+  caption cacheのキーは移行commitで失効し、`StoreMutationEffects.rotation_keys`／取り込みの `ImportCommittedChanges.rotation_keys` は
+  各commitの実変更を表す一時結果なので、保持して後日の改名に追従させる集合ではない。Pending中の変更キーもその要求の寿命で棄却判定にだけ使う。
+- 回帰2件: 全7集合についてexact／配下／仮想ページ／隣接prefixと同一移行の二重通知を検査。
+  実ファイル・実DBの改名とフォルダ間移動→generic完了採用→表示worker読込み→全解除でBの回転だけが古くなり、
+  再利用した旧Aと兄弟の表示値は保持されることを検査する。App共有cacheを使い、viewer別の新状態は作らない。
+- 今回の変更ファイル: `src/app.rs`、`src/app/caption_display_tests.rs`、`docs/local-vlm-caption-plan.md`、`docs/next-release-backlog.md`。
+  関連検証と確認用buildは以下のとおり成功。コミットは行っていない。
+- 修正差分の独立レビュー（GPT-6.1 Sol / xhigh）は ACCEPT、追加の修正必須指摘なし。
+  `cargo check -p mimageviewer --bin mimageviewer-core` は exit0（44.82秒）、`cargo fmt`（引数なし）／`cargo fmt --check`／`git diff --check` も成功。
+  checkログは `target/caption-rotation-rename-check.*.log`。TEMP/TMPは今回も `target/tmp-test-env`、`MSBUILDDISABLENODEREUSE=1`。
+- 関連テスト: `cargo nextest run -p mimageviewer --lib --test-threads 4 -E 'test(/caption|rotation|rename_rewrites_presence_sets|book_structure/)'` は
+  **347/347成功、exit0、67.207秒**（compile 4分33秒、default feature／test profile／nextest default）。
+  run `77953569-4d79-4ee0-9852-96212cb1dad1`、ログ `target/caption-rotation-rename-tests.*.log`。
+  新しい回帰2件と既存の改名・製本を含む。UI文字列・描画の変更はなく、snapshotは更新していない。
+- `.\scripts\build-dev.ps1` は exit0（core 2分44秒）。通常feature／`dev-runtime` profileでcoreと付属4本を更新し、
+  配置後VCRT/PE検査は `runtime=4 pe=5` で成功。ログ `target/caption-rotation-rename-build-dev.log`。
+  製品起動・画面操作は未実施。保護対象の設定ファイルは開始時hashと一致し、候補ディレクトリは変更していない。
+
+#### §1.717 全件検証で判明したfixtureの追補（2026-11-05）
+
+- 出どころ: 設計担当がP2修正前の本体lib全件と、修正後の `rename_key_migration::`（67/70）で、
+  `copy_path_covers_all_unique_stores_for_image_zip_and_pdf_faces`、`book_follow_stores_swap_all_faces_replace_stale_and_initialize_copies`、
+  `shared_store_list_hard_purge_covers_exact_folder_and_container_prefixes` の3件に `no such column: angle` を確認。
+  前回の347件のfilterにはこの3件が入らず、fixtureの追従不足を捕捉していなかった。
+- 原因の判断: fixture側を修正する。実際の `RotationDb` は導入当初から `rotations(path, angle)` を持ち、get/setもangle必須。
+  固定の `STORES` を扱うrun/copy/purgeは、任意SQLite schemaを受け取る汎用APIではない。
+  キー移行自体はdescriptor駆動のままで、回転の実効変化を通知するための角度読取りが、既存の製品DBの契約を壊したものではない。
+  他ストアにもratingsのsource_path等の専用処理がある。列欠落を0として隠す製品fallbackは加えない。
+- 変更: `src/rename_key_migration.rs` のtest moduleだけで、3fixtureの回転表を既存 `rotation_fixture` → 製品の `RotationDb::open_at` から作る。
+  copy/book用のpayload列は検証用として追加し、90/180/270の非ゼロ角度をseedする。
+  従来の全ストア網羅・payload移行・source保持・隣接prefix保持のassertを維持し、角度の保持・入替とcopy/purgeの通知キーも検査する。
+  製品部分は今回の開始時コピーと一致することを比較した。製品コード変更がないため、確認用binaryの再buildは不要で前回P2修正後のbuildを再利用する。
+- 独立したGPT-6.1 Sol / xhighの原因判断も同じ。今回の広いfilterと結果は実施後に追記する。コミットは行わない。
+- 完成差分の独立レビューも ACCEPT、追加指摘なし。今回の編集は `src/rename_key_migration.rs` のtest moduleと本記録だけ。
+- 広い検証: `cargo nextest run -p mimageviewer --lib --test-threads 4 -E 'test(/rename_key_migration::|metadata_transfer|content_identity|rotation|caption|metadata_cleanup|ingest|settings_db|agent_ipc/)'`。
+  **955実行／953成功／2失敗、exit100、104.176秒**（compile 2分19秒、default feature／test profile／nextest default）。
+  run `b25bb32c-e146-4679-8c6a-fb90ed20d842`、ログ `target/caption-rotation-wide-tests.*.log`、JUnit `target/caption-rotation-wide-junit.xml`。
+- JUnitの実行済みテスト名の語一致で集計した範囲（語が重なるため合計しない）:
+
+  | filter内の語 | 実行 | 成功 | 失敗 |
+  | --- | ---: | ---: | ---: |
+  | `rename_key_migration::` | 70 | 70 | 0 |
+  | `metadata_transfer` | 119 | 119 | 0 |
+  | `content_identity` | 98 | 98 | 0 |
+  | `rotation` | 137 | 137 | 0 |
+  | `caption` | 204 | 204 | 0 |
+  | `metadata_cleanup` | 16 | 16 | 0 |
+  | `ingest` | 51 | 51 | 0 |
+  | `settings_db` | 154 | 154 | 0 |
+  | `agent_ipc` | 164 | 162 | 2 |
+
+- 失敗2件は `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry`（`pipe.rs:334`、fixture pipeへのclient open）と
+  `agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`（`tests.rs:759`、fixture_server作成、adapter取得／起動より前）。
+  いずれもOS5／PermissionDeniedで、[V2aの既存記録](local-vlm-caption-plan.md#21163-検証)と同じテスト・同じ箇所の環境制限に一致する。
+  今回の説明文処理へ到達する前の失敗で、製品pipeコード・当該テストは変更していない。独立レビューも同分類。
+  成功扱い・ignore/skip化・権限変更・同条件retryは行わず、この環境での実transport検証は未完了とする。
+- 追加のIPC型crate検証: `cargo nextest run -p mimageviewer-agent-ipc --lib --test-threads 4` は **16/16成功、exit0、0.190秒**（compile 4.41秒）。
+  run `b8377cb9-57cb-48f5-b841-2608195dbdb2`、ログ `target/caption-rotation-ipc-types-tests.*.log`。
+- TEMP/TMPは `target/tmp-test-env`、`MSBUILDDISABLENODEREUSE=1`。`cargo fmt`（引数なし）／`cargo fmt --check`／`git diff --check` は成功。
+  全libは再実行しておらず、上記filterの結果として報告する。コミット・製品起動・UI/snapshot更新は行っていない。
+
 ### 1.716 AI 説明文の保存前に連続反復を整理する (2026-11-05)
 
 - 利用者の画面写真の観測: 画像内の文字に短い語の連続、連続行、2行交互の反復が上限まで続いた。生成結果の本文は転載しない。

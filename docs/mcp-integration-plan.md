@@ -1223,7 +1223,7 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
     `CaptionField` は `present` (説明文・画像内の文字・検索語・モデル名・UTC Unix ms の作成日時・`stale`)、`none`、`not_permitted`。
     既存の `InfoField` の状態は変えない。部分の指定では項目の説明文は `none`、外側の本の説明文を `container_ai_caption` に返す。
     部分の指定がなければ `container_ai_caption` は `null`。OFF は `not_permitted` で、説明文 DB を開かない。
-    画像の古さだけ既読 metadata と署名で判定し、本の古さは表紙解決を持ち込まず `null`。失敗行は `none`、DB 読取失敗はログと要求の失敗にする。
+    画像・本の古さは作成済み判定と共通の署名・表紙位置・回転の照合で判定する (§1.717)。本の表紙解決と回転の読取りは応答 worker で行い、今の入力を読めない場合は `null`。失敗行は `none`、DB 読取失敗はログと要求の失敗にする。
 - 全 tool で `readOnlyHint=true`。
 
 ### 15.4 出力予算・期限・取消 (1a、全 tool 共通)

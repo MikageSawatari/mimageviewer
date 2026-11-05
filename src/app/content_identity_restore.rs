@@ -417,6 +417,13 @@ impl App {
         // Successful restores publish ledger entries incrementally below; they
         // do not require an authoritative ledger reload. Captions are shared
         // across viewer contexts and must still reflect the committed copies.
+        self.caption_display.invalidate_rotation_keys(
+            report
+                .store_mutations
+                .rotation_keys()
+                .iter()
+                .map(String::as_str),
+        );
         if report.store_mutations.ai_captions_changed() {
             self.notify_caption_changed();
         }
@@ -931,7 +938,7 @@ mod tests {
             tx.send(crate::content_identity::ContentRestoreReport {
                 // An actual store commit owns invalidation even without any
                 // requested restore/decline count in the terminal report.
-                store_mutations: mutation,
+                store_mutations: mutation.clone(),
                 ..Default::default()
             })
             .unwrap();

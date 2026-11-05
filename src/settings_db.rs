@@ -327,6 +327,13 @@ pub(crate) struct RemoteListingSettings {
     thumb_aspect_auto: bool,
 }
 
+pub(crate) struct CaptionSourceSettings {
+    pub(crate) books_root: PathBuf,
+    pub(crate) folder_thumb_sort: crate::settings::SortOrder,
+    pub(crate) folder_thumb_depth: u32,
+    pub(crate) visibility: crate::file_type_visibility::FileTypeVisibility,
+}
+
 /// Small live snapshot used to resolve one Remote book presentation.
 ///
 /// The long-lived Remote container engine keeps a startup `Settings` value for
@@ -897,6 +904,48 @@ impl SettingsDb {
         crate::settings::normalize_image_ext_priority(&mut settings.image_ext_priority);
         settings.audio_thumbnail_indicator = settings.audio_thumbnail_indicator.normalized();
         Ok(settings)
+    }
+
+    /// Worker-only read projection; does not run startup migration or update saved state.
+    pub(crate) fn load_caption_source_settings(
+        &self,
+    ) -> Result<CaptionSourceSettings, SettingsDbError> {
+        let mut settings = Settings::default();
+        {
+            let inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
+            let mut statement = inner.conn.prepare("SELECT key, value FROM settings_kv WHERE key IN ('book_root','folder_thumb_sort','folder_thumb_depth','file_type_visibility')")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (key, raw) = row?;
+                match key.as_str() {
+                    "book_root" => {
+                        settings.book_root = serde_json::from_str(&raw)
+                            .map_err(classify_settings_deserialization_error)?
+                    }
+                    "folder_thumb_sort" => {
+                        settings.folder_thumb_sort = serde_json::from_str(&raw)
+                            .map_err(classify_settings_deserialization_error)?
+                    }
+                    "folder_thumb_depth" => {
+                        settings.folder_thumb_depth = serde_json::from_str(&raw)
+                            .map_err(classify_settings_deserialization_error)?
+                    }
+                    "file_type_visibility" => {
+                        settings.file_type_visibility = serde_json::from_str(&raw)
+                            .map_err(classify_settings_deserialization_error)?
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        Ok(CaptionSourceSettings {
+            books_root: settings.books_root_path(),
+            folder_thumb_sort: settings.folder_thumb_sort,
+            folder_thumb_depth: settings.folder_thumb_depth,
+            visibility: settings.file_type_visibility,
+        })
     }
 
     /// Read only the scalar settings that determine one Remote book layout.

@@ -47,6 +47,7 @@ impl BookKind {
 
 #[derive(Clone)]
 pub(crate) struct BookCoverEnv {
+    pub(crate) books_root: Option<PathBuf>,
     pub(crate) folder_thumb_sort: crate::settings::SortOrder,
     pub(crate) folder_thumb_depth: u32,
     pub(crate) visibility: crate::file_type_visibility::FileTypeVisibility,
@@ -61,6 +62,7 @@ pub(crate) struct BookCoverEnv {
 impl Default for BookCoverEnv {
     fn default() -> Self {
         Self {
+            books_root: None,
             folder_thumb_sort: crate::settings::SortOrder::Numeric,
             folder_thumb_depth: 3,
             visibility: Default::default(),
@@ -78,6 +80,7 @@ impl App {
     /// Capture handles and settings only; opening stores and source I/O happen on the worker.
     pub(crate) fn book_cover_env(&self) -> BookCoverEnv {
         BookCoverEnv {
+            books_root: Some(self.book_root_path()),
             folder_thumb_sort: self.settings.folder_thumb_sort,
             folder_thumb_depth: self.settings.folder_thumb_depth,
             visibility: self.listing_file_type_visibility().clone(),

@@ -53,6 +53,8 @@ impl App {
         &mut self,
         effects: crate::rename_key_migration::StoreMutationEffects,
     ) {
+        self.caption_display
+            .invalidate_rotation_keys(effects.rotation_keys().iter().map(String::as_str));
         if effects.ai_captions_changed() {
             self.notify_caption_changed();
         }

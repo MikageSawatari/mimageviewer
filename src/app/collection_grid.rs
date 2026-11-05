@@ -4062,6 +4062,7 @@ mod tests {
         let db = CaptionDb::open_at(app.tmp.path().join("ai_caption.db")).unwrap();
         assert_eq!(
             db.save(&SaveRequest {
+                rotation: crate::rotation_db::Rotation::None,
                 item_path: page.clone(),
                 signature_path: page.clone(),
                 signature: original,

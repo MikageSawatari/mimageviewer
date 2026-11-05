@@ -1371,10 +1371,10 @@ V1-4b の本対応は実装・検証中で、検収・実機確認は未完了�
 
 `CaptionDisplayCache` は `ViewerContextBundle` に入れずApp共有とし、共通情報パネルから読む。
 既存のcontext別メタデータcache・pending・読み込みworkerを変更せず、休眠中の窓も同じ値を参照する。
-キーごとにLoading／Loaded（行なしを含む）を持ち、全消去の `epoch` とキー別 `gen` を要求に付ける。
+キーごとにPending（初回／以前の表示値を持つ再読み込み）／Loaded（行なしを含む）を持ち、全消去の `epoch` とキー別 `gen` を要求に付ける。
 初回要求で単一workerを起動し、以後はchannelで待つ。DB未作成なら作らず行なしを返す。
 1件ごとにread-only SELECTを行い、画像は現在のファイル署名、本は `BookCoverEnv` を使う
-`resolve_book_cover` の `cover_ref` と署名で照合する。読み取りtransactionを持ち越さない。
+`resolve_book_cover` の `cover_ref` と署名で照合する。§1.717では現在の回転もworkerで読み、生成時の回転と共通照合する。読み取りtransactionを持ち越さない。
 結果は `request_repaint` とchannelでrootへ渡し、`App::ui` の非blocking pollで世代照合して採用する。
 DB失敗はログと行なしに留め、終了時はchannelを閉じてUIでjoinしない。
 
@@ -1383,7 +1383,7 @@ DB失敗はログと行なしに留め、終了時はchannelを閉じてUIでjoi
 共通パネルの「この本の AI 説明」に出す。表紙の解決は表示開始時に1回だけ worker で行う。
 表示の再入場はeguiのviewport＋panel IDごとの一時履歴のframe／keyで判定し、bundleには持たせない。
 同じキーの連続描画では再送せず、毎フレームのSELECT／statを避ける。表示再入場では読み込み中でも
-genを進めて再送し、旧結果を捨てる。後続readの印を足さずLoading／Loadedの2状態を保つ。
+genを進めて再送し、旧結果を捨てる。再読込中の以前の値と回転変更の記録はPendingの要求寿命に属する。
 ZIP内画像・PDFページ個別の説明文、動画・音声では送らない。512件を超えたcacheは全消去する。
 作成ジョブの `item_done` は結果によらずそのキーを失効させる。それ以外の書き手は、
 `ImportChangedSections.ai_captions`／`thumbnail_pins`（動画の固定を含む）、
@@ -1392,6 +1392,9 @@ Appの完了点で採用して全消去する。`caption_display_stale` は説�
 動画固定表紙のいずれかの DB 行の実変更を表す。`set_folder_thumb_pin`／`remove_folder_thumb_pin`
 そのものと動画固定表紙の変更・解除でも全消去し、呼出元で読み直しの印が消される経路も拾う。
 一覧再読み込みも全消去する。
+回転変更は、そのページキーを画像／表紙の入力に使う項目だけを失効させる。未解決のPendingには変更キーを記録し、
+結果が返す入力キーに当たる場合だけ棄却する。全体世代を進めず、無関係な値・要求を保持する。
+詳細は [§1.717](local-vlm-caption-plan.md#caption-rotation-1717) を参照。
 消去より前の結果は `epoch`／`gen` の不一致で捨て、次のパネル描画で必要なキーだけ再要求する。
 detachedの述語・viewport・context別cacheを変更せず、Remoteのパネル・IPCへは接続しない。
 境界と簡素化の判断は [画像の設計 §21.11.2](local-vlm-caption-plan.md#21112-v1-4a-画像の説明文の表示) と

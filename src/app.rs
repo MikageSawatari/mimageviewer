@@ -49005,6 +49005,8 @@ impl App {
         changed: crate::metadata_transfer::ImportChangedSections,
         committed: &crate::metadata_transfer::ImportCommittedChanges,
     ) -> Vec<metadata_import_refresh::ContextRequest> {
+        self.caption_display
+            .invalidate_rotation_keys(committed.rotation_keys.iter().map(String::as_str));
         fn take_current(
             index: &mut Option<MetadataImportRefreshState>,
             context_id: ViewerContextId,
@@ -50989,7 +50991,7 @@ impl App {
         }
     }
 
-    /// リネームに合わせて、編集済みバッジ用の presence set (起動時に全 DB キーを読み込む
+    /// リネームに合わせて、編集済みバッジと回転全解除通知用の presence set (起動時に全 DB キーを読み込む
     /// グローバル集合) のキーを in-memory で書き換える。DB 側の移行
     /// (`rename_key_migration`) と同じ exact + `/` + `::` の 3 面規則。
     pub(crate) fn rewrite_page_edit_presence_for_rename(
@@ -51007,6 +51009,7 @@ impl App {
         rewrite_key_set_for_rename(&mut self.mask_page_keys, &old_k, &new_k);
         rewrite_key_set_for_rename(&mut self.conceal_page_keys, &old_k, &new_k);
         rewrite_key_set_for_rename(&mut self.comic_page_keys, &old_k, &new_k);
+        rewrite_key_set_for_rename(&mut self.rotation_page_keys, &old_k, &new_k);
         rewrite_key_set_for_rename(&mut self.export_crop_page_keys, &old_k, &new_k);
     }
 
@@ -75817,9 +75820,13 @@ impl App {
             .as_ref()
             .ok_or_else(|| "回転DBを利用できません".to_string())
             .and_then(|db| {
-                db.set_key(&key, rot)
+                db.set_key_if_changed(&key, rot)
                     .map_err(|error| format!("回転を保存できませんでした: {error}"))
             });
+        if persist_result.as_ref().is_ok_and(|changed| *changed) {
+            self.caption_display
+                .invalidate_rotation_keys([key.as_str()]);
+        }
         if self.rotation_cache.insert(idx, rot) != Some(rot) {
             self.similar_panel.reset_info_target();
         }
@@ -75839,7 +75846,7 @@ impl App {
                 crate::ui_sns_split::SNS_SPLIT_ROTATION_DISABLED_REASON.to_string(),
             );
         }
-        persist_result
+        persist_result.map(|_| ())
     }
 
     // ── レーティング ───────────────────────────────────────────────

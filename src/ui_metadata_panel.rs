@@ -2759,7 +2759,13 @@ impl App {
                 let refresh =
                     caption_panel_visit(ctx, caption_target.as_ref().map(|(key, _)| key.as_str()));
                 let caption_display = caption_target.and_then(|(key, path)| {
-                    if let Err(error) = self.caption_display.request(ctx, &key, &path, refresh) {
+                    if let Err(error) = self.caption_display.request_image(
+                        ctx,
+                        &key,
+                        &path,
+                        refresh,
+                        self.book_root_path(),
+                    ) {
                         self.show_feedback_warning(format!(
                             "AI 説明を読み込めませんでした: {error}"
                         ));
@@ -6123,7 +6129,9 @@ fn caption_stale_message(
     if !value.is_stale() {
         return None;
     }
-    Some(if !book {
+    Some(if !value.is_source_stale() {
+        "向きが変わっています。右クリックの『AI 説明文を作る』で作り直せます"
+    } else if !book {
         "画像が変わっています。右クリックの『AI 説明文を作る』で作り直せます"
     } else if value.has_video_cover() {
         "表紙が変わっています。動画の表紙からは説明文を作れません"
@@ -6806,7 +6814,9 @@ mod caption_panel_tests {
             mtime_ms: 1_793_665_800_000,
         };
         CaptionDisplayValue {
+            rotation: crate::rotation_db::Rotation::None,
             row: Some(CaptionRow {
+                rotation: crate::rotation_db::Rotation::None,
                 item_key: "c:/photos/cafe.jpg".into(), signature,
                 model_id: "qwen3.5-4b-q4_k_m@fixture".into(),
                 prompt_version: 1, lang: "ja".into(),
@@ -6818,6 +6828,38 @@ mod caption_panel_tests {
             }),
             current: Some(crate::caption_display_cache::CurrentCaptionSource::Image(signature)),
         }
+    }
+
+    #[test]
+    fn caption_rotation_warning_uses_orientation_text_and_source_warning_wins() {
+        let mut value = fixture();
+        value.rotation = crate::rotation_db::Rotation::Cw90;
+        assert_eq!(
+            caption_stale_message(&value, false),
+            Some("向きが変わっています。右クリックの『AI 説明文を作る』で作り直せます")
+        );
+        assert_eq!(
+            caption_stale_message(&value, true),
+            Some("向きが変わっています。右クリックの『AI 説明文を作る』で作り直せます")
+        );
+        value.current.as_mut().unwrap().signature_mut().size += 1;
+        assert_eq!(
+            caption_stale_message(&value, false),
+            Some("画像が変わっています。右クリックの『AI 説明文を作る』で作り直せます")
+        );
+        assert_eq!(
+            caption_stale_message(&value, true),
+            Some("表紙が変わっています。右クリックの『AI 説明文を作る』で作り直せます")
+        );
+    }
+
+    #[test]
+    fn caption_panel_snapshot_rotation_stale() {
+        let mut value = fixture();
+        value.rotation = crate::rotation_db::Rotation::Cw90;
+        let mut ui = harness(value);
+        ui.run();
+        ui.snapshot("caption_panel_rotation_stale");
     }
 
     fn harness(value: CaptionDisplayValue) -> egui_kittest::Harness<'static> {

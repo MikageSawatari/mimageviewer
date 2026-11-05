@@ -331,12 +331,13 @@ fn process_target(
             process_book_cover(
                 config,
                 db,
+                rotation,
                 cancel,
                 path,
                 cover,
                 request_id,
                 infer,
-                &mut |cover| decode_book_input(config, rotation, cover, cancel),
+                &mut |cover, angle| decode_book_input(config, angle, cover, cancel),
             )
         }
     }
@@ -346,6 +347,7 @@ fn process_target(
 fn process_book_cover(
     config: &CaptionWorkerConfig,
     db: &CaptionDb,
+    rotation: Option<&RotationDb>,
     cancel: &Arc<AtomicBool>,
     path: &Path,
     cover: BookCover,
@@ -353,6 +355,7 @@ fn process_book_cover(
     infer: &mut impl FnMut(u64, u32, u32, Vec<u8>) -> Result<CaptionOutcome, VlmError>,
     read: &mut impl FnMut(
         &ResolvedBookCover,
+        Rotation,
     ) -> Result<Result<image::RgbImage, CaptionItemOutcome>, String>,
 ) -> Result<CaptionItemOutcome, String> {
     if cancel.load(Ordering::Acquire) {
@@ -370,20 +373,25 @@ fn process_book_cover(
             });
         }
     };
+    let rotation_key = crate::edit_source::caption_rotation_key(
+        &cover.location,
+        config.book_cover_env.books_root.as_deref(),
+    );
+    let angle = crate::edit_source::read_caption_rotation(rotation, rotation_key.as_deref())
+        .map_err(|error| error.to_string())?;
     let existing = db
         .get(&path.to_string_lossy())
         .map_err(|error| error.to_string())?;
     if existing.is_some_and(|row| {
         row.status == CaptionStatus::Ok
-            && row.cover_ref == cover.cover_ref
-            && row.signature == cover.signature
+            && row.matches_source(cover.signature, &cover.cover_ref, angle)
             && row.model_id == config.model_id
             && row.prompt_version == PROMPT_VERSION
     }) {
         return Ok(CaptionItemOutcome::AlreadyCreated);
     }
     let started = Instant::now();
-    let decoded = read(&cover);
+    let decoded = read(&cover, angle);
     stage_event("image_load", started, matches!(&decoded, Ok(Ok(_))));
     if cancel.load(Ordering::Acquire) {
         return Ok(CaptionItemOutcome::Cancelled);
@@ -413,6 +421,7 @@ fn process_book_cover(
         db,
         cancel,
         SaveRequest {
+            rotation: angle,
             item_path: path.to_owned(),
             signature_path: cover.signature_path,
             signature: cover.signature,
@@ -427,15 +436,26 @@ fn process_book_cover(
 
 fn decode_book_input(
     config: &CaptionWorkerConfig,
-    rotation: Option<&RotationDb>,
+    angle: Rotation,
     cover: &ResolvedBookCover,
     cancel: &Arc<AtomicBool>,
 ) -> Result<Result<image::RgbImage, CaptionItemOutcome>, String> {
-    use crate::pdf_loader::{CancelWaitPolicy, JobPriority, PdfRenderValidity};
+    decode_book_input_with_pdf(config, angle, cover, cancel, &mut |cover| {
+        render_book_pdf(cover, cancel)
+    })
+}
+
+fn decode_book_input_with_pdf(
+    config: &CaptionWorkerConfig,
+    angle: Rotation,
+    cover: &ResolvedBookCover,
+    cancel: &Arc<AtomicBool>,
+    render_pdf: &mut impl FnMut(&ResolvedBookCover) -> io::Result<image::DynamicImage>,
+) -> Result<Result<image::RgbImage, CaptionItemOutcome>, String> {
     use crate::thumb_loader::ReadLocation;
     let decoded = match &cover.location {
         ReadLocation::File(path) => {
-            return decode_input(config, rotation, path, cancel).map(|result| {
+            return decode_input_at_rotation(config, angle, path, cancel).map(|result| {
                 result.map_err(|message| {
                     crate::logger::log(format!("caption_job: book image decode: {message}"));
                     CaptionItemOutcome::Failed
@@ -460,46 +480,57 @@ fn decode_book_input(
                     _ => Err("first-frame decode did not return a static image".into()),
                 })
         }
-        ReadLocation::PdfPage { pdf, page } => {
-            let rendered = match cover.epub_read.as_ref() {
-                Some(read) => crate::pdf_loader::render_page_with_read_target(
-                    pdf,
-                    read,
-                    *page,
-                    1024,
-                    cover.pdf_password.as_deref(),
-                    Some(cancel.clone()),
-                    JobPriority::Normal,
-                    PdfRenderValidity::Unscoped,
-                    CancelWaitPolicy::AbortOnCancel,
-                ),
-                None => crate::pdf_loader::render_page(
-                    pdf,
-                    *page,
-                    1024,
-                    cover.pdf_password.as_deref(),
-                    Some(cancel.clone()),
-                    JobPriority::Normal,
-                    PdfRenderValidity::Unscoped,
-                    CancelWaitPolicy::AbortOnCancel,
-                ),
-            };
-            match rendered {
-                Ok(result) => Ok(result.image),
-                Err(error) => {
-                    crate::logger::log(format!("caption_job: book PDF render: {error}"));
-                    return Ok(Err(pdf_failure_outcome(&error)));
-                }
+        ReadLocation::PdfPage { .. } => match render_pdf(cover) {
+            Ok(image) => Ok(image),
+            Err(error) => {
+                crate::logger::log(format!("caption_job: book PDF render: {error}"));
+                return Ok(Err(pdf_failure_outcome(&error)));
             }
-        }
+        },
         ReadLocation::ChildCached | ReadLocation::Unreadable { .. } => {
             return Ok(Err(CaptionItemOutcome::Failed));
         }
     };
-    Ok(decoded.map(|image| resize_rgb(&image)).map_err(|message| {
-        crate::logger::log(format!("caption_job: book cover decode: {message}"));
-        CaptionItemOutcome::Failed
-    }))
+    Ok(decoded
+        .map(|image| resize_rgb(&crate::capture::rotate_dynamic_image(image, angle)))
+        .map_err(|message| {
+            crate::logger::log(format!("caption_job: book cover decode: {message}"));
+            CaptionItemOutcome::Failed
+        }))
+}
+
+fn render_book_pdf(
+    cover: &ResolvedBookCover,
+    cancel: &Arc<AtomicBool>,
+) -> io::Result<image::DynamicImage> {
+    use crate::pdf_loader::{CancelWaitPolicy, JobPriority, PdfRenderValidity};
+    let crate::thumb_loader::ReadLocation::PdfPage { pdf, page } = &cover.location else {
+        unreachable!()
+    };
+    let rendered = match cover.epub_read.as_ref() {
+        Some(read) => crate::pdf_loader::render_page_with_read_target(
+            pdf,
+            read,
+            *page,
+            1024,
+            cover.pdf_password.as_deref(),
+            Some(cancel.clone()),
+            JobPriority::Normal,
+            PdfRenderValidity::Unscoped,
+            CancelWaitPolicy::AbortOnCancel,
+        ),
+        None => crate::pdf_loader::render_page(
+            pdf,
+            *page,
+            1024,
+            cover.pdf_password.as_deref(),
+            Some(cancel.clone()),
+            JobPriority::Normal,
+            PdfRenderValidity::Unscoped,
+            CancelWaitPolicy::AbortOnCancel,
+        ),
+    };
+    rendered.map(|result| result.image)
 }
 
 fn pdf_failure_outcome(error: &io::Error) -> CaptionItemOutcome {
@@ -556,19 +587,25 @@ fn process_item(
         crate::logger::log("caption_job: unavailable input signature");
         return Ok(CaptionItemOutcome::Failed);
     };
+    let key = crate::edit_source::caption_rotation_key(
+        &crate::thumb_loader::ReadLocation::File(path.to_owned()),
+        config.book_cover_env.books_root.as_deref(),
+    );
+    let angle = crate::edit_source::read_caption_rotation(rotation, key.as_deref())
+        .map_err(|error| error.to_string())?;
     let existing = db
         .get(&path.to_string_lossy())
         .map_err(|error| error.to_string())?;
     if existing.is_some_and(|row| {
         row.status == CaptionStatus::Ok
-            && row.signature == signature
+            && row.matches_source(signature, "", angle)
             && row.model_id == config.model_id
             && row.prompt_version == PROMPT_VERSION
     }) {
         return Ok(CaptionItemOutcome::AlreadyCreated);
     }
     let started = Instant::now();
-    let decoded = decode_input(config, rotation, path, cancel);
+    let decoded = decode_input_at_rotation(config, angle, path, cancel);
     stage_event("image_load", started, decoded.is_ok());
     if cancel.load(Ordering::Acquire) {
         return Ok(CaptionItemOutcome::Cancelled);
@@ -599,7 +636,7 @@ fn process_item(
             CaptionResult::Failed
         }
     };
-    save_result(config, db, cancel, path, signature, result)
+    save_result(config, db, cancel, path, signature, angle, result)
 }
 
 /// Outer errors are fatal DB failures; inner errors belong to just this image.
@@ -609,16 +646,21 @@ fn decode_input(
     path: &Path,
     cancel: &Arc<AtomicBool>,
 ) -> Result<Result<image::RgbImage, String>, String> {
-    let angle = match rotation {
-        Some(db) => {
-            // RotationDb's existing physical-path key contract.
-            let key = path.to_string_lossy().to_lowercase().replace('\\', "/");
-            db.get_key_checked(&key)
-                .map_err(|error| error.to_string())?
-                .unwrap_or(Rotation::None)
-        }
-        None => Rotation::None,
-    };
+    let key = crate::edit_source::caption_rotation_key(
+        &crate::thumb_loader::ReadLocation::File(path.to_owned()),
+        config.book_cover_env.books_root.as_deref(),
+    );
+    let angle = crate::edit_source::read_caption_rotation(rotation, key.as_deref())
+        .map_err(|error| error.to_string())?;
+    decode_input_at_rotation(config, angle, path, cancel)
+}
+
+fn decode_input_at_rotation(
+    config: &CaptionWorkerConfig,
+    angle: Rotation,
+    path: &Path,
+    cancel: &Arc<AtomicBool>,
+) -> Result<Result<image::RgbImage, String>, String> {
     let decoded = decode_canonical_image(
         CanonicalImageSource::File {
             path,
@@ -645,12 +687,14 @@ fn save_result(
     cancel: &Arc<AtomicBool>,
     path: &Path,
     signature: FileSignature,
+    angle: Rotation,
     result: CaptionResult,
 ) -> Result<CaptionItemOutcome, String> {
     if cancel.load(Ordering::Acquire) {
         return Ok(CaptionItemOutcome::Cancelled);
     }
     let request = SaveRequest {
+        rotation: angle,
         item_path: path.to_owned(),
         signature_path: path.to_owned(),
         signature,
@@ -876,6 +920,221 @@ mod tests {
     }
 
     #[test]
+    fn caption_rotation_image_skip_and_saved_angle_follow_current_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config(tmp.path());
+        let path = image(tmp.path());
+        let db = CaptionDb::open_at(&config.caption_db_path).unwrap();
+        let rotations = RotationDb::open_at(&config.rotation_db_path).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        for angle in [
+            Rotation::None,
+            Rotation::Cw90,
+            Rotation::Cw180,
+            Rotation::Cw270,
+        ] {
+            rotations.set(&path, angle).unwrap();
+            let mut infer = |_, width, height, _| {
+                assert_eq!(
+                    (width, height),
+                    if matches!(angle, Rotation::Cw90 | Rotation::Cw270) {
+                        (1, 2)
+                    } else {
+                        (2, 1)
+                    }
+                );
+                Ok(ok_result())
+            };
+            assert_eq!(
+                process_item(
+                    &config,
+                    &db,
+                    Some(&rotations),
+                    &cancel,
+                    &path,
+                    1,
+                    &mut infer
+                )
+                .unwrap(),
+                CaptionItemOutcome::Created
+            );
+            assert_eq!(
+                db.get(&path.to_string_lossy()).unwrap().unwrap().rotation,
+                angle
+            );
+            assert_eq!(
+                process_item(
+                    &config,
+                    &db,
+                    Some(&rotations),
+                    &cancel,
+                    &path,
+                    2,
+                    &mut |_, _, _, _| panic!("matching orientation inferred")
+                )
+                .unwrap(),
+                CaptionItemOutcome::AlreadyCreated
+            );
+        }
+    }
+
+    #[test]
+    fn caption_rotation_book_zip_and_pdf_share_desktop_keys_and_capture_inference_angle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config(tmp.path());
+        let source = image(tmp.path());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let db = CaptionDb::open_at(&config.caption_db_path).unwrap();
+        let rotations = RotationDb::open_at(&config.rotation_db_path).unwrap();
+        for pdf in [false, true] {
+            let book = tmp.path().join(if pdf { "book.pdf" } else { "book.zip" });
+            std::fs::write(&book, b"book source").unwrap();
+            let item = if pdf {
+                crate::grid_item::GridItem::PdfPage {
+                    pdf_path: book.clone(),
+                    page_num: 2,
+                    content_type: None,
+                }
+            } else {
+                crate::grid_item::GridItem::ZipImage {
+                    zip_path: book.clone(),
+                    entry_name: "nested/cover.png".into(),
+                }
+            };
+            let key = crate::edit_source::page_key_for_grid_item(&item).unwrap();
+            let cover = || {
+                let BookCover::Readable(mut cover) = book_cover(
+                    &book,
+                    if pdf {
+                        "#page=2"
+                    } else {
+                        "#entry=nested/cover.png"
+                    },
+                ) else {
+                    unreachable!()
+                };
+                cover.location = if pdf {
+                    crate::thumb_loader::ReadLocation::PdfPage {
+                        pdf: book.clone(),
+                        page: 2,
+                    }
+                } else {
+                    crate::thumb_loader::ReadLocation::ArchiveEntry {
+                        archive: book.clone(),
+                        entry: "nested/cover.png".into(),
+                    }
+                };
+                cover.preloaded_bytes = Some(std::fs::read(&source).unwrap());
+                assert_eq!(
+                    crate::edit_source::caption_rotation_key(&cover.location, None).as_deref(),
+                    Some(key.as_str())
+                );
+                BookCover::Readable(cover)
+            };
+            for angle in [
+                Rotation::None,
+                Rotation::Cw90,
+                Rotation::Cw180,
+                Rotation::Cw270,
+            ] {
+                rotations.set_key(&key, angle).unwrap();
+                let mut decode = |cover: &ResolvedBookCover, captured| {
+                    assert_eq!(captured, angle);
+                    if pdf {
+                        // The PDF raster is injected at the render boundary; no native helper is launched.
+                        decode_book_input_with_pdf(&config, captured, cover, &cancel, &mut |_| {
+                            Ok(image::open(&source).unwrap())
+                        })
+                    } else {
+                        decode_book_input(&config, captured, cover, &cancel)
+                    }
+                };
+                assert_eq!(
+                    process_book_cover(
+                        &config,
+                        &db,
+                        Some(&rotations),
+                        &cancel,
+                        &book,
+                        cover(),
+                        1,
+                        &mut |_, width, height, bytes| {
+                            let expected = crate::capture::rotate_dynamic_image(
+                                image::open(&source).unwrap(),
+                                angle,
+                            )
+                            .into_rgb8();
+                            assert_eq!((width, height), expected.dimensions());
+                            assert_eq!(bytes, expected.into_raw());
+                            // A concurrent later edit must not relabel the input already inferred.
+                            rotations.set_key(&key, angle.rotate_cw()).unwrap();
+                            Ok(ok_result())
+                        },
+                        &mut decode
+                    )
+                    .unwrap(),
+                    CaptionItemOutcome::Created
+                );
+                assert_eq!(
+                    db.get(&book.to_string_lossy()).unwrap().unwrap().rotation,
+                    angle
+                );
+                rotations.set_key(&key, angle).unwrap();
+                assert_eq!(
+                    process_book_cover(
+                        &config,
+                        &db,
+                        Some(&rotations),
+                        &cancel,
+                        &book,
+                        cover(),
+                        2,
+                        &mut |_, _, _, _| panic!("matching book inferred"),
+                        &mut |_, _| panic!("matching book decoded")
+                    )
+                    .unwrap(),
+                    CaptionItemOutcome::AlreadyCreated
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn caption_rotation_compiled_physical_pages_always_use_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = config(tmp.path());
+        let root = tmp.path().join("shelf");
+        let book = root.join("book");
+        std::fs::create_dir_all(&book).unwrap();
+        let path = image(&book);
+        config.book_cover_env.books_root = Some(root);
+        let rotations = RotationDb::open_at(&config.rotation_db_path).unwrap();
+        rotations.set(&path, Rotation::Cw90).unwrap();
+        let db = CaptionDb::open_at(&config.caption_db_path).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            process_item(
+                &config,
+                &db,
+                Some(&rotations),
+                &cancel,
+                &path,
+                1,
+                &mut |_, width, height, _| {
+                    assert_eq!((width, height), (2, 1));
+                    Ok(ok_result())
+                }
+            )
+            .unwrap(),
+            CaptionItemOutcome::Created
+        );
+        assert_eq!(
+            db.get(&path.to_string_lossy()).unwrap().unwrap().rotation,
+            Rotation::None
+        );
+    }
+
+    #[test]
     fn failed_items_retry_and_never_replace_existing_ok() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = config(temp.path());
@@ -981,6 +1240,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let signature = FileSignature::from_metadata(&std::fs::metadata(&path).unwrap()).unwrap();
         db.save(&SaveRequest {
+            rotation: crate::rotation_db::Rotation::None,
             item_path: path.clone(),
             signature_path: path.clone(),
             signature,
@@ -1094,11 +1354,13 @@ mod tests {
             calls += 1;
             Ok(ok_result())
         };
-        let mut read = |cover: &ResolvedBookCover| decode_book_input(&config, None, cover, &cancel);
+        let mut read =
+            |cover: &ResolvedBookCover, angle| decode_book_input(&config, angle, cover, &cancel);
         assert_eq!(
             process_book_cover(
                 &config,
                 &db,
+                None,
                 &cancel,
                 folder,
                 book_cover(&source, "synthetic.png"),
@@ -1122,12 +1384,13 @@ mod tests {
             process_book_cover(
                 &config,
                 &db,
+                None,
                 &cancel,
                 folder,
                 book_cover(&source, "synthetic.png"),
                 2,
                 &mut infer,
-                &mut |_| panic!("unchanged book decoded")
+                &mut |_, _| panic!("unchanged book decoded")
             )
             .unwrap(),
             CaptionItemOutcome::AlreadyCreated
@@ -1136,6 +1399,7 @@ mod tests {
             process_book_cover(
                 &config,
                 &db,
+                None,
                 &cancel,
                 folder,
                 book_cover(&source, "different.png"),
@@ -1175,12 +1439,13 @@ mod tests {
         let result = process_book_cover(
             &config,
             &db,
+            None,
             &cancel,
             &original,
             BookCover::Readable(cover),
             1,
             &mut |_, _, _, _| Ok(ok_result()),
-            &mut |cover| decode_book_input(&config, None, cover, &cancel),
+            &mut |cover, angle| decode_book_input(&config, angle, cover, &cancel),
         )
         .unwrap();
         assert_eq!(result, CaptionItemOutcome::Created);
@@ -1228,12 +1493,13 @@ mod tests {
                 process_book_cover(
                     &config,
                     &db,
+                    None,
                     &cancel,
                     temp.path(),
                     cover,
                     1,
                     &mut |_, _, _, _| panic!("unreadable book inferred"),
-                    &mut |_| panic!("unreadable book decoded")
+                    &mut |_, _| panic!("unreadable book decoded")
                 )
                 .unwrap(),
                 expected
@@ -1263,12 +1529,13 @@ mod tests {
             let result = process_book_cover(
                 &config,
                 &db,
+                None,
                 &cancel,
                 temp.path(),
                 book_cover(&source, "book.pdf#page=3"),
                 1,
                 &mut |_, _, _, _| panic!("failed PDF inferred"),
-                &mut |_| Ok(Err(pdf_failure_outcome(&io::Error::other(message)))),
+                &mut |_, _| Ok(Err(pdf_failure_outcome(&io::Error::other(message)))),
             )
             .unwrap();
             assert_eq!(result, expected);
@@ -1279,12 +1546,13 @@ mod tests {
             process_book_cover(
                 &config,
                 &db,
+                None,
                 &cancel,
                 temp.path(),
                 book_cover(&source, "synthetic.png"),
                 2,
                 &mut |_, _, _, _| panic!("bad cover inferred"),
-                &mut |cover| decode_book_input(&config, None, cover, &cancel)
+                &mut |cover, angle| decode_book_input(&config, angle, cover, &cancel)
             )
             .unwrap(),
             CaptionItemOutcome::Failed
@@ -1303,12 +1571,13 @@ mod tests {
             process_book_cover(
                 &config,
                 &db,
+                None,
                 &cancel,
                 temp.path(),
                 book_cover(&source, "synthetic.png"),
                 1,
                 &mut |_, _, _, _| panic!("cancelled read inferred"),
-                &mut |_| {
+                &mut |_, _| {
                     cancel.store(true, Ordering::Release);
                     Ok(Ok(image::RgbImage::new(1, 1)))
                 }
@@ -1321,6 +1590,7 @@ mod tests {
             process_book_cover(
                 &config,
                 &db,
+                None,
                 &cancel,
                 temp.path(),
                 book_cover(&source, "synthetic.png"),
@@ -1329,7 +1599,7 @@ mod tests {
                     cancel.store(true, Ordering::Release);
                     Ok(ok_result())
                 },
-                &mut |cover| decode_book_input(&config, None, cover, &cancel)
+                &mut |cover, angle| decode_book_input(&config, angle, cover, &cancel)
             )
             .unwrap(),
             CaptionItemOutcome::Cancelled
@@ -1339,6 +1609,7 @@ mod tests {
             process_book_cover(
                 &config,
                 &db,
+                None,
                 &cancel,
                 temp.path(),
                 book_cover(&source, "synthetic.png"),
@@ -1347,7 +1618,7 @@ mod tests {
                     std::fs::write(&source, b"changed").unwrap();
                     Ok(ok_result())
                 },
-                &mut |cover| decode_book_input(&config, None, cover, &cancel)
+                &mut |cover, angle| decode_book_input(&config, angle, cover, &cancel)
             )
             .unwrap(),
             CaptionItemOutcome::Discarded
@@ -1356,7 +1627,7 @@ mod tests {
     }
 
     #[test]
-    fn book_job_preloaded_archive_image_uses_entry_extension_and_ignores_rotation() {
+    fn book_job_preloaded_archive_image_uses_entry_extension_and_captured_rotation() {
         let temp = tempfile::tempdir().unwrap();
         let config = config(temp.path());
         let source = image(temp.path());
@@ -1368,7 +1639,7 @@ mod tests {
             _ => unreachable!(),
         };
         assert_eq!(
-            decode_book_input(&config, Some(&rotation), &cover, &cancel)
+            decode_book_input(&config, Rotation::Cw90, &cover, &cancel)
                 .unwrap()
                 .unwrap()
                 .dimensions(),
@@ -1379,7 +1650,7 @@ mod tests {
             entry: "cover.png".into(),
         };
         cover.preloaded_bytes = Some(std::fs::read(&source).unwrap());
-        let rgb = decode_book_input(&config, Some(&rotation), &cover, &cancel)
+        let rgb = decode_book_input(&config, Rotation::None, &cover, &cancel)
             .unwrap()
             .unwrap();
         assert_eq!(rgb.dimensions(), (2, 1));

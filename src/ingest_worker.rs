@@ -567,6 +567,7 @@ mod tests {
     fn save_caption(db: &CaptionDb, cand: &CandidateFile, failed: bool) {
         use crate::ai_caption_db::{CaptionResult, FileSignature, SaveRequest};
         db.save(&SaveRequest {
+            rotation: crate::rotation_db::Rotation::None,
             item_path: cand.abs_path.clone(),
             signature_path: cand.abs_path.clone(),
             signature: FileSignature::from_metadata(&cand.abs_path.metadata().unwrap()).unwrap(),

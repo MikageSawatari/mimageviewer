@@ -4,8 +4,9 @@
 //! each short read-only SELECT and file stat; it never holds a transaction
 //! between requests. Dropping the channels retires the worker without a join.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 
@@ -18,6 +19,7 @@ const MAX_ENTRIES: usize = 512;
 pub(crate) struct CaptionDisplayValue {
     pub row: Option<CaptionRow>,
     pub current: Option<CurrentCaptionSource>,
+    pub rotation: crate::rotation_db::Rotation,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,9 +36,9 @@ pub(crate) enum CurrentCaptionSource {
 }
 
 impl CurrentCaptionSource {
-    fn differs_from(&self, row: &CaptionRow) -> bool {
+    fn differs_from(&self, row: &CaptionRow, rotation: crate::rotation_db::Rotation) -> bool {
         match self {
-            Self::Image(signature) => row.signature != *signature,
+            Self::Image(signature) => !row.matches_source(*signature, "", rotation),
             Self::Book {
                 signature,
                 cover_ref,
@@ -44,7 +46,7 @@ impl CurrentCaptionSource {
             | Self::VideoFrame {
                 signature,
                 cover_ref,
-            } => row.signature != *signature || row.cover_ref != *cover_ref,
+            } => !row.matches_source(*signature, cover_ref, rotation),
         }
     }
 
@@ -64,7 +66,14 @@ impl CaptionDisplayValue {
         self.row
             .as_ref()
             .zip(self.current.as_ref())
-            .is_some_and(|(row, current)| current.differs_from(row))
+            .is_some_and(|(row, current)| current.differs_from(row, self.rotation))
+    }
+
+    pub fn is_source_stale(&self) -> bool {
+        self.row
+            .as_ref()
+            .zip(self.current.as_ref())
+            .is_some_and(|(row, current)| current.differs_from(row, row.rotation))
     }
 
     pub fn has_video_cover(&self) -> bool {
@@ -73,31 +82,34 @@ impl CaptionDisplayValue {
 }
 
 enum DisplaySource {
-    Image,
+    Image { books_root: Option<PathBuf> },
     Book { kind: BookKind, env: BookCoverEnv },
 }
 
 enum Entry {
-    Loading {
+    Pending {
+        previous: Option<CaptionDisplayValue>,
         generation: u64,
+        changed_rotation_keys: Vec<Arc<HashSet<String>>>,
     },
     Loaded {
         value: CaptionDisplayValue,
         generation: u64,
+        rotation_key: Option<String>,
     },
 }
 
 impl Entry {
     fn generation(&self) -> u64 {
         match self {
-            Self::Loading { generation } | Self::Loaded { generation, .. } => *generation,
+            Self::Pending { generation, .. } | Self::Loaded { generation, .. } => *generation,
         }
     }
 
     fn value(&self) -> Option<&CaptionDisplayValue> {
         match self {
             Self::Loaded { value, .. } => Some(value),
-            Self::Loading { .. } => None,
+            Self::Pending { previous, .. } => previous.as_ref(),
         }
     }
 }
@@ -117,6 +129,7 @@ struct ReadResult {
     epoch: u64,
     generation: u64,
     value: CaptionDisplayValue,
+    rotation_key: Option<String>,
 }
 
 struct Worker {
@@ -134,7 +147,7 @@ impl Worker {
                 // Resolve the application data path on the worker as well.
                 let db_path = db_path.unwrap_or_else(CaptionDb::db_path);
                 while let Ok(request) = request_rx.recv() {
-                    let value = read_value_for_source(
+                    let (value, rotation_key) = read_value_for_source(
                         &db_path,
                         &request.key,
                         &request.path,
@@ -145,6 +158,7 @@ impl Worker {
                         epoch: request.epoch,
                         generation: request.generation,
                         value,
+                        rotation_key,
                     };
                     if result_tx.send(result).is_err() {
                         break;
@@ -160,7 +174,13 @@ impl Worker {
 
 #[cfg(test)]
 fn read_value(db_path: &Path, key: &str, path: &Path) -> CaptionDisplayValue {
-    read_value_for_source(db_path, key, path, &DisplaySource::Image)
+    read_value_for_source(
+        db_path,
+        key,
+        path,
+        &DisplaySource::Image { books_root: None },
+    )
+    .0
 }
 
 fn read_value_for_source(
@@ -168,7 +188,7 @@ fn read_value_for_source(
     key: &str,
     path: &Path,
     source: &DisplaySource,
-) -> CaptionDisplayValue {
+) -> (CaptionDisplayValue, Option<String>) {
     let started = Instant::now();
     // Open anew for each request so a store first created by a job, or replaced
     // by an import, is observed. get() finishes its statement before stat().
@@ -183,8 +203,15 @@ fn read_value_for_source(
             (None, true)
         }
     };
+    let mut rotation_key = match source {
+        DisplaySource::Image { books_root } => crate::edit_source::caption_rotation_key(
+            &crate::thumb_loader::ReadLocation::File(path.to_owned()),
+            books_root.as_deref(),
+        ),
+        DisplaySource::Book { .. } => None,
+    };
     let current = match source {
-        DisplaySource::Image => std::fs::metadata(path)
+        DisplaySource::Image { .. } => std::fs::metadata(path)
             .ok()
             .as_ref()
             .and_then(FileSignature::from_metadata)
@@ -193,10 +220,16 @@ fn read_value_for_source(
         // viewing an uncatalogued folder does not start a representative scan.
         DisplaySource::Book { kind, env } if row.is_some() => {
             match resolve_book_cover(path, *kind, env) {
-                BookCover::Readable(cover) => Some(CurrentCaptionSource::Book {
-                    signature: cover.signature,
-                    cover_ref: cover.cover_ref,
-                }),
+                BookCover::Readable(cover) => {
+                    rotation_key = crate::edit_source::caption_rotation_key(
+                        &cover.location,
+                        env.books_root.as_deref(),
+                    );
+                    Some(CurrentCaptionSource::Book {
+                        signature: cover.signature,
+                        cover_ref: cover.cover_ref,
+                    })
+                }
                 BookCover::VideoFrame {
                     signature,
                     cover_ref,
@@ -210,6 +243,24 @@ fn read_value_for_source(
         }
         DisplaySource::Book { .. } => None,
     };
+    let rotation_path = db_path.with_file_name("rotation.db");
+    let rotation = (|| {
+        if rotation_key.is_none()
+            || !rotation_path
+                .try_exists()
+                .map_err(|_| rusqlite::Error::InvalidQuery)?
+        {
+            return Ok(crate::rotation_db::Rotation::None);
+        }
+        let db = crate::rotation_db::RotationDb::open_readonly_at(&rotation_path)?;
+        crate::edit_source::read_caption_rotation(Some(&db), rotation_key.as_deref())
+    })()
+    .unwrap_or_else(|error: rusqlite::Error| {
+        crate::logger::log(format!(
+            "caption display: reading rotation for {key} failed: {error}"
+        ));
+        crate::rotation_db::Rotation::None
+    });
     if crate::perf::is_enabled() {
         crate::perf::event(
             "ai",
@@ -227,7 +278,14 @@ fn read_value_for_source(
             ],
         );
     }
-    CaptionDisplayValue { row, current }
+    (
+        CaptionDisplayValue {
+            row,
+            current,
+            rotation,
+        },
+        rotation_key,
+    )
 }
 
 #[derive(Default)]
@@ -260,7 +318,32 @@ impl CaptionDisplayCache {
         path: &Path,
         refresh: bool,
     ) -> Result<bool, String> {
-        self.request_source(ctx, key, path, refresh, DisplaySource::Image)
+        self.request_source(
+            ctx,
+            key,
+            path,
+            refresh,
+            DisplaySource::Image { books_root: None },
+        )
+    }
+
+    pub fn request_image(
+        &mut self,
+        ctx: &egui::Context,
+        key: &str,
+        path: &Path,
+        refresh: bool,
+        books_root: PathBuf,
+    ) -> Result<bool, String> {
+        self.request_source(
+            ctx,
+            key,
+            path,
+            refresh,
+            DisplaySource::Image {
+                books_root: Some(books_root),
+            },
+        )
     }
 
     /// UI callers check demand before capturing the password/settings snapshot.
@@ -297,15 +380,14 @@ impl CaptionDisplayCache {
         }
         self.next_generation = self.next_generation.wrapping_add(1);
         let generation = self.next_generation;
-        let entry = match self.entries.remove(key) {
-            Some(Entry::Loaded {
-                value,
-                generation: previous_gen,
-            }) => {
-                debug_assert_ne!(generation, previous_gen);
-                Entry::Loaded { value, generation }
-            }
-            _ => Entry::Loading { generation },
+        let previous = self.entries.remove(key).and_then(|entry| match entry {
+            Entry::Loaded { value, .. } => Some(value),
+            Entry::Pending { previous, .. } => previous,
+        });
+        let entry = Entry::Pending {
+            previous,
+            generation,
+            changed_rotation_keys: Vec::new(),
         };
         self.entries.insert(key.to_owned(), entry);
         let request = ReadRequest {
@@ -326,6 +408,7 @@ impl CaptionDisplayCache {
                         epoch: request.epoch,
                         generation,
                         value: CaptionDisplayValue::default(),
+                        rotation_key: None,
                     });
                     return Err(error.to_string());
                 }
@@ -345,6 +428,7 @@ impl CaptionDisplayCache {
                 epoch: request.epoch,
                 generation,
                 value: CaptionDisplayValue::default(),
+                rotation_key: None,
             });
             return Err("caption display reader disconnected".into());
         }
@@ -353,6 +437,27 @@ impl CaptionDisplayCache {
 
     pub fn invalidate(&mut self, key: &str) {
         self.entries.remove(key);
+    }
+
+    /// Pending books resolve their dependency on the worker. Remember changes
+    /// with that request, then reject only a result which actually used a changed key.
+    pub(crate) fn invalidate_rotation_keys<'a>(&mut self, keys: impl IntoIterator<Item = &'a str>) {
+        let keys: Arc<HashSet<String>> = Arc::new(keys.into_iter().map(str::to_owned).collect());
+        if keys.is_empty() {
+            return;
+        }
+        self.entries.retain(|_, entry| match entry {
+            Entry::Loaded { rotation_key, .. } => {
+                !rotation_key.as_ref().is_some_and(|key| keys.contains(key))
+            }
+            Entry::Pending {
+                changed_rotation_keys,
+                ..
+            } => {
+                changed_rotation_keys.push(Arc::clone(&keys));
+                true
+            }
+        });
     }
 
     pub fn clear(&mut self) {
@@ -380,11 +485,24 @@ impl CaptionDisplayCache {
         {
             return false;
         }
+        if let Some(Entry::Pending {
+            changed_rotation_keys,
+            ..
+        }) = self.entries.get(&result.key)
+            && result
+                .rotation_key
+                .as_ref()
+                .is_some_and(|key| changed_rotation_keys.iter().any(|keys| keys.contains(key)))
+        {
+            self.entries.remove(&result.key);
+            return true;
+        }
         self.entries.insert(
             result.key,
             Entry::Loaded {
                 value: result.value,
                 generation: result.generation,
+                rotation_key: result.rotation_key,
             },
         );
         true
@@ -395,8 +513,10 @@ impl CaptionDisplayCache {
         self.next_generation = self.next_generation.wrapping_add(1);
         self.entries.insert(
             key.to_owned(),
-            Entry::Loading {
+            Entry::Pending {
+                previous: None,
                 generation: self.next_generation,
+                changed_rotation_keys: Vec::new(),
             },
         );
     }
@@ -404,6 +524,19 @@ impl CaptionDisplayCache {
     #[cfg(test)]
     pub(crate) fn contains_for_test(&self, key: &str) -> bool {
         self.entries.contains_key(key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_rotation_for_test(&mut self, key: &str, rotation_key: &str) {
+        self.next_generation = self.next_generation.wrapping_add(1);
+        self.entries.insert(
+            key.to_owned(),
+            Entry::Loaded {
+                value: CaptionDisplayValue::default(),
+                generation: self.next_generation,
+                rotation_key: Some(rotation_key.to_owned()),
+            },
+        );
     }
 
     #[cfg(test)]
@@ -434,6 +567,7 @@ mod tests {
 
     fn row(signature: FileSignature) -> CaptionRow {
         CaptionRow {
+            rotation: crate::rotation_db::Rotation::None,
             item_key: "image".into(),
             signature,
             model_id: "model@revision".into(),
@@ -456,6 +590,7 @@ mod tests {
             mtime_ms: 10,
         };
         CaptionDisplayValue {
+            rotation: crate::rotation_db::Rotation::None,
             row: Some(row(signature)),
             current: Some(crate::caption_display_cache::CurrentCaptionSource::Image(
                 signature,
@@ -469,6 +604,7 @@ mod tests {
             epoch: request.epoch,
             generation: request.generation,
             value,
+            rotation_key: Some(crate::adjustment_db::normalize_path(&request.path)),
         }
     }
 
@@ -513,6 +649,7 @@ mod tests {
         CaptionDb::open_at(&db_path)
             .unwrap()
             .save(&SaveRequest {
+                rotation: crate::rotation_db::Rotation::None,
                 item_path: path.clone(),
                 signature_path: path.clone(),
                 signature,
@@ -690,6 +827,98 @@ mod tests {
         assert!(!value.is_stale());
     }
 
+    #[test]
+    fn caption_rotation_invalidation_preserves_loaded_and_pending_siblings() {
+        let (mut cache, requests, results) = fake_cache();
+        let ctx = egui::Context::default();
+        for key in ["image", "sibling", "pending-sibling", "book"] {
+            cache.request(&ctx, key, Path::new(key), false).unwrap();
+        }
+        let image = requests.try_recv().unwrap();
+        let sibling = requests.try_recv().unwrap();
+        let pending_sibling = requests.try_recv().unwrap();
+        let book = requests.try_recv().unwrap();
+        results.send(result(image, value())).unwrap();
+        results.send(result(sibling, value())).unwrap();
+        cache.poll();
+        cache.invalidate_rotation_keys(["image"]);
+        assert!(cache.get("image").is_none());
+        assert_eq!(cache.get("sibling"), Some(&value()));
+        let mut book = result(book, value());
+        // The worker resolves this dependency only after the request was sent.
+        book.rotation_key = Some("image".into());
+        results.send(book).unwrap();
+        results.send(result(pending_sibling, value())).unwrap();
+        cache.poll();
+        assert!(!cache.contains_for_test("book"));
+        assert_eq!(cache.get("pending-sibling"), Some(&value()));
+        assert_eq!(cache.get("sibling"), Some(&value()));
+        cache
+            .request(&ctx, "image", Path::new("image"), false)
+            .unwrap();
+        let request = requests.try_recv().unwrap();
+        let mut rotated = value();
+        rotated.rotation = crate::rotation_db::Rotation::Cw90;
+        results.send(result(request, rotated.clone())).unwrap();
+        cache.poll();
+        assert_eq!(cache.get("image"), Some(&rotated));
+        assert!(rotated.is_stale());
+        assert!(!rotated.is_source_stale());
+    }
+
+    #[test]
+    fn caption_rotation_worker_rereads_angle_after_key_invalidation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cover.png");
+        std::fs::write(&path, b"cover").unwrap();
+        let db_path = tmp.path().join("ai_caption.db");
+        let db = CaptionDb::open_at(&db_path).unwrap();
+        let signature = file_signature_for_test(&path);
+        db.save(&SaveRequest {
+            item_path: path.clone(),
+            signature_path: path.clone(),
+            signature,
+            rotation: crate::rotation_db::Rotation::None,
+            cover_ref: String::new(),
+            model_id: "fixture".into(),
+            prompt_version: 1,
+            lang: "ja".into(),
+            result: CaptionResult::Ok {
+                caption: "cover".into(),
+                text: String::new(),
+                keywords: Vec::new(),
+            },
+        })
+        .unwrap();
+        let key = CaptionDb::normalize_path(&path);
+        let rotation_key = crate::edit_source::page_key_for_grid_item(
+            &crate::grid_item::GridItem::Image(path.clone()),
+        )
+        .unwrap();
+        let mut cache = CaptionDisplayCache {
+            worker: Some(Worker::start(Some(db_path)).unwrap()),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        cache.request(&ctx, &key, &path, false).unwrap();
+        receive_worker(&mut cache);
+        assert!(!cache.get(&key).unwrap().is_stale());
+        let rotations =
+            crate::rotation_db::RotationDb::open_at(&tmp.path().join("rotation.db")).unwrap();
+        rotations
+            .set_key(&rotation_key, crate::rotation_db::Rotation::Cw270)
+            .unwrap();
+        cache.invalidate_rotation_keys([rotation_key.as_str()]);
+        cache.request(&ctx, &key, &path, false).unwrap();
+        receive_worker(&mut cache);
+        assert!(cache.get(&key).unwrap().is_stale());
+        assert!(!cache.get(&key).unwrap().is_source_stale());
+        assert_eq!(
+            cache.get(&key).unwrap().rotation,
+            crate::rotation_db::Rotation::Cw270
+        );
+    }
+
     fn receive_worker(cache: &mut CaptionDisplayCache) {
         let result = cache
             .worker
@@ -719,6 +948,7 @@ mod tests {
         assert_eq!(
             cache.get("image"),
             Some(&CaptionDisplayValue {
+                rotation: crate::rotation_db::Rotation::None,
                 row: None,
                 current: Some(crate::caption_display_cache::CurrentCaptionSource::Image(
                     signature
@@ -747,6 +977,7 @@ mod tests {
         assert!(!db_path.exists());
         let db = CaptionDb::open_at(&db_path).unwrap();
         let mut request = SaveRequest {
+            rotation: crate::rotation_db::Rotation::None,
             item_path: path.clone(),
             signature_path: path.clone(),
             signature,
@@ -820,6 +1051,7 @@ mod tests {
         let db_path = tmp.path().join("ai_caption.db");
         let db = CaptionDb::open_at(&db_path).unwrap();
         db.save(&SaveRequest {
+            rotation: crate::rotation_db::Rotation::None,
             item_path: folder.clone(),
             signature_path: first,
             signature,
@@ -951,6 +1183,7 @@ mod tests {
             let db = CaptionDb::open_at(&db_path).unwrap();
             assert_eq!(
                 db.save(&SaveRequest {
+                    rotation: crate::rotation_db::Rotation::None,
                     item_path: folder.clone(),
                     signature_path: created.signature_path.clone(),
                     signature: created.signature,

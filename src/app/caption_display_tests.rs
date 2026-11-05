@@ -11,6 +11,222 @@ fn caption_mutation() -> StoreMutationEffects {
     effects
 }
 
+#[test]
+fn caption_rotation_single_noop_and_reset_only_invalidate_changed_dependencies() {
+    use crate::rotation_db::Rotation;
+    let mut app = setup_app_for_test();
+    let first = app.tmp.path().join("first.png");
+    let sibling = app.tmp.path().join("sibling.png");
+    app.items = vec![
+        GridItem::Image(first.clone()),
+        GridItem::Image(sibling.clone()),
+    ];
+    let first_key = crate::edit_source::page_key_for_grid_item(&app.items[0]).unwrap();
+    let sibling_key = crate::edit_source::page_key_for_grid_item(&app.items[1]).unwrap();
+    app.caption_display
+        .seed_rotation_for_test("first", &first_key);
+    app.caption_display
+        .seed_rotation_for_test("sibling", &sibling_key);
+    app.set_image_rotation(0, Rotation::None).unwrap();
+    assert!(app.caption_display.contains_for_test("first"));
+    app.set_image_rotation(0, Rotation::Cw90).unwrap();
+    assert!(!app.caption_display.contains_for_test("first"));
+    assert!(app.caption_display.contains_for_test("sibling"));
+    app.caption_display
+        .seed_rotation_for_test("first", &first_key);
+    app.set_image_rotation(0, Rotation::Cw90).unwrap();
+    assert!(app.caption_display.contains_for_test("first"));
+    assert!(app.reset_saved_rotations());
+    assert!(!app.caption_display.contains_for_test("first"));
+    assert!(app.caption_display.contains_for_test("sibling"));
+    app.caption_display
+        .seed_rotation_for_test("first", &first_key);
+    app.set_image_rotation(1, Rotation::Cw180).unwrap();
+    app.caption_display
+        .seed_rotation_for_test("sibling", &sibling_key);
+    assert!(app.reset_saved_rotations());
+    assert!(app.caption_display.contains_for_test("first"));
+    assert!(!app.caption_display.contains_for_test("sibling"));
+}
+
+#[test]
+fn caption_rotation_rename_move_rewrites_every_presence_set_in_three_faces() {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    let mut environment = setup_app_for_test();
+    let app = &mut environment.app;
+    for (old, new) in [
+        ("C:/images/a.jpg", "C:/images/b.jpg"),
+        ("C:/images/album", "D:/moved/renamed-album"),
+        ("C:/images/book.zip", "D:/moved/book.zip"),
+        ("C:/images/book.pdf", "D:/moved/book.pdf"),
+    ] {
+        let old_key = crate::adjustment_db::normalize_path(Path::new(old));
+        let new_key = crate::adjustment_db::normalize_path(Path::new(new));
+        let neighbor = format!("{old_key}2/unrelated.jpg");
+        let before = BTreeSet::from([
+            old_key.clone(),
+            format!("{old_key}/cover.jpg"),
+            format!("{old_key}::page_1"),
+            neighbor.clone(),
+        ]);
+        for keys in [
+            &mut app.adjusted_page_keys,
+            &mut app.local_adjust_page_keys,
+            &mut app.mask_page_keys,
+            &mut app.conceal_page_keys,
+            &mut app.comic_page_keys,
+            &mut app.rotation_page_keys,
+            &mut app.export_crop_page_keys,
+        ] {
+            keys.clone_from(&before);
+        }
+        app.rewrite_page_edit_presence_for_rename(Path::new(old), Path::new(new));
+        // Shell success and the later migration completion both use this helper.
+        app.rewrite_page_edit_presence_for_rename(Path::new(old), Path::new(new));
+        let expected = BTreeSet::from([
+            new_key.clone(),
+            format!("{new_key}/cover.jpg"),
+            format!("{new_key}::page_1"),
+            neighbor,
+        ]);
+        for keys in [
+            &app.adjusted_page_keys,
+            &app.local_adjust_page_keys,
+            &app.mask_page_keys,
+            &app.conceal_page_keys,
+            &app.comic_page_keys,
+            &app.rotation_page_keys,
+            &app.export_crop_page_keys,
+        ] {
+            assert_eq!(keys, &expected, "presence must follow {old} -> {new}");
+        }
+    }
+}
+
+#[test]
+fn caption_rotation_rename_move_display_then_reset_preserves_reused_path_and_sibling() {
+    use crate::ai_caption_db::{CaptionDb, CaptionResult, FileSignature, SaveRequest};
+    use crate::rotation_db::Rotation;
+    use std::path::Path;
+
+    fn save_caption(path: &Path, rotation: Rotation) {
+        CaptionDb::open()
+            .unwrap()
+            .save(&SaveRequest {
+                item_path: path.to_owned(),
+                signature_path: path.to_owned(),
+                signature: FileSignature::from_metadata(&std::fs::metadata(path).unwrap()).unwrap(),
+                rotation,
+                cover_ref: String::new(),
+                model_id: "rotation-rename-fixture".into(),
+                prompt_version: 1,
+                lang: "ja".into(),
+                result: CaptionResult::Ok {
+                    caption: "fixture".into(),
+                    text: String::new(),
+                    keywords: Vec::new(),
+                },
+            })
+            .unwrap();
+    }
+
+    fn display(
+        app: &mut App,
+        ctx: &egui::Context,
+        path: &Path,
+    ) -> crate::caption_display_cache::CaptionDisplayValue {
+        let key = CaptionDb::normalize_path(path);
+        app.caption_display.request(ctx, &key, path, false).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            app.caption_display.poll();
+            if let Some(value) = app.caption_display.get(&key) {
+                return value.clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "caption read timed out"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    for move_folder in [false, true] {
+        let mut app = setup_app_for_test();
+        app.settings.edit_restore_prompt_enabled = false;
+        app.rename_migration_data_dir_override = Some(app.tmp.path().to_owned());
+        app.rename_migration_journal_admission = RenameMigrationJournalAdmission::Durable;
+        let old = app
+            .tmp
+            .path()
+            .join(if move_folder { "source/album" } else { "a.jpg" });
+        let new = app.tmp.path().join(if move_folder {
+            "destination/album"
+        } else {
+            "b.jpg"
+        });
+        let old_image = if move_folder {
+            old.join("cover.jpg")
+        } else {
+            old.clone()
+        };
+        let new_image = if move_folder {
+            new.join("cover.jpg")
+        } else {
+            new.clone()
+        };
+        std::fs::create_dir_all(old_image.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+        std::fs::write(&old_image, b"image fixture").unwrap();
+        app.items = vec![GridItem::Image(old_image.clone())];
+        app.set_image_rotation(0, Rotation::Cw90).unwrap();
+        save_caption(&old_image, Rotation::Cw90);
+
+        std::fs::rename(&old, &new).unwrap();
+        // Exercise completion too: a recovered migration may not have had the
+        // in-process Shell-success notification that rewrites the presence set.
+        let report = crate::rename_key_migration::run_at(app.tmp.path(), &old, &new);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(report).unwrap();
+        app.rename_migration_in_flight = Some(RenameMigrationInFlight::Generic {
+            job: crate::rename_key_migration::PathMigrationJob::shell_rename(old, new, move_folder),
+            rx,
+        });
+        let ctx = egui::Context::default();
+        app.poll_rename_migration_pending(&ctx);
+
+        // This shared cache is also what a sibling window reads; no viewer-local
+        // reset or second copy of the dependency keys is involved.
+        let shown = display(&mut app, &ctx, &new_image);
+        assert_eq!(shown.row.as_ref().unwrap().rotation, Rotation::Cw90);
+        assert!(!shown.is_stale());
+        std::fs::create_dir_all(old_image.parent().unwrap()).unwrap();
+        std::fs::write(&old_image, b"reused path").unwrap();
+        save_caption(&old_image, Rotation::None);
+        let reused = display(&mut app, &ctx, &old_image);
+        let sibling_image = app.tmp.path().join("unrelated.jpg");
+        std::fs::write(&sibling_image, b"sibling").unwrap();
+        save_caption(&sibling_image, Rotation::None);
+        let sibling = display(&mut app, &ctx, &sibling_image);
+        let new_key = CaptionDb::normalize_path(&new_image);
+        let old_key = CaptionDb::normalize_path(&old_image);
+        let sibling_key = CaptionDb::normalize_path(&sibling_image);
+
+        assert!(app.reset_saved_rotations());
+        assert!(app.caption_display.get(&new_key).is_none());
+        assert_eq!(app.caption_display.get(&old_key), Some(&reused));
+        assert_eq!(app.caption_display.get(&sibling_key), Some(&sibling));
+        let after_reset = display(&mut app, &ctx, &new_image);
+        assert_eq!(after_reset.row.as_ref().unwrap().rotation, Rotation::Cw90);
+        assert_eq!(after_reset.rotation, Rotation::None);
+        assert!(after_reset.is_stale());
+        assert!(!after_reset.is_source_stale());
+    }
+}
+
 #[derive(Clone, Copy)]
 struct DisplayEpoch {
     display: u64,

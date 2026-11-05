@@ -327,14 +327,89 @@ fn read_caption(
         if row.status != CaptionStatus::Ok {
             return Ok(CaptionField::None);
         }
+        let source_settings =
+            crate::settings_db::with_db_result(|db| db.load_caption_source_settings())
+                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let (current, rotation_key) = if let Some(metadata) = image_metadata {
+            (
+                FileSignature::from_metadata(metadata).map(|signature| (signature, String::new())),
+                crate::edit_source::caption_rotation_key(
+                    &crate::thumb_loader::ReadLocation::File(path.to_owned()),
+                    Some(&source_settings.books_root),
+                ),
+            )
+        } else {
+            use crate::app::book_cover::{BookCover, BookCoverEnv, BookKind, resolve_book_cover};
+            use std::sync::Arc;
+            let pin_path = crate::folder_thumb_pins::FolderThumbPinDb::db_path();
+            let video_path = crate::video_pins::VideoPinDb::db_path();
+            let mut env = BookCoverEnv {
+                books_root: Some(source_settings.books_root),
+                folder_thumb_sort: source_settings.folder_thumb_sort,
+                folder_thumb_depth: source_settings.folder_thumb_depth,
+                visibility: source_settings.visibility,
+                pdf_passwords: crate::pdf_passwords::PdfPasswordStore::load(),
+                ..Default::default()
+            };
+            if pin_path
+                .try_exists()
+                .map_err(|_| rusqlite::Error::InvalidQuery)?
+            {
+                env.pin_db = Some(Arc::new(
+                    crate::folder_thumb_pins::FolderThumbPinDb::open_readonly(&pin_path)?,
+                ));
+            }
+            if video_path
+                .try_exists()
+                .map_err(|_| rusqlite::Error::InvalidQuery)?
+            {
+                env.video_pins =
+                    crate::video_pins::VideoPinDb::open_readonly(&video_path)?.read_source();
+            }
+            if crate::archive_cache::db_path()
+                .try_exists()
+                .map_err(|_| rusqlite::Error::InvalidQuery)?
+            {
+                env.archive_cache = Some(Arc::new(
+                    crate::archive_cache::ArchiveCacheDb::open_readonly()?,
+                ));
+            }
+            match resolve_book_cover(path, BookKind::for_path(path), &env) {
+                BookCover::Readable(cover) => {
+                    let key = crate::edit_source::caption_rotation_key(
+                        &cover.location,
+                        env.books_root.as_deref(),
+                    );
+                    (Some((cover.signature, cover.cover_ref)), key)
+                }
+                BookCover::VideoFrame {
+                    signature,
+                    cover_ref,
+                    ..
+                } => (Some((signature, cover_ref)), None),
+                BookCover::Unreadable(_) => (None, None),
+            }
+        };
+        let rotation_path = db_path.with_file_name("rotation.db");
+        let rotation = if rotation_key.is_some()
+            && rotation_path
+                .try_exists()
+                .map_err(|_| rusqlite::Error::InvalidQuery)?
+        {
+            let rotations = crate::rotation_db::RotationDb::open_readonly_at(&rotation_path)?;
+            crate::edit_source::read_caption_rotation(Some(&rotations), rotation_key.as_deref())?
+        } else {
+            crate::rotation_db::Rotation::None
+        };
+        let stale = current
+            .map(|(signature, cover_ref)| !row.matches_source(signature, &cover_ref, rotation));
         Ok(CaptionField::Present(AiCaptionInfo {
             caption: text(row.caption),
             visible_text: text(row.visible_text),
             keywords: row.keywords,
             model: row.model_id,
             created_at: row.created_at,
-            stale: image_metadata
-                .map(|metadata| FileSignature::from_metadata(metadata) != Some(row.signature)),
+            stale,
         }))
     })();
     result.map_err(|error: rusqlite::Error| {

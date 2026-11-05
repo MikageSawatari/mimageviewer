@@ -60,7 +60,7 @@ impl App {
         &mut self,
         report: &crate::metadata_cleanup::DeleteReport,
     ) {
-        self.apply_content_identity_store_mutations(report.store_mutations);
+        self.apply_content_identity_store_mutations(report.store_mutations.clone());
         self.reload_book_resume_meters();
         if report.deleted_keys.is_empty() {
             return;

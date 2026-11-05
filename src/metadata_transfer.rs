@@ -164,6 +164,7 @@ pub struct ImportSummary {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ImportCommittedChanges {
+    pub rotation_keys: BTreeSet<String>,
     /// Physical items whose caption was changed or removed, published after commit.
     pub ai_captions: usize,
     pub video_pins: usize,
@@ -475,6 +476,8 @@ struct PortableEntry {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct PortableAiCaption {
+    #[serde(default)]
+    rotation: i32,
     model_id: String,
     prompt_version: i64,
     lang: String,
@@ -977,6 +980,7 @@ where
     let mut batch_video_pin_changes = 0usize;
     let mut batch_folder_pin_changes = 0usize;
     let mut batch_ai_caption_changes = 0usize;
+    let mut batch_rotation_keys = BTreeSet::new();
     let mut batch_spread_shift_changes = SpreadShiftFamilyChanges::default();
     let mut batch_composition_changes = CompositionFamilyChanges::default();
     let mut batch_started = batch_now();
@@ -1105,6 +1109,7 @@ where
                             batch_spread_shift_changes.merge(outcome.spread_shift);
                             batch_composition_changes.merge(outcome.composition);
                             batch_ai_caption_changes += usize::from(outcome.ai_caption_changed);
+                            batch_rotation_keys.extend(outcome.rotation_keys);
                         }
                         Err(error) => {
                             conn.execute_batch(
@@ -1163,6 +1168,10 @@ where
                 }
                 summary.applied_entries = summary.applied_entries.saturating_add(batch_applied);
                 summary.committed.ai_captions += std::mem::take(&mut batch_ai_caption_changes);
+                summary
+                    .committed
+                    .rotation_keys
+                    .append(&mut batch_rotation_keys);
                 summary.committed.video_pins = summary
                     .committed
                     .video_pins
@@ -1235,6 +1244,10 @@ where
     };
     if commit_result.is_ok() {
         summary.committed.ai_captions += batch_ai_caption_changes;
+        summary
+            .committed
+            .rotation_keys
+            .append(&mut batch_rotation_keys);
         summary.applied_entries = summary.applied_entries.saturating_add(batch_applied);
         summary.committed.video_pins = summary
             .committed
@@ -2216,12 +2229,18 @@ where
     let mut conn = open_readonly(&path)?;
     prepare_metadata_scope(&mut conn, index, &HashMap::new(), cancel)?;
     // Captions belong only to physical items, never virtual page families.
+    let rotation_column =
+        if crate::ai_caption_db::CaptionDb::has_rotation_column(&conn).map_err(db_error)? {
+            "c.rotation"
+        } else {
+            "0"
+        };
     let mut stmt = conn
         .prepare(
-            "SELECT c.item_key, c.model_id, c.prompt_version, c.lang, c.caption,
-                c.visible_text, c.keywords, c.cover_ref, c.mtime_ms, c.size, c.created_at
+            &format!("SELECT c.item_key, c.model_id, c.prompt_version, c.lang, c.caption,
+                c.visible_text, c.keywords, c.cover_ref, c.mtime_ms, c.size, c.created_at, {rotation_column}
          FROM metadata_transfer_physical_scope AS s CROSS JOIN captions AS c
-         WHERE c.item_key = s.item_key AND c.status = 'ok'",
+         WHERE c.item_key = s.item_key AND c.status = 'ok'"),
         )
         .map_err(db_error)?;
     let rows = stmt
@@ -2238,6 +2257,7 @@ where
             Ok((
                 row.get::<_, String>(0)?,
                 PortableAiCaption {
+                    rotation: row.get(11)?,
                     model_id: row.get(1)?,
                     prompt_version: row.get(2)?,
                     lang: row.get(3)?,
@@ -5406,6 +5426,7 @@ struct ApplyEntryOutcome {
     spread_shift: SpreadShiftFamilyChanges,
     composition: CompositionFamilyChanges,
     ai_caption_changed: bool,
+    rotation_keys: BTreeSet<String>,
 }
 
 fn validate_ai_caption(caption: &PortableAiCaption) -> Result<(), TransferError> {
@@ -5415,6 +5436,11 @@ fn validate_ai_caption(caption: &PortableAiCaption) -> Result<(), TransferError>
         &caption.keywords,
     )
     .map_err(|error| TransferError::Invalid(format!("AI説明文: {error}")))?;
+    if !matches!(caption.rotation, 0 | 90 | 180 | 270) {
+        return Err(TransferError::Invalid(
+            "AI説明文の回転角度が不正です".into(),
+        ));
+    }
     if caption.size > i64::MAX as u64 {
         return Err(TransferError::Invalid(
             "AI説明文のファイルサイズが不正です".into(),
@@ -5442,22 +5468,22 @@ fn apply_ai_caption(
     tx.prepare_cached(
         "INSERT INTO ai_caption.captions
             (item_key, mtime_ms, size, model_id, prompt_version, lang, caption,
-             visible_text, keywords, cover_ref, status, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'ok', ?11)
+             visible_text, keywords, cover_ref, status, created_at, rotation)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'ok', ?11, ?12)
          ON CONFLICT(item_key) DO UPDATE SET
             mtime_ms=excluded.mtime_ms, size=excluded.size, model_id=excluded.model_id,
             prompt_version=excluded.prompt_version, lang=excluded.lang, caption=excluded.caption,
             visible_text=excluded.visible_text, keywords=excluded.keywords,
-            cover_ref=excluded.cover_ref, status='ok', created_at=excluded.created_at
+            cover_ref=excluded.cover_ref, status='ok', created_at=excluded.created_at, rotation=excluded.rotation
          WHERE captions.mtime_ms IS NOT excluded.mtime_ms OR captions.size IS NOT excluded.size
             OR captions.model_id IS NOT excluded.model_id OR captions.prompt_version IS NOT excluded.prompt_version
             OR captions.lang IS NOT excluded.lang OR captions.caption IS NOT excluded.caption
             OR captions.visible_text IS NOT excluded.visible_text OR captions.keywords IS NOT excluded.keywords
             OR captions.cover_ref IS NOT excluded.cover_ref OR captions.status IS NOT 'ok'
-            OR captions.created_at IS NOT excluded.created_at",
+            OR captions.created_at IS NOT excluded.created_at OR captions.rotation IS NOT excluded.rotation",
     ).map_err(db_error)?.execute(params![
         key, caption.mtime_ms, caption.size, caption.model_id, caption.prompt_version, caption.lang,
-        caption.caption, caption.visible_text, keywords, caption.cover_ref, caption.created_at,
+        caption.caption, caption.visible_text, keywords, caption.cover_ref, caption.created_at, caption.rotation,
     ]).map(|count| count > 0).map_err(db_error)
 }
 
@@ -5676,6 +5702,12 @@ fn apply_entry(
         }
     }
     if sections.page_state && supports_page_state {
+        let previous_rotations = read_rotation_family(
+            tx,
+            &base_key,
+            &page_base_key,
+            deterministic_cache_key.as_deref(),
+        )?;
         delete_page_key_family(
             tx,
             "adjustment.page_params",
@@ -5747,6 +5779,19 @@ fn apply_entry(
                 &canonical_virtual_item_key(&page_base_key, &item.member_key),
                 &item.page_state,
             )?;
+        }
+        let current_rotations = read_rotation_family(
+            tx,
+            &base_key,
+            &page_base_key,
+            deterministic_cache_key.as_deref(),
+        )?;
+        for key in previous_rotations.keys().chain(current_rotations.keys()) {
+            if previous_rotations.get(key).copied().unwrap_or_default()
+                != current_rotations.get(key).copied().unwrap_or_default()
+            {
+                outcome.rotation_keys.insert(key.clone());
+            }
         }
     }
     if sections.container_state && supports_container {
@@ -6254,6 +6299,22 @@ fn join_container_key(base: &str, member: &str) -> String {
         base.trim_end_matches('/'),
         canonical_member_key(member)
     )
+}
+
+fn read_rotation_family(
+    tx: &Connection,
+    base_key: &str,
+    page_base_key: &str,
+    cache_key: Option<&str>,
+) -> Result<HashMap<String, crate::rotation_db::Rotation>, TransferError> {
+    let alternate = if page_base_key != base_key {
+        page_base_key
+    } else {
+        cache_key.unwrap_or(base_key)
+    };
+    tx.prepare_cached("SELECT path, angle FROM rotation.rotations WHERE path = ?1 OR (path >= ?1 || '::' AND path < ?1 || ':;') OR path = ?2 OR (path >= ?2 || '::' AND path < ?2 || ':;')")
+        .map_err(db_error)?.query_map(params![base_key, alternate], |row| Ok((row.get(0)?, crate::rotation_db::Rotation::from_degrees(row.get(1)?)))).map_err(db_error)?
+        .collect::<rusqlite::Result<HashMap<_,_>>>().map_err(db_error)
 }
 
 fn delete_page_key_family(
@@ -7731,6 +7792,7 @@ mod tests {
 
     fn transfer_caption() -> PortableAiCaption {
         PortableAiCaption {
+            rotation: 90,
             model_id: "test-model@revision".into(),
             prompt_version: 1,
             lang: "ja".into(),
@@ -7751,8 +7813,8 @@ mod tests {
             .unwrap()
             .execute(
                 "INSERT INTO captions (item_key, mtime_ms, size, model_id, prompt_version,
-                    lang, caption, visible_text, keywords, cover_ref, status, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    lang, caption, visible_text, keywords, cover_ref, status, created_at, rotation)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     key,
                     caption.mtime_ms,
@@ -7766,6 +7828,7 @@ mod tests {
                     caption.cover_ref,
                     status,
                     caption.created_at,
+                    caption.rotation,
                 ],
             )
             .unwrap();
@@ -7857,6 +7920,15 @@ mod tests {
         assert!(imported.changed.ai_captions);
         assert_eq!(imported.committed.ai_captions, 1);
         let conn = Connection::open(destination_data.join("ai_caption.db")).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT rotation FROM captions WHERE item_key=?1",
+                [&key],
+                |row| row.get::<_, i32>(0)
+            )
+            .unwrap(),
+            90
+        );
         let (mtime, size, rev, indexed): (i64, u64, i64, i64) = conn
             .query_row(
                 "SELECT mtime_ms, size, rev, indexed FROM captions WHERE item_key=?1",
@@ -7918,6 +7990,100 @@ mod tests {
             .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn ai_caption_rotation_legacy_export_and_json_default_preserve_existing_description() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        init_data_dir(&data);
+        let path = root.join("image.jpg");
+        fs::write(&path, b"image").unwrap();
+        let key = crate::path_key::normalize_keep_drive(&path);
+        let mut expected = transfer_caption();
+        expected.rotation = 0;
+        set_transfer_caption(&data, &key, "ok", &expected);
+        let conn = Connection::open(data.join("ai_caption.db")).unwrap();
+        conn.execute_batch("DROP TRIGGER captions_upd; ALTER TABLE captions DROP COLUMN rotation;")
+            .unwrap();
+        drop(conn);
+        let cancel = AtomicBool::new(false);
+        assert_eq!(
+            export_at(&data, &root, false, &cancel, no_progress)
+                .unwrap()
+                .ai_captions,
+            1
+        );
+        let manifest = read_bundle_manifest(&root, &cancel).unwrap();
+        let mut caption_entries = 0;
+        visit_bundle_entries(&root, &manifest, &cancel, |entry, _, _| {
+            if entry.path == "image.jpg" {
+                assert_eq!(entry.ai_caption.as_ref(), Some(&expected));
+                caption_entries += 1;
+            } else {
+                assert!(entry.ai_caption.is_none());
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(caption_entries, 1);
+        let mut wire = serde_json::to_value(&expected).unwrap();
+        wire.as_object_mut().unwrap().remove("rotation");
+        assert_eq!(
+            serde_json::from_value::<PortableAiCaption>(wire)
+                .unwrap()
+                .rotation,
+            0
+        );
+    }
+
+    #[test]
+    fn ai_caption_rotation_import_publishes_only_committed_effective_changes() {
+        use crate::rotation_db::{Rotation, RotationDb};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir_all(&root).unwrap();
+        init_data_dir(&source);
+        init_data_dir(&destination);
+        let mut keys = Vec::new();
+        for name in ["changed.png", "same.png", "removed.png", "failed.png"] {
+            let path = root.join(name);
+            fs::write(&path, b"image").unwrap();
+            keys.push(crate::path_key::normalize_keep_drive(&path));
+        }
+        let before = RotationDb::open_at(&source.join("rotation.db")).unwrap();
+        before.set_key(&keys[0], Rotation::Cw90).unwrap();
+        before.set_key(&keys[1], Rotation::Cw180).unwrap();
+        before.set_key(&keys[3], Rotation::Cw90).unwrap();
+        let after = RotationDb::open_at(&destination.join("rotation.db")).unwrap();
+        after.set_key(&keys[0], Rotation::Cw270).unwrap();
+        after.set_key(&keys[1], Rotation::Cw180).unwrap();
+        after.set_key(&keys[2], Rotation::Cw90).unwrap();
+        after.set_key(&keys[3], Rotation::Cw270).unwrap();
+        let conn = Connection::open(destination.join("rotation.db")).unwrap();
+        // Trigger failures happen after the old family was deleted, so the
+        // enclosing item's SAVEPOINT must restore its old angle as well.
+        conn.execute("CREATE TABLE rejected_rotation(path TEXT)", [])
+            .unwrap();
+        conn.execute("INSERT INTO rejected_rotation VALUES (?1)", [&keys[3]])
+            .unwrap();
+        conn.execute_batch("CREATE TRIGGER reject_rotation AFTER INSERT ON rotations WHEN EXISTS(SELECT 1 FROM rejected_rotation WHERE path=NEW.path) BEGIN SELECT RAISE(ABORT, 'fixture rejection'); END;").unwrap();
+        let cancel = AtomicBool::new(false);
+        export_at(&source, &root, false, &cancel, no_progress).unwrap();
+        let imported = import_at(&destination, &root, &cancel, no_progress).unwrap();
+        assert_eq!(imported.failed_entries, 1);
+        assert_eq!(
+            imported.committed.rotation_keys,
+            [keys[0].clone(), keys[2].clone()].into_iter().collect()
+        );
+        assert_eq!(after.get_key(&keys[3]), Some(Rotation::Cw270));
+        let unchanged = import_at(&destination, &root, &cancel, no_progress).unwrap();
+        assert_eq!(unchanged.failed_entries, 1);
+        assert!(unchanged.committed.rotation_keys.is_empty());
     }
 
     #[test]

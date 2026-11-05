@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::rotation_db::Rotation;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 mod normalize;
@@ -161,6 +162,7 @@ pub struct SaveRequest {
     pub item_path: PathBuf,
     pub signature_path: PathBuf,
     pub signature: FileSignature,
+    pub rotation: Rotation,
     pub cover_ref: String,
     pub model_id: String,
     pub prompt_version: i64,
@@ -187,6 +189,7 @@ pub enum CaptionStatus {
 pub struct CaptionRow {
     pub item_key: String,
     pub signature: FileSignature,
+    pub rotation: Rotation,
     pub model_id: String,
     pub prompt_version: i64,
     pub lang: String,
@@ -200,8 +203,21 @@ pub struct CaptionRow {
     pub indexed: bool,
 }
 
+impl CaptionRow {
+    /// The input identity used by creation, display and MCP.
+    pub(crate) fn matches_source(
+        &self,
+        signature: FileSignature,
+        cover_ref: &str,
+        rotation: Rotation,
+    ) -> bool {
+        self.signature == signature && self.cover_ref == cover_ref && self.rotation == rotation
+    }
+}
+
 pub struct CaptionDb {
     conn: Connection,
+    has_rotation: bool,
 }
 
 impl CaptionDb {
@@ -221,7 +237,10 @@ impl CaptionDb {
         let conn = Connection::open(path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         Self::ensure_schema(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            has_rotation: true,
+        })
     }
 
     /// Worker-only reads. Missing or not-yet-initialized stores are unpublished;
@@ -247,7 +266,10 @@ impl CaptionDb {
         // Opening the file can race that commit, so version zero is still absent.
         match conn.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))? {
             0 => Ok(None),
-            1 => Ok(Some(Self { conn })),
+            1 => {
+                let has_rotation = Self::has_rotation_column(&conn)?;
+                Ok(Some(Self { conn, has_rotation }))
+            }
             _ => Err(rusqlite::Error::InvalidQuery),
         }
     }
@@ -259,7 +281,14 @@ impl CaptionDb {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
-        Ok(Self { conn })
+        let has_rotation = Self::has_rotation_column(&conn)?;
+        Ok(Self { conn, has_rotation })
+    }
+
+    pub(crate) fn has_rotation_column(conn: &Connection) -> rusqlite::Result<bool> {
+        conn.prepare("PRAGMA table_info(captions)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .try_fold(false, |found, name| Ok(found || name? == "rotation"))
     }
 
     fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -273,6 +302,7 @@ impl CaptionDb {
             "CREATE TABLE IF NOT EXISTS captions (
                 item_key TEXT PRIMARY KEY NOT NULL,
                 mtime_ms INTEGER NOT NULL, size INTEGER NOT NULL,
+                rotation INTEGER NOT NULL DEFAULT 0 CHECK(rotation IN (0,90,180,270)),
                 model_id TEXT NOT NULL, prompt_version INTEGER NOT NULL,
                 lang TEXT NOT NULL, caption TEXT NOT NULL, visible_text TEXT NOT NULL,
                 cover_ref TEXT NOT NULL, keywords TEXT NOT NULL,
@@ -305,6 +335,21 @@ impl CaptionDb {
             END;
             PRAGMA user_version = 1;",
         )?;
+        if !Self::has_rotation_column(&tx)? {
+            tx.execute_batch("ALTER TABLE captions ADD COLUMN rotation INTEGER NOT NULL DEFAULT 0 CHECK(rotation IN (0,90,180,270));")?;
+        }
+        tx.execute_batch(
+            "DROP TRIGGER IF EXISTS captions_upd;
+            CREATE TRIGGER captions_upd AFTER UPDATE OF
+                item_key, mtime_ms, size, rotation, model_id, prompt_version, caption,
+                visible_text, cover_ref, keywords, status ON captions BEGIN
+                UPDATE caption_seq SET n = n + 1;
+                UPDATE captions SET rev = (SELECT n FROM caption_seq), indexed = 0
+                    WHERE item_key = NEW.item_key;
+                INSERT OR IGNORE INTO caption_removed
+                    SELECT OLD.item_key, n FROM caption_seq WHERE OLD.item_key <> NEW.item_key;
+            END;",
+        )?;
         tx.commit()
     }
 
@@ -320,11 +365,12 @@ impl CaptionDb {
     /// Read by item key. Physical paths may be passed without pre-normalizing.
     pub fn get(&self, item_key: &str) -> rusqlite::Result<Option<CaptionRow>> {
         let key = Self::normalize_path(Path::new(item_key));
+        let rotation_column = if self.has_rotation { "rotation" } else { "0" };
         self.conn
             .query_row(
-                "SELECT item_key, mtime_ms, size, model_id, prompt_version, lang,
-                caption, visible_text, keywords, cover_ref, status, created_at, rev, indexed
-             FROM captions WHERE item_key = ?1",
+                &format!("SELECT item_key, mtime_ms, size, model_id, prompt_version, lang,
+                caption, visible_text, keywords, cover_ref, status, created_at, rev, indexed, {rotation_column}
+             FROM captions WHERE item_key = ?1"),
                 [key],
                 |row| {
                     let keywords: String = row.get(8)?;
@@ -347,6 +393,7 @@ impl CaptionDb {
                             mtime_ms: row.get(1)?,
                             size: row.get(2)?,
                         },
+                        rotation: Rotation::from_degrees(row.get(14)?),
                         model_id: row.get(3)?,
                         prompt_version: row.get(4)?,
                         lang: row.get(5)?,
@@ -628,14 +675,14 @@ impl CaptionDb {
         }
         let changed = tx.execute(
             "INSERT INTO captions (item_key, mtime_ms, size, model_id, prompt_version,
-                lang, caption, visible_text, cover_ref, keywords, status, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                lang, caption, visible_text, cover_ref, keywords, status, created_at, rotation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(item_key) DO UPDATE SET
                 mtime_ms=excluded.mtime_ms, size=excluded.size, model_id=excluded.model_id,
                 prompt_version=excluded.prompt_version, lang=excluded.lang,
                 caption=excluded.caption, visible_text=excluded.visible_text,
                 cover_ref=excluded.cover_ref, keywords=excluded.keywords,
-                status=excluded.status, created_at=excluded.created_at
+                status=excluded.status, created_at=excluded.created_at, rotation=excluded.rotation
              WHERE excluded.status = 'ok' OR captions.status <> 'ok'",
             params![
                 key,
@@ -649,7 +696,8 @@ impl CaptionDb {
                 request.cover_ref,
                 keywords,
                 status,
-                system_time_ms(SystemTime::now()).unwrap_or(0)
+                system_time_ms(SystemTime::now()).unwrap_or(0),
+                request.rotation.degrees()
             ],
         )?;
         if let Some(cancel) = cancel {
@@ -702,6 +750,7 @@ mod tests {
 
     fn request(path: &Path) -> SaveRequest {
         SaveRequest {
+            rotation: crate::rotation_db::Rotation::None,
             item_path: path.to_path_buf(),
             signature_path: path.to_path_buf(),
             signature: FileSignature::from_metadata(&std::fs::metadata(path).unwrap()).unwrap(),
@@ -1356,21 +1405,25 @@ mod tests {
 
     #[test]
     fn copied_indexed_row_is_a_new_pending_revision() {
-        let (_temp, db, req) = fixture();
+        let (_temp, db, mut req) = fixture();
+        req.rotation = Rotation::Cw90;
         db.save(&req).unwrap();
         db.conn
             .execute("UPDATE captions SET indexed=1", [])
             .unwrap();
         db.conn
             .execute(
-                "INSERT INTO captions SELECT 'c:/copy.jpg', mtime_ms, size,
+                "INSERT INTO captions (item_key, mtime_ms, size, model_id, prompt_version,
+            lang, caption, visible_text, cover_ref, keywords, status, created_at, rev, indexed, rotation)
+            SELECT 'c:/copy.jpg', mtime_ms, size,
             model_id, prompt_version, lang, caption, visible_text, cover_ref, keywords,
-            status, created_at, rev, indexed FROM captions",
+            status, created_at, rev, indexed, rotation FROM captions",
                 [],
             )
             .unwrap();
         let copied = db.get("c:/copy.jpg").unwrap().unwrap();
         assert_eq!(copied.rev, 2);
+        assert_eq!(copied.rotation, Rotation::Cw90);
         assert!(!copied.indexed);
         assert!(read(&db, &req).unwrap().indexed);
     }
@@ -1378,8 +1431,10 @@ mod tests {
     fn seed_caption_key(db: &CaptionDb, key: &str) {
         db.conn
             .execute(
-                "INSERT INTO captions SELECT ?1, mtime_ms, size, model_id, prompt_version,
-             lang, caption, visible_text, cover_ref, keywords, status, created_at, rev, indexed
+                "INSERT INTO captions (item_key, mtime_ms, size, model_id, prompt_version,
+             lang, caption, visible_text, cover_ref, keywords, status, created_at, rev, indexed, rotation)
+             SELECT ?1, mtime_ms, size, model_id, prompt_version,
+             lang, caption, visible_text, cover_ref, keywords, status, created_at, rev, indexed, rotation
              FROM captions LIMIT 1",
                 [key],
             )
@@ -1562,6 +1617,65 @@ mod tests {
         lock.rollback().unwrap();
         assert!(read(&db, &req).is_none());
         assert_eq!(seq(&db), 0);
+    }
+
+    #[test]
+    fn caption_rotation_legacy_column_migration_keeps_all_rows_and_readonly_defaults_to_zero() {
+        let (temp, db, req) = fixture();
+        db.save(&req).unwrap();
+        db.conn.execute_batch("WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<999)
+            INSERT INTO captions SELECT item_key || n, mtime_ms, size, rotation, model_id, prompt_version, lang,
+                caption, visible_text, cover_ref, keywords, status, created_at, rev, indexed
+                FROM captions, numbers WHERE item_key = (SELECT item_key FROM captions LIMIT 1);
+            UPDATE captions SET indexed=1;
+            DROP TRIGGER captions_upd;
+            ALTER TABLE captions DROP COLUMN rotation;").unwrap();
+        let key = CaptionDb::normalize_path(&req.item_path);
+        let legacy = CaptionDb::open_read_only(temp.path().join("ai_caption.db"))
+            .unwrap()
+            .unwrap();
+        let original = legacy.get(&key).unwrap().unwrap();
+        assert_eq!(original.rotation, Rotation::None);
+        let original_seq = seq(&db);
+        drop(legacy);
+        drop(db);
+        let reopened = CaptionDb::open_at(temp.path().join("ai_caption.db")).unwrap();
+        assert_eq!(reopened.get(&key).unwrap(), Some(original.clone()));
+        assert_eq!(seq(&reopened), original_seq);
+        assert_eq!(
+            reopened
+                .conn
+                .query_row("SELECT COUNT(*) FROM captions", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            1000
+        );
+        reopened
+            .conn
+            .execute("UPDATE captions SET rotation=90 WHERE item_key=?1", [&key])
+            .unwrap();
+        let rotated = reopened.get(&key).unwrap().unwrap();
+        assert_eq!(rotated.rotation, Rotation::Cw90);
+        assert!(rotated.rev > original.rev);
+        assert!(!rotated.indexed);
+    }
+
+    #[test]
+    fn caption_rotation_save_and_common_identity_cover_all_quarter_turns() {
+        let (_temp, db, mut req) = fixture();
+        for angle in [
+            Rotation::None,
+            Rotation::Cw90,
+            Rotation::Cw180,
+            Rotation::Cw270,
+        ] {
+            req.rotation = angle;
+            db.save(&req).unwrap();
+            let row = read(&db, &req).unwrap();
+            assert_eq!(row.rotation, angle);
+            assert!(row.matches_source(req.signature, "", angle));
+            assert!(!row.matches_source(req.signature, "", angle.rotate_cw()));
+        }
     }
 
     #[test]

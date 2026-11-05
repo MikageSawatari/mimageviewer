@@ -13,6 +13,7 @@ fn permission(gps: bool) -> PermissionSnapshot {
 fn seed_caption(path: &Path, failed: bool) {
     use crate::ai_caption_db::*;
     let request = SaveRequest {
+        rotation: crate::rotation_db::Rotation::None,
         item_path: path.to_owned(),
         signature_path: path.to_owned(),
         signature: FileSignature::from_metadata(&std::fs::metadata(path).unwrap()).unwrap(),
@@ -78,7 +79,161 @@ fn ai_caption_permission_rows_and_image_staleness() {
 }
 
 #[test]
-fn ai_caption_books_and_partial_items_use_outer_book_without_staleness() {
+fn ai_caption_rotation_stale_compares_saved_generation_angle() {
+    let directory = crate::settings_db::DataDirOverrideGuard::new();
+    let path = directory.path().join("caption.png");
+    std::fs::write(&path, png(&[])).unwrap();
+    seed_caption(&path, false);
+    let metadata = std::fs::metadata(&path).unwrap();
+    let read = || {
+        read_caption(
+            &crate::ai_caption_db::CaptionDb::db_path(),
+            &path,
+            Some(&metadata),
+            true,
+        )
+        .unwrap()
+    };
+    assert!(matches!(
+        read(),
+        CaptionField::Present(AiCaptionInfo {
+            stale: Some(false),
+            ..
+        })
+    ));
+    let rotations = crate::rotation_db::RotationDb::open().unwrap();
+    rotations
+        .set(&path, crate::rotation_db::Rotation::Cw180)
+        .unwrap();
+    assert!(matches!(
+        read(),
+        CaptionField::Present(AiCaptionInfo {
+            stale: Some(true),
+            ..
+        })
+    ));
+    let db = crate::ai_caption_db::CaptionDb::open().unwrap();
+    let mut row = db.get(&path.to_string_lossy()).unwrap().unwrap();
+    db.save(&crate::ai_caption_db::SaveRequest {
+        item_path: path.clone(),
+        signature_path: path.clone(),
+        signature: row.signature,
+        rotation: crate::rotation_db::Rotation::Cw180,
+        cover_ref: row.cover_ref,
+        model_id: row.model_id,
+        prompt_version: row.prompt_version,
+        lang: row.lang,
+        result: crate::ai_caption_db::CaptionResult::Ok {
+            caption: std::mem::take(&mut row.caption),
+            text: row.visible_text,
+            keywords: row.keywords,
+        },
+    })
+    .unwrap();
+    assert!(matches!(
+        read(),
+        CaptionField::Present(AiCaptionInfo {
+            stale: Some(false),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn ai_caption_rotation_book_stale_uses_current_folder_or_zip_cover() {
+    use crate::ai_caption_db::{CaptionDb, CaptionResult, FileSignature, SaveRequest};
+    use crate::rotation_db::{Rotation, RotationDb};
+    let directory = crate::settings_db::DataDirOverrideGuard::new();
+    let allowed = PermissionSnapshot {
+        ai_captions: true,
+        ..permission(false)
+    };
+    for zip in [false, true] {
+        let book = directory
+            .path()
+            .join(if zip { "book.zip" } else { "folder" });
+        let (signature_path, cover_ref, rotation_key) = if zip {
+            std::fs::write(&book, zip_bytes(&[("cover.png", &png(&[]))])).unwrap();
+            (
+                book.clone(),
+                "#entry=cover.png".to_string(),
+                crate::edit_source::page_key_for_grid_item(&GridItem::ZipImage {
+                    zip_path: book.clone(),
+                    entry_name: "cover.png".into(),
+                })
+                .unwrap(),
+            )
+        } else {
+            std::fs::create_dir(&book).unwrap();
+            let cover = book.join("cover.png");
+            std::fs::write(&cover, png(&[])).unwrap();
+            (
+                cover.clone(),
+                "cover.png".to_string(),
+                crate::edit_source::page_key_for_grid_item(&GridItem::Image(cover)).unwrap(),
+            )
+        };
+        let db = CaptionDb::open().unwrap();
+        db.save(&SaveRequest {
+            item_path: book.clone(),
+            signature: FileSignature::from_metadata(&std::fs::metadata(&signature_path).unwrap())
+                .unwrap(),
+            signature_path,
+            rotation: Rotation::None,
+            cover_ref,
+            model_id: "fixture".into(),
+            prompt_version: 1,
+            lang: "ja".into(),
+            result: CaptionResult::Ok {
+                caption: "book".into(),
+                text: String::new(),
+                keywords: Vec::new(),
+            },
+        })
+        .unwrap();
+        let read_book = || {
+            read(&item(&book, None), allowed, &AtomicBool::new(false))
+                .unwrap()
+                .ai_caption
+        };
+        assert!(matches!(
+            read_book(),
+            CaptionField::Present(AiCaptionInfo {
+                stale: Some(false),
+                ..
+            })
+        ));
+        RotationDb::open()
+            .unwrap()
+            .set_key(&rotation_key, Rotation::Cw90)
+            .unwrap();
+        assert!(matches!(
+            read_book(),
+            CaptionField::Present(AiCaptionInfo {
+                stale: Some(true),
+                ..
+            })
+        ));
+        if zip {
+            let output = read(
+                &item(&book, Some("cover.png")),
+                allowed,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert!(matches!(
+                output.container_ai_caption,
+                Some(CaptionField::Present(AiCaptionInfo {
+                    stale: Some(true),
+                    ..
+                }))
+            ));
+        }
+    }
+}
+
+#[test]
+fn ai_caption_books_and_partial_items_use_outer_book_and_current_cover_staleness() {
     let directory = crate::settings_db::DataDirOverrideGuard::new();
     let allowed = PermissionSnapshot {
         ai_captions: true,
@@ -96,11 +251,12 @@ fn ai_caption_books_and_partial_items_use_outer_book_without_staleness() {
         }
         seed_caption(&path, false);
         let mut output = read(&item(&path, None), allowed, &cancel).unwrap();
-        assert!(
-            matches!(
-                output.ai_caption,
-                CaptionField::Present(AiCaptionInfo { stale: None, .. })
-            ),
+        let CaptionField::Present(info) = &output.ai_caption else {
+            panic!("{name}")
+        };
+        assert_eq!(
+            info.stale,
+            if name == "book.zip" { Some(true) } else { None },
             "{name}"
         );
         assert!(output.container_ai_caption.is_none());
@@ -128,7 +284,10 @@ fn ai_caption_books_and_partial_items_use_outer_book_without_staleness() {
                 assert_eq!(output.ai_caption, CaptionField::None);
                 assert!(matches!(
                     output.container_ai_caption,
-                    Some(CaptionField::Present(AiCaptionInfo { stale: None, .. }))
+                    Some(CaptionField::Present(AiCaptionInfo {
+                        stale: Some(true),
+                        ..
+                    }))
                 ));
                 let hidden = read(&item(&path, Some(member)), permission(false), &cancel).unwrap();
                 assert_eq!(hidden.ai_caption, CaptionField::NotPermitted);

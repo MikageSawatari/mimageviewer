@@ -325,7 +325,7 @@ fn restore_candidates_with_maintenance(
                 );
             // A later store/promotion may fail after a pin store committed.
             report.committed_thumbnail_pins += copied.committed_thumbnail_pins;
-            report.store_mutations.merge(copied.store_mutations);
+            report.store_mutations.merge(copied.store_mutations.clone());
             if !copied.errors.is_empty() {
                 return Err(copied.errors.join("; "));
             }

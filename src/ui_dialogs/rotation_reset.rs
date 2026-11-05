@@ -7,7 +7,21 @@ impl crate::app::App {
         if self.rotation_db.is_none() || !self.admit_book_append_followup_mutation() {
             return false;
         }
-        let deleted = self.rotation_db.as_ref().unwrap().clear_all().unwrap_or(0);
+        let deleted = match self.rotation_db.as_ref().unwrap().clear_all() {
+            Ok(deleted) => {
+                if deleted > 0 {
+                    self.caption_display.invalidate_rotation_keys(
+                        self.rotation_page_keys.iter().map(String::as_str),
+                    );
+                }
+                self.rotation_page_keys.clear();
+                deleted
+            }
+            Err(error) => {
+                crate::logger::log(format!("[rotation] Reset failed: {error}"));
+                0
+            }
+        };
         self.reset_rotation_cache_after_clear();
         crate::logger::log(format!("[rotation] Reset: {deleted} entries cleared"));
         true

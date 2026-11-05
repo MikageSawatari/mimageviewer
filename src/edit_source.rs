@@ -373,6 +373,51 @@ pub(crate) fn page_key_for_grid_item(item: &crate::grid_item::GridItem) -> Optio
     }
 }
 
+/// Caption input keys use the same page identities as desktop edits.
+/// A compiled physical book page cannot be rotated by the desktop.
+pub(crate) fn caption_rotation_key(
+    location: &crate::thumb_loader::ReadLocation,
+    books_root: Option<&Path>,
+) -> Option<String> {
+    use crate::grid_item::GridItem;
+    use crate::thumb_loader::ReadLocation;
+    let item = match location {
+        ReadLocation::File(path) => {
+            if books_root.is_some_and(|root| {
+                path.parent()
+                    .is_some_and(|parent| crate::books::is_direct_book_folder(root, parent))
+            }) {
+                return None;
+            }
+            GridItem::Image(path.clone())
+        }
+        ReadLocation::ArchiveEntry { archive, entry } => GridItem::ZipImage {
+            zip_path: archive.clone(),
+            entry_name: entry.clone(),
+        },
+        ReadLocation::PdfPage { pdf, page } => GridItem::PdfPage {
+            pdf_path: pdf.clone(),
+            page_num: *page,
+            content_type: None,
+        },
+        ReadLocation::ChildCached | ReadLocation::Unreadable { .. } => return None,
+    };
+    page_key_for_grid_item(&item)
+}
+
+/// Worker-only rotation read; an absent store or row means no rotation.
+pub(crate) fn read_caption_rotation(
+    db: Option<&crate::rotation_db::RotationDb>,
+    key: Option<&str>,
+) -> rusqlite::Result<crate::rotation_db::Rotation> {
+    match (db, key) {
+        (Some(db), Some(key)) => Ok(db
+            .get_key_checked(key)?
+            .unwrap_or(crate::rotation_db::Rotation::None)),
+        _ => Ok(crate::rotation_db::Rotation::None),
+    }
+}
+
 pub(crate) fn page_key_for_remote(
     logical_path: &Path,
     subresource: &mimageviewer_ipc::RemoteSubresource,

@@ -654,6 +654,7 @@ mod tests {
     fn caption_text_uses_successful_content_without_signature_filtering() {
         use crate::ai_caption_db::{CaptionRow, CaptionStatus, FileSignature};
         let mut row = CaptionRow {
+            rotation: crate::rotation_db::Rotation::None,
             item_key: "c:/missing.jpg".into(),
             signature: FileSignature {
                 size: 0,

@@ -58,7 +58,7 @@
 //! - **エクスプローラー等アプリ外でのリネーム**: このモジュールはアプリ内リネームの
 //!   成功ハンドラからしか呼ばれない (外部リネームの検知は将来課題)。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -240,12 +240,13 @@ pub struct RenameMigrationReport {
 /// orphan cleanup の削除・key rewrite は増分通知を持たない。descriptor commit の共通境界でこの
 /// effect を立て、UI 側は SQLite を触らず cancellable worker で authoritative snapshot を再読込する。
 /// 説明文などの共有表示キャッシュは、実際に行が変わったストアの完了印で失効させる。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StoreMutationEffects {
     content_identity_index_stale: bool,
     book_composition_changed: bool,
     caption_display_stale: bool,
     ai_captions_changed: bool,
+    rotation_keys: BTreeSet<String>,
 }
 
 impl StoreMutationEffects {
@@ -255,6 +256,7 @@ impl StoreMutationEffects {
             book_composition_changed: false,
             caption_display_stale: false,
             ai_captions_changed: false,
+            rotation_keys: BTreeSet::new(),
         }
     }
 
@@ -277,16 +279,24 @@ impl StoreMutationEffects {
         ) && rows > 0;
     }
 
-    pub(crate) fn book_composition_changed(self) -> bool {
+    pub(crate) fn book_composition_changed(&self) -> bool {
         self.book_composition_changed
     }
 
-    pub(crate) fn caption_display_stale(self) -> bool {
+    pub(crate) fn caption_display_stale(&self) -> bool {
         self.caption_display_stale
     }
 
-    pub(crate) fn ai_captions_changed(self) -> bool {
+    pub(crate) fn ai_captions_changed(&self) -> bool {
         self.ai_captions_changed
+    }
+
+    pub(crate) fn rotation_keys(&self) -> &BTreeSet<String> {
+        &self.rotation_keys
+    }
+
+    pub(crate) fn record_rotation_keys(&mut self, keys: BTreeSet<String>) {
+        self.rotation_keys.extend(keys);
     }
 
     pub(crate) fn merge(&mut self, other: Self) {
@@ -294,10 +304,111 @@ impl StoreMutationEffects {
         self.book_composition_changed |= other.book_composition_changed;
         self.caption_display_stale |= other.caption_display_stale;
         self.ai_captions_changed |= other.ai_captions_changed;
+        self.rotation_keys.extend(other.rotation_keys);
     }
 
-    pub(crate) fn content_identity_index_stale(self) -> bool {
+    pub(crate) fn content_identity_index_stale(&self) -> bool {
         self.content_identity_index_stale
+    }
+}
+
+/// Worker-only before/after comparison of the SQL mutation's exact keys and indexed ranges.
+/// Missing rows and stored zero/invalid angles have the same effective rotation as RotationDb.
+#[derive(Default)]
+pub(crate) struct RotationMutationSnapshot {
+    exact_keys: BTreeSet<String>,
+    prefixes: BTreeSet<String>,
+    before: BTreeMap<String, crate::rotation_db::Rotation>,
+}
+
+impl RotationMutationSnapshot {
+    pub(crate) fn capture(
+        connection: &rusqlite::Connection,
+        descriptor: &StoreDescriptor,
+        exact_keys: impl IntoIterator<Item = String>,
+        prefixes: impl IntoIterator<Item = String>,
+    ) -> rusqlite::Result<Self> {
+        if descriptor.file != "rotation.db" {
+            return Ok(Self::default());
+        }
+        let mut snapshot = Self {
+            exact_keys: exact_keys.into_iter().collect(),
+            prefixes: prefixes.into_iter().collect(),
+            before: BTreeMap::new(),
+        };
+        snapshot.before = snapshot.read(connection)?;
+        Ok(snapshot)
+    }
+
+    fn capture_families(
+        connection: &rusqlite::Connection,
+        descriptor: &StoreDescriptor,
+        keys: impl IntoIterator<Item = String>,
+    ) -> rusqlite::Result<Self> {
+        if descriptor.file != "rotation.db" {
+            return Ok(Self::default());
+        }
+        let keys = keys.into_iter().collect::<Vec<_>>();
+        let prefixes = keys
+            .iter()
+            .flat_map(|key| [format!("{key}/"), format!("{key}::")]);
+        Self::capture(connection, descriptor, keys.iter().cloned(), prefixes)
+    }
+
+    fn read(
+        &self,
+        connection: &rusqlite::Connection,
+    ) -> rusqlite::Result<BTreeMap<String, crate::rotation_db::Rotation>> {
+        let mut values = BTreeMap::new();
+        if self.exact_keys.is_empty() && self.prefixes.is_empty() {
+            return Ok(values);
+        }
+        let read_row = |row: &rusqlite::Row<'_>| {
+            Ok((
+                row.get::<_, String>(0)?,
+                crate::rotation_db::Rotation::from_degrees(row.get::<_, i32>(1)?),
+            ))
+        };
+        let mut exact = connection.prepare("SELECT path, angle FROM rotations WHERE path = ?1")?;
+        for key in &self.exact_keys {
+            values.extend(
+                exact
+                    .query_map([key], read_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+        }
+        for prefix in &self.prefixes {
+            let rows = if let Some(upper) = prefix_upper_bound(prefix) {
+                connection
+                    .prepare("SELECT path, angle FROM rotations WHERE path >= ?1 AND path < ?2")?
+                    .query_map(rusqlite::params![prefix, upper], read_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                connection
+                    .prepare("SELECT path, angle FROM rotations WHERE path >= ?1 AND substr(path, 1, ?2) = ?1")?
+                    .query_map(rusqlite::params![prefix, prefix.chars().count() as i64], read_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            values.extend(rows);
+        }
+        Ok(values)
+    }
+
+    pub(crate) fn changed_keys(
+        &self,
+        connection: &rusqlite::Connection,
+    ) -> rusqlite::Result<BTreeSet<String>> {
+        let after = self.read(connection)?;
+        Ok(self
+            .before
+            .keys()
+            .chain(after.keys())
+            .filter(|key| {
+                self.before.get(*key).copied().unwrap_or_default()
+                    != after.get(*key).copied().unwrap_or_default()
+            })
+            .cloned()
+            .collect())
     }
 }
 
@@ -1880,13 +1991,15 @@ pub(crate) fn migrate_book_paths_at(
         };
         let result = if descriptor.book_policy == BookStorePolicy::OwnedByEditPreview {
             crate::edit_preview_cache::migrate_book_paths_at(data_dir, &store_moves, &store_copies)
+                .map(|rows| (rows, BTreeSet::new()))
         } else {
             migrate_book_store(&db_path, descriptor, &store_moves, &store_copies, moves)
         };
         match result {
-            Ok(rows) => {
+            Ok((rows, rotation_keys)) => {
                 report.rows += rows;
                 report.store_mutations.record_rows_changed(descriptor, rows);
+                report.store_mutations.record_rotation_keys(rotation_keys);
             }
             Err(error) => report.errors.push(format!(
                 "{}: {}.{}: {error}",
@@ -1926,7 +2039,7 @@ fn migrate_book_store(
     moves: &[(String, String)],
     copies: &[(String, String)],
     raw_moves: &[(PathBuf, PathBuf)],
-) -> Result<usize, String> {
+) -> Result<(usize, BTreeSet<String>), String> {
     let mut conn = open_store_for_write(db_path, descriptor)?;
     let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
     let _rating_write =
@@ -1935,6 +2048,15 @@ fn migrate_book_store(
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| e.to_string())?;
+    let rotation_snapshot = RotationMutationSnapshot::capture_families(
+        &tx,
+        descriptor,
+        moves
+            .iter()
+            .flat_map(|(old, new)| [old.clone(), new.clone()])
+            .chain(copies.iter().map(|(_, new)| new.clone())),
+    )
+    .map_err(|error| error.to_string())?;
     let action = || -> rusqlite::Result<usize> {
         let columns = table_columns(&tx, descriptor.table)?;
         if columns.is_empty() && descriptor.optional_legacy_table() {
@@ -2032,8 +2154,11 @@ fn migrate_book_store(
         Ok(changed)
     };
     let changed = action().map_err(|e| e.to_string())?;
+    let rotation_keys = rotation_snapshot
+        .changed_keys(&tx)
+        .map_err(|error| error.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
-    Ok(changed)
+    Ok((changed, rotation_keys))
 }
 
 fn rewrite_book_store_values(
@@ -2488,7 +2613,7 @@ fn purge_store_with_before_sql(
     report.db_open_count += 1;
     let action = || {
         before_sql();
-        (|| -> Result<usize, Box<dyn std::error::Error>> {
+        (|| -> Result<(usize, BTreeSet<String>), Box<dyn std::error::Error>> {
             let mut conn =
                 open_store_for_write(&db_path, descriptor).map_err(std::io::Error::other)?;
             let table_exists: bool = conn.query_row(
@@ -2497,7 +2622,7 @@ fn purge_store_with_before_sql(
                 |row| row.get(0),
             )?;
             if !table_exists {
-                return Ok(0);
+                return Ok((0, BTreeSet::new()));
             }
             let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
             let _rating_write =
@@ -2505,6 +2630,11 @@ fn purge_store_with_before_sql(
             let _tag_write =
                 (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let rotation_snapshot = RotationMutationSnapshot::capture_families(
+                &tx,
+                descriptor,
+                removed_keys.iter().cloned(),
+            )?;
             let mut changed = 0usize;
 
             // exact は PK / index を使う IN へまとめる。batch 幅は SQLite の既定 parameter
@@ -2544,8 +2674,9 @@ fn purge_store_with_before_sql(
                     }
                 }
             }
+            let rotation_keys = rotation_snapshot.changed_keys(&tx)?;
             tx.commit()?;
-            Ok(changed)
+            Ok((changed, rotation_keys))
         })()
     };
     let result = if guard.is_some() {
@@ -2554,9 +2685,10 @@ fn purge_store_with_before_sql(
         with_identity_epub_coverage(descriptor, coverage, action)
     };
     match result {
-        Ok(rows) => {
+        Ok((rows, rotation_keys)) => {
             report.rows += rows;
             report.store_mutations.record_rows_changed(descriptor, rows);
+            report.store_mutations.record_rotation_keys(rotation_keys);
         }
         Err(error) => report.errors.push(format!(
             "{}: {}.{}: {error}",
@@ -2605,7 +2737,7 @@ fn migrate_store(
         return;
     }
     // The operation already owns the union EPUB coverage before shift maintenance.
-    let result = (|| -> Result<usize, Box<dyn std::error::Error>> {
+    let result = (|| -> Result<(usize, BTreeSet<String>), Box<dyn std::error::Error>> {
         let mut conn = open_store_for_write(db_path, descriptor).map_err(std::io::Error::other)?;
         let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
         let _rating_write =
@@ -2616,11 +2748,16 @@ fn migrate_store(
         if columns.is_empty()
             && descriptor.table_availability == StoreTableAvailability::OptionalInLegacySchema
         {
-            return Ok(0);
+            return Ok((0, BTreeSet::new()));
         }
         if !columns.iter().any(|column| column == descriptor.column) {
             return Err(rusqlite::Error::InvalidColumnName(descriptor.column.to_string()).into());
         }
+        let rotation_snapshot = RotationMutationSnapshot::capture_families(
+            &tx,
+            descriptor,
+            [old_key.to_owned(), new_key.to_owned()],
+        )?;
         let changed = migrate_store_family(
             &tx,
             descriptor,
@@ -2639,14 +2776,16 @@ fn migrate_store(
             update_rating_source_paths_for_prefix(&tx, &format!("{new_key}/"))?;
             update_rating_source_paths_for_prefix(&tx, &format!("{new_key}::"))?;
         }
+        let rotation_keys = rotation_snapshot.changed_keys(&tx)?;
         tx.commit()?;
-        Ok(changed)
+        Ok((changed, rotation_keys))
     })();
 
     match result {
-        Ok(n) => {
+        Ok((n, rotation_keys)) => {
             report.rows += n;
             report.store_mutations.record_rows_changed(descriptor, n);
+            report.store_mutations.record_rotation_keys(rotation_keys);
         }
         Err(e) => report.errors.push(format!(
             "{}: {}.{}: {e}",
@@ -2864,11 +3003,12 @@ fn copy_store(
     let result = copy_store_transaction(db_path, descriptor, mappings, on_mapping);
 
     match result {
-        Ok(rows) => {
+        Ok((rows, rotation_keys)) => {
             report.rows += rows;
             report
                 .store_mutations
                 .record_rows_changed(&descriptor, rows);
+            report.store_mutations.record_rotation_keys(rotation_keys);
             if matches!(descriptor.table, "folder_thumb_pins" | "video_pins") {
                 report.committed_thumbnail_pins += rows;
             }
@@ -2885,13 +3025,13 @@ fn copy_store_transaction(
     descriptor: StoreDescriptor,
     mappings: &[NormalizedStoreCopyMapping],
     on_mapping: &mut impl FnMut(),
-) -> Result<usize, String> {
+) -> Result<(usize, BTreeSet<String>), String> {
     let cache_root = db_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("edit_preview_cache");
     let mut destination_files = Vec::new();
-    let result = (|| -> Result<usize, String> {
+    let result = (|| -> Result<(usize, BTreeSet<String>), String> {
         let mut conn = open_store_for_write(db_path, &descriptor)?;
         let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
         let _rating_write =
@@ -2904,13 +3044,26 @@ fn copy_store_transaction(
         if columns.is_empty()
             && descriptor.table_availability == StoreTableAvailability::OptionalInLegacySchema
         {
-            return Ok(0);
+            return Ok((0, BTreeSet::new()));
         }
         if !columns.iter().any(|column| column == descriptor.column) {
             return Err(
                 rusqlite::Error::InvalidColumnName(descriptor.column.to_string()).to_string(),
             );
         }
+        let rotation_snapshot = RotationMutationSnapshot::capture(
+            &tx,
+            &descriptor,
+            mappings.iter().filter_map(|mapping| match mapping {
+                NormalizedStoreCopyMapping::Exact { new_key, .. } => Some(new_key.clone()),
+                NormalizedStoreCopyMapping::Prefix { .. } => None,
+            }),
+            mappings.iter().filter_map(|mapping| match mapping {
+                NormalizedStoreCopyMapping::Prefix { new_prefix, .. } => Some(new_prefix.clone()),
+                NormalizedStoreCopyMapping::Exact { .. } => None,
+            }),
+        )
+        .map_err(|error| error.to_string())?;
         let mut changed = 0usize;
         for mapping in mappings {
             changed += copy_store_mapping(
@@ -2923,8 +3076,11 @@ fn copy_store_transaction(
             )?;
             on_mapping();
         }
+        let rotation_keys = rotation_snapshot
+            .changed_keys(&tx)
+            .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
-        Ok(changed)
+        Ok((changed, rotation_keys))
     })();
     if result.is_err() {
         crate::edit_preview_cache::cleanup_restored_preview_copy_files(
@@ -3257,6 +3413,235 @@ mod tests {
     use rusqlite::OptionalExtension;
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
+
+    fn rotation_fixture(data_dir: &Path, rows: &[(&str, i32)]) -> rusqlite::Connection {
+        let path = data_dir.join("rotation.db");
+        crate::rotation_db::RotationDb::open_at(&path).unwrap();
+        let connection = rusqlite::Connection::open(path).unwrap();
+        for (key, angle) in rows {
+            connection
+                .execute(
+                    "INSERT INTO rotations(path, angle) VALUES (?1, ?2)",
+                    rusqlite::params![key, angle],
+                )
+                .unwrap();
+        }
+        connection
+    }
+
+    fn rotation_key_set(keys: &[&str]) -> BTreeSet<String> {
+        keys.iter().map(|key| (*key).to_owned()).collect()
+    }
+
+    #[test]
+    fn rotation_generic_rename_reports_only_effective_angle_changes_in_all_faces() {
+        let dir = tempfile::tempdir().unwrap();
+        let connection = rotation_fixture(
+            dir.path(),
+            &[
+                ("c:/old", 90),
+                ("c:/new", 90),
+                ("c:/old/child.jpg", 180),
+                ("c:/old::page.jpg", 270),
+                ("c:/old/zero.jpg", 360),
+                ("c:/old/invalid.jpg", 42),
+                ("c:/old-other/untouched.jpg", 90),
+            ],
+        );
+        let report = run_at(dir.path(), Path::new("c:/old"), Path::new("c:/new"));
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            report.store_mutations.rotation_keys(),
+            &rotation_key_set(&[
+                "c:/old",
+                "c:/old/child.jpg",
+                "c:/new/child.jpg",
+                "c:/old::page.jpg",
+                "c:/new::page.jpg",
+            ])
+        );
+        assert!(!report.store_mutations.caption_display_stale());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT angle FROM rotations WHERE path = 'c:/new'",
+                    [],
+                    |row| row.get::<_, i32>(0),
+                )
+                .unwrap(),
+            90
+        );
+        let repeat = run_at(dir.path(), Path::new("c:/old"), Path::new("c:/new"));
+        assert!(repeat.errors.is_empty(), "{:?}", repeat.errors);
+        assert!(repeat.store_mutations.rotation_keys().is_empty());
+    }
+
+    #[test]
+    fn rotation_generic_copy_reports_destination_changes_and_preserves_same_angle_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let _connection = rotation_fixture(
+            dir.path(),
+            &[
+                ("c:/source.jpg", 90),
+                ("c:/same.jpg", 90),
+                ("c:/zero.jpg", 0),
+                ("c:/source.zip::page.jpg", 180),
+                ("c:/source.zip::same.jpg", 270),
+                ("c:/dest.zip::same.jpg", 270),
+                ("c:/source.zip::zero.jpg", 0),
+                ("c:/dest.zip-other::page.jpg", 90),
+            ],
+        );
+        let report = copy_stores_at(
+            dir.path(),
+            &[
+                StoreCopyPathMapping::exact("c:/source.jpg", "c:/dest.jpg"),
+                StoreCopyPathMapping::exact("c:/source.jpg", "c:/same.jpg"),
+                StoreCopyPathMapping::exact("c:/zero.jpg", "c:/dest-zero.jpg"),
+                StoreCopyPathMapping::VirtualPrefix {
+                    old_path: PathBuf::from("c:/source.zip"),
+                    new_path: PathBuf::from("c:/dest.zip"),
+                },
+            ],
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            report.store_mutations.rotation_keys(),
+            &rotation_key_set(&["c:/dest.jpg", "c:/dest.zip::page.jpg",])
+        );
+        assert!(!report.store_mutations.caption_display_stale());
+        let mut merged = StoreMutationEffects::default();
+        merged.record_rotation_keys(rotation_key_set(&["c:/another.jpg", "c:/dest.jpg"]));
+        merged.merge(report.store_mutations.clone());
+        assert_eq!(
+            merged.rotation_keys(),
+            &rotation_key_set(&["c:/another.jpg", "c:/dest.jpg", "c:/dest.zip::page.jpg",])
+        );
+    }
+
+    #[test]
+    fn rotation_purge_reports_nonzero_deletions_only_with_exact_and_descendant_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let connection = rotation_fixture(
+            dir.path(),
+            &[
+                ("c:/gone", 90),
+                ("c:/gone/child.jpg", 180),
+                ("c:/gone::page.jpg", 270),
+                ("c:/gone/zero.jpg", 0),
+                ("c:/gone/invalid.jpg", 42),
+                ("c:/gone-other/child.jpg", 90),
+            ],
+        );
+        let report = purge_removed_paths_at(dir.path(), &[PathBuf::from("c:/gone")], &[]);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            report.store_mutations.rotation_keys(),
+            &rotation_key_set(&["c:/gone", "c:/gone/child.jpg", "c:/gone::page.jpg",])
+        );
+        assert!(!report.store_mutations.caption_display_stale());
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM rotations", [], |row| row
+                    .get::<_, i32>(0))
+                .unwrap(),
+            1
+        );
+        let repeat = purge_removed_paths_at(dir.path(), &[PathBuf::from("c:/gone")], &[]);
+        assert!(repeat.store_mutations.rotation_keys().is_empty());
+    }
+
+    #[test]
+    fn rotation_book_move_and_copy_compare_final_angles_without_temporary_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let connection = rotation_fixture(
+            dir.path(),
+            &[
+                ("c:/book/a.jpg", 90),
+                ("c:/book/b.jpg", 180),
+                ("c:/book/same-a.jpg", 270),
+                ("c:/book/same-b.jpg", 270),
+                ("c:/book/copy.jpg", 90),
+                ("c:/book/zero.jpg", 0),
+            ],
+        );
+        let guard = acquire_store_maintenance(dir.path(), &[]).unwrap();
+        let report = migrate_book_paths_at(
+            dir.path(),
+            &[
+                (
+                    PathBuf::from("c:/book/a.jpg"),
+                    PathBuf::from("c:/book/b.jpg"),
+                ),
+                (
+                    PathBuf::from("c:/book/b.jpg"),
+                    PathBuf::from("c:/book/a.jpg"),
+                ),
+                (
+                    PathBuf::from("c:/book/same-a.jpg"),
+                    PathBuf::from("c:/book/same-b.jpg"),
+                ),
+                (
+                    PathBuf::from("c:/book/same-b.jpg"),
+                    PathBuf::from("c:/book/same-a.jpg"),
+                ),
+            ],
+            &[
+                (
+                    PathBuf::from("c:/book/a.jpg"),
+                    PathBuf::from("c:/book/copy.jpg"),
+                ),
+                (
+                    PathBuf::from("c:/book/a.jpg"),
+                    PathBuf::from("c:/book/zero.jpg"),
+                ),
+            ],
+            &guard,
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(
+            report.store_mutations.rotation_keys(),
+            &rotation_key_set(&["c:/book/a.jpg", "c:/book/b.jpg", "c:/book/copy.jpg",])
+        );
+        assert!(!report.store_mutations.caption_display_stale());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM rotations WHERE path LIKE '__miv_book_migration_%'",
+                    [],
+                    |row| row.get::<_, i32>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn rotation_failed_rename_and_copy_do_not_publish_uncommitted_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let connection = rotation_fixture(dir.path(), &[("c:/source.jpg", 90)]);
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_rotation_update BEFORE UPDATE ON rotations
+             BEGIN SELECT RAISE(ABORT, 'test rejected mutation'); END;
+             CREATE TRIGGER reject_rotation_insert BEFORE INSERT ON rotations
+             BEGIN SELECT RAISE(ABORT, 'test rejected mutation'); END;",
+            )
+            .unwrap();
+        let report = run_at(
+            dir.path(),
+            Path::new("c:/source.jpg"),
+            Path::new("c:/dest.jpg"),
+        );
+        assert!(!report.errors.is_empty());
+        assert!(report.store_mutations.rotation_keys().is_empty());
+        let copied = copy_stores_at(
+            dir.path(),
+            &[StoreCopyPathMapping::exact("c:/source.jpg", "c:/dest.jpg")],
+        );
+        assert!(!copied.errors.is_empty());
+        assert!(copied.store_mutations.rotation_keys().is_empty());
+    }
 
     fn caption_fixture(data_dir: &Path) -> rusqlite::Connection {
         let path = data_dir.join("ai_caption.db");
@@ -3619,6 +4004,11 @@ mod tests {
                 conn.execute_batch("ALTER TABLE edit_origin ADD COLUMN payload TEXT")
                     .unwrap();
                 conn
+            } else if descriptor.file == "rotation.db" {
+                let conn = rotation_fixture(dir.path(), &[]);
+                conn.execute_batch("ALTER TABLE rotations ADD COLUMN payload TEXT")
+                    .unwrap();
+                conn
             } else {
                 let conn = rusqlite::Connection::open(&path).unwrap();
                 let extra = if descriptor.table == "ratings" {
@@ -3651,6 +4041,18 @@ mod tests {
                         )
                     };
                     conn.execute(&insert, rusqlite::params![key, base]).unwrap();
+                    if descriptor.file == "rotation.db" {
+                        let angle = match base {
+                            "a" => 90,
+                            "b" => 180,
+                            _ => 270,
+                        };
+                        conn.execute(
+                            "UPDATE rotations SET angle = ?1 WHERE path = ?2",
+                            rusqlite::params![angle, key],
+                        )
+                        .unwrap();
+                    }
                 }
             }
             drop(conn);
@@ -3675,6 +4077,14 @@ mod tests {
                         )
                         .unwrap();
                     assert_eq!(payload, expected, "{} {key}", descriptor.table);
+                    if descriptor.file == "rotation.db" {
+                        let angle: i32 = conn
+                            .query_row("SELECT angle FROM rotations WHERE path = ?1", [&key], |r| {
+                                r.get(0)
+                            })
+                            .unwrap();
+                        assert_eq!(angle, if expected == "a" { 90 } else { 180 });
+                    }
                     if descriptor.table == "ratings" {
                         let source: String = conn
                             .query_row(
@@ -4437,7 +4847,15 @@ mod tests {
                 }
                 continue;
             }
-            let connection = open(dir, descriptor.file);
+            let connection = if descriptor.file == "rotation.db" {
+                let connection = rotation_fixture(dir, &[]);
+                connection
+                    .execute_batch("ALTER TABLE rotations ADD COLUMN payload TEXT")
+                    .unwrap();
+                connection
+            } else {
+                open(dir, descriptor.file)
+            };
             if descriptor.unique {
                 if descriptor.table == "edit_previews" {
                     connection
@@ -4512,6 +4930,11 @@ mod tests {
                             .unwrap();
                     }
                 }
+                if descriptor.file == "rotation.db" {
+                    connection
+                        .execute("UPDATE rotations SET angle = 90", [])
+                        .unwrap();
+                }
             } else {
                 connection
                     .execute_batch(
@@ -4562,6 +4985,21 @@ mod tests {
         assert_eq!(covered, 29);
         assert_eq!(report.rows, covered * 2);
         assert_eq!(report.committed_thumbnail_pins, 4);
+        let rotation_store = STORES
+            .iter()
+            .find(|store| store.file == "rotation.db")
+            .unwrap();
+        let rotation_key = rotation_store.normalize_path(new);
+        assert_eq!(
+            report.store_mutations.rotation_keys(),
+            &BTreeSet::from([
+                rotation_key.clone(),
+                format!(
+                    "{}ページ/001.jpg",
+                    restore_family_prefix(&rotation_key, rotation_store.restore_family)
+                ),
+            ])
+        );
 
         for descriptor in STORES {
             let connection = open(dir.path(), descriptor.file);
@@ -4613,6 +5051,16 @@ mod tests {
                         copied
                     };
                     assert_eq!(copied, payload, "{}.{}", descriptor.file, descriptor.table);
+                }
+                if descriptor.file == "rotation.db" {
+                    let wrong_angles: usize = connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM rotations WHERE angle != 90",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(wrong_angles, 0, "copy must preserve source rotation angles");
                 }
                 let source_rows: i64 = connection
                     .query_row(
@@ -5462,6 +5910,8 @@ mod tests {
                     &dir.path().join(descriptor.file),
                 )
                 .unwrap()
+            } else if descriptor.file == "rotation.db" {
+                rotation_fixture(dir.path(), &[])
             } else {
                 let conn = open(dir.path(), descriptor.file);
                 conn.execute_batch(&format!(
@@ -5497,6 +5947,9 @@ mod tests {
                         [key],
                     )
                     .unwrap();
+                } else if descriptor.file == "rotation.db" {
+                    conn.execute("INSERT INTO rotations(path, angle) VALUES (?1, 90)", [key])
+                        .unwrap();
                 } else {
                     conn.execute(
                         &format!(
@@ -5531,6 +5984,15 @@ mod tests {
         );
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.rows, STORES.len() * 3 + 2);
+        let rotation_key = crate::adjustment_db::normalize_path(&removed);
+        assert_eq!(
+            report.store_mutations.rotation_keys(),
+            &BTreeSet::from([
+                rotation_key.clone(),
+                format!("{rotation_key}/child.jpg"),
+                format!("{rotation_key}::page_1"),
+            ])
+        );
 
         for descriptor in STORES {
             let conn = open(dir.path(), descriptor.file);

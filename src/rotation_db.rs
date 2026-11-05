@@ -16,9 +16,10 @@ pub(crate) fn read_operations_for_test() -> usize {
 }
 
 /// 回転角度 (時計回り)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Rotation {
-    None,  // 0°
+    #[default]
+    None, // 0°
     Cw90,  // 90°
     Cw180, // 180°
     Cw270, // 270° (= 反時計回り 90°)
@@ -219,17 +220,35 @@ impl RotationDb {
     ///
     /// None (0°) の場合はレコードを削除する。
     pub fn set_key(&self, key: &str, rotation: Rotation) -> Result<(), rusqlite::Error> {
-        if rotation.is_none() {
-            self.conn
-                .execute("DELETE FROM rotations WHERE path = ?1", [key])?;
+        self.set_key_if_changed(key, rotation).map(|_| ())
+    }
+
+    pub(crate) fn set_key_if_changed(
+        &self,
+        key: &str,
+        rotation: Rotation,
+    ) -> Result<bool, rusqlite::Error> {
+        let rows = if rotation.is_none() {
+            use rusqlite::OptionalExtension;
+            return self
+                .conn
+                .query_row(
+                    "DELETE FROM rotations WHERE path = ?1 RETURNING angle",
+                    [key],
+                    |row| row.get::<_, i32>(0),
+                )
+                .optional()
+                .map(|previous| {
+                    previous.is_some_and(|angle| !Rotation::from_degrees(angle).is_none())
+                });
         } else {
             self.conn.execute(
                 "INSERT INTO rotations (path, angle) VALUES (?1, ?2)
-                 ON CONFLICT(path) DO UPDATE SET angle = ?2",
+                 ON CONFLICT(path) DO UPDATE SET angle = ?2 WHERE rotations.angle != ?2",
                 rusqlite::params![key, rotation.degrees()],
-            )?;
-        }
-        Ok(())
+            )?
+        };
+        Ok(rows > 0)
     }
 
     /// 全レコードを削除 (リセット)

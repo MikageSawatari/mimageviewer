@@ -971,6 +971,20 @@ fn delete_descriptor<F>(
                 return;
             }
         };
+    let rotation_snapshot = match crate::rename_key_migration::RotationMutationSnapshot::capture(
+        &transaction,
+        descriptor,
+        candidates.iter().map(|candidate| candidate.key.clone()),
+        std::iter::empty(),
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            report
+                .errors
+                .push(format!("{}.{}: {error}", descriptor.file, descriptor.table));
+            return;
+        }
+    };
     let sql = format!(
         "DELETE FROM {} WHERE {} = ?1",
         descriptor.table, descriptor.column
@@ -1011,6 +1025,15 @@ fn delete_descriptor<F>(
         drop(transaction);
         return;
     }
+    let rotation_keys = match rotation_snapshot.changed_keys(&transaction) {
+        Ok(keys) => keys,
+        Err(error) => {
+            report
+                .errors
+                .push(format!("{}.{}: {error}", descriptor.file, descriptor.table));
+            return;
+        }
+    };
     if let Err(error) = transaction.commit() {
         report.errors.push(format!(
             "{}.{} commit: {error}",
@@ -1021,6 +1044,7 @@ fn delete_descriptor<F>(
     report
         .store_mutations
         .record_rows_changed(descriptor, committed.iter().map(|(_, rows, _)| *rows).sum());
+    report.store_mutations.record_rotation_keys(rotation_keys);
     for (key, rows, store) in committed {
         *deleted.entry(store).or_default() += rows;
         report.deleted_keys.push(key);
@@ -1485,6 +1509,94 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM ratings", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn rotation_cleanup_reports_only_committed_nonzero_deleted_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let files = temp.path().join("files");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&files).unwrap();
+        let rotated = files.join("rotated.jpg");
+        let zero = files.join("zero.jpg");
+        let restored = files.join("restored.jpg");
+        let keys =
+            [&rotated, &zero, &restored].map(|path| crate::adjustment_db::normalize_path(path));
+        crate::rotation_db::RotationDb::open_at(&data_dir.join("rotation.db")).unwrap();
+        let connection = rusqlite::Connection::open(data_dir.join("rotation.db")).unwrap();
+        for (key, angle) in keys.iter().zip([90, 0, 270]) {
+            connection
+                .execute(
+                    "INSERT INTO rotations(path, angle) VALUES (?1, ?2)",
+                    rusqlite::params![key, angle],
+                )
+                .unwrap();
+        }
+        let cancel = AtomicBool::new(false);
+        let scan =
+            run_scan_at(&data_dir, Path::new(""), &cancel, &progress(PHASE_SCANNING)).unwrap();
+        assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+        assert_eq!(scan.orphan_total(), 3);
+        std::fs::write(&restored, b"restored after scan").unwrap();
+        let report = run_delete_at(
+            &data_dir,
+            Path::new(""),
+            &scan,
+            &cancel,
+            &progress(PHASE_DELETING),
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.deleted_total(), 2);
+        assert_eq!(
+            report.store_mutations.rotation_keys(),
+            &std::collections::BTreeSet::from([keys[0].clone()])
+        );
+        assert!(!report.store_mutations.caption_display_stale());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT angle FROM rotations WHERE path = ?1",
+                    [&keys[2]],
+                    |row| row.get::<_, i32>(0),
+                )
+                .unwrap(),
+            270
+        );
+    }
+
+    #[test]
+    fn rotation_cleanup_cancellation_rolls_back_without_publishing_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let files = temp.path().join("files");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&files).unwrap();
+        let db = crate::rotation_db::RotationDb::open_at(&data_dir.join("rotation.db")).unwrap();
+        for name in ["a.jpg", "b.jpg"] {
+            db.set(&files.join(name), crate::rotation_db::Rotation::Cw90)
+                .unwrap();
+        }
+        let cancel = AtomicBool::new(false);
+        let scan =
+            run_scan_at(&data_dir, Path::new(""), &cancel, &progress(PHASE_SCANNING)).unwrap();
+        let report = run_delete_with_hook(
+            &data_dir,
+            Path::new(""),
+            &scan,
+            &cancel,
+            &progress(PHASE_DELETING),
+            || cancel.store(true, Ordering::Relaxed),
+        );
+        assert!(report.canceled);
+        assert_eq!(report.deleted_total(), 0);
+        assert!(report.store_mutations.rotation_keys().is_empty());
+        for name in ["a.jpg", "b.jpg"] {
+            assert_eq!(
+                db.get(&files.join(name)),
+                Some(crate::rotation_db::Rotation::Cw90)
+            );
+        }
     }
 
     #[test]
