@@ -1,5 +1,9 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
+§1.714/§1.715（2026-11-05）: AI説明文作成と作成状況を「ツール」メニューへ追加。
+新しいKeyAction・既定キーは追加しない。進捗窓のEscは非モーダル窓内の固定操作で、表示だけを閉じる。
+旧Convert/Video設定の一度限りの整理はMenuLayoutSettingsの共通serde境界が所有する。
+
 §1.705/§1.708（2026-11-04）: 履歴は既存GridHistoryBack/Forwardを維持し、Local検索欄の
 Focused/PendingFocus/FocusRecoveryには限定permitで実効Alt（Ctrlなし）chordだけを通す。
 修飾なし/Ctrl/AltGrの編集割当・IME・別widgetへ一般gateを広げない。

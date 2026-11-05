@@ -68,6 +68,12 @@ pub(crate) struct CaptionJob {
 
 impl CaptionJob {
     #[cfg(test)]
+    pub(crate) fn for_progress_test(cancel: Arc<AtomicBool>) -> Self {
+        let (worker, _commands, _events) = CaptionWorker::test_channels(cancel.clone());
+        Self::new(worker, cancel)
+    }
+
+    #[cfg(test)]
     pub(super) fn queued_paths_for_test(&self) -> Vec<PathBuf> {
         self.queue
             .iter()
@@ -175,7 +181,7 @@ impl CaptionJob {
             "作成が終わりました"
         };
         let mut summary = format!(
-            "AI 説明文の{completion} (作成 {}、作成済み {}、対象外 {} (動画の表紙 {})、ファイルなし {}、未変換 {}、パスワードが必要 {}、読めなかった・失敗 {}、変更により破棄 {})",
+            "AI 説明文の{completion} (作成 {}、既にあり {}、対象外 {} (動画の表紙 {})、ファイルなし {}、未変換 {}、パスワードが必要 {}、読めなかった・失敗 {}、変更により破棄 {})",
             p.created,
             p.already_created,
             p.unsupported,
@@ -301,33 +307,38 @@ impl App {
         }
     }
 
-    pub(crate) fn request_create_ai_captions(&mut self, ctx: &egui::Context, background: bool) {
-        // The command is dispatched before its native/egui menu owner is cleared.
-        // Reuse the shared non-menu modal policy, preserving all real blockers.
-        if self.main_chrome_pointer_blocked() || self.remote_session_blocks_local_control() {
-            return;
+    pub(crate) fn caption_creation_disabled_reason(
+        &self,
+        background: bool,
+    ) -> Option<&'static str> {
+        if self.remote_session_blocks_local_control() {
+            return Some("リモート閲覧中は AI 説明文を作れません");
+        }
+        // A native/egui menu still owns its command while this is queried.
+        if self.main_chrome_pointer_blocked() {
+            return Some("ほかの操作を終えてから AI 説明文を作ってください");
         }
         if self
             .caption_job
             .as_ref()
             .is_some_and(|job| job.state == JobState::Stopping)
         {
-            self.show_feedback_result(STOPPING_MESSAGE.into(), FeedbackKind::Info);
+            return Some(STOPPING_MESSAGE);
+        }
+        if self.caption_targets(background).paths.is_empty() {
+            return Some(crate::context_menu_model::CAPTION_NO_TARGET_REASON);
+        }
+        None
+    }
+
+    pub(crate) fn request_create_ai_captions(&mut self, ctx: &egui::Context, background: bool) {
+        if let Some(reason) = self.caption_creation_disabled_reason(background) {
+            self.show_feedback_result(reason.into(), FeedbackKind::Info);
             return;
         }
         let targets = self.caption_targets(background);
         if self.caption_job.is_some() {
             self.append_caption_job_targets(targets);
-            return;
-        }
-        if targets.paths.is_empty() {
-            self.show_feedback_result(
-                format!(
-                    "AI 説明文を作れる画像や本がありません (対象外 {})",
-                    targets.unsupported
-                ),
-                FeedbackKind::Info,
-            );
             return;
         }
         if targets.unsupported != 0 {
@@ -344,6 +355,7 @@ impl App {
         let before = job.queue.len();
         let unsupported = targets.unsupported;
         let message = if job.append(targets) {
+            self.show_caption_progress = true;
             format!(
                 "AI 説明文の作成に追加しました (追加 {}、対象外 {unsupported})",
                 job.queue.len() - before
@@ -386,6 +398,7 @@ impl App {
             return;
         }
         self.caption_job = Some(job);
+        self.show_caption_progress = true;
     }
 
     /// Root-frame polling is independent of viewer lifetime and Remote input ownership.
@@ -420,6 +433,7 @@ impl App {
             };
             if let Some(result) = result {
                 let job = self.caption_job.take().expect("polled job");
+                self.show_caption_progress = false;
                 match result {
                     Ok(()) => self.show_feedback_result(job.summary(), FeedbackKind::Info),
                     Err(error) => {
@@ -436,6 +450,7 @@ impl App {
     }
 
     pub(crate) fn stop_caption_job_for_exit(&mut self) {
+        self.show_caption_progress = false;
         if let Some(job) = self.caption_job.take() {
             job.cancel.store(true, Ordering::Release);
             job.worker.stop_for_exit();
@@ -444,7 +459,47 @@ impl App {
     }
 
     pub(crate) fn show_caption_job_progress(&mut self, ctx: &egui::Context) {
+        if !self.show_caption_progress {
+            return;
+        }
+        // This modeless window must not take a text field's Escape, close under
+        // another dialog/popup, or consume a key belonging to another viewport.
+        let escape = self.dialog_escape_pressed(ctx)
+            && ctx.viewport_id() == egui::ViewportId::ROOT
+            && ctx.input(|input| input.viewport().focused).unwrap_or(true)
+            && !self.common_modal_dialog_open()
+            // Memory owns open menus/ComboBoxes even before their widget is drawn.
+            // The current-pass check also protects a popup drawn earlier that has
+            // already closed its memory state on this same Escape.
+            && !egui::Popup::is_any_open(ctx)
+            && !ctx.any_popup_open()
+            && ctx.memory(|memory| {
+                memory
+                    .layer_ids()
+                    .filter(|layer| {
+                        layer.order == egui::Order::Middle
+                            && memory.areas().is_visible(layer)
+                            && memory.areas().parent_layer(*layer).is_none()
+                    })
+                    .last()
+            }) == Some(egui::LayerId::new(
+                egui::Order::Middle,
+                egui::Id::unique("caption_job_progress"),
+            ))
+            && matches!(
+                self.keyboard_owner_for_pass(ctx),
+                crate::keyboard_input::KeyboardOwner::ApplicationShortcut { .. }
+                    | crate::keyboard_input::KeyboardOwner::FocusedUi { .. }
+            );
+        if escape {
+            ctx.input_mut(|input| {
+                input.consume_key(input.modifiers, egui::Key::Escape);
+            });
+            self.show_caption_progress = false;
+            return;
+        }
         let Some(job) = self.caption_job.as_mut() else {
+            self.show_caption_progress = false;
             return;
         };
         if draw_caption_progress(
@@ -452,6 +507,7 @@ impl App {
             &job.progress,
             job.current.as_ref().map(CaptionTarget::path),
             job.state,
+            &mut self.show_caption_progress,
         ) {
             job.stop();
         }
@@ -463,10 +519,12 @@ fn draw_caption_progress(
     progress: &CaptionProgress,
     current: Option<&Path>,
     state: JobState,
+    open: &mut bool,
 ) -> bool {
     let mut stop = false;
     egui::Window::new("AI 説明文を作成")
         .id(egui::Id::unique("caption_job_progress"))
+        .open(open)
         .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
         .default_width(360.0)
         .max_width((ctx.content_rect().width() - 32.0).max(180.0))
@@ -485,8 +543,12 @@ fn draw_caption_progress(
                 .truncate(),
             );
             ui.label(format!(
-                "作成済み {} / 対象外 {} (動画の表紙 {})",
-                progress.already_created, progress.unsupported, progress.video_cover
+                "作成 {} / 既にあり {}",
+                progress.created, progress.already_created
+            ));
+            ui.label(format!(
+                "対象外 {} (動画の表紙 {})",
+                progress.unsupported, progress.video_cover
             ));
             ui.label(format!(
                 "ファイルなし {} / 未変換 {} / パスワードが必要 {}",
@@ -559,6 +621,136 @@ mod tests {
             .0;
         assert!(text.contains("追加 0"), "{text}");
         assert!(text.contains("対象外 1"), "{text}");
+    }
+
+    fn tools_menu_fixture(append: bool, selected: bool) -> crate::app::AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
+        app.current_folder = Some("C:/caption-tools".into());
+        app.items = vec![
+            GridItem::Image("C:/caption-tools/a.png".into()),
+            GridItem::Image("C:/caption-tools/b.png".into()),
+            GridItem::Image("C:/caption-tools/sub/child.png".into()),
+            GridItem::Video("C:/caption-tools/movie.mp4".into()),
+        ];
+        if selected {
+            app.selected = Some(0);
+            app.checked = [0, 3].into_iter().collect();
+        }
+        app.main_hwnd = None;
+        app.vlm_setup =
+            super::super::vlm_addon::VlmSetup::for_caption_menu_test(app.tmp.path().join("vlm"));
+        if append {
+            let (job, _commands, _events) = job();
+            app.caption_job = Some(job);
+        }
+        app
+    }
+
+    fn tools_menubar_harness(
+        app: crate::app::AppTestEnvForTest,
+    ) -> egui_kittest::Harness<'static, crate::app::AppTestEnvForTest> {
+        crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1600.0, 700.0))
+            .build_ui_state(
+                |ui, app: &mut crate::app::AppTestEnvForTest| {
+                    app.note_main_chrome_pointer_block_transition(ui.ctx());
+                    app.render_menubar(ui);
+                },
+                app,
+            )
+    }
+
+    #[test]
+    fn caption_job_tools_menu_creates_and_appends_the_same_selection_targets() {
+        for append in [false, true] {
+            for selected in [false, true] {
+                let app = tools_menu_fixture(append, selected);
+                let expected = app.caption_targets(false);
+                assert_eq!(app.caption_creation_disabled_reason(false), None);
+                assert_eq!(expected.paths.len(), if selected { 1 } else { 2 });
+                assert_eq!(expected.unsupported, usize::from(selected));
+                let label = app
+                    .keymap
+                    .menu_command_label(crate::keymap::MenuCommandId::ToolsCreateAiCaptions);
+                let mut harness = tools_menubar_harness(app);
+                harness.run_steps(4);
+                harness
+                    .get_by_label(crate::keymap::TopMenuId::Tools.label())
+                    .click();
+                harness.run_steps(2);
+                harness.get_by_label(&label).click();
+                harness.run_steps(2);
+                let app = harness.state();
+                if append {
+                    let job = app.caption_job.as_ref().unwrap();
+                    assert_eq!(
+                        job.queue.iter().cloned().collect::<Vec<_>>(),
+                        expected.paths
+                    );
+                    assert_eq!(job.progress.unsupported, expected.unsupported);
+                    assert!(app.show_caption_progress);
+                    assert!(app.vlm_setup.captured_caption_targets_for_test().is_none());
+                } else {
+                    assert_eq!(
+                        app.vlm_setup.captured_caption_targets_for_test(),
+                        Some(&expected)
+                    );
+                    assert!(app.caption_job.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn caption_job_tools_menu_progress_click_reopens_the_existing_job() {
+        let app = tools_menu_fixture(true, true);
+        assert!(!app.show_caption_progress);
+        let cancel = app.caption_job.as_ref().unwrap().cancel.clone();
+        let label = app
+            .keymap
+            .menu_command_label(crate::keymap::MenuCommandId::ToolsShowCaptionProgress);
+        let mut harness = tools_menubar_harness(app);
+        harness.run_steps(4);
+        harness
+            .get_by_label(crate::keymap::TopMenuId::Tools.label())
+            .click();
+        harness.run_steps(2);
+        harness.get_by_label(&label).click();
+        harness.run_steps(2);
+        assert!(harness.state().show_caption_progress);
+        assert_eq!(
+            harness.state().caption_job.as_ref().unwrap().state,
+            JobState::Running
+        );
+        assert!(!cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn caption_job_creation_availability_shares_selected_and_folder_target_rules() {
+        let mut app = tools_menu_fixture(false, true);
+        assert_eq!(app.caption_creation_disabled_reason(false), None);
+        app.selected = Some(3);
+        app.checked.clear();
+        assert!(app.caption_targets(false).paths.is_empty());
+        assert_eq!(
+            app.caption_creation_disabled_reason(false),
+            Some(crate::context_menu_model::CAPTION_NO_TARGET_REASON)
+        );
+        // Background and unselected requests use only the current folder's direct members.
+        assert_eq!(app.caption_creation_disabled_reason(true), None);
+        assert_eq!(app.caption_targets(true).paths.len(), 2);
+        app.selected = None;
+        assert_eq!(app.caption_creation_disabled_reason(false), None);
+        assert_eq!(app.caption_targets(false), app.caption_targets(true));
+        app.current_folder = None;
+        assert_eq!(
+            app.caption_creation_disabled_reason(false),
+            Some(crate::context_menu_model::CAPTION_NO_TARGET_REASON)
+        );
+        // An explicit valid selection remains usable without a current folder.
+        app.selected = Some(0);
+        assert_eq!(app.caption_creation_disabled_reason(false), None);
     }
 
     #[test]
@@ -1003,17 +1195,181 @@ mod tests {
     }
 
     #[test]
+    fn caption_job_hidden_progress_keeps_polling_and_addition_reopens_it() {
+        let mut app = crate::app::setup_app_for_test();
+        let (mut job, commands, events) = job();
+        job.append(vec!["a.png".into(), "b.png".into()].into());
+        job.advance().unwrap();
+        assert_item(&commands, "a.png");
+        let cancel = job.cancel.clone();
+        app.caption_job = Some(job);
+        app.show_caption_progress = false;
+        app.show_caption_job_progress(&egui::Context::default());
+        events
+            .send(CaptionWorkerEvent::ItemDone(CaptionItemOutcome::Created))
+            .unwrap();
+        app.poll_caption_job();
+        assert_item(&commands, "b.png");
+        assert!(!app.show_caption_progress);
+        assert!(!cancel.load(Ordering::Acquire));
+        app.append_caption_job_targets(vec!["c.png".into()].into());
+        assert!(app.show_caption_progress);
+        app.show_caption_progress = false;
+        events
+            .send(CaptionWorkerEvent::ItemDone(
+                CaptionItemOutcome::AlreadyCreated,
+            ))
+            .unwrap();
+        app.poll_caption_job();
+        assert_item(&commands, "c.png");
+        events
+            .send(CaptionWorkerEvent::ItemDone(CaptionItemOutcome::Created))
+            .unwrap();
+        app.poll_caption_job();
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(CaptionWorkerCommand::Finish)
+        ));
+        // Finishing jobs remain inspectable, while additions cannot reopen them.
+        app.show_caption_progress = true;
+        app.append_caption_job_targets(vec!["late.png".into()].into());
+        assert_eq!(app.caption_job.as_ref().unwrap().progress.total, 3);
+        events.send(CaptionWorkerEvent::Finished(Ok(()))).unwrap();
+        app.poll_caption_job();
+        assert!(app.caption_job.is_none());
+        assert!(!app.show_caption_progress);
+        let summary = &app.fs_feedback_toast.as_ref().unwrap().0;
+        assert!(summary.contains("作成 2、既にあり 1"), "{summary}");
+    }
+
+    #[test]
+    fn caption_job_progress_close_and_escape_leave_job_running() {
+        for close in ["Close window", "Escape"] {
+            let mut app = crate::app::setup_app_for_test();
+            let (mut job, _commands, _events) = job();
+            job.append(vec!["a.png".into()].into());
+            job.advance().unwrap();
+            let cancel = job.cancel.clone();
+            app.caption_job = Some(job);
+            app.show_caption_progress = true;
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(900.0, 600.0))
+                .build_ui_state(
+                    |ui, app: &mut crate::app::AppTestEnvForTest| {
+                        app.show_caption_job_progress(ui.ctx());
+                    },
+                    app,
+                );
+            harness.run_steps(4);
+            if close == "Escape" {
+                harness.key_press(egui::Key::Escape);
+            } else {
+                harness.get_by_label(close).click();
+            }
+            harness.run_steps(2);
+            assert!(!harness.state().show_caption_progress, "{close}");
+            let job = harness.state().caption_job.as_ref().unwrap();
+            assert_eq!(job.state, JobState::Running, "{close}");
+            assert!(job.current.is_some(), "{close}");
+            assert!(!cancel.load(Ordering::Acquire), "{close}");
+        }
+    }
+
+    #[test]
+    fn caption_job_progress_escape_preserves_text_ime_and_modal_owners() {
+        for owner in ["text", "ime", "modal", "covered"] {
+            let mut app = crate::app::setup_app_for_test();
+            let (mut job, _commands, _events) = job();
+            job.append(vec!["a.png".into()].into());
+            job.advance().unwrap();
+            app.caption_job = Some(job);
+            app.show_caption_progress = true;
+            if owner == "text" {
+                app.search_has_focus = true;
+            } else if owner == "modal" {
+                app.show_open_folder_dialog = true;
+            }
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(|ctx| {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    crate::ime_focus::install_ime_input_policy(ctx);
+                })
+                .with_size(egui::vec2(900.0, 600.0))
+                .build_ui_state(
+                    move |ui, app: &mut crate::app::AppTestEnvForTest| {
+                        app.show_caption_job_progress(ui.ctx());
+                        if owner == "covered" {
+                            egui::Window::new("Another tool").show(ui.ctx(), |ui| {
+                                ui.label("Another window owns Escape");
+                            });
+                        }
+                    },
+                    app,
+                );
+            harness.run_steps(4);
+            if owner == "ime" {
+                harness.event(egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "変換中".into(),
+                    active_range_chars: None,
+                }));
+                harness.run_steps(1);
+            }
+            harness.key_press(egui::Key::Escape);
+            harness.run_steps(2);
+            assert!(harness.state().show_caption_progress, "{owner}");
+            let job = harness.state().caption_job.as_ref().unwrap();
+            assert_eq!(job.state, JobState::Running, "{owner}");
+            assert!(!job.cancel.load(Ordering::Acquire), "{owner}");
+        }
+    }
+
+    #[test]
+    fn caption_job_progress_escape_after_covering_window_closes() {
+        let mut app = crate::app::setup_app_for_test();
+        let (job, _commands, _events) = job();
+        app.caption_job = Some(job);
+        app.show_caption_progress = true;
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(900.0, 600.0))
+            .build_ui_state(
+                |ui, (app, covering): &mut (crate::app::AppTestEnvForTest, bool)| {
+                    app.show_caption_job_progress(ui.ctx());
+                    if *covering {
+                        egui::Window::new("Covering tool").show(ui.ctx(), |ui| {
+                            ui.label("Another window owns Escape");
+                        });
+                    }
+                },
+                (app, true),
+            );
+        harness.run_steps(4);
+        harness.key_press(egui::Key::Escape);
+        harness.run_steps(2);
+        assert!(harness.state().0.show_caption_progress);
+        harness.state_mut().1 = false;
+        harness.run_steps(2);
+        harness.key_press(egui::Key::Escape);
+        harness.run_steps(2);
+        assert!(!harness.state().0.show_caption_progress);
+        assert!(harness.state().0.caption_job.is_some());
+    }
+
+    #[test]
     fn caption_job_progress_small_window_cancel_visible_and_clickable() {
         for size in [egui::vec2(1093.0, 614.0), egui::vec2(546.5, 307.0)] {
             let mut harness = crate::test_ui::builder()
                 .with_context_setup(crate::ui_fonts::configure_fonts)
                 .with_size(size)
                 .build_ui_state(|ui, stopped: &mut bool| {
-                    *stopped |= draw_caption_progress(ui.ctx(), &CaptionProgress { total: 100, done: 10, unsupported: 2, failed: 3, ..Default::default() }, Some(Path::new("とても長い画像の名前ですとても長い画像の名前ですとても長い画像の名前です.png")), JobState::Running);
+                    *stopped |= draw_caption_progress(ui.ctx(), &CaptionProgress { total: 100, done: 10, unsupported: 2, failed: 3, ..Default::default() }, Some(Path::new("とても長い画像の名前ですとても長い画像の名前ですとても長い画像の名前です.png")), JobState::Running, &mut true);
                 }, false);
             harness.run_steps(4);
             let cancel = harness.get_by_role_and_label(egui::accesskit::Role::Button, "中止");
             assert!(egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(cancel.rect()));
+            let close = harness.get_by_label("Close window");
+            assert!(egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(close.rect()));
             cancel.click();
             harness.run_steps(2);
             assert!(*harness.state());
@@ -1033,6 +1389,7 @@ mod tests {
                     &CaptionProgress {
                         total: 27,
                         done: 12,
+                        created: 5,
                         already_created: 3,
                         unsupported: 2,
                         missing: 1,
@@ -1041,6 +1398,7 @@ mod tests {
                     },
                     Some(Path::new("sample.png")),
                     JobState::Running,
+                    &mut true,
                 );
             });
         harness.run_steps(4);

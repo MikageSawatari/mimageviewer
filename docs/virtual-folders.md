@@ -486,7 +486,7 @@ comic-book 別名 (`.cbz`/`.cbr`/`.cb7`) は実体フォーマットと同一扱
 
 - 深さ上限 `MAX_NESTED_ARCHIVE_DEPTH` (=8)。閲覧用 cache 変換は、超過・壊れた・
   パスワード付き入れ子をログ + skip して従来の寛容な表示用変換を維持する。
-- 「変換 > ZIP ファイルに変換」の sibling / batch 経路は
+- 「ツール > ZIP ファイルに変換」の sibling / batch 経路は
   `ConvertOptions { no_clobber: true, verify: true }` を使う。`verify` は
   `ConvertCtx.strict` も兼ね、入れ子展開失敗、アーカイブエントリ読取失敗、
   LZH の未対応圧縮方式 / CRC 不一致、深さ超過を伝播する。変換完了後は一時 ZIP を

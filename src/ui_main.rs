@@ -8507,16 +8507,6 @@ impl App {
         let collection_manage_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::CollectionsManage);
-        let convert_to_zip_menu_label = self.keymap.menu_command_label(MenuCommandId::ConvertToZip);
-        let video_register_upscale_menu_label = self
-            .keymap
-            .menu_command_label(MenuCommandId::VideoRegisterUpscale);
-        let video_delete_upscale_menu_label = self
-            .keymap
-            .menu_command_label(MenuCommandId::VideoDeleteUpscale);
-        let video_show_upscale_tasks_menu_label = self
-            .keymap
-            .menu_command_label(MenuCommandId::VideoShowUpscaleTasks);
         let tag_manage_pinned_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::TagsManagePinned);
@@ -9193,81 +9183,39 @@ impl App {
                             });
                             top_menu_responses.push(response.response);
                         }
-                        TopMenuId::Convert => {
-                            let commands = &resolved_top_menu.commands;
-                            let response = ui.menu_button(TopMenuId::Convert.label(), |ui| {
-                                for &command in commands {
-                                    if command != MenuCommandId::ConvertToZip {
-                                        continue;
-                                    }
-                                    let enabled = self.grid_item_input_allowed() && convert_target_count > 0
+                        TopMenuId::Tools => {
+                            let response = ui.menu_button(TopMenuId::Tools.label(), |ui| {
+                                // Resolve targets only while the menu body is open, not on idle frames.
+                                let state = crate::ui_tools_menu::ToolsMenuState {
+                                    convert_enabled: self.grid_item_input_allowed() && convert_target_count > 0
                                         && self.archive_convert.is_none()
                                         && self.batch_convert.is_none()
-                                        && self.epub_batch_convert.is_none();
-                                    let response = ui
-                                        .add_enabled(
-                                            enabled,
-                                            egui::Button::new(&convert_to_zip_menu_label),
-                                        )
-                                        .hover_tip_disabled(
-                                            "RAR/CBR/7z/CB7/LZH/LHA ファイルを選択してください\
-                                             (スペースキーで複数選択可)",
-                                        );
-                                    if response.clicked() {
-                                        self.start_batch_convert_to_zip();
-                                        ui.close();
-                                    }
-                                }
+                                        && self.epub_batch_convert.is_none(),
+                                    caption_disabled_reason: self.caption_creation_disabled_reason(false),
+                                    caption_progress_available: self.caption_job.is_some(),
+                                    video_selected: self.grid_item_input_allowed() && selected_video_path.is_some(),
+                                };
+                                crate::ui_tools_menu::draw(ui, &resolved_top_menu.commands, &self.keymap, state)
                             });
-                            top_menu_responses.push(response.response);
-                        }
-                        TopMenuId::Video => {
-                            let video_menu_commands = &resolved_top_menu.commands;
-                            let response = ui.menu_button(TopMenuId::Video.label(), |ui| {
-                                let can_apply_to_selected =
-                                    self.grid_item_input_allowed() && selected_video_path.is_some();
-                                for &command in video_menu_commands {
-                                    match command {
-                                        MenuCommandId::VideoRegisterUpscale => {
-                                            if ui
-                                                .add_enabled(
-                                                    can_apply_to_selected,
-                                                    egui::Button::new(&video_register_upscale_menu_label),
-                                                )
-                                                .clicked()
-                                            {
-                                                if let Some(path) = selected_video_path.clone() {
-                                                    self.request_video_upscale(path);
-                                                }
-                                                ui.close();
-                                            }
+                            if let Some(Some(command)) = response.inner {
+                                match command {
+                                    MenuCommandId::ConvertToZip => self.start_batch_convert_to_zip(),
+                                    MenuCommandId::ToolsCreateAiCaptions => self.request_create_ai_captions(ctx, false),
+                                    MenuCommandId::ToolsShowCaptionProgress => self.show_caption_progress = true,
+                                    MenuCommandId::VideoRegisterUpscale => {
+                                        if let Some(path) = selected_video_path.clone() {
+                                            self.request_video_upscale(path);
                                         }
-                                        MenuCommandId::VideoDeleteUpscale => {
-                                            if ui
-                                                .add_enabled(
-                                                    can_apply_to_selected,
-                                                    egui::Button::new(&video_delete_upscale_menu_label),
-                                                )
-                                                .clicked()
-                                            {
-                                                if let Some(path) = selected_video_path.clone() {
-                                                    self.request_video_upscale_artifact_delete(path);
-                                                }
-                                                ui.close();
-                                            }
-                                        }
-                                        MenuCommandId::VideoShowUpscaleTasks => {
-                                            ui.separator();
-                                            if ui.button(&video_show_upscale_tasks_menu_label).clicked()
-                                            {
-                                                self.show_video_upscale_tasks = true;
-                                                ui.close();
-                                            }
-                                        }
-                                        _ => {}
                                     }
+                                    MenuCommandId::VideoDeleteUpscale => {
+                                        if let Some(path) = selected_video_path.clone() {
+                                            self.request_video_upscale_artifact_delete(path);
+                                        }
+                                    }
+                                    MenuCommandId::VideoShowUpscaleTasks => self.show_video_upscale_tasks = true,
+                                    _ => {}
                                 }
-                            });
+                            }
                             top_menu_responses.push(response.response);
                         }
                         TopMenuId::Tags => {

@@ -1625,6 +1625,32 @@ mod tests {
     }
 
     #[test]
+    fn tools_menu_v411_generation_import_uses_shared_migration_without_changing_source() {
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        let backup = dir.join("settings.db.bak1");
+        {
+            let db = SettingsDb::create_new(dir).unwrap();
+            db.save_full(&Settings::default()).unwrap();
+        }
+        {
+            let conn = rusqlite::Connection::open(dir.join("settings.db")).unwrap();
+            conn.execute(
+                "UPDATE settings_kv SET value = ?1 WHERE key = 'menu_layout'",
+                [crate::keymap::V411_MENU_LAYOUT_FIXTURE],
+            )
+            .unwrap();
+        }
+        std::fs::copy(dir.join("settings.db"), &backup).unwrap();
+        let before = std::fs::read(&backup).unwrap();
+        let bundle = load_operation_customize(dir, &BackupSource::Bak(1)).unwrap();
+        let expected: crate::keymap::MenuLayoutSettings =
+            serde_json::from_str(crate::keymap::V411_MENU_LAYOUT_FIXTURE).unwrap();
+        assert_eq!(bundle.menu_layout, expected);
+        assert_eq!(std::fs::read(&backup).unwrap(), before);
+    }
+
+    #[test]
     fn load_operation_customize_extracts_three_fields_from_generation() {
         let guard = DataDirOverrideGuard::new();
         let dir = guard.path();

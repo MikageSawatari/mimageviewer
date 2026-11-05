@@ -14894,6 +14894,29 @@ mod tests {
     }
 
     #[test]
+    fn tools_menu_v411_legacy_json_file_uses_shared_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let fixture = format!(
+            "{{\"menu_layout\":{}}}",
+            crate::keymap::V411_MENU_LAYOUT_FIXTURE
+        );
+        std::fs::write(&path, fixture).unwrap();
+        let LoadFileResult::Ok(loaded) = try_parse_settings_file(&path) else {
+            panic!("released legacy settings JSON must remain readable");
+        };
+        let expected: crate::keymap::MenuLayoutSettings =
+            serde_json::from_str(crate::keymap::V411_MENU_LAYOUT_FIXTURE).unwrap();
+        assert_eq!(loaded.menu_layout, expected);
+        assert_eq!(
+            serde_json::from_str::<Settings>(&serde_json::to_string(&loaded).unwrap())
+                .unwrap()
+                .menu_layout,
+            expected
+        );
+    }
+
+    #[test]
     fn menu_layout_defaults_to_catalog_order_when_missing() {
         let loaded: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(

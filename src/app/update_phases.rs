@@ -2172,6 +2172,72 @@ impl App {
     }
 }
 
+#[cfg(all(test, windows))]
+mod caption_progress_popup_tests {
+    use super::*;
+    use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn caption_progress_escape_yields_to_toolbar_popup_in_both_draw_orders() {
+        for progress_first in [true, false] {
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.show_toolbar_cols = true;
+            app.settings.toolbar_cols_display = crate::settings::ToolbarSectionDisplay::Dropdown;
+            app.settings.toolbar_cols_items = vec![2, 4, 6];
+            app.settings.grid_cols = 4;
+            let cancel = Arc::new(AtomicBool::new(false));
+            app.caption_job =
+                Some(crate::ui_dialogs::caption_job::CaptionJob::for_progress_test(cancel.clone()));
+            app.show_caption_progress = true;
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(1600.0, 700.0))
+                .build_ui_state(
+                    move |ui, app: &mut crate::app::AppTestEnvForTest| {
+                        // Production draws conversion dialogs before the toolbar.
+                        // Also cover an earlier-drawn popup closing on the same key.
+                        if progress_first {
+                            app.render_main_conversion_dialogs(ui.ctx());
+                            app.render_toolbar(ui);
+                        } else {
+                            app.render_toolbar(ui);
+                            app.render_main_conversion_dialogs(ui.ctx());
+                        }
+                    },
+                    app,
+                );
+            harness.run_steps(4);
+            harness
+                .get_all_by_role(egui::accesskit::Role::ComboBox)
+                .into_iter()
+                .find(|node| node.value().as_deref() == Some("4 列"))
+                .expect("production columns ComboBox")
+                .click();
+            harness.run_steps(2);
+            assert!(egui::Popup::is_any_open(&harness.ctx));
+            assert!(harness.get_by_label("2 列").rect().is_positive());
+            harness.key_press(egui::Key::Escape);
+            harness.run_steps(2);
+            assert!(!egui::Popup::is_any_open(&harness.ctx));
+            assert!(
+                harness.state().show_caption_progress,
+                "progress_first={progress_first}"
+            );
+            assert!(harness.state().vlm_caption_job_running());
+            assert!(!cancel.load(Ordering::Acquire));
+            // Once the popup is gone, the next Escape still closes only the tool.
+            harness.key_press(egui::Key::Escape);
+            harness.run_steps(2);
+            assert!(
+                !harness.state().show_caption_progress,
+                "progress_first={progress_first}"
+            );
+            assert!(harness.state().vlm_caption_job_running());
+            assert!(!cancel.load(Ordering::Acquire));
+        }
+    }
+}
+
 #[cfg(test)]
 mod everything_entry_tests {
     use super::*;

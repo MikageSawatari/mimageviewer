@@ -1,6 +1,6 @@
 //! Local AI captions. All filesystem/SQLite operations here belong on workers.
 //!
-//! This unreleased store starts at schema 1; no migration is needed. Rollback
+//! This unreleased store starts at schema 1. Rollback
 //! journaling is retained so metadata transfer can commit its attached DBs atomically.
 
 use std::fs::Metadata;
@@ -11,7 +11,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
+mod normalize;
+
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const REPETITION_CLEANUP: &str = "scalar_repetition_cleanup_v1";
 
 struct CommitWait {
     cancel: Arc<AtomicBool>,
@@ -466,6 +469,94 @@ impl CaptionDb {
         )
     }
 
+    /// User-requested cleanup of this unreleased store, once on the startup worker.
+    /// Content changes use the existing revision/index-pending triggers. The
+    /// completion marker commits with the rows; any failure leaves it retryable
+    /// on the next startup, without another recovery state or in-process retry.
+    pub(crate) fn normalize_saved_captions_once(&self) -> rusqlite::Result<usize> {
+        let version: i64 = self
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version != 1 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS caption_meta (
+                key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL
+            )",
+        )?;
+        let completed: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM caption_meta WHERE key = ?1 AND value = '1')",
+            [REPETITION_CLEANUP],
+            |row| row.get(0),
+        )?;
+        if completed {
+            return Ok(0);
+        }
+        let mut changed = 0;
+        let mut after: Option<String> = None;
+        loop {
+            // Bound temporary memory without retaining a SELECT while writing.
+            // The writer transaction fixes the row set throughout this pass.
+            let rows = {
+                let lower_bound = if after.is_some() {
+                    "AND item_key > ?1 COLLATE BINARY"
+                } else {
+                    ""
+                };
+                let mut statement = tx.prepare(&format!(
+                    "SELECT item_key, caption, visible_text, keywords FROM captions
+                     WHERE status = 'ok' {lower_bound}
+                     ORDER BY item_key COLLATE BINARY LIMIT 256",
+                ))?;
+                statement
+                    .query_map(rusqlite::params_from_iter(after.iter()), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if rows.is_empty() {
+                break;
+            }
+            after = rows.last().map(|row| row.0.clone());
+            for (key, caption, text, raw_keywords) in rows {
+                let keywords: Vec<String> =
+                    serde_json::from_str(&raw_keywords).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                let normalized = normalize::fields(&caption, &text, &keywords);
+                if normalized != (caption, text, keywords) {
+                    changed += tx.execute(
+                        "UPDATE captions SET caption = ?2, visible_text = ?3, keywords = ?4
+                         WHERE item_key = ?1",
+                        params![
+                            key,
+                            normalized.0,
+                            normalized.1,
+                            serde_json::to_string(&normalized.2).expect("strings serialize")
+                        ],
+                    )?;
+                }
+            }
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO caption_meta(key, value) VALUES (?1, '1')",
+            [REPETITION_CLEANUP],
+        )?;
+        tx.commit()?;
+        Ok(changed)
+    }
+
     /// Worker-only: reserve the writer before rechecking the input, so a rename
     /// cannot migrate DB keys between this check and commit. Exactly one
     /// filesystem metadata call is made inside the transaction. DB failures are
@@ -520,13 +611,16 @@ impl CaptionDb {
                 caption,
                 text,
                 keywords,
-            } => (
-                "ok",
-                caption.as_str(),
-                text.as_str(),
-                serde_json::to_string(keywords).expect("strings serialize"),
-            ),
-            CaptionResult::Failed => ("failed", "", "", "[]".to_string()),
+            } => {
+                let (caption, text, keywords) = normalize::fields(caption, text, keywords);
+                (
+                    "ok",
+                    caption,
+                    text,
+                    serde_json::to_string(&keywords).expect("strings serialize"),
+                )
+            }
+            CaptionResult::Failed => ("failed", String::new(), String::new(), "[]".to_string()),
         };
         if cancelled() {
             tx.rollback()?;
@@ -977,6 +1071,164 @@ mod tests {
             .to_uppercase()
             .replace('\\', "/");
         assert_eq!(db.get(&variant).unwrap(), Some(row));
+    }
+
+    #[test]
+    fn caption_save_normalizes_both_image_and_book_requests_at_the_db_boundary() {
+        let (temp, db, mut req) = fixture();
+        req.result = CaptionResult::Ok {
+            caption: format!("  {} \n", "青い空".repeat(10)),
+            text: "看板\n".repeat(10),
+            keywords: vec![
+                format!(" {} ", "海辺".repeat(15)),
+                "海辺".into(),
+                "海".into(),
+                "海海海".into(),
+                "海".into(),
+            ],
+        };
+        for book in [false, true] {
+            if book {
+                req.item_path = temp.path().join("book");
+                req.cover_ref = "cover.jpg".into();
+                assert_eq!(
+                    db.save_unless_cancelled(&req, &Arc::new(AtomicBool::new(false)))
+                        .unwrap(),
+                    Some(SaveOutcome::Written)
+                );
+            } else {
+                assert_eq!(db.save(&req).unwrap(), SaveOutcome::Written);
+            }
+            let row = read(&db, &req).unwrap();
+            assert_eq!(row.caption, "  青い空");
+            assert_eq!(row.visible_text, "看板");
+            assert_eq!(row.keywords, ["海辺", "海", "海海海"]);
+            assert_eq!(row.signature, req.signature);
+            assert_eq!(row.cover_ref, req.cover_ref);
+            assert_eq!(row.model_id, req.model_id);
+            assert_eq!(row.prompt_version, req.prompt_version);
+        }
+    }
+
+    #[test]
+    fn caption_saved_cleanup_updates_only_changed_rows_and_commits_once_marker() {
+        let (temp, db, req) = fixture();
+        db.save(&req).unwrap();
+        // Include more than one batch, including unchanged rows and raw JSON
+        // whose whitespace must not cause an otherwise unchanged row update.
+        for index in 0..258 {
+            seed_caption_key(&db, &format!("c:/existing/{index:03}.jpg"));
+        }
+        db.conn
+            .execute(
+                "UPDATE captions SET caption=?1,
+             visible_text=?2, keywords=?3
+             WHERE item_key IN ('c:/existing/000.jpg','c:/existing/257.jpg')",
+                params![
+                    format!("{}  ", "青い空".repeat(10)),
+                    "表紙\n".repeat(10),
+                    serde_json::to_string(&[
+                        " 空空空 ".to_owned(),
+                        "海辺".repeat(15),
+                        "海辺".into()
+                    ])
+                    .unwrap()
+                ],
+            )
+            .unwrap();
+        db.conn.execute(
+            "UPDATE captions SET keywords='[ \"空\", \"青\" ]' WHERE item_key='c:/existing/001.jpg'", [],
+        ).unwrap();
+        db.conn
+            .execute(
+                "UPDATE captions SET caption='はいはいはい' WHERE item_key='c:/existing/002.jpg'",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute("UPDATE captions SET indexed=1", [])
+            .unwrap();
+        let before = db.get("c:/existing/000.jpg").unwrap().unwrap();
+        let unchanged = db.get("c:/existing/001.jpg").unwrap().unwrap();
+        let short_run = db.get("c:/existing/002.jpg").unwrap().unwrap();
+        assert_eq!(db.normalize_saved_captions_once().unwrap(), 2);
+        let mut expected = before.clone();
+        expected.caption = "青い空".into();
+        expected.visible_text = "表紙".into();
+        expected.keywords = vec!["空空空".into(), "海辺".into()];
+        let cleaned = db.get(&before.item_key).unwrap().unwrap();
+        assert!(cleaned.rev > before.rev && !cleaned.indexed);
+        expected.rev = cleaned.rev;
+        expected.indexed = false;
+        assert_eq!(
+            cleaned, expected,
+            "all source/model/time metadata remains intact"
+        );
+        assert_eq!(db.get(&unchanged.item_key).unwrap().unwrap(), unchanged);
+        assert_eq!(db.get(&short_run.item_key).unwrap().unwrap(), short_run);
+        db.mark_reflected(&[(before.item_key.clone(), before.rev, false)])
+            .unwrap();
+        assert!(!db.get(&before.item_key).unwrap().unwrap().indexed);
+        let reopened =
+            CaptionDb::open_existing_for_write(temp.path().join("ai_caption.db")).unwrap();
+        assert_eq!(reopened.normalize_saved_captions_once().unwrap(), 0);
+        assert_eq!(db.get(&before.item_key).unwrap().unwrap(), cleaned);
+        // The marker skips future startup scans; this is a one-time cleanup,
+        // not a perpetual rewrite of later imports or metadata copies.
+        db.conn
+            .execute(
+                "UPDATE captions SET caption=?2 WHERE item_key=?1",
+                params![&before.item_key, "後続".repeat(15)],
+            )
+            .unwrap();
+        assert_eq!(reopened.normalize_saved_captions_once().unwrap(), 0);
+        assert_eq!(
+            db.get(&before.item_key).unwrap().unwrap().caption,
+            "後続".repeat(15)
+        );
+    }
+
+    #[test]
+    fn caption_saved_cleanup_failure_rolls_back_rows_and_leaves_next_startup_retryable() {
+        let (_temp, db, req) = fixture();
+        db.save(&req).unwrap();
+        for key in ["c:/existing/a.jpg", "c:/existing/b.jpg"] {
+            seed_caption_key(&db, key);
+        }
+        db.conn
+            .execute(
+                "UPDATE captions SET caption=?1 WHERE item_key LIKE 'c:/existing/%'",
+                ["反復".repeat(15)],
+            )
+            .unwrap();
+        let before = db.get("c:/existing/a.jpg").unwrap().unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER reject_cleanup BEFORE UPDATE OF caption ON captions
+            WHEN OLD.item_key = 'c:/existing/b.jpg' BEGIN
+                SELECT RAISE(ABORT, 'synthetic cleanup failure');
+            END;",
+            )
+            .unwrap();
+        assert!(db.normalize_saved_captions_once().is_err());
+        assert_eq!(db.get(&before.item_key).unwrap().unwrap(), before);
+        let marker_tables: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='caption_meta'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            marker_tables, 0,
+            "marker creation was rolled back with the rows"
+        );
+        db.conn
+            .execute_batch("DROP TRIGGER reject_cleanup")
+            .unwrap();
+        assert_eq!(db.normalize_saved_captions_once().unwrap(), 2);
+        assert_eq!(db.get(&before.item_key).unwrap().unwrap().caption, "反復");
     }
 
     #[test]

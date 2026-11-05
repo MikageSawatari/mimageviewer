@@ -1221,6 +1221,10 @@ const TABLE: &[VersionHighlights] = &[
         // 音響調整のプリセット共有の終了と、アイテム検索の索引の作り直しは、リリース済みの動きの変更なので必読に置く。
         must_read: &[
             HighlightItem {
+                title: "「変換」「動画」メニューを「ツール」にまとめました",
+                body: "ZIP への変換と動画のアップスケールは「ツール」へ移動しました。AI 説明文の作成と作成状況もここから開けます。",
+            },
+            HighlightItem {
                 title: "音響調整は mImageViewer 用の「mIV Sound」になりました",
                 body: "設定やプリセットは mImageViewer のデータフォルダに保存し、これまでのデータは最初の起動で一度だけ引き継ぎます。\
                        DAW で使う EffeTune Mixwright やデスクトップ版の EffeTune とはプリセットを共有しなくなりました。\

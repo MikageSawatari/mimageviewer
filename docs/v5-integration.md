@@ -716,5 +716,5 @@ git add / commit / merge等のgit書き込みも行わない。
 - 独立レビュー (xhigh): ACCEPT。
 - 比較 (設計担当が開発機で worker を直接実行、製品は起動していない。結果は `G:\home\vlm-eval\runs\20261105-repeat\`): 評価用セット 26 枚は出力が全て同一、中央値 1.61→1.72 秒。利用者の DB でループしていた 11 枚は、768 で大きな反復 (240〜396 文字) 6 枚→0 枚 (6〜9 文字の重なりが 3 枚残る)、1024 で反復 6 枚 (うち 1 枚は 33 文字、他は 335〜381 文字)→0 枚。JSON はすべて妥当。
 - worker 本体: `vendor/vlm-worker/mimageviewer-vlm.exe` を新しいソースの identity `9159b4a1…` に更新し、`scripts/vlm-worker-identity.ps1 -ValidateRepo` で照合した。`C:\home\mimageviewer_vendor_backup\vlm-worker\` も更新し、旧版 (`79c6482a…`) は `C:\home\mimageviewer_vendor_backup\vlm-worker-79c6482a-before-dry.exe` に残した。
-- 保存前に反復を切る処理 (§1.716) は、取りこぼしへの保険として別に入れる。
+- 保存前に合計30 scalar以上の連続反復を切る処理 (§1.716) は、取りこぼしへの保険として別に入れる。
 - 実機確認: 未確認 (rc3 で利用者・サブ PC が確認する)。

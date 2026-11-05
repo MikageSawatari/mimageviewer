@@ -2680,9 +2680,8 @@ pub enum TopMenuId {
     SmartFolders,
     Books,
     Collections,
-    Convert,
-    Video,
     Tags,
+    Tools,
     Settings,
     Help,
 }
@@ -2694,9 +2693,8 @@ impl TopMenuId {
         Self::SmartFolders,
         Self::Books,
         Self::Collections,
-        Self::Convert,
-        Self::Video,
         Self::Tags,
+        Self::Tools,
         Self::Settings,
         Self::Help,
     ];
@@ -2708,8 +2706,7 @@ impl TopMenuId {
             TopMenuId::SmartFolders => "スマートフォルダ",
             TopMenuId::Books => "製本",
             TopMenuId::Collections => "コレクション",
-            TopMenuId::Convert => "変換",
-            TopMenuId::Video => "動画",
+            TopMenuId::Tools => "ツール",
             TopMenuId::Tags => "タグ",
             TopMenuId::Settings => "設定",
             TopMenuId::Help => "ヘルプ",
@@ -2723,8 +2720,7 @@ impl TopMenuId {
             TopMenuId::SmartFolders => "SmartFolders",
             TopMenuId::Books => "Books",
             TopMenuId::Collections => "Collections",
-            TopMenuId::Convert => "Convert",
-            TopMenuId::Video => "Video",
+            TopMenuId::Tools => "Tools",
             TopMenuId::Tags => "Tags",
             TopMenuId::Settings => "Settings",
             TopMenuId::Help => "Help",
@@ -2738,8 +2734,7 @@ impl TopMenuId {
             "SmartFolders" => Some(TopMenuId::SmartFolders),
             "Books" => Some(TopMenuId::Books),
             "Collections" => Some(TopMenuId::Collections),
-            "Convert" => Some(TopMenuId::Convert),
-            "Video" => Some(TopMenuId::Video),
+            "Tools" => Some(TopMenuId::Tools),
             "Tags" => Some(TopMenuId::Tags),
             "Settings" => Some(TopMenuId::Settings),
             "Help" => Some(TopMenuId::Help),
@@ -2782,12 +2777,14 @@ pub enum MenuCommandId {
     CollectionsRelinkCurrent,
     CollectionsReorderCurrent,
     CollectionsManage,
+    TagsManagePinned,
+    TagsTagView,
     ConvertToZip,
+    ToolsCreateAiCaptions,
+    ToolsShowCaptionProgress,
     VideoRegisterUpscale,
     VideoDeleteUpscale,
     VideoShowUpscaleTasks,
-    TagsManagePinned,
-    TagsTagView,
     SettingsThumbnailCache,
     SettingsAlwaysOnTop,
     SettingsArchiveCache,
@@ -2840,12 +2837,14 @@ impl MenuCommandId {
         Self::CollectionsRelinkCurrent,
         Self::CollectionsReorderCurrent,
         Self::CollectionsManage,
+        Self::TagsManagePinned,
+        Self::TagsTagView,
         Self::ConvertToZip,
+        Self::ToolsCreateAiCaptions,
+        Self::ToolsShowCaptionProgress,
         Self::VideoRegisterUpscale,
         Self::VideoDeleteUpscale,
         Self::VideoShowUpscaleTasks,
-        Self::TagsManagePinned,
-        Self::TagsTagView,
         Self::SettingsThumbnailCache,
         Self::SettingsAlwaysOnTop,
         Self::SettingsArchiveCache,
@@ -2899,6 +2898,8 @@ impl MenuCommandId {
             MenuCommandId::CollectionsReorderCurrent => "CollectionsReorderCurrent",
             MenuCommandId::CollectionsManage => "CollectionsManage",
             MenuCommandId::ConvertToZip => "ConvertToZip",
+            MenuCommandId::ToolsCreateAiCaptions => "ToolsCreateAiCaptions",
+            MenuCommandId::ToolsShowCaptionProgress => "ToolsShowCaptionProgress",
             MenuCommandId::VideoRegisterUpscale => "VideoRegisterUpscale",
             MenuCommandId::VideoDeleteUpscale => "VideoDeleteUpscale",
             MenuCommandId::VideoShowUpscaleTasks => "VideoShowUpscaleTasks",
@@ -3141,30 +3142,6 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         action: Some(KeyAction::GridManageCollections),
     },
     MenuCommandSpec {
-        id: MenuCommandId::ConvertToZip,
-        parent: TopMenuId::Convert,
-        label: "ZIP ファイルに変換",
-        action: None,
-    },
-    MenuCommandSpec {
-        id: MenuCommandId::VideoRegisterUpscale,
-        parent: TopMenuId::Video,
-        label: "この動画をアップスケール登録…",
-        action: None,
-    },
-    MenuCommandSpec {
-        id: MenuCommandId::VideoDeleteUpscale,
-        parent: TopMenuId::Video,
-        label: "この動画のアップスケールを削除",
-        action: None,
-    },
-    MenuCommandSpec {
-        id: MenuCommandId::VideoShowUpscaleTasks,
-        parent: TopMenuId::Video,
-        label: "アップスケールタスク表示",
-        action: None,
-    },
-    MenuCommandSpec {
         id: MenuCommandId::TagsManagePinned,
         parent: TopMenuId::Tags,
         label: "ピン留めタグの管理…",
@@ -3175,6 +3152,42 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         parent: TopMenuId::Tags,
         label: "タグビュー",
         action: Some(KeyAction::GridTagView),
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::ConvertToZip,
+        parent: TopMenuId::Tools,
+        label: "ZIP ファイルに変換",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::ToolsCreateAiCaptions,
+        parent: TopMenuId::Tools,
+        label: "AI 説明文を作る",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::ToolsShowCaptionProgress,
+        parent: TopMenuId::Tools,
+        label: "AI 説明文の作成状況",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::VideoRegisterUpscale,
+        parent: TopMenuId::Tools,
+        label: "この動画をアップスケール登録…",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::VideoDeleteUpscale,
+        parent: TopMenuId::Tools,
+        label: "この動画のアップスケールを削除",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::VideoShowUpscaleTasks,
+        parent: TopMenuId::Tools,
+        label: "アップスケールタスク表示",
+        action: None,
     },
     MenuCommandSpec {
         id: MenuCommandId::SettingsAlwaysOnTop,
@@ -3307,6 +3320,7 @@ pub fn menu_command_spec(id: MenuCommandId) -> Option<MenuCommandSpec> {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(from = "MenuLayoutSettingsWire", into = "MenuLayoutSettingsWire")]
 pub struct MenuLayoutSettings {
     /// Top menu order by `TopMenuId::stable_name()`. Missing menus are appended in default order.
     #[serde(default)]
@@ -3318,6 +3332,131 @@ pub struct MenuLayoutSettings {
     #[serde(default)]
     pub hidden_commands: Vec<String>,
 }
+
+/// The version lives on the wire so runtime layouts retain their existing public shape.
+/// All settings DB, legacy JSON and operation-share readers cross this one boundary.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MenuLayoutSettingsWire {
+    #[serde(default)]
+    format_version: u32,
+    #[serde(default)]
+    top_menu_order: Vec<String>,
+    #[serde(default)]
+    command_order: Vec<MenuCommandOrderSettings>,
+    #[serde(default)]
+    hidden_commands: Vec<String>,
+}
+
+impl From<MenuLayoutSettings> for MenuLayoutSettingsWire {
+    fn from(settings: MenuLayoutSettings) -> Self {
+        Self {
+            format_version: 1,
+            top_menu_order: settings.top_menu_order,
+            command_order: settings.command_order,
+            hidden_commands: settings.hidden_commands,
+        }
+    }
+}
+
+impl From<MenuLayoutSettingsWire> for MenuLayoutSettings {
+    fn from(wire: MenuLayoutSettingsWire) -> Self {
+        // Respect pre-versioned Tools layouts too. A new partial layout can omit Tools entirely;
+        // format_version prevents reapplying this migration after its next save/restart.
+        let has_tools = wire.top_menu_order.iter().any(|name| name == "Tools")
+            || wire
+                .command_order
+                .iter()
+                .any(|order| order.parent == "Tools");
+        let migrate_tools = wire.format_version == 0 && !has_tools;
+        let saved_settings = wire.top_menu_order.iter().any(|name| name == "Settings");
+        let saved_top_order = !wire.top_menu_order.is_empty();
+        let mut settings = Self {
+            top_menu_order: wire.top_menu_order,
+            command_order: wire.command_order,
+            hidden_commands: wire.hidden_commands,
+        };
+        let obsolete_parent = |name: &str| matches!(name, "Convert" | "Video");
+        settings
+            .top_menu_order
+            .retain(|name| !obsolete_parent(name));
+        settings
+            .command_order
+            .retain(|order| !obsolete_parent(&order.parent));
+        if migrate_tools {
+            let moved_command = |name: &str| {
+                matches!(
+                    name,
+                    "ConvertToZip"
+                        | "VideoRegisterUpscale"
+                        | "VideoDeleteUpscale"
+                        | "VideoShowUpscaleTasks"
+                )
+            };
+            settings.hidden_commands.retain(|name| !moved_command(name));
+            for order in &mut settings.command_order {
+                order.commands.retain(|name| !moved_command(name));
+            }
+            // An empty saved top order means the canonical default, not a Tools-only override.
+            if saved_top_order {
+                // Complete the old order first, preserving the pre-Collections insertion rule.
+                if !settings
+                    .top_menu_order
+                    .iter()
+                    .any(|name| name == "Collections")
+                    && let Some(books) = settings
+                        .top_menu_order
+                        .iter()
+                        .position(|name| name == "Books")
+                {
+                    settings
+                        .top_menu_order
+                        .insert(books + 1, "Collections".to_string());
+                }
+                for parent in TopMenuId::ALL
+                    .iter()
+                    .filter(|parent| **parent != TopMenuId::Tools)
+                {
+                    if !settings
+                        .top_menu_order
+                        .iter()
+                        .any(|name| name == parent.stable_name())
+                    {
+                        settings
+                            .top_menu_order
+                            .push(parent.stable_name().to_string());
+                    }
+                }
+                let position = if saved_settings {
+                    settings
+                        .top_menu_order
+                        .iter()
+                        .position(|name| name == "Settings")
+                        .unwrap()
+                } else {
+                    settings.top_menu_order.len()
+                };
+                settings
+                    .top_menu_order
+                    .insert(position, "Tools".to_string());
+            }
+        }
+        settings
+    }
+}
+
+/// Released v4.11.0 wire shape, including hidden legacy menus and reordered leaves.
+#[cfg(test)]
+pub(crate) const V411_MENU_LAYOUT_FIXTURE: &str = r#"{
+    "top_menu_order": ["Help", "Video", "Tags", "Convert", "Settings", "File", "Favorites", "SmartFolders", "Books", "Collections"],
+    "command_order": [
+        {"parent": "Video", "commands": ["VideoShowUpscaleTasks", "VideoDeleteUpscale", "VideoRegisterUpscale"]},
+        {"parent": "Convert", "commands": ["ConvertToZip"]},
+        {"parent": "Help", "commands": ["HelpAbout", "HelpOpenManual"]},
+        {"parent": "File", "commands": ["FileQuit", "FileReload"]},
+        {"parent": "Settings", "commands": ["SettingsPreferences", "SettingsOperationCustomize"]}
+    ],
+    "hidden_commands": ["ConvertToZip", "VideoRegisterUpscale", "VideoDeleteUpscale", "VideoShowUpscaleTasks", "SettingsAlwaysOnTop", "SettingsThumbnailCache", "SettingsArchiveCache", "SettingsEpubCache", "SettingsThumbnailQuality", "SettingsStats", "SettingsResetRotation", "SettingsRestoreSettings", "SettingsOperationCustomize", "SettingsPreferences", "SettingsRemoteConnection", "HelpOpenLogs", "FileReload"]
+}"#;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MenuCommandOrderSettings {
@@ -11996,6 +12135,210 @@ mod tests {
                 .collect();
             assert_eq!(menu.commands, expected);
         }
+    }
+
+    #[test]
+    fn tools_menu_catalog_has_requested_default_order_and_menu_only_ai_commands() {
+        let tags = TopMenuId::ALL
+            .iter()
+            .position(|id| *id == TopMenuId::Tags)
+            .unwrap();
+        assert_eq!(TopMenuId::ALL[tags + 1], TopMenuId::Tools);
+        assert_eq!(TopMenuId::ALL[tags + 2], TopMenuId::Settings);
+        assert_eq!(TopMenuId::parse_stable_name("Convert"), None);
+        assert_eq!(TopMenuId::parse_stable_name("Video"), None);
+        let commands = menu_commands_for_parent(TopMenuId::Tools)
+            .map(|spec| spec.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            commands,
+            vec![
+                MenuCommandId::ConvertToZip,
+                MenuCommandId::ToolsCreateAiCaptions,
+                MenuCommandId::ToolsShowCaptionProgress,
+                MenuCommandId::VideoRegisterUpscale,
+                MenuCommandId::VideoDeleteUpscale,
+                MenuCommandId::VideoShowUpscaleTasks,
+            ]
+        );
+        for id in [
+            MenuCommandId::ToolsCreateAiCaptions,
+            MenuCommandId::ToolsShowCaptionProgress,
+        ] {
+            assert_eq!(menu_command_spec(id).unwrap().action, None);
+            assert_eq!(MenuCommandId::parse_stable_name(id.stable_name()), Some(id));
+        }
+    }
+
+    #[test]
+    fn tools_menu_migrates_v411_hidden_reordered_menus_without_changing_other_preferences() {
+        let migrated: MenuLayoutSettings = serde_json::from_str(V411_MENU_LAYOUT_FIXTURE).unwrap();
+        assert_eq!(
+            migrated.top_menu_order,
+            [
+                "Help",
+                "Tags",
+                "Tools",
+                "Settings",
+                "File",
+                "Favorites",
+                "SmartFolders",
+                "Books",
+                "Collections"
+            ]
+        );
+        assert_eq!(
+            migrated
+                .command_order
+                .iter()
+                .map(|order| order.parent.as_str())
+                .collect::<Vec<_>>(),
+            ["Help", "File", "Settings"]
+        );
+        assert_eq!(
+            migrated.hidden_commands,
+            [
+                "SettingsAlwaysOnTop",
+                "SettingsThumbnailCache",
+                "SettingsArchiveCache",
+                "SettingsEpubCache",
+                "SettingsThumbnailQuality",
+                "SettingsStats",
+                "SettingsResetRotation",
+                "SettingsRestoreSettings",
+                "SettingsOperationCustomize",
+                "SettingsPreferences",
+                "SettingsRemoteConnection",
+                "HelpOpenLogs",
+                "FileReload"
+            ]
+        );
+        let resolved = resolve_menu_layout(&migrated);
+        let tools = resolved
+            .menus
+            .iter()
+            .find(|menu| menu.id == TopMenuId::Tools)
+            .unwrap();
+        assert_eq!(
+            tools.commands,
+            menu_commands_for_parent(TopMenuId::Tools)
+                .map(|spec| spec.id)
+                .collect::<Vec<_>>()
+        );
+        let settings = resolved
+            .menus
+            .iter()
+            .find(|menu| menu.id == TopMenuId::Settings)
+            .unwrap();
+        assert!(
+            settings
+                .commands
+                .contains(&MenuCommandId::SettingsPreferences)
+        );
+        assert!(
+            !settings
+                .commands
+                .contains(&MenuCommandId::SettingsOperationCustomize)
+        );
+        assert_eq!(resolved.menus[0].commands[0], MenuCommandId::HelpAbout);
+        assert_eq!(
+            serde_json::from_str::<MenuLayoutSettings>(&serde_json::to_string(&migrated).unwrap())
+                .unwrap(),
+            migrated
+        );
+    }
+
+    #[test]
+    fn tools_menu_migration_places_tools_last_without_saved_settings_and_defaults_empty_top() {
+        let mut fixture: serde_json::Value =
+            serde_json::from_str(V411_MENU_LAYOUT_FIXTURE).unwrap();
+        fixture["top_menu_order"] =
+            serde_json::json!(["Help", "Video", "Convert", "Books", "File"]);
+        let migrated: MenuLayoutSettings = serde_json::from_value(fixture.clone()).unwrap();
+        let resolved = resolve_menu_layout(&migrated);
+        assert_eq!(resolved.menus.last().unwrap().id, TopMenuId::Tools);
+        assert_eq!(
+            &migrated.top_menu_order[..4],
+            ["Help", "Books", "Collections", "File"]
+        );
+        fixture["top_menu_order"] = serde_json::json!([]);
+        let empty_top: MenuLayoutSettings = serde_json::from_value(fixture).unwrap();
+        assert!(empty_top.top_menu_order.is_empty());
+        assert_eq!(
+            resolve_menu_layout(&empty_top)
+                .menus
+                .iter()
+                .map(|menu| menu.id)
+                .collect::<Vec<_>>(),
+            TopMenuId::ALL
+        );
+        assert_eq!(
+            serde_json::from_str::<MenuLayoutSettings>("{}").unwrap(),
+            MenuLayoutSettings::default()
+        );
+    }
+
+    #[test]
+    fn tools_menu_new_format_roundtrip_preserves_hidden_order_and_partial_top_layouts() {
+        for top_menu_order in [
+            vec!["Tools".to_string(), "Help".to_string()],
+            vec!["Help".to_string()],
+            vec![],
+        ] {
+            let settings = MenuLayoutSettings {
+                top_menu_order,
+                command_order: vec![MenuCommandOrderSettings {
+                    parent: "Tools".to_string(),
+                    commands: vec![
+                        "VideoShowUpscaleTasks".to_string(),
+                        "ConvertToZip".to_string(),
+                    ],
+                }],
+                hidden_commands: vec![
+                    "ConvertToZip".to_string(),
+                    "ToolsCreateAiCaptions".to_string(),
+                ],
+            };
+            let wire = serde_json::to_value(&settings).unwrap();
+            assert_eq!(wire["format_version"], 1);
+            let reloaded: MenuLayoutSettings = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(reloaded, settings);
+            // Tools was already usable before the wire version was introduced.
+            let mut unversioned = wire;
+            unversioned
+                .as_object_mut()
+                .unwrap()
+                .remove("format_version");
+            assert_eq!(
+                serde_json::from_value::<MenuLayoutSettings>(unversioned).unwrap(),
+                settings
+            );
+        }
+        // A new hidden-only layout without a Tools entry must also survive restart unchanged.
+        let partial = MenuLayoutSettings {
+            hidden_commands: vec!["VideoRegisterUpscale".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::from_str::<MenuLayoutSettings>(&serde_json::to_string(&partial).unwrap())
+                .unwrap(),
+            partial
+        );
+        let hidden_tools = MenuLayoutSettings {
+            hidden_commands: menu_commands_for_parent(TopMenuId::Tools)
+                .map(|spec| spec.id.stable_name().to_string())
+                .collect(),
+            ..Default::default()
+        };
+        let reloaded: MenuLayoutSettings =
+            serde_json::from_str(&serde_json::to_string(&hidden_tools).unwrap()).unwrap();
+        assert_eq!(reloaded, hidden_tools);
+        assert!(
+            !resolve_menu_layout(&reloaded)
+                .menus
+                .iter()
+                .any(|menu| menu.id == TopMenuId::Tools)
+        );
     }
 
     #[test]

@@ -402,7 +402,7 @@ fn process_book_cover(
         CaptionOutcome::Ok(result) => CaptionResult::Ok {
             caption: result.caption,
             text: result.text,
-            keywords: deduplicate_keywords(result.keywords),
+            keywords: result.keywords,
         },
         CaptionOutcome::ImageFailure { message } => {
             crate::logger::log(format!("caption_job: book inference: {message}"));
@@ -586,7 +586,7 @@ fn process_item(
                 CaptionOutcome::Ok(result) => CaptionResult::Ok {
                     caption: result.caption,
                     text: result.text,
-                    keywords: deduplicate_keywords(result.keywords),
+                    keywords: result.keywords,
                 },
                 CaptionOutcome::ImageFailure { message } => {
                     crate::logger::log(format!("caption_job: image inference: {message}"));
@@ -637,17 +637,6 @@ fn decode_input(
     };
     let image = crate::capture::rotate_dynamic_image(image, angle);
     Ok(Ok(resize_rgb(&image)))
-}
-
-fn deduplicate_keywords(keywords: Vec<String>) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    keywords
-        .into_iter()
-        .filter_map(|word| {
-            let word = word.trim().to_owned();
-            seen.insert(word.clone()).then_some(word)
-        })
-        .collect()
 }
 
 fn save_result(
@@ -816,26 +805,6 @@ mod tests {
             .events
             .recv_timeout(Duration::from_secs(20))
             .expect("worker completion")
-    }
-
-    #[test]
-    fn keyword_deduplication_trims_exact_matches_and_preserves_order_and_spelling() {
-        let words = [
-            " 海 ",
-            "海辺",
-            "海",
-            "Ａ",
-            "A",
-            " ｶﾀｶﾅ",
-            "カタカナ",
-            "A",
-            "",
-            " ",
-        ];
-        assert_eq!(
-            deduplicate_keywords(words.into_iter().map(str::to_owned).collect()),
-            ["海", "海辺", "Ａ", "A", "ｶﾀｶﾅ", "カタカナ", ""]
-        );
     }
 
     #[test]

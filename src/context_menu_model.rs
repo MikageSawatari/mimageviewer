@@ -513,14 +513,15 @@ impl ContextMenuPreviewScenario {
                 CheckedFileOperationSelection::Empty
             },
             can_use_folder_commands: is_folder_context,
-            can_create_ai_captions: matches!(
+            caption_creation_disabled_reason: (!matches!(
                 kind,
                 ContextMenuItemKind::Image
                     | ContextMenuItemKind::Folder
                     | ContextMenuItemKind::ZipFile
                     | ContextMenuItemKind::PdfFile
                     | ContextMenuItemKind::ConvertibleArchive
-            ),
+            ))
+            .then(|| CAPTION_NO_TARGET_REASON.into()),
             can_paste_edit_bundle: true,
             has_explorer_folder: true,
             collection_reference,
@@ -924,7 +925,7 @@ pub struct ContextMenuInput {
     pub checked_file_operation_selection: CheckedFileOperationSelection,
     pub can_use_folder_commands: bool,
     /// Computed from the same effective selection/direct-folder targets as admission.
-    pub can_create_ai_captions: bool,
+    pub caption_creation_disabled_reason: Option<String>,
     pub can_paste_edit_bundle: bool,
     pub has_explorer_folder: bool,
     /// Collection root の参照解除権限。元ファイル操作は独立した対象を持つ。
@@ -1020,12 +1021,14 @@ fn push_group(nodes: &mut Vec<MenuNode>, group: impl IntoIterator<Item = MenuNod
     nodes.append(&mut group);
 }
 
+pub(crate) const CAPTION_NO_TARGET_REASON: &str = "AI 説明文を作れる画像ファイルや本がありません。書庫内の画像・フォルダ、本のページ、動画・音声などは対象外です";
+
 fn caption_creation_node(input: &ContextMenuInput, label: &str) -> MenuNode {
     MenuNode::Item {
         command: MenuCommand::CreateAiCaptions,
         label: label.into(),
-        enabled: input.can_create_ai_captions,
-        disabled_reason: (!input.can_create_ai_captions).then(|| "AI 説明文を作れる画像ファイルや本がありません。書庫内の画像・フォルダ、本のページ、動画・音声などは対象外です".into()),
+        enabled: input.caption_creation_disabled_reason.is_none(),
+        disabled_reason: input.caption_creation_disabled_reason.clone(),
     }
 }
 
@@ -1912,14 +1915,15 @@ mod tests {
             checked_count: 0,
             checked_file_operation_selection: CheckedFileOperationSelection::Empty,
             can_use_folder_commands: false,
-            can_create_ai_captions: matches!(
+            caption_creation_disabled_reason: (!matches!(
                 kind,
                 ContextMenuItemKind::Image
                     | ContextMenuItemKind::Folder
                     | ContextMenuItemKind::ZipFile
                     | ContextMenuItemKind::PdfFile
                     | ContextMenuItemKind::ConvertibleArchive
-            ),
+            ))
+            .then(|| CAPTION_NO_TARGET_REASON.into()),
             can_paste_edit_bundle: false,
             has_explorer_folder: false,
             collection_reference: CollectionReferenceAvailability::NotCollectionRoot,
@@ -3161,8 +3165,8 @@ mod tests {
                     assert_eq!(state.is_some(), surface == ContextMenuSurface::Grid);
                     if let Some((label, enabled, reason)) = state {
                         assert_eq!(label, id.label());
-                        assert_eq!(enabled, case.can_create_ai_captions);
-                        assert_eq!(reason.is_some(), !case.can_create_ai_captions);
+                        assert_eq!(enabled, case.caption_creation_disabled_reason.is_none());
+                        assert_eq!(reason, case.caption_creation_disabled_reason);
                     }
                     case.layout.set_visible(id, false);
                     assert!(

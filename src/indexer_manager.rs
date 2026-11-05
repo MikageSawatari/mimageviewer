@@ -135,6 +135,22 @@ fn open_stores_with_rebuild_sync(
     log_tag: &str,
     progress: Option<&StartupProgressHook>,
 ) -> Result<(Arc<FtsMetaDb>, Arc<FtsIndex>), StoreOpenFailure> {
+    // This runs on startup-init, before index stores/supervisors are published.
+    // The existing caption UPDATE triggers queue only changed rows for reflection.
+    let caption_path = data_dir.join("ai_caption.db");
+    if caption_path.exists() {
+        let result = crate::ai_caption_db::CaptionDb::open_existing_for_write(&caption_path)
+            .and_then(|db| db.normalize_saved_captions_once());
+        match result {
+            Ok(changed) if changed != 0 => crate::logger::log(format!(
+                "ai_caption: startup repetition cleanup updated {changed} rows"
+            )),
+            Ok(_) => {}
+            Err(error) => crate::logger::log(format!(
+                "ai_caption: startup repetition cleanup failed; retry next startup: {error}"
+            )),
+        }
+    }
     open_stores_with_rebuild_sync_using(data_dir, log_tag, progress, |path| {
         std::fs::remove_dir_all(path)
     })
@@ -2055,6 +2071,107 @@ mod tests {
             !flag.load(Ordering::SeqCst)
         });
     }
+    #[test]
+    fn caption_startup_cleanup_reflects_existing_indexed_rows_when_initial_scan_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let root = tmp.path().join("images");
+        std::fs::create_dir_all(&root).unwrap();
+        let image_path = root.join("one.png");
+        image::RgbImage::new(2, 2).save(&image_path).unwrap();
+        let key = crate::search_index_db::normalize_path(&image_path);
+        let favorite = mk_fav("cleanup", &root, true);
+        let mut manager = IndexerManager::new_at(
+            &data,
+            std::slice::from_ref(&favorite),
+            crate::settings::IndexerSpeedProfile::default(),
+            Arc::new(ActivityGate::new(0)),
+            vec![],
+        )
+        .unwrap();
+        wait_until("initial metadata scan before caption cleanup", || {
+            manager
+                .all_stats()
+                .iter()
+                .any(|entry| entry.stats.initial_scan_done)
+                && manager
+                    .meta_db
+                    .scanned_once(&crate::metadata_ownership::root_key(&root))
+                    .unwrap()
+                    .is_some()
+        });
+        assert!(
+            crate::fts_index::find_doc_by_path(&manager.fts.searcher(), manager.fts.fields(), &key)
+                .unwrap()
+                .is_some()
+        );
+        manager.runtime.shutdown();
+        let writer = Arc::downgrade(&manager.writer);
+        let fts = Arc::downgrade(&manager.fts);
+        drop(manager);
+        wait_until("caption cleanup test released index stores", || {
+            writer.strong_count() == 0 && fts.strong_count() == 0
+        });
+
+        let caption_path = data.join("ai_caption.db");
+        let db = crate::ai_caption_db::CaptionDb::open_at(&caption_path).unwrap();
+        let conn = rusqlite::Connection::open(&caption_path).unwrap();
+        conn.execute(
+            "INSERT INTO captions (item_key, mtime_ms, size, model_id, prompt_version,
+             lang, caption, visible_text, keywords, cover_ref, status, created_at)
+             VALUES (?1,0,0,'test',1,'ja',?2,?3,?4,'','ok',0)",
+            rusqlite::params![
+                &key,
+                format!("{}  ", "青い空".repeat(10)),
+                "看板".repeat(15),
+                serde_json::to_string(&["海辺".repeat(15), "海辺".into()]).unwrap()
+            ],
+        )
+        .unwrap();
+        conn.execute("UPDATE captions SET indexed=1", []).unwrap();
+        let original = db.get(&key).unwrap().unwrap();
+        // The production startup owner cleans rows before it publishes stores.
+        let (meta, fts) =
+            open_stores_with_rebuild_sync(&data, "caption cleanup test", None).unwrap();
+        let cleaned = db.get(&key).unwrap().unwrap();
+        assert_eq!(cleaned.caption, "青い空");
+        assert!(cleaned.rev > original.rev && !cleaned.indexed);
+        let manager = IndexerManager::new_with_stores(
+            caption_path,
+            meta,
+            fts,
+            std::slice::from_ref(&favorite),
+            crate::settings::IndexerSpeedProfile::default(),
+            Arc::new(ActivityGate::new(0)),
+            vec![],
+            None,
+            None,
+            None,
+            true,
+            None,
+        )
+        .unwrap();
+        wait_until("startup cleanup indexed without initial scan", || {
+            manager
+                .all_stats()
+                .iter()
+                .any(|entry| entry.stats.initial_scan_done)
+                && db.get(&key).unwrap().unwrap().indexed
+        });
+        assert!(manager.all_stats()[0].stats.initial_scan_skipped);
+        let searcher = manager.fts.searcher();
+        let address = crate::fts_index::find_doc_by_path(&searcher, manager.fts.fields(), &key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crate::fts_index::doc_per_source_text(&searcher, manager.fts.fields(), address)
+                .unwrap()
+                .ai_caption,
+            "青い空 看板 海辺"
+        );
+        assert_eq!(db.normalize_saved_captions_once().unwrap(), 0);
+    }
+
     #[test]
     fn caption_epoch_updates_nested_owners_and_full_rescan_drains_without_notification() {
         let tmp = tempfile::tempdir().unwrap();

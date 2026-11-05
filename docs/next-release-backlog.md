@@ -38,6 +38,140 @@
 
 ## 1. 優先候補
 
+### 1.713 AI 説明文の進捗に新しく作った件数が出ない (2026-11-05)
+
+- 利用者の観測: 「作成済み」がずっと0に見え、既にあって飛ばした件数だと後で気づいた。
+- 原因（source）: 進捗窓は `already_created` だけを「作成済み」と表示し、`created` は最終まとめにしか出していなかった。
+- 実装: 進捗とまとめの呼び方を「作成」「既にあり」に統一。新規保存と既存スキップの両方を表示する。
+- 検証: 下の§1.713〜§1.716検証記録へ集約。製品の実行結果は未確認。
+
+### 1.714 AI 説明文の進捗窓を閉じ、ツールから開き直す (2026-11-05)
+
+- 利用者の観測: 長い一括作成で小窓が出続ける。sourceではWindowに `.open()` がなく閉じられなかった。
+- 利用者決定どおり動画アップスケールのタスク窓と同様に、ジョブとは別の `show_caption_progress` が表示だけを所有する。
+  × / Esc は表示だけを閉じ、毎フレームのpoll・保存・中止・終了まとめを維持する。開始と受付済みの追加で自動再表示。
+- 判断: 「ツール → AI 説明文の作成状況」はジョブがあるときだけ有効。無いときは「作成中の AI 説明文はありません」と無効理由を表示する。
+  最後の結果を保持する別状態は作らず、既存の終了通知を維持する。EscはIME-safe helperと既存keyboard ownerを通し、
+  文字入力・IME・別モーダル／popup・非active viewport・前面の別窓から奪わない固定操作。
+- 簡素化: 長い作成をmodalにせず、独立して動く既存job ownerと表示boolだけにする利用者決定を採用。新しい再開・待機状態は作らない。
+
+#### §1.714 独立レビューREJECTの追補（2026-11-05）
+
+- **P2の原因（source）**: 進捗窓は `render_main_conversion_dialogs` でツールバーより前に描画する。
+  `Context::any_popup_open()` は今passで描画済みのpopupだけを見るため、後段の列ComboBoxが開いていてもfalseとなり、
+  進捗窓がEscを消費してComboBoxを残していた。前回の単独進捗／別Windowの回帰ではこの呼び出し順を通していなかった。
+- **修正・判断**: ComboBox／メニューが既に保持する `Popup::is_any_open(ctx)` のMemory所有状態も判定し、描画前のpopupへEscを譲る。
+  先に描画されたpopupが同じEscでMemoryを閉じた場合も進捗を閉じないよう、今passの `ctx.any_popup_open()` も維持する。
+  既存の動画アップスケールタスク窓は×で閉じるだけで独自Escを持たない。そちらへのEsc追加やpopup状態の二重保持は行わず、
+  既存egui popupの閉じ方を優先する。製品のComboBox／メニューはMemory管理で、Bool専用popupの新状態や描画後handlerは不要。
+- **回帰**: `app::update_phases::caption_progress_popup_tests::caption_progress_escape_yields_to_toolbar_popup_in_both_draw_orders`。
+  実際のダイアログ群→ツールバー（逆順も）を描き、列ComboBoxをpointer clickで開いてEscでpopupだけを閉じ、
+  進捗表示・ジョブ・取消flagを保持する。次のEscでは進捗だけを閉じ、ジョブを維持する。
+- **検証**: `target/tmp-test-env` のTEMP/TMP、default feature／test profile、nextest 4並列で関連 **7/7成功、exit0、2.925秒**（compile 2分12秒）。
+  filterは `(test(~caption_progress_popup_tests::) | test(~ui_dialogs::caption_job::tests::caption_job_progress_) | test(~caption_job_hidden_progress_) | test(~caption_job_tools_menu_progress_)) & !test(~snapshot)`。
+  run `114ad0a8-993c-44d7-bad7-fd478724d557`、ログ `target/caption-tools-review-escape-tests.log`。
+  IME／文字入力／前面窓・別窓を閉じた後・×／Esc・隠した進捗のpollと再表示も含む。snapshotは除外した。
+- **独立追確認**: GPT-6.1 Sol / xhighがP2/P3の完成差分をread-onlyで確認し、追加の必要指摘なし・コード受入可。
+  実行結果とは区別する。最終 `cargo check -p mimageviewer --bin mimageviewer-core` もexit0、18.02秒
+  （`target/caption-tools-review-core-check.stderr.log`）。以後のsource変更は新テストの未使用import削除だけで、回帰結果は再利用する。
+- **最終静的検査・保護**: `cargo fmt`／`cargo fmt --check`・`git diff --check`、UIグリフ0、カード52件・超過0。
+  当該Esc／メニュー修正作業では、§1.716の4ソース、`config/miv-sound.rs`、更新済みstartup snapshot2枚は作業開始時hashと一致。
+  製品起動・commit・`build-dev.ps1`・snapshot更新・全件テストは行っていない。
+
+### 1.715 「変換」「動画」を「ツール」に統合する (2026-11-05)
+
+- 利用者決定: ZIP変換／区切り／AI説明文作成・作成状況／区切り／動画アップスケール登録・削除・タスク表示の順。
+  旧トップメニューを削除し、AI2項目はKeyAction・既定キーを増やさないメニュー専用とする。
+- 実装: AI作成は右クリック・ツール・実行受付で `caption_creation_disabled_reason` と既存 `caption_targets`／request入口を共用。
+  進捗の表示状態とジョブ状態の所有者を分離し、Tools本文の共通rendererで有効条件・理由・グループ間区切りを描く。
+- 保存先の棚卸し: `settings.db` のkv JSON、旧 `settings.json`／そのbackup、操作設定共有 `.mivkeys.json` と保存世代の取り込みは
+  すべて `MenuLayoutSettings` のserde読み込み境界を通る。旧 `keymap.ini` はキー割当だけでメニュー設定を持たない。
+  トップ非表示専用値はなく、固定項目をすべて隠したトップを解決時に除く既存方式（環境設定入口は従来どおり保護）。
+- 移行: 旧Convert/Videoトップと所属項目の順序・非表示を捨て、Toolsを全項目表示で作る。他メニューの順序・非表示・キーは保持する。
+  旧保存順のSettings直前、Settingsが保存順に無ければ欠落メニュー補完後の最後。保存順なしは新既定のTags／Tools／Settings。
+  旧既定のConvert位置はTagsより前だったため、新既定も「Settings直前」へ一本化した。
+  nested `menu_layout.format_version=1` を書き、Toolsを再カスタマイズした後は再移行しない。未知の旧IDで落ちず他値を削除しない。
+- 文書: specの図とメニューバー表（ヘルプ行を補完）、キー仕様、公開マニュアル・製品ページを更新。
+  5.0.0の必読に移動案内を短い1項目で追加する判断（リリース済み入口の移動のため）。
+- v4.11.0保存形式fixtureで非表示・並替・Settings全項目非表示指定・Settings順序欠落・DB再open・旧JSON・共有・保存世代取り込みを回帰対象とした。
+
+#### §1.715 独立レビューREJECTの追補（2026-11-05）
+
+- **P3の原因と修正**: 前回の検索が公開マニュアル `formats.html` の「変換 → ZIP ファイルに変換」を取りこぼしていた。
+  `htdocs` と `docs` 全体をrgで再検索し、同ページと `spec.md` の完了項目、`rar-direct-read-plan.md` のZIP変換入口、
+  `touch-support-plan.md` のオフライン動画アップスケール入口、`virtual-folders.md` の明示ZIP変換経路を「ツール」に訂正。
+- **検索時の区別**: 旧名の移行記録、過去の変更履歴、環境設定の「動画」ページ、動画→音声モード、
+  現存する右クリック内「変換」サブメニューは旧トップメニューの案内ではないため保持する。
+- Esc／旧メニュー案内の追補時点では§1.716の正常反復を切る問題を除外していたが、続く2026-11-05の利用者決定で
+  今回の規則変更に含めた。合計30 scalar未満を残す条件を追加した（下記§1.716）。
+  設計担当が更新した `startup_whats_new_1093x614.png`／`startup_whats_new_1366x728.png` は保持し、snapshotを実行・更新しない。
+
+### 1.716 AI 説明文の保存前に連続反復を整理する (2026-11-05)
+
+- 利用者の画面写真の観測: 画像内の文字に短い語の連続、連続行、2行交互の反復が上限まで続いた。生成結果の本文は転載しない。
+  worker生成中のDRYはHEAD `708666f03` に取り込み済み。今回C++には触れず、利用者決定の保存前整理をRust側へ追加する。
+- 所有者: `CaptionDb::save_inner` の正常結果保存直前だけで説明文・`visible_text`・keywordsを整理する。
+  Unicode scalarで2〜64文字の塊の隣接3回以上のうち、**反復部の合計長（単位長×連続回数）が30以上**のものだけ1回へ縮める。
+  `MIN_COLLAPSED_RUN_SCALARS = 30` を単一の閾値定数とし、30未満、単一文字だけの反復、2回だけ、離れた同じ語は保持。
+  縮めた結果、新たに条件を満たす隣接反復ができた場合も既存ループで再走査し、冪等性を維持する。
+  改行・空白・複数行を塊に含め、末尾空白／改行を整え、keywordは整理後の完全一致重複を最初の1個にまとめる。
+  上限64は短い語だけでなく報告された2行の反復を拾い、長い文章の再登場まで巻き込まず探索量を抑える固定の境界。
+- 既存行: captionは未リリースなので世代別移行の仕組みは作らない。起動の既存索引初期化workerで同じ関数を一度だけ適用する。
+  既存caption DBにmeta表が無いため `caption_meta` の完了印を行更新と同一transactionで保存。変更行だけ既存triggerでrevを進めindexed=0とし、
+  既存の索引反映でCtrl+Gへ届ける。起動結果採用時に早期caption表示cacheを再読込させ、表示・検索・MCP・書出しは保存値を読む。
+- 2026-11-05利用者決定の規則変更: 短い正常反復も削るというP2を受け、合計30 scalarの条件を追加した。
+  保存・既存行整理は共通関数を既に使うため処理本体は変更不要。v5未リリース・未コミット／未配布なので印は既存のv1を維持し、移行を追加しない。
+  DB保存・一度限り整理・索引反映のテストだけ、反復入力を30以上に更新し、短い既存行を変更しない検査も加えた。
+- まれな失敗はログ＋次回起動で再実行。完了印は成功時だけcommitし、retry loopや追加の復旧状態は作らない。
+  Rust側は従来からraw caption/text各400scalar等の受理上限を持つため、それを超えたworker出力の救済や上限変更は今回含めない。
+
+#### §1.716 合計30 scalar規則の検証記録（2026-11-05）
+
+- 変更: normalizerの1定数と反復部合計の条件、normalizer／DB保存・既存行／索引の合成fixtureと期待、規則文書。
+  DB保存・一度限り整理・索引の製品処理と `scalar_repetition_cleanup_v1` は変更しない。
+- 既存期待の変更: `scalar_repetition_collapses_only_three_or_more_bounded_nonuniform_units` の短い反復と短いUnicode例・2字単位×3を保持へ、
+  `caption_fields_trim_ends_and_deduplicate_keywords_after_repetition_cleanup` の短い反復keywordを独立語として保持へ変更。
+  `reported_caption_repetitions_collapse_and_keep_incomplete_final_units` は反復部を30以上に延長し、末尾の不完全単位の保持を維持。
+  `caption_save_normalizes_both_image_and_book_requests_at_the_db_boundary`、
+  `caption_saved_cleanup_updates_only_changed_rows_and_commits_once_marker`、
+  `caption_saved_cleanup_failure_rolls_back_rows_and_leaves_next_startup_retryable`、
+  `caption_startup_cleanup_reflects_existing_indexed_rows_when_initial_scan_is_skipped` は入力を30以上に更新し、整理後の値・rev・印・索引の期待は維持。
+- 追加回帰: 29 scalar入力（完全反復28＋不完全1）、ちょうど30（10字×3／2字×15）、長いUnicode、削除でできた新たな反復の再走査と冪等性。
+- **検証**: `cargo nextest run -p mimageviewer --lib --test-threads 4 -E '(test(/normalize|ai_caption/) | test(=indexer_manager::tests::caption_startup_cleanup_reflects_existing_indexed_rows_when_initial_scan_is_skipped)) & !test(~snapshot)'` は
+  **192/192成功、exit0、18.173秒**（compile 3分12秒、default feature／test profile／nextest default）。
+  run `29b0e278-9f07-4b84-9d2d-91199c852c85`、ログ `target/caption-rule-thirty-tests-final.log`。
+  純粋normalizerの単独rustcによる7件も成功。初回Cargoは追加fixtureの文字列連結の型エラー2件で未実行、`format!`へ訂正した（`target/caption-rule-thirty-tests.log`）。
+- TEMP/TMPは作業ツリー内 `target/tmp-test-env` に指定。既存のテスト残骸は同じtarget内の
+  `tmp-test-env-before-caption-rule-14d6ae687731412ca23499f35e110a50` へディレクトリ名を変更して保持し、空の指定先を作ってから実行した。
+- `cargo fmt`（引数なし）／`cargo fmt --check`・`git diff --check` は成功。
+  DB／索引managerの製品部分は開始時のソースと一致し、変更はtest module内だけ。既存設定ファイルとstartup PNG2枚も開始時hashと一致。
+- 独立read-only確認（GPT-6.1 Sol / xhigh）は追加の必要指摘なし・コード受入可。テスト結果とは区別する。
+  `cargo check -p mimageviewer --bin mimageviewer-core` もexit0、26.21秒（`target/caption-rule-thirty-core-check.stderr.log`）。
+  製品起動・snapshot更新・build-dev・commitは行っていない。
+
+#### §1.713〜§1.716 の検証記録（以下は合計長条件追加前の履歴）
+
+- 独立read-onlyレビュー（GPT-6.1 Sol / xhigh）でP2二件を修正: Tools未表示時の全対象構築を本文描画closureへ移し、
+  Escの最前面判定を非表示layerを含む `ctx.top_layer_id()` から可視Middle窓だけの判定へ変更。
+  別窓を閉じた後のEsc回帰を追加し、二件の追確認では必要な未解消findingなし。AI項目にキー割当があるという文書の誤記も訂正。
+- 初回の関連テストは新UI fixtureのAPI/一時文字列の寿命の3 compile errorで未実行。訂正後は関連 **128/128成功**（exit0、test profile/default feature、nextest 4並列、9.873秒）。
+  run `d03701b9-7335-413c-8b8a-2844e1f459e4`、ログ `target/caption-tools-related-tests-final.log`。
+  caption DB/normalizer・job worker・進捗の状態/入力/実メニュー操作・v4.11.0の全保存入口・メニュー構成/無効理由・キー仕様/告知を含み、snapshotは除外した。
+- 起動時cache採用の既存回帰、告知窓のgeometry、設定layoutの既存roundtripを補完し、**18/18成功**（exit0、同条件、12.213秒、128件との一部重複あり）。
+  run `5bf8334e-052c-4e76-ac24-c1ee87520ae0`、ログ `target/caption-tools-additional-tests.log`。
+  最後のsource整形はui_mainのインデントのみで、これらの検証対象のtoken/動作は変更していない。
+- `cargo check -p mimageviewer --bin mimageviewer-core` の最終結果も **exit0、18.11秒**。
+  ログ `target/caption-tools-core-check-final.stderr.log`。初回もexit0（68秒）。
+- テストのTEMP/TMPは作業ツリー内 `target/tmp-test-env` に設定し、古いシステムTEMPを使っていない。
+- `cargo fmt` / `cargo fmt --check` / `git diff --check` は成功。UI文字検査は危険グリフ0、製品ページのカード検査は52件・超過0。
+  最終の全体整形後も同じ結果。既存compiler warningは今回の範囲へ広げていない。
+- 利用者指定によりsnapshotの生成／通常比較と `test-lib-full.ps1` は設計担当へ引き継ぐ。製品起動・commit・`build-dev.ps1` は行わない。
+  snapshotは `ui_tools_menu::tests::tools_menu_snapshot_dark_and_light`（新規2枚 `tools_menu_dark/light`）と
+  `ui_dialogs::caption_job::tests::caption_job_progress_snapshot`（既存 `caption_job_progress` 更新）が対象。
+  `UPDATE_SNAPSHOTS=1` で生成・目視後、同じfilterを通常比較で実行してからfullへ進む。PNG生成／更新は今回未実施。
+  `config/miv-sound.rs` は変更しない。
+
+
 ### 1.710 初回起動の引き継ぎが、旧 host の残した WebView2 browser 待ちで失敗する (2026-11-05)
 
 - **観測者・資料**: 利用者の PC のログを設計担当が確認。PID 55360 の `msedgewebview2.exe` browser 本体が 2026-11-02 から残り、親 host PID 83216 は不存在、移行は共通 5 秒の期限で失敗。利用者が当該 PID を終了して再起動すると成功した。開発テスト起源は推定であり、実装担当の実機観測ではない。利用者決定で v5 に入れる。

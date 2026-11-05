@@ -19152,6 +19152,9 @@ pub struct App {
     pub(crate) vlm_setup: crate::ui_dialogs::vlm_addon::VlmSetup,
     #[cfg(windows)]
     pub(crate) caption_job: Option<crate::ui_dialogs::caption_job::CaptionJob>,
+    /// Progress-window visibility is independent of the caption worker lifetime.
+    #[cfg(windows)]
+    pub(crate) show_caption_progress: bool,
     /// フルスクリーン中央のヒントオーバーレイ。
     /// 最後/最初の項目でさらに進もう/戻ろうとしたとき、または Ctrl+↑↓ で
     /// 画像・動画のあるフォルダが skip_limit 以内に見つからなかったときに表示する。
@@ -21946,6 +21949,8 @@ impl App {
             vlm_setup: Default::default(),
             #[cfg(windows)]
             caption_job: None,
+            #[cfg(windows)]
+            show_caption_progress: false,
             fs_boundary_hint: None,
             bucket_region_flash: None,
 
@@ -33801,6 +33806,9 @@ impl App {
         full_check_requested: bool,
     ) {
         let stage = miv_startup::span(miv_startup::Lane::Core, miv_startup::Stage::IndexerAdopt);
+        // Startup's caption normalization completes before this result is sent. An early
+        // info-panel read may have cached the old row while that worker was running.
+        self.caption_display.clear();
         self.indexer_init = match outcome {
             crate::indexer_manager::StartupInitOutcome::Ready(manager) => {
                 // Current SW_HIDE state, not a snapshot taken when the worker began.
@@ -103584,6 +103592,9 @@ mod index_full_check_tests {
     fn startup_deadline_keeps_receiver_then_adopts_hidden_manager_once() {
         let mut env = setup_app_for_test();
         let app = &mut env.app;
+        let caption_key = "c:/startup/early-caption.jpg";
+        app.caption_display.seed_for_test(caption_key);
+        let caption_epoch = app.caption_display.epoch_for_test();
         let (tx, rx) = mpsc::channel();
         app.indexer_init = IndexerInit::Pending(StartupInitPending {
             rx,
@@ -103613,6 +103624,8 @@ mod index_full_check_tests {
         );
         app.poll_startup_init();
         assert!(app.indexer_init.is_terminal());
+        assert!(!app.caption_display.contains_for_test(caption_key));
+        assert!(app.caption_display.epoch_for_test() > caption_epoch);
         let semaphore = app.indexer_init.as_ref().unwrap().io_sem();
         assert!(semaphore.is_throttled());
         assert_eq!(app.global_search.metadata_draft, "latest query");

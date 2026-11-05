@@ -668,6 +668,51 @@ mod tests {
     }
 
     #[test]
+    fn tools_menu_v411_shared_import_migrates_before_sanitizing_and_roundtrips_new_settings() {
+        let mut wire = serde_json::to_value(OperationCustomizeBundle::defaults()).unwrap();
+        wire["app_version"] = serde_json::json!("4.11.0");
+        wire["menu_layout"] =
+            serde_json::from_str(crate::keymap::V411_MENU_LAYOUT_FIXTURE).unwrap();
+        wire["keymap"]["overrides"] = serde_json::json!([{"action": "GridPin", "chords": ["F13"]}]);
+        let imported = parse_json(&serde_json::to_string(&wire).unwrap()).unwrap();
+        let mut expected: MenuLayoutSettings =
+            serde_json::from_str(crate::keymap::V411_MENU_LAYOUT_FIXTURE).unwrap();
+        // Existing import policy protects the Preferences entry from being hidden.
+        expected
+            .hidden_commands
+            .retain(|name| name != "SettingsPreferences");
+        assert_eq!(imported.bundle.menu_layout, expected);
+        assert_eq!(
+            imported.bundle.keymap.overrides[0],
+            binding("GridPin", &["F13"])
+        );
+        let mut applied = Settings::default();
+        imported.bundle.apply_to(&mut applied);
+        assert_eq!(applied.menu_layout, expected);
+        let mut customized = imported.bundle;
+        customized.menu_layout.top_menu_order =
+            vec!["Tools".into(), "Settings".into(), "Help".into()];
+        customized
+            .menu_layout
+            .hidden_commands
+            .push("VideoRegisterUpscale".into());
+        customized
+            .menu_layout
+            .command_order
+            .push(MenuCommandOrderSettings {
+                parent: "Tools".into(),
+                commands: vec!["ToolsShowCaptionProgress".into(), "ConvertToZip".into()],
+            });
+        assert_eq!(
+            parse_json(&to_json(&customized).unwrap())
+                .unwrap()
+                .bundle
+                .menu_layout,
+            customized.menu_layout
+        );
+    }
+
+    #[test]
     fn bundle_json_roundtrip_preserves_all_customization_groups_and_ignores_future_fields() {
         let mut settings = Settings::default();
         settings.keymap.legacy_ini_migration_done = true;

@@ -1478,11 +1478,12 @@ impl crate::app::App {
             checked_count: target.checked_count,
             checked_file_operation_selection: target.checked_file_operation_selection,
             can_use_folder_commands: target.folder_command_target.is_some(),
-            can_create_ai_captions: target.surface == ContextMenuSurface::Grid
-                && !self
-                    .caption_targets(target.is_folder_context)
-                    .paths
-                    .is_empty(),
+            caption_creation_disabled_reason: if target.surface == ContextMenuSurface::Grid {
+                self.caption_creation_disabled_reason(target.is_folder_context)
+                    .map(str::to_owned)
+            } else {
+                Some(crate::context_menu_model::CAPTION_NO_TARGET_REASON.into())
+            },
             can_paste_edit_bundle: self.has_page_edit_bundle_clipboard(),
             has_explorer_folder: target.explorer_folder.is_some(),
             collection_reference: match &target.collection_root_delete {

@@ -4701,6 +4701,48 @@ impl Drop for DataDirOverrideGuard {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn tools_menu_v411_settings_db_migrates_once_and_preserves_new_customization() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "UPDATE settings_kv SET value = ?1 WHERE key = 'menu_layout'",
+                [crate::keymap::V411_MENU_LAYOUT_FIXTURE],
+            )
+            .unwrap();
+        let mut loaded = db.load_into_settings().unwrap();
+        let expected: crate::keymap::MenuLayoutSettings =
+            serde_json::from_str(crate::keymap::V411_MENU_LAYOUT_FIXTURE).unwrap();
+        assert_eq!(loaded.menu_layout, expected);
+        loaded.menu_layout.top_menu_order = vec!["Tools".into(), "Help".into()];
+        loaded
+            .menu_layout
+            .hidden_commands
+            .push("ConvertToZip".into());
+        loaded
+            .menu_layout
+            .command_order
+            .push(crate::keymap::MenuCommandOrderSettings {
+                parent: "Tools".into(),
+                commands: vec![
+                    "VideoShowUpscaleTasks".into(),
+                    "ToolsShowCaptionProgress".into(),
+                ],
+            });
+        db.save_full(&loaded).unwrap();
+        drop(db);
+        let reopened = SettingsDb::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.load_into_settings().unwrap().menu_layout,
+            loaded.menu_layout
+        );
+    }
+
+    #[test]
     fn agent_level_defaults_disabled_and_roundtrips_live_changes() {
         assert_eq!(Settings::default().agent_level, AgentLevel::Disabled);
         let missing: Settings = serde_json::from_str("{}").unwrap();
