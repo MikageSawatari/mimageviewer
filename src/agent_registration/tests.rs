@@ -575,6 +575,56 @@ fn raw_json_editor_rejects_duplicate_keys_bom_invalid_containers_and_excessive_n
     }
 }
 
+#[test]
+fn registration_preservation_deep_large_string_keeps_exact_bytes() {
+    let command = RegistrationCommand {
+        command: "miv".into(),
+        args: vec![],
+    };
+    let mut original = String::from("{\n  \"preferences\": ");
+    // Root object + 126 arrays reach the existing accepted container limit.
+    for level in 0..126 {
+        original.push_str("[\n");
+        original.push_str(&"  ".repeat(level + 2));
+    }
+    original.push('"');
+    original.push_str(&"x".repeat(1024 * 1024));
+    original.push_str(r#"\u00e9\/😀"#);
+    original.push('"');
+    for level in (0..126).rev() {
+        original.push('\n');
+        original.push_str(&"  ".repeat(level + 1));
+        original.push(']');
+    }
+    original.push_str(",\n  \"tail\": 1e400,\n  \"mcpServers\": {}\n}\n");
+    let expected = original.replace(
+        "  \"mcpServers\": {}",
+        "  \"mcpServers\": {\n    \"mimageviewer\": {\n      \"command\": \"miv\",\n      \"args\": []\n    }\n  }",
+    );
+    let edited = config::edit(
+        AppTarget::ClaudeDesktop,
+        &original,
+        Action::Register,
+        &command,
+    )
+    .unwrap();
+    // Compare literal bytes, without parsing the expected number/string values.
+    assert!(
+        edited.as_bytes() == expected.as_bytes(),
+        "deep input must preserve all unrelated bytes"
+    );
+    assert_eq!(
+        config::state(AppTarget::ClaudeDesktop, &edited, Some(&command)).unwrap(),
+        RegistrationState::Registered
+    );
+    let removed =
+        config::edit(AppTarget::ClaudeDesktop, &edited, Action::Remove, &command).unwrap();
+    assert!(
+        removed.as_bytes() == original.as_bytes(),
+        "removing the registration must restore the exact deep input"
+    );
+}
+
 fn fixture() -> (tempfile::TempDir, RegistrationEnvironment) {
     let temp = tempfile::tempdir().unwrap();
     let env = RegistrationEnvironment {

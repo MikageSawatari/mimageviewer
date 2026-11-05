@@ -16,13 +16,15 @@ enum Json {
 
 impl<'de> Deserialize<'de> for Json {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        let raw = <&'de serde_json::value::RawValue>::deserialize(deserializer)?;
         Self::from_raw(raw, 0).map_err(serde::de::Error::custom)
     }
 }
 
 impl Json {
-    fn from_raw(raw: Box<serde_json::value::RawValue>, depth: usize) -> serde_json::Result<Self> {
+    fn from_raw(raw: &serde_json::value::RawValue, depth: usize) -> serde_json::Result<Self> {
+        // Container ranges borrow the original text at every level. Own only
+        // terminal tokens, so nested ancestors never copy/retain whole subtrees.
         // Each container has its own deserializer, so retain the original
         // bounded nesting rather than resetting serde_json's recursion budget.
         let container = matches!(raw.get().as_bytes().first(), Some(b'{' | b'['));
@@ -40,7 +42,7 @@ impl Json {
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Json, A::Error> {
                 let mut entries = Vec::new();
                 while let Some((key, raw)) =
-                    map.next_entry::<String, Box<serde_json::value::RawValue>>()?
+                    map.next_entry::<String, &'de serde_json::value::RawValue>()?
                 {
                     // Duplicate keys have application-dependent meaning. Refuse to
                     // rewrite such a file instead of leaving a second registration.
@@ -55,7 +57,7 @@ impl Json {
             }
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Json, A::Error> {
                 let mut values = Vec::new();
-                while let Some(raw) = seq.next_element::<Box<serde_json::value::RawValue>>()? {
+                while let Some(raw) = seq.next_element::<&'de serde_json::value::RawValue>()? {
                     values.push(
                         Json::from_raw(raw, self.depth + 1).map_err(serde::de::Error::custom)?,
                     );
@@ -70,7 +72,7 @@ impl Json {
             Some(b'[') => {
                 serde_json::Deserializer::from_str(raw.get()).deserialize_seq(Ordered { depth })
             }
-            _ => Ok(Self::Scalar(raw)),
+            _ => Ok(Self::Scalar(raw.to_owned())),
         }
     }
 }
