@@ -78720,6 +78720,7 @@ impl App {
 
     /// Request original pixels through the existing pending/upload owner. Completed display
     /// material is preserved until the requested operation performs a real edit.
+    #[track_caller]
     pub(crate) fn ensure_original_material_for_entry(
         &mut self,
         idx: usize,
@@ -78767,6 +78768,14 @@ impl App {
             FsPageLoadContract::Sequential,
             crate::video::PlaybackStartOrigin::NewSource,
         );
+        // A PDF without viewport/canonical dimensions has not been admitted yet.
+        // Re-evaluating that demand must not emit a caller record every frame.
+        if self.fs_pending.contains_key(&idx) {
+            crate::logger::log(format!(
+                "[fs] original material requested idx={idx} entry={entry:?} caller={}",
+                std::panic::Location::caller()
+            ));
+        }
         false
     }
 
@@ -96899,26 +96908,29 @@ impl App {
                     original_entry_receipts.push((items_generation, key, entry));
                 }
             }
-            if preserve_completed {
-                continue;
+            if !preserve_completed {
+                self.bump_input_generation_for_fs_cache_reload(key);
+                // 360 度パノラマビュー Phase 2a (§3.6.4): worker は tee しなかったが、
+                // 画像が 360 候補 (XMP equirect OR aspect 2:1) かつ大画像 (>200 MP) なら
+                // バナー表示の判定。state が既に BaseOnly ならそのまま、未設定なら
+                // NeedsUserConfirmation を立てる。SettleReady の小さい候補は worker tee
+                // 経路 (StaticPanorama) で処理されるので、ここに到達するのは tee 不採用ケース。
+                self.maybe_update_pano_quality_state_from_static(key);
+                mark_poll_prefetch_perf(
+                    &mut prefetch_perf,
+                    PollPrefetchPerfStage::OtherPostprocessing,
+                );
             }
-            self.bump_input_generation_for_fs_cache_reload(key);
-            // 360 度パノラマビュー Phase 2a (§3.6.4): worker は tee しなかったが、
-            // 画像が 360 候補 (XMP equirect OR aspect 2:1) かつ大画像 (>200 MP) なら
-            // バナー表示の判定。state が既に BaseOnly ならそのまま、未設定なら
-            // NeedsUserConfirmation を立てる。SettleReady の小さい候補は worker tee
-            // 経路 (StaticPanorama) で処理されるので、ここに到達するのは tee 不採用ケース。
-            self.maybe_update_pano_quality_state_from_static(key);
-            mark_poll_prefetch_perf(
-                &mut prefetch_perf,
-                PollPrefetchPerfStage::OtherPostprocessing,
-            );
-            // 保存済みマスクがあれば自動で inpaint 適用
+            // Every accepted source joins the same saved-erase owner. Original
+            // hydration preserves completed stages, but must not bypass production.
             self.auto_apply_saved_mask(ctx, key);
             mark_poll_prefetch_perf(
                 &mut prefetch_perf,
                 PollPrefetchPerfStage::AutoApplySavedMask,
             );
+            if preserve_completed {
+                continue;
+            }
             if self.fullscreen_idx == Some(key) {
                 // 連結表示の keep/prefetch 範囲は viewport 上の可視ページから
                 // ui_fullscreen 側で毎フレーム計算する。ここで通常の前後ページ window を

@@ -1163,6 +1163,58 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn erase_prefetch_raw_developed_source_starts_the_same_saved_stage_owner() {
+        let mut app = app_with_raw_and_jpeg();
+        let ctx = egui::Context::default();
+        app.fullscreen_idx = Some(1);
+        app.ai_runtime_init = crate::ai::runtime::AiRuntimeInitOwner::failed_for_test("RAW erase");
+        let page_key = app.page_path_key(0).unwrap();
+        let mut mask = vec![false; 24];
+        mask[9] = true;
+        app.mask_db = Some(crate::mask_db::MaskDb::open().unwrap());
+        app.mask_db
+            .as_ref()
+            .unwrap()
+            .set(&page_key, &mask, &[], 6, 4)
+            .unwrap();
+        app.mask_pages.insert(0);
+        app.mask_page_keys.insert(page_key);
+        let mut f = Fixture::new();
+        f.info(RawDevelopSupport::Supported);
+        f.preparing(RawBrightness::MatchPreview);
+        *app.raw_pages.page(0).unwrap().develop.lock().unwrap() = std::mem::replace(
+            &mut *f.store.page(0).unwrap().develop.lock().unwrap(),
+            RawDevelopPhase::Idle,
+        );
+        let tag = RawResultTag {
+            source: app.raw_pages.page(0).unwrap().source.clone(),
+            context: app.fs_page_load_context_serial(),
+            generation: app.items_generation,
+            ..f.tag
+        };
+        app.apply_raw_fs_result(
+            &ctx,
+            tag,
+            RawPageResult::Develop(Box::new(FsLoadResult::Static {
+                ci: egui::ColorImage::filled([6, 4], egui::Color32::GRAY),
+                source_dims: [12000, 8000],
+                animation: StaticAnimationState::Still,
+            })),
+            1,
+        );
+        assert!(app.commit_pending_matches_current_erase_key(0));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !app.erase_inpaint_pending.is_empty() {
+            app.poll_erase_inpaint(&ctx);
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(app.page_turn_resident_quality_for_test(0), Some("erase"));
+        app.auto_apply_saved_mask(&ctx, 0);
+        assert!(app.erase_inpaint_pending.is_empty());
+    }
+
+    #[test]
     fn raw_review_page_turn_deferral_retires_preview_owner_before_and_after_info() {
         for info_received in [false, true] {
             let mut app = app_with_raw_and_jpeg();

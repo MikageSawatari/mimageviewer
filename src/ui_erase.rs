@@ -114,6 +114,19 @@ enum EraseInpaintMaskSource {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SavedMaskAutoApplySkip {
+    Editing,
+    RemoteControlled,
+    NoSavedMask,
+    Completed,
+    CommitPending,
+    SourceUnavailable,
+    InvalidDimensions,
+    PageIdentityUnavailable,
+    ProducerNotStarted,
+}
+
 #[derive(Debug)]
 pub(crate) enum EraseInpaintResult {
     Pixels(egui::ColorImage),
@@ -3321,53 +3334,61 @@ impl App {
         self.reset_erase_mode();
     }
 
-    /// 画像ロード完了後に保存済みマスクがあれば自動で inpaint を適用する。
-    /// `poll_prefetch` から呼ばれる。
+    /// Common accepted-source boundary for every load purpose and RAW development.
+    /// Only this event logs skips; ordinary per-frame lookups remain silent.
     pub(crate) fn auto_apply_saved_mask(&mut self, ctx: &egui::Context, idx: usize) {
-        // erase mode 中は手動操作に任せる
+        let outcome = self.start_saved_erase_for_accepted_source(ctx, idx);
+        let context = self.virtual_list_context_id();
+        match outcome {
+            Ok(()) => crate::logger::log(format!(
+                "erase: auto-applying saved mask for idx={idx} context={context:?}"
+            )),
+            Err(reason) => crate::logger::log(format!(
+                "erase: auto-apply skipped reason={reason:?} idx={idx} context={context:?} key={:?}",
+                self.current_erase_result_key(idx)
+            )),
+        }
+    }
+
+    fn start_saved_erase_for_accepted_source(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Result<(), SavedMaskAutoApplySkip> {
+        use SavedMaskAutoApplySkip as Skip;
         if self.erase_mode {
-            return;
+            return Err(Skip::Editing);
         }
-
-        let key = match self.page_path_key(idx) {
-            Some(k) => k,
-            None => return,
-        };
-
-        // DB にマスクがあるか確認。入力は raw 固定ではなく、現在の pre-erase 表示レイヤ
-        // (補正 > AI > raw) を使う。
-        let Some(pixels) = self.resolve_erase_input_source(idx) else {
-            return;
-        };
-        let [w, h] = pixels.size;
-
-        let (bitmap, shapes) = match self.mask_db.as_ref().and_then(|db| db.get_full(&key, w, h)) {
-            Some(m) => m,
-            None => return,
-        };
-        let mut composite = bitmap.clone();
-        crate::mask_db::rasterize_shapes_into(&mut composite, &shapes, w, h);
-        if !composite.iter().any(|&m| m) {
-            // ensure_erase_result_texture と同じく、composite 空のときは mask_pages
-            // からも外しておく (badge 一貫性、Phase 1-5 code-review CONFIRMED)。
-            self.mask_pages.remove(&idx);
-            self.mask_page_keys.remove(&key);
-            return;
+        if self.remote_session_blocks_local_control() {
+            return Err(Skip::RemoteControlled);
         }
-
-        crate::logger::log(format!("erase: auto-applying saved mask for idx={idx}"));
-
-        // 元画像を base_cache に保存（サイズが変わった場合は更新）
-        let need_update = self
-            .erase_base_cache
-            .get(&idx)
-            .map(|old| old.size != pixels.size)
-            .unwrap_or(true);
-        if need_update {
-            self.erase_base_cache.insert(idx, pixels.clone());
+        if !self.mask_pages.contains(&idx) {
+            return Err(Skip::NoSavedMask);
         }
-
-        self.run_inpaint_and_cache(ctx, idx, pixels, composite, w, h, "auto-apply", false);
+        if self.current_erase_result_pixels(idx).is_some() {
+            return Err(Skip::Completed);
+        }
+        // Do not replace a pending receiver or an editor continuation, including
+        // a result already received by its worker but not yet adopted by the UI.
+        if self.commit_pending_matches_current_erase_key(idx) {
+            return Err(Skip::CommitPending);
+        }
+        let pixels = self
+            .current_raw_source_pixels(idx)
+            .ok_or(Skip::SourceUnavailable)?;
+        if pixels.size.contains(&0) {
+            return Err(Skip::InvalidDimensions);
+        }
+        self.page_path_key(idx)
+            .ok_or(Skip::PageIdentityUnavailable)?;
+        self.ensure_erase_stage_for_entry(
+            ctx,
+            idx,
+            crate::app::OriginalMaterialEntry::MaterialOnly,
+        );
+        self.commit_pending_matches_current_erase_key(idx)
+            .then_some(())
+            .ok_or(Skip::ProducerNotStarted)
     }
 
     /// フルスクリーン表示中 (消しゴムモード外) で F7/F8 から呼ばれる。
@@ -3499,7 +3520,13 @@ impl App {
             }
             return false;
         }
-        let Some(source) = self.resolve_erase_input_source(idx) else {
+        // Capture resident metadata and Arc only. Saved-mask preparation,
+        // transparency flattening and tone analysis belong to the worker.
+        let source = self
+            .current_raw_source_pixels(idx)
+            .map(|pixels| self.capture_erase_base_source(idx, pixels))
+            .or_else(|| self.erase_base_cache.get(&idx).cloned());
+        let Some(source) = source else {
             self.ensure_original_material_for_entry(idx, entry);
             return false;
         };
@@ -3507,6 +3534,13 @@ impl App {
             return false;
         };
         let [w, h] = source.size;
+        if self
+            .erase_base_cache
+            .get(&idx)
+            .is_none_or(|old| old.size != source.size)
+        {
+            self.erase_base_cache.insert(idx, source.clone());
+        }
         self.start_inpaint_job(
             ctx,
             idx,
@@ -3563,8 +3597,7 @@ impl App {
         let (progress_tx, progress_rx) = mpsc::channel::<EraseInpaintProgress>();
         let ctx_clone = ctx.clone();
         let local_ai_activity = self.local_ai_activity_lease();
-        let mono_tone_axis =
-            inpaint_mono_tone_axis(&original, self.settings.erase_inpaint_mono_tolerance);
+        let mono_tolerance = self.settings.erase_inpaint_mono_tolerance;
 
         let spawn_result = std::thread::Builder::new()
             .name("erase-inpaint".to_string())
@@ -3573,8 +3606,8 @@ impl App {
                 if cancel_for_thread.load(Ordering::Relaxed) {
                     return;
                 }
-                let composite = match mask_source {
-                    EraseInpaintMaskSource::Prepared(composite) => composite,
+                let (composite, original) = match mask_source {
+                    EraseInpaintMaskSource::Prepared(composite) => (composite, original),
                     EraseInpaintMaskSource::Saved { db_path, page_key } => {
                         let db = match crate::mask_db::MaskDb::open_readonly_at(&db_path) {
                             Ok(db) => db,
@@ -3614,9 +3647,19 @@ impl App {
                             ctx_clone.request_repaint();
                             return;
                         }
-                        bitmap
+                        if cancel_for_thread.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let original = black_flatten_if_transparent(&original)
+                            .map(Arc::new)
+                            .unwrap_or(original);
+                        (bitmap, original)
                     }
                 };
+                if cancel_for_thread.load(Ordering::Relaxed) {
+                    return;
+                }
+                let mono_tone_axis = inpaint_mono_tone_axis(&original, mono_tolerance);
                 let runtime = match runtime_init
                     .wait_terminal_while(|| !cancel_for_thread.load(Ordering::Acquire))
                 {
