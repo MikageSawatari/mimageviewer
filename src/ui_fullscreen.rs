@@ -53099,12 +53099,11 @@ impl App {
     }
 
     pub(crate) fn fs_erase_complete(&self, idx: usize) -> bool {
-        // The edit base can exist before inpaint, including when a resized saved
-        // mask turns out empty. Only a current committed result proves completion.
+        // Preserve the master's base-based indication across retained-PDF eviction
+        // and pending inpaint. MaskAbsent clears presence without deleting edit bases.
         !self.erase_mode
-            && self
-                .erase_result_cache
-                .contains_key(&self.current_erase_result_key(idx))
+            && self.erase_base_cache.contains_key(&idx)
+            && self.mask_pages.contains(&idx)
     }
 
     /// フルスクリーン左下に AI 処理ステータスを表示する。

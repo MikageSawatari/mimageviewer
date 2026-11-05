@@ -6787,7 +6787,9 @@ Original新規要求にはcallerも記録する。source受理時だけで、毎
 書き換えない。新規jobは既存`MaterializeForEntry(MaterialOnly)`を使う。
 同じ入力の実体化完了で上段を消さず、実際のsource／mask変更は既存の世代更新と取消で扱う。
 独立レビューの空マスク指摘への対応では、縮小で空になった保存maskの存在情報だけを外し、編集用base／textureは保持する。
-実装担当のworker回帰で確認し、HUDの補完完了はbaseの有無ではなく現在世代の確定erase結果で判定する（製品実行は未確認）。
+再レビューでは保持PDFのfinal-AI復元時にerase結果だけが退去済みとなるため、HUDはmasterのbase有無と編集モード外の判定に`mask_pages`の存在条件だけを足す形へ戻した。
+補完pending中もmasterどおり表示し、`MaskAbsent`後や無描画で編集を終えた頁では表示しない。古いerase keyだけを理由にHUDを消す検査はこの契約に合わないため外した。
+実装担当の回帰はkeep-set退去→保持final復元→raw読込省略と空mask後のbase／texture保持を検査する。手動確定は存在情報を同期更新してから編集モードを解除する（製品実行は未確認）。
 
 組み合わせの簡素化として、目的別の呼出し追加や新pending／queueを作らず、source受理と
 既存Commitのkey照合へ集約した。閲覧のmodal化は入力や演出を制限するため採らない。

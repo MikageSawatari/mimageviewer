@@ -100,6 +100,118 @@ fn erase_prefetch_original_sources_start_saved_stage_before_page_turn() {
 }
 
 #[test]
+fn fs_erase_complete_survives_keep_set_eviction_and_retained_pdf_final_restore() {
+    let ctx = egui::Context::default();
+    let mut app = super::paged_prefetch_tests::pdf_book(&ctx);
+    app.mask_pages.insert(0);
+    let page_key = app.page_path_key(0).unwrap();
+    app.mask_page_keys.insert(page_key);
+    let pixels = app.current_raw_source_pixels(0).unwrap();
+    let base = app.capture_erase_base_source(0, Arc::clone(&pixels));
+    app.erase_base_cache.insert(0, base.clone());
+    let texture = ctx.load_texture(
+        "erase-hud-completed",
+        pixels.clone(),
+        DISPLAY_IMAGE_TEXTURE_OPTIONS,
+    );
+    let erase_key = app.current_erase_result_key(0);
+    app.erase_result_cache.insert(
+        erase_key,
+        EraseResultCacheEntry {
+            texture_options: DISPLAY_IMAGE_TEXTURE_OPTIONS,
+            display_basis: base.display_basis,
+            pixels,
+            texture,
+        },
+    );
+    let final_key = super::paged_prefetch_tests::retain_pdf_ai(&mut app, 0);
+    assert!(app.fs_erase_complete(0));
+    app.evict_final_pipeline_cache_for_keep_set(&std::collections::HashSet::from([1]));
+    assert!(app.erase_result_cache.is_empty());
+    assert!(app.erase_base_cache.contains_key(&0));
+    assert!(app.mask_pages.contains(&0));
+    assert!(app.has_retained_pdf_final_ai_for_current_params(0));
+    assert!(
+        app.restore_retained_pdf_final_ai_composite(&ctx, 0)
+            .is_some()
+    );
+    assert!(app.final_composite_cache[&final_key].complete);
+    // A known viewport prevents the loader's earlier "no display target" return.
+    app.fs_pdf_display_target = Some(crate::pdf_loader::PdfDisplayTarget {
+        width_px: 4,
+        height_px: 6,
+        fit_mode: crate::pdf_loader::PdfDisplayFitMode::Page,
+    });
+    app.start_fs_load(0); // Retained final-AI bypasses the normal raw PDF load.
+    assert!(app.fs_pending.is_empty());
+    assert!(app.current_raw_source_pixels(0).is_none());
+    assert!(app.erase_result_cache.is_empty());
+    assert!(app.erase_inpaint_pending.is_empty());
+    assert!(
+        app.fs_erase_complete(0),
+        "retained erased display keeps the master HUD indication"
+    );
+    app.erase_mode = true;
+    assert!(!app.fs_erase_complete(0));
+}
+
+#[test]
+fn fs_erase_complete_manual_commit_publishes_mask_before_leaving_edit_mode() {
+    for from_preview in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = super::paged_prefetch_tests::pdf_book(&ctx);
+        app.show_whats_new = false;
+        app.show_mouse_nav_migration_prompt = false;
+        app.network_data_dir_notice = None;
+        app.fullscreen_idx = Some(0);
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        app.ai_runtime_init =
+            crate::ai::runtime::AiRuntimeInitOwner::failed_for_test("manual HUD commit");
+        app.mask_db = Some(crate::mask_db::MaskDb::open().unwrap());
+        app.enter_erase_mode(0);
+        assert!(app.erase_mode);
+        app.execute_erase_inpaint(&ctx, 0); // Entering and leaving without painting is not completion.
+        assert!(!app.erase_mode);
+        assert!(app.erase_base_cache.contains_key(&0));
+        assert!(!app.mask_pages.contains(&0));
+        assert!(!app.fs_erase_complete(0));
+        app.enter_erase_mode(0);
+        assert!(app.erase_mode);
+        app.erase_mask.as_mut().unwrap()[9] = true;
+        if from_preview {
+            let base = app.erase_base_cache[&0].clone();
+            let texture = ctx.load_texture(
+                "erase-hud-preview",
+                base.pixels.clone(),
+                DISPLAY_IMAGE_TEXTURE_OPTIONS,
+            );
+            app.erase_preview_cache.insert(
+                0,
+                ErasePreviewCacheEntry {
+                    display_basis: base.display_basis,
+                    pixels: base.pixels,
+                    texture,
+                },
+            );
+        }
+        assert!(!app.fs_erase_complete(0));
+        app.execute_erase_inpaint(&ctx, 0);
+        assert!(!app.erase_mode);
+        assert!(app.mask_pages.contains(&0));
+        assert!(app.mask_page_keys.contains(&app.page_path_key(0).unwrap()));
+        assert_eq!(app.current_erase_result_pixels(0).is_some(), from_preview);
+        assert_eq!(
+            app.commit_pending_matches_current_erase_key(0),
+            !from_preview
+        );
+        assert!(
+            app.fs_erase_complete(0),
+            "manual commit publishes presence before HUD resumes"
+        );
+    }
+}
+
+#[test]
 fn erase_prefetch_resized_empty_mask_never_reports_hud_completion_or_removes_edit_base() {
     for preserve_edit_base in [false, true] {
         let ctx = egui::Context::default();
@@ -165,7 +277,7 @@ fn erase_prefetch_resized_empty_mask_never_reports_hud_completion_or_removes_edi
         }
         assert!(
             !app.fs_erase_complete(0),
-            "an edit base without a completed erase result must not light the HUD"
+            "an edit base for an absent saved mask must not light the HUD"
         );
     }
 }
@@ -296,11 +408,6 @@ fn erase_prefetch_source_acceptance_is_purpose_independent_and_idempotent() {
         app.erase_mode = true;
         assert!(!app.fs_erase_complete(0));
         app.erase_mode = false;
-        // A retained entry for a previous key is not a current completion.
-        let input_generation = app.input_generation.get(&0).copied().unwrap_or(0);
-        app.input_generation.insert(0, input_generation + 1);
-        assert!(!app.fs_erase_complete(0));
-        app.input_generation.insert(0, input_generation);
         if matches!(purpose, FsLoadPurpose::Original { .. }) {
             assert_eq!(app.current_edit_result_key(0), before);
             assert!(Arc::ptr_eq(
