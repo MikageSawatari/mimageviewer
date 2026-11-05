@@ -1063,6 +1063,75 @@ fn agent_registration_long_confirmation_controls_and_scroll_small_200_percent() 
 }
 
 #[test]
+fn agent_registration_long_confirmation_vertical_resize_stays_shrunk() {
+    use crate::test_ui::scroll_layout::HeightExpectation;
+    for scale in [1.0, 2.0] {
+        let mut state = injected(&Settings::default());
+        if let DetectionState::Ready(_, detection) = &mut state.detection {
+            detection.apps[0].config_paths = vec![PathBuf::from(format!(
+                r"C:\{}\config.json",
+                "長いフォルダ名\\".repeat(100)
+            ))];
+        }
+        state.confirm(AppTarget::ClaudeDesktop, Action::Register, 0);
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1093.0, 614.0))
+            .with_context_setup(move |ctx| {
+                crate::ui_fonts::configure_fonts(ctx);
+                crate::settings::apply_ui_scale_factor(ctx, scale);
+            })
+            .build_ui_state(
+                |root, state| draw_registration_dialog(root.ctx(), state, false, false, false),
+                state,
+            );
+        harness.run_steps(8);
+        let window_rect = |harness: &egui_kittest::Harness<'_, AgentIntegrationState>| {
+            harness
+                .ctx
+                .memory(|memory| memory.area_rect(egui::Id::new("agent_registration_confirmation")))
+                .unwrap()
+        };
+        let original = window_rect(&harness);
+        // Drag the bottom edge vertically, retaining the width and title position.
+        let start = egui::pos2(original.center().x, original.bottom() - 1.0);
+        let end = start - egui::vec2(0.0, original.height() * 0.3);
+        harness.hover_at(start);
+        harness.run_steps(1);
+        harness.drag_at(start);
+        harness.run_steps(1);
+        harness.hover_at(end);
+        harness.run_steps(2);
+        harness.drop_at(end);
+        harness.run_steps(2);
+        let shrunk = window_rect(&harness);
+        assert!(
+            shrunk.height() < original.height() - 20.0,
+            "resize must shrink the actual window: {original:?} -> {shrunk:?}"
+        );
+        let footer = harness.get_by_label("キャンセル").rect();
+        for frame in 0..40 {
+            harness.run_steps(1);
+            assert_eq!(window_rect(&harness), shrunk, "frame={frame} scale={scale}");
+            assert_eq!(harness.get_by_label("キャンセル").rect(), footer);
+            for label in ["書き換える", "キャンセル", "Close window"] {
+                let rect = harness.get_by_label(label).rect();
+                assert!(
+                    shrunk.contains_rect(rect) && harness.ctx.content_rect().contains_rect(rect)
+                );
+            }
+        }
+        harness.state().dialog_scroll.unwrap().assert_height(
+            HeightExpectation::Scrolls,
+            shrunk,
+            harness.ctx.pixels_per_point(),
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(2);
+        assert!(harness.state().operation.is_none());
+    }
+}
+
+#[test]
 fn agent_integration_window_small_200_percent_controls_and_end_reachable() {
     use crate::test_ui::scroll_layout::HeightExpectation;
     for scale in [1.0, 2.0] {

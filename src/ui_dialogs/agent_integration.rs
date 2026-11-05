@@ -787,12 +787,14 @@ fn draw_registration_dialog(
         .open(&mut open)
         .show(ctx, |ui| {
             let footer =
-                super::startup_dialog_footer_height(ui, &["書き換える", "キャンセル"], 0.0);
-            // Use the viewport, never this resizable Window's previous content height.
-            // Reserving the measured footer prevents a body/footer sizing feedback loop.
+                super::startup_dialog_footer_height(ui, &["書き換える", "キャンセル"], 6.0);
+            // Respect the current resize allocation as well as the viewport.
+            // Include the separator so the footer cannot grow the Window again.
             let frame = egui::Frame::window(ui.style()).total_margin();
             let body_height =
-                (screen.bottom() - 24.0 - frame.bottom - ui.cursor().top() - footer).max(1.0);
+                (screen.bottom() - 24.0 - frame.bottom - ui.cursor().top() - footer)
+                    .min(ui.available_height() - footer)
+                    .max(1.0);
             ui.spacing_mut().scroll =
                 super::non_overlapping_dialog_scroll_style(panel_scroll_style());
             let output = egui::ScrollArea::vertical()

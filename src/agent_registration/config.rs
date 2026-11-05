@@ -9,12 +9,29 @@ use std::fmt;
 enum Json {
     Object(Vec<(String, Json)>),
     Array(Vec<Json>),
-    Scalar(serde_json::Value),
+    // Keep terminal JSON tokens verbatim: even a valid JSON number may exceed
+    // f64/u64, and decoding/re-encoding can change ordinary decimal values.
+    Scalar(Box<serde_json::value::RawValue>),
 }
 
 impl<'de> Deserialize<'de> for Json {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Ordered;
+        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        Self::from_raw(raw, 0).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Json {
+    fn from_raw(raw: Box<serde_json::value::RawValue>, depth: usize) -> serde_json::Result<Self> {
+        // Each container has its own deserializer, so retain the original
+        // bounded nesting rather than resetting serde_json's recursion budget.
+        let container = matches!(raw.get().as_bytes().first(), Some(b'{' | b'['));
+        if container && depth >= 127 {
+            return Err(serde::de::Error::custom("JSON recursion limit exceeded"));
+        }
+        struct Ordered {
+            depth: usize,
+        }
         impl<'de> Visitor<'de> for Ordered {
             type Value = Json;
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -22,46 +39,39 @@ impl<'de> Deserialize<'de> for Json {
             }
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Json, A::Error> {
                 let mut entries = Vec::new();
-                while let Some(entry) = map.next_entry::<String, Json>()? {
+                while let Some((key, raw)) =
+                    map.next_entry::<String, Box<serde_json::value::RawValue>>()?
+                {
                     // Duplicate keys have application-dependent meaning. Refuse to
                     // rewrite such a file instead of leaving a second registration.
-                    if entries.iter().any(|(key, _)| key == &entry.0) {
+                    if entries.iter().any(|(existing, _)| existing == &key) {
                         return Err(serde::de::Error::custom("duplicate JSON key"));
                     }
-                    entries.push(entry);
+                    let value =
+                        Json::from_raw(raw, self.depth + 1).map_err(serde::de::Error::custom)?;
+                    entries.push((key, value));
                 }
                 Ok(Json::Object(entries))
             }
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Json, A::Error> {
                 let mut values = Vec::new();
-                while let Some(value) = seq.next_element()? {
-                    values.push(value);
+                while let Some(raw) = seq.next_element::<Box<serde_json::value::RawValue>>()? {
+                    values.push(
+                        Json::from_raw(raw, self.depth + 1).map_err(serde::de::Error::custom)?,
+                    );
                 }
                 Ok(Json::Array(values))
             }
-            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Json, E> {
-                Ok(Json::Scalar(value.into()))
-            }
-            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Json, E> {
-                Ok(Json::Scalar(value.into()))
-            }
-            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Json, E> {
-                Ok(Json::Scalar(value.into()))
-            }
-            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Json, E> {
-                Ok(Json::Scalar(serde_json::Value::from(value)))
-            }
-            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Json, E> {
-                Ok(Json::Scalar(value.into()))
-            }
-            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Json, E> {
-                Ok(Json::Scalar(value.into()))
-            }
-            fn visit_unit<E: serde::de::Error>(self) -> Result<Json, E> {
-                Ok(Json::Scalar(serde_json::Value::Null))
-            }
         }
-        deserializer.deserialize_any(Ordered)
+        match raw.get().as_bytes().first() {
+            Some(b'{') => {
+                serde_json::Deserializer::from_str(raw.get()).deserialize_map(Ordered { depth })
+            }
+            Some(b'[') => {
+                serde_json::Deserializer::from_str(raw.get()).deserialize_seq(Ordered { depth })
+            }
+            _ => Ok(Self::Scalar(raw)),
+        }
     }
 }
 
@@ -100,8 +110,29 @@ impl Json {
             _ => Err("設定ファイルの形式を読めません".into()),
         }
     }
-    fn value(&self) -> serde_json::Value {
-        serde_json::to_value(self).expect("valid JSON")
+    fn string(value: &str) -> Self {
+        Self::Scalar(serde_json::value::to_raw_value(value).expect("valid JSON string"))
+    }
+    fn decoded_string(&self) -> Option<String> {
+        match self {
+            Self::Scalar(raw) => serde_json::from_str(raw.get()).ok(),
+            _ => None,
+        }
+    }
+    fn matches_command(&self, command: &RegistrationCommand) -> bool {
+        self.get("command")
+            .and_then(Self::decoded_string)
+            .as_deref()
+            == Some(command.command.as_str())
+            && self.get("args").is_some_and(|args| match args {
+                Self::Array(args) => {
+                    args.len() == command.args.len()
+                        && args.iter().zip(&command.args).all(|(actual, expected)| {
+                            actual.decoded_string().as_deref() == Some(expected.as_str())
+                        })
+                }
+                _ => false,
+            })
     }
 }
 
@@ -146,37 +177,30 @@ pub(super) fn state(
         AppTarget::ClaudeDesktop => parse_json(text)?
             .get("mcpServers")
             .and_then(|v| v.get("mimageviewer"))
-            .map(Json::value),
+            .map(|item| command.is_some_and(|command| item.matches_command(command))),
         AppTarget::ChatGpt => {
             let doc = parse_toml(text)?;
             doc.get("mcp_servers")
                 .and_then(|t| t.get("mimageviewer"))
                 .map(|item| {
                     let cmd = item.get("command").and_then(toml_edit::Item::as_str);
-                    let args = item
-                        .get("args")
-                        .and_then(toml_edit::Item::as_array)
-                        .map(|array| array.iter().map(|v| v.as_str()).collect::<Option<Vec<_>>>());
-                    match (cmd, args) {
-                        (Some(cmd), Some(Some(args))) => {
-                            serde_json::json!({"command":cmd,"args":args})
-                        }
-                        _ => serde_json::Value::Null,
-                    }
+                    let args = item.get("args").and_then(toml_edit::Item::as_array);
+                    command.is_some_and(|command| {
+                        cmd == Some(command.command.as_str())
+                            && args.is_some_and(|args| {
+                                args.len() == command.args.len()
+                                    && args.iter().zip(&command.args).all(|(actual, expected)| {
+                                        actual.as_str() == Some(expected.as_str())
+                                    })
+                            })
+                    })
                 })
         }
     };
     Ok(match actual {
         None => RegistrationState::Unregistered,
-        Some(actual)
-            if command.is_some_and(|cmd| {
-                actual.get("command") == Some(&serde_json::json!(cmd.command))
-                    && actual.get("args") == Some(&serde_json::json!(cmd.args))
-            }) =>
-        {
-            RegistrationState::Registered
-        }
-        Some(_) => RegistrationState::DifferentTarget,
+        Some(true) => RegistrationState::Registered,
+        Some(false) => RegistrationState::DifferentTarget,
     })
 }
 
@@ -209,19 +233,10 @@ pub(super) fn edit(
                 }
                 Action::Register => {
                     let value = Json::Object(vec![
-                        (
-                            "command".into(),
-                            Json::Scalar(command.command.clone().into()),
-                        ),
+                        ("command".into(), Json::string(&command.command)),
                         (
                             "args".into(),
-                            Json::Array(
-                                command
-                                    .args
-                                    .iter()
-                                    .map(|s| Json::Scalar(s.clone().into()))
-                                    .collect(),
-                            ),
+                            Json::Array(command.args.iter().map(|s| Json::string(s)).collect()),
                         ),
                     ]);
                     if let Some(index) = existing {

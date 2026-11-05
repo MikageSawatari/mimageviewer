@@ -194,8 +194,8 @@ fn json_registration_preserves_pretty_indentation_line_endings_and_other_bytes()
         command: r"C:\日本語\mimageviewer.exe".into(),
         args: vec!["--mcp".into(), "--data-dir".into(), r"C:\profile".into()],
     };
-    // Canonical JSON.stringify-style scalar spellings: compare complete text so
-    // unrelated values, number spellings, order and whitespace must all survive.
+    // Compare complete text, including terminal tokens which cannot round-trip
+    // through f64/u64 or have distinct escape/number spellings.
     let base = r#"{
   "preferences": {
     "chromeExtension": true,
@@ -208,6 +208,15 @@ fn json_registration_preserves_pretty_indentation_line_endings_and_other_bytes()
         -2.5,
         9007199254740991,
         9007199254740992,
+        0.12345678901234567,
+        18446744073709551617,
+        -0,
+        1e400,
+        1E+21,
+        1.0,
+        100000000000000000000,
+        5e-324,
+        "é\/😀\u00e9\ud83d\ude00",
         "quote: \" backslash: \\ newline: \n",
         {},
         [],
@@ -332,6 +341,238 @@ fn json_registration_preserves_pretty_indentation_line_endings_and_other_bytes()
         config::edit(AppTarget::ClaudeDesktop, "{}", Action::Register, &command).unwrap();
     assert!(minified.starts_with("{\n  \"mcpServers\""));
     assert!(!minified.ends_with('\n'));
+}
+
+/// Independent fixture scanner: neither RawValue nor serde_json::Value is used
+/// to build the preservation oracle. Object keys identify the excluded subtree;
+/// all remaining leaf tokens are compared as their original UTF-8 bytes.
+fn external_json_leaf_tokens(text: &str) -> Vec<(Vec<String>, String)> {
+    struct Scanner<'a> {
+        text: &'a str,
+        offset: usize,
+    }
+    impl Scanner<'_> {
+        fn whitespace(&mut self) {
+            while self
+                .text
+                .as_bytes()
+                .get(self.offset)
+                .is_some_and(u8::is_ascii_whitespace)
+            {
+                self.offset += 1;
+            }
+        }
+        fn quoted(&mut self) -> &str {
+            let start = self.offset;
+            assert_eq!(self.text.as_bytes()[self.offset], b'"');
+            self.offset += 1;
+            loop {
+                match self.text.as_bytes()[self.offset] {
+                    b'\\' => self.offset += 2,
+                    b'"' => {
+                        self.offset += 1;
+                        return &self.text[start..self.offset];
+                    }
+                    _ => self.offset += 1,
+                }
+            }
+        }
+        fn value(&mut self, path: &mut Vec<String>, tokens: &mut Vec<(Vec<String>, String)>) {
+            self.whitespace();
+            match self.text.as_bytes()[self.offset] {
+                b'{' => {
+                    self.offset += 1;
+                    self.whitespace();
+                    if self.text.as_bytes()[self.offset] == b'}' {
+                        self.offset += 1;
+                        return;
+                    }
+                    loop {
+                        let key = self.quoted().to_owned();
+                        self.whitespace();
+                        assert_eq!(self.text.as_bytes()[self.offset], b':');
+                        self.offset += 1;
+                        path.push(key);
+                        self.value(path, tokens);
+                        path.pop();
+                        self.whitespace();
+                        match self.text.as_bytes()[self.offset] {
+                            b'}' => {
+                                self.offset += 1;
+                                break;
+                            }
+                            b',' => {
+                                self.offset += 1;
+                                self.whitespace();
+                            }
+                            _ => panic!("invalid fixture object"),
+                        }
+                    }
+                }
+                b'[' => {
+                    self.offset += 1;
+                    self.whitespace();
+                    if self.text.as_bytes()[self.offset] == b']' {
+                        self.offset += 1;
+                        return;
+                    }
+                    let mut index = 0;
+                    loop {
+                        path.push(format!("[{index}]"));
+                        self.value(path, tokens);
+                        path.pop();
+                        index += 1;
+                        self.whitespace();
+                        match self.text.as_bytes()[self.offset] {
+                            b']' => {
+                                self.offset += 1;
+                                break;
+                            }
+                            b',' => self.offset += 1,
+                            _ => panic!("invalid fixture array"),
+                        }
+                    }
+                }
+                _ => {
+                    let start = self.offset;
+                    if self.text.as_bytes()[self.offset] == b'"' {
+                        self.quoted();
+                    } else {
+                        while self.text.as_bytes().get(self.offset).is_some_and(|b| {
+                            !b.is_ascii_whitespace() && !matches!(*b, b',' | b']' | b'}')
+                        }) {
+                            self.offset += 1;
+                        }
+                    }
+                    if !(path.first().is_some_and(|p| p == "\"mcpServers\"")
+                        && path.get(1).is_some_and(|p| p == "\"mimageviewer\""))
+                    {
+                        tokens.push((path.clone(), self.text[start..self.offset].to_owned()));
+                    }
+                }
+            }
+        }
+    }
+    let mut scanner = Scanner { text, offset: 0 };
+    let mut tokens = Vec::new();
+    scanner.value(&mut Vec::new(), &mut tokens);
+    scanner.whitespace();
+    assert_eq!(scanner.offset, text.len());
+    tokens
+}
+
+#[test]
+fn registration_preservation_raw_json_tokens_and_state_across_lifecycle() {
+    let command = RegistrationCommand {
+        command: "miv".into(),
+        args: vec!["--mcp".into()],
+    };
+    let external = r#"[0.12345678901234567,18446744073709551617,-0,1e400,1E+21,1.0,100000000000000000000,5e-324,"é\/😀\u00e9\ud83d\ude00",true,false,null,{"inner":[0.1,{},[]]}]"#;
+    for servers in [
+        "".to_owned(),
+        format!(r#", "mcpServers":{{"other":{{"values":{external}}}}}"#),
+        format!(
+            r#", "mcpServers":{{"other":{{"values":{external}}},"mimageviewer":{{"command":"old","args":[],"extra":1e400}}}}"#
+        ),
+    ] {
+        let original = format!(r#"{{"preferences":{external},"tail":"keep"{servers}}}"#);
+        let expected = external_json_leaf_tokens(&original);
+        assert!(!expected.is_empty());
+        let mut text = original;
+        for action in [
+            Action::Register,
+            Action::Register,
+            Action::Remove,
+            Action::Register,
+            Action::Remove,
+        ] {
+            text = config::edit(AppTarget::ClaudeDesktop, &text, action, &command).unwrap();
+            assert_eq!(external_json_leaf_tokens(&text), expected, "{action:?}");
+            assert_eq!(
+                config::state(AppTarget::ClaudeDesktop, &text, Some(&command)).unwrap(),
+                if action == Action::Register {
+                    RegistrationState::Registered
+                } else {
+                    RegistrationState::Unregistered
+                }
+            );
+        }
+    }
+    // Even inside this app's entry, unrelated large values are never decoded
+    // to Value. Inspect only the command string and string-array arguments.
+    for (entry, expected) in [
+        (
+            r#"{"command":"m\u0069v","args":["--\u006dcp"],"extra":1e400,"nested":{"large":18446744073709551617}}"#,
+            RegistrationState::Registered,
+        ),
+        (
+            r#"{"command":"old","args":["--mcp"],"extra":1e400}"#,
+            RegistrationState::DifferentTarget,
+        ),
+        (
+            r#"{"command":1e400,"args":["--mcp"]}"#,
+            RegistrationState::DifferentTarget,
+        ),
+        (
+            r#"{"command":"miv","args":[18446744073709551617]}"#,
+            RegistrationState::DifferentTarget,
+        ),
+        ("1e400", RegistrationState::DifferentTarget),
+    ] {
+        let text =
+            format!(r#"{{"preferences":{external},"mcpServers":{{"mimageviewer":{entry}}}}}"#);
+        assert_eq!(
+            config::state(AppTarget::ClaudeDesktop, &text, Some(&command)).unwrap(),
+            expected
+        );
+        assert_eq!(
+            config::state(AppTarget::ClaudeDesktop, &text, None).unwrap(),
+            RegistrationState::DifferentTarget
+        );
+    }
+}
+
+#[test]
+fn raw_json_editor_rejects_duplicate_keys_bom_invalid_containers_and_excessive_nesting() {
+    let command = RegistrationCommand {
+        command: "miv".into(),
+        args: vec![],
+    };
+    let valid_depth = format!("{{\"nested\":{}0{}}}", "[".repeat(126), "]".repeat(126));
+    let valid_empty_depth = format!("{{\"nested\":{}{}}}", "[".repeat(126), "]".repeat(126));
+    for valid in [&valid_depth, &valid_empty_depth] {
+        assert_eq!(
+            config::state(AppTarget::ClaudeDesktop, valid, Some(&command)).unwrap(),
+            RegistrationState::Unregistered
+        );
+    }
+    let deep = format!("{{\"nested\":{}0{}}}", "[".repeat(127), "]".repeat(127));
+    let deep_empty = format!("{{\"nested\":{}{}}}", "[".repeat(127), "]".repeat(127));
+    for invalid in [
+        r#"{"duplicate":1,"duplicate":2}"#,
+        r#"{"nested":[{"duplicate":1,"duplic\u0061te":2}]}"#,
+        r#"{"mcpServers":{"mimageviewer":{"command":"old","command":"other"}}}"#,
+        r#"{"mcpServers":{},"mcp\u0053ervers":{}}"#,
+        r#"{"mcpServers":[]}"#,
+        r#"{"mcpServers":null}"#,
+        r#"{"mcpServers":1e400}"#,
+        "\u{feff}{}",
+        "[]",
+        "{} trailing",
+        &deep,
+        &deep_empty,
+    ] {
+        assert!(
+            config::state(AppTarget::ClaudeDesktop, invalid, Some(&command)).is_err(),
+            "{invalid}"
+        );
+        for action in [Action::Register, Action::Remove] {
+            assert!(
+                config::edit(AppTarget::ClaudeDesktop, invalid, action, &command).is_err(),
+                "{invalid}"
+            );
+        }
+    }
 }
 
 fn fixture() -> (tempfile::TempDir, RegistrationEnvironment) {
@@ -894,10 +1135,7 @@ fn real_file_reread_backup_replace_and_remove_use_only_injected_temporary_paths(
                 .unwrap()
                 .contains("external")
         );
-        let remove = WriteRequest {
-            action: Action::Remove,
-            ..request
-        };
+        let remove = app(&detect(&env), target).remove_request().unwrap();
         write_with_processes(&env, &remove, || Ok(vec![])).unwrap();
         assert_eq!(
             app(&detect(&env), target).state,
@@ -907,6 +1145,130 @@ fn real_file_reread_backup_replace_and_remove_use_only_injected_temporary_paths(
             fs::read_to_string(&remove.path)
                 .unwrap()
                 .contains("external")
+        );
+    }
+}
+
+#[test]
+fn write_rejects_changed_summary_before_touching_config_backup_or_directory() {
+    for target in [AppTarget::ClaudeDesktop, AppTarget::ChatGpt] {
+        let (_temp, env) = fixture();
+        let command = env.resolve_command().unwrap();
+        let current = command.snippet(target);
+        let other = RegistrationCommand {
+            command: "other-location".into(),
+            args: vec![],
+        }
+        .snippet(target);
+        for (original, external, action, confirmed) in [
+            (
+                "",
+                current.as_str(),
+                Action::Register,
+                RegistrationChange::Add,
+            ),
+            (
+                "",
+                other.as_str(),
+                Action::Register,
+                RegistrationChange::Add,
+            ),
+            (
+                current.as_str(),
+                "",
+                Action::Remove,
+                RegistrationChange::Remove,
+            ),
+            (
+                current.as_str(),
+                other.as_str(),
+                Action::Register,
+                RegistrationChange::Unchanged,
+            ),
+            (
+                other.as_str(),
+                current.as_str(),
+                Action::Register,
+                RegistrationChange::Replace,
+            ),
+        ] {
+            let path = env.working_dir.join("config");
+            let backup = env.working_dir.join("config.mimageviewer.bak");
+            let change = config::change(target, original, action, &command).unwrap();
+            assert_eq!(change, confirmed);
+            let request = WriteRequest {
+                target,
+                path: path.clone(),
+                action,
+                command: command.clone(),
+                change,
+            };
+            fs::write(&path, external).unwrap();
+            fs::write(&backup, "existing-backup").unwrap();
+            assert_eq!(
+                write_with_processes(&env, &request, || Ok(vec![])).unwrap_err(),
+                "設定ファイルが確認後に変わりました。もう一度確認してください",
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), external);
+            assert_eq!(fs::read_to_string(&backup).unwrap(), "existing-backup");
+        }
+        // A removed file must not be recreated (or its parent created) for a
+        // confirmation whose operation no longer matches the current content.
+        let path = env.working_dir.join("absent-parent/config");
+        let request = WriteRequest {
+            target,
+            path: path.clone(),
+            action: Action::Remove,
+            command: command.clone(),
+            change: RegistrationChange::Remove,
+        };
+        assert_eq!(
+            write_with_processes(&env, &request, || Ok(vec![])).unwrap_err(),
+            "設定ファイルが確認後に変わりました。もう一度確認してください"
+        );
+        assert!(!path.parent().unwrap().exists());
+    }
+}
+
+#[test]
+fn write_allows_format_changes_with_the_same_summary_and_backs_up_reread_bytes() {
+    for target in [AppTarget::ClaudeDesktop, AppTarget::ChatGpt] {
+        let (_temp, env) = fixture();
+        let command = env.resolve_command().unwrap();
+        let (original, external) = match target {
+            AppTarget::ClaudeDesktop => (
+                "{\n  \"preferences\": {\n    \"keep\": true\n  }\n}\n",
+                "{\r\n\t\"preferences\": {\r\n\t\t\"keep\": true\r\n\t}\r\n}\r\n",
+            ),
+            AppTarget::ChatGpt => ("# keep\nmodel = 'test'\n", "# keep\r\nmodel = 'test'\r\n"),
+        };
+        let change = config::change(target, original, Action::Register, &command).unwrap();
+        assert_eq!(change, RegistrationChange::Add);
+        assert_eq!(
+            config::change(target, external, Action::Register, &command).unwrap(),
+            change
+        );
+        let path = env.working_dir.join("config");
+        let request = WriteRequest {
+            target,
+            path: path.clone(),
+            action: Action::Register,
+            command: command.clone(),
+            change,
+        };
+        fs::write(&path, external).unwrap();
+        write_with_processes(&env, &request, || Ok(vec![])).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            config::edit(target, external, Action::Register, &command).unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(env.working_dir.join("config.mimageviewer.bak")).unwrap(),
+            external
+        );
+        assert_eq!(
+            config::state(target, &fs::read_to_string(path).unwrap(), Some(&command)).unwrap(),
+            RegistrationState::Registered
         );
     }
 }

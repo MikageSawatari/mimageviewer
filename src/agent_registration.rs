@@ -419,6 +419,11 @@ fn write_with_processes(
         return Err("設定ファイルのパスを確認できません".into());
     }
     let original = read_config(&request.path)?;
+    if config::change(request.target, &original, request.action, &request.command)?
+        != request.change
+    {
+        return Err("設定ファイルが確認後に変わりました。もう一度確認してください".into());
+    }
     let edited = config::edit(request.target, &original, request.action, &request.command)?;
     let parent = request
         .path
