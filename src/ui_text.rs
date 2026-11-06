@@ -2295,21 +2295,25 @@ impl App {
         let editing_text = ctx.memory(|m| m.focused().is_some());
 
         // Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z: エディタ専用 Undo/Redo (D7)。
-        // テキスト入力中のウィジェット (TextEdit) が **キーボード入力を要求している間**は
-        // egui に Ctrl+Z を委ねて (= 消費しない) フィールド内テキストの undo を壊さない。
-        // 判定は `wants_keyboard_input()` を使う (ラボと同じ。`focused().is_some()` だと
-        // ボタン / スライダーへのフォーカスでも抑制してしまい、TextEdit でもないのに
-        // comic undo が効かなくなる — Codex P3)。フィールド外の編集 (追加 / 削除 / 移動 /
-        // 変形 / パネル操作) のみここで undo する。
+        // 専用 permit が TextEdit / IME / popup / modal の所有を保ち、通常の
+        // ボタン・スライダー focus 中はフィールド外の編集を undo できる。
         // **メタ undo との非干渉**: テキストモード中は `handle_fs_key_input` がこの関数で
         // return するため、ここで消費しなかった key も含めて `handle_meta_undo_keys`
         // (レーティング/タグ undo) には決して到達しない。
         // consume 順は `handle_meta_undo_keys` と同じ: Ctrl+Shift+Z (redo) → Ctrl+Y (redo)
         // → Ctrl+Z (undo)。`Modifiers::CTRL` 指定の consume は Shift 併用 Z も拾うため
         // redo を先に握り、Ctrl+Shift+Z が undo 側へ流れないようにする。
-        if !ctx.egui_wants_keyboard_input() {
-            let redo = self.keymap.consume_action(ctx, KeyAction::TextRedo);
-            let undo = self.keymap.consume_action(ctx, KeyAction::TextUndo);
+        if let Some(permit) = self.edit_history_key_permit(ctx) {
+            let redo = self.keymap.consume_edit_history_key(
+                ctx,
+                permit,
+                crate::keymap::EditHistoryKey::Action(KeyAction::TextRedo),
+            );
+            let undo = self.keymap.consume_edit_history_key(
+                ctx,
+                permit,
+                crate::keymap::EditHistoryKey::Action(KeyAction::TextUndo),
+            );
             if undo {
                 self.do_comic_undo();
                 return action;

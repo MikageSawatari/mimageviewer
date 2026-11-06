@@ -7379,6 +7379,13 @@ pub struct Keymap {
     warnings: Vec<String>,
 }
 
+/// The limited inputs accepted by the edit-history ownership exception.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum EditHistoryKey {
+    Action(KeyAction),
+    MetaRedo,
+}
+
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DiagnosticChordPressSnapshot {
@@ -8632,6 +8639,57 @@ impl Keymap {
             }
         }
         false
+    }
+
+    /// Only edit history may bypass the general focused-widget shortcut gate.
+    /// Action bindings (including `none`) and native/egui twin consumption stay
+    /// identical to the ordinary keymap route. Meta Redo remains fixed input.
+    pub(crate) fn consume_edit_history_key(
+        &self,
+        ctx: &egui::Context,
+        permit: crate::keyboard_input::EditHistoryKeyPermit,
+        key: EditHistoryKey,
+    ) -> bool {
+        if !permit.allows(ctx) {
+            return false;
+        }
+        match key {
+            EditHistoryKey::Action(action) => {
+                if !matches!(
+                    action,
+                    KeyAction::UndoLastAction
+                        | KeyAction::EraseUndo
+                        | KeyAction::EraseRedo
+                        | KeyAction::ConcealUndo
+                        | KeyAction::ConcealRedo
+                        | KeyAction::TextUndo
+                        | KeyAction::TextRedo
+                ) {
+                    return false;
+                }
+                #[cfg(all(windows, feature = "test-script"))]
+                if crate::test_script::consume_pending_action(ctx, action) {
+                    return true;
+                }
+                self.effective_chords(action).into_iter().any(|chord| {
+                    if !self.consume_owned_chord(ctx, chord, true) {
+                        return false;
+                    }
+                    #[cfg(windows)]
+                    crate::key_debug::record_consumed_action(
+                        action,
+                        action.context(),
+                        chord,
+                        "consume_edit_history_key",
+                    );
+                    true
+                })
+            }
+            EditHistoryKey::MetaRedo => {
+                self.consume_owned_chord(ctx, Chord::ctrl_shift(KeyName::Z), true)
+                    || self.consume_owned_chord(ctx, Chord::ctrl(KeyName::Y), true)
+            }
+        }
     }
 
     /// Local-search input may navigate history with Alt chords while retaining text editing.
@@ -10827,6 +10885,73 @@ mod tests {
         begin_key_pass(&ctx, egui::Key::F16, egui::Modifiers::NONE);
         assert!(rebound.consume_action(&ctx, KeyAction::UndoLastAction));
         assert!(!rebound.consume_action(&ctx, KeyAction::UndoLastAction));
+        ctx.end_pass().drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn edit_history_permit_respects_rebinding_none_and_other_shortcut_gate() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        #[cfg(windows)]
+        let _clear = ClearTestKeyFrame;
+        for (ini, key, modifiers, expected) in [
+            ("", egui::Key::Z, egui::Modifiers::CTRL, true),
+            (
+                "[Global]\nUndoLastAction = F16\n",
+                egui::Key::Z,
+                egui::Modifiers::CTRL,
+                false,
+            ),
+            (
+                "[Global]\nUndoLastAction = F16\n",
+                egui::Key::F16,
+                egui::Modifiers::NONE,
+                true,
+            ),
+            (
+                "[Global]\nUndoLastAction = none\n",
+                egui::Key::Z,
+                egui::Modifiers::CTRL,
+                false,
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            let keymap = Keymap::from_ini_str(ini);
+            begin_key_pass(&ctx, key, modifiers);
+            let owner = crate::keyboard_input::KeyboardOwner::FocusedUi {
+                viewport: ctx.viewport_id(),
+                widget_id: egui::Id::unique("history-button"),
+            };
+            crate::keyboard_input::cache_keyboard_owner(&ctx, owner);
+            let permit = owner.edit_history_key_permit(false, false).unwrap();
+            assert!(!keymap.consume_action(&ctx, KeyAction::UndoLastAction));
+            assert_eq!(
+                keymap.consume_edit_history_key(
+                    &ctx,
+                    permit,
+                    EditHistoryKey::Action(KeyAction::UndoLastAction)
+                ),
+                expected,
+                "{ini} {key:?}"
+            );
+            assert_eq!(ctx.input(|i| i.key_pressed(key)), !expected);
+            ctx.end_pass().drop_without_applying_deltas();
+        }
+        let ctx = egui::Context::default();
+        begin_key_pass(&ctx, egui::Key::R, egui::Modifiers::NONE);
+        let owner = crate::keyboard_input::KeyboardOwner::FocusedUi {
+            viewport: ctx.viewport_id(),
+            widget_id: egui::Id::unique("history-slider"),
+        };
+        crate::keyboard_input::cache_keyboard_owner(&ctx, owner);
+        let permit = owner.edit_history_key_permit(false, false).unwrap();
+        assert!(!Keymap::default().consume_edit_history_key(
+            &ctx,
+            permit,
+            EditHistoryKey::Action(KeyAction::FsRotateCw)
+        ));
+        assert!(!Keymap::default().consume_action(&ctx, KeyAction::FsRotateCw));
+        assert!(ctx.input(|i| i.key_pressed(egui::Key::R)));
         ctx.end_pass().drop_without_applying_deltas();
     }
 

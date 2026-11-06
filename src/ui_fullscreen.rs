@@ -34867,14 +34867,12 @@ impl App {
                 self.show_context_shortcuts_help = true;
                 return action;
             }
-            // 多角形作成中の Ctrl+Z は頂点戻し。ただし consume_key は matches_logically 判定の
-            // ため Modifiers::CTRL 指定でも Ctrl+Shift+Z (やり直し) を吸ってしまう
-            // (undo_ops.rs handle_meta_undo_keys の注記と同じ罠)。そこでイベントの修飾子を
-            // matches_exact(CTRL) で完全一致判定し、Ctrl 単独の Z だけを消費する。Ctrl+Shift+Z は
-            // 残して下の handle_meta_undo_keys で redo へ流す。FS viewport で stale になる
-            // i.modifiers の状態読みは使わない。
+            // 多角形の頂点戻しは従来どおり固定 Ctrl+Z（完全一致）。履歴と共通の
+            // permit で TextEdit / IME / popup / modal の所有を保つ。
+            // Ctrl+Shift+Z は残り、下のメタ Redo へ流れる。
             if self.local_adjust_mask_tool == crate::app::LocalAdjustMaskTool::Polygon
                 && !self.local_adjust_mask_lasso_points.is_empty()
+                && self.edit_history_key_permit(ctx).is_some()
                 && ctx.input_mut(|i| {
                     let before = i.events.len();
                     i.events.retain(|e| {

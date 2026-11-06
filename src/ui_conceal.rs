@@ -692,7 +692,14 @@ impl App {
 
         // Redo は Ctrl+Shift+Z → Ctrl+Y → Ctrl+Z (Undo) の順に consume する。
         // Undo を先にすると Ctrl+Shift+Z が Undo 側へ流れ得る。
-        let redo = self.keymap.consume_action(ctx, KeyAction::ConcealRedo);
+        let history_permit = self.edit_history_key_permit(ctx);
+        let redo = history_permit.is_some_and(|permit| {
+            self.keymap.consume_edit_history_key(
+                ctx,
+                permit,
+                crate::keymap::EditHistoryKey::Action(KeyAction::ConcealRedo),
+            )
+        });
         if redo {
             if self.redo_conceal() {
                 self.show_feedback_toast("[やり直す]".to_string());
@@ -702,7 +709,13 @@ impl App {
         }
 
         // Ctrl+Z: Undo
-        let ctrl_z = self.keymap.consume_action(ctx, KeyAction::ConcealUndo);
+        let ctrl_z = history_permit.is_some_and(|permit| {
+            self.keymap.consume_edit_history_key(
+                ctx,
+                permit,
+                crate::keymap::EditHistoryKey::Action(KeyAction::ConcealUndo),
+            )
+        });
         if ctrl_z {
             if self.conceal_tool == ConcealTool::Polygon && !self.conceal_lasso_points.is_empty() {
                 if !self.admit_book_append_followup_mutation() {

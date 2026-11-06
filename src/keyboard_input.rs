@@ -138,6 +138,25 @@ impl FullscreenRawKeyPermit {
     }
 }
 
+/// Proof that this viewport's editor history may consume a key, even when a
+/// non-text widget has focus. Text input, modal UI and popups retain their keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EditHistoryKeyPermit {
+    viewport: egui::ViewportId,
+}
+
+impl EditHistoryKeyPermit {
+    pub(crate) fn allows(self, ctx: &egui::Context) -> bool {
+        self.viewport == ctx.viewport_id()
+    }
+}
+
+/// Memory retains popups before they draw; the pass also tracks newly drawn
+/// popups (including ones without a Memory open flag).
+pub(crate) fn popup_owns_keyboard(ctx: &egui::Context) -> bool {
+    egui::Popup::is_any_open(ctx) || ctx.any_popup_open()
+}
+
 /// Why a viewport pass may dispatch discrete keyboard input.
 ///
 /// Focus is only one possible proof. On Windows a key edge already stamped
@@ -333,6 +352,29 @@ pub(crate) const fn focused_key_state_permit_for_viewport(
 }
 
 impl KeyboardOwner {
+    pub(crate) const fn edit_history_key_permit(
+        self,
+        popup_open: bool,
+        text_edit_focused: bool,
+    ) -> Option<EditHistoryKeyPermit> {
+        if popup_open {
+            return None;
+        }
+        match self {
+            Self::ApplicationShortcut { scope } => Some(EditHistoryKeyPermit {
+                viewport: scope.viewport,
+            }),
+            // DragValue renders its internal TextEdit whenever an enabled
+            // widget has keyboard focus. Its persisted TextEditState also
+            // protects numeric editors absent from the helper text claim.
+            // A retained state is intentionally treated conservatively.
+            Self::FocusedUi { viewport, .. } if !text_edit_focused => {
+                Some(EditHistoryKeyPermit { viewport })
+            }
+            Self::Modal | Self::TextInput { .. } | Self::FocusedUi { .. } | Self::Unclaimed => None,
+        }
+    }
+
     pub const fn shortcut_permit(self) -> Option<ShortcutPermit> {
         match self {
             Self::ApplicationShortcut { scope } => Some(ShortcutPermit { scope }),
@@ -890,6 +932,73 @@ mod tests {
         ] {
             assert_eq!(owner.shortcut_permit(), None, "{owner:?}");
         }
+    }
+
+    #[test]
+    fn edit_history_key_permit_covers_every_owner_phase_popup_and_text_focus() {
+        let viewport = egui::ViewportId::ROOT;
+        let widget_id = egui::Id::unique("history-focus");
+        let mut owners = vec![
+            (KeyboardOwner::Modal, false),
+            (KeyboardOwner::Unclaimed, false),
+            (
+                KeyboardOwner::FocusedUi {
+                    viewport,
+                    widget_id,
+                },
+                true,
+            ),
+            (
+                KeyboardOwner::ApplicationShortcut {
+                    scope: scope(ShortcutSurface::Main),
+                },
+                true,
+            ),
+            (
+                KeyboardOwner::ApplicationShortcut {
+                    scope: scope(ShortcutSurface::Fullscreen),
+                },
+                true,
+            ),
+        ];
+        for phase in [
+            TextInputPhase::PendingFocus,
+            TextInputPhase::Focused,
+            TextInputPhase::FocusRecovery,
+            TextInputPhase::ImeComposing,
+        ] {
+            owners.push((
+                KeyboardOwner::TextInput {
+                    viewport,
+                    widget_id,
+                    phase,
+                },
+                false,
+            ));
+        }
+        for (owner, eligible) in owners {
+            for popup_open in [false, true] {
+                for text_edit_focused in [false, true] {
+                    let text_blocks =
+                        matches!(owner, KeyboardOwner::FocusedUi { .. }) && text_edit_focused;
+                    assert_eq!(
+                        owner
+                            .edit_history_key_permit(popup_open, text_edit_focused)
+                            .is_some(),
+                        eligible && !popup_open && !text_blocks,
+                        "{owner:?}, popup={popup_open}, text={text_edit_focused}"
+                    );
+                }
+            }
+        }
+        let ctx = egui::Context::default();
+        let sibling = KeyboardOwner::FocusedUi {
+            viewport: egui::ViewportId::from_hash_of("sibling"),
+            widget_id,
+        }
+        .edit_history_key_permit(false, false)
+        .unwrap();
+        assert!(!sibling.allows(&ctx));
     }
 
     #[test]

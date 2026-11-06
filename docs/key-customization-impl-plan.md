@@ -1,5 +1,19 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
+§1.681: 編集履歴専用の `EditHistoryKeyPermit` を keyboard owner から発行する。
+`ApplicationShortcut` と非テキスト `FocusedUi` のみを許可し、`TextInput` の全 phase /
+IME / `Modal` / `Unclaimed` は拒否する。popup は Memory の `Popup::is_any_open` と
+今 pass の `Context::any_popup_open` の両方を見て、owner の種類にかかわらず拒否する。
+`FocusedUi` は `Context::text_edit_focused()` が真でも拒否し、helper claim 外の
+TextEdit / DragValue の数値直接入力を保護する。persisted state の残存も保守的に拒否する。
+`decide_keyboard_owner` の分類自体は変更しない。
+App の発行入口を共通化し、keymap の `consume_edit_history_key` と補正多角形の
+頂点戻しだけがこの permit を使う。
+メタUndo / 固定Redo、消しゴム・隠蔽・テキスト専用Undo / Redoが対象。
+補正多角形の固定Ctrl+Zによる頂点戻しも、consume前に同じpermitを要求する。
+action の再割り当て・none、native / egui の同一入力のconsumeは既存経路を共有する。
+一般の `blocks_legacy_keymap_shortcuts` と `FullscreenRawKeyPermit` は変更しない。
+
 §1.714/§1.715（2026-11-05）: AI説明文作成と作成状況を「ツール」メニューへ追加。
 新しいKeyAction・既定キーは追加しない。進捗窓のEscは非モーダル窓内の固定操作で、表示だけを閉じる。
 旧Convert/Video設定の一度限りの整理はMenuLayoutSettingsの共通serde境界が所有する。

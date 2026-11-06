@@ -397,6 +397,21 @@ OS/egui のclipboardイベント自体、D&D、IME 確定、右クリック操�
 消しゴム・隠蔽・テキスト等の編集専用Undoと、TextEdit / IME / ダイアログの入力所有を優先する。
 メタデータRedoの `Ctrl+Y` / `Ctrl+Shift+Z` は固定入力のまま維持する。
 
+編集の Undo / Redo は、ボタン・スライダー・チェックボックス・ラジオ・トグルなど通常の
+非テキスト `FocusedUi` にも通す（§1.681）。パネル操作の focus だけで画像編集の履歴を
+取り消せなくなるのを避けるためで、補正パネルに限らず main 一覧のメタUndoも同じ規則とする。
+TextEdit（DragValue の数値直接入力を含む）の全 phase、IME 変換中、ドロップダウン /
+ComboBox / メニュー / コンテキストメニューの popup、modal は引き続き入力を所有する。
+`EditHistoryKeyPermit` で編集履歴の consume だけを許可し、他の keymap 操作の
+`FocusedUi` 抑止や固定 Esc / 矢印の raw-key permit は変えない。
+`UndoLastAction` と編集モード専用 Undo / Redo は再割り当て・`none` を尊重する。
+補正の多角形の頂点戻しは固定 Ctrl+Z の意味を保ち、同じ permit 判定を通す。
+helper の `TextInput` claim に載らない TextEdit は `Context::text_edit_focused()`
+（現在の focus ID の `TextEditState` の有無）で識別し、`FocusedUi` でも permit を出さない。
+有効な DragValue は keyboard focus を得ると直ちに内部 TextEdit に切り替わるため、
+数値直接入力もこの条件で保護される。state は永続化されるため、同じ ID に残る state でも
+保守的に拒否する。owner 自体を `TextInput` に変更せず、他の shortcut の判定には波及させない。
+
 ゲームパッド全体は `Settings::gamepad_enabled` で無効にできる (操作カスタマイズ →
 設定 → ゲームパッド)。これは割り当ての変更ではなく**デバイスを読むかどうか**の設定で、
 無効の間は `GamepadRuntime` が読み取りスレッドごと止まる。読み捨てるだけにすると、
