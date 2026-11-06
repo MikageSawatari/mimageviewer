@@ -325,13 +325,14 @@ impl App {
         ctx: &egui::Context,
     ) -> Option<crate::keyboard_input::EditHistoryKeyPermit> {
         self.keyboard_owner_for_pass(ctx).edit_history_key_permit(
+            ctx.viewport_id(),
             crate::keyboard_input::popup_owns_keyboard(ctx),
             ctx.text_edit_focused(),
         )
     }
 
     /// グリッドとフルスクリーンの両ハンドラ共通。専用 permit により非テキスト
-    /// widget focus は通し、TextEdit / IME / popup / modal の所有は維持する。
+    /// widget focus を追加で通す。旧 keymap の許可範囲と呼び出し元の外側 gate は維持する。
     ///
     /// **consume 順序の注意**: Ctrl+Shift+Z (Redo) → Ctrl+Y (Redo) → Ctrl+Z (Undo)
     /// の順で consume することで、Ctrl+Shift+Z が Undo 側に流れない。

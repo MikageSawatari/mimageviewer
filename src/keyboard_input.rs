@@ -138,8 +138,8 @@ impl FullscreenRawKeyPermit {
     }
 }
 
-/// Proof that this viewport's editor history may consume a key, even when a
-/// non-text widget has focus. Text input, modal UI and popups retain their keys.
+/// Proof that edit history may use the legacy keymap route or the additional
+/// non-text widget exception. Each caller retains its outer modal/input gates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EditHistoryKeyPermit {
     viewport: egui::ViewportId,
@@ -354,24 +354,30 @@ pub(crate) const fn focused_key_state_permit_for_viewport(
 impl KeyboardOwner {
     pub(crate) const fn edit_history_key_permit(
         self,
+        viewport: egui::ViewportId,
         popup_open: bool,
         text_edit_focused: bool,
     ) -> Option<EditHistoryKeyPermit> {
-        if popup_open {
-            return None;
+        // This exception must never narrow the legacy keymap's allowed set.
+        // Modal/Unclaimed have no viewport payload: their caller supplies the
+        // current viewport and still owns the outer modal/discrete-input gate.
+        let viewport = match self {
+            Self::ApplicationShortcut { scope } => scope.viewport,
+            Self::TextInput { viewport, .. } | Self::FocusedUi { viewport, .. } => viewport,
+            Self::Modal | Self::Unclaimed => viewport,
+        };
+        if !self.blocks_legacy_keymap_shortcuts() {
+            return Some(EditHistoryKeyPermit { viewport });
         }
         match self {
-            Self::ApplicationShortcut { scope } => Some(EditHistoryKeyPermit {
-                viewport: scope.viewport,
-            }),
             // DragValue renders its internal TextEdit whenever an enabled
             // widget has keyboard focus. Its persisted TextEditState also
             // protects numeric editors absent from the helper text claim.
             // A retained state is intentionally treated conservatively.
-            Self::FocusedUi { viewport, .. } if !text_edit_focused => {
+            Self::FocusedUi { .. } if !popup_open && !text_edit_focused => {
                 Some(EditHistoryKeyPermit { viewport })
             }
-            Self::Modal | Self::TextInput { .. } | Self::FocusedUi { .. } | Self::Unclaimed => None,
+            _ => None,
         }
     }
 
@@ -938,27 +944,28 @@ mod tests {
     fn edit_history_key_permit_covers_every_owner_phase_popup_and_text_focus() {
         let viewport = egui::ViewportId::ROOT;
         let widget_id = egui::Id::unique("history-focus");
+        // Columns: no menu/no text, no menu/text, menu/no text, menu/text.
         let mut owners = vec![
-            (KeyboardOwner::Modal, false),
-            (KeyboardOwner::Unclaimed, false),
+            (KeyboardOwner::Modal, [true; 4]),
+            (KeyboardOwner::Unclaimed, [true; 4]),
             (
                 KeyboardOwner::FocusedUi {
                     viewport,
                     widget_id,
                 },
-                true,
+                [true, false, false, false],
             ),
             (
                 KeyboardOwner::ApplicationShortcut {
                     scope: scope(ShortcutSurface::Main),
                 },
-                true,
+                [true; 4],
             ),
             (
                 KeyboardOwner::ApplicationShortcut {
                     scope: scope(ShortcutSurface::Fullscreen),
                 },
-                true,
+                [true; 4],
             ),
         ];
         for phase in [
@@ -973,21 +980,21 @@ mod tests {
                     widget_id,
                     phase,
                 },
-                false,
+                [phase == TextInputPhase::PendingFocus; 4],
             ));
         }
-        for (owner, eligible) in owners {
+        for (owner, expected) in owners {
+            let mut column = 0;
             for popup_open in [false, true] {
                 for text_edit_focused in [false, true] {
-                    let text_blocks =
-                        matches!(owner, KeyboardOwner::FocusedUi { .. }) && text_edit_focused;
                     assert_eq!(
                         owner
-                            .edit_history_key_permit(popup_open, text_edit_focused)
+                            .edit_history_key_permit(viewport, popup_open, text_edit_focused)
                             .is_some(),
-                        eligible && !popup_open && !text_blocks,
+                        expected[column],
                         "{owner:?}, popup={popup_open}, text={text_edit_focused}"
                     );
+                    column += 1;
                 }
             }
         }
@@ -996,7 +1003,7 @@ mod tests {
             viewport: egui::ViewportId::from_hash_of("sibling"),
             widget_id,
         }
-        .edit_history_key_permit(false, false)
+        .edit_history_key_permit(ctx.viewport_id(), false, false)
         .unwrap();
         assert!(!sibling.allows(&ctx));
     }

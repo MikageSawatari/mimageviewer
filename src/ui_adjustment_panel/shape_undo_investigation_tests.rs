@@ -572,13 +572,18 @@ fn shape_undo_text_ime_popup_modal_owners_keep_history_and_keys() {
                                     ui.label("Option");
                                 });
                             popup_id.set(response.response.id.with("popup"));
+                            response.response.request_focus();
                         }
                         "menu" => {
                             let response = ui.button("Edit menu");
+                            response.request_focus();
                             popup_id.set(egui::Popup::default_response_id(&response));
                             egui::Popup::menu(&response).show(|ui| {
                                 let _ = ui.button("Menu item");
                             });
+                        }
+                        "pass-popup" => {
+                            ui.button("Popup anchor").request_focus();
                         }
                         _ => {
                             ui.label("Canvas");
@@ -614,6 +619,12 @@ fn shape_undo_text_ime_popup_modal_owners_keep_history_and_keys() {
                 ctx.run_ui(raw, |root| {
                     let ctx = &root.ctx().clone();
                     app.update_ime_state(ctx);
+                    if matches!(blocker, "combo" | "menu") {
+                        // Production order: dispatch BEFORE drawing this pass.
+                        // Memory still owns the already-open egui popup.
+                        assert!(egui::Popup::is_any_open(ctx));
+                        assert!(!ctx.any_popup_open(), "popup has not been drawn this pass");
+                    }
                     // Exercise the pass-only popup flag, with no Memory open entry.
                     if blocker == "pass-popup" {
                         egui::CentralPanel::default().show(root, |ui| {
@@ -649,9 +660,12 @@ fn shape_undo_text_ime_popup_modal_owners_keep_history_and_keys() {
                         ctx.input(|i| i.key_pressed(key)),
                         "{canvas:?} {blocker} {key:?}"
                     );
-                    // Also exercise the shared meta handler directly (it must enforce ownership).
-                    app.handle_meta_undo_keys(ctx);
-                    assert!(ctx.input(|i| i.key_pressed(key)), "meta: {blocker}");
+                    // Actual modals are the caller's outer gate, just as in
+                    // the legacy keymap. Do not bypass that gate in this test.
+                    if blocker != "modal" {
+                        app.handle_meta_undo_keys(ctx);
+                        assert!(ctx.input(|i| i.key_pressed(key)), "meta: {blocker}");
+                    }
                     assert_eq!(undo_count(&app, canvas), 1, "{canvas:?} {blocker}");
                     assert_eq!(shapes(&app, canvas), created);
                     // The polygon vertex-back route must not bypass the same
@@ -799,6 +813,83 @@ fn shape_undo_main_meta_history_and_polygon_vertices_allow_focused_button() {
             },
         )
         .drop_without_applying_deltas();
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn shape_undo_polygon_native_press_and_layout_retry_are_one_vertex_action() {
+    let _input = crate::key_input::lock_test_input();
+    for native_only in [false, true] {
+        for point_count in [1, 2] {
+            let ctx = egui::Context::default();
+            let (mut app, transform) = setup(&ctx);
+            prepare_canvas(&mut app, Canvas::Local, LocalAdjustMaskTool::HorizLine);
+            drag(
+                &mut app,
+                &ctx,
+                &transform,
+                Canvas::Local,
+                [0.3, 0.3],
+                [0.7, 0.7],
+                1.0,
+            );
+            let created = shapes(&app, Canvas::Local);
+            app.local_adjust_mask_tool = LocalAdjustMaskTool::Polygon;
+            app.local_adjust_mask_lasso_points = vec![[0.2, 0.2]; point_count];
+            let mut value = 0.5;
+            ctx.run_ui(Default::default(), |root| {
+                draw_history_focus(root, Focus::Button, &mut value).request_focus();
+            })
+            .drop_without_applying_deltas();
+            let sibling = egui::ViewportId::from_hash_of("polygon-sibling");
+            let edge = |viewport| crate::key_input::KeyEdge {
+                operation_id: crate::key_input::KeyOperationId::unassigned(),
+                source_hwnd: 1,
+                source_viewport: viewport,
+                virtual_key: 0x5A,
+                scan_code: 0,
+                extended: false,
+                pressed: true,
+                repeat: false,
+                ctrl: true,
+                shift: false,
+                alt: false,
+            };
+            crate::key_input::set_test_routed_frame(vec![
+                edge(egui::ViewportId::ROOT),
+                edge(sibling),
+            ]);
+            let mut raw = history_key_input(egui::Key::Z, egui::Modifiers::CTRL);
+            if native_only {
+                raw.events
+                    .retain(|event| !matches!(event, egui::Event::Key { .. }));
+            }
+            let mut passes = 0;
+            ctx.run_ui(raw, |root| {
+                let ctx = &root.ctx().clone();
+                passes += 1;
+                app.handle_fs_key_input(ctx, 0, false);
+                assert_eq!(app.local_adjust_mask_lasso_points.len(), point_count - 1);
+                assert_eq!(app.meta_undo.undo_len(), 1);
+                assert_eq!(shapes(&app, Canvas::Local), created);
+                assert!(!ctx.input(|i| i.key_pressed(egui::Key::Z)));
+                assert!(!crate::key_input::pressed_key_down(
+                    ctx.viewport_id(),
+                    |e| e.virtual_key == 0x5A
+                ));
+                assert!(crate::key_input::pressed_key_down(sibling, |e| e
+                    .virtual_key
+                    == 0x5A));
+                draw_history_focus(root, Focus::Button, &mut value);
+                if ctx.current_pass_index() == 0 {
+                    ctx.request_discard("polygon history key ownership retry");
+                }
+            })
+            .drop_without_applying_deltas();
+            assert!(passes >= 2);
+            crate::key_input::clear_test_frame();
+        }
     }
 }
 

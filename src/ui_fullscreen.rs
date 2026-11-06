@@ -34868,25 +34868,16 @@ impl App {
                 return action;
             }
             // 多角形の頂点戻しは従来どおり固定 Ctrl+Z（完全一致）。履歴と共通の
-            // permit で TextEdit / IME / popup / modal の所有を保つ。
+            // permit と keymap で native / egui の同一押下を一緒に消費する。
             // Ctrl+Shift+Z は残り、下のメタ Redo へ流れる。
             if self.local_adjust_mask_tool == crate::app::LocalAdjustMaskTool::Polygon
                 && !self.local_adjust_mask_lasso_points.is_empty()
-                && self.edit_history_key_permit(ctx).is_some()
-                && ctx.input_mut(|i| {
-                    let before = i.events.len();
-                    i.events.retain(|e| {
-                        !matches!(
-                            e,
-                            egui::Event::Key {
-                                key: egui::Key::Z,
-                                pressed: true,
-                                modifiers,
-                                ..
-                            } if modifiers.matches_exact(egui::Modifiers::CTRL)
-                        )
-                    });
-                    i.events.len() != before
+                && self.edit_history_key_permit(ctx).is_some_and(|permit| {
+                    self.keymap.consume_edit_history_key(
+                        ctx,
+                        permit,
+                        crate::keymap::EditHistoryKey::PolygonVertexUndo,
+                    )
                 })
             {
                 self.local_adjust_mask_lasso_points.pop();

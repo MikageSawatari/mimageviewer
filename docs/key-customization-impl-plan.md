@@ -1,16 +1,20 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
 §1.681: 編集履歴専用の `EditHistoryKeyPermit` を keyboard owner から発行する。
-`ApplicationShortcut` と非テキスト `FocusedUi` のみを許可し、`TextInput` の全 phase /
-IME / `Modal` / `Unclaimed` は拒否する。popup は Memory の `Popup::is_any_open` と
-今 pass の `Context::any_popup_open` の両方を見て、owner の種類にかかわらず拒否する。
+発行条件は `!blocks_legacy_keymap_shortcuts()` と非テキスト `FocusedUi` 例外の和集合。
+`ApplicationShortcut` / `Modal` / `Unclaimed` / `TextInput::PendingFocus` は旧来どおり通し、
+popup 有無では拒否しない。実 modal と配送先の外側 gate は各 caller が維持する。
+`TextInput::Focused` / `FocusRecovery` / `ImeComposing` は旧来どおり拒否する。
+`FocusedUi` 例外だけが Memory の `Popup::is_any_open` と今 pass の `Context::any_popup_open` を見て、
+egui popup（ComboBox・egui メニュー・コンテキストメニュー）表示中は拒否する。
 `FocusedUi` は `Context::text_edit_focused()` が真でも拒否し、helper claim 外の
 TextEdit / DragValue の数値直接入力を保護する。persisted state の残存も保守的に拒否する。
 `decide_keyboard_owner` の分類自体は変更しない。
-App の発行入口を共通化し、keymap の `consume_edit_history_key` と補正多角形の
-頂点戻しだけがこの permit を使う。
-メタUndo / 固定Redo、消しゴム・隠蔽・テキスト専用Undo / Redoが対象。
-補正多角形の固定Ctrl+Zによる頂点戻しも、consume前に同じpermitを要求する。
+App の発行入口を共通化し、メタUndo / 固定Redo、消しゴム・隠蔽・テキスト専用Undo / Redo、
+補正多角形の固定Ctrl+Zによる頂点戻しを keymap の `consume_edit_history_key` へ通す。
+頂点戻しは `PolygonVertexUndo` 種別で native / egui の twin を一緒に消費する。
+自前描画メニューは Ctrl+Z / Ctrl+Y を使わず通常状態では従来から Undo を通すため、FocusedUi だけの除外は設けない。
+利益のない viewport 所属・native claim・音楽 HUD の ID 変更へ配管を広げず、各 consumer で既存 owner から permit を得る。
 action の再割り当て・none、native / egui の同一入力のconsumeは既存経路を共有する。
 一般の `blocks_legacy_keymap_shortcuts` と `FullscreenRawKeyPermit` は変更しない。
 

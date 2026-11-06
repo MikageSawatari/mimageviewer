@@ -7384,6 +7384,7 @@ pub struct Keymap {
 pub(crate) enum EditHistoryKey {
     Action(KeyAction),
     MetaRedo,
+    PolygonVertexUndo,
 }
 
 #[cfg(windows)]
@@ -8688,6 +8689,9 @@ impl Keymap {
             EditHistoryKey::MetaRedo => {
                 self.consume_owned_chord(ctx, Chord::ctrl_shift(KeyName::Z), true)
                     || self.consume_owned_chord(ctx, Chord::ctrl(KeyName::Y), true)
+            }
+            EditHistoryKey::PolygonVertexUndo => {
+                self.consume_owned_chord(ctx, Chord::ctrl(KeyName::Z), true)
             }
         }
     }
@@ -10923,7 +10927,9 @@ mod tests {
                 widget_id: egui::Id::unique("history-button"),
             };
             crate::keyboard_input::cache_keyboard_owner(&ctx, owner);
-            let permit = owner.edit_history_key_permit(false, false).unwrap();
+            let permit = owner
+                .edit_history_key_permit(ctx.viewport_id(), false, false)
+                .unwrap();
             assert!(!keymap.consume_action(&ctx, KeyAction::UndoLastAction));
             assert_eq!(
                 keymap.consume_edit_history_key(
@@ -10944,7 +10950,9 @@ mod tests {
             widget_id: egui::Id::unique("history-slider"),
         };
         crate::keyboard_input::cache_keyboard_owner(&ctx, owner);
-        let permit = owner.edit_history_key_permit(false, false).unwrap();
+        let permit = owner
+            .edit_history_key_permit(ctx.viewport_id(), false, false)
+            .unwrap();
         assert!(!Keymap::default().consume_edit_history_key(
             &ctx,
             permit,
@@ -10953,6 +10961,141 @@ mod tests {
         assert!(!Keymap::default().consume_action(&ctx, KeyAction::FsRotateCw));
         assert!(ctx.input(|i| i.key_pressed(egui::Key::R)));
         ctx.end_pass().drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn edit_history_keymap_owner_table_preserves_all_legacy_consumers() {
+        use crate::keyboard_input::{
+            KeyboardOwner, ShortcutScope, ShortcutSurface, TextInputPhase,
+        };
+        let _input = crate::key_input::lock_test_input();
+        #[cfg(windows)]
+        let _clear = ClearTestKeyFrame;
+        let viewport = egui::ViewportId::ROOT;
+        let widget_id = egui::Id::unique("legacy-history-owner");
+        let mut owners = vec![
+            KeyboardOwner::Modal,
+            KeyboardOwner::Unclaimed,
+            KeyboardOwner::FocusedUi {
+                viewport,
+                widget_id,
+            },
+            KeyboardOwner::ApplicationShortcut {
+                scope: ShortcutScope::new(viewport, ShortcutSurface::Main),
+            },
+            KeyboardOwner::ApplicationShortcut {
+                scope: ShortcutScope::new(viewport, ShortcutSurface::Fullscreen),
+            },
+        ];
+        for phase in [
+            TextInputPhase::PendingFocus,
+            TextInputPhase::Focused,
+            TextInputPhase::FocusRecovery,
+            TextInputPhase::ImeComposing,
+        ] {
+            owners.push(KeyboardOwner::TextInput {
+                viewport,
+                widget_id,
+                phase,
+            });
+        }
+        let mut routes = vec![
+            (EditHistoryKey::MetaRedo, Chord::ctrl(KeyName::Y)),
+            (EditHistoryKey::MetaRedo, Chord::ctrl_shift(KeyName::Z)),
+            (EditHistoryKey::PolygonVertexUndo, Chord::ctrl(KeyName::Z)),
+        ];
+        for action in [
+            KeyAction::UndoLastAction,
+            KeyAction::EraseUndo,
+            KeyAction::EraseRedo,
+            KeyAction::ConcealUndo,
+            KeyAction::ConcealRedo,
+            KeyAction::TextUndo,
+            KeyAction::TextRedo,
+        ] {
+            for chord in action.default_chords().iter() {
+                routes.push((EditHistoryKey::Action(action), chord));
+            }
+        }
+        for owner in owners {
+            for (route, chord) in routes.iter().copied() {
+                for popup_open in [false, true] {
+                    for text_edit_focused in [false, true] {
+                        for native in [false, true] {
+                            if native && !cfg!(windows) {
+                                continue;
+                            }
+                            let key = chord.key_name().unwrap().to_egui().unwrap();
+                            let (ctrl, shift, alt) = chord.key_modifiers().unwrap();
+                            let modifiers = egui::Modifiers {
+                                ctrl,
+                                shift,
+                                alt,
+                                ..Default::default()
+                            };
+                            let consume = |with_permit| {
+                                let ctx = egui::Context::default();
+                                begin_key_pass(&ctx, key, modifiers);
+                                crate::keyboard_input::cache_keyboard_owner(&ctx, owner);
+                                #[cfg(windows)]
+                                if native {
+                                    crate::key_input::set_test_frame(vec![
+                                        crate::key_input::KeyEdge {
+                                            operation_id:
+                                                crate::key_input::KeyOperationId::unassigned(),
+                                            source_hwnd: 1,
+                                            source_viewport: viewport,
+                                            virtual_key: chord.key_name().unwrap().to_vk(),
+                                            scan_code: 0,
+                                            extended: false,
+                                            pressed: true,
+                                            repeat: false,
+                                            ctrl,
+                                            shift,
+                                            alt,
+                                        },
+                                    ]);
+                                }
+                                let keymap = Keymap::default();
+                                let result = if with_permit {
+                                    owner
+                                        .edit_history_key_permit(
+                                            viewport,
+                                            popup_open,
+                                            text_edit_focused,
+                                        )
+                                        .is_some_and(|permit| {
+                                            keymap.consume_edit_history_key(&ctx, permit, route)
+                                        })
+                                } else {
+                                    match route {
+                                        EditHistoryKey::Action(action) => {
+                                            keymap.consume_action(&ctx, action)
+                                        }
+                                        _ => keymap.consume_fixed_chord(&ctx, chord),
+                                    }
+                                };
+                                assert_eq!(ctx.input(|i| i.key_pressed(key)), !result);
+                                ctx.end_pass().drop_without_applying_deltas();
+                                #[cfg(windows)]
+                                crate::key_input::clear_test_frame();
+                                result
+                            };
+                            let legacy = consume(false);
+                            let permitted = consume(true);
+                            let extra = matches!(owner, KeyboardOwner::FocusedUi { .. })
+                                && !popup_open
+                                && !text_edit_focused;
+                            assert_eq!(
+                                permitted,
+                                legacy || extra,
+                                "{owner:?} {route:?} {chord:?} menu={popup_open} text={text_edit_focused} native={native}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
