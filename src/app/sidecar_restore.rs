@@ -195,6 +195,7 @@ struct DeferredFullscreen {
     requested_materialization: FsOpenMaterialization,
     load_contract: FsPageLoadContract,
     metadata_boundary: FsMetadataBoundary,
+    resume_notice: Option<BookResumeNotice>,
 }
 
 impl DeferredFullscreen {
@@ -659,6 +660,7 @@ impl SidecarRestoreState {
         requested_materialization: FsOpenMaterialization,
         load_contract: FsPageLoadContract,
         metadata_boundary: FsMetadataBoundary,
+        resume_notice: Option<BookResumeNotice>,
     ) -> bool {
         if !self.target_matches(context, generation) {
             return false;
@@ -670,6 +672,7 @@ impl SidecarRestoreState {
             requested_materialization,
             load_contract,
             metadata_boundary,
+            resume_notice,
         });
         true
     }
@@ -1136,6 +1139,25 @@ impl App {
         load_contract: FsPageLoadContract,
         metadata_boundary: FsMetadataBoundary,
     ) -> bool {
+        self.defer_sidecar_restore_fullscreen_with_notice(
+            idx,
+            trigger,
+            requested_materialization,
+            load_contract,
+            metadata_boundary,
+            None,
+        )
+    }
+
+    pub(super) fn defer_sidecar_restore_fullscreen_with_notice(
+        &mut self,
+        idx: usize,
+        trigger: HistoryTrigger,
+        requested_materialization: FsOpenMaterialization,
+        load_contract: FsPageLoadContract,
+        metadata_boundary: FsMetadataBoundary,
+        resume_notice: Option<BookResumeNotice>,
+    ) -> bool {
         if self.sidecar_restore.is_none() {
             return false;
         }
@@ -1152,6 +1174,7 @@ impl App {
                     requested_materialization,
                     load_contract,
                     metadata_boundary,
+                    resume_notice,
                 )
             } else {
                 false
@@ -1331,15 +1354,19 @@ impl App {
         let items = self.items.clone();
         let logical = self.archive_source_override.clone();
         let policy = self.settings.file_type_visibility.clone();
+        let resume_source =
+            super::file_type_resume::LegacyResumeSource::from_recipe(&self.projection_recipe);
         let (page_index_tx, page_index_rx) = mpsc::channel();
         if let Err(error) = std::thread::Builder::new()
             .name("reading-position-prepare".to_owned())
             .spawn(move || {
-                let prepared = super::file_type_resume::PreparedPageIdentityIndex::prepare(
-                    &items,
-                    logical.as_deref(),
-                    policy,
-                );
+                let prepared =
+                    super::file_type_resume::PreparedPageIdentityIndex::prepare_for_source(
+                        &items,
+                        logical.as_deref(),
+                        policy,
+                        resume_source,
+                    );
                 let _ = page_index_tx.send(prepared);
             })
         {
@@ -1493,6 +1520,8 @@ impl App {
         let source_path = self.current_folder.clone();
         let items = self.items.clone();
         let logical = logical_override;
+        let resume_source =
+            super::file_type_resume::LegacyResumeSource::from_recipe(&self.projection_recipe);
         let (tx, rx) = mpsc::channel();
         let previous = std::mem::replace(
             &mut self.page_identity_index,
@@ -1506,10 +1535,11 @@ impl App {
         if let Err(error) = std::thread::Builder::new()
             .name("snapshot-reading-position-prepare".into())
             .spawn(move || {
-                let index = super::file_type_resume::PreparedPageIdentityIndex::prepare(
+                let index = super::file_type_resume::PreparedPageIdentityIndex::prepare_for_source(
                     &items,
                     logical.as_deref(),
                     policy,
+                    resume_source,
                 );
                 let _ = tx.send(index);
             })
@@ -2561,6 +2591,7 @@ impl App {
                         deferred.load_contract,
                         None,
                         deferred.metadata_boundary,
+                        deferred.resume_notice,
                     );
                 } else {
                     #[cfg(windows)]
@@ -2608,6 +2639,7 @@ impl App {
                     deferred.load_contract,
                     None,
                     deferred.metadata_boundary,
+                    deferred.resume_notice,
                 );
             } else {
                 deferred_identity_mismatch = true;
@@ -4935,6 +4967,7 @@ mod tests {
             requested_materialization: FsOpenMaterialization::DeferredPageTurn,
             load_contract: FsPageLoadContract::LatestSeek,
             metadata_boundary: FsMetadataBoundary::Manual,
+            resume_notice: None,
         };
 
         assert_eq!(
@@ -4942,6 +4975,60 @@ mod tests {
             FsOpenMaterialization::DeferredPageTurn
         );
         assert_eq!(deferred.load_contract, FsPageLoadContract::LatestSeek);
+    }
+
+    #[test]
+    fn resume_notice_survives_live_and_index_only_sidecar_open_continuations() {
+        for index_only in [false, true] {
+            let mut app = crate::app::tests::phase_c_support::setup_app();
+            let folder = app.tmp.path().join("notice-sidecar");
+            app.current_folder = Some(folder.clone());
+            app.items = vec![GridItem::Image(folder.join("page.jpg"))];
+            app.visible_indices = vec![0];
+            app.thumbnails = vec![ThumbnailState::Pending];
+            app.image_metas = vec![None];
+            app.settings.detached_viewer_open_images_in_window = false;
+            app.adjustment_page_params
+                .insert(0, crate::adjustment::AdjustParams::default());
+            let _rx = app.activate_live_sidecar_restore_for_test(folder.clone());
+            if index_only {
+                app.sidecar_restore.as_mut().unwrap().common.continuation =
+                    ContinuationOwner::IndexOnly {
+                        cancel: Arc::new(AtomicBool::new(false)),
+                    };
+            }
+            let notice = BookResumeNotice {
+                path: folder,
+                resolution: file_type_resume::PositionResolution::LegacyWithExclusions,
+            };
+            app.open_fullscreen_with_resume_notice(
+                0,
+                HistoryTrigger::UserChosen,
+                Some(notice.clone()),
+            );
+            assert_eq!(app.fullscreen_idx, None);
+            assert!(app.fs_feedback_toast.is_none());
+            assert_eq!(
+                app.sidecar_restore
+                    .as_ref()
+                    .unwrap()
+                    .common
+                    .deferred_fullscreen
+                    .as_ref()
+                    .unwrap()
+                    .resume_notice,
+                Some(notice)
+            );
+            app.finish_page_identity_preparation_for_test();
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert!(
+                app.fs_feedback_toast
+                    .as_ref()
+                    .is_some_and(|toast| toast.0.contains("絞り込み")),
+                "final toast: {:?}",
+                app.fs_feedback_toast
+            );
+        }
     }
 
     #[test]
@@ -5421,25 +5508,31 @@ mod tests {
                 owner.finish_page_identity_preparation_for_test()
             })
             .unwrap();
-            if outcome != "resume-refused" {
-                // DetachedPhysical intentionally ignores main-only facets. App-wide
-                // file type visibility is already applied by the scan instead.
+            // DetachedPhysical ignores main-only facets. Resume refusal also uses
+            // the ordinary first-page path, retaining the requesting reader owner.
+            assert!(
+                app.with_active_viewer_context(|owner| {
+                    owner.fullscreen_idx == Some(0)
+                        && owner.current_folder.as_ref() == Some(&folder)
+                })
+                .unwrap()
+            );
+            assert_ne!(
+                app.detached_window_state(window),
+                Some(crate::app::DetachedWindowState::Closing),
+                "first page remains open: outcome={outcome}"
+            );
+            if outcome == "resume-refused" {
                 assert!(
                     app.with_active_viewer_context(|owner| {
-                        owner.fullscreen_idx == Some(0)
-                            && owner.current_folder.as_ref() == Some(&folder)
+                        owner
+                            .fs_feedback_toast
+                            .as_ref()
+                            .is_some_and(|toast| toast.0.contains("絞り込み中に復元できません"))
                     })
                     .unwrap()
                 );
-            } else {
-                assert_eq!(
-                    app.detached_window_state(window),
-                    Some(crate::app::DetachedWindowState::Closing),
-                    "terminal outcome={outcome}"
-                );
-                if outcome == "resume-refused" {
-                    assert_eq!(app.book_resume_db.as_ref().unwrap().get(&folder), Some(0));
-                }
+                assert_eq!(app.book_resume_db.as_ref().unwrap().get(&folder), Some(0));
             }
             assert_eq!(app.items, main_rows, "first display cannot alter main rows");
             assert_eq!(app.items_generation, main_generation);

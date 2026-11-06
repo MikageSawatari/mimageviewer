@@ -51,7 +51,10 @@ fn composition1669_extracted_absence_is_rechecked_after_sibling_save_and_remove(
         materialization: FsOpenMaterialization::Eager,
         contract: FsPageLoadContract::Sequential,
         purpose: BookTargetPurpose::Explicit,
-        route: BookTargetRoute::FullscreenOpen(FsMetadataBoundary::Manual),
+        route: BookTargetRoute::FullscreenOpen {
+            metadata_boundary: FsMetadataBoundary::Manual,
+            resume_notice: None,
+        },
         navigation_origin: Vec::new(),
     };
     let candidates = env
@@ -301,7 +304,10 @@ fn book_structure_waits_for_open_permission_but_not_passive_display_reads_or_ado
         materialization: FsOpenMaterialization::Eager,
         contract: FsPageLoadContract::Sequential,
         purpose: BookTargetPurpose::Explicit,
-        route: BookTargetRoute::FullscreenOpen(FsMetadataBoundary::Manual),
+        route: BookTargetRoute::FullscreenOpen {
+            metadata_boundary: FsMetadataBoundary::Manual,
+            resume_notice: None,
+        },
         navigation_origin: Vec::new(),
     };
     app.book_composition_permission.open = OpenPermission::Checking {
@@ -514,15 +520,218 @@ fn fullscreen_open_captures_rating_metadata_boundary_in_composition_continuation
         let OpenPermission::Checking { intent, .. } = &env.book_composition_permission.open else {
             panic!("open must carry its own qualified continuation");
         };
-        assert_eq!(intent.route, BookTargetRoute::FullscreenOpen(boundary));
+        assert_eq!(
+            intent.route,
+            BookTargetRoute::FullscreenOpen {
+                metadata_boundary: boundary,
+                resume_notice: None
+            }
+        );
         assert_eq!(
             intent.clone().route,
-            BookTargetRoute::FullscreenOpen(boundary)
+            BookTargetRoute::FullscreenOpen {
+                metadata_boundary: boundary,
+                resume_notice: None
+            }
         );
         assert_eq!(env.fullscreen_idx, None);
         process.shutdown_and_join();
     }
 }
+
+#[test]
+fn resume_notice_survives_permission_recheck_and_open_feedback() {
+    use crate::app::file_type_resume::PositionResolution;
+    for resolution in [
+        PositionResolution::HiddenIdentity,
+        PositionResolution::LegacyWithExclusions,
+    ] {
+        let mut env = crate::app::tests::phase_c_support::setup_app();
+        let root = env.tmp.path().join("notice-permission.pdf");
+        env.items = vec![crate::grid_item::GridItem::PdfPage {
+            pdf_path: root.clone(),
+            page_num: 0,
+            content_type: None,
+        }];
+        env.current_folder = None;
+        env.projection_recipe = crate::app::book_materialization::ProjectionRecipe::OrdinaryList;
+        env.visible_indices = vec![0];
+        env.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+        env.image_metas = vec![None];
+        env.settings.detached_viewer_open_images_in_window = false;
+        env.adjustment_page_params
+            .insert(0, crate::adjustment::AdjustParams::default());
+        let (service, process) =
+            BookCompositionService::spawn_at(env.tmp.path().join("notice-permission-data"), None)
+                .unwrap();
+        service
+            .save(
+                crate::book_scope::BookScopeKey::document(&root).unwrap(),
+                PageDomain::Document,
+                BookComposition::new(
+                    ReadingDirection::Ltr,
+                    vec![CompositionPageRef::PdfPage { page_num: 0 }],
+                ),
+            )
+            .recv()
+            .unwrap()
+            .status
+            .unwrap();
+        env.install_book_composition_runtime(service);
+        let notice = BookResumeNotice {
+            path: root,
+            resolution,
+        };
+        env.open_fullscreen_with_resume_notice(0, HistoryTrigger::UserChosen, Some(notice.clone()));
+        let OpenPermission::Checking { intent, candidates } =
+            std::mem::take(&mut env.book_composition_permission.open)
+        else {
+            panic!("saved composition requires asynchronous permission");
+        };
+        assert!(env.fs_feedback_toast.is_none());
+        // Re-enter the common callback while its proof still needs requalification. The
+        // retained request owns the notice even when the callback supplies no new notice.
+        env.book_composition_permission.open = OpenPermission::Resuming { intent, candidates };
+        env.open_fullscreen(0, HistoryTrigger::UserChosen);
+        let OpenPermission::Checking { intent, .. } = &env.book_composition_permission.open else {
+            panic!("permission must be rechecked");
+        };
+        assert!(
+            matches!(&intent.route, BookTargetRoute::FullscreenOpen { resume_notice: Some(retained), .. } if retained == &notice)
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while env.fullscreen_idx.is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "permission did not finish"
+            );
+            env.poll_book_presentation_permission(&egui::Context::default());
+            std::thread::yield_now();
+        }
+        assert_eq!(env.fullscreen_idx, Some(0));
+        assert!(
+            env.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|toast| toast.0.contains(
+                    if resolution == PositionResolution::HiddenIdentity {
+                        "非表示"
+                    } else {
+                        "絞り込み"
+                    }
+                )),
+            "final toast: {:?}",
+            env.fs_feedback_toast
+        );
+        process.shutdown_and_join();
+    }
+}
+
+#[test]
+fn resume_notice_is_discarded_with_cancelled_or_hidden_permission_target() {
+    for cancel in [false, true] {
+        let mut env = crate::app::tests::phase_c_support::setup_app();
+        let root = env.tmp.path().join("notice-refused.pdf");
+        env.items = vec![crate::grid_item::GridItem::PdfPage {
+            pdf_path: root.clone(),
+            page_num: 0,
+            content_type: None,
+        }];
+        env.current_folder = None;
+        env.projection_recipe = crate::app::book_materialization::ProjectionRecipe::OrdinaryList;
+        env.visible_indices = vec![0];
+        env.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+        env.image_metas = vec![None];
+        let (service, process) =
+            BookCompositionService::spawn_at(env.tmp.path().join("notice-refused-data"), None)
+                .unwrap();
+        let page = CompositionPageRef::PdfPage { page_num: 0 };
+        let mut record = BookComposition::new(ReadingDirection::Ltr, vec![page.clone()]);
+        record.hidden_pages.push(page);
+        service
+            .save(
+                crate::book_scope::BookScopeKey::document(&root).unwrap(),
+                PageDomain::Document,
+                record,
+            )
+            .recv()
+            .unwrap()
+            .status
+            .unwrap();
+        env.install_book_composition_runtime(service);
+        env.open_fullscreen_with_resume_notice(
+            0,
+            HistoryTrigger::UserChosen,
+            Some(BookResumeNotice {
+                path: root,
+                resolution: crate::app::file_type_resume::PositionResolution::LegacyWithExclusions,
+            }),
+        );
+        assert!(matches!(
+            env.book_composition_permission.open,
+            OpenPermission::Checking { .. }
+        ));
+        if cancel {
+            env.cancel_pending_folder_nav();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !matches!(env.book_composition_permission.open, OpenPermission::Idle) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "permission did not terminate"
+            );
+            env.poll_book_presentation_permission(&egui::Context::default());
+            std::thread::yield_now();
+        }
+        assert_eq!(env.fullscreen_idx, None);
+        assert!(
+            !env.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|toast| toast.0.contains("絞り込み"))
+        );
+        process.shutdown_and_join();
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn resume_notice_follows_materialized_open_into_its_detached_context() {
+    let mut env = crate::app::tests::phase_c_support::setup_app();
+    let folder = env.tmp.path().join("notice-detached");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(
+        folder.join("001.jpg"),
+        b"fixture: no image decoding required",
+    )
+    .unwrap();
+    env.load_folder(folder.clone());
+    env.finish_page_identity_preparation_for_test();
+    env.settings.detached_viewer_open_images_in_window = true;
+    env.fs_open_intent_from_grid = true;
+    env.adjustment_page_params
+        .insert(0, crate::adjustment::AdjustParams::default());
+    env.open_fullscreen_with_resume_notice(
+        0,
+        HistoryTrigger::UserChosen,
+        Some(BookResumeNotice {
+            path: folder.clone(),
+            resolution: crate::app::file_type_resume::PositionResolution::LegacyWithExclusions,
+        }),
+    );
+    assert_eq!(env.fullscreen_idx, None, "main retains its grid");
+    env.with_active_viewer_context(|child| {
+        assert_eq!(child.fullscreen_idx, Some(0));
+        assert_eq!(child.current_folder.as_deref(), Some(folder.as_path()));
+    })
+    .expect("materialized open forks the detached context");
+    assert!(
+        env.fs_feedback_toast
+            .as_ref()
+            .is_some_and(|toast| toast.0.contains("絞り込み")),
+        "final toast: {:?}",
+        env.fs_feedback_toast
+    );
+}
+
 fn hidden() -> CandidatePermission {
     CandidatePermission::Hidden(ScopePermissionToken {
         scope: crate::book_scope::BookScopeKey::document("C:/book.pdf").unwrap(),
