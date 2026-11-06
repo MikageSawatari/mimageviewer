@@ -386,6 +386,7 @@ pub(crate) enum PreferencesPage {
     /// AI 推論バックエンド (DirectML / TensorRT) の選択と TRT pack 管理
     AiBackend,
     AiCaption,
+    DepthAddon,
     Cache,
     Folder,
     /// v1.7.0: 製本（本棚の保存先ルート）
@@ -592,6 +593,7 @@ impl PreferencesPage {
         Self::GpuMemory,
         Self::AiBackend,
         Self::AiCaption,
+        Self::DepthAddon,
         Self::Cache,
         Self::Folder,
         Self::Book,
@@ -632,6 +634,7 @@ impl PreferencesPage {
             Self::GpuMemory => "GPUメモリ",
             Self::AiBackend => "AI バックエンド",
             Self::AiCaption => "AI 説明文",
+            Self::DepthAddon => "3D 写真の追加モデル",
             Self::Cache => "キャッシュ",
             Self::Folder => "フォルダ・ファイル",
             Self::Book => "製本",
@@ -912,6 +915,7 @@ const TREE: &[TreeCategory] = &[
         page: None,
         children: &[
             PreferencesPage::AiCaption,
+            PreferencesPage::DepthAddon,
             PreferencesPage::EditingAddon,
             PreferencesPage::Developer,
         ],
@@ -1336,6 +1340,10 @@ pub(crate) struct PreferencesState {
     /// 編集用追加パックの導入状態 (環境設定ダイアログを開いた時点のスナップショット)。
     pub editing_addon_status: crate::editing_addon::AddonStatus,
     pub vlm_view: super::vlm_addon::VlmPreferencesView,
+    pub depth_view: super::depth_addon::DepthPreferencesView,
+    pub depth_download_requested: bool,
+    pub depth_remove_requested: bool,
+    pub depth_folder_requested: bool,
     pub vlm_download_requested: bool,
     pub vlm_remove_requested: bool,
     pub vlm_folder_requested: bool,
@@ -1863,6 +1871,10 @@ impl PreferencesState {
             uninstall_trt_pack_requested: false,
             editing_addon_status,
             vlm_view: Default::default(),
+            depth_view: Default::default(),
+            depth_download_requested: false,
+            depth_remove_requested: false,
+            depth_folder_requested: false,
             vlm_download_requested: false,
             vlm_remove_requested: false,
             vlm_folder_requested: false,
@@ -3227,6 +3239,7 @@ impl App {
         // 初回: 一時コピーを作成
         self.ensure_preferences_state();
         self.refresh_vlm_preferences(ctx);
+        self.refresh_depth_preferences();
         // A fresh draft gets a fresh ScrollArea id, with one explicit restore.
         // This also works when close and reopen happen without a hidden frame.
         let mut restore_scroll_y = (self
@@ -3739,6 +3752,7 @@ impl App {
         }
 
         self.process_vlm_preferences_requests(ctx);
+        self.process_depth_preferences_requests(ctx);
 
         // 「インストール先を開く」が押されていたら Explorer で開く。
         if let Some(ps) = self.pref_state.as_mut() {
@@ -4322,6 +4336,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::GpuMemory => page_gpu_memory(ui, state),
         PreferencesPage::AiBackend => page_ai_backend(ui, state),
         PreferencesPage::AiCaption => page_ai_caption(ui, state),
+        PreferencesPage::DepthAddon => page_depth_addon(ui, state),
         PreferencesPage::Cache => page_cache(ui, state),
         PreferencesPage::Folder => page_folder(ui, state),
         PreferencesPage::Book => page_book(ui, state),

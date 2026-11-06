@@ -142,7 +142,7 @@ fn download_with_backoffs(
     if bytes == 0 {
         return Err("VLM download size must be positive".into());
     }
-    super::vlm_addon::reject_links(partial)?;
+    super::addon::reject_links(partial)?;
     let existing = match fs::metadata(partial) {
         Ok(metadata) if metadata.is_file() => metadata.len(),
         Ok(_) => return Err("VLM partial is not a regular file".into()),
@@ -158,7 +158,7 @@ fn download_with_backoffs(
     }
     let agent = agent();
     retry(cancel, backoffs, || {
-        super::vlm_addon::reject_links(partial).map_err(AttemptError::Stop)?;
+        super::addon::reject_links(partial).map_err(AttemptError::Stop)?;
         let start = match fs::metadata(partial) {
             Ok(metadata) => metadata.len(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,

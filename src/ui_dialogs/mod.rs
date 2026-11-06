@@ -9,6 +9,8 @@
 
 mod about;
 pub(crate) mod agent_integration;
+pub(crate) mod depth_addon;
+mod model_addon;
 #[doc(hidden)]
 pub use about::{draw_avif_license_snapshot_fixture, draw_raw_license_snapshot_fixture};
 pub(crate) mod archive_cache_manager;

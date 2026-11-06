@@ -781,6 +781,7 @@ session 取消で通知・未開始仕事を失効させ、最後の fetch / sav
 | Susie ワーカー | **別プロセス** (`mimageviewer-susie32.exe`、32bit ビルド) + ディスパッチャースレッド | 3 (設定で 1 に落とせる) | 32bit の Susie 画像プラグイン (`.spi`) をロードし IsSupported/GetPicture を呼び出す。プラグインクラッシュの隔離も兼ねる。`get_pool` の初期化待ちは待機開始から絶対期限 5 秒 (lib unit test は 100 ms)。早期 wake でも期限を延ばさず、init / reload / timeout fallback は pool 公開後に全 waiter へ通知する |
 | AI runtime 初期化 | `std::thread` (`ai-runtime-init`) + `AiRuntimeInitOwner` の Mutex / Condvar | GUI process 全体で constructor 1 回 | App 構築後に worker を開始し、DLL 展開と `ort::init_from` を UI thread 外で行う。App / Remote / materializer は同じ `Arc` owner の `Ready` / `Failed` terminal だけを消費する。background consumer は request cancel / generation を見ながら Condvar を待ち、App の UI producer は毎 frame snapshot を poll する。初期化中の final AI は provisional composite を保持し、terminal repaint 後に job が無ければ Ready へ投入または Failed 完了へ再評価する。spawn failure / panic も Failed を publish し、owner 外 constructor と process 内 retry は行わない |
 | AI 推論 (final pipeline) | `std::thread` (`final-ai-worker`, 常駐) + 優先度キュー (`AiJobQueue`) + 共有 mpsc | 1 | final AI (upscale/denoise) を `AiJob` キューから逐次処理。`AiRuntime` の sessions Mutex が全推論を直列化するため worker は 1 本で十分。**モデルロード (`load_model`) / 推論を worker スレッド上で実行し、UI スレッドは sessions ロックに触らない** (= per-job spawn だった旧設計の「UI THREAD HANG: 推論ロック飢餓」を解消、§3.2.1)。優先度は Display(表示中ページ, LIFO) → Prefetch(先読み, FIFO) |
+| 深度推論 (3D 写真・段 A) | `std::thread` (`depth-estimation`, 常駐) + `Mutex + Condvar` 最新 slot + 要求ごとの mpsc | 1 (process 共通) | 共通 runtime owner の取消可能な初期化待ち、固定 504² DA3 推論、guided 前処理・f16 化。pending Drop / 同 context の新要求で取消、別 context の active は保持。lease は実終了まで、結果は要求元 viewport へ repaint。viewer 接続は段 B |
 | カラー化 / 最終エフェクト | `std::thread` (`miv-final-effect-{idx}` / `miv-final-effect-prefetch-{idx}`、要求ごとの短命 worker) + 個別 mpsc | 表示要求 + 背景先読み最大 1 本 | final AI / sharpen 後の `ColorImage` に、モノクロ系判定、スクリーントーン濃淡変換、階調カラー LUT、ポストフィルタを順に適用する。AI と共通の前後枚数を候補にし、ページ送りでは従来どおり、連結読みでは `fs_vertical_cache_keep_set` との積に絞り、実テクスチャ会計が共有 pool 由来の LOW 未満のときだけ遠方ページを先読みする。厳密可視の前後 1 ユニットの準備帯は LOW をバイパスして非表示ページを 1 枚ずつ先行処理し、色調補正・smart sharpen も worker 上で行う。可視ページの表示要求は水位をバイパスする。先読み／表示開始時とも無着色の provisional texture を upload せず、完成結果だけを `final_composite_cache` へ upload する。表示要求が先読み中の同じ key に来た場合は job を昇格して再利用し、同一 viewer のページ送りでは完成まで直前ページを holdover する。連結読みでは keep-set 内の各表示済みページがページ別 transition texture を持ち、raw source 差し替えや incomplete → complete 再合成で live final が一時的に消えても黒い読込表示へ戻さない。complete final の GPU 登録後に差し替え、keep-set 離脱時は旧 texture も破棄する。ページ入場だけでは完成 cache / pending を破棄しない。別 key の表示要求、設定変更、keep-set 除外、context close / drop では `Arc<AtomicBool>` を立て、`items_generation` と composite key が一致する結果だけを採用する。pending map とページ別 transition は viewer context の swap / park と一緒に所有権移動するため、別ウィンドウの要求や表示を誤って共有しない |
 | edit materialization (local / conceal) | `std::thread` (`local-adjust-render` / `conceal-materialize`、要求ごとの短命 worker) + idx 別 mpsc | viewer context 内で idx ごとに最新 1 本。可視ページが複数なら別 idx は並行し得る | source 解像度 edit chain の lazy LocalAdjust DB / JSON load、mask resize、local compose、および Conceal DB read、deflate / JSON decode、shape raster、conceal compose を UI thread 外で行う。local と conceal は同じ `local_adjust_pending[idx]` slot を共有し、後段が必要な local 完了前に conceal を誤った下位 source へ合成しない。CPU 結果だけを返し、generation / key を UI 側で検証した後、共通予算で 1 フレーム 1 枚だけ GPU upload する。詳細は §3.2.2 |
 | AI 消しゴム (MI-GAN inpaint) | `std::thread` (使い捨て) + mpsc | preview/commit ごと | erase ツールの補完推論 (`erase_inpaint_pending`、final pipeline とは別経路、§3.3) |
@@ -1306,6 +1307,27 @@ pending 中は追加ホイール入力を捨て、queue も delta 累積もし�
 > PDF retained orphan はこの retained layer へ store するためだけの例外であり、表示中
 > キャッシュ / GPU 常駐分を延命するものではない。残る課題は、表示中キャッシュ / GPU 常駐分の
 > バイト予算と、高速ページ送り中の AI 起動デバウンスである。
+
+### 深度推論 worker (3D 写真・段 A)
+
+`depth_estimation.rs` の process 共通 `DepthWorker::shared()` が常駐 thread `depth-estimation` を
+1 本だけ所有する。待機要求は `Mutex + Condvar` の slot 1 件 (最新が勝つ)。推論・画像処理・送信中は
+queue mutex を保持しない。新要求は同 context の active 要求と旧 queued 要求を取り消し、
+別 context の active 要求は変更しない。旧 queued の画像・receiver の送信側・lease は差替時に解放する。
+
+`DepthPending` は `context + request_id + TextureId`、`Arc<AtomicBool>` と専用 receiver を持つ。
+Drop で取消、結果の採用でも現在 context / key / request_id / cancel を照合するため、
+同じ TextureId で再要求しても古い結果が届かない。共有結果 channel・待機件数 counter・retry sleep は使わない。
+runtime は既存 `AiRuntimeInitOwner::wait_terminal_while` で取消を見ながら待つ。
+App から受け取る `local_ai_activity_lease()` は queued / active の実寿命を覆い、取消後も ORT 実行中は保持する。
+モデル I/O と session load、ImageNet 正規化、推論、`depth_preprocess` は worker 上だけで行う。
+完了を専用 receiver へ送った後、要求元 viewport に `request_repaint_of` を出す。
+perf の `depth/inference` / `depth/preprocess` は input_seq と request_id / context / ms を記録する。
+失敗はログと要求の Err、次要求への自動 retry はしない。段 A では viewer 状態への組込はまだ行わない。
+
+アドオン管理は `addon.rs` の `AddonKind` で VLM と深度の転送・分割結合・sha256・配置・取消・再開を共有する。
+`DepthSetup` は App 所有の cached status と非blocking poll だけを UI に公開し、scan / HTTP / 削除は背景 thread。
+深度 session の cold load 時だけ pack 全体を検証し、ロード済み session の要求では再度 hash しない。
 
 ### 3.2.2 edit materialization の ownership / generation / cancel / upload
 

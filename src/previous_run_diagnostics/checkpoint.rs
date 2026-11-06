@@ -35,6 +35,7 @@ pub enum DiagnosticModel {
     DenoiseRealplksr,
     InpaintMiGan,
     SubjectMatte,
+    DepthDa3MonoLarge,
 }
 impl From<crate::ai::ModelKind> for DiagnosticModel {
     fn from(model: crate::ai::ModelKind) -> Self {
@@ -48,6 +49,7 @@ impl From<crate::ai::ModelKind> for DiagnosticModel {
             ModelKind::DenoiseRealplksr => Self::DenoiseRealplksr,
             ModelKind::InpaintMiGan => Self::InpaintMiGan,
             ModelKind::SubjectMatte => Self::SubjectMatte,
+            ModelKind::DepthDa3MonoLarge => Self::DepthDa3MonoLarge,
         }
     }
 }

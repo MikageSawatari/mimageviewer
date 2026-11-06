@@ -1,6 +1,6 @@
 # 3D 写真 (AI 深度による視差表示と書き出し) — 設計書
 
-状態: **設計確定 (2026-11-06)。実装前の独立レビュー 4 回で段 A〜C とも着手可 (§16)**。実装は未着手。worktree `G:\home\mimageviewer-depth`、ブランチ
+状態: **設計確定 (2026-11-06)。実装前の独立レビュー 4 回で段 A〜C とも着手可 (§16)**。段 A は実装・指定自動テスト・独立レビュー・確認用 build 完了 (§10)。ClaudeCode の検収待ち。worktree `G:\home\mimageviewer-depth`、ブランチ
 `depth-parallax`。調査とスパイクの記録は [depth-parallax-research.md](depth-parallax-research.md)。
 試験実装の結果がよければ、**v5 リリースの次のリリース**に入れる (2026-11-06 利用者方針)。
 バックログ番号は未採番。
@@ -519,12 +519,99 @@ pub enum DepthSourcePhase {
 
 | 段 | 内容 | 受入れ |
 | --- | --- | --- |
-| A | 配布用モデルの作成スクリプト、アドオン (VLM の共通化)、`ModelKind`、深度 worker、前処理の Rust 版 | 前処理をスパイクの Python と同じ入力で比べ、差が小さいこと (テストに固定値で残す)。VLM アドオンの既存テストが通る |
+| A | **実装済み (2026-11-07)**。配布用モデルの作成スクリプト、アドオン (VLM の共通化)、`ModelKind`、深度 worker、前処理の Rust 版。詳細・検証記録は直下 | Python 固定 fixture 比較を含む対象 82/82、VLM アドオン既存テスト・snapshot 成功。実モデル 1/1、Python stretch 相関 1.00000000 |
 | B | 3D モード: 状態・入口・遷移・占有モードの述語 (§6.5 の表)、GPU の色テクスチャと読み戻し、シェーダ、マウス追従、パネル、キー | 状態遷移テスト、入口条件のテスト、360° の既存テスト、シェーダの不変条件テスト (§11) |
 | C | 書き出し (GIF / APNG / MP4、映像だけの muxer、進行ダイアログ) | 書き出したファイルを読み戻してフレーム数・遅延・寸法を確かめるテスト。音楽ビデオの書き出しのテストが通る |
 | D | 文書 (§12) と製品ページ・マニュアル | 公開文書の検査スクリプト |
 
 各段のあと独立レビュー (Sol / xhigh)。実機確認は利用者 (`build-dev.ps1` のバイナリ)。
+
+### 段 A の実装記録 (2026-11-07)
+
+- `tools/depth_model/build_depth_addon.py` でローカルの SpatialHub 原本を fp16 化・504 固定・単一 ONNX 化。
+  Apache-2.0 全文は既存の `vendor/egui/LICENSE-APACHE` を流用し、変更内容入り NOTICE と
+  `depth-model-index.json` を生成する。実変換先は git 管理外の `target/depth-addon/`。
+- `addon.rs` に転送・検証・連結・配置・管理 worker を集約し、`AddonKind` で VLM / 深度を選ぶ。
+  VLM 固有の GGUF / model ID / 4 ファイル検証は `vlm_addon.rs`、深度の固定 ONNX / LICENSE /
+  NOTICE 検証は `depth_addon.rs`。保存先・配布タグは §3.2 のとおり。既存 downloader の
+  Range 再開・取消時 staging 保持・転送再試行を共用する (§13 に新たな回復機構は足さない)。
+- App の `DepthSetup` は導入状態を cache し、設定の「アドオン」に導入・削除・取消・進行を追加。
+  VLM とボタン・進捗描画を共用する。`DepthSetup::installed_model_path` (cached status の判定) と
+  `App::request_depth_addon_setup` が段 B の入口用 API。3D モードの状態・案内からの入場は未実装。
+- `ModelKind::DepthDa3MonoLarge` と `depth_estimation.rs` を追加。共通 runtime owner を待ち、
+  `load_model` / `with_session` で固定形の fp32 I/O を実行する。モデルの完全検証は cold load 時だけで、
+  保持済み session があればページごとのファイル hash は行わない。TRT pack / 拡大モデル一覧には含めない。
+- worker は process に 1 本、`Mutex + Condvar` の待機 slot は最新 1 件。同 context の active 要求を
+  supersede し、別 context の active 要求は取り消さない。slot の差替は旧 queued 要求を取消・解放する。
+  `DepthPending` は要求ごとの receiver と cancel を持ち、Drop と採用時にも取消を照合する。
+  `context + request_id + key` を照合し、完了後に要求元 viewport を repaint。lease は実処理終端まで保持する。
+- `depth_preprocess.rs` に percentile / cubic / guided filter / scaled 膨張・Gaussian / median を実装。
+  `DepthMap.values` は `Vec<half::f16>`、median は量子化前の f32。ガンマ・焦点は掛けない。
+  非有限の disparity は前処理入口で拒否する (モデル出力の非正・非有限 depth は先に視差 0 へ変換)。
+  Python / OpenCV の段別 fixture は 16,861 bytes。大サイズ case は全処理後の境界・中央 sample と全量 median を記録する。
+
+設計の機能変更はない。膨張半径の整数化は Python / OpenCV に合わせた round-to-even、ぼかしは
+長辺比例の実数 sigma とする。取り消し token は既存の viewer / BiRefNet と同じ `Arc<AtomicBool>`。
+要求は `App::local_ai_activity_lease()` を受け取り、待機中も含めて実処理終了まで保持する。
+ViewerContextBundle / GPU / キー・3D パネルは段 B、公開文書は段 D に残す。
+段 B で導入・削除と 3D 要求を接続するときは、§3.4 の session 保持／既存 reload 契約と
+表示側の取消を整合させる。UI から `unload_model` を直接呼んで推論 mutex を待つ経路は作らない。
+要求を出す側は既存 AI と同じ `App::ensure_ai_runtime()` で初期化を開始してから共有 owner を渡す。
+初回の導入確認は lazy scan の完了を待って判定し、未確認を未導入として再取得させない。
+
+#### 段 A の検証記録
+
+対象は `depth-parallax` の本段の未コミット差分。全 Cargo コマンドで
+`MSBUILDDISABLENODEREUSE=1`。native 依存の初回 24 並列 build で FFmpeg bindgen の
+access violation と TurboJPEG の MSBuild 失敗が発生したため、TurboJPEG を `/m:1 /nr:false`
+で構築し、その後は `CARGO_BUILD_JOBS=1` で検証した。製品テストの失敗とは区別する。
+
+| 実行 | 結果・証拠 |
+| --- | --- |
+| `python -m unittest discover -s tools/depth_model -p test_build_depth_addon.py` (spike venv) | 2/2 成功。fp32 I/O、fp16 initializer、固定入力、外部 tensor なし、index の hash / bytes、別 export の拒否。`target/depth-python-tests.log` |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/^addon::/) \| test(/depth\|vlm_addon/) \| test(=ai::trt_worker_lifecycle::tests::models_outside_the_pack_never_start_the_worker)'` | 最終 82/82 成功、exit 0。UPDATE 指定なし。前処理 4 件、worker の取消・相関・別 context、VLM 共通化の既存回帰・snapshot、深度 pack の欠落 / 同長 hash 破損 / size 不一致、UI 小画面・busy を含む。`target/depth-tests-final.log` |
+| 新規 UI snapshot だけ `UPDATE_SNAPSHOTS=1` で明示生成 | 2/2 成功。その後上の通常比較も成功。`depth_addon_confirm_dark.png` 64,353 bytes、`depth_addon_preferences_dark.png` 49,555 bytes。実装者・独立 reviewer が日本語、ライセンス、取得元、保存先、ボタンの欠け・重なりが無いことを目視。`target/depth-snapshot-update.log` |
+| `MIV_DEPTH_MODEL_DIR=target/depth-addon`、nextest `--run-ignored only -E 'test(=depth_estimation::tests::depth_real_model_matches_python_static_stretch)' --success-output immediate` | 1/1 成功 (2.69 秒)。実写真 `target/depth-spike/samples/IMG_0001.JPG` (EXIF 反映後 720×960) を同じ `INTER_CUBIC` stretch で入れ、504×504 出力・Python 相関 **1.00000000**。共有 `AiRuntimeInitOwner` / DirectML で実行。通常 profile は使わず test data dir に隔離。`target/depth-real-model.log` |
+| `cargo check --offline -p mimageviewer --bin mimageviewer-core` | 成功、exit 0。`target/depth-check-final.log` |
+| `cargo fmt` (引数なし) → `cargo fmt --check` | 成功、exit 0。`target/depth-fmt.log` |
+| `python scripts/check_ui_glyphs.py` | 危険グリフ 0、exit 0。`target/depth-glyphs.log` |
+| `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` (`CARGO_NET_OFFLINE=true`) | 成功、exit 0。通常 feature / 非 portable の core と Remote / EPUB / MCP / music-video editor の 5 exe、FFmpeg 6 DLL と CRT 4 DLL を配置。PE 依存検査 runtime=4 / pe=5 成功 (`target/vcrt-pe-reports/dev-runtime.json`)。core は `target/dev-runtime/mimageviewer-core.exe`、391,114,240 bytes。実行していない |
+
+実変換したモデルは 671,032,016 bytes、SHA-256
+`0f5ff3be208d04bc34937946546d75b6d12d8aba4aa2cf1cc26a6bde2c26ed95`。
+`tools/depth_model/README.md` に生成・fixture・実写真 oracle の再生成コマンドを残した。
+モデル・写真 oracle・build/test log はすべて git 管理外。ネットからモデルや大きなファイルは取得していない。
+全体 gate / 実アプリの対話試験は未実施 (今回の指定は範囲を絞った検証)。製品起動・実機検収の代用とはしない。
+公開配信先での実取得も未確認 (転送・配置はローカル HTTP サーバで検証)。利用者の確認対象は、設定の
+「アドオン」から「3D 写真の追加モデル」の表示と取得案内の開閉。3D 表示の入口自体は段 B。
+通常版／トレイ常駐を終了してから、利用者が次のコマンドで起動する。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+これは高速ビルド用の通常 profile で、既定の `%APPDATA%\mimageviewer` の実設定・データを更新し得る。
+single-instance mutex を通常版と共有する。エージェントによる起動は行っていない。
+
+変更ファイル:
+
+- 依存・module: `Cargo.toml`、`Cargo.lock`、`src/lib.rs`。
+- 転送・導入: `src/addon.rs`、`src/depth_addon.rs`、`src/vlm_addon.rs`、`src/vlm_addon_download.rs`。
+- worker・推論: `src/depth_estimation.rs`、`src/depth_preprocess.rs`、`src/ai/mod.rs`、
+  `src/ai/model_manager.rs`、`src/ai/tensorrt_builder.rs`、`src/ai/trt_worker_lifecycle.rs`、
+  `src/previous_run_diagnostics.rs`、`src/previous_run_diagnostics/checkpoint.rs`。
+- 設定 UI・App: `src/app.rs`、`src/ui_dialogs/mod.rs`、`src/ui_dialogs/depth_addon.rs`、
+  `src/ui_dialogs/model_addon.rs`、`src/ui_dialogs/vlm_addon.rs`、`src/ui_dialogs/preferences.rs`、
+  `src/ui_dialogs/preferences/pages.rs`。
+- 生成・fixture: `tools/depth_model/build_depth_addon.py`、`generate_fixtures.py`、
+  `test_build_depth_addon.py`、`requirements.txt`、`README.md` (いずれも同ディレクトリ)、
+  `tests/fixtures/depth/preprocess.json`、`tests/snapshots/depth_addon_confirm_dark.png`、
+  `tests/snapshots/depth_addon_preferences_dark.png`。
+- 設計文書: 本書、`docs/async-architecture.md`、`docs/architecture-overview.md`。
+
+独立レビュー (GPT-6.1 Sol / xhigh) は事前の所有境界と完成差分・追加テスト・新 PNG・検証ログを確認し、
+P1/P2 指摘なし、段 A の実装は受入可と判断。最終検収と commit は ClaudeCode が行う。
+この worktree では stage / commit を行っていない。
 
 §6.5 の分類表は段 B の実装担当がここに追記する。
 

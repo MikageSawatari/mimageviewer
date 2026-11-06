@@ -59,12 +59,16 @@ mod wgpu_backend_policy;
 mod wheel_input;
 
 pub mod activity_gate;
+pub mod addon;
 pub mod adjustment;
 pub mod adjustment_db;
 pub mod ai;
 pub mod ai_caption_db;
 mod app;
 pub(crate) mod caption_display_cache;
+pub mod depth_addon;
+pub(crate) mod depth_estimation;
+pub(crate) mod depth_preprocess;
 pub mod detached_window_geometry;
 pub(crate) mod feedback;
 #[doc(hidden)]

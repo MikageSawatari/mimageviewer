@@ -602,7 +602,11 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `ai_caption_db.rs` | ローカル AI 説明文の保存基盤。作成ジョブの保存役が worker thread 上で `BEGIN IMMEDIATE` 後に入力署名を照合し、成功／失敗の上書き規則を適用する。DB trigger が全体 revision と索引反映待ちを管理し、STORES 経由の改名・削除・復元にも適用する。表示 worker は DB を作らない読み取り専用 open を使う。検索接続は後段 |
 | `caption_display_cache.rs` | bundle外の共有 `CaptionDisplayCache`、最大512件の保持と `epoch`／`gen`、専用の単一read-only SELECT＋画像署名／本の表紙照合workerを持つ。Appがroot pollと書き手・固定表紙の変更の採用点から接続する |
 | `app/book_cover.rs` | 本の AI 説明文用の表紙解決。既存の一覧計画・固定表紙・変換 cache 候補とサムネイルの2段の解決をworkerから呼び、読む位置・`cover_ref`・元ファイルの署名と世代leaseを返す。未変換・パスワード不足・動画の表紙を値で区別し、変換や入力画面は起動しない |
-| `vlm_addon.rs` / `vlm_addon_download.rs` | ローカル AI 説明文モデルの導入 (V1-3b)。固定配布一覧・安全な名前・分割と全体の SHA-256 を検証する。App の単一 owner が導入／取消／削除を完了通知まで排他にし、状態確認・HTTP・連結・配置・削除は worker 上だけで行う |
+| `addon.rs` / `vlm_addon_download.rs` | VLM / 深度アドオン共通の schema・HTTP・分割結合・SHA-256・一時ファイルからの配置・取消・再開。`AddonKind` と App 所有の管理 owner が導入／取消／削除を完了通知まで排他にし、状態確認・HTTP・配置・削除は worker 上だけで行う |
+| `vlm_addon.rs` / `depth_addon.rs` | 種別ごとの配布契約。VLM の GGUF / model ID / 4 ファイル検証と互換 API を残し、深度は固定 ONNX / LICENSE / NOTICE を検証。深度保存先は `<data_dir>/addons/depth/` |
+| `depth_estimation.rs` | 3D 写真の要求ごとの pending / cancel / reply と process 共通 worker。Condvar と最新 1 件の slot、context 別の supersession、共通 runtime の初期化待ち・固定 504² DA3 推論・要求元 viewport の repaint。段 A は viewer 状態未接続 |
+| `depth_preprocess.rs` | worker 専用の視差正規化・bicubic・guided filter・長辺比例の膨張とぼかし・中央値。R16Float 用 f16 を返し、ガンマ・焦点は描画側へ残す |
+| `ui_dialogs/depth_addon.rs` / `ui_dialogs/model_addon.rs` | App の導入状態 cache から深度の設定ページ・取得／削除 UI を描く。VLM とボタン・進捗を共用し、UI にファイル I/O を追加しない |
 | `ui_dialogs/vlm_addon.rs` | GPU 判定を必要時に一度だけ worker で実行し、設定ページへ cached view を渡す。初回の確認だけ modal、長い取得は modeless。取得成功時だけ操作時点の対象パスを作成ジョブへ一回渡す。設定からの導入だけではジョブを開始しない |
 | `mask_db.rs` | 消しゴムマスクの SQLite 永続化 (1bit/pixel deflate 圧縮 + ベクタオブジェクト JSON) |
 | `conceal_db.rs` | 隠蔽加工マスクの SQLite 永続化。`mask_db.rs` と同じビットマップ + ベクタ構造を使い、マスクスロットも管理 |
@@ -801,6 +805,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `rating.db` | レーティング (★1〜5、0 は未登録)。ページ単位 (画像/ZIP 内画像/PDF ページ) とコンテナ (フォルダ/ZIP/PDF 本体) を同一テーブルに格納。キー形式の違い (`::` の有無) で区別 | `rating_db.rs` |
 | `ai_caption.db`（未リリース） | schema 1。物理項目キーごとの説明文・画像内の文字・検索語・入力署名を保存。rollback journal、trigger による全体 revision と削除記録。STORES は Follow／ページコピーなし、ページ追加先は作成前に初期化。説明文だけでは内容同一性の台帳を作らず、既存台帳のある項目だけ復元に便乗する | `ai_caption_db.rs` |
 | `addons/vlm/` | 利用者の明示操作で取得するモデル。固定 GitHub Releases の一覧と分割・全体hashを検証し、`packs/<model_id>/`、`INSTALL_OK`、`active.json` で導入を管理する。モデル削除では `ai_caption.db` を消さない | `vlm_addon.rs` / `vlm_addon_download.rs` |
+| `addons/depth/` | 3D 写真用モデル (fp16 DA3 Mono-Large、固定 504²) と LICENSE / NOTICE。VLM と同じ検証・配置契約で導入し、本体に重みを内包しない | `addon.rs` / `depth_addon.rs` |
 | `vlm/workers/<hash>/mimageviewer-vlm.exe` | 通常版の内容別展開先。背景threadで配置する。portable はexe隣の同梱workerを使う。モデルの重みは本体へ内包しない | `ai/vlm_worker_extract.rs` |
 | `search_index.db` | Ctrl+S 用。お気に入り配下のフォルダ/ZIP/PDF/動画名索引 | `search_index_db.rs` |
 | `fts_index/` | Ctrl+G 用 Tantivy index (複数 segment + meta.json)。bigram 候補絞り込み。旧 `tags` STORED は tags.db 移行専用 | `fts_index.rs` → `ingest_worker.rs` |

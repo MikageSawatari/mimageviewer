@@ -7497,6 +7497,17 @@ pub(super) fn page_ai_caption(ui: &mut egui::Ui, state: &mut PreferencesState) {
     });
 }
 
+/// Depth addon shares the cached management controls with the VLM page.
+pub(super) fn page_depth_addon(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    anchored(ui, state, "depth-addon/manage", |ui, state| {
+        let (download, remove, folder) =
+            super::super::depth_addon::draw_preferences(ui, &state.depth_view);
+        state.depth_download_requested |= download;
+        state.depth_remove_requested |= remove;
+        state.depth_folder_requested |= folder;
+    });
+}
+
 /// 編集用追加パック (オノマトペ向けフォント + 被写体分離モデル) の管理ページ。
 /// `from_settings` の snapshot を表示し、実際の処理は App に要求する。
 pub(super) fn page_editing_addon(ui: &mut egui::Ui, state: &mut PreferencesState) {

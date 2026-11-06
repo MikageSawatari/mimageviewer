@@ -204,8 +204,12 @@ impl ModelManager {
     }
 
     /// モデルファイルのパスを返す。
-    /// モデルは exe に同梱されているため常に存在する。
+    /// 深度は追加アドオンを worker 側で検証する。未導入・不正なら None。
+    /// その他は既存の同梱モデルを参照する。UI から深度の解決を呼ばないこと。
     pub fn model_path(&self, kind: ModelKind) -> Option<PathBuf> {
+        if kind == ModelKind::DepthDa3MonoLarge {
+            return crate::depth_addon::model_path();
+        }
         let filename = Self::model_filename(kind)?;
         let path = self.models_dir.join(filename);
         if path.exists() { Some(path) } else { None }

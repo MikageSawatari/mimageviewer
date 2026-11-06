@@ -19175,6 +19175,7 @@ pub struct App {
     /// true の間は編集系入口での再 prompt を抑制する (spec §4.1 `declined_this_session`)。
     pub(crate) editing_addon_declined_session: bool,
     pub(crate) vlm_setup: crate::ui_dialogs::vlm_addon::VlmSetup,
+    pub(crate) depth_setup: crate::ui_dialogs::depth_addon::DepthSetup,
     #[cfg(windows)]
     pub(crate) caption_job: Option<crate::ui_dialogs::caption_job::CaptionJob>,
     /// Progress-window visibility is independent of the caption worker lifetime.
@@ -21972,6 +21973,7 @@ impl App {
             editing_addon_install_state: None,
             editing_addon_declined_session: false,
             vlm_setup: Default::default(),
+            depth_setup: Default::default(),
             #[cfg(windows)]
             caption_job: None,
             #[cfg(windows)]
@@ -24172,6 +24174,7 @@ impl App {
                 => "subfolder_expansion_install_pending",
             self.editing_addon_install_state.is_some() => "editing_addon_install",
             self.vlm_setup.modal_open() => "vlm_model_setup",
+            self.depth_setup.modal_open() => "depth_model_setup",
             self.text_subdialog_open() => "text_subdialog",
         ];
         None
@@ -99866,6 +99869,7 @@ impl App {
         // TRT pack オンラインインストールダイアログ (環境設定から起動)。
         self.show_trt_install_dialog(ctx);
         self.show_vlm_addon_dialog(ctx);
+        self.show_depth_addon_dialog(ctx);
         // 編集用追加パック (フォント + 被写体分離モデル) のオンライン取得ダイアログ。
         // ⚠️ フルスクリーン中はフルスクリーンビューポート側 (ui_fullscreen.rs) で描画する
         //    (VST3 マネージャと同様。両ビューポートで描くと egui::Window の位置が二重管理に
@@ -100538,6 +100542,7 @@ impl eframe::App for App {
         self.cut_clipboard.poll();
         self.poll_clipboard_capture(ctx);
         self.poll_vlm_setup(ctx);
+        self.poll_depth_setup(ctx);
         #[cfg(windows)]
         self.poll_caption_job();
         self.caption_display.poll();

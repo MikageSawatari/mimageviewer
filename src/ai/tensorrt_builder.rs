@@ -59,7 +59,10 @@ fn run_worker_with_args(args: Vec<String>) -> ! {
     // ここでも build を拒否しておかないと、ユーザが `--tensorrt-build realesr_general_v3`
     // を打つと無意味な engine を生成し、`build_trt_pack` 検証で「想定外の engine が
     // 余分にある」状態を作ってしまう。
-    if matches!(kind, ModelKind::UpscaleRealEsrGeneralV3) {
+    if matches!(
+        kind,
+        ModelKind::UpscaleRealEsrGeneralV3 | ModelKind::DepthDa3MonoLarge
+    ) {
         eprintln!(
             "[skip] {kind_str}: TRT pack v3 ではこのモデルは DirectML 専用です。\n\
              build をスキップします (engine cache は作成されません)。"
@@ -158,6 +161,9 @@ fn warmup_input_shape(kind: ModelKind) -> (usize, usize, usize, usize) {
         // SubjectMatte (BiRefNet) は model_uses_trt_worker=false なので TRT engine は作らないが、
         // match の網羅性のため shape を残す (= BiRefNet 入力 1024²)。
         ModelKind::SubjectMatte => (1, 3, 1024, 1024),
+        // Depth is never admitted above: its three 5D camera/image inputs are
+        // supplied by depth_estimation through the shared DirectML runtime.
+        ModelKind::DepthDa3MonoLarge => unreachable!("depth has no TRT pack warmup"),
         ModelKind::UpscaleRealEsrGeneralV3 => (1, 3, 512, 512),
         ModelKind::UpscaleRealEsrganX4Plus
         | ModelKind::UpscaleRealEsrganAnime6B

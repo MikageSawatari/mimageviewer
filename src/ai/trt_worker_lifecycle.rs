@@ -2052,6 +2052,7 @@ mod tests {
         for kind in [
             ModelKind::InpaintMiGan,
             ModelKind::SubjectMatte,
+            ModelKind::DepthDa3MonoLarge,
             ModelKind::UpscaleRealEsrGeneralV3,
         ] {
             assert!(!owner.route_or_begin(kind).uses_worker());
