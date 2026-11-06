@@ -2726,6 +2726,7 @@ impl App {
                 ),
             },
             token,
+            None,
         );
         let position_key =
             super::top_level_grid_view::SubfolderExpansionPositionKey::new(&root, &roots);

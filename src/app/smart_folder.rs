@@ -3980,6 +3980,7 @@ impl App {
                     None,
                     authority,
                     prepared_visible,
+                    None,
                 );
                 if self.settings.follow_document_reading_direction {
                     let defaults = super::SpreadRestoreDefaults::for_book(&self.settings);
@@ -4048,6 +4049,7 @@ impl App {
                     None,
                     authority,
                     prepared_visible,
+                    None,
                 );
                 self.pdf_placeholder_count = Some(page_count);
                 let owner = super::OpenRequestOwner::MainGridArchive(

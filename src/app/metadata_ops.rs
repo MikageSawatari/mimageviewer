@@ -247,14 +247,27 @@ pub(super) fn facet_ai_filter_applies(item: &GridItem) -> bool {
 ///
 /// component-boundary も守る (`/books/book-a` と `/books/book-a-extra` を別扱い)。
 pub(super) fn path_in_subtree_ci(current: &std::path::Path, anchor: &std::path::Path) -> bool {
-    let norm = |p: &std::path::Path| p.to_string_lossy().to_lowercase().replace('\\', "/");
+    let norm = |p: &std::path::Path| {
+        let mut key = p.to_string_lossy().to_lowercase().replace('\\', "/");
+        // Ignore trailing separators, retaining absolute / and C:/ roots. In
+        // particular C: (drive-relative) must not become equal to C:/.
+        let root_len = if key.starts_with('/') {
+            1
+        } else if key.as_bytes().get(1) == Some(&b':') && key.as_bytes().get(2) == Some(&b'/') {
+            3
+        } else {
+            0
+        };
+        key.truncate(key.trim_end_matches('/').len().max(root_len));
+        key
+    };
     let cur = norm(current);
     let anc = norm(anchor);
     if cur == anc {
         return true;
     }
     cur.strip_prefix(&anc)
-        .is_some_and(|tail| tail.starts_with('/'))
+        .is_some_and(|tail| anc.ends_with('/') || tail.starts_with('/'))
 }
 
 /// パスからファイル名のステム部分を小文字で取得するヘルパー。

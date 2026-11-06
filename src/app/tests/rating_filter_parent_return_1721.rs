@@ -281,3 +281,246 @@ fn synthetic_search_and_smart_origins_allow_new_physical_entry() {
         assert!(app.restore_rating_filter_suppression());
     }
 }
+
+fn write_reload_zip(backing: &Path, remove_a: bool) {
+    use std::io::Write as _;
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::RgbImage::new(2, 2)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let mut zip = ::zip::ZipWriter::new(std::fs::File::create(backing).unwrap());
+    for name in if remove_a {
+        ["unrated-root.png", "B/001.png"]
+    } else {
+        ["A/001.png", "B/001.png"]
+    } {
+        zip.start_file(name, ::zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(png.get_ref()).unwrap();
+    }
+    zip.finish().unwrap();
+}
+
+fn zip_book_reload(book: Book, outer_starred: bool, remove_a: bool) {
+    let mut app = setup_app_for_test();
+    configure(&mut app);
+    app.settings.auto_fullscreen_zip_pdf = false;
+    let ctx = egui::Context::default();
+    let root = app.tmp.path().join("zip-reload");
+    std::fs::create_dir(&root).unwrap();
+    let (row, backing) = fixture(&mut app, &root, book);
+    let source = row.drag_source_path().unwrap().to_path_buf();
+    write_reload_zip(&backing, false);
+    if matches!(book, Book::Converted) {
+        let stamp = std::fs::metadata(&source).unwrap();
+        app.archive_cache_db
+            .as_ref()
+            .unwrap()
+            .record(
+                &source,
+                crate::ui_helpers::mtime_secs(&stamp),
+                stamp.len() as i64,
+                crate::archive_converter::ArchiveFormat::SevenZ,
+                &backing,
+                std::fs::metadata(&backing).unwrap().len() as i64,
+                2,
+                false,
+            )
+            .unwrap();
+    }
+    rate(&app, &source, if outer_starred { 4 } else { 0 });
+    let anchor = source.join("A");
+    rate(&app, &anchor, 4);
+    app.settings.rating_filter = FOUR;
+    app.load_folder(root);
+    let outcome = app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+        source.clone(),
+        false,
+        OpenRequestOwner::Navigation,
+        StartupListIntent::ExplicitList,
+    );
+    assert!(matches!(
+        outcome,
+        FolderOpenOutcome::Loaded | FolderOpenOutcome::Classifying
+    ));
+    settle(&mut app, &ctx, None);
+    // Explicit filter on the outer list, whether or not the outer ZIP is rated.
+    app.restore_rating_filter_suppression();
+    app.rebuild_visible_indices();
+    let a = app
+        .items
+        .iter()
+        .position(|item| matches!(item, GridItem::ZipDir { dir_prefix, .. } if dir_prefix == "A/"))
+        .unwrap();
+    assert_eq!(app.current_grid_order(), &[a]);
+    app.selected = Some(a);
+    grid_key(&mut app, egui::Key::Enter, egui::Modifiers::NONE);
+    settle(&mut app, &ctx, None);
+    assert_eq!(
+        app.rating_filter_suppressed_at.as_ref().map(|(p, _)| p),
+        Some(&anchor)
+    );
+    assert_eq!(visible(&app), app.items);
+    assert_eq!(app.items.len(), 1);
+    assert_eq!(app.get_rating(0), 0);
+
+    if remove_a {
+        write_reload_zip(&backing, true);
+    }
+    // The real F5 refresh owner captures the internal prefix and re-enumerates.
+    app.reload_current_folder_preserving_override();
+    settle(&mut app, &ctx, None);
+    assert_eq!(app.effective_folder(), Some(source));
+    assert_eq!(app.current_folder, Some(backing));
+    assert_eq!(app.settings.rating_filter, FOUR);
+    if remove_a {
+        assert!(app.zip_nav.as_ref().unwrap().at_root());
+        assert!(app.rating_filter_suppressed_at.is_none());
+        assert_eq!(app.effective_rating_filter(), FOUR);
+        assert_eq!(app.items.len(), 2, "the refreshed ancestor has real rows");
+        assert!(
+            visible(&app).is_empty(),
+            "unrated ancestor rows must be filtered"
+        );
+    } else {
+        assert_eq!(app.zip_nav.as_ref().unwrap().current(), &["A".to_owned()]);
+        assert_eq!(
+            app.rating_filter_suppressed_at.as_ref().map(|(p, _)| p),
+            Some(&anchor)
+        );
+        assert_eq!(app.effective_rating_filter(), [true; 6]);
+        assert_eq!(app.items.len(), 1);
+        assert_eq!(visible(&app), app.items);
+        assert_eq!(app.get_rating(0), 0);
+    }
+}
+
+macro_rules! reload_cases {
+    ($name:ident, $book:ident) => {
+        mod $name {
+            use super::*;
+            #[test]
+            fn rated_outer_f5_keeps_internal_anchor() {
+                zip_book_reload(Book::$book, true, false);
+            }
+            #[test]
+            fn unrated_outer_f5_keeps_internal_anchor() {
+                zip_book_reload(Book::$book, false, false);
+            }
+            #[test]
+            fn rated_outer_f5_missing_level_restores_filter() {
+                zip_book_reload(Book::$book, true, true);
+            }
+            #[test]
+            fn unrated_outer_f5_missing_level_restores_filter() {
+                zip_book_reload(Book::$book, false, true);
+            }
+        }
+    };
+}
+reload_cases!(zip_reload, Zip);
+reload_cases!(converted_reload, Converted);
+
+#[test]
+fn synthetic_origins_enter_starred_physical_ancestor_of_data_dir() {
+    let mut app = setup_app_for_test();
+    configure(&mut app);
+    let parent = crate::data_dir::get().parent().unwrap().to_path_buf();
+    rate(&app, &parent, 4); // Only the disposable rating DB is written.
+    app.settings.rating_filter = FOUR;
+    for origin in [
+        search_results_synthetic_path(),
+        reading_history_synthetic_path(),
+        bookmark_view_synthetic_path(),
+        rating_view_synthetic_path(),
+        subfolder_expansion_synthetic_path(),
+        smart_folder::smart_folder_synthetic_path(uuid::Uuid::nil()),
+        drive_list_synthetic_path(),
+    ] {
+        assert!(is_synthetic_view_path(&origin));
+        assert!(path_in_subtree_ci(&origin, &parent));
+        // Exercise the adoption boundary without enumerating the shared temp parent.
+        app.current_folder = Some(parent.clone());
+        app.maybe_restore_rating_filter_if_out_of_scope(Some(&origin), None);
+        assert_eq!(
+            app.rating_filter_suppressed_at.as_ref().map(|(p, _)| p),
+            Some(&parent)
+        );
+        assert_eq!(app.effective_rating_filter(), [true; 6]);
+        assert!(app.restore_rating_filter_suppression());
+    }
+    assert_eq!(app.settings.rating_filter, FOUR);
+}
+
+#[test]
+fn drive_root_return_keeps_explicit_filter_and_visible_rows_without_drive_io() {
+    let mut app = setup_app_for_test();
+    configure(&mut app);
+    let root = PathBuf::from("Z:/");
+    let book = PathBuf::from(r"z:\book.zip");
+    let row = GridItem::ZipFile(book.clone());
+    rate(&app, &root, 4);
+    rate(&app, &book, 4);
+    app.settings.rating_filter = FOUR;
+    app.items = vec![row.clone(), GridItem::Image(root.join("unrated.png"))];
+    app.current_folder = Some(root);
+    app.rating_filter_suppressed_at = Some((book.clone(), FOUR));
+    app.maybe_restore_rating_filter_if_out_of_scope(Some(&book), None);
+    app.rebuild_visible_indices();
+    assert!(app.rating_filter_suppressed_at.is_none());
+    assert_eq!(app.effective_rating_filter(), FOUR);
+    assert_eq!(app.settings.rating_filter, FOUR);
+    assert_eq!(visible(&app), vec![row]);
+}
+
+#[test]
+fn non_zip_same_location_restores_stale_internal_anchor() {
+    let mut app = setup_app_for_test();
+    configure(&mut app);
+    app.settings.rating_filter = FOUR;
+    for path in ["Z:/folder", "Z:/folder.zip", "Z:/book.pdf"] {
+        let current = PathBuf::from(path);
+        app.current_folder = Some(current.clone());
+        app.rating_filter_suppressed_at = Some((current.join("stale-child"), FOUR));
+        app.maybe_restore_rating_filter_if_out_of_scope(Some(&current), None);
+        assert!(app.rating_filter_suppressed_at.is_none(), "{path}");
+        assert_eq!(app.effective_rating_filter(), FOUR);
+    }
+}
+
+#[test]
+fn subtree_helper_handles_roots_and_trailing_separators() {
+    for (child, root) in [
+        (r"C:\book.zip", r"c:\"),
+        ("c:/book.zip", "C:/"),
+        ("C:/", r"c:\"),
+        ("/book.zip", "/"),
+        ("/", "/"),
+        ("C:/books", "c:/books/"),
+        ("C:/books/", "c:/books"),
+        ("C:/books/book.zip", "c:/books///"),
+        (r"\\server\share\book.zip", "//SERVER/share/"),
+    ] {
+        assert!(
+            path_in_subtree_ci(Path::new(child), Path::new(root)),
+            "{child} under {root}"
+        );
+    }
+}
+
+#[test]
+fn subtree_helper_preserves_component_and_drive_boundaries() {
+    for (child, root) in [
+        ("D:/book.zip", "C:/"),
+        ("C:book.zip", "C:/"),
+        ("C:", "C:/"),
+        ("C:/books-extra/book.zip", "C:/books/"),
+        ("C:/books", "C:/books/child/"),
+        ("//server/share-extra/book.zip", "//server/share/"),
+    ] {
+        assert!(
+            !path_in_subtree_ci(Path::new(child), Path::new(root)),
+            "{child} outside {root}"
+        );
+    }
+}

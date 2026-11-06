@@ -32349,6 +32349,7 @@ impl App {
             prepared_folder_rating,
             authority,
             prepared_visible,
+            None,
         );
         self.folder_observation = self
             .current_folder
@@ -35648,6 +35649,7 @@ impl App {
             None,
             VisibleInstallAuthority::Ordinary,
             token,
+            None,
         );
         self.items_are_reading_history_view = true;
         self.top_level_grid_view.replace_surface(
@@ -37975,6 +37977,7 @@ impl App {
                     None,
                     authority,
                     token,
+                    None,
                 );
                 if let Some((continuation, _)) = hydration.as_mut() {
                     continuation.restore_intent = restore_intent.clone();
@@ -39947,6 +39950,7 @@ impl App {
             None,
             authority,
             prepared_visible,
+            Some(nav),
         );
         let archive_key = crate::path_key::normalize_keep_drive(&zip_path);
         if let Some(trace) = self.archive_auto_fs_paint_trace.as_mut()
@@ -39969,8 +39973,8 @@ impl App {
                 ],
             );
         }
-        // start_loading_items が zip_nav を None にした後で、新しいツリーナビを設定する。
-        self.zip_nav = Some(nav);
+        // The prepared nav was installed and its rating scope checked before the
+        // single visibility build in install_loading_items_inner.
         self.adopt_archive_recipe();
         // アドレス欄をパンくず表示に更新 (単一ラッパー ZIP は collapse 済み実効 prefix を反映)。
         self.update_zip_nav_address();
@@ -41113,6 +41117,7 @@ impl App {
                 None,
                 VisibleInstallAuthority::Ordinary,
                 token,
+                None,
             );
             if let Some((continuation, _)) = hydration.as_mut() {
                 continuation.restore_intent = intent;
@@ -42883,6 +42888,7 @@ impl App {
             None,
             VisibleInstallAuthority::Projection { recipe },
             prepared_visible,
+            None,
         );
         if let Some((continuation, _)) = hydration.as_mut() {
             continuation.restore_intent = hydration_intent;
@@ -42973,6 +42979,7 @@ impl App {
                 stars: self.rating_view_stars,
             },
             prepared_visible,
+            None,
         )
     }
 
@@ -43171,6 +43178,7 @@ impl App {
             prepared_folder_rating,
             authority,
             prepared_visible,
+            None,
         );
         self.hydrate_installed_main_list(hydration);
     }
@@ -43198,6 +43206,7 @@ impl App {
         prepared_folder_rating: Option<(std::collections::HashMap<usize, u8>, u64, f64)>,
         authority: VisibleInstallAuthority<'_>,
         prepared_visible: PreparedVisibleInstall,
+        prepared_zip_nav: Option<crate::zip_tree::ZipNavState>,
     ) -> MainListHydration {
         let detached_physical = self.navigation_scope.is_detached_physical();
         // Save source owners before transferring roots or adopting destination presentation.
@@ -43523,7 +43532,10 @@ impl App {
         // would incorrectly keep that book's suppression on its parent or sibling.
         // Keep this before item installation so visibility uses the resolved filter.
         if !detached_physical {
-            self.maybe_restore_rating_filter_if_out_of_scope(previous_effective_folder);
+            self.maybe_restore_rating_filter_if_out_of_scope(
+                previous_effective_folder,
+                prepared_zip_nav.as_ref(),
+            );
         }
         // Ctrl+G 絞り込みビュー中はブレッドクラム形式を維持する
         // (2026-04 ユーザー報告: PDF 開くと raw パスに戻ってしまうバグ)。
@@ -43754,6 +43766,14 @@ impl App {
             self.cancel_search_pending();
         }
         let rebuild_t0 = std::time::Instant::now();
+        // Move the prepared ZIP owner only after the logical source/backing and
+        // rows are settled. Refresh may have fallen back to an ancestor prefix.
+        // This is the same scope check as lightweight ZIP level adoption, before
+        // the existing single visibility build (including detached physical).
+        if let Some(nav) = prepared_zip_nav {
+            self.zip_nav = Some(nav);
+            self.maybe_restore_rating_filter_after_zip_level_change();
+        }
         self.rebuild_visible_indices();
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -53108,6 +53128,7 @@ impl App {
             None,
             VisibleInstallAuthority::Ordinary,
             token,
+            None,
         );
         self.items_are_bookmark_view = true;
         self.top_level_grid_view
@@ -53272,6 +53293,7 @@ impl App {
             None,
             VisibleInstallAuthority::Ordinary,
             token,
+            None,
         );
         self.hydrate_installed_main_list(hydration);
         self.items_are_bookmark_view = true;
@@ -76811,23 +76833,40 @@ impl App {
     /// `install_loading_items_inner` の論理位置確定後・可視列生成前に1回呼ぶ。
     /// `previous` は採用直前の archive_source_override.or(current_folder)。
     ///
-    /// 1. 既に suppress 中 + anchor の subtree 内 → 維持 (= 子孫探索中は継続)
-    /// 2. 既に suppress 中 + anchor の subtree 外 → 一旦 restore
-    /// 3. 現在位置が出発地点と同じかその祖先なら、帰還・再読込として新規発動しない
-    /// 4. それ以外 (= 子孫・兄弟・無関係な場所・出発地点なし) は現在 folder の★で判定
+    /// synthetic の出発地点は物理的な親子関係を表さないため、出発地点なしとして扱う。
+    /// 同じ場所の再採用では新規発動しない。ZIP の内部 anchor だけは、引数の準備済み
+    /// nav を設置した後の範囲判定へ委ねる。フォルダ/PDF などでは範囲外なら復元する。
+    /// 祖先への帰還も範囲外なら復元し、新規発動しない。その他の移動・出発地点なしは
+    /// 現在 folder の★で発動可否を判定する。既存 anchor 配下の移動では解除を維持する。
     ///
     /// これにより Ctrl+↑↓ / Ctrl+PageUp/Down で別の★付き folder に移動した際にも
     /// 自動的に ★一時解除 が発動する。
     ///
-    /// 入力経路や追加状態によらず、採用境界で位置関係だけを判定する（§1.721）。
+    /// 入力経路や追加状態によらず、物理的な位置関係と準備済み ZIP nav で判定する（§1.721）。
     ///
     /// Codex P1-2 fix 後: settings.rating_filter は書き換えないので、active 判定は
     /// 直接 rating_filter_active() を見れば良い (= 旧版の自己破壊ループ回避が不要に)。
-    pub(crate) fn maybe_restore_rating_filter_if_out_of_scope(&mut self, previous: Option<&Path>) {
+    pub(crate) fn maybe_restore_rating_filter_if_out_of_scope(
+        &mut self,
+        previous: Option<&Path>,
+        prepared_zip_nav: Option<&crate::zip_tree::ZipNavState>,
+    ) {
         let Some(current) = self.effective_folder() else {
             // 現在フォルダが取れない状態 (起動直後など) は触らない
             return;
         };
+        let previous = previous.filter(|path| !is_synthetic_view_path(path));
+        // Only an actual prepared ZIP nav guarantees the later internal-scope
+        // check. A folder named *.zip or a PDF must not retain a stale child anchor.
+        if prepared_zip_nav.is_some()
+            && previous.is_some_and(|path| crate::folder_tree::path_eq(path, &current))
+            && self
+                .rating_filter_suppressed_at
+                .as_ref()
+                .is_some_and(|(anchor, _)| path_in_subtree_ci(anchor, &current))
+        {
+            return;
+        }
         // 既に suppress 中: anchor の subtree 内なら維持、外なら一旦 restore
         if let Some((anchor, _)) = self.rating_filter_suppressed_at.as_ref() {
             let anchor_owned = anchor.clone(); // immutable borrow を切る
