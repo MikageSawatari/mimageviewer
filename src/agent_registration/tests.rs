@@ -838,10 +838,99 @@ fn process_paths_guard_desktop_and_shared_codex_without_confusing_claude_code() 
             PathBuf::from(r"C:\tools\codex-other.exe"),
             RunningApps::Stopped,
         ),
+        (
+            AppTarget::ChatGpt,
+            env.user_profile.as_ref().unwrap().join(".codex/plugins/cache/openai-bundled/chrome/latest/extension-host/windows/x64/extension-host.exe"),
+            RunningApps::Stopped,
+        ),
+        (
+            // Document the current package-wide rule, without assuming that
+            // this hypothetical helper exists or remains after the app exits.
+            AppTarget::ChatGpt,
+            PathBuf::from(r"C:\Program Files\WindowsApps\OpenAI.Codex_one\app\helper.exe"),
+            RunningApps::App,
+        ),
     ] {
         assert_eq!(
             running_apps(&env, target, &[(10, path.clone())]),
             expected,
+            "{}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn claude_desktop_requires_its_executable_name_and_install_location() {
+    let (_temp, env) = fixture();
+    let root = env.local_app_data.as_ref().unwrap().join("AnthropicClaude");
+    let helpers = [
+        "Update.exe",
+        "app-1/squirrel.exe",
+        "app-1/resources/chrome-native-host.exe",
+        "app-1/resources/claude-ssh-askpass.exe",
+        "app-1/resources/claude-ssh-broker.exe",
+        "app-1/resources/claude-ssh-proxy.exe",
+        "app-1/resources/app.asar.unpacked/resources/github-mcp/github-mcp-server.exe",
+    ];
+    let mut images = Vec::new();
+    for (index, helper) in helpers.iter().enumerate() {
+        let path = root.join(helper);
+        assert_eq!(
+            running_apps(&env, AppTarget::ClaudeDesktop, &[(10, path.clone())]),
+            RunningApps::Stopped,
+            "{helper}"
+        );
+        images.push((index as u32 + 10, path));
+    }
+    assert_eq!(
+        running_apps(&env, AppTarget::ClaudeDesktop, &images),
+        RunningApps::Stopped
+    );
+    for path in [
+        root.join("claude.exe"),
+        root.join("app-1/Claude.exe"),
+        PathBuf::from(
+            root.join("app-1/Claude.exe")
+                .to_str()
+                .unwrap()
+                .replace('\\', "/")
+                .to_uppercase(),
+        ),
+        PathBuf::from(r"C:\Program Files\WindowsApps\Claude_one\app\CLAUDE.EXE"),
+    ] {
+        assert_eq!(
+            running_apps(&env, AppTarget::ClaudeDesktop, &[(10, path.clone())]),
+            RunningApps::App,
+            "{}",
+            path.display()
+        );
+        let mut mixed = images.clone();
+        mixed.push((100, path));
+        for reversed in [false, true] {
+            if reversed {
+                mixed.reverse();
+            }
+            assert_eq!(
+                running_apps(&env, AppTarget::ClaudeDesktop, &mixed),
+                RunningApps::App
+            );
+        }
+    }
+    for path in [
+        PathBuf::from(
+            r"C:\Program Files\WindowsApps\Claude_one\app\resources\chrome-native-host.exe",
+        ),
+        PathBuf::from(r"C:\Program Files\WindowsApps\Claude_one\Update.exe"),
+        env.user_profile
+            .as_ref()
+            .unwrap()
+            .join(".local/bin/claude.exe"),
+        root.join("app-1/claude.exe.bak"),
+    ] {
+        assert_eq!(
+            running_apps(&env, AppTarget::ClaudeDesktop, &[(10, path.clone())]),
+            RunningApps::Stopped,
             "{}",
             path.display()
         );
@@ -867,6 +956,11 @@ fn running_app_classification_and_writer_errors_preserve_config_and_backup() {
         .as_ref()
         .unwrap()
         .join("AnthropicClaude/app-1/Claude.exe");
+    let native_host = env
+        .local_app_data
+        .as_ref()
+        .unwrap()
+        .join("AnthropicClaude/app-1/resources/chrome-native-host.exe");
     let path = env.working_dir.join("config");
     let backup = env.working_dir.join("config.mimageviewer.bak");
     let command = env.resolve_command().unwrap();
@@ -916,7 +1010,19 @@ fn running_app_classification_and_writer_errors_preserve_config_and_backup() {
         (AppTarget::ChatGpt, vec![], RunningApps::Stopped, None),
         (
             AppTarget::ClaudeDesktop,
-            vec![claude],
+            vec![native_host.clone()],
+            RunningApps::Stopped,
+            None,
+        ),
+        (
+            AppTarget::ClaudeDesktop,
+            vec![claude.clone()],
+            RunningApps::App,
+            Some("Claude Desktop を終了してから押してください"),
+        ),
+        (
+            AppTarget::ClaudeDesktop,
+            vec![claude, native_host],
             RunningApps::App,
             Some("Claude Desktop を終了してから押してください"),
         ),

@@ -1578,8 +1578,11 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
       Claude の設定ファイルに書いてください」と出し、候補の path を「手順を見る」に並べる。
     - どちらも無い → 「見つからない」。
     設定ファイルが無ければ `{"mcpServers": {...}}` だけの新しいファイルを作る。
-  - 動作中の判定: **実行ファイルの path で判定する** (`%LOCALAPPDATA%\AnthropicClaude\` の下、または
-    `WindowsApps\Claude_*` の下)。名前 `claude.exe` だけでは判定しない (Claude Code の CLI も `claude.exe`)。
+  - 動作中の判定: **ファイル名が `claude.exe` で、かつ所定の path にある process だけを対象にする**
+    (`%LOCALAPPDATA%\AnthropicClaude\` の下、または `WindowsApps\Claude_*` の下。大文字小文字は正規化する)。
+    Claude Desktop 終了後も登録を拒否されるとの利用者報告 (2026-11-06) に対応し、
+    終了後も残り得る `chrome-native-host.exe` などの補助 exe を本体として数えない。
+    別の場所にある Claude Code CLI の `claude.exe` は対象外。
     process の列挙は `runtime_cleanup.rs` の `K32EnumProcesses` + `QueryFullProcessImageNameW` を、**全 Windows の構成で
     動く共通の関数**に取り出して使う (今の関数は portable の構成で空を返す。設計レビュー 12 巡目の回答 2)。
   - 書く内容: `mcpServers.mimageviewer = {"command": "...", "args": [...]}`。他の項目には触れない。**最上位と
@@ -5915,3 +5918,7 @@ cached / 再表示時の Focus、選択可能ラベルの捕捉・キー・Escap
 今回は指定どおり `build-dev` を実行していない。前回の全体 gate の名前付きパイプ 4 件と後続 gate の sandbox 外補完は残る。
 
 再レビューの Codex P2 対応: 許可層のラベルで新しい選択を開始するとき、背面の旧選択と `granular_drag` を破棄して新規に初期化する。同じ層・非 modal の単語／行選択は維持し、実 double/triple click の回帰を含む egui 188/188、指定 focused 253/253、fmt 検査が成功 (`target/agent-modal-anchor-egui.log` / `target/agent-modal-anchor-focused.log`)。独立レビュー ACCEPT、製品起動・commit は行っていない。
+
+5 件目 (2026-11-06): 利用者から Claude Desktop 終了後も登録を拒否されるとの報告があり、設計担当は同じインストール先の `chrome-native-host.exe` が終了後も残ることを確認した (拒否した瞬間の一致 process は未観測)。所定の Squirrel / WindowsApps の場所にある `claude.exe` だけを本体として扱い、Update / squirrel / Chrome native host / ssh 補助 / github-mcp-server は除外する。設定を書き換え得るのは Desktop 本体の Electron process 群だけという設計前提で、これに反する証拠は今回のコード確認では見つかっていない。Codex 側は WindowsApps の OpenAI.Codex パッケージ内なら別名 exe も App になる構造が残るが、パッケージ内部の補助 exe の実在・残留は未確認で変更しない。提示された Chrome 拡張の `extension-host.exe` はパッケージ外かつ名前も `codex.exe` ではないため対象外であり、テストで保つ。
+
+5 件目の検証 (`43a678222` 上の未コミット差分): 指定 focused は exit 0、58/58 成功 (`target/agent-claude-process-focused.log`)。`cargo fmt` / `cargo fmt --check` / 差分の空白検査は成功、独立レビュー ACCEPT。`build-dev.ps1 -PreserveRuntime` は同じ出力先の core (PID 30000) が稼働中のため保護で中止し、バイナリは未更新 (`target/agent-claude-process-build-dev.log`)。製品の起動・停止、commit、ブランチ切替は行っていない。

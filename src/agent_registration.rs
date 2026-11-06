@@ -382,10 +382,12 @@ pub(crate) fn running_apps(
         };
         match target {
             AppTarget::ClaudeDesktop => {
-                app |= squirrel
-                    .as_ref()
-                    .is_some_and(|root| parts.len() > root.len() && parts.starts_with(root))
-                    || windows_package("claude_");
+                // Helpers such as the Chrome native host can outlive Desktop.
+                app |= parts.last().is_some_and(|name| name == "claude.exe")
+                    && (squirrel
+                        .as_ref()
+                        .is_some_and(|root| parts.len() > root.len() && parts.starts_with(root))
+                        || windows_package("claude_"));
             }
             AppTarget::ChatGpt => {
                 let is_daemon = codex_daemon
