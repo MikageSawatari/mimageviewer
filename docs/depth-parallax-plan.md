@@ -1,6 +1,6 @@
 # 3D 写真 (AI 深度による視差表示と書き出し) — 設計書
 
-状態: **設計 (2026-11-06)。実装前の独立レビュー第 2 回まで反映済み (§16)、段 B / C は再確認待ち**。worktree `G:\home\mimageviewer-depth`、ブランチ
+状態: **設計確定 (2026-11-06)。実装前の独立レビュー 4 回で段 A〜C とも着手可 (§16)**。実装は未着手。worktree `G:\home\mimageviewer-depth`、ブランチ
 `depth-parallax`。調査とスパイクの記録は [depth-parallax-research.md](depth-parallax-research.md)。
 試験実装の結果がよければ、**v5 リリースの次のリリース**に入れる (2026-11-06 利用者方針)。
 バックログ番号は未採番。
@@ -651,3 +651,7 @@ P1 4 件・P2 6 件。ClaudeCode が主要な根拠 (egui のテクスチャの 
 
 F12 の確定点で終える変更と、viewer の pass の中で持ち主を呼ぶこと (既存の描画も `&mut self` で状態を
 更新している、ui_fullscreen.rs:48594) は妥当と確認された。
+
+### 第 4 回 (2026-11-06、同じセッションの継続、read-only)
+
+第 3 回の P1 は解消。新しい P1 / P2 は無し。段 B も着手可。
