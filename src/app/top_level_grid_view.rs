@@ -1482,6 +1482,28 @@ pub(crate) enum TopLevelGridSurface {
 }
 
 impl super::App {
+    /// The accepted surface/row producer owns the departing location, not a
+    /// retained backing path. Everything's result root can retain the last book.
+    /// Its adopted physical child still participates in reload/parent navigation.
+    pub(super) fn rating_filter_departure_is_physical(&self) -> bool {
+        if !self.current_grid_reload_is_physical() {
+            return false;
+        }
+        match (
+            self.top_level_grid_view.surface(),
+            &self.global_search.accepted,
+        ) {
+            (
+                TopLevelGridSurface::Search(TopLevelSearchView::Global),
+                crate::global_search_ui::SearchAccepted::Everything { position, .. },
+            ) => matches!(
+                position,
+                crate::global_search_ui::EverythingPosition::PhysicalChild { .. }
+            ),
+            _ => true,
+        }
+    }
+
     /// A synthetic surface can still own a physical descendant. Its position and the
     /// adopted row producer decide refresh routing, not the parent's surface alone.
     pub(super) fn current_grid_reload_is_physical(&self) -> bool {
