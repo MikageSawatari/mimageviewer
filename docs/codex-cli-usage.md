@@ -71,6 +71,15 @@ read-only サンドボックス (ファイル書き換え・ネットワーク�
 | ブランチ全体 (`main` からの分岐) をレビュー | `codex exec --sandbox read-only "Review this branch against main. Use git merge-base main HEAD and git diff from that base. Focus on bugs, regressions, missing tests, and compatibility risks. Return findings first."` |
 | 未コミットの作業変更だけレビュー | `codex exec --sandbox read-only "Review the uncommitted changes in this repo. Use git diff and git diff --cached. Focus on bugs, regressions, missing tests, and compatibility risks. Return findings first."` |
 
+### mimageviewer の MCP を外して起動する (v5 系、2026-11-06)
+
+Codex CLI は ChatGPT (Codex) アプリと同じ `~/.codex/config.toml` を読む。利用者がインストール版の
+mIV を AI 連携で登録していると、開発中の Codex がその MCP 経由で利用者の普段のライブラリ
+(`%APPDATA%\mimageviewer`) につながる。開発・レビューで Codex を起動するときは、`exec` でも
+`exec resume` でも毎回 `-c 'mcp_servers.mimageviewer.enabled=false'` を付ける。
+開発中の試験ビルドは `--data-dir` で隔離して起動し、その AI 連携からは登録しない
+(登録先がインストール先から試験ビルドの場所へ置き換わるため)。
+
 ### 同じタスクは同じセッションで継続する (resume)
 
 **同じタスク内でレビュー往復をするときは、毎回 `codex exec` で新セッションを開かず、

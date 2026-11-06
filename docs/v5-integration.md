@@ -734,3 +734,11 @@ git add / commit / merge等のgit書き込みも行わない。
 - 独立レビュー (xhigh): `1c71181` ACCEPT、`6657990` REJECT (P1 構文エラー)、`1daaafb` ACCEPT。既存の問題として、`vst-bootstrap.js` 25 行目の min-width の規則も同じクラスに依存していて効いていない (P3、今回は直さない)。
 - ctest 117/117 成功。`miv` ブランチを `1daaafb` まで push。`third_party/miv-sound/0.15.0-miv.7/` を作成、バックアップは `C:\home\mimageviewer_vendor_backup\miv-sound-0.15.0-miv.7\`。マニュアルを `manual/sound/v0.15.0-miv.7/` へ作り直した。
 - 実機確認: 未確認 (利用者の手元確認待ち)。
+
+## 18. rc3 インストーラ (2026-11-06、利用者の指示)
+
+- 利用者が「普段の作業でもテストを続けたい」として、インストーラ版を依頼した。普段使いはインストール版 (普段のデータ・AI 連携の登録先)、開発中の試験ビルドは `--data-dir` で隔離する運用にした。single-instance の名前空間は解決済み data_dir から導出するので (`src/lib.rs` の DataDir 初期化・`src/data_dir.rs`)、両者は同時に起動できる。
+- v5-integration `0ec34dc6b` で `.\scripts\build-dist.ps1 -NoSign -PreserveRuntime` (設計担当、`CARGO_BUILD_JOBS=6`、空の TEMP)。test-full は本体 18,463 件ほか全件成功、PE 依存の照合も成功。
+- 成果物: `installer\Output\mImageViewer_setup.exe` (5.0.0、未署名、SHA-256 `8193B4531A27B0E48E22EAD5153D51E2A41D58FEB4CCAA5D24BB88AF817EE198`)。
+- 開発中の Codex は `~/.codex/config.toml` を ChatGPT アプリと共有するため、`mcp_servers.mimageviewer.enabled=false` で起動する決まりを `docs/codex-cli-usage.md` に足した。
+- 実機確認: 未確認 (利用者の導入と確認待ち)。

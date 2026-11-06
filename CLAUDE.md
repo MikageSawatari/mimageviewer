@@ -476,6 +476,7 @@ VST3 bridge、署名、packagingなどrelease構成そのものを確認する�
   実装前にも確認を取る。定型の公開作業には自発レビューは不要。
 - **モデル**: レビューは `--model gpt-6.1-sol -c 'model_reasoning_effort="xhigh"' --sandbox read-only`、
   実装は同 model の `high` + `--sandbox workspace-write`。個人 config に依存しない。
+  v5 系では `exec` / `resume` とも `-c 'mcp_servers.mimageviewer.enabled=false'` を付け、利用者の普段のライブラリへつながない (詳細は codex-cli-usage)。
 - **同じタスク・同じ段階は `codex exec resume` で続ける** (resume には `--sandbox` が無い)。長さを理由に
   新しいセッションへ切り替えない。brief に「区切りで止めて報告してよい」と書かない。
 - 最終回答は `-o <FILE>` で受け取り、`tail -N` で切らない。stdin は必ず制御する (`< /dev/null`、または `-` +
