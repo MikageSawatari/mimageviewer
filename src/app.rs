@@ -43209,6 +43209,12 @@ impl App {
         prepared_zip_nav: Option<crate::zip_tree::ZipNavState>,
     ) -> MainListHydration {
         let detached_physical = self.navigation_scope.is_detached_physical();
+        // Capture the departing logical position before cleanup can replace its
+        // top-level surface. Synthetic results may retain the last book's path.
+        let previous_effective_folder = self
+            .rating_filter_departure_is_physical()
+            .then(|| self.effective_folder())
+            .flatten();
         // Save source owners before transferring roots or adopting destination presentation.
         self.save_leaving_folder_grid_position();
         let smart_open_path = match &authority {
@@ -43320,9 +43326,6 @@ impl App {
         }
         let previous_folder = self.current_folder.clone();
         let previous_archive_source_override = self.archive_source_override.clone();
-        let previous_effective_folder = previous_archive_source_override
-            .as_deref()
-            .or(previous_folder.as_deref());
         let preserve_archive_source_override = previous_archive_source_override.is_some()
             && previous_folder
                 .as_ref()
@@ -43533,7 +43536,7 @@ impl App {
         // Keep this before item installation so visibility uses the resolved filter.
         if !detached_physical {
             self.maybe_restore_rating_filter_if_out_of_scope(
-                previous_effective_folder,
+                previous_effective_folder.as_deref(),
                 prepared_zip_nav.as_ref(),
             );
         }
@@ -76831,7 +76834,7 @@ impl App {
     }
 
     /// `install_loading_items_inner` の論理位置確定後・可視列生成前に1回呼ぶ。
-    /// `previous` は採用直前の archive_source_override.or(current_folder)。
+    /// `previous` は採用前 surface が物理位置を所有する場合だけ、その effective_folder。
     ///
     /// synthetic の出発地点は物理的な親子関係を表さないため、出発地点なしとして扱う。
     /// 同じ場所の再採用では新規発動しない。ZIP の内部 anchor だけは、引数の準備済み
@@ -76936,12 +76939,19 @@ impl App {
         let Some((anchor, _)) = self.rating_filter_suppressed_at.as_ref() else {
             return;
         };
-        let anchor_key = crate::adjustment_db::normalize_path(anchor);
-        let Some((cur_key, _)) = self.current_container_rating_key_and_source() else {
+        let Some(nav) = self.zip_nav.as_ref() else {
             return;
         };
-        let inside = cur_key == anchor_key || cur_key.starts_with(&format!("{anchor_key}/"));
-        if !inside {
+        // Scope follows the effective display prefix even when wrapper collapse
+        // makes that prefix the nav root. The container-rating storage target is
+        // deliberately different at root and must not decide navigation scope.
+        let root = zip_rating_root_path(
+            &nav.tree.zip_path,
+            self.archive_source_override.as_deref(),
+            self.current_folder.as_deref(),
+        );
+        let current = book_container_key_from_segs(root, nav.current());
+        if !path_in_subtree_ci(&current, anchor) {
             self.restore_rating_filter_suppression();
             self.current_folder_rating_cache = None;
         }

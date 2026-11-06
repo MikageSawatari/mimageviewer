@@ -523,6 +523,54 @@ fn scenario(book: Book, linked: bool, parent_starred: bool, everything: bool, ro
         assert!(app.rating_filter_suppressed_at.is_none());
         assert_eq!(app.effective_rating_filter(), FIVE);
         assert_eq!(visible(&app), vec![row]);
+        assert!(!app.rating_filter_departure_is_physical());
+        // Address/navigation admission must reopen the same last book as a new
+        // entry, without the grid-open helper pre-suppressing its rating filter.
+        let outcome = app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+            source.clone(),
+            false,
+            OpenRequestOwner::Navigation,
+            StartupListIntent::ExplicitList,
+        );
+        assert!(matches!(
+            outcome,
+            FolderOpenOutcome::Loaded | FolderOpenOutcome::Classifying
+        ));
+        settle(
+            &mut app,
+            &ctx,
+            matches!(book, Book::Pdf).then_some(source.as_path()),
+        );
+        assert_eq!(app.effective_folder(), Some(source.clone()));
+        assert_eq!(
+            app.rating_filter_suppressed_at.as_ref().map(|(p, _)| p),
+            Some(&source)
+        );
+        assert_eq!(app.effective_rating_filter(), [true; 6]);
+        assert_eq!(app.items.len(), 1);
+        assert_eq!(visible(&app), app.items);
+        assert_eq!(app.get_rating(0), 0);
+        assert!(app.everything_has_physical_child());
+        assert!(app.rating_filter_departure_is_physical());
+        // PhysicalChild is a real location: an explicitly restored filter must
+        // remain active on its same-book reload, unlike results-root reentry.
+        assert!(app.restore_rating_filter_suppression());
+        app.rebuild_visible_indices();
+        let before_reload = app.items_generation;
+        app.reload_current_folder_preserving_override();
+        settle(
+            &mut app,
+            &ctx,
+            matches!(book, Book::Pdf).then_some(source.as_path()),
+        );
+        assert!(app.rating_filter_suppressed_at.is_none());
+        assert_eq!(app.effective_rating_filter(), FIVE);
+        assert_eq!(app.items.len(), 1);
+        assert!(visible(&app).is_empty());
+        assert_ne!(
+            app.items_generation, before_reload,
+            "reload must adopt rows"
+        );
     } else {
         assert!(app.archive_source_override.is_none());
         assert_eq!(app.current_folder, Some(root.clone()));

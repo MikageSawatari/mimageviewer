@@ -282,18 +282,26 @@ fn synthetic_search_and_smart_origins_allow_new_physical_entry() {
     }
 }
 
-fn write_reload_zip(backing: &Path, remove_a: bool) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReloadLayout {
+    Preserve,
+    RemoveA,
+    CollapseToA,
+}
+
+fn write_reload_zip(backing: &Path, layout: ReloadLayout) {
     use std::io::Write as _;
     let mut png = std::io::Cursor::new(Vec::new());
     image::RgbImage::new(2, 2)
         .write_to(&mut png, image::ImageFormat::Png)
         .unwrap();
     let mut zip = ::zip::ZipWriter::new(std::fs::File::create(backing).unwrap());
-    for name in if remove_a {
-        ["unrated-root.png", "B/001.png"]
-    } else {
-        ["A/001.png", "B/001.png"]
-    } {
+    let names: &[&str] = match layout {
+        ReloadLayout::Preserve => &["A/001.png", "B/001.png"],
+        ReloadLayout::RemoveA => &["unrated-root.png", "B/001.png"],
+        ReloadLayout::CollapseToA => &["A/001.png"],
+    };
+    for &name in names {
         zip.start_file(name, ::zip::write::SimpleFileOptions::default())
             .unwrap();
         zip.write_all(png.get_ref()).unwrap();
@@ -301,7 +309,7 @@ fn write_reload_zip(backing: &Path, remove_a: bool) {
     zip.finish().unwrap();
 }
 
-fn zip_book_reload(book: Book, outer_starred: bool, remove_a: bool) {
+fn zip_book_reload(book: Book, outer_starred: bool, layout: ReloadLayout) {
     let mut app = setup_app_for_test();
     configure(&mut app);
     app.settings.auto_fullscreen_zip_pdf = false;
@@ -310,7 +318,7 @@ fn zip_book_reload(book: Book, outer_starred: bool, remove_a: bool) {
     std::fs::create_dir(&root).unwrap();
     let (row, backing) = fixture(&mut app, &root, book);
     let source = row.drag_source_path().unwrap().to_path_buf();
-    write_reload_zip(&backing, false);
+    write_reload_zip(&backing, ReloadLayout::Preserve);
     if matches!(book, Book::Converted) {
         let stamp = std::fs::metadata(&source).unwrap();
         app.archive_cache_db
@@ -364,16 +372,16 @@ fn zip_book_reload(book: Book, outer_starred: bool, remove_a: bool) {
     assert_eq!(app.items.len(), 1);
     assert_eq!(app.get_rating(0), 0);
 
-    if remove_a {
-        write_reload_zip(&backing, true);
+    if layout != ReloadLayout::Preserve {
+        write_reload_zip(&backing, layout);
     }
     // The real F5 refresh owner captures the internal prefix and re-enumerates.
     app.reload_current_folder_preserving_override();
     settle(&mut app, &ctx, None);
-    assert_eq!(app.effective_folder(), Some(source));
+    assert_eq!(app.effective_folder(), Some(source.clone()));
     assert_eq!(app.current_folder, Some(backing));
     assert_eq!(app.settings.rating_filter, FOUR);
-    if remove_a {
+    if layout == ReloadLayout::RemoveA {
         assert!(app.zip_nav.as_ref().unwrap().at_root());
         assert!(app.rating_filter_suppressed_at.is_none());
         assert_eq!(app.effective_rating_filter(), FOUR);
@@ -392,6 +400,30 @@ fn zip_book_reload(book: Book, outer_starred: bool, remove_a: bool) {
         assert_eq!(app.items.len(), 1);
         assert_eq!(visible(&app), app.items);
         assert_eq!(app.get_rating(0), 0);
+        if layout == ReloadLayout::CollapseToA {
+            assert!(app.zip_nav.as_ref().unwrap().at_root());
+            // The storage target is still the outer book. Scope must use A's
+            // effective prefix independently of that intentionally unchanged key.
+            assert_eq!(
+                app.current_container_rating_key_and_source().unwrap().0,
+                crate::adjustment_db::normalize_path(&source)
+            );
+        } else {
+            assert!(!app.zip_nav.as_ref().unwrap().at_root());
+            assert!(app.zip_nav_back());
+            settle(&mut app, &ctx, None);
+            assert!(app.zip_nav.as_ref().unwrap().at_root());
+            assert!(app.zip_nav.as_ref().unwrap().current().is_empty());
+            assert!(app.rating_filter_suppressed_at.is_none());
+            assert_eq!(app.effective_rating_filter(), FOUR);
+            assert_eq!(visible(&app).len(), 1, "only rated A in the outer list");
+            let nav = app.handle_grid_parent_folder_action().unwrap();
+            assert!(app.apply_fullscreen_close_nav_immediate(nav));
+            settle(&mut app, &ctx, None);
+            assert!(app.zip_nav.is_none());
+            assert!(app.rating_filter_suppressed_at.is_none());
+            assert_eq!(app.effective_rating_filter(), FOUR);
+        }
     }
 }
 
@@ -401,25 +433,58 @@ macro_rules! reload_cases {
             use super::*;
             #[test]
             fn rated_outer_f5_keeps_internal_anchor() {
-                zip_book_reload(Book::$book, true, false);
+                zip_book_reload(Book::$book, true, ReloadLayout::Preserve);
             }
             #[test]
             fn unrated_outer_f5_keeps_internal_anchor() {
-                zip_book_reload(Book::$book, false, false);
+                zip_book_reload(Book::$book, false, ReloadLayout::Preserve);
             }
             #[test]
             fn rated_outer_f5_missing_level_restores_filter() {
-                zip_book_reload(Book::$book, true, true);
+                zip_book_reload(Book::$book, true, ReloadLayout::RemoveA);
             }
             #[test]
             fn unrated_outer_f5_missing_level_restores_filter() {
-                zip_book_reload(Book::$book, false, true);
+                zip_book_reload(Book::$book, false, ReloadLayout::RemoveA);
+            }
+            #[test]
+            fn rated_outer_f5_collapsed_root_keeps_internal_anchor() {
+                zip_book_reload(Book::$book, true, ReloadLayout::CollapseToA);
+            }
+            #[test]
+            fn unrated_outer_f5_collapsed_root_keeps_internal_anchor() {
+                zip_book_reload(Book::$book, false, ReloadLayout::CollapseToA);
             }
         }
     };
 }
 reload_cases!(zip_reload, Zip);
 reload_cases!(converted_reload, Converted);
+
+#[test]
+fn zip_effective_scope_keeps_drive_root_anchor_and_rejects_other_drive() {
+    let mut app = setup_app_for_test();
+    configure(&mut app);
+    app.settings.rating_filter = FOUR;
+    let backing = PathBuf::from("Z:/book.zip");
+    let entries = vec![crate::zip_loader::ZipImageEntry {
+        entry_name: "001.png".into(),
+        uncompressed_size: 1,
+        mtime: 0,
+        container_ancestry: Vec::new(),
+    }];
+    app.zip_nav = Some(crate::zip_tree::ZipNavState::new(Arc::new(
+        crate::zip_tree::ZipTree::build(backing.clone(), entries),
+    )));
+    app.current_folder = Some(backing);
+    // Pure scope transitions: no drive is enumerated or opened.
+    for (anchor, inside) in [(r"z:\", true), ("Y:/", false)] {
+        app.rating_filter_suppressed_at = Some((PathBuf::from(anchor), FOUR));
+        app.maybe_restore_rating_filter_after_zip_level_change();
+        assert_eq!(app.rating_filter_suppressed_at.is_some(), inside);
+        assert_eq!(app.settings.rating_filter, FOUR);
+    }
+}
 
 #[test]
 fn synthetic_origins_enter_starred_physical_ancestor_of_data_dir() {
