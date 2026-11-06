@@ -43311,6 +43311,9 @@ impl App {
         }
         let previous_folder = self.current_folder.clone();
         let previous_archive_source_override = self.archive_source_override.clone();
+        let previous_effective_folder = previous_archive_source_override
+            .as_deref()
+            .or(previous_folder.as_deref());
         let preserve_archive_source_override = previous_archive_source_override.is_some()
             && previous_folder
                 .as_ref()
@@ -43498,7 +43501,7 @@ impl App {
             .then_some(folder_signature)
             .flatten();
         if preserve_archive_source_override {
-            if let Some(src) = previous_archive_source_override {
+            if let Some(src) = previous_archive_source_override.clone() {
                 self.address = src.to_string_lossy().to_string();
                 self.archive_source_override = Some(src);
             }
@@ -43520,7 +43523,7 @@ impl App {
         // would incorrectly keep that book's suppression on its parent or sibling.
         // Keep this before item installation so visibility uses the resolved filter.
         if !detached_physical {
-            self.maybe_restore_rating_filter_if_out_of_scope();
+            self.maybe_restore_rating_filter_if_out_of_scope(previous_effective_folder);
         }
         // Ctrl+G 絞り込みビュー中はブレッドクラム形式を維持する
         // (2026-04 ユーザー報告: PDF 開くと raw パスに戻ってしまうバグ)。
@@ -76805,20 +76808,22 @@ impl App {
         self.show_feedback_toast("★フィルタ一時解除中 (本から戻ると復元)".to_string());
     }
 
-    /// `load_folder` の最後に呼ぶ: suppression の自動再評価。
+    /// `install_loading_items_inner` の論理位置確定後・可視列生成前に1回呼ぶ。
+    /// `previous` は採用直前の archive_source_override.or(current_folder)。
     ///
     /// 1. 既に suppress 中 + anchor の subtree 内 → 維持 (= 子孫探索中は継続)
     /// 2. 既に suppress 中 + anchor の subtree 外 → 一旦 restore
-    /// 3. fall through (= suppress なし) で現在 folder の★を見て suppress 発動可否を判定
+    /// 3. 現在位置が出発地点と同じかその祖先なら、帰還・再読込として新規発動しない
+    /// 4. それ以外 (= 子孫・兄弟・無関係な場所・出発地点なし) は現在 folder の★で判定
     ///
     /// これにより Ctrl+↑↓ / Ctrl+PageUp/Down で別の★付き folder に移動した際にも
     /// 自動的に ★一時解除 が発動する。
     ///
-    /// 関数名は互換性のため維持 (= 呼び出し元: load_folder_with_scan 末尾)。
+    /// 入力経路や追加状態によらず、採用境界で位置関係だけを判定する（§1.721）。
     ///
     /// Codex P1-2 fix 後: settings.rating_filter は書き換えないので、active 判定は
     /// 直接 rating_filter_active() を見れば良い (= 旧版の自己破壊ループ回避が不要に)。
-    pub(crate) fn maybe_restore_rating_filter_if_out_of_scope(&mut self) {
+    pub(crate) fn maybe_restore_rating_filter_if_out_of_scope(&mut self, previous: Option<&Path>) {
         let Some(current) = self.effective_folder() else {
             // 現在フォルダが取れない状態 (起動直後など) は触らない
             return;
@@ -76831,6 +76836,11 @@ impl App {
             }
             // subtree 外 → restore してから再評価
             self.restore_rating_filter_suppression();
+        }
+        // 帰還・再読込では一覧で明示したフィルタを維持する。既存 anchor の
+        // scope 判定を先に行い、元から一時解除中だった親への帰還は維持する。
+        if previous.is_some_and(|previous| path_in_subtree_ci(previous, &current)) {
+            return;
         }
         // suppress なし状態で再評価: rating_filter_active なら現在 folder の★で発動可否判定
         if !self.rating_filter_active() {

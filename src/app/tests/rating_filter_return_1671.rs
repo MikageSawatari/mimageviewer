@@ -1,6 +1,8 @@
 //! §1.671: compare logical/book backing pairs through real admission, adoption,
 //! close and parent navigation. No product window or native input is used.
 use super::*;
+#[path = "rating_filter_parent_return_1721.rs"]
+mod rating1721;
 
 const FIVE: [bool; 6] = [false, false, false, false, false, true];
 
@@ -525,21 +527,13 @@ fn scenario(book: Book, linked: bool, parent_starred: bool, everything: bool, ro
         assert!(app.archive_source_override.is_none());
         assert_eq!(app.current_folder, Some(root.clone()));
         assert_eq!(app.effective_folder(), Some(root.clone()));
-        assert_eq!(
-            app.rating_filter_suppressed_at.as_ref().map(|(p, _)| p),
-            parent_starred.then_some(&root),
-            "old book anchor must leave scope; a starred parent establishes its own anchor"
+        assert!(
+            app.rating_filter_suppressed_at.is_none(),
+            "returning to the list must not establish a new anchor from the parent's stars"
         );
-        assert_eq!(
-            app.effective_rating_filter(),
-            if parent_starred { [true; 6] } else { FIVE }
-        );
-        if parent_starred {
-            assert_eq!(visible(&app), app.items);
-            assert!(visible(&app).contains(&unstarred));
-        } else {
-            assert_eq!(visible(&app), vec![row]);
-        }
+        assert_eq!(app.effective_rating_filter(), FIVE);
+        assert_eq!(visible(&app), vec![row]);
+        assert!(!visible(&app).contains(&unstarred));
     }
     app.with_viewer_context(sibling, |other| {
         assert_eq!(other.current_folder, sibling_before.0);

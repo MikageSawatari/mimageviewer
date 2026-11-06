@@ -550,7 +550,13 @@ Windowsのpublishは捕捉済みHRESULTからWin32 codeを保持し、UIには
 StagedArchive / SmartPhysical の採用は行き先の論理 source を反映してから判定する。
 新しい backing と退場した本の alias を組み合わせて判定してはならない（§1.671）。
 本の内部・ページ一覧では同じ anchor の一時解除を保ち、範囲外では解除前の評価条件を使う。
-戻った親自身の★が条件に合う場合は、親を anchor とする新しい一時解除になる。
+帰還・再読込では、戻り先自身の★で新しい一時解除を発動しない（§1.721）。
+採用直前の `archive_source_override.or(current_folder)` を出発地点として引数で渡し、
+採用後の論理位置が出発地点と同じ、またはその祖先なら帰還・再読込と判定する。
+判定はこの採用境界で `path_in_subtree_ci` による位置関係だけを見て行い、入力経路ごとの
+guard や追加の保存状態は作らない。既存 anchor の subtree 内なら一時解除を維持し、
+外なら復元する。子孫・兄弟・無関係な場所への移動と出発地点のない起動時は、
+従来どおり移動先の★で発動可否を判定する。明示的な本への入場時の一時解除も維持する。
 保存済み `settings.rating_filter` は変えず、一時解除の所有者も既存の viewer context のまま。
 Everything の結果帰路は既存の明示復元を使い、synthetic surface の論理位置は
 `EverythingPosition` に従う（最後の物理 backing / alias は結果採用後も保持される）。
