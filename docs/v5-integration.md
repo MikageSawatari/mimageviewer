@@ -741,4 +741,4 @@ git add / commit / merge等のgit書き込みも行わない。
 - v5-integration `0ec34dc6b` で `.\scripts\build-dist.ps1 -NoSign -PreserveRuntime` (設計担当、`CARGO_BUILD_JOBS=6`、空の TEMP)。test-full は本体 18,463 件ほか全件成功、PE 依存の照合も成功。
 - 成果物: `installer\Output\mImageViewer_setup.exe` (5.0.0、未署名、SHA-256 `8193B4531A27B0E48E22EAD5153D51E2A41D58FEB4CCAA5D24BB88AF817EE198`)。
 - 開発中の Codex は `~/.codex/config.toml` を ChatGPT アプリと共有するため、`mcp_servers.mimageviewer.enabled=false` で起動する決まりを `docs/codex-cli-usage.md` に足した。
-- 実機確認: 未確認 (利用者の導入と確認待ち)。
+- 実機確認 (観測者: 利用者、2026-11-06): rc3 をインストールし、インストール版の AI 連携から Claude Desktop と ChatGPT (Codex) へ登録し直せた (「登録し直せました。問題なさそうです」)。ChatGPT アプリ起動中の断る文の確認は、個別の報告を受けていない。
