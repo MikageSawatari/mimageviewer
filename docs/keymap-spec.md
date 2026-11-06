@@ -400,11 +400,14 @@ OS/egui のclipboardイベント自体、D&D、IME 確定、右クリック操�
 編集の Undo / Redo は、ボタン・スライダー・チェックボックス・ラジオ・トグルなど通常の
 非テキスト `FocusedUi` にも通す（§1.681）。パネル操作の focus だけで画像編集の履歴を
 取り消せなくなるのを避けるためで、補正パネルに限らず main 一覧のメタUndoも同じ規則とする。
-`EditHistoryKeyPermit` は旧 keymap が通していた範囲を狭めず、次の和集合として発行する。
+`EditHistoryKeyPermit` は、所有者によらず `Context::text_edit_focused()` が真なら発行しない。
+TextEdit は常に自分の Undo を所有し、ROOT の modeless VST3 パネルが owner を `Modal` にしても
+注釈本文・数値直接入力の履歴を画像編集が奪わない。この共通保護が旧テキスト注釈 handler の独自ガードを引き継ぐ。
+それ以外は旧 keymap の許可範囲を狭めず、次の和集合として発行する。
 
 | owner | 履歴キーの permit |
 |---|---|
-| `ApplicationShortcut` / `Modal` / `Unclaimed` / `TextInput::PendingFocus` | 旧来どおり発行。popup や TextEditState の有無によらない |
+| `ApplicationShortcut` / `Modal` / `Unclaimed` / `TextInput::PendingFocus` | TextEdit 非フォーカスなら旧来どおり発行。popup の有無によらない |
 | `TextInput::Focused` / `FocusRecovery` / `ImeComposing` | 旧来どおり発行しない |
 | `FocusedUi` | 非テキストかつ、その viewport に egui popup が開いていないときだけ追加で発行 |
 
@@ -418,7 +421,7 @@ popup の存在だけを理由に、旧来通っていた `ApplicationShortcut` 
 補正の多角形の頂点戻しは固定 Ctrl+Z の完全一致を保ち、専用 `PolygonVertexUndo` と
 同じ permit / keymap consume で native KeySlot と egui の同一押下を一緒に消費する。
 helper の `TextInput` claim に載らない TextEdit は `Context::text_edit_focused()`
-（現在の focus ID の `TextEditState` の有無）で識別し、`FocusedUi` でも permit を出さない。
+（現在の focus ID の `TextEditState` の有無）で識別し、どの owner でも permit を出さない。
 有効な DragValue は keyboard focus を得ると直ちに内部 TextEdit に切り替わるため、
 数値直接入力もこの条件で保護される。state は永続化されるため、同じ ID に残る state でも
 保守的に拒否する。owner 自体を `TextInput` に変更せず、他の shortcut の判定には波及させない。

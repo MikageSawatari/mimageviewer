@@ -2295,8 +2295,9 @@ impl App {
         let editing_text = ctx.memory(|m| m.focused().is_some());
 
         // Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z: エディタ専用 Undo/Redo (D7)。
-        // 専用 permit が TextEdit / IME / popup / modal の所有を保ち、通常の
-        // ボタン・スライダー focus 中はフィールド外の編集を undo できる。
+        // 旧 egui_wants_keyboard_input ガードの TextEdit 保護は共通 permit が所有する。
+        // ROOT の modeless VST3 パネルで owner が Modal でも本文・数値の Undo を奪わず、
+        // 通常のボタン・スライダー focus 中はフィールド外の編集を undo できる。
         // **メタ undo との非干渉**: テキストモード中は `handle_fs_key_input` がこの関数で
         // return するため、ここで消費しなかった key も含めて `handle_meta_undo_keys`
         // (レーティング/タグ undo) には決して到達しない。
@@ -9783,6 +9784,136 @@ fn shape_half(shape: &BubbleShape) -> (f32, f32) {
 mod tests {
     use super::*;
     use crate::rotation_db::Rotation;
+
+    #[test]
+    fn text_undo_modeless_vst3_annotation_text_and_numeric_fields_keep_history_keys() {
+        let _input = crate::key_input::lock_test_input();
+        for numeric in [false, true] {
+            for native in [false, true] {
+                if native && !cfg!(windows) {
+                    continue;
+                }
+                let ctx = egui::Context::default();
+                let mut app = crate::app::setup_app_for_test();
+                app.items = vec![crate::grid_item::GridItem::Image(
+                    app.tmp.path().join("annotation.png"),
+                )];
+                app.fullscreen_idx = Some(0);
+                app.text_mode = true;
+                app.viewer_presentation = crate::app::ViewerPresentation::MainWindow;
+                app.show_vst3_manager = true;
+                let page = app.page_path_key(0).unwrap();
+                let objects = vec![comic_core::AnnotationObject::new_text(
+                    1,
+                    (8.0, 8.0),
+                    Default::default(),
+                )];
+                app.comic_undo_key = Some(page.clone());
+                app.comic_undo_baseline = Vec::new();
+                app.comic_docs.insert(page.clone(), objects.clone());
+                let mut text = TextBlock {
+                    text: "annotation body".into(),
+                    ..Default::default()
+                };
+                let mut value = 0.5;
+                let field_id = std::cell::Cell::new(egui::Id::NULL);
+                let mut focus_request = true;
+                let mut draw = |root: &mut egui::Ui| {
+                    egui::CentralPanel::default().show(root, |ui| {
+                        // Use the real annotation body renderer and a numeric
+                        // control, neither requiring a helper TextInput claim.
+                        let id = if numeric {
+                            ui.add(egui::DragValue::new(&mut value)).id
+                        } else {
+                            text_body_ui(ui, &mut text, &mut false, 1);
+                            egui::Id::unique(("comic_text_edit", 1_u64))
+                        };
+                        field_id.set(id);
+                        if focus_request {
+                            ui.ctx().memory_mut(|m| m.request_focus(id));
+                            focus_request = false;
+                        }
+                    });
+                };
+                // A focused DragValue renders its internal TextEdit next pass.
+                for _ in 0..2 {
+                    ctx.run_ui(Default::default(), &mut draw)
+                        .drop_without_applying_deltas();
+                }
+                for (key, modifiers) in [
+                    (egui::Key::Z, egui::Modifiers::CTRL),
+                    (egui::Key::Y, egui::Modifiers::CTRL),
+                    (egui::Key::Z, egui::Modifiers::CTRL | egui::Modifiers::SHIFT),
+                ] {
+                    ctx.run_ui(
+                        egui::RawInput {
+                            focused: true,
+                            events: vec![
+                                egui::Event::ModifiersChanged(modifiers),
+                                egui::Event::Key {
+                                    key,
+                                    physical_key: Some(key),
+                                    pressed: true,
+                                    repeat: false,
+                                    modifiers,
+                                },
+                            ],
+                            ..Default::default()
+                        },
+                        |root| {
+                            let ctx = &root.ctx().clone();
+                            #[cfg(windows)]
+                            if native {
+                                crate::key_input::set_test_frame(vec![crate::key_input::KeyEdge {
+                                    operation_id: crate::key_input::KeyOperationId::unassigned(),
+                                    source_hwnd: 1,
+                                    source_viewport: ctx.viewport_id(),
+                                    virtual_key: if key == egui::Key::Z { 0x5A } else { 0x59 },
+                                    scan_code: 0,
+                                    extended: false,
+                                    pressed: true,
+                                    repeat: false,
+                                    ctrl: true,
+                                    shift: modifiers.shift,
+                                    alt: false,
+                                }]);
+                            }
+                            assert_eq!(ctx.memory(|m| m.focused()), Some(field_id.get()));
+                            assert!(ctx.text_edit_focused());
+                            assert_eq!(
+                                app.keyboard_owner_for_pass(ctx),
+                                crate::keyboard_input::KeyboardOwner::Modal
+                            );
+                            assert!(!app.any_modal_dialog_open_for_fullscreen_keys());
+                            // Production order: dispatch before drawing the field.
+                            app.handle_fs_key_input(ctx, 0, false);
+                            assert!(
+                                ctx.input(|i| i.key_pressed(key)),
+                                "numeric={numeric}, native={native}"
+                            );
+                            #[cfg(windows)]
+                            if native {
+                                assert!(crate::key_input::pressed_key_down(
+                                    ctx.viewport_id(),
+                                    |_| true
+                                ));
+                            }
+                            assert_eq!(app.comic_docs[&page], objects);
+                            assert!(app.comic_undo_stack.is_empty());
+                            assert!(app.comic_redo_stack.is_empty());
+                            assert!(app.comic_undo_baseline.is_empty());
+                            assert_eq!(app.meta_undo.undo_len(), 0);
+                            assert_eq!(ctx.memory(|m| m.focused()), Some(field_id.get()));
+                            draw(root);
+                        },
+                    )
+                    .drop_without_applying_deltas();
+                    #[cfg(windows)]
+                    crate::key_input::clear_test_frame();
+                }
+            }
+        }
+    }
 
     fn assert_annotation_accessibility_controls(
         mut draw: impl FnMut(&mut egui::Ui),

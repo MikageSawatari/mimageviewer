@@ -1,14 +1,17 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
 §1.681: 編集履歴専用の `EditHistoryKeyPermit` を keyboard owner から発行する。
-発行条件は `!blocks_legacy_keymap_shortcuts()` と非テキスト `FocusedUi` 例外の和集合。
+まず owner によらず `Context::text_edit_focused()` が真なら発行しない。
+注釈本文 / DragValue の数値直接入力は常にフィールド自身が Undo を所有し、ROOT の modeless VST3 パネルによる
+`Modal` 分類でも保護する（旧テキスト注釈 handler の独自ガードを共通判定へ集約）。
+TextEdit 非フォーカス時の発行条件は `!blocks_legacy_keymap_shortcuts()` と非テキスト `FocusedUi` 例外の和集合。
 `ApplicationShortcut` / `Modal` / `Unclaimed` / `TextInput::PendingFocus` は旧来どおり通し、
 popup 有無では拒否しない。実 modal と配送先の外側 gate は各 caller が維持する。
 `TextInput::Focused` / `FocusRecovery` / `ImeComposing` は旧来どおり拒否する。
 `FocusedUi` 例外だけが Memory の `Popup::is_any_open` と今 pass の `Context::any_popup_open` を見て、
 egui popup（ComboBox・egui メニュー・コンテキストメニュー）表示中は拒否する。
-`FocusedUi` は `Context::text_edit_focused()` が真でも拒否し、helper claim 外の
-TextEdit / DragValue の数値直接入力を保護する。persisted state の残存も保守的に拒否する。
+helper claim 外の TextEdit / DragValue も共通の TextEdit 判定で保護する。
+persisted state の残存も保守的に拒否する。
 `decide_keyboard_owner` の分類自体は変更しない。
 App の発行入口を共通化し、メタUndo / 固定Redo、消しゴム・隠蔽・テキスト専用Undo / Redo、
 補正多角形の固定Ctrl+Zによる頂点戻しを keymap の `consume_edit_history_key` へ通す。

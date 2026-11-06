@@ -358,7 +358,13 @@ impl KeyboardOwner {
         popup_open: bool,
         text_edit_focused: bool,
     ) -> Option<EditHistoryKeyPermit> {
-        // This exception must never narrow the legacy keymap's allowed set.
+        // TextEdit always owns its history, even when a modeless VST3 panel
+        // makes the ROOT owner Modal before text claims are considered.
+        // DragValue's internal TextEdit (including retained state) counts too.
+        if text_edit_focused {
+            return None;
+        }
+        // Apart from text editing, preserve the legacy keymap's allowed set.
         // Modal/Unclaimed have no viewport payload: their caller supplies the
         // current viewport and still owns the outer modal/discrete-input gate.
         let viewport = match self {
@@ -374,9 +380,7 @@ impl KeyboardOwner {
             // widget has keyboard focus. Its persisted TextEditState also
             // protects numeric editors absent from the helper text claim.
             // A retained state is intentionally treated conservatively.
-            Self::FocusedUi { .. } if !popup_open && !text_edit_focused => {
-                Some(EditHistoryKeyPermit { viewport })
-            }
+            Self::FocusedUi { .. } if !popup_open => Some(EditHistoryKeyPermit { viewport }),
             _ => None,
         }
     }
@@ -946,8 +950,8 @@ mod tests {
         let widget_id = egui::Id::unique("history-focus");
         // Columns: no menu/no text, no menu/text, menu/no text, menu/text.
         let mut owners = vec![
-            (KeyboardOwner::Modal, [true; 4]),
-            (KeyboardOwner::Unclaimed, [true; 4]),
+            (KeyboardOwner::Modal, [true, false, true, false]),
+            (KeyboardOwner::Unclaimed, [true, false, true, false]),
             (
                 KeyboardOwner::FocusedUi {
                     viewport,
@@ -959,13 +963,13 @@ mod tests {
                 KeyboardOwner::ApplicationShortcut {
                     scope: scope(ShortcutSurface::Main),
                 },
-                [true; 4],
+                [true, false, true, false],
             ),
             (
                 KeyboardOwner::ApplicationShortcut {
                     scope: scope(ShortcutSurface::Fullscreen),
                 },
-                [true; 4],
+                [true, false, true, false],
             ),
         ];
         for phase in [
@@ -980,7 +984,12 @@ mod tests {
                     widget_id,
                     phase,
                 },
-                [phase == TextInputPhase::PendingFocus; 4],
+                [
+                    phase == TextInputPhase::PendingFocus,
+                    false,
+                    phase == TextInputPhase::PendingFocus,
+                    false,
+                ],
             ));
         }
         for (owner, expected) in owners {

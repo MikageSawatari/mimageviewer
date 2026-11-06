@@ -10964,7 +10964,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_history_keymap_owner_table_preserves_all_legacy_consumers() {
+    fn edit_history_keymap_owner_table_preserves_non_text_legacy_consumers() {
         use crate::keyboard_input::{
             KeyboardOwner, ShortcutScope, ShortcutSurface, TextInputPhase,
         };
@@ -11088,7 +11088,7 @@ mod tests {
                                 && !text_edit_focused;
                             assert_eq!(
                                 permitted,
-                                legacy || extra,
+                                !text_edit_focused && (legacy || extra),
                                 "{owner:?} {route:?} {chord:?} menu={popup_open} text={text_edit_focused} native={native}"
                             );
                         }
