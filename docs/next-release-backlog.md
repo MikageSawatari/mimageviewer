@@ -38,6 +38,15 @@
 
 ## 1. 優先候補
 
+### 1.723 Undo を Shift+Esc に割り当てると、固定の Esc と Undo が同じ押下を二重に使う (2026-11-07)
+
+- 状態: **未着手**。§1.681 の独立レビューで判明 (コード読み。実機では未確認)。既定のキー割り当てでは起きない。
+- 原因 (コード、親 `edfc660f7` でも成立): フルスクリーンの固定 Esc は `consume_key(NONE, Escape)` の論理一致で Shift+Esc の egui イベントも消費するが、
+  native の KeySlot は残す。同じ handler の後段でメタ Undo が残った native 押下を取り、その後に閉じる操作も適用されるため、1 回の押下で Undo と閉じるが両方動く。
+  フォーカスの無い ApplicationShortcut で旧来から起きる。§1.681 で非テキスト FocusedUi にも Undo を通したため、その範囲にも広がった。
+- 直し方の案: 固定操作が取得した押下を、同じ viewport の native 側でも claim する (固定キーの消費を keymap の `consume_owned_chord` と同じく egui / native の両方にする)。
+  固定キー全般に関わるので、範囲を確かめてから設計する。規模 / 優先度: Small〜Medium / P3。
+
 ### 1.722 Ctrl+F「すべての対象」の XMP 読みが写真をファイル全体まで読む (2026-11-06、v5.0.0)
 
 - 状態: **修正済み・利用者の実機確認待ち** (ブランチ `fix/xmp-partial-read`、c8c91e019 + e7f5c3c14 を master へ merge)。実装 Codex gpt-6.1-sol / high、独立レビュー gpt-6.1-sol / xhigh (1 回目 REJECT の P2 を直して ACCEPT)。
@@ -900,7 +909,20 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.681 補正レイヤーのボタン・スライダーにフォーカスがあると取り消しキーが届かない — 図形 Undo 調査 (2026-11-02)
 
-- 状態: **別件として起票、製品未修正**。設計担当 ClaudeCode の依頼で `inv-shape-undo` / `312b04810` を調査。図形作成の Undo 登録が §1.679 で失われたという退行は、下記のソース照合・headless handler 比較では確認できなかった。製品起動・実入力・コミットは行わない。
+- 状態: **修正済み (master、v5.0.0 で出荷予定)。実機は未確認**。
+  - 仕様 (設計担当の判断): 非テキストの widget (ボタン・スライダー・チェックボックス等) にフォーカスがあっても、編集の Undo / Redo を通す。
+    TextEdit・数値の直接入力 (DragValue の文字編集)・IME 変換中・egui のポップアップ (ComboBox・メニュー・コンテキストメニュー) が開いている間は、今の所有を保つ。
+  - 修正: `KeyboardOwner::edit_history_key_permit` (src/keyboard_input.rs) の 1 か所で判定する。`ctx.text_edit_focused()` が真なら所有者によらず発行しない。
+    それ以外は、旧来 keymap が通していた範囲 (Modal・Unclaimed・PendingFocus・ApplicationShortcut。外側ゲートは各呼び出し元のまま) に、
+    egui ポップアップの無い非テキスト FocusedUi を足しただけで、旧来の許可を狭めない。Undo / Redo の受け口 (メタ Undo・固定 Redo、消しゴム、伏せ字、
+    テキスト注釈、補正多角形の頂点戻し) はすべて `Keymap::consume_edit_history_key` を通る。頂点戻しは専用の固定 Ctrl+Z 種別にして、egui と native の押下を一緒に消費する。
+  - 簡素化の判断: 自前描画のメニュー (ズーム / フィット・表示モード等) はポップアップ扱いにしない。Ctrl+Z を使わず、フォーカスが無い状態では旧来から
+    メニューを開いたまま Undo が動くため、viewport 所属や native claim の配管を足す利益が無い。詳細は [キー仕様](keymap-spec.md)。
+  - 検証: 実装担当 Codex (gpt-6.1-sol / high) の関連 nextest 1,136 件成功。調査テスト `shape_undo_investigation_tests.rs` の期待値を新仕様へ更新し、
+    `src/app/tests/edit_history_1681.rs` を追加。独立レビュー (gpt-6.1-sol / xhigh) は 1 回目 P2×4、2 回目 P2×2 を修正・判断し、3 回目で ACCEPT。
+    commit: `01e5db056`・`7084b2b05`・`06cf19a35` (merge `5317216f1`)。
+  - 残した既存の別問題: §1.723 (Undo を Shift+Esc に割り当てたときの二重使用)。
+  - 経緯 (起票時の記述): 別件として起票、製品未修正。設計担当 ClaudeCode の依頼で `inv-shape-undo` / `312b04810` を調査。図形作成の Undo 登録が §1.679 で失われたという退行は、下記のソース照合・headless handler 比較では確認できなかった。製品起動・実入力・コミットは行わない。
 - 元の観測は設計担当 ClaudeCode によるもの: 2026-11-02 未明、`312b04810` の dev-runtime を隔離データで起動し、画面操作ツールで、補正レイヤーのバケツ→Ctrl+Z は成功、その後の横線作成→Ctrl+Z はオブジェクトが残った。観測時のキーボード owner／widget focus／Undo 件数の記録はなく、以下のフォーカス抑止がその試行の原因だったとは断定しない。
 - 履歴登録の照合: 補正の線・縦線・横線・矩形・楕円は `commit_local_adjust_mask_shape` が変更前後の文書を `set_local_adjust_layers_for_idx_with_undo` → `UndoEntry::LocalAdjustment` へ登録する。ポインタ移動は開始前文書を保持し、`persist_local_adjust_shape_drag` が release で1件確定、Delete は `delete_selected_local_adjust_shape_from_shortcut` が1件登録する。キー移動／回転は既存の `LocalAdjustShapeKeyEdit` にまとめ、idle／履歴境界で確定する。これらの関数と Undo helper は前後同じで、§1.679 は release 処理を `finish_local_adjust_canvas_gesture` へ移して既存登録を維持している。
 - 消しゴム／伏せ字: 作成の release で、bitmap＋図形列の変更前 snapshot を各専用 Undo stack へ1件積んでから commit する。選択移動は drag 開始時、Delete は削除直前に snapshot を積む。動かさない選択クリックも snapshot を積む既存挙動がある。補正とは確定時点が異なるが、共通 pointer owner が Undo payload を所有する形へは変わっていない。多角形／囲みは3ツールとも bitmap に塗る操作で、移動・Delete 可能な図形オブジェクトではない。多角形確定も既存 Undo の1手となる。
