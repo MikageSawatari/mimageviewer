@@ -38,6 +38,17 @@
 
 ## 1. 優先候補
 
+### 1.722 Ctrl+F「すべての対象」の XMP 読みが写真をファイル全体まで読む (2026-11-06、v5.0.0)
+
+- 状態: **修正済み・利用者の実機確認待ち** (ブランチ `fix/xmp-partial-read`、c8c91e019 + e7f5c3c14 を master へ merge)。実装 Codex gpt-6.1-sol / high、独立レビュー gpt-6.1-sol / xhigh (1 回目 REJECT の P2 を直して ACCEPT)。
+- 観測 (利用者の perf ログ `search/metadata_filter_done`、v5 rc3): `D:\home\photo\2025PEN` の 648 件を「刺身」で検索し 9 件一致。`pass2_ms`=41,267、`pass2_file_reads`=648、`bytes_read`=5,692,589,945。利用者によると 2 回目はディスクのキャッシュで速かった。
+- 原因 (コード): pass2 の `xmp_reader::read_tweet_info_counted` が jpg/jpeg/jfif/png/webp を `std::fs::read` で全体読みしていた。webp は XMP が RIFF 末尾に追記されるため (v1.0.0 DI-3)。AI 説明文より前からの作りで、説明文で写真フォルダを検索する場面が増えるので v5 で直した (利用者判断)。
+- 修正: XMP 抽出を `Read + Seek` 上の 1 か所にまとめ、bytes 版 (ZIP 内) は `Cursor` で同じ走査を通す。JPEG は SOS まで segment をたどり、PNG は IEND まで chunk 見出しをたどる (iTXt/tEXt は keyword だけ読む)。WebP は RIFF chunk 見出しをたどる。どれも XMP の本体だけを読み、画像本体は seek で飛ばす。`<x:xmpmeta` の fallback は先頭 512KB かつ最初の画像データの手前まで。path 版の読み取り (投稿情報・情報パネルの bundle・dc:subject・rating・パノラマ・tag_prewarm の rating) をすべてこの入口へ揃えた。
+- 今の結果との違い (この 4 つだけ。旧実装を `#[cfg(test)]` の oracle に残し差分テストで固定): (1) PNG の tEXt XMP を IDAT や 512KB より後ろでも拾う (iTXt → 範囲限定 fallback → tEXt 本文の順)。(2) 画像データの中にしかない `<x:xmpmeta` は拾わない。(3) 拡張子と中身が違う (`.tif` の中身が JPEG 等) 場合は全長を構造探索する。(4) TIFF 等の rating / dc:subject は全体読みをやめ 512KB だけ読む (結果は同じ)。
+- 意図的にしないこと: Extended XMP の結合 (今と同じく標準 XMP だけ)、zTXt・圧縮 iTXt の展開 (writer が非圧縮 iTXt だけを扱うので、読み書きの対応を変えない)。読み込みエラーは今と同じく「XMP なし」(`try_read_dc_subject` だけ `Err`)。
+- 検証: 関連 nextest 150 件、`test-lib-full.ps1`。テスト上、XMP の無い 8MB の JPEG で `bytes_read` は 117 バイト。実フォルダでの時間と `bytes_read` は未確認 (利用者の隔離データでの確認待ち)。
+- 残り (別件): `ingest_text::read_metadata_bytes` (索引作成) は PNG/EXIF パーサーと bytes を共有するため JPEG/PNG を全体読みしたまま。PNG の IDAT が多数ある場合の見出し読みは `png_metadata` の走査と同じ O(chunk 数)。
+
 ### 1.721 ★付きの親フォルダへ戻ると、一覧で明示した評価絞り込みが再び一時解除される — 5ch >>734 (2026-11-06)
 
 - 状態: **未修正・コードで報告条件と一致する経路を確認、利用者が不具合として起票を指示**。収録版は未指定。[>>734](https://egg.5ch.io/test/read.cgi/software/1782419551/734) は、>>687への修正案内（>>713、v4.11.0）後も残る条件を特定した報告。親フォルダ自身が★4で、その中で★4を含む絞り込みを設定し、本を開いて閉じると「★一時解除中」が残る。親の評価を変えると発生する絞り込み条件も変わると報告された。報告者のウィンドウモード・本の形式・閉じる入力は未記載だが、今回の原因説明に必要な条件はソースで確認できているため、追加の試行一式を依頼しない。

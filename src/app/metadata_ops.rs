@@ -278,7 +278,7 @@ pub(super) fn is_ai_metadata_path(path: &std::path::Path) -> bool {
 /// フルスクリーン画像のメタデータ (AI プロンプト / EXIF / XMP) を読み込むワーカー本体。
 /// ZipImage は ZIP エントリを 1 回だけ開いて 3 パーサー間で bytes を共有する。
 /// それ以外 (Image / Video) はファイルを直接パーサーに渡す。パーサー側で
-/// 必要に応じて full-file read が行われる (XMP の JPEG/PNG は全体読み)。
+/// 必要に応じて I/O を行う。XMP の JPEG/PNG/WebP は見出し・payload の部分読み。
 pub(super) fn run_metadata_load(
     key: String,
     item: GridItem,
@@ -322,7 +322,7 @@ pub(super) fn run_metadata_load(
                 return None;
             }
             // xtw (X/Twitter) と GPano は同じ XMP packet を参照するので 1 回読み +
-            // 1 回 extract_xmp_packet にまとめる (Codex P2 第 19 ラウンド: 旧コードは
+            // 1 回のパケット抽出にまとめる (Codex P2 第 19 ラウンド: 旧コードは
             // 2 回 fs::read + 2 回 extract を実行していた)。
             let bundle = match verified_bytes.as_ref() {
                 Some(bytes) => crate::xmp_reader::read_xmp_bundle_from_bytes(bytes),

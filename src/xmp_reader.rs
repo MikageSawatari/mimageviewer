@@ -4,15 +4,20 @@
 //! パケットに `xtw:` カスタム名前空間 (`https://mXDownloader.app/ns/x-twitter/1.0/`)
 //! で tweet URL / 投稿者 / 本文 / スレッド情報等が埋め込まれている。
 //!
-//! このモジュールは JPEG APP1 / PNG iTXt から XMP パケットを取り出し、`xtw:*`
+//! このモジュールは JPEG APP1 / PNG iTXt・tEXt / WebP XMP chunk から XMP パケットを取り出し、`xtw:*`
 //! と必要最小限の `dc:*` プロパティだけを拾って [`XmpTweetInfo`] を返す。
 //! フル機能の汎用 XMP パーサーではない。詳細仕様は
 //! `C:/home/mxdownloader/docs/miv-integration.md` 参照。
+//! path は見出し・keyword・XMP payload を部分読みし、画像本体は seek で飛ばす。
+//! bytes も Cursor 経由で同じ走査を使う。fallback は先頭 512KB 以内、かつ
+//! JPEG/PNG/WebP では探索中に到達した最初の画像データの手前に限定する。
+//! PNG tEXt は iTXt と範囲限定 fallback の後で、本文全体から packet を切り出す。
 
 use quick_xml::XmlVersion;
 use quick_xml::events::Event;
 use quick_xml::reader::NsReader;
 use std::collections::HashMap;
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
 /// mXD が `xtw:` 名前空間で埋め込む X/Twitter 情報。
@@ -87,13 +92,11 @@ fn extension_might_have_xmp(path: &Path) -> bool {
 /// XMP パケットが無い / `xtw:*` プロパティが無い場合は None。
 ///
 /// **フォーマット別の読み込み戦略**:
-/// - JPEG / PNG (通常 ≤50MB): ファイル全体を読む。専用パーサーが
-///   APP1 / iTXt をコンテナ末尾まで走査するので、optipng や jpegtran 等で
-///   XMP セグメントが先頭から離れた位置に置かれていても拾える。
-/// - MP4 / MOV / M4V / TIFF (数百MB ありうる): 先頭 [`FALLBACK_SCAN_LIMIT`]
-///   バイトだけ読む。mXD / ExifTool が書く XMP は uuid アトム / IFD0 の
-///   先頭付近に置かれるので 512KB あれば実用上十分。これにより UI 同期スレッド
-///   での丸読みハングを防ぐ。
+/// - Magic が JPEG / PNG / WebP: 見出しと XMP payload を部分読みし、他は seek。
+///   JPEG は SOS で終了し、PNG / WebP は画像データより後ろの XMP も探す。
+///   fallback は最初に到達した画像データの手前、最大 512KB。
+/// - MP4 / MOV / M4V / TIFF: 先頭 [`FALLBACK_SCAN_LIMIT`] バイトだけを fallback で探す。
+/// 部分読みでも I/O を伴うため worker から呼ぶこと。
 pub fn read_tweet_info(path: &Path) -> Option<XmpTweetInfo> {
     read_tweet_info_counted(path).info
 }
@@ -105,6 +108,7 @@ pub(crate) struct XmpTweetRead {
 
 /// `read_tweet_info` と同じ読み取りを行い、perf 計装用に実際にバッファへ
 /// 読み込んだバイト数も返す。
+/// 共通入口が I/O エラーを返した場合は XMP なし・計数 0 とする。
 pub(crate) fn read_tweet_info_counted(path: &Path) -> XmpTweetRead {
     if !extension_might_have_xmp(path) {
         return XmpTweetRead {
@@ -112,50 +116,17 @@ pub(crate) fn read_tweet_info_counted(path: &Path) -> XmpTweetRead {
             bytes_read: 0,
         };
     }
-    let small_image = matches!(
-        lowercase_ext(path).as_deref(),
-        // webp も full-read する: XMP は RIFF 末尾の "XMP " チャンクに追記されるため、
-        // 先頭部分読みでは取りこぼす (v1.0.0 データ整合性レビュー DI-3)。
-        Some("jpg" | "jpeg" | "jfif" | "png" | "webp")
-    );
-    if small_image {
-        let Ok(bytes) = std::fs::read(path) else {
-            return XmpTweetRead {
-                info: None,
-                bytes_read: 0,
-            };
-        };
-        return XmpTweetRead {
-            info: read_tweet_info_from_bytes(&bytes),
-            bytes_read: bytes.len() as u64,
-        };
-    }
-    // 大容量コンテナ系: 先頭 FALLBACK_SCAN_LIMIT のみ
-    use std::io::Read;
-    let Ok(f) = std::fs::File::open(path) else {
-        return XmpTweetRead {
-            info: None,
-            bytes_read: 0,
-        };
-    };
-    let mut buf = Vec::with_capacity(FALLBACK_SCAN_LIMIT.min(64 * 1024));
-    let read_ok = f
-        .take(FALLBACK_SCAN_LIMIT as u64)
-        .read_to_end(&mut buf)
-        .is_ok();
+    let read = read_xmp_packet_from_path(path).unwrap_or_default();
     XmpTweetRead {
-        info: read_ok.then(|| read_tweet_info_from_bytes(&buf)).flatten(),
-        bytes_read: buf.len() as u64,
+        info: read.packet.as_deref().and_then(parse_xmp),
+        bytes_read: read.bytes_read,
     }
 }
 
 /// バイト列版 (ZIP 内画像などで使用)。拡張子で事前フィルタできないので、
 /// マジックバイトで JPEG / PNG / ISO BMFF 系かどうかを判別してから parse に進む。
 pub fn read_tweet_info_from_bytes(bytes: &[u8]) -> Option<XmpTweetInfo> {
-    if !has_xmp_capable_magic(bytes) {
-        return None;
-    }
-    let xmp = extract_xmp_packet(bytes)?;
+    let xmp = read_xmp_packet_from_bytes(bytes)?;
     let info = parse_xmp(&xmp)?;
     if info.is_populated() {
         Some(info)
@@ -166,7 +137,7 @@ pub fn read_tweet_info_from_bytes(bytes: &[u8]) -> Option<XmpTweetInfo> {
 
 /// XMP 由来の各パース結果をまとめて返す bundle 型。
 /// `xtw:*` (mXD X/Twitter) と GPano パノラマプロパティはどちらも同じ XMP packet を
-/// 参照するため、1 回のファイル読み + extract_xmp_packet で両方を取り出して
+/// 参照するため、1 回の部分読み・パケット抽出で両方を取り出して
 /// I/O を半減する (Codex P2 第 19 ラウンド)。
 #[derive(Clone, Debug, Default)]
 pub struct XmpReadBundle {
@@ -175,51 +146,35 @@ pub struct XmpReadBundle {
 }
 
 /// パスから XMP 関連情報をまとめて読む。`read_tweet_info` + `read_panorama_info`
-/// と等価だが、I/O と extract_xmp_packet を **1 回** で済ます (Codex P2 第 19 ラウンド)。
+/// と等価だが、I/O とパケット抽出を **1 回** で済ます (Codex P2 第 19 ラウンド)。
 ///
 /// 戦略は [`read_tweet_info`] と同じ:
-/// - JPEG / PNG: ファイル全体読み
-/// - MP4 / MOV / M4V / TIFF: 先頭 [`FALLBACK_SCAN_LIMIT`] バイトのみ
+/// - Magic が JPEG / PNG / WebP: 見出し・XMP payload の部分読み
+/// - MP4 / MOV / M4V / TIFF: 先頭 [`FALLBACK_SCAN_LIMIT`] バイトの fallback
 pub fn read_xmp_bundle(path: &Path) -> XmpReadBundle {
     if !extension_might_have_xmp(path) {
         return XmpReadBundle::default();
     }
-    let small_image = matches!(
-        lowercase_ext(path).as_deref(),
-        // webp も full-read する: XMP は RIFF 末尾の "XMP " チャンクに追記されるため、
-        // 先頭部分読みでは取りこぼす (v1.0.0 データ整合性レビュー DI-3)。
-        Some("jpg" | "jpeg" | "jfif" | "png" | "webp")
-    );
-    let bytes_result = if small_image {
-        std::fs::read(path).ok()
-    } else {
-        use std::io::Read;
-        std::fs::File::open(path).ok().and_then(|f| {
-            let mut buf = Vec::with_capacity(FALLBACK_SCAN_LIMIT.min(64 * 1024));
-            f.take(FALLBACK_SCAN_LIMIT as u64)
-                .read_to_end(&mut buf)
-                .ok()
-                .map(|_| buf)
-        })
-    };
-    let Some(bytes) = bytes_result else {
-        return XmpReadBundle::default();
-    };
-    read_xmp_bundle_from_bytes(&bytes)
+    let read = read_xmp_packet_from_path(path).unwrap_or_default();
+    read.packet
+        .as_deref()
+        .map(parse_xmp_bundle)
+        .unwrap_or_default()
 }
 
-/// バイト列版。`has_xmp_capable_magic` と `extract_xmp_packet` を 1 回ずつしか
-/// 実行しないので、tweet + panorama を別関数で 2 回読むのに比べて約半分のコスト。
+/// バイト列版。共通の `read_xmp_packet_from_bytes` で magic 判定・抽出を 1 回だけ行い、
+/// tweet と panorama の両パーサへ同じ packet を渡す。
 pub fn read_xmp_bundle_from_bytes(bytes: &[u8]) -> XmpReadBundle {
-    if !has_xmp_capable_magic(bytes) {
-        return XmpReadBundle::default();
-    }
-    let Some(packet) = extract_xmp_packet(bytes) else {
+    let Some(packet) = read_xmp_packet_from_bytes(bytes) else {
         return XmpReadBundle::default();
     };
     // 各パーサに XMP packet を共有させる
-    let tweet = parse_xmp(&packet).filter(|t| t.is_populated());
-    let panorama = parse_gpano(&packet).filter(|p| p.is_populated());
+    parse_xmp_bundle(&packet)
+}
+
+fn parse_xmp_bundle(packet: &[u8]) -> XmpReadBundle {
+    let tweet = parse_xmp(packet).filter(|t| t.is_populated());
+    let panorama = parse_gpano(packet).filter(|p| p.is_populated());
     XmpReadBundle { tweet, panorama }
 }
 
@@ -250,33 +205,289 @@ pub(crate) fn has_xmp_capable_magic(bytes: &[u8]) -> bool {
 // XMP パケット抽出 (JPEG APP1 / PNG iTXt / fallback)
 // ---------------------------------------------------------------------------
 
-/// ファイル形式を自動判別して XMP パケット (x:xmpmeta を含む XML バイト列) を返す。
+/// 部分読みで抽出した packet と、実際に読んだバイト数。
+#[derive(Default)]
+pub(crate) struct XmpPacketRead {
+    pub packet: Option<Vec<u8>>,
+    pub bytes_read: u64,
+}
+
+/// Magic で形式を判定し、見出しと XMP payload だけを読む共通 path 入口。
+/// ファイル長は open 直後に固定し、壊れた範囲は I/O 前に判定する。
+/// open / seek / read の失敗は呼び出し側へ返す。
+pub(crate) fn read_xmp_packet_from_path(path: &Path) -> io::Result<XmpPacketRead> {
+    let file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut reader = XmpPacketReader {
+        inner: file,
+        len,
+        bytes_read: 0,
+    };
+    let packet = reader.extract(true)?;
+    Ok(XmpPacketRead {
+        packet,
+        bytes_read: reader.bytes_read,
+    })
+}
+
+/// bytes 版も path 版と同じ Read + Seek の走査を使う。
+/// この内部抽出関数は従来どおり未知 magic の raw fallback も許可する。
+/// 公開 API の magic ゲートは `read_xmp_packet_from_bytes` が同じ走査内で行う。
+#[cfg(test)]
 pub(crate) fn extract_xmp_packet(bytes: &[u8]) -> Option<Vec<u8>> {
+    extract_xmp_packet_from_bytes(bytes, false)
+}
+
+fn read_xmp_packet_from_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
+    extract_xmp_packet_from_bytes(bytes, true)
+}
+
+fn extract_xmp_packet_from_bytes(bytes: &[u8], gate_magic: bool) -> Option<Vec<u8>> {
+    XmpPacketReader {
+        inner: Cursor::new(bytes),
+        len: bytes.len() as u64,
+        bytes_read: 0,
+    }
+    .extract(gate_magic)
+    .ok()
+    .flatten()
+}
+
+/// packet が無ければ image_start より前だけを fallback で探す。
+/// 画像の見出しへ到達する前に探索終了した場合はファイル長を使う。
+#[derive(Default)]
+struct XmpScan {
+    packet: Option<Vec<u8>>,
+    image_start: Option<u64>,
+    /// File order; read these bodies only after the bounded fallback misses.
+    png_text_ranges: Vec<(u64, u64)>,
+}
+
+struct XmpPacketReader<R> {
+    inner: R,
+    len: u64,
+    bytes_read: u64,
+}
+
+impl<R: Read + Seek> XmpPacketReader<R> {
+    /// seek で飛ばした分を含めず、実際の Read の戻り値だけを数える。
+    fn read_at(&mut self, pos: u64, mut buf: &mut [u8]) -> io::Result<()> {
+        self.inner.seek(SeekFrom::Start(pos))?;
+        while !buf.is_empty() {
+            match self.inner.read(buf) {
+                Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                Ok(n) => {
+                    self.bytes_read += n as u64;
+                    buf = &mut buf[n..];
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    fn read_vec_at(&mut self, pos: u64, len: u64) -> io::Result<Vec<u8>> {
+        let len = usize::try_from(len).map_err(|_| io::ErrorKind::OutOfMemory)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(len)
+            .map_err(|_| io::ErrorKind::OutOfMemory)?;
+        bytes.resize(len, 0);
+        self.read_at(pos, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn extract(&mut self, gate_magic: bool) -> io::Result<Option<Vec<u8>>> {
+        let mut head = [0; 12];
+        let head_len = self.len.min(12) as usize;
+        self.read_at(0, &mut head[..head_len])?;
+        let head = &head[..head_len];
+        if gate_magic && !has_xmp_capable_magic(head) {
+            return Ok(None);
+        }
+        let scan = if head.starts_with(&[0xff, 0xd8]) {
+            self.scan_jpeg()?
+        } else if head.starts_with(b"\x89PNG\r\n\x1a\n") {
+            self.scan_png()?
+        } else if head.starts_with(b"RIFF") && head.get(8..12) == Some(b"WEBP") {
+            self.scan_webp()?
+        } else {
+            XmpScan::default()
+        };
+        if scan.packet.is_some() {
+            return Ok(scan.packet);
+        }
+        let end = scan
+            .image_start
+            .unwrap_or(self.len)
+            .min(FALLBACK_SCAN_LIMIT as u64);
+        let bytes = self.read_vec_at(0, end)?;
+        if let Some(packet) = extract_xmp_fallback(&bytes) {
+            return Ok(Some(packet));
+        }
+        for (start, length) in scan.png_text_ranges {
+            let text = self.read_vec_at(start, length)?;
+            if let Some(packet) = extract_xmp_xml(&text) {
+                return Ok(Some(packet));
+            }
+        }
+        Ok(None)
+    }
+
+    fn scan_jpeg(&mut self) -> io::Result<XmpScan> {
+        const XMP_ID: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
+        let mut pos = 2;
+        while self.len - pos >= 4 {
+            let mut marker = [0; 2];
+            self.read_at(pos, &mut marker)?;
+            if marker[0] != 0xff {
+                break;
+            }
+            if marker[1] == 0xda {
+                return Ok(XmpScan {
+                    image_start: Some(pos),
+                    ..XmpScan::default()
+                });
+            }
+            pos += 2;
+            if matches!(marker[1], 0xd8 | 0xd9 | 0xd0..=0xd7) {
+                continue;
+            }
+            let mut length = [0; 2];
+            self.read_at(pos, &mut length)?;
+            let length = u64::from(u16::from_be_bytes(length));
+            if length < 2 || length > self.len - pos {
+                break;
+            }
+            if marker[1] == 0xe1 && length - 2 >= XMP_ID.len() as u64 {
+                let mut id = [0; 29];
+                self.read_at(pos + 2, &mut id)?;
+                if id == XMP_ID {
+                    return Ok(XmpScan {
+                        packet: Some(self.read_vec_at(
+                            pos + 2 + id.len() as u64,
+                            length - 2 - id.len() as u64,
+                        )?),
+                        ..XmpScan::default()
+                    });
+                }
+            }
+            pos += length;
+        }
+        Ok(XmpScan::default())
+    }
+
+    fn scan_png(&mut self) -> io::Result<XmpScan> {
+        let mut pos = 8;
+        let mut scan = XmpScan::default();
+        // Record tEXt locations without making them a structural result.
+        // iTXt and the legacy bounded fallback both take priority over tEXt.
+        while self.len - pos >= 8 {
+            let mut header = [0; 8];
+            self.read_at(pos, &mut header)?;
+            let length = u64::from(u32::from_be_bytes(header[..4].try_into().unwrap()));
+            let kind = &header[4..];
+            if kind == b"IDAT" {
+                scan.image_start.get_or_insert(pos);
+            }
+            let data_start = pos + 8;
+            if self.len - data_start < 4 || length > self.len - data_start - 4 {
+                break;
+            }
+            if matches!(kind, b"iTXt" | b"tEXt") {
+                let mut prefix = [0; 80];
+                let prefix_len = length.min(80) as usize;
+                self.read_at(data_start, &mut prefix[..prefix_len])?;
+                if let Some(kw_end) = prefix[..prefix_len].iter().position(|&b| b == 0)
+                    && &prefix[..kw_end] == b"XML:com.adobe.xmp"
+                {
+                    let text_start = data_start + kw_end as u64 + 1;
+                    let rest_len = length - kw_end as u64 - 1;
+                    if kind == b"tEXt" {
+                        scan.png_text_ranges.push((text_start, rest_len));
+                    } else {
+                        let rest = self.read_vec_at(text_start, rest_len)?;
+                        scan.packet = parse_xmp_itxt(&rest).map(<[u8]>::to_vec);
+                        return Ok(scan);
+                    }
+                }
+            } else if kind == b"IEND" {
+                break;
+            }
+            pos = data_start + length + 4;
+        }
+        Ok(scan)
+    }
+
+    fn scan_webp(&mut self) -> io::Result<XmpScan> {
+        let mut pos = 12;
+        let mut scan = XmpScan::default();
+        while pos <= self.len && self.len - pos >= 8 {
+            let mut header = [0; 8];
+            self.read_at(pos, &mut header)?;
+            let kind = &header[..4];
+            let size = u64::from(u32::from_le_bytes(header[4..].try_into().unwrap()));
+            if matches!(kind, b"VP8 " | b"VP8L" | b"ALPH" | b"ANMF") {
+                scan.image_start.get_or_insert(pos);
+            }
+            let start = pos + 8;
+            if size > self.len - start {
+                break;
+            }
+            if kind == b"XMP " {
+                scan.packet = Some(self.read_vec_at(start, size)?);
+                return Ok(scan);
+            }
+            pos = start + size + (size & 1);
+        }
+        Ok(scan)
+    }
+}
+
+/// compression flag + method + language\0 + translated keyword\0 + text.
+/// Preserve the legacy structure validation even for compressed iTXt.
+fn parse_xmp_itxt(rest: &[u8]) -> Option<&[u8]> {
+    if rest.len() < 2 {
+        return None;
+    }
+    let after = &rest[2..];
+    let lang_end = after.iter().position(|&b| b == 0)?;
+    let after_lang = &after[lang_end + 1..];
+    let trans_end = after_lang.iter().position(|&b| b == 0)?;
+    (rest[0] == 0).then_some(&after_lang[trans_end + 1..])
+}
+
+// Frozen pre-partial-read implementation: differential tests must not share
+// the new container walkers or iTXt header parser with this oracle.
+#[cfg(test)]
+fn legacy_extract_xmp_packet(bytes: &[u8]) -> Option<Vec<u8>> {
     if bytes.starts_with(&[0xFF, 0xD8]) {
         // JPEG
-        if let Some(xmp) = extract_xmp_from_jpeg(bytes) {
+        if let Some(xmp) = legacy_extract_xmp_from_jpeg(bytes) {
             return Some(xmp);
         }
     } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         // PNG
-        if let Some(xmp) = extract_xmp_from_png(bytes) {
+        if let Some(xmp) = legacy_extract_xmp_from_png(bytes) {
             return Some(xmp);
         }
     } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
         // WebP (RIFF): "XMP " チャンクのペイロードが XMP packet (v1.0.0 データ整合性レビュー DI-3)
-        if let Some(xmp) = extract_xmp_from_webp(bytes) {
+        if let Some(xmp) = legacy_extract_xmp_from_webp(bytes) {
             return Some(xmp);
         }
     }
     // フォールバック: ファイル先頭 256KB から <x:xmpmeta ... </x:xmpmeta> を切り出す。
     // MP4 / TIFF 等の未対応形式にも対応するため。
-    extract_xmp_fallback(bytes)
+    legacy_extract_xmp_fallback(bytes)
 }
 
 /// WebP (RIFF) コンテナを走査して "XMP " チャンクのペイロード (XMP packet) を返す。
 /// xmp_writer の RIFF 書き込み経路と対になる読み取り側 (DI-3)。チャンクは
 /// 4byte FourCC + 4byte LE size + payload で、size が奇数なら 1byte padding が続く。
-fn extract_xmp_from_webp(bytes: &[u8]) -> Option<Vec<u8>> {
+#[cfg(test)]
+fn legacy_extract_xmp_from_webp(bytes: &[u8]) -> Option<Vec<u8>> {
     if bytes.len() < 12 || !bytes.starts_with(b"RIFF") || &bytes[8..12] != b"WEBP" {
         return None;
     }
@@ -306,7 +517,8 @@ fn extract_xmp_from_webp(bytes: &[u8]) -> Option<Vec<u8>> {
 /// JPEG APP1 セグメントから Adobe XMP パケットを探す。
 /// Standard XMP は "http://ns.adobe.com/xap/1.0/\0" プレフィクス付き。
 /// ExtendedXMP (>64KB) はここでは扱わない — mXD の出力には収まる想定。
-fn extract_xmp_from_jpeg(bytes: &[u8]) -> Option<Vec<u8>> {
+#[cfg(test)]
+fn legacy_extract_xmp_from_jpeg(bytes: &[u8]) -> Option<Vec<u8>> {
     const XMP_ID: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
     let mut pos = 2; // SOI をスキップ
     while pos + 4 <= bytes.len() {
@@ -340,7 +552,8 @@ fn extract_xmp_from_jpeg(bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// PNG の iTXt チャンクから Adobe XMP を探す。keyword は `XML:com.adobe.xmp`。
-fn extract_xmp_from_png(bytes: &[u8]) -> Option<Vec<u8>> {
+#[cfg(test)]
+fn legacy_extract_xmp_from_png(bytes: &[u8]) -> Option<Vec<u8>> {
     let mut pos = 8; // PNG シグネチャをスキップ
     while pos + 8 <= bytes.len() {
         let length =
@@ -393,6 +606,11 @@ fn extract_xmp_from_png(bytes: &[u8]) -> Option<Vec<u8>> {
 const FALLBACK_SCAN_LIMIT: usize = 512 * 1024;
 fn extract_xmp_fallback(bytes: &[u8]) -> Option<Vec<u8>> {
     let scan = &bytes[..bytes.len().min(FALLBACK_SCAN_LIMIT)];
+    extract_xmp_xml(scan)
+}
+
+/// 切り出し規則は fallback と同じ。PNG tEXt 本文には 512KB 制限をかけない。
+fn extract_xmp_xml(scan: &[u8]) -> Option<Vec<u8>> {
     let start = find_subsequence(scan, b"<x:xmpmeta")?;
     let end_needle = b"</x:xmpmeta>";
     let rel_end = find_subsequence(&scan[start..], end_needle)?;
@@ -620,6 +838,7 @@ fn parse_xmp(xml: &[u8]) -> Option<XmpTweetInfo> {
 /// ファイルの XMP `dc:subject` Bag 要素を読み取る。
 /// `#` で始まるもの・つかないもの問わず全て返す。呼び出し側が必要に応じて
 /// `#` 接頭辞でフィルタする。
+/// 非動画の部分読み戦略は [`read_tweet_info`] と同じ。動画は従来どおり sidecar を読む。
 pub fn read_dc_subject(path: &Path) -> Vec<String> {
     try_read_dc_subject(path).unwrap_or_default()
 }
@@ -628,6 +847,7 @@ pub fn read_dc_subject(path: &Path) -> Vec<String> {
 ///
 /// `read_dc_subject` と同じ内容を返すが、ファイル読み取りエラーを呼び出し側へ返す。
 /// XMP 非対応拡張子・XMP パケット無し・動画 sidecar 不在は「タグなし」として `Ok(Vec::new())`。
+/// 非動画は共通の部分読み入口を使い、open / seek / read の I/O エラーを返す。
 pub fn try_read_dc_subject(path: &Path) -> Result<Vec<String>, std::io::Error> {
     if let Some(result) = try_read_dc_subject_video_sidecar(path) {
         return result;
@@ -635,8 +855,12 @@ pub fn try_read_dc_subject(path: &Path) -> Result<Vec<String>, std::io::Error> {
     if !extension_might_have_xmp(path) {
         return Ok(Vec::new());
     }
-    let bytes = std::fs::read(path)?;
-    Ok(read_dc_subject_from_bytes(&bytes))
+    let read = read_xmp_packet_from_path(path)?;
+    Ok(read
+        .packet
+        .as_deref()
+        .map(parse_dc_subject)
+        .unwrap_or_default())
 }
 
 fn try_read_dc_subject_video_sidecar(path: &Path) -> Option<Result<Vec<String>, std::io::Error>> {
@@ -655,10 +879,7 @@ fn try_read_dc_subject_video_sidecar(path: &Path) -> Option<Result<Vec<String>, 
 
 /// バイト列版。
 pub fn read_dc_subject_from_bytes(bytes: &[u8]) -> Vec<String> {
-    if !has_xmp_capable_magic(bytes) {
-        return Vec::new();
-    }
-    let Some(xmp) = extract_xmp_packet(bytes) else {
+    let Some(xmp) = read_xmp_packet_from_bytes(bytes) else {
         return Vec::new();
     };
     parse_dc_subject(&xmp)
@@ -729,20 +950,18 @@ pub(crate) fn parse_dc_subject(xml: &[u8]) -> Vec<String> {
 
 /// ファイルの XMP `xmp:Rating` を読み取る。0 / 未設定で `None` を返す。
 /// 1..=5 の範囲外は clamp。
+/// 部分読み戦略は [`read_tweet_info`] と同じ。
 pub fn read_xmp_rating(path: &Path) -> Option<u8> {
     if !extension_might_have_xmp(path) {
         return None;
     }
-    let bytes = std::fs::read(path).ok()?;
-    read_xmp_rating_from_bytes(&bytes)
+    let packet = read_xmp_packet_from_path(path).ok()?.packet?;
+    parse_xmp_rating(&packet)
 }
 
 /// バイト列版。
 pub fn read_xmp_rating_from_bytes(bytes: &[u8]) -> Option<u8> {
-    if !has_xmp_capable_magic(bytes) {
-        return None;
-    }
-    let xmp = extract_xmp_packet(bytes)?;
+    let xmp = read_xmp_packet_from_bytes(bytes)?;
     parse_xmp_rating(&xmp)
 }
 
@@ -904,36 +1123,18 @@ impl XmpPanoramaInfo {
 /// XMP パケットが無い / GPano プロパティが無い場合は None。
 ///
 /// 読み込み戦略は [`read_tweet_info`] と同じ:
-/// JPEG/PNG はファイル全体、MP4/MOV/M4V/TIFF は先頭 512 KB のみ。
+/// Magic が JPEG/PNG/WebP なら部分読み、MP4/MOV/M4V/TIFF は先頭 512KB の fallback。
 pub fn read_panorama_info(path: &Path) -> Option<XmpPanoramaInfo> {
     if !extension_might_have_xmp(path) {
         return None;
     }
-    let small_image = matches!(
-        lowercase_ext(path).as_deref(),
-        // webp も full-read する: XMP は RIFF 末尾の "XMP " チャンクに追記されるため、
-        // 先頭部分読みでは取りこぼす (v1.0.0 データ整合性レビュー DI-3)。
-        Some("jpg" | "jpeg" | "jfif" | "png" | "webp")
-    );
-    if small_image {
-        let bytes = std::fs::read(path).ok()?;
-        return read_panorama_info_from_bytes(&bytes);
-    }
-    use std::io::Read;
-    let f = std::fs::File::open(path).ok()?;
-    let mut buf = Vec::with_capacity(FALLBACK_SCAN_LIMIT.min(64 * 1024));
-    f.take(FALLBACK_SCAN_LIMIT as u64)
-        .read_to_end(&mut buf)
-        .ok()?;
-    read_panorama_info_from_bytes(&buf)
+    let packet = read_xmp_packet_from_path(path).ok()?.packet?;
+    parse_gpano(&packet).filter(|info| info.is_populated())
 }
 
 /// バイト列版 (ZIP 内画像などで使用)。
 pub fn read_panorama_info_from_bytes(bytes: &[u8]) -> Option<XmpPanoramaInfo> {
-    if !has_xmp_capable_magic(bytes) {
-        return None;
-    }
-    let xmp = extract_xmp_packet(bytes)?;
+    let xmp = read_xmp_packet_from_bytes(bytes)?;
     let info = parse_gpano(&xmp)?;
     if info.is_populated() {
         Some(info)
@@ -1346,7 +1547,7 @@ mod tests {
         out
     }
 
-    /// XMP が先頭から 512KB 超の位置にあっても、JPEG は全読みするので拾える。
+    /// XMP が先頭から 512KB 超の位置にあっても、JPEG は segment をたどって拾える。
     #[test]
     fn jpeg_with_xmp_past_512kb_is_found() {
         // FALLBACK_SCAN_LIMIT = 512KB。それを超える junk を XMP の前に置く。
@@ -1356,10 +1557,9 @@ mod tests {
         assert_eq!(info.tweet_id.as_deref(), Some("2044629346967773284"));
     }
 
-    /// `read_tweet_info(path)` のファイルベース経路でも、JPEG は全読みパスを
-    /// 通るので 512KB 超の位置にある XMP を拾えること (Codex Finding 2 のリグレッション)。
+    /// path 経路でも segment をたどり、512KB 超の XMP を拾うこと。
     #[test]
-    fn read_tweet_info_path_reads_full_jpeg() {
+    fn read_tweet_info_path_finds_late_jpeg_xmp() {
         let bytes = build_jpeg_with_xmp_at_offset(700 * 1024);
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("big.jpg");
@@ -1757,7 +1957,7 @@ mod tests {
         jpeg.extend_from_slice(&payload);
         jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0xFF, 0xD9]); // SOS+EOI
 
-        // 1 回読み込み (= extract_xmp_packet 1 回) で両方拾えることを検証
+        // 1 回のパケット抽出で両方拾えることを検証
         let bundle = read_xmp_bundle_from_bytes(&jpeg);
         let tweet = bundle.tweet.expect("xtw should be parsed");
         let panorama = bundle.panorama.expect("GPano should be parsed");
@@ -1833,3 +2033,16 @@ mod tests {
         assert!(bundle.panorama.is_some(), "GPano should be parsed");
     }
 }
+
+#[cfg(test)]
+fn legacy_extract_xmp_fallback(bytes: &[u8]) -> Option<Vec<u8>> {
+    let scan = &bytes[..bytes.len().min(FALLBACK_SCAN_LIMIT)];
+    let start = find_subsequence(scan, b"<x:xmpmeta")?;
+    let end_needle = b"</x:xmpmeta>";
+    let rel_end = find_subsequence(&scan[start..], end_needle)?;
+    Some(scan[start..start + rel_end + end_needle.len()].to_vec())
+}
+
+#[cfg(test)]
+#[path = "xmp_reader_partial_read_tests.rs"]
+mod partial_read_tests;
