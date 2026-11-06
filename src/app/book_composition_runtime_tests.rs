@@ -1275,6 +1275,78 @@ fn g3_initial_moved_projection_preserves_raw_resume_identity_and_history_ordinal
 }
 
 #[test]
+fn resume_refusal_composed_fallback_saves_canonical_first_page_position() {
+    use crate::book_composition::{BookComposition, fixtures::document_page};
+    let mut env = setup_app();
+    let root = env.tmp.path().join("resume-fallback.pdf");
+    let data = env.tmp.path().join("resume-fallback-data");
+    let scope = install_document(&mut env, &root);
+    let writer = env.book_resume_writer.as_ref().unwrap();
+    assert!(writer.record(&root, 0, None));
+    writer.read_all().recv_timeout(WAIT).unwrap().unwrap();
+    let (service, owner) = runtime(&mut env, &data);
+    let mut record = BookComposition::new(
+        ReadingDirection::Ltr,
+        [2, 3, 0, 1].into_iter().map(document_page).collect(),
+    );
+    record.hidden_pages = vec![document_page(0)];
+    service
+        .save(scope.clone(), PageDomain::Document, record)
+        .recv_timeout(WAIT)
+        .unwrap()
+        .status
+        .unwrap();
+    adopt(&mut env, &service, &scope);
+    let outcome = env.open_deferred_fullscreen_after_enumerate(DeferredFsReopen {
+        history_trigger: HistoryTrigger::UserChosen,
+        resume_slideshow: false,
+        target: DeferredFsTarget::None,
+        resume_to_last_page: true,
+        from_explicit_open: true,
+        preserve_after_password_prompt: true,
+    });
+    assert!(matches!(
+        outcome,
+        DeferredFsOpenOutcome::Opened | DeferredFsOpenOutcome::WaitingComposition
+    ));
+    let deadline = std::time::Instant::now() + WAIT;
+    while env.fullscreen_idx.is_none() {
+        barrier(&service, &scope);
+        env.poll_book_composition_read(&egui::Context::default());
+        env.poll_book_presentation_permission(&egui::Context::default());
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fallback open did not settle"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(current_physical_page(&env), Some(2));
+    assert_eq!(env.fullscreen_idx, Some(0));
+    env.book_resume_writer
+        .as_ref()
+        .unwrap()
+        .read_all()
+        .recv_timeout(WAIT)
+        .unwrap()
+        .unwrap();
+    let saved = env
+        .book_resume_db
+        .as_ref()
+        .unwrap()
+        .get_position(&root)
+        .unwrap();
+    assert_eq!(
+        saved.page, 2,
+        "persist canonical raw page, not projected index zero"
+    );
+    assert_eq!(
+        saved.identity,
+        crate::book_resume_db::PageIdentity::for_item(&env.items[0], None)
+    );
+    owner.shutdown_and_join();
+}
+
+#[test]
 fn g3_initial_deferred_entry_waits_for_projection_then_opens_first_visible_real() {
     use crate::book_composition::{BookComposition, fixtures::document_page};
     for hide_all in [false, true] {

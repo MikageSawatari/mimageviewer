@@ -1,7 +1,7 @@
 //! Context-owned visible demand and one qualified fullscreen-open continuation.
 use super::{
-    App, DeferredFsReopen, FsMetadataBoundary, FsOpenMaterialization, FsPageLoadContract,
-    HistoryTrigger,
+    App, BookResumeNotice, DeferredFsReopen, FsMetadataBoundary, FsOpenMaterialization,
+    FsPageLoadContract, HistoryTrigger,
 };
 use crate::book_composition::*;
 use std::{collections::HashMap, sync::mpsc};
@@ -27,7 +27,10 @@ pub(crate) enum BookIdentityPermission {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum BookTargetRoute {
-    FullscreenOpen(FsMetadataBoundary),
+    FullscreenOpen {
+        metadata_boundary: FsMetadataBoundary,
+        resume_notice: Option<BookResumeNotice>,
+    },
     FullscreenNavigation,
     ContinuousSeek,
     ZipDfs(BookDfsContinuation),
@@ -1272,13 +1275,37 @@ impl App {
         purpose: BookTargetPurpose,
         metadata_boundary: FsMetadataBoundary,
     ) -> bool {
+        self.defer_book_composition_fullscreen_open_with_notice(
+            idx,
+            history_trigger,
+            materialization,
+            contract,
+            purpose,
+            metadata_boundary,
+            None,
+        )
+    }
+
+    pub(super) fn defer_book_composition_fullscreen_open_with_notice(
+        &mut self,
+        idx: usize,
+        history_trigger: HistoryTrigger,
+        materialization: FsOpenMaterialization,
+        contract: FsPageLoadContract,
+        purpose: BookTargetPurpose,
+        metadata_boundary: FsMetadataBoundary,
+        resume_notice: Option<BookResumeNotice>,
+    ) -> bool {
         self.defer_book_composition_target_route(
             idx,
             history_trigger,
             materialization,
             contract,
             purpose,
-            BookTargetRoute::FullscreenOpen(metadata_boundary),
+            BookTargetRoute::FullscreenOpen {
+                metadata_boundary,
+                resume_notice,
+            },
             Vec::new(),
         )
     }
@@ -1709,7 +1736,7 @@ impl App {
         let captured = match &self.book_composition_permission.open {
             OpenPermission::Resuming {
                 intent: accepted, ..
-            } if matches!(&route, BookTargetRoute::FullscreenOpen(_))
+            } if matches!(&route, BookTargetRoute::FullscreenOpen { .. })
                 || (!accepted.navigation_origin.is_empty()
                     && route == accepted.route
                     && matches!(
@@ -1729,7 +1756,7 @@ impl App {
                 intent: accepted, ..
             } if matches!(
                 &route,
-                BookTargetRoute::FullscreenOpen(_) | BookTargetRoute::FullscreenNavigation
+                BookTargetRoute::FullscreenOpen { .. } | BookTargetRoute::FullscreenNavigation
             ) && matches!(&accepted.route, BookTargetRoute::Slideshow { .. }) =>
             {
                 Some(accepted)
@@ -1783,7 +1810,7 @@ impl App {
         if let Some(candidates) = self.qualify_book_unit_from_current_projection(&intent, &demand) {
             self.publish_qualified_book_candidates(&candidates);
             self.book_composition_permission.open = match intent.route {
-                BookTargetRoute::FullscreenOpen(_) => OpenPermission::Idle,
+                BookTargetRoute::FullscreenOpen { .. } => OpenPermission::Idle,
                 BookTargetRoute::ContinuousSeek if intent.navigation_origin.is_empty() => {
                     OpenPermission::Idle
                 }
@@ -2078,15 +2105,18 @@ impl App {
     fn resume_qualified_book_target(&mut self, ctx: &egui::Context, intent: &OpenIntent) {
         self.service_final_prepare_before_lookup(ctx);
         match &intent.route {
-            BookTargetRoute::FullscreenOpen(metadata_boundary) => self
-                .open_fullscreen_with_metadata_boundary(
-                    intent.idx,
-                    intent.history_trigger,
-                    intent.materialization,
-                    intent.contract,
-                    None,
-                    *metadata_boundary,
-                ),
+            BookTargetRoute::FullscreenOpen {
+                metadata_boundary,
+                resume_notice,
+            } => self.open_fullscreen_with_metadata_boundary(
+                intent.idx,
+                intent.history_trigger,
+                intent.materialization,
+                intent.contract,
+                None,
+                *metadata_boundary,
+                resume_notice.clone(),
+            ),
             BookTargetRoute::FullscreenNavigation => self.complete_book_navigation_target(
                 ctx,
                 intent.idx,

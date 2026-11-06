@@ -12,6 +12,287 @@ use crate::settings::{ReadingDirection, SpreadMode};
 
 const WORKER_TIMEOUT: Duration = Duration::from_secs(10);
 
+fn legacy_resume_fixture(document: bool, hidden_identity: bool) -> AppTestEnv {
+    let mut app = setup_app();
+    settle(&mut app);
+    let source = app
+        .tmp
+        .path()
+        .join(if document { "book.pdf" } else { "album" });
+    app.current_folder = Some(source.clone());
+    app.settings.detached_viewer_open_images_in_window = false;
+    app.settings.book_open_resume = crate::settings::ResumeMode::Resume;
+    app.settings
+        .file_type_visibility
+        .excluded_categories
+        .insert(crate::file_type_visibility::FileTypeCategory::Rar);
+    let rows = (0..4)
+        .map(|page_num| {
+            if document {
+                GridItem::PdfPage {
+                    pdf_path: source.clone(),
+                    page_num,
+                    content_type: None,
+                }
+            } else {
+                GridItem::Image(source.join(format!("{page_num}.jpg")))
+            }
+        })
+        .collect();
+    set_pages(&mut app, rows);
+    app.projection_recipe = if document {
+        super::book_materialization::ProjectionRecipe::Book(
+            super::book_materialization::BookScope::Document(source.clone()),
+        )
+    } else {
+        super::book_materialization::ProjectionRecipe::OrdinaryList
+    };
+    app.page_identity_index = std::sync::Arc::new(
+        super::file_type_resume::PreparedPageIdentityIndex::prepare_for_source(
+            &app.items,
+            None,
+            app.settings.file_type_visibility.clone(),
+            super::file_type_resume::LegacyResumeSource::from_recipe(&app.projection_recipe),
+        ),
+    );
+    app.book_resume_db
+        .as_ref()
+        .unwrap()
+        .set(&source, 2)
+        .unwrap();
+    if hidden_identity {
+        let identity = crate::book_resume_db::PageIdentity::for_item(
+            &GridItem::Image(source.join("hidden.png")),
+            None,
+        )
+        .unwrap();
+        rusqlite::Connection::open(app.tmp.path().join("book_resume.db"))
+            .unwrap()
+            .execute(
+                "UPDATE book_resume SET page_identity=?1 WHERE path=?2",
+                rusqlite::params![
+                    serde_json::to_string(&identity).unwrap(),
+                    crate::path_key::normalize(&source)
+                ],
+            )
+            .unwrap();
+    }
+    app
+}
+
+#[test]
+fn legacy_document_resume_deferred_opens_saved_raw_with_exclusions() {
+    let mut app = legacy_resume_fixture(true, false);
+    assert_eq!(
+        app.open_deferred_fullscreen_after_enumerate(super::DeferredFsReopen {
+            history_trigger: super::HistoryTrigger::UserChosen,
+            resume_slideshow: false,
+            target: super::DeferredFsTarget::None,
+            resume_to_last_page: true,
+            from_explicit_open: true,
+            preserve_after_password_prompt: true,
+        }),
+        super::DeferredFsOpenOutcome::Opened
+    );
+    assert_eq!(app.fullscreen_idx, Some(2));
+    assert!(app.fs_feedback_toast.is_none());
+}
+
+#[test]
+fn legacy_resume_refusal_deferred_opens_first_page_with_notice() {
+    resume_refusal_deferred_opens_first_page_with_notice(false);
+}
+
+#[test]
+fn hidden_identity_resume_refusal_deferred_opens_first_page_with_notice() {
+    resume_refusal_deferred_opens_first_page_with_notice(true);
+}
+
+fn resume_refusal_deferred_opens_first_page_with_notice(hidden: bool) {
+    let mut app = legacy_resume_fixture(false, hidden);
+    assert_eq!(
+        app.open_deferred_fullscreen_after_enumerate(super::DeferredFsReopen {
+            history_trigger: super::HistoryTrigger::UserChosen,
+            resume_slideshow: false,
+            target: super::DeferredFsTarget::None,
+            resume_to_last_page: true,
+            from_explicit_open: true,
+            preserve_after_password_prompt: true,
+        }),
+        super::DeferredFsOpenOutcome::Opened
+    );
+    assert_eq!(app.fullscreen_idx, Some(0));
+    assert!(
+        app.fs_feedback_toast
+            .as_ref()
+            .is_some_and(|toast| toast.0.contains(if hidden {
+                "非表示"
+            } else {
+                "絞り込み"
+            }))
+    );
+}
+
+#[test]
+fn legacy_resume_refusal_auto_fullscreen_opens_first_page_with_notice() {
+    resume_refusal_auto_fullscreen_opens_first_page_with_notice(false);
+}
+
+#[test]
+fn hidden_identity_resume_refusal_auto_fullscreen_opens_first_page_with_notice() {
+    resume_refusal_auto_fullscreen_opens_first_page_with_notice(true);
+}
+
+fn resume_refusal_auto_fullscreen_opens_first_page_with_notice(hidden: bool) {
+    let mut app = legacy_resume_fixture(false, hidden);
+    let source = app.current_folder.clone().unwrap();
+    let _rx = app.activate_live_sidecar_restore_for_test(source);
+    app.set_live_sidecar_first_display_for_test(
+        super::sidecar_restore::FirstDisplayAction::AutoFullscreenFolder,
+        None,
+    );
+    app.finish_page_identity_preparation_for_test();
+    assert_eq!(app.fullscreen_idx, Some(0));
+    assert!(
+        app.fs_feedback_toast
+            .as_ref()
+            .is_some_and(|toast| toast.0.contains(if hidden {
+                "非表示"
+            } else {
+                "絞り込み"
+            }))
+    );
+}
+
+#[test]
+fn resume_refusal_grid_keeps_cursor_and_page_list() {
+    for hidden in [false, true] {
+        let mut app = legacy_resume_fixture(false, hidden);
+        app.selected = Some(1);
+        let source = app.current_folder.clone().unwrap();
+        let _rx = app.activate_live_sidecar_restore_for_test(source);
+        app.finish_page_identity_preparation_for_test();
+        assert_eq!(app.fullscreen_idx, None);
+        assert_eq!(app.selected, Some(1));
+        assert!(app.fs_feedback_toast.is_some());
+    }
+}
+
+#[test]
+fn resume_refusal_deferred_warning_survives_first_page_adjustment_notice() {
+    for hidden in [false, true] {
+        let mut app = legacy_resume_fixture(false, hidden);
+        app.adjustment_page_params
+            .insert(0, crate::adjustment::AdjustParams::default());
+        assert_eq!(
+            app.open_deferred_fullscreen_after_enumerate(super::DeferredFsReopen {
+                history_trigger: super::HistoryTrigger::UserChosen,
+                resume_slideshow: false,
+                target: super::DeferredFsTarget::None,
+                resume_to_last_page: true,
+                from_explicit_open: true,
+                preserve_after_password_prompt: true,
+            }),
+            super::DeferredFsOpenOutcome::Opened
+        );
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|toast| toast.0.contains(if hidden {
+                    "非表示"
+                } else {
+                    "絞り込み"
+                })),
+            "final toast: {:?}",
+            app.fs_feedback_toast
+        );
+    }
+}
+
+#[test]
+fn resume_refusal_auto_warning_survives_first_page_adjustment_notice() {
+    for hidden in [false, true] {
+        let mut app = legacy_resume_fixture(false, hidden);
+        app.adjustment_page_params
+            .insert(0, crate::adjustment::AdjustParams::default());
+        let source = app.current_folder.clone().unwrap();
+        let _rx = app.activate_live_sidecar_restore_for_test(source);
+        app.set_live_sidecar_first_display_for_test(
+            super::sidecar_restore::FirstDisplayAction::AutoFullscreenFolder,
+            None,
+        );
+        app.finish_page_identity_preparation_for_test();
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|toast| toast.0.contains(if hidden {
+                    "非表示"
+                } else {
+                    "絞り込み"
+                })),
+            "final toast: {:?}",
+            app.fs_feedback_toast
+        );
+    }
+}
+
+#[test]
+fn resume_refusal_open_warning_survives_cached_panorama_hint() {
+    for auto in [false, true] {
+        for hidden in [false, true] {
+            let mut app = legacy_resume_fixture(false, hidden);
+            let key = app.metadata_cache_key(0).unwrap();
+            app.xmp_panorama_info.insert(
+                key,
+                Some(crate::xmp_reader::XmpPanoramaInfo {
+                    projection_type: Some("equirectangular".into()),
+                    use_panorama_viewer: Some(true),
+                    ..Default::default()
+                }),
+            );
+            if auto {
+                let source = app.current_folder.clone().unwrap();
+                let _rx = app.activate_live_sidecar_restore_for_test(source);
+                app.set_live_sidecar_first_display_for_test(
+                    super::sidecar_restore::FirstDisplayAction::AutoFullscreenFolder,
+                    None,
+                );
+                app.finish_page_identity_preparation_for_test();
+            } else {
+                assert_eq!(
+                    app.open_deferred_fullscreen_after_enumerate(super::DeferredFsReopen {
+                        history_trigger: super::HistoryTrigger::UserChosen,
+                        resume_slideshow: false,
+                        target: super::DeferredFsTarget::None,
+                        resume_to_last_page: true,
+                        from_explicit_open: true,
+                        preserve_after_password_prompt: true,
+                    }),
+                    super::DeferredFsOpenOutcome::Opened
+                );
+            }
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert!(
+                app.pano_toast_shown_for_current_fs,
+                "open emitted the panorama hint"
+            );
+            assert!(
+                app.fs_feedback_toast
+                    .as_ref()
+                    .is_some_and(|toast| toast.0.contains(if hidden {
+                        "非表示"
+                    } else {
+                        "絞り込み"
+                    })),
+                "final toast: {:?}",
+                app.fs_feedback_toast
+            );
+        }
+    }
+}
+
 fn meter(ordinal: usize, total: usize) -> Option<ReadingMeterValue> {
     ReadingMeterValue::new(ordinal, total)
 }

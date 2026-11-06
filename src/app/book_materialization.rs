@@ -1,6 +1,7 @@
 //! Shared page-row projection with the existing visibility policy and duplicate removal.
 //! Enumeration, cancellation, leases and adoption remain with the existing source owners.
 //! Child-container positions are surface policy; only the direct page block is a book order.
+use super::file_type_resume::LegacyResumeSource;
 use crate::{
     grid_item::GridItem,
     settings::{GridDisplayOrder, SortOrder},
@@ -58,6 +59,7 @@ fn finish_book_rows(
     logical: &Path,
     rows: PageRows,
     policy: crate::file_type_visibility::FileTypeVisibility,
+    resume_source: LegacyResumeSource,
     prepared: crate::book_composition::PreparedCompositionProjection,
 ) -> crate::book_composition::CompositionResult<MaterializedBookRows> {
     let (items, metas) = rows;
@@ -83,7 +85,12 @@ fn finish_book_rows(
         (items, metas)
     };
     let page_identities = std::sync::Arc::new(
-        super::file_type_resume::PreparedPageIdentityIndex::prepare(&items, Some(logical), policy),
+        super::file_type_resume::PreparedPageIdentityIndex::prepare_for_source(
+            &items,
+            Some(logical),
+            policy,
+            resume_source,
+        ),
     );
     Ok(MaterializedBookRows {
         items,
@@ -123,6 +130,7 @@ pub(crate) fn project_archive_composition(
                 logical,
                 rows,
                 policy,
+                LegacyResumeSource::General,
                 PreparedCompositionProjection {
                     output_to_input: (0..row_count).collect(),
                     outcome: CompositionProjectionOutcome::Unsupported {
@@ -143,7 +151,7 @@ pub(crate) fn project_archive_composition(
                 output_to_input: (0..rows.0.len()).collect(),
                 outcome: CompositionProjectionOutcome::Unsupported { reason },
             };
-            return finish_book_rows(logical, rows, policy, prepared);
+            return finish_book_rows(logical, rows, policy, LegacyResumeSource::General, prepared);
         }
     };
     let domain = PageDomain::ArchiveLevel {
@@ -214,7 +222,7 @@ pub(crate) fn project_archive_composition(
         &manifest,
         rows.0.len(),
     )?;
-    finish_book_rows(logical, rows, policy, prepared)
+    finish_book_rows(logical, rows, policy, LegacyResumeSource::General, prepared)
 }
 
 pub(crate) fn project_document_composition(
@@ -232,6 +240,7 @@ pub(crate) fn project_document_composition(
             logical,
             rows,
             policy,
+            LegacyResumeSource::Document(std::sync::Arc::from(logical)),
             PreparedCompositionProjection {
                 output_to_input: (0..row_count).collect(),
                 outcome: CompositionProjectionOutcome::Unsupported {
@@ -285,7 +294,13 @@ pub(crate) fn project_document_composition(
         &manifest,
         rows.0.len(),
     )?;
-    finish_book_rows(logical, rows, policy, prepared)
+    finish_book_rows(
+        logical,
+        rows,
+        policy,
+        LegacyResumeSource::Document(std::sync::Arc::from(logical)),
+        prepared,
+    )
 }
 
 /// Only a preparation worker may wait here. The UI receives one completed result.

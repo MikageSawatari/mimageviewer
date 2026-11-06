@@ -1455,6 +1455,21 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-06 PDF旧読書位置復元とPCの先頭fallback
+
+利用者提示のOpus設計A/Bに基づく、汎用resume解決境界の修正。
+独立レビュー（Sol/xhigh、2026-11-06）は「症状パッチではなく構造的修正」であることに合意した。
+ClaudeCode（Opus）も検収で同じ主張に合意した（2026-11-06、再レビューACCEPT後）。
+`app.rs`のdeferred open / AutoFullscreenFolderで復元拒否後を通常の先頭選択へ戻し、
+PDF/EPUBそのものから列挙した本の旧raw採否は準備済みindexとRemoteで共有する。
+detachedのowner・述語・HWND・placementを維持し、共通resume処理の結果として終了/openの到達結果が変わる。
+通知は既存open要求に付随する値としてpermission/sidecar/forkへ運び、実open後に共通箇所で発行する。
+この通知の引継ぎでは既存fork routingの要求payload転送だけを更新し、detached専用の待機・回復機構は追加しない。
+`sidecar_restore`の既存handler回帰は、
+旧raw拒否時のClosing期待を、先頭open・通知・要求owner存続・main rows/generation/index不変へ更新。
+guard・delay・repaint・resetを追加する症状パッチではなく、既存の共通先頭選択を回復する構造修正。
+実アプリ起動は行わず、非対話検証の結果は[file type計画§5.5](file-type-visibility-plan.md#55-ページidentityによる復元と旧raw記録r3追加q15)へ記録する。
+
 ### 2026-11-05 §1.712 情報タブの左右ページ選択
 
 利用者依頼に基づく実装担当Codexと、実装と別contextの独立review担当は、情報タブの左右選択を
