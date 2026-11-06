@@ -319,22 +319,37 @@ impl App {
         self.meta_undo.push_undo_from_redo(entry);
     }
 
-    /// グリッドとフルスクリーンの両ハンドラ共通: Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z を消費して
-    /// Undo/Redo を実行する。ダイアログ抑止や IME 抑止は呼び出し元 (`handle_keyboard` /
-    /// フルスクリーン入力) が既に弾いてからここに来る前提。
+    /// All edit-history consumers share this owner/popup issuance boundary.
+    pub(crate) fn edit_history_key_permit(
+        &self,
+        ctx: &egui::Context,
+    ) -> Option<crate::keyboard_input::EditHistoryKeyPermit> {
+        self.keyboard_owner_for_pass(ctx).edit_history_key_permit(
+            ctx.viewport_id(),
+            crate::keyboard_input::popup_owns_keyboard(ctx),
+            ctx.text_edit_focused(),
+        )
+    }
+
+    /// グリッドとフルスクリーンの両ハンドラ共通。専用 permit により非テキスト
+    /// widget focus を追加で通す。旧 keymap の許可範囲と呼び出し元の外側 gate は維持する。
     ///
     /// **consume 順序の注意**: Ctrl+Shift+Z (Redo) → Ctrl+Y (Redo) → Ctrl+Z (Undo)
     /// の順で consume することで、Ctrl+Shift+Z が Undo 側に流れない。
     pub(crate) fn handle_meta_undo_keys(&mut self, ctx: &egui::Context) {
-        let redo = self.keymap.consume_fixed_chord(
+        let Some(permit) = self.edit_history_key_permit(ctx) else {
+            return;
+        };
+        let redo = self.keymap.consume_edit_history_key(
             ctx,
-            crate::keymap::Chord::ctrl_shift(crate::keymap::KeyName::Z),
-        ) || self
-            .keymap
-            .consume_fixed_chord(ctx, crate::keymap::Chord::ctrl(crate::keymap::KeyName::Y));
-        let undo = self
-            .keymap
-            .consume_action(ctx, crate::keymap::KeyAction::UndoLastAction);
+            permit,
+            crate::keymap::EditHistoryKey::MetaRedo,
+        );
+        let undo = self.keymap.consume_edit_history_key(
+            ctx,
+            permit,
+            crate::keymap::EditHistoryKey::Action(crate::keymap::KeyAction::UndoLastAction),
+        );
         if undo && self.try_undo_book_append(ctx) {
             return;
         }

@@ -397,6 +397,40 @@ OS/egui のclipboardイベント自体、D&D、IME 確定、右クリック操�
 消しゴム・隠蔽・テキスト等の編集専用Undoと、TextEdit / IME / ダイアログの入力所有を優先する。
 メタデータRedoの `Ctrl+Y` / `Ctrl+Shift+Z` は固定入力のまま維持する。
 
+編集の Undo / Redo は、ボタン・スライダー・チェックボックス・ラジオ・トグルなど通常の
+非テキスト `FocusedUi` にも通す（§1.681）。パネル操作の focus だけで画像編集の履歴を
+取り消せなくなるのを避けるためで、補正パネルに限らず main 一覧のメタUndoも同じ規則とする。
+`EditHistoryKeyPermit` は、所有者によらず `Context::text_edit_focused()` が真なら発行しない。
+TextEdit は常に自分の Undo を所有し、ROOT の modeless VST3 パネルが owner を `Modal` にしても
+注釈本文・数値直接入力の履歴を画像編集が奪わない。この共通保護が旧テキスト注釈 handler の独自ガードを引き継ぐ。
+それ以外は旧 keymap の許可範囲を狭めず、次の和集合として発行する。
+
+| owner | 履歴キーの permit |
+|---|---|
+| `ApplicationShortcut` / `Modal` / `Unclaimed` / `TextInput::PendingFocus` | TextEdit 非フォーカスなら旧来どおり発行。popup の有無によらない |
+| `TextInput::Focused` / `FocusRecovery` / `ImeComposing` | 旧来どおり発行しない |
+| `FocusedUi` | 非テキストかつ、その viewport に egui popup が開いていないときだけ追加で発行 |
+
+実際の modal、入力配送先、離散入力の証明は従来どおり各呼び出し元の外側 gate が扱う。
+ROOT で `Modal` と分類される非モーダル VST3 管理パネルは fullscreen の外側 gate では許可される。
+キー配送後に focus を失った `Unclaimed` も、同 viewport の native edge があれば従来どおり処理する。
+popup の存在だけを理由に、旧来通っていた `ApplicationShortcut` 等の履歴キーを止めない。
+この permit は編集履歴の consume だけに使い、他の keymap 操作の
+`FocusedUi` 抑止や固定 Esc / 矢印の raw-key permit は変えない。
+`UndoLastAction` と編集モード専用 Undo / Redo は再割り当て・`none` を尊重する。
+補正の多角形の頂点戻しは固定 Ctrl+Z の完全一致を保ち、専用 `PolygonVertexUndo` と
+同じ permit / keymap consume で native KeySlot と egui の同一押下を一緒に消費する。
+helper の `TextInput` claim に載らない TextEdit は `Context::text_edit_focused()`
+（現在の focus ID の `TextEditState` の有無）で識別し、どの owner でも permit を出さない。
+有効な DragValue は keyboard focus を得ると直ちに内部 TextEdit に切り替わるため、
+数値直接入力もこの条件で保護される。state は永続化されるため、同じ ID に残る state でも
+保守的に拒否する。owner 自体を `TextInput` に変更せず、他の shortcut の判定には波及させない。
+
+`FocusedUi` の例外判定は `Popup::is_any_open`（描画前も有効な Memory）と
+`any_popup_open`（今 pass）の両方を使い、ComboBox・egui メニュー・コンテキストメニューを除外する。
+自前描画メニューは Ctrl+Z / Ctrl+Y を使わず、通常状態では従来から Undo を通すため除外しない。
+FocusedUi だけを止める利益がなく、viewport 所属・native claim・音楽 HUD の ID へ配管を広げないためである。
+
 ゲームパッド全体は `Settings::gamepad_enabled` で無効にできる (操作カスタマイズ →
 設定 → ゲームパッド)。これは割り当ての変更ではなく**デバイスを読むかどうか**の設定で、
 無効の間は `GamepadRuntime` が読み取りスレッドごと止まる。読み捨てるだけにすると、

@@ -138,6 +138,25 @@ impl FullscreenRawKeyPermit {
     }
 }
 
+/// Proof that edit history may use the legacy keymap route or the additional
+/// non-text widget exception. Each caller retains its outer modal/input gates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EditHistoryKeyPermit {
+    viewport: egui::ViewportId,
+}
+
+impl EditHistoryKeyPermit {
+    pub(crate) fn allows(self, ctx: &egui::Context) -> bool {
+        self.viewport == ctx.viewport_id()
+    }
+}
+
+/// Memory retains popups before they draw; the pass also tracks newly drawn
+/// popups (including ones without a Memory open flag).
+pub(crate) fn popup_owns_keyboard(ctx: &egui::Context) -> bool {
+    egui::Popup::is_any_open(ctx) || ctx.any_popup_open()
+}
+
 /// Why a viewport pass may dispatch discrete keyboard input.
 ///
 /// Focus is only one possible proof. On Windows a key edge already stamped
@@ -333,6 +352,39 @@ pub(crate) const fn focused_key_state_permit_for_viewport(
 }
 
 impl KeyboardOwner {
+    pub(crate) const fn edit_history_key_permit(
+        self,
+        viewport: egui::ViewportId,
+        popup_open: bool,
+        text_edit_focused: bool,
+    ) -> Option<EditHistoryKeyPermit> {
+        // TextEdit always owns its history, even when a modeless VST3 panel
+        // makes the ROOT owner Modal before text claims are considered.
+        // DragValue's internal TextEdit (including retained state) counts too.
+        if text_edit_focused {
+            return None;
+        }
+        // Apart from text editing, preserve the legacy keymap's allowed set.
+        // Modal/Unclaimed have no viewport payload: their caller supplies the
+        // current viewport and still owns the outer modal/discrete-input gate.
+        let viewport = match self {
+            Self::ApplicationShortcut { scope } => scope.viewport,
+            Self::TextInput { viewport, .. } | Self::FocusedUi { viewport, .. } => viewport,
+            Self::Modal | Self::Unclaimed => viewport,
+        };
+        if !self.blocks_legacy_keymap_shortcuts() {
+            return Some(EditHistoryKeyPermit { viewport });
+        }
+        match self {
+            // DragValue renders its internal TextEdit whenever an enabled
+            // widget has keyboard focus. Its persisted TextEditState also
+            // protects numeric editors absent from the helper text claim.
+            // A retained state is intentionally treated conservatively.
+            Self::FocusedUi { .. } if !popup_open => Some(EditHistoryKeyPermit { viewport }),
+            _ => None,
+        }
+    }
+
     pub const fn shortcut_permit(self) -> Option<ShortcutPermit> {
         match self {
             Self::ApplicationShortcut { scope } => Some(ShortcutPermit { scope }),
@@ -890,6 +942,79 @@ mod tests {
         ] {
             assert_eq!(owner.shortcut_permit(), None, "{owner:?}");
         }
+    }
+
+    #[test]
+    fn edit_history_key_permit_covers_every_owner_phase_popup_and_text_focus() {
+        let viewport = egui::ViewportId::ROOT;
+        let widget_id = egui::Id::unique("history-focus");
+        // Columns: no menu/no text, no menu/text, menu/no text, menu/text.
+        let mut owners = vec![
+            (KeyboardOwner::Modal, [true, false, true, false]),
+            (KeyboardOwner::Unclaimed, [true, false, true, false]),
+            (
+                KeyboardOwner::FocusedUi {
+                    viewport,
+                    widget_id,
+                },
+                [true, false, false, false],
+            ),
+            (
+                KeyboardOwner::ApplicationShortcut {
+                    scope: scope(ShortcutSurface::Main),
+                },
+                [true, false, true, false],
+            ),
+            (
+                KeyboardOwner::ApplicationShortcut {
+                    scope: scope(ShortcutSurface::Fullscreen),
+                },
+                [true, false, true, false],
+            ),
+        ];
+        for phase in [
+            TextInputPhase::PendingFocus,
+            TextInputPhase::Focused,
+            TextInputPhase::FocusRecovery,
+            TextInputPhase::ImeComposing,
+        ] {
+            owners.push((
+                KeyboardOwner::TextInput {
+                    viewport,
+                    widget_id,
+                    phase,
+                },
+                [
+                    phase == TextInputPhase::PendingFocus,
+                    false,
+                    phase == TextInputPhase::PendingFocus,
+                    false,
+                ],
+            ));
+        }
+        for (owner, expected) in owners {
+            let mut column = 0;
+            for popup_open in [false, true] {
+                for text_edit_focused in [false, true] {
+                    assert_eq!(
+                        owner
+                            .edit_history_key_permit(viewport, popup_open, text_edit_focused)
+                            .is_some(),
+                        expected[column],
+                        "{owner:?}, popup={popup_open}, text={text_edit_focused}"
+                    );
+                    column += 1;
+                }
+            }
+        }
+        let ctx = egui::Context::default();
+        let sibling = KeyboardOwner::FocusedUi {
+            viewport: egui::ViewportId::from_hash_of("sibling"),
+            widget_id,
+        }
+        .edit_history_key_permit(ctx.viewport_id(), false, false)
+        .unwrap();
+        assert!(!sibling.allows(&ctx));
     }
 
     #[test]
