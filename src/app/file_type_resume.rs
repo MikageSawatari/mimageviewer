@@ -21,6 +21,9 @@ pub(crate) struct PreparedPageIdentityIndex {
     shift_identities: Arc<HashMap<PageIdentity, usize>>,
     current_slots: Vec<Option<usize>>,
     readable_indices: HashSet<usize>,
+    // Group accepted rows by their actual document, independently of logical identity
+    // aliases. None contains every non-document row. Deletion only remaps integers.
+    legacy_resume_rows: HashMap<Option<Arc<Path>>, Vec<usize>>,
     overview_metadata: Arc<PageOverviewMetadata>,
 }
 
@@ -30,6 +33,23 @@ pub(crate) enum PositionResolution {
     HiddenIdentity,
     LegacyWithExclusions,
     InvalidRaw,
+}
+
+/// Type exclusions cannot shift a sequence consisting solely of one document's
+/// pages: PDF/EPUB visibility admits or rejects the entire document. Callers may
+/// pass either all rows or their distinct, nonempty source groups.
+pub(crate) fn legacy_raw_resume_allowed<'a>(
+    policy: &FileTypeVisibility,
+    sources: impl IntoIterator<Item = Option<&'a Path>>,
+) -> bool {
+    if policy.is_all_visible() {
+        return true;
+    }
+    let mut sources = sources.into_iter();
+    let Some(Some(document)) = sources.next() else {
+        return false;
+    };
+    sources.all(|source| source == Some(document))
 }
 
 impl PreparedPageIdentityIndex {
@@ -42,7 +62,13 @@ impl PreparedPageIdentityIndex {
         let mut identities = HashMap::new();
         let mut readable_indices = std::collections::HashSet::new();
         let mut overview_entries = Vec::new();
+        let mut legacy_resume_rows: HashMap<Option<Arc<Path>>, Vec<usize>> = HashMap::new();
         for (index, item) in items.iter().enumerate() {
+            let document = match item {
+                GridItem::PdfPage { pdf_path, .. } => Some(Arc::from(pdf_path.as_path())),
+                _ => None,
+            };
+            legacy_resume_rows.entry(document).or_default().push(index);
             if let Some(identity) = PageIdentity::for_item(item, logical_container) {
                 overview_entries.push(PageOverviewEntry {
                     items_idx: index,
@@ -64,6 +90,7 @@ impl PreparedPageIdentityIndex {
             shift_identities: Arc::new(shift_identities),
             current_slots: (0..items.len()).map(Some).collect(),
             readable_indices,
+            legacy_resume_rows,
             overview_metadata: Arc::new(
                 PageOverviewMetadata::new(overview_entries)
                     .expect("prepared items have unique integer indices"),
@@ -101,6 +128,15 @@ impl PreparedPageIdentityIndex {
                 .iter()
                 .filter_map(|index| remap(*index))
                 .collect(),
+            legacy_resume_rows: self
+                .legacy_resume_rows
+                .iter()
+                .filter_map(|(document, indices)| {
+                    let indices: Vec<_> =
+                        indices.iter().filter_map(|&index| remap(index)).collect();
+                    (!indices.is_empty()).then(|| (document.clone(), indices))
+                })
+                .collect(),
             overview_metadata: Arc::new(
                 self.overview_metadata
                     .remap_items(self.overview_metadata.entries().filter_map(|entry| {
@@ -116,6 +152,19 @@ impl PreparedPageIdentityIndex {
     pub(crate) fn with_mapped_additions(&self, additions: &Self, slots: &[Option<usize>]) -> Self {
         let mut identities = HashMap::new();
         let mut readable_indices = self.readable_indices.clone();
+        let mut legacy_resume_rows = self.legacy_resume_rows.clone();
+        for (document, indices) in &additions.legacy_resume_rows {
+            let accepted: Vec<_> = indices
+                .iter()
+                .filter_map(|&index| slots.get(index).copied().flatten())
+                .collect();
+            if !accepted.is_empty() {
+                legacy_resume_rows
+                    .entry(document.clone())
+                    .or_default()
+                    .extend(accepted);
+            }
+        }
         for (identity, original_slot) in self.identities.iter() {
             if let Some(index) = self.current_slots.get(*original_slot).copied().flatten() {
                 identities.insert(identity.clone(), index);
@@ -172,6 +221,7 @@ impl PreparedPageIdentityIndex {
             shift_identities: Arc::new(shift_identities),
             current_slots: (0..len).map(Some).collect(),
             readable_indices,
+            legacy_resume_rows,
             overview_metadata: Arc::new(
                 PageOverviewMetadata::new(overview_entries.into_values())
                     .expect("worker merge has unique accepted integer indices"),
@@ -188,7 +238,12 @@ impl PreparedPageIdentityIndex {
                 .map(PositionResolution::Restored)
                 .unwrap_or(PositionResolution::HiddenIdentity);
         }
-        if !self.policy.is_all_visible() {
+        if !legacy_raw_resume_allowed(
+            &self.policy,
+            self.legacy_resume_rows
+                .keys()
+                .map(|source| source.as_deref()),
+        ) {
             return PositionResolution::LegacyWithExclusions;
         }
         if self.readable_indices.contains(&position.page) {
@@ -251,6 +306,120 @@ fn shift_identity_key(identity: &PageIdentity) -> PageIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_document_resume_with_exclusions_survives_row_remapping() {
+        let mut policy = FileTypeVisibility::default();
+        policy
+            .excluded_categories
+            .insert(crate::file_type_visibility::FileTypeCategory::Rar);
+        let legacy = ReadingPosition {
+            page: 2,
+            identity: None,
+        };
+        for name in ["book.pdf", "book.epub"] {
+            let rows: Vec<_> = (0..4)
+                .map(|page_num| GridItem::PdfPage {
+                    pdf_path: name.into(),
+                    page_num,
+                    content_type: None,
+                })
+                .collect();
+            let index = PreparedPageIdentityIndex::prepare(&rows, None, policy.clone());
+            assert_eq!(index.resolve(&legacy), PositionResolution::Restored(2));
+            assert_eq!(
+                index.without_removed_indices(&[0]).resolve(&legacy),
+                PositionResolution::Restored(2)
+            );
+            let additions = PreparedPageIdentityIndex::prepare(&rows[3..], None, policy.clone());
+            let merged = index
+                .without_removed_indices(&[3])
+                .with_mapped_additions(&additions, &[Some(3)]);
+            assert_eq!(merged.resolve(&legacy), PositionResolution::Restored(2));
+            assert_eq!(
+                index.resolve(&ReadingPosition {
+                    page: 9,
+                    identity: None
+                }),
+                PositionResolution::InvalidRaw
+            );
+            for other in [
+                GridItem::Image("other.jpg".into()),
+                GridItem::Folder("chapter".into()),
+                GridItem::PdfPage {
+                    pdf_path: "other.pdf".into(),
+                    page_num: 0,
+                    content_type: None,
+                },
+            ] {
+                let extra = PreparedPageIdentityIndex::prepare(&[other], None, policy.clone());
+                let mixed = index.with_mapped_additions(&extra, &[Some(4)]);
+                assert_eq!(
+                    mixed.resolve(&legacy),
+                    PositionResolution::LegacyWithExclusions
+                );
+                assert_eq!(
+                    mixed.without_removed_indices(&[4]).resolve(&legacy),
+                    PositionResolution::Restored(2)
+                );
+                assert_eq!(
+                    index
+                        .with_mapped_additions(&extra, &[None])
+                        .resolve(&legacy),
+                    PositionResolution::Restored(2)
+                );
+            }
+        }
+        let rows = ["1.jpg", "2.jpg", "3.jpg"].map(|name| GridItem::Image(name.into()));
+        let folder = PreparedPageIdentityIndex::prepare(&rows, None, policy);
+        assert_eq!(
+            folder.resolve(&legacy),
+            PositionResolution::LegacyWithExclusions
+        );
+        assert_eq!(
+            folder.without_removed_indices(&[0]).resolve(&legacy),
+            PositionResolution::LegacyWithExclusions
+        );
+        assert_eq!(
+            folder
+                .with_mapped_additions(&folder, &[Some(3), Some(4), Some(5)])
+                .resolve(&legacy),
+            PositionResolution::LegacyWithExclusions
+        );
+    }
+
+    #[test]
+    fn legacy_document_resume_classification_uses_actual_sources_and_accepted_rows() {
+        let mut policy = FileTypeVisibility::default();
+        policy.excluded_extensions.insert("rar".into());
+        let rows = ["first.pdf", "second.pdf"].map(|name| GridItem::PdfPage {
+            pdf_path: name.into(),
+            page_num: 0,
+            content_type: None,
+        });
+        let index = PreparedPageIdentityIndex::prepare(
+            &rows,
+            Some(Path::new("alias.epub")),
+            policy.clone(),
+        );
+        let legacy = ReadingPosition {
+            page: 0,
+            identity: None,
+        };
+        assert_eq!(
+            index.resolve(&legacy),
+            PositionResolution::LegacyWithExclusions
+        );
+        let single = index.without_removed_indices(&[0]);
+        assert_eq!(single.resolve(&legacy), PositionResolution::Restored(0));
+        let empty = single.without_removed_indices(&[0]);
+        assert_eq!(
+            empty.resolve(&legacy),
+            PositionResolution::LegacyWithExclusions
+        );
+        let restored = empty.with_mapped_additions(&single, &[Some(0)]);
+        assert_eq!(restored.resolve(&legacy), PositionResolution::Restored(0));
+    }
 
     #[test]
     fn projected_resume_never_substitutes_same_index_and_preserves_session_policy() {

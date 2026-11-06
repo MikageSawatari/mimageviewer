@@ -9,6 +9,12 @@
 
 ## 0. 合意した設計と前提
 
+2026-11-06追記: 単一PDF/EPUBのページ列は種類除外で一部だけ消えないため、identityのない
+旧記録も従来どおりraw indexを検証して復元する。フォルダ/ZIP等で旧位置を特定できない場合や
+保存ページが非表示の場合、PCのページ表示openは通知後に通常の先頭ページを開く。
+グリッドのcursor復元は見送りのまま、Remoteも案内付きグリッドを維持する。保存・メーターは
+変更せず、その後の読書位置は通常どおり記録する。詳細・理由は下記§5.5を参照。
+
 2026-10-08追記（§1.345）: 読書位置のoptional PageIdentityとraw-only更新による失効は
 [file-type-visibility-plan.md §5.5](file-type-visibility-plan.md#55-ページidentityによる復元と旧raw記録r3追加q15)を正本とする。
 書庫ページは論理元container＋完全entry_nameで照合する。同じ外側書庫に実directory

@@ -5421,25 +5421,31 @@ mod tests {
                 owner.finish_page_identity_preparation_for_test()
             })
             .unwrap();
-            if outcome != "resume-refused" {
-                // DetachedPhysical intentionally ignores main-only facets. App-wide
-                // file type visibility is already applied by the scan instead.
+            // DetachedPhysical ignores main-only facets. Resume refusal also uses
+            // the ordinary first-page path, retaining the requesting reader owner.
+            assert!(
+                app.with_active_viewer_context(|owner| {
+                    owner.fullscreen_idx == Some(0)
+                        && owner.current_folder.as_ref() == Some(&folder)
+                })
+                .unwrap()
+            );
+            assert_ne!(
+                app.detached_window_state(window),
+                Some(crate::app::DetachedWindowState::Closing),
+                "first page remains open: outcome={outcome}"
+            );
+            if outcome == "resume-refused" {
                 assert!(
                     app.with_active_viewer_context(|owner| {
-                        owner.fullscreen_idx == Some(0)
-                            && owner.current_folder.as_ref() == Some(&folder)
+                        owner
+                            .fs_feedback_toast
+                            .as_ref()
+                            .is_some_and(|toast| toast.0.contains("絞り込み中に復元できません"))
                     })
                     .unwrap()
                 );
-            } else {
-                assert_eq!(
-                    app.detached_window_state(window),
-                    Some(crate::app::DetachedWindowState::Closing),
-                    "terminal outcome={outcome}"
-                );
-                if outcome == "resume-refused" {
-                    assert_eq!(app.book_resume_db.as_ref().unwrap().get(&folder), Some(0));
-                }
+                assert_eq!(app.book_resume_db.as_ref().unwrap().get(&folder), Some(0));
             }
             assert_eq!(app.items, main_rows, "first display cannot alter main rows");
             assert_eq!(app.items_generation, main_generation);

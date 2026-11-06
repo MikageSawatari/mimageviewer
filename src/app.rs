@@ -41211,11 +41211,7 @@ impl App {
         };
         // grid から本を開いた場合は保存済み読書位置 (続きから) を優先。
         if new_idx.is_none() && deferred.resume_to_last_page {
-            let resume_rejected = self.saved_resume_is_unresolvable();
             new_idx = self.resume_page_for_container();
-            if resume_rejected {
-                return DeferredFsOpenOutcome::NoPlayableItem;
-            }
         }
         if new_idx.is_none() {
             new_idx = match self.composed_book_layout() {
@@ -44125,18 +44121,12 @@ impl App {
             first_display_action,
             sidecar_restore::FirstDisplayAction::AutoFullscreenFolder
         ) {
-            let resume_rejected =
-                self.settings.book_open_resume.resumes() && self.saved_resume_is_unresolvable();
             let new_idx = if self.settings.book_open_resume.resumes() {
                 self.resume_page_for_container()
             } else {
                 None
             }
-            .or_else(|| {
-                (!resume_rejected)
-                    .then(|| self.find_fullscreen_nav_target_filtered(false))
-                    .flatten()
-            });
+            .or_else(|| self.find_fullscreen_nav_target_filtered(false));
             if let Some(new_idx) = new_idx {
                 #[cfg(windows)]
                 {
@@ -62563,25 +62553,6 @@ impl App {
 
     /// 現在のコンテナ (`current_folder`) の保存済み読書位置を、現在の `items` に対して
     /// 検証して返す。範囲外 / 本ページでない場合は None (= 先頭にフォールバック)。
-    fn saved_resume_is_unresolvable(&self) -> bool {
-        self.current_folder
-            .as_deref()
-            .and_then(|folder| {
-                self.fenced_book_resume(folder).unwrap_or_else(|| {
-                    self.book_resume_db
-                        .as_ref()
-                        .and_then(|db| db.get_position(folder))
-                })
-            })
-            .is_some_and(|position| {
-                matches!(
-                    self.resolve_current_book_position(&position),
-                    file_type_resume::PositionResolution::HiddenIdentity
-                        | file_type_resume::PositionResolution::LegacyWithExclusions
-                )
-            })
-    }
-
     pub(crate) fn resume_page_for_container(&mut self) -> Option<usize> {
         let folder = self.current_folder.clone()?;
         self.resume_page_for_path(&folder)
@@ -62600,10 +62571,18 @@ impl App {
                 Some(index)
             }
             file_type_resume::PositionResolution::HiddenIdentity => {
+                crate::logger::log(format!(
+                    "book resume skipped: reason=HiddenIdentity path={}",
+                    folder.display()
+                ));
                 self.show_feedback_warning("保存した読書位置のページは非表示になっています".into());
                 None
             }
             file_type_resume::PositionResolution::LegacyWithExclusions => {
+                crate::logger::log(format!(
+                    "book resume skipped: reason=LegacyWithExclusions path={}",
+                    folder.display()
+                ));
                 self.show_feedback_warning(
                     "以前の読書位置はファイル種類の絞り込み中に復元できません".into(),
                 );

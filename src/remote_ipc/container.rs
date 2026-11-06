@@ -2067,7 +2067,13 @@ fn resolve_saved_resume_for_items(
                     == Some(identity)
             })
             .and_then(|item| grid_item_address(container, item))
-    } else if policy.is_all_visible() {
+    } else if crate::app::file_type_resume::legacy_raw_resume_allowed(
+        policy,
+        items.iter().map(|item| match item {
+            crate::grid_item::GridItem::PdfPage { pdf_path, .. } => Some(pdf_path.as_path()),
+            _ => None,
+        }),
+    ) {
         resolve_resume_page(container, items, saved.page)
     } else {
         return ResumePageResolution::VisibilityRefused(
@@ -2076,7 +2082,7 @@ fn resolve_saved_resume_for_items(
     };
     match page {
         Some(page) => ResumePageResolution::Page(page),
-        None if saved.identity.is_some() || !policy.is_all_visible() => {
+        None if saved.identity.is_some() => {
             ResumePageResolution::VisibilityRefused(ContainerResumeRefusal::SavedPageUnavailable)
         }
         None => ResumePageResolution::Unavailable,
@@ -5900,9 +5906,18 @@ impl ContainerEngine {
         let Some(saved) = saved else {
             return ResumePageResolution::Unavailable;
         };
-        let resolved = if let Some(slots) =
-            canonical_slots.filter(|_| saved.identity.is_none() && policy.is_all_visible())
-        {
+        let resolved = if let Some(slots) = canonical_slots.filter(|_| {
+            saved.identity.is_none()
+                && crate::app::file_type_resume::legacy_raw_resume_allowed(
+                    policy,
+                    items.iter().map(|item| match item {
+                        crate::grid_item::GridItem::PdfPage { pdf_path, .. } => {
+                            Some(pdf_path.as_path())
+                        }
+                        _ => None,
+                    }),
+                )
+        }) {
             slots
                 .iter()
                 .position(|&slot| slot == saved.page)
@@ -17106,6 +17121,71 @@ pub(super) mod tests {
         assert_eq!(
             engine.container_open_mode(true),
             ContainerOpenMode::FirstPage
+        );
+    }
+
+    #[test]
+    fn legacy_document_resume_with_exclusions_resolves_remote_page() {
+        let mut policy = crate::file_type_visibility::FileTypeVisibility::default();
+        policy
+            .excluded_categories
+            .insert(crate::file_type_visibility::FileTypeCategory::Rar);
+        for name in ["C:/book.pdf", "C:/book.epub"] {
+            let path = Path::new(name);
+            let address = RemoteAddress::file(name);
+            let items: Vec<_> = (0..4)
+                .map(|page_num| crate::grid_item::GridItem::PdfPage {
+                    pdf_path: path.into(),
+                    page_num,
+                    content_type: None,
+                })
+                .collect();
+            let saved = crate::book_resume_db::ReadingPosition {
+                page: 2,
+                identity: None,
+            };
+            assert_eq!(
+                resolve_saved_resume_for_items(&address, path, &items, &saved, &policy),
+                ResumePageResolution::Page(grid_item_address(&address, &items[2]).unwrap())
+            );
+            let invalid = crate::book_resume_db::ReadingPosition {
+                page: 99,
+                identity: None,
+            };
+            assert_eq!(
+                resolve_saved_resume_for_items(&address, path, &items, &invalid, &policy),
+                ResumePageResolution::Unavailable
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_document_resume_with_exclusions_uses_canonical_slots() {
+        let path = Path::new("C:/book.pdf");
+        let address = RemoteAddress::file(path.to_string_lossy().into_owned());
+        let mut policy = crate::file_type_visibility::FileTypeVisibility::default();
+        policy
+            .excluded_categories
+            .insert(crate::file_type_visibility::FileTypeCategory::Rar);
+        let mut engine = ContainerEngine::new(crate::settings::Settings::default());
+        engine.resume_reader = Some(ResumeReader::Saved(
+            crate::book_resume_db::ReadingPosition {
+                page: 2,
+                identity: None,
+            },
+        ));
+        let slots = [2, 0, 1, 3];
+        let items: Vec<_> = slots
+            .iter()
+            .map(|&page_num| crate::grid_item::GridItem::PdfPage {
+                pdf_path: path.into(),
+                page_num: page_num as u32,
+                content_type: None,
+            })
+            .collect();
+        assert_eq!(
+            engine.resume_page_for_items(&address, path, &items, true, &policy, Some(&slots)),
+            ResumePageResolution::Page(grid_item_address(&address, &items[0]).unwrap())
         );
     }
 
