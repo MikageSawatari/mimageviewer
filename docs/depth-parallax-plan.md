@@ -1,6 +1,6 @@
 # 3D 写真 (AI 深度による視差表示と書き出し) — 設計書
 
-状態: **設計 (2026-11-06)、実装前の独立レビュー待ち**。worktree `G:\home\mimageviewer-depth`、ブランチ
+状態: **設計 (2026-11-06)。実装前の独立レビュー第 1 回を反映済み (§16)、再確認待ち**。worktree `G:\home\mimageviewer-depth`、ブランチ
 `depth-parallax`。調査とスパイクの記録は [depth-parallax-research.md](depth-parallax-research.md)。
 試験実装の結果がよければ、**v5 リリースの次のリリース**に入れる (2026-11-06 利用者方針)。
 バックログ番号は未採番。
@@ -38,7 +38,7 @@
 | 動画、アニメーション画像 (GIF / APNG / WebP) | フレームごとに深度が変わりちらつく。研究調査 §6 と同じ |
 | 見開き・連結読み | 2 ページを 1 つの奥行きとして扱えない。360° と同じく入口で弾く |
 | **別ウィンドウ (F12 の detached viewer)** | §6.4。状態の組み合わせを減らすため、v1 はメインのフルスクリーンだけ |
-| 360° パノラマ表示との同時使用 | どちらも表示を占有するモード。片方が ON の間はもう片方に入れない |
+| 360° パノラマ表示との同時使用 | どちらも表示を占有するモード。3D に入ると 360° は終わり、3D 中は 360° に入れない (§6.2) |
 | 深度の手修正、左右並び (SBS)、2 層化と背景補完 | 研究調査 §6 の v1.x / v2 |
 | 先読み (次のページの深度を前もって計算) | dGPU では 30〜50 ms で不要。内蔵 GPU で 1 秒待つ点は試験実装で評価してから |
 | mIV Remote | 表示はローカルだけ。Remote 側には何も出さない |
@@ -88,6 +88,9 @@
   **アドオンの種類を引数に取る形へ共通化して使う**。コピーして 2 つ持たない。
   - 実装担当は着手前に VLM 側のコードを読み、共通化で VLM の既存挙動 (保存先・index の URL・
     取り消し・失敗時の表示) が変わらないことを確かめる。変わるなら止めて設計担当へ返す。
+  - 共通にするのは転送と配置 (ダウンロード・分割の結合・sha256・一時ファイルからの配置・取り消し)。
+    VLM 固有の検証 (4 ファイル必須・GGUF・model ID、vlm_addon.rs:73) は VLM 側に残し、深度側は
+    「ONNX 1 つ + LICENSE + NOTICE」の検証を持つ。
   - 編集アドオンパック (フォント + BiRefNet、約 550 MB) には入れない。入れると被写体マスクだけ
     使いたい人も 1.2 GB を落とすことになり、パックのビルダーも全 `*.onnx` を被写体マスクとして扱う。
 - 保存先は `<data_dir>/addons/depth/` (VLM と同じ規則。ポータブルはその data_dir 配下)。
@@ -129,13 +132,28 @@
   3D 側に同じ判断をもう 1 つ書かない。
 - **鍵は `DepthSourceKey { texture_id: egui::TextureId }`**。egui の managed texture の id は
   プロセス内で再利用されない。画素が変われば (補正の確定、AI 拡大の到着、ページ移動) 表示側が
-  別のテクスチャを作るので、鍵も自然に変わる。
-  - 実装担当は、表示側が**同じ TextureId のまま画素を書き換える**経路 (`TextureHandle::set` 等) が
-    無いかをコードで確かめる。あれば鍵に世代を足す必要があるので、設計担当へ返す。
-- **安定したときだけ始める**: 表示が暫定のもの (サムネイルの fallback、ページ送り中の通過表示、
-  `complete=false` の final composite、元画像ホールド中) のときは深度を作らず 2D で描く。
-  これを判断できるよう、`resolve_fs_processed_payload` の結果に「最終の表示か」を持たせる
-  (新しい判定を 3D 側に書かず、表示側の分岐が知っている事実を返す)。待ち時間の窓 (debounce) は使わない。
+  別のテクスチャを作るので、鍵も自然に変わる。final / processed の経路で同じ id のまま画素を
+  書き換える箇所は無い (独立レビューの確認、app.rs:89872 付近の新規生成)。実装担当は着手時に
+  `TextureHandle::set` の呼び出し元を一覧にして確かめ直す。
+- **素材の契約 (表示側が返す)**: 3D 側は表示側から次の 1 つを受け取り、自分で分岐を足さない。
+
+  ```rust
+  pub enum DepthSourceMaterial {
+      Ready { texture: egui::TextureHandle },   // 表示側がこれ以上差し替える予定の無い、読める元テクスチャ
+      NotYet(DepthSourceWait),                  // 2D のまま待つ (理由はパネル表示とテスト用)
+  }
+  ```
+
+  `NotYet` になるのは: サムネイルの fallback、ページ送り中の通過表示、`complete=false` の final
+  composite、元画像ホールド中、**注釈のベイク待ち** (comic が None を返し完成済みの下地へ fallback
+  している間。下地の `complete=true` だけでは最終と言えない、app.rs:90704 / ui_fullscreen.rs:13396)、
+  **元テクスチャを持たない Native の presentation** (保持済みの GPU 縮小結果など。`source_texture()` が
+  意図的に `None`、ui_fullscreen.rs:11953 / gpu_lanczos.rs:938)。
+  - Native だけが残っている場合、3D 側は既存の元素材の再準備の経路 (紙めくりから戻るときと同じ経路) を
+    要求する。実装担当はその経路を特定し、無ければ設計担当へ返す (3D 用の再準備を新しく書かない)。
+  - RAW の現像待ちで元画像の preview を出している間は、その preview を最終として扱う。現像が終われば
+    表示側が別テクスチャへ替えるので、鍵が変わって深度を作り直す。
+  - 判定は `resolve_fs_processed_payload` の分岐が知っている事実を返すだけにする。待ち時間の窓は使わない。
 - 回転 (R / L の 90° 単位) はテクスチャに焼き込まれていないので、深度もテクスチャと同じ向きで作り、
   描画で両方に同じ回転をかける (§5.2)。
 
@@ -145,17 +163,24 @@ CPU の画素 (`ColorImage`) を探さず、**表示中のテクスチャを GPU
 
 1. 表示中テクスチャの `wgpu::Texture` を `renderer.read().texture(&id)` で借りる (gpu_lanczos.rs と同じ。
    backing が `None` なら準備できていないとして 2D のまま)。
-2. 3D 用の**色テクスチャ**を作る: 同じ大きさ・形式で GPU 上にコピーし、mipmap を生成する
+2. 3D 用の**色テクスチャ**を作る: egui の managed texture は `TEXTURE_BINDING | COPY_DST` だけで
+   `COPY_SRC` が無い (vendor/egui-wgpu/src/renderer.rs:776) ので、`copy_texture_to_texture` は使えない。
+   **元テクスチャをサンプルして level 0 へ描く blit** を行い、そのあと mipmap を生成する
    (`egui_wgpu::MipmapGenerator`、360° と同じ)。縮小表示でのちらつきを防ぐため、3D の描画と
    書き出しはこの mip 付きの色テクスチャから読む。CPU からの大きなアップロードは無い。
+   - **色空間**: egui のテクスチャは sRGB で符号化した値を `Rgba8Unorm` に入れている
+     (renderer.rs:782)。framebuffer も非 sRGB の形式が優先される (vendor/egui-wgpu/src/lib.rs:526)。
+     3D の色テクスチャ・読み戻し・書き出しの描画先は**すべて `Rgba8Unorm`** にそろえ、シェーダは
+     値をそのまま通す (sRGB の変換を挟まない)。推論入力もこの値 (= スパイクと同じ sRGB の 8 bit) になる。
 3. 色テクスチャから 2 枚を描く: **推論入力** 504×504 (縦横比を無視して引き伸ばし) と
-   **ガイド画像** (長辺 1536、元より大きくしない。縦横比はテクスチャのまま)。どちらも sRGB の RGBA8。
+   **ガイド画像** (長辺 1536、元より大きくしない。縦横比はテクスチャのまま)。
 4. 2 枚を `copy_texture_to_buffer` → `map_async`。**UI スレッドでは `poll(Wait)` しない**。
-   以後のフレームで map 完了を確かめ、完了した frame で worker へ渡す
-   (wgpu のコールバックが立てる flag を見るだけ。eframe の描画が毎フレーム queue を submit するので、
-   完了は数フレーム以内に届く)。
-   - 実装担当は、map 完了の通知が届くために UI 側で `device.poll(PollType::Poll)` が要るかを確かめる。
-     要るなら非ブロッキングの Poll を 3D モード中だけ毎フレーム 1 回呼ぶ。
+   map の callback は `Queue::submit` でも進む (wgpu-30 buffer.rs:363) ので、常時の別 poll は要らない。
+5. **起こす責任**: egui は再描画の要求が無いと休む (ui-responsiveness.md:249)。マウス追従で
+   ポインタが止まっていても進むよう、`ReadingBack` の間は毎フレーム非ブロッキングの
+   `device.poll(PollType::Poll)` と `request_repaint` を行う。map が完了した frame で worker へ渡す。
+   worker は結果を送ったあと、**要求元の viewport** に `request_repaint_of` を出す (要求に viewport id を持たせる)。
+   - 回帰検査: ポインタを動かさずに 3D を ON にして `Ready` まで進むこと。
 
 読み戻すのは 1 MB + 長辺 1536 の 9 MB 程度で、8K の画像でも CPU 側の大きなコピーは発生しない。
 
@@ -179,12 +204,17 @@ CPU の画素 (`ColorImage`) を探さず、**表示中のテクスチャを GPU
 - プロセスに 1 本の常駐 thread `depth-estimation`。要求は **1 つの slot (最新が勝つ)** を
   `Mutex + Condvar` で渡す (coding-conventions の並行処理。try_lock の再試行ループは書かない)。
   v1 は 3D モードがメインの viewer だけ (§6.4) なので、同時に要る要求は 1 つ。
-- 要求: `DepthRequest { context, key, input_504, guide, cancel: CancelToken }`。
+- 要求: `DepthRequest { context, request_id, viewport, key, input_504, guide, cancel: CancelToken, reply }`。
+  - `request_id` は単調増加。**要求の寿命は `TextureId` ではなく context + `request_id` で識別する**。
+    同じテクスチャで OFF → ON した場合に、取り消した前の要求の結果を受け取らないため。
+  - `reply` は**要求ごとの受け口** (pending が持つ専用の receiver)。共有 channel にしない。
+    pending を捨てれば受け口も消え、結果は届き先を失って捨てられる。
   - ランタイム初期化待ちは `AiRuntimeInitOwner::wait_terminal_while(|| !cancel)` (ui-responsiveness §2.1.2)。
   - 推論そのものは途中で止められない (数十 ms〜数秒)。終わったら cancel を見て、取り消し済みなら捨てる。
-- 結果は channel で返し、UI は `DepthViewState` の**今欲しい鍵と一致するときだけ**受け取る。
+- UI は pending の受け口から受け取り、鍵が `DepthViewState` の今欲しい鍵と一致するときだけ採る。
   取り消しは: 3D モード OFF、フルスクリーン終了、フォルダ移動、context の terminal close
-  (`ViewerContextBundle::cancel_all_context_work`)。要求の `Drop` で cancel を立てる (BiRefNet の pending と同じ)。
+  (`ViewerContextBundle::cancel_all_context_work`)、アプリ終了。要求の `Drop` で cancel を立てる
+  (BiRefNet の pending と同じ)。slot に新しい要求を置くと、前の要求は取り消し扱いになる。
 - 深度の LRU: context 所有で 4 件 (GPU の R16Float テクスチャ + 中央値)。前後のページへ戻る・
   補正の ON/OFF で元のテクスチャに戻る、ときに計算し直さないため。ディスクには保存しない。
 
@@ -196,6 +226,12 @@ CPU の画素 (`ColorImage`) を探さず、**表示中のテクスチャを GPU
   テクスチャ・bind group は context 所有の `DepthViewState` が `Arc` で持ち、毎フレーム
   `callback_resources` に入れる。paint 時に `DepthSourceKey` と context の一致を確かめてから描く
   (panorama_wgpu.rs の stale guard と同じ)。
+- **slot の後始末**: `callback_resources` に入れた `Arc` は state を捨てただけでは消えない。
+  360° と同じく (`clear_pano_upload`、app.rs:95685)、OFF・フルスクリーン終了・context の terminal close で
+  **所有 context が一致する slot を明示的に取り除く**。
+- **VRAM の会計**: 色テクスチャ (mip 込み。8K で約 340 MB) と深度テクスチャの LRU を、既存の VRAM
+  accountant に登録する (async-architecture.md §4 の末尾「新しいテクスチャキャッシュを追加する時は」)。
+  色テクスチャは今のページの 1 枚だけ持つ。
 - アルゴリズムはスパイクの `parallax.render_view` (研究調査 §4)。画面上の点ごとに、手前から奥へ
   40 段で深度面を探し、二分探索 5 回で詰める。深さ `t` の面は `offset × (t − focus)` だけずれて見える。
 - uniform: `offset` (画像幅に対する割合、x / y)、`focus`、`gamma`、`zoom`、uv の範囲、回転、段数。
@@ -235,20 +271,49 @@ CPU の画素 (`ColorImage`) を探さず、**表示中のテクスチャを GPU
 
 - 画像フルスクリーンでない、動画、アニメーション画像
 - 見開きの 2 ページ表示中、連結読み
-- 360° パノラマ表示が ON
-- メインの viewer でない (§6.4)
+- メインの viewer の、メイン窓のフルスクリーン表示でない (§6.4)
 - wgpu の描画状態が無い
 - 編集系のモード (消しゴム・隠蔽加工・補正レイヤー・テキスト注釈・切り取り・SNS 分割) の最中
 
 モデル未導入は入口条件ではなく、通過したあとに案内ダイアログを出す分岐 (§3.3)。
 弾いたときは理由をトーストで出す (既存の `FsNavNoOpReason` の流儀)。
+360° が ON のときに 3D へ入るのは弾かず、§6.2 の 1 つの持ち主が 360° を終わらせてから 3D にする。
 
-### 6.2 状態
+**同じ条件を「続けてよいか」にも使う**: 入口条件のうちページと表示の状態に関わるもの
+(静止画・1 ページ・連結読みでない・メインの表示) は、3D 中も毎フレーム同じ関数で照合する (§6.3)。
+
+### 6.2 状態 — 表示を占有するモードの持ち主を 1 つにする
+
+360° の `panorama_state` と 3D の状態を別々の `Option` で持つと、両方が `Some` になり得る。
+現行の 360° には V キーと `panorama_intent` の自動復帰という 2 つの入口があり、それぞれ 360° の
+state を作る (ui_fullscreen.rs:36651、app.rs:94965)。さらに 360° は「state を持ったまま非アクティブ」
+(360° でないページ) を許すので、「3D の入口で 360° が ON か」を見るだけでは、後で 360° のページへ移った
+ときに 2 つが同時に有効になる。
 
 ```rust
 // ViewerContextBundle の swap 対象 (viewer ごと。App 全体に置くと別 context に漏れる)
-pub(crate) depth_view: Option<DepthViewState>,
+// 既存の panorama_state を置き換える
+pub(crate) fs_exclusive_view: FsExclusiveView,
 
+pub enum FsExclusiveView {
+    None,
+    Panorama(PanoramaState),   // 今の panorama_state の中身 (非アクティブを含む)
+    Depth(DepthViewState),
+}
+```
+
+- 遷移は **1 つの持ち主** `set_fs_exclusive_view(target, cause)` だけが行う。360° の V キー・
+  上部ボタン・intent の自動復帰、3D の D キー・上部ボタン・継続条件の OFF (§6.3)、フルスクリーン終了の
+  すべてがここを通る。別の値へ移るときは、前の値の OFF の後始末 (360° なら `clear_pano_upload` 等、
+  3D なら §5.1 の slot 除去と要求の取り消し) を先に行う。
+- 360° の既存コードは `panorama_state()` / `panorama_state_mut()` の accessor で読む形にし、
+  中身の扱いは変えない。
+- **3D に入るときは 360° の state を捨て、360° の intent (`panorama_intent.on`) も落とす**。利用者が
+  明示的に 3D を選んだので、3D を抜けたあと 360° のページで自動的に 360° に戻らないようにする。
+  360° の自動復帰は `panorama::entry_allowed` を通るので、3D 中は復帰しない (3D 中であることを
+  入口条件に入れる)。
+
+```rust
 pub struct DepthViewState {
     pub panel_visible: bool,
     pub started_at: Instant,                 // 自動の動きの時刻原点
@@ -280,13 +345,19 @@ pub enum DepthSourcePhase {
 | 上部バーの × | 3D を OFF (フルスクリーンは閉じない。360° と同じ) |
 | Esc / 一覧へ戻る / フォルダ移動 | フルスクリーンごと閉じ、3D も終わる |
 | 静止画の次 / 前ページへ移動 | ON のまま。新しいページの表示が安定したら深度を作る |
-| **入口条件を満たさないページへ移動** (動画・アニメーション画像・見開きになる) | **3D を OFF にする** (同じ OFF の経路を通る)。トーストで知らせる |
-| F12 で別ウィンドウへ移る | 既存の `reset_detached_pause_foreground_modes` で OFF にする |
+| **続ける条件を満たさなくなった** (動画・アニメーション画像のページへ移った、同じページでアニメーションと後から分かった、見開き・連結読みに切り替わった、F12 で別ウィンドウ表示になった) | **3D を OFF にする** (§6.2 の持ち主を通る)。トーストで知らせる |
 | 3D パネルの「書き出し…」 | モーダルの書き出しダイアログ (§7) |
 
-- 「ON のまま入口条件を満たさないページにいる」状態を作らない。360° は「state を保ったまま非アクティブ」
+- 「ON のまま続ける条件を満たさない」状態を作らない。360° は「state を保ったまま非アクティブ」
   にしていて、戻ったときに入場時の後始末を通らない既知の穴がある (360° 設計書 §5.1.1、backlog §1.169)。
-  3D は満たさないページへ移った時点で OFF にし、この組み合わせを最初から無くす。
+  3D は満たさなくなった時点で OFF にし、この組み合わせを最初から無くす。
+- **照合の場所は 1 か所**: 各ページ移動の関数 (open_fullscreen の各種、スライドショー再開、フォルダを
+  またぐ移動、動画タイル、ページ一覧) や見開き・連結読みの切替、F12 にそれぞれ OFF を足さない。
+  フレームの中で **worker の結果の採用と設定・入力の適用が終わったあと、描画と占有モードの入力判定の前**
+  に `reconcile_depth_view_continuation(fs_idx)` を 1 回呼び、§6.1 と同じ関数で照合して OFF の経路へ
+  落とす。360° の intent の照合 (`reconcile_panorama_session_intent`) と同じ位置にそろえる。
+  - これは時間窓や再試行ではなく、各フレームの事実 (今のページ・表示の状態) での状態の照合である。
+  - open_fullscreen の途中では照合しない (360° と同じ理由。呼び出し元がその後でモードを戻すことがある)。
 - ON にするときの後始末は 360° と同じ: スライドショー停止、補正パネル・補正レイヤー・切り取り・SNS 分割・
   ルーペ・分析・消しゴム・比較・メタデータパネルを閉じる。
 
@@ -298,8 +369,17 @@ pub enum DepthSourcePhase {
   組み合わせを作らない。
 - それでも状態は `ViewerContextBundle` に置く。メインの bundle が mount を外れる間 (active detached を
   mount している間) に App の field として見えてしまわないため。
-- F12 で別ウィンドウへ移るときは、360° と同じ `reset_detached_pause_foreground_modes` で OFF にする。
-  park / fork の経路で 3D の状態を相手側へ渡す処理は作らない (常に OFF にしてから移る)。
+- **「メイン」の定義**: context の識別子 (メインの bundle か) と、**今の presentation** (メイン窓の
+  フルスクリーンか、別ウィンドウか) の両方で決める。メインの context 自身も F12 で別ウィンドウ表示に
+  なる (viewer_context_registry.rs:4936、app.rs:63053) ので、識別子の比較だけでは足りない。
+- **F12 で別ウィンドウ表示に移る**: 通常の F12 は `apply_egui_viewer_presentation_for_current_item`
+  (app.rs:91819 → 91624) で presentation を変え、`reset_detached_pause_foreground_modes` は通らない。
+  そこに 3D の OFF を足さず、presentation が変わった次の照合 (§6.3) で「メインの表示でない」になって
+  OFF にする。F12 の経路そのものには手を入れない。
+  - 照合より前に別ウィンドウの viewport で 3D を描く frame が 1 つも無いことを、照合の位置で保証する
+    (照合は描画の前)。実装担当はこれをテストで確かめる。
+- park / fork の経路で 3D の状態を相手側へ渡す処理は作らない。fork・park は常に `FsExclusiveView::Depth`
+  を OFF にしてから行う (`reset_detached_pause_foreground_modes` は 360° と同じく占有モードを終える)。
 - detached の述語に触れる箇所 (入口条件の「メインの viewer か」と park 時の OFF) は、
   CLAUDE.md「Detached viewer リワーク中のルール」に従い、**ClaudeCode と Codex の双方のレビューで
   症状パッチではない構造的な変更だと合意**し、detached-rework-plan.md §11 に記録する。
@@ -310,10 +390,15 @@ pub enum DepthSourcePhase {
 ズーム / パン / ホイール・見開き・ルーペ・メタデータパネル・ナビゲータ・ページ一覧・
 トリミング・動画タイル) に、3D 用の同じ判定を 1 つずつ書き足さない。
 
-- `fs_exclusive_view(fs_idx) -> Option<ExclusiveView>` (`Panorama` / `DepthParallax`) を 1 つ作る。
+- §6.2 の `FsExclusiveView` を読む述語 `fs_exclusive_view_active(fs_idx) -> Option<ExclusiveViewKind>`
+  (`Panorama` / `Depth`) を 1 つ作る。これは判定の集約で、状態の持ち主は §6.2 の 1 つ。
 - 360° の判定箇所を 2 種類に分ける: **「表示を占有するモード中だから止める」**箇所は新しい述語に置き換え、
   **360° の意味に依存する**箇所 (ホイール = 画角、ドラッグ = 視線、ナビゲータの球面表示など) は
   `is_panorama_mode_active` のまま残す。
+- 単純に置き換えられない箇所 (独立レビューの指摘): ズームの持ち主 `FsZoomOwner` (ui_fullscreen.rs:15104)、
+  タッチのピンチ・パン、紙めくりの可否 (page_turn.rs:1809)、連結表示の判定。これらは 3D 中の
+  あるべき挙動を個別に決めて表に書く (3D は fit 固定なのでズーム・パンは止める、紙めくりは
+  1 ページ表示の静止画なら入口条件で既に除外しているか、を確かめる)。
 - 実装担当は全箇所を表にして (箇所・どちらに分類したか・理由)、本書の §10 に記録する。
   置き換えで 360° の挙動が変わらないことを、既存の 360° のテストで確かめる。
 - 3D 中のホイール: **通常どおりページ送り**。3D 中に固有の意味は持たせない (360° と違う点)。
@@ -336,15 +421,31 @@ pub enum DepthSourcePhase {
 4. 終わったらトーストで保存先を知らせる。
 
 書き出しをモーダルにするので、書き出し中のページ移動・3D OFF・設定変更の組み合わせは起きない
-(CLAUDE.md「長い処理はモーダルにして割り込みを消せないか」)。
+(CLAUDE.md「長い処理はモーダルにして割り込みを消せないか」)。ただし `common_modal_dialog_open` への
+登録だけでは、外から来る「開く」要求と mIV Remote の取得は止まらない (独立レビューの指摘):
+
+- **Remote**: 書き出しダイアログを開く時点で既存の `try_local_modal_lease` (remote_ipc/session.rs:1448)
+  を取り、取れなければ書き出しを始めない (既存の通知付きの版を使う)。lease は書き出しの進行ダイアログが
+  閉じるまで持つ。
+- **開く要求** (関連付け・D&D・単一起動への引数など): `document_open_modal_admission_blocked`
+  (app.rs:42299) に書き出し中を足し、既存のモーダルと同じく受付を止める。
+- **凍結**: 書き出しの要求を作る時点で、パネルの設定・回転・uv の範囲・画像の寸法・色テクスチャと
+  深度テクスチャの `Arc` を `DepthExportRequest` に写す。worker はこれだけを見る。
 
 ### 7.2 フレームの描画
 
-- **画面と同じシェーダ**でオフスクリーンのテクスチャ (書き出しの大きさ、Rgba8UnormSrgb) に描き、
-  読み戻す。描き方を画面用と書き出し用で 2 つ持たない。
+- **画面と同じシェーダ**でオフスクリーンのテクスチャ (書き出しの大きさ、**`Rgba8Unorm`**。§4.2 の
+  色空間と同じ) に描き、読み戻す。描き方 (WGSL) を画面用と書き出し用で 2 つ持たない。
+  - pipeline・uniform buffer・bind group は**書き出し用に別に作る**。画面用の prepare は毎フレーム
+    uniform を書き換える (panorama_wgpu.rs:526 と同じ作り) ので、共有すると書き出しのフレームに
+    画面の値が混ざる。
+  - **透過**: 書き出しはすべて不透明にする。フルスクリーンの背景色の上に合成してから符号化する
+    (MP4 は透過を持てず、GIF の 1 bit 透過は縁が汚れるため。形式で挙動を分けない)。egui の
+    テクスチャは premultiplied alpha なので、背景との合成は `rgb + bg × (1 − a)` で行う。
+  - 回帰検査: 中間の灰色 (sRGB 128) と半透明の画像で、画面の描画と書き出しの画素が一致すること。
 - 描画・読み戻し・エンコードは **書き出し worker** で行う。wgpu 30 の `Device` / `Queue` は
   `Clone + Send + Sync` なので、worker が encode → submit → `poll(Wait)` してよい (UI スレッドは待たない)。
-  色テクスチャ・深度テクスチャは `Arc` で worker に渡す (モーダル中は差し替わらない)。
+  色テクスチャ・深度テクスチャは凍結した要求の `Arc` で持つ (モーダル中は差し替わらない)。
 - フレーム数 `N = round(周期 × fps)`。fps は形式で固定: MP4 30、GIF 15、APNG 15 (スパイクの大きさの計測に合わせる)。
   `phase = i / N`。
 
@@ -352,7 +453,7 @@ pub enum DepthSourcePhase {
 
 | 形式 | 使うもの | 要点 |
 | --- | --- | --- |
-| GIF | `image` 0.25 の `GifEncoder` | 各フレームの遅延は `Delay::from_numer_denom_ms`、`Repeat::Infinite`。256 色化は gif crate の NeuQuant (フレームごと) |
+| GIF | `image` 0.25 の `GifEncoder` | `Repeat::Infinite`。256 色化は gif crate の NeuQuant (フレームごと)。**遅延は 10 ms 単位**で、`image` は ms の整数へ切り捨ててから 10 ms 単位にする (image-0.25.10 codecs/gif.rs:586)。`1000 / 15` ms をそのまま渡すと各 60 ms になり 1 周期が約 10% 短くなるので、累積時刻から各フレームに 60 / 70 ms を配分し、1 周期の合計を周期に一致させる |
 | APNG | `png` 0.18 の `Encoder::set_animated` / `set_frame_delay` | 可逆なので大きい (720 px・2 秒で 14〜18 MB、研究調査 §8.3) |
 | MP4 | `video::mvexport` の部品 | H.264 の encoder 選択 (`open_h264_encoder`)、BT.709 の YUV 変換、`PartialOutput` (一時ファイル → 完了時に rename)、faststart。**映像だけの `Mp4Muxer`** を足す (今の `Mp4Muxer::new` は音声 stream を要求する)。寸法は偶数に丸める |
 
@@ -402,10 +503,18 @@ pub enum DepthSourcePhase {
 
 ## 11. テスト
 
-- **状態遷移**: OFF → ON → (ページ移動) → ON、入口条件を満たさないページへ移ると OFF、× / D で OFF、
-  フルスクリーン終了・フォルダ移動で取り消し、F12 の park で OFF。
-- **要求の相関**: 古い鍵の結果を捨てる、取り消した要求の結果を捨てる、`Drop` で cancel が立つ、
+- **状態遷移**: OFF → ON → (ページ移動) → ON、× / D で OFF、フルスクリーン終了・フォルダ移動で取り消し。
+- **続ける条件の照合** (§6.3): open_fullscreen の各種、スライドショー再開、フォルダをまたぐ移動、
+  動画タイル、ページ一覧からの移動、同じページでの見開き・連結読みの切替、アニメーションと後から
+  分かる場合、F12 での別ウィンドウ化、の各経路で 3D が OFF になり、別ウィンドウで 3D を描く frame が無い。
+- **占有モードの持ち主** (§6.2): 360° ON から 3D に入ると 360° の state と intent が消える、3D 中に
+  360° のページへ移っても 360° が復帰しない、3D 中の V キーは弾かれる、360° の非アクティブ state が
+  残っていても 3D と同時に有効にならない。
+- **要求の相関**: 古い鍵の結果を捨てる、取り消した要求の結果を捨てる、同じテクスチャで OFF → ON したとき
+  前の要求の結果を受け取らない、slot の置き換えで前の要求が取り消される、`Drop` で cancel が立つ、
   別の context の状態が変わらない。
+- **起こす責任**: ポインタを動かさずに 3D を ON にして `Ready` まで進む。
+- **GPU 資源**: OFF・終了・terminal close で `callback_resources` の slot が消え、VRAM の会計から外れる。
 - **入口条件**: 動画・アニメーション・見開き・連結読み・360° ON・detached・編集モードで弾き、理由が正しい。
 - **占有モードの述語**: 3D 中に止めるキー・入口が 360° 中と同じであること (分類表の「止める」側)。
   360° 固有の挙動 (ホイール = 画角) が 3D 中に出ないこと。
@@ -414,7 +523,9 @@ pub enum DepthSourcePhase {
   入力と同じ (zoom を除く)。
 - **動きの関数**: phase 0 と 1 で同じ値 (継ぎ目が無い)、各動きの範囲。
 - **前処理**: 正規化・guided filter・中央値をスパイクの出力と固定値で比べる。
-- **書き出し**: 各形式でフレーム数・遅延・寸法・ループ指定を読み戻して確かめる。取り消しで途中ファイルが残らない。
+- **書き出し**: 各形式でフレーム数・遅延・**1 周期の合計時間**・寸法・ループ指定を読み戻して確かめる。
+  取り消しで途中ファイルが残らない。画面と書き出しの色が一致する (中間の灰色・半透明)。
+  書き出し中は開く要求と Remote の取得が受け付けられない。
 - **パネル**: UI スナップショット、小さい画面 (1093×614) で全項目に届くこと。
 
 ## 12. 文書の同時更新
@@ -445,16 +556,42 @@ pub enum DepthSourcePhase {
 | モデル | DA3 Mono-L fp16 の 1 つ | DAv2-Small を既定に足す: 利用者がイラストで Mono-L を最も自然と判断。fp16 で内蔵 GPU でも約 1 秒 |
 | 配布 | 独立したアドオン (VLM の仕組みを共通化) | 本体に同梱: 0.67 GB 増える。編集パックに同梱: 被写体マスクだけの人まで落とす |
 | 3D の ON を持ち越す | 持ち越さない | 360° の intent のように持ち越す: 復帰の契機・入口条件・park の扱いが増える |
-| 満たさないページ | OFF にする | 360° のように保ったまま非アクティブ: 戻ったときに入場の後始末を通らない穴 (§6.3) |
+| 360° との排他 | 1 つの enum (`FsExclusiveView`) と 1 つの遷移の持ち主 | 別々の `Option` + 判定の集約だけ: 360° の非アクティブ state や自動復帰で両方が有効になり得る (独立レビュー P1) |
+| 満たさなくなったとき | OFF にする | 360° のように保ったまま非アクティブ: 戻ったときに入場の後始末を通らない穴 (§6.3) |
+| OFF にする場所 | 毎フレーム 1 か所で照合 | 各ページ移動・見開き切替・F12 の関数に OFF を足す: 経路が多く網羅できない (独立レビュー P2) |
 | 別ウィンドウ | v1 は対象外 | 対応する: 再描画・GPU 資源・worker の取り合いの組み合わせが増える (§6.4) |
 | 書き出し | モーダル、画面と同じシェーダ | 非モーダル: 書き出し中の操作との組み合わせ。CPU で描く: 描き方が 2 つになる |
 | AI の優先度 | 足さない (既存の mutex のまま) | 深度推論を後回しにする優先度: 3D は利用者が今待っている前面の処理 |
 
 ## 15. 未確認の点
 
-- 表示側が同じ TextureId のまま画素を書き換える経路の有無 (§4.1)。
-- map 完了の通知に UI 側の非ブロッキング poll が要るか (§4.2)。
+- `TextureHandle::set` の呼び出し元の一覧 (§4.1。独立レビューでは final / processed の経路に無かった)。
+- Native だけが残る presentation から元素材を再準備する既存の経路 (§4.1)。
 - 極端な縦横比 (3:1 以上) での深度の劣化 (§3.1)。
 - 一般的な GPU・遅い CPU での所要時間 (研究調査 §8.5)。
 - マウス追従の向き (§5.3)。
 - 名前 (「3D 写真」で仮置き)。
+
+## 16. 独立レビューの記録
+
+### 第 1 回 (2026-11-06、GPT-6.1 Sol / xhigh、read-only、実装前)
+
+P1 4 件・P2 6 件。ClaudeCode が主要な根拠 (egui のテクスチャの usage と形式、F12 の経路、
+`image` の GIF 遅延の切り捨て) をコードで確かめ、すべて採って本書を直した。
+
+| 指摘 | 対応 |
+| --- | --- |
+| P1 egui のテクスチャに `COPY_SRC` が無く GPU コピーできない | blit で level 0 を描いてから mipmap (§4.2) |
+| P1 通常の F12 は `reset_detached_pause_foreground_modes` を通らない。メインの context も別ウィンドウになる | 「メイン」を識別子 + presentation で定義。F12 は毎フレームの照合で OFF (§6.4) |
+| P1 判定の集約は排他状態の持ち主にならない。360° の 2 つの入口と非アクティブ state で両方が有効になり得る | `FsExclusiveView` の 1 つの enum と遷移の持ち主。3D に入ると 360° の intent も落とす (§6.2) |
+| P1 書き出しを `Rgba8UnormSrgb` にすると sRGB が二重にかかる | 3D の描画先をすべて `Rgba8Unorm`。透過は背景色へ合成して不透明に (§4.2・§7.2) |
+| P2 OFF の境界がページ移動以外 (後から分かるアニメーション、見開き・連結の切替) を覆わない | 毎フレーム 1 か所で照合 (§6.3) |
+| P2 payload が元テクスチャを持たない場合 (Native、注釈のベイク待ち) | 素材の契約 `DepthSourceMaterial` (§4.1) |
+| P2 マウス追従で止まっている間に非同期処理が進まない | `ReadingBack` 中の poll + 再描画、結果は要求元 viewport へ repaint (§4.2) |
+| P2 `callback_resources` の slot が残る、VRAM の会計、要求の寿命を `TextureId` で識別している | slot の明示除去、accountant 登録、context + `request_id` と要求ごとの受け口 (§4.4・§5.1) |
+| P2 モーダル登録だけでは開く要求と Remote の取得が止まらない、uniform が画面と混ざる | `try_local_modal_lease`、`document_open_modal_admission_blocked`、要求の凍結、書き出し用の pipeline (§7.1・§7.2) |
+| P2 GIF の遅延が 60 ms に切り捨てられ周期が約 10% 短くなる | 累積時刻から 60 / 70 ms を配分し、合計時間をテストする (§7.3) |
+
+レビュー担当は、bundle 所有と既存の識別子による対象制限 (§6.4) を「症状パッチではなく構造的な変更」
+と認めた (上の P1 2 件を反映する条件付き)。ClaudeCode も同じ判断。detached-rework-plan.md §11 への
+記録は段 B の実装時に行う。
