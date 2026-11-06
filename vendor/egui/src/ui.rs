@@ -653,6 +653,16 @@ impl Ui {
         self.painter().layer_id()
     }
 
+    /// Apply the same layer boundary as widget interaction before a widget handles actions itself.
+    /// Blocked requests must be discarded, including before `Context::create_widget` runs.
+    /// Undo cached focus adoption here too, before a widget reads keyboard input.
+    pub(crate) fn discard_blocked_accesskit_actions(&self, id: Id) {
+        if !self.memory(|memory| memory.allows_interaction(self.layer_id())) {
+            self.memory_mut(|memory| memory.ignore_focus(id));
+            self.input_mut(|input| input.consume_accesskit_action_requests(id, |_| true));
+        }
+    }
+
     /// The height of text of this text style.
     ///
     /// Returns a value rounded to [`emath::GUI_ROUNDING`].

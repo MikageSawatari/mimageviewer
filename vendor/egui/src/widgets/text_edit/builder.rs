@@ -534,6 +534,8 @@ impl<'t> TextEdit<'t> {
             }
         });
 
+        ui.discard_blocked_accesskit_actions(id);
+
         classes.add_class_if(Self::CLASS_READ_ONLY, !text.is_mutable());
         let TextEditStyle {
             atom_layout: mut atom_layout_style,

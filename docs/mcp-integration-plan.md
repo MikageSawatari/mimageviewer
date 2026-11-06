@@ -1592,6 +1592,7 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
   - 検出: `Packages\OpenAI.Codex_*` か `%USERPROFILE%\.codex` が在れば「入っている」。
   - 動作中の判定: `WindowsApps\OpenAI.Codex_*` の下の process、または名前が `codex.exe` の process (Codex CLI・IDE 拡張。
     同じ `config.toml` を共有し、同時に書くと他方の変更を失う。§15.7 初版の独立レビュー P2-11)。
+    判定対象は変えず、アプリのみ・CLI/IDE 拡張のみ・両方に分け、終了が必要なものを断る文に明記する (§41)。
   - 書く内容: `[mcp_servers.mimageviewer]` に `command`・`args`・`default_tools_approval_mode = "approve"`。
     `toml_edit` (直接の依存に足す) で他の表・コメント・書式を残す。改行コード (CRLF / LF) はファイルのものを保つ。
     `approve` が「確認なし」の意味かは文書で明言されていないので、1d の後の実機確認で見る (未確認)。
@@ -5803,3 +5804,114 @@ UI をそろえてほしいとの指摘があった。下端に「閉じる」�
 独立レビューは指摘なし、ACCEPT。メモリ量の直接測定は行わず、コンテナの受け取りが全て借用であることをコードで確認した。
 `build-dev.ps1 -PreserveRuntime` は同じ出力先の core (PID 8248) が稼働中のため保護で中止し、検証用バイナリは未更新。
 製品起動・稼働中アプリの停止・commit は行っていない。
+
+## 41. 登録確認の覆いと Codex の終了案内 (2026-11-06)
+
+### A. 不透明な窓と全画面の覆い
+
+利用者から、登録確認の後ろの AI 連携窓だけが半透明になり、さらに後ろのメイン画面は鮮明に見えて違和感があるとの指摘があった。
+原因は egui 0.37 の `Window::enabled(false)` が窓の painter 全体へ disabled_alpha を掛けることだった。
+AI 連携窓と書き込み中の確認窓の Window 全体の無効化をやめ、画面全体を同じ暗さに沈める覆いへ変更する。
+
+- `egui::Modal` 自身を `Frame::NONE` の覆い用 host として使い、既定の `Color32::from_black_alpha(100)` と、
+  Area の全画面の入力受け・`set_modal_layer`・focus 制限を再利用する。`ModalResponse::should_close` は呼ばず、
+  Enter / Escape / IME / opened_frame の扱いは既存の確認処理だけが所有する。
+- 確認内容は既存の移動・リサイズ可能な `egui::Window` のままにする。`set_sublayer` で覆いの直上へ置き、
+  覆いを `move_to_top` する。同じ Order の連続した `move_to_top` だけでは相対順が保証されないため、親子関係を明示する。
+- 背面の AI 連携窓は不透明なまま描き、ボタン・チェック・scroll・×・移動・resize・focus 経由の操作とメインのクリックを modal 層で止める。
+  メインのキーボードショートカットは、既存の `common_modal_dialog_open` などの登録を維持する。
+- egui の AccessKit 直接要求は pointer hit test を経由しないため、vendored Context の疑似クリックと scroll 要求にも
+  `Memory::allows_interaction` の modal 制限を適用する。背面への直接 Click / ScrollDown / ScrollIntoView を拒否し、
+  確認窓側では同じ操作が有効であることを回帰検査する。modal 外の既存の有効・無効の扱いは変えない。
+- 書き込み中も覆いと不透明な確認窓を残し、操作ボタンだけを無効にする。タイトルバーの × だけを無効にする既存APIがないため、
+  vendored egui の Window に `close_button_enabled` (既定 true) を追加した。同じ Widget ID / geometry を保つ局所的な `add_enabled` で、
+  × 以外の窓の描画・移動・resizeを無効化しない。
+- preferences.rs / settings_restore.rs にある同じ fade の作りは別件とし、この変更では触らない。
+
+### B. Codex CLI / IDE 拡張が動いている場合の文言
+
+利用者が ChatGPT (Codex) の登録を拒否されたとき、設計担当が確認した実プロセスは npm 版の Codex CLI だけだった。
+CLI・IDE 拡張も同じ config.toml を使うため拒否する仕様は変えず、型でアプリのみ・CLI/IDE 拡張のみ・両方・停止を区別し、
+終了が必要なものを拒否文に出し分ける。WindowsApps の OpenAI.Codex パッケージ内の codex.exe はアプリ側へ分類する。
+既存の daemon 除外と Claude Desktop の判定・文言は維持する。ChatGPT の確認本文とマニュアルにも、CLI/IDE 拡張の終了が必要な理由を明記する。
+
+### C. 独立レビューの Codex P2 対応: modal 下の入力経路を統一
+
+4 件目の未コミット差分に対する独立レビューで、次の 2 件を採用した。
+AI 連携窓だけの guard は追加せず、他の `egui::Modal` にも同じ入力制限が働くよう vendored egui 側で修正する。
+
+- **P2-1 (表示前からのポインター捕捉)**: `Context::get_response` の共通入口で
+  `Memory::allows_interaction(layer_id)` が偽なら、操作の成立フラグと操作座標を返さない。
+  click / double-click / triple-click / long-touch、押下中、drag started / dragged / stopped を同じ判定に通す。
+  Context の捕捉を強制解除する方式は採らず、既存の捕捉 owner と終了処理を維持する。成立を返す場所で毎回判定するほうが、
+  押下開始時や modal の登場時だけに依存せず単純で、Window / Area の移動・resize の Response にも共通して効く。
+  enabled / visible などの描画状態は保ち、fade を再導入しない。
+  Modal の前 pass を使う既存の層順契約は変えず、`allows_interaction` が偽の時点で成立を拒否する。
+  実 checkbox の押下中に実登録ボタンを Enter で開いてから解放し、設定と保存済み権限・epoch が不変であること、
+  実 Window の移動・縦 resize 中に確認を開いた後は移動・解放しても矩形が変わらないことを回帰にする。
+  modal が無い場合の実 click と保存、および確認窓のコピー・キャンセルを正の対照にする。
+- **P2-2 (widget による AccessKit 値変更の先行適用)**: 全直接 consumer を検索し、
+  `Ui::discard_blocked_accesskit_actions` に対象 ID の要求を消費・破棄する処理を集約する。
+  TextEdit はイベント複製前、他の widget も値・選択・サイズを適用する前に呼ぶ。modal 外の enabled 判定は従来のまま。
+  また、cached AccessKit Focus は widget 登録より先に採用されるため、同じ共通処理で `ignore_focus(id)` も前倒しする。
+  前 pass の widget の有無には依存せず、再表示する widget 自身の実際の所属層で判定する。
+  これにより Focus と Text を同じ frame で送っても、背面の TextEdit / DragValue の先行入力処理へ届かない。
+  一度表示してから 1 frame 隠し、modal 下に再表示するときの stale Focus も、非 modal の正の対照と併せて検査する。
+
+`rg` による AccessKit consumer 棚卸しと対応範囲:
+
+| consumer | 処理と制限を置く位置 |
+|---|---|
+| `widgets/text_edit/builder.rs` | SetValue / ReplaceSelectedText / SetTextSelection。ID 決定後、filtered events の複製前 |
+| `widgets/drag_value.rs` | Increment / Decrement / 数値 SetValue。値操作前 |
+| `widgets/slider_core.rs` | Slider と RangeSlider の Increment / Decrement / 数値 SetValue。共通値操作前 |
+| `containers/panel.rs` | resize の Increment / Decrement / SetValue。サイズ操作前 |
+| `text_selection/cursor_range.rs` の SetTextSelection | 呼び元の TextEdit と `label_text_selection.rs` で制限 |
+| `text_selection/label_text_selection.rs` | AccessKit 要求を plugin lock 前に破棄。独自の既存ドラッグ捕捉と raw キーによる選択・scroll も同じ層判定で停止し、選択の描画は維持 |
+| `context.rs` / `memory/mod.rs` | 既存 Click / scroll 制限に加え、Response 成立を制限。Focus の先行採用は各 consumer の共通 Ui 処理で取り消す |
+
+### 初回検証記録 (P2 追補前)
+
+実装担当、`v5-integration` / `c4d4d713a` 上の未コミット差分。製品起動・commit は行っていない。
+
+| 検査 | 結果 |
+|---|---|
+| 指定 focused nextest | exit 0、251 / 251 成功。`target/agent-modal-running-focused-final.log` |
+| `UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot agent_` と更新指定なしの同じ比較 | 各 exit 0、11 / 11 成功。`target/agent-modal-snapshot-update.log` / `target/agent-modal-snapshot-compare.log` |
+| standalone egui の全 lib test (全体 gate と同じ nextest 設定) | exit 0、171 / 171 成功。`target/agent-modal-egui.log` |
+| `scripts/test-full.ps1` | workspace は完走、exit 100、18,434 成功・4 失敗・77 skipped。全失敗が名前付きパイプのアクセス拒否 (OS error 5)。`target/agent-modal-full.log` |
+| glyph / `cargo fmt` / root と egui の `cargo fmt --check` / 差分の空白検査 | 成功。危険な glyph 0 件 |
+| 独立レビュー | A/B とも ACCEPT、P1/P2 残件なし。上記 focused と snapshot の成功結果を再利用 |
+| `build-dev.ps1 -PreserveRuntime` | exit 0。core と補助 4 バイナリを更新し、VCRT 検査も成功。起動していない。`target/agent-modal-build-dev.log` |
+
+PNG の変更は `agent_registration_confirmation_small_light.png` 1 枚 (64,823 → 64,509 bytes) のみ。
+既存の AI 連携窓 10 枚はバイト同一。確認 PNG の RGB は全画素同一、元から不透明な窓の 113,344 画素は RGBA 同一で、
+外側の alpha が 0 → 100、影などの半透明部分も黒 alpha 100 の合成だけになった。白地へ合成した画像でも目視し、本文と配置に差がないことを確認した。
+
+全体 gate の未成功 4 件は `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry`、
+`agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`、MCP server の
+`pipe::tests::real_pipe_cancel_reaches_core_while_stdio_stdout_is_blocked` と
+`pipe::tests::real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld`。
+いずれも fixture の名前付きパイプ作成・接続時のアクセス拒否で、タイムアウトはなかった。
+スクリプトは workspace の失敗で停止したため、後続の doctest と vendor gate は未実行 (変更した egui の 171 件は上記で別途実行)。
+全体 gate を成功と扱わず、sandbox 外での補完を検収担当へ引き継ぐ。
+
+### P2 追補の検証記録
+
+同じ未コミット差分に追加し、上記初回結果とは区別する。製品起動・commit・ブランチ切替は行っていない。
+
+| 検査 | 結果 |
+|---|---|
+| standalone egui の全 lib test | exit 0、187 / 187 成功 (新規 16 件を含む)。`target/agent-modal-p2-egui.log` |
+| 指定 focused nextest | exit 0、253 / 253 成功。新規 app 回帰 2 件と既存の小画面・200%・IME・クリック到達性を含む。`target/agent-modal-p2-focused.log` |
+| `cargo test --test ui_snapshot agent_` (更新指定なし) | exit 0、11 / 11 成功。今回の追補前後で PNG 11 枚の SHA-256 は全て同一。`target/agent-modal-p2-snapshot.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険な glyph 0 件。`target/agent-modal-p2-glyph.log` |
+| `cargo fmt`、root / egui の `cargo fmt --check`、差分の空白検査 | 成功 |
+| 独立レビュー | P2-1 / P2-2 とも ACCEPT、P1/P2 残件なし。上記成功結果を再利用 |
+
+新規 vendor 回帰は捕捉済みポインターの成立フラグ、AccessKit の値・選択・数値・Panel resize、
+cached / 再表示時の Focus、選択可能ラベルの捕捉・キー・Escape を検査し、modal 内と非 modal の正の対照を置いた。
+新規 fixture の出力破棄漏れと初回サイズ計測・Panel 自然幅の不備は修正し、製品側の条件や期待値は緩和していない。
+今回は指定どおり `build-dev` を実行していない。前回の全体 gate の名前付きパイプ 4 件と後続 gate の sandbox 外補完は残る。
+
+再レビューの Codex P2 対応: 許可層のラベルで新しい選択を開始するとき、背面の旧選択と `granular_drag` を破棄して新規に初期化する。同じ層・非 modal の単語／行選択は維持し、実 double/triple click の回帰を含む egui 188/188、指定 focused 253/253、fmt 検査が成功 (`target/agent-modal-anchor-egui.log` / `target/agent-modal-anchor-focused.log`)。独立レビュー ACCEPT、製品起動・commit は行っていない。

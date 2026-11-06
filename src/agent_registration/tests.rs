@@ -786,54 +786,176 @@ fn codex_detection_and_config_home_are_independent() {
 #[test]
 fn process_paths_guard_desktop_and_shared_codex_without_confusing_claude_code() {
     let (_temp, env) = fixture();
-    let images = |s: &str| vec![(10, PathBuf::from(s))];
-    assert!(!app_is_running(
-        &env,
-        AppTarget::ClaudeDesktop,
-        &images(r"C:\Users\a\.local\bin\claude.exe")
-    ));
-    assert!(!app_is_running(
-        &env,
-        AppTarget::ClaudeDesktop,
-        &[(
-            10,
+    for (target, path, expected) in [
+        (
+            AppTarget::ClaudeDesktop,
+            PathBuf::from(r"C:\Users\a\.local\bin\claude.exe"),
+            RunningApps::Stopped,
+        ),
+        (
+            AppTarget::ClaudeDesktop,
             env.local_app_data
                 .as_ref()
                 .unwrap()
-                .join("AnthropicClaude-other/claude.exe")
-        )]
-    ));
-    assert!(app_is_running(
-        &env,
-        AppTarget::ClaudeDesktop,
-        &[(
-            10,
+                .join("AnthropicClaude-other/claude.exe"),
+            RunningApps::Stopped,
+        ),
+        (
+            AppTarget::ClaudeDesktop,
             env.local_app_data
                 .as_ref()
                 .unwrap()
-                .join("AnthropicClaude/app-1/Claude.exe")
-        )]
-    ));
-    assert!(app_is_running(
-        &env,
-        AppTarget::ClaudeDesktop,
-        &images(r"C:\Program Files\WindowsApps\Claude_one\app\Claude.exe")
-    ));
-    assert!(app_is_running(
-        &env,
-        AppTarget::ChatGpt,
-        &images(r"C:\Program Files\WindowsApps\OpenAI.Codex_one\app\ChatGPT.exe")
-    ));
-    assert!(app_is_running(
-        &env,
-        AppTarget::ChatGpt,
-        &images(r"C:\tools\CODEX.EXE")
-    ));
-    assert!(!app_is_running(
-        &env,
-        AppTarget::ChatGpt,
-        &images(r"C:\tools\codex-other.exe")
-    ));
+                .join("AnthropicClaude/app-1/Claude.exe"),
+            RunningApps::App,
+        ),
+        (
+            AppTarget::ClaudeDesktop,
+            PathBuf::from(r"C:\Program Files\WindowsApps\Claude_one\app\Claude.exe"),
+            RunningApps::App,
+        ),
+        (
+            AppTarget::ChatGpt,
+            PathBuf::from(r"C:\Program Files\WindowsApps\OpenAI.Codex_one\app\ChatGPT.exe"),
+            RunningApps::App,
+        ),
+        (
+            AppTarget::ChatGpt,
+            PathBuf::from(r"C:\Program Files\WindowsApps\OpenAI.Codex_one\app\codex.exe"),
+            RunningApps::App,
+        ),
+        (
+            AppTarget::ChatGpt,
+            PathBuf::from(r"C:\tools\CODEX.EXE"),
+            RunningApps::CodexCliOrIde,
+        ),
+        (
+            AppTarget::ChatGpt,
+            PathBuf::from(r"C:\Users\fixture\.vscode\extensions\openai.chatgpt\bin\codex.exe"),
+            RunningApps::CodexCliOrIde,
+        ),
+        (
+            AppTarget::ChatGpt,
+            PathBuf::from(r"C:\tools\codex-other.exe"),
+            RunningApps::Stopped,
+        ),
+    ] {
+        assert_eq!(
+            running_apps(&env, target, &[(10, path.clone())]),
+            expected,
+            "{}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn running_app_classification_and_writer_errors_preserve_config_and_backup() {
+    let (_temp, env) = fixture();
+    let daemon = env
+        .user_profile
+        .as_ref()
+        .unwrap()
+        .join(".codex/packages/app-server-daemon/1/bin/codex.exe");
+    let desktop = PathBuf::from(r"C:\Program Files\WindowsApps\OpenAI.Codex_one\app\ChatGPT.exe");
+    let packaged_codex =
+        PathBuf::from(r"C:\Program Files\WindowsApps\OpenAI.Codex_one\app\codex.exe");
+    let npm_codex = PathBuf::from(
+        "C:/Users/fixture/AppData/Roaming/npm/node_modules/@openai/codex/vendor/x86_64-pc-windows-msvc/codex/codex.exe",
+    );
+    let claude = env
+        .local_app_data
+        .as_ref()
+        .unwrap()
+        .join("AnthropicClaude/app-1/Claude.exe");
+    let path = env.working_dir.join("config");
+    let backup = env.working_dir.join("config.mimageviewer.bak");
+    let command = env.resolve_command().unwrap();
+    for (target, paths, expected, message) in [
+        (
+            AppTarget::ChatGpt,
+            vec![desktop.clone()],
+            RunningApps::App,
+            Some("ChatGPT (Codex) を終了してから押してください"),
+        ),
+        (
+            AppTarget::ChatGpt,
+            vec![packaged_codex],
+            RunningApps::App,
+            Some("ChatGPT (Codex) を終了してから押してください"),
+        ),
+        (
+            AppTarget::ChatGpt,
+            vec![npm_codex.clone()],
+            RunningApps::CodexCliOrIde,
+            Some(
+                "Codex CLI または IDE 拡張 (codex.exe) が動作中です。同じ設定ファイルを使うため、終了してから押してください",
+            ),
+        ),
+        (
+            AppTarget::ChatGpt,
+            vec![desktop, npm_codex.clone()],
+            RunningApps::AppAndCodexCliOrIde,
+            Some(
+                "ChatGPT (Codex) と、Codex CLI または IDE 拡張 (codex.exe) を終了してから押してください",
+            ),
+        ),
+        (
+            AppTarget::ChatGpt,
+            vec![daemon.clone()],
+            RunningApps::Stopped,
+            None,
+        ),
+        (
+            AppTarget::ChatGpt,
+            vec![daemon, npm_codex],
+            RunningApps::CodexCliOrIde,
+            Some(
+                "Codex CLI または IDE 拡張 (codex.exe) が動作中です。同じ設定ファイルを使うため、終了してから押してください",
+            ),
+        ),
+        (AppTarget::ChatGpt, vec![], RunningApps::Stopped, None),
+        (
+            AppTarget::ClaudeDesktop,
+            vec![claude],
+            RunningApps::App,
+            Some("Claude Desktop を終了してから押してください"),
+        ),
+    ] {
+        let images: Vec<_> = paths
+            .into_iter()
+            .enumerate()
+            .map(|(pid, path)| (pid as u32 + 10, path))
+            .collect();
+        assert_eq!(running_apps(&env, target, &images), expected);
+        let reversed: Vec<_> = images.iter().rev().cloned().collect();
+        assert_eq!(running_apps(&env, target, &reversed), expected);
+        let original = match target {
+            AppTarget::ChatGpt => "# retained\nmodel = 'keep'\n",
+            AppTarget::ClaudeDesktop => r#"{"retained":true}"#,
+        };
+        fs::write(&path, original).unwrap();
+        fs::write(&backup, "previous backup").unwrap();
+        let request = WriteRequest {
+            target,
+            path: path.clone(),
+            action: Action::Register,
+            command: command.clone(),
+            change: RegistrationChange::Add,
+        };
+        let result = write_with_processes(&env, &request, || Ok(images));
+        if let Some(message) = message {
+            assert_eq!(result.unwrap_err(), message);
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            assert_eq!(fs::read_to_string(&backup).unwrap(), "previous backup");
+        } else {
+            result.unwrap();
+            assert_eq!(
+                config::state(target, &fs::read_to_string(&path).unwrap(), Some(&command)).unwrap(),
+                RegistrationState::Registered
+            );
+            assert_eq!(fs::read_to_string(&backup).unwrap(), original);
+        }
+    }
 }
 
 #[test]
@@ -842,7 +964,7 @@ fn codex_daemon_exclusion_uses_normalized_components_under_the_current_home_only
     let profile = env.user_profile.as_ref().unwrap().clone();
     let default_home = profile.join(".codex");
     let running = |env: &RegistrationEnvironment, path: PathBuf| {
-        app_is_running(env, AppTarget::ChatGpt, &[(10, path)])
+        running_apps(env, AppTarget::ChatGpt, &[(10, path)]) != RunningApps::Stopped
     };
     let daemon = default_home.join("packages/app-server-daemon/1/bin/codex.exe");
     assert!(!running(&env, daemon.clone()));

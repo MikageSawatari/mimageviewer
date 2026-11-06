@@ -20,6 +20,25 @@ fn painted_text(output: &egui::FullOutput) -> Vec<&egui::epaint::TextShape> {
     texts
 }
 
+fn painted_rects(output: &egui::FullOutput) -> Vec<&egui::epaint::RectShape> {
+    fn collect<'a>(shape: &'a egui::Shape, rects: &mut Vec<&'a egui::epaint::RectShape>) {
+        match shape {
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect(shape, rects);
+                }
+            }
+            egui::Shape::Rect(rect) => rects.push(rect),
+            _ => {}
+        }
+    }
+    let mut rects = Vec::new();
+    for shape in &output.shapes {
+        collect(&shape.shape, &mut rects);
+    }
+    rects
+}
+
 #[test]
 fn exposure_descriptions_are_left_aligned_without_justification_and_still_wrap() {
     for theme in [
@@ -420,6 +439,13 @@ fn app_harness_at_size(
         .with_size(size)
         .build_ui_state(
             |root, app| {
+                if root.button("メインのテスト操作").clicked() {
+                    root.ctx().data_mut(|data| {
+                        let id = egui::Id::unique("agent_test_main_clicks");
+                        let count = data.get_temp::<usize>(id).unwrap_or(0);
+                        data.insert_temp(id, count + 1);
+                    });
+                }
                 app.update_ime_state(root.ctx());
                 app.show_agent_integration_dialog(&root.ctx().clone());
             },
@@ -581,9 +607,10 @@ fn agent_registration_confirmation_shows_worker_summary_and_path_without_config_
                 );
             harness.run_steps(5);
             let summary_rect = harness.get_by_label(summary).rect();
-            let instruction = harness
-                .get_by_label(&format!("{} を終了してから進めてください。", target.name()))
-                .rect();
+            let instruction = harness.get_by_label(match target {
+                AppTarget::ClaudeDesktop => "Claude Desktop を終了してから進めてください。",
+                AppTarget::ChatGpt => "ChatGPT (Codex) を終了してから進めてください。Codex CLI・IDE 拡張も同じ設定ファイルを使うので、使っている場合は終了してください。",
+            }).rect();
             let path_rect = harness.get_by_label(&path).rect();
             let backup = harness
                 .get_by_label(
@@ -723,8 +750,515 @@ fn agent_registration_cancel_button_enter_and_unfocused_escape_only_dismiss() {
 }
 
 #[test]
+fn agent_registration_modal_layer_backdrop_and_window_opacity_survive_writing_and_reopen() {
+    for theme in [
+        crate::os_theme::ResolvedTheme::Light,
+        crate::os_theme::ResolvedTheme::Dark,
+    ] {
+        let mut harness = app_harness_at_size(egui::vec2(1600.0, 1600.0));
+        crate::os_theme::apply_resolved(&harness.ctx, theme);
+        harness.run_steps(20);
+        let background = egui::LayerId::new(
+            egui::Order::Middle,
+            egui::Id::new("agent_integration_dialog"),
+        );
+        let backdrop = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::unique("agent_registration_backdrop"),
+        );
+        let confirmation = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("agent_registration_confirmation"),
+        );
+        let fill = egui::Frame::window(&harness.ctx.style_of(match theme {
+            crate::os_theme::ResolvedTheme::Light => egui::Theme::Light,
+            crate::os_theme::ResolvedTheme::Dark => egui::Theme::Dark,
+        }))
+        .fill;
+        let registered_colors: Vec<_> = painted_text(harness.output())
+            .iter()
+            .filter(|text| text.galley.job.text == "登録済み")
+            .map(|text| text.fallback_color)
+            .collect();
+        assert_eq!(registered_colors.len(), 2);
+        let backdrop_color = egui::Modal::new(backdrop.id).backdrop_color;
+        let (tx, rx) = mpsc::channel();
+        let mut receiver = Some(rx);
+        for writing in [false, true] {
+            let state = harness
+                .state_mut()
+                .agent_integration_dialog
+                .as_mut()
+                .unwrap();
+            if writing {
+                state.operation = Some(RegistrationOperation::Writing {
+                    target: AppTarget::ClaudeDesktop,
+                    rx: receiver.take().unwrap(),
+                });
+            } else {
+                state.confirm(AppTarget::ClaudeDesktop, Action::Register, 0);
+            }
+            harness.run_steps(12);
+            assert!(harness.state().common_modal_dialog_open());
+            let layers: Vec<_> = harness.ctx.memory(|memory| memory.layer_ids().collect());
+            let at = |layer| {
+                layers
+                    .iter()
+                    .position(|candidate| *candidate == layer)
+                    .unwrap()
+            };
+            assert!(at(background) < at(backdrop));
+            assert_eq!(at(backdrop) + 1, at(confirmation));
+            assert_eq!(
+                harness.ctx.memory(|memory| memory.top_modal_layer()),
+                Some(backdrop)
+            );
+            assert!(
+                !harness
+                    .ctx
+                    .memory(|memory| memory.allows_interaction(background))
+            );
+            assert!(
+                harness
+                    .ctx
+                    .memory(|memory| memory.allows_interaction(confirmation))
+            );
+            let rects = painted_rects(harness.output());
+            assert!(
+                rects
+                    .iter()
+                    .any(|rect| rect.rect == harness.ctx.content_rect()
+                        && rect.fill == backdrop_color),
+                "native Modal backdrop must cover the full viewport"
+            );
+            for layer in [background, confirmation] {
+                let window = harness
+                    .ctx
+                    .memory(|memory| memory.area_rect(layer.id))
+                    .unwrap();
+                assert!(
+                    rects
+                        .iter()
+                        .any(|rect| (rect.rect.left() - window.left()).abs() <= 1.0
+                            && (rect.rect.width() - window.width()).abs() <= 1.0
+                            && (rect.rect.height() - window.height()).abs() <= 1.0
+                            && rect.fill == fill),
+                    "Window frame must stay opaque: writing={writing}, window={window:?}"
+                );
+            }
+            let colors: Vec<_> = painted_text(harness.output())
+                .iter()
+                .filter(|text| text.galley.job.text == "登録済み")
+                .map(|text| text.fallback_color)
+                .collect();
+            assert_eq!(
+                colors, registered_colors,
+                "registration section must not be faded either"
+            );
+            for label in ["書き換える", "キャンセル"] {
+                assert_eq!(
+                    harness.get_by_label(label).accesskit_node().is_disabled(),
+                    writing
+                );
+            }
+            if writing {
+                let window = harness
+                    .ctx
+                    .memory(|memory| memory.area_rect(confirmation.id))
+                    .unwrap();
+                let close = harness
+                    .get_all_by_label("Close window")
+                    .find(|node| window.contains_rect(node.rect()))
+                    .unwrap();
+                assert!(close.accesskit_node().is_disabled());
+                let position = close.rect().center();
+                click_at(&mut harness, position);
+                for label in ["書き換える", "キャンセル"] {
+                    let position = harness.get_by_label(label).rect().center();
+                    click_at(&mut harness, position);
+                }
+                assert!(harness.state().agent_registration_dialog_open());
+                assert_eq!(mock_writes(&harness), 0);
+            }
+        }
+        tx.send(Err("injected failure".into())).unwrap();
+        harness.run_steps(5);
+        assert!(!harness.state().common_modal_dialog_open());
+        harness
+            .state_mut()
+            .agent_integration_dialog
+            .as_mut()
+            .unwrap()
+            .confirm(AppTarget::ClaudeDesktop, Action::Register, 0);
+        harness.run_steps(5);
+        let layers: Vec<_> = harness.ctx.memory(|memory| memory.layer_ids().collect());
+        assert_eq!(
+            layers.iter().position(|layer| *layer == backdrop).unwrap() + 1,
+            layers
+                .iter()
+                .position(|layer| *layer == confirmation)
+                .unwrap()
+        );
+        harness.key_press(egui::Key::Escape);
+        harness.run_steps(3);
+        assert!(!harness.state().agent_registration_dialog_open());
+        assert!(harness.state().agent_integration_dialog.is_some());
+    }
+}
+
+#[test]
+fn agent_registration_modal_rejects_accesskit_background_clicks_but_allows_confirmation() {
+    let mut harness = app_harness_at_size(egui::vec2(1600.0, 1600.0));
+    harness.run_steps(8);
+    harness
+        .state_mut()
+        .agent_integration_dialog
+        .as_mut()
+        .unwrap()
+        .mock_backend
+        .as_mut()
+        .unwrap()
+        .detection
+        .apps[0]
+        .message = Some("再確認が動いた".into());
+    harness
+        .state_mut()
+        .agent_integration_dialog
+        .as_mut()
+        .unwrap()
+        .confirm(AppTarget::ClaudeDesktop, Action::Register, 0);
+    harness.run_steps(5);
+    for label in [
+        "縮小画像を AI に見せる",
+        "閉じる",
+        "メインのテスト操作",
+        "再確認",
+    ] {
+        harness
+            .get_all_by_label(label)
+            .next()
+            .unwrap()
+            .click_accesskit();
+        harness.run_steps(2);
+        assert!(harness.state().agent_registration_dialog_open());
+        assert!(!harness.state().settings.agent_show_thumbnails);
+        assert!(harness.query_by_label("再確認が動いた").is_none());
+        assert_eq!(
+            harness
+                .ctx
+                .data(|data| data.get_temp::<usize>(egui::Id::unique("agent_test_main_clicks")))
+                .unwrap_or(0),
+            0
+        );
+    }
+    harness.get_by_label("コピー").click_accesskit();
+    harness.run_steps(1);
+    assert!(
+        harness
+            .output()
+            .platform_output
+            .commands
+            .iter()
+            .any(|command| matches!(command, egui::OutputCommand::CopyText(_)))
+    );
+    harness.get_by_label("キャンセル").click_accesskit();
+    harness.run_steps(3);
+    assert!(!harness.state().agent_registration_dialog_open());
+    assert!(harness.state().agent_integration_dialog.is_some());
+}
+
+#[test]
+fn agent_registration_modal_rejects_accesskit_background_scrolls_but_allows_confirmation() {
+    let mut harness = app_harness_at_size(egui::vec2(1093.0, 614.0));
+    harness.run_steps(8);
+    let state = harness
+        .state_mut()
+        .agent_integration_dialog
+        .as_mut()
+        .unwrap();
+    if let DetectionState::Ready(_, detection) = &mut state.detection {
+        detection.apps[0].config_paths = vec![PathBuf::from(format!(
+            r"C:\{}\config.json",
+            "長いフォルダ名\\".repeat(100)
+        ))];
+    }
+    state.confirm(AppTarget::ClaudeDesktop, Action::Register, 0);
+    harness.run_steps(8);
+    let background = harness
+        .state()
+        .agent_integration_dialog
+        .as_ref()
+        .unwrap()
+        .page_scroll
+        .unwrap();
+    let confirmation = harness
+        .state()
+        .agent_integration_dialog
+        .as_ref()
+        .unwrap()
+        .dialog_scroll
+        .unwrap();
+    confirmation.assert_height(
+        crate::test_ui::scroll_layout::HeightExpectation::Scrolls,
+        harness.ctx.content_rect(),
+        harness.ctx.pixels_per_point(),
+    );
+    for (label, action) in [
+        (
+            "縮小画像を AI に見せる",
+            egui::accesskit::Action::ScrollDown,
+        ),
+        ("再確認", egui::accesskit::Action::ScrollIntoView),
+    ] {
+        let (target_node, target_tree) = harness
+            .get_all_by_label(label)
+            .next()
+            .unwrap()
+            .accesskit_node()
+            .locate();
+        harness.event(egui::Event::AccessKitActionRequest(
+            egui::accesskit::ActionRequest {
+                target_node,
+                target_tree,
+                action,
+                data: None,
+            },
+        ));
+        harness.run_steps(8);
+        let state = harness.state().agent_integration_dialog.as_ref().unwrap();
+        assert_eq!(state.page_scroll.unwrap().offset, background.offset);
+        assert_eq!(state.dialog_scroll.unwrap().offset, confirmation.offset);
+    }
+    // The same accessibility actions must still scroll the active modal body.
+    let backup = "書き換え前の内容は、同じ場所に .mimageviewer.bak を付けた名前で残します。";
+    for action in [
+        egui::accesskit::Action::ScrollDown,
+        egui::accesskit::Action::ScrollIntoView,
+    ] {
+        let before = harness
+            .state()
+            .agent_integration_dialog
+            .as_ref()
+            .unwrap()
+            .dialog_scroll
+            .unwrap()
+            .offset;
+        let (target_node, target_tree) = harness.get_by_label(backup).accesskit_node().locate();
+        harness.event(egui::Event::AccessKitActionRequest(
+            egui::accesskit::ActionRequest {
+                target_node,
+                target_tree,
+                action,
+                data: None,
+            },
+        ));
+        harness.run_steps(8);
+        let state = harness.state().agent_integration_dialog.as_ref().unwrap();
+        assert!(
+            state.dialog_scroll.unwrap().offset.y > before.y,
+            "{action:?}"
+        );
+        assert_eq!(state.page_scroll.unwrap().offset, background.offset);
+    }
+}
+
+#[test]
+fn agent_registration_modal_rejects_a_checkbox_release_captured_before_opening() {
+    for modal in [false, true] {
+        let mut harness = app_harness_at_size(egui::vec2(1600.0, 1600.0));
+        assert!(harness.state().settings.save_checked());
+        let read_saved =
+            || crate::settings_db::with_db_result(|db| db.load_agent_permission()).unwrap();
+        let saved = read_saved();
+        let before = harness.state().settings.agent_show_thumbnails;
+        harness.run_steps(8);
+        let checkbox = harness
+            .get_by_label("縮小画像を AI に見せる")
+            .rect()
+            .center();
+        harness.hover_at(checkbox);
+        harness.run_steps(1);
+        harness.drag_at(checkbox);
+        harness.run_steps(1);
+        assert!(harness.ctx.input(|input| input.pointer.primary_down()));
+        if modal {
+            // Open through the real registration button while the checkbox's
+            // pointer capture remains held, then release after the modal shows.
+            harness.get_all_by_label("登録する").next().unwrap().focus();
+            harness.run_steps(1);
+            harness.key_press(egui::Key::Enter);
+            harness.run_steps(3);
+            assert_confirming(&harness);
+        }
+        harness.drop_at(checkbox);
+        harness.run_steps(3);
+        assert_eq!(
+            harness.state().settings.agent_show_thumbnails,
+            if modal { before } else { !before }
+        );
+        if modal {
+            assert_eq!(
+                read_saved(),
+                saved,
+                "blocked release must not save permissions or advance their epoch"
+            );
+            harness.get_by_label("コピー").click();
+            harness.run_steps(1);
+            assert!(
+                harness
+                    .output()
+                    .platform_output
+                    .commands
+                    .iter()
+                    .any(|command| matches!(command, egui::OutputCommand::CopyText(_)))
+            );
+            harness.get_by_label("キャンセル").click();
+            harness.run_steps(2);
+            assert!(!harness.state().agent_registration_dialog_open());
+            assert!(harness.state().agent_integration_dialog.is_some());
+            assert_eq!(read_saved(), saved);
+        } else {
+            assert_ne!(
+                read_saved(),
+                saved,
+                "positive control must exercise the real permission save path"
+            );
+        }
+    }
+}
+
+#[test]
+fn agent_registration_modal_stops_window_move_and_resize_captured_before_opening() {
+    let window_id = egui::Id::new("agent_integration_dialog");
+    for resize in [false, true] {
+        let mut harness = app_harness_at_size(egui::vec2(1600.0, 1600.0));
+        harness.run_steps(8);
+        let original = harness
+            .ctx
+            .memory(|memory| memory.area_rect(window_id))
+            .unwrap();
+        let (start, delta) = if resize {
+            (
+                egui::pos2(original.center().x, original.bottom() - 1.0),
+                egui::vec2(0.0, -40.0),
+            )
+        } else {
+            (
+                egui::pos2(original.center().x, original.top() + 10.0),
+                egui::vec2(35.0, 30.0),
+            )
+        };
+        harness.hover_at(start);
+        harness.run_steps(1);
+        harness.drag_at(start);
+        harness.run_steps(1);
+        let held = start + delta;
+        harness.hover_at(held);
+        harness.run_steps(3);
+        let dragged = harness
+            .ctx
+            .memory(|memory| memory.area_rect(window_id))
+            .unwrap();
+        assert_ne!(
+            dragged, original,
+            "fixture must begin a real window drag: resize={resize}"
+        );
+        harness
+            .state_mut()
+            .agent_integration_dialog
+            .as_mut()
+            .unwrap()
+            .confirm(AppTarget::ClaudeDesktop, Action::Register, 0);
+        harness.run_steps(3);
+        assert_confirming(&harness);
+        let blocked = harness
+            .ctx
+            .memory(|memory| memory.area_rect(window_id))
+            .unwrap();
+        harness.hover_at(held + delta * 2.0);
+        harness.run_steps(3);
+        assert_eq!(
+            harness
+                .ctx
+                .memory(|memory| memory.area_rect(window_id))
+                .unwrap(),
+            blocked,
+            "held drag must stop: resize={resize}"
+        );
+        harness.drop_at(held + delta * 2.0);
+        harness.run_steps(3);
+        assert_eq!(
+            harness
+                .ctx
+                .memory(|memory| memory.area_rect(window_id))
+                .unwrap(),
+            blocked,
+            "release must not move or resize: resize={resize}"
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(2);
+        assert!(!harness.state().agent_registration_dialog_open());
+        assert!(harness.state().agent_integration_dialog.is_some());
+    }
+}
+
+#[test]
+fn agent_registration_modal_tab_space_enter_cannot_activate_background_controls() {
+    for key in [egui::Key::Space, egui::Key::Enter] {
+        let mut harness = app_harness_at_size(egui::vec2(1600.0, 1600.0));
+        harness.run_steps(8);
+        harness
+            .state_mut()
+            .agent_integration_dialog
+            .as_mut()
+            .unwrap()
+            .mock_backend
+            .as_mut()
+            .unwrap()
+            .detection
+            .apps[0]
+            .message = Some("再確認が動いた".into());
+        harness.get_by_label("縮小画像を AI に見せる").focus();
+        harness.run_steps(1);
+        harness
+            .state_mut()
+            .agent_integration_dialog
+            .as_mut()
+            .unwrap()
+            .confirm(AppTarget::ClaudeDesktop, Action::Register, 0);
+        harness.run_steps(5);
+        let foreground = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("agent_registration_confirmation"),
+        );
+        harness.key_press(egui::Key::Tab);
+        harness.run_steps(2);
+        let focus = harness
+            .ctx
+            .memory(|memory| memory.focused())
+            .expect("Tab must enter the confirmation");
+        assert_eq!(
+            harness.ctx.read_response(focus).unwrap().layer_id,
+            foreground
+        );
+        harness.key_press(key);
+        harness.run_steps(4);
+        assert!(harness.state().agent_integration_dialog.is_some());
+        assert!(!harness.state().settings.agent_show_thumbnails);
+        assert!(harness.query_by_label("再確認が動いた").is_none());
+        assert_eq!(
+            harness
+                .ctx
+                .data(|data| data.get_temp::<usize>(egui::Id::unique("agent_test_main_clicks")))
+                .unwrap_or(0),
+            0
+        );
+    }
+}
+
+#[test]
 fn agent_registration_confirmation_and_writing_block_backdrop_settings_and_x() {
-    let mut harness = app_harness_at_size(egui::vec2(1600.0, 1000.0));
+    let mut harness = app_harness_at_size(egui::vec2(1600.0, 1600.0));
     harness.run_steps(4);
     let thumbnail = harness
         .get_by_label("縮小画像を AI に見せる")
@@ -732,6 +1266,24 @@ fn agent_registration_confirmation_and_writing_block_backdrop_settings_and_x() {
         .center();
     let close = harness.get_by_label("Close window").rect().center();
     let footer_close = harness.get_by_label("閉じる").rect().center();
+    let main_button = harness.get_by_label("メインのテスト操作").rect().center();
+    let recheck = harness
+        .get_all_by_label("再確認")
+        .next()
+        .unwrap()
+        .rect()
+        .center();
+    harness
+        .state_mut()
+        .agent_integration_dialog
+        .as_mut()
+        .unwrap()
+        .mock_backend
+        .as_mut()
+        .unwrap()
+        .detection
+        .apps[0]
+        .message = Some("再確認が動いた".into());
     harness
         .state_mut()
         .agent_integration_dialog
@@ -769,32 +1321,94 @@ fn agent_registration_confirmation_and_writing_block_backdrop_settings_and_x() {
             });
         }
         harness.run_steps(2);
-        assert!(
-            harness
-                .get_by_label("縮小画像を AI に見せる")
-                .accesskit_node()
-                .is_disabled()
+        let background = egui::LayerId::new(
+            egui::Order::Middle,
+            egui::Id::new("agent_integration_dialog"),
         );
         assert!(
-            harness
-                .get_all_by_label("Close window")
-                .any(|node| node.accesskit_node().is_disabled() && node.rect().center() == close)
+            !harness
+                .ctx
+                .memory(|memory| memory.allows_interaction(background))
         );
         assert!(
-            harness
-                .get_by_label("閉じる")
-                .accesskit_node()
-                .is_disabled()
+            !harness
+                .ctx
+                .memory(|memory| memory.allows_interaction(egui::LayerId::background()))
         );
         let foreground = harness
             .ctx
             .memory(|memory| memory.area_rect(modal_id))
             .unwrap();
-        for position in [thumbnail, close, footer_close] {
+        for position in [thumbnail, close, footer_close, main_button, recheck] {
             assert!(!foreground.contains(position), "backdrop must be uncovered");
             click_at(&mut harness, position);
             assert!(harness.state().agent_registration_dialog_open());
             assert!(!harness.state().settings.agent_show_thumbnails);
+            assert!(harness.query_by_label("再確認が動いた").is_none());
+            assert_eq!(
+                harness
+                    .ctx
+                    .data(|data| data.get_temp::<usize>(egui::Id::unique("agent_test_main_clicks")))
+                    .unwrap_or(0),
+                0
+            );
+        }
+        let scroll = harness
+            .state()
+            .agent_integration_dialog
+            .as_ref()
+            .unwrap()
+            .page_scroll
+            .unwrap();
+        let window = harness
+            .ctx
+            .memory(|memory| memory.area_rect(background.id))
+            .unwrap();
+        harness.event(egui::Event::PointerMoved(scroll.inner.center()));
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -1000.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
+        });
+        harness.run_steps(12);
+        assert_eq!(
+            harness
+                .state()
+                .agent_integration_dialog
+                .as_ref()
+                .unwrap()
+                .page_scroll
+                .unwrap()
+                .offset,
+            scroll.offset
+        );
+        for (start, end) in [
+            (
+                window.min + egui::vec2(70.0, 12.0),
+                window.min + egui::vec2(170.0, 62.0),
+            ),
+            (
+                window.right_bottom() - egui::vec2(2.0, 2.0),
+                window.right_bottom() - egui::vec2(80.0, 80.0),
+            ),
+        ] {
+            harness.hover_at(start);
+            harness.run_steps(1);
+            harness.drag_at(start);
+            harness.run_steps(1);
+            harness.hover_at(end);
+            harness.run_steps(2);
+            harness.drop_at(end);
+            harness.run_steps(2);
+            assert_eq!(
+                harness
+                    .ctx
+                    .memory(|memory| memory.area_rect(background.id))
+                    .unwrap(),
+                window
+            );
         }
     }
     tx.send(Err("injected failure".into())).unwrap();

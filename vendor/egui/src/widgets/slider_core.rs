@@ -497,6 +497,7 @@ pub fn value_at_pointer(
 ///
 /// Also locks the arrow keys along the slider's axis, so stepping does not move focus.
 pub fn keyboard_steps(ui: &Ui, response: &Response, geom: &SliderGeometry) -> f32 {
+    ui.discard_blocked_accesskit_actions(response.id);
     let orientation = geom.orientation;
     let mut decrement = 0usize;
     let mut increment = 0usize;
@@ -552,6 +553,7 @@ fn value_direction(geom: &SliderGeometry) -> f32 {
 ///
 /// The last request of the frame wins, as it did when this was a loop of `set_value` calls.
 pub fn accesskit_set_value_request(ui: &Ui, id: Id) -> Option<f64> {
+    ui.discard_blocked_accesskit_actions(id);
     ui.input(|input| {
         use accesskit::{Action, ActionData};
         input

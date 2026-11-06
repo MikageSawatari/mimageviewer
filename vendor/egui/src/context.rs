@@ -1719,12 +1719,19 @@ impl Context {
 
         self.write(|ctx| {
             use crate::{Align, pass_state::ScrollTarget, style::ScrollAnimation};
+            let allows_interaction = ctx.memory.allows_interaction(w.layer_id);
             let viewport = ctx.viewport_for(ctx.viewport_id());
 
             viewport
                 .input
                 .consume_accesskit_action_requests(res.id, |request| {
                     use accesskit::Action;
+
+                    // Modal layers own all input, including accessibility
+                    // scrolling/value actions that bypass pointer hit testing.
+                    if !allows_interaction {
+                        return true;
+                    }
 
                     // TODO(lucasmerlin): Correctly handle the scroll unit:
                     // https://github.com/AccessKit/accesskit/blob/e639c0e0d8ccbfd9dff302d972fa06f9766d608e/common/src/lib.rs#L2621
@@ -1909,6 +1916,12 @@ impl Context {
         res.flags.set(Flags::HIGHLIGHTED, highlighted);
 
         self.write(|ctx| {
+            // A capture can predate the modal. Check eligibility when producing
+            // every response, including releases and ongoing window/resize drags.
+            // Keep visual enabled state intact so blocked windows do not fade.
+            if !ctx.memory.allows_interaction(layer_id) {
+                return;
+            }
             let viewport = ctx.viewports.entry(ctx.viewport_id()).or_default();
 
             res.flags.set(
@@ -5510,6 +5523,87 @@ fn flatten_labelled_by(nodes: &mut [(accesskit::NodeId, accesskit::Node)]) {
 
 #[cfg(test)]
 mod ime_interrupt_tests;
+
+#[cfg(test)]
+mod modal_capture_response_tests {
+    use super::*;
+    use crate::PointerButton;
+
+    fn pass(ctx: &Context, events: Vec<crate::Event>, modal: bool) -> Response {
+        let mut response = None;
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                response = Some(ui.interact(
+                    Rect::from_min_size(Pos2::new(20.0, 20.0), Vec2::splat(100.0)),
+                    Id::unique("captured-before-modal"),
+                    Sense::click_and_drag(),
+                ));
+                if modal {
+                    crate::Modal::new(Id::unique("capture-modal")).show(ui.ctx(), |ui| {
+                        ui.label("Modal");
+                    });
+                }
+            },
+        )
+        .drop_without_applying_deltas();
+        response.unwrap()
+    }
+
+    #[test]
+    fn modal_rejects_pointer_response_flags_from_an_existing_capture() {
+        for modal in [false, true] {
+            for drag in [false, true] {
+                let ctx = Context::default();
+                let start = Pos2::new(40.0, 40.0);
+                let edge = |pos, pressed| crate::Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed,
+                    modifiers: Modifiers::NONE,
+                };
+                pass(&ctx, vec![], false);
+                let pressed = pass(
+                    &ctx,
+                    vec![crate::Event::PointerMoved(start), edge(start, true)],
+                    false,
+                );
+                assert!(pressed.is_pointer_button_down_on());
+                pass(&ctx, vec![], modal); // Display the modal while capture is held.
+                let end = if drag {
+                    start + Vec2::splat(30.0)
+                } else {
+                    start
+                };
+                let held = pass(&ctx, vec![crate::Event::PointerMoved(end)], modal);
+                assert!(
+                    held.enabled(),
+                    "modal blocking must preserve the visual enabled state"
+                );
+                assert_eq!(held.is_pointer_button_down_on(), !modal);
+                assert_eq!(held.dragged(), drag && !modal);
+                assert_eq!(held.drag_started(), drag && !modal);
+                if modal {
+                    assert!(held.interact_pointer_pos().is_none());
+                }
+                let released = pass(&ctx, vec![edge(end, false)], modal);
+                assert_eq!(released.clicked(), !drag && !modal);
+                assert_eq!(released.drag_stopped(), drag && !modal);
+                if modal {
+                    assert!(!released.double_clicked() && !released.triple_clicked());
+                    assert!(
+                        !released.long_touched() && !released.dragged() && !released.drag_started()
+                    );
+                    assert!(released.interact_pointer_pos().is_none());
+                }
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod viewport_retirement_tests;

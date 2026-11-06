@@ -524,7 +524,7 @@ fn draw_app(
     state: &mut AgentIntegrationState,
     target: AppTarget,
 ) {
-    ui.add_enabled_ui(state.operation.is_none(), |ui| {
+    ui.scope(|ui| {
     ui.push_id(target.name(), |ui| {
         let mut requested = None;
         match &state.detection {
@@ -718,7 +718,6 @@ fn draw_window(
         .max_size((screen.size() - egui::vec2(80.0, 80.0)).max(egui::vec2(100.0, 100.0)))
         .resizable(true)
         .collapsible(false)
-        .enabled(!blocked)
         .open(&mut open)
         .show(ctx, |ui| {
             ui.spacing_mut().scroll = panel_scroll_style();
@@ -763,6 +762,20 @@ fn draw_registration_dialog(
         return;
     };
     egui::Popup::close_all(ctx);
+    // Use egui's native modal input/focus boundary and its default backdrop.
+    // The empty frame is only a host: retain the resizable Window above it.
+    let backdrop =
+        egui::Modal::new(egui::Id::unique("agent_registration_backdrop")).frame(egui::Frame::NONE);
+    let backdrop_layer = backdrop.area.layer();
+    let confirmation_layer = egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("agent_registration_confirmation"),
+    );
+    // Unlike successive move_to_top calls, a sublayer guarantees adjacency
+    // even when the Window already existed before this modal was opened.
+    ctx.set_sublayer(backdrop_layer, confirmation_layer);
+    ctx.move_to_top(backdrop_layer);
+    backdrop.show(ctx, |_| {});
     let writing = matches!(operation, RegistrationOperation::Writing { .. });
     // A sizing/layout pass can show the new window again within the opening
     // frame. Its initiating key must never double as confirmation/cancellation.
@@ -783,7 +796,7 @@ fn draw_registration_dialog(
         .max_size((screen.size() - egui::vec2(48.0, 48.0)).max(egui::vec2(100.0, 100.0)))
         .collapsible(false)
         .resizable(true)
-        .enabled(!writing)
+        .close_button_enabled(!writing)
         .open(&mut open)
         .show(ctx, |ui| {
             let footer =
@@ -812,10 +825,10 @@ fn draw_registration_dialog(
                                 backend::RegistrationChange::Remove => "mIV の登録項目 (mimageviewer) を削除します。ほかの設定の値は変えません。",
                                 backend::RegistrationChange::Unchanged => "登録内容の変更はありません。",
                             }).wrap());
-                            ui.label(format!(
-                                "{} を終了してから進めてください。",
-                                request.target.name()
-                            ));
+                            ui.add(egui::Label::new(match request.target {
+                                AppTarget::ClaudeDesktop => "Claude Desktop を終了してから進めてください。",
+                                AppTarget::ChatGpt => "ChatGPT (Codex) を終了してから進めてください。Codex CLI・IDE 拡張も同じ設定ファイルを使うので、使っている場合は終了してください。",
+                            }).wrap());
                             selectable_copy(ui, &request.path.display().to_string());
                             ui.label("書き換え前の内容は、同じ場所に .mimageviewer.bak を付けた名前で残します。");
                         }
@@ -834,11 +847,11 @@ fn draw_registration_dialog(
             let _ = output;
             ui.separator();
             ui.horizontal_wrapped(|ui| {
-                let confirm = ui.button("書き換える");
+                let confirm = ui.add_enabled(!writing, egui::Button::new("書き換える"));
                 if registration_action_requested(&confirm, enter, keyboard_allowed, ime_active) {
                     submit = true;
                 }
-                let cancel_button = ui.button("キャンセル");
+                let cancel_button = ui.add_enabled(!writing, egui::Button::new("キャンセル"));
                 if registration_action_requested(
                     &cancel_button,
                     escape,

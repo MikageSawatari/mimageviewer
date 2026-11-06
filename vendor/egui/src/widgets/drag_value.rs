@@ -445,6 +445,7 @@ impl Widget for DragValue<'_> {
         let shift = ui.input(|i| i.modifiers.shift_only());
         // The widget has the same ID whether it's in edit or button mode.
         let id = ui.next_auto_id();
+        ui.discard_blocked_accesskit_actions(id);
         let is_slow_speed = shift && ui.ctx().is_being_dragged(id);
 
         // The following ensures that when a `DragValue` receives focus,

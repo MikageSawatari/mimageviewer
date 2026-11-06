@@ -1238,6 +1238,7 @@ impl Panel {
         outer_size: f32,
         available_size: f32,
     ) -> Option<f32> {
+        ui.discard_blocked_accesskit_actions(resize_id);
         let steps = ui.input(|input| {
             input.num_accesskit_action_requests(resize_id, accesskit::Action::Increment) as f32
                 - input.num_accesskit_action_requests(resize_id, accesskit::Action::Decrement)

@@ -342,11 +342,19 @@ fn normalized_components(path: &Path) -> Vec<String> {
     parts
 }
 
-pub(crate) fn app_is_running(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RunningApps {
+    Stopped,
+    App,
+    CodexCliOrIde,
+    AppAndCodexCliOrIde,
+}
+
+pub(crate) fn running_apps(
     env: &RegistrationEnvironment,
     target: AppTarget,
     images: &[(u32, PathBuf)],
-) -> bool {
+) -> RunningApps {
     let squirrel = env
         .local_app_data
         .as_deref()
@@ -363,7 +371,9 @@ pub(crate) fn app_is_running(
         })
         .and_then(Result::ok)
         .map(|home| normalized_components(&home.join("packages/app-server-daemon")));
-    images.iter().any(|(_, image)| {
+    let mut app = false;
+    let mut codex_cli_or_ide = false;
+    for (_, image) in images {
         let parts = normalized_components(image);
         let windows_package = |prefix: &str| {
             parts
@@ -372,21 +382,33 @@ pub(crate) fn app_is_running(
         };
         match target {
             AppTarget::ClaudeDesktop => {
-                squirrel
+                app |= squirrel
                     .as_ref()
                     .is_some_and(|root| parts.len() > root.len() && parts.starts_with(root))
-                    || windows_package("claude_")
+                    || windows_package("claude_");
             }
             AppTarget::ChatGpt => {
                 let is_daemon = codex_daemon
                     .as_ref()
                     .is_some_and(|root| parts.len() > root.len() && parts.starts_with(root));
-                !is_daemon
-                    && (parts.last().is_some_and(|p| p == "codex.exe")
-                        || windows_package("openai.codex_"))
+                if !is_daemon {
+                    // A package's codex.exe belongs to the desktop app. All
+                    // other codex.exe paths retain the shared-config CLI gate.
+                    if windows_package("openai.codex_") {
+                        app = true;
+                    } else if parts.last().is_some_and(|p| p == "codex.exe") {
+                        codex_cli_or_ide = true;
+                    }
+                }
             }
         }
-    })
+    }
+    match (app, codex_cli_or_ide) {
+        (false, false) => RunningApps::Stopped,
+        (true, false) => RunningApps::App,
+        (false, true) => RunningApps::CodexCliOrIde,
+        (true, true) => RunningApps::AppAndCodexCliOrIde,
+    }
 }
 
 pub(crate) fn write(
@@ -409,11 +431,21 @@ fn write_with_processes(
     processes: impl FnOnce() -> io::Result<Vec<(u32, PathBuf)>>,
 ) -> Result<String, String> {
     let images = processes().map_err(|_| "動作中のアプリを確認できません")?;
-    if app_is_running(env, request.target, &images) {
-        return Err(format!(
-            "{} を終了してから押してください",
-            request.target.name()
-        ));
+    let message = match (request.target, running_apps(env, request.target, &images)) {
+        (_, RunningApps::Stopped) => None,
+        (AppTarget::ClaudeDesktop, _) => Some("Claude Desktop を終了してから押してください"),
+        (AppTarget::ChatGpt, RunningApps::App) => {
+            Some("ChatGPT (Codex) を終了してから押してください")
+        }
+        (AppTarget::ChatGpt, RunningApps::CodexCliOrIde) => Some(
+            "Codex CLI または IDE 拡張 (codex.exe) が動作中です。同じ設定ファイルを使うため、終了してから押してください",
+        ),
+        (AppTarget::ChatGpt, RunningApps::AppAndCodexCliOrIde) => Some(
+            "ChatGPT (Codex) と、Codex CLI または IDE 拡張 (codex.exe) を終了してから押してください",
+        ),
+    };
+    if let Some(message) = message {
+        return Err(message.into());
     }
     if !request.path.is_absolute() {
         return Err("設定ファイルのパスを確認できません".into());

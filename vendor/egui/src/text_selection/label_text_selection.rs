@@ -212,6 +212,7 @@ impl LabelSelectionState {
         fallback_color: epaint::Color32,
         underline: epaint::Stroke,
     ) {
+        ui.discard_blocked_accesskit_actions(response.id);
         let plugin = ui.ctx().plugin::<Self>();
         let mut plugin = plugin.lock();
         let state = plugin.states.entry(ui.ctx().viewport_id()).or_default();
@@ -230,13 +231,24 @@ impl LabelSelectionState {
 }
 
 impl ViewportLabelSelectionState {
+    fn selection_allows_interaction(&self, ui: &Ui) -> bool {
+        self.selection.is_none_or(|selection| {
+            ui.memory(|memory| memory.allows_interaction(selection.layer_id))
+        })
+    }
+
     fn on_begin_pass(&mut self, ui: &Ui) {
+        let allows_interaction = self.selection_allows_interaction(ui);
+        if !allows_interaction {
+            // A modal ends the captured gesture, while the existing selection stays visible.
+            self.is_dragging = false;
+        }
         if ui.input(|i| i.pointer.any_pressed() && !i.modifiers.shift) {
             // Maybe a new selection is about to begin, but the old one is over:
             // state.selection = None; // TODO(emilk): this makes sense, but doesn't work as expected.
         }
 
-        if ui.input(|i| i.pointer.any_pressed()) {
+        if allows_interaction && ui.input(|i| i.pointer.any_pressed()) {
             if ui.input(|i| i.modifiers.shift) && self.selection.is_some() {
                 // A shift-click extends the current selection, keeping any double- or
                 // triple-clicked word/line selected, but now by the granularity of this press:
@@ -260,10 +272,16 @@ impl ViewportLabelSelectionState {
         self.text_to_copy.clear();
         self.last_copied_galley_rect = None;
         self.painted_selections.clear();
-        self.report_selection = self.selection_is_dirty && !ui.input(|i| i.pointer.any_down());
+        self.report_selection =
+            allows_interaction && self.selection_is_dirty && !ui.input(|i| i.pointer.any_down());
     }
 
     fn on_end_pass(&mut self, ui: &Ui) {
+        let allows_interaction = self.selection_allows_interaction(ui);
+        if !allows_interaction {
+            self.is_dragging = false;
+            self.report_selection = false;
+        }
         if self.is_dragging {
             ui.set_cursor_icon(CursorIcon::Text);
         }
@@ -310,7 +328,7 @@ impl ViewportLabelSelectionState {
 
         let pressed_escape = ui.input(|i| i.key_pressed(crate::Key::Escape));
         let clicked_something_else = ui.input(|i| i.pointer.any_pressed()) && !self.any_hovered;
-        let delected_everything = pressed_escape || clicked_something_else;
+        let delected_everything = allows_interaction && (pressed_escape || clicked_something_else);
 
         if delected_everything {
             self.selection = None;
@@ -330,7 +348,7 @@ impl ViewportLabelSelectionState {
                     ));
             }
         }
-        if !text_to_copy.is_empty() && got_copy_event(ui.ctx()) {
+        if allows_interaction && !text_to_copy.is_empty() && got_copy_event(ui.ctx()) {
             ui.copy_text(text_to_copy);
         }
     }
@@ -395,6 +413,7 @@ impl ViewportLabelSelectionState {
         response: &Response,
         global_from_galley: TSTransform,
         galley: &Galley,
+        allows_interaction: bool,
     ) -> TextCursorState {
         let Some(selection) = &mut self.selection else {
             // Nothing selected.
@@ -413,7 +432,8 @@ impl ViewportLabelSelectionState {
         let may_select_widget =
             multi_widget_text_select || selection.primary.widget_id == response.id;
 
-        if self.is_dragging
+        if allows_interaction
+            && self.is_dragging
             && may_select_widget
             && let Some(pointer_pos) = ui.ctx().pointer_interact_pos()
         {
@@ -630,6 +650,18 @@ impl ViewportLabelSelectionState {
         galley: &mut Arc<Galley>,
     ) -> Vec<RowVertexIndices> {
         let widget_id = response.id;
+        let allows_interaction = ui.memory(|memory| memory.allows_interaction(response.layer_id));
+
+        if allows_interaction
+            && !self.selection_allows_interaction(ui)
+            && response.hovered()
+            && ui.input(|input| input.pointer.any_pressed())
+        {
+            // A new selection above the modal cannot extend the blocked selection
+            // or its word/line anchor. Same-layer selection keeps its usual rules.
+            self.selection = None;
+            self.granular_drag = None;
+        }
 
         let global_from_layer = ui
             .ctx()
@@ -641,20 +673,22 @@ impl ViewportLabelSelectionState {
         let galley_from_global = galley_from_layer * layer_from_global;
         let global_from_galley = global_from_layer * layer_from_galley;
 
-        if response.hovered() {
+        if allows_interaction && response.hovered() {
             ui.set_cursor_icon(CursorIcon::Text);
         }
 
-        self.any_hovered |= response.hovered();
-        self.is_dragging |= response.is_pointer_button_down_on(); // we don't want the initial latency of drag vs click decision
+        self.any_hovered |= allows_interaction && response.hovered();
+        self.is_dragging |= allows_interaction && response.is_pointer_button_down_on(); // we don't want the initial latency of drag vs click decision
 
         let old_selection = self.selection;
 
-        let mut cursor_state = self.cursor_for(ui, response, global_from_galley, galley);
+        let mut cursor_state =
+            self.cursor_for(ui, response, global_from_galley, galley, allows_interaction);
 
         let old_range = cursor_state.range(galley);
 
-        if let Some(pointer_pos) = ui.ctx().pointer_interact_pos()
+        if allows_interaction
+            && let Some(pointer_pos) = ui.ctx().pointer_interact_pos()
             && response.contains_pointer()
         {
             let cursor_at_pointer =
@@ -714,7 +748,8 @@ impl ViewportLabelSelectionState {
             let galley_rect = global_from_galley * Rect::from_min_size(Pos2::ZERO, galley.size());
             self.selection_bbox_this_frame |= galley_rect;
 
-            if let Some(selection) = &self.selection
+            if allows_interaction
+                && let Some(selection) = &self.selection
                 && selection.primary.widget_id == response.id
                 && process_selection_key_events(ui.ctx(), galley, response.id, &mut cursor_range)
             {
@@ -722,7 +757,7 @@ impl ViewportLabelSelectionState {
                 self.granular_drag = None;
             }
 
-            if got_copy_event(ui.ctx()) || self.report_selection {
+            if allows_interaction && (got_copy_event(ui.ctx()) || self.report_selection) {
                 self.copy_text(galley_rect, galley, &cursor_range);
             }
 
@@ -781,7 +816,7 @@ impl ViewportLabelSelectionState {
         }
 
         // Scroll containing ScrollArea on cursor change:
-        if let Some(range) = new_range {
+        if allows_interaction && let Some(range) = new_range {
             let old_primary = old_selection.map(|s| s.primary);
             let new_primary = self.selection.as_ref().map(|s| s.primary);
             if let Some(new_primary) = new_primary {
@@ -877,6 +912,10 @@ fn estimate_row_height(galley: &Galley) -> f32 {
         galley.size().y
     }
 }
+
+#[cfg(test)]
+#[path = "label_modal_tests.rs"]
+mod modal_tests;
 
 #[cfg(test)]
 mod tests {

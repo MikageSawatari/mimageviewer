@@ -82,6 +82,7 @@ impl WindowDrag {
 pub struct Window<'a> {
     title: Atoms<'a>,
     open: Option<&'a mut bool>,
+    close_button_enabled: bool,
     area: Area,
     frame: Option<Frame>,
     title_frame: Option<Frame>,
@@ -105,6 +106,7 @@ impl<'a> Window<'a> {
         Self {
             title,
             open: None,
+            close_button_enabled: true,
             area,
             frame: None,
             title_frame: None,
@@ -172,6 +174,14 @@ impl<'a> Window<'a> {
     #[inline]
     pub fn open(mut self, open: &'a mut bool) -> Self {
         self.open = Some(open);
+        self
+    }
+
+    /// Enable the title-bar close button without disabling the window's body,
+    /// movement, or resizing. The button still requires [`Self::open`].
+    #[inline]
+    pub fn close_button_enabled(mut self, enabled: bool) -> Self {
+        self.close_button_enabled = enabled;
         self
     }
 
@@ -556,6 +566,7 @@ impl Window<'_> {
         let Window {
             title,
             mut open,
+            close_button_enabled,
             area,
             frame,
             title_frame,
@@ -724,6 +735,7 @@ impl Window<'_> {
                             collapsible,
                             on_top,
                             open.as_deref_mut(),
+                            close_button_enabled,
                             auto_sized,
                             effective_drag == WindowDrag::TitleBar,
                             area_id,
@@ -1318,6 +1330,7 @@ fn title_ui(
     collapsible: bool,
     active: bool,
     open: Option<&mut bool>,
+    close_button_enabled: bool,
     auto_sized: bool,
     drag_to_move: bool,
     area_id: Id,
@@ -1421,7 +1434,10 @@ fn title_ui(
     {
         let rect = rect.shrink2(button_shrink);
         title_click_rect = title_click_rect.with_max_x(rect.min.x);
-        if close_button(&mut child_ui, rect).clicked() {
+        if child_ui
+            .add_enabled(close_button_enabled, |ui: &mut Ui| close_button(ui, rect))
+            .clicked()
+        {
             *open = false;
         }
     }

@@ -392,6 +392,8 @@
 extern crate alloc;
 
 pub mod accessibility;
+#[cfg(test)]
+mod accesskit_modal_tests;
 mod animation_manager;
 mod atomics;
 pub mod cache;
