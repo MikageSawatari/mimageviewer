@@ -938,6 +938,86 @@ fn claude_desktop_requires_its_executable_name_and_install_location() {
 }
 
 #[test]
+fn codex_extracted_app_bin_is_distinct_from_cli_and_helpers() {
+    let (_temp, mut env) = fixture();
+    let root = env
+        .local_app_data
+        .as_ref()
+        .unwrap()
+        .join("OpenAI/Codex/bin");
+    let extracted = root.join("hash/codex.exe");
+    let package = PathBuf::from(r"C:\Program Files\WindowsApps\OpenAI.Codex_one\app\ChatGPT.exe");
+    for path in [
+        extracted.clone(),
+        PathBuf::from(
+            extracted
+                .to_str()
+                .unwrap()
+                .replace('\\', "/")
+                .to_uppercase(),
+        ),
+        root.join("hash/./sub/../codex.exe"),
+    ] {
+        assert_eq!(
+            running_apps(&env, AppTarget::ChatGpt, &[(10, path)]),
+            RunningApps::App
+        );
+    }
+    for helper in [
+        "codex-command-runner.exe",
+        "codex-code-mode-host.exe",
+        "codex-exec-server.exe",
+        "codex-windows-sandbox-setup.exe",
+        "rg.exe",
+        "node.exe",
+        "node_repl.exe",
+    ] {
+        assert_eq!(
+            running_apps(
+                &env,
+                AppTarget::ChatGpt,
+                &[(10, root.join("hash").join(helper))]
+            ),
+            RunningApps::Stopped,
+            "{helper}"
+        );
+    }
+    for path in [
+        root.with_file_name("bin-other").join("hash/codex.exe"),
+        root.join("../other/codex.exe"),
+    ] {
+        assert_eq!(
+            running_apps(&env, AppTarget::ChatGpt, &[(10, path)]),
+            RunningApps::CodexCliOrIde
+        );
+    }
+    // Exclusion keeps precedence even if CODEX_HOME is nested in the app's bin.
+    env.codex_home = Some(root.join("hash"));
+    let daemon = root.join("hash/packages/app-server-daemon/1/bin/codex.exe");
+    assert_eq!(
+        running_apps(&env, AppTarget::ChatGpt, &[(10, daemon.clone())]),
+        RunningApps::Stopped
+    );
+    env.local_app_data = None;
+    assert_eq!(
+        running_apps(&env, AppTarget::ChatGpt, &[(10, extracted)]),
+        RunningApps::CodexCliOrIde
+    );
+    assert_eq!(
+        running_apps(&env, AppTarget::ChatGpt, &[(10, package)]),
+        RunningApps::App
+    );
+    assert_eq!(
+        running_apps(&env, AppTarget::ChatGpt, &[(10, daemon)]),
+        RunningApps::Stopped
+    );
+    assert_eq!(
+        running_apps(&env, AppTarget::ClaudeDesktop, &[]),
+        RunningApps::Stopped
+    );
+}
+
+#[test]
 fn running_app_classification_and_writer_errors_preserve_config_and_backup() {
     let (_temp, env) = fixture();
     let daemon = env
@@ -948,6 +1028,11 @@ fn running_app_classification_and_writer_errors_preserve_config_and_backup() {
     let desktop = PathBuf::from(r"C:\Program Files\WindowsApps\OpenAI.Codex_one\app\ChatGPT.exe");
     let packaged_codex =
         PathBuf::from(r"C:\Program Files\WindowsApps\OpenAI.Codex_one\app\codex.exe");
+    let extracted_codex = env
+        .local_app_data
+        .as_ref()
+        .unwrap()
+        .join("OpenAI/Codex/bin/hash/codex.exe");
     let npm_codex = PathBuf::from(
         "C:/Users/fixture/AppData/Roaming/npm/node_modules/@openai/codex/vendor/x86_64-pc-windows-msvc/codex/codex.exe",
     );
@@ -976,6 +1061,26 @@ fn running_app_classification_and_writer_errors_preserve_config_and_backup() {
             vec![packaged_codex],
             RunningApps::App,
             Some("ChatGPT (Codex) を終了してから押してください"),
+        ),
+        (
+            AppTarget::ChatGpt,
+            vec![extracted_codex.clone()],
+            RunningApps::App,
+            Some("ChatGPT (Codex) を終了してから押してください"),
+        ),
+        (
+            AppTarget::ChatGpt,
+            vec![desktop.clone(), extracted_codex.clone()],
+            RunningApps::App,
+            Some("ChatGPT (Codex) を終了してから押してください"),
+        ),
+        (
+            AppTarget::ChatGpt,
+            vec![desktop.clone(), extracted_codex, npm_codex.clone()],
+            RunningApps::AppAndCodexCliOrIde,
+            Some(
+                "ChatGPT (Codex) と、Codex CLI または IDE 拡張 (codex.exe) を終了してから押してください",
+            ),
         ),
         (
             AppTarget::ChatGpt,

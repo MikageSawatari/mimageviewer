@@ -1596,6 +1596,7 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
   - 動作中の判定: `WindowsApps\OpenAI.Codex_*` の下の process、または名前が `codex.exe` の process (Codex CLI・IDE 拡張。
     同じ `config.toml` を共有し、同時に書くと他方の変更を失う。§15.7 初版の独立レビュー P2-11)。
     判定対象は変えず、アプリのみ・CLI/IDE 拡張のみ・両方に分け、終了が必要なものを断る文に明記する (§41)。
+    `%LOCALAPPDATA%\OpenAI\Codex\bin\` の下の `codex.exe` もアプリ側に分類する。その他の同ディレクトリの補助 exe は数えず、daemon 除外を優先する。
   - 書く内容: `[mcp_servers.mimageviewer]` に `command`・`args`・`default_tools_approval_mode = "approve"`。
     `toml_edit` (直接の依存に足す) で他の表・コメント・書式を残す。改行コード (CRLF / LF) はファイルのものを保つ。
     `approve` が「確認なし」の意味かは文書で明言されていないので、1d の後の実機確認で見る (未確認)。
@@ -5922,3 +5923,7 @@ cached / 再表示時の Focus、選択可能ラベルの捕捉・キー・Escap
 5 件目 (2026-11-06): 利用者から Claude Desktop 終了後も登録を拒否されるとの報告があり、設計担当は同じインストール先の `chrome-native-host.exe` が終了後も残ることを確認した (拒否した瞬間の一致 process は未観測)。所定の Squirrel / WindowsApps の場所にある `claude.exe` だけを本体として扱い、Update / squirrel / Chrome native host / ssh 補助 / github-mcp-server は除外する。設定を書き換え得るのは Desktop 本体の Electron process 群だけという設計前提で、これに反する証拠は今回のコード確認では見つかっていない。Codex 側は WindowsApps の OpenAI.Codex パッケージ内なら別名 exe も App になる構造が残るが、パッケージ内部の補助 exe の実在・残留は未確認で変更しない。提示された Chrome 拡張の `extension-host.exe` はパッケージ外かつ名前も `codex.exe` ではないため対象外であり、テストで保つ。
 
 5 件目の検証 (`43a678222` 上の未コミット差分): 指定 focused は exit 0、58/58 成功 (`target/agent-claude-process-focused.log`)。`cargo fmt` / `cargo fmt --check` / 差分の空白検査は成功、独立レビュー ACCEPT。`build-dev.ps1 -PreserveRuntime` は同じ出力先の core (PID 30000) が稼働中のため保護で中止し、バイナリは未更新 (`target/agent-claude-process-build-dev.log`)。製品の起動・停止、commit、ブランチ切替は行っていない。
+
+6 件目 (2026-11-06): 設計担当が、ChatGPT.exe の子・孫として `%LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\codex.exe` が動き、MCP server を起動することを確認した。この場所の `codex.exe` をアプリ側へ分類し直し、アプリだけの利用時に CLI・IDE 拡張の終了を求めない。他の場所の `codex.exe` と daemon 除外、何かが動いていれば書かない条件は維持する。
+
+6 件目の検証 (`2724818f5` 上の未コミット差分): 指定 focused は exit 0、59/59 成功 (`target/agent-codex-app-bin-focused.log`)。`cargo fmt` / `cargo fmt --check` / 差分の空白検査は成功、独立レビュー ACCEPT。指定どおり build-dev・製品起動・commit・ブランチ切替は行っていない。

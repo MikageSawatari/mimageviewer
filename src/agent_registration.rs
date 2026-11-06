@@ -360,6 +360,11 @@ pub(crate) fn running_apps(
         .as_deref()
         .and_then(|p| env.absolute(p).ok())
         .map(|p| normalized_components(&p.join("AnthropicClaude")));
+    let codex_app_bin = env
+        .local_app_data
+        .as_deref()
+        .and_then(|p| env.absolute(p).ok())
+        .map(|p| normalized_components(&p.join("OpenAI/Codex/bin")));
     let codex_daemon = env
         .codex_home
         .as_deref()
@@ -394,11 +399,15 @@ pub(crate) fn running_apps(
                     .as_ref()
                     .is_some_and(|root| parts.len() > root.len() && parts.starts_with(root));
                 if !is_daemon {
-                    // A package's codex.exe belongs to the desktop app. All
-                    // other codex.exe paths retain the shared-config CLI gate.
-                    if windows_package("openai.codex_") {
+                    let is_codex = parts.last().is_some_and(|p| p == "codex.exe");
+                    // Desktop also runs codex.exe from its extracted bin directory.
+                    let is_app_bin = is_codex
+                        && codex_app_bin.as_ref().is_some_and(|root| {
+                            parts.len() > root.len() && parts.starts_with(root)
+                        });
+                    if windows_package("openai.codex_") || is_app_bin {
                         app = true;
-                    } else if parts.last().is_some_and(|p| p == "codex.exe") {
+                    } else if is_codex {
                         codex_cli_or_ide = true;
                     }
                 }
