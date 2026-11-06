@@ -7535,9 +7535,9 @@ pub(crate) struct FolderNavResult {
 /// 非同期メタデータ読み込み (フルスクリーン表示対象画像の AI/EXIF/XMP) の状態。
 ///
 /// `open_fullscreen` から起動され、`poll_metadata_load` で結果を受信する。
-/// **背景**: XMP リーダーは JPEG/PNG 全体を読むため (`read_tweet_info`)、
-/// 20MP 級の写真で UI スレッドが 100ms 級でブロックしていた
-/// (AI metadata と EXIF は数 ms だが、XMP が主犯)。
+/// **背景**: 旧 XMP リーダーの JPEG/PNG 全体読みで、20MP 級の写真では
+/// UI スレッドが 100ms 級でブロックしていた。現在は部分読みだが、
+/// AI/EXIF/XMP の I/O は引き続き worker で実行する。
 /// 新 fullscreen idx が開かれたら旧 pending を cancel する (連打時は最新のみ処理)。
 pub(crate) struct MetadataLoadPending {
     key: String,
@@ -17589,8 +17589,8 @@ pub struct App {
     pub(crate) tag_view_pending: Option<crate::tag_view::TagViewPending>,
     /// フルスクリーン画像の AI/EXIF/XMP メタデータを非同期読み込み中。
     /// `open_fullscreen` で spawn、`poll_metadata_load` で受信してキャッシュに投入。
-    /// 20MP JPEG の XMP 読み (`read_tweet_info` が full-file 読む) で UI が
-    /// 100ms 級にブロックしていた問題を解消する。
+    /// 旧 JPEG 全体読みで UI が 100ms 級にブロックしていた問題を解消する。
+    /// 現在の XMP 部分読みも worker で実行する。
     pub(crate) metadata_pending: Option<MetadataLoadPending>,
     /// XMP rating hydration のバックグラウンドプリフェッチ。
     /// タグ正本は `tags.db` なので、ここでは XMP `dc:subject` を読まない。
@@ -71627,8 +71627,8 @@ impl App {
         }
 
         // AI / EXIF / XMP メタデータ読み込みは **バックグラウンドスレッド** で実行する。
-        // XMP は JPEG/PNG 全体を読むため UI スレッドで同期実行すると 20MP 画像で
-        // 100ms 級にブロックする。メタデータパネルは値到着まで空表示。
+        // XMP は見出しと payload の部分読みだが、I/O は worker に置く。
+        // メタデータパネルは値到着まで空表示。
         let start_metadata_load_perf_t0 = start_fs_open_perf_span(&perf);
         self.start_metadata_load(idx);
         finish_fs_open_perf_span(
