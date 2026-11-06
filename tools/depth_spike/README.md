@@ -13,3 +13,13 @@ target\depth-spike\venv\Scripts\python tools\depth_spike\make_anim.py target\dep
 
 Model sources: onnx-community/depth-anything-v2-small, onnx-community/depth-anything-v3-small,
 Ruicheng/moge-2-vits-normal-onnx, SpatialHub/depth-anything-3-onnx (da3mono_large only).
+
+Follow-up scripts (2026-11-06):
+
+```powershell
+target\depth-spike\venv\Scripts\python -m pip install onnx onnxconverter-common
+target\depth-spike\venv\Scripts\python tools\depth_spike\make_variants.py target\depth-spike <stem>...   # parameter variations -> compare\<stem>\
+target\depth-spike\venv\Scripts\python tools\depth_spike\to_fp16.py <in.onnx> <out.onnx>
+target\depth-spike\venv\Scripts\python tools\depth_spike\check_fp16.py target\depth-spike <stem>...
+target\depth-spike\venv\Scripts\python tools\depth_spike\measure_vram.py target\depth-spike <model> <device_id>
+```
