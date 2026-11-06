@@ -1,0 +1,29 @@
+[package]
+name = "depth-preprocess-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Compile the real production module directly, without linking the application
+# and embedded models. This is an independent test-only workspace.
+[workspace]
+
+[dependencies]
+half = "=2.7.1"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+mimalloc = { version = "=0.1.52", default-features = false }
+
+[patch.crates-io]
+libmimalloc-sys = { path = "../../../vendor/libmimalloc-sys" }
+
+# Keep identical to the application's dev-runtime profile for timing.
+[profile.dev-runtime]
+inherits = "release"
+opt-level = 2
+lto = "off"
+codegen-units = 64
+incremental = true
+strip = false
+debug = "line-tables-only"
+split-debuginfo = "packed"

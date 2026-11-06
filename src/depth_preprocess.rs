@@ -81,12 +81,19 @@ fn pixel_count(width: u32, height: u32) -> Result<usize, String> {
 }
 
 fn percentile(values: &mut [f32], fraction: f64) -> f32 {
-    values.sort_unstable_by(f32::total_cmp);
     let position = (values.len() - 1) as f64 * fraction;
     let lower = position.floor() as usize;
     let upper = position.ceil() as usize;
-    (values[lower] as f64
-        + (values[upper] as f64 - values[lower] as f64) * (position - lower as f64)) as f32
+    // Only two adjacent order statistics are needed, including for a megapixel
+    // median. Preserve NumPy's linear interpolation without sorting every pixel.
+    let (_, lo, greater) = values.select_nth_unstable_by(lower, f32::total_cmp);
+    let lo = *lo as f64;
+    let hi = if lower == upper {
+        lo
+    } else {
+        *greater.iter().min_by(|a, b| a.total_cmp(b)).unwrap() as f64
+    };
+    (lo + (hi - lo) * (position - lower as f64)) as f32
 }
 
 fn normalize_disparity(values: &[f32]) -> Vec<f32> {
@@ -176,15 +183,25 @@ fn box_mean(src: &[f32], width: usize, height: usize, radius: usize) -> Vec<f32>
                 - src[y * width + reflect(x as isize - radius as isize, width, true)] as f64;
         }
     }
+    // Keep one vertical rolling sum per column, visiting contiguous rows. Each
+    // column retains the same f64 add/subtract order as the strided version.
+    let mut sums = vec![0.0f64; width];
+    for y in -(radius as isize)..=radius as isize {
+        let row = &horizontal[reflect(y, height, true) * width..][..width];
+        for (sum, &value) in sums.iter_mut().zip(row) {
+            *sum += value;
+        }
+    }
     let mut result = vec![0.0; src.len()];
-    for x in 0..width {
-        let mut sum: f64 = (-(radius as isize)..=radius as isize)
-            .map(|y| horizontal[reflect(y, height, true) * width + x])
-            .sum();
-        for y in 0..height {
-            result[y * width + x] = (sum / (size * size)) as f32;
-            sum += horizontal[reflect((y + radius + 1) as isize, height, true) * width + x]
-                - horizontal[reflect(y as isize - radius as isize, height, true) * width + x];
+    for (y, row) in result.chunks_exact_mut(width).enumerate() {
+        for (out, &sum) in row.iter_mut().zip(&sums) {
+            *out = (sum / (size * size)) as f32;
+        }
+        let add = &horizontal[reflect((y + radius + 1) as isize, height, true) * width..][..width];
+        let remove =
+            &horizontal[reflect(y as isize - radius as isize, height, true) * width..][..width];
+        for ((sum, &add), &remove) in sums.iter_mut().zip(add).zip(remove) {
+            *sum += add - remove;
         }
     }
     result
@@ -255,30 +272,36 @@ fn gaussian_blur(src: &[f32], width: usize, height: usize, sigma: f64) -> Vec<f3
         *value /= sum;
     }
     let kernel: Vec<f32> = kernel.into_iter().map(|v| v as f32).collect();
+    // Reflect once into a small reusable row instead of branching for every
+    // tap of every pixel. Convolution still adds taps in ascending kernel order.
+    let reflected: Vec<_> = (0..width + size - 1)
+        .map(|x| reflect(x as isize - radius, width, false))
+        .collect();
+    let mut padded = vec![0.0; reflected.len()];
     let mut horizontal = vec![0.0; src.len()];
-    for y in 0..height {
-        for x in 0..width {
-            horizontal[y * width + x] = kernel
+    for (source, out) in src
+        .chunks_exact(width)
+        .zip(horizontal.chunks_exact_mut(width))
+    {
+        for (value, &x) in padded.iter_mut().zip(&reflected) {
+            *value = source[x];
+        }
+        for (x, out) in out.iter_mut().enumerate() {
+            *out = padded[x..x + size]
                 .iter()
-                .enumerate()
-                .map(|(i, weight)| {
-                    src[y * width + reflect(x as isize + i as isize - radius, width, false)]
-                        * weight
-                })
+                .zip(&kernel)
+                .map(|(&v, &k)| v * k)
                 .sum();
         }
     }
     let mut result = vec![0.0; src.len()];
-    for y in 0..height {
-        for x in 0..width {
-            result[y * width + x] = kernel
-                .iter()
-                .enumerate()
-                .map(|(i, weight)| {
-                    horizontal[reflect(y as isize + i as isize - radius, height, false) * width + x]
-                        * weight
-                })
-                .sum();
+    for (y, out) in result.chunks_exact_mut(width).enumerate() {
+        for (i, &weight) in kernel.iter().enumerate() {
+            let row = &horizontal
+                [reflect(y as isize + i as isize - radius, height, false) * width..][..width];
+            for (out, &value) in out.iter_mut().zip(row) {
+                *out += value * weight;
+            }
         }
     }
     result
@@ -293,6 +316,7 @@ mod tests {
     struct Fixture {
         stages: Stages,
         cases: Vec<Case>,
+        full_size: Case,
     }
 
     #[derive(Deserialize)]
@@ -317,6 +341,124 @@ mod tests {
 
     fn fixture() -> Fixture {
         serde_json::from_str(include_str!("../tests/fixtures/depth/preprocess.json")).unwrap()
+    }
+
+    fn full_size_input() -> (Vec<f32>, Vec<u8>) {
+        let disparity = (0..504_u32 * 504)
+            .map(|i| {
+                let (x, y) = (i % 504, i / 504);
+                let mut n = i ^ 0x5A17C9E3;
+                n = (n ^ (n >> 16)).wrapping_mul(0x7FEB352D);
+                n = (n ^ (n >> 15)).wrapping_mul(0x846CA68B);
+                n ^= n >> 16;
+                ((3 * x + 5 * y) % 1024) as f32 / 1024.0
+                    + (n & 255) as f32 / 4096.0
+                    + if (200..320).contains(&x) && (140..360).contains(&y) {
+                        0.75
+                    } else {
+                        0.0
+                    }
+            })
+            .collect();
+        let rgba = (0..1024_u32)
+            .flat_map(|y| {
+                (0..1536_u32).flat_map(move |x| {
+                    [
+                        ((x * 37 + y * 13) % 256) as u8,
+                        ((x * 19 + y * 71) % 256) as u8,
+                        ((x * 83 + y * 7) % 256) as u8,
+                        255,
+                    ]
+                })
+            })
+            .collect();
+        (disparity, rgba)
+    }
+
+    #[test]
+    fn depth_full_size_504_to_1536_matches_opencv() {
+        let expected = fixture().full_size;
+        let (disparity, guide) = full_size_input();
+        // Same worker boundary as production: never run image processing on UI.
+        let actual = std::thread::Builder::new()
+            .name("depth-estimation".into())
+            .spawn(move || prepare_depth(&disparity, 504, 504, &guide, 1536, 1024).unwrap())
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(
+            (actual.width, actual.height),
+            (expected.width, expected.height)
+        );
+        assert_eq!(actual.values.len(), 1536 * 1024);
+        assert!(expected.sample_indices.len() >= 750);
+        let samples: Vec<_> = expected
+            .sample_indices
+            .iter()
+            .map(|&i| actual.values[i].to_f32())
+            .collect();
+        let max_error = samples
+            .iter()
+            .zip(&expected.values)
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        let median_error = (actual.median - expected.median).abs();
+        println!(
+            "depth full-size OpenCV samples={} max_error={max_error:.8} median_error={median_error:.8}",
+            samples.len()
+        );
+        // f16 rounding contributes <=1/4096; the remaining allowance covers
+        // float32 cubic/filter accumulation differences from OpenCV SIMD.
+        close(&samples, &expected.values, 3e-4);
+        assert!(
+            median_error < 2e-5,
+            "median {} vs {}",
+            actual.median,
+            expected.median
+        );
+    }
+
+    #[test]
+    #[ignore = "explicit isolated worker timing in debug and dev-runtime profiles"]
+    fn depth_preprocess_worker_timing_1536() {
+        use std::hint::black_box;
+        let (disparity, guide) = full_size_input(); // Excluded from timing.
+        let times = std::thread::Builder::new()
+            .name("depth-estimation".into())
+            .spawn(move || {
+                let run = || {
+                    prepare_depth(
+                        black_box(&disparity),
+                        504,
+                        504,
+                        black_box(&guide),
+                        1536,
+                        1024,
+                    )
+                    .unwrap()
+                };
+                black_box(run()); // Warm up the same worker thread and allocations.
+                let mut times = Vec::new();
+                for _ in 0..3 {
+                    let started = std::time::Instant::now();
+                    let result = black_box(run());
+                    times.push(started.elapsed().as_secs_f64() * 1000.0);
+                    assert_eq!(result.values.len(), 1536 * 1024);
+                    // Drop is outside the timed interval; all prepare_depth-owned
+                    // scratch allocation/free, median and f16 conversion are inside.
+                }
+                times
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        let mut sorted = times.clone();
+        sorted.sort_by(f64::total_cmp);
+        println!(
+            "depth preprocessing 504x504 -> 1536x1024 worker=depth-estimation debug_assertions={} runs_ms={times:?} median_ms={:.3}",
+            cfg!(debug_assertions),
+            sorted[1]
+        );
     }
 
     fn close(actual: &[f32], expected: &[f32], tolerance: f32) {
@@ -419,5 +561,27 @@ mod tests {
         assert_eq!(reflect(3, 3, false), 1);
         assert_eq!(reflect(-100, 1, false), 0);
         assert_eq!(percentile(&mut [0.0, 1.0, 0.2, 0.6], 0.5), 0.4);
+    }
+
+    #[test]
+    fn depth_percentile_selection_matches_full_sort() {
+        let (input, _) = full_size_input();
+        for count in [1, 2, 3, 128, input.len()] {
+            let mut sorted = input[..count].to_vec();
+            sorted.sort_unstable_by(f32::total_cmp);
+            for fraction in [0.0, 0.01, 0.5, 0.99, 1.0] {
+                let position = (count - 1) as f64 * fraction;
+                let (lo, hi) = (position.floor() as usize, position.ceil() as usize);
+                let expected = (sorted[lo] as f64
+                    + (sorted[hi] as f64 - sorted[lo] as f64) * (position - lo as f64))
+                    as f32;
+                let actual = percentile(&mut input[..count].to_vec(), fraction);
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "count={count}, p={fraction}"
+                );
+            }
+        }
     }
 }

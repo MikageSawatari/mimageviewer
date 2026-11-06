@@ -52,3 +52,35 @@ artifacts and are **not** release assets.
 To compare an existing photo instead, add
 `--reference-image target/depth-spike/samples/IMG_0001.JPG`. This replaces only
 the ignored local oracle files, preserving the checked-in synthetic fixtures.
+
+The model oracle also stores the original photo's guide (long edge <=1536,
+never enlarged), the full float32 prepared map, and its unquantized median.
+The ignored Rust model test checks inference and every prepared pixel against
+these local-only files. Regenerate with the photo option before running it.
+
+The checked-in numerical fixture includes a 504x504 disparity field with a
+seeded integer pattern, two-axis ramps and a rectangular step, prepared against
+a 1536x1024 guide. Stratified, border and step-neighbour samples keep the entire
+fixture below 40 KB; all pixels participate in the median. The test allows
+3e-4 per f16 pixel (<=1/4096 rounding plus float32 OpenCV accumulation) and 2e-5
+for the pre-quantization median.
+
+For isolated preprocessing checks and timings, run these from the repository
+root (so the same `.cargo/config.toml`, linker and CRT rustflags apply):
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE = '1'
+cargo test --offline --manifest-path tools/depth_model/preprocess_probe/Cargo.toml --target-dir target/depth-preprocess-probe -- --test-threads=1
+cargo test --offline --manifest-path tools/depth_model/preprocess_probe/Cargo.toml --target-dir target/depth-preprocess-probe depth_preprocess_worker_timing_1536 -- --ignored --nocapture --test-threads=1
+cargo test --offline --manifest-path tools/depth_model/preprocess_probe/Cargo.toml --target-dir target/depth-preprocess-probe --profile dev-runtime depth_preprocess_worker_timing_1536 -- --ignored --nocapture --test-threads=1
+```
+
+The tiny standalone workspace compiles the production `src/depth_preprocess.rs`
+directly, including the same tests; it contains no alternate preprocessing
+implementation. Its `dev-runtime` settings match the application's profile.
+It also uses the application's global MiMalloc allocator and vendored source.
+Timing includes the complete `prepare_depth` call (scratch allocation/free,
+filters, median and f16 packing) on one `depth-estimation` thread. Input creation,
+thread startup and dropping the returned map are outside the timed interval.
+One warm-up precedes three measured calls; report their median separately for
+debug and optimized builds. It does not initialize the application or AI runtime.

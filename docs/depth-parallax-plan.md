@@ -613,6 +613,78 @@ single-instance mutex を通常版と共有する。エージェントによる�
 P1/P2 指摘なし、段 A の実装は受入可と判断。最終検収と commit は ClaudeCode が行う。
 この worktree では stage / commit を行っていない。
 
+#### Codex P1〜P3 対応 (2026-11-07、基点 `6e20dfa43`)
+
+独立レビュー指摘を修正した。ここからは上記の初回実装記録とは別の未コミット差分。
+
+- **P1**: `AddonKind` の scan / install / remove 名 helper を実際の spawn に渡す。
+  VLM は従来の `vlm-model-{scan,install,remove}` を復元し、深度は
+  `depth-model-{scan,install,remove}`。6 名の完全一致を回帰テストで固定した。
+- **P3**: エラー本文全体の `VLM` → `Depth` 置換を廃止した。HTTP・検証・配置の生成点で
+  `kind.label()` を埋め込み、パスと下位エラー文字列はそのまま保持する。取消 sentinel も
+  種別ごとの producer / consumer を揃えた。VLM の既存文字列と回帰テストは維持。
+  `VLM` を含むパス・JSON 下位エラー・HTTP 下位エラーの保持など、P1/P3 合計 7 テストを追加。
+- **P2**: 504×504 の二軸 ramp・矩形段差・整数 seed noise を両言語で再生成し、
+  1536×1024 の二次元ガイドへ `parallax.prepare_depth` と同じ前処理を行う検査を追加。
+  境界・段差の両側・全体を分散して **797 画素**、および全量の中央値を比較する。
+  fixture 全体は **38,053 bytes**。許容差は f16 丸めの最大 1/4096 と float32 の
+  OpenCV SIMD / Rust 加算差を合わせて画素 3e-4、量子化前中央値 2e-5。
+  実測の最大差 **0.00024390**、中央値の差 **0.00000003** (debug / 最適化版とも成功)。
+- 実モデル ignore テストを推論から前処理まで `depth-estimation` thread 上で通す形に広げた。
+  同じ実写真 (720×960、ガイドは拡大しない) の **691,200 画素すべて**を Python の f32 結果と比較。
+  推論相関 **1.00000000**、前処理後の最大差 **0.00024426**、平均差 **0.00005896**、
+  中央値の差 **0.00000003**。1/1 成功。画像・全量 oracle は `target/depth-addon/` だけに保存。
+- 200 ms の目安を超えたため、percentile / median の全件 sort を隣接順位の選択へ変更。
+  box filter の縦 rolling sum を行順に処理し、Gaussian は横の reflect を padded row に事前計算、
+  縦を連続行の加算にした。各画素の f64 加減算・Gaussian の tap 加算順は維持し、並列化は追加していない。
+  percentile は旧 sort とビット一致する回帰も追加した。
+
+**前処理の計測条件**: Intel Core Ultra 9 285、rustc 1.99.1、Windows x64。
+`tools/depth_model/preprocess_probe/` は製品 `src/depth_preprocess.rs` を `#[path]` で直接コンパイルする
+独立したテスト用 workspace。アルゴリズムのコピーを持たず、アプリと同じ MiMalloc 0.1.52
+(`default-features=false`、同じ vendored libmimalloc-sys)、root の linker / `+crt-static` を使う。
+最適化は root と同じ `dev-runtime` (opt-level=2、lto=off、codegen-units=64 など)。
+repo root から `--offline --test-threads=1`、他の Cargo / テスト実行と重ねずに計測した。
+同じ `depth-estimation` thread で 1 回 warm-up 後に 3 回測定し、その中央値。
+入力生成・thread 作成・返却 map の drop は除外し、`prepare_depth` 内の確保・scratch 解放・全フィルター・
+中央値・f16 化は含める。入力と完成結果を `black_box` で観測する。3D 表示全体の応答時間の計測ではない。
+
+| profile | 修正前 3 回 (ms) | 修正前中央値 | 修正後 3 回 (ms) | 修正後中央値 |
+| --- | --- | ---: | --- | ---: |
+| `dev-runtime` (最適化) | 214.360 / 214.752 / 216.848 | **214.752 ms** | 119.596 / 121.536 / 123.314 | **121.536 ms** |
+| debug (`test`) | 2206.732 / 2193.411 / 2193.933 | **2193.933 ms** | 1317.034 / 1310.109 / 1309.065 | **1310.109 ms** |
+
+最適化版は 200 ms の目安を下回った。debug は診断用であり、200 ms の判定には用いない。
+計測ログは `target/depth-perf-mimalloc-{before,after}-{optimized,debug}.log`。
+修正前は `git show 6e20dfa43:src/depth_preprocess.rs` の製品コード部分を改変せず、現行テスト部分だけを
+組み合わせた一時 host (`target/depth-preprocess-baseline/`) で計測した。
+元製品コード部分の SHA-256 は `354fe1e3243fc1ceb7ba47eefea25df19284b48286c11990f7a8a072bffd03e6`。
+同じ条件で修正前後の全 1,572,864 画素の f16 と中央値を保存し、**ビット単位で全量一致**も確認した
+(3,145,732 bytes、両方の SHA-256 は `ad7c934e1664a3133bd5bfce0ad71c7a615b3e8afc9e17e96b2e183c082eac02`)。
+一時 host と比較データは git 管理外。単離用 host の再実行方法は `tools/depth_model/README.md` に記載。
+
+**検証** (`MSBUILDDISABLENODEREUSE=1`、ネット取得なし):
+
+- 本体の前回と同じ nextest 絞り込み: **91/91 成功**、exit 0 (`target/depth-review-tests.log`)。
+  VLM の既存テスト・snapshot と、新規実サイズ・順位選択・診断回帰を含む。
+- 実モデル ignore テスト: **1/1 成功**、exit 0 (`target/depth-review-real-model.log`)。
+- 単離 host の通常テスト: debug / dev-runtime **各 6/6 成功** (同じ製品テストを再利用、重複合算しない)。
+  timing テストは上の 4 条件で各 1/1、全量ビット比較 host は前後各 1/1 成功。
+- `cargo check --offline -p mimageviewer --bin mimageviewer-core`: 成功、exit 0 (`target/depth-review-check.log`)。
+- 最後に standalone host とワークスペース全体へ `cargo fmt` を実行。`cargo fmt --check` も成功。
+  UI グリフ検査は危険グリフ 0、exit 0 (`target/depth-review-{probe-fmt,fmt,glyphs}.log`)。
+- `build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0`: 成功、exit 0 (通常 feature、非 portable)。
+  core と 4 コンパニオンを更新し、PE 依存検査 runtime=4 / pe=5 成功。
+  `target/dev-runtime/mimageviewer-core.exe` を起動せず引き渡す。通常 profile の起動手順・
+  実設定への注意は上記のとおり。全体 gate / 実 UI / 公開配信先の実取得は今回も未実施。
+- 独立 reviewer (Sol / xhigh) は P1/P3 の生成点・取消分類と数値同値、上のログ・基点ソースを確認し、
+  新規指摘なし、P1〜P3 修正は受入可と判断した。
+
+変更ファイル: `src/addon.rs`、`src/vlm_addon_download.rs`、`src/depth_addon.rs`、
+`src/depth_preprocess.rs`、`src/depth_estimation.rs`、`tools/depth_model/generate_fixtures.py`、
+`tools/depth_model/README.md`、`tools/depth_model/preprocess_probe/{Cargo.toml,Cargo.lock,src/lib.rs}`、
+`tests/fixtures/depth/preprocess.json`、本書。stage / commit は行わない。
+
 §6.5 の分類表は段 B の実装担当がここに追記する。
 
 ## 11. テスト

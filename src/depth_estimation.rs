@@ -790,13 +790,29 @@ mod tests {
             AiRuntimeInitWait::Ready(runtime) => runtime,
             _ => panic!("runtime initialization failed"),
         };
-        let actual = infer_disparity(
-            &runtime,
-            Some(&root.join("da3mono_large_fp16_504.onnx")),
-            &rgba,
-            &AtomicBool::new(false),
-        )
-        .unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("reference.json")).unwrap()).unwrap();
+        let guide = std::fs::read(root.join("reference-guide.rgba")).unwrap();
+        let (gw, gh) = (
+            metadata["guide_width"].as_u64().unwrap() as u32,
+            metadata["guide_height"].as_u64().unwrap() as u32,
+        );
+        let model_path = root.join("da3mono_large_fp16_504.onnx");
+        let (actual, prepared) = std::thread::Builder::new()
+            .name("depth-estimation".into())
+            .spawn(move || {
+                let actual =
+                    infer_disparity(&runtime, Some(&model_path), &rgba, &AtomicBool::new(false))
+                        .unwrap();
+                let prepared = crate::depth_preprocess::prepare_depth(
+                    &actual, INPUT_SIZE, INPUT_SIZE, &guide, gw, gh,
+                )
+                .unwrap();
+                (actual, prepared)
+            })
+            .unwrap()
+            .join()
+            .unwrap();
         assert_eq!(actual.len(), INPUT_PIXELS);
         assert_eq!(reference.len(), INPUT_PIXELS);
         let mean = |v: &[f32]| v.iter().map(|&x| x as f64).sum::<f64>() / v.len() as f64;
@@ -811,5 +827,31 @@ mod tests {
         let correlation = covariance / (avar * bvar).sqrt();
         println!("DA3 504x504 Python stretch correlation: {correlation:.8}");
         assert!(correlation > 0.999, "correlation={correlation}");
+        let reference_prepared = std::fs::read(root.join("reference-prepared.f32")).unwrap();
+        let reference_prepared: Vec<f32> = reference_prepared
+            .chunks_exact(4)
+            .map(|v| f32::from_le_bytes(v.try_into().unwrap()))
+            .collect();
+        assert_eq!((prepared.width, prepared.height), (gw, gh));
+        assert_eq!(prepared.values.len(), reference_prepared.len());
+        let errors: Vec<f32> = prepared
+            .values
+            .iter()
+            .zip(&reference_prepared)
+            .map(|(a, &b)| (a.to_f32() - b).abs())
+            .collect();
+        let max_error = errors.iter().copied().fold(0.0_f32, f32::max);
+        let mean_error = errors.iter().map(|&v| v as f64).sum::<f64>() / errors.len() as f64;
+        let median_error = (prepared.median as f64 - metadata["median"].as_f64().unwrap()).abs();
+        println!(
+            "DA3 prepared {gw}x{gh} all_pixels={} max_error={max_error:.8} mean_error={mean_error:.8} median_error={median_error:.8}",
+            errors.len()
+        );
+        // Compare every pixel to the float32 Python oracle. f16 quantization
+        // alone permits <=1/4096 absolute error; leave 5.6e-5 for ORT/OpenCV
+        // float32 accumulation differences. Median is measured before f16.
+        assert!(max_error < 3e-4, "max_error={max_error}");
+        assert!(mean_error < 1e-4, "mean_error={mean_error}");
+        assert!(median_error < 2e-5, "median_error={median_error}");
     }
 }

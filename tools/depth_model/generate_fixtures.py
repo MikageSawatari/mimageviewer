@@ -27,6 +27,36 @@ def floats(array):
     return array.astype(np.float32).ravel().tolist()
 
 
+def full_size_disparity():
+    # Stateless seeded integer noise plus two-axis ramps/steps. Binary fractions
+    # make the input exactly reproducible in Rust, independent of RNG libraries.
+    y, x = np.mgrid[:504, :504]
+    n = (y * 504 + x).astype(np.uint32) ^ np.uint32(0x5A17C9E3)
+    n = (n ^ (n >> 16)) * np.uint32(0x7FEB352D)
+    n = (n ^ (n >> 15)) * np.uint32(0x846CA68B)
+    n ^= n >> 16
+    return (((3 * x + 5 * y) % 1024).astype(np.float32) / 1024
+            + (n & 255).astype(np.float32) / 4096
+            + ((x >= 200) & (x < 320) & (y >= 140) & (y < 360)).astype(np.float32) * 0.75)
+
+
+def full_size_case():
+    width, height = 1536, 1024
+    result = parallax.prepare_depth(full_size_disparity(), rgb_pattern(width, height),
+                                   dilate_px=round(3 * width / 1600), blur_px=1.5 * width / 1600)
+    # Stratified coverage, each edge, and both sides of the source rectangle's
+    # scaled steps. Expectations remain tens of KB rather than a multi-MB map.
+    points = {(y * height // 16, x * width // 32) for y in range(16) for x in range(32)}
+    xs = {0, 1, 2, width // 2, width - 3, width - 2, width - 1}
+    ys = {0, 1, 2, height // 2, height - 3, height - 2, height - 1}
+    xs.update(round(x * width / 504) + d for x in (200, 320) for d in (-4, -1, 0, 1, 4))
+    ys.update(round(y * height / 504) + d for y in (140, 360) for d in (-4, -1, 0, 1, 4))
+    points.update((y, x) for y in ys for x in xs)
+    indices = sorted(y * width + x for y, x in points)
+    return dict(width=width, height=height, sample_indices=indices,
+                values=floats(result.ravel()[indices]), median=float(np.median(result)))
+
+
 def generate(destination):
     # Outliers exercise interpolated percentiles; a step and impulse exercise edges.
     source = np.array([-7, 2, 3, 3, 10, 4, 0, 7, 4, 8, 11, 90], np.float32).reshape(3, 4)
@@ -59,7 +89,8 @@ def generate(destination):
         cases.append(dict(width=width, height=height, sample_indices=indices,
                           values=floats(result.ravel()[indices]), median=float(np.median(result))))
     data = dict(reference="tools/depth_spike/parallax.py; gamma=1; scaled dilation/blur",
-                opencv=cv2.__version__, numpy=np.__version__, stages=stages, cases=cases)
+                opencv=cv2.__version__, numpy=np.__version__, stages=stages, cases=cases,
+                full_size=full_size_case())
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(data, separators=(",", ":")) + "\n", encoding="utf-8")
 
@@ -94,9 +125,22 @@ def model_oracle(model, output, image=None):
     output.mkdir(parents=True, exist_ok=True)
     rgba.tofile(output / "reference-input.rgba")
     disparity.astype("<f4").tofile(output / "reference-disparity.f32")
+    # Local-only full-image oracle. Match the production guide rule (long edge
+    # <=1536 and never enlarge the original), then retain every expected pixel.
+    scale = min(1.0, 1536 / max(original.shape[:2]))
+    gh, gw = (round(original.shape[0] * scale), round(original.shape[1] * scale))
+    guide = cv2.resize(original, (gw, gh), interpolation=cv2.INTER_CUBIC)
+    guide_rgba = np.concatenate((guide, np.full((gh, gw, 1), 255, np.uint8)), axis=2)
+    prepared = parallax.prepare_depth(disparity, guide,
+                                     dilate_px=round(3 * max(gw, gh) / 1600),
+                                     blur_px=1.5 * max(gw, gh) / 1600)
+    guide_rgba.tofile(output / "reference-guide.rgba")
+    prepared.astype("<f4").tofile(output / "reference-prepared.f32")
     (output / "reference.json").write_text(json.dumps(dict(
         width=504, height=504, source=source, source_width=original.shape[1], source_height=original.shape[0],
         image="reference-input.rgba", disparity="reference-disparity.f32",
+        guide_width=gw, guide_height=gh, guide="reference-guide.rgba",
+        prepared="reference-prepared.f32", median=float(np.median(prepared)),
         provider=session.get_providers(), reference="check_static.py stretched; cv2.INTER_CUBIC; sRGB RGBA; f32 LE disparity"), indent=2) + "\n", encoding="utf-8")
     print(f"Model oracle: disparity range {disparity.min()}..{disparity.max()}", flush=True)
 

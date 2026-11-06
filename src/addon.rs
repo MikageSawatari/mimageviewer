@@ -13,7 +13,9 @@ use std::sync::mpsc::{self, Receiver};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::vlm_addon_download::{self as http, CANCELLED, check_cancel};
+#[cfg(test)]
+use crate::vlm_addon_download::CANCELLED;
+use crate::vlm_addon_download::{self as http};
 
 pub(crate) const INDEX_NAME: &str = "vlm-model-index.json";
 const DEFAULT_BASE_URL: &str =
@@ -150,10 +152,68 @@ mod depth_tests {
                 .default_base_url()
                 .ends_with("/depth-model-v1")
         );
-        assert_eq!(AddonKind::Vlm.error("VLM failure".into()), "VLM failure");
+    }
+
+    #[test]
+    fn addon_thread_names_preserve_vlm_contract_and_identify_depth() {
+        assert_eq!(AddonKind::Vlm.scan_thread_name(), "vlm-model-scan");
+        assert_eq!(AddonKind::Vlm.install_thread_name(), "vlm-model-install");
+        assert_eq!(AddonKind::Vlm.remove_thread_name(), "vlm-model-remove");
+        assert_eq!(AddonKind::Depth.scan_thread_name(), "depth-model-scan");
         assert_eq!(
-            AddonKind::Depth.error("VLM failure".into()),
-            "Depth failure"
+            AddonKind::Depth.install_thread_name(),
+            "depth-model-install"
+        );
+        assert_eq!(AddonKind::Depth.remove_thread_name(), "depth-model-remove");
+    }
+
+    #[test]
+    fn addon_scan_diagnostics_preserve_vlm_in_lower_error_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = br#"{"schema":1,"model_id":"VLM-id","VLM_detail":"VLM-source"}"#;
+        fs::write(dir.path().join("active.json"), raw).unwrap();
+        let source = serde_json::from_slice::<ActivePointer>(raw)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(source.contains("VLM_detail"));
+        for (kind, label) in [(AddonKind::Vlm, "VLM"), (AddonKind::Depth, "Depth")] {
+            assert_eq!(
+                scan_for_kind(kind, dir.path(), &AtomicBool::new(false)),
+                AddonStatus::Corrupt(format!("Invalid {label} active.json: {source}"))
+            );
+        }
+    }
+
+    #[test]
+    fn addon_scan_diagnostics_preserve_vlm_in_user_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("VLM-user-data");
+        let pack = root.join("packs").join("VLM-model");
+        fs::create_dir_all(&pack).unwrap();
+        fs::write(
+            root.join("active.json"),
+            br#"{"schema":1,"model_id":"VLM-model"}"#,
+        )
+        .unwrap();
+        fs::write(pack.join("INSTALL_OK"), b"1").unwrap();
+        for kind in [AddonKind::Vlm, AddonKind::Depth] {
+            let path = pack.join(kind.index_name());
+            let source = File::open(&path).err().unwrap();
+            let expected = format!("Open {}: {source}", path.display());
+            assert_eq!(
+                scan_for_kind(kind, &root, &AtomicBool::new(false)),
+                AddonStatus::Corrupt(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn shared_validator_diagnostics_keep_exact_vlm_text() {
+        assert_eq!(validate_hash("invalid").unwrap_err(), "Invalid VLM SHA-256");
+        assert_eq!(
+            validate_hash_for_kind(AddonKind::Depth, "invalid").unwrap_err(),
+            "Invalid Depth SHA-256"
         );
     }
 }
@@ -165,10 +225,34 @@ pub enum AddonKind {
 }
 
 impl AddonKind {
-    fn error(self, message: String) -> String {
+    pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::Vlm => message,
-            Self::Depth => message.replace("VLM", "Depth"),
+            Self::Vlm => "VLM",
+            Self::Depth => "Depth",
+        }
+    }
+    pub(crate) fn cancelled(self) -> &'static str {
+        match self {
+            Self::Vlm => http::CANCELLED,
+            Self::Depth => "Depth installation cancelled",
+        }
+    }
+    fn scan_thread_name(self) -> &'static str {
+        match self {
+            Self::Vlm => "vlm-model-scan",
+            Self::Depth => "depth-model-scan",
+        }
+    }
+    fn install_thread_name(self) -> &'static str {
+        match self {
+            Self::Vlm => "vlm-model-install",
+            Self::Depth => "depth-model-install",
+        }
+    }
+    fn remove_thread_name(self) -> &'static str {
+        match self {
+            Self::Vlm => "vlm-model-remove",
+            Self::Depth => "depth-model-remove",
         }
     }
     pub fn index_name(self) -> &'static str {
@@ -262,13 +346,23 @@ impl ModelIndex {
 }
 
 pub(crate) fn validate_hash(hash: &str) -> Result<(), String> {
+    validate_hash_for_kind(AddonKind::Vlm, hash)
+}
+
+pub(crate) fn validate_hash_for_kind(kind: AddonKind, hash: &str) -> Result<(), String> {
+    let label = kind.label();
     if hash.len() != 64 || !hash.bytes().all(|c| c.is_ascii_hexdigit()) {
-        return Err("Invalid VLM SHA-256".into());
+        return Err(format!("Invalid {label} SHA-256"));
     }
     Ok(())
 }
 
 pub(crate) fn validate_name(name: &str) -> Result<(), String> {
+    validate_name_for_kind(AddonKind::Vlm, name)
+}
+
+pub(crate) fn validate_name_for_kind(kind: AddonKind, name: &str) -> Result<(), String> {
+    let label = kind.label();
     crate::editing_addon::validate_safe_filename(name)?;
     // Also reject Windows device names, ADS, trailing dots and URL metacharacters.
     if !name
@@ -276,7 +370,7 @@ pub(crate) fn validate_name(name: &str) -> Result<(), String> {
         .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c))
         || name.ends_with('.')
     {
-        return Err("Invalid VLM filename characters".into());
+        return Err(format!("Invalid {label} filename characters"));
     }
     let stem = name
         .split('.')
@@ -444,7 +538,7 @@ impl ModelAddon {
             return;
         }
         let kind = self.kind;
-        match self.spawn("model-addon-scan", move |root, cancel, _| {
+        match self.spawn(kind.scan_thread_name(), move |root, cancel, _| {
             (
                 scan_for_kind(kind, &root, &cancel),
                 AddonEvent::StatusChanged,
@@ -453,7 +547,7 @@ impl ModelAddon {
             Ok(running) => self.state = WorkerState::Scanning(running),
             Err(message) => {
                 self.scanned = true;
-                self.status = AddonStatus::Corrupt(self.kind.error(message));
+                self.status = AddonStatus::Corrupt(message);
             }
         }
     }
@@ -461,15 +555,13 @@ impl ModelAddon {
     pub fn start_install(&mut self) -> Result<(), String> {
         self.ensure_idle()?;
         let kind = self.kind;
-        let running = self.spawn("model-addon-install", move |root, cancel, tx| {
+        let running = self.spawn(kind.install_thread_name(), move |root, cancel, tx| {
             let result = install_for_kind(kind, &root, &kind.base_url(), &cancel, tx);
             let status = scan_for_kind(kind, &root, &AtomicBool::new(false));
             let event = match result {
                 Ok(model_id) => AddonEvent::Installed { model_id },
-                Err(error) if error == CANCELLED => AddonEvent::Cancelled,
-                Err(message) => AddonEvent::Error {
-                    message: kind.error(message),
-                },
+                Err(error) if error == kind.cancelled() => AddonEvent::Cancelled,
+                Err(message) => AddonEvent::Error { message },
             };
             (status, event)
         })?;
@@ -491,12 +583,10 @@ impl ModelAddon {
     pub fn start_remove(&mut self) -> Result<(), String> {
         self.ensure_idle()?;
         let kind = self.kind;
-        let running = self.spawn("model-addon-remove", move |root, _, _| {
-            let event = match remove(&root) {
+        let running = self.spawn(kind.remove_thread_name(), move |root, _, _| {
+            let event = match remove_for_kind(kind, &root) {
                 Ok(()) => AddonEvent::Removed,
-                Err(message) => AddonEvent::Error {
-                    message: kind.error(message),
-                },
+                Err(message) => AddonEvent::Error { message },
             };
             (scan_for_kind(kind, &root, &AtomicBool::new(false)), event)
         })?;
@@ -534,7 +624,7 @@ impl ModelAddon {
                 // No filesystem work after this message: receipt is the completion barrier.
                 let _ = tx.send(WorkerMessage::Complete { status, event });
             })
-            .map_err(|e| self.kind.error(format!("Start VLM worker: {e}")))?;
+            .map_err(|e| format!("Start {} worker: {e}", self.kind.label()))?;
         Ok(Running { rx, cancel })
     }
 
@@ -550,7 +640,7 @@ impl ModelAddon {
                 }
                 Err(mpsc::TryRecvError::Empty) => return None,
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    let message = self.kind.error("VLM worker stopped unexpectedly".into());
+                    let message = format!("{} worker stopped unexpectedly", self.kind.label());
                     self.status = AddonStatus::Corrupt(message.clone());
                     self.finish();
                     return Some(AddonEvent::Error { message });
@@ -583,7 +673,8 @@ struct ActivePointer {
 }
 
 /// Reject reparse points in every existing component, including parent paths.
-pub(crate) fn reject_links(path: &Path) -> Result<(), String> {
+pub(crate) fn reject_links_for_kind(kind: AddonKind, path: &Path) -> Result<(), String> {
+    let label = kind.label();
     for component in path.ancestors() {
         match fs::symlink_metadata(component) {
             Ok(metadata) => {
@@ -595,28 +686,29 @@ pub(crate) fn reject_links(path: &Path) -> Result<(), String> {
                 }
                 if link {
                     return Err(format!(
-                        "VLM path contains a reparse point: {}",
+                        "{label} path contains a reparse point: {}",
                         component.display()
                     ));
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("Check VLM path: {error}")),
+            Err(error) => return Err(format!("Check {label} path: {error}")),
         }
     }
     Ok(())
 }
 
-fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
-    reject_links(path)?;
+fn read_bounded_for_kind(kind: AddonKind, path: &Path) -> Result<Vec<u8>, String> {
+    let label = kind.label();
+    reject_links_for_kind(kind, path)?;
     let mut bytes = Vec::new();
     File::open(path)
         .map_err(|e| format!("Open {}: {e}", path.display()))?
         .take(256 * 1024 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| format!("Read VLM manifest: {e}"))?;
+        .map_err(|e| format!("Read {label} manifest: {e}"))?;
     if bytes.len() > 256 * 1024 {
-        return Err("VLM manifest is too large".into());
+        return Err(format!("{label} manifest is too large"));
     }
     Ok(bytes)
 }
@@ -630,7 +722,7 @@ pub(crate) fn scan_for_kind(kind: AddonKind, root: &Path, cancel: &AtomicBool) -
     match scan_inner(kind, root, cancel) {
         Ok(Some(status)) => status,
         Ok(None) => AddonStatus::Missing,
-        Err(message) => AddonStatus::Corrupt(kind.error(message)),
+        Err(message) => AddonStatus::Corrupt(message),
     }
 }
 
@@ -639,45 +731,48 @@ fn scan_inner(
     root: &Path,
     cancel: &AtomicBool,
 ) -> Result<Option<AddonStatus>, String> {
-    reject_links(root)?;
+    let label = kind.label();
+    reject_links_for_kind(kind, root)?;
     let pointer_path = root.join("active.json");
-    reject_links(&pointer_path)?;
+    reject_links_for_kind(kind, &pointer_path)?;
     if !pointer_path
         .try_exists()
-        .map_err(|e| format!("Read active VLM: {e}"))?
+        .map_err(|e| format!("Read active {label}: {e}"))?
     {
         return Ok(None);
     }
-    let pointer: ActivePointer = serde_json::from_slice(&read_bounded(&pointer_path)?)
-        .map_err(|e| format!("Invalid VLM active.json: {e}"))?;
+    let pointer: ActivePointer =
+        serde_json::from_slice(&read_bounded_for_kind(kind, &pointer_path)?)
+            .map_err(|e| format!("Invalid {label} active.json: {e}"))?;
     if pointer.schema != 1 {
-        return Err("Unsupported VLM active pointer".into());
+        return Err(format!("Unsupported {label} active pointer"));
     }
-    validate_name(&pointer.model_id)?;
+    validate_name_for_kind(kind, &pointer.model_id)?;
     let pack = root.join("packs").join(&pointer.model_id);
     let sentinel = pack.join("INSTALL_OK");
-    reject_links(&sentinel)?;
+    reject_links_for_kind(kind, &sentinel)?;
     if !sentinel
         .try_exists()
-        .map_err(|e| format!("Read VLM sentinel: {e}"))?
+        .map_err(|e| format!("Read {label} sentinel: {e}"))?
     {
         return Ok(None);
     }
-    let index: ModelIndex = serde_json::from_slice(&read_bounded(&pack.join(kind.index_name()))?)
-        .map_err(|e| format!("Invalid installed VLM index: {e}"))?;
+    let index: ModelIndex =
+        serde_json::from_slice(&read_bounded_for_kind(kind, &pack.join(kind.index_name()))?)
+            .map_err(|e| format!("Invalid installed {label} index: {e}"))?;
     index.validate_for(kind)?;
     if index.model_id != pointer.model_id {
-        return Err("VLM model pointer mismatch".into());
+        return Err(format!("{label} model pointer mismatch"));
     }
     for file in &index.files {
         let path = pack.join(&file.name);
-        reject_links(&path)?;
-        let metadata = fs::metadata(&path).map_err(|e| format!("VLM file missing: {e}"))?;
+        reject_links_for_kind(kind, &path)?;
+        let metadata = fs::metadata(&path).map_err(|e| format!("{label} file missing: {e}"))?;
         if !metadata.is_file()
             || metadata.len() != file.bytes
-            || !http::sha256_file(&path, cancel)?.eq_ignore_ascii_case(&file.sha256)
+            || !http::sha256_file_for_kind(kind, &path, cancel)?.eq_ignore_ascii_case(&file.sha256)
         {
-            return Err(format!("VLM file is corrupt: {}", file.name));
+            return Err(format!("{label} file is corrupt: {}", file.name));
         }
     }
     Ok(Some(AddonStatus::Valid {
@@ -692,43 +787,45 @@ fn scan_inner(
     }))
 }
 
-fn remove_tree(path: &Path) -> Result<(), String> {
-    reject_links(path)?;
+fn remove_tree(kind: AddonKind, path: &Path) -> Result<(), String> {
+    let label = kind.label();
+    reject_links_for_kind(kind, path)?;
     if !path
         .try_exists()
-        .map_err(|e| format!("Check VLM directory: {e}"))?
+        .map_err(|e| format!("Check {label} directory: {e}"))?
     {
         return Ok(());
     }
     // Do not recurse through reparse points, even if an unexpected one was placed
     // inside a failed download directory.
-    for entry in fs::read_dir(path).map_err(|e| format!("Read VLM directory: {e}"))? {
-        let entry = entry.map_err(|e| format!("Read VLM entry: {e}"))?;
+    for entry in fs::read_dir(path).map_err(|e| format!("Read {label} directory: {e}"))? {
+        let entry = entry.map_err(|e| format!("Read {label} entry: {e}"))?;
         let path = entry.path();
-        reject_links(&path)?;
+        reject_links_for_kind(kind, &path)?;
         if entry
             .file_type()
-            .map_err(|e| format!("Read VLM type: {e}"))?
+            .map_err(|e| format!("Read {label} type: {e}"))?
             .is_dir()
         {
-            remove_tree(&path)?;
+            remove_tree(kind, &path)?;
         } else {
-            fs::remove_file(path).map_err(|e| format!("Remove VLM file: {e}"))?;
+            fs::remove_file(path).map_err(|e| format!("Remove {label} file: {e}"))?;
         }
     }
-    fs::remove_dir(path).map_err(|e| format!("Remove VLM directory: {e}"))
+    fs::remove_dir(path).map_err(|e| format!("Remove {label} directory: {e}"))
 }
 
-fn remove(root: &Path) -> Result<(), String> {
-    reject_links(root)?;
+fn remove_for_kind(kind: AddonKind, root: &Path) -> Result<(), String> {
+    let label = kind.label();
+    reject_links_for_kind(kind, root)?;
     let active = root.join("active.json");
-    reject_links(&active)?;
+    reject_links_for_kind(kind, &active)?;
     match fs::remove_file(active) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("Remove VLM pointer: {error}")),
+        Err(error) => return Err(format!("Remove {label} pointer: {error}")),
     }
-    remove_tree(root)
+    remove_tree(kind, root)
 }
 
 fn install_for_kind(
@@ -738,23 +835,24 @@ fn install_for_kind(
     cancel: &AtomicBool,
     tx: &mpsc::SyncSender<WorkerMessage>,
 ) -> Result<String, String> {
-    let raw = http::fetch_index(&format!("{base}/{}", kind.index_name()), cancel)?;
+    let label = kind.label();
+    let raw = http::fetch_index_for_kind(kind, &format!("{base}/{}", kind.index_name()), cancel)?;
     let index: ModelIndex =
-        serde_json::from_slice(&raw).map_err(|e| format!("Invalid VLM index: {e}"))?;
+        serde_json::from_slice(&raw).map_err(|e| format!("Invalid {label} index: {e}"))?;
     index.validate_for(kind)?;
-    reject_links(root)?;
+    reject_links_for_kind(kind, root)?;
     let downloads = root.join("downloads").join(&index.model_id);
-    reject_links(&downloads)?;
-    fs::create_dir_all(&downloads).map_err(|e| format!("Create VLM downloads: {e}"))?;
+    reject_links_for_kind(kind, &downloads)?;
+    fs::create_dir_all(&downloads).map_err(|e| format!("Create {label} downloads: {e}"))?;
     let staging = downloads.join("staging");
-    reject_links(&staging)?;
-    fs::create_dir_all(&staging).map_err(|e| format!("Create VLM staging: {e}"))?;
+    reject_links_for_kind(kind, &staging)?;
+    fs::create_dir_all(&staging).map_err(|e| format!("Create {label} staging: {e}"))?;
     // Completed files remain useful when cancellation happens in a later file.
     // Keep only this validated index's outputs; never publish unrelated remnants.
-    for entry in fs::read_dir(&staging).map_err(|e| format!("Read VLM staging: {e}"))? {
-        let entry = entry.map_err(|e| format!("Read VLM staging entry: {e}"))?;
+    for entry in fs::read_dir(&staging).map_err(|e| format!("Read {label} staging: {e}"))? {
+        let entry = entry.map_err(|e| format!("Read {label} staging entry: {e}"))?;
         let path = entry.path();
-        reject_links(&path)?;
+        reject_links_for_kind(kind, &path)?;
         if !index
             .files
             .iter()
@@ -762,23 +860,26 @@ fn install_for_kind(
         {
             if entry
                 .file_type()
-                .map_err(|e| format!("Read VLM staging type: {e}"))?
+                .map_err(|e| format!("Read {label} staging type: {e}"))?
                 .is_dir()
             {
-                remove_tree(&path)?;
+                remove_tree(kind, &path)?;
             } else {
-                fs::remove_file(path).map_err(|e| format!("Remove VLM staging remnant: {e}"))?;
+                fs::remove_file(path)
+                    .map_err(|e| format!("Remove {label} staging remnant: {e}"))?;
             }
         }
     }
     let mut done = 0;
     for file in &index.files {
         let staged_file = staging.join(&file.name);
-        reject_links(&staged_file)?;
+        reject_links_for_kind(kind, &staged_file)?;
         let _ = tx.try_send(WorkerMessage::Progress(InstallProgress::Verifying));
         match fs::metadata(&staged_file) {
             Ok(metadata) if metadata.is_file() && metadata.len() == file.bytes => {
-                if http::sha256_file(&staged_file, cancel)?.eq_ignore_ascii_case(&file.sha256) {
+                if http::sha256_file_for_kind(kind, &staged_file, cancel)?
+                    .eq_ignore_ascii_case(&file.sha256)
+                {
                     // A cancellation at concatenation's last checkpoint can leave
                     // both a complete output and its verified source partials.
                     // Reclaim only this file's declared assets after revalidation.
@@ -789,11 +890,13 @@ fn install_for_kind(
                     };
                     for name in names {
                         let partial = downloads.join(format!("{name}.partial"));
-                        reject_links(&partial)?;
+                        reject_links_for_kind(kind, &partial)?;
                         match fs::remove_file(partial) {
                             Ok(()) => {}
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(error) => return Err(format!("Remove verified VLM part: {error}")),
+                            Err(error) => {
+                                return Err(format!("Remove verified {label} part: {error}"));
+                            }
                         }
                     }
                     done += file.bytes;
@@ -805,11 +908,11 @@ fn install_for_kind(
                 }
             }
             Ok(metadata) if metadata.is_dir() => {
-                return Err("VLM staging file is a directory".into());
+                return Err(format!("{label} staging file is a directory"));
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("Check staged VLM file: {error}")),
+            Err(error) => return Err(format!("Check staged {label} file: {error}")),
         }
         let mut sources = Vec::new();
         let assets: Vec<_> = if file.parts.is_empty() {
@@ -823,7 +926,8 @@ fn install_for_kind(
         for (name, bytes, hash) in assets {
             let partial = downloads.join(format!("{name}.partial"));
             let mut last_progress = std::time::Instant::now();
-            http::download(
+            http::download_for_kind(
+                kind,
                 &format!("{base}/{name}"),
                 &partial,
                 bytes,
@@ -846,81 +950,101 @@ fn install_for_kind(
             sources.push(partial);
         }
         let _ = tx.try_send(WorkerMessage::Progress(InstallProgress::Concatenating));
-        concatenate(&sources, &staged_file, file, cancel)?;
+        concatenate_for_kind(kind, &sources, &staged_file, file, cancel)?;
         // Verified source assets can be removed only after the whole file matches.
         for source in sources {
-            fs::remove_file(source).map_err(|e| format!("Remove VLM part: {e}"))?;
+            fs::remove_file(source).map_err(|e| format!("Remove {label} part: {e}"))?;
         }
     }
-    check_cancel(cancel)?;
-    fs::write(staging.join(kind.index_name()), &raw).map_err(|e| format!("Save VLM index: {e}"))?;
+    http::check_cancel_for_kind(kind, cancel)?;
+    fs::write(staging.join(kind.index_name()), &raw)
+        .map_err(|e| format!("Save {label} index: {e}"))?;
     let packs = root.join("packs");
-    reject_links(&packs)?;
-    fs::create_dir_all(&packs).map_err(|e| format!("Create VLM packs: {e}"))?;
+    reject_links_for_kind(kind, &packs)?;
+    fs::create_dir_all(&packs).map_err(|e| format!("Create {label} packs: {e}"))?;
     let destination = packs.join(&index.model_id);
     // A repair of this immutable model replaces only its own directory. No other
     // pack or user-authored caption data is touched.
-    check_cancel(cancel)?;
+    http::check_cancel_for_kind(kind, cancel)?;
     // Commit boundary: once replacing the destination starts, finish publishing
     // rather than allowing cancellation to leave the old pointer without a pack.
-    remove_tree(&destination)?;
+    remove_tree(kind, &destination)?;
     let _ = tx.try_send(WorkerMessage::Progress(InstallProgress::Installing));
-    fs::rename(&staging, &destination).map_err(|e| format!("Publish VLM model: {e}"))?;
+    fs::rename(&staging, &destination).map_err(|e| format!("Publish {label} model: {e}"))?;
     fs::write(destination.join("INSTALL_OK"), b"1\n")
-        .map_err(|e| format!("Write VLM sentinel: {e}"))?;
+        .map_err(|e| format!("Write {label} sentinel: {e}"))?;
     let pointer = serde_json::to_vec(&ActivePointer {
         schema: 1,
         model_id: index.model_id.clone(),
     })
-    .map_err(|e| format!("Encode VLM pointer: {e}"))?;
+    .map_err(|e| format!("Encode {label} pointer: {e}"))?;
     let temporary = root.join("active.json.tmp");
-    reject_links(&temporary)?;
-    reject_links(&root.join("active.json"))?;
-    fs::write(&temporary, pointer).map_err(|e| format!("Write VLM pointer: {e}"))?;
+    reject_links_for_kind(kind, &temporary)?;
+    reject_links_for_kind(kind, &root.join("active.json"))?;
+    fs::write(&temporary, pointer).map_err(|e| format!("Write {label} pointer: {e}"))?;
     fs::rename(temporary, root.join("active.json"))
-        .map_err(|e| format!("Publish VLM pointer: {e}"))?;
+        .map_err(|e| format!("Publish {label} pointer: {e}"))?;
     Ok(index.model_id)
 }
 
-fn concatenate(
+fn concatenate_for_kind(
+    kind: AddonKind,
     sources: &[PathBuf],
     output: &Path,
     file: &ModelFile,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    reject_links(output)?;
-    let mut target = File::create(output).map_err(|e| format!("Create VLM model: {e}"))?;
+    let label = kind.label();
+    reject_links_for_kind(kind, output)?;
+    let mut target = File::create(output).map_err(|e| format!("Create {label} model: {e}"))?;
     let mut hash = Sha256::new();
     let mut total = 0u64;
     let mut buffer = vec![0; 256 * 1024];
     for source in sources {
-        reject_links(source)?;
-        let mut source = File::open(source).map_err(|e| format!("Open VLM part: {e}"))?;
+        reject_links_for_kind(kind, source)?;
+        let mut source = File::open(source).map_err(|e| format!("Open {label} part: {e}"))?;
         loop {
-            check_cancel(cancel)?;
+            http::check_cancel_for_kind(kind, cancel)?;
             let n = source
                 .read(&mut buffer)
-                .map_err(|e| format!("Read VLM part: {e}"))?;
+                .map_err(|e| format!("Read {label} part: {e}"))?;
             if n == 0 {
                 break;
             }
             if n as u64 > file.bytes.saturating_sub(total) {
-                return Err("VLM concatenation exceeds declared size".into());
+                return Err(format!("{label} concatenation exceeds declared size"));
             }
             target
                 .write_all(&buffer[..n])
-                .map_err(|e| format!("Write VLM model: {e}"))?;
+                .map_err(|e| format!("Write {label} model: {e}"))?;
             hash.update(&buffer[..n]);
             total += n as u64;
         }
     }
     target
         .flush()
-        .map_err(|e| format!("Flush VLM model: {e}"))?;
+        .map_err(|e| format!("Flush {label} model: {e}"))?;
     if total != file.bytes || !format!("{:x}", hash.finalize()).eq_ignore_ascii_case(&file.sha256) {
-        return Err("Concatenated VLM file size or SHA-256 does not match".into());
+        return Err(format!(
+            "Concatenated {label} file size or SHA-256 does not match"
+        ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn remove(root: &Path) -> Result<(), String> {
+    remove_for_kind(AddonKind::Vlm, root)
+}
+
+#[cfg(test)]
+fn concatenate(
+    sources: &[PathBuf],
+    output: &Path,
+    file: &ModelFile,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    concatenate_for_kind(AddonKind::Vlm, sources, output, file, cancel)
 }
 
 #[cfg(test)]

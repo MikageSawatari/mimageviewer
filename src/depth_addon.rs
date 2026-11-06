@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicBool;
 
 use crate::addon::{
     AddonKind, AddonStatus, FileKind, MAX_MODEL_BYTES, MAX_PART_BYTES, ModelAddon, ModelIndex,
-    validate_hash, validate_name,
+    validate_hash_for_kind, validate_name_for_kind,
 };
 
 pub const MODEL_FILENAME: &str = "da3mono_large_fp16_504.onnx";
@@ -16,7 +16,7 @@ pub fn validate_index(index: &ModelIndex) -> Result<(), String> {
     if index.schema != 1 {
         return Err("Unsupported depth index schema".into());
     }
-    validate_name(&index.model_id)?;
+    validate_name_for_kind(AddonKind::Depth, &index.model_id)?;
     if index.files.len() != 3 {
         return Err("Depth index must contain ONNX, LICENSE and NOTICE".into());
     }
@@ -26,8 +26,8 @@ pub fn validate_index(index: &ModelIndex) -> Result<(), String> {
         .collect();
     let mut total = 0u64;
     for file in &index.files {
-        validate_name(&file.name)?;
-        validate_hash(&file.sha256)?;
+        validate_name_for_kind(AddonKind::Depth, &file.name)?;
+        validate_hash_for_kind(AddonKind::Depth, &file.sha256)?;
         if !names.insert(file.name.to_ascii_lowercase()) {
             return Err("Duplicate or reserved depth filename".into());
         }
@@ -45,8 +45,8 @@ pub fn validate_index(index: &ModelIndex) -> Result<(), String> {
             }
             let mut sum = 0u64;
             for part in &file.parts {
-                validate_name(&part.name)?;
-                validate_hash(&part.sha256)?;
+                validate_name_for_kind(AddonKind::Depth, &part.name)?;
+                validate_hash_for_kind(AddonKind::Depth, &part.sha256)?;
                 if !names.insert(part.name.to_ascii_lowercase()) {
                     return Err("Duplicate depth asset name".into());
                 }
