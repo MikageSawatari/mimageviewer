@@ -1459,7 +1459,7 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 利用者提示のOpus設計A/Bに基づく、汎用resume解決境界の修正。
 独立レビュー（Sol/xhigh、2026-11-06）は「症状パッチではなく構造的修正」であることに合意した。
-ClaudeCode側の合意はOpusが検収で行う。
+ClaudeCode（Opus）も検収で同じ主張に合意した（2026-11-06、再レビューACCEPT後）。
 `app.rs`のdeferred open / AutoFullscreenFolderで復元拒否後を通常の先頭選択へ戻し、
 PDF/EPUBそのものから列挙した本の旧raw採否は準備済みindexとRemoteで共有する。
 detachedのowner・述語・HWND・placementを維持し、共通resume処理の結果として終了/openの到達結果が変わる。
