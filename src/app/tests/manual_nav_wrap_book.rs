@@ -783,7 +783,10 @@ fn manual_nav_wrap_nonwrapped_hidden_pdf_lands_on_plain_image() {
 #[test]
 fn manual_nav_wrap_permission_free_hidden_skip_keeps_other_routes_unchanged() {
     for route in [
-        BookTargetRoute::FullscreenOpen(FsMetadataBoundary::Manual),
+        BookTargetRoute::FullscreenOpen {
+            metadata_boundary: FsMetadataBoundary::Manual,
+            resume_notice: None,
+        },
         BookTargetRoute::ZipDfs(BookDfsContinuation::Navigation { forward: true }),
         BookTargetRoute::Slideshow { slice: None },
     ] {

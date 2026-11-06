@@ -224,16 +224,26 @@ policy変更やrefresh後に古いVを新snapshotへmergeしない。rename/dele
 ### 5.5 ページidentityによる復元と旧raw記録（r3追加、Q15）
 
 **2026-11-06 修正（利用者決定）:** 旧rawを拒否する条件は、除外設定の存在ではなく、
-種類除外がその読書ページ列の一部を消し得ることとする。全行が同じ文書の`PdfPage`なら、
+種類除外がその読書ページ列の一部を消し得ることとする。列挙元そのものがPDF/EPUBの本で、
+全行が同じ文書の`PdfPage`なら、
 PDF/EPUBの採否は文書全体にしか作用せずraw indexはずれないため、除外なしと同じ範囲・
 読書ページ検証で旧rawを採用する。フォルダ・ZIP・Collection・複数文書などの混在列では
 除外ありの旧raw拒否を維持する。PCとRemoteは同じ述語を使い、PCの準備済みindexは
-行削除・採用された行追加に合わせて文書別の整数slot集合を更新する。
+行削除・採用された行追加に合わせて文書別の整数slot集合と列挙元の資格を維持する。
+資格はPCの既存`ProjectionRecipe::Book(Document)`／文書materializerとRemoteの文書列挙入口で
+確定し、indexの単一の所有値へ渡す。評価・検索・Collectionなどの投影後にPDFページだけが
+残っても資格を昇格しない。一般列の行削除や追加から単一文書になった場合も旧rawを拒否する。
 
 本をページ表示で開くPCのdeferred open / AutoFullscreenFolderでは、旧raw拒否または
-保存identityの非表示を通知・理由と対象pathをログ記録した後、通常の先頭ページ選択へ進む。
+保存identityの非表示を解決結果として保持して通常の先頭ページ選択へ進み、実open後に
+理由を通知・対象pathとともにログ記録する。警告発行は一箇所に保ち、補正・360案内が
+同期open内で発行された場合も、最後は復元見送りの警告を表示する。遅延・取消・forkは
+既存open要求と同じ寿命で扱い、独立したpendingは追加しない。
 製本の先頭または既存の可視ページ探索を使い、保存位置に近いページは探さない。
-先頭を開いた後の読書位置は通常どおり保存する。グリッドだけを開く場合のcursor復元は
+利用者決定の帰結として、自動で先頭を開いた時点で通常の読書位置保存が走り、旧記録は
+その先頭の位置へ置き換わる。並べ替え済み製本では投影後indexでなくcanonical位置を保存する。
+従来のグリッドで選ぶ場合は、利用者がページを選ぶまで旧記録が残っていた。
+グリッドだけを開く場合のcursor復元は
 見送りのまま動かさない。Remoteで本当に復元を見送る場合は、従来どおりグリッドと案内を維持する。
 新しいpendingや回復機構は設けず、既存のresume→先頭選択に戻すことで分岐を減らす。
 
@@ -294,6 +304,45 @@ core / Remote / EPUB workerの3実行体と依存DLLを生成し、`vcrt-pe`はr
 HEADは`c1c25d0d5`のまま、11ファイルの差分を保持。通常のPowerShellで実行できる
 `target/commit-pdf-legacy-resume.ps1`を用意し、構文を検査した。このscriptはブランチを確認し、
 全体fmt後に今回の11パスだけをaddし、pathspec付きcommitを行う。push / merge / アプリ起動は含まない。
+
+**独立レビュー1回目の指摘対応（2026-11-06、基準`d6ed3c21c`）:**
+P2-1・P2-2はともにコードと修正前テストで確認した。投影後の行から文書資格を推測せず、
+列挙元の資格を準備済みindexへ渡す。見送り通知は解決から分離し、既存open要求に値として
+付けて実open完了時に発行する。グリッドcursor復元の通知は即時のまま維持した。
+独立`gpt-6.1-sol / xhigh`の読み取り専用レビューはACCEPT、追加P1/P2/P3なし。
+
+次の4件は製品コード修正前に追加し、`d6ed3c21c`で全件失敗（exit 100）を確認した。
+
+- `projected_aggregate_with_only_one_pdf_keeps_legacy_resume_unverified`
+- `projected_aggregate_pdf_rows_keep_remote_legacy_resume_unverified`
+- `resume_refusal_deferred_warning_survives_first_page_adjustment_notice`
+- `resume_refusal_auto_warning_survives_first_page_adjustment_notice`
+
+追加の保護回帰は次の7件。これらの修正前実行は行っていない。
+
+- `document_resume_qualification_comes_from_recipe_not_retained_document_anchor`
+- `resume_refusal_open_warning_survives_cached_panorama_hint`
+- `resume_refusal_composed_fallback_saves_canonical_first_page_position`
+- `resume_notice_survives_permission_recheck_and_open_feedback`
+- `resume_notice_is_discarded_with_cancelled_or_hidden_permission_target`
+- `resume_notice_follows_materialized_open_into_its_detached_context`
+- `resume_notice_survives_live_and_index_only_sidecar_open_continuations`
+
+修正後の重点nextestは上記11件と既存回帰を含む29件すべて成功（exit 0）。
+ログは`target/pdf-review1-red.log`と`target/pdf-review1-focused.log`。
+`cargo fmt`後の`cargo fmt --check`・`git diff --check`も成功した。
+`test-focused.ps1`は広域入力としてexit 2となり、続けた`test-lib-full.ps1`は
+**15,661成功、失敗0、71 skipped、exit 0**（755.977秒、10 slow）。台帳は
+`target/test-lib-full/65c0d9697e22fe69f3d0c8a26663eda3c0df65dbf4be64cd226ebc77fac0e555.json`、
+実行ログは`target/test-lib-full/runs/20261106T022421374Z-12155334/`。
+全件テスト後の変更はこの検証記録とQ15の通知順序の文書訂正のみ。
+UI文言は変更しておらず、製品ページ`htdocs/mimageviewer/index.html`にも差分はない。
+`build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0`もexit 0で成功し、
+通常featureのcore / Remote / EPUB workerを配置した（`vcrt-pe`: runtime=4 / pe=3）。
+製品バイナリは起動していない。
+今回も14パスを明示した`git add`が共通Git管理領域の`index.lock`作成権限で失敗し、
+コミットは行えなかった。HEADは`d6ed3c21c`のまま、差分を保持して利用者へ返す。
+依頼どおり追加のコミット用scriptや回避操作は行わない。
 
 **ネスト書庫の同名衝突の制限（利用者決定、2026-10-08、選択肢(a)）:**
 同じ外側書庫に実directory `book.zip/` とネスト書庫file `book.zip` が共存する構成は非対応。
@@ -444,7 +493,7 @@ IDは以前の議論と対応させ、仕様内容はr4の推奨から変更し�
 | Q7 | JPEG＋MP4のfolderで動画を除外すると、JPEGだけの本として自動open/畳み込みする | 非空の表示mediaが全画像で子コンテナなし。全画像除外なら非本。通常/Remote/page countを揃える |
 | Q11 | 種類設定の確定時、検索結果・サブ展開・一時snapshotを閉じて元場所へ戻す | 一時結果が失われる影響を受け入れ、既存reloadを使う。各producerの再実行案は採らない |
 | Q12 | PC viewerでは動画除外後も再生中の動画を継続し、開いている本の読順もsession終了まで保持する | 次の一覧生成/open/reloadから新policyを適用。Remoteは§6の次のlist/readで最新設定を照合する。全windowへの即時適用なら中断動作と所有変更を再相談 |
-| Q15 | ページidentityも保存し、旧raw記録は種類除外がページ列の一部を消し得るときに復元を見送る。単一PDF/EPUBのページ列は旧rawを採用（§5.5、2026-11-06修正） | PCのページ表示openは通知後に通常の先頭へ進む。グリッドcursorは動かさず、Remoteの見送りもグリッドを維持。追加optional列・raw-only失効trigger・新版→旧版→新版回帰は保持 |
+| Q15 | ページidentityも保存し、旧raw記録は種類除外がページ列の一部を消し得るときに復元を見送る。列挙元が単一PDF/EPUBの本なら旧rawを採用（§5.5、2026-11-06修正） | PCのページ表示openは通常の先頭へ進み、実open後に通知する。グリッドcursorは動かさず、Remoteの見送りもグリッドを維持。追加optional列・raw-only失効trigger・新版→旧版→新版回帰は保持 |
 | Q16 | 内部書庫の列挙来歴を追加し、旧変換cacheの来歴が必要なときは再変換を求める（§3.1） | ZIP内book.zipを除外してnotes.zipという実folderは残す。旧cacheの再変換に時間がかかる影響を受け入れ、内部書庫を今回対象外にする案は不採用 |
 | Q17 | collection並べ替えは非表示entryの元slotを固定し、可視entryだけを入れ替える（§5.4）。A,H,B,J,C→C,H,A,J,B（H/JがPNG） | 全ID保存・revision検証を維持。編集画面だけ全登録を見せる例外案は不採用 |
 

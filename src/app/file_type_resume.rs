@@ -24,6 +24,7 @@ pub(crate) struct PreparedPageIdentityIndex {
     // Group accepted rows by their actual document, independently of logical identity
     // aliases. None contains every non-document row. Deletion only remaps integers.
     legacy_resume_rows: HashMap<Option<Arc<Path>>, Vec<usize>>,
+    legacy_resume_source: LegacyResumeSource,
     overview_metadata: Arc<PageOverviewMetadata>,
 }
 
@@ -35,15 +36,40 @@ pub(crate) enum PositionResolution {
     InvalidRaw,
 }
 
-/// Type exclusions cannot shift a sequence consisting solely of one document's
-/// pages: PDF/EPUB visibility admits or rejects the entire document. Callers may
+/// Provenance of the enumeration, captured before visibility projection. A
+/// projected aggregate never becomes a document book just because its other rows vanish.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum LegacyResumeSource {
+    #[default]
+    General,
+    Document(Arc<Path>),
+}
+
+impl LegacyResumeSource {
+    pub(crate) fn from_recipe(recipe: &super::book_materialization::ProjectionRecipe) -> Self {
+        use super::book_materialization::{BookScope, ProjectionRecipe};
+        match recipe {
+            ProjectionRecipe::Book(BookScope::Document(path)) => {
+                Self::Document(Arc::from(path.as_path()))
+            }
+            _ => Self::General,
+        }
+    }
+}
+
+/// Type exclusions cannot shift a document book's own page enumeration:
+/// PDF/EPUB visibility admits or rejects the entire document. Callers may
 /// pass either all rows or their distinct, nonempty source groups.
 pub(crate) fn legacy_raw_resume_allowed<'a>(
     policy: &FileTypeVisibility,
+    source: &LegacyResumeSource,
     sources: impl IntoIterator<Item = Option<&'a Path>>,
 ) -> bool {
     if policy.is_all_visible() {
         return true;
+    }
+    if !matches!(source, LegacyResumeSource::Document(_)) {
+        return false;
     }
     let mut sources = sources.into_iter();
     let Some(Some(document)) = sources.next() else {
@@ -58,6 +84,20 @@ impl PreparedPageIdentityIndex {
         items: &[GridItem],
         logical_container: Option<&Path>,
         policy: FileTypeVisibility,
+    ) -> Self {
+        Self::prepare_for_source(
+            items,
+            logical_container,
+            policy,
+            LegacyResumeSource::General,
+        )
+    }
+
+    pub(crate) fn prepare_for_source(
+        items: &[GridItem],
+        logical_container: Option<&Path>,
+        policy: FileTypeVisibility,
+        legacy_resume_source: LegacyResumeSource,
     ) -> Self {
         let mut identities = HashMap::new();
         let mut readable_indices = std::collections::HashSet::new();
@@ -91,6 +131,7 @@ impl PreparedPageIdentityIndex {
             current_slots: (0..items.len()).map(Some).collect(),
             readable_indices,
             legacy_resume_rows,
+            legacy_resume_source,
             overview_metadata: Arc::new(
                 PageOverviewMetadata::new(overview_entries)
                     .expect("prepared items have unique integer indices"),
@@ -116,6 +157,7 @@ impl PreparedPageIdentityIndex {
         };
         Self {
             policy: self.policy.clone(),
+            legacy_resume_source: self.legacy_resume_source.clone(),
             identities: Arc::clone(&self.identities),
             shift_identities: Arc::clone(&self.shift_identities),
             current_slots: self
@@ -153,12 +195,16 @@ impl PreparedPageIdentityIndex {
         let mut identities = HashMap::new();
         let mut readable_indices = self.readable_indices.clone();
         let mut legacy_resume_rows = self.legacy_resume_rows.clone();
+        let mut legacy_resume_source = self.legacy_resume_source.clone();
         for (document, indices) in &additions.legacy_resume_rows {
             let accepted: Vec<_> = indices
                 .iter()
                 .filter_map(|&index| slots.get(index).copied().flatten())
                 .collect();
             if !accepted.is_empty() {
+                if self.legacy_resume_source != additions.legacy_resume_source {
+                    legacy_resume_source = LegacyResumeSource::General;
+                }
                 legacy_resume_rows
                     .entry(document.clone())
                     .or_default()
@@ -222,6 +268,7 @@ impl PreparedPageIdentityIndex {
             current_slots: (0..len).map(Some).collect(),
             readable_indices,
             legacy_resume_rows,
+            legacy_resume_source,
             overview_metadata: Arc::new(
                 PageOverviewMetadata::new(overview_entries.into_values())
                     .expect("worker merge has unique accepted integer indices"),
@@ -240,6 +287,7 @@ impl PreparedPageIdentityIndex {
         }
         if !legacy_raw_resume_allowed(
             &self.policy,
+            &self.legacy_resume_source,
             self.legacy_resume_rows
                 .keys()
                 .map(|source| source.as_deref()),
@@ -308,6 +356,84 @@ mod tests {
     use super::*;
 
     #[test]
+    fn projected_aggregate_with_only_one_pdf_keeps_legacy_resume_unverified() {
+        let mut policy = FileTypeVisibility::default();
+        policy.excluded_extensions.insert("png".into());
+        let mut original = vec![GridItem::Image("0.png".into())];
+        original.extend((0..3).map(|page_num| GridItem::PdfPage {
+            pdf_path: "book.pdf".into(),
+            page_num,
+            content_type: None,
+        }));
+        let saved = ReadingPosition {
+            page: 2,
+            identity: None,
+        };
+        let projected = PreparedPageIdentityIndex::prepare(&original[1..], None, policy.clone());
+        assert_eq!(
+            projected.resolve(&saved),
+            PositionResolution::LegacyWithExclusions
+        );
+        let removed = PreparedPageIdentityIndex::prepare(&original, None, policy.clone())
+            .without_removed_indices(&[0]);
+        assert_eq!(
+            removed.resolve(&saved),
+            PositionResolution::LegacyWithExclusions
+        );
+        let merged = PreparedPageIdentityIndex::empty(policy)
+            .with_mapped_additions(&projected, &[Some(0), Some(1), Some(2)]);
+        assert_eq!(
+            merged.resolve(&saved),
+            PositionResolution::LegacyWithExclusions
+        );
+    }
+
+    #[test]
+    fn document_resume_qualification_comes_from_recipe_not_retained_document_anchor() {
+        use super::super::book_materialization::{BookScope, ExtractedSurface, ProjectionRecipe};
+        let path = Path::new("book.pdf");
+        let rows: Vec<_> = (0..3)
+            .map(|page_num| GridItem::PdfPage {
+                pdf_path: path.into(),
+                page_num,
+                content_type: None,
+            })
+            .collect();
+        let mut policy = FileTypeVisibility::default();
+        policy.excluded_extensions.insert("png".into());
+        let saved = ReadingPosition {
+            page: 2,
+            identity: None,
+        };
+        for (recipe, expected) in [
+            (
+                ProjectionRecipe::Book(BookScope::Document(path.into())),
+                PositionResolution::Restored(2),
+            ),
+            (
+                ProjectionRecipe::OrdinaryList,
+                PositionResolution::LegacyWithExclusions,
+            ),
+            (
+                ProjectionRecipe::ExtractedResult(ExtractedSurface::Rating),
+                PositionResolution::LegacyWithExclusions,
+            ),
+            (
+                ProjectionRecipe::ExtractedResult(ExtractedSurface::Collection),
+                PositionResolution::LegacyWithExclusions,
+            ),
+        ] {
+            let prepared = PreparedPageIdentityIndex::prepare_for_source(
+                &rows,
+                Some(path),
+                policy.clone(),
+                LegacyResumeSource::from_recipe(&recipe),
+            );
+            assert_eq!(prepared.resolve(&saved), expected);
+        }
+    }
+
+    #[test]
     fn legacy_document_resume_with_exclusions_survives_row_remapping() {
         let mut policy = FileTypeVisibility::default();
         policy
@@ -325,13 +451,24 @@ mod tests {
                     content_type: None,
                 })
                 .collect();
-            let index = PreparedPageIdentityIndex::prepare(&rows, None, policy.clone());
+            let source = LegacyResumeSource::Document(Arc::from(Path::new(name)));
+            let index = PreparedPageIdentityIndex::prepare_for_source(
+                &rows,
+                None,
+                policy.clone(),
+                source.clone(),
+            );
             assert_eq!(index.resolve(&legacy), PositionResolution::Restored(2));
             assert_eq!(
                 index.without_removed_indices(&[0]).resolve(&legacy),
                 PositionResolution::Restored(2)
             );
-            let additions = PreparedPageIdentityIndex::prepare(&rows[3..], None, policy.clone());
+            let additions = PreparedPageIdentityIndex::prepare_for_source(
+                &rows[3..],
+                None,
+                policy.clone(),
+                source.clone(),
+            );
             let merged = index
                 .without_removed_indices(&[3])
                 .with_mapped_additions(&additions, &[Some(3)]);
@@ -360,7 +497,7 @@ mod tests {
                 );
                 assert_eq!(
                     mixed.without_removed_indices(&[4]).resolve(&legacy),
-                    PositionResolution::Restored(2)
+                    PositionResolution::LegacyWithExclusions
                 );
                 assert_eq!(
                     index
@@ -397,10 +534,11 @@ mod tests {
             page_num: 0,
             content_type: None,
         });
-        let index = PreparedPageIdentityIndex::prepare(
+        let index = PreparedPageIdentityIndex::prepare_for_source(
             &rows,
             Some(Path::new("alias.epub")),
             policy.clone(),
+            LegacyResumeSource::Document(Arc::from(Path::new("alias.epub"))),
         );
         let legacy = ReadingPosition {
             page: 0,

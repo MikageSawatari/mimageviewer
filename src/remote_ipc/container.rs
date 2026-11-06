@@ -2058,6 +2058,7 @@ fn resolve_saved_resume_for_items(
     items: &[crate::grid_item::GridItem],
     saved: &crate::book_resume_db::ReadingPosition,
     policy: &crate::file_type_visibility::FileTypeVisibility,
+    resume_source: &crate::app::file_type_resume::LegacyResumeSource,
 ) -> ResumePageResolution {
     let page = if let Some(identity) = &saved.identity {
         items
@@ -2069,6 +2070,7 @@ fn resolve_saved_resume_for_items(
             .and_then(|item| grid_item_address(container, item))
     } else if crate::app::file_type_resume::legacy_raw_resume_allowed(
         policy,
+        resume_source,
         items.iter().map(|item| match item {
             crate::grid_item::GridItem::PdfPage { pdf_path, .. } => Some(pdf_path.as_path()),
             _ => None,
@@ -5886,6 +5888,7 @@ impl ContainerEngine {
         items: &[crate::grid_item::GridItem],
         resume_supported: bool,
         policy: &crate::file_type_visibility::FileTypeVisibility,
+        resume_source: &crate::app::file_type_resume::LegacyResumeSource,
         canonical_slots: Option<&[usize]>,
     ) -> ResumePageResolution {
         if !resume_supported {
@@ -5910,6 +5913,7 @@ impl ContainerEngine {
             saved.identity.is_none()
                 && crate::app::file_type_resume::legacy_raw_resume_allowed(
                     policy,
+                    resume_source,
                     items.iter().map(|item| match item {
                         crate::grid_item::GridItem::PdfPage { pdf_path, .. } => {
                             Some(pdf_path.as_path())
@@ -5928,7 +5932,14 @@ impl ContainerEngine {
                     ContainerResumeRefusal::SavedPageUnavailable,
                 ))
         } else {
-            resolve_saved_resume_for_items(container, container_path, items, &saved, policy)
+            resolve_saved_resume_for_items(
+                container,
+                container_path,
+                items,
+                &saved,
+                policy,
+                resume_source,
+            )
         };
         if !matches!(resolved, ResumePageResolution::Page(_)) {
             crate::logger::log(format!(
@@ -5993,6 +6004,7 @@ impl ContainerEngine {
             &listing.items,
             true,
             &listing.file_type_visibility,
+            &crate::app::file_type_resume::LegacyResumeSource::General,
             None,
         );
         let source_items = listing.items;
@@ -6312,6 +6324,7 @@ impl ContainerEngine {
             &items,
             at_resume_root,
             &policy,
+            &crate::app::file_type_resume::LegacyResumeSource::General,
             projection
                 .as_ref()
                 .map(|projection| projection.output_to_input.as_slice()),
@@ -6528,6 +6541,9 @@ impl ContainerEngine {
             &items,
             true,
             &policy,
+            &crate::app::file_type_resume::LegacyResumeSource::Document(Arc::from(
+                resolved.logical.as_path(),
+            )),
             projection.as_ref().map(|_| page_order.as_slice()),
         );
         let (resume_page, resume_refusal, open_mode) =
@@ -10036,6 +10052,7 @@ pub(super) mod tests {
                 &items,
                 true,
                 &policy,
+                &crate::app::file_type_resume::LegacyResumeSource::General,
                 Some(&projection.output_to_input),
             ),
             ResumePageResolution::Page(zip_entry_address(&address, "0.png"))
@@ -10053,6 +10070,7 @@ pub(super) mod tests {
                 &items,
                 true,
                 &policy,
+                &crate::app::file_type_resume::LegacyResumeSource::General,
                 Some(&projection.output_to_input),
             ),
             ResumePageResolution::VisibilityRefused(ContainerResumeRefusal::SavedPageUnavailable)
@@ -17125,6 +17143,38 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn projected_aggregate_pdf_rows_keep_remote_legacy_resume_unverified() {
+        let path = Path::new("C:/album");
+        let address = RemoteAddress::file(path.to_string_lossy().into_owned());
+        let items: Vec<_> = (0..3)
+            .map(|page_num| crate::grid_item::GridItem::PdfPage {
+                pdf_path: "C:/book.pdf".into(),
+                page_num,
+                content_type: None,
+            })
+            .collect();
+        let mut policy = crate::file_type_visibility::FileTypeVisibility::default();
+        policy.excluded_extensions.insert("png".into());
+        let saved = crate::book_resume_db::ReadingPosition {
+            page: 2,
+            identity: None,
+        };
+        assert_eq!(
+            resolve_saved_resume_for_items(
+                &address,
+                path,
+                &items,
+                &saved,
+                &policy,
+                &crate::app::file_type_resume::LegacyResumeSource::General
+            ),
+            ResumePageResolution::VisibilityRefused(
+                ContainerResumeRefusal::LegacyPositionUnverified
+            )
+        );
+    }
+
+    #[test]
     fn legacy_document_resume_with_exclusions_resolves_remote_page() {
         let mut policy = crate::file_type_visibility::FileTypeVisibility::default();
         policy
@@ -17145,7 +17195,14 @@ pub(super) mod tests {
                 identity: None,
             };
             assert_eq!(
-                resolve_saved_resume_for_items(&address, path, &items, &saved, &policy),
+                resolve_saved_resume_for_items(
+                    &address,
+                    path,
+                    &items,
+                    &saved,
+                    &policy,
+                    &crate::app::file_type_resume::LegacyResumeSource::Document(Arc::from(path))
+                ),
                 ResumePageResolution::Page(grid_item_address(&address, &items[2]).unwrap())
             );
             let invalid = crate::book_resume_db::ReadingPosition {
@@ -17153,7 +17210,14 @@ pub(super) mod tests {
                 identity: None,
             };
             assert_eq!(
-                resolve_saved_resume_for_items(&address, path, &items, &invalid, &policy),
+                resolve_saved_resume_for_items(
+                    &address,
+                    path,
+                    &items,
+                    &invalid,
+                    &policy,
+                    &crate::app::file_type_resume::LegacyResumeSource::Document(Arc::from(path))
+                ),
                 ResumePageResolution::Unavailable
             );
         }
@@ -17184,7 +17248,15 @@ pub(super) mod tests {
             })
             .collect();
         assert_eq!(
-            engine.resume_page_for_items(&address, path, &items, true, &policy, Some(&slots)),
+            engine.resume_page_for_items(
+                &address,
+                path,
+                &items,
+                true,
+                &policy,
+                &crate::app::file_type_resume::LegacyResumeSource::Document(Arc::from(path)),
+                Some(&slots)
+            ),
             ResumePageResolution::Page(grid_item_address(&address, &items[0]).unwrap())
         );
     }
@@ -17272,7 +17344,14 @@ pub(super) mod tests {
             identity: None,
         };
         assert_eq!(
-            resolve_saved_resume_for_items(&address, path, &items, &legacy, &policy),
+            resolve_saved_resume_for_items(
+                &address,
+                path,
+                &items,
+                &legacy,
+                &policy,
+                &crate::app::file_type_resume::LegacyResumeSource::General
+            ),
             ResumePageResolution::Page(grid_item_address(&address, &items[0]).unwrap()),
         );
         let missing = crate::book_resume_db::ReadingPosition {
@@ -17280,7 +17359,14 @@ pub(super) mod tests {
             identity: None,
         };
         assert_eq!(
-            resolve_saved_resume_for_items(&address, path, &items, &missing, &policy),
+            resolve_saved_resume_for_items(
+                &address,
+                path,
+                &items,
+                &missing,
+                &policy,
+                &crate::app::file_type_resume::LegacyResumeSource::General
+            ),
             ResumePageResolution::Unavailable,
         );
         let missing_exact = crate::book_resume_db::ReadingPosition {
@@ -17293,8 +17379,14 @@ pub(super) mod tests {
                 Some(path),
             ),
         };
-        let exact_result =
-            resolve_saved_resume_for_items(&address, path, &items, &missing_exact, &policy);
+        let exact_result = resolve_saved_resume_for_items(
+            &address,
+            path,
+            &items,
+            &missing_exact,
+            &policy,
+            &crate::app::file_type_resume::LegacyResumeSource::General,
+        );
         assert_eq!(
             exact_result,
             ResumePageResolution::VisibilityRefused(ContainerResumeRefusal::SavedPageUnavailable)

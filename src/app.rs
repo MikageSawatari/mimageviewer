@@ -1891,6 +1891,31 @@ pub(crate) enum FsMetadataBoundary {
     BookAppend(crate::book_append_undo::AppendOperation),
 }
 
+/// A resume refusal travels with the existing open request until its target is admitted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BookResumeNotice {
+    path: PathBuf,
+    resolution: file_type_resume::PositionResolution,
+}
+
+#[derive(Default)]
+enum ResolvedBookResume {
+    Page(usize),
+    Refused(BookResumeNotice),
+    #[default]
+    Unavailable,
+}
+
+impl ResolvedBookResume {
+    fn into_parts(self) -> (Option<usize>, Option<BookResumeNotice>) {
+        match self {
+            Self::Page(index) => (Some(index), None),
+            Self::Refused(notice) => (None, Some(notice)),
+            Self::Unavailable => (None, None),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DetachedViewerBorderlessTransition {
     pub(crate) target_borderless: bool,
@@ -41209,9 +41234,10 @@ impl App {
             }
             DeferredFsTarget::CollectionNavigation(_) => None,
         };
+        let mut resume_notice = None;
         // grid から本を開いた場合は保存済み読書位置 (続きから) を優先。
         if new_idx.is_none() && deferred.resume_to_last_page {
-            new_idx = self.resume_page_for_container();
+            (new_idx, resume_notice) = self.resolve_book_resume_for_container().into_parts();
         }
         if new_idx.is_none() {
             new_idx = match self.composed_book_layout() {
@@ -41233,7 +41259,11 @@ impl App {
             if deferred.from_explicit_open {
                 self.fs_open_intent_from_grid = true;
             }
-            self.open_fullscreen(new_idx, deferred.history_trigger);
+            self.open_fullscreen_with_resume_notice(
+                new_idx,
+                deferred.history_trigger,
+                resume_notice,
+            );
             self.move_grid_cursor(Some(new_idx), crate::app::GridCursorIntent::Automatic);
             self.grid_scroll.set_reveal_requested(true);
             self.update_last_selected_image();
@@ -44121,18 +44151,23 @@ impl App {
             first_display_action,
             sidecar_restore::FirstDisplayAction::AutoFullscreenFolder
         ) {
-            let new_idx = if self.settings.book_open_resume.resumes() {
-                self.resume_page_for_container()
+            let (resume_page, resume_notice) = if self.settings.book_open_resume.resumes() {
+                self.resolve_book_resume_for_container()
             } else {
-                None
+                ResolvedBookResume::default()
             }
-            .or_else(|| self.find_fullscreen_nav_target_filtered(false));
+            .into_parts();
+            let new_idx = resume_page.or_else(|| self.find_fullscreen_nav_target_filtered(false));
             if let Some(new_idx) = new_idx {
                 #[cfg(windows)]
                 {
                     self.fs_open_intent_from_grid = true;
                 }
-                self.open_fullscreen(new_idx, HistoryTrigger::UserChosen);
+                self.open_fullscreen_with_resume_notice(
+                    new_idx,
+                    HistoryTrigger::UserChosen,
+                    resume_notice,
+                );
                 self.move_grid_cursor(Some(new_idx), crate::app::GridCursorIntent::Automatic);
                 self.grid_scroll.set_reveal_requested(true);
                 self.update_last_selected_image();
@@ -62559,36 +62594,65 @@ impl App {
     }
 
     fn resume_page_for_path(&mut self, folder: &Path) -> Option<usize> {
-        let position = self.fenced_book_resume(folder).unwrap_or_else(|| {
+        let (page, notice) = self.resolve_book_resume_for_path(folder).into_parts();
+        self.notify_book_resume(notice);
+        page
+    }
+
+    fn resolve_book_resume_for_container(&self) -> ResolvedBookResume {
+        self.current_folder
+            .as_deref()
+            .map(|folder| self.resolve_book_resume_for_path(folder))
+            .unwrap_or_default()
+    }
+
+    fn resolve_book_resume_for_path(&self, folder: &Path) -> ResolvedBookResume {
+        let Some(position) = self.fenced_book_resume(folder).unwrap_or_else(|| {
             self.book_resume_db
                 .as_ref()
                 .and_then(|db| db.get_position(folder))
-        })?;
+        }) else {
+            return ResolvedBookResume::default();
+        };
         match self.resolve_current_book_position(&position) {
             file_type_resume::PositionResolution::Restored(index)
                 if self.is_readable_page_idx(index) =>
             {
-                Some(index)
+                ResolvedBookResume::Page(index)
             }
+            resolution @ (file_type_resume::PositionResolution::HiddenIdentity
+            | file_type_resume::PositionResolution::LegacyWithExclusions) => {
+                ResolvedBookResume::Refused(BookResumeNotice {
+                    path: folder.to_path_buf(),
+                    resolution,
+                })
+            }
+            _ => ResolvedBookResume::default(),
+        }
+    }
+
+    fn notify_book_resume(&mut self, notice: Option<BookResumeNotice>) {
+        let Some(BookResumeNotice { path, resolution }) = notice else {
+            return;
+        };
+        match resolution {
             file_type_resume::PositionResolution::HiddenIdentity => {
                 crate::logger::log(format!(
                     "book resume skipped: reason=HiddenIdentity path={}",
-                    folder.display()
+                    path.display()
                 ));
                 self.show_feedback_warning("保存した読書位置のページは非表示になっています".into());
-                None
             }
             file_type_resume::PositionResolution::LegacyWithExclusions => {
                 crate::logger::log(format!(
                     "book resume skipped: reason=LegacyWithExclusions path={}",
-                    folder.display()
+                    path.display()
                 ));
                 self.show_feedback_warning(
                     "以前の読書位置はファイル種類の絞り込み中に復元できません".into(),
                 );
-                None
             }
-            _ => None,
+            _ => {}
         }
     }
 
@@ -68426,7 +68490,11 @@ impl App {
     /// が先に descriptor 化して非同期列挙する。この fallback は `current_folder` と
     /// materialized source が一致し、仮想 surface flag がすべて落ちた場合にだけ使う。
     #[cfg(windows)]
-    fn route_materialized_physical_still_open_to_active_context(&mut self, idx: usize) -> bool {
+    fn route_materialized_physical_still_open_to_active_context(
+        &mut self,
+        idx: usize,
+        resume_notice: Option<BookResumeNotice>,
+    ) -> bool {
         if self.active_detached_context_is_at_rest()
             || !matches!(self.navigation_scope, ViewerNavigationScope::Main)
             || self.detached_viewer_main_history_suppression_depth != 0
@@ -68471,7 +68539,11 @@ impl App {
                         detached.page_path_key(index).as_deref() == Some(requested_page.as_str())
                     })
                     .expect("fork retains requested page identity");
-                detached.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
+                detached.open_fullscreen_with_resume_notice(
+                    idx,
+                    crate::app::HistoryTrigger::UserChosen,
+                    resume_notice,
+                );
                 detached
                     .active_detached_session
                     .map(|session| session.window_id)
@@ -70494,6 +70566,23 @@ impl App {
         );
     }
 
+    fn open_fullscreen_with_resume_notice(
+        &mut self,
+        idx: usize,
+        history_trigger: HistoryTrigger,
+        resume_notice: Option<BookResumeNotice>,
+    ) {
+        self.open_fullscreen_with_metadata_boundary(
+            idx,
+            history_trigger,
+            FsOpenMaterialization::Eager,
+            FsPageLoadContract::Sequential,
+            None,
+            FsMetadataBoundary::Manual,
+            resume_notice,
+        );
+    }
+
     pub(crate) fn open_fullscreen_with_materialization(
         &mut self,
         idx: usize,
@@ -70564,6 +70653,7 @@ impl App {
             load_contract,
             perf,
             FsMetadataBoundary::Manual,
+            None,
         );
     }
 
@@ -70577,6 +70667,7 @@ impl App {
             FsPageLoadContract::Sequential,
             None,
             FsMetadataBoundary::RatingMembership,
+            None,
         );
         if let Some(toast) = toast {
             self.fs_feedback_toast = Some(toast);
@@ -70596,6 +70687,7 @@ impl App {
         load_contract: FsPageLoadContract,
         mut perf: Option<&mut FsOpenPerfRecorder>,
         boundary: FsMetadataBoundary,
+        resume_notice: Option<BookResumeNotice>,
     ) {
         if self.remote_session_blocks_local_control() {
             crate::logger::log("remote_ipc: rejected fullscreen open outside Local phase");
@@ -70612,22 +70704,24 @@ impl App {
         let Some(idx) = self.poll_and_remap_book_target(&composition_ctx, idx) else {
             return;
         };
-        if self.defer_book_composition_fullscreen_open_with_metadata_boundary(
+        if self.defer_book_composition_fullscreen_open_with_notice(
             idx,
             history_trigger,
             requested_materialization,
             load_contract,
             book_composition_permission::BookTargetPurpose::Explicit,
             boundary,
+            resume_notice.clone(),
         ) {
             return;
         }
-        if self.defer_sidecar_restore_fullscreen_with_metadata_boundary(
+        if self.defer_sidecar_restore_fullscreen_with_notice(
             idx,
             history_trigger,
             requested_materialization,
             load_contract,
             boundary,
+            resume_notice.clone(),
         ) {
             return;
         }
@@ -70636,7 +70730,10 @@ impl App {
         let route_materialized_perf_t0 = start_fs_open_perf_span(&perf);
         #[cfg(windows)]
         let routed_materialized_physical_still = boundary == FsMetadataBoundary::Manual
-            && self.route_materialized_physical_still_open_to_active_context(idx);
+            && self.route_materialized_physical_still_open_to_active_context(
+                idx,
+                resume_notice.clone(),
+            );
         #[cfg(windows)]
         finish_fs_open_perf_span(
             &mut perf,
@@ -71167,6 +71264,7 @@ impl App {
             FsOpenPerfSpan::StartMetadataLoad,
             start_metadata_load_perf_t0,
         );
+        self.notify_book_resume(resume_notice);
         finish_fs_open_perf_span(&mut perf, FsOpenPerfSpan::Total, total_perf_t0);
     }
 
