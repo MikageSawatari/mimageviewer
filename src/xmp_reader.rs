@@ -11,6 +11,7 @@
 //! path は見出し・keyword・XMP payload を部分読みし、画像本体は seek で飛ばす。
 //! bytes も Cursor 経由で同じ走査を使う。fallback は先頭 512KB 以内、かつ
 //! JPEG/PNG/WebP では探索中に到達した最初の画像データの手前に限定する。
+//! PNG tEXt は iTXt と範囲限定 fallback の後で、本文全体から packet を切り出す。
 
 use quick_xml::XmlVersion;
 use quick_xml::events::Event;
@@ -136,7 +137,7 @@ pub fn read_tweet_info_from_bytes(bytes: &[u8]) -> Option<XmpTweetInfo> {
 
 /// XMP 由来の各パース結果をまとめて返す bundle 型。
 /// `xtw:*` (mXD X/Twitter) と GPano パノラマプロパティはどちらも同じ XMP packet を
-/// 参照するため、1 回のファイル読み + extract_xmp_packet で両方を取り出して
+/// 参照するため、1 回の部分読み・パケット抽出で両方を取り出して
 /// I/O を半減する (Codex P2 第 19 ラウンド)。
 #[derive(Clone, Debug, Default)]
 pub struct XmpReadBundle {
@@ -145,7 +146,7 @@ pub struct XmpReadBundle {
 }
 
 /// パスから XMP 関連情報をまとめて読む。`read_tweet_info` + `read_panorama_info`
-/// と等価だが、I/O と extract_xmp_packet を **1 回** で済ます (Codex P2 第 19 ラウンド)。
+/// と等価だが、I/O とパケット抽出を **1 回** で済ます (Codex P2 第 19 ラウンド)。
 ///
 /// 戦略は [`read_tweet_info`] と同じ:
 /// - Magic が JPEG / PNG / WebP: 見出し・XMP payload の部分読み
@@ -161,8 +162,8 @@ pub fn read_xmp_bundle(path: &Path) -> XmpReadBundle {
         .unwrap_or_default()
 }
 
-/// バイト列版。`has_xmp_capable_magic` と `extract_xmp_packet` を 1 回ずつしか
-/// 実行しないので、tweet + panorama を別関数で 2 回読むのに比べて約半分のコスト。
+/// バイト列版。共通の `read_xmp_packet_from_bytes` で magic 判定・抽出を 1 回だけ行い、
+/// tweet と panorama の両パーサへ同じ packet を渡す。
 pub fn read_xmp_bundle_from_bytes(bytes: &[u8]) -> XmpReadBundle {
     let Some(packet) = read_xmp_packet_from_bytes(bytes) else {
         return XmpReadBundle::default();
@@ -232,6 +233,7 @@ pub(crate) fn read_xmp_packet_from_path(path: &Path) -> io::Result<XmpPacketRead
 /// bytes 版も path 版と同じ Read + Seek の走査を使う。
 /// この内部抽出関数は従来どおり未知 magic の raw fallback も許可する。
 /// 公開 API の magic ゲートは `read_xmp_packet_from_bytes` が同じ走査内で行う。
+#[cfg(test)]
 pub(crate) fn extract_xmp_packet(bytes: &[u8]) -> Option<Vec<u8>> {
     extract_xmp_packet_from_bytes(bytes, false)
 }
@@ -257,6 +259,8 @@ fn extract_xmp_packet_from_bytes(bytes: &[u8], gate_magic: bool) -> Option<Vec<u
 struct XmpScan {
     packet: Option<Vec<u8>>,
     image_start: Option<u64>,
+    /// File order; read these bodies only after the bounded fallback misses.
+    png_text_ranges: Vec<(u64, u64)>,
 }
 
 struct XmpPacketReader<R> {
@@ -319,7 +323,16 @@ impl<R: Read + Seek> XmpPacketReader<R> {
             .unwrap_or(self.len)
             .min(FALLBACK_SCAN_LIMIT as u64);
         let bytes = self.read_vec_at(0, end)?;
-        Ok(extract_xmp_fallback(&bytes))
+        if let Some(packet) = extract_xmp_fallback(&bytes) {
+            return Ok(Some(packet));
+        }
+        for (start, length) in scan.png_text_ranges {
+            let text = self.read_vec_at(start, length)?;
+            if let Some(packet) = extract_xmp_xml(&text) {
+                return Ok(Some(packet));
+            }
+        }
+        Ok(None)
     }
 
     fn scan_jpeg(&mut self) -> io::Result<XmpScan> {
@@ -333,8 +346,8 @@ impl<R: Read + Seek> XmpPacketReader<R> {
             }
             if marker[1] == 0xda {
                 return Ok(XmpScan {
-                    packet: None,
                     image_start: Some(pos),
+                    ..XmpScan::default()
                 });
             }
             pos += 2;
@@ -356,7 +369,7 @@ impl<R: Read + Seek> XmpPacketReader<R> {
                             pos + 2 + id.len() as u64,
                             length - 2 - id.len() as u64,
                         )?),
-                        image_start: None,
+                        ..XmpScan::default()
                     });
                 }
             }
@@ -368,9 +381,8 @@ impl<R: Read + Seek> XmpPacketReader<R> {
     fn scan_png(&mut self) -> io::Result<XmpScan> {
         let mut pos = 8;
         let mut scan = XmpScan::default();
-        // Keep only the first tEXt location. An XMP iTXt always takes priority,
-        // including its legacy early termination for malformed/compressed data.
-        let mut text_range = None;
+        // Record tEXt locations without making them a structural result.
+        // iTXt and the legacy bounded fallback both take priority over tEXt.
         while self.len - pos >= 8 {
             let mut header = [0; 8];
             self.read_at(pos, &mut header)?;
@@ -393,7 +405,7 @@ impl<R: Read + Seek> XmpPacketReader<R> {
                     let text_start = data_start + kw_end as u64 + 1;
                     let rest_len = length - kw_end as u64 - 1;
                     if kind == b"tEXt" {
-                        text_range.get_or_insert((text_start, rest_len));
+                        scan.png_text_ranges.push((text_start, rest_len));
                     } else {
                         let rest = self.read_vec_at(text_start, rest_len)?;
                         scan.packet = parse_xmp_itxt(&rest).map(<[u8]>::to_vec);
@@ -404,9 +416,6 @@ impl<R: Read + Seek> XmpPacketReader<R> {
                 break;
             }
             pos = data_start + length + 4;
-        }
-        if let Some((start, length)) = text_range {
-            scan.packet = Some(self.read_vec_at(start, length)?);
         }
         Ok(scan)
     }
@@ -597,6 +606,11 @@ fn legacy_extract_xmp_from_png(bytes: &[u8]) -> Option<Vec<u8>> {
 const FALLBACK_SCAN_LIMIT: usize = 512 * 1024;
 fn extract_xmp_fallback(bytes: &[u8]) -> Option<Vec<u8>> {
     let scan = &bytes[..bytes.len().min(FALLBACK_SCAN_LIMIT)];
+    extract_xmp_xml(scan)
+}
+
+/// 切り出し規則は fallback と同じ。PNG tEXt 本文には 512KB 制限をかけない。
+fn extract_xmp_xml(scan: &[u8]) -> Option<Vec<u8>> {
     let start = find_subsequence(scan, b"<x:xmpmeta")?;
     let end_needle = b"</x:xmpmeta>";
     let rel_end = find_subsequence(&scan[start..], end_needle)?;
@@ -1943,7 +1957,7 @@ mod tests {
         jpeg.extend_from_slice(&payload);
         jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0xFF, 0xD9]); // SOS+EOI
 
-        // 1 回読み込み (= extract_xmp_packet 1 回) で両方拾えることを検証
+        // 1 回のパケット抽出で両方拾えることを検証
         let bundle = read_xmp_bundle_from_bytes(&jpeg);
         let tweet = bundle.tweet.expect("xtw should be parsed");
         let panorama = bundle.panorama.expect("GPano should be parsed");

@@ -206,9 +206,128 @@ fn png_partial_read_itxt_has_priority_over_first_text() {
     check_fixture(
         &png(&[(b"tEXt", &first), (b"tEXt", &second)]),
         "png",
-        Some(b"first text"),
-        false,
+        None,
+        true,
     );
+}
+
+#[test]
+fn png_partial_read_empty_text_does_not_hide_later_xmp() {
+    let empty = png_text(b"", false, false);
+    let valid = png_text(XML, false, false);
+    let bytes = png(&[
+        (b"IHDR", &[0; 13]),
+        (b"tEXt", &empty),
+        (b"tEXt", &valid),
+        (b"IDAT", &[0; 16]),
+        (b"IEND", &[]),
+    ]);
+    check_fixture(&bytes, "png", Some(XML), true);
+}
+
+#[test]
+fn png_partial_read_non_xml_text_does_not_hide_later_xmp() {
+    let junk = png_text(b"not XML", false, false);
+    let valid = png_text(XML, false, false);
+    let bytes = png(&[
+        (b"IHDR", &[0; 13]),
+        (b"tEXt", &junk),
+        (b"tEXt", &valid),
+        (b"IDAT", &[0; 16]),
+        (b"IEND", &[]),
+    ]);
+    check_fixture(&bytes, "png", Some(XML), true);
+}
+
+#[test]
+fn png_partial_read_empty_text_before_idat_finds_late_text_xmp() {
+    let empty = png_text(b"", false, false);
+    let valid = png_text(XML, false, false);
+    let bytes = png(&[
+        (b"tEXt", &empty),
+        (b"IDAT", &vec![0; 600_000]),
+        (b"tEXt", &valid),
+        (b"IEND", &[]),
+    ]);
+    assert!(check_fixture(&bytes, "png", Some(XML), false) < 2_000);
+}
+
+#[test]
+fn png_partial_read_all_non_xml_text_returns_none() {
+    let empty = png_text(b"", false, false);
+    let junk = png_text(b"not XML", false, false);
+    let bytes = png(&[
+        (b"tEXt", &empty),
+        (b"IDAT", &vec![0; 600_000]),
+        (b"tEXt", &junk),
+        (b"tEXt", &png_text(b"<x:xmpmeta missing end", false, false)),
+        (b"IEND", &[]),
+    ]);
+    check_fixture(&bytes, "png", None, true);
+}
+
+#[test]
+fn png_partial_read_text_body_scan_is_not_limited_to_512kb() {
+    let mut body = vec![b' '; 600_000];
+    body.extend_from_slice(XML);
+    body.extend_from_slice(b"trailing text");
+    let text = png_text(&body, false, false);
+    let bytes = png(&[(b"IDAT", &[0; 16]), (b"tEXt", &text), (b"IEND", &[])]);
+    check_fixture(&bytes, "png", Some(XML), false);
+}
+
+#[test]
+fn png_partial_read_bounded_fallback_precedes_deferred_text_body() {
+    let mut bytes = png(&[(b"junk", XML), (b"IDAT", &vec![0; 600_000])]);
+    let mut text = png_text(b"", false, false);
+    text.resize(1_000_000, b' ');
+    text.extend_from_slice(b"<x:xmpmeta>later packet</x:xmpmeta>");
+    let data_start = bytes.len() as u64 + 8;
+    png_chunk(&mut bytes, b"tEXt", &text);
+    png_chunk(&mut bytes, b"IEND", &[]);
+    check_fixture(&bytes, "png", Some(XML), true);
+    let audited = AuditedReader {
+        inner: Cursor::new(bytes.as_slice()),
+        forbidden: data_start + 80..data_start + text.len() as u64,
+        bytes_read: 0,
+    };
+    let mut reader = XmpPacketReader {
+        inner: audited,
+        len: bytes.len() as u64,
+        bytes_read: 0,
+    };
+    assert_eq!(reader.extract(true).unwrap().as_deref(), Some(XML));
+}
+
+#[test]
+fn png_partial_read_deferred_text_stops_at_first_packet_in_file_order() {
+    let empty = png_text(b"", false, false);
+    let junk = png_text(b"not XML", false, false);
+    let valid = png_text(XML, false, false);
+    let mut bytes = png(&[
+        (b"IDAT", &vec![0; 600_000]),
+        (b"tEXt", &empty),
+        (b"tEXt", &junk),
+        (b"tEXt", &valid),
+    ]);
+    let mut later = png_text(b"", false, false);
+    later.resize(1_000_000, b' ');
+    later.extend_from_slice(b"<x:xmpmeta>later packet</x:xmpmeta>");
+    let data_start = bytes.len() as u64 + 8;
+    png_chunk(&mut bytes, b"tEXt", &later);
+    png_chunk(&mut bytes, b"IEND", &[]);
+    check_fixture(&bytes, "png", Some(XML), false);
+    let audited = AuditedReader {
+        inner: Cursor::new(bytes.as_slice()),
+        forbidden: data_start + 80..data_start + later.len() as u64,
+        bytes_read: 0,
+    };
+    let mut reader = XmpPacketReader {
+        inner: audited,
+        len: bytes.len() as u64,
+        bytes_read: 0,
+    };
+    assert_eq!(reader.extract(true).unwrap().as_deref(), Some(XML));
 }
 
 #[test]
