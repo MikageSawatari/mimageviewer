@@ -19186,6 +19186,7 @@ pub struct App {
     pub(crate) vlm_setup: crate::ui_dialogs::vlm_addon::VlmSetup,
     pub(crate) depth_setup: crate::ui_dialogs::depth_addon::DepthSetup,
     pub(crate) depth_export_operation: Option<Box<depth_export::Operation>>,
+    pub(crate) depth_export_workers: Option<crate::depth_export::DepthExportWorkers>,
     #[cfg(windows)]
     pub(crate) caption_job: Option<crate::ui_dialogs::caption_job::CaptionJob>,
     #[cfg(windows)]
@@ -20041,6 +20042,7 @@ pub struct App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.retire_depth_export_for_exit();
         #[cfg(windows)]
         self.stop_caption_job_for_exit();
         self.close_local_composition_editor(CompositionEditorCloseReason::Shutdown);
@@ -21988,6 +21990,7 @@ impl App {
             vlm_setup: Default::default(),
             depth_setup: Default::default(),
             depth_export_operation: None,
+            depth_export_workers: None,
             #[cfg(windows)]
             caption_job: None,
             #[cfg(windows)]
@@ -100799,6 +100802,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.retire_depth_export_for_exit();
         #[cfg(windows)]
         self.stop_caption_job_for_exit();
         self.retire_close_return_owners(ViewerCloseCause::AppExit);

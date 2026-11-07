@@ -1,7 +1,7 @@
 //! Frozen 3D-photo export requests and one worker per modal operation.
 use std::path::PathBuf;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -116,6 +116,75 @@ pub(crate) struct DepthExportJob {
     cancel: Arc<AtomicBool>,
     rx: mpsc::Receiver<DepthExportEvent>,
 }
+
+struct ExportWorker {
+    cancel: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct ExportWorkersState {
+    closed: bool,
+    workers: Vec<ExportWorker>,
+}
+
+/// UI-side admission/cancellation only. Join authority stays outside run_native.
+#[derive(Clone)]
+pub(crate) struct DepthExportWorkers(Arc<Mutex<ExportWorkersState>>);
+
+/// The same process-owned lifetime as the collection/composition exit owners.
+pub(crate) struct DepthExportProcessOwner {
+    workers: DepthExportWorkers,
+}
+
+impl Default for DepthExportProcessOwner {
+    fn default() -> Self {
+        Self {
+            workers: DepthExportWorkers(Arc::new(Mutex::new(ExportWorkersState::default()))),
+        }
+    }
+}
+
+impl DepthExportProcessOwner {
+    pub(crate) fn client(&self) -> DepthExportWorkers {
+        self.workers.clone()
+    }
+
+    /// Called only after run_native returns (or while unwinding that outer scope).
+    pub(crate) fn shutdown_and_join(&mut self) {
+        let workers = {
+            let mut state = self.workers.0.lock().unwrap();
+            state.closed = true;
+            for worker in &state.workers {
+                worker.cancel.store(true, Ordering::Relaxed);
+            }
+            std::mem::take(&mut state.workers)
+        };
+        for worker in workers {
+            if worker.thread.join().is_err() {
+                crate::logger::log("[DepthExport] 書き出し worker が異常終了しました");
+            }
+        }
+    }
+}
+
+impl Drop for DepthExportProcessOwner {
+    fn drop(&mut self) {
+        self.shutdown_and_join();
+    }
+}
+
+impl DepthExportWorkers {
+    /// on_exit / App::drop must never join a worker from a UI callback.
+    pub(crate) fn retire(&self) {
+        let mut state = self.0.lock().unwrap();
+        state.closed = true;
+        for worker in &state.workers {
+            worker.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 impl DepthExportJob {
     #[cfg(test)]
     pub(crate) fn controlled_for_test() -> (Self, mpsc::Sender<DepthExportEvent>, Arc<AtomicBool>) {
@@ -130,15 +199,25 @@ impl DepthExportJob {
             cancel,
         )
     }
+    pub(crate) fn try_recv(&self) -> Result<DepthExportEvent, mpsc::TryRecvError> {
+        self.rx.try_recv()
+    }
+    pub(crate) fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+impl DepthExportWorkers {
     pub(crate) fn start(
+        &self,
         request: DepthExportRequest,
         device: wgpu::Device,
         queue: wgpu::Queue,
         ctx: egui::Context,
         viewport: egui::ViewportId,
-    ) -> Result<Self, String> {
+    ) -> Result<DepthExportJob, String> {
         let output = request.output.clone();
-        Self::spawn(ctx, viewport, output, move |cancel, progress| {
+        self.spawn(ctx, viewport, output, move |cancel, progress| {
             let size =
                 request
                     .options
@@ -172,15 +251,24 @@ impl DepthExportJob {
         })
     }
     fn spawn(
+        &self,
         ctx: egui::Context,
         viewport: egui::ViewportId,
         output: PathBuf,
         run: impl FnOnce(&AtomicBool, &dyn Fn(u32, u32)) -> Result<(), ExportFailure> + Send + 'static,
-    ) -> Result<Self, String> {
+    ) -> Result<DepthExportJob, String> {
+        // Serialize admission, spawn and registration with retire/drain. The
+        // worker never takes this lock and no GPU/encode/I/O runs under it.
+        let mut state = self.0.lock().unwrap();
+        if state.closed {
+            return Err("アプリを終了しているため、書き出しを開始できません".into());
+        }
+        // Finished native thread handles can be closed without a UI-side join.
+        state.workers.retain(|worker| !worker.thread.is_finished());
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let (tx, rx) = mpsc::channel();
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("depth-export".into())
             .spawn(move || {
                 let result = run(&worker_cancel, &|completed, total| {
@@ -199,13 +287,11 @@ impl DepthExportJob {
                 ctx.request_repaint_of(viewport);
             })
             .map_err(|error| format!("書き出しを開始できません: {error}"))?;
-        Ok(Self { cancel, rx })
-    }
-    pub(crate) fn try_recv(&self) -> Result<DepthExportEvent, mpsc::TryRecvError> {
-        self.rx.try_recv()
-    }
-    pub(crate) fn cancel(&self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        state.workers.push(ExportWorker {
+            cancel: cancel.clone(),
+            thread,
+        });
+        Ok(DepthExportJob { cancel, rx })
     }
 }
 impl Drop for DepthExportJob {

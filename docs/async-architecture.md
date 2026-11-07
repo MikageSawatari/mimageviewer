@@ -21,6 +21,12 @@ UI は非blockingで drain し、書き出し中の自動運動による連続 r
 取消ボタン・進行窓×は cancel を立て、worker の一時ファイル回収後の終端まで操作 owner を
 保持する。`DepthExportJob::Drop` も cancel を立て、UI では join しない。全形式で
 `mvexport::PartialOutput` を使い、完了時だけ rename、取消・失敗・未完了 Drop で回収する。
+正常終了時の回収権限は `run_native` 外の `DepthExportProcessOwner` が持つ。
+App は受付clientだけを保持し、`on_exit` と App の Drop は受付停止・cancelのみ行う。
+spawnとhandle登録を同じ短いmutex区間で行い、終了のdrainと競合しても取りこぼさない。
+`finish_run_native` の既存cleanup先頭でhandleをlock外へ取り出してjoinするため、
+UI receiverが先に破棄されても `PartialOutput` の回収までプロセスは終了しない。
+完了済みthread handleは次の受付で待たずに破棄し、UIでjoinするreaperや終了deadlineは足さない。
 失敗はログと通知のみで、自動 retry や途中状態の復元は追加しない。
 
 ## 3D 写真の bounded readback と要求所有（2026-11-07、段 B 実装・独立レビュー中）

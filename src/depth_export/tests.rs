@@ -151,6 +151,8 @@ fn depth_export_dimensions_rotate_crop_and_round_mp4_even() {
 #[test]
 fn depth_export_job_drop_cancels_and_cleans_each_format_without_ui_wait() {
     let dir = tempfile::tempdir().unwrap();
+    let mut process = DepthExportProcessOwner::default();
+    let workers = process.client();
     for format in [
         DepthExportFormat::Gif,
         DepthExportFormat::Apng,
@@ -161,33 +163,34 @@ fn depth_export_job_drop_cancels_and_cleans_each_format_without_ui_wait() {
         let (resume_tx, resume_rx) = mpsc::channel();
         let (finished_tx, finished_rx) = mpsc::channel();
         let path = output.clone();
-        let job = DepthExportJob::spawn(
-            egui::Context::default(),
-            egui::ViewportId::ROOT,
-            output.clone(),
-            move |cancel, progress| {
-                let result = encode_frames(
-                    &path,
-                    &options(format),
-                    1.,
-                    [32, 18],
-                    cancel,
-                    |index, _| {
-                        if index == 1 {
-                            entered_tx.send(()).unwrap();
-                            resume_rx.recv().unwrap();
-                        }
-                        frame([32, 18], index)
-                    },
-                    progress,
-                );
-                finished_tx
-                    .send(matches!(result, Err(ExportFailure::Cancelled)))
-                    .unwrap();
-                result
-            },
-        )
-        .unwrap();
+        let job = workers
+            .spawn(
+                egui::Context::default(),
+                egui::ViewportId::ROOT,
+                output.clone(),
+                move |cancel, progress| {
+                    let result = encode_frames(
+                        &path,
+                        &options(format),
+                        1.,
+                        [32, 18],
+                        cancel,
+                        |index, _| {
+                            if index == 1 {
+                                entered_tx.send(()).unwrap();
+                                resume_rx.recv().unwrap();
+                            }
+                            frame([32, 18], index)
+                        },
+                        progress,
+                    );
+                    finished_tx
+                        .send(matches!(result, Err(ExportFailure::Cancelled)))
+                        .unwrap();
+                    result
+                },
+            )
+            .unwrap();
         entered_rx
             .recv_timeout(std::time::Duration::from_secs(30))
             .unwrap();
@@ -201,6 +204,168 @@ fn depth_export_job_drop_cancels_and_cleans_each_format_without_ui_wait() {
         assert!(!output.exists());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
+    process.shutdown_and_join();
+}
+
+#[test]
+fn depth_export_process_exit_reaps_partial_files_after_on_exit_and_app_drop() {
+    for app_drop in [false, true] {
+        for format in [
+            DepthExportFormat::Gif,
+            DepthExportFormat::Apng,
+            DepthExportFormat::Mp4,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let output = dir.path().join(format!("exit.{}", format.extension()));
+            std::fs::write(&output, b"existing destination").unwrap();
+            let mut process = DepthExportProcessOwner::default();
+            let workers = process.client();
+            let mut app = Some(crate::app::setup_app_for_test());
+            app.as_mut().unwrap().depth_export_workers = Some(workers.clone());
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let finished = Arc::new(AtomicBool::new(false));
+            let worker_finished = finished.clone();
+            let path = output.clone();
+            let job = workers
+                .spawn(
+                    egui::Context::default(),
+                    egui::ViewportId::ROOT,
+                    output.clone(),
+                    move |cancel, progress| {
+                        let result = encode_frames(
+                            &path,
+                            &options(format),
+                            1.,
+                            [32, 18],
+                            cancel,
+                            |index, _| {
+                                if index == 1 {
+                                    entered_tx.send(()).unwrap();
+                                    resume_rx.recv().unwrap();
+                                }
+                                frame([32, 18], index)
+                            },
+                            progress,
+                        );
+                        worker_finished.store(true, Ordering::Release);
+                        result
+                    },
+                )
+                .unwrap();
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap();
+            assert_eq!(
+                std::fs::read_dir(dir.path()).unwrap().count(),
+                2,
+                "the test must reach a real partial file before exit"
+            );
+            let cancel = job.cancel.clone();
+            if app_drop {
+                // Discarded UI receivers must not discard the process's join authority.
+                drop(job);
+                drop(app.take());
+            } else {
+                eframe::App::on_exit(&mut **app.as_mut().unwrap(), None);
+                assert!(
+                    cancel.load(Ordering::Relaxed),
+                    "on_exit must signal the live worker"
+                );
+                drop(job);
+            }
+            assert!(cancel.load(Ordering::Relaxed));
+            assert!(
+                !finished.load(Ordering::Acquire),
+                "the UI teardown must not wait for the worker"
+            );
+            assert!(
+                workers
+                    .spawn(
+                        egui::Context::default(),
+                        egui::ViewportId::ROOT,
+                        output.clone(),
+                        |_, _| panic!("retired admission started a new worker")
+                    )
+                    .is_err()
+            );
+            resume_tx.send(()).unwrap();
+            // The actual post-run cleanup function is the completion barrier;
+            // unlike the old Drop test, no completion receiver is waited here.
+            process.shutdown_and_join();
+            assert!(finished.load(Ordering::Acquire));
+            assert_eq!(std::fs::read(&output).unwrap(), b"existing destination");
+            assert_eq!(
+                std::fs::read_dir(dir.path()).unwrap().count(),
+                1,
+                "all temporary files must be gone when process cleanup returns"
+            );
+        }
+    }
+}
+
+#[test]
+fn depth_export_process_shutdown_linearizes_with_spawn_and_closes_surviving_clients() {
+    let mut process = DepthExportProcessOwner::default();
+    let workers = process.client();
+    let starter = workers.clone();
+    let start = Arc::new(std::sync::Barrier::new(2));
+    let worker_start = start.clone();
+    let finished = Arc::new(AtomicBool::new(false));
+    let worker_finished = finished.clone();
+    let producer = std::thread::spawn(move || {
+        worker_start.wait();
+        starter.spawn(
+            egui::Context::default(),
+            egui::ViewportId::ROOT,
+            PathBuf::from("not-written.gif"),
+            move |_, _| {
+                worker_finished.store(true, Ordering::Release);
+                Ok(())
+            },
+        )
+    });
+    start.wait();
+    // No on_exit: renderer failure uses this same fallback boundary.
+    process.shutdown_and_join();
+    match producer.join().unwrap() {
+        Ok(job) => {
+            assert!(job.cancel.load(Ordering::Relaxed));
+            assert!(
+                finished.load(Ordering::Acquire),
+                "registered worker must be joined"
+            );
+        }
+        Err(_) => assert!(!finished.load(Ordering::Acquire)),
+    }
+    process.shutdown_and_join();
+    assert!(
+        workers
+            .spawn(
+                egui::Context::default(),
+                egui::ViewportId::ROOT,
+                PathBuf::from("not-written.gif"),
+                |_, _| panic!("late client started after process cleanup")
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn depth_export_outer_owner_drop_closes_admission_without_on_exit() {
+    let process = DepthExportProcessOwner::default();
+    let workers = process.client();
+    drop(process);
+    assert!(
+        workers
+            .spawn(
+                egui::Context::default(),
+                egui::ViewportId::ROOT,
+                PathBuf::from("not-written.gif"),
+                |_, _| panic!("client outlived process admission")
+            )
+            .is_err()
+    );
 }
 
 #[test]

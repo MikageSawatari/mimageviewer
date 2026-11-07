@@ -1320,6 +1320,76 @@ single-instance mutexも通常版と共有する。段Dの公開文書・実機�
   `docs/ui-responsiveness.md`, `docs/music-video-export-plan.md`, `docs/detached-rework-plan.md`,
   `docs/ui-snapshot-policy.md`。
 
+#### 段 C 独立レビュー1回目 P2: 正常終了時の一時ファイル回収 (2026-11-08)
+
+基点は段C commit `9f38dcd85` と master merge `c4425da6d`。指摘は正当。
+旧実装はspawnの`JoinHandle`を破棄し、JobのDropでcancelを立てるだけだった。
+プロセスがGPU待ち／圧縮の途中で終わると、workerの`PartialOutput`がDropされる前にthreadが
+消える。従来のDropテストは別の完了通知を待ってから検査しており、正常終了の回収境界を検証していなかった。
+
+**既存経路への接続**:
+
+- `src/lib.rs` の `run_native` 外で `DepthExportProcessOwner` を保持し、Appへは受付clientだけを渡す。
+  collection／book-composition／spread-shiftと同じ、既存 `finish_run_native` cleanupへ載せた。
+  Ok／Errの共通cleanup先頭でcancel→handle取出し→lock外joinを完了し、他ownerの長いdrainと
+  scriptの最終`process::exit`より前に回収する。outer ownerのDropも同じ回収関数を使う。
+- `App::on_exit` と AppのDropの先頭ではclientをretireし、受付を閉じて登録済みworkerへcancelを立てるだけ。
+  UI callback／UI frame内でjoinしない。Job receiverが先に失われてもprocess ownerがhandleを保持する。
+- 受付確認・spawn・handle登録を一つの短いmutex区間で行い、retire／drainとの間に登録漏れを作らない。
+  worker本体はこのmutexに触れない。完了済みthreadのhandleは次の受付で`is_finished`を確認して破棄し、
+  activeなhandleは外側の終了回収へ残す。汎用reaper・retry・待機deadlineは追加しない。
+- 既存TRT reaperはpool専用で、exportの回収口にはならない。音楽ビデオは別アプリ
+  (`musicvideo-editor`) のClose受付が `ConfirmExport → StoppingExport → receiver終端` を待つ個別方式。
+  これらを複製／変更せず、既にある本体のprocess cleanupを利用した。
+
+**照合した終了入口**（新しいroot Close policyは追加しない）:
+
+| 入口 | 到達先と回収 |
+| --- | --- |
+| main窓×／OS Close、通常のMainWindowClose割当 | root lifecycleのClose policyが実終了を受理するとeframe `on_exit` → `run_native`復帰 → 共通cleanupでjoin |
+| tray「終了」 | `tray.rs` のquit flag＋WM_CLOSE → tray常駐へのhideを迂回 → 同じon_exit／共通cleanup |
+| ファイルメニュー「終了」、QuitApplication割当（gamepad／ringを含む） | `request_application_quit` → shutdown flag＋root Close → 同じ経路 |
+| installerのshutdown event | `single_instance.rs` が同じshutdown flagとroot Closeへ配送 → 同じ経路 |
+| fullscreenだけ閉じる／兄弟readerを閉じる | 既存のcontext照合付き取消を維持。sourceのworkerはcancel、兄弟は不変。プロセス受付は閉じず、継続利用できる。最終app終了時は残るhandleも共通cleanupで回収 |
+| trayへ隠す／CloseがCancelCloseされた場合 | 実終了ではないためprocess ownerをretireしない。既存のhide／fullscreen閉鎖policyを維持 |
+| Remoteのセッション終了・ローカルへ戻る | Remote／agent IPCに独立の本体Quit命令は無い。セッション退役とプロセス終了を区別。Remote稼働中の本体終了も通常のon_exit／共通cleanup |
+| rendererのErr復帰／creator失敗、on_exitを通らないApp Drop | App Dropのcancelと、Ok／Err共通のouter cleanup。App生成前の失敗ではworker未起動 |
+| test-scriptの正常終了 | `exit_after_run_native`より前に共通cleanupが完了 |
+
+`--play-test` の診断用直接`process::exit`、GUI起動前の早期exit、別worker／開発CLI、
+強制終了・abortは通常の3D書き出し中の終了入口に含めない。異常終了の再試行／孤児復元機構は追加しない。
+
+**cancel確認の区切り**:
+
+全形式で毎frameのGPU描画／読み戻しの前後にcancelを確認し、確認後は次frameへ進まない。
+GIFはそのframeのNeuQuant＋圧縮、APNGはそのframeの`write_image_data`、MP4はそのframeの
+BT.709変換・encoder送信・packet排出が一つの区切り。MP4 finishの入口と全形式のpublish直前にも確認する。
+したがって残り全frame／全loopを処理してから止まる経路はない。既存のGPU `poll(Wait)`、
+圧縮、FFmpeg／ファイルI/Oの一呼出し自体は中断できず、その現在の区切りが返るまでは待つ。
+最大長辺2160の1frameを区切りとし、時間制限つきの待ち・polling sleep・retryは足していない。
+正常に戻る呼出しの完了と資源破棄まで外側で回収する。GPU driver等の異常停止にまで時間上限を約束するものではない。
+
+変更ファイル: `src/depth_export.rs`, `src/depth_export/tests.rs`, `src/app.rs`,
+`src/app/depth_export.rs`, `src/lib.rs`, `docs/async-architecture.md`, 本書。
+**検証結果**（全Cargoに`MSBUILDDISABLENODEREUSE=1`、build/testは`CARGO_BUILD_JOBS=1`）:
+
+| 実行 | 結果・証拠 |
+| --- | --- |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/depth_export::tests::depth_export_(process\|outer\|job_drop)/)' --test-threads 2` | **4/4成功**、exit0、実行6.441秒（初回compile8分19秒）。新規3件と既存Job Drop。`target/depth-c-exit-focused.log` |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/depth\|mvexport\|export\|root_lifecycle\|tray.*quit/)' --test-threads 4` | **303/303成功**、exit0、48.099秒。新規3件を含む終了回収、従来3D/GPU/全形式/音楽ビデオとroot lifecycle／tray回帰。先行4件はこの303件に含まれ、重複加算しない。`target/depth-c-exit-related.log` |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/^run_native_failure::/)' --test-threads 4` | **14/14成功**、exit0、0.551秒。既存の正常／Err／scriptとcleanup順の終了境界を確認。`target/depth-c-exit-boundary.log` |
+| `cargo check --offline -p mimageviewer --bin mimageviewer-core` | 成功、exit0、1分14秒。`target/depth-c-exit-check.log` |
+| 最後にworkspace全体へ引数なし`cargo fmt` → `cargo fmt --check` | 成功、exit0。`target/depth-c-exit-fmt.log`。変更のないsourceで上記test結果を再利用 |
+| `python scripts/check_ui_glyphs.py` / `git diff --check` | 両方exit0、危険なUI文字0。`target/depth-c-exit-glyphs.log` |
+| 独立review（Sol / xhigh、同じreview contextで継続） | **最終ACCEPT、未解決P1/P2なし**。登録と終了の直列化、UIで待たない取消、outer join、実部分ファイル6条件と303/303・14/14ログを照合。reviewerによるCargo重複実行なし |
+
+新しい終了回収testは、GIF／APNG／MP4それぞれで本物の途中ファイルが存在する区切りまで進め、
+workerをgateで停止したまま実`eframe::App::on_exit`またはApp Dropを呼ぶ（6条件）。
+UI側は完了を待たずcancel／新規受付拒否となり、worker再開後は別の完了receiverを待たず
+`shutdown_and_join`だけで回収を確定する。return時のworker完了・一時ファイル消失・既存保存先保持を確認した。
+spawnとshutdownの競合、shutdown後に残るclientの拒否、on_exitを経由しないouter owner Dropも検査した。
+全件gateは指示どおりClaudeCode担当。stage／commit／製品起動は未実施、build-devも指示により実行しない。
+
 ## 11. テスト
 
 - **状態遷移**: OFF → ON → (ページ移動) → ON、× / D で OFF、フルスクリーン終了・フォルダ移動で取り消し。

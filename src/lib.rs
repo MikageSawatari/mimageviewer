@@ -1962,6 +1962,8 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
     gpu_startup_diagnostics::begin(gpu_request);
     let previous_run_report = session.diagnostics.report_handle();
     let diagnostic_checkpoint = session.diagnostics.publisher();
+    let mut depth_export_owner = depth_export::DepthExportProcessOwner::default();
+    let depth_export_workers = depth_export_owner.client();
     let run_result = eframe::run_native(
         "mimageviewer",
         options,
@@ -2024,6 +2026,7 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
                     Arc::clone(&raw_develop_executor),
                 )
             });
+            app.depth_export_workers = Some(depth_export_workers);
             app.install_previous_run_notice(previous_run_report, &cc.egui_ctx);
             app.install_diagnostic_checkpoint(diagnostic_checkpoint, cc.wgpu_render_state.as_ref());
             match collection_install.clone() {
@@ -2200,6 +2203,9 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
             } else {
                 miv_startup::Outcome::Error
             });
+            // Reap cancelled exports before any other potentially long shutdown drain.
+            // The same outer cleanup covers normal close and run_native errors.
+            depth_export_owner.shutdown_and_join();
             // Stop public admission before named-pipe workers, then close the only Remote collection
             // producer before joining the actor. The App normally completed its drain in on_exit; this
             // outer fallback also covers creator failure/panic and is deliberately idempotent.

@@ -552,6 +552,12 @@ pub(crate) struct Operation {
 }
 
 impl App {
+    /// The process owner will join after run_native; no waiting in this callback.
+    pub(crate) fn retire_depth_export_for_exit(&self) {
+        if let Some(workers) = &self.depth_export_workers {
+            workers.retire();
+        }
+    }
     /// A read-only sibling close must never retire the main viewer's export.
     pub(crate) fn cancel_depth_export_for_fullscreen_close(&mut self) {
         let context = self.edit_request_owner_context();
@@ -837,8 +843,8 @@ impl App {
         let request = capture.into_request(op.settings.clone(), options.clone(), output);
         let total = request.options.total_frames(request.settings.period_secs);
         #[cfg(windows)]
-        let result = match &self.wgpu_render_state {
-            Some(render) => DepthExportJob::start(
+        let result = match (&self.wgpu_render_state, &self.depth_export_workers) {
+            (Some(render), Some(workers)) => workers.start(
                 request,
                 render.device.clone(),
                 render.queue.clone(),
@@ -846,7 +852,7 @@ impl App {
                 // Root owns polling even after the source fullscreen closes.
                 egui::ViewportId::ROOT,
             ),
-            None => Err("GPU を利用できません".into()),
+            _ => Err("GPU または書き出し worker を利用できません".into()),
         };
         #[cfg(not(windows))]
         let result: Result<DepthExportJob, String> = {
