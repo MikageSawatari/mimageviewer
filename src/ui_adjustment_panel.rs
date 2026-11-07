@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui;
+use egui::emath::GuiRounding as _;
 use rayon::prelude::*;
 
 use crate::adjustment::{AdjustParams, AutoMode, PostFilter, PresetSlot};
@@ -31,9 +32,7 @@ use crate::app::{
 };
 use crate::displayed_image_transform::DisplayedImageTransform;
 use crate::keymap::KeyAction;
-use crate::local_adjust_catalog::{
-    EFFECT_GROUPS, EffectKind, effect_picker_button_width, effect_picker_matches_query,
-};
+use crate::local_adjust_catalog::{EFFECT_GROUPS, EffectKind, effect_picker_matches_query};
 use crate::local_adjust_effect_ui::draw_effect_params;
 
 const HEADER_H: f32 = 64.0;
@@ -72,6 +71,8 @@ const LOCAL_ADJUST_PANEL_SECTION_CONTENT_W_SHRINK: f32 =
     (LOCAL_ADJUST_PANEL_SECTION_MARGIN_LEFT + LOCAL_ADJUST_PANEL_SECTION_MARGIN_RIGHT) as f32;
 const LOCAL_ADJUST_MASK_PICKER_BUTTON_SIZE: egui::Vec2 = egui::vec2(156.0, 30.0);
 const LOCAL_ADJUST_EFFECT_PICKER_BUTTON_H: f32 = 30.0;
+const LOCAL_ADJUST_PICKER_BUTTON_SPACING: f32 = 6.0;
+
 const LOCAL_ADJUST_EDGE_BRUSH_INCLUDE_BOUNDARY_RADIUS: isize = 2;
 /// 被写体マット (BiRefNet) の正方形入力サイズ。BiRefNet は 1024² 学習。
 const LOCAL_ADJUST_SUBJECT_INPUT_SIZE: usize = 1024;
@@ -86,6 +87,53 @@ pub(crate) const LOCAL_ADJUST_NUDGE_PIXELS: f32 = 1.0;
 pub(crate) const LOCAL_ADJUST_NUDGE_PIXELS_FAST: f32 = 10.0;
 pub(crate) const LOCAL_ADJUST_ROTATE_DEG_STEP: f32 = 0.1;
 pub(crate) const LOCAL_ADJUST_ROTATE_DEG_STEP_FAST: f32 = 1.0;
+
+fn local_adjust_picker_scroll_area(ui: &mut egui::Ui) -> egui::ScrollArea {
+    // These dialogs contain wrapping text; keep the floating bar off the contents.
+    let scroll = &mut ui.spacing_mut().scroll;
+    scroll.floating_allocated_width = scroll
+        .floating_allocated_width
+        .max(scroll.bar_inner_margin + scroll.bar_width);
+    egui::ScrollArea::vertical()
+        .scroll_source(egui::scroll_area::ScrollSource {
+            drag: egui::scroll_area::DragScroll::Always,
+            ..Default::default()
+        })
+        .max_height(ui.available_height())
+        .auto_shrink([false, false])
+}
+
+fn local_adjust_effect_picker_columns(ui: &egui::Ui) -> (usize, f32) {
+    // Measure the whole catalog so filtering cannot change the grid's width.
+    let text_width = EFFECT_GROUPS
+        .iter()
+        .flat_map(|group| group.kinds)
+        .map(|kind| {
+            egui::WidgetText::from(egui::RichText::new(kind.picker_label()).size(12.0))
+                .into_galley(
+                    ui,
+                    Some(egui::TextWrapMode::Extend),
+                    f32::INFINITY,
+                    egui::TextStyle::Button,
+                )
+                .size()
+                .x
+        })
+        .fold(0.0, f32::max);
+    // Button's default frame converts this padding to Margin too.
+    let padding: egui::Margin = ui.spacing().button_padding.into();
+    let min_width = text_width + padding.sum().x;
+    let min_width = (min_width / egui::emath::GUI_ROUNDING).ceil() * egui::emath::GUI_ROUNDING;
+    let spacing = LOCAL_ADJUST_PICKER_BUTTON_SPACING;
+    let columns = ((ui.available_width() + spacing) / (min_width + spacing))
+        .floor()
+        .max(1.0) as usize;
+    // Round down using egui's layout quantum: rounding five equal cells up can
+    // otherwise exceed the row and grow the Window on subsequent passes.
+    let width =
+        ((ui.available_width() - spacing * (columns - 1) as f32) / columns as f32).floor_ui();
+    (columns, width)
+}
 
 fn initial_adjust_scope_selection(has_page_override: bool) -> AdjustScopeSelection {
     if has_page_override {
@@ -15260,53 +15308,42 @@ impl App {
                     .weak(),
                 );
                     ui.separator();
-                    egui::ScrollArea::vertical()
-                        .scroll_source(egui::scroll_area::ScrollSource {
-                            drag: egui::scroll_area::DragScroll::Always,
-                            ..Default::default()
-                        })
-                        .max_height(320.0)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            for group in MASK_GROUPS {
-                                ui.label(
-                                    egui::RichText::new(group.title)
-                                        .size(13.0)
-                                        .strong()
-                                        .color(egui::Color32::WHITE),
-                                );
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-                                    for &kind in group.kinds {
-                                        let response = ui
-                                            .add_sized(
-                                                LOCAL_ADJUST_MASK_PICKER_BUTTON_SIZE,
-                                                egui::Button::new(
-                                                    egui::RichText::new(kind.label())
-                                                        .size(12.0)
-                                                        .strong(),
-                                                )
-                                                .wrap(),
-                                            )
-                                            .on_hover_text(kind.description());
-                                        if response.clicked() {
-                                            add_requested = Some(kind);
-                                        }
-                                    }
-                                });
-                                ui.add_space(6.0);
-                            }
-                            let (w, h) = image_dims;
+                    local_adjust_picker_scroll_area(ui).show(ui, |ui| {
+                        for group in MASK_GROUPS {
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "対象画像: {} x {}",
-                                    w.max(1),
-                                    h.max(1)
-                                ))
+                                egui::RichText::new(group.title)
+                                    .size(13.0)
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                                for &kind in group.kinds {
+                                    let response = ui
+                                        .add_sized(
+                                            LOCAL_ADJUST_MASK_PICKER_BUTTON_SIZE,
+                                            egui::Button::new(
+                                                egui::RichText::new(kind.label())
+                                                    .size(12.0)
+                                                    .strong(),
+                                            )
+                                            .wrap(),
+                                        )
+                                        .on_hover_text(kind.description());
+                                    if response.clicked() {
+                                        add_requested = Some(kind);
+                                    }
+                                }
+                            });
+                            ui.add_space(6.0);
+                        }
+                        let (w, h) = image_dims;
+                        ui.label(
+                            egui::RichText::new(format!("対象画像: {} x {}", w.max(1), h.max(1)))
                                 .size(10.0)
                                 .weak(),
-                            );
-                        });
+                        );
+                    });
                 });
         });
         if let Some(kind) = add_requested {
@@ -15365,51 +15402,44 @@ impl App {
                         .weak(),
                     );
                     ui.separator();
-                    egui::ScrollArea::vertical()
-                        .scroll_source(egui::scroll_area::ScrollSource {
-                            drag: egui::scroll_area::DragScroll::Always,
-                            ..Default::default()
-                        })
-                        .max_height(320.0)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            for group in MASK_GROUPS {
-                                ui.label(
-                                    egui::RichText::new(group.title)
-                                        .size(13.0)
-                                        .strong()
-                                        .color(egui::Color32::WHITE),
-                                );
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-                                    for &kind in group.kinds {
-                                        let is_current = kind == current_kind;
-                                        let response = ui
-                                            .add_enabled_ui(!is_current, |ui| {
-                                                ui.add_sized(
-                                                    LOCAL_ADJUST_MASK_PICKER_BUTTON_SIZE,
-                                                    egui::Button::new(
-                                                        egui::RichText::new(kind.label())
-                                                            .size(12.0)
-                                                            .strong(),
-                                                    )
-                                                    .wrap(),
+                    local_adjust_picker_scroll_area(ui).show(ui, |ui| {
+                        for group in MASK_GROUPS {
+                            ui.label(
+                                egui::RichText::new(group.title)
+                                    .size(13.0)
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                                for &kind in group.kinds {
+                                    let is_current = kind == current_kind;
+                                    let response = ui
+                                        .add_enabled_ui(!is_current, |ui| {
+                                            ui.add_sized(
+                                                LOCAL_ADJUST_MASK_PICKER_BUTTON_SIZE,
+                                                egui::Button::new(
+                                                    egui::RichText::new(kind.label())
+                                                        .size(12.0)
+                                                        .strong(),
                                                 )
-                                            })
-                                            .inner
-                                            .on_hover_text(if is_current {
-                                                "現在のマスク種類です。"
-                                            } else {
-                                                kind.description()
-                                            });
-                                        if response.clicked() {
-                                            selected_kind = Some(kind);
-                                        }
+                                                .wrap(),
+                                            )
+                                        })
+                                        .inner
+                                        .on_hover_text(if is_current {
+                                            "現在のマスク種類です。"
+                                        } else {
+                                            kind.description()
+                                        });
+                                    if response.clicked() {
+                                        selected_kind = Some(kind);
                                     }
-                                });
-                                ui.add_space(6.0);
-                            }
-                        });
+                                }
+                            });
+                            ui.add_space(6.0);
+                        }
+                    });
                 });
         });
         if let Some(kind) = selected_kind {
@@ -15478,64 +15508,69 @@ impl App {
                     );
                     ui.separator();
                     let query = effect_query.trim();
-                    egui::ScrollArea::vertical()
-                        .scroll_source(egui::scroll_area::ScrollSource {
-                            drag: egui::scroll_area::DragScroll::Always,
-                            ..Default::default()
-                        })
-                        .max_height(440.0)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            let button_width = effect_picker_button_width(ui.available_width());
-                            let mut any_effect = false;
-                            for group in EFFECT_GROUPS {
-                                let matched: Vec<EffectKind> = group
-                                    .kinds
-                                    .iter()
-                                    .copied()
-                                    .filter(|kind| effect_picker_matches_query(*kind, query))
-                                    .collect();
-                                if matched.is_empty() {
-                                    continue;
-                                }
-                                any_effect = true;
-                                ui.label(
-                                    egui::RichText::new(group.title)
-                                        .size(13.0)
-                                        .strong()
-                                        .color(egui::Color32::WHITE),
-                                );
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-                                    for kind in matched {
-                                        let response = ui
-                                            .add_sized(
-                                                egui::vec2(
-                                                    button_width,
-                                                    LOCAL_ADJUST_EFFECT_PICKER_BUTTON_H,
-                                                ),
-                                                egui::Button::new(
-                                                    egui::RichText::new(kind.picker_label())
-                                                        .size(12.0),
+                    let _picker_scroll = local_adjust_picker_scroll_area(ui).show(ui, |ui| {
+                        let (columns, button_width) = local_adjust_effect_picker_columns(ui);
+                        let mut any_effect = false;
+                        for group in EFFECT_GROUPS {
+                            let matched: Vec<EffectKind> = group
+                                .kinds
+                                .iter()
+                                .copied()
+                                .filter(|kind| effect_picker_matches_query(*kind, query))
+                                .collect();
+                            if matched.is_empty() {
+                                continue;
+                            }
+                            any_effect = true;
+                            ui.label(
+                                egui::RichText::new(group.title)
+                                    .size(13.0)
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            );
+                            ui.scope(|ui| {
+                                ui.spacing_mut().item_spacing =
+                                    egui::Vec2::splat(LOCAL_ADJUST_PICKER_BUTTON_SPACING);
+                                for row in matched.chunks(columns) {
+                                    ui.horizontal(|ui| {
+                                        for &kind in row {
+                                            let response = ui
+                                                .add_sized(
+                                                    egui::vec2(
+                                                        button_width,
+                                                        LOCAL_ADJUST_EFFECT_PICKER_BUTTON_H,
+                                                    ),
+                                                    egui::Button::new(
+                                                        egui::RichText::new(kind.picker_label())
+                                                            .size(12.0),
+                                                    )
+                                                    .wrap_mode(egui::TextWrapMode::Extend),
                                                 )
-                                                .wrap(),
-                                            )
-                                            .on_hover_text(kind.description());
-                                        if response.clicked() {
-                                            picked_effect = Some(kind);
+                                                .on_hover_text(kind.description());
+                                            if response.clicked() {
+                                                picked_effect = Some(kind);
+                                            }
                                         }
-                                    }
-                                });
-                                ui.add_space(6.0);
-                            }
-                            if !any_effect {
-                                ui.label(
-                                    egui::RichText::new("該当する効果がありません")
-                                        .size(11.0)
-                                        .weak(),
-                                );
-                            }
-                        });
+                                    });
+                                }
+                            });
+                            ui.add_space(6.0);
+                        }
+                        if !any_effect {
+                            ui.label(
+                                egui::RichText::new("該当する効果がありません")
+                                    .size(11.0)
+                                    .weak(),
+                            );
+                        }
+                    });
+                    #[cfg(test)]
+                    ui.ctx().data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::unique(Some("effect_picker_scroll_1727")),
+                            _picker_scroll.inner_rect,
+                        )
+                    });
                 });
         });
         if let Some(kind) = picked_effect {
@@ -17743,3 +17778,7 @@ mod shape_undo_investigation_tests;
 #[cfg(test)]
 #[path = "ui_adjustment_panel/picker_width_1725_tests.rs"]
 mod picker_width_1725_tests;
+
+#[cfg(test)]
+#[path = "ui_adjustment_panel/picker_layout_1727_tests.rs"]
+mod picker_layout_1727_tests;

@@ -363,19 +363,6 @@ pub(crate) const EFFECT_GROUPS: &[EffectGroup] = &[
     },
 ];
 
-const EFFECT_PICKER_BUTTON_MIN_W: f32 = 78.0;
-const EFFECT_PICKER_BUTTON_MAX_W: f32 = 150.0;
-
-pub(crate) fn effect_picker_button_width(available_width: f32) -> f32 {
-    let spacing = 6.0;
-    let available_width = available_width.max(EFFECT_PICKER_BUTTON_MIN_W);
-    let columns = ((available_width + spacing) / (EFFECT_PICKER_BUTTON_MIN_W + spacing))
-        .floor()
-        .clamp(1.0, 5.0);
-    ((available_width - spacing * (columns - 1.0)) / columns)
-        .clamp(EFFECT_PICKER_BUTTON_MIN_W, EFFECT_PICKER_BUTTON_MAX_W)
-}
-
 pub(crate) fn effect_picker_matches_query(kind: EffectKind, query: &str) -> bool {
     let query = query.trim().to_lowercase();
     if query.is_empty() {
