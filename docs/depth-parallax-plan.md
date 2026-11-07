@@ -1462,7 +1462,7 @@ fps、MP4 12Mbps、縦横比、書き出しの非永続性、既存のモーダ�
 - **注・Shift+B**: §6.5の「表示占有による制限」を実装した§10の分類表に、Depth中は背景切替を抑止することが
   明記されている。`ui_fullscreen::handle_fs_key_input_with_operation` は `FsBgCycle` をconsumeした後、
   `fs_exclusive_view_active` が返ると背景操作を無効化する。`apply_ring_action` の `ImageBackgroundCycle` も同じ。
-  キー到達のログだけが出て背景値が変わらない観測はこの規則と一致する。利用者の「意図した抑止なら直さない」に従い変更しない。
+  キー到達のログだけが出て背景値が変わらない観測はこの規則と一致する。設計担当の指示「意図した抑止なら直さない」に従い変更しない。
   背景だけを止める個別の描画上の必然性は既存文書にはない。下地自体は `try_paint_depth` へ毎描画渡す構造であり、
   開始時の下地を描画側で固定しているためではない。書き出しは従来どおり要求作成時に下地を凍結する。
 
@@ -1512,6 +1512,46 @@ PNGは1093×614の設定（56,335 bytes）と進行（29,457 bytes）を更新�
 `tests/snapshots/depth_export_progress_small_dark.png`, 本書。
 未解決のコード上の指摘なし。Shift+Bは上記の既存設計に従って維持した。
 全件gateはClaudeCode担当。今回の指示に従いstage／commit／製品起動／build-devは実施していない。
+
+#### 段 C 独立レビュー3回目: 下端のphase拡大 (2026-11-08、基点 `85062d72e`)
+
+原因は `ui_depth_export::draw` の同一Window IDと、eguiの寸法採用の順序。
+`AreaState` が保持する前回の外形で `Area::begin` が画面内への位置制限を済ませた後に、
+`Window` の `fixed_size` が新しいphaseの外寸を適用する。下端の進行→終端、下端の終端を閉じて設定へ
+開き直す場合は、新しい本文・操作行が初回frameだけ画面外へ伸び、次frameに位置が変わる。
+先行回帰は中央でのphase遷移だけだったため、この保持位置の条件を覆っていなかった。
+
+`current_pos` だけを渡す方法も検討したが、`Area::begin` はその後にドラッグ原点＋累積deltaで位置を
+上書きするため、ドラッグを続けたまま非同期完了すると補正が失われる。
+設定／終端だけ、既存 `AreaState::load` の既知寸法を新外寸へ同期し、左上位置を維持したまま
+公開APIの `Areas::set_state` で同じlayerへ描画前に渡す。これで `Area::begin` 自身が新外寸を使って
+ドラッグとconstrainを処理する。`set_state` は `Area::end` 自身と同じAPIであり、このpassで表示する
+同じWindowのstateを更新する。初回／復元時の寸法未確定stateはeguiのsizingに任せ、作成・消去しない。
+新しい位置stateは持たず、default_pos・ドラッグ・constrainを維持する。自然高の進行表示には固定割当170を
+外形として使わず、下端へ移動した進行窓を不要に押し上げない。追加repaintは行わない。
+この方針は独立Sol/xhighの実装前レビューでも確認した。
+
+Shift+Bの注の指示元を利用者から設計担当（ClaudeCode）へ訂正した。利用者への確認中のため挙動は変更しない。
+回帰は1093×614の同一Contextで、実pointer入力で進行窓を下端へドラッグし、解放後と押したままの両方で完了へ遷移する。
+さらに下端の終端を実ボタンで閉じ、設定を再表示する。`Harness::step` を1回だけ実行して初回の矩形を採り、
+初回＋後続5frameでWindowと操作行の画面内包含と位置不変を確認する。進行窓の下端位置が不要に上がらないことも検査する。
+
+**検証結果**（全Cargoに`MSBUILDDISABLENODEREUSE=1`、build/testは`CARGO_BUILD_JOBS=1`）:
+
+| 実行 | 結果・証拠 |
+| --- | --- |
+| 修正前 `cargo nextest run --offline -p mimageviewer --lib -E 'test(/depth_export_bottom_drag/)' --test-threads 1` | 新規回帰 **1/1失敗（意図したred）**、exit100、0.294秒（compile3分36秒）。初回rectが`[[337,481],[757,701]]`となり画面高さ614を超える。`target/depth-c-bottom-red.log` |
+| 同じ限定コマンド、修正後（ドラッグ継続中の条件も追加） | **1/1成功**、exit0、0.466秒（compile3分41秒）。`target/depth-c-bottom-focused.log` |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/depth\|export/)' --test-threads 4` | **296/296成功**、exit0、45.951秒。新規回帰1件と従来の3D／モーダル／各形式／終了回収を含む。先行1件はこの中に含み重複加算しない。`target/depth-c-bottom-related.log` |
+| 更新指定なし `cargo test --offline -p mimageviewer --test ui_snapshot depth_` | **6/6成功**、exit0、1.94秒（compile1分31秒）。通常の設定／進行PNGと小画面到達性は不変。PNG更新なし。`target/depth-c-bottom-ui.log` |
+| `cargo check --offline -p mimageviewer --bin mimageviewer-core` | 成功、exit0、18.14秒。`target/depth-c-bottom-check.log` |
+| 最後にworkspace全体へ引数なし `cargo fmt` → `cargo fmt --check` | 両方成功、exit0。`target/depth-c-bottom-fmt.log` |
+| `python scripts/check_ui_glyphs.py` / `git diff --check` | 両方成功、exit0、危険なUI文字0。`target/depth-c-bottom-glyphs.log` |
+| 独立レビュー（Sol / xhigh、実装前と同じcontextで継続） | **最終ACCEPT、未解決P1/P2なし**。最終差分・red／green・296件・UI6件と最終検査の証拠を照合。重複Cargo／製品起動なし |
+
+変更ファイルは `src/ui_depth_export.rs`, `src/ui_depth_export_tests.rs`, 本書の3本。
+Shift+Bの挙動、PNG、他のダイアログの実装は変更していない。
+stage／commit／製品起動／build-devは指示どおり実施していない。全件gateはClaudeCode担当。
 
 ## 11. テスト
 

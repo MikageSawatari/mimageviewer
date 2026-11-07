@@ -415,3 +415,97 @@ fn depth_export_long_terminal_geometry_is_bounded_and_stable_from_first_frame() 
         }
     }
 }
+
+fn drag_dialog_to_bottom(
+    harness: &mut Harness<'_, State>,
+    screen: egui::Rect,
+    release: bool,
+) -> egui::Pos2 {
+    let rect = harness.state().dialog.as_ref().unwrap().rect;
+    let title = egui::pos2(rect.center().x, rect.top() + 12.0);
+    let target = title + egui::vec2(0.0, screen.bottom() - rect.bottom());
+    harness.hover_at(title);
+    harness.event(egui::Event::PointerButton {
+        pos: title,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness.step();
+    harness.event(egui::Event::PointerMoved(target));
+    harness.step();
+    if release {
+        harness.event(egui::Event::PointerButton {
+            pos: target,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+    }
+    let moved = harness.state().dialog.as_ref().unwrap().rect;
+    assert!(screen.contains_rect(moved));
+    assert!(
+        (screen.bottom() - moved.bottom()).abs() <= 1.0,
+        "the actual drag must reach the bottom: {moved:?}"
+    );
+    target
+}
+
+fn assert_first_frame_and_following_geometry(harness: &mut Harness<'_, State>, screen: egui::Rect) {
+    // One frame only: run() could conceal the bug by settling a second layout.
+    harness.step();
+    let response = harness.state().dialog.as_ref().unwrap();
+    let initial = (response.rect, response.action_rects.clone());
+    for _ in 0..6 {
+        let response = harness.state().dialog.as_ref().unwrap();
+        assert!(
+            screen.contains_rect(response.rect),
+            "new phase must fit from its first frame: {:?}",
+            response.rect
+        );
+        for action in &response.action_rects {
+            assert!(screen.contains_rect(*action));
+            assert!(response.rect.contains_rect(*action));
+        }
+        assert_eq!((response.rect, response.action_rects.clone()), initial);
+        harness.step();
+    }
+}
+
+#[test]
+fn depth_export_bottom_drag_then_completion_and_settings_reopen_fit_from_first_frame() {
+    let size = egui::vec2(1093.0, 614.0);
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+    for release_before_completion in [true, false] {
+        let mut harness = harness(size);
+        harness.state_mut().phase = Some(TestPhase::Progress);
+        harness.run();
+        let pointer = drag_dialog_to_bottom(&mut harness, screen, release_before_completion);
+        // A stationary progress window must retain its dragged position too.
+        let progress_rect = harness.state().dialog.as_ref().unwrap().rect;
+        harness.step();
+        assert_eq!(harness.state().dialog.as_ref().unwrap().rect, progress_rect);
+
+        harness.state_mut().phase = Some(TestPhase::Finished);
+        assert_first_frame_and_following_geometry(&mut harness, screen);
+        if !release_before_completion {
+            harness.event(egui::Event::PointerButton {
+                pos: pointer,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            harness.step();
+        }
+
+        drag_dialog_to_bottom(&mut harness, screen, true);
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "閉じる")
+            .click();
+        harness.run();
+        assert!(harness.state().phase.is_none());
+        harness.state_mut().phase = Some(TestPhase::Settings);
+        assert_first_frame_and_following_geometry(&mut harness, screen);
+    }
+}

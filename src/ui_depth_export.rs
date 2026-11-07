@@ -69,13 +69,11 @@ pub(crate) fn draw(ctx: &egui::Context, mut phase: Phase<'_>, escape: bool) -> D
         .backdrop_color(egui::Color32::TRANSPARENT);
     let backdrop_layer = backdrop.area.layer();
     let dialog_id = egui::Id::unique("depth_export_dialog");
+    let dialog_layer = egui::LayerId::new(egui::Order::Foreground, dialog_id);
     // Keep the movable Window directly above its modal backdrop, as in the
     // registration confirmation. Outside clicks may raise the whole group,
     // never the backdrop above the Window or a backing panel above the modal.
-    ctx.set_sublayer(
-        backdrop_layer,
-        egui::LayerId::new(egui::Order::Foreground, dialog_id),
-    );
+    ctx.set_sublayer(backdrop_layer, dialog_layer);
     ctx.move_to_top(backdrop_layer);
     backdrop.show(ctx, |_| {});
     let screen = ctx.content_rect();
@@ -97,6 +95,19 @@ pub(crate) fn draw(ctx: &egui::Context, mut phase: Phase<'_>, escape: bool) -> D
         170.0
     })
     .min((screen.height() - 70.0).max(100.0));
+    if (settings || finished)
+        && let Some(mut area) = egui::AreaState::load(ctx, dialog_id)
+        && area.size.is_some()
+    {
+        // Area constrains before Window applies its Resize allocation. Publish
+        // the known outer size first, preserving the position/pivot and egui's
+        // drag owner, so even completion during a drag uses the new bounds.
+        // Leave initial sizing/restoration and natural-height progress alone.
+        let top_left = area.left_top_pos();
+        area.size = Some(egui::vec2(width, height));
+        area.set_left_top_pos(top_left);
+        ctx.memory_mut(|memory| memory.areas_mut().set_state(dialog_layer, area));
+    }
     let stopping = matches!(phase, Phase::Progress { stopping: true, .. });
     let mut open = true;
     let mut response = DialogResponse {
