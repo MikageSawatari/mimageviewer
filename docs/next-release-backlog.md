@@ -39,6 +39,14 @@
 
 ## 1. 優先候補
 
+### 1.737 mIV Sound 説明書の URL から版番号を外し、固定 URL にする (2026-11-08、v5.1.0)
+
+- 状態: **未着手・利用者決定 2026-11-08: 固定 URL にする。v5.1.0 で対応**。正本は申し送り [docs/briefs/sound-docs-fixed-url.md](briefs/sound-docs-fixed-url.md) (サイト点検セッション起票)。
+- 問題: 説明書は `manual/sound/<版>/` に生成され、版を上げるたびに URL 全体が変わる (`effetune/v0.12.0/` → … → `sound/v0.15.0-miv.7/`)。旧 URL は 301 で送っているのでリンク切れは無いが、Search Console では Google の切り替えが版の更新に追いつかず、古い URL ばかりが表示されている (申し送り §1 の表、2026-11-08 点検)。
+- 目標: 正規 URL を `manual/sound/<ページ名>.html` (画像は `manual/sound/images/`) に固定し、`manual/sound/index.html` を目次そのものにする。版は本文で示す。旧 `manual/effetune/<版>/`・`manual/sound/<版>/` は 1 回の 301 で同名の固定ページへ (無ければ目次へ)。版の更新で `.htaccess` を書き換えずに済む規則にし、ループしないこと・www 経由が 2 ホップで着くことを確かめる。
+- 作業 (申し送り §3): `scripts/gen-effetune-docs.py` の出力先・canonical・相対リンク・redirect 生成・`--check` の版ディレクトリ検査、`htdocs/.../manual/sound/` の作り直し、`manual/effetune.html` の 2 リンク、`scripts/test_gen_effetune_docs.py` の版付きパス前提の検査と新しい検査 (版を変えても URL 不変・旧 URL が 1 回で届く)、`docs/effetune-integration-plan.md`・`docs/effetune-fork-plan.md`・`docs/release-checklist.md`・`docs/release-operations.md` の手順の記述、sitemap の再生成。
+- 公開: 説明の中身は v5.0.0 と同じなので、申し送りでは次のリリースを待たずに出してもよいとしている (他の未リリース分が htdocs に混ざらないことを確かめてから)。直下の `sitemap.xml` は scp で上書きする。公開後の確認 (curl・canonical・sitemap・Search Console の再送信) は申し送り §5、Search Console の操作は利用者の了承を得てから。
+
 ### 1.736 v5.0.0 を vGPU 付きの Windows Sandbox で起動すると、ゲスト Windows が 0x3B で止まる (2026-11-07)
 
 - 状態: **未着手・原因未特定**。Store 申請前の確認で判明。vGPU なしの Sandbox では正常に起動したので、Store 申請は進めた。
