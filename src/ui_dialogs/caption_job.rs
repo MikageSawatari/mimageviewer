@@ -737,21 +737,23 @@ mod tests {
     }
 
     #[test]
-    fn caption_job_tools_creation_is_disabled_during_caption_deletion() {
+    fn caption_job_tools_menu_is_disabled_during_caption_deletion() {
         let mut app = tools_menu_fixture(false, true);
         app.caption_delete = Some(super::super::caption_delete::CaptionDeleteState::Counting {
             rx: mpsc::channel().1,
         });
-        let label = app
-            .keymap
-            .menu_command_label(crate::keymap::MenuCommandId::ToolsCreateAiCaptions);
+        assert_eq!(
+            app.caption_creation_disabled_reason(false),
+            Some("AI 説明文の削除を処理しています。終わってから選んでください")
+        );
         let mut harness = tools_menubar_harness(app);
         harness.run_steps(4);
-        harness
-            .get_by_label(crate::keymap::TopMenuId::Tools.label())
-            .click();
-        harness.run_steps(2);
-        assert!(harness.get_by_label(&label).accesskit_node().is_disabled());
+        assert!(
+            harness
+                .get_by_label(crate::keymap::TopMenuId::Tools.label())
+                .accesskit_node()
+                .is_disabled()
+        );
         assert!(harness.state().caption_job.is_none());
     }
 

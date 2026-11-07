@@ -650,10 +650,9 @@ UI の種類 hint は最上位も worker の metadata で照合し、`album.pdf`
 #### ローカル AI 説明文の削除 (§1.730)
 
 `ui_dialogs/caption_delete.rs` が App の単一 `caption_delete` 状態で集計・確認・削除を進める。
-一覧の右クリックだけから作成と共通の対象を捕捉し、worker が read-only 集計後、確認したキーを
-既存 DB の単一 Immediate transaction で削除する。確認中だけ共通 modal、全 phase で作成と排他。
-既存 trigger の反映待ち、`notify_caption_changed` と共有表示 cache の全消去を再利用する。
-詳細は [計画 §6.8](local-vlm-caption-plan.md#68-説明文の削除-2026-11-07-利用者決定backlog-1730)。
+一覧の右クリックから作成と共通の対象を捕捉し、全 phase を同じ可視 modal にして作成・閲覧開始と排他にする。
+worker が read-only 集計後、クリックで確認したキーを既存 DB の単一 Immediate transaction で削除する。
+Enter では確定しない。既存 trigger の反映待ち、索引通知と共有表示 cache 全消去を再利用する。[計画 §6.8](local-vlm-caption-plan.md)。
 
 #### ローカル AI 説明文の表示 (V1-4a / V1-4b)
 

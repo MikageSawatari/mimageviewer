@@ -65,7 +65,7 @@ impl App {
         &self,
         background: bool,
     ) -> Option<&'static str> {
-        // The confirmation itself is modal, so name the active flow before the
+        // The entire deletion flow is modal, so name it before the
         // generic modal check. Remote still takes precedence.
         if self.remote_session_blocks_local_control() {
             return Some("リモート閲覧中は AI 説明文を削除できません");
@@ -154,22 +154,22 @@ impl App {
         );
     }
 
-    pub(crate) fn caption_delete_confirm_visible(&self) -> bool {
-        matches!(
-            self.caption_delete,
-            Some(CaptionDeleteState::Confirm { .. })
-        )
+    pub(crate) fn caption_delete_dialog_visible(&self) -> bool {
+        self.caption_delete.is_some()
     }
 
     fn confirm_caption_deletion(&mut self, ctx: &egui::Context) {
-        if !self.caption_delete_confirm_visible() {
+        if !matches!(
+            self.caption_delete,
+            Some(CaptionDeleteState::Confirm { .. })
+        ) {
             return;
         }
         let Some(CaptionDeleteState::Confirm { keys, .. }) = self.caption_delete.take() else {
             unreachable!()
         };
         // Remove our own modal before rechecking the remaining operation gates.
-        // The captured keys remain the target even if the grid changed during counting.
+        // The captured keys remain the target throughout the modal flow.
         if let Some(reason) = self.caption_deletion_operation_disabled_reason() {
             self.show_feedback_result(reason.into(), FeedbackKind::Info);
             return;
@@ -186,13 +186,13 @@ impl App {
         }
     }
 
-    pub(crate) fn show_caption_delete_confirm(&mut self, ctx: &egui::Context) {
-        let Some(CaptionDeleteState::Confirm { ok, failed, .. }) = &self.caption_delete else {
+    pub(crate) fn show_caption_delete_dialog(&mut self, ctx: &egui::Context) {
+        let Some(state) = &self.caption_delete else {
             return;
         };
-        let enter = self.dialog_enter_pressed(ctx);
-        let escape = self.dialog_escape_pressed(ctx);
-        match draw_confirmation(ctx, *ok, *failed, enter, escape) {
+        let escape = !matches!(state, CaptionDeleteState::Deleting { .. })
+            && self.dialog_escape_pressed(ctx);
+        match draw_caption_delete_dialog(ctx, state, escape) {
             ConfirmationAction::Delete => self.confirm_caption_deletion(ctx),
             ConfirmationAction::Cancel => self.caption_delete = None,
             ConfirmationAction::None => {}
@@ -207,23 +207,33 @@ enum ConfirmationAction {
     Cancel,
 }
 
-fn draw_confirmation(
+fn draw_caption_delete_dialog(
     ctx: &egui::Context,
-    ok: usize,
-    failed: usize,
-    enter: bool,
+    state: &CaptionDeleteState,
     escape: bool,
 ) -> ConfirmationAction {
     let mut action = ConfirmationAction::None;
     let mut open = true;
-    egui::Window::new("AI 説明文の削除")
+    let window = egui::Window::new("AI 説明文の削除")
         .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
         .default_width(380.0_f32.min((ctx.content_rect().width() - 100.0).max(180.0)))
         .collapsible(false)
-        .resizable(false)
-        .open(&mut open)
-        .show(ctx, |ui| {
-            let detail = if failed == 0 {
+        .resizable(false);
+    let window = if matches!(state, CaptionDeleteState::Deleting { .. }) {
+        window
+    } else {
+        window.open(&mut open)
+    };
+    window.show(ctx, |ui| match state {
+        CaptionDeleteState::Counting { .. } => {
+            ui.label("AI 説明文を数えています…");
+            ui.add_space(8.0);
+            if ui.button("キャンセル").clicked() || escape {
+                action = ConfirmationAction::Cancel;
+            }
+        }
+        CaptionDeleteState::Confirm { ok, failed, .. } => {
+            let detail = if *failed == 0 {
                 String::new()
             } else {
                 format!(" (うち作成に失敗した記録 {failed} 件)")
@@ -234,14 +244,20 @@ fn draw_confirmation(
             ));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button("削除").clicked() || enter {
+                // A focused egui button's clicked() also accepts Enter/Space.
+                // This irreversible operation requires a pointer click.
+                if ui.button("削除").clicked_by(egui::PointerButton::Primary) {
                     action = ConfirmationAction::Delete;
                 }
                 if ui.button("キャンセル").clicked() || escape {
                     action = ConfirmationAction::Cancel;
                 }
             });
-        });
+        }
+        CaptionDeleteState::Deleting { .. } => {
+            ui.label("AI 説明文を削除しています…");
+        }
+    });
     if !open {
         action = ConfirmationAction::Cancel;
     }
@@ -319,16 +335,15 @@ mod tests {
             app.caption_delete,
             Some(CaptionDeleteState::Counting { .. })
         ));
-        assert!(!app.caption_delete_confirm_visible());
+        assert!(app.caption_delete_dialog_visible());
+        assert!(app.common_modal_dialog_open());
+        assert!(!app.grid_open_from_click_allowed());
         wait(&mut app, true);
         let Some(CaptionDeleteState::Confirm { keys, ok, failed }) = &app.caption_delete else {
             panic!("missing confirmation")
         };
         assert_eq!((*ok, *failed, keys.len()), (1, 1, 2));
-        assert_eq!(
-            app.modal_dialog_block_reason(),
-            Some("caption_delete_confirm")
-        );
+        assert_eq!(app.modal_dialog_block_reason(), Some("caption_delete"));
         let revision = app.book_append_undo_revision;
         app.confirm_caption_deletion(&ctx);
         assert!(app.book_append_undo_revision > revision);
@@ -336,7 +351,9 @@ mod tests {
             app.caption_delete,
             Some(CaptionDeleteState::Deleting { .. })
         ));
-        assert!(!app.caption_delete_confirm_visible());
+        assert!(app.caption_delete_dialog_visible());
+        assert!(app.common_modal_dialog_open());
+        assert!(!app.grid_open_from_click_allowed());
         wait(&mut app, false);
         assert!(app.caption_delete.is_none());
         assert!(!app.caption_display.contains_for_test("cached"));
@@ -505,7 +522,7 @@ mod tests {
                 .with_context_setup(crate::ui_fonts::configure_fonts)
                 .with_size(egui::vec2(1093.0, 614.0))
                 .build_ui_state(
-                    |ui, app: &mut AppTestEnvForTest| app.show_caption_delete_confirm(ui.ctx()),
+                    |ui, app: &mut AppTestEnvForTest| app.show_caption_delete_dialog(ui.ctx()),
                     app,
                 );
             harness.run_steps(4);
@@ -542,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn caption_delete_confirmation_ime_preserves_enter_escape_and_plain_enter_deletes() {
+    fn caption_delete_confirmation_ime_preserves_escape_and_only_click_deletes() {
         for key in [egui::Key::Enter, egui::Key::Escape] {
             let mut app = fixture();
             app.request_delete_ai_captions(&egui::Context::default(), false);
@@ -554,7 +571,7 @@ mod tests {
                 })
                 .with_size(egui::vec2(1093.0, 614.0))
                 .build_ui_state(
-                    |ui, app: &mut AppTestEnvForTest| app.show_caption_delete_confirm(ui.ctx()),
+                    |ui, app: &mut AppTestEnvForTest| app.show_caption_delete_dialog(ui.ctx()),
                     app,
                 );
             harness.run_steps(4);
@@ -565,10 +582,19 @@ mod tests {
             harness.run_steps(1);
             harness.key_press(key);
             harness.run_steps(2);
-            assert!(harness.state().caption_delete_confirm_visible());
+            assert!(matches!(
+                harness.state().caption_delete,
+                Some(CaptionDeleteState::Confirm { .. })
+            ));
             harness.event(egui::Event::Ime(egui::ImeEvent::Commit("変換".into())));
             harness.run_steps(1);
             harness.key_press(egui::Key::Enter);
+            harness.run_steps(2);
+            assert!(matches!(
+                harness.state().caption_delete,
+                Some(CaptionDeleteState::Confirm { .. })
+            ));
+            harness.get_by_label("削除").click();
             harness.run_steps(2);
             assert!(matches!(
                 harness.state().caption_delete,
@@ -577,6 +603,157 @@ mod tests {
             wait(harness.state_mut(), false);
             assert!(harness.state().caption_delete.is_none());
         }
+    }
+
+    #[test]
+    fn caption_delete_counting_is_visible_modal_and_cancel_discards_late_result() {
+        for cancel in ["キャンセル", "Escape", "Close window"] {
+            let mut app = fixture();
+            let keys = app
+                .caption_targets(false)
+                .paths
+                .iter()
+                .map(|target| CaptionDb::normalize_path(target.path()))
+                .collect::<Vec<_>>();
+            let worker_keys = keys.clone();
+            let path = CaptionDb::db_path();
+            let (tx, rx) = mpsc::channel();
+            let (finish, release) = mpsc::channel();
+            let (reported, report) = mpsc::channel();
+            std::thread::spawn(move || {
+                release.recv().unwrap();
+                let result = count_at(&path, &worker_keys).map_err(|error| error.to_string());
+                assert_eq!(result.as_ref().unwrap().keys.len(), 2);
+                reported.send(tx.send(result).is_err()).unwrap();
+            });
+            app.caption_delete = Some(CaptionDeleteState::Counting { rx });
+            assert!(app.common_modal_dialog_open());
+            assert!(!app.grid_open_from_click_allowed());
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(1093.0, 614.0))
+                .build_ui_state(
+                    |ui, app: &mut AppTestEnvForTest| app.show_caption_delete_dialog(ui.ctx()),
+                    app,
+                );
+            harness.run_steps(4);
+            harness.get_by_label("AI 説明文を数えています…");
+            if cancel == "Escape" {
+                harness.key_press(egui::Key::Escape);
+            } else {
+                harness.get_by_label(cancel).click();
+            }
+            harness.run_steps(2);
+            assert!(harness.state().caption_delete.is_none());
+            assert!(!harness.state().common_modal_dialog_open());
+            finish.send(()).unwrap();
+            assert!(
+                report
+                    .recv_timeout(std::time::Duration::from_secs(20))
+                    .unwrap()
+            );
+            harness.state_mut().poll_caption_delete();
+            harness.run_steps(2);
+            assert!(harness.state().caption_delete.is_none());
+            assert!(harness.query_by_label("削除").is_none());
+            assert_eq!(
+                CaptionDb::open_read_only(CaptionDb::db_path())
+                    .unwrap()
+                    .unwrap()
+                    .count_existing(&keys)
+                    .unwrap()
+                    .keys
+                    .len(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn caption_delete_confirmation_enter_never_confirms_including_first_display_and_focus() {
+        let mut app = fixture();
+        let keys = app
+            .caption_targets(false)
+            .paths
+            .iter()
+            .map(|target| CaptionDb::normalize_path(target.path()))
+            .collect::<Vec<_>>();
+        let (counted, rx) = mpsc::channel();
+        app.caption_delete = Some(CaptionDeleteState::Counting { rx });
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build_ui_state(
+                |ui, app: &mut AppTestEnvForTest| {
+                    app.poll_caption_delete();
+                    app.show_caption_delete_dialog(ui.ctx());
+                },
+                app,
+            );
+        harness.run_steps(4);
+        harness.get_by_label("AI 説明文を数えています…");
+        // Adopt the count in the same frame as an Enter intended for the old UI.
+        counted
+            .send(Ok(CaptionDeletionCandidates {
+                keys: keys.clone(),
+                ok: 1,
+                failed: 1,
+            }))
+            .unwrap();
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(4);
+        assert!(matches!(
+            harness.state().caption_delete,
+            Some(CaptionDeleteState::Confirm { .. })
+        ));
+        harness.get_by_label("削除").focus();
+        harness.run_steps(1);
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(2);
+        assert!(matches!(
+            harness.state().caption_delete,
+            Some(CaptionDeleteState::Confirm { .. })
+        ));
+        assert_eq!(
+            CaptionDb::open_read_only(CaptionDb::db_path())
+                .unwrap()
+                .unwrap()
+                .count_existing(&keys)
+                .unwrap()
+                .keys
+                .len(),
+            2
+        );
+        harness.key_press(egui::Key::Escape);
+        harness.run_steps(2);
+        assert!(harness.state().caption_delete.is_none());
+    }
+
+    #[test]
+    fn caption_delete_deleting_is_visible_modal_and_escape_cannot_close_it() {
+        let mut app = setup_app_for_test();
+        let (_tx, rx) = mpsc::channel();
+        app.caption_delete = Some(CaptionDeleteState::Deleting { rx });
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build_ui_state(
+                |ui, app: &mut AppTestEnvForTest| app.show_caption_delete_dialog(ui.ctx()),
+                app,
+            );
+        harness.run_steps(4);
+        harness.get_by_label("AI 説明文を削除しています…");
+        assert!(harness.query_by_label("Close window").is_none());
+        assert!(harness.query_by_label("キャンセル").is_none());
+        assert!(harness.query_by_label("削除").is_none());
+        harness.key_press(egui::Key::Escape);
+        harness.run_steps(2);
+        assert!(matches!(
+            harness.state().caption_delete,
+            Some(CaptionDeleteState::Deleting { .. })
+        ));
+        assert!(harness.state().common_modal_dialog_open());
+        assert!(!harness.state().grid_open_from_click_allowed());
     }
 
     #[test]
@@ -624,7 +801,15 @@ mod tests {
             .with_size(egui::vec2(520.0, 250.0))
             .build_ui(|ui| {
                 crate::os_theme::apply_resolved(ui.ctx(), crate::os_theme::ResolvedTheme::Dark);
-                draw_confirmation(ui.ctx(), 12, 3, false, false);
+                draw_caption_delete_dialog(
+                    ui.ctx(),
+                    &CaptionDeleteState::Confirm {
+                        keys: Vec::new(),
+                        ok: 12,
+                        failed: 3,
+                    },
+                    false,
+                );
             });
         harness.run_steps(4);
         harness.snapshot("caption_delete_confirmation_dark");

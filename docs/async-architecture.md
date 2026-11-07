@@ -2,13 +2,11 @@
 
 ## AI 説明文の削除（§1.730）
 
-App の `caption_delete` が Counting / Confirm / Deleting を単独所有する。
-集計 worker は読み取り専用 DB から存在するキーと ok/failed の内訳を返し、削除 worker は
-確認済みキーを既存 DB の `BEGIN IMMEDIATE` で一括削除する。どちらも結果を channel で返して
-repaint を要求し、root frame は非blocking poll で採用する。UI で DB I/O や join はしない。
-Confirm だけモーダル、作成とは全 phase で排他にして割り込み・再開の仕組みを持たない。
-commit 後は既存の索引通知・共有表示 cache 全消去だけを使う。失敗はログと通知で閉じる。
-正本は [AI 説明文計画 §6.8](local-vlm-caption-plan.md)。
+App の `caption_delete` が Counting / Confirm / Deleting を単独所有し、全 phase を同じ可視 modal にする。
+集計 worker は read-only でキーと ok/failed 件数を返し、取消時は rx と状態を捨てて遅い結果を採用しない。
+クリックで確認後、削除 worker が既存 DB の単一 `BEGIN IMMEDIATE` で削除し、その間は閉じられない。
+完了は repaint と root の非blocking poll で採用する。UI で DB I/O や join はせず、作成との排他も維持する。
+commit 後は既存の索引通知・表示 cache 全消去、失敗はログと通知だけを使う。[計画 §6.8](local-vlm-caption-plan.md)。
 
 ## 本棚順の単一writer（§1.683）
 

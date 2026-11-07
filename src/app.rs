@@ -24085,8 +24085,8 @@ impl App {
             };
         }
         #[cfg(windows)]
-        if self.caption_delete_confirm_visible() {
-            return Some("caption_delete_confirm");
+        if self.caption_delete_dialog_visible() {
+            return Some("caption_delete");
         }
         first![
             self.book_order_saving() => "book_order",
