@@ -699,8 +699,7 @@ mod tests {
     #[test]
     fn vlm_setup_download_with_or_without_reserved_targets_blocks_caption_delete_and_confirm() {
         use super::super::caption_delete::CaptionDeleteState;
-        const REASON: &str =
-            "AI 説明文のモデルを準備中は削除できません。終わってから選んでください";
+        const REASON: &str = "AI 説明文のモデルの準備中や、モデルの窓を開いている間は削除できません。準備が終わり窓を閉じてから選んでください";
         for reserved in [false, true] {
             let mut app = crate::app::setup_app_for_test();
             app.items = vec![crate::grid_item::GridItem::Image(
