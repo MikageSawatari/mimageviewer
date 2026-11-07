@@ -509,6 +509,30 @@ fn append_xmp(out: &mut String, info: &crate::xmp_reader::XmpTweetInfo) {
     }
 }
 
+// Frozen pre-partial-read policy; keep independent of the production reader.
+#[cfg(test)]
+fn read_metadata_bytes_legacy(path: &Path) -> Option<Vec<u8>> {
+    const METADATA_SCAN_LIMIT: u64 = 2 * 1024 * 1024;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)?;
+    match ext.as_str() {
+        // 小画像: 全読み (末尾に XMP セグメントが置かれるケースを拾うため)
+        "jpg" | "jpeg" | "jfif" | "png" => std::fs::read(path).ok(),
+        // 大容量コンテナ: 先頭 2MB だけ読む (上記コメント参照)
+        "tif" | "tiff" | "mp4" | "mov" | "m4v" => {
+            use std::io::Read;
+            let f = std::fs::File::open(path).ok()?;
+            let mut buf = Vec::with_capacity(64 * 1024);
+            f.take(METADATA_SCAN_LIMIT).read_to_end(&mut buf).ok()?;
+            Some(buf)
+        }
+        // BMP / GIF / WebP / HEIC / RAW: XMP/PNG チャンクを持たない想定なので読まない
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 fn build_per_source_for_file_legacy(path: &Path) -> PerSourceText {
     let mut out = build_per_source_for_filename(path);
@@ -521,7 +545,7 @@ fn build_per_source_for_file_legacy(path: &Path) -> PerSourceText {
     let is_video_sidecar = crate::xmp_writer::is_video_for_sidecar(path);
     let mut ai_from_exif_user_comment = false;
 
-    if let Some(bytes) = std::fs::read(path).ok() {
+    if let Some(bytes) = read_metadata_bytes_legacy(path) {
         // 2a. XMP (mXD Twitter メタ)
         if let Some(xmp) = crate::xmp_reader::read_tweet_info_from_bytes(&bytes) {
             let mut buf = String::with_capacity(128);
@@ -584,12 +608,7 @@ mod tests {
         .unwrap()
     }
 
-    fn jpeg_metadata(comment: Option<&str>, xmp: Option<&[u8]>, image_size: usize) -> Vec<u8> {
-        fn app1(out: &mut Vec<u8>, data: &[u8]) {
-            out.extend_from_slice(&[0xff, 0xe1]);
-            out.extend_from_slice(&u16::try_from(data.len() + 2).unwrap().to_be_bytes());
-            out.extend_from_slice(data);
-        }
+    fn tiff_metadata(comment: Option<&str>) -> Vec<u8> {
         // Little-endian TIFF: IFD0 Make + ExifIFD, then UserComment (ASCII preamble).
         let mut tiff = b"II\x2a\0\x08\0\0\0".to_vec();
         tiff.extend_from_slice(&2_u16.to_le_bytes());
@@ -613,6 +632,16 @@ mod tests {
         tiff.extend_from_slice(&0_u32.to_le_bytes());
         tiff.extend_from_slice(b"Canon\0");
         tiff.extend_from_slice(&user);
+        tiff
+    }
+
+    fn jpeg_metadata(comment: Option<&str>, xmp: Option<&[u8]>, image_size: usize) -> Vec<u8> {
+        fn app1(out: &mut Vec<u8>, data: &[u8]) {
+            out.extend_from_slice(&[0xff, 0xe1]);
+            out.extend_from_slice(&u16::try_from(data.len() + 2).unwrap().to_be_bytes());
+            out.extend_from_slice(data);
+        }
+        let tiff = tiff_metadata(comment);
         let mut out = vec![0xff, 0xd8];
         app1(&mut out, &[b"Exif\0\0".as_slice(), &tiff].concat());
         if let Some(xmp) = xmp {
@@ -740,6 +769,66 @@ mod tests {
         assert!(text.exif.is_empty());
         let text = assert_legacy_matches(&tmp.path().join("xmp.png"), &large_png(false, true));
         assert!(text.xmp_tweet.contains("partialreader"));
+    }
+
+    #[test]
+    fn partial_ingest_matches_legacy_for_tiff_magic_jpg_and_late_tiff_comment() {
+        let tmp = TempDir::new().unwrap();
+        let ai = "positive lighthouse\nNegative prompt: negative-secret\nSteps: 20, Sampler: Euler, CFG scale: 7, Seed: 42";
+        let mut bytes = tiff_metadata(Some(ai));
+        assert!(bytes.starts_with(b"II*\0"));
+        let jpg = tmp.path().join("tiff-content.jpg");
+        let text = assert_legacy_matches(&jpg, &bytes);
+        assert!(text.exif.contains("canon"));
+        assert!(text.png_prompt.contains("positive lighthouse"));
+        assert!(!text.combined().contains("negative-secret"));
+
+        // Move UserComment beyond the old TIFF prefix limit. Its IFD entry's
+        // value-offset field is at 48, and its original payload starts at 62.
+        let comment = bytes.split_off(62);
+        let offset = 2 * 1024 * 1024 + 128;
+        bytes[48..52].copy_from_slice(&(offset as u32).to_le_bytes());
+        bytes.resize(offset, 0);
+        bytes.extend_from_slice(&comment);
+        let text = assert_legacy_matches(&jpg, &bytes);
+        assert!(text.png_prompt.contains("positive lighthouse"));
+        assert!(!text.combined().contains("negative-secret"));
+
+        for ext in ["tif", "tiff"] {
+            let path = tmp.path().join(format!("late-comment.{ext}"));
+            let text = assert_legacy_matches(&path, &bytes);
+            assert!(
+                text.png_prompt.is_empty(),
+                "AI bytes reader must retain the 2MB limit"
+            );
+            assert!(
+                text.exif.contains("negative-secret"),
+                "the independent full EXIF read remains unsuppressed"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_metadata_reader_preserves_extension_gates_and_two_mb_limit() {
+        let tmp = TempDir::new().unwrap();
+        let bytes = vec![0x55; 2 * 1024 * 1024 + 128];
+        for ext in [
+            "jpg", "jpeg", "jfif", "png", "JPG", "tif", "tiff", "mp4", "mov", "m4v", "TIFF",
+            "webp", "bmp", "gif", "heic", "raw", "txt", "",
+        ] {
+            let path = tmp.path().join(format!("image.{ext}"));
+            fs::write(&path, &bytes).unwrap();
+            let expected = match ext {
+                "jpg" | "jpeg" | "jfif" | "png" | "JPG" => Some(bytes.as_slice()),
+                "tif" | "tiff" | "mp4" | "mov" | "m4v" | "TIFF" => Some(&bytes[..2 * 1024 * 1024]),
+                _ => None,
+            };
+            assert_eq!(
+                read_metadata_bytes_legacy(&path).as_deref(),
+                expected,
+                "{ext}"
+            );
+        }
     }
 
     #[test]
