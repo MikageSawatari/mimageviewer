@@ -1460,7 +1460,8 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 設計担当の決定に沿い、`App::use_full_path_cache_keys` の Collection 条件を root に限定し、
 物理子の準備前判定も通常のパス判定へ揃える。帰路の Collection 所有と物理一覧の cache key を
 分離する構造的修正であり、detached 固有の guard・待機・状態追加は行わない。
-Codex もこの構造判断に同意。判定は mount 済み viewer context の一覧状態だけを使い、
+設計担当 (ClaudeCode) と、実装者とは別の独立レビュー (Codex GPT-6.1 Sol / xhigh、重要指摘なし) の双方が
+「症状パッチではなく構造的修正」であることに合意した。判定は mount 済み viewer context の一覧状態だけを使い、
 headless の複数 context テストで root／物理子と兄弟一覧の不変を検査する。
 
 ### 2026-11-06 PDF旧読書位置復元とPCの先頭fallback
