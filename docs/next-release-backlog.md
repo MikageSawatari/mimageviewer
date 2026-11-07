@@ -39,6 +39,12 @@
 
 ## 1. 優先候補
 
+### 1.730 作成済みの AI 説明文を削除する操作が無い (2026-11-07、v5.0.0)
+
+- 状態: **着手** (ブランチ `feat/caption-delete`、worktree `G:\home\mimageviewer-caption-delete`)。利用者決定 2026-11-07: v5.0.0 に入れる。
+- 現状 (コード): 利用者が使える操作は右クリック・ツールメニューの「AI 説明文を作る」だけ。`ai_caption_db::CaptionDb::delete` はテストからしか呼ばれていない。行が消えるのはファイル削除の purge・改名の孤児整理・メタ情報取り込みの「記載された空は消す」・本への追記だけ。
+- 方針: 一覧の右クリックに「AI 説明文を削除」を足す (作成と同じ対象範囲、複数選択・背景可。ツールメニューには足さない)。worker で対象の行数を数えてから件数つきの確認ダイアログを出し、確定後に worker で 1 トランザクションで消す。失敗 (failed) 行も消す。作成ジョブ中・削除の処理中・リモート閲覧中は押せない (理由を表示)。索引からの除去は既存の `caption_removed` trigger + `notify_caption_changed`、表示は `caption_display.clear()` に乗せ、新しい無効化経路を作らない。DB スキーマは変えない (未リリース機能)。まれな失敗は割り切り (ログ + 通知)。設計の正本は `docs/local-vlm-caption-plan.md` §6.8。
+
 ### 1.729 索引作成のメタ読みが JPEG/PNG をファイル全体まで読む (2026-11-07、v5.0.0)
 
 - 状態: **修正済み・利用者の実機確認待ち** (ブランチ `fix/ingest-metadata-partial-read`、2c762d0e4 + 3d09bbf23 を master へ merge)。実装 Codex gpt-6.1-sol / high、独立レビュー gpt-6.1-sol / xhigh は ACCEPT (P3 1 件: 比較用旧実装の読み範囲を本当の旧実装に合わせた)。§1.722 の別件。
