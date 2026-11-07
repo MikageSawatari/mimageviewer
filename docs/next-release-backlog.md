@@ -84,11 +84,15 @@
 
 ### 1.724 非表示になったファイル名と理由を一覧で確認する — 5ch >>736・738 (2026-11-07)
 
-- 状態: **修正済み・利用者の実機確認待ち** (ブランチ `feat/omitted-list-1724`、`8022c8f1a` + `5348cf517` を master へ merge、v5.0.0 に収録。利用者決定 2026-11-07)。実装 Codex gpt-6.1-sol / high、独立レビュー gpt-6.1-sol / xhigh (1 回目 REJECT の P2×2・P3×1 を直して ACCEPT)。
+- 状態: **修正済み (master `ed604f6fb`、v5.0.0 に収録。利用者決定 2026-11-07)。サブ PC 担当が実機確認 (依頼 16、2026-11-07)**。ブランチ `feat/omitted-list-1724`、`8022c8f1a` + `5348cf517` を merge。
+  - 実機確認 (観測者はすべてサブ PC 担当、build `ed604f6fb` 相当、隔離 data-dir、結果は `C:\miv-subpc\results-16\`): `mixed` (同名 1・隠し 1・対象外 3・システム 2) で「非表示 5 件」と内訳が一致し、一覧の窓には理由ごとの名前が出て、システム 2 件は末尾の別区分に出た。窓を開いたまま `Rename-Item` で `a.txt` → `renamed.txt` にすると、3 秒後の画面で表が新しい名前に変わり、件数は変わらなかった。「同名ファイル設定を開く」で窓が閉じ、環境設定の同名ファイルのページが開いた。Esc 1 回で一覧の窓だけが閉じ、× でも閉じた。閉じた後は矢印・Enter・Esc が普段どおり効いた。隠し 1000・対象外 3000 の `many` で「非表示 4000 件」が出て、表はクリック直後の画面で既に描かれていた。スクロールバーのドラッグでも固まらなかった。開いている間の CPU は 5 秒で 0.05 秒。panic・ERROR・WARN なし。
+  - 見込み違い (不具合ではない): 窓を開いている間に背面のサムネイルを 1 回クリックすると、選択だけが移る。ホイール・ダブルクリック・矢印は効かない。共通のモーダル相当ダイアログすべてに共通の作りで、`any_dialog_open` の間は選択を通し、開く操作だけを止める (`src/ui_main.rs` のグリッドのクリック処理と `grid_open_from_click_allowed`)。§1.724 で入った挙動ではない。依頼書の「受け付けない見込み」が誤りだった。設定リンクで閉じた回に `released` のログが無いと報告されたが、`held by a dialog: preferences` へ引き継がれ、`released by preferences` が出ていた。
+  - 気づき (未対応・別件): ホイール 1 回で約 1.6 行しか動かず、数千行をホイールで下るのは現実的ではない (サブ PC 担当)。内訳の「『システム』は Thumbs.db など…」の注は、システムが 0 件でも出る (`draw_omitted_entries_summary`、§1.724 より前の `8cca8dcdf` からの作り)。
+  - 未確認: エクスプローラーでの名前変更 (`Rename-Item` で代用)、「隠しファイル・フォルダを表示する」のリンク、開くまでの時間の数値。実装 Codex gpt-6.1-sol / high、独立レビュー gpt-6.1-sol / xhigh (1 回目 REJECT の P2×2・P3×1 を直して ACCEPT)。
   - 修正: `src/app/folder_scan.rs::OmittedFolderEntries::record(reason, name)` が件数の加算と (ファイル名, 理由) の記録を同じ判定箇所で行う (走査ループ・`project_scanned_directory`・同名除外 5 関数)。一覧のための再判定・再走査はしない。同名分は除いた規則ごとに理由を分ける (同名の本/フォルダ/ZIP・CBZ/PDF/動画・音声を優先、同名画像の拡張子優先順)。システムファイルは従来どおり主件数に入れず、一覧の末尾に「システム（件数に含めない）」で出す。
   - UI: チップのメニューの「ファイル名の一覧を表示…」から `src/ui_dialogs/omitted_entries.rs` の確認専用ダイアログを開く (上部に理由別件数と既存の設定リンク、下部に「ファイル名」「非表示理由」の仮想化した一覧)。modal 相当 (`common_modal_dialog_open`)。毎フレーム、チップと同じ所属判定の accessor から読み、フォルダが合わなくなったら閉じる。他の共通モーダルが出たら閉じる (Esc の二重使用を避ける)。設定リンクを押すと閉じて環境設定を開く。
   - レビュー対応: 表示行が変わらない外部再走査 (Equal) でも新しい除外結果へ置き換える (通常の採用と同じ書き込み条件の helper)。読み込みごとの並べ替えはせず、一覧を開いたとき・開いている間に新しい結果を採用したときに 1 回だけ並べる。
-  - 検証: 実装担当の関連 nextest 142 件 + 再走査 2 件、`cargo test --test ui_snapshot` 239 件 (基準 PNG `omitted_entries_dialog_dark.png` 追加・`file_type_visibility_status_dark.png` はメニューのリンク追加分だけ更新、設計担当が目視)、`check_ui_glyphs.py`、`test-lib-full.ps1` 16525 件 (設計担当、`5348cf517`)。実アプリでの表示・操作は未確認 (利用者の隔離データでの確認待ち)。
+  - 検証: 実装担当の関連 nextest 142 件 + 再走査 2 件、`cargo test --test ui_snapshot` 239 件 (基準 PNG `omitted_entries_dialog_dark.png` 追加・`file_type_visibility_status_dark.png` はメニューのリンク追加分だけ更新、設計担当が目視)、`check_ui_glyphs.py`、`test-lib-full.ps1` 16525 件 (設計担当、`5348cf517`)。実アプリでの確認は上の依頼 16。
   - 範囲外 (従来どおり): 検索結果・スマートフォルダ・サブ展開・書庫内部・Remote・detached viewer。
 - 経緯 (起票時): 未着手・意図確認済み、利用者が通常バックログへの移管を指示。[>>736](https://egg.5ch.io/test/read.cgi/software/1782419551/736) の「何が非表示になっているか確認したい」に対し、>>737でファイル名一覧の意味か確認し、[>>738](https://egg.5ch.io/test/read.cgi/software/1782419551/738) の「よろしくお願いします」を受け、返答待ちを解除した。
 - 現状（ソース照合）: `src/ui_main.rs::draw_omitted_entries_chip` は理由別件数と関連設定へのリンクを表示する。`src/app.rs::NormalFolderOmittedEntries` はフォルダと `OmittedFolderEntryCounts` を保持するだけで、個々の非表示ファイル名の一覧はない。
