@@ -2786,6 +2786,16 @@ mod tests {
             metadata_search_captions(&items, None, &absent, &AtomicBool::new(false)).is_empty()
         );
         assert!(!absent.parent().unwrap().exists());
+        // Ctrl+F reads the current DB on every request; deleting a saved caption
+        // must remove its hit without any additional search invalidation path.
+        let image_key = crate::ai_caption_db::CaptionDb::normalize_path(
+            items[0].file_operation_path().unwrap(),
+        );
+        let db = crate::ai_caption_db::CaptionDb::open_existing_for_write(&db_path).unwrap();
+        assert_eq!(db.delete_keys(&[image_key]).unwrap(), 1);
+        let remaining = run("sunflower", caption_only(), None);
+        assert!(!remaining.contains(&0));
+        assert_eq!(remaining, (1..6).collect());
     }
 
     #[test]

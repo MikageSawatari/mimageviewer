@@ -314,6 +314,9 @@ impl App {
         if self.remote_session_blocks_local_control() {
             return Some("リモート閲覧中は AI 説明文を作れません");
         }
+        if self.caption_delete.is_some() {
+            return Some("AI 説明文の削除を処理しています。終わってから選んでください");
+        }
         // A native/egui menu still owns its command while this is queried.
         if self.main_chrome_pointer_blocked() {
             return Some("ほかの操作を終えてから AI 説明文を作ってください");
@@ -372,6 +375,19 @@ impl App {
         targets: CaptionTargets,
         config: CaptionWorkerConfig,
     ) {
+        if self.caption_delete.is_some() {
+            // Model preparation excludes deletion, so reserved targets cannot normally reach this fence.
+            crate::logger::log(format!(
+                "[VLM] caption job rejected during deletion: discarded_targets={} unsupported={}",
+                targets.paths.len(),
+                targets.unsupported,
+            ));
+            self.show_feedback_result(
+                "AI 説明文の削除を処理しています。終わってから選んでください".into(),
+                FeedbackKind::Info,
+            );
+            return;
+        }
         if self.caption_job.is_some() {
             self.append_caption_job_targets(targets);
             return;
@@ -724,6 +740,27 @@ mod tests {
             JobState::Running
         );
         assert!(!cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn caption_job_tools_menu_is_disabled_during_caption_deletion() {
+        let mut app = tools_menu_fixture(false, true);
+        app.caption_delete = Some(super::super::caption_delete::CaptionDeleteState::Counting {
+            rx: mpsc::channel().1,
+        });
+        assert_eq!(
+            app.caption_creation_disabled_reason(false),
+            Some("AI 説明文の削除を処理しています。終わってから選んでください")
+        );
+        let mut harness = tools_menubar_harness(app);
+        harness.run_steps(4);
+        assert!(
+            harness
+                .get_by_label(crate::keymap::TopMenuId::Tools.label())
+                .accesskit_node()
+                .is_disabled()
+        );
+        assert!(harness.state().caption_job.is_none());
     }
 
     #[test]

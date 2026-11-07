@@ -479,6 +479,11 @@ sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを
 
 ## 4. 新機能追加時のチェックリスト
 
+AI 説明文の削除（§1.730）は UI で既存一覧の対象を捕捉するだけとし、説明文 DB の open、
+存在・status の集計、単一 transaction の DELETE を worker 上に置く。root は完了 channel を
+非blocking poll し、worker 完了時だけ repaint を要求する。全 phase を同じ可視 modal にし、
+集計の取消は rx を捨てるだけ、削除中は閉じない。描画・押せない条件に DB 参照を持ち込まず、終了時も worker を待たない。
+
 §1.482 段A〜Cの前回終了通知は、資料のread/open/metadata/置換/整理・serialize・DXGI照会を専用writerで行う。Appは不変本文を非blockingで一度受け取り、起動overlay/非表示/最小化中に消費せず、表示と明示コピーだけを行う。AI等の実活動中はworker側だけで約1秒を目標にcheckpointを保存し、idleの周期起床・診断専用の周期repaintは追加しない。native前回資料の確保も今回のrotationより前にworkerで行う。device-lost callbackはdeviceごとの単一atomicへのCASだけで、通常root maintenance/活動/終端処理からworkerが観測・保存する。panicだけは既存hookの詳細処理より前に、事前open済みの専用sinkへ固定bufferで単発raw書込みを行う（同期WriteFileの完了時間は保証できず、通常UIへ流用しない）。main最終境界だけが共通終了deadlineまで保存完了を待ち、その後に制御エラーのnative通知を出す。
 
 本の AI 説明文（V1-4b）は、UI で種類と実パス、設定と読み取り用ハンドルだけを捕捉する。

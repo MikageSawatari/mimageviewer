@@ -49,6 +49,7 @@ pub enum ContextMenuItemId {
     CopyFiles,
     OrganizeFiles,
     CreateAiCaptions,
+    DeleteAiCaptions,
     ConvertImageFolderToZip,
     NewFolder,
     Paste,
@@ -86,6 +87,7 @@ impl ContextMenuItemId {
         Self::CopyFiles,
         Self::OrganizeFiles,
         Self::CreateAiCaptions,
+        Self::DeleteAiCaptions,
         Self::ConvertImageFolderToZip,
         Self::NewFolder,
         Self::Paste,
@@ -123,6 +125,7 @@ impl ContextMenuItemId {
             Self::CopyFiles => "CopyFiles",
             Self::OrganizeFiles => "OrganizeFiles",
             Self::CreateAiCaptions => "CreateAiCaptions",
+            Self::DeleteAiCaptions => "DeleteAiCaptions",
             Self::ConvertImageFolderToZip => "ConvertImageFolderToZip",
             Self::NewFolder => "NewFolder",
             Self::Paste => "Paste",
@@ -175,6 +178,7 @@ impl ContextMenuItemId {
             Self::CopyFiles => "コピー",
             Self::OrganizeFiles => "ファイル整理先…",
             Self::CreateAiCaptions => "AI 説明文を作る",
+            Self::DeleteAiCaptions => "AI 説明文を削除",
             Self::ConvertImageFolderToZip => "ZIP に変換…",
             Self::NewFolder => "新しいフォルダ…",
             Self::Paste => "貼り付け",
@@ -216,6 +220,7 @@ impl ContextMenuItemId {
             MenuCommand::CopyFiles => Self::CopyFiles,
             MenuCommand::OrganizeFiles => Self::OrganizeFiles,
             MenuCommand::CreateAiCaptions => Self::CreateAiCaptions,
+            MenuCommand::DeleteAiCaptions => Self::DeleteAiCaptions,
             MenuCommand::ConvertImageFolderToZip => Self::ConvertImageFolderToZip,
             MenuCommand::CopyPath => Self::CopyPath,
             MenuCommand::CopyFileName => Self::CopyFileName,
@@ -522,6 +527,15 @@ impl ContextMenuPreviewScenario {
                     | ContextMenuItemKind::ConvertibleArchive
             ))
             .then(|| CAPTION_NO_TARGET_REASON.into()),
+            caption_deletion_disabled_reason: (!matches!(
+                kind,
+                ContextMenuItemKind::Image
+                    | ContextMenuItemKind::Folder
+                    | ContextMenuItemKind::ZipFile
+                    | ContextMenuItemKind::PdfFile
+                    | ContextMenuItemKind::ConvertibleArchive
+            ))
+            .then(|| CAPTION_DELETE_NO_TARGET_REASON.into()),
             can_paste_edit_bundle: true,
             has_explorer_folder: true,
             collection_reference,
@@ -748,6 +762,7 @@ pub enum MenuCommand {
     CopyFiles,
     OrganizeFiles,
     CreateAiCaptions,
+    DeleteAiCaptions,
     ConvertImageFolderToZip,
     CopyPath,
     CopyFileName,
@@ -926,6 +941,7 @@ pub struct ContextMenuInput {
     pub can_use_folder_commands: bool,
     /// Computed from the same effective selection/direct-folder targets as admission.
     pub caption_creation_disabled_reason: Option<String>,
+    pub caption_deletion_disabled_reason: Option<String>,
     pub can_paste_edit_bundle: bool,
     pub has_explorer_folder: bool,
     /// Collection root の参照解除権限。元ファイル操作は独立した対象を持つ。
@@ -1022,6 +1038,17 @@ fn push_group(nodes: &mut Vec<MenuNode>, group: impl IntoIterator<Item = MenuNod
 }
 
 pub(crate) const CAPTION_NO_TARGET_REASON: &str = "AI 説明文を作れる画像ファイルや本がありません。書庫内の画像・フォルダ、本のページ、動画・音声などは対象外です";
+
+pub(crate) const CAPTION_DELETE_NO_TARGET_REASON: &str = "AI 説明文を削除できる画像ファイルや本がありません。書庫内の画像・フォルダ、本のページ、動画・音声などは対象外です";
+
+fn caption_deletion_node(input: &ContextMenuInput) -> MenuNode {
+    MenuNode::Item {
+        command: MenuCommand::DeleteAiCaptions,
+        label: "AI 説明文を削除".into(),
+        enabled: input.caption_deletion_disabled_reason.is_none(),
+        disabled_reason: input.caption_deletion_disabled_reason.clone(),
+    }
+}
 
 fn caption_creation_node(input: &ContextMenuInput, label: &str) -> MenuNode {
     MenuNode::Item {
@@ -1305,7 +1332,10 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
         if input.surface == ContextMenuSurface::Grid {
             push_group(
                 &mut nodes,
-                [caption_creation_node(input, "AI 説明文を作る")],
+                [
+                    caption_creation_node(input, "AI 説明文を作る"),
+                    caption_deletion_node(input),
+                ],
             );
         }
 
@@ -1434,7 +1464,10 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
     if input.surface == ContextMenuSurface::Grid {
         push_group(
             &mut nodes,
-            [caption_creation_node(input, "AI 説明文を作る")],
+            [
+                caption_creation_node(input, "AI 説明文を作る"),
+                caption_deletion_node(input),
+            ],
         );
     }
 
@@ -1924,6 +1957,15 @@ mod tests {
                     | ContextMenuItemKind::ConvertibleArchive
             ))
             .then(|| CAPTION_NO_TARGET_REASON.into()),
+            caption_deletion_disabled_reason: (!matches!(
+                kind,
+                ContextMenuItemKind::Image
+                    | ContextMenuItemKind::Folder
+                    | ContextMenuItemKind::ZipFile
+                    | ContextMenuItemKind::PdfFile
+                    | ContextMenuItemKind::ConvertibleArchive
+            ))
+            .then(|| CAPTION_DELETE_NO_TARGET_REASON.into()),
             can_paste_edit_bundle: false,
             has_explorer_folder: false,
             collection_reference: CollectionReferenceAvailability::NotCollectionRoot,
@@ -2273,6 +2315,7 @@ mod tests {
                     "コピー (Ctrl+C)",
                     "ファイル整理先…",
                     "AI 説明文を作る",
+                    "AI 説明文を削除",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -2295,6 +2338,7 @@ mod tests {
                     "コピー (Ctrl+C)",
                     "ファイル整理先…",
                     "AI 説明文を作る",
+                    "AI 説明文を削除",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -2312,6 +2356,7 @@ mod tests {
                     "コピー (Ctrl+C)",
                     "ファイル整理先…",
                     "AI 説明文を作る",
+                    "AI 説明文を削除",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -2330,6 +2375,7 @@ mod tests {
                     "コピー (Ctrl+C)",
                     "ファイル整理先…",
                     "AI 説明文を作る",
+                    "AI 説明文を削除",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -2344,6 +2390,7 @@ mod tests {
                     "コピー (Ctrl+C)",
                     "ファイル整理先…",
                     "AI 説明文を作る",
+                    "AI 説明文を削除",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -2361,6 +2408,7 @@ mod tests {
                     "コピー (Ctrl+C)",
                     "ファイル整理先…",
                     "AI 説明文を作る",
+                    "AI 説明文を削除",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -2378,6 +2426,7 @@ mod tests {
                     "コピー (Ctrl+C)",
                     "ファイル整理先…",
                     "AI 説明文を作る",
+                    "AI 説明文を削除",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -2393,6 +2442,7 @@ mod tests {
                 &[
                     "ファイル整理先…",
                     "AI 説明文を作る",
+                    "AI 説明文を削除",
                     "パスをコピー",
                     "ファイル名をコピー",
                     "画像をクリップボードにコピー",
@@ -2411,6 +2461,7 @@ mod tests {
                 &[
                     "ファイル整理先…",
                     "AI 説明文を作る",
+                    "AI 説明文を削除",
                     "パスをコピー",
                     "ページ名をコピー",
                     "編集を反映した画像をコピー",
@@ -2428,6 +2479,7 @@ mod tests {
                 &[
                     "ファイル整理先…",
                     "AI 説明文を作る",
+                    "AI 説明文を削除",
                     "代表画像のパスをコピー",
                     "アプリケーションで開く…",
                     "外部ツールの設定…",
@@ -2435,11 +2487,21 @@ mod tests {
             ),
             (
                 ContextMenuItemKind::ZipDir,
-                &["ファイル整理先…", "AI 説明文を作る", "パスをコピー"][..],
+                &[
+                    "ファイル整理先…",
+                    "AI 説明文を作る",
+                    "AI 説明文を削除",
+                    "パスをコピー",
+                ][..],
             ),
             (
                 ContextMenuItemKind::SearchContainer,
-                &["ファイル整理先…", "AI 説明文を作る", "パスをコピー"][..],
+                &[
+                    "ファイル整理先…",
+                    "AI 説明文を作る",
+                    "AI 説明文を削除",
+                    "パスをコピー",
+                ][..],
             ),
         ];
         for (kind, expected) in cases {
@@ -2563,6 +2625,7 @@ mod tests {
                 "コピー [5件] (Ctrl+C)",
                 "ファイル整理先…",
                 "AI 説明文を作る",
+                "AI 説明文を削除",
                 "選択項目のパスをコピー [5件]",
                 "左に回転 (L)",
                 "右に回転 (R)",
@@ -2762,6 +2825,7 @@ mod tests {
             folder,
             &[
                 "AI 説明文を作る",
+                "AI 説明文を削除",
                 "新しいフォルダ…",
                 "貼り付け",
                 "このフォルダのパスをコピー",
@@ -2863,6 +2927,7 @@ mod tests {
                 "OrganizeFiles",
                 "|",
                 "CreateAiCaptions",
+                "DeleteAiCaptions",
                 "|",
                 "Rename",
                 "|",
@@ -2908,6 +2973,7 @@ mod tests {
                 "OrganizeFiles",
                 "|",
                 "CreateAiCaptions",
+                "DeleteAiCaptions",
                 "|",
                 "CopyPath",
                 "|",
@@ -3119,6 +3185,98 @@ mod tests {
             .filter(|item| *item != ContextMenuItemId::OrganizeFiles)
             .collect();
         assert_eq!(known_without_new, saved);
+    }
+
+    #[test]
+    fn ai_caption_deletion_is_grid_only_immediately_after_creation_and_preserves_reason() {
+        let id = ContextMenuItemId::DeleteAiCaptions;
+        assert!(ContextMenuItemId::ALL.contains(&id));
+        assert_eq!(id.stable_name(), "DeleteAiCaptions");
+        assert_eq!(
+            ContextMenuItemId::parse_stable_name("DeleteAiCaptions"),
+            Some(id)
+        );
+        assert_eq!(
+            ContextMenuItemId::from_command(&MenuCommand::DeleteAiCaptions),
+            Some(id)
+        );
+        assert_eq!(id.parent(), ContextMenuParentId::Root);
+        for background in [false, true] {
+            for checked in [false, true] {
+                let mut case = input(ContextMenuItemKind::Image, ContextMenuSurface::Grid);
+                case.is_folder_context = background;
+                case.has_checked = checked;
+                case.checked_count = usize::from(checked) * 2;
+                for reason in [None, Some("AI 説明文の削除を処理しています".to_owned())]
+                {
+                    case.caption_deletion_disabled_reason = reason.clone();
+                    let nodes = build_context_menu(&case);
+                    let shape = menu_shape(&nodes);
+                    let slot = shape
+                        .iter()
+                        .position(|name| name == "CreateAiCaptions")
+                        .unwrap();
+                    assert_eq!(shape[slot + 1], "DeleteAiCaptions");
+                    assert_eq!(
+                        command_state(&nodes, MenuCommand::DeleteAiCaptions),
+                        Some((id.label().into(), reason.is_none(), reason))
+                    );
+                }
+                case.layout.set_visible(id, false);
+                assert!(
+                    command_state(&build_context_menu(&case), MenuCommand::DeleteAiCaptions)
+                        .is_none()
+                );
+                case.layout.set_visible(id, true);
+                case.surface = ContextMenuSurface::Fullscreen;
+                assert!(
+                    command_state(&build_context_menu(&case), MenuCommand::DeleteAiCaptions)
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ai_caption_deletion_uses_canonical_slot_for_saved_and_custom_layouts() {
+        let id = ContextMenuItemId::DeleteAiCaptions;
+        let canonical = ContextMenuLayoutSettings::canonical_order(ContextMenuParentId::Root);
+        let slot = canonical
+            .iter()
+            .position(|candidate| *candidate == id)
+            .unwrap();
+        assert_eq!(canonical[slot - 1], ContextMenuItemId::CreateAiCaptions);
+        let mut saved: Vec<_> = canonical
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != id)
+            .collect();
+        let mut case = input(ContextMenuItemKind::Image, ContextMenuSurface::Grid);
+        for custom in [false, true] {
+            if custom {
+                saved.reverse();
+            }
+            case.layout.set_order(ContextMenuParentId::Root, &saved);
+            let resolved = case.layout.resolved_order(ContextMenuParentId::Root);
+            assert_eq!(resolved[slot], id);
+            assert_eq!(
+                resolved
+                    .into_iter()
+                    .filter(|candidate| *candidate != id)
+                    .collect::<Vec<_>>(),
+                saved
+            );
+            let nodes = build_context_menu(&case);
+            assert!(root_layout_ids(&nodes).contains(&id));
+        }
+        let mut custom = canonical;
+        custom.remove(slot);
+        custom.insert(0, id);
+        case.layout.set_order(ContextMenuParentId::Root, &custom);
+        for background in [false, true] {
+            case.is_folder_context = background;
+            assert_eq!(root_layout_ids(&build_context_menu(&case))[0], id);
+        }
     }
 
     #[test]

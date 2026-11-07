@@ -1484,6 +1484,12 @@ impl crate::app::App {
             } else {
                 Some(crate::context_menu_model::CAPTION_NO_TARGET_REASON.into())
             },
+            caption_deletion_disabled_reason: if target.surface == ContextMenuSurface::Grid {
+                self.caption_deletion_disabled_reason(target.is_folder_context)
+                    .map(str::to_owned)
+            } else {
+                None
+            },
             can_paste_edit_bundle: self.has_page_edit_bundle_clipboard(),
             has_explorer_folder: target.explorer_folder.is_some(),
             collection_reference: match &target.collection_root_delete {
@@ -1724,6 +1730,7 @@ impl crate::app::App {
                     &command,
                     MenuCommand::NewFolder
                         | MenuCommand::CreateAiCaptions
+                        | MenuCommand::DeleteAiCaptions
                         | MenuCommand::EditBookComposition
                         | MenuCommand::ConvertImageFolderToZip
                         | MenuCommand::Paste
@@ -1753,6 +1760,12 @@ impl crate::app::App {
             MenuCommand::CreateAiCaptions => {
                 if target.surface == ContextMenuSurface::Grid {
                     self.request_create_ai_captions(ctx, target.is_folder_context);
+                }
+                None
+            }
+            MenuCommand::DeleteAiCaptions => {
+                if target.surface == ContextMenuSurface::Grid {
+                    self.request_delete_ai_captions(ctx, target.is_folder_context);
                 }
                 None
             }
@@ -3456,6 +3469,83 @@ mod caption_menu_tests {
                     .collect::<Vec<_>>(),
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn caption_delete_native_and_egui_routes_accept_item_and_folder_background() {
+        use egui_kittest::kittest::Queryable;
+        for background in [false, true] {
+            let mut app = fixture(false);
+            let index = if background { usize::MAX } else { 0 };
+            let item = if background {
+                GridItem::Folder(app.current_folder.clone().unwrap())
+            } else {
+                app.items[0].clone()
+            };
+            app.context_menu_idx = Some(app.capture_grid_context_menu_owner(index));
+            let target = app.context_menu_target(
+                index,
+                item,
+                background,
+                false,
+                None,
+                ContextMenuSurface::Grid,
+                None,
+            );
+            assert!(matches!(
+                app.dispatch_native_context_menu_result(
+                    &egui::Context::default(),
+                    NativeContextMenuResult::MivCommand(MenuCommand::DeleteAiCaptions),
+                    &target
+                ),
+                NativeGridContextMenuOutcome::Consumed { .. }
+            ));
+            assert!(matches!(
+                app.caption_delete,
+                Some(crate::ui_dialogs::caption_delete::CaptionDeleteState::Counting { .. })
+            ));
+            // Finish the worker before the temporary data-dir owner is dropped.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while matches!(
+                app.caption_delete,
+                Some(crate::ui_dialogs::caption_delete::CaptionDeleteState::Counting { .. })
+            ) {
+                app.poll_caption_delete();
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            drop(app);
+            let mut app = fixture(false);
+            app.context_menu_idx = Some(app.capture_grid_context_menu_owner(index));
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(900.0, 900.0))
+                .build_ui_state(
+                    |ui, app: &mut crate::app::AppTestEnvForTest| {
+                        if app.context_menu_idx.is_some() {
+                            let _ = app.show_context_menu(ui.ctx());
+                        }
+                    },
+                    app,
+                );
+            harness.run_steps(4);
+            harness.get_by_label("AI 説明文を削除").click();
+            harness.run_steps(2);
+            assert!(harness.state().context_menu_idx.is_none());
+            assert!(matches!(
+                harness.state().caption_delete,
+                Some(crate::ui_dialogs::caption_delete::CaptionDeleteState::Counting { .. })
+            ));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while matches!(
+                harness.state().caption_delete,
+                Some(crate::ui_dialogs::caption_delete::CaptionDeleteState::Counting { .. })
+            ) {
+                harness.state_mut().poll_caption_delete();
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::yield_now();
+            }
         }
     }
 

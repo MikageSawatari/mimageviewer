@@ -1,5 +1,11 @@
 # UI スナップショットテスト運用方針
 
+§1.730 は共通 modal の Confirm を純粋描画する `caption_delete_confirmation_snapshot` で
+`caption_delete_confirmation_dark.png` 1枚を保持する。App・DB・worker は fixture に含めない。
+Counting / Deleting の可視性・全 phase の modal、集計取消後の遅着結果、Enter の非確定、Escape と IME、
+1093×614 の Confirm のボタン・×は別の headless 回帰で検査する。
+設定 catalog の PNG は `preferences_context_menu_layout{,_open_with}.png` の2枚。実アプリ操作の証拠とは分ける。
+
 §1.727の加工内容選択は、製品と共通のWindow描画関数を使うlibの
 `effect_picker_default_dark_snapshot`で、既定サイズ860×560の窓（PNGは1000×660）の
 `local_adjust_effect_picker_default_dark.png`を1枚保持する。製品の暗色テーマ・
