@@ -123,7 +123,7 @@ fn startup_dialog_footer_height(ui: &eframe::egui::Ui, labels: &[&str], spacing:
         + 2.0
 }
 
-fn startup_dialog_button_rows_height(ui: &eframe::egui::Ui, labels: &[&str]) -> f32 {
+pub(crate) fn startup_dialog_button_rows_height(ui: &eframe::egui::Ui, labels: &[&str]) -> f32 {
     use eframe::egui;
     let mut height = 0.0_f32;
     let mut row_height = 0.0_f32;

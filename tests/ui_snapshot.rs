@@ -591,7 +591,7 @@ fn depth_export_small_viewport_keeps_actions_visible_and_reaches_settings() {
             }
             if let Some(scroll) = response.scroll.as_ref() {
                 let before = ScrollLayout::from_output(scroll);
-                if before.content.y <= before.inner.height() + 1.0 {
+                if size.y >= 614.0 {
                     before.assert_height(
                         HeightExpectation::Fits,
                         response.rect,

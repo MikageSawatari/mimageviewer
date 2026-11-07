@@ -1436,6 +1436,83 @@ fps、MP4 12Mbps、縦横比、書き出しの非永続性、既存のモーダ�
 `src/app/depth_export.rs`, `tests/snapshots/depth_export_settings_small_dark.png`, 本書。
 未解決事項なし。lib全件gateとbuild-devは指示どおりClaudeCode担当。stage／commit／製品起動は未実施。
 
+#### 段 C サブ PC 依頼19: モーダルの層と初期サイズ (2026-11-08、基点 `b26f1b969`)
+
+修正前にコードで特定した原因を記録する。実機の観測者はサブ PC 担当（RTX 4060 Ti、1920×1080、100%）。
+`eda886076` での記録は `C:\home\mimageviewer-subpc\depth-c\results\notes.md` と同フォルダの
+`screens/NG1*`・`screens/NG2*`。記録とNG2の前後画像を読み取り専用で照合した。
+
+- **NG1**: `ui_depth_export::draw` は空の `Modal` と `Window` を独立した Foreground Area にしており、
+  親子関係を登録していなかった。egui 0.37 の `Area::begin` は外側の backdrop のクリックでも
+  `move_to_top` を実行する。同一 order の順序は `Areas::end_pass` に保存され、
+  `Memory::allows_interaction` は top modal より下の Window の入力を止める。逆に backdrop より上に
+  残った3Dパネルは操作できる。Windowだけ開き直しても同じ layer の順序を再利用する。
+  既存 `draw_export_progress_dialog` は通常の Window だけで、この二層の問題を持たない。
+  モーダルの実装は既存 `ui_dialogs::agent_integration::draw_registration_dialog` と同じく、
+  backdrop を親、Window を sublayer にして一つの前面グループとして扱う方針とした。
+- **NG2**: 同じ `depth_export_dialog` ID を設定340／進行170／終端220の各phaseで使い、
+  `default_size` と `max_size` だけを指定していた。egui の `Resize::begin` は既存stateがあると
+  defaultを再採用しないため、進行／終端から設定へ開き直しても小さい割当が残る。
+  本文もその `available_height` に依存する。操作行の控除は `interact_size.y` ベースの概算で、
+  実フォント＋paddingによるボタン高とseparator／item spacingの実占有を計測していない。
+  `Resize` が前回の `last_content_size` まで自動拡大するため、入力で次のframeが来るたびに成長し得る。
+  phaseと画面寸法からResizeの割当を毎回固定し、操作行を既存のフォント／折返し計測で予約する。
+  設定／終端は本文の親領域も明示確保する。短い進行表示の外形は従来どおり本文の自然高とする。
+  追加のrepaintやstate消去では隠さない。
+- **注・Shift+B**: §6.5の「表示占有による制限」を実装した§10の分類表に、Depth中は背景切替を抑止することが
+  明記されている。`ui_fullscreen::handle_fs_key_input_with_operation` は `FsBgCycle` をconsumeした後、
+  `fs_exclusive_view_active` が返ると背景操作を無効化する。`apply_ring_action` の `ImageBackgroundCycle` も同じ。
+  キー到達のログだけが出て背景値が変わらない観測はこの規則と一致する。利用者の「意図した抑止なら直さない」に従い変更しない。
+  背景だけを止める個別の描画上の必然性は既存文書にはない。下地自体は `try_paint_depth` へ毎描画渡す構造であり、
+  開始時の下地を描画側で固定しているためではない。書き出しは従来どおり要求作成時に下地を凍結する。
+
+独立Sol/xhighの実装前レビューは、NG1の層所有とNG2のサイズ決定を直す構造修正として合意。
+実Depthパネルとcanvasを背面にした入力、全phaseと再open、2160を含む素材、全形式、初回と後続frameのgeometry、
+通常画面の明示Fits・小画面のscroll末尾到達を回帰対象にした。
+
+実装は `ui_depth_export::draw` のbackdrop／Windowを `set_sublayer` と親の `move_to_top` でまとめた。
+設定・進行・終端すべてと、main／fullscreen双方の既存描画入口に同じ処理を使う。
+phaseごとに `fixed_size` でResize割当を決め直し、共通の `startup_dialog_button_rows_height` を
+`pub(crate)` にしてボタンの実フォント・padding・折り返しを計測する。本文→separator→操作行の
+2つのitem spacingと明示したseparator高2を控除し、設定／終端のScrollAreaには親の領域を確保した。
+既存ダイアログのhelperの計算内容は変えず、guard・retry・追加repaint・Window stateの消去は足していない。
+
+新規 `ui_depth_export_tests` の回帰:
+
+- 実3Dパネルとcanvasがモーダルなしでは操作できるpositive controlを置き、モーダル中の外側クリックと
+  パネルの「書き出し…」クリックを、同一frame／別frameのpress-release × 1093×614／1920×1080で検査。
+  背面の操作が起きず、設定のGIF→APNG・保存・キャンセル、進行のキャンセル、終端の閉じる、全phaseの
+  ドラッグ・タイトル×、Esc後の再openが動作する。backdrop直上がWindow、パネルはmodal未満であることも検査。
+- 同じContextの設定→進行→終端→閉鎖→設定について、source長辺4000・全3形式で、最初と後続7frameの
+  rect／操作行がidle・pointer移動によらず一致し、画面内に収まることを検査。
+  通常の本文は `ScrollLayout::assert_height(Fits)` として不要なscrollを許さない。
+- 長い保存先／失敗文は両解像度で初回からのgeometry不変・画面内包含・`Scrolls`を検査。
+  既存integration到達性検査も、1093×614では明示Fits、546.5×307ではScrolls＋末尾到達とする。
+
+**検証結果**（全Cargoに`MSBUILDDISABLENODEREUSE=1`、build/testは`CARGO_BUILD_JOBS=1`）:
+
+| 実行 | 結果・証拠 |
+| --- | --- |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/ui_depth_export::regression_tests/)' --test-threads 2` | 先行の入力／初回geometry **2/2成功**、exit0、1.352秒（compile6分20秒）。`target/depth-c-subpc-focused.log` |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/depth\|export/)' --test-threads 4` | 最終の新規3件を含む **295/295成功**、exit0、44.811秒（compile3分38秒）。先行2件はこの中に含む。3D／GPU／全形式／音楽ビデオ／終了回収の回帰。`target/depth-c-subpc-related.log` |
+| `UPDATE_SNAPSHOTS=1 cargo test --offline -p mimageviewer --test ui_snapshot depth_export_` | **3/3成功**、exit0、1.80秒（compile1分32秒）。設定／進行の2枚のみ更新。`target/depth-c-subpc-ui-update.log` |
+| 更新指定なし `cargo test --offline -p mimageviewer --test ui_snapshot depth_` | **6/6成功**、exit0、1.22秒。強化したFits／小画面到達性と通常画像比較。`target/depth-c-subpc-ui-compare.log` |
+| `cargo check --offline -p mimageviewer --bin mimageviewer-core` | 成功、exit0、19.03秒。`target/depth-c-subpc-check.log` |
+| 最後にworkspace全体へ引数なし `cargo fmt` → `cargo fmt --check` | 両方成功、exit0。`target/depth-c-subpc-fmt.log` |
+| `python scripts/check_ui_glyphs.py` / `git diff --check` | 両方成功、exit0、危険なUI文字0。`target/depth-c-subpc-glyphs.log` |
+| 独立レビュー（Sol / xhigh、設計と同じcontextで継続） | **最終ACCEPT、未解決P1/P2なし**。最終source・295件・UI3件/6件のログとPNG2枚を照合。重複Cargo／製品起動なし |
+
+PNGは1093×614の設定（56,335 bytes）と進行（29,457 bytes）を更新し、生成後に両方と変更前のPNGを目視比較した。
+操作行・区切り線・下端の配置が高さ計算に合わせて変わる。設定のMP4／1280／左右／ループ4と本文、
+進行のフレーム数・キャンセル、双方のタイトル×が画面内に収まり、文字・操作の見切れがない。他のPNGは変更しない。
+サブ PC の観測と修正後のheadless検証を区別し、製品起動・修正後の実機操作は実施していない。
+
+変更ファイル: `src/ui_depth_export.rs`, 新規`src/ui_depth_export_tests.rs`, `src/ui_dialogs/mod.rs`,
+`tests/ui_snapshot.rs`, `tests/snapshots/depth_export_settings_small_dark.png`,
+`tests/snapshots/depth_export_progress_small_dark.png`, 本書。
+未解決のコード上の指摘なし。Shift+Bは上記の既存設計に従って維持した。
+全件gateはClaudeCode担当。今回の指示に従いstage／commit／製品起動／build-devは実施していない。
+
 ## 11. テスト
 
 - **状態遷移**: OFF → ON → (ページ移動) → ON、× / D で OFF、フルスクリーン終了・フォルダ移動で取り消し。

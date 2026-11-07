@@ -3,6 +3,10 @@ use crate::depth_export::{DepthExportFormat, DepthExportOptions};
 use crate::depth_parallax::MotionKind;
 use eframe::egui;
 
+#[cfg(test)]
+#[path = "ui_depth_export_tests.rs"]
+mod regression_tests;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[doc(hidden)]
 pub enum Action {
@@ -60,10 +64,20 @@ pub(crate) fn default_long_edge(format: DepthExportFormat, source: u32) -> u32 {
 }
 
 pub(crate) fn draw(ctx: &egui::Context, mut phase: Phase<'_>, escape: bool) -> DialogResponse {
-    let _ = egui::Modal::new(egui::Id::unique("depth_export_barrier"))
+    let backdrop = egui::Modal::new(egui::Id::unique("depth_export_barrier"))
         .frame(egui::Frame::NONE)
-        .backdrop_color(egui::Color32::TRANSPARENT)
-        .show(ctx, |_| {});
+        .backdrop_color(egui::Color32::TRANSPARENT);
+    let backdrop_layer = backdrop.area.layer();
+    let dialog_id = egui::Id::unique("depth_export_dialog");
+    // Keep the movable Window directly above its modal backdrop, as in the
+    // registration confirmation. Outside clicks may raise the whole group,
+    // never the backdrop above the Window or a backing panel above the modal.
+    ctx.set_sublayer(
+        backdrop_layer,
+        egui::LayerId::new(egui::Order::Foreground, dialog_id),
+    );
+    ctx.move_to_top(backdrop_layer);
+    backdrop.show(ctx, |_| {});
     let screen = ctx.content_rect();
     let width = 420.0_f32.min((screen.width() - 40.0).max(160.0));
     let settings = matches!(phase, Phase::Settings { .. });
@@ -97,7 +111,7 @@ pub(crate) fn draw(ctx: &egui::Context, mut phase: Phase<'_>, escape: bool) -> D
         } else {
             "3D 写真の書き出し状況"
         })
-        .id(egui::Id::unique("depth_export_dialog"))
+        .id(dialog_id)
         .order(egui::Order::Foreground)
         .drag_area(egui::WindowDrag::Anywhere)
         .open(&mut open)
@@ -105,15 +119,23 @@ pub(crate) fn draw(ctx: &egui::Context, mut phase: Phase<'_>, escape: bool) -> D
         .resizable(false)
         .default_pos(screen.center() - egui::vec2(width, height) * 0.5)
         .default_size(egui::vec2(width, height))
-        .max_size(egui::vec2(width, height))
-        .min_width(160.0)
-        .min_height(0.0)
+        // All phases share position/drag ownership, but not a remembered
+        // Resize allocation from the smaller progress/finished contents.
+        .fixed_size(egui::vec2(width, height))
         .show(ctx, |ui| {
             ui.style_mut().spacing.scroll.floating_allocated_width =
                 ui.spacing().scroll.bar_inner_margin + ui.spacing().scroll.bar_width;
-            let action_height = ui.spacing().interact_size.y
-                + ui.spacing().item_spacing.y * 2.0
-                + ui.spacing().interact_size.y * 0.25;
+            let labels: &[&str] = if settings {
+                &["保存先を選ぶ…", "キャンセル"]
+            } else if finished {
+                &["閉じる"]
+            } else {
+                &["キャンセル"]
+            };
+            const SEPARATOR_HEIGHT: f32 = 2.0;
+            let action_height = crate::ui_dialogs::startup_dialog_button_rows_height(ui, labels)
+                + 2.0 * ui.spacing().item_spacing.y
+                + SEPARATOR_HEIGHT;
             let body_height = (ui.available_height() - action_height).max(0.0);
             let mut draw_body = |ui: &mut egui::Ui| match &mut phase {
                 Phase::Settings {
@@ -197,20 +219,26 @@ pub(crate) fn draw(ctx: &egui::Context, mut phase: Phase<'_>, escape: bool) -> D
                 }
             };
             if settings || finished {
-                // Reserve the same viewport that ScrollArea reports; natural Window
-                // sizing must not shrink underneath a larger input/clip rectangle.
                 response.scroll = Some(
-                    egui::ScrollArea::vertical()
-                        .id_salt("depth_export_body")
-                        .auto_shrink([false, false])
-                        .max_height(body_height)
-                        .show(ui, draw_body),
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), body_height),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt("depth_export_body")
+                                .auto_shrink([false, false])
+                                .min_scrolled_height(0.0)
+                                .max_height(body_height)
+                                .show(ui, draw_body)
+                        },
+                    )
+                    .inner,
                 );
             } else {
                 // Progress is short and bounded. Keep its natural height.
                 draw_body(ui);
             }
-            ui.separator();
+            ui.add(egui::Separator::default().spacing(SEPARATOR_HEIGHT));
             ui.horizontal_wrapped(|ui| {
                 if settings {
                     let save = ui
