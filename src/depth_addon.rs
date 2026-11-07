@@ -201,4 +201,21 @@ pub(crate) mod tests {
             assert!(validate_index(&bad).is_err(), "change {change}");
         }
     }
+
+    /// Checks a real installed tree, e.g. one made by `scripts/install-local-depth-addon.ps1`.
+    /// `MIV_DEPTH_ADDON_ROOT` points at `<data_dir>/addons/depth`.
+    #[test]
+    #[ignore = "needs MIV_DEPTH_ADDON_ROOT with an installed depth add-on"]
+    fn installed_tree_from_env_scans_valid() {
+        let root = std::env::var_os("MIV_DEPTH_ADDON_ROOT").expect("MIV_DEPTH_ADDON_ROOT");
+        let status = crate::addon::scan_for_kind(
+            AddonKind::Depth,
+            std::path::Path::new(&root),
+            &AtomicBool::new(false),
+        );
+        assert!(
+            matches!(status, AddonStatus::Valid { .. }),
+            "unexpected status: {status:?}"
+        );
+    }
 }
