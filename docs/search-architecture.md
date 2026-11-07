@@ -253,6 +253,16 @@ Ctrl+S も `name_bulk_indexer::classify_name_index_kind` が EPUB を `PdfFile` 
 ための索引。Ctrl+G が使う。Ctrl+F (現在地フィルタ) はこの索引を使わず、
 表示中アイテムを on-demand に判定する (§5.2)。
 
+索引作成の `ingest_text::build_per_source_for_file_counted` は、jpg/jpeg/jfif/png の
+XMP・AI メタ・EXIF を Ctrl+F pass 2 と同じ計数付き path reader で読む。JPEG は SOS 前の
+メタ領域、PNG はチャンク見出しと text payload を読み、画像データは seek する。AI reader は
+拡張子の入口制限を保ち、PNG signature なら PNG text、それ以外は rexif の JPEG/TIFF 判定へ渡す。
+そのため `.jpg` の中身が PNG、`.png` の中身が JPEG でも、索引と Ctrl+F の両方で AI メタを拾う。
+TIFF/MP4/MOV/M4V の XMP/AI は従来どおり先頭 2MB を bytes 版へ渡す
+(入力の 2MB 上限を変更しない。現行の共有 XMP bytes reader の fallback 探索自体は 512KB)。TIFF EXIF の全体読みと、WebP 等の他形式を
+XMP/AI 用に読まない方針は維持する。非計数の入口もこの計数版へ委譲する。
+新しい共有読取構造・非同期状態は追加せず、既存 ingest worker / I/O permit 内で行う。
+
 EPUB は Ctrl+S / Ctrl+G とも元ファイル名を検索対象にし、検索結果と同定には元 EPUB の
 パスを保持する (`IndexDoc.path` 等)。パスの親ディレクトリ名は検索語にしない。
 `ingest_worker::build_doc_for_pdf` は EPUB を
@@ -765,7 +775,8 @@ PNG の tEXt/iTXt/zTXt と JPEG/JFIF の EXIF UserComment に埋め込まれた�
   (`consumed_keys`) を素通し除外に使う。新フォーマット追加時のキー追加漏れで
   Negative が混入する事故を防ぐため。
 - path / bytes / メタデータパネル / Ctrl+F / Ctrl+G は `detect_and_parse_outcome` を共通境界にする。
-  PNG の path scanner は IDAT payload を seek して後置 text chunk も読む。ingest の full read も維持する。
+  PNG の path scanner は IDAT payload を seek して後置 text chunk も読む。
+  ingest も同じ path reader を使い、全体読みを行わず後置 text を保持する (§4.1)。
 - ingest は perf log 有効時、文書ごとの `stored_text_bytes` event に STORED 原文の総 byte 数と
   `png_prompt_bytes` を記録する。巨大テンプレートが索引へ残っていないことを再索引後に確認できる。
 
@@ -1235,6 +1246,15 @@ Ctrl+Fだけは一覧内filterなので、移譲されたcontextを復元し、�
 
 `--perf-log` で `perf_events.jsonl` を出力。検索 / インデクサ用の category は
 `global_search` / `ingest` / `walker`。`scripts/analyze_perf.py` で解析。
+
+お気に入りごとの `index/initial_scan_done` (`index_kind=fts`) には
+`metadata_bytes_read` と `metadata_files_read` を含める。前者はその初回スキャンでの
+XMP・AI・EXIF・先頭 2MB・外部 JSON/TXT サイドカーの計数 API の合計バイト数。
+再読したバイトも足し、seek した範囲、属性取得、説明文 DB、FFmpeg / PDFium の I/O は含めない。
+後者は 1 バイト以上の計数対象を読んだ ingest 候補数 (サイドカーを含めて候補 1 件につき 1)。
+メタ無しでも実読込があれば数え、読込 0 の候補は数えない。初回走査省略時は両方 0。
+初回フルスキャンの `apply` だけが対象で、説明文の反映待ち処理は含めない。
+監視差分・手動再走査で初回値は更新せず、per-file イベントも追加しない。
 
 ---
 
