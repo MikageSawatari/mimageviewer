@@ -376,6 +376,12 @@ impl App {
         config: CaptionWorkerConfig,
     ) {
         if self.caption_delete.is_some() {
+            // Model preparation excludes deletion, so reserved targets cannot normally reach this fence.
+            crate::logger::log(format!(
+                "[VLM] caption job rejected during deletion: discarded_targets={} unsupported={}",
+                targets.paths.len(),
+                targets.unsupported,
+            ));
             self.show_feedback_result(
                 "AI 説明文の削除を処理しています。終わってから選んでください".into(),
                 FeedbackKind::Info,

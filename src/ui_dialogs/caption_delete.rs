@@ -52,6 +52,9 @@ impl App {
         if self.remote_session_blocks_local_control() {
             return Some("リモート閲覧中は AI 説明文を削除できません");
         }
+        if self.vlm_setup.blocks_caption_deletion() {
+            return Some("AI 説明文のモデルを準備中は削除できません。終わってから選んでください");
+        }
         if self.main_chrome_pointer_blocked() {
             return Some("ほかの操作を終えてから AI 説明文を削除してください");
         }
