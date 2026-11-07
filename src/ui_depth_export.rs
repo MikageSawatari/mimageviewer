@@ -38,7 +38,7 @@ pub struct DialogResponse {
 
 /// Include a source-size choice when every standard preset would enlarge it.
 pub(crate) fn long_edge_choices(source: u32) -> Vec<u32> {
-    let choices: Vec<_> = [720, 1080, 1600, 2160]
+    let choices: Vec<_> = [720, 1080, 1280, 1600, 2160]
         .into_iter()
         .filter(|&edge| edge <= source)
         .collect();
@@ -47,6 +47,16 @@ pub(crate) fn long_edge_choices(source: u32) -> Vec<u32> {
     } else {
         choices
     }
+}
+
+pub(crate) fn default_long_edge(format: DepthExportFormat, source: u32) -> u32 {
+    let choices = long_edge_choices(source);
+    choices
+        .iter()
+        .copied()
+        .filter(|&edge| edge <= format.default_long_edge())
+        .next_back()
+        .unwrap_or(choices[0])
 }
 
 pub(crate) fn draw(ctx: &egui::Context, mut phase: Phase<'_>, escape: bool) -> DialogResponse {
@@ -121,7 +131,12 @@ pub(crate) fn draw(ctx: &egui::Context, mut phase: Phase<'_>, escape: bool) -> D
                             (DepthExportFormat::Gif, "GIF"),
                             (DepthExportFormat::Apng, "APNG"),
                         ] {
-                            ui.selectable_value(&mut options.format, format, label);
+                            if ui
+                                .selectable_value(&mut options.format, format, label)
+                                .changed()
+                            {
+                                options.long_edge = default_long_edge(format, *source_long_edge);
+                            }
                         }
                     });
                     if options.format == DepthExportFormat::Apng {
@@ -242,12 +257,7 @@ pub(crate) fn draw(ctx: &egui::Context, mut phase: Phase<'_>, escape: bool) -> D
 
 #[doc(hidden)]
 pub fn draw_snapshot_fixture(ctx: &egui::Context, progress: bool) -> DialogResponse {
-    let mut options = DepthExportOptions {
-        format: DepthExportFormat::Mp4,
-        long_edge: 1080,
-        motion: MotionKind::Horizontal,
-        loops: 4,
-    };
+    let mut options = DepthExportOptions::default();
     if progress {
         draw(
             ctx,
@@ -275,10 +285,93 @@ pub fn draw_snapshot_fixture(ctx: &egui::Context, progress: bool) -> DialogRespo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui_kittest::kittest::Queryable;
+
     #[test]
-    fn presets_never_enlarge_small_source() {
-        assert_eq!(long_edge_choices(360), vec![360]);
-        assert_eq!(long_edge_choices(1000), vec![720]);
-        assert_eq!(long_edge_choices(4000), vec![720, 1080, 1600, 2160]);
+    fn depth_export_long_edge_choices_cover_each_threshold_without_enlarging() {
+        for source in [
+            0, 1, 360, 719, 720, 721, 1079, 1080, 1081, 1279, 1280, 1281, 1599, 1600, 1601, 2159,
+            2160, 2161, 4000,
+        ] {
+            let expected = if source < 720 {
+                vec![source.max(1)]
+            } else if source < 1080 {
+                vec![720]
+            } else if source < 1280 {
+                vec![720, 1080]
+            } else if source < 1600 {
+                vec![720, 1080, 1280]
+            } else if source < 2160 {
+                vec![720, 1080, 1280, 1600]
+            } else {
+                vec![720, 1080, 1280, 1600, 2160]
+            };
+            assert_eq!(long_edge_choices(source), expected, "source={source}");
+        }
+    }
+
+    #[test]
+    fn depth_export_format_switch_resets_long_edge_to_bounded_default() {
+        for (source, expected) in [
+            (4000, [720, 1080, 1280]),
+            (1280, [720, 1080, 1280]),
+            (1279, [720, 1080, 1080]),
+            (1000, [720, 720, 720]),
+            (600, [600, 600, 600]),
+        ] {
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(1093.0, 614.0))
+                .build_ui_state(
+                    move |ui, options: &mut DepthExportOptions| {
+                        draw(
+                            ui.ctx(),
+                            Phase::Settings {
+                                options,
+                                source_long_edge: source,
+                                period_secs: 3.0,
+                                save_enabled: true,
+                            },
+                            false,
+                        );
+                    },
+                    DepthExportOptions {
+                        long_edge: default_long_edge(DepthExportFormat::Mp4, source),
+                        ..DepthExportOptions::default()
+                    },
+                );
+            harness.run();
+            assert_eq!(harness.state().long_edge, expected[2]);
+            for (format, edge) in [
+                DepthExportFormat::Gif,
+                DepthExportFormat::Apng,
+                DepthExportFormat::Mp4,
+            ]
+            .into_iter()
+            .zip(expected)
+            {
+                // Exercise a manual size choice before every format change.
+                let largest = *long_edge_choices(source).last().unwrap();
+                harness.get_by_label(&format!("{largest} px")).click();
+                harness.run();
+                assert_eq!(harness.state().long_edge, largest);
+                harness.get_by_label(format.label()).click();
+                harness.run();
+                assert_eq!(harness.state().format, format);
+                assert_eq!(
+                    harness.state().long_edge,
+                    edge,
+                    "{format:?}, source={source}"
+                );
+                assert_eq!(harness.state().loops, 4);
+            }
+            // Re-selecting the current format must preserve a manual choice.
+            let largest = *long_edge_choices(source).last().unwrap();
+            harness.get_by_label(&format!("{largest} px")).click();
+            harness.run();
+            harness.get_by_label("MP4").click();
+            harness.run();
+            assert_eq!(harness.state().long_edge, largest);
+        }
     }
 }

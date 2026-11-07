@@ -16,6 +16,48 @@ fn frame(size: [u32; 2], index: u32) -> Result<Vec<u8>, String> {
 }
 
 #[test]
+fn depth_export_finished_reports_published_file_size_or_omits_unavailable_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    for remove_after_publish in [false, true] {
+        let output = dir.path().join("published.gif");
+        std::fs::write(&output, b"old").unwrap();
+        let destination = output.clone();
+        let mut process = DepthExportProcessOwner::default();
+        let job = process
+            .client()
+            .spawn(
+                egui::Context::default(),
+                egui::ViewportId::ROOT,
+                output.clone(),
+                move |cancel, _| {
+                    let partial = PartialOutput::new(&destination)?;
+                    std::fs::write(partial.path(), b"completed export").unwrap();
+                    partial.commit(&destination, true, cancel)?;
+                    if remove_after_publish {
+                        // Simulate a file disappearing before the worker's metadata lookup.
+                        std::fs::remove_file(&destination).unwrap();
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let DepthExportEvent::Finished(Ok(summary)) = job
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap()
+        else {
+            panic!("expected successful completion even when metadata is unavailable")
+        };
+        assert_eq!(summary.output, output);
+        assert_eq!(
+            summary.bytes,
+            if remove_after_publish { None } else { Some(16) }
+        );
+        process.shutdown_and_join();
+    }
+}
+
+#[test]
 fn depth_export_animation_roundtrip_counts_delays_cycle_dimensions_and_loop() {
     let dir = tempfile::tempdir().unwrap();
     for format in [DepthExportFormat::Gif, DepthExportFormat::Apng] {

@@ -468,13 +468,17 @@ pub enum DepthSourcePhase {
 
 1. 3D パネルの「書き出し…」→ **モーダルの書き出しダイアログ** (`App::common_modal_dialog_open` に登録)。
    - 形式: MP4 / GIF / APNG (APNG には「ファイルが大きくなります」の注記)
-   - 長辺: 720 / 1080 / 1600 / 2160 px (元のテクスチャより大きいものは出さない)
+   - 長辺: 720 / 1080 / 1280 / 1600 / 2160 px (元のテクスチャより大きいものは出さない。
+     720 px 未満なら元の長辺を1つ表示)
+   - 長辺の既定: MP4 1280 / GIF 720 / APNG 1080 px。形式を切り替えるたびにその形式の既定へ戻す。
+     選択肢にないときは既定以下で最大の候補、なければ最小の候補。設定は保存せず、開くたびに既定から始める
    - 動き: 自動の動き 4 種から (パネルがマウス追従なら左右を初期値にする)
    - MP4 だけ: 長さ (ループ回数 1〜10、既定 4)
    - 強さ・周期・焦点・整形はパネルの設定をそのまま使う (ダイアログで二重に持たない)
 2. 「保存先を選ぶ」→ 既存の core と同じ `rfd::FileDialog::save_file` (既定名 `<元の名前>_3d.mp4` 等)。
 3. **モーダルの進行ダイアログ** (フレーム数 / 全体、キャンセル)。書き出し中は他の操作を受け付けない。
-4. 終わったらトーストで保存先を知らせる。
+4. 終わったらトーストで保存先とファイルの大きさを知らせる。worker が rename 後のファイルから大きさを取り、
+   完了事象に載せる。取得できなければ大きさだけ省く。UI スレッドで metadata を読まない。
 
 書き出しをモーダルにするので、書き出し中のページ移動・3D OFF・設定変更の組み合わせは起きない
 (CLAUDE.md「長い処理はモーダルにして割り込みを消せないか」)。ただし `common_modal_dialog_open` への
@@ -1389,6 +1393,48 @@ UI側は完了を待たずcancel／新規受付拒否となり、worker再開後
 `shutdown_and_join`だけで回収を確定する。return時のworker完了・一時ファイル消失・既存保存先保持を確認した。
 spawnとshutdownの競合、shutdown後に残るclientの拒否、on_exitを経由しないouter owner Dropも検査した。
 全件gateは指示どおりClaudeCode担当。stage／commit／製品起動は未実施、build-devも指示により実行しない。
+
+#### 段 C 利用者決定: SNS 投稿向けの選択肢と既定 (2026-11-08、基点 `eda886076`)
+
+利用者が実機で書き出し・保存を確認したうえで、次の3点を採択した。SNS の名称・上限は UI に表示しない。
+
+- 長辺に1280 pxを追加。利用者提示の X 推奨（横1280×720／縦720×1280／正方形720×720）を理由に、
+  長辺1280を選べるようにする。縦横比は従来どおり保ち、元のテクスチャより拡大しない。
+- 形式ごとの長辺の既定を MP4 1280／GIF 720／APNG 1080 px とし、形式を切り替えたときにも
+  共通の候補解決で既定へ戻す。利用者提示の GIF 上限（X 15MB／pixiv 16MB）に対し1080では大きくなりやすいため、
+  GIF は720へ下げる。SNS ごとのプリセットは仕様変更が頻繁で中身もほぼ同じになるため作らない。
+- 保存完了事象を保存先と任意のバイト数にし、worker がファイル公開後に metadata を取得する。
+  取得失敗は通知のサイズ省略だけとし、再試行しない。トーストと完了ダイアログで既存の MB／GB 表記を共用する。
+
+MP4 のループ回数の既定4回は、繰り返し再生しない投稿先でも短すぎないようにする利用者決定として維持する。
+fps、MP4 12Mbps、縦横比、書き出しの非永続性、既存のモーダル／終了時回収経路は変更しない。
+設計との差異なし。形式の押し直しでは手動の長辺を保持し、実際に形式が変わったときだけ既定へ戻す。
+
+**検証結果**（全Cargoに`MSBUILDDISABLENODEREUSE=1`、build/testは`CARGO_BUILD_JOBS=1`）:
+
+| 実行 | 結果・証拠 |
+| --- | --- |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/depth_export/)' --test-threads 4` | **20/20成功**、exit0、11.043秒（compile6分16秒）。`target/depth-c-sns-focused.log` |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/depth\|export/)' --test-threads 4` | **292/292成功**、exit0、42.017秒。先行20件を含み重複加算しない。3D・全形式・音楽ビデオの回帰。`target/depth-c-sns-related.log` |
+| `UPDATE_SNAPSHOTS=1 cargo test --offline -p mimageviewer --test ui_snapshot depth_export_settings_small_dark -- --exact` | **1/1成功**、exit0、3.27秒（compile7分12秒）。指定の設定PNGだけ更新。`target/depth-c-sns-snapshot-update.log` |
+| 更新指定なし `cargo test --offline -p mimageviewer --test ui_snapshot depth_` | **6/6成功**、exit0、2.31秒。設定／進行の通常比較と1093×614・546.5×307での操作可視性・本文末尾への到達・実クリックを含む。`target/depth-c-sns-snapshot-compare.log` |
+| `cargo check --offline -p mimageviewer --bin mimageviewer-core` | 成功、exit0、47.72秒。`target/depth-c-sns-check.log` |
+| 最後にworkspace全体へ引数なし `cargo fmt` → `cargo fmt --check` | 両方成功、exit0。sourceに追加差分なし。`target/depth-c-sns-fmt.log` |
+| `python scripts/check_ui_glyphs.py` / `git diff --check` | 両方成功、exit0、危険なUI文字0。`target/depth-c-sns-glyphs.log` |
+
+長辺の全閾値の前後、元の長辺4000／1280／1279／1000／600の実UIクリックによる形式切替、
+同じ形式を押し直したときの手動長辺保持を検査した。worker の実一時ファイル→rename 後の新しいサイズが
+完了事象に載ること、公開後にファイルが消えた場合はサイズなしで成功すること、App の完了事象処理で
+保存先と任意のサイズがトースト・完了メッセージの両方に入ることを検査した。
+
+更新した`depth_export_settings_small_dark.png`（1093×614、56,335 bytes）を生成後に目視した。
+1280 pxの選択表示、MP4、左右、ループ4回（約12.0秒）、説明文が読み取れ、保存先を選ぶ／キャンセル／
+タイトルの×が画面内に収まる。元の長辺2000のfixtureなので2160は表示しない。他のPNGは変更しない。
+製品の起動・実機操作は実施していない。
+
+変更ファイル: `src/ui_depth_export.rs`, `src/depth_export.rs`, `src/depth_export/tests.rs`,
+`src/app/depth_export.rs`, `tests/snapshots/depth_export_settings_small_dark.png`, 本書。
+未解決事項なし。lib全件gateとbuild-devは指示どおりClaudeCode担当。stage／commit／製品起動は未実施。
 
 ## 11. テスト
 

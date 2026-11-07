@@ -37,6 +37,13 @@ impl DepthExportFormat {
     pub fn fps(self) -> u32 {
         if self == Self::Mp4 { 30 } else { 15 }
     }
+    pub fn default_long_edge(self) -> u32 {
+        match self {
+            Self::Mp4 => 1280,
+            Self::Gif => 720,
+            Self::Apng => 1080,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -50,7 +57,7 @@ impl Default for DepthExportOptions {
     fn default() -> Self {
         Self {
             format: DepthExportFormat::Mp4,
-            long_edge: 1080,
+            long_edge: DepthExportFormat::Mp4.default_long_edge(),
             motion: MotionKind::Horizontal,
             loops: 4,
         }
@@ -107,9 +114,13 @@ pub(crate) struct DepthExportRequest {
     pub output: PathBuf,
     pub options: DepthExportOptions,
 }
+pub(crate) struct DepthExportSummary {
+    pub output: PathBuf,
+    pub bytes: Option<u64>,
+}
 pub(crate) enum DepthExportEvent {
     Progress { completed: u32, total: u32 },
-    Finished(Result<PathBuf, String>),
+    Finished(Result<DepthExportSummary, String>),
     Cancelled,
 }
 pub(crate) struct DepthExportJob {
@@ -281,7 +292,12 @@ impl DepthExportWorkers {
                         crate::logger::log(format!("[DepthExport] {error}"));
                         DepthExportEvent::Finished(Err(error))
                     }
-                    Ok(()) => DepthExportEvent::Finished(Ok(output)),
+                    Ok(()) => {
+                        // run returns only after publishing the completed file.
+                        // Size lookup belongs to this worker, never the UI.
+                        let bytes = std::fs::metadata(&output).ok().map(|file| file.len());
+                        DepthExportEvent::Finished(Ok(DepthExportSummary { output, bytes }))
+                    }
                 };
                 let _ = tx.send(event);
                 ctx.request_repaint_of(viewport);

@@ -56,6 +56,46 @@ mod tests {
     }
 
     #[test]
+    fn depth_export_completion_toast_includes_optional_worker_file_size() {
+        for (bytes, expected) in [
+            (Some(8_800_000), "保存しました: photo_3d.mp4 (8.4 MB)"),
+            (None, "保存しました: photo_3d.mp4"),
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app_for_test();
+            install_pages(&mut app, &ctx);
+            install_ready_depth_for_export(&mut app);
+            remember_display(&app, &ctx);
+            app.open_depth_export(&ctx, 0);
+            let (job, events, _) = DepthExportJob::controlled_for_test();
+            app.depth_export_operation.as_mut().unwrap().phase = Phase::Running {
+                job,
+                completed: 1,
+                total: 1,
+                status: RunStatus::Active,
+            };
+            events
+                .send(DepthExportEvent::Finished(Ok(
+                    crate::depth_export::DepthExportSummary {
+                        // This path need not exist: the UI uses only worker-supplied data.
+                        output: PathBuf::from("photo_3d.mp4"),
+                        bytes,
+                    },
+                )))
+                .unwrap();
+            app.poll_depth_export();
+            let Phase::Finished { message, failed } =
+                &app.depth_export_operation.as_ref().unwrap().phase
+            else {
+                panic!("completion event did not finish the dialog")
+            };
+            assert!(!failed);
+            assert_eq!(message, expected);
+            assert_eq!(app.fs_feedback_toast.as_ref().unwrap().0, expected);
+        }
+    }
+
+    #[test]
     fn depth_export_freezes_display_and_retains_modal_admission_until_dismissal() {
         let ctx = egui::Context::default();
         let mut app = setup_app_for_test();
@@ -655,13 +695,10 @@ impl App {
             None
         };
         let settings = self.settings.depth_parallax.clone();
-        let choices = ui::long_edge_choices(resource.color.width.max(resource.color.height));
-        let long_edge = choices
-            .iter()
-            .copied()
-            .filter(|&edge| edge <= 1080)
-            .next_back()
-            .unwrap_or(choices[0]);
+        let long_edge = ui::default_long_edge(
+            DepthExportFormat::Mp4,
+            resource.color.width.max(resource.color.height),
+        );
         let motion = if settings.motion == crate::depth_parallax::MotionKind::Mouse {
             crate::depth_parallax::MotionKind::Horizontal
         } else {
@@ -711,7 +748,15 @@ impl App {
                 }
                 Ok(DepthExportEvent::Finished(result)) => {
                     terminal = Some(match result {
-                        Ok(path) => (format!("保存しました: {}", path.display()), false),
+                        Ok(summary) => {
+                            let size = summary.bytes.map_or_else(String::new, |bytes| {
+                                format!(" ({})", crate::ui_helpers::format_bytes(bytes))
+                            });
+                            (
+                                format!("保存しました: {}{size}", summary.output.display()),
+                                false,
+                            )
+                        }
                         Err(error) => (format!("3D 写真を書き出せませんでした: {error}"), true),
                     });
                     break;
