@@ -362,9 +362,12 @@ source key を持つ typed restore で同じ root へ戻る。
 
 サムネイルの full-path cache key を使うかどうかの正本は
 `App::use_full_path_cache_keys()`。検索結果（Ctrl+S / Ctrl+G）、タグ一覧、閲覧履歴、
-レーティング一覧、コレクションに加え、synthetic view path の一覧（★固定等）と
+レーティング一覧、コレクションの root に加え、synthetic view path の一覧（★固定等）と
 ドライブ/共有ルートを対象とする。要求生成・読出し・seed・欠損整理で同じ判定を共有し、
 一覧の種類ごとに basename/full-path の分岐を独自追加しない。
+コレクションから開いた実フォルダ・ZIP・PDF は通常の経路と同じキーを使う。
+実フォルダ DB に保存済みの旧フルパス行は移行せず、次の読込の欠損整理で削除し、
+元ファイルから通常キーで一度作り直す（schema・`CATALOG_VERSION` は変更しない）。
 
 通常グリッドの表示順は `Settings.grid_display_order` の 4 行割り当てで決まる。カテゴリは
 実フォルダ (`Folder`) / アーカイブ類 (`ZipFile` / `PdfFile` / `ConvertibleArchive`、ZIP 内では
