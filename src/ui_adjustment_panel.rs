@@ -135,6 +135,123 @@ fn local_adjust_effect_picker_columns(ui: &egui::Ui) -> (usize, f32) {
     (columns, width)
 }
 
+fn show_local_adjust_effect_picker_window(
+    ctx: &egui::Context,
+    open: &mut bool,
+    effect_query: &mut String,
+) -> Option<EffectKind> {
+    let mut picked_effect = None;
+    let dialog_frame = egui::Frame::window(ctx.global_style().as_ref())
+        .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 245))
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
+        ));
+    crate::os_theme::with_dark_context_style(ctx, || {
+        egui::Window::new("加工内容を選択")
+            .drag_area(egui::WindowDrag::Anywhere)
+            .order(egui::Order::Debug)
+            .frame(dialog_frame)
+            .default_pos(ctx.content_rect().min + egui::vec2(80.0, 64.0))
+            .collapsible(false)
+            .resizable(true)
+            .default_size(egui::vec2(860.0, 560.0))
+            .min_size(egui::vec2(560.0, 360.0))
+            .open(open)
+            .show(ctx, |ui| {
+                crate::os_theme::apply_dark_ui(ui);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 24.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        // Reserve the actual button and spacing before filling the search field.
+                        let clear_clicked = ui
+                            .add_enabled(!effect_query.is_empty(), egui::Button::new("×"))
+                            .on_hover_text("検索をクリア")
+                            .clicked();
+                        crate::ime_focus::add_sized_singleline(
+                            ui,
+                            egui::vec2(ui.available_width(), 24.0),
+                            effect_query,
+                            None,
+                            |edit| edit.hint_text("効果名で検索").desired_width(f32::INFINITY),
+                        );
+                        // Apply clear after text/IME events, as in the left-to-right row.
+                        if clear_clicked {
+                            effect_query.clear();
+                        }
+                    },
+                );
+                ui.separator();
+                let query = effect_query.trim();
+                let _picker_scroll = local_adjust_picker_scroll_area(ui).show(ui, |ui| {
+                    let (columns, button_width) = local_adjust_effect_picker_columns(ui);
+                    let mut any_effect = false;
+                    for group in EFFECT_GROUPS {
+                        let matched: Vec<EffectKind> = group
+                            .kinds
+                            .iter()
+                            .copied()
+                            .filter(|kind| effect_picker_matches_query(*kind, query))
+                            .collect();
+                        if matched.is_empty() {
+                            continue;
+                        }
+                        any_effect = true;
+                        ui.label(
+                            egui::RichText::new(group.title)
+                                .size(13.0)
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        );
+                        ui.scope(|ui| {
+                            ui.spacing_mut().item_spacing =
+                                egui::Vec2::splat(LOCAL_ADJUST_PICKER_BUTTON_SPACING);
+                            for row in matched.chunks(columns) {
+                                ui.horizontal(|ui| {
+                                    for &kind in row {
+                                        let response = ui
+                                            .add_sized(
+                                                egui::vec2(
+                                                    button_width,
+                                                    LOCAL_ADJUST_EFFECT_PICKER_BUTTON_H,
+                                                ),
+                                                egui::Button::new(
+                                                    egui::RichText::new(kind.picker_label())
+                                                        .size(12.0),
+                                                )
+                                                .wrap_mode(egui::TextWrapMode::Extend),
+                                            )
+                                            .on_hover_text(kind.description());
+                                        if response.clicked() {
+                                            picked_effect = Some(kind);
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                        ui.add_space(6.0);
+                    }
+                    if !any_effect {
+                        ui.label(
+                            egui::RichText::new("該当する効果がありません")
+                                .size(11.0)
+                                .weak(),
+                        );
+                    }
+                });
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::unique(Some("effect_picker_scroll_1727")),
+                        _picker_scroll.inner_rect,
+                    )
+                });
+            });
+    });
+    picked_effect
+}
+
 fn initial_adjust_scope_selection(has_page_override: bool) -> AdjustScopeSelection {
     if has_page_override {
         AdjustScopeSelection::Page
@@ -15464,115 +15581,7 @@ impl App {
             return;
         }
         let mut open = self.local_adjust_effect_picker_dialog_open;
-        let mut picked_effect = None;
-        let dialog_frame = egui::Frame::window(ctx.global_style().as_ref())
-            .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 26, 245))
-            .stroke(egui::Stroke::new(
-                1.0,
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
-            ));
-        crate::os_theme::with_dark_context_style(ctx, || {
-            egui::Window::new("加工内容を選択")
-                .drag_area(egui::WindowDrag::Anywhere)
-                .order(egui::Order::Debug)
-                .frame(dialog_frame)
-                .default_pos(ctx.content_rect().min + egui::vec2(80.0, 64.0))
-                .collapsible(false)
-                .resizable(true)
-                .default_size(egui::vec2(860.0, 560.0))
-                .min_size(egui::vec2(560.0, 360.0))
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    crate::os_theme::apply_dark_ui(ui);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), 24.0),
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            // Reserve the actual button and spacing before filling the search field.
-                            let clear_clicked = ui
-                                .add_enabled(!effect_query.is_empty(), egui::Button::new("×"))
-                                .on_hover_text("検索をクリア")
-                                .clicked();
-                            crate::ime_focus::add_sized_singleline(
-                                ui,
-                                egui::vec2(ui.available_width(), 24.0),
-                                effect_query,
-                                None,
-                                |edit| edit.hint_text("効果名で検索").desired_width(f32::INFINITY),
-                            );
-                            // Apply clear after text/IME events, as in the left-to-right row.
-                            if clear_clicked {
-                                effect_query.clear();
-                            }
-                        },
-                    );
-                    ui.separator();
-                    let query = effect_query.trim();
-                    let _picker_scroll = local_adjust_picker_scroll_area(ui).show(ui, |ui| {
-                        let (columns, button_width) = local_adjust_effect_picker_columns(ui);
-                        let mut any_effect = false;
-                        for group in EFFECT_GROUPS {
-                            let matched: Vec<EffectKind> = group
-                                .kinds
-                                .iter()
-                                .copied()
-                                .filter(|kind| effect_picker_matches_query(*kind, query))
-                                .collect();
-                            if matched.is_empty() {
-                                continue;
-                            }
-                            any_effect = true;
-                            ui.label(
-                                egui::RichText::new(group.title)
-                                    .size(13.0)
-                                    .strong()
-                                    .color(egui::Color32::WHITE),
-                            );
-                            ui.scope(|ui| {
-                                ui.spacing_mut().item_spacing =
-                                    egui::Vec2::splat(LOCAL_ADJUST_PICKER_BUTTON_SPACING);
-                                for row in matched.chunks(columns) {
-                                    ui.horizontal(|ui| {
-                                        for &kind in row {
-                                            let response = ui
-                                                .add_sized(
-                                                    egui::vec2(
-                                                        button_width,
-                                                        LOCAL_ADJUST_EFFECT_PICKER_BUTTON_H,
-                                                    ),
-                                                    egui::Button::new(
-                                                        egui::RichText::new(kind.picker_label())
-                                                            .size(12.0),
-                                                    )
-                                                    .wrap_mode(egui::TextWrapMode::Extend),
-                                                )
-                                                .on_hover_text(kind.description());
-                                            if response.clicked() {
-                                                picked_effect = Some(kind);
-                                            }
-                                        }
-                                    });
-                                }
-                            });
-                            ui.add_space(6.0);
-                        }
-                        if !any_effect {
-                            ui.label(
-                                egui::RichText::new("該当する効果がありません")
-                                    .size(11.0)
-                                    .weak(),
-                            );
-                        }
-                    });
-                    #[cfg(test)]
-                    ui.ctx().data_mut(|data| {
-                        data.insert_temp(
-                            egui::Id::unique(Some("effect_picker_scroll_1727")),
-                            _picker_scroll.inner_rect,
-                        )
-                    });
-                });
-        });
+        let picked_effect = show_local_adjust_effect_picker_window(ctx, &mut open, effect_query);
         if let Some(kind) = picked_effect {
             *set_layer_effect = Some((selected_layer, kind));
             open = false;

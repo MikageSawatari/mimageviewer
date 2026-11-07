@@ -13,6 +13,10 @@ fn scroll_rect(ctx: &egui::Context) -> egui::Rect {
 }
 
 fn assert_columns<T>(h: &egui_kittest::Harness<'_, (T, String)>) {
+    assert_columns_with_tolerance(h, 0.1);
+}
+
+fn assert_columns_with_tolerance<T>(h: &egui_kittest::Harness<'_, (T, String)>, tolerance: f32) {
     let inner = scroll_rect(&h.ctx);
     let min_width = EFFECT_GROUPS
         .iter()
@@ -47,21 +51,24 @@ fn assert_columns<T>(h: &egui_kittest::Harness<'_, (T, String)>) {
             })
             .collect();
         for row in rects.chunks(columns) {
-            assert!((row[0].left() - inner.left()).abs() < 0.1);
+            assert!(
+                (row[0].left() - inner.left()).abs() <= tolerance,
+                "inner={inner:?}, row={row:?}"
+            );
             for (index, rect) in row.iter().enumerate() {
                 assert!(
-                    (rect.top() - row[0].top()).abs() < 0.1,
+                    (rect.top() - row[0].top()).abs() <= tolerance,
                     "{}: {rects:?}",
                     group.title
                 );
-                assert!(rect.right() <= inner.right() + 0.1);
+                assert!(rect.right() <= inner.right() + tolerance);
                 if index > 0 {
-                    assert!((rect.left() - row[index - 1].right() - 6.0).abs() < 0.1);
+                    assert!((rect.left() - row[index - 1].right() - 6.0).abs() <= tolerance);
                 }
             }
         }
         if rects.len() > columns {
-            assert!(rects[columns].top() >= rects[0].bottom() + 6.0 - 0.1);
+            assert!(rects[columns].top() >= rects[0].bottom() + 6.0 - tolerance);
         }
     }
 }
@@ -353,4 +360,197 @@ fn effect_picker_uses_the_calculated_columns() {
             group.title
         );
     }
+}
+
+#[test]
+fn effect_picker_fractional_dpi_keeps_labels_columns_and_window_stable() {
+    check_render_configuration(1.25, 1.0, false);
+}
+
+#[test]
+fn effect_picker_ui_scale_200_keeps_labels_columns_and_window_stable() {
+    check_render_configuration(1.0, 2.0, false);
+}
+
+#[test]
+fn effect_picker_meiryo_keeps_labels_columns_and_window_stable() {
+    check_render_configuration(1.0, 1.0, true);
+}
+
+fn label_width(ctx: &egui::Context, label: &str) -> f32 {
+    ctx.fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap(
+                label.into(),
+                egui::FontId::proportional(12.0),
+                egui::Color32::WHITE,
+            )
+            .size()
+            .x
+    })
+}
+
+fn check_render_configuration(native_ppp: f32, zoom: f32, meiryo: bool) {
+    let mut app = crate::app::setup_app_for_test();
+    app.local_adjust_effect_picker_dialog_open = true;
+    let mut h = crate::test_ui::builder()
+        .with_size(egui::vec2(2400.0, 1600.0))
+        .with_pixels_per_point(native_ppp)
+        .with_context_setup(move |ctx| {
+            crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+            if meiryo {
+                let path = std::path::PathBuf::from(r"C:\Windows\Fonts\meiryo.ttc");
+                assert!(
+                    path.is_file(),
+                    "Windows test prerequisite: Meiryo must be installed"
+                );
+                crate::ui_fonts::configure_fonts_with_settings(
+                    ctx,
+                    &crate::settings::UiFontSettings {
+                        selection: crate::settings::UiFontSelection::Face {
+                            display_name: "Meiryo".into(),
+                            path,
+                            face_index: 0,
+                            post_script_name: "Meiryo".into(),
+                        },
+                        ..Default::default()
+                    },
+                );
+            } else {
+                crate::ui_fonts::configure_fonts(ctx);
+            }
+            crate::settings::apply_ui_scale_factor(ctx, zoom);
+        })
+        .build_ui_state(
+            |root, (app, query)| {
+                app.draw_local_adjust_effect_picker_dialog(root.ctx(), 0, query, &mut None);
+            },
+            (app, String::new()),
+        );
+    h.run_steps(4);
+    assert!((h.ctx.zoom_factor() - zoom).abs() < 0.001);
+    assert!((h.ctx.pixels_per_point() - native_ppp * zoom).abs() < 0.001);
+    assert_eq!(
+        h.ctx.input(|i| i.viewport().native_pixels_per_point),
+        Some(native_ppp)
+    );
+    if meiryo {
+        // Reject silent fallback: both the selected family and different actual
+        // catalog text metrics must be present, not merely a font setting.
+        h.ctx.fonts_mut(|fonts| {
+            let defs = fonts.definitions();
+            assert!(defs.font_data.contains_key("ui_primary"));
+            assert_eq!(
+                defs.families[&egui::FontFamily::Proportional][0],
+                "ui_primary"
+            );
+        });
+        let default_ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&default_ctx);
+        let mut different = false;
+        default_ctx
+            .run_pass(Default::default(), |ctx| {
+                different = EFFECT_GROUPS.iter().flat_map(|g| g.kinds).any(|kind| {
+                    (label_width(ctx, kind.picker_label())
+                        - label_width(&h.ctx, kind.picker_label()))
+                    .abs()
+                        > 0.1
+                });
+            })
+            .drop_without_applying_deltas();
+        assert!(different, "Meiryo must actually change picker text widths");
+    }
+    let before = window_rect(&h.ctx, "加工内容を選択");
+    let corner = before.max - egui::vec2(2.0, 2.0);
+    drag!(
+        h,
+        corner,
+        corner + egui::vec2(560.0 - before.width(), 360.0 - before.height())
+    );
+    let expected = window_rect(&h.ctx, "加工内容を選択");
+    assert!((expected.width() - 560.0).abs() < 2.0 && (expected.height() - 360.0).abs() < 2.0);
+    let padding: egui::Margin = h.ctx.global_style().spacing.button_padding.into();
+    let first = h
+        .get_by_label(EFFECT_GROUPS[0].kinds[0].picker_label())
+        .rect();
+    eprintln!(
+        "native_ppp={native_ppp}, zoom={zoom}, meiryo={meiryo}: scroll={:?}, first={first:?}",
+        scroll_rect(&h.ctx)
+    );
+    for frame in 0..24 {
+        let query = [
+            "",
+            "グラデーションマップ",
+            "ポスタリゼーション",
+            "no-such-effect-1727",
+        ][frame % 4];
+        h.state_mut().1 = query.into();
+        h.event(egui::Event::PointerMoved(egui::pos2(
+            20.0 + frame as f32,
+            20.0,
+        )));
+        h.run_steps(1);
+        assert_eq!(
+            window_rect(&h.ctx, "加工内容を選択").size(),
+            expected.size()
+        );
+        // ScrollArea pixel-rounds its content bounds before placing widgets,
+        // while inner_rect retains the unsnapped bounds.
+        // Keep the original cases' 0.1pt tolerance; these conditions use the
+        // snapshot policy's one-physical-pixel geometry tolerance. Text ink,
+        // button height and Window stability below retain their strict checks.
+        assert_columns_with_tolerance(&h, 1.0 / h.ctx.pixels_per_point());
+        for kind in EFFECT_GROUPS
+            .iter()
+            .flat_map(|g| g.kinds)
+            .filter(|kind| effect_picker_matches_query(**kind, query))
+        {
+            let label = kind.picker_label();
+            let button = h
+                .get_by(|n| {
+                    n.role() == egui::accesskit::Role::Button && n.label().as_deref() == Some(label)
+                })
+                .rect();
+            assert!(
+                label_width(&h.ctx, label) + padding.sum().x <= button.width() + 0.1,
+                "{label}: {button:?}"
+            );
+            assert!((button.height() - 30.0).abs() < 0.1);
+        }
+        if frame % 4 == 1 || frame % 4 == 2 {
+            let button = h.get_by_label(query).rect();
+            let painted: usize = h
+                .output()
+                .shapes
+                .iter()
+                .map(|s| assert_painted_label(&s.shape, s.clip_rect, query, button))
+                .sum();
+            assert_eq!(painted, 1, "{query}");
+        }
+    }
+}
+
+#[test]
+fn effect_picker_default_dark_snapshot() {
+    // The production Window renderer needs only transient UI state. No App,
+    // settings store, worker, native window, or real image is constructed.
+    let mut open = true;
+    let mut query = String::new();
+    let mut h = crate::test_ui::builder()
+        // Leave room for the production default_pos and viewport margins so
+        // egui doesn't shrink the 860x560 Window to fit the screenshot canvas.
+        .with_size(egui::vec2(1000.0, 660.0))
+        .with_context_setup(|ctx| {
+            crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+            crate::ui_fonts::configure_fonts(ctx);
+        })
+        .build_ui(move |ui| {
+            let _ = show_local_adjust_effect_picker_window(ui.ctx(), &mut open, &mut query);
+        });
+    h.run_steps(4);
+    assert_eq!(
+        window_rect(&h.ctx, "加工内容を選択").size(),
+        egui::vec2(860.0, 560.0)
+    );
+    h.snapshot("local_adjust_effect_picker_default_dark");
 }
