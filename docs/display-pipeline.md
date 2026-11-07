@@ -15,6 +15,8 @@ Ready の元 texture から GPU blit で `Rgba8Unorm` の色＋mipmapを作り�
 同じ表示 transform の fit / UV / 90度回転と下地を使って視差 callback を描く。
 元 texture 自体は書き換えず、final / processed の source ID を深度の鍵とする。
 mouse / touch の zoom・pan と navigator は Depth 中だけ止め、通常2Dの transform は保持する。
+保存された Z の active / aiming は Depth 中に休止する。入力・cursor・chrome・PDF需要・描画の可否は
+保存flagではなく `fs_zoom_owner()` に基づく実効helperを使い、通常のtouchページ送りを止めない。
 占有 owner、readiness、全入口の分類と検証状況の正本は [3D 設計](depth-parallax-plan.md)。
 
 §1.668（案C）: PC Collection rootのgeneric thumbnailは可視workerでdrive/UNC保持の実親catalogを

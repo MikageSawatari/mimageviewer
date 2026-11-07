@@ -52807,7 +52807,7 @@ impl App {
         let base_active = self.adjustment_mode.is_open()
             && !matches!(self.compare_view_mode, CompareViewMode::Wipe { .. })
             && !self.fs_exclusive_view_active(fs_idx).is_some()
-            && !self.fs_zoom_mode_engaged();
+            && !self.fs_zoom_mode_effective();
         let analysis_active = self.analysis_mode
             && !is_spread_double
             && !self.fs_exclusive_view_active(fs_idx).is_some();

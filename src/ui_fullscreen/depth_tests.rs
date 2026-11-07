@@ -49,6 +49,67 @@ fn install_depth(app: &mut App) {
 }
 
 #[test]
+fn depth_suspends_effective_zoom_consumers_while_2d_and_panorama_keep_their_owner() {
+    let ctx = egui::Context::default();
+    let mut app = crate::app::setup_app_for_test();
+    app.items = vec![GridItem::Image("depth-zoom-owner.jpg".into())];
+    app.fullscreen_idx = Some(0);
+    let pixels = Arc::new(egui::ColorImage::filled([4, 2], egui::Color32::WHITE));
+    app.fs_cache.insert(
+        0,
+        FsCacheEntry::Static {
+            pdf_metadata: None,
+            pdf_rerender_failures: Vec::new(),
+            tex: ctx.load_texture("depth-zoom-owner", pixels.clone(), Default::default()),
+            pixels,
+            source_dims: Some([4, 2]),
+            load_seq: 1,
+            animation: crate::fs_animation::StaticAnimationState::Still,
+        },
+    );
+    for kind in ["2d", "panorama", "depth"] {
+        let target = match kind {
+            "depth" => FsExclusiveView::Depth(crate::depth_parallax::DepthViewState::new(
+                app.edit_request_owner_context(),
+            )),
+            "panorama" => FsExclusiveView::Panorama(crate::panorama::PanoramaState::new(
+                0.0,
+                0.0,
+                crate::panorama::PanoProjection::Perspective,
+            )),
+            _ => FsExclusiveView::None,
+        };
+        app.set_fs_exclusive_view(target, "effective_zoom_test");
+        for (active, aiming) in [(false, false), (true, false), (false, true)] {
+            app.fs_zoom_active = active;
+            app.fs_zoom_aiming = aiming;
+            let stored = active || aiming;
+            assert_eq!(app.fs_zoom_mode_engaged(), stored);
+            assert_eq!(app.fs_zoom_mode_effective(), stored && kind != "depth");
+            assert_eq!(app.fs_zoom_mode_active(), active && kind != "depth");
+            assert_eq!(app.fs_zoom_mode_aiming(), aiming && kind != "depth");
+            assert_eq!(
+                app.fs_zoom_owner(),
+                if kind == "depth" {
+                    FsZoomOwner::Depth
+                } else if stored {
+                    FsZoomOwner::ZoomMode
+                } else if kind == "panorama" {
+                    FsZoomOwner::Panorama
+                } else {
+                    FsZoomOwner::Image
+                }
+            );
+            if kind == "depth" {
+                app.update_fullscreen_cursor_visibility(&ctx, ctx.viewport_id(), true, true, false);
+                assert_ne!(app.cursor_hide_reason, Some(FsCursorHide::ZoomAiming));
+                assert_eq!((app.fs_zoom_active, app.fs_zoom_aiming), (active, aiming));
+            }
+        }
+    }
+}
+
+#[test]
 fn depth_excludes_an_otherwise_eligible_single_still_from_page_turn_animation() {
     let mut app = crate::app::setup_app_for_test();
     app.items = vec![GridItem::Image("depth-page-turn.jpg".into())];

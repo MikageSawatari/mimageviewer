@@ -14700,9 +14700,22 @@ impl App {
         }
     }
 
-    /// ZipPla 風全画面ズームモードが何らかの形で動作中か (照準 or ズーム+パン中)。
+    /// Stored Z state (aiming or committed). Depth suspends this state without clearing it.
+    /// Runtime input/paint consumers use the effective-owner helpers below instead.
     pub(crate) fn fs_zoom_mode_engaged(&self) -> bool {
         self.fs_zoom_active || self.fs_zoom_aiming
+    }
+
+    pub(crate) fn fs_zoom_mode_effective(&self) -> bool {
+        self.fs_zoom_owner() == FsZoomOwner::ZoomMode
+    }
+
+    fn fs_zoom_mode_active(&self) -> bool {
+        self.fs_zoom_mode_effective() && self.fs_zoom_active
+    }
+
+    fn fs_zoom_mode_aiming(&self) -> bool {
+        self.fs_zoom_mode_effective() && self.fs_zoom_aiming
     }
 
     /// フルスクリーンの現ページが FsVideo コンテキストか (動画 / 音声 / 動画→音声モード)。
@@ -14964,7 +14977,7 @@ impl App {
             state.tex.clone(),
             state.original_preview_active,
         );
-        let active = self.fs_zoom_active;
+        let active = self.fs_zoom_mode_active();
         let pixel_grid = self.fs_pixel_grid_enabled;
         let tex_size = paint_resource
             .as_ref()
@@ -15156,7 +15169,7 @@ impl App {
     ///
     /// Z ズームと連結読みはそれぞれ専用制約を持つため、このクランプを適用しない。
     fn set_fs_pan_from_input(&mut self, proposed_zoom: f32, proposed_pan: egui::Vec2) {
-        self.fs_pan = if self.fs_zoom_mode_engaged() {
+        self.fs_pan = if self.fs_zoom_mode_effective() {
             proposed_pan
         } else {
             clamp_fullscreen_pan_from_layout(
@@ -15645,7 +15658,7 @@ impl App {
             return false;
         }
         // ZipPla 風ズーム中は専用経路なので、ゲームパッドで不可視の fs_zoom を動かさない。
-        if self.analysis_mode || self.fs_zoom_mode_engaged() || amount.abs() < 0.01 || dt <= 0.0 {
+        if self.analysis_mode || self.fs_zoom_mode_effective() || amount.abs() < 0.01 || dt <= 0.0 {
             return false;
         }
         let old_zoom = self.fs_zoom;
@@ -15667,7 +15680,7 @@ impl App {
             return false;
         }
         if self.analysis_mode
-            || self.fs_zoom_mode_engaged()
+            || self.fs_zoom_mode_effective()
             || delta.length_sq() <= f32::EPSILON
             || self.fs_zoom <= ZOOM_NEAR_ONE
         {
@@ -22221,7 +22234,7 @@ impl App {
         let page_idx = self.fullscreen_idx?;
         if self.fs_exclusive_view_active(page_idx).is_some()
             || self.analysis_mode
-            || self.fs_zoom_mode_engaged()
+            || self.fs_zoom_mode_effective()
             || self.is_overlay_edit_mode_active()
             || self.view_trim_mode
             || matches!(
@@ -25128,7 +25141,7 @@ impl App {
                     crate::app::CompareViewMode::Wipe { .. }
                 ),
                 overlay_edit_active: self.is_overlay_edit_mode_active(),
-                zoom_active: self.fs_zoom_mode_engaged(),
+                zoom_active: self.fs_zoom_mode_effective(),
             },
         )
     }
@@ -28648,8 +28661,7 @@ impl App {
                                         }
                                     } else if panorama_painted {
                                         navigator_texture_sources.submission = FsDisplayUnitSubmission::LegacyRendered;
-                                    } else if self.fs_zoom_mode_engaged()
-                                        && !self.fs_exclusive_view.is_depth()
+                                    } else if self.fs_zoom_mode_effective()
                                         && !state.is_video
                                         && !analysis_active
                                     {
@@ -29340,7 +29352,7 @@ impl App {
                             && !compare_wipe_active
                             && !panorama_mode_active_now
                             && self.reading_flow.is_paged()
-                            && !self.fs_zoom_mode_engaged()
+                            && !self.fs_zoom_mode_effective()
                         {
                             // ZipPla ズーム中 (照準含む) は表示トリムパネルも抑止する。
                             self.draw_view_trim_panel(ctx, full_rect, fs_idx, spread_pair);
@@ -29373,7 +29385,7 @@ impl App {
                             self.draw_pano_confirmation_banner(ui, ctx, full_rect, fs_idx);
                         } else if !compare_wipe_active
                             && !self.is_overlay_edit_mode_active()
-                            && !self.fs_zoom_mode_engaged()
+                            && !self.fs_zoom_mode_effective()
                         {
                             // ── メタデータパネル（通常ホバー or ClickToShow）──
                             // 消しゴム / 隠蔽加工モード中は自前パネルとの競合 + 編集集中度
@@ -29401,7 +29413,7 @@ impl App {
                                 panorama_active: panorama_mode_active_now,
                                 overlay_edit_active: self.is_overlay_edit_mode_active(),
                                 view_trim_active: self.view_trim_mode,
-                                zoom_active: self.fs_zoom_mode_engaged(),
+                                zoom_active: self.fs_zoom_mode_effective(),
                                 animated: self.fs_entry_is_animated(fs_idx),
                             });
                         let touch_chrome_latched = self.still_touch_chrome_is_latched(ctx);
@@ -30696,7 +30708,7 @@ impl App {
             Some("analysis_mode")
         } else if self.view_trim_mode {
             Some("view_trim_mode")
-        } else if self.fs_zoom_mode_engaged() {
+        } else if self.fs_zoom_mode_effective() {
             Some("zoom_mode")
         } else if !matches!(self.compare_view_mode, crate::app::CompareViewMode::Off) {
             Some("compare_mode")
@@ -32168,7 +32180,7 @@ impl App {
                 .or_insert(required);
         }
         let single_z = self.fullscreen_page_layout.kind() == FullscreenPageLayoutKind::Single
-            && self.fs_zoom_mode_engaged();
+            && self.fs_zoom_mode_effective();
         let original_floor = (self.settings.fullscreen_fit_no_downscale && !single_z)
             || (continuous && self.effective_fullscreen_fit_mode() == FullscreenFitMode::Original);
         // A cover source can occur twice in continuous reading at different
@@ -33615,7 +33627,7 @@ impl App {
         let threshold = self.settings.fullscreen_cursor_hide_delay_secs;
         let next = next_fullscreen_cursor_hide_reason(
             self.cursor_hide_reason,
-            self.fs_zoom_aiming,
+            self.fs_zoom_mode_aiming(),
             cursor_active,
             clean,
             clean && idle >= threshold,
@@ -38219,7 +38231,7 @@ impl App {
         layout: &FlatNavigatorLayout,
         image_rect: egui::Rect,
     ) -> f32 {
-        if !self.fs_zoom_mode_engaged() {
+        if !self.fs_zoom_mode_effective() {
             return self.fs_zoom;
         }
         if let [page] = layout.pages.as_slice() {
@@ -38298,7 +38310,7 @@ impl App {
         layout: &FlatNavigatorLayout,
         image_rect: egui::Rect,
     ) -> bool {
-        if !self.fs_zoom_mode_engaged() {
+        if !self.fs_zoom_mode_effective() {
             return false;
         }
         self.fs_zoom = self.fs_navigator_current_manual_zoom(layout, image_rect);
@@ -38881,7 +38893,7 @@ impl App {
                         ) {
                             interaction.gesture =
                                 FsNavigatorPointerGesture::AwaitingPan { start: pos };
-                        } else if self.fs_zoom_mode_engaged() {
+                        } else if self.fs_zoom_mode_effective() {
                             let current_view_pos = layout.visible_rect.center();
                             if let Some((page, source_pos)) =
                                 layout.nearest_page_at(current_view_pos)
@@ -39912,7 +39924,7 @@ impl App {
                 panorama_active,
                 overlay_edit_active: self.is_overlay_edit_mode_active(),
                 view_trim_active: self.view_trim_mode,
-                zoom_active: self.fs_zoom_mode_engaged(),
+                zoom_active: self.fs_zoom_mode_effective(),
                 animated: panel_fs_idx.is_some_and(|idx| self.fs_entry_is_animated(idx)),
             });
         let passive_side_panel_hover_enabled =
@@ -39985,7 +39997,7 @@ impl App {
                 });
         let cursor_in_panel = cursor_in_depth_panel
             || passive_hover_enabled
-                && !self.fs_zoom_mode_engaged()
+                && !self.fs_zoom_mode_effective()
                 && ctx.input(|i| {
                     i.pointer
                         .hover_pos()
@@ -40089,7 +40101,7 @@ impl App {
             }
             self.persist_pending_view_trim_state();
             self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
-        } else if self.fs_zoom_mode_engaged() {
+        } else if self.fs_zoom_mode_effective() {
             // ZipPla ズーム中 (照準含む) は左端ホバーで補正パネルを開かない (パン操作の邪魔をしない)。
             if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
@@ -40314,7 +40326,7 @@ impl App {
             compare_wipe_active,
             overlay_edit_active: self.is_overlay_edit_mode_active(),
             view_trim_active: self.view_trim_mode,
-            zoom_active: self.fs_zoom_mode_engaged(),
+            zoom_active: self.fs_zoom_mode_effective(),
         });
         // タップ判定を使わない面でも、ピンチだけは受け取る。上の driver 群と同じ値。
         let touch_tap_zones_enabled = touch_tap_zones;
@@ -40783,8 +40795,8 @@ impl App {
                             || self.panorama_projection_popup_open,
                         suppress_egui_wheel,
                         handle_wheel_here,
-                        self.fs_zoom_aiming,
-                        self.fs_zoom_active,
+                        self.fs_zoom_mode_aiming(),
+                        self.fs_zoom_mode_active(),
                         self.is_overlay_edit_mode_active(),
                         continuous_active,
                         self.frame_counter
@@ -40888,8 +40900,8 @@ impl App {
             return !action.input.modifiers.ctrl;
         }
         let ctrl = action.input.modifiers.ctrl;
-        if self.fs_zoom_aiming
-            || (self.fs_zoom_active && ctrl)
+        if self.fs_zoom_mode_aiming()
+            || (self.fs_zoom_mode_active() && ctrl)
             || self.analysis_mode
             || self
                 .fullscreen_idx
@@ -40901,7 +40913,7 @@ impl App {
         {
             return false;
         }
-        if self.fs_zoom_active {
+        if self.fs_zoom_mode_active() {
             return true;
         }
         if should_zoom_fullscreen_wheel(ctrl, self.is_overlay_edit_mode_active()) {
@@ -41078,14 +41090,12 @@ impl App {
                 })
                 .unwrap_or(default_image_rect);
             let mut wheel_navigation = FsPageNav::None;
-            if !self.fs_exclusive_view.is_depth()
-                && (self.fs_zoom_aiming || (self.fs_zoom_active && ctrl_held))
-            {
+            if self.fs_zoom_mode_aiming() || (self.fs_zoom_mode_active() && ctrl_held) {
                 // ZipPla 準拠: 照準中 (Z 押下中) はホイールで枠サイズ=倍率。ズーム確定後は
                 // Ctrl+ホイールのときだけ倍率変更。
                 crate::modifier_probe::record_modified_action(ctx, "FsWheelZoom", "zoom_mode");
                 self.adjust_fs_zoom_factor(wheel_y);
-            } else if self.fs_zoom_active {
+            } else if self.fs_zoom_mode_active() {
                 // ZipPla 準拠: ズーム確定中の修飾なしホイールは通常どおり前後ページ移動。
                 let base = if wheel_y < 0.0 { 1 } else { -1 };
                 wheel_navigation = self.spread_page_nav(base);
@@ -41393,7 +41403,7 @@ impl App {
     ) -> (f32, egui::Vec2) {
         let mut zoom = self.fs_zoom;
         let mut pan = self.fs_pan;
-        let ordinary_zoom = !self.fs_zoom_mode_engaged()
+        let ordinary_zoom = !self.fs_zoom_mode_effective()
             && !self.analysis_mode
             && !self
                 .fullscreen_idx
@@ -50543,7 +50553,7 @@ impl App {
                 [content_left, content_right],
                 fit_mode,
                 fit_scale_limits,
-                self.fs_zoom_mode_engaged(),
+                self.fs_zoom_mode_effective(),
             ));
         let left_allow_thumbnail = display_override.is_none()
             && !settling_with_renditions
@@ -50589,7 +50599,7 @@ impl App {
             // Height matching now depends only on fit mode, so the geometry is final before the
             // ZipPla solve. The old result-dependent geometry feedback loop is structurally gone,
             // and zoom needs to be resolved only once.
-            let zip_input = if self.fs_zoom_mode_engaged() {
+            let zip_input = if self.fs_zoom_mode_effective() {
                 let top_m = TOP_BAR_HOVER_Y.min(image_rect.height() * 0.25);
                 let bottom_m = (seek_geometry.total_height + 8.0).min(image_rect.height() * 0.25);
                 let pan_band = egui::Rect::from_min_max(
@@ -50612,7 +50622,7 @@ impl App {
                     spread_gap,
                     fit_scale,
                     self.fs_zoom_factor,
-                    self.fs_zoom_active,
+                    self.fs_zoom_mode_active(),
                 )
             });
             if let Some(result) = zip_result {
@@ -50629,7 +50639,7 @@ impl App {
             let center = base_center - geometry.content_center_offset * total_scale;
             let resolved_placement = if zip_input.is_some() {
                 ResolvedDisplayPlacement::Z {
-                    active: self.fs_zoom_active,
+                    active: self.fs_zoom_mode_active(),
                     factor: self.fs_zoom_factor,
                     zoom_pan: resolved_zoom_pan,
                     singleton_side: SingletonSpreadPlacement::Center,
@@ -50644,7 +50654,7 @@ impl App {
             // ZipPla ズーム確定中は gap も合成ページと同率 (total_scale / fit_scale = zoom) で拡大し、
             // composite に含めた gap_page と整合させる (Codex P3: 照準枠 ↔ 確定の表示範囲を一致)。
             // 通常表示・照準・手動 Ctrl+ホイールズームでは従来どおり一定の gap を使う。
-            let effective_gap = if self.fs_zoom_active && self.fs_zoom_mode_engaged() {
+            let effective_gap = if self.fs_zoom_mode_active() {
                 spread_gap * (total_scale / fit_scale.max(f32::EPSILON))
             } else {
                 spread_gap

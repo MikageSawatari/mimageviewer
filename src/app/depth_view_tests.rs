@@ -639,6 +639,196 @@ fn depth_actual_z_d_keys_preserve_committed_zoom_through_idle_and_blocked_input(
 
 #[cfg(windows)]
 #[test]
+fn depth_actual_touch_page_navigation_ignores_suspended_committed_z_zoom() {
+    // The immediate renderer is thread-local: drive the real child viewer without
+    // opening a native window or leaving a backend callback on a test-pool thread.
+    std::thread::spawn(|| {
+        let _input_guard = crate::key_input::lock_test_input();
+        let mut destinations = Vec::new();
+        for committed_zoom in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.set_embed_viewports(false);
+            crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
+            let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let child_events = events.clone();
+            let child_passes = std::rc::Rc::new(std::cell::Cell::new(0));
+            let observed = child_passes.clone();
+            let viewport_rect =
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+            egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
+                observed.set(observed.get() + 1);
+                let input_events = std::mem::take(&mut *child_events.borrow_mut());
+                ctx.run_ui(
+                    egui::RawInput {
+                        viewport_id: viewport.ids.this,
+                        screen_rect: Some(viewport_rect),
+                        time: Some(observed.get() as f64 / 60.0),
+                        events: input_events,
+                        viewports: [
+                            (
+                                egui::ViewportId::ROOT,
+                                egui::ViewportInfo {
+                                    focused: Some(false),
+                                    ..Default::default()
+                                },
+                            ),
+                            (
+                                viewport.ids.this,
+                                egui::ViewportInfo {
+                                    parent: Some(egui::ViewportId::ROOT),
+                                    focused: Some(true),
+                                    inner_rect: Some(viewport_rect),
+                                    native_pixels_per_point: Some(1.0),
+                                    ..Default::default()
+                                },
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                        ..Default::default()
+                    },
+                    |ui| (viewport.viewport_ui_cb)(ui),
+                )
+                .drop_without_applying_deltas();
+            });
+            let mut app = setup_app_for_test();
+            install_pages(&mut app, &ctx);
+            app.items[1] = GridItem::Image("depth-touch-next.jpg".into());
+            install_still(&mut app, &ctx, 1, [2, 3]);
+            app.window_visible = false; // No depth worker/model during this input test.
+            app.settings.video_in_window_mode = false;
+            app.settings.detached_viewer_enabled = false;
+            app.settings.touch_still_chrome_learned = true;
+            let model_path = app.tmp.path().join("unused-depth-model.onnx");
+            app.depth_setup
+                .set_status_for_test(crate::addon::AddonStatus::Valid {
+                    model_id: "depth-touch-fixture".to_owned(),
+                    bytes: 1,
+                    model_path,
+                    mmproj_path: None,
+                });
+            app.fs_zoom_factor = 2.75;
+            if committed_zoom {
+                depth_key_frame(&mut app, &ctx, &[(egui::Key::Z, true)]);
+                assert!(app.fs_zoom_aiming);
+                depth_key_frame(&mut app, &ctx, &[(egui::Key::Z, false)]);
+                assert!(app.fs_zoom_active);
+                assert!(!app.fs_zoom_aiming);
+            }
+            depth_key_frame(
+                &mut app,
+                &ctx,
+                &[(egui::Key::D, true), (egui::Key::D, false)],
+            );
+            // Hide the actual Depth panel through its key handler so that the
+            // page-side tap is centered vertically and clear of panel widgets.
+            depth_key_frame(
+                &mut app,
+                &ctx,
+                &[(egui::Key::I, true), (egui::Key::I, false)],
+            );
+            assert!(matches!(
+                &app.fs_exclusive_view,
+                FsExclusiveView::Depth(state) if !state.panel_visible
+            ));
+            let render_frame = |app: &mut App| {
+                app.frame_counter += 1;
+                ctx.run_pass(
+                    egui::RawInput {
+                        screen_rect: Some(viewport_rect),
+                        ..Default::default()
+                    },
+                    |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
+                )
+                .drop_without_applying_deltas();
+            };
+            render_frame(&mut app);
+            assert_eq!(app.fullscreen_idx, Some(0));
+            for phase in [egui::TouchPhase::Start, egui::TouchPhase::End] {
+                assert_eq!(
+                    app.fs_zoom_owner(),
+                    crate::ui_fullscreen::FsZoomOwner::Depth
+                );
+                assert_eq!(
+                    app.fs_exclusive_view_active(0),
+                    Some(ExclusiveViewKind::Depth)
+                );
+                let pos = egui::pos2(900.0, 400.0);
+                // Match egui-winit's ordered synthetic-pointer signature. Raw
+                // Touch alone leaves correlation pending and cannot authorize a tap.
+                events.borrow_mut().push(egui::Event::Touch {
+                    device_id: egui::TouchDeviceId(88_072),
+                    id: egui::TouchId(1),
+                    phase,
+                    pos,
+                    force: None,
+                });
+                if phase == egui::TouchPhase::Start {
+                    events.borrow_mut().push(egui::Event::PointerMoved(pos));
+                }
+                events.borrow_mut().push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: phase == egui::TouchPhase::Start,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                if phase == egui::TouchPhase::End {
+                    events.borrow_mut().push(egui::Event::PointerGone);
+                }
+                render_frame(&mut app);
+                assert!(
+                    events.borrow().is_empty(),
+                    "child viewport must receive the touch batch"
+                );
+                assert_eq!(app.fs_zoom_active, committed_zoom);
+                assert_eq!(app.fs_zoom_factor, 2.75);
+            }
+            assert!(
+                child_passes.get() >= 3,
+                "the actual child viewer UI must run"
+            );
+            assert_eq!(
+                app.fullscreen_idx,
+                Some(1),
+                "raw touch must reach PageSide navigation with committed_zoom={committed_zoom}"
+            );
+            assert!(app.fs_exclusive_view.is_depth());
+            assert_eq!(
+                app.fs_zoom_owner(),
+                crate::ui_fullscreen::FsZoomOwner::Depth
+            );
+            destinations.push(app.items[app.fullscreen_idx.unwrap()].clone());
+            depth_key_frame(
+                &mut app,
+                &ctx,
+                &[(egui::Key::D, true), (egui::Key::D, false)],
+            );
+            assert!(matches!(app.fs_exclusive_view, FsExclusiveView::None));
+            assert_eq!(app.fs_zoom_active, committed_zoom);
+            assert!(!app.fs_zoom_aiming);
+            assert_eq!(app.fs_zoom_factor, 2.75);
+            assert_eq!(
+                app.fs_zoom_owner(),
+                if committed_zoom {
+                    crate::ui_fullscreen::FsZoomOwner::ZoomMode
+                } else {
+                    crate::ui_fullscreen::FsZoomOwner::Image
+                }
+            );
+            crate::key_input::clear_test_frame();
+        }
+        assert_eq!(
+            destinations[0],
+            GridItem::Image("depth-touch-next.jpg".into())
+        );
+        assert_eq!(destinations[1], destinations[0]);
+    })
+    .join()
+    .unwrap();
+}
+
+#[cfg(windows)]
+#[test]
 fn depth_actual_viewer_pass_retires_video_spread_continuous_and_late_animation() {
     // egui's immediate renderer is thread-local. Keep this test's backend callback
     // on its own thread and execute real viewer UI passes without creating a window.

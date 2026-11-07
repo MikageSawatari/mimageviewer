@@ -977,6 +977,94 @@ detached §11 に BA-7 の退役順序と BA-4 の既存 identity / commit 境�
   帰還後の非復活、360表示の従来のZ解除とfork移譲を対象とする。起動方法と実profileの注意は上記を使う。
   HEAD `dee2fd1ec` を維持し、stage / commit は行わない。
 
+#### 段 B 再レビュー P1: 休止 Z の消費側 (2026-11-07、基点 `551040002`)
+
+Z確定 → D では2Dの保存状態を残すが、その値をタッチ認識へ直接渡すと Depth の通常ページ送りまで停止する。
+保存と実効の区別を全 consumer の境界で揃える。`fs_zoom_mode_engaged()` は保存 active / aiming の述語として残し、
+`fs_zoom_mode_effective()` は `fs_zoom_owner() == FsZoomOwner::ZoomMode` を返す。
+active / aiming の runtime consumer もそれぞれ owner を通す helper を使う。
+owner の優先順（Depth → 保存 Z → Panorama → Analysis → Image）は変更しない。
+新しい状態・bool・復元用snapshotは追加せず、Depth の入口で保存ズームを捨てる対処もしない。
+通常2Dと360では旧 raw 判定と実効判定が一致する既存の順序を維持する。
+
+以下は **基点 `551040002` の行番号**。`src/` の全 `fs_zoom_active` / `fs_zoom_mode_engaged()` と
+照準の兄弟 consumer を検索し、テスト・コメント・宣言・書込みを分けて全てを分類した。
+
+| 基点の消費箇所 | 分類・対応 |
+| --- | --- |
+| `ui_fullscreen.rs:14704-14705` 保存述語 | raw維持。保存 state 自体を表す |
+| 同 `14760` toggle action | raw維持。admission を通った後の既存 Z state の切替であり、Depth は到達しない |
+| 同 `14862,14872,14882` key state machine | raw維持。admission後の確定／照準・held repaint。対象外の transient reset と level latch は既存どおり |
+| 同 `15186` owner解決 | raw維持。Depth を先に選び、Zの保存値から実効 owner を一度だけ決める。helper と循環しない |
+| `app.rs:18247-18249,21656-21657` field/default | 保存値の宣言・初期化。変更なし |
+| `viewer_context_registry.rs:1787,3047,3477,3810,4199,4429` field/default/extract/swap/move | context所有の保存・搬送。active/aiming を保持し、描画や入力の可否を決めないので変更なし |
+| `ui_fullscreen.rs:14967` 単ページZ描画 | 実効 active。保存中の Depth からZ描画を導かない |
+| 同 `15159` pan clamp | 実効 owner。Z中は通常pan clampを適用しない既存の分岐 |
+| 同 `15648,15670` gamepad zoom/pan | 実効 owner。占有モード拒否は既存どおり、その後のZ判定も統一 |
+| 同 `22224` similar preview | 実効 owner。既存の占有モード拒否は維持 |
+| 同 `25131` info panel lock適格性 | 実効 owner。表示幅の確保と実描画に同じ値を渡す |
+| 同 `28651` 単ページのZ描画分岐 | 実効 owner。重複するDepth専用guardは除く |
+| 同 `29343` view trim panel | 実効 owner。保存Zをパネル抑止へ使わない。Depth固有の適格性は既存 owner が守る |
+| 同 `29376` metadata panel | 実効 owner。パネルの既存占有規則は維持 |
+| 同 `29404` callout/touch handles | 実効 owner。共通 chrome 入力へ渡す |
+| 同 `30699` page-turn context blocker | 実効 owner。Depth は保存Zでなく既存の占有モード判定で除外 |
+| 同 `32171` PDF display demand | 実効 owner。休止Zを単ページZの解像度需要と誤認しない |
+| 同 `33618` cursor visibility | 実効 aiming。休止した照準状態で ZoomAiming のcursor非表示を作らない |
+| 同 `38222` navigator current zoom | 実効 owner。Zの倍率から通常倍率へ換算するかの判定 |
+| 同 `38301` navigator adopt zoom | 実効 owner。実際のZ操作だけが保存値を通常panへ採用しresetする |
+| 同 `38884` navigator gesture | 実効 owner。Depthのnavigator入場拒否は維持 |
+| 同 `39915` side panel chrome | 実効 owner。表示・hit判定の共通入力 |
+| 同 `39988` panel hit領域 | 実効 owner。保存Zでpanel上のpointer判定を変えない |
+| 同 `40092` adjustment hover | 実効 owner。Depth等の別の抑止条件は維持 |
+| 同 `40317` touch recognition | 実効 owner。本件の修正境界。tap/pinch driver を保存Zで停止しない |
+| 同 `40786-40787` wheel診断 | 実効 active/aiming。実際のwheel処理で使う値を記録する |
+| 同 `40891-40904` wheel分類 | 実効 active/aiming。Depthの通常wheel=ページ移動、Ctrl+wheel拒否は維持 |
+| 同 `41082,41088` wheel適用 | 実効 active/aiming。重複するDepth専用guardを除き、保存倍率を動かさない |
+| 同 `41396` wheel後のclick用transform | 実効 owner。通常描画のズーム投影だけを計算する |
+| 同 `50546` spread clip | 実効 owner。Zの表示クリップかの判定 |
+| 同 `50592` spread Z入口 | 実効 owner。保存Zから専用solveを開始しない |
+| 同 `50615,50632,50647` spread solve/placement/gap | 実効 active。確定状態を描画へ反映するかの判定 |
+| `app.rs:52810` adjustment panel reachability | 実効 owner。描画側との適格性を揃える |
+| `ui_fullscreen/page_turn.rs:1817` animation適格性 | 実効 owner。Depth自体の紙めくり除外は既存の占有判定で維持 |
+| raw flag の reset/代入 | state machine/lifecycleの書込みでありruntime consumerではない。変更なし |
+| `cfg(test)` の直接設定・assert | fixtureと保存値の検査。runtime 判定へ置換しない |
+
+**派生する入力・表示の確認**: マウス canvas click は既存の占有 owner 判定で Depth の無操作を選び、
+Z保存値を直接読まない。タップ領域は Depth の通常ページ送りを許可し、360/Analysis を除く既存規則のまま。
+初回タッチヘルプの開始／終了と上部バーのtouch target登録は `40317` の認識可否から派生するため、同じ実効値で揃う。
+上部バーの表示自体には保存Zの直接consumerは無い。navigatorのDepth入場拒否とパネル固有の占有規則も変更しない。
+
+回帰は実 Z press/release → D → Iでパネルを隠す → child viewer の egui-winit と同じ完全な
+Touch/Pointer signature（Start・移動・primary press、End・primary release・PointerGone）→ 実 PageSide 移動 → D を通す。
+Z未使用のDepthと移動先が一致し、移動中は実効ownerがDepth、解除後は保存active/factorを持つZoomModeへ戻ることを検査する。
+別の owner matrix / cursor 回帰で、保存値と実効値の違い、および2D/360の既存優先順を固定する。
+全件gateは実行せず、ClaudeCodeが使用中の `target/test-lib-full/` は参照・変更しない。
+変更は7ファイル: `src/ui_fullscreen.rs`, `src/app.rs`, `src/ui_fullscreen/page_turn.rs`,
+`src/app/depth_view_tests.rs`, `src/ui_fullscreen/depth_tests.rs`, `docs/depth-parallax-plan.md`,
+`docs/display-pipeline.md`。状態field・keymap・通常2D/360の仕様は変更しない。
+
+検証記録（全cargo/build/testに `MSBUILDDISABLENODEREUSE=1`）:
+
+- 新規回帰2件を含む限定670/670成功、45.305秒、exit0 (`target/depth-b-touch-related.log`)。
+  選択は `depth|panorama|pano|fs_zoom|touch|keymap|fs_cursor`。先の狭い選択で通ったmatrixは重複加算しない。
+  初回はfixtureの借用順を修正し、次の狭い選択はmatrix成功・touch baseline失敗だった。
+  touch fixtureの不完全なイベント列を、既存correlationが受理する完全signatureへ直し、
+  時刻・App frame番号も進めた後に上記の全選択が成功した。製品の相関処理を緩めていない。
+- `cargo check --offline -p mimageviewer --bin mimageviewer-core` 成功、45.59秒
+  (`target/depth-b-touch-check.log`)。追加のsource変更はその後もtest fixtureだけである。
+- workspace全体へ引数なしの `cargo fmt` を実行し、最終 `cargo fmt --check` 成功
+  (`target/depth-b-touch-fmt.log`)。UI glyph checkerは危険な文字0 (`target/depth-b-touch-glyphs.log`)。
+- 独立完成レビュー（GPT-6.1 Sol / xhigh）は最終fixture・670件の実行ログ・本分類表まで照合して
+  ACCEPT、P1/P2残件なし。
+- `scripts/build-dev.ps1 -PreserveRuntime` は exit0。normal feature set の core は2分08秒、
+  付属4バイナリも成功。VCRT PE検査は runtime4 / PE5 成功 (`target/depth-b-touch-build-dev.log`)。
+  確認用binaryは起動していない。実機では Z確定 → D → タッチのページ送り → D の拡大表示復帰と、
+  通常2D / 360の従来操作を利用者に確認してもらう。起動方法・実profileの注意は上記を使う。
+  HEAD `551040002` を維持し、stage/commit・製品起動はしていない。
+- 作業制約の逸脱: reviewerがログ名探索で `rg --files target -g 'depth-b-touch*' -g '!test-lib-full/**'`
+  を一度実行した。禁止領域のディレクトリ走査を完全には除外できないため「一切アクセスなし」とは扱わない。
+  `target/test-lib-full/` のファイル内容は未読・未変更。利用者へ報告し、以後は指定済みログの直接参照だけに限定した。
+
 ## 11. テスト
 
 - **状態遷移**: OFF → ON → (ページ移動) → ON、× / D で OFF、フルスクリーン終了・フォルダ移動で取り消し。

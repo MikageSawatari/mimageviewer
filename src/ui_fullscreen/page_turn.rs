@@ -1814,7 +1814,7 @@ impl App {
             && !self.is_overlay_edit_mode_active()
             && !self.analysis_mode
             && !self.adjustment_mode.is_open()
-            && !self.fs_zoom_mode_engaged()
+            && !self.fs_zoom_mode_effective()
             && self.fs_zoom_pan().is_none()
             && self.fs_free_rotation.abs() <= TRANSFORM_EPSILON
             && self.sns_split.is_none()
