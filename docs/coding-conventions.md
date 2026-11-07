@@ -344,6 +344,10 @@ cancel) は [docs/ui-responsiveness.md §2](ui-responsiveness.md) に実装テ�
 - `ctx.load_texture`
 - `rusqlite` / `search_index_db` / catalog DB の open・全件 load・search
 
+`xmp_reader` の path 版は magic に応じて JPEG/PNG/WebP の見出しと XMP payload だけを読み、
+他の segment/chunk は seek で飛ばす。fallback は先頭最大 512KB、JPEG/PNG/WebP では探索中に
+到達した最初の画像データの手前まで。部分読みでも I/O は worker で実行する。
+
 UI 同期なら、worker 化・キャンセル・結果適用時の世代/idx 整合・1 フレーム予算・perf 計装が
 揃っていることを確認する。特に `decide_partial` のような lazy 化でも、cheap miss や
 除外トークンだけの検索など「追加情報が必要になる最悪ケース」で UI を止めないかを見る。

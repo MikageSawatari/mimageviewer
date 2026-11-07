@@ -4935,7 +4935,7 @@ pub(crate) struct PreparedScannedFolderListing {
     prepared_folder_rating: Option<(HashMap<usize, u8>, u64, f64)>,
     video_thumb_overrides: Vec<(PathBuf, PathBuf)>,
     audio_inventory: Option<HashSet<String>>,
-    omitted: folder_scan::OmittedFolderEntryCounts,
+    omitted: folder_scan::OmittedFolderEntries,
     rating_order_failed: bool,
     auto_open_image_folder: bool,
     restore_intent: StartupListIntent,
@@ -5385,6 +5385,7 @@ pub(crate) enum ExternalRescanResult {
         Arc<folder_scan::FolderRowRecord>,
         book_append_refresh::FolderRefreshCause,
         std::time::SystemTime,
+        folder_scan::OmittedFolderEntries,
     ),
     Different(
         folder_scan::ScannedDir,
@@ -7542,9 +7543,9 @@ pub(crate) struct FolderNavResult {
 /// 非同期メタデータ読み込み (フルスクリーン表示対象画像の AI/EXIF/XMP) の状態。
 ///
 /// `open_fullscreen` から起動され、`poll_metadata_load` で結果を受信する。
-/// **背景**: XMP リーダーは JPEG/PNG 全体を読むため (`read_tweet_info`)、
-/// 20MP 級の写真で UI スレッドが 100ms 級でブロックしていた
-/// (AI metadata と EXIF は数 ms だが、XMP が主犯)。
+/// **背景**: 旧 XMP リーダーの JPEG/PNG 全体読みで、20MP 級の写真では
+/// UI スレッドが 100ms 級でブロックしていた。現在は部分読みだが、
+/// AI/EXIF/XMP の I/O は引き続き worker で実行する。
 /// 新 fullscreen idx が開かれたら旧 pending を cancel する (連打時は最新のみ処理)。
 pub(crate) struct MetadataLoadPending {
     key: String,
@@ -16304,7 +16305,7 @@ pub(crate) enum MetadataTransferTagDbReleaseState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NormalFolderOmittedEntries {
     pub(crate) folder: PathBuf,
-    pub(crate) counts: folder_scan::OmittedFolderEntryCounts,
+    pub(crate) omitted: folder_scan::OmittedFolderEntries,
 }
 
 /// 静止画・音楽フルスクリーンの「その他の機能」パネルが所有する排他的な表示状態。
@@ -16391,6 +16392,7 @@ pub struct App {
     /// A fullscreen page from a composite grid can own an EPUB independently of current_folder.
     pub(crate) fullscreen_epub_source: Option<crate::pdf_loader::LeasedEpubPath>,
     pub(crate) normal_folder_omitted_entries: Option<NormalFolderOmittedEntries>,
+    pub(crate) omitted_entries_dialog_folder: Option<PathBuf>,
     pub(crate) navigation_scope: ViewerNavigationScope,
     pub(crate) items: Vec<GridItem>,
     pub(crate) projection_recipe: book_materialization::ProjectionRecipe,
@@ -17596,8 +17598,8 @@ pub struct App {
     pub(crate) tag_view_pending: Option<crate::tag_view::TagViewPending>,
     /// フルスクリーン画像の AI/EXIF/XMP メタデータを非同期読み込み中。
     /// `open_fullscreen` で spawn、`poll_metadata_load` で受信してキャッシュに投入。
-    /// 20MP JPEG の XMP 読み (`read_tweet_info` が full-file 読む) で UI が
-    /// 100ms 級にブロックしていた問題を解消する。
+    /// 旧 JPEG 全体読みで UI が 100ms 級にブロックしていた問題を解消する。
+    /// 現在の XMP 部分読みも worker で実行する。
     pub(crate) metadata_pending: Option<MetadataLoadPending>,
     /// XMP rating hydration のバックグラウンドプリフェッチ。
     /// タグ正本は `tags.db` なので、ここでは XMP `dc:subject` を読まない。
@@ -19186,6 +19188,8 @@ pub struct App {
     pub(crate) depth_export_operation: Option<Box<depth_export::Operation>>,
     #[cfg(windows)]
     pub(crate) caption_job: Option<crate::ui_dialogs::caption_job::CaptionJob>,
+    #[cfg(windows)]
+    pub(crate) caption_delete: Option<crate::ui_dialogs::caption_delete::CaptionDeleteState>,
     /// Progress-window visibility is independent of the caption worker lifetime.
     #[cfg(windows)]
     pub(crate) show_caption_progress: bool,
@@ -20958,6 +20962,7 @@ impl App {
             fullscreen_epub_source: None,
             #[cfg(windows)]
             normal_folder_omitted_entries: None,
+            omitted_entries_dialog_folder: None,
             navigation_scope: ViewerNavigationScope::Main,
             items: Vec::new(),
             projection_recipe: Default::default(),
@@ -21985,6 +21990,8 @@ impl App {
             depth_export_operation: None,
             #[cfg(windows)]
             caption_job: None,
+            #[cfg(windows)]
+            caption_delete: None,
             #[cfg(windows)]
             show_caption_progress: false,
             fs_boundary_hint: None,
@@ -24072,10 +24079,25 @@ impl App {
         &self,
         include_menus: bool,
     ) -> Option<&'static str> {
+        self.modal_dialog_block_reason_without_omitted_entries(include_menus)
+            .or_else(|| {
+                self.omitted_entries_dialog_visible()
+                    .then_some("omitted_entries")
+            })
+    }
+
+    fn modal_dialog_block_reason_without_omitted_entries(
+        &self,
+        include_menus: bool,
+    ) -> Option<&'static str> {
         macro_rules! first {
             ($( $cond:expr => $name:literal ),+ $(,)?) => {
                 $( if $cond { return Some($name); } )+
             };
+        }
+        #[cfg(windows)]
+        if self.caption_delete_dialog_visible() {
+            return Some("caption_delete");
         }
         first![
             self.book_order_saving() => "book_order",
@@ -27887,6 +27909,7 @@ impl App {
                             materialized.row_record.clone(),
                             cause,
                             parent_mtime,
+                            materialized.omitted,
                         )
                     } else {
                         scan.reconcile = Some(folder_scan::FolderScanReconcile {
@@ -28064,7 +28087,7 @@ impl App {
         let _ = scan_options;
         let result = scan.expect("checked above");
         let mut cause = match &result {
-            ExternalRescanResult::Equal(_, _, cause, _)
+            ExternalRescanResult::Equal(_, _, cause, _, _)
             | ExternalRescanResult::Different(_, _, cause) => cause.clone(),
         };
         if matches!(
@@ -28109,7 +28132,8 @@ impl App {
         }
         let main_context_id = self.viewer_context_main();
         let accepted_now = match result {
-            ExternalRescanResult::Equal(signature, rows, _, parent_mtime) => {
+            ExternalRescanResult::Equal(signature, rows, _, parent_mtime, omitted) => {
+                self.adopt_normal_folder_omitted_entries(&folder, omitted);
                 self.current_folder_signature = Some(signature);
                 self.current_folder_last_mtime = Some(parent_mtime);
                 let previous = self.folder_observation.replace(FolderObservation {
@@ -32096,20 +32120,20 @@ impl App {
         // `materialize_local_folder_listing` が唯一の集計者。ここで数え直すと
         // remote 一覧と本体一覧で違う数が出る。
         let omitted_entries = materialized.omitted;
-        if omitted_entries != folder_scan::OmittedFolderEntryCounts::default() {
+        if omitted_entries.counts != folder_scan::OmittedFolderEntryCounts::default() {
             // チップが出ない / 数が合わないという報告を、推測でなくログで切り分けるための 1 行。
             // 走査済みの値を書くだけで追加の I/O は無い。
             crate::logger::log(format!(
                 "omitted entries: same_name={} hidden={} ignored_archive={} ignored_epub={} unsupported={} \
                  system={} chip={} \
                  published={} surface={:?}",
-                omitted_entries.same_name,
-                omitted_entries.hidden,
-                omitted_entries.ignored_archive,
-                omitted_entries.ignored_epub,
-                omitted_entries.unsupported,
-                omitted_entries.system,
-                omitted_entries.primary_count(),
+                omitted_entries.counts.same_name,
+                omitted_entries.counts.hidden,
+                omitted_entries.counts.ignored_archive,
+                omitted_entries.counts.ignored_epub,
+                omitted_entries.counts.unsupported,
+                omitted_entries.counts.system,
+                omitted_entries.counts.primary_count(),
                 !detached_physical,
                 self.top_level_grid_view.surface(),
             ));
@@ -32334,17 +32358,6 @@ impl App {
             self.video_thumb_overrides
                 .insert(crate::path_key::normalize_keep_drive(&video), image);
         }
-        if !detached_physical
-            && matches!(
-                self.top_level_grid_view.surface(),
-                top_level_grid_view::TopLevelGridSurface::Folder
-            )
-        {
-            self.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
-                folder: path.clone(),
-                counts: omitted,
-            });
-        }
         self.stack_active_rule = None;
         self.stack_script_error = None;
         let items_len = items.len();
@@ -32362,7 +32375,11 @@ impl App {
             prepared_folder_rating,
             authority,
             prepared_visible,
+            None,
         );
+        // The shared write predicate can now validate the adopted folder itself,
+        // before hydration starts any content-identity detection.
+        self.adopt_normal_folder_omitted_entries(&audio_inventory_parent, omitted);
         self.folder_observation = self
             .current_folder
             .as_ref()
@@ -35661,6 +35678,7 @@ impl App {
             None,
             VisibleInstallAuthority::Ordinary,
             token,
+            None,
         );
         self.items_are_reading_history_view = true;
         self.top_level_grid_view.replace_surface(
@@ -37988,6 +38006,7 @@ impl App {
                     None,
                     authority,
                     token,
+                    None,
                 );
                 if let Some((continuation, _)) = hydration.as_mut() {
                     continuation.restore_intent = restore_intent.clone();
@@ -39960,6 +39979,7 @@ impl App {
             None,
             authority,
             prepared_visible,
+            Some(nav),
         );
         let archive_key = crate::path_key::normalize_keep_drive(&zip_path);
         if let Some(trace) = self.archive_auto_fs_paint_trace.as_mut()
@@ -39982,8 +40002,8 @@ impl App {
                 ],
             );
         }
-        // start_loading_items が zip_nav を None にした後で、新しいツリーナビを設定する。
-        self.zip_nav = Some(nav);
+        // The prepared nav was installed and its rating scope checked before the
+        // single visibility build in install_loading_items_inner.
         self.adopt_archive_recipe();
         // アドレス欄をパンくず表示に更新 (単一ラッパー ZIP は collapse 済み実効 prefix を反映)。
         self.update_zip_nav_address();
@@ -41126,6 +41146,7 @@ impl App {
                 None,
                 VisibleInstallAuthority::Ordinary,
                 token,
+                None,
             );
             if let Some((continuation, _)) = hydration.as_mut() {
                 continuation.restore_intent = intent;
@@ -42897,6 +42918,7 @@ impl App {
             None,
             VisibleInstallAuthority::Projection { recipe },
             prepared_visible,
+            None,
         );
         if let Some((continuation, _)) = hydration.as_mut() {
             continuation.restore_intent = hydration_intent;
@@ -42987,6 +43009,7 @@ impl App {
                 stars: self.rating_view_stars,
             },
             prepared_visible,
+            None,
         )
     }
 
@@ -43185,6 +43208,7 @@ impl App {
             prepared_folder_rating,
             authority,
             prepared_visible,
+            None,
         );
         self.hydrate_installed_main_list(hydration);
     }
@@ -43212,8 +43236,15 @@ impl App {
         prepared_folder_rating: Option<(std::collections::HashMap<usize, u8>, u64, f64)>,
         authority: VisibleInstallAuthority<'_>,
         prepared_visible: PreparedVisibleInstall,
+        prepared_zip_nav: Option<crate::zip_tree::ZipNavState>,
     ) -> MainListHydration {
         let detached_physical = self.navigation_scope.is_detached_physical();
+        // Capture the departing logical position before cleanup can replace its
+        // top-level surface. Synthetic results may retain the last book's path.
+        let previous_effective_folder = self
+            .rating_filter_departure_is_physical()
+            .then(|| self.effective_folder())
+            .flatten();
         // Save source owners before transferring roots or adopting destination presentation.
         self.save_leaving_folder_grid_position();
         let smart_open_path = match &authority {
@@ -43512,7 +43543,7 @@ impl App {
             .then_some(folder_signature)
             .flatten();
         if preserve_archive_source_override {
-            if let Some(src) = previous_archive_source_override {
+            if let Some(src) = previous_archive_source_override.clone() {
                 self.address = src.to_string_lossy().to_string();
                 self.archive_source_override = Some(src);
             }
@@ -43534,7 +43565,10 @@ impl App {
         // would incorrectly keep that book's suppression on its parent or sibling.
         // Keep this before item installation so visibility uses the resolved filter.
         if !detached_physical {
-            self.maybe_restore_rating_filter_if_out_of_scope();
+            self.maybe_restore_rating_filter_if_out_of_scope(
+                previous_effective_folder.as_deref(),
+                prepared_zip_nav.as_ref(),
+            );
         }
         // Ctrl+G 絞り込みビュー中はブレッドクラム形式を維持する
         // (2026-04 ユーザー報告: PDF 開くと raw パスに戻ってしまうバグ)。
@@ -43765,6 +43799,14 @@ impl App {
             self.cancel_search_pending();
         }
         let rebuild_t0 = std::time::Instant::now();
+        // Move the prepared ZIP owner only after the logical source/backing and
+        // rows are settled. Refresh may have fallen back to an ancestor prefix.
+        // This is the same scope check as lightweight ZIP level adoption, before
+        // the existing single visibility build (including detached physical).
+        if let Some(nav) = prepared_zip_nav {
+            self.zip_nav = Some(nav);
+            self.maybe_restore_rating_filter_after_zip_level_change();
+        }
         self.rebuild_visible_indices();
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -53120,6 +53162,7 @@ impl App {
             None,
             VisibleInstallAuthority::Ordinary,
             token,
+            None,
         );
         self.items_are_bookmark_view = true;
         self.top_level_grid_view
@@ -53284,6 +53327,7 @@ impl App {
             None,
             VisibleInstallAuthority::Ordinary,
             token,
+            None,
         );
         self.hydrate_installed_main_list(hydration);
         self.items_are_bookmark_view = true;
@@ -71666,8 +71710,8 @@ impl App {
         }
 
         // AI / EXIF / XMP メタデータ読み込みは **バックグラウンドスレッド** で実行する。
-        // XMP は JPEG/PNG 全体を読むため UI スレッドで同期実行すると 20MP 画像で
-        // 100ms 級にブロックする。メタデータパネルは値到着まで空表示。
+        // XMP は見出しと payload の部分読みだが、I/O は worker に置く。
+        // メタデータパネルは値到着まで空表示。
         let start_metadata_load_perf_t0 = start_fs_open_perf_span(&perf);
         self.start_metadata_load(idx);
         finish_fs_open_perf_span(
@@ -73521,6 +73565,14 @@ impl App {
     pub(crate) fn current_normal_folder_omitted_counts(
         &self,
     ) -> Option<folder_scan::OmittedFolderEntryCounts> {
+        self.current_normal_folder_omitted_entries()
+            .map(|owner| owner.omitted.counts)
+    }
+
+    /// Both UI consumers share this exact ownership/surface predicate.
+    pub(crate) fn current_normal_folder_omitted_entries(
+        &self,
+    ) -> Option<&NormalFolderOmittedEntries> {
         if self.navigation_scope.is_detached_physical()
             || self.search_filter.is_some()
             || self.search_pending.is_some()
@@ -73538,7 +73590,72 @@ impl App {
         self.normal_folder_omitted_entries
             .as_ref()
             .filter(|entries| crate::folder_tree::path_eq(&entries.folder, current))
-            .map(|entries| entries.counts)
+    }
+
+    pub(crate) fn open_omitted_entries_dialog(&mut self) {
+        self.omitted_entries_dialog_folder = self
+            .current_normal_folder_omitted_entries()
+            .map(|owner| owner.folder.clone());
+        self.close_omitted_entries_dialog_if_interrupted();
+        self.sort_visible_omitted_entries();
+    }
+
+    /// Both ordinary adoption and Equal rescans publish only the main folder's owner.
+    fn adopt_normal_folder_omitted_entries(
+        &mut self,
+        folder: &Path,
+        omitted: folder_scan::OmittedFolderEntries,
+    ) {
+        if self.edit_request_owner_context() != self.viewer_context_main()
+            || self.navigation_scope.is_detached_physical()
+            || !matches!(
+                self.top_level_grid_view.surface(),
+                top_level_grid_view::TopLevelGridSurface::Folder
+            )
+            || !self
+                .current_folder
+                .as_deref()
+                .is_some_and(|current| crate::folder_tree::path_eq(current, folder))
+        {
+            return;
+        }
+        self.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
+            folder: folder.to_path_buf(),
+            omitted,
+        });
+        self.sort_visible_omitted_entries();
+    }
+
+    fn sort_visible_omitted_entries(&mut self) {
+        if self.omitted_entries_dialog_visible() {
+            self.normal_folder_omitted_entries
+                .as_mut()
+                .unwrap()
+                .omitted
+                .sort_for_display();
+        }
+    }
+
+    pub(crate) fn close_omitted_entries_dialog_if_interrupted(&mut self) {
+        if self.omitted_entries_dialog_folder.is_some()
+            && self
+                .modal_dialog_block_reason_without_omitted_entries(true)
+                .is_some()
+        {
+            self.omitted_entries_dialog_folder = None;
+        }
+    }
+
+    pub(crate) fn omitted_entries_dialog_visible(&self) -> bool {
+        self.omitted_entries_dialog_folder
+            .as_deref()
+            .is_some_and(|folder| {
+                self.current_normal_folder_omitted_entries()
+                    .is_some_and(|owner| crate::folder_tree::path_eq(folder, &owner.folder))
+                    && self
+                        .modal_dialog_block_reason_without_omitted_entries(true)
+                        .is_none()
+            })
     }
 
     /// ZIP/PDF + フォルダの重複: 同名フォルダがあれば ZIP/PDF エントリをスキップ。
@@ -76844,24 +76961,43 @@ impl App {
         self.show_feedback_toast("★フィルタ一時解除中 (本から戻ると復元)".to_string());
     }
 
-    /// `load_folder` の最後に呼ぶ: suppression の自動再評価。
+    /// `install_loading_items_inner` の論理位置確定後・可視列生成前に1回呼ぶ。
+    /// `previous` は採用前 surface が物理位置を所有する場合だけ、その effective_folder。
     ///
-    /// 1. 既に suppress 中 + anchor の subtree 内 → 維持 (= 子孫探索中は継続)
-    /// 2. 既に suppress 中 + anchor の subtree 外 → 一旦 restore
-    /// 3. fall through (= suppress なし) で現在 folder の★を見て suppress 発動可否を判定
+    /// synthetic の出発地点は物理的な親子関係を表さないため、出発地点なしとして扱う。
+    /// 同じ場所の再採用では新規発動しない。ZIP の内部 anchor だけは、引数の準備済み
+    /// nav を設置した後の範囲判定へ委ねる。フォルダ/PDF などでは範囲外なら復元する。
+    /// 祖先への帰還も範囲外なら復元し、新規発動しない。その他の移動・出発地点なしは
+    /// 現在 folder の★で発動可否を判定する。既存 anchor 配下の移動では解除を維持する。
     ///
     /// これにより Ctrl+↑↓ / Ctrl+PageUp/Down で別の★付き folder に移動した際にも
     /// 自動的に ★一時解除 が発動する。
     ///
-    /// 関数名は互換性のため維持 (= 呼び出し元: load_folder_with_scan 末尾)。
+    /// 入力経路や追加状態によらず、物理的な位置関係と準備済み ZIP nav で判定する（§1.721）。
     ///
     /// Codex P1-2 fix 後: settings.rating_filter は書き換えないので、active 判定は
     /// 直接 rating_filter_active() を見れば良い (= 旧版の自己破壊ループ回避が不要に)。
-    pub(crate) fn maybe_restore_rating_filter_if_out_of_scope(&mut self) {
+    pub(crate) fn maybe_restore_rating_filter_if_out_of_scope(
+        &mut self,
+        previous: Option<&Path>,
+        prepared_zip_nav: Option<&crate::zip_tree::ZipNavState>,
+    ) {
         let Some(current) = self.effective_folder() else {
             // 現在フォルダが取れない状態 (起動直後など) は触らない
             return;
         };
+        let previous = previous.filter(|path| !is_synthetic_view_path(path));
+        // Only an actual prepared ZIP nav guarantees the later internal-scope
+        // check. A folder named *.zip or a PDF must not retain a stale child anchor.
+        if prepared_zip_nav.is_some()
+            && previous.is_some_and(|path| crate::folder_tree::path_eq(path, &current))
+            && self
+                .rating_filter_suppressed_at
+                .as_ref()
+                .is_some_and(|(anchor, _)| path_in_subtree_ci(anchor, &current))
+        {
+            return;
+        }
         // 既に suppress 中: anchor の subtree 内なら維持、外なら一旦 restore
         if let Some((anchor, _)) = self.rating_filter_suppressed_at.as_ref() {
             let anchor_owned = anchor.clone(); // immutable borrow を切る
@@ -76870,6 +77006,11 @@ impl App {
             }
             // subtree 外 → restore してから再評価
             self.restore_rating_filter_suppression();
+        }
+        // 帰還・再読込では一覧で明示したフィルタを維持する。既存 anchor の
+        // scope 判定を先に行い、元から一時解除中だった親への帰還は維持する。
+        if previous.is_some_and(|previous| path_in_subtree_ci(previous, &current)) {
+            return;
         }
         // suppress なし状態で再評価: rating_filter_active なら現在 folder の★で発動可否判定
         if !self.rating_filter_active() {
@@ -76926,12 +77067,19 @@ impl App {
         let Some((anchor, _)) = self.rating_filter_suppressed_at.as_ref() else {
             return;
         };
-        let anchor_key = crate::adjustment_db::normalize_path(anchor);
-        let Some((cur_key, _)) = self.current_container_rating_key_and_source() else {
+        let Some(nav) = self.zip_nav.as_ref() else {
             return;
         };
-        let inside = cur_key == anchor_key || cur_key.starts_with(&format!("{anchor_key}/"));
-        if !inside {
+        // Scope follows the effective display prefix even when wrapper collapse
+        // makes that prefix the nav root. The container-rating storage target is
+        // deliberately different at root and must not decide navigation scope.
+        let root = zip_rating_root_path(
+            &nav.tree.zip_path,
+            self.archive_source_override.as_deref(),
+            self.current_folder.as_deref(),
+        );
+        let current = book_container_key_from_segs(root, nav.current());
+        if !path_in_subtree_ci(&current, anchor) {
             self.restore_rating_filter_suppression();
             self.current_folder_rating_cache = None;
         }
@@ -99923,6 +100071,7 @@ impl App {
             self.show_editing_addon_dialog(ctx);
         }
         self.show_stats_dialog_window(ctx);
+        self.show_omitted_entries_dialog(ctx);
         self.show_rotation_reset_confirm_dialog(ctx);
         let context_nav = self.show_context_menu(ctx);
         self.render_main_dialogs_after_context(ctx, main_viewer_blocked);
@@ -100588,6 +100737,8 @@ impl eframe::App for App {
         self.poll_depth_setup(ctx);
         #[cfg(windows)]
         self.poll_caption_job();
+        #[cfg(windows)]
+        self.poll_caption_delete();
         self.caption_display.poll();
         self.poll_capture_selection(ctx);
         self.render_update_before_frame(ctx);

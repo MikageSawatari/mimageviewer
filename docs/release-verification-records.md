@@ -12,6 +12,19 @@
 
 ---
 
+## v5.0.0 (2026-11-07)
+
+- **対象**: master `d073af54a` (配布ビルドの入力)。v4.11.0 以降の v5 系 (MCP・AI 説明文・mIV Sound・音楽ビデオ) と §1.681〜§1.730 の修正。更新履歴は利用者承認済み (`3bb93924e`)、アプリ内通知用の短縮版 `docs/release-body-v5.0.0.md` (5.2 KB) も承認済み。
+- **自動テスト**: 配布ビルド内の全体テスト 18,611 件成功 (vendor crate 分も全件成功)。test-script feature の lib 全件 16,715 件成功。初回は 1 件が失敗したが、原因はテストの fixture がホストの TEMP の深さに依存していたことで、`d073af54a` で fixture を直した (製品コードは不変。Codex 実装、xhigh 独立レビュー ACCEPT)。CI と同じ `cargo fmt --check`・viewer context 監査は手元で成功 (master は公開前に未 push のため GitHub CI の記録なし)。
+- **ReleaseChecks (ClaudeCode が実行、利用者了承 2026-11-07)**: run `release-checks-20261107-121602-52b1e351`、9 件すべて PASS、警告なし。AI アップスケール経路の変更がないため `-IncludeFirstAi` なし。perf-cached / perf-uncached とも drawn 16ms 未満 99.7% (n=301/302、p95 11ms、max 50/53ms)、pre_grid p95 0.09ms。idle 5 件とも測定中の描画 0 フレーム、CPU 1 コア比 1% 未満。
+- **bench**: `bench_search --docs 50000` で回帰なし。`rare_jp_and` +42% / +0.07ms は NOISE 判定、baseline は更新していない。
+- **依存**: crate の patch 対象 (egui 系・tantivy・mimalloc・unrar)・LibRaw・ONNX Runtime・VST3 SDK・Rust は最新。PDFium (chromium/8138)・FFmpeg・EffeTune 上流 v0.17.0 は新版があるが、公開直前のため上げず v5.0.x 以降で検討。
+- **panic.log**: 17 種すべて disposition あり。新しい 1 種 (accesskit_windows subclass.rs:109、2026-11-06、OS が ERROR_NOT_ENOUGH_MEMORY を返したのを依存側が unwrap) は external として記録 (`80ae99ea7`)。
+- **署名・成果物**: `build-dist.ps1` (署名あり) で単体exe / setup.exe / portable zip を生成。単体exe / setup.exe / portable の mimageviewer.exe を `signtool verify /pa /v` で確認 (Open Source Developer Taku Sano、Certum Timestamp 2026、エラー 0)。Vector 用 `mImageViewer_installer_v5.0.0.zip` を作成。
+- **VirusTotal (2026-11-07、送信は利用者の了承のうえ利用者が実行、判定は ClaudeCode が結果ページで確認)**:
+  - `mimageviewer-vst3-host.exe` (署名済み、1,239,128 bytes) sha256 `5a49e23068609082085452f46f8497cc61d826749dfa216e61b76975c69007bf` — 0/65、Google・Microsoft とも Undetected。https://www.virustotal.com/gui/file/5a49e23068609082085452f46f8497cc61d826749dfa216e61b76975c69007bf
+  - `effetune/mIV Sound.vst3/Contents/x86_64-win/mIV Sound.vst3` (DLL、署名済み、5,894,232 bytes) sha256 `25c94c8274e75c26f2c878ca4dd2a26171c1036d2e4ac07069954bc7349bfc4f` — 初回 0/62 で Google が Timeout、Reanalyze 後 0/71、Google・Microsoft とも Undetected。https://www.virustotal.com/gui/file/25c94c8274e75c26f2c878ca4dd2a26171c1036d2e4ac07069954bc7349bfc4f
+
 ## v4.11.0 (2026-11-02)
 
 - **対象**: master `2322f5a2c` (リリース用ブランチ `release-4.11.0` を、利用者の更新履歴承認後に merge)。v4.10.2 以降の §1.482・§1.663・§1.668・§1.669・§1.670・§1.671・§1.672・§1.673・§1.674・§1.677・§1.679・§1.680 と、バケツの「範囲の基準」ボタンの統一。各項目とも独立レビュー ACCEPT。

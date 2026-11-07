@@ -106,6 +106,15 @@ impl VlmSetup {
         )
     }
 
+    /// Even a modeless/terminal model window can cover the deletion modal.
+    /// Retain exclusion while preparation workers finish after their window closes.
+    pub(crate) fn blocks_caption_deletion(&self) -> bool {
+        self.dialog.is_some()
+            || self.addon.operation() != AddonOperation::None
+            || self.addon.is_scanning()
+            || matches!(self.gpu, GpuProbe::Checking(_))
+    }
+
     fn ensure_checked(&mut self, ctx: &egui::Context) {
         self.addon.request_scan();
         if matches!(self.gpu, GpuProbe::Unchecked) {
@@ -207,6 +216,14 @@ impl App {
         ctx: &egui::Context,
         targets: CaptionTargets,
     ) {
+        // Both creation and settings requests enter here, including queued requests.
+        if self.caption_delete.is_some() {
+            self.show_feedback_result(
+                "AI 説明文の削除を処理しています。終わってから選んでください".into(),
+                crate::feedback::FeedbackKind::Info,
+            );
+            return;
+        }
         if targets.paths.is_empty() && self.vlm_caption_job_running() {
             return;
         }
@@ -616,6 +633,159 @@ pub(super) fn draw_preferences(ui: &mut egui::Ui, view: &VlmPreferencesView) -> 
 mod tests {
     use super::*;
     use egui_kittest::kittest::{NodeT, Queryable};
+
+    #[test]
+    fn vlm_setup_blocks_caption_deletion_for_visible_windows_and_hidden_preparation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut setup = VlmSetup::for_caption_menu_test(temp.path().join("vlm"));
+        assert!(!setup.blocks_caption_deletion());
+        for dialog in [
+            Dialog::Checking(vec![].into()),
+            Dialog::Confirm(vec![].into()),
+            Dialog::Running(vec![].into()),
+            Dialog::Unsupported("unsupported".into()),
+            Dialog::Done,
+            Dialog::Cancelled,
+            Dialog::Error("failure".into()),
+            Dialog::GpuError("failure".into()),
+            Dialog::RemoveConfirm,
+        ] {
+            setup.dialog = Some(dialog);
+            assert!(setup.blocks_caption_deletion());
+        }
+        setup.dialog = None;
+        for operation in [
+            AddonOperation::Installing,
+            AddonOperation::Cancelling,
+            AddonOperation::Removing,
+        ] {
+            setup.addon = VlmAddon::with_test_operation(temp.path().join("vlm"), operation);
+            assert!(setup.blocks_caption_deletion(), "{operation:?}");
+        }
+        setup.addon = VlmAddon::new(temp.path().join("vlm"));
+        setup.addon.request_scan();
+        assert!(setup.blocks_caption_deletion());
+        let until = std::time::Instant::now() + Duration::from_secs(20);
+        while setup.addon.is_scanning() {
+            setup.addon.poll();
+            assert!(std::time::Instant::now() < until);
+            std::thread::yield_now();
+        }
+        assert!(!setup.blocks_caption_deletion());
+        let (_tx, rx) = mpsc::channel();
+        setup.gpu = GpuProbe::Checking(rx);
+        assert!(setup.blocks_caption_deletion());
+    }
+
+    #[test]
+    fn vlm_setup_download_with_or_without_reserved_targets_blocks_caption_delete_and_confirm() {
+        use super::super::caption_delete::CaptionDeleteState;
+        const REASON: &str = "AI 説明文のモデルの準備中や、モデルの窓を開いている間は削除できません。準備が終わり窓を閉じてから選んでください";
+        for reserved in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            app.items = vec![crate::grid_item::GridItem::Image(
+                "C:/caption/image.png".into(),
+            )];
+            app.selected = Some(0);
+            let targets: CaptionTargets = if reserved {
+                vec![PathBuf::from("C:/caption/image.png")]
+            } else {
+                Vec::new()
+            }
+            .into();
+            app.vlm_setup = VlmSetup::for_caption_menu_test(app.tmp.path().join("vlm"));
+            app.vlm_setup.addon = VlmAddon::with_test_operation(
+                app.tmp.path().join("vlm"),
+                AddonOperation::Installing,
+            );
+            app.vlm_setup.dialog = Some(Dialog::Running(targets.clone()));
+            assert_eq!(app.caption_deletion_disabled_reason(false), Some(REASON));
+            app.request_delete_ai_captions(&egui::Context::default(), false);
+            assert!(app.caption_delete.is_none());
+            assert_eq!(app.fs_feedback_toast.as_ref().unwrap().0, REASON);
+            assert_eq!(
+                app.vlm_setup.captured_caption_targets_for_test(),
+                Some(&targets)
+            );
+
+            // Exercise final admission even if preparation appeared after confirmation.
+            app.caption_delete = Some(CaptionDeleteState::Confirm {
+                keys: vec!["key".into()],
+                ok: 1,
+                failed: 0,
+            });
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(1093.0, 614.0))
+                .build_ui_state(
+                    |ui, app: &mut crate::app::AppTestEnvForTest| {
+                        app.show_caption_delete_dialog(ui.ctx())
+                    },
+                    app,
+                );
+            harness.run_steps(4);
+            harness.get_by_label("削除").click();
+            harness.run_steps(2);
+            assert!(harness.state().caption_delete.is_none());
+            assert_eq!(
+                harness.state().fs_feedback_toast.as_ref().unwrap().0,
+                REASON
+            );
+            assert!(harness.state().caption_job.is_none());
+            assert_eq!(
+                harness
+                    .state()
+                    .vlm_setup
+                    .captured_caption_targets_for_test(),
+                Some(&targets)
+            );
+            assert_eq!(
+                harness.state_mut().vlm_setup.installed(false),
+                Some(targets)
+            );
+        }
+    }
+
+    #[test]
+    fn vlm_setup_requests_from_settings_and_creation_are_rejected_during_caption_deletion() {
+        use super::super::caption_delete::CaptionDeleteState;
+        for phase in 0..3 {
+            let mut app = crate::app::setup_app_for_test();
+            app.items = vec![crate::grid_item::GridItem::Image(
+                "C:/caption/image.png".into(),
+            )];
+            app.selected = Some(0);
+            app.vlm_setup = VlmSetup::for_caption_menu_test(app.tmp.path().join("vlm"));
+            app.caption_delete = Some(match phase {
+                0 => CaptionDeleteState::Counting {
+                    rx: mpsc::channel().1,
+                },
+                1 => CaptionDeleteState::Confirm {
+                    keys: vec!["key".into()],
+                    ok: 1,
+                    failed: 0,
+                },
+                _ => CaptionDeleteState::Deleting {
+                    rx: mpsc::channel().1,
+                },
+            });
+            let ctx = egui::Context::default();
+            // Both settings-only and directly submitted creation requests share this entry.
+            for targets in [Vec::new(), vec![PathBuf::from("C:/caption/image.png")]] {
+                app.request_vlm_caption_setup(&ctx, targets);
+                assert!(app.vlm_setup.dialog.is_none());
+                assert!(!app.vlm_setup.addon.is_scanning());
+                assert_eq!(app.vlm_setup.addon.operation(), AddonOperation::None);
+                assert_eq!(
+                    app.fs_feedback_toast.as_ref().unwrap().0,
+                    "AI 説明文の削除を処理しています。終わってから選んでください"
+                );
+            }
+            app.request_create_ai_captions(&ctx, false);
+            assert!(app.vlm_setup.dialog.is_none());
+            assert!(app.caption_job.is_none());
+        }
+    }
 
     #[test]
     fn vlm_setup_model_remove_is_disabled_for_running_and_stopping_job_owner() {

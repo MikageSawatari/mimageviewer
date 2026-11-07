@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use crate::app::folder_scan::{OmittedFolderEntryCounts, ScanMediaKind};
+use crate::app::folder_scan::ScanMediaKind;
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::snapshot::{SnapshotSourceLabel, SnapshotTarget};
 use crate::ui_fullscreen::FsPageNav;
@@ -59,7 +59,7 @@ fn image_scan(paths: &[PathBuf]) -> ScannedDir {
                 sort_meta: crate::settings::ListingSortMetadata::new(0, Some(0)),
             })
             .collect(),
-        omitted: OmittedFolderEntryCounts::default(),
+        omitted: Default::default(),
     }
 }
 

@@ -196,40 +196,65 @@ pub fn build_per_source_for_filename(path: &Path) -> PerSourceText {
 /// 1 ファイル分のソース別検索テキストをディスクから構築する。
 /// 抽出に失敗した部分は空文字列。ファイル名は必ず含める。
 pub fn build_per_source_for_file(path: &Path) -> PerSourceText {
-    let mut out = build_per_source_for_filename(path);
+    build_per_source_for_file_counted(path).0
+}
 
-    // 2. XMP / PNG / EXIF UserComment AI メタは同じファイル実体を
-    //    複数回読む path-based 版を使うと
-    //    AI 生成 PNG (10-30MB) で 3x 倍のディスク読み取りになり、インデクサが
-    //    350MB/秒級でディスクを占有してしまう (Codex perf 報告)。
-    //    ここで一度だけ読んで bytes 版に渡すことで I/O を 3 分の 1 に減らす。
+/// 同じ抽出と、メタデータ読み取り API が返す実読込バイト数の合計。
+/// XMP / AI / EXIF / 先頭 2MB / 外部サイドカーを含む。seek で飛ばした範囲、
+/// ファイル属性、説明文 DB、FFmpeg の動画メタデータ I/O は含まない。
+pub fn build_per_source_for_file_counted(path: &Path) -> (PerSourceText, u64) {
+    let mut out = build_per_source_for_filename(path);
+    let mut bytes_read = 0;
+
+    // 2. JPEG / PNG は Ctrl+F pass 2 と同じ path 版で見出しと必要なメタだけ読む。
+    //    TIFF / MP4 等は既存の先頭 2MB を bytes 版で共有する経路を維持する。
     let is_video_sidecar = crate::xmp_writer::is_video_for_sidecar(path);
     let mut ai_from_exif_user_comment = false;
 
-    if let Some(bytes) = read_metadata_bytes(path) {
-        // 2a. XMP (mXD Twitter メタ)
-        if let Some(xmp) = crate::xmp_reader::read_tweet_info_from_bytes(&bytes) {
-            let mut buf = String::with_capacity(128);
-            append_xmp(&mut buf, &xmp);
-            if !buf.trim().is_empty() {
-                out.xmp_tweet = normalize_for_match(&buf);
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    let (xmp, ai_text, ai_origin) =
+        if matches!(ext.as_deref(), Some("jpg" | "jpeg" | "jfif" | "png")) {
+            let xmp = crate::xmp_reader::read_tweet_info_counted(path);
+            let ai = crate::png_metadata::build_searchable_from_path_counted(path);
+            bytes_read += xmp.bytes_read + ai.bytes_read;
+            (xmp.info, ai.text, ai.origin)
+        } else {
+            let (bytes, read) = read_metadata_bytes(path);
+            bytes_read += read;
+            if let Some(bytes) = bytes {
+                let xmp = crate::xmp_reader::read_tweet_info_from_bytes(&bytes);
+                let (text, origin) =
+                    crate::png_metadata::build_searchable_from_bytes_with_origin(&bytes);
+                (xmp, text, origin)
+            } else {
+                (None, String::new(), None)
             }
-        }
-        // 2b. AI プロンプト (PNG tEXt/iTXt/zTXt / EXIF UserComment)
-        let (ai_text, ai_origin) =
-            crate::png_metadata::build_searchable_from_bytes_with_origin(&bytes);
-        if !ai_text.is_empty() {
-            out.png_prompt = normalize_for_match(&ai_text);
-        }
-        if ai_origin.is_some_and(|o| o.suppresses_exif_user_comment()) {
-            ai_from_exif_user_comment = true;
+        };
+    // 2a. XMP (mXD Twitter メタ)
+    if let Some(xmp) = xmp {
+        let mut buf = String::with_capacity(128);
+        append_xmp(&mut buf, &xmp);
+        if !buf.trim().is_empty() {
+            out.xmp_tweet = normalize_for_match(&buf);
         }
     }
+    // 2b. AI プロンプト (PNG tEXt/iTXt/zTXt / EXIF UserComment)
+    if !ai_text.is_empty() {
+        out.png_prompt = normalize_for_match(&ai_text);
+    }
+    if ai_origin.is_some_and(|o| o.suppresses_exif_user_comment()) {
+        ai_from_exif_user_comment = true;
+    }
 
-    // 3. EXIF (rexif が自前で開く。内部パーサーが IFD を読むだけなので全読みしない想定)
+    // 3. EXIF (JPEG は SOS 手前まで。TIFF は従来どおり全体読み)
     //    UserComment が AI メタとして認識された場合は png_prompt 側に正規化済みで載るため、
     //    EXIF 側には再掲しない (Negative prompt の二重取り込み防止)。
-    if let Some(exif) = crate::exif_reader::read_exif(path, &[]) {
+    let exif = crate::exif_reader::read_exif_counted(path, &[]);
+    bytes_read += exif.bytes_read;
+    if let Some(exif) = exif.info {
         let mut buf = String::with_capacity(128);
         append_exif(&mut buf, &exif, ai_from_exif_user_comment);
         if !buf.trim().is_empty() {
@@ -246,12 +271,14 @@ pub fn build_per_source_for_file(path: &Path) -> PerSourceText {
     //    JSON はリーフ値のみ / TXT は全文を sidecar_text へ。タグ抽出はしない
     //    (mIV タグ系統とは別系統。docs/sidecar-metadata-ingest.md)。
     if !is_video_sidecar {
-        if let Some(text) = crate::external_metadata::read_search_text(path) {
+        let sidecar = crate::external_metadata::read_search_text_counted(path);
+        bytes_read += sidecar.bytes_read;
+        if let Some(text) = sidecar.text {
             out.sidecar = normalize_for_match(&text);
         }
     }
 
-    out
+    (out, bytes_read)
 }
 
 /// 動画コンテナの埋め込みメタデータを検索用テキストにする。
@@ -349,11 +376,10 @@ fn push_metadata_value(
     }
 }
 
-/// メタ抽出共通のファイル読み込み (XMP / PNG で共有)。
+/// TIFF / MP4 / MOV / M4V の先頭 2MB を bytes 版メタ抽出へ渡す。
 ///
-/// JPEG / PNG は通常 ≤50MB なので全読み。TIFF / MP4 等の大コンテナは先頭 2MB のみ読む
-/// (`xmp_reader::read_tweet_info` が旧来 512KB に絞っていたのを 2MB に拡張)。
-/// それ以外の拡張子は metadata 検索対象外として `None`。
+/// JPEG / PNG は path 版の部分読みを使うためここでは読まない。
+/// WebP 等の他拡張子も従来どおり読まない。
 ///
 /// 戻り値の `Vec<u8>` は同一ファイルに対して XMP / PNG パーサーで共有される。
 ///
@@ -362,29 +388,28 @@ fn push_metadata_value(
 /// 旧タグ検索経路では TIFF/MP4 でもフルファイル読みが起き得たため、大容量コンテナは
 /// ここで上限を設けて通常操作を巻き込まないようにする。
 ///
-/// ExifTool / mXD など一般的な XMP writer は uuid atom / IFD0 の先頭付近に packet を
-/// 置くので 512KB で実用上十分だったが、MP4 では XMP packet を末尾 (moov atom の後)
-/// に置く encoder も存在する。`moov` が先頭にくる fast-start 形式なら 2MB 内に XMP も
-/// 収まる想定。
-fn read_metadata_bytes(path: &Path) -> Option<Vec<u8>> {
+/// 入力上限 2MB は既存契約として保つ。現行の共有 XMP bytes reader は fallback を
+/// 512KB に制限するため、2MB 全域の XMP を抽出できるという保証ではない。
+fn read_metadata_bytes(path: &Path) -> (Option<Vec<u8>>, u64) {
     const METADATA_SCAN_LIMIT: u64 = 2 * 1024 * 1024;
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase)?;
-    match ext.as_str() {
-        // 小画像: 全読み (末尾に XMP セグメントが置かれるケースを拾うため)
-        "jpg" | "jpeg" | "jfif" | "png" => std::fs::read(path).ok(),
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
         // 大容量コンテナ: 先頭 2MB だけ読む (上記コメント参照)
-        "tif" | "tiff" | "mp4" | "mov" | "m4v" => {
+        Some("tif" | "tiff" | "mp4" | "mov" | "m4v") => {
             use std::io::Read;
-            let f = std::fs::File::open(path).ok()?;
+            let Ok(f) = std::fs::File::open(path) else {
+                return (None, 0);
+            };
             let mut buf = Vec::with_capacity(64 * 1024);
-            f.take(METADATA_SCAN_LIMIT).read_to_end(&mut buf).ok()?;
-            Some(buf)
+            let result = f.take(METADATA_SCAN_LIMIT).read_to_end(&mut buf);
+            let bytes_read = buf.len() as u64;
+            (result.ok().map(|_| buf), bytes_read)
         }
         // BMP / GIF / WebP / HEIC / RAW: XMP/PNG チャンクを持たない想定なので読まない
-        _ => None,
+        _ => (None, 0),
     }
 }
 
@@ -484,11 +509,415 @@ fn append_xmp(out: &mut String, info: &crate::xmp_reader::XmpTweetInfo) {
     }
 }
 
+// Frozen pre-partial-read policy; keep independent of the production reader.
+#[cfg(test)]
+fn read_metadata_bytes_legacy(path: &Path) -> Option<Vec<u8>> {
+    const METADATA_SCAN_LIMIT: u64 = 2 * 1024 * 1024;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)?;
+    match ext.as_str() {
+        // 小画像: 全読み (末尾に XMP セグメントが置かれるケースを拾うため)
+        "jpg" | "jpeg" | "jfif" | "png" => std::fs::read(path).ok(),
+        // 大容量コンテナ: 先頭 2MB だけ読む (上記コメント参照)
+        "tif" | "tiff" | "mp4" | "mov" | "m4v" => {
+            use std::io::Read;
+            let f = std::fs::File::open(path).ok()?;
+            let mut buf = Vec::with_capacity(64 * 1024);
+            f.take(METADATA_SCAN_LIMIT).read_to_end(&mut buf).ok()?;
+            Some(buf)
+        }
+        // BMP / GIF / WebP / HEIC / RAW: XMP/PNG チャンクを持たない想定なので読まない
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+fn build_per_source_for_file_legacy(path: &Path) -> PerSourceText {
+    let mut out = build_per_source_for_filename(path);
+
+    // 2. XMP / PNG / EXIF UserComment AI メタは同じファイル実体を
+    //    複数回読む path-based 版を使うと
+    //    AI 生成 PNG (10-30MB) で 3x 倍のディスク読み取りになり、インデクサが
+    //    350MB/秒級でディスクを占有してしまう (Codex perf 報告)。
+    //    ここで一度だけ読んで bytes 版に渡すことで I/O を 3 分の 1 に減らす。
+    let is_video_sidecar = crate::xmp_writer::is_video_for_sidecar(path);
+    let mut ai_from_exif_user_comment = false;
+
+    if let Some(bytes) = read_metadata_bytes_legacy(path) {
+        // 2a. XMP (mXD Twitter メタ)
+        if let Some(xmp) = crate::xmp_reader::read_tweet_info_from_bytes(&bytes) {
+            let mut buf = String::with_capacity(128);
+            append_xmp(&mut buf, &xmp);
+            if !buf.trim().is_empty() {
+                out.xmp_tweet = normalize_for_match(&buf);
+            }
+        }
+        // 2b. AI プロンプト (PNG tEXt/iTXt/zTXt / EXIF UserComment)
+        let (ai_text, ai_origin) =
+            crate::png_metadata::build_searchable_from_bytes_with_origin(&bytes);
+        if !ai_text.is_empty() {
+            out.png_prompt = normalize_for_match(&ai_text);
+        }
+        if ai_origin.is_some_and(|o| o.suppresses_exif_user_comment()) {
+            ai_from_exif_user_comment = true;
+        }
+    }
+
+    // 3. EXIF (rexif が自前で開く。内部パーサーが IFD を読むだけなので全読みしない想定)
+    //    UserComment が AI メタとして認識された場合は png_prompt 側に正規化済みで載るため、
+    //    EXIF 側には再掲しない (Negative prompt の二重取り込み防止)。
+    if let Some(exif) = crate::exif_reader::read_exif(path, &[]) {
+        let mut buf = String::with_capacity(128);
+        append_exif(&mut buf, &exif, ai_from_exif_user_comment);
+        if !buf.trim().is_empty() {
+            out.exif = normalize_for_match(&buf);
+        }
+    }
+
+    // 4. 動画ファイルは同名 `.xmp` サイドカーではなくコンテナメタだけを検索対象にする。
+    if is_video_sidecar {
+        out.video_meta = build_video_metadata_text(path);
+    }
+
+    // 5. 外部メタデータサイドカー (画像のみ。動画は既存 .xmp 経路を維持する)。
+    //    JSON はリーフ値のみ / TXT は全文を sidecar_text へ。タグ抽出はしない
+    //    (mIV タグ系統とは別系統。docs/sidecar-metadata-ingest.md)。
+    if !is_video_sidecar {
+        if let Some(text) = crate::external_metadata::read_search_text(path) {
+            out.sidecar = normalize_for_match(&text);
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    fn fixture(name: &str) -> Vec<u8> {
+        fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/ai_metadata")
+                .join(name),
+        )
+        .unwrap()
+    }
+
+    fn tiff_metadata(comment: Option<&str>) -> Vec<u8> {
+        // Little-endian TIFF: IFD0 Make + ExifIFD, then UserComment (ASCII preamble).
+        let mut tiff = b"II\x2a\0\x08\0\0\0".to_vec();
+        tiff.extend_from_slice(&2_u16.to_le_bytes());
+        for (tag, kind, count, offset) in [(0x010f_u16, 2_u16, 6_u32, 56_u32), (0x8769, 4, 1, 38)] {
+            tiff.extend_from_slice(&tag.to_le_bytes());
+            tiff.extend_from_slice(&kind.to_le_bytes());
+            tiff.extend_from_slice(&count.to_le_bytes());
+            tiff.extend_from_slice(&offset.to_le_bytes());
+        }
+        tiff.extend_from_slice(&0_u32.to_le_bytes());
+        let user = [
+            b"ASCII\0\0\0".as_slice(),
+            comment.unwrap_or("ordinary comment").as_bytes(),
+        ]
+        .concat();
+        tiff.extend_from_slice(&1_u16.to_le_bytes());
+        tiff.extend_from_slice(&0x9286_u16.to_le_bytes());
+        tiff.extend_from_slice(&7_u16.to_le_bytes());
+        tiff.extend_from_slice(&(user.len() as u32).to_le_bytes());
+        tiff.extend_from_slice(&62_u32.to_le_bytes());
+        tiff.extend_from_slice(&0_u32.to_le_bytes());
+        tiff.extend_from_slice(b"Canon\0");
+        tiff.extend_from_slice(&user);
+        tiff
+    }
+
+    fn jpeg_metadata(comment: Option<&str>, xmp: Option<&[u8]>, image_size: usize) -> Vec<u8> {
+        fn app1(out: &mut Vec<u8>, data: &[u8]) {
+            out.extend_from_slice(&[0xff, 0xe1]);
+            out.extend_from_slice(&u16::try_from(data.len() + 2).unwrap().to_be_bytes());
+            out.extend_from_slice(data);
+        }
+        let tiff = tiff_metadata(comment);
+        let mut out = vec![0xff, 0xd8];
+        app1(&mut out, &[b"Exif\0\0".as_slice(), &tiff].concat());
+        if let Some(xmp) = xmp {
+            app1(
+                &mut out,
+                &[b"http://ns.adobe.com/xap/1.0/\0".as_slice(), xmp].concat(),
+            );
+        }
+        out.extend_from_slice(&[0xff, 0xda, 0, 2]);
+        out.resize(out.len() + image_size, 0x55);
+        out.extend_from_slice(&[0xff, 0xd9]);
+        out
+    }
+
+    const XMP: &[u8] = br#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:xtw="https://mXDownloader.app/ns/x-twitter/1.0/" xtw:TweetId="123" xtw:AuthorScreenName="PartialReader"/></rdf:RDF></x:xmpmeta>"#;
+
+    fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        out.extend_from_slice(&[0; 4]); // Metadata readers do not validate CRC or decode IDAT.
+    }
+
+    fn large_png(ai: bool, xmp: bool) -> Vec<u8> {
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        png_chunk(&mut out, b"IHDR", &[0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0]);
+        if ai {
+            png_chunk(&mut out, b"tEXt", b"parameters\0positive lighthouse\nNegative prompt: negative-secret\nSteps: 20, Sampler: Euler, CFG scale: 7, Seed: 42");
+        }
+        png_chunk(&mut out, b"IDAT", &vec![0x55; 8 * 1024 * 1024]);
+        if xmp {
+            png_chunk(
+                &mut out,
+                b"iTXt",
+                &[b"XML:com.adobe.xmp\0\0\0\0\0".as_slice(), XMP].concat(),
+            );
+        }
+        png_chunk(&mut out, b"IEND", &[]);
+        out
+    }
+
+    fn assert_legacy_matches(path: &Path, bytes: &[u8]) -> PerSourceText {
+        fs::write(path, bytes).unwrap();
+        let (actual, _) = build_per_source_for_file_counted(path);
+        assert_eq!(
+            actual,
+            build_per_source_for_file_legacy(path),
+            "{}",
+            path.display()
+        );
+        assert_eq!(actual, build_per_source_for_file(path));
+        actual
+    }
+
+    #[test]
+    fn partial_ingest_matches_legacy_for_jpeg_png_fixtures() {
+        fn visit(root: &Path, tmp: &Path, checked: &mut usize) {
+            for entry in fs::read_dir(root).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    visit(&path, tmp, checked);
+                } else if matches!(
+                    path.extension().and_then(|x| x.to_str()),
+                    Some("jpg" | "jpeg" | "jfif" | "png")
+                ) {
+                    let target = tmp.join(path.file_name().unwrap());
+                    assert_legacy_matches(&target, &fs::read(&path).unwrap());
+                    *checked += 1;
+                }
+            }
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut checked = 0;
+        for root in ["ai_metadata", "sd_parsers_upstream"] {
+            visit(
+                &Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures")
+                    .join(root),
+                tmp.path(),
+                &mut checked,
+            );
+        }
+        assert!(
+            checked > 40,
+            "must compare real fixtures, including text/iTXt/zTXt and bad images"
+        );
+    }
+
+    #[test]
+    fn partial_ingest_matches_legacy_for_exif_xmp_and_mismatched_extensions() {
+        let tmp = TempDir::new().unwrap();
+        let ai = "positive lighthouse\nNegative prompt: negative-secret\nSteps: 20, Sampler: Euler, CFG scale: 7, Seed: 42";
+        for ext in ["jpg", "jpeg", "jfif", "png"] {
+            let path = tmp.path().join(format!("photo.{ext}"));
+            let exif = assert_legacy_matches(&path, &jpeg_metadata(None, None, 16));
+            assert!(exif.exif.contains("canon"));
+            let text = assert_legacy_matches(&path, &jpeg_metadata(Some(ai), None, 16));
+            assert!(text.png_prompt.contains("positive lighthouse"));
+            assert!(!text.combined().contains("negative-secret"));
+            let text = assert_legacy_matches(
+                &path,
+                &jpeg_metadata(Some(r#"{"unknown":"json-secret"}"#), None, 16),
+            );
+            assert!(text.png_prompt.is_empty());
+            assert!(!text.exif.contains("json-secret"));
+            let text = assert_legacy_matches(&path, &jpeg_metadata(None, Some(XMP), 16));
+            assert!(text.xmp_tweet.contains("partialreader"));
+            let text = assert_legacy_matches(&path, &jpeg_metadata(Some(ai), Some(XMP), 16));
+            assert!(text.xmp_tweet.contains("123"));
+            assert!(text.png_prompt.contains("positive lighthouse"));
+            let text = assert_legacy_matches(&path, &fixture("enc_a1111_itxt.png"));
+            assert!(!text.png_prompt.is_empty());
+            assert_legacy_matches(&path, &[]);
+            assert_legacy_matches(&path, &[0xff, 0xd8, 0xff]);
+            assert_legacy_matches(&path, b"\x89PNG\r\n\x1a\n\0\0");
+        }
+        let mut xmp_only = vec![0xff, 0xd8];
+        let data = [b"http://ns.adobe.com/xap/1.0/\0".as_slice(), XMP].concat();
+        xmp_only.extend_from_slice(&[0xff, 0xe1]);
+        xmp_only.extend_from_slice(&((data.len() + 2) as u16).to_be_bytes());
+        xmp_only.extend_from_slice(&data);
+        xmp_only.extend_from_slice(&[0xff, 0xda, 0, 2, 0xff, 0xd9]);
+        let text = assert_legacy_matches(&tmp.path().join("xmp.jpg"), &xmp_only);
+        assert!(!text.xmp_tweet.is_empty());
+        assert!(text.exif.is_empty());
+        let text = assert_legacy_matches(&tmp.path().join("xmp.png"), &large_png(false, true));
+        assert!(text.xmp_tweet.contains("partialreader"));
+    }
+
+    #[test]
+    fn partial_ingest_matches_legacy_for_tiff_magic_jpg_and_late_tiff_comment() {
+        let tmp = TempDir::new().unwrap();
+        let ai = "positive lighthouse\nNegative prompt: negative-secret\nSteps: 20, Sampler: Euler, CFG scale: 7, Seed: 42";
+        let mut bytes = tiff_metadata(Some(ai));
+        assert!(bytes.starts_with(b"II*\0"));
+        let jpg = tmp.path().join("tiff-content.jpg");
+        let text = assert_legacy_matches(&jpg, &bytes);
+        assert!(text.exif.contains("canon"));
+        assert!(text.png_prompt.contains("positive lighthouse"));
+        assert!(!text.combined().contains("negative-secret"));
+
+        // Move UserComment beyond the old TIFF prefix limit. Its IFD entry's
+        // value-offset field is at 48, and its original payload starts at 62.
+        let comment = bytes.split_off(62);
+        let offset = 2 * 1024 * 1024 + 128;
+        bytes[48..52].copy_from_slice(&(offset as u32).to_le_bytes());
+        bytes.resize(offset, 0);
+        bytes.extend_from_slice(&comment);
+        let text = assert_legacy_matches(&jpg, &bytes);
+        assert!(text.png_prompt.contains("positive lighthouse"));
+        assert!(!text.combined().contains("negative-secret"));
+
+        for ext in ["tif", "tiff"] {
+            let path = tmp.path().join(format!("late-comment.{ext}"));
+            let text = assert_legacy_matches(&path, &bytes);
+            assert!(
+                text.png_prompt.is_empty(),
+                "AI bytes reader must retain the 2MB limit"
+            );
+            assert!(
+                text.exif.contains("negative-secret"),
+                "the independent full EXIF read remains unsuppressed"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_metadata_reader_preserves_extension_gates_and_two_mb_limit() {
+        let tmp = TempDir::new().unwrap();
+        let bytes = vec![0x55; 2 * 1024 * 1024 + 128];
+        for ext in [
+            "jpg", "jpeg", "jfif", "png", "JPG", "tif", "tiff", "mp4", "mov", "m4v", "TIFF",
+            "webp", "bmp", "gif", "heic", "raw", "txt", "",
+        ] {
+            let path = tmp.path().join(format!("image.{ext}"));
+            fs::write(&path, &bytes).unwrap();
+            let expected = match ext {
+                "jpg" | "jpeg" | "jfif" | "png" | "JPG" => Some(bytes.as_slice()),
+                "tif" | "tiff" | "mp4" | "mov" | "m4v" | "TIFF" => Some(&bytes[..2 * 1024 * 1024]),
+                _ => None,
+            };
+            assert_eq!(
+                read_metadata_bytes_legacy(&path).as_deref(),
+                expected,
+                "{ext}"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_ingest_large_images_skip_pixel_payload_and_count_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        for (name, bytes) in [
+            ("large.jpg", jpeg_metadata(None, None, 8 * 1024 * 1024)),
+            (
+                "plain.jpg",
+                [
+                    vec![0xff, 0xd8, 0xff, 0xda, 0, 2],
+                    vec![0x55; 8 * 1024 * 1024],
+                    vec![0xff, 0xd9],
+                ]
+                .concat(),
+            ),
+            ("large.png", large_png(true, false)),
+            ("plain.png", large_png(false, false)),
+        ] {
+            let path = tmp.path().join(name);
+            assert_legacy_matches(&path, &bytes);
+            let (without, read) = build_per_source_for_file_counted(&path);
+            assert!(
+                read > 0 && read < 64 * 1024,
+                "{name}: {read} of {}",
+                bytes.len()
+            );
+            let sidecar = b"sidecar counted text";
+            fs::write(tmp.path().join(format!("{name}.txt")), sidecar).unwrap();
+            let (with, total) = build_per_source_for_file_counted(&path);
+            assert_eq!(total, read + sidecar.len() as u64);
+            assert!(without.sidecar.is_empty());
+            assert_eq!(with.sidecar, "sidecar counted text");
+            assert_eq!(with, build_per_source_for_file_legacy(&path));
+        }
+    }
+
+    #[test]
+    fn partial_ingest_keeps_two_mb_prefix_and_skips_other_formats() {
+        let tmp = TempDir::new().unwrap();
+        for ext in ["tif", "tiff", "mp4", "mov", "m4v"] {
+            let path = tmp.path().join(format!("late.{ext}"));
+            let mut bytes = if matches!(ext, "tif" | "tiff") {
+                b"II*\0".to_vec()
+            } else {
+                b"\0\0\0\x18ftypisom".to_vec()
+            };
+            bytes.resize(768 * 1024, 0);
+            bytes.extend_from_slice(XMP);
+            bytes.resize(3 * 1024 * 1024, 0);
+            fs::write(&path, bytes).unwrap();
+            let (prefix, read) = read_metadata_bytes(&path);
+            assert_eq!(read, 2 * 1024 * 1024);
+            let prefix = prefix.unwrap();
+            assert_eq!(&prefix[768 * 1024..768 * 1024 + XMP.len()], XMP);
+            // The shared XMP bytes reader currently also bounds fallback to 512KB.
+            // Keep the existing 2MB input contract without expanding that reader here.
+            assert!(crate::xmp_reader::read_tweet_info_from_bytes(&prefix).is_none());
+            // TIFF EXIF retains its independent full-read behavior. Avoid FFmpeg in this test.
+            if matches!(ext, "tif" | "tiff") {
+                assert_eq!(
+                    build_per_source_for_file(&path),
+                    build_per_source_for_file_legacy(&path)
+                );
+            }
+        }
+        for ext in ["webp", "bmp", "gif", "heic", "raw", "jpg", "png"] {
+            assert_eq!(
+                read_metadata_bytes(&tmp.path().join(format!("skip.{ext}"))),
+                (None, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn partial_ingest_xmp_without_tweet_id_does_not_append_fields() {
+        let tmp = TempDir::new().unwrap();
+        let xmp = String::from_utf8(XMP.to_vec())
+            .unwrap()
+            .replace("xtw:TweetId=\"123\"", "");
+        let path = tmp.path().join("unpopulated.jpg");
+        let text = assert_legacy_matches(&path, &jpeg_metadata(None, Some(xmp.as_bytes()), 16));
+        assert!(text.xmp_tweet.is_empty());
+        assert!(
+            crate::xmp_reader::read_tweet_info_counted(&path)
+                .info
+                .is_none()
+        );
+    }
 
     #[test]
     fn includes_filename() {

@@ -2578,6 +2578,7 @@ pub fn draw_file_type_visibility_status_snapshot_fixture(ui: &mut egui::Ui) {
             unsupported: 1,
             ..Default::default()
         },
+        &mut false,
     );
 }
 
@@ -2612,11 +2613,66 @@ fn omitted_entries_breakdown_label(counts: crate::app::OmittedFolderEntryCounts)
     parts.join("、")
 }
 
+pub(crate) fn draw_omitted_entries_summary(
+    ui: &mut egui::Ui,
+    counts: crate::app::OmittedFolderEntryCounts,
+) -> Option<crate::ui_dialogs::preferences::PreferencesOpenRequest> {
+    let mut open_preferences = None;
+    ui.label(omitted_entries_breakdown_label(counts));
+    ui.label(
+        egui::RichText::new(
+            "「システム」は Thumbs.db など自動で作られるファイルです。件数には含めません。",
+        )
+        .small()
+        .weak(),
+    );
+    if counts.same_name > 0
+        || counts.ignored_archive > 0
+        || counts.ignored_epub > 0
+        || counts.hidden > 0
+        || counts.file_type > 0
+    {
+        ui.separator();
+    }
+    if counts.same_name > 0 && ui.link("同名ファイル設定を開く").clicked() {
+        open_preferences =
+            Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::DUPLICATE_FILES);
+    }
+    if counts.file_type > 0 && ui.link("表示するファイル種類を設定する").clicked() {
+        open_preferences =
+            Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::FILE_TYPE_VISIBILITY);
+    }
+    if counts.ignored_archive > 0 {
+        let archive_labels = crate::archive_converter::ArchiveFormat::convertible_labels();
+        if ui
+            .link(format!("「{archive_labels} の処理」を設定する"))
+            .clicked()
+        {
+            open_preferences =
+                Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::ARCHIVE_HANDLING);
+        }
+    }
+    if counts.ignored_epub > 0 && ui.link("「EPUB の処理」を設定する").clicked() {
+        open_preferences =
+            Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::EPUB_HANDLING);
+    }
+    if counts.hidden > 0
+        && ui
+            .link("「隠しファイル・フォルダを表示する」を設定する")
+            .clicked()
+    {
+        open_preferences =
+            Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::HIDDEN_FILES);
+    }
+    open_preferences
+}
+
 /// 走査時に確定した内訳だけを描画する。ここからファイルシステムを再走査しない。
 /// 戻り値は、内訳に対応する設定リンクが押された場合の遷移先。
 fn draw_omitted_entries_chip(
     ui: &mut egui::Ui,
     counts: crate::app::OmittedFolderEntryCounts,
+    open_list: &mut bool,
 ) -> Option<crate::ui_dialogs::preferences::PreferencesOpenRequest> {
     let Some(label) = omitted_entries_chip_label(counts) else {
         return None;
@@ -2625,56 +2681,13 @@ fn draw_omitted_entries_chip(
     let button_label = egui::RichText::new(label).small().strong();
     let (response, _) = egui::containers::menu::MenuButton::new(button_label).ui(ui, |ui| {
         ui.set_min_width(300.0);
-        ui.label(omitted_entries_breakdown_label(counts));
-        ui.label(
-            egui::RichText::new(
-                "「システム」は Thumbs.db など自動で作られるファイルです。件数には含めません。",
-            )
-            .small()
-            .weak(),
-        );
-        if counts.same_name > 0
-            || counts.ignored_archive > 0
-            || counts.ignored_epub > 0
-            || counts.hidden > 0
-            || counts.file_type > 0
-        {
-            ui.separator();
-        }
-        if counts.same_name > 0 && ui.link("同名ファイル設定を開く").clicked() {
-            open_preferences =
-                Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::DUPLICATE_FILES);
+        open_preferences = draw_omitted_entries_summary(ui, counts);
+        ui.separator();
+        if ui.link("ファイル名の一覧を表示…").clicked() {
+            *open_list = true;
             ui.close();
         }
-        if counts.file_type > 0 && ui.link("表示するファイル種類を設定する").clicked()
-        {
-            open_preferences =
-                Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::FILE_TYPE_VISIBILITY);
-            ui.close();
-        }
-        if counts.ignored_archive > 0 {
-            let archive_labels = crate::archive_converter::ArchiveFormat::convertible_labels();
-            if ui
-                .link(format!("「{archive_labels} の処理」を設定する"))
-                .clicked()
-            {
-                open_preferences =
-                    Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::ARCHIVE_HANDLING);
-                ui.close();
-            }
-        }
-        if counts.ignored_epub > 0 && ui.link("「EPUB の処理」を設定する").clicked() {
-            open_preferences =
-                Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::EPUB_HANDLING);
-            ui.close();
-        }
-        if counts.hidden > 0
-            && ui
-                .link("「隠しファイル・フォルダを表示する」を設定する")
-                .clicked()
-        {
-            open_preferences =
-                Some(crate::ui_dialogs::preferences::PreferencesOpenRequest::HIDDEN_FILES);
+        if open_preferences.is_some() {
             ui.close();
         }
     });
@@ -15530,6 +15543,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             .then(|| self.current_normal_folder_omitted_counts())
             .flatten();
         let mut open_preferences = None;
+        let mut open_omitted_list = false;
         // Measure the same visible controls in the folder bar's normal style.
         let mut widths = crate::ui_toolbar_layout::FolderBarWidth::with_input();
         widths.label(ui, "フォルダ:");
@@ -16198,7 +16212,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             match part {
                                 crate::ui_toolbar_layout::FolderTailPart::RightControls => {
                                     if let Some(counts) = omitted_counts {
-                                        if let Some(page) = draw_omitted_entries_chip(ui, counts) {
+                                        if let Some(page) = draw_omitted_entries_chip(
+                                            ui,
+                                            counts,
+                                            &mut open_omitted_list,
+                                        ) {
                                             open_preferences = Some(page);
                                         }
                                         if omitted_entries_chip_label(counts).is_some() {
@@ -16531,6 +16549,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 result
             },
         );
+        if open_omitted_list {
+            self.open_omitted_entries_dialog();
+        }
         if let Some(request) = open_preferences {
             self.open_preferences_request(request);
         }
@@ -22202,7 +22223,7 @@ mod facet_filter_bar_tests {
             .with_size(egui::vec2(640.0, 240.0))
             .build_ui(move |root_ui| {
                 egui::CentralPanel::default().show(root_ui, |ui| {
-                    let _ = draw_omitted_entries_chip(ui, counts);
+                    let _ = draw_omitted_entries_chip(ui, counts, &mut false);
                 });
             });
         harness.run();
@@ -22240,7 +22261,7 @@ mod facet_filter_bar_tests {
             .with_size(egui::vec2(640.0, 240.0))
             .build_ui(move |root_ui| {
                 egui::CentralPanel::default().show(root_ui, |ui| {
-                    let _ = draw_omitted_entries_chip(ui, unsupported_only);
+                    let _ = draw_omitted_entries_chip(ui, unsupported_only, &mut false);
                 });
             });
         harness.run();
@@ -22271,7 +22292,7 @@ mod facet_filter_bar_tests {
             .with_size(egui::vec2(640.0, 240.0))
             .build_ui(move |root_ui| {
                 egui::CentralPanel::default().show(root_ui, |ui| {
-                    if let Some(request) = draw_omitted_entries_chip(ui, counts) {
+                    if let Some(request) = draw_omitted_entries_chip(ui, counts, &mut false) {
                         *opened_for_ui.lock().unwrap() = Some(request);
                     }
                 });
@@ -22332,6 +22353,36 @@ mod facet_filter_bar_tests {
             "「隠しファイル・フォルダを表示する」を設定する",
             PreferencesOpenRequest::HIDDEN_FILES,
         );
+    }
+
+    #[test]
+    fn omitted_chip_list_link_closes_the_popup_and_emits_open_intent() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(700.0, 400.0))
+            .build_ui_state(
+                |ctx, open_list| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        draw_omitted_entries_chip(
+                            ui,
+                            crate::app::OmittedFolderEntryCounts {
+                                unsupported: 1,
+                                ..Default::default()
+                            },
+                            open_list,
+                        );
+                    });
+                },
+                false,
+            );
+        harness.run();
+        harness.get_by_label("非表示 1 件").click();
+        harness.run();
+        harness.get_by_label("ファイル名の一覧を表示…").click();
+        harness.run();
+        assert!(*harness.state());
+        assert!(harness.query_by_label("ファイル名の一覧を表示…").is_none());
     }
 
     fn collect_shape_text(shape: &egui::epaint::Shape, text: &mut String) {
@@ -34923,8 +34974,12 @@ mod section207_tests {
                 env.current_folder_rating_cache = Some(0);
                 env.normal_folder_omitted_entries = Some(crate::app::NormalFolderOmittedEntries {
                     folder,
-                    counts: crate::app::OmittedFolderEntryCounts {
-                        unsupported: 321,
+                    omitted: crate::app::folder_scan::OmittedFolderEntries {
+                        counts: crate::app::OmittedFolderEntryCounts {
+                            unsupported: 321,
+                            ..Default::default()
+                        },
+                        entries: Vec::new(),
                         ..Default::default()
                     },
                 });

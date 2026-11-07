@@ -165,6 +165,128 @@ fn section1375_worker_equal_preserves_cursor_checks_scroll_and_late_thumbnail() 
 }
 
 #[test]
+fn section1375_omitted_equal_rescan_refreshes_names_counts_and_only_sorts_if_open() {
+    for open in [false, true] {
+        let (mut app, folder, ctx) = fixture(&["page.jpg", "a.txt"]);
+        assert_eq!(
+            app.current_normal_folder_omitted_counts()
+                .unwrap()
+                .unsupported,
+            1
+        );
+        assert!(
+            !app.current_normal_folder_omitted_entries()
+                .unwrap()
+                .omitted
+                .sorted
+        );
+        if open {
+            app.open_omitted_entries_dialog();
+        }
+        std::fs::rename(folder.join("a.txt"), folder.join("b.txt")).unwrap();
+        std::fs::write(folder.join("c.txt"), b"unsupported").unwrap();
+        let items = app.items.as_ptr();
+        let thumbnails = app.thumbnails.as_ptr();
+        let generation = app.items_generation;
+        app.start_external_rescan(&ctx, folder.clone(), SystemTime::UNIX_EPOCH);
+        let response = app
+            .external_rescan_pending
+            .as_ref()
+            .unwrap()
+            .rx
+            .recv_timeout(Duration::from_secs(20))
+            .unwrap();
+        let Some(ExternalRescanResult::Equal(_, _, _, _, omitted)) = &response else {
+            panic!("unsupported-only changes must keep visible rows equal");
+        };
+        assert!(
+            !omitted.sorted,
+            "worker materialization must not pay for display sorting"
+        );
+        omitted.assert_consistent();
+        let (tx, rx) = mpsc::channel();
+        tx.send(response).unwrap();
+        app.external_rescan_pending.as_mut().unwrap().rx = rx;
+        app.poll_external_rescan(&ctx);
+        assert_eq!(app.items.as_ptr(), items);
+        assert_eq!(app.thumbnails.as_ptr(), thumbnails);
+        assert_eq!(app.items_generation, generation);
+        let owner = &mut app.normal_folder_omitted_entries.as_mut().unwrap().omitted;
+        owner.assert_consistent();
+        assert_eq!(owner.counts.unsupported, 2);
+        let mut names = owner
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, ["b.txt", "c.txt"]);
+        assert_eq!(owner.sorted, open);
+        if open {
+            assert!(
+                !owner.sort_for_display(),
+                "adoption sorted the shown owner exactly once"
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn section1375_omitted_equal_non_main_context_never_replaces_main_owner() {
+    use book_append_refresh::FolderRefreshCause;
+    use folder_scan::{OmittedFolderEntries, OmittedReason};
+    let (mut app, folder, ctx) = fixture(&["page.jpg", "a.txt"]);
+    let original = app.normal_folder_omitted_entries.clone();
+    let rows = app.folder_observation.as_ref().unwrap().rows.clone();
+    let sibling = app.build_window_context_for_test(91724, |sibling| {
+        // Test actual context ownership independently of the detached scope flag.
+        sibling.navigation_scope = ViewerNavigationScope::Main;
+        sibling.current_folder = Some(folder.clone());
+        sibling
+            .top_level_grid_view
+            .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
+        sibling.items = vec![GridItem::Image(folder.join("page.jpg"))];
+        sibling.image_metas = vec![None];
+        sibling.thumbnails = vec![ThumbnailState::Pending];
+    });
+    app.with_viewer_context(sibling, |mounted| {
+        let mut omitted = OmittedFolderEntries::default();
+        omitted.record(OmittedReason::Unsupported, "sibling.txt".into());
+        let (tx, rx) = mpsc::channel();
+        tx.send(Some(ExternalRescanResult::Equal(
+            folder_scan::FolderScanSignature::for_test(1724),
+            rows,
+            FolderRefreshCause::Operation,
+            SystemTime::UNIX_EPOCH,
+            omitted,
+        )))
+        .unwrap();
+        mounted.external_rescan_pending = Some(ExternalRescanPending {
+            proof: None,
+            cause: FolderRefreshCause::Operation,
+            owner_context_id: mounted.edit_request_owner_context(),
+            folder: folder.clone(),
+            mtime: SystemTime::UNIX_EPOCH,
+            items_generation: mounted.items_generation,
+            scan_options: mounted.current_external_scan_options(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+            restart_requested: false,
+        });
+        mounted.poll_external_rescan(&ctx);
+        assert_eq!(
+            mounted.current_folder_signature,
+            Some(folder_scan::FolderScanSignature::for_test(1724)),
+            "must exercise accepted Equal, not a rejected result"
+        );
+        assert_eq!(mounted.normal_folder_omitted_entries, original);
+    })
+    .unwrap();
+    assert_eq!(app.normal_folder_omitted_entries, original);
+}
+
+#[test]
 fn section1375_actual_delete_no_notify_equal_preserves_rows_and_rating_zeros() {
     let (mut app, folder, ctx) = fixture(&["a.jpg", "b.jpg", "c.jpg", "d.jpg"]);
     app.rating_cache = [(0, 0), (1, 5), (2, 4), (3, 0)].into_iter().collect();
@@ -1200,6 +1322,7 @@ fn section1375_large_equal_poll_and_repeated_delete_overlay_do_not_clone_history
             rows,
             Default::default(),
             SystemTime::UNIX_EPOCH,
+            Default::default(),
         )))
         .unwrap();
         let baseline = app.folder_observation.clone();

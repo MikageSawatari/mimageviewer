@@ -35,12 +35,17 @@ mod first_setup;
 #[doc(hidden)]
 pub use first_setup::draw_first_setup_dialog;
 #[cfg(windows)]
+pub(crate) mod caption_delete;
+#[cfg(windows)]
 pub(crate) mod caption_job;
 mod metadata_cleanup;
 pub(crate) mod metadata_transfer;
 pub mod network_data_dir_notice;
 pub(crate) mod new_folder;
+mod omitted_entries;
 mod open_folder;
+#[doc(hidden)]
+pub use omitted_entries::draw_omitted_entries_snapshot_fixture;
 mod pdf_password;
 mod pdf_worker_notice;
 pub(crate) mod preferences;

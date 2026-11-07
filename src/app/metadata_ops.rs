@@ -247,14 +247,27 @@ pub(super) fn facet_ai_filter_applies(item: &GridItem) -> bool {
 ///
 /// component-boundary も守る (`/books/book-a` と `/books/book-a-extra` を別扱い)。
 pub(super) fn path_in_subtree_ci(current: &std::path::Path, anchor: &std::path::Path) -> bool {
-    let norm = |p: &std::path::Path| p.to_string_lossy().to_lowercase().replace('\\', "/");
+    let norm = |p: &std::path::Path| {
+        let mut key = p.to_string_lossy().to_lowercase().replace('\\', "/");
+        // Ignore trailing separators, retaining absolute / and C:/ roots. In
+        // particular C: (drive-relative) must not become equal to C:/.
+        let root_len = if key.starts_with('/') {
+            1
+        } else if key.as_bytes().get(1) == Some(&b':') && key.as_bytes().get(2) == Some(&b'/') {
+            3
+        } else {
+            0
+        };
+        key.truncate(key.trim_end_matches('/').len().max(root_len));
+        key
+    };
     let cur = norm(current);
     let anc = norm(anchor);
     if cur == anc {
         return true;
     }
     cur.strip_prefix(&anc)
-        .is_some_and(|tail| tail.starts_with('/'))
+        .is_some_and(|tail| anc.ends_with('/') || tail.starts_with('/'))
 }
 
 /// パスからファイル名のステム部分を小文字で取得するヘルパー。
@@ -278,7 +291,7 @@ pub(super) fn is_ai_metadata_path(path: &std::path::Path) -> bool {
 /// フルスクリーン画像のメタデータ (AI プロンプト / EXIF / XMP) を読み込むワーカー本体。
 /// ZipImage は ZIP エントリを 1 回だけ開いて 3 パーサー間で bytes を共有する。
 /// それ以外 (Image / Video) はファイルを直接パーサーに渡す。パーサー側で
-/// 必要に応じて full-file read が行われる (XMP の JPEG/PNG は全体読み)。
+/// 必要に応じて I/O を行う。XMP の JPEG/PNG/WebP は見出し・payload の部分読み。
 pub(super) fn run_metadata_load(
     key: String,
     item: GridItem,
@@ -322,7 +335,7 @@ pub(super) fn run_metadata_load(
                 return None;
             }
             // xtw (X/Twitter) と GPano は同じ XMP packet を参照するので 1 回読み +
-            // 1 回 extract_xmp_packet にまとめる (Codex P2 第 19 ラウンド: 旧コードは
+            // 1 回のパケット抽出にまとめる (Codex P2 第 19 ラウンド: 旧コードは
             // 2 回 fs::read + 2 回 extract を実行していた)。
             let bundle = match verified_bytes.as_ref() {
                 Some(bytes) => crate::xmp_reader::read_xmp_bundle_from_bytes(bytes),
@@ -2773,6 +2786,16 @@ mod tests {
             metadata_search_captions(&items, None, &absent, &AtomicBool::new(false)).is_empty()
         );
         assert!(!absent.parent().unwrap().exists());
+        // Ctrl+F reads the current DB on every request; deleting a saved caption
+        // must remove its hit without any additional search invalidation path.
+        let image_key = crate::ai_caption_db::CaptionDb::normalize_path(
+            items[0].file_operation_path().unwrap(),
+        );
+        let db = crate::ai_caption_db::CaptionDb::open_existing_for_write(&db_path).unwrap();
+        assert_eq!(db.delete_keys(&[image_key]).unwrap(), 1);
+        let remaining = run("sunflower", caption_only(), None);
+        assert!(!remaining.contains(&0));
+        assert_eq!(remaining, (1..6).collect());
     }
 
     #[test]

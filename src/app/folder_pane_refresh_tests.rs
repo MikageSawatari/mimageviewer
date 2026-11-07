@@ -142,10 +142,17 @@ fn navigation_tree_fixture() -> (AppTestEnvForTest, egui::Context, u64, PathBuf,
     for path in [&a, &b, &c] {
         std::fs::create_dir_all(path).unwrap();
     }
-    app.folder_pane.test_scan_subtree(root);
+    app.folder_pane.test_scan_subtree(root.clone());
     app.load_folder(a.clone());
     settle(&mut app, &ctx);
     app.set_folder_tree_pane_visible(true);
+    // Navigation arbitration needs only this subtree. Host TEMP ancestors can
+    // scroll the 800x360 setup and leave a fading scrollbar over B's clipped
+    // label when navigation_tree_frame switches to 1600x600. Fix the tree's
+    // scope instead of waiting for unrelated scroll/layout state to settle.
+    app.folder_pane = FolderPaneState::test_tree(&root, vec![a.clone(), b.clone(), c.clone()]);
+    app.folder_pane.test_scan_subtree(root);
+    app.folder_pane.set_cursor(a.clone());
     let mut frame = 0;
     assert_tree_location(&mut app, &ctx, &mut frame, &a);
     app.folder_pane.set_cursor(b.clone());

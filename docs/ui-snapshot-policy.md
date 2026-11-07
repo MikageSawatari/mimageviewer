@@ -9,6 +9,23 @@
 純描画fixtureで、App・worker・製品アプリは起動しない。UPDATEなしのdepth関連6/6成功、
 既存535枚のSHA-256変更0。実行ログと段C全体の検証は[3D計画 §10](depth-parallax-plan.md#10-実装の段階-codex-への委任単位)に集約する。
 
+§1.730 は共通 modal の Confirm を純粋描画する `caption_delete_confirmation_snapshot` で
+`caption_delete_confirmation_dark.png` 1枚を保持する。App・DB・worker は fixture に含めない。
+Counting / Deleting の可視性・全 phase の modal、集計取消後の遅着結果、Enter の非確定、Escape と IME、
+1093×614 の Confirm のボタン・×は別の headless 回帰で検査する。
+設定 catalog の PNG は `preferences_context_menu_layout{,_open_with}.png` の2枚。実アプリ操作の証拠とは分ける。
+
+§1.727の加工内容選択は、製品と共通のWindow描画関数を使うlibの
+`effect_picker_default_dark_snapshot`で、既定サイズ860×560の窓（PNGは1000×660）の
+`local_adjust_effect_picker_default_dark.png`を1枚保持する。製品の暗色テーマ・
+スクロールバー設定・既定フォントを適用し、App・保存先・worker・製品ウィンドウを
+構築しない。既存PNGは更新しない。非整数DPI 1.25、製品UI倍率200%、Meiryoの
+各条件はPNGを増やさず、全表示名の幅・30pt高・実列数・24passの窓寸法不変と
+長名の実paint/clipをheadless回帰で検査する。Meiryoは選択faceの登録と既定との
+実字幅差も必須にし、フォールバックによる条件の空振りを許さない。
+追加PNGは95,352 bytes。見出し・検索行・長い効果名・列配置・待機中のスクロールバーを
+生成後に目視確認した。製品起動・実機確認の証拠とは分ける。
+
 §1.704 の場所メニューは、本体共通のメニューボタン／既知フォルダ行rendererを固定pathの
 fixtureから描く `folder_location_menu_dark`（260×230、10,055 bytes）を追加する。
 デスクトップ・ピクチャ・ダウンロード・ビデオ・ミュージックの順と文字を目視確認した。

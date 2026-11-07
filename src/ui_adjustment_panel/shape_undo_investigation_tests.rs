@@ -425,14 +425,354 @@ fn shape_undo_investigation_polygon_is_bitmap_and_undo_redo_all_canvases() {
 enum Focus {
     Button,
     Slider,
+    Checkbox,
+}
+
+fn draw_history_focus(root: &mut egui::Ui, focus: Focus, value: &mut f32) -> egui::Response {
+    egui::CentralPanel::default()
+        .show(root, |ui| match focus {
+            Focus::Button => ui.button("shape tool"),
+            Focus::Slider => ui.add(egui::Slider::new(value, 0.0..=1.0).show_value(false)),
+            Focus::Checkbox => ui.checkbox(&mut false, "layer enabled"),
+        })
+        .inner
+}
+
+fn history_key_input(key: egui::Key, modifiers: egui::Modifiers) -> egui::RawInput {
+    egui::RawInput {
+        focused: true,
+        events: vec![
+            egui::Event::ModifiersChanged(modifiers),
+            key_event(key, modifiers, true),
+            key_event(key, modifiers, false),
+        ],
+        ..Default::default()
+    }
 }
 
 #[test]
-fn shape_undo_investigation_focused_widgets_block_local_undo_with_history_intact() {
-    for focus in [Focus::Button, Focus::Slider] {
+fn shape_undo_focused_widgets_allow_undo_redo_all_canvases_and_keep_focus() {
+    let _input = crate::key_input::lock_test_input();
+    for canvas in [Canvas::Local, Canvas::Conceal, Canvas::Erase] {
+        for focus in [Focus::Button, Focus::Slider, Focus::Checkbox] {
+            let ctx = egui::Context::default();
+            let (mut app, transform) = setup(&ctx);
+            prepare_canvas(&mut app, canvas, LocalAdjustMaskTool::HorizLine);
+            drag(
+                &mut app,
+                &ctx,
+                &transform,
+                canvas,
+                [0.3, 0.3],
+                [0.7, 0.7],
+                1.0,
+            );
+            let created = shapes(&app, canvas);
+            assert_eq!(created.len(), 1);
+            let mut value = 0.5;
+            let mut focused = egui::Id::NULL;
+            ctx.run_ui(Default::default(), |root| {
+                let response = draw_history_focus(root, focus, &mut value);
+                focused = response.id;
+                response.request_focus();
+            })
+            .drop_without_applying_deltas();
+            for (key, modifiers, count) in [
+                (egui::Key::Z, egui::Modifiers::CTRL, 0),
+                (egui::Key::Y, egui::Modifiers::CTRL, 1),
+                (egui::Key::Z, egui::Modifiers::CTRL, 0),
+                (
+                    egui::Key::Z,
+                    egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                    1,
+                ),
+            ] {
+                ctx.run_ui(history_key_input(key, modifiers), |root| {
+                    let ctx = &root.ctx().clone();
+                    assert_eq!(ctx.memory(|m| m.focused()), Some(focused));
+                    assert!(!ctx.text_edit_focused(), "{focus:?}: non-text widget");
+                    assert!(matches!(
+                        app.keyboard_owner_for_pass(ctx),
+                        crate::keyboard_input::KeyboardOwner::FocusedUi { .. }
+                    ));
+                    app.handle_fs_key_input(ctx, 0, false);
+                    assert!(!ctx.input(|i| i.key_pressed(key)), "{canvas:?} {focus:?}");
+                    assert_eq!(ctx.memory(|m| m.focused()), Some(focused));
+                    draw_history_focus(root, focus, &mut value);
+                })
+                .drop_without_applying_deltas();
+                assert_eq!(undo_count(&app, canvas), count, "{canvas:?} {focus:?}");
+                assert_eq!(
+                    shapes(&app, canvas),
+                    if count == 0 { vec![] } else { created.clone() }
+                );
+                assert_eq!(ctx.memory(|m| m.focused()), Some(focused));
+            }
+        }
+    }
+}
+
+#[test]
+fn shape_undo_text_ime_popup_modal_owners_keep_history_and_keys() {
+    let _input = crate::key_input::lock_test_input();
+    for canvas in [Canvas::Local, Canvas::Conceal, Canvas::Erase] {
+        for blocker in [
+            "text",
+            "numeric",
+            "ime",
+            "combo",
+            "menu",
+            "pass-popup",
+            "modal",
+        ] {
+            for (key, modifiers) in [
+                (egui::Key::Z, egui::Modifiers::CTRL),
+                (egui::Key::Y, egui::Modifiers::CTRL),
+                (egui::Key::Z, egui::Modifiers::CTRL | egui::Modifiers::SHIFT),
+            ] {
+                let ctx = egui::Context::default();
+                crate::ime_focus::install_ime_input_policy(&ctx);
+                let (mut app, transform) = setup(&ctx);
+                prepare_canvas(&mut app, canvas, LocalAdjustMaskTool::HorizLine);
+                drag(
+                    &mut app,
+                    &ctx,
+                    &transform,
+                    canvas,
+                    [0.3, 0.3],
+                    [0.7, 0.7],
+                    1.0,
+                );
+                let created = shapes(&app, canvas);
+                let mut text = String::from("editing");
+                let mut value = 0.5;
+                let mut focus_request = true;
+                let popup_id = std::cell::Cell::new(egui::Id::NULL);
+                let mut draw = |root: &mut egui::Ui| {
+                    egui::CentralPanel::default().show(root, |ui| match blocker {
+                        "text" => {
+                            crate::ime_focus::add_singleline(
+                                ui,
+                                &mut text,
+                                Some(&mut focus_request),
+                                |edit| edit,
+                            );
+                        }
+                        "numeric" => {
+                            let response = ui.add(egui::DragValue::new(&mut value));
+                            if focus_request {
+                                response.request_focus();
+                                focus_request = false;
+                            }
+                        }
+                        "combo" => {
+                            let response = egui::ComboBox::from_id_salt("history-combo")
+                                .selected_text("Choice")
+                                .show_ui(ui, |ui| {
+                                    ui.label("Option");
+                                });
+                            popup_id.set(response.response.id.with("popup"));
+                            response.response.request_focus();
+                        }
+                        "menu" => {
+                            let response = ui.button("Edit menu");
+                            response.request_focus();
+                            popup_id.set(egui::Popup::default_response_id(&response));
+                            egui::Popup::menu(&response).show(|ui| {
+                                let _ = ui.button("Menu item");
+                            });
+                        }
+                        "pass-popup" => {
+                            ui.button("Popup anchor").request_focus();
+                        }
+                        _ => {
+                            ui.label("Canvas");
+                        }
+                    });
+                };
+                ctx.run_ui(Default::default(), &mut draw)
+                    .drop_without_applying_deltas();
+                if blocker == "numeric" {
+                    ctx.run_ui(Default::default(), &mut draw)
+                        .drop_without_applying_deltas();
+                    assert!(ctx.text_edit_focused());
+                }
+                if matches!(blocker, "combo" | "menu") {
+                    egui::Popup::open_id(&ctx, popup_id.get());
+                    ctx.run_ui(Default::default(), &mut draw)
+                        .drop_without_applying_deltas();
+                    assert!(egui::Popup::is_any_open(&ctx));
+                }
+                if blocker == "modal" {
+                    app.show_open_folder_dialog = true;
+                }
+                let mut raw = history_key_input(key, modifiers);
+                if blocker == "ime" {
+                    raw.events.insert(
+                        0,
+                        egui::Event::Ime(egui::ImeEvent::Preedit {
+                            text: "変換中".into(),
+                            active_range_chars: None,
+                        }),
+                    );
+                }
+                ctx.run_ui(raw, |root| {
+                    let ctx = &root.ctx().clone();
+                    app.update_ime_state(ctx);
+                    if matches!(blocker, "combo" | "menu") {
+                        // Production order: dispatch BEFORE drawing this pass.
+                        // Memory still owns the already-open egui popup.
+                        assert!(egui::Popup::is_any_open(ctx));
+                        assert!(!ctx.any_popup_open(), "popup has not been drawn this pass");
+                    }
+                    // Exercise the pass-only popup flag, with no Memory open entry.
+                    if blocker == "pass-popup" {
+                        egui::CentralPanel::default().show(root, |ui| {
+                            let response = ui.button("Popup anchor");
+                            egui::Popup::from_response(&response).show(|ui| {
+                                ui.label("Popup");
+                            });
+                        });
+                        assert!(!egui::Popup::is_any_open(ctx));
+                        assert!(ctx.any_popup_open());
+                    }
+                    let owner = app.keyboard_owner_for_pass(ctx);
+                    match blocker {
+                        "text" | "ime" => assert!(
+                            matches!(
+                                owner,
+                                crate::keyboard_input::KeyboardOwner::TextInput { .. }
+                            ),
+                            "{blocker}: {owner:?}"
+                        ),
+                        "modal" => assert_eq!(owner, crate::keyboard_input::KeyboardOwner::Modal),
+                        "numeric" => {
+                            assert!(matches!(
+                                owner,
+                                crate::keyboard_input::KeyboardOwner::FocusedUi { .. }
+                            ));
+                            assert!(ctx.text_edit_focused());
+                        }
+                        _ => assert!(crate::keyboard_input::popup_owns_keyboard(ctx)),
+                    }
+                    app.handle_fs_key_input(ctx, 0, false);
+                    assert!(
+                        ctx.input(|i| i.key_pressed(key)),
+                        "{canvas:?} {blocker} {key:?}"
+                    );
+                    // Actual modals are the caller's outer gate, just as in
+                    // the legacy keymap. Do not bypass that gate in this test.
+                    if blocker != "modal" {
+                        app.handle_meta_undo_keys(ctx);
+                        assert!(ctx.input(|i| i.key_pressed(key)), "meta: {blocker}");
+                    }
+                    assert_eq!(undo_count(&app, canvas), 1, "{canvas:?} {blocker}");
+                    assert_eq!(shapes(&app, canvas), created);
+                    // The polygon vertex-back route must not bypass the same
+                    // editor / popup ownership while a polygon is unfinished.
+                    app.local_adjust_mask_tool = LocalAdjustMaskTool::Polygon;
+                    app.local_adjust_mask_lasso_points = vec![[0.2, 0.2], [0.6, 0.6]];
+                    app.erase_tool = crate::app::EraseTool::Polygon;
+                    app.erase_lasso_points = vec![(0.2, 0.2), (0.6, 0.6)];
+                    app.conceal_tool = crate::conceal::ConcealTool::Polygon;
+                    app.conceal_lasso_points = vec![(0.2, 0.2), (0.6, 0.6)];
+                    app.handle_fs_key_input(ctx, 0, false);
+                    assert_eq!(app.local_adjust_mask_lasso_points.len(), 2);
+                    assert_eq!(app.erase_lasso_points.len(), 2);
+                    assert_eq!(app.conceal_lasso_points.len(), 2);
+                    assert!(
+                        ctx.input(|i| i.key_pressed(key)),
+                        "polygon: {canvas:?} {blocker}"
+                    );
+                    // Text annotations have a separate history consumer too.
+                    app.local_adjust_mode = false;
+                    app.erase_mode = false;
+                    app.conceal_mode = false;
+                    app.text_mode = true;
+                    let page = app.page_path_key(0).unwrap();
+                    let objects = vec![comic_core::AnnotationObject::new_text(
+                        1,
+                        (8.0, 8.0),
+                        Default::default(),
+                    )];
+                    app.comic_undo_key = Some(page.clone());
+                    app.comic_undo_baseline = objects.clone();
+                    app.comic_docs.insert(page.clone(), objects.clone());
+                    app.comic_undo_stack = vec![Vec::new()];
+                    app.comic_redo_stack = vec![Vec::new()];
+                    app.handle_fs_key_input(ctx, 0, false);
+                    assert_eq!(app.comic_docs[&page], objects, "text: {blocker}");
+                    assert_eq!(app.comic_undo_stack.len(), 1, "text: {blocker}");
+                    assert_eq!(app.comic_redo_stack.len(), 1, "text: {blocker}");
+                    assert!(ctx.input(|i| i.key_pressed(key)), "text: {blocker}");
+                    if blocker != "pass-popup" {
+                        draw(root);
+                    }
+                })
+                .drop_without_applying_deltas();
+            }
+        }
+    }
+}
+#[test]
+fn shape_undo_text_annotation_history_allows_focused_widgets_and_keeps_focus() {
+    let _input = crate::key_input::lock_test_input();
+    for focus in [Focus::Button, Focus::Slider, Focus::Checkbox] {
+        let ctx = egui::Context::default();
+        let (mut app, _) = setup(&ctx);
+        app.local_adjust_mode = false;
+        app.text_mode = true;
+        let page = app.page_path_key(0).unwrap();
+        let objects = vec![comic_core::AnnotationObject::new_text(
+            1,
+            (8.0, 8.0),
+            Default::default(),
+        )];
+        app.comic_undo_key = Some(page.clone());
+        app.comic_undo_baseline = Vec::new();
+        app.comic_docs.insert(page.clone(), objects.clone());
+        let mut value = 0.5;
+        let mut focused = egui::Id::NULL;
+        ctx.run_ui(Default::default(), |root| {
+            let response = draw_history_focus(root, focus, &mut value);
+            focused = response.id;
+            response.request_focus();
+        })
+        .drop_without_applying_deltas();
+        for (key, modifiers, count) in [
+            (egui::Key::Z, egui::Modifiers::CTRL, 0),
+            (egui::Key::Y, egui::Modifiers::CTRL, 1),
+            (egui::Key::Z, egui::Modifiers::CTRL, 0),
+            (
+                egui::Key::Z,
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                1,
+            ),
+        ] {
+            ctx.run_ui(history_key_input(key, modifiers), |root| {
+                let ctx = &root.ctx().clone();
+                assert!(!ctx.text_edit_focused());
+                app.handle_fs_key_input(ctx, 0, false);
+                assert!(!ctx.input(|i| i.key_pressed(key)), "{focus:?}");
+                assert_eq!(ctx.memory(|m| m.focused()), Some(focused));
+                draw_history_focus(root, focus, &mut value);
+            })
+            .drop_without_applying_deltas();
+            assert_eq!(app.comic_docs[&page].len(), count, "{focus:?}");
+            assert_eq!(app.comic_undo_stack.len(), count, "{focus:?}");
+            assert_eq!(ctx.memory(|m| m.focused()), Some(focused));
+        }
+        assert_eq!(app.comic_docs[&page], objects);
+        assert_eq!(app.meta_undo.undo_len(), 0);
+    }
+}
+
+#[test]
+fn shape_undo_main_meta_history_and_polygon_vertices_allow_focused_button() {
+    let _input = crate::key_input::lock_test_input();
+    for polygon in [false, true] {
         let ctx = egui::Context::default();
         let (mut app, transform) = setup(&ctx);
-        prepare_canvas(&mut app, Canvas::Local, LocalAdjustMaskTool::HorizLine);
         drag(
             &mut app,
             &ctx,
@@ -442,84 +782,189 @@ fn shape_undo_investigation_focused_widgets_block_local_undo_with_history_intact
             [0.7, 0.7],
             1.0,
         );
-        assert_eq!(app.local_adjust_selected_shape, Some(0));
-        let created = shapes(&app, Canvas::Local);
+        assert_eq!(app.meta_undo.undo_len(), 1);
+        if polygon {
+            app.local_adjust_mask_tool = LocalAdjustMaskTool::Polygon;
+            app.local_adjust_mask_lasso_points = vec![[0.2, 0.2], [0.6, 0.6]];
+        } else {
+            app.fullscreen_idx = None;
+            app.local_adjust_mode = false;
+        }
         let mut value = 0.5;
-        let draw = |root: &mut egui::Ui, value: &mut f32| {
-            egui::CentralPanel::default().show(root, |ui| {
-                let response = match focus {
-                    Focus::Button => ui.button("shape tool"),
-                    Focus::Slider => ui.add(egui::Slider::new(value, 0.0..=1.0)),
-                };
-                response.request_focus();
-            });
-        };
-        let _ = ctx
-            .run_ui(
-                egui::RawInput {
-                    focused: true,
-                    ..Default::default()
-                },
-                |root| {
-                    draw(root, &mut value);
-                },
-            )
-            .drop_without_applying_deltas();
-        let _ = ctx
-            .run_ui(
-                egui::RawInput {
-                    focused: true,
-                    events: vec![
-                        egui::Event::ModifiersChanged(egui::Modifiers::CTRL),
-                        key_event(egui::Key::Z, egui::Modifiers::CTRL, true),
-                        key_event(egui::Key::Z, egui::Modifiers::CTRL, false),
-                    ],
-                    ..Default::default()
-                },
-                |root| {
-                    let ctx = &root.ctx().clone();
-                    assert!(ctx.egui_wants_keyboard_input(), "{focus:?}");
-                    assert!(matches!(
-                        app.keyboard_owner_for_pass(ctx),
-                        crate::keyboard_input::KeyboardOwner::FocusedUi { .. }
-                    ));
+        ctx.run_ui(Default::default(), |root| {
+            draw_history_focus(root, Focus::Button, &mut value).request_focus();
+        })
+        .drop_without_applying_deltas();
+        ctx.run_ui(
+            history_key_input(egui::Key::Z, egui::Modifiers::CTRL),
+            |root| {
+                let ctx = &root.ctx().clone();
+                if polygon {
                     app.handle_fs_key_input(ctx, 0, false);
-                    assert!(ctx.input(|i| i.events.iter().any(|event| matches!(
-                        event,
-                        egui::Event::Key {
-                            key: egui::Key::Z,
-                            pressed: true,
-                            ..
-                        }
-                    ))));
-                    draw(root, &mut value);
-                },
-            )
-            .drop_without_applying_deltas();
-        assert_eq!(
-            shapes(&app, Canvas::Local),
-            created,
-            "{focus:?}: blocked undo"
-        );
-        assert_eq!(
-            undo_count(&app, Canvas::Local),
-            1,
-            "{focus:?}: history retained"
-        );
-        // Releasing UI focus enables the identical key path; history was never missing.
-        ctx.memory_mut(|memory| {
-            if let Some(id) = memory.focused() {
-                memory.surrender_focus(id);
-            }
-        });
-        key(&mut app, &ctx, egui::Key::Z, egui::Modifiers::CTRL);
-        assert!(
-            shapes(&app, Canvas::Local).is_empty(),
-            "{focus:?}: undo after focus release"
-        );
-        key(&mut app, &ctx, egui::Key::Y, egui::Modifiers::CTRL);
-        assert_eq!(shapes(&app, Canvas::Local), created, "{focus:?}: redo");
+                    assert_eq!(app.local_adjust_mask_lasso_points, vec![[0.2, 0.2]]);
+                    assert_eq!(app.meta_undo.undo_len(), 1);
+                } else {
+                    app.handle_meta_undo_keys(ctx);
+                    assert_eq!(app.meta_undo.undo_len(), 0);
+                    assert!(shapes(&app, Canvas::Local).is_empty());
+                }
+                assert!(!ctx.input(|i| i.key_pressed(egui::Key::Z)));
+                draw_history_focus(root, Focus::Button, &mut value);
+            },
+        )
+        .drop_without_applying_deltas();
     }
+}
+
+#[test]
+#[cfg(windows)]
+fn shape_undo_polygon_native_press_and_layout_retry_are_one_vertex_action() {
+    let _input = crate::key_input::lock_test_input();
+    for native_only in [false, true] {
+        for point_count in [1, 2] {
+            let ctx = egui::Context::default();
+            let (mut app, transform) = setup(&ctx);
+            prepare_canvas(&mut app, Canvas::Local, LocalAdjustMaskTool::HorizLine);
+            drag(
+                &mut app,
+                &ctx,
+                &transform,
+                Canvas::Local,
+                [0.3, 0.3],
+                [0.7, 0.7],
+                1.0,
+            );
+            let created = shapes(&app, Canvas::Local);
+            app.local_adjust_mask_tool = LocalAdjustMaskTool::Polygon;
+            app.local_adjust_mask_lasso_points = vec![[0.2, 0.2]; point_count];
+            let mut value = 0.5;
+            ctx.run_ui(Default::default(), |root| {
+                draw_history_focus(root, Focus::Button, &mut value).request_focus();
+            })
+            .drop_without_applying_deltas();
+            let sibling = egui::ViewportId::from_hash_of("polygon-sibling");
+            let edge = |viewport| crate::key_input::KeyEdge {
+                operation_id: crate::key_input::KeyOperationId::unassigned(),
+                source_hwnd: 1,
+                source_viewport: viewport,
+                virtual_key: 0x5A,
+                scan_code: 0,
+                extended: false,
+                pressed: true,
+                repeat: false,
+                ctrl: true,
+                shift: false,
+                alt: false,
+            };
+            crate::key_input::set_test_routed_frame(vec![
+                edge(egui::ViewportId::ROOT),
+                edge(sibling),
+            ]);
+            let mut raw = history_key_input(egui::Key::Z, egui::Modifiers::CTRL);
+            if native_only {
+                raw.events
+                    .retain(|event| !matches!(event, egui::Event::Key { .. }));
+            }
+            let mut passes = 0;
+            ctx.run_ui(raw, |root| {
+                let ctx = &root.ctx().clone();
+                passes += 1;
+                app.handle_fs_key_input(ctx, 0, false);
+                assert_eq!(app.local_adjust_mask_lasso_points.len(), point_count - 1);
+                assert_eq!(app.meta_undo.undo_len(), 1);
+                assert_eq!(shapes(&app, Canvas::Local), created);
+                assert!(!ctx.input(|i| i.key_pressed(egui::Key::Z)));
+                assert!(!crate::key_input::pressed_key_down(
+                    ctx.viewport_id(),
+                    |e| e.virtual_key == 0x5A
+                ));
+                assert!(crate::key_input::pressed_key_down(sibling, |e| e
+                    .virtual_key
+                    == 0x5A));
+                draw_history_focus(root, Focus::Button, &mut value);
+                if ctx.current_pass_index() == 0 {
+                    ctx.request_discard("polygon history key ownership retry");
+                }
+            })
+            .drop_without_applying_deltas();
+            assert!(passes >= 2);
+            crate::key_input::clear_test_frame();
+        }
+    }
+}
+
+#[test]
+fn shape_undo_numeric_text_input_keeps_history_keys_despite_focused_ui_owner() {
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    crate::ime_focus::install_ime_input_policy(&ctx);
+    let (mut app, transform) = setup(&ctx);
+    prepare_canvas(&mut app, Canvas::Local, LocalAdjustMaskTool::HorizLine);
+    drag(
+        &mut app,
+        &ctx,
+        &transform,
+        Canvas::Local,
+        [0.3, 0.3],
+        [0.7, 0.7],
+        1.0,
+    );
+    let created = shapes(&app, Canvas::Local);
+    let mut value = 0.5;
+    let mut field_id = egui::Id::NULL;
+    ctx.run_ui(Default::default(), |root| {
+        egui::CentralPanel::default().show(root, |ui| {
+            let response = ui.add(egui::DragValue::new(&mut value));
+            field_id = response.id;
+            response.request_focus();
+        });
+    })
+    .drop_without_applying_deltas();
+    // DragValue switches from button to its internal TextEdit on focus.
+    ctx.run_ui(Default::default(), |root| {
+        egui::CentralPanel::default().show(root, |ui| {
+            let response = ui.add(egui::DragValue::new(&mut value));
+            assert_eq!(response.id, field_id);
+            assert!(response.has_focus());
+            assert!(egui::TextEdit::load_state(ui.ctx(), field_id).is_some());
+        });
+    })
+    .drop_without_applying_deltas();
+    ctx.run_ui(
+        egui::RawInput {
+            focused: true,
+            events: vec![
+                egui::Event::ModifiersChanged(egui::Modifiers::CTRL),
+                key_event(egui::Key::Z, egui::Modifiers::CTRL, true),
+                key_event(egui::Key::Z, egui::Modifiers::CTRL, false),
+            ],
+            ..Default::default()
+        },
+        |root| {
+            let ctx = &root.ctx().clone();
+            assert_eq!(ctx.memory(|m| m.focused()), Some(field_id));
+            assert_eq!(crate::ime_focus::focused_text_input(ctx), None);
+            // Owner classification stays unchanged; the history permit protects
+            // the internal TextEdit before the panel draws it.
+            assert!(ctx.text_edit_focused());
+            assert!(app.edit_history_key_permit(ctx).is_none());
+            assert_eq!(
+                app.keyboard_owner_for_pass(ctx),
+                crate::keyboard_input::KeyboardOwner::FocusedUi {
+                    viewport: ctx.viewport_id(),
+                    widget_id: field_id,
+                }
+            );
+            app.handle_fs_key_input(ctx, 0, false);
+            assert_eq!(undo_count(&app, Canvas::Local), 1);
+            assert_eq!(shapes(&app, Canvas::Local), created);
+            assert!(ctx.input(|i| i.key_pressed(egui::Key::Z)));
+            egui::CentralPanel::default().show(root, |ui| {
+                ui.add(egui::DragValue::new(&mut value));
+            });
+        },
+    )
+    .drop_without_applying_deltas();
 }
 
 #[test]

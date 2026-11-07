@@ -343,20 +343,14 @@ pub(crate) fn spawn() -> TagPrewarmPending {
     }
 }
 
-/// ファイルを 1 回だけ read して、XMP パケットから xmp:Rating を抜き出す。
+/// 共通の部分読み取りで XMP パケットから xmp:Rating を抜き出す（拡張子ゲートなし）。
 fn read_xmp_rating(path: &std::path::Path) -> Option<u8> {
     if crate::xmp_writer::is_video_for_sidecar(path) {
         return None;
     }
-    let Ok(bytes) = std::fs::read(path) else {
-        return None;
-    };
-    if !crate::xmp_reader::has_xmp_capable_magic(&bytes) {
-        return None;
-    }
-    let Some(xmp) = crate::xmp_reader::extract_xmp_packet(&bytes) else {
-        return None;
-    };
+    let xmp = crate::xmp_reader::read_xmp_packet_from_path(path)
+        .ok()?
+        .packet?;
     crate::xmp_reader::parse_xmp_rating(&xmp)
 }
 
@@ -402,6 +396,39 @@ fn run_worker(
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn rating_partial_read_keeps_magic_detection_without_extension_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let xml = br#"<x:xmpmeta xmlns:x="adobe:ns:meta/" xmlns:xmp="http://ns.adobe.com/xap/1.0/"><xmp:Rating>4</xmp:Rating></x:xmpmeta>"#;
+        let mut payload = b"http://ns.adobe.com/xap/1.0/\0".to_vec();
+        payload.extend_from_slice(xml);
+        let mut jpeg = vec![0xff, 0xd8, 0xff, 0xe1];
+        jpeg.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        jpeg.extend_from_slice(&payload);
+        for name in ["rating.bin", "rating", "rating.JPG"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, &jpeg).unwrap();
+            assert_eq!(read_xmp_rating(&path), Some(4), "{name}");
+        }
+        let video = dir.path().join("rating.mp4");
+        std::fs::write(&video, &jpeg).unwrap();
+        assert_eq!(read_xmp_rating(&video), None);
+    }
+
+    #[test]
+    fn rating_partial_read_keeps_tiff_fallback_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rating.bin");
+        let xml = br#"<x:xmpmeta xmlns:x="adobe:ns:meta/" xmlns:xmp="http://ns.adobe.com/xap/1.0/"><xmp:Rating>3</xmp:Rating></x:xmpmeta>"#;
+        for offset in [128, 700_000] {
+            let mut bytes = vec![0; offset];
+            bytes[..4].copy_from_slice(b"II*\0");
+            bytes.extend_from_slice(xml);
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(read_xmp_rating(&path), (offset == 128).then_some(3));
+        }
+    }
 
     /// 存在しないパスを push しても worker は rating=None で結果を返し、エラーにならないこと。
     #[test]

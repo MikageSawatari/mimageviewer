@@ -544,13 +544,29 @@ Windowsのpublishは捕捉済みHRESULTからWin32 codeを保持し、UIには
 (`open_archive_via_cache` が set、`effective_folder()` =
 `archive_source_override.or(current_folder)`)。
 
-一覧採用時の★フィルタ一時解除の範囲判定は、`install_loading_items_inner` で
+一覧採用時の★フィルタ一時解除（入場・帰還）の共通判定は、`install_loading_items_inner` で
 `current_folder` と `archive_source_override` の組を確定した後、項目の設置・可視列の生成より前に
 1 回行う。同じ backing の再読込では元書庫 alias を保持し、別の一覧では旧 alias を外し、
 StagedArchive / SmartPhysical の採用は行き先の論理 source を反映してから判定する。
 新しい backing と退場した本の alias を組み合わせて判定してはならない（§1.671）。
 本の内部・ページ一覧では同じ anchor の一時解除を保ち、範囲外では解除前の評価条件を使う。
-戻った親自身の★が条件に合う場合は、親を anchor とする新しい一時解除になる。
+帰還・再読込では、戻り先自身の★で新しい一時解除を発動しない（§1.721）。
+採用前 surface と採用済み行 producer が物理位置を所有する場合だけ、その時点の
+`effective_folder()`（`archive_source_override.or(current_folder)`）を出発地点として渡す。
+判定は `rating_filter_departure_is_physical` に集約し、surface の cleanup より前に捕捉する。
+検索結果・履歴・ブックマーク・評価一覧 root・Smart root・サブ展開等の合成一覧では出発地点なしとし、
+synthetic path の文字列だけでなく既存の surface／位置所有を見る。
+Everything 結果 Root は最後の本の backing／alias を保持していても物理位置ではない。
+採用済みの `EverythingPosition::PhysicalChild` は物理位置として扱い、同じ本の再読込や
+その親への帰還では一覧の明示絞り込みを維持する。合成パス自体も引き続き除外する。
+採用後の論理位置が出発地点と同じなら再読込、その祖先なら帰還と判定する。
+判定はこの採用境界で `path_in_subtree_ci` による物理的な位置関係と準備済み ZIP nav を使い、入力経路ごとの
+guard や追加の保存状態は作らない。既存 anchor の subtree 内なら一時解除を維持する。
+同じ場所の ZIP 再採用で anchor が内部 scope にある場合だけ、準備済み `ZipNavState` の
+移譲を根拠に後段の ZIP 範囲判定へ委ねる。フォルダ（名前が .zip でも同じ）・PDF 等では
+範囲外の anchor を復元する。祖先への帰還も範囲外なら復元する。
+子孫・兄弟・無関係な場所への移動と出発地点のない起動時・synthetic 起点は、
+従来どおり移動先の★で発動可否を判定する。明示的な本への入場時の一時解除も維持する。
 保存済み `settings.rating_filter` は変えず、一時解除の所有者も既存の viewer context のまま。
 Everything の結果帰路は既存の明示復元を使い、synthetic surface の論理位置は
 `EverythingPosition` に従う（最後の物理 backing / alias は結果採用後も保持される）。
@@ -558,11 +574,18 @@ Everything の結果帰路は既存の明示復元を使い、synthetic surface 
 操作の組み合わせを増やす変更ではないため、新たな modal も不要。まれな失敗は既定の
 ログ・通知の方針を維持し、未採用・取消・失敗のための回復機構を追加しない。
 
+ZIP の一括採用（F5・変換書庫 backing・Smart 等）は `install_prepared_zip_grid` から
+準備済み nav を引数で移譲し、`install_loading_items_inner` の既存の可視列生成直前に
+`zip_nav` 設置 → `maybe_restore_rating_filter_after_zip_level_change` → 可視列生成を行う。
+F5 で内部階層が消え、`refresh_prefix` が祖先を選んだ場合も、この判定で範囲外の anchor を
+復元する。ここでは新規の一時解除を発動せず、二度目の可視列再構築も追加しない。
 ZIP 内の軽量階層移動は `install_loading_items_inner` を通らない。
 `install_zip_current_level` でも、移動先の `zip_nav` が確定した後、可視列を作る前に
 `maybe_restore_rating_filter_after_zip_level_change` を 1 回呼ぶ（§1.671 追加P2）。
-範囲判定は論理 archive root / 実効 prefix のキーだけを使い、後段のアドレス表示や
-見開き設定の読込には依存しない。解除後に二度目の可視列再構築を追加しない。
+範囲判定は論理 archive root と `nav.current()` の実効 prefix から組む本キーだけを使い、
+後段のアドレス表示や見開き設定の読込には依存しない。root が A/ へ collapse しても、
+範囲キーは `outer.zip/A` のまま。本の★の保存先は root では外側 ZIP を指す従来規則を
+維持し、その保存先キーを範囲判定へ流用しない。解除後に二度目の可視列再構築を追加しない。
 Direct PDF のパスワード待ちは未採用なので、Cancel / Parked でも元の本の一時解除・
 可視列を保持する。既に PDF / 空の shell を採用した Legacy の終端解除は維持する。
 Everything 起点の入れ子階層は、通常mainで履歴sourceを得られず項目の採用が止まる

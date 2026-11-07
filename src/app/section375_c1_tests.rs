@@ -422,6 +422,7 @@ fn section1375_c1_completed_passive_response_keeps_later_operation_through_resta
             _,
             _,
             FolderRefreshCause::External,
+            _,
             _
         ))
     ));
