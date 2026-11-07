@@ -433,6 +433,16 @@ constructor単体・headless測定であり実アプリの最大frameを示さ�
 
 ## 3. GPU テクスチャアップロード
 
+3D 写真（段 B、2026-11-07、実装・独立レビュー中）は元画像全量を CPU へ戻さない。
+表示 source を GPU で blit / mip生成し、504×504と長辺最大1536のガイドだけを
+bounded readbackする。UI は `map_async` と `PollType::Poll` / 非blocking receiverだけを使い、
+待機・decode・推論・ファイルI/Oを加えない。readback完了後の bounded画素コピーと、
+worker結果の小さい `R16Float` uploadだけをUIで行い、深度mapの採用・uploadは1 frame最大1件とする。
+ReadingBackは可視viewportだけ継続repaint、推論完了はworkerが要求元viewportを起こす。
+自動運動は可視中に再描画し、マウス追従は収束後に止める。通常sourceの再準備は既存の
+final/edit/upload ownerへ戻し、3D専用のdecode/upload列を増やさない。
+検証の完了状況は [3D設計 §10](depth-parallax-plan.md#10-実装の段階-codex-への委任単位) を参照。
+
 `ctx.load_texture(name, ColorImage, options)` は UI スレッドで同期実行され、内部で
 wgpu の queue.write_texture が走る。20MP RGBA (78MB) で 26-58ms かかる。
 

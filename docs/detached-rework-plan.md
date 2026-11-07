@@ -1455,6 +1455,36 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-07 3D 写真・段 B の占有表示 owner と presentation commit（実装・独立コードレビュー済み）
+
+設計の正本は [depth-parallax-plan §6・§10・§16](depth-parallax-plan.md)。
+ClaudeCode と独立 Codex review の実装前の構造合意は同書 §16 に記録済み。
+以下は実装範囲と判断理由である。独立コードレビューは ACCEPT、P1/P2 残件なし。
+ClaudeCode の検収・実機確認と、全件 gate の成否は別に扱う。
+
+- BA-7: context 所有の `panorama_state: Option<_>` を
+  `FsExclusiveView::{None, Panorama, Depth}` 一つへ移す。App の投影と `ViewerContextBundle` は
+  同じ owner を swap し、入替えは `set_fs_exclusive_view` が旧要求と GPU slot を退役してから行う。
+  detached 用の追加 bool / pending / presence sentinel は作らない。
+- BA-4: 「メイン」は既存の `ViewerContextId` と `ViewerPresentation::Fullscreen` の事実で判定する。
+  `commit_viewer_presentation` は非対応 presentation の公開前に Depth を終了する共通境界。
+  F12・静止画 window mode・動画・rating からの presentation 切替も同じ commit へ通す。
+  viewport ID・rect・直近操作の推測で main を同定しない。
+  既存の context identity、main ID の採番・移動・promote 規則は変更しない。
+- park では Depth を終了し、fork 先へ要求・LRU・GPU resource を複製しない。
+  panorama の park 時の intent 保持は既存の意味を維持する。兄弟の read-only open / close で
+  所有していない context の generation・queue・cancel・texture を変更しない。
+- BA-1 の HWND 同定、BA-3 の再生成契機、BA-6 の placement 所有・保存・同期には触れない。
+  新しい時間窓・recreate・repaint retry・通常設定の初期化も加えない。
+
+状態と presentation の公開境界を一つにして新しい表示機能を接続する構造変更であり、
+detached の既存症状を条件追加で隠す変更ではない。入力・表示・所有境界の実装レビューは完了し、
+自動検証の件数・全件 gate の失敗・補修後の限定結果は深度計画 §10 に集約する。
+
+2026-11-07 の独立実装レビュー（GPT-6.1 Sol / xhigh）は、上記の enum owner と presentation commit の
+接続を「症状パッチではなく構造的変更」と確認した。ClaudeCode との実装前の合意 (§16) を維持する。
+実装全体の自動 gate・実機検収とは分けた構造上の合意である。
+
 ### 2026-11-06 PDF旧読書位置復元とPCの先頭fallback
 
 利用者提示のOpus設計A/Bに基づく、汎用resume解決境界の修正。

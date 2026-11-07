@@ -253,10 +253,11 @@ CPU の画素 (`ColorImage`) を探さず、**表示中のテクスチャを GPU
 - 自動の動きは時刻だけで決まる関数 `motion_offset(kind, strength, phase)`。
   `phase = (経過時間 / 周期) mod 1`。左右 = (sin, 0)、円 = (cos, 0.6 sin)、8 の字 = (sin, 0.5 sin 2θ)、
   上下 = (0, 0.7 sin)。書き出しは同じ関数に `phase = i / N` を渡す (継ぎ目が出ない)。
-- **マウス追従**: 画像矩形の中心からのポインタ位置を −1〜1 に正規化し、`offset = 強さ × (nx, 0.6 ny)`
+- **マウス追従**: 画像矩形の中心からのポインタ位置を −1〜1 に正規化し、`offset = −強さ × (nx, 0.6 ny)`
   を目標にして時定数 0.15 秒で近づける。ポインタが 3D パネルの上にあるときは目標を動かさない
   (パネルを操作すると絵が揺れるのを防ぐ)。ポインタが窓の外なら中心へ戻す。
-  向き (ポインタ側から覗き込む見え方にするか) は試験実装で決め、テストで固定する。
+  基準の逆引き shader で手前がポインタから離れる向きとする (右 pointer → 手前は左)。
+  段 B の純粋追従・GPU sample 方向のテストで固定し、実機の操作感は別に確認する。
 - 再描画: 自動の動きの間は毎フレーム `request_repaint`。マウス追従は目標に近づき切るまで。
   フルスクリーンの viewport が最小化・非表示のときは要求しない。
   - 3D の自動の動きは常に再描画するので、アイドル時の負荷検査 (`check-idle-health.ps1`) の対象外になる
@@ -685,7 +686,207 @@ repo root から `--offline --test-threads=1`、他の Cargo / テスト実行�
 `tools/depth_model/README.md`、`tools/depth_model/preprocess_probe/{Cargo.toml,Cargo.lock,src/lib.rs}`、
 `tests/fixtures/depth/preprocess.json`、本書。stage / commit は行わない。
 
-§6.5 の分類表は段 B の実装担当がここに追記する。
+### 段 B の実装記録 (2026-11-07、実装・独立コードレビュー済み)
+
+段 A の上に状態・表示・入力を接続する未コミット差分。独立コードレビューは ACCEPT、
+P1/P2 残件なし。ClaudeCode の検収・利用者の実機確認は未実施であり、全件 gate の失敗と
+補修後の限定検査は下記の実行記録で区別する。stage / commit、製品バイナリの起動は行わない。
+
+- `fs_exclusive_view.rs` の `FsExclusiveView::{None, Panorama, Depth}` を App と
+  `ViewerContextBundle` の一つの owner とする。非アクティブな panorama state も同じ enum に残す。
+  生きた状態の入替えは `set_fs_exclusive_view` が旧 owner を退役してから公開する。
+  `app/depth_view.rs` が入口、継続照合、presentation の commit、パネル操作、worker 接続を担う。
+- 型の本体 (`MotionKind`、`DepthParallaxSettings`、`MouseFollow`、`DepthEntryInput` / block、
+  `DepthSourceMaterial` / wait、`DepthSourcePhase`、`DepthLru`、`DepthViewState`) は
+  `depth_parallax.rs` に置く。設定本体を `settings.rs` に分散させず、`Settings.depth_parallax` が参照する。
+  全体設定として保存し、欠落時の既定・未知の動き・非有限値・範囲外値は既定または範囲内へ正規化する。
+  設定の転送は既存の「環境設定にある項目だけ」方針に従い、3D パネルで操作するこの値を対象外とする。
+  import に同名値があっても転送先の値を維持する。全体保存と転送の対象範囲を混同しない。
+- 表示の正本を複製せず、`resolve_fs_processed_payload_and_depth` が通常 selector の選択した
+  payload と readiness を一緒に返す。元画像ホールド、通過表示、注釈ベイク、不完全な final、
+  thumbnail fallback、元 source のない Native は `NotYet`。RAW preview は既存契約のまま扱う。
+  Native の再準備は §15 の既存の通常 final/edit 準備を使う。
+- `depth_parallax_wgpu.rs` は managed source を sample して sRGB 符号値の `Rgba8Unorm`
+  色テクスチャへ blit し、mipmap を作る。504×504 と長辺最大1536のガイドを別に描いて
+  bounded buffer へ読み戻す。UI は `map_async` と非 blocking の `PollType::Poll` / receiver poll だけを使う。
+  深度は `R16Float`、現在色だけを保持し深度 LRU は4件、callback は context / key / resource ID を照合する。
+  `DepthViewState` の Drop は要求を取消し、自分の context の callback slot だけを除く。
+  色・深度・readback は `VramSubsystem::DepthParallax` と既存の context 会計に含める。
+- shader は基準の逆引き式を維持する。マウス target はポインタの正規化変位の **負** とし、
+  `source = pixel - offset * (depth - focus)` で手前がポインタから離れる。
+  右へ動かすと手前は左、下へ動かすと手前は上へ動く。純粋な追従テストと GPU の色 ramp テストで
+  target の符号と実際の sample 方向を検査する。これは実機での見え方の検収済みを意味しない。
+- 新規 managed texture の GPU 登録は UI の後であり、`load_texture` 自体は次の frame を要求しない。
+  `Ready` 素材の backing が未登録の場合だけ要求元 viewport を再描画し、登録後に読み戻しを始める。
+  一般の `NotYet` は既存 producer の完了通知を使い、ReadingBack は Poll + repaint、推論結果は worker の
+  viewport repaint、同 frame の upload 繰越は次 frame repaint が起床を所有する。
+  実際の texture delta の登録を挟む App 回帰と、ポインタ入力なしの state → Ready 回帰で確認した。
+- 固定パネルは明示的な位置・本文高の制約を正本とし、Area の推定サイズによる二重の位置補正を無効にする。
+  1093×614 と 546.5×307 の contains / scroll end / header固定 / close の検査、PNG 目視を行う。
+- 独立実装レビュー (GPT-6.1 Sol / xhigh) は最終コードと新規回帰を **ACCEPT、P1/P2 なし**とした。
+  ClaudeCode の検収、利用者による実機確認とは分けたコードレビューの結論である。
+- `ui_depth_parallax.rs` は固定ヘッダと高さを制限した scroll body を持つ右パネル。
+  動き・強さ・周期・焦点・奥行き整形を保存し、マウス追従では周期を無効表示する。
+  段 C 前の「書き出し…」は準備中の無効表示。3D 中は fit 固定、通常 wheel はページ送り、
+  Ctrl+wheel / mouse・touch の zoom・pan は停止し、I / Tab は3Dパネルを切り替える設計に接続する。
+- detached との境界は [detached-rework-plan §11](detached-rework-plan.md#11-リワーク外からの変更記録)
+  に記録した。main context ID と `ViewerPresentation::Fullscreen` を両方要求し、
+  `commit_viewer_presentation` が別 presentation の公開前に Depth を終える。
+  native 側の静止画 window mode 切替・動画 presentation・rating 後の遷移もこの commit 境界へ通す。
+  継続照合は owning pass の先頭と描画直前の2箇所とし、不適格な表示へ持ち越さない。
+  読み取り専用の兄弟 context の open / close から別 owner を失効させない。
+
+#### §6.5 の全箇所分類表
+
+追補の入口監査では、キー以外の既存リング dispatch も調べた。段 B で追加する `Depth` のときだけ、
+`apply_ring_action` が slideshow / zoom / pixel grid / 背景切替 / 比較 pin を抑止し、metadata は
+3D パネルの表示切替へ送る。キー・リング共通の `cycle_fullscreen_fit_mode` も Depth 中は変更しない。
+これにより非表示の 2D zoom / pan / 自由回転が fit 切替で初期化されない。
+既存 Panorama のリング挙動は今回の変更対象に広げていない。
+
+素材の追加監査では、local edit の materialization が未完了で final が `None` の間に、
+通常表示が raw 下地を返す経路を確認した。2D の fallback は維持し、深度素材だけ
+`IncompleteComposite` とする。`RawPreview` / `PreviewShown` の現像待ち preview は正本 §4.1 の
+明示例外として `Ready` にできる。両方を実 resolver の回帰で検査した。
+失敗済みの key は元画像 hold 等の `NotYet` でも保持し、同じ key で推論を再試行しない。
+
+| 追加監査箇所 | 分類 | 理由 |
+| --- | --- | --- |
+| `app/gamepad_input.rs::apply_ring_action` | Depth の入力規則 | キー以外の direct dispatch でも表示の占有と 2D 状態保持を守る。既存 360° は変更しない |
+| `cycle_fullscreen_fit_mode` | Depth の fit 固定 | フィット切替は描画に反映しないだけでなく、保存している 2D transform の reset も行わない |
+
+**基点は実装前 HEAD `8adc67829`**。以下の行番号はこの commit の source を指す。
+段 B の編集で行番号や field 名が変わるため、関数名と併記して追跡する。
+「占有」は `fs_exclusive_view_active` へ集約する制限、「360」は panorama 固有の意味を維持する箇所、
+「分岐」は Depth の仕様を別に決める必要のある箇所。兄弟をまとめた行も対象の出現位置を列挙した。
+
+| 基点の箇所 | 分類 | 判断・段 B の接続方針 |
+| --- | --- | --- |
+| `app.rs:52806,52809` 補正・分析 panel | 占有 | 他パネルの停止 |
+| `app.rs:79046,79147` edit continuation / target switch | 占有 | 非同期再開も同じ編集入口条件 |
+| `ui_fullscreen.rs:14656` zoom mode eligibility | 占有 | fit 固定の3Dへ zoom mode を開始しない |
+| `ui_fullscreen.rs:22124` similar preview | 占有 | 通常画像を置換する preview の入場停止 |
+| `ui_fullscreen.rs:25027` info lock、`28007` overflow、`28041` PDF analysis | 占有 | panel / 通常表示の領域・入力所有 |
+| `ui_fullscreen.rs:28382,28387` analysis draw | 占有 | 通常分析 renderer を出さない |
+| `ui_fullscreen.rs:29179,29184,29215,29223` local adjust / SNS / crop / trim | 占有 | 各ツール panel の停止 |
+| `ui_fullscreen.rs:29281,29677,39757` callouts / overflow request / side chrome | 占有 | パネルの表示と入力受付を揃える |
+| `ui_fullscreen.rs:30576` seek menu blocker | 占有 | 通常静止画 menu の停止 |
+| `ui_fullscreen.rs:41225,41273` ordinary wheel zoom / canvas click | 占有 | 2D transform を変更しない |
+| `ui_fullscreen.rs:43016,49713` edit admission / loupe | 占有 | 共通入口と描画の両方を停止 |
+| `app/page_overview.rs:230` overview | 占有＋360 | 占有中は入場停止。既存の `panorama_intent.on` による停止は別に維持 |
+| `ui_video_tile.rs:69`、`ui_view_trim.rs:993` | 占有 | tile の入口、trim の準備完了後の再開も停止 |
+| `ui_fullscreen/page_turn.rs:1813` | 占有 | Depth 中は紙めくりなしで通常 navigation |
+| `ui_fullscreen.rs:15104,15110` `FsZoomOwner` | 分岐 | Depth owner を明示し、Image へ落として不可視の zoom 値を動かさない |
+| `ui_fullscreen.rs:15127,15192,15225,15233,15245,15281,15292,15374,15405,15430,15655,40331` | 分岐 | pivot・キー/ピンチ・pan・drag・PDF rerender の owner dispatch 全体で Depth は無操作 |
+| `ui_fullscreen.rs:15140,15163` panorama touch helper | 360 | FOV と yaw/pitch の専用操作を維持 |
+| `ui_fullscreen.rs:40728` wheel navigation 判定 | 360＋分岐 | 360 は全 wheel を FOV に所有。Depth の通常 wheel は navigation、Ctrl+wheel だけ停止 |
+| `ui_fullscreen.rs:37999` touch tap zones | 分岐 | 360 の視線 drag と3Dの fit 固定を区別。zoom/pan を止めても3Dの通常ページ移動は維持 |
+| `ui_fullscreen.rs:501,24970,24971,29393,29396,29401,29413,29510,29511,51223` topbar inputs | 分岐 | 占有制限と、360 の active / projection 値を分離 |
+| `ui_fullscreen.rs:51336,51420,51455,51481,51593` topbar restriction | 占有 | その他・編集・VST・slideshow 等の通常ボタンを抑止 |
+| `ui_fullscreen.rs:51315,51322` close、`51784,51815,51821` 360 button | 分岐＋360 | × の終了先と tooltip はモード別、360 の選択表示・投影操作は360固有 |
+| `ui_fullscreen.rs:34359,34531` Escape / early × | 分岐 | Depth の終了を panorama toggle へ渡さない |
+| `ui_fullscreen.rs:35908` と派生 `35915,35916,35918,35919,35920,35921,35922,35923,35924,35925` | 分岐 | Z/S/M/bg/grid/compare は占有制限、I は3D panel 切替。編集は共通入口へ通す |
+| `ui_fullscreen.rs:36011,36104` | 整理 | 前者は診断値、後者は未使用の `_pano_active_now`。機能 gate ではない |
+| `ui_fullscreen.rs:36647` Shift+V | 360 | 投影方式だけの操作。V の入場判定は Depth 中の入場を拒否 |
+| `ui_fullscreen.rs:28512` | 360 | panorama shader の paint。Depth shader は同じ通常描画境界で別に選ぶ |
+| `ui_fullscreen.rs:29246` confirmation banner | 分岐＋360 | banner は360専用だが、その分岐が metadata への fallthrough も防ぐ。Depth panel を別枝にする |
+| `ui_fullscreen.rs:38028,38058,38300,38351,38360,38389,38418,38497,39149` | 360 | 球面 navigator の layout / pose / input / paint。Depth の通常 navigator は停止 |
+| `ui_fullscreen.rs:37258,37328` navigator admission（Depth のため条件追加） | 分岐 | Depth だけ navigator の描画・入力を止め、保存済み2D pan/zoom を維持する。従来の通常 flat / 360 navigator の可否は維持 |
+| `ui_fullscreen.rs:45254,45788` non-paged cleanup / continuous | 分岐 | 連結へ切替で Depth を終了。継続照合は reading-flow の事実を使い、表示 predicate で変化を隠さない |
+| `ui_fullscreen.rs:48511,48515,48566,48569,48615` | 360 | drag pose、wheel FOV、panorama renderer |
+| `ui_fullscreen.rs:7100,7121,7136,7147,7257,7271` pure chrome / touch helpers | 占有＋分岐 | 呼出元から占有制限を渡す。canvas の意味を持つ touch 判定は360とDepthを区別 |
+| `app.rs:94171,94172` | 360 | panorama state と検出結果の意味を維持 |
+| `app.rs:94481,94488,94600,95546` | 360 | refinement / GPU preparation の source と pose |
+| `app.rs:94969,95037,95067` | 360 | auto-reentry intent / hint / 未使用 current helper。Depth 中の360復帰は共通 owner が拒否 |
+| `app.rs:95364,95375,95394,95408,95439` | 360＋owner | projection / intent の意味は維持し、状態の作成・破棄は共通 setter へ移す |
+| `app.rs:64157,81507` park / fullscreen close | 分岐 | Depth を終了。park の360 intent は既存どおり保持、close は既存の終了規則 |
+| `app/native_video.rs:6137,6145,6154,6162,9097,9102,9104,9114,9136,9140,9157,9161,9173,9176,9418,12915` | 360 | native video の panorama 同期・FOV・pose。Depth へ置換しない |
+| `app.rs:17444,21367`、`app/viewer_context_registry.rs:1695,2974,3404,3736,4117,4380` | owner | 保存・初期化・bundle swap を enum へ移す。独立した gate ではない |
+
+テスト側の `panorama_state` 直接設定も同じ enum owner に追従させる。
+360 の既存テストは変更前の意図を維持し、Depth の入口・遷移・別 context・GPU の stale resource・
+マウス方向・設定転送・パネルの snapshot に回帰を追加する。
+
+#### 段 B の変更ファイル (39 件)
+
+- 新規の型・GPU・パネル: `src/fs_exclusive_view.rs`, `src/depth_parallax.rs`,
+  `src/depth_parallax_wgpu.rs`, `src/ui_depth_parallax.rs`, `src/app/depth_view.rs`。
+- App の接続・会計: `src/app.rs`, `src/app/gamepad_input.rs`, `src/app/native_video.rs`,
+  `src/app/page_overview.rs`, `src/app/rating_membership_ops.rs`,
+  `src/app/viewer_context_registry.rs`, `src/app/vram_accounting.rs`。
+- 表示・入力・設定・導入: `src/lib.rs`, `src/keymap.rs`, `src/settings.rs`,
+  `src/settings_transfer.rs`, `src/ui_dialogs/depth_addon.rs`,
+  `src/ui_dialogs/preferences/search_index.rs`, `src/ui_fullscreen.rs`,
+  `src/ui_fullscreen/page_turn.rs`, `src/ui_video_tile.rs`, `src/ui_view_trim.rs`,
+  `src/vram_budget.rs`。
+- 回帰・fixture・snapshot: `src/app/depth_view_tests.rs`, `src/ui_fullscreen/depth_tests.rs`,
+  `src/app/tests.rs`, `src/ui_fullscreen/front_popup_input_tests.rs`,
+  `src/depth_estimation.rs` (test 用完了 receiver fixture のみ), `tests/ui_snapshot.rs`,
+  `tests/snapshots/depth_parallax_panel_dark.png`。
+- 文書: `docs/depth-parallax-plan.md`, `docs/detached-rework-plan.md`,
+  `docs/panorama-360-view-plan.md`, `docs/display-pipeline.md`, `docs/async-architecture.md`,
+  `docs/ui-responsiveness.md`, `docs/keymap-spec.md`, `docs/keymap.ini.default`,
+  `docs/development-build-and-test-native.md`。
+
+#### 設計との差分と検証の限界
+
+段 B の機能範囲・入口条件・継続条件を変える仕様変更はない。小さな配置・型の置き場所と
+設定転送の既存方針への接続は上記に記録した。WGSL は画面 uniform / pipeline から分離し、
+段 C の書き出しは実装せず、ボタンを無効表示する。段 D の製品ページ・マニュアル・privacy は未変更。
+
+全件検査で、追加設定の分類済み件数の期待値更新漏れと、段 A のモデル管理ページの検索索引未登録を検出した。
+前者は総数489・対象155・除外334へ更新し、後者は実 anchor / page / 見出しで索引登録した。
+索引の既存検査は描画 helper の実呼出と `depth_addon.rs` 内の見出しを照合し、検査を省略しない。
+この補修と実描画 source の検査追従も独立コードレビューで ACCEPT、指摘なし。
+
+実モデルの品質・所要時間・実 HWND / GPU での操作感は今回の自動検査では検収していない。
+右 pointer で手前が左へ動く方向、透過下地、90度回転、ページ移動後の再準備、V / D 相互排他、
+F11 / F12 / 見開き・連結・動画への切替での終了を、利用者の実機確認へ引き継ぐ。
+
+#### 段 B の実行記録
+
+- 3D / panorama / 占有モード / keymap の限定検査: 403/403 成功
+  (`target/depth-b-focused-final.log`)。その後の最終 3D 検査は88/88成功
+  (`target/depth-b-depth-final2.log`)。GPU offscreen の不変条件・逆引き方向・slot / LRU、
+  App の repaint 所有・要求相関・一 frame 一枚・兄弟 context 会計を含む。
+- 素材 resolver の追補85/85、リング入力の追補1/1成功
+  (`target/depth-b-material-tests.log`, `target/depth-b-ring-test.log`)。
+- UI snapshot は全240/240成功 (`target/depth-b-ui-snapshot-final.log`)。
+  同じ headless test target を直接実行したもので、製品 exe は起動していない。
+  1093×614 の新規 PNG を実装担当と独立 reviewer が目視し、見出し・全項目・状態・無効の書き出しボタンが
+  読め、重なりや切れがないことを確認した。546.5×307 の scroll end / header固定も検査した。
+- 指示どおり `scripts/test-lib-full.ps1` は一度だけ実行。
+  16490件中16485成功、5失敗、73skip、796.553秒 (10 slow, 2 leaky)、exit100。
+  正本ログは `target/test-lib-full/runs/20261107T033036728Z-50edeaff/` の stderr / JUnit。
+  失敗は上記の分類件数・検索索引各1件、既存 IPC 2件、既存 audio EOF 1件。
+- 既存3失敗を同じ built lib で serial 単独実行
+  (`target/depth-b-isolated-failures.log`): audio EOF は成功、IPC 2件は再び Windows の
+  Os code5 / PermissionDenied で失敗。audio は全件負荷時の失敗を観測しただけで原因を断定しない。
+  IPC は一意な名前の `CreateNamedPipe` を作る低レベル検査と fixture server 準備の両方で失敗し、
+  Depth state を作る前の権限エラーである。関連コードや検査を緩めず、全件 gate 成功とは扱わない。
+- 補修後の設定転送・検索索引は63/63成功 (`target/depth-b-settings-final2.log`)。
+  全件での失敗5件を最終 source の全件成功へ読み替えず、補修した2箇所の限定再検査として残す。
+- 最終 production source の `cargo check --offline -p mimageviewer --bin mimageviewer-core` は成功
+  (`target/depth-b-check-final.log`)。workspace 全体へ引数なしの `cargo fmt` を実行し、
+  `cargo fmt --check` と `python scripts/check_ui_glyphs.py` (危険な文字0) も成功。
+- `scripts/build-dev.ps1 -PreserveRuntime` を一度実行し exit0。
+  core (3分51秒) と remote / EPUB PDF / MCP / music-video の4 companion を normal feature set の
+  `dev-runtime` へ用意した。portable feature は追加していない。VCRT PE 検査も runtime4 / PE5 成功。
+  `target/depth-b-build-dev.log` に完了記録を残し、成果物は起動していない。
+
+確認用の起動は、インストール済み・トレイ常駐の mImageViewer を終了してから、利用者自身で実行する。
+通常の `%APPDATA%\mimageviewer` プロファイルを使うため、実際の設定・データが更新され得る。
+単一起動 mutex は通常版と共通である。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+静止画で D / 上部3Dボタン、未導入案内と導入後の手動入場、素材準備中の2Dから3Dへの切替、
+パネル全項目と I / Tab、ポインタ側から覗き込む方向とパネル上の追従停止を確認する。
+通常 wheel のページ移動・Ctrl+wheel の zoom停止・90度回転での色と深度の一致・OFF後の2D変換保持、
+360から3Dへの切替とV拒否、動画・見開き・連結・F11/F12・全画面終了での終了と非復活も確認対象。
+自動の動き中は idle health の対象外。実モデルの品質・速度と操作感の検収は利用者・ClaudeCodeへ引き継ぐ。
 
 ## 11. テスト
 
@@ -753,13 +954,34 @@ repo root から `--offline --test-threads=1`、他の Cargo / テスト実行�
 | 書き出し | モーダル、画面と同じシェーダ | 非モーダル: 書き出し中の操作との組み合わせ。CPU で描く: 描き方が 2 つになる |
 | AI の優先度 | 足さない (既存の mutex のまま) | 深度推論を後回しにする優先度: 3D は利用者が今待っている前面の処理 |
 
-## 15. 未確認の点
+## 15. 調査で解消した点と未確認の点
 
-- `TextureHandle::set` の呼び出し元の一覧 (§4.1。独立レビューでは final / processed の経路に無かった)。
-- Native だけが残る presentation から元素材を再準備する既存の経路 (§4.1)。
+段 B 着手時の source 監査 (基点 `8adc67829`) で次を確認した。
+
+- `TextureHandle::set` / `set_partial` の production 呼出元は
+  `ui_adjustment_panel.rs:8731` (local-adjust mask preview)、`ui_conceal.rs:1189`
+  (conceal mask の部分更新)、`ui_erase.rs:1364` (erase mask の部分更新)、および別アプリの
+  `crates/musicvideo-editor/src/app.rs:1905` (動画編集 preview)。前三者は編集 UI の mask overlay、
+  後者は fullscreen の producer ではない。final / processed の元画素には到達しない。
+  final の生成は `app.rs:89372,89875,90162,90820` の新しい `ctx.load_texture`、
+  edit material の再生成は `86889,86929` の upload helper を使う。
+- Native だけが残っている間も `resolve_fs_processed_payload` は held payload を選ぶ前に
+  通常 material selector を呼ぶ。通常の final 準備 (`ensure_final_composite_texture_impl`)
+  → `ensure_edit_result_pixels` → `assemble_edit_result_pixels` →
+  `ensure_original_material_for_entry(idx, OriginalMaterialEntry::MaterialOnly)`
+  (`app.rs:89960` 以降、`86864,86998,87001,78804`) が既存 pending / upload owner へ再準備を要求する。
+  CPU edit pixels が残る場合は既存の paced upload を使う。紙めくり中もこの通常準備は続き、
+  終了後は同じ selector へ戻る。Depth 中は `page_turn_view_eligible` が false となり、
+  `page_turn_held_resource` が None を返すため、通常 selector の素材がそのまま選択される。
+  専用の「紙めくり再準備 API」は不要で、3D 専用 producer は追加しない。
+  source-less payload は `NotYet(NativeOnly)` として既存の準備を待つ。
+- マウス方向は §10 の負の target に決めた。基準の shader 式を変えず、右 pointer で手前が左へ動く。
+  符号と実際の GPU sample 方向の回帰を追加した。実機での操作感の確認は残る。
+
+以下は未確認。
+
 - 極端な縦横比 (3:1 以上) での深度の劣化 (§3.1)。
 - 一般的な GPU・遅い CPU での所要時間 (研究調査 §8.5)。
-- マウス追従の向き (§5.3)。
 - 名前 (「3D 写真」で仮置き)。
 
 ## 16. 独立レビューの記録

@@ -990,7 +990,7 @@ impl App {
                 != request.state_fingerprint
             || self.any_modal_dialog_open_for_fullscreen_keys()
             || self.remote_session_blocks_local_control()
-            || self.is_panorama_mode_active(anchor)
+            || self.fs_exclusive_view_active(anchor).is_some()
             || self.analysis_mode
             || self.erase_mode
             || self.conceal_mode

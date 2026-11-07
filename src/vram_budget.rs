@@ -133,13 +133,14 @@ pub(crate) enum VramSubsystem {
     ContinuousPageTransitions,
     LanczosOutputs,
     PageTurnPresentation,
+    DepthParallax,
     Thumbnails,
     ThumbTextures,
     ThumbAdjustTex,
 }
 
 impl VramSubsystem {
-    pub(crate) const ALL: [Self; 15] = [
+    pub(crate) const ALL: [Self; 16] = [
         Self::FsCache,
         Self::FinalCompositeCache,
         Self::AdjustmentCache,
@@ -152,6 +153,7 @@ impl VramSubsystem {
         Self::ContinuousPageTransitions,
         Self::LanczosOutputs,
         Self::PageTurnPresentation,
+        Self::DepthParallax,
         Self::Thumbnails,
         Self::ThumbTextures,
         Self::ThumbAdjustTex,
@@ -171,6 +173,7 @@ impl VramSubsystem {
             Self::ContinuousPageTransitions => "continuous_page_transitions",
             Self::LanczosOutputs => "lanczos_outputs",
             Self::PageTurnPresentation => "page_turn_presentation",
+            Self::DepthParallax => "depth_parallax",
             Self::Thumbnails => "thumbnails",
             Self::ThumbTextures => "thumb_textures",
             Self::ThumbAdjustTex => "thumb_adjust_tex",
@@ -209,6 +212,14 @@ impl VramAccountant {
         let texels = texture_size_texels(size, mipmapped);
         let slot = &mut self.subsystem_texels[subsystem as usize];
         *slot = slot.saturating_add(texels);
+    }
+
+    /// Native allocations do not have an egui TextureId. Their context owner
+    /// visits each allocation once; budgets use rounded RGBA8-equivalent texels.
+    pub(crate) fn add_native_bytes(&mut self, subsystem: VramSubsystem, bytes: u64) {
+        let texels = usize::try_from(bytes.div_ceil(4)).unwrap_or(usize::MAX);
+        self.subsystem_texels[subsystem as usize] =
+            self.subsystem_texels[subsystem as usize].saturating_add(texels);
     }
 
     pub(crate) fn finish(self) -> VramAccountingSnapshot {

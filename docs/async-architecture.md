@@ -1,5 +1,19 @@
 # 非同期・並列アーキテクチャ
 
+## 3D 写真の bounded readback と要求所有（2026-11-07、段 B 実装・独立レビュー中）
+
+context 所有の `DepthViewState` は `WaitingForStableTexture / ReadingBack / Estimating / Ready / Failed`
+の一つを所有する。GPU は表示 source の色を blit し、504×504と長辺最大1536の二つだけを
+map する。`map_async` の完了 channel と `PollType::Poll` を使い、UI で `poll(Wait)`・join・sleepしない。
+読み戻し待ちの owning viewport は可視時に repaint を要求する。完了後は既存の
+`depth-estimation` worker の最新 slot へ渡し、worker が要求元 viewport を起こす。
+
+要求は context / request ID / TextureId / cancel に相関し、結果も同じ所有者で照合する。
+source 切替・OFF・presentation変更・Dropは receiver/cancel と自分の GPU slot を退役する。
+兄弟 context の状態・cache・要求を変更しない。現在色と4件の深度 LRU を所有し、
+色・深度・readback buffer は既存 VRAM 会計へ渡す。推論は共有 AI runtime の直列契約を維持する。
+状態・入口・実装レビューと検証結果の正本は [3D 設計 §10](depth-parallax-plan.md#10-実装の段階-codex-への委任単位)。
+
 ## 本棚順の単一writer（§1.683）
 
 一覧・本の操作・順保存は既存の製本pending受信口を共有する。`app/book_shelf`は送信済みmode/identity列と最新表示snapshotを分け、一件の書込が終わって異なる最新値があれば一件だけ送る。古い成功はtokenだけ進め、表示は戻さない。ShelfOrderの受信・後続送信・lease解放・終了再開はroot close受理後の共通logic serviceが所有し、LogicOnlyでも進む。他の本結果の表示採用はFull側に残す。管理closeはownerを破棄せず、通常終了は受理済みbatchの終端を既存root lifecycleへ非同期接続する。最初の順操作は既存製本・Shell操作・未完了openと排他し、Remote local modal leaseをbatch終端まで保持する。作成/新規本へのAppend/管理改名/削除/transferは同じworkerで順を保守して完成snapshotを返す。既存本Appendは追加先だけを処理し件数差分を採用する。新規Appendの事前観測は直下名と順序tokenだけで、ページ数は列挙しない。全結果はroot/選択epochで採用し、Listは要求revisionも照合する。root切替は旧List受信口とその番号continuationだけを退役し、捕捉済みmutation workerは保持する。[設計](book-order-plan.md)。

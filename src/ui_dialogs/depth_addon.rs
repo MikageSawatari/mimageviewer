@@ -176,7 +176,10 @@ impl App {
                         if self.depth_setup.dialog.is_some() {
                             self.depth_setup.dialog = Some(Dialog::Done);
                         }
-                        self.show_feedback_result("モデルの準備ができました。もう一度 D キーで 3D 表示に切り替えてください".into(), crate::feedback::FeedbackKind::Info);
+                        self.show_feedback_result(
+                            depth_setup_completion_message(&self.keymap),
+                            crate::feedback::FeedbackKind::Info,
+                        );
                     }
                 }
                 AddonEvent::Cancelled => {
@@ -222,6 +225,7 @@ impl App {
             self.depth_setup.addon.progress(),
             self.depth_setup.addon.operation(),
             self.depth_setup.addon.root(),
+            &depth_setup_completion_message(&self.keymap),
         );
         match action {
             Action::Download => match self.depth_setup.addon.start_install() {
@@ -253,20 +257,35 @@ enum Action {
     Close,
 }
 
+fn depth_setup_completion_message(keymap: &crate::keymap::Keymap) -> String {
+    match keymap.first_chord_label(crate::keymap::KeyAction::FsDepthParallax) {
+        Some(chord) => format!(
+            "モデルの準備ができました。もう一度 {chord} キーか上部の「3D」ボタンで 3D 写真に切り替えてください。"
+        ),
+        None => {
+            "モデルの準備ができました。上部の「3D」ボタンで 3D 写真に切り替えてください。".into()
+        }
+    }
+}
+
 fn draw_dialog(
     ctx: &egui::Context,
     dialog: &Dialog,
     progress: &InstallProgress,
     operation: AddonOperation,
     root: &std::path::Path,
+    completion_message: &str,
 ) -> Action {
     let mut open = true;
     let mut action = Action::None;
     let screen = ctx.content_rect();
     let margin = 16.0;
-    egui::Window::new("3D 写真の追加モデル").id(egui::Id::new("depth_model_dialog"))
+    egui::Window::new("3D 写真の追加モデル")
+        .id(egui::Id::new("depth_model_dialog"))
         .order(egui::Order::Foreground)
-        .open(&mut open).collapsible(false).resizable(true)
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
         .default_pos(screen.min + egui::vec2(margin, margin))
         .default_width(520.0_f32.min((screen.width() - 2.0 * margin).max(160.0)))
         .default_height((screen.height() - 2.0 * margin).min(380.0))
@@ -274,37 +293,91 @@ fn draw_dialog(
         .show(ctx, |ui| {
             let footer = ui.spacing().interact_size.y + ui.spacing().item_spacing.y + 12.0;
             let body_height = (ui.available_height() - footer).max(20.0);
-            ui.style_mut().spacing.scroll = super::non_overlapping_dialog_scroll_style(ui.style().spacing.scroll);
-            egui::ScrollArea::vertical().max_height(body_height).auto_shrink([false, true])
+            ui.style_mut().spacing.scroll =
+                super::non_overlapping_dialog_scroll_style(ui.style().spacing.scroll);
+            egui::ScrollArea::vertical()
+                .max_height(body_height)
+                .auto_shrink([false, true])
                 .show(ui, |ui| {
                     match dialog {
-                        Dialog::Checking => { ui.label("モデルを確認中..."); }
+                        Dialog::Checking => {
+                            ui.label("モデルを確認中...");
+                        }
                         Dialog::Confirm => {
-                            ui.label("写真やイラストの奥行きを PC 内で計算する追加モデルを取得します。");
+                            ui.label(
+                                "写真やイラストの奥行きを PC 内で計算する追加モデルを取得します。",
+                            );
                             ui.label("取得するもの: DA3 Mono-Large (約 0.67 GB)");
-                            ui.label("ライセンス: Apache License 2.0 (LICENSE と NOTICE を同時に取得)");
+                            ui.label(
+                                "ライセンス: Apache License 2.0 (LICENSE と NOTICE を同時に取得)",
+                            );
                             ui.label("取得元: mImageViewer の GitHub Releases (depth-model-v1)");
                             ui.label("画像は PC の外へ出ません。");
                         }
                         Dialog::Running => {
-                            if matches!(operation, AddonOperation::Cancelling | AddonOperation::Removing) { ui.label("前の処理を片付けています"); }
-                            else { super::model_addon::draw_progress(ui, progress); }
+                            if matches!(
+                                operation,
+                                AddonOperation::Cancelling | AddonOperation::Removing
+                            ) {
+                                ui.label("前の処理を片付けています");
+                            } else {
+                                super::model_addon::draw_progress(ui, progress);
+                            }
                         }
-                        Dialog::RemoveConfirm => { ui.label("3D 写真の追加モデルを削除しますか？"); ui.label("必要になったら再ダウンロードできます。"); }
-                        Dialog::Done => { ui.label("モデルの準備ができました。もう一度 D キーで 3D 表示に切り替えてください。"); }
-                        Dialog::Cancelled => { ui.label("ダウンロードをキャンセルしました。"); }
-                        Dialog::Error(error) => { ui.colored_label(ui.visuals().error_fg_color, "モデルの処理に失敗しました"); ui.label(error); }
+                        Dialog::RemoveConfirm => {
+                            ui.label("3D 写真の追加モデルを削除しますか？");
+                            ui.label("必要になったら再ダウンロードできます。");
+                        }
+                        Dialog::Done => {
+                            ui.label(completion_message);
+                        }
+                        Dialog::Cancelled => {
+                            ui.label("ダウンロードをキャンセルしました。");
+                        }
+                        Dialog::Error(error) => {
+                            ui.colored_label(
+                                ui.visuals().error_fg_color,
+                                "モデルの処理に失敗しました",
+                            );
+                            ui.label(error);
+                        }
                     }
                     ui.add_space(8.0);
                     ui.label(format!("保存先: {}", root.display()));
                 });
             ui.separator();
-            ui.horizontal_wrapped(|ui| {
-                match dialog {
-                    Dialog::Confirm => { if ui.button("ダウンロード").clicked() { action = Action::Download; } if ui.button("今はしない").clicked() { action = Action::Close; } }
-                    Dialog::RemoveConfirm => { if ui.button("削除する").clicked() { action = Action::Remove; } if ui.button("今はしない").clicked() { action = Action::Close; } }
-                    Dialog::Running => { if ui.add_enabled(operation == AddonOperation::Installing, egui::Button::new("キャンセル")).clicked() { action = Action::Cancel; } }
-                    _ => { if ui.button("閉じる").clicked() { action = Action::Close; } }
+            ui.horizontal_wrapped(|ui| match dialog {
+                Dialog::Confirm => {
+                    if ui.button("ダウンロード").clicked() {
+                        action = Action::Download;
+                    }
+                    if ui.button("今はしない").clicked() {
+                        action = Action::Close;
+                    }
+                }
+                Dialog::RemoveConfirm => {
+                    if ui.button("削除する").clicked() {
+                        action = Action::Remove;
+                    }
+                    if ui.button("今はしない").clicked() {
+                        action = Action::Close;
+                    }
+                }
+                Dialog::Running => {
+                    if ui
+                        .add_enabled(
+                            operation == AddonOperation::Installing,
+                            egui::Button::new("キャンセル"),
+                        )
+                        .clicked()
+                    {
+                        action = Action::Cancel;
+                    }
+                }
+                _ => {
+                    if ui.button("閉じる").clicked() {
+                        action = Action::Close;
+                    }
                 }
             });
         });
@@ -337,6 +410,18 @@ pub(super) fn draw_preferences(
 mod tests {
     use super::*;
     use egui_kittest::kittest::{NodeT, Queryable};
+
+    #[test]
+    fn depth_setup_completion_uses_effective_shortcut_and_handles_unassigned() {
+        let rebound = crate::keymap::Keymap::from_ini_str("[FsImage]\nFsDepthParallax = F13\n");
+        let message = depth_setup_completion_message(&rebound);
+        assert!(message.contains("F13 キー"));
+        assert!(!message.contains(" D キー"));
+        let unassigned = crate::keymap::Keymap::from_ini_str("[FsImage]\nFsDepthParallax = none\n");
+        let message = depth_setup_completion_message(&unassigned);
+        assert!(!message.contains("キー"));
+        assert!(message.contains("「3D」ボタン"));
+    }
 
     #[test]
     fn depth_management_modal_boundary_keeps_download_modeless() {
@@ -410,6 +495,7 @@ mod tests {
                                 },
                                 operation,
                                 std::path::Path::new("C:/disposable/addons/depth"),
+                                &depth_setup_completion_message(&crate::keymap::Keymap::empty()),
                             );
                             if result != Action::None {
                                 *action = result;
@@ -484,6 +570,7 @@ mod tests {
                     &InstallProgress::Idle,
                     AddonOperation::None,
                     std::path::Path::new("C:/disposable/addons/depth"),
+                    &depth_setup_completion_message(&crate::keymap::Keymap::empty()),
                 );
             });
         harness.run();

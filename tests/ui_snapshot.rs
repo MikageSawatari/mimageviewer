@@ -421,6 +421,99 @@ mod test_ui;
 mod logical_bounds;
 
 #[test]
+fn depth_parallax_panel_dark() {
+    let mut settings = mimageviewer::depth_parallax::DepthParallaxSettings::default();
+    snapshot_with_theme_at_size(
+        "depth_parallax_panel_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(1093.0, 614.0),
+        None,
+        move |ui| {
+            mimageviewer::ui_depth_parallax::draw_depth_parallax_panel(
+                ui.ctx(),
+                &mut settings,
+                "奥行きを計算中",
+            );
+        },
+    );
+}
+
+#[test]
+fn depth_parallax_panel_small_viewport_reaches_every_control_and_keeps_header_fixed() {
+    use test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+    struct State {
+        settings: mimageviewer::depth_parallax::DepthParallaxSettings,
+        layout: Option<(ScrollLayout, egui::Rect, egui::Rect, egui::Rect, egui::Rect)>,
+        closed: bool,
+    }
+    for (size, expected) in [
+        (egui::vec2(1093.0, 614.0), HeightExpectation::Fits),
+        (egui::vec2(546.5, 307.0), HeightExpectation::Scrolls),
+    ] {
+        let mut harness = test_ui::builder()
+            .with_context_setup(install_app_fonts)
+            .with_size(size)
+            .build_ui_state(
+                |ui, state: &mut State| {
+                    mimageviewer::os_theme::apply_resolved(
+                        ui.ctx(),
+                        mimageviewer::os_theme::ResolvedTheme::Dark,
+                    );
+                    let panel = mimageviewer::ui_depth_parallax::draw_depth_parallax_panel(
+                        ui.ctx(),
+                        &mut state.settings,
+                        "失敗しました (モデルを読み込めませんでした)",
+                    );
+                    state.layout = Some((
+                        ScrollLayout::from_output(&panel.scroll),
+                        panel.rect,
+                        panel.header_rect,
+                        panel.close_rect,
+                        panel.export_rect,
+                    ));
+                    state.closed |= panel.close_requested;
+                },
+                State {
+                    settings: Default::default(),
+                    layout: None,
+                    closed: false,
+                },
+            );
+        harness.run();
+        let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        let (before, panel, header, close, _) = harness.state().layout.unwrap();
+        assert!(bounds.contains_rect(panel));
+        assert!(panel.contains_rect(header));
+        assert!(header.contains_rect(close));
+        assert!(before.inner.top() > header.bottom());
+        before.assert_height(expected, panel, harness.ctx.pixels_per_point());
+        if matches!(expected, HeightExpectation::Scrolls) {
+            harness.event(egui::Event::PointerMoved(before.inner.center()));
+            harness.event(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -100000.0),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+            });
+            harness.run_steps(40);
+            let (after, _, after_header, after_close, export) = harness.state().layout.unwrap();
+            after.assert_scrolled_to_end(before, harness.ctx.pixels_per_point());
+            assert_eq!(after_header, header);
+            assert_eq!(after_close, close);
+            assert!(after.inner.expand(1.0).contains_rect(export));
+        }
+        let export = harness.get_by_role_and_label(egui::accesskit::Role::Button, "書き出し…");
+        assert!(export.accesskit_node().is_disabled());
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "×")
+            .click();
+        harness.run();
+        assert!(harness.state().closed);
+    }
+}
+
+#[test]
 fn global_search_short_term_reject_light() {
     global_search_short_term_reject_snapshot(
         "global_search_short_term_reject_light",

@@ -28,6 +28,19 @@ ChatGPT / DALL-E や 360 カメラ (Insta360 / RICOH Theta 等) が出力する
 
 ---
 
+### 3D 写真・段 B との排他（2026-11-07、実装・独立レビュー中）
+
+panorama の状態は context 所有の `FsExclusiveView::Panorama` へ移し、
+非360画像へ移った際の非アクティブ状態と intent の意味を維持する。
+他の panel・編集・loupe・通常 zoom 等を止める判定は `fs_exclusive_view_active` に集約する。
+FOV、yaw/pitch、球面 navigator、投影方式、native video の panorama 同期は
+`is_panorama_mode_active` / panorama accessor の意味を維持する。
+3D は fit 固定で zoom/pan と navigator を止める一方、通常 wheel はページ送り。
+360 は従来どおり全 wheel を FOV に使う。
+3D 入場は panorama owner を終了して `intent.on` を解除し、projection の選択は保持する。
+3D 中に360の自動復帰・Vによる入場を行わない。全箇所の分類と未完了の検証は
+[3D 設計 §10](depth-parallax-plan.md#10-実装の段階-codex-への委任単位) を参照。
+
 ## 1. 背景: equirectangular とは
 
 緯度経度を 2D 画像に展開する標準投影方式:

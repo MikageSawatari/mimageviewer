@@ -700,6 +700,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ]
     ),
     entry!(
+        "depth-addon/manage",
+        DepthAddon,
+        "3D 写真の追加モデル",
+        ["3D", "奥行き", "深度", "モデル", "ダウンロード", "削除"]
+    ),
+    entry!(
         "editing-addon/manage",
         EditingAddon,
         "編集用追加ファイル",
@@ -1642,6 +1648,7 @@ mod tests {
     const PREFERENCES_SOURCE: &str = include_str!("../preferences.rs");
     const RAW_SETTINGS_SOURCE: &str = include_str!("../../ui_raw.rs");
     const NAME_COLORS_SOURCE: &str = include_str!("name_colors.rs");
+    const DEPTH_ADDON_SOURCE: &str = include_str!("../depth_addon.rs");
 
     #[test]
     fn same_name_folder_book_choice_queries_target_the_existing_anchor() {
@@ -1811,6 +1818,11 @@ mod tests {
                             .contains("crate::ui_raw::draw_settings(ui, &mut state.settings)")
                     );
                     RAW_SETTINGS_SOURCE
+                } else if entry.anchor == "depth-addon/manage" {
+                    assert!(PAGES_SOURCE.contains(
+                        "super::super::depth_addon::draw_preferences(ui, &state.depth_view)"
+                    ));
+                    DEPTH_ADDON_SOURCE
                 } else if entry.anchor == "file-types/categories" {
                     assert_eq!(entry.title, PreferencesPage::FileTypeVisibility.label());
                     assert!(PREFERENCES_SOURCE.contains("ui.heading(state.selected.label())"));

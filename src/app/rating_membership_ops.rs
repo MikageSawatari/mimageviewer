@@ -457,7 +457,7 @@ impl App {
                     ..
                 }) = &intent
                 {
-                    self.viewer_presentation = *presentation;
+                    self.commit_viewer_presentation(*presentation, "rating_presentation");
                 }
                 self.open_fullscreen_for_rating_membership(idx);
                 cursor = RatingNeighborDecision::Move(key.clone());

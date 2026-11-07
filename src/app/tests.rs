@@ -57862,11 +57862,16 @@ mod pipeline_cache_refactor_tests {
                 "pano_edit_mode_raw",
                 egui::Color32::BLACK,
             );
-            app.panorama_state = Some(crate::panorama::PanoramaState::new(
-                0.0,
-                0.0,
-                crate::panorama::PanoProjection::Perspective,
-            ));
+            app.set_fs_exclusive_view(
+                crate::fs_exclusive_view::FsExclusiveView::Panorama(
+                    crate::panorama::PanoramaState::new(
+                        0.0,
+                        0.0,
+                        crate::panorama::PanoProjection::Perspective,
+                    ),
+                ),
+                "panorama_on",
+            );
 
             let ctrl = egui::Modifiers {
                 ctrl: ctrl_pressed,
@@ -57918,16 +57923,21 @@ mod pipeline_cache_refactor_tests {
             "pano_projection_popup",
             egui::Color32::BLACK,
         );
-        app.panorama_state = Some(crate::panorama::PanoramaState::new(
-            0.0,
-            0.0,
-            crate::panorama::PanoProjection::Perspective,
-        ));
+        app.set_fs_exclusive_view(
+            crate::fs_exclusive_view::FsExclusiveView::Panorama(
+                crate::panorama::PanoramaState::new(
+                    0.0,
+                    0.0,
+                    crate::panorama::PanoProjection::Perspective,
+                ),
+            ),
+            "panorama_on",
+        );
         app.panorama_projection_popup_open = true;
 
         app.toggle_panorama_mode(idx);
 
-        assert!(app.panorama_state.is_none(), "360 を抜けたはず");
+        assert!(app.panorama_state().is_none(), "360 を抜けたはず");
         assert!(
             !app.panorama_projection_popup_open,
             "the projection list must not outlive the button that owns it"
@@ -57944,11 +57954,11 @@ mod pipeline_cache_refactor_tests {
         insert_pano_static_source(&mut app, &ctx, first, "pano_carry_a", egui::Color32::BLACK);
         app.fullscreen_idx = Some(first);
         app.toggle_panorama_mode(first);
-        assert!(app.panorama_state.is_some(), "V で 360 に入ったはず");
+        assert!(app.panorama_state().is_some(), "V で 360 に入ったはず");
 
         app.close_fullscreen();
         assert!(
-            app.panorama_state.is_none(),
+            app.panorama_state().is_none(),
             "state はフルスクリーン退出で捨てる (GPU リソースを抱えたままにしない)"
         );
         assert!(
@@ -57962,7 +57972,7 @@ mod pipeline_cache_refactor_tests {
         app.reconcile_panorama_session_intent(second);
 
         assert!(
-            app.panorama_state.is_some(),
+            app.panorama_state().is_some(),
             "次に開いたものも 360 素材なら 360 で見えるはず"
         );
     }
@@ -58008,7 +58018,7 @@ mod pipeline_cache_refactor_tests {
         app.reconcile_panorama_session_intent(square);
 
         assert!(
-            app.panorama_state.is_none(),
+            app.panorama_state().is_none(),
             "360 素材でないものを 360 で描いてはいけない"
         );
         assert!(
@@ -58036,7 +58046,7 @@ mod pipeline_cache_refactor_tests {
         app.reconcile_panorama_session_intent(second);
 
         assert!(
-            app.panorama_state.is_none(),
+            app.panorama_state().is_none(),
             "解除したままフォルダを移ったのに 360 が復活してはいけない"
         );
     }
@@ -58064,8 +58074,7 @@ mod pipeline_cache_refactor_tests {
         app.toggle_panorama_mode(idx);
 
         assert_eq!(
-            app.panorama_state
-                .as_ref()
+            app.panorama_state()
                 .expect("360 に入り直したはず")
                 .projection,
             crate::panorama::PanoProjection::Stereographic,
@@ -58098,7 +58107,7 @@ mod pipeline_cache_refactor_tests {
         app.reconcile_panorama_session_intent(second);
 
         assert!(
-            app.panorama_state.is_none(),
+            app.panorama_state().is_none(),
             "連結読み中に 360 state ができると、描画は連結のままなのに入力と上バーだけが              360 として振る舞う"
         );
         assert!(
@@ -58108,7 +58117,7 @@ mod pipeline_cache_refactor_tests {
 
         app.reading_flow = crate::settings::ReadingFlow::Paged;
         app.reconcile_panorama_session_intent(second);
-        assert!(app.panorama_state.is_some(), "ページ単位へ戻せば復帰する");
+        assert!(app.panorama_state().is_some(), "ページ単位へ戻せば復帰する");
     }
 
     /// 復帰は 1 か所 (フレームの reconcile) が行う。`open_fullscreen` の中でやると、
@@ -58131,7 +58140,7 @@ mod pipeline_cache_refactor_tests {
         let toast_fired = app.try_show_pano_hint_toast_returning_fired(idx);
 
         assert!(
-            app.panorama_state.is_none(),
+            app.panorama_state().is_none(),
             "open の途中で 360 に入れない。復帰はフレームの reconcile が行う"
         );
         assert!(
@@ -58181,14 +58190,14 @@ mod pipeline_cache_refactor_tests {
         app.reset_detached_pause_foreground_modes(idx);
 
         assert!(
-            app.panorama_state.is_none(),
+            app.panorama_state().is_none(),
             "退避中は前面モードを落とす (既存の契約)"
         );
         assert!(app.panorama_intent.on, "退避は 360 をやめた操作ではない");
 
         app.reconcile_panorama_session_intent(idx);
         assert!(
-            app.panorama_state.is_some(),
+            app.panorama_state().is_some(),
             "戻したときに 360 で再開できるはず"
         );
     }
@@ -58296,45 +58305,50 @@ mod pipeline_cache_refactor_tests {
             "360 must not rewrite the selected video scale filter"
         );
         {
-            let state = app.panorama_state.as_mut().unwrap();
+            let state = app.panorama_state_mut().unwrap();
             state.yaw = 0.75;
             state.pitch = -0.25;
             state.fov_y = state.projection.fov_max();
         }
-        let retained_pose = app.panorama_state.as_ref().unwrap().pose();
+        let retained_pose = app.panorama_state().unwrap().pose();
         assert!(
             app.apply_native_video_panorama_wheel(&ctx, first, -120),
             "wheel remains consumed when FOV is already at its upper limit"
         );
-        assert_eq!(app.panorama_state.as_ref().unwrap().pose(), retained_pose);
+        assert_eq!(app.panorama_state().unwrap().pose(), retained_pose);
 
         app.fullscreen_idx = Some(flat);
         assert!(!app.is_panorama_mode_active(flat));
-        assert_eq!(app.panorama_state.as_ref().unwrap().pose(), retained_pose);
+        assert_eq!(app.panorama_state().unwrap().pose(), retained_pose);
         app.fullscreen_idx = Some(second);
         assert!(app.is_panorama_mode_active(second));
-        assert_eq!(app.panorama_state.as_ref().unwrap().pose(), retained_pose);
+        assert_eq!(app.panorama_state().unwrap().pose(), retained_pose);
 
         app.video_audio_mode = Some(second);
         assert!(!app.native_video_panorama_input_active(second));
-        assert_eq!(app.panorama_state.as_ref().unwrap().pose(), retained_pose);
+        assert_eq!(app.panorama_state().unwrap().pose(), retained_pose);
         app.video_audio_mode = None;
         assert!(app.native_video_panorama_input_active(second));
-        assert_eq!(app.panorama_state.as_ref().unwrap().pose(), retained_pose);
+        assert_eq!(app.panorama_state().unwrap().pose(), retained_pose);
 
         app.toggle_panorama_mode(second);
         assert!(
-            app.panorama_state.is_none(),
+            app.panorama_state().is_none(),
             "explicit OFF discards the state"
         );
-        app.panorama_state = Some(crate::panorama::PanoramaState::new(
-            0.0,
-            0.0,
-            crate::panorama::PanoProjection::Perspective,
-        ));
+        app.set_fs_exclusive_view(
+            crate::fs_exclusive_view::FsExclusiveView::Panorama(
+                crate::panorama::PanoramaState::new(
+                    0.0,
+                    0.0,
+                    crate::panorama::PanoProjection::Perspective,
+                ),
+            ),
+            "panorama_on",
+        );
         app.close_fullscreen();
         assert!(
-            app.panorama_state.is_none(),
+            app.panorama_state().is_none(),
             "fullscreen exit discards the shared panorama state"
         );
     }
@@ -58354,20 +58368,25 @@ mod pipeline_cache_refactor_tests {
             "pano_projection_apply",
             egui::Color32::BLACK,
         );
-        app.panorama_state = Some(crate::panorama::PanoramaState::new(
-            0.0,
-            0.0,
-            crate::panorama::PanoProjection::Stereographic,
-        ));
+        app.set_fs_exclusive_view(
+            crate::fs_exclusive_view::FsExclusiveView::Panorama(
+                crate::panorama::PanoramaState::new(
+                    0.0,
+                    0.0,
+                    crate::panorama::PanoProjection::Stereographic,
+                ),
+            ),
+            "panorama_on",
+        );
         // 立体射影でしか許されない広い画角にしておく。
-        app.panorama_state.as_mut().unwrap().fov_y = crate::panorama::FOV_MAX_WIDE;
+        app.panorama_state_mut().unwrap().fov_y = crate::panorama::FOV_MAX_WIDE;
 
         // 一覧から透視を選ぶ = 画角も透視の上限まで丸める。
         assert_eq!(
             app.set_panorama_projection(crate::panorama::PanoProjection::Perspective),
             Some(crate::panorama::PanoProjection::Perspective)
         );
-        let pano = app.panorama_state.as_ref().unwrap();
+        let pano = app.panorama_state().unwrap();
         assert_eq!(
             pano.projection,
             crate::panorama::PanoProjection::Perspective
@@ -58380,12 +58399,15 @@ mod pipeline_cache_refactor_tests {
             Some(crate::panorama::PanoProjection::Stereographic)
         );
         assert_eq!(
-            app.panorama_state.as_ref().unwrap().projection,
+            app.panorama_state().unwrap().projection,
             crate::panorama::PanoProjection::Stereographic
         );
 
         // 360 が動いていなければどちらも何もしない。
-        app.panorama_state = None;
+        app.set_fs_exclusive_view(
+            crate::fs_exclusive_view::FsExclusiveView::None,
+            "panorama_off",
+        );
         assert_eq!(app.cycle_panorama_projection(), None);
         assert_eq!(
             app.set_panorama_projection(crate::panorama::PanoProjection::Equidistant),
@@ -64898,11 +64920,16 @@ mod native_video_rating_key_tests {
             },
         );
         app.fullscreen_idx = Some(idx);
-        app.panorama_state = Some(crate::panorama::PanoramaState::new(
-            0.0,
-            0.0,
-            crate::panorama::PanoProjection::Stereographic,
-        ));
+        app.set_fs_exclusive_view(
+            crate::fs_exclusive_view::FsExclusiveView::Panorama(
+                crate::panorama::PanoramaState::new(
+                    0.0,
+                    0.0,
+                    crate::panorama::PanoProjection::Stereographic,
+                ),
+            ),
+            "panorama_on",
+        );
 
         app.handle_native_video_output_event(
             &ctx,
@@ -64914,7 +64941,7 @@ mod native_video_rating_key_tests {
         );
 
         assert_eq!(
-            app.panorama_state.as_ref().unwrap().projection,
+            app.panorama_state().unwrap().projection,
             crate::panorama::PanoProjection::Equidistant
         );
     }
@@ -81742,11 +81769,16 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.settings.detached_viewer_open_images_in_window = true;
         app.fullscreen_idx = Some(first);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
-        app.panorama_state = Some(crate::panorama::PanoramaState::new(
-            0.5,
-            -0.25,
-            crate::panorama::PanoProjection::Perspective,
-        ));
+        app.set_fs_exclusive_view(
+            crate::fs_exclusive_view::FsExclusiveView::Panorama(
+                crate::panorama::PanoramaState::new(
+                    0.5,
+                    -0.25,
+                    crate::panorama::PanoProjection::Perspective,
+                ),
+            ),
+            "panorama_on",
+        );
         app.pano_toast_shown_for_current_fs = true;
         app.analysis_mode = true;
         app.analysis_zoom = 2.0;
@@ -81761,7 +81793,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         assert_eq!(app.fullscreen_idx, Some(second));
         assert!(
-            app.panorama_state.is_none(),
+            app.panorama_state().is_none(),
             "a newly opened detached still window should start in normal image mode"
         );
         assert!(!app.pano_toast_shown_for_current_fs);
@@ -81799,7 +81831,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.open_fullscreen(second, crate::app::HistoryTrigger::UserChosen);
 
         assert!(
-            app.panorama_state.is_none(),
+            app.panorama_state().is_none(),
             "新しい窓は通常表示で始まる (既存の契約)"
         );
         assert!(
@@ -81820,11 +81852,16 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fullscreen_idx = Some(first);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
-        app.panorama_state = Some(crate::panorama::PanoramaState::new(
-            0.5,
-            -0.25,
-            crate::panorama::PanoProjection::Perspective,
-        ));
+        app.set_fs_exclusive_view(
+            crate::fs_exclusive_view::FsExclusiveView::Panorama(
+                crate::panorama::PanoramaState::new(
+                    0.5,
+                    -0.25,
+                    crate::panorama::PanoProjection::Perspective,
+                ),
+            ),
+            "panorama_on",
+        );
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.fs_open_intent_from_grid = true;
@@ -81849,7 +81886,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         ));
         assert!(app.detached_image_windows[0].reopen_sync_stamp.is_some());
         assert!(
-            app.panorama_state.is_none(),
+            app.panorama_state().is_none(),
             "opening the follow-up window should still reset foreground panorama mode"
         );
         let second_window_id = app
@@ -81874,7 +81911,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             "always-new detached image windows remain independent after reactivation"
         );
         assert!(
-            app.panorama_state.is_none(),
+            app.panorama_state().is_none(),
             "reactivated plain image windows should return in normal display mode so V can start panorama anew"
         );
         assert_eq!(app.detached_image_windows.len(), 1);
@@ -85144,11 +85181,16 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.viewer_presentation = ViewerPresentation::DetachedWindow;
             app.detached_viewer_independent_active = true;
             app.set_detached_window_binding_for_test(Some(42));
-            app.panorama_state = Some(crate::panorama::PanoramaState::new(
-                1.0,
-                -0.5,
-                crate::panorama::PanoProjection::Perspective,
-            ));
+            app.set_fs_exclusive_view(
+                crate::fs_exclusive_view::FsExclusiveView::Panorama(
+                    crate::panorama::PanoramaState::new(
+                        1.0,
+                        -0.5,
+                        crate::panorama::PanoProjection::Perspective,
+                    ),
+                ),
+                "panorama_on",
+            );
             app.pano_toast_shown_for_current_fs = true;
             app.analysis_mode = true;
             app.analysis_zoom = 2.5;
@@ -85202,7 +85244,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let paused_id = app.detached_image_windows[0].id;
         app.with_window_viewer_context(paused_id, |paused| {
             assert!(
-                paused.panorama_state.is_none(),
+                paused.panorama_state().is_none(),
                 "paused detached windows should freeze normal image display, not keep panorama mode active"
             );
             assert!(!paused.pano_toast_shown_for_current_fs);
@@ -85322,38 +85364,48 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     #[test]
     fn active_detached_context_uses_its_own_panorama_mode_state() {
         let mut app = setup_app();
-        app.panorama_state = Some(crate::panorama::PanoramaState::new(
-            1.0,
-            0.0,
-            crate::panorama::PanoProjection::Perspective,
-        ));
+        app.set_fs_exclusive_view(
+            crate::fs_exclusive_view::FsExclusiveView::Panorama(
+                crate::panorama::PanoramaState::new(
+                    1.0,
+                    0.0,
+                    crate::panorama::PanoProjection::Perspective,
+                ),
+            ),
+            "panorama_on",
+        );
         app.pano_toast_shown_for_current_fs = true;
 
         app.build_active_context_for_test(None, DetachedSource::Image, |bundle| {
-            bundle.panorama_state = None;
+            bundle.fs_exclusive_view = crate::fs_exclusive_view::FsExclusiveView::None;
             bundle.pano_toast_shown_for_current_fs = false;
         });
 
         let _ = app.with_active_viewer_context(|mounted| {
             assert!(
-                mounted.panorama_state.is_none(),
+                mounted.panorama_state().is_none(),
                 "a detached window must not inherit panorama mode from another viewer context"
             );
             assert!(
                 !mounted.pano_toast_shown_for_current_fs,
                 "panorama guide state is also per fullscreen viewer context"
             );
-            mounted.panorama_state = Some(crate::panorama::PanoramaState::new(
-                0.25,
-                -0.1,
-                crate::panorama::PanoProjection::Perspective,
-            ));
+            mounted.set_fs_exclusive_view(
+                crate::fs_exclusive_view::FsExclusiveView::Panorama(
+                    crate::panorama::PanoramaState::new(
+                        0.25,
+                        -0.1,
+                        crate::panorama::PanoProjection::Perspective,
+                    ),
+                ),
+                "panorama_on",
+            );
             mounted.pano_toast_shown_for_current_fs = true;
         });
 
         app.with_active_viewer_context(|active| {
             assert!(
-                active.panorama_state.is_some(),
+                active.panorama_state().is_some(),
                 "panorama mode enabled in the detached window must be stored with that window"
             );
             assert!(active.pano_toast_shown_for_current_fs);
@@ -110018,7 +110070,7 @@ mod sns_split_p2_transition_tests {
 
         app.toggle_panorama_mode(1);
 
-        assert!(app.panorama_state.is_some());
+        assert!(app.panorama_state().is_some());
         assert_sns_split_transient_state_cleared(&app);
         assert_eq!(app.spread_mode, crate::settings::SpreadMode::Single);
         assert_eq!(app.fullscreen_idx, Some(1));

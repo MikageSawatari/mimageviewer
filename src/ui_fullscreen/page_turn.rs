@@ -1810,7 +1810,7 @@ impl App {
         self.settings.page_turn_animation_enabled
             && self.reading_flow.is_paged()
             && !self.fs_entry_is_animated(page_idx)
-            && !self.is_panorama_mode_active(page_idx)
+            && !self.fs_exclusive_view_active(page_idx).is_some()
             && !self.is_overlay_edit_mode_active()
             && !self.analysis_mode
             && !self.adjustment_mode.is_open()

@@ -5379,6 +5379,9 @@ pub struct Settings {
     /// そのセッションの `PanoramaState` だけを動かす。
     #[serde(default)]
     pub panorama_projection: crate::panorama::PanoProjection,
+    /// 3D 写真の動き・奥行き。ON/OFF は viewer セッションだけが所有する。
+    #[serde(default)]
+    pub depth_parallax: crate::depth_parallax::DepthParallaxSettings,
     /// Length of one side of the navigator canvas in logical points.
     #[serde(default = "default_fullscreen_navigator_size")]
     pub fullscreen_navigator_size: f32,
@@ -7917,6 +7920,7 @@ impl Default for Settings {
             fullscreen_navigator_visible: false,
             fullscreen_navigator_corner: FullscreenNavigatorCorner::default(),
             panorama_projection: crate::panorama::PanoProjection::default(),
+            depth_parallax: crate::depth_parallax::DepthParallaxSettings::default(),
             fullscreen_navigator_size: FULLSCREEN_NAVIGATOR_SIZE_DEFAULT,
             fullscreen_seek_bar_locked: false,
             still_seek_strip_locked: false,
@@ -10303,6 +10307,7 @@ impl Settings {
             clamp_fullscreen_cursor_hide_delay_secs(self.fullscreen_cursor_hide_delay_secs);
         self.fullscreen_navigator_corner = self.fullscreen_navigator_corner.normalized();
         self.panorama_projection = self.panorama_projection.normalized();
+        self.depth_parallax.normalize();
         self.fullscreen_navigator_size = if self.fullscreen_navigator_size.is_finite() {
             self.fullscreen_navigator_size
                 .clamp(FULLSCREEN_NAVIGATOR_SIZE_MIN, FULLSCREEN_NAVIGATOR_SIZE_MAX)
@@ -10650,6 +10655,8 @@ impl Settings {
         self.sns_split_count = src.sns_split_count;
         self.sns_split_seam_permille = src.sns_split_seam_permille;
         self.sns_split_frame_ratio = src.sns_split_frame_ratio.take();
+        // 3D 写真パネルのライブ調整を古い環境設定 draft で巻き戻さない。
+        self.depth_parallax.clone_from(&src.depth_parallax);
         // フォルダバー (アドレス行) の表示設定も v2.0.0 で右クリックメニューへ移したため、
         // 環境設定を開いている間の変更が OK で巻き戻らないよう live 値を引き継ぐ (Codex P2)。
         self.show_toolbar_folder = src.show_toolbar_folder;
@@ -20500,6 +20507,35 @@ mod tests {
             );
             let _ = env;
         }
+    }
+
+    #[test]
+    fn depth_parallax_settings_default_roundtrip_and_sanitize() {
+        let defaults: super::Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            defaults.depth_parallax,
+            crate::depth_parallax::DepthParallaxSettings::default()
+        );
+        let mut configured = defaults;
+        configured.depth_parallax.motion = crate::depth_parallax::MotionKind::FigureEight;
+        configured.depth_parallax.strength = 0.035;
+        configured.depth_parallax.period_secs = 7.0;
+        configured.depth_parallax.focus = 0.7;
+        configured.depth_parallax.shape_depth = false;
+        let restored: super::Settings =
+            serde_json::from_value(serde_json::to_value(&configured).unwrap()).unwrap();
+        assert_eq!(restored.depth_parallax, configured.depth_parallax);
+        let mut live = restored;
+        let mut stale_draft = super::Settings::default();
+        stale_draft.overwrite_non_preferences_from(&mut live);
+        assert_eq!(stale_draft.depth_parallax, configured.depth_parallax);
+        configured.depth_parallax.strength = 1.0;
+        configured.depth_parallax.period_secs = 0.0;
+        configured.depth_parallax.focus = -1.0;
+        configured.sanitize();
+        assert_eq!(configured.depth_parallax.strength, 0.05);
+        assert_eq!(configured.depth_parallax.period_secs, 1.0);
+        assert_eq!(configured.depth_parallax.focus, 0.0);
     }
 
     #[test]

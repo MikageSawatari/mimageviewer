@@ -8086,6 +8086,28 @@ impl App {
         action: RingActionId,
         source: &'static str,
     ) -> Option<AddressBarNav> {
+        // These alternate input routes share Depth's fullscreen restrictions.
+        // Panorama keeps its released ring behavior; its key restrictions remain separate.
+        if context == RingShortcutContext::ImageFullscreen
+            && self.fullscreen_idx.is_some_and(|idx| {
+                self.fs_exclusive_view_active(idx)
+                    == Some(crate::fs_exclusive_view::ExclusiveViewKind::Depth)
+            })
+        {
+            match &action {
+                RingActionId::ImageToggleMetadata => {
+                    self.toggle_depth_panel();
+                    ctx.request_repaint();
+                    return None;
+                }
+                RingActionId::ImageSlideshow
+                | RingActionId::ImageZoomMode
+                | RingActionId::ImagePixelGrid
+                | RingActionId::ImageBackgroundCycle
+                | RingActionId::ImageComparePin => return None,
+                _ => {}
+            }
+        }
         if self.page_overview.session().is_some() && context == RingShortcutContext::ImageFullscreen
         {
             if self.page_overview_ring_action_executable(context, &action)

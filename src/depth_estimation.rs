@@ -56,6 +56,33 @@ pub(crate) struct DepthPending {
 }
 
 impl DepthPending {
+    /// Windowless stage-B tests can exercise the real adoption/upload boundary
+    /// without model initialization or changing the process worker's backend.
+    #[cfg(test)]
+    pub(crate) fn completed_for_test(
+        context: ViewerContextId,
+        request_id: u64,
+        map: DepthMap,
+    ) -> Self {
+        let stamp = RequestStamp {
+            context,
+            request_id,
+            key: map.key,
+        };
+        let (reply, rx) = mpsc::channel();
+        reply
+            .send(DepthReply {
+                stamp,
+                result: Ok(map),
+            })
+            .unwrap();
+        Self {
+            stamp,
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+        }
+    }
+
     pub(crate) fn request_id(&self) -> u64 {
         self.stamp.request_id
     }

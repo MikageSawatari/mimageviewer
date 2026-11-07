@@ -1,5 +1,22 @@
 # 表示パイプライン (サムネイル / フルスクリーン)
 
+## 3D 写真の表示レイヤー（2026-11-07、段 B 実装・独立レビュー中）
+
+3D は既存の final / comic / source の優先順位を変更しない。
+`resolve_fs_processed_payload_and_depth` が通常 selector と同じ選択から payload と
+`DepthSourceMaterial` を返す。元画像ホールド、navigation の通過表示、注釈ベイク、
+不完全な final、thumbnail 代役、元 texture のない Native は `NotYet` とし、既存2Dを描く。
+RAW preview は最終素材として扱い、現像完了で source TextureId が変われば再計算する。
+Native しか残らない場合の復元は既存の final/edit と original material 準備を通す。
+Depth は紙めくり対象外なので held presentation を選び続けず、通常の素材選択へ戻る。
+
+Ready の元 texture から GPU blit で `Rgba8Unorm` の色＋mipmapを作り、
+504×504入力と長辺最大1536のガイドだけを readback する。深度を `R16Float` に上げ、
+同じ表示 transform の fit / UV / 90度回転と下地を使って視差 callback を描く。
+元 texture 自体は書き換えず、final / processed の source ID を深度の鍵とする。
+mouse / touch の zoom・pan と navigator は Depth 中だけ止め、通常2Dの transform は保持する。
+占有 owner、readiness、全入口の分類と検証状況の正本は [3D 設計](depth-parallax-plan.md)。
+
 §1.668（案C）: PC Collection rootのgeneric thumbnailは可視workerでdrive/UNC保持の実親catalogを
 既存DBだけROで個別lookupし、既存stamp/proof・preview優先・cache/source分岐を通る。
 typedな保存targetは実測policy/forceで保存が確定した後だけRWを開き、非保存Autoで空DBを作らない。

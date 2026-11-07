@@ -739,6 +739,9 @@ use final_prepare::{FinalEffectOrigin, FinalEffectReady, FinalEffectReceiver, Fi
 pub(crate) use prepared_edit::{
     FinalPipelineInvalidation, PreparedEditCancel, PreparedEditDisposition, PreparedEditReject,
 };
+mod depth_view;
+#[cfg(all(test, windows))]
+mod depth_view_tests;
 #[cfg(test)]
 pub(crate) mod final_prepare_tests;
 #[cfg(windows)]
@@ -17441,7 +17444,7 @@ pub struct App {
     /// 360 度パノラマビュー: インタラクティブステート (フルスクリーン内のみ Some)。
     /// 360 モード ON → Some、OFF → None。equirect でない画像へナビした場合は
     /// **保持しつつ非アクティブ化** する設計 (`is_panorama_mode_active(fs_idx)` で判定)。
-    pub(crate) panorama_state: Option<crate::panorama::PanoramaState>,
+    pub(crate) fs_exclusive_view: crate::fs_exclusive_view::FsExclusiveView,
     /// mount 中の viewer context が所有する通常動画の拡大・パン state の投影。
     /// 360 と違いセッション意図は持たず、項目が変わるたびに `None` へ戻す。
     pub(crate) video_zoom_state: Option<crate::video::zoom_view::VideoZoomState>,
@@ -21364,7 +21367,7 @@ impl App {
             xmp_panorama_info: std::collections::HashMap::new(),
             sidecar_display_cache: std::collections::HashMap::new(),
             caption_display: crate::caption_display_cache::CaptionDisplayCache::default(),
-            panorama_state: None,
+            fs_exclusive_view: crate::fs_exclusive_view::FsExclusiveView::None,
             video_zoom_state: None,
             #[cfg(windows)]
             native_video_mouse_seek_holds: native_video::NativeVideoMouseSeekHolds::default(),
@@ -52803,10 +52806,11 @@ impl App {
     ) -> bool {
         let base_active = self.adjustment_mode.is_open()
             && !matches!(self.compare_view_mode, CompareViewMode::Wipe { .. })
-            && !self.is_panorama_mode_active(fs_idx)
+            && !self.fs_exclusive_view_active(fs_idx).is_some()
             && !self.fs_zoom_mode_engaged();
-        let analysis_active =
-            self.analysis_mode && !is_spread_double && !self.is_panorama_mode_active(fs_idx);
+        let analysis_active = self.analysis_mode
+            && !is_spread_double
+            && !self.fs_exclusive_view_active(fs_idx).is_some();
         base_active
             && !self.fs_music_view_active(fs_idx)
             && !analysis_active
@@ -64154,10 +64158,16 @@ impl App {
         self.clear_fullscreen_tag_picker_state();
 
         self.deactivate_compare_view();
-        if self.panorama_state.is_some() {
+        if !matches!(
+            self.fs_exclusive_view,
+            crate::fs_exclusive_view::FsExclusiveView::None
+        ) {
             // park は利用者が 360 をやめた操作ではないので、**意図は残す**。
             // 残さないと parked 側が resume したときに 360 が戻らない (backlog §1.145)。
-            self.apply_panorama_mode_toggle(fs_idx);
+            self.set_fs_exclusive_view(
+                crate::fs_exclusive_view::FsExclusiveView::None,
+                "park_or_fork",
+            );
         }
         if self.video_zoom_state.take().is_some() {
             self.sync_native_video_zoom_state(fs_idx);
@@ -66486,7 +66496,10 @@ impl App {
                 self.fullscreen_idx = None;
                 #[cfg(windows)]
                 self.publish_effetune_auto_fullscreen();
-                self.viewer_presentation = self.non_detached_viewer_presentation();
+                self.commit_viewer_presentation(
+                    self.non_detached_viewer_presentation(),
+                    "presentation_commit",
+                );
                 #[cfg(windows)]
                 self.publish_effetune_auto_fullscreen();
                 self.detached_viewer_independent_active = false;
@@ -66567,7 +66580,10 @@ impl App {
                     DetachedWindowState::Opening,
                     "start_active_detached_loading_context",
                 );
-                app.viewer_presentation = ViewerPresentation::DetachedWindow;
+                app.commit_viewer_presentation(
+                    ViewerPresentation::DetachedWindow,
+                    "detached_commit",
+                );
                 app.detached_viewer_independent_active = true;
                 app.address = address.to_string_lossy().to_string();
                 let outcome = initialize
@@ -66705,7 +66721,10 @@ impl App {
                     "start_active_detached_collection_root_image",
                 );
                 app.detached_viewer_independent_active = true;
-                app.viewer_presentation = ViewerPresentation::DetachedWindow;
+                app.commit_viewer_presentation(
+                    ViewerPresentation::DetachedWindow,
+                    "detached_commit",
+                );
                 app.fs_open_intent_from_grid = false;
                 app.top_level_grid_view.begin(
                     top_level_grid_view::TopLevelGridSurface::Collection(plan.identity),
@@ -68826,7 +68845,10 @@ impl App {
         self.fullscreen_idx = None;
         #[cfg(windows)]
         self.publish_effetune_auto_fullscreen();
-        self.viewer_presentation = self.non_detached_viewer_presentation();
+        self.commit_viewer_presentation(
+            self.non_detached_viewer_presentation(),
+            "presentation_commit",
+        );
         #[cfg(windows)]
         self.publish_effetune_auto_fullscreen();
         self.detached_viewer_independent_active = false;
@@ -68976,7 +68998,10 @@ impl App {
         self.fullscreen_idx = None;
         #[cfg(windows)]
         self.publish_effetune_auto_fullscreen();
-        self.viewer_presentation = self.non_detached_viewer_presentation();
+        self.commit_viewer_presentation(
+            self.non_detached_viewer_presentation(),
+            "presentation_commit",
+        );
         #[cfg(windows)]
         self.publish_effetune_auto_fullscreen();
         self.detached_viewer_independent_active = false;
@@ -69298,7 +69323,10 @@ impl App {
         self.fullscreen_idx = None;
         #[cfg(windows)]
         self.publish_effetune_auto_fullscreen();
-        self.viewer_presentation = self.non_detached_viewer_presentation();
+        self.commit_viewer_presentation(
+            self.non_detached_viewer_presentation(),
+            "presentation_commit",
+        );
         #[cfg(windows)]
         self.publish_effetune_auto_fullscreen();
         self.detached_viewer_independent_active = false;
@@ -70763,7 +70791,7 @@ impl App {
         if self.viewer_presentation != presentation {
             self.fs_front_pointer = Default::default();
         }
-        self.viewer_presentation = presentation;
+        self.commit_viewer_presentation(presentation, "presentation_commit");
         #[cfg(windows)]
         self.publish_effetune_auto_fullscreen();
         if detached_still && !independent_detached_still {
@@ -79043,7 +79071,7 @@ impl App {
                 .detached_viewer_image_edit_tools_disabled_reason()
                 .is_some()
             || self.continuous_reading_active_for_idx(requested_fs_idx)
-            || self.is_panorama_mode_active(requested_fs_idx)
+            || self.fs_exclusive_view_active(requested_fs_idx).is_some()
             || self.fs_entry_is_animated(idx)
             || matches!(
                 self.items.get(idx),
@@ -79144,7 +79172,7 @@ impl App {
             && self
                 .detached_viewer_image_edit_tools_disabled_reason()
                 .is_none()
-            && !self.is_panorama_mode_active(request.from_idx)
+            && !self.fs_exclusive_view_active(request.from_idx).is_some()
     }
 
     fn start_media_load_with_origin(
@@ -80907,7 +80935,10 @@ impl App {
         // intent (including borderless state) through intermediate folder-nav closes.
         let preserve_detached_for_folder_nav = self.detached_active_window_alive_wanted();
         if !preserve_detached_for_folder_nav {
-            self.viewer_presentation = self.non_detached_viewer_presentation();
+            self.commit_viewer_presentation(
+                self.non_detached_viewer_presentation(),
+                "presentation_commit",
+            );
             #[cfg(windows)]
             self.publish_effetune_auto_fullscreen();
             self.last_viewer_sync_stamp = None;
@@ -80999,7 +81030,7 @@ impl App {
                 // viewport instead of reusing the existing detached host.
                 self.fs_open_intent_from_grid = false;
                 self.fs_viewport_shown = true;
-                self.viewer_presentation = viewer_presentation;
+                self.commit_viewer_presentation(viewer_presentation, "presentation_commit");
                 #[cfg(windows)]
                 self.publish_effetune_auto_fullscreen();
                 self.fs_viewport_presentation = fs_viewport_presentation;
@@ -81504,7 +81535,10 @@ impl App {
         // 360 度パノラマビュー: フルスクリーン退出で state と GPU リソースを drop。
         // docs/panorama-360-view-plan.md §5.1 / §6.3。CallbackResources からも
         // UploadedPanoTextureRef を除去 (Codex P2 第 18 ラウンド)。
-        self.panorama_state = None;
+        self.set_fs_exclusive_view(
+            crate::fs_exclusive_view::FsExclusiveView::None,
+            "panorama_off",
+        );
         self.video_zoom_state = None;
         self.clear_pano_upload();
         self.pano_toast_shown_for_current_fs = false;
@@ -91627,7 +91661,7 @@ impl App {
         if self.viewer_presentation != target_presentation {
             self.fs_front_pointer = Default::default();
         }
-        self.viewer_presentation = target_presentation;
+        self.commit_viewer_presentation(target_presentation, "presentation_commit");
         #[cfg(windows)]
         self.publish_effetune_auto_fullscreen();
         self.native_video_in_window_active =
@@ -94169,7 +94203,7 @@ impl App {
     /// 360 モードが現在 fs_idx に対してアクティブか。`panorama_state` が `Some`
     /// かつ `detect_panorama` がトリガーを返す場合のみ true。
     pub(crate) fn is_panorama_mode_active(&self, fs_idx: usize) -> bool {
-        self.panorama_state.is_some() && self.detect_panorama(fs_idx).is_some()
+        self.panorama_state().is_some() && self.detect_panorama(fs_idx).is_some()
     }
 
     /// 360 度パノラマビュー Phase 2a: `source_key` (metadata_cache_key) から
@@ -94485,7 +94519,7 @@ impl App {
         let Some(resolution) = self.resolve_pano_source(ctx, fs_idx) else {
             return;
         };
-        let Some(pano_state) = self.panorama_state.as_ref() else {
+        let Some(pano_state) = self.panorama_state() else {
             return;
         };
         let pose = pano_state.pose();
@@ -94597,7 +94631,7 @@ impl App {
         fs_idx: usize,
         resolution: &crate::panorama::PanoSourceResolution,
     ) {
-        let Some(pano_state) = self.panorama_state.as_ref() else {
+        let Some(pano_state) = self.panorama_state() else {
             return;
         };
         let pose = pano_state.pose();
@@ -94966,7 +95000,7 @@ impl App {
     /// を通る。360 は機能制限モードなので、衝突するパネル / モードを止める副作用まで
     /// 含めて同じでなければ、復帰したときだけ 360 と補正パネルが同時に開く。
     pub(crate) fn reconcile_panorama_session_intent(&mut self, fs_idx: usize) {
-        if !self.panorama_intent.on || self.panorama_state.is_some() {
+        if !self.panorama_intent.on || self.panorama_state().is_some() {
             return;
         }
         // 素材判定を先に見るのは、この後の `resolve_spread_pair` が毎フレーム呼ぶには
@@ -94990,6 +95024,9 @@ impl App {
     /// `resolve_spread_pair` はフレーム冒頭で 1 回だけ解くのが既存の作法。
     pub(crate) fn panorama_entry_allowed(&self, fs_idx: usize, is_spread_double: bool) -> bool {
         let is_video = matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Video { .. }));
+        if self.fs_exclusive_view.is_depth() {
+            return false;
+        }
         crate::panorama::entry_allowed(
             self.detect_panorama(fs_idx),
             is_video,
@@ -95034,7 +95071,7 @@ impl App {
         if self.pano_toast_shown_for_current_fs {
             return false;
         }
-        if self.panorama_state.is_some() {
+        if self.panorama_state().is_some() {
             return false;
         }
         let Some(trigger) = self.detect_panorama(fs_idx) else {
@@ -95361,7 +95398,7 @@ impl App {
     /// ここで overlay を明示破棄しないのは、pose を単一の型
     /// ([`crate::panorama::PanoPose`]) に閉じて stale 判定を 1 箇所に保つため。
     pub(crate) fn cycle_panorama_projection(&mut self) -> Option<crate::panorama::PanoProjection> {
-        let next = self.panorama_state.as_ref()?.projection.next();
+        let next = self.panorama_state()?.projection.next();
         self.set_panorama_projection(next)
     }
 
@@ -95372,7 +95409,7 @@ impl App {
         &mut self,
         projection: crate::panorama::PanoProjection,
     ) -> Option<crate::panorama::PanoProjection> {
-        let pano = self.panorama_state.as_mut()?;
+        let pano = self.panorama_state_mut()?;
         let applied = pano.set_projection(projection);
         pano.sanitize();
         // 選んだ方式はセッションに覚える。360 を解除して入れ直したときに既定へ
@@ -95391,7 +95428,7 @@ impl App {
     /// [`Self::apply_panorama_mode_toggle`] を直に呼び、意図を書き換えない。
     pub(crate) fn toggle_panorama_mode(&mut self, fs_idx: usize) {
         self.apply_panorama_mode_toggle(fs_idx);
-        self.panorama_intent.on = self.panorama_state.is_some();
+        self.panorama_intent.on = self.panorama_state().is_some();
     }
 
     /// 360 モード ON / OFF の状態遷移そのもの。fs_idx は対象画像 (検出 hint の初期視点取得用)。
@@ -95404,29 +95441,17 @@ impl App {
     /// - compare_view_mode を Off
     /// - show_metadata_panel は false に
     pub(crate) fn apply_panorama_mode_toggle(&mut self, fs_idx: usize) {
+        if self.fs_exclusive_view.is_depth() {
+            return;
+        }
         let is_video = matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Video { .. }));
-        if self.panorama_state.is_some() {
+        if self.panorama_state().is_some() {
             // OFF: state と GPU リソースを drop (callback_resources からも除去、
             // Codex P2 第 18 ラウンド)。
-            self.panorama_state = None;
-            // 投影ポップアップの持ち主 (上バーの投影ボタン) は 360 OFF で消えるので、
-            // 開いたまま残さない。残すとカーソル自動非表示やホイールの抑制が効き続ける。
-            self.panorama_projection_popup_open = false;
-            self.clear_pano_upload();
-            // **進行中の settle render と high-res worker を cancel** (Codex P2 第 8、
-            // 2026-05): 360 OFF 中も worker が走り続けると、(a) ~2.15 GB の RGBA を
-            // 数秒余分にメモリに保持、(b) 失敗時に `BaseOnly` / `failed` state を
-            // 立ててしまい、再度 V キーで ON にしても 8K base 表示で固まる。OFF は
-            // 「今は 360 不要」の明示シグナルなので worker を止めるのが UX 上自然。
-            // HighResSource (既に loaded 済み) は保持 (= 再 ON で即 settle 再開可能)。
-            self.clear_pano_refinement();
-            for (_, req) in self.pano_high_res_pending.drain() {
-                req.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-            #[cfg(windows)]
-            if is_video {
-                self.sync_native_video_panorama_state(fs_idx);
-            }
+            self.set_fs_exclusive_view(
+                crate::fs_exclusive_view::FsExclusiveView::None,
+                "panorama_off",
+            );
             return;
         }
         // ON: GPano hint があれば初期視点に反映
@@ -95436,9 +95461,12 @@ impl App {
         let projection = self
             .panorama_intent
             .projection_or(self.settings.panorama_projection);
-        self.panorama_state = Some(crate::panorama::PanoramaState::new(
-            init_yaw, init_pitch, projection,
-        ));
+        self.set_fs_exclusive_view(
+            crate::fs_exclusive_view::FsExclusiveView::Panorama(
+                crate::panorama::PanoramaState::new(init_yaw, init_pitch, projection),
+            ),
+            "panorama_on",
+        );
         // Video 360 owns the same native canvas as tile mode, but it is not the
         // still-viewer's restriction mode. Keep playback and panels intact.
         if is_video {
@@ -95456,6 +95484,10 @@ impl App {
         // 衝突する機能を停止 (docs/panorama-360-view-plan.md フィードバック対応):
         // 360 中は上バーのみの機能制限モードになるので、他の panel / mode を OFF
         // しておく。これらは 360 OFF 後にユーザーが再度有効化できる。
+        self.close_fs_exclusive_conflicts();
+    }
+
+    pub(crate) fn close_fs_exclusive_conflicts(&mut self) {
         self.slideshow_playing = false;
         self.slideshow_anchor_idx = None;
         self.continuous_reading_scroll_transition = None;
@@ -99869,7 +99901,9 @@ impl App {
         // TRT pack オンラインインストールダイアログ (環境設定から起動)。
         self.show_trt_install_dialog(ctx);
         self.show_vlm_addon_dialog(ctx);
-        self.show_depth_addon_dialog(ctx);
+        if !main_viewer_blocked {
+            self.show_depth_addon_dialog(ctx);
+        }
         // 編集用追加パック (フォント + 被写体分離モデル) のオンライン取得ダイアログ。
         // ⚠️ フルスクリーン中はフルスクリーンビューポート側 (ui_fullscreen.rs) で描画する
         //    (VST3 マネージャと同様。両ビューポートで描くと egui::Window の位置が二重管理に
