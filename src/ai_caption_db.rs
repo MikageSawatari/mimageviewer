@@ -220,6 +220,14 @@ pub struct CaptionDb {
     has_rotation: bool,
 }
 
+/// Existing normalized keys and their status counts, read together on a worker.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct CaptionDeletionCandidates {
+    pub keys: Vec<String>,
+    pub ok: usize,
+    pub failed: usize,
+}
+
 impl CaptionDb {
     pub fn db_path() -> PathBuf {
         crate::data_dir::get().join("ai_caption.db")
@@ -714,6 +722,47 @@ impl CaptionDb {
         }))
     }
 
+    /// Worker-only lookup. Keys are already normalized; never normalize them twice.
+    pub(crate) fn count_existing(
+        &self,
+        keys: &[String],
+    ) -> rusqlite::Result<CaptionDeletionCandidates> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut candidates = CaptionDeletionCandidates::default();
+        {
+            let mut query = tx.prepare("SELECT status FROM captions WHERE item_key = ?1")?;
+            for key in keys {
+                let status = query
+                    .query_row([key], |row| row.get::<_, String>(0))
+                    .optional()?;
+                if let Some(status) = status {
+                    if status == "ok" {
+                        candidates.ok += 1;
+                    } else {
+                        candidates.failed += 1;
+                    }
+                    candidates.keys.push(key.clone());
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(candidates)
+    }
+
+    /// Worker-only bulk deletion of normalized keys. Existing triggers own indexing.
+    pub(crate) fn delete_keys(&self, keys: &[String]) -> rusqlite::Result<usize> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let mut deleted = 0;
+        {
+            let mut delete = tx.prepare("DELETE FROM captions WHERE item_key = ?1")?;
+            for key in keys {
+                deleted += delete.execute([key])?;
+            }
+        }
+        tx.commit()?;
+        Ok(deleted)
+    }
+
     /// Worker-only destination initialization/purge. The trigger records removal.
     pub fn delete(&self, item_key: &str) -> rusqlite::Result<usize> {
         self.conn.execute(
@@ -747,6 +796,61 @@ fn system_time_ms(value: SystemTime) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caption_delete_counts_statuses_and_bulk_delete_leaves_each_removal_pending() {
+        let (temp, db, req) = fixture();
+        db.save(&req).unwrap();
+        let mut failed = req.clone();
+        failed.item_path = temp.path().join("failed.jpg");
+        failed.result = CaptionResult::Failed;
+        db.save(&failed).unwrap();
+        let keys = vec![
+            CaptionDb::normalize_path(&req.item_path),
+            CaptionDb::normalize_path(&failed.item_path),
+        ];
+        let mut queried = keys.clone();
+        queried.push(CaptionDb::normalize_path(&temp.path().join("absent.jpg")));
+        let candidates = db.count_existing(&queried).unwrap();
+        assert_eq!(candidates.keys, keys);
+        assert_eq!((candidates.ok, candidates.failed), (1, 1));
+        // The mutation helper consumes normalized keys verbatim.
+        assert_eq!(db.delete_keys(&queried).unwrap(), 2);
+        assert_eq!(db.delete_keys(&queried).unwrap(), 0);
+        assert_eq!(
+            db.count_existing(&queried).unwrap(),
+            CaptionDeletionCandidates::default()
+        );
+        let removed = db
+            .conn
+            .prepare("SELECT item_key FROM caption_removed ORDER BY item_key")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let mut expected = keys;
+        expected.sort();
+        assert_eq!(removed, expected);
+    }
+
+    #[test]
+    fn caption_delete_bulk_failure_rolls_back_all_rows_and_removal_marks() {
+        let (_temp, db, req) = fixture();
+        db.save(&req).unwrap();
+        let key = CaptionDb::normalize_path(&req.item_path);
+        db.conn.execute_batch("CREATE TRIGGER reject_caption_delete BEFORE DELETE ON captions WHEN OLD.item_key = 'blocked' BEGIN SELECT RAISE(ABORT, 'fixture'); END;").unwrap();
+        db.conn.execute("INSERT INTO captions SELECT 'blocked', mtime_ms, size, rotation, model_id, prompt_version, lang, caption, visible_text, cover_ref, keywords, status, created_at, rev, indexed FROM captions", []).unwrap();
+        assert!(db.delete_keys(&[key.clone(), "blocked".into()]).is_err());
+        assert!(db.get(&key).unwrap().is_some());
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM caption_removed", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            0
+        );
+    }
 
     fn request(path: &Path) -> SaveRequest {
         SaveRequest {

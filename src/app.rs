@@ -19179,6 +19179,8 @@ pub struct App {
     pub(crate) vlm_setup: crate::ui_dialogs::vlm_addon::VlmSetup,
     #[cfg(windows)]
     pub(crate) caption_job: Option<crate::ui_dialogs::caption_job::CaptionJob>,
+    #[cfg(windows)]
+    pub(crate) caption_delete: Option<crate::ui_dialogs::caption_delete::CaptionDeleteState>,
     /// Progress-window visibility is independent of the caption worker lifetime.
     #[cfg(windows)]
     pub(crate) show_caption_progress: bool,
@@ -21978,6 +21980,8 @@ impl App {
             #[cfg(windows)]
             caption_job: None,
             #[cfg(windows)]
+            caption_delete: None,
+            #[cfg(windows)]
             show_caption_progress: false,
             fs_boundary_hint: None,
             bucket_region_flash: None,
@@ -24079,6 +24083,10 @@ impl App {
             ($( $cond:expr => $name:literal ),+ $(,)?) => {
                 $( if $cond { return Some($name); } )+
             };
+        }
+        #[cfg(windows)]
+        if self.caption_delete_confirm_visible() {
+            return Some("caption_delete_confirm");
         }
         first![
             self.book_order_saving() => "book_order",
@@ -100681,6 +100689,8 @@ impl eframe::App for App {
         self.poll_vlm_setup(ctx);
         #[cfg(windows)]
         self.poll_caption_job();
+        #[cfg(windows)]
+        self.poll_caption_delete();
         self.caption_display.poll();
         self.poll_capture_selection(ctx);
         self.render_update_before_frame(ctx);

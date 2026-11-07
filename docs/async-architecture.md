@@ -1,5 +1,15 @@
 # 非同期・並列アーキテクチャ
 
+## AI 説明文の削除（§1.730）
+
+App の `caption_delete` が Counting / Confirm / Deleting を単独所有する。
+集計 worker は読み取り専用 DB から存在するキーと ok/failed の内訳を返し、削除 worker は
+確認済みキーを既存 DB の `BEGIN IMMEDIATE` で一括削除する。どちらも結果を channel で返して
+repaint を要求し、root frame は非blocking poll で採用する。UI で DB I/O や join はしない。
+Confirm だけモーダル、作成とは全 phase で排他にして割り込み・再開の仕組みを持たない。
+commit 後は既存の索引通知・共有表示 cache 全消去だけを使う。失敗はログと通知で閉じる。
+正本は [AI 説明文計画 §6.8](local-vlm-caption-plan.md)。
+
 ## 本棚順の単一writer（§1.683）
 
 一覧・本の操作・順保存は既存の製本pending受信口を共有する。`app/book_shelf`は送信済みmode/identity列と最新表示snapshotを分け、一件の書込が終わって異なる最新値があれば一件だけ送る。古い成功はtokenだけ進め、表示は戻さない。ShelfOrderの受信・後続送信・lease解放・終了再開はroot close受理後の共通logic serviceが所有し、LogicOnlyでも進む。他の本結果の表示採用はFull側に残す。管理closeはownerを破棄せず、通常終了は受理済みbatchの終端を既存root lifecycleへ非同期接続する。最初の順操作は既存製本・Shell操作・未完了openと排他し、Remote local modal leaseをbatch終端まで保持する。作成/新規本へのAppend/管理改名/削除/transferは同じworkerで順を保守して完成snapshotを返す。既存本Appendは追加先だけを処理し件数差分を採用する。新規Appendの事前観測は直下名と順序tokenだけで、ページ数は列挙しない。全結果はroot/選択epochで採用し、Listは要求revisionも照合する。root切替は旧List受信口とその番号continuationだけを退役し、捕捉済みmutation workerは保持する。[設計](book-order-plan.md)。

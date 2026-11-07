@@ -647,6 +647,14 @@ UI の種類 hint は最上位も worker の metadata で照合し、`album.pdf`
 変換とパスワードのモーダルは起動せず、未変換・パスワード不足・動画の表紙・読み込み失敗を数える。
 詳細は [計画 §21.13](local-vlm-caption-plan.md#2113-v1-4b-の設計-2026-11-03)。
 
+#### ローカル AI 説明文の削除 (§1.730)
+
+`ui_dialogs/caption_delete.rs` が App の単一 `caption_delete` 状態で集計・確認・削除を進める。
+一覧の右クリックだけから作成と共通の対象を捕捉し、worker が read-only 集計後、確認したキーを
+既存 DB の単一 Immediate transaction で削除する。確認中だけ共通 modal、全 phase で作成と排他。
+既存 trigger の反映待ち、`notify_caption_changed` と共有表示 cache の全消去を再利用する。
+詳細は [計画 §6.8](local-vlm-caption-plan.md#68-説明文の削除-2026-11-07-利用者決定backlog-1730)。
+
 #### ローカル AI 説明文の表示 (V1-4a / V1-4b)
 
 `App::caption_display: CaptionDisplayCache` は `ViewerContextBundle` の外に一つだけ置く。

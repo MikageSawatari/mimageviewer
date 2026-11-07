@@ -389,6 +389,32 @@ VLM の結果は推論の後に届く。何もしないと、A を推論して�
 - mIV の終了時、削除の worker は待たない (1 トランザクションで終わるので、途中で終わっても全部消えるか全く消えないかのどちらか)。
 - detached viewer の経路には触れない (入口は一覧の右クリックだけ)。
 
+実装メモ (2026-11-07): `ui_dialogs/caption_delete.rs` と App の単一
+`caption_delete: Option<CaptionDeleteState>` が Counting / Confirm / Deleting を所有する。
+Counting と Deleting は非モーダル、Confirm だけを共通の modal 判定へ登録する。
+確認では捕捉済みキーを保持し、自身の Confirm を外してから他操作・Remote・作成ジョブを再確認する。
+タグ・評価と同じ `admit_book_append_followup_mutation` を Deleting の受付にも使う。
+モデル取得が後から完了して作成へ進む入口も削除中は拒否し、作成と削除の同時実行を避ける。
+DB の集計・削除は worker 内だけ、スキーマ・trigger は変更しない。まれな失敗はログと通知で終える。
+自動テストと確認用 build の結果は実装引き渡しに記録し、実アプリの操作確認とは区別する。
+
+自動検証 (2026-11-07、未コミット差分): `cargo check -p mimageviewer --bin mimageviewer-core`、
+`cargo nextest run -p mimageviewer --lib -E 'test(/caption|context_menu/)'` (380件すべて成功、
+snapshot 更新指定なし)、`cargo fmt --check`、UI glyph 検査、site card 検査が成功。
+実行記録は `target/caption-check-final.log` / `target/caption-tests-final.log`。
+初回の旧メニュー期待値3件と snapshot 基準2テストの差分を反映した後に再実行した。
+確認画面1枚を追加し、右クリック設定画面2枚を更新した。実アプリの操作は未実施。
+
+独立レビュー (2026-11-07、gpt-6.1-sol / xhigh): **未受入、設計判断待ち**。
+集計中に通常の in-window 閲覧へ入った場合、確認を描く一覧 tail が early return で飛ばされ、
+Confirm の共通 modal だけが残って見えない確認が閲覧操作を止める (P1)。また集計完了を採用する
+pass の Enter が、確認を一度も表示する前の削除確定へ再所属する (P2)。上の380件はこの2経路を
+覆わない。実装者も関連コードを照合し、利用者指定の「前提の矛盾では設計担当へ報告」に従い
+追加実装を停止した。仕様は未変更。集計中も可視 modal にして遷移を禁止し、確認表示後の入力
+だけを受ける案を設計担当へ提示する。非modalを維持する案は表示先と入力所有の追加設計が要る。
+確認用 `build-dev.ps1` は core のコンパイル中に中断し、実行用の完成 binary は引き渡していない。
+コミットなし。全件テスト・実機操作・設計担当によるPNG目視確認は未実施。
+
 ## 7. 保存
 
 - 新しいストア `ai_caption.db` (SQLite、未リリースなので移行は不要)。

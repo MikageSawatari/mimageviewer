@@ -772,6 +772,8 @@ impl App {
         self.show_video_upscale_tasks_window(ctx);
         #[cfg(windows)]
         self.show_caption_job_progress(ctx);
+        #[cfg(windows)]
+        self.show_caption_delete_confirm(ctx);
     }
 
     pub(super) fn service_thumb_quality_results(&mut self, ctx: &egui::Context) {

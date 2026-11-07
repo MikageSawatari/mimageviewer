@@ -1,5 +1,14 @@
 # UI スナップショットテスト運用方針
 
+§1.730 の説明文削除は、製品と共通の純粋な確認 Window を描く lib の
+`caption_delete_confirmation_snapshot` で `caption_delete_confirmation_dark.png` を1枚追加する。
+App・DB・worker は snapshot fixture に含めない。件数・失敗記録の内訳・取り消せない説明・
+削除／キャンセルを保持する。1093×614 の両ボタンとタイトル×の矩形・キャンセル、
+Enter/Escape と IME は別の headless 回帰で検査する。
+設定 catalog に項目が増えるため、`preferences_context_menu_layout.png` と
+`preferences_context_menu_layout_open_with.png` を更新する。追加行とスクロール後の配置を
+生成画像で確認し、設計担当へ3枚を目視確認用に引き渡す。実アプリの操作確認とは区別する。
+
 §1.727の加工内容選択は、製品と共通のWindow描画関数を使うlibの
 `effect_picker_default_dark_snapshot`で、既定サイズ860×560の窓（PNGは1000×660）の
 `local_adjust_effect_picker_default_dark.png`を1枚保持する。製品の暗色テーマ・
