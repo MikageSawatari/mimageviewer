@@ -560,6 +560,10 @@ thumbnail結果はeditor寿命のownerへだけ採用し、背景viewerのqueue/
       近似へ変えない。入力世代・表示順・font/style/DPI 変更時は古い state を破棄する。
 - [ ] **画像デコード / XMP / EXIF 読み取り**: 絶対に worker thread。
       既存 `fs_pending` / `metadata_pending` に乗せられないか確認。
+      索引作成の JPEG/PNG は Ctrl+F pass 2 と同じ path reader で画像本体を seek し、
+      見出しと必要なメタだけを読む。既存 ingest worker と I/O permit 内で行い、UI 同期 I/O は追加しない。
+      初回の読込量は `index/initial_scan_done` の `metadata_bytes_read` / `metadata_files_read` で確認する
+      ([計数対象と除外範囲](search-architecture.md#83-perf-計装))。実フォルダの時間短縮は未測定。
 - [ ] **cancel パス**: フォルダ切替 / close_fullscreen / 新リクエスト投入時、
       古い pending を cancel できるか。
 - [ ] **perf 計装**: 該当区間に perf::event を追加 (`--perf-log` 計測できるように)。

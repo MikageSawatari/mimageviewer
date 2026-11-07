@@ -86,6 +86,9 @@ pub struct SupervisorStats {
     pub overflowed: bool,
     /// 初期スキャンの所要時間 (初回のみ記録, 以降の手動再構築では更新しない)
     pub initial_scan_duration_ms: Option<u64>,
+    /// Initial full scan's counted metadata I/O; watcher/manual scans do not update these.
+    pub initial_metadata_bytes_read: u64,
+    pub initial_metadata_files_read: usize,
     /// 直近のフル再スキャン所要時間 (initial_scan 含む, 更新あり)
     pub last_scan_duration_ms: Option<u64>,
     /// 直近のスキャンで走査された候補ファイル総数
@@ -468,33 +471,47 @@ fn supervisor_loop(
             &progress,
         );
     }
-    let initial_scan_duration_ms = {
+    let (initial_scan_duration_ms, metadata_bytes_read, metadata_files_read) = {
         let mut stats = stats.lock().unwrap();
         stats.initial_scan_done = true;
         stats.initial_scan_skipped = enable_metadata_index && skip_initial_scan;
-        stats.initial_scan_duration_ms.unwrap_or_default()
+        (
+            stats.initial_scan_duration_ms.unwrap_or_default(),
+            stats.initial_metadata_bytes_read,
+            stats.initial_metadata_files_read,
+        )
     };
-    crate::perf::event(
-        "index",
-        "initial_scan_done",
-        None,
-        0,
-        &[
-            ("index_kind", serde_json::Value::from("fts")),
-            (
-                "skipped",
-                serde_json::Value::from(enable_metadata_index && skip_initial_scan),
-            ),
-            (
-                "favorite_id",
-                serde_json::Value::from(favorite_id.to_string()),
-            ),
-            (
-                "duration_ms",
-                serde_json::Value::from(initial_scan_duration_ms),
-            ),
-        ],
-    );
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "index",
+            "initial_scan_done",
+            None,
+            0,
+            &[
+                ("index_kind", serde_json::Value::from("fts")),
+                (
+                    "skipped",
+                    serde_json::Value::from(enable_metadata_index && skip_initial_scan),
+                ),
+                (
+                    "favorite_id",
+                    serde_json::Value::from(favorite_id.to_string()),
+                ),
+                (
+                    "duration_ms",
+                    serde_json::Value::from(initial_scan_duration_ms),
+                ),
+                (
+                    "metadata_bytes_read",
+                    serde_json::Value::from(metadata_bytes_read),
+                ),
+                (
+                    "metadata_files_read",
+                    serde_json::Value::from(metadata_files_read),
+                ),
+            ],
+        );
+    }
     // スキャン完了後は "今の作業" を消す (UI が ⏳→✅ に切り替わるタイミング)
     progress.clear();
 
@@ -1105,6 +1122,8 @@ fn run_initial_scan_inner(
         s.last_scan_diag = diag;
         if is_initial {
             s.initial_scan_duration_ms = Some(dur_ms);
+            s.initial_metadata_bytes_read = ingest_stats.metadata_bytes_read;
+            s.initial_metadata_files_read = ingest_stats.metadata_files_read;
         }
         // in_full_scan のクリアは関数末尾の InFullScanGuard::drop で行う。
     }
@@ -1530,6 +1549,65 @@ mod tests {
 
     fn write_image(dir: &Path, name: &str) {
         fs::write(dir.join(name), b"pretend-image").unwrap();
+    }
+
+    #[test]
+    fn initial_metadata_totals_are_preserved_after_manual_full_scan() {
+        let (tmp, meta, fts, writer, sem, _gate) = setup();
+        let root = tmp.path().join("images");
+        fs::create_dir(&root).unwrap();
+        write_image(&root, "plain.jpg");
+        fs::write(root.join("plain.jpg.txt"), "initial sidecar").unwrap();
+        fs::write(root.join("empty.jpg"), []).unwrap();
+        let expected =
+            crate::ingest_text::build_per_source_for_file_counted(&root.join("plain.jpg")).1;
+        let id = Uuid::new_v4();
+        let mut session = IngestSession::new_with_caption_db_path(
+            id,
+            root.clone(),
+            &meta,
+            &fts,
+            tmp.path().join("absent-captions.db"),
+        );
+        let stats = Mutex::new(SupervisorStats::default());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = ProgressReporter::new();
+        run_initial_scan(
+            id,
+            &root,
+            &mut session,
+            &writer,
+            &sem,
+            &[],
+            cancel.clone(),
+            &stats,
+            &progress,
+        );
+        {
+            let mut snapshot = stats.lock().unwrap();
+            assert_eq!(snapshot.last_full_outcome, Some(FullScanOutcome::Complete));
+            assert_eq!(snapshot.initial_metadata_bytes_read, expected);
+            assert_eq!(snapshot.initial_metadata_files_read, 1);
+            snapshot.initial_scan_done = true;
+        }
+        // A later full scan reads a new candidate but must keep the initial measurement.
+        write_image(&root, "later.jpg");
+        run_initial_scan(
+            id,
+            &root,
+            &mut session,
+            &writer,
+            &sem,
+            &[],
+            cancel,
+            &stats,
+            &progress,
+        );
+        let snapshot = stats.lock().unwrap();
+        assert_eq!(snapshot.last_full_outcome, Some(FullScanOutcome::Complete));
+        assert_eq!(snapshot.ingested_ok, 3);
+        assert_eq!(snapshot.initial_metadata_bytes_read, expected);
+        assert_eq!(snapshot.initial_metadata_files_read, 1);
     }
 
     #[test]

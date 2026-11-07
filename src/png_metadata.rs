@@ -2110,43 +2110,51 @@ pub(crate) fn build_searchable_from_path_counted(path: &Path) -> SearchableMetad
             bytes_read: 0,
         };
     };
-    match ext.as_str() {
-        "png" => {
-            let read = read_png_text_chunks_counted(path);
-            let (text, origin) = if read.chunks.is_empty() {
-                (String::new(), None)
-            } else {
-                (
-                    build_searchable_from_chunks(&read.chunks),
-                    Some(MetadataOrigin::PngText),
-                )
-            };
-            SearchableMetadataRead {
-                text,
-                origin,
-                bytes_read: read.bytes_read,
-            }
-        }
-        "jpg" | "jpeg" | "jfif" => {
-            let (searchable, bytes_read) = exif_user_comment_searchable_from_path_counted(path);
-            let Some((text, origin)) = searchable else {
-                return SearchableMetadataRead {
-                    text: String::new(),
-                    origin: None,
-                    bytes_read,
-                };
-            };
-            SearchableMetadataRead {
-                text,
-                origin: Some(origin),
-                bytes_read,
-            }
-        }
-        _ => SearchableMetadataRead {
+    if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "jfif") {
+        return SearchableMetadataRead {
             text: String::new(),
             origin: None,
             bytes_read: 0,
-        },
+        };
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return SearchableMetadataRead {
+            text: String::new(),
+            origin: None,
+            bytes_read: 0,
+        };
+    };
+    let mut reader = CountingReader::new(file);
+    let mut magic = [0_u8; 8];
+    // 短いファイル・途中の read error でも、実際に読めた分だけを計数する。
+    let png = reader.read_exact(&mut magic).is_ok() && is_png_bytes(&magic);
+    let magic_bytes = reader.bytes_read;
+    drop(reader);
+    if png {
+        let read = read_png_text_chunks_counted(path);
+        let (text, origin) = if read.chunks.is_empty() {
+            (String::new(), None)
+        } else {
+            (
+                build_searchable_from_chunks(&read.chunks),
+                Some(MetadataOrigin::PngText),
+            )
+        };
+        SearchableMetadataRead {
+            text,
+            origin,
+            bytes_read: magic_bytes + read.bytes_read,
+        }
+    } else {
+        let (searchable, bytes_read) = exif_user_comment_searchable_from_path_counted(path);
+        let (text, origin) = searchable
+            .map(|(text, origin)| (text, Some(origin)))
+            .unwrap_or_default();
+        SearchableMetadataRead {
+            text,
+            origin,
+            bytes_read: magic_bytes + bytes_read,
+        }
     }
 }
 
@@ -2913,6 +2921,54 @@ mod tests {
             }
         }
         assert!(checked > 0, "JPEG fixtures must be discovered");
+    }
+
+    #[test]
+    fn searchable_path_uses_magic_for_mismatched_extensions_and_counts_probe() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for (fixture, target) in [
+            ("enc_a1111_itxt.png", "actually_png.jpg"),
+            ("jpeg_a1111_ascii.jpg", "actually_jpeg.png"),
+        ] {
+            let bytes = std::fs::read(fixture_root(&format!(
+                "tests/fixtures/ai_metadata/{fixture}"
+            )))
+            .unwrap();
+            let path = tmp.path().join(target);
+            std::fs::write(&path, &bytes).unwrap();
+            let read = build_searchable_from_path_counted(&path);
+            let expected = build_searchable_from_bytes_with_origin(&bytes);
+            assert!(!expected.0.is_empty());
+            assert_eq!((read.text, read.origin), expected);
+            let payload_read = if is_png_bytes(&bytes) {
+                read_png_text_chunks_counted(&path).bytes_read
+            } else {
+                exif_user_comment_searchable_from_path_counted(&path).1
+            };
+            assert_eq!(read.bytes_read, 8 + payload_read);
+        }
+    }
+
+    #[test]
+    fn searchable_path_counts_short_missing_and_gated_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for bytes in [b"".as_slice(), b"abc", b"\xff\xd8\xff"] {
+            let path = tmp.path().join("short.png");
+            std::fs::write(&path, bytes).unwrap();
+            let read = build_searchable_from_path_counted(&path);
+            assert!(read.text.is_empty());
+            assert!(read.origin.is_none());
+            // Magic probe + rexif's four-byte probe, both stop at EOF.
+            assert_eq!(read.bytes_read, 2 * bytes.len() as u64);
+        }
+        for name in ["missing.jpg", "unsupported.webp", "extensionless"] {
+            let read = build_searchable_from_path_counted(&tmp.path().join(name));
+            assert!(read.text.is_empty());
+            assert_eq!(read.bytes_read, 0);
+        }
+        let path = tmp.path().join("unsupported.webp");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+        assert_eq!(build_searchable_from_path_counted(&path).bytes_read, 0);
     }
 
     #[test]
