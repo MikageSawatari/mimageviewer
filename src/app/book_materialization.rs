@@ -599,7 +599,6 @@ pub(crate) fn materialize_local_folder_listing_with_order(
             &settings.image_ext_priority,
         ));
     }
-    omitted.sort_for_display();
     let duplicate_filter_ms = duplicate_started.elapsed().as_secs_f64() * 1000.0;
 
     let mut items = folders;

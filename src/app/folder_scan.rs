@@ -154,6 +154,7 @@ impl OmittedEntry {
 pub(crate) struct OmittedFolderEntries {
     pub(crate) counts: OmittedFolderEntryCounts,
     pub(crate) entries: Vec<OmittedEntry>,
+    pub(crate) sorted: bool,
 }
 
 impl OmittedFolderEntries {
@@ -161,6 +162,7 @@ impl OmittedFolderEntries {
         let count = reason.count_mut(&mut self.counts);
         *count = count.saturating_add(1);
         self.entries.push(OmittedEntry { name, reason });
+        self.sorted = false;
     }
 
     fn record_path(&mut self, reason: OmittedReason, path: &std::path::Path) {
@@ -178,16 +180,22 @@ impl OmittedFolderEntries {
         // Materialization historically replaces (rather than adds to) this total.
         self.entries.retain(|entry| !entry.reason.is_same_name());
         self.counts.same_name = 0;
+        self.sorted = false;
     }
 
-    pub(crate) fn sort_for_display(&mut self) {
-        // Temporary sort keys exist only during materialization, never while drawing.
+    pub(crate) fn sort_for_display(&mut self) -> bool {
+        if self.sorted {
+            return false;
+        }
+        // Pay for temporary keys only when this owner's list is actually shown.
         self.entries.sort_by_cached_key(|entry| {
             (
                 entry.reason,
                 crate::filename_sort::FileNameSortKey::new(&entry.name),
             )
         });
+        self.sorted = true;
+        true
     }
 
     #[cfg(test)]
@@ -203,6 +211,36 @@ impl OmittedFolderEntries {
 #[cfg(test)]
 mod omitted_entries_tests {
     use super::*;
+
+    #[test]
+    fn omitted_materialization_preserves_encounter_order_without_display_sort() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut scan = signature_tests::fixture(temp.path());
+        for (reason, name) in [
+            (OmittedReason::System, "Thumbs.db"),
+            (OmittedReason::Unsupported, "z.txt"),
+            (OmittedReason::Unsupported, "a.txt"),
+        ] {
+            scan.omitted.record(reason, name.into());
+        }
+        let listing = materialize_local_folder_listing(
+            temp.path(),
+            scan,
+            &crate::settings::Settings::default(),
+        );
+        assert!(!listing.omitted.sorted);
+        assert_eq!(
+            listing
+                .omitted
+                .entries
+                .iter()
+                .take(3)
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Thumbs.db", "z.txt", "a.txt"]
+        );
+        listing.omitted.assert_consistent();
+    }
 
     fn files(names: &[&str]) -> tempfile::TempDir {
         let temp = tempfile::tempdir().unwrap();
@@ -317,6 +355,7 @@ mod omitted_entries_tests {
                 .record(OmittedReason::ImagePriority, "old.jpg".into());
             let listing = materialize_local_folder_listing(temp.path(), scan, &settings);
             listing.omitted.assert_consistent();
+            assert!(!listing.omitted.sorted);
             let mut expected = vec![
                 ("ZipBook.rar", OmittedReason::ZipExists),
                 ("ZipBook.7z", OmittedReason::ZipExists),
@@ -350,15 +389,16 @@ mod omitted_entries_tests {
             expected.sort_by_key(|entry| {
                 (entry.1, crate::filename_sort::FileNameSortKey::new(entry.0))
             });
-            assert_eq!(
-                listing
-                    .omitted
-                    .entries
-                    .iter()
-                    .map(|entry| (entry.name.as_str(), entry.reason))
-                    .collect::<Vec<_>>(),
-                expected
-            );
+            let mut actual = listing
+                .omitted
+                .entries
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.reason))
+                .collect::<Vec<_>>();
+            actual.sort_by_key(|entry| {
+                (entry.1, crate::filename_sort::FileNameSortKey::new(entry.0))
+            });
+            assert_eq!(actual, expected);
         }
     }
 

@@ -873,6 +873,7 @@ fn rescan_fixture(
             env.folder_observation.as_ref().unwrap().rows.clone(),
             FolderRefreshCause::External,
             mtime,
+            scan.omitted,
         )
     };
     tx.send(Some(result)).unwrap();

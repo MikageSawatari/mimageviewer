@@ -5378,6 +5378,7 @@ pub(crate) enum ExternalRescanResult {
         Arc<folder_scan::FolderRowRecord>,
         book_append_refresh::FolderRefreshCause,
         std::time::SystemTime,
+        folder_scan::OmittedFolderEntries,
     ),
     Different(
         folder_scan::ScannedDir,
@@ -24063,6 +24064,17 @@ impl App {
         &self,
         include_menus: bool,
     ) -> Option<&'static str> {
+        self.modal_dialog_block_reason_without_omitted_entries(include_menus)
+            .or_else(|| {
+                self.omitted_entries_dialog_visible()
+                    .then_some("omitted_entries")
+            })
+    }
+
+    fn modal_dialog_block_reason_without_omitted_entries(
+        &self,
+        include_menus: bool,
+    ) -> Option<&'static str> {
         macro_rules! first {
             ($( $cond:expr => $name:literal ),+ $(,)?) => {
                 $( if $cond { return Some($name); } )+
@@ -24080,7 +24092,6 @@ impl App {
             self.remote_session_blocks_local_control() => "remote_session",
             self.remote_connection_dialog_open() => "remote_connection",
             self.show_stats_dialog => "stats",
-            self.omitted_entries_dialog_visible() => "omitted_entries",
             self.show_favorites_editor => "favorites_editor",
             self.show_smart_folder_editor => "smart_folder_editor",
             self.smart_folder_create_name.is_some() => "smart_folder_create_name",
@@ -27877,6 +27888,7 @@ impl App {
                             materialized.row_record.clone(),
                             cause,
                             parent_mtime,
+                            materialized.omitted,
                         )
                     } else {
                         scan.reconcile = Some(folder_scan::FolderScanReconcile {
@@ -28054,7 +28066,7 @@ impl App {
         let _ = scan_options;
         let result = scan.expect("checked above");
         let mut cause = match &result {
-            ExternalRescanResult::Equal(_, _, cause, _)
+            ExternalRescanResult::Equal(_, _, cause, _, _)
             | ExternalRescanResult::Different(_, _, cause) => cause.clone(),
         };
         if matches!(
@@ -28099,7 +28111,8 @@ impl App {
         }
         let main_context_id = self.viewer_context_main();
         let accepted_now = match result {
-            ExternalRescanResult::Equal(signature, rows, _, parent_mtime) => {
+            ExternalRescanResult::Equal(signature, rows, _, parent_mtime, omitted) => {
+                self.adopt_normal_folder_omitted_entries(&folder, omitted);
                 self.current_folder_signature = Some(signature);
                 self.current_folder_last_mtime = Some(parent_mtime);
                 let previous = self.folder_observation.replace(FolderObservation {
@@ -32324,17 +32337,6 @@ impl App {
             self.video_thumb_overrides
                 .insert(crate::path_key::normalize_keep_drive(&video), image);
         }
-        if !detached_physical
-            && matches!(
-                self.top_level_grid_view.surface(),
-                top_level_grid_view::TopLevelGridSurface::Folder
-            )
-        {
-            self.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
-                folder: path.clone(),
-                omitted,
-            });
-        }
         self.stack_active_rule = None;
         self.stack_script_error = None;
         let items_len = items.len();
@@ -32354,6 +32356,9 @@ impl App {
             prepared_visible,
             None,
         );
+        // The shared write predicate can now validate the adopted folder itself,
+        // before hydration starts any content-identity detection.
+        self.adopt_normal_folder_omitted_entries(&audio_inventory_parent, omitted);
         self.folder_observation = self
             .current_folder
             .as_ref()
@@ -73544,6 +73549,54 @@ impl App {
         self.omitted_entries_dialog_folder = self
             .current_normal_folder_omitted_entries()
             .map(|owner| owner.folder.clone());
+        self.close_omitted_entries_dialog_if_interrupted();
+        self.sort_visible_omitted_entries();
+    }
+
+    /// Both ordinary adoption and Equal rescans publish only the main folder's owner.
+    fn adopt_normal_folder_omitted_entries(
+        &mut self,
+        folder: &Path,
+        omitted: folder_scan::OmittedFolderEntries,
+    ) {
+        if self.edit_request_owner_context() != self.viewer_context_main()
+            || self.navigation_scope.is_detached_physical()
+            || !matches!(
+                self.top_level_grid_view.surface(),
+                top_level_grid_view::TopLevelGridSurface::Folder
+            )
+            || !self
+                .current_folder
+                .as_deref()
+                .is_some_and(|current| crate::folder_tree::path_eq(current, folder))
+        {
+            return;
+        }
+        self.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
+            folder: folder.to_path_buf(),
+            omitted,
+        });
+        self.sort_visible_omitted_entries();
+    }
+
+    fn sort_visible_omitted_entries(&mut self) {
+        if self.omitted_entries_dialog_visible() {
+            self.normal_folder_omitted_entries
+                .as_mut()
+                .unwrap()
+                .omitted
+                .sort_for_display();
+        }
+    }
+
+    pub(crate) fn close_omitted_entries_dialog_if_interrupted(&mut self) {
+        if self.omitted_entries_dialog_folder.is_some()
+            && self
+                .modal_dialog_block_reason_without_omitted_entries(true)
+                .is_some()
+        {
+            self.omitted_entries_dialog_folder = None;
+        }
     }
 
     pub(crate) fn omitted_entries_dialog_visible(&self) -> bool {
@@ -73552,6 +73605,9 @@ impl App {
             .is_some_and(|folder| {
                 self.current_normal_folder_omitted_entries()
                     .is_some_and(|owner| crate::folder_tree::path_eq(folder, &owner.folder))
+                    && self
+                        .modal_dialog_block_reason_without_omitted_entries(true)
+                        .is_none()
             })
     }
 

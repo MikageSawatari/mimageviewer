@@ -3,6 +3,7 @@ use crate::ui_dialogs::preferences::PreferencesOpenRequest;
 
 impl crate::app::App {
     pub(crate) fn show_omitted_entries_dialog(&mut self, ctx: &egui::Context) {
+        self.close_omitted_entries_dialog_if_interrupted();
         if !self.omitted_entries_dialog_visible() {
             self.omitted_entries_dialog_folder = None;
             return;

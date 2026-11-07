@@ -34980,6 +34980,7 @@ mod section207_tests {
                             ..Default::default()
                         },
                         entries: Vec::new(),
+                        ..Default::default()
                     },
                 });
                 env.settings.show_address_bar_history_nav = true;

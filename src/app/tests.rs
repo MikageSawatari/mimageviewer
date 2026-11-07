@@ -1246,6 +1246,7 @@ mod folder_mtime_rescan_tests {
                     app.folder_observation.as_ref().unwrap().rows.clone(),
                     Default::default(),
                     std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2),
+                    Default::default(),
                 ))
             })
             .unwrap();
@@ -13624,6 +13625,7 @@ fn omitted_entries_are_exposed_only_for_the_normal_folder_surface() {
         omitted: crate::app::folder_scan::OmittedFolderEntries {
             counts,
             entries: Vec::new(),
+            ..Default::default()
         },
     });
     assert_eq!(app.current_normal_folder_omitted_counts(), Some(counts));
@@ -13744,6 +13746,140 @@ fn omitted_dialog_opens_uses_live_result_closes_on_staleness_escape_and_settings
     harness.state_mut().open_omitted_entries_dialog();
     harness.state_mut().search_filter = Some(std::collections::HashSet::new().into());
     harness.run_steps(1);
+    assert!(harness.state().omitted_entries_dialog_folder.is_none());
+}
+
+#[test]
+fn omitted_dialog_sorts_only_opened_and_readopted_owners() {
+    use folder_scan::{OmittedFolderEntries, OmittedReason};
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("pictures");
+    app.current_folder = Some(folder.clone());
+    let owner = |last: &str| {
+        let mut omitted = OmittedFolderEntries::default();
+        for (reason, name) in [
+            (OmittedReason::System, "Thumbs.db"),
+            (OmittedReason::Unsupported, "z.txt"),
+            (OmittedReason::Unsupported, last),
+        ] {
+            omitted.record(reason, name.into());
+        }
+        omitted
+    };
+    app.adopt_normal_folder_omitted_entries(&folder, owner("a.txt"));
+    assert!(
+        !app.normal_folder_omitted_entries
+            .as_ref()
+            .unwrap()
+            .omitted
+            .sorted
+    );
+    app.open_omitted_entries_dialog();
+    assert_eq!(
+        app.current_normal_folder_omitted_entries()
+            .unwrap()
+            .omitted
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        ["a.txt", "z.txt", "Thumbs.db"]
+    );
+    assert!(
+        !app.normal_folder_omitted_entries
+            .as_mut()
+            .unwrap()
+            .omitted
+            .sort_for_display(),
+        "opening already sorted this owner once"
+    );
+    app.adopt_normal_folder_omitted_entries(&folder, owner("b.txt"));
+    assert!(
+        app.normal_folder_omitted_entries
+            .as_ref()
+            .unwrap()
+            .omitted
+            .sorted
+    );
+    assert_eq!(
+        app.current_normal_folder_omitted_entries()
+            .unwrap()
+            .omitted
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        ["b.txt", "z.txt", "Thumbs.db"]
+    );
+    assert!(
+        !app.normal_folder_omitted_entries
+            .as_mut()
+            .unwrap()
+            .omitted
+            .sort_for_display(),
+        "re-adoption already sorted the new owner once"
+    );
+}
+
+#[test]
+fn omitted_dialog_yields_before_restore_prompt_can_read_the_same_escape() {
+    use egui_kittest::kittest::Queryable;
+    use folder_scan::{OmittedFolderEntries, OmittedReason};
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("pictures");
+    app.current_folder = Some(folder.clone());
+    let mut omitted = OmittedFolderEntries::default();
+    omitted.record(OmittedReason::Unsupported, "a.txt".into());
+    app.adopt_normal_folder_omitted_entries(&folder, omitted);
+    app.open_omitted_entries_dialog();
+    let mut harness = crate::test_ui::builder()
+        .with_context_setup(crate::ui_fonts::configure_fonts)
+        .with_size(egui::vec2(1000.0, 700.0))
+        .build_ui_state(
+            |ui, app| {
+                app.note_main_chrome_pointer_block_transition(ui.ctx());
+                if app.content_restore_window_visible() {
+                    assert!(
+                        app.omitted_entries_dialog_folder.is_none(),
+                        "list must close before the earlier restore renderer reads Esc"
+                    );
+                }
+                // Match the real root drawing order: restore first, omitted list later.
+                app.show_content_restore_dialog(ui.ctx());
+                app.show_omitted_entries_dialog(ui.ctx());
+            },
+            app,
+        );
+    harness.run();
+    assert!(harness.state().omitted_entries_dialog_visible());
+    harness.state_mut().set_content_restore_candidates(vec![
+        crate::content_identity::RestoreCandidate {
+            epub_source_state: None,
+            target_key: "copied/target.png".into(),
+            target_path: "C:/copied/target.png".into(),
+            target_kind: crate::content_identity::ContentKind::Image,
+            full_hash: "full".into(),
+            sources: vec![crate::content_identity::RestoreSourceCandidate {
+                file_key: "original/source.png".into(),
+                path: "C:/original/source.png".into(),
+                kind: crate::content_identity::ContentKind::Image,
+                last_edit_at: 10,
+                source_exists: true,
+            }],
+        },
+    ]);
+    assert!(!harness.state().omitted_entries_dialog_visible());
+    assert_eq!(
+        harness.state().modal_dialog_block_reason(),
+        Some("content_restore")
+    );
+    harness.run_steps(1);
+    assert!(harness.state().omitted_entries_dialog_folder.is_none());
+    assert!(harness.state().content_restore_window_visible());
+    assert!(harness.query_by_label("a.txt").is_none());
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(1);
+    assert!(harness.state().content_restore_prompt.is_none());
     assert!(harness.state().omitted_entries_dialog_folder.is_none());
 }
 
