@@ -613,7 +613,7 @@ mod tests {
         app.current_folder = Some(folder.to_path_buf());
         app.normal_folder_omitted_entries = Some(crate::app::NormalFolderOmittedEntries {
             folder: folder.to_path_buf(),
-            counts: Default::default(),
+            omitted: Default::default(),
         });
         app.top_level_grid_view
             .replace_surface(crate::app::top_level_grid_view::TopLevelGridSurface::Folder);

@@ -4928,7 +4928,7 @@ pub(crate) struct PreparedScannedFolderListing {
     prepared_folder_rating: Option<(HashMap<usize, u8>, u64, f64)>,
     video_thumb_overrides: Vec<(PathBuf, PathBuf)>,
     audio_inventory: Option<HashSet<String>>,
-    omitted: folder_scan::OmittedFolderEntryCounts,
+    omitted: folder_scan::OmittedFolderEntries,
     rating_order_failed: bool,
     auto_open_image_folder: bool,
     restore_intent: StartupListIntent,
@@ -5378,6 +5378,7 @@ pub(crate) enum ExternalRescanResult {
         Arc<folder_scan::FolderRowRecord>,
         book_append_refresh::FolderRefreshCause,
         std::time::SystemTime,
+        folder_scan::OmittedFolderEntries,
     ),
     Different(
         folder_scan::ScannedDir,
@@ -16297,7 +16298,7 @@ pub(crate) enum MetadataTransferTagDbReleaseState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NormalFolderOmittedEntries {
     pub(crate) folder: PathBuf,
-    pub(crate) counts: folder_scan::OmittedFolderEntryCounts,
+    pub(crate) omitted: folder_scan::OmittedFolderEntries,
 }
 
 /// 静止画・音楽フルスクリーンの「その他の機能」パネルが所有する排他的な表示状態。
@@ -16384,6 +16385,7 @@ pub struct App {
     /// A fullscreen page from a composite grid can own an EPUB independently of current_folder.
     pub(crate) fullscreen_epub_source: Option<crate::pdf_loader::LeasedEpubPath>,
     pub(crate) normal_folder_omitted_entries: Option<NormalFolderOmittedEntries>,
+    pub(crate) omitted_entries_dialog_folder: Option<PathBuf>,
     pub(crate) navigation_scope: ViewerNavigationScope,
     pub(crate) items: Vec<GridItem>,
     pub(crate) projection_recipe: book_materialization::ProjectionRecipe,
@@ -20949,6 +20951,7 @@ impl App {
             fullscreen_epub_source: None,
             #[cfg(windows)]
             normal_folder_omitted_entries: None,
+            omitted_entries_dialog_folder: None,
             navigation_scope: ViewerNavigationScope::Main,
             items: Vec::new(),
             projection_recipe: Default::default(),
@@ -24058,6 +24061,17 @@ impl App {
     }
 
     fn modal_dialog_block_reason_including_menus(
+        &self,
+        include_menus: bool,
+    ) -> Option<&'static str> {
+        self.modal_dialog_block_reason_without_omitted_entries(include_menus)
+            .or_else(|| {
+                self.omitted_entries_dialog_visible()
+                    .then_some("omitted_entries")
+            })
+    }
+
+    fn modal_dialog_block_reason_without_omitted_entries(
         &self,
         include_menus: bool,
     ) -> Option<&'static str> {
@@ -27874,6 +27888,7 @@ impl App {
                             materialized.row_record.clone(),
                             cause,
                             parent_mtime,
+                            materialized.omitted,
                         )
                     } else {
                         scan.reconcile = Some(folder_scan::FolderScanReconcile {
@@ -28051,7 +28066,7 @@ impl App {
         let _ = scan_options;
         let result = scan.expect("checked above");
         let mut cause = match &result {
-            ExternalRescanResult::Equal(_, _, cause, _)
+            ExternalRescanResult::Equal(_, _, cause, _, _)
             | ExternalRescanResult::Different(_, _, cause) => cause.clone(),
         };
         if matches!(
@@ -28096,7 +28111,8 @@ impl App {
         }
         let main_context_id = self.viewer_context_main();
         let accepted_now = match result {
-            ExternalRescanResult::Equal(signature, rows, _, parent_mtime) => {
+            ExternalRescanResult::Equal(signature, rows, _, parent_mtime, omitted) => {
+                self.adopt_normal_folder_omitted_entries(&folder, omitted);
                 self.current_folder_signature = Some(signature);
                 self.current_folder_last_mtime = Some(parent_mtime);
                 let previous = self.folder_observation.replace(FolderObservation {
@@ -32083,20 +32099,20 @@ impl App {
         // `materialize_local_folder_listing` が唯一の集計者。ここで数え直すと
         // remote 一覧と本体一覧で違う数が出る。
         let omitted_entries = materialized.omitted;
-        if omitted_entries != folder_scan::OmittedFolderEntryCounts::default() {
+        if omitted_entries.counts != folder_scan::OmittedFolderEntryCounts::default() {
             // チップが出ない / 数が合わないという報告を、推測でなくログで切り分けるための 1 行。
             // 走査済みの値を書くだけで追加の I/O は無い。
             crate::logger::log(format!(
                 "omitted entries: same_name={} hidden={} ignored_archive={} ignored_epub={} unsupported={} \
                  system={} chip={} \
                  published={} surface={:?}",
-                omitted_entries.same_name,
-                omitted_entries.hidden,
-                omitted_entries.ignored_archive,
-                omitted_entries.ignored_epub,
-                omitted_entries.unsupported,
-                omitted_entries.system,
-                omitted_entries.primary_count(),
+                omitted_entries.counts.same_name,
+                omitted_entries.counts.hidden,
+                omitted_entries.counts.ignored_archive,
+                omitted_entries.counts.ignored_epub,
+                omitted_entries.counts.unsupported,
+                omitted_entries.counts.system,
+                omitted_entries.counts.primary_count(),
                 !detached_physical,
                 self.top_level_grid_view.surface(),
             ));
@@ -32321,17 +32337,6 @@ impl App {
             self.video_thumb_overrides
                 .insert(crate::path_key::normalize_keep_drive(&video), image);
         }
-        if !detached_physical
-            && matches!(
-                self.top_level_grid_view.surface(),
-                top_level_grid_view::TopLevelGridSurface::Folder
-            )
-        {
-            self.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
-                folder: path.clone(),
-                counts: omitted,
-            });
-        }
         self.stack_active_rule = None;
         self.stack_script_error = None;
         let items_len = items.len();
@@ -32351,6 +32356,9 @@ impl App {
             prepared_visible,
             None,
         );
+        // The shared write predicate can now validate the adopted folder itself,
+        // before hydration starts any content-identity detection.
+        self.adopt_normal_folder_omitted_entries(&audio_inventory_parent, omitted);
         self.folder_observation = self
             .current_folder
             .as_ref()
@@ -73510,6 +73518,14 @@ impl App {
     pub(crate) fn current_normal_folder_omitted_counts(
         &self,
     ) -> Option<folder_scan::OmittedFolderEntryCounts> {
+        self.current_normal_folder_omitted_entries()
+            .map(|owner| owner.omitted.counts)
+    }
+
+    /// Both UI consumers share this exact ownership/surface predicate.
+    pub(crate) fn current_normal_folder_omitted_entries(
+        &self,
+    ) -> Option<&NormalFolderOmittedEntries> {
         if self.navigation_scope.is_detached_physical()
             || self.search_filter.is_some()
             || self.search_pending.is_some()
@@ -73527,7 +73543,72 @@ impl App {
         self.normal_folder_omitted_entries
             .as_ref()
             .filter(|entries| crate::folder_tree::path_eq(&entries.folder, current))
-            .map(|entries| entries.counts)
+    }
+
+    pub(crate) fn open_omitted_entries_dialog(&mut self) {
+        self.omitted_entries_dialog_folder = self
+            .current_normal_folder_omitted_entries()
+            .map(|owner| owner.folder.clone());
+        self.close_omitted_entries_dialog_if_interrupted();
+        self.sort_visible_omitted_entries();
+    }
+
+    /// Both ordinary adoption and Equal rescans publish only the main folder's owner.
+    fn adopt_normal_folder_omitted_entries(
+        &mut self,
+        folder: &Path,
+        omitted: folder_scan::OmittedFolderEntries,
+    ) {
+        if self.edit_request_owner_context() != self.viewer_context_main()
+            || self.navigation_scope.is_detached_physical()
+            || !matches!(
+                self.top_level_grid_view.surface(),
+                top_level_grid_view::TopLevelGridSurface::Folder
+            )
+            || !self
+                .current_folder
+                .as_deref()
+                .is_some_and(|current| crate::folder_tree::path_eq(current, folder))
+        {
+            return;
+        }
+        self.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
+            folder: folder.to_path_buf(),
+            omitted,
+        });
+        self.sort_visible_omitted_entries();
+    }
+
+    fn sort_visible_omitted_entries(&mut self) {
+        if self.omitted_entries_dialog_visible() {
+            self.normal_folder_omitted_entries
+                .as_mut()
+                .unwrap()
+                .omitted
+                .sort_for_display();
+        }
+    }
+
+    pub(crate) fn close_omitted_entries_dialog_if_interrupted(&mut self) {
+        if self.omitted_entries_dialog_folder.is_some()
+            && self
+                .modal_dialog_block_reason_without_omitted_entries(true)
+                .is_some()
+        {
+            self.omitted_entries_dialog_folder = None;
+        }
+    }
+
+    pub(crate) fn omitted_entries_dialog_visible(&self) -> bool {
+        self.omitted_entries_dialog_folder
+            .as_deref()
+            .is_some_and(|folder| {
+                self.current_normal_folder_omitted_entries()
+                    .is_some_and(|owner| crate::folder_tree::path_eq(folder, &owner.folder))
+                    && self
+                        .modal_dialog_block_reason_without_omitted_entries(true)
+                        .is_none()
+            })
     }
 
     /// ZIP/PDF + フォルダの重複: 同名フォルダがあれば ZIP/PDF エントリをスキップ。
@@ -99935,6 +100016,7 @@ impl App {
             self.show_editing_addon_dialog(ctx);
         }
         self.show_stats_dialog_window(ctx);
+        self.show_omitted_entries_dialog(ctx);
         self.show_rotation_reset_confirm_dialog(ctx);
         let context_nav = self.show_context_menu(ctx);
         self.render_main_dialogs_after_context(ctx, main_viewer_blocked);

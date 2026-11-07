@@ -3,6 +3,9 @@ use super::App;
 impl App {
     /// Dismiss background menus once when a real modal takes input ownership.
     pub(crate) fn note_main_chrome_pointer_block_transition(&mut self, ctx: &egui::Context) {
+        // Yield this read-only list before any other modal can consume Esc and
+        // disappear earlier in the dialog drawing order.
+        self.close_omitted_entries_dialog_if_interrupted();
         let blocked = self.main_chrome_pointer_blocked();
         if blocked && !self.main_chrome_pointer_was_blocked {
             // Popups have independent Uis; disabling their anchor cannot revoke

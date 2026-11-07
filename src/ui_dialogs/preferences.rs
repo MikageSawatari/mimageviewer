@@ -9761,7 +9761,7 @@ mod tests {
             entry.item,
             crate::grid_item::GridItem::ConvertibleArchive { .. }
         )));
-        assert_eq!(scan.omitted.ignored_epub, 1);
+        assert_eq!(scan.omitted.counts.ignored_epub, 1);
 
         harness
             .state_mut()
