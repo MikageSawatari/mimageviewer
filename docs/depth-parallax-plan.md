@@ -888,6 +888,95 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 360から3Dへの切替とV拒否、動画・見開き・連結・F11/F12・全画面終了での終了と非復活も確認対象。
 自動の動き中は idle health の対象外。実モデルの品質・速度と操作感の検収は利用者・ClaudeCodeへ引き継ぐ。
 
+#### 段 B 独立レビュー P1〜P2 の対応 (2026-11-07、基点 `dee2fd1ec`)
+
+ClaudeCode が正当と判断した別 session の独立指摘3件に対応する未コミット差分。
+先の実装記録・コードレビュー ACCEPT はこの追加指摘の解消証拠とは分ける。
+
+- P1: `fs_zoom_mode_context_ok` は Z / 非キー操作の入場判定のまま使い、保存済み2Dズームの
+  寿命判定とは分けた。二つの blocked caller は共通の `fs_zoom_reset_for_blocked_context` を通り、
+  Depth だけは既存の transient reset で照準・release待ち・edgeを畳む。確定 active / factor は残す。
+  Z edge の消費と held level の追跡は維持し、Depth から新しい照準やズーム解除を始めない。
+  Panorama 等の対象外 context は従来どおり full reset とする。
+- P2: `activate_mounted_as_independent_detached` を `commit_viewer_presentation` に接続した。
+  live / materialized の両 fork が通る `split_current_context_preserving_main_grid` の入口で、
+  context を移す前に Depth だけを共通 setter で退役する。要求取消と自 context の callback slot 除去を
+  Drop の既存契約で完了し、Panorama の state / intent 移譲は変えない。
+- P2 の配線検査: 実 Z press / release → D → idle / 拒否される Z → D を
+  `handle_fs_key_input` へ流す。継続検査は video / spread / continuous / 後判明 animation の各ケースを
+  実 `render_fullscreen_viewport` から通し、still 帰還後の pass でも復活しないことを検査する。
+  headless immediate viewport callback は専用 thread、資源 slot は各ケース専有 renderer に隔離する。
+  実 independent activation と両 fork では、推論中は cancel token、Ready は slot 除去と LRU 破棄、
+  逆の phase に置いた兄弟の要求・資源不変を相補的に検査する。
+- 素材は実 resolver で、complete な2D下地があっても `AnnotationBake` の間は `NotYet` とする検査を追加。
+  source-free Native しか残らない fixture では、元 managed allocation が消えていることを検査し、
+  既存の `ensure_original_material_for_entry(MaterialOnly)` → `fs_pending` → `poll_prefetch` → final 完成を通す。
+  Native の実 payload が選択されたとき、下層の generic `IncompleteComposite` より `NativeOnly` の理由を
+  優先するよう素材契約を揃えた。OriginalHold / PageTransition / AnnotationBake の優先と2D選択は維持。
+  新しい素材 producer・再ロード経路は作らない。
+- GPU は製品 callback / WGSL を使い、非一様な二つの深度面、90度回転、非中央の切り取り uv、
+  逆向きの変位と、両端を越える大きな変位での crop UV clamp を固定画素の期待値で検査する。
+  白 / 市松の透明・半透明・不透明部分と余白は、
+  実際の `paint_image_underlay` と通常2D texture mesh の描画結果に照合する。
+
+**2D 状態の兄弟経路監査**:
+
+| 箇所 | 結論 |
+| --- | --- |
+| 毎 frame の Z handler、非キー Z action | 今回の admission / 保存寿命分離の対象。Depth の確定状態だけ保持する |
+| draw の fit / zoom / pan / 自由回転 | Depth が先に選ばれ、描画引数だけ fit / zero にする。保存値を書き換えない |
+| key / touch / gamepad / middle-drag の zoom owner | `FsZoomOwner::Depth` は無操作。保存状態を reset しない |
+| wheel | Depth の Ctrl+wheel は Z 分岐より前に消費。通常 wheel はページ移動の既存契約 |
+| navigator / drag / double-click | Depth は navigator 不許可、canvas入力は専用の無操作分岐。drag origin の破棄は一時状態だけ |
+| fit cycle | Depth は入口で拒否し、保存 fit や2D transformを変更しない |
+| `reset_fullscreen_fit_transform` / `reset_continuous_reading_transform` | 明示 fit / reading-mode 切替の既存境界。Depth中の毎 frame reset ではない |
+| `open_fullscreen` の変換初期化 | ページ変更の既存境界。同一ページ D 往復の per-frame 処理ではない |
+
+**production presentation 代入の全件監査** (テスト・scenario fixture は除外):
+
+| 箇所 | 扱いと理由 |
+| --- | --- |
+| `app/depth_view.rs::commit_viewer_presentation` | 生きた presentation を変更する唯一の直接代入。旧 Depth を先に退役する |
+| `viewer_context_registry.rs::activate_mounted_as_independent_detached` | 今回 bypass を除き共通 commit へ接続。ほかの live transition も同じ commit を使用 |
+| `app.rs` の App initializer / `viewer_session.rs::ViewerSession::default` | 新しい空 context の初期値で、退役対象が無い。commit は通さない |
+| `ViewerSession::swap_with_mounted` (registry の mount / fork) | context 所有の既存値を exclusive owner とともに運ぶ操作。別 owner の transition として再 commit しない。fork の Depth は搬送前に退役する |
+| `cfg(test)` 内と `test_script.rs` の scenario fixture | 実行中の製品 presentation の変更ではないので監査対象外 |
+
+detached §11 に BA-7 の退役順序と BA-4 の既存 identity / commit 境界を記録する。
+追加 modal・rollback state・bool は不要で、表示時 guard ではなく公開・移譲元で不適格な組合せを消す。
+既存 IPC 2件は利用者から「sandbox 外では成功」との連絡を受けた。本対応で IPC の変更・再検査はしない。
+全件 gate は依頼どおり実行せず ClaudeCode に引き継ぐ。
+
+今回の変更は11ファイル: `src/ui_fullscreen.rs`, `src/app/viewer_context_registry.rs`,
+`src/app/depth_view_tests.rs`, `src/ui_fullscreen/depth_tests.rs`, `src/ui_fullscreen/page_turn.rs`,
+`src/depth_parallax_wgpu.rs`, `src/depth_estimation.rs`, `src/addon.rs`,
+`src/ui_dialogs/depth_addon.rs`, `docs/depth-parallax-plan.md`, `docs/detached-rework-plan.md`。
+新規 test は9件（実キー1・実viewer pass1に4条件・所有境界3・素材2・GPU2）。
+`depth_estimation.rs` の cancel token accessor、addon / DepthSetup の status 注入は `cfg(test)` だけで、
+実モデルや通常 profile を用いず実 request / entry の契約を検査するための fixture とする。
+
+実行結果（全 cargo / build / test に `MSBUILDDISABLENODEREUSE=1`）:
+
+- 深度関連97/97成功、12.545秒 (`target/depth-b-review-depth2.log`)。
+  初回は test fixture API の公開範囲2箇所で compile error を検出し、test 専用委譲と公開 enum の照合へ修正した。
+- 既存の panorama / pano / exclusive / keymap / fs_zoom / viewer_context_registry は、成功した depth 選択を
+  除いて430/430成功、19.392秒 (`target/depth-b-review-related.log`)。
+  この二つの選択の計527件を成功とし、重複する後続のGPU限定実行は件数へ加算しない。
+- production core の `cargo check --offline -p mimageviewer --bin mimageviewer-core` は成功、42.94秒
+  (`target/depth-b-review-check.log`)。
+- workspace 全体へ引数なしの `cargo fmt` を実行。UI glyph checker は危険な文字0
+  (`target/depth-b-review-glyphs.log`)、`cargo fmt --check` と `git diff --check` も成功。
+- 補強した crop overshoot は該当 GPU test だけ再実行し1/1成功、1.122秒
+  (`target/depth-b-review-crop-clamp.log`)。uv端の半 texel 補間値を固定し、全画像端への誤った clamp では通らない。
+- 独立完成レビュー（GPT-6.1 Sol / xhigh）は11ファイルと上記の実行ログ・文書を照合し ACCEPT、
+  P1/P2 残件なし。BA-7 / BA-4 の構造変更であることも再確認した。全件 gate / 実機検収は対象外。
+- `scripts/build-dev.ps1 -PreserveRuntime` は exit0。core 2分22秒、付属4バイナリも成功し、
+  VCRT PE 検査は runtime4 / PE5 成功 (`target/depth-b-review-build-dev.log`)。
+  normal feature set で確認用 binary を更新し、製品バイナリ・実UIは起動していない。
+  利用者の実機確認は Z確定 → D → D の拡大表示復帰、Depth中のZ拒否、D中のF12 / 独立窓への切替と
+  帰還後の非復活、360表示の従来のZ解除とfork移譲を対象とする。起動方法と実profileの注意は上記を使う。
+  HEAD `dee2fd1ec` を維持し、stage / commit は行わない。
+
 ## 11. テスト
 
 - **状態遷移**: OFF → ON → (ページ移動) → ON、× / D で OFF、フルスクリーン終了・フォルダ移動で取り消し。

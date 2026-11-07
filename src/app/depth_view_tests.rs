@@ -82,6 +82,250 @@ fn depth(app: &mut App) {
     app.set_fs_exclusive_view(FsExclusiveView::Depth(state), "depth_test_on");
 }
 
+#[cfg(windows)]
+struct DepthOwnerEvidence {
+    cancel: Option<Arc<AtomicBool>>,
+    resource_id: Option<u64>,
+}
+
+#[cfg(windows)]
+fn isolate_depth_renderer(app: &mut App) -> egui_wgpu::RenderState {
+    let mut render = app.wgpu_render_state.clone().unwrap();
+    // Share the device, but never callback slots between independently running tests.
+    render.renderer = Arc::new(egui::epaint::mutex::RwLock::new(egui_wgpu::Renderer::new(
+        &render.device,
+        render.target_format,
+        Default::default(),
+    )));
+    app.wgpu_render_state = Some(render.clone());
+    render
+}
+
+/// Exercise pending cancellation and published GPU ownership in separate, valid phases.
+#[cfg(windows)]
+fn tracked_depth(app: &mut App, ready: bool) -> DepthOwnerEvidence {
+    let render = app.wgpu_render_state.clone().unwrap();
+    let context = app.edit_request_owner_context();
+    let key = crate::depth_estimation::DepthSourceKey {
+        texture_id: egui::TextureId::Managed(88_071),
+    };
+    let map = crate::depth_estimation::DepthMap {
+        key,
+        width: 2,
+        height: 2,
+        values: vec![half::f16::from_f32(0.5); 4],
+        median: 0.5,
+    };
+    let mut state = DepthViewState::new(context);
+    state.attach_renderer(&render);
+    let evidence = if ready {
+        let source = render.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("depth-owner-retirement-source"),
+            size: wgpu::Extent3d {
+                width: 2,
+                height: 2,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        state.lru.insert(
+            key,
+            Arc::new(
+                crate::depth_parallax_wgpu::DepthTexture::upload(
+                    &render.device,
+                    &render.queue,
+                    map,
+                )
+                .unwrap(),
+            ),
+        );
+        state
+            .select_source(&render.device, &render.queue, &source, key)
+            .unwrap();
+        let resource_id = state.ready().unwrap().resource_id;
+        state.publish(&mut render.renderer.write().callback_resources);
+        DepthOwnerEvidence {
+            cancel: None,
+            resource_id: Some(resource_id),
+        }
+    } else {
+        let pending =
+            crate::depth_estimation::DepthPending::completed_for_test(context, 70_311, map);
+        let cancel = pending.cancellation_token_for_test();
+        assert!(!cancel.load(Ordering::Acquire));
+        state.source = crate::depth_parallax::DepthSourcePhase::Estimating { key, pending };
+        DepthOwnerEvidence {
+            cancel: Some(cancel),
+            resource_id: None,
+        }
+    };
+    app.set_fs_exclusive_view(FsExclusiveView::Depth(state), "depth_owner_test");
+    evidence
+}
+
+#[cfg(windows)]
+fn assert_depth_owner_live(app: &App, evidence: &DepthOwnerEvidence) {
+    let FsExclusiveView::Depth(state) = &app.fs_exclusive_view else {
+        panic!("sibling must retain its Depth owner");
+    };
+    if let Some(cancel) = &evidence.cancel {
+        assert!(!cancel.load(Ordering::Acquire));
+        assert!(matches!(
+            &state.source,
+            crate::depth_parallax::DepthSourcePhase::Estimating { pending, .. }
+                if pending.request_id() == 70_311
+        ));
+    }
+    if let Some(resource_id) = evidence.resource_id {
+        assert_eq!(state.ready().unwrap().resource_id, resource_id);
+        assert!(state.lru.resident_bytes() > 0);
+    }
+}
+
+#[cfg(windows)]
+fn assert_depth_retired_with_sibling_slot(
+    render: &egui_wgpu::RenderState,
+    retired: &DepthOwnerEvidence,
+    sibling: &DepthOwnerEvidence,
+) {
+    if let Some(cancel) = &retired.cancel {
+        assert!(cancel.load(Ordering::Acquire));
+    }
+    let renderer = render.renderer.read();
+    let slot = renderer
+        .callback_resources
+        .get::<crate::depth_parallax_wgpu::DepthRenderResourcesRef>();
+    assert_eq!(slot.map(|slot| slot.0.resource_id), sibling.resource_id);
+}
+
+#[cfg(windows)]
+#[test]
+fn depth_actual_independent_activation_retires_own_request_or_slot_and_keeps_sibling() {
+    for ready in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = setup_app_for_test();
+        install_pages(&mut app, &ctx);
+        let render = isolate_depth_renderer(&mut app);
+        let own = tracked_depth(&mut app, ready);
+        let mut sibling_evidence = None;
+        let sibling = app.build_window_context_for_test(70_312, |owner| {
+            sibling_evidence = Some(tracked_depth(owner, !ready));
+        });
+        let sibling_evidence = sibling_evidence.unwrap();
+
+        app.activate_mounted_as_independent_detached(70_313);
+
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert!(matches!(app.fs_exclusive_view, FsExclusiveView::None));
+        assert_depth_retired_with_sibling_slot(&render, &own, &sibling_evidence);
+        app.with_viewer_context(sibling, |owner| {
+            assert_depth_owner_live(owner, &sibling_evidence);
+        })
+        .unwrap();
+        assert_depth_retired_with_sibling_slot(&render, &own, &sibling_evidence);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn depth_actual_forks_retire_before_new_identity_and_keep_sibling_request_or_slot() {
+    for live in [false, true] {
+        for ready in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app_for_test();
+            install_pages(&mut app, &ctx);
+            let folder = app.tmp.path().join("depth-owner-fork");
+            app.current_folder = Some(folder.clone());
+            app.items[0] = GridItem::Image(folder.join("page.jpg"));
+            let main = app.viewer_context_main();
+            let render = isolate_depth_renderer(&mut app);
+            let own = tracked_depth(&mut app, ready);
+            let mut sibling_evidence = None;
+            let sibling = app.build_window_context_for_test(70_314, |owner| {
+                sibling_evidence = Some(tracked_depth(owner, !ready));
+            });
+            let sibling_evidence = sibling_evidence.unwrap();
+
+            let child = if live {
+                app.bind_window(main, 70_315).unwrap();
+                app.fork_mounted_live_media_context(70_315)
+            } else {
+                app.fork_materialized_still_context(&folder, 0)
+            };
+
+            assert_ne!(child, main);
+            assert!(matches!(app.fs_exclusive_view, FsExclusiveView::None));
+            assert_depth_retired_with_sibling_slot(&render, &own, &sibling_evidence);
+            app.with_viewer_context(child, |owner| {
+                assert!(matches!(owner.fs_exclusive_view, FsExclusiveView::None));
+            })
+            .unwrap();
+            app.with_viewer_context(sibling, |owner| {
+                assert_depth_owner_live(owner, &sibling_evidence);
+            })
+            .unwrap();
+            assert_depth_retired_with_sibling_slot(&render, &own, &sibling_evidence);
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn depth_fork_retirement_preserves_existing_panorama_state_and_intent_transfer() {
+    for live in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = setup_app_for_test();
+        install_pages(&mut app, &ctx);
+        let folder = app.tmp.path().join("panorama-owner-fork");
+        app.current_folder = Some(folder.clone());
+        app.items[0] = GridItem::Image(folder.join("page.jpg"));
+        app.panorama_intent.on = true;
+        app.panorama_intent.projection = Some(crate::panorama::PanoProjection::Equidistant);
+        let mut panorama = crate::panorama::PanoramaState::new(
+            0.4,
+            -0.2,
+            crate::panorama::PanoProjection::Equidistant,
+        );
+        panorama.fov_y = 2.0;
+        panorama.drag_active = true;
+        panorama.last_pointer = Some(egui::pos2(11.0, 13.0));
+        app.set_fs_exclusive_view(FsExclusiveView::Panorama(panorama), "panorama_fork_test");
+        let main = app.viewer_context_main();
+        let child = if live {
+            app.bind_window(main, 70_316).unwrap();
+            app.fork_mounted_live_media_context(70_316)
+        } else {
+            app.fork_materialized_still_context(&folder, 0)
+        };
+        assert!(matches!(app.fs_exclusive_view, FsExclusiveView::None));
+        assert!(!app.panorama_intent.on);
+        app.with_viewer_context(child, |owner| {
+            let panorama = owner.panorama_state().unwrap();
+            assert_eq!(
+                (panorama.yaw, panorama.pitch, panorama.fov_y),
+                (0.4, -0.2, 2.0)
+            );
+            assert_eq!(
+                panorama.projection,
+                crate::panorama::PanoProjection::Equidistant
+            );
+            assert!(panorama.drag_active);
+            assert_eq!(panorama.last_pointer, Some(egui::pos2(11.0, 13.0)));
+            assert!(owner.panorama_intent.on);
+            assert_eq!(
+                owner.panorama_intent.projection,
+                Some(crate::panorama::PanoProjection::Equidistant)
+            );
+        })
+        .unwrap();
+    }
+}
+
 #[test]
 fn depth_replaces_active_or_inactive_panorama_and_clears_only_its_intent() {
     let ctx = egui::Context::default();
@@ -303,6 +547,204 @@ fn depth_actual_f12_transition_has_no_depth_frame_in_detached_or_after_return() 
     assert!(!app.settings.detached_viewer_enabled);
     assert_eq!(app.viewer_presentation, ViewerPresentation::Fullscreen);
     assert!(!app.depth_view_may_continue(0));
+}
+
+#[cfg(windows)]
+fn depth_key_frame(app: &mut App, ctx: &egui::Context, keys: &[(egui::Key, bool)]) {
+    ctx.begin_pass(egui::RawInput {
+        events: keys
+            .iter()
+            .map(|&(key, pressed)| egui::Event::Key {
+                key,
+                physical_key: Some(key),
+                pressed,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            })
+            .collect(),
+        ..Default::default()
+    });
+    let idx = app.fullscreen_idx.unwrap();
+    let _ = app.handle_fs_key_input(ctx, idx, false);
+    ctx.end_pass().drop_without_applying_deltas();
+}
+
+#[cfg(windows)]
+#[test]
+fn depth_actual_z_d_keys_preserve_committed_zoom_through_idle_and_blocked_input() {
+    let _input_guard = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let mut app = setup_app_for_test();
+    install_pages(&mut app, &ctx);
+    let model_path = app.tmp.path().join("unused-depth-model.onnx");
+    app.depth_setup
+        .set_status_for_test(crate::addon::AddonStatus::Valid {
+            model_id: "depth-key-fixture".to_owned(),
+            bytes: 1,
+            model_path,
+            mmproj_path: None,
+        });
+    app.fs_zoom_factor = 2.75;
+    depth_key_frame(&mut app, &ctx, &[(egui::Key::Z, true)]);
+    assert!(app.fs_zoom_aiming);
+    depth_key_frame(&mut app, &ctx, &[(egui::Key::Z, false)]);
+    assert!(app.fs_zoom_active);
+    assert!(!app.fs_zoom_aiming);
+
+    depth_key_frame(
+        &mut app,
+        &ctx,
+        &[(egui::Key::D, true), (egui::Key::D, false)],
+    );
+    assert!(app.fs_exclusive_view.is_depth());
+    assert!(app.fs_zoom_active);
+    assert_eq!(app.fs_zoom_factor, 2.75);
+    depth_key_frame(&mut app, &ctx, &[]);
+    assert!(
+        app.fs_zoom_active,
+        "idle Depth input must preserve committed 2D zoom"
+    );
+    depth_key_frame(&mut app, &ctx, &[(egui::Key::Z, true)]);
+    assert!(
+        app.fs_zoom_active,
+        "blocked Z must not toggle the suspended zoom"
+    );
+    assert!(!app.fs_zoom_aiming);
+    depth_key_frame(&mut app, &ctx, &[(egui::Key::Z, false)]);
+    assert!(app.fs_zoom_active);
+    assert_eq!(app.fs_zoom_factor, 2.75);
+    depth_key_frame(
+        &mut app,
+        &ctx,
+        &[(egui::Key::D, true), (egui::Key::D, false)],
+    );
+    assert!(matches!(app.fs_exclusive_view, FsExclusiveView::None));
+    assert!(app.fs_zoom_active);
+    assert!(!app.fs_zoom_aiming);
+    assert_eq!(app.fs_zoom_factor, 2.75);
+
+    // Panorama keeps its released contract: entering it clears committed zoom.
+    app.fullscreen_idx = Some(2);
+    depth_key_frame(
+        &mut app,
+        &ctx,
+        &[(egui::Key::V, true), (egui::Key::V, false)],
+    );
+    assert!(app.panorama_state().is_some());
+    depth_key_frame(&mut app, &ctx, &[]);
+    assert!(!app.fs_zoom_active);
+    assert_eq!(app.fs_zoom_factor, 2.75);
+    crate::key_input::clear_test_frame();
+}
+
+#[cfg(windows)]
+#[test]
+fn depth_actual_viewer_pass_retires_video_spread_continuous_and_late_animation() {
+    // egui's immediate renderer is thread-local. Keep this test's backend callback
+    // on its own thread and execute real viewer UI passes without creating a window.
+    std::thread::spawn(|| {
+        let _input_guard = crate::key_input::lock_test_input();
+        for case in ["video", "spread", "continuous", "late_animation"] {
+            let ctx = egui::Context::default();
+            ctx.set_embed_viewports(false);
+            crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
+            let child_passes = std::rc::Rc::new(std::cell::Cell::new(0));
+            let observed = child_passes.clone();
+            egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
+                observed.set(observed.get() + 1);
+                ctx.run_ui(
+                    egui::RawInput {
+                        viewport_id: viewport.ids.this,
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(820.0, 600.0),
+                        )),
+                        viewports: [
+                            (egui::ViewportId::ROOT, egui::ViewportInfo::default()),
+                            (
+                                viewport.ids.this,
+                                egui::ViewportInfo {
+                                    parent: Some(egui::ViewportId::ROOT),
+                                    focused: Some(true),
+                                    ..Default::default()
+                                },
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                        ..Default::default()
+                    },
+                    |ui| (viewport.viewport_ui_cb)(ui),
+                )
+                .drop_without_applying_deltas();
+            });
+            let mut app = setup_app_for_test();
+            install_pages(&mut app, &ctx);
+            // Do not initialize a worker/model while testing presentation routing.
+            app.window_visible = false;
+            app.settings.video_in_window_mode = false;
+            app.settings.detached_viewer_enabled = false;
+            app.native_video_in_window_active = false;
+            depth(&mut app);
+            match case {
+                "video" => app.fullscreen_idx = Some(1),
+                "spread" => {
+                    app.items[1] = GridItem::Image("depth-spread-second.jpg".into());
+                    install_still(&mut app, &ctx, 1, [2, 3]);
+                    app.spread_mode = crate::settings::SpreadMode::Ltr;
+                    assert!(matches!(
+                        app.resolve_visible_spread_pair(0),
+                        crate::ui_fullscreen::SpreadPair::Double { .. }
+                    ));
+                }
+                "continuous" => app.reading_flow = crate::settings::ReadingFlow::Vertical,
+                _ => {
+                    let Some(FsCacheEntry::Static { animation, .. }) = app.fs_cache.get_mut(&0)
+                    else {
+                        panic!("still fixture");
+                    };
+                    *animation = crate::fs_animation::StaticAnimationState::FirstFrameOnly(
+                        crate::canonical_image_loader::CanonicalAnimatedFormat::Gif,
+                    );
+                }
+            }
+            let input = || egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(820.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            ctx.run_pass(input(), |ctx| {
+                ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
+            })
+            .drop_without_applying_deltas();
+            assert!(
+                matches!(app.fs_exclusive_view, FsExclusiveView::None),
+                "{case}"
+            );
+
+            app.fullscreen_idx = Some(3);
+            app.spread_mode = crate::settings::SpreadMode::Single;
+            app.reading_flow = crate::settings::ReadingFlow::Paged;
+            ctx.run_pass(input(), |ctx| {
+                ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui));
+            })
+            .drop_without_applying_deltas();
+            assert!(
+                child_passes.get() > 0,
+                "{case}: the actual child viewer UI must run"
+            );
+            assert!(
+                matches!(app.fs_exclusive_view, FsExclusiveView::None),
+                "{case}: still return"
+            );
+            assert_eq!(app.fs_exclusive_view_active(3), None, "{case}");
+        }
+        crate::key_input::clear_test_frame();
+    })
+    .join()
+    .unwrap();
 }
 
 #[test]

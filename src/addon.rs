@@ -491,9 +491,14 @@ impl ModelAddon {
     #[cfg(test)]
     pub(crate) fn with_test_status(root: PathBuf, status: AddonStatus) -> Self {
         let mut addon = Self::new(root);
-        addon.status = status;
-        addon.scanned = true;
+        addon.set_status_for_test(status);
         addon
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_status_for_test(&mut self, status: AddonStatus) {
+        self.status = status;
+        self.scanned = true;
     }
 
     pub fn new(root: PathBuf) -> Self {

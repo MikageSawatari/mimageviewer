@@ -1,6 +1,42 @@
 use super::*;
 use crate::fs_exclusive_view::FsExclusiveView;
 
+#[test]
+fn depth_annotation_bake_wait_overrides_an_otherwise_complete_2d_base() {
+    let ctx = egui::Context::default();
+    let mut app = crate::app::setup_app_for_test();
+    app.items = vec![GridItem::Image("depth-annotation.png".into())];
+    app.fullscreen_idx = Some(0);
+    let source_id = crate::app::source_texture_test_support::seed(&mut app, &ctx, 0);
+    assert!(app.ensure_final_composite_material(&ctx, 0).is_some());
+    assert!(app.current_final_composite_is_complete(0));
+    let key = app.page_path_key(0).unwrap();
+    app.comic_docs.insert(
+        key,
+        vec![comic_core::AnnotationObject::new_text(
+            1,
+            (0.0, 0.0),
+            comic_core::TextBlock::default(),
+        )],
+    );
+    assert!(app.comic_has_objects(&ctx, 0));
+    // Occupied bake slots keep the actual producer pending without starting a
+    // font lookup or a worker. The resolver still selects the complete 2D base.
+    app.comic_bake_inflight
+        .store(2, std::sync::atomic::Ordering::Relaxed);
+    let (payload, material) = app.resolve_fs_processed_payload_and_depth(&ctx, 0, false);
+    app.comic_bake_inflight
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(payload.unwrap().source_texture_id(), source_id);
+    assert!(app.current_final_composite_is_complete(0));
+    assert!(matches!(
+        material,
+        crate::depth_parallax::DepthSourceMaterial::NotYet(
+            crate::depth_parallax::DepthSourceWait::AnnotationBake
+        )
+    ));
+}
+
 fn install_depth(app: &mut App) {
     app.items = vec![GridItem::Image("depth-input.jpg".into())];
     app.fullscreen_idx = Some(0);

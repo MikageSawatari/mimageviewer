@@ -87,6 +87,11 @@ impl DepthPending {
         self.stamp.request_id
     }
 
+    #[cfg(test)]
+    pub(crate) fn cancellation_token_for_test(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
+    }
+
     pub(crate) fn cancel(&self) {
         self.cancel.store(true, Ordering::Release);
     }

@@ -771,6 +771,272 @@ mod tests {
         assert_eq!(color_byte_size(4, 2), 44);
     }
 
+    fn render_egui_frame(
+        gpu: &mut crate::egui037_stage4_gpu_tests::OffscreenGpu,
+        ctx: &egui::Context,
+        size: [u32; 2],
+        paint: impl FnOnce(&egui::Painter),
+    ) -> Vec<[u8; 4]> {
+        let rect =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0] as f32, size[1] as f32));
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(rect),
+            ..Default::default()
+        });
+        paint(
+            &ctx.layer_painter(egui::LayerId::background())
+                .with_clip_rect(rect),
+        );
+        let mut output = ctx.end_pass();
+        for (id, deltas) in output.textures_delta.set.drain() {
+            for delta in deltas {
+                gpu.renderer
+                    .update_texture(&gpu.device, &gpu.queue, id, &delta);
+            }
+        }
+        let jobs = ctx.tessellate(std::mem::take(&mut output.shapes), output.pixels_per_point);
+        let pixels = gpu.render(&jobs, size, [13, 23, 37, 255]);
+        for id in output.textures_delta.free.drain() {
+            gpu.renderer.free_texture(&id);
+        }
+        pixels
+    }
+
+    fn cropped_quarter_turn(
+        viewport: egui::Rect,
+        crop: egui::Rect,
+    ) -> crate::displayed_image_transform::DisplayedImageTransform {
+        use crate::displayed_image_transform::{
+            DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
+            RectPixelFit, ResolvedDisplayPlacement,
+        };
+        DisplayedImageTransform::from_resolved_rect(
+            DisplayedImageTransformInput {
+                page_idx: 0,
+                viewport_rect: viewport,
+                source_size: egui::vec2(64., 48.),
+                texture_size: egui::vec2(64., 48.),
+                rotation: crate::rotation_db::Rotation::Cw90,
+                free_rotation_rad: 0.,
+                content_bbox: Some(crop),
+                fit_mode: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                    crate::settings::FullscreenFitMode::Page,
+                ),
+                fit_scale_limits: FullscreenFitScaleLimits::default(),
+                pixels_per_point: 1.,
+                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                pixel_fit: RectPixelFit::Texels,
+            },
+            egui::Rect::from_center_size(viewport.center(), egui::vec2(48., 64.)),
+        )
+        .unwrap()
+    }
+
+    fn install_two_depth_planes(
+        gpu: &mut crate::egui037_stage4_gpu_tests::OffscreenGpu,
+        texture_id: egui::TextureId,
+        transform: &crate::displayed_image_transform::DisplayedImageTransform,
+    ) -> DepthShaderCallback {
+        let key = DepthSourceKey { texture_id };
+        let source = gpu
+            .renderer
+            .texture(&texture_id)
+            .unwrap()
+            .texture
+            .as_ref()
+            .unwrap();
+        let copier = DepthGpu::new(&gpu.device);
+        let color = Arc::new(copier.copy_color(&gpu.device, &gpu.queue, source).unwrap());
+        let depth = Arc::new(
+            DepthTexture::upload(
+                &gpu.device,
+                &gpu.queue,
+                DepthMap {
+                    key,
+                    width: 64,
+                    height: 48,
+                    // The boundary is intentionally off-center, so dropping the crop
+                    // from depth sampling changes which plane owns test pixels.
+                    values: (0..48)
+                        .flat_map(|_| {
+                            (0..64).map(|x| half::f16::from_f32(if x < 36 { 0.25 } else { 0.75 }))
+                        })
+                        .collect(),
+                    median: 0.25,
+                },
+            )
+            .unwrap(),
+        );
+        let resources = Arc::new(DepthRenderResources::new(
+            &gpu.device,
+            ViewerContextId::for_test(20),
+            key,
+            color,
+            depth,
+        ));
+        let job = DepthShaderCallback {
+            context: resources.context,
+            key,
+            resource_id: resources.resource_id,
+            params: DepthRenderParams {
+                offset: egui::Vec2::ZERO,
+                focus: 0.5,
+                gamma: 1.,
+                zoom: 1.,
+                uv: transform.uv_rect,
+                quarter_turns: transform.rotation.degrees() as u32 / 90,
+                aspect: transform.paint_rect.aspect_ratio(),
+            },
+            target_format: crate::egui037_stage4_gpu_tests::FORMAT,
+        };
+        gpu.renderer
+            .callback_resources
+            .insert(DepthRenderResourcesRef(resources));
+        job
+    }
+
+    #[test]
+    fn depth_gpu_nonuniform_planes_rotate_and_crop_with_color() {
+        use crate::egui037_stage4_gpu_tests::{OffscreenGpu, assert_rgba, callback};
+        let mut gpu = OffscreenGpu::new();
+        let ctx = egui::Context::default();
+        let rgba: Vec<_> = (0..48)
+            .flat_map(|y| (0..64).map(move |x| egui::Color32::from_rgb(x * 2, y * 3, 80)))
+            .collect();
+        let source = ctx.load_texture(
+            "depth rotated color ramp",
+            egui::ColorImage::new([64, 48], rgba),
+            egui::TextureOptions::LINEAR,
+        );
+        let size = [24, 32];
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(24., 32.));
+        let transform = cropped_quarter_turn(
+            viewport,
+            egui::Rect::from_min_max(egui::pos2(0.25, 0.25), egui::pos2(0.75, 0.75)),
+        );
+        assert_eq!(transform.paint_rect, viewport);
+        let two_d = render_egui_frame(&mut gpu, &ctx, size, |painter| {
+            transform.paint_texture(painter, source.id(), egui::Color32::WHITE);
+        });
+        let mut job = install_two_depth_planes(&mut gpu, source.id(), &transform);
+        let still = gpu.render(&[callback(viewport, job.clone())], size, [13, 23, 37, 255]);
+        for (actual, expected) in still.iter().zip(&two_d) {
+            assert_rgba(*actual, *expected);
+        }
+        // A native-sized clockwise crop maps screen (x,y) to source
+        // (16+y, 35-x). This is a fixed pixel oracle, not a second ray marcher.
+        for (x, y) in [(3, 4), (15, 18), (8, 26)] {
+            assert_rgba(
+                still[y * 24 + x],
+                [(16 + y) as u8 * 2, (35 - x) as u8 * 3, 80, 255],
+            );
+        }
+        // .25/.75 planes straddle focus .5. At 24px wide, offset 1/6
+        // translates them by exactly one screen pixel in opposite directions.
+        // After rotation the depth boundary lies at y=20, not at screen x=36.
+        job.params.offset = egui::vec2(1. / 6., 0.);
+        let moving = gpu.render(&[callback(viewport, job.clone())], size, [13, 23, 37, 255]);
+        for y in [3, 10, 18, 23, 28] {
+            for x in 2..22 {
+                let sample_x = if y < 20 { x + 1 } else { x - 1 };
+                assert_rgba(moving[y * 24 + x], two_d[y * 24 + sample_x]);
+                assert!(
+                    moving[y * 24 + x][1].abs_diff(still[y * 24 + x][1]) >= 2,
+                    "both distinct depth planes must move at ({x}, {y})"
+                );
+            }
+        }
+        // Force the two planes beyond opposite crop edges. Clamping to the
+        // full texture (instead of the cropped UV range) exposes different ramp
+        // pixels. The half-texel edge samples are green 34.5 and 106.5.
+        job.params.offset = egui::vec2(1., 0.);
+        let clamped = gpu.render(&[callback(viewport, job)], size, [13, 23, 37, 255]);
+        assert_rgba(clamped[3 * 24 + 23], [38, 35, 80, 255]);
+        assert_rgba(clamped[28 * 24], [88, 107, 80, 255]);
+    }
+
+    #[test]
+    fn depth_gpu_transparency_matches_2d_white_and_checker_underlays() {
+        use crate::egui037_stage4_gpu_tests::{OffscreenGpu, assert_rgba};
+        use crate::ui_fullscreen::{paint_image_underlay, transparent_bg_style};
+        let mut gpu = OffscreenGpu::new();
+        let ctx = egui::Context::default();
+        let pixels = (0..48)
+            .flat_map(|_| {
+                (0..64).map(|x| match x {
+                    0..24 => egui::Color32::TRANSPARENT,
+                    24..40 => egui::Color32::from_rgba_premultiplied(64, 32, 16, 128),
+                    _ => egui::Color32::from_gray(128),
+                })
+            })
+            .collect();
+        let source = ctx.load_texture(
+            "depth alpha patches",
+            egui::ColorImage::new([64, 48], pixels),
+            egui::TextureOptions::LINEAR,
+        );
+        // The normal 2D underlay painter owns repeat UVs and the 16px tile size.
+        let checker = ctx.load_texture(
+            "depth checker fixture",
+            egui::ColorImage::new(
+                [16, 16],
+                (0..16)
+                    .flat_map(|y| {
+                        (0..16).map(move |x| {
+                            egui::Color32::from_gray(if (x / 8 + y / 8) % 2 == 0 {
+                                224
+                            } else {
+                                176
+                            })
+                        })
+                    })
+                    .collect(),
+            ),
+            egui::TextureOptions {
+                wrap_mode: egui::TextureWrapMode::Repeat,
+                ..egui::TextureOptions::NEAREST
+            },
+        );
+        let size = [80, 64];
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(80., 64.));
+        let transform = cropped_quarter_turn(
+            viewport,
+            egui::Rect::from_min_max(egui::pos2(0.125, 0.25), egui::pos2(0.875, 0.75)),
+        );
+        // Upload the managed source before creating the real depth resources.
+        render_egui_frame(&mut gpu, &ctx, size, |_| {});
+        let job = install_two_depth_planes(&mut gpu, source.id(), &transform);
+        for mode in [1, 2] {
+            let underlay = transparent_bg_style(mode, Some(&checker));
+            let two_d = render_egui_frame(&mut gpu, &ctx, size, |painter| {
+                paint_image_underlay(painter, transform.paint_quad(), &underlay);
+                transform.paint_texture(painter, source.id(), egui::Color32::WHITE);
+            });
+            let three_d = render_egui_frame(&mut gpu, &ctx, size, |painter| {
+                paint_image_underlay(painter, transform.paint_quad(), &underlay);
+                painter.add(egui::Shape::Callback(
+                    egui_wgpu::Callback::new_paint_callback(transform.paint_rect, job.clone()),
+                ));
+            });
+            for (actual, expected) in three_d.iter().zip(&two_d) {
+                assert_rgba(*actual, *expected);
+            }
+            // Explicit oracles prevent the two paths from agreeing on an
+            // absent underlay, wrong blend/alpha, or accidental sRGB transform.
+            assert_rgba(three_d[16 * 80 + 10], [13, 23, 37, 255]);
+            assert_rgba(three_d[48 * 80 + 32], [128, 128, 128, 255]);
+            if mode == 1 {
+                assert_rgba(three_d[16 * 80 + 32], [255, 255, 255, 255]);
+                assert_rgba(three_d[32 * 80 + 32], [191, 159, 143, 255]);
+            } else {
+                assert_rgba(three_d[16 * 80 + 32], [176, 176, 176, 255]);
+                assert_rgba(three_d[16 * 80 + 40], [224, 224, 224, 255]);
+                assert_rgba(three_d[32 * 80 + 32], [152, 120, 104, 255]);
+                assert_rgba(three_d[32 * 80 + 40], [176, 144, 128, 255]);
+            }
+        }
+    }
+
     /// Actual product WGSL/blit/readback on a windowless device. No model,
     /// filesystem, application profile, surface, or desktop interaction.
     #[test]

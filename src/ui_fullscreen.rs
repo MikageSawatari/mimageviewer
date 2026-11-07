@@ -13285,17 +13285,25 @@ impl App {
             DepthSourceMaterial::NotYet(DepthSourceWait::OriginalHold)
         } else if self.fs_navigation_sequence_blocks_new_target() {
             DepthSourceMaterial::NotYet(DepthSourceWait::PageTransition)
-        } else if let Some(reason) = wait {
-            DepthSourceMaterial::NotYet(reason)
+        } else if wait == Some(DepthSourceWait::AnnotationBake) {
+            DepthSourceMaterial::NotYet(DepthSourceWait::AnnotationBake)
         } else {
             match payload.as_ref() {
                 Some(payload) => match payload.source_texture() {
-                    Some(texture) => DepthSourceMaterial::Ready {
-                        texture: texture.clone(),
+                    Some(texture) => match wait {
+                        Some(reason) => DepthSourceMaterial::NotYet(reason),
+                        None => DepthSourceMaterial::Ready {
+                            texture: texture.clone(),
+                        },
                     },
+                    // The ordinary selector can keep a source-free Native presentation
+                    // while its existing material producer is incomplete. That actual
+                    // selected payload owns the wait reason, rather than the lower layer.
                     None => DepthSourceMaterial::NotYet(DepthSourceWait::NativeOnly),
                 },
-                None => DepthSourceMaterial::NotYet(DepthSourceWait::ThumbnailFallback),
+                None => {
+                    DepthSourceMaterial::NotYet(wait.unwrap_or(DepthSourceWait::ThumbnailFallback))
+                }
             }
         };
         (payload, material)
@@ -14735,7 +14743,7 @@ impl App {
     /// KeyHold ではないので照準表示はスキップし、現在のカーソル位置で即ズーム状態に入る。
     pub(crate) fn toggle_fs_zoom_mode_action(&mut self, ctx: &egui::Context, fs_idx: usize) {
         if !self.fs_zoom_mode_context_ok(fs_idx) {
-            self.fs_zoom_reset();
+            self.fs_zoom_reset_for_blocked_context();
             if !self.show_continuous_reading_shortcut_noop(
                 ctx,
                 fs_idx,
@@ -14776,6 +14784,17 @@ impl App {
         self.fs_zoom_aiming = false;
         self.fs_zoom_exit_pending = false;
         self.fs_zoom_z_was_down = false;
+    }
+
+    /// Input admission does not define the lifetime of the stored 2D zoom.
+    /// Depth displays fit while retaining that zoom for its eventual return to 2D.
+    /// Other excluded contexts (including Panorama) keep their existing reset behavior.
+    fn fs_zoom_reset_for_blocked_context(&mut self) {
+        if self.fs_exclusive_view.is_depth() {
+            self.fs_zoom_reset_transient();
+        } else {
+            self.fs_zoom_reset();
+        }
     }
 
     /// ZipPla 風全画面ズームのキー状態機械を 1 フレーム進める。Z (修飾なし) のホールド/離しを
@@ -14824,9 +14843,9 @@ impl App {
         let rising = z_press_event || (z_down && !self.fs_zoom_z_was_down);
         let falling = z_release_event || (!z_down && self.fs_zoom_z_was_down);
         if !self.fs_zoom_mode_context_ok(fs_idx) {
-            // コンテキスト外: ズーム解除し、エッジ状態もリセット
-            // (Z 押しっぱで対象外へ移った時の誤発火を防ぐ)。
-            self.fs_zoom_reset();
+            // 入力対象外では照準とエッジを畳む。Depth は確定済み2Dズームを
+            // 休止するだけで、ほかの対象外contextでは従来どおり解除する。
+            self.fs_zoom_reset_for_blocked_context();
             self.fs_zoom_z_was_down = z_down;
             self.show_continuous_reading_shortcut_noop(
                 ctx,
@@ -34910,7 +34929,8 @@ impl App {
         }
 
         // ZipPla 風全画面ズーム (Z ホールド) のエッジ検出。編集/分析/見開き/連結/パノラマ/動画では
-        // 無効化され、コンテキスト外なら状態をリセットする。編集モードの early-return より前に
+        // 無効化される。Depth は確定状態を保持し、ほかのコンテキスト外ではリセットする。
+        // 編集モードの early-return より前に
         // 毎フレーム呼び、Z 押しっぱで対象外へ移ったときに状態が残らないようにする。
         self.update_fs_zoom_mode_keys(ctx, fs_idx, input_permits.current_level);
 

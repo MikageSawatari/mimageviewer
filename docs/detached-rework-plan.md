@@ -1485,6 +1485,20 @@ detached の既存症状を条件追加で隠す変更ではない。入力・�
 接続を「症状パッチではなく構造的変更」と確認した。ClaudeCode との実装前の合意 (§16) を維持する。
 実装全体の自動 gate・実機検収とは分けた構造上の合意である。
 
+2026-11-07 独立レビュー追補（基点 `dee2fd1ec`）:
+初回実装には independent activation の presentation 直接代入と、fork での Depth 移譲前の退役漏れが残っていた。
+`activate_mounted_as_independent_detached` は既存共通 commit に接続し、live / materialized fork の
+共通 primitive `split_current_context_preserving_main_grid` では成功した fork の状態を移す前に
+Depth だけを `set_fs_exclusive_view(None)` で終える。推論要求の取消と自 context の callback slot 除去を
+完了してから session / context を搬送する。既存 park の `reset_detached_pause_foreground_modes` は維持し、
+Panorama の state / intent 移譲と兄弟 context の要求・資源は変えない。
+
+ClaudeCode が指摘を正当と判断した依頼を受け、独立 Codex reviewer（GPT-6.1 Sol / xhigh）は着手前と
+完成 source の双方で、BA-7 の単一 owner の退役順序と BA-4 の既存 presentation / identity 境界を正す
+構造変更であり、症状 guard ではないことに同意した。BA-1 / BA-3 / BA-6 は変更しない。
+実 activation / 両 fork のテストで取消・slot 除去・兄弟不変を検査し、Panorama 移譲の回帰を維持する。
+件数と実行結果は深度計画 §10 の追補へ集約し、実機確認・ClaudeCode の最終検収とは分ける。
+
 ### 2026-11-06 PDF旧読書位置復元とPCの先頭fallback
 
 利用者提示のOpus設計A/Bに基づく、汎用resume解決境界の修正。

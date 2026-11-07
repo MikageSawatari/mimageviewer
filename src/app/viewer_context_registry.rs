@@ -3226,7 +3226,10 @@ impl App {
             // already owns its independent list loses passive observation here.
             self.retire_passive_folder_observation();
         }
-        self.viewer_presentation = ViewerPresentation::DetachedWindow;
+        self.commit_viewer_presentation(
+            ViewerPresentation::DetachedWindow,
+            "activate_independent_detached",
+        );
         self.ensure_mounted_detached_session_binding(window_id);
         self.detached_viewer_independent_active = true;
         self.detached_viewer_open_next_still_detached_once = false;
@@ -3965,6 +3968,15 @@ impl App {
         &mut self,
     ) -> Box<ViewerContextBundle> {
         // This boundary executes only after the table admitted the successful fork.
+        // Depth belongs to the original main fullscreen identity. Retire its request
+        // and callback slot before moving viewer state to a new owner. Panorama's
+        // existing state/intent transfer below remains unchanged.
+        if self.fs_exclusive_view.is_depth() {
+            self.set_fs_exclusive_view(
+                crate::fs_exclusive_view::FsExclusiveView::None,
+                "fork_exclusive_owner",
+            );
+        }
         // The transient reader and its return lifetime move as one owner; the main
         // projection receives the unchanged, already prepared physical basis.
         let direct_owner = self.direct_media_reader_active().then(|| {

@@ -36,6 +36,11 @@ pub(crate) struct DepthPreferencesView {
 }
 
 impl DepthSetup {
+    #[cfg(test)]
+    pub(crate) fn set_status_for_test(&mut self, status: AddonStatus) {
+        self.addon.set_status_for_test(status);
+    }
+
     pub(crate) fn modal_open(&self) -> bool {
         matches!(
             self.dialog,
