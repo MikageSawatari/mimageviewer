@@ -60,7 +60,9 @@
           UI: 深度を R16Float テクスチャへ上げる (小さい) → 視差シェーダで描画 (§5)
 ```
 
-結果待ちの間は通常の 2D 表示のまま、パネルに「奥行きを計算中」を出す。
+結果待ちの間は通常の2D画像を保ち、パネルの状態行と、150ms後に画像上へ出す待機の箱で知らせる。
+パネルを隠していても箱を出す。初期化中は「3D 写真のモデルを準備中…」、それ以外は
+「奥行きを計算中…」とし、実効キーがある場合だけ「<キー> で取り消し」を小さく添える (§5.4)。
 
 ## 3. モデルと追加ダウンロード
 
@@ -262,6 +264,27 @@ CPU の画素 (`ColorImage`) を探さず、**表示中のテクスチャを GPU
   フルスクリーンの viewport が最小化・非表示のときは要求しない。
   - 3D の自動の動きは常に再描画するので、アイドル時の負荷検査 (`check-idle-health.ps1`) の対象外になる
     ことを development-build-and-test-native に書く。
+
+### 5.4 結果待ちの表示
+
+`FsExclusiveView::Depth` で source phase が `Ready` / `Failed` 以外の間は、素材 `NotYet` も含めて
+画像上に非モーダルの状態箱を出す。状態の正本は `depth_wait_status` 一つとし、パネルの状態行と共有する。
+runtime が Dormant / Initializing なら準備中、それ以外は計算中。Failed のパネル文言と既存通知は維持し、箱は出さない。
+
+見た目は既存のアニメーション展開中表示と同じ角丸・半透明の暗い箱、17ptの白文字、下の細い不定進捗バー。
+初回入場と terminal から再び待つ時だけ提示時計を開始し、NotYet → ReadingBack → Estimating や待ち中の素材変更では
+一続きのbusy表示を維持する。150msはちらつき防止だけの条件で、仕事の生存・完了・取消を決めない。
+上部chromeと下のページ情報、現在表示中の右パネルを除いた画像領域に置き、1093×614 logicalで収める。
+取消の2行目は keymap の現在の実効ラベルを使い、未割当なら省く。
+
+gateに達するための遅延wakeを一度予約し、箱が見えている間だけ33ms周期でバーを再描画する。
+hidden / minimized は予約せず、Ready / Failed / OFFでは箱と箱由来の再描画を止める。
+結果採用の起床と自動の3D運動は既存ownerが引き続き担当する。
+
+**設計の簡素化の検討**: modalも検討したが、待ちは初回2〜3.5秒、以後はページごとの短い推論であり、
+毎ページmodalにすると通常の閲覧に操作待ちを加える。待ち中もDでの取消とページ送りを受け付ける必要がある。
+割込み・要求取消・新しい画像での再推論は段Bの要求ownerが既に扱っており、新しい状態の組合せは増えないため、
+非モーダルの提示だけを足す。
 
 ## 6. モードの状態と寿命
 
@@ -501,7 +524,8 @@ pub enum DepthSourcePhase {
   - 止まる深さ: 奥 ↔ 手前 (0〜1)、既定 0.5 (整形 ON なら中央値の深さ)
   - 奥行きを整える: ON / OFF、既定 ON (説明: 手前の床などが奥行きを占めて平らに見えるのを防ぐ)
   - 「書き出し…」
-  - 状態の 1 行: 「モデルを準備中」「奥行きを計算中」「失敗しました (理由)」
+  - 状態の1行: 「モデルを準備中」「奥行きを計算中」「失敗しました (理由)」。待機中は画像上にも
+    §5.4の状態箱を出し、パネルを隠していても知らせる。準備／計算中の判定はパネルと箱で共有する。
 - 配色は `os_theme` の helper、文字色は `ui.visuals()`。固定文言に絵文字を使わない
   (`scripts/check_ui_glyphs.py`)。
 - 上部ホバーバーに 3D ボタンを足す (360° ボタンの隣)。入口条件で弾かれる画像では無効表示。
@@ -1064,6 +1088,54 @@ Z未使用のDepthと移動先が一致し、移動中は実効ownerがDepth、�
 - 作業制約の逸脱: reviewerがログ名探索で `rg --files target -g 'depth-b-touch*' -g '!test-lib-full/**'`
   を一度実行した。禁止領域のディレクトリ走査を完全には除外できないため「一切アクセスなし」とは扱わない。
   `target/test-lib-full/` のファイル内容は未読・未変更。利用者へ報告し、以後は指定済みログの直接参照だけに限定した。
+
+#### 段 B 実機フィードバック: 画像上の待機表示 (2026-11-07、基点 `acc937311`)
+
+利用者から「Dを押してから動き始めるまで反応がない」との実機報告を受けた追加。
+§5.4の非モーダル箱を実装し、既存の取消・ページ送り・要求ownerは維持する。
+
+- `app/depth_view.rs::depth_wait_status` が source phase と runtime snapshot から準備／計算中を一度だけ決め、
+  パネルと箱が共有する。Ready / Failed / Depth以外はNone。既存の失敗文字列と通知は変更しない。
+- `DepthViewState.wait_started_at` は常に存在する提示時計であり、新しいpending状態や生存sentinelではない。
+  Ready / Failed後の新しい待ちだけをresetし、NotYet → 読み戻し → 推論、待ち中の別keyは継続する。
+  既存 `animation_expansion_progress_visible` と同じ150ms gateを使う。
+- `draw_feedback_toast` のviewer共通経路で、source採用とcurrent panel矩形の公開後に描く。
+  パネルを隠しても表示し、表示中のpanelだけを避ける。上160pt／下48ptと現在の画像領域を使ってchromeを避ける。
+  gate前は到達用wake、描画した箱だけ33ms再描画とし、hidden/minimized/terminalでは箱由来の予約を止める。
+- `ui_depth_wait.rs` は状態・I/O・repaintを持たない純描画。アニメーション展開中表示に揃えた色・角丸・17pt見出し・
+  細いバーと、実効割当の取消captionを描く。未割当captionは省略し、狭幅は折返す。
+- 実Ready採用までのpass回帰で、既存Depth shader成功枝が素材traceを空にしてSingle layoutだけを返す不整合を検出した。
+  `layout_rebound=true` / `sources_rebound=false` の既存debug assertionが失敗したため、assertを維持したまま、
+  同じ成功境界で実際に描画したresourceを同じNavigation occurrenceのLive sourceとして公開するよう補修した。
+  LegacyRenderedとDepthのnavigator／紙めくり禁止は維持し、通常2D／360の描画経路は変更しない。
+  独立reviewerもこの素材／layoutの公表境界の構造修正に同意した。
+- 初回fixtureのUI textures deltaの明示破棄と、raw textureではなく正本final sourceを使う準備を揃えた。
+  Readyの回帰はcompleted pending → 実advance → R16 upload／Ready採用まで同passで通し、直後に箱が消えることを検査する。
+  パネルとの非交差・上部／下部の予約帯・1093×614内のcontainsも実viewer出力で検査する。
+- snapshotは `depth_wait_indicator_small_dark.png` を1枚追加。生成は該当testだけ `UPDATE_SNAPSHOTS=1`。
+  既存534枚を事前SHA-256と照合し変更0。実装担当と独立reviewerがPNGを目視し、文字・取消行・バーに欠けや重なりがなく、
+  上部表示と右パネルを避けて画像領域内に収まることを確認した（snapshotは模擬chrome、実placementは上記pass回帰で検査）。
+
+変更は11ファイル: `src/app/depth_view.rs`, `src/depth_parallax.rs`, `src/ui_fullscreen.rs`, `src/lib.rs`,
+新規 `src/ui_depth_wait.rs`, `src/app/depth_view_tests.rs`, `src/ui_fullscreen/depth_tests.rs`,
+`tests/ui_snapshot.rs`, 新規 `tests/snapshots/depth_wait_indicator_small_dark.png`,
+`docs/depth-parallax-plan.md`, `docs/ui-responsiveness.md`。
+
+検証（全cargo/build/testに `MSBUILDDISABLENODEREUSE=1`）:
+
+- libの追加9回帰を含む深度＋既存animation gateの限定110/110成功、14.056秒
+  (`target/depth-wait-verified.log`)。初回のfixture修正と公表漏れの修正前失敗は別ログに残し、最終成功と区別する。
+- 新規snapshot生成1/1成功、1.69秒 (`target/depth-wait-snapshot-generate.log`)。
+  UPDATEなしの新規箱・既存3Dパネル・従来page waitの関連4/4比較も成功、2.12秒
+  (`target/depth-wait-snapshot-compare.log`)。新規testはlib9件とsnapshot1件の計10件。
+- core check成功、48.21秒 (`target/depth-wait-check.log`)、workspace全体の `cargo fmt` / `cargo fmt --check` 成功、
+  UI glyph checkerは危険な文字0 (`target/depth-wait-glyphs.log`)。
+- 独立完成レビュー（GPT-6.1 Sol / xhigh）は最終source・文書・110件ログ・新PNGを照合し ACCEPT、P1/P2なし。
+- `scripts/build-dev.ps1 -PreserveRuntime` は起動中の確認用core（PID85540）を検出し、上書き前にexit1で停止
+  (`target/depth-wait-build-dev.log`)。利用者のプロセスを終了せず、確認用binaryは今回の変更へ更新できていない。
+  起動中のcore終了後に再buildが必要。コンパイル失敗とは区別する。
+
+全件gateは実行していない。stage/commit・製品バイナリの起動、通常profileの設定変更もしていない。
 
 ## 11. テスト
 

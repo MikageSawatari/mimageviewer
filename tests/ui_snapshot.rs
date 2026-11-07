@@ -2589,6 +2589,17 @@ fn fullscreen_page_wait_indicator_dark() {
 }
 
 #[test]
+fn depth_wait_indicator_small_dark() {
+    snapshot_with_theme_at_size(
+        "depth_wait_indicator_small_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(1093.0, 614.0),
+        None,
+        mimageviewer::draw_depth_wait_indicator_snapshot_fixture,
+    );
+}
+
+#[test]
 fn preferences_video_bar_visibility_dark() {
     snapshot_with_theme(
         "preferences_video_bar_visibility_dark",

@@ -312,6 +312,9 @@ pub mod source_coverage;
 #[cfg(all(windows, any(test, feature = "test-script")))]
 mod test_script;
 pub mod ui_depth_parallax;
+mod ui_depth_wait;
+#[doc(hidden)]
+pub use ui_depth_wait::draw_depth_wait_indicator_snapshot_fixture;
 mod vram_budget;
 // loose-deps ポータブルビルド専用の native ファイル所在解決 (exe 隣の bundled file)。
 // 通常ビルドでは中身が無いので宣言ごと cfg で落とす。詳細: docs/portable-build-plan.md

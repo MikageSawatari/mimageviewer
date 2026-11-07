@@ -3,6 +3,188 @@ use super::*;
 use crate::depth_parallax::{DepthEntryBlock, DepthViewState};
 use crate::fs_exclusive_view::{ExclusiveViewKind, FsExclusiveView};
 
+#[test]
+fn depth_wait_status_is_shared_with_panel_and_its_gate_never_owns_lifetime() {
+    use crate::ai::runtime::AiRuntimeInitSnapshot;
+    use crate::app::depth_view::{DepthWaitStatus, depth_wait_status};
+    use crate::depth_parallax::{DepthSourcePhase, DepthSourceWait};
+    let mut app = setup_app_for_test();
+    depth(&mut app);
+    let key = crate::depth_estimation::DepthSourceKey {
+        texture_id: egui::TextureId::Managed(781),
+    };
+    let start = std::time::Instant::now();
+    for reason in [
+        DepthSourceWait::TexturePending,
+        DepthSourceWait::NativeOnly,
+        DepthSourceWait::AnnotationBake,
+        DepthSourceWait::OriginalHold,
+    ] {
+        let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+            unreachable!()
+        };
+        state.wait_started_at = start;
+        state.wait_for_source(reason);
+        assert_eq!(
+            state.wait_started_at, start,
+            "NotYet must not restart a continuous wait"
+        );
+        for runtime in [
+            AiRuntimeInitSnapshot::Dormant,
+            AiRuntimeInitSnapshot::Initializing,
+        ] {
+            let status = depth_wait_status(&app.fs_exclusive_view, &runtime).unwrap();
+            assert_eq!(status, DepthWaitStatus::PreparingModel);
+            assert_eq!(status.overlay_text(), "3D 写真のモデルを準備中…");
+            assert!(!status.visible_at(start, start + std::time::Duration::from_millis(149)));
+            assert!(status.visible_at(start, start + std::time::Duration::from_millis(150)));
+            assert!(!status.visible_at(start, start - std::time::Duration::from_millis(1)));
+        }
+        assert_eq!(
+            app.depth_panel_status(),
+            app.depth_wait_status().unwrap().panel_text()
+        );
+    }
+    app.ai_runtime_init =
+        crate::ai::runtime::AiRuntimeInitOwner::failed_for_test("UI status fixture");
+    assert_eq!(app.depth_wait_status(), Some(DepthWaitStatus::Calculating));
+    assert_eq!(app.depth_panel_status(), "奥行きを計算中");
+    assert_eq!(
+        app.depth_wait_status().unwrap().overlay_text(),
+        "奥行きを計算中…"
+    );
+    for failed in [false, true] {
+        let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+            unreachable!()
+        };
+        state.source = if failed {
+            DepthSourcePhase::Failed {
+                key,
+                reason: "reason".into(),
+            }
+        } else {
+            DepthSourcePhase::Ready { key }
+        };
+        for runtime in [
+            AiRuntimeInitSnapshot::Dormant,
+            AiRuntimeInitSnapshot::Initializing,
+        ] {
+            assert_eq!(depth_wait_status(&app.fs_exclusive_view, &runtime), None);
+        }
+        assert_eq!(
+            app.depth_panel_status(),
+            if failed {
+                "失敗しました (reason)"
+            } else {
+                ""
+            }
+        );
+    }
+    for target in [
+        FsExclusiveView::None,
+        FsExclusiveView::Panorama(crate::panorama::PanoramaState::new(
+            0.0,
+            0.0,
+            crate::panorama::PanoProjection::Perspective,
+        )),
+    ] {
+        app.set_fs_exclusive_view(target, "depth_wait_status_non_depth");
+        assert!(app.depth_wait_status().is_none());
+        assert!(app.depth_panel_status().is_empty());
+    }
+}
+
+#[test]
+fn depth_wait_clock_survives_readback_estimation_and_resets_only_after_terminal() {
+    use crate::depth_parallax::{DepthSourcePhase, DepthSourceWait};
+    let render = renderer();
+    let mut app = setup_app_for_test();
+    let mut state = DepthViewState::new(app.edit_request_owner_context());
+    let old = std::time::Instant::now() - std::time::Duration::from_secs(2);
+    state.wait_started_at = old;
+    let texture = render.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("depth-wait-clock"),
+        size: wgpu::Extent3d {
+            width: 2,
+            height: 2,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let key = crate::depth_estimation::DepthSourceKey {
+        texture_id: egui::TextureId::Managed(782),
+    };
+    state
+        .select_source(&render.device, &render.queue, &texture, key)
+        .unwrap();
+    assert!(matches!(state.source, DepthSourcePhase::ReadingBack { .. }));
+    assert_eq!(state.wait_started_at, old);
+    app.set_fs_exclusive_view(FsExclusiveView::Depth(state), "depth_wait_readback");
+    assert!(app.depth_wait_status().is_some());
+    let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+        unreachable!()
+    };
+    let map = crate::depth_estimation::DepthMap {
+        key,
+        width: 2,
+        height: 2,
+        values: vec![half::f16::from_f32(0.5); 4],
+        median: 0.5,
+    };
+    state.source = DepthSourcePhase::Estimating {
+        key,
+        pending: crate::depth_estimation::DepthPending::completed_for_test(state.context, 80, map),
+    };
+    assert_eq!(state.wait_started_at, old);
+    assert!(app.depth_wait_status().is_some());
+    let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+        unreachable!()
+    };
+    state.wait_for_source(DepthSourceWait::NativeOnly);
+    assert_eq!(state.wait_started_at, old);
+    let next_key = crate::depth_estimation::DepthSourceKey {
+        texture_id: egui::TextureId::Managed(783),
+    };
+    state
+        .select_source(&render.device, &render.queue, &texture, next_key)
+        .unwrap();
+    assert_eq!(
+        state.wait_started_at, old,
+        "new key during pending remains one busy presentation"
+    );
+    state.source = DepthSourcePhase::Ready { key: next_key };
+    state.wait_for_source(DepthSourceWait::TexturePending);
+    assert!(state.wait_started_at > old);
+    state.wait_started_at = old;
+    for failed in [false, true] {
+        state.source = if failed {
+            DepthSourcePhase::Failed {
+                key: next_key,
+                reason: "fixture".into(),
+            }
+        } else {
+            DepthSourcePhase::Ready { key: next_key }
+        };
+        state
+            .select_source(&render.device, &render.queue, &texture, key)
+            .unwrap();
+        assert!(state.wait_started_at > old);
+        state.wait_started_at = old;
+        state
+            .select_source(&render.device, &render.queue, &texture, key)
+            .unwrap();
+        assert_eq!(
+            state.wait_started_at, old,
+            "same-key pass never restarts the gate"
+        );
+    }
+}
+
 #[cfg(windows)]
 fn renderer() -> egui_wgpu::RenderState {
     static RENDERER: std::sync::OnceLock<egui_wgpu::RenderState> = std::sync::OnceLock::new();
@@ -1201,4 +1383,319 @@ fn depth_new_managed_texture_owns_the_wake_for_backend_registration_without_poin
         state.source,
         crate::depth_parallax::DepthSourcePhase::ReadingBack { .. }
     ));
+}
+
+/// Run the real child-viewer UI without installing a native viewport backend.
+/// Its managed source stays unregistered until a test explicitly registers it,
+/// so source preparation cannot start a readback or a real depth worker.
+#[cfg(windows)]
+struct DepthWaitViewerFixture {
+    ctx: egui::Context,
+    minimized: std::rc::Rc<std::cell::Cell<bool>>,
+    shapes: std::rc::Rc<std::cell::RefCell<Vec<egui::epaint::ClippedShape>>>,
+    passes: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+#[cfg(windows)]
+impl DepthWaitViewerFixture {
+    fn new(app: &mut App) -> Self {
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
+        let minimized = std::rc::Rc::new(std::cell::Cell::new(false));
+        let shapes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let passes = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed_minimized = minimized.clone();
+        let observed_shapes = shapes.clone();
+        let observed_passes = passes.clone();
+        egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
+            observed_passes.set(observed_passes.get() + 1);
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    viewport_id: viewport.ids.this,
+                    screen_rect: Some(Self::rect()),
+                    viewports: [
+                        (egui::ViewportId::ROOT, egui::ViewportInfo::default()),
+                        (
+                            viewport.ids.this,
+                            egui::ViewportInfo {
+                                parent: Some(egui::ViewportId::ROOT),
+                                focused: Some(true),
+                                minimized: Some(observed_minimized.get()),
+                                ..Default::default()
+                            },
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    ..Default::default()
+                },
+                |ui| (viewport.viewport_ui_cb)(ui),
+            );
+            observed_shapes.borrow_mut().extend(output.shapes.clone());
+            output.drop_without_applying_deltas();
+        });
+        install_pages(app, &ctx);
+        crate::app::source_texture_test_support::seed(app, &ctx, 0);
+        isolate_depth_renderer(app);
+        app.window_visible = true;
+        app.settings.video_in_window_mode = false;
+        app.settings.detached_viewer_enabled = false;
+        app.native_video_in_window_active = false;
+        app.ai_runtime_init =
+            crate::ai::runtime::AiRuntimeInitOwner::failed_for_test("no runtime in UI fixture");
+        depth(app);
+        Self {
+            ctx,
+            minimized,
+            shapes,
+            passes,
+        }
+    }
+
+    fn rect() -> egui::Rect {
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1093.0, 614.0))
+    }
+
+    fn frame(&self, app: &mut App) {
+        self.shapes.borrow_mut().clear();
+        let previous_passes = self.passes.get();
+        app.frame_counter += 1;
+        self.ctx
+            .run_pass(
+                egui::RawInput {
+                    screen_rect: Some(Self::rect()),
+                    ..Default::default()
+                },
+                |ctx| ctx.root_ui(|ui| app.render_fullscreen_viewport(ui)),
+            )
+            .drop_without_applying_deltas();
+        assert!(
+            self.passes.get() > previous_passes,
+            "the actual child-viewer pass must run"
+        );
+    }
+
+    fn text_rects(&self, expected: &str) -> Vec<egui::Rect> {
+        fn collect(shape: &egui::Shape, expected: &str, result: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == expected => {
+                    result.push(egui::Rect::from_min_size(text.pos, text.galley.size()));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, expected, result);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut result = Vec::new();
+        for shape in self.shapes.borrow().iter() {
+            collect(&shape.shape, expected, &mut result);
+        }
+        result
+    }
+
+    fn assert_wait_box(&self, caption: &str) -> egui::Rect {
+        fn collect(shape: &egui::Shape, target: egui::Rect, result: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Rect(rect) if rect.rect.contains_rect(target) => {
+                    result.push(rect.rect);
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, target, result);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let caption_rects = self.text_rects(caption);
+        let caption_rect = *caption_rects.first().expect("wait cancellation caption");
+        let mut boxes = Vec::new();
+        for shape in self.shapes.borrow().iter() {
+            collect(&shape.shape, caption_rect, &mut boxes);
+        }
+        boxes
+            .into_iter()
+            .find(|rect| {
+                Self::rect().contains_rect(*rect)
+                    && rect.width() < Self::rect().width() * 0.75
+                    && rect.height() < Self::rect().height() * 0.5
+            })
+            .expect("the actual painter must emit a bounded box around the wait caption")
+    }
+
+    fn source_key_and_register_backing(
+        &self,
+        app: &mut App,
+    ) -> crate::depth_estimation::DepthSourceKey {
+        let source = app
+            .ensure_final_composite_material(&self.ctx, 0)
+            .expect("canonical final source");
+        let tex = source.source_texture();
+        let Some(FsCacheEntry::Static { pixels, .. }) = app.fs_cache.get(&0) else {
+            panic!("still fixture");
+        };
+        let render = app.wgpu_render_state.as_ref().unwrap();
+        render.renderer.write().update_texture(
+            &render.device,
+            &render.queue,
+            tex.id(),
+            &egui::epaint::ImageDelta::full((**pixels).clone(), Default::default()),
+        );
+        crate::depth_estimation::DepthSourceKey {
+            texture_id: tex.id(),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn set_depth_wait_age(app: &mut App, age: std::time::Duration) {
+    let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+        panic!("depth fixture");
+    };
+    state.wait_started_at = std::time::Instant::now() - age;
+}
+
+#[cfg(windows)]
+#[test]
+fn depth_wait_actual_viewer_box_obeys_delay_and_panel_visibility() {
+    std::thread::spawn(|| {
+        let _input_guard = crate::key_input::lock_test_input();
+        let mut app = setup_app_for_test();
+        let viewer = DepthWaitViewerFixture::new(&mut app);
+        for panel_visible in [true, false] {
+            let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+                panic!("depth fixture");
+            };
+            state.panel_visible = panel_visible;
+            // A future fixture clock keeps slow CI/GPU setup from crossing the gate.
+            state.wait_started_at = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            viewer.frame(&mut app);
+            assert!(viewer.text_rects("D で取り消し").is_empty());
+            set_depth_wait_age(&mut app, std::time::Duration::from_millis(151));
+            viewer.frame(&mut app);
+            let rect = viewer.assert_wait_box("D で取り消し");
+            assert!(
+                rect.top() >= 160.0
+                    && rect.bottom() <= DepthWaitViewerFixture::rect().bottom() - 48.0
+            );
+            if panel_visible {
+                let panel = viewer
+                    .ctx
+                    .data(|data| data.get_temp::<egui::Rect>(egui::Id::unique("depth_panel_rect")))
+                    .unwrap();
+                assert!(
+                    !rect.intersects(panel),
+                    "wait box must avoid the current visible panel"
+                );
+            }
+            assert!(app.fs_exclusive_view.is_depth());
+        }
+        crate::key_input::clear_test_frame();
+    })
+    .join()
+    .unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn depth_wait_actual_viewer_caption_uses_effective_binding_and_hides_while_not_visible() {
+    std::thread::spawn(|| {
+        let _input_guard = crate::key_input::lock_test_input();
+        let mut app = setup_app_for_test();
+        let viewer = DepthWaitViewerFixture::new(&mut app);
+        let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+            panic!("depth fixture");
+        };
+        state.panel_visible = false;
+        set_depth_wait_age(&mut app, std::time::Duration::from_secs(1));
+        app.keymap = crate::keymap::Keymap::from_ini_str("[FsImage]\nFsDepthParallax = F13\n");
+        viewer.frame(&mut app);
+        viewer.assert_wait_box("F13 で取り消し");
+        assert!(viewer.text_rects("D で取り消し").is_empty());
+        let status = app.depth_wait_status().unwrap().overlay_text();
+        assert!(!viewer.text_rects(status).is_empty());
+
+        app.keymap = crate::keymap::Keymap::from_ini_str("[FsImage]\nFsDepthParallax = none\n");
+        viewer.frame(&mut app);
+        assert!(!viewer.text_rects(status).is_empty());
+        assert!(viewer.text_rects("D で取り消し").is_empty());
+        assert!(viewer.text_rects("F13 で取り消し").is_empty());
+        app.window_visible = false;
+        viewer.frame(&mut app);
+        assert!(viewer.text_rects(status).is_empty());
+        app.window_visible = true;
+        viewer.minimized.set(true);
+        viewer.frame(&mut app);
+        assert!(viewer.text_rects(status).is_empty());
+        viewer.minimized.set(false);
+        viewer.frame(&mut app);
+        assert!(!viewer.text_rects(status).is_empty());
+        crate::key_input::clear_test_frame();
+    })
+    .join()
+    .unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn depth_wait_actual_viewer_box_disappears_for_ready_failed_and_off() {
+    std::thread::spawn(|| {
+        let _input_guard = crate::key_input::lock_test_input();
+        for terminal in ["ready", "failed", "off"] {
+            let mut app = setup_app_for_test();
+            let viewer = DepthWaitViewerFixture::new(&mut app);
+            set_depth_wait_age(&mut app, std::time::Duration::from_secs(1));
+            viewer.frame(&mut app);
+            viewer.assert_wait_box("D で取り消し");
+            if terminal == "off" {
+                app.set_fs_exclusive_view(FsExclusiveView::None, "depth_wait_test_off");
+            } else {
+                let key = viewer.source_key_and_register_backing(&mut app);
+                let render = app.wgpu_render_state.clone().unwrap();
+                let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+                    panic!("depth fixture");
+                };
+                state.source = if terminal == "ready" {
+                    let backing = render.renderer.read().texture(&key.texture_id).unwrap().texture.clone().unwrap();
+                    state.select_source(&render.device, &render.queue, &backing, key).unwrap();
+                    let size = backing.size();
+                    let map = crate::depth_estimation::DepthMap { key, width: size.width, height: size.height,
+                        values: vec![half::f16::from_f32(0.5); (size.width * size.height) as usize], median: 0.5 };
+                    crate::depth_parallax::DepthSourcePhase::Estimating { key,
+                        pending: crate::depth_estimation::DepthPending::completed_for_test(state.context, 80, map) }
+                } else {
+                    crate::depth_parallax::DepthSourcePhase::Failed {
+                        key,
+                        reason: "fixture failure".to_owned(),
+                    }
+                };
+            }
+            viewer.frame(&mut app);
+            assert!(viewer.text_rects("D で取り消し").is_empty(), "{terminal}");
+            assert!(app.depth_wait_status().is_none(), "{terminal}");
+            if terminal == "failed" {
+                assert!(app.depth_panel_status().contains("fixture failure"));
+                assert!(matches!(
+                    &app.fs_exclusive_view,
+                    FsExclusiveView::Depth(state)
+                        if matches!(state.source, crate::depth_parallax::DepthSourcePhase::Failed { .. })
+                ));
+            } else if terminal == "ready" {
+                assert!(matches!(&app.fs_exclusive_view, FsExclusiveView::Depth(state) if state.ready().is_some()),
+                    "the real viewer advance must adopt and upload a depth result in this pass");
+                assert!(matches!(
+                    &app.fs_exclusive_view,
+                    FsExclusiveView::Depth(state)
+                        if matches!(state.source, crate::depth_parallax::DepthSourcePhase::Ready { .. })
+                ));
+            }
+        }
+        crate::key_input::clear_test_frame();
+    })
+    .join()
+    .unwrap();
 }

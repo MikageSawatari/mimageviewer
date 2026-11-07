@@ -2,6 +2,88 @@ use super::*;
 use crate::fs_exclusive_view::FsExclusiveView;
 
 #[test]
+fn depth_wait_overlay_repaint_stops_for_ready_failed_hidden_and_minimized() {
+    let ctx = egui::Context::default();
+    let mut app = crate::app::setup_app_for_test();
+    install_depth(&mut app);
+    app.window_visible = true;
+    let frame = |app: &App, minimized: bool, draw: bool| {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1093.0, 614.0),
+            )),
+            ..Default::default()
+        };
+        input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .minimized = Some(minimized);
+        let output = ctx.run_ui(input, |ui| {
+            if draw {
+                app.draw_depth_wait_indicator(
+                    ui,
+                    ui.max_rect(),
+                    &ctx,
+                    crate::app::ActionSurface::Viewer,
+                );
+            }
+        });
+        let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        output.drop_without_applying_deltas();
+        delay
+    };
+    for _ in 0..8 {
+        frame(&app, false, false);
+    }
+    let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+        unreachable!()
+    };
+    state.panel_visible = false;
+    state.wait_started_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    assert_eq!(
+        frame(&app, false, true),
+        std::time::Duration::from_millis(33)
+    );
+    app.window_visible = false;
+    assert!(frame(&app, false, true) > std::time::Duration::from_secs(1));
+    app.window_visible = true;
+    assert!(frame(&app, true, true) > std::time::Duration::from_secs(1));
+    let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+        unreachable!()
+    };
+    state.wait_started_at = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    assert_eq!(
+        frame(&app, false, true),
+        std::time::Duration::from_millis(150),
+        "only the gate wake before visibility"
+    );
+    let key = crate::depth_estimation::DepthSourceKey {
+        texture_id: egui::TextureId::Managed(784),
+    };
+    for failed in [false, true] {
+        let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+            unreachable!()
+        };
+        state.source = if failed {
+            crate::depth_parallax::DepthSourcePhase::Failed {
+                key,
+                reason: "fixture".into(),
+            }
+        } else {
+            crate::depth_parallax::DepthSourcePhase::Ready { key }
+        };
+        assert!(
+            frame(&app, false, true) > std::time::Duration::from_secs(1),
+            "terminal phase cannot animate"
+        );
+    }
+    app.set_fs_exclusive_view(FsExclusiveView::None, "depth_wait_repaint_test_off");
+    assert!(frame(&app, false, true) > std::time::Duration::from_secs(1));
+}
+
+#[test]
 fn depth_annotation_bake_wait_overrides_an_otherwise_complete_2d_base() {
     let ctx = egui::Context::default();
     let mut app = crate::app::setup_app_for_test();

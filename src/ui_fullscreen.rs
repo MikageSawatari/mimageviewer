@@ -44599,6 +44599,14 @@ impl App {
             {
                 if let Some(submitted) = submitted {
                     submitted.pages.clear();
+                    // The shader still presents this source as one page. Keep the
+                    // trace paired with the returned Single layout, even though
+                    // the exclusive owner disables navigator and paper-turn input.
+                    submitted.pages.push(FsNavigatorTextureSource {
+                        occurrence: SpreadPageOccurrence::navigation(page_idx, page_idx),
+                        resource: resource.clone(),
+                        provenance: FsDisplayUnitPageProvenance::Live,
+                    });
                     submitted.submission = FsDisplayUnitSubmission::LegacyRendered;
                 }
                 return Some(transform);
@@ -53758,6 +53766,7 @@ impl App {
         // ジョブ寿命に連動した専用ステータスも描く。トーストが無いフレームでも必要。
         self.draw_erase_inpaint_progress(ui, full_rect, ctx, drawing_surface);
         self.draw_animation_expansion_progress(ui, full_rect, ctx, drawing_surface);
+        self.draw_depth_wait_indicator(ui, full_rect, ctx, drawing_surface);
 
         let Some((ref text, start_time, duration)) = self.fs_feedback_toast else {
             return;
@@ -53851,6 +53860,72 @@ impl App {
 
         // フェードアウト中は 30fps で再描画
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
+    }
+
+    /// A visual hint for the existing pending Depth owner, independent of its panel.
+    pub(crate) fn draw_depth_wait_indicator(
+        &self,
+        ui: &egui::Ui,
+        full_rect: egui::Rect,
+        ctx: &egui::Context,
+        drawing_surface: crate::app::ActionSurface,
+    ) {
+        if drawing_surface != crate::app::ActionSurface::Viewer
+            || !self.window_visible
+            || ctx.input(|input| input.viewport().minimized == Some(true))
+        {
+            return;
+        }
+        let Some(status) = self.depth_wait_status() else {
+            return;
+        };
+        let crate::fs_exclusive_view::FsExclusiveView::Depth(state) = &self.fs_exclusive_view
+        else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let elapsed = now
+            .checked_duration_since(state.wait_started_at)
+            .unwrap_or_default();
+        if !status.visible_at(state.wait_started_at, now) {
+            // A single delayed wake owns the flicker gate even for a quiet NotYet
+            // source. This does not poll the request or animate a hidden bar.
+            ctx.request_repaint_after(
+                std::time::Duration::from_millis(150).saturating_sub(elapsed),
+            );
+            return;
+        }
+        let image_region = self
+            .fullscreen_page_layout
+            .single_page()
+            .map_or(full_rect, |page| page.transform.viewport_rect);
+        let mut available = image_region.intersect(full_rect).shrink(8.0);
+        // Reserve hover chrome as well as locked chrome; page info lives at the
+        // bottom and must not compete with the waiting message on small screens.
+        available.min.y = available.min.y.max(full_rect.top() + 160.0);
+        available.max.y = available.max.y.min(full_rect.bottom() - 48.0);
+        if state.panel_visible
+            && let Some(panel) =
+                ctx.data(|data| data.get_temp::<egui::Rect>(egui::Id::unique("depth_panel_rect")))
+            && panel.intersects(available)
+        {
+            available.max.x = available.max.x.min(panel.left() - 12.0);
+        }
+        let cancel = self
+            .keymap
+            .first_chord_label(KeyAction::FsDepthParallax)
+            .map(|label| format!("{label} で取り消し"));
+        if crate::ui_depth_wait::paint_depth_wait_indicator(
+            ui,
+            available,
+            status.overlay_text(),
+            cancel.as_deref(),
+            elapsed,
+        )
+        .is_some()
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        }
     }
 
     /// 現ページの全フレーム展開中に、初回 decode / 先読み後の昇格を問わず出すステータス。

@@ -4,6 +4,65 @@ use crate::depth_parallax::{
 };
 use crate::fs_exclusive_view::{ExclusiveViewKind, FsExclusiveView};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DepthWaitStatus {
+    PreparingModel,
+    Calculating,
+}
+
+impl DepthWaitStatus {
+    pub(crate) fn panel_text(self) -> &'static str {
+        match self {
+            Self::PreparingModel => "モデルを準備中",
+            Self::Calculating => "奥行きを計算中",
+        }
+    }
+
+    pub(crate) fn overlay_text(self) -> &'static str {
+        match self {
+            Self::PreparingModel => "3D 写真のモデルを準備中…",
+            Self::Calculating => "奥行きを計算中…",
+        }
+    }
+
+    pub(crate) fn visible_at(
+        self,
+        started_at: std::time::Instant,
+        now: std::time::Instant,
+    ) -> bool {
+        super::animation_expansion_progress_visible(Some(started_at), now)
+    }
+}
+
+/// Presentation only: the source phase, never the delay gate, owns job lifetime.
+pub(crate) fn depth_wait_status(
+    view: &FsExclusiveView,
+    runtime: &crate::ai::runtime::AiRuntimeInitSnapshot,
+) -> Option<DepthWaitStatus> {
+    use crate::ai::runtime::AiRuntimeInitSnapshot;
+    use crate::depth_parallax::DepthSourcePhase;
+    match view {
+        FsExclusiveView::Depth(state)
+            if !matches!(
+                state.source,
+                DepthSourcePhase::Ready { .. } | DepthSourcePhase::Failed { .. }
+            ) =>
+        {
+            Some(
+                if matches!(
+                    runtime,
+                    AiRuntimeInitSnapshot::Dormant | AiRuntimeInitSnapshot::Initializing
+                ) {
+                    DepthWaitStatus::PreparingModel
+                } else {
+                    DepthWaitStatus::Calculating
+                },
+            )
+        }
+        _ => None,
+    }
+}
+
 impl App {
     pub(crate) fn panorama_state(&self) -> Option<&crate::panorama::PanoramaState> {
         self.fs_exclusive_view.panorama_state()
@@ -233,6 +292,20 @@ impl App {
         false
     }
 
+    pub(crate) fn depth_wait_status(&self) -> Option<DepthWaitStatus> {
+        depth_wait_status(&self.fs_exclusive_view, &self.ai_runtime_init.snapshot())
+    }
+
+    pub(crate) fn depth_panel_status(&self) -> String {
+        if let FsExclusiveView::Depth(state) = &self.fs_exclusive_view
+            && let crate::depth_parallax::DepthSourcePhase::Failed { reason, .. } = &state.source
+        {
+            return format!("失敗しました ({reason})");
+        }
+        self.depth_wait_status()
+            .map_or_else(String::new, |status| status.panel_text().to_owned())
+    }
+
     pub(crate) fn draw_depth_panel(&mut self, ctx: &egui::Context, fs_idx: usize) {
         if self.depth_entry_allowed(fs_idx).is_err() {
             return;
@@ -243,21 +316,7 @@ impl App {
         if !state.panel_visible {
             return;
         }
-        let status = match &state.source {
-            crate::depth_parallax::DepthSourcePhase::Failed { reason, .. } => {
-                format!("失敗しました ({reason})")
-            }
-            crate::depth_parallax::DepthSourcePhase::Ready { .. } => String::new(),
-            _ if matches!(
-                self.ai_runtime_init.snapshot(),
-                crate::ai::runtime::AiRuntimeInitSnapshot::Dormant
-                    | crate::ai::runtime::AiRuntimeInitSnapshot::Initializing
-            ) =>
-            {
-                "モデルを準備中".to_owned()
-            }
-            _ => "奥行きを計算中".to_owned(),
-        };
+        let status = self.depth_panel_status();
         let response = crate::ui_depth_parallax::draw_depth_parallax_panel(
             ctx,
             &mut self.settings.depth_parallax,

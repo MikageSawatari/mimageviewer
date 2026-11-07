@@ -441,6 +441,10 @@ worker結果の小さい `R16Float` uploadだけをUIで行い、深度mapの採
 ReadingBackは可視viewportだけ継続repaint、推論完了はworkerが要求元viewportを起こす。
 自動運動は可視中に再描画し、マウス追従は収束後に止める。通常sourceの再準備は既存の
 final/edit/upload ownerへ戻し、3D専用のdecode/upload列を増やさない。
+深度待ち（素材NotYetを含む）は2Dを保ったまま非モーダルの状態箱で知らせる。150msの提示gateは
+仕事の生存判定に使わず、gate到達用の遅延wakeと、箱が見える間だけの33msバー再描画を持つ。
+Ready / Failed / OFF、およびhidden / minimizedでは箱由来の再描画を予約しない。
+Dの取消・ページ送りは既存の要求ownerに任せ、同期の初期化待ち・推論待ちを追加しない。
 検証の完了状況は [3D設計 §10](depth-parallax-plan.md#10-実装の段階-codex-への委任単位) を参照。
 
 `ctx.load_texture(name, ColorImage, options)` は UI スレッドで同期実行され、内部で

@@ -276,6 +276,8 @@ pub(crate) struct DepthViewState {
     pub context: ViewerContextId,
     pub panel_visible: bool,
     pub started_at: Instant,
+    // Continuous pending presentation only; readiness/cancellation still belongs to source.
+    pub wait_started_at: Instant,
     pub mouse: MouseFollow,
     pub source: DepthSourcePhase,
     pub lru: DepthLru,
@@ -290,10 +292,12 @@ pub(crate) struct DepthViewState {
 }
 impl DepthViewState {
     pub(crate) fn new(context: ViewerContextId) -> Self {
+        let now = Instant::now();
         Self {
             context,
             panel_visible: true,
-            started_at: Instant::now(),
+            started_at: now,
+            wait_started_at: now,
             mouse: MouseFollow::default(),
             source: DepthSourcePhase::WaitingForStableTexture,
             lru: DepthLru::default(),
@@ -325,6 +329,9 @@ impl DepthViewState {
     pub(crate) fn wait_for_source(&mut self, reason: DepthSourceWait) {
         // Temporary display holds are not permission to retry a failed key.
         if !matches!(self.source, DepthSourcePhase::Failed { .. }) {
+            if matches!(self.source, DepthSourcePhase::Ready { .. }) {
+                self.wait_started_at = Instant::now();
+            }
             self.source = DepthSourcePhase::WaitingForStableTexture;
         }
         self.color = None;
@@ -341,6 +348,12 @@ impl DepthViewState {
     ) -> Result<(), String> {
         if self.source.key() == Some(key) {
             return Ok(());
+        }
+        if matches!(
+            self.source,
+            DepthSourcePhase::Ready { .. } | DepthSourcePhase::Failed { .. }
+        ) {
+            self.wait_started_at = Instant::now();
         }
         self.clear_slot();
         self.source = DepthSourcePhase::WaitingForStableTexture;
