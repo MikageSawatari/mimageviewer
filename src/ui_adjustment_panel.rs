@@ -15454,22 +15454,28 @@ impl App {
                 .open(&mut open)
                 .show(ctx, |ui| {
                     crate::os_theme::apply_dark_ui(ui);
-                    ui.horizontal(|ui| {
-                        crate::ime_focus::add_sized_singleline(
-                            ui,
-                            egui::vec2((ui.available_width() - 32.0).max(120.0), 24.0),
-                            effect_query,
-                            None,
-                            |edit| edit.hint_text("効果名で検索").desired_width(f32::INFINITY),
-                        );
-                        if ui
-                            .add_enabled(!effect_query.is_empty(), egui::Button::new("×"))
-                            .on_hover_text("検索をクリア")
-                            .clicked()
-                        {
-                            effect_query.clear();
-                        }
-                    });
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), 24.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            // Reserve the actual button and spacing before filling the search field.
+                            let clear_clicked = ui
+                                .add_enabled(!effect_query.is_empty(), egui::Button::new("×"))
+                                .on_hover_text("検索をクリア")
+                                .clicked();
+                            crate::ime_focus::add_sized_singleline(
+                                ui,
+                                egui::vec2(ui.available_width(), 24.0),
+                                effect_query,
+                                None,
+                                |edit| edit.hint_text("効果名で検索").desired_width(f32::INFINITY),
+                            );
+                            // Apply clear after text/IME events, as in the left-to-right row.
+                            if clear_clicked {
+                                effect_query.clear();
+                            }
+                        },
+                    );
                     ui.separator();
                     let query = effect_query.trim();
                     egui::ScrollArea::vertical()
@@ -17733,3 +17739,7 @@ mod click_timing_1679_tests;
 #[cfg(test)]
 #[path = "ui_adjustment_panel/shape_undo_investigation_tests.rs"]
 mod shape_undo_investigation_tests;
+
+#[cfg(test)]
+#[path = "ui_adjustment_panel/picker_width_1725_tests.rs"]
+mod picker_width_1725_tests;
