@@ -234,7 +234,7 @@ fn install_still(app: &mut App, ctx: &egui::Context, idx: usize, size: [usize; 2
     );
 }
 
-fn install_pages(app: &mut App, ctx: &egui::Context) {
+pub(super) fn install_pages(app: &mut App, ctx: &egui::Context) {
     app.items = vec![
         GridItem::Image("depth-first.jpg".into()),
         GridItem::Video("depth-video.mp4".into()),
@@ -732,7 +732,7 @@ fn depth_actual_f12_transition_has_no_depth_frame_in_detached_or_after_return() 
 }
 
 #[cfg(windows)]
-fn depth_key_frame(app: &mut App, ctx: &egui::Context, keys: &[(egui::Key, bool)]) {
+pub(super) fn depth_key_frame(app: &mut App, ctx: &egui::Context, keys: &[(egui::Key, bool)]) {
     ctx.begin_pass(egui::RawInput {
         events: keys
             .iter()
@@ -1695,6 +1695,207 @@ fn depth_wait_actual_viewer_box_disappears_for_ready_failed_and_off() {
             }
         }
         crate::key_input::clear_test_frame();
+    })
+    .join()
+    .unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn depth_actual_mouse_page_navigation_ignores_suspended_2d_transforms() {
+    // The immediate renderer is thread-local: drive the real child viewer without
+    // opening a native window or leaving a backend callback on a test-pool thread.
+    std::thread::spawn(|| {
+        let _input_guard = crate::key_input::lock_test_input();
+        let mut destinations = Vec::new();
+        for (committed_zoom, panel_visible) in
+            [(false, true), (true, true), (false, false), (true, false)]
+        {
+            let ctx = egui::Context::default();
+            ctx.set_embed_viewports(false);
+            crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
+            let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let child_events = events.clone();
+            let responses = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let observed_responses = responses.clone();
+            let child_passes = std::rc::Rc::new(std::cell::Cell::new(0));
+            let observed = child_passes.clone();
+            let viewport_rect =
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
+            egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
+                observed.set(observed.get() + 1);
+                let input_events = std::mem::take(&mut *child_events.borrow_mut());
+                ctx.run_ui(
+                    egui::RawInput {
+                        viewport_id: viewport.ids.this,
+                        screen_rect: Some(viewport_rect),
+                        time: Some(observed.get() as f64 / 60.0),
+                        events: input_events,
+                        viewports: [
+                            (
+                                egui::ViewportId::ROOT,
+                                egui::ViewportInfo {
+                                    focused: Some(false),
+                                    ..Default::default()
+                                },
+                            ),
+                            (
+                                viewport.ids.this,
+                                egui::ViewportInfo {
+                                    parent: Some(egui::ViewportId::ROOT),
+                                    focused: Some(true),
+                                    inner_rect: Some(viewport_rect),
+                                    native_pixels_per_point: Some(1.0),
+                                    ..Default::default()
+                                },
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        (viewport.viewport_ui_cb)(ui);
+                        if let Some(response) = ctx.read_response(egui::Id::unique("fs_click")) {
+                            observed_responses.borrow_mut().push(format!(
+                                "pos={:?} clicked={} down={} hovered={} layer={:?}",
+                                response.interact_pointer_pos(), response.clicked(),
+                                response.is_pointer_button_down_on(), response.hovered(),
+                                ctx.input(|i| i.pointer.hover_pos()).and_then(|pos| ctx.layer_id_at(pos))
+                            ));
+                        }
+                    },
+                )
+                .drop_without_applying_deltas();
+            });
+            let mut app = setup_app_for_test();
+            install_pages(&mut app, &ctx);
+            app.items[1] = GridItem::Image("depth-mouse-next.jpg".into());
+            install_still(&mut app, &ctx, 1, [2, 3]);
+            app.window_visible = false; // No depth worker/model during this input test.
+            app.settings.video_in_window_mode = false;
+            app.settings.detached_viewer_enabled = false;
+            app.settings.touch_still_chrome_learned = true;
+            let model_path = app.tmp.path().join("unused-depth-model.onnx");
+            app.depth_setup
+                .set_status_for_test(crate::addon::AddonStatus::Valid {
+                    model_id: "depth-mouse-fixture".to_owned(),
+                    bytes: 1,
+                    model_path,
+                    mmproj_path: None,
+                });
+            app.fs_zoom_factor = 2.75;
+            app.fs_zoom = 1.8;
+            app.fs_pan = egui::vec2(24.0, -18.0);
+            app.fs_free_rotation = 0.2;
+            if committed_zoom {
+                depth_key_frame(&mut app, &ctx, &[(egui::Key::Z, true)]);
+                assert!(app.fs_zoom_aiming);
+                depth_key_frame(&mut app, &ctx, &[(egui::Key::Z, false)]);
+                assert!(app.fs_zoom_active);
+                assert!(!app.fs_zoom_aiming);
+            }
+            depth_key_frame(
+                &mut app,
+                &ctx,
+                &[(egui::Key::D, true), (egui::Key::D, false)],
+            );
+            if !panel_visible {
+                depth_key_frame(
+                    &mut app,
+                    &ctx,
+                    &[(egui::Key::I, true), (egui::Key::I, false)],
+                );
+            }
+            assert!(matches!(
+                &app.fs_exclusive_view,
+                FsExclusiveView::Depth(state) if state.panel_visible == panel_visible
+            ));
+            let render_frame = |app: &mut App| {
+                app.frame_counter += 1;
+                ctx.run_pass(
+                    egui::RawInput {
+                        screen_rect: Some(viewport_rect),
+                        ..Default::default()
+                    },
+                    |ctx| ctx.root_ui(|root_ui| app.render_fullscreen_viewport(root_ui)),
+                )
+                .drop_without_applying_deltas();
+            };
+            render_frame(&mut app);
+            assert_eq!(app.fullscreen_idx, Some(0));
+            // Model a settled, already focused viewer, as in the reported clicks.
+            // Its initial focus-acquisition click is intentionally not navigation.
+            app.fs_focus_regained_at = None;
+            assert!(!app.fs_primary_suppression.is_active());
+            // Real mouse producer, distinct from the touch regression: right
+            // page-side click advances, then left page-side click returns.
+            for (pos, expected) in [
+                (egui::pos2(1100.0, 500.0), 1),
+                (egui::pos2(250.0, 500.0), 0),
+            ] {
+                events.borrow_mut().push(egui::Event::PointerMoved(pos));
+                render_frame(&mut app);
+                for pressed in [true, false] {
+                    events.borrow_mut().extend([
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ]);
+                    render_frame(&mut app);
+                    assert!(
+                        events.borrow().is_empty(),
+                        "child viewer must consume mouse batch"
+                    );
+                    assert!(app.fs_exclusive_view.is_depth());
+                    assert_eq!(app.fs_zoom_active, committed_zoom);
+                    assert_eq!(app.fs_zoom_factor, 2.75);
+                }
+                assert_eq!(app.fullscreen_idx, Some(expected), "mouse page-side click: Z={committed_zoom}, panel={panel_visible}, pos={pos:?}, responses={:?}", responses.borrow());
+            }
+            assert!(
+                child_passes.get() >= 3,
+                "the actual child viewer UI must run"
+            );
+            assert_eq!(
+                app.fullscreen_idx,
+                Some(0),
+                "raw mouse must reach PageSide navigation with committed_zoom={committed_zoom}"
+            );
+            assert!(app.fs_exclusive_view.is_depth());
+            assert_eq!(
+                app.fs_zoom_owner(),
+                crate::ui_fullscreen::FsZoomOwner::Depth
+            );
+            destinations.push(app.items[app.fullscreen_idx.unwrap()].clone());
+            depth_key_frame(
+                &mut app,
+                &ctx,
+                &[(egui::Key::D, true), (egui::Key::D, false)],
+            );
+            assert!(matches!(app.fs_exclusive_view, FsExclusiveView::None));
+            assert_eq!(app.fs_zoom_active, committed_zoom);
+            assert!(!app.fs_zoom_aiming);
+            assert_eq!(app.fs_zoom_factor, 2.75);
+            assert_eq!(
+                app.fs_zoom_owner(),
+                if committed_zoom {
+                    crate::ui_fullscreen::FsZoomOwner::ZoomMode
+                } else {
+                    crate::ui_fullscreen::FsZoomOwner::Image
+                }
+            );
+            crate::key_input::clear_test_frame();
+        }
+        assert!(
+            destinations
+                .iter()
+                .all(|destination| destination == &destinations[0])
+        );
     })
     .join()
     .unwrap();

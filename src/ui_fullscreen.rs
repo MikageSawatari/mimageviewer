@@ -41327,28 +41327,28 @@ impl App {
                 self.fs_pan_drag_start = None;
                 self.fs_rotation_drag_start = None;
             }
-
-            // ダブルクリック → ズーム/パン/回転リセット
-            match canvas_click {
-                FsCanvasClickAction::None => {}
-                FsCanvasClickAction::ResetTransform => {
-                    self.fs_zoom = 1.0;
-                    self.fs_pan = egui::Vec2::ZERO;
-                    self.fs_free_rotation = 0.0;
-                    self.maybe_rerender_pdf(1.0);
+        }
+        // Click navigation is independent of transform ownership. Depth keeps
+        // its saved 2D transform suspended while accepting ordinary page clicks.
+        match canvas_click {
+            FsCanvasClickAction::None => {}
+            FsCanvasClickAction::ResetTransform => {
+                self.fs_zoom = 1.0;
+                self.fs_pan = egui::Vec2::ZERO;
+                self.fs_free_rotation = 0.0;
+                self.maybe_rerender_pdf(1.0);
+            }
+            FsCanvasClickAction::ToggleVideo(idx) => {
+                if let Some(player) = self.fs_video_player(idx) {
+                    player.toggle_play();
                 }
-                FsCanvasClickAction::ToggleVideo(idx) => {
-                    if let Some(player) = self.fs_video_player(idx) {
-                        player.toggle_play();
-                    }
-                }
-                FsCanvasClickAction::DismissOverflow => {
-                    self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
-                }
-                FsCanvasClickAction::PageSide(base) => {
-                    page_nav = self.spread_page_nav(base);
-                    *navigation_operation = input.pointer_navigation_operation;
-                }
+            }
+            FsCanvasClickAction::DismissOverflow => {
+                self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+            }
+            FsCanvasClickAction::PageSide(base) => {
+                page_nav = self.spread_page_nav(base);
+                *navigation_operation = input.pointer_navigation_operation;
             }
         }
         // 分析モード中は右クリックを色固定に使うため、終了トリガーにしない
@@ -41455,17 +41455,24 @@ impl App {
             || self.analysis_mode
             || self
                 .fullscreen_idx
-                .is_some_and(|idx| self.fs_exclusive_view_active(idx).is_some())
+                .is_some_and(|idx| self.is_panorama_mode_active(idx))
         {
             return FsCanvasClickAction::None;
         }
+        // Depth suspends the saved 2D transform. Classify clicks on its fitted
+        // canvas, and never reset the suspended transform on a double-click.
+        let (zoom, pan, rotation) = if self.fs_exclusive_view.is_depth() {
+            (1.0, egui::Vec2::ZERO, 0.0)
+        } else {
+            (zoom, pan, self.fs_free_rotation)
+        };
         let has_transform = zoom_differs_from_fit(zoom)
-            || self.fs_free_rotation.abs() > TRANSFORM_EPSILON
+            || rotation.abs() > TRANSFORM_EPSILON
             || pan.length_sq() > PAN_EPSILON_SQ;
         if self.fs_front_pointer.backing_double_clicked(response) && has_transform {
             return FsCanvasClickAction::ResetTransform;
         }
-        if fullscreen_click_belongs_to_view(zoom, self.fs_free_rotation)
+        if fullscreen_click_belongs_to_view(zoom, rotation)
             || self.fs_context_menu_idx.is_some()
             || (response.dragged() && response.drag_delta().length() > 3.0)
             || !response.clicked()

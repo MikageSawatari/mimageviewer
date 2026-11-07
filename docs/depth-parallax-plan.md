@@ -101,10 +101,17 @@
 
 ### 3.3 未導入のとき
 
-- 3D モードに入ろうとすると、**ダウンロード案内ダイアログ**を出してモードは始めない。
+- lazy scan の未確認は未導入扱いにせず、確認中のモーダルを出す。D／上部3Dボタン由来で
+  導入済みと確認できた場合は窓を閉じ、その時点の `entry_allowed` と受付時の画像の同一性
+  （context・items世代・位置・item識別子）を再照合して、そのまま3Dへ入る。
+  環境設定由来の確認は自動入場しない。確認中に画像が変わっていれば入場要求は終了する。
+  ローカル閲覧入力はモーダルで止まるので、再開・rollbackの状態機械は足さない。
+  関連付けのopenやRemoteなどモーダル外の変更には、上記の照合と操作権の確認で応答する。
+- 未導入なら **ダウンロード案内ダイアログ**を出してモードは始めない。
   ダイアログには大きさ (約 0.67 GB)、ライセンス (Apache-2.0)、入手元、保存先を出す。
-- ダウンロード中・完了後に **自動で 3D モードへ入らない**。完了したら「もう一度 D キーで 3D 表示」と
-  通知する。ダウンロード中にページを移る・フルスクリーンを閉じる、と 3D モードの組み合わせを作らないため。
+- ダウンロード中・完了後に **自動で 3D モードへ入らない**。完了したら現在のキー割当を使って再入場を
+  案内する。ダウンロード中にページを移る・フルスクリーンを閉じる、と 3D モードの組み合わせを作らないため。
+  導入済み確認だけを継続するのは、起動ごとにDを2回押す手間を除き、短いモーダル確認の既存境界を使うため。
 - 設定画面のアドオン一覧 (VLM と同じ場所) からも導入・削除できる。
 
 ### 3.4 推論
@@ -450,6 +457,8 @@ pub enum DepthSourcePhase {
   置き換えで 360° の挙動が変わらないことを、既存の 360° のテストで確かめる。
 - 3D 中のホイール: **通常どおりページ送り**。3D 中に固有の意味は持たせない (360° と違う点)。
   Ctrl+ホイールのズームだけ止める (§5.2)。
+- 3D 中のマウス左クリック／タップ: **通常どおりページ送り**。360°がcanvasを視線操作に使うための
+  クリック停止をDepthへ持ち込まない。判定は表示中のfit transformを使い、保存2D transformを変更しない。
 - 3D 中の左右パネルの表示切替 (I / Tab): **3D パネルの表示・非表示を切り替える**。他のパネルは
   3D 中は出ない。
 
@@ -795,7 +804,7 @@ P1/P2 残件なし。ClaudeCode の検収・利用者の実機確認は未実施
 | `ui_fullscreen.rs:29179,29184,29215,29223` local adjust / SNS / crop / trim | 占有 | 各ツール panel の停止 |
 | `ui_fullscreen.rs:29281,29677,39757` callouts / overflow request / side chrome | 占有 | パネルの表示と入力受付を揃える |
 | `ui_fullscreen.rs:30576` seek menu blocker | 占有 | 通常静止画 menu の停止 |
-| `ui_fullscreen.rs:41225,41273` ordinary wheel zoom / canvas click | 占有 | 2D transform を変更しない |
+| `ui_fullscreen.rs` ordinary wheel zoom / canvas click | 分岐（依頼18で訂正） | wheel zoom は占有。canvas click は360°の意味に依存し、Depthの通常ページ送りを許可。保存2D transform は不変 |
 | `ui_fullscreen.rs:43016,49713` edit admission / loupe | 占有 | 共通入口と描画の両方を停止 |
 | `app/page_overview.rs:230` overview | 占有＋360 | 占有中は入場停止。既存の `panorama_intent.on` による停止は別に維持 |
 | `ui_video_tile.rs:69`、`ui_view_trim.rs:993` | 占有 | tile の入口、trim の準備完了後の再開も停止 |
@@ -951,7 +960,7 @@ ClaudeCode が正当と判断した別 session の独立指摘3件に対応す�
 | draw の fit / zoom / pan / 自由回転 | Depth が先に選ばれ、描画引数だけ fit / zero にする。保存値を書き換えない |
 | key / touch / gamepad / middle-drag の zoom owner | `FsZoomOwner::Depth` は無操作。保存状態を reset しない |
 | wheel | Depth の Ctrl+wheel は Z 分岐より前に消費。通常 wheel はページ移動の既存契約 |
-| navigator / drag / double-click | Depth は navigator 不許可、canvas入力は専用の無操作分岐。drag origin の破棄は一時状態だけ |
+| navigator / drag / double-click | Depth は navigator 不許可、transform変更は無操作。依頼18でclick採用を分離し、保存transformを参照せずページ送りを許可。drag origin の破棄は一時状態だけ |
 | fit cycle | Depth は入口で拒否し、保存 fit や2D transformを変更しない |
 | `reset_fullscreen_fit_transform` / `reset_continuous_reading_transform` | 明示 fit / reading-mode 切替の既存境界。Depth中の毎 frame reset ではない |
 | `open_fullscreen` の変換初期化 | ページ変更の既存境界。同一ページ D 往復の per-frame 処理ではない |
@@ -1053,8 +1062,8 @@ owner の優先順（Depth → 保存 Z → Panorama → Analysis → Image）�
 | raw flag の reset/代入 | state machine/lifecycleの書込みでありruntime consumerではない。変更なし |
 | `cfg(test)` の直接設定・assert | fixtureと保存値の検査。runtime 判定へ置換しない |
 
-**派生する入力・表示の確認**: マウス canvas click は既存の占有 owner 判定で Depth の無操作を選び、
-Z保存値を直接読まない。タップ領域は Depth の通常ページ送りを許可し、360/Analysis を除く既存規則のまま。
+**派生する入力・表示の確認（依頼18で訂正）**: 当初マウス canvas click を占有 owner 判定で無操作にしていたが、
+Depthでも通常ページ送りを許可するのが正しい。タップ領域も Depth の通常ページ送りを許可し、360/Analysis を除く既存規則のまま。
 初回タッチヘルプの開始／終了と上部バーのtouch target登録は `40317` の認識可否から派生するため、同じ実効値で揃う。
 上部バーの表示自体には保存Zの直接consumerは無い。navigatorのDepth入場拒否とパネル固有の占有規則も変更しない。
 
@@ -1136,6 +1145,80 @@ Z未使用のDepthと移動先が一致し、移動中は実効ownerがDepth、�
   起動中のcore終了後に再buildが必要。コンパイル失敗とは区別する。
 
 全件gateは実行していない。stage/commit・製品バイナリの起動、通常profileの設定変更もしていない。
+
+#### 段 B サブ PC 実機確認（依頼18）への対応 (2026-11-07)
+
+観測者はサブ PC 担当。正本は `C:/home/mimageviewer-subpc/depth-b/results/notes.md`。
+修正前に確認した原因経路・検証方針を以下に記録する。
+
+- クリック: `plan_fs_canvas_click` が `fs_exclusive_view_active(...).is_some()` で
+  Depth の通常ページ送りまで拒否し、採用側も Depth の transform 停止分岐内で click action を捨てていた。
+  360° のドラッグ所有と Depth の fit 固定を混同した分類が原因。§10 の過去の canvas 無操作の記録は誤りで、
+  transform の変更停止と通常ページ送りを分離する。保存済み2D transform は判定にも使わない。
+- 動き欄: egui 0.37 の ComboBox popup と親パネルがともに Foreground。親へのクリック／slider drag による
+  Area の前面化と、保持された popup の相対順序の組合せで popup が親の背面に残る経路を確認。
+  実 panel painter の「上下選択→強さ5%へdrag→再開」で、押下／解放を同じ RawInput に入れると、
+  再開した左右の行の最前面layerが親パネルになることを修正前テストで再現した。
+  開いている ComboBox の実 response から popup IDを導き、`set_sublayer` で親子関係を登録する。
+  親とpopupのForegroundを維持し、前面化の順序競合を所有境界で除く。guard・retry・repaintは加えない。
+  サブPCのpress/releaseのframe分割はログにないので、実機でも同じ分割だったとは断定しない。
+- 導入確認: `toggle_depth_parallax` → `request_depth_addon_setup` の Checking は呼出元を持たず、
+  `poll_depth_setup` が scan 完了の installed を常に Done へ変えていたため、起動ごとに再度 D が必要だった。
+  確認元を Checking の typed state に持ち、D／上部ボタン由来の installed 完了だけ、同じ画像と入口条件を再照合して入る。
+  環境設定・download 完了からは入らない。外部の画像変更経路も照合対象に含める。
+
+動き欄の調査範囲は、製品panel／viewer描画・toggle、既知menuのclose、main modal遷移時のpopup close、
+wheel消費と、egui 0.37 の ComboBox／Popup／Area／Memory／ScrollArea。
+`vendor/egui/src/containers/combo_box.rs` の popup ID は response IDの `with("popup")`、
+`containers/popup.rs` の menu Area はForeground、`containers/area.rs` は親へのpress／dragで前面要求を出し、
+`memory/mod.rs::Areas::end_pass` は同一順序の相対関係を保持する。
+`Context::set_sublayer` は同じOrderの子を親の直上に置く契約なので、この固定panel／menuの所有関係に適用する。
+popup memoryはviewport単位だが、独自のdisable latch／popup state resetを要する証拠はなかった。
+既存のwheel消費は入力deltaだけを変更し、modal遷移のcloseはdialog開始境界だけなので、今回の永続する背面化の原因ではない。
+
+クリック以外も入口と採用先を確認した（行番号は依頼18の基点）。
+
+| 箇所／操作 | 分類と確認結果 |
+|---|---|
+| `plan_fs_canvas_click` / `apply_fs_wheel_frame_proposal` 左クリック | 360°の意味に依存。Depthはfitの実効transformでページ送りを分類し、transform適用と独立して採用する |
+| 同 double-click | 通常2Dのtransform resetは維持。Depthでは保存transformを参照／resetせず、通常のpage-side clickとして扱う。360°は既存pose resetへ |
+| `handle_middle_drag_zoom` 中ドラッグ、Ctrl+左ドラッグ／pan | 占有。Depthはfit固定なので停止。短い中クリックの割当実行とは独立 |
+| `40622` 中短クリック → `viewer_chrome::dispatch_viewer_middle_short_click` | 入力slotの意味。Depthの一律拒否なし。既定は未割当。共有mouse/ring resolverへ渡す |
+| `35826,37235` Extra1/Extra2／browser back-forward → `apply_mouse_back_forward_button` | 入力slotの意味。Depthの一律拒否なし。既定のfolder履歴／従来互換の移動を保持 |
+| `recognize_viewer_right_drag_frame` / `apply_fs_secondary_input` 右短クリック・ring・gesture | 入力slotの意味。Depth固有の一律拒否なし。右短クリック既定の全画面終了は維持 |
+| `app/gamepad_input.rs::apply_ring_action` 共通mouse/ring採用 | DepthでZ/補正と衝突する操作だけ止め、metadata割当はDepthパネル切替へ。ページ移動／表示終了の割当は止めない |
+| wheel / Ctrl+wheel | 通常wheelはページ送り、Ctrl+wheelはfit固定のため停止。今回変更なし |
+| front pointer所有・popup／パネル／seek矩形・focus復帰抑制 | モードに依存しないchrome所有。Depthパネルを触った入力を背面のページ送りに流さない規則は維持 |
+
+Checking のモーダル外経路も確認した。`app/startup_ops.rs::poll_activation_open_paths` →
+`activation_open_precheck` → `document_open_modal_admission_blocked` は Depth setup を含めず、
+関連付けopenの解決・採用が進み得る。`remote_ipc/ui.rs::service_remote_session_requests` も
+別に acquisition を開始し、viewer close barrierへ進む。したがって確認完了時には画像の同一性に加えて
+`remote_session_blocks_local_control()` を照合する。Remoteが取得中でまだ旧画像が残る場合も入場させない。
+clipboardからの新規取込は既存の fullscreen／common modal の受付条件で止まる。
+新しい外部openの保留機構や再試行は足さず、照合不一致なら一回の入場要求を終える。
+
+再現テストは、クリックが実child viewerへ届く経路（1920×1080、Zの有無×パネル表示の有無の4条件で左右往復）、
+導入確認の8件（実D・小さなローカルpackの非同期scan、未導入／破損、環境設定、画像／世代／context変更、
+入口再拒否、Remote取得中、案内移行後の非継続）、実panelの選択→slider→再展開1件
+（1920×1080／1093×614 × 同一／別frameの4条件）を追加した。
+マウスfixtureは初回passのfocus取得を落ち着いた前面状態へ揃える。既存の300ms focus復帰抑制は変更しない。
+独立コードレビューで、click採用の分離・scanのtyped origin・popup親子layerの修正が所有境界の変更であり、
+症状だけを隠すguardではないことを確認した。最終の自動検証結果は以下に記録する。
+
+| 検証 | 結果 |
+|---|---|
+| `MSBUILDDISABLENODEREUSE=1 cargo nextest run --offline -p mimageviewer --lib -E 'test(/depth_\|panorama\|pano\|canvas_double_click/)' --test-threads 4` | **215/215 成功**（追加10件を含む）。`target/depth-subpc18-final.log`。全件は依頼どおり実行しない |
+| `cargo check --offline -p mimageviewer --bin mimageviewer-core`（同env） | 成功。`target/depth-subpc18-check.log` |
+| `cargo test --offline -p mimageviewer --test ui_snapshot depth_`（同env、更新modeなし） | **3/3 成功**。通常panel・1093×614の全control到達性・待機表示。`target/depth-subpc18-ui.log`。既存PNG変更なし、追加PNGなし |
+| `cargo fmt`（引数なし）／`cargo fmt --check`／`python scripts/check_ui_glyphs.py` | 成功、危険glyph 0件 |
+| `scripts/build-dev.ps1 -PreserveRuntime`（同env、offline） | 成功。core／remote／EPUB worker／MCP／music-videoを準備。core更新日時 2026-11-07 18:20:54、391,422,464 bytes。製品は起動していない |
+
+修正前の再現と途中のfixture補正は `target/depth-subpc18-focused.log`／`depth-subpc18-regression.log` に残す。
+初回のmotionテストでは Harness のevent queueがpress/releaseを別frameへ分けていたため成功していた。
+RawInputへの同時注入へ直した版で背面化を再現してから製品を修正し、最終215件で回復を確認した。
+commit／stageは行わず、全件台帳用ディレクトリには触れていない。
+実機での最終確認は利用者側へ引き継ぐ（D後の左右click、上下選択→強さ5%→再選択、導入済み起動直後の最初のD）。
 
 ## 11. テスト
 

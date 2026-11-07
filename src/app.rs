@@ -740,6 +740,9 @@ pub(crate) use prepared_edit::{
     FinalPipelineInvalidation, PreparedEditCancel, PreparedEditDisposition, PreparedEditReject,
 };
 mod depth_view;
+pub(crate) use depth_view::DepthEntryRequest;
+#[cfg(all(test, windows))]
+mod depth_setup_entry_tests;
 #[cfg(all(test, windows))]
 mod depth_view_tests;
 #[cfg(test)]

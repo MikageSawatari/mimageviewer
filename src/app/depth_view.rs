@@ -4,6 +4,16 @@ use crate::depth_parallax::{
 };
 use crate::fs_exclusive_view::{ExclusiveViewKind, FsExclusiveView};
 
+/// A lazy model check may only resume the original image in its original context.
+/// Textures can refine during the check, so content/list identity owns this intent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DepthEntryRequest {
+    context: ViewerContextId,
+    items_generation: u64,
+    fs_idx: usize,
+    item_id: crate::item_identity::ItemId,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DepthWaitStatus {
     PreparingModel,
@@ -184,9 +194,45 @@ impl App {
         }
         // Setup owns its lazy scan. Unknown installation is Checking, never Missing.
         if self.depth_setup.installed_model_path().is_none() {
-            self.request_depth_addon_setup(ctx);
+            self.request_depth_addon_for_entry(
+                ctx,
+                DepthEntryRequest {
+                    context: self.edit_request_owner_context(),
+                    items_generation: self.items_generation,
+                    fs_idx,
+                    item_id: self.item_id(fs_idx),
+                },
+            );
             return;
         }
+        self.enter_depth_parallax(ctx);
+    }
+
+    pub(crate) fn resume_depth_entry_after_check(
+        &mut self,
+        ctx: &egui::Context,
+        request: DepthEntryRequest,
+    ) {
+        // Modal keyboard ownership does not block association opens or Remote takeover.
+        if self.edit_request_owner_context() != request.context
+            || self.items_generation != request.items_generation
+            || self.fullscreen_idx != Some(request.fs_idx)
+            || self.item_id(request.fs_idx) != request.item_id
+        {
+            return;
+        }
+        if self.remote_session_blocks_local_control() {
+            self.show_feedback_toast("リモート閲覧中のため、3D 写真に切り替えられません".into());
+            return;
+        }
+        if let Err(reason) = self.depth_entry_allowed(request.fs_idx) {
+            self.show_feedback_toast(reason.message().to_owned());
+            return;
+        }
+        self.enter_depth_parallax(ctx);
+    }
+
+    fn enter_depth_parallax(&mut self, ctx: &egui::Context) {
         let mut state = DepthViewState::new(self.edit_request_owner_context());
         #[cfg(windows)]
         if let Some(renderer) = &self.wgpu_render_state {

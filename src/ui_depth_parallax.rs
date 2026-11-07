@@ -1,5 +1,9 @@
 //! Pure drawing for the fullscreen 3D-photo controls; the viewer owns mode lifetime.
 
+#[cfg(test)]
+#[path = "ui_depth_parallax_tests.rs"]
+mod tests;
+
 use crate::depth_parallax::{DepthParallaxSettings, MotionKind};
 use eframe::egui;
 
@@ -70,7 +74,7 @@ pub fn draw_depth_parallax_panel(
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
                                     let motion_label = ui.label("動き");
-                                    egui::ComboBox::from_id_salt("depth_motion")
+                                    let motion_combo = egui::ComboBox::from_id_salt("depth_motion")
                                         .selected_text(settings.motion.label())
                                         .popup_style(crate::os_theme::dark_popup_style(ctx))
                                         .show_ui(ui, |ui| {
@@ -83,8 +87,20 @@ pub fn draw_depth_parallax_panel(
                                                     )
                                                     .changed();
                                             }
-                                        })
-                                        .response.labelled_by(motion_label.id);
+                                        });
+                                    if motion_combo.inner.is_some() {
+                                        // The fixed panel and menus both use Foreground.
+                                        // Own this popup as a child so pressing a panel
+                                        // control cannot raise the panel over its menu.
+                                        ctx.set_sublayer(
+                                            motion_combo.response.layer_id,
+                                            egui::LayerId::new(
+                                                egui::Order::Foreground,
+                                                motion_combo.response.id.with("popup"),
+                                            ),
+                                        );
+                                    }
+                                    motion_combo.response.labelled_by(motion_label.id);
                                     ui.add_space(6.0);
                                     let strength_label = ui.label("強さ");
                                     let mut percent = settings.strength * 100.0;
