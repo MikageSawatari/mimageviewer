@@ -68,7 +68,18 @@ pub struct IngestStats {
     pub skipped_unsupported: usize,
     /// Per-batch diagnostics; reflection must not acknowledge unread caption content.
     pub caption_read_errors: usize,
+    /// Counted metadata I/O only; excludes FFmpeg, PDFium and caption DB reads.
+    pub metadata_bytes_read: u64,
+    /// Ingest candidates with at least one counted byte (sidecar included), once per candidate.
+    pub metadata_files_read: usize,
     pub cancelled: bool,
+}
+
+impl IngestStats {
+    fn record_metadata_read(&mut self, bytes_read: u64) {
+        self.metadata_bytes_read = self.metadata_bytes_read.saturating_add(bytes_read);
+        self.metadata_files_read += usize::from(bytes_read > 0);
+    }
 }
 
 /// 単一お気に入りに対する ingest セッション。
@@ -346,9 +357,9 @@ impl<'a> IngestSession<'a> {
                 break;
             };
             let built = match cand.kind {
-                CandidateKind::Image => self.build_doc_for_image(&cand),
+                CandidateKind::Image => self.build_doc_for_image(&cand, &mut stats),
                 CandidateKind::Pdf => self.build_doc_for_pdf(&cand),
-                CandidateKind::Video => self.build_doc_for_video(&cand),
+                CandidateKind::Video => self.build_doc_for_video(&cand, &mut stats),
                 CandidateKind::Audio => self.build_doc_for_audio(&cand),
                 CandidateKind::Book(_) => self.build_doc(
                     &cand,
@@ -421,15 +432,27 @@ impl<'a> IngestSession<'a> {
     }
 
     /// 画像ファイルから IndexDoc を組み立てる。build phase は書き込みを行わない。
-    fn build_doc_for_image(&self, cand: &CandidateFile) -> Result<IndexDoc, String> {
-        let norms = crate::ingest_text::build_per_source_for_file(&cand.abs_path);
+    fn build_doc_for_image(
+        &self,
+        cand: &CandidateFile,
+        stats: &mut IngestStats,
+    ) -> Result<IndexDoc, String> {
+        let (norms, bytes_read) =
+            crate::ingest_text::build_per_source_for_file_counted(&cand.abs_path);
+        stats.record_metadata_read(bytes_read);
         self.build_doc(cand, Container::Fs, IndexKind::Image, norms)
     }
 
     /// 動画ファイルから IndexDoc を組み立てる。ファイル名 / mXD XMP /
     /// sidecar tags / FFmpeg container metadata をソース別に保持する。
-    fn build_doc_for_video(&self, cand: &CandidateFile) -> Result<IndexDoc, String> {
-        let norms = crate::ingest_text::build_per_source_for_file(&cand.abs_path);
+    fn build_doc_for_video(
+        &self,
+        cand: &CandidateFile,
+        stats: &mut IngestStats,
+    ) -> Result<IndexDoc, String> {
+        let (norms, bytes_read) =
+            crate::ingest_text::build_per_source_for_file_counted(&cand.abs_path);
+        stats.record_metadata_read(bytes_read);
         self.build_doc(cand, Container::Fs, IndexKind::Video, norms)
     }
 
@@ -564,6 +587,68 @@ mod tests {
         }
     }
 
+    #[test]
+    fn apply_counts_metadata_bytes_and_candidates_once_including_sidecars_and_video() {
+        let (tmp, meta, fts) = setup();
+        let mut candidates = Vec::new();
+        for (name, body, sidecar) in [
+            ("empty.jpg", b"".as_slice(), None),
+            ("plain.jpg", b"no metadata".as_slice(), None),
+            ("sidecar_only.jpg", b"".as_slice(), Some("sidecar only")),
+            (
+                "both.jpg",
+                b"no metadata".as_slice(),
+                Some("sidecar and image"),
+            ),
+            ("video.mp4", b"not a video".as_slice(), None),
+        ] {
+            let mut cand = make_image_file(tmp.path(), name);
+            fs::write(&cand.abs_path, body).unwrap();
+            cand.file_size = body.len() as i64;
+            cand.diff_size = cand.file_size;
+            if name.ends_with("mp4") {
+                cand.kind = CandidateKind::Video;
+            }
+            if let Some(text) = sidecar {
+                fs::write(tmp.path().join(format!("{name}.txt")), text).unwrap();
+            }
+            candidates.push(cand);
+        }
+        let expected: u64 = candidates
+            .iter()
+            .map(|cand| crate::ingest_text::build_per_source_for_file_counted(&cand.abs_path).1)
+            .sum();
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
+            fts.writer().unwrap(),
+            fts.clone(),
+        );
+        let session = IngestSession::new_with_caption_db_path(
+            Uuid::new_v4(),
+            tmp.path().to_path_buf(),
+            &meta,
+            &fts,
+            tmp.path().join("absent-captions.db"),
+        );
+        let stats = session
+            .apply(
+                candidates,
+                vec![],
+                &writer,
+                &GlobalIoSemaphore::new(2),
+                IoPriority::Low,
+                &AtomicBool::new(false),
+                None,
+            )
+            .unwrap();
+        assert_eq!(stats.ingested_ok, 5);
+        assert_eq!(stats.metadata_bytes_read, expected);
+        assert!(expected > 0);
+        assert_eq!(
+            stats.metadata_files_read, 4,
+            "empty image reads zero, sidecar-only counts, both counts once"
+        );
+    }
+
     fn save_caption(db: &CaptionDb, cand: &CandidateFile, failed: bool) {
         use crate::ai_caption_db::{CaptionResult, FileSignature, SaveRequest};
         db.save(&SaveRequest {
@@ -608,7 +693,7 @@ mod tests {
         let expected = "blue sky visible letters search keyword";
         assert_eq!(
             session
-                .build_doc_for_image(&image)
+                .build_doc_for_image(&image, &mut IngestStats::default())
                 .unwrap()
                 .norms
                 .ai_caption,
@@ -634,7 +719,7 @@ mod tests {
         );
         assert!(
             session
-                .build_doc_for_image(&failed)
+                .build_doc_for_image(&failed, &mut IngestStats::default())
                 .unwrap()
                 .norms
                 .ai_caption
@@ -674,7 +759,7 @@ mod tests {
         assert!(matches!(session.caption_db, Ok(Some(_))));
         assert!(
             session
-                .build_doc_for_image(&cand)
+                .build_doc_for_image(&cand, &mut IngestStats::default())
                 .unwrap()
                 .norms
                 .ai_caption
@@ -683,7 +768,7 @@ mod tests {
         db.delete(&cand.key).unwrap();
         assert!(
             session
-                .build_doc_for_image(&cand)
+                .build_doc_for_image(&cand, &mut IngestStats::default())
                 .unwrap()
                 .norms
                 .ai_caption
@@ -692,7 +777,7 @@ mod tests {
         save_caption(&db, &cand, false);
         assert!(
             session
-                .build_doc_for_image(&cand)
+                .build_doc_for_image(&cand, &mut IngestStats::default())
                 .unwrap()
                 .norms
                 .ai_caption

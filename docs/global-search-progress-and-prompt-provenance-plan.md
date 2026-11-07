@@ -297,11 +297,14 @@ positive topology から到達した未解決入力を、未解決のまま検�
   `App::poll_startup_init` へ返す。既存 `show_feedback_toast` owner で「全文検索索引を再構築できず、
   次回起動時に再試行する」旨を 1 回表示して通常 UI へ進む。App に別の error field は足さず、
   その後の Ctrl+G は既存の generic unavailable 表示を使う。全面的な startup state 再設計は行わない。
-- コスト: 取り込みは PNG を丸ごと読む ([ingest_text.rs](../src/ingest_text.rs) `read_metadata_bytes`)。
-  利用者の索引は約 79 万件、1 枚約 5 MB なので**およそ 4 TB の読み取り**。
+- 当時のコスト: 取り込みは PNG を丸ごと読んでいた。利用者の索引は約 79 万件、
+  1 枚約 5 MB なので**およそ 4 TB の読み取り**という見積もりだった。
+  v5.0.0 の部分読み対応後は JPEG/PNG とも Ctrl+F pass 2 と同じ path reader を使い、
+  画像本体を seek で飛ばす ([現行の読み方と計数](search-architecture.md#41-アイテム索引-ctrlg-用))。
 - **IDAT 打ち切りは不採用**。read-only sample 48 枚 / 14 folder では IDAT 後の text chunk は 0 件だったが、
   これは一般保証にならず、repository に `enc_a1111_text_after_idat.png` の既知 fixture がある。
-  path reader が IDAT payload を seek で飛ばしつつ後置 chunk を読む契約と、ingest の full read を維持する。
+  path reader が IDAT payload を seek で飛ばしつつ後置 chunk を読む契約を維持する。
+  ingest も同じ path reader を使うため、後置 text を拾うための全体読みは不要になった。
 - ディスク: 旧 60 GB と新索引は併存しない。通常移行は旧 directory の wipe を先に行ってから再構築する。
   wipe 失敗時は旧索引の open / 検索を止め、durable pending により次回起動で再試行する。
 
