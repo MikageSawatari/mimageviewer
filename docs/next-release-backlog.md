@@ -39,6 +39,15 @@
 
 ## 1. 優先候補
 
+### 1.729 索引作成のメタ読みが JPEG/PNG をファイル全体まで読む (2026-11-07、v5.0.0)
+
+- 状態: **修正済み・利用者の実機確認待ち** (ブランチ `fix/ingest-metadata-partial-read`、2c762d0e4 + 3d09bbf23 を master へ merge)。実装 Codex gpt-6.1-sol / high、独立レビュー gpt-6.1-sol / xhigh は ACCEPT (P3 1 件: 比較用旧実装の読み範囲を本当の旧実装に合わせた)。§1.722 の別件。
+- 原因 (コード): `ingest_text::build_per_source_for_file` が jpg/jpeg/jfif/png を `read_metadata_bytes` (`std::fs::read`) で全体読みし、bytes 版の XMP・AI プロンプト読みに渡していた。写真フォルダの初回索引で画像データまで全部読む。
+- 修正: jpg/jpeg/jfif/png は Ctrl+F pass 2 と同じ path 版 (`read_tweet_info_counted` / `build_searchable_from_path_counted` / `read_exif_counted`) を使う。TIFF/MP4/MOV/M4V の先頭 2MB 経路と、その他拡張子 (WebP 含む) を読まない点は変えない。`build_searchable_from_path_counted` は拡張子の入口 (png/jpg/jpeg/jfif) を保ったまま中身の magic で分岐する。
+- 今の結果との違い (旧実装を `#[cfg(test)]` の比較相手に残し差分テストで固定): (1) Ctrl+F が、拡張子と中身が違う JPEG/PNG (`.jpg` の中身が PNG 等) の AI プロンプトも拾う (索引は前から拾っていた)。(2) JPEG の EXIF UserComment は rexif に SOS 手前 (上限 16MB) だけを渡すので、壊れた marker 列などのまれな場合は AI プロンプトなしになる (割り切り)。XMP は §1.722 と同じ。
+- 計測: `index/initial_scan_done` に `metadata_bytes_read` / `metadata_files_read` を追加 (初回スキャンの合計。FFmpeg の動画メタ I/O は含まない。定義は `docs/search-architecture.md` §8.3)。
+- 検証: 関連 nextest 242 件 + P3 後 84 件、`test-lib-full.ps1` 16,520 件成功 (P3 前のコード。P3 はテストだけの変更)。テスト上、8MiB の画像で読込量は 64KiB 未満。実フォルダでの時間と読込量は未確認 (利用者の隔離データでの確認待ち)。
+
 ### 1.728 マスクの選択窓を最小幅より狭めようとすると窓が左へ動く・左パネルの白い長方形が選択窓の上に出る (2026-11-07)
 
 - 状態: **未着手・原因未調査**。サブ PC 担当が依頼 15 (§1.727 の確認) で観測。§1.727 の修正が触れていない部分で、修正前からある見込み (修正前の版では未確認)。
@@ -99,7 +108,7 @@
 - 今の結果との違い (この 4 つだけ。旧実装を `#[cfg(test)]` の oracle に残し差分テストで固定): (1) PNG の tEXt XMP を IDAT や 512KB より後ろでも拾う (iTXt → 範囲限定 fallback → tEXt 本文の順)。(2) 画像データの中にしかない `<x:xmpmeta` は拾わない。(3) 拡張子と中身が違う (`.tif` の中身が JPEG 等) 場合は全長を構造探索する。(4) TIFF 等の rating / dc:subject は全体読みをやめ 512KB だけ読む (結果は同じ)。
 - 意図的にしないこと: Extended XMP の結合 (今と同じく標準 XMP だけ)、zTXt・圧縮 iTXt の展開 (writer が非圧縮 iTXt だけを扱うので、読み書きの対応を変えない)。読み込みエラーは今と同じく「XMP なし」(`try_read_dc_subject` だけ `Err`)。
 - 検証: 関連 nextest 150 件、`test-lib-full.ps1`。テスト上、XMP の無い 8MB の JPEG で `bytes_read` は 117 バイト。実フォルダでの時間と `bytes_read` は未確認 (利用者の隔離データでの確認待ち)。
-- 残り (別件): `ingest_text::read_metadata_bytes` (索引作成) は PNG/EXIF パーサーと bytes を共有するため JPEG/PNG を全体読みしたまま。PNG の IDAT が多数ある場合の見出し読みは `png_metadata` の走査と同じ O(chunk 数)。
+- 残り (別件): 索引作成 (`ingest_text`) の JPEG/PNG 全体読みは §1.729 で部分読みにした。PNG の IDAT が多数ある場合の見出し読みは `png_metadata` の走査と同じ O(chunk 数)。
 
 ### 1.721 ★付きの親フォルダへ戻ると、一覧で明示した評価絞り込みが再び一時解除される — 5ch >>734 (2026-11-06)
 
