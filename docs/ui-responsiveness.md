@@ -24,6 +24,16 @@ overlayの段階名と経過時間は常時timelineのmemory snapshotを使う�
 
 ---
 
+## 3D 写真の書き出し（2026-11-07、段 C）
+
+設定画面と進行画面は単一モーダル操作。UI は resident texture の Arc・表示幾何・設定を
+凍結し、既存 core と同じ OS 保存ダイアログで出力先を選ぶ。保存ダイアログ以外の待機は
+UI へ持ち込まない。オフスクリーン GPU 描画・同期読み戻し・GIF/APNG/H.264 encode・
+mux・ファイル公開は `depth-export` worker に置き、画面用 uniform は共有しない。
+進行と終端は worker が repaint を通知し、UI の常時 poll / timer / 待機は不要。
+モーダル中は3D自動運動の連続 repaint も停止する。取消は atomic flag、UI では join しない。
+実機での画質・所要時間・保存ダイアログの操作感は自動テストとは別に確認する。
+
 ## 1. 原則: UI スレッドで避けるべき処理
 
 `App::update` から直接 (あるいは呼び出し先から同期的に) 呼ばれるコードで、以下はすべて

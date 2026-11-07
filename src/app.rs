@@ -739,6 +739,7 @@ use final_prepare::{FinalEffectOrigin, FinalEffectReady, FinalEffectReceiver, Fi
 pub(crate) use prepared_edit::{
     FinalPipelineInvalidation, PreparedEditCancel, PreparedEditDisposition, PreparedEditReject,
 };
+mod depth_export;
 mod depth_view;
 pub(crate) use depth_view::DepthEntryRequest;
 #[cfg(all(test, windows))]
@@ -19182,6 +19183,7 @@ pub struct App {
     pub(crate) editing_addon_declined_session: bool,
     pub(crate) vlm_setup: crate::ui_dialogs::vlm_addon::VlmSetup,
     pub(crate) depth_setup: crate::ui_dialogs::depth_addon::DepthSetup,
+    pub(crate) depth_export_operation: Option<Box<depth_export::Operation>>,
     #[cfg(windows)]
     pub(crate) caption_job: Option<crate::ui_dialogs::caption_job::CaptionJob>,
     /// Progress-window visibility is independent of the caption worker lifetime.
@@ -21980,6 +21982,7 @@ impl App {
             editing_addon_declined_session: false,
             vlm_setup: Default::default(),
             depth_setup: Default::default(),
+            depth_export_operation: None,
             #[cfg(windows)]
             caption_job: None,
             #[cfg(windows)]
@@ -24159,6 +24162,7 @@ impl App {
             self.slot_save_dialog.is_some() => "slot_save",
             self.favorite_default_clear_confirm.is_some() => "favorite_default_clear_confirm",
             self.export_dialog.is_some() => "export_dialog",
+            self.depth_export_dialog_open() => "depth_export",
             self.export_batch_dialog.is_some() => "export_batch_dialog",
             self.export_pending.is_some() => "export_pending",
             self.local_adjust_add_layer_dialog_open => "local_adjust_add_layer",
@@ -42307,6 +42311,7 @@ impl App {
 
     pub(crate) fn document_open_modal_admission_blocked(&self) -> bool {
         self.book_structural_op.is_some()
+            || self.depth_export_dialog_open()
             || self.book_append_undo_in_progress()
             || self.image_folder_zip_operation.is_some()
             || self.composition_editor_modal_active()
@@ -81529,6 +81534,7 @@ impl App {
         // 閉じても継続できる。進捗とキャンセル操作も一覧側のダイアログへ引き継がれるため、
         // `export_pending` と cancel フラグには触れない。
         self.export_dialog = None;
+        self.cancel_depth_export_for_fullscreen_close();
         // **`folder_refresh_pending` は触らない**: これは「一覧に戻ったら
         // 現在フォルダを更新」の dirty フラグで、`consume_*` が
         // 同フレ末で取り出す前提。close_fullscreen 内で None に戻すと取り出す前に
@@ -100596,6 +100602,7 @@ impl eframe::App for App {
             }
         }
         self.poll_image_folder_zip(ctx);
+        self.poll_depth_export();
         let main_chrome_drawn = self.update_frame(ui, frame);
         self.finish_folder_pane_presentation(ctx, main_chrome_drawn);
         self.render_update_after_frame(ctx);

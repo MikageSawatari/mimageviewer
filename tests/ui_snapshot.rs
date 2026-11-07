@@ -514,6 +514,126 @@ fn depth_parallax_panel_small_viewport_reaches_every_control_and_keeps_header_fi
 }
 
 #[test]
+fn depth_export_settings_small_dark() {
+    snapshot_with_theme_at_size(
+        "depth_export_settings_small_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(1093.0, 614.0),
+        None,
+        |ui| {
+            mimageviewer::ui_depth_export::draw_snapshot_fixture(ui.ctx(), false);
+        },
+    );
+}
+
+#[test]
+fn depth_export_progress_small_dark() {
+    snapshot_with_theme_at_size(
+        "depth_export_progress_small_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(1093.0, 614.0),
+        None,
+        |ui| {
+            mimageviewer::ui_depth_export::draw_snapshot_fixture(ui.ctx(), true);
+        },
+    );
+}
+
+#[test]
+fn depth_export_small_viewport_keeps_actions_visible_and_reaches_settings() {
+    use test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+    struct State {
+        response: Option<mimageviewer::ui_depth_export::DialogResponse>,
+        last_action: Option<mimageviewer::ui_depth_export::Action>,
+    }
+    for size in [egui::vec2(1093.0, 614.0), egui::vec2(546.5, 307.0)] {
+        for progress in [false, true] {
+            let mut harness = test_ui::builder()
+                .with_context_setup(install_app_fonts)
+                .with_size(size)
+                .build_ui_state(
+                    move |ui, state: &mut State| {
+                        let response = mimageviewer::ui_depth_export::draw_snapshot_fixture(
+                            ui.ctx(),
+                            progress,
+                        );
+                        if response.action.is_some() {
+                            state.last_action = response.action;
+                        }
+                        state.response = Some(response);
+                    },
+                    State {
+                        response: None,
+                        last_action: None,
+                    },
+                );
+            harness.run();
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let response = harness.state().response.as_ref().unwrap();
+            assert!(
+                screen.contains_rect(response.rect),
+                "dialog {:?} outside {screen:?}",
+                response.rect
+            );
+            for action in &response.action_rects {
+                assert!(screen.contains_rect(*action));
+            }
+            if let Some(scroll) = response.scroll.as_ref() {
+                let before = ScrollLayout::from_output(scroll);
+                if before.content.y <= before.inner.height() + 1.0 {
+                    before.assert_height(
+                        HeightExpectation::Fits,
+                        response.rect,
+                        harness.ctx.pixels_per_point(),
+                    );
+                } else {
+                    before.assert_height(
+                        HeightExpectation::Scrolls,
+                        response.rect,
+                        harness.ctx.pixels_per_point(),
+                    );
+                    let fixed_actions = response.action_rects.clone();
+                    harness.event(egui::Event::PointerMoved(before.inner.center()));
+                    harness.event(egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -100000.0),
+                        modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
+                    });
+                    harness.run_steps(40);
+                    let response = harness.state().response.as_ref().unwrap();
+                    let after = ScrollLayout::from_output(response.scroll.as_ref().unwrap());
+                    after.assert_scrolled_to_end(before, harness.ctx.pixels_per_point());
+                    assert_eq!(response.action_rects, fixed_actions);
+                }
+            }
+            for label in if progress {
+                vec!["キャンセル", "Close window"]
+            } else {
+                vec!["保存先を選ぶ…", "キャンセル", "Close window"]
+            } {
+                let button = harness.get_by_role_and_label(egui::accesskit::Role::Button, label);
+                assert!(screen.contains_rect(button.rect()));
+                assert!(!button.accesskit_node().is_disabled());
+                button.click();
+                harness.run();
+                assert_eq!(
+                    harness.state().last_action,
+                    Some(if label == "保存先を選ぶ…" {
+                        mimageviewer::ui_depth_export::Action::Save
+                    } else {
+                        mimageviewer::ui_depth_export::Action::Cancel
+                    }),
+                    "the modal must deliver the actual {label} click"
+                );
+                harness.state_mut().last_action = None;
+            }
+        }
+    }
+}
+
+#[test]
 fn global_search_short_term_reject_light() {
     global_search_short_term_reject_snapshot(
         "global_search_short_term_reject_light",

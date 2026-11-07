@@ -555,7 +555,7 @@ pub enum DepthSourcePhase {
 | --- | --- | --- |
 | A | **実装済み (2026-11-07)**。配布用モデルの作成スクリプト、アドオン (VLM の共通化)、`ModelKind`、深度 worker、前処理の Rust 版。詳細・検証記録は直下 | Python 固定 fixture 比較を含む対象 82/82、VLM アドオン既存テスト・snapshot 成功。実モデル 1/1、Python stretch 相関 1.00000000 |
 | B | 3D モード: 状態・入口・遷移・占有モードの述語 (§6.5 の表)、GPU の色テクスチャと読み戻し、シェーダ、マウス追従、パネル、キー | 状態遷移テスト、入口条件のテスト、360° の既存テスト、シェーダの不変条件テスト (§11) |
-| C | 書き出し (GIF / APNG / MP4、映像だけの muxer、進行ダイアログ) | 書き出したファイルを読み戻してフレーム数・遅延・寸法を確かめるテスト。音楽ビデオの書き出しのテストが通る |
+| C | **実装済み (2026-11-07、ClaudeCode検収・利用者実機確認待ち)**。書き出し (GIF / APNG / MP4、映像だけの muxer、進行ダイアログ)。直下に実装・検証記録 | 限定lib286/286、UI関連6/6成功。全件gateはClaudeCode担当 |
 | D | 文書 (§12) と製品ページ・マニュアル | 公開文書の検査スクリプト |
 
 各段のあと独立レビュー (Sol / xhigh)。実機確認は利用者 (`build-dev.ps1` のバイナリ)。
@@ -1220,6 +1220,106 @@ RawInputへの同時注入へ直した版で背面化を再現してから製品
 commit／stageは行わず、全件台帳用ディレクトリには触れていない。
 実機での最終確認は利用者側へ引き継ぐ（D後の左右click、上下選択→強さ5%→再選択、導入済み起動直後の最初のD）。
 
+### 段 C の実装記録 (2026-11-07)
+
+- `depth_export.rs` に凍結した要求、形式・寸法・フレーム時刻、要求専用channelとcancelを
+  持つ `DepthExportJob` を追加した。設定画面から進行・終端画面までは App 共通の単一
+  `Operation` が所有し、local-modal lease は開始前取得→終端画面の閉鎖まで保持する。
+  共通modalとdocument-open admissionに登録し、長い処理をモーダルにして割込みの組合せを除いた。
+- パネルの書き出しはReadyかつ現在の描画snapshotが一致するときだけ有効。
+  設定画面は形式・元テクスチャを超えない長辺・自動4動作・MP4のループ数だけを持つ。
+  720px未満の素材では選択肢が空にならないよう元の長辺を1つ表示する。
+  強さ・周期・焦点・整形は現パネル設定を凍結し、別の編集項目は作らない。
+  パネルのクリックはframe内の意図だけを返し、実際の3D描画後に素材・ページ・一覧世代を
+  照合して設定画面へ入る。保存時も最新のReady素材と描画snapshotを一組で読み、
+  設定画面中のresizeや背景の素材更新を古い市松寸法／素材と混ぜない。
+  worker要求を作った後はその一組を固定する。要求を作れるまで保存操作は理由付きで無効。
+- `depth_parallax_wgpu/export.rs` が専用pipeline / uniform / bind group / readbackを所有する。
+  3Dの描画は画面と同じ `DEPTH_SHADER`。下地専用のshaderへ黒・白・市松を描いた後、
+  既存と同じpremultiplied blendを行うことでgamma空間の `rgb + bg*(1-a)` とalpha=1を得る。
+  3Dの描き方は複製せず、画面用uniformを共有しない。市松の升目は画面の8logical pxを
+  出力寸法比で縮尺し、表示画像の左上を原点にする。画面の `paint_quad()` と同じく、
+  90度回転は画像sampleへ適用し、市松の原点は表示矩形の左上に保つ。
+- GIFはimage 0.25のNeuQuantと無限ループ、APNGはpng 0.18のanimated frame。
+  GIFは累積時刻を10ms単位、APNGは1ms単位へ丸めて各frameへ差分配分する。
+  既定3秒はGIF45frame合計3000ms、APNG45frame合計3000msとなる。
+  任意の小数周期も形式が表せる時刻精度で累積端点を一致させる。
+- `mvexport::VideoOnlyMp4Writer` / `Mp4Muxer::new_video_only` を追加し、H.264選択・
+  BT.709変換・faststart・`PartialOutput`を再利用。音楽ビデオとRemoteの入口は維持する。
+  新しいoffline専用encoder入口ではOpenH264のframe skipを無効化し、全frame数を保証する。
+  GIF/APNGも同じ一時ファイル→公開へ統一する。取消・失敗・Dropは未完了出力を回収する。
+- workerだけがGPU submit / `poll(Wait)` / encode / I/Oを実行し、進行・終端でrootを起こす。
+  UIに常時repaintを追加せず、モーダル中の3D自動運動のrepaintを止める。
+  進行窓×はcancel→実処理の終了待ち表示、終端画面を閉じるまでleaseを維持する。
+  fullscreenの所有contextを閉じたときも同じ取消遷移を通す。別contextの終了では触れない。
+  ナビゲーションの共通受付でも書き出しモーダルを照合し、同frameの遅延入力と
+  スライドショーの自動送りを止める。OSの窓閉鎖は通して既存の取消境界へ渡す。
+  UIはjoinしない。まれな失敗はログ＋通知だけでretry・復旧stateは足さない。
+
+機能上の設計変更はない。小画像の元寸法選択、APNGの拡張子を`.png`とすること、下地を
+先に描くpremultiplied blend、OpenH264のoffline専用設定は§7の契約を満たす実装上の具体化。
+公開文書・製品ページ・privacyは指示どおり段Dに残す。
+#### 段 C の検証記録
+
+対象は `depth-parallax` の本段の未コミット差分。全Cargo / build / testに
+`MSBUILDDISABLENODEREUSE=1`、build/testは`CARGO_BUILD_JOBS=1`。
+製品・通常profileのアプリは起動せず、GUI検査はheadless fixtureだけで行った。
+
+| 実行 | 結果・証拠 |
+| --- | --- |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/depth\|mvexport\|export/)' --test-threads 4` | **286/286成功**、exit0。実行34.573秒（compile5分47秒）。`target/depth-c-related-final.log`。新規lib19件を含む。形式ごとのフレーム数・遅延・周期合計・寸法・loop、MP4のCFR timestamps／音声なし／BT.709／faststart、各形式の取消／Drop／既存出力保持、GPUの灰色128完全一致・半透明／黒白市松の画面照合（既存GPU helperの±1LSB）、専用uniform、lease／外部open／終了owner／resize／新素材／凍結／manual・slideshow排他、既存音楽ビデオ回帰を確認 |
+| 新規snapshot2枚とgeometry/clickを限定して`UPDATE_SNAPSHOTS=1 cargo test --offline -p mimageviewer --test ui_snapshot depth_export_` | **3/3成功**、exit0。`target/depth-c-ui-update.log`。1093×614と546.5×307でスクロール末尾、固定操作行、Save／Cancel／タイトル×の実クリックを確認 |
+| workspace全体へ引数なし`cargo fmt`後、UPDATEなし`cargo test --offline -p mimageviewer --test ui_snapshot depth_` | **6/6成功**、exit0、4.43秒。新規3と既存panel2・wait1。`target/depth-c-ui-compare.log` |
+| snapshot目視／既存画像の照合 | 新規2枚は55,224＋29,457＝84,681 bytes。実装担当・親担当・独立reviewerが、文字・選択肢・ループ既定4・操作行・タイトル×・進行数に欠け／重なりがないことを目視。進行窓は自然高を維持。既存535枚のSHA-256変更0（`target/depth-c-snapshot-before.json`） |
+| `cargo fmt --check` / `python scripts/check_ui_glyphs.py` / `git diff --check` | 全てexit0、危険なUI文字0。`target/depth-c-fmt-check.log`, `target/depth-c-glyphs.log` |
+| `cargo check --offline -p mimageviewer --bin mimageviewer-core` | 成功、exit0、55.14秒。`target/depth-c-check-final.log` |
+| `scripts/build-dev.ps1 -PreserveRuntime`（1回実行） | **成功、exit0**。normal feature setのcoreと付属4バイナリを構築し、VCRT／PE検査はruntime4・PE5成功。`target/depth-c-build-dev.log`, `target/vcrt-pe-reports/dev-runtime.json`。確認用coreは`target/dev-runtime/mimageviewer-core.exe`（391,680,000 bytes、2026-11-07 19:26 JST更新）。製品は起動していない |
+| 独立コードレビュー（GPT-6.1 Sol / xhigh、別context） | **最終ACCEPT、未解決P1/P2なし**。要求凍結、frame-local受付、OS closeと兄弟context、lease、GPU、時刻、既存MP4経路、最終286/286とUI6/6のログを照合。最新PNG2枚も目視し、既存535枚不変を確認。全件gate／実機検収は別担当 |
+
+途中の失敗と補正は最終成功と区別する。初回型検査のUI参照外し1件、test compileの
+FFmpeg packet iteratorのResult展開2件を修正した。初回focusedは40件中39成功／GPU1失敗
+（`target/depth-c-focused.log`）。切り取り後のpaint_rectを固定48×64と仮定したfixtureを、
+実paint_rectの24×48・実originを使う比較へ直した。併せて画面の市松はquarter-turnで回転せず
+表示矩形左上が原点であることを確認し、exportの下地も揃えた。最終286件で再確認済み。
+UI初回は3件中2成功／geometry1失敗。自然高のWindowよりScrollAreaのinput/clip範囲が
+大きく残るため、設定／終端は実viewportを確保し、短い進行表示は自然高の直接描画とした。
+
+sourceレビューで、fullscreen終了時の取消漏れ、ページ・回転・resizeと受付順序の混合、
+設定画面中の新素材、slideshowによるモーダル迂回を発見し、上記の所有境界へ接続した。
+`ctx.data_mut`内のpass番号参照によるlock再入候補も、pass取得をclosure外へ移して解消した。
+後者はコードでの発見で、製品の実機deadlockを観測したという意味ではない。
+新規検査はlib19＋integration3＝22件。全件gateは依頼どおり実行せずClaudeCodeへ引き継ぐ。
+
+利用者の実機確認は次を対象にする（製品は起動していない）:
+
+- Readyの3Dパネルから設定画面を開き、MP4／GIF／APNG、動き、長辺、MP4のループ数を選んで保存する。
+  マウス追従からは左右が初期値、APNGには容量の注記があることを確認する。
+- 保存したGIF／APNGの繰り返しと周期、MP4の無音再生・指定ループ数、回転と透過下地の見た目を確認する。
+- 進行中の取消・進行窓×・元のfullscreen窓の閉鎖で中断し、途中ファイルが残らないことを確認する。
+  完了／取消画面を閉じるまでページ移動・Remote取得・外部からのopenが止まり、閉じると復帰する。
+- 設定画面を小さくしたり表示窓をresizeしてから保存し、操作ボタンに届くことと市松の縮尺が合うことを確認する。
+
+実機起動はインストール版／tray常駐版を終了してから、repository rootで
+`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
+このnormal feature setのcoreは実利用中の`%APPDATA%\mimageviewer`を使い、設定・データを更新し得る。
+single-instance mutexも通常版と共有する。段Dの公開文書・実機検収・全件gateは本段の実施済み結果に含めない。
+
+変更ファイル（段Cのみ、stage／commitはしない）:
+
+- 状態・描画・worker: `src/depth_export.rs`, `src/depth_export/tests.rs`,
+  `src/depth_parallax_wgpu.rs`, `src/depth_parallax_wgpu/export.rs`, `src/lib.rs`。
+- UI・App接続: `src/app.rs`, `src/app/depth_export.rs`, `src/app/depth_view.rs`,
+  `src/app/depth_view_tests.rs`, `src/app/update_phases.rs`, `src/ui_depth_export.rs`,
+  `src/ui_depth_parallax.rs`, `src/ui_fullscreen.rs`, `src/ui_fullscreen/viewer_chrome.rs`。
+- MP4共用部品: `src/video/mvexport/driver.rs`, `src/video/mvexport/mod.rs`,
+  `src/video/mvexport/mux.rs`, `src/video/mvexport/video_only.rs`,
+  `src/video/mvexport/video_only_tests.rs`, `src/video/stream/encoder.rs`。
+- UI検査: `tests/ui_snapshot.rs`, `tests/snapshots/depth_export_settings_small_dark.png`,
+  `tests/snapshots/depth_export_progress_small_dark.png`。
+- 文書: 本書、`docs/architecture-overview.md`, `docs/async-architecture.md`,
+  `docs/ui-responsiveness.md`, `docs/music-video-export-plan.md`, `docs/detached-rework-plan.md`,
+  `docs/ui-snapshot-policy.md`。
+
 ## 11. テスト
 
 - **状態遷移**: OFF → ON → (ページ移動) → ON、× / D で OFF、フルスクリーン終了・フォルダ移動で取り消し。
@@ -1309,6 +1409,9 @@ commit／stageは行わず、全件台帳用ディレクトリには触れてい
   source-less payload は `NotYet(NativeOnly)` として既存の準備を待つ。
 - マウス方向は §10 の負の target に決めた。基準の shader 式を変えず、右 pointer で手前が左へ動く。
   符号と実際の GPU sample 方向の回帰を追加した。実機での操作感の確認は残る。
+
+段Cで、映像だけのmuxer、GIFの累積遅延、独立GPU資源と画面の色・半透明下地の一致、
+Remote leaseと外部open受付の排他をコードと回帰検査の対象へ具体化した。実行結果は§10に集約する。
 
 以下は未確認。
 

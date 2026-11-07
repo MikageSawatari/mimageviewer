@@ -843,6 +843,7 @@ impl App {
             self.draw_export_dialog(ctx);
             self.draw_export_batch_dialog(ctx);
             self.draw_export_progress_dialog(ctx);
+            self.draw_depth_export_dialog(ctx);
         }
     }
 

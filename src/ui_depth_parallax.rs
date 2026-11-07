@@ -10,6 +10,7 @@ use eframe::egui;
 pub struct DepthPanelResponse {
     pub changed: bool,
     pub close_requested: bool,
+    pub export_requested: bool,
     pub rect: egui::Rect,
     pub header_rect: egui::Rect,
     pub close_rect: egui::Rect,
@@ -23,6 +24,15 @@ pub fn draw_depth_parallax_panel(
     ctx: &egui::Context,
     settings: &mut DepthParallaxSettings,
     status: &str,
+) -> DepthPanelResponse {
+    draw_depth_parallax_panel_with_export(ctx, settings, status, false)
+}
+
+pub fn draw_depth_parallax_panel_with_export(
+    ctx: &egui::Context,
+    settings: &mut DepthParallaxSettings,
+    status: &str,
+    export_enabled: bool,
 ) -> DepthPanelResponse {
     let screen = ctx.content_rect();
     let frame = crate::os_theme::dark_popup_frame(ctx);
@@ -59,6 +69,7 @@ pub fn draw_depth_parallax_panel(
                 .clamp(0.0, 380.0);
                 let mut changed = false;
                 let mut export_rect = egui::Rect::NOTHING;
+                let mut export_requested = false;
                 let scroll = ui
                     .allocate_ui_with_layout(
                         egui::vec2(content_width, body_height),
@@ -148,9 +159,10 @@ pub fn draw_depth_parallax_panel(
                                     );
                                     ui.separator();
                                     let export = ui
-                                        .add_enabled(false, egui::Button::new("書き出し…"))
-                                        .on_disabled_hover_text("書き出しは準備中です");
+                                        .add_enabled(export_enabled, egui::Button::new("書き出し…"))
+                                        .on_disabled_hover_text("奥行きの計算が終わると書き出せます");
                                     export_rect = export.rect;
+                                    export_requested = export.clicked();
                                     ui.add(
                                         egui::Label::new(
                                             egui::RichText::new(if status.is_empty() {
@@ -174,15 +186,17 @@ pub fn draw_depth_parallax_panel(
                     header.response.rect,
                     close_rect,
                     export_rect,
+                    export_requested,
                     scroll,
                 )
             })
         });
-    let (changed, close_requested, header_rect, close_rect, export_rect, scroll) =
+    let (changed, close_requested, header_rect, close_rect, export_rect, export_requested, scroll) =
         output.inner.inner;
     DepthPanelResponse {
         changed,
         close_requested,
+        export_requested,
         rect: output.response.rect,
         header_rect,
         close_rect,

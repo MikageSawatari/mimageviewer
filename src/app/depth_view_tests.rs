@@ -351,6 +351,12 @@ fn tracked_depth(app: &mut App, ready: bool) -> DepthOwnerEvidence {
 }
 
 #[cfg(windows)]
+pub(super) fn install_ready_depth_for_export(app: &mut App) {
+    isolate_depth_renderer(app);
+    tracked_depth(app, true);
+}
+
+#[cfg(windows)]
 fn assert_depth_owner_live(app: &App, evidence: &DepthOwnerEvidence) {
     let FsExclusiveView::Depth(state) = &app.fs_exclusive_view else {
         panic!("sibling must retain its Depth owner");

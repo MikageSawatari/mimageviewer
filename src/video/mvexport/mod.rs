@@ -12,8 +12,11 @@ use musicvideo_core::{Assets, Project};
 
 mod driver;
 mod mux;
+mod video_only;
 
+pub(crate) use driver::PartialOutput;
 pub use driver::verify_exported_mp4;
+pub(crate) use video_only::{VideoOnlyMp4Options, VideoOnlyMp4Writer};
 
 /// The audio stream an export decodes. The CLI probes the same stream so its duration
 /// and the exported audio cannot come from different tracks.

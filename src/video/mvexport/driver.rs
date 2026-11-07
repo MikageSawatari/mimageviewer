@@ -353,7 +353,7 @@ fn has_mp4_extension(path: &Path) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("mp4"))
 }
 
-fn stream_encoder_preference(preference: EncoderPreference) -> StreamEncoderPreference {
+pub(super) fn stream_encoder_preference(preference: EncoderPreference) -> StreamEncoderPreference {
     match preference {
         EncoderPreference::Auto => StreamEncoderPreference::Auto,
         EncoderPreference::Nvenc => StreamEncoderPreference::Encoder(H264EncoderKind::Nvenc),
@@ -424,7 +424,7 @@ fn materialize_audio_chunk(
     }
 }
 
-struct RgbaConverter {
+pub(super) struct RgbaConverter {
     bands: Vec<RgbaConverterBand>,
     output: Video,
     input_format: H264InputFormat,
@@ -449,7 +449,11 @@ struct RgbaConverterBand {
 unsafe impl Send for RgbaConverterBand {}
 
 impl RgbaConverter {
-    fn new(width: u32, height: u32, format: H264InputFormat) -> Result<Self, ExportError> {
+    pub(super) fn new(
+        width: u32,
+        height: u32,
+        format: H264InputFormat,
+    ) -> Result<Self, ExportError> {
         Self::with_parallelism(width, height, format, rayon::current_num_threads())
     }
 
@@ -475,9 +479,13 @@ impl RgbaConverter {
     }
 
     fn convert(&mut self, frame: &Frame) -> Result<&mut Video, ExportError> {
+        self.convert_rgba(&frame.rgba)
+    }
+
+    pub(super) fn convert_rgba(&mut self, rgba: &[u8]) -> Result<&mut Video, ExportError> {
         self.bands
             .par_iter_mut()
-            .try_for_each(|band| band.convert(frame))
+            .try_for_each(|band| band.convert(rgba))
             .map_err(|error| {
                 ExportError::Encoder(format!("RGBA→YUV 変換に失敗しました: {error}"))
             })?;
@@ -531,12 +539,12 @@ impl RgbaConverterBand {
         })
     }
 
-    fn convert(&mut self, frame: &Frame) -> Result<(), ffmpeg::Error> {
+    fn convert(&mut self, rgba: &[u8]) -> Result<(), ffmpeg::Error> {
         let source_row_bytes = self.width as usize * 4;
         let source_start = self.source_y0 as usize * source_row_bytes;
         let source_end = source_start + self.source_height as usize * source_row_bytes;
         let stride = self.input.stride(0);
-        for (source, destination) in frame.rgba[source_start..source_end]
+        for (source, destination) in rgba[source_start..source_end]
             .chunks_exact(source_row_bytes)
             .zip(self.input.data_mut(0).chunks_exact_mut(stride))
         {
@@ -680,7 +688,7 @@ fn set_bt709_metadata(output: &mut Video) {
     output.set_color_transfer_characteristic(ffmpeg::color::TransferCharacteristic::BT709);
 }
 
-fn drain_h264_packets(
+pub(super) fn drain_h264_packets(
     encoder: &mut ffmpeg::codec::encoder::video::Encoder,
 ) -> Result<Vec<ffmpeg::Packet>, ExportError> {
     let mut packets = Vec::new();
@@ -746,7 +754,7 @@ fn ensure_resolved(report: &RenderReport, frame_index: u64) -> Result<(), Export
     )))
 }
 
-fn check_cancel(cancel: &AtomicBool) -> Result<(), ExportError> {
+pub(super) fn check_cancel(cancel: &AtomicBool) -> Result<(), ExportError> {
     if cancel.load(Ordering::Relaxed) {
         Err(ExportError::Cancelled)
     } else {
@@ -774,32 +782,36 @@ fn percentile(values: &[f64], quantile: f64) -> f64 {
     sorted[index]
 }
 
-struct PartialOutput {
+pub(crate) struct PartialOutput {
     path: tempfile::TempPath,
 }
 
 impl PartialOutput {
-    fn new(destination: &Path) -> Result<Self, ExportError> {
+    pub(crate) fn new(destination: &Path) -> Result<Self, ExportError> {
         let parent = destination
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
+        let extension = destination
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("tmp");
         let temporary = tempfile::Builder::new()
             .prefix(".mvexport-")
-            .suffix(".part.mp4")
+            .suffix(&format!(".part.{extension}"))
             .tempfile_in(parent)
-            .map_err(|error| io_error("一時 MP4 を作成できません", parent, error))?;
+            .map_err(|error| io_error("一時ファイルを作成できません", parent, error))?;
         // Release the reservation handle before FFmpeg opens it on Windows.
         Ok(Self {
             path: temporary.into_temp_path(),
         })
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
-    fn commit(
+    pub(crate) fn commit(
         self,
         destination: &Path,
         replace_existing: bool,
@@ -811,7 +823,8 @@ impl PartialOutput {
         } else {
             self.path.persist_noclobber(destination)
         };
-        result.map_err(|error| io_error("MP4 を出力先へ公開できません", destination, error.error))
+        result
+            .map_err(|error| io_error("ファイルを出力先へ公開できません", destination, error.error))
     }
 }
 

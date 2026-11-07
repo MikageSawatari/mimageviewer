@@ -1,5 +1,28 @@
 # 非同期・並列アーキテクチャ
 
+## 3D 写真の書き出し worker（2026-11-07、段 C）
+
+`depth_export.rs` はモーダル操作ごとに `depth-export` thread を1本作る。App の単一
+`depth_export::Operation` が設定画面→実行中→終端表示を所有し、表示素材・設定・回転・UV・
+寸法・下地を凍結する。Remote の local-modal lease は設定画面を開く前に取得し、終端表示を
+閉じるまで保持する。共通 modal と document-open admission の両方で割込みを止めるため、
+navigation / supersession / rollback の組合せを追加しない。
+パネルのクリックはframe内の意図とし、描画後の素材・ページ・一覧世代を照合して受付する。
+保存時は最新のReady素材と描画snapshotを一組で捕捉し、設定画面中のresizeや背景の素材更新を
+旧snapshotと混ぜない。ナビゲーションの共通受付はmanual／slideshowとも停止し、
+OS closeだけは所有contextの取消へ通す。
+
+worker は凍結した色・深度 Arc だけを読み、画面と同じ WGSL を専用 pipeline / uniform /
+bind group で不透明な `Rgba8Unorm` へ描く。GPU submit / map / `poll(Wait)`、GIF/APNG の
+量子化・圧縮、H.264/BT.709 変換・mux、ファイル I/O はすべて worker に置く。
+フレームごとの進行と終端を要求専用 channel へ送り、その都度poll ownerのROOTを repaint する。
+UI は非blockingで drain し、書き出し中の自動運動による連続 repaint は止める。
+
+取消ボタン・進行窓×は cancel を立て、worker の一時ファイル回収後の終端まで操作 owner を
+保持する。`DepthExportJob::Drop` も cancel を立て、UI では join しない。全形式で
+`mvexport::PartialOutput` を使い、完了時だけ rename、取消・失敗・未完了 Drop で回収する。
+失敗はログと通知のみで、自動 retry や途中状態の復元は追加しない。
+
 ## 3D 写真の bounded readback と要求所有（2026-11-07、段 B 実装・独立レビュー中）
 
 context 所有の `DepthViewState` は `WaitingForStableTexture / ReadingBack / Estimating / Ready / Failed`

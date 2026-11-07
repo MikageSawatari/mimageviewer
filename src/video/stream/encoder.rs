@@ -333,6 +333,24 @@ pub(crate) fn open_h264_encoder(
     output: StreamOutputParameters,
     frame_rate: FrameRate,
 ) -> Result<OpenedH264Encoder, H264EncoderOpenError> {
+    open_h264_encoder_with_frame_skipping(preference, output, frame_rate, true)
+}
+
+/// Offline exports must retain every submitted frame, including the OpenH264 fallback.
+pub(crate) fn open_offline_h264_encoder(
+    preference: EncoderPreference,
+    output: StreamOutputParameters,
+    frame_rate: FrameRate,
+) -> Result<OpenedH264Encoder, H264EncoderOpenError> {
+    open_h264_encoder_with_frame_skipping(preference, output, frame_rate, false)
+}
+
+fn open_h264_encoder_with_frame_skipping(
+    preference: EncoderPreference,
+    output: StreamOutputParameters,
+    frame_rate: FrameRate,
+    allow_skip_frames: bool,
+) -> Result<OpenedH264Encoder, H264EncoderOpenError> {
     ffmpeg::init().map_err(|error| H264EncoderOpenError::BackendInitializationFailed {
         reason: error.to_string(),
     })?;
@@ -340,7 +358,7 @@ pub(crate) fn open_h264_encoder(
         preference,
         output,
         frame_rate,
-        &mut FfmpegH264EncoderBackend,
+        &mut FfmpegH264EncoderBackend { allow_skip_frames },
     )?;
     let keyint_frames = frame_rate.keyint_frames();
     let profile_request = if selected.kind == H264EncoderKind::OpenH264 {
@@ -386,7 +404,9 @@ pub(crate) fn open_h264_encoder(
     })
 }
 
-struct FfmpegH264EncoderBackend;
+struct FfmpegH264EncoderBackend {
+    allow_skip_frames: bool,
+}
 
 impl H264EncoderBackend for FfmpegH264EncoderBackend {
     type Opened = ffmpeg::codec::encoder::video::Encoder;
@@ -411,7 +431,14 @@ impl H264EncoderBackend for FfmpegH264EncoderBackend {
             return BackendOpenAttempt::OpenFailed(reason);
         };
 
-        match open_ffmpeg_encoder(codec, encoder, input_format, output, frame_rate) {
+        match open_ffmpeg_encoder(
+            codec,
+            encoder,
+            input_format,
+            output,
+            frame_rate,
+            self.allow_skip_frames,
+        ) {
             Ok(opened) => {
                 let effective_video_bitrate_bps =
                     unsafe { (*opened.as_ptr()).bit_rate.max(0) as u64 };
@@ -453,6 +480,7 @@ fn open_ffmpeg_encoder(
     input_format: H264InputFormat,
     output: StreamOutputParameters,
     frame_rate: FrameRate,
+    allow_skip_frames: bool,
 ) -> Result<ffmpeg::codec::encoder::video::Encoder, ffmpeg::Error> {
     let mut context = ffmpeg::codec::context::Context::new_with_codec(codec)
         .encoder()
@@ -512,7 +540,11 @@ fn open_ffmpeg_encoder(
             // OpenH264 warns that bitrate mode cannot enforce the target unless frame skipping
             // is enabled. The fallback exists for constrained links, so prefer the configured
             // bitrate over preserving every source frame under encoder overload.
-            options.set("allow_skip_frames", "1");
+            // Offline export explicitly disables skipping and preserves the frame timeline.
+            options.set(
+                "allow_skip_frames",
+                if allow_skip_frames { "1" } else { "0" },
+            );
         }
         H264EncoderKind::MediaFoundation => {}
     }
@@ -733,7 +765,11 @@ mod tests {
             .output_parameters(1_280, 720)
             .unwrap();
         for encoder in H264EncoderKind::AUTO_ORDER {
-            match FfmpegH264EncoderBackend.try_open(encoder, output, fps_30()) {
+            match (FfmpegH264EncoderBackend {
+                allow_skip_frames: true,
+            })
+            .try_open(encoder, output, fps_30())
+            {
                 BackendOpenAttempt::Opened(opened) => unsafe {
                     let context = &*opened.value.as_ptr();
                     println!(

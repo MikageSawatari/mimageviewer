@@ -604,6 +604,7 @@ BA-1 の不変条件は geometry 非依存の HWND 所有である。detached ho
 | `app/book_cover.rs` | 本の AI 説明文用の表紙解決。既存の一覧計画・固定表紙・変換 cache 候補とサムネイルの2段の解決をworkerから呼び、読む位置・`cover_ref`・元ファイルの署名と世代leaseを返す。未変換・パスワード不足・動画の表紙を値で区別し、変換や入力画面は起動しない |
 | `addon.rs` / `vlm_addon_download.rs` | VLM / 深度アドオン共通の schema・HTTP・分割結合・SHA-256・一時ファイルからの配置・取消・再開。`AddonKind` と App 所有の管理 owner が導入／取消／削除を完了通知まで排他にし、状態確認・HTTP・配置・削除は worker 上だけで行う |
 | `vlm_addon.rs` / `depth_addon.rs` | 種別ごとの配布契約。VLM の GGUF / model ID / 4 ファイル検証と互換 API を残し、深度は固定 ONNX / LICENSE / NOTICE を検証。深度保存先は `<data_dir>/addons/depth/` |
+| `depth_export.rs` / `depth_parallax_wgpu/export.rs` / `app/depth_export.rs` / `ui_depth_export.rs` | 3D写真のモーダル書き出し。操作 owner が表示素材・設定とRemote leaseを保持し、workerが画面と同じWGSLでGPU描画・読み戻し・GIF/APNG/映像だけのMP4出力を行う。進行通知で再描画し、一時ファイルは完了時だけ公開する |
 | `depth_estimation.rs` | 3D 写真の要求ごとの pending / cancel / reply と process 共通 worker。Condvar と最新 1 件の slot、context 別の supersession、共通 runtime の初期化待ち・固定 504² DA3 推論・要求元 viewport の repaint。段 A は viewer 状態未接続 |
 | `depth_preprocess.rs` | worker 専用の視差正規化・bicubic・guided filter・長辺比例の膨張とぼかし・中央値。R16Float 用 f16 を返し、ガンマ・焦点は描画側へ残す |
 | `ui_dialogs/depth_addon.rs` / `ui_dialogs/model_addon.rs` | App の導入状態 cache から深度の設定ページ・取得／削除 UI を描く。VLM とボタン・進捗を共用し、UI にファイル I/O を追加しない |

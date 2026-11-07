@@ -309,7 +309,7 @@ impl App {
                     true,
                 )
             };
-            if moving && self.window_visible && visible {
+            if moving && self.window_visible && visible && self.depth_export_operation.is_none() {
                 ctx.request_repaint();
             }
             let params = crate::depth_parallax_wgpu::DepthRenderParams::from_settings(
@@ -329,6 +329,13 @@ impl App {
             };
             state.publish(&mut render.renderer.write().callback_resources);
             crate::ui_fullscreen::paint_image_underlay(painter, transform.paint_quad(), underlay);
+            super::depth_export::record_display(
+                ctx,
+                resource.resource_id,
+                self.items_generation,
+                transform,
+                underlay,
+            );
             painter.add(egui::Shape::Callback(
                 egui_wgpu::Callback::new_paint_callback(transform.paint_rect, callback),
             ));
@@ -352,21 +359,23 @@ impl App {
             .map_or_else(String::new, |status| status.panel_text().to_owned())
     }
 
-    pub(crate) fn draw_depth_panel(&mut self, ctx: &egui::Context, fs_idx: usize) {
+    pub(crate) fn draw_depth_panel(&mut self, ctx: &egui::Context, fs_idx: usize) -> bool {
         if self.depth_entry_allowed(fs_idx).is_err() {
-            return;
+            return false;
         }
         let FsExclusiveView::Depth(state) = &self.fs_exclusive_view else {
-            return;
+            return false;
         };
         if !state.panel_visible {
-            return;
+            return false;
         }
         let status = self.depth_panel_status();
-        let response = crate::ui_depth_parallax::draw_depth_parallax_panel(
+        let export_enabled = self.depth_export_available(ctx);
+        let response = crate::ui_depth_parallax::draw_depth_parallax_panel_with_export(
             ctx,
             &mut self.settings.depth_parallax,
             &status,
+            export_enabled,
         );
         ctx.data_mut(|data| data.insert_temp(egui::Id::unique("depth_panel_rect"), response.rect));
         if response.changed {
@@ -375,6 +384,7 @@ impl App {
         if response.close_requested {
             self.set_fs_exclusive_view(FsExclusiveView::None, "depth_panel_close");
         }
+        response.export_requested
     }
 
     #[cfg(windows)]

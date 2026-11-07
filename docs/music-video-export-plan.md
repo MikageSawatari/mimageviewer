@@ -1,5 +1,11 @@
 # 音楽ビデオ書き出し (Music Video Export) — 設計計画
 
+3D写真の段 C（2026-11-07）で `mvexport::VideoOnlyMp4Writer` と
+`Mp4Muxer::new_video_only` を追加した。BT.709 RGBA変換、H.264選択、faststart、
+`PartialOutput` を再利用し、音声 stream は作らない。オフライン専用の encoder 入口だけ
+OpenH264 のフレーム省略を無効化する。既存の音楽ビデオ／Remote の encoder 設定と
+音声付き mux の入口は維持する。GIF/APNG も同じ一時出力の所有・公開境界を使用する。
+
 Status: P1〜P3j、P4b-1〜4 の実装・非対話検証あり。H3a の契約と H3b の画素一致は非対話検証済み。P4c・P4d の実装・非対話検証あり。P4d の独立レビュー1回目はREVISE、対応後の再レビュー・実機検収は未完了。P4e は実装・非対話配布検証済み（独立レビュー・GUI 検収は未実施）。P4f は独立レビュー1回目 REVISE の P2 に対応し、利用者決定による fps 選択を追加。対応後の再レビュー・検収待ち（末尾の実施記録）。
 2026-10-09 に P4 の方式を「別 exe のエディタ」へ改訂（D10 / D16）、
 画面構成（D14）と文字装飾の初版範囲（D15）を追加。改訂は GPT-6.1 Sol / xhigh の独立レビュー 3 回で

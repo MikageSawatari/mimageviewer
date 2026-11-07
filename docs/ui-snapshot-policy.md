@@ -1,5 +1,14 @@
 # UI スナップショットテスト運用方針
 
+3D写真 段C（2026-11-07）は `depth_export_settings_small_dark` /
+`depth_export_progress_small_dark` の2枚（1093×614、55,224 / 29,457 bytes）を追加した。
+設定の各選択・既定4ループ・固定操作行・タイトル×、進行数と取消の表示を実装担当と
+独立reviewerが目視した。`depth_export_small_viewport_keeps_actions_visible_and_reaches_settings`
+は1093×614と546.5×307（200%相当の論理面積）でスクロール末尾・固定操作行と
+保存／取消／タイトル×の実クリックを検査する。進行表示は短文の自然高を維持する。
+純描画fixtureで、App・worker・製品アプリは起動しない。UPDATEなしのdepth関連6/6成功、
+既存535枚のSHA-256変更0。実行ログと段C全体の検証は[3D計画 §10](depth-parallax-plan.md#10-実装の段階-codex-への委任単位)に集約する。
+
 §1.704 の場所メニューは、本体共通のメニューボタン／既知フォルダ行rendererを固定pathの
 fixtureから描く `folder_location_menu_dark`（260×230、10,055 bytes）を追加する。
 デスクトップ・ピクチャ・ダウンロード・ビデオ・ミュージックの順と文字を目視確認した。

@@ -28353,7 +28353,7 @@ impl App {
                         if overview_rendered { return; }
                         // Paint foreground controls first so their current rectangle owns
                         // pointer input and mouse-follow suppression on the first frame too.
-                        self.draw_depth_panel(ctx, fs_idx);
+                        let depth_export_requested = self.draw_depth_panel(ctx, fs_idx);
                         let still_seek_geometry =
                             self.still_seek_geometry_for_idx(full_rect, fs_idx, state.is_video);
                         let resolved_fullscreen_media_rect = self.fullscreen_media_rect_with_geometry(
@@ -29863,6 +29863,11 @@ impl App {
                         // no panel, page, or gesture target should appear above its guide.
                         self.draw_still_touch_first_run_help_overlay(ui, ctx, full_rect, fs_idx);
 
+                        // Admit export after this pass has painted its actual source,
+                        // rotation, UV and geometry. The intent lasts only this frame.
+                        if depth_export_requested {
+                            self.open_depth_export(ctx, fs_idx);
+                        }
                         self.draw_viewer_shared_dialogs(ctx);
 
                         // The popup edits temporary fields during drawing. Restore the
@@ -43363,6 +43368,11 @@ impl App {
         operation: Option<ViewerOperationId>,
         fs_render_perf: &mut Option<FsRenderPerfRecorder>,
     ) {
+        // Own manual navigation and slideshow timers at their common boundary.
+        // OS close still reaches teardown and cancels only the owning export.
+        if self.depth_export_dialog_open() && !close_fs {
+            return;
+        }
         if self.viewer_mutation_modal_active() {
             return;
         }

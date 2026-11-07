@@ -11,11 +11,15 @@ use super::ExportError;
 pub(super) struct Mp4Muxer {
     output: ffmpeg::format::context::Output,
     video_stream_index: usize,
-    audio_stream_index: usize,
+    audio: Option<AudioStream>,
     video_source_time_base: ffmpeg::Rational,
-    audio_source_time_base: ffmpeg::Rational,
     video_stream_time_base: ffmpeg::Rational,
-    audio_stream_time_base: ffmpeg::Rational,
+}
+
+struct AudioStream {
+    index: usize,
+    source_time_base: ffmpeg::Rational,
+    stream_time_base: ffmpeg::Rational,
 }
 
 impl Mp4Muxer {
@@ -23,6 +27,23 @@ impl Mp4Muxer {
         path: &Path,
         video: &OpenedH264Encoder,
         audio: &OpenedAacEncoder,
+        frame_rate: (u32, u32),
+    ) -> Result<Self, ExportError> {
+        Self::new_tracks(path, video, Some(audio), frame_rate)
+    }
+
+    pub(super) fn new_video_only(
+        path: &Path,
+        video: &OpenedH264Encoder,
+        frame_rate: (u32, u32),
+    ) -> Result<Self, ExportError> {
+        Self::new_tracks(path, video, None, frame_rate)
+    }
+
+    fn new_tracks(
+        path: &Path,
+        video: &OpenedH264Encoder,
+        audio: Option<&OpenedAacEncoder>,
         frame_rate: (u32, u32),
     ) -> Result<Self, ExportError> {
         let mut output = ffmpeg::format::output(path).map_err(|error| {
@@ -35,12 +56,7 @@ impl Mp4Muxer {
             .encoder
             .codec()
             .ok_or_else(|| ExportError::Mux("H.264 エンコーダ情報を取得できません".to_owned()))?;
-        let audio_codec = audio
-            .encoder
-            .codec()
-            .ok_or_else(|| ExportError::Mux("AAC エンコーダ情報を取得できません".to_owned()))?;
         let video_source_time_base = ffmpeg::Rational(frame_rate.1 as i32, frame_rate.0 as i32);
-        let audio_source_time_base = ffmpeg::Rational(1, audio.output_sample_rate() as i32);
 
         let video_stream_index;
         {
@@ -56,18 +72,25 @@ impl Mp4Muxer {
                 (*stream.parameters_mut().as_mut_ptr()).codec_tag = 0;
             }
         }
-        let audio_stream_index;
-        {
+        let audio_stream = if let Some(audio) = audio {
+            let audio_codec = audio
+                .encoder
+                .codec()
+                .ok_or_else(|| ExportError::Mux("AAC エンコーダ情報を取得できません".to_owned()))?;
+            let audio_source_time_base = ffmpeg::Rational(1, audio.output_sample_rate() as i32);
             let mut stream = output.add_stream(audio_codec).map_err(|error| {
                 ExportError::Mux(format!("音声ストリームを作成できません: {error}"))
             })?;
-            audio_stream_index = stream.index();
+            let audio_stream_index = stream.index();
             stream.set_time_base(audio_source_time_base);
             stream.copy_parameters_from_context(&audio.encoder);
             unsafe {
                 (*stream.parameters_mut().as_mut_ptr()).codec_tag = 0;
             }
-        }
+            Some((audio_stream_index, audio_source_time_base))
+        } else {
+            None
+        };
 
         let mut options = ffmpeg::Dictionary::new();
         options.set("movflags", "+faststart");
@@ -78,19 +101,26 @@ impl Mp4Muxer {
             .stream(video_stream_index)
             .ok_or_else(|| ExportError::Mux("映像ストリームを再取得できません".to_owned()))?
             .time_base();
-        let audio_stream_time_base = output
-            .stream(audio_stream_index)
-            .ok_or_else(|| ExportError::Mux("音声ストリームを再取得できません".to_owned()))?
-            .time_base();
+        let audio = audio_stream
+            .map(|(index, source_time_base)| {
+                let stream_time_base = output
+                    .stream(index)
+                    .ok_or_else(|| ExportError::Mux("音声ストリームを再取得できません".to_owned()))?
+                    .time_base();
+                Ok::<_, ExportError>(AudioStream {
+                    index,
+                    source_time_base,
+                    stream_time_base,
+                })
+            })
+            .transpose()?;
 
         Ok(Self {
             output,
             video_stream_index,
-            audio_stream_index,
+            audio,
             video_source_time_base,
-            audio_source_time_base,
             video_stream_time_base,
-            audio_stream_time_base,
         })
     }
 
@@ -99,6 +129,7 @@ impl Mp4Muxer {
         audio: &ffmpeg::Packet,
         video: &ffmpeg::Packet,
     ) -> Result<bool, ExportError> {
+        let audio_stream = self.audio_stream()?;
         let audio_dts = audio
             .dts()
             .ok_or_else(|| ExportError::Mux("AAC パケットに DTS がありません".to_owned()))?;
@@ -107,7 +138,7 @@ impl Mp4Muxer {
             .ok_or_else(|| ExportError::Mux("H.264 パケットに DTS がありません".to_owned()))?;
         Ok(compare_timestamps(
             audio_dts,
-            self.audio_source_time_base,
+            audio_stream.source_time_base,
             video_dts,
             self.video_source_time_base,
         ) != Ordering::Greater)
@@ -123,12 +154,19 @@ impl Mp4Muxer {
     }
 
     pub(super) fn write_audio(&mut self, mut packet: ffmpeg::Packet) -> Result<(), ExportError> {
-        packet.set_stream(self.audio_stream_index);
+        let audio = self.audio_stream()?;
+        packet.set_stream(audio.index);
         packet.set_duration(packet.duration().max(1));
-        packet.rescale_ts(self.audio_source_time_base, self.audio_stream_time_base);
+        packet.rescale_ts(audio.source_time_base, audio.stream_time_base);
         packet
             .write_interleaved(&mut self.output)
             .map_err(|error| ExportError::Mux(format!("音声パケットを書き込めません: {error}")))
+    }
+
+    fn audio_stream(&self) -> Result<&AudioStream, ExportError> {
+        self.audio
+            .as_ref()
+            .ok_or_else(|| ExportError::Mux("映像のみの MP4 に音声を書き込めません".to_owned()))
     }
 
     pub(super) fn finish(mut self) -> Result<(), ExportError> {

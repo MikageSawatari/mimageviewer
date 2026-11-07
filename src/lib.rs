@@ -274,6 +274,7 @@ pub(crate) mod log_writer;
 pub mod logger;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_diagnostics_export_snapshot_fixture;
+pub mod depth_export;
 pub mod depth_parallax;
 pub mod depth_parallax_wgpu;
 mod fs_exclusive_view;
@@ -311,6 +312,7 @@ mod settings_override;
 pub mod source_coverage;
 #[cfg(all(windows, any(test, feature = "test-script")))]
 mod test_script;
+pub mod ui_depth_export;
 pub mod ui_depth_parallax;
 mod ui_depth_wait;
 #[doc(hidden)]

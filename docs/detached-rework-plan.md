@@ -1455,6 +1455,21 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-07: 3D写真 段Cの書き出し取消とviewer終了（BA-7）
+
+設計担当の段C §7.3「窓を閉じる…取り消し」を、既存のfullscreen終了境界へ接続する。
+`App::close_fullscreen_content` のteardownから、凍結したexport resourceのcontextと現在の
+`edit_request_owner_context`を照合するhelperを1回呼ぶ。所有contextなら設定／終端表示を
+退役し、実行中はcancel→Stoppingへ移す。別contextのreader終了ではexportに触れない。
+実処理の一時ファイル回収と終端通知まではOperationとRemote leaseを維持する。
+閉じたfullscreenを通知先に残さず、workerはpoll ownerのROOTを起こす。
+
+§2を読み、実装担当と独立Sol/xhigh reviewerは、既存のcontext identityと終了ownerに
+取消を接続する構造修正であり症状patchではないと判断した。detached述語、HWND同定、
+viewport生成／配置／focus、detachedの状態fieldは変更しない。設計担当ClaudeCodeの
+今回の検収と実機確認は未実施。検証結果は[3D計画 §10](depth-parallax-plan.md#10-実装の段階-codex-への委任単位)
+に集約し、兄弟contextの実終了で所有exportが維持される回帰も含める。
+
 ### 2026-11-07 3D 写真・段 B の占有表示 owner と presentation commit（実装・独立コードレビュー済み）
 
 設計の正本は [depth-parallax-plan §6・§10・§16](depth-parallax-plan.md)。

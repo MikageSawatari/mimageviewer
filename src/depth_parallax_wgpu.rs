@@ -7,6 +7,9 @@ use std::sync::{
     mpsc,
 };
 
+mod export;
+pub(crate) use export::DepthFrameRenderer;
+
 // No sRGB texture format is used: egui stores sRGB-encoded bytes in Rgba8Unorm.
 pub(crate) const DEPTH_SHADER: &str = r#"
 struct Vertex { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> };
@@ -1039,6 +1042,122 @@ mod tests {
 
     /// Actual product WGSL/blit/readback on a windowless device. No model,
     /// filesystem, application profile, surface, or desktop interaction.
+    #[test]
+    fn depth_export_gpu_matches_screen_gamma_alpha_and_rotated_checker() {
+        use crate::depth_export::DepthExportUnderlay;
+        use crate::egui037_stage4_gpu_tests::{OffscreenGpu, assert_rgba};
+        use crate::ui_fullscreen::{paint_image_underlay, transparent_bg_style};
+        let mut gpu = OffscreenGpu::new();
+        let ctx = egui::Context::default();
+        let pixels = (0..48)
+            .flat_map(|_| {
+                (0..64).map(|x| match x {
+                    0..24 => egui::Color32::TRANSPARENT,
+                    24..40 => egui::Color32::from_rgba_premultiplied(64, 32, 16, 128),
+                    _ => egui::Color32::from_gray(128),
+                })
+            })
+            .collect();
+        let source = ctx.load_texture(
+            "depth export alpha",
+            egui::ColorImage::new([64, 48], pixels),
+            egui::TextureOptions::LINEAR,
+        );
+        let checker = ctx.load_texture(
+            "depth export checker",
+            egui::ColorImage::new(
+                [16, 16],
+                (0..16)
+                    .flat_map(|y| {
+                        (0..16).map(move |x| {
+                            egui::Color32::from_gray(if (x / 8 + y / 8) % 2 == 0 {
+                                224
+                            } else {
+                                176
+                            })
+                        })
+                    })
+                    .collect(),
+            ),
+            egui::TextureOptions {
+                wrap_mode: egui::TextureWrapMode::Repeat,
+                ..egui::TextureOptions::NEAREST
+            },
+        );
+        let size = [80, 64];
+        let transform = cropped_quarter_turn(
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(80., 64.)),
+            egui::Rect::from_min_max(egui::pos2(0.125, 0.25), egui::pos2(0.875, 0.75)),
+        );
+        render_egui_frame(&mut gpu, &ctx, size, |_| {});
+        let job = install_two_depth_planes(&mut gpu, source.id(), &transform);
+        let export_size = [
+            transform.paint_rect.width() as u32,
+            transform.paint_rect.height() as u32,
+        ];
+        let origin = [
+            transform.paint_rect.left() as usize,
+            transform.paint_rect.top() as usize,
+        ];
+        let resource = gpu
+            .renderer
+            .callback_resources
+            .get::<DepthRenderResourcesRef>()
+            .unwrap()
+            .0
+            .clone();
+        for mode in [0, 1, 2] {
+            let screen_bg = transparent_bg_style(mode, Some(&checker));
+            let screen = render_egui_frame(&mut gpu, &ctx, size, |painter| {
+                paint_image_underlay(painter, transform.paint_quad(), &screen_bg);
+                painter.add(egui::Shape::Callback(
+                    egui_wgpu::Callback::new_paint_callback(transform.paint_rect, job.clone()),
+                ));
+            });
+            let export_bg = if mode == 2 {
+                DepthExportUnderlay::Checker {
+                    cell_size: [8., 8.],
+                }
+            } else {
+                DepthExportUnderlay::Solid([if mode == 1 { 255 } else { 0 }; 3])
+            };
+            let exporter = DepthFrameRenderer::new(
+                gpu.device.clone(),
+                gpu.queue.clone(),
+                &resource,
+                export_size,
+                export_bg,
+            );
+            // Deliberately overwrite the screen uniform after construction. An export
+            // using the callback's buffer would now use the wrong crop/motion.
+            gpu.queue.write_buffer(
+                &resource.uniform,
+                0,
+                &DepthRenderParams {
+                    offset: egui::vec2(0.5, 0.5),
+                    ..job.params
+                }
+                .bytes(),
+            );
+            let exported = exporter.render(job.params).unwrap();
+            let [width, height] = export_size.map(|n| n as usize);
+            for y in 0..height {
+                for x in 0..width {
+                    let actual: [u8; 4] = exported[(y * width + x) * 4..(y * width + x + 1) * 4]
+                        .try_into()
+                        .unwrap();
+                    assert_eq!(actual[3], 255);
+                    assert_rgba(actual, screen[(y + origin[1]) * 80 + x + origin[0]]);
+                }
+            }
+            assert_eq!(
+                exported[((height - 4) * width + width / 2) * 4
+                    ..((height - 4) * width + width / 2 + 1) * 4],
+                [128, 128, 128, 255]
+            );
+        }
+    }
+
     #[test]
     fn depth_gpu_blit_shader_stale_guard_and_lru() {
         use crate::depth_parallax::{DepthSourcePhase, DepthViewState};
