@@ -39,6 +39,35 @@
 
 ## 1. 優先候補
 
+### 1.731 コレクションから開いたフォルダと、レーティング一覧などから開いた同じフォルダで、中身のサムネイルキャッシュを消し合う — メール報告 (2026-11-07)
+
+- 状態: **未着手・利用者決定 2026-11-07: 不具合として直す**。報告者は v4.11.0 (インストーラ版)。実アプリでは誰も確認していない (原因はコードを読んだ結果)。
+- 報告 (報告者の観測): レーティング一覧に登録したフォルダ A を開くと中の ZIP 等のサムネイルが作られ、以後はレーティング一覧・お気に入り経由なら速い。A をコレクションに追加してコレクションから開くと作成が走る。途中でレーティング一覧から A を開き直すと続きから作成が走る (最初のキャッシュが消えたように見える)。両経路で作り直した後も、コレクション→A→レーティング一覧→A と切り替えると「微妙に」遅い。同じ経路の往復は速い。
+- 原因の候補 (コード、確度高): キャッシュ DB はフォルダ A の実パスごとに 1 つだが、行のキーが経路で変わる。`App::use_full_path_cache_keys` (`src/app.rs`) は表示面が `TopLevelGridSurface::Collection(_)` なら常に真で、コレクションから実フォルダへ入った `CollectionGridPosition::PhysicalSource` も Collection 面のままなのでフルパスキー (`zipthumb:C:\…\AAA.zip` 等)。レーティング一覧の子・お気に入りは Folder 面でファイル名キー。さらに一覧の読込ごとに `delete_missing` (`src/catalog.rs`、呼び出しは `src/app.rs` の `catalog_existing_keys`) が今回のキー集合に無い行を消すので、経路を切り替えるたびに相手の行が消える。v4.0.0 (`4fd374ba2`) からの作りで、最近の退行ではない。
+- 方針案: `PhysicalSource` (実フォルダ 1 つの中身) ではファイル名キーに揃える。フルパスキーにした理由は「コレクションの root は親の違う同名項目を 1 一覧に並べる」ため (`docs/virtual-folders.md` の名前付きコレクションの段落) で、root にだけ要る。読出し・seed・`delete_missing` は同じ判定を共有する規則 (`use_full_path_cache_keys` のコメント)。逆の仕様を固定しているテスト (`src/app/collection_grid.rs` 11112 行付近) を改める。コレクション内の実フォルダでサブフォルダ展開や ZIP を開いた場合のキーは実装前に確認する。キャッシュは作り直せるデータなので移行は不要 (旧形式の行は次の読込で `delete_missing` が消す)。
+- 未解明: 「両方で作り直した後でも切り替えると微妙に遅い」。上の仕組みなら毎回ほぼ全部の作り直しになるはずで、程度が合わない (キャッシュしない設定の項目、メモリ側の保持の違いなどが候補、未確認)。修正後に報告者へ聞く価値があるのはここだけ。
+
+### 1.732 どの一覧でもフォルダを複数選択・Ctrl+A の対象にする — メール報告 (2026-11-07)
+
+- 状態: **未着手・利用者決定 2026-11-07: 仕様を変える** (利用者自身も戸惑ったことがある)。既存の動きが変わる点はリリースノートで知らせる。
+- 報告 (報告者の観測): レーティング一覧やコレクションで Ctrl/Shift+クリックでフォルダを複数選択できない (ファイルはできる)。おそらくどの一覧でも Ctrl+A でフォルダが選ばれない。
+- 現状 (コード): 選べるかどうかの基準 `GridItem::is_checkable()` (`src/grid_item.rs`) は Folder を含まない。`App::grid_item_can_be_checked` (`src/app/subfolder_expansion.rs`) が `subfolder_expansion_available()` の真のときだけ Folder を追加で認めるため、レーティング一覧・コレクション・検索結果・閲覧履歴・タグ一覧・スマートフォルダ・ZIP 内では選べない (サブフォルダ展開のための条件 f7d6a914c をそのまま借りている)。Ctrl+A (`src/app/update_phases.rs` の全選択) とゲームパッドの全チェック (`src/app/gamepad_input.rs`) は `is_checkable()` を直接見るので、どの一覧でもフォルダが入らない。Ctrl+A の除外は仕様として公開文書に書いてある (`docs/spec.md` の Ctrl+A の行 2 か所、マニュアル `grid.html` 2 か所・`shortcuts.html`)。`docs/item-kind-capability-matrix.md` §6 では食い違いの一覧に入っている。
+- 選んだ項目を使う側: レーティング・タグ・コレクションへの追加・外部ツール・コピー/移動/D&D (中身ごと、エクスプローラーと同じ) は今もフォルダを扱える。一括書き出し・一括補正・EPUB 変換はフォルダを黙って飛ばす。名前変更は 2 件以上で断る。Remote・MCP はこの判定を使わない。
+- 一緒に入れる安全策 (利用者決定 2026-11-07):
+  - 削除: フォルダは中身ごとごみ箱へ行く。「ごみ箱へ移すときは確認しない」(`skip_recycle_bin_delete_confirmation`、既定 OFF) が ON でも、フォルダを含む削除は必ず確認を出し、確認文に「うちフォルダ N 個」を出す (`src/ui_dialogs/context_menu.rs` の `should_skip_delete_confirmation`)。コレクション root の Delete は登録解除なので対象外。
+  - 本へ追加: 今は Folder が 1 件でもあると全体を中止する (`src/ui_fullscreen.rs` の本への追加)。フォルダを除いて続け、除いた件数を伝える。ZIP の扱いをそろえるかは実装前に決める。
+  - AI 説明文: `collect_caption_targets` (`src/ui_dialogs/caption_job.rs`) は Folder を本として受けるので、Ctrl+A の後の処理量が大きく増える。フォルダを対象に残すか、対象外にして件数を伝えるかを実装前に決める。
+- 変わる動き (リリースノートに書く): 通常フォルダで Ctrl+A の後にサブフォルダ展開を押すと「チェックしたフォルダだけ展開」になり今のフォルダ自身のファイルが外れる (`selected_subfolder_expansion_roots`)。「ファイルだけ全部選ぶ」手段がなくなる (代わりは Ctrl+A 後に Ctrl+クリックで外す、または範囲選択)。
+- 更新する文書: `docs/spec.md`、マニュアル `grid.html`・`shortcuts.html`、`docs/item-kind-capability-matrix.md` §6、`docs/keymap-spec.md` の該当行。
+
+### 1.733 コレクション・本を開く操作をリング・マウスジェスチャー等へ割り当てる — メール要望 (2026-11-07)
+
+- 状態: **未着手・利用者決定 2026-11-07: 追加する**。
+- 要望 (報告者): 「コレクション 1 を開く」などをマウスジェスチャーへ割り当てたい。
+- 現状 (コード): キー操作には `GridOpenCollection1..20`・`GridOpenBook1..20`・`GridCollectionPrev/Next` がある (`src/keymap.rs` の `SAVED_GROUP_ACTIONS`)。リング・マウスジェスチャー・マウスボタン・パッド X リングの候補 `RingActionId` (`src/ring_shortcut.rs`) には、お気に入り 1〜20・ドライブ・★一覧などしか無い。
+- 方針: お気に入りと同じ形で、コレクション 1〜20 に加えて本 1〜20 と前/次のコレクションも同時に足す。使える場面もお気に入りに合わせる (リング・ジェスチャーは一覧と画像・動画の全画面、マウスボタンは一覧だけ)。お気に入りの配線 (`RingActionId::favorite_slot_action` / `favorite_slot_number`、`src/app/gamepad_input.rs` の `ring_location_action_for_key_action` と ring 実行、`src/ui_dialogs/preferences/pages.rs` の候補表示) と、キー側の実行入口 `App::apply_saved_group_key_action` (`src/app/saved_group_actions.rs`) を使う。複数ウィンドウ・スナップショット中・処理中の拒否は既存の入口の判定に従う。
+- 注意: 新しいリング操作 ID は旧版で読むと「なし」に置き換わる (`docs/keymap-spec.md` の `GridColumnCount11..20` の段落)。公開時に版番号を上げれば足りる。`docs/keymap-spec.md` とマニュアルの操作カスタマイズの説明も更新する。
+
 ### 1.730 作成済みの AI 説明文を削除する操作が無い (2026-11-07、v5.0.0)
 
 - 状態: **完了・サブ PC で実機確認済み** (ブランチ `feat/caption-delete` を master へ merge、a6232e089)。利用者決定 2026-11-07: v5.0.0 に入れる。実装 Codex gpt-6.1-sol / high、独立レビュー gpt-6.1-sol / xhigh は 2 回目で ACCEPT (1 回目 P2 2 件: モデル取得中の作成予約が削除で捨てられる・削除窓がモデルの窓に隠れる → モデルの準備中・窓の表示中は削除を押せない形で解消。P3 1 件: 押せない理由とマニュアルの文言)。
