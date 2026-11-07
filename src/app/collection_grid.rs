@@ -11038,6 +11038,159 @@ mod tests {
         app.shutdown_collection_runtime_for_exit();
     }
 
+    fn thumbnail_request_keys(app: &App) -> std::collections::HashSet<String> {
+        app.items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let (mtime, size) = app.image_metas[index].unwrap_or_default();
+                let request = super::super::make_load_request(
+                    item,
+                    index,
+                    mtime,
+                    size,
+                    false,
+                    None,
+                    Some(app.settings.folder_thumb_sort),
+                    app.settings.folder_thumb_depth,
+                    &app.folder_pin_map,
+                    &app.converted_archive_cache_paths,
+                    None,
+                    app.current_folder.as_deref(),
+                    app.folder_thumb_pin_db.as_deref(),
+                    app.video_pin_db.as_ref(),
+                    app.use_full_path_cache_keys(),
+                )
+                .expect("thumbnail request");
+                crate::thumb_loader::cache_key_for_request(&request)
+                    .unwrap()
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    fn physical_folder_thumbnail_keys(
+        app: &mut App,
+        folder: &Path,
+    ) -> (
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+    ) {
+        let scan =
+            super::super::folder_scan::scan_directory_with_settings(folder, &app.settings).unwrap();
+        let now = Instant::now();
+        let prepared = app.prepare_scanned_folder_listing_with_cache_keys(
+            folder.to_path_buf(),
+            scan,
+            super::super::FolderListingMetrics {
+                seq: 0,
+                started: now,
+                scan_started: now,
+                pre_scanned: true,
+                path_display: folder.display().to_string(),
+            },
+            crate::app::StartupListIntent::ExplicitList,
+            app.use_full_path_cache_keys(),
+        );
+        (thumbnail_request_keys(app), prepared.existing_keys)
+    }
+
+    fn load_thumbnail_test_folder(
+        app: &mut App,
+        folder: &Path,
+        owner: super::super::OpenRequestOwner,
+    ) {
+        let scan =
+            super::super::folder_scan::scan_directory_with_settings(folder, &app.settings).unwrap();
+        assert!(app.load_folder_with_scan_owned(
+            folder.to_path_buf(),
+            Some(scan),
+            owner,
+            crate::app::StartupListIntent::ExplicitList,
+        ));
+        poll_until(app, "physical thumbnail hydration did not finish", |_| true);
+    }
+
+    fn assert_collection_physical_thumbnail_cache(normal_first: bool, compare_keys: bool) {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("album");
+        std::fs::create_dir(&folder).unwrap();
+        // Invalid image payloads keep background decoders from producing replacement rows.
+        std::fs::write(folder.join("page.png"), b"image").unwrap();
+        write_single_page_zip(&folder.join("book.zip"));
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot =
+            collection_with_sources(&client, &[(folder.clone(), CollectionResolvedKind::Folder)]);
+        let open = |app: &mut App, collection: bool| {
+            let owner = if collection {
+                app.open_collection_grid(snapshot.collection_id(), None);
+                wait_for_grid(app, snapshot.collection_id());
+                assert!(app.use_full_path_cache_keys(), "root keeps full-path keys");
+                super::super::OpenRequestOwner::CollectionGridPhysical(
+                    app.collection_grid_physical_load_owner(0, &folder).unwrap(),
+                )
+            } else {
+                super::super::OpenRequestOwner::Navigation
+            };
+            load_thumbnail_test_folder(app, &folder, owner);
+            assert_eq!(
+                matches!(
+                    app.top_level_grid_view.surface(),
+                    TopLevelGridSurface::Collection(_)
+                ),
+                collection
+            );
+        };
+        open(&mut app, !normal_first);
+        let before = physical_folder_thumbnail_keys(&mut app, &folder);
+        assert_eq!(before.0.len(), 2);
+        assert!(before.0.is_subset(&before.1));
+        let catalog = app.get_or_open_catalog(&folder).unwrap();
+        for key in &before.0 {
+            catalog.save(key, 1, 1, 1, 1, None, b"thumb").unwrap();
+        }
+        catalog
+            .save("removed.png", 1, 1, 1, 1, None, b"removed")
+            .unwrap();
+        open(&mut app, normal_first);
+        let after = physical_folder_thumbnail_keys(&mut app, &folder);
+        if compare_keys {
+            assert_eq!(
+                before, after,
+                "ordinary and collection physical request/prune keys must agree"
+            );
+        }
+        // The production load above must run start_loading_items/delete_missing on this DB.
+        let retained = catalog.load_all().unwrap();
+        assert!(
+            !retained.contains_key("removed.png"),
+            "production prune must have run"
+        );
+        assert!(
+            before.0.iter().all(|key| retained.contains_key(key)),
+            "switching routes deleted saved thumbnail rows: saved={:?}, retained={:?}",
+            before.0,
+            retained.keys().collect::<Vec<_>>()
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn collection_physical_thumbnail_keys_match_ordinary_folder() {
+        assert_collection_physical_thumbnail_cache(true, true);
+    }
+
+    #[test]
+    fn collection_physical_load_preserves_ordinary_thumbnail_rows() {
+        assert_collection_physical_thumbnail_cache(true, false);
+    }
+
+    #[test]
+    fn ordinary_load_preserves_collection_physical_thumbnail_rows() {
+        assert_collection_physical_thumbnail_cache(false, false);
+    }
+
     #[test]
     fn root_load_owner_stales_on_wanted_revision_but_physical_continuation_does_not() {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
