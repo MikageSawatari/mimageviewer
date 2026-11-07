@@ -29,6 +29,17 @@ use egui_kittest::kittest::NodeT;
 use egui_kittest::{Harness, kittest::Queryable};
 
 #[test]
+fn omitted_entries_dialog_dark() {
+    snapshot_with_theme_at_size(
+        "omitted_entries_dialog_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(840.0, 570.0),
+        None,
+        mimageviewer::draw_omitted_entries_snapshot_fixture,
+    );
+}
+
+#[test]
 fn folder_location_menu_dark() {
     snapshot_with_theme_contrast_and_size_with_interaction(
         "folder_location_menu_dark",

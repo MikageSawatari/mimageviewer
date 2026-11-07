@@ -551,9 +551,9 @@ pub(crate) fn materialize_local_folder_listing_with_order(
     let sort_ms = sort_started.elapsed().as_secs_f64() * 1000.0;
 
     let duplicate_started = std::time::Instant::now();
-    let mut same_name = 0usize;
+    omitted.reset_same_name();
     {
-        same_name = same_name.saturating_add(filter_virtual_folder_duplicates_with_sort_metadata(
+        omitted.record_removed(filter_virtual_folder_duplicates_with_sort_metadata(
             settings.same_name_folder_book,
             &mut folders,
             &mut metas,
@@ -561,15 +561,14 @@ pub(crate) fn materialize_local_folder_listing_with_order(
         ));
     }
     if settings.skip_archive_if_zip_exists {
-        same_name =
-            same_name.saturating_add(filter_convertible_archive_duplicates_with_sort_metadata(
-                &mut folders,
-                &mut metas,
-                &mut sort_metas,
-            ));
+        omitted.record_removed(filter_convertible_archive_duplicates_with_sort_metadata(
+            &mut folders,
+            &mut metas,
+            &mut sort_metas,
+        ));
     }
     if settings.skip_epub_if_pdf_exists {
-        same_name = same_name.saturating_add(filter_epub_pdf_duplicates_with_sort_metadata(
+        omitted.record_removed(filter_epub_pdf_duplicates_with_sort_metadata(
             &mut folders,
             &mut metas,
             &mut sort_metas,
@@ -592,15 +591,15 @@ pub(crate) fn materialize_local_folder_listing_with_order(
         };
     if settings.skip_image_if_video_exists {
         let filtered = filter_video_image_duplicates(&mut all_media, false);
-        same_name = same_name.saturating_add(filtered.omitted);
+        omitted.record_removed(filtered.omitted);
     }
     if settings.skip_duplicate_images {
-        same_name = same_name.saturating_add(filter_image_ext_duplicates(
+        omitted.record_removed(filter_image_ext_duplicates(
             &mut all_media,
             &settings.image_ext_priority,
         ));
     }
-    omitted.same_name = same_name;
+    omitted.sort_for_display();
     let duplicate_filter_ms = duplicate_started.elapsed().as_secs_f64() * 1000.0;
 
     let mut items = folders;

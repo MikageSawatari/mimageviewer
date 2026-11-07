@@ -38,7 +38,10 @@ mod metadata_cleanup;
 pub(crate) mod metadata_transfer;
 pub mod network_data_dir_notice;
 pub(crate) mod new_folder;
+mod omitted_entries;
 mod open_folder;
+#[doc(hidden)]
+pub use omitted_entries::draw_omitted_entries_snapshot_fixture;
 mod pdf_password;
 mod pdf_worker_notice;
 pub(crate) mod preferences;
