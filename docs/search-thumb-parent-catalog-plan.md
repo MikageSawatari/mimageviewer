@@ -1,6 +1,6 @@
 # 検索結果などで作ったサムネイルを親フォルダのキャッシュにも置く (§1.741)
 
-作成: 2026-11-08。状態: **設計案 r3 (独立設計レビュー r1・r2 REVISE を反映)**。対象版: 利用者判断 (§12)。
+作成: 2026-11-08。状態: **設計案 r4 (独立設計レビュー r1〜r3 REVISE を反映)**。対象版: 利用者判断 (§12)。
 バックログ: [next-release-backlog.md §1.741](next-release-backlog.md)。報告: 5ch >>746。
 
 ## 1. 問題
@@ -24,13 +24,15 @@
 
 ## 2. 目標と範囲
 
-- **単体ファイル項目** (画像・ZIP・PDF/EPUB・RAR 等の変換対象書庫) の**ピンなしの表紙**を、複数の親を並べる一覧で
-  作ったときも、**その親フォルダを通常に開いたときと同じ DB・同じキー・同じ署名の行**として置く。親フォルダの
-  代表選定と親フォルダの一覧が、その行をそのまま使う。逆向き (先にフォルダで作った行を検索結果などが使う) も効く。
+- **単体ファイル項目** (画像・ZIP・PDF/EPUB) の**ピンなしの表紙**を、複数の親を並べる一覧で**新しく作った・
+  作り直した**とき (元からの生成、またはアイドル時の高画質化の `SourceOnly` による再生成)、**その親フォルダを通常に
+  開いたときと同じ DB・同じキー・同じ署名の行**として置く。親フォルダの代表選定と親フォルダの一覧が、その行を
+  そのまま使う。逆向き (先にフォルダで作った行を検索結果などが使う) も効く。
+  共有を保証するのはこの「新しく保存した行」だけ。合成 DB の旧行や、画面に残っている表示を親フォルダへ移す保証はしない (r3 で合意)。
 - 検索を始めた元の一覧の DB とメモリに、検索の行を書かない (動画ピンの seed を含む)。
 - 今その一覧で表示できているサムネイルを、表示できなくしない・遅くしない (取り外したドライブの閲覧履歴など)。
-- 対象外 (理由は §8): フォルダ行・ピン付きの行・ファイル名スタック・ZIP/PDF の中のページ・検索の集約行・
-  ドライブ一覧、コレクションの root (§1.668)、音声 (既に実親 scope の別経路)、動画 (catalog を使わない別経路)、Remote。
+- 対象外 (理由は §8): フォルダ行・ピン付きの行・RAR 等の変換対象書庫・ファイル名スタック・ZIP/PDF の中のページ・
+  検索の集約行・ドライブ一覧、コレクションの root (§1.668)、音声 (既に実親 scope の別経路)、動画 (catalog を使わない別経路)、Remote。
 
 ## 3. 構造の要点
 
@@ -39,7 +41,7 @@
 1. **検索も自分の pool を持つ (§4)**。複数の親を並べる一覧は、どれも「その一覧の合成 DB を Fixed に持つ自分の
    pool」で動く。今これを満たさないのは Ctrl+G / Ctrl+R が他の一覧の pool を借りるときだけ。
 2. **単体ファイルの表紙要求には「親フォルダの行」を付ける (§5)**。worker はその要求の DB の読み書きを、
-   pool の Fixed ではなく親フォルダの DB で行う。メモリ (`cache_map`) の扱いは今と同じ。
+   pool の Fixed ではなく親フォルダの DB で行う。メモリ (`cache_map`) は今と同じく一覧自身のもので、要求キーで扱う。
 
 一覧の分類 (コードで確認。r1 指摘 8・r2 指摘 7 で補正):
 
@@ -60,16 +62,30 @@
 ## 4. 検索も自分の pool を持つ
 
 - Ctrl+G / Ctrl+R の結果を採用するとき、今の pool の Fixed が `__search_results__` でなければ、pool を
-  `__search_results__` の catalog と、その `load_all` のメモリで作り直す。pool が無いときの今の準備
-  (`SearchThumbnailInitRequest::prepare`、準備 worker 上で open・load_all) を、「pool が無い、**または** pool が検索の
-  ものでない」ときに使う。作り直しは既存の `restart_thumbnail_workers_after_metadata_pin_refresh` と同じ手順
-  (cancel token・channel・queue を新しくし、旧 pool の要求の結果は世代で捨てる)。
+  `__search_results__` の catalog と、その `load_all` のメモリで作り直す。作り直しは既存の
+  `restart_thumbnail_workers_after_metadata_pin_refresh` と同じ手順 (cancel token・channel・queue を新しくし、
+  旧 pool の要求の結果は世代で捨てる)。
+- **検索の thumbnail owner の受け渡しを 1 つの契約にする** (r3 指摘 1):
+  - `SearchMetadataResources::for_app` は、今の pool が検索のもの (`ThumbnailPoolCatalog::View(search)`) なら
+    `SearchThumbnailOwner::Current(その owner の identity と resources)`、それ以外 (pool なし・他の一覧の pool) なら
+    `SearchThumbnailOwner::Prepare { request, replaced: 今の pool の identity または なし }` を作る。`Prepare` のとき、
+    他の一覧の `folder_thumbnails` は捕捉しない。
+  - 準備 worker は `Prepare` なら `__search_results__` を open・`load_all` し (今の pool なしのときの
+    `SearchThumbnailInitRequest::prepare` と同じ)、**その新しい owner** に Everything の動画ピン seed を commit する。
+    既存 owner を優先して返す今の `prepare(existing)` は `Current` のときだけ使う。
+  - Ready の検証 (`is_current`): `Current` は今と同じく現在の owner と identity を比べる。`Prepare` は「現在の pool が
+    まだ `replaced` と同じ (Ready 待ちの間に別の owner へ変わっていない)」ことを確かめる。変わっていれば今と同じく
+    棄却して準備を取り直す。identity の検証自体は外さない。
+  - 採用 (`install_missing_search_thumbnail_workers` を一般化) で、`Prepare` の owner の catalog・メモリで pool を
+    作り直す (pool なしなら作る)。以後の rebuild は `Current` として現在の検索 owner を捕捉する今の経路に戻る。
+  - `ThumbnailPoolCatalog` は pool の channel・queue・cancel token と同じ context の所有単位に置き、pool を作る・作り直す・
+    退役させる箇所で一緒に置き換える (別 context へ漏らさない)。
 - 同じ検索の中のストリーミング・再検索・並べ替えの rebuild (`replace_search_view_items_with_ratings`) では
   作り直さない (pool が既に検索のもの)。今の「Ctrl+G の rebuild で worker を作り直さない」作りは保つ。
 - pool がどの DB のものかは、pool を作るときに型で記録する (`ThumbnailPoolCatalog`: 実フォルダ / 合成 DB /
   コレクション / なし)。`current_color_catalog` の Arc の比較や合成パスの推測で判定しない。
-- Everything の準備 worker のフォルダ動画ピン seed は、今と同じく「捕捉した owner」へ commit する。owner は
-  検索自身の `__search_results__` になるので、借りた pool の DB に seed 行が入る経路が無くなる。
+- 上の契約で、Everything の準備 worker のフォルダ動画ピン seed の commit 先は常に検索自身の `__search_results__` になり、
+  借りた pool の DB に seed 行が入る経路が無くなる。
 - 検索を閉じると、今と同じく元の一覧を通常に読み込む (新しい pool)。戻りの経路は変えない。
 - 費用: 他の一覧から検索に入る 1 回目に pool を作り直す。結果の採用で items は総入れ替えになり、元の一覧の
   要求は今も世代で捨てているので、表示の挙動は変わらない (元の一覧と同じパスの項目の `Loaded` の引き継ぎ
@@ -77,7 +93,8 @@
 
 これで次が今の作りのまま成り立つ (r2 指摘 4・5・7 の解消):
 - 単体ファイル以外の項目 (フォルダ行・ピン付き・ZIP/PDF の中・集約行) は、その一覧の合成 DB とメモリ (Fixed) で
-  今と同じ処理を受ける。再帰 `CachedPinned` の mirror、PDF メタ補完・catch-up も今の Fixed の規則のまま。
+  今と同じ処理を受ける。再帰 `CachedPinned` の mirror、PDF メタ補完・catch-up も今の Fixed の規則のまま
+  (Parent の PDF メタ補完は §5.4)。
 - 借りた pool のメモリを別の一覧のキーで引くことが無くなる。
 
 ## 5. 単体ファイルの表紙要求の「親フォルダの行」
@@ -92,18 +109,22 @@
 | `Image` | 通常 (ピンの概念なし) | — |
 | `ZipFile` | ピンなし (要求は ZIP の先頭画像) | ピンあり (`#pin:`) |
 | `PdfFile` (EPUB を含む) | ピンなし (`pdf_page = Some(0)` の通常の表紙) | ピンあり |
-| `ConvertibleArchive` | ピンなし (`resolve_override = ZipFirstImage`、`path` は変換済み ZIP) | ピンあり |
-| それ以外 (`Folder`・`Stack`・`ZipImage`・`PdfPage`・`ZipDir`・`SearchContainer`・`Audio`・`Video`) | — | すべて |
+| それ以外 (`ConvertibleArchive`・`Folder`・`Stack`・`ZipImage`・`PdfPage`・`ZipDir`・`SearchContainer`・`Audio`・`Video`) | — | すべて |
+
+`ConvertibleArchive` (RAR 等) を外す理由 (r3 指摘 4): 読むのは以前に変換した ZIP で、その ZIP がどの元書庫の署名に
+対応するかを今の `CachedZip` は持たない。元書庫が変換後に更新されていると、古い内容の表紙を新しい署名で親 DB へ
+保存し得る。また、フォルダの自動代表の候補は ZIP/PDF 系だけで、変換対象書庫の行は代表選定に使われない
+(r1 の確認)。目標に要らない対象のために変換の署名を持ち回る契約を足さない。
 
 ```text
 struct ParentRow {
-    source: PathBuf,       // 元の項目のパス。ConvertibleArchive は元の書庫 (変換済み ZIP ではない)
+    source: PathBuf,       // 元の項目のパス
     folder: PathBuf,       // source.parent()。実在の通常パスのときだけ ParentRow を作る
     row_key: String,       // その親フォルダを通常に開いたときの要求キー
 }
 ```
 
-- `row_key` は今のキー helper (`container_cache_base_key` / `convertible_archive_cache_base_key` / 画像キー) を
+- `row_key` は今のキー helper (`container_cache_base_key` / 画像キー) を
   `use_full_path = use_full_path_cache_keys_for_folder(folder)` で呼んだもの。新しい綴りは作らない。種類フィルタの
   suffix (`representative_cache_key_for_policy`) は、worker が要求キーに付けるのと同じ箇所で `row_key` にも付ける。
 - `folder` の DB は、通常にそのフォルダを開くときと同じ (`CatalogDb::open(cache_dir, folder)` /
@@ -150,35 +171,49 @@ struct ThumbnailCatalogProvider {
 
 ### 5.4 worker の読み・書き (Parent の要求)
 
+手順 0 として、**今の worker の要求の準備 (`prepare_load_request_stamp`、EPUB の read target と世代の解決) を今と同じく
+最初に行う** (r3 指摘 3)。以下の「要求の署名」は、この準備の後の署名 (EPUB なら世代の署名) を指す。
+
 | `LoadSourcePolicy` | 1. メモリ | 2. 署名の確定 | 3. 親 DB の lookup | 4. 元から生成 | 5. 保存 |
 | --- | --- | --- | --- | --- | --- |
-| `CacheOrSource` | 要求キー・要求の署名で引く (今と同じ)。当たれば表示して終わり | 1 が外れたら | observed で | 3 が外れたら (今と同じ) | ポリシーが選べば親 DB へ `row_key`・observed |
+| `CacheOrSource` | 要求キー・要求の署名で引く (今と同じ)。当たれば表示して終わり | 1 が外れたら | observed で。observed が無ければ要求の署名で (読むだけ) | 3 が外れたら (今と同じ) | ポリシーが選べば親 DB へ `row_key`・observed。メモリへ要求キー・要求の署名で |
 | `SourceOnly` (アイドル時の高画質化) | 飛ばす (今と同じ) | する | 飛ばす | する | 同上 |
 | `CacheOnly` | 引く (今と同じ) | しない | 要求の署名で RO lookup だけ | しない | しない |
 
-- **メモリを最初に引き、当たれば stat しない** (r2 指摘 3)。★一覧などが開くときに読んだ合成 DB の旧行 (フルパス) は
+- **メモリを最初に引き、当たれば filesystem の stat を足さない** (r2 指摘 3)。EPUB の世代解決 (手順 0) は今もメモリより前に
+  行っている処理で、省かない。★一覧などが開くときに読んだ合成 DB の旧行 (フルパス) は
   今と同じ速さで表示され、取り外したドライブでも今と同じく出る。stat は、今も元ファイルを読みに行く場面
   (メモリにも DB にも無い) の直前にだけ行うので、オフラインのドライブで新たに待つ場面は増えない。
 - **署名 (observed) は、通常一覧の要求が最終的に使う署名と同じ所有者で決める** (r1 指摘 1・r2 指摘 2):
-  - 画像・ZIP・通常の PDF・変換対象書庫: `ParentRow.source` の `std::fs::metadata` を、通常のフォルダ読込
-    (`folder_scan.rs` の `mtime_secs` と `len`) と同じ helper で変換する。変換対象書庫は元の書庫を stat する。
-  - EPUB: 今の通常一覧と同じく worker が解決する世代の署名 (`stamp_resolved_pdf_request` の `generation_catalog_pair`)。
+  - 画像・ZIP・通常の PDF: `ParentRow.source` の `std::fs::metadata` を、通常のフォルダ読込
+    (`folder_scan.rs` の `mtime_secs` と `len`) と同じ helper で変換する。
+  - EPUB: 手順 0 で解決した世代の署名 (`stamp_resolved_pdf_request` の `generation_catalog_pair`) をそのまま使う。
+    通常一覧の EPUB 行も同じ署名なので一致する。
   - RAW の follow-up (現像待ちの再開): 最初の処理で確定した observed を継承し、再開時に stat し直さない。
-  - 要求の署名 (お気に入り横断検索の ZIP/PDF の size 0、閲覧履歴の保存時の値など) は、親 DB の行には使わない。
-  - stat できない (取り外したドライブ等): 親 DB は読まず書かず、今と同じく生成を試みて失敗する経路へ進む。
+  - 一覧が渡す要求の署名 (お気に入り横断検索の ZIP/PDF の size 0、閲覧履歴の保存時の値など) は、親 DB へ**書く**
+    行には使わない。
+  - stat できない (取り外したドライブ等): 親 DB は要求の署名で RO lookup だけ行い (保存しない)、外れれば今と同じく
+    生成を試みて失敗する経路へ進む。
 - clear を跨いだ `CacheOnly` は、§1.668 と同じく旧メモリを使わず、provider の一回 RO 継続で successor を読む。
   clear を跨いだ要求は保存しない (受付時の admission)。
 - **合成 DB の旧行は親 DB へ写さない**。旧行で表示した項目は、既定で有効な「アイドル時にキャッシュ由来の
   サムネイルを高画質化する」の `SourceOnly` 要求が元から作り直したときに、observed 付きで親 DB に入る。この設定を
   切っている場合、旧行で表示できている項目は親 DB に入らない (新しく作る項目は入る)。写しの段を設けないのは、
   表示後に stat を足す経路 (r2 指摘 3) と移行の段を増やさないため (§10)。
-- 生成した行は親 DB にだけ保存する。合成 DB・`cache_map` には入れない (`cache_map` を書くのは今と同じく Fixed の
-  要求だけ)。同じ一覧の中で表示範囲から外れて戻ったときは、親 DB の lookup で当たる。
+- 生成した行の DB は親 DB だけ (合成 DB には書かない)。あわせて、その一覧自身の `cache_map` に**要求キー・要求の署名**で
+  入れる (r3 指摘 2)。Fixed の要求が保存成功時に `cache_map` を更新する今の作りと同じで、表示範囲から外れて戻った
+  ときや、その後にドライブを外したときも、メモリから再表示できる (要求の署名が仮の値でも、メモリの照合は今と同じく
+  要求の署名どうしなので当たる)。`cache_map` に `row_key` (basename) を入れることはしない。
+  複数の親を並べる一覧は §4 で必ず自分の pool とメモリを持つので、他の一覧のメモリを書くことは無い。
 - 派生要求 (EPUB fallback、RAW follow-up、PDF catch-up) は外側の `RequestCatalog` と `CatalogWork` を継承する。
   `ParentRow` はピンなしの表紙だけに付くので、キーが外側と変わる派生 (ピンの再帰、EPUB のピンの世代付け足し) は
   起きない。worker で Parent の要求のキーが外側の要求キーと違えば、debug_assert + ログで止め、親 DB に書かない。
-- PDF メタ補完 (通常一覧の Fixed の書き込み接続で行う処理) は Parent では行わない。PDF のページ数などは、
-  親フォルダを開いたときに今と同じく補完される。
+- **PDF メタ補完は Parent の保存先でも行う** (r3 指摘 5)。今 Fixed の書き込み接続で行っている PDF メタの保存
+  (表紙のレンダリング結果からのページ数等の保存、cache hit 時の catch-up) を、保存先が Parent のときは親 DB の
+  書き込み接続 (受付時の `CatalogWork` の admission の下、表紙の保存と同じ `ThumbnailSaveTarget` から開くもの) で、
+  今と同じ password の安全条件で行う。今は検索が PDF の親フォルダの pool を借りたときだけ親 DB に入っていた
+  pdf_meta が、どこから検索しても親 DB に入る (Enter の即時 placeholder が使える場面が増える)。
+  RO の lookup 接続を書き込みに使わない (§1.668 と同じ)。
 - perf: 今の `collection/thumb_catalog_open`・`thumb_catalog_lookup` を一般化して種類を field で分け、Parent の stat にも区間を付ける。
 
 ## 6. 同名項目の衝突
@@ -192,8 +227,11 @@ struct ThumbnailCatalogProvider {
   誤表示し得る**。これは今も両方のフォルダを順に開けば起きる既存の制約で、今回その範囲が検索などにも広がる。
   ドライブ文字を保つ identity への変更は通常のフォルダ閲覧のキャッシュ互換を変える別の判断なので行わない。
 - 既存の別問題 (今回は直さず別に起票する): 検索の合成 DB では、`ZipImage` (entry 名)・`PdfPage`・`ZipDir` の要求キーが
-  書庫を含まず、検索の ZIP 内行は署名が `(0,0)` のことがある (r2 指摘 5)。今回の変更でこの範囲は広がらない
-  (検索の pool が借りた一覧のメモリを引かなくなる分、むしろ狭まる)。
+  書庫を含まず、検索の ZIP 内行は署名が `(0,0)` のことがある (r2 指摘 5)。今回の変更で、借りた一覧のメモリを引く
+  経路は無くなるが、Ctrl+G / Ctrl+R の行がいつも `__search_results__` に入るようになるので、従来は開始元ごとの別 DB に
+  分かれていた `cover.png`・`(0,0)` の行が 1 つの DB で再利用され得る (r3 指摘 6)。今の通常の索引には ZIP 内のヒットが
+  無い (`global_search_ui.rs` 1292 付近) ので、影響は旧索引・古い索引の経路に限られる。この残りと共有化の影響を
+  別の項目として起票する。
 
 ## 7. 永続データの判断 (リリース済み)
 
@@ -220,6 +258,7 @@ struct ThumbnailCatalogProvider {
 - **コレクション root**: §1.668 (v4.11.0 で出荷) は元フォルダごとの別 DB にフルパスのキーで置き、メモリに旧行を読まない。
   親 DB へ寄せると、2000 件規模のコレクション (§1.668 の報告) で旧行を読む別の lookup が要る。provider は同じ
   `LazyCatalogs` を使う形にしておき、寄せるかは別の判断にする。
+- **RAR 等の変換対象書庫**: §5.1 (変換済み ZIP と元書庫の署名の対応を持たない。代表選定にも使われない)。
 - **音声**: generic provider より前に専用経路へ分かれ、既に実親 scope の `audioart:` を使う (`thumb_loader.rs` 2803 付近)。
 - **動画**: catalog を使わない別 thread (`spawn_video_thread`、Shell API・video pin DB)。
 - **Remote**: Remote の一覧は本体の catalog を読み取り専用で引く別経路で、書かない。
@@ -247,8 +286,8 @@ struct ThumbnailCatalogProvider {
 - 採用: **対象を単体ファイルのピンなしの表紙に絞り、分岐で決める**。フォルダ行の proof・再帰 mirror・seed、EPUB の
   世代、ピンの再帰を親 DB の側で扱わずに済む。
 - 採用: **署名は通常一覧と同じ所有者で worker が確定**。一覧ごとに「署名が本物か」の宣言を作らない。
-- 採用: **旧行は今と同じく読み、写さない**。移行の段・表示後の stat を作らない。親 DB への移りは、アイドル時の
-  高画質化と新しい生成で自然に進む。
+- 採用: **旧行は今と同じく読み、写さない**。移行の段・表示後の stat を作らない。親 DB に入るのは新しく生成した行と、
+  アイドル時の高画質化で作り直した行だけで、共有の保証もこの範囲に限る (§2、r3 で合意)。
 - 採用しなかった: 検索に入るたびに pool を作り直すだけ (元のフォルダの DB は汚さないが、代表選定との共有ができない)。
 - 採用しなかった: 代表選定が検索の DB も引く (検索専用 DB に結果のパスが溜まり続け、§15 の方針と逆向き。代表選定が
   1 フォルダのために別 DB を開く)。
@@ -258,9 +297,13 @@ struct ThumbnailCatalogProvider {
 
 ## 11. 変わる挙動 (利用者から見て)
 
-- 良くなる: Everything 検索・Ctrl+G・★一覧・履歴などで作った ZIP・PDF・書庫のサムネイルが、親フォルダの代表
-  サムネイルと親フォルダの一覧で使われる。フォルダを開いて作ったサムネイルを、検索結果などが使う
-  (開いたことのあるフォルダの項目は、検索結果の初回表示でも作り直さない)。
+- 良くなる: Everything 検索・Ctrl+G・★一覧・履歴などで新しく作った (またはアイドル時の高画質化で作り直した)
+  ZIP・PDF・画像のサムネイルが、親フォルダの代表サムネイルと親フォルダの一覧で使われる。フォルダを開いて作った
+  サムネイルを、検索結果などが使う (開いたことのあるフォルダの項目は、検索結果の初回表示でも作り直さない)。
+  更新前に★一覧などの合成 DB へ入っていた行は、そのまま★一覧などで使われ、親フォルダへは移らない
+  (アイドル時の高画質化が有効なら、作り直したときに親フォルダにも入る)。
+- 良くなる: 検索で表示した PDF のページ数などの情報が PDF の親フォルダのキャッシュに入り、Enter で開いたときの
+  即時の仮表示が使える場面が増える (今は検索が PDF の親フォルダから始めたときだけ)。
 - 良くなる: 検索を始めた元のフォルダの DB に行が入らない (戻ったときの削除も起きない)。Ctrl+G / Ctrl+R の
   2 回目以降の検索で、前回の結果のサムネイルが `__search_results__` から当たる (今は借りた pool のときは当たらない)。
 - 費用: 他の一覧から Ctrl+G / Ctrl+R に入る 1 回目に、`__search_results__` の catalog を準備 worker で開いて読む
@@ -274,10 +317,10 @@ struct ThumbnailCatalogProvider {
 ## 12. 規模と出荷の見込み
 
 - 本体の変更: 検索の pool の作り直し (`global_search_ui.rs` の `for_app`・採用、`app.rs` の pool の型の記録)、
-  `ParentRow` (`make_load_request_with_visibility` の 4 分岐と受付)、`RequestCatalog` / provider の一般化
-  (`catalog_provider.rs`)、worker の lookup・保存の分岐 (`thumb_loader.rs`)。数百行と、横断のテスト。中規模。
-- r1 の見積もり (対象を絞る前の案): 実装・テスト 3〜5 人日 + 独立レビュー・全件 gate・実機確認。r3 で対象を絞り、
-  宛先の別型も無くしたので減るが、provider は出荷済みの §1.668 の機構を触る。
+  `ParentRow` (`make_load_request_with_visibility` の 3 分岐と受付)、`RequestCatalog` / provider の一般化
+  (`catalog_provider.rs`)、worker の lookup・保存・PDF メタ補完の分岐 (`thumb_loader.rs`)。数百行と、横断のテスト。中規模。
+- r1 の見積もり (対象を絞る前の案): 実装・テスト 3〜5 人日 + 独立レビュー・全件 gate・実機確認。r2・r3 で対象を絞り、
+  宛先の別型も無くしたので減るが、provider は出荷済みの §1.668 の機構を、検索の owner の受け渡しは Everything の準備を触る。
 - v5.1.0 (数日以内) に入れるかは利用者判断。設計担当の見立ては「v5.1.0 に間に合わせるより、v5.1.x で出す方が安全」。
 
 ## 13. テスト (実装時)
@@ -289,14 +332,20 @@ struct ThumbnailCatalogProvider {
 - pool: 通常フォルダ・★一覧・コレクションから Ctrl+G / Ctrl+R に入ると pool が `__search_results__` になり、ストリーミング
   中の rebuild では作り直さない。検索を閉じると元の一覧が通常に読み込まれる。借りた pool の DB とメモリに検索の行・
   seed 行が入らない。兄弟 context の pool は変わらない。
-- 分岐: `ParentRow` が付くのは表 (§5.1) のピンなしの 4 分岐だけ。ピンあり・Folder・Stack・ZipImage・PdfPage・ZipDir・
-  SearchContainer・Audio・Video には付かない (種類ごとの受付テスト)。ConvertibleArchive の `source` は元の書庫。
+- owner の受け渡し: 他の一覧から入った Everything の準備が、新しい `__search_results__` の owner に seed し、Ready の検証を
+  通って採用される。Ready 待ちの間に pool が別の owner へ変わったら棄却して取り直す (今の再試行と同じ)。
+- 分岐: `ParentRow` が付くのは表 (§5.1) のピンなしの 3 分岐 (Image / ZipFile / PdfFile) だけ。ピンあり・ConvertibleArchive・
+  Folder・Stack・ZipImage・PdfPage・ZipDir・SearchContainer・Audio・Video には付かない (種類ごとの受付テスト)。
 - 署名: お気に入り横断検索 (size 0) と閲覧履歴 (保存時の署名) でも、親 DB の行は observed で書かれ、通常一覧の行を
-  上書きしない。EPUB は世代の署名で、通常一覧の行と一致する。RAW の follow-up は再開時に stat しない。stat できない
-  項目は親 DB に読み書きしない。
+  上書きしない。EPUB は手順 0 の世代の署名で、合成 DB の旧行にもメモリで当たり、通常一覧の行とも一致する。
+  RAW の follow-up は再開時に stat しない。stat できない項目は親 DB を要求の署名で読むだけで、書かない。
+- オフライン再表示: 生成・保存 → 表示範囲から外す (Evicted) → ドライブを外した状態で戻る → メモリから再表示される
+  (要求の署名が size 0 の一覧でも)。
+- PDF メタ: Parent で表紙を保存したとき・cache hit の catch-up で、PDF の親 DB に pdf_meta が入る (password の条件は今と同じ)。
 - 順序: メモリで当たる項目は stat しない (stat の呼び出し回数を数える)。`SourceOnly` はメモリ・DB を引かず親 DB へ保存、
   `CacheOnly` は生成・保存をしない。clear を跨いだ `CacheOnly` の一回 RO 継続、clear を跨いだ要求の保存禁止。
-- 互換: ★一覧の合成 DB の旧フルパス行が今と同じく表示される。`SourceOnly` で作り直すと親 DB に入る。
+- 互換: ★一覧の合成 DB の旧フルパス行が今と同じく表示される (EPUB を含む)。`SourceOnly` で作り直すと親 DB に入る。
+  旧行で表示しただけでは親 DB に入らない (保証の範囲、§2)。
 - 同名: F01・F02 の `vol01.zip` が別 DB に入る。ドライブルート直下の項目はルート DB にフルパスのキーで入る。
 - 一覧の種類ごとの判定表 (`ThumbStorageScope`) のテスト。`SingleFolder` (通常フォルダ・ZIP の中・ドライブルート・
   コレクションの PhysicalSource) は今と同じ Fixed とキー。§1.731 の 3 テストが通ること。
