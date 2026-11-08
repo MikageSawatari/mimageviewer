@@ -13136,6 +13136,7 @@ impl App {
         self.publish_effetune_auto_fullscreen();
         self.fs_zoom = 1.0;
         self.fs_pan = egui::Vec2::ZERO;
+        self.clear_fs_initial_placement_request();
     }
 
     /// 編集ツールを抜けたのに見開きが戻っていない状態を解消する。
@@ -13204,6 +13205,7 @@ impl App {
         self.publish_effetune_auto_fullscreen();
         self.fs_zoom = 1.0;
         self.fs_pan = egui::Vec2::ZERO;
+        self.clear_fs_initial_placement_request();
     }
 }
 
@@ -18245,6 +18247,8 @@ pub struct App {
     pub(crate) fs_zoom: f32,
     /// 通常フルスクリーンのパンオフセット（スクリーン座標系）
     pub(crate) fs_pan: egui::Vec2,
+    pub(crate) fs_initial_placement_request:
+        Option<crate::ui_fullscreen::FsInitialPlacementRequest>,
 
     // ── ZipPla 風 全画面ズームモード (Z キー、v2.0.0) ──────────────
     // 画像の一部を画面いっぱいに拡大 (cover) し、マウス位置で表示範囲をパンする
@@ -21667,6 +21671,7 @@ impl App {
             fs_primary_suppression: Default::default(),
             fs_zoom: 1.0,
             fs_pan: egui::Vec2::ZERO,
+            fs_initial_placement_request: None,
             fs_zoom_active: false,
             fs_zoom_aiming: false,
             // 既定 1.0 = cover (縦長画像では横幅目一杯)。ZipPla 単ページの既定に合わせる。
@@ -44652,6 +44657,7 @@ impl App {
 
     fn set_items_generation(&mut self, items_generation: u64) {
         if self.items_generation != items_generation {
+            self.clear_fs_initial_placement_request();
             self.close_page_overview();
             self.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
             self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
@@ -67959,6 +67965,7 @@ impl App {
                 if let Some((zoom, pan)) = zoom_pan {
                     app.fs_zoom = zoom;
                     app.fs_pan = pan;
+                    app.clear_fs_initial_placement_request();
                 }
                 app.fs_free_rotation = free_rotation;
             })
@@ -68028,6 +68035,7 @@ impl App {
             if let Some((zoom, pan)) = activate_zoom_pan {
                 self.fs_zoom = zoom;
                 self.fs_pan = pan;
+                self.clear_fs_initial_placement_request();
             }
             self.fs_free_rotation = activate_free_rotation;
             self.log_detached_image_window_debug(format!(
@@ -71514,6 +71522,7 @@ impl App {
         self.analysis_sv_cache = None;
         self.fs_zoom = 1.0;
         self.fs_pan = egui::Vec2::ZERO;
+        self.request_fs_initial_placement(idx);
         self.fs_pan_drag_start = None;
         self.fs_vertical_scroll = 0.0;
         self.continuous_reading_scroll_transition = None;
@@ -81428,6 +81437,7 @@ impl App {
     }
 
     fn close_fullscreen_now_with_metadata_boundary(&mut self, boundary: FsMetadataBoundary) {
+        self.clear_fs_initial_placement_request();
         self.cancel_original_material_entry_intents(None);
         self.pending_fs_page_turn_ready = None;
         self.page_turn_presentation.deactivate("closed");

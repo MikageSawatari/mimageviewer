@@ -56,6 +56,8 @@ pub fn draw_fullscreen_fit_cycle_settings_snapshot_fixture(ui: &mut egui::Ui) {
         "SpecifiedScale".into(),
     ];
     pages::draw_fullscreen_fit_cycle_settings(ui, &mut settings);
+    ui.add_space(8.0);
+    pages::draw_fullscreen_page_start_position_setting(ui, &mut settings);
 }
 
 #[doc(hidden)]

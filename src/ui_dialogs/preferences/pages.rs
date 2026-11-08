@@ -16,10 +16,10 @@ use crate::ring_shortcut::{
 };
 use crate::settings::{
     self, AiFeatureMode, ArchiveFileHandling, CachePolicy, FullscreenFitMode,
-    FullscreenHorizontalCursorDirection, FullscreenJumpMode, FullscreenSeekDirection,
-    GridItemDisplayKind, Parallelism, ReadingDirection, ReadingFlow, SortOrder, SpreadMode,
-    StartupFolderMode, StartupWindowState, TextContrast, UI_FONT_VERTICAL_ADJUST_MAX,
-    UI_FONT_VERTICAL_ADJUST_MIN, UiFontSelection, UiTheme,
+    FullscreenHorizontalCursorDirection, FullscreenJumpMode, FullscreenPageStartPosition,
+    FullscreenSeekDirection, GridItemDisplayKind, Parallelism, ReadingDirection, ReadingFlow,
+    SortOrder, SpreadMode, StartupFolderMode, StartupWindowState, TextContrast,
+    UI_FONT_VERTICAL_ADJUST_MAX, UI_FONT_VERTICAL_ADJUST_MIN, UiFontSelection, UiTheme,
 };
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
@@ -10414,6 +10414,22 @@ mod plain_folder_spread_tests {
     }
 }
 
+pub(super) fn draw_fullscreen_page_start_position_setting(
+    ui: &mut egui::Ui,
+    settings: &mut Settings,
+) {
+    egui::ComboBox::from_label("ページ切替後の表示位置")
+        .selected_text(settings.fullscreen_page_start_position.label())
+        .show_ui(ui, |ui| {
+            for &position in FullscreenPageStartPosition::all() {
+                ui.selectable_value(&mut settings.fullscreen_page_start_position, position, position.label());
+            }
+        })
+        .response
+        .on_hover_text("読み始めは、縦にはみ出すときは上端、横にはみ出すときは読み方向の始まり（右→左なら右端、左→右なら左端）に合わせます。");
+    ui.small("画面からはみ出すとき、ページを切り替えた直後にどこから表示するか。");
+}
+
 pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "spread/chrome-suppression", |ui, state| {
         crate::ui_helpers::draw_fullscreen_chrome_suppression_setting(
@@ -10602,6 +10618,9 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
         });
     });
     ui.small("自動フィット時の倍率制限。ホイールなどの手動ズームは制限しません。");
+    anchored(ui, state, "spread/page-start-position", |ui, state| {
+        draw_fullscreen_page_start_position_setting(ui, &mut state.settings);
+    });
     ui.add_space(8.0);
     anchored(ui, state, "spread/specified-scale", |ui, state| {
         draw_fullscreen_specified_scale_settings(
@@ -11223,6 +11242,40 @@ mod context_menu_layout_settings_tests {
         );
         apply_context_menu_layout_edit(&mut layout, ContextMenuLayoutEdit::Reset);
         assert_eq!(layout, ContextMenuLayoutSettings::default());
+    }
+
+    #[test]
+    fn page_start_position_ui_selects_both_positions() {
+        use egui_kittest::kittest::Queryable;
+        for width in [320.0, 560.0] {
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(width, 180.0))
+                .build_ui_state(
+                    |root_ui, (settings, fonts_ready)| {
+                        if !*fonts_ready {
+                            crate::ui_fonts::configure_fonts(root_ui.ctx());
+                            *fonts_ready = true;
+                            root_ui.ctx().request_repaint();
+                            return;
+                        }
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            draw_fullscreen_page_start_position_setting(ui, settings);
+                        });
+                    },
+                    (Settings::default(), false),
+                );
+            harness.run();
+            for (label, expected) in [
+                ("読み始め", FullscreenPageStartPosition::ReadingStart),
+                ("中央", FullscreenPageStartPosition::Center),
+            ] {
+                harness.get_by_label("ページ切替後の表示位置").click();
+                harness.run();
+                harness.get_by_label(label).click();
+                harness.run();
+                assert_eq!(harness.state().0.fullscreen_page_start_position, expected);
+            }
+        }
     }
 
     #[test]

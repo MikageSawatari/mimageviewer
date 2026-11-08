@@ -1455,6 +1455,16 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-08: ページ切替後の初期表示位置 (§1.726)
+
+`ViewerContextBundle` へ一般の表示状態 1 フィールドを追加 (§1.726)。detached 述語・viewport 経路は不変。
+`fs_zoom` / `fs_pan` と同じ context が初期配置要求の生成・消費・退役を所有し、既存 bundle の移譲・swap で一緒に移す。
+新規 context は要求なしで始め、兄弟 context の位置や要求へ波及させない。detached 専用の状態や HWND・placement の経路は増やさない。
+
+設計担当 ClaudeCode と独立 Sol / xhigh 設計レビューは、bundle への一般表示状態の追加と holdover 描画入力の所有分離を、
+症状パッチではなく構造的な追加と合意した。実装は幾何の設計前提と現行コードの差異により途中で停止しており、独立実装レビューでの合意は未完了。
+設計 r3 と実装・検証記録の正本は [初期表示位置の計画](fullscreen-page-start-position-plan.md)。
+
 ### 2026-11-08: 3D 写真の MainWindow 対応（段 C 続き・案1）
 
 基点 `29bb7f54b`、正本は [3D 設計 §6.4.1](depth-parallax-plan.md#641-mainwindow-対応-2026-11-08案1を採択実装済み)。

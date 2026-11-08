@@ -3668,6 +3668,37 @@ impl ReadingDirection {
     }
 }
 
+/// ページ切替後に、はみ出す表示単位をどこから表示するか。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FullscreenPageStartPosition {
+    #[default]
+    Center,
+    ReadingStart,
+    #[serde(other)]
+    Unknown,
+}
+
+impl FullscreenPageStartPosition {
+    pub fn all() -> &'static [Self] {
+        &[Self::Center, Self::ReadingStart]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self.normalized() {
+            Self::Center => "中央",
+            Self::ReadingStart => "読み始め",
+            Self::Unknown => unreachable!(),
+        }
+    }
+
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Unknown => Self::Center,
+            value => value,
+        }
+    }
+}
+
 /// 静止画フルスクリーンのページシークバーで、左端から右端へページ番号をどう並べるか。
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum FullscreenSeekDirection {
@@ -5321,6 +5352,9 @@ pub struct Settings {
     /// フルスクリーンの倍率/フィット基準。
     #[serde(default)]
     pub fullscreen_fit_mode: FullscreenFitMode,
+    /// 単ページ・見開き・分割のページ切替直後の初期表示位置。
+    #[serde(default)]
+    pub fullscreen_page_start_position: FullscreenPageStartPosition,
     /// Per-axis display constraints, initially an enabled 80% by 80% frame.
     #[serde(default)]
     pub fullscreen_specified_scale: FullscreenSpecifiedScale,
@@ -7905,6 +7939,7 @@ impl Default for Settings {
             continuous_reading_gap_px: default_continuous_reading_gap_px(),
             fullscreen_image_margin_color: FULLSCREEN_IMAGE_MARGIN_COLOR_DEFAULT,
             fullscreen_fit_mode: FullscreenFitMode::default(),
+            fullscreen_page_start_position: FullscreenPageStartPosition::default(),
             fullscreen_specified_scale: FullscreenSpecifiedScale::default(),
             fullscreen_specified_scale_max_tenths: default_fullscreen_specified_scale_max_tenths(),
             fullscreen_fit_cycle_excluded: Vec::new(),
@@ -15417,6 +15452,42 @@ mod tests {
             Some(37)
         );
         assert!(!saved.contains_key("gpu_memory_percent"));
+    }
+
+    #[test]
+    fn fullscreen_page_start_position_defaults_and_serde_are_compatible() {
+        let defaults = Settings::default();
+        assert_eq!(
+            defaults.fullscreen_page_start_position,
+            FullscreenPageStartPosition::Center
+        );
+        let mut persisted = serde_json::to_value(defaults).unwrap();
+        persisted
+            .as_object_mut()
+            .unwrap()
+            .remove("fullscreen_page_start_position");
+        let missing: Settings = serde_json::from_value(persisted.clone()).unwrap();
+        assert_eq!(
+            missing.fullscreen_page_start_position,
+            FullscreenPageStartPosition::Center
+        );
+
+        for value in FullscreenPageStartPosition::all() {
+            persisted["fullscreen_page_start_position"] = serde_json::to_value(value).unwrap();
+            let loaded: Settings = serde_json::from_value(persisted.clone()).unwrap();
+            assert_eq!(loaded.fullscreen_page_start_position, *value);
+        }
+        persisted["fullscreen_page_start_position"] = serde_json::json!("FuturePosition");
+        let loaded: Settings = serde_json::from_value(persisted).unwrap();
+        assert_eq!(
+            loaded.fullscreen_page_start_position,
+            FullscreenPageStartPosition::Unknown
+        );
+        assert_eq!(
+            loaded.fullscreen_page_start_position.normalized(),
+            FullscreenPageStartPosition::Center
+        );
+        assert_eq!(loaded.fullscreen_page_start_position.label(), "中央");
     }
 
     #[test]

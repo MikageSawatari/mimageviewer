@@ -1926,6 +1926,20 @@ PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行
 6. 物理ピクセル境界へ整列済みの paint rect / hit rect / UV / source↔screen 写像 / total scale
 ```
 
+#### ページ切替直後の初期 pan (§1.726)
+
+`fullscreen_page_start_position` は `Center` (既定) / `ReadingStart`。後者だけが、受理済み open と
+同一画像内の受理済み分割移動で context 所有の one-shot 要求を作る。現在の表示単位を最初に描く
+frame で、固定 HUD・パネルを除いた viewport と pan 0 の canonical placement を使い、描くページの
+paint rect の和（描く白 companion を含む）から初期 pan を一度だけ求める。縦の超過は上端、横の超過は
+実効読書方向の始端へ合わせ、収まる軸の既存配置と倍率は保つ。同じ frame の最終 placement に反映する。
+
+holdover 選択中・幾何未解決なら要求を保持し、世代・anchor 不一致、利用者の位置／倍率入力、除外モード、
+close・復元・reset では退役する。高画質化や resize で再適用しない。連結読み・動画・360 度・depth・Z・分析には適用しない。
+navigation の previous holdover は capture 済みの通常 placement で前の位置を保ち、同一表示単位の
+source reload 待ちと Z holdover は既存 transform を使う。紙めくりの zoom / pan 適格条件は維持する。
+状態の所有・消去入口と検証範囲は [設計 r3](fullscreen-page-start-position-plan.md) を参照。
+
 ### 部分矩形 (content bbox) の座標系 — 2026-08-25 に分離
 
 `content_bbox` は**元画像空間**の正規化矩形である。作っているのは

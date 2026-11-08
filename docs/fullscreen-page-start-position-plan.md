@@ -1,6 +1,6 @@
 # ページ切替後の初期表示位置「中央 / 読み始め」(§1.726)
 
-- 状態: 設計 r3 (2026-11-08、設計担当 ClaudeCode)。独立設計レビュー (GPT-6.1 Sol / xhigh) r1 の P2 5 件、r2 の P2 2 件を反映 (§8)。
+- 状態: **実装途中・幾何の設計前提と現行コードの差異を確認して停止** (2026-11-08、§9)。独立実装レビュー未実施。設計 r3 (設計担当 ClaudeCode) の独立設計レビュー (GPT-6.1 Sol / xhigh) r1 の P2 5 件、r2 の P2 2 件を反映 (§8)。
 - 要望: 5ch >>739 (2026-11-07)。ズーム/フィット設定で画像が画面からはみ出すと、ページを送った先が
   中央から表示されるので、上から読みたい。拡大操作の中心点やマウスカーソルの移動を変える要望ではない。
 - 利用者決定 (backlog §1.726): 設定を追加する。既定は従来どおり「中央」。
@@ -178,7 +178,8 @@ struct FsInitialPlacementRequest {
 
 `ViewerContextBundle` へ一般の表示状態フィールドを 1 つ足すだけで、detached 述語・viewport 経路・placement・HWND には触れない。
 detached 専用の bool / Option ではなく、既存の `fs_pan` と同じ context 固有の表示状態 (憲法 §2-3 の対象外と判断)。
-独立レビューで「症状パッチではなく構造的な追加である」ことへの合意を取り、detached-rework-plan.md §11 に記録する。
+独立設計レビューで「症状パッチではなく構造的な追加である」ことに合意済み (§8)。
+変更範囲を detached-rework-plan.md §11 に記録した。実装は §9 の前提差異で停止中で、独立実装レビューでの確認は未完了。
 
 ## 8. 独立設計レビュー r1 の対応 (GPT-6.1 Sol / xhigh、2026-11-08)
 
@@ -198,4 +199,44 @@ r2 の再レビュー: P1 なし、P2 2 件。どちらもレビュー担当が�
 
 あわせて、要求構造体から未使用の `page_slice` を外し、退役 helper の呼び出し点を明記した。
 レビュー担当は、`ViewerContextBundle` への追加と holdover の描画入力の所有分離が症状パッチではなく構造的な変更であることに同意した (§7)。
+
+## 9. 実装途中の記録と設計前提の差異 (2026-11-08)
+
+設定・転送・環境設定 UI、context 所有の要求、受理済み分割移動、要求の消去入口、単ページ・見開きの初期配置、
+navigation previous の placement 再生までの未コミット差分を作成した。完成・受入済みとは扱わない。
+実装位置は `src/ui_fullscreen/initial_placement.rs` (`FsInitialPlacementRequest`、`reading_start_pan`、
+`request_fs_initial_placement` / `clear_fs_initial_placement_request` / `retire_fs_initial_placement_request` /
+`resolve_fs_initial_placement`)、`src/ui_fullscreen.rs` (`accept_fullscreen_page_slice_navigation`、
+`draw_fs_image_with_initial_placement`、`draw_fs_spread_with_placement`、
+`draw_fs_display_unit_holdover_for_selection`、`FsHoldoverTransform`)。
+
+**§2 の「最初の current frame の矩形は元寸法で決まり、高画質化後も変わらない」という前提が、通常サムネイルの単ページでは成立しない。**
+`ThumbnailState::raster_thumbnail_display_basis` (`src/grid_item.rs`) は元寸法が既知でも Single にサムネイル自身の sampler 基準を渡す。
+通常完成素材の `normal_raster_material_basis` (`src/app.rs`) も Single に完成 sampler 基準を渡す。
+`prepare_fullscreen_state_with_permission` は通常の非通過・非カラー化待ちで、完成素材が無いとき直接サムネイルを選択する。
+たとえば原寸表示で 80×120 のサムネイルから 800×1200 の完成画像へ替わると、最初の矩形が画面に収まっていても完成画像ははみ出す。
+今回の one-shot consumer は最初のサムネイルで pan 0 として消費するため、その後の完成画像は中央のままとなる。
+これはコードからの確認であり、製品起動・自動実行による再現は未確認。既存の `display_basis_tests` も通常画像の原寸は選択 texture pixel 基準という契約を明記している。
+論点を限定した別担当 (GPT-6.1 Sol / xhigh) のソース確認でも、通常の初回 open で到達可能と確認した。
+非 RAW の thumbnail fallback は許可され、初回 open は full load の完了を待たず、previous の無い frame は `Current` になる。
+1 pixel/point・viewport 600×400・thumbnail 150×200・full 1500×2000 なら、先の収まる矩形で要求が消え、後の画像上端は中央配置の -800 になる。
+この確認は設計前提だけを対象にしており、独立実装レビューの完了ではない。現時点の実描画テスト案は完成素材だけを渡しており、この thumbnail 到着順をまだ検査していない。
+
+既存の表示基準を変える、要求の消費を遅らせる、または適用仕様を見直す判断が必要になるため、実装担当は独自の補償設計を加えず停止した。
+設計担当がこの境界を決定してから実装と §6 の検証を再開する。
+追加した回帰テスト案は `src/ui_fullscreen/initial_placement/tests.rs`。テスト実行・snapshot 更新は未完了。
+`cargo check -p mimageviewer --bin mimageviewer-core` は本体 Rust 検査前に依存物の準備で失敗し、
+絞り込み nextest は依存物の初回コンパイル中に停止した。ビルド失敗を製品コードのテスト失敗とは扱わない。
+
+検証実績:
+
+- `cargo fmt` / `cargo fmt --check` / `git diff --check`: 成功。
+- `python scripts/check_ui_glyphs.py`: 危険グリフ 0。
+- `python scripts/check_site_cards.py`: 53 件、超過 0。
+- `cargo check -p mimageviewer --bin mimageviewer-core`: VLM worker 不足・TurboJPEG native build の出力先アクセス拒否で、本体 Rust の型検査前に失敗。
+- `powershell -NoProfile -File scripts/vlm-worker-identity.ps1 -RestoreBackupRepo .`: 既存バックアップを実ファイルで復元し identity 一致を確認。worker は起動していない。
+- `cargo nextest run -p mimageviewer --lib --build-jobs 2 --test-threads 2 -E 'test(~fullscreen_page_start_position) | test(~page_start_position) | test(~settings_transfer::tests::) | test(~preferences::search_index::tests::)'`: TurboJPEG native build で失敗。
+- 上記を `--build-jobs 1` にして再実行: TurboJPEG を通過、依存物の初回コンパイル中に設計前提の差異が確定したため停止。選択テストの実行前。ログは `target/1726-settings-focused.log`。
+- snapshot は既存 fixture に設定行を足したところまでで、PNG 更新・比較・目視確認は未実施。
+- full gate・build-dev・製品起動・コミットは利用者指定に従い未実施。
 

@@ -1088,6 +1088,20 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["拡大", "縮小", "倍率", "zoom"]
     ),
     entry!(
+        "spread/page-start-position",
+        SpreadMode,
+        "ページ切替後の表示位置",
+        [
+            "中央",
+            "読み始め",
+            "上端",
+            "右端",
+            "左端",
+            "はみ出す",
+            "初期位置"
+        ]
+    ),
+    entry!(
         "spread/specified-scale",
         SpreadMode,
         "指定サイズ",
@@ -1937,6 +1951,18 @@ mod tests {
                 search_preferences(query, test_tree_position)
                     .iter()
                     .any(|entry| entry.anchor == "spread/auto-view-trim"
+                        && entry.page == PreferencesPage::SpreadMode)
+            );
+        }
+    }
+
+    #[test]
+    fn page_start_position_search_reaches_its_anchor() {
+        for query in ["ページ切替後", "読み始め", "初期位置", "はみ出す 中央"] {
+            assert!(
+                search_preferences(query, test_tree_position)
+                    .iter()
+                    .any(|entry| entry.anchor == "spread/page-start-position"
                         && entry.page == PreferencesPage::SpreadMode)
             );
         }
