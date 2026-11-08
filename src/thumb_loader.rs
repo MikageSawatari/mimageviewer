@@ -8366,6 +8366,17 @@ mod tests {
             catalog.load_source_dims_matching(7, 9).unwrap()[&key],
             Some((12, 8))
         );
+        // The PDF page box (1/1000 point) is kept alongside the raster dimensions.
+        let conn = rusqlite::Connection::open(crate::catalog::db_path_for(tmp.path(), tmp.path()))
+            .unwrap();
+        let layout: (Option<u32>, Option<u32>) = conn
+            .query_row(
+                "SELECT layout_width, layout_height FROM page_dims WHERE filename = ?1",
+                [&key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(layout, (Some(120_000), Some(80_000)));
         assert!(cache.read().unwrap().is_empty());
     }
 

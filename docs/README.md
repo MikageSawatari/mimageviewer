@@ -200,6 +200,7 @@
 | ドキュメント | 内容 |
 | --- | --- |
 | [catalog-design.md](catalog-design.md) | サムネイルキャッシュ DB の設計 |
+| [book-thumb-cover-only-plan.md](book-thumb-cover-only-plan.md) | §1.452 本の中のページは寸法だけ記録し表紙だけ保存する設定、`page_dims` 表、書き戻しの stamp 条件 |
 | [dct-scale-plan.md](dct-scale-plan.md) | TurboJPEG の DCT スケールデコードによるサムネ生成高速化。倍率選択と、圧縮入力サイズによるフォールバック条件 |
 | [scroll-visibility-priority-plan.md](scroll-visibility-priority-plan.md) | スクロール停止後に可視サムネのジョブを優先レーンへ昇格させる仕組みと perf 計装 |
 | [prefetch-suppression-during-scroll-plan.md](prefetch-suppression-during-scroll-plan.md) | スクロール中 / 可視待ち中に prefetch を enqueue しない判定と、永久 stall を防ぐ backstop |
