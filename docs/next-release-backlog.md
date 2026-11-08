@@ -41,7 +41,7 @@
 
 ### 1.741 Everything 検索で作った ZIP・PDF のサムネイルが、親フォルダの代表サムネイルに使われない (検索を閉じると消える) — 5ch >>746 (2026-11-08)
 
-- 状態: **未着手・利用者決定 2026-11-08: 起票して設計へ**。[>>746](https://egg.5ch.io/test/read.cgi/software/1782419551/746) は、Everything 検索で複数フォルダの ZIP のサムネイルを一気に作ったのに、フォルダのサムネイルには使われず、1 つずつ開かないと作られないのか、という質問。
+- 状態: **未着手・利用者決定 2026-11-08: 起票して設計へ**。5ch へは 2026-11-09 に利用者が返信済み (検証用 PC で報告どおりだったこと、検索で作ったサムネイルが検索を閉じると残らない作りであること、改善を検討すること)。[>>746](https://egg.5ch.io/test/read.cgi/software/1782419551/746) は、Everything 検索で複数フォルダの ZIP のサムネイルを一気に作ったのに、フォルダのサムネイルには使われず、1 つずつ開かないと作られないのか、という質問。
 - 実機確認 (サブ PC 担当、依頼 23、build-1731 = v5.0.0 + §1.731 修正、`C:\miv-subpc\results-23\`): どのフォルダも開かずに Ctrl+R で `thumb746\ ext:zip` を検索 → 6 個の ZIP の表紙が約 1 秒で揃った。検索を閉じて親 `root` を開く → F01〜F06 はすべてフォルダのアイコン (直後・10 秒後とも)。F01 を開いて戻る → F01 だけ表紙。「最新の情報に更新」後も F02〜F06 はアイコンのまま。ログでは `resolve_folder_thumb_image` が F01〜F06 とも `<none>`、F01 を開いた後だけ `<cached-pin:zipthumb:vol01.zip>`。ERROR / WARN / panic なし。
 - 原因 (設計担当がサブ PC のキャッシュの写しを読んで確認、ハッシュでどのフォルダの DB かを照合):
   - Ctrl+R の検索結果は、**検索を始めたときに開いていたフォルダ** (今回は `OneDrive\Desktop`) の catalog DB に、フルパスのキー `zipthumb:C:\...\F01\vol01.zip` で保存された (`use_full_path_cache_keys` が `items_are_global_search_view` で true、catalog folder は `current_folder` のまま)。
