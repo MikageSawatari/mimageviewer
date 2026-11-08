@@ -44725,7 +44725,7 @@ impl App {
                     zero_input.placement =
                         if singleton_placement == SingletonSpreadPlacement::Center {
                             ResolvedDisplayPlacement::Normal {
-                                zoom_pan: Some((request.base_zoom, egui::Vec2::ZERO)),
+                                zoom_pan: Some((request.origin_zoom, egui::Vec2::ZERO)),
                             }
                         } else {
                             ResolvedDisplayPlacement::SingletonSpread {
@@ -44734,7 +44734,7 @@ impl App {
                                     self.settings.spread_page_gap_px.min(200) as f32,
                                     ui.ctx().pixels_per_point(),
                                 ),
-                                zoom_pan: Some((request.base_zoom, egui::Vec2::ZERO)),
+                                zoom_pan: Some((request.origin_zoom, egui::Vec2::ZERO)),
                             }
                         };
                     let zero = resolve_fs_image_transform(zero_input, layout_source_size)?;
@@ -51138,9 +51138,9 @@ impl App {
                         resolve_layout(
                             self,
                             ResolvedDisplayPlacement::Normal {
-                                zoom_pan: Some((request.base_zoom, egui::Vec2::ZERO)),
+                                zoom_pan: Some((request.origin_zoom, egui::Vec2::ZERO)),
                             },
-                            Some((request.base_zoom, egui::Vec2::ZERO)),
+                            Some((request.origin_zoom, egui::Vec2::ZERO)),
                         )
                         .2
                     });

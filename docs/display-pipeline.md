@@ -1936,7 +1936,8 @@ paint rect の和（描く白 companion を含む）から初期 pan を求め�
 
 素材の `FullscreenPageMaterialKind` は通常サムネイル・通過 rendition・未完成 final／完成待ち代役を
 `Provisional`、完成素材を `Complete` として生成元・選択元で付け、Native 化・capture 後も保持する。
-仮素材の frame は配置後の zoom/pan を要求の base へ更新して保持し、単ページならそのページ、見開きなら
+要求作成時の `origin_zoom` / `origin_pan` は幾何と収まる軸の配置基準として保つ。仮素材の frame は
+配置後の zoom/pan を CAS 用の `applied_zoom` / `applied_pan` だけへ更新して要求を保持し、単ページならそのページ、見開きなら
 全ページの実際に準備できた素材が完成した最初の current frame で消す。原寸では素材差し替えで矩形が変わる
 既存契約を保ち、完成画像の最初の frame も読み始めへ揃える。準備段で代役へ fallback したら確定しない。
 

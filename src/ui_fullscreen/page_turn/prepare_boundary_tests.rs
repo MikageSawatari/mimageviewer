@@ -952,8 +952,8 @@ fn initial_placement_rejected_native_pair_commits_only_actual_thumbnail_geometry
             let request = app
                 .fs_initial_placement_request
                 .expect("actual fallback is provisional");
-            assert_eq!(request.base_pan, egui::Vec2::ZERO);
-            assert_eq!(request.base_zoom, app.fs_zoom);
+            assert_eq!(request.applied_pan, egui::Vec2::ZERO);
+            assert_eq!(request.applied_zoom, app.fs_zoom);
         });
         let painted = texture_ids_in_output(&output);
         assert!(thumbnails.iter().all(|id| painted.contains(id)));
@@ -1045,7 +1045,7 @@ fn initial_placement_one_rejected_native_side_recomputes_the_actual_mixed_unit()
             let request = app
                 .fs_initial_placement_request
                 .expect("one provisional side keeps the unit request");
-            assert_eq!(request.base_pan, app.fs_pan);
+            assert_eq!(request.applied_pan, app.fs_pan);
         });
         let painted = texture_ids_in_output(&output);
         assert!(painted.contains(&thumbnails[0]));

@@ -9,8 +9,12 @@ mod tests;
 pub(crate) struct FsInitialPlacementRequest {
     pub(crate) items_generation: u64,
     pub(crate) anchor_idx: usize,
-    pub(crate) base_zoom: f32,
-    pub(crate) base_pan: egui::Vec2,
+    /// Immutable placement basis captured at accepted page entry.
+    pub(crate) origin_zoom: f32,
+    pub(crate) origin_pan: egui::Vec2,
+    /// Last automatic placement, used only to detect an intervening writer.
+    pub(crate) applied_zoom: f32,
+    pub(crate) applied_pan: egui::Vec2,
 }
 
 /// `unit` is the union of the canonical, trimmed paint rects at pan zero.
@@ -18,9 +22,9 @@ fn reading_start_pan(
     unit: egui::Rect,
     viewport: egui::Rect,
     direction: ReadingDirection,
-    base_pan: egui::Vec2,
+    origin_pan: egui::Vec2,
 ) -> egui::Vec2 {
-    let mut pan = base_pan;
+    let mut pan = origin_pan;
     if unit.height() > viewport.height() {
         pan.y = viewport.top() - unit.top();
     }
@@ -45,8 +49,10 @@ impl App {
                 .then_some(FsInitialPlacementRequest {
                     items_generation: self.items_generation,
                     anchor_idx,
-                    base_zoom: self.fs_zoom,
-                    base_pan: self.fs_pan,
+                    origin_zoom: self.fs_zoom,
+                    origin_pan: self.fs_pan,
+                    applied_zoom: self.fs_zoom,
+                    applied_pan: self.fs_pan,
                 });
     }
 
@@ -83,8 +89,8 @@ impl App {
         };
         if request.items_generation != self.items_generation
             || request.anchor_idx != anchor_idx
-            || self.fs_zoom != request.base_zoom
-            || self.fs_pan != request.base_pan
+            || self.fs_zoom != request.applied_zoom
+            || self.fs_pan != request.applied_pan
         {
             self.clear_fs_initial_placement_request();
             return None;
@@ -101,7 +107,7 @@ impl App {
             self.spread_mode
                 .reading_direction()
                 .unwrap_or(self.reading_direction),
-            request.base_pan,
+            request.origin_pan,
         ))
     }
 
@@ -126,8 +132,8 @@ impl App {
         self.fs_initial_placement_request = match material_kind {
             FullscreenPageMaterialKind::Complete => None,
             FullscreenPageMaterialKind::Provisional => Some(FsInitialPlacementRequest {
-                base_zoom: self.fs_zoom,
-                base_pan: pan,
+                applied_zoom: self.fs_zoom,
+                applied_pan: pan,
                 ..request
             }),
         };

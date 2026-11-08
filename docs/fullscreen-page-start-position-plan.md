@@ -1,6 +1,6 @@
 # ページ切替後の初期表示位置「中央 / 読み始め」(§1.726)
 
-- 状態: **r4 実装済み・独立実装レビュー待ち** (2026-11-09、§9)。設計担当の §10 の決定を実装し、core check・絞り込み nextest・UI snapshot を通過した。独立設計レビュー (GPT-6.1 Sol / xhigh) r1 の P2 5 件、r2 の P2 2 件を反映した r3 の記録は §8。
+- 状態: **r4 独立実装レビュー P2 修正済み・再確認待ち** (2026-11-09、§9.4)。設計担当の §10 の決定を実装し、core check・絞り込み nextest・UI snapshot を通過した。独立設計レビュー (GPT-6.1 Sol / xhigh) r1 の P2 5 件、r2 の P2 2 件を反映した r3 の記録は §8。
 - 要望: 5ch >>739 (2026-11-07)。ズーム/フィット設定で画像が画面からはみ出すと、ページを送った先が
   中央から表示されるので、上から読みたい。拡大操作の中心点やマウスカーソルの移動を変える要望ではない。
 - 利用者決定 (backlog §1.726): 設定を追加する。既定は従来どおり「中央」。
@@ -79,8 +79,10 @@ viewer context ごとの 1 フィールド (仮名 `fs_initial_placement_request
 struct FsInitialPlacementRequest {
     items_generation: u64,      // 要求を作った context の items 世代
     anchor_idx: usize,          // 開いた (切り替えた) ページ
-    base_zoom: f32,             // 要求作成時の fs_zoom (open では 1.0)
-    base_pan: egui::Vec2,       // 要求作成時の fs_pan (open では ZERO)
+    origin_zoom: f32,           // 要求作成時の fs_zoom (open では 1.0)
+    origin_pan: egui::Vec2,     // 要求作成時の fs_pan (open では ZERO)
+    applied_zoom: f32,          // 最後に自動適用した倍率 (初期値は origin_zoom)
+    applied_pan: egui::Vec2,    // 最後に自動適用した位置 (初期値は origin_pan)
 }
 ```
 
@@ -89,7 +91,7 @@ struct FsInitialPlacementRequest {
   分割片側移動の要求は、その移動後の slice を描く frame で解く)。
 - **解く (唯一の consumer)**: 単ページ / 見開きの paint で、placement を解く**直前**に 1 回。条件:
   1. 要求の items 世代・anchor が今の frame の表示単位と一致する
-  2. `fs_zoom == base_zoom` かつ `fs_pan == base_pan` (作成後に誰かが位置・倍率を動かしていない。補助条件で、主は下の明示消去)
+  2. `fs_zoom == applied_zoom` かつ `fs_pan == applied_pan` (最後の自動適用後に誰かが位置・倍率を動かしていない。補助条件で、主は下の明示消去)
   3. この frame で選んだ表示単位が current である (holdover を選んでいない。`selected_display_unit.is_current()` を両描画経路へ渡す。
      current を描いた上に holdover を重ねる経路があるので、`CurrentItem` かどうかでは判定しない。紙めくり条件を含む `live_eligible` は代用しない)
   4. **実際に選んだ素材と今の fit / view から、この表示単位の幾何を解決できた** (`MaterialDisplayBasis` の single / spread / specified の契約に従う)
@@ -97,7 +99,7 @@ struct FsInitialPlacementRequest {
   1・2 が不成立なら要求を捨てる。3・4 が不成立なら要求を残し、次の frame で再評価する
   (holdover 中、寸法が後着する PDF・RAW 等。条件がそろった最初の frame で一度だけ確定する)。
   除外モード (下の「消す」) は通常 paint へ入らない場合があるので、その判定は paint の外で行う。
-  成立したら `base_zoom`・pan 0 で幾何を解き、§2 で pan を求めて `fs_pan` に入れ、要求を消し、同じ frame の placement をその pan で解く。
+  成立したら `origin_zoom`・pan 0 で幾何を解き、収まる軸は `origin_pan` を保って §2 で pan を求めて `fs_pan` に入れ、同じ frame の placement をその pan で解く。要求の保持・確定は §10 に従う。
   **中央で 1 frame 描いてから跳ぶ見え方を作らない。**
 - **消す**: 解いたとき、条件 1・2 不成立のとき、フルスクリーンを閉じたとき、items 世代の交代、
   および利用者の位置・倍率入力の入口 (`set_fs_pan_from_input`、ホイール拡大、キー拡大、ピンチ、ナビゲータ、ダブルクリック表示リセット、
@@ -110,7 +112,7 @@ struct FsInitialPlacementRequest {
   比較・オーバーレイ編集・表示トリム編集中、または current が page renderer の描かない項目 (動画・音声) のとき、要求を捨てる。
   設定変更時に全 context を走査しない (各 context が自分の frame で退役する)。
   条件 2 があるので、消し忘れた書き手があっても「人が動かした位置を初期位置で上書きする」ことは起きない。
-  明示の消去は、後でたまたま値が base に戻った場合の取り違えを防ぐため。
+  明示の消去は、後でたまたま値が applied に戻った場合の取り違えを防ぐため。
 - context 固有: `ViewerContextBundle` へ `fs_zoom` / `fs_pan` と同じく入れ、swap / 既定値 / destructure の全箇所を揃える。
   main / F12 detached / 独立 viewer のそれぞれで、自分の context の要求だけを作り・解き・消す。兄弟 context の pan を変えない。
 
@@ -181,7 +183,7 @@ struct FsInitialPlacementRequest {
 `ViewerContextBundle` へ一般の表示状態フィールドを 1 つ足すだけで、detached 述語・viewport 経路・placement・HWND には触れない。
 detached 専用の bool / Option ではなく、既存の `fs_pan` と同じ context 固有の表示状態 (憲法 §2-3 の対象外と判断)。
 独立設計レビューで「症状パッチではなく構造的な追加である」ことに合意済み (§8)。
-変更範囲を detached-rework-plan.md §11 に記録した。§10 の決定を実装・自動検証済みで、全体の独立実装レビューでの確認は未完了。
+変更範囲を detached-rework-plan.md §11 に記録した。§10 の決定を実装・自動検証済みで、全体の独立実装レビューの P2 1 件を修正した (§9.4)。再確認は未完了。
 
 ## 8. 独立設計レビュー r1 の対応 (GPT-6.1 Sol / xhigh、2026-11-08)
 
@@ -248,7 +250,7 @@ navigation previous の placement 再生までの未コミット差分を作成�
 
 ### 9.2 r4 実装・検証記録 (2026-11-09)
 
-- 状態: **実装済み・独立実装レビュー待ち**。以下は今回完了した内容と実行結果。製品起動・実機確認は未実施。
+- 当時の状態: **実装済み・独立実装レビュー待ち**。以下は r4 実装時の内容と実行結果。以後の P2 修正は §9.4。製品起動・実機確認は未実施。
 
 `FullscreenPageMaterialKind::{Complete, Provisional}` を `src/gpu_lanczos.rs` の通常素材・presentation 素材に保持する。
 `src/app.rs` の通常サムネイル・通過素材の生成元（RAW 早期分岐・キャッシュ再利用を含む）で仮素材を明示し、
@@ -315,13 +317,15 @@ cargo nextest run -p mimageviewer --lib --build-jobs 4 --test-threads 4 -E 'test
 
 ### 9.3 追加・拡充した回帰名
 
-`initial_placement_` 系は 46 件（前回の候補を含む）。全件を上記の filter で実行した。
+`initial_placement_` 系は 48 件（前回の候補と §9.4 の追加 2 件を含む）。全件を同じ filter で実行した。
 
 ```text
 initial_placement_r4_original_thumbnail_then_full_aligns_first_complete_frame
 initial_placement_r4_incomplete_final_retains_until_actual_completed_ai_material
 initial_placement_r4_width_thumbnail_then_full_keeps_initial_pan
 initial_placement_r4_manual_pan_during_thumbnail_survives_full_arrival
+initial_placement_single_provisional_resize_restores_origin_before_complete_arrival
+initial_placement_spread_provisional_resize_restores_origin_before_complete_arrival
 initial_placement_r4_failed_full_load_keeps_stable_provisional_pan
 initial_placement_r4_spread_waits_until_both_actual_materials_are_complete
 initial_placement_r4_actual_passthrough_producer_keeps_request_until_full_arrives
@@ -378,6 +382,48 @@ pdf_metadata_readoption_retires_only_dependent_live_passthrough_materials
 fullscreen_fit_cycle_single_mode_dark
 ```
 
+### 9.4 独立実装レビュー P2: 配置基準と CAS の分離 (2026-11-09)
+
+独立実装レビュー (GPT-6.1 Sol / xhigh) の P2 1 件を設計担当がコードで確認し、修正を指示した。
+仮表示の適用値を次の配置基準にも使っていたため、表示領域の拡大で収まった軸にも仮表示の pan が残っていた。
+`src/ui_fullscreen/initial_placement.rs` の要求を不変の `origin_zoom` / `origin_pan` と CAS 用の
+`applied_zoom` / `applied_pan` に分け、仮表示では後者だけを更新する。
+単ページ・見開きの pan 0 の幾何は `src/ui_fullscreen.rs` で毎回 `origin_zoom` から解き、収まる軸は `origin_pan` へ戻す。
+
+`initial_placement_single_provisional_resize_restores_origin_before_complete_arrival` と
+`initial_placement_spread_provisional_resize_restores_origin_before_complete_arrival` を追加した。
+実際のサムネイル描画で縦にはみ出した後、完成素材の到着前に viewport を拡大し、収まった軸が origin に戻ること、
+その frame では要求が残り、完成素材を描く frame で同じ位置に確定して消えることを検査する。
+open 相当の origin pan 0 と、非ゼロの origin pan の両方を通す。
+既存の `initial_placement_r4_manual_pan_during_thumbnail_survives_full_arrival` と CAS 不成立の回帰は維持し、
+既存テストの期待値を弱める変更はしていない。要求生成時の origin の検査も追加した。
+
+- 追加 2 件の先行実行は成功 (2.652 秒、コンパイル 3 分 26 秒)。ログ: `target/1726-r4-p2-resize.log`。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+cargo nextest run -p mimageviewer --lib --build-jobs 4 --test-threads 4 -E 'test(~provisional_resize_restores_origin)'
+```
+
+- 前回と同じ絞り込み範囲は **235 件成功・16,658 件除外** (前回の 233 件 + 追加 2 件、実行 71.663 秒、再コンパイル 3 分 10 秒)。
+  ログ: `target/1726-r4-p2-focused.log`、run ID: `27924f05-301b-4c37-8680-fc02d57f1a2e`。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+cargo nextest run -p mimageviewer --lib --build-jobs 4 --test-threads 4 -E 'test(~initial_placement) | test(~page_start_position) | test(~settings_transfer) | test(~search_index) | (test(~viewer_context_registry) & (test(~bundle) | test(~swap) | test(~context_async_owner_registry))) | test(~holdover) | test(~page_turn_submission_tests) | test(~page_material_kind) | test(~pdf_metadata_readoption) | test(~source_absent_changed_view_or_prepare_key_uses_existing_fallback) | test(~source_absent_stable_view_keeps_native_single_and_pair)'
+```
+
+- core check は成功 (40.84 秒)。ログ: `target/1726-r4-p2-core.log`。既存 warning は残る。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+cargo check -p mimageviewer --bin mimageviewer-core --jobs 4
+```
+
+- 最後に `$env:MSBUILDDISABLENODEREUSE='1'; cargo fmt` (引数なし) を実行して成功した。
+  整形後の Rust 変更は整形のみで、機能の追加変更はない。`git diff --check` も成功した。
+- UI・公開文言は変更していない。製品起動・full gate・build-dev・コミットは行わない。
+
 ## 10. r4: 仮の素材の frame と確定 (設計担当の決定、2026-11-08)
 
 §9 の差異への対応。§2 の「最初の current frame で一度だけ確定」を次の 2 段に置き換える。§3 の条件 1〜4・消去・退役はそのまま。
@@ -385,7 +431,9 @@ fullscreen_fit_cycle_single_mode_dark
 - **仮の段階**: current frame で、表示単位のどれかのページが**完成素材ではない素材** (通常サムネイル、通過 rendition、
   カラー化待ちの代役など、`prepare_fullscreen_state_with_permission` が完成素材の代わりに選んだもの) で描かれるとき、
   その frame の幾何で §2 の pan を求めて `fs_pan` に入れ、同じ frame の placement をその pan で解く。**要求は消さない**。
-  要求の `base_zoom` / `base_pan` をいま入れた値へ更新する (以後の利用者入力は CAS と明示消去の両方で検出される)。
+  要求の `applied_zoom` / `applied_pan` だけをいま入れた値へ更新する (以後の利用者入力は CAS と明示消去の両方で検出される)。
+  配置基準の `origin_zoom` / `origin_pan` は要求作成時の値を保ち、毎回の幾何と収まる軸の維持値に使う。
+  CAS の比較には最後の自動適用値 `applied_zoom` / `applied_pan` を使い、配置基準と分ける。
 - **確定**: 表示単位の全ページが完成素材で描かれる最初の current frame で、同じく pan を求めて入れ、要求を消す。以後は再計算しない (§2 のとおり)。
 - 「完成素材かどうか」は、描画 resolver が実際に選んだ素材の種類 (型付きの選択結果) で判定する。寸法の比較・ページ番号・ログ文字列で推測しない。
   未完成 final 合成や通常 final の完成待ちに選んだ下段素材も仮素材とし、完成素材の最初の frame で確定する。
@@ -401,5 +449,6 @@ fullscreen_fit_cycle_single_mode_dark
   「サムネイルでも元寸法の基準で描く」案は既存の表示基準 (`display_basis_tests` の契約) を変えるので採らない。
 - 追加の回帰: 原寸で thumbnail 150×200 → full 1500×2000 (viewport 600×400) の到着順で、完成画像の最初の frame が上端にあること。
   幅 fit で thumbnail → full の間に pan が変わらないこと。仮の段階で利用者がパンしたら、完成素材の到着後もその位置のままであること。
+  単ページ・見開きとも、仮表示中の viewport 拡大で収まった軸が origin の値へ戻り、その後に完成素材が来てもその位置で確定すること。
   読み込み失敗で要求が残っても pan が動かないこと。
 

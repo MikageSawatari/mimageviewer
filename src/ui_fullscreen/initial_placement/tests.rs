@@ -170,6 +170,15 @@ fn paint_prepared_single(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
 ) -> DisplayedImageTransform {
+    paint_prepared_single_in_viewport(app, ui, ctx, arrival_viewport())
+}
+
+fn paint_prepared_single_in_viewport(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    rect: egui::Rect,
+) -> DisplayedImageTransform {
     let idx = app.fullscreen_idx.unwrap();
     let state = app.prepare_fullscreen_state(ctx, idx, FsPageTurnDecision::normal());
     let selected = state
@@ -191,7 +200,7 @@ fn paint_prepared_single(
     let transform = app
         .draw_fs_image_with_initial_placement(
             ui,
-            arrival_viewport(),
+            rect,
             idx,
             source_size,
             FsPageLayoutSource::CurrentItem,
@@ -223,6 +232,143 @@ fn paint_prepared_single(
         .begin(FullscreenPageLayoutKind::Single);
     app.fullscreen_page_layout.push(transform);
     transform
+}
+
+fn placement_frame_in_rect(
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    mut paint: impl FnMut(&mut egui::Ui, &egui::Context),
+) {
+    crate::test_ui::headless_paint_output(ctx.run_pass(
+        egui::RawInput {
+            screen_rect: Some(rect),
+            ..Default::default()
+        },
+        |ctx| {
+            ctx.root_ui(|root| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(root, |ui| paint(ui, ctx));
+            })
+        },
+    ))
+    .drop_without_applying_deltas();
+}
+
+#[test]
+fn initial_placement_single_provisional_resize_restores_origin_before_complete_arrival() {
+    let small = arrival_viewport();
+    let large = egui::Rect::from_min_size(small.min, egui::vec2(600.0, 1000.0));
+    for origin_pan in [egui::Vec2::ZERO, egui::vec2(17.0, 23.0)] {
+        let ctx = egui::Context::default();
+        let mut app = thumbnail_arrival_app(&ctx, FullscreenFitMode::Width);
+        app.fs_pan = origin_pan;
+        app.request_fs_initial_placement(0);
+        placement_frame_in_rect(&ctx, small, |ui, ctx| {
+            let t = paint_prepared_single_in_viewport(&mut app, ui, ctx, small);
+            close_to(t.paint_rect.height(), 800.0);
+            close_to(t.paint_rect.top(), small.top());
+        });
+        let request = app.fs_initial_placement_request.unwrap();
+        assert_eq!(request.origin_pan, origin_pan);
+        close_to(request.applied_pan.y, 200.0);
+        assert_eq!(request.applied_pan, app.fs_pan);
+
+        placement_frame_in_rect(&ctx, large, |ui, ctx| {
+            let t = paint_prepared_single_in_viewport(&mut app, ui, ctx, large);
+            assert!(t.paint_rect.height() < large.height());
+            close_to(t.paint_rect.center().y, large.center().y + origin_pan.y);
+            assert!(t.paint_rect.bottom() <= large.bottom());
+            assert_eq!(app.fs_pan, origin_pan);
+            let request = app.fs_initial_placement_request.expect("still provisional");
+            assert_eq!(request.origin_pan, origin_pan);
+            assert_eq!(request.applied_pan, origin_pan);
+            assert_eq!((request.origin_zoom, request.applied_zoom), (1.0, 1.0));
+        });
+        install_arriving_full(&mut app, &ctx, 0);
+        placement_frame_in_rect(&ctx, large, |ui, ctx| {
+            let t = paint_prepared_single_in_viewport(&mut app, ui, ctx, large);
+            assert_eq!(app.fs_pan, origin_pan);
+            close_to(t.paint_rect.center().y, large.center().y + origin_pan.y);
+            assert!(t.paint_rect.bottom() <= large.bottom());
+            assert!(app.fs_initial_placement_request.is_none());
+        });
+    }
+}
+
+#[test]
+fn initial_placement_spread_provisional_resize_restores_origin_before_complete_arrival() {
+    let small = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 200.0));
+    let large = egui::Rect::from_min_size(small.min, egui::vec2(600.0, 1000.0));
+    for origin_pan in [egui::Vec2::ZERO, egui::vec2(17.0, 23.0)] {
+        let ctx = egui::Context::default();
+        let mut app = thumbnail_arrival_app(&ctx, FullscreenFitMode::Width);
+        app.spread_mode = SpreadMode::Ltr;
+        let texture = ctx.load_texture(
+            "origin-spread-thumbnail",
+            egui::ColorImage::filled([150, 200], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        app.thumbnails[1] = ThumbnailState::loaded_raster(
+            texture,
+            crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+                evaluated_display_px: 200,
+            },
+            false,
+            200,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((1500, 2000)),
+            None,
+        );
+        app.record_page_dims_for_spread(1, (1500, 2000));
+        app.fs_pan = origin_pan;
+        app.request_fs_initial_placement(0);
+        let unit_rect = |app: &App| {
+            app.fullscreen_page_layout
+                .page_by_idx(0)
+                .unwrap()
+                .transform
+                .paint_rect
+                .union(
+                    app.fullscreen_page_layout
+                        .page_by_idx(1)
+                        .unwrap()
+                        .transform
+                        .paint_rect,
+                )
+        };
+        placement_frame_in_rect(&ctx, small, |ui, ctx| {
+            paint_spread(&mut app, ui, ctx, small, true);
+            assert!(unit_rect(&app).height() > small.height());
+            close_to(unit_rect(&app).top(), small.top());
+        });
+        let request = app.fs_initial_placement_request.unwrap();
+        assert_eq!(request.origin_pan, origin_pan);
+        assert!(request.applied_pan.y > origin_pan.y);
+        assert_eq!(request.applied_pan, app.fs_pan);
+        placement_frame_in_rect(&ctx, large, |ui, ctx| {
+            paint_spread(&mut app, ui, ctx, large, true);
+            let unit = unit_rect(&app);
+            assert!(unit.height() < large.height());
+            close_to(unit.center().y, large.center().y + origin_pan.y);
+            assert!(unit.bottom() <= large.bottom());
+            assert_eq!(app.fs_pan, origin_pan);
+            let request = app
+                .fs_initial_placement_request
+                .expect("both pages still provisional");
+            assert_eq!(request.origin_pan, origin_pan);
+            assert_eq!(request.applied_pan, origin_pan);
+        });
+        install_arriving_full(&mut app, &ctx, 0);
+        install_arriving_full(&mut app, &ctx, 1);
+        placement_frame_in_rect(&ctx, large, |ui, ctx| {
+            paint_spread(&mut app, ui, ctx, large, true);
+            assert_eq!(app.fs_pan, origin_pan);
+            close_to(unit_rect(&app).center().y, large.center().y + origin_pan.y);
+            assert!(unit_rect(&app).bottom() <= large.bottom());
+            assert!(app.fs_initial_placement_request.is_none());
+        });
+    }
 }
 
 #[test]
@@ -384,7 +530,8 @@ fn initial_placement_r4_width_thumbnail_then_full_keeps_initial_pan() {
     let provisional_request = app
         .fs_initial_placement_request
         .expect("provisional request remains");
-    assert_eq!(provisional_request.base_pan, provisional_pan);
+    assert_eq!(provisional_request.applied_pan, provisional_pan);
+    assert_eq!(provisional_request.origin_pan, egui::Vec2::ZERO);
     install_arriving_full(&mut app, &ctx, 0);
     frame(&ctx, |ui, ctx| {
         close_to(
@@ -619,7 +766,7 @@ fn initial_placement_rejected_native_uses_fitting_thumbnail_without_committing_c
         let request = app
             .fs_initial_placement_request
             .expect("fallback is still provisional");
-        assert_eq!(request.base_pan, egui::Vec2::ZERO);
+        assert_eq!(request.applied_pan, egui::Vec2::ZERO);
     });
     let painted_ids: Vec<_> = output
         .shapes
@@ -874,7 +1021,11 @@ fn initial_placement_accepted_open_creates_request_after_resetting_transform() {
             assert_eq!(request.anchor_idx, 1);
             assert_eq!(request.items_generation, app.items_generation);
             assert_eq!(
-                (request.base_zoom, request.base_pan),
+                (request.origin_zoom, request.origin_pan),
+                (1.0, egui::Vec2::ZERO)
+            );
+            assert_eq!(
+                (request.applied_zoom, request.applied_pan),
                 (1.0, egui::Vec2::ZERO)
             );
         }
@@ -1676,8 +1827,10 @@ fn initial_placement_slideshow_same_image_slice_creates_request_without_reopenin
         .fs_initial_placement_request
         .expect("accepted same-image slideshow half");
     assert_eq!(request.anchor_idx, 0);
-    assert_eq!(request.base_zoom, 2.0);
-    assert_eq!(request.base_pan, egui::vec2(13.0, 17.0));
+    assert_eq!(request.origin_zoom, 2.0);
+    assert_eq!(request.origin_pan, egui::vec2(13.0, 17.0));
+    assert_eq!(request.applied_zoom, 2.0);
+    assert_eq!(request.applied_pan, egui::vec2(13.0, 17.0));
 }
 
 #[test]
