@@ -70,7 +70,7 @@
 | [v3.7.0-input-and-still-seek-plan.md](v3.7.0-input-and-still-seek-plan.md) | v3.7.0 の動画ホイール・マウスボタン割り当て、段階別シーク秒数、詳細表示起点の不具合と静止画サムネイル列5段階の実装計画 |
 | [release-check-automation-plan.md](release-check-automation-plan.md) | **2026-10-11利用者採用**。毎リリースのReleaseChecks suite（隔離seed、5 idle、cached／uncached perf）、証拠・既知startup gapの上限500ms・foreground条件・採用run記録。手動／実データ確認の範囲も維持 |
 | [idle-health-check.md](idle-health-check.md) | ReleaseChecks suiteを正規手順とする静止／背面／動画ピン／tray読込中・完了後の条件と判定値。従来の手動scriptはfallback／診断 |
-| [nightly-combination-test-plan.md](nightly-combination-test-plan.md) | **設計案・レビュー前・未実装**。サブPCのWindows Sandboxで、設定（pairwise）×内容×操作の組み合わせを夜間に無人で流す試験。Sandbox内の無人入力の確認記録、生成器・判定・縮小・朝の報告、Claudeの役割、利用者判断事項 |
+| [nightly-combination-test-plan.md](nightly-combination-test-plan.md) | **設計案R3・独立レビュー2回（ACCEPT WITH CHANGES反映）・未実装**。サブPCのWindows Sandboxで、設定（pairwise）×内容×操作の組み合わせを夜間に無人で流す試験。Sandbox内の無人入力の確認記録、生成器・判定・縮小・朝の報告、Claudeの役割、利用者判断事項 |
 | [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md) | §1.197 の実アプリ自動検証。診断portable、複数窓PDF、静止画pointer、動画の実OSマウス入力の段階と検証範囲 |
 | [interactive-release-verification.md](interactive-release-verification.md) | 実アプリ起動・操作テストはリリース前等の検証枠で、内容・所要時間を示し利用者の明示了承後に実行する運用 |
 | [v3.7.0-priority-work.md](v3.7.0-priority-work.md) | §1.198 / §1.197 / §1.195 のコード照合、担当移行、設計判断、実行済み検証の台帳 |
