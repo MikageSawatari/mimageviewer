@@ -7178,3 +7178,16 @@ embedded root 入力は通常時／page-turn barrier 中ともグリッドの ke
 Terminal capture 前から失効していた帰還 plan についても、teardown 宛先を導出する時点で
 配送と同じ currentness helper を使い、CurrentList の Bookmark 方針を適用する。
 保存済み recipe は再計画せず後段で破棄する。独立 reviewer はこの限定補修も ACCEPT と確認した。
+
+#### S1 実装レビュー R2: reader 受理が終わらせる Zip 帰還の寿命
+
+Terminal nav を take 後、同じ階層の reader を開いてから旧 nav を適用すると、tree／Chosen だけの検証では
+後発 reader の items が親一覧に置換される P2 を確認した。既存 close slot の排他的 Issued owner に
+唯一の plan と strong identity を移し、nav は phase と Weak ticket だけを持つ。
+共通 open の既存 None→Some 受理境界が現在の context の Zip 帰還だけを終端する。
+通常のページ送り、兄弟 context の reader 受理、拒否／defer はその owner を終了しない。
+Issued 中の terminal teardown も保存済み plan を使い、consumer は exact owner を一回消費してから plan を検証する。
+nav の全 drop は ticket の終了であり、新しい close を妨げない。新しい App field／flag／timer は追加しない。
+独立 Sol/xhigh reviewer はこの所有境界の修正に合意した。Direct にもある既存の同型穴は報告し、今回修正しない。
+detached 述語・registry 本体・viewport identity／HWND／rect／placement／timer は変更しない。
+検証結果は [内部本計画 §9](archive-inner-book-open-return-plan.md) に記録する。

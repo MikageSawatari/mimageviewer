@@ -18,19 +18,65 @@ pub(crate) enum ZipDirActivationOutcome {
 
 #[derive(Clone, Debug)]
 pub(crate) enum ZipListReturnRequest {
-    Live(crate::zip_tree::ZipListReturnPlan),
-    Terminal(crate::zip_tree::ZipListReturnPlan),
+    PreparedLive(crate::zip_tree::ZipListReturnPlan),
+    PreparedTerminal(crate::zip_tree::ZipListReturnPlan),
+    Live { ticket: ZipListReturnTicket },
+    Terminal { ticket: ZipListReturnTicket },
+}
+
+/// The existing close-continuation slot retains the sole delivery authority.
+/// A moved-out navigation holds only a weak ticket, never another owner.
+#[derive(Debug)]
+pub(crate) struct ZipListReturnOwner {
+    identity: Arc<()>,
+    plan: crate::zip_tree::ZipListReturnPlan,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ZipListReturnTicket(std::sync::Weak<()>);
+
+impl ZipListReturnOwner {
+    pub(super) fn new(plan: crate::zip_tree::ZipListReturnPlan) -> Self {
+        Self {
+            identity: Arc::new(()),
+            plan,
+        }
+    }
+
+    pub(super) fn ticket(&self) -> ZipListReturnTicket {
+        ZipListReturnTicket(Arc::downgrade(&self.identity))
+    }
+
+    pub(super) fn accepts(&self, ticket: &ZipListReturnTicket) -> bool {
+        std::sync::Weak::ptr_eq(&Arc::downgrade(&self.identity), &ticket.0)
+    }
+
+    pub(super) fn has_outstanding_tickets(&self) -> bool {
+        Arc::weak_count(&self.identity) != 0
+    }
+
+    pub(super) fn plan(&self) -> &crate::zip_tree::ZipListReturnPlan {
+        &self.plan
+    }
+
+    pub(super) fn into_plan(self) -> crate::zip_tree::ZipListReturnPlan {
+        self.plan
+    }
 }
 
 impl ZipListReturnRequest {
-    pub(super) fn plan(&self) -> &crate::zip_tree::ZipListReturnPlan {
-        let (Self::Live(plan) | Self::Terminal(plan)) = self;
-        plan
+    pub(super) fn prepared_plan(&self) -> Option<&crate::zip_tree::ZipListReturnPlan> {
+        match self {
+            Self::PreparedLive(plan) | Self::PreparedTerminal(plan) => Some(plan),
+            Self::Live { .. } | Self::Terminal { .. } => None,
+        }
     }
 
     pub(super) fn into_terminal(self) -> Self {
-        let (Self::Live(plan) | Self::Terminal(plan)) = self;
-        Self::Terminal(plan)
+        match self {
+            Self::PreparedLive(plan) | Self::PreparedTerminal(plan) => Self::PreparedTerminal(plan),
+            Self::Live { ticket } | Self::Terminal { ticket } => Self::Terminal { ticket },
+        }
     }
 }
 
@@ -239,8 +285,20 @@ impl App {
             crate::logger::log("archive list return dropped: foreign context");
             return;
         }
-        let needs_close = matches!(&request, ZipListReturnRequest::Live(_));
-        let (ZipListReturnRequest::Live(plan) | ZipListReturnRequest::Terminal(plan)) = request;
+        let (ticket, needs_close) = match request {
+            ZipListReturnRequest::Live { ticket } => (ticket, true),
+            ZipListReturnRequest::Terminal { ticket } => (ticket, false),
+            ZipListReturnRequest::PreparedLive(_) | ZipListReturnRequest::PreparedTerminal(_) => {
+                crate::logger::log("archive list return dropped: unissued request");
+                return;
+            }
+        };
+        // Reader acceptance retires this context's authority even when rows,
+        // prefix and Chosen are unchanged. Consume it once, including stale plans.
+        let Some(plan) = self.consume_issued_zip_list_return(&ticket) else {
+            crate::logger::log("archive list return dropped: delivery lifetime ended");
+            return;
+        };
         if let Some(reason) = self.zip_list_return_stale_reason(&plan) {
             crate::logger::log(format!("archive list return destination dropped: {reason}"));
             if needs_close && self.fullscreen_idx.is_some() {

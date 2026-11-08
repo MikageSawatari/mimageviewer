@@ -174,6 +174,8 @@ navigation でこの関数を呼ぶだけ (再列挙なし = in-memory)。見開
   最も深い記録済み祖先へ戻り、旧ページの teardown 後に一覧を作り、現在の本のセルと row anchor を復元する。
   close 受理時に帰還先を確定し、main context 専用の既存 teardown を使う。stale Live は帰還先だけを捨てて
   現在の一覧へ閉じ、close 済みの Terminal はログを出して捨てる。兄弟の active session は終了しない。
+  take 後も close slot が plan と配送権限を保持し、同じ context の新 reader 受理で終了する。
+  nav は Weak ticket のみを持ち、失効後は Chosen が残っていても後発 reader を変更しない。
   Backspace は従来どおり現在本の L2。見ていない祖先を推測して帰路にはしない。
 - DFS・ソート・ピンで記録を維持し、refresh・履歴・同一書庫へのブックマーク／Required jump で消す。
   snapshot の退避には同行するが固定中は帰路を出さない。独立 build／fork／promote は独立側の

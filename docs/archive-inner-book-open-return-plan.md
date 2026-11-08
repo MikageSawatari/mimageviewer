@@ -103,7 +103,17 @@ enum ZipListChoice {
 - 帰路の解決: close の時点で、**現在の本を含む最も深い `Chosen` の厳密な祖先階層**を探す。
 - 配送: close を受理した時点で帰還先を確定し、既存の `FullscreenCloseContinuation::LiveZipListReturn(plan)`
   に保持する。配送までに refresh 等で記録が消えても、帰還先を再解決しない。
-  `AddressBarNav::ZipListReturn(ZipListReturnRequest::{Live, Terminal}(plan))` で close 済みかも型で運ぶ。
+  `AddressBarNav::ZipListReturn(request)` で準備中 recipe と Live／Terminal の配送 ticket を型で運ぶ。
+  準備中の recipe は `PreparedLive`／`PreparedTerminal`、take 後の配送は `Live`／`Terminal` と区別する。
+  take は唯一の確定 plan を既存 slot の `IssuedZipListReturn(owner)` へ移し、nav には phase と Weak ticket だけを渡す。
+  Issued のまま同じ reader が terminal close されても、teardown は owner の保存済み plan から方針を導く。
+  二度目の take は owner を保持して `None` を返す。Issued は未配送の pending ではないため、一覧操作を妨げない。
+  **同じ context の新 reader 受理（共通 open の既存 None→Some 境界）で、その context の Zip 帰還を終了する。**
+  既存 reader 内のページ送りと兄弟 context の reader 受理は終了条件にしない。
+  consumer は現在の slot が持つ exact owner と ticket を照合し、一回だけ plan を取り出して検証する。
+  新 reader 受理後の旧 nav は Chosen／ツリー／prefix が一致していてもログを出して捨て、何も install しない。
+  plan 自体が stale の場合も配送権限は消費する。準備中 recipe は consumer で実行しない。
+  配送 nav がすべて破棄された場合は Weak ticket もなくなるため、後の新しい close を妨げない。
   plan は owner から導いた一回限りの値で、
   別の来歴 owner ではない (中身: 帰還する階層の深さと display prefix、読んでいた本の prefix、`rows_above`、
   ツリーの identity)。`transfer_terminal_close_return` は解決済みの帰還先から effect を選び、`ZipListReturn` なら
@@ -142,6 +152,7 @@ enum ZipListChoice {
 | ★固定 snapshot | 既存の `saved_zip_nav` 退避・復帰に値ごと同行。固定中は帰路を発行しない |
 | 独立ビューアの build / fork / promote | **独立 bundle になる側の `zip_nav` と保存中の `saved_zip_nav` の記録を `Unseen` にする** (§1.670 A と同じく、main への帰還権限を独立 bundle に作らない)。main 側の原本は保持 |
 | main admission・Remote 取得・終了 | 既存の close return 失効入口 (`retire_close_returns_for_main_admission` 等) がそのまま配送中の plan を捨てる |
+| 同じ context の新 reader 受理 | 未配送／配送済みの Zip 帰還だけを終了。take 済み nav の Weak ticket も失効。別 context と既存 reader のページ送りには影響しない |
 
 ## 4. 開く処理の接続 (§1.675、通常モード)
 
@@ -835,6 +846,55 @@ core・remote・EPUB PDF worker・MCP adapter・music-video editor と必要 DLL
 core は normal feature set（portable 無効）であり、製品起動・通常 profile のデータ操作・全 lib／workspace suite は行っていない。
 S1 の追補差分は未コミット。S2／S3 の内部 resume・複数窓の内部本 activation は未変更。
 
+### S1 実装レビュー R2 修正（`75f796a6e` に対する追補）
+
+- P2 をコードで確認した。Terminal の take は nav を slot 外へ渡して origin を捨てるため、
+  同じ A 階層のページを再 open しても tree／prefix／Chosen の検証だけでは旧帰還を識別できなかった。
+- reader 受理の共通 owner `open_fullscreen_with_metadata_boundary` の既存 None→Some commit 境界で、
+  **その context の Zip 帰還だけを終了する**。他 context、通常のページ送り、拒否／defer 中の要求には適用しない。
+  `input_seq` は App 共通の perf 相関値、items generation は同階層の再 open で不変なので流用しない。
+- 既存 `FullscreenCloseContinuation` に排他的な `IssuedZipListReturn(owner)` を加えた。
+  strong identity と唯一の確定 plan は slot だけが保持し、nav は phase と Weak ticket を持つ。
+  take 済み Live／Terminal を同じ規則で扱う。Issued 中の terminal teardown も保存済み plan を使う。
+  同じ slot の再 take は owner を保持して None。新 reader・main admission・Remote／終了の clear は owner を捨てる。
+  consumer は exact owner を一回消費してから plan を検証し、stale plan も権限を終端する。
+  nav がすべて drop された場合は outstanding ticket がなくなり、後の新しい close を受理できる。
+  ticket の実生存数を使い、時刻・世代・fullscreen の有無から推測しない。
+  新しい App field／bool／Option／pending、viewport／HWND／配置／timer の変更はない。
+- Chosen を維持した実 Enter／実 render_grid ダブルクリックで、Terminal take 後に同じ A の別ページを開き、
+  旧 nav が items／fullscreen index／tree／prefix／Chosen／generation を変更しない回帰を追加した。
+  take 前の reader 受理、二度目の take、拒否 open、二重配送、兄弟 reader 受理も検証する。
+- 既存テストの変更は transport の API 更新だけ。Terminal の tuple pattern を issued struct pattern へ変更し、
+  `section1676_real_refresh_stale_live_plan_closes_to_current_list` の synthetic Live は既存 slot に準備して take する。
+  最終的な close／rows／階層／選択の期待値は変えない。テストの削除・弱化は行わない。
+- 独立 Sol/xhigh reviewer は上記 owner 設計を ACCEPT。検証の実行担当は実装担当である。
+
+R2 検証（`MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=1`、`TEMP`／`TMP` は
+worktree の `target/codex-tmp`。既存 native 依存物を再利用。製品起動と全 lib／workspace suite は行わない）:
+
+| コマンド／filter | 結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 成功、exit 0 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/section167[56]/)'` | **57/57 成功、失敗 0、exit 0**。追加9件を含む |
+| R1 と同じ指定既存回帰 filter | **344/344 成功、失敗 0、exit 0**。既知の origin 無し Everything 1件は ignore |
+| R1 と同じ detached／main context／barrier filter | **48/48 成功、失敗 0、exit 0** |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-dev.ps1 -PreserveRuntime` | 成功、exit 0。core・全 companion・DLL／bundle 配置と最終 PE 5本／CRT 4本の検査まで完了。製品起動なし |
+| `cargo fmt`／`cargo fmt --check`／`git -c core.safecrlf=false diff --check` | すべて exit 0 |
+| `python scripts/check_ui_glyphs.py` | 違反0、exit 0 |
+
+#### 別件報告: 他 AddressBarNav の Terminal にもある再 open 後の旧配送（今回は修正しない）
+
+- R2 開始時点の `src/app/close_return.rs:333` 以降は Terminal effect から nav を返して origin を捨てる。
+  `src/app.rs:71343` の reader 受理は close return を終了せず、main list admission の終了入口も通らない。
+- 例えば root ページから直接読んでいた ZIP を Terminal close → teardown →親フォルダ Direct nav を take →
+  同じ context のページを再 open →旧 Direct を適用すると、`src/app.rs:24887` の Direct 分岐は受付寿命を照合せず
+  load を開始し、後発 reader を置換する。S1 の ZipListReturn より前からある同型の穴と確認した。
+- 実装前に設計担当へこの範囲外の穴を報告した。今回は Zip の queued／issued 帰還だけを終了させ、
+  Direct 等の reader 受付・take・consumer の契約は変更しない。横展開は別の設計判断とする。
+
+R2 の source と追加9テストは独立 reviewer が ACCEPT（新規 P1/P2 なし）。指定検証は上記のとおりすべて成功。
+変更は未コミットで設計担当の検収・commit 待ち。S2／S3 の機能と永続スキーマは変更していない。
+
 ## 10. 実装段階と規模
 
 | 段階・commit境界 | 内容 | 主な検証 |
@@ -846,8 +906,9 @@ S1 の追補差分は未コミット。S2／S3 の内部 resume・複数窓の�
 
 各段階で独立レビューを行い、修正済みfindingの影響範囲だけを再検証する。S1単独を今回要求の完成・リリース可能状態とは扱わない。
 
-S1 本体は `875166c1b` に commit 済み。実装レビュー R1 の修正は未コミットで設計担当へ返し、
-上記 §9 の検証結果と独立レビューを確認して追補の commit 境界を確定する。S2／S3／S4 は未着手。
+S1 本体は `875166c1b`、実装レビュー R1 の修正は `75f796a6e` に commit 済み。
+実装レビュー R2 の修正は未コミットで設計担当へ返し、上記 §9 の検証結果と独立レビューを確認して
+追補の commit 境界を確定する。S2／S3／S4 は未着手。
 
 追加対象には `book_resume_key` 相当の共通module、`book_resume_db`、`rename_key_migration`、Remoteのcontainer/session/ui、descriptorを構築する `startup_ops`、archive conversion continuationを含む。
 

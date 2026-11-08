@@ -71343,6 +71343,7 @@ impl App {
             self.cleanup_normalize_state_for_fs_idx(previous_idx);
         }
         if self.fullscreen_idx.is_none() {
+            self.retire_zip_close_return_for_reader_acceptance();
             self.retire_result_search_input_focus();
             if self.extracted_result_surface().is_some() {
                 self.begin_extracted_result_view();
@@ -81038,7 +81039,7 @@ impl App {
         if self.projected_viewer_context_id() == self.viewer_context_main() {
             // One accepted close owns one frozen destination. Later refreshes
             // invalidate only that destination; they must not choose a new route.
-            if self.pending_return_to_parent.is_pending() {
+            if self.pending_return_to_parent.has_accepted_request() {
                 return;
             }
             if let Some(plan) = self.chosen_zip_list_return() {

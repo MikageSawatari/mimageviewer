@@ -992,7 +992,7 @@ fn section1676_invalidated_frozen_live_terminal_uses_current_list_teardown() {
         .expect("terminal recipe remains deliverable after teardown");
     assert!(matches!(
         &nav,
-        AddressBarNav::ZipListReturn(ZipListReturnRequest::Terminal(_))
+        AddressBarNav::ZipListReturn(ZipListReturnRequest::Terminal { .. })
     ));
     assert!(app.apply_fullscreen_close_nav_immediate(nav));
     settle(&mut app, &ctx);
@@ -1362,11 +1362,15 @@ fn section1676_real_refresh_stale_live_plan_closes_to_current_list() {
     app.open_fullscreen(1, HistoryTrigger::UserChosen);
     app.spread_popup_open = true;
     let before = (app.items.clone(), app.items_generation);
-    assert!(
-        app.apply_fullscreen_close_nav_immediate(AddressBarNav::ZipListReturn(
-            ZipListReturnRequest::Live(plan),
-        ))
-    );
+    app.pending_return_to_parent = FullscreenCloseContinuation::LiveZipListReturn(plan);
+    let nav = app
+        .take_pending_return_to_parent_nav()
+        .expect("frozen Live request issues its delivery authority");
+    assert!(matches!(
+        &nav,
+        AddressBarNav::ZipListReturn(ZipListReturnRequest::Live { .. })
+    ));
+    assert!(app.apply_fullscreen_close_nav_immediate(nav));
     assert_eq!((app.items.clone(), app.items_generation), before);
     assert!(
         app.fullscreen_idx.is_none(),
@@ -2403,7 +2407,7 @@ fn section1676_stale_terminal_return_cannot_close_a_later_reader() {
         .expect("terminal return outlives the closed reader");
     assert!(matches!(
         &nav,
-        AddressBarNav::ZipListReturn(ZipListReturnRequest::Terminal(_))
+        AddressBarNav::ZipListReturn(ZipListReturnRequest::Terminal { .. })
     ));
     app.zip_nav.as_mut().unwrap().clear_list_choices();
     // A later real open has its own fullscreen lifetime. Delivery of the old
@@ -2430,4 +2434,458 @@ fn section1676_stale_terminal_return_cannot_close_a_later_reader() {
     assert!(app.spread_popup_open);
     assert_eq!(app.zip_nav.as_ref().unwrap().current(), &["A"]);
     assert!(!app.pending_return_to_parent.is_pending());
+}
+
+#[cfg(windows)]
+fn archive_return_lifetime_env() -> (AppTestEnvForTest, egui::Context, PathBuf) {
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    let book = app.tmp.path().join("outer.zip");
+    write_pages(&book, &["A/001.png", "A/002.png", "A/003.png", "B/001.png"]);
+    open_list(&mut app, &ctx, &book);
+    app.settings.auto_fullscreen_zip_pdf = true;
+    activate(&mut app, &ctx, "A/", true);
+    app.open_fullscreen(1, HistoryTrigger::UserChosen);
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert!(
+        app.zip_nav
+            .as_ref()
+            .unwrap()
+            .chosen_list_return_plan()
+            .is_some()
+    );
+    (app, ctx, book)
+}
+
+#[cfg(windows)]
+fn take_terminal_archive_return(app: &mut App) -> AddressBarNav {
+    let main = app.viewer_context_main();
+    app.transfer_terminal_close_return(main, ViewerCloseCause::User);
+    assert!(matches!(
+        app.pending_return_to_parent,
+        FullscreenCloseContinuation::Terminal(_)
+    ));
+    app.close_fullscreen_now();
+    assert!(app.fullscreen_idx.is_none());
+    let nav = app
+        .take_pending_return_to_parent_nav()
+        .expect("real Terminal issues a navigation authority");
+    assert!(matches!(
+        &nav,
+        AddressBarNav::ZipListReturn(ZipListReturnRequest::Terminal { .. })
+    ));
+    assert!(matches!(
+        app.pending_return_to_parent,
+        FullscreenCloseContinuation::IssuedZipListReturn(_)
+    ));
+    assert!(!app.pending_return_to_parent.is_pending());
+    nav
+}
+
+#[cfg(windows)]
+#[derive(Debug, PartialEq)]
+struct ArchiveReaderSnapshot {
+    items: Vec<GridItem>,
+    items_generation: u64,
+    fullscreen: Option<usize>,
+    selected: Option<usize>,
+    folder: Option<PathBuf>,
+    tree_identity: usize,
+    display_prefix: Vec<String>,
+    raw_prefix: Vec<String>,
+    chosen: Option<(Vec<String>, Option<u32>)>,
+}
+
+#[cfg(windows)]
+fn archive_reader_snapshot(app: &App) -> ArchiveReaderSnapshot {
+    let nav = app.zip_nav.as_ref().unwrap();
+    ArchiveReaderSnapshot {
+        items: app.items.clone(),
+        items_generation: app.items_generation,
+        fullscreen: app.fullscreen_idx,
+        selected: app.selected,
+        folder: app.current_folder.clone(),
+        tree_identity: Arc::as_ptr(&nav.tree) as usize,
+        display_prefix: nav.current().to_vec(),
+        raw_prefix: nav.current_raw().to_vec(),
+        chosen: nav
+            .chosen_list_return_plan()
+            .map(|plan| (plan.left_prefix().to_vec(), plan.rows_above())),
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn section1676_taken_terminal_then_real_enter_reopen_keeps_chosen_reader() {
+    let (mut app, ctx, _) = archive_return_lifetime_env();
+    let nav = take_terminal_archive_return(&mut app);
+    let chosen = app
+        .zip_nav
+        .as_ref()
+        .unwrap()
+        .chosen_list_return_plan()
+        .unwrap();
+    app.selected = Some(0);
+    ctx.begin_pass(egui::RawInput {
+        events: vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        ..Default::default()
+    });
+    assert!(app.handle_keyboard(&ctx).is_none());
+    ctx.end_pass().drop_without_applying_deltas();
+    settle(&mut app, &ctx);
+    assert_eq!(
+        app.fullscreen_idx,
+        Some(0),
+        "Enter reopens a different page in the same installed A level"
+    );
+    assert!(app.fs_suppress_enter_close_until_release);
+    assert!(
+        app.zip_nav
+            .as_ref()
+            .unwrap()
+            .matches_list_return_plan(&chosen),
+        "reopen retains the valid Chosen/tree facts; only old return authority expires"
+    );
+    let before = archive_reader_snapshot(&app);
+    assert!(app.apply_fullscreen_close_nav_immediate(nav));
+    assert_eq!(
+        archive_reader_snapshot(&app),
+        before,
+        "the taken Terminal must not replace the reopened reader with its parent rows"
+    );
+    assert!(!app.pending_return_to_parent.is_pending());
+}
+
+#[test]
+#[cfg(windows)]
+fn section1676_taken_terminal_then_real_grid_double_click_reopen_keeps_chosen_reader() {
+    let (mut app, _, _) = archive_return_lifetime_env();
+    let nav = take_terminal_archive_return(&mut app);
+    let chosen = app
+        .zip_nav
+        .as_ref()
+        .unwrap()
+        .chosen_list_return_plan()
+        .unwrap();
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+    app.settings.grid_cols = 4;
+    app.settings.thumb_aspect_auto = false;
+    app.selected = Some(0);
+    app.grid_scroll.set_position(0.0);
+    app.grid_scroll.set_reveal_requested(true);
+    struct State {
+        app: AppTestEnvForTest,
+        origin: egui::Pos2,
+    }
+    let mut configured = false;
+    let mut harness = crate::test_ui::builder()
+        .with_size(egui::vec2(1000.0, 600.0))
+        .with_step_dt(0.01)
+        .build_ui_state(
+            move |ui, state: &mut State| {
+                let ctx = ui.ctx().clone();
+                if !configured {
+                    crate::ui_fonts::configure_fonts(&ctx);
+                    configured = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                state.origin = ui.available_rect_before_wrap().min;
+                state.app.begin_grid_click_input_frame(&ctx);
+                assert!(state.app.render_grid(ui).is_none());
+            },
+            State {
+                app,
+                origin: egui::Pos2::ZERO,
+            },
+        );
+    harness.run_steps(6);
+    // The first page is another page than the closed reader's page 2. Use the
+    // center of its actual painted cell, inside portrait-image letterboxing.
+    let pos = harness.state().origin
+        + egui::vec2(
+            8.0 + harness.state().app.last_cell_size * 0.5,
+            8.0 + harness.state().app.last_cell_h * 0.5,
+        );
+    harness.hover_at(pos);
+    for _ in 0..2 {
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.step();
+    }
+    let ctx = harness.ctx.clone();
+    let app = &mut harness.state_mut().app;
+    settle(app, &ctx);
+    assert_eq!(
+        app.fullscreen_idx,
+        Some(0),
+        "real grid double-click must reopen page 1"
+    );
+    assert!(
+        app.zip_nav
+            .as_ref()
+            .unwrap()
+            .matches_list_return_plan(&chosen)
+    );
+    let before = archive_reader_snapshot(app);
+    assert!(app.apply_fullscreen_close_nav_immediate(nav));
+    assert_eq!(
+        archive_reader_snapshot(app),
+        before,
+        "old Terminal authority must not navigate after the real pointer handler accepted another reader"
+    );
+    assert!(!app.pending_return_to_parent.is_pending());
+}
+
+#[test]
+#[cfg(windows)]
+fn section1676_new_reader_acceptance_retires_zip_close_before_take() {
+    for terminal in [false, true] {
+        let (mut app, ctx, _) = archive_return_lifetime_env();
+        if terminal {
+            let main = app.viewer_context_main();
+            app.transfer_terminal_close_return(main, ViewerCloseCause::User);
+        } else {
+            app.handle_fullscreen_close_request();
+        }
+        app.close_fullscreen_now();
+        assert!(
+            app.pending_return_to_parent.is_pending(),
+            "the old close has not been taken; terminal={terminal}"
+        );
+        app.open_fullscreen(0, HistoryTrigger::UserChosen);
+        settle(&mut app, &ctx);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(!app.pending_return_to_parent.is_pending());
+        assert!(
+            app.take_pending_return_to_parent_nav().is_none(),
+            "new reader acceptance retires untaken ZIP return; terminal={terminal}"
+        );
+        assert!(
+            app.zip_nav
+                .as_ref()
+                .unwrap()
+                .chosen_list_return_plan()
+                .is_some()
+        );
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn section1676_repeated_take_retains_the_issued_zip_authority() {
+    let (mut app, ctx, _) = archive_return_lifetime_env();
+    let nav = take_terminal_archive_return(&mut app);
+    let ticket = match &app.pending_return_to_parent {
+        FullscreenCloseContinuation::IssuedZipListReturn(owner) => owner.ticket(),
+        _ => panic!("issued owner must remain in the original slot"),
+    };
+    for _ in 0..3 {
+        assert!(app.take_pending_return_to_parent_nav().is_none());
+        assert!(!app.pending_return_to_parent.is_pending());
+        assert!(
+            matches!(&app.pending_return_to_parent, FullscreenCloseContinuation::IssuedZipListReturn(current) if current.accepts(&ticket))
+        );
+    }
+    assert!(app.apply_fullscreen_close_nav_immediate(nav));
+    settle(&mut app, &ctx);
+    assert_returned(&app, &[], "A/");
+}
+
+#[test]
+#[cfg(windows)]
+fn section1676_refused_reader_open_keeps_issued_zip_authority() {
+    let (mut app, ctx, _) = archive_return_lifetime_env();
+    let nav = take_terminal_archive_return(&mut app);
+    let before = archive_reader_snapshot(&app);
+    let invalid = app.items.len();
+    app.open_fullscreen(invalid, HistoryTrigger::UserChosen);
+    assert_eq!(archive_reader_snapshot(&app), before);
+    assert!(matches!(
+        app.pending_return_to_parent,
+        FullscreenCloseContinuation::IssuedZipListReturn(_)
+    ));
+    assert!(app.take_pending_return_to_parent_nav().is_none());
+    assert!(app.apply_fullscreen_close_nav_immediate(nav));
+    settle(&mut app, &ctx);
+    assert_returned(&app, &[], "A/");
+}
+
+#[test]
+#[cfg(windows)]
+fn section1676_issued_zip_return_installs_its_exact_destination_once() {
+    let (mut app, ctx, _) = archive_return_lifetime_env();
+    let nav = take_terminal_archive_return(&mut app);
+    let duplicate = match &nav {
+        AddressBarNav::ZipListReturn(request) => AddressBarNav::ZipListReturn(request.clone()),
+        _ => panic!("terminal fixture must issue a ZIP return"),
+    };
+    assert!(app.apply_fullscreen_close_nav_immediate(nav));
+    settle(&mut app, &ctx);
+    assert_returned(&app, &[], "A/");
+    let before = archive_reader_snapshot(&app);
+    assert!(app.apply_fullscreen_close_nav_immediate(duplicate));
+    assert_eq!(archive_reader_snapshot(&app), before);
+    assert!(app.take_pending_return_to_parent_nav().is_none());
+}
+
+#[test]
+#[cfg(windows)]
+fn section1676_sibling_reader_acceptance_keeps_main_issued_zip_authority() {
+    let (mut app, ctx, book) = archive_return_lifetime_env();
+    let nav = take_terminal_archive_return(&mut app);
+    let ticket = match &app.pending_return_to_parent {
+        FullscreenCloseContinuation::IssuedZipListReturn(owner) => owner.ticket(),
+        _ => panic!("main issued owner"),
+    };
+    let before = archive_reader_snapshot(&app);
+    app.settings.detached_viewer_open_images_in_window = true;
+    ctx.set_embed_viewports(false);
+    assert!(app.start_active_detached_book_context(
+        ViewerContextDescriptor::Zip {
+            path: book,
+            entry_name: Some("B/001.png".into()),
+            archive_source_override: None,
+        },
+        &ctx,
+        None,
+        None
+    ));
+    let sibling = app.active_viewer_context_id().unwrap();
+    assert_ne!(sibling, app.viewer_context_main());
+    app.with_active_viewer_context(|viewer| {
+        settle(viewer, &ctx);
+        assert!(viewer.fullscreen_idx.is_some());
+        assert_eq!(
+            viewer.viewer_presentation,
+            ViewerPresentation::DetachedWindow
+        );
+    })
+    .unwrap();
+    assert_eq!(archive_reader_snapshot(&app), before);
+    assert!(
+        matches!(&app.pending_return_to_parent, FullscreenCloseContinuation::IssuedZipListReturn(current) if current.accepts(&ticket))
+    );
+    assert!(app.take_pending_return_to_parent_nav().is_none());
+    assert!(app.apply_fullscreen_close_nav_immediate(nav));
+    settle(&mut app, &ctx);
+    assert_returned(&app, &[], "A/");
+    assert_eq!(app.active_viewer_context_id(), Some(sibling));
+    assert!(
+        app.with_viewer_context_state(sibling, |viewer| viewer.fullscreen_idx.is_some())
+            .unwrap()
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn section1676_issued_live_terminal_teardown_preserves_valid_chosen_bookmark_owner() {
+    use crate::bookmark_browser::BookmarkViewReturnTarget;
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    let book = app.tmp.path().join("outer.zip");
+    write_pages(&book, &["A/001.png", "A/002.png", "B/001.png"]);
+    open_list(&mut app, &ctx, &book);
+    app.bookmark_view_state = Some(BookmarkViewState::Opening {
+        target: BookmarkViewReturnTarget::Book(book.clone()),
+        grid: BookmarkViewReturnGridState {
+            row_keys: vec![(1, 4)],
+            selected_key: Some((1, 4)),
+            opened_key: Some((1, 4)),
+            scroll_offset_y: 123.0,
+        },
+    });
+    app.settings.auto_fullscreen_zip_pdf = true;
+    activate(&mut app, &ctx, "A/", true);
+    app.handle_fullscreen_close_request();
+    let nav = app
+        .take_pending_return_to_parent_nav()
+        .expect("accepted Live issues its navigation");
+    assert!(matches!(
+        &nav,
+        AddressBarNav::ZipListReturn(ZipListReturnRequest::Live { .. })
+    ));
+    assert!(matches!(
+        app.pending_return_to_parent,
+        FullscreenCloseContinuation::IssuedZipListReturn(_)
+    ));
+    assert!(
+        app.zip_nav
+            .as_ref()
+            .unwrap()
+            .chosen_list_return_plan()
+            .is_some()
+    );
+    let main = app.viewer_context_main();
+    app.transfer_terminal_close_return(main, ViewerCloseCause::User);
+    app.close_fullscreen_now();
+    assert!(app.fullscreen_idx.is_none());
+    assert!(
+        matches!(&app.bookmark_view_state, Some(BookmarkViewState::Opening { target: BookmarkViewReturnTarget::Book(path), grid }) if path == &book && grid.scroll_offset_y == 123.0),
+        "terminal teardown must derive ChosenZipList from the still-issued Live owner"
+    );
+    assert!(app.apply_fullscreen_close_nav_immediate(nav));
+    settle(&mut app, &ctx);
+    assert_returned(&app, &[], "A/");
+    assert!(
+        matches!(&app.bookmark_view_state, Some(BookmarkViewState::Opening { target: BookmarkViewReturnTarget::Book(path), grid }) if path == &book && grid.scroll_offset_y == 123.0)
+    );
+    assert!(matches!(
+        app.handle_grid_parent_folder_action(),
+        Some(AddressBarNav::Bookmarks)
+    ));
+}
+
+#[test]
+#[cfg(windows)]
+fn section1676_dropped_issued_navigation_allows_a_fresh_user_close() {
+    let (mut app, ctx, _) = archive_return_lifetime_env();
+    app.handle_fullscreen_close_request();
+    {
+        let nav = app
+            .take_pending_return_to_parent_nav()
+            .expect("first Close issues its navigation");
+        assert!(matches!(
+            &nav,
+            AddressBarNav::ZipListReturn(ZipListReturnRequest::Live { .. })
+        ));
+        // Keep no weak probe or cloned request: this is the actual lifetime
+        // where all delivery owners disappear before reaching the consumer.
+        drop(nav);
+    }
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert!(matches!(
+        app.pending_return_to_parent,
+        FullscreenCloseContinuation::IssuedZipListReturn(_)
+    ));
+    app.handle_fullscreen_close_request();
+    assert!(
+        matches!(
+            app.pending_return_to_parent,
+            FullscreenCloseContinuation::LiveZipListReturn(_)
+        ),
+        "an orphaned issued slot must not permanently block a later user Close"
+    );
+    let nav = app
+        .take_pending_return_to_parent_nav()
+        .expect("fresh Close must issue a deliverable navigation");
+    assert!(matches!(
+        &nav,
+        AddressBarNav::ZipListReturn(ZipListReturnRequest::Live { .. })
+    ));
+    assert!(app.apply_fullscreen_close_nav_immediate(nav));
+    settle(&mut app, &ctx);
+    assert_returned(&app, &[], "A/");
 }
