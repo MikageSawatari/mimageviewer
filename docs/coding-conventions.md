@@ -8,7 +8,11 @@
 - **Virtual scrolling**: `show_viewport` で全体高さだけ確保し、可視行のみ描画。
   スクロールオフセットは App が自前管理（egui の自動スクロールは使わない）。
 - **Row snapping**: オフセットは常に `cell_size` の整数倍。最大オフセットも
-  `ceil((total_h - viewport_h) / cell_size) * cell_size` で行境界に揃える。
+  `total_h <= viewport_h` なら 0、それ以外は
+  `ceil((total_h - max(viewport_h, cell_size)) / cell_size) * cell_size` で行境界に揃える。
+  行を見せる計算では表示域を最低 1 行分として扱い、1 行未満の表示域では選択行の上端を
+  表示域の上端に合わせる。確保高は短い content では自然高、それ以外は最大オフセット + 実 viewport 高。
+  2026-11-08 サブ PC 担当から窓 1600x560 で一覧が真っ白になる報告を受け、空の次行を上限／reveal にしない式へ修正。
   一覧の touch drag も `GridScrollState` のcanonical offset自体はanchorとして行境界に保ち、1 行未満の
   描画端数だけを viewport の一時データに分離する。端数を canonical offset へ混ぜない。
 - **一覧の位置とgeometryの契約（5ch >>661）**: offset・一回要求・未消費RowAnchor・描画geometryは

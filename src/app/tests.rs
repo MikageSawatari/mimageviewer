@@ -112358,14 +112358,25 @@ mod background_click_scroll_regression_tests {
         app.settings.grid_cols = 4;
         app.settings.grid_background_double_click_parent = true;
         app.grid_scroll.set_position(100_000.0);
-        let mut harness = harness(app);
+        // Fit a complete thumbnail row so the snapped tail has real background below it.
+        let mut harness = if view == crate::settings::GridViewMode::Thumbnail {
+            harness_with_size(app, egui::vec2(1200.0, 480.0))
+        } else {
+            harness(app)
+        };
         harness
             .ctx
             .options_mut(|options| options.input_options.max_double_click_delay = 5.0);
         harness.run_steps(6);
         let old_offset = harness.state().app.grid_scroll.offset();
         assert!(old_offset > 100.0);
-        // The snapped end extent includes unowned background below the last row.
+        let geometry = harness.state().app.grid_scroll.geometry();
+        assert_eq!(old_offset, geometry.max_offset);
+        assert!(
+            geometry.row_h < geometry.viewport_h,
+            "background probe needs a whole row in view: {geometry:?}"
+        );
+        // Probe below the last painted row, not an empty row created by an invalid extent.
         let body_top = if view == crate::settings::GridViewMode::Details {
             38.0
         } else {
@@ -112373,6 +112384,22 @@ mod background_click_scroll_regression_tests {
         };
         let pos = egui::pos2(30.0, body_top + harness.state().app.last_viewport_h - 1.0);
         assert!(pos.y < 480.0);
+        let last_index = *harness.state().app.current_grid_order().last().unwrap();
+        let last_cell = harness
+            .ctx
+            .data(|data| {
+                data.get_temp::<egui::Response>(egui::Id::unique((
+                    "grid_cell_input_response",
+                    harness.state().app.grid_scroll_context_id(),
+                    last_index,
+                )))
+            })
+            .expect("last row must be painted at the end")
+            .rect;
+        assert!(
+            pos.y > last_cell.max.y,
+            "background probe {pos:?} must be below the last cell {last_cell:?}"
+        );
         click(&mut harness, pos);
         assert_eq!(
             harness.state().app.current_folder.as_ref(),
@@ -112389,6 +112416,10 @@ mod background_click_scroll_regression_tests {
         );
         assert_eq!(harness.state().app.grid_scroll.offset(), 0.0);
         harness.run_steps(6);
+        assert!(
+            harness.state().app.grid_scroll.geometry().max_offset > old_offset,
+            "the old offset must remain valid in the restored list to expose stale readback"
+        );
         assert_eq!(
             harness.state().app.grid_scroll.offset(),
             0.0,

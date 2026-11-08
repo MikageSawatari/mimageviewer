@@ -154,6 +154,27 @@ fn section1335_explicit_book_list_and_direct_read_restart_choose_different_lists
 }
 
 #[test]
+fn grid_scroll_short_viewport_back_to_list_reveals_viewed_page() {
+    let (mut env, _, book) = book_env();
+    open_zip(&mut env, &book, true);
+    env.open_fullscreen(1, HistoryTrigger::UserChosen);
+    env.close_fullscreen_to_page_list();
+    assert!(env.fullscreen_idx.is_none());
+    assert_eq!(env.selected, Some(1));
+    let reveal = env.grid_scroll.take_reveal();
+    assert!(reveal, "returning to the list must request the viewed page");
+    let selected_position = env
+        .current_grid_order()
+        .iter()
+        .position(|&index| Some(index) == env.selected);
+    let rows = env.current_grid_order().len().div_ceil(4);
+    let geometry = GridScrollGeometry::new(4, 270.0, 160.0, rows as f32 * 270.0);
+    env.grid_scroll
+        .resolve_layout(geometry, reveal, selected_position, true);
+    assert_eq!(env.grid_scroll.offset(), 0.0);
+}
+
+#[test]
 fn section1335_back_to_list_acceptance_captures_viewed_page_instead_of_grid_selection() {
     let (mut env, parent, book) = book_env();
     open_zip(&mut env, &book, true);
