@@ -367,7 +367,7 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.675 書庫内フォルダ・入れ子書庫にも、ページを直接表示する設定を適用する — 5ch >>694・696 (2026-11-01)
 
-- 状態: **branch `fix-1675-1676-zipdir-book`（worktree `G:\home\mimageviewer-zipdir-book`）で実装済み。S1〜S3 の独立レビューは ACCEPT。master へ未マージ。マージ時期は利用者への確認待ちで、v5.1 より後になる場合がある。実機確認待ち。** 設計・実装・検証の正本は[内部本計画](archive-inner-book-open-return-plan.md)。
+- 状態: **branch `fix-1675-1676-zipdir-book`（worktree `G:\home\mimageviewer-zipdir-book`）で実装済み。S1〜S3 の実装レビューと S4 の文書レビューは ACCEPT。本体 lib 全件 16,684 件・test-full 18,732 件成功。master へ未マージ。マージ時期は利用者への確認待ちで、v5.1 より後になる場合がある。** 実機確認: サブ PC 依頼 22 (2026-11-08、build 7931dc7b0 = code 7b3960558、隔離 data-dir) で、観測者 = サブ PC 担当 (Claude) が、フル機能ウィンドウの ZIP 内フォルダ・入れ子 ZIP の直接表示、Esc / × / Enter 閉じでの内部一覧への帰還と選択・スクロール位置、内部本ごとの「続きから」、子フォルダだけの階層での一覧表示、Backspace、Ctrl+↓ 後の帰還、変換 RAR での同じ動き (RAR と ZIP は別の読書位置)、複数ウィンドウモードでの別ウィンドウ open / close 後もメインの一覧・選択・スクロールが不変、複数の別ウィンドウ同士の独立を確認し、NG なし。mIV Remote (PIN 入力が要るため) とウィンドウ表示 (F11) での帰還は未確認。RAR は試験データの作りの都合で同名 ZIP に隠れたため、アドレス欄から開いた (既存の同名ファイル設定の動作)。 設計・実装・検証の正本は[内部本計画](archive-inner-book-open-return-plan.md)。
 - 対象外: §1.678（子の本だけの ZIP へ Ctrl+↓）と、独立 reader の Ctrl 移動順（物理 DFS が内部 DFS より先）は今回変更しない。
 
 #### 起票時の記録（以下は修正前の調査・方針）
@@ -381,7 +381,7 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.676 書庫内の本を閉じたら、その本を選んだ内部一覧へ戻す — 5ch >>697 (2026-11-01)
 
-- 状態: **branch `fix-1675-1676-zipdir-book`（worktree `G:\home\mimageviewer-zipdir-book`）で実装済み。S1〜S3 の独立レビューは ACCEPT。master へ未マージ。マージ時期は利用者への確認待ちで、v5.1 より後になる場合がある。実機確認待ち。** 設計・実装・検証の正本は[内部本計画](archive-inner-book-open-return-plan.md)。
+- 状態: **branch `fix-1675-1676-zipdir-book`（worktree `G:\home\mimageviewer-zipdir-book`）で実装済み。S1〜S3 の実装レビューと S4 の文書レビューは ACCEPT。本体 lib 全件 16,684 件・test-full 18,732 件成功。master へ未マージ。マージ時期は利用者への確認待ちで、v5.1 より後になる場合がある。** 実機確認: サブ PC 依頼 22 (2026-11-08、build 7931dc7b0 = code 7b3960558、隔離 data-dir) で、観測者 = サブ PC 担当 (Claude) が、フル機能ウィンドウの ZIP 内フォルダ・入れ子 ZIP の直接表示、Esc / × / Enter 閉じでの内部一覧への帰還と選択・スクロール位置、内部本ごとの「続きから」、子フォルダだけの階層での一覧表示、Backspace、Ctrl+↓ 後の帰還、変換 RAR での同じ動き (RAR と ZIP は別の読書位置)、複数ウィンドウモードでの別ウィンドウ open / close 後もメインの一覧・選択・スクロールが不変、複数の別ウィンドウ同士の独立を確認し、NG なし。mIV Remote (PIN 入力が要るため) とウィンドウ表示 (F11) での帰還は未確認。RAR は試験データの作りの都合で同名 ZIP に隠れたため、アドレス欄から開いた (既存の同名ファイル設定の動作)。 設計・実装・検証の正本は[内部本計画](archive-inner-book-open-return-plan.md)。
 
 #### 起票時の記録（以下は修正前の調査・方針）
 
