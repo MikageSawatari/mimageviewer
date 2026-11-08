@@ -1,10 +1,69 @@
 //! Read-only base grid listings. Enumeration and composition use the grid's
 //! pure adapters; the agent never adopts UI state or runs metadata migration.
+use super::rating::RatingKey;
 use super::*;
 use crate::app::book_materialization as materialize;
 use crate::book_composition::{CompositionProjectionOutcome, CompositionSnapshot};
 use crate::grid_item::GridItem;
 use crate::settings::Settings;
+use std::collections::HashMap;
+
+struct FolderRow {
+    item: FolderItem,
+    rating_key: Option<RatingKey>,
+}
+
+#[derive(Default, Serialize)]
+struct FolderFilters {
+    min_stars: Option<u8>,
+    max_stars: Option<u8>,
+    kinds: Option<Vec<FolderKind>>,
+}
+
+impl FolderFilters {
+    fn new(
+        min_stars: Option<u8>,
+        max_stars: Option<u8>,
+        mut kinds: Option<Vec<FolderKind>>,
+    ) -> Result<Self, AgentError> {
+        if min_stars.is_some_and(|stars| stars > 5)
+            || max_stars.is_some_and(|stars| stars > 5)
+            || min_stars.zip(max_stars).is_some_and(|(min, max)| min > max)
+        {
+            return Err(error(
+                ErrorCode::BadRequest,
+                "★の範囲は0～5で指定してください",
+            ));
+        }
+        if let Some(kinds) = &mut kinds {
+            kinds.sort_unstable();
+            if kinds.is_empty() || kinds.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err(error(
+                    ErrorCode::BadRequest,
+                    "種類は重複せず1つ以上指定してください",
+                ));
+            }
+        }
+        Ok(Self {
+            min_stars,
+            max_stars,
+            kinds,
+        })
+    }
+
+    fn matches(&self, item: &FolderItem) -> bool {
+        self.kinds
+            .as_ref()
+            .is_none_or(|kinds| kinds.contains(&item.kind))
+            && if self.min_stars.is_some() || self.max_stars.is_some() {
+                item.rating.is_some_and(|rating| {
+                    rating >= self.min_stars.unwrap_or(0) && rating <= self.max_stars.unwrap_or(5)
+                })
+            } else {
+                true
+            }
+    }
+}
 
 const AGENT_NESTED_LIMITS: crate::zip_loader::NestedZipLimits =
     crate::zip_loader::NestedZipLimits {
@@ -17,12 +76,16 @@ impl Handlers {
         &self,
         path: String,
         subresource: Option<String>,
+        min_stars: Option<u8>,
+        max_stars: Option<u8>,
+        kinds: Option<Vec<FolderKind>>,
         limit: Option<u32>,
         cursor: Option<String>,
         ctx: &ReadContext,
     ) -> Result<Payload, AgentError> {
         ctx.checkpoint()?;
         folder_limit(limit)?;
+        let filters = FolderFilters::new(min_stars, max_stars, kinds)?;
         let path = input_path::validate(&path)?;
         let prefix = folder_prefix(subresource.as_deref())?;
         let mut settings = crate::settings_db::with_db_result(|db| db.load_into_settings())
@@ -73,12 +136,14 @@ impl Handlers {
             }
         };
         ctx.checkpoint()?;
+        let items = enrich_ratings(items, ctx)?;
         let args = serde_json::json!([
             physical_identity(path),
             prefix
                 .iter()
                 .map(|segment| segment.to_lowercase())
                 .collect::<Vec<_>>(),
+            filters,
         ]);
         let page = folder_page(
             items,
@@ -87,6 +152,8 @@ impl Handlers {
             cursor.as_deref(),
             &args,
             ctx.granted.1,
+            &filters,
+            |items| enrich_tags(items, ctx),
         )?;
         ctx.checkpoint()?;
         Ok(Payload::Folder(page))
@@ -143,7 +210,7 @@ fn physical_folder(
     path: &Path,
     settings: &Settings,
     ctx: &ReadContext,
-) -> Result<Vec<FolderItem>, AgentError> {
+) -> Result<Vec<FolderRow>, AgentError> {
     let scan = crate::app::folder_scan::scan_directory_with_settings_cancel(
         path,
         settings,
@@ -181,7 +248,7 @@ fn physical_folder(
                 .and(meta)
         })
         .collect();
-    folder_items(rows.items, metas)
+    folder_items(rows.items, metas, &HashMap::new())
 }
 
 fn archive_folder(
@@ -190,7 +257,7 @@ fn archive_folder(
     settings: &Settings,
     snapshot: &CompositionSnapshot,
     ctx: &ReadContext,
-) -> Result<(Vec<FolderItem>, bool), AgentError> {
+) -> Result<(Vec<FolderRow>, bool), AgentError> {
     let enumeration =
         crate::zip_loader::enumerate_image_entries_detailed_readonly_with_cancel_and_limits(
             path,
@@ -198,13 +265,19 @@ fn archive_folder(
             Some(AGENT_NESTED_LIMITS),
         );
     ctx.checkpoint()?;
-    let enumeration = enumeration.map_err(|cause| {
+    let mut enumeration = enumeration.map_err(|cause| {
         if crate::zip_loader::is_nested_zip_limit_error(&cause) {
             error(ErrorCode::BadRequest, "大きすぎる入れ子の ZIP があります")
         } else {
             internal()
         }
     })?;
+    // prepare consumes the enumeration. Retain image aliases, including the
+    // full legacy ancestry of nested ZIP entries, without migrating any key.
+    let legacy_names = std::mem::take(&mut enumeration.legacy_renames)
+        .into_iter()
+        .map(|(legacy, current)| (current, legacy))
+        .collect::<HashMap<_, _>>();
     let prepared = crate::zip_loader::PreparedZipEnumeration::prepare(
         path.to_path_buf(),
         enumeration,
@@ -252,7 +325,10 @@ fn archive_folder(
     .map_err(|_| internal())?;
     ctx.checkpoint()?;
     let applied = matches!(rows.composition, CompositionProjectionOutcome::Composed(_));
-    Ok((folder_items(rows.items, rows.metas)?, applied))
+    Ok((
+        folder_items(rows.items, rows.metas, &legacy_names)?,
+        applied,
+    ))
 }
 
 fn document_folder(
@@ -261,7 +337,7 @@ fn document_folder(
     settings: &Settings,
     snapshot: &CompositionSnapshot,
     ctx: &ReadContext,
-) -> Result<(Vec<FolderItem>, bool), AgentError> {
+) -> Result<(Vec<FolderRow>, bool), AgentError> {
     let mtime = crate::ui_helpers::mtime_secs(metadata);
     let file_size = metadata.len();
     let catalog = path
@@ -330,13 +406,17 @@ fn document_folder(
     .map_err(|_| internal())?;
     ctx.checkpoint()?;
     let applied = matches!(rows.composition, CompositionProjectionOutcome::Composed(_));
-    Ok((folder_items(rows.items, rows.metas)?, applied))
+    Ok((
+        folder_items(rows.items, rows.metas, &HashMap::new())?,
+        applied,
+    ))
 }
 
 fn folder_items(
     items: Vec<GridItem>,
     metas: Vec<Option<(i64, i64)>>,
-) -> Result<Vec<FolderItem>, AgentError> {
+    legacy_names: &HashMap<String, String>,
+) -> Result<Vec<FolderRow>, AgentError> {
     if items.len() != metas.len() {
         return Err(internal());
     }
@@ -345,6 +425,19 @@ fn folder_items(
         .zip(metas)
         .map(|(item, meta)| {
             let name = item.name().into_owned();
+            let rating_key = item.accepts_rating().then(|| {
+                let legacy = match &item {
+                    GridItem::ZipImage {
+                        zip_path,
+                        entry_name,
+                    } => legacy_names
+                        .get(entry_name)
+                        .map(|name| crate::adjustment_db::zip_entry_key(zip_path, name)),
+                    // ZipDir aliases are deliberately unsupported, matching the grid.
+                    _ => None,
+                };
+                RatingKey::for_item(&item, legacy)
+            });
             let (path, subresource, kind) = match item {
                 GridItem::Folder(path) => (path, None, FolderKind::Folder),
                 GridItem::Image(path) => (path, None, FolderKind::Image),
@@ -388,20 +481,72 @@ fn folder_items(
             } else {
                 meta
             };
-            Ok(FolderItem {
-                path: path.to_string_lossy().into_owned(),
-                subresource,
-                name,
-                kind,
-                size: if kind == FolderKind::Folder {
-                    None
-                } else {
-                    meta.and_then(|(_, size)| u64::try_from(size).ok())
+            let tags = subresource.is_none().then(Vec::new);
+            Ok(FolderRow {
+                rating_key,
+                item: FolderItem {
+                    path: path.to_string_lossy().into_owned(),
+                    subresource,
+                    name,
+                    kind,
+                    size: if kind == FolderKind::Folder {
+                        None
+                    } else {
+                        meta.and_then(|(_, size)| u64::try_from(size).ok())
+                    },
+                    modified: meta.and_then(|(mtime, _)| mtime.checked_mul(1000)),
+                    rating: None,
+                    tags,
                 },
-                modified: meta.and_then(|(mtime, _)| mtime.checked_mul(1000)),
             })
         })
         .collect()
+}
+
+fn enrich_ratings(rows: Vec<FolderRow>, ctx: &ReadContext) -> Result<Vec<FolderItem>, AgentError> {
+    ctx.checkpoint()?;
+    let path = crate::rating_db::RatingDb::db_path();
+    let ratings = if path.try_exists().map_err(|_| internal())? {
+        let db = crate::rating_db::RatingDb::open_readonly(path).map_err(|_| internal())?;
+        let keys = rows
+            .iter()
+            .filter_map(|row| row.rating_key.as_ref())
+            .flat_map(RatingKey::keys)
+            .cloned()
+            .collect::<Vec<_>>();
+        ctx.checkpoint()?;
+        db.get_many(&keys)
+    } else {
+        HashMap::new()
+    };
+    ctx.checkpoint()?;
+    Ok(rows
+        .into_iter()
+        .map(|mut row| {
+            row.item.rating = row.rating_key.map(|key| key.resolve(&ratings));
+            row.item
+        })
+        .collect())
+}
+
+fn enrich_tags(items: &mut [FolderItem], ctx: &ReadContext) -> Result<(), AgentError> {
+    ctx.checkpoint()?;
+    let db = optional_tags(&crate::tags_db::TagsDb::db_path())?;
+    let keys = items
+        .iter()
+        .filter(|item| item.subresource.is_none())
+        .map(|item| crate::tags_db::item_key_for_path(Path::new(&item.path)))
+        .collect::<Vec<_>>();
+    ctx.checkpoint()?;
+    let tags = db
+        .map(|db| db.get_many_display_tags(&keys))
+        .unwrap_or_default();
+    ctx.checkpoint()?;
+    for item in items.iter_mut().filter(|item| item.subresource.is_none()) {
+        let key = crate::tags_db::item_key_for_path(Path::new(&item.path));
+        item.tags = Some(tags.get(&key).cloned().unwrap_or_default());
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -422,7 +567,7 @@ fn folder_cursor(
     permission_epoch: u64,
 ) -> String {
     serde_json::to_vec(&FolderCursor {
-        version: 3,
+        version: 4,
         tool: "list_folder".into(),
         args_digest: args_digest.into(),
         listing_digest: listing_digest.into(),
@@ -454,7 +599,7 @@ fn folder_offset(
         .map(|index| u8::from_str_radix(&cursor[index..index + 2], 16).map_err(|_| bad()))
         .collect::<Result<Vec<_>, _>>()?;
     let cursor: FolderCursor = serde_json::from_slice(&bytes).map_err(|_| bad())?;
-    if cursor.version != 3 || cursor.tool != "list_folder" || cursor.args_digest != args {
+    if cursor.version != 4 || cursor.tool != "list_folder" || cursor.args_digest != args {
         return Err(bad());
     }
     if cursor.permission_epoch != permission_epoch {
@@ -482,6 +627,8 @@ fn folder_page(
     cursor: Option<&str>,
     args: &serde_json::Value,
     permission_epoch: u64,
+    filters: &FolderFilters,
+    read_tags: impl FnOnce(&mut [FolderItem]) -> Result<(), AgentError>,
 ) -> Result<FolderPage, AgentError> {
     let limit = folder_limit(limit)?;
     let args_digest = wire_digest(args).map_err(|_| internal())?;
@@ -497,11 +644,18 @@ fn folder_page(
         items.len(),
         permission_epoch,
     )?;
-    let total = items.len();
+    let mut matching = items
+        .into_iter()
+        .enumerate()
+        .skip(offset)
+        .filter(|(_, item)| filters.matches(item));
+    let selected = matching.by_ref().take(limit).collect::<Vec<_>>();
+    let more = matching.next().is_some();
+    let (indices, mut items): (Vec<_>, Vec<_>) = selected.into_iter().unzip();
+    // Tags cannot affect membership, and only the prospective page needs them.
+    read_tags(&mut items)?;
     let items = items
         .into_iter()
-        .skip(offset)
-        .take(limit)
         .map(|item| {
             if mcp_content_chars(&item).map_err(|_| internal())? > MAX_ITEM_CHARS {
                 PageRow::too_long(&item).map_err(|_| internal())
@@ -517,12 +671,12 @@ fn folder_page(
         book_composition_applied: applied,
     };
     loop {
-        page.truncated = offset + page.items.len() < total;
+        page.truncated = more || page.items.len() < indices.len();
         page.cursor = (page.truncated && !page.items.is_empty()).then(|| {
             folder_cursor(
                 &args_digest,
                 &listing_digest,
-                offset + page.items.len(),
+                indices[page.items.len() - 1] + 1,
                 permission_epoch,
             )
         });

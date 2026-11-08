@@ -19,9 +19,11 @@ pub struct FolderItem {
     pub size: Option<u64>,
     /// UTC Unix milliseconds, when known.
     pub modified: Option<i64>,
+    pub rating: Option<u8>,
+    pub tags: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum FolderKind {
     Folder,
@@ -104,6 +106,38 @@ mod tests {
     use crate::*;
 
     #[test]
+    fn filter_omission_and_null_have_identical_wire_defaults() {
+        for base in [
+            serde_json::json!({"type":"list_folder","path":"C:/photos"}),
+            serde_json::json!({"type":"list_library","kind":"rated"}),
+        ] {
+            let mut explicit = base.clone();
+            explicit["max_stars"] = serde_json::Value::Null;
+            if base["type"] == "list_folder" {
+                explicit["min_stars"] = serde_json::Value::Null;
+                explicit["kinds"] = serde_json::Value::Null;
+            }
+            let omitted: Command = serde_json::from_value(base).unwrap();
+            let null: Command = serde_json::from_value(explicit).unwrap();
+            assert_eq!(omitted, null);
+            assert_eq!(
+                serde_json::to_value(omitted).unwrap(),
+                serde_json::to_value(null).unwrap()
+            );
+        }
+        for command in [
+            serde_json::json!({"type":"list_folder","path":"C:/photos","min_stars":0,"max_stars":2,"kinds":["image","audio"]}),
+            serde_json::json!({"type":"list_library","kind":"rated","stars":2,"max_stars":2}),
+        ] {
+            let parsed: Command = serde_json::from_value(command.clone()).unwrap();
+            let wire = serde_json::to_value(parsed).unwrap();
+            for (key, value) in command.as_object().unwrap() {
+                assert_eq!(&wire[key], value);
+            }
+        }
+    }
+
+    #[test]
     fn folder_and_thumbnail_commands_and_payloads_roundtrip() {
         let item = ItemRef {
             path: "C:/猫.zip".into(),
@@ -111,6 +145,9 @@ mod tests {
         };
         for command in [
             Command::ListFolder {
+                min_stars: None,
+                max_stars: None,
+                kinds: None,
                 path: item.path.clone(),
                 subresource: Some("pages/".into()),
                 limit: Some(100),
@@ -197,6 +234,8 @@ mod tests {
         let page = FolderPage {
             items: vec![
                 FolderItem {
+                    rating: Some(0),
+                    tags: None,
                     path: "C:/book.pdf".into(),
                     subresource: Some("0".into()),
                     name: "page 1".into(),

@@ -20,6 +20,7 @@ mod metadata_response_tests;
 pub(crate) mod metadata_write;
 pub(crate) mod open;
 mod open_response;
+mod rating;
 mod recent;
 pub(crate) use recent::{RecentApps, SharedRecentApps};
 mod collection_write;
@@ -768,10 +769,11 @@ impl Handlers {
             Command::ListLibrary {
                 kind,
                 stars,
+                max_stars,
                 limit,
                 cursor,
             } => self
-                .library(kind, stars, limit, cursor, ctx)
+                .library(kind, stars, max_stars, limit, cursor, ctx)
                 .map(Payload::Library),
             Command::GetItemInfo {
                 items,
@@ -781,9 +783,21 @@ impl Handlers {
             Command::ListFolder {
                 path,
                 subresource,
+                min_stars,
+                max_stars,
+                kinds,
                 limit,
                 cursor,
-            } => self.list_folder(path, subresource, limit, cursor, ctx),
+            } => self.list_folder(
+                path,
+                subresource,
+                min_stars,
+                max_stars,
+                kinds,
+                limit,
+                cursor,
+                ctx,
+            ),
             Command::GetThumbnail {
                 items,
                 long_side,
