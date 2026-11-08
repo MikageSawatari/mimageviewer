@@ -1,6 +1,6 @@
 # 書庫内の本を開く・閉じる (§1.675 + §1.676) 設計
 
-状態: **設計 R4・実装前の独立レビュー ACCEPT (2026-11-08)**。設計担当 ClaudeCode Opus 5.5。ソース調査と下書きは Codex GPT-6.1 Sol / high
+状態: **設計 R4・S1〜S3 実装の独立レビュー ACCEPT、S4 文書整備完了 (2026-11-08)**。master 未マージ・実機確認待ち。設計担当 ClaudeCode Opus 5.5。ソース調査と下書きは Codex GPT-6.1 Sol / high
 (読み取り専用、`bec01bf11`)。利用者の採択は §9、独立設計レビューの経過は §9 に記録する。
 利用者方針 (2026-11-08): 時間がかかるなら v5.1.0 より後に延期してよく、範囲を削らず理想的な形で入れる。
 master へ入れる時期は完成時に利用者へ確認する。
@@ -773,6 +773,7 @@ FFmpeg DLL を `target/debug/deps` へ実体コピーした）:
 
 #### 別件報告: Everything の検索前 origin がない場合の ZIP 階層採用（S1 対象外）
 
+- 別件の追跡先は[バックログ §1.738](next-release-backlog.md)。以下は S1 調査時の記録。
 - master `bec01bf11` の `zip_nav_enter`（`src/app.rs:40520`）、`zip_nav_show_current_level`（`:40190`）、
   `folder_nav_current_entry`（`:25237`）は S1 worktree と同一の関数本体であることを `git show master:src/app.rs` で確認した。
 - Search の owner は `TopLevelGridView` の `return_to` を物理履歴 origin として使う。検索前 origin がないと、
@@ -896,6 +897,7 @@ worktree の `target/codex-tmp`。既存 native 依存物を再利用。製品�
 
 #### 別件報告: 他 AddressBarNav の Terminal にもある再 open 後の旧配送（今回は修正しない）
 
+- 別件の追跡先は[バックログ §1.739](next-release-backlog.md)。以下の行番号は R2 開始時点。
 - R2 開始時点の `src/app/close_return.rs:333` 以降は Terminal effect から nav を返して origin を捨てる。
   `src/app.rs:71343` の reader 受理は close return を終了せず、main list admission の終了入口も通らない。
 - 例えば root ページから直接読んでいた ZIP を Terminal close → teardown →親フォルダ Direct nav を take →
@@ -1099,7 +1101,7 @@ cargo nextest run -p mimageviewer --lib -E 'test(/detached_|viewer_context_regis
 `target/s3-regressions-verified.log`。全lib／workspace suiteと製品起動は実施しない。
 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-dev.ps1 -PreserveRuntime` も成功
 （exit 0）。coreとcompanionを `target/dev-runtime` に配置し、VCRT／PEチェック成功（runtime=4、pe=5）。
-製品は起動していない。変更は未コミットで設計担当の検収待ち。
+製品は起動していない。S3 実装引継ぎ時は未コミットで設計担当の検収待ちだった。その後 `7b3960558` に commit 済みで独立 ACCEPT。
 
 S3変更ファイル：
 
@@ -1112,21 +1114,42 @@ S3変更ファイル：
   `src/app/tests/detached_binding_identity.rs`、`src/app/tests/startup_notices.rs`。
 - 文書：本書、`docs/virtual-folders.md`、`docs/nested-zip-tree-plan.md`、`docs/detached-rework-plan.md`。
 
+### S4 文書・バックログ整備（2026-11-08）
+
+S1〜S3 の独立 ACCEPT を受け、公開マニュアルの設定・本・フルスクリーン・操作一覧・グリッド・検索・読書手順を現在の挙動へ合わせる。
+開く設定の内部階層への適用、選択元の内部一覧への帰還と選択・位置、内部本ごとの続きから、複数窓で main を変えない点を説明する。
+起動時の `startup_list_restore` と読書終了時の帰還は別の契約として明記する。
+キーの action／割当は追加せず、keymap-spec の旧「常に実親へ直帰」の説明だけを訂正する。
+製品ページに今回の挙動と矛盾する説明はなく、カードや公開履歴を増やさない。
+
+バックログ §1.675／§1.676 は旧報告・調査を残して branch 実装済み、独立 ACCEPT、master 未マージ・実機確認待ちを追記する。
+既存 master の別件は §1.738／§1.739 へ分離する。detached 計画 §11 は S1〜S3 の変更範囲と構造修正の合意を確定記録とする。
+S4 は文書だけの未コミット差分であり、製品コードの変更・製品起動は行わない。既存の実装検証証跡を再利用し、文書検査の結果を引継ぎに報告する。
+実機確認と master への取り込み時期の利用者確認は別途残る。
+
+S4 文書検査：`python scripts/check_ui_glyphs.py` は危険 glyph 0・exit 0。
+worktree 内の一時検査 `python target/s4-doc-check.py` は HTML 8 ページの構造差分・ID と追加ローカルリンク 25 件、
+新規番号 §1.738／§1.739、§1.675／§1.676 の旧記録保持、変更 12 ファイルが文書だけであることを確認し exit 0。
+`git -c core.safecrlf=false diff --check` も exit 0。製品ページは変更しないためカード検査は対象外。
+文書のみなので Rust の再テスト・検証バイナリの再ビルドは行わず、製品起動・公開・commit もしない。
+
 ## 10. 実装段階と規模
 
 | 段階・commit境界 | 内容 | 主な検証 |
 |---|---|---|
-| **S1：共通activationとmain帰還** | 採択済みOption A、Chosen、row anchor、通常／即時／early-return close、typed内部open継続。**内部本は先頭固定・resume の照会も保存もしない** | 現§8の入口・close・deep／collapse・専用帰路・linked／独立不変 |
-| **S2：内部resumeの保存契約（実装・自動検証完了）** | key helper、DB/writer adapter、read/write/fence、内部DFS、editor、Remote、maintenance、互換性 | §9の最終検証成功。保存開始とmaintenance対応を同じcoherent commitに含める |
-| **S3：複数窓の内部本open（実装・自動検証完了）** | descriptor target、列挙前scope解決、source alias、hydration／構成／resume、conversion・初回終端 | §9の110件＋既存1,085件成功、未コミット |
-| **S4：統合受入** | docs／spec／manualの最終整合、必要な全体gate、検証build | S1〜S3の有効証跡を再利用し、統合差分と必須gateを検査 |
+| **S1：共通activationとmain帰還（完了・独立 ACCEPT）** `875166c1b`・`75f796a6e`・`73a478805` | 採択済みOption A、Chosen、row anchor、通常／即時／early-return close、typed内部open継続。S1 時点では内部本を先頭固定とし、resume は S2 で追加 | §9 の入口・close・deep／collapse・専用帰路・linked／独立不変、実装レビュー R1／R2 の回帰成功 |
+| **S2：内部resumeの保存契約（完了・独立 ACCEPT）** `e7804a2ea`・`871439372` | key helper、DB/writer adapter、read/write/fence、内部DFS、editor、Remote、maintenance、互換性、IPC 版照合 | §9の最終検証成功。保存開始とmaintenance対応を同じcoherent commitに含めた |
+| **S3：複数窓の内部本open（完了・独立 ACCEPT）** `7b3960558` | descriptor target、列挙前scope解決、source alias、hydration／構成／resume、conversion・初回終端 | §9の110件＋既存1,085件成功、core check・検証build成功 |
+| **S4：文書・バックログ整備（本変更、未コミット）** | manual／keymap-spec の整合、バックログ状態更新・既存別件の起票、detached §11 と本節の確定記録。製品コード変更なし | S1〜S3の有効証跡を再利用。公開文書のグリフ・差分・リンクを検査し結果を引継ぎに記録。実機確認・マージ時期の確認は別途 |
 
 各段階で独立レビューを行い、修正済みfindingの影響範囲だけを再検証する。S1単独を今回要求の完成・リリース可能状態とは扱わない。
 
 S1 本体は `875166c1b`、実装レビュー R1 の修正は `75f796a6e` に commit 済み。
 実装レビュー R2 の修正は `73a478805` に commit 済みで独立 ACCEPT。S2 本体は `e7804a2ea` に commit 済み。
 S2 レビュー R1 の版照合修正は `871439372` にcommit済みで独立ACCEPT。
-S3は実装・自動検証完了、未コミットで設計担当の検収待ち。S4は未着手。
+S3 は `7b3960558` に commit 済みで独立 ACCEPT。S4 は今回の文書変更として完了し、未コミットで引き渡す。
+branch `fix-1675-1676-zipdir-book`（worktree `G:\home\mimageviewer-zipdir-book`）で実装済みだが master へは未マージ。
+取り込み時期は利用者に確認し、v5.1 より後になる場合がある。実機確認は未実施であり、今回の文書整備をリリース受入の完了とは扱わない。
 
 追加対象には `book_resume_key` 相当の共通module、`book_resume_db`、`rename_key_migration`、Remoteのcontainer/session/ui、descriptorを構築する `startup_ops`、archive conversion continuationを含む。
 
