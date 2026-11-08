@@ -185,6 +185,7 @@ const {
   isStreamMediaKind,
   loadFolder,
   renderFolder,
+  showContainer,
   setViewerRating,
   requestSpreadMode,
   normalizeRemoteAdjustmentValues,
@@ -1322,12 +1323,21 @@ test("container opening resumes the matching page and otherwise falls back safel
   }), -1);
   for (const resumeRefusal of ["saved_page_unavailable", "legacy_position_unverified"]) {
     assert.equal(containerInitialImageIndex({
-      openMode: "resume_page",
+      openMode: "grid",
       resumePage: null,
       resumeRefusal,
       images,
     }), -1);
     assert.match(containerResumeRefusalNotice(resumeRefusal), /一覧からページを選んでください/);
+    for (const openMode of ["first_page", "resume_page"]) {
+      assert.equal(containerInitialImageIndex({
+        openMode,
+        resumePage: null,
+        resumeRefusal,
+        images,
+      }), 0, "the server's inner-book Page decision owns refusal fallback");
+      assert.match(containerResumeRefusalNotice(resumeRefusal, openMode), /先頭ページから表示します/);
+    }
   }
   assert.equal(containerResumeRefusalNotice(null), "");
 });
@@ -4819,6 +4829,175 @@ test("visibility resume refusals remain on the grid with a visible selection not
   } finally {
     globalThis.ResizeObserver = previousResizeObserver;
     globalThis.history = previousHistory;
+  }
+});
+
+test("inner resume refusal opens the server's first visible composed page with a viewer notice", async () => {
+  const previousFetch = globalThis.fetch;
+  const previousHistory = globalThis.history;
+  const previousDocumentElement = document.documentElement;
+  const originalNotice = ImageViewer.prototype.showBoundaryMessage;
+  let viewer = null;
+  let reason = "saved_page_unavailable";
+  const address = { path: testPath("inner-refused.zip"), subresource: { kind: "zip_directory", prefix: "A/" } };
+  const entries = ["03.jpg", "01.jpg"].map((name) => ({
+    kind: "image", name,
+    address: { path: address.path, subresource: { kind: "zip_entry", entry_name: `A/${name}` } },
+  }));
+  document.documentElement = {};
+  globalThis.history = {
+    state: {},
+    replaceState(value) { this.state = value; },
+    pushState(value) { this.state = value; },
+  };
+  globalThis.fetch = async (input) => {
+    if (new URL(input, testLocation.origin).pathname === "/api/container") {
+      return Response.json({
+        kind: "zip", effective_address: address,
+        entries, image_count: 2, composition_managed: true,
+        resume_page: null, resume_refusal: reason, open_mode: "first_page",
+        page_groups: entries.map((entry) => ({ anchor: entry.address, pages: [entry.address], slice: "full" })),
+      });
+    }
+    // Keep page loading pending: the initial route and visible notice are already synchronous.
+    return new Promise(() => {});
+  };
+  ImageViewer.prototype.showBoundaryMessage = function(message) {
+    viewer = this;
+    originalNotice.call(this, message);
+  };
+  try {
+    for (reason of ["saved_page_unavailable", "legacy_position_unverified"]) {
+      history.state = {};
+      await showContainer(address);
+      const snapshot = containerRuntimeStateForTest();
+      assert.equal(snapshot.imageIndex, 0);
+      assert.equal(snapshot.pageGroupIndex, 0);
+      assert.equal(snapshot.container.openMode, "first_page");
+      assert.equal(viewer.boundaryMessage.hidden, false);
+      assert.equal(viewer.boundaryMessage.textContent, containerResumeRefusalNotice(reason, "first_page"));
+      assert.match(viewer.boundaryMessage.textContent, /先頭ページから表示します/);
+      assert.equal(history.state.autoOpenedContainer, true);
+      cleanupVideoViewerForTest(viewer);
+      viewer = null;
+    }
+  } finally {
+    if (viewer) cleanupVideoViewerForTest(viewer);
+    ImageViewer.prototype.showBoundaryMessage = originalNotice;
+    globalThis.fetch = previousFetch;
+    globalThis.history = previousHistory;
+    document.documentElement = previousDocumentElement;
+  }
+});
+
+test("reading progress retains requested raw scope when the visible ZIP level collapses", async () => {
+  // Give this lifecycle fixture its own progress/session/container owners. Other
+  // runtime tests must not inherit an emitted batch or cancelled page demand.
+  const runtime = await import("./app.js?reading-progress-raw-scope");
+  const previousFetch = globalThis.fetch;
+  const previousHistory = globalThis.history;
+  const previousDocumentElement = document.documentElement;
+  const previousVisibility = document.visibilityState;
+  const previousFocus = FakeElement.prototype.focus;
+  const originalLoadGroup = runtime.ImageViewer.prototype.loadGroup;
+  let viewer = null;
+  const path = testPath("progress-raw-scope.zip");
+  const effectiveAddress = { path, subresource: { kind: "zip_directory", prefix: "Chapter/Pages/" } };
+  const requestedAddresses = [
+    { path, subresource: { kind: "zip_directory", prefix: "Chapter/" } },
+    { path, subresource: { kind: "file" } },
+  ];
+  const pageAddress = { path, subresource: { kind: "zip_entry", entry_name: "Chapter/Pages/03.jpg" } };
+  const entries = ["03.jpg", "01.jpg"].map((name) => ({
+    kind: "image", name,
+    address: { path, subresource: { kind: "zip_entry", entry_name: `Chapter/Pages/${name}` } },
+  }));
+  const writes = [];
+  const renderedContexts = [];
+  document.documentElement = {};
+  document.visibilityState = "hidden";
+  FakeElement.prototype.focus = () => {};
+  globalThis.history = {
+    state: {},
+    replaceState(value) { this.state = value; },
+    pushState(value) { this.state = value; },
+  };
+  globalThis.fetch = async (input, init = {}) => {
+    const url = new URL(input, testLocation.origin);
+    if (url.pathname === "/api/container") return Response.json({
+      kind: "zip", effective_address: effectiveAddress,
+      entries, image_count: entries.length, composition_managed: true,
+      open_mode: "first_page",
+      page_groups: entries.map((entry) => ({ anchor: entry.address, pages: [entry.address], slice: "full" })),
+    });
+    if (url.pathname === "/api/page") return new Promise((_resolve, reject) => {
+      const cancel = () => reject(new DOMException("test page cancelled", "AbortError"));
+      if (init.signal?.aborted) cancel();
+      else init.signal?.addEventListener("abort", cancel, { once: true });
+    });
+    if (url.pathname === "/api/write") {
+      const body = JSON.parse(init.body);
+      if (body.kind === "record_reading_progress") {
+        const paths = url.searchParams.getAll("path");
+        const expandAddress = ({ path_query_index, ...address }) => {
+          assert.ok(Number.isInteger(path_query_index) && path_query_index < paths.length);
+          return { ...address, path: paths[path_query_index] };
+        };
+        writes.push({ ...body,
+          address: expandAddress(body.address),
+          context_address: expandAddress(body.context_address),
+        });
+      }
+      return Response.json({ applied: true });
+    }
+    return Response.json({});
+  };
+  runtime.ImageViewer.prototype.loadGroup = async function(group) {
+    viewer = this;
+    renderedContexts.push(...group.pages.map((page) => page.request.renderContext));
+    // Control only the image-loader completion. The route, position settlement,
+    // progress batching and wire producer all execute through their real handlers.
+    return { outcome: ViewerGroupLoadOutcome.APPLIED };
+  };
+  try {
+    runtime.applyRemoteSessionId(TEST_SESSION_ID, () => {});
+    for (const [index, requestedAddress] of requestedAddresses.entries()) {
+      history.state = {};
+      await runtime.showContainer(requestedAddress);
+      for (let turn = 0; turn < 100 && writes.length <= index; turn += 1) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      assert.equal(writes.length, index + 1, "each requested book scope owns a separate progress batch");
+      assert.deepEqual(writes[index].context_address, requestedAddress);
+      assert.deepEqual(writes[index].address, pageAddress);
+      assert.equal(writes[index].page_index, 0);
+      assert.equal(writes[index].page_number, 1);
+      assert.equal(writes[index].page_count, 2);
+      const snapshot = runtime.containerRuntimeStateForTest();
+      assert.deepEqual(snapshot.container.requestedAddress, requestedAddress);
+      assert.deepEqual(snapshot.container.address, effectiveAddress);
+      assert.equal(snapshot.position.displayed.groupIndex, 0);
+      runtime.cleanupVideoViewerForTest(viewer);
+      viewer = null;
+    }
+    assert.ok(renderedContexts.length > 0);
+    assert.ok(renderedContexts.every((context) =>
+      remoteAddressIdentity(context.context_address) === remoteAddressIdentity(effectiveAddress)),
+    "page rendering retains its effective visible context");
+  } finally {
+    if (viewer) runtime.cleanupVideoViewerForTest(viewer);
+    runtime.applyRemoteSessionId("", () => {});
+    runtime.applyContainerData({ path, subresource: { kind: "file" } }, { entries: [], page_groups: [] }, false);
+    // Finish the progress POST and cancellation callbacks with this fixture's
+    // fetch still installed; the isolated owner cannot later publish into tests.
+    for (let turn = 0; turn < 10; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+    runtime.ImageViewer.prototype.loadGroup = originalLoadGroup;
+    if (previousFocus) FakeElement.prototype.focus = previousFocus;
+    else delete FakeElement.prototype.focus;
+    globalThis.fetch = previousFetch;
+    globalThis.history = previousHistory;
+    document.documentElement = previousDocumentElement;
+    document.visibilityState = previousVisibility;
   }
 });
 

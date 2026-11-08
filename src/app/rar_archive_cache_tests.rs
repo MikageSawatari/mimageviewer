@@ -657,7 +657,7 @@ fn rar_archive_cache_direct_first_volume_has_priority_over_old_conversion_cache(
     app.record_book_resume(0);
     assert_eq!(
         app.last_book_resume.as_ref().map(|(key, _, _, _)| key),
-        Some(&first)
+        Some(&crate::book_resume_key::BookResumeKey::legacy(&first))
     );
     assert_eq!(app.try_archive_cache_lookup(&first), Some(cached));
 }
@@ -873,6 +873,6 @@ fn rar_archive_cache_single_volume_with_later_looking_filename_still_opens_direc
     app.record_book_resume(0);
     assert_eq!(
         app.last_book_resume.as_ref().map(|(key, _, _, _)| key),
-        Some(&single)
+        Some(&crate::book_resume_key::BookResumeKey::legacy(&single))
     );
 }

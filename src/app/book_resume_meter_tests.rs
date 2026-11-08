@@ -88,7 +88,7 @@ fn legacy_document_resume_deferred_opens_saved_raw_with_exclusions() {
             history_trigger: super::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: super::DeferredFsTarget::None,
-            resume_to_last_page: true,
+            resume_to_last_page: (true).into(),
             from_explicit_open: true,
             preserve_after_password_prompt: true,
         }),
@@ -115,7 +115,7 @@ fn resume_refusal_deferred_opens_first_page_with_notice(hidden: bool) {
             history_trigger: super::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: super::DeferredFsTarget::None,
-            resume_to_last_page: true,
+            resume_to_last_page: (true).into(),
             from_explicit_open: true,
             preserve_after_password_prompt: true,
         }),
@@ -189,7 +189,7 @@ fn resume_refusal_deferred_warning_survives_first_page_adjustment_notice() {
                 history_trigger: super::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: super::DeferredFsTarget::None,
-                resume_to_last_page: true,
+                resume_to_last_page: (true).into(),
                 from_explicit_open: true,
                 preserve_after_password_prompt: true,
             }),
@@ -266,7 +266,7 @@ fn resume_refusal_open_warning_survives_cached_panorama_hint() {
                         history_trigger: super::HistoryTrigger::UserChosen,
                         resume_slideshow: false,
                         target: super::DeferredFsTarget::None,
-                        resume_to_last_page: true,
+                        resume_to_last_page: (true).into(),
                         from_explicit_open: true,
                         preserve_after_password_prompt: true,
                     }),
@@ -998,21 +998,23 @@ fn book_resume_meter_records_hud_ordinal_in_mixed_items() {
         app.record_book_resume(idx);
         assert_eq!(
             app.last_book_resume.as_ref().map(|(path, page, meter, _)| (
-                path.clone(),
+                path.storage_key(),
                 *page,
                 *meter
             )),
-            Some((book.clone(), idx, meter(ordinal, 3)))
+            Some((crate::path_key::normalize(&book), idx, meter(ordinal, 3)))
         );
         assert_eq!(app.book_resume_meters.get(&book), meter(ordinal, 3));
     }
     app.record_book_resume(1);
     app.record_book_resume(2);
     assert_eq!(
-        app.last_book_resume
-            .as_ref()
-            .map(|(path, page, meter, _)| (path.clone(), *page, *meter)),
-        Some((book.clone(), 4, meter(3, 3)))
+        app.last_book_resume.as_ref().map(|(path, page, meter, _)| (
+            path.storage_key(),
+            *page,
+            *meter
+        )),
+        Some((crate::path_key::normalize(&book), 4, meter(3, 3)))
     );
     settle(&mut app);
     assert_eq!(
@@ -1042,10 +1044,12 @@ fn book_resume_meter_uses_hud_rtl_reading_order_and_spread_anchor() {
     );
     app.record_book_resume(1);
     assert_eq!(
-        app.last_book_resume
-            .as_ref()
-            .map(|(path, page, meter, _)| (path.clone(), *page, *meter)),
-        Some((book.clone(), 1, meter(2, 4)))
+        app.last_book_resume.as_ref().map(|(path, page, meter, _)| (
+            path.storage_key(),
+            *page,
+            *meter
+        )),
+        Some((crate::path_key::normalize(&book), 1, meter(2, 4)))
     );
 
     app.spread_mode = SpreadMode::Rtl;
@@ -1055,10 +1059,12 @@ fn book_resume_meter_uses_hud_rtl_reading_order_and_spread_anchor() {
     );
     app.record_book_resume(1);
     assert_eq!(
-        app.last_book_resume
-            .as_ref()
-            .map(|(path, page, meter, _)| (path.clone(), *page, *meter)),
-        Some((book.clone(), 1, meter(2, 4)))
+        app.last_book_resume.as_ref().map(|(path, page, meter, _)| (
+            path.storage_key(),
+            *page,
+            *meter
+        )),
+        Some((crate::path_key::normalize(&book), 1, meter(2, 4)))
     );
     assert_eq!(app.book_resume_meters.get(&book), meter(2, 4));
 }
@@ -1140,9 +1146,11 @@ fn book_resume_meter_pending_snapshot_replays_record_remove_and_clear() {
     writer_ack(app.book_resume_writer.as_ref().unwrap());
     app.clear_book_resume_async();
     assert_eq!(
-        app.last_book_resume
-            .as_ref()
-            .map(|(path, page, meter, _)| (path.clone(), *page, *meter)),
+        app.last_book_resume.as_ref().map(|(path, page, meter, _)| (
+            path.storage_key(),
+            *page,
+            *meter
+        )),
         None
     );
     app.persist_book_resume(keep.clone(), 1, meter(2, 3));
@@ -1183,12 +1191,14 @@ fn book_resume_meter_reload_preserves_latest_pending_resume_source() {
     let resume = app.book_resume_writer.as_ref().unwrap().pause_for_test();
     let value = meter(8, 10);
     app.persist_book_resume(book.clone(), 7, value);
-    let latest = Some((book.clone(), 7, value));
+    let latest = Some((crate::path_key::normalize(&book), 7, value));
     app.reload_book_resume_meters();
     assert_eq!(
-        app.last_book_resume
-            .as_ref()
-            .map(|(path, page, meter, _)| (path.clone(), *page, *meter)),
+        app.last_book_resume.as_ref().map(|(path, page, meter, _)| (
+            path.storage_key(),
+            *page,
+            *meter
+        )),
         latest,
         "Remoteの直近raw位置は再読込で失わない"
     );
@@ -1197,9 +1207,11 @@ fn book_resume_meter_reload_preserves_latest_pending_resume_source() {
     resume.send(()).unwrap();
     settle(&mut app);
     assert_eq!(
-        app.last_book_resume
-            .as_ref()
-            .map(|(path, page, meter, _)| (path.clone(), *page, *meter)),
+        app.last_book_resume.as_ref().map(|(path, page, meter, _)| (
+            path.storage_key(),
+            *page,
+            *meter
+        )),
         latest
     );
     assert_eq!(app.book_resume_meters.get(&book), value);

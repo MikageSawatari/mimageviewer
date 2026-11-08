@@ -1501,7 +1501,7 @@ impl App {
             if let Some(index) = landing {
                 self.fullscreen_idx = Some(index);
                 self.move_grid_cursor(Some(index), super::GridCursorIntent::Automatic);
-            } else if !self.has_book_dfs_continuation() {
+            } else if !self.has_book_projection_open_continuation() {
                 self.close_fullscreen();
             }
         }

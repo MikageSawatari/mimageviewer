@@ -2059,10 +2059,8 @@ impl crate::app::App {
                 ClaimedRemoteUiRequest::BookResumeRead(pending) => {
                     if let Some(writer) = self.book_resume_writer.as_ref() {
                         let cutoff = writer.watermarks().admitted;
-                        let receiver = writer.read_position_after(
-                            &crate::path_key::normalize(pending.path()),
-                            cutoff,
-                        );
+                        let receiver =
+                            writer.read_position_after(&pending.key().storage_key(), cutoff);
                         self.remote_session_ui
                             .pending_resume_reads
                             .push(PendingRemoteResumeRead {
@@ -2072,21 +2070,32 @@ impl crate::app::App {
                             });
                         continue;
                     }
+                    if matches!(
+                        pending.key(),
+                        crate::book_resume_key::BookResumeKey::ArchiveLevel { .. }
+                    ) {
+                        crate::logger::log(
+                            "remote_ipc: inner book resume read unavailable without writer"
+                                .to_owned(),
+                        );
+                        pending.complete_position(None);
+                        continue;
+                    }
                     let latest =
                         self.last_book_resume
                             .as_ref()
-                            .and_then(|(path, page, _, identity)| {
-                                (crate::path_key::normalize(path)
-                                    == crate::path_key::normalize(pending.path()))
-                                .then(|| crate::book_resume_db::ReadingPosition {
-                                    page: *page,
-                                    identity: identity.clone(),
+                            .and_then(|(key, page, _, identity)| {
+                                (key == pending.key()).then(|| {
+                                    crate::book_resume_db::ReadingPosition {
+                                        page: *page,
+                                        identity: identity.clone(),
+                                    }
                                 })
                             });
                     let page = latest.or_else(|| {
                         self.book_resume_db
                             .as_ref()
-                            .and_then(|db| db.get_position(pending.path()))
+                            .and_then(|db| db.get_position_key(pending.key()))
                     });
                     pending.complete_position(page);
                 }
@@ -2739,10 +2748,32 @@ impl crate::app::App {
             )));
             return;
         }
-        let response = self.apply_remote_write_with_composition_admission(
-            pending.request(),
-            pending.composition_admission(),
-        );
+        let response = if let Some(progress) = pending.reading_progress() {
+            let RemoteWriteRequest::RecordReadingProgress {
+                address,
+                context_address,
+                page_number,
+                page_count,
+                record_history,
+                ..
+            } = pending.request()
+            else {
+                unreachable!("validated progress retains its wire request")
+            };
+            self.persist_validated_remote_reading_progress(
+                address,
+                context_address,
+                *page_number,
+                *page_count,
+                *record_history,
+                progress,
+            )
+        } else {
+            self.apply_remote_write_with_composition_admission(
+                pending.request(),
+                pending.composition_admission(),
+            )
+        };
         if matches!(response, RemoteWriteResponse::Success(_))
             && self.settings.remember_spread_shift_per_book
             && let RemoteWriteRequest::SetSpread { address, .. } = pending.request()
@@ -2886,22 +2917,9 @@ impl crate::app::App {
                 endpoint,
                 preference,
             } => self.persist_remote_page_alone_preference(address, *endpoint, *preference),
-            RemoteWriteRequest::RecordReadingProgress {
-                address,
-                context_address,
-                page_index,
-                page_number,
-                page_count,
-                record_resume,
-                record_history,
-            } => self.persist_remote_reading_progress(
-                address,
-                context_address,
-                *page_index,
-                *page_number,
-                *page_count,
-                *record_resume,
-                *record_history,
+            RemoteWriteRequest::RecordReadingProgress { .. } => write_error(
+                RemoteWriteErrorCode::BadRequest,
+                "読書位置の検証結果がありません",
             ),
             RemoteWriteRequest::RecordVideoProgress {
                 address,
@@ -3310,56 +3328,33 @@ impl crate::app::App {
         }
     }
 
-    fn persist_remote_reading_progress(
+    fn persist_validated_remote_reading_progress(
         &mut self,
         address: &mimageviewer_ipc::RemoteAddress,
         context_address: &mimageviewer_ipc::RemoteAddress,
-        page_index: u32,
         page_number: u32,
         page_count: u32,
-        record_resume: bool,
         record_history: bool,
+        validated: &super::session::ValidatedRemoteReadingProgress,
     ) -> RemoteWriteResponse {
         let target = match remote_reading_target(address, context_address) {
             Ok(target) => target,
             Err(error) => return RemoteWriteResponse::Error(error),
         };
-        if record_resume && (self.book_resume_db.is_none() || self.book_resume_writer.is_none()) {
-            return write_error(
-                RemoteWriteErrorCode::PersistenceFailed,
-                "読書位置 DB を利用できません",
-            );
-        }
-        let page_index = page_index as usize;
-        if record_resume {
-            // Remoteの従来のNULL記録を維持し、旧meterを消す。
-            let identity = match &address.subresource {
-                mimageviewer_ipc::RemoteSubresource::File => {
-                    Some(crate::book_resume_db::PageIdentity::Image {
-                        path: crate::path_key::normalize_keep_drive(std::path::Path::new(
-                            &address.path,
-                        )),
-                    })
-                }
-                mimageviewer_ipc::RemoteSubresource::ZipEntry { entry_name } => {
-                    Some(crate::book_resume_db::PageIdentity::Archive {
-                        container: crate::path_key::normalize_keep_drive(&target.container_path),
-                        entry_name: entry_name.replace('\\', "/"),
-                    })
-                }
-                mimageviewer_ipc::RemoteSubresource::PdfPage { page_number } => {
-                    Some(crate::book_resume_db::PageIdentity::Document {
-                        container: crate::path_key::normalize_keep_drive(&target.container_path),
-                        page_num: *page_number as usize,
-                    })
-                }
-                mimageviewer_ipc::RemoteSubresource::ZipDirectory { .. } => None,
-            };
-            self.persist_book_resume_with_identity(
-                target.container_path.clone(),
-                page_index,
+        if let Some(resume) = &validated.resume {
+            if self.book_resume_db.is_none() || self.book_resume_writer.is_none() {
+                return write_error(
+                    RemoteWriteErrorCode::PersistenceFailed,
+                    "読書位置 DB を利用できません",
+                );
+            }
+            // The worker validated this exact logical key, identity and canonical
+            // slot. Preserve Remote's existing NULL reading-meter semantics.
+            self.persist_book_resume_key_with_identity(
+                resume.key.clone(),
+                resume.raw_index,
                 None,
-                identity,
+                Some(resume.identity.clone()),
             );
         }
 
@@ -3391,8 +3386,12 @@ impl crate::app::App {
                     target.history_kind,
                     None,
                     title,
-                    record_resume.then_some(i64::from(page_number)),
-                    record_resume.then_some(i64::from(page_count)),
+                    validated
+                        .history_has_position
+                        .then_some(i64::from(page_number)),
+                    validated
+                        .history_has_position
+                        .then_some(i64::from(page_count)),
                 );
                 if let Some(writer) = self.reading_history_writer.as_ref() {
                     writer.record(entry, self.settings.reading_history_limit);
@@ -7915,6 +7914,69 @@ mod tests {
             .unwrap()
     }
 
+    fn apply_validated_progress_for_test(
+        app: &mut crate::app::App,
+        handle: &SessionHandle,
+        request: RemoteWriteRequest,
+    ) -> RemoteWriteResponse {
+        let engine = super::super::container::ContainerEngine::new(app.settings.clone());
+        let payload = engine.qualified_write_payload(request).unwrap();
+        let operation = handle
+            .begin_operation(&handle.owner_for_test("phone"), "reading progress".into())
+            .unwrap();
+        let producer = handle.clone();
+        let worker = std::thread::spawn(move || {
+            producer.submit_validated_write(payload, operation, Default::default())
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !worker.is_finished() {
+            app.service_remote_session(&egui::Context::default());
+            assert!(
+                std::time::Instant::now() < deadline,
+                "validated progress did not settle"
+            );
+            std::thread::yield_now();
+        }
+        let UiWriteOutcome::Write(response) = worker.join().unwrap() else {
+            panic!("validated reading progress lost session ownership");
+        };
+        response
+    }
+
+    fn reading_progress_request(
+        address: mimageviewer_ipc::RemoteAddress,
+        context_address: mimageviewer_ipc::RemoteAddress,
+    ) -> RemoteWriteRequest {
+        RemoteWriteRequest::RecordReadingProgress {
+            address,
+            context_address,
+            page_index: 999,
+            page_number: 999,
+            page_count: 999,
+            record_resume: false,
+            record_history: false,
+        }
+    }
+
+    fn read_remote_position_for_test(
+        app: &mut crate::app::App,
+        handle: &SessionHandle,
+        key: crate::book_resume_key::BookResumeKey,
+    ) -> Option<crate::book_resume_db::ReadingPosition> {
+        let reader = handle.clone();
+        let worker = std::thread::spawn(move || reader.read_book_position_key(&key));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !worker.is_finished() {
+            app.service_remote_session(&egui::Context::default());
+            assert!(
+                std::time::Instant::now() < deadline,
+                "typed FIFO resume read did not settle"
+            );
+            std::thread::yield_now();
+        }
+        worker.join().unwrap().unwrap()
+    }
+
     #[test]
     fn remote_static_page_progress_is_the_next_pc_open_position() {
         let mut app = crate::app::tests::phase_c_support::setup_app();
@@ -7946,20 +8008,19 @@ mod tests {
             super::super::session::RemoteControlPhase::RemoteActive
         );
 
-        let response = app.persist_remote_reading_progress(
-            &mimageviewer_ipc::RemoteAddress::file(second.to_string_lossy().into_owned()),
-            &mimageviewer_ipc::RemoteAddress::file(folder.to_string_lossy().into_owned()),
-            1,
-            2,
-            2,
-            true,
-            true,
+        let response = apply_validated_progress_for_test(
+            &mut app,
+            &handle,
+            reading_progress_request(
+                mimageviewer_ipc::RemoteAddress::file(second.to_string_lossy().into_owned()),
+                mimageviewer_ipc::RemoteAddress::file(folder.to_string_lossy().into_owned()),
+            ),
         );
         assert!(matches!(response, RemoteWriteResponse::Success(_)));
         assert_eq!(
             app.last_book_resume,
             Some((
-                folder.clone(),
+                crate::book_resume_key::BookResumeKey::legacy(&folder),
                 1,
                 None,
                 Some(crate::book_resume_db::PageIdentity::Image {
@@ -7988,45 +8049,137 @@ mod tests {
     }
 
     #[test]
-    fn remote_nested_page_without_resume_preserves_previous_root_meter() {
+    fn remote_inner_progress_saves_its_key_without_overwriting_root_resume_or_history_position() {
+        use std::io::Write;
         let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.settings.reading_history_enabled = true;
         settle_book_resume_meter(&mut app);
         let archive = app.tmp.path().join("remote-book.zip");
-        // producerの既存path guardを通す実ファイル。ZIP列挙は検証済みhandoffの前段。
-        std::fs::write(&archive, b"zip").unwrap();
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        for name in [
+            "root.jpg",
+            "chapter/01.jpg",
+            "chapter/02.jpg",
+            "sibling/01.jpg",
+        ] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"page").unwrap();
+        }
+        zip.finish().unwrap();
         let old_meter = crate::book_resume_db::ReadingMeterValue::new(3, 8);
         app.persist_book_resume(archive.clone(), 2, old_meter);
         settle_book_resume_meter(&mut app);
-        let previous_resume = app.last_book_resume.clone();
 
-        let response = app.persist_remote_reading_progress(
-            &mimageviewer_ipc::RemoteAddress {
-                path: archive.to_string_lossy().into_owned(),
-                subresource: RemoteSubresource::ZipEntry {
-                    entry_name: "chapter/01.jpg".into(),
-                },
+        let handle = SessionHandle::new();
+        app.set_remote_session_handle(handle.clone());
+        handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "phone".into(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: None,
             },
-            &mimageviewer_ipc::RemoteAddress {
-                path: archive.to_string_lossy().into_owned(),
-                subresource: RemoteSubresource::ZipDirectory {
-                    prefix: "chapter/".into(),
+        });
+        app.poll_remote_session(&egui::Context::default());
+        let response = apply_validated_progress_for_test(
+            &mut app,
+            &handle,
+            reading_progress_request(
+                mimageviewer_ipc::RemoteAddress {
+                    path: archive.to_string_lossy().into_owned(),
+                    subresource: RemoteSubresource::ZipEntry {
+                        entry_name: "chapter/02.jpg".into(),
+                    },
                 },
-            },
-            0,
-            1,
-            2,
-            false,
-            true,
+                mimageviewer_ipc::RemoteAddress {
+                    path: archive.to_string_lossy().into_owned(),
+                    subresource: RemoteSubresource::ZipDirectory {
+                        prefix: "chapter/".into(),
+                    },
+                },
+            ),
         );
         assert!(matches!(response, RemoteWriteResponse::Success(_)));
-        assert_eq!(app.last_book_resume, previous_resume);
+        let inner_key =
+            crate::book_resume_key::BookResumeKey::archive(&archive, &["chapter".into()]).unwrap();
+        let identity = crate::book_resume_db::PageIdentity::Archive {
+            container: crate::path_key::normalize_keep_drive(&archive),
+            entry_name: "chapter/02.jpg".into(),
+        };
+        assert_eq!(
+            app.last_book_resume,
+            Some((inner_key.clone(), 1, None, Some(identity.clone())))
+        );
         assert_eq!(app.book_resume_meters.get(&archive), old_meter);
         settle_book_resume_meter(&mut app);
         assert_eq!(
             persisted_book_resume_meter_row(app.tmp.path(), &archive),
             (2, Some(3), Some(8)),
-            "非root階層のローカルindexは既存root位置やmeterを変更しない"
+            "内部本の位置やmeterをroot行へ保存しない"
         );
+        assert_eq!(
+            app.book_resume_db
+                .as_ref()
+                .unwrap()
+                .get_position_key(&inner_key),
+            Some(crate::book_resume_db::ReadingPosition {
+                page: 1,
+                identity: Some(identity)
+            })
+        );
+        let sibling_key =
+            crate::book_resume_key::BookResumeKey::archive(&archive, &["sibling".into()]).unwrap();
+        assert_eq!(
+            app.book_resume_db
+                .as_ref()
+                .unwrap()
+                .get_position_key(&sibling_key),
+            None
+        );
+
+        for (key, expected_page) in [
+            (inner_key.clone(), Some(1)),
+            (sibling_key, None),
+            (
+                crate::book_resume_key::BookResumeKey::legacy(&archive),
+                Some(2),
+            ),
+        ] {
+            assert_eq!(
+                read_remote_position_for_test(&mut app, &handle, key).map(|position| position.page),
+                expected_page
+            );
+        }
+        drop(app.book_resume_writer.take());
+        assert_eq!(
+            read_remote_position_for_test(&mut app, &handle, inner_key),
+            None,
+            "a new inner-key read never falls back to synchronous UI-thread DB I/O"
+        );
+        assert_eq!(
+            read_remote_position_for_test(
+                &mut app,
+                &handle,
+                crate::book_resume_key::BookResumeKey::legacy(&archive)
+            )
+            .map(|position| position.page),
+            Some(2),
+            "the released root fallback is unchanged"
+        );
+
+        // Joining this test-owned writer gives a deterministic persisted-history assertion.
+        drop(app.reading_history_writer.take());
+        let rows = app
+            .reading_history_db
+            .as_ref()
+            .unwrap()
+            .list_recent(100)
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.path == archive)
+            .expect("outer archive history touch");
+        assert_eq!((row.last_page, row.page_count), (None, None));
     }
 }
 

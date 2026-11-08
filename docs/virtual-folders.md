@@ -445,12 +445,20 @@ Enter/ダブルクリック/ゲームパッド/Ctrl+↑↓(本またぎ)/Backspa
 現在の本のページだけになるため本ごとに自動リセットされる。詳細は
 [nested-zip-tree-plan.md](nested-zip-tree-plan.md)。
 
-§1.675/§1.676 S1（実装中）: main の ZipDir のダブルクリック・Enter・パッド決定は
+§1.675/§1.676 S1・S2（実装・自動検証済み）: main の ZipDir のダブルクリック・Enter・パッド決定は
 `activate_main_zipdir` を共用する。「ページを表示」の実効値が ON なら、collapse 後の階層に
 直下ページがある場合に既存の index 準備・本の構成・表示許可を経て開く。内部フォルダと入れ子書庫は
 同じ扱いで、画像のみ実フォルダ用の設定には依存しない。構成順と最終可視集合を満たす最初のページを
 採り、表示可能なページがなければその階層の一覧に留まる。子の本へ自動で潜らない。
-S1 は内部本の保存位置を読まず・保存せず、先頭固定。複数ウィンドウモードと★固定中は従来の一覧移動を保つ。
+S2 では内部本ごとに読書位置を保存し、直接 open は `book_open_resume`、fullscreen 内部 DFS は
+`book_nav_resume` に従う。slideshow は先頭から開く。保存ページは構成・★を含む最終可視集合で検証し、
+復元できなければ通知付きで先頭へ、表示可能ページがなければ一覧へ戻る。
+複数ウィンドウモードと★固定中の ZipDir activation は従来の一覧移動を保つ（複数窓の本 open は S3）。
+内部キーは論理元書庫＋case を保持した raw prefix とし、変換 cache の更新でも再利用する。
+root の既存キーは変更しない。fence の保存済み／未保存結果は構成待ちの前に request へ固定し、待機後は再照会しない。
+構成採用中も同じ request owner が activation／DFS を保持し、保存ページの拒否は採用完了後に通知付き先頭へ進む。
+管理 rename／move／copy／delete は内部キーと Archive PageIdentity を同一 transaction で扱い、cache 削除では消さない。
+読書履歴と metadata export/import の対象は変えず、内部の位置を外側の履歴進捗・メーターへ流用しない。
 本候補になった後で `BookScopeKey` を検証し、非対応名ならその階層を `ExplicitList`／`List` で表示する。
 Chosen を維持し、理由のログと情報通知を 1 回出す。OFF／分岐等の非本候補は scope 検証しない。
 履歴・アドレス・Backspace・refresh・ブックマーク・Required leaf・一覧の Ctrl+↑↓ はこの直接表示入口を使わない。
@@ -900,7 +908,7 @@ ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開く�
 
 ### 退出ルーティング = 「設定で固定分岐」(一時フラグなし)
 
-§1.676 S1（実装中）では、main／linked F12 の通常 close に、**利用者が本を選んだ書庫内一覧**を
+§1.676 S1（実装・自動検証済み）では、main／linked F12 の通常 close に、**利用者が本を選んだ書庫内一覧**を
 最優先の帰路として加える。「ページを表示」が有効で、現在の本の厳密な祖先に `Chosen` がある場合に限る。
 `AddressBarNav::ZipListReturn` は同一ツリーと階層を検証し、旧ページの close 処理を済ませてから
 メモリ上の一覧へ戻す。読んでいた本のセルを選び、row anchor と reveal を組にして位置を復元する。

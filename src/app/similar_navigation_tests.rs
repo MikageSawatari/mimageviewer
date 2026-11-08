@@ -1659,7 +1659,7 @@ fn password_wait_can_resume_and_true_cancel_releases_the_viewer_owner() {
             pdf_path: pdf,
             page_num: 7,
         }),
-        resume_to_last_page: false,
+        resume_to_last_page: (false).into(),
         from_explicit_open: false,
         preserve_after_password_prompt: true,
     });

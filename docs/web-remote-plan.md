@@ -882,6 +882,31 @@ raw index を検証できない場合は `legacy_position_unverified` を返す�
 列挙に使った種類ポリシーの snapshot を使う。保存位置なし・全種類表示時の旧 raw の範囲外位置・
 UI reader の Busy / Timeout / Stopped は従来どおり先頭ページへの fallback を保つ。
 
+2026-11-08 の §1.675 S2 では、非rootの書庫内本にも読書位置を保存・復元する。
+worker は raw ZIP tree と要求 prefix から `ZipNavState::restore_prefix` と共通
+`BookResumeKey::for_archive` を使い、表示種類の除外で collapse した表示階層から保存キーを
+推測しない。内部本のキーは logical source と大小文字を保持した raw prefix で作り、
+root は Remote の出荷済み logical path キーを維持する。内部本に保存位置がなければ
+root の位置を代用しない。
+
+Web の progress producer も、保存contextとbatchのidentityには読込時の `requestedAddress` を使う。
+`effective_address` は表示policy適用後にさらにcollapseする場合があるため、内部本の要求prefixや
+rootのFile要求をこの表示住所へ置換しない。表示ページ自体は最終構成のcanonicalなpage addressを
+送る。描画・評価・ブックマーク等の既存操作はeffective contextを維持する。
+
+内部 resume read は typed key を既存の bounded UI queue と writer の FIFO / cutoff に渡す。
+progress はサーバーが検証したキー・既存 PageIdentity・canonical raw index を通常writeと
+区別する内部 payload に保持して UI へ渡す。UI は scope を再列挙せず、その検証結果を保存する。
+内部 resume の保存と外側履歴の位置資格を分け、履歴touchの資格・抑制は維持するが内部の
+ordinal / count を外側履歴に付けない。Remote の resume meter は従来どおり NULL とする。
+
+復元拒否は root では引き続き `open_mode=grid` と一覧選択の通知にする。内部本でページ表示が
+有効なら `open_mode=first_page` と拒否理由を返し、Web は最終構成後の先頭の表示可能ページを
+開いて「先頭ページから表示します」と通知する。Web は拒否理由だけで Grid に上書きしない。
+子本だけの branch は Grid のまま。通知に符号化された保存キーや変換cache path を表示しない。
+HTTP / RemoteAddress / RecordReadingProgress の wire は変更せず、追加資格は本体内だけの
+payload なので IPC 版は変更しない。
+
 2026-10-09 の §1.345 レビュー修正で protocol 68 とする。旧 `/api/image-info` と
 `/api/image` は認証済み Home worker の stateless `SourceReadEligibility` を共有し、
 最新の種類設定と source 解決を照合してから既存 Library の寸法取得・画像描画へ進む。

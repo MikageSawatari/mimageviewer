@@ -1301,7 +1301,7 @@ fn resume_refusal_composed_fallback_saves_canonical_first_page_position() {
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::None,
-        resume_to_last_page: true,
+        resume_to_last_page: (true).into(),
         from_explicit_open: true,
         preserve_after_password_prompt: true,
     });
@@ -1381,7 +1381,7 @@ fn g3_initial_deferred_entry_waits_for_projection_then_opens_first_visible_real(
             history_trigger: HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
-            resume_to_last_page: false,
+            resume_to_last_page: (false).into(),
             from_explicit_open: true,
             preserve_after_password_prompt: true,
         });
@@ -1431,7 +1431,7 @@ fn g3_composition_poll_cannot_consume_source_owned_deferred_reopen() {
             history_trigger: HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
-            resume_to_last_page: false,
+            resume_to_last_page: (false).into(),
             from_explicit_open: true,
             preserve_after_password_prompt: true,
         };
@@ -1466,7 +1466,7 @@ fn g3_source_terminal_reopen_survives_automatic_projection() {
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::None,
-        resume_to_last_page: false,
+        resume_to_last_page: (false).into(),
         from_explicit_open: true,
         preserve_after_password_prompt: true,
     });
@@ -1507,7 +1507,7 @@ fn startup_notices_book_wait_escape_and_close_retire_reopen_before_late_completi
                 history_trigger: HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
-                resume_to_last_page: false,
+                resume_to_last_page: (false).into(),
                 from_explicit_open: false,
                 preserve_after_password_prompt: false,
             };
@@ -1644,7 +1644,7 @@ fn g3_source_terminal_required_hidden_or_missing_target_never_uses_another_page(
                 pdf_path: root,
                 page_num: requested_page,
             }),
-            resume_to_last_page: false,
+            resume_to_last_page: (false).into(),
             from_explicit_open: true,
             preserve_after_password_prompt: true,
         };
@@ -1691,7 +1691,7 @@ fn g3_hidden_refresh_follows_next_previous_first_and_closes_without_resume_write
     save(&service, &scope, ReadingDirection::Ltr);
     adopt(&mut env, &service, &scope);
     env.last_book_resume = Some((
-        root.clone(),
+        crate::book_resume_key::BookResumeKey::legacy(&root),
         1,
         None,
         Some(document_page(1).resume_identity(&root)),

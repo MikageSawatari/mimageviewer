@@ -179,7 +179,7 @@ fn section1675_branch_and_collapsed_wrapper() {
 }
 
 #[test]
-fn section1675_s1_ignores_outer_resume_and_does_not_record_inner() {
+fn section1675_inner_resume_keeps_outer_position_separate() {
     let mut app = setup_app_for_test();
     let ctx = egui::Context::default();
     let book = app.tmp.path().join("outer.zip");
@@ -207,6 +207,25 @@ fn section1675_s1_ignores_outer_resume_and_does_not_record_inner() {
     activate(&mut app, &ctx, "A/", true);
     assert_eq!(app.items[app.fullscreen_idx.unwrap()].name(), "001.png");
     app.record_book_resume(1);
+    let key = app.current_book_resume_key().unwrap();
+    let saved = app
+        .book_resume_writer
+        .as_ref()
+        .unwrap()
+        .read_position_after(
+            &key.storage_key(),
+            app.book_resume_writer
+                .as_ref()
+                .unwrap()
+                .watermarks()
+                .admitted,
+        )
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(
+        saved.position.unwrap().identity,
+        Some(crate::book_resume_db::PageIdentity::for_item(&app.items[1], Some(&book)).unwrap())
+    );
     app.handle_fullscreen_close_request_immediate();
     settle(&mut app, &ctx);
     assert_eq!(app.book_resume_db.as_ref().unwrap().get(&book), before);

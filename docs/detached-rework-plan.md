@@ -7191,3 +7191,17 @@ nav の全 drop は ticket の終了であり、新しい close を妨げない�
 独立 Sol/xhigh reviewer はこの所有境界の修正に合意した。Direct にもある既存の同型穴は報告し、今回修正しない。
 detached 述語・registry 本体・viewport identity／HWND／rect／placement／timer は変更しない。
 検証結果は [内部本計画 §9](archive-inner-book-open-return-plan.md) に記録する。
+
+#### S2: 共有 Live continuation の resume cutoff（2026-11-08）
+
+内部本 resume の追加では、既存 deferred request の resume 指示を排他 enum に置き換え、
+IndexOnly と独立 context の初回 Live continuation が同じ FIFO fence の saved／unsaved を
+構成待ちの前に捕捉する。待機後に DB を再照会せず、既存 context／generation の終端で破棄する。
+独立 context の試験は実 `begin_sidecar_restore` からの read と main の items／世代／選択不変を検査する。
+S3 の BookScope descriptor を先行実装せず、detached 述語・registry 本体・viewport identity・
+HWND／rect 捕捉・placement 保存・timer は変更しない。新しい App pending も加えない。
+承認済み内部本設計の共有 owner 修正であり、独立 reviewer は production に追加 P1/P2 なしと確認した。
+構成採用時も、現在の内部本 request を既存 `AwaitingProjection` に保全する。
+linked F12 中の main activation と DFS の双方が対象で、保存拒否後の fallback は採用完了後に同 owner から再開する。
+旧採用の末尾が後発 reader を close する組合せを除き、新しい待機状態や viewport 側の条件分岐は加えない。
+検証結果は [内部本計画 §9](archive-inner-book-open-return-plan.md) に記録する。

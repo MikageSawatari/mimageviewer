@@ -2269,7 +2269,7 @@ fn rating_deferred_zip_hydration_consumes_the_older_bundled_enumeration_reopen()
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::None,
-        resume_to_last_page: false,
+        resume_to_last_page: (false).into(),
         from_explicit_open: true,
         preserve_after_password_prompt: false,
     });
@@ -2412,7 +2412,7 @@ fn rating_deferred_warm_pdf_verification_keeps_chosen_endpoint_after_close_or_re
             history_trigger: HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
-            resume_to_last_page: false,
+            resume_to_last_page: (false).into(),
             from_explicit_open: true,
             preserve_after_password_prompt: false,
         });

@@ -1347,15 +1347,14 @@ fn write_worker_loop(
                     if matches!(request, RemoteWriteRequest::ListBookBookmarks { .. }) {
                         let response = container_engine.book_bookmarks(&mut request);
                         finish_direct_write_request(id, session_operation, response)
-                    } else if let Err(error) = container_engine.validate_write_request(&mut request)
-                    {
-                        session_operation.finish(false);
-                        ServerMessage::Write {
-                            id,
-                            response: RemoteWriteResponse::Error(error),
-                        }
                     } else {
-                        match container_engine.composition_write_admission(&request) {
+                        match container_engine.qualified_write_payload(request).and_then(
+                            |payload| {
+                                container_engine
+                                    .composition_write_admission(payload.request())
+                                    .map(|admission| (payload, admission))
+                            },
+                        ) {
                             Err(error) => {
                                 session_operation.finish(false);
                                 ServerMessage::Write {
@@ -1363,8 +1362,8 @@ fn write_worker_loop(
                                     response: RemoteWriteResponse::Error(error),
                                 }
                             }
-                            Ok(admission) => match session.submit_write_with_composition(
-                                request,
+                            Ok((payload, admission)) => match session.submit_validated_write(
+                                payload,
                                 session_operation,
                                 admission,
                             ) {

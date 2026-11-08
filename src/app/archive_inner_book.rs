@@ -5,6 +5,13 @@ use super::*;
 pub(crate) struct ArchiveBookTarget {
     pub(crate) requested_prefix: String,
     pub(crate) scope: crate::book_scope::BookScopeKey,
+    pub(crate) entry: ArchiveBookEntry,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArchiveBookEntry {
+    Activation,
+    Dfs(book_composition_permission::BookDfsContinuation),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,6 +162,7 @@ impl App {
                 Ok(scope) => ArchiveLevelOpenIntent::Book(ArchiveBookTarget {
                     requested_prefix,
                     scope,
+                    entry: ArchiveBookEntry::Activation,
                 }),
                 Err(reason) => ArchiveLevelOpenIntent::UnsupportedBook {
                     logical_root: logical.to_path_buf(),
@@ -196,8 +204,7 @@ impl App {
             history_trigger: HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::CurrentArchiveBook(target),
-            // S2 enables inner-scope resume atomically with its save/fence contract.
-            resume_to_last_page: false,
+            resume_to_last_page: self.settings.book_open_resume.resumes().into(),
             from_explicit_open: true,
             preserve_after_password_prompt: false,
         };
@@ -221,12 +228,16 @@ impl App {
             .archive_source_override
             .as_deref()
             .unwrap_or(&nav.tree.zip_path);
-        let requested = target
-            .requested_prefix
-            .trim_end_matches('/')
-            .split('/')
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
+        let requested = if target.requested_prefix.is_empty() {
+            Vec::new()
+        } else {
+            target
+                .requested_prefix
+                .trim_end_matches('/')
+                .split('/')
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
         nav.tree.node_at(&requested).is_some()
             && nav.tree.collapse_redundant(&requested) == nav.current()
             && crate::book_scope::BookScopeKey::archive(logical, nav.current_raw()).as_ref()

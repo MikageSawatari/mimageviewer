@@ -383,7 +383,7 @@ fn deferred_projection_wait_is_retired_by_close_source_replacement_and_fork() {
             history_trigger: HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: super::super::DeferredFsTarget::None,
-            resume_to_last_page: false,
+            resume_to_last_page: (false).into(),
             from_explicit_open: true,
             preserve_after_password_prompt: true,
         };
@@ -434,7 +434,7 @@ fn deferred_projection_carry_requires_original_context_generation_and_scope() {
             history_trigger: HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: super::super::DeferredFsTarget::None,
-            resume_to_last_page: false,
+            resume_to_last_page: (false).into(),
             from_explicit_open: true,
             preserve_after_password_prompt: true,
         };
@@ -579,7 +579,7 @@ fn resume_notice_survives_permission_recheck_and_open_feedback() {
             .unwrap();
         env.install_book_composition_runtime(service);
         let notice = BookResumeNotice {
-            path: root,
+            label: crate::book_resume_key::BookResumeKey::legacy(&(root)).display_label(),
             resolution,
         };
         env.open_fullscreen_with_resume_notice(0, HistoryTrigger::UserChosen, Some(notice.clone()));
@@ -662,7 +662,7 @@ fn resume_notice_is_discarded_with_cancelled_or_hidden_permission_target() {
             0,
             HistoryTrigger::UserChosen,
             Some(BookResumeNotice {
-                path: root,
+                label: crate::book_resume_key::BookResumeKey::legacy(&(root)).display_label(),
                 resolution: crate::app::file_type_resume::PositionResolution::LegacyWithExclusions,
             }),
         );
@@ -713,7 +713,7 @@ fn resume_notice_follows_materialized_open_into_its_detached_context() {
         0,
         HistoryTrigger::UserChosen,
         Some(BookResumeNotice {
-            path: folder.clone(),
+            label: crate::book_resume_key::BookResumeKey::legacy(&(folder.clone())).display_label(),
             resolution: crate::app::file_type_resume::PositionResolution::LegacyWithExclusions,
         }),
     );
@@ -1684,8 +1684,7 @@ fn external_bookmark_handler_qualifies_hidden_identity_before_installing_source(
 fn all_hidden_zip_level_keeps_dfs_continuation_for_manual_and_slideshow() {
     use crate::app::{
         book_composition_runtime::{
-            BookCompositionSource, BookProjectionReply, ProjectionAdoptionCause, ProjectionOrigin,
-            ViewerBookComposition,
+            BookCompositionSource, BookProjectionReply, ProjectionOrigin, ViewerBookComposition,
         },
         book_materialization::{
             BookScope, ProjectionRecipe, materialize_archive_level, project_archive_composition,
@@ -1867,6 +1866,27 @@ fn all_hidden_zip_level_keeps_dfs_continuation_for_manual_and_slideshow() {
         };
         let ctx = egui::Context::default();
         crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
+        // C now enters through IndexOnly before permission qualification. Hold
+        // its real FIFO read so the unqualified timer/anchor phase is observable.
+        let resume_release = env.book_resume_writer.as_ref().unwrap().pause_for_test();
+        // A paused idle worker alone can still serve a completed immutable
+        // snapshot. Admit a write after its pause ACK so C's cutoff exceeds
+        // that snapshot, without publishing an App-level reading transition.
+        let c_key =
+            crate::book_resume_key::BookResumeKey::archive(&root, &["c-show".into()]).unwrap();
+        let c_identity = crate::book_resume_db::PageIdentity::for_item(
+            &crate::grid_item::GridItem::ZipImage {
+                zip_path: root.clone(),
+                entry_name: "c-show/c.jpg".into(),
+            },
+            Some(&root),
+        )
+        .unwrap();
+        let resume_writer = env.book_resume_writer.as_ref().unwrap();
+        assert!(resume_writer.record_key_identity(&c_key, 0, None, Some(c_identity)));
+        let pending = resume_writer.watermarks();
+        assert!(pending.admitted > pending.completed_through);
+        let resume_before = env.last_book_resume.clone();
         ctx.run_pass(egui::RawInput::default(), |ctx| {
             env.poll_book_composition_read(ctx)
         })
@@ -1885,44 +1905,52 @@ fn all_hidden_zip_level_keeps_dfs_continuation_for_manual_and_slideshow() {
             if slideshow { Some(0) } else { None },
             "manual Ctrl-navigation clears the stopped slideshow anchor; automatic DFS retains its unscheduled anchor while checking"
         );
-
-        // Keep the next level's real permission worker, and deliver its exact
-        // completion while bypassing unrelated sidecar hydration in this fixture.
-        let scope = crate::book_scope::BookScopeKey::archive(&root, &["c-show".into()]).unwrap();
-        env.sidecar_restore = None;
-        env.book_composition = ViewerBookComposition::Accepted {
-            scope: scope.clone(),
-            token: service.snapshot().token_for(&scope),
-            record: None,
-            layout: CompositionProjectionOutcome::Automatic,
-            source: BookCompositionSource::Archive {
-                tree: tree.clone(),
-                prefix: vec!["c-show".into()],
-                display_prefix: vec!["c-show".into()],
-            },
-            generation: env.items_generation,
-            cause: ProjectionAdoptionCause::Normal,
-        };
-        let state = std::mem::take(&mut env.book_composition_permission.open);
-        let OpenPermission::Checking {
-            intent,
-            mut candidates,
-        } = state
-        else {
-            panic!("next real unit is independently qualified");
-        };
-        for candidate in &mut candidates {
-            if let OpenCandidateState::Checking(receiver) = &candidate.state {
-                let reply = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
-                assert_eq!(reply.correlation, candidate.correlation);
-                candidate.state = OpenCandidateState::Complete(reply.status.unwrap());
-            }
-        }
-        env.book_composition_permission.open = OpenPermission::Ready { intent, candidates };
+        assert!(env.sidecar_restore_active());
+        assert!(
+            env.sidecar_restore_navigation_fullscreen_wait_active(),
+            "C's exact accepted archive-book request must survive inside the index owner"
+        );
+        assert!(env.fs_nav_is_locked());
         ctx.run_pass(egui::RawInput::default(), |ctx| {
-            env.poll_book_composition_read(ctx)
+            env.poll_sidecar_restore(ctx);
+            env.poll_book_composition_read(ctx);
         })
         .drop_without_applying_deltas();
+        assert!(
+            env.sidecar_restore_active(),
+            "the actual destination FIFO read remains blocked"
+        );
+        assert_eq!(env.slideshow_next_at, old_timer);
+        assert_eq!(
+            env.last_book_resume, resume_before,
+            "unqualified C must not publish reading progress"
+        );
+
+        // Release the actual index/fence owner and let its composition and
+        // permission handlers finish. A validated manifest may qualify C directly;
+        // no synthetic Checking state or replacement request is needed.
+        resume_release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
+                env.poll_sidecar_restore(ctx);
+                env.poll_book_composition_read(ctx);
+                env.poll_fs_nav_lock(ctx);
+            })
+            .drop_without_applying_deltas();
+            if !env.sidecar_restore_active()
+                && !env.book_composition.is_pending()
+                && !env.book_composition_permission.pending()
+                && !env.fs_nav_deferred_reopen_wait_active()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "C's index/composition/permission continuation did not complete"
+            );
+            std::thread::yield_now();
+        }
         assert!(
             matches!(env.items.get(env.fullscreen_idx.unwrap()), Some(crate::grid_item::GridItem::ZipImage { entry_name, .. }) if entry_name == "c-show/c.jpg")
         );
@@ -1934,6 +1962,301 @@ fn all_hidden_zip_level_keeps_dfs_continuation_for_manual_and_slideshow() {
         } else {
             assert_eq!(env.slideshow_next_at, old_timer);
         }
+        process.shutdown_and_join();
+    }
+}
+
+#[test]
+fn section1675_inner_resume_hidden_saved_reprojection_defers_fallback_until_adoption_finishes() {
+    use crate::app::{
+        ArchiveBookEntry, ArchiveBookTarget, DeferredBookResume, DeferredFsTarget,
+        book_composition_runtime::{
+            BookCompositionSource, BookProjectionReply, ProjectionOrigin, ViewerBookComposition,
+        },
+        book_materialization::{
+            BookScope, ProjectionRecipe, materialize_archive_level, project_archive_composition,
+        },
+        file_type_resume::PreparedPageIdentityIndex,
+    };
+    use crate::book_resume_db::{PageIdentity, ReadingMeterValue, ReadingPosition};
+    use crate::book_resume_key::BookResumeKey;
+    use crate::grid_item::{GridItem, ThumbnailState};
+    use std::{
+        io::Write,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    for (checking, entry) in [false, true].into_iter().flat_map(|checking| {
+        [
+            ArchiveBookEntry::Activation,
+            ArchiveBookEntry::Dfs(BookDfsContinuation::Navigation { forward: true }),
+        ]
+        .map(move |entry| (checking, entry))
+    }) {
+        let mut env = crate::app::tests::phase_c_support::setup_app();
+        env.settings.detached_viewer_open_images_in_window = false;
+        let root = env.tmp.path().join("resume-hidden-reprojection.zip");
+        let names = [
+            "chapter/001.png",
+            "chapter/002.png",
+            "chapter/003.png",
+            "sibling/001.png",
+        ];
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(8, 12)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&root).unwrap());
+        for name in names {
+            writer
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(png.get_ref()).unwrap();
+        }
+        writer.finish().unwrap();
+        let tree = Arc::new(crate::zip_tree::ZipTree::build(
+            root.clone(),
+            names
+                .into_iter()
+                .map(|name| crate::zip_loader::ZipImageEntry {
+                    entry_name: name.into(),
+                    uncompressed_size: 0,
+                    mtime: 0,
+                    container_ancestry: vec![],
+                })
+                .collect(),
+        ));
+        let prefix = vec!["chapter".to_owned()];
+        let (items, metas) = materialize_archive_level(
+            &tree,
+            &prefix,
+            crate::app::BOOK_READING_PAGE_ORDER,
+            Some(&env.settings.grid_display_order),
+        );
+        env.current_folder = Some(root.clone());
+        env.zip_nav =
+            Some(crate::zip_tree::ZipNavState::restore_prefix(tree.clone(), "chapter").unwrap());
+        env.items = items.clone();
+        env.image_metas = metas.clone();
+        env.thumbnails = vec![ThumbnailState::Pending; items.len()];
+        env.visible_indices = (0..items.len()).collect();
+        let policy = env.settings.file_type_visibility.clone();
+        env.page_identity_index = Arc::new(PreparedPageIdentityIndex::prepare(
+            &items,
+            Some(&root),
+            policy.clone(),
+        ));
+        env.projection_recipe = ProjectionRecipe::Book(BookScope::Archive {
+            logical_root: root.clone(),
+            prefix: prefix.clone(),
+        });
+        env.spread_mode = crate::settings::SpreadMode::Single;
+        env.fullscreen_idx = Some(1);
+        env.selected = Some(1);
+        let scope = crate::book_scope::BookScopeKey::archive(&root, &prefix).unwrap();
+        let key = BookResumeKey::archive(&root, &prefix).unwrap();
+        let saved = ReadingPosition {
+            page: 1,
+            identity: PageIdentity::for_item(&items[1], Some(&root)),
+        };
+
+        // The request already froze 002 at its fence. A later writer snapshot
+        // points at visible 003, and must not be read during refusal/fallback.
+        assert!(env.persist_book_resume_key_with_identity(
+            key.clone(),
+            2,
+            ReadingMeterValue::new(3, 3),
+            PageIdentity::for_item(&items[2], Some(&root))
+        ));
+        let resume_writer = env.book_resume_writer.as_ref().unwrap();
+        let cutoff = resume_writer.watermarks().admitted;
+        let latest = resume_writer
+            .read_position_after(&key.storage_key(), cutoff)
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap();
+        latest.status.unwrap();
+        assert_eq!(
+            latest.position.unwrap().identity,
+            PageIdentity::for_item(&items[2], Some(&root))
+        );
+
+        let pages = names[..3]
+            .iter()
+            .map(|entry_name| CompositionPageRef::ArchiveEntry {
+                entry_name: (*entry_name).into(),
+            })
+            .collect();
+        let mut composition = BookComposition::new(ReadingDirection::Ltr, pages);
+        composition
+            .hidden_pages
+            .push(CompositionPageRef::ArchiveEntry {
+                entry_name: names[1].into(),
+            });
+        let (service, process) =
+            BookCompositionService::spawn_at(env.tmp.path().join("resume-hidden-data"), None)
+                .unwrap();
+        service
+            .save(
+                scope.clone(),
+                PageDomain::ArchiveLevel {
+                    prefix: scope.level_prefix.clone(),
+                },
+                composition,
+            )
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap()
+            .status
+            .unwrap();
+        env.install_book_composition_runtime(service.clone());
+        let snapshot = service.snapshot();
+        let record = snapshot.rows[&scope.storage_key()].clone();
+        let token = snapshot.token_for(&scope);
+        let rows = project_archive_composition(
+            &tree,
+            &root,
+            &prefix,
+            (items, metas),
+            crate::app::BOOK_READING_PAGE_ORDER,
+            Some(&env.settings.grid_display_order),
+            policy,
+            token,
+            Some(&record.composition),
+        )
+        .unwrap();
+        assert_eq!(rows.items.len(), 2);
+        let context_id = env.spread_shift_context_id().serial();
+        let generation = env.items_generation;
+        env.book_composition_permission.bind(context_id, generation);
+        let candidates = env
+            .book_target_presentation_demand(1)
+            .into_iter()
+            .map(|occurrence| {
+                let candidate = env.presentation_candidate(occurrence.item_index).unwrap();
+                let correlation = env
+                    .book_composition_permission
+                    .correlation(occurrence, &candidate);
+                let permission =
+                    crate::book_composition::candidate_permission(&snapshot, &candidate).unwrap();
+                assert!(matches!(permission, CandidatePermission::Hidden(_)));
+                OpenCandidate {
+                    correlation,
+                    candidate,
+                    state: OpenCandidateState::Complete(permission),
+                }
+            })
+            .collect();
+        let intent = OpenIntent {
+            context_id,
+            items_generation: generation,
+            idx: 1,
+            history_trigger: HistoryTrigger::UserChosen,
+            materialization: FsOpenMaterialization::Eager,
+            contract: FsPageLoadContract::Sequential,
+            purpose: BookTargetPurpose::Explicit,
+            route: BookTargetRoute::DeferredBook(Box::new(DeferredFsReopen {
+                history_trigger: HistoryTrigger::UserChosen,
+                resume_slideshow: false,
+                target: DeferredFsTarget::CurrentArchiveBook(ArchiveBookTarget {
+                    requested_prefix: "chapter".into(),
+                    scope: scope.clone(),
+                    entry,
+                }),
+                resume_to_last_page: DeferredBookResume::Captured {
+                    key,
+                    position: Some(saved),
+                },
+                from_explicit_open: matches!(entry, ArchiveBookEntry::Activation),
+                preserve_after_password_prompt: false,
+            })),
+            navigation_origin: Vec::new(),
+        };
+        env.book_composition_permission.open = if checking {
+            OpenPermission::Checking { intent, candidates }
+        } else {
+            OpenPermission::Ready { intent, candidates }
+        };
+        let (deliver, receiver) = mpsc::channel();
+        assert!(
+            deliver
+                .send(Ok(BookProjectionReply {
+                    trace: CompositionTrace::default(),
+                    rows,
+                    landing: None,
+                    rotations: HashMap::new(),
+                    rotation_invalidation_revision: env.rotation_cache.invalidation_revision(),
+                    edits: None,
+                    automatic_preferences: None,
+                    refresh_landings: HashMap::new(),
+                    saved_trim: None,
+                }))
+                .is_ok()
+        );
+        env.book_composition = ViewerBookComposition::Projecting {
+            scope,
+            token,
+            record: Some(record),
+            source: BookCompositionSource::Archive {
+                tree,
+                prefix: prefix.clone(),
+                display_prefix: prefix,
+            },
+            generation,
+            origin: Box::new(ProjectionOrigin::Fresh),
+            receiver,
+        };
+        let ctx = egui::Context::default();
+        env.fs_feedback_toast = None;
+        // Activation can retain a shown main reader when its grid lives alongside
+        // linked F12. Both it and DFS must survive the same adoption tail, which
+        // used to open the fallback in remap and then close it with landing=None.
+        env.poll_book_composition_read(&ctx);
+        assert!(
+            env.fullscreen_idx.is_some() || env.book_deferred_open_wait_active(),
+            "adoption must retain either the accepted fallback or its request: checking={checking} entry={entry:?}"
+        );
+        // A current projection often qualifies synchronously, but a service
+        // snapshot/metadata gate may still require its normal worker completion.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !matches!(env.fullscreen_idx.and_then(|index| env.items.get(index)), Some(GridItem::ZipImage { entry_name, .. }) if entry_name == "chapter/001.png")
+        {
+            env.poll_sidecar_restore(&ctx);
+            env.poll_book_composition_read(&ctx);
+            env.poll_fs_nav_lock(&ctx);
+            assert!(
+                Instant::now() < deadline,
+                "fallback did not finish: checking={checking} entry={entry:?}"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(env.selected, env.fullscreen_idx);
+        assert!(
+            env.fs_feedback_toast
+                .as_ref()
+                .expect("saved hidden position is explained")
+                .0
+                .contains("非表示")
+        );
+        let accepted = (
+            env.fullscreen_idx,
+            env.items_generation,
+            env.last_book_resume.clone(),
+        );
+        env.fs_feedback_toast = None;
+        env.poll_book_composition_read(&ctx);
+        env.poll_book_presentation_permission(&ctx);
+        assert_eq!(
+            (
+                env.fullscreen_idx,
+                env.items_generation,
+                env.last_book_resume.clone()
+            ),
+            accepted
+        );
+        assert!(
+            env.fs_feedback_toast.is_none(),
+            "the consumed refusal must not notify again"
+        );
         process.shutdown_and_join();
     }
 }

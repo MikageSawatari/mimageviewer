@@ -1506,7 +1506,18 @@ impl App {
         if !self.sidecar_restore_context_current(&state.common) {
             return false;
         }
+        // A/a share a composition scope, but are distinct resume books. A new
+        // book-open request always owns a fresh FIFO read, even in that case.
+        let restore = state
+            .common
+            .book_restore
+            .is_none()
+            .then(|| state.common.request_id);
+        let restore = restore.and_then(|request_id| self.begin_book_shift_restore(request_id));
         let state = self.sidecar_restore.as_mut().unwrap();
+        if restore.is_some() {
+            state.common.book_restore = restore;
+        }
         if let ContinuationOwner::IndexOnly {
             after_prepare,
             cancel,
@@ -2624,7 +2635,10 @@ impl App {
         }
 
         if let ContinuationOwner::IndexOnly { after_prepare, .. } = &mut state.common.continuation {
-            let after_prepare = std::mem::take(after_prepare);
+            let mut after_prepare = std::mem::take(after_prepare);
+            if let IndexOnlyAfterPrepare::OpenArchiveBook(deferred) = &mut after_prepare {
+                self.capture_deferred_book_resume(deferred);
+            }
             if let Some(warning) = state.common.warning.take() {
                 crate::logger::log(format!("snapshot page index preparation: {warning}"));
                 self.show_feedback_warning(warning);
@@ -4199,7 +4213,7 @@ mod tests {
                         history_trigger: HistoryTrigger::UserChosen,
                         resume_slideshow: false,
                         target: crate::app::DeferredFsTarget::None,
-                        resume_to_last_page: true,
+                        resume_to_last_page: (true).into(),
                         from_explicit_open: true,
                         preserve_after_password_prompt: false,
                     });
@@ -5050,7 +5064,7 @@ mod tests {
                     };
             }
             let notice = BookResumeNotice {
-                path: folder,
+                label: crate::book_resume_key::BookResumeKey::legacy(&(folder)).display_label(),
                 resolution: file_type_resume::PositionResolution::LegacyWithExclusions,
             };
             app.open_fullscreen_with_resume_notice(

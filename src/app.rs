@@ -542,6 +542,8 @@ fn thumbnail_keep_bounds_for_count(
     (anchor - back, anchor + forward)
 }
 
+#[cfg(test)]
+mod archive_inner_book_s2;
 pub(crate) mod book_resume_meter;
 #[cfg(test)]
 mod book_resume_meter_tests;
@@ -677,7 +679,7 @@ mod archive_inner_book;
 mod close_return;
 #[cfg(test)]
 use archive_inner_book::ZipDirActivationOutcome;
-pub(crate) use archive_inner_book::{ArchiveBookTarget, ZipListReturnRequest};
+pub(crate) use archive_inner_book::{ArchiveBookEntry, ArchiveBookTarget, ZipListReturnRequest};
 #[cfg(all(test, windows))]
 mod context_state_tests;
 mod logic_service;
@@ -1904,7 +1906,7 @@ pub(crate) enum FsMetadataBoundary {
 /// A resume refusal travels with the existing open request until its target is admitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BookResumeNotice {
-    path: PathBuf,
+    label: String,
     resolution: file_type_resume::PositionResolution,
 }
 
@@ -4658,6 +4660,34 @@ pub(crate) enum FolderNavMode {
     SlideshowNext,
 }
 
+/// One resume read owned by a reader admission, including a definite unsaved result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DeferredBookResume {
+    First,
+    AwaitingFence,
+    Refused(BookResumeNotice),
+    Captured {
+        key: crate::book_resume_key::BookResumeKey,
+        position: Option<crate::book_resume_db::ReadingPosition>,
+    },
+}
+
+impl From<bool> for DeferredBookResume {
+    fn from(resume: bool) -> Self {
+        if resume {
+            Self::AwaitingFence
+        } else {
+            Self::First
+        }
+    }
+}
+
+impl DeferredBookResume {
+    fn resumes(&self) -> bool {
+        !matches!(self, Self::First)
+    }
+}
+
 /// 非同期 PDF / ZIP 列挙完了後に fullscreen を開き直すための deferred reopen 状態。
 /// (旧来は `Option<bool>` で forward だけ持っていたが、スライドショー NextFolder の
 /// resume を deferred 経路でも引き継ぐため struct 化した。resume は自由 bool ではなく
@@ -4678,7 +4708,7 @@ pub(crate) struct DeferredFsReopen {
     /// grid から本を開いた経路は設定 `book_open_resume`、Ctrl+↑↓ フォルダナビ経路は
     /// `book_nav_resume` で true/false を決める (位置復元マトリクス)。既定は grid=続き /
     /// nav=先頭で従来挙動を維持。
-    pub resume_to_last_page: bool,
+    pub resume_to_last_page: DeferredBookResume,
     /// grid / CLI / SendTo など、ユーザーが明示的にコンテナを開いた後の自動 fullscreen。
     /// PDF / ZIP は列挙完了後に遅れて `open_fullscreen` するため、この意図を保持して
     /// detached viewer の focus / always-new window 判定へ渡す。
@@ -4686,6 +4716,18 @@ pub(crate) struct DeferredFsReopen {
     /// パスワード付き PDF で入力ダイアログを挟んでも、この reopen 意図を維持するか。
     /// grid / CLI / SendTo の明示オープンは true、Ctrl+↑↓ などのナビ由来は false。
     pub preserve_after_password_prompt: bool,
+}
+
+impl DeferredFsReopen {
+    fn zip_dfs_continuation(&self) -> Option<book_composition_permission::BookDfsContinuation> {
+        match &self.target {
+            DeferredFsTarget::CurrentArchiveBook(ArchiveBookTarget {
+                entry: ArchiveBookEntry::Dfs(continuation),
+                ..
+            }) => Some(*continuation),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4703,6 +4745,8 @@ enum DeferredFsOpenOutcome {
     WaitingComposition,
     NoPlayableItem,
     ArchiveBookList,
+    ArchiveDfsNoPage,
+    ArchiveDfsContinue(book_composition_permission::BookDfsContinuation),
     StaleArchiveBook,
     RequiredTargetMissing,
     RequiredTargetHidden,
@@ -18042,7 +18086,7 @@ pub struct App {
     /// 直近に受け付けた `(コンテナパス, page idx, meter)`。フルスクリーンのページ送り毎の
     /// 重複書き込みを抑止する dedup。
     pub(crate) last_book_resume: Option<(
-        PathBuf,
+        crate::book_resume_key::BookResumeKey,
         usize,
         Option<crate::book_resume_db::ReadingMeterValue>,
         Option<crate::book_resume_db::PageIdentity>,
@@ -37843,7 +37887,7 @@ impl App {
                     history_trigger: HistoryTrigger::UserChosen,
                     resume_slideshow: false,
                     target: DeferredFsTarget::None,
-                    resume_to_last_page: app.settings.book_open_resume.resumes(),
+                    resume_to_last_page: (app.settings.book_open_resume.resumes()).into(),
                     from_explicit_open: true,
                     preserve_after_password_prompt: true,
                 });
@@ -39404,7 +39448,7 @@ impl App {
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
                 // 「ZIP/PDF × 一覧から開く」: 続きから / 先頭から を設定で切替。
-                resume_to_last_page: self.settings.book_open_resume.resumes(),
+                resume_to_last_page: (self.settings.book_open_resume.resumes()).into(),
                 from_explicit_open: true,
                 preserve_after_password_prompt: true,
             });
@@ -40668,30 +40712,50 @@ impl App {
         }
         // 新しい本のページに差し替え + その本の見開き設定を適用。
         self.zip_nav_show_current_level(StartupListIntent::PageContinuation);
-        // 新しい本の先頭画像をフルスクリーンで開く (Ctrl+↑↓ 慣習: 常に先頭着地)。
-        if let Some(new_idx) = self.find_fullscreen_nav_target_filtered(true) {
-            let continuation = if sequence_ctx.is_some() {
-                book_composition_permission::BookDfsContinuation::Navigation { forward }
-            } else {
-                book_composition_permission::BookDfsContinuation::Slideshow
-            };
-            let ctx = sequence_ctx.cloned().unwrap_or_default();
-            self.complete_book_zip_dfs_target(&ctx, new_idx, continuation);
+        let continuation = if sequence_ctx.is_some() {
+            book_composition_permission::BookDfsContinuation::Navigation { forward }
         } else {
-            // 直下画像はあるがレーティングフィルタで全 hidden のケース。
-            // open_fullscreen に到達しないまま放置すると、
-            // ① 旧 fs_idx が新 items の範囲外なら poll_fs_nav_lock の解除条件
-            //    (thumbnails[idx] Loaded / fs_cache) に永遠に達せず holdover lock が
-            //    残留して以降の Ctrl+↑↓ が全部無視される、
-            // ② 範囲内なら ZipDir セルをフルスクリーン表示してしまう (レビュー P1)。
-            // lock を明示解放してフルスクリーンを閉じ、グリッドにこの階層を見せる
-            // (= グリッド側 Ctrl+↓ でこの階層へ移動したときと同じ着地)。
-            self.release_fs_nav_lock();
-            self.slideshow_playing = false;
-            self.slideshow_anchor_idx = None;
-            self.continuous_reading_scroll_transition = None;
-            self.slideshow_scroll_range_cache = None;
-            self.close_fullscreen();
+            book_composition_permission::BookDfsContinuation::Slideshow
+        };
+        let nav = self.zip_nav.as_ref().unwrap();
+        let logical = self
+            .archive_source_override
+            .as_deref()
+            .unwrap_or(&nav.tree.zip_path);
+        let target =
+            crate::book_scope::BookScopeKey::archive(logical, nav.current_raw()).map(|scope| {
+                ArchiveBookTarget {
+                    requested_prefix: nav.current().join("/"),
+                    scope,
+                    entry: ArchiveBookEntry::Dfs(continuation),
+                }
+            });
+        match target {
+            Ok(target) => {
+                let deferred = DeferredFsReopen {
+                    history_trigger: HistoryTrigger::UserChosen,
+                    resume_slideshow: sequence_ctx.is_none(),
+                    target: DeferredFsTarget::CurrentArchiveBook(target),
+                    resume_to_last_page: (sequence_ctx.is_some()
+                        && self.settings.book_nav_resume.resumes())
+                    .into(),
+                    from_explicit_open: false,
+                    preserve_after_password_prompt: false,
+                };
+                if !self.attach_archive_book_index_continuation(deferred) {
+                    crate::logger::log("archive DFS: missing index continuation");
+                    self.finish_visible_container_fs_nav_failed();
+                }
+            }
+            Err(reason) => {
+                crate::logger::log(format!("archive DFS: unsupported book scope: {reason}"));
+                if let Some(idx) = self.find_fullscreen_nav_target_filtered(true) {
+                    let ctx = sequence_ctx.cloned().unwrap_or_default();
+                    self.complete_book_zip_dfs_target(&ctx, idx, continuation);
+                } else {
+                    self.finish_visible_container_fs_nav_failed();
+                }
+            }
         }
         true
     }
@@ -41326,7 +41390,7 @@ impl App {
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
                 // 「ZIP/PDF × 一覧から開く」: 続きから / 先頭から を設定で切替。
-                resume_to_last_page: self.settings.book_open_resume.resumes(),
+                resume_to_last_page: (self.settings.book_open_resume.resumes()).into(),
                 from_explicit_open: true,
                 preserve_after_password_prompt: true,
             });
@@ -41550,14 +41614,22 @@ impl App {
 
     fn open_deferred_fullscreen_after_enumerate(
         &mut self,
-        deferred: DeferredFsReopen,
+        mut deferred: DeferredFsReopen,
     ) -> DeferredFsOpenOutcome {
+        self.capture_deferred_book_resume(&mut deferred);
         if let DeferredFsTarget::CurrentArchiveBook(target) = &deferred.target
             && !self.archive_book_target_is_current(target)
         {
             return DeferredFsOpenOutcome::StaleArchiveBook;
         }
         let ctx = self.edit_preview_repaint_ctx.clone().unwrap_or_default();
+        if self.book_composition.is_pending() {
+            // Transfer the request before adoption can replace the page rows.
+            // A DFS with no landing still owns its continuation at that boundary.
+            self.defer_book_projection_open(deferred);
+            self.poll_book_composition_read(&ctx);
+            return DeferredFsOpenOutcome::WaitingComposition;
+        }
         self.poll_book_composition_read(&ctx);
         if self.book_composition.is_pending() {
             self.defer_book_projection_open(deferred);
@@ -41590,9 +41662,21 @@ impl App {
         // grid から本を開いた場合は保存済み読書位置 (続きから) を優先。
         let current_archive_book =
             matches!(deferred.target, DeferredFsTarget::CurrentArchiveBook(_));
-        if !current_archive_book && new_idx.is_none() && deferred.resume_to_last_page {
-            (new_idx, resume_notice) = self.resolve_book_resume_for_container().into_parts();
+        if new_idx.is_none() {
+            match &deferred.resume_to_last_page {
+                DeferredBookResume::Captured {
+                    key,
+                    position: Some(position),
+                } => {
+                    (new_idx, resume_notice) = self
+                        .resolve_captured_book_resume(key, position)
+                        .into_parts();
+                }
+                DeferredBookResume::Refused(notice) => resume_notice = Some(notice.clone()),
+                _ => {}
+            }
         }
+        let restored_position = new_idx.is_some();
         if new_idx.is_none() {
             new_idx = if current_archive_book {
                 self.first_visible_archive_book_page()
@@ -41604,9 +41688,9 @@ impl App {
             };
         }
         if let Some(new_idx) = new_idx {
-            let purpose = if current_archive_book
+            let purpose = if (current_archive_book && !restored_position)
                 || (matches!(deferred.target, DeferredFsTarget::None)
-                    && !deferred.resume_to_last_page)
+                    && !deferred.resume_to_last_page.resumes())
             {
                 book_composition_permission::BookTargetPurpose::FirstInBook
             } else {
@@ -41635,7 +41719,19 @@ impl App {
             }
             DeferredFsOpenOutcome::Opened
         } else if current_archive_book {
-            DeferredFsOpenOutcome::ArchiveBookList
+            self.notify_book_resume(resume_notice);
+            if let Some(continuation) = deferred.zip_dfs_continuation() {
+                if self
+                    .composed_book_layout()
+                    .is_some_and(|layout| layout.visible_pages.is_empty())
+                {
+                    DeferredFsOpenOutcome::ArchiveDfsContinue(continuation)
+                } else {
+                    DeferredFsOpenOutcome::ArchiveDfsNoPage
+                }
+            } else {
+                DeferredFsOpenOutcome::ArchiveBookList
+            }
         } else {
             DeferredFsOpenOutcome::NoPlayableItem
         }
@@ -41646,11 +41742,46 @@ impl App {
         self.handle_deferred_fs_open_outcome(outcome);
     }
 
+    pub(super) fn refuse_deferred_saved_book_page(
+        &mut self,
+        mut deferred: DeferredFsReopen,
+    ) -> bool {
+        if !matches!(deferred.target, DeferredFsTarget::CurrentArchiveBook(_)) {
+            return false;
+        }
+        let DeferredBookResume::Captured {
+            key,
+            position: Some(_),
+        } = &deferred.resume_to_last_page
+        else {
+            return false;
+        };
+        deferred.resume_to_last_page = DeferredBookResume::Refused(
+            self.book_resume_notice(key, file_type_resume::PositionResolution::HiddenIdentity),
+        );
+        // Projection adoption is still replacing rows. The same request resumes
+        // from its owner in the permission poll after that adoption has finished.
+        self.defer_book_projection_open(deferred);
+        true
+    }
+
     fn handle_deferred_fs_open_outcome(&mut self, outcome: DeferredFsOpenOutcome) {
         match outcome {
             DeferredFsOpenOutcome::Opened | DeferredFsOpenOutcome::WaitingComposition => {}
             DeferredFsOpenOutcome::ArchiveBookList => {
                 self.finish_main_list_open(StartupListIntent::ExplicitList);
+            }
+            DeferredFsOpenOutcome::ArchiveDfsNoPage => {
+                self.release_fs_nav_lock();
+                self.slideshow_playing = false;
+                self.slideshow_anchor_idx = None;
+                self.continuous_reading_scroll_transition = None;
+                self.slideshow_scroll_range_cache = None;
+                self.close_fullscreen();
+            }
+            DeferredFsOpenOutcome::ArchiveDfsContinue(continuation) => {
+                let ctx = self.edit_preview_repaint_ctx.clone().unwrap_or_default();
+                self.continue_book_zip_dfs_after_hidden(&ctx, continuation);
             }
             DeferredFsOpenOutcome::StaleArchiveBook => {
                 crate::logger::log("archive book open dropped: stale scope");
@@ -44472,8 +44603,18 @@ impl App {
         // 同セッション履歴 (folder_history) に位置が無い (= 再起動後の初回など) かつ
         // select_after_load も無い場合、永続化した読書位置 (book_resume_db) をグリッド選択に
         // 復元する (= 再起動を跨いだ「続きから」)。
-        if !restored && history_state.is_none() {
-            let resume = self.resume_page_for_path(&source_path);
+        if !restored
+            && history_state.is_none()
+            && !matches!(
+                self.fs_nav_after_pdf_enumerate
+                    .as_ref()
+                    .map(|request| &request.target),
+                Some(DeferredFsTarget::CurrentArchiveBook(_))
+            )
+        {
+            // An accepted inner-book request owns its cursor and refusal notice.
+            // A cancelled request leaves the ordinary list restore in charge.
+            let resume = self.resume_page_for_container();
             if let Some(page) = resume {
                 self.move_grid_cursor(Some(page), crate::app::GridCursorIntent::Automatic);
                 self.grid_scroll.set_reveal_requested(true);
@@ -48623,7 +48764,11 @@ impl App {
         if self
             .last_book_resume
             .as_ref()
-            .is_some_and(|(path, _, _, _)| matches_key(&crate::adjustment_db::normalize_path(path)))
+            .is_some_and(|(key, _, _, _)| {
+                removed
+                    .iter()
+                    .any(|path| key.matches_source_family(path, true))
+            })
         {
             self.last_book_resume = None;
         }
@@ -61155,7 +61300,7 @@ impl App {
                 resume_slideshow,
                 target: DeferredFsTarget::None,
                 // 「ZIP/PDF × Ctrl+↑↓ 移動」: 続きから / 先頭から を設定で切替。
-                resume_to_last_page: self.settings.book_nav_resume.resumes(),
+                resume_to_last_page: (self.settings.book_nav_resume.resumes()).into(),
                 from_explicit_open: false,
                 preserve_after_password_prompt: false,
             });
@@ -61194,7 +61339,7 @@ impl App {
                 resume_slideshow,
                 target: DeferredFsTarget::None,
                 // 「ZIP/PDF × Ctrl+↑↓ 移動」: 続きから / 先頭から を設定で切替。
-                resume_to_last_page: self.settings.book_nav_resume.resumes(),
+                resume_to_last_page: (self.settings.book_nav_resume.resumes()).into(),
                 from_explicit_open: false,
                 preserve_after_password_prompt: false,
             });
@@ -62770,12 +62915,18 @@ impl App {
         )
     }
 
-    /// The producer and fresh-open fence share the same root eligibility and physical key.
-    pub(super) fn book_resume_recording_folder(&self) -> Option<&Path> {
-        if self.zip_nav.as_ref().is_some_and(|nav| !nav.at_root()) {
-            return None;
+    /// Resume, its FIFO fence and editor intents share one book identity.
+    pub(super) fn current_book_resume_key(&self) -> Option<crate::book_resume_key::BookResumeKey> {
+        let legacy = self.current_folder.as_deref()?;
+        if let Some(nav) = &self.zip_nav {
+            let logical = self
+                .archive_source_override
+                .as_deref()
+                .unwrap_or(&nav.tree.zip_path);
+            crate::book_resume_key::BookResumeKey::for_archive(logical, legacy, nav).ok()
+        } else {
+            Some(crate::book_resume_key::BookResumeKey::legacy(legacy))
         }
-        self.current_folder.as_deref()
     }
 
     /// 現在のフルスクリーンページを「最後に読んだページ」として永続記録する。
@@ -62796,13 +62947,7 @@ impl App {
         if !self.is_readable_page_idx(idx) {
             return;
         }
-        // ネスト ZIP の本の中 (スタック深さ ≥ 2) では記録しない: ここでの idx は
-        // 「現在の階層」ローカルだが、resume_page_for_container は再オープン時の
-        // ルート階層 items に対して idx を検証するため、同 idx の別アイテムに誤って
-        // 「続きから」着地し得る (レビュー P3)。ルート表示 (フラット ZIP / collapse 済み
-        // 単一ラッパー) は再オープン時と同じ階層が materialize されるので従来どおり記録する。
-        // 深い階層への cross-book resume は将来課題 (docs/nested-zip-tree-plan.md §14)。
-        let Some(folder) = self.book_resume_recording_folder().map(Path::to_path_buf) else {
+        let Some(key) = self.current_book_resume_key() else {
             return;
         };
         let indices = self.get_still_image_indices();
@@ -62827,11 +62972,11 @@ impl App {
             _ => idx,
         };
         if self.last_book_resume.as_ref()
-            == Some(&(folder.clone(), raw_index, meter, identity.clone()))
+            == Some(&(key.clone(), raw_index, meter, identity.clone()))
         {
             return;
         }
-        self.persist_book_resume_with_identity(folder, raw_index, meter, identity);
+        self.persist_book_resume_key_with_identity(key, raw_index, meter, identity);
         if writer_available {
             self.record_current_container_content_identity(
                 crate::content_identity::ContentIdentityTrigger::ViewingState,
@@ -63018,8 +63163,9 @@ impl App {
     /// 現在のコンテナ (`current_folder`) の保存済み読書位置を、現在の `items` に対して
     /// 検証して返す。範囲外 / 本ページでない場合は None (= 先頭にフォールバック)。
     pub(crate) fn resume_page_for_container(&mut self) -> Option<usize> {
-        let folder = self.current_folder.clone()?;
-        self.resume_page_for_path(&folder)
+        let (page, notice) = self.resolve_book_resume_for_container().into_parts();
+        self.notify_book_resume(notice);
+        page
     }
 
     fn resume_page_for_path(&mut self, folder: &Path) -> Option<usize> {
@@ -63029,53 +63175,118 @@ impl App {
     }
 
     fn resolve_book_resume_for_container(&self) -> ResolvedBookResume {
-        self.current_folder
-            .as_deref()
-            .map(|folder| self.resolve_book_resume_for_path(folder))
+        self.current_book_resume_key()
+            .map(|key| self.resolve_book_resume_for_key(&key))
             .unwrap_or_default()
     }
 
     fn resolve_book_resume_for_path(&self, folder: &Path) -> ResolvedBookResume {
-        let Some(position) = self.fenced_book_resume(folder).unwrap_or_else(|| {
-            self.book_resume_db
-                .as_ref()
-                .and_then(|db| db.get_position(folder))
-        }) else {
+        self.resolve_book_resume_for_key(&crate::book_resume_key::BookResumeKey::legacy(folder))
+    }
+
+    fn book_resume_position_for_key(
+        &self,
+        key: &crate::book_resume_key::BookResumeKey,
+    ) -> Option<crate::book_resume_db::ReadingPosition> {
+        self.fenced_book_resume_key(key)
+            .unwrap_or_else(|| match key {
+                crate::book_resume_key::BookResumeKey::LegacyPath(_) => self
+                    .book_resume_db
+                    .as_ref()
+                    .and_then(|db| db.get_position_key(key)),
+                crate::book_resume_key::BookResumeKey::ArchiveLevel { .. } => self
+                    .book_resume_writer
+                    .as_ref()
+                    .and_then(|writer| writer.position_snapshot())
+                    .and_then(|snapshot| snapshot.values.get(&key.storage_key()).cloned()),
+            })
+    }
+
+    fn resolve_book_resume_for_key(
+        &self,
+        key: &crate::book_resume_key::BookResumeKey,
+    ) -> ResolvedBookResume {
+        let Some(position) = self.book_resume_position_for_key(key) else {
             return ResolvedBookResume::default();
         };
+        self.resolve_captured_book_resume(key, &position)
+    }
+
+    fn resolve_captured_book_resume(
+        &self,
+        key: &crate::book_resume_key::BookResumeKey,
+        position: &crate::book_resume_db::ReadingPosition,
+    ) -> ResolvedBookResume {
+        let inner = matches!(
+            key,
+            crate::book_resume_key::BookResumeKey::ArchiveLevel { .. }
+        );
         match self.resolve_current_book_position(&position) {
             file_type_resume::PositionResolution::Restored(index)
-                if self.is_readable_page_idx(index) =>
+                if self.is_readable_page_idx(index)
+                    && (!inner || self.visible_indices.contains(&index)) =>
             {
                 ResolvedBookResume::Page(index)
             }
             resolution @ (file_type_resume::PositionResolution::HiddenIdentity
             | file_type_resume::PositionResolution::LegacyWithExclusions) => {
-                ResolvedBookResume::Refused(BookResumeNotice {
-                    path: folder.to_path_buf(),
-                    resolution,
-                })
+                ResolvedBookResume::Refused(self.book_resume_notice(key, resolution))
             }
+            _ if inner => ResolvedBookResume::Refused(
+                self.book_resume_notice(key, file_type_resume::PositionResolution::HiddenIdentity),
+            ),
             _ => ResolvedBookResume::default(),
         }
     }
 
+    /// Freeze both saved and unsaved reads before composition can suspend this request.
+    fn capture_deferred_book_resume(&self, deferred: &mut DeferredFsReopen) {
+        if matches!(
+            deferred.resume_to_last_page,
+            DeferredBookResume::AwaitingFence
+        ) {
+            deferred.resume_to_last_page = match self.current_book_resume_key() {
+                Some(key) => {
+                    let position = self.book_resume_position_for_key(&key);
+                    DeferredBookResume::Captured { key, position }
+                }
+                None => DeferredBookResume::First,
+            };
+        }
+    }
+
+    fn book_resume_notice(
+        &self,
+        key: &crate::book_resume_key::BookResumeKey,
+        resolution: file_type_resume::PositionResolution,
+    ) -> BookResumeNotice {
+        let label = match key {
+            crate::book_resume_key::BookResumeKey::LegacyPath(_) => self
+                .archive_source_override
+                .as_deref()
+                .map(|source| source.display().to_string())
+                .unwrap_or_else(|| key.display_label()),
+            _ => key.display_label(),
+        };
+        BookResumeNotice { label, resolution }
+    }
+
     fn notify_book_resume(&mut self, notice: Option<BookResumeNotice>) {
-        let Some(BookResumeNotice { path, resolution }) = notice else {
+        let Some(BookResumeNotice { label, resolution }) = notice else {
             return;
         };
         match resolution {
             file_type_resume::PositionResolution::HiddenIdentity => {
                 crate::logger::log(format!(
                     "book resume skipped: reason=HiddenIdentity path={}",
-                    path.display()
+                    label
                 ));
                 self.show_feedback_warning("保存した読書位置のページは非表示になっています".into());
             }
             file_type_resume::PositionResolution::LegacyWithExclusions => {
                 crate::logger::log(format!(
                     "book resume skipped: reason=LegacyWithExclusions path={}",
-                    path.display()
+                    label
                 ));
                 self.show_feedback_warning(
                     "以前の読書位置はファイル種類の絞り込み中に復元できません".into(),
@@ -67014,7 +67225,7 @@ impl App {
                 history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::Required(target),
-                resume_to_last_page: false,
+                resume_to_last_page: (false).into(),
                 from_explicit_open: true,
                 preserve_after_password_prompt: true,
             });
@@ -67153,7 +67364,7 @@ impl App {
                         history_trigger: crate::app::HistoryTrigger::UserChosen,
                         resume_slideshow: false,
                         target: DeferredFsTarget::Required(target),
-                        resume_to_last_page: false,
+                        resume_to_last_page: (false).into(),
                         from_explicit_open: true,
                         preserve_after_password_prompt: true,
                     });

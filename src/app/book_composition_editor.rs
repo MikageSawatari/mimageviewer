@@ -165,13 +165,13 @@ enum ResumeWriteIntent {
     Keep,
     Reanchor {
         owner: CompositionEditorOwner,
-        resume_key: std::path::PathBuf,
+        resume_key: crate::book_resume_key::BookResumeKey,
         seed: ResumeSeed,
         old_order: Vec<PageIdentity>,
     },
 }
 struct ResumeCommit {
-    key: std::path::PathBuf,
+    key: crate::book_resume_key::BookResumeKey,
     position: ReadingPosition,
     meter: ReadingMeterValue,
 }
@@ -359,12 +359,9 @@ impl App {
             .and_then(|index| self.items.get(index))
             .and_then(|item| PageIdentity::for_item(item, self.archive_source_override.as_deref()));
         let existing_position = if current_seed.is_none() {
-            self.book_resume_recording_folder().and_then(|key| {
+            self.current_book_resume_key().and_then(|key| {
                 self.book_resume_writer.as_ref().map(|writer| {
-                    writer.read_position_after(
-                        &crate::path_key::normalize(key),
-                        writer.watermarks().admitted,
-                    )
+                    writer.read_position_after(&key.storage_key(), writer.watermarks().admitted)
                 })
             })
         } else {
@@ -628,7 +625,7 @@ impl App {
                 Ok(resume) => {
                     // This is the sole receipt consumer, before service publications start reloads.
                     if let Some(resume) = resume {
-                        let recorded = self.persist_book_resume_with_identity(
+                        let recorded = self.persist_book_resume_key_with_identity(
                             resume.key.clone(),
                             resume.position.page,
                             Some(resume.meter),
@@ -680,10 +677,7 @@ impl App {
     }
 
     fn capture_editor_resume_intent(&self, owner: &CompositionEditorOwner) -> ResumeWriteIntent {
-        let Some(key) = self
-            .book_resume_recording_folder()
-            .map(std::path::Path::to_path_buf)
-        else {
+        let Some(key) = self.current_book_resume_key() else {
             return ResumeWriteIntent::Keep;
         };
         if self
@@ -1516,7 +1510,7 @@ mod continuation_tests {
             worker
                 .send(SaveCompletion {
                     status: Ok(Some(ResumeCommit {
-                        key: resume_path.clone(),
+                        key: crate::book_resume_key::BookResumeKey::legacy(&resume_path),
                         position: ReadingPosition {
                             page: 2,
                             identity: Some(identity.clone()),
@@ -1611,7 +1605,7 @@ mod continuation_tests {
         worker
             .send(SaveCompletion {
                 status: Ok(Some(ResumeCommit {
-                    key: old.scope.logical_root.clone(),
+                    key: crate::book_resume_key::BookResumeKey::legacy(&old.scope.logical_root),
                     position: ReadingPosition {
                         page: 4,
                         identity: None,

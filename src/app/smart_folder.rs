@@ -3940,7 +3940,7 @@ impl App {
                     history_trigger: super::HistoryTrigger::UserChosen,
                     resume_slideshow: false,
                     target: super::DeferredFsTarget::None,
-                    resume_to_last_page: self.settings.book_open_resume.resumes(),
+                    resume_to_last_page: (self.settings.book_open_resume.resumes()).into(),
                     from_explicit_open: true,
                     preserve_after_password_prompt: true,
                 });
@@ -10399,7 +10399,7 @@ mod tests {
             history_trigger: HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
-            resume_to_last_page: false,
+            resume_to_last_page: (false).into(),
             from_explicit_open: false,
             preserve_after_password_prompt: false,
         });

@@ -2149,7 +2149,7 @@ impl App {
                     crate::app::DeferredFsTarget::None,
                     crate::app::DeferredFsTarget::Preferred,
                 ),
-                resume_to_last_page: false,
+                resume_to_last_page: (false).into(),
                 from_explicit_open: false,
                 preserve_after_password_prompt: false,
             });
@@ -2327,7 +2327,7 @@ impl App {
                     history_trigger,
                     resume_slideshow,
                     target: crate::app::DeferredFsTarget::None,
-                    resume_to_last_page,
+                    resume_to_last_page: resume_to_last_page.into(),
                     from_explicit_open: false,
                     preserve_after_password_prompt: false,
                 },
@@ -2367,7 +2367,7 @@ impl App {
                 history_trigger,
                 resume_slideshow: false,
                 target: crate::app::DeferredFsTarget::Required(target),
-                resume_to_last_page: false,
+                resume_to_last_page: (false).into(),
                 from_explicit_open: false,
                 preserve_after_password_prompt: true,
             });
@@ -2377,7 +2377,7 @@ impl App {
             history_trigger,
             resume_slideshow: false,
             target: crate::app::DeferredFsTarget::Required(target),
-            resume_to_last_page: false,
+            resume_to_last_page: (false).into(),
             from_explicit_open: false,
             preserve_after_password_prompt: true,
         });

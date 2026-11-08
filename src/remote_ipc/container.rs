@@ -2028,19 +2028,28 @@ enum ResumeReader {
     Error(super::session::UiReadError),
     #[cfg(test)]
     Saved(crate::book_resume_db::ReadingPosition),
+    #[cfg(test)]
+    Positions(
+        std::collections::HashMap<
+            crate::book_resume_key::BookResumeKey,
+            crate::book_resume_db::ReadingPosition,
+        >,
+    ),
 }
 
 impl ResumeReader {
     fn read_book_resume(
         &self,
-        path: &Path,
+        key: &crate::book_resume_key::BookResumeKey,
     ) -> Result<Option<crate::book_resume_db::ReadingPosition>, super::session::UiReadError> {
         match self {
-            Self::Session(session) => session.read_book_position(path),
+            Self::Session(session) => session.read_book_position_key(key),
             #[cfg(test)]
             Self::Error(error) => Err(*error),
             #[cfg(test)]
             Self::Saved(saved) => Ok(Some(saved.clone())),
+            #[cfg(test)]
+            Self::Positions(positions) => Ok(positions.get(key).cloned()),
         }
     }
 }
@@ -2296,6 +2305,8 @@ struct ValidatedPageContext {
     record_history: bool,
     record_resume: bool,
     bookmark_supported: bool,
+    resume_key: Option<crate::book_resume_key::BookResumeKey>,
+    history_has_position: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -3218,6 +3229,82 @@ impl ContainerEngine {
         request: &mut RemoteWriteRequest,
     ) -> Result<(), RemoteWriteError> {
         self.validate_write_request_admitted(request, current_catalog_admission())
+    }
+
+    /// Only the worker can construct a progress payload. The UI receives the
+    /// validated scope/index/identity, never a client-supplied persistence key.
+    pub(super) fn qualified_write_payload(
+        &self,
+        mut request: RemoteWriteRequest,
+    ) -> Result<super::session::RemoteWritePayload, RemoteWriteError> {
+        if let RemoteWriteRequest::RecordReadingProgress {
+            address,
+            context_address,
+            page_index,
+            page_number,
+            page_count,
+            record_resume,
+            record_history,
+        } = &mut request
+        {
+            self.canonicalize_write_address(address)?;
+            self.canonicalize_write_address(context_address)?;
+            let validated =
+                self.validate_page_context(address, context_address, current_catalog_admission())?;
+            if !validated.record_resume && !validated.record_history {
+                return Err(RemoteWriteError::new(
+                    RemoteWriteErrorCode::Unsupported,
+                    "この一覧は読書位置の記録対象ではありません",
+                ));
+            }
+            *page_index = validated.page_index;
+            *page_number = validated.page_number;
+            *page_count = validated.page_count;
+            *record_resume = validated.record_resume;
+            *record_history = validated.record_history;
+            let resume = if validated.record_resume {
+                let container = Path::new(&context_address.path);
+                let identity = match &address.subresource {
+                    RemoteSubresource::File => crate::book_resume_db::PageIdentity::Image {
+                        path: crate::path_key::normalize_keep_drive(Path::new(&address.path)),
+                    },
+                    RemoteSubresource::ZipEntry { entry_name } => {
+                        crate::book_resume_db::PageIdentity::Archive {
+                            container: crate::path_key::normalize_keep_drive(container),
+                            entry_name: entry_name.replace('\\', "/"),
+                        }
+                    }
+                    RemoteSubresource::PdfPage { page_number } => {
+                        crate::book_resume_db::PageIdentity::Document {
+                            container: crate::path_key::normalize_keep_drive(container),
+                            page_num: *page_number as usize,
+                        }
+                    }
+                    RemoteSubresource::ZipDirectory { .. } => {
+                        unreachable!("validated page is not a directory")
+                    }
+                };
+                Some(super::session::ValidatedRemoteResume {
+                    key: validated.resume_key.unwrap_or_else(|| {
+                        crate::book_resume_key::BookResumeKey::legacy(container)
+                    }),
+                    identity,
+                    raw_index: validated.page_index as usize,
+                })
+            } else {
+                None
+            };
+            Ok(super::session::RemoteWritePayload::ReadingProgress {
+                request,
+                validated: super::session::ValidatedRemoteReadingProgress {
+                    resume,
+                    history_has_position: validated.history_has_position,
+                },
+            })
+        } else {
+            self.validate_write_request(&mut request)?;
+            Ok(super::session::RemoteWritePayload::Request(request))
+        }
     }
 
     pub(super) fn composition_write_admission(
@@ -4319,7 +4406,22 @@ impl ContainerEngine {
             ));
         }
         let effective_segments = tree.collapse_redundant(&requested_segments);
-        let root_segments = tree.collapse_redundant(&[]);
+        let resume_nav = crate::zip_tree::ZipNavState::restore_prefix(
+            Arc::new(tree.raw_source().clone()),
+            requested_prefix,
+        )
+        .ok_or_else(|| {
+            RemoteWriteError::new(
+                RemoteWriteErrorCode::BadRequest,
+                "ZIP 内の本の場所が不正です",
+            )
+        })?;
+        let resume_key = crate::book_resume_key::BookResumeKey::for_archive(
+            &resolved.logical,
+            &resolved.logical,
+            &resume_nav,
+        )
+        .map_err(|error| RemoteWriteError::new(RemoteWriteErrorCode::BadRequest, error))?;
         let (items, _) = crate::app::book_materialization::materialize_archive_level(
             tree,
             &effective_segments,
@@ -4346,11 +4448,11 @@ impl ContainerEngine {
         let projection = if matches!(order, PageContextOrder::Canonical) {
             None
         } else {
-            let scope =
-                crate::book_scope::BookScopeKey::archive(&resolved.logical, &effective_segments)
-                    .map_err(|error| {
-                        RemoteWriteError::new(RemoteWriteErrorCode::BadRequest, error)
-                    })?;
+            let scope = crate::book_scope::BookScopeKey::archive(
+                &resolved.logical,
+                resume_nav.current_raw(),
+            )
+            .map_err(|error| RemoteWriteError::new(RemoteWriteErrorCode::BadRequest, error))?;
             self.remote_book_projection(
                 resolved,
                 scope.clone(),
@@ -4399,12 +4501,14 @@ impl ContainerEngine {
             index,
             image_count,
             items.iter().all(|item| item.has_page_data()),
-            effective_segments == root_segments,
+            true,
             true,
         )
         .map(|mut context| {
             context.page_number =
                 u32::try_from(image_position.saturating_add(1)).unwrap_or(u32::MAX);
+            context.resume_key = Some(resume_key);
+            context.history_has_position = resume_nav.at_root();
             context
         })
     }
@@ -5891,13 +5995,36 @@ impl ContainerEngine {
         resume_source: &crate::app::file_type_resume::LegacyResumeSource,
         canonical_slots: Option<&[usize]>,
     ) -> ResumePageResolution {
+        self.resume_page_for_items_key(
+            container,
+            container_path,
+            &crate::book_resume_key::BookResumeKey::legacy(container_path),
+            items,
+            resume_supported,
+            policy,
+            resume_source,
+            canonical_slots,
+        )
+    }
+
+    fn resume_page_for_items_key(
+        &self,
+        container: &RemoteAddress,
+        container_path: &Path,
+        key: &crate::book_resume_key::BookResumeKey,
+        items: &[crate::grid_item::GridItem],
+        resume_supported: bool,
+        policy: &crate::file_type_visibility::FileTypeVisibility,
+        resume_source: &crate::app::file_type_resume::LegacyResumeSource,
+        canonical_slots: Option<&[usize]>,
+    ) -> ResumePageResolution {
         if !resume_supported {
             return ResumePageResolution::Unavailable;
         }
         let Some(reader) = self.resume_reader.as_ref() else {
             return ResumePageResolution::Unavailable;
         };
-        let saved = match reader.read_book_resume(container_path) {
+        let saved = match reader.read_book_resume(key) {
             Ok(saved) => saved,
             Err(error) => {
                 crate::logger::log(format!(
@@ -5960,6 +6087,19 @@ impl ContainerEngine {
         Option<ContainerResumeRefusal>,
         ContainerOpenMode,
     ) {
+        self.container_resume_fields_for_scope(auto_open, resume, false)
+    }
+
+    fn container_resume_fields_for_scope(
+        &self,
+        auto_open: bool,
+        resume: ResumePageResolution,
+        inner: bool,
+    ) -> (
+        Option<RemoteAddress>,
+        Option<ContainerResumeRefusal>,
+        ContainerOpenMode,
+    ) {
         match resume {
             ResumePageResolution::Page(page) => {
                 (Some(page), None, self.container_open_mode(auto_open))
@@ -5967,7 +6107,15 @@ impl ContainerEngine {
             ResumePageResolution::VisibilityRefused(reason)
                 if self.settings.book_open_resume.resumes() =>
             {
-                (None, Some(reason), ContainerOpenMode::Grid)
+                (
+                    None,
+                    Some(reason),
+                    if inner && auto_open {
+                        ContainerOpenMode::FirstPage
+                    } else {
+                        ContainerOpenMode::Grid
+                    },
+                )
             }
             _ => (None, None, self.container_open_mode(auto_open)),
         }
@@ -6259,12 +6407,22 @@ impl ContainerEngine {
             ));
         }
         let effective_segments = tree.collapse_redundant(&requested_segments);
-        let root_segments = tree.collapse_redundant(&[]);
+        let resume_nav = crate::zip_tree::ZipNavState::restore_prefix(
+            Arc::new(composition_source.clone()),
+            &requested_prefix,
+        )
+        .ok_or_else(|| media_error(MediaErrorCode::BadRequest, "ZIP 内の本の場所が不正です"))?;
+        let resume_key = crate::book_resume_key::BookResumeKey::for_archive(
+            &resolved.logical,
+            &resolved.logical,
+            &resume_nav,
+        )
+        .map_err(|error| media_error(MediaErrorCode::BadRequest, error))?;
         let effective_prefix = zip_prefix(&effective_segments);
         let (items, _) =
             tree.materialize_level(&effective_segments, crate::app::BOOK_READING_PAGE_ORDER);
         let scope =
-            crate::book_scope::BookScopeKey::archive(&resolved.logical, &effective_segments)
+            crate::book_scope::BookScopeKey::archive(&resolved.logical, resume_nav.current_raw())
                 .map_err(|_| media_error(MediaErrorCode::BadRequest, "本の場所が不正です"))?;
         let raw_pages = || {
             items
@@ -6317,21 +6475,26 @@ impl ContainerEngine {
             && items
                 .iter()
                 .all(|item| matches!(item, crate::grid_item::GridItem::ZipImage { .. }));
-        let at_resume_root = effective_segments == root_segments;
-        let resume = self.resume_page_for_items(
+        let at_resume_root = resume_nav.at_root();
+        let resume = self.resume_page_for_items_key(
             &address,
             &resolved.logical,
+            &resume_key,
             &items,
-            at_resume_root,
+            true,
             &policy,
             &crate::app::file_type_resume::LegacyResumeSource::General,
             projection
                 .as_ref()
                 .map(|projection| projection.output_to_input.as_slice()),
         );
-        let (resume_page, resume_refusal, open_mode) = self.container_resume_fields(
-            at_resume_root && self.settings.effective_auto_fullscreen_zip_pdf(),
+        let (resume_page, resume_refusal, open_mode) = self.container_resume_fields_for_scope(
+            self.settings.effective_auto_fullscreen_zip_pdf()
+                && items
+                    .iter()
+                    .any(|item| matches!(item, crate::grid_item::GridItem::ZipImage { .. })),
             resume,
+            !at_resume_root,
         );
         let mut budget = ContainerEntryBudget::new(super::REMOTE_LIST_RESPONSE_BUDGET_BYTES);
         let mut bounded_items = Vec::new();
@@ -9186,6 +9349,8 @@ fn validated_context(
         record_history,
         record_resume,
         bookmark_supported,
+        resume_key: None,
+        history_has_position: record_resume,
     })
 }
 
@@ -17259,6 +17424,514 @@ pub(super) mod tests {
             ),
             ResumePageResolution::Page(grid_item_address(&address, &items[0]).unwrap())
         );
+    }
+
+    #[test]
+    fn section1675_inner_resume_root_rows_pc_and_remote_converted_source() {
+        use crate::book_resume_db::{PageIdentity, ReadingPosition};
+        use crate::book_resume_key::BookResumeKey;
+        let mut app = crate::app::setup_app_for_test();
+        let source = app.tmp.path().join("converted.7z");
+        std::fs::write(&source, b"prepared converted source").unwrap();
+        let backing = app.tmp.path().join("converted-cache.zip");
+        write_remote_ai_test_zip(
+            &backing,
+            &[
+                ("01.jpg", b"one"),
+                ("02.jpg", b"two"),
+                ("03.jpg", b"three"),
+                ("A/01.jpg", b"inner one"),
+                ("A/02.jpg", b"inner two"),
+            ],
+        );
+        let source_key = BookResumeKey::legacy(&source);
+        let backing_key = BookResumeKey::legacy(&backing);
+        let inner_key = BookResumeKey::archive(&source, &["A".into()]).unwrap();
+        let identity = |entry: &str| PageIdentity::Archive {
+            container: crate::path_key::normalize_keep_drive(&source),
+            entry_name: entry.into(),
+        };
+        // The identities are all valid logical pages. Picking the wrong legacy key
+        // therefore resumes a different page instead of merely falling back.
+        let rows = [
+            (
+                backing_key,
+                ReadingPosition {
+                    page: 1,
+                    identity: Some(identity("01.jpg")),
+                },
+            ),
+            (
+                source_key,
+                ReadingPosition {
+                    page: 2,
+                    identity: Some(identity("02.jpg")),
+                },
+            ),
+            (
+                inner_key,
+                ReadingPosition {
+                    page: 1,
+                    identity: Some(identity("A/02.jpg")),
+                },
+            ),
+        ];
+        for (key, saved) in &rows {
+            app.persist_book_resume_key_with_identity(
+                key.clone(),
+                saved.page,
+                None,
+                saved.identity.clone(),
+            );
+        }
+        let session = super::super::session::SessionHandle::new();
+        app.set_remote_session_handle(session.clone());
+        session.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "converted-resume".into(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: None,
+            },
+        });
+        app.poll_remote_session(&egui::Context::default());
+        let mut settings = app.settings.clone();
+        settings.auto_fullscreen_zip_pdf = true;
+        settings.book_open_resume = crate::settings::ResumeMode::Resume;
+        let mut engine = ContainerEngine::new(settings);
+        engine.resume_reader = Some(ResumeReader::Session(session));
+        let root = RemoteAddress::file(source.to_string_lossy().into_owned());
+        let inner = RemoteAddress {
+            path: root.path.clone(),
+            subresource: RemoteSubresource::ZipDirectory {
+                prefix: "A/".into(),
+            },
+        };
+        let expected = [
+            zip_entry_address(&root, "02.jpg"),
+            zip_entry_address(&inner, "A/02.jpg"),
+        ];
+        let resolved = ResolvedPath::with_archive_backing(&source, &root.path, &backing).unwrap();
+        let worker = std::thread::spawn(move || {
+            [root, inner].map(|address| {
+                engine
+                    .enumerate_zip(
+                        &ContainerRequest {
+                            address,
+                            spread_mode: None,
+                            reading_direction: None,
+                            force_single_page: true,
+                        },
+                        &resolved,
+                    )
+                    .unwrap()
+            })
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !worker.is_finished() {
+            app.service_remote_session(&egui::Context::default());
+            assert!(
+                Instant::now() < deadline,
+                "converted typed resume reads did not settle"
+            );
+            std::thread::yield_now();
+        }
+        for (payload, expected_page) in worker.join().unwrap().into_iter().zip(expected) {
+            assert_eq!(payload.open_mode, ContainerOpenMode::ResumePage);
+            assert_eq!(payload.resume_refusal, None);
+            assert_eq!(payload.resume_page, Some(expected_page));
+        }
+        for (key, saved) in rows {
+            assert_eq!(
+                app.book_resume_db.as_ref().unwrap().get_position_key(&key),
+                Some(saved),
+                "Remote reads preserve both released root rows and the shared logical inner row"
+            );
+        }
+    }
+
+    #[test]
+    fn section1675_remote_inner_resume_keys_and_refusal_preserve_root_contract() {
+        use crate::book_resume_db::{PageIdentity, ReadingPosition};
+        use crate::book_resume_key::BookResumeKey;
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("scoped.zip");
+        write_remote_ai_test_zip(
+            &archive,
+            &[
+                ("root.jpg", b"root"),
+                ("A/01.jpg", b"one"),
+                ("A/02.jpg", b"two"),
+                ("a/01.jpg", b"lower one"),
+                ("a/02.jpg", b"lower two"),
+                ("B/child/01.jpg", b"branch"),
+            ],
+        );
+        let mut settings = crate::settings::Settings::default();
+        settings.auto_fullscreen_zip_pdf = true;
+        settings.book_open_resume = crate::settings::ResumeMode::Resume;
+        let mut engine = ContainerEngine::new(settings);
+        let saved = |entry: &str| ReadingPosition {
+            page: 999,
+            identity: Some(PageIdentity::Archive {
+                container: crate::path_key::normalize_keep_drive(&archive),
+                entry_name: entry.into(),
+            }),
+        };
+        engine.resume_reader = Some(ResumeReader::Positions(
+            [
+                (BookResumeKey::legacy(&archive), saved("root.jpg")),
+                (
+                    BookResumeKey::archive(&archive, &["A".into()]).unwrap(),
+                    saved("A/02.jpg"),
+                ),
+                (
+                    BookResumeKey::archive(&archive, &["a".into()]).unwrap(),
+                    saved("a/01.jpg"),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        let address = |prefix: &str| RemoteAddress {
+            path: archive.to_string_lossy().into_owned(),
+            subresource: if prefix.is_empty() {
+                RemoteSubresource::File
+            } else {
+                RemoteSubresource::ZipDirectory {
+                    prefix: prefix.into(),
+                }
+            },
+        };
+        let enumerate = |prefix: &str| {
+            let ContainerResponse::Success(payload) = engine.container(ContainerRequest {
+                address: address(prefix),
+                spread_mode: None,
+                reading_direction: None,
+                force_single_page: true,
+            }) else {
+                panic!("scope enumeration failed: {prefix}");
+            };
+            payload
+        };
+        for (prefix, expected) in [("", "root.jpg"), ("A/", "A/02.jpg"), ("a/", "a/01.jpg")] {
+            let payload = enumerate(prefix);
+            assert_eq!(payload.open_mode, ContainerOpenMode::ResumePage);
+            assert_eq!(
+                payload.resume_page,
+                Some(zip_entry_address(&address(prefix), expected))
+            );
+        }
+        // An unrecorded inner scope does not read the root's saved page.
+        let unrecorded = enumerate("B/");
+        assert_eq!(unrecorded.resume_page, None);
+        assert_eq!(unrecorded.resume_refusal, None);
+        assert_eq!(unrecorded.open_mode, ContainerOpenMode::ResumePage);
+
+        for prefix in ["", "A/"] {
+            engine.resume_reader = Some(ResumeReader::Saved(saved("removed.jpg")));
+            let ContainerResponse::Success(payload) = engine.container(ContainerRequest {
+                address: address(prefix),
+                spread_mode: None,
+                reading_direction: None,
+                force_single_page: true,
+            }) else {
+                panic!("refused scope enumeration failed");
+            };
+            assert_eq!(payload.resume_page, None);
+            assert_eq!(
+                payload.resume_refusal,
+                Some(ContainerResumeRefusal::SavedPageUnavailable)
+            );
+            assert_eq!(
+                payload.open_mode,
+                if prefix.is_empty() {
+                    ContainerOpenMode::Grid
+                } else {
+                    ContainerOpenMode::FirstPage
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn section1675_remote_scope_uses_raw_collapse_and_progress_keeps_verified_identity() {
+        use crate::book_resume_db::{PageIdentity, ReadingPosition};
+        use crate::book_resume_key::BookResumeKey;
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("policy.zip");
+        write_remote_ai_test_zip(
+            &archive,
+            &[
+                ("root.png", b"hidden root"),
+                ("Chapter/hidden.png", b"hidden chapter"),
+                ("Chapter/Pages/01.jpg", b"one"),
+                ("Chapter/Pages/02.jpg", b"two"),
+            ],
+        );
+        let mut settings = crate::settings::Settings::default();
+        settings.auto_fullscreen_zip_pdf = true;
+        settings.book_open_resume = crate::settings::ResumeMode::Resume;
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("png".into());
+        let mut engine = ContainerEngine::new(settings);
+        let context = RemoteAddress {
+            path: archive.to_string_lossy().into_owned(),
+            subresource: RemoteSubresource::ZipDirectory {
+                prefix: "Chapter/".into(),
+            },
+        };
+        let key = BookResumeKey::archive(&archive, &["Chapter".into()]).unwrap();
+        let page = zip_entry_address(&context, "Chapter/Pages/02.jpg");
+        let identity = PageIdentity::Archive {
+            container: crate::path_key::normalize_keep_drive(&archive),
+            entry_name: "Chapter/Pages/02.jpg".into(),
+        };
+        engine.resume_reader = Some(ResumeReader::Positions(
+            [
+                (
+                    key.clone(),
+                    ReadingPosition {
+                        page: 999,
+                        identity: Some(identity.clone()),
+                    },
+                ),
+                (
+                    BookResumeKey::legacy(&archive),
+                    ReadingPosition {
+                        page: 999,
+                        identity: Some(PageIdentity::Archive {
+                            container: crate::path_key::normalize_keep_drive(&archive),
+                            entry_name: "Chapter/Pages/01.jpg".into(),
+                        }),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        for (address, expected) in [
+            (context.clone(), page.clone()),
+            (
+                RemoteAddress::file(archive.to_string_lossy().into_owned()),
+                zip_entry_address(&context, "Chapter/Pages/01.jpg"),
+            ),
+        ] {
+            let ContainerResponse::Success(payload) = engine.container(ContainerRequest {
+                address,
+                spread_mode: None,
+                reading_direction: None,
+                force_single_page: true,
+            }) else {
+                panic!("policy collapsed enumeration failed");
+            };
+            assert_eq!(payload.resume_page, Some(expected));
+        }
+        let payload = engine
+            .qualified_write_payload(RemoteWriteRequest::RecordReadingProgress {
+                address: page,
+                context_address: context,
+                page_index: 999,
+                page_number: 999,
+                page_count: 999,
+                record_resume: false,
+                record_history: false,
+            })
+            .unwrap();
+        assert!(matches!(
+            payload.request(),
+            RemoteWriteRequest::RecordReadingProgress {
+                page_index: 1,
+                page_number: 2,
+                page_count: 2,
+                record_resume: true,
+                record_history: true,
+                ..
+            }
+        ));
+        let progress = payload.reading_progress().unwrap();
+        assert!(!progress.history_has_position);
+        let resume = progress.resume.as_ref().unwrap();
+        assert_eq!(
+            (&resume.key, &resume.identity, resume.raw_index),
+            (&key, &identity, 1)
+        );
+
+        // A saved page excluded by policy reports the refusal but opens the inner first page.
+        engine.resume_reader = Some(ResumeReader::Saved(ReadingPosition {
+            page: 0,
+            identity: Some(PageIdentity::Archive {
+                container: crate::path_key::normalize_keep_drive(&archive),
+                entry_name: "Chapter/hidden.png".into(),
+            }),
+        }));
+        let ContainerResponse::Success(payload) = engine.container(ContainerRequest {
+            address: RemoteAddress {
+                path: archive.to_string_lossy().into_owned(),
+                subresource: RemoteSubresource::ZipDirectory {
+                    prefix: "Chapter/".into(),
+                },
+            },
+            spread_mode: None,
+            reading_direction: None,
+            force_single_page: true,
+        }) else {
+            panic!("hidden resume enumeration failed");
+        };
+        assert_eq!(
+            payload.resume_refusal,
+            Some(ContainerResumeRefusal::SavedPageUnavailable)
+        );
+        assert_eq!(payload.open_mode, ContainerOpenMode::FirstPage);
+    }
+
+    #[test]
+    fn section1675_remote_inner_refusal_first_page_uses_final_composition_order() {
+        use crate::book_composition::*;
+        let mut app = crate::app::setup_app_for_test();
+        let archive = app.tmp.path().join("composed-inner.zip");
+        write_remote_ai_test_zip(
+            &archive,
+            &[
+                ("root.jpg", b"root"),
+                ("A/0.jpg", b"zero"),
+                ("A/1.jpg", b"one"),
+                ("A/2.jpg", b"two"),
+            ],
+        );
+        let page_ref = |page| CompositionPageRef::ArchiveEntry {
+            entry_name: format!("A/{page}.jpg"),
+        };
+        let mut record =
+            BookComposition::new(ReadingDirection::Rtl, [2, 1, 0].map(page_ref).to_vec());
+        record.hidden_pages.push(page_ref(1));
+        let (service, owner) =
+            BookCompositionService::spawn_at(app.tmp.path().join("inner-composition"), None)
+                .unwrap();
+        let scope = crate::book_scope::BookScopeKey::archive(&archive, &["A".into()]).unwrap();
+        service
+            .save(
+                scope.clone(),
+                PageDomain::ArchiveLevel {
+                    prefix: scope.level_prefix.clone(),
+                },
+                record,
+            )
+            .recv()
+            .unwrap()
+            .status
+            .unwrap();
+        app.install_book_composition_runtime(service);
+        let session = super::super::session::SessionHandle::new();
+        app.set_remote_session_handle(session.clone());
+        let mut settings = app.settings.clone();
+        settings.auto_fullscreen_zip_pdf = true;
+        settings.book_open_resume = crate::settings::ResumeMode::Resume;
+        let mut engine = ContainerEngine::new(settings);
+        engine.session = Some(session);
+        engine.resume_reader = Some(ResumeReader::Saved(
+            crate::book_resume_db::ReadingPosition {
+                page: 1,
+                identity: Some(crate::book_resume_db::PageIdentity::Archive {
+                    container: crate::path_key::normalize_keep_drive(&archive),
+                    entry_name: "A/1.jpg".into(),
+                }),
+            },
+        ));
+        let context = RemoteAddress {
+            path: archive.to_string_lossy().into_owned(),
+            subresource: RemoteSubresource::ZipDirectory {
+                prefix: "A/".into(),
+            },
+        };
+        let ContainerResponse::Success(payload) = engine.container(ContainerRequest {
+            address: context.clone(),
+            spread_mode: None,
+            reading_direction: None,
+            force_single_page: true,
+        }) else {
+            panic!("composed inner enumeration failed");
+        };
+        assert_eq!(
+            payload
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["2.jpg", "0.jpg"]
+        );
+        assert_eq!(payload.open_mode, ContainerOpenMode::FirstPage);
+        assert_eq!(payload.resume_page, None);
+        assert_eq!(
+            payload.resume_refusal,
+            Some(ContainerResumeRefusal::SavedPageUnavailable)
+        );
+        let progress = engine
+            .qualified_write_payload(RemoteWriteRequest::RecordReadingProgress {
+                address: zip_entry_address(&context, "A/2.jpg"),
+                context_address: context,
+                page_index: 999,
+                page_number: 999,
+                page_count: 999,
+                record_resume: false,
+                record_history: false,
+            })
+            .unwrap();
+        assert!(matches!(
+            progress.request(),
+            RemoteWriteRequest::RecordReadingProgress {
+                page_index: 2,
+                page_number: 1,
+                page_count: 2,
+                ..
+            }
+        ));
+        assert_eq!(
+            progress
+                .reading_progress()
+                .unwrap()
+                .resume
+                .as_ref()
+                .unwrap()
+                .raw_index,
+            2
+        );
+        assert!(!progress.reading_progress().unwrap().history_has_position);
+        owner.shutdown_and_join();
+    }
+
+    #[test]
+    fn section1675_remote_child_only_branch_remains_grid() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("branch.zip");
+        write_remote_ai_test_zip(
+            &archive,
+            &[("Branch/A/01.jpg", b"a"), ("Branch/B/01.jpg", b"b")],
+        );
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            auto_fullscreen_zip_pdf: true,
+            ..Default::default()
+        });
+        let ContainerResponse::Success(payload) = engine.container(ContainerRequest {
+            address: RemoteAddress {
+                path: archive.to_string_lossy().into_owned(),
+                subresource: RemoteSubresource::ZipDirectory {
+                    prefix: "Branch/".into(),
+                },
+            },
+            spread_mode: None,
+            reading_direction: None,
+            force_single_page: true,
+        }) else {
+            panic!("branch enumeration failed");
+        };
+        assert_eq!(payload.open_mode, ContainerOpenMode::Grid);
+        assert!(payload.entries.iter().all(|entry| matches!(
+            entry.address.subresource,
+            RemoteSubresource::ZipDirectory { .. }
+        )));
+        assert_eq!(payload.resume_page, None);
     }
 
     #[test]

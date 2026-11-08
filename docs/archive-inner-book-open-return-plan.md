@@ -895,20 +895,118 @@ worktree の `target/codex-tmp`。既存 native 依存物を再利用。製品�
 R2 の source と追加9テストは独立 reviewer が ACCEPT（新規 P1/P2 なし）。指定検証は上記のとおりすべて成功。
 変更は未コミットで設計担当の検収・commit 待ち。S2／S3 の機能と永続スキーマは変更していない。
 
+### S2 実装記録（2026-11-08、自動検証完了・未コミット）
+
+- `BookResumeKey` の追加名前空間と既存 root adapter を実装。テーブル・schema version は変更せず、
+  既存 PC backing／Remote logical root のキーを維持する。内部 raw prefix は case を保持する。
+- 既存 deferred request の resume 指示を排他的な `First / AwaitingFence / Captured / Refused` に変更。
+  IndexOnly と Live の双方で、構成待ちの前に cutoff の saved／unsaved を request へ固定する。
+  保存ページだけが `Explicit`、先頭探索は `FirstInBook`。明示 Required leaf の失敗契約は維持する。
+- 実コードの fence 開始条件は case-fold した構成 scope の変化だけだったため、`A/` → `a/` でも
+  本 open request の受理が既存 restore owner に読取を依頼するようにした。App pending は増設しない。
+- 保存・meter・editor・Remote と managed rename／move／copy／delete の family adapter を同時に実装。
+  新キーと Archive PageIdentity の書換えは同一 transaction、cross-drive の除外前に元 source を渡す。
+  読書履歴・metadata transfer・cache 削除の寿命は変更しない。
+- Remote の応答は既存 `resume_refusal` と `open_mode` で内部「通知＋Page」と root「通知＋Grid」を区別する。
+  wire の形は変更せず、検証済み progress と typed key は core 内部 queue の値とする。
+  Web の進捗送信・batch identity は `requestedAddress` を使い、wrapper collapse 後の表示用 address と
+  保存用の raw book scope を分離する。同じ表示階層でも別の本の進捗は batch を共用しない。
+- S3 の detached BookScope target、HWND／rect 捕捉、viewport identity、placement、timer は変更しない。
+- 実行順によって構成全非表示の DFS が閉じてしまう回帰を確認し、構成採用前に request を既存
+  `AwaitingProjection` owner へ移す順序に修正した。採用末尾は、現在の内部本 request を Activation／DFS
+  とも保全する。保存ページの拒否も同 owner に戻し、採用途中で後発 reader を同期 open しない。
+  root／Required／Preferred の終了契約は維持する。worker hold を使った全非表示 DFS と、
+  Activation／DFS × Checking／Ready の保存拒否再投影を決定的な回帰として追加した。
+  新しい App field・待ち時間・retry・repaint は追加せず、独立 source review で修正を ACCEPT と確認した。
+
+既存テストの仕様上の期待変更：
+
+- `section1675_s1_ignores_outer_resume_and_does_not_record_inner` は
+  `section1675_inner_resume_keeps_outer_position_separate` へ変更。内部保存を確認し、外側行の不変を維持する。
+- `record_book_resume_skipped_inside_zip_book_level` は
+  `record_book_resume_uses_separate_key_inside_zip_book_level` へ変更。内部行を保存する S2 の仕様に合わせる。
+- `remote_nested_page_without_resume_preserves_previous_root_meter` は
+  `remote_inner_progress_saves_its_key_without_overwriting_root_resume_or_history_position` へ変更。
+  内部行の保存と外側 meter／履歴資格の不変を同時に検証する。
+- Web の `container opening resumes the matching page and otherwise falls back safely` は、拒否理由だけで
+  Grid に強制せず server の open mode に従う期待へ変更。root の Grid 期待は維持する。
+- `all_hidden_zip_level_keeps_dfs_continuation_for_manual_and_slideshow` は、移動先の index owner を
+  破棄して即時 `Checking` を注入する旧 fixture を、実際の Index／FIFO／構成／permission 順へ更新。
+  pause 後に書込を admit して cutoff を進め、完了済み snapshot の正当な即時応答では待機を仮定しない。
+  未資格時の timer／anchor／進捗不変と、最終 reader／source／選択／slideshow の assertion は維持する。
+- これ以外の既存 fixture は typed key／resume intent の型合わせと、検証済み progress queue への接続。
+  既存の保存先・位置の意味は変更せず、テストを削除・ignore・弱体化していない。
+
+#### S2 最終検証
+
+PowerShell の共通環境は以下。TEMP／TMP は worktree 内の空ディレクトリを使用した。
+全 lib／workspace suite と製品起動は実施していない。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+$env:CARGO_BUILD_JOBS='1'
+$env:TEMP=(Join-Path (Get-Location) 'target/codex-tmp')
+$env:TMP=$env:TEMP
+```
+
+| コマンド | 結果 | exit code |
+|---|---|---|
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 成功 | 0 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/section167[56]/)'` | 92 passed、0 failed | 0 |
+| 下記の既存回帰 filter | 1,235 passed、0 failed | 0 |
+| `cargo test -p mimageviewer-remote` | 142 passed、0 failed、既存の1 ignored | 0 |
+| `node --experimental-test-isolation=none --test crates/remote-web/web/*.test.mjs` | 540 passed、0 failed | 0 |
+| `cargo fmt` / `cargo fmt --check` | 成功 | 0 |
+| `python scripts/check_ui_glyphs.py` | 危険 glyph 0 | 0 |
+| `git -c core.safecrlf=false diff --check` | 成功 | 0 |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-dev.ps1 -PreserveRuntime` | core と companion の build／配置成功、起動なし | 0 |
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/zip_nav_back_selects_book_cell_left_from|zip_nav_ctrl_updown_|section1335_|section1328_|collection_zip_details_auto_close|everything_close_return|section1678_|close_return_tests|index_only|visibility_current_listing|visibility_live_page_index|book_resume|record_book_resume|rename_key_migration|remote_ipc::|spread_shift_owner|spread_shift_composition|book_composition_editor::|book_composition_permission|book_composition_runtime_tests|composition_transfer_folder_owner_and_document_number_round_trip|book_append_producer_tests::section1373/)'
+```
+
+Web の通常 `node --test` は sandbox の子プロセス spawn が EPERM となるため、同じ test files を
+process isolation 無効で実行した。最終ログは `target/s2-core-final.log`、`target/s2-s1s2-verified.log`、
+`target/s2-regressions-verified.log`、`target/s2-remote-verified.log`、`target/s2-web-verified.log`。
+途中の fixture／compile 失敗と構成採用順の不具合は修正し、上記の確定 source で再検証した。
+追加の schema migration、既存 root 行の rekey、IPC version 変更はない。独立 source review は
+最終修正を ACCEPT（残存 P1/P2 なし）。設計担当の検収・commit は未実施。
+
+#### S2 変更ファイル
+
+- 共通 key／保存／maintenance：`src/book_resume_key.rs`（新規）、`src/book_resume_db.rs`、
+  `src/rename_key_migration.rs`、`src/metadata_transfer.rs`、`src/lib.rs`。
+- 本 open／fence／構成／meter：`src/app.rs`、`src/app/archive_inner_book.rs`、
+  `src/app/sidecar_restore.rs`、`src/app/spread_shift_owner.rs`、`src/app/book_composition_editor.rs`、
+  `src/app/book_composition_permission.rs`、`src/app/book_composition_runtime.rs`、`src/app/book_resume_meter.rs`。
+- Remote：`src/remote_ipc/container.rs`、`session.rs`、`pipe.rs`、`ui.rs`、
+  `crates/remote-web/web/app.js`、`app-runtime.test.mjs`。
+- typed resume intent への既存 producer の型合わせ：`src/app/collection_navigation.rs`、
+  `src/app/smart_folder.rs`、`src/app/snapshot_ops.rs`、`src/filename_stack_ui.rs`、`src/ui_dialogs/epub_convert.rs`。
+- テスト：`src/app/archive_inner_book_s2.rs`（新規）、`src/app/tests/archive_inner_book_s1.rs`、
+  `src/app/book_append_producer_tests.rs`、`src/app/book_composition_editor/{resume_tests,tests}.rs`、
+  `src/app/book_composition_permission_tests.rs`、`src/app/book_composition_revision_tests.rs`、
+  `src/app/book_composition_runtime_tests.rs`、`src/app/book_resume_meter_tests.rs`、
+  `src/app/list_order_virtual_tests.rs`、`src/app/rar_archive_cache_tests.rs`、`src/app/rating_membership_tests.rs`、
+  `src/app/similar_navigation_tests.rs`、`src/app/tests.rs`、`src/app/tests/startup_notices.rs`、
+  `src/ui_dialogs/archive_convert/rar_cache_tests.rs`、`src/ui_fullscreen/continuous_quality_tests.rs`。
+- 文書：本書、`docs/virtual-folders.md`、`docs/nested-zip-tree-plan.md`、
+  `docs/web-remote-plan.md`、`docs/detached-rework-plan.md`。
+
 ## 10. 実装段階と規模
 
 | 段階・commit境界 | 内容 | 主な検証 |
 |---|---|---|
 | **S1：共通activationとmain帰還** | 採択済みOption A、Chosen、row anchor、通常／即時／early-return close、typed内部open継続。**内部本は先頭固定・resume の照会も保存もしない** | 現§8の入口・close・deep／collapse・専用帰路・linked／独立不変 |
-| **S2：内部resumeの保存契約** | key helper、DB/writer adapter、read/write/fence、内部DFS、editor、Remote、maintenance、互換性 | 上記A全件。保存開始とmaintenance対応を同じcoherent commitに含める |
+| **S2：内部resumeの保存契約（実装・自動検証完了）** | key helper、DB/writer adapter、read/write/fence、内部DFS、editor、Remote、maintenance、互換性 | §9の最終検証成功。保存開始とmaintenance対応を同じcoherent commitに含める |
 | **S3：複数窓の内部本open** | descriptor target、列挙前scope解決、source alias、hydration／構成／resume、conversion・初回終端 | 上記B全件、既存detached／RAR cache／Required leaf回帰 |
 | **S4：統合受入** | docs／spec／manualの最終整合、必要な全体gate、検証build | S1〜S3の有効証跡を再利用し、統合差分と必須gateを検査 |
 
 各段階で独立レビューを行い、修正済みfindingの影響範囲だけを再検証する。S1単独を今回要求の完成・リリース可能状態とは扱わない。
 
 S1 本体は `875166c1b`、実装レビュー R1 の修正は `75f796a6e` に commit 済み。
-実装レビュー R2 の修正は未コミットで設計担当へ返し、上記 §9 の検証結果と独立レビューを確認して
-追補の commit 境界を確定する。S2／S3／S4 は未着手。
+実装レビュー R2 の修正は `73a478805` に commit 済みで独立 ACCEPT。S2 は実装・自動検証完了、未コミットで設計担当の検収待ち。
+S3／S4 は未着手。
 
 追加対象には `book_resume_key` 相当の共通module、`book_resume_db`、`rename_key_migration`、Remoteのcontainer/session/ui、descriptorを構築する `startup_ops`、archive conversion continuationを含む。
 
