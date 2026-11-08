@@ -660,7 +660,7 @@ pub enum DepthSourcePhase {
 | A | **実装済み (2026-11-07)**。配布用モデルの作成スクリプト、アドオン (VLM の共通化)、`ModelKind`、深度 worker、前処理の Rust 版。詳細・検証記録は直下 | Python 固定 fixture 比較を含む対象 82/82、VLM アドオン既存テスト・snapshot 成功。実モデル 1/1、Python stretch 相関 1.00000000 |
 | B | 3D モード: 状態・入口・遷移・占有モードの述語 (§6.5 の表)、GPU の色テクスチャと読み戻し、シェーダ、マウス追従、パネル、キー | 状態遷移テスト、入口条件のテスト、360° の既存テスト、シェーダの不変条件テスト (§11) |
 | C | **実装済み (2026-11-07、ClaudeCode検収・利用者実機確認待ち)**。書き出し (GIF / APNG / MP4、映像だけの muxer、進行ダイアログ)。直下に実装・検証記録 | 限定lib286/286、UI関連6/6成功。全件gateはClaudeCode担当 |
-| D | 文書 (§12) と製品ページ・マニュアル | 公開文書の検査スクリプト |
+| D | **文書更新済み (2026-11-08)**。製品ページ・マニュアル・日英 privacy・ライセンス案内・モデル公開手順。更新一覧とコード照合は §12 | 公開文書の検査、Rust はライセンス文言のみの check・関連テスト（結果は §12） |
 
 各段のあと独立レビュー (Sol / xhigh)。実機確認は利用者 (`build-dev.ps1` のバイナリ)。
 
@@ -1871,6 +1871,80 @@ stage／commit・製品起動・build-dev・filterなし全件は実施しない
   360° の設計書 (占有モードの述語へ移したこと)、detached-rework-plan §11 (§6.4)。
 - 公開手順: release-checklist にモデルの公開 (タグ `depth-model-v1`) を足す。
 
+### 段 D の更新記録 (2026-11-08、基点 `930fbc7a4`)
+
+再起動後は `0c988a36d` 上で継続。元モデルIDの正本は同commitで訂正済みの
+`tools/depth_model/build_depth_addon.py::NOTICE` にある `depth-anything/DA3MONO-LARGE`。
+本作業ではbuilderを再編集せず、公開手順の参照先もこのURLに揃えた。
+再開時に製品ページとshortcutsの全内容がNULになっていたため、この2ファイルだけHEADから復元して
+記録済みの段D差分を再適用した。他の編集は維持し、下記検査で14ファイルのUTF-8とNULなしを確認した。
+
+公開名は **「3D 写真」で確定**。実装用語はライセンスの変更通知と開発者向け手順に限定し、
+公開マニュアル・製品カードに本体の版番号を追加しない。コードの挙動・更新履歴・画像素材は変更しない。
+Rust の差分は `src/ui_dialogs/about.rs` のライセンス案内の文言追加のみ。
+
+| 更新ファイル（repository root から） | 内容 |
+| --- | --- |
+| `htdocs/mimageviewer/manual/fullscreen.html` | `#depth-photo` に入口・初回取得・右パネル・書き出し・制限・F11切替時終了・透過背景切替を追加。`#depth-export`、`#depth-availability` も設ける |
+| `htdocs/mimageviewer/manual/shortcuts.html` | D、3D中の I / Tab と Shift+B、連結読みで使えない操作の一覧を更新 |
+| `htdocs/mimageviewer/manual/settings.html` | `#depth-addon` に導入・削除・保存先・ライセンスと派生物の変更内容を追加。保存場所一覧にも追加 |
+| `htdocs/mimageviewer/manual/index.html` | 目次から `fullscreen.html#depth-photo` へ直接リンク |
+| `htdocs/mimageviewer/manual/troubleshooting.html` | 開始できない条件・取得後の再操作・初回準備と内蔵GPU等の待ち時間を短く説明。FAQに同じ説明を重複追加しない |
+| `htdocs/mimageviewer/index.html` | AIカード付近に3D写真カードを1枚追加。安心欄のPC内処理に奥行き計算を含め、ライセンス欄にDA3派生物を追加。通信のカードは既に任意機能とprivacyへのリンクで包括できるため維持 |
+| `htdocs/mimageviewer/privacy.html` | 日英の任意ダウンロード・保存データ・PC内のAI処理に深度モデルを追加。GPU専用との読み違いを避け、PC内処理と記載 |
+| `README.md`、`installer/readme.txt`、`installer/readme_portable.txt`、`src/ui_dialogs/about.rs` | 第三者ライセンス案内にDepth Anything 3（DA3 Mono-Large、Apache-2.0）・fp16化・入力固定・再学習なし・LICENSE/NOTICEの参照方法を追加 |
+| `docs/release-checklist.md` | Phase 5に初回・モデル更新時の公開手順を追加。builder、4 assets、独立タグ、latestにしない、既存資産維持と新タグへの更新を明記 |
+| `htdocs/sitemap.xml` | 生成スクリプトで更新した公開ページのlastmodを反映（URL増減なし） |
+| `docs/depth-parallax-plan.md` | 段D・本節・§15の名称確定を記録 |
+
+**記載した事実のコード根拠**（行番号より関数名を追跡の正本とする）:
+
+| 事実 | 根拠 |
+| --- | --- |
+| メインウィンドウ/全画面の静止画・単ページに限定。動画/音声/アニメ/見開き/連結/編集/紙めくり/別窓/GPU描画なしを拒否 | `src/depth_parallax.rs::DepthEntryBlock / entry_allowed`、`src/app/depth_view.rs::depth_entry_allowed / depth_presentation_eligible`。実際の2ページ表示判定を使う |
+| F11等の実表示切替で終了、再度D/ボタンで開始 | `src/app/depth_view.rs::commit_viewer_presentation_deferred_feedback / toggle_depth_parallax`、`src/ui_fullscreen.rs` の3D上部ボタン |
+| D、I/Tab、Shift+Bの既定・3D中のパネル切替/背景切替 | `src/keymap.rs::default_chords` の `FsDepthParallax / FsToggleMetadata / FsBgCycle` と `docs/keymap.ini.default`、`src/ui_fullscreen.rs::handle_fs_key_input_with_operation`、`src/app/depth_view.rs::toggle_depth_panel` |
+| 初回約0.67GB、同意後取得、完了で自動入場しない、導入・削除・保存先表示 | `src/ui_dialogs/depth_addon.rs::draw_dialog / poll_depth_setup / depth_setup_completion_message / draw_preferences`、`src/ui_dialogs/model_addon.rs::draw_actions`。環境設定ツリーは `src/ui_dialogs/preferences.rs` の `DepthAddon` |
+| GitHub Releasesの固定タグ、データフォルダ内addons/depth、ポータブルはdata配下 | `src/addon.rs::AddonKind::default_base_url / index_name`、`src/depth_addon.rs::addon_root`、`src/data_dir.rs` |
+| 奥行き計算はローカル、画像を計算のために外部送信しない | `src/depth_estimation.rs::estimate / infer_disparity` がローカルモデルを `AiRuntime::load_model / with_session` で実行。取得処理は別の `src/addon.rs` と `src/vlm_addon_download.rs` |
+| 動き5種、強さ/周期/止まる深さ/整形の範囲と既定、共通設定として保存 | `src/depth_parallax.rs::MotionKind / DepthParallaxSettings`、`src/ui_depth_parallax.rs::draw_depth_parallax_panel_with_export`、`src/app/depth_view.rs::draw_depth_panel` |
+| 書き出し3形式、fps・ループ、長辺5候補と形式別既定・縮小側の候補・拡大なし | `src/depth_export.rs::DepthExportFormat / DepthExportOptions`、`src/ui_depth_export.rs::long_edge_choices / default_long_edge / draw` |
+| マウス追従時の書き出し初期値は左右、現在の設定と背景を反映、保存先と大きさを通知 | `src/app/depth_export.rs::admit_depth_export / poll_depth_export / ExportCapture::into_request`、`src/depth_export.rs` の `DepthExportSummary`（大きさ取得失敗時は省略） |
+| 書き出し設定から完了まで閲覧を止め、進捗・取消を表示 | `src/app/depth_export.rs::Operation`、`src/app.rs::common_modal_dialog_open / document_open_modal_admission_blocked`、`src/ui_depth_export.rs::draw` |
+| Remoteでは3Dを表示せず、リモート操作中のローカル開始も拒否、360°との切替・編集との排他 | `src/app/depth_view.rs::resume_depth_entry_after_check / set_fs_exclusive_view`、`src/app.rs::close_fs_exclusive_conflicts`、`src/ui_fullscreen.rs` の編集/360°入口と操作権判定 |
+| DA3 Mono-Large、Apache-2.0、fp16化・1枚504×504入力固定・再学習なし、モデルとLICENSE/NOTICEを取得 | `tools/depth_model/build_depth_addon.py::NOTICE / build`、`src/depth_addon.rs::validate_index`、`src/addon.rs::install_for_kind` |
+
+**設計との照合・記述を控えた事項**:
+
+- §6.1の箇条書きに明記のない「紙めくり中」の拒否も、コードの `DepthEntryBlock::PageTurning` に従って掲載した。
+- §9の「画像フルスクリーン」はkeymapの文脈名。利用者向けには§6.4.1と実コードどおりメインウィンドウ内表示も含めた。
+- §1の書き出し「1周期」だけではMP4の長さを説明しきれないため、§7と実コードのループ回数1〜10・既定4回を記載した。
+- 待ち時間の根拠は [研究調査 §8.5](depth-parallax-research.md)。
+  初回GPU準備2〜3.5秒と内蔵GPU初回13〜19秒の記録があり、公開文書は「数秒以上かかることがある」に留めた。
+  一般的なGPU/低速CPUへの所要時間の保証、極端な縦横比での品質、書き出しファイル容量の目安は掲載しない。
+- モデルReleaseの公開状態・公開URLからの実取得は今回未確認。公開手順として記載し、取得済みとは主張しない。
+
+**検査記録**（`0c988a36d`＋段Dの未コミット差分、通常feature）:
+
+| 検査 | 結果 |
+| --- | --- |
+| `python scripts/check_site_cards.py` | exit 0、53枚・違反0 |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険グリフ0 |
+| `python scripts/gen-effetune-docs.py --check` | exit 0、137 version files＋entry＋redirectsが現行と一致 |
+| `python scripts/test_gen_effetune_docs.py` | exit 0、33/33 |
+| `python scripts/gen-sitemap-xml.py --check` | exit 0、216 URLs。生成によるURL増減なし |
+| 内部リンク・HTML・UTF-8/NUL検査 | `target/depth-docs-audit.py`、exit 0。変更した14ファイルはUTF-8/NULなし、公開ページのfragment91件・新規ローカルリンク9件に不在先なし、新規の閉じ忘れ/重複IDなし |
+| `python scripts/test_public_privacy_scope.py` | exit 1、7/9。privacyの既存「確認では」の検出と旧SFZ保存先の期待値で2件失敗。同じscriptをHEADの公開3ファイルへ適用して同じ2件失敗を再確認。今回の深度追記による追加失敗はなく、範囲外の表記・期待値は変更しない |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0、通常dev。ログ `target/depth-docs-cargo-check.log`、既存warningあり |
+| `cargo fmt --check` | exit 0 |
+| `cargo test -p mimageviewer --lib ui_dialogs::about::tests::` | exit 0、7/7（snapshotを含むheadless）。通常test profile、コンパイル6分44秒・実行3.26秒、既存warningあり。再起動前の中断結果は採用せず再実行した。ログ `target/depth-docs-about-tests.log` |
+| 同じモデル作成用venvで `python -m unittest discover -s tools/depth_model -p test_build_depth_addon.py` | exit 0、2/2。モデル取得・製品起動なし |
+| `python scripts/verify-site.py htdocs https://www.mikage.to` | exit 1、392件すべてWinError 10061（接続拒否）で取得できず。公開内容の一致は未確認。ログ `target/depth-docs-verify-site.log` |
+| `git diff --check` | exit 0。stageされたファイルなし |
+
+`gen-changelog-html.py` は更新履歴、`gen-moire-sample.py` は画像素材を生成するため、依頼の範囲外として実行しない。
+製品起動・確認用build・stage・commitは行っていない。
+
 ## 13. まれな失敗の扱い
 
 まれな失敗は割り切り (ログ + 通知)。ダウンロードの失敗・推論の失敗・GPU の読み戻しの失敗・
@@ -1922,11 +1996,10 @@ stage／commit・製品起動・build-dev・filterなし全件は実施しない
 段Cで、映像だけのmuxer、GIFの累積遅延、独立GPU資源と画面の色・半透明下地の一致、
 Remote leaseと外部open受付の排他をコードと回帰検査の対象へ具体化した。実行結果は§10に集約する。
 
-以下は未確認。
+公開名は「3D 写真」で確定し、この名前で公開文書を更新した（段D）。以下は未確認。
 
 - 極端な縦横比 (3:1 以上) での深度の劣化 (§3.1)。
 - 一般的な GPU・遅い CPU での所要時間 (研究調査 §8.5)。
-- 名前 (「3D 写真」で仮置き)。
 
 ## 16. 独立レビューの記録
 

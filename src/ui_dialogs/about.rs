@@ -304,6 +304,10 @@ impl App {
                 ui.label("llama.cpp / ggml (MIT) を使用しています。");
                 draw_license_text(ui, "AI 説明文のライセンス・著作権表記 全文", "about_vlm_worker_license", VLM_WORKER_LICENSE);
                 ui.label("追加モデル: Qwen3.5-4B (Apache License 2.0)。モデルの LICENSE と NOTICE は環境設定の「AI 説明文」から保存先フォルダを開いて確認できます。");
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new("3D 写真").strong());
+                ui.label("追加モデル: Depth Anything 3 (DA3 Mono-Large、Apache-2.0) の派生物。重みと内部計算を fp16 化し、入力を 1 枚・504 × 504 px に固定しています。再学習は行っていません。");
+                ui.label("モデルの LICENSE と NOTICE は、環境設定の「3D 写真の追加モデル」から保存先フォルダを開いて確認できます。");
 
                 draw_license_text(
                     ui,
