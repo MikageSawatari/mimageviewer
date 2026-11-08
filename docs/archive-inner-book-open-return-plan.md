@@ -1,6 +1,6 @@
 # 書庫内の本を開く・閉じる (§1.675 + §1.676) 設計
 
-状態: **設計 R3 (2026-11-08)**。設計担当 ClaudeCode Opus 5.5。ソース調査と下書きは Codex GPT-6.1 Sol / high
+状態: **設計 R4 (2026-11-08)**。設計担当 ClaudeCode Opus 5.5。ソース調査と下書きは Codex GPT-6.1 Sol / high
 (読み取り専用、`bec01bf11`)。利用者の採択は §9、独立設計レビューの経過は §9 に記録する。
 利用者方針 (2026-11-08): 時間がかかるなら v5.1.0 より後に延期してよく、範囲を削らず理想的な形で入れる。
 master へ入れる時期は完成時に利用者へ確認する。
@@ -147,8 +147,10 @@ enum ZipListChoice {
   先頭探索は**本の構成順と可視集合の両方を満たす最初の直下ページ**を選ぶ。
   目的は先頭なら `BookTargetPurpose::FirstInBook`、保存位置なら `Explicit`。既存の本の構成待ち・表示許可を通って
   開く (`from_explicit_open = true`、`HistoryTrigger::UserChosen`、resume notice は要求に同行)。
-- resume fence: IndexOnly の末尾は既存どおり fence を消費する。そのとき fence を通した保存位置 (PageIdentity) を
-  **要求の値へ写し取り**、構成待ちの後はその写しを構成適用後の列へ解決する (構成待ちの間に fence を開いたままにしない)。
+- resume fence: IndexOnly の末尾と、独立ビューアの初回 open が通る Live continuation (ZIP first-display の後) は、
+  既存どおり fence を消費する。**どちらも fence を消す前に同じ capture 処理を通し**、fence を通した保存位置
+  (PageIdentity) を要求の値へ写し取る。「cutoff 時点で保存なし」も確定結果として写し取る。構成待ちの後はその写しを
+  構成適用後の列へ解決し、DB を再照会しない (構成待ちの間に fence を開いたままにしない)。
 - **S1 では内部本は先頭固定・保存なし**とする (既存の container resume 照会は `current_folder` を読み、外側 root の位置を
   内部へ適用し得るため、S1 では resume 照会そのものを呼ばない)。S2 で typed な読取と保存を同時に有効にする。
 - 候補が無ければ、型付きの結果で**その階層の一覧表示**に終える。既存の `DeferredFsTarget::None` / Required の終端と
@@ -583,7 +585,8 @@ HWND／rect capture、viewport ID、registry transaction、placement保存、tim
 - `section1675_inner_resume_saved_page_hidden_by_filter`  
   ★一時解除が発動しない条件で「保存ページだけ除外」「全ページ除外」。保存位置を採らず通知付き先頭 / 一覧。
 - `section1675_inner_resume_fence_across_composition_wait`  
-  IndexOnly 完了 → 構成待ち → 表示の間に保存が入る cutoff。写し取った位置を使い、fence を開いたままにしない。
+  IndexOnly (通常モード) と Live continuation (独立ビューアの初回 open) で parameter 化し、保存あり・保存なしの両方で、
+  fence の解除 → 構成待ち → 表示の間に保存が入る cutoff。写し取った値を使い、待機後に DB を再照会しない。
 - `section1675_inner_resume_remote_refusal_contract`  
   Remote で内部本の復元拒否は通知 + 先頭、root の拒否は従来どおり Grid。
 - `section1675_inner_resume_root_rows_pc_and_remote`  
@@ -647,7 +650,10 @@ HWND／rect capture、viewport ID、registry transaction、placement保存、tim
   root キーは PC backing・Remote logical の各既存キーを維持 / literal prefix を含む `ArchiveBookTarget` を単一 owner で移す /
   保存位置も可視集合と照合 / Remote の内部本の復元拒否契約) と P3 2 件 (ドライブ違いの move・copy の接続位置 /
   S1 は先頭固定) と未決 1 件 (構成待ちをまたぐ resume fence) を R3 で反映した。detached 部分は構造的修正であることに同意。
-- 独立設計レビュー R3: 未実施。
+- 独立設計レビュー R3 (`72fcc9a9a`): REVISE。R2 の全項目は解消と確認。P2 1 件 (resume fence の写し取りを独立ビューアの
+  Live continuation にも適用し、「保存なし」も確定結果として持つ) を R4 で反映した。追加の利用者判断は不要。
+  detached 部分は構造的修正であることに引き続き同意。
+- 独立設計レビュー R4: 未実施。
 
 ## 10. 実装段階と規模
 
