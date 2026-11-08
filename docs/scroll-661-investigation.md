@@ -302,11 +302,14 @@ vendor の opt-in 経路内に、この transport ID に属する一つの typed
 「オフセットは App が自前管理し、常に `cell_size` の整数倍」は維持する。詳細では row height 28 pt、サムネイルでは現在の `cell_h` がこの単位に当たる。
 
 ```text
-M = natural_h <= viewport_h ? 0 : ceil((natural_h - viewport_h) / row_h) * row_h
+row_visibility_h = max(viewport_h, row_h)
+M = natural_h <= viewport_h ? 0 : ceil((natural_h - row_visibility_h) / row_h) * row_h
 確保高 = natural_h <= viewport_h ? natural_h : M + viewport_h
 canonical = 行境界上の 0..M
 touch の描画位置 = canonical + 既存の一時 remainder
 ```
+
+2026-11-08 サブ PC 担当の報告（窓 1600x560 で一覧が真っ白）を受け、extent と選択 reveal の行表示計算を最低 1 行分の高さで共通化する。実 viewport が 1 行より低い場合は行の上端を合わせ、下側は切れる。最大オフセットは最後の行の上端を超えず、実 viewport 高と確保高の関係は維持する。
 
 位置要求は同 frame の行高で snap / clamp し、**その補正の意味も一緒に**渡す。例えば旧 canonical 840、縮小後 max 560 なら解決結果は `Set(560)` であって `Sync(560)` ではない。egui が受け取る数値が有効でも、旧 velocity / target を終えてから描画 origin / viewport を決める。`Set` はこの解決 frame の結果であり、以後の readback を毎 frame Set にするものではない。egui は履歴・canonical の所有者にはならず、native 入力の候補 offset を返す。App は既存の details 半行 / thumbnail `should_sync_grid_scrollbar` の読戻し閾値と丸めを保持し、丸め後も現在の snapped max に収める。touch 端数は canonical や履歴へ保存せず、現在の方向 settle・130 ms snap 補間・prefetch / keep 範囲の扱いを保つ。
 
