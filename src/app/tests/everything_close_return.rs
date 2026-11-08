@@ -792,3 +792,60 @@ fn section1708_physical_result_open_retires_search_focus_without_resubmitting() 
         assert!(app.global_search.pending.is_none());
     }
 }
+
+// Master bec01bf11 has the same zip_nav_enter/show_current_level bodies.
+// This records that pre-existing boundary; it is not an S1 desired behavior.
+#[test]
+fn investigation_master_everything_no_origin_zipdir_list_keeps_rows_while_nav_moves() {
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    app.indexer_init = IndexerInit::Unavailable;
+    app.settings.auto_fullscreen_zip_pdf = false;
+    app.settings.detached_viewer_open_images_in_window = false;
+    assert!(app.current_folder.is_none());
+    let root = app.tmp.path().to_path_buf();
+    let (row, backing) = fixture(&mut app, &root, Book::Zip);
+    let mut image = std::io::Cursor::new(Vec::new());
+    image::RgbImage::new(2, 2)
+        .write_to(&mut image, image::ImageFormat::Png)
+        .unwrap();
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&backing).unwrap());
+    for name in ["A/001.png", "B/001.png"] {
+        zip.start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zip, image.get_ref()).unwrap();
+    }
+    zip.finish().unwrap();
+    adopt(
+        &mut app,
+        &ctx,
+        "master no origin control",
+        dataset(vec![row.clone()]),
+    );
+    assert!(app.top_level_grid_view.return_to().is_none());
+    open(&mut app, &ctx, &row, false);
+    assert!(app.main_folder_history_available());
+    assert!(app.folder_nav_current_entry().is_none());
+    assert!(app.zip_nav.as_ref().unwrap().at_root());
+    assert!(
+        app.items
+            .iter()
+            .all(|item| matches!(item, GridItem::ZipDir { .. }))
+    );
+    let rows = app.items.clone();
+    let generation = app.items_generation;
+    // The released OFF path: mutate nav, then attempt ExplicitList install.
+    app.zip_nav_enter("A/");
+    assert_eq!(app.zip_nav.as_ref().unwrap().current(), &["A"]);
+    assert_eq!(app.items, rows);
+    assert_eq!(app.items_generation, generation);
+    assert!(app.fullscreen_idx.is_none());
+    assert!(!app.sidecar_restore_active());
+    assert!(
+        app.zip_nav
+            .as_ref()
+            .unwrap()
+            .chosen_list_return_plan()
+            .is_none()
+    );
+}

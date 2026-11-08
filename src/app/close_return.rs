@@ -9,6 +9,12 @@ pub(crate) enum ViewerCloseCause {
     AppExit,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FullscreenCloseDestination {
+    CurrentList,
+    ChosenZipList,
+}
+
 #[derive(Debug, Default)]
 pub(crate) enum FullscreenCloseContinuation {
     #[default]
@@ -18,6 +24,22 @@ pub(crate) enum FullscreenCloseContinuation {
 }
 
 impl FullscreenCloseContinuation {
+    pub(super) fn terminal_destination(&self) -> FullscreenCloseDestination {
+        match self {
+            Self::Terminal(request)
+                if matches!(
+                    &request.effect,
+                    CloseReturnEffect::Navigation {
+                        nav: crate::ui_main::AddressBarNav::ZipListReturn(_),
+                        ..
+                    }
+                ) =>
+            {
+                FullscreenCloseDestination::ChosenZipList
+            }
+            _ => FullscreenCloseDestination::CurrentList,
+        }
+    }
     pub(crate) fn is_pending(&self) -> bool {
         matches!(self, Self::Live | Self::Terminal(_))
     }
@@ -126,7 +148,8 @@ impl App {
             let Some(origin) = app.close_return_origin() else {
                 return;
             };
-            let parent = if app.bookmark_view_back_nav().is_some()
+            let parent = if app.chosen_zip_list_return().is_some()
+                || app.bookmark_view_back_nav().is_some()
                 || app.auto_open_for_current_container()
             {
                 app.resolve_close_return_navigation()
@@ -136,7 +159,12 @@ impl App {
             let Some((nav, selection)) = parent else {
                 return;
             };
-            let effect = if let Some(BookmarkViewState::Opening { target, grid }) =
+            let effect = if matches!(&nav, crate::ui_main::AddressBarNav::ZipListReturn(_)) {
+                CloseReturnEffect::Navigation {
+                    nav,
+                    select_after_load: selection,
+                }
+            } else if let Some(BookmarkViewState::Opening { target, grid }) =
                 app.bookmark_view_state.as_ref()
             {
                 let target = target.clone();
@@ -215,6 +243,9 @@ impl App {
     pub(super) fn resolve_close_return_navigation(
         &self,
     ) -> Option<(crate::ui_main::AddressBarNav, Option<String>)> {
+        if let Some(plan) = self.chosen_zip_list_return() {
+            return Some((crate::ui_main::AddressBarNav::ZipListReturn(plan), None));
+        }
         if self.everything_book_close_return_available() {
             // The accepted Search owner holds the logical source and full-path anchor,
             // including converted books. Never infer this return from a cache's parent.

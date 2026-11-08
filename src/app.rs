@@ -673,7 +673,11 @@ pub(crate) mod smart_folder;
 mod snapshot_ops;
 use raw_page_store::*;
 mod ai_terminal_service;
+mod archive_inner_book;
 mod close_return;
+pub(crate) use archive_inner_book::ArchiveBookTarget;
+#[cfg(test)]
+use archive_inner_book::ZipDirActivationOutcome;
 #[cfg(all(test, windows))]
 mod context_state_tests;
 mod logic_service;
@@ -682,7 +686,9 @@ pub(crate) mod root_lifecycle;
 mod startup_ops;
 mod subfolder_expansion;
 mod update_phases;
-pub(crate) use close_return::{FullscreenCloseContinuation, ViewerCloseCause};
+pub(crate) use close_return::{
+    FullscreenCloseContinuation, FullscreenCloseDestination, ViewerCloseCause,
+};
 #[cfg(all(test, windows))]
 mod close_return_tests;
 #[cfg(test)]
@@ -4685,6 +4691,7 @@ pub(crate) struct DeferredFsReopen {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DeferredFsTarget {
     None,
+    CurrentArchiveBook(ArchiveBookTarget),
     Preferred(crate::snapshot::SnapshotTarget),
     Required(crate::snapshot::SnapshotTarget),
     CollectionNavigation(CollectionArchiveNavigationContinuation),
@@ -4695,6 +4702,8 @@ enum DeferredFsOpenOutcome {
     Opened,
     WaitingComposition,
     NoPlayableItem,
+    ArchiveBookList,
+    StaleArchiveBook,
     RequiredTargetMissing,
     RequiredTargetHidden,
 }
@@ -24871,6 +24880,10 @@ impl App {
         nav: crate::ui_main::AddressBarNav,
     ) -> bool {
         match nav {
+            crate::ui_main::AddressBarNav::ZipListReturn(plan) => {
+                self.apply_zip_list_return(plan);
+                true
+            }
             crate::ui_main::AddressBarNav::Direct(path, restore_intent) => {
                 let outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
                     path,
@@ -41539,6 +41552,11 @@ impl App {
         &mut self,
         deferred: DeferredFsReopen,
     ) -> DeferredFsOpenOutcome {
+        if let DeferredFsTarget::CurrentArchiveBook(target) = &deferred.target
+            && !self.archive_book_target_is_current(target)
+        {
+            return DeferredFsOpenOutcome::StaleArchiveBook;
+        }
         let ctx = self.edit_preview_repaint_ctx.clone().unwrap_or_default();
         self.poll_book_composition_read(&ctx);
         if self.book_composition.is_pending() {
@@ -41553,7 +41571,7 @@ impl App {
         // fallback する。一方、detached の明示 leaf open は Required で、対象が列挙結果に
         // 無ければ別ページを開かず terminal close へ進める。
         let mut new_idx = match &deferred.target {
-            DeferredFsTarget::None => None,
+            DeferredFsTarget::None | DeferredFsTarget::CurrentArchiveBook(_) => None,
             DeferredFsTarget::Preferred(target) => self.resolve_snapshot_target_idx(target),
             DeferredFsTarget::Required(target) => {
                 let resolved = self.resolve_required_snapshot_target_idx(target);
@@ -41570,18 +41588,25 @@ impl App {
         };
         let mut resume_notice = None;
         // grid から本を開いた場合は保存済み読書位置 (続きから) を優先。
-        if new_idx.is_none() && deferred.resume_to_last_page {
+        let current_archive_book =
+            matches!(deferred.target, DeferredFsTarget::CurrentArchiveBook(_));
+        if !current_archive_book && new_idx.is_none() && deferred.resume_to_last_page {
             (new_idx, resume_notice) = self.resolve_book_resume_for_container().into_parts();
         }
         if new_idx.is_none() {
-            new_idx = match self.composed_book_layout() {
-                Some(layout) => layout.visible_pages.first().map(|page| page.item_index),
-                None => self.find_fullscreen_nav_target_filtered(!deferred.resume_slideshow),
+            new_idx = if current_archive_book {
+                self.first_visible_archive_book_page()
+            } else {
+                match self.composed_book_layout() {
+                    Some(layout) => layout.visible_pages.first().map(|page| page.item_index),
+                    None => self.find_fullscreen_nav_target_filtered(!deferred.resume_slideshow),
+                }
             };
         }
         if let Some(new_idx) = new_idx {
-            let purpose = if matches!(deferred.target, DeferredFsTarget::None)
-                && !deferred.resume_to_last_page
+            let purpose = if current_archive_book
+                || (matches!(deferred.target, DeferredFsTarget::None)
+                    && !deferred.resume_to_last_page)
             {
                 book_composition_permission::BookTargetPurpose::FirstInBook
             } else {
@@ -41609,6 +41634,8 @@ impl App {
                 self.resume_collection_archive_navigation(continuation);
             }
             DeferredFsOpenOutcome::Opened
+        } else if current_archive_book {
+            DeferredFsOpenOutcome::ArchiveBookList
         } else {
             DeferredFsOpenOutcome::NoPlayableItem
         }
@@ -41622,6 +41649,12 @@ impl App {
     fn handle_deferred_fs_open_outcome(&mut self, outcome: DeferredFsOpenOutcome) {
         match outcome {
             DeferredFsOpenOutcome::Opened | DeferredFsOpenOutcome::WaitingComposition => {}
+            DeferredFsOpenOutcome::ArchiveBookList => {
+                self.finish_main_list_open(StartupListIntent::ExplicitList);
+            }
+            DeferredFsOpenOutcome::StaleArchiveBook => {
+                crate::logger::log("archive book open dropped: stale scope");
+            }
             DeferredFsOpenOutcome::NoPlayableItem => {
                 self.finish_visible_container_fs_nav_failed();
                 #[cfg(windows)]
@@ -52822,6 +52855,7 @@ impl App {
         let Some(nav) = self.zip_nav.as_mut() else {
             return false;
         };
+        nav.clear_list_choices();
         nav.enter(&target.effective_prefix);
         self.zip_nav_show_current_level(crate::app::StartupListIntent::PageContinuation);
         true
@@ -54175,6 +54209,9 @@ impl App {
         idx: usize,
         provenance: Option<crate::book_bookmarks::RelativePageProvenance>,
     ) {
+        if let Some(nav) = self.zip_nav.as_mut() {
+            nav.clear_list_choices();
+        }
         self.bookmark_relative_page_open_once = provenance.map(|value| (idx, value));
         self.open_fullscreen_from_fs_navigation(ctx, idx, crate::app::HistoryTrigger::UserChosen);
         self.bookmark_relative_page_open_once = None;
@@ -59152,13 +59189,9 @@ impl App {
                         }) if self.items_are_rating_view => {
                             self.open_rating_view_zipdir(zip_path.clone(), dir_prefix.clone());
                         }
-                        // ネスト ZIP ツリーの子コンテナへ Enter で降りる (Phase 3)。
-                        Some(GridItem::ZipDir { dir_prefix, .. }) => {
-                            let dp = dir_prefix.clone();
-                            // ★付きの本を絞り込み中に開くと中身が空表示になるのを防ぐ
-                            // (Codex P2)。enter 前に抑制を仕込む。
-                            self.maybe_suppress_rating_filter_for_opened_zip_book(idx);
-                            self.zip_nav_enter(&dp);
+                        // ZipDir activation はマウス・パッドと同じ入口で意図を決める。
+                        Some(GridItem::ZipDir { .. }) => {
+                            let _outcome = self.activate_main_zipdir(idx);
                         }
                         // ファイル名スタック (v2.0.0): 集約グリッドのセルは上の
                         // stack_try_open_from_grid で処理済み (フラットフルスクリーンへ)。
@@ -80967,8 +81000,8 @@ impl App {
     ///
     /// **「ページを直接開く」設定が ON で ZIP/PDF ページ、または追加設定 ON の画像のみ
     /// 通常フォルダを見ているとき**は、ページ一覧 (L2) を経由せずファイル一覧 (L1) まで戻る。
-    /// 判定は `auto_open_for_current_container()` (= 設定 ON & 対象コンテナ内 & 帰路あり) のみで、
-    /// 直接オープン由来かどうかは見ない。それ以外 (設定 OFF / 対象外の通常画像) は 1 段だけ閉じる
+    /// 設定 ON なら、利用者が本を選んだ書庫内一覧を最優先にし、それがなければ
+    /// `auto_open_for_current_container()` の既存帰路を使う。それ以外 (設定 OFF / 対象外の通常画像) は 1 段だけ閉じる
     /// (`close_fullscreen`: コンテナなら L2 ページ一覧、通常画像なら親フォルダグリッド)。
     /// Everything の PhysicalChild では実親へ移らず、既存 Search owner が保持した結果へ戻る。
     ///
@@ -80996,7 +81029,7 @@ impl App {
             return;
         }
         if self.projected_viewer_context_id() == self.viewer_context_main()
-            && self.auto_open_for_current_container()
+            && (self.chosen_zip_list_return().is_some() || self.auto_open_for_current_container())
         {
             self.pending_return_to_parent.request_live();
             return;
@@ -81179,16 +81212,29 @@ impl App {
     /// `keep_fullscreen_viewport_alive` がこのフラグを見て Visible(false) を
     /// 送信し、その直後に false に落とす。ここで先に落とすと送信が抑止される。
     pub(crate) fn close_fullscreen(&mut self) {
+        self.close_fullscreen_for_destination(self.pending_return_to_parent.terminal_destination());
+    }
+
+    fn close_fullscreen_for_destination(&mut self, destination: FullscreenCloseDestination) {
         if self.book_append_undo_in_progress() {
             return;
         }
         self.finish_fullscreen_navigation_for_true_close();
-        self.close_fullscreen_content();
+        self.close_fullscreen_content_for_destination(destination);
     }
 
     /// Content-only teardown for an owner that will reopen or transfer this reader.
     /// True session exits must use close_fullscreen / close_fullscreen_to_completion.
     pub(super) fn close_fullscreen_content(&mut self) {
+        self.close_fullscreen_content_for_destination(
+            self.pending_return_to_parent.terminal_destination(),
+        );
+    }
+
+    fn close_fullscreen_content_for_destination(
+        &mut self,
+        destination: FullscreenCloseDestination,
+    ) {
         if self.book_append_undo_in_progress() {
             return;
         }
@@ -81205,7 +81251,7 @@ impl App {
                 .dispatch(PresentationTransitionEvent::TerminalClose);
             return;
         }
-        self.close_fullscreen_now();
+        self.close_fullscreen_now_for_destination(FsMetadataBoundary::Manual, destination);
     }
 
     /// 「後で」が無い経路から、フルスクリーンを終端まで閉じる。
@@ -81374,6 +81420,17 @@ impl App {
     }
 
     fn close_fullscreen_now_with_metadata_boundary(&mut self, boundary: FsMetadataBoundary) {
+        self.close_fullscreen_now_for_destination(
+            boundary,
+            self.pending_return_to_parent.terminal_destination(),
+        );
+    }
+
+    fn close_fullscreen_now_for_destination(
+        &mut self,
+        boundary: FsMetadataBoundary,
+        destination: FullscreenCloseDestination,
+    ) {
         self.cancel_original_material_entry_intents(None);
         self.pending_fs_page_turn_ready = None;
         self.page_turn_presentation.deactivate("closed");
@@ -81511,6 +81568,7 @@ impl App {
         let cf_fs_cache = self.fs_cache.len();
         let cf_ai_cache = self.ai_upscale_cache.len();
         if cf_was_open
+            && destination == FullscreenCloseDestination::CurrentList
             && matches!(
                 self.bookmark_view_state,
                 Some(BookmarkViewState::Opening { .. })

@@ -7127,3 +7127,34 @@ Modal化や独立した予約世代/保留stateは不要で、既存の採用own
 
 本追補の関連717件は全成功、core check・fmt/glyph・diff checkも成功。
 独立reviewerが証拠と本記録を確認して最終ACCEPTとした。製品起動・実機確認は未実施。
+
+### 2026-11-08: §1.675／§1.676 S1 内部本openと選択元一覧の所有（実装・検証中）
+
+設計担当 ClaudeCode と独立設計 reviewer は
+[内部本計画 R4](archive-inner-book-open-return-plan.md) §7／§9 で構造的修正に合意した。
+S1 は main の ZipDir activation と、main／linked F12 の通常 close を既存の継続 owner へ接続する。
+選択元の記録は `ZipNavLevel`、配送は既存 close continuation が所有し、close 時のパス推測や
+独立ビューアからの main 復元を追加しない。
+
+接点は sidecar の既存待機述語（IndexOnly の型付き本openを含める）、main／linked の既存
+close executor、registry の独立 build／fork／promote 境界である。独立 bundle になる側だけから
+選択元記録（snapshot の `saved_zip_nav` も含む）を除き、main の原本と兄弟の items・queue・世代を維持する。
+複数ウィンドウモードの ZipDir は S1 では一覧移動を維持し、descriptor の拡張は S3。
+HWND／rect capture、viewport identity、placement storage、timer は変更しない。
+
+独立実装 reviewer も基本方針を症状パッチではなく所有境界の構造修正と評価したが、初回は
+Everything 採用境界と構成非対応 prefix の閲覧維持に関する P2 で REVISE。最終 ACCEPT は未取得。
+Everything の「常に install できない」という断定は撤回し、検索前 origin がない条件の既存境界へ訂正した。
+Bookmark teardown は同期的な `FullscreenCloseDestination` を追加して帰還先を区別し、Live は consumer、
+Terminal は既存 effect が値を与える。独立 reviewer はこの補修にも追加 P1/P2 なし・構造修正と確認した。
+動画 transition／metadata boundary の意味や App の保存状態を増やさず、Backspace の既存動作を保つ。
+初回引継ぎ時の最終製品コードでは指定既存回帰 344/344 成功、新規 S1 は 43 件中 41 成功・
+前提差分 2 件が失敗した。その後、設計担当の判断で非対応 prefix は候補だけ scope 検証し
+一覧終端＋情報通知とする修正を加え、origin 無し Everything は master 既存の別件として切り分けた。
+通知は既存の generation/token 所有の Unsupported 状態を共用し、通常 projection の Warning は維持する。
+App field・detached 述語・registry・viewport の追加変更はない。追補の独立レビューは限定差分 ACCEPT、
+追加 P1/P2 なし・構造修正との評価。追補の core check、S1 42/42、指定既存回帰 345/345
+（master 挙動調査 1 件を含む、nextest の leaky 表示 4 件）、追加 Unsupported 回帰 3/3 はすべて exit 0。
+詳細は内部本計画 §9 に記録した。
+全件 gate・製品起動は行っていない。
+前提差分・試験結果・段階の完了状態は内部本計画 §9／§10 に集約する。製品起動・実機確認は未実施。

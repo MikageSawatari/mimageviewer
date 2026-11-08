@@ -782,6 +782,44 @@ impl App {
         self.poll_book_composition_service(ctx);
     }
 
+    /// Publish the existing generation-owned Unsupported outcome once. Explicit
+    /// book activation chooses an informational list ending; ordinary projection
+    /// keeps its released warning. No separate notification latch is needed.
+    pub(super) fn accept_unsupported_archive_composition(
+        &mut self,
+        logical_root: &std::path::Path,
+        reason: String,
+        notice: &str,
+        kind: crate::feedback::FeedbackKind,
+    ) {
+        crate::logger::log(format!(
+            "book_composition: unsupported archive level {}: {reason}",
+            logical_root.display()
+        ));
+        if let Ok(scope) = BookScopeKey::archive(logical_root, &[]) {
+            let token = self
+                .book_composition_service
+                .as_ref()
+                .map(|service| service.snapshot().token_for(&scope))
+                .unwrap_or(CompositionToken {
+                    service_epoch: 0,
+                    publication_sequence: 0,
+                });
+            self.book_composition = ViewerBookComposition::Accepted {
+                scope,
+                token,
+                record: None,
+                layout: CompositionProjectionOutcome::Unsupported { reason },
+                source: self.composition_source(),
+                generation: self.items_generation,
+                cause: ProjectionAdoptionCause::Normal,
+            };
+            self.spread_shift.availability =
+                crate::spread_shift::PairingEditAvailability::Automatic;
+        }
+        self.show_feedback_result(notice.into(), kind);
+    }
+
     fn poll_book_composition_projection(&mut self, ctx: &egui::Context) {
         if let super::book_materialization::ProjectionRecipe::Book(
             super::book_materialization::BookScope::Archive { logical_root, .. },
@@ -805,22 +843,13 @@ impl App {
                 scope: accepted, token: old, generation, layout: CompositionProjectionOutcome::Unsupported { .. }, ..
             } if accepted == &scope && *old == token && *generation == self.items_generation)
             {
-                crate::logger::log(format!(
-                    "book_composition: unsupported archive level {}: {reason}",
-                    logical_root.display()
-                ));
-                self.show_feedback_warning(
-                    crate::book_composition::UNSUPPORTED_COMPOSITION_NOTICE.into(),
+                let logical_root = logical_root.clone();
+                self.accept_unsupported_archive_composition(
+                    &logical_root,
+                    reason,
+                    crate::book_composition::UNSUPPORTED_COMPOSITION_NOTICE,
+                    crate::feedback::FeedbackKind::Warning,
                 );
-                self.book_composition = ViewerBookComposition::Accepted {
-                    scope,
-                    token,
-                    record: None,
-                    layout: CompositionProjectionOutcome::Unsupported { reason },
-                    source: self.composition_source(),
-                    generation: self.items_generation,
-                    cause: ProjectionAdoptionCause::Normal,
-                };
             }
             self.spread_shift.availability =
                 crate::spread_shift::PairingEditAvailability::Automatic;

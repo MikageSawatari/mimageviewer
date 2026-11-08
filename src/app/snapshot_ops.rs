@@ -2545,6 +2545,9 @@ impl App {
                 crate::book_bookmarks::resolve_archive_bookmark_target(&nav.tree, requested_entry)?;
             (tree_path, target)
         };
+        // Required leaf opens are direct navigation, including a leaf whose
+        // level is already installed. Earlier list choices grant no return.
+        self.zip_nav.as_mut()?.clear_list_choices();
         let already_materialized = self.zip_nav.as_ref().is_some_and(|nav| {
             let current = nav.current().join("/");
             current == target.effective_prefix.trim_end_matches('/')
@@ -3363,6 +3366,41 @@ mod tests {
     }
 
     #[test]
+    fn section1676_choice_required_leaf_clears_same_archive_choices_even_when_materialized() {
+        let source = PathBuf::from(r"E:\test\choice-required.zip");
+        let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(
+            source.clone(),
+            ["A/page.jpg", "B/page.jpg"]
+                .into_iter()
+                .map(|entry| crate::zip_loader::ZipImageEntry {
+                    entry_name: entry.into(),
+                    uncompressed_size: 0,
+                    mtime: 0,
+                    container_ancestry: Vec::new(),
+                })
+                .collect(),
+        ));
+        for already_materialized in [false, true] {
+            let mut nav = crate::zip_tree::ZipNavState::new(tree.clone());
+            nav.choose_current_list(Some(5));
+            nav.enter(if already_materialized { "A/" } else { "B/" });
+            assert!(nav.chosen_list_return_plan().is_some());
+            let (items, _) = nav.materialize_current(crate::settings::SortOrder::FileName);
+            let mut app = test_app_with_items(items);
+            app.current_folder = Some(source.clone());
+            app.zip_nav = Some(nav);
+            let resolved = app.materialize_required_archive_target(&source, "A/page.jpg");
+            assert!(resolved.is_some());
+            let nav = app.zip_nav.as_mut().unwrap();
+            assert_eq!(nav.current(), &["A".to_owned()]);
+            assert!(nav.chosen_list_return_plan().is_none());
+            while nav.back() {
+                assert!(nav.chosen_list_return_plan().is_none());
+            }
+        }
+    }
+
+    #[test]
     fn required_virtual_leaf_stages_before_filesystem_preflight() {
         use crate::snapshot::SnapshotTarget;
 
@@ -3736,7 +3774,9 @@ mod tests {
         ];
         let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(zip_path, entries));
         let mut nav = crate::zip_tree::ZipNavState::new(tree);
+        nav.choose_current_list(Some(3));
         nav.enter("bookA/"); // 本の中 (スタック深さ 2)
+        let return_plan = nav.chosen_list_return_plan().unwrap();
         app.zip_nav = Some(nav);
 
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
@@ -3744,6 +3784,15 @@ mod tests {
         assert!(
             app.zip_nav.is_none(),
             "snapshot 中に zip_nav が残ると BS が ZIP 階層を復活させる"
+        );
+        assert!(
+            app.snapshot
+                .as_ref()
+                .unwrap()
+                .saved_zip_nav
+                .as_ref()
+                .unwrap()
+                .matches_list_return_plan(&return_plan)
         );
 
         // at_origin (= current_folder 不変) の解除で nav も復元される。
@@ -3754,6 +3803,7 @@ mod tests {
             !nav.at_root(),
             "退避時のスタック深さ (本の中) ごと復元される"
         );
+        assert!(nav.matches_list_return_plan(&return_plan));
     }
 
     #[test]

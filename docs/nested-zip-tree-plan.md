@@ -153,13 +153,31 @@ navigation でこの関数を呼ぶだけ (再列挙なし = in-memory)。見開
 
 | 操作 | 挙動 |
 | --- | --- |
-| ZipDir を Enter/ダブルクリック | `prefix.push(seg)` → `materialize_level` で再表示 |
+| ZipDir を Enter/ダブルクリック/パッド決定 | 共通 `activate_main_zipdir`。collapse 後の階層を採用し、「ページを表示」が有効なら直下ページを本として開く（§1.675 S1、下記） |
 | Backspace | `prefix.pop()`。空なら ZIP を出て実フォルダ親へ ([`effective_folder`](../src/app.rs)`.parent()`) |
 | アドレスバー/パンくず | `vol.zip > chapters > ch01.zip` (Ctrl+G drill breadcrumb 形式) |
 | Ctrl+↑↓ | **DFS 前順トラバーサル** (`ZipNavState::dfs_step`)。実フォルダの Ctrl+↑↓ と同じ規則 (次 = 最初の子 → 次の兄弟 → 祖先の次の兄弟、前 = 前の兄弟の最後の子孫 → 親) を ZIP ツリーに適用。ツリーの端で `false` → 呼び出し側が ZIP を抜けて実フォルダ DFS へ続く (実機 3 巡目 #6。当初の「兄弟のみ + ルート即脱出」を置換)。FS 中は直下画像なしノードを自動スキップ |
 
 - 状態リセット境界: 同一 ZIP 内のナビでは `ZipNavState.tree` を保持し再列挙しない。
   別 ZIP/フォルダへ出るときのみ `clear_nested_cache` + tree 破棄。
+
+§1.675/§1.676 S1（実装中）:
+
+- 内部フォルダ／入れ子書庫とも「ページを表示」の実効値に従う。候補判定はメモリ上の直下ページ、
+  最終判定は既存の index 準備と構成適用後の順序・可視集合を使う。表示可能なページがなければ
+  その階層の一覧に留まり、子の本へ DFS しない。S1 は保存位置を照会・保存せず先頭から開く。
+- 直接表示候補は `PageContinuation`、一覧移動は `ExplicitList` で install する。取消は既存の
+  sidecar／構成継続を取消し、古い完了から開かない。複数ウィンドウモード・★固定中は一覧移動を維持する。
+- scope は本候補だけで検証する。非対応 prefix は Chosen を保った `ExplicitList`／`List` に終え、
+  ログ＋情報通知 1 回。設定 OFF／分岐等の非本候補は従来どおり一覧へ入る。
+- 共通入口だけが出発階層に `ZipListChoice::Chosen { rows_above }` を記録する。通常 close は現在本の
+  最も深い記録済み祖先へ戻り、旧ページの teardown 後に一覧を作り、現在の本のセルと row anchor を復元する。
+  Backspace は従来どおり現在本の L2。見ていない祖先を推測して帰路にはしない。
+- DFS・ソート・ピンで記録を維持し、refresh・履歴・同一書庫へのブックマーク／Required jump で消す。
+  snapshot の退避には同行するが固定中は帰路を出さない。独立 build／fork／promote は独立側の
+  通常／退避 stack の記録を消し、main と兄弟の items・世代・queue を変更しない。
+- 外側の Collection 等への帰路は保持する。内部一覧から root、さらに外側へ Backspace で戻れる。
+  実装段階と内部本 resume／複数窓の後続作業は [archive-inner-book-open-return-plan.md](archive-inner-book-open-return-plan.md) §10。
 
 ### ⚠ 実効 prefix スタック方式で Backspace 罠を回避 (Phase 1 Codex P2 → Phase 3a 実装で確定)
 当初案は「`ZipNavState.prefix` に論理 prefix を持ち、collapse は materialize 直前の

@@ -206,17 +206,29 @@ impl DeferredFullscreen {
     }
 }
 
+#[derive(Default)]
+pub(super) enum IndexOnlyAfterPrepare {
+    #[default]
+    None,
+    OpenArchiveBook(DeferredFsReopen),
+}
+
 enum ContinuationOwner {
     Live(SidecarLoadContinuation),
-    IndexOnly { cancel: Arc<AtomicBool> },
-    Discarded { cancel: Arc<AtomicBool> },
+    IndexOnly {
+        cancel: Arc<AtomicBool>,
+        after_prepare: IndexOnlyAfterPrepare,
+    },
+    Discarded {
+        cancel: Arc<AtomicBool>,
+    },
 }
 
 impl ContinuationOwner {
     fn cancel(&self) -> &Arc<AtomicBool> {
         match self {
             Self::Live(continuation) => &continuation.cancel,
-            Self::IndexOnly { cancel } | Self::Discarded { cancel } => cancel,
+            Self::IndexOnly { cancel, .. } | Self::Discarded { cancel } => cancel,
         }
     }
 
@@ -665,6 +677,10 @@ impl SidecarRestoreState {
         if !self.target_matches(context, generation) {
             return false;
         }
+        if let ContinuationOwner::IndexOnly { after_prepare, .. } = &mut self.common.continuation {
+            // A manual exact page open supersedes the automatic book demand.
+            *after_prepare = IndexOnlyAfterPrepare::None;
+        }
         self.common.deferred_fullscreen = Some(DeferredFullscreen {
             idx,
             trigger,
@@ -806,11 +822,14 @@ impl App {
     pub(crate) fn sidecar_restore_navigation_fullscreen_wait_active(&self) -> bool {
         self.sidecar_restore.as_ref().is_some_and(|state| {
             self.sidecar_restore_context_current(&state.common)
-                && matches!(&state.common.continuation,
-                    ContinuationOwner::Live(continuation)
-                        if continuation.items_len == self.items.len()
-                            && !continuation.cancel.load(Ordering::Relaxed)
-                            && continuation.fullscreen_reopen_pending())
+                && match &state.common.continuation {
+                    ContinuationOwner::Live(continuation) => continuation.items_len == self.items.len()
+                        && !continuation.cancel.load(Ordering::Relaxed)
+                        && continuation.fullscreen_reopen_pending(),
+                    ContinuationOwner::IndexOnly { cancel, after_prepare: IndexOnlyAfterPrepare::OpenArchiveBook(deferred) } =>
+                        !cancel.load(Ordering::Relaxed) && matches!(&deferred.target, DeferredFsTarget::CurrentArchiveBook(target) if self.archive_book_target_is_current(target)),
+                    _ => false,
+                }
         })
     }
 
@@ -826,6 +845,9 @@ impl App {
         }
         let common = &mut self.sidecar_restore.as_mut().unwrap().common;
         common.deferred_fullscreen = None;
+        if let ContinuationOwner::IndexOnly { after_prepare, .. } = &mut common.continuation {
+            *after_prepare = IndexOnlyAfterPrepare::None;
+        }
         if let ContinuationOwner::Live(continuation) = &mut common.continuation
             && continuation.fullscreen_reopen_pending()
         {
@@ -1474,6 +1496,30 @@ impl App {
         );
     }
 
+    pub(super) fn attach_archive_book_index_continuation(
+        &mut self,
+        deferred: DeferredFsReopen,
+    ) -> bool {
+        let Some(state) = self.sidecar_restore.as_ref() else {
+            return false;
+        };
+        if !self.sidecar_restore_context_current(&state.common) {
+            return false;
+        }
+        let state = self.sidecar_restore.as_mut().unwrap();
+        if let ContinuationOwner::IndexOnly {
+            after_prepare,
+            cancel,
+        } = &mut state.common.continuation
+        {
+            if !cancel.load(Ordering::Relaxed) {
+                *after_prepare = IndexOnlyAfterPrepare::OpenArchiveBook(deferred);
+                return true;
+            }
+        }
+        false
+    }
+
     pub(crate) fn prepare_current_listing_page_identity_index(
         &mut self,
         policy: crate::file_type_visibility::FileTypeVisibility,
@@ -1571,7 +1617,10 @@ impl App {
                 },
                 tag_item_keys: Vec::new(),
                 source_path,
-                continuation: ContinuationOwner::IndexOnly { cancel },
+                continuation: ContinuationOwner::IndexOnly {
+                    cancel,
+                    after_prepare: IndexOnlyAfterPrepare::None,
+                },
                 deferred_fullscreen: None,
                 favorite_failures: Vec::new(),
                 warning: None,
@@ -2574,10 +2623,8 @@ impl App {
             return;
         }
 
-        if matches!(
-            state.common.continuation,
-            ContinuationOwner::IndexOnly { .. }
-        ) {
+        if let ContinuationOwner::IndexOnly { after_prepare, .. } = &mut state.common.continuation {
+            let after_prepare = std::mem::take(after_prepare);
             if let Some(warning) = state.common.warning.take() {
                 crate::logger::log(format!("snapshot page index preparation: {warning}"));
                 self.show_feedback_warning(warning);
@@ -2601,6 +2648,9 @@ impl App {
                 }
             }
             self.spread_shift.finish_fenced_book_resume();
+            if let IndexOnlyAfterPrepare::OpenArchiveBook(deferred) = after_prepare {
+                self.complete_deferred_book_composition_open(deferred);
+            }
             ctx.request_repaint();
             return;
         }
@@ -4018,6 +4068,7 @@ mod tests {
             let state = app.sidecar_restore.as_mut().unwrap();
             state.common.continuation = ContinuationOwner::IndexOnly {
                 cancel: Arc::new(AtomicBool::new(false)),
+                after_prepare: IndexOnlyAfterPrepare::None,
             };
             state.phase = Phase::PreparingPageIndex(PreparingPageIndex {
                 rx,
@@ -4995,6 +5046,7 @@ mod tests {
                 app.sidecar_restore.as_mut().unwrap().common.continuation =
                     ContinuationOwner::IndexOnly {
                         cancel: Arc::new(AtomicBool::new(false)),
+                        after_prepare: IndexOnlyAfterPrepare::None,
                     };
             }
             let notice = BookResumeNotice {
@@ -5279,6 +5331,7 @@ mod tests {
                     app.sidecar_restore.as_mut().unwrap().common.continuation =
                         ContinuationOwner::IndexOnly {
                             cancel: Arc::new(AtomicBool::new(false)),
+                            after_prepare: IndexOnlyAfterPrepare::None,
                         }
                 }
                 _ => {}

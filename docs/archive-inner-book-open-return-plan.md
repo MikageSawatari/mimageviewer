@@ -35,6 +35,13 @@ Ctrl+↑↓ の探索順 (物理 DFS が内部 DFS より先) はこの設計の
   要求を持つ context で本の構成・★絞り込みを適用した後に行う:
   通常モードで表示ページが 0 なら**その階層の一覧表示**に終える。複数ウィンドウの独立ビューアでは通知して
   初回 open を終える。どちらも最初の子へ潜る DFS・フラット化はしない。
+- S1 の scope 検証は、通常モードで「ページを表示」ON・複数ウィンドウ OFF・直下ページありの
+  **本候補になった後だけ**行う。OFF／分岐等の非本候補は scope を作らず、従来どおり一覧へ入る。
+  `part:one/` 等で `BookScopeKey` を作れない本候補は、本の構成による許可判定ができないため
+  `ExplicitList` でその階層の一覧に終え、typed outcome は `List` とする。理由をログへ出し、
+  「この内部フォルダは本として開けないため、一覧を表示します」の情報通知を 1 回出す。
+  既存の generation/token に対応する Unsupported 状態を記録し、後続 poll の構成警告と重複させない。
+  利用者が選んだ事実である Chosen は維持する。他の本・親・先頭の子への fallback はしない。
 - 開く位置 (利用者採択で今回に含める):
   - 一覧からの直接表示は `book_open_resume`、内部本どうしの手動フルスクリーン DFS は `book_nav_resume` に従う
     (外側コンテナの Ctrl+↑↓ と同じ設定の意味)。スライドショーの自動本送りは先頭のまま。
@@ -656,6 +663,95 @@ HWND／rect capture、viewport ID、registry transaction、placement保存、tim
 - 独立設計レビュー R4 (`69570a9c3`): **ACCEPT** (P1/P2/P3 なし)。detached 部分を「症状パッチではなく構造的修正」とすることに同意。
 - 設計担当 ClaudeCode も同じ主張に合意 (2026-11-08)。実装後の完了レビューで改めて合意を取り、detached 計画 §11 に記録する。
 
+### S1 実装記録（2026-11-08、未コミット）
+
+- 共通 `activate_main_zipdir`、`PageContinuation` → `IndexOnlyAfterPrepare::OpenArchiveBook` →
+  `CurrentArchiveBook` の継続、構成順と可視集合の先頭探索を接続した。S1 では container resume を照会せず、
+  内部位置の保存も有効化しない。複数窓・★固定は一覧移動のまま。
+- `ZipNavLevel` の Chosen と同一ツリーの帰還 plan、通常／即時／Terminal close の共通 consumer、
+  旧 items の teardown → pop → ExplicitList → 選択 → anchor/reveal の順序を接続した。
+  bookmark／Required jump、独立 build／fork／promote の失効も、退避中 nav を含めて追加した。
+- teardown は同期引数 `FullscreenCloseDestination::{CurrentList, ChosenZipList}` で帰還先を区別する。
+  Live は検証済み plan の consumer から、Terminal は既存の Navigation effect から導出する。
+  `ChosenZipList` のみ外側の Bookmark owner を保持し、Backspace 等は従来どおり破棄する。
+  App の保存状態・pending は追加しない。独立 reviewer はこの修正にも新規 P1/P2 なしと確認した。
+- 独立実装レビューの初回評価は **REVISE**。全体方針は構造的修正と確認したが、以下の実コードとの
+  前提差分があり、初回引継ぎでは未完了とした。追補の設計担当判断で、(1) は別件、(2) は §2.1 の境界に確定した。
+  1. Everything は**検索前の folder/origin がない場合**、`folder_nav_current_entry()` がなく、既存の
+     `zip_nav_show_current_level` が階層 install 前に戻る。master 既存の不具合と確認し、S1 では修正しない（下記別件報告）。
+     初回レビューの「Everything は常に install できない」という断定は撤回した。origin がある通常条件では
+     open・内部帰還が成功する。Backspace は nav を返さず既存 Parent 処理をその場で実行するため、
+     テストは `None` の後の再投影完了・Everything root・選択 anchor を検証する。
+  2. `part:one/` 等は従来の ZIP 一覧で閲覧可能だが `BookScopeKey` が拒否する。構成非対応と
+     一覧移動の可否を分け、本候補のみ scope 検証し、非対応候補は明示的な一覧終端＋情報通知とする実装へ修正した。
+- headless の共通入力・構成・取消・帰還・記録寿命・linked／独立／兄弟不変の回帰を追加。
+  初回 42 件は 36 成功・6 失敗。上記 prefix、origin 有り Everything の戻り値期待、空構成の同期完了、
+  fork/build の snapshot 所有に関する fixture、Bookmark teardown を切り分け、期待を弱めず修正した。
+  teardown 修正前の指定既存回帰は 344/344 成功。修正後の統合 387 件は 383 成功・4 失敗。
+  修正途中の S1 43 件は 40 成功・3 失敗（exit 100）。別 archive 要求後に旧返信を保持したまま
+  新 adoption 完了を待つ fixture の循環を直し、S1 の最終 43 件は **41 成功・2 失敗**（exit 100）。
+  初回引継ぎ時の失敗は `section1675_unsafe_structural_prefix_keeps_existing_list_navigation` と
+  `section1676_everything_without_origin_adopts_internal_level`。その時点では削除・ignore・期待の引下げはしていない。
+  修正後の既存回帰 344 件は全成功（統合実行の内訳）。その後は新規 fixture のみを直しており、同じ製品コードの成功証跡を再利用する。
+  製品起動は行わない。既存テストの期待値は変更していない。
+
+初回引継ぎまでの検証コマンド（`MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=1`、`TEMP`/`TMP` は worktree の
+`target/codex-tmp`。初回 native 準備で VLM worker の source hash を既存スクリプトで検証して実体復元し、
+FFmpeg DLL を `target/debug/deps` へ実体コピーした）:
+
+| コマンド／filter | 初回引継ぎ時の結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0。初回 native 準備と新 variant の match 漏れを修正後、最終 teardown 変更後も成功 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/section167[56]/)'` | 43 件、41 成功（2 slow）・上記 2 失敗、exit 100 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/zip_nav_back_selects_book_cell_left_from\|zip_nav_ctrl_updown_\|section1335_\|section1328_\|collection_zip_details_auto_close\|everything_close_return\|section1678_\|close_return_tests\|index_only\|visibility_current_listing\|visibility_live_page_index/)'` | 単独 344/344、exit 0。最終製品コードでも下記統合実行内の 344 件が成功 |
+| 上記二つの正規表現を `\|` で結合した focused 実行 | 387 件、383 成功・4 失敗、exit 100。その後直した新規 fixture 2 件は S1 再実行で成功 |
+
+初回 nextest のテストコンパイルは import／型の取り違え 2 件で実行前に失敗（コマンド exit 1、Cargo 子プロセス 101）。
+修正後に上記を実行した。全 lib／workspace gate・検証 build・実機確認は実施せず、S4 に残す。
+初回引継ぎ時は merge／リリース可能とは扱わず、上記 2 条件の設計判断と再レビューを必要とした。
+最終 `cargo fmt`（引数なし）、`python scripts/check_ui_glyphs.py`、
+`git -c core.safecrlf=false diff --check` はすべて exit 0。グリフ違反は 0 件。
+
+#### S1 追補（設計担当判断を反映）
+
+- scope 検証を本候補の後へ移した。非対応候補は `ExplicitList`／`List`／Chosen 維持、ログ＋情報通知 1 回。
+  既存 Unsupported の状態公開を共通 helper へ抽出し、通常の一覧 projection は master の Warning 契約を維持する。
+  新しい App field・通知用 latch・pending は作らない。
+- `section1675_unsafe_structural_prefix_keeps_existing_list_navigation` は ON/OFF × 複数窓 × 分岐の
+  8 条件で、一覧・Chosen・非 fullscreen・候補のときだけ情報通知 1 回・後続の重複警告なしを検証する。
+- 設計担当の指示により、origin 無しの desired-behavior variant は S1 のテストから外した。
+  通常 origin 有りの Everything open／close／Backspace 回帰は維持し、既存挙動の調査テストを別 namespace へ移した。
+- 追補の独立レビューは **ACCEPT（限定差分、新規 P1/P2 なし）**。症状パッチではなく構造修正という評価を維持。
+  追補の自動検証は実装担当が下記を実行した。製品起動・commit は行っていない。
+
+追補の検証（上記と同じ環境変数・native 依存物を使用）:
+
+| コマンド／filter | 結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 成功、exit 0 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/section167[56]/)'` | **42/42 成功、失敗 0、exit 0** |
+| 上記の指定既存回帰 filter（変更なし） | **345/345 成功、失敗 0、exit 0**。既存 344 件＋下記の master 挙動調査 1 件。nextest の leaky 表示 4 件あり |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/g3_unsupported_source_notifies_once\|g3_unsafe_and_ambiguous_actual_archives\|unsafe_or_unproven_archive_source_does_not_infer_scope/)'` | **3/3 成功、失敗 0、exit 0** |
+
+既存テストの期待値は変更せず、S1 外の origin 無し desired-behavior variant の分離だけを設計担当の指示どおり実施した。
+通常 origin 有りの Everything 帰還、非対応 prefix の OFF/ON 一覧移動・通知、既存 Unsupported 契約は成功。
+追補の最終 `cargo fmt` は exit 0（Rust ファイルの追加変更 0）、グリフ検査は違反 0・exit 0、diff check も exit 0。
+追補の差分・検証は完了し、設計担当の検収・commit 待ち。S1 単独を S2/S3 を含む機能全体やリリースの完成とは扱わない。
+
+#### 別件報告: Everything の検索前 origin がない場合の ZIP 階層採用（S1 対象外）
+
+- master `bec01bf11` の `zip_nav_enter`（`src/app.rs:40520`）、`zip_nav_show_current_level`（`:40190`）、
+  `folder_nav_current_entry`（`:25237`）は S1 worktree と同一の関数本体であることを `git show master:src/app.rs` で確認した。
+- Search の owner は `TopLevelGridView` の `return_to` を物理履歴 origin として使う。検索前 origin がないと、
+  `current_top_level_restore_snapshot` は Search surface から `None` を返す（master `:26465`／Search 分岐 `:26512`）。
+  `folder_nav_current_target`（master `:26269`）→ `folder_nav_current_entry` も `None` となる。
+- `zip_nav_enter` は先に nav を A へ進めるが、main の `zip_nav_show_current_level` は履歴採用に必要な source entry を
+  取得できず master `:40207`〜`:40208` で return する。items・items generation・address の install は実行されず、
+  **nav は A、表示は元の A/B 一覧**という不整合になる。「ページを表示」OFF の既存経路でも成立し、S1 が作った不具合ではない。
+- 調査テスト `everything_close_return::investigation_master_everything_no_origin_zipdir_list_keeps_rows_while_nav_moves`
+  は、OFF／origin なし／変更していない `zip_nav_enter` でこの境界を確認する。S1 の正常動作契約には含めず、
+  別 backlog で Search の一覧採用 owner を直す際に更新する。今回、Everything の製品コードは変更していない。
+
 ## 10. 実装段階と規模
 
 | 段階・commit境界 | 内容 | 主な検証 |
@@ -666,6 +762,9 @@ HWND／rect capture、viewport ID、registry transaction、placement保存、tim
 | **S4：統合受入** | docs／spec／manualの最終整合、必要な全体gate、検証build | S1〜S3の有効証跡を再利用し、統合差分と必須gateを検査 |
 
 各段階で独立レビューを行い、修正済みfindingの影響範囲だけを再検証する。S1単独を今回要求の完成・リリース可能状態とは扱わない。
+
+S1 の差分・追補・指定 focused 検証は完了（上記 §9）。未コミットの差分は設計担当が受け取り、
+検証結果と独立レビューを確認して段階の commit 境界を確定する。S2／S3／S4 は未着手。
 
 追加対象には `book_resume_key` 相当の共通module、`book_resume_db`、`rename_key_migration`、Remoteのcontainer/session/ui、descriptorを構築する `startup_ops`、archive conversion continuationを含む。
 
