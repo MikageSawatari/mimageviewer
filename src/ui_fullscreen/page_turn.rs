@@ -1810,11 +1810,11 @@ impl App {
         self.settings.page_turn_animation_enabled
             && self.reading_flow.is_paged()
             && !self.fs_entry_is_animated(page_idx)
-            && !self.is_panorama_mode_active(page_idx)
+            && !self.fs_exclusive_view_active(page_idx).is_some()
             && !self.is_overlay_edit_mode_active()
             && !self.analysis_mode
             && !self.adjustment_mode.is_open()
-            && !self.fs_zoom_mode_engaged()
+            && !self.fs_zoom_mode_effective()
             && self.fs_zoom_pan().is_none()
             && self.fs_free_rotation.abs() <= TRANSFORM_EPSILON
             && self.sns_split.is_none()
@@ -3960,6 +3960,105 @@ fn actual_page_visibility(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn depth_native_only_material_rehydrates_through_the_ordinary_original_worker() {
+        use crate::depth_parallax::{DepthSourceMaterial, DepthSourceWait};
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        let path = app.tmp.path().join("depth-native-original.png");
+        image::RgbaImage::from_pixel(4, 6, image::Rgba([60, 120, 180, 255]))
+            .save(&path)
+            .unwrap();
+        app.items = vec![GridItem::Image(path)];
+        app.fullscreen_idx = Some(0);
+        app.visible_indices = vec![0];
+        app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+        app.spread_mode = SpreadMode::Single;
+        app.reading_flow = crate::settings::ReadingFlow::Paged;
+        app.settings.page_turn_animation_enabled = true;
+        let source_id = crate::app::source_texture_test_support::seed(&mut app, &ctx, 0);
+        let original = app.ensure_final_composite_material(&ctx, 0).unwrap();
+        let native = crate::gpu_lanczos::test_native_resource(original, [2, 3]);
+        let held = crate::gpu_lanczos::FullscreenPaintPayload::PresentationMaterial(
+            native.capture_presentation(&ctx),
+        );
+        drop(native);
+        assert!(held.source_texture().is_none());
+        let outgoing = unit(
+            &ctx,
+            ctx.load_texture(
+                "depth-outgoing",
+                egui::ColorImage::filled([1, 1], egui::Color32::BLACK),
+                Default::default(),
+            ),
+            99,
+        );
+        let fact = ViewerOperationFact {
+            destination: app.page_turn_destination(),
+            ..fact(99)
+        };
+        app.page_turn_presentation.state = PresentationState::Offered {
+            outgoing,
+            offer: AcceptedOffer {
+                fact,
+                ready_sources: Arc::new(AcceptedSources(vec![AcceptedSource {
+                    occurrence: SpreadPageOccurrence::navigation(0, 0),
+                    resource: held,
+                    source_mipmapped: false,
+                    quality: "native_output",
+                    content: app.page_turn_content(0),
+                }])),
+                resident_bytes: 24,
+                pin_bytes: 24,
+                accepted_at: presentation_now(),
+                duration: Duration::from_millis(200),
+                forward: true,
+                submission: Arc::new(SubmissionTracker::new(fact)),
+            },
+        };
+        app.fs_cache.clear();
+        app.edit_result_cache.clear();
+        app.final_composite_cache.clear();
+        assert!(
+            ctx.tex_manager().read().meta(source_id).is_none(),
+            "the fixture must retain only the Native output, not its managed original"
+        );
+        let (payload, material) = app.resolve_fs_processed_payload_and_depth(&ctx, 0, false);
+        assert!(payload.unwrap().source_texture().is_none());
+        assert!(matches!(
+            material,
+            DepthSourceMaterial::NotYet(DepthSourceWait::NativeOnly)
+        ));
+        let pending = app
+            .fs_pending
+            .get(&0)
+            .expect("ordinary final preparation requested original");
+        assert!(matches!(
+            pending.purpose,
+            crate::app::FsLoadPurpose::Original {
+                entry: crate::app::OriginalMaterialEntry::MaterialOnly,
+            }
+        ));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            app.poll_prefetch(&ctx, crate::app::PollPrefetchOrigin::TopLevel);
+            let (payload, material) = app.resolve_fs_processed_payload_and_depth(&ctx, 0, false);
+            if let DepthSourceMaterial::Ready { texture } = material {
+                assert_ne!(texture.id(), source_id);
+                assert_eq!(texture.size(), [4, 6]);
+                assert_eq!(payload.unwrap().source_texture_id(), texture.id());
+                assert!(app.current_final_composite_is_complete(0));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "ordinary original preparation did not reach Ready"
+            );
+            std::thread::yield_now();
+        }
+    }
 
     pub(super) fn destination(serial: u64) -> PresentationDestination {
         PresentationDestination {

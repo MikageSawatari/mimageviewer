@@ -1,4 +1,4 @@
-//! Bounded HTTP transport for the VLM installer. Call only from a worker.
+//! Bounded HTTP transport shared by model addon kind. Call only from a worker.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::addon::AddonKind;
 use sha2::{Digest, Sha256};
 
 pub(crate) const BACKOFFS: [Duration; 4] = [
@@ -17,9 +18,9 @@ pub(crate) const BACKOFFS: [Duration; 4] = [
 const CHUNK: usize = 256 * 1024;
 pub(crate) const CANCELLED: &str = "VLM installation cancelled";
 
-pub(crate) fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
+pub(crate) fn check_cancel_for_kind(kind: AddonKind, cancel: &AtomicBool) -> Result<(), String> {
     if cancel.load(Ordering::Relaxed) {
-        Err(CANCELLED.into())
+        Err(kind.cancelled().into())
     } else {
         Ok(())
     }
@@ -47,14 +48,15 @@ fn http_error(error: ureq::Error) -> AttemptError {
     }
 }
 
-fn retry<T>(
+fn retry_for_kind<T>(
+    kind: AddonKind,
     cancel: &AtomicBool,
     backoffs: &[Duration],
     mut attempt: impl FnMut() -> Result<T, AttemptError>,
 ) -> Result<T, String> {
     let mut retries = 0;
     loop {
-        check_cancel(cancel)?;
+        check_cancel_for_kind(kind, cancel)?;
         match attempt() {
             Ok(value) => return Ok(value),
             Err(AttemptError::Stop(error)) => return Err(error),
@@ -65,7 +67,7 @@ fn retry<T>(
                 retries += 1;
                 let until = Instant::now() + *delay;
                 while let Some(remaining) = until.checked_duration_since(Instant::now()) {
-                    check_cancel(cancel)?;
+                    check_cancel_for_kind(kind, cancel)?;
                     std::thread::sleep(remaining.min(Duration::from_millis(50)));
                 }
             }
@@ -73,10 +75,15 @@ fn retry<T>(
     }
 }
 
-pub(crate) fn fetch_index(url: &str, cancel: &AtomicBool) -> Result<Vec<u8>, String> {
+pub(crate) fn fetch_index_for_kind(
+    kind: AddonKind,
+    url: &str,
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>, String> {
+    let label = kind.label();
     const LIMIT: u64 = 256 * 1024;
     let agent = agent();
-    retry(cancel, &BACKOFFS, || {
+    retry_for_kind(kind, cancel, &BACKOFFS, || {
         let response = agent.get(url).call().map_err(http_error)?;
         if response.status() != 200 {
             return Err(AttemptError::Stop("Unexpected index HTTP response".into()));
@@ -88,19 +95,23 @@ pub(crate) fn fetch_index(url: &str, cancel: &AtomicBool) -> Result<Vec<u8>, Str
             .read_to_end(&mut bytes)
             .map_err(|e| AttemptError::Retry(format!("Read index: {e}")))?;
         if bytes.len() as u64 > LIMIT {
-            return Err(AttemptError::Stop("VLM index is too large".into()));
+            return Err(AttemptError::Stop(format!("{label} index is too large")));
         }
-        check_cancel(cancel).map_err(AttemptError::Stop)?;
+        check_cancel_for_kind(kind, cancel).map_err(AttemptError::Stop)?;
         Ok(bytes)
     })
 }
 
-pub(crate) fn sha256_file(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
+pub(crate) fn sha256_file_for_kind(
+    kind: AddonKind,
+    path: &Path,
+    cancel: &AtomicBool,
+) -> Result<String, String> {
     let mut file = File::open(path).map_err(|e| format!("Open {}: {e}", path.display()))?;
     let mut hash = Sha256::new();
     let mut buffer = vec![0; CHUNK];
     loop {
-        check_cancel(cancel)?;
+        check_cancel_for_kind(kind, cancel)?;
         let n = file.read(&mut buffer).map_err(|e| format!("Hash: {e}"))?;
         if n == 0 {
             break;
@@ -111,7 +122,8 @@ pub(crate) fn sha256_file(path: &Path, cancel: &AtomicBool) -> Result<String, St
 }
 
 /// A completed partial is verified before any request, avoiding Range 416.
-pub(crate) fn download(
+pub(crate) fn download_for_kind(
+    kind: AddonKind,
     url: &str,
     partial: &Path,
     bytes: u64,
@@ -119,7 +131,8 @@ pub(crate) fn download(
     cancel: &AtomicBool,
     mut progress: impl FnMut(u64),
 ) -> Result<(), String> {
-    download_with_backoffs(
+    download_with_backoffs_for_kind(
+        kind,
         url,
         partial,
         bytes,
@@ -130,7 +143,8 @@ pub(crate) fn download(
     )
 }
 
-fn download_with_backoffs(
+fn download_with_backoffs_for_kind(
+    kind: AddonKind,
     url: &str,
     partial: &Path,
     bytes: u64,
@@ -139,26 +153,29 @@ fn download_with_backoffs(
     progress: &mut impl FnMut(u64),
     backoffs: &[Duration],
 ) -> Result<(), String> {
+    let label = kind.label();
     if bytes == 0 {
-        return Err("VLM download size must be positive".into());
+        return Err(format!("{label} download size must be positive"));
     }
-    super::vlm_addon::reject_links(partial)?;
+    super::addon::reject_links_for_kind(kind, partial)?;
     let existing = match fs::metadata(partial) {
         Ok(metadata) if metadata.is_file() => metadata.len(),
-        Ok(_) => return Err("VLM partial is not a regular file".into()),
+        Ok(_) => return Err(format!("{label} partial is not a regular file")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
         Err(error) => return Err(format!("Read partial: {error}")),
     };
     if existing >= bytes && existing > 0 {
-        if existing == bytes && sha256_file(partial, cancel)?.eq_ignore_ascii_case(sha256) {
+        if existing == bytes
+            && sha256_file_for_kind(kind, partial, cancel)?.eq_ignore_ascii_case(sha256)
+        {
             progress(bytes);
             return Ok(());
         }
         fs::remove_file(partial).map_err(|e| format!("Remove corrupt partial: {e}"))?;
     }
     let agent = agent();
-    retry(cancel, backoffs, || {
-        super::vlm_addon::reject_links(partial).map_err(AttemptError::Stop)?;
+    retry_for_kind(kind, cancel, backoffs, || {
+        super::addon::reject_links_for_kind(kind, partial).map_err(AttemptError::Stop)?;
         let start = match fs::metadata(partial) {
             Ok(metadata) => metadata.len(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
@@ -195,7 +212,7 @@ fn download_with_backoffs(
         let mut done = offset;
         progress(done);
         while done < bytes {
-            check_cancel(cancel).map_err(AttemptError::Stop)?;
+            check_cancel_for_kind(kind, cancel).map_err(AttemptError::Stop)?;
             let remaining = (bytes - done).min(CHUNK as u64) as usize;
             let n = reader
                 .read(&mut buffer[..remaining])
@@ -214,11 +231,78 @@ fn download_with_backoffs(
             .map_err(|e| AttemptError::Stop(format!("Flush download: {e}")))?;
         Ok(())
     })?;
-    if !sha256_file(partial, cancel)?.eq_ignore_ascii_case(sha256) {
+    if !sha256_file_for_kind(kind, partial, cancel)?.eq_ignore_ascii_case(sha256) {
         fs::remove_file(partial).map_err(|e| format!("Remove corrupt download: {e}"))?;
-        return Err("Downloaded VLM file SHA-256 does not match".into());
+        return Err(format!("Downloaded {label} file SHA-256 does not match"));
     }
     Ok(())
+}
+
+// VLM regression callers keep their original API and exact diagnostics.
+#[cfg(test)]
+pub(crate) fn check_cancel(cancel: &AtomicBool) -> Result<(), String> {
+    check_cancel_for_kind(AddonKind::Vlm, cancel)
+}
+
+#[cfg(test)]
+fn retry<T>(
+    cancel: &AtomicBool,
+    backoffs: &[Duration],
+    attempt: impl FnMut() -> Result<T, AttemptError>,
+) -> Result<T, String> {
+    retry_for_kind(AddonKind::Vlm, cancel, backoffs, attempt)
+}
+
+#[cfg(test)]
+pub(crate) fn fetch_index(url: &str, cancel: &AtomicBool) -> Result<Vec<u8>, String> {
+    fetch_index_for_kind(AddonKind::Vlm, url, cancel)
+}
+
+#[cfg(test)]
+pub(crate) fn sha256_file(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
+    sha256_file_for_kind(AddonKind::Vlm, path, cancel)
+}
+
+#[cfg(test)]
+pub(crate) fn download(
+    url: &str,
+    partial: &Path,
+    bytes: u64,
+    sha256: &str,
+    cancel: &AtomicBool,
+    progress: impl FnMut(u64),
+) -> Result<(), String> {
+    download_for_kind(
+        AddonKind::Vlm,
+        url,
+        partial,
+        bytes,
+        sha256,
+        cancel,
+        progress,
+    )
+}
+
+#[cfg(test)]
+fn download_with_backoffs(
+    url: &str,
+    partial: &Path,
+    bytes: u64,
+    sha256: &str,
+    cancel: &AtomicBool,
+    progress: &mut impl FnMut(u64),
+    backoffs: &[Duration],
+) -> Result<(), String> {
+    download_with_backoffs_for_kind(
+        AddonKind::Vlm,
+        url,
+        partial,
+        bytes,
+        sha256,
+        cancel,
+        progress,
+        backoffs,
+    )
 }
 
 #[cfg(test)]
@@ -226,6 +310,67 @@ pub(crate) mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::sync::mpsc;
+
+    #[test]
+    fn transport_diagnostics_choose_kind_without_rewriting_lower_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = AtomicBool::new(false);
+        for (kind, label) in [(AddonKind::Vlm, "VLM"), (AddonKind::Depth, "Depth")] {
+            assert_eq!(
+                download_for_kind(kind, "unused", dir.path(), 0, "unused", &cancel, |_| {})
+                    .unwrap_err(),
+                format!("{label} download size must be positive")
+            );
+            assert_eq!(
+                download_for_kind(kind, "unused", dir.path(), 1, "unused", &cancel, |_| {})
+                    .unwrap_err(),
+                format!("{label} partial is not a regular file")
+            );
+            let source = "underlying VLM error at C:/VLM-user/model.onnx";
+            let result: Result<(), String> = retry_for_kind(kind, &cancel, &[], || {
+                Err(AttemptError::Stop(source.into()))
+            });
+            assert_eq!(result.unwrap_err(), source);
+        }
+        let cancelled = AtomicBool::new(true);
+        assert_eq!(
+            check_cancel(&cancelled).unwrap_err(),
+            "VLM installation cancelled"
+        );
+        assert_eq!(
+            check_cancel_for_kind(AddonKind::Depth, &cancelled).unwrap_err(),
+            "Depth installation cancelled"
+        );
+    }
+
+    #[test]
+    fn transport_hash_diagnostics_preserve_vlm_in_user_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("VLM-user-model.onnx");
+        let source = File::open(&missing).err().unwrap();
+        let expected = format!("Open {}: {source}", missing.display());
+        for kind in [AddonKind::Vlm, AddonKind::Depth] {
+            assert_eq!(
+                sha256_file_for_kind(kind, &missing, &AtomicBool::new(false)).unwrap_err(),
+                expected
+            );
+        }
+        fs::write(&missing, b"VLM content").unwrap();
+        assert_eq!(
+            sha256_file(&missing, &AtomicBool::new(false)).unwrap(),
+            digest(b"VLM content")
+        );
+    }
+
+    #[test]
+    fn oversized_index_diagnostics_keep_exact_vlm_and_depth_labels() {
+        for (kind, label) in [(AddonKind::Vlm, "VLM"), (AddonKind::Depth, "Depth")] {
+            let (base, _, join) = server(vec![ok(&vec![b'x'; 256 * 1024 + 1])]);
+            let error = fetch_index_for_kind(kind, &base, &AtomicBool::new(false)).unwrap_err();
+            join.join().unwrap();
+            assert_eq!(error, format!("{label} index is too large"));
+        }
+    }
 
     pub(crate) fn digest(bytes: &[u8]) -> String {
         format!("{:x}", Sha256::digest(bytes))

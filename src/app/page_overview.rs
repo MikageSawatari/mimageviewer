@@ -222,12 +222,15 @@ impl App {
         {
             return Some("編集・範囲選択を終了してからページ一覧を開いてください");
         }
+        if self.fs_exclusive_view.is_depth() {
+            return Some("3D 写真を終了してからページ一覧を開いてください");
+        }
         if self.analysis_mode
             || self.compare_view_mode != CompareViewMode::Off
             || self.compare_pin_pending.is_some()
             || self.compare_pin_load_pending.is_some()
             || self.panorama_intent.on
-            || self.is_panorama_mode_active(idx)
+            || self.fs_exclusive_view_active(idx).is_some()
         {
             return Some("分析・比較・パノラマ表示を終了してからページ一覧を開いてください");
         }

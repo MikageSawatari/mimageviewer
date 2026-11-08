@@ -6,8 +6,10 @@
 
 mIV Sound の名称・クレジット・保存先・初回移行・公開文書は [派生版計画 §2・§4・§5・§10](effetune-fork-plan.md) が正本。
 公開前に `python scripts/gen-effetune-docs.py --check`、`python scripts/test_gen_effetune_docs.py`、
-`python scripts/check_site_cards.py` と sitemap の再生成・検査を行う。`manual/sound/`、旧生成物の削除と
-`.htaccess` の 301 を同時反映する。F3・F4 統合後のポータブル文言・Counter・説明書の照合記録は同計画 §19 を参照。
+`python scripts/check_site_cards.py` と、htdocs コミット後の sitemap 再生成・検査を行う。
+説明書は版番号なしの `manual/sound/` に上書きし、版は目次本文だけに示す。版だけの更新では URL・転送規則は不変。
+固定 URL への移行時は残存版ディレクトリ・旧生成物を明示的に除き、旧 URL からの1回の301と同時反映する。
+F3・F4 統合後のポータブル文言・Counter・説明書の照合記録は同計画 §19 を参照。
 
 3 つの配布形態がある (v1.1.0 以降):
 
@@ -638,6 +640,36 @@ GitHub Release 公開後、各配布チャネルへ反映・申請する。**Vec
       コード署名は build-dist.ps1 が実施済み (Phase 3 / 「code signing」)。詳細な経緯・ハマりどころは
       [docs/release-operations.md](release-operations.md) §8 参照。
 
+
+#### 3D 写真の追加モデルの公開（初回・モデル更新時）
+
+`depth-model-v1` は、AI 説明文の `vlm-model-v1` と同じく本体と独立した GitHub Release。
+**版ごとの作業ではない。一度公開したモデルは残し、本体のリリースごとには作り直さない。**
+3D 写真を含む本体の初回公開までに、以下の資産を取得できる状態にしておく。
+この手順はモデルの作成・公開だけで、本体のビルドやアプリ起動は行わない。
+
+1. [モデル作成手順](../tools/depth_model/README.md)の固定環境を用意し、
+   SpatialHub の元の `da3mono_large.onnx` と外部 tensor ファイルをローカルに揃える。
+   元モデルのカードは [depth-anything/DA3MONO-LARGE](https://huggingface.co/depth-anything/DA3MONO-LARGE)。
+   元のモデル名・配布元・Apache-2.0 と変更内容は builder の `NOTICE` を正本にする。
+2. repository root で次を実行する（Python 環境の準備は上記 README 参照）。
+   ```powershell
+   & .\target\depth-spike\venv\Scripts\python.exe tools/depth_model/build_depth_addon.py --input target/depth-spike/models/da3monol/da3mono_large.onnx --output target/depth-addon
+   ```
+   fp16 化・入力形の固定後のモデルと `depth-model-index.json`、`LICENSE`、`NOTICE` が生成される。
+   元の fp32 モデルや検証用 oracle はアップロードしない。
+3. 上記と同じPython環境で `python -m unittest discover -s tools/depth_model -p test_build_depth_addon.py` を通し、生成した index の
+   各ファイルの bytes / SHA-256 が配布する実体と一致すること、LICENSE の全文と NOTICE の
+   fp16 化・1 view / 504 × 504 固定・再学習なしの記載を確認する。
+4. 公開担当が mImageViewer リポジトリの GitHub Release をタグ **`depth-model-v1`** で作り、次の **4 ファイル**を assets に添付する。
+   `da3mono_large_fp16_504.onnx` / `depth-model-index.json` / `LICENSE` / `NOTICE`。
+   **モデル用 Release を latest にしない**（本体の更新確認とダウンロード先を変えない）。
+   公開後、`https://github.com/MikageSawatari/mimageviewer/releases/download/depth-model-v1/` の
+   各ファイルが取得でき、取得したファイルの bytes / SHA-256 が index と一致することを照合する。
+   取得元の正本は `src/addon.rs::AddonKind::Depth` の `default_base_url()` / `index_name()`。
+5. モデル・変換条件・index を差し替えるときは **新しいタグ**（例: `depth-model-v2`）で別 Release を作る。
+   公開済みタグ・assets を上書き・削除しない。旧本体の取得先として残す。
+   新タグへの本体の取得先変更は開発側へ戻し、モデル ID・検証・LICENSE / NOTICE・公開文書との整合を確認してから本体を公開する。
 
 ### Phase 6: 公開後の後始末 (毎リリース、2026-10-07 利用者指示)
 

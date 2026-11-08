@@ -1088,6 +1088,11 @@
         <p>Real-ESRGAN / Real-CUGAN / NMKD-Siax（DirectML GPU）で画像を高品質に拡大。画像タイプ（イラスト / 漫画 / 写真）を自動判定して最適なモデルで処理します。AI モデルは内蔵済みで追加ダウンロード不要。</p>
       </div>
       <div class="feature-card">
+        <div class="icon">3D</div>
+        <h3>3D 写真</h3>
+        <p>写真やイラストの奥行きを PC 内の AI で推定し、左右や円の動き、マウス追従で立体的に表示。GIF / APNG / MP4 に書き出せます。初回は追加モデルを取得します。<a href="manual/fullscreen.html#depth-photo">使い方を見る</a></p>
+      </div>
+      <div class="feature-card">
         <div class="icon">🤖</div>
         <h3>AI 画像メタデータ表示</h3>
         <p>Stable Diffusion (A1111/Forge)・ComfyUI・Midjourney のプロンプト情報を PNG から自動抽出し、フルスクリーンの右パネルで確認できます。見開きでは左右のページを選んで確認できます。</p>
@@ -1236,7 +1241,7 @@
     <div class="trust-grid">
       <div class="trust-item">
         <h3>🔒 本体の画像 AI 処理は PC の中で</h3>
-        <p>AI 補正・消しゴムの補完・画像タイプの自動判別・<a href="manual/grid.html#ai-captions">画像や本の表紙の AI 説明文の作成</a>は、<strong>お使いの PC 内で実行</strong>します。そのために画像や表紙を外部へアップロードしません。説明文や画像内の文字を検索するための索引も PC 内に保存します。AI アプリとの連携は下の注記をご覧ください。</p>
+        <p>AI 補正・消しゴムの補完・画像タイプの自動判別・<a href="manual/grid.html#ai-captions">画像や本の表紙の AI 説明文の作成</a>・<a href="manual/fullscreen.html#depth-photo">3D 写真の奥行きの計算</a>は、<strong>お使いの PC 内で実行</strong>します。そのために画像や表紙を外部へアップロードしません。説明文や画像内の文字を検索するための索引も PC 内に保存します。AI アプリとの連携は下の注記をご覧ください。</p>
       </div>
       <div class="trust-item">
         <h3>🌐 通信が発生する場面</h3>
@@ -1435,6 +1440,13 @@
     <p style="font-size:0.88rem; color:#888;">
       本ソフトウェアは「現状のまま」提供され、作者は一切の保証を行いません。
       詳細はライセンス全文をご確認ください。
+    </p>
+
+    <h3 style="margin-top:1.6rem;">追加モデル（3D 写真）</h3>
+    <p style="font-size:0.9rem;">
+      3D 写真には Depth Anything 3（DA3 Mono-Large、Apache-2.0）の派生モデルを使用します。
+      重みと内部計算を fp16 化し、入力を 1 枚・504 × 504 px に固定しています。再学習は行っていません。
+      モデルと一緒に取得する LICENSE と NOTICE は、環境設定の<a href="manual/settings.html#depth-addon">「3D 写真の追加モデル」</a>から保存先フォルダを開いて確認できます。
     </p>
 
     <h3 style="margin-top:1.6rem;">サードパーティ ソフトウェア（LibRaw / CDDL）</h3>

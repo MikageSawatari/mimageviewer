@@ -77,6 +77,7 @@ fn add_lanczos_cache(
 /// Read-only normal GPU owners shared by mounted and at-rest contexts.
 /// Presentation inventory is deliberately independent of these resident stores.
 pub(in crate::app) struct ViewerTextureCaches<'a> {
+    pub(in crate::app) fs_exclusive_view: &'a crate::fs_exclusive_view::FsExclusiveView,
     pub(in crate::app) fs_lanczos_cache: &'a crate::gpu_lanczos::GpuLanczosCache,
     pub(in crate::app) similar_panel: &'a crate::ui_metadata_panel::SimilarPanelState,
     pub(in crate::app) fs_cache: &'a ItemsGenerationMap<FsCacheEntry>,
@@ -113,6 +114,11 @@ impl ViewerTextureCaches<'_> {
         accountant: &mut VramAccountant,
         indices: Option<&std::collections::HashSet<usize>>,
     ) {
+        if indices.is_none()
+            && let crate::fs_exclusive_view::FsExclusiveView::Depth(state) = self.fs_exclusive_view
+        {
+            accountant.add_native_bytes(VramSubsystem::DepthParallax, state.resident_bytes());
+        }
         add_lanczos_cache(accountant, self.fs_lanczos_cache, indices);
         if indices.is_none() {
             add_similar_preview_source(accountant, self.similar_panel);
@@ -349,6 +355,7 @@ impl App {
 
     pub(in crate::app) fn viewer_texture_caches(&self) -> ViewerTextureCaches<'_> {
         ViewerTextureCaches {
+            fs_exclusive_view: &self.fs_exclusive_view,
             fs_lanczos_cache: &self.fs_lanczos_cache,
             similar_panel: &self.similar_panel,
             fs_cache: &self.fs_cache,

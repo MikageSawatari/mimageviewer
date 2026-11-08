@@ -565,9 +565,7 @@ fn view_state(app: &App) -> (Option<usize>, f32, egui::Vec2, f32, Option<(f32, f
         app.fs_zoom,
         app.fs_pan,
         app.fs_free_rotation,
-        app.panorama_state
-            .as_ref()
-            .map(|p| (p.yaw, p.pitch, p.fov_y)),
+        app.panorama_state().map(|p| (p.yaw, p.pitch, p.fov_y)),
     )
 }
 
@@ -593,11 +591,16 @@ fn front_popup_all_six_menus_close_on_outside_press_and_own_the_entire_drag() {
             let mut app = sources(&ctx, [320, 160]);
             app.fs_zoom = 2.0;
             if matches!(menu, Menu::Projection) {
-                app.panorama_state = Some(crate::panorama::PanoramaState::new(
-                    0.3,
-                    0.1,
-                    crate::panorama::PanoProjection::Perspective,
-                ));
+                app.set_fs_exclusive_view(
+                    crate::fs_exclusive_view::FsExclusiveView::Panorama(
+                        crate::panorama::PanoramaState::new(
+                            0.3,
+                            0.1,
+                            crate::panorama::PanoProjection::Perspective,
+                        ),
+                    ),
+                    "panorama_on",
+                );
             }
             settle(&mut app, &ctx, rect);
             if matches!(menu, Menu::Projection) {
@@ -680,11 +683,16 @@ fn front_popup_launch_button_closes_once_without_reopening_on_release() {
         let rect = viewport(1093.0);
         let mut app = sources(&ctx, [320, 160]);
         if matches!(menu, Menu::Projection) {
-            app.panorama_state = Some(crate::panorama::PanoramaState::new(
-                0.0,
-                0.0,
-                crate::panorama::PanoProjection::Perspective,
-            ));
+            app.set_fs_exclusive_view(
+                crate::fs_exclusive_view::FsExclusiveView::Panorama(
+                    crate::panorama::PanoramaState::new(
+                        0.0,
+                        0.0,
+                        crate::panorama::PanoProjection::Perspective,
+                    ),
+                ),
+                "panorama_on",
+            );
         }
         settle(&mut app, &ctx, rect);
         menu.open(&mut app, &ctx, rect);
@@ -1687,11 +1695,16 @@ fn navigator_sources(
     app.settings.fullscreen_navigator_size = 520.0;
     app.fs_zoom = 2.0;
     if panorama {
-        app.panorama_state = Some(crate::panorama::PanoramaState::new(
-            0.3,
-            0.1,
-            crate::panorama::PanoProjection::Perspective,
-        ));
+        app.set_fs_exclusive_view(
+            crate::fs_exclusive_view::FsExclusiveView::Panorama(
+                crate::panorama::PanoramaState::new(
+                    0.3,
+                    0.1,
+                    crate::panorama::PanoProjection::Perspective,
+                ),
+            ),
+            "panorama_on",
+        );
     }
     settle(&mut app, ctx, rect);
     if panorama {

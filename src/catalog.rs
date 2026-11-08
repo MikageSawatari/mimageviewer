@@ -1268,15 +1268,53 @@ impl CatalogDb {
     /// (4,628 枚のカタログで 157 MiB)、5 万枚のフォルダでは寸法を知るためだけに
     /// 1.7 GB を運ぶことになる。整数列だけで答えられる問いにはこちらを使う。
     ///
+    /// `page_dims` があるキーは、最後の WebP 保存より新しい寸法として優先する。
     /// 値の `None` は「行はあるが寸法列が NULL」(寸法列より前に保存された古いエントリ) を、
     /// key の不在は「行が無い」を表す。blob からの復元が要る呼び出し側は、前者のときだけ
     /// `load_one` で個別に取り直す。
     pub fn load_source_dims(&self) -> rusqlite::Result<HashMap<String, Option<(u32, u32)>>> {
+        self.load_source_dims_for_stamp(None)
+    }
+
+    /// EPUB page dimensions belonging to one immutable converted generation.
+    /// The same integer columns hold PDF file attributes in ordinary catalogs.
+    pub fn load_source_dims_matching(
+        &self,
+        mtime: i64,
+        file_size: i64,
+    ) -> rusqlite::Result<HashMap<String, Option<(u32, u32)>>> {
+        self.load_source_dims_for_stamp(Some((mtime, file_size)))
+    }
+
+    fn load_source_dims_for_stamp(
+        &self,
+        stamp: Option<(i64, i64)>,
+    ) -> rusqlite::Result<HashMap<String, Option<(u32, u32)>>> {
         let conn = self.phase()?;
-        let mut stmt =
-            conn.prepare("SELECT filename, source_width, source_height FROM thumbnails WHERE substr(filename,1,9) <> 'audioart:'")?;
+        // Read-only legacy/Collection catalogs must stay readable without creating tables.
+        let has_page_dims: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='page_dims')",
+            [],
+            |row| row.get(0),
+        )?;
+        let filter = if stamp.is_some() {
+            "mtime = ?1 AND file_size = ?2 AND "
+        } else {
+            ""
+        };
+        let mut sql = format!(
+            "SELECT filename, source_width, source_height FROM thumbnails WHERE {filter}substr(filename,1,9) <> 'audioart:'"
+        );
+        if has_page_dims {
+            // One SELECT snapshot, with newer dimensions-only records visited last.
+            sql.push_str(&format!(
+                " UNION ALL SELECT filename, source_width, source_height FROM page_dims WHERE {filter}substr(filename,1,9) <> 'audioart:'"
+            ));
+        }
+        let mut stmt = conn.prepare(&sql)?;
         let mut map = HashMap::new();
-        let iter = stmt.query_map([], |row| {
+        let values = stamp.map(|(mtime, size)| [mtime, size]);
+        let iter = stmt.query_map(rusqlite::params_from_iter(values.iter().flatten()), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<u32>>(1)?,
@@ -1289,30 +1327,32 @@ impl CatalogDb {
         Ok(map)
     }
 
-    /// EPUB page dimensions belonging to one immutable converted generation.
-    /// The same integer columns hold PDF file attributes in ordinary catalogs.
-    pub fn load_source_dims_matching(
+    /// Record current page dimensions while preserving any previously saved WebP,
+    /// including its original stamp. A later WebP INSERT removes this row atomically.
+    pub fn save_page_dims(
         &self,
+        filename: &str,
         mtime: i64,
         file_size: i64,
-    ) -> rusqlite::Result<HashMap<String, Option<(u32, u32)>>> {
+        source_dims: Option<(u32, u32)>,
+        layout_dims: Option<(u32, u32)>,
+    ) -> rusqlite::Result<()> {
         let conn = self.phase()?;
-        let mut stmt = conn.prepare(
-            "SELECT filename, source_width, source_height FROM thumbnails \
-             WHERE mtime = ?1 AND file_size = ?2 AND substr(filename,1,9) <> 'audioart:'",
+        conn.execute(
+            "INSERT OR REPLACE INTO page_dims \
+             (filename, mtime, file_size, source_width, source_height, layout_width, layout_height) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                filename,
+                mtime,
+                file_size,
+                source_dims.map(|dims| dims.0),
+                source_dims.map(|dims| dims.1),
+                layout_dims.map(|dims| dims.0),
+                layout_dims.map(|dims| dims.1),
+            ],
         )?;
-        let mut map = HashMap::new();
-        let iter = stmt.query_map(rusqlite::params![mtime, file_size], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<u32>>(1)?,
-                row.get::<_, Option<u32>>(2)?,
-            ))
-        })?;
-        for (filename, width, height) in iter.flatten() {
-            map.insert(filename, valid_dims(width, height));
-        }
-        Ok(map)
+        Ok(())
     }
 
     /// DB 内の全エントリを HashMap<filename, CacheEntry> として返す（一括 SELECT）。
@@ -1798,17 +1838,24 @@ impl CatalogDb {
     /// `existing` に含まれないファイル名の行を削除する（削除済みファイルの掃除）。
     pub fn delete_missing(&self, existing: &HashSet<String>) -> rusqlite::Result<()> {
         let conn = self.phase()?;
-        let db_names: Vec<String> = {
-            let mut stmt = conn.prepare(
-                "SELECT filename FROM thumbnails WHERE substr(filename,1,9) <> 'audioart:'",
-            )?;
-            stmt.query_map([], |r| r.get(0))?.flatten().collect()
-        };
-        for name in db_names {
-            if !existing.contains(&name) {
-                conn.execute("DELETE FROM thumbnails WHERE filename = ?1", params![name])?;
+        let tx = conn.unchecked_transaction()?;
+        for table in ["thumbnails", "page_dims"] {
+            let db_names: Vec<String> = {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT filename FROM {table} WHERE substr(filename,1,9) <> 'audioart:'"
+                ))?;
+                stmt.query_map([], |r| r.get(0))?.flatten().collect()
+            };
+            for name in db_names {
+                if !existing.contains(&name) {
+                    tx.execute(
+                        &format!("DELETE FROM {table} WHERE filename = ?1"),
+                        params![name],
+                    )?;
+                }
             }
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -2115,6 +2162,9 @@ impl CatalogDb {
 }
 
 fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
+    // The INSERT trigger is the common WebP publication boundary, including
+    // direct SQL from audio-art and pin batches. Its DELETE is part of the same
+    // SQLite statement/transaction; dimensions-only writes never touch WebPs.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS meta (
              key   TEXT PRIMARY KEY,
@@ -2134,6 +2184,19 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
               folder_provenance TEXT,
               selection_proof TEXT
          );
+         CREATE TABLE IF NOT EXISTS page_dims (
+             filename       TEXT    NOT NULL PRIMARY KEY,
+             mtime          INTEGER NOT NULL,
+             file_size      INTEGER NOT NULL,
+             source_width   INTEGER,
+             source_height  INTEGER,
+             layout_width   INTEGER,
+             layout_height  INTEGER
+         );
+         CREATE TRIGGER IF NOT EXISTS thumbnail_replaces_page_dims
+         AFTER INSERT ON thumbnails BEGIN
+             DELETE FROM page_dims WHERE filename = NEW.filename;
+         END;
          CREATE TABLE IF NOT EXISTS pdf_meta (
              filename          TEXT    NOT NULL PRIMARY KEY,
              mtime             INTEGER NOT NULL,
@@ -2723,7 +2786,7 @@ fn delete_legacy_folder_cache_under_delete(
             params![scope.prefix.len(), scope.prefix],
         )?;
     }
-    for table in ["pdf_meta", "container_page_meta", "video_meta"] {
+    for table in ["pdf_meta", "container_page_meta", "video_meta", "page_dims"] {
         let present: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
             [table],
@@ -3772,6 +3835,10 @@ mod tests {
         let dk = d.key_for(&d.parent.join("song.mp3"));
         save_audio_art_absence(temp.path(), &c, &ck, stamp, admitted, &cancel).unwrap();
         save_audio_art_absence(temp.path(), &d, &dk, stamp, admitted, &cancel).unwrap();
+        let db = CatalogDb::open(temp.path(), &c.parent).unwrap();
+        db.save_page_dims("page_0000", 1, 2, Some((1600, 900)), None)
+            .unwrap();
+        drop(db);
         let deletion = access.begin_delete(CatalogDeleteOperation::All).unwrap();
         deletion.retire_connections();
         assert!(delete_folder_cache_under_delete(temp.path(), &c.parent).unwrap());
@@ -3785,6 +3852,19 @@ mod tests {
             lookup_audio_art(temp.path(), &d, &dk, stamp, new).unwrap(),
             AudioArtCached::NoArt
         ));
+        let db = CatalogDb::open_existing_read_only(temp.path(), &d.parent)
+            .unwrap()
+            .unwrap();
+        assert!(db.load_source_dims().unwrap().is_empty());
+        assert_eq!(
+            db.conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM page_dims", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -4320,6 +4400,300 @@ mod tests {
         for (filename, entry) in &full {
             assert_eq!(dims.get(filename), Some(&entry.source_dims), "{filename}");
         }
+    }
+
+    #[test]
+    fn page_dims_preserves_old_webp_and_returns_new_dimensions() {
+        let db = open_in_memory();
+        db.save("page_0000", 1, 10, 8, 12, Some((800, 1200)), b"old_webp")
+            .unwrap();
+        db.save_page_dims(
+            "page_0000",
+            2,
+            20,
+            Some((1600, 900)),
+            Some((800_000, 450_000)),
+        )
+        .unwrap();
+        let webp = db.load_one("page_0000").unwrap().unwrap();
+        assert_eq!((webp.mtime, webp.file_size), (1, 10));
+        assert_eq!(webp.jpeg_data, b"old_webp");
+        assert_eq!(webp.source_dims, Some((800, 1200)));
+        assert_eq!(db.load_all().unwrap().len(), 1);
+        assert_eq!(
+            db.load_source_dims().unwrap()["page_0000"],
+            Some((1600, 900))
+        );
+        let stored: (i64, i64, u32, u32) = db.conn.lock().unwrap().query_row(
+            "SELECT mtime, file_size, layout_width, layout_height FROM page_dims WHERE filename='page_0000'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert_eq!(stored, (2, 20, 800_000, 450_000));
+    }
+
+    #[test]
+    fn page_dims_updates_legacy_null_dimensions_without_replacing_webp() {
+        let db = open_in_memory();
+        db.save("page.jpg", 1, 10, 8, 12, None, b"legacy_webp")
+            .unwrap();
+        db.save_page_dims("page.jpg", 1, 10, Some((1200, 800)), None)
+            .unwrap();
+        assert_eq!(
+            db.load_source_dims().unwrap()["page.jpg"],
+            Some((1200, 800))
+        );
+        assert_eq!(
+            db.load_source_dims_matching(1, 10).unwrap()["page.jpg"],
+            Some((1200, 800))
+        );
+        let webp = db.load_one("page.jpg").unwrap().unwrap();
+        assert_eq!(webp.jpeg_data, b"legacy_webp");
+        assert_eq!(webp.source_dims, None);
+    }
+
+    #[test]
+    fn page_dims_matching_filters_each_epub_generation_before_merging() {
+        let db = open_in_memory();
+        db.save("page_0000", 1, 10, 8, 12, Some((800, 1200)), b"old")
+            .unwrap();
+        db.save_page_dims("page_0000", 2, 20, Some((1600, 900)), None)
+            .unwrap();
+        db.save_page_dims("page_0001", 2, 20, Some((900, 1600)), None)
+            .unwrap();
+        let old = db.load_source_dims_matching(1, 10).unwrap();
+        assert_eq!(old.len(), 1);
+        assert_eq!(old["page_0000"], Some((800, 1200)));
+        let new = db.load_source_dims_matching(2, 20).unwrap();
+        assert_eq!(new.len(), 2);
+        assert_eq!(new["page_0000"], Some((1600, 900)));
+        assert_eq!(new["page_0001"], Some((900, 1600)));
+        assert!(db.load_source_dims_matching(1, 20).unwrap().is_empty());
+        assert!(db.load_source_dims_matching(2, 10).unwrap().is_empty());
+        // No WebP is synthesized for dimensions-only pages.
+        assert!(db.load_one("page_0001").unwrap().is_none());
+    }
+
+    #[test]
+    fn webp_save_entry_points_replace_page_dims_atomically() {
+        let db = open_in_memory();
+        let bytes = encode_thumb_webp(&image::DynamicImage::new_rgb8(2, 3), 3, 80.0)
+            .unwrap()
+            .0;
+        let keys = [
+            "save",
+            "layout",
+            "bytes",
+            "bytes_layout",
+            "auto",
+            "seed",
+            "pin",
+        ];
+        for key in keys {
+            db.save_page_dims(key, 1, 10, Some((900, 1600)), None)
+                .unwrap();
+        }
+        db.save("save", 2, 20, 2, 3, Some((1600, 900)), &bytes)
+            .unwrap();
+        db.save_with_layout_dims(
+            "layout",
+            2,
+            20,
+            2,
+            3,
+            Some((1600, 900)),
+            Some((160_000, 90_000)),
+            &bytes,
+        )
+        .unwrap();
+        assert!(
+            db.save_thumb_bytes("bytes", 2, 20, Some((1600, 900)), &bytes)
+                .unwrap()
+        );
+        assert!(
+            db.save_thumb_bytes_with_layout_dims(
+                "bytes_layout",
+                2,
+                20,
+                Some((1600, 900)),
+                None,
+                &bytes
+            )
+            .unwrap()
+        );
+        assert!(
+            db.save_auto_folder_bytes("auto", 2, 20, Some((1600, 900)), None, &bytes, None)
+                .unwrap()
+        );
+        assert!(
+            db.save_seeded_folder_bytes("seed", 2, 20, Some((1600, 900)), &bytes)
+                .unwrap()
+        );
+        let entry = CacheEntry {
+            mtime: 2,
+            file_size: 20,
+            jpeg_data: bytes,
+            source_dims: None,
+            layout_dims: None,
+            folder_provenance: None,
+            selection_proof: None,
+        };
+        assert!(
+            db.commit_pin_materializations(&[], &[("pin".into(), entry)], &AtomicBool::new(false))
+                .unwrap()
+        );
+        assert_eq!(
+            db.conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM page_dims", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        for key in keys {
+            let dims = db.load_source_dims().unwrap();
+            assert_eq!(
+                dims[key],
+                if key == "pin" {
+                    None
+                } else {
+                    Some((1600, 900))
+                },
+                "{key}"
+            );
+        }
+
+        db.save_page_dims("save", 3, 30, Some((100, 200)), None)
+            .unwrap();
+        db.conn.lock().unwrap().execute_batch("CREATE TRIGGER reject_dims_delete BEFORE DELETE ON page_dims BEGIN SELECT RAISE(ABORT, 'reject deletion'); END;").unwrap();
+        assert!(
+            db.save("save", 4, 40, 1, 1, Some((1, 1)), b"rejected")
+                .is_err()
+        );
+        assert_eq!(db.load_one("save").unwrap().unwrap().mtime, 2);
+        assert_eq!(db.load_source_dims().unwrap()["save"], Some((100, 200)));
+    }
+
+    #[test]
+    fn audio_art_webp_insert_also_replaces_same_key_page_dims() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = AudioArtCatalogScope::new(&temp.path().join("music"));
+        let key = scope.key_for(&scope.parent.join("song.mp3"));
+        let db = CatalogDb::open(temp.path(), &scope.parent).unwrap();
+        db.save_page_dims(&key, 1, 10, Some((1, 2)), None).unwrap();
+        let entry = CacheEntry {
+            mtime: 2,
+            file_size: 20,
+            jpeg_data: encode_thumb_webp(&image::DynamicImage::new_rgb8(2, 3), 3, 80.0)
+                .unwrap()
+                .0,
+            source_dims: Some((2, 3)),
+            layout_dims: None,
+            folder_provenance: None,
+            selection_proof: None,
+        };
+        assert!(
+            save_audio_art_pixels(
+                temp.path(),
+                &scope,
+                &key,
+                &entry,
+                CatalogAccess::for_cache_dir(temp.path()).admit(),
+                &AtomicBool::new(false)
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            db.conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM page_dims", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn page_dims_read_only_and_collection_readers_allow_missing_table() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("pages");
+        for with_page_dims in [true, false] {
+            let db = CatalogDb::open(temp.path(), &folder).unwrap();
+            db.save("page_0000", 1, 10, 1, 1, Some((800, 1200)), b"old")
+                .unwrap();
+            db.save_page_dims("page_0000", 2, 20, Some((1600, 900)), None)
+                .unwrap();
+            if !with_page_dims {
+                db.conn
+                    .lock()
+                    .unwrap()
+                    .execute_batch(
+                        "DROP TRIGGER thumbnail_replaces_page_dims; DROP TABLE page_dims;",
+                    )
+                    .unwrap();
+            }
+            drop(db);
+            let access = CatalogWork::capture(temp.path());
+            let ordinary = CatalogDb::open_existing_read_only(temp.path(), &folder)
+                .unwrap()
+                .unwrap();
+            let collection = access
+                .open_existing_collection_parent(&folder)
+                .unwrap()
+                .unwrap();
+            for reader in [&ordinary, &collection] {
+                assert!(reader.is_read_only());
+                let expected = if with_page_dims {
+                    Some((1600, 900))
+                } else {
+                    Some((800, 1200))
+                };
+                assert_eq!(reader.load_source_dims().unwrap()["page_0000"], expected);
+                assert_eq!(
+                    reader.load_source_dims_matching(1, 10).unwrap()["page_0000"],
+                    Some((800, 1200))
+                );
+                assert_eq!(
+                    reader
+                        .load_source_dims_matching(2, 20)
+                        .unwrap()
+                        .contains_key("page_0000"),
+                    with_page_dims
+                );
+                let has_table: bool = reader
+                    .conn
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='page_dims')",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(has_table, with_page_dims);
+            }
+        }
+    }
+
+    #[test]
+    fn page_dims_delete_missing_preserves_present_keys_and_webp() {
+        let db = open_in_memory();
+        db.save("keep", 1, 10, 1, 1, Some((800, 1200)), b"old")
+            .unwrap();
+        for key in ["keep", "dims_only", "remove"] {
+            db.save_page_dims(key, 2, 20, Some((1600, 900)), None)
+                .unwrap();
+        }
+        db.delete_missing(&HashSet::from(["keep".into(), "dims_only".into()]))
+            .unwrap();
+        let dims = db.load_source_dims().unwrap();
+        assert_eq!(dims.len(), 2);
+        assert_eq!(dims["keep"], Some((1600, 900)));
+        assert_eq!(dims["dims_only"], Some((1600, 900)));
+        assert_eq!(db.load_one("keep").unwrap().unwrap().jpeg_data, b"old");
+        db.delete_missing(&HashSet::new()).unwrap();
+        assert!(db.load_source_dims().unwrap().is_empty());
     }
 
     #[test]

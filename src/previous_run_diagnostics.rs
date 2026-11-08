@@ -534,6 +534,7 @@ fn diagnostic_model(value: Option<checkpoint::DiagnosticModel>) -> &'static str 
         Some(M::DenoiseRealplksr) => K::DenoiseRealplksr.display_label(),
         Some(M::InpaintMiGan) => K::InpaintMiGan.display_label(),
         Some(M::SubjectMatte) => K::SubjectMatte.display_label(),
+        Some(M::DepthDa3MonoLarge) => K::DepthDa3MonoLarge.display_label(),
     }
 }
 fn diagnostic_backend(value: checkpoint::DiagnosticBackend) -> &'static str {

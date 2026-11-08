@@ -59,12 +59,16 @@ mod wgpu_backend_policy;
 mod wheel_input;
 
 pub mod activity_gate;
+pub mod addon;
 pub mod adjustment;
 pub mod adjustment_db;
 pub mod ai;
 pub mod ai_caption_db;
 mod app;
 pub(crate) mod caption_display_cache;
+pub mod depth_addon;
+pub(crate) mod depth_estimation;
+pub(crate) mod depth_preprocess;
 pub mod detached_window_geometry;
 pub(crate) mod feedback;
 #[doc(hidden)]
@@ -87,6 +91,8 @@ pub use app::draw_thumbnail_name_style_snapshot_fixture;
 pub use app::draw_video_thumbnail_indicator_snapshot_fixture;
 pub use ui_dialogs::agent_integration::draw_agent_integration_snapshot_fixture;
 pub use ui_dialogs::agent_integration::draw_agent_registration_snapshot_fixture;
+#[doc(hidden)]
+pub use ui_dialogs::preferences::draw_book_cover_only_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_book_resume_meter_settings_snapshot_fixture;
 pub use ui_dialogs::preferences::draw_file_organize_destinations_settings_snapshot_fixture;
@@ -271,6 +277,10 @@ pub(crate) mod log_writer;
 pub mod logger;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_diagnostics_export_snapshot_fixture;
+pub mod depth_export;
+pub mod depth_parallax;
+pub mod depth_parallax_wgpu;
+mod fs_exclusive_view;
 mod manual_mask_tools;
 pub mod margin_fit;
 pub mod mask_db;
@@ -305,6 +315,11 @@ mod settings_override;
 pub mod source_coverage;
 #[cfg(all(windows, any(test, feature = "test-script")))]
 mod test_script;
+pub mod ui_depth_export;
+pub mod ui_depth_parallax;
+mod ui_depth_wait;
+#[doc(hidden)]
+pub use ui_depth_wait::draw_depth_wait_indicator_snapshot_fixture;
 mod vram_budget;
 // loose-deps ポータブルビルド専用の native ファイル所在解決 (exe 隣の bundled file)。
 // 通常ビルドでは中身が無いので宣言ごと cfg で落とす。詳細: docs/portable-build-plan.md
@@ -1950,6 +1965,8 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
     gpu_startup_diagnostics::begin(gpu_request);
     let previous_run_report = session.diagnostics.report_handle();
     let diagnostic_checkpoint = session.diagnostics.publisher();
+    let mut depth_export_owner = depth_export::DepthExportProcessOwner::default();
+    let depth_export_workers = depth_export_owner.client();
     let run_result = eframe::run_native(
         "mimageviewer",
         options,
@@ -2012,6 +2029,7 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
                     Arc::clone(&raw_develop_executor),
                 )
             });
+            app.depth_export_workers = Some(depth_export_workers);
             app.install_previous_run_notice(previous_run_report, &cc.egui_ctx);
             app.install_diagnostic_checkpoint(diagnostic_checkpoint, cc.wgpu_render_state.as_ref());
             match collection_install.clone() {
@@ -2188,6 +2206,9 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
             } else {
                 miv_startup::Outcome::Error
             });
+            // Reap cancelled exports before any other potentially long shutdown drain.
+            // The same outer cleanup covers normal close and run_native errors.
+            depth_export_owner.shutdown_and_join();
             // Stop public admission before named-pipe workers, then close the only Remote collection
             // producer before joining the actor. The App normally completed its drain in on_exit; this
             // outer fallback also covers creator failure/panic and is deliberately idempotent.

@@ -18,6 +18,7 @@ README、Cargo.toml.orig、同梱Cargo.lockは原本を保持する。
 | repaint delay witness | (b) 保持 | `src/context.rs`とCargo.tomlの`miv-repaint-witness` feature。現在viewportのschedulerを読み、outstandingがあれば0、有限delayならその値、要求なしなら`None`。状態を変更しない |
 | 本家click分類 | (a) 差分不要 | 0.37の距離・時間条件をそのまま使用する。旧分類を再実装せず、本家の事実を別回帰で固定する |
 | license本文 | (b) 保持 | 旧vendorのMIT / Apache本文をbyte変更なしで同梱する |
+| §1.691 非primary押下での部分選択保持 | (b・新規) | `src/text_selection/text_cursor_state.rs`。upstream [#4393](https://github.com/emilk/egui/issues/4393) の選択内右クリックによる選択崩壊を修正。primary pressが無いpassでは選択内（両端の文字境界を含む）の非primary pressを無操作として扱い、範囲・granular anchor・focus／cursor purposeを保持。ドラッグ更新はprimary保持中だけ。`text_cursor_state_tests.rs`とAppの`everything_select_1691.rs`で回帰検査 |
 
 段2a-1ではIME中断要求のviewport所有・pass出力集約を変更していない（段2a-2追補を参照）。
 非描画viewport退役入口は段2a-3追補を参照。
@@ -429,3 +430,94 @@ frozen during both runs; final SHA-256 is
 `465e6febc5054cc2ee2bdc2a7618d88058761106f9d96575acd30c58fb9b40e8`.
 Evidence is `target/scroll661-revise-vendor-order-{red,green}.{log,json}`.
 Direct rustfmt and diff checks passed. No product or desktop session was started.
+
+## §1.691: preserve selection on non-primary presses (2026-11-08)
+
+`TextCursorState::pointer_interaction` fixes the TextEdit selection collapse
+tracked by upstream [egui#4393](https://github.com/emilk/egui/issues/4393).
+A hovered, non-empty character range retains both endpoints and `granular_drag`
+when the pointer boundary is inside it (inclusive) and no primary button was
+pressed in this pass. The method returns `false`, including with Shift held,
+so this press does not request focus or reset the TextEdit cursor purpose.
+Outside/empty selections, primary presses, Shift extension, and granular
+double/triple presses keep the existing behavior. Selection dragging updates
+only while the primary button is down.
+
+`interaction.rs` assigns potential drag capture on every PointerEvent::Pressed,
+without filtering the button. Its click_and_drag promotion also accepts
+secondary-only motion; the real-Context TextEdit regression asserts that this
+route actually reaches `is_being_dragged` before checking range/anchor retention.
+No application or IME workaround and no label_text_selection.rs edit is included.
+Labels have their own any_pressed resets and may need a separate follow-up.
+
+The adjacent `text_cursor_state_tests.rs` uses real Context/TextEdit frames for
+secondary/middle/extra presses, inclusive endpoints and reversed ranges,
+Shift+secondary, outside/empty selections and paste position, primary drag,
+simultaneous primary/secondary press, and secondary-only drag. A real-response
+state-boundary test additionally checks the `false` result and granular anchor.
+The existing four App tests exercise temporary and pinned Everything fields.
+
+Bookkeeping audit: upstream-provenance.json is an original-file hash inventory;
+its recorded hashes remain unchanged. import-upstream.py imports pristine crates
+and refuses existing destinations; it has no patch allow-list to extend.
+check-dependency-updates.ps1 discovers PATCHES.md dynamically; its offline test
+now checks discovery for egui as well. No source-diff allow-list was found in
+the repository's Rust/Python/PowerShell checks. The current patch is also listed
+in docs/egui-0.37-update-plan.md §4.8; earlier stage verification inventories
+are historical checkpoints and are preserved.
+
+Initial implementer verification, before the designer follow-up (Windows,
+`MSBUILDDISABLENODEREUSE=1` for every Cargo invocation, uncommitted worktree
+diff): **application acceptance was incomplete at this checkpoint**.
+
+| Command | Result |
+| --- | --- |
+| `cargo test --offline --manifest-path vendor/egui/Cargo.toml --lib section1691` | Initial 10 tests passed, 0 failed |
+| `cargo test --offline --manifest-path vendor/egui/Cargo.toml --lib text_selection::text_cursor_state` | Final 20 passed (11 new), 0 failed, 179 filtered out. An intermediate compile failed because the test fixture omitted the argument to `Id::unique`; corrected before this successful run |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/section1691/)'` | 3 passed, 1 failed, 16,636 skipped; run `c3b62420-2e28-4d20-b6d5-95dd5b98a77d`, shell exit 1 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/context_menu\|singleline\|ime_focus\|text_edit/)'` | 187 passed, 0 failed, 16,453 skipped; run `90459fa0-cfd5-43ff-8a1d-dc1a7f19bbab`, exit 0. The command's regex uses ordinary OR bars; the backslashes here only escape Markdown table delimiters |
+| `cargo test -p egui-ime` | 30 unit tests passed, 0 failed; 0 doctests; exit 0 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | Failed in turbojpeg-sys 1.2.0's native build: CMake configure/generate succeeded, `cmake --build ... --target install --config Debug --parallel 24` / MSBuild exited 1; shell exit 1. No Rust type error was reported |
+| `scripts/test-check-dependency-updates.ps1` | All offline regression checks passed; script exit 0, no individual assertion count emitted |
+
+The remaining App failure at that checkpoint was `section1691_right_click_inside_partial_selection_cuts_it`
+at `src/app/tests/everything_select_1691.rs:271`, in the temporary field. Its
+preceding assertion confirms the right-click retains chars 3..6, but clicking
+the menu's Cut leaves the query unchanged instead of deleting `abc`. Thus the
+decided pointer fix does not make all four App tests pass. The three other tests
+remain green. Source inspection found an additional candidate: Context's
+outside-click focus surrender and TextEdit's `!owns_ime_events` branch that
+collapses selection before the application context-menu helper reads it.
+This specific focus transition has not been traced in the failing App run and
+is not reported as a confirmed second diagnosis. No scope extension or change
+to TextEdit builder, Context, application helpers, or IME was made; the design
+owner must resolve the remaining failure before acceptance.
+
+The main-library full suite and product launch were not run. A verification
+binary was not built because the required App regression and core check are
+not green. Changes remain uncommitted for the design owner.
+Final formatting checks: `cargo fmt` (no arguments), the earlier `cargo fmt
+--check`, `rustfmt --edition 2024 --check
+vendor/egui/src/text_selection/text_cursor_state.rs`, and `git diff --check`
+completed without errors. Root formatting introduced no additional file changes.
+
+Designer follow-up (2026-11-08): the design owner confirmed the additional
+focus-surrender/selection-collapse path using temporary App instrumentation,
+subsequently reverted, and authorized a menu-opening target snapshot in the
+application helper. That helper fix is application code, not an additional
+vendored-egui patch. The pointer patch and upstream hashes above remain unchanged.
+
+Final follow-up results supersede the initial App failure above: the unchanged
+four App regressions passed (run `e9f0d3c1-a1bd-45ec-8478-c95961fad7dc`, 4 passed /
+0 failed). The expanded `context_menu|singleline|ime_focus|text_edit|ui_helpers`
+filter passed 271 / 0, including all eight new application-helper regressions
+(run `3ae27166-7672-4289-8992-b04944a9a540`). The same standalone egui cursor
+command passed 20 / 0 again, and `cargo test -p egui-ime` passed 30 / 0 with
+0 doctests. All used `MSBUILDDISABLENODEREUSE=1`. Earlier helper-only runs were
+0 / 7 and 7 / 1: the fixture first exceeded egui's 0.8-second click limit, then
+incorrectly expected an already open popup to stay open after an outside
+secondary click. Both fixture expectations were corrected without changing
+egui's open/close semantics. Menu Paste execution remains untested because the
+application clipboard reader has no injection seam; no global fake or OS
+clipboard fixture was added. Core check was not retried after the native-build
+failure above, as directed by the designer; no verification binary was built.

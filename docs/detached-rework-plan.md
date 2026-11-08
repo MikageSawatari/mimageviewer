@@ -1455,6 +1455,89 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-08: 3D 写真の MainWindow 対応（段 C 続き・案1）
+
+基点 `29bb7f54b`、正本は [3D 設計 §6.4.1](depth-parallax-plan.md#641-mainwindow-対応-2026-11-08案1を採択実装済み)。
+設計担当 ClaudeCode と独立 Sol / xhigh レビューが、症状パッチではなく、単一 context の表示許可と
+presentation 確定点の寿命を揃える構造変更であると合意済み（2026-11-08 の実装依頼に明記）。
+
+- `App::depth_presentation_eligible` は projected context が main であることと、明示した
+  `MainWindow | Fullscreen` の許可集合を同時に判定する。`depth_entry_allowed` と
+  `commit_viewer_presentation` が同じ述語を使い、`DetachedWindow` と独立 context の全 presentation を拒否する。
+- 共通確定点では実切替または不適格な切替先で `set_fs_exclusive_view(None, cause)` を通して終了する。
+  同じ適格な presentation の再確定は継続。MainWindow ⇔ Fullscreen の終了は実効キー（既定 D）で再入場できると通知し、キー割り当てなしなら上部3Dボタンを案内する。
+  source phase・LRU・要求 receiver・GPU slot は既存 owner の Drop で退役し、新しい D は空 LRU から始まる。
+- 既存 ROOT embedded と child は同じ canvas／パネル／ダイアログを通る。root tail への追加、
+  worker の通知先移管、継続用の追加 repaint はない。fork／park、bundle swap、window ID／HWND／placement は変更しない。
+- 状態 matrix、F11 両方向・F12・close／fork／park、旧要求の遅着と新 owner／slot の保持、
+  ROOT 実描画・書き出し全 phase の modal／小画面 geometry を検証した。限定975件・UI snapshot245件が成功し、独立 Sol / xhigh の最終レビューは受入可・未解決指摘なし。実行ログと詳細は
+  [3D 設計 §10](depth-parallax-plan.md#10-実装の段階-codex-への委任単位) の今回の実装記録に集約する。
+
+追補P3（2026-11-08）: 共通内部commitから終了通知文を返し、通常F12のON/OFF・メディア別窓の同期案内へ統合して最後に1回だけ発行する。通知の組み立てだけを変え、detached述語・表示切替・fork／park・通知slotは変更しない。
+
+評価の経路でpresentationが変わって3Dが終わるときは、後の評価の通知が案内を上書きし得る。まれで、3Dは正しく終わるので割り切る（2026-11-08 設計担当判断）。
+
+まれな失敗は既定のログ＋通知で閉じる。製品起動・実機確認・build-dev は今回実施しない。
+
+### 2026-11-07: 3D写真 段Cの書き出し取消とviewer終了（BA-7）
+
+設計担当の段C §7.3「窓を閉じる…取り消し」を、既存のfullscreen終了境界へ接続する。
+`App::close_fullscreen_content` のteardownから、凍結したexport resourceのcontextと現在の
+`edit_request_owner_context`を照合するhelperを1回呼ぶ。所有contextなら設定／終端表示を
+退役し、実行中はcancel→Stoppingへ移す。別contextのreader終了ではexportに触れない。
+実処理の一時ファイル回収と終端通知まではOperationとRemote leaseを維持する。
+閉じたfullscreenを通知先に残さず、workerはpoll ownerのROOTを起こす。
+
+§2を読み、実装担当と独立Sol/xhigh reviewerは、既存のcontext identityと終了ownerに
+取消を接続する構造修正であり症状patchではないと判断した。detached述語、HWND同定、
+viewport生成／配置／focus、detachedの状態fieldは変更しない。設計担当ClaudeCodeの
+今回の検収と実機確認は未実施。検証結果は[3D計画 §10](depth-parallax-plan.md#10-実装の段階-codex-への委任単位)
+に集約し、兄弟contextの実終了で所有exportが維持される回帰も含める。
+
+### 2026-11-07 3D 写真・段 B の占有表示 owner と presentation commit（実装・独立コードレビュー済み）
+
+設計の正本は [depth-parallax-plan §6・§10・§16](depth-parallax-plan.md)。
+ClaudeCode と独立 Codex review の実装前の構造合意は同書 §16 に記録済み。
+以下は実装範囲と判断理由である。独立コードレビューは ACCEPT、P1/P2 残件なし。
+ClaudeCode の検収・実機確認と、全件 gate の成否は別に扱う。
+
+- BA-7: context 所有の `panorama_state: Option<_>` を
+  `FsExclusiveView::{None, Panorama, Depth}` 一つへ移す。App の投影と `ViewerContextBundle` は
+  同じ owner を swap し、入替えは `set_fs_exclusive_view` が旧要求と GPU slot を退役してから行う。
+  detached 用の追加 bool / pending / presence sentinel は作らない。
+- BA-4: 「メイン」は既存の `ViewerContextId` と `ViewerPresentation::Fullscreen` の事実で判定する。
+  `commit_viewer_presentation` は非対応 presentation の公開前に Depth を終了する共通境界。
+  F12・静止画 window mode・動画・rating からの presentation 切替も同じ commit へ通す。
+  viewport ID・rect・直近操作の推測で main を同定しない。
+  既存の context identity、main ID の採番・移動・promote 規則は変更しない。
+- park では Depth を終了し、fork 先へ要求・LRU・GPU resource を複製しない。
+  panorama の park 時の intent 保持は既存の意味を維持する。兄弟の read-only open / close で
+  所有していない context の generation・queue・cancel・texture を変更しない。
+- BA-1 の HWND 同定、BA-3 の再生成契機、BA-6 の placement 所有・保存・同期には触れない。
+  新しい時間窓・recreate・repaint retry・通常設定の初期化も加えない。
+
+状態と presentation の公開境界を一つにして新しい表示機能を接続する構造変更であり、
+detached の既存症状を条件追加で隠す変更ではない。入力・表示・所有境界の実装レビューは完了し、
+自動検証の件数・全件 gate の失敗・補修後の限定結果は深度計画 §10 に集約する。
+
+2026-11-07 の独立実装レビュー（GPT-6.1 Sol / xhigh）は、上記の enum owner と presentation commit の
+接続を「症状パッチではなく構造的変更」と確認した。ClaudeCode との実装前の合意 (§16) を維持する。
+実装全体の自動 gate・実機検収とは分けた構造上の合意である。
+
+2026-11-07 独立レビュー追補（基点 `dee2fd1ec`）:
+初回実装には independent activation の presentation 直接代入と、fork での Depth 移譲前の退役漏れが残っていた。
+`activate_mounted_as_independent_detached` は既存共通 commit に接続し、live / materialized fork の
+共通 primitive `split_current_context_preserving_main_grid` では成功した fork の状態を移す前に
+Depth だけを `set_fs_exclusive_view(None)` で終える。推論要求の取消と自 context の callback slot 除去を
+完了してから session / context を搬送する。既存 park の `reset_detached_pause_foreground_modes` は維持し、
+Panorama の state / intent 移譲と兄弟 context の要求・資源は変えない。
+
+ClaudeCode が指摘を正当と判断した依頼を受け、独立 Codex reviewer（GPT-6.1 Sol / xhigh）は着手前と
+完成 source の双方で、BA-7 の単一 owner の退役順序と BA-4 の既存 presentation / identity 境界を正す
+構造変更であり、症状 guard ではないことに同意した。BA-1 / BA-3 / BA-6 は変更しない。
+実 activation / 両 fork のテストで取消・slot 除去・兄弟不変を検査し、Panorama 移譲の回帰を維持する。
+件数と実行結果は深度計画 §10 の追補へ集約し、実機確認・ClaudeCode の最終検収とは分ける。
+
 ### 2026-11-08 §1.731 コレクション物理子のサムネイルキー
 
 設計担当の決定に沿い、`App::use_full_path_cache_keys` の Collection 条件を root に限定し、

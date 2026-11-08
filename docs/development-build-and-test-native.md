@@ -13,6 +13,12 @@ HWND owner・focus・z-order / IME の実挙動 / マルチモニター DPI な�
 
 ### 検証起動時の設定データ保護（必須）
 
+3D 写真の自動運動（左右・円・8の字・上下）は連続描画を要求するため、通常の静止画 idle 測定には
+含めない。idle 条件は3DをOFFにして揃え、3Dの動作・repaint・GPU負荷は別シナリオとして記録する。
+マウス追従も readback / 推論中や追従中を idle と数えない。段 B の headless検査・snapshotは
+実機での画質・操作感の検収を代替せず、確認の実施状況は [3D設計 §10](depth-parallax-plan.md#10-実装の段階-codex-への委任単位)
+に残す。起動承認・使い捨てdata・通常profile保護はこの節の既存規則をそのまま適用する。
+
 standalone Rustテストでもアプリ起動・前面切替・稼働中UIへの実入力送出を行うものはlive試験。
 段0aでは`run_native`でeframeアプリの窓を起動する1件をignoreし、
 利用者実行の `scripts/test-live-windows.ps1` へ分離する。

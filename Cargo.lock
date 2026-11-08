@@ -4152,6 +4152,7 @@ dependencies = [
  "fontdb",
  "fs4",
  "gilrs",
+ "half",
  "image",
  "kamadak-exif",
  "libavif-sys",

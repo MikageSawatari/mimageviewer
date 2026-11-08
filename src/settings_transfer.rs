@@ -526,6 +526,7 @@ preferences_policy! {
         text_smart_snap_enabled => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         thumb_quality => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         cache_policy => "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
+        cache_book_cover_only => "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
         cache_threshold_ms => "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
         cache_size_threshold_bytes => "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
         cache_videos_always => "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
@@ -626,6 +627,7 @@ preferences_policy! {
         fullscreen_navigator_visible => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         fullscreen_navigator_corner => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         fullscreen_navigator_size => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        depth_parallax => "環境設定外の 3D 写真パネルで管理する動き・奥行き";
         touch_still_chrome_learned => "初回/学習/通知/保存版の内部記録";
         touch_video_chrome_learned => "初回/学習/通知/保存版の内部記録";
         gamepad_enabled => "既存の操作カスタマイズ共有が正本";
@@ -2024,7 +2026,7 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 488);
+        assert_eq!(entries.len(), 490);
         assert_eq!(
             entries
                 .iter()
@@ -2037,7 +2039,7 @@ mod tests {
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            333
+            335
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -2444,6 +2446,32 @@ mod tests {
     }
 
     #[test]
+    fn cache_book_cover_only_is_local_cache_policy() {
+        let source = Settings {
+            cache_book_cover_only: true,
+            ..Settings::default()
+        };
+        assert!(
+            classifications()
+                .iter()
+                .any(|(key, reason)| { *key == "cache_book_cover_only" && reason.is_some() })
+        );
+        let exported = export_preferences(&source).unwrap();
+        let value: Value = serde_json::from_str(&exported.json).unwrap();
+        assert!(value["preferences"].get("cache_book_cover_only").is_none());
+        let mut destination = Settings::default();
+        parse_preferences(&exported.json)
+            .unwrap()
+            .apply_to(&mut destination);
+        assert!(!destination.cache_book_cover_only);
+        destination.cache_book_cover_only = true;
+        parse_preferences(&document(json!({})))
+            .unwrap()
+            .apply_to(&mut destination);
+        assert!(destination.cache_book_cover_only);
+    }
+
+    #[test]
     fn tag_sort_and_applied_at_columns_remain_local_view_settings() {
         let mut destination = Settings {
             tag_view_sort: crate::tag_view::TagViewSort::AppliedAtAsc,
@@ -2718,6 +2746,28 @@ mod tests {
             before.detached_viewer_window_physical_placement
         );
         assert_excluded_unchanged(&before, &destination);
+    }
+
+    #[test]
+    fn depth_parallax_transfer_excludes_panel_settings_and_preserves_destination() {
+        let mut source = Settings::default();
+        source.depth_parallax.motion = crate::depth_parallax::MotionKind::Circle;
+        source.depth_parallax.strength = 0.04;
+        let exported = export_preferences(&source).unwrap();
+        let mut document: Value = serde_json::from_str(&exported.json).unwrap();
+        assert!(document["preferences"].get("depth_parallax").is_none());
+        // Even a forged full object is outside the preferences-transfer boundary.
+        document["preferences"]["depth_parallax"] =
+            serde_json::to_value(&source.depth_parallax).unwrap();
+        let mut destination = Settings::default();
+        destination.depth_parallax.motion = crate::depth_parallax::MotionKind::Vertical;
+        destination.depth_parallax.focus = 0.75;
+        let before = destination.depth_parallax.clone();
+        let report = parse_preferences(&document.to_string())
+            .unwrap()
+            .apply_to(&mut destination);
+        assert_eq!(report.unknown_count, 1);
+        assert_eq!(destination.depth_parallax, before);
     }
 
     #[test]

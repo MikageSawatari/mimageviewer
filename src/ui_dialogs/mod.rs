@@ -9,6 +9,8 @@
 
 mod about;
 pub(crate) mod agent_integration;
+pub(crate) mod depth_addon;
+mod model_addon;
 #[doc(hidden)]
 pub use about::{draw_avif_license_snapshot_fixture, draw_raw_license_snapshot_fixture};
 pub(crate) mod archive_cache_manager;
@@ -121,7 +123,7 @@ fn startup_dialog_footer_height(ui: &eframe::egui::Ui, labels: &[&str], spacing:
         + 2.0
 }
 
-fn startup_dialog_button_rows_height(ui: &eframe::egui::Ui, labels: &[&str]) -> f32 {
+pub(crate) fn startup_dialog_button_rows_height(ui: &eframe::egui::Ui, labels: &[&str]) -> f32 {
     use eframe::egui;
     let mut height = 0.0_f32;
     let mut row_height = 0.0_f32;

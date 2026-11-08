@@ -299,7 +299,7 @@ impl App {
             model_id: model_id.clone(),
             load: crate::ai::vlm_worker::LoadRequest {
                 model_path: model_path.clone(),
-                mmproj_path: mmproj_path.clone(),
+                mmproj_path: mmproj_path.clone().expect("validated VLM projection model"),
                 device_luid: device.luid.clone(),
                 cpu_threads: 4,
             },
@@ -578,16 +578,7 @@ fn draw_dialog(
                                 ui.label("前の処理を片付けています");
                             } else {
                                 ui.label("モデルをダウンロードしています。取得中も画像を閲覧できます。");
-                                match progress {
-                                    InstallProgress::Downloading { bytes_done, bytes_total } => {
-                                        let ratio = if *bytes_total > 0 { *bytes_done as f32 / *bytes_total as f32 } else { 0.0 };
-                                        ui.add(egui::ProgressBar::new(ratio.clamp(0.0, 1.0)).text(format!("{:.2} / {:.2} GB", *bytes_done as f64 / 1e9, *bytes_total as f64 / 1e9)));
-                                    }
-                                    InstallProgress::Idle | InstallProgress::FetchingIndex => { ui.label("配布一覧を取得中..."); }
-                                    InstallProgress::Verifying => { ui.label("ファイルを検証中..."); }
-                                    InstallProgress::Concatenating => { ui.label("モデルのファイルをまとめています..."); }
-                                    InstallProgress::Installing => { ui.label("モデルを配置中..."); }
-                                }
+                                super::model_addon::draw_progress(ui, progress);
                             }
                         }
                         Dialog::Done => { ui.label("モデルのダウンロードが完了しました。"); }
@@ -635,17 +626,7 @@ pub(super) fn draw_preferences(ui: &mut egui::Ui, view: &VlmPreferencesView) -> 
         ui.label(&view.activity);
     }
     ui.add_space(8.0);
-    let mut result = (false, false, false);
-    ui.horizontal_wrapped(|ui| {
-        result.0 = ui
-            .add_enabled(!view.busy, egui::Button::new("ダウンロード"))
-            .clicked();
-        result.1 = ui
-            .add_enabled(view.can_remove, egui::Button::new("削除"))
-            .clicked();
-        result.2 = ui.button("フォルダを開く").clicked();
-    });
-    result
+    super::model_addon::draw_actions(ui, view.busy, view.can_remove)
 }
 
 #[cfg(test)]
@@ -819,7 +800,7 @@ mod tests {
                 model_id: "synthetic-model".into(),
                 bytes: 10,
                 model_path: "synthetic-model.gguf".into(),
-                mmproj_path: "synthetic-mmproj.gguf".into(),
+                mmproj_path: Some("synthetic-mmproj.gguf".into()),
             },
         );
         assert!(app.vlm_setup.view(app.vlm_caption_job_running()).can_remove);

@@ -359,6 +359,7 @@ fn batch(
             webp_always: true,
             pdf_always: true,
             zip_always: true,
+            cache_book_cover_only: false,
         },
     )
 }

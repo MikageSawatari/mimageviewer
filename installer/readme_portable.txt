@@ -186,6 +186,14 @@ HEIC / JPEG XL 表示は Windows Imaging Component（WIC）を
   - Twemoji 絵文字グラフィックス (CC-BY 4.0): Twitter, Inc. and other contributors
     （注釈機能のスタンプに使用）
 
+3D 写真の追加モデル（任意ダウンロード）:
+
+  - Depth Anything 3 (DA3 Mono-Large、Apache-2.0) の派生物
+    重みと内部計算を fp16 化し、入力を 1 枚・504 x 504 px に固定しています。
+    再学習は行っていません。LICENSE と NOTICE はモデルと一緒に取得します。
+    環境設定の「3D 写真の追加モデル」から保存先フォルダを開いて確認できます。
+    保存先は実行ファイルと同じ場所の data\addons\depth\ 内です。
+
 AI モデルは各配布元のライセンスに従います。詳細は
 オンラインマニュアル（下記）を参照してください。
 

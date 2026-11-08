@@ -583,8 +583,12 @@ host の起動・終了コードや `job_process` は変更しない。以下の
     デスクトップ版だけの設定)。ページ単位は `selection.json` の `include:false`、節単位は既存の `remove_section` の規則で書く。
     規則は一回だけ一致することを要求するので、上流が変わればビルドが止まって知らせる (今の仕組み)。
   - `SOURCE.md` の「submodule of EffeTune Mixwright <ver>」の照合 (`:608-611`) を派生版の版に合わせる。
-- URL: 今の `manual/effetune/<ver>/` を `manual/sound/<ver>/` (名前に合わせる) へ移し、古い URL は `.htaccess` で 301 する
-  (生成器の既存の redirect の仕組み `:716-753` を使う。134 ページが検索に載っているため)。
+- URL (2026-11-08、§1.737): 版番号なしの `manual/sound/` 直下に固定し、index.html を目次そのものにする。
+  版表記は目次本文の1か所だけ。旧 `manual/effetune/<ver>/`・`manual/sound/<ver>/` と旧 EffeTune 入口は
+  `.htaccess` で1回の301により同名の固定 URL へ送る。現行生成物一覧に無いパスは目次へ送り、
+  固定 URL の消えたページも目次へ送る。ファイル存在検査は使わないため、サーバに残った旧ファイルにも効く。
+  版だけの更新では URL・目次以外のページ・生成ブロックは変わらない。移行時の残存版ディレクトリは
+  明示的に削除し、通常の版更新では固定パスの内容を上書きする。
 - テスト `scripts/test_gen_effetune_docs.py` を合わせて直す。
 
 ### 10.2 mIV のマニュアル・製品ページ・その他
@@ -626,7 +630,8 @@ F2a の候補ビルド・確認・承認の手順は [mIV Sound のビルド](mi
 F2a は §7.3〜7.4、bridge 環境と表記までで、§5 の移行本体は F2b。
 固定値は `config/miv-sound.rs` に集約する。`-SkipCTest` の候補は未承認のまま保持し、
 `-TestCandidate -Candidate <ID>` で同じ出力の ctest 成功記録を作ってから承認する。
-F3 で公開説明書を mIV Sound 向けに更新した。URL は `v` 付きの `VERSION`、元の上流資料の版は `DOCS_VERSION` として分ける。
+F3 で公開説明書を mIV Sound 向けに更新した。§1.737 で URL は `manual/sound/` に固定した。
+`v` 付きの `VERSION` は目次本文だけに表示し、元の上流資料の版は `DOCS_VERSION` として分ける。
 生成器・公開文書・F4 の照合待ちは末尾の「F3 の実装記録」を参照。
 F2a はコミット済み（`e5731ca69`、`28f706c8a`）。実際の候補ビルドと ctest 111/111 は外部で確認済みだが、
 その旧候補には新しい構成・登録テストの記録が無いため承認には使わない。承認・release launcher は未完了。

@@ -66,7 +66,7 @@ impl App {
             self.close_video_tile_mode();
             return;
         }
-        if self.is_panorama_mode_active(fs_idx) {
+        if self.fs_exclusive_view_active(fs_idx).is_some() {
             return;
         }
         debug_assert_eq!(

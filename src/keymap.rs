@@ -1787,6 +1787,7 @@ pub enum KeyAction {
     FsScrubZoomHold,
     FsPanorama,
     FsPanoramaProjection,
+    FsDepthParallax,
     FsNavigatorToggle,
     FsPageTurnAnimationToggle,
     FsNavigatorHold,
@@ -2397,6 +2398,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsScrubZoomHold,
     KeyAction::FsPanorama,
     KeyAction::FsPanoramaProjection,
+    KeyAction::FsDepthParallax,
     KeyAction::FsNavigatorToggle,
     KeyAction::FsPageTurnAnimationToggle,
     KeyAction::FsNavigatorHold,
@@ -4632,6 +4634,7 @@ impl KeyAction {
             FsScrubZoomHold => "FsScrubZoomHold",
             FsPanorama => "FsPanorama",
             FsPanoramaProjection => "FsPanoramaProjection",
+            FsDepthParallax => "FsDepthParallax",
             FsNavigatorToggle => "FsNavigatorToggle",
             FsPageTurnAnimationToggle => "FsPageTurnAnimationToggle",
             FsNavigatorHold => "FsNavigatorHold",
@@ -5407,6 +5410,7 @@ impl KeyAction {
             FsZoomMode => "全画面ズームモード (押している間ズーム範囲を指定)",
             FsPanorama => "360度表示または通常動画の拡大表示を切り替える",
             FsPanoramaProjection => "360度パノラマの投影方式を切り替える",
+            FsDepthParallax => "3D 写真の表示を切り替える",
             FsNavigatorToggle => "ナビゲータの表示を切り替える",
             FsPageTurnAnimationToggle => "ページめくりアニメーションを切り替える",
             FsNavigatorHold => "押している間だけナビゲータを表示する",
@@ -5996,6 +6000,7 @@ impl KeyAction {
             | FsRotateCcw
             | FsImageAnalysis
             | FsZoomMode
+            | FsDepthParallax
             | FsNavigatorToggle
             | FsPageTurnAnimationToggle
             | FsNavigatorHold
@@ -6556,6 +6561,7 @@ impl KeyAction {
             | FsImageAnalysis
             | FsPanorama
             | FsPanoramaProjection
+            | FsDepthParallax
             | FsNavigatorToggle
             | FsPageTurnAnimationToggle
             | FsPixelGrid
@@ -7131,6 +7137,7 @@ impl KeyAction {
             FsZoomMode => ChordList::one(Chord::key(Z)),
             FsPanorama => ChordList::one(Chord::key(V)),
             FsPanoramaProjection => ChordList::one(Chord::shift(V)),
+            FsDepthParallax => ChordList::one(Chord::key(D)),
             FsNavigatorToggle => ChordList::one(Chord::alt(N)),
             FsPageTurnAnimationToggle => ChordList::EMPTY,
             FsNavigatorHold => ChordList::one(Chord::modifier(ModKind::Alt)),
@@ -12016,6 +12023,47 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Chord::ctrl(KeyName::Right)]
         );
+    }
+
+    #[test]
+    fn depth_parallax_has_image_only_d_contract_and_supports_rebinding() {
+        let action = KeyAction::FsDepthParallax;
+        let chord = Chord::key(KeyName::D);
+        assert!(ALL_ACTIONS.contains(&action));
+        assert_eq!(action.context(), KeyContext::FsImage);
+        assert_eq!(action.trigger(), KeyTrigger::Press);
+        assert_eq!(KeyAction::from_ini_name(action.ini_name()), Some(action));
+        assert_eq!(
+            action.default_chords().iter().collect::<Vec<_>>(),
+            vec![chord]
+        );
+        // D was free in every scope active during ordinary image viewing.
+        for &other in ALL_ACTIONS {
+            if other != action && FS_IMAGE_ACTIVE_SCOPES.contains(&other.context()) {
+                assert!(
+                    !other.default_chords().iter().any(|bound| bound == chord),
+                    "{other:?}"
+                );
+            }
+        }
+        let keymap = Keymap::empty();
+        assert_eq!(
+            keymap.resolve_first_action_for_chord(chord, FS_IMAGE_ACTIVE_SCOPES, ALL_ACTIONS),
+            Some(action)
+        );
+        assert_eq!(
+            keymap.resolve_first_action_for_chord(chord, FS_VIDEO_ACTIVE_SCOPES, ALL_ACTIONS),
+            None
+        );
+        let rebound = Keymap::from_ini_str("[FsImage]\nFsDepthParallax = F13\n");
+        assert!(rebound.warnings().is_empty());
+        assert_eq!(
+            rebound.effective_chords(action),
+            vec![Chord::key(KeyName::F13)]
+        );
+        let disabled = Keymap::from_ini_str("[FsImage]\nFsDepthParallax = none\n");
+        assert!(disabled.effective_chords(action).is_empty());
+        assert!(Keymap::default_reference_ini().contains("# FsDepthParallax = D"));
     }
 
     #[test]

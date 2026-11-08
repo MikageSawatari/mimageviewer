@@ -7497,6 +7497,17 @@ pub(super) fn page_ai_caption(ui: &mut egui::Ui, state: &mut PreferencesState) {
     });
 }
 
+/// Depth addon shares the cached management controls with the VLM page.
+pub(super) fn page_depth_addon(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    anchored(ui, state, "depth-addon/manage", |ui, state| {
+        let (download, remove, folder) =
+            super::super::depth_addon::draw_preferences(ui, &state.depth_view);
+        state.depth_download_requested |= download;
+        state.depth_remove_requested |= remove;
+        state.depth_folder_requested |= folder;
+    });
+}
+
 /// 編集用追加パック (オノマトペ向けフォント + 被写体分離モデル) の管理ページ。
 /// `from_settings` の snapshot を表示し、実際の処理は App に要求する。
 pub(super) fn page_editing_addon(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -7664,6 +7675,22 @@ pub(super) fn reset_epub_file_handling(settings: &mut crate::settings::Settings)
     settings.epub_file_handling = crate::settings::EpubFileHandling::default();
 }
 
+pub(super) fn book_cover_only_setting(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    ui.checkbox(
+        &mut state.settings.cache_book_cover_only,
+        "本 (ZIP・PDF など) は表紙のサムネイルだけ保存する",
+    );
+    ui.label(
+        egui::RichText::new(
+            "本棚に並ぶ表紙 (先頭ページ、または代表に固定した画像) だけを保存し、本の中のページのサムネイルは保存しません。\n\
+             容量を抑えられますが、本を開き直したときなどにページ一覧の表示が遅くなることがあります。保存済みのキャッシュは消えません。\n\
+             次にフォルダや本を開いたときから反映されます。",
+        )
+        .small()
+        .weak(),
+    );
+}
+
 pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.label(
         "サムネイルキャッシュをいつ生成するかを指定します。\n\
@@ -7685,6 +7712,9 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(8.0);
     ui.separator();
     ui.add_space(6.0);
+
+    anchored(ui, state, "cache/book-cover-only", book_cover_only_setting);
+    ui.add_space(8.0);
 
     let auto_active = state.settings.cache_policy == CachePolicy::Auto;
 

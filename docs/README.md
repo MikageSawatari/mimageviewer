@@ -139,7 +139,8 @@
 | [settings-export-import-plan.md](settings-export-import-plan.md) | **§1.317 実装済み (レビュー前)**。環境設定の持ち運び、全458フィールドの分類 (144対象 / 314除外、音響調整タスクバー設定追加後)、形式 v1、draft → 既存 OK、単一転送 job、利用者承認と検証計画。既存 OK の §1.305 / §1.295 は今回未修正 |
 | [comic-integration-plan.md](comic-integration-plan.md) | comic DB、注釈 overlay、編集・書き出しパイプラインの統合契約 |
 | [conceal-feature-plan.md](conceal-feature-plan.md) | 隠蔽加工の形状、保存、合成、キャッシュ無効化の現行仕様 |
-| [depth-parallax-research.md](depth-parallax-research.md) | **調査のみ・未着手**。AI 深度推定で写真・イラストを立体的に見せる「3D 写真」と GIF / APNG / MP4 書き出し。既存製品の手法、モデルのライセンス、描画方式、mIV の流用部品と段階案 |
+| [depth-parallax-plan.md](depth-parallax-plan.md) | **設計・実装前レビュー待ち** (ブランチ `depth-parallax`)。「3D 写真」モード: 表示中テクスチャから深度を推定し視差シェーダで描く、パネル・マウス追従・GIF / APNG / MP4 書き出し、モデルの追加ダウンロード |
+| [depth-parallax-research.md](depth-parallax-research.md) | 3D 写真の調査とスパイク結果。既存製品の手法、モデルのライセンス、描画方式、所要時間・VRAM・fp16 化の計測 |
 | [panorama-360-view-plan.md](panorama-360-view-plan.md) | **コード実装済み・実素材／実機性能の手動確認は記録上未確認**。360° パノラマ表示、GPano crop、mipmap、settle refinement、fullscreen 合成の現行仕様と設計経緯 |
 | [fullscreen-side-panel-mode-plan.md](fullscreen-side-panel-mode-plan.md) | **実装済み・手動実機確認は記録上未確認**。静止画・動画・音楽で共通のサイドパネル表示モード仕様 |
 | [fullscreen-locked-chrome-suppression-plan.md](fullscreen-locked-chrome-suppression-plan.md) | §1.344 の決定仕様と実装記録。F11 の正確な表示先から導く実効ロック、native 動画・F12・描画/予約/hit の共通契約。2026-10-08に利用者判断・構造合意済み |
@@ -200,6 +201,7 @@
 | ドキュメント | 内容 |
 | --- | --- |
 | [catalog-design.md](catalog-design.md) | サムネイルキャッシュ DB の設計 |
+| [book-thumb-cover-only-plan.md](book-thumb-cover-only-plan.md) | §1.452 本の中のページは寸法だけ記録し表紙だけ保存する設定、`page_dims` 表、書き戻しの stamp 条件 |
 | [dct-scale-plan.md](dct-scale-plan.md) | TurboJPEG の DCT スケールデコードによるサムネ生成高速化。倍率選択と、圧縮入力サイズによるフォールバック条件 |
 | [scroll-visibility-priority-plan.md](scroll-visibility-priority-plan.md) | スクロール停止後に可視サムネのジョブを優先レーンへ昇格させる仕組みと perf 計装 |
 | [prefetch-suppression-during-scroll-plan.md](prefetch-suppression-during-scroll-plan.md) | スクロール中 / 可視待ち中に prefetch を enqueue しない判定と、永久 stall を防ぐ backstop |

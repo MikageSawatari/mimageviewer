@@ -1710,7 +1710,7 @@ pub(in crate::app) struct ViewerContextBundle {
     video_seek_strip_runtime: crate::app::native_video::VideoSeekStripRuntime,
     video_seek_strip_wave_holdover: Option<crate::app::native_video::HeldSeekStripWaveWorker>,
     video_seek_strip_next_session_id: u64,
-    panorama_state: Option<crate::panorama::PanoramaState>,
+    fs_exclusive_view: crate::fs_exclusive_view::FsExclusiveView,
     /// 現在の通常動画項目の拡大率と中心。presenter へ渡す値 snapshot の正本であり、
     /// context を mount した間だけ App field へ投影する。
     video_zoom_state: Option<crate::video::zoom_view::VideoZoomState>,
@@ -1958,6 +1958,9 @@ pub(in crate::app) struct ViewerContextBundle {
 
 #[cfg(windows)]
 impl ViewerContextBundle {
+    pub(crate) fn panorama_state(&self) -> Option<&crate::panorama::PanoramaState> {
+        self.fs_exclusive_view.panorama_state()
+    }
     fn take_page_edit_commits(
         &mut self,
         boundary: page_edit_owner::PageEditBoundary,
@@ -2447,6 +2450,7 @@ impl<'a> ContextRef<'a> {
         match self.source {
             ContextRefSource::Mounted(app) => app.viewer_texture_caches(),
             ContextRefSource::AtRest(bundle) => super::vram_accounting::ViewerTextureCaches {
+                fs_exclusive_view: &bundle.fs_exclusive_view,
                 fs_lanczos_cache: &bundle.fs_lanczos_cache,
                 similar_panel: &bundle.similar_panel,
                 fs_cache: &bundle.fs_cache,
@@ -2736,6 +2740,7 @@ impl ViewerContextBundle {
     /// one-shot worker だが、owner の消滅後に CPU / GPU / AI 処理を続ける理由がないので、
     /// 各 worker が既に監視している cancel token を立てる。
     fn cancel_all_context_work(&mut self) {
+        self.fs_exclusive_view = crate::fs_exclusive_view::FsExclusiveView::None;
         self.page_overview.close();
         if let Some(pending) = self.external_rescan_pending.take() {
             pending.cancel_and_retire();
@@ -2989,7 +2994,7 @@ impl ViewerContextBundle {
             video_seek_strip_runtime: crate::app::native_video::VideoSeekStripRuntime::Closed,
             video_seek_strip_wave_holdover: None,
             video_seek_strip_next_session_id: 1,
-            panorama_state: None,
+            fs_exclusive_view: crate::fs_exclusive_view::FsExclusiveView::None,
             video_zoom_state: None,
             native_video_mouse_seek_holds:
                 crate::app::native_video::NativeVideoMouseSeekHolds::default(),
@@ -3239,7 +3244,10 @@ impl App {
             // already owns its independent list loses passive observation here.
             self.retire_passive_folder_observation();
         }
-        self.viewer_presentation = ViewerPresentation::DetachedWindow;
+        self.commit_viewer_presentation(
+            ViewerPresentation::DetachedWindow,
+            "activate_independent_detached",
+        );
         self.ensure_mounted_detached_session_binding(window_id);
         self.detached_viewer_independent_active = true;
         self.detached_viewer_open_next_still_detached_once = false;
@@ -3419,7 +3427,7 @@ impl App {
             video_seek_strip_runtime,
             video_seek_strip_wave_holdover,
             video_seek_strip_next_session_id,
-            panorama_state,
+            fs_exclusive_view,
             video_zoom_state,
             native_video_mouse_seek_holds,
             panorama_intent,
@@ -3751,7 +3759,7 @@ impl App {
         swap_field!(video_seek_strip_runtime);
         swap_field!(video_seek_strip_wave_holdover);
         swap_field!(video_seek_strip_next_session_id);
-        swap_field!(panorama_state);
+        swap_field!(fs_exclusive_view);
         swap_field!(video_zoom_state);
         swap_field!(native_video_mouse_seek_holds);
         swap_field!(panorama_intent);
@@ -3978,6 +3986,15 @@ impl App {
         &mut self,
     ) -> Box<ViewerContextBundle> {
         // This boundary executes only after the table admitted the successful fork.
+        // Depth belongs to the original main fullscreen identity. Retire its request
+        // and callback slot before moving viewer state to a new owner. Panorama's
+        // existing state/intent transfer below remains unchanged.
+        if self.fs_exclusive_view.is_depth() {
+            self.set_fs_exclusive_view(
+                crate::fs_exclusive_view::FsExclusiveView::None,
+                "fork_exclusive_owner",
+            );
+        }
         // The transient reader and its return lifetime move as one owner; the main
         // projection receives the unchanged, already prepared physical basis.
         let direct_owner = self.direct_media_reader_active().then(|| {
@@ -4132,7 +4149,7 @@ impl App {
             video_seek_strip_runtime,
             video_seek_strip_wave_holdover,
             video_seek_strip_next_session_id,
-            panorama_state,
+            fs_exclusive_view,
             video_zoom_state,
             native_video_mouse_seek_holds,
             panorama_intent,
@@ -4395,7 +4412,7 @@ impl App {
             video_seek_strip_runtime,
             video_seek_strip_wave_holdover,
             video_seek_strip_next_session_id,
-            panorama_state,
+            fs_exclusive_view,
             video_zoom_state,
             native_video_mouse_seek_holds,
             // 意図は 360 state と同じ側へ動く。渡した viewer が 360 を続けるので、

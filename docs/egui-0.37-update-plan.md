@@ -1574,6 +1574,7 @@ settings.dbは初期化しない。リリース済みId永続経路が実装時�
 | 入れ子run_ui・実discard回帰 | (b・新規) §4.5の親だけ／子だけ要求と、実run_ui再passの最終出力を検査 |
 | 承認済み子viewportの非描画退役入口 | (b・新規) 既存Context viewport GCを共通化し、pass外で対象登録を退役できるeframe向け入口を追加。兄弟やrootを変更しない |
 | テスト・license・standalone | (b) 新構造へ移植 |
+| §1.691 非primary押下での部分選択保持（2026-11-08） | (b・新規) `src/text_selection/text_cursor_state.rs`。upstream [#4393](https://github.com/emilk/egui/issues/4393)。primary pressの無いpassで、非空の選択内（両端の文字境界を含む）への非primary pressを無操作として扱い、範囲・granular anchorとfocus／cursor purposeを保持する。Shiftでも同じ。選択外・空選択・primary pressの従来動作を維持し、drag更新はprimary保持中だけ。隣接`text_cursor_state_tests.rs`の実Context／TextEdit回帰とAppの`everything_select_1691.rs`で検査。台帳の詳細は`vendor/egui/PATCHES.md` |
 
 新wheel ownerは`egui-0.37.0/src/input_state/mod.rs:228`、`wheel_state.rs:54`。汎用非表示終端APIは追加しない。
 

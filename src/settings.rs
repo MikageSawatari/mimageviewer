@@ -4768,6 +4768,9 @@ pub struct Settings {
     /// サムネイルキャッシュ生成ポリシー（段階 C）
     #[serde(default)]
     pub cache_policy: CachePolicy,
+    /// 本の中のページは寸法だけ記録し、表紙のサムネイルだけ保存する (RAW ページを除く)。
+    #[serde(default)]
+    pub cache_book_cover_only: bool,
     /// Auto モード: `decode + display` がこの値以上のファイルをキャッシュ対象にする（ms, 10-100）
     #[serde(default = "default_cache_threshold_ms")]
     pub cache_threshold_ms: u32,
@@ -5379,6 +5382,9 @@ pub struct Settings {
     /// そのセッションの `PanoramaState` だけを動かす。
     #[serde(default)]
     pub panorama_projection: crate::panorama::PanoProjection,
+    /// 3D 写真の動き・奥行き。ON/OFF は viewer セッションだけが所有する。
+    #[serde(default)]
+    pub depth_parallax: crate::depth_parallax::DepthParallaxSettings,
     /// Length of one side of the navigator canvas in logical points.
     #[serde(default = "default_fullscreen_navigator_size")]
     pub fullscreen_navigator_size: f32,
@@ -7812,6 +7818,7 @@ impl Default for Settings {
             text_smart_snap_enabled: true,
             thumb_quality: default_thumb_quality(),
             cache_policy: CachePolicy::default(),
+            cache_book_cover_only: false,
             cache_threshold_ms: default_cache_threshold_ms(),
             cache_size_threshold_bytes: default_cache_size_threshold_bytes(),
             cache_videos_always: true,
@@ -7917,6 +7924,7 @@ impl Default for Settings {
             fullscreen_navigator_visible: false,
             fullscreen_navigator_corner: FullscreenNavigatorCorner::default(),
             panorama_projection: crate::panorama::PanoProjection::default(),
+            depth_parallax: crate::depth_parallax::DepthParallaxSettings::default(),
             fullscreen_navigator_size: FULLSCREEN_NAVIGATOR_SIZE_DEFAULT,
             fullscreen_seek_bar_locked: false,
             still_seek_strip_locked: false,
@@ -10303,6 +10311,7 @@ impl Settings {
             clamp_fullscreen_cursor_hide_delay_secs(self.fullscreen_cursor_hide_delay_secs);
         self.fullscreen_navigator_corner = self.fullscreen_navigator_corner.normalized();
         self.panorama_projection = self.panorama_projection.normalized();
+        self.depth_parallax.normalize();
         self.fullscreen_navigator_size = if self.fullscreen_navigator_size.is_finite() {
             self.fullscreen_navigator_size
                 .clamp(FULLSCREEN_NAVIGATOR_SIZE_MIN, FULLSCREEN_NAVIGATOR_SIZE_MAX)
@@ -10650,6 +10659,8 @@ impl Settings {
         self.sns_split_count = src.sns_split_count;
         self.sns_split_seam_permille = src.sns_split_seam_permille;
         self.sns_split_frame_ratio = src.sns_split_frame_ratio.take();
+        // 3D 写真パネルのライブ調整を古い環境設定 draft で巻き戻さない。
+        self.depth_parallax.clone_from(&src.depth_parallax);
         // フォルダバー (アドレス行) の表示設定も v2.0.0 で右クリックメニューへ移したため、
         // 環境設定を開いている間の変更が OK で巻き戻らないよう live 値を引き継ぐ (Codex P2)。
         self.show_toolbar_folder = src.show_toolbar_folder;
@@ -15014,6 +15025,28 @@ mod tests {
     }
 
     #[test]
+    fn cache_book_cover_only_defaults_off_and_survives_preferences_merge() {
+        assert!(!Settings::default().cache_book_cover_only);
+        let legacy: Settings = serde_json::from_str(r#"{"cache_policy":"Always"}"#).unwrap();
+        assert!(!legacy.cache_book_cover_only);
+        for enabled in [true, false] {
+            let mut edited = Settings {
+                cache_book_cover_only: enabled,
+                ..Settings::default()
+            };
+            let mut live = Settings {
+                cache_book_cover_only: !enabled,
+                ..Settings::default()
+            };
+            edited.overwrite_non_preferences_from(&mut live);
+            assert_eq!(edited.cache_book_cover_only, enabled);
+            let loaded: Settings =
+                serde_json::from_value(serde_json::to_value(&edited).unwrap()).unwrap();
+            assert_eq!(loaded.cache_book_cover_only, enabled);
+        }
+    }
+
+    #[test]
     fn metadata_export_recursive_defaults_to_true() {
         assert!(Settings::default().metadata_export_recursive);
 
@@ -15248,6 +15281,7 @@ mod tests {
         assert_eq!(s.thumb_px, 512);
         assert_eq!(s.thumb_quality, 75);
         assert_eq!(s.cache_policy, CachePolicy::Auto);
+        assert!(!s.cache_book_cover_only);
         assert_eq!(s.cache_threshold_ms, 25);
         assert_eq!(s.cache_size_threshold_bytes, 2_000_000);
         assert!(s.cache_videos_always);
@@ -20500,6 +20534,35 @@ mod tests {
             );
             let _ = env;
         }
+    }
+
+    #[test]
+    fn depth_parallax_settings_default_roundtrip_and_sanitize() {
+        let defaults: super::Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            defaults.depth_parallax,
+            crate::depth_parallax::DepthParallaxSettings::default()
+        );
+        let mut configured = defaults;
+        configured.depth_parallax.motion = crate::depth_parallax::MotionKind::FigureEight;
+        configured.depth_parallax.strength = 0.035;
+        configured.depth_parallax.period_secs = 7.0;
+        configured.depth_parallax.focus = 0.7;
+        configured.depth_parallax.shape_depth = false;
+        let restored: super::Settings =
+            serde_json::from_value(serde_json::to_value(&configured).unwrap()).unwrap();
+        assert_eq!(restored.depth_parallax, configured.depth_parallax);
+        let mut live = restored;
+        let mut stale_draft = super::Settings::default();
+        stale_draft.overwrite_non_preferences_from(&mut live);
+        assert_eq!(stale_draft.depth_parallax, configured.depth_parallax);
+        configured.depth_parallax.strength = 1.0;
+        configured.depth_parallax.period_secs = 0.0;
+        configured.depth_parallax.focus = -1.0;
+        configured.sanitize();
+        assert_eq!(configured.depth_parallax.strength, 0.05);
+        assert_eq!(configured.depth_parallax.period_secs, 1.0);
+        assert_eq!(configured.depth_parallax.focus, 0.0);
     }
 
     #[test]

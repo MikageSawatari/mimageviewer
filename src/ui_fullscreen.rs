@@ -22,6 +22,10 @@ pub(crate) mod canonical_demand;
 mod compare_original;
 #[cfg(test)]
 mod continuous_quality_tests;
+#[cfg(all(test, windows))]
+mod depth_main_window_tests;
+#[cfg(test)]
+mod depth_tests;
 #[cfg(test)]
 mod front_pointer_ownership_tests;
 #[cfg(test)]
@@ -4111,6 +4115,7 @@ fn panorama_navigator_wrap_yaw(yaw: f32) -> f32 {
 /// `if analysis_mode … else if panorama …` を書き直すと、必ずどれかを落とす。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FsZoomOwner {
+    Depth,
     /// ZipPla 風ズーム (照準中 / 確定中)。専用描画経路で `fs_zoom` を見ない。
     ZoomMode,
     /// 360 度ビュー。`fov_y` / `yaw` / `pitch`。
@@ -13246,7 +13251,7 @@ impl App {
         idx: usize,
         original_preview_active: bool,
     ) -> Option<FullscreenPaintResource> {
-        self.resolve_fs_processed_material_from_caches(ctx, idx, original_preview_active)
+        self.resolve_fs_processed_material_from_caches(ctx, idx, original_preview_active, &mut None)
             .filter(|resource| self.display_texture_matches_page(resource.source_texture(), idx))
     }
 
@@ -13256,8 +13261,54 @@ impl App {
         idx: usize,
         original_preview_active: bool,
     ) -> Option<FullscreenPaintPayload> {
-        let ordinary = self.resolve_fs_processed_material(ctx, idx, original_preview_active);
-        self.fullscreen_paint_payload_for_page(idx, ordinary, original_preview_active)
+        self.resolve_fs_processed_payload_and_depth(ctx, idx, original_preview_active)
+            .0
+    }
+
+    /// The display selector supplies readiness alongside the exact selected payload.
+    /// Depth never repeats the final/comic/source priority rules.
+    fn resolve_fs_processed_payload_and_depth(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        original_preview_active: bool,
+    ) -> (
+        Option<FullscreenPaintPayload>,
+        crate::depth_parallax::DepthSourceMaterial,
+    ) {
+        use crate::depth_parallax::{DepthSourceMaterial, DepthSourceWait};
+        let mut wait = None;
+        let ordinary = self
+            .resolve_fs_processed_material_from_caches(ctx, idx, original_preview_active, &mut wait)
+            .filter(|resource| self.display_texture_matches_page(resource.source_texture(), idx));
+        let payload =
+            self.fullscreen_paint_payload_for_page(idx, ordinary, original_preview_active);
+        let material = if original_preview_active {
+            DepthSourceMaterial::NotYet(DepthSourceWait::OriginalHold)
+        } else if self.fs_navigation_sequence_blocks_new_target() {
+            DepthSourceMaterial::NotYet(DepthSourceWait::PageTransition)
+        } else if wait == Some(DepthSourceWait::AnnotationBake) {
+            DepthSourceMaterial::NotYet(DepthSourceWait::AnnotationBake)
+        } else {
+            match payload.as_ref() {
+                Some(payload) => match payload.source_texture() {
+                    Some(texture) => match wait {
+                        Some(reason) => DepthSourceMaterial::NotYet(reason),
+                        None => DepthSourceMaterial::Ready {
+                            texture: texture.clone(),
+                        },
+                    },
+                    // The ordinary selector can keep a source-free Native presentation
+                    // while its existing material producer is incomplete. That actual
+                    // selected payload owns the wait reason, rather than the lower layer.
+                    None => DepthSourceMaterial::NotYet(DepthSourceWait::NativeOnly),
+                },
+                None => {
+                    DepthSourceMaterial::NotYet(wait.unwrap_or(DepthSourceWait::ThumbnailFallback))
+                }
+            }
+        };
+        (payload, material)
     }
 
     pub(crate) fn resolve_fs_processed_texture(
@@ -13275,6 +13326,7 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
         original_preview_active: bool,
+        depth_wait: &mut Option<crate::depth_parallax::DepthSourceWait>,
     ) -> Option<FullscreenPaintResource> {
         if self.raw_development_blocked(idx) {
             return self.resolve_original_preview_material(idx);
@@ -13396,8 +13448,25 @@ impl App {
         if let Some(comic) = self.ensure_comic_composite_material(ctx, idx) {
             return Some(comic);
         }
+        if self.comic_has_objects(ctx, idx) {
+            *depth_wait = Some(crate::depth_parallax::DepthSourceWait::AnnotationBake);
+        }
         if let Some(texture) = self.ensure_final_composite_material(ctx, idx) {
+            if !self.current_final_composite_is_complete(idx) && depth_wait.is_none() {
+                *depth_wait = Some(crate::depth_parallax::DepthSourceWait::IncompleteComposite);
+            }
             return Some(texture);
+        }
+        // A lower layer remains a valid 2D fallback while the selected final
+        // producer is pending. It is not yet the stable input for inference.
+        // RAW development previews are the explicit stable-preview exception.
+        let raw_preview = matches!(
+            self.fs_cache.get(&idx),
+            Some(FsCacheEntry::RawPreview { .. })
+        ) || self.raw_page_load_state(idx)
+            == Some(crate::app::raw_page_store::RawPageLoadState::PreviewShown);
+        if !raw_preview {
+            depth_wait.get_or_insert(crate::depth_parallax::DepthSourceWait::IncompleteComposite);
         }
         if self.colorize_display_requires_final_effect(idx) {
             // RAW previews share the existing small, faithful rendition path.
@@ -14633,9 +14702,22 @@ impl App {
         }
     }
 
-    /// ZipPla 風全画面ズームモードが何らかの形で動作中か (照準 or ズーム+パン中)。
+    /// Stored Z state (aiming or committed). Depth suspends this state without clearing it.
+    /// Runtime input/paint consumers use the effective-owner helpers below instead.
     pub(crate) fn fs_zoom_mode_engaged(&self) -> bool {
         self.fs_zoom_active || self.fs_zoom_aiming
+    }
+
+    pub(crate) fn fs_zoom_mode_effective(&self) -> bool {
+        self.fs_zoom_owner() == FsZoomOwner::ZoomMode
+    }
+
+    fn fs_zoom_mode_active(&self) -> bool {
+        self.fs_zoom_mode_effective() && self.fs_zoom_active
+    }
+
+    fn fs_zoom_mode_aiming(&self) -> bool {
+        self.fs_zoom_mode_effective() && self.fs_zoom_aiming
     }
 
     /// フルスクリーンの現ページが FsVideo コンテキストか (動画 / 音声 / 動画→音声モード)。
@@ -14653,7 +14735,7 @@ impl App {
 
     fn fs_zoom_mode_context_ok(&self, fs_idx: usize) -> bool {
         self.reading_flow.is_paged()
-            && !self.is_panorama_mode_active(fs_idx)
+            && !self.fs_exclusive_view_active(fs_idx).is_some()
             && !self.analysis_mode
             // 消しゴム / 補正レイヤー / 隠蔽 / 切り取り / 注釈 をまとめて除外 (Codex P2: 切り取り
             // モード漏れ防止のため手書き列挙でなく is_overlay_edit_mode_active を使う)。
@@ -14676,7 +14758,7 @@ impl App {
     /// KeyHold ではないので照準表示はスキップし、現在のカーソル位置で即ズーム状態に入る。
     pub(crate) fn toggle_fs_zoom_mode_action(&mut self, ctx: &egui::Context, fs_idx: usize) {
         if !self.fs_zoom_mode_context_ok(fs_idx) {
-            self.fs_zoom_reset();
+            self.fs_zoom_reset_for_blocked_context();
             if !self.show_continuous_reading_shortcut_noop(
                 ctx,
                 fs_idx,
@@ -14717,6 +14799,17 @@ impl App {
         self.fs_zoom_aiming = false;
         self.fs_zoom_exit_pending = false;
         self.fs_zoom_z_was_down = false;
+    }
+
+    /// Input admission does not define the lifetime of the stored 2D zoom.
+    /// Depth displays fit while retaining that zoom for its eventual return to 2D.
+    /// Other excluded contexts (including Panorama) keep their existing reset behavior.
+    fn fs_zoom_reset_for_blocked_context(&mut self) {
+        if self.fs_exclusive_view.is_depth() {
+            self.fs_zoom_reset_transient();
+        } else {
+            self.fs_zoom_reset();
+        }
     }
 
     /// ZipPla 風全画面ズームのキー状態機械を 1 フレーム進める。Z (修飾なし) のホールド/離しを
@@ -14765,9 +14858,9 @@ impl App {
         let rising = z_press_event || (z_down && !self.fs_zoom_z_was_down);
         let falling = z_release_event || (!z_down && self.fs_zoom_z_was_down);
         if !self.fs_zoom_mode_context_ok(fs_idx) {
-            // コンテキスト外: ズーム解除し、エッジ状態もリセット
-            // (Z 押しっぱで対象外へ移った時の誤発火を防ぐ)。
-            self.fs_zoom_reset();
+            // 入力対象外では照準とエッジを畳む。Depth は確定済み2Dズームを
+            // 休止するだけで、ほかの対象外contextでは従来どおり解除する。
+            self.fs_zoom_reset_for_blocked_context();
             self.fs_zoom_z_was_down = z_down;
             self.show_continuous_reading_shortcut_noop(
                 ctx,
@@ -14886,7 +14979,7 @@ impl App {
             state.tex.clone(),
             state.original_preview_active,
         );
-        let active = self.fs_zoom_active;
+        let active = self.fs_zoom_mode_active();
         let pixel_grid = self.fs_pixel_grid_enabled;
         let tex_size = paint_resource
             .as_ref()
@@ -15078,7 +15171,7 @@ impl App {
     ///
     /// Z ズームと連結読みはそれぞれ専用制約を持つため、このクランプを適用しない。
     fn set_fs_pan_from_input(&mut self, proposed_zoom: f32, proposed_pan: egui::Vec2) {
-        self.fs_pan = if self.fs_zoom_mode_engaged() {
+        self.fs_pan = if self.fs_zoom_mode_effective() {
             proposed_pan
         } else {
             clamp_fullscreen_pan_from_layout(
@@ -15102,6 +15195,9 @@ impl App {
     ///
     /// 判定はここ 1 か所に集める。新しい入力を足すときは必ずこれを通すこと。
     pub(crate) fn fs_zoom_owner(&self) -> FsZoomOwner {
+        if self.fs_exclusive_view.is_depth() {
+            return FsZoomOwner::Depth;
+        }
         if self.fs_zoom_mode_engaged() {
             return FsZoomOwner::ZoomMode;
         }
@@ -15141,7 +15237,7 @@ impl App {
         {
             return false;
         }
-        let Some(pano) = self.panorama_state.as_mut() else {
+        let Some(pano) = self.panorama_state_mut() else {
             return false;
         };
         let Some(fov_y) = panorama_touch_zoom_fov(pano.fov_y, factor, pano.projection) else {
@@ -15164,7 +15260,7 @@ impl App {
         {
             return false;
         }
-        let Some(pano) = self.panorama_state.as_mut() else {
+        let Some(pano) = self.panorama_state_mut() else {
             return false;
         };
         let Some((yaw, pitch)) =
@@ -15184,6 +15280,9 @@ impl App {
         pivot: egui::Pos2,
         rect_center: egui::Pos2,
     ) -> bool {
+        if self.fs_exclusive_view.is_depth() {
+            return false;
+        }
         if !factor.is_finite() || factor <= 0.0 {
             return false;
         }
@@ -15223,6 +15322,7 @@ impl App {
         let owner = self.fs_zoom_owner();
         let changed = match owner {
             FsZoomOwner::ZoomMode => self.adjust_fs_zoom_factor(if zoom_in { 1.0 } else { -1.0 }),
+            FsZoomOwner::Depth => false,
             FsZoomOwner::Panorama => self.apply_panorama_touch_zoom(factor),
             FsZoomOwner::Image | FsZoomOwner::Analysis => {
                 self.apply_touch_zoom_factor_about_pivot(factor, egui::Pos2::ZERO, egui::Pos2::ZERO)
@@ -15232,7 +15332,7 @@ impl App {
             match owner {
                 FsZoomOwner::Image => self.maybe_rerender_pdf(self.fs_zoom),
                 FsZoomOwner::Analysis => self.maybe_rerender_pdf(self.analysis_zoom),
-                FsZoomOwner::ZoomMode | FsZoomOwner::Panorama => {}
+                FsZoomOwner::ZoomMode | FsZoomOwner::Panorama | FsZoomOwner::Depth => {}
             }
             ctx.request_repaint();
         }
@@ -15242,6 +15342,7 @@ impl App {
     /// ピンチ中の 2 本指平行移動を、いまの持ち主の pan へ流す。
     fn apply_touch_pan_delta(&mut self, delta: egui::Vec2, full_rect: egui::Rect) {
         match self.fs_zoom_owner() {
+            FsZoomOwner::Depth => {}
             FsZoomOwner::Panorama => {
                 self.apply_panorama_touch_pan(delta, full_rect.height());
             }
@@ -15278,7 +15379,7 @@ impl App {
         });
         self.retire_changed_drag_zoom(ctx);
         let owner = self.fs_zoom_owner();
-        if owner == FsZoomOwner::Panorama {
+        if matches!(owner, FsZoomOwner::Panorama | FsZoomOwner::Depth) {
             // Preserve the original middle-button consumption contract in 360.
             if self
                 .fs_middle_zoom_drag
@@ -15374,7 +15475,7 @@ impl App {
                 FsZoomOwner::Image => (self.fs_zoom, self.fs_pan),
                 FsZoomOwner::Analysis => (self.analysis_zoom, self.analysis_pan),
                 FsZoomOwner::ZoomMode => (self.fs_zoom_factor, egui::Vec2::ZERO),
-                FsZoomOwner::Panorama => (1.0, egui::Vec2::ZERO),
+                FsZoomOwner::Panorama | FsZoomOwner::Depth => (1.0, egui::Vec2::ZERO),
             };
             self.fs_middle_zoom_drag = Some(MiddleZoomDrag {
                 input,
@@ -15416,7 +15517,7 @@ impl App {
                             ctx.request_repaint();
                         }
                     }
-                    FsZoomOwner::Panorama => {}
+                    FsZoomOwner::Panorama | FsZoomOwner::Depth => {}
                 }
             }
         } else if released || !down {
@@ -15429,7 +15530,7 @@ impl App {
         let zoom = match drag.owner {
             FsZoomOwner::Image => self.fs_zoom,
             FsZoomOwner::Analysis => self.analysis_zoom,
-            FsZoomOwner::ZoomMode | FsZoomOwner::Panorama => return,
+            FsZoomOwner::ZoomMode | FsZoomOwner::Panorama | FsZoomOwner::Depth => return,
         };
         if (zoom - drag.start_zoom).abs() > f32::EPSILON {
             self.maybe_rerender_pdf(zoom);
@@ -15552,8 +15653,14 @@ impl App {
     }
 
     pub(crate) fn apply_gamepad_fullscreen_zoom(&mut self, amount: f32, dt: f32) -> bool {
+        if self
+            .fullscreen_idx
+            .is_some_and(|idx| self.fs_exclusive_view_active(idx).is_some())
+        {
+            return false;
+        }
         // ZipPla 風ズーム中は専用経路なので、ゲームパッドで不可視の fs_zoom を動かさない。
-        if self.analysis_mode || self.fs_zoom_mode_engaged() || amount.abs() < 0.01 || dt <= 0.0 {
+        if self.analysis_mode || self.fs_zoom_mode_effective() || amount.abs() < 0.01 || dt <= 0.0 {
             return false;
         }
         let old_zoom = self.fs_zoom;
@@ -15568,8 +15675,14 @@ impl App {
     }
 
     pub(crate) fn apply_gamepad_fullscreen_pan(&mut self, delta: egui::Vec2) -> bool {
+        if self
+            .fullscreen_idx
+            .is_some_and(|idx| self.fs_exclusive_view_active(idx).is_some())
+        {
+            return false;
+        }
         if self.analysis_mode
-            || self.fs_zoom_mode_engaged()
+            || self.fs_zoom_mode_effective()
             || delta.length_sq() <= f32::EPSILON
             || self.fs_zoom <= ZOOM_NEAR_ONE
         {
@@ -22121,9 +22234,9 @@ impl App {
         ctx: &egui::Context,
     ) -> Option<crate::similar_preview::SimilarPreviewSession> {
         let page_idx = self.fullscreen_idx?;
-        if self.is_panorama_mode_active(page_idx)
+        if self.fs_exclusive_view_active(page_idx).is_some()
             || self.analysis_mode
-            || self.fs_zoom_mode_engaged()
+            || self.fs_zoom_mode_effective()
             || self.is_overlay_edit_mode_active()
             || self.view_trim_mode
             || matches!(
@@ -24967,8 +25080,8 @@ impl App {
                 self.items.get(idx),
                 Some(GridItem::Video(_) | GridItem::Audio(_))
             ),
-            self.panorama_state.is_some(),
-            self.is_panorama_mode_active(idx),
+            self.panorama_state().is_some(),
+            self.fs_exclusive_view_active(idx).is_some(),
         );
         let rotation = fs_rotation_popup_open(ctx);
         let seek = fs_still_seek_strip_popup_open(ctx);
@@ -25024,13 +25137,13 @@ impl App {
                 export_crop_active: self.export_crop_mode,
                 view_trim_active: self.view_trim_mode,
                 analysis_active: self.analysis_mode,
-                panorama_active: self.is_panorama_mode_active(fs_idx),
+                panorama_active: self.fs_exclusive_view_active(fs_idx).is_some(),
                 compare_wipe_active: matches!(
                     self.compare_view_mode,
                     crate::app::CompareViewMode::Wipe { .. }
                 ),
                 overlay_edit_active: self.is_overlay_edit_mode_active(),
-                zoom_active: self.fs_zoom_mode_engaged(),
+                zoom_active: self.fs_zoom_mode_effective(),
             },
         )
     }
@@ -27273,6 +27386,7 @@ impl App {
             std::time::Instant::now,
             Self::thread_cycles_now,
         );
+        self.depth_view_may_continue(self.fullscreen_idx.unwrap_or(usize::MAX));
         let Some(fs_idx) = self.fullscreen_idx else {
             // in-window 静止画モードで PDF/ZIP enumerate defer 中:
             // grid (= 白 CentralPanel) が露出するのを防ぐため、メインウィンドウに
@@ -28004,7 +28118,7 @@ impl App {
                         // paint cannot cover this early presentation.
                         let root_overflow_frame = if self.fs_overflow_panel_state == FsOverflowPanelState::Root
                             && !state.is_video && !self.fs_music_view_active(fs_idx)
-                            && !self.is_panorama_mode_active(fs_idx)
+                            && !self.fs_exclusive_view_active(fs_idx).is_some()
                             && self.fullscreen_top_bar_chrome_allowed(fs_idx)
                         {
                             if let Some(wheel) = hud_popup_wheel.as_mut() {
@@ -28038,7 +28152,7 @@ impl App {
                         let pdf_fit_mode = self.pdf_display_fit_mode();
                         let pdf_analysis_active = self.analysis_mode
                             && !is_spread_double
-                            && !self.is_panorama_mode_active(paint_idx);
+                            && !self.fs_exclusive_view_active(paint_idx).is_some();
                         let pdf_media_rect = if pdf_analysis_active {
                             analysis_image_rect(full_rect)
                         } else {
@@ -28239,6 +28353,9 @@ impl App {
                             }
                         }
                         if overview_rendered { return; }
+                        // Paint foreground controls first so their current rectangle owns
+                        // pointer input and mouse-follow suppression on the first frame too.
+                        let depth_export_requested = self.draw_depth_panel(ctx, fs_idx);
                         let still_seek_geometry =
                             self.still_seek_geometry_for_idx(full_rect, fs_idx, state.is_video);
                         let resolved_fullscreen_media_rect = self.fullscreen_media_rect_with_geometry(
@@ -28379,7 +28496,7 @@ impl App {
                         );
                         // 360 度パノラマビューモード中は分析 / 補正 / 比較を抑止する
                         // (= 上バーの 360 / × / window のみ、機能制限モード)。
-                        let panorama_mode_active_now = self.is_panorama_mode_active(fs_idx);
+                        let panorama_mode_active_now = self.fs_exclusive_view_active(fs_idx).is_some();
                         // 画像領域を狭めた側と同じ答えを描画側にも渡す (§1.158)。
                         let info_panel_lock_effective =
                             self.still_info_panel_lock_effective_for_idx(fs_idx, state.is_video);
@@ -28546,7 +28663,7 @@ impl App {
                                         }
                                     } else if panorama_painted {
                                         navigator_texture_sources.submission = FsDisplayUnitSubmission::LegacyRendered;
-                                    } else if self.fs_zoom_mode_engaged()
+                                    } else if self.fs_zoom_mode_effective()
                                         && !state.is_video
                                         && !analysis_active
                                     {
@@ -28565,12 +28682,14 @@ impl App {
                                             );
                                     } else {
                                         let fs_rotation = self.get_rotation(paint_idx);
-                                        let zp = if analysis_active {
+                                        let zp = if self.fs_exclusive_view.is_depth() {
+                                            None
+                                        } else if analysis_active {
                                             Some((self.analysis_zoom, self.analysis_pan))
                                         } else {
                                             self.fs_zoom_pan()
                                         };
-                                        let free_rot = if analysis_active {
+                                        let free_rot = if self.fs_exclusive_view.is_depth() || analysis_active {
                                             0.0
                                         } else {
                                             self.fs_free_rotation
@@ -28585,8 +28704,9 @@ impl App {
                                         let continuous_reading_active =
                                             self.continuous_reading_active_for_idx(paint_idx);
                                         let pixels_per_point = ctx.pixels_per_point();
-                                        let fit_scale_limits =
-                                            self.fullscreen_fit_scale_limits(pixels_per_point);
+                                        let fit_scale_limits = if self.fs_exclusive_view.is_depth() {
+                                            FullscreenFitScaleLimits { pixels_per_point, ..Default::default() }
+                                        } else { self.fullscreen_fit_scale_limits(pixels_per_point) };
                                         if continuous_reading_active {
                                             navigator_texture_sources = self
                                                 .draw_fs_continuous_reading(
@@ -28631,7 +28751,7 @@ impl App {
                                                     self.fs_pixel_grid_enabled && !analysis_active;
                                                 // 余白カットフィット用 bbox (設定 OFF なら None)。
                                                 // bg_style が self を借用する前に算出しておく。
-                                                let fit_mode = if analysis_active {
+                                                let fit_mode = if self.fs_exclusive_view.is_depth() || analysis_active {
                                                     FullscreenFitMode::Page
                                                 } else {
                                                     self.effective_fullscreen_fit_mode()
@@ -28642,10 +28762,22 @@ impl App {
                                                     self.view_trim_single_content_bbox(paint_idx)
                                                 };
                                                 let crop = self.prepare_single_crop_from_frame_state(paint_idx, &state);
-                                                let paint_resource =
-                                                    self.fullscreen_paint_payload_for_page(
-                                                        paint_idx, state.tex.clone(), state.original_preview_active,
-                                                    );
+                                                let mut paint_resource = self.fullscreen_paint_payload_for_page(
+                                                    paint_idx, state.tex.clone(), state.original_preview_active,
+                                                );
+                                                if self.fs_exclusive_view.is_depth() {
+                                                    // The display's pass-through choice remains authoritative.
+                                                    // Never promote a navigation rendition to a depth source.
+                                                    let depth_material = if state.page_turn_decision.paint_source == FsPageTurnPaintSource::PassThrough {
+                                                        crate::depth_parallax::DepthSourceMaterial::NotYet(crate::depth_parallax::DepthSourceWait::PageTransition)
+                                                    } else {
+                                                        let (selected, material) = self.resolve_fs_processed_payload_and_depth(ctx, paint_idx, state.original_preview_active);
+                                                        paint_resource = selected;
+                                                        material
+                                                    };
+                                                    #[cfg(windows)]
+                                                    self.advance_depth_source(ctx, depth_material);
+                                                }
                                                 let bg_style = self.fs_bg_style(ctx);
                                                 #[cfg(all(windows, feature = "test-script"))]
                                                 let test_script_content_proof = paint_resource
@@ -29222,7 +29354,7 @@ impl App {
                             && !compare_wipe_active
                             && !panorama_mode_active_now
                             && self.reading_flow.is_paged()
-                            && !self.fs_zoom_mode_engaged()
+                            && !self.fs_zoom_mode_effective()
                         {
                             // ZipPla ズーム中 (照準含む) は表示トリムパネルも抑止する。
                             self.draw_view_trim_panel(ctx, full_rect, fs_idx, spread_pair);
@@ -29243,7 +29375,9 @@ impl App {
                                 still_seek_height,
                              overflow_pointer_input.clone(), );
                             side_panel_visible |= right_panel_visible;
-                        } else if panorama_mode_active_now {
+                        } else if self.fs_exclusive_view.is_depth() {
+                            // The depth panel was painted before canvas input.
+                        } else if self.is_panorama_mode_active(fs_idx) {
                             // 360 モード中はメタデータ / 補正 / 分析パネルを全て抑止
                             // (docs/panorama-360-view-plan.md フィードバック対応)。
                             // 上部ホバーバーの 360 / × / window だけが表示される。
@@ -29253,7 +29387,7 @@ impl App {
                             self.draw_pano_confirmation_banner(ui, ctx, full_rect, fs_idx);
                         } else if !compare_wipe_active
                             && !self.is_overlay_edit_mode_active()
-                            && !self.fs_zoom_mode_engaged()
+                            && !self.fs_zoom_mode_effective()
                         {
                             // ── メタデータパネル（通常ホバー or ClickToShow）──
                             // 消しゴム / 隠蔽加工モード中は自前パネルとの競合 + 編集集中度
@@ -29281,7 +29415,7 @@ impl App {
                                 panorama_active: panorama_mode_active_now,
                                 overlay_edit_active: self.is_overlay_edit_mode_active(),
                                 view_trim_active: self.view_trim_mode,
-                                zoom_active: self.fs_zoom_mode_engaged(),
+                                zoom_active: self.fs_zoom_mode_effective(),
                                 animated: self.fs_entry_is_animated(fs_idx),
                             });
                         let touch_chrome_latched = self.still_touch_chrome_is_latched(ctx);
@@ -29390,16 +29524,15 @@ impl App {
                             // 非対応画像でもボタンは disabled で常に表示する。
                             let panorama_trigger = self.detect_panorama(fs_idx);
                             let panorama_active =
-                                self.panorama_state.is_some() && panorama_trigger.is_some();
+                                self.panorama_state().is_some() && panorama_trigger.is_some();
                             // panorama_mode_active=true なら他のボタン (info / analysis /
                             // spread / 補正 / rotate / capture / VST / play / tile) は全て隠す。
-                            let panorama_mode_active = panorama_active;
+                            let panorama_mode_active = self.fs_exclusive_view_active(fs_idx).is_some();
                             let mut panorama_pressed = false;
                             // 投影方式は 360 セッションの state。OFF 中はボタン自体を
                             // 出さないので、値は既定でよい。
                             let panorama_projection = self
-                                .panorama_state
-                                .as_ref()
+                                .panorama_state()
                                 .map(|pano| pano.projection)
                                 .unwrap_or(self.settings.panorama_projection);
                             let mut panorama_projection_choice: Option<
@@ -29489,6 +29622,9 @@ impl App {
                             let pairing_availability = self.pairing_edit_availability();
                             let composition_spread_mode = self.composed_spread_mode();
                             let shift_view = self.spread_shift_hud_view();
+                            let depth_active = self.fs_exclusive_view.is_depth();
+                            let depth_allowed = self.depth_entry_allowed(fs_idx).is_ok();
+                            let mut depth_pressed = false;
                             Self::draw_fs_hover_bar(
                                 ui,
                                 ctx,
@@ -29561,7 +29697,8 @@ impl App {
                                 self.frame_counter,
                                 (!extracted_result).then_some(&shift_view),
                                 frame_close_response.take(),
-                            );
+                            Some((depth_active, depth_allowed, &mut depth_pressed)),
+);
                             if top_bar_lock_pressed {
                                 self.settings.fullscreen_top_bar_locked =
                                     !self.settings.fullscreen_top_bar_locked;
@@ -29619,6 +29756,9 @@ impl App {
                                 );
                             }
                             // 360 度パノラマビュー: トグル
+                            if depth_pressed {
+                                self.toggle_depth_parallax(ctx, fs_idx);
+                            }
                             if panorama_pressed {
                                 self.toggle_panorama_mode(fs_idx);
                             }
@@ -29725,6 +29865,11 @@ impl App {
                         // no panel, page, or gesture target should appear above its guide.
                         self.draw_still_touch_first_run_help_overlay(ui, ctx, full_rect, fs_idx);
 
+                        // Admit export after this pass has painted its actual source,
+                        // rotation, UV and geometry. The intent lasts only this frame.
+                        if depth_export_requested {
+                            self.open_depth_export(ctx, fs_idx);
+                        }
                         self.draw_viewer_shared_dialogs(ctx);
 
                         // The popup edits temporary fields during drawing. Restore the
@@ -29961,6 +30106,7 @@ impl App {
                 // 「DL ボタンを押しても何も起きない」状態になる (実機 FB 2026-06-06)。
                 // メイン update 側は fullscreen 中スキップするので二重描画にはならない。
                 self.show_editing_addon_dialog(ctx);
+                self.show_depth_addon_dialog(ctx);
 
                 // 編集内容貼り付けの全置換確認は、操作した fullscreen viewport 上に出す。
                 self.show_edit_bundle_paste_confirm_dialog(ctx);
@@ -30569,11 +30715,11 @@ impl App {
             Some("analysis_mode")
         } else if self.view_trim_mode {
             Some("view_trim_mode")
-        } else if self.fs_zoom_mode_engaged() {
+        } else if self.fs_zoom_mode_effective() {
             Some("zoom_mode")
         } else if !matches!(self.compare_view_mode, crate::app::CompareViewMode::Off) {
             Some("compare_mode")
-        } else if self.is_panorama_mode_active(fs_idx) {
+        } else if self.fs_exclusive_view_active(fs_idx).is_some() {
             Some("panorama_mode")
         } else {
             let observation = self.original_preview_frame_observation(ctx, fs_idx);
@@ -32041,7 +32187,7 @@ impl App {
                 .or_insert(required);
         }
         let single_z = self.fullscreen_page_layout.kind() == FullscreenPageLayoutKind::Single
-            && self.fs_zoom_mode_engaged();
+            && self.fs_zoom_mode_effective();
         let original_floor = (self.settings.fullscreen_fit_no_downscale && !single_z)
             || (continuous && self.effective_fullscreen_fit_mode() == FullscreenFitMode::Original);
         // A cover source can occur twice in continuous reading at different
@@ -33488,7 +33634,7 @@ impl App {
         let threshold = self.settings.fullscreen_cursor_hide_delay_secs;
         let next = next_fullscreen_cursor_hide_reason(
             self.cursor_hide_reason,
-            self.fs_zoom_aiming,
+            self.fs_zoom_mode_aiming(),
             cursor_active,
             clean,
             clean && idle >= threshold,
@@ -34354,7 +34500,8 @@ impl App {
         if self.compare_view_mode.is_overlay() {
             self.deactivate_compare_view();
             self.show_feedback_toast("[比較: Normal]".to_string());
-        } else if !self.is_panorama_mode_active(fs_idx) && self.close_click_side_panels() {
+        } else if self.fs_exclusive_view_active(fs_idx).is_none() && self.close_click_side_panels()
+        {
             // ClickToShow の明示オープンは Esc で先に閉じる。
             if adjustment_open_before_escape {
                 crate::ime_focus::record_side_panel_close(
@@ -34526,6 +34673,13 @@ impl App {
         let close_clicked = close_response
             .as_ref()
             .is_some_and(BarButtonResponse::clicked);
+        if close_clicked && self.fs_exclusive_view.is_depth() {
+            self.toggle_depth_parallax(ctx, fs_idx);
+            return PageTurnFrameEntry::Continue {
+                close_response,
+                committed: false,
+            };
+        }
         if close_clicked && self.is_panorama_mode_active(fs_idx) {
             self.toggle_panorama_mode(fs_idx);
             return PageTurnFrameEntry::Continue {
@@ -34792,7 +34946,8 @@ impl App {
         }
 
         // ZipPla 風全画面ズーム (Z ホールド) のエッジ検出。編集/分析/見開き/連結/パノラマ/動画では
-        // 無効化され、コンテキスト外なら状態をリセットする。編集モードの early-return より前に
+        // 無効化される。Depth は確定状態を保持し、ほかのコンテキスト外ではリセットする。
+        // 編集モードの early-return より前に
         // 毎フレーム呼び、Z 押しっぱで対象外へ移ったときに状態が残らないようにする。
         self.update_fs_zoom_mode_keys(ctx, fs_idx, input_permits.current_level);
 
@@ -35887,12 +36042,19 @@ impl App {
         let key_b_bg =
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsBgCycle);
         // 360 モード中は他モード切替系のキーを抑止 (= フィードバック反映の「機能制限モード」)。
-        // - 抑止対象: Z (分析) / S (スライドショー) / M (ルーペ) / B (bg cycle)
+        // - 抑止対象: Z (分析) / S (スライドショー) / M (ルーペ)
         //   / G (ピクセルグリッド) / I (メタデータ) / C 系 (比較)
+        //   / Shift+B (背景切替。360° だけで止め、3D では許可する)
         // - E / Ctrl+G / Ctrl+M / Ctrl+T は各編集モードの共通入口まで通し、
         //   そこで理由付き no-op にする。
         // - 抑止しない: V (= 360 を抜ける手段)、Esc / 矢印 / Wheel / F1-F5 / BS (= ナビ・レーティング)
-        let pano_active_now = self.is_panorama_mode_active(fs_idx);
+        if !is_video_fs
+            && !fs_music_view_active
+            && self.keymap.consume_action(ctx, KeyAction::FsDepthParallax)
+        {
+            self.toggle_depth_parallax(ctx, fs_idx);
+        }
+        let pano_active_now = self.fs_exclusive_view_active(fs_idx).is_some();
         // 描画・PageUp/Down・通常ナビと同じ正本を使う。reading_flow だけでは、比較等で
         // 実際には単ページ描画へフォールバック中なのに連結表示扱いする食い違いが起きる。
         let continuous_reading = self.continuous_reading_active_for_idx(fs_idx);
@@ -35903,9 +36065,10 @@ impl App {
         let key_s = key_s && !pano_active_now;
         let key_e = key_e_raw;
         let key_m = key_m && !pano_active_now;
-        let key_b_bg = key_b_bg && !pano_active_now;
+        // 透過部分の下地は3Dでも毎描画反映する。背景切替の抑止は360°固有。
+        let key_b_bg = key_b_bg && !self.is_panorama_mode_active(fs_idx);
         let key_g = key_g && !pano_active_now;
-        let key_i = key_i && !pano_active_now;
+        let key_i = key_i && (!pano_active_now || self.fs_exclusive_view.is_depth());
         let key_compare_x = key_compare_x && !pano_active_now;
         let key_compare_alt_c = key_compare_alt_c && !pano_active_now;
         let key_compare_shift_c = key_compare_shift_c && !pano_active_now;
@@ -36617,7 +36780,9 @@ impl App {
             return action;
         }
         // I / Tab は左右パネルの呼び出しモードを切り替える。
-        if key_i {
+        if key_i && self.fs_exclusive_view.is_depth() {
+            self.toggle_depth_panel();
+        } else if key_i {
             if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
                     ctx,
@@ -37318,6 +37483,9 @@ impl App {
         fs_idx: usize,
         captured_display_unit: bool,
     ) -> bool {
+        if self.fs_exclusive_view.is_depth() {
+            return false;
+        }
         let focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
         let hold_active =
             crate::keyboard_input::focused_key_state_permit(ctx).is_some_and(|permit| {
@@ -38042,7 +38210,7 @@ impl App {
         image_rect: egui::Rect,
         fs_idx: usize,
     ) -> Option<PanoramaNavigatorLayout> {
-        let pano = self.panorama_state.as_ref()?;
+        let pano = self.panorama_state()?;
         let (source_w, source_h) = self.source_dims_for_idx(fs_idx)?;
         build_panorama_navigator_layout(
             egui::vec2(source_w, source_h),
@@ -38059,7 +38227,7 @@ impl App {
         layout: &FlatNavigatorLayout,
         image_rect: egui::Rect,
     ) -> f32 {
-        if !self.fs_zoom_mode_engaged() {
+        if !self.fs_zoom_mode_effective() {
             return self.fs_zoom;
         }
         if let [page] = layout.pages.as_slice() {
@@ -38138,7 +38306,7 @@ impl App {
         layout: &FlatNavigatorLayout,
         image_rect: egui::Rect,
     ) -> bool {
-        if !self.fs_zoom_mode_engaged() {
+        if !self.fs_zoom_mode_effective() {
             return false;
         }
         self.fs_zoom = self.fs_navigator_current_manual_zoom(layout, image_rect);
@@ -38284,7 +38452,7 @@ impl App {
                     {
                         let current_uv = panorama_navigator_screen_to_uv(layout.content_rect, pos);
                         let delta_uv = current_uv - start_uv;
-                        if let Some(pano) = self.panorama_state.as_mut() {
+                        if let Some(pano) = self.panorama_state_mut() {
                             pano.yaw = panorama_navigator_wrap_yaw(
                                 start_yaw - delta_uv.x * std::f32::consts::TAU,
                             );
@@ -38335,8 +38503,7 @@ impl App {
                             );
                             let (yaw, pitch) = panorama_navigator_uv_to_yaw_pitch(uv);
                             let projection = self
-                                .panorama_state
-                                .as_ref()
+                                .panorama_state()
                                 .map(|pano| pano.projection)
                                 .unwrap_or_default();
                             let fov_y = panorama_navigator_fov_from_height(
@@ -38344,7 +38511,7 @@ impl App {
                                 layout.content_rect.height(),
                                 projection,
                             );
-                            if let Some(pano) = self.panorama_state.as_mut() {
+                            if let Some(pano) = self.panorama_state_mut() {
                                 pano.yaw = yaw;
                                 pano.pitch = pitch;
                                 pano.fov_y = fov_y;
@@ -38373,7 +38540,7 @@ impl App {
                     ) {
                         interaction = Some(PanoramaNavigatorInteraction::Header(action));
                     } else if layout.canvas_rect.contains(*pos)
-                        && let Some(pano) = self.panorama_state.as_ref()
+                        && let Some(pano) = self.panorama_state()
                     {
                         let pos = clamp_to_canvas(*pos);
                         interaction = Some(PanoramaNavigatorInteraction::Pan {
@@ -38402,7 +38569,7 @@ impl App {
                     {
                         let uv = panorama_navigator_screen_to_uv(layout.content_rect, click_pos);
                         let (yaw, pitch) = panorama_navigator_uv_to_yaw_pitch(uv);
-                        if let Some(pano) = self.panorama_state.as_mut() {
+                        if let Some(pano) = self.panorama_state_mut() {
                             pano.yaw = yaw;
                             pano.pitch = pitch;
                             pano.sanitize();
@@ -38722,7 +38889,7 @@ impl App {
                         ) {
                             interaction.gesture =
                                 FsNavigatorPointerGesture::AwaitingPan { start: pos };
-                        } else if self.fs_zoom_mode_engaged() {
+                        } else if self.fs_zoom_mode_effective() {
                             let current_view_pos = layout.visible_rect.center();
                             if let Some((page, source_pos)) =
                                 layout.nearest_page_at(current_view_pos)
@@ -39741,7 +39908,8 @@ impl App {
             crate::app::CompareViewMode::Wipe { .. }
         );
         let panel_fs_idx = self.fullscreen_idx;
-        let panorama_active = panel_fs_idx.is_some_and(|idx| self.is_panorama_mode_active(idx));
+        let panorama_active =
+            panel_fs_idx.is_some_and(|idx| self.fs_exclusive_view_active(idx).is_some());
         let music_view_active = panel_fs_idx.is_some_and(|idx| self.fs_music_view_active(idx));
         let side_panel_chrome_enabled =
             still_side_panel_chrome_enabled(StillSidePanelChromeInputs {
@@ -39752,7 +39920,7 @@ impl App {
                 panorama_active,
                 overlay_edit_active: self.is_overlay_edit_mode_active(),
                 view_trim_active: self.view_trim_mode,
-                zoom_active: self.fs_zoom_mode_engaged(),
+                zoom_active: self.fs_zoom_mode_effective(),
                 animated: panel_fs_idx.is_some_and(|idx| self.fs_entry_is_animated(idx)),
             });
         let passive_side_panel_hover_enabled =
@@ -39813,62 +39981,74 @@ impl App {
                     .hover_pos()
                     .is_some_and(|p| seek_panel_interactive && seek_panel_rect.contains(p))
             });
-        let cursor_in_panel = passive_hover_enabled
-            && !self.fs_zoom_mode_engaged()
-            && ctx.input(|i| {
-                i.pointer
-                    .hover_pos()
-                    .map(|p| {
-                        let in_side_panel = fullscreen_side_panel_contains_pointer_with_seek_height(
-                            full_rect,
-                            p,
-                            side_panel_chrome_enabled,
-                            self.settings.fullscreen_side_panel_mode,
-                            has_right_panel,
-                            self.adjustment_mode.is_open(),
-                            navigator_exclusion,
-                            seek_geometry.total_height,
-                        );
-                        let in_music_side_panel = music_side_panel_contains_pointer(
-                            full_rect,
-                            p,
-                            music_left_panel_visible,
-                            music_right_panel_visible,
-                        );
-                        let in_erase_panel =
-                            self.erase_mode && self.erase_panel_rect(full_rect).contains(p);
-                        let in_local_adjust_panel = self.local_adjust_mode
-                            && (self.local_adjust_panel_rect(full_rect).contains(p)
-                                || self.local_adjust_tool_panel_rect(full_rect).contains(p));
-                        let in_conceal_panel =
-                            self.conceal_mode && self.conceal_panel_rect(full_rect).contains(p);
-                        let in_export_crop_panel = self.export_crop_mode
-                            && self.export_crop_panel_rect(full_rect).contains(p);
-                        let in_sns_split_panel = self.sns_split.is_some()
-                            && self.sns_split_panel_rect(full_rect).contains(p);
-                        let in_view_trim_panel =
-                            self.view_trim_mode && self.view_trim_panel_rect(full_rect).contains(p);
-                        // テキスト注釈モードの左 (一覧) / 右 (詳細) パネル。一覧 ScrollArea を
-                        // ホイールでスクロールしたいので、パネル上のホイールはズームに使わない
-                        // (実機 FB 2026-06-07)。text mode では image_rect == full_rect なので
-                        // (analysis/vst3_compact 以外。1992 行) text_panel_rect(full_rect) が
-                        // 実際のパネル矩形と一致する。
-                        let in_text_panel = self.text_mode
-                            && (self.text_panel_rect(full_rect).contains(p)
-                                || self.text_detail_panel_rect(full_rect).contains(p));
-                        in_side_panel
-                            || in_music_side_panel
-                            || in_erase_panel
-                            || in_local_adjust_panel
-                            || in_conceal_panel
-                            || in_export_crop_panel
-                            || in_sns_split_panel
-                            || in_view_trim_panel
-                            || in_text_panel
-                            || cursor_in_seek_panel
+        let cursor_in_depth_panel = self.fs_exclusive_view.is_depth()
+            && matches!(&self.fs_exclusive_view, crate::fs_exclusive_view::FsExclusiveView::Depth(state) if state.panel_visible)
+            && ctx
+                .input(|input| input.pointer.hover_pos())
+                .is_some_and(|point| {
+                    ctx.data(|data| {
+                        data.get_temp::<egui::Rect>(egui::Id::unique("depth_panel_rect"))
                     })
-                    .unwrap_or(false)
-            });
+                    .is_some_and(|rect| rect.contains(point))
+                });
+        let cursor_in_panel = cursor_in_depth_panel
+            || passive_hover_enabled
+                && !self.fs_zoom_mode_effective()
+                && ctx.input(|i| {
+                    i.pointer
+                        .hover_pos()
+                        .map(|p| {
+                            let in_side_panel =
+                                fullscreen_side_panel_contains_pointer_with_seek_height(
+                                    full_rect,
+                                    p,
+                                    side_panel_chrome_enabled,
+                                    self.settings.fullscreen_side_panel_mode,
+                                    has_right_panel,
+                                    self.adjustment_mode.is_open(),
+                                    navigator_exclusion,
+                                    seek_geometry.total_height,
+                                );
+                            let in_music_side_panel = music_side_panel_contains_pointer(
+                                full_rect,
+                                p,
+                                music_left_panel_visible,
+                                music_right_panel_visible,
+                            );
+                            let in_erase_panel =
+                                self.erase_mode && self.erase_panel_rect(full_rect).contains(p);
+                            let in_local_adjust_panel = self.local_adjust_mode
+                                && (self.local_adjust_panel_rect(full_rect).contains(p)
+                                    || self.local_adjust_tool_panel_rect(full_rect).contains(p));
+                            let in_conceal_panel =
+                                self.conceal_mode && self.conceal_panel_rect(full_rect).contains(p);
+                            let in_export_crop_panel = self.export_crop_mode
+                                && self.export_crop_panel_rect(full_rect).contains(p);
+                            let in_sns_split_panel = self.sns_split.is_some()
+                                && self.sns_split_panel_rect(full_rect).contains(p);
+                            let in_view_trim_panel = self.view_trim_mode
+                                && self.view_trim_panel_rect(full_rect).contains(p);
+                            // テキスト注釈モードの左 (一覧) / 右 (詳細) パネル。一覧 ScrollArea を
+                            // ホイールでスクロールしたいので、パネル上のホイールはズームに使わない
+                            // (実機 FB 2026-06-07)。text mode では image_rect == full_rect なので
+                            // (analysis/vst3_compact 以外。1992 行) text_panel_rect(full_rect) が
+                            // 実際のパネル矩形と一致する。
+                            let in_text_panel = self.text_mode
+                                && (self.text_panel_rect(full_rect).contains(p)
+                                    || self.text_detail_panel_rect(full_rect).contains(p));
+                            in_side_panel
+                                || in_music_side_panel
+                                || in_erase_panel
+                                || in_local_adjust_panel
+                                || in_conceal_panel
+                                || in_export_crop_panel
+                                || in_sns_split_panel
+                                || in_view_trim_panel
+                                || in_text_panel
+                                || cursor_in_seek_panel
+                        })
+                        .unwrap_or(false)
+                });
 
         // Hover モードでは左端だけが左補正パネルを召喚する。右端は右情報パネル、
         // 上端は上バーの各経路へ委ねる。ClickToShow は呼び出しバーでのみ開閉する。
@@ -39917,7 +40097,7 @@ impl App {
             }
             self.persist_pending_view_trim_state();
             self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
-        } else if self.fs_zoom_mode_engaged() {
+        } else if self.fs_zoom_mode_effective() {
             // ZipPla ズーム中 (照準含む) は左端ホバーで補正パネルを開かない (パン操作の邪魔をしない)。
             if self.adjustment_mode.is_open() {
                 crate::ime_focus::record_side_panel_close(
@@ -40142,7 +40322,7 @@ impl App {
             compare_wipe_active,
             overlay_edit_active: self.is_overlay_edit_mode_active(),
             view_trim_active: self.view_trim_mode,
-            zoom_active: self.fs_zoom_mode_engaged(),
+            zoom_active: self.fs_zoom_mode_effective(),
         });
         // タップ判定を使わない面でも、ピンチだけは受け取る。上の driver 群と同じ値。
         let touch_tap_zones_enabled = touch_tap_zones;
@@ -40315,6 +40495,7 @@ impl App {
                     crate::touch_input::TouchCommand::Zoom { factor, pivot } => {
                         // 書き先は `fs_zoom_owner` が決める。ここで新しい分岐を足さない。
                         let applied = match self.fs_zoom_owner() {
+                            FsZoomOwner::Depth => false,
                             FsZoomOwner::Panorama => self.apply_panorama_touch_zoom(factor),
                             _ => {
                                 let rect = self.fs_zoom_pivot_rect(full_rect, default_image_rect);
@@ -40334,7 +40515,12 @@ impl App {
                         ctx.request_repaint();
                     }
                     crate::touch_input::TouchCommand::PinchEnd => {
-                        self.maybe_rerender_pdf(self.fs_zoom);
+                        if !matches!(
+                            self.fs_zoom_owner(),
+                            FsZoomOwner::Depth | FsZoomOwner::Panorama
+                        ) {
+                            self.maybe_rerender_pdf(self.fs_zoom);
+                        }
                     }
                     // Grid-only commands cannot be produced by this viewer
                     // surface profile.
@@ -40605,8 +40791,8 @@ impl App {
                             || self.panorama_projection_popup_open,
                         suppress_egui_wheel,
                         handle_wheel_here,
-                        self.fs_zoom_aiming,
-                        self.fs_zoom_active,
+                        self.fs_zoom_mode_aiming(),
+                        self.fs_zoom_mode_active(),
                         self.is_overlay_edit_mode_active(),
                         continuous_active,
                         self.frame_counter
@@ -40706,9 +40892,12 @@ impl App {
     }
 
     fn fs_wheel_action_requests_navigation(&self, action: &FsWheelAction) -> bool {
+        if self.fs_exclusive_view.is_depth() {
+            return !action.input.modifiers.ctrl;
+        }
         let ctrl = action.input.modifiers.ctrl;
-        if self.fs_zoom_aiming
-            || (self.fs_zoom_active && ctrl)
+        if self.fs_zoom_mode_aiming()
+            || (self.fs_zoom_mode_active() && ctrl)
             || self.analysis_mode
             || self
                 .fullscreen_idx
@@ -40720,7 +40909,7 @@ impl App {
         {
             return false;
         }
-        if self.fs_zoom_active {
+        if self.fs_zoom_mode_active() {
             return true;
         }
         if should_zoom_fullscreen_wheel(ctrl, self.is_overlay_edit_mode_active()) {
@@ -40864,6 +41053,9 @@ impl App {
             let wheel_y = wheel.delta.y;
             let modifiers = wheel.modifiers;
             let ctrl_held = modifiers.ctrl;
+            if self.fs_exclusive_view.is_depth() && ctrl_held {
+                continue;
+            }
             if ctrl_held
                 && self
                     .fullscreen_idx
@@ -40894,12 +41086,12 @@ impl App {
                 })
                 .unwrap_or(default_image_rect);
             let mut wheel_navigation = FsPageNav::None;
-            if self.fs_zoom_aiming || (self.fs_zoom_active && ctrl_held) {
+            if self.fs_zoom_mode_aiming() || (self.fs_zoom_mode_active() && ctrl_held) {
                 // ZipPla 準拠: 照準中 (Z 押下中) はホイールで枠サイズ=倍率。ズーム確定後は
                 // Ctrl+ホイールのときだけ倍率変更。
                 crate::modifier_probe::record_modified_action(ctx, "FsWheelZoom", "zoom_mode");
                 self.adjust_fs_zoom_factor(wheel_y);
-            } else if self.fs_zoom_active {
+            } else if self.fs_zoom_mode_active() {
                 // ZipPla 準拠: ズーム確定中の修飾なしホイールは通常どおり前後ページ移動。
                 let base = if wheel_y < 0.0 { 1 } else { -1 };
                 wheel_navigation = self.spread_page_nav(base);
@@ -41039,6 +41231,8 @@ impl App {
                 self.maybe_rerender_pdf(1.0);
             }
             // 右クリックは analysis_panel 側で処理
+        } else if self.fs_exclusive_view.is_depth() {
+            // Depth owns the fitted canvas; stored 2D transforms are untouched.
         } else if self.handle_panorama_drag_if_active(
             ctx,
             full_rect,
@@ -41129,28 +41323,28 @@ impl App {
                 self.fs_pan_drag_start = None;
                 self.fs_rotation_drag_start = None;
             }
-
-            // ダブルクリック → ズーム/パン/回転リセット
-            match canvas_click {
-                FsCanvasClickAction::None => {}
-                FsCanvasClickAction::ResetTransform => {
-                    self.fs_zoom = 1.0;
-                    self.fs_pan = egui::Vec2::ZERO;
-                    self.fs_free_rotation = 0.0;
-                    self.maybe_rerender_pdf(1.0);
+        }
+        // Click navigation is independent of transform ownership. Depth keeps
+        // its saved 2D transform suspended while accepting ordinary page clicks.
+        match canvas_click {
+            FsCanvasClickAction::None => {}
+            FsCanvasClickAction::ResetTransform => {
+                self.fs_zoom = 1.0;
+                self.fs_pan = egui::Vec2::ZERO;
+                self.fs_free_rotation = 0.0;
+                self.maybe_rerender_pdf(1.0);
+            }
+            FsCanvasClickAction::ToggleVideo(idx) => {
+                if let Some(player) = self.fs_video_player(idx) {
+                    player.toggle_play();
                 }
-                FsCanvasClickAction::ToggleVideo(idx) => {
-                    if let Some(player) = self.fs_video_player(idx) {
-                        player.toggle_play();
-                    }
-                }
-                FsCanvasClickAction::DismissOverflow => {
-                    self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
-                }
-                FsCanvasClickAction::PageSide(base) => {
-                    page_nav = self.spread_page_nav(base);
-                    *navigation_operation = input.pointer_navigation_operation;
-                }
+            }
+            FsCanvasClickAction::DismissOverflow => {
+                self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+            }
+            FsCanvasClickAction::PageSide(base) => {
+                page_nav = self.spread_page_nav(base);
+                *navigation_operation = input.pointer_navigation_operation;
             }
         }
         // 分析モード中は右クリックを色固定に使うため、終了トリガーにしない
@@ -41205,11 +41399,11 @@ impl App {
     ) -> (f32, egui::Vec2) {
         let mut zoom = self.fs_zoom;
         let mut pan = self.fs_pan;
-        let ordinary_zoom = !self.fs_zoom_mode_engaged()
+        let ordinary_zoom = !self.fs_zoom_mode_effective()
             && !self.analysis_mode
             && !self
                 .fullscreen_idx
-                .is_some_and(|idx| self.is_panorama_mode_active(idx));
+                .is_some_and(|idx| self.fs_exclusive_view_active(idx).is_some());
         if ordinary_zoom {
             let mouse = ctx.input(|input| input.pointer.hover_pos());
             for action in actions {
@@ -41261,13 +41455,20 @@ impl App {
         {
             return FsCanvasClickAction::None;
         }
+        // Depth suspends the saved 2D transform. Classify clicks on its fitted
+        // canvas, and never reset the suspended transform on a double-click.
+        let (zoom, pan, rotation) = if self.fs_exclusive_view.is_depth() {
+            (1.0, egui::Vec2::ZERO, 0.0)
+        } else {
+            (zoom, pan, self.fs_free_rotation)
+        };
         let has_transform = zoom_differs_from_fit(zoom)
-            || self.fs_free_rotation.abs() > TRANSFORM_EPSILON
+            || rotation.abs() > TRANSFORM_EPSILON
             || pan.length_sq() > PAN_EPSILON_SQ;
         if self.fs_front_pointer.backing_double_clicked(response) && has_transform {
             return FsCanvasClickAction::ResetTransform;
         }
-        if fullscreen_click_belongs_to_view(zoom, self.fs_free_rotation)
+        if fullscreen_click_belongs_to_view(zoom, rotation)
             || self.fs_context_menu_idx.is_some()
             || (response.dragged() && response.drag_delta().length() > 3.0)
             || !response.clicked()
@@ -43000,7 +43201,11 @@ impl App {
     /// false の場合は既存の no-op 案内と同じ単一 state を更新するため、キーリピートや
     /// 非同期 continuation が重なっても通知を積み上げない。
     pub(crate) fn fullscreen_edit_mode_entry_allowed(&mut self, fs_idx: usize) -> bool {
-        if !self.is_panorama_mode_active(fs_idx) {
+        if self.fs_exclusive_view.is_depth() {
+            self.show_feedback_toast("3D 写真を終了してから編集してください".to_owned());
+            return false;
+        }
+        if !self.fs_exclusive_view_active(fs_idx).is_some() {
             return true;
         }
         self.set_fullscreen_nav_noop(FsNavNoOpReason::PanoramaEditUnavailable);
@@ -43154,6 +43359,11 @@ impl App {
         operation: Option<ViewerOperationId>,
         fs_render_perf: &mut Option<FsRenderPerfRecorder>,
     ) {
+        // Own manual navigation and slideshow timers at their common boundary.
+        // OS close still reaches teardown and cancels only the owning export.
+        if self.depth_export_dialog_open() && !close_fs {
+            return;
+        }
         if self.viewer_mutation_modal_active() {
             return;
         }
@@ -44391,6 +44601,24 @@ impl App {
                     fit_mode,
                     fit_scale_limits,
                 ));
+            if matches!(layout_source, FsPageLayoutSource::CurrentItem)
+                && self.depth_view_may_continue(page_idx)
+                && self.try_paint_depth(&painter, ui.ctx(), resource, &transform, bg_style)
+            {
+                if let Some(submitted) = submitted {
+                    submitted.pages.clear();
+                    // The shader still presents this source as one page. Keep the
+                    // trace paired with the returned Single layout, even though
+                    // the exclusive owner disables navigator and paper-turn input.
+                    submitted.pages.push(FsNavigatorTextureSource {
+                        occurrence: SpreadPageOccurrence::navigation(page_idx, page_idx),
+                        resource: resource.clone(),
+                        provenance: FsDisplayUnitPageProvenance::Live,
+                    });
+                    submitted.submission = FsDisplayUnitSubmission::LegacyRendered;
+                }
+                return Some(transform);
+            }
             let white = white_companion_override
                 .or_else(|| white_companion_rect(&transform).map(|rect| (rect, full_rect)));
             let Some(paint_resource) = self.prepare_fs_paged_paint_payload(
@@ -45199,6 +45427,11 @@ impl App {
     }
 
     pub(crate) fn cycle_fullscreen_fit_mode(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.fs_exclusive_view_active(fs_idx)
+            == Some(crate::fs_exclusive_view::ExclusiveViewKind::Depth)
+        {
+            return;
+        }
         // The key, ring, gesture and mouse buttons share the same image-only operation.
         // A stale image-context command must not change the next image's fit during media playback.
         if !self.continuous_reading_supported_idx(fs_idx)
@@ -48499,7 +48732,7 @@ impl App {
             return false;
         }
         let viewport_h = full_rect.height().max(1.0);
-        if let Some(pano) = self.panorama_state.as_mut() {
+        if let Some(pano) = self.panorama_state_mut() {
             // 左ドラッグ → yaw/pitch (「掴んで引っ張る」感覚、Google Street View 流)。
             // 画像がドラッグ方向と同じ向きに動くようにする。
             //
@@ -48553,7 +48786,7 @@ impl App {
         if !self.is_panorama_mode_active(fs_idx) {
             return false;
         }
-        if let Some(pano) = self.panorama_state.as_mut() {
+        if let Some(pano) = self.panorama_state_mut() {
             if pano.apply_wheel_delta(wheel_y) {
                 ctx.request_repaint();
             }
@@ -48599,7 +48832,7 @@ impl App {
         if !uploaded_ready {
             return false;
         }
-        let Some(pano) = self.panorama_state.as_ref() else {
+        let Some(pano) = self.panorama_state() else {
             return false;
         };
         let aspect = if image_rect.height() > 0.0 {
@@ -49697,7 +49930,7 @@ impl App {
         full_rect: egui::Rect,
         fs_idx: usize,
     ) {
-        if self.is_panorama_mode_active(fs_idx) {
+        if self.fs_exclusive_view_active(fs_idx).is_some() {
             return;
         }
         if fs_loupe_suppressed_by_edit_mode(
@@ -50336,7 +50569,7 @@ impl App {
                 [content_left, content_right],
                 fit_mode,
                 fit_scale_limits,
-                self.fs_zoom_mode_engaged(),
+                self.fs_zoom_mode_effective(),
             ));
         let left_allow_thumbnail = display_override.is_none()
             && !settling_with_renditions
@@ -50382,7 +50615,7 @@ impl App {
             // Height matching now depends only on fit mode, so the geometry is final before the
             // ZipPla solve. The old result-dependent geometry feedback loop is structurally gone,
             // and zoom needs to be resolved only once.
-            let zip_input = if self.fs_zoom_mode_engaged() {
+            let zip_input = if self.fs_zoom_mode_effective() {
                 let top_m = TOP_BAR_HOVER_Y.min(image_rect.height() * 0.25);
                 let bottom_m = (seek_geometry.total_height + 8.0).min(image_rect.height() * 0.25);
                 let pan_band = egui::Rect::from_min_max(
@@ -50405,7 +50638,7 @@ impl App {
                     spread_gap,
                     fit_scale,
                     self.fs_zoom_factor,
-                    self.fs_zoom_active,
+                    self.fs_zoom_mode_active(),
                 )
             });
             if let Some(result) = zip_result {
@@ -50422,7 +50655,7 @@ impl App {
             let center = base_center - geometry.content_center_offset * total_scale;
             let resolved_placement = if zip_input.is_some() {
                 ResolvedDisplayPlacement::Z {
-                    active: self.fs_zoom_active,
+                    active: self.fs_zoom_mode_active(),
                     factor: self.fs_zoom_factor,
                     zoom_pan: resolved_zoom_pan,
                     singleton_side: SingletonSpreadPlacement::Center,
@@ -50437,7 +50670,7 @@ impl App {
             // ZipPla ズーム確定中は gap も合成ページと同率 (total_scale / fit_scale = zoom) で拡大し、
             // composite に含めた gap_page と整合させる (Codex P3: 照準枠 ↔ 確定の表示範囲を一致)。
             // 通常表示・照準・手動 Ctrl+ホイールズームでは従来どおり一定の gap を使う。
-            let effective_gap = if self.fs_zoom_active && self.fs_zoom_mode_engaged() {
+            let effective_gap = if self.fs_zoom_mode_active() {
                 spread_gap * (total_scale / fit_scale.max(f32::EPSILON))
             } else {
                 spread_gap
@@ -51205,6 +51438,7 @@ impl App {
         touch_target_frame: u64,
         shift_view: Option<&SpreadShiftHudView>,
         pre_resolved_close: Option<BarButtonResponse>,
+        mut depth_controls: Option<(bool, bool, &mut bool)>,
     ) {
         let menu_eligibility =
             FsTopMenuEligibility::new(is_video, panorama_active, panorama_mode_active);
@@ -51299,14 +51533,23 @@ impl App {
                 |p, c, r| draw_close_icon(p, c, r),
             )
         };
-        let close_tooltip = if panorama_active {
+        let depth_active = depth_controls
+            .as_ref()
+            .is_some_and(|(active, _, _)| *active);
+        let close_tooltip = if depth_active {
+            "3D 写真を終了 (フルスクリーンを閉じるには Esc)"
+        } else if panorama_active {
             "360° モードを抜ける (フルスクリーンを閉じるには Esc)"
         } else {
             "閉じる [Esc]"
         };
         let close_resp = close_resp.hover_tip_dark(close_tooltip);
         if close_resp.clicked() {
-            if panorama_active {
+            if depth_active {
+                if let Some((_, _, pressed)) = depth_controls.as_mut() {
+                    **pressed = true;
+                }
+            } else if panorama_active {
                 // 360 モード中は × → 360 解除 (toggle_panorama_mode が OFF 経路に入る)。
                 *panorama_pressed = true;
             } else {
@@ -51786,12 +52029,13 @@ impl App {
                 }
             };
             // 入れるかの判断は V キー / 復帰と同じ関数が持つ。理由文は上の分岐が選ぶ。
-            let is_enabled = crate::panorama::entry_allowed(
-                panorama_trigger,
-                is_video,
-                *reading_flow,
-                is_spread_double,
-            );
+            let is_enabled = !depth_active
+                && crate::panorama::entry_allowed(
+                    panorama_trigger,
+                    is_video,
+                    *reading_flow,
+                    is_spread_double,
+                );
             let pano_resp = draw_bar_button(
                 ui,
                 next_x,
@@ -51826,6 +52070,42 @@ impl App {
 
         // 📖 表示モードボタン (画像のみ。動画では非表示)
         // 360 モード中も非表示 (360 は強制 Single)。
+        if let Some((active, allowed, pressed)) = depth_controls.as_mut() {
+            let response = draw_bar_button(
+                ui,
+                next_x,
+                bar_rect.min.y + BAR_BUTTON_MARGIN,
+                "fs_depth_parallax_btn",
+                |hovered| bar_button_bg(hovered && *allowed, *active),
+                *active,
+                |painter, center, _| {
+                    painter.text(
+                        center,
+                        egui::Align2::CENTER_CENTER,
+                        "3D",
+                        egui::FontId::proportional(14.0),
+                        if *allowed || *active {
+                            egui::Color32::WHITE
+                        } else {
+                            egui::Color32::from_gray(90)
+                        },
+                    );
+                },
+            );
+            let shortcut = keymap.chord_labels(KeyAction::FsDepthParallax).join(" / ");
+            let response = response.hover_tip_dark(if shortcut.is_empty() {
+                "3D 写真".to_owned()
+            } else {
+                format!("3D 写真 [{shortcut}]")
+            });
+            if response.clicked() && (*allowed || *active) {
+                **pressed = true;
+            }
+            if response.hovered() {
+                *page_nav = FsPageNav::None;
+            }
+            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+        }
         let spread_active = spread_mode.is_spread() || !reading_flow.is_paged();
         let sm = *spread_mode;
         let mut spread_resp_rect = egui::Rect::NOTHING;
@@ -53494,6 +53774,7 @@ impl App {
         // ジョブ寿命に連動した専用ステータスも描く。トーストが無いフレームでも必要。
         self.draw_erase_inpaint_progress(ui, full_rect, ctx, drawing_surface);
         self.draw_animation_expansion_progress(ui, full_rect, ctx, drawing_surface);
+        self.draw_depth_wait_indicator(ui, full_rect, ctx, drawing_surface);
 
         let Some((ref text, start_time, duration)) = self.fs_feedback_toast else {
             return;
@@ -53587,6 +53868,72 @@ impl App {
 
         // フェードアウト中は 30fps で再描画
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
+    }
+
+    /// A visual hint for the existing pending Depth owner, independent of its panel.
+    pub(crate) fn draw_depth_wait_indicator(
+        &self,
+        ui: &egui::Ui,
+        full_rect: egui::Rect,
+        ctx: &egui::Context,
+        drawing_surface: crate::app::ActionSurface,
+    ) {
+        if drawing_surface != crate::app::ActionSurface::Viewer
+            || !self.window_visible
+            || ctx.input(|input| input.viewport().minimized == Some(true))
+        {
+            return;
+        }
+        let Some(status) = self.depth_wait_status() else {
+            return;
+        };
+        let crate::fs_exclusive_view::FsExclusiveView::Depth(state) = &self.fs_exclusive_view
+        else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let elapsed = now
+            .checked_duration_since(state.wait_started_at)
+            .unwrap_or_default();
+        if !status.visible_at(state.wait_started_at, now) {
+            // A single delayed wake owns the flicker gate even for a quiet NotYet
+            // source. This does not poll the request or animate a hidden bar.
+            ctx.request_repaint_after(
+                std::time::Duration::from_millis(150).saturating_sub(elapsed),
+            );
+            return;
+        }
+        let image_region = self
+            .fullscreen_page_layout
+            .single_page()
+            .map_or(full_rect, |page| page.transform.viewport_rect);
+        let mut available = image_region.intersect(full_rect).shrink(8.0);
+        // Reserve hover chrome as well as locked chrome; page info lives at the
+        // bottom and must not compete with the waiting message on small screens.
+        available.min.y = available.min.y.max(full_rect.top() + 160.0);
+        available.max.y = available.max.y.min(full_rect.bottom() - 48.0);
+        if state.panel_visible
+            && let Some(panel) =
+                ctx.data(|data| data.get_temp::<egui::Rect>(egui::Id::unique("depth_panel_rect")))
+            && panel.intersects(available)
+        {
+            available.max.x = available.max.x.min(panel.left() - 12.0);
+        }
+        let cancel = self
+            .keymap
+            .first_chord_label(KeyAction::FsDepthParallax)
+            .map(|label| format!("{label} で取り消し"));
+        if crate::ui_depth_wait::paint_depth_wait_indicator(
+            ui,
+            available,
+            status.overlay_text(),
+            cancel.as_deref(),
+            elapsed,
+        )
+        .is_some()
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        }
     }
 
     /// 現ページの全フレーム展開中に、初回 decode / 先読み後の昇格を問わず出すステータス。
@@ -64562,6 +64909,7 @@ mod tests {
                                 1,
                                 None,
                                 None,
+                                None,
                             );
                             positions = test_current_bar_button_targets(ctx)
                                 .into_iter()
@@ -64799,6 +65147,7 @@ mod tests {
                                 None,
                                 false,
                                 1,
+                                None,
                                 None,
                                 None,
                             );
@@ -70549,11 +70898,11 @@ mod tests {
         app.analysis_zoom = 3.0;
         app.analysis_pan = egui::vec2(30.0, 40.0);
         let unchanged = (app.fs_zoom, app.fs_pan, app.analysis_zoom, app.analysis_pan);
-        let fov = app.panorama_state.as_ref().unwrap().fov_y;
+        let fov = app.panorama_state().unwrap().fov_y;
         assert!(app.apply_fs_key_zoom_step(&ctx, true));
-        assert!((app.panorama_state.as_ref().unwrap().fov_y - fov / 1.25).abs() < 1e-6);
+        assert!((app.panorama_state().unwrap().fov_y - fov / 1.25).abs() < 1e-6);
         assert!(app.apply_fs_key_zoom_step(&ctx, false));
-        assert!((app.panorama_state.as_ref().unwrap().fov_y - fov).abs() < 1e-6);
+        assert!((app.panorama_state().unwrap().fov_y - fov).abs() < 1e-6);
         // Repeated steps eventually reach each projection's existing FOV clamp.
         for zoom_in in [true, false] {
             for _ in 0..100 {
@@ -70565,7 +70914,10 @@ mod tests {
             (app.fs_zoom, app.fs_pan, app.analysis_zoom, app.analysis_pan),
             unchanged
         );
-        app.panorama_state = None;
+        app.set_fs_exclusive_view(
+            crate::fs_exclusive_view::FsExclusiveView::None,
+            "panorama_off",
+        );
         for aiming in [true, false] {
             app.fs_zoom_aiming = aiming;
             app.fs_zoom_active = !aiming;
@@ -71359,7 +71711,11 @@ mod tests {
             ] {
                 let ctx = egui::Context::default();
                 let (mut app, _, _) = setup_panorama_navigator_input_test(&ctx);
-                let panorama = app.panorama_state.take().unwrap();
+                let panorama = app.panorama_state().cloned().unwrap();
+                app.set_fs_exclusive_view(
+                    crate::fs_exclusive_view::FsExclusiveView::None,
+                    "test_take_panorama",
+                );
                 let pivot = egui::pos2(300.0, 200.0);
                 let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
                 let button = if input == ZoomDragInput::Middle {
@@ -71401,7 +71757,10 @@ mod tests {
                     .drop_without_applying_deltas();
                 match next {
                     FsZoomOwner::ZoomMode => app.fs_zoom_active = true,
-                    FsZoomOwner::Panorama => app.panorama_state = Some(panorama),
+                    FsZoomOwner::Panorama => app.set_fs_exclusive_view(
+                        crate::fs_exclusive_view::FsExclusiveView::Panorama(panorama),
+                        "panorama_on",
+                    ),
                     FsZoomOwner::Analysis => app.analysis_mode = true,
                     _ => unreachable!(),
                 }
@@ -71473,7 +71832,10 @@ mod tests {
             let ctx = egui::Context::default();
             let (mut app, _, _) = setup_panorama_navigator_input_test(&ctx);
             if owner != FsZoomOwner::Panorama {
-                app.panorama_state = None;
+                app.set_fs_exclusive_view(
+                    crate::fs_exclusive_view::FsExclusiveView::None,
+                    "panorama_off",
+                );
             }
             app.analysis_mode = owner == FsZoomOwner::Analysis;
             app.fs_zoom_active = owner == FsZoomOwner::ZoomMode;
@@ -71527,10 +71889,13 @@ mod tests {
                     FsZoomOwner::Analysis => app.analysis_zoom,
                     FsZoomOwner::ZoomMode => app.fs_zoom_factor,
                     FsZoomOwner::Panorama => 2.0,
+                    FsZoomOwner::Depth => {
+                        unreachable!("depth inputs have separate blocked-owner coverage")
+                    }
                 };
                 assert_eq!(
                     actual,
-                    if owner == FsZoomOwner::Panorama {
+                    if matches!(owner, FsZoomOwner::Panorama | FsZoomOwner::Depth) {
                         2.0
                     } else {
                         zoom
@@ -72117,11 +72482,16 @@ mod tests {
                 animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
-        app.panorama_state = Some(crate::panorama::PanoramaState::new(
-            0.0,
-            0.0,
-            crate::panorama::PanoProjection::Perspective,
-        ));
+        app.set_fs_exclusive_view(
+            crate::fs_exclusive_view::FsExclusiveView::Panorama(
+                crate::panorama::PanoramaState::new(
+                    0.0,
+                    0.0,
+                    crate::panorama::PanoProjection::Perspective,
+                ),
+            ),
+            "panorama_on",
+        );
         assert!(app.is_panorama_mode_active(fs_idx));
         (app, image_rect, fs_idx)
     }
@@ -75813,7 +76183,7 @@ mod tests {
                 0.0,
             ),
         ));
-        let pano = app.panorama_state.as_ref().unwrap();
+        let pano = app.panorama_state().unwrap();
         assert!((pano.yaw - expected_yaw).abs() < 1.0e-4);
         assert!((pano.pitch - expected_pitch).abs() < 1.0e-4);
         assert!(!app.fullscreen_navigator_interaction.is_active());
@@ -92061,6 +92431,7 @@ mod specified_scale_consumer_tests {
                             None,
                             false,
                             1,
+                            None,
                             None,
                             None,
                         );

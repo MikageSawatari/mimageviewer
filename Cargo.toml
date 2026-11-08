@@ -445,6 +445,7 @@ base64 = "0.22"
 # API 24 matches bundled DirectML 1.24.4 and TensorRT pack GPU 1.24.2; rc.15 defaults to API 31.
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "tracing", "api-24", "directml", "cuda", "tensorrt", "load-dynamic"] }
 ndarray = "0.17"
+half = "2.7"
 # mXD (mxdownloader) が埋め込む X/Twitter メタデータは XMP RDF パケットとして
 # JPEG APP1 / PNG iTXt に入っている。quick-xml で xtw:* 名前空間だけ拾う。
 quick-xml = "0.41"

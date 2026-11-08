@@ -159,3 +159,9 @@ eframe / egui は Emil Ernerfeldt および contributors により
 [MIT](vendor/egui-wgpu/LICENSE-MIT) / [Apache-2.0](vendor/egui-wgpu/LICENSE-APACHE) を参照してください。
 
 RAR 展開には RARLAB UnRAR source code を利用します。UnRAR のライセンス全文は [UNRAR-LICENSE.txt](UNRAR-LICENSE.txt) を参照してください。
+
+3D 写真の追加モデルは Depth Anything 3（DA3 Mono-Large、Apache-2.0）の派生物です。
+重みと内部計算を fp16 化し、入力を 1 枚・504 × 504 px に固定しています（再学習なし）。
+モデルと一緒に取得する LICENSE と NOTICE は、環境設定の「3D 写真の追加モデル」から
+保存先フォルダを開いて確認できます。配布物の生成と変更通知は
+[モデル作成スクリプト](tools/depth_model/build_depth_addon.py) を参照してください。

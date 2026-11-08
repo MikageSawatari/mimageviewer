@@ -24,6 +24,16 @@ overlayの段階名と経過時間は常時timelineのmemory snapshotを使う�
 
 ---
 
+## 3D 写真の書き出し（2026-11-07、段 C）
+
+設定画面と進行画面は単一モーダル操作。UI は resident texture の Arc・表示幾何・設定を
+凍結し、既存 core と同じ OS 保存ダイアログで出力先を選ぶ。保存ダイアログ以外の待機は
+UI へ持ち込まない。オフスクリーン GPU 描画・同期読み戻し・GIF/APNG/H.264 encode・
+mux・ファイル公開は `depth-export` worker に置き、画面用 uniform は共有しない。
+進行と終端は worker が repaint を通知し、UI の常時 poll / timer / 待機は不要。
+モーダル中は3D自動運動の連続 repaint も停止する。取消は atomic flag、UI では join しない。
+実機での画質・所要時間・保存ダイアログの操作感は自動テストとは別に確認する。
+
 ## 1. 原則: UI スレッドで避けるべき処理
 
 `App::update` から直接 (あるいは呼び出し先から同期的に) 呼ばれるコードで、以下はすべて
@@ -432,6 +442,20 @@ constructor単体・headless測定であり実アプリの最大frameを示さ�
 実機確認待ち。詳しい条件・全結果は設計書§8.2へ残し、旧方式の結果をR10の受入証拠に流用しない。
 
 ## 3. GPU テクスチャアップロード
+
+3D 写真（段 B、2026-11-07、実装・独立レビュー中）は元画像全量を CPU へ戻さない。
+表示 source を GPU で blit / mip生成し、504×504と長辺最大1536のガイドだけを
+bounded readbackする。UI は `map_async` と `PollType::Poll` / 非blocking receiverだけを使い、
+待機・decode・推論・ファイルI/Oを加えない。readback完了後の bounded画素コピーと、
+worker結果の小さい `R16Float` uploadだけをUIで行い、深度mapの採用・uploadは1 frame最大1件とする。
+ReadingBackは可視viewportだけ継続repaint、推論完了はworkerが要求元viewportを起こす。
+自動運動は可視中に再描画し、マウス追従は収束後に止める。通常sourceの再準備は既存の
+final/edit/upload ownerへ戻し、3D専用のdecode/upload列を増やさない。
+深度待ち（素材NotYetを含む）は2Dを保ったまま非モーダルの状態箱で知らせる。150msの提示gateは
+仕事の生存判定に使わず、gate到達用の遅延wakeと、箱が見える間だけの33msバー再描画を持つ。
+Ready / Failed / OFF、およびhidden / minimizedでは箱由来の再描画を予約しない。
+Dの取消・ページ送りは既存の要求ownerに任せ、同期の初期化待ち・推論待ちを追加しない。
+検証の完了状況は [3D設計 §10](depth-parallax-plan.md#10-実装の段階-codex-への委任単位) を参照。
 
 `ctx.load_texture(name, ColorImage, options)` は UI スレッドで同期実行され、内部で
 wgpu の queue.write_texture が走る。20MP RGBA (78MB) で 26-58ms かかる。

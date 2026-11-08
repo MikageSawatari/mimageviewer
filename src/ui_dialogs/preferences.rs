@@ -386,6 +386,7 @@ pub(crate) enum PreferencesPage {
     /// AI 推論バックエンド (DirectML / TensorRT) の選択と TRT pack 管理
     AiBackend,
     AiCaption,
+    DepthAddon,
     Cache,
     Folder,
     /// v1.7.0: 製本（本棚の保存先ルート）
@@ -592,6 +593,7 @@ impl PreferencesPage {
         Self::GpuMemory,
         Self::AiBackend,
         Self::AiCaption,
+        Self::DepthAddon,
         Self::Cache,
         Self::Folder,
         Self::Book,
@@ -632,6 +634,7 @@ impl PreferencesPage {
             Self::GpuMemory => "GPUメモリ",
             Self::AiBackend => "AI バックエンド",
             Self::AiCaption => "AI 説明文",
+            Self::DepthAddon => "3D 写真の追加モデル",
             Self::Cache => "キャッシュ",
             Self::Folder => "フォルダ・ファイル",
             Self::Book => "製本",
@@ -912,6 +915,7 @@ const TREE: &[TreeCategory] = &[
         page: None,
         children: &[
             PreferencesPage::AiCaption,
+            PreferencesPage::DepthAddon,
             PreferencesPage::EditingAddon,
             PreferencesPage::Developer,
         ],
@@ -1336,6 +1340,10 @@ pub(crate) struct PreferencesState {
     /// 編集用追加パックの導入状態 (環境設定ダイアログを開いた時点のスナップショット)。
     pub editing_addon_status: crate::editing_addon::AddonStatus,
     pub vlm_view: super::vlm_addon::VlmPreferencesView,
+    pub depth_view: super::depth_addon::DepthPreferencesView,
+    pub depth_download_requested: bool,
+    pub depth_remove_requested: bool,
+    pub depth_folder_requested: bool,
     pub vlm_download_requested: bool,
     pub vlm_remove_requested: bool,
     pub vlm_folder_requested: bool,
@@ -1863,6 +1871,10 @@ impl PreferencesState {
             uninstall_trt_pack_requested: false,
             editing_addon_status,
             vlm_view: Default::default(),
+            depth_view: Default::default(),
+            depth_download_requested: false,
+            depth_remove_requested: false,
+            depth_folder_requested: false,
             vlm_download_requested: false,
             vlm_remove_requested: false,
             vlm_folder_requested: false,
@@ -3227,6 +3239,7 @@ impl App {
         // 初回: 一時コピーを作成
         self.ensure_preferences_state();
         self.refresh_vlm_preferences(ctx);
+        self.refresh_depth_preferences();
         // A fresh draft gets a fresh ScrollArea id, with one explicit restore.
         // This also works when close and reopen happen without a hidden frame.
         let mut restore_scroll_y = (self
@@ -3739,6 +3752,7 @@ impl App {
         }
 
         self.process_vlm_preferences_requests(ctx);
+        self.process_depth_preferences_requests(ctx);
 
         // 「インストール先を開く」が押されていたら Explorer で開く。
         if let Some(ps) = self.pref_state.as_mut() {
@@ -4322,6 +4336,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::GpuMemory => page_gpu_memory(ui, state),
         PreferencesPage::AiBackend => page_ai_backend(ui, state),
         PreferencesPage::AiCaption => page_ai_caption(ui, state),
+        PreferencesPage::DepthAddon => page_depth_addon(ui, state),
         PreferencesPage::Cache => page_cache(ui, state),
         PreferencesPage::Folder => page_folder(ui, state),
         PreferencesPage::Book => page_book(ui, state),
@@ -4360,6 +4375,23 @@ pub(crate) fn draw_raw_settings_snapshot_fixture(ui: &mut egui::Ui) {
     draw_page(ui, &mut state, false);
 }
 
+pub fn draw_book_cover_only_snapshot_fixture(ui: &mut egui::Ui) {
+    let mut state = PreferencesState::from_settings(
+        &Settings {
+            cache_book_cover_only: true,
+            ..Settings::default()
+        },
+        crate::external_tool::LaunchTarget::None,
+        None,
+        crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new().snapshot(),
+        false,
+        0,
+        0,
+        0,
+    );
+    pages::book_cover_only_setting(ui, &mut state);
+}
+
 pub fn draw_file_type_visibility_snapshot_fixture(ui: &mut egui::Ui) {
     let mut state = PreferencesState::from_settings(
         &Settings::default(),
@@ -4388,6 +4420,50 @@ pub fn draw_file_type_visibility_snapshot_fixture(ui: &mut egui::Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_book_cover_only_preferences_ok_persists_and_drives_worker_catalog() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.cache_policy = crate::settings::CachePolicy::Always;
+        app.open_preferences_page(PreferencesPage::Cache);
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1093.0, 900.0))
+            .build_ui_state(
+                |root_ui, app| app.show_preferences_dialog(&root_ui.ctx().clone()),
+                app,
+            );
+        harness.run_steps(3);
+        harness
+            .get_by_label("本 (ZIP・PDF など) は表紙のサムネイルだけ保存する")
+            .click();
+        harness.run_steps(2);
+        assert!(!harness.state().settings.cache_book_cover_only);
+        assert!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .cache_book_cover_only
+        );
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        assert!(!harness.state().show_preferences);
+        assert!(harness.state().settings.cache_book_cover_only);
+        let directory = harness.state().tmp.path().to_path_buf();
+        let persisted = crate::settings_db::SettingsDb::open(&directory)
+            .unwrap()
+            .load_into_settings()
+            .unwrap();
+        assert!(persisted.cache_book_cover_only);
+        crate::app::tests::assert_cache_book_cover_only_worker_catalog_contract(
+            &mut harness.state_mut().app,
+            &directory,
+        );
+    }
 
     #[test]
     fn section1445_cache_text_survives_direct_tree_switch_and_ok() {

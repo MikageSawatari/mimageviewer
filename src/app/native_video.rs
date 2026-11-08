@@ -5175,11 +5175,14 @@ impl App {
         crate::dwm_transitions::disable_transitions_for_thread_windows();
         self.settings.video_in_window_mode = in_window;
         self.native_video_in_window_active = in_window;
-        self.viewer_presentation = if in_window {
-            ViewerPresentation::MainWindow
-        } else {
-            ViewerPresentation::Fullscreen
-        };
+        self.commit_viewer_presentation(
+            if in_window {
+                ViewerPresentation::MainWindow
+            } else {
+                ViewerPresentation::Fullscreen
+            },
+            "still_window_mode",
+        );
         self.publish_effetune_auto_fullscreen();
         if in_window
             && self
@@ -5250,7 +5253,7 @@ impl App {
         }
         let in_window = matches!(presentation, ViewerPresentation::MainWindow);
         self.native_video_in_window_active = in_window;
-        self.viewer_presentation = presentation;
+        self.commit_viewer_presentation(presentation, "video_presentation");
         self.publish_effetune_auto_fullscreen();
         if matches!(presentation, ViewerPresentation::DetachedWindow) {
             let id = self.ensure_detached_viewer_window_id();
@@ -9101,8 +9104,7 @@ impl App {
         let panorama_pose = self
             .is_panorama_mode_active(fs_idx)
             .then(|| {
-                self.panorama_state
-                    .as_ref()
+                self.panorama_state()
                     .map(|state| (state.pose(), self.compute_pano_uv_transform(fs_idx)))
             })
             .flatten();
@@ -9133,8 +9135,7 @@ impl App {
             return false;
         }
         let changed = self
-            .panorama_state
-            .as_mut()
+            .panorama_state_mut()
             .is_some_and(|state| state.apply_drag_delta(delta_points, viewport_height_points));
         if changed {
             self.sync_native_video_panorama_state(fs_idx);
@@ -9154,8 +9155,7 @@ impl App {
             return false;
         }
         let changed = self
-            .panorama_state
-            .as_mut()
+            .panorama_state_mut()
             .is_some_and(|state| state.apply_wheel_delta(wheel_delta as f32));
         if changed {
             self.sync_native_video_panorama_state(fs_idx);
@@ -9170,7 +9170,7 @@ impl App {
         if !self.native_video_panorama_input_active(fs_idx) {
             return;
         }
-        if let Some(state) = self.panorama_state.as_mut() {
+        if let Some(state) = self.panorama_state_mut() {
             state.reset();
         }
         self.sync_native_video_panorama_state(fs_idx);
