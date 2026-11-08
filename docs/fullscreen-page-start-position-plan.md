@@ -1,6 +1,6 @@
 # ページ切替後の初期表示位置「中央 / 読み始め」(§1.726)
 
-- 状態: **実装途中・幾何の設計前提と現行コードの差異を確認して停止** (2026-11-08、§9)。独立実装レビュー未実施。設計 r3 (設計担当 ClaudeCode) の独立設計レビュー (GPT-6.1 Sol / xhigh) r1 の P2 5 件、r2 の P2 2 件を反映 (§8)。
+- 状態: **r4 実装済み・独立実装レビュー待ち** (2026-11-09、§9)。設計担当の §10 の決定を実装し、core check・絞り込み nextest・UI snapshot を通過した。独立設計レビュー (GPT-6.1 Sol / xhigh) r1 の P2 5 件、r2 の P2 2 件を反映した r3 の記録は §8。
 - 要望: 5ch >>739 (2026-11-07)。ズーム/フィット設定で画像が画面からはみ出すと、ページを送った先が
   中央から表示されるので、上から読みたい。拡大操作の中心点やマウスカーソルの移動を変える要望ではない。
 - 利用者決定 (backlog §1.726): 設定を追加する。既定は従来どおり「中央」。
@@ -50,6 +50,8 @@ setter は寸法判明・分割モード変更・回転による整合 (`reconci
 - mIV Remote の Web 表示 (本体の `fs_pan` を使わない別の表示)
 
 ## 2. 幾何: どの時点の何に合わせるか
+
+**r4 では確定時点を §10 が上書きする。** 仮素材にもその frame の幾何を適用し、実際の完成素材が表示単位全体で揃った最初の current frame に確定する。
 
 初期位置は、**その表示単位を初めて live に描く frame の、canonical な表示幾何**から求める。
 
@@ -179,7 +181,7 @@ struct FsInitialPlacementRequest {
 `ViewerContextBundle` へ一般の表示状態フィールドを 1 つ足すだけで、detached 述語・viewport 経路・placement・HWND には触れない。
 detached 専用の bool / Option ではなく、既存の `fs_pan` と同じ context 固有の表示状態 (憲法 §2-3 の対象外と判断)。
 独立設計レビューで「症状パッチではなく構造的な追加である」ことに合意済み (§8)。
-変更範囲を detached-rework-plan.md §11 に記録した。実装は §9 の前提差異で停止中で、独立実装レビューでの確認は未完了。
+変更範囲を detached-rework-plan.md §11 に記録した。§10 の決定を実装・自動検証済みで、全体の独立実装レビューでの確認は未完了。
 
 ## 8. 独立設計レビュー r1 の対応 (GPT-6.1 Sol / xhigh、2026-11-08)
 
@@ -201,6 +203,10 @@ r2 の再レビュー: P1 なし、P2 2 件。どちらもレビュー担当が�
 レビュー担当は、`ViewerContextBundle` への追加と holdover の描画入力の所有分離が症状パッチではなく構造的な変更であることに同意した (§7)。
 
 ## 9. 実装途中の記録と設計前提の差異 (2026-11-08)
+
+### 9.1 2026-11-08 の停止記録
+
+以下は当時の記録。途中差分は設計担当が `b9329ec7b` にコミットし、§10 の決定 (`0ac62559f`) を受けて再開した。
 
 設定・転送・環境設定 UI、context 所有の要求、受理済み分割移動、要求の消去入口、単ページ・見開きの初期配置、
 navigation previous の placement 再生までの未コミット差分を作成した。完成・受入済みとは扱わない。
@@ -240,6 +246,138 @@ navigation previous の placement 再生までの未コミット差分を作成�
 - snapshot は既存 fixture に設定行を足したところまでで、PNG 更新・比較・目視確認は未実施。
 - full gate・build-dev・製品起動・コミットは利用者指定に従い未実施。
 
+### 9.2 r4 実装・検証記録 (2026-11-09)
+
+- 状態: **実装済み・独立実装レビュー待ち**。以下は今回完了した内容と実行結果。製品起動・実機確認は未実施。
+
+`FullscreenPageMaterialKind::{Complete, Provisional}` を `src/gpu_lanczos.rs` の通常素材・presentation 素材に保持する。
+`src/app.rs` の通常サムネイル・通過素材の生成元（RAW 早期分岐・キャッシュ再利用を含む）で仮素材を明示し、
+`resolve_fs_processed_material_from_caches` は未完成 final・注釈待ちの下地・通常 final 待ちの下段素材も仮素材として返す。
+寸法・texture ID・ページ番号から種類を推測しない。リサンプル・capture・Native の再構成・補助素材への変換も種類を保持する。
+
+`fs_initial_placement_pan` は要求と選択素材の幾何から frame 内の配置候補を解き、App の pan/base にはまだ公開しない。
+paint はその候補で素材を準備し、実際に選べた素材で `resolve_fs_initial_placement` を呼ぶ。
+仮素材なら要求の base zoom/pan を更新して保持し、単ページはそのページ、見開きは両ページが完成素材で準備できた frame に確定する。
+単ページの Native が拒否された場合は元の要求から次の候補を解く。見開きも各ページで既存のサムネイル代替を一度だけ選べる
+有限の選択経路を使い、実際の素材の union で配置を解き直す。通常素材の GPU 準備は選択が定まった後の一回だけにする。
+片側を準備できなければ要求を保持し、既存の部分描画には確定済み pan を使う。代役も無い Native は描画せず、寸法情報だけを残して従来の部分配置を保つ。
+確定前の候補 pan や素材を bind/submit しない。
+この選択整理は有効な初期配置要求がある current frame に限り、既定の中央・captured・Z の既存描画経路は保つ。
+Native の準備で代役へ戻った場合や片側が無い場合は確定しない。既存の source 選択順序・表示基準・紙めくり条件は変えない。
+同 frame の最終 transform に反映し、余分な persistent field・rollback・待機機構は追加していない。
+
+`src/ui_fullscreen/initial_placement/tests.rs` と `src/app/tests.rs` に、§6 と §10 の到着順・状態遷移・実描画・入力・
+context・別窓復元・実際の紙めくり offer 着地の回帰を置く。素材種類の保持は `src/gpu_lanczos.rs` と既存の素材所有テストでも検査する。
+設定の既定・serde・転送分類・検索・環境設定 UI のテストは `b9329ec7b` の追加分をそのまま検証する。
+
+検証コマンドには `MSBUILDDISABLENODEREUSE=1` を付け、Cargo の並列数を 4 に制限する。
+full gate・build-dev・製品起動・コミットは今回も行わない。
+
+- UI snapshot は次の PowerShell で更新・通常比較し、どちらも 1 成功・245 除外。
+  ログは `target/1726-snapshot-update.log` / `target/1726-snapshot-verify.log`。
+  PNG は 480×300 の既存画像を維持し、目視で設定行・短説明の追加だけと確認した。
+  差分 24,274 pixels は `(8,180)–(466,233)` に限り、上 180 行は完全一致。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+$env:CARGO_BUILD_JOBS='4'
+$env:UPDATE_SNAPSHOTS='1'
+cargo test --test ui_snapshot fullscreen_fit_cycle_single_mode_dark
+Remove-Item Env:UPDATE_SNAPSHOTS
+cargo test --test ui_snapshot fullscreen_fit_cycle_single_mode_dark
+```
+
+- 最終 core check は以下のコマンドで成功 (17.48 秒)。ログは `target/1726-r4-core-verified.log`。既存 warning は残る。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+cargo check -p mimageviewer --bin mimageviewer-core --jobs 4
+```
+
+- 絞り込み nextest は以下のコマンドで **233 件成功・16,658 件除外** (実行 23.205 秒、再コンパイル 1 分 39 秒)。
+  ログは `target/1726-r4-focused-verified.log`、run ID は `3b6e8c5c-fd7d-4012-b0dd-ca06b4d39334`。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+cargo nextest run -p mimageviewer --lib --build-jobs 4 --test-threads 4 -E 'test(~initial_placement) | test(~page_start_position) | test(~settings_transfer) | test(~search_index) | (test(~viewer_context_registry) & (test(~bundle) | test(~swap) | test(~context_async_owner_registry))) | test(~holdover) | test(~page_turn_submission_tests) | test(~page_material_kind) | test(~pdf_metadata_readoption) | test(~source_absent_changed_view_or_prepare_key_uses_existing_fallback) | test(~source_absent_stable_view_keeps_native_single_and_pair)'
+```
+
+- 検証途中で、前回の未実行候補の enum 値・借用競合、寸法の優先順位を反映していない fixture、headless texture 上限、
+  double-click の入力 frame 列、raw texture と完成合成 texture の ID の同一視を修正した。
+  修正前に原因を報告し、期待する位置・入力取消・要求保持の assert は維持した。既存 detached テストは変更していない。
+  初回コンパイル失敗は `target/1726-r4-focused.log`、途中の実行結果は同 `focused-retry.log` (223/226)、
+  `focused-final.log` (230/231)、`focused-pass.log` (232/233)。最後の部分描画の失敗は fixture 変更で回避せず、上記の実装境界で修正した。
+- 候補配置→実素材準備→確定と、Native の有限な選択・部分描画の維持は、別担当 Sol / xhigh の限定レビューでも構造的な整理と合意した。
+  これは全体の独立実装レビューを代替しない。
+- 最後に引数なしの `cargo fmt` を実行し、`cargo fmt --check` / `git diff --check` も成功。
+  `python scripts/check_ui_glyphs.py` は危険グリフ 0、`python scripts/check_site_cards.py` は 53 件・超過 0。
+  整形後の Rust 変更は整形のみで、追加の機能変更は行っていない。
+
+### 9.3 追加・拡充した回帰名
+
+`initial_placement_` 系は 46 件（前回の候補を含む）。全件を上記の filter で実行した。
+
+```text
+initial_placement_r4_original_thumbnail_then_full_aligns_first_complete_frame
+initial_placement_r4_incomplete_final_retains_until_actual_completed_ai_material
+initial_placement_r4_width_thumbnail_then_full_keeps_initial_pan
+initial_placement_r4_manual_pan_during_thumbnail_survives_full_arrival
+initial_placement_r4_failed_full_load_keeps_stable_provisional_pan
+initial_placement_r4_spread_waits_until_both_actual_materials_are_complete
+initial_placement_r4_actual_passthrough_producer_keeps_request_until_full_arrives
+initial_placement_rejected_native_uses_fitting_thumbnail_without_committing_candidate_pan
+initial_placement_actual_paint_without_material_preserves_request_and_pan
+initial_placement_actual_ctrl_wheel_route_cancels_request_before_changing_zoom
+initial_placement_actual_double_click_reset_cancels_request_and_centers
+initial_placement_actual_zoom_key_hold_start_cancels_request
+initial_placement_items_generation_boundary_retires_before_next_paint
+initial_placement_accepted_open_creates_request_after_resetting_transform
+initial_placement_geometry_aligns_only_overflowing_axes_and_respects_direction
+initial_placement_center_creates_no_request_and_does_not_change_split_pan
+initial_placement_holdover_and_missing_geometry_retain_until_first_current_frame
+initial_placement_stale_identity_and_changed_transform_discard_without_moving
+initial_placement_replacement_request_uses_latest_anchor_and_transform
+initial_placement_single_uses_book_direction_when_mode_has_no_direction
+initial_placement_single_paint_starts_at_top_in_the_first_painted_frame
+initial_placement_single_paint_respects_trim_rotation_and_reserved_viewport
+initial_placement_single_paint_keeps_nonoverflowing_singleton_side
+initial_placement_white_companion_union_controls_overflow_and_reading_start_edge
+initial_placement_selected_holdover_does_not_consume_single_or_spread_request
+initial_placement_spread_paint_aligns_unit_union_in_the_first_frame
+initial_placement_navigation_holdover_preserves_old_single_and_spread_position
+initial_placement_source_reload_holdover_keeps_live_manual_pan
+initial_placement_z_navigation_holdover_uses_the_existing_live_transform_path
+initial_placement_offered_animation_target_submits_aligned_flat_in_first_frame
+initial_placement_input_pan_pinch_and_key_zoom_cancel_even_when_values_return_to_base
+initial_placement_fit_continuous_and_edit_resets_clear_the_request
+initial_placement_split_reconciliation_never_recreates_a_consumed_request
+initial_placement_accepted_same_image_split_step_requests_only_reading_start
+initial_placement_excluded_modes_retire_requests_without_changing_position
+initial_placement_slideshow_same_image_slice_creates_request_without_reopening
+initial_placement_close_clears_unresolved_request
+initial_placement_panorama_retires_request
+initial_placement_context_swap_keeps_sibling_requests_and_pan_separate
+initial_placement_parked_geometry_resets_clear_only_the_affected_context_request
+initial_placement_page_turn_target_paints_aligned_before_disabling_nonzero_pan_animation
+initial_placement_detached_resume_restored_zero_pan_explicitly_clears_request
+initial_placement_rejected_native_pair_commits_only_actual_thumbnail_geometry
+initial_placement_one_rejected_native_side_recomputes_the_actual_mixed_unit
+initial_placement_missing_native_fallback_keeps_committed_pan_and_request_for_partial_paint
+initial_placement_center_and_reading_start_without_request_keep_existing_native_fallback_geometry
+```
+
+設定・UI・素材種類の追加／拡充回帰と snapshot:
+
+```text
+fullscreen_page_start_position_defaults_and_serde_are_compatible
+page_start_position_transfer_roundtrip_missing_and_invalid_preserve_value
+page_start_position_ui_selects_both_positions
+page_start_position_search_reaches_its_anchor
+page_material_kind_survives_prepare_capture_and_native_reconstruction
+pdf_metadata_readoption_retires_only_dependent_live_passthrough_materials
+fullscreen_fit_cycle_single_mode_dark
+```
+
 ## 10. r4: 仮の素材の frame と確定 (設計担当の決定、2026-11-08)
 
 §9 の差異への対応。§2 の「最初の current frame で一度だけ確定」を次の 2 段に置き換える。§3 の条件 1〜4・消去・退役はそのまま。
@@ -250,8 +388,10 @@ navigation previous の placement 再生までの未コミット差分を作成�
   要求の `base_zoom` / `base_pan` をいま入れた値へ更新する (以後の利用者入力は CAS と明示消去の両方で検出される)。
 - **確定**: 表示単位の全ページが完成素材で描かれる最初の current frame で、同じく pan を求めて入れ、要求を消す。以後は再計算しない (§2 のとおり)。
 - 「完成素材かどうか」は、描画 resolver が実際に選んだ素材の種類 (型付きの選択結果) で判定する。寸法の比較・ページ番号・ログ文字列で推測しない。
-  AI・カラー化などの後段の差し替えは、表示基準が AI 前の原寸に揃う既存契約 (指定スケール計画 §4.3) により幾何を変えないので、
-  完成素材の最初の frame で確定してよい。
+  未完成 final 合成や通常 final の完成待ちに選んだ下段素材も仮素材とし、完成素材の最初の frame で確定する。
+  指定スケールは AI 前の原寸に揃うが (指定スケール計画 §4.3)、既存の原寸・倍率制限は選んだ texture の寸法を使うため、
+  未完成 AI 素材から完成 AI 素材への幾何変化も仮の段階に含める。注釈合成は既存どおり完成した下地からのみ選び、
+  元画像表示・RAW の安定 preview はそれぞれ既存の完成表示の契約を保つ。
 - 見え方: 幅・高さ・ページ fit ではサムネイルと完成画像の矩形が同じなので、位置は最初から読み始めで動かない。
   原寸・px 指定ではサムネイルが小さく描かれる既存挙動のまま (はみ出さなければ従来の配置)、完成画像に替わる frame で読み始めへ揃う。
   替わる frame で大きさ自体が変わる既存の見え方に重なるので、新しい跳びは作らない。

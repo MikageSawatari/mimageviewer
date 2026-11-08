@@ -1462,8 +1462,9 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 新規 context は要求なしで始め、兄弟 context の位置や要求へ波及させない。detached 専用の状態や HWND・placement の経路は増やさない。
 
 設計担当 ClaudeCode と独立 Sol / xhigh 設計レビューは、bundle への一般表示状態の追加と holdover 描画入力の所有分離を、
-症状パッチではなく構造的な追加と合意した。実装は幾何の設計前提と現行コードの差異により途中で停止しており、独立実装レビューでの合意は未完了。
-設計 r3 と実装・検証記録の正本は [初期表示位置の計画](fullscreen-page-start-position-plan.md)。
+症状パッチではなく構造的な追加と合意した。設計担当の r4 決定に従って実装・絞り込み自動検証を完了した。
+候補配置→実素材の準備→確定の所有境界も別担当の限定レビューで構造的な整理と確認したが、全体の独立実装レビューは待ちである。
+設計 r4 と実装・検証記録の正本は [初期表示位置の計画](fullscreen-page-start-position-plan.md)。
 
 ### 2026-11-08: 3D 写真の MainWindow 対応（段 C 続き・案1）
 

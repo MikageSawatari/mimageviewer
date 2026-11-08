@@ -1929,16 +1929,22 @@ PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行
 #### ページ切替直後の初期 pan (§1.726)
 
 `fullscreen_page_start_position` は `Center` (既定) / `ReadingStart`。後者だけが、受理済み open と
-同一画像内の受理済み分割移動で context 所有の one-shot 要求を作る。現在の表示単位を最初に描く
+同一画像内の受理済み分割移動で context 所有の要求を作る。現在の表示単位を描く
 frame で、固定 HUD・パネルを除いた viewport と pan 0 の canonical placement を使い、描くページの
-paint rect の和（描く白 companion を含む）から初期 pan を一度だけ求める。縦の超過は上端、横の超過は
+paint rect の和（描く白 companion を含む）から初期 pan を求める。縦の超過は上端、横の超過は
 実効読書方向の始端へ合わせ、収まる軸の既存配置と倍率は保つ。同じ frame の最終 placement に反映する。
 
+素材の `FullscreenPageMaterialKind` は通常サムネイル・通過 rendition・未完成 final／完成待ち代役を
+`Provisional`、完成素材を `Complete` として生成元・選択元で付け、Native 化・capture 後も保持する。
+仮素材の frame は配置後の zoom/pan を要求の base へ更新して保持し、単ページならそのページ、見開きなら
+全ページの実際に準備できた素材が完成した最初の current frame で消す。原寸では素材差し替えで矩形が変わる
+既存契約を保ち、完成画像の最初の frame も読み始めへ揃える。準備段で代役へ fallback したら確定しない。
+
 holdover 選択中・幾何未解決なら要求を保持し、世代・anchor 不一致、利用者の位置／倍率入力、除外モード、
-close・復元・reset では退役する。高画質化や resize で再適用しない。連結読み・動画・360 度・depth・Z・分析には適用しない。
+close・復元・reset では退役する。確定後の高画質化や resize で再適用しない。連結読み・動画・360 度・depth・Z・分析には適用しない。
 navigation の previous holdover は capture 済みの通常 placement で前の位置を保ち、同一表示単位の
 source reload 待ちと Z holdover は既存 transform を使う。紙めくりの zoom / pan 適格条件は維持する。
-状態の所有・消去入口と検証範囲は [設計 r3](fullscreen-page-start-position-plan.md) を参照。
+状態の所有・消去入口と検証範囲は [設計 r4](fullscreen-page-start-position-plan.md) を参照。
 
 ### 部分矩形 (content bbox) の座標系 — 2026-08-25 に分離
 

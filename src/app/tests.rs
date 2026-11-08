@@ -87624,6 +87624,61 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     #[cfg(windows)]
+    fn initial_placement_detached_resume_restored_zero_pan_explicitly_clears_request() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, r"C:\pics\initial-placement-resume.jpg");
+        app.selected = Some(idx);
+        app.settings.fullscreen_page_start_position =
+            crate::settings::FullscreenPageStartPosition::ReadingStart;
+        app.settings.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Width;
+        let stamp = app
+            .viewer_sync_stamp_for_idx(idx)
+            .expect("plain image sync stamp");
+        let texture = ctx.load_texture(
+            "initial-placement-resume-snapshot",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        app.transition_detached_window_state(1726, DetachedWindowState::Parked, "test_parked");
+        app.detached_image_windows
+            .push(DetachedImageWindowSnapshot {
+                id: 1726,
+                display: crate::gpu_lanczos::FullscreenPaintResource::direct(texture).into(),
+                title: "resume".into(),
+                location_display: "resume".into(),
+                image_dims: Some((1500, 2000)),
+                rotation: crate::rotation_db::Rotation::None,
+                // Equal to open's reset values: the CAS guard cannot distinguish
+                // this explicit saved-position restoration from untouched input.
+                zoom_pan: Some((1.0, egui::Vec2::ZERO)),
+                free_rotation: 0.0,
+                image_rect_norm: egui::Rect::from_min_max(
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                ),
+                image_content_bbox: None,
+                image_underlay: DetachedImageWindowUnderlay::Solid(egui::Color32::BLACK),
+                frozen_continuous_pages: Vec::new(),
+                reopen_descriptor: None,
+                reopen_sync_stamp: Some(stamp),
+                reopen_collection_root: None,
+                activation_ready_frame: 0,
+                activation_armed: true,
+                focused_last_frame: false,
+                initial_placement_applied: false,
+            });
+        assert!(app.activate_detached_image_window_snapshot(&ctx, 1726));
+        assert_eq!(app.fullscreen_idx, Some(idx));
+        assert_eq!((app.fs_zoom, app.fs_pan), (1.0, egui::Vec2::ZERO));
+        assert!(
+            app.fs_initial_placement_request.is_none(),
+            "restored transform must retire the request even when values equal open's base"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn live_media_park_creates_parked_live_snapshot_without_closing() {
         let mut app = setup_app();
         let ctx = egui::Context::default();

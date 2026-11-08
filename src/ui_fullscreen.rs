@@ -110,7 +110,9 @@ use crate::fs_animation::{AnimationPlayback, FsCacheEntry};
 use crate::fullscreen_specified_scale::{
     FullscreenFitBasis, FullscreenFitInput, resolve_specified_scale,
 };
-use crate::gpu_lanczos::{FullscreenPaintPayload, FullscreenPaintResource};
+use crate::gpu_lanczos::{
+    FullscreenPageMaterialKind, FullscreenPaintPayload, FullscreenPaintResource,
+};
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::items_generation_cache::ItemsGenerationMap;
 use crate::keymap::{
@@ -2906,6 +2908,7 @@ impl FsNavigatorTextureSources {
                 FullscreenPaintResource::direct(resource.source_texture().clone())
                     .with_source_coverage(resource.source_coverage())
                     .with_display_basis(resource.display_basis())
+                    .with_page_material_kind(resource.page_material_kind())
                     .into()
             }
             FullscreenPaintPayload::PresentationMaterial(_) => source.resource.clone(),
@@ -13456,14 +13459,22 @@ impl App {
         if let Some(comic) = self.ensure_comic_composite_material(ctx, idx) {
             return Some(comic);
         }
-        if self.comic_has_objects(ctx, idx) {
+        let annotation_waiting = self.comic_has_objects(ctx, idx);
+        if annotation_waiting {
             *depth_wait = Some(crate::depth_parallax::DepthSourceWait::AnnotationBake);
         }
         if let Some(texture) = self.ensure_final_composite_material(ctx, idx) {
-            if !self.current_final_composite_is_complete(idx) && depth_wait.is_none() {
+            let complete = self.current_final_composite_is_complete(idx);
+            if !complete && depth_wait.is_none() {
                 *depth_wait = Some(crate::depth_parallax::DepthSourceWait::IncompleteComposite);
             }
-            return Some(texture);
+            return Some(
+                texture.with_page_material_kind(if complete && !annotation_waiting {
+                    FullscreenPageMaterialKind::Complete
+                } else {
+                    FullscreenPageMaterialKind::Provisional
+                }),
+            );
         }
         // A lower layer remains a valid 2D fallback while the selected final
         // producer is pending. It is not yet the stable input for inference.
@@ -13494,7 +13505,13 @@ impl App {
         ) {
             return self.source_material_for_idx(idx);
         }
-        self.resolve_fs_pre_overlay_material(idx)
+        self.resolve_fs_pre_overlay_material(idx).map(|material| {
+            material.with_page_material_kind(if raw_preview {
+                FullscreenPageMaterialKind::Complete
+            } else {
+                FullscreenPageMaterialKind::Provisional
+            })
+        })
     }
 
     pub(crate) fn fs_navigation_sequence_blocks_new_target(&self) -> bool {
@@ -14703,8 +14720,12 @@ impl App {
     /// フルスクリーン通常モードのズーム/パンが有効なら返す。
     /// 1.0 付近の誤差範囲だけ None。縮小も描画側へ渡す。
     pub(crate) fn fs_zoom_pan(&self) -> Option<(f32, egui::Vec2)> {
-        if zoom_differs_from_fit(self.fs_zoom) || self.fs_pan.length_sq() > PAN_EPSILON_SQ {
-            Some((self.fs_zoom, self.fs_pan))
+        Self::fs_zoom_pan_for(self.fs_zoom, self.fs_pan)
+    }
+
+    fn fs_zoom_pan_for(zoom: f32, pan: egui::Vec2) -> Option<(f32, egui::Vec2)> {
+        if zoom_differs_from_fit(zoom) || pan.length_sq() > PAN_EPSILON_SQ {
+            Some((zoom, pan))
         } else {
             None
         }
@@ -44536,7 +44557,7 @@ impl App {
         submitted: Option<&mut FsNavigatorTextureSources>,
         live_eligible: bool,
         crop: Option<crate::export_crop::CropSettings>,
-        mut flat_crop: page_turn::FlatCropPaint<'_>,
+        flat_crop: page_turn::FlatCropPaint<'_>,
     ) -> Option<DisplayedImageTransform> {
         self.draw_fs_image_with_initial_placement(
             ui,
@@ -44609,6 +44630,7 @@ impl App {
                 selected_current,
                 full_rect,
                 None,
+                FullscreenPageMaterialKind::Provisional,
             );
         }
         // Current items resolve the active split here. A captured holdover keeps
@@ -44633,7 +44655,11 @@ impl App {
         let mut fallback = (!is_video && tex.is_some())
             .then_some(thumb_resource.as_ref())
             .flatten();
+        let input_zoom_pan = zoom_pan;
+        let input_live_eligible = live_eligible;
         while let Some(resource) = display_tex.take() {
+            zoom_pan = input_zoom_pan;
+            live_eligible = input_live_eligible;
             let tex_size = resource.full_source_size_vec2();
             let layout_source_size = match layout_source {
                 FsPageLayoutSource::Captured { layout_size, .. } => Some(layout_size),
@@ -44691,8 +44717,10 @@ impl App {
                         }
                     }),
             };
+            let mut initial_placement_applied = false;
+            let mut initial_zero_pan_unit = None;
             if matches!(layout_source, FsPageLayoutSource::CurrentItem) {
-                let zero_pan_unit = self.fs_initial_placement_request.and_then(|request| {
+                initial_zero_pan_unit = self.fs_initial_placement_request.and_then(|request| {
                     let mut zero_input = transform_input;
                     zero_input.placement =
                         if singleton_placement == SingletonSpreadPlacement::Center {
@@ -44715,13 +44743,14 @@ impl App {
                             .map_or(zero.paint_rect, |white| zero.paint_rect.union(white)),
                     )
                 });
-                if self.resolve_fs_initial_placement(
+                if let Some(pan) = self.fs_initial_placement_pan(
                     self.fullscreen_idx.unwrap_or(page_idx),
                     selected_current,
                     full_rect,
-                    zero_pan_unit,
+                    initial_zero_pan_unit,
                 ) {
-                    zoom_pan = self.fs_zoom_pan();
+                    initial_placement_applied = true;
+                    zoom_pan = Self::fs_zoom_pan_for(self.fs_zoom, pan);
                     transform_input.placement = match transform_input.placement {
                         ResolvedDisplayPlacement::Normal { .. } => {
                             ResolvedDisplayPlacement::Normal { zoom_pan }
@@ -44735,7 +44764,7 @@ impl App {
                         }
                         z => z,
                     };
-                    live_eligible &= self.page_turn_view_eligible(page_idx);
+                    live_eligible &= zoom_pan.is_none();
                 }
             }
             let transform = match resolved_transform {
@@ -44791,6 +44820,15 @@ impl App {
                 using_full_texture = false;
                 continue;
             };
+            if initial_placement_applied {
+                self.resolve_fs_initial_placement(
+                    self.fullscreen_idx.unwrap_or(page_idx),
+                    selected_current,
+                    full_rect,
+                    initial_zero_pan_unit,
+                    paint_resource.page_material_kind(),
+                );
+            }
             if matches!(layout_source, FsPageLayoutSource::CurrentItem) {
                 self.observe_raw_presentation(page_idx);
             }
@@ -50583,11 +50621,10 @@ impl App {
                 selected_current,
                 image_rect,
                 None,
+                FullscreenPageMaterialKind::Provisional,
             );
         }
         self.fullscreen_page_layout.clear();
-        let mut prepared_pages: [Option<PreparedPagedPage>; 2] = [None, None];
-        let mut missing_pages = [None, None];
         let submitted_sources;
         let occurrences = display_override
             .map(|(left, right)| [left.occurrence, right.occurrence])
@@ -50759,102 +50796,6 @@ impl App {
                 self.fs_page_coordinate_source_size(right_idx),
             ),
         };
-        let layout_size = |idx,
-                           rotation,
-                           captured: Option<&FsDisplayUnitHoldoverPage>,
-                           resource: Option<&FullscreenPaintPayload>| {
-            captured
-                .map(|page| rotated_display_size(page.layout_size, rotation))
-                .or_else(|| {
-                    resource.and_then(|resource| {
-                        self.fs_spread_page_layout_size(idx, resource)
-                            .map(|size| rotated_display_size(size, rotation))
-                    })
-                })
-                .or_else(|| {
-                    self.fs_thumbnail_resource_for_display(idx)
-                        .ok()
-                        .and_then(|resource| {
-                            self.fs_spread_page_layout_size(idx, &resource.into())
-                                .map(|size| rotated_display_size(size, rotation))
-                        })
-                })
-        };
-        let (left_size, right_size) = (
-            layout_size(
-                left_idx,
-                left_rot,
-                display_override.map(|(left, _)| left),
-                left_display_tex.as_ref(),
-            ),
-            layout_size(
-                right_idx,
-                right_rot,
-                display_override.map(|(_, right)| right),
-                right_display_tex.as_ref(),
-            ),
-        );
-        let (left_size, right_size) = if fit_mode == FullscreenFitMode::SpecifiedScale {
-            // The unit and each page use the same selected-material resolver.
-            // In particular a retained partial material must not rediscover O
-            // through the thumbnail cache after that cache has been evicted.
-            let selected_fit =
-                |idx,
-                 captured: Option<&FsDisplayUnitHoldoverPage>,
-                 resource: Option<&FullscreenPaintPayload>| {
-                    captured.map(|page| page.fit_input).or_else(|| {
-                        match resource.cloned().or_else(|| {
-                            self.fs_thumbnail_resource_for_display(idx)
-                                .ok()
-                                .map(Into::into)
-                        }) {
-                            Some(resource) => self.fs_spread_fit_input(idx, fit_mode, &resource),
-                            None => None,
-                        }
-                    })
-                };
-            let left_basis = selected_fit(
-                left_idx,
-                display_override.map(|(left, _)| left),
-                left_display_tex.as_ref(),
-            );
-            let right_basis = selected_fit(
-                right_idx,
-                display_override.map(|(_, right)| right),
-                right_display_tex.as_ref(),
-            );
-            (
-                left_basis.map(|input| {
-                    rotated_display_size(fit_input_layout_size(input, egui::Vec2::ZERO), left_rot)
-                }),
-                right_basis.map(|input| {
-                    rotated_display_size(fit_input_layout_size(input, egui::Vec2::ZERO), right_rot)
-                }),
-            )
-        } else {
-            (left_size, right_size)
-        };
-        let (left_page_layout_source, right_page_layout_source) = match display_override {
-            Some((left, right)) => (
-                FsPageLayoutSource::Captured {
-                    layout_size: left.layout_size,
-                    post_filter: left.post_filter,
-                    fit_input: left.fit_input,
-                },
-                FsPageLayoutSource::Captured {
-                    layout_size: right.layout_size,
-                    post_filter: right.post_filter,
-                    fit_input: right.fit_input,
-                },
-            ),
-            None => (
-                FsPageLayoutSource::CurrentItem,
-                FsPageLayoutSource::CurrentItem,
-            ),
-        };
-
-        // ズーム/パンが有効な場合は image_rect でクリップする
-        // (ズーム時にページが image_rect 外へはみ出して他の UI を覆わないようにするため)
         let left_allow_thumbnail = display_override.is_none()
             && !settling_with_renditions
             && (pass_through
@@ -50867,435 +50808,775 @@ impl App {
                 || (!pass_through
                     && (original_preview_active
                         || !self.colorize_display_requires_final_effect(right_idx))));
-        if let (Some(ls), Some(rs)) = (left_size, right_size) {
-            let spread_gap = quantize_points_to_physical_pixels(
-                self.settings.spread_page_gap_px.min(200) as f32,
-                pixels_per_point,
+        // Only an active entry-position request needs actual-material re-layout.
+        // Keep the released Center/captured fallback geometry on its existing path.
+        let select_initial_material = display_override.is_none()
+            && captured_placement.is_none()
+            && !self.fs_zoom_mode_effective()
+            && selected_current
+            && self.fs_initial_placement_request.is_some();
+        let mut left_using_full_texture = left_display_tex.is_some();
+        let mut right_using_full_texture = right_display_tex.is_some();
+        let mut left_fallback_available =
+            select_initial_material && left_using_full_texture && left_allow_thumbnail;
+        let mut right_fallback_available =
+            select_initial_material && right_using_full_texture && right_allow_thumbnail;
+        if select_initial_material {
+            left_display_tex = self.fs_spread_page_paint_resource(
+                left_idx,
+                left_display_tex.as_ref(),
+                left_allow_thumbnail,
             );
-            let full_bbox = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-            let left_bbox = content_left.unwrap_or(full_bbox);
-            let right_bbox = content_right.unwrap_or(full_bbox);
-            let content_active = content_left.is_some() || content_right.is_some();
-            let specified = display_override
-                .and_then(|(left, _)| fit_input_specified_size(left.fit_input))
-                .unwrap_or(self.settings.fullscreen_specified_scale);
-            let Some((geometry, auto_fit)) = canonical_demand::spread_auto_layout(
-                [ls, rs],
-                [content_left, content_right],
-                fit_mode,
-                specified,
-                display_override
-                    .and_then(|(left, _)| fit_input_specified_max_tenths(left.fit_input))
-                    .unwrap_or(self.settings.fullscreen_specified_scale_max_tenths),
-                image_rect,
-                spread_gap,
-                fit_scale_limits,
-            ) else {
-                return FsNavigatorTextureSources::default();
-            };
-            let spread_gap = auto_fit.gap;
-            let fit_scale = auto_fit.scale;
-
-            // Height matching now depends only on fit mode, so the geometry is final before the
-            // ZipPla solve. The old result-dependent geometry feedback loop is structurally gone,
-            // and zoom needs to be resolved only once.
-            let zip_input = if captured_placement.is_none() && self.fs_zoom_mode_effective() {
-                let top_m = TOP_BAR_HOVER_Y.min(image_rect.height() * 0.25);
-                let bottom_m = (seek_geometry.total_height + 8.0).min(image_rect.height() * 0.25);
-                let pan_band = egui::Rect::from_min_max(
-                    egui::pos2(image_rect.left(), image_rect.top() + top_m),
-                    egui::pos2(image_rect.right(), image_rect.bottom() - bottom_m),
+            right_display_tex = self.fs_spread_page_paint_resource(
+                right_idx,
+                right_display_tex.as_ref(),
+                right_allow_thumbnail,
+            );
+        }
+        let input_zoom_pan = zoom_pan;
+        let mut propose_initial_placement = select_initial_material;
+        // Each side can select its thumbnail once. An unpaintable partial unit
+        // gets one final pass using the unchanged, committed transform.
+        'material_selection: loop {
+            zoom_pan = input_zoom_pan;
+            let mut prepared_pages: [Option<PreparedPagedPage>; 2] = [None, None];
+            let mut missing_pages = [None, None];
+            let layout_size =
+                |idx,
+                 rotation,
+                 captured: Option<&FsDisplayUnitHoldoverPage>,
+                 resource: Option<&FullscreenPaintPayload>| {
+                    captured
+                        .map(|page| rotated_display_size(page.layout_size, rotation))
+                        .or_else(|| {
+                            resource.and_then(|resource| {
+                                self.fs_spread_page_layout_size(idx, resource)
+                                    .map(|size| rotated_display_size(size, rotation))
+                            })
+                        })
+                        .or_else(|| {
+                            self.fs_thumbnail_resource_for_display(idx)
+                                .ok()
+                                .and_then(|resource| {
+                                    self.fs_spread_page_layout_size(idx, &resource.into())
+                                        .map(|size| rotated_display_size(size, rotation))
+                                })
+                        })
+                };
+            let (left_size, right_size) = (
+                layout_size(
+                    left_idx,
+                    left_rot,
+                    display_override.map(|(left, _)| left),
+                    left_display_tex.as_ref(),
+                ),
+                layout_size(
+                    right_idx,
+                    right_rot,
+                    display_override.map(|(_, right)| right),
+                    right_display_tex.as_ref(),
+                ),
+            );
+            let (left_size, right_size) = if fit_mode == FullscreenFitMode::SpecifiedScale {
+                // The unit and each page use the same selected-material resolver.
+                // In particular a retained partial material must not rediscover O
+                // through the thumbnail cache after that cache has been evicted.
+                let selected_fit =
+                    |idx,
+                     captured: Option<&FsDisplayUnitHoldoverPage>,
+                     resource: Option<&FullscreenPaintPayload>| {
+                        captured.map(|page| page.fit_input).or_else(|| {
+                            match resource.cloned().or_else(|| {
+                                self.fs_thumbnail_resource_for_display(idx)
+                                    .ok()
+                                    .map(Into::into)
+                            }) {
+                                Some(resource) => {
+                                    self.fs_spread_fit_input(idx, fit_mode, &resource)
+                                }
+                                None => None,
+                            }
+                        })
+                    };
+                let left_basis = selected_fit(
+                    left_idx,
+                    display_override.map(|(left, _)| left),
+                    left_display_tex.as_ref(),
                 );
-                let cursor = ctx
-                    .input(|i| i.pointer.hover_pos())
-                    .unwrap_or_else(|| image_rect.center());
-                Some((pan_band, cursor))
-            } else {
-                None
-            };
-            let zip_result = zip_input.map(|(pan_band, cursor)| {
-                resolve_spread_zip_zoom(
-                    image_rect,
-                    pan_band,
-                    cursor,
-                    geometry.fit_size,
-                    spread_gap,
-                    fit_scale,
-                    self.fs_zoom_factor,
-                    self.fs_zoom_mode_active(),
+                let right_basis = selected_fit(
+                    right_idx,
+                    display_override.map(|(_, right)| right),
+                    right_display_tex.as_ref(),
+                );
+                (
+                    left_basis.map(|input| {
+                        rotated_display_size(
+                            fit_input_layout_size(input, egui::Vec2::ZERO),
+                            left_rot,
+                        )
+                    }),
+                    right_basis.map(|input| {
+                        rotated_display_size(
+                            fit_input_layout_size(input, egui::Vec2::ZERO),
+                            right_rot,
+                        )
+                    }),
                 )
-            });
-            if let Some(result) = zip_result {
-                self.fs_zoom_factor = result.factor;
-            }
-            let mut resolved_zoom_pan = zip_result
-                .and_then(|result| result.zoom_pan)
-                .or(zoom_pan.filter(|_| zip_input.is_none()));
-            let aim_frame = zip_result.and_then(|result| result.aim_frame);
-            let total_scale = resolved_zoom_pan.map_or(fit_scale, |(zoom, _)| fit_scale * zoom);
-            let mut resolved_placement = if zip_input.is_some() {
-                ResolvedDisplayPlacement::Z {
-                    active: self.fs_zoom_mode_active(),
-                    factor: self.fs_zoom_factor,
-                    zoom_pan: resolved_zoom_pan,
-                    singleton_side: SingletonSpreadPlacement::Center,
-                    singleton_gap: 0.0,
-                }
             } else {
-                ResolvedDisplayPlacement::Normal {
-                    zoom_pan: resolved_zoom_pan,
-                }
+                (left_size, right_size)
+            };
+            let (left_page_layout_source, right_page_layout_source) = match display_override {
+                Some((left, right)) => (
+                    FsPageLayoutSource::Captured {
+                        layout_size: left.layout_size,
+                        post_filter: left.post_filter,
+                        fit_input: left.fit_input,
+                    },
+                    FsPageLayoutSource::Captured {
+                        layout_size: right.layout_size,
+                        post_filter: right.post_filter,
+                        fit_input: right.fit_input,
+                    },
+                ),
+                None => (
+                    FsPageLayoutSource::CurrentItem,
+                    FsPageLayoutSource::CurrentItem,
+                ),
             };
 
-            // ZipPla ズーム確定中は gap も合成ページと同率 (total_scale / fit_scale = zoom) で拡大し、
-            // composite に含めた gap_page と整合させる (Codex P3: 照準枠 ↔ 確定の表示範囲を一致)。
-            // 通常表示・照準・手動 Ctrl+ホイールズームでは従来どおり一定の gap を使う。
-            let effective_gap = if captured_placement.is_none() && self.fs_zoom_mode_active() {
-                spread_gap * (total_scale / fit_scale.max(f32::EPSILON))
-            } else {
-                spread_gap
-            };
-
-            // 見える領域を中央に配置し、フルページ矩形はその背後へ戻す。
-            let resolve_layout = |app: &mut App,
-                                  placement: ResolvedDisplayPlacement,
-                                  zp: Option<(f32, egui::Vec2)>| {
-                let (scale, base_center) = zp
-                    .map_or((fit_scale, image_rect.center()), |(zoom, pan)| {
-                        (fit_scale * zoom, image_rect.center() + pan)
-                    });
-                let center = base_center - geometry.content_center_offset * scale;
-                let total_scale = scale;
-                let resolved_placement = placement;
-                let spread_rects = layout_spread_page_rects(
-                    center,
-                    geometry,
-                    total_scale,
-                    effective_gap,
+            // ズーム/パンが有効な場合は image_rect でクリップする
+            // (ズーム時にページが image_rect 外へはみ出して他の UI を覆わないようにするため)
+            if let (Some(ls), Some(rs)) = (left_size, right_size) {
+                let spread_gap = quantize_points_to_physical_pixels(
+                    self.settings.spread_page_gap_px.min(200) as f32,
                     pixels_per_point,
-                    left_bbox,
-                    right_bbox,
-                    content_active,
                 );
+                let full_bbox =
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                let left_bbox = content_left.unwrap_or(full_bbox);
+                let right_bbox = content_right.unwrap_or(full_bbox);
+                let content_active = content_left.is_some() || content_right.is_some();
+                let specified = display_override
+                    .and_then(|(left, _)| fit_input_specified_size(left.fit_input))
+                    .unwrap_or(self.settings.fullscreen_specified_scale);
+                let Some((geometry, auto_fit)) = canonical_demand::spread_auto_layout(
+                    [ls, rs],
+                    [content_left, content_right],
+                    fit_mode,
+                    specified,
+                    display_override
+                        .and_then(|(left, _)| fit_input_specified_max_tenths(left.fit_input))
+                        .unwrap_or(self.settings.fullscreen_specified_scale_max_tenths),
+                    image_rect,
+                    spread_gap,
+                    fit_scale_limits,
+                ) else {
+                    return FsNavigatorTextureSources::default();
+                };
+                let spread_gap = auto_fit.gap;
+                let fit_scale = auto_fit.scale;
 
-                // 左右を独立に物理ピクセルへ寄せると、レイアウトが空けた間隔が最終矩形では
-                // 保たれない (§1.154)。寄せ終わった矩形を先に求め、1 か所で両方を置き直す。
-                // 片側だけ寄せ直さないのは、それだと組が中心からずれるため。
-                let (spread_offsets, unit) = {
-                    let mut resolve = |rect,
-                                       idx,
-                                       source_size,
-                                       layout_source,
-                                       rot,
-                                       display_tex,
-                                       allow_thumbnail,
-                                       content_bbox| {
-                        let handle =
-                            app.fs_spread_page_paint_resource(idx, display_tex, allow_thumbnail)?;
-                        app.resolve_fs_spread_page_payload_transform(
-                            &handle,
+                // Height matching now depends only on fit mode, so the geometry is final before the
+                // ZipPla solve. The old result-dependent geometry feedback loop is structurally gone,
+                // and zoom needs to be resolved only once.
+                let zip_input = if captured_placement.is_none() && self.fs_zoom_mode_effective() {
+                    let top_m = TOP_BAR_HOVER_Y.min(image_rect.height() * 0.25);
+                    let bottom_m =
+                        (seek_geometry.total_height + 8.0).min(image_rect.height() * 0.25);
+                    let pan_band = egui::Rect::from_min_max(
+                        egui::pos2(image_rect.left(), image_rect.top() + top_m),
+                        egui::pos2(image_rect.right(), image_rect.bottom() - bottom_m),
+                    );
+                    let cursor = ctx
+                        .input(|i| i.pointer.hover_pos())
+                        .unwrap_or_else(|| image_rect.center());
+                    Some((pan_band, cursor))
+                } else {
+                    None
+                };
+                let zip_result = zip_input.map(|(pan_band, cursor)| {
+                    resolve_spread_zip_zoom(
+                        image_rect,
+                        pan_band,
+                        cursor,
+                        geometry.fit_size,
+                        spread_gap,
+                        fit_scale,
+                        self.fs_zoom_factor,
+                        self.fs_zoom_mode_active(),
+                    )
+                });
+                if let Some(result) = zip_result {
+                    self.fs_zoom_factor = result.factor;
+                }
+                let mut resolved_zoom_pan = zip_result
+                    .and_then(|result| result.zoom_pan)
+                    .or(zoom_pan.filter(|_| zip_input.is_none()));
+                let aim_frame = zip_result.and_then(|result| result.aim_frame);
+                let total_scale = resolved_zoom_pan.map_or(fit_scale, |(zoom, _)| fit_scale * zoom);
+                let mut resolved_placement = if zip_input.is_some() {
+                    ResolvedDisplayPlacement::Z {
+                        active: self.fs_zoom_mode_active(),
+                        factor: self.fs_zoom_factor,
+                        zoom_pan: resolved_zoom_pan,
+                        singleton_side: SingletonSpreadPlacement::Center,
+                        singleton_gap: 0.0,
+                    }
+                } else {
+                    ResolvedDisplayPlacement::Normal {
+                        zoom_pan: resolved_zoom_pan,
+                    }
+                };
+
+                // ZipPla ズーム確定中は gap も合成ページと同率 (total_scale / fit_scale = zoom) で拡大し、
+                // composite に含めた gap_page と整合させる (Codex P3: 照準枠 ↔ 確定の表示範囲を一致)。
+                // 通常表示・照準・手動 Ctrl+ホイールズームでは従来どおり一定の gap を使う。
+                let effective_gap = if captured_placement.is_none() && self.fs_zoom_mode_active() {
+                    spread_gap * (total_scale / fit_scale.max(f32::EPSILON))
+                } else {
+                    spread_gap
+                };
+
+                // 見える領域を中央に配置し、フルページ矩形はその背後へ戻す。
+                let resolve_layout =
+                    |app: &mut App,
+                     placement: ResolvedDisplayPlacement,
+                     zp: Option<(f32, egui::Vec2)>| {
+                        let (scale, base_center) = zp
+                            .map_or((fit_scale, image_rect.center()), |(zoom, pan)| {
+                                (fit_scale * zoom, image_rect.center() + pan)
+                            });
+                        let center = base_center - geometry.content_center_offset * scale;
+                        let total_scale = scale;
+                        let resolved_placement = placement;
+                        let spread_rects = layout_spread_page_rects(
+                            center,
+                            geometry,
+                            total_scale,
+                            effective_gap,
+                            pixels_per_point,
+                            left_bbox,
+                            right_bbox,
+                            content_active,
+                        );
+
+                        // 左右を独立に物理ピクセルへ寄せると、レイアウトが空けた間隔が最終矩形では
+                        // 保たれない (§1.154)。寄せ終わった矩形を先に求め、1 か所で両方を置き直す。
+                        // 片側だけ寄せ直さないのは、それだと組が中心からずれるため。
+                        let (spread_offsets, unit) = {
+                            let mut resolve =
+                                |rect,
+                                 idx,
+                                 source_size,
+                                 layout_source,
+                                 rot,
+                                 display_tex,
+                                 allow_thumbnail,
+                                 content_bbox| {
+                                    let handle = app.fs_spread_page_paint_resource(
+                                        idx,
+                                        display_tex,
+                                        allow_thumbnail && !select_initial_material,
+                                    )?;
+                                    app.resolve_fs_spread_page_payload_transform(
+                                        &handle,
+                                        image_rect,
+                                        rect,
+                                        idx,
+                                        source_size,
+                                        layout_source,
+                                        rot,
+                                        content_bbox,
+                                        pixels_per_point,
+                                        resolved_placement,
+                                    )
+                                };
+                            let left = resolve(
+                                spread_rects.left_rect,
+                                left_idx,
+                                left_coordinate_size,
+                                left_page_layout_source,
+                                left_rot,
+                                left_display_tex.as_ref(),
+                                left_allow_thumbnail,
+                                content_left,
+                            );
+                            let right = resolve(
+                                spread_rects.right_rect,
+                                right_idx,
+                                right_coordinate_size,
+                                right_page_layout_source,
+                                right_rot,
+                                right_display_tex.as_ref(),
+                                right_allow_thumbnail,
+                                content_right,
+                            );
+                            match (left, right) {
+                                (Some(left), Some(right)) => {
+                                    let offsets = align_spread_pages_for_gap(
+                                        &left,
+                                        &right,
+                                        (effective_gap.max(0.0) * pixels_per_point).round(),
+                                        pixels_per_point,
+                                    );
+                                    let unit = left
+                                        .paint_rect
+                                        .translate(offsets.0)
+                                        .union(right.paint_rect.translate(offsets.1));
+                                    (offsets, Some(unit))
+                                }
+                                _ => ((egui::Vec2::ZERO, egui::Vec2::ZERO), None),
+                            }
+                        };
+
+                        (spread_rects, spread_offsets, unit)
+                    };
+                let mut initial_placement_applied = false;
+                let mut initial_zero_pan_unit = None;
+                if propose_initial_placement {
+                    initial_zero_pan_unit = self.fs_initial_placement_request.and_then(|request| {
+                        resolve_layout(
+                            self,
+                            ResolvedDisplayPlacement::Normal {
+                                zoom_pan: Some((request.base_zoom, egui::Vec2::ZERO)),
+                            },
+                            Some((request.base_zoom, egui::Vec2::ZERO)),
+                        )
+                        .2
+                    });
+                    if let Some(pan) = self.fs_initial_placement_pan(
+                        self.fullscreen_idx.unwrap_or(left_idx),
+                        selected_current,
+                        image_rect,
+                        initial_zero_pan_unit,
+                    ) {
+                        initial_placement_applied = true;
+                        zoom_pan = Self::fs_zoom_pan_for(self.fs_zoom, pan);
+                        resolved_zoom_pan = zoom_pan;
+                        resolved_placement = ResolvedDisplayPlacement::Normal { zoom_pan };
+                    }
+                }
+                let (spread_rects, spread_offsets, _) =
+                    resolve_layout(self, resolved_placement, resolved_zoom_pan);
+                let painter = ui
+                    .painter()
+                    .with_clip_rect(canonical_demand::spread_clip_rect(
+                        ui.painter().clip_rect(),
+                        image_rect,
+                        zoom_pan,
+                        [content_left, content_right],
+                        fit_mode,
+                        fit_scale_limits,
+                        self.fs_zoom_mode_effective(),
+                    ));
+                let mut selected_transforms = [None, None];
+                let mut native_materials = [None, None];
+                if select_initial_material {
+                    // Preflight only paint-only Native leases. Normal inputs always
+                    // prepare successfully and must not repeat GPU work while the
+                    // other side selects its one existing thumbnail alternative.
+                    for (
+                        side,
+                        idx,
+                        rect,
+                        source_size,
+                        layout_source,
+                        rot,
+                        content_bbox,
+                        offset,
+                        handle,
+                    ) in [
+                        (
+                            0,
+                            left_idx,
+                            spread_rects.left_rect,
+                            left_coordinate_size,
+                            left_page_layout_source,
+                            left_rot,
+                            content_left,
+                            spread_offsets.0,
+                            left_display_tex.clone(),
+                        ),
+                        (
+                            1,
+                            right_idx,
+                            spread_rects.right_rect,
+                            right_coordinate_size,
+                            right_page_layout_source,
+                            right_rot,
+                            content_right,
+                            spread_offsets.1,
+                            right_display_tex.clone(),
+                        ),
+                    ] {
+                        let Some(handle) = handle else {
+                            continue;
+                        };
+                        let Some(transform) = self
+                            .resolve_fs_spread_page_payload_transform(
+                                &handle,
+                                image_rect,
+                                rect,
+                                idx,
+                                source_size,
+                                layout_source,
+                                rot,
+                                content_bbox,
+                                pixels_per_point,
+                                resolved_placement,
+                            )
+                            .map(|transform| transform.translated_by(offset))
+                        else {
+                            continue;
+                        };
+                        selected_transforms[side] = Some(transform);
+                        if matches!(&handle, FullscreenPaintPayload::PresentationMaterial(material) if material.source_texture().is_none())
+                        {
+                            native_materials[side] = self.prepare_fs_paged_paint_payload(
+                                &handle,
+                                &transform,
+                                &painter,
+                                &bg_style,
+                                layout_source,
+                                submit_final
+                                    && !original_preview_active
+                                    && !color_faithful_rendition_unit
+                                    && self.page_turn_view_eligible(idx)
+                                    && zoom_pan.is_none(),
+                            );
+                            if native_materials[side].is_none() {
+                                selected_transforms[side] = None;
+                                let fallback_available = if side == 0 {
+                                    &mut left_fallback_available
+                                } else {
+                                    &mut right_fallback_available
+                                };
+                                if *fallback_available {
+                                    *fallback_available = false;
+                                    if let Some(fallback) =
+                                        self.fs_spread_page_paint_resource(idx, None, true)
+                                    {
+                                        if side == 0 {
+                                            left_display_tex = Some(fallback);
+                                            left_using_full_texture = false;
+                                        } else {
+                                            right_display_tex = Some(fallback);
+                                            right_using_full_texture = false;
+                                        }
+                                        continue 'material_selection;
+                                    }
+                                    // The rejected Native still supplies the measured
+                                    // unit geometry. Its absent selected transform
+                                    // excludes it from paint; the other side retains
+                                    // the committed pan instead of losing its layout.
+                                }
+                            }
+                        }
+                    }
+                    if initial_placement_applied && selected_transforms.iter().any(Option::is_none)
+                    {
+                        // Preserve partial painting, using only the committed pan.
+                        // No Normal material has been prepared yet in this pass.
+                        propose_initial_placement = false;
+                        continue 'material_selection;
+                    }
+                }
+                self.fullscreen_page_layout
+                    .begin(FullscreenPageLayoutKind::Spread);
+                for (
+                    page_offset,
+                    rect,
+                    idx,
+                    source_size,
+                    layout_source,
+                    rot,
+                    location,
+                    display_tex,
+                    allow_thumbnail,
+                    content_bbox,
+                ) in [
+                    (
+                        spread_offsets.0,
+                        spread_rects.left_rect,
+                        left_idx,
+                        left_coordinate_size,
+                        left_page_layout_source,
+                        left_rot,
+                        &left_location,
+                        left_display_tex.clone(),
+                        left_allow_thumbnail,
+                        content_left,
+                    ),
+                    (
+                        spread_offsets.1,
+                        spread_rects.right_rect,
+                        right_idx,
+                        right_coordinate_size,
+                        right_page_layout_source,
+                        right_rot,
+                        &right_location,
+                        right_display_tex.clone(),
+                        right_allow_thumbnail,
+                        content_right,
+                    ),
+                ] {
+                    let using_full_texture = if idx == left_idx {
+                        left_using_full_texture
+                    } else {
+                        right_using_full_texture
+                    };
+                    let live_eligible = submit_final
+                        && !original_preview_active
+                        && !color_faithful_rendition_unit
+                        && self.settings.page_turn_animation_enabled
+                        && self.page_turn_view_eligible(idx)
+                        && (!select_initial_material || (zoom_pan.is_none() && using_full_texture));
+                    let prepared = if select_initial_material {
+                        let side = usize::from(idx == right_idx);
+                        match (display_tex.as_ref(), selected_transforms[side]) {
+                            (Some(handle), Some(transform)) => {
+                                let resource = if matches!(handle, FullscreenPaintPayload::PresentationMaterial(material) if material.source_texture().is_none())
+                                {
+                                    native_materials[side].take()
+                                } else {
+                                    self.prepare_fs_paged_paint_payload(
+                                        handle,
+                                        &transform,
+                                        &painter,
+                                        &bg_style,
+                                        layout_source,
+                                        live_eligible,
+                                    )
+                                };
+                                resource.map(|resource| PreparedPagedPage {
+                                    crop: None,
+                                    occurrence: SpreadPageOccurrence::navigation(idx, idx),
+                                    transform,
+                                    resource,
+                                    painter: painter.clone(),
+                                    underlay: bg_style.clone(),
+                                    spine: None,
+                                    live: live_eligible
+                                        && matches!(layout_source, FsPageLayoutSource::CurrentItem),
+                                })
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        self.prepare_fs_spread_page(
+                            &painter,
                             image_rect,
                             rect,
                             idx,
                             source_size,
                             layout_source,
                             rot,
+                            &bg_style,
+                            location,
+                            display_tex.as_ref(),
+                            allow_thumbnail,
                             content_bbox,
                             pixels_per_point,
                             resolved_placement,
+                            page_offset,
+                            live_eligible,
                         )
                     };
-                    let left = resolve(
-                        spread_rects.left_rect,
+                    if let Some(mut page) = prepared {
+                        if let Some(occurrence) =
+                            occurrences.iter().find(|occurrence| occurrence.idx == idx)
+                        {
+                            page.occurrence = *occurrence;
+                        }
+                        page.spine = Some(spread_rects.spine);
+                        if submit_final && !select_initial_material {
+                            page = self.page_turn_bind_prepared(page);
+                        }
+                        if !select_initial_material {
+                            self.fullscreen_page_layout
+                                .push_occurrence(page.transform, page.occurrence);
+                        }
+                        prepared_pages[usize::from(idx == right_idx)] = Some(page);
+                    } else {
+                        missing_pages[usize::from(idx == right_idx)] =
+                            Some((idx, rect, location.as_str()));
+                    }
+                }
+                if initial_placement_applied {
+                    let material_kind = if prepared_pages.iter().all(|page| {
+                        page.as_ref().is_some_and(|page| {
+                            page.resource.page_material_kind()
+                                == FullscreenPageMaterialKind::Complete
+                        })
+                    }) {
+                        FullscreenPageMaterialKind::Complete
+                    } else {
+                        FullscreenPageMaterialKind::Provisional
+                    };
+                    self.resolve_fs_initial_placement(
+                        self.fullscreen_idx.unwrap_or(left_idx),
+                        selected_current,
+                        image_rect,
+                        initial_zero_pan_unit,
+                        material_kind,
+                    );
+                }
+                if select_initial_material {
+                    for slot in &mut prepared_pages {
+                        if let Some(mut page) = slot.take() {
+                            self.observe_raw_presentation(page.occurrence.idx);
+                            if submit_final {
+                                page = self.page_turn_bind_prepared(page);
+                            }
+                            self.fullscreen_page_layout
+                                .push_occurrence(page.transform, page.occurrence);
+                            *slot = Some(page);
+                        }
+                    }
+                }
+                submitted_sources = self.submit_fs_spread_prepared(
+                    ctx,
+                    prepared_pages,
+                    display_override.is_some(),
+                    submit_final,
+                );
+                for (idx, rect, location) in missing_pages.into_iter().flatten() {
+                    self.paint_fs_spread_loading(&painter, rect, idx, &location);
+                }
+
+                // ZipPla ズーム照準中の枠 (見開き)。離すと枠の範囲が全画面化する。
+                if let Some(frame) = aim_frame {
+                    let frame_painter = ui.painter().with_clip_rect(image_rect);
+                    let dim = egui::Color32::from_black_alpha(120);
+                    for r in capture_region_outside_rects(image_rect, frame) {
+                        frame_painter.rect_filled(r, 0.0, dim);
+                    }
+                    frame_painter.rect_stroke(
+                        frame,
+                        0.0,
+                        egui::Stroke::new(2.0, ui.visuals().selection.bg_fill),
+                        egui::StrokeKind::Outside,
+                    );
+                }
+            } else {
+                if display_override.is_none() {
+                    self.resolve_fs_initial_placement(
+                        self.fullscreen_idx.unwrap_or(left_idx),
+                        selected_current,
+                        image_rect,
+                        None,
+                        FullscreenPageMaterialKind::Provisional,
+                    );
+                }
+                let painter = ui
+                    .painter()
+                    .with_clip_rect(canonical_demand::spread_clip_rect(
+                        ui.painter().clip_rect(),
+                        image_rect,
+                        zoom_pan,
+                        [content_left, content_right],
+                        fit_mode,
+                        fit_scale_limits,
+                        self.fs_zoom_mode_effective(),
+                    ));
+
+                // サイズ不明の場合は均等分割フォールバック
+                // (ズーム/パンはサイズが分かってからでないと正しく計算できないため適用しない)
+                let spread_gap = quantize_points_to_physical_pixels(
+                    self.settings.spread_page_gap_px.min(200) as f32,
+                    pixels_per_point,
+                );
+                let half_w = (image_rect.width() - spread_gap).max(2.0) / 2.0;
+                let left_rect = egui::Rect::from_min_size(
+                    image_rect.min,
+                    egui::vec2(half_w, image_rect.height()),
+                );
+                let right_rect = egui::Rect::from_min_size(
+                    egui::pos2(image_rect.min.x + half_w + spread_gap, image_rect.min.y),
+                    egui::vec2(half_w, image_rect.height()),
+                );
+                for (
+                    rect,
+                    idx,
+                    source_size,
+                    layout_source,
+                    rot,
+                    location,
+                    display_tex,
+                    allow_thumbnail,
+                    content_bbox,
+                ) in [
+                    (
+                        left_rect,
                         left_idx,
                         left_coordinate_size,
                         left_page_layout_source,
                         left_rot,
+                        &left_location,
                         left_display_tex.as_ref(),
                         left_allow_thumbnail,
                         content_left,
-                    );
-                    let right = resolve(
-                        spread_rects.right_rect,
+                    ),
+                    (
+                        right_rect,
                         right_idx,
                         right_coordinate_size,
                         right_page_layout_source,
                         right_rot,
+                        &right_location,
                         right_display_tex.as_ref(),
                         right_allow_thumbnail,
                         content_right,
-                    );
-                    match (left, right) {
-                        (Some(left), Some(right)) => {
-                            let offsets = align_spread_pages_for_gap(
-                                &left,
-                                &right,
-                                (effective_gap.max(0.0) * pixels_per_point).round(),
-                                pixels_per_point,
-                            );
-                            let unit = left
-                                .paint_rect
-                                .translate(offsets.0)
-                                .union(right.paint_rect.translate(offsets.1));
-                            (offsets, Some(unit))
+                    ),
+                ] {
+                    if let Some(mut page) = self.prepare_fs_spread_page(
+                        &painter,
+                        image_rect,
+                        rect,
+                        idx,
+                        source_size,
+                        layout_source,
+                        rot,
+                        &bg_style,
+                        location,
+                        display_tex,
+                        allow_thumbnail,
+                        content_bbox,
+                        pixels_per_point,
+                        ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                        // 寸法未確定のフォールバック。間隔合わせの前提 (最終幅が分かって
+                        // いること) が成り立たないので、ここでは合わせない。
+                        egui::Vec2::ZERO,
+                        false,
+                    ) {
+                        if let Some(occurrence) =
+                            occurrences.iter().find(|occurrence| occurrence.idx == idx)
+                        {
+                            page.occurrence = *occurrence;
                         }
-                        _ => ((egui::Vec2::ZERO, egui::Vec2::ZERO), None),
+                        page.live = false;
+                        prepared_pages[usize::from(idx == right_idx)] = Some(page);
+                    } else {
+                        missing_pages[usize::from(idx == right_idx)] =
+                            Some((idx, rect, location.as_str()));
                     }
-                };
-
-                (spread_rects, spread_offsets, unit)
-            };
-            if display_override.is_none() {
-                let zero_unit = self.fs_initial_placement_request.and_then(|request| {
-                    resolve_layout(
-                        self,
-                        ResolvedDisplayPlacement::Normal {
-                            zoom_pan: Some((request.base_zoom, egui::Vec2::ZERO)),
-                        },
-                        Some((request.base_zoom, egui::Vec2::ZERO)),
-                    )
-                    .2
-                });
-                if self.resolve_fs_initial_placement(
-                    self.fullscreen_idx.unwrap_or(left_idx),
-                    selected_current,
-                    image_rect,
-                    zero_unit,
-                ) {
-                    zoom_pan = self.fs_zoom_pan();
-                    resolved_zoom_pan = zoom_pan;
-                    resolved_placement = ResolvedDisplayPlacement::Normal { zoom_pan };
                 }
-            }
-            let (spread_rects, spread_offsets, _) =
-                resolve_layout(self, resolved_placement, resolved_zoom_pan);
-            let painter = ui
-                .painter()
-                .with_clip_rect(canonical_demand::spread_clip_rect(
-                    ui.painter().clip_rect(),
-                    image_rect,
-                    zoom_pan,
-                    [content_left, content_right],
-                    fit_mode,
-                    fit_scale_limits,
-                    self.fs_zoom_mode_effective(),
-                ));
-            self.fullscreen_page_layout
-                .begin(FullscreenPageLayoutKind::Spread);
-            for (
-                page_offset,
-                rect,
-                idx,
-                source_size,
-                layout_source,
-                rot,
-                location,
-                display_tex,
-                allow_thumbnail,
-                content_bbox,
-            ) in [
-                (
-                    spread_offsets.0,
-                    spread_rects.left_rect,
-                    left_idx,
-                    left_coordinate_size,
-                    left_page_layout_source,
-                    left_rot,
-                    &left_location,
-                    left_display_tex.as_ref(),
-                    left_allow_thumbnail,
-                    content_left,
-                ),
-                (
-                    spread_offsets.1,
-                    spread_rects.right_rect,
-                    right_idx,
-                    right_coordinate_size,
-                    right_page_layout_source,
-                    right_rot,
-                    &right_location,
-                    right_display_tex.as_ref(),
-                    right_allow_thumbnail,
-                    content_right,
-                ),
-            ] {
-                if let Some(mut page) = self.prepare_fs_spread_page(
-                    &painter,
-                    image_rect,
-                    rect,
-                    idx,
-                    source_size,
-                    layout_source,
-                    rot,
-                    &bg_style,
-                    location,
-                    display_tex,
-                    allow_thumbnail,
-                    content_bbox,
-                    pixels_per_point,
-                    resolved_placement,
-                    page_offset,
-                    submit_final
-                        && !original_preview_active
-                        && !color_faithful_rendition_unit
-                        && self.settings.page_turn_animation_enabled
-                        && self.page_turn_view_eligible(idx),
-                ) {
-                    if let Some(occurrence) =
-                        occurrences.iter().find(|occurrence| occurrence.idx == idx)
-                    {
-                        page.occurrence = *occurrence;
-                    }
-                    page.spine = Some(spread_rects.spine);
-                    if submit_final {
-                        page = self.page_turn_bind_prepared(page);
-                    }
-                    self.fullscreen_page_layout
-                        .push_occurrence(page.transform, page.occurrence);
-                    prepared_pages[usize::from(idx == right_idx)] = Some(page);
-                } else {
-                    missing_pages[usize::from(idx == right_idx)] =
-                        Some((idx, rect, location.as_str()));
-                }
-            }
-            submitted_sources = self.submit_fs_spread_prepared(
-                ctx,
-                prepared_pages,
-                display_override.is_some(),
-                submit_final,
-            );
-            for (idx, rect, location) in missing_pages.into_iter().flatten() {
-                self.paint_fs_spread_loading(&painter, rect, idx, &location);
-            }
-
-            // ZipPla ズーム照準中の枠 (見開き)。離すと枠の範囲が全画面化する。
-            if let Some(frame) = aim_frame {
-                let frame_painter = ui.painter().with_clip_rect(image_rect);
-                let dim = egui::Color32::from_black_alpha(120);
-                for r in capture_region_outside_rects(image_rect, frame) {
-                    frame_painter.rect_filled(r, 0.0, dim);
-                }
-                frame_painter.rect_stroke(
-                    frame,
-                    0.0,
-                    egui::Stroke::new(2.0, ui.visuals().selection.bg_fill),
-                    egui::StrokeKind::Outside,
+                submitted_sources = self.submit_fs_spread_prepared(
+                    ctx,
+                    prepared_pages,
+                    display_override.is_some(),
+                    submit_final,
                 );
-            }
-        } else {
-            if display_override.is_none() {
-                self.resolve_fs_initial_placement(
-                    self.fullscreen_idx.unwrap_or(left_idx),
-                    selected_current,
-                    image_rect,
-                    None,
-                );
-            }
-            let painter = ui
-                .painter()
-                .with_clip_rect(canonical_demand::spread_clip_rect(
-                    ui.painter().clip_rect(),
-                    image_rect,
-                    zoom_pan,
-                    [content_left, content_right],
-                    fit_mode,
-                    fit_scale_limits,
-                    self.fs_zoom_mode_effective(),
-                ));
-
-            // サイズ不明の場合は均等分割フォールバック
-            // (ズーム/パンはサイズが分かってからでないと正しく計算できないため適用しない)
-            let spread_gap = quantize_points_to_physical_pixels(
-                self.settings.spread_page_gap_px.min(200) as f32,
-                pixels_per_point,
-            );
-            let half_w = (image_rect.width() - spread_gap).max(2.0) / 2.0;
-            let left_rect =
-                egui::Rect::from_min_size(image_rect.min, egui::vec2(half_w, image_rect.height()));
-            let right_rect = egui::Rect::from_min_size(
-                egui::pos2(image_rect.min.x + half_w + spread_gap, image_rect.min.y),
-                egui::vec2(half_w, image_rect.height()),
-            );
-            for (
-                rect,
-                idx,
-                source_size,
-                layout_source,
-                rot,
-                location,
-                display_tex,
-                allow_thumbnail,
-                content_bbox,
-            ) in [
-                (
-                    left_rect,
-                    left_idx,
-                    left_coordinate_size,
-                    left_page_layout_source,
-                    left_rot,
-                    &left_location,
-                    left_display_tex.as_ref(),
-                    left_allow_thumbnail,
-                    content_left,
-                ),
-                (
-                    right_rect,
-                    right_idx,
-                    right_coordinate_size,
-                    right_page_layout_source,
-                    right_rot,
-                    &right_location,
-                    right_display_tex.as_ref(),
-                    right_allow_thumbnail,
-                    content_right,
-                ),
-            ] {
-                if let Some(mut page) = self.prepare_fs_spread_page(
-                    &painter,
-                    image_rect,
-                    rect,
-                    idx,
-                    source_size,
-                    layout_source,
-                    rot,
-                    &bg_style,
-                    location,
-                    display_tex,
-                    allow_thumbnail,
-                    content_bbox,
-                    pixels_per_point,
-                    ResolvedDisplayPlacement::Normal { zoom_pan: None },
-                    // 寸法未確定のフォールバック。間隔合わせの前提 (最終幅が分かって
-                    // いること) が成り立たないので、ここでは合わせない。
-                    egui::Vec2::ZERO,
-                    false,
-                ) {
-                    if let Some(occurrence) =
-                        occurrences.iter().find(|occurrence| occurrence.idx == idx)
-                    {
-                        page.occurrence = *occurrence;
-                    }
-                    page.live = false;
-                    prepared_pages[usize::from(idx == right_idx)] = Some(page);
-                } else {
-                    missing_pages[usize::from(idx == right_idx)] =
-                        Some((idx, rect, location.as_str()));
+                for (idx, rect, location) in missing_pages.into_iter().flatten() {
+                    self.paint_fs_spread_loading(&painter, rect, idx, &location);
                 }
+                // フォールバック分岐: サイズ未確定でアスペクト比が崩れる可能性があるため、
+                // ルーペ用レイアウトには書かない (ルーペは非見開きパスのロジックで描画しない)。
+                self.fullscreen_page_layout.clear();
             }
-            submitted_sources = self.submit_fs_spread_prepared(
-                ctx,
-                prepared_pages,
-                display_override.is_some(),
-                submit_final,
-            );
-            for (idx, rect, location) in missing_pages.into_iter().flatten() {
-                self.paint_fs_spread_loading(&painter, rect, idx, &location);
-            }
-            // フォールバック分岐: サイズ未確定でアスペクト比が崩れる可能性があるため、
-            // ルーペ用レイアウトには書かない (ルーペは非見開きパスのロジックで描画しない)。
-            self.fullscreen_page_layout.clear();
+
+            break;
         }
-
         submitted_sources
     }
 

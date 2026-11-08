@@ -22516,14 +22516,9 @@ impl App {
         if !self.display_texture_matches_page(tex, idx) {
             return Err(PassthroughUnavailable::IdentityMismatch);
         }
-        Ok(
-            self.fs_direct_resource_for_accepted_texture(
-                idx,
-                tex.clone(),
-                coverage,
-                *display_basis,
-            ),
-        )
+        Ok(self
+            .fs_direct_resource_for_accepted_texture(idx, tex.clone(), coverage, *display_basis)
+            .with_page_material_kind(crate::gpu_lanczos::FullscreenPageMaterialKind::Provisional))
     }
 
     /// Resolve media policy only while adopting a producer. The dimensions and
@@ -96234,7 +96229,11 @@ impl App {
         mut perf: Option<&mut PassthroughRenditionPerfRecorder>,
     ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
         if self.raw_development_blocked(idx) {
-            return self.resolve_original_preview_material(idx);
+            return self.resolve_original_preview_material(idx).map(|material| {
+                material.with_page_material_kind(
+                    crate::gpu_lanczos::FullscreenPageMaterialKind::Provisional,
+                )
+            });
         }
         if !self.raw_fullscreen_fallback_allowed(idx) {
             return None;
@@ -96265,7 +96264,9 @@ impl App {
             perf.calls.push(perf_call);
         }
         match outcome {
-            Ok(texture) => Some(texture),
+            Ok(texture) => Some(texture.with_page_material_kind(
+                crate::gpu_lanczos::FullscreenPageMaterialKind::Provisional,
+            )),
             Err(reason) => {
                 self.note_passthrough_unavailable(idx, reason);
                 None
@@ -96563,7 +96564,11 @@ impl App {
         idx: usize,
     ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
         if self.raw_development_blocked(idx) {
-            return self.resolve_original_preview_material(idx);
+            return self.resolve_original_preview_material(idx).map(|material| {
+                material.with_page_material_kind(
+                    crate::gpu_lanczos::FullscreenPageMaterialKind::Provisional,
+                )
+            });
         }
         if !self.raw_fullscreen_fallback_allowed(idx) {
             return None;
@@ -96587,6 +96592,9 @@ impl App {
                     self.resolve_preview_coverage_for_display(idx, entry.source_coverage)
                         .expect("coverage checked on this entry"),
                     entry.display_basis,
+                )
+                .with_page_material_kind(
+                    crate::gpu_lanczos::FullscreenPageMaterialKind::Provisional,
                 )
             })
     }
@@ -105403,6 +105411,28 @@ mod material_display_owner_tests {
         let held = app.ensure_passthrough_material(&ctx, 0).unwrap();
         let captured = held.capture_presentation(&ctx);
         let sibling = app.ensure_passthrough_material(&ctx, 1).unwrap();
+        for material in [&held, &sibling] {
+            assert_eq!(
+                material.page_material_kind(),
+                crate::gpu_lanczos::FullscreenPageMaterialKind::Provisional
+            );
+        }
+        assert_eq!(
+            captured.page_material_kind(),
+            crate::gpu_lanczos::FullscreenPageMaterialKind::Provisional
+        );
+        assert_eq!(
+            app.fs_thumbnail_resource_for_display(0)
+                .unwrap()
+                .page_material_kind(),
+            crate::gpu_lanczos::FullscreenPageMaterialKind::Provisional
+        );
+        assert_eq!(
+            app.ensure_passthrough_material(&ctx, 0)
+                .unwrap()
+                .page_material_kind(),
+            crate::gpu_lanczos::FullscreenPageMaterialKind::Provisional
+        );
         let old = held.display_basis();
         assert_eq!(old.specified(), Err(U::PdfMetadataUnavailable));
         let thumbnail_legacy = L::SourceLayout {
@@ -105425,11 +105455,19 @@ mod material_display_owner_tests {
         );
         assert!(app.cached_passthrough_material(0).is_none());
         let unchanged = app.cached_passthrough_material(1).unwrap();
+        assert_eq!(
+            unchanged.page_material_kind(),
+            crate::gpu_lanczos::FullscreenPageMaterialKind::Provisional
+        );
         assert_eq!(unchanged.display_basis(), sibling.display_basis());
         assert_eq!(unchanged.source_texture_id(), sibling.source_texture_id());
         assert_eq!(held.display_basis(), old);
         assert_eq!(captured.display_basis(), old);
         let rebuilt = app.ensure_passthrough_material(&ctx, 0).unwrap();
+        assert_eq!(
+            rebuilt.page_material_kind(),
+            crate::gpu_lanczos::FullscreenPageMaterialKind::Provisional
+        );
         assert!(rebuilt.display_basis().specified().is_ok());
         assert_eq!(rebuilt.display_basis().legacy(V::Single), thumbnail_legacy);
         app.readopt_loaded_pdf_thumbnail_basis(0, metadata);

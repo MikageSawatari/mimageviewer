@@ -1,5 +1,6 @@
-//! One-shot page-entry positioning. Geometry is resolved by the actual paint path.
+//! Page-entry positioning: provisional paint aligns until the first complete unit.
 use super::*;
+use crate::gpu_lanczos::FullscreenPageMaterialKind;
 
 #[cfg(test)]
 mod tests;
@@ -68,17 +69,17 @@ impl App {
         }
     }
 
-    /// The sole consumer. An unavailable selected-material geometry or holdover
-    /// retains the request; changed identity or transform retires it.
-    pub(super) fn resolve_fs_initial_placement(
+    /// Propose without publishing a transform from a material that preparation
+    /// may still reject. Every fallback starts from the unchanged request.
+    pub(super) fn fs_initial_placement_pan(
         &mut self,
         anchor_idx: usize,
         selected_current: bool,
         viewport: egui::Rect,
         zero_pan_unit: Option<egui::Rect>,
-    ) -> bool {
+    ) -> Option<egui::Vec2> {
         let Some(request) = self.fs_initial_placement_request else {
-            return false;
+            return None;
         };
         if request.items_generation != self.items_generation
             || request.anchor_idx != anchor_idx
@@ -86,23 +87,50 @@ impl App {
             || self.fs_pan != request.base_pan
         {
             self.clear_fs_initial_placement_request();
-            return false;
+            return None;
         }
         if !selected_current {
-            return false;
+            return None;
         }
         let Some(unit) = zero_pan_unit else {
-            return false;
+            return None;
         };
-        self.fs_pan = reading_start_pan(
+        Some(reading_start_pan(
             unit,
             viewport,
             self.spread_mode
                 .reading_direction()
                 .unwrap_or(self.reading_direction),
             request.base_pan,
-        );
-        self.clear_fs_initial_placement_request();
+        ))
+    }
+
+    /// The sole consumer, after preparation selected the actual paint material.
+    pub(super) fn resolve_fs_initial_placement(
+        &mut self,
+        anchor_idx: usize,
+        selected_current: bool,
+        viewport: egui::Rect,
+        zero_pan_unit: Option<egui::Rect>,
+        material_kind: FullscreenPageMaterialKind,
+    ) -> bool {
+        let Some(pan) =
+            self.fs_initial_placement_pan(anchor_idx, selected_current, viewport, zero_pan_unit)
+        else {
+            return false;
+        };
+        let request = self
+            .fs_initial_placement_request
+            .expect("validated placement request");
+        self.fs_pan = pan;
+        self.fs_initial_placement_request = match material_kind {
+            FullscreenPageMaterialKind::Complete => None,
+            FullscreenPageMaterialKind::Provisional => Some(FsInitialPlacementRequest {
+                base_zoom: self.fs_zoom,
+                base_pan: pan,
+                ..request
+            }),
+        };
         true
     }
 }
