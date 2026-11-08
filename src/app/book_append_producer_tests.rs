@@ -374,7 +374,12 @@ fn section1373_explicit_view_and_resume_resets_gate_before_clearing_live_state()
             let id = uuid::Uuid::new_v4();
             let state = crate::settings::FavoriteViewState::from_settings(&app.settings);
             app.favorite_view_states.insert(id, state.clone());
-            let resume = (app.tmp.path().join("book.zip"), 2, None, None);
+            let resume = (
+                crate::book_resume_key::BookResumeKey::legacy(&app.tmp.path().join("book.zip")),
+                2,
+                None,
+                None,
+            );
             app.last_book_resume = Some(resume.clone());
             match action {
                 "favorite_remove" => {

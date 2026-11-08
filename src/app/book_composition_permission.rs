@@ -40,6 +40,16 @@ enum BookTargetRoute {
     },
 }
 
+impl BookTargetRoute {
+    fn zip_dfs_continuation(&self) -> Option<BookDfsContinuation> {
+        match self {
+            Self::ZipDfs(continuation) => Some(*continuation),
+            Self::DeferredBook(deferred) => deferred.zip_dfs_continuation(),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct OpenIntent {
     context_id: u64,
@@ -879,14 +889,20 @@ impl App {
             self.book_composition_permission.open = OpenPermission::Idle;
         }
     }
-    pub(crate) fn has_book_dfs_continuation(&self) -> bool {
-        matches!(
-            self.book_composition_permission.open,
-            OpenPermission::ContinueDfs(_)
-        )
+    pub(crate) fn has_book_projection_open_continuation(&self) -> bool {
+        match &self.book_composition_permission.open {
+            OpenPermission::ContinueDfs(_) => true,
+            OpenPermission::AwaitingProjection { deferred, .. } => {
+                matches!(
+                    deferred.target,
+                    super::DeferredFsTarget::CurrentArchiveBook(_)
+                ) && self.book_deferred_open_wait_active()
+            }
+            _ => false,
+        }
     }
     pub(crate) fn has_book_dfs_open_continuation(&self) -> bool {
-        matches!(&self.book_composition_permission.open, OpenPermission::Checking { intent, .. } | OpenPermission::Ready { intent, .. } | OpenPermission::Resuming { intent, .. } if matches!(&intent.route, BookTargetRoute::ZipDfs(_)))
+        matches!(&self.book_composition_permission.open, OpenPermission::Checking { intent, .. } | OpenPermission::Ready { intent, .. } | OpenPermission::Resuming { intent, .. } if intent.route.zip_dfs_continuation().is_some())
     }
     pub(crate) fn has_book_slideshow_continuation(&self) -> bool {
         matches!(&self.book_composition_permission.open, OpenPermission::Checking { intent, .. } | OpenPermission::Ready { intent, .. } | OpenPermission::Resuming { intent, .. } if matches!(&intent.route, BookTargetRoute::Slideshow { .. }))
@@ -1110,18 +1126,23 @@ impl App {
             _ => return,
         };
         if intent.purpose == BookTargetPurpose::FirstInBook {
+            let archive_book = matches!(&intent.route, BookTargetRoute::DeferredBook(deferred)
+                if matches!(deferred.target, super::DeferredFsTarget::CurrentArchiveBook(_)));
             if let Some(item_index) = projection
                 .resolved
                 .visible_pages
-                .first()
+                .iter()
                 .map(|page| page.item_index)
+                .find(|idx| !archive_book || self.visible_indices.contains(idx))
             {
                 intent.idx = item_index;
                 intent.items_generation = new_generation;
                 let demand = self.book_target_presentation_demand(item_index);
                 self.begin_qualified_book_unit(intent, demand);
-            } else if let BookTargetRoute::ZipDfs(continuation) = &intent.route {
-                self.book_composition_permission.open = OpenPermission::ContinueDfs(*continuation);
+            } else if let Some(continuation) = intent.route.zip_dfs_continuation() {
+                self.book_composition_permission.open = OpenPermission::ContinueDfs(continuation);
+            } else if archive_book {
+                self.handle_deferred_fs_open_outcome(super::DeferredFsOpenOutcome::ArchiveBookList);
             }
             return;
         }
@@ -1143,6 +1164,11 @@ impl App {
                 self.begin_qualified_book_unit(intent, demand);
             }
             PageStatus::HiddenByComposition if intent.purpose == BookTargetPurpose::Explicit => {
+                if let BookTargetRoute::DeferredBook(deferred) = &intent.route {
+                    if self.refuse_deferred_saved_book_page((**deferred).clone()) {
+                        return;
+                    }
+                }
                 self.handle_deferred_fs_open_outcome(
                     super::DeferredFsOpenOutcome::RequiredTargetHidden,
                 )
@@ -1974,10 +2000,19 @@ impl App {
                 && candidate.is_allowed()
         });
         if !target_allowed {
+            let archive_book = matches!(&intent.route, BookTargetRoute::DeferredBook(deferred)
+                if matches!(deferred.target, super::DeferredFsTarget::CurrentArchiveBook(_)));
             match intent.purpose {
-                BookTargetPurpose::Explicit => self.handle_deferred_fs_open_outcome(
-                    super::DeferredFsOpenOutcome::RequiredTargetHidden,
-                ),
+                BookTargetPurpose::Explicit => {
+                    if let BookTargetRoute::DeferredBook(deferred) = &intent.route {
+                        if self.refuse_deferred_saved_book_page((**deferred).clone()) {
+                            return;
+                        }
+                    }
+                    self.handle_deferred_fs_open_outcome(
+                        super::DeferredFsOpenOutcome::RequiredTargetHidden,
+                    );
+                }
                 BookTargetPurpose::Next
                 | BookTargetPurpose::Previous
                 | BookTargetPurpose::FirstInBook => {
@@ -1988,6 +2023,10 @@ impl App {
                         .find(|candidate| {
                             candidate.occurrence().role == PresentationRole::Navigation
                                 && candidate.is_allowed()
+                                && (!archive_book
+                                    || self
+                                        .visible_indices
+                                        .contains(&candidate.occurrence().item_index))
                         })
                         .map(|candidate| candidate.occurrence().item_index)
                     {
@@ -2042,9 +2081,13 @@ impl App {
                                 let demand = self.book_target_presentation_demand(target);
                                 self.begin_qualified_book_unit(intent, demand);
                             }
-                        } else if let BookTargetRoute::ZipDfs(continuation) = &intent.route {
+                        } else if let Some(continuation) = intent.route.zip_dfs_continuation() {
                             self.book_composition_permission.open =
-                                OpenPermission::ContinueDfs(*continuation);
+                                OpenPermission::ContinueDfs(continuation);
+                        } else if archive_book {
+                            self.handle_deferred_fs_open_outcome(
+                                super::DeferredFsOpenOutcome::ArchiveBookList,
+                            );
                         } else {
                             self.close_fullscreen();
                         }
