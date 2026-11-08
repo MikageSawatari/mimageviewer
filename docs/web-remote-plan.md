@@ -904,8 +904,11 @@ ordinal / count を外側履歴に付けない。Remote の resume meter は従�
 有効なら `open_mode=first_page` と拒否理由を返し、Web は最終構成後の先頭の表示可能ページを
 開いて「先頭ページから表示します」と通知する。Web は拒否理由だけで Grid に上書きしない。
 子本だけの branch は Grid のまま。通知に符号化された保存キーや変換cache path を表示しない。
-HTTP / RemoteAddress / RecordReadingProgress の wire は変更せず、追加資格は本体内だけの
-payload なので IPC 版は変更しない。
+RemoteAddress / RecordReadingProgress の JSON 形は維持するが、context_address の意味変更を伴うため
+レビュー R1 で strict IPC を **v73 → v74** に更新した。旧Remoteの接続をhandshakeで拒否する。
+Webも `X-mIV-Remote-Protocol: 74` を付け、progress POSTの版欠落・不一致をHTTP 409
+`protocol_version_mismatch` でcore保存受付前に拒否する。旧Webのasset token照合は自動更新・案内として
+維持するが、storage利用不可等で旧scriptが継続しても異なる意味の進捗を受け入れない。
 
 2026-10-09 の §1.345 レビュー修正で protocol 68 とする。旧 `/api/image-info` と
 `/api/image` は認証済み Home worker の stateless `SourceReadEligibility` を共有し、
@@ -2121,7 +2124,13 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 ### 13.5 プロトコル版数
 
-2026-11-04 受入 F の現行 strict IPC は **v73**。`RecordVideoProgress` にソースの映像能力
+2026-11-08 §1.675 S2 レビュー R1 の現行 strict IPC は **v74**。
+`RecordReadingProgress.context_address` は表示上のcollapse後の階層ではなく、要求時のraw本scopeを表す。
+JSONのshapeが同じでも意味が異なるためv73を拒否する。Webは同じ版を `X-mIV-Remote-Protocol` で送信し、
+HTTP ownerはprogress POSTだけその一致を必須にする。定数更新時はWebの定数も更新し、一致テストを通す。
+asset tokenは従来どおり配信資産の変更から生成され、session acquire時の更新案内を維持する。
+
+2026-11-04 受入 F の v73 は `RecordVideoProgress` にソースの映像能力
 `has_video` を必須追加し、音声のみの MP4 の再生位置保存が続きの画像生成へ進まないようにする。
 端末の成功した start / state から位置報告へ固定し、stop 後の最終報告でも同じ値を使う。
 下記の v69 等は各増分の実装記録である。

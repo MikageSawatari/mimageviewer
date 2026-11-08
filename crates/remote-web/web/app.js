@@ -150,6 +150,10 @@ export { ADJUSTMENT_PANEL_TABS };
 // このモジュールが実行され始めたということ。この後の遅さはアプリ自身が画面で伝える。
 if (typeof window !== "undefined") window.__mivRemoteAppStarted = true;
 
+// Keep this in sync with remote-ipc. A progress POST must attest that its
+// context_address is the requested raw book scope, even from an already-open tab.
+const REMOTE_PROTOCOL_VERSION = 74;
+
 const app = document.querySelector("#app");
 const hudElement = document.querySelector("#telemetry-hud");
 const sessionOwnerBadgeElement = document.querySelector(
@@ -16487,6 +16491,7 @@ async function pageResourceResponseError(response) {
 
 function remoteHeaders(initial = {}) {
   const headers = new Headers(initial);
+  headers.set("X-mIV-Remote-Protocol", String(REMOTE_PROTOCOL_VERSION));
   headers.set("X-mIV-Remote-Client", REMOTE_CLIENT_ID);
   if (state.remoteSessionId) {
     headers.set("X-mIV-Remote-Session", state.remoteSessionId);

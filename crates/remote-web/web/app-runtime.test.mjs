@@ -4938,6 +4938,8 @@ test("reading progress retains requested raw scope when the visible ZIP level co
     if (url.pathname === "/api/write") {
       const body = JSON.parse(init.body);
       if (body.kind === "record_reading_progress") {
+        assert.equal(new Headers(init.headers).get("X-mIV-Remote-Protocol"), "74",
+          "a collapsed-root progress POST attests the raw-context contract");
         const paths = url.searchParams.getAll("path");
         const expandAddress = ({ path_query_index, ...address }) => {
           assert.ok(Number.isInteger(path_query_index) && path_query_index < paths.length);

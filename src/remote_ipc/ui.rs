@@ -8181,6 +8181,93 @@ mod tests {
             .expect("outer archive history touch");
         assert_eq!((row.last_page, row.page_count), (None, None));
     }
+
+    #[test]
+    fn section1675_remote_collapsed_root_progress_keeps_root_row() {
+        use crate::book_resume_db::{PageIdentity, ReadingPosition};
+        use crate::book_resume_key::BookResumeKey;
+        use mimageviewer_ipc::{ContainerRequest, ContainerResponse, RemoteAddress};
+        use std::io::Write;
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        settle_book_resume_meter(&mut app);
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("png".into());
+        let archive = app.tmp.path().join("collapsed-root.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        for name in ["cover.png", "A/01.jpg", "A/02.jpg"] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"page").unwrap();
+        }
+        zip.finish().unwrap();
+        let requested = RemoteAddress::file(archive.to_string_lossy().into_owned());
+        let engine = super::super::container::ContainerEngine::new(app.settings.clone());
+        let ContainerResponse::Success(container) = engine.container(ContainerRequest {
+            address: requested.clone(),
+            spread_mode: None,
+            reading_direction: None,
+            force_single_page: true,
+        }) else {
+            panic!("collapsed root must enumerate");
+        };
+        assert_eq!(
+            container.effective_address.subresource,
+            RemoteSubresource::ZipDirectory {
+                prefix: "A/".into()
+            }
+        );
+
+        app.persist_book_resume(
+            archive.clone(),
+            0,
+            crate::book_resume_db::ReadingMeterValue::new(1, 2),
+        );
+        settle_book_resume_meter(&mut app);
+        let handle = SessionHandle::new();
+        app.set_remote_session_handle(handle.clone());
+        handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+            client_id: "phone".into(),
+            peer: mimageviewer_ipc::SessionPeerInfo {
+                connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                device_name: None,
+            },
+        });
+        app.poll_remote_session(&egui::Context::default());
+        // This is the new Web's wire value: requested File, never effective A/.
+        let response = apply_validated_progress_for_test(
+            &mut app,
+            &handle,
+            reading_progress_request(
+                RemoteAddress {
+                    path: requested.path.clone(),
+                    subresource: RemoteSubresource::ZipEntry {
+                        entry_name: "A/02.jpg".into(),
+                    },
+                },
+                requested,
+            ),
+        );
+        assert!(matches!(response, RemoteWriteResponse::Success(_)));
+        settle_book_resume_meter(&mut app);
+        let db = app.book_resume_db.as_ref().unwrap();
+        assert_eq!(
+            db.get_position_key(&BookResumeKey::legacy(&archive)),
+            Some(ReadingPosition {
+                page: 1,
+                identity: Some(PageIdentity::Archive {
+                    container: crate::path_key::normalize_keep_drive(&archive),
+                    entry_name: "A/02.jpg".into(),
+                }),
+            })
+        );
+        assert_eq!(
+            db.get_position_key(&BookResumeKey::archive(&archive, &["A".into()]).unwrap()),
+            None
+        );
+    }
 }
 
 #[cfg(windows)]

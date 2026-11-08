@@ -325,7 +325,10 @@ Remoteも同じ内部本キーを読み書きする。PCの現在表示やcache 
    従って版を上げ、同文書を更新する。内部本と root の両方の拒否を試験する。
 6. **resume記録と履歴進捗を分離する。** 現行UIは `record_resume` を履歴のpage/count付与にも使っている。内部resumeを有効にしても、外側履歴へ内部のordinalを保存しない。履歴touchの資格・抑制は維持する。`src/remote_ipc/ui.rs:3394`
 
-HTTP／RemoteAddress／`RecordReadingProgress` のwire形式は変更しない。新しい検証済みscopeは本体内queueの値であり、IPC版変更は不要とする。
+RemoteAddress／`RecordReadingProgress` のJSON形は変更しないが、`context_address` の意味を表示階層から
+要求したraw本scopeへ変えるため、strict IPC を **v73 → v74** に更新する。旧Remoteと新core（逆も同様）は
+接続handshakeで拒否する。Webは `X-mIV-Remote-Protocol: 74` を送信し、progress POSTは版欠落・不一致を
+HTTP 409 `protocol_version_mismatch` で保存受付前に拒否する。asset tokenの更新案内だけには依存しない。
 
 ### 4.4 rename／move／deleteと保存行の寿命
 
@@ -519,6 +522,8 @@ enum ArchiveBookOpenOutcome {
 - **downgrade中の制限：** 旧版のrename／moveは新名前空間を移行できない。旧版中に元書庫を改名・移動した場合、新版へ戻しても旧sourceの内部位置は自動追随しない。これは既存root値の破損ではなく、新機能の旧版非対応として明記する。
 - 新版では保存開始と同時にrename／copy／delete adapterを提供する。
 - `startup_list_restore` V1と帰路の保存規則は変更しない。`Chosen` はruntimeだけ。
+- 保存schemaの互換性と通信の意味互換性は別である。S2はIPC v74を要求し、旧Remoteの接続と
+  旧Webのprogress POSTを拒否する。DB downgradeの互換性を通信相手の混在許可へ拡張しない。
 
 これはCLAUDE.mdの出荷済みデータ方針に対する、**既存形式の読み替えを維持した追加互換**である。「schema変更なし」だけを理由に互換試験を省略しない。
 
@@ -619,6 +624,11 @@ HWND／rect capture、viewport ID、registry transaction、placement保存、tim
   Remote で内部本の復元拒否は通知 + 先頭、root の拒否は従来どおり Grid。
 - `section1675_inner_resume_root_rows_pc_and_remote`  
   PC の backing root 行と Remote の logical root 行を両方 seed し、どちらも従来どおり読まれ、内部行と混ざらない。
+- `section1675_remote_collapsed_root_progress_keeps_root_row`
+  `cover.png`＋`A/01.jpg`＋`A/02.jpg`、PNG除外でroot表示がAへcollapseしてもFile要求の進捗はroot行だけを更新する。
+- `protocol_v74_rejects_pre_raw_book_scope_reading_progress_clients`／
+  `reading_progress_refuses_old_web_protocol_before_write_admission`
+  IPC v73を拒否し、Webの版欠落・v73・不正値をHTTP ownerで拒否。v74は通常validationへ進み、scriptの版定数も照合する。
 - `section1675_inner_resume_cross_drive_maintenance`  
   `C:/Books/A.zip → D:/Books/A.zip` の move・copy で内部行が正しく移る / 複製される。
 - `section1675_inner_resume_maintenance`  
@@ -908,7 +918,8 @@ R2 の source と追加9テストは独立 reviewer が ACCEPT（新規 P1/P2 �
   新キーと Archive PageIdentity の書換えは同一 transaction、cross-drive の除外前に元 source を渡す。
   読書履歴・metadata transfer・cache 削除の寿命は変更しない。
 - Remote の応答は既存 `resume_refusal` と `open_mode` で内部「通知＋Page」と root「通知＋Grid」を区別する。
-  wire の形は変更せず、検証済み progress と typed key は core 内部 queue の値とする。
+  JSON の形は維持するが、context の意味変更を伴うため IPC v74 と Web progress の版照合を要求する。
+  検証済み progress と typed key は core 内部 queue の値とする。
   Web の進捗送信・batch identity は `requestedAddress` を使い、wrapper collapse 後の表示用 address と
   保存用の raw book scope を分離する。同じ表示階層でも別の本の進捗は batch を共用しない。
 - S3 の detached BookScope target、HWND／rect 捕捉、viewport identity、placement、timer は変更しない。
@@ -969,7 +980,7 @@ Web の通常 `node --test` は sandbox の子プロセス spawn が EPERM と�
 process isolation 無効で実行した。最終ログは `target/s2-core-final.log`、`target/s2-s1s2-verified.log`、
 `target/s2-regressions-verified.log`、`target/s2-remote-verified.log`、`target/s2-web-verified.log`。
 途中の fixture／compile 失敗と構成採用順の不具合は修正し、上記の確定 source で再検証した。
-追加の schema migration、既存 root 行の rekey、IPC version 変更はない。独立 source review は
+追加の schema migration、既存 root 行の rekey はない。IPC version はレビュー R1 で v74 へ更新する。独立 source review は
 最終修正を ACCEPT（残存 P1/P2 なし）。設計担当の検収・commit は未実施。
 
 #### S2 変更ファイル
@@ -993,6 +1004,40 @@ process isolation 無効で実行した。最終ログは `target/s2-core-final.
 - 文書：本書、`docs/virtual-folders.md`、`docs/nested-zip-tree-plan.md`、
   `docs/web-remote-plan.md`、`docs/detached-rework-plan.md`。
 
+### S2 実装レビュー R1（2026-11-08）
+
+- S2本体は `e7804a2ea` にcommit済み。本節のR1修正は未コミットで設計担当へ引き渡す。
+- P2を確認。v73は旧Remoteを受け入れ、旧Webのcollapse後の `ZipDirectory` を内部本として保存してしまう。
+  `context_address` は形が同じでも意味が変わっており、版変更不要とした§4.3／§6／本節の判断を訂正した。
+- strict IPCをv74へ更新し、v73の拒否をhandshakeテストに追加。既存asset tokenは内容hashで更新されるが、
+  storage利用不可等では通知だけで旧scriptが継続するため、Webのprogress POSTに版を付ける。
+  欠落／旧版／不正値はHTTP ownerで409＋通知理由を返し、coreへのwrite受付に到達させない。
+- `cover.png` と `A/01.jpg`・`A/02.jpg`、PNG除外の実ZIPで、root要求→A表示へのcollapseと
+  root行更新・A内部行未作成を検証。実Web producerもraw File要求と版headerを検証する。
+- DB schema／既存row／保存先resolverは変更しない。S3の範囲とdetached/native経路も変更しない。
+
+R1最終検証（環境変数・既存回帰filterは上記S2最終検証と同じ。製品起動なし）：
+
+| コマンド | 結果 | exit code |
+|---|---|---|
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 成功 | 0 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/section167[56]/)'` | 93 passed、0 failed | 0 |
+| 上記S2既存回帰filter | 1,236 passed、0 failed（1 slow・2 leaky） | 0 |
+| `cargo test -p mimageviewer-remote` | 143 passed、0 failed、既存1 ignored | 0 |
+| `cargo test -p mimageviewer-ipc` | 69 passed、0 failed、doc test 0 | 0 |
+| `node --experimental-test-isolation=none --test crates/remote-web/web/*.test.mjs` | 540 passed、0 failed | 0 |
+| `cargo fmt` / `cargo fmt --check` | 成功 | 0 |
+| `python scripts/check_ui_glyphs.py` | 危険glyph 0 | 0 |
+| `git -c core.safecrlf=false diff --check` | 成功 | 0 |
+
+最終ログ：`target/s2-r1-core.log`、`target/s2-r1-sections.log`、`target/s2-r1-regressions.log`、
+`target/s2-r1-remote.log`、`target/s2-r1-ipc.log`、`target/s2-r1-web.log`。
+追加HTTP fixtureの初期compile／wire構築の誤りは修正済み。既存テストの期待変更は版数の固定assertion
+（73→74）だけで、既存Webのraw-scopeテストには版headerのassertionを追加した。削除・ignore追加はない。
+`powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-dev.ps1 -PreserveRuntime` も成功
+（exit 0）。v74のcore／Remoteとcompanionを `target/dev-runtime` に配置し、VCRT/PEチェックも成功
+（runtime=4、pe=5）。製品は起動していない。
+
 ## 10. 実装段階と規模
 
 | 段階・commit境界 | 内容 | 主な検証 |
@@ -1005,7 +1050,8 @@ process isolation 無効で実行した。最終ログは `target/s2-core-final.
 各段階で独立レビューを行い、修正済みfindingの影響範囲だけを再検証する。S1単独を今回要求の完成・リリース可能状態とは扱わない。
 
 S1 本体は `875166c1b`、実装レビュー R1 の修正は `75f796a6e` に commit 済み。
-実装レビュー R2 の修正は `73a478805` に commit 済みで独立 ACCEPT。S2 は実装・自動検証完了、未コミットで設計担当の検収待ち。
+実装レビュー R2 の修正は `73a478805` に commit 済みで独立 ACCEPT。S2 本体は `e7804a2ea` に commit 済み。
+S2 レビュー R1 の版照合修正は未コミットで設計担当の検収待ち。
 S3／S4 は未着手。
 
 追加対象には `book_resume_key` 相当の共通module、`book_resume_db`、`rename_key_migration`、Remoteのcontainer/session/ui、descriptorを構築する `startup_ops`、archive conversion continuationを含む。
