@@ -6000,8 +6000,8 @@ v5.1.0 の範囲 (利用者決定 2026-11-08):
 
 - ★・タグの読み取りは、今の `list_folder` と同じ agent の読み取り worker (`ReadContext`) の中で、`RatingDb::open_readonly` と
   `TagsDb::open_readonly` (`optional_tags`) を 1 回ずつ開いて行う。DB が無ければ★は 0 (★を付けられる行)、タグは空。UI スレッドは通らない。
-- ★は一覧全体 (絞り込みの判定に要る) を `get_many` でまとめて読む。タグは返す行と `container_tags` の分だけ読む (`get_many_display_tags` が使えれば使う)。
-  1 フォルダ数千件でも DB の読み取りは 1〜2 回の一括の照会で済む。読み取りは DB を変えない (旧 key の移行もしない)。
+- ★は一覧全体 (絞り込みの判定に要る) を `get_many` でまとめて読む。タグは返す行の分だけ読む (`get_many_display_tags` が使えれば使う)。
+  どちらも一括取得の API を使い、内部の照会は 500 キー単位 (`rating_db.rs` の `get_many`)。行ごとに DB を開き直さない。読み取りは DB を変えない (旧 key の移行もしない)。
 - 物理フォルダの基本一覧は、★の並べ替えのために既に RatingDb を読むことがある (`materialize_local_folder_listing_with_order`)。
   これは並べ替えの経路のまま残し、行の★の値は C の共有の key 解決関数で読む (並べ替えの結果を行の★として流用しない。ZIP の旧キー等の扱いが違うため)。
 - 権限: `list_folder` は今と同じ「読み取りのみ」以上で使える。★・タグは `search_items` / `get_item_info` で既に読み取り段に見せている情報で、
@@ -6047,7 +6047,7 @@ v5.1.0 の範囲 (利用者決定 2026-11-08):
 
 ### I. 採らなかった案
 
-(設計レビュー 1 巡目 `a9f7292ce` の指摘 P2×3・P3×3 を反映: ★順の cursor、ZIP の旧 key の出どころ、container のタグの上限、版の不一致の実際のエラー、MCP 側の変更先、公開文書。)
+(設計レビュー 2 巡目 `f41ddf784` で ready、残りの P3 (読み取りの説明) を反映。1 巡目 `a9f7292ce` の指摘 P2×3・P3×3 を反映: ★順の cursor、ZIP の旧 key の出どころ、container のタグの上限、版の不一致の実際のエラー、MCP 側の変更先、公開文書。)
 
 - `list_library` の rated に path の接頭辞を足す案: 「このフォルダの★N」はこの節の `list_folder` の絞り込みで足りる。
   サブフォルダを含む★の取り出しは、rating DB のキー (ZIP 内・合成の本のキー) と path の接頭辞の照合を別に設計する必要があり、§1.740 へ回した。
