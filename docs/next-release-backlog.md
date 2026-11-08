@@ -69,7 +69,12 @@
 
 ### 1.731 コレクションから開いたフォルダと、レーティング一覧などから開いた同じフォルダで、中身のサムネイルキャッシュを消し合う — メール報告 (2026-11-07)
 
-- 状態: **修正済み・master 入り (2026-11-08、v5.1.0 に入る)。実機では未確認** (利用者・サブ PC とも未実施)。報告者は v4.11.0 (インストーラ版)。
+- 状態: **修正済み・master 入り (2026-11-08、v5.1.0 に入る)。サブ PC 担当が実機で確認済み (2026-11-08、依頼 18)**。報告者は v4.11.0 (インストーラ版)。
+- 実機確認 (2026-11-08、観測者 = サブ PC 担当。結果は `C:\miv-subpc\results-18\`): ZIP 24 個のフォルダ A を「★1 一覧 → コレクション → ★1 一覧 → コレクション」の順で開き、各段階でキャッシュを写し取った。
+  - 修正前の版 (`build-1730`): 経路を変えるたびに A の DB の 24 行が入れ替わった (`zipthumb:book01.zip` と `zipthumb:C:\…\A\book01.zip`)。ログでは毎回 `cache_hit=0` で、24 個を作り直していた。報告どおりの症状。
+  - 修正版 (`63ca708fb`): 4 段階とも 24 行が `zipthumb:bookNN.zip` のまま変わらなかった (thumb_data も同じ)。2 回目以降はログで `cache_hit=24`。ERROR / WARN は 0 件。
+  - 画面: 24 個の作成が約 0.8 秒で終わるため、どちらの版でも見た目では区別できなかった。
+  - 修正版でも開くたびに `idle upgrade: queued 24 items` が出て、24 個を元から作り直して保存していた。これは既定で有効な設定「アイドル時にキャッシュ由来のサムネイルを高画質化する」の動作 (`enqueue_idle_upgrades`、`UpgradeableCache`)。経路にかかわらず、キャッシュから開くたびに起きる。§1.731 とは別の、元からの挙動。下の「未解明」の候補の 1 つになり得るが、同じ経路の往復でも起きるので、報告にある経路による差は説明しない。
 - 結果 (2026-11-08): 下の「原因の候補」の仕組みがコードにあることをテストで確かめた (報告者の症状がこの原因によるものかは、実アプリでは未確認)。再現テスト 3 件 (`collection_physical_thumbnail_keys_match_ordinary_folder`、`collection_physical_load_preserves_ordinary_thumbnail_rows`、`ordinary_load_preserves_collection_physical_thumbnail_rows`、`src/app/collection_grid.rs`) が修正前のコードで落ち、本物の読込と `delete_missing` を通して、通常→コレクション・コレクション→通常の両向きで保存済みの行が全部消えた (`retained=[]`)。
   - 修正 (`23e1abf40`): `use_full_path_cache_keys` の Collection 条件を root (`CollectionGridPosition::Root`) に限った。コレクション専用にフルパスを固定していた 4 か所 (実フォルダを開く、履歴から開く、Ctrl+↑↓ の外側移動、履歴での子への戻り) を、通常の経路と同じ判定 (`use_full_path_cache_keys_for_folder`) にした。root の保存先 (§1.668 の別 DB) とキーは変えていない。
   - 同型の経路 (テストあり): 実フォルダ内・直接登録の ZIP / PDF のページ、Ctrl+↑↓・履歴での戻り・root への戻り、ネストしたサブフォルダ、ファイル名スタック (通常のキー) とサブフォルダ展開 (synthetic path のフルパスのまま)、viewer context ごとの判定 (headless の複数 context。実窓は未操作)。
