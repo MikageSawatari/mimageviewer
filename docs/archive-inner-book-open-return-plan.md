@@ -1,6 +1,6 @@
 # 書庫内の本を開く・閉じる (§1.675 + §1.676) 設計
 
-状態: **設計 R2 (2026-11-08)**。設計担当 ClaudeCode Opus 5.5。ソース調査と下書きは Codex GPT-6.1 Sol / high
+状態: **設計 R3 (2026-11-08)**。設計担当 ClaudeCode Opus 5.5。ソース調査と下書きは Codex GPT-6.1 Sol / high
 (読み取り専用、`bec01bf11`)。利用者の採択は §9、独立設計レビューの経過は §9 に記録する。
 利用者方針 (2026-11-08): 時間がかかるなら v5.1.0 より後に延期してよく、範囲を削らず理想的な形で入れる。
 master へ入れる時期は完成時に利用者へ確認する。
@@ -136,14 +136,21 @@ enum ZipListChoice {
   (ページ identity の index 準備) が動くので、その完了動作に型付きの値を持たせる:
   `IndexOnlyAfterPrepare::{None, OpenArchiveBook(DeferredFsReopen)}`。新しい App の pending は作らない。
   true close 用の取消 (`sidecar_restore.rs` の `deferred_fullscreen` と Live continuation の取消) にもこの値を含める。
-- `DeferredFsTarget` に `CurrentArchiveBook { scope: BookScopeKey }` を足し、leaf 指定 (Required / Preferred) と区別する。
-  scope は表示 prefix ではなく、既存の**論理 source + `current_raw()`** による `BookScopeKey`
-  (`book_composition_runtime.rs` と同じ) とする。
+- `DeferredFsTarget` に `CurrentArchiveBook(ArchiveBookTarget)` を足し、leaf 指定 (Required / Preferred) と区別する。
+  `ArchiveBookTarget` (§4.5) は、元の綴りを保った `requested_prefix` (tree lookup 用) と、
+  **論理 source + `current_raw()`** による `BookScopeKey` (構成照合用、`book_composition_runtime.rs` と同じ) を
+  1 つの値として持つ。通常モード・独立ビューアとも同じ型を使い、descriptor → 変換 → 列挙 → 対象 level の解決 →
+  IndexOnly → 構成待ち → 表示まで、この値を単一の owner 間で移す (scope から prefix を復元しない)。
 - 完了時に scope・context・items 世代が一致することを確かめてから、`CurrentArchiveBook` 専用の解決を行う:
-  保存位置 (`book_open_resume` が続きからのとき) を PageIdentity で解決し、無ければ
-  **本の構成順と現在の可視集合 (`visible_indices`、★・ファイル種類) の両方を満たす最初の直下ページ**を選ぶ。
+  保存位置 (`book_open_resume` が続きからのとき) を PageIdentity で解決し、**それが要求 context の最終的な可視集合
+  (`visible_indices`、★・ファイル種類・構成) に属するときだけ**採る。属さなければ既存の通知を付けて先頭探索へ進む。
+  先頭探索は**本の構成順と可視集合の両方を満たす最初の直下ページ**を選ぶ。
   目的は先頭なら `BookTargetPurpose::FirstInBook`、保存位置なら `Explicit`。既存の本の構成待ち・表示許可を通って
   開く (`from_explicit_open = true`、`HistoryTrigger::UserChosen`、resume notice は要求に同行)。
+- resume fence: IndexOnly の末尾は既存どおり fence を消費する。そのとき fence を通した保存位置 (PageIdentity) を
+  **要求の値へ写し取り**、構成待ちの後はその写しを構成適用後の列へ解決する (構成待ちの間に fence を開いたままにしない)。
+- **S1 では内部本は先頭固定・保存なし**とする (既存の container resume 照会は `current_folder` を読み、外側 root の位置を
+  内部へ適用し得るため、S1 では resume 照会そのものを呼ばない)。S2 で typed な読取と保存を同時に有効にする。
 - 候補が無ければ、型付きの結果で**その階層の一覧表示**に終える。既存の `DeferredFsTarget::None` / Required の終端と
   §1.678 の `NoPlayableItem`・独立窓の終端の意味は変えない。
 - 取消・失敗・古い完了: 既存の sidecar / 構成 owner が要求を捨てる。キャンセル後に勝手に開かない。
@@ -187,7 +194,9 @@ miv:zipbook:v1:<hex(UTF-8 canonical logical source)>:<hex(UTF-8 canonical raw pr
 
 - hexは小文字・2桁固定。
 - logical sourceは `BookScopeKey` と同じドライブ保持・区切り統一・大小文字正規化を使う。
-- prefixは `ZipNavLevel.raw` から `BookScopeKey::archive` で検証・正規化する。
+- prefixは `ZipNavLevel.raw` を `BookScopeKey::archive` と同じ規則で**検証**するが、**大文字・小文字は元のまま保持**する
+  (ZIP ツリーでは `A/` と `a/` が別の階層なので、case-fold すると別の本が同じ行を上書きする)。構成照合用の
+  case-fold 済み `BookScopeKey` とは別の値として扱う。区切りの統一 (`\` → `/`、末尾 `/` の扱い) だけを行う。
 - prefixは非空。root／collapse済みrootには使用しない。
 - ハッシュではなく可逆な符号化とし、rename／deleteのfamily照合で元sourceを取得できる。
 - 符号化済み文字列を `PathBuf` に偽装して通常のpath処理へ渡さない。
@@ -199,7 +208,10 @@ Windowsの実パス由来の既存キーは、ドライブ除去後のpathまた
 #### root互換性
 
 - ZIP root・実フォルダ・PDF等の既存キーは変更しない。
-- **変換書庫のrootも現在のbackingキーを維持する。** 内部本だけがlogical sourceの新キーを使う。
+- **root の `LegacyPath` は各経路の出荷済みキーをそのまま維持する。** 変換書庫の root は、PC では backing キー、
+  Remote では公開住所由来の logical キー (`remote_ipc/container.rs` の `resolved.logical`、`remote_ipc/ui.rs` の保存) を
+  今までどおり使う。PC と Remote で共通化するのは内部本の `ArchiveLevel` だけ。互換試験では PC の backing 行と
+  Remote の logical 行を両方 seed する。
 - 内部本の保存値がない場合、rootの位置を読まない。
 - PageIdentityは既存の `Archive { container, entry_name }` を使い、`container` はlogical source、`entry_name` は外側からの完全なentry名とする。新しいPageIdentity variantは追加しない。
 
@@ -276,6 +288,11 @@ Remoteも同じ内部本キーを読み書きする。PCの現在表示やcache 
 3. progressの検証結果に、検証済みキー・PageIdentity・canonical raw indexを保持する。クライアント提供のscopeや符号化キーを信用しない。
 4. `QueuedRemoteWrite`／`ClaimedRemoteWrite` の既存payloadを、通常writeと検証済みprogressを区別するenumへ拡張する。新しいApp pendingは作らない。`src/remote_ipc/session.rs:1142`
 5. 内部本にもresume pageを返し、ページ表示設定が有効なら内部本の続き／先頭を使う。子本だけのbranchはGridのまま。
+   **復元拒否時**: 内部本は「通知 + 先頭ページ」とする (PC と同じ)。現行サーバーは拒否を `Grid` にし
+   (`remote_ipc/container.rs` の拒否分岐)、クライアントは拒否理由があれば open mode に関係なく一覧へ戻す
+   (`crates/remote-web/web/app.js` の resume 処理) ので、サーバー応答・クライアント動作・通知文をまとめて定義する。
+   **root の既存契約 (拒否 → Grid) は変えない**。応答の形が変わる場合は [リモート設計](web-remote-plan.md) の IPC 版規則に
+   従って版を上げ、同文書を更新する。内部本と root の両方の拒否を試験する。
 6. **resume記録と履歴進捗を分離する。** 現行UIは `record_resume` を履歴のpage/count付与にも使っている。内部resumeを有効にしても、外側履歴へ内部のordinalを保存しない。履歴touchの資格・抑制は維持する。`src/remote_ipc/ui.rs:3394`
 
 HTTP／RemoteAddress／`RecordReadingProgress` のwire形式は変更しない。新しい検証済みscopeは本体内queueの値であり、IPC版変更は不要とする。
@@ -299,7 +316,10 @@ renameではキーだけでなく、新しい内部行の `PageIdentity::Archive
 
 既存 `rewrite_book_store_values` はImage identityだけを書き換えるため、内部Archive行への対応が必要である。`src/rename_key_migration.rs:2180`
 
-adapterは元のドライブ保持pathを受け取る。既存のDriveStripped文字列から元ドライブを逆算しない。新キーfamilyの照合はdecodeしたsourceに対して行い、hex文字列の前方一致で代用しない。
+adapterは元のドライブ保持pathを受け取る。既存のDriveStripped文字列から元ドライブを逆算しない。
+既存 dispatch は DriveStripped 後に一致するもの (ドライブだけ異なる move / copy) を先に除外し
+(`rename_key_migration.rs` の dispatch と製本移行の正規化済み copy / raw move)、新 family adapter はこの**除外の前**の
+元の move / copy を受け取る位置に接続する。`C:/Books/A.zip → D:/Books/A.zip` の move・copy を試験する。新キーfamilyの照合はdecodeしたsourceに対して行い、hex文字列の前方一致で代用しない。
 
 metadata bundle転送は引き続きresume対象外である。store移行／content-identity復元と、利用者が行うmetadata export/importを混同しない。
 
@@ -371,7 +391,7 @@ descriptor
 ```rust
 enum ZipEnumerationPresentation {
     Existing(StartupListIntent),
-    ArchiveBook(DeferredFsReopen),
+    ArchiveBook(DeferredFsReopen), // target は CurrentArchiveBook(ArchiveBookTarget) で literal prefix を含む
 }
 ```
 
@@ -558,6 +578,18 @@ HWND／rect capture、viewport ID、registry transaction、placement保存、tim
   editorの既存read／save／reorder fixtureで内部キーと書込先を検査。
 - `section1675_inner_resume_remote_matches_pc`  
   PC→Remote／Remote→PC、policy collapse差、変換cache差。raw scopeキー一致・クライアント偽造拒否・外側履歴進捗不変。
+- `section1675_inner_resume_case_distinct_books`  
+  同じ書庫に `A/` と `a/` (内部フォルダ / 入れ子 ZIP)。交互に保存・再 open しても互いの位置を上書きしない。
+- `section1675_inner_resume_saved_page_hidden_by_filter`  
+  ★一時解除が発動しない条件で「保存ページだけ除外」「全ページ除外」。保存位置を採らず通知付き先頭 / 一覧。
+- `section1675_inner_resume_fence_across_composition_wait`  
+  IndexOnly 完了 → 構成待ち → 表示の間に保存が入る cutoff。写し取った位置を使い、fence を開いたままにしない。
+- `section1675_inner_resume_remote_refusal_contract`  
+  Remote で内部本の復元拒否は通知 + 先頭、root の拒否は従来どおり Grid。
+- `section1675_inner_resume_root_rows_pc_and_remote`  
+  PC の backing root 行と Remote の logical root 行を両方 seed し、どちらも従来どおり読まれ、内部行と混ざらない。
+- `section1675_inner_resume_cross_drive_maintenance`  
+  `C:/Books/A.zip → D:/Books/A.zip` の move・copy で内部行が正しく移る / 複製される。
 - `section1675_inner_resume_maintenance`  
   managed rename／親folder move／copy／削除、既存衝突規則、Archive identityのcontainer更新、兄弟・別ドライブ不変。
 - `section1675_inner_resume_cache_rebuild`  
@@ -581,6 +613,8 @@ HWND／rect capture、viewport ID、registry transaction、placement保存、tim
   子本だけではsession／parkを作らずmain一覧へ。
 - `section1675_multiwindow_scope_before_first_install`  
   rootページと内部ページを同居。最初から対象scopeでinstallされ、rootのresume／構成／履歴位置を採らない。
+- `section1675_multiwindow_scope_literal_prefix`  
+  大文字を含む prefix で、非同期列挙と prepared 同期経路の双方が literal prefix で対象 level を解決する。
 - `section1675_multiwindow_scope_collapse_and_raw`  
   多段wrapperとpolicyによるdisplay/raw差。要求scope一致・正しいresume。
 - `section1675_multiwindow_scope_missing_changed_hidden`  
@@ -609,13 +643,17 @@ HWND／rect capture、viewport ID、registry transaction、placement保存、tim
   P2 (close teardown の順序 / Terminal のブックマーク上書き / 構成と★を満たす先頭と FirstInBook / anchor と reveal の組) と
   P3 (同じ書庫内の直接 jump・fork / promote / 保存中 nav の記録消去 / stale plan は捨てる) を R2 で反映した。
   detached 部分を「症状パッチではなく構造的修正」とする方向には同意 (R2 の範囲での再確認待ち)。
-- 独立設計レビュー R2: 未実施。
+- 独立設計レビュー R2 (`7fa8fc6f1`): REVISE。R1 の指摘は解消済みと確認。P2 5 件 (読書位置キーの大文字小文字保持 /
+  root キーは PC backing・Remote logical の各既存キーを維持 / literal prefix を含む `ArchiveBookTarget` を単一 owner で移す /
+  保存位置も可視集合と照合 / Remote の内部本の復元拒否契約) と P3 2 件 (ドライブ違いの move・copy の接続位置 /
+  S1 は先頭固定) と未決 1 件 (構成待ちをまたぐ resume fence) を R3 で反映した。detached 部分は構造的修正であることに同意。
+- 独立設計レビュー R3: 未実施。
 
 ## 10. 実装段階と規模
 
 | 段階・commit境界 | 内容 | 主な検証 |
 |---|---|---|
-| **S1：共通activationとmain帰還** | 採択済みOption A、Chosen、row anchor、通常／即時／early-return close、typed内部open継続 | 現§8の入口・close・deep／collapse・専用帰路・linked／独立不変 |
+| **S1：共通activationとmain帰還** | 採択済みOption A、Chosen、row anchor、通常／即時／early-return close、typed内部open継続。**内部本は先頭固定・resume の照会も保存もしない** | 現§8の入口・close・deep／collapse・専用帰路・linked／独立不変 |
 | **S2：内部resumeの保存契約** | key helper、DB/writer adapter、read/write/fence、内部DFS、editor、Remote、maintenance、互換性 | 上記A全件。保存開始とmaintenance対応を同じcoherent commitに含める |
 | **S3：複数窓の内部本open** | descriptor target、列挙前scope解決、source alias、hydration／構成／resume、conversion・初回終端 | 上記B全件、既存detached／RAR cache／Required leaf回帰 |
 | **S4：統合受入** | docs／spec／manualの最終整合、必要な全体gate、検証build | S1〜S3の有効証跡を再利用し、統合差分と必須gateを検査 |
