@@ -1575,8 +1575,8 @@ mod accessibility_names_tests {
 
 /// 単一行 `TextEdit` に Windows 標準に近い右クリックメニューを追加する。
 ///
-/// egui 0.33 の `TextEdit` は `show()` の戻り値から cursor state を更新できるため、
-/// 入力中の IME composition には触れず、メニュー操作で確定済み文字列だけを編集する。
+/// メニューを開いたときの文字列と選択範囲を対象とする。項目のクリックで TextEdit が
+/// focus を失い、live selection が畳まれても、メニューの操作対象は変えない。
 /// 戻り値はテキスト内容を変更したかどうか。
 #[allow(dead_code)]
 pub(crate) fn singleline_text_edit_context_menu(
@@ -1590,15 +1590,38 @@ pub(crate) fn singleline_text_edit_context_menu(
     let id = output.response.id;
     let state = output.state.clone();
     let char_count = text.chars().count();
-    let selection = clamp_cursor_range(
-        output.cursor_range.or_else(|| state.cursor.char_range()),
-        char_count,
-    );
-    let has_selection = !selection.is_empty();
-    let selected_text = has_selection.then(|| selection.slice_str(text).to_owned());
+    let target_id = id.with("miv_singleline_context_menu_target");
+    // Popup::context_menu uses secondary_clicked() to open/reopen this popup,
+    // including when it is already open at another pointer position.
+    if !output.response.context_menu_opened() || output.response.secondary_clicked() {
+        output
+            .response
+            .ctx
+            .data_mut(|data| data.remove::<SinglelineContextMenuTarget>(target_id));
+    }
 
     let mut changed = false;
     output.response.context_menu(|ui| {
+        // Popup::show applies its open command before calling this closure.
+        // Capture only here: context_menu_opened() before show still reports
+        // the previous memory state on the opening pass.
+        let target = ui.ctx().data_mut(|data| {
+            data.get_temp::<SinglelineContextMenuTarget>(target_id)
+                .unwrap_or_else(|| {
+                    let target = SinglelineContextMenuTarget {
+                        text: text.clone(),
+                        selection: clamp_cursor_range(
+                            output.cursor_range.or_else(|| state.cursor.char_range()),
+                            char_count,
+                        ),
+                    };
+                    data.insert_temp(target_id, target.clone());
+                    target
+                })
+        });
+        let selection = target.selection_for(text);
+        let has_selection = !selection.is_empty();
+        let selected_text = has_selection.then(|| selection.slice_str(&target.text).to_owned());
         let paste_text = read_clipboard_text().map(|s| singleline_clipboard_text(&s));
         let can_paste = paste_text.as_ref().is_some_and(|s| !s.is_empty());
 
@@ -1650,24 +1673,408 @@ pub(crate) fn singleline_text_edit_context_menu(
             ui.close();
         }
         if ui
-            .add_enabled(char_count > 0, egui::Button::new("すべて選択"))
+            .add_enabled(!target.text.is_empty(), egui::Button::new("すべて選択"))
             .clicked()
         {
             store_text_edit_cursor(
                 ui.ctx(),
                 id,
                 &state,
-                CCursorRange::two(CCursor::new(0), CCursor::new(char_count)),
+                clamp_cursor_range(
+                    Some(CCursorRange::two(
+                        CCursor::new(0),
+                        CCursor::new(target.text.chars().count()),
+                    )),
+                    char_count,
+                ),
             );
             output.response.request_focus();
             ui.close();
         }
     });
 
+    // Includes item actions, Escape and outside clicks handled by Popup::show.
+    // If the field disappeared, egui retires the abandoned popup; the next
+    // invocation also clears this target before a new menu can capture it.
+    if !output.response.context_menu_opened() {
+        output
+            .response
+            .ctx
+            .data_mut(|data| data.remove::<SinglelineContextMenuTarget>(target_id));
+    }
+
     if changed {
         output.response.mark_changed();
     }
     changed
+}
+
+#[derive(Clone)]
+struct SinglelineContextMenuTarget {
+    text: String,
+    selection: egui::text::CCursorRange,
+}
+
+impl SinglelineContextMenuTarget {
+    fn selection_for(&self, text: &str) -> egui::text::CCursorRange {
+        let selection = if text == self.text {
+            self.selection
+        } else {
+            // A stale target never deletes/copies another string. Paste keeps
+            // the original sorted caret start, clamped to the current text.
+            egui::text::CCursorRange::one(egui::text::CCursor::new(
+                self.selection.as_sorted_char_range().start,
+            ))
+        };
+        clamp_cursor_range(Some(selection), text.chars().count())
+    }
+}
+
+#[cfg(test)]
+mod singleline_context_menu_tests {
+    use super::*;
+    use egui::text::{CCursor, CCursorRange};
+    use egui::{Context, Event, Id, Key, Modifiers, PointerButton, Pos2, Rect, pos2, vec2};
+
+    const TEXT: &str = "旅行 abc 日本語";
+
+    struct Field {
+        ctx: Context,
+        id: Id,
+        text: String,
+        output: Option<egui::text_edit::TextEditOutput>,
+        labels: Vec<(String, Pos2)>,
+        buttons: Vec<(String, bool)>,
+        copied: Vec<String>,
+        changes: Vec<(bool, bool)>,
+        time: f64,
+        visible: bool,
+    }
+
+    impl Field {
+        fn new() -> Self {
+            let ctx = Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            crate::ime_focus::install_ime_input_policy(&ctx);
+            ctx.enable_accesskit();
+            let mut field = Self {
+                ctx,
+                id: Id::unique("singleline-context-menu-test"),
+                text: TEXT.to_owned(),
+                output: None,
+                labels: vec![],
+                buttons: vec![],
+                copied: vec![],
+                changes: vec![],
+                time: 0.0,
+                visible: true,
+            };
+            field.frame(vec![]);
+            field
+                .ctx
+                .memory_mut(|memory| memory.request_focus(field.id));
+            field.frame(vec![]);
+            field
+        }
+
+        fn frame(&mut self, events: Vec<Event>) {
+            self.time += 0.05; // Each press/release stays below max_click_duration.
+            let output = self.ctx.run_ui(
+                egui::RawInput {
+                    time: Some(self.time),
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(640.0, 320.0))),
+                    events,
+                    ..Default::default()
+                },
+                |root| {
+                    egui::CentralPanel::default().show(root, |ui| {
+                        if self.visible {
+                            let mut output = crate::ime_focus::show_singleline(
+                                ui,
+                                &mut self.text,
+                                None,
+                                |edit| edit.id(self.id).desired_width(300.0),
+                            );
+                            let changed =
+                                singleline_text_edit_context_menu(ui, &mut output, &mut self.text);
+                            if changed || output.response.changed() {
+                                self.changes.push((changed, output.response.changed()));
+                            }
+                            self.output = Some(output);
+                        }
+                        let _ = ui.put(
+                            Rect::from_min_size(pos2(400.0, 240.0), vec2(100.0, 30.0)),
+                            egui::Button::new("Outside"),
+                        );
+                    });
+                },
+            );
+            self.labels.clear();
+            fn visit(shape: &egui::Shape, labels: &mut Vec<(String, Pos2)>) {
+                match shape {
+                    egui::Shape::Text(text) => labels.push((
+                        text.galley.text().to_owned(),
+                        text.galley.rect.translate(text.pos.to_vec2()).center(),
+                    )),
+                    egui::Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            visit(shape, labels);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for shape in &output.shapes {
+                visit(&shape.shape, &mut self.labels);
+            }
+            self.buttons = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.role() == egui::accesskit::Role::Button)
+                .filter_map(|(_, node)| {
+                    node.label()
+                        .map(|label| (label.to_owned(), node.is_disabled()))
+                })
+                .collect();
+            for command in &output.platform_output.commands {
+                if let egui::OutputCommand::CopyText(text) = command {
+                    self.copied.push(text.clone());
+                }
+            }
+            output.drop_without_applying_deltas();
+        }
+
+        fn target(&self) -> Option<SinglelineContextMenuTarget> {
+            self.ctx
+                .data(|data| data.get_temp(self.id.with("miv_singleline_context_menu_target")))
+        }
+
+        fn menu_open(&self) -> bool {
+            self.output.as_ref().unwrap().response.context_menu_opened()
+        }
+
+        fn range(&self) -> CCursorRange {
+            egui::TextEdit::load_state(&self.ctx, self.id)
+                .unwrap()
+                .cursor
+                .char_range()
+                .unwrap()
+        }
+
+        fn position(&self, index: usize) -> Pos2 {
+            let output = self.output.as_ref().unwrap();
+            output.galley_pos
+                + output
+                    .galley
+                    .pos_from_cursor(CCursor::new(index))
+                    .center()
+                    .to_vec2()
+        }
+
+        fn click(&mut self, pos: Pos2, button: PointerButton) {
+            self.time += 1.0; // Separate gestures without wall-clock sleeps.
+            self.frame(vec![Event::PointerMoved(pos)]);
+            self.frame(vec![pointer(pos, button, true)]);
+            self.frame(vec![pointer(pos, button, false)]);
+            self.frame(vec![]);
+        }
+
+        fn drag_selection(&mut self) {
+            self.time += 1.0;
+            let from = self.position(3);
+            let to = self.position(6);
+            self.frame(vec![Event::PointerMoved(from)]);
+            self.frame(vec![pointer(from, PointerButton::Primary, true)]);
+            self.frame(vec![Event::PointerMoved(to)]);
+            self.frame(vec![pointer(to, PointerButton::Primary, false)]);
+            assert_eq!(
+                self.range().as_sorted_char_range(),
+                egui::text::CharIndex(3)..egui::text::CharIndex(6)
+            );
+        }
+
+        fn open_selection_menu(&mut self) {
+            self.drag_selection();
+            self.click(self.position(4), PointerButton::Secondary);
+            assert!(self.menu_open());
+            let target = self.target().unwrap();
+            assert_eq!(target.text, TEXT);
+            assert_eq!(target.selection, self.range());
+        }
+
+        fn item(&self, label: &str) -> Pos2 {
+            self.labels
+                .iter()
+                .find(|(text, _)| text == label)
+                .unwrap()
+                .1
+        }
+
+        fn item_disabled(&self, label: &str) -> bool {
+            self.buttons
+                .iter()
+                .find(|(text, _)| text == label)
+                .unwrap()
+                .1
+        }
+
+        fn assert_closed(&self) {
+            assert!(!self.menu_open());
+            assert!(self.target().is_none());
+        }
+    }
+
+    fn pointer(pos: Pos2, button: PointerButton, pressed: bool) -> Event {
+        Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn singleline_context_menu_cut_uses_opening_selection_after_focus_loss() {
+        let mut field = Field::new();
+        field.open_selection_menu();
+        assert!(!field.item_disabled("切り取り"));
+        field.click(field.item("切り取り"), PointerButton::Primary);
+        assert_eq!(field.text, "旅行  日本語");
+        assert_eq!(field.copied, ["abc"]);
+        assert_eq!(field.range(), CCursorRange::one(CCursor::new(3)));
+        assert_eq!(field.changes, [(true, true)]);
+        assert!(field.ctx.memory(|memory| memory.has_focus(field.id)));
+        field.assert_closed();
+    }
+
+    #[test]
+    fn singleline_context_menu_copy_uses_opening_selection_without_changed_flags() {
+        let mut field = Field::new();
+        field.open_selection_menu();
+        field.click(field.item("コピー"), PointerButton::Primary);
+        assert_eq!(field.text, TEXT);
+        assert_eq!(field.copied, ["abc"]);
+        assert!(field.changes.is_empty());
+        assert!(field.ctx.memory(|memory| memory.has_focus(field.id)));
+        field.assert_closed();
+    }
+
+    #[test]
+    fn singleline_context_menu_empty_target_keeps_right_click_caret() {
+        let mut field = Field::new();
+        field.click(field.position(3), PointerButton::Primary);
+        field.click(field.position(7), PointerButton::Secondary);
+        assert!(field.menu_open());
+        assert_eq!(field.range(), CCursorRange::one(CCursor::new(7)));
+        assert_eq!(
+            field.target().unwrap().selection_for(&field.text),
+            field.range()
+        );
+        assert!(field.item_disabled("切り取り"));
+        assert!(field.item_disabled("コピー"));
+        // No test seam for read_clipboard_text exists. Do not read/write a
+        // fixture into the user's OS clipboard to exercise menu Paste here.
+    }
+
+    #[test]
+    fn singleline_context_menu_secondary_reopen_captures_new_target() {
+        let mut field = Field::new();
+        field.open_selection_menu();
+        // Popup::show's existing CloseOnClick also closes on a secondary
+        // click outside an already shown popup. Keep egui's close rule, then
+        // verify the next open targets the new caret rather than the old range.
+        field.click(field.position(1), PointerButton::Secondary);
+        field.assert_closed();
+        field.click(field.position(1), PointerButton::Secondary);
+        assert!(field.menu_open());
+        assert_eq!(
+            field.target().unwrap().selection,
+            CCursorRange::one(CCursor::new(1))
+        );
+        assert!(field.item_disabled("切り取り"));
+        assert!(field.item_disabled("コピー"));
+    }
+
+    #[test]
+    fn singleline_context_menu_select_all_uses_snapshot_and_restores_focus() {
+        let mut field = Field::new();
+        field.open_selection_menu();
+        field.click(field.item("すべて選択"), PointerButton::Primary);
+        assert_eq!(
+            field.range(),
+            CCursorRange::two(CCursor::new(0), CCursor::new(TEXT.chars().count()))
+        );
+        assert_eq!(field.text, TEXT);
+        assert!(field.copied.is_empty());
+        assert!(field.changes.is_empty());
+        assert!(field.ctx.memory(|memory| memory.has_focus(field.id)));
+        field.assert_closed();
+    }
+
+    #[test]
+    fn singleline_context_menu_escape_and_outside_click_remove_target() {
+        for escape in [true, false] {
+            let mut field = Field::new();
+            field.open_selection_menu();
+            if escape {
+                field.frame(vec![Event::Key {
+                    key: Key::Escape,
+                    physical_key: Some(Key::Escape),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }]);
+            } else {
+                field.click(pos2(450.0, 255.0), PointerButton::Primary);
+            }
+            field.assert_closed();
+            // The next open captures a new caret instead of the old range.
+            field.click(field.position(8), PointerButton::Secondary);
+            assert_eq!(
+                field.target().unwrap().selection,
+                CCursorRange::one(CCursor::new(8))
+            );
+        }
+    }
+
+    #[test]
+    fn singleline_context_menu_abandoned_field_clears_target_when_drawn_again() {
+        let mut field = Field::new();
+        field.open_selection_menu();
+        field.visible = false;
+        field.frame(vec![]);
+        field.frame(vec![]);
+        assert!(!field.menu_open());
+        field.visible = true;
+        field.frame(vec![]);
+        field.assert_closed();
+    }
+
+    #[test]
+    fn singleline_context_menu_text_change_disables_cut_copy_and_clamps_caret() {
+        for text in ["別", "別の文字列です"] {
+            let mut field = Field::new();
+            field.open_selection_menu();
+            let target = field.target().unwrap();
+            field.text = text.to_owned();
+            field.frame(vec![]);
+            assert!(field.item_disabled("切り取り"));
+            assert!(field.item_disabled("コピー"));
+            assert_eq!(field.target().unwrap().text, TEXT);
+            assert_eq!(
+                target.selection_for(&field.text),
+                CCursorRange::one(CCursor::new(3.min(text.chars().count())))
+            );
+            field.click(field.item("切り取り"), PointerButton::Primary);
+            assert_eq!(field.text, text);
+            assert!(field.copied.is_empty());
+            assert!(field.changes.is_empty());
+        }
+    }
 }
 
 fn clamp_cursor_range(

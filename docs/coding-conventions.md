@@ -169,6 +169,18 @@ focus 喪失時は全状態を消す（egui も keys_down を消去する）。
 終端直前に空 preedit を補う（focus 喪失後の終端待ちも含む）。composition が無い `Disabled` へは挿入せず、
 非 composing Esc は通常入力として残す。
 
+**単一行 TextEdit の右クリックメニュー（§1.691）**:
+`ui_helpers::singleline_text_edit_context_menu` は、egui がメニュー内容を実行する最初の pass に
+文字列と clamp 済みの選択範囲を一つの型付き target として field id 別の temp data へ保存する。
+開いたまま再度右クリックされた場合も、`Popup::context_menu` が使う `secondary_clicked()` に
+合わせて新しい対象を捕捉する。raw pointer の押下や独自の開閉フラグでは判定しない。
+項目のクリックで focus が外れ、TextEdit の live selection が畳まれても、メニューは保存した
+対象を使う。現在の文字列が保存時と異なれば切り取り／コピーを無効にし、貼り付け位置は
+保存した選択の先頭を現在の文字数へ clamp する。全選択は保存時の全文範囲を現在の文字数へ
+clamp する。`Response::context_menu_opened()` で呼出し前後に閉状態を確認して target を削除し、
+非表示で放棄された欄も、egui が popup を退役させた後の次回描画で削除する。
+開閉判定・focus surrender・IME policy 自体は egui／既存 IME helper に任せる。
+
 **借用の注意**:
 `egui::Window::show(ctx, |ui| {...})` の closure 内で `self` 経由のメソッド呼び出しは
 借用衝突になりやすい。`dialog_enter_pressed` / `dialog_escape_pressed` は closure の**前**で
