@@ -1,6 +1,6 @@
 # 一覧のコンテナを種類アイコンで表示する (§1.697)
 
-作成: 2026-11-08。状態: **設計確定 (独立設計レビュー r3 ACCEPT、2026-11-08)・実装中**。対象版: v5.1.0 候補。
+作成: 2026-11-08。状態: **実装・focused 自動検証済み (設計レビュー r3 / 独立実装レビュー ACCEPT)**。対象版: v5.1.0 候補。
 要望: 5ch >>728・730。バックログ: [next-release-backlog.md §1.697](next-release-backlog.md)。
 
 ## 1. 要件
@@ -229,7 +229,81 @@ ON の間も「代表サムネに固定」の操作は従来どおり使える (
 
 ## 6. 実装記録
 
-(実装後に記入: 触ったファイル、テスト名、レビュー結果)
+実装: 2026-11-08〜09、`feat-1697-container-type-icons` worktree。設計の主要な前提を
+コードで確認したうえで §4 の範囲を実装。コミット・merge・push・製品起動は行っていない。
+
+変更ファイル:
+
+- `src/grid_item.rs`: 対象種類を持つ唯一の判定と表示状態の純粋な射影。
+- `src/settings.rs`、`src/settings_transfer.rs`、`src/ui_dialogs/preferences.rs`、
+  `src/ui_dialogs/preferences/pages.rs`、`src/ui_dialogs/preferences/search_index.rs`:
+  既定 OFF・DB/移送・checkbox/説明/検索・OK 時の現在一覧限定復帰。
+- `src/app.rs`、`src/ui_main.rs`: 一覧要求・idle upgrade の抑止、全 production
+  layout/draw と補正 texture の射影、自動比率の母数/標本/判定/終端条件、hover 抑止。
+- `src/app/runtime_ops.rs`、`scripts/analyze_perf.py`、`scripts/test_analyze_perf.py`:
+  作成時・進行中の画像待ち集合を絞り、空/既充足も同 seq の完了 endpoint を出す。
+  analyzer は完了時の有効母数を表示する。
+- `src/app/tests.rs`、`src/app/tests/container_type_icons.rs`、`src/app/collection_grid.rs`、
+  `src/global_search_ui.rs`、`src/app/grid_type_icon_tests.rs`: handler・状態遷移・実 painter 回帰。
+- `src/app/container_type_icon_fixture.rs`、`src/lib.rs`、`tests/ui_snapshot.rs`:
+  App を使わない実 Loaded の表示射影 fixture と新規一覧 snapshot。
+- `tests/snapshots/preferences_favorite_view_state_dark.png` を更新し、
+  `tests/snapshots/container_type_icon_loaded_grid_dark.png` を追加した。
+- 本書、`docs/display-pipeline.md` §1.3.2、`docs/README.md` の設計索引を更新。
+
+追加回帰は `container_type_icon`（設定/移送/検索/OK・Cancel、対象種類表、keep/priority/drive、
+要求中の切替と両終端順、idle、比率の keep 外終端・Loaded/seed・旧標本の判定/連勝/保存件数、
+キャッシュ/固定保持、parked context、Collection/Everything の一覧保持、hover、painter/hit）と
+`container_icon_scroll`（空/既読込・混在・進行中切替・covered 集合）の filter で実行できる。
+一覧 snapshot は `container_type_icon_loaded_grid_dark`、環境設定は
+`preferences_favorite_view_state_dark` を指定して生成・通常比較する。
+
+独立実装レビュー（GPT-6.1 Sol / xhigh）で、`contains_key` が実要求の終端後も
+`AwaitingArchiveJudgement` の受付枠を含むことを指摘された。keep の表示状態保護は
+実要求 ID の有無で判断し、受付枠は残すよう修正した。
+`container_type_icons_finished_deferred_slot_is_no_art_without_removing_admission_owner` で
+終端受信後の `NoArt` 化と受付枠保持を検査する。§4.2 の実要求の寿命契約に沿う修正であり、
+仕様変更はない。索引の「一覧読み直し」説明だけは旧案が残っていたため併せて修正した。
+
+独立実装レビューは修正再確認後 **ACCEPT**、未解決指摘なし。最終ソースの focused gate:
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/container_type_icon|container_icon_scroll|auto_aspect|thumbnail_request_lifecycle|settings_transfer::tests|thumbnail_type_icon/)'
+```
+
+**161 passed / 0 failed**（新規25件を含む、実行10.465秒）。ログ:
+`target/1697-focused-complete.log`。反復途中の新規 fixture の失敗は、変換書庫の
+準備済み受付状態と環境設定 draft の初期化を既存 helper に合わせて修正した。
+同じ最終 gate に失敗・timeout はない。
+`python scripts/test_analyze_perf.py` は担当が **106 passed** を確認し、その結果を再利用した。
+`cargo fmt`（引数なし）、`cargo fmt --check`、`python scripts/check_ui_glyphs.py`
+（危険文字0件）、`git diff --check` は成功。
+
+UI snapshot は `UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot <filter>` で
+指定の2件をそれぞれ生成し、各 **1 passed**。更新指定なしの同2件の nextest 比較も
+**2 passed / 0 failed**（`target/1697-snapshot-compare.log`）。設定ページは新checkboxと
+small説明の折り返し・既存の名前設定、一覧は中央icon＋左上markと非対象3種の画像保持を
+両PNGを開いて目視確認した。既存設定ページは600×260・68,789 bytes、新規一覧は
+744×488・67,177 bytes、合計135,966 bytes。Appや製品GUIの実行を伴わない純描画検査である。
+
+確認 build は 2026-11-09 に `$env:CARGO_BUILD_JOBS = '1'; .\scripts\build-dev.ps1 -PreserveRuntime`
+で **成功（exit 0）**。共有 PC の負荷を抑えるため1並列とし、通常 feature set（portable なし）で
+core / Remote / EPUB PDF worker / MCP adapter / music-video editor の5本を
+`target/dev-runtime/` に生成した。初回 core は依存構築込み48分34秒。
+DLL 配置と PE 検査も成功（runtime=4 / pe=5）。検査記録:
+`target/vcrt-pe-reports/dev-runtime.json`。製品バイナリは起動しておらず、実機動作は未確認。
+利用者の通常設定へのアクセス・稼働中製品の停止・git の commit/merge/push は行っていない。
+
+利用者が確認する場合は、インストール版／トレイ常駐版を終了してから次を実行する。
+同じ single-instance mutex を共有し、引数なしでは通常の `%APPDATA%\mimageviewer` を使うため、
+実際の設定・データを更新し得る。新設定の ON/OFF、コンテナのアイコン表示、固定代表の復帰、
+単体画像・本の中のページの画像保持を確認する。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+`test-lib-full.ps1` / `test-full.ps1` は利用者指示により未実施で、ClaudeCode の最終 gate へ引き継ぐ。
 
 ## 7. 設計レビューの記録
 

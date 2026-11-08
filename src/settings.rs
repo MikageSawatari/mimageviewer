@@ -4867,6 +4867,9 @@ pub struct Settings {
     /// Keep a small typed mark after the representative thumbnail loads (§1.677).
     #[serde(default = "default_thumb_show_type_icon")]
     pub thumb_show_type_icon: bool,
+    /// 一覧のコンテナを代表画像の代わりに種類アイコンで表示する。
+    #[serde(default)]
+    pub thumb_container_type_icon_only: bool,
     /// サムネイル右下に動画・音声の長さを表示する。
     #[serde(default = "default_true")]
     pub thumb_show_media_duration: bool,
@@ -7843,6 +7846,7 @@ impl Default for Settings {
             thumb_name_max_lines: default_thumb_name_max_lines(),
             thumb_name_prioritize_width: false,
             thumb_show_type_icon: default_thumb_show_type_icon(),
+            thumb_container_type_icon_only: false,
             selection_info_display_mode: SelectionInfoDisplayMode::Tooltip,
             thumb_show_media_duration: true,
             thumb_show_resume_meter: true,
@@ -11218,6 +11222,42 @@ mod tests {
                 enabled
             );
         }
+    }
+
+    #[test]
+    fn thumb_container_type_icon_only_default_missing_and_db_roundtrip() {
+        assert!(!Settings::default().thumb_container_type_icon_only);
+        assert!(
+            !serde_json::from_str::<Settings>("{}")
+                .unwrap()
+                .thumb_container_type_icon_only
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(temp.path()).unwrap();
+        for enabled in [false, true] {
+            let settings = Settings {
+                thumb_container_type_icon_only: enabled,
+                ..Settings::default()
+            };
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings()
+                    .unwrap()
+                    .thumb_container_type_icon_only,
+                enabled
+            );
+        }
+        let conn = rusqlite::Connection::open(temp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'thumb_container_type_icon_only'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            !db.load_into_settings()
+                .unwrap()
+                .thumb_container_type_icon_only
+        );
     }
 
     #[test]

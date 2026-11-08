@@ -289,6 +289,7 @@ preferences_policy! {
         thumb_name_font_scale_percent: u32 => ("サムネイル一覧の名前の文字サイズ", |v, _raw| (THUMB_NAME_FONT_SCALE_PERCENT_MIN..=THUMB_NAME_FONT_SCALE_PERCENT_MAX).contains(v), plain, plain);
         thumb_name_max_lines: u32 => ("サムネイル一覧の名前の最大行数", |v, _raw| (THUMB_NAME_MAX_LINES_MIN..=THUMB_NAME_MAX_LINES_MAX).contains(v), plain, plain);
         thumb_show_type_icon: bool => ("サムネイルに種類アイコンを表示する", |_, _raw| true, plain, plain);
+        thumb_container_type_icon_only: bool => ("フォルダ・書庫・PDF を種類のアイコンで表示する", |_, _raw| true, plain, plain);
         thumb_name_prioritize_width: bool => ("ファイル名の表示幅を優先する", |_, _raw| true, plain, plain);
         selection_info_display_mode: SelectionInfoDisplayMode => ("選択項目の情報表示", |v, _raw| !matches!(v, SelectionInfoDisplayMode::Unknown), plain, plain);
         thumb_tooltip_show_filename: bool => ("サムネイルツールチップ：ファイル名", |_, _| true, plain, plain);
@@ -2024,15 +2025,51 @@ mod tests {
     }
 
     #[test]
+    fn thumb_container_type_icon_only_transfer_roundtrip_missing_invalid() {
+        for enabled in [false, true] {
+            let source = Settings {
+                thumb_container_type_icon_only: enabled,
+                ..Settings::default()
+            };
+            let mut destination = Settings {
+                thumb_container_type_icon_only: !enabled,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            let report = parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert!(report.changed_fields.iter().any(|label| {
+                label == "フォルダ・書庫・PDF を種類のアイコンで表示する"
+            }));
+            assert_eq!(destination.thumb_container_type_icon_only, enabled);
+            parse_preferences(&document(json!({})))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.thumb_container_type_icon_only, enabled);
+            for invalid in [json!("true"), json!(1), Value::Null] {
+                let report = parse_preferences(&document(
+                    json!({"thumb_container_type_icon_only": invalid}),
+                ))
+                .unwrap()
+                .apply_to(&mut destination);
+                assert_eq!(report.issues.len(), 1);
+                assert_eq!(destination.thumb_container_type_icon_only, enabled);
+            }
+        }
+    }
+
+    #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 490);
+        assert_eq!(entries.len(), 491);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            155
+            156
         );
         assert_eq!(
             entries
@@ -2068,7 +2105,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 153);
+        assert_eq!(wire.len(), 154);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);

@@ -928,6 +928,9 @@ pub(crate) fn detached_placement_with_logical_client_for_test(
 #[path = "tests/thumbnail_request_lifecycle.rs"]
 mod thumbnail_request_lifecycle;
 
+#[path = "tests/container_type_icons.rs"]
+mod container_type_icons;
+
 #[path = "tests/section1328_session.rs"]
 mod section1328_session;
 

@@ -475,6 +475,12 @@ SQLite 更新、LRU prune はすべて専用 worker 上で行い、UI スレッ�
 
 ### 1.3.2 親コンテナの代表サムネ — 優先順位
 
+§1.697 の `thumb_container_type_icon_only`（既定 OFF）が ON の間、一覧の対象コンテナは
+共通判定で表示・レイアウトを既存の `NoArt` に置き換え、一覧由来の代表要求と idle 高画質化を省く。
+要求中の owner、固定・キャッシュは保持し、自動比率とスクロールの画像待ち集計からは除く。
+OFF への復帰は現在の App 一覧の対象 `NoArt` を `Pending` に戻す。対象と別利用者の除外範囲、
+退避 context の扱いは [コンテナ種類アイコン設計](container-type-icon-plan.md) を参照。
+
 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) の代表サムネは次の順で決まる:
 
 1. **手動ピン (`folder_thumb_pins.db`)** — ユーザーがアドレスバー 📌 ボタンや

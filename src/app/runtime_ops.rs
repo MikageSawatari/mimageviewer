@@ -1,5 +1,151 @@
 use super::*;
 
+fn emit_visible_thumb_all_ready(state: &mut ScrollSettleState, latency_ms: f64) {
+    state.all_ready_emitted = true;
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "ui",
+            "visible_thumb_all_ready",
+            None,
+            0,
+            &[
+                ("settle_seq", serde_json::Value::from(state.seq)),
+                ("latency_ms", serde_json::Value::from(latency_ms)),
+                (
+                    "target_count",
+                    serde_json::Value::from(state.visible_target.len()),
+                ),
+            ],
+        );
+    }
+}
+
+#[cfg(test)]
+mod container_icon_scroll_tests {
+    use super::*;
+
+    fn loaded_thumb(ctx: &egui::Context) -> crate::grid_item::ThumbnailState {
+        crate::grid_item::ThumbnailState::loaded_raster(
+            ctx.load_texture(
+                "container-icon-scroll",
+                egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+                Default::default(),
+            ),
+            crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+            false,
+            1,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((1, 1)),
+            None,
+        )
+    }
+
+    fn setup_scroll(items: Vec<GridItem>) -> crate::app::AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
+        app.visible_indices = (0..items.len()).collect();
+        app.thumbnails = items
+            .iter()
+            .map(|_| crate::grid_item::ThumbnailState::Pending)
+            .collect();
+        app.items = items;
+        app.settings.grid_cols = 8;
+        app.last_cell_h = 100.0;
+        app.last_viewport_h = 100.0;
+        app
+    }
+
+    #[test]
+    fn container_icon_scroll_empty_and_already_loaded_targets_complete() {
+        let mut app = setup_scroll(vec![GridItem::Folder("folder".into())]);
+        app.settings.thumb_container_type_icon_only = true;
+        app.emit_scroll_settle_event();
+        let state = app.scroll_settle_state.as_ref().unwrap();
+        assert_eq!(state.seq, app.scroll_settle_seq);
+        assert!(state.visible_target.is_empty());
+        assert!(state.all_ready_emitted);
+        assert!(!state.first_ready_emitted);
+        assert!(matches!(
+            app.thumbnails[0],
+            crate::grid_item::ThumbnailState::Pending
+        ));
+
+        app.settings.thumb_container_type_icon_only = false;
+        app.thumbnails[0] = loaded_thumb(&egui::Context::default());
+        app.emit_scroll_settle_event();
+        let state = app.scroll_settle_state.as_ref().unwrap();
+        assert_eq!(state.seq, app.scroll_settle_seq);
+        assert_eq!(state.visible_target, HashSet::from([0]));
+        assert!(state.all_ready_emitted);
+        assert!(!state.first_ready_emitted);
+    }
+
+    #[test]
+    fn container_icon_scroll_mixed_target_only_waits_for_images() {
+        let mut app = setup_scroll(vec![
+            GridItem::Folder("folder".into()),
+            GridItem::Image("image.jpg".into()),
+        ]);
+        app.settings.thumb_container_type_icon_only = true;
+        app.emit_scroll_settle_event();
+        let state = app.scroll_settle_state.as_ref().unwrap();
+        assert_eq!(state.visible_target, HashSet::from([1]));
+        assert!(!state.all_ready_emitted);
+
+        app.thumbnails[1] = loaded_thumb(&egui::Context::default());
+        app.check_visible_thumb_ready();
+        let state = app.scroll_settle_state.as_ref().unwrap();
+        assert!(state.first_ready_emitted);
+        assert!(state.all_ready_emitted);
+        assert_eq!(state.newly_loaded, HashSet::from([1]));
+    }
+
+    #[test]
+    fn container_icon_scroll_toggle_completes_without_new_pixels() {
+        let mut app = setup_scroll(vec![GridItem::Folder("folder".into())]);
+        app.emit_scroll_settle_event();
+        let seq = app.scroll_settle_seq;
+        assert!(!app.scroll_settle_state.as_ref().unwrap().all_ready_emitted);
+
+        app.settings.thumb_container_type_icon_only = true;
+        app.check_visible_thumb_ready();
+        let state = app.scroll_settle_state.as_ref().unwrap();
+        assert_eq!(state.seq, seq);
+        assert!(state.visible_target.is_empty());
+        assert!(state.all_ready_emitted);
+        assert!(!state.first_ready_emitted);
+    }
+
+    #[test]
+    fn container_icon_scroll_toggle_prunes_both_covered_sets() {
+        let mut app = setup_scroll(vec![
+            GridItem::Folder("loaded-before".into()),
+            GridItem::Folder("loaded-after".into()),
+            GridItem::Image("image.jpg".into()),
+        ]);
+        let ctx = egui::Context::default();
+        app.thumbnails[0] = loaded_thumb(&ctx);
+        app.emit_scroll_settle_event();
+        app.thumbnails[1] = loaded_thumb(&ctx);
+        app.check_visible_thumb_ready();
+        let state = app.scroll_settle_state.as_ref().unwrap();
+        assert_eq!(state.loaded_at_settle, HashSet::from([0]));
+        assert_eq!(state.newly_loaded, HashSet::from([1]));
+        assert!(!state.all_ready_emitted);
+
+        app.settings.thumb_container_type_icon_only = true;
+        app.check_visible_thumb_ready();
+        let state = app.scroll_settle_state.as_ref().unwrap();
+        assert_eq!(state.visible_target, HashSet::from([2]));
+        assert!(state.loaded_at_settle.is_empty());
+        assert!(state.newly_loaded.is_empty());
+        assert!(!state.all_ready_emitted);
+
+        app.thumbnails[2] = loaded_thumb(&ctx);
+        app.check_visible_thumb_ready();
+        assert!(app.scroll_settle_state.as_ref().unwrap().all_ready_emitted);
+    }
+}
+
 // scroll_settle 計装の helper 群は inherent impl (trait method ではない)
 impl App {
     /// `App::update` 冒頭で 1 回呼ぶ。同フレーム内の wheel / arrow keys / Page / Home / End と
@@ -131,6 +277,14 @@ impl App {
         let visible_target: HashSet<usize> = self.visible_indices[vis_first..vis_end]
             .iter()
             .copied()
+            .filter(|&idx| {
+                !self.items.get(idx).is_some_and(|item| {
+                    crate::grid_item::container_icon_only(
+                        item,
+                        self.settings.thumb_container_type_icon_only,
+                    )
+                })
+            })
             .collect();
         let loaded_at_settle: HashSet<usize> = visible_target
             .iter()
@@ -181,15 +335,7 @@ impl App {
             crate::perf::event("ui", "scroll_settle", None, 0, &fields);
         }
 
-        // already-loaded で全部済んでいれば first_ready/all_ready は emit 不要 (latency=0 扱い)
-        if already_loaded >= target_count {
-            // この window は emit せず終了 (latency=0)
-            self.scroll_settle_state = None;
-            self.last_scroll_event_at = None;
-            return;
-        }
-
-        self.scroll_settle_state = Some(ScrollSettleState {
+        let mut state = ScrollSettleState {
             seq,
             settled_at,
             visible_target,
@@ -197,7 +343,13 @@ impl App {
             newly_loaded: HashSet::new(),
             first_ready_emitted: false,
             all_ready_emitted: false,
-        });
+        };
+        // 空 target と全画像が既読込の settle も、analyzer が要求する同じ seq の
+        // completion endpoint を出す。新しく届いた画像は無いので first_ready は出さない。
+        if already_loaded >= target_count {
+            emit_visible_thumb_all_ready(&mut state, 0.0);
+        }
+        self.scroll_settle_state = Some(state);
         // 次の scroll を待つ (settle 済みなので last_scroll_event_at は clear)
         self.last_scroll_event_at = None;
     }
@@ -211,6 +363,24 @@ impl App {
         if state.all_ready_emitted {
             return;
         }
+
+        // settle 開始後に設定が ON になっても、表示しない代表画像を待たない。
+        // covered の集合も target と同じ範囲に絞り、除外済みの Loaded が残った画像を
+        // 覆ったものとして数えられないようにする。
+        state.visible_target.retain(|&idx| {
+            !self.items.get(idx).is_some_and(|item| {
+                crate::grid_item::container_icon_only(
+                    item,
+                    self.settings.thumb_container_type_icon_only,
+                )
+            })
+        });
+        state
+            .loaded_at_settle
+            .retain(|idx| state.visible_target.contains(idx));
+        state
+            .newly_loaded
+            .retain(|idx| state.visible_target.contains(idx));
 
         // 新規 Loaded 化を集める。
         // **Codex P2-3 対応**: settle 時点で既に Loaded だった idx (= loaded_at_settle に
@@ -231,21 +401,11 @@ impl App {
                 newly.push(idx);
             }
         }
-        if newly.is_empty() {
-            // all_ready 判定: settle 時点で全部 loaded だったケース (= target ⊆ loaded_at_settle)
-            // は emit_scroll_settle_event 側で state を None にして早期 return しているので、
-            // ここに来るのは「未 loaded が残ってる」ケース。
-            // ただし「target が空」のエッジケースだけは保護する。
-            if state.visible_target.is_empty() && !state.all_ready_emitted {
-                state.all_ready_emitted = true;
-            }
-            return;
-        }
         for idx in &newly {
             state.newly_loaded.insert(*idx);
         }
         // first_ready
-        if !state.first_ready_emitted {
+        if !newly.is_empty() && !state.first_ready_emitted {
             state.first_ready_emitted = true;
             if crate::perf::is_enabled() {
                 let latency_ms = state.settled_at.elapsed().as_secs_f64() * 1000.0;
@@ -273,24 +433,8 @@ impl App {
         // all_ready: loaded_at_settle ∪ newly_loaded が target を覆ったか
         let total_covered = state.loaded_at_settle.len() + state.newly_loaded.len();
         if total_covered >= state.visible_target.len() && !state.all_ready_emitted {
-            state.all_ready_emitted = true;
-            if crate::perf::is_enabled() {
-                let latency_ms = state.settled_at.elapsed().as_secs_f64() * 1000.0;
-                crate::perf::event(
-                    "ui",
-                    "visible_thumb_all_ready",
-                    None,
-                    0,
-                    &[
-                        ("settle_seq", serde_json::Value::from(state.seq)),
-                        ("latency_ms", serde_json::Value::from(latency_ms)),
-                        (
-                            "target_count",
-                            serde_json::Value::from(state.visible_target.len()),
-                        ),
-                    ],
-                );
-            }
+            let latency_ms = state.settled_at.elapsed().as_secs_f64() * 1000.0;
+            emit_visible_thumb_all_ready(state, latency_ms);
         }
     }
 

@@ -1415,6 +1415,15 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
             "画像が表示された後も、左上の固定マークでフォルダ・書庫・画像などを見分けられます。",
         );
     });
+    anchored(ui, state, "thumbnail/container-type-icon", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.thumb_container_type_icon_only,
+            "フォルダ・書庫・PDF を種類のアイコンで表示する",
+        );
+        ui.small(
+            "代表画像の代わりにアイコンを表示します。画像・動画・音声と、本を開いた後のページはそのままです。固定した代表画像やキャッシュは残り、オフに戻すと再び表示されます。",
+        );
+    });
     anchored(ui, state, "thumbnail/name-font-scale", |ui, state| {
         ui.horizontal_wrapped(|ui| {
             let label = ui.label("名前の文字サイズ:");
