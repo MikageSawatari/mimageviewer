@@ -1079,7 +1079,7 @@ mod tests {
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: crate::app::DeferredFsTarget::None,
-            resume_to_last_page: false,
+            resume_to_last_page: (false).into(),
             from_explicit_open: false,
             preserve_after_password_prompt: false,
         });
@@ -1120,7 +1120,7 @@ mod tests {
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: crate::app::DeferredFsTarget::None,
-            resume_to_last_page: false,
+            resume_to_last_page: (false).into(),
             from_explicit_open: false,
             preserve_after_password_prompt: false,
         });
@@ -1161,7 +1161,7 @@ mod tests {
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: crate::app::DeferredFsTarget::None,
-            resume_to_last_page: false,
+            resume_to_last_page: (false).into(),
             from_explicit_open: false,
             preserve_after_password_prompt: false,
         });
@@ -1222,7 +1222,7 @@ mod tests {
                 history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: crate::app::DeferredFsTarget::None,
-                resume_to_last_page: false,
+                resume_to_last_page: (false).into(),
                 from_explicit_open: false,
                 preserve_after_password_prompt: false,
             });

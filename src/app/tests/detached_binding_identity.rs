@@ -129,7 +129,7 @@ fn detached_binding_identity_zip_load_poll_open_uses_published_window() {
     assert!(app.start_active_detached_book_context(
         ViewerContextDescriptor::Zip {
             path: zip.clone(),
-            entry_name: None,
+            target: crate::app::DetachedZipTarget::RootBook,
             archive_source_override: None
         },
         &egui::Context::default(),

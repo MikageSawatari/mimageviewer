@@ -840,6 +840,9 @@ mod everything_select_1691;
 #[path = "tests/ctrl_down_close_1678.rs"]
 mod ctrl_down_close_1678;
 
+#[path = "tests/archive_inner_book_s1.rs"]
+mod archive_inner_book_s1;
+
 // Legacy fixture paths now use the same immutable payload types as runtime navigation.
 pub(crate) fn reading_history_return_for_test(container: PathBuf) -> ReadingHistoryBookReturn {
     ReadingHistoryBookReturn::without_entrance(container)
@@ -4077,7 +4080,7 @@ fn epub_modal_rejects_second_direct_open_and_cancel_preserves_history() {
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::None,
-        resume_to_last_page: false,
+        resume_to_last_page: (false).into(),
         from_explicit_open: false,
         preserve_after_password_prompt: false,
     });
@@ -4311,7 +4314,7 @@ fn epub_modal_blocks_pane_scan_until_cancel() {
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::None,
-        resume_to_last_page: false,
+        resume_to_last_page: (false).into(),
         from_explicit_open: false,
         preserve_after_password_prompt: false,
     });
@@ -4379,7 +4382,7 @@ fn epub_modal_blocks_failed_pane_scan_and_cancel_restores_source() {
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::None,
-        resume_to_last_page: false,
+        resume_to_last_page: (false).into(),
         from_explicit_open: false,
         preserve_after_password_prompt: false,
     });
@@ -4453,7 +4456,7 @@ fn epub_ready_pane_replacement_scenario(c_succeeds: bool) {
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::None,
-        resume_to_last_page: false,
+        resume_to_last_page: (false).into(),
         from_explicit_open: false,
         preserve_after_password_prompt: false,
     });
@@ -4588,7 +4591,7 @@ fn epub_published_stale_collection_reopen_preserves_other_pending_attachments() 
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::None,
-        resume_to_last_page: false,
+        resume_to_last_page: (false).into(),
         from_explicit_open: false,
         preserve_after_password_prompt: false,
     });
@@ -16198,7 +16201,9 @@ mod startup_open_path_resolve_tests {
                         cancel: std::sync::Arc::clone(&cancel),
                         rx,
 
-                        restore_intent: crate::app::StartupListIntent::ExplicitList,
+                        presentation: crate::app::ZipEnumerationPresentation::Existing(
+                            crate::app::StartupListIntent::ExplicitList,
+                        ),
                     });
                     app.pause_mounted_background_work_keep_current_frame();
                     assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
@@ -18561,6 +18566,7 @@ mod startup_open_path_resolve_tests {
             #[cfg(windows)]
             lease: crate::app::DetachedSessionLease { window_id: 8_589 },
             source_path: source.clone(),
+            target: crate::app::DetachedZipTarget::RootBook,
             collection_restore: None,
         };
 
@@ -22150,7 +22156,12 @@ mod phase_c_folder_nav_history_tests {
             .expect("book resume DB")
             .set(&book, 12)
             .expect("seed book resume");
-        app.last_book_resume = Some((book.clone(), 12, None, None));
+        app.last_book_resume = Some((
+            crate::book_resume_key::BookResumeKey::legacy(&book),
+            12,
+            None,
+            None,
+        ));
         app.settings
             .video_resume_positions
             .insert("/miv-test/movie.mp4".to_string(), 91.5);
@@ -22208,11 +22219,11 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(app.checked, HashSet::from([1, 3]));
         assert_eq!(
             app.last_book_resume.as_ref().map(|(path, page, meter, _)| (
-                path.clone(),
+                path.storage_key(),
                 *page,
                 *meter
             )),
-            Some((book.clone(), 12, None))
+            Some((crate::path_key::normalize(&book), 12, None))
         );
         assert_eq!(
             app.book_resume_db
@@ -43310,9 +43321,8 @@ mod favorite_adjustment_defaults_tests {
     }
 
     /// ウィンドウ内フルスクリーン (embedded still) では root 側キー処理が
-    /// `handle_keyboard` を毎フレーム抑止する。ただし「ページを直接開く」設定 ON の
-    /// ZIP/PDF close 要求で `pending_return_to_parent` が立っているときは、入力ナビ合流点に
-    /// 親一覧へのナビ予約を消費させる必要がある。
+    /// `handle_keyboard` を毎フレーム抑止する。ZIP/PDF close の continuation も
+    /// グリッドに先取りさせず、描画後の dispatcher に渡して early-return 前に消費する。
     #[cfg(windows)]
     #[test]
     fn embedded_container_close_request_allows_parent_return_to_be_consumed() {
@@ -43338,9 +43348,10 @@ mod favorite_adjustment_defaults_tests {
 
         app.pending_return_to_parent.request_live();
         assert!(
-            !app.handle_fullscreen_root_key_input(&egui::Context::default()),
-            "parent-return reservation must reach handle_keyboard on the next frame"
+            app.handle_fullscreen_root_key_input(&egui::Context::default()),
+            "embedded close must remain owned by the post-render dispatcher"
         );
+        assert!(app.pending_return_to_parent.is_pending());
         let nav = app
             .take_pending_return_to_parent_nav()
             .expect("parent return request should become a direct nav");
@@ -43476,7 +43487,7 @@ mod favorite_adjustment_defaults_tests {
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
-            resume_to_last_page: true,
+            resume_to_last_page: (true).into(),
             from_explicit_open: true,
             preserve_after_password_prompt: true,
         });
@@ -43490,7 +43501,7 @@ mod favorite_adjustment_defaults_tests {
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
-            resume_to_last_page: false,
+            resume_to_last_page: (false).into(),
             from_explicit_open: false,
             preserve_after_password_prompt: false,
         });
@@ -43521,22 +43532,22 @@ mod favorite_adjustment_defaults_tests {
         let meter = crate::book_resume_db::ReadingMeterValue::new(1, 1);
         assert_eq!(
             app.last_book_resume.as_ref().map(|(path, page, meter, _)| (
-                path.clone(),
+                path.storage_key(),
                 *page,
                 *meter
             )),
-            Some((folder.clone(), 0, meter))
+            Some((crate::path_key::normalize(&folder), 0, meter))
         );
 
         // フォルダタイル idx 1 → 対象外。直近記録は据え置き
         app.record_book_resume(1);
         assert_eq!(
             app.last_book_resume.as_ref().map(|(path, page, meter, _)| (
-                path.clone(),
+                path.storage_key(),
                 *page,
                 *meter
             )),
-            Some((folder, 0, meter))
+            Some((crate::path_key::normalize(&folder), 0, meter))
         );
     }
 
@@ -49080,11 +49091,9 @@ mod favorite_adjustment_defaults_tests {
         assert!(existing_keys.contains(&pinned_key));
     }
 
-    /// 読書位置レジュームはネスト ZIP の本の中 (スタック深さ ≥ 2) では記録しない。
-    /// idx は階層ローカルだが、再オープン時はルート階層 items に対して検証されるため、
-    /// 同 idx の別アイテムへ誤って「続きから」着地し得る (レビュー P3)。
+    /// 内部本は専用キーに保存し、root の位置とは独立させる（§1.675 S2）。
     #[test]
-    fn record_book_resume_skipped_inside_zip_book_level() {
+    fn record_book_resume_uses_separate_key_inside_zip_book_level() {
         use crate::grid_item::GridItem;
         let mut app = setup_app();
         let zip_path = std::path::PathBuf::from(r"C:\test\outer.zip");
@@ -49095,19 +49104,25 @@ mod favorite_adjustment_defaults_tests {
         });
         app.rebuild_visible_indices();
 
-        // 本の中 (深さ 2) → 記録されない
+        // 本の中 (深さ 2) → 論理元書庫＋raw prefix のキーに記録する。
         let mut nav = test_zip_nav(&["bookA/p1.jpg", "bookB/p1.jpg"]);
         nav.enter("bookA/");
         app.zip_nav = Some(nav);
         app.record_book_resume(0);
+        let inner_key = app.current_book_resume_key().unwrap();
+        assert!(matches!(
+            inner_key,
+            crate::book_resume_key::BookResumeKey::ArchiveLevel { .. }
+        ));
         assert_eq!(
-            app.last_book_resume.as_ref().map(|(path, page, meter, _)| (
-                path.clone(),
-                *page,
-                *meter
-            )),
-            None,
-            "本の中では resume を記録しない"
+            app.last_book_resume
+                .as_ref()
+                .map(|(key, page, meter, _)| (key.clone(), *page, *meter)),
+            Some((
+                inner_key,
+                0,
+                crate::book_resume_db::ReadingMeterValue::new(1, 1)
+            ))
         );
 
         // ルート表示 (フラット ZIP 相当) → 従来どおり記録される
@@ -49119,12 +49134,12 @@ mod favorite_adjustment_defaults_tests {
         app.record_book_resume(0);
         assert_eq!(
             app.last_book_resume.as_ref().map(|(path, page, meter, _)| (
-                path.clone(),
+                path.storage_key(),
                 *page,
                 *meter
             )),
             Some((
-                zip_path,
+                crate::path_key::normalize(&zip_path),
                 0,
                 crate::book_resume_db::ReadingMeterValue::new(1, 1),
             ))
@@ -49951,7 +49966,7 @@ mod favorite_adjustment_defaults_tests {
             input_seq,
             prepared,
             VisibleInstallAuthority::Ordinary,
-            StartupListIntent::ExplicitList,
+            ZipEnumerationPresentation::Existing(StartupListIntent::ExplicitList),
         );
         assert!(app.pending_rating_view_zipdir_open.is_none());
         app.finish_page_identity_preparation_for_test();
@@ -53356,7 +53371,7 @@ mod favorite_adjustment_defaults_tests {
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
-            resume_to_last_page: false,
+            resume_to_last_page: (false).into(),
             from_explicit_open: false,
             preserve_after_password_prompt: false,
         });
@@ -54336,7 +54351,7 @@ mod favorite_adjustment_defaults_tests {
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
-            resume_to_last_page: false,
+            resume_to_last_page: (false).into(),
             from_explicit_open: false,
             preserve_after_password_prompt: false,
         });
@@ -69368,7 +69383,7 @@ mod still_window_mode_key_tests {
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
-            resume_to_last_page: false,
+            resume_to_last_page: (false).into(),
             from_explicit_open: false,
             preserve_after_password_prompt: false,
         });
@@ -69469,7 +69484,7 @@ mod still_window_mode_key_tests {
                 history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
-                resume_to_last_page: false,
+                resume_to_last_page: (false).into(),
                 from_explicit_open: false,
                 preserve_after_password_prompt: false,
             });
@@ -74652,6 +74667,7 @@ mod still_window_mode_key_tests {
             #[cfg(windows)]
             lease: crate::app::DetachedSessionLease { window_id },
             source_path: source.clone(),
+            target: crate::app::DetachedZipTarget::RootBook,
             collection_restore: None,
         };
         let (tx, rx) = mpsc::channel();
@@ -74731,7 +74747,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx,
 
-                restore_intent: crate::app::StartupListIntent::ExplicitList,
+                presentation: crate::app::ZipEnumerationPresentation::Existing(
+                    crate::app::StartupListIntent::ExplicitList,
+                ),
             });
             mounted.poll_zip_enumerate();
         })
@@ -75433,7 +75451,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             DetachedBuild::Built(DetachedGridItemOpenPlan::Descriptor {
                 descriptor: ViewerContextDescriptor::Zip {
                     path,
-                    entry_name: None,
+                    target: crate::app::DetachedZipTarget::RootBook,
                     archive_source_override: None,
                 },
                 ..
@@ -77103,7 +77121,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
-                resume_to_last_page: false,
+                resume_to_last_page: (false).into(),
                 from_explicit_open: false,
                 preserve_after_password_prompt: false,
             });
@@ -77142,7 +77160,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
-                resume_to_last_page: false,
+                resume_to_last_page: (false).into(),
                 from_explicit_open: false,
                 preserve_after_password_prompt: false,
             });
@@ -77641,7 +77659,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx: zip_rx,
 
-                restore_intent: crate::app::StartupListIntent::ExplicitList,
+                presentation: crate::app::ZipEnumerationPresentation::Existing(
+                    crate::app::StartupListIntent::ExplicitList,
+                ),
             });
         });
         run_active_detached_frame_for_test(&mut app, &ctx);
@@ -77748,7 +77768,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
-                resume_to_last_page: false,
+                resume_to_last_page: (false).into(),
                 from_explicit_open: false,
                 preserve_after_password_prompt: false,
             });
@@ -82876,7 +82896,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
-            resume_to_last_page: false,
+            resume_to_last_page: (false).into(),
             from_explicit_open: true,
             preserve_after_password_prompt: true,
         });
@@ -82925,7 +82945,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 pdf_path: pdf,
                 page_num: 9,
             }),
-            resume_to_last_page: true,
+            resume_to_last_page: (true).into(),
             from_explicit_open: true,
             preserve_after_password_prompt: true,
         });
@@ -83519,7 +83539,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
-                resume_to_last_page: false,
+                resume_to_last_page: (false).into(),
                 from_explicit_open: true,
                 preserve_after_password_prompt: true,
             });
@@ -88411,7 +88431,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             )),
             None,
             VisibleInstallAuthority::Ordinary,
-            crate::app::StartupListIntent::ExplicitList,
+            crate::app::ZipEnumerationPresentation::Existing(
+                crate::app::StartupListIntent::ExplicitList,
+            ),
         );
 
         app.finish_page_identity_preparation_for_test();
@@ -99329,7 +99351,7 @@ mod smart_folder_transition_tests {
                     history_trigger: crate::app::HistoryTrigger::UserChosen,
                     resume_slideshow: false,
                     target: DeferredFsTarget::None,
-                    resume_to_last_page: false,
+                    resume_to_last_page: (false).into(),
                     from_explicit_open: false,
                     preserve_after_password_prompt: false,
                 },
@@ -100118,7 +100140,9 @@ mod smart_folder_transition_tests {
             cancel: std::sync::Arc::clone(&old_cancel),
             rx,
 
-            restore_intent: crate::app::StartupListIntent::ExplicitList,
+            presentation: crate::app::ZipEnumerationPresentation::Existing(
+                crate::app::StartupListIntent::ExplicitList,
+            ),
         });
 
         assert!(app.begin_smart_grid_container_navigation(
@@ -100174,7 +100198,9 @@ mod smart_folder_transition_tests {
             cancel: std::sync::Arc::clone(&old_cancel),
             rx,
 
-            restore_intent: crate::app::StartupListIntent::ExplicitList,
+            presentation: crate::app::ZipEnumerationPresentation::Existing(
+                crate::app::StartupListIntent::ExplicitList,
+            ),
         });
 
         assert!(app.begin_smart_grid_container_navigation(
@@ -100243,7 +100269,9 @@ mod smart_folder_transition_tests {
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rx,
 
-            restore_intent: crate::app::StartupListIntent::ExplicitList,
+            presentation: crate::app::ZipEnumerationPresentation::Existing(
+                crate::app::StartupListIntent::ExplicitList,
+            ),
         });
         app.poll_zip_enumerate();
         assert!(app.fs_navigation_sequence_owned_by_smart_folder());

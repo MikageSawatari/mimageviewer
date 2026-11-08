@@ -1139,8 +1139,43 @@ pub(crate) enum VideoStreamUiOutcome {
     Error(VideoStreamError),
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ValidatedRemoteResume {
+    pub(super) key: crate::book_resume_key::BookResumeKey,
+    pub(super) identity: crate::book_resume_db::PageIdentity,
+    pub(super) raw_index: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ValidatedRemoteReadingProgress {
+    pub(super) resume: Option<ValidatedRemoteResume>,
+    pub(super) history_has_position: bool,
+}
+
+pub(crate) enum RemoteWritePayload {
+    Request(RemoteWriteRequest),
+    ReadingProgress {
+        request: RemoteWriteRequest,
+        validated: ValidatedRemoteReadingProgress,
+    },
+}
+
+impl RemoteWritePayload {
+    pub(crate) fn request(&self) -> &RemoteWriteRequest {
+        match self {
+            Self::Request(request) | Self::ReadingProgress { request, .. } => request,
+        }
+    }
+    pub(crate) fn reading_progress(&self) -> Option<&ValidatedRemoteReadingProgress> {
+        match self {
+            Self::ReadingProgress { validated, .. } => Some(validated),
+            _ => None,
+        }
+    }
+}
+
 struct QueuedRemoteWrite {
-    request: RemoteWriteRequest,
+    request: RemoteWritePayload,
     composition_admission: crate::book_composition::CompositionWriteAdmission,
     operation: SessionOperation,
     reply: mpsc::SyncSender<UiWriteOutcome>,
@@ -1148,7 +1183,7 @@ struct QueuedRemoteWrite {
 }
 
 struct QueuedBookResumeRead {
-    path: std::path::PathBuf,
+    key: crate::book_resume_key::BookResumeKey,
     reply: mpsc::SyncSender<Option<crate::book_resume_db::ReadingPosition>>,
     dispatch: Arc<UiRequestDispatch>,
 }
@@ -1167,14 +1202,14 @@ enum QueuedRemoteUiRequest {
 }
 
 pub(crate) struct ClaimedRemoteWrite {
-    request: RemoteWriteRequest,
+    request: RemoteWritePayload,
     composition_admission: crate::book_composition::CompositionWriteAdmission,
     operation: SessionOperation,
     reply: mpsc::SyncSender<UiWriteOutcome>,
 }
 
 pub(crate) struct ClaimedBookResumeRead {
-    path: std::path::PathBuf,
+    key: crate::book_resume_key::BookResumeKey,
     reply: mpsc::SyncSender<Option<crate::book_resume_db::ReadingPosition>>,
 }
 
@@ -1333,7 +1368,10 @@ impl ClaimedRemoteWrite {
         &self.composition_admission
     }
     pub(crate) fn request(&self) -> &RemoteWriteRequest {
-        &self.request
+        self.request.request()
+    }
+    pub(crate) fn reading_progress(&self) -> Option<&ValidatedRemoteReadingProgress> {
+        self.request.reading_progress()
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -1362,7 +1400,7 @@ impl ClaimedRemoteWrite {
         let (reply, receiver) = mpsc::sync_channel(1);
         (
             Self {
-                request,
+                request: RemoteWritePayload::Request(request),
                 composition_admission: Default::default(),
                 operation,
                 reply,
@@ -1373,8 +1411,8 @@ impl ClaimedRemoteWrite {
 }
 
 impl ClaimedBookResumeRead {
-    pub(crate) fn path(&self) -> &std::path::Path {
-        &self.path
+    pub(crate) fn key(&self) -> &crate::book_resume_key::BookResumeKey {
+        &self.key
     }
 
     pub(crate) fn complete(self, page: Option<usize>) {
@@ -1399,7 +1437,13 @@ impl ClaimedBookResumeRead {
         mpsc::Receiver<Option<crate::book_resume_db::ReadingPosition>>,
     ) {
         let (reply, receiver) = mpsc::sync_channel(1);
-        (Self { path, reply }, receiver)
+        (
+            Self {
+                key: crate::book_resume_key::BookResumeKey::legacy(&path),
+                reply,
+            },
+            receiver,
+        )
     }
 }
 
@@ -2048,7 +2092,7 @@ impl SessionHandle {
         admission: crate::book_composition::CompositionWriteAdmission,
     ) -> UiWriteOutcome {
         self.submit_qualified_write_with_timeout(
-            request,
+            RemoteWritePayload::Request(request),
             operation,
             admission,
             UI_REQUEST_ACCEPT_TIMEOUT,
@@ -2061,11 +2105,29 @@ impl SessionHandle {
         operation: SessionOperation,
         timeout: Duration,
     ) -> UiWriteOutcome {
-        self.submit_qualified_write_with_timeout(request, operation, Default::default(), timeout)
+        self.submit_qualified_write_with_timeout(
+            RemoteWritePayload::Request(request),
+            operation,
+            Default::default(),
+            timeout,
+        )
+    }
+    pub(crate) fn submit_validated_write(
+        &self,
+        request: RemoteWritePayload,
+        operation: SessionOperation,
+        admission: crate::book_composition::CompositionWriteAdmission,
+    ) -> UiWriteOutcome {
+        self.submit_qualified_write_with_timeout(
+            request,
+            operation,
+            admission,
+            UI_REQUEST_ACCEPT_TIMEOUT,
+        )
     }
     fn submit_qualified_write_with_timeout(
         &self,
-        request: RemoteWriteRequest,
+        request: RemoteWritePayload,
         operation: SessionOperation,
         composition_admission: crate::book_composition::CompositionWriteAdmission,
         timeout: Duration,
@@ -2125,15 +2187,33 @@ impl SessionHandle {
         self.read_book_position_with_timeout(path, UI_REQUEST_ACCEPT_TIMEOUT)
     }
 
+    pub(crate) fn read_book_position_key(
+        &self,
+        key: &crate::book_resume_key::BookResumeKey,
+    ) -> Result<Option<crate::book_resume_db::ReadingPosition>, UiReadError> {
+        self.read_book_position_key_with_timeout(key, UI_REQUEST_ACCEPT_TIMEOUT)
+    }
+
     fn read_book_position_with_timeout(
         &self,
         path: &std::path::Path,
         timeout: Duration,
     ) -> Result<Option<crate::book_resume_db::ReadingPosition>, UiReadError> {
+        self.read_book_position_key_with_timeout(
+            &crate::book_resume_key::BookResumeKey::legacy(path),
+            timeout,
+        )
+    }
+
+    fn read_book_position_key_with_timeout(
+        &self,
+        key: &crate::book_resume_key::BookResumeKey,
+        timeout: Duration,
+    ) -> Result<Option<crate::book_resume_db::ReadingPosition>, UiReadError> {
         let dispatch = Arc::new(UiRequestDispatch::pending());
         let (reply, receiver) = mpsc::sync_channel(1);
         let queued = QueuedRemoteUiRequest::BookResumeRead(QueuedBookResumeRead {
-            path: path.to_path_buf(),
+            key: key.clone(),
             reply,
             dispatch: Arc::clone(&dispatch),
         });
@@ -2293,7 +2373,7 @@ impl SessionHandle {
                 QueuedRemoteUiRequest::BookResumeRead(queued) if queued.dispatch.try_claim() => {
                     claimed.push(ClaimedRemoteUiRequest::BookResumeRead(
                         ClaimedBookResumeRead {
-                            path: queued.path,
+                            key: queued.key,
                             reply: queued.reply,
                         },
                     ));
@@ -4161,9 +4241,55 @@ mod tests {
         let ClaimedRemoteUiRequest::BookResumeRead(read) = claimed else {
             panic!("book resume read was routed as a write")
         };
-        assert_eq!(read.path(), std::path::Path::new("C:/books/book.zip"));
+        assert_eq!(
+            read.key(),
+            &crate::book_resume_key::BookResumeKey::legacy(std::path::Path::new(
+                "C:/books/book.zip"
+            ))
+        );
         read.complete(Some(7));
         assert_eq!(worker.join().unwrap(), Ok(Some(7)));
+    }
+
+    #[test]
+    fn section1675_inner_resume_read_keeps_typed_key_through_bounded_queue() {
+        let handle = SessionHandle::new();
+        handle.acquire(SessionAcquireRequest {
+            client_id: "client".into(),
+            peer: peer(),
+        });
+        let key = crate::book_resume_key::BookResumeKey::archive(
+            std::path::Path::new("C:/books/outer.zip"),
+            &["A".into(), "inner.zip".into()],
+        )
+        .unwrap();
+        let expected_key = key.clone();
+        let producer = handle.clone();
+        let worker = std::thread::spawn(move || producer.read_book_position_key(&key));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let claimed = loop {
+            if let Some(request) = handle.take_pending_ui_requests().pop() {
+                break request;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "typed resume read was not queued"
+            );
+            std::thread::yield_now();
+        };
+        let ClaimedRemoteUiRequest::BookResumeRead(read) = claimed else {
+            panic!("wrong read request");
+        };
+        assert_eq!(read.key(), &expected_key);
+        let saved = crate::book_resume_db::ReadingPosition {
+            page: 4,
+            identity: Some(crate::book_resume_db::PageIdentity::Archive {
+                container: "c:/books/outer.zip".into(),
+                entry_name: "A/inner.zip/05.jpg".into(),
+            }),
+        };
+        read.complete_position(Some(saved.clone()));
+        assert_eq!(worker.join().unwrap(), Ok(Some(saved)));
     }
 
     #[test]
@@ -4374,7 +4500,7 @@ mod tests {
         handle
             .try_enqueue_ui_request(
                 QueuedRemoteUiRequest::Write(QueuedRemoteWrite {
-                    request: write_request(),
+                    request: RemoteWritePayload::Request(write_request()),
                     composition_admission: Default::default(),
                     operation: write_operation,
                     reply: write_tx,
@@ -4389,7 +4515,9 @@ mod tests {
         handle
             .try_enqueue_ui_request(
                 QueuedRemoteUiRequest::BookResumeRead(QueuedBookResumeRead {
-                    path: std::path::PathBuf::from(r"C:\books\book.zip"),
+                    key: crate::book_resume_key::BookResumeKey::legacy(std::path::Path::new(
+                        r"C:\books\book.zip",
+                    )),
                     reply: read_tx,
                     dispatch: read_dispatch,
                 }),

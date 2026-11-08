@@ -9608,6 +9608,10 @@ impl App {
         if !self.guard_reading_history_open(idx) {
             return None;
         }
+        if self.activate_main_zipdir(idx, ctx) != crate::app::ZipDirActivationOutcome::NotApplicable
+        {
+            return None;
+        }
         self.capture_main_list_restore_cursor();
         // ファイル名スタックの集約グリッドでメディアセルを開いたら、フラット読書フルスクリーンへ
         // (スタック/単独画像/動画を直接開く)。コンテナは false で通常ナビへ流れる。
@@ -9696,11 +9700,9 @@ impl App {
                 self.open_rating_view_zipdir(zip_path, dir_prefix);
                 None
             }
-            // ネスト ZIP ツリーの子コンテナへ降りる (Phase 3)。
-            Some(GridItem::ZipDir { dir_prefix, .. }) => {
-                // ★付きの本を絞り込み中に開くと中身が空表示になるのを防ぐ (Codex P2)。
-                self.maybe_suppress_rating_filter_for_opened_zip_book(idx);
-                self.zip_nav_enter(&dir_prefix);
+            // ZipDir activation はキーボード・マウスと同じ入口で意図を決める。
+            Some(GridItem::ZipDir { .. }) => {
+                // Main activation was consumed before the generic detached router.
                 None
             }
             // ファイル名スタック (v2.0.0): 集約グリッドのセルは上の stack_try_open_from_grid で

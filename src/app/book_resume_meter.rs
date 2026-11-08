@@ -5,12 +5,13 @@ use std::sync::mpsc;
 
 use super::{ActionSurface, App};
 use crate::book_resume_db::{BookResumeWriter, MeterReadResult, ReadingMeterValue};
+use crate::book_resume_key::BookResumeKey;
 use crate::keymap::KeyAction;
 
 #[derive(Clone)]
 enum Delta {
     Record(String, Option<ReadingMeterValue>),
-    RemoveScopes(Vec<String>),
+    RemoveScopes(Vec<PathBuf>),
     Clear,
 }
 
@@ -21,11 +22,10 @@ impl Delta {
                 rows.insert(key.clone(), *value);
             }
             Self::RemoveScopes(scopes) => rows.retain(|key, _| {
-                !scopes.iter().any(|scope| {
-                    key == scope
-                        || key
-                            .strip_prefix(scope)
-                            .is_some_and(|tail| tail.starts_with('/') || tail.starts_with("::"))
+                !BookResumeKey::from_storage_key(key).is_ok_and(|key| {
+                    scopes
+                        .iter()
+                        .any(|scope| key.matches_source_family(scope, true))
                 })
             }),
             Self::Clear => rows.clear(),
@@ -96,16 +96,15 @@ impl BookResumeMeters {
     }
 
     pub(crate) fn record(&mut self, path: &Path, value: Option<ReadingMeterValue>) {
-        self.update(Delta::Record(crate::path_key::normalize(path), value));
+        self.record_key(&BookResumeKey::legacy(path), value);
+    }
+
+    pub(crate) fn record_key(&mut self, key: &BookResumeKey, value: Option<ReadingMeterValue>) {
+        self.update(Delta::Record(key.storage_key(), value));
     }
 
     pub(crate) fn remove_scopes(&mut self, paths: &[PathBuf]) {
-        self.update(Delta::RemoveScopes(
-            paths
-                .iter()
-                .map(|p| crate::path_key::normalize(p))
-                .collect(),
-        ));
+        self.update(Delta::RemoveScopes(paths.to_vec()));
         self.keys.clear();
     }
 
@@ -115,6 +114,14 @@ impl BookResumeMeters {
         self.rows
             .as_ref()?
             .get(&self.keys.get(path)?.book)
+            .copied()
+            .flatten()
+    }
+
+    pub(crate) fn get_key(&self, key: &BookResumeKey) -> Option<ReadingMeterValue> {
+        self.rows
+            .as_ref()?
+            .get(&key.storage_key())
             .copied()
             .flatten()
     }
@@ -246,17 +253,31 @@ impl App {
         value: Option<ReadingMeterValue>,
         identity: Option<crate::book_resume_db::PageIdentity>,
     ) -> bool {
+        self.persist_book_resume_key_with_identity(
+            BookResumeKey::legacy(&path),
+            idx,
+            value,
+            identity,
+        )
+    }
+
+    pub(crate) fn persist_book_resume_key_with_identity(
+        &mut self,
+        key: BookResumeKey,
+        idx: usize,
+        value: Option<ReadingMeterValue>,
+        identity: Option<crate::book_resume_db::PageIdentity>,
+    ) -> bool {
         let value = value.and_then(|v| ReadingMeterValue::new(v.ordinal, v.total));
-        let record = (path, idx, value, identity);
+        let record = (key, idx, value, identity);
         if self.last_book_resume.as_ref() == Some(&record) {
             return true;
         }
-        let recorded = self
-            .book_resume_writer
-            .as_ref()
-            .is_some_and(|writer| writer.record_identity(&record.0, idx, value, record.3.clone()));
+        let recorded = self.book_resume_writer.as_ref().is_some_and(|writer| {
+            writer.record_key_identity(&record.0, idx, value, record.3.clone())
+        });
         if recorded {
-            self.book_resume_meters.record(&record.0, value);
+            self.book_resume_meters.record_key(&record.0, value);
         }
         self.last_book_resume = Some(record);
         recorded

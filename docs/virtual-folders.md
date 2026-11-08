@@ -444,6 +444,34 @@ Enter/ダブルクリック/ゲームパッド/Ctrl+↑↓(本またぎ)/Backspa
 レーティング/タグ等の永続キーは不変 (DB 移行不要)。見開きペアリングは `self.items` が
 現在の本のページだけになるため本ごとに自動リセットされる。詳細は
 [nested-zip-tree-plan.md](nested-zip-tree-plan.md)。
+
+§1.675/§1.676 S1〜S3（実装・自動検証済み）: main の ZipDir のダブルクリック・Enter・パッド決定は
+`activate_main_zipdir` を共用する。「ページを表示」の実効値が ON なら、collapse 後の階層に
+直下ページがある場合に既存の index 準備・本の構成・表示許可を経て開く。内部フォルダと入れ子書庫は
+同じ扱いで、画像のみ実フォルダ用の設定には依存しない。構成順と最終可視集合を満たす最初のページを
+採り、表示可能なページがなければその階層の一覧に留まる。子の本へ自動で潜らない。
+S2 では内部本ごとに読書位置を保存し、直接 open は `book_open_resume`、fullscreen 内部 DFS は
+`book_nav_resume` に従う。slideshow は先頭から開く。保存ページは構成・★を含む最終可視集合で検証し、
+復元できなければ通知付きで先頭へ、表示可能ページがなければ一覧へ戻る。
+S3 の複数ウィンドウモードでは、本候補を独立ビューアで開き、main の一覧・選択・位置・nav・★を変更しない。
+子本だけの分岐と★固定中は従来の一覧移動を保つ。独立側は literal prefix と raw scope を初回 install 前に
+解決し、列挙→hydration→構成→resume→表示許可へ同じ要求を渡す。消失・scope変更・表示ページなしは
+通知して初回 open を終了し、root や子本へ代替しない。取消・遅着は所有 context の要求だけを終了する。
+変換元の再解決・cache確認・RAR probe は既存 archive worker と lease を使い、scopeを変換完了まで保持する。
+内部キーは論理元書庫＋case を保持した raw prefix とし、変換 cache の更新でも再利用する。
+root の既存キーは変更しない。fence の保存済み／未保存結果は構成待ちの前に request へ固定し、待機後は再照会しない。
+構成採用中も同じ request owner が activation／DFS を保持し、保存ページの拒否は採用完了後に通知付き先頭へ進む。
+管理 rename／move／copy／delete は内部キーと Archive PageIdentity を同一 transaction で扱い、cache 削除では消さない。
+読書履歴と metadata export/import の対象は変えず、内部の位置を外側の履歴進捗・メーターへ流用しない。
+本候補になった後で `BookScopeKey` を検証し、非対応名ならその階層を `ExplicitList`／`List` で表示する。
+Chosen を維持し、理由のログと情報通知を 1 回出す。OFF／分岐等の非本候補は scope 検証しない。
+履歴・アドレス・Backspace・refresh・ブックマーク・Required leaf・一覧の Ctrl+↑↓ はこの直接表示入口を使わない。
+
+main が ZipDir を選んで main 内を移動する分岐の出発階層だけに `ZipListChoice::Chosen { rows_above }` を記録する。
+独立ビューアへ渡す分岐では記録を作らず、新 bundle の全階層は `Unseen`。独立 close は main の帰還を発行しない。
+記録は同じツリー内の DFS とソート・ピン再表示では維持し、refresh・履歴復元・同一書庫内への
+ブックマーク／Required jump では破棄する。★固定の退避には同行するが、固定中は帰路を発行しない。
+独立 bundle の build・fork・promote は独立側の記録（退避中の `saved_zip_nav` も含む）だけを消す。
 本ブックマークから開く場合は完全な `entry_name` の prefix を `ZipNavState` へ渡して対象階層を
 materialize してからページを解決するため、現在表示中とは別の ZIP 内階層にも左パネル / 横断一覧の
 どちらからでも移動できる。`/` を含まない直下 entry の親は空 prefix (= ZIP root) とする。
@@ -884,6 +912,21 @@ ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開く�
   completed scanを新しいdetached bundleへ移す。
 
 ### 退出ルーティング = 「設定で固定分岐」(一時フラグなし)
+
+§1.676 S1（実装・自動検証済み）では、main／linked F12 の通常 close に、**利用者が本を選んだ書庫内一覧**を
+最優先の帰路として加える。「ページを表示」が有効で、現在の本の厳密な祖先に `Chosen` がある場合に限る。
+`AddressBarNav::ZipListReturn` は同一ツリーと階層を検証し、旧ページの close 処理を済ませてから
+メモリ上の一覧へ戻す。読んでいた本のセルを選び、row anchor と reveal を組にして位置を復元する。
+DFS で A から B へ移った場合は B を選ぶ。帰還先は close 受理時に確定する。
+古い Live plan は理由をログに出し、帰還先だけを捨てて現在の一覧へ閉じる。close 済みの Terminal は捨てるだけ。
+teardown は物理一覧への帰還と同じ main context 専用処理を使い、兄弟ビューアの active session を終了しない。
+take 済みの帰還も既存 close slot が配送権限を保持し、同じ context の新 reader 受理で失効する。
+古い nav は Chosen／tree が一致していても新 reader の items を置換しない。ページ送りと兄弟の受理はこの失効を起こさない。
+Everything・Collection・ブックマーク等の外側の帰路は消費せず残すため、その後の Backspace で
+root から従来の外側へ抜けられる。記録のない直接 open は以下の既存規則を使う。
+Backspace による L2 表示・設定 OFF の通常 close・独立ビューアの close は変更しない。
+S3で内部本を独立ビューアへ開く場合も、この独立close規則を使う。新bundleは全階層Unseenでmainの帰還を
+継承せず、Esc／×でmainの一覧・選択・scroll・navを変更しない。初回準備の取消も同leaseの要求だけを終了する。
 
 「どう入ったか」を覚える一時フラグ (旧 `fs_zip_auto_opened` / `auto_opened_container`) は
 **廃止**。階層 (L1 ファイル一覧 > L2 ページ一覧 > フルスクリーン) の概念は変えず、

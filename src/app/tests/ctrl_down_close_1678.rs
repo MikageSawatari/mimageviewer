@@ -174,7 +174,7 @@ fn independent_navigation_closes(sidecar_enabled: bool) -> bool {
     assert!(env.start_active_detached_book_context(
         ViewerContextDescriptor::Zip {
             path: flat.clone(),
-            entry_name: None,
+            target: crate::app::DetachedZipTarget::RootBook,
             archive_source_override: None,
         },
         &ctx,

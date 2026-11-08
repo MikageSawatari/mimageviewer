@@ -850,6 +850,7 @@ enum PinButtonClick {
 
 #[derive(Debug)]
 pub(crate) enum AddressBarNav {
+    ZipListReturn(crate::app::ZipListReturnRequest),
     Direct(PathBuf, crate::app::StartupListIntent),
     GridVirtual(crate::app::GridVirtualOpenIntent),
     RatingSource {
@@ -15937,6 +15938,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     Some(
                                         AddressBarNav::HistoryBack
                                         | AddressBarNav::HistoryForward
+                                        | AddressBarNav::ZipListReturn(_)
                                         | AddressBarNav::EverythingResults
                                         | AddressBarNav::SavedGroupReady(_),
                                     )
@@ -17839,6 +17841,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             None
         };
         if activation_allowed {
+            if self.activate_main_zipdir(idx, ctx)
+                != crate::app::ZipDirActivationOutcome::NotApplicable
+            {
+                return nav;
+            }
             self.capture_main_list_restore_cursor();
             // ファイル名スタックの集約グリッドでメディアセルをダブルクリックしたら、フラット読書
             // フルスクリーンへ (スタック/単独画像/動画を直接開く)。コンテナは false で通常ナビへ。
@@ -17962,13 +17969,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 }) if self.items_are_rating_view => {
                     self.open_rating_view_zipdir(zip_path.clone(), dir_prefix.clone());
                 }
-                // ネスト ZIP ツリーの子コンテナへダブルクリックで降りる (Phase 3)。
-                Some(GridItem::ZipDir { dir_prefix, .. }) => {
-                    let dp = dir_prefix.clone();
-                    // ★付きの本を絞り込み中に開くと中身が空表示になるのを防ぐ
-                    // (Codex P2)。enter 前に抑制を仕込む。
-                    self.maybe_suppress_rating_filter_for_opened_zip_book(idx);
-                    self.zip_nav_enter(&dp);
+                // ZipDir activation はキーボード・パッドと同じ入口で意図を決める。
+                Some(GridItem::ZipDir { .. }) => {
+                    // Main activation was consumed before the generic detached router.
                 }
                 // ファイル名スタック (v2.0.0): 集約グリッドのセルは上の stack_try_open_from_grid
                 // で処理済み (フラットフルスクリーンへ)。非スタックモードでは Stack セルは存在

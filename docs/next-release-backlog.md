@@ -41,7 +41,7 @@
 
 ### 1.741 Everything 検索で作った ZIP・PDF のサムネイルが、親フォルダの代表サムネイルに使われない (検索を閉じると消える) — 5ch >>746 (2026-11-08)
 
-- 状態: **未着手・利用者決定 2026-11-08: 起票して設計へ**。[>>746](https://egg.5ch.io/test/read.cgi/software/1782419551/746) は、Everything 検索で複数フォルダの ZIP のサムネイルを一気に作ったのに、フォルダのサムネイルには使われず、1 つずつ開かないと作られないのか、という質問。
+- 状態: **未着手・利用者決定 2026-11-08: 起票して設計へ**。5ch へは 2026-11-09 に利用者が返信済み (検証用 PC で報告どおりだったこと、検索で作ったサムネイルが検索を閉じると残らない作りであること、改善を検討すること)。[>>746](https://egg.5ch.io/test/read.cgi/software/1782419551/746) は、Everything 検索で複数フォルダの ZIP のサムネイルを一気に作ったのに、フォルダのサムネイルには使われず、1 つずつ開かないと作られないのか、という質問。
 - 実機確認 (サブ PC 担当、依頼 23、build-1731 = v5.0.0 + §1.731 修正、`C:\miv-subpc\results-23\`): どのフォルダも開かずに Ctrl+R で `thumb746\ ext:zip` を検索 → 6 個の ZIP の表紙が約 1 秒で揃った。検索を閉じて親 `root` を開く → F01〜F06 はすべてフォルダのアイコン (直後・10 秒後とも)。F01 を開いて戻る → F01 だけ表紙。「最新の情報に更新」後も F02〜F06 はアイコンのまま。ログでは `resolve_folder_thumb_image` が F01〜F06 とも `<none>`、F01 を開いた後だけ `<cached-pin:zipthumb:vol01.zip>`。ERROR / WARN / panic なし。
 - 原因 (設計担当がサブ PC のキャッシュの写しを読んで確認、ハッシュでどのフォルダの DB かを照合):
   - Ctrl+R の検索結果は、**検索を始めたときに開いていたフォルダ** (今回は `OneDrive\Desktop`) の catalog DB に、フルパスのキー `zipthumb:C:\...\F01\vol01.zip` で保存された (`use_full_path_cache_keys` が `items_are_global_search_view` で true、catalog folder は `current_folder` のまま)。
@@ -50,6 +50,21 @@
 - 関連: §1.731 (コレクションとレーティング一覧でキーを消し合う) と同じ「複数の親を並べる一覧のサムネの保存先」の問題。§1.731 はコレクションの root だけを full-path キーにして直した。
 - 設計で決めること: 実在の親を持つ項目のサムネを、検索結果でも親フォルダの catalog に通常キーで保存する (または読む) か。検索を始めた元のフォルダの DB へ無関係な行を書かない形にする。Ctrl+G・タグ・レーティング・閲覧履歴など、同じ判定を使う他の一覧への波及。「検索語と結果は保存しません」(製品の説明) との関係。サムネキャッシュはリリース済みなので、キーや保存先を変えるならマイグレーションの要否を判断表で決める。
 - ついでの観測 (サブ PC 担当、build-1731 は §1.691 の修正前): Everything 検索欄で Enter を押しても検索が始まらず、「検索」ボタンで始まった。既存の動きかは未確認。
+
+### 1.739 Terminal から取り出した Direct 帰路が、同じ窓で後から開いた reader を置き換える (2026-11-08、§1.676 調査で確認)
+
+- 状態: **未着手・master 既存の別件。§1.675／§1.676 の対象外**。S1 実装レビュー R2 で同型の寿命問題を調査し、ZipListReturn だけを修正した。Direct への横展開は未実施。調査記録は[内部本計画 §9](archive-inner-book-open-return-plan.md)。実機確認は未実施。
+- 現状: ZIP の root ページを直接読む → Terminal close で teardown → 親フォルダへの Direct nav を take → 同じ context でページを再 open → 古い Direct を配送すると、後発 reader の items が置き換わる。現在の `src/app/close_return.rs:404`（`take_close_return_navigation`）は Terminal の Navigation から nav を返す際に origin を保持しない。`src/app.rs:71865` の reader 受理で呼ぶ `retire_zip_close_return_for_reader_acceptance`（`src/app/close_return.rs:80`）は ZipListReturn 専用で、`src/app.rs:24952` の Direct consumer も reader の受付寿命を照合せず load を始める。
+- 方針: 同じ context に新しい reader が受理されたら、その context の旧 close return を終了させる所有規則を Direct の take／配送まで設計する。consumer に `fullscreen_idx` の有無を見るガードや並列 pending を追加して済ませない。別 context の reader や専用帰路を終了しないことを先に整理する。§1.676 で採択した ZipListReturn の修正を勝手に他 variant へ広げず、独立した設計・レビューで扱う。
+- 検証: Terminal take → 同じ窓でキーボード／ページセルのダブルクリックによる再 open → 旧 Direct 配送を handler-level で再現し、後発 reader の items・fullscreen_idx・zip_nav が不変で、何も install されないことを確認する。別 context の session・runtime・viewport も不変とする。今回の起票では製品コード・既存テストを変更しない。
+
+### 1.738 検索前の場所がない Everything 結果から書庫内へ入ると、階層だけが進んで一覧が変わらない (2026-11-08、§1.675 調査で確認)
+
+- 状態: **未着手・master 既存の別件。§1.675／§1.676 の対象外**。master `bec01bf11` の「ページを表示」OFF の既存経路でも成立することをソースと headless 調査で確認した。報告者の実機再現とは区別する。調査記録は[内部本計画 §9](archive-inner-book-open-return-plan.md)。
+- 現状: 検索前の origin folder を持たない Everything 結果を採用し、そこから開いた書庫の内部 A/B 一覧で A へ入ると、`zip_nav_enter` は先に nav を A へ進めるが、表示は A/B 一覧のままになる。Search の `TopLevelGridView.return_to` に履歴の source entry がなく、`current_top_level_restore_snapshot` → `folder_nav_current_target` → `folder_nav_current_entry` が None を返すため、`zip_nav_show_current_level` が items・世代・address を install する前に return する。
+- コード: master `bec01bf11` の `src/app.rs:40520`（enter）、`:40190`／`:40207`〜`:40208`（表示採用の early return）、`:25237`（current entry）、`:26269`（current target）、`:26465`／`:26512`（Search snapshot）。現在の対応箇所は `src/app.rs:40747`、`:40417`／`:40434`〜`:40435`、`:25315`、`:26347`、`:26543`。欠けているのは Search 側の履歴 source entry で、書庫 tree の列挙結果ではない。
+- 方針: origin がない検索結果でも、ZIP 階層と表示一覧を同じ採用単位で更新できる所有境界を設計する。見ていない実フォルダを origin として捏造したり、nav だけの症状修正に留めたりしない。検索へ戻る経路と履歴 Back／Forward の意味を確認してから着手する。
+- 検証: `src/app/tests/everything_close_return.rs` の `investigation_master_everything_no_origin_zipdir_rows_match_nav` は、望ましい「表示行と nav が一致する」契約を assert し、`#[ignore = "pre-existing master bug: Everything without search origin; separate backlog item"]` として保持している。別件修正時に有効化し、設定 OFF の一覧移動と origin ありの検索帰路を回帰する。今回の起票では製品コードを変更しない。
 
 ### 1.737 mIV Sound 説明書の URL から版番号を外し、固定 URL にする (2026-11-08、v5.1.0)
 
@@ -368,6 +383,11 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.675 書庫内フォルダ・入れ子書庫にも、ページを直接表示する設定を適用する — 5ch >>694・696 (2026-11-01)
 
+- 状態: **branch `fix-1675-1676-zipdir-book`（worktree `G:\home\mimageviewer-zipdir-book`）で実装済み。S1〜S3 の実装レビューと S4 の文書レビューは ACCEPT。本体 lib 全件 16,684 件・test-full 18,732 件成功。2026-11-09 に利用者の判断 (v5.1.0 に含める) で master へ取り込んだ (ef2310a3b)。取り込み後の全件 2 回は、回ごとに別の時間制限テストが負荷で失敗し (計 6 件、どれも単独では成功、5 件は本ブランチで触っていないファイル)、退行は見つからなかった。** 実機確認: サブ PC 依頼 22 (2026-11-08、build 7931dc7b0 = code 7b3960558、隔離 data-dir) で、観測者 = サブ PC 担当 (Claude) が、フル機能ウィンドウの ZIP 内フォルダ・入れ子 ZIP の直接表示、Esc / × / Enter 閉じでの内部一覧への帰還と選択・スクロール位置、内部本ごとの「続きから」、子フォルダだけの階層での一覧表示、Backspace、Ctrl+↓ 後の帰還、変換 RAR での同じ動き (RAR と ZIP は別の読書位置)、複数ウィンドウモードでの別ウィンドウ open / close 後もメインの一覧・選択・スクロールが不変、複数の別ウィンドウ同士の独立を確認し、NG なし。mIV Remote (PIN 入力が要るため) とウィンドウ表示 (F11) での帰還は未確認。RAR は試験データの作りの都合で同名 ZIP に隠れたため、アドレス欄から開いた (既存の同名ファイル設定の動作)。 設計・実装・検証の正本は[内部本計画](archive-inner-book-open-return-plan.md)。
+- 対象外: §1.678（子の本だけの ZIP へ Ctrl+↓）と、独立 reader の Ctrl 移動順（物理 DFS が内部 DFS より先）は今回変更しない。
+
+#### 起票時の記録（以下は修正前の調査・方針）
+
 - 状態: **未着手・利用者からバックログへの起票依頼 (2026-11-01)**。[>>694](https://egg.5ch.io/test/read.cgi/software/1782419551/694) は「開いたとき、ページを表示」と「画像のみフォルダは、PDF/ZIPのように本として扱う」を有効にすると、通常フォルダはダブルクリックでページ表示になるが、書庫内フォルダはページ一覧で止まるという報告。[>>696](https://egg.5ch.io/test/read.cgi/software/1782419551/696) で入れ子書庫のダブルクリックでも同じと追記され、通常のフォルダ・書庫と同様に扱う設定が求められた。ウィンドウモードは明記されていない。開発側は今回、コード確認のみで実機再現・修正・回帰テストの実行はしていない。
 - 現状の処理: ダブルクリック (`src/ui_main.rs`)・Enter (`src/app.rs`)・ゲームパッド (`src/app/gamepad_input.rs`) の `GridItem::ZipDir` は `zip_nav_enter` を呼ぶ。`src/app.rs::zip_nav_enter` は内部階層を進めた後、常に `zip_nav_show_current_level(StartupListIntent::ExplicitList)` とする。通常の Folder / ZipFile / PdfFile が使う自動ページ表示の受付とは別であり、内部階層に同じ設定を適用する処理がない。書庫内フォルダと入れ子書庫が同じ ZipDir 経路を通るため、両報告と整合する。現段階では「新しい不具合を実機で再現した」とは扱わない。
 - 改善の方向: 通常のフォルダ・本と同様、内部で選んだ本にもページ表示 / 一覧表示の設定を適用できるようにする。画像のみフォルダを本扱いする設定の適用範囲、実フォルダと内部フォルダ・内部書庫の分類、既存利用者への既定の扱いは設計時に整理する。別のオプションが必要かはそこで決め、すべての ZipDir を無条件にページ表示へ変えない。直下に表示対象ページがない分岐は一覧に留め、勝手に最初の子の本へ DFS で潜る変更や、書庫のフラット化は含めない。
@@ -376,6 +396,10 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - 対象: `src/app.rs` の `zip_nav_enter` / `zip_nav_show_current_level`、`src/ui_main.rs`、`src/app/gamepad_input.rs`、既存の本open・表示continuation、関連テスト・設定説明。[仮想フォルダ](virtual-folders.md)、[内部書庫ツリー設計](nested-zip-tree-plan.md) を参照。規模: 設計時に確定 / 優先度: P3。リリース時期は未指定。
 
 ### 1.676 書庫内の本を閉じたら、その本を選んだ内部一覧へ戻す — 5ch >>697 (2026-11-01)
+
+- 状態: **branch `fix-1675-1676-zipdir-book`（worktree `G:\home\mimageviewer-zipdir-book`）で実装済み。S1〜S3 の実装レビューと S4 の文書レビューは ACCEPT。本体 lib 全件 16,684 件・test-full 18,732 件成功。2026-11-09 に利用者の判断 (v5.1.0 に含める) で master へ取り込んだ (ef2310a3b)。取り込み後の全件 2 回は、回ごとに別の時間制限テストが負荷で失敗し (計 6 件、どれも単独では成功、5 件は本ブランチで触っていないファイル)、退行は見つからなかった。** 実機確認: サブ PC 依頼 22 (2026-11-08、build 7931dc7b0 = code 7b3960558、隔離 data-dir) で、観測者 = サブ PC 担当 (Claude) が、フル機能ウィンドウの ZIP 内フォルダ・入れ子 ZIP の直接表示、Esc / × / Enter 閉じでの内部一覧への帰還と選択・スクロール位置、内部本ごとの「続きから」、子フォルダだけの階層での一覧表示、Backspace、Ctrl+↓ 後の帰還、変換 RAR での同じ動き (RAR と ZIP は別の読書位置)、複数ウィンドウモードでの別ウィンドウ open / close 後もメインの一覧・選択・スクロールが不変、複数の別ウィンドウ同士の独立を確認し、NG なし。mIV Remote (PIN 入力が要るため) とウィンドウ表示 (F11) での帰還は未確認。RAR は試験データの作りの都合で同名 ZIP に隠れたため、アドレス欄から開いた (既存の同名ファイル設定の動作)。 設計・実装・検証の正本は[内部本計画](archive-inner-book-open-return-plan.md)。
+
+#### 起票時の記録（以下は修正前の調査・方針）
 
 - 状態: **未着手・利用者からバックログへの起票依頼 (2026-11-01)**。[>>697](https://egg.5ch.io/test/read.cgi/software/1782419551/697) は、外側 `A.rar` 内の「書庫内フォルダA / B」(または入れ子書庫A / B) が並ぶ一覧からAを開いてページを閲覧した後、閉じると外側 `A.rar / B.rar` の並ぶ実フォルダまで戻るという報告。希望は、Aを選んだ書庫内のA / B一覧へ戻ること。閉じた入力が Esc・×・Backspace のどれかは未記載。開発側は実機再現しておらず、当該利用者の具体的な終了経路は未確定。
 - コードで確認: `auto_open_for_current_container` はページ直接表示設定と現在の外側コンテナから退出を決め、`handle_fullscreen_close_request` が close return を要求する。`src/app/close_return.rs::resolve_close_return_navigation` は検索・閲覧履歴等の専用帰路がない場合、`effective_folder().parent()` へ戻す。内部の `zip_nav` の階層をこの通常分岐では使わないため、RARの元sourceを保持する場合も、内部Aの親ではなく外側RARの置き場所へ抜け得る。コードは報告と整合するが、RARだけの原因・実機確認済みの診断とはしない。

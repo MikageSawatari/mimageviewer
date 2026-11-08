@@ -33744,7 +33744,7 @@ impl App {
         {
             #[cfg(windows)]
             if self.fullscreen_embedded_still_active() {
-                return (!self.pending_return_to_parent.is_pending(), None);
+                return (true, None);
             }
             return (
                 true,
@@ -33770,13 +33770,11 @@ impl App {
         // 処理するとナビが二重発火するので委譲する。true を返して
         // handle_keyboard / handle_clipboard_shortcuts (= グリッド用) を抑止する。
         //
-        // ただし「ページを直接開く」設定 ON の ZIP/PDF や画像のみ通常フォルダの Esc/右クリックは
-        // `handle_fullscreen_close_request` で `pending_return_to_parent` を立て、入力ナビ合流点が
-        // 親一覧への AddressBarNav を発行する設計。embedded 中にここで常に true を返すと、
-        // その予約を消化できず閉じられない。
+        // close continuation も描画後の共通 dispatcher が消費する。ここでグリッドの
+        // handle_keyboard に先取りさせると、embedded の early-return で帰還先が失われる。
         #[cfg(windows)]
         if self.fullscreen_embedded_still_active() {
-            return !self.pending_return_to_parent.is_pending();
+            return true;
         }
         // モーダル表示中に main/root 側へ漏れたキーは背面操作へ流さず捨てる。
         if self.any_modal_dialog_open_for_fullscreen_keys() {

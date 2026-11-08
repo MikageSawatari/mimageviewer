@@ -882,6 +882,34 @@ raw index を検証できない場合は `legacy_position_unverified` を返す�
 列挙に使った種類ポリシーの snapshot を使う。保存位置なし・全種類表示時の旧 raw の範囲外位置・
 UI reader の Busy / Timeout / Stopped は従来どおり先頭ページへの fallback を保つ。
 
+2026-11-08 の §1.675 S2 では、非rootの書庫内本にも読書位置を保存・復元する。
+worker は raw ZIP tree と要求 prefix から `ZipNavState::restore_prefix` と共通
+`BookResumeKey::for_archive` を使い、表示種類の除外で collapse した表示階層から保存キーを
+推測しない。内部本のキーは logical source と大小文字を保持した raw prefix で作り、
+root は Remote の出荷済み logical path キーを維持する。内部本に保存位置がなければ
+root の位置を代用しない。
+
+Web の progress producer も、保存contextとbatchのidentityには読込時の `requestedAddress` を使う。
+`effective_address` は表示policy適用後にさらにcollapseする場合があるため、内部本の要求prefixや
+rootのFile要求をこの表示住所へ置換しない。表示ページ自体は最終構成のcanonicalなpage addressを
+送る。描画・評価・ブックマーク等の既存操作はeffective contextを維持する。
+
+内部 resume read は typed key を既存の bounded UI queue と writer の FIFO / cutoff に渡す。
+progress はサーバーが検証したキー・既存 PageIdentity・canonical raw index を通常writeと
+区別する内部 payload に保持して UI へ渡す。UI は scope を再列挙せず、その検証結果を保存する。
+内部 resume の保存と外側履歴の位置資格を分け、履歴touchの資格・抑制は維持するが内部の
+ordinal / count を外側履歴に付けない。Remote の resume meter は従来どおり NULL とする。
+
+復元拒否は root では引き続き `open_mode=grid` と一覧選択の通知にする。内部本でページ表示が
+有効なら `open_mode=first_page` と拒否理由を返し、Web は最終構成後の先頭の表示可能ページを
+開いて「先頭ページから表示します」と通知する。Web は拒否理由だけで Grid に上書きしない。
+子本だけの branch は Grid のまま。通知に符号化された保存キーや変換cache path を表示しない。
+RemoteAddress / RecordReadingProgress の JSON 形は維持するが、context_address の意味変更を伴うため
+レビュー R1 で strict IPC を **v73 → v74** に更新した。旧Remoteの接続をhandshakeで拒否する。
+Webも `X-mIV-Remote-Protocol: 74` を付け、progress POSTの版欠落・不一致をHTTP 409
+`protocol_version_mismatch` でcore保存受付前に拒否する。旧Webのasset token照合は自動更新・案内として
+維持するが、storage利用不可等で旧scriptが継続しても異なる意味の進捗を受け入れない。
+
 2026-10-09 の §1.345 レビュー修正で protocol 68 とする。旧 `/api/image-info` と
 `/api/image` は認証済み Home worker の stateless `SourceReadEligibility` を共有し、
 最新の種類設定と source 解決を照合してから既存 Library の寸法取得・画像描画へ進む。
@@ -2096,7 +2124,13 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
 ### 13.5 プロトコル版数
 
-2026-11-04 受入 F の現行 strict IPC は **v73**。`RecordVideoProgress` にソースの映像能力
+2026-11-08 §1.675 S2 レビュー R1 の現行 strict IPC は **v74**。
+`RecordReadingProgress.context_address` は表示上のcollapse後の階層ではなく、要求時のraw本scopeを表す。
+JSONのshapeが同じでも意味が異なるためv73を拒否する。Webは同じ版を `X-mIV-Remote-Protocol` で送信し、
+HTTP ownerはprogress POSTだけその一致を必須にする。定数更新時はWebの定数も更新し、一致テストを通す。
+asset tokenは従来どおり配信資産の変更から生成され、session acquire時の更新案内を維持する。
+
+2026-11-04 受入 F の v73 は `RecordVideoProgress` にソースの映像能力
 `has_video` を必須追加し、音声のみの MP4 の再生位置保存が続きの画像生成へ進まないようにする。
 端末の成功した start / state から位置報告へ固定し、stop 後の最終報告でも同じ値を使う。
 下記の v69 等は各増分の実装記録である。
