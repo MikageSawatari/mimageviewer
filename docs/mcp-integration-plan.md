@@ -5927,3 +5927,103 @@ cached / 再表示時の Focus、選択可能ラベルの捕捉・キー・Escap
 6 件目 (2026-11-06): 設計担当が、ChatGPT.exe の子・孫として `%LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\codex.exe` が動き、MCP server を起動することを確認した。この場所の `codex.exe` をアプリ側へ分類し直し、アプリだけの利用時に CLI・IDE 拡張の終了を求めない。他の場所の `codex.exe` と daemon 除外、何かが動いていれば書かない条件は維持する。
 
 6 件目の検証 (`2724818f5` 上の未コミット差分): 指定 focused は exit 0、59/59 成功 (`target/agent-codex-app-bin-focused.log`)。`cargo fmt` / `cargo fmt --check` / 差分の空白検査は成功、独立レビュー ACCEPT。指定どおり build-dev・製品起動・commit・ブランチ切替は行っていない。
+
+## 42. フォルダ一覧の★・種類・タグ (§1.735、2026-11-08、v5.1.0)
+
+### A. きっかけと範囲
+
+v5.0.0 の利用者の試験で、Claude Desktop に「G:\...\フォルダ の★2 から 3 枚選んで★4 に」と頼むと、AI アプリが★2 だけを
+取り出せず、300 件余りの `list_folder` と 50 件ずつの `get_item_info` を組み合わせる遠回りになった (利用者の観測)。
+`list_folder` の行に★が無く、★で絞る手段は索引 (`search_items`) かライブラリ全体 (`list_library` の rated、★N 以上) しかない。
+
+利用者の方針 (2026-11-07・11-08): MCP ツール全体を、いろいろな依頼に柔軟に応えられるよう拡充する。v5.1.0 にはこの節の範囲を入れ、
+それ以外の拡充は backlog (§1.740) に起票して後で進める。
+
+v5.1.0 の範囲 (利用者決定 2026-11-08):
+
+1. `list_folder` の各行に `rating` と `tags` を付ける。
+2. `list_folder` に★の範囲 (`min_stars` / `max_stars`) と種類 (`kinds`) の絞り込みを足す。
+3. `list_library` の rated に `max_stars` を足し、「ちょうど★N」を取れるようにする。
+
+### B. `list_folder` の入力
+
+既存の `path` / `subresource` / `limit` / `cursor` に、省略可能な 3 つを足す。省略時は v5.0.0 と同じ一覧を返す。
+
+- `min_stars` / `max_stars`: 0〜5 の整数または null。どちらか一方でも指定すると、★を付けられない行 (`rating` が null) は除く。
+  `min_stars` だけなら「★N 以上」、`max_stars` だけなら「★N 以下 (0 なら未評価だけ)」、両方同じなら「ちょうど★N」。
+  `min_stars > max_stars` は `bad_request`。`list_library` の `stars` と違い、0 を 1 に読み替えない (0 は未評価を表す)。
+- `kinds`: 行の `kind` の enum (`folder` `image` `video` `audio` `zip` `pdf` `epub` `archive` `zip_folder` `pdf_page` `zip_entry`) の配列、
+  1 件以上・重複なし。指定した種類の行だけを返す。null・省略は全種類。
+- 複数の条件は AND。絞り込みは基本一覧 (保存済みの種類の表示・並び・本の構成・隠したページ・重複の畳み込み) を作った後、ページ分けの前に行う。
+  一覧画面の検索・ファセット・色・しおり・履歴の絞り込みには従わない (今と同じ)。
+
+### C. `list_folder` の出力
+
+- 行に `rating` を足す: 0〜5 の整数、または★を付けられない行 (`GridItem::accepts_rating()` が偽) なら null。
+  **同じ参照 (path + subresource) に対する `get_item_info` の `rating` と必ず一致させる**。ZIP 内のフォルダ・入れ子の ZIP の本
+  (`zip_directory_rating_key`)、ZIP 内の画像・PDF のページ (`page_key_for_grid_item`)、CP932 の旧キー (`legacy_name`) の読み替えを含め、
+  `item_info.rs` の `enrich` と `list_folder` は 1 つの key 解決関数を共有する (同じ意味を 2 か所に書かない)。
+- 行に `tags` を足す: 物理 path の行 (subresource が null) は表示用のタグの配列 (`display_tags_for_item(item_key_for_path)`、`search_items` と同じ)。
+  subresource のある行 (ZIP 内・PDF のページ) は null (タグはファイル単位で、ページや ZIP 内の項目には付かない)。
+- ページに `container_tags` を足す: `path` が ZIP / PDF なら、その本のタグの配列。物理フォルダなら null。行ごとには繰り返さない。
+- 既存の `size` / `modified` / `book_composition_applied` の意味は変えない。
+
+### D. ページ分けと cursor
+
+- **cursor は絞り込み前の基本一覧の位置を持つ**。次のページは、その位置から先の基本一覧を順に見て、条件に合う行を `limit` 件まで返す。
+  これで、ページの間に AI が★を変えても (例: ★2 の一覧の途中で何枚かを★4 にする)、次のページの取得は失敗せず、残りの★2 を飛ばさない。
+  `listing_digest` は今と同じく基本一覧の行の識別子 (path + subresource) から作る。★・タグの変化では変わらない。
+- `args_digest` には `min_stars` / `max_stars` / `kinds` を正規化して含める (`kinds` は並べ替えて重複なし)。条件を変えて続きを取ろうとすると、
+  今と同じ「最初からやり直してください」(`bad_request`)。
+- `truncated` は「この位置より後に条件に合う行が残っているか」。最後に返した行の後に合う行が無ければ false で cursor は null。
+  条件に合う行が 1 件も無い場合は、空の `items`・`truncated` false・cursor null を返す (エラーにしない)。
+- ページの文字数の上限 (`MAX_PAGE_CHARS`) で行を落とすときも、cursor は最後に返した行の基本一覧での次の位置にする。
+- cursor の版 (`FolderCursor.version`) を 3 → 4 に上げる。旧版の cursor は `bad_request` で拒否する (cursor は短命で、移行は要らない)。
+
+### E. 読み取りの経路
+
+- ★・タグの読み取りは、今の `list_folder` と同じ agent の読み取り worker (`ReadContext`) の中で、`RatingDb::open_readonly` と
+  `TagsDb::open_readonly` (`optional_tags`) を 1 回ずつ開いて行う。DB が無ければ★は 0 (★を付けられる行)、タグは空。UI スレッドは通らない。
+- ★は一覧全体 (絞り込みの判定に要る) を `get_many` でまとめて読む。タグは返す行と `container_tags` の分だけ読む (`get_many_display_tags` が使えれば使う)。
+  1 フォルダ数千件でも DB の読み取りは 1〜2 回の一括の照会で済む。
+- 物理フォルダの基本一覧は、★の並べ替えのために既に RatingDb を読むことがある (`materialize_local_folder_listing_with_order`)。
+  これは並べ替えの経路のまま残し、行の★の値は C の共有の key 解決関数で読む (並べ替えの結果を行の★として流用しない。ZIP の旧キー等の扱いが違うため)。
+- 権限: `list_folder` は今と同じ「読み取りのみ」以上で使える。★・タグは `search_items` / `get_item_info` で既に読み取り段に見せている情報で、
+  新しい許可項目は要らない。GPS・AI 説明文・縮小画像の許可には触れない。
+- 処理中の取り消し (`ctx.checkpoint()`) は DB の読み取りの前後にも置く。
+
+### F. `list_library` の rated
+
+- `max_stars` (0〜5 または null) を足す。kind が rated のときだけ使い、他の kind で指定したら `bad_request`。
+- 返す範囲は「`stars` (既存の意味のまま、既定 1・0 は 1) 以上、`max_stars` 以下」。`max_stars` が実効の最小値より小さい (0 を含む) なら `bad_request`。
+  rated は★1 以上の行しか持たないので、未評価は返さない (未評価の取り出しは `list_folder` の `max_stars: 0`)。
+- 並び (★の多い順・新しい評価時刻・path) と cursor の形は今と同じ。`args` に `max_stars` を含める。
+- DB 側は既存の `list_at_least_stars` の結果を `max_stars` で絞るか、範囲の照会を足す (実装担当が選ぶ。結果は同じ)。
+
+### G. 版と互換
+
+- 本体と MCP の exe は同梱で、組で更新される。行の形 (`outputSchema` の `additionalProperties: false`) が変わるので、
+  `AGENT_PROTOCOL_VERSION` を 2 → 3 に上げる。古い組み合わせは今と同じ `version_mismatch` になる。
+- 永続データ (DB の schema・保存内容) は変えない。読むだけ。
+- ツールの説明 (AI アプリが読む文) を更新する。`list_folder` の「★などの絞り込みを除く」は「一覧画面の検索・ファセット・色・しおり・履歴の絞り込みは除く。
+  ★の範囲と種類では絞れる。行に★とタグを付ける」の趣旨に改める。`list_library` は `max_stars` を説明する。説明の変更は AI アプリの再読み込み後に効く。
+- 入力の検査は MCP 側 (`crates/mcp-server/src/input.rs`) と本体側の両方で、今のツールと同じ方針で行う。
+
+### H. 検査
+
+- ★の値: 物理フォルダ・ZIP (直下・中のフォルダ・入れ子の ZIP の本・CP932 の旧キーのみの行)・PDF のページで、`list_folder` の `rating` が
+  同じ参照の `get_item_info` の `rating` と一致すること。★を付けられない行は null。
+- 絞り込み: 以上・以下・ちょうど・未評価 (`max_stars: 0`)、`kinds` 単独と★との AND、0 件、`min_stars > max_stars` の拒否、`kinds` の空配列・重複の拒否。
+- cursor: 絞り込み付きで複数ページにわたり、ページの間に★を変えても続きが取れ、残りを飛ばさず重複もしないこと。条件を変えた cursor・旧版の cursor の拒否。
+  `MAX_PAGE_CHARS` で行を落とした後の続き。
+- タグ: 物理の行のタグ、subresource の行の null、ZIP / PDF の `container_tags`、物理フォルダの null。
+- `list_library` rated: `max_stars` の範囲、他の kind での拒否、範囲の逆転の拒否、cursor の継続。
+- schema: tools/list の `inputSchema` / `outputSchema` と実際の応答の一致 (既存の schema の検査に足す)。
+
+### I. 採らなかった案
+
+- `list_library` の rated に path の接頭辞を足す案: 「このフォルダの★N」はこの節の `list_folder` の絞り込みで足りる。
+  サブフォルダを含む★の取り出しは、rating DB のキー (ZIP 内・合成の本のキー) と path の接頭辞の照合を別に設計する必要があり、§1.740 へ回した。
+- 行ごとに `container_tags` を繰り返す案 (`search_items` の形): 1 つの一覧の subresource の行はすべて同じ本なので、ページに 1 回だけ置く。
+- 状態の組み合わせの検討 (CLAUDE.md): 読み取り専用で、書き込み・非同期の割り込みは増えない。ページの間の★の変更は D の cursor の作りで扱い、
+  専用の再試行や回復の仕組みは足さない。まれな失敗 (DB が読めない等) は既存どおり `internal` で返す (既定の割り切り)。
