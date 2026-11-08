@@ -5960,19 +5960,35 @@ v5.1.0 の範囲 (利用者決定 2026-11-08):
 ### C. `list_folder` の出力
 
 - 行に `rating` を足す: 0〜5 の整数、または★を付けられない行 (`GridItem::accepts_rating()` が偽) なら null。
-  **同じ参照 (path + subresource) に対する `get_item_info` の `rating` と必ず一致させる**。ZIP 内のフォルダ・入れ子の ZIP の本
-  (`zip_directory_rating_key`)、ZIP 内の画像・PDF のページ (`page_key_for_grid_item`)、CP932 の旧キー (`legacy_name`) の読み替えを含め、
-  `item_info.rs` の `enrich` と `list_folder` は 1 つの key 解決関数を共有する (同じ意味を 2 か所に書かない)。
+  key は `item_info.rs` の `enrich` と 1 つの解決関数を共有する (同じ意味を 2 か所に書かない)。入力は「現在の key」と「旧 key の候補 (省略可)」で、
+  現在の key に行があればその値 (明示の★0 も含む) を使い、無ければ旧 key の値、どちらも無ければ 0。
+  - 現在の key: ZIP 内のフォルダ・入れ子の ZIP の本は `zip_directory_rating_key`、ZIP 内の画像・PDF のページ・画像は `page_key_for_grid_item`、
+    それ以外は `normalize_path` (今の `enrich` と同じ)。
+  - ZIP 内の画像の旧 key (CP932 対応前の名前、v1.3.x まで): `list_folder` は列挙結果の `ZipEnumeration::legacy_renames` (旧名 → 現在名) を
+    `PreparedZipEnumeration::prepare` に渡す前に取り出して持ち、行の現在名から旧名を引いて `zip_entry_key(path, 旧名)` を候補にする。
+    画面側はこの対応で旧 key を移行している (`zip_key_migration`) ので、これで `get_item_info` と画面の両方に一致する。
+  - ZIP 内のフォルダ (`ZipDir`) の旧 key は `list_folder` では読まない。画面も読まず移行もしない (`zip_key_migration.rs` の「対象外」)。
+    旧名の境界は CP932 の 0x5c のため列挙結果からは安全に切り出せない (`item_info.rs` の `zip_directory_entry_identity`)。
+    このため、v1.3.x までに★を付け、その後付け直していない ZIP 内フォルダだけは、`get_item_info` (旧 key も読む) と `list_folder` (画面と同じ) で★が食い違い得る。
+    この食い違いは既知の制限として記録し、`get_item_info` の既存の挙動は変えない。
+  - 検査で一致を保証するのは「`get_item_info` と同じ値」(ZipDir の旧 key だけの行を除く) と「画面の★と同じ key」。
 - 行に `tags` を足す: 物理 path の行 (subresource が null) は表示用のタグの配列 (`display_tags_for_item(item_key_for_path)`、`search_items` と同じ)。
   subresource のある行 (ZIP 内・PDF のページ) は null (タグはファイル単位で、ページや ZIP 内の項目には付かない)。
-- ページに `container_tags` を足す: `path` が ZIP / PDF なら、その本のタグの配列。物理フォルダなら null。行ごとには繰り返さない。
+  タグの多い行は、既存の行の上限 (`MAX_ITEM_CHARS`) により今と同じ `too_long` の行になる。
+- ZIP / PDF そのもののタグ (container の tags) は `list_folder` に入れない。AI は `get_item_info` にその ZIP / PDF の path を 1 件渡して読む。
+  ページに共通の欄を置くと、タグが多いときに行を削っても上限に収まらない出口が要るため (独立レビュー指摘)。
 - 既存の `size` / `modified` / `book_composition_applied` の意味は変えない。
 
 ### D. ページ分けと cursor
 
 - **cursor は絞り込み前の基本一覧の位置を持つ**。次のページは、その位置から先の基本一覧を順に見て、条件に合う行を `limit` 件まで返す。
-  これで、ページの間に AI が★を変えても (例: ★2 の一覧の途中で何枚かを★4 にする)、次のページの取得は失敗せず、残りの★2 を飛ばさない。
-  `listing_digest` は今と同じく基本一覧の行の識別子 (path + subresource) から作る。★・タグの変化では変わらない。
+  実装は `(基本一覧の index, 行)` の組で絞り込み、返した最後の行の index + 1 を cursor に入れる。
+  これで、保存済みの並びが★に依らないなら、ページの間に AI が★を変えても (例: ★2 の一覧の途中で何枚かを★4 にする)、
+  次のページの取得は失敗せず、残りの★2 を飛ばさず、重複もしない。
+- `listing_digest` は今と同じく基本一覧の行の識別子 (path + subresource) を並び順のまま使う。
+  **保存済みの並びが★順のとき**は、★の変更で基本一覧の並びが変わるので、次のページは今と同じ「一覧が変わりました。最初から取り直してください」
+  (`bad_request`) になる (既存の契約のまま)。初回の並びを保持する仕組みは足さない (状態を増やさない。★で絞る一覧は通常 1 ページに収まり、
+  取り直しで足りる)。この制限はツールの説明の「一覧が変わると cursor は無効」で既に伝わっている。
 - `args_digest` には `min_stars` / `max_stars` / `kinds` を正規化して含める (`kinds` は並べ替えて重複なし)。条件を変えて続きを取ろうとすると、
   今と同じ「最初からやり直してください」(`bad_request`)。
 - `truncated` は「この位置より後に条件に合う行が残っているか」。最後に返した行の後に合う行が無ければ false で cursor は null。
@@ -5985,7 +6001,7 @@ v5.1.0 の範囲 (利用者決定 2026-11-08):
 - ★・タグの読み取りは、今の `list_folder` と同じ agent の読み取り worker (`ReadContext`) の中で、`RatingDb::open_readonly` と
   `TagsDb::open_readonly` (`optional_tags`) を 1 回ずつ開いて行う。DB が無ければ★は 0 (★を付けられる行)、タグは空。UI スレッドは通らない。
 - ★は一覧全体 (絞り込みの判定に要る) を `get_many` でまとめて読む。タグは返す行と `container_tags` の分だけ読む (`get_many_display_tags` が使えれば使う)。
-  1 フォルダ数千件でも DB の読み取りは 1〜2 回の一括の照会で済む。
+  1 フォルダ数千件でも DB の読み取りは 1〜2 回の一括の照会で済む。読み取りは DB を変えない (旧 key の移行もしない)。
 - 物理フォルダの基本一覧は、★の並べ替えのために既に RatingDb を読むことがある (`materialize_local_folder_listing_with_order`)。
   これは並べ替えの経路のまま残し、行の★の値は C の共有の key 解決関数で読む (並べ替えの結果を行の★として流用しない。ZIP の旧キー等の扱いが違うため)。
 - 権限: `list_folder` は今と同じ「読み取りのみ」以上で使える。★・タグは `search_items` / `get_item_info` で既に読み取り段に見せている情報で、
@@ -6003,27 +6019,41 @@ v5.1.0 の範囲 (利用者決定 2026-11-08):
 ### G. 版と互換
 
 - 本体と MCP の exe は同梱で、組で更新される。行の形 (`outputSchema` の `additionalProperties: false`) が変わるので、
-  `AGENT_PROTOCOL_VERSION` を 2 → 3 に上げる。古い組み合わせは今と同じ `version_mismatch` になる。
+  `AGENT_PROTOCOL_VERSION` を 2 → 3 に上げる。版は pipe 名にも入るので、古い組み合わせ (v5.0.0 の MCP の exe が動いたまま本体だけ更新した等) は
+  握手まで届かず「mIV が起動していない」扱い (`not_ready`、tools/list は `miv_status` だけ) になる。AI アプリを再起動すると新しい MCP の exe が起動して直る。
+  AI アプリへの登録の形 (launcher の `--mcp`) は変えない。launcher が内包する MCP の exe は通常のリリースビルドで新しくなる。
 - 永続データ (DB の schema・保存内容) は変えない。読むだけ。
 - ツールの説明 (AI アプリが読む文) を更新する。`list_folder` の「★などの絞り込みを除く」は「一覧画面の検索・ファセット・色・しおり・履歴の絞り込みは除く。
   ★の範囲と種類では絞れる。行に★とタグを付ける」の趣旨に改める。`list_library` は `max_stars` を説明する。説明の変更は AI アプリの再読み込み後に効く。
-- 入力の検査は MCP 側 (`crates/mcp-server/src/input.rs`) と本体側の両方で、今のツールと同じ方針で行う。
+- 入力の検査は MCP 側 (`crates/mcp-server/src/lib.rs` の `FolderArgs` / `LibraryArgs`・`parse_tool`・wire の `Command` への転送) と
+  本体側 (`folder.rs` / `library.rs`) の両方で、今のツールと同じ方針で行う。新しい引数の省略・null は v5.0.0 と同じ動きにする。
+- 公開文書: マニュアル「AI アプリとの連携」に、フォルダの中を★の範囲・種類・未評価で取り出せることと、索引の検索 (お気に入りの「アイテム索引」の場所だけ)
+  との違いを書く。製品ページのカード (「検索やタグ・★・コレクションの整理を頼めます」) は今も正しく、文字数の上限もあるので変えない (確認済み)。
+  頼めることの例の表は「テスト用の画像で動作を確かめた頼み方」なので、利用者の実機確認の後に足す。
 
 ### H. 検査
 
-- ★の値: 物理フォルダ・ZIP (直下・中のフォルダ・入れ子の ZIP の本・CP932 の旧キーのみの行)・PDF のページで、`list_folder` の `rating` が
-  同じ参照の `get_item_info` の `rating` と一致すること。★を付けられない行は null。
+- ★の値: 物理フォルダ・ZIP (直下・中のフォルダ・入れ子の ZIP の本・CP932 の旧 key だけの画像・現在 key の明示の★0 が旧 key に勝つ)・PDF のページで、
+  `list_folder` の `rating` が同じ参照の `get_item_info` の `rating` と一致すること (ZipDir の旧 key だけの行は C の制限どおり食い違うことを固定する)。
+  ★を付けられない行は null。読み取りの前後で rating DB が変わらないこと。
 - 絞り込み: 以上・以下・ちょうど・未評価 (`max_stars: 0`)、`kinds` 単独と★との AND、0 件、`min_stars > max_stars` の拒否、`kinds` の空配列・重複の拒否。
-- cursor: 絞り込み付きで複数ページにわたり、ページの間に★を変えても続きが取れ、残りを飛ばさず重複もしないこと。条件を変えた cursor・旧版の cursor の拒否。
-  `MAX_PAGE_CHARS` で行を落とした後の続き。
-- タグ: 物理の行のタグ、subresource の行の null、ZIP / PDF の `container_tags`、物理フォルダの null。
+- cursor: 絞り込み付きで複数ページにわたり、★に依らない並びでは、ページの間に既出の行・未返却の行の★を変えても続きが取れ、残りを飛ばさず重複もしないこと。
+  ★順 (昇順・降順) の並びで★を変えると「一覧が変わりました」になること。条件を変えた cursor・旧版の cursor の拒否。
+  まばらに一致する行・末尾の不一致の行・`too_long` の行・`MAX_PAGE_CHARS` で行を落とした後の続き。
+- タグ: 物理の行のタグ、subresource の行の null、タグの多い行の `too_long`。
+- MCP 側: 新しい引数の転送、省略・null が v5.0.0 と同じ wire になること。版の不一致で `not_ready` になること (既存の検査の版の値を更新)。
 - `list_library` rated: `max_stars` の範囲、他の kind での拒否、範囲の逆転の拒否、cursor の継続。
 - schema: tools/list の `inputSchema` / `outputSchema` と実際の応答の一致 (既存の schema の検査に足す)。
 
 ### I. 採らなかった案
 
+(設計レビュー 1 巡目 `a9f7292ce` の指摘 P2×3・P3×3 を反映: ★順の cursor、ZIP の旧 key の出どころ、container のタグの上限、版の不一致の実際のエラー、MCP 側の変更先、公開文書。)
+
 - `list_library` の rated に path の接頭辞を足す案: 「このフォルダの★N」はこの節の `list_folder` の絞り込みで足りる。
   サブフォルダを含む★の取り出しは、rating DB のキー (ZIP 内・合成の本のキー) と path の接頭辞の照合を別に設計する必要があり、§1.740 へ回した。
-- 行ごとに `container_tags` を繰り返す案 (`search_items` の形): 1 つの一覧の subresource の行はすべて同じ本なので、ページに 1 回だけ置く。
+- container のタグを行ごと (`search_items` の形) またはページに 1 回置く案: 行ごとは同じ値の繰り返し、ページに置くとタグが多いとき上限の出口が要る。
+  `get_item_info` で 1 回読めば足りるので入れない。
+- ★順の一覧で初回の並びを cursor に保持する案: 状態が増え、★で絞った一覧は通常 1 ページに収まるので、既存の取り直しの契約にした。
+- ZIP 内フォルダの旧 key を `list_folder` でも読む案: 画面が読まない値を AI にだけ見せることになり、境界の切り出しも安全にできないため採らない。
 - 状態の組み合わせの検討 (CLAUDE.md): 読み取り専用で、書き込み・非同期の割り込みは増えない。ページの間の★の変更は D の cursor の作りで扱い、
   専用の再試行や回復の仕組みは足さない。まれな失敗 (DB が読めない等) は既存どおり `internal` で返す (既定の割り切り)。
