@@ -404,6 +404,10 @@ VST3 bridge、署名、packagingなどrelease構成そのものを確認する�
 - エージェントが画面を操作するテストは `.\scripts\prepare-portable-smoke.ps1` で作った使い捨てコピー
   `target\portable-smoke\mimageviewer.exe` (データは `target\portable-smoke\data`) だけを使う。
   利用者の設定をコピーして使わない。テスト準備として通常設定を削除・リネーム・復元・初期化しない。
+- **例外 (2026-11-08 利用者決定)**: サブ PC の Windows Sandbox の中で、夜間の組み合わせ試験の runner が
+  試験用 portable ビルドを使い捨ての path で起動することは、毎回の承認なしに常設で許可されている。範囲と条件は
+  [docs/interactive-release-verification.md](docs/interactive-release-verification.md) の該当節と
+  [docs/nightly-combination-test-plan.md](docs/nightly-combination-test-plan.md) §11。Sandbox の外には広げない。
 - ユニットテストで再現できない Windows ネイティブ挙動を変えたら、実機確認を頼む前に検証用バイナリを用意する
   (core 内の挙動は `.\scripts\build-dev.ps1`、release 構成に依存する挙動は `.\scripts\build-release.ps1`)。
   エージェントのツールから呼ぶときは `*>&1` を付けない。

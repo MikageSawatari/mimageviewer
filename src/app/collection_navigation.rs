@@ -3758,7 +3758,7 @@ impl App {
             None,
             restore_intent,
             false,
-            true,
+            super::use_full_path_cache_keys_for_folder(&target.source_path),
         )?;
         let token = match self.prepare_visible_install(
             listing.source_path(),

@@ -144,6 +144,21 @@ impl TextCursorState {
     ) -> bool {
         let text = galley.text();
 
+        // Context-menu (and other non-primary) presses inside a selection must
+        // preserve both its range and its word/line drag anchor. Do not report
+        // an interaction: TextEdit would request focus and reset its cursor purpose.
+        if response.hovered()
+            && ui.input(|i| i.pointer.any_pressed() && !i.pointer.primary_pressed())
+            && self.ccursor_range.is_some_and(|range| {
+                let [min, max] = range.sorted_cursors();
+                !range.is_empty()
+                    && min.index <= cursor_at_pointer.index
+                    && cursor_at_pointer.index <= max.index
+            })
+        {
+            return false;
+        }
+
         // Shift-click extends the existing selection (handled on press, below),
         // so don't replace it with the clicked word/line when the click is released:
         let shift = ui.input(|i| i.modifiers.shift);
@@ -201,7 +216,7 @@ impl TextCursorState {
                     self.begin_granular_drag(granularity, text, cursor_at_pointer);
                 }
                 true
-            } else if is_being_dragged {
+            } else if is_being_dragged && ui.input(|i| i.pointer.primary_down()) {
                 // Drag to select text:
                 if let Some(granular) = self.granular_drag {
                     // Extend the selection by whole words or lines:
@@ -241,6 +256,10 @@ impl TextCursorState {
         self.ccursor_range = Some(anchor);
     }
 }
+
+#[cfg(test)]
+#[path = "text_cursor_state_tests.rs"]
+mod pointer_tests;
 
 /// The whole word or line at the given position.
 pub(crate) fn select_unit_at(

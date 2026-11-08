@@ -29,6 +29,11 @@ Assert-Equal $mimalloc.Count 1 'one mimalloc patch row'
 Assert-Equal $mimalloc[0].Path 'vendor/libmimalloc-sys' 'mimalloc patch path'
 Assert-Equal $mimalloc[0].Kind 'patch.crates-io' 'mimalloc patch kind'
 Assert-Equal (Get-PatchRecords $mimalloc[0].Path) 'vendor/libmimalloc-sys/PATCHES.md' 'mimalloc patch record'
+$egui = @(Get-LocalCrates $sections | Where-Object { $_.Name -eq 'egui' })
+Assert-Equal $egui.Count 1 'one egui patch row'
+Assert-Equal $egui[0].Path 'vendor/egui' 'egui patch path'
+Assert-Equal $egui[0].Kind 'patch.crates-io' 'egui patch kind'
+Assert-Equal (Get-PatchRecords $egui[0].Path) 'vendor/egui/PATCHES.md' 'egui patch record (includes section 1.691)'
 
 # Mock only process/network/filesystem inputs. Keep JSON decoding, enumeration,
 # version comparison, bash discovery, setup output parsing and table cells real.

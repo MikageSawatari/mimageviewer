@@ -24,6 +24,10 @@
 - **VirusTotal (2026-11-07、送信は利用者の了承のうえ利用者が実行、判定は ClaudeCode が結果ページで確認)**:
   - `mimageviewer-vst3-host.exe` (署名済み、1,239,128 bytes) sha256 `5a49e23068609082085452f46f8497cc61d826749dfa216e61b76975c69007bf` — 0/65、Google・Microsoft とも Undetected。https://www.virustotal.com/gui/file/5a49e23068609082085452f46f8497cc61d826749dfa216e61b76975c69007bf
   - `effetune/mIV Sound.vst3/Contents/x86_64-win/mIV Sound.vst3` (DLL、署名済み、5,894,232 bytes) sha256 `25c94c8274e75c26f2c878ca4dd2a26171c1036d2e4ac07069954bc7349bfc4f` — 初回 0/62 で Google が Timeout、Reanalyze 後 0/71、Google・Microsoft とも Undetected。https://www.virustotal.com/gui/file/25c94c8274e75c26f2c878ca4dd2a26171c1036d2e4ac07069954bc7349bfc4f
+- **公開後 (2026-11-07 夜)**: GitHub Release v5.0.0 (タグ・main = `446c59562`)、資産 4 点のサイズ一致・latest・CI 緑。mikage.to 反映 183 ファイル + sitemap.xml (権限の都合で scp 上書き)、verify-site 404/405 (.htaccess の 403 のみ)、DL 3 点 200・サイズ一致。ポータブル zip の Chrome ダウンロードでブロックなし (利用者が確認)。Vector 申請・X 告知は利用者が実施。Store 用 setup.exe を R2 `https://dl.mikage.jp/mimageviewer/v5.0.0/mImageViewer_setup.exe` に配置 (配信 sha256 一致)。Store の認定の注意事項・掲載文・Vector の説明文を v5 向けに更新。
+- **Store 申請前の Sandbox 起動確認 (サブ PC、観測者はサブ PC 担当、`/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-`)**:
+  - 依頼 19 (vGPU=Enable、`C:\miv-sandbox\results\v5.0.0-20261107-233449`): install exit 0、起動から約 8 秒で Sandbox のゲスト Windows が bugcheck 0x3B (SYSTEM_SERVICE_EXCEPTION、0xC0000005) で停止。mIV の窓の有無は記録できず。10-25 の v4.8.1 は同じ wsb で完走していた。原因は未特定 (§1.736)。
+  - 依頼 19b (vGPU=Disable、`C:\miv-sandbox\results\v5.0.0-20261107-235218`): install exit 0、初回 183 秒・2 回目 91 秒とも responding=True、タイトル「Desktop - mimageviewer」、初回設定の窓を表示。描画は Microsoft Basic Render Driver (Dx12)。ERROR / WARN / panic なし。
 
 ## v4.11.0 (2026-11-02)
 

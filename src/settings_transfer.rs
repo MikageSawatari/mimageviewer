@@ -526,6 +526,7 @@ preferences_policy! {
         text_smart_snap_enabled => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         thumb_quality => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         cache_policy => "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
+        cache_book_cover_only => "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
         cache_threshold_ms => "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
         cache_size_threshold_bytes => "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
         cache_videos_always => "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
@@ -2442,6 +2443,32 @@ mod tests {
                 .iter()
                 .all(|label| label.chars().any(|c| !c.is_ascii()))
         );
+    }
+
+    #[test]
+    fn cache_book_cover_only_is_local_cache_policy() {
+        let source = Settings {
+            cache_book_cover_only: true,
+            ..Settings::default()
+        };
+        assert!(
+            classifications()
+                .iter()
+                .any(|(key, reason)| { *key == "cache_book_cover_only" && reason.is_some() })
+        );
+        let exported = export_preferences(&source).unwrap();
+        let value: Value = serde_json::from_str(&exported.json).unwrap();
+        assert!(value["preferences"].get("cache_book_cover_only").is_none());
+        let mut destination = Settings::default();
+        parse_preferences(&exported.json)
+            .unwrap()
+            .apply_to(&mut destination);
+        assert!(!destination.cache_book_cover_only);
+        destination.cache_book_cover_only = true;
+        parse_preferences(&document(json!({})))
+            .unwrap()
+            .apply_to(&mut destination);
+        assert!(destination.cache_book_cover_only);
     }
 
     #[test]

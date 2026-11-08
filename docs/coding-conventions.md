@@ -8,7 +8,11 @@
 - **Virtual scrolling**: `show_viewport` で全体高さだけ確保し、可視行のみ描画。
   スクロールオフセットは App が自前管理（egui の自動スクロールは使わない）。
 - **Row snapping**: オフセットは常に `cell_size` の整数倍。最大オフセットも
-  `ceil((total_h - viewport_h) / cell_size) * cell_size` で行境界に揃える。
+  `total_h <= viewport_h` なら 0、それ以外は
+  `ceil((total_h - max(viewport_h, cell_size)) / cell_size) * cell_size` で行境界に揃える。
+  行を見せる計算では表示域を最低 1 行分として扱い、1 行未満の表示域では選択行の上端を
+  表示域の上端に合わせる。確保高は短い content では自然高、それ以外は最大オフセット + 実 viewport 高。
+  2026-11-08 サブ PC 担当から窓 1600x560 で一覧が真っ白になる報告を受け、空の次行を上限／reveal にしない式へ修正。
   一覧の touch drag も `GridScrollState` のcanonical offset自体はanchorとして行境界に保ち、1 行未満の
   描画端数だけを viewport の一時データに分離する。端数を canonical offset へ混ぜない。
 - **一覧の位置とgeometryの契約（5ch >>661）**: offset・一回要求・未消費RowAnchor・描画geometryは
@@ -164,6 +168,20 @@ focus 喪失時は全状態を消す（egui も keys_down を消去する）。
 空の `Preedit("")` を送らず `Disabled` だけを送る経路では、非空 Commit の無い composition の
 終端直前に空 preedit を補う（focus 喪失後の終端待ちも含む）。composition が無い `Disabled` へは挿入せず、
 非 composing Esc は通常入力として残す。
+
+**単一行 TextEdit の右クリックメニュー（§1.691）**:
+`ui_helpers::singleline_text_edit_context_menu` は、egui がメニュー内容を実行する最初の pass に
+文字列と clamp 済みの選択範囲を一つの型付き target として field id 別の temp data へ保存する。
+選択は pointer 処理後の `TextEditOutput.state.cursor.char_range()` を優先し、state に無い場合だけ
+`output.cursor_range` を使う。後者はキー／IME 処理時の値で、同一 pass の pointer 処理より古い。
+開いたまま再度右クリックされた場合も、`Popup::context_menu` が使う `secondary_clicked()` に
+合わせて新しい対象を捕捉する。raw pointer の押下や独自の開閉フラグでは判定しない。
+項目のクリックで focus が外れ、TextEdit の live selection が畳まれても、切り取り／コピー／
+貼り付けは保存した対象を使う。現在の文字列が保存時と異なれば切り取り／コピーを無効にし、
+貼り付け位置は保存した選択の先頭を現在の文字数へ clamp する。全選択の有効判定と範囲は
+現在の全文を使う。`Response::context_menu_opened()` で呼出し前後に閉状態を確認して target を削除し、
+非表示で放棄された欄も、egui が popup を退役させた後の次回描画で削除する。
+開閉判定・focus surrender・IME policy 自体は egui／既存 IME helper に任せる。
 
 **借用の注意**:
 `egui::Window::show(ctx, |ui| {...})` の closure 内で `self` 経由のメソッド呼び出しは

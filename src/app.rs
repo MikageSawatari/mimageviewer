@@ -31861,9 +31861,7 @@ impl App {
         if !self.open_request_owner_is_current(&path, &owner) {
             return FolderOpenOutcome::Ignored;
         }
-        let full_keys = matches!(owner, OpenRequestOwner::CollectionGridPhysical(_))
-            || matches!(&owner,OpenRequestOwner::MainGridArchive(intent) if intent.collection_grid_owner.is_some())
-            || use_full_path_cache_keys_for_folder(&path);
+        let full_keys = use_full_path_cache_keys_for_folder(&path);
         let prepared = self.prepare_scanned_folder_listing_with_cache_keys(
             path.clone(),
             scan,
@@ -32027,10 +32025,10 @@ impl App {
             pre_scanned,
             path_display: lf_path_disp,
         } = metrics;
-        // Surface adoption is the canonical cache-key boundary. A collection-owned physical
-        // source deliberately keeps the Collection surface (and therefore uses full paths),
-        // while an independent navigation adopts Folder and keeps the ordinary basename keys.
-        // The same decision must feed request/read, seed, and delete_missing.
+        // Physical listings use the destination path's ordinary cache-key policy even when
+        // Collection owns their return navigation. Only the Collection root mixes parents.
+        // Before surface adoption callers use the destination path; after adoption request/read,
+        // seed, and delete_missing share App::use_full_path_cache_keys.
         // Keep the image-book boundary independent from the caller and from the eventual
         // detached/main owner. Grid Folder preflight uses this same predicate before it
         // commits a context, preventing the two load paths from drifting apart.
@@ -37646,12 +37644,7 @@ impl App {
             }
             _ => request.restore_intent.clone().for_book(),
         });
-        let full_path = matches!(
-            request.intent,
-            PhysicalHistoryIntent::CollectionNavigation { .. }
-        ) || matches!(owner, OpenRequestOwner::CollectionGridPhysical(_))
-            || matches!(&owner,OpenRequestOwner::MainGridArchive(owner) if owner.collection_grid_owner.is_some())
-            || use_full_path_cache_keys_for_folder(&request.path);
+        let full_path = use_full_path_cache_keys_for_folder(&request.path);
         let password = pdf_password_submission
             .as_ref()
             .map(|(password, _)| password.clone());
@@ -42608,12 +42601,15 @@ impl App {
         };
 
         // ── seed 経路 ──────────────────────────────────────────────
+        // ON ではページ WebP を増やさず、既に記録した最新の寸法も維持する。
+        // 開いた時点の設定を使い、writeback の準備は従来どおり続ける。
+        let seed_enabled = !self.settings.cache_book_cover_only;
         // 仮想 catalog 側に既にあれば何もしない (再 seed 不要)。
         let already_in_virtual = cache_map
             .read()
             .map(|m| m.contains_key(&target_key))
             .unwrap_or(false);
-        let parent_entry = if !already_in_virtual {
+        let parent_entry = if seed_enabled && !already_in_virtual {
             parent_db.load_one(&parent_key).ok().flatten()
         } else {
             None
@@ -42649,7 +42645,7 @@ impl App {
             } else {
                 crate::perf::event("nav", "virtual_seed_undecodable", Some(&parent_key), 0, &[]);
             }
-        } else if !already_in_virtual {
+        } else if seed_enabled && !already_in_virtual {
             crate::perf::event("nav", "virtual_seed_miss", Some(&parent_key), 0, &[]);
         }
 
@@ -42693,7 +42689,10 @@ impl App {
         if finalized_idx != wb.target_idx {
             return;
         }
-        // cache_map から WebP データを取り出す (worker が直前に書き込んでいるはず)。
+        // 同じ items 世代の要求 stamp と一致する WebP だけを親へ写す。
+        // 保存を省略した要求では cache_map に古い stamp の行が残ることがある。
+        let request_stamp = self.image_metas.get(wb.target_idx).copied().flatten();
+        // cache_map から WebP データを取り出す。
         // RwLock の read guard を save() 越しに保持しないために clone する
         // (save 中はファイル I/O で blocking、guard 保持は他スレッドの読み書きを止める)。
         // None なら from_cache 経路 (cache hit で finalize 不発) など、worker が
@@ -42703,7 +42702,8 @@ impl App {
             .cache_map
             .read()
             .ok()
-            .and_then(|m| m.get(&wb.target_key).cloned());
+            .and_then(|m| m.get(&wb.target_key).cloned())
+            .filter(|entry| request_stamp == Some((entry.mtime, entry.file_size)));
         if let Some(entry) = entry_opt {
             let parent_key = wb.parent_key.clone();
             let _ = wb.parent_catalog.save_thumb_bytes_with_layout_dims(
@@ -100959,6 +100959,8 @@ impl App {
     /// Ctrl+S / Ctrl+G / Ctrl+T 検索結果ビューとドライブルートでは、basename ベースの
     /// cache key だと別スコープの同名項目を誤表示しうる。このメソッドが true を返す
     /// コンテキストでは `make_load_request` が full-path を含むキーを使う。
+    /// Collection は複数の親を並べる root だけが対象。PhysicalSource は通常経路と
+    /// 同じ場所のキーを共有し、Collection の帰路を持つことではキーを変えない。
     /// サムネ読み出し側、`delete_missing` の存続キー、seed 側で必ず同じ判定を共有すること。
     pub(crate) fn use_full_path_cache_keys(&self) -> bool {
         self.current_folder
@@ -100968,10 +100970,18 @@ impl App {
             || self.items_are_tag_view
             || self.items_are_reading_history_view
             || self.items_are_rating_view
-            || matches!(
+            || (matches!(
                 self.top_level_grid_view.surface(),
                 top_level_grid_view::TopLevelGridSurface::Collection(_)
-            )
+            ) && self
+                .top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| {
+                    matches!(
+                        session.position,
+                        top_level_grid_view::CollectionGridPosition::Root
+                    )
+                }))
     }
 }
 

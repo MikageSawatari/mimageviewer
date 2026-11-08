@@ -63,6 +63,22 @@ wheel/panやGPU scanoutの確認には読み替えない。このscenario名、�
   repository の viewer process を停止し得る。
 - 隔離データ、exact PID/HWND、再試行上限、証跡保存、下記の入力デスクトップ確認はそのまま適用する。
 
+## 例外: サブ PC の Windows Sandbox 内の夜間試験 (2026-11-08 利用者決定)
+
+[夜間の組み合わせ実アプリ試験](nightly-combination-test-plan.md) に限り、次の範囲の実アプリ起動・操作は
+**毎回の承認なしに常設で許可**されている。理由: 操作は使い捨ての Sandbox の中で完結し、利用者の PC の
+前面・入力・データを奪わない。
+
+- 対象 PC: サブ PC (DESKTOP-4060TI) だけ。メイン PC と、Sandbox の外のサブ PC には広げない
+- 起動するもの: 試験用 portable ビルド (`portable,test-script`、manifest と hash を照合したもの) を、Sandbox 内の
+  使い捨ての path と使い捨ての data で起動する。利用者の設定・実データは持ち込まない
+- 時間枠: 利用者が決めた夜間の枠 (既定 01:00〜07:00) の中だけ。枠の外では新しい試行を始めない
+- 起動の主体: サブ PC のタスクスケジューラから起動した runner (§5)。runner は Sandbox の外では起動を拒否する
+- 範囲を変える (別の PC、Sandbox の外、通常 profile のビルド、時間枠の拡大) には改めて利用者の決定が要る
+
+S0 の環境確認 (同計画 §12) もこの範囲で行う。サブ PC の Claude Code セッションに Sandbox の起動を
+頼む場合も、Sandbox の外で mIV を起動しないこと。
+
 ## データ保護と記録
 
 実行了承は、通常profileの起動許可を兼ねない。エージェントは引き続き

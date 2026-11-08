@@ -2598,7 +2598,7 @@ impl App {
             pdf_password_override,
             super::StartupListIntent::ExplicitList,
             false,
-            true,
+            super::use_full_path_cache_keys_for_folder(&path),
         ) else {
             return false;
         };
@@ -11038,6 +11038,514 @@ mod tests {
         app.shutdown_collection_runtime_for_exit();
     }
 
+    fn thumbnail_request_keys(app: &App) -> std::collections::HashSet<String> {
+        app.items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let (mtime, size) = app.image_metas[index].unwrap_or_default();
+                let request = super::super::make_load_request(
+                    item,
+                    index,
+                    mtime,
+                    size,
+                    false,
+                    None,
+                    Some(app.settings.folder_thumb_sort),
+                    app.settings.folder_thumb_depth,
+                    &app.folder_pin_map,
+                    &app.converted_archive_cache_paths,
+                    None,
+                    app.current_folder.as_deref(),
+                    app.folder_thumb_pin_db.as_deref(),
+                    app.video_pin_db.as_ref(),
+                    app.use_full_path_cache_keys(),
+                )
+                .expect("thumbnail request");
+                crate::thumb_loader::cache_key_for_request(&request)
+                    .unwrap()
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    fn physical_folder_thumbnail_keys(
+        app: &mut App,
+        folder: &Path,
+    ) -> (
+        std::collections::HashSet<String>,
+        std::collections::HashSet<String>,
+    ) {
+        let scan =
+            super::super::folder_scan::scan_directory_with_settings(folder, &app.settings).unwrap();
+        let now = Instant::now();
+        let prepared = app.prepare_scanned_folder_listing_with_cache_keys(
+            folder.to_path_buf(),
+            scan,
+            super::super::FolderListingMetrics {
+                seq: 0,
+                started: now,
+                scan_started: now,
+                pre_scanned: true,
+                path_display: folder.display().to_string(),
+            },
+            crate::app::StartupListIntent::ExplicitList,
+            app.use_full_path_cache_keys(),
+        );
+        (thumbnail_request_keys(app), prepared.existing_keys)
+    }
+
+    fn load_thumbnail_test_folder(
+        app: &mut App,
+        folder: &Path,
+        owner: super::super::OpenRequestOwner,
+    ) {
+        let scan =
+            super::super::folder_scan::scan_directory_with_settings(folder, &app.settings).unwrap();
+        assert!(app.load_folder_with_scan_owned(
+            folder.to_path_buf(),
+            Some(scan),
+            owner,
+            crate::app::StartupListIntent::ExplicitList,
+        ));
+        poll_until(app, "physical thumbnail hydration did not finish", |_| true);
+    }
+
+    fn assert_collection_physical_thumbnail_cache(normal_first: bool, compare_keys: bool) {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("album");
+        std::fs::create_dir(&folder).unwrap();
+        // Invalid image payloads keep background decoders from producing replacement rows.
+        std::fs::write(folder.join("page.png"), b"image").unwrap();
+        write_single_page_zip(&folder.join("book.zip"));
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot =
+            collection_with_sources(&client, &[(folder.clone(), CollectionResolvedKind::Folder)]);
+        let open = |app: &mut App, collection: bool| {
+            let owner = if collection {
+                app.open_collection_grid(snapshot.collection_id(), None);
+                wait_for_grid(app, snapshot.collection_id());
+                assert!(app.use_full_path_cache_keys(), "root keeps full-path keys");
+                super::super::OpenRequestOwner::CollectionGridPhysical(
+                    app.collection_grid_physical_load_owner(0, &folder).unwrap(),
+                )
+            } else {
+                super::super::OpenRequestOwner::Navigation
+            };
+            load_thumbnail_test_folder(app, &folder, owner);
+            assert_eq!(
+                matches!(
+                    app.top_level_grid_view.surface(),
+                    TopLevelGridSurface::Collection(_)
+                ),
+                collection
+            );
+        };
+        open(&mut app, !normal_first);
+        let before = physical_folder_thumbnail_keys(&mut app, &folder);
+        assert_eq!(before.0.len(), 2);
+        assert!(before.0.is_subset(&before.1));
+        let catalog = app.get_or_open_catalog(&folder).unwrap();
+        for key in &before.0 {
+            catalog.save(key, 1, 1, 1, 1, None, b"thumb").unwrap();
+        }
+        catalog
+            .save("removed.png", 1, 1, 1, 1, None, b"removed")
+            .unwrap();
+        open(&mut app, normal_first);
+        let after = physical_folder_thumbnail_keys(&mut app, &folder);
+        if compare_keys {
+            assert_eq!(
+                before, after,
+                "ordinary and collection physical request/prune keys must agree"
+            );
+        }
+        // The production load above must run start_loading_items/delete_missing on this DB.
+        let retained = catalog.load_all().unwrap();
+        assert!(
+            !retained.contains_key("removed.png"),
+            "production prune must have run"
+        );
+        assert!(
+            before.0.iter().all(|key| retained.contains_key(key)),
+            "switching routes deleted saved thumbnail rows: saved={:?}, retained={:?}",
+            before.0,
+            retained.keys().collect::<Vec<_>>()
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn collection_physical_thumbnail_keys_match_ordinary_folder() {
+        assert_collection_physical_thumbnail_cache(true, true);
+    }
+
+    #[test]
+    fn collection_physical_load_preserves_ordinary_thumbnail_rows() {
+        assert_collection_physical_thumbnail_cache(true, false);
+    }
+
+    #[test]
+    fn ordinary_load_preserves_collection_physical_thumbnail_rows() {
+        assert_collection_physical_thumbnail_cache(false, false);
+    }
+
+    fn assert_physical_thumbnail_rows(
+        app: &mut App,
+        folder: &Path,
+        expected: &std::collections::HashSet<String>,
+    ) {
+        assert!(!app.use_full_path_cache_keys());
+        let (requests, existing) = physical_folder_thumbnail_keys(app, folder);
+        assert_eq!(&requests, expected);
+        assert!(requests.is_subset(&existing));
+        for item in &app.items {
+            if let GridItem::Image(path) = item {
+                let (catalog, key) = app.details_catalog_lookup_for_item(item);
+                assert_eq!(catalog.as_deref(), Some(folder));
+                assert_eq!(
+                    key.as_deref(),
+                    path.file_name().and_then(|name| name.to_str())
+                );
+            }
+        }
+        let retained = app.get_or_open_catalog(folder).unwrap().load_all().unwrap();
+        assert!(
+            expected.iter().all(|key| retained.contains_key(key)),
+            "physical rows lost: {expected:?}"
+        );
+    }
+
+    #[test]
+    fn collection_physical_history_and_outer_navigation_share_thumbnail_keys() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("album");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("page.png"), b"page").unwrap();
+        write_single_page_zip(&folder.join("book.zip"));
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        app.active_quick_folder_slot = None;
+        load_thumbnail_test_folder(
+            &mut app,
+            &folder,
+            super::super::OpenRequestOwner::Navigation,
+        );
+        let expected = thumbnail_request_keys(&app);
+        let catalog = app.get_or_open_catalog(&folder).unwrap();
+        for key in &expected {
+            catalog.save(key, 1, 1, 1, 1, None, b"thumb").unwrap();
+        }
+        let legacy_key = super::super::image_full_path_cache_key(&folder.join("page.png"));
+        catalog
+            .save(&legacy_key, 1, 1, 1, 1, None, b"legacy")
+            .unwrap();
+        let snapshot =
+            collection_with_sources(&client, &[(folder.clone(), CollectionResolvedKind::Folder)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let owner = app.collection_grid_physical_load_owner(0, &folder).unwrap();
+        load_thumbnail_test_folder(
+            &mut app,
+            &folder,
+            super::super::OpenRequestOwner::CollectionGridPhysical(owner),
+        );
+        assert_physical_thumbnail_rows(&mut app, &folder, &expected);
+        assert!(
+            !catalog.load_all().unwrap().contains_key(&legacy_key),
+            "obsolete full-path row is pruned without migration"
+        );
+
+        replay_real_history(&mut app, true, None, None);
+        assert!(app.use_full_path_cache_keys());
+        assert!(app.current_color_catalog.is_none());
+        let root_request = collection_pin_request(&app, 0);
+        assert!(
+            crate::thumb_loader::cache_key_for_request(&root_request)
+                .unwrap()
+                .contains(folder.to_string_lossy().as_ref())
+        );
+        replay_real_history(&mut app, false, Some(&folder), None);
+        assert_physical_thumbnail_rows(&mut app, &folder, &expected);
+        replay_real_history(&mut app, true, None, None);
+
+        // The native Ctrl+down outer-grid entry uses its own prepared physical adopter.
+        app.selected = None;
+        let ctx = egui::Context::default();
+        assert!(app.start_collection_outer_grid_navigation(&ctx, true));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            app.poll_collection_ui(&ctx);
+            app.poll_collection_navigation(&ctx);
+            app.poll_collection_history_transition(&ctx);
+            app.poll_sidecar_restore(&ctx);
+            if app.current_folder.as_deref() == Some(folder.as_path())
+                && !app.top_level_grid_view.collection_navigation_pending()
+                && !app.sidecar_restore_active()
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "outer navigation did not install physical folder"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_physical_thumbnail_rows(&mut app, &folder, &expected);
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn collection_physical_archive_pages_share_ordinary_thumbnail_keys() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        for pdf in [false, true] {
+            for descendant in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let folder = temp.path().join("album");
+                std::fs::create_dir(&folder).unwrap();
+                let book = folder.join(if pdf { "book.pdf" } else { "book.zip" });
+                let pages: Option<crate::pdf_loader::PdfEnumerateResult> = if pdf {
+                    write_two_page_history_pdf(&book);
+                    Some(read_real_pdf_pages_for_history(&book).into())
+                } else {
+                    write_single_page_zip(&book);
+                    None
+                };
+                let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+                app.active_quick_folder_slot = None;
+                assert!(app.load_folder_with_scan_owned(
+                    book.clone(),
+                    None,
+                    super::super::OpenRequestOwner::Navigation,
+                    crate::app::StartupListIntent::ExplicitList
+                ));
+                poll_real_history_load(&mut app, Some(&book), pages.as_ref());
+                let expected = thumbnail_request_keys(&app);
+                assert_eq!(
+                    expected,
+                    if pdf {
+                        [
+                            crate::grid_item::pdf_page_cache_key(0),
+                            crate::grid_item::pdf_page_cache_key(1),
+                        ]
+                        .into_iter()
+                        .collect()
+                    } else {
+                        ["page.jpg".to_owned()].into_iter().collect()
+                    }
+                );
+                let snapshot = collection_with_sources(
+                    &client,
+                    &[(
+                        if descendant {
+                            folder.clone()
+                        } else {
+                            book.clone()
+                        },
+                        if descendant {
+                            CollectionResolvedKind::Folder
+                        } else if pdf {
+                            CollectionResolvedKind::Pdf
+                        } else {
+                            CollectionResolvedKind::Zip
+                        },
+                    )],
+                );
+                app.open_collection_grid(snapshot.collection_id(), None);
+                wait_for_grid(&mut app, snapshot.collection_id());
+                if descendant {
+                    let owner = app.collection_grid_physical_load_owner(0, &folder).unwrap();
+                    load_thumbnail_test_folder(
+                        &mut app,
+                        &folder,
+                        super::super::OpenRequestOwner::CollectionGridPhysical(owner),
+                    );
+                }
+                let index = app
+                    .items
+                    .iter()
+                    .position(|item| item.drag_source_path() == Some(book.as_path()))
+                    .unwrap();
+                let owner = if descendant {
+                    // Cover the archive continuation carrying the Collection return owner too.
+                    let owner = app.collection_grid_source_open_owner(index, &book).unwrap();
+                    app.collection_archive_open_owner(&book, owner, None)
+                } else {
+                    super::super::OpenRequestOwner::CollectionGridPhysical(
+                        app.collection_grid_physical_load_owner(index, &book)
+                            .unwrap(),
+                    )
+                };
+                assert!(app.load_folder_with_scan_owned(
+                    book.clone(),
+                    None,
+                    owner,
+                    crate::app::StartupListIntent::ExplicitList
+                ));
+                poll_real_history_load(&mut app, Some(&book), pages.as_ref());
+                assert!(!app.use_full_path_cache_keys());
+                assert_eq!(thumbnail_request_keys(&app), expected);
+                for item in &app.items {
+                    let (catalog, key) = app.details_catalog_lookup_for_item(item);
+                    assert_eq!(catalog.as_deref(), Some(book.as_path()));
+                    assert!(expected.contains(&key.unwrap()));
+                }
+                app.shutdown_collection_runtime_for_exit();
+            }
+        }
+    }
+
+    #[test]
+    fn collection_physical_stack_and_expansion_use_destination_key_policy() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("album");
+        let nested = folder.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        for path in [
+            folder.join("scan_001.jpg"),
+            folder.join("scan_002.jpg"),
+            folder.join("other_001.jpg"),
+            folder.join("other_002.jpg"),
+            nested.join("scan_001.jpg"),
+            nested.join("scan_002.jpg"),
+            nested.join("other_001.jpg"),
+            nested.join("other_002.jpg"),
+        ] {
+            std::fs::write(path, b"page").unwrap();
+        }
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot =
+            collection_with_sources(&client, &[(folder.clone(), CollectionResolvedKind::Folder)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let owner = app.collection_grid_physical_load_owner(0, &folder).unwrap();
+        load_thumbnail_test_folder(
+            &mut app,
+            &folder,
+            super::super::OpenRequestOwner::CollectionGridPhysical(owner),
+        );
+        app.settings.stack_script_enabled = false;
+        let ctx = egui::Context::default();
+        app.toggle_stack_mode();
+        let settle = |app: &mut App| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                app.settle_open_path_classification_for_test();
+                app.poll_collection_history_transition(&ctx);
+                app.poll_sidecar_restore(&ctx);
+                app.poll_subfolder_expansion(&ctx);
+                app.poll_stack_script(&ctx);
+                if !app.sidecar_restore_active()
+                    && app
+                        .top_level_grid_view
+                        .history_navigation_transition()
+                        .is_none()
+                    && !app.subfolder_expansion_busy()
+                    && app.stack_script_pending.is_none()
+                {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "stack/expansion did not settle");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        settle(&mut app);
+        assert!(!app.use_full_path_cache_keys());
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            TopLevelGridSurface::Collection(_)
+        ));
+        assert!(
+            app.items
+                .iter()
+                .any(|item| matches!(item, GridItem::Stack { .. }))
+        );
+        assert!(
+            thumbnail_request_keys(&app)
+                .iter()
+                .any(|key| key == "scan_001.jpg")
+        );
+        app.toggle_stack_mode();
+        settle(&mut app);
+        app.settings.auto_fullscreen_image_folders = false;
+        app.toggle_subfolder_expansion_view();
+        settle(&mut app);
+        assert!(app.items_are_subfolder_expansion_view);
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            TopLevelGridSurface::SubfolderExpansion
+        ));
+        assert_eq!(
+            app.current_folder,
+            Some(super::super::subfolder_expansion_synthetic_path())
+        );
+        assert!(app.use_full_path_cache_keys());
+        assert!(
+            thumbnail_request_keys(&app).contains(&super::super::image_full_path_cache_key(
+                &nested.join("scan_001.jpg")
+            ))
+        );
+        app.toggle_stack_mode();
+        settle(&mut app);
+        assert!(app.use_full_path_cache_keys());
+        assert!(
+            app.items
+                .iter()
+                .any(|item| matches!(item, GridItem::Stack { .. }))
+        );
+        assert!(
+            thumbnail_request_keys(&app)
+                .iter()
+                .all(|key| key.starts_with("imgthumb:"))
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn collection_thumbnail_key_policy_is_owned_by_each_viewer_context() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("album");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("page.png"), b"page").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot =
+            collection_with_sources(&client, &[(folder.clone(), CollectionResolvedKind::Folder)]);
+        load_thumbnail_test_folder(
+            &mut app,
+            &folder,
+            super::super::OpenRequestOwner::Navigation,
+        );
+        let main_keys = thumbnail_request_keys(&app);
+        let generation = app.items_generation;
+        let window = app.build_window_context_for_test(1731, |_| {});
+        app.with_viewer_context(window, |app| {
+            app.open_collection_grid(snapshot.collection_id(), None);
+            wait_for_grid(app, snapshot.collection_id());
+            assert!(app.use_full_path_cache_keys());
+        })
+        .unwrap();
+        assert!(!app.use_full_path_cache_keys());
+        assert_eq!(app.items_generation, generation);
+        app.with_viewer_context(window, |app| {
+            let owner = app.collection_grid_physical_load_owner(0, &folder).unwrap();
+            load_thumbnail_test_folder(
+                app,
+                &folder,
+                super::super::OpenRequestOwner::CollectionGridPhysical(owner),
+            );
+            assert!(!app.use_full_path_cache_keys());
+            assert_eq!(thumbnail_request_keys(app), main_keys);
+        })
+        .unwrap();
+        assert!(!app.use_full_path_cache_keys());
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(thumbnail_request_keys(&app), main_keys);
+        app.shutdown_collection_runtime_for_exit();
+    }
+
     #[test]
     fn root_load_owner_stales_on_wanted_revision_but_physical_continuation_does_not() {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
@@ -11045,14 +11553,9 @@ mod tests {
         let root = temp.path().join("book");
         let nested = root.join("nested");
         let deeper = nested.join("deeper");
-        let other = temp.path().join("other");
         std::fs::create_dir_all(&deeper).unwrap();
-        std::fs::create_dir_all(&other).unwrap();
         std::fs::write(root.join("page.png"), b"page").unwrap();
-        let root_same = root.join("same.jpg");
-        let other_same = other.join("same.jpg");
-        std::fs::write(&root_same, b"root same").unwrap();
-        std::fs::write(&other_same, b"other same").unwrap();
+        std::fs::write(root.join("same.jpg"), b"root same").unwrap();
         std::fs::write(nested.join("nested.png"), b"nested").unwrap();
         std::fs::write(deeper.join("deep.png"), b"deep").unwrap();
         let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
@@ -11110,64 +11613,11 @@ mod tests {
             CollectionGridPosition::PhysicalSource { .. }
         ));
 
-        // Collection-owned PhysicalSource keeps the Collection surface, so load requests and
-        // delete_missing must both use full paths. Model two same-basename rows from different
-        // parents in one catalog and verify pruning retains exactly the keys the readers request.
-        assert!(app.use_full_path_cache_keys());
-        let same_name_items = [
-            GridItem::Image(root_same.clone()),
-            GridItem::Image(other_same.clone()),
-        ];
-        let existing_keys = same_name_items
-            .iter()
-            .flat_map(|item| {
-                super::super::folder_thumb_existing_keys_for(
-                    item,
-                    None,
-                    &std::collections::HashMap::new(),
-                    None,
-                    Some(app.settings.folder_thumb_sort),
-                    app.settings.folder_thumb_depth,
-                    app.use_full_path_cache_keys(),
-                )
-            })
-            .collect::<std::collections::HashSet<_>>();
-        let requested_keys = same_name_items
-            .iter()
-            .enumerate()
-            .map(|(idx, item)| {
-                super::super::make_load_request(
-                    item,
-                    idx,
-                    1,
-                    1,
-                    false,
-                    None,
-                    Some(app.settings.folder_thumb_sort),
-                    app.settings.folder_thumb_depth,
-                    &std::collections::HashMap::new(),
-                    &std::collections::HashMap::new(),
-                    None,
-                    app.current_folder.as_deref(),
-                    None,
-                    None,
-                    app.use_full_path_cache_keys(),
-                )
-                .unwrap()
-                .cache_key_override
-                .unwrap()
-            })
-            .collect::<std::collections::HashSet<_>>();
-        assert_eq!(existing_keys, requested_keys);
-        assert_eq!(existing_keys.len(), 2);
-        let catalog = crate::catalog::CatalogDb::open(&temp.path().join("cache"), &root).unwrap();
-        for key in &requested_keys {
-            catalog.save(key, 1, 1, 1, 1, None, b"thumb").unwrap();
-        }
-        catalog.delete_missing(&existing_keys).unwrap();
-        let retained = catalog.load_all().unwrap();
-        assert_eq!(retained.len(), 2);
-        assert!(requested_keys.iter().all(|key| retained.contains_key(key)));
+        // One physical folder has one inventory, regardless of its Collection return owner.
+        assert!(!app.use_full_path_cache_keys());
+        let (requested_keys, existing_keys) = physical_folder_thumbnail_keys(&mut app, &root);
+        assert!(requested_keys.contains("same.jpg"));
+        assert!(requested_keys.is_subset(&existing_keys));
 
         let renamed = recv(
             client
@@ -11201,6 +11651,14 @@ mod tests {
             crate::app::StartupListIntent::ExplicitList,
         ));
         assert_eq!(app.current_folder.as_deref(), Some(nested.as_path()));
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            TopLevelGridSurface::Collection(_)
+        ));
+        assert!(!app.use_full_path_cache_keys());
+        let (requested, existing) = physical_folder_thumbnail_keys(&mut app, &nested);
+        assert!(requested.contains("nested.png"));
+        assert!(requested.is_subset(&existing));
         poll_until(&mut app, "nested child hydration did not finish", |_| true);
         assert!(matches!(
             app.collection_grid_parent_nav(),

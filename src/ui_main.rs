@@ -27382,6 +27382,26 @@ mod compute_cell_size_tests {
     }
 
     #[test]
+    fn snapped_scroll_extent_short_viewport_bounds_touch_to_occupied_rows() {
+        for (natural_h, expected) in [(270.0, 0.0), (810.0, 540.0)] {
+            let (content_h, max_offset) = snapped_scroll_extent(natural_h, 160.0, 270.0);
+            assert_eq!(max_offset, expected);
+            assert_eq!(content_h, expected + 160.0);
+            let moved = apply_grid_touch_scroll_delta(0.0, 0.0, -10000.0, 270.0, max_offset);
+            assert_eq!(moved.anchor_y, expected);
+            assert_eq!(moved.remainder_y, 0.0);
+            let settled = settle_grid_touch_scroll(
+                moved.anchor_y,
+                moved.remainder_y,
+                270.0,
+                max_offset,
+                None,
+            );
+            assert_eq!(settled.anchor_y, expected);
+        }
+    }
+
+    #[test]
     fn snapped_scroll_extent_does_not_expand_short_content() {
         let (total_h, max_offset) = snapped_scroll_extent(280.0, 600.0, 100.0);
 

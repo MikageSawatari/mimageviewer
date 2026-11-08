@@ -19,6 +19,11 @@ impl Default for GridScrollSessionId {
 /// Keep the caller's geometry and ScrollArea's minimum inner height identical.
 pub(crate) const GRID_SCROLL_MIN_VIEWPORT_H: f32 = 64.0;
 
+/// A row taller than the viewport is revealed by its top, not the next row boundary.
+fn row_visibility_height(viewport_h: f32, row_h: f32) -> f32 {
+    viewport_h.max(row_h)
+}
+
 /// Last declared and drawn grid geometry, scoped with its canonical position.
 /// Before the first paint, use the same navigation defaults as App historically used.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -58,7 +63,8 @@ impl GridScrollGeometry {
             return (natural_h, 0.0);
         }
         let row_h = row_h.max(1.0);
-        let max_offset = ((natural_h - viewport_h) / row_h).ceil() * row_h;
+        let visibility_h = row_visibility_height(viewport_h, row_h);
+        let max_offset = ((natural_h - visibility_h) / row_h).ceil() * row_h;
         (max_offset + viewport_h, max_offset)
     }
 }
@@ -290,11 +296,12 @@ impl GridScrollState {
         }
         let row_top = row as f32 * geometry.row_h;
         let row_bottom = row_top + geometry.row_h;
+        let visibility_h = row_visibility_height(geometry.viewport_h, geometry.row_h);
         if row_top < self.offset_y {
             self.offset_y = row_top;
-        } else if row_bottom > self.offset_y + geometry.viewport_h {
-            self.offset_y = ((row_bottom - geometry.viewport_h).max(0.0) / geometry.row_h).ceil()
-                * geometry.row_h;
+        } else if row_bottom > self.offset_y + visibility_h {
+            self.offset_y =
+                ((row_bottom - visibility_h).max(0.0) / geometry.row_h).ceil() * geometry.row_h;
         }
     }
 
@@ -403,6 +410,109 @@ impl GridScrollState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grid_scroll_short_viewport_extent_stops_at_last_occupied_row() {
+        for (natural_h, expected) in [
+            (100.0, 0.0),
+            (200.0, 0.0),
+            (270.0, 0.0),
+            (300.0, 270.0),
+            (810.0, 540.0),
+        ] {
+            let geometry = GridScrollGeometry::new(4, 270.0, 160.0, natural_h);
+            assert_eq!(geometry.max_offset, expected, "natural_h={natural_h}");
+            assert_eq!(geometry.max_offset % geometry.row_h, 0.0);
+            if natural_h > geometry.viewport_h {
+                assert_eq!(geometry.content_h, expected + geometry.viewport_h);
+            } else {
+                assert_eq!(geometry.content_h, natural_h);
+            }
+        }
+    }
+
+    #[test]
+    fn grid_scroll_short_viewport_bottom_resolves_to_last_occupied_row() {
+        for item_count in [3_usize, 11] {
+            let rows = item_count.div_ceil(4);
+            let geometry = GridScrollGeometry::new(4, 270.0, 160.0, rows as f32 * 270.0);
+            let mut state = GridScrollState::default();
+            state.request_edge(GridScrollIntent::Bottom);
+            let resolved = state.resolve_layout(geometry, false, None, false);
+            let expected = (rows - 1) as f32 * 270.0;
+            assert_eq!(state.offset(), expected);
+            assert_eq!(
+                resolved.position,
+                egui::scroll_area::ExternalScrollPosition::Set(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn grid_scroll_short_viewport_reveal_aligns_selected_row_top() {
+        for item_count in [3_usize, 11] {
+            let geometry =
+                GridScrollGeometry::new(4, 270.0, 160.0, item_count.div_ceil(4) as f32 * 270.0);
+            for selected in [0, item_count - 1] {
+                for initial_offset in [0.0, 540.0] {
+                    let mut state = GridScrollState::default();
+                    state.set_position(initial_offset);
+                    state.set_reveal_requested(true);
+                    let reveal = state.take_reveal();
+                    state.resolve_layout(geometry, reveal, Some(selected), false);
+                    assert_eq!(
+                        state.offset(),
+                        (selected / 4) as f32 * 270.0,
+                        "items={item_count}, selected={selected}, initial={initial_offset}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grid_scroll_short_viewport_resize_keeps_bottom_on_an_occupied_row() {
+        let mut state = GridScrollState::default();
+        state.request_edge(GridScrollIntent::Bottom);
+        state.resolve_layout(
+            GridScrollGeometry::new(4, 270.0, 600.0, 2700.0),
+            false,
+            None,
+            false,
+        );
+        assert_eq!(state.offset(), 2160.0);
+        state.resolve_layout(
+            GridScrollGeometry::new(4, 270.0, 160.0, 2700.0),
+            false,
+            None,
+            true,
+        );
+        assert_eq!(state.offset(), 2160.0);
+    }
+
+    #[test]
+    fn grid_scroll_short_viewport_item_reduction_clamps_to_first_row() {
+        let mut state = GridScrollState::default();
+        state.request_edge(GridScrollIntent::Bottom);
+        state.resolve_layout(
+            GridScrollGeometry::new(4, 270.0, 160.0, 2700.0),
+            false,
+            None,
+            false,
+        );
+        assert!(state.offset() > 0.0);
+        let resolved = state.resolve_layout(
+            GridScrollGeometry::new(4, 270.0, 160.0, 270.0),
+            false,
+            None,
+            false,
+        );
+        assert_eq!(state.offset(), 0.0);
+        assert_eq!(
+            resolved.position,
+            egui::scroll_area::ExternalScrollPosition::Set(0.0)
+        );
+    }
 
     #[test]
     fn grid_scroll_session_renewal_preserves_position_requests_anchor_and_geometry() {

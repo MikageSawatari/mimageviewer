@@ -14983,6 +14983,253 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn remote_cover_only_zip_pdf_requests_save_covers_and_page_dimensions() {
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let cache_dir = crate::catalog::default_cache_dir();
+        for cover_only in [false, true] {
+            let folder = data.path().join(format!("remote-cover-only-{cover_only}"));
+            std::fs::create_dir_all(&folder).unwrap();
+            let zip_path = folder.join("book.zip");
+            write_remote_ai_test_zip(&zip_path, &[("page.png", &remote_ai_test_png(96, 48))]);
+            let pdf_path = folder.join("book.pdf");
+            std::fs::write(&pdf_path, minimal_remote_pdf_with_direction(72, 144)).unwrap();
+            let _pdf = crate::pdf_loader::RemotePdfTestBackend::for_path(&pdf_path);
+            let engine = ContainerEngine::new(crate::settings::Settings {
+                cache_policy: crate::settings::CachePolicy::Always,
+                cache_book_cover_only: cover_only,
+                ..Default::default()
+            });
+            for (path, page, page_key, cover_key) in [
+                (
+                    &zip_path,
+                    RemoteSubresource::ZipEntry {
+                        entry_name: "page.png".into(),
+                    },
+                    "page.png".to_owned(),
+                    container_thumb_key(crate::thumb_loader::CACHE_KEY_ZIP, &zip_path).unwrap(),
+                ),
+                (
+                    &pdf_path,
+                    RemoteSubresource::PdfPage { page_number: 0 },
+                    crate::grid_item::pdf_page_cache_key(0),
+                    container_thumb_key(crate::thumb_loader::CACHE_KEY_PDF, &pdf_path).unwrap(),
+                ),
+            ] {
+                for subresource in [page, RemoteSubresource::File] {
+                    let response = engine.thumbnail(
+                        &mimageviewer_ipc::ThumbnailRequest {
+                            address: RemoteAddress {
+                                path: path.to_string_lossy().into_owned(),
+                                subresource,
+                            },
+                            source_address: None,
+                            target_px: 64,
+                        },
+                        &WorkerContext::without_databases(),
+                    );
+                    let ThumbnailResponse::Success { webp_bytes } = response else {
+                        panic!("cover_only={cover_only}: {response:?}");
+                    };
+                    assert!(image::load_from_memory(&webp_bytes).is_ok());
+                }
+                let pages = crate::catalog::CatalogDb::open(&cache_dir, path).unwrap();
+                assert_eq!(pages.load_one(&page_key).unwrap().is_some(), !cover_only);
+                let metadata = std::fs::metadata(path).unwrap();
+                let dims = pages
+                    .load_source_dims_matching(
+                        crate::ui_helpers::mtime_secs(&metadata),
+                        metadata.len() as i64,
+                    )
+                    .unwrap();
+                let (width, height) = dims[&page_key].expect("viewed pages retain dimensions");
+                assert_eq!(width > height, path == &zip_path);
+                let covers = crate::catalog::CatalogDb::open(&cache_dir, &folder).unwrap();
+                assert!(covers.load_one(&cover_key).unwrap().is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn remote_cover_only_preloaded_decode_uses_the_same_page_save_policy() {
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let png = remote_ai_test_png(96, 48);
+        for cover_only in [false, true] {
+            let path = data.path().join(format!("preloaded-{cover_only}.zip"));
+            write_remote_ai_test_zip(&path, &[("page.png", &png)]);
+            let catalog = Arc::new(
+                crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &path)
+                    .unwrap(),
+            );
+            let settings = crate::settings::Settings {
+                cache_policy: crate::settings::CachePolicy::Always,
+                cache_book_cover_only: cover_only,
+                ..Default::default()
+            };
+            let cache_map = Arc::new(RwLock::new(HashMap::new()));
+            for override_key in [None, Some("zipthumb:book.zip#pin:page".to_owned())] {
+                let request = crate::thumb_loader::LoadRequest {
+                    path: path.clone(),
+                    zip_entry: Some("page.png".into()),
+                    cache_key_override: override_key.clone(),
+                    mtime: 17,
+                    file_size: png.len() as i64,
+                    ..Default::default()
+                };
+                let decoded = decode_remote_source(
+                    request,
+                    Arc::clone(&cache_map),
+                    Some(Arc::clone(&catalog)),
+                    64,
+                    80,
+                    64,
+                    remote_page_cache_decision(false, &settings),
+                    Arc::new(Mutex::new(crate::stats::ThumbStats::default())),
+                    &Arc::new(AtomicBool::new(false)),
+                    false,
+                    Some(png.clone()),
+                )
+                .unwrap();
+                assert_eq!(decoded.raster.decoded_source_dims, Some((96, 48)));
+                let key = override_key.as_deref().unwrap_or("page.png");
+                let saves_webp = !cover_only || override_key.is_some();
+                assert_eq!(catalog.load_one(key).unwrap().is_some(), saves_webp);
+                assert_eq!(cache_map.read().unwrap().contains_key(key), saves_webp);
+                assert_eq!(
+                    catalog
+                        .load_source_dims_matching(17, png.len() as i64)
+                        .unwrap()[key],
+                    Some((96, 48))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn remote_cover_only_preserves_rar_nested_and_exif_landscape_classification() {
+        let data = crate::data_dir::TestDataDirGuard::new();
+        // Stored raster is portrait; orientation 6 makes its displayed dimensions landscape.
+        let jpeg = remote_ai_test_jpeg(48, 96);
+        let exif = b"Exif\0\0II\x2a\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0\0\0\0\0";
+        let mut oriented_jpeg = jpeg[..2].to_vec();
+        oriented_jpeg.extend_from_slice(&[0xff, 0xe1]);
+        oriented_jpeg.extend_from_slice(&((exif.len() + 2) as u16).to_be_bytes());
+        oriented_jpeg.extend_from_slice(exif);
+        oriented_jpeg.extend_from_slice(&jpeg[2..]);
+        let mut results = Vec::new();
+        for cover_only in [false, true] {
+            let folder = data.path().join(format!("landscape-{cover_only}"));
+            std::fs::create_dir_all(&folder).unwrap();
+            let rar = folder.join("book.rar");
+            std::fs::write(&rar, crate::rar_loader::direct_read_test_fixture_bytes()).unwrap();
+            let nested = folder.join("nested.zip");
+            let inner = remote_ai_test_zip_bytes(&[("page.png", &remote_ai_test_png(96, 48))]);
+            write_remote_ai_test_zip(&nested, &[("inner.zip", &inner)]);
+            let exif_zip = folder.join("exif.zip");
+            write_remote_ai_test_zip(&exif_zip, &[("page.jpg", &oriented_jpeg)]);
+            let engine = ContainerEngine::new(crate::settings::Settings {
+                cache_policy: crate::settings::CachePolicy::Always,
+                cache_book_cover_only: cover_only,
+                ..Default::default()
+            });
+            let mut flags = Vec::new();
+            for (path, entry_name, expected_dims) in [
+                (&rar, "page.png", (64, 48)),
+                (&nested, "inner.zip/page.png", (96, 48)),
+                (&exif_zip, "page.jpg", (96, 48)),
+            ] {
+                let address = RemoteAddress {
+                    path: path.to_string_lossy().into_owned(),
+                    subresource: RemoteSubresource::ZipEntry {
+                        entry_name: entry_name.into(),
+                    },
+                };
+                // A direct RAR is admitted by an archive job before the image request.
+                // Supply the same resolved backing here; a bare file resolution is not
+                // a Remote archive container and correctly rejects ZipEntry addresses.
+                let resolved = if path == &rar {
+                    ResolvedPath::with_archive_backing(path, &address.path, path).unwrap()
+                } else {
+                    resolve_existing(&address.path).unwrap()
+                };
+                let loaded = engine
+                    .load_image(
+                        &address,
+                        &resolved,
+                        64,
+                        RemoteImageLoadKind::Thumbnail(current_catalog_admission()),
+                        crate::rotation_db::Rotation::None,
+                        false,
+                        &WorkerContext::without_databases(),
+                        None,
+                        None,
+                    )
+                    .unwrap_or_else(|error| panic!("{}: {error:?}", path.display()));
+                assert!(!loaded.pixels.pixels.is_empty());
+                let catalog =
+                    crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), path)
+                        .unwrap();
+                assert_eq!(catalog.load_one(entry_name).unwrap().is_some(), !cover_only);
+                assert_eq!(
+                    catalog.load_source_dims().unwrap()[entry_name],
+                    Some(expected_dims)
+                );
+                let items = [crate::grid_item::GridItem::ZipImage {
+                    zip_path: path.clone(),
+                    entry_name: entry_name.into(),
+                }];
+                let (landscape, audit) =
+                    audit_enumeration(None, || engine.cached_landscape_flags(path, &items));
+                assert_eq!(landscape, [true]);
+                assert!(
+                    audit.zip_probes.is_empty(),
+                    "saved dimensions must avoid header fallback"
+                );
+                flags.extend(landscape);
+            }
+            results.push(flags);
+        }
+        assert_eq!(results[0], results[1]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn remote_cover_only_raw_without_preview_still_reads_saved_page_thumbnail() {
+        let _data = crate::data_dir::TestDataDirGuard::new();
+        let (path, mut settings) = review2_cached_raw_zip();
+        settings.cache_book_cover_only = true;
+        let catalog =
+            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &path).unwrap();
+        let before = catalog.load_one("chapter/page.cr2").unwrap().unwrap();
+        let engine = ContainerEngine::new(settings);
+        let response = engine.thumbnail(
+            &mimageviewer_ipc::ThumbnailRequest {
+                address: RemoteAddress {
+                    path: path.to_string_lossy().into_owned(),
+                    subresource: RemoteSubresource::ZipEntry {
+                        entry_name: "chapter/page.cr2".into(),
+                    },
+                },
+                source_address: None,
+                target_px: 8,
+            },
+            &WorkerContext::without_databases(),
+        );
+        let ThumbnailResponse::Success { webp_bytes } = response else {
+            panic!("RAW without preview must use its saved page row: {response:?}");
+        };
+        let image = image::load_from_memory(&webp_bytes).unwrap();
+        assert_eq!((image.width(), image.height()), (8, 8));
+        assert_eq!(
+            catalog
+                .load_one("chapter/page.cr2")
+                .unwrap()
+                .unwrap()
+                .jpeg_data,
+            before.jpeg_data
+        );
+    }
+
+    #[test]
     fn remote_pages_survive_catalog_open_failure() {
         let data_dir = crate::data_dir::TestDataDirGuard::new();
         initialize_remote_page_edit_databases();
