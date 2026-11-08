@@ -18,13 +18,19 @@ struct Frames {
     /// The field's own galley and where it was painted in the latest pass.
     painted: Option<(egui::Pos2, std::sync::Arc<egui::Galley>)>,
     labels: Vec<(String, egui::Rect)>,
-    last_press: Option<egui::Pos2>,
 }
 
 impl Frames {
     fn new(query: &'static str, ppp: f32) -> Self {
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
+        // EpiIntegration supplies real time, but these tests exercise only
+        // single clicks/drags. mIV applies the OS delay at context creation,
+        // not on each App frame, so these overrides remain in effect.
+        ctx.options_mut(|options| {
+            options.input_options.max_click_duration = f64::INFINITY;
+            options.input_options.max_double_click_delay = 0.0;
+        });
         Self {
             backend: eframe::HeadlessEpiIntegration::new(ctx.clone()),
             ctx,
@@ -34,7 +40,6 @@ impl Frames {
             copied: Vec::new(),
             painted: None,
             labels: Vec::new(),
-            last_press: None,
         }
     }
 
@@ -81,16 +86,9 @@ impl Frames {
         }
     }
 
-    /// Press and release `button` at `pos`. The headless driver uses real time for
-    /// click counting, so a nearby earlier press first waits out the double-click window.
+    /// Press and release `button` at `pos`; fixture options make classification
+    /// independent of scheduler delays and proximity to earlier clicks.
     fn click(&mut self, app: &mut App, pos: egui::Pos2, button: egui::PointerButton) {
-        if self
-            .last_press
-            .is_some_and(|last| (last.x - pos.x).abs() < 8.0)
-        {
-            std::thread::sleep(std::time::Duration::from_millis(400));
-        }
-        self.last_press = Some(pos);
         self.tick(app, vec![egui::Event::PointerMoved(pos)]);
         self.tick(app, vec![pointer(pos, button, true)]);
         self.tick(app, vec![pointer(pos, button, false)]);
@@ -98,10 +96,6 @@ impl Frames {
     }
 
     fn drag(&mut self, app: &mut App, from: egui::Pos2, to: egui::Pos2) {
-        if self.last_press.is_some() {
-            std::thread::sleep(std::time::Duration::from_millis(400));
-        }
-        self.last_press = Some(from);
         self.tick(app, vec![egui::Event::PointerMoved(from)]);
         self.tick(app, vec![pointer(from, egui::PointerButton::Primary, true)]);
         for step in 1..=4 {

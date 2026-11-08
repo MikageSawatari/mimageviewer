@@ -1575,8 +1575,9 @@ mod accessibility_names_tests {
 
 /// 単一行 `TextEdit` に Windows 標準に近い右クリックメニューを追加する。
 ///
-/// メニューを開いたときの文字列と選択範囲を対象とする。項目のクリックで TextEdit が
-/// focus を失い、live selection が畳まれても、メニューの操作対象は変えない。
+/// 切り取り／コピー／貼り付けは、メニューを開いたときの文字列と選択範囲を対象とする。
+/// 項目のクリックで TextEdit が focus を失い、live selection が畳まれても対象を変えない。
+/// すべて選択は、操作時点の全文を対象とする。
 /// 戻り値はテキスト内容を変更したかどうか。
 #[allow(dead_code)]
 pub(crate) fn singleline_text_edit_context_menu(
@@ -1611,7 +1612,10 @@ pub(crate) fn singleline_text_edit_context_menu(
                     let target = SinglelineContextMenuTarget {
                         text: text.clone(),
                         selection: clamp_cursor_range(
-                            output.cursor_range.or_else(|| state.cursor.char_range()),
+                            // TextEdit updates state after pointer handling;
+                            // output.cursor_range still reflects keyboard/IME
+                            // handling before a same-pass pointer press/release.
+                            state.cursor.char_range().or(output.cursor_range),
                             char_count,
                         ),
                     };
@@ -1673,20 +1677,14 @@ pub(crate) fn singleline_text_edit_context_menu(
             ui.close();
         }
         if ui
-            .add_enabled(!target.text.is_empty(), egui::Button::new("すべて選択"))
+            .add_enabled(char_count > 0, egui::Button::new("すべて選択"))
             .clicked()
         {
             store_text_edit_cursor(
                 ui.ctx(),
                 id,
                 &state,
-                clamp_cursor_range(
-                    Some(CCursorRange::two(
-                        CCursor::new(0),
-                        CCursor::new(target.text.chars().count()),
-                    )),
-                    char_count,
-                ),
+                CCursorRange::two(CCursor::new(0), CCursor::new(char_count)),
             );
             output.response.request_focus();
             ui.close();
@@ -1757,6 +1755,10 @@ mod singleline_context_menu_tests {
             crate::ui_fonts::configure_fonts(&ctx);
             crate::ime_focus::install_ime_input_policy(&ctx);
             ctx.enable_accesskit();
+            ctx.options_mut(|options| {
+                options.input_options.max_click_duration = f64::INFINITY;
+                options.input_options.max_double_click_delay = 0.0;
+            });
             let mut field = Self {
                 ctx,
                 id: Id::unique("singleline-context-menu-test"),
@@ -1778,7 +1780,7 @@ mod singleline_context_menu_tests {
         }
 
         fn frame(&mut self, events: Vec<Event>) {
-            self.time += 0.05; // Each press/release stays below max_click_duration.
+            self.time += 0.05; // Advance animations; click classification ignores timing.
             let output = self.ctx.run_ui(
                 egui::RawInput {
                     time: Some(self.time),
@@ -1876,7 +1878,6 @@ mod singleline_context_menu_tests {
         }
 
         fn click(&mut self, pos: Pos2, button: PointerButton) {
-            self.time += 1.0; // Separate gestures without wall-clock sleeps.
             self.frame(vec![Event::PointerMoved(pos)]);
             self.frame(vec![pointer(pos, button, true)]);
             self.frame(vec![pointer(pos, button, false)]);
@@ -1884,7 +1885,6 @@ mod singleline_context_menu_tests {
         }
 
         fn drag_selection(&mut self) {
-            self.time += 1.0;
             let from = self.position(3);
             let to = self.position(6);
             self.frame(vec![Event::PointerMoved(from)]);
@@ -1981,6 +1981,45 @@ mod singleline_context_menu_tests {
     }
 
     #[test]
+    fn singleline_context_menu_same_pass_secondary_uses_post_pointer_state() {
+        for (index, inside) in [(4, true), (7, false)] {
+            let mut field = Field::new();
+            field.drag_selection();
+            let before = field.range();
+            let pos = field.position(index);
+            field.frame(vec![Event::PointerMoved(pos)]);
+            // Both edges in one RawInput: the output range is from keyboard
+            // handling, but state already includes the pointer interaction.
+            field.frame(vec![
+                pointer(pos, PointerButton::Secondary, true),
+                pointer(pos, PointerButton::Secondary, false),
+            ]);
+            assert!(field.menu_open());
+            assert_eq!(field.output.as_ref().unwrap().cursor_range, Some(before));
+            let expected = if inside {
+                before
+            } else {
+                CCursorRange::one(CCursor::new(index))
+            };
+            assert_eq!(field.range(), expected);
+            let target = field.target().unwrap();
+            assert_eq!(target.selection, expected);
+            // This is also the range/start consumed by menu Paste; no OS
+            // clipboard fixture or global clipboard override is introduced.
+            assert_eq!(target.selection_for(&field.text), expected);
+            field.frame(vec![]);
+            assert_eq!(field.item_disabled("切り取り"), !inside);
+            assert_eq!(field.item_disabled("コピー"), !inside);
+            if inside {
+                field.click(field.item("切り取り"), PointerButton::Primary);
+                assert_eq!(field.text, "旅行  日本語");
+                assert_eq!(field.copied, ["abc"]);
+                field.assert_closed();
+            }
+        }
+    }
+
+    #[test]
     fn singleline_context_menu_secondary_reopen_captures_new_target() {
         let mut field = Field::new();
         field.open_selection_menu();
@@ -2000,7 +2039,7 @@ mod singleline_context_menu_tests {
     }
 
     #[test]
-    fn singleline_context_menu_select_all_uses_snapshot_and_restores_focus() {
+    fn singleline_context_menu_select_all_restores_focus_without_changed_flags() {
         let mut field = Field::new();
         field.open_selection_menu();
         field.click(field.item("すべて選択"), PointerButton::Primary);
@@ -2012,6 +2051,47 @@ mod singleline_context_menu_tests {
         assert!(field.copied.is_empty());
         assert!(field.changes.is_empty());
         assert!(field.ctx.memory(|memory| memory.has_focus(field.id)));
+        field.assert_closed();
+    }
+
+    #[test]
+    fn singleline_context_menu_select_all_includes_text_added_while_open() {
+        let mut field = Field::new();
+        field.open_selection_menu();
+        field.text.push_str(" 追加");
+        field.frame(vec![]);
+        assert_eq!(field.target().unwrap().text, TEXT);
+        assert!(field.item_disabled("切り取り"));
+        assert!(!field.item_disabled("すべて選択"));
+        field.click(field.item("すべて選択"), PointerButton::Primary);
+        assert_eq!(
+            field.range(),
+            CCursorRange::two(CCursor::new(0), CCursor::new(field.text.chars().count()))
+        );
+        assert!(field.changes.is_empty());
+        field.assert_closed();
+    }
+
+    #[test]
+    fn singleline_context_menu_select_all_enables_after_empty_target_is_typed_into() {
+        let mut field = Field::new();
+        field.text.clear();
+        field.frame(vec![]);
+        field.click(field.position(0), PointerButton::Secondary);
+        assert!(field.target().unwrap().text.is_empty());
+        assert!(field.item_disabled("すべて選択"));
+        field.frame(vec![Event::Text("入力".to_owned())]);
+        assert_eq!(field.text, "入力");
+        assert!(field.target().unwrap().text.is_empty());
+        assert!(!field.item_disabled("すべて選択"));
+        // The typed-text change is independent of the subsequent menu action.
+        field.changes.clear();
+        field.click(field.item("すべて選択"), PointerButton::Primary);
+        assert_eq!(
+            field.range(),
+            CCursorRange::two(CCursor::new(0), CCursor::new(2))
+        );
+        assert!(field.changes.is_empty());
         field.assert_closed();
     }
 
