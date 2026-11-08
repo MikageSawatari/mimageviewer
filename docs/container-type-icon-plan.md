@@ -258,14 +258,14 @@ ON の間も「代表サムネに固定」の操作は従来どおり使える (
 一覧 snapshot は `container_type_icon_loaded_grid_dark`、環境設定は
 `preferences_favorite_view_state_dark` を指定して生成・通常比較する。
 
-独立実装レビュー（GPT-6.1 Sol / xhigh）で、`contains_key` が実要求の終端後も
+実装担当の内部レビュー（GPT-6.1 Sol / xhigh）で、`contains_key` が実要求の終端後も
 `AwaitingArchiveJudgement` の受付枠を含むことを指摘された。keep の表示状態保護は
 実要求 ID の有無で判断し、受付枠は残すよう修正した。
 `container_type_icons_finished_deferred_slot_is_no_art_without_removing_admission_owner` で
 終端受信後の `NoArt` 化と受付枠保持を検査する。§4.2 の実要求の寿命契約に沿う修正であり、
 仕様変更はない。索引の「一覧読み直し」説明だけは旧案が残っていたため併せて修正した。
 
-独立実装レビューは修正再確認後 **ACCEPT**、未解決指摘なし。最終ソースの focused gate:
+実装担当の内部レビューは修正再確認後 **ACCEPT**、未解決指摘なし。最終ソースの focused gate:
 
 ```powershell
 cargo nextest run -p mimageviewer --lib -E 'test(/container_type_icon|container_icon_scroll|auto_aspect|thumbnail_request_lifecycle|settings_transfer::tests|thumbnail_type_icon/)'
@@ -318,3 +318,9 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
   自動比率の標本が判定に混入 → 判定時にも除外 (§4.3)。P3 スクロール計測の空 target で endpoint が欠ける・
   進行中の target が残る → endpoint を出す契約と進行中への適用を追記 (§4.3)。
 - r3 (同、resume): ACCEPT。追加指摘なし。
+- 実装レビュー (設計レビューと同じ独立担当、実装担当とは別、2026-11-09、`bb4c509a1..0c9b4003d` + マニュアル):
+  P3 1 件 (マニュアルの「代表画像の読み込みも行いません」「影響しません」が言い過ぎ) のみ。提案どおり
+  文言を直した (470db253a)。実装上の P1/P2 なし。
+- 最終確認 (ClaudeCode、2026-11-09): `test-lib-full.ps1` 16,791 件成功 (74 skipped)、
+  `cargo test --test ui_snapshot` 247 件成功、`scripts/test_analyze_perf.py` 106 件成功、
+  `check_ui_glyphs.py` 成功。製品の起動による確認は未実施 (利用者の実機確認待ち)。
