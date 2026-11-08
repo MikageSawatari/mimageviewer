@@ -39,6 +39,7 @@
 | [book-key-migration-plan.md](book-key-migration-plan.md) | §1.272/§1.273 本の並べ替え・移動/コピー・改名・削除と中央 DB の追従、§1.245 しおり番号の正本。設計 v4、§3.10 で実装中の判断を決定。単一 owner、FS 前の静止、STORES 方針列、移行元優先、service 内の本移動参照解除。別窓・Snapshot は作り直さず、旧 path 再照合の限界は §3.10。全件テスト・レビュー追補は §8.7、D2c は §8.8、削除 purge と XMP ★ import の取消境界は §8.9 |
 | [book-composition-plan.md](book-composition-plan.md) | §1.242 本の構成。B1採択設計とB2実装・検証の正本。方向・表紙・順序・hidden・ページ指定を保存し、通常builderで組を自動生成。旧units移行なし。Remoteの制限範囲・表示許可・位置・転送・出力・editor行高の受入条件を含む。旧G履歴は保持。画像folderは対象外でStored ZIPへ変換する。次のリリース向けnext-bookで開発 |
 | [image-folder-to-zip-plan.md](image-folder-to-zip-plan.md) | §1.242 の独立した画像folder→Stored ZIP変換の設計R3（対象7346683c6、独立レビューACCEPTは利用者報告）、実装中。画像タグのZIP本体集約、XMP評価補充、favorite表示状態FIFO、取消/完了選択、既存再帰範囲。2026-10-12利用者決定でCollectionは元参照を保持し、型拡張・容量検査・複製を除外。同名3択と旧ON→本表示/旧OFF→両方表示は決定済み |
+| [search-thumb-parent-catalog-plan.md](search-thumb-parent-catalog-plan.md) | §1.741 検索・★一覧・履歴など複数の親を並べる一覧で作ったピンなしの画像・ZIP・PDF の表紙を、親フォルダの通常 catalog に通常キー・通常署名で置く。検索は他の一覧の pool を借りず自分の pool を持つ。設計確定 (r5 ACCEPT)・実装未着手 |
 | [thumbnail-request-lifecycle-plan.md](thumbnail-request-lifecycle-plan.md) | §1.360 サムネイル要求とCPU画像の単一owner、保存/画像両終端、request ID相関、動画のidle/repaint/進捗投影、tray両測定、回帰・検証証拠 |
 | [section327-startup-window-flicker-investigation.md](section327-startup-window-flicker-investigation.md) | §1.327 起動時の白窓、native診断の採取・観測限界、利用者ログで確認した最大化起動の原因、採用したnormal表示後の一度だけの最大化 (§8)。大規模backend案 (§7) は将来候補 |
 | [notification-duration-policy.md](notification-duration-policy.md) | §1.402 成功通知の簡潔化と時間の全体設定。単一時間ポリシー、typedな種類、固定秒数/nativeの適用・例外と呼出元棚卸し |
