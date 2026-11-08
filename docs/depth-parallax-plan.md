@@ -1943,6 +1943,32 @@ Rust の差分は `src/ui_dialogs/about.rs` のライセンス案内の文言追
 | `git diff --check` | exit 0。stageされたファイルなし |
 
 `gen-changelog-html.py` は更新履歴、`gen-moire-sample.py` は画像素材を生成するため、依頼の範囲外として実行しない。
+
+#### 段 D の公開・検収 (2026-11-08、`dcabbd100`)
+
+- **独立レビュー** (GPT-6.1 Sol / xhigh、read-only、`git diff 0c988a36d dcabbd100`): P1〜P3 とも指摘なし。
+  公開文書の事実 (入口条件・F11/F12・パネル・書き出し・保存先・同意・既定キー・360°/Remote) がコードと一致、
+  privacy の日英が同内容、ライセンス表記が NOTICE と一致、release-checklist の手順が実物と整合。
+- 製品ページの安心欄で、Codex の差分が既存の AI 説明文へのリンクと「画像内の文字」の記述を削っていたため、
+  設計担当が元の文言に戻して 3D を足す形にした (コミット前に修正)。
+- **モデルの公開**: 利用者の承認 (2026-11-08) を受けて GitHub Release `depth-model-v1` を作成。
+  プレリリース・latest にしない、target は v5.0.0 (`446c59562`)。資産は `da3mono_large_fp16_504.onnx`
+  (671,032,016 B)、`LICENSE`、`NOTICE` (704 B、元モデル URL 訂正版)、`depth-model-index.json`。
+  公開前に元モデルのライセンスを再確認した: 公式 GitHub README の表・公式 Hugging Face
+  (`depth-anything/DA3MONO-LARGE`) のモデルカードとも Apache-2.0。変換元 SpatialHub の ONNX リポジトリは
+  見出しの license 欄が cc-by-nc-4.0 だが、本文で da3mono_large.onnx は Apache-2.0 を継承すると明記している
+  (Giant / Large だけが CC BY-NC)。この食い違いを示したうえで利用者が公開を判断した。
+- **サブ PC 確認依頼 21** (観測者: サブ PC 担当、ビルド `dcabbd100` の dev-runtime、モデルなしの隔離 data から実取得):
+  14 項目中 13 OK。同意画面の文言 (約 0.67 GB・Apache License 2.0・depth-model-v1・保存先)、
+  「今はしない」で何も作られない、途中取消で導入済みにならず次回は続きから再開 (`.partial` は完了後に消える)、
+  完了で自動入場しない・完了通知の文言、`packs/da3mono-large-fp16-504-0f5ff3be208d/` の内容と onnx の SHA-256 が
+  目録と一致、D で約 3 秒後に 3D が動く、再起動後は案内なしで入れる、環境設定からの削除と再導入、
+  バージョン情報の「3D 写真」節、ログに ERROR / WARN / panic なし。
+  - NG 1 件 (ダウンロード中に後ろのページが送れる) は、依頼文の期待が誤っていた。§3.3 のとおり
+    取得中は modeless で、`depth_management_modal_boundary_keeps_download_modeless` がこれを固定している。不具合ではない。
+  - 気づいた点: 環境設定の検索で枠が付いたとき、ライセンス行の末尾「)」が枠線に掛かって見えた。
+    文言と配置は AI 説明文 (リリース済み) の行と同じで、3D 固有ではない。段 D の対象外として残す。
+    取得完了後に `downloads/…` の空フォルダが残る点も VLM と共通の既存動作。
 製品起動・確認用build・stage・commitは行っていない。
 
 ## 13. まれな失敗の扱い
