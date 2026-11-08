@@ -1837,7 +1837,7 @@ impl App {
             {
                 DetachedBuild::Built(ViewerContextDescriptor::Zip {
                     path: openable.to_path_buf(),
-                    entry_name: None,
+                    target: crate::app::DetachedZipTarget::RootBook,
                     archive_source_override: None,
                 })
             }
@@ -1863,7 +1863,7 @@ impl App {
                 };
                 DetachedBuild::Built(ViewerContextDescriptor::Zip {
                     path: cached,
-                    entry_name: None,
+                    target: crate::app::DetachedZipTarget::RootBook,
                     archive_source_override: Some(source),
                 })
             }
@@ -4527,6 +4527,7 @@ mod tests {
             request_id: 77,
             lease: DetachedSessionLease { window_id: 80002 },
             source_path: PathBuf::from("other-context.zip"),
+            target: crate::app::DetachedZipTarget::RootBook,
             collection_restore: None,
         });
         assert!(app.claim_open_request_owner(Path::new("other-context.zip"), &owner));

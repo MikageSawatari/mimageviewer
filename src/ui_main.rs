@@ -17841,6 +17841,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             None
         };
         if activation_allowed {
+            if self.activate_main_zipdir(idx, ctx)
+                != crate::app::ZipDirActivationOutcome::NotApplicable
+            {
+                return nav;
+            }
             self.capture_main_list_restore_cursor();
             // ファイル名スタックの集約グリッドでメディアセルをダブルクリックしたら、フラット読書
             // フルスクリーンへ (スタック/単独画像/動画を直接開く)。コンテナは false で通常ナビへ。
@@ -17966,7 +17971,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 }
                 // ZipDir activation はキーボード・パッドと同じ入口で意図を決める。
                 Some(GridItem::ZipDir { .. }) => {
-                    let _outcome = self.activate_main_zipdir(idx);
+                    // Main activation was consumed before the generic detached router.
                 }
                 // ファイル名スタック (v2.0.0): 集約グリッドのセルは上の stack_try_open_from_grid
                 // で処理済み (フラットフルスクリーンへ)。非スタックモードでは Stack セルは存在

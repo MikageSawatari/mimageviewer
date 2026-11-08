@@ -8,6 +8,26 @@ pub(crate) struct ArchiveBookTarget {
     pub(crate) entry: ArchiveBookEntry,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DetachedZipTarget {
+    RootBook,
+    BookScope(ArchiveBookTarget),
+    RequiredPage { entry_name: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum ArchiveBookOpenOutcome {
+    Opened,
+    Waiting,
+    ScopeMissing,
+    ScopeChanged,
+    NoDisplayablePages,
+    Cancelled,
+    Stale,
+    Failed,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ArchiveBookEntry {
     Activation,
@@ -99,7 +119,11 @@ enum ArchiveLevelOpenIntent {
 impl App {
     /// The only producer of a chosen internal list. Programmatic ZIP navigation
     /// keeps its explicit-list/page-continuation intent and never calls here.
-    pub(crate) fn activate_main_zipdir(&mut self, idx: usize) -> ZipDirActivationOutcome {
+    pub(crate) fn activate_main_zipdir(
+        &mut self,
+        idx: usize,
+        ctx: &egui::Context,
+    ) -> ZipDirActivationOutcome {
         if self.projected_viewer_context_id() != self.viewer_context_main()
             || self.items_are_rating_view
         {
@@ -145,10 +169,7 @@ impl App {
         let mut destination = nav.clone();
         destination.choose_current_list(Some(self.selected_rows_below_view_top(idx)));
         destination.enter(&requested_prefix);
-        // S3 will route book candidates to a new independent bundle. S1 retains
-        // the released multi-window list navigation and never opens main fullscreen.
         let book_candidate = self.settings.effective_auto_fullscreen_zip_pdf()
-            && !self.settings.detached_viewer_open_images_in_window
             && destination
                 .tree
                 .node_at(destination.current())
@@ -172,6 +193,34 @@ impl App {
         } else {
             ArchiveLevelOpenIntent::List
         };
+        #[cfg(windows)]
+        if self.settings.detached_viewer_open_images_in_window {
+            match &intent {
+                ArchiveLevelOpenIntent::Book(target) => {
+                    let descriptor = ViewerContextDescriptor::Zip {
+                        path: destination.tree.zip_path.clone(),
+                        target: DetachedZipTarget::BookScope(target.clone()),
+                        archive_source_override: self.archive_source_override.clone(),
+                    };
+                    let opened = self.execute_detached_grid_item_open_plan(
+                        ctx,
+                        DetachedGridItemOpenPlan::Descriptor {
+                            descriptor,
+                            collection_restore: None,
+                        },
+                        None,
+                    );
+                    if !opened {
+                        self.show_feedback_warning(
+                            "内部の本を別ウィンドウで開けませんでした".into(),
+                        );
+                        return ZipDirActivationOutcome::Refused;
+                    }
+                    return ZipDirActivationOutcome::BookRequested;
+                }
+                ArchiveLevelOpenIntent::UnsupportedBook { .. } | ArchiveLevelOpenIntent::List => {}
+            }
+        }
         self.capture_main_list_restore_cursor();
         self.maybe_suppress_rating_filter_for_opened_zip_book(idx);
         self.accept_zip_level_navigation();
@@ -218,6 +267,51 @@ impl App {
             );
             ZipDirActivationOutcome::Refused
         }
+    }
+
+    pub(super) fn resolve_archive_book_nav(
+        tree: Arc<crate::zip_tree::ZipTree>,
+        logical_source: &Path,
+        target: &ArchiveBookTarget,
+    ) -> Result<crate::zip_tree::ZipNavState, ArchiveBookOpenOutcome> {
+        let parts = target
+            .requested_prefix
+            .trim_end_matches('/')
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if tree.raw_source().node_at(&parts).is_none() {
+            return Err(ArchiveBookOpenOutcome::ScopeMissing);
+        }
+        if tree.node_at(&parts).is_none() {
+            return Err(ArchiveBookOpenOutcome::NoDisplayablePages);
+        }
+        let nav = crate::zip_tree::ZipNavState::restore_prefix(tree, &target.requested_prefix)
+            .ok_or(ArchiveBookOpenOutcome::ScopeChanged)?;
+        let scope = crate::book_scope::BookScopeKey::archive(logical_source, nav.current_raw())
+            .map_err(|_| ArchiveBookOpenOutcome::ScopeChanged)?;
+        if scope != target.scope {
+            return Err(ArchiveBookOpenOutcome::ScopeChanged);
+        }
+        Ok(nav)
+    }
+
+    pub(super) fn finalize_archive_book_open_outcome(&mut self, outcome: ArchiveBookOpenOutcome) {
+        use ArchiveBookOpenOutcome::*;
+        crate::logger::log(format!("detached archive book open: {outcome:?}"));
+        let message = match outcome {
+            Opened | Waiting | Stale => return,
+            ScopeMissing | ScopeChanged => {
+                "書庫内の本が見つかりません。元の一覧を再読み込みしてください"
+            }
+            NoDisplayablePages => "この内部の本には表示できるページがありません",
+            Cancelled => "内部の本を開く操作を取り消しました",
+            Failed => "内部の本を別ウィンドウで開けませんでした",
+        };
+        self.show_feedback_warning(message.into());
+        #[cfg(windows)]
+        self.terminate_active_detached_open_before_viewport("archive_book_open_terminal");
     }
 
     pub(super) fn archive_book_target_is_current(&self, target: &ArchiveBookTarget) -> bool {

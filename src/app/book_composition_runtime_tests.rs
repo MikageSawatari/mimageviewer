@@ -1422,7 +1422,9 @@ fn g3_composition_poll_cannot_consume_source_owned_deferred_reopen() {
         let (source_sender, source_receiver) = mpsc::channel();
         env.zip_enumerate_pending = Some(ZipEnumeratePending {
             zip_path: root,
-            restore_intent: StartupListIntent::PageContinuation,
+            presentation: crate::app::ZipEnumerationPresentation::Existing(
+                StartupListIntent::PageContinuation,
+            ),
             input_seq: 0,
             cancel: Arc::new(AtomicBool::new(false)),
             rx: source_receiver,

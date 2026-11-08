@@ -7205,3 +7205,21 @@ HWND／rect 捕捉・placement 保存・timer は変更しない。新しい App
 linked F12 中の main activation と DFS の双方が対象で、保存拒否後の fallback は採用完了後に同 owner から再開する。
 旧採用の末尾が後発 reader を close する組合せを除き、新しい待機状態や viewport 側の条件分岐は加えない。
 検証結果は [内部本計画 §9](archive-inner-book-open-return-plan.md) に記録する。
+
+#### S3: 独立内部本のscope要求（2026-11-08、実装・自動検証完了）
+
+承認済みR4の構造合意に基づき、三入力の共通入口からmainを変えず既存plan実行へscope descriptorを渡す。
+`DetachedZipTarget` でroot／本scope／Required leafを区別し、列挙前にliteral prefixとraw scopeを解決する。
+`ZipEnumerationPresentation`→Live first-display→構成permissionへ同じrequestを移し、root予約を重複させない。
+Liveのresume fenceのsaved／unsavedも同requestが捕捉し、取消はそのleaseの列挙・sidecar・permissionを消費する。
+変換元を持つscopeとdirect RARは既存loading shell／archive ownerへ渡し、workerがcacheとRAR direct probeを解決する。
+完了は同じtargetを同じleaseへ戻す。初回失敗は既存 `terminate_active_detached_open_before_viewport`、
+staleは破棄し、mainや後発readerへの帰還・teardownを作らない。
+
+変更範囲はdescriptor producer／load、grid plan実行の共用、ZIP列挙・hydrationの要求所有、
+既存待機／取消述語、archive workerとconversion completion。registryの既存独立buildでChosenを消す規則を再利用する。
+新しいApp field、HWND／rect捕捉、viewport identity、registry transaction、placement保存、timerは変更しない。
+keepaliveの症状条件を足す修正ではなく、対象と寿命を既存ownerに一貫して持たせる構造修正である。
+実装レビュー・自動検証の結果は [内部本計画 §9](archive-inner-book-open-return-plan.md) に記録する。
+独立source追レビューはACCEPT（追加P1/P2なし）。Ready close／parkの2件、S1〜S3の110件、
+既存detached／close／archiveの1,085件が全成功。core check・fmt・glyph・検証用buildも成功し、製品は起動していない。

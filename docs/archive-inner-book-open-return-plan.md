@@ -42,6 +42,8 @@ Ctrl+↑↓ の探索順 (物理 DFS が内部 DFS より先) はこの設計の
   「この内部フォルダは本として開けないため、一覧を表示します」の情報通知を 1 回出す。
   既存の generation/token に対応する Unsupported 状態を記録し、後続 poll の構成警告と重複させない。
   利用者が選んだ事実である Chosen は維持する。他の本・親・先頭の子への fallback はしない。
+  S3 の複数窓でも、scope を生成できない候補は独立本として dispatch せず、この既存一覧終端を保つ。
+  独立 descriptor を生成した後の park／open 拒否は、その要求の終端として扱う。
 - 開く位置 (利用者採択で今回に含める):
   - 一覧からの直接表示は `book_open_resume`、内部本どうしの手動フルスクリーン DFS は `book_nav_resume` に従う
     (外側コンテナの Ctrl+↑↓ と同じ設定の意味)。スライドショーの自動本送りは先頭のまま。
@@ -1038,21 +1040,93 @@ R1最終検証（環境変数・既存回帰filterは上記S2最終検証と同�
 （exit 0）。v74のcore／Remoteとcompanionを `target/dev-runtime` に配置し、VCRT/PEチェックも成功
 （runtime=4、pe=5）。製品は起動していない。
 
+### S3 実装記録（2026-11-08、実装・自動検証完了・未コミット）
+
+- 三入力を汎用detached router／一覧出発記録より前の共通activationへ集め、本候補は既存plan実行へ渡す。
+  mainの階層・items・選択・位置・facet・★抑制・Chosenを変更しない。分岐／★固定は既存一覧移動。
+  scope非対応名は独立本の要求を作らず、S1の承認済み境界どおりChosen＋ExplicitList＋Info通知1回を保つ。
+- `DetachedZipTarget::{RootBook, BookScope, RequiredPage}` をdescriptor・変換ownerへ接続。
+  literal prefixを列挙完了後、初回materialize前に解決し、raw scope一致を検証する。root／Required leafの意味は維持する。
+- `ZipEnumerationPresentation::ArchiveBook` が要求を列挙中に所有し、installで
+  `FirstDisplayAction::ArchiveBook` へ移す。hydrationのLive fenceがsaved／unsavedを捕捉し、既存permissionへ渡す。
+  root用auto-open予約・外部deferred slotとの二重所有は作らない。初回取消は同leaseのsidecar要求も消費する。
+- `ArchiveBookOpenOutcome` で初回の結果を区別。消失・scope変更・表示ページなし・失敗は通知＋既存初回終端、
+  staleは破棄し後発readerを閉じない。scope workerのspawn失敗はログ＋通知で終え、UI同期列挙へ回復しない。
+- source/backingは最初のinstall前に渡す。aliasを持つscopeとdirect RARは実productionのarchive ownerへ渡し、
+  workerがcache／RAR direct probe／再変換を解決する。同じtargetとleaseをpassword／確認／変換完了まで保持する。
+  workerのcache採用は `lookup_with_visibility` とpolicy snapshotを使い、来歴が必要な旧cacheを迂回採用しない。
+- 新bundleは既存registry buildの規則で通常／退避stackともUnseen。独立closeはmain帰還を発行しない。
+  共有nested bytesの一括clearをscope openでは行わず、既存のarchive identity検証を使う。
+  HWND／rect、viewport identity、registry transaction、placement保存、timer、新しいApp fieldは変更しない。
+
+独立source reviewの初回はREVISE。productionの変換ownerへBookScopeを生成する接続不足と、
+非RAR workerへcache照会を広げた際のvisibility／origin条件の不足を修正した。
+追レビューはACCEPT（追加P1/P2なし）、所有境界に沿った構造修正であることにも合意。
+設計の前提矛盾はなく、既存workerの条件を維持した接続として実装した。
+
+新規headlessは三入力matrix、literal／prepared／raw collapse、resume設定、消失・変更・hidden、
+enum／hydration／構成待ち取消・遅着、実変換owner／password取消、park再open、main／兄弟／close不変を検査する。
+非RAR workerはcache hitが内容scanより先であることと、origin0旧cacheのnested除外時再変換・非削除を検査する。
+既存fixtureはtyped target／presentationとctx引数を型合わせした。
+既存 `section1675_unsafe_structural_prefix_keeps_existing_list_navigation` の通知件数だけは、S1限定の
+`auto && !multi_window` からS3の実効ページ表示設定へ更新する。複数窓でも本候補を判定するためInfoが1回必要となる。
+一覧・Chosen・非fullscreenのassertionは維持し、テストの削除・ignore追加・期待の弱体化はしていない。
+途中版の最初の実行は109件中104成功・5失敗（exit 100）。非対応prefixの旧拒否分岐を既存Listへ戻し、
+新規fixtureでは構成serviceの明示install、実park可能な兄弟の生成、hydrationとprojectionの待機境界を切り分ける。
+既存の動作期待を弱めず、確定sourceで指定filterを再実行する。最終結果は完了後に本節へ追記する。
+fixture修正後のfocused実行は8件中7成功・1失敗（exit 100）。残りは上記S1の通知件数であり、S3の契約へ更新した。
+
+S3最終検証（共通環境：`MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=1`、
+`TEMP`／`TMP` はworktreeの `target/codex-tmp`）：
+
+| コマンド | 結果 | exit code |
+|---|---|---|
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 成功 | 0 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/section1675_multiwindow_scope_no_main_return\|section1675_multiwindow_same_archive_sibling_unchanged/)'` | 2 passed、0 failed | 0 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/section167[56]/)'` | 110 passed、0 failed | 0 |
+| 下記の既存detached／close／archive回帰filter | 1,085 passed、0 failed | 0 |
+| `cargo fmt` / `cargo fmt --check` | 成功 | 0 |
+| `python scripts/check_ui_glyphs.py` | 危険glyph 0 | 0 |
+| `git -c core.safecrlf=false diff --check` | 成功 | 0 |
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/detached_|viewer_context_registry|section1670|multiwindow|zip_nav_back_selects_book_cell_left_from|zip_nav_ctrl_updown_|section1335_|section1328_|collection_zip_details_auto_close|everything_close_return|section1678_|close_return_tests|index_only|visibility_current_listing|visibility_live_page_index|archive_convert::|rar_archive_cache|book_resume|spread_shift_owner/)'
+```
+
+通常closeを初回Preparing取消と分けるため、実viewport描画完了consumerでReady／Activeへ進めるassertionを追加。
+兄弟のpark前とclose前にも同じ確認を入れ、補強後の確定sourceで上記2件・110件・1,085件をすべて再検証した。
+ログは `target/s3-core-final.log`、`target/s3-ready-close.log`、`target/s3-sections-verified.log`、
+`target/s3-regressions-verified.log`。全lib／workspace suiteと製品起動は実施しない。
+`powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-dev.ps1 -PreserveRuntime` も成功
+（exit 0）。coreとcompanionを `target/dev-runtime` に配置し、VCRT／PEチェック成功（runtime=4、pe=5）。
+製品は起動していない。変更は未コミットで設計担当の検収待ち。
+
+S3変更ファイル：
+
+- 製品コード：`src/app.rs`、`src/app/archive_inner_book.rs`、`src/app/sidecar_restore.rs`、
+  `src/app/gamepad_input.rs`、`src/ui_main.rs`、`src/app/startup_ops.rs`、`src/app/smart_folder.rs`、
+  `src/ui_dialogs/archive_convert.rs`。
+- テスト：`src/app/archive_inner_book_s3.rs`（新規）、`src/app/archive_inner_book_s2.rs`、
+  `src/app/book_composition_runtime_tests.rs`、`src/app/multiwindow_scenario_tests.rs`、`src/app/tests.rs`、
+  `src/app/tests/archive_inner_book_s1.rs`、`src/app/tests/ctrl_down_close_1678.rs`、
+  `src/app/tests/detached_binding_identity.rs`、`src/app/tests/startup_notices.rs`。
+- 文書：本書、`docs/virtual-folders.md`、`docs/nested-zip-tree-plan.md`、`docs/detached-rework-plan.md`。
+
 ## 10. 実装段階と規模
 
 | 段階・commit境界 | 内容 | 主な検証 |
 |---|---|---|
 | **S1：共通activationとmain帰還** | 採択済みOption A、Chosen、row anchor、通常／即時／early-return close、typed内部open継続。**内部本は先頭固定・resume の照会も保存もしない** | 現§8の入口・close・deep／collapse・専用帰路・linked／独立不変 |
 | **S2：内部resumeの保存契約（実装・自動検証完了）** | key helper、DB/writer adapter、read/write/fence、内部DFS、editor、Remote、maintenance、互換性 | §9の最終検証成功。保存開始とmaintenance対応を同じcoherent commitに含める |
-| **S3：複数窓の内部本open** | descriptor target、列挙前scope解決、source alias、hydration／構成／resume、conversion・初回終端 | 上記B全件、既存detached／RAR cache／Required leaf回帰 |
+| **S3：複数窓の内部本open（実装・自動検証完了）** | descriptor target、列挙前scope解決、source alias、hydration／構成／resume、conversion・初回終端 | §9の110件＋既存1,085件成功、未コミット |
 | **S4：統合受入** | docs／spec／manualの最終整合、必要な全体gate、検証build | S1〜S3の有効証跡を再利用し、統合差分と必須gateを検査 |
 
 各段階で独立レビューを行い、修正済みfindingの影響範囲だけを再検証する。S1単独を今回要求の完成・リリース可能状態とは扱わない。
 
 S1 本体は `875166c1b`、実装レビュー R1 の修正は `75f796a6e` に commit 済み。
 実装レビュー R2 の修正は `73a478805` に commit 済みで独立 ACCEPT。S2 本体は `e7804a2ea` に commit 済み。
-S2 レビュー R1 の版照合修正は未コミットで設計担当の検収待ち。
-S3／S4 は未着手。
+S2 レビュー R1 の版照合修正は `871439372` にcommit済みで独立ACCEPT。
+S3は実装・自動検証完了、未コミットで設計担当の検収待ち。S4は未着手。
 
 追加対象には `book_resume_key` 相当の共通module、`book_resume_db`、`rename_key_migration`、Remoteのcontainer/session/ui、descriptorを構築する `startup_ops`、archive conversion continuationを含む。
 

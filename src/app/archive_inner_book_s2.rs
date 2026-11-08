@@ -94,7 +94,7 @@ fn activate(app: &mut App, ctx: &egui::Context, prefix: &str, as_book: bool) {
     let index = child(app, prefix);
     app.selected = Some(index);
     assert_eq!(
-        app.activate_main_zipdir(index),
+        app.activate_main_zipdir(index, ctx),
         if as_book {
             ZipDirActivationOutcome::BookRequested
         } else {
@@ -470,7 +470,7 @@ fn section1675_inner_resume_fence_after_rapid_reopen() {
     app.settings.auto_fullscreen_zip_pdf = true;
     let index = child(&app, "A/");
     assert_eq!(
-        app.activate_main_zipdir(index),
+        app.activate_main_zipdir(index, &ctx),
         ZipDirActivationOutcome::BookRequested
     );
     app.poll_sidecar_restore(&ctx);

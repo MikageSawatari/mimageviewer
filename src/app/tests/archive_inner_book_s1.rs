@@ -78,7 +78,7 @@ fn child(app: &App, prefix: &str) -> usize {
 fn activate(app: &mut App, ctx: &egui::Context, prefix: &str, page: bool) {
     let index = child(app, prefix);
     app.selected = Some(index);
-    let result = app.activate_main_zipdir(index);
+    let result = app.activate_main_zipdir(index, ctx);
     if page {
         assert!(matches!(result, ZipDirActivationOutcome::BookRequested));
     } else {
@@ -242,7 +242,7 @@ fn section1675_cancel_index_preparation_does_not_reopen() {
         app.settings.auto_fullscreen_zip_pdf = true;
         let index = child(&app, "A/");
         assert!(matches!(
-            app.activate_main_zipdir(index),
+            app.activate_main_zipdir(index, &ctx),
             ZipDirActivationOutcome::BookRequested
         ));
         assert!(
@@ -669,7 +669,7 @@ fn section1675_projection_gates_open() {
         app.settings.auto_fullscreen_zip_pdf = true;
         let index = child(&app, "A/");
         assert!(matches!(
-            app.activate_main_zipdir(index),
+            app.activate_main_zipdir(index, &ctx),
             ZipDirActivationOutcome::BookRequested
         ));
         assert!(
@@ -729,7 +729,7 @@ fn section1675_cancel_composition_wait_does_not_reopen() {
         app.settings.auto_fullscreen_zip_pdf = true;
         let index = child(&app, "A/");
         assert!(matches!(
-            app.activate_main_zipdir(index),
+            app.activate_main_zipdir(index, &ctx),
             ZipDirActivationOutcome::BookRequested
         ));
         // Hold the real completion outside its owner, so the absence of a reply
@@ -824,7 +824,7 @@ fn section1675_obsolete_index_owner_cannot_replace_another_level_or_archive() {
         app.settings.auto_fullscreen_zip_pdf = true;
         let index = child(&app, "A/");
         assert!(matches!(
-            app.activate_main_zipdir(index),
+            app.activate_main_zipdir(index, &ctx),
             ZipDirActivationOutcome::BookRequested
         ));
         // Retain the actual old owner and worker reply channel outside App,
@@ -1283,7 +1283,7 @@ fn section1675_unsafe_structural_prefix_keeps_existing_list_navigation() {
                         .is_some()
                 );
                 let feedback = &app.feedback_toasts_for_test[feedback_start..];
-                let book_candidate = auto && !multi_window && !branch;
+                let book_candidate = app.settings.effective_auto_fullscreen_zip_pdf() && !branch;
                 assert_eq!(
                     feedback
                         .iter()
@@ -1294,7 +1294,7 @@ fn section1675_unsafe_structural_prefix_keeps_existing_list_navigation() {
                     usize::from(book_candidate)
                 );
                 if book_candidate {
-                    // The normal composition poll must reuse its Unsupported
+                    // The composition poll must reuse its Unsupported
                     // outcome, not publish a second warning for this generation.
                     assert!(
                         !feedback.iter().any(|(text, _)| text
@@ -2217,7 +2217,9 @@ fn section1676_pending_main_live_return_preserves_newly_active_sibling_session()
     assert!(app.start_active_detached_book_context(
         ViewerContextDescriptor::Zip {
             path: book.clone(),
-            entry_name: Some("B/001.png".into()),
+            target: crate::app::DetachedZipTarget::RequiredPage {
+                entry_name: "B/001.png".into(),
+            },
             archive_source_override: None,
         },
         &ctx,
@@ -2775,7 +2777,9 @@ fn section1676_sibling_reader_acceptance_keeps_main_issued_zip_authority() {
     assert!(app.start_active_detached_book_context(
         ViewerContextDescriptor::Zip {
             path: book,
-            entry_name: Some("B/001.png".into()),
+            target: crate::app::DetachedZipTarget::RequiredPage {
+                entry_name: "B/001.png".into(),
+            },
             archive_source_override: None,
         },
         &ctx,

@@ -103,6 +103,7 @@ pub(super) enum FirstDisplayAction {
     Zip {
         has_foreign_archives: bool,
     },
+    ArchiveBook(super::DeferredFsReopen),
     WarmPdf,
     Pdf {
         pages: crate::pdf_loader::PdfEnumerateResult,
@@ -143,7 +144,10 @@ pub(crate) struct SidecarLoadContinuation {
 
 impl SidecarLoadContinuation {
     fn fullscreen_reopen_pending(&self) -> bool {
-        match &self.navigation_after_hydration {
+        matches!(
+            self.first_display_action,
+            FirstDisplayAction::ArchiveBook(_)
+        ) || match &self.navigation_after_hydration {
             Some(super::MainListAfterHydration::Dfs { continuation, .. }) => {
                 continuation.fullscreen
             }
@@ -681,6 +685,14 @@ impl SidecarRestoreState {
             // A manual exact page open supersedes the automatic book demand.
             *after_prepare = IndexOnlyAfterPrepare::None;
         }
+        if let ContinuationOwner::Live(continuation) = &mut self.common.continuation
+            && matches!(
+                continuation.first_display_action,
+                FirstDisplayAction::ArchiveBook(_)
+            )
+        {
+            continuation.first_display_action = FirstDisplayAction::None;
+        }
         self.common.deferred_fullscreen = Some(DeferredFullscreen {
             idx,
             trigger,
@@ -825,7 +837,12 @@ impl App {
                 && match &state.common.continuation {
                     ContinuationOwner::Live(continuation) => continuation.items_len == self.items.len()
                         && !continuation.cancel.load(Ordering::Relaxed)
-                        && continuation.fullscreen_reopen_pending(),
+                        && continuation.fullscreen_reopen_pending()
+                        && match &continuation.first_display_action {
+                            FirstDisplayAction::ArchiveBook(deferred) => matches!(&deferred.target,
+                                DeferredFsTarget::CurrentArchiveBook(target) if self.archive_book_target_is_current(target)),
+                            _ => true,
+                        },
                     ContinuationOwner::IndexOnly { cancel, after_prepare: IndexOnlyAfterPrepare::OpenArchiveBook(deferred) } =>
                         !cancel.load(Ordering::Relaxed) && matches!(&deferred.target, DeferredFsTarget::CurrentArchiveBook(target) if self.archive_book_target_is_current(target)),
                     _ => false,
@@ -853,6 +870,12 @@ impl App {
         {
             // Drop the DFS tail as well: queued navigation must not restart a closed viewer.
             continuation.navigation_after_hydration = None;
+            if matches!(
+                continuation.first_display_action,
+                FirstDisplayAction::ArchiveBook(_)
+            ) {
+                continuation.first_display_action = FirstDisplayAction::None;
+            }
         }
     }
 
@@ -882,7 +905,7 @@ impl App {
         .then_some(deferred.idx)
     }
 
-    /// The accepted detached folder owns its first display until index/hydration completion.
+    /// The accepted detached book owns its first display until index/hydration completion.
     /// An ordinary grid, stale source, or discarded continuation cannot keep its shell alive.
     pub(crate) fn sidecar_restore_detached_auto_fullscreen_wait_active(&self) -> bool {
         self.sidecar_restore.as_ref().is_some_and(|state| {
@@ -890,8 +913,12 @@ impl App {
                 && matches!(&state.common.continuation,
                     ContinuationOwner::Live(continuation)
                         if continuation.detached_physical
-                            && matches!(continuation.first_display_action,
-                                FirstDisplayAction::AutoFullscreenFolder)
+                            && match &continuation.first_display_action {
+                                FirstDisplayAction::AutoFullscreenFolder => true,
+                                FirstDisplayAction::ArchiveBook(deferred) => matches!(&deferred.target,
+                                    DeferredFsTarget::CurrentArchiveBook(target) if self.archive_book_target_is_current(target)),
+                                _ => false,
+                            }
                             && continuation.items_len == self.items.len()
                             && !continuation.cancel.load(Ordering::Relaxed))
         })
@@ -1213,7 +1240,10 @@ impl App {
             {
                 // Acceptance consumes the older demand now. Cancelling this Rating target
                 // later must not revive first-display navigation at hydration completion.
-                if continuation.first_display_action == FirstDisplayAction::AutoFullscreenFolder {
+                if matches!(
+                    continuation.first_display_action,
+                    FirstDisplayAction::AutoFullscreenFolder | FirstDisplayAction::ArchiveBook(_)
+                ) {
                     continuation.first_display_action = FirstDisplayAction::None;
                 }
                 if matches!(
@@ -2683,7 +2713,14 @@ impl App {
         let continuation = state.common.continuation.take_live();
         let continuation_discarded = continuation.is_none();
         self.resume_metadata_transfer_context_readers();
-        if let Some(continuation) = continuation {
+        if let Some(mut continuation) = continuation {
+            if let FirstDisplayAction::ArchiveBook(deferred) =
+                &mut continuation.first_display_action
+            {
+                // Keep the request's saved/unsaved position from this hydration fence before
+                // first display can transfer it to composition or retire the fenced result.
+                self.capture_deferred_book_resume(deferred);
+            }
             self.resume_loading_items_after_sidecar(continuation);
         }
         for command in favorite_failures {

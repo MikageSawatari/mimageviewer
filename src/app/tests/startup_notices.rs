@@ -264,7 +264,9 @@ fn startup_notices_settings_and_list_exits_retire_enumeration_before_late_succes
                     input_seq: 1,
                     cancel: Arc::clone(&cancel),
                     rx,
-                    restore_intent: StartupListIntent::PageContinuation,
+                    presentation: crate::app::ZipEnumerationPresentation::Existing(
+                        StartupListIntent::PageContinuation,
+                    ),
                 });
                 cancel
             };

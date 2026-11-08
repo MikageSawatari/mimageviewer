@@ -4082,7 +4082,9 @@ impl App {
                 self.input_seq,
                 prepared,
                 authority,
-                super::StartupListIntent::InternalInstall,
+                super::ZipEnumerationPresentation::Existing(
+                    super::StartupListIntent::InternalInstall,
+                ),
                 prepared_visible,
             ),
             SmartPhysicalReady::Folder(_)

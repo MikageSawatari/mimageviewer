@@ -15631,7 +15631,9 @@ mod startup_open_path_resolve_tests {
                         cancel: std::sync::Arc::clone(&cancel),
                         rx,
 
-                        restore_intent: crate::app::StartupListIntent::ExplicitList,
+                        presentation: crate::app::ZipEnumerationPresentation::Existing(
+                            crate::app::StartupListIntent::ExplicitList,
+                        ),
                     });
                     app.pause_mounted_background_work_keep_current_frame();
                     assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
@@ -17994,6 +17996,7 @@ mod startup_open_path_resolve_tests {
             #[cfg(windows)]
             lease: crate::app::DetachedSessionLease { window_id: 8_589 },
             source_path: source.clone(),
+            target: crate::app::DetachedZipTarget::RootBook,
             collection_restore: None,
         };
 
@@ -49393,7 +49396,7 @@ mod favorite_adjustment_defaults_tests {
             input_seq,
             prepared,
             VisibleInstallAuthority::Ordinary,
-            StartupListIntent::ExplicitList,
+            ZipEnumerationPresentation::Existing(StartupListIntent::ExplicitList),
         );
         assert!(app.pending_rating_view_zipdir_open.is_none());
         app.finish_page_identity_preparation_for_test();
@@ -74066,6 +74069,7 @@ mod still_window_mode_key_tests {
             #[cfg(windows)]
             lease: crate::app::DetachedSessionLease { window_id },
             source_path: source.clone(),
+            target: crate::app::DetachedZipTarget::RootBook,
             collection_restore: None,
         };
         let (tx, rx) = mpsc::channel();
@@ -74145,7 +74149,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx,
 
-                restore_intent: crate::app::StartupListIntent::ExplicitList,
+                presentation: crate::app::ZipEnumerationPresentation::Existing(
+                    crate::app::StartupListIntent::ExplicitList,
+                ),
             });
             mounted.poll_zip_enumerate();
         })
@@ -74847,7 +74853,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             DetachedBuild::Built(DetachedGridItemOpenPlan::Descriptor {
                 descriptor: ViewerContextDescriptor::Zip {
                     path,
-                    entry_name: None,
+                    target: crate::app::DetachedZipTarget::RootBook,
                     archive_source_override: None,
                 },
                 ..
@@ -77055,7 +77061,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx: zip_rx,
 
-                restore_intent: crate::app::StartupListIntent::ExplicitList,
+                presentation: crate::app::ZipEnumerationPresentation::Existing(
+                    crate::app::StartupListIntent::ExplicitList,
+                ),
             });
         });
         run_active_detached_frame_for_test(&mut app, &ctx);
@@ -87800,7 +87808,9 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             )),
             None,
             VisibleInstallAuthority::Ordinary,
-            crate::app::StartupListIntent::ExplicitList,
+            crate::app::ZipEnumerationPresentation::Existing(
+                crate::app::StartupListIntent::ExplicitList,
+            ),
         );
 
         app.finish_page_identity_preparation_for_test();
@@ -99507,7 +99517,9 @@ mod smart_folder_transition_tests {
             cancel: std::sync::Arc::clone(&old_cancel),
             rx,
 
-            restore_intent: crate::app::StartupListIntent::ExplicitList,
+            presentation: crate::app::ZipEnumerationPresentation::Existing(
+                crate::app::StartupListIntent::ExplicitList,
+            ),
         });
 
         assert!(app.begin_smart_grid_container_navigation(
@@ -99563,7 +99575,9 @@ mod smart_folder_transition_tests {
             cancel: std::sync::Arc::clone(&old_cancel),
             rx,
 
-            restore_intent: crate::app::StartupListIntent::ExplicitList,
+            presentation: crate::app::ZipEnumerationPresentation::Existing(
+                crate::app::StartupListIntent::ExplicitList,
+            ),
         });
 
         assert!(app.begin_smart_grid_container_navigation(
@@ -99632,7 +99646,9 @@ mod smart_folder_transition_tests {
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rx,
 
-            restore_intent: crate::app::StartupListIntent::ExplicitList,
+            presentation: crate::app::ZipEnumerationPresentation::Existing(
+                crate::app::StartupListIntent::ExplicitList,
+            ),
         });
         app.poll_zip_enumerate();
         assert!(app.fs_navigation_sequence_owned_by_smart_folder());

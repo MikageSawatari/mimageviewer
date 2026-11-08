@@ -161,7 +161,7 @@ navigation でこの関数を呼ぶだけ (再列挙なし = in-memory)。見開
 - 状態リセット境界: 同一 ZIP 内のナビでは `ZipNavState.tree` を保持し再列挙しない。
   別 ZIP/フォルダへ出るときのみ `clear_nested_cache` + tree 破棄。
 
-§1.675/§1.676 S1・S2（実装・自動検証済み）:
+§1.675/§1.676 S1〜S3（実装・自動検証済み）:
 
 - 内部フォルダ／入れ子書庫とも「ページを表示」の実効値に従う。候補判定はメモリ上の直下ページ、
   最終判定は既存の index 準備と構成適用後の順序・可視集合を使う。表示可能なページがなければ
@@ -173,9 +173,16 @@ navigation でこの関数を呼ぶだけ (再列挙なし = in-memory)。見開
   構成採用前に同 request を既存 owner へ移し、採用の終了後に保存拒否の fallback／DFS 継続を再開する。
   editor・meter・Remote は同じキーを使う。管理移動はキーと PageIdentity を同時更新し、cache 再生成では保持する。
 - 直接表示候補は `PageContinuation`、一覧移動は `ExplicitList` で install する。取消は既存の
-  sidecar／構成継続を取消し、古い完了から開かない。複数ウィンドウモード・★固定中は一覧移動を維持する。
-- scope は本候補だけで検証する。非対応 prefix は Chosen を保った `ExplicitList`／`List` に終え、
-  ログ＋情報通知 1 回。設定 OFF／分岐等の非本候補は従来どおり一覧へ入る。
+  sidecar／構成継続を取消し、古い完了から開かない。★固定中は一覧移動を維持する。
+- S3 の複数ウィンドウでは、本候補は main を動かさず独立 bundle へ渡し、分岐だけを main で一覧移動する。
+  `DetachedZipTarget` が root／scope／Required leaf を区別し、scope は初回の一覧生成前に literal prefix で
+  復元して raw scope の一致を確認する。列挙 owner の要求は Live hydration→permission に一度ずつ移す。
+  saved／unsaved はその Live fence から捕捉する。消失・scope変更・全非表示・失敗は通知＋初回終端、staleは破棄。
+  変換の owner も同じ target／lease を保持し、workerでcache・RAR probeを解決する。独立closeはmainを変更しない。
+  同じ書庫を開く scope dispatch は共有nested bytesを一括clearせず、既存の書庫identityによる更新検証を使う。
+- scope は本候補だけで検証する。通常モードの非対応 prefix は Chosen を保った `ExplicitList`／`List` に終え、
+  ログ＋情報通知 1 回。scope を作れない候補は複数窓でも本として dispatch せず、この既存一覧経路を保つ。
+  設定 OFF／分岐等の非本候補は従来どおり一覧へ入る。
 - 共通入口だけが出発階層に `ZipListChoice::Chosen { rows_above }` を記録する。通常 close は現在本の
   最も深い記録済み祖先へ戻り、旧ページの teardown 後に一覧を作り、現在の本のセルと row anchor を復元する。
   close 受理時に帰還先を確定し、main context 専用の既存 teardown を使う。stale Live は帰還先だけを捨てて
