@@ -14,6 +14,8 @@ Ready の元 texture から GPU blit で `Rgba8Unorm` の色＋mipmapを作り�
 504×504入力と長辺最大1536のガイドだけを readback する。深度を `R16Float` に上げ、
 同じ表示 transform の fit / UV / 90度回転と下地を使って視差 callback を描く。
 元 texture 自体は書き換えず、final / processed の source ID を深度の鍵とする。
+透過部分の背景は3D中もShift+B／リングで切り替えられ、毎描画の `FsBgStyle` を下地へ反映する。
+AI拡大で背景を焼き込む場合は既存の合成キャッシュ失効によりsource IDが変わり、深度も作り直す。
 mouse / touch の zoom・pan と navigator は Depth 中だけ止め、通常2Dの transform は保持する。
 保存された Z の active / aiming は Depth 中に休止する。入力・cursor・chrome・PDF需要・描画の可否は
 保存flagではなく `fs_zoom_owner()` に基づく実効helperを使い、通常のtouchページ送りを止めない。

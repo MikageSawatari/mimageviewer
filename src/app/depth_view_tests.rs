@@ -1280,7 +1280,6 @@ fn depth_ring_dispatch_preserves_transforms_and_conflicting_modes() {
         RingActionId::ImageSlideshow,
         RingActionId::ImageZoomMode,
         RingActionId::ImagePixelGrid,
-        RingActionId::ImageBackgroundCycle,
         RingActionId::ImageComparePin,
         RingActionId::ImageFitModeCycle,
     ] {
@@ -1313,6 +1312,124 @@ fn depth_ring_dispatch_preserves_transforms_and_conflicting_modes() {
         matches!(&app.fs_exclusive_view, FsExclusiveView::Depth(state) if !state.panel_visible)
     );
     assert_eq!(app.settings.fullscreen_side_panel_mode, side_mode);
+}
+
+#[cfg(windows)]
+#[test]
+fn depth_background_cycle_key_and_ring_preserve_owner_and_alpha_rules() {
+    use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+    let _input_guard = crate::key_input::lock_test_input();
+    for ring in [false, true] {
+        for ai in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app_for_test();
+            install_pages(&mut app, &ctx);
+            depth(&mut app);
+            app.ai_upscale_enabled = ai;
+            let started = match &app.fs_exclusive_view {
+                FsExclusiveView::Depth(state) => state.started_at,
+                _ => unreachable!(),
+            };
+            let cycle = |app: &mut App| {
+                if ring {
+                    app.apply_ring_action(
+                        &ctx,
+                        RingShortcutContext::ImageFullscreen,
+                        RingActionId::ImageBackgroundCycle,
+                        "depth_background_test",
+                    );
+                } else {
+                    let modifiers = egui::Modifiers::SHIFT;
+                    ctx.begin_pass(egui::RawInput {
+                        events: vec![egui::Event::Key {
+                            key: egui::Key::B,
+                            physical_key: Some(egui::Key::B),
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                        }],
+                        ..Default::default()
+                    });
+                    let _ = app.handle_fs_key_input(&ctx, 0, false);
+                    ctx.end_pass().drop_without_applying_deltas();
+                }
+            };
+            // Opaque source: both entry points keep the existing guidance.
+            cycle(&mut app);
+            assert_eq!(app.fs_transparent_bg_mode, 0);
+            assert_eq!(
+                app.fs_feedback_toast.as_ref().unwrap().0,
+                "透過画像ではないため背景は切り替えできません"
+            );
+            let Some(FsCacheEntry::Static { pixels, .. }) = app.fs_cache.get_mut(&0) else {
+                unreachable!()
+            };
+            *pixels = Arc::new(egui::ColorImage::filled([2, 3], egui::Color32::TRANSPARENT));
+            let modulo = if ai { 2 } else { 3 };
+            for step in 1..=6 {
+                cycle(&mut app);
+                assert_eq!(
+                    app.fs_transparent_bg_mode,
+                    step % modulo,
+                    "ring={ring}, ai={ai}"
+                );
+                let FsExclusiveView::Depth(state) = &app.fs_exclusive_view else {
+                    panic!("background cycling must not end Depth")
+                };
+                assert_eq!(state.started_at, started);
+                assert!(app.depth_view_may_continue(0));
+            }
+        }
+    }
+    crate::key_input::clear_test_frame();
+}
+
+#[cfg(windows)]
+#[test]
+fn depth_background_change_preserves_panorama_key_suppression_and_existing_ring_behavior() {
+    use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+    let _input_guard = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let mut app = setup_app_for_test();
+    install_pages(&mut app, &ctx);
+    app.fullscreen_idx = Some(2);
+    let Some(FsCacheEntry::Static { pixels, .. }) = app.fs_cache.get_mut(&2) else {
+        unreachable!()
+    };
+    *pixels = Arc::new(egui::ColorImage::filled([2, 1], egui::Color32::TRANSPARENT));
+    app.set_fs_exclusive_view(
+        FsExclusiveView::Panorama(crate::panorama::PanoramaState::new(
+            0.0,
+            0.0,
+            crate::panorama::PanoProjection::Perspective,
+        )),
+        "background_panorama_test",
+    );
+    assert!(app.is_panorama_mode_active(2));
+    let modifiers = egui::Modifiers::SHIFT;
+    ctx.begin_pass(egui::RawInput {
+        events: vec![egui::Event::Key {
+            key: egui::Key::B,
+            physical_key: Some(egui::Key::B),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }],
+        ..Default::default()
+    });
+    let _ = app.handle_fs_key_input(&ctx, 2, false);
+    ctx.end_pass().drop_without_applying_deltas();
+    assert_eq!(app.fs_transparent_bg_mode, 0);
+    // Baseline 58816f030 never blocked Panorama's direct ring dispatch.
+    app.apply_ring_action(
+        &ctx,
+        RingShortcutContext::ImageFullscreen,
+        RingActionId::ImageBackgroundCycle,
+        "background_panorama_test",
+    );
+    assert_eq!(app.fs_transparent_bg_mode, 1);
+    assert!(app.is_panorama_mode_active(2));
+    crate::key_input::clear_test_frame();
 }
 
 #[test]
@@ -1563,6 +1680,118 @@ fn set_depth_wait_age(app: &mut App, age: std::time::Duration) {
         panic!("depth fixture");
     };
     state.wait_started_at = std::time::Instant::now() - age;
+}
+
+#[cfg(windows)]
+#[test]
+fn depth_background_cycle_actual_viewer_updates_underlay_and_retires_replaced_material() {
+    use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+    std::thread::spawn(|| {
+        let _input_guard = crate::key_input::lock_test_input();
+        let mut app = setup_app_for_test();
+        let viewer = DepthWaitViewerFixture::new(&mut app);
+        let Some(FsCacheEntry::Static { pixels, .. }) = app.fs_cache.get_mut(&0) else {
+            unreachable!()
+        };
+        *pixels = Arc::new(egui::ColorImage::filled([2, 3], egui::Color32::TRANSPARENT));
+        let key = viewer.source_key_and_register_backing(&mut app);
+        let render = app.wgpu_render_state.clone().unwrap();
+        let backing = render.renderer.read().texture(&key.texture_id).unwrap().texture.clone().unwrap();
+        let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+            unreachable!()
+        };
+        let map = crate::depth_estimation::DepthMap {
+            key, width: 2, height: 3,
+            values: vec![half::f16::from_f32(0.5); 6], median: 0.5,
+        };
+        state.lru.insert(key, Arc::new(crate::depth_parallax_wgpu::DepthTexture::upload(
+            &render.device, &render.queue, map,
+        ).unwrap()));
+        state.select_source(&render.device, &render.queue, &backing, key).unwrap();
+        let resource_id = state.ready().unwrap().resource_id;
+        let cycle = |app: &mut App| {
+            app.apply_ring_action(&viewer.ctx, RingShortcutContext::ImageFullscreen,
+                RingActionId::ImageBackgroundCycle, "depth_background_actual_viewer");
+        };
+        for mode in [0, 1, 2, 0] {
+            assert_eq!(app.fs_transparent_bg_mode, mode);
+            viewer.frame(&mut app);
+            let FsExclusiveView::Depth(state) = &app.fs_exclusive_view else {
+                panic!("background cycling ended Depth")
+            };
+            assert_eq!(state.ready().unwrap().resource_id, resource_id);
+            let quad = app.fullscreen_page_layout.single_page().unwrap().transform.paint_quad();
+            let shapes = viewer.shapes.borrow();
+            assert!(shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Callback(_))),
+                "the actual viewer must submit the depth callback");
+            if mode == 2 {
+                let checker = app.fs_checker_texture.as_ref().unwrap().id();
+                assert!(shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Mesh(mesh)
+                    if mesh.texture_id == checker && mesh.vertices.iter().map(|v| v.pos).collect::<Vec<_>>() == quad.positions)));
+            } else {
+                let color = if mode == 1 { egui::Color32::WHITE } else { egui::Color32::BLACK };
+                assert!(shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Path(path)
+                    if path.fill == color && path.points == quad.positions)));
+            }
+            drop(shapes);
+            cycle(&mut app);
+        }
+        // Supply a real final-AI output shape without running an inference model.
+        // Merely setting the legacy flag leaves the no-effect source shared.
+        app.ai_upscale_enabled = true;
+        app.settings.ai_feature_mode = crate::settings::AiFeatureMode::HighQuality;
+        let params = crate::adjustment::AdjustParams {
+            upscale_model: Some("realesr_general_v3".into()),
+            ..Default::default()
+        };
+        app.adjustment_page_params.insert(0, params.clone());
+        app.clear_adjustment_caches(0);
+        let ai_key = app.final_ai_key_for_pixels(app.current_edit_result_key(0), [2, 3], &params).unwrap();
+        assert_eq!(ai_key.bg, 1);
+        let ai_pixels = Arc::new(egui::ColorImage::filled([4, 6], egui::Color32::WHITE));
+        app.final_ai_cache.insert(ai_key, FinalAiEntry {
+            diagnostic_metadata: None, canonical_dims: None, source_size: [2, 3],
+            pixels: ai_pixels.clone(), used_upscale: true,
+        });
+        let baked = app.ensure_final_composite_material(&viewer.ctx, 0).unwrap();
+        let baked_key = crate::depth_estimation::DepthSourceKey { texture_id: baked.source_texture().id() };
+        assert_ne!(baked_key, key);
+        render.renderer.write().update_texture(&render.device, &render.queue, baked_key.texture_id,
+            &egui::epaint::ImageDelta::full((*ai_pixels).clone(), Default::default()));
+        let baked_backing = render.renderer.read().texture(&baked_key.texture_id).unwrap().texture.clone().unwrap();
+        let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else { unreachable!() };
+        state.lru.insert(baked_key, Arc::new(crate::depth_parallax_wgpu::DepthTexture::upload(
+            &render.device, &render.queue, crate::depth_estimation::DepthMap {
+                key: baked_key, width: 4, height: 6, values: vec![half::f16::from_f32(0.5); 24], median: 0.5,
+            },
+        ).unwrap()));
+        state.select_source(&render.device, &render.queue, &baked_backing, baked_key).unwrap();
+        let baked_resource_id = state.ready().unwrap().resource_id;
+        viewer.frame(&mut app);
+        assert!(matches!(&app.fs_exclusive_view, FsExclusiveView::Depth(state)
+            if state.ready().unwrap().key == baked_key));
+        assert!(!app.final_composite_cache.is_empty());
+        cycle(&mut app);
+        assert!(app.final_composite_cache.is_empty());
+        assert!(app.final_ai_cache.is_empty());
+        viewer.frame(&mut app);
+        assert!(app.fs_exclusive_view.is_depth());
+        let replacement = app.ensure_final_composite_material(&viewer.ctx, 0).unwrap();
+        assert_ne!(replacement.source_texture().id(), baked_key.texture_id);
+        let FsExclusiveView::Depth(state) = &app.fs_exclusive_view else { unreachable!() };
+        if let Some(ready) = state.ready() {
+            // A failed lazy runtime may select a stable no-AI fallback from the LRU.
+            assert_eq!(ready.key.texture_id, replacement.source_texture().id());
+            assert_ne!(ready.resource_id, baked_resource_id);
+        } else {
+            assert!(!viewer.shapes.borrow().iter().any(|shape| matches!(&shape.shape, egui::Shape::Callback(_))),
+                "a replaced source must not paint the old depth resource");
+        }
+        let renderer = render.renderer.read();
+        let slot = renderer.callback_resources.get::<crate::depth_parallax_wgpu::DepthRenderResourcesRef>();
+        assert_ne!(slot.map(|slot| slot.0.resource_id), Some(baked_resource_id));
+        crate::key_input::clear_test_frame();
+    }).join().unwrap();
 }
 
 #[cfg(windows)]

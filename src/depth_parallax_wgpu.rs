@@ -959,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn depth_gpu_transparency_matches_2d_white_and_checker_underlays() {
+    fn depth_gpu_transparency_matches_2d_changing_underlays_without_rebuilding_resources() {
         use crate::egui037_stage4_gpu_tests::{OffscreenGpu, assert_rgba};
         use crate::ui_fullscreen::{paint_image_underlay, transparent_bg_style};
         let mut gpu = OffscreenGpu::new();
@@ -1009,7 +1009,8 @@ mod tests {
         // Upload the managed source before creating the real depth resources.
         render_egui_frame(&mut gpu, &ctx, size, |_| {});
         let job = install_two_depth_planes(&mut gpu, source.id(), &transform);
-        for mode in [1, 2] {
+        // Reuse the same source, depth, callback and uniforms across background changes.
+        for mode in [0, 1, 2, 0] {
             let underlay = transparent_bg_style(mode, Some(&checker));
             let two_d = render_egui_frame(&mut gpu, &ctx, size, |painter| {
                 paint_image_underlay(painter, transform.paint_quad(), &underlay);
@@ -1028,7 +1029,10 @@ mod tests {
             // absent underlay, wrong blend/alpha, or accidental sRGB transform.
             assert_rgba(three_d[16 * 80 + 10], [13, 23, 37, 255]);
             assert_rgba(three_d[48 * 80 + 32], [128, 128, 128, 255]);
-            if mode == 1 {
+            if mode == 0 {
+                assert_rgba(three_d[16 * 80 + 32], [0, 0, 0, 255]);
+                assert_rgba(three_d[32 * 80 + 32], [64, 32, 16, 255]);
+            } else if mode == 1 {
                 assert_rgba(three_d[16 * 80 + 32], [255, 255, 255, 255]);
                 assert_rgba(three_d[32 * 80 + 32], [191, 159, 143, 255]);
             } else {

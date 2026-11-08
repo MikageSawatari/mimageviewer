@@ -430,6 +430,100 @@ pub enum DepthSourcePhase {
   CLAUDE.md「Detached viewer リワーク中のルール」に従い、**ClaudeCode と Codex の双方のレビューで
   症状パッチではない構造的な変更だと合意**し、detached-rework-plan.md §11 に記録する。
 
+#### 6.4.1 MainWindow 対応の設計案 (2026-11-08、未採択・未実装)
+
+対象は **メイン context の `MainWindow` と `Fullscreen`**。`DetachedWindow` と独立 context は
+引き続き対象外で、§6.4 の複数 viewer・GPU slot・worker・park/fork の理由を変更しない。
+以下は設計担当の判断用の案であり、現行の入口・presentation 確定点・描画コードは変更していない。
+参照行は基点 `58816f030`（関数名を追跡の正本とする）。
+
+**描画までの経路と依存先**
+
+| 対象 | MainWindow で通る経路／参照 | 全画面への依存・設計上の扱い |
+| --- | --- | --- |
+| 入口と継続 | `app/depth_view.rs::depth_entry_allowed`:123、`depth_view_may_continue`:156 | 現在 `main_presentation` が Fullscreen 限定。メイン context かつ MainWindow / Fullscreen の共通許可条件へ拡張する。単ページ・静止画・編集・wgpu 等の他条件は維持 |
+| F11 / F12 の表示確定 | F11: `ui_fullscreen.rs`:36329 → `native_video.rs::toggle_egui_viewer_window_mode_for_input`:5229 → `toggle_still_window_mode`:5170 → `depth_view.rs::commit_viewer_presentation`:171。F12: `app.rs::apply_egui_viewer_presentation_for_current_item`:91808 → 同じ確定点 | `viewer_presentation` と `native_video_in_window_active` が既存経路で更新される。Depth 用の別 viewport や表示切替 owner は作らない |
+| 静止画 canvas | `ui_fullscreen.rs::fullscreen_embedded_still_active`:32568、`render_fullscreen_viewport_with_root_input`:27376 / `render_fs_body` 呼出し:30172 | MainWindow は root の CentralPanel、Fullscreen は `show_viewport_immediate(fs_id, ...)`。**同じ render_fs_body** を通る。静止画は native fullscreen video presenter / D3D11 HWND を使わない |
+| 表示素材・Depth 描画 | `ui_fullscreen.rs::resolve_fs_processed_payload_and_depth`:13268 → `advance_depth_source`:28777 → `draw_fs_image_with_receipt` → `try_paint_depth`:44604、`depth_view.rs`:252 | 素材選択・fit transform・UV・回転・下地は共通。Depth は表示画素の texture ID を使い、fullscreen の面積を素材 key に含めない。各 pass 先頭:27387 と描画直前:44603 の継続照合は両方残す |
+| GPU と callback_resources | `depth_view.rs::enter_depth_parallax`:234 / `try_paint_depth`:323、`depth_parallax.rs::attach_renderer` / `publish` / `Drop` | `App.wgpu_render_state.renderer` が所有し、OS 窓ごとの renderer ではない。slot は context と resource ID で照合。サイズ変更だけなら色・深度資源は共用可能。別 context への譲渡はしない |
+| worker の wake | `depth_view.rs::advance_depth_source`:411、`depth_estimation.rs` の要求 viewport、`depth_parallax.rs::advance`:395 | `ctx.viewport_id()` を要求に捕捉して完了時にその viewport を起こす。MainWindow で新規開始すれば ROOT。継続案では、旧 viewport 宛ての実行中要求を切替後どう起こすかの設計が必要 |
+| パネルと入力除外 | `depth_view.rs::draw_depth_panel`:362、`ui_depth_parallax.rs::draw_depth_parallax_panel_with_export`:32、`ui_fullscreen.rs`:28356 / 39988 | 現在の `ctx.content_rect()` 内に右パネルを配置し、`depth_panel_rect` を同じ ctx の一時データへ記録。MainWindow も同じ関数。移行時は前 viewport の rect を移植せず、新しい pass で描いてから canvas 入力を判定 |
+| 待機表示 | `ui_fullscreen.rs::draw_depth_wait_indicator`、`app/depth_view.rs::depth_wait_status` | 現在の page transform / content rect から領域を求め、上部160pt・下部48pt・表示中パネルを避ける。専用 viewport ID 固定ではない。小窓の実描画でパネルとの非交差・取消表示を検証 |
+| キー・リング・pointer | `ui_fullscreen.rs::handle_fullscreen_root_key_input`:33766、`handle_fs_key_input_with_operation`、`gamepad_input.rs::apply_ring_action` | embedded では root 側 shortcut probe は処理を委譲し、viewer 本体が同じ ROOT のキーを処理する。Grid 用入力へ落とさない。Viewer の surface / owner gate を維持し、F11・D・I/Tab・Shift+B・ページ送りを各1回だけ受理 |
+| マウス追従 | `depth_view.rs::try_paint_depth`:284、`depth_parallax.rs::MouseFollow::update`:116 | 現在 ctx の `hover_pos` と `transform.paint_rect` は同じ論理座標。OS screen 座標や専用 fullscreen rect に変換しない。パネル上で凍結、窓外では中央へ戻す。リサイズ後は新しい fit rect を使う |
+| カーソル自動非表示 | `ui_fullscreen.rs::fs_ui_is_clean`:51284、`update_fullscreen_cursor_visibility`:33615、呼出し:30079 | 現行 MainWindow 閲覧も同じ仕組みで現在の `ctx.viewport_id()` を対象にする。modalはcleanを偽にするが、`DepthViewState.panel_visible` はこの関数で直接参照していない。パネル表示だけで非表示を止めるとは断定せず、実効挙動を検証する。今回の案では独自の非表示規則を加えず、既存入力境界を維持 |
+| 書き出しの表示と前面 | `viewer_chrome.rs::draw_viewer_shared_dialogs`:396 → `depth_export.rs::draw_depth_export_dialog`:793、`ui_fullscreen.rs`:29868、`ui_depth_export.rs::draw`:66 | canvas 描画後に capture・open・dialog 描画までを同じ viewer ctx で実行。MainWindow も ROOT 内でここを通る。root tail は embedded 時 early return (`app.rs`:99967) するため、tail に追加してはいけない。backdrop と Foreground Window の `set_sublayer` / `move_to_top` を維持し、パネルより前面にする |
+| modal の止め方 | `app.rs::common_modal_dialog_open`:23988 / `modal_dialog_block_reason` の depth_export、`document_open_modal_admission_blocked`:42338、`depth_export.rs::admit_depth_export`:670 | Settings〜Finished の operation がある間は共通 modal。キー・wheel・canvas・リングの既存 modal gate を使う。Remote の local modal lease は窓によらず取得〜dismiss まで保持。関連付け・D&D・単一起動等の開く要求も受付停止。外クリックは backdrop が所有し、背面へ渡さない |
+
+**表示切替の組合せを先に減らす**
+
+| 案 | 資源・状態と利点 | 失われる使い勝手／費用 |
+| --- | --- | --- |
+| 1: MainWindow ⇔ Fullscreen の実際の切替で Depth を終了し、D で再入場 | 共通確定点で既存 setter を通して終了。推論取消・slot 破棄・旧 viewport の wake の移管を扱わずに済む。終了後は通常2Dの既存 F11 経路だけになる | 切替後に D がもう1回必要。**深度 LRU は DepthViewState 所有で Drop される** (`depth_parallax.rs`:283 / 294 / 488)。新しい D は `new` で空 LRU、readback と推論をやり直す。表示側の色テクスチャが残っていても「キャッシュで即復帰」とは言えない。動きの時刻・mouse offset・panel の開閉も新規状態になる（Settings の値は残る） |
+| 2: 同じ Depth を継続 | context が同じで renderer も共通なので、Ready の色・深度・LRU、Settings、panel_visible、動きの時刻を保持できる。fit / UV / aspect は次 pass の transform から再計算。切替のための再推論と D の手間が無い | ReadingBack / Estimating での切替も普通に起きる。worker 完了の repaint 宛先が旧 viewport に固定されており、現在は移管が無い。パネル rect・pointer・表示 snapshot は新 viewport で描き直す必要がある。Ready だけを扱って継続できたとする実装にはできない |
+
+**推奨は案1**。表示切替中の pending 推論の宛先移管を新設せず、既存の終了経路で組合せを減らせる。
+現行 Fullscreen → MainWindow も Depth を終了するので、その方向の挙動を悪化させない。
+逆方向にも同じ規則を適用する。ただし新たに使える MainWindow から全画面へ広げる際にも D と再推論が要る。
+この操作負担を受け入れるかは**設計担当の判断待ち**。採択前に実装しない。案2を選ぶなら worker の完了通知先と
+表示切替 owner の接続を別の設計レビュー対象とし、単なる追加 repaint・継続不能 guard で隠さない。
+同じ presentation への再確定は切替でなく、Depth を終了しない。
+
+**MainWindow 特有の組合せ（案1を採る場合）**
+
+| 操作・状態 | 扱い |
+| --- | --- |
+| サイドバー・グリッド | 同時表示を新設しない。現行 embedded 閲覧は main の menubar / toolbar / grid を描かず early return (`app.rs`:99954)。Depth を許すために一覧や通常全画面の機能を削る必要はない。閲覧内の補正・metadata・navigator等は§6.5どおり、I/Tabは3Dパネルのみ |
+| リサイズ・最大化 | そのまま。色・深度の key はサイズ非依存。新しい content rect / fit transform / aspect を毎描画使用。PDF の既存再レンダリング等で**素材**が変わった場合のみ§4.1で新規推論 |
+| 最小化・非表示 | モードはそのまま、既存 `advance_depth_source` の非表示／minimized gate で poll・採用を休止。自動モーションの追加 repaint も抑止。復帰の通常 pass で再開。推論結果保持の新しい中間状態は作らない |
+| 別アプリへ切替 | 終了させない。非focusは最小化とは違い、現状は自動モーションが継続し得る。既存 focus / keyboard permit で他アプリの入力を受けないことを確認し、今回の拡張で休止規則は変更しない |
+| Esc・Enter・Backspace・一覧へ戻る | 既存の viewer close / return-to-list を通して Depth 終了 (`app.rs::close_fullscreen`:81688付近)。単に panel を隠して state を残さない。フォルダ移動も既存の終了・継続規則を維持 |
+| ページ一覧（O）、見開き・連結、編集、360° | ページ一覧は `page_overview_available` の占有中入場禁止を維持 (`app/page_overview.rs`:230付近)。Depth中はOを止める。既にページ一覧ならその実行可能キー集合にDは含めない。見開き・連結等へ状態が変わった場合は共通継続照合で終了。3Dから360°への切替を新しく許さない |
+| 書き出し Settings / Running / Finished | modal のまま。F11/F12・D・ページ移動・Shift+B・panel操作を止め、開く要求とRemote取得も拒否する。ROOT上のbackdrop＋dialogでpanel/canvasより前面を保証。native保存先選択もそのmodalの内側。外クリックでcanvasやpanelが動くならNG（依頼19 NG1と同じ受入条件） |
+
+**detached 述語に触れる範囲と合意後の記録案**
+
+- 入口 `DepthEntryInput.main_context / main_presentation` と `commit_viewer_presentation` の終了規則を、
+  同じ「メイン context かつ MainWindow / Fullscreen」の適格性へ接続する。許可集合を明記するので
+  `DetachedWindow` は引き続き除外される。context 比較を落としたり `!= DetachedWindow` だけにしない。
+  案1では適格性に加え「両表示間の実切替で終了」の規則が確定点に必要。
+- `fullscreen_embedded_still_active`、`render_fs_body` の root/child routing、
+  `handle_fullscreen_root_key_input`、`apply_egui_viewer_presentation_for_current_item` は読み取り監査対象。
+  それらの変更が必要になれば detached viewport 経路に触れる変更として扱う。
+  `reset_detached_pause_foreground_modes`、fork/park、bundle swap、window_id/HWND/placement は今回拡張しない。
+- CLAUDE.md「Detached viewer リワーク中のルール」と detached-rework-plan §2 の対象。
+  実装着手前に ClaudeCode と独立Codexレビューで、適格な単一contextの表示許可を広げる構造変更であり、
+  detached の症状を guard 等で隠す変更ではないと合意する。
+- 合意後に detached-rework-plan §11 へ記録する案: 日付・基点・合意者、変更した共通適格性と確定点、
+  MainWindow/Fullscreen許可・DetachedWindow/独立context拒否、案1の切替時終了、fork/park不変、
+  ROOT/child双方の照合・slot破棄・モーダルテストの証拠。**今回は§11へ追記しない**。
+
+**実装の分け方と受入テスト案**
+
+1. 設計担当が案1/2と操作負担を決定し、上記の構造合意を取る。現行§6.1/6.3/6.4の全画面限定を
+   採択した仕様へ更新してから、入口・確定点の共通適格性を一塊で実装する。
+   状態遷移テストは main × MainWindow/Fullscreen/DetachedWindow、独立contextの全表示、
+   同じpresentationへの再確定、F11両方向、F12両方向、close/fork/parkを含める。
+   案1ではpending取消・slot退役・D再入場で空LRUを確認。案2なら両方向×全source phaseの継続と
+   旧viewport完了通知から新viewportで無入力のReady到達までを受入条件にする。
+2. ROOT embedded の実viewer headless passで、入口直後と描画直前の照合、同pass内の動画・見開き等への変更、
+   不一致素材のcallback不送出、fit固定・下地・回転・リサイズ・panel rectを検査。
+   既存Fullscreenの入力・ページ送り・2D transform保存・推論/描画テストを再利用する。
+3. ROOTの本物のパネル/canvasを背面に、書き出し全phase・初回/後続pass・再open・形式変更を検査。
+   modalの外クリック・wheel・キー・リングで背面が変化せず、dialog内の操作だけが届くこと、
+   lease/開く要求拒否、UI snapshotと§7の凍結素材を検査。tailへ依存した二重描画を許さない。
+4. 1093×614 logical points と通常サイズ、UI倍率100%/200%で、右panelの×・書き出しボタン、
+   dialogの見出し・全固定操作行が収まり、必要時だけ本文scrollで末尾へ届くことをgeometryとsnapshotで確認。
+   リサイズ・最小化復帰・Alt+Tab・OS保存先dialogのowner/focusは、実装後の承認済みportable実機枠で確認する。
+   今回は実機起動もBのコード変更も行わない。
+
+まれな失敗は既定の割り切り（ログ＋通知）で閉じ、失敗別の回復設計は加えない。
+公開文書は段Dでまとめて更新する。現時点の `htdocs/mimageviewer/manual/` のgrepでは「3D 写真」の節自体が
+未追加だった。更新予定は `manual/fullscreen.html` の3D写真節（使用できる表示、F11、F12対象外、Dで再入場の有無、
+パネル・背景・書き出し）、`manual/shortcuts.html`（DとF11）、`manual/faq.html`（対応範囲）、
+`index.html` の3D紹介・対応表示説明。既存Creative 3D LUTの説明は別機能なので対象にしない。
+設計担当への未確定点は案1の再操作・再推論の許容、案2を求める場合のwake所有設計、段Dでの公開説明の採択。
+
 ### 6.5 他の機能との関係 — 「表示を占有するモード」を 1 つの述語にする
 
 360° が他の機能を止めている箇所 (調査では 30 か所余り: キー・編集ツールの入口・補正パネル・
@@ -461,6 +555,10 @@ pub enum DepthSourcePhase {
   クリック停止をDepthへ持ち込まない。判定は表示中のfit transformを使い、保存2D transformを変更しない。
 - 3D 中の左右パネルの表示切替 (I / Tab): **3D パネルの表示・非表示を切り替える**。他のパネルは
   3D 中は出ない。
+- **透過部分の背景切替 (Shift+B / ImageBackgroundCycle)**: Depth中も許可する（利用者決定2026-11-08）。
+  表示占有による制限ではなく、キーの抑止は360°固有に分類する。Panoramaの既存キー抑止は維持。
+  リングは基点でもPanoramaを抑止していないため、その既存挙動を維持する。AIアップスケール中は従来の黒/白2段と
+  表示キャッシュ失効を共用し、素材が変われば§4.1どおり深度も作り直す。書き出しの凍結は§7のまま。
 
 ## 7. 書き出し
 
@@ -776,10 +874,12 @@ P1/P2 残件なし。ClaudeCode の検収・利用者の実機確認は未実施
 #### §6.5 の全箇所分類表
 
 追補の入口監査では、キー以外の既存リング dispatch も調べた。段 B で追加する `Depth` のときだけ、
-`apply_ring_action` が slideshow / zoom / pixel grid / 背景切替 / 比較 pin を抑止し、metadata は
+`apply_ring_action` が slideshow / zoom / pixel grid / 比較 pin を抑止し、metadata は
 3D パネルの表示切替へ送る。キー・リング共通の `cycle_fullscreen_fit_mode` も Depth 中は変更しない。
 これにより非表示の 2D zoom / pan / 自由回転が fit 切替で初期化されない。
 既存 Panorama のリング挙動は今回の変更対象に広げていない。
+背景切替は2026-11-08利用者決定でDepthの抑止対象から外した。Panoramaのキー抑止と、
+元から抑止されていないリングの挙動は維持する。
 
 素材の追加監査では、local edit の materialization が未完了で final が `None` の間に、
 通常表示が raw 下地を返す経路を確認した。2D の fallback は維持し、深度素材だけ
@@ -822,7 +922,8 @@ P1/P2 残件なし。ClaudeCode の検収・利用者の実機確認は未実施
 | `ui_fullscreen.rs:51336,51420,51455,51481,51593` topbar restriction | 占有 | その他・編集・VST・slideshow 等の通常ボタンを抑止 |
 | `ui_fullscreen.rs:51315,51322` close、`51784,51815,51821` 360 button | 分岐＋360 | × の終了先と tooltip はモード別、360 の選択表示・投影操作は360固有 |
 | `ui_fullscreen.rs:34359,34531` Escape / early × | 分岐 | Depth の終了を panorama toggle へ渡さない |
-| `ui_fullscreen.rs:35908` と派生 `35915,35916,35918,35919,35920,35921,35922,35923,35924,35925` | 分岐 | Z/S/M/bg/grid/compare は占有制限、I は3D panel 切替。編集は共通入口へ通す |
+| `ui_fullscreen.rs:35908` と派生 `35915,35916,35918,35919,35920,35921,35922,35923,35924,35925` | 分岐 | Z/S/M/grid/compare は占有制限、I は3D panel 切替。編集は共通入口へ通す |
+| `ui_fullscreen.rs::handle_fs_key_input_with_operation` の `FsBgCycle`、`gamepad_input.rs::apply_ring_action` の `ImageBackgroundCycle` | 360（キー抑止）／通常操作（Depth） | 2026-11-08決定。Depthは下地を毎描画反映するため背景切替を許可。キーは `is_panorama_mode_active` だけで止める。Panoramaリングは基点でも許可されており変更しない |
 | `ui_fullscreen.rs:36011,36104` | 整理 | 前者は診断値、後者は未使用の `_pano_active_now`。機能 gate ではない |
 | `ui_fullscreen.rs:36647` Shift+V | 360 | 投影方式だけの操作。V の入場判定は Depth 中の入場を拒否 |
 | `ui_fullscreen.rs:28512` | 360 | panorama shader の paint。Depth shader は同じ通常描画境界で別に選ぶ |
@@ -1459,12 +1560,11 @@ fps、MP4 12Mbps、縦横比、書き出しの非永続性、既存のモーダ�
   phaseと画面寸法からResizeの割当を毎回固定し、操作行を既存のフォント／折返し計測で予約する。
   設定／終端は本文の親領域も明示確保する。短い進行表示の外形は従来どおり本文の自然高とする。
   追加のrepaintやstate消去では隠さない。
-- **注・Shift+B**: §6.5の「表示占有による制限」を実装した§10の分類表に、Depth中は背景切替を抑止することが
-  明記されている。`ui_fullscreen::handle_fs_key_input_with_operation` は `FsBgCycle` をconsumeした後、
-  `fs_exclusive_view_active` が返ると背景操作を無効化する。`apply_ring_action` の `ImageBackgroundCycle` も同じ。
-  キー到達のログだけが出て背景値が変わらない観測はこの規則と一致する。設計担当の指示「意図した抑止なら直さない」に従い変更しない。
-  背景だけを止める個別の描画上の必然性は既存文書にはない。下地自体は `try_paint_depth` へ毎描画渡す構造であり、
-  開始時の下地を描画側で固定しているためではない。書き出しは従来どおり要求作成時に下地を凍結する。
+- **注・Shift+B（2026-11-08利用者決定で更新）**: 依頼19の調査時は§6.5の占有制限をDepthにも適用していた。
+  背景だけを止める描画上の必然性は無く、利用者がDepth中の切替を許可したため、今回キーとリングの両方を通す。
+  キーは `is_panorama_mode_active` のみで抑止し、リングはDepth専用の拒否集合から背景切替を除く。
+  Panoramaのキー抑止は維持。Panoramaのリングは基点 `58816f030` でも背景切替を許可しており、変更していない。
+  下地は `try_paint_depth` へ毎描画渡し、書き出しは従来どおり開いた時の下地を保持する。
 
 独立Sol/xhighの実装前レビューは、NG1の層所有とNG2のサイズ決定を直す構造修正として合意。
 実Depthパネルとcanvasを背面にした入力、全phaseと再open、2160を含む素材、全形式、初回と後続frameのgeometry、
@@ -1552,6 +1652,74 @@ Shift+Bの注の指示元を利用者から設計担当（ClaudeCode）へ訂正
 変更ファイルは `src/ui_depth_export.rs`, `src/ui_depth_export_tests.rs`, 本書の3本。
 Shift+Bの挙動、PNG、他のダイアログの実装は変更していない。
 stage／commit／製品起動／build-devは指示どおり実施していない。全件gateはClaudeCode担当。
+
+#### 段 C 追補: Depth 中の背景切替 (2026-11-08、基点 `58816f030`)
+
+利用者決定に従い `handle_fs_key_input_with_operation` の背景キーの抑止を
+`is_panorama_mode_active` へ限定し、`apply_ring_action` のDepth拒否集合から
+`ImageBackgroundCycle` を外した。他の占有制限は変更していない。
+**前提との差**: Panoramaのキーは従来どおり停止するが、リングは基点でも停止していなかった。
+「Panoramaの既存挙動を変えない」を優先し、この差を回帰テストに明示した。
+
+素材・下地の監査結果:
+
+- 通常の背景変更は `fs_bg_style` (`ui_fullscreen.rs`:49784付近) が現在値から下地を作り、
+  静止画描画:28778付近 → `draw_fs_image_with_receipt` → `try_paint_depth`
+  (`app/depth_view.rs`:252) が毎回受け取る。下地は `paint_image_underlay` でcallbackの直前に描く。
+  `DepthSourceKey` はtexture IDだけで、`DepthRenderParams`・GPU色/深度資源・LRUに下地を焼き込まない。
+  AI無効なら同じresource IDのままでよい。GPU回帰は同一callback・uniform・色/深度で
+  黒→白→市松→黒を描き、各下地の不透明/半透明画素を2Dと比較する。
+- AIアップスケール有効時の既存キー／リングは黒/白2段で、`clear_adjustment_caches`
+  (`app.rs`:93984) → `clear_final_pipeline_caches_for_idx_inner`:85120 を呼ぶ。
+  adjustment・final AI/composite・comic等の派生結果を失効し、pendingを取消す。
+  `final_ai_key_for_pixels`:87267 と `final_composite_key_for_pixels`:89011 はbgをkeyに含む。
+  実行側 `ai/final_pipeline.rs`:142付近は `background_mode` の黒/白へ合成してから拡大する。
+  再合成は `ctx.load_texture` で新規IDを作る (`app.rs`:90069 / 90356付近)。
+  `TextureHandle::set` の使用元も確認し、final/processedの同一ID更新は無く、該当した
+  `ui_adjustment_panel.rs`:8896 は編集パネルのmask preview用だった。
+- **深度推論はやり直しになる**。新規texture IDを `resolve_fs_processed_payload_and_depth`
+  (`ui_fullscreen.rs`:13268) がそのまま素材として返し、`DepthViewState::select_source`
+  (`depth_parallax.rs`:342) が旧slot/color/renderedを退役する。LRUは旧IDで新素材には一致しないためreadbackへ進む。
+  未完成の合成は `NotYet(IncompleteComposite)` → `wait_for_source`:329 で2D待機となる。
+  これは§4.1の「表示中の画素が変われば新規素材」に従う動作で、推論を省く変更は行わない。
+  ここでいう再推論は**実際に背景を焼き込んだAI出力が置換される場合**。AI有効フラグだけで処理が無く、
+  無変換素材の共有IDが保たれる経路では再推論は不要。同じ表示画素のkeyを維持するのも§4.1どおり。
+- **古い素材を参照したまま3Dを描かない**。`try_paint_depth`:275付近は現在payloadのtexture IDと
+  `resource.key.texture_id` が違えばcallbackを作らない。GPU callbackもcontext / key / resource IDを照合する。
+  旧深度がLRUに残っても表示中素材として使用されない。**3Dモード自体は終了しない**。
+  背景値やキャッシュ失効は入口・継続条件ではなく、素材の段階だけがReady→待機→新規Readyへ進む。
+- 書き出しは変更なし。`depth_export.rs::admit_depth_export`:670付近が開いた時のdisplay/settingsとleaseを持ち、
+  `ExportCapture::into_request`:547付近が下地を要求へ写す。Settings中の同一ページcapture更新は既存どおりだが、
+  `app.rs::modal_dialog_block_reason` の `depth_export` と `document_open_modal_admission_blocked`:42338、
+  `ui_fullscreen.rs`:34893付近のキー早期returnが背景変更・移動を止める。
+  Runningはその要求だけを見るため、書き出しとShift+Bの競合を新たに扱う必要はない。
+  既存の `depth_export_freezes_display_and_retains_modal_admission_until_dismissal` 等でlease/受付停止を確認。
+
+公開文書の監査は `htdocs/mimageviewer/manual/` に `3D` / `Shift.*B` を検索した。
+3D写真節は段Dで未追加のため今回同期すべきキー記述は無く、Creative 3D LUTの記述は別機能。
+既存の背景キー説明は今回の動作と矛盾しない。キー仕様と表示パイプラインの3D節を同期した。
+MainWindow案は§6.4.1だけに記録し、Bの製品コード・detached-rework-plan §11は変更していない。
+
+検証記録:
+
+- handler回帰2件を追加: キー／リング×AI有無の循環・不透明画像の同じ案内・Depth owner維持、
+  Panoramaの既存キー抑止／リング許可。既存GPU回帰1件を黒・白・市松の連続切替へ拡張。
+- 実child viewer回帰1件を追加: 毎passの下地shapeと同一Depth resource、AI有効cycleのfinal cache失効・
+  置換素材のtexture ID照合・旧GPU slot/callback退役を確認。実モデルは使わず、背景焼込み済みの
+  `FinalAiEntry` と既存fixtureの失敗済みlazy runtimeで隔離する。
+  初回はAI有効フラグだけでtexture IDの変更を期待して1件失敗した。無変換素材のID共有という正しい挙動だったため、
+  製品コードを変えず、実際に背景を焼き込んだAI結果を与えるfixtureへ修正した。
+- `cargo nextest run -p mimageviewer --lib -E 'test(/depth|background|bg_cycle|ring/)'`: **731件成功**。
+- 上記成功後に追加した実viewer回帰は `cargo nextest run -p mimageviewer --lib -E 'test(depth_background_cycle_actual_viewer)'`
+  で **1件成功**（fixture修正後、実行1.357秒）。既存731件の実行時から製品コードの追加変更はなく、結果を再利用した。
+- `cargo test -p mimageviewer --test ui_snapshot`: **245件成功**。
+- `cargo check -p mimageviewer --bin mimageviewer-core`: 成功（既存warningあり）。
+- ワークスペース全体の `cargo fmt`、`git diff --check`: 成功。
+  `python scripts/check_ui_glyphs.py`: dangerous glyph **0件**。
+- `MSBUILDDISABLENODEREUSE=1`。全件lib/full gateは指示どおり未実施。
+  build-dev・製品起動・stage・commitも行わない。UI文言の追加変更はない。
+- 独立GPT-6.1 Sol / xhighレビュー: BのF11参照誤りを訂正し、未解決指摘なし。
+  Bの採択とdetached構造合意は別途ClaudeCodeの判断待ち。
 
 ## 11. テスト
 

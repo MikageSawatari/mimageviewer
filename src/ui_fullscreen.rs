@@ -36042,8 +36042,9 @@ impl App {
         let key_b_bg =
             !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsBgCycle);
         // 360 モード中は他モード切替系のキーを抑止 (= フィードバック反映の「機能制限モード」)。
-        // - 抑止対象: Z (分析) / S (スライドショー) / M (ルーペ) / B (bg cycle)
+        // - 抑止対象: Z (分析) / S (スライドショー) / M (ルーペ)
         //   / G (ピクセルグリッド) / I (メタデータ) / C 系 (比較)
+        //   / Shift+B (背景切替。360° だけで止め、3D では許可する)
         // - E / Ctrl+G / Ctrl+M / Ctrl+T は各編集モードの共通入口まで通し、
         //   そこで理由付き no-op にする。
         // - 抑止しない: V (= 360 を抜ける手段)、Esc / 矢印 / Wheel / F1-F5 / BS (= ナビ・レーティング)
@@ -36064,7 +36065,8 @@ impl App {
         let key_s = key_s && !pano_active_now;
         let key_e = key_e_raw;
         let key_m = key_m && !pano_active_now;
-        let key_b_bg = key_b_bg && !pano_active_now;
+        // 透過部分の下地は3Dでも毎描画反映する。背景切替の抑止は360°固有。
+        let key_b_bg = key_b_bg && !self.is_panorama_mode_active(fs_idx);
         let key_g = key_g && !pano_active_now;
         let key_i = key_i && (!pano_active_now || self.fs_exclusive_view.is_depth());
         let key_compare_x = key_compare_x && !pano_active_now;

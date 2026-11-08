@@ -8103,7 +8103,6 @@ impl App {
                 RingActionId::ImageSlideshow
                 | RingActionId::ImageZoomMode
                 | RingActionId::ImagePixelGrid
-                | RingActionId::ImageBackgroundCycle
                 | RingActionId::ImageComparePin => return None,
                 _ => {}
             }
