@@ -20,8 +20,8 @@ INPUT_SHAPES = {
     "extrinsics_in": (1, 1, 4, 4),
     "intrinsics_in": (1, 1, 3, 3),
 }
-NOTICE = """Depth Anything 3 Mono-Large (DA3-MONO-LARGE)
-Original model: https://huggingface.co/depth-anything/DA3-MONO-LARGE
+NOTICE = """Depth Anything 3 Mono-Large (DA3MONO-LARGE)
+Original model: https://huggingface.co/depth-anything/DA3MONO-LARGE
 Original project: https://github.com/ByteDance-Seed/Depth-Anything-3
 ONNX export: https://huggingface.co/SpatialHub/depth-anything-3-onnx
 Source file: da3mono_large.onnx (with its external tensor data)
