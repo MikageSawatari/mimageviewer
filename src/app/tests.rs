@@ -2,6 +2,573 @@
 use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, PresentationRequest};
 use super::*;
 
+pub(crate) fn assert_cache_book_cover_only_worker_catalog_contract(
+    app: &mut App,
+    directory: &Path,
+) {
+    section1452_book_cover_cache::assert_worker_catalog_contract(app, directory);
+}
+
+mod section1452_book_cover_cache {
+    use super::*;
+    use crate::settings::CachePolicy;
+    use std::io::Write;
+
+    fn fixture_zip(path: &Path) {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            12,
+            8,
+            image::Rgba([20, 80, 200, 255]),
+        ))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        for name in ["root.png", "chapter/page.png", "other/page.png"] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(png.get_ref()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    fn request(app: &App, item: &GridItem, stamp: (i64, i64)) -> LoadRequest {
+        make_load_request(
+            item,
+            0,
+            stamp.0,
+            stamp.1,
+            false,
+            None,
+            Some(crate::settings::SortOrder::Numeric),
+            3,
+            &app.folder_pin_map,
+            &Default::default(),
+            None,
+            item.drag_source_path().and_then(Path::parent),
+            app.folder_thumb_pin_db.as_deref(),
+            None,
+            false,
+        )
+        .unwrap()
+    }
+
+    fn render_result() -> crate::pdf_loader::RenderResult {
+        crate::pdf_loader::RenderResult {
+            image: image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                12,
+                8,
+                image::Rgba([180, 60, 20, 255]),
+            )),
+            content_type: crate::pdf_loader::PdfPageContentType::Vector,
+            page_count: 2,
+            page_size_points: crate::pdf_loader::PdfPageSizePoints {
+                width: 120.0,
+                height: 80.0,
+            },
+        }
+    }
+
+    fn process(
+        request: &mut LoadRequest,
+        catalog: &Arc<crate::catalog::CatalogDb>,
+        map: &std::sync::RwLock<HashMap<String, crate::catalog::CacheEntry>>,
+        decision: CacheDecision,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        let done = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(Mutex::new(crate::stats::ThumbStats::default()));
+        let keep_start = Arc::new(AtomicUsize::new(0));
+        let keep_end = Arc::new(AtomicUsize::new(1));
+        let is_pdf = request.pdf_page.is_some();
+        let mut run = || {
+            crate::thumb_loader::process_load_request(
+                request,
+                map,
+                &tx,
+                Some(catalog),
+                64,
+                75,
+                64,
+                decision,
+                &done,
+                &stats,
+                None,
+                &keep_start,
+                &keep_end,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        if is_pdf {
+            crate::thumb_loader::with_test_pdf_render_result(render_result(), run);
+        } else {
+            run();
+        }
+        let messages: Vec<_> = rx.try_iter().collect();
+        assert!(
+            messages.iter().any(|message| matches!(
+                message.payload,
+                crate::thumb_loader::ThumbMsgPayload::SourcePixels(_)
+            )),
+            "the generated page must still reach display"
+        );
+        assert!(messages.iter().any(|message| message.is_finalized()));
+        assert_eq!(done.load(Ordering::Relaxed), 1);
+    }
+
+    pub(super) fn assert_worker_catalog_contract(app: &mut App, directory: &Path) {
+        assert!(app.settings.cache_book_cover_only);
+        let parent = directory.join("book-cover-contract");
+        std::fs::create_dir_all(&parent).unwrap();
+        let zip_path = parent.join("book.zip");
+        fixture_zip(&zip_path);
+        let pdf_path = parent.join("book.pdf");
+        std::fs::write(&pdf_path, b"fake renderer fixture").unwrap();
+        let cache_dir = directory.join("contract-catalogs");
+        let parent_db = Arc::new(crate::catalog::CatalogDb::open(&cache_dir, &parent).unwrap());
+        for (path, page, cover) in [
+            (
+                zip_path.clone(),
+                GridItem::ZipImage {
+                    zip_path: zip_path.clone(),
+                    entry_name: "root.png".into(),
+                },
+                GridItem::ZipFile(zip_path),
+            ),
+            (
+                pdf_path.clone(),
+                GridItem::PdfPage {
+                    pdf_path: pdf_path.clone(),
+                    page_num: 0,
+                    content_type: None,
+                },
+                GridItem::PdfFile(pdf_path),
+            ),
+        ] {
+            let catalog = Arc::new(crate::catalog::CatalogDb::open(&cache_dir, &path).unwrap());
+            let map = std::sync::RwLock::new(HashMap::new());
+            let mut page_req = request(app, &page, (77, 123));
+            let page_key = crate::thumb_loader::cache_key_for_request(&page_req)
+                .unwrap()
+                .into_owned();
+            process(
+                &mut page_req,
+                &catalog,
+                &map,
+                CacheDecision::from_settings(&app.settings),
+            );
+            assert!(catalog.load_one(&page_key).unwrap().is_none());
+            assert!(map.read().unwrap().is_empty());
+            assert_eq!(
+                catalog
+                    .load_source_dims_matching(77, 123)
+                    .unwrap()
+                    .get(&page_key),
+                Some(&Some((12, 8)))
+            );
+            let mut cover_req = request(app, &cover, (88, 456));
+            let cover_key = crate::thumb_loader::cache_key_for_request(&cover_req)
+                .unwrap()
+                .into_owned();
+            process(
+                &mut cover_req,
+                &parent_db,
+                &std::sync::RwLock::new(HashMap::new()),
+                CacheDecision::from_settings(&app.settings),
+            );
+            assert!(parent_db.load_one(&cover_key).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn cache_book_cover_only_seed_preserves_dimensions_and_off_keeps_existing_seed() {
+        let mut app = setup_app_for_test();
+        let cache_dir = crate::catalog::default_cache_dir();
+        let webp =
+            crate::catalog::encode_thumb_webp(&image::DynamicImage::new_rgb8(8, 12), 64, 75.0)
+                .unwrap()
+                .0;
+        for enabled in [true, false] {
+            for extension in ["pdf", "zip", "cbz"] {
+                let parent = app.tmp.path().join(format!("seed-{enabled}-{extension}"));
+                std::fs::create_dir_all(&parent).unwrap();
+                let path = parent.join(format!("book.{extension}"));
+                std::fs::write(&path, b"current document").unwrap();
+                let is_pdf = extension == "pdf";
+                let key = if is_pdf {
+                    crate::grid_item::pdf_page_cache_key(0)
+                } else {
+                    "root.png".into()
+                };
+                let prefix = if is_pdf {
+                    crate::thumb_loader::CACHE_KEY_PDF
+                } else {
+                    crate::thumb_loader::CACHE_KEY_ZIP
+                };
+                let parent_key = format!("{prefix}book.{extension}");
+                let parent_db = crate::catalog::CatalogDb::open(&cache_dir, &parent).unwrap();
+                parent_db
+                    .save_thumb_bytes(&parent_key, 1, 2, Some((8, 12)), &webp)
+                    .unwrap();
+                let catalog = crate::catalog::CatalogDb::open(&cache_dir, &path).unwrap();
+                catalog
+                    .save_page_dims(&key, 40, 80, Some((12, 8)), Some((120_000, 80_000)))
+                    .unwrap();
+                let map = Arc::new(std::sync::RwLock::new(catalog.load_all().unwrap()));
+                assert!(map.read().unwrap().is_empty());
+                app.settings.cache_book_cover_only = enabled;
+                app.items = vec![if is_pdf {
+                    GridItem::PdfPage {
+                        pdf_path: path.clone(),
+                        page_num: 0,
+                        content_type: None,
+                    }
+                } else {
+                    GridItem::ZipImage {
+                        zip_path: path.clone(),
+                        entry_name: key.clone(),
+                    }
+                }];
+                app.setup_virtual_folder_seed_and_writeback(&path, &catalog, &map);
+                let wb = app
+                    .virtual_folder_writeback
+                    .as_ref()
+                    .expect("writeback target remains prepared under either setting");
+                assert_eq!(wb.target_key, key);
+                assert_eq!(wb.parent_key, parent_key);
+                assert_eq!(wb.items_gen, app.items_generation);
+                assert_eq!(catalog.load_one(&key).unwrap().is_some(), !enabled);
+                assert_eq!(map.read().unwrap().contains_key(&key), !enabled);
+                if enabled {
+                    assert_eq!(
+                        catalog.load_source_dims_matching(40, 80).unwrap()[&key],
+                        Some((12, 8))
+                    );
+                    assert_eq!(catalog.load_source_dims().unwrap()[&key], Some((12, 8)));
+                } else {
+                    let seed = catalog.load_one(&key).unwrap().unwrap();
+                    assert_eq!(seed.jpeg_data, webp);
+                    assert_eq!((seed.mtime, seed.file_size), (1, 2));
+                    assert_eq!(catalog.load_source_dims().unwrap()[&key], Some((8, 12)));
+                    assert!(
+                        catalog
+                            .load_source_dims_matching(40, 80)
+                            .unwrap()
+                            .is_empty()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cache_book_cover_only_preserves_existing_pages_and_saves_replacement_pins() {
+        let mut app = setup_app_for_test();
+        app.settings.cache_policy = CachePolicy::Always;
+        let parent = app.tmp.path().join("cover-pins");
+        std::fs::create_dir_all(&parent).unwrap();
+        let zip_path = parent.join("book.zip");
+        fixture_zip(&zip_path);
+        let cache_dir = app.tmp.path().join("catalogs");
+        let catalog = Arc::new(crate::catalog::CatalogDb::open(&cache_dir, &zip_path).unwrap());
+        let map = std::sync::RwLock::new(HashMap::new());
+        let page = GridItem::ZipImage {
+            zip_path: zip_path.clone(),
+            entry_name: "root.png".into(),
+        };
+        let mut req = request(&app, &page, (4, 8));
+        process(
+            &mut req,
+            &catalog,
+            &map,
+            CacheDecision::from_settings(&app.settings),
+        );
+        let before = catalog.load_one("root.png").unwrap().unwrap();
+        let mut edited = app.settings.clone();
+        edited.cache_book_cover_only = true;
+        app.install_preferences_settings(edited);
+        let reopened = std::sync::RwLock::new(catalog.load_all().unwrap());
+        catalog
+            .delete_missing(
+                &[
+                    "root.png".to_owned(),
+                    "chapter/page.png".to_owned(),
+                    "other/page.png".to_owned(),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap();
+        assert_eq!(
+            catalog.load_one("root.png").unwrap().unwrap().jpeg_data,
+            before.jpeg_data
+        );
+        // Regenerate the same page under ON: existing WebP remains byte-for-byte intact.
+        req.source_policy = crate::thumb_loader::LoadSourcePolicy::SourceOnly;
+        process(
+            &mut req,
+            &catalog,
+            &reopened,
+            CacheDecision::from_settings(&app.settings),
+        );
+        assert_eq!(
+            catalog.load_one("root.png").unwrap().unwrap().jpeg_data,
+            before.jpeg_data
+        );
+        let parent_db = Arc::new(crate::catalog::CatalogDb::open(&cache_dir, &parent).unwrap());
+        let cover = GridItem::ZipFile(zip_path.clone());
+        let mut keys = Vec::new();
+        for entry in ["root.png", "chapter/page.png"] {
+            app.folder_pin_map.insert(
+                crate::path_key::normalize_keep_drive(&zip_path),
+                crate::folder_thumb_pins::source_from_grid_item(
+                    &zip_path,
+                    &GridItem::ZipImage {
+                        zip_path: zip_path.clone(),
+                        entry_name: entry.into(),
+                    },
+                )
+                .unwrap(),
+            );
+            let mut req = request(&app, &cover, (9, 10));
+            let key = crate::thumb_loader::cache_key_for_request(&req)
+                .unwrap()
+                .into_owned();
+            assert!(key.contains("#pin:"));
+            process(
+                &mut req,
+                &parent_db,
+                &std::sync::RwLock::new(HashMap::new()),
+                CacheDecision::from_settings(&app.settings),
+            );
+            assert!(parent_db.load_one(&key).unwrap().is_some());
+            keys.push(key);
+        }
+        assert_ne!(keys[0], keys[1]);
+    }
+
+    #[test]
+    fn cache_book_cover_only_writeback_requires_page_request_stamp() {
+        let mut app = setup_app_for_test();
+        app.settings.cache_policy = CachePolicy::Always;
+        let cache_dir = app.tmp.path().join("writeback-catalogs");
+        for (name, cover_only, old_webp, expect_copy) in [
+            ("changed.pdf", true, true, false),
+            ("refreshed.pdf", false, true, true),
+            ("direct.pdf", true, false, false),
+            ("valid.zip", false, true, true),
+        ] {
+            let path = app.tmp.path().join(name);
+            let pdf = name.ends_with("pdf");
+            if pdf {
+                std::fs::write(&path, b"new document stamp").unwrap();
+            } else {
+                fixture_zip(&path);
+            }
+            let catalog = Arc::new(crate::catalog::CatalogDb::open(&cache_dir, &path).unwrap());
+            let parent_db =
+                Arc::new(crate::catalog::CatalogDb::open(&cache_dir, app.tmp.path()).unwrap());
+            let page = if pdf {
+                GridItem::PdfPage {
+                    pdf_path: path.clone(),
+                    page_num: 0,
+                    content_type: None,
+                }
+            } else {
+                GridItem::ZipImage {
+                    zip_path: path.clone(),
+                    entry_name: "root.png".into(),
+                }
+            };
+            let key = if pdf {
+                crate::grid_item::pdf_page_cache_key(0)
+            } else {
+                "root.png".into()
+            };
+            let parent_key = format!(
+                "{}{}",
+                if pdf {
+                    crate::thumb_loader::CACHE_KEY_PDF
+                } else {
+                    crate::thumb_loader::CACHE_KEY_ZIP
+                },
+                name
+            );
+            if old_webp {
+                let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                    4,
+                    6,
+                    image::Rgba([0, 255, 0, 255]),
+                ));
+                let webp = crate::catalog::encode_thumb_webp(&image, 64, 75.0)
+                    .unwrap()
+                    .0;
+                catalog
+                    .save_thumb_bytes(&key, 1, 2, Some((4, 6)), &webp)
+                    .unwrap();
+            }
+            let map = Arc::new(std::sync::RwLock::new(catalog.load_all().unwrap()));
+            app.settings.cache_book_cover_only = cover_only;
+            app.items = vec![page.clone()];
+            app.image_metas = vec![Some((40, 80))];
+            app.virtual_folder_writeback = Some(VirtualFolderWriteback {
+                parent_catalog: Arc::clone(&parent_db),
+                parent_key: parent_key.clone(),
+                target_key: key.clone(),
+                target_idx: 0,
+                items_gen: app.items_generation,
+                cache_map: Arc::clone(&map),
+                parent_entry_mtime: 900,
+                parent_entry_size: 1000,
+            });
+            let mut req = request(&app, &page, (40, 80));
+            process(
+                &mut req,
+                &catalog,
+                &map,
+                CacheDecision::from_settings(&app.settings),
+            );
+            app.fire_virtual_folder_writeback_if_ready(0);
+            let copied = parent_db.load_one(&parent_key).unwrap();
+            assert_eq!(copied.is_some(), expect_copy, "{name}");
+            if let Some(copied) = copied {
+                assert_eq!((copied.mtime, copied.file_size), (900, 1000));
+                assert_eq!(copied.source_dims, Some((12, 8)));
+                assert_eq!(
+                    copied.jpeg_data,
+                    catalog.load_one(&key).unwrap().unwrap().jpeg_data
+                );
+            }
+            assert!(app.virtual_folder_writeback.is_none());
+        }
+    }
+
+    #[test]
+    fn cache_book_cover_only_zip_navigation_keeps_worker_snapshot_until_reopened() {
+        struct Workers {
+            cancel: Arc<AtomicBool>,
+            regular: Arc<NotifyQueue>,
+            heavy: Arc<NotifyQueue>,
+            receiver: mpsc::Receiver<crate::thumb_loader::ThumbMsg>,
+        }
+        impl Drop for Workers {
+            fn drop(&mut self) {
+                self.cancel.store(true, Ordering::Relaxed);
+                // Take each queue lock so cancellation cannot race the worker's wait.
+                for queue in [&self.regular, &self.heavy] {
+                    let _guard = queue.0.lock().unwrap();
+                    queue.1.notify_all();
+                }
+            }
+        }
+        fn spawn(app: &mut App, catalog: &Arc<crate::catalog::CatalogDb>) -> Workers {
+            let regular = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+            let heavy = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+            let cancel = Arc::new(AtomicBool::new(false));
+            let (sender, receiver) = mpsc::channel();
+            app.reload_queue = Some(Arc::clone(&regular));
+            app.heavy_io_queue = Some(Arc::clone(&heavy));
+            app.spawn_thumbnail_workers(
+                &sender,
+                Arc::clone(&cancel),
+                Arc::clone(&regular),
+                Arc::clone(&heavy),
+                Arc::new(std::sync::RwLock::new(catalog.load_all().unwrap())),
+                Some(Arc::clone(catalog)),
+                None,
+            );
+            Workers {
+                cancel,
+                regular,
+                heavy,
+                receiver,
+            }
+        }
+        fn finish_current_page(app: &App, workers: &Workers) -> String {
+            assert_eq!(app.items.len(), 1);
+            let mut req = request(app, &app.items[0], app.image_metas[0].unwrap());
+            req.items_gen = app.items_generation;
+            let key = crate::thumb_loader::cache_key_for_request(&req)
+                .unwrap()
+                .into_owned();
+            app.keep_start_shared.store(0, Ordering::Relaxed);
+            app.keep_end_shared.store(1, Ordering::Relaxed);
+            workers.regular.0.lock().unwrap().push(req);
+            workers.regular.1.notify_one();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                let message = workers
+                    .receiver
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap();
+                if message.is_finalized() {
+                    break;
+                }
+            }
+            key
+        }
+        let mut app = setup_app_for_test();
+        app.settings.cache_policy = CachePolicy::Always;
+        app.settings.parallelism = crate::settings::Parallelism::Manual(2);
+        let path = app.tmp.path().join("snapshot.zip");
+        fixture_zip(&path);
+        let entries = ["root.png", "chapter/page.png", "other/page.png"]
+            .into_iter()
+            .map(|entry| crate::zip_loader::ZipImageEntry {
+                entry_name: entry.into(),
+                mtime: 7,
+                uncompressed_size: 100,
+                container_ancestry: Vec::new(),
+            })
+            .collect();
+        let nav = crate::zip_tree::ZipNavState::new(Arc::new(crate::zip_tree::ZipTree::build(
+            path.clone(),
+            entries,
+        )));
+        let (items, metas) = nav.materialize_current(crate::settings::SortOrder::Numeric);
+        app.current_folder = Some(path.clone());
+        app.install_new_items(items, metas);
+        app.zip_nav = Some(nav);
+        let catalog = Arc::new(
+            crate::catalog::CatalogDb::open(&app.tmp.path().join("catalogs"), &path).unwrap(),
+        );
+        let old = spawn(&mut app, &catalog);
+        let mut edited = app.settings.clone();
+        edited.cache_book_cover_only = true;
+        app.install_preferences_settings(edited);
+        app.zip_nav_enter("chapter/");
+        assert!(Arc::ptr_eq(
+            app.reload_queue.as_ref().unwrap(),
+            &old.regular
+        ));
+        assert!(!old.cancel.load(Ordering::Relaxed));
+        let old_key = finish_current_page(&app, &old);
+        assert!(
+            catalog.load_one(&old_key).unwrap().is_some(),
+            "existing ZIP workers keep the OFF snapshot"
+        );
+        drop(old);
+        let reopened = spawn(&mut app, &catalog);
+        app.zip_nav_enter("other/");
+        let new_key = finish_current_page(&app, &reopened);
+        assert!(
+            catalog.load_one(&new_key).unwrap().is_none(),
+            "new worker pools capture the accepted ON setting"
+        );
+        assert_eq!(
+            catalog
+                .load_source_dims_matching(7, 100)
+                .unwrap()
+                .get(&new_key),
+            Some(&Some((12, 8)))
+        );
+    }
+}
+
 #[test]
 fn review_a_search_completion_requires_current_list_and_request_identity() {
     for case in ["generation", "context", "request", "current"] {
@@ -52451,6 +53018,7 @@ mod favorite_adjustment_defaults_tests {
         );
 
         let parent_key = format!("{}{}", crate::thumb_loader::CACHE_KEY_PDF, "bar.pdf");
+        app.image_metas = vec![None, None, None, Some((999, 4096))];
         let cur_gen = app.items_generation;
         app.virtual_folder_writeback = Some(crate::app::VirtualFolderWriteback {
             parent_catalog: Arc::clone(&parent_db_arc),
@@ -111617,6 +112185,7 @@ fn excluded_png_zip_parent_seed_never_becomes_first_visible_jpg_cache() {
     let first_jpg = crate::catalog::CacheEntry {
         ..parent_db.load_one(&old_key).unwrap().unwrap()
     };
+    app.image_metas = vec![Some((first_jpg.mtime, first_jpg.file_size))];
     map.write().unwrap().insert("2.jpg".into(), first_jpg);
     app.fire_virtual_folder_writeback_if_ready(0);
     assert_eq!(

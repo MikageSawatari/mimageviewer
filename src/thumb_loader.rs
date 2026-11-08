@@ -202,25 +202,66 @@ pub const CACHE_KEY_SEARCH_REP: &str = "searchrep:";
 ///
 /// 詳細: [docs/auto-thumb-aspect-plan.md §4.1.2](../../docs/auto-thumb-aspect-plan.md)
 pub fn cache_key_for_request(req: &LoadRequest) -> Option<std::borrow::Cow<'_, str>> {
-    if let Some(ref key) = req.cache_key_override {
-        if is_representative_cache_key(key) {
-            Some(std::borrow::Cow::Owned(
-                representative_cache_key_for_policy(key, &req.file_type_visibility),
-            ))
-        } else {
-            Some(std::borrow::Cow::Borrowed(key.as_str()))
+    match catalog_row_kind(
+        req.cache_key_override.as_deref(),
+        req.zip_entry.as_deref(),
+        req.pdf_page,
+    ) {
+        CatalogRowKind::Override(key) => {
+            if is_representative_cache_key(key) {
+                Some(std::borrow::Cow::Owned(
+                    representative_cache_key_for_policy(key, &req.file_type_visibility),
+                ))
+            } else {
+                Some(std::borrow::Cow::Borrowed(key))
+            }
         }
-    } else if let Some(page_num) = req.pdf_page {
-        Some(std::borrow::Cow::Owned(
+        CatalogRowKind::PdfPage(page_num) => Some(std::borrow::Cow::Owned(
             crate::grid_item::pdf_page_cache_key(page_num),
-        ))
-    } else if let Some(ref name) = req.zip_entry {
-        Some(std::borrow::Cow::Borrowed(name.as_str()))
-    } else {
-        req.path
+        )),
+        CatalogRowKind::ZipPage(name) => Some(std::borrow::Cow::Borrowed(name)),
+        CatalogRowKind::File => req
+            .path
             .file_name()
             .and_then(|n| n.to_str())
-            .map(std::borrow::Cow::Borrowed)
+            .map(std::borrow::Cow::Borrowed),
+    }
+}
+
+/// Classify the row being saved, independently of the resolved cover's source.
+/// An override always names an outer tile, even when it reads a book page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CatalogRowKind<'a> {
+    Override(&'a str),
+    PdfPage(u32),
+    ZipPage(&'a str),
+    File,
+}
+
+fn catalog_row_kind<'a>(
+    key_override: Option<&'a str>,
+    zip_entry: Option<&'a str>,
+    pdf_page: Option<u32>,
+) -> CatalogRowKind<'a> {
+    if let Some(key) = key_override {
+        CatalogRowKind::Override(key)
+    } else if let Some(page) = pdf_page {
+        CatalogRowKind::PdfPage(page)
+    } else if let Some(entry) = zip_entry {
+        CatalogRowKind::ZipPage(entry)
+    } else {
+        CatalogRowKind::File
+    }
+}
+
+impl CatalogRowKind<'_> {
+    fn save_dims_only(self, decision: CacheDecision) -> bool {
+        decision.cache_book_cover_only
+            && match self {
+                Self::PdfPage(_) => true,
+                Self::ZipPage(entry) => !crate::raw_format::is_raw_path(Path::new(entry)),
+                Self::Override(_) | Self::File => false,
+            }
     }
 }
 
@@ -1654,6 +1695,7 @@ pub struct CacheDecision {
     pub webp_always: bool,
     pub pdf_always: bool,
     pub zip_always: bool,
+    pub cache_book_cover_only: bool,
     // cache_videos_always は動画が別パス (video_thumb) を通るため load_one_cached では使わない
 }
 
@@ -1666,6 +1708,7 @@ impl CacheDecision {
             webp_always: s.cache_webp_always,
             pdf_always: s.cache_pdf_always,
             zip_always: s.cache_zip_always,
+            cache_book_cover_only: s.cache_book_cover_only,
         }
     }
 
@@ -1684,6 +1727,7 @@ impl CacheDecision {
             webp_always: false,
             pdf_always: false,
             zip_always: false,
+            cache_book_cover_only: false,
         }
     }
 
@@ -5225,18 +5269,22 @@ pub fn load_one_cached(
     // cache_key_override が Some のとき: フォルダ一覧の ZipFile/PdfFile 用キーを優先。
     let auto_key_buf: String;
     let display_buf: String;
-    let (name, display_name): (&str, &str) = if let Some(key) = cache_key_override {
-        let dn = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-        (key, dn)
-    } else if let Some(page_num) = pdf_page {
-        auto_key_buf = crate::grid_item::pdf_page_cache_key(page_num);
-        display_buf = format!("Page {}", page_num + 1);
-        (&auto_key_buf, &display_buf)
-    } else if let Some(n) = zip_entry {
-        (n, n)
-    } else {
-        let n = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-        (n, n)
+    let row_kind = catalog_row_kind(cache_key_override, zip_entry, pdf_page);
+    let (name, display_name): (&str, &str) = match row_kind {
+        CatalogRowKind::Override(key) => {
+            let dn = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            (key, dn)
+        }
+        CatalogRowKind::PdfPage(page_num) => {
+            auto_key_buf = crate::grid_item::pdf_page_cache_key(page_num);
+            display_buf = format!("Page {}", page_num + 1);
+            (&auto_key_buf, &display_buf)
+        }
+        CatalogRowKind::ZipPage(n) => (n, n),
+        CatalogRowKind::File => {
+            let n = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            (n, n)
+        }
     };
     let t = std::time::Instant::now();
 
@@ -5947,92 +5995,105 @@ pub fn load_one_cached(
 
     if let Some(save_catalog) = save_catalog {
         let cat = save_catalog.as_ref();
-        let t_enc = std::time::Instant::now();
-        let encoded = crate::catalog::encode_thumb_webp_with_aspect_dims(
-            &img,
-            thumb_px,
-            thumb_quality as f32,
-            layout_dims
-                .or(source_dims)
-                .unwrap_or((img.width(), img.height())),
-        );
-        cache_encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
-        match encoded {
-            Some((webp_data, w, h)) => {
-                let encode_ms = cache_encode_ms;
-                let cache_save_started = std::time::Instant::now();
-                let save_result = cat.save_with_folder_proof(
-                    name,
-                    mtime,
-                    file_size,
-                    w,
-                    h,
-                    source_dims,
-                    layout_dims,
-                    &webp_data,
-                    folder_provenance,
-                    folder_selection_proof,
-                );
-                cache_save_ms = cache_save_started.elapsed().as_secs_f64() * 1000.0;
-                if let Err(e) = save_result {
-                    cat.record_cache_error(format!("thumbnail catalog save: {e}"));
-                    measured_thumbnail_log(
-                        format!("    idx={idx:>4} catalog save: {e}"),
-                        &mut normal_log,
-                    );
-                } else if let Some(cm) = cache_map {
-                    // DB 保存成功 → in-memory cache_map にも反映する。
-                    // Evicted → 再ロード時にキャッシュヒットさせるために必要。
-                    let cache_map_started = std::time::Instant::now();
-                    if let Ok(mut map) = cm.write() {
-                        map.insert(
-                            name.to_owned(),
-                            crate::catalog::CacheEntry {
-                                mtime,
-                                file_size,
-                                jpeg_data: webp_data,
-                                source_dims,
-                                layout_dims,
-                                folder_provenance,
-                                selection_proof: folder_selection_proof.cloned(),
-                            },
-                        );
-                    }
-                    cache_map_ms = cache_map_started.elapsed().as_secs_f64() * 1000.0;
-                    // **HarvestOnCancel ROI 計測**: cache_map.insert 完了後に
-                    // cancel が立っているか確認する (encode/save 中に flip した
-                    // ケースも拾う、Codex round 1 P3-1 対応)。立っていれば「投資回収
-                    // に成功した」イベントを発火 — pdf_page 経路のみ意味がある。
-                    if pdf_page.is_some()
-                        && crate::perf::is_enabled()
-                        && cancel.is_some_and(|c| c.load(Ordering::Relaxed))
-                    {
-                        crate::perf::event(
-                            "pdf",
-                            "pdf_thumb_cache_saved_after_cancel",
-                            Some(name),
-                            input_seq,
-                            &[("idx", serde_json::Value::from(idx))],
-                        );
-                    }
-                }
-                let force_note = if force_cache && !policy_should_save {
-                    " force-cache"
-                } else {
-                    ""
-                };
+        if row_kind.save_dims_only(cache_decision) {
+            let cache_save_started = std::time::Instant::now();
+            if let Err(error) = cat.save_page_dims(name, mtime, file_size, source_dims, layout_dims)
+            {
+                cat.record_cache_error(format!("page dimensions catalog save: {error}"));
                 measured_thumbnail_log(
-                    format!(
-                        "    idx={idx:>4} decode={decode_ms:>6.1}ms display={display_ms:>5.1}ms encode={encode_ms:>5.1}ms{force_note}  {display_name}  -> save_key=`{name}`"
-                    ),
+                    format!("    idx={idx:>4} page dimensions save: {error}"),
                     &mut normal_log,
                 );
             }
-            None => {
-                measured_thumbnail_log(
-                    format!("    idx={idx:>4} WebP encode FAIL  {display_name}"),
-                    &mut normal_log,
-                );
+            cache_save_ms = cache_save_started.elapsed().as_secs_f64() * 1000.0;
+        } else {
+            let t_enc = std::time::Instant::now();
+            let encoded = crate::catalog::encode_thumb_webp_with_aspect_dims(
+                &img,
+                thumb_px,
+                thumb_quality as f32,
+                layout_dims
+                    .or(source_dims)
+                    .unwrap_or((img.width(), img.height())),
+            );
+            cache_encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
+            match encoded {
+                Some((webp_data, w, h)) => {
+                    let encode_ms = cache_encode_ms;
+                    let cache_save_started = std::time::Instant::now();
+                    let save_result = cat.save_with_folder_proof(
+                        name,
+                        mtime,
+                        file_size,
+                        w,
+                        h,
+                        source_dims,
+                        layout_dims,
+                        &webp_data,
+                        folder_provenance,
+                        folder_selection_proof,
+                    );
+                    cache_save_ms = cache_save_started.elapsed().as_secs_f64() * 1000.0;
+                    if let Err(e) = save_result {
+                        cat.record_cache_error(format!("thumbnail catalog save: {e}"));
+                        measured_thumbnail_log(
+                            format!("    idx={idx:>4} catalog save: {e}"),
+                            &mut normal_log,
+                        );
+                    } else if let Some(cm) = cache_map {
+                        // DB 保存成功 → in-memory cache_map にも反映する。
+                        // Evicted → 再ロード時にキャッシュヒットさせるために必要。
+                        let cache_map_started = std::time::Instant::now();
+                        if let Ok(mut map) = cm.write() {
+                            map.insert(
+                                name.to_owned(),
+                                crate::catalog::CacheEntry {
+                                    mtime,
+                                    file_size,
+                                    jpeg_data: webp_data,
+                                    source_dims,
+                                    layout_dims,
+                                    folder_provenance,
+                                    selection_proof: folder_selection_proof.cloned(),
+                                },
+                            );
+                        }
+                        cache_map_ms = cache_map_started.elapsed().as_secs_f64() * 1000.0;
+                        // **HarvestOnCancel ROI 計測**: cache_map.insert 完了後に
+                        // cancel が立っているか確認する (encode/save 中に flip した
+                        // ケースも拾う、Codex round 1 P3-1 対応)。立っていれば「投資回収
+                        // に成功した」イベントを発火 — pdf_page 経路のみ意味がある。
+                        if pdf_page.is_some()
+                            && crate::perf::is_enabled()
+                            && cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+                        {
+                            crate::perf::event(
+                                "pdf",
+                                "pdf_thumb_cache_saved_after_cancel",
+                                Some(name),
+                                input_seq,
+                                &[("idx", serde_json::Value::from(idx))],
+                            );
+                        }
+                    }
+                    let force_note = if force_cache && !policy_should_save {
+                        " force-cache"
+                    } else {
+                        ""
+                    };
+                    measured_thumbnail_log(
+                        format!(
+                            "    idx={idx:>4} decode={decode_ms:>6.1}ms display={display_ms:>5.1}ms encode={encode_ms:>5.1}ms{force_note}  {display_name}  -> save_key=`{name}`"
+                        ),
+                        &mut normal_log,
+                    );
+                }
+                None => {
+                    measured_thumbnail_log(
+                        format!("    idx={idx:>4} WebP encode FAIL  {display_name}"),
+                        &mut normal_log,
+                    );
+                }
             }
         }
     } else {
@@ -6170,9 +6231,18 @@ pub fn load_one_cached(
 // -----------------------------------------------------------------------
 
 #[cfg(test)]
+pub(crate) fn with_test_pdf_render_result<T>(
+    result: crate::pdf_loader::RenderResult,
+    run: impl FnOnce() -> T,
+) -> T {
+    tests::with_pdf_render_result(result, run)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::settings::{CachePolicy, Settings, SortOrder};
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -6188,6 +6258,19 @@ mod tests {
     }
 
     struct PdfRenderFixtureScope(Option<PdfRenderFixture>);
+
+    pub(super) fn with_pdf_render_result<T>(
+        result: crate::pdf_loader::RenderResult,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        let _scope = PdfRenderFixtureScope::install(PdfRenderFixture {
+            result: Ok(result),
+            cancel_on_reply: None,
+            observed_policy: Arc::new(Mutex::new(None)),
+            observed_validity: None,
+        });
+        run()
+    }
 
     impl PdfRenderFixtureScope {
         fn install(fixture: PdfRenderFixture) -> Self {
@@ -7958,7 +8041,401 @@ mod tests {
             webp_always: true,
             pdf_always: true,
             zip_always: true,
+            cache_book_cover_only: false,
         }
+    }
+
+    fn cover_only_decision(policy: CachePolicy, enabled: bool) -> CacheDecision {
+        CacheDecision {
+            cache_book_cover_only: enabled,
+            ..make_decision(policy, u32::MAX, u64::MAX)
+        }
+    }
+
+    fn cover_only_worker(
+        request: &mut LoadRequest,
+        catalog: &Arc<crate::catalog::CatalogDb>,
+        cache: &std::sync::RwLock<HashMap<String, crate::catalog::CacheEntry>>,
+        decision: CacheDecision,
+        cancel: Option<&Arc<AtomicBool>>,
+    ) -> Vec<ThumbMsg> {
+        let (tx, rx) = mpsc::channel();
+        let done = Arc::new(AtomicUsize::new(0));
+        process_load_request(
+            request,
+            cache,
+            &tx,
+            Some(catalog),
+            64,
+            75,
+            64,
+            decision,
+            &done,
+            &Arc::new(Mutex::new(crate::stats::ThumbStats::default())),
+            cancel,
+            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(1)),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(done.load(Ordering::Relaxed), 1);
+        rx.try_iter().collect()
+    }
+
+    fn cover_only_pdf_result() -> crate::pdf_loader::RenderResult {
+        crate::pdf_loader::RenderResult {
+            image: image::DynamicImage::new_rgb8(12, 8),
+            content_type: crate::pdf_loader::PdfPageContentType::Vector,
+            page_count: 1,
+            page_size_points: crate::pdf_loader::PdfPageSizePoints {
+                width: 120.0,
+                height: 80.0,
+            },
+        }
+    }
+
+    #[test]
+    fn book_cover_only_row_classification_and_cache_decision_matrix() {
+        assert!(!CacheDecision::without_thumbnail().cache_book_cover_only);
+        for enabled in [false, true] {
+            let settings = Settings {
+                cache_book_cover_only: enabled,
+                ..Default::default()
+            };
+            let decision = CacheDecision::from_settings(&settings);
+            assert_eq!(decision.cache_book_cover_only, enabled);
+            for override_key in [None, Some("zipthumb:book.zip#pin:page")] {
+                for entry in [None, Some("chapter/page.png"), Some("chapter/PAGE.CR2")] {
+                    for page in [None, Some(3)] {
+                        let row = catalog_row_kind(override_key, entry, page);
+                        let expected = enabled
+                            && override_key.is_none()
+                            && (page.is_some() || entry == Some("chapter/page.png"));
+                        assert_eq!(
+                            row.save_dims_only(decision),
+                            expected,
+                            "{row:?} ON={enabled}"
+                        );
+                        let req = LoadRequest {
+                            path: PathBuf::from("book.png"),
+                            zip_entry: entry.map(str::to_owned),
+                            pdf_page: page,
+                            cache_key_override: override_key.map(str::to_owned),
+                            ..Default::default()
+                        };
+                        let key = cache_key_for_request(&req).unwrap();
+                        let expected_key = override_key
+                            .map(str::to_owned)
+                            .or_else(|| page.map(crate::grid_item::pdf_page_cache_key))
+                            .or_else(|| entry.map(str::to_owned))
+                            .unwrap_or("book.png".into());
+                        assert_eq!(key, expected_key);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn book_cover_only_worker_pages_and_outer_tiles_follow_policy() {
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("book.zip");
+        let image = image::DynamicImage::new_rgb8(12, 8);
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        zip.start_file("chapter/page.png", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(bytes.get_ref()).unwrap();
+        zip.finish().unwrap();
+        for policy in [CachePolicy::Always, CachePolicy::Auto, CachePolicy::Off] {
+            for enabled in [false, true] {
+                // These outer keys cover ZipFile, ConvertibleArchive, ZipDir and pinned/aggregate tiles.
+                for outer in [
+                    None,
+                    Some("zipthumb:book.zip"),
+                    Some("archivethumb:rar:book.rar"),
+                    Some("zipdir:chapter/"),
+                    Some("zipthumb:book.zip#pin:page"),
+                    Some("searchrep:book#pin:page"),
+                ] {
+                    let db_root = TempDir::new().unwrap();
+                    let catalog =
+                        Arc::new(crate::catalog::CatalogDb::open(db_root.path(), &path).unwrap());
+                    let cache = std::sync::RwLock::new(HashMap::new());
+                    let mut req = LoadRequest {
+                        path: path.clone(),
+                        zip_entry: Some("chapter/page.png".into()),
+                        cache_key_override: outer.map(str::to_owned),
+                        mtime: 7,
+                        file_size: 9,
+                        // Explicit leaf dispatch also models a resolved pin.
+                        resolve_override: outer.map(|_| ResolveStrategy::DirectImage),
+                        ..Default::default()
+                    };
+                    let messages = cover_only_worker(
+                        &mut req,
+                        &catalog,
+                        &cache,
+                        cover_only_decision(policy, enabled),
+                        None,
+                    );
+                    assert_eq!(messages.len(), 2, "{outer:?}");
+                    assert!(matches!(
+                        messages[0].payload,
+                        ThumbMsgPayload::SourcePixels(_)
+                    ));
+                    assert!(messages[1].is_finalized());
+                    let key = cache_key_for_request(&req).unwrap();
+                    let saves = policy != CachePolicy::Off;
+                    let dims_only = saves && enabled && outer.is_none();
+                    assert_eq!(
+                        catalog.load_one(&key).unwrap().is_some(),
+                        saves && !dims_only,
+                        "{outer:?}"
+                    );
+                    assert_eq!(
+                        cache.read().unwrap().contains_key(key.as_ref()),
+                        saves && !dims_only
+                    );
+                    assert_eq!(
+                        catalog
+                            .load_source_dims_matching(7, 9)
+                            .unwrap()
+                            .get(key.as_ref()),
+                        saves.then_some(&Some((12, 8)))
+                    );
+                }
+                for outer in [
+                    None,
+                    Some("pdfthumb:book.pdf"),
+                    Some("pdfthumb:book.pdf#pin:page"),
+                ] {
+                    let db_root = TempDir::new().unwrap();
+                    let pdf = tmp.path().join("book.pdf");
+                    let catalog =
+                        Arc::new(crate::catalog::CatalogDb::open(db_root.path(), &pdf).unwrap());
+                    let cache = std::sync::RwLock::new(HashMap::new());
+                    let mut req = LoadRequest {
+                        path: pdf,
+                        pdf_page: Some(0),
+                        cache_key_override: outer.map(str::to_owned),
+                        mtime: 7,
+                        file_size: 9,
+                        ..Default::default()
+                    };
+                    let messages = with_pdf_render_result(cover_only_pdf_result(), || {
+                        cover_only_worker(
+                            &mut req,
+                            &catalog,
+                            &cache,
+                            cover_only_decision(policy, enabled),
+                            None,
+                        )
+                    });
+                    assert_eq!(messages.len(), 2);
+                    assert!(matches!(
+                        messages[0].payload,
+                        ThumbMsgPayload::SourcePixels(_)
+                    ));
+                    assert!(messages[1].is_finalized());
+                    let key = cache_key_for_request(&req).unwrap();
+                    let saves = policy != CachePolicy::Off;
+                    assert_eq!(
+                        catalog.load_one(&key).unwrap().is_some(),
+                        saves && (!enabled || outer.is_some())
+                    );
+                    assert_eq!(
+                        catalog
+                            .load_source_dims_matching(7, 9)
+                            .unwrap()
+                            .get(key.as_ref()),
+                        saves.then_some(&Some((12, 8)))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn book_cover_only_source_only_preserves_old_webp_and_cache_hits() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("book.pdf");
+        let catalog = Arc::new(crate::catalog::CatalogDb::open(tmp.path(), &path).unwrap());
+        let key = crate::grid_item::pdf_page_cache_key(0);
+        let old_bytes =
+            crate::catalog::encode_thumb_webp(&image::DynamicImage::new_rgb8(8, 12), 64, 75.0)
+                .unwrap()
+                .0;
+        catalog
+            .save_thumb_bytes(&key, 1, 2, Some((8, 12)), &old_bytes)
+            .unwrap();
+        let cache = std::sync::RwLock::new(catalog.load_all().unwrap());
+        let mut req = LoadRequest {
+            path,
+            pdf_page: Some(0),
+            mtime: 7,
+            file_size: 9,
+            source_policy: LoadSourcePolicy::SourceOnly,
+            ..Default::default()
+        };
+        let messages = with_pdf_render_result(cover_only_pdf_result(), || {
+            cover_only_worker(
+                &mut req,
+                &catalog,
+                &cache,
+                cover_only_decision(CachePolicy::Always, true),
+                None,
+            )
+        });
+        assert!(matches!(
+            messages[0].payload,
+            ThumbMsgPayload::SourcePixels(_)
+        ));
+        assert!(messages[1].is_finalized());
+        assert_eq!(
+            catalog.load_one(&key).unwrap().unwrap().jpeg_data,
+            old_bytes
+        );
+        assert_eq!(cache.read().unwrap()[&key].mtime, 1);
+        assert_eq!(
+            catalog.load_source_dims_matching(7, 9).unwrap()[&key],
+            Some((12, 8))
+        );
+        assert!(catalog.load_source_dims_matching(8, 9).unwrap().is_empty());
+        // A matching existing image remains readable while ON, without rendering a source.
+        req.mtime = 1;
+        req.file_size = 2;
+        req.source_policy = LoadSourcePolicy::CacheOnly;
+        let messages = cover_only_worker(
+            &mut req,
+            &catalog,
+            &cache,
+            cover_only_decision(CachePolicy::Always, true),
+            None,
+        );
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].pixels().is_some());
+        assert!(!matches!(
+            messages[0].payload,
+            ThumbMsgPayload::SourcePixels(_)
+        ));
+    }
+
+    #[test]
+    fn book_cover_only_pdf_cancel_harvest_saves_dimensions_and_layout() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = Arc::new(crate::catalog::CatalogDb::open(tmp.path(), tmp.path()).unwrap());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let observed_policy = Arc::new(Mutex::new(None));
+        let _scope = PdfRenderFixtureScope::install(PdfRenderFixture {
+            result: Ok(cover_only_pdf_result()),
+            cancel_on_reply: Some(Arc::clone(&cancel)),
+            observed_policy: Arc::clone(&observed_policy),
+            observed_validity: None,
+        });
+        let mut req = LoadRequest {
+            path: tmp.path().join("book.pdf"),
+            pdf_page: Some(0),
+            mtime: 7,
+            file_size: 9,
+            ..Default::default()
+        };
+        let cache = std::sync::RwLock::new(HashMap::new());
+        let messages = cover_only_worker(
+            &mut req,
+            &catalog,
+            &cache,
+            cover_only_decision(CachePolicy::Always, true),
+            Some(&cancel),
+        );
+        assert_eq!(
+            *observed_policy.lock().unwrap(),
+            Some(crate::pdf_loader::CancelWaitPolicy::HarvestOnCancel)
+        );
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(messages[0].pixels().is_some());
+        assert!(messages[1].is_finalized());
+        let key = crate::grid_item::pdf_page_cache_key(0);
+        assert!(catalog.load_one(&key).unwrap().is_none());
+        assert_eq!(
+            catalog.load_source_dims_matching(7, 9).unwrap()[&key],
+            Some((12, 8))
+        );
+        assert!(cache.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn book_cover_only_force_cache_keeps_page_rows_dimensions_only() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = Arc::new(crate::catalog::CatalogDb::open(tmp.path(), tmp.path()).unwrap());
+        let cache = std::sync::RwLock::new(HashMap::new());
+        let mut req = LoadRequest {
+            path: tmp.path().join("book.pdf"),
+            pdf_page: Some(0),
+            mtime: 7,
+            file_size: 9,
+            force_cache: true,
+            ..Default::default()
+        };
+        let messages = with_pdf_render_result(cover_only_pdf_result(), || {
+            cover_only_worker(
+                &mut req,
+                &catalog,
+                &cache,
+                cover_only_decision(CachePolicy::Off, true),
+                None,
+            )
+        });
+        assert!(messages[0].pixels().is_some());
+        assert!(messages[1].is_finalized());
+        let key = crate::grid_item::pdf_page_cache_key(0);
+        assert!(catalog.load_one(&key).unwrap().is_none());
+        assert_eq!(
+            catalog.load_source_dims_matching(7, 9).unwrap()[&key],
+            Some((12, 8))
+        );
+        assert!(cache.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn book_cover_only_raw_development_continuation_still_saves_webp() {
+        let tmp = TempDir::new().unwrap();
+        let catalog = Arc::new(crate::catalog::CatalogDb::open(tmp.path(), tmp.path()).unwrap());
+        let cache = std::sync::RwLock::new(HashMap::new());
+        let mut req = LoadRequest {
+            path: tmp.path().join("book.zip"),
+            zip_entry: Some("chapter/page.CR2".into()),
+            mtime: 7,
+            file_size: 9,
+            source_policy: LoadSourcePolicy::SourceOnly,
+            raw_source: LoadRequestSource::RawHalfDeveloped {
+                image: image::DynamicImage::new_rgb8(12, 8),
+                developed_dims: [120, 80],
+                decode_ms: 1.0,
+                folder_selection_proof: None,
+            },
+            ..Default::default()
+        };
+        let messages = cover_only_worker(
+            &mut req,
+            &catalog,
+            &cache,
+            cover_only_decision(CachePolicy::Always, true),
+            None,
+        );
+        assert!(matches!(
+            messages[0].payload,
+            ThumbMsgPayload::SourcePixels(_)
+        ));
+        assert!(messages[1].is_finalized());
+        let row = catalog.load_one("chapter/page.CR2").unwrap().unwrap();
+        assert_eq!(row.source_dims, Some((120, 80)));
+        assert!(cache.read().unwrap().contains_key("chapter/page.CR2"));
     }
 
     fn orientation_exif_payload(value: u16) -> Vec<u8> {

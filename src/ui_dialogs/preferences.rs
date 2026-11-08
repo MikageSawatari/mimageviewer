@@ -4360,6 +4360,23 @@ pub(crate) fn draw_raw_settings_snapshot_fixture(ui: &mut egui::Ui) {
     draw_page(ui, &mut state, false);
 }
 
+pub fn draw_book_cover_only_snapshot_fixture(ui: &mut egui::Ui) {
+    let mut state = PreferencesState::from_settings(
+        &Settings {
+            cache_book_cover_only: true,
+            ..Settings::default()
+        },
+        crate::external_tool::LaunchTarget::None,
+        None,
+        crate::ai::trt_worker_lifecycle::TrtWorkerLifecycleOwner::new().snapshot(),
+        false,
+        0,
+        0,
+        0,
+    );
+    pages::book_cover_only_setting(ui, &mut state);
+}
+
 pub fn draw_file_type_visibility_snapshot_fixture(ui: &mut egui::Ui) {
     let mut state = PreferencesState::from_settings(
         &Settings::default(),
@@ -4388,6 +4405,50 @@ pub fn draw_file_type_visibility_snapshot_fixture(ui: &mut egui::Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_book_cover_only_preferences_ok_persists_and_drives_worker_catalog() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.cache_policy = crate::settings::CachePolicy::Always;
+        app.open_preferences_page(PreferencesPage::Cache);
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1093.0, 900.0))
+            .build_ui_state(
+                |root_ui, app| app.show_preferences_dialog(&root_ui.ctx().clone()),
+                app,
+            );
+        harness.run_steps(3);
+        harness
+            .get_by_label("本 (ZIP・PDF など) は表紙のサムネイルだけ保存する")
+            .click();
+        harness.run_steps(2);
+        assert!(!harness.state().settings.cache_book_cover_only);
+        assert!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .cache_book_cover_only
+        );
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        assert!(!harness.state().show_preferences);
+        assert!(harness.state().settings.cache_book_cover_only);
+        let directory = harness.state().tmp.path().to_path_buf();
+        let persisted = crate::settings_db::SettingsDb::open(&directory)
+            .unwrap()
+            .load_into_settings()
+            .unwrap();
+        assert!(persisted.cache_book_cover_only);
+        crate::app::tests::assert_cache_book_cover_only_worker_catalog_contract(
+            &mut harness.state_mut().app,
+            &directory,
+        );
+    }
 
     #[test]
     fn section1445_cache_text_survives_direct_tree_switch_and_ok() {

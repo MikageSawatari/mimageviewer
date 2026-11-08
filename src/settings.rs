@@ -4768,6 +4768,9 @@ pub struct Settings {
     /// サムネイルキャッシュ生成ポリシー（段階 C）
     #[serde(default)]
     pub cache_policy: CachePolicy,
+    /// 本の中のページは寸法だけ記録し、表紙のサムネイルだけ保存する (RAW ページを除く)。
+    #[serde(default)]
+    pub cache_book_cover_only: bool,
     /// Auto モード: `decode + display` がこの値以上のファイルをキャッシュ対象にする（ms, 10-100）
     #[serde(default = "default_cache_threshold_ms")]
     pub cache_threshold_ms: u32,
@@ -7812,6 +7815,7 @@ impl Default for Settings {
             text_smart_snap_enabled: true,
             thumb_quality: default_thumb_quality(),
             cache_policy: CachePolicy::default(),
+            cache_book_cover_only: false,
             cache_threshold_ms: default_cache_threshold_ms(),
             cache_size_threshold_bytes: default_cache_size_threshold_bytes(),
             cache_videos_always: true,
@@ -15014,6 +15018,28 @@ mod tests {
     }
 
     #[test]
+    fn cache_book_cover_only_defaults_off_and_survives_preferences_merge() {
+        assert!(!Settings::default().cache_book_cover_only);
+        let legacy: Settings = serde_json::from_str(r#"{"cache_policy":"Always"}"#).unwrap();
+        assert!(!legacy.cache_book_cover_only);
+        for enabled in [true, false] {
+            let mut edited = Settings {
+                cache_book_cover_only: enabled,
+                ..Settings::default()
+            };
+            let mut live = Settings {
+                cache_book_cover_only: !enabled,
+                ..Settings::default()
+            };
+            edited.overwrite_non_preferences_from(&mut live);
+            assert_eq!(edited.cache_book_cover_only, enabled);
+            let loaded: Settings =
+                serde_json::from_value(serde_json::to_value(&edited).unwrap()).unwrap();
+            assert_eq!(loaded.cache_book_cover_only, enabled);
+        }
+    }
+
+    #[test]
     fn metadata_export_recursive_defaults_to_true() {
         assert!(Settings::default().metadata_export_recursive);
 
@@ -15248,6 +15274,7 @@ mod tests {
         assert_eq!(s.thumb_px, 512);
         assert_eq!(s.thumb_quality, 75);
         assert_eq!(s.cache_policy, CachePolicy::Auto);
+        assert!(!s.cache_book_cover_only);
         assert_eq!(s.cache_threshold_ms, 25);
         assert_eq!(s.cache_size_threshold_bytes, 2_000_000);
         assert!(s.cache_videos_always);

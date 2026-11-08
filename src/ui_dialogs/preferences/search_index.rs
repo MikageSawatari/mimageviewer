@@ -718,6 +718,20 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["Off", "Auto", "Always", "サムネイルキャッシュ"]
     ),
     entry!(
+        "cache/book-cover-only",
+        Cache,
+        "本 (ZIP・PDF など) は表紙のサムネイルだけ保存する",
+        [
+            "表紙",
+            "本棚",
+            "代表画像",
+            "先頭ページ",
+            "容量",
+            "RAW",
+            "ページの寸法"
+        ]
+    ),
+    entry!(
         "cache/auto-time",
         Cache,
         "時間しきい値 (decode + display の合計がこれ以上ならキャッシュ):",
@@ -2127,6 +2141,22 @@ mod tests {
                 .find(|entry| entry.anchor == "spread/manual-nav-wrap")
                 .expect("手動の前後移動ループ設定が検索できる");
             assert_eq!(entry.page, PreferencesPage::SpreadMode);
+        }
+    }
+
+    #[test]
+    fn cache_book_cover_only_is_searchable_at_the_cache_page() {
+        for query in [
+            "表紙 キャッシュ",
+            "代表画像 容量",
+            "先頭ページ",
+            "ページの寸法",
+        ] {
+            let entry = search_preferences(query, test_tree_position)
+                .into_iter()
+                .find(|entry| entry.anchor == "cache/book-cover-only")
+                .expect("本の表紙だけを保存する設定が検索できる");
+            assert_eq!(entry.page, PreferencesPage::Cache);
         }
     }
 

@@ -508,6 +508,7 @@ fn run_bench(
         webp_always: false,
         pdf_always: false,
         zip_always: false,
+        cache_book_cover_only: false,
     };
 
     // 結果チャネル

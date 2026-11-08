@@ -54,6 +54,7 @@ fn color_scan_cache_decision(req: &LoadRequest, cache_decision: CacheDecision) -
         webp_always: false,
         pdf_always: false,
         zip_always: false,
+        cache_book_cover_only: cache_decision.cache_book_cover_only,
     }
 }
 
@@ -1021,6 +1022,7 @@ mod tests {
             webp_always: true,
             pdf_always: true,
             zip_always: true,
+            cache_book_cover_only: false,
         }
     }
 

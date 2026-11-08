@@ -7664,6 +7664,22 @@ pub(super) fn reset_epub_file_handling(settings: &mut crate::settings::Settings)
     settings.epub_file_handling = crate::settings::EpubFileHandling::default();
 }
 
+pub(super) fn book_cover_only_setting(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    ui.checkbox(
+        &mut state.settings.cache_book_cover_only,
+        "本 (ZIP・PDF など) は表紙のサムネイルだけ保存する",
+    );
+    ui.label(
+        egui::RichText::new(
+            "本棚に並ぶ表紙 (先頭ページ、または代表に固定した画像) だけを保存し、本の中のページのサムネイルは保存しません (ページの縦横の大きさだけは記録します)。\n\
+             容量を抑えられますが、本を開き直したときにページ一覧の表示が遅くなることがあります。RAW 画像のページは保存します。保存済みのキャッシュは消えません。\n\
+             フォルダや本を次に開いたときから反映されます。開いている ZIP の中のフォルダ移動には、本を開き直すまで反映されません。mIV Remote には本体の次回起動から反映されます。",
+        )
+        .small()
+        .weak(),
+    );
+}
+
 pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.label(
         "サムネイルキャッシュをいつ生成するかを指定します。\n\
@@ -7685,6 +7701,9 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(8.0);
     ui.separator();
     ui.add_space(6.0);
+
+    anchored(ui, state, "cache/book-cover-only", book_cover_only_setting);
+    ui.add_space(8.0);
 
     let auto_active = state.settings.cache_policy == CachePolicy::Auto;
 

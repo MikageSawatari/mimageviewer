@@ -937,7 +937,19 @@ V1-4b の共通解決では、cache 前の `prepare_load_request_stamp` と cach
 | ConvertibleArchive | None または Some(entry) | None | `archivethumb:{format}:{filename-or-fullpath}` | 有効な変換キャッシュ ZIP があれば、その ZIP から先頭画像またはピン画像を読む。キャッシュ未作成/失効時は LoadRequest なしでアイコン表示 |
 | ZipImage | Some(entry) | None | なし (entry が自動キー) | ZIP からエントリバイト → decode → bytes から EXIF Orientation 適用 |
 | ZipDir | Some(representative) または None (`ZipDirRepresentative`) | None | `zipdir:{dir_prefix}` | 通常は部分木代表 entry を直接読む。ZipDir source pin は `zip_dir_prefix` を worker に渡し、同じ sort で部分木代表を選び直す |
-| PdfPage | None | Some(page) | `pdf_page_cache_key(page)` | PDF ワーカーでそのページをレンダリング |
+| PdfPage | None | Some(page) | なし (`pdf_page_cache_key(page)` が自動キー) | PDF ワーカーでそのページをレンダリング |
+
+`cache_book_cover_only` (既定 OFF) が ON のとき、worker は override の無い ZIP エントリ・PDF ページの
+WebP 保存を省き、通常の保存条件が成り立つ場合だけ同じキー・stamp の寸法を `page_dims` に記録する。
+RAW ページと override 付きの表紙・固定代表・`zipdir:` は従来どおり保存し、一括作成の明示選択も優先する。
+読み込み・メモリ上の表示・既存 WebP 行の保持と `delete_missing` の存続集合は変えない。
+設定は新しく作る thumbnail worker に取り込むため、開いている ZIP 内の階層移動は前の設定のままで、
+本を開き直すと反映される (Remote は本体の次回起動から)。本から親表紙への書き戻しは、
+`image_metas[target_idx]` の要求 stamp と一致する WebP だけを写し、古い行に現在の本の stamp を付けない。
+ON で直接開いた本に新しいページ WebP が無ければ先回りの親表紙保存はせず、親一覧の通常要求で作る。
+本を開いた時点で ON なら、親表紙から先頭ページへの seed も行わず、記録済みの寸法を保つ。
+OFF の seed と、ON/OFF にかかわらない書き戻し target の準備は従来どおり。
+詳しい条件は [表紙だけ保存する設定](book-thumb-cover-only-plan.md) を参照。
 
 #### 本の AI 説明文が読む表紙（V1-4b、検収・実機確認は未完了）
 

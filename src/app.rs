@@ -42582,12 +42582,15 @@ impl App {
         };
 
         // ── seed 経路 ──────────────────────────────────────────────
+        // ON ではページ WebP を増やさず、既に記録した最新の寸法も維持する。
+        // 開いた時点の設定を使い、writeback の準備は従来どおり続ける。
+        let seed_enabled = !self.settings.cache_book_cover_only;
         // 仮想 catalog 側に既にあれば何もしない (再 seed 不要)。
         let already_in_virtual = cache_map
             .read()
             .map(|m| m.contains_key(&target_key))
             .unwrap_or(false);
-        let parent_entry = if !already_in_virtual {
+        let parent_entry = if seed_enabled && !already_in_virtual {
             parent_db.load_one(&parent_key).ok().flatten()
         } else {
             None
@@ -42623,7 +42626,7 @@ impl App {
             } else {
                 crate::perf::event("nav", "virtual_seed_undecodable", Some(&parent_key), 0, &[]);
             }
-        } else if !already_in_virtual {
+        } else if seed_enabled && !already_in_virtual {
             crate::perf::event("nav", "virtual_seed_miss", Some(&parent_key), 0, &[]);
         }
 
@@ -42667,7 +42670,10 @@ impl App {
         if finalized_idx != wb.target_idx {
             return;
         }
-        // cache_map から WebP データを取り出す (worker が直前に書き込んでいるはず)。
+        // 同じ items 世代の要求 stamp と一致する WebP だけを親へ写す。
+        // 保存を省略した要求では cache_map に古い stamp の行が残ることがある。
+        let request_stamp = self.image_metas.get(wb.target_idx).copied().flatten();
+        // cache_map から WebP データを取り出す。
         // RwLock の read guard を save() 越しに保持しないために clone する
         // (save 中はファイル I/O で blocking、guard 保持は他スレッドの読み書きを止める)。
         // None なら from_cache 経路 (cache hit で finalize 不発) など、worker が
@@ -42677,7 +42683,8 @@ impl App {
             .cache_map
             .read()
             .ok()
-            .and_then(|m| m.get(&wb.target_key).cloned());
+            .and_then(|m| m.get(&wb.target_key).cloned())
+            .filter(|entry| request_stamp == Some((entry.mtime, entry.file_size)));
         if let Some(entry) = entry_opt {
             let parent_key = wb.parent_key.clone();
             let _ = wb.parent_catalog.save_thumb_bytes_with_layout_dims(

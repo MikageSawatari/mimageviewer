@@ -257,6 +257,17 @@ CREATE TABLE thumbnails (
     layout_width  INTEGER,                     -- PDF page box 幅（1/1000 point、他はNULL）
     layout_height INTEGER                      -- PDF page box 高さ（1/1000 point、他はNULL）
 );
+
+-- 本のページで WebP 保存を抑えた場合の寸法 (§1.452)
+CREATE TABLE page_dims (
+    filename      TEXT NOT NULL PRIMARY KEY,
+    mtime         INTEGER NOT NULL,
+    file_size     INTEGER NOT NULL,
+    source_width  INTEGER,
+    source_height INTEGER,
+    layout_width  INTEGER,
+    layout_height INTEGER
+);
 ```
 
 `source_*` は画像種別にかかわらずピクセル座標系で、編集・注釈・クリック判定等が参照する。
@@ -265,6 +276,18 @@ PDF の raster 丸めに依存しないページ矩形比だけを `layout_*` �
 v1 は PDF の `source_*` へ page-box 単位を書いていた。どちらも WebP から正確には補えないため、
 `pdf_layout_dims_version=2` への移行時に PDF catalog の全 page 行と通常 catalog の `pdfthumb:` 行を
 一度だけ削除・再生成し、無関係な画像 / ZIP 行は保持する。
+
+`page_dims` は既存 schema version を変えない追加表で、通常の writable open だけで作る。
+`save_page_dims` は元の WebP と同じキー・stamp・source/layout 寸法を記録し、既存 `thumbnails` 行の
+stamp やバイト列を変更しない。WebP 保存は `thumbnails` の INSERT trigger
+`thumbnail_replaces_page_dims` で同じキーの寸法行を消す。この共通 DB 境界により、通常保存、
+RAW、表紙、一括作成、seed、pin batch、音声アートの SQL 直書きも同一 transaction で整合する。
+寸法行が残っているキーは最後の WebP 保存より新しい記録なので、`load_source_dims` と
+`load_source_dims_matching` は WebP の寸法に合成し、`page_dims` を優先する。後者は両表へ同じ
+mtime/file_size 条件を適用してから合成するため、EPUB の変換世代を混ぜない。Blob は読まない。
+通常・Collection の read-only open は表を作らず、旧 catalog に表が無い場合は WebP の寸法だけを返す。
+`delete_missing` は両表を存続集合で掃除する。指定フォルダの SQL 削除経路も `page_dims` を消し、
+共有 DB にある別ドライブの音声 scope は従来どおり残す。全件・期限削除は DB ファイル単位のまま。
 
 ### 動画・音声メタデータ (`video_meta`)
 
@@ -494,6 +517,17 @@ fn path_to_db_path(cache_dir: &Path, folder_path: &Path) -> PathBuf {
 | 設定名 | 型 | デフォルト | 説明 |
 |--------|-----|---------|------|
 | `cache_dir` | String | `%APPDATA%\mimageviewer\cache` | サムネイルキャッシュの格納先 |
+| `cache_book_cover_only` | bool | false | ZIP・PDF 等の本のページは寸法だけ記録し、表紙の WebP は保存する |
+
+`cache_book_cover_only` は thumbnail worker の保存直前に適用する。保存先が使え、既存 policy または
+force が保存を選んだ場合にだけ、override の無い ZIP 内画像 / PDF ページの WebP を `page_dims` へ
+置き換える。書庫内 RAW、表紙・固定代表・`zipdir:` は従来どおり保存する。一括キャッシュ作成は
+その場の選択を優先する。既存 WebP の読み取りは維持し、設定を変えただけでは消さない。
+ON では親表紙から本の先頭ページへの seed を行わず、記録済みの最新寸法を古い表紙で置き換えない。
+OFF の seed は従来どおりで、ON/OFF は本を開いた時点の設定を使う。
+本 → 親の書き戻しは現在のページ要求の stamp と一致する WebP だけを写す。
+本体は次に worker を作る読み込み、Remote は次回起動から反映する。
+仕様・代償と検証条件は [本の表紙だけ保存する設定](book-thumb-cover-only-plan.md) を参照。
 
 ---
 

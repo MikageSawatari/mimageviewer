@@ -29,6 +29,17 @@ use egui_kittest::kittest::NodeT;
 use egui_kittest::{Harness, kittest::Queryable};
 
 #[test]
+fn preferences_book_cover_only_dark() {
+    snapshot_with_theme_at_size(
+        "preferences_book_cover_only_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(600.0, 260.0),
+        None,
+        mimageviewer::draw_book_cover_only_snapshot_fixture,
+    );
+}
+
+#[test]
 fn omitted_entries_dialog_dark() {
     snapshot_with_theme_at_size(
         "omitted_entries_dialog_dark",

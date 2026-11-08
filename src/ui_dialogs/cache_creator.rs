@@ -99,6 +99,15 @@ impl App {
                             &mut self.settings.batch_cache_pdf_contents,
                             "PDF ファイルの中身もキャッシュ",
                         );
+                        if self.settings.cache_book_cover_only {
+                            ui.label(
+                                egui::RichText::new(
+                                    "「表紙のサムネイルだけ保存する」設定より、ここでの選択が優先されます。",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                        }
                         ui.label(
                             egui::RichText::new(
                                 "チェックなしでも先頭1枚/1ページはキャッシュされます",
