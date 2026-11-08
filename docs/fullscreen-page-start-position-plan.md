@@ -1,6 +1,6 @@
 # ページ切替後の初期表示位置「中央 / 読み始め」(§1.726)
 
-- 状態: 設計 r2 (2026-11-08、設計担当 ClaudeCode)。r1 の独立設計レビュー (GPT-6.1 Sol / xhigh) の P2 5 件を反映 (§8)。
+- 状態: 設計 r3 (2026-11-08、設計担当 ClaudeCode)。独立設計レビュー (GPT-6.1 Sol / xhigh) r1 の P2 5 件、r2 の P2 2 件を反映 (§8)。
 - 要望: 5ch >>739 (2026-11-07)。ズーム/フィット設定で画像が画面からはみ出すと、ページを送った先が
   中央から表示されるので、上から読みたい。拡大操作の中心点やマウスカーソルの移動を変える要望ではない。
 - 利用者決定 (backlog §1.726): 設定を追加する。既定は従来どおり「中央」。
@@ -77,7 +77,6 @@ viewer context ごとの 1 フィールド (仮名 `fs_initial_placement_request
 struct FsInitialPlacementRequest {
     items_generation: u64,      // 要求を作った context の items 世代
     anchor_idx: usize,          // 開いた (切り替えた) ページ
-    page_slice: PageSlice,      // 分割の片側
     base_zoom: f32,             // 要求作成時の fs_zoom (open では 1.0)
     base_pan: egui::Vec2,       // 要求作成時の fs_pan (open では ZERO)
 }
@@ -102,7 +101,9 @@ struct FsInitialPlacementRequest {
   および利用者の位置・倍率入力の入口 (`set_fs_pan_from_input`、ホイール拡大、キー拡大、ピンチ、ナビゲータ、ダブルクリック表示リセット、
   fit 方式変更のリセット、連結リセット、編集ツールの単ページ化 / 復帰、detached 再開の zoom/pan 復元、
   共通設定変更時に駐車中 context の pan を 0 にする reset (viewer_context_registry.rs の 3 か所。その bundle の要求を消す))。
-- **paint の外の退役判定 (1 か所)**: フルスクリーンの frame ごとに、描画の前に 1 回だけ見る。要求があり、
+- **paint の外の退役判定 (判定ロジックは 1 つの helper)**: `render_fullscreen_viewport_with_root_input` で、キー・pointer 処理の後、
+  `paint_viewer_presentation_interlude` より前に呼ぶ (冒頭だけだと同じ frame の Z・比較開始を見落とす)。native media の早期 return
+  (動画・音声) の前でも同じ helper を呼ぶ。呼び出しは複数でもよいが、判定は helper 1 つだけに書く。要求があり、
   設定が `読み始め` でない (設定を `中央` へ戻した)、`fs_zoom_owner() != Image` (Z・360・depth・分析)、paged でない (連結)、
   比較・オーバーレイ編集・表示トリム編集中、または current が page renderer の描かない項目 (動画・音声) のとき、要求を捨てる。
   設定変更時に全 context を走査しない (各 context が自分の frame で退役する)。
@@ -135,7 +136,13 @@ struct FsInitialPlacementRequest {
 - **holdover は前の表示単位を描いたときの placement で描く**: open は pan を 0 へ戻すが、holdover は現行 `self.fs_zoom_pan()` (現在値) を使うため、
   `読み始め` で pan が 0 でなかった前ページが、待ちの間だけ中央へ跳ぶ。capture 時に保存済みの
   `FsDisplayUnitLayoutProjection::Painted(placement)` (`capture_fs_display_unit_with_rendition`) を、白 companion 経路と同じく
-  通常の単ページ・見開きの holdover にも使い、新ページの transform と分離する。これは `中央` で手動パン後に送った場合の
+  **別の表示単位への移動中に残す previous** (navigation sequence の previous overlay) の単ページ・見開きにも使い、新ページの transform と分離する。
+  - 適用は `Normal` / `SingletonSpread` placement に限る。`Painted(Z)` は placement だけでは再生できない (Z は fit を Page 基準にし倍率制限を外すが、
+    holdover のページ情報は通常の実効 fit から capture される) ので、Z の holdover は現行経路のまま。
+  - 同じ表示単位の再構築待ち (`FinalEffectSourceReload` の holdover) は現行どおり現在の transform で描く (待機中も手動パン・ズームが効く)。
+  - どちらの holdover かは、`FsHoldover` の種類が分かる選択側から描画関数 (`draw_fs_display_unit_holdover_with_geometry`) へ明示的に渡す。
+    ページ番号やログ文字列から推測しない。App の zoom/pan を一時的に書き換えて描く方式にしない。既存の `PaintedWhite` 経路は維持する。
+  - 見開きでは captured placement を使う間、現在カーソルによる Z の再計算へ入れない。これは `中央` で手動パン後に送った場合の
   同じ跳び (現行の挙動) も直すが、「前の表示単位をそのまま描き残す」という holdover の意味どおりの修正であり、新しい挙動ではない。
 
 ## 5. 設定・UI・保存
@@ -184,5 +191,11 @@ P1 なし、P2 5 件。すべてコードで確かめて採用した。
 5. 紙めくりは「元から対象外」と言えない → §4。`読み始め` 選択時だけの演出制限として仕様に書き、既定の挙動は変えない。
    中央→跳びの frame を作らないことを実装で確かめる。
 
-レビュー担当は、`ViewerContextBundle` への追加が症状パッチではなく構造的な追加であることに同意した (§7)。
+r2 の再レビュー: P1 なし、P2 2 件。どちらもレビュー担当が示した範囲どおりに採用した (r3)。
+
+6. captured placement を一律に使うと、同じ表示単位の再構築待ち (`FinalEffectSourceReload`) で手動操作が止まる → §4。navigation の previous だけに限定し、種類は選択側から明示的に渡す。
+7. `Painted(Z)` は placement だけでは再生できない → §4。`Normal` / `SingletonSpread` に限定し、Z は現行経路。
+
+あわせて、要求構造体から未使用の `page_slice` を外し、退役 helper の呼び出し点を明記した。
+レビュー担当は、`ViewerContextBundle` への追加と holdover の描画入力の所有分離が症状パッチではなく構造的な変更であることに同意した (§7)。
 
