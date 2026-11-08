@@ -39,6 +39,18 @@
 
 ## 1. 優先候補
 
+### 1.741 Everything 検索で作った ZIP・PDF のサムネイルが、親フォルダの代表サムネイルに使われない (検索を閉じると消える) — 5ch >>746 (2026-11-08)
+
+- 状態: **未着手・利用者決定 2026-11-08: 起票して設計へ**。[>>746](https://egg.5ch.io/test/read.cgi/software/1782419551/746) は、Everything 検索で複数フォルダの ZIP のサムネイルを一気に作ったのに、フォルダのサムネイルには使われず、1 つずつ開かないと作られないのか、という質問。
+- 実機確認 (サブ PC 担当、依頼 23、build-1731 = v5.0.0 + §1.731 修正、`C:\miv-subpc\results-23\`): どのフォルダも開かずに Ctrl+R で `thumb746\ ext:zip` を検索 → 6 個の ZIP の表紙が約 1 秒で揃った。検索を閉じて親 `root` を開く → F01〜F06 はすべてフォルダのアイコン (直後・10 秒後とも)。F01 を開いて戻る → F01 だけ表紙。「最新の情報に更新」後も F02〜F06 はアイコンのまま。ログでは `resolve_folder_thumb_image` が F01〜F06 とも `<none>`、F01 を開いた後だけ `<cached-pin:zipthumb:vol01.zip>`。ERROR / WARN / panic なし。
+- 原因 (設計担当がサブ PC のキャッシュの写しを読んで確認、ハッシュでどのフォルダの DB かを照合):
+  - Ctrl+R の検索結果は、**検索を始めたときに開いていたフォルダ** (今回は `OneDrive\Desktop`) の catalog DB に、フルパスのキー `zipthumb:C:\...\F01\vol01.zip` で保存された (`use_full_path_cache_keys` が `items_are_global_search_view` で true、catalog folder は `current_folder` のまま)。
+  - 検索を閉じてそのフォルダへ戻ると、一覧に無いキーとして 6 行とも削除された (写し s1 で 6 行 → s2 で 0 行)。
+  - フォルダの代表選定 (`src/thumb_loader.rs` の `cached_candidate`) は ZIP・PDF を新たに開かず、各フォルダ自身の catalog DB を basename キー (`zipthumb:vol01.zip`) で引く。検索側の行は DB もキーも違うので、消えていなくても届かない。
+- 関連: §1.731 (コレクションとレーティング一覧でキーを消し合う) と同じ「複数の親を並べる一覧のサムネの保存先」の問題。§1.731 はコレクションの root だけを full-path キーにして直した。
+- 設計で決めること: 実在の親を持つ項目のサムネを、検索結果でも親フォルダの catalog に通常キーで保存する (または読む) か。検索を始めた元のフォルダの DB へ無関係な行を書かない形にする。Ctrl+G・タグ・レーティング・閲覧履歴など、同じ判定を使う他の一覧への波及。「検索語と結果は保存しません」(製品の説明) との関係。サムネキャッシュはリリース済みなので、キーや保存先を変えるならマイグレーションの要否を判断表で決める。
+- ついでの観測 (サブ PC 担当、build-1731 は §1.691 の修正前): Everything 検索欄で Enter を押しても検索が始まらず、「検索」ボタンで始まった。既存の動きかは未確認。
+
 ### 1.737 mIV Sound 説明書の URL から版番号を外し、固定 URL にする (2026-11-08、v5.1.0)
 
 - 状態: **実装・自動検証・独立レビュー ACCEPT (2026-11-08、Codex gpt-6.1-sol/xhigh、指摘なし)、master 未統合・未公開** (ブランチ `fix-1737-sound-fixed-url`)。固定 URL の生成物133 HTML＋4画像、転送規則、運用手順を更新した。`python -m unittest scripts/test_gen_effetune_docs.py` 35件成功、生成器の `--check` 成功、sitemap 再生成済み (216 件、`manual/sound/` 133 件、版付き URL 0 件)。redirect 規則は Apache の仕様・ソースとの照合とテスト内 emulator による検査で、実 Apache での確認は公開後の §5 (curl) で行う。正本は申し送り [docs/briefs/sound-docs-fixed-url.md](briefs/sound-docs-fixed-url.md) (サイト点検セッション起票)。
