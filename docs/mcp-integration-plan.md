@@ -6057,3 +6057,24 @@ v5.1.0 の範囲 (利用者決定 2026-11-08):
 - ZIP 内フォルダの旧 key を `list_folder` でも読む案: 画面が読まない値を AI にだけ見せることになり、境界の切り出しも安全にできないため採らない。
 - 状態の組み合わせの検討 (CLAUDE.md): 読み取り専用で、書き込み・非同期の割り込みは増えない。ページの間の★の変更は D の cursor の作りで扱い、
   専用の再試行や回復の仕組みは足さない。まれな失敗 (DB が読めない等) は既存どおり `internal` で返す (既定の割り切り)。
+
+### J. 実装と検証の記録 (2026-11-09)
+
+- 実装: Codex GPT-6.1 Sol / high。`c76ad4d57` (本体)、`e7195eda9` (説明文の製品名)、`dff903da3` (テストの準備)。
+  共有の key 解決は `src/agent_ipc/rating.rs` (`RatingKey`)。仕様からの逸脱はない。
+- 設計担当の検収で見つけた点: 実装担当は tools/list の文字数上限 (40,000 文字・余裕 512) に収めるため、`list_folder` と `list_library` の
+  説明の書き出しを「mIV」に縮めていた。§34 の製品名による道具の選択に反するので「mImageViewer (mIV)」に戻し、
+  `get_item_info` 以外の全ツールの書き出しに製品名があることを検査に足した。tools/list の最大 (整理まで) は 39,464 文字で、余裕は 536 文字。
+  **次にツールや説明を足すときは、文字数の上限に余裕がほとんど無い** (§1.740 の拡充では schema の重複を `$defs` にまとめる等を先に行う)。
+- 独立レビュー: Codex GPT-6.1 Sol / xhigh。設計は 2 巡で ready、実装は `c76ad4d57` で指摘なし、追加の 2 コミットも指摘なしで accept。
+- テスト (設計担当がサンドボックスの外で実行): `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp` 17 + 71 件成功 (実 pipe の 2 件を含む)、
+  `cargo nextest run -p mimageviewer --lib -E 'test(/agent/)'` 271 件成功。`cargo check -p mimageviewer --bin mimageviewer-core` 成功 (新しい警告なし)。
+  初回の本体テストでは新しい ZIP の旧 key の検査 2 件が、データフォルダ作成直後の設定 DB の初期化書き込みを「書き込み」と判定して落ちた。
+  v5.0.0 からの設定読み込みの動きで、既存の検査と同じく設定を先に一度保存してから検査するよう直した。
+- MCP 経由の確認 (2026-11-09、観測者 = 設計担当 ClaudeCode): `build-dev.ps1` の core を隔離データフォルダ (`--data-dir target\dev-runtime\data-1735`) で起動し、
+  `scripts/mcp_stdio_check.py` で `target\dev-runtime\mimageviewer-mcp.exe --data-dir …` に stdio でつないだ。PNG 8 枚と子フォルダ 1 つの試験フォルダに
+  `set_rating` で★2 を 3 枚・★4 を 1 枚付け、`add_tags` でタグを 1 つ付けたあと、`list_folder` の `min_stars: 2, max_stars: 2` は★2 の 3 枚だけ (タグ付き 1 枚を含む)、
+  `max_stars: 0, kinds: ["image"]` は未評価の画像 4 枚、`kinds: ["folder"]` は子フォルダだけ、`min_stars: 2, limit: 2` は 2 件と基本一覧の位置 4 を持つ cursor を返した。
+  `list_library` rated の `stars: 2, max_stars: 2` は★2 の 3 枚だけを返した。範囲の逆転・空の `kinds`・`max_stars` が最小より小さい rated は `-32602` で拒否された。
+  起動中の本体は許可をメモリに持つので、設定 DB を直接書き換えた後は再起動が要った (確認手順上の注意で、製品の挙動の変更ではない)。
+  AI アプリ (Claude Desktop 等) からの確認は未実施 (利用者に依頼する)。

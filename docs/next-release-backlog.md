@@ -71,7 +71,7 @@
 
 ### 1.735 AI 連携で「このフォルダの★N だけ」を直接取り出せない (2026-11-07、v5.0.x)
 
-- 状態: **設計中 (2026-11-08、v5.1.0)**。利用者決定 2026-11-08: v5.1.0 には `list_folder` の行の★・タグ、★の範囲・種類の絞り込み、`list_library` rated の `max_stars` を入れる。設計は `docs/mcp-integration-plan.md` §42。それ以外の拡充は §1.740。 作業ツリー `G:\home\mimageviewer-1735` (branch `feat-1735-mcp-rating-filter`)。
+- 状態: **実装済み・branch `feat-1735-mcp-rating-filter` (2026-11-09、v5.1.0 予定、master 未反映)**。独立レビューは設計・実装とも accept、隔離環境の MCP 経由の確認は設計担当が実施、AI アプリからの確認は利用者待ち。利用者決定 2026-11-08: v5.1.0 には `list_folder` の行の★・タグ、★の範囲・種類の絞り込み、`list_library` rated の `max_stars` を入れる。設計は `docs/mcp-integration-plan.md` §42。それ以外の拡充は §1.740。 作業ツリー `G:\home\mimageviewer-1735` (branch `feat-1735-mcp-rating-filter`)。
 - 利用者方針 (2026-11-07): 次の版では、この項目だけでなく、いろいろな依頼に柔軟に応えられるよう MCP ツール全体を拡充する。比較材料として、同じ試験で Claude Code (ファイルを読む権限あり) はファイルを直接読んで★を調べ、縮小画像と大きな画像も見て選んでいた (利用者の観測)。どの保存先の★を読んだかは未確認 (mIV の★の正本は rating DB で、ファイルの XMP へは `write_rating_to_xmp` が ON のときだけ書く)。
 - 観測 (利用者、v5.0.0 配布ビルドのインストーラで入れた版を Claude Desktop から試験中): 「G:\home\comfyui\202611-12_明治のドレスメーカー の★2 から 3 枚選んで★4 に」と頼むと、AI アプリが★2 だけを取る方法を見つけられず、300 件余りの一覧を取り直しながら★を読む遠回りになった。
 - 現状 (コード、`crates/mcp-server/src/schema.rs`):
