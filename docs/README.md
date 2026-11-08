@@ -101,6 +101,7 @@
 | [next-version-background-color-plan.md](next-version-background-color-plan.md) | 画像・本の余白色と透過画像内背景を分離する設計、回転・別窓・連結の描画契約 |
 | [tray-residency-cpu-spin-investigation.md](tray-residency-cpu-spin-investigation.md) | v2.10.0 のトレイ格納後 main-thread CPU spin の計装結果、producer / consumer、eframe scheduler 根本修正 |
 | [virtual-folders.md](virtual-folders.md) | ZIP/PDF 関連を触るとき。**通常画像との分岐チェックリスト** |
+| [container-type-icon-plan.md](container-type-icon-plan.md) | §1.697 一覧のフォルダ・書庫・PDF を代表画像ではなく種類アイコンで表示する設定。対象の種類と一覧、要求を省く範囲と省かない利用者、描画の状態置き換え、切り替えは既存の一覧読み直しに合流 |
 | [folder-representative-plan.md](folder-representative-plan.md) | §1.275/§1.276 のフォルダ自動代表。候補順、ZIP/PDF の既存 cache 再利用、catalog revision と選定 proof、pin key の互換性 |
 | [folder-representative-idle-archive-plan.md](folder-representative-idle-archive-plan.md) | **§1.398 設計案・独立レビュー前・未実装**。表示周辺の ZIP/PDF idle 作成、優先・取消・context 所有、確定否定の永続化と再探索、移行・回帰・性能検証 |
 | [archive-page-load-scheduler-plan.md](archive-page-load-scheduler-plan.md) | **設計合意済み・未実装**。書庫の高速ページ送りが詰まる問題 (§1.174) の正本。ページ読み込みの受付・待機・実行・取消中・終了を上限つきで所有する `FsPageLoadScheduler`、ZIP 中央目次の再利用、アニメーション通知の分離 |
