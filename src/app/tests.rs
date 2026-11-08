@@ -833,6 +833,9 @@ mod diagnostic_lifecycle;
 #[path = "tests/everything_close_return.rs"]
 mod everything_close_return;
 
+#[path = "tests/everything_select_1691.rs"]
+mod everything_select_1691;
+
 #[cfg(windows)]
 #[path = "tests/ctrl_down_close_1678.rs"]
 mod ctrl_down_close_1678;
