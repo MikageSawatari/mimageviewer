@@ -389,6 +389,8 @@ fn cp932_names(mut bytes: Vec<u8>, placeholder: &str, actual: &str) -> (Vec<u8>,
 #[test]
 fn zip_images_read_legacy_ratings_including_nested_ancestry_and_current_zero_wins() {
     let f = Fixture::new();
+    // Complete startup's shared settings load/migrations before read-only snapshots.
+    settings(|_| {});
     let (_service, owner) = composition(&f);
     let (leaf, legacy_leaf) = cp932_zip("xxxx.png", "日本.png", b"image");
     let (nested, legacy_outer) = cp932_zip("xxxx.zip", "日本.zip", &leaf);
@@ -437,6 +439,8 @@ fn zip_images_read_legacy_ratings_including_nested_ancestry_and_current_zero_win
 #[test]
 fn zip_directory_legacy_only_rating_is_a_documented_grid_limitation() {
     let f = Fixture::new();
+    // Complete startup's shared settings load/migrations before read-only snapshots.
+    settings(|_| {});
     let (_service, owner) = composition(&f);
     // Two levels prevent the grid's redundant-root collapse from hiding the directory.
     let (bytes, legacy) = cp932_names(
