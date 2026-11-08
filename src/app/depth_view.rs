@@ -122,18 +122,17 @@ impl App {
 
     pub(crate) fn depth_entry_allowed(&mut self, fs_idx: usize) -> Result<(), DepthEntryBlock> {
         if self.fullscreen_idx != Some(fs_idx) {
-            return Err(DepthEntryBlock::NotImageFullscreen);
+            return Err(DepthEntryBlock::NotImageViewer);
         }
         #[cfg(windows)]
-        let (main_context, main_presentation, wgpu_available) = (
-            self.projected_viewer_context_id() == self.viewer_context_main(),
-            self.viewer_presentation == ViewerPresentation::Fullscreen,
+        let (main_viewer_presentation, wgpu_available) = (
+            self.depth_presentation_eligible(self.viewer_presentation),
             self.wgpu_render_state.is_some(),
         );
         #[cfg(not(windows))]
-        let (main_context, main_presentation, wgpu_available) = (true, true, false);
+        let (main_viewer_presentation, wgpu_available) = (true, false);
         crate::depth_parallax::entry_allowed(DepthEntryInput {
-            image_fullscreen: self.fullscreen_idx == Some(fs_idx)
+            image_viewer: self.fullscreen_idx == Some(fs_idx)
                 && self.items.get(fs_idx).is_some_and(GridItem::has_page_data),
             is_video: matches!(
                 self.items.get(fs_idx),
@@ -145,8 +144,7 @@ impl App {
                 crate::ui_fullscreen::SpreadPair::Double { .. }
             ),
             continuous_reading: !self.reading_flow.is_paged(),
-            main_context,
-            main_presentation,
+            main_viewer_presentation,
             wgpu_available,
             editing: self.is_overlay_edit_mode_active(),
             page_turning: self.page_turn_barrier_active() || self.page_turn_completion_active(),
@@ -165,21 +163,58 @@ impl App {
         true
     }
 
-    /// Presentation is a context-owned fact; committing a non-main-fullscreen target
-    /// retires Depth before the next viewport can observe the context.
+    /// Entry and presentation commits share the same context/presentation boundary.
+    #[cfg(windows)]
+    pub(crate) fn depth_presentation_eligible(&self, presentation: ViewerPresentation) -> bool {
+        self.projected_viewer_context_id() == self.viewer_context_main()
+            && matches!(
+                presentation,
+                ViewerPresentation::MainWindow | ViewerPresentation::Fullscreen
+            )
+    }
+
+    /// Retire before changing hosts, even between eligible presentations. This keeps
+    /// pending requests, their viewport wake target and GPU resources in one lifetime.
     #[cfg(windows)]
     pub(crate) fn commit_viewer_presentation(
         &mut self,
         target: ViewerPresentation,
         cause: &'static str,
     ) {
-        if self.fs_exclusive_view.is_depth()
-            && (target != ViewerPresentation::Fullscreen
-                || self.projected_viewer_context_id() != self.viewer_context_main())
+        if let Some(message) = self.commit_viewer_presentation_deferred_feedback(target, cause) {
+            self.show_feedback_toast(message);
+        }
+    }
+
+    /// A caller with its own final notification combines this notice before publishing once.
+    /// Both immediate and deferred feedback use this single presentation commit.
+    #[cfg(windows)]
+    pub(crate) fn commit_viewer_presentation_deferred_feedback(
+        &mut self,
+        target: ViewerPresentation,
+        cause: &'static str,
+    ) -> Option<String> {
+        let eligible = self.depth_presentation_eligible(target);
+        let feedback = if self.fs_exclusive_view.is_depth()
+            && (target != self.viewer_presentation || !eligible)
         {
             self.set_fs_exclusive_view(FsExclusiveView::None, cause);
-        }
+            let message = if eligible {
+                match self.keymap.first_chord_label(KeyAction::FsDepthParallax) {
+                    Some(key) => format!(
+                        "3D 写真を終了しました: 表示を切り替えました。{key} キーでもう一度使えます"
+                    ),
+                    None => "3D 写真を終了しました: 表示を切り替えました。上部の 3D ボタンでもう一度使えます".into(),
+                }
+            } else {
+                "3D 写真を終了しました: メインウィンドウの画像表示で使えます".into()
+            };
+            Some(message)
+        } else {
+            None
+        };
         self.viewer_presentation = target;
+        feedback
     }
 
     pub(crate) fn toggle_depth_parallax(&mut self, ctx: &egui::Context, fs_idx: usize) {

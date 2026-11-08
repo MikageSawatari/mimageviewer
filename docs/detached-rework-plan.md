@@ -1455,6 +1455,30 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-08: 3D 写真の MainWindow 対応（段 C 続き・案1）
+
+基点 `29bb7f54b`、正本は [3D 設計 §6.4.1](depth-parallax-plan.md#641-mainwindow-対応-2026-11-08案1を採択実装済み)。
+設計担当 ClaudeCode と独立 Sol / xhigh レビューが、症状パッチではなく、単一 context の表示許可と
+presentation 確定点の寿命を揃える構造変更であると合意済み（2026-11-08 の実装依頼に明記）。
+
+- `App::depth_presentation_eligible` は projected context が main であることと、明示した
+  `MainWindow | Fullscreen` の許可集合を同時に判定する。`depth_entry_allowed` と
+  `commit_viewer_presentation` が同じ述語を使い、`DetachedWindow` と独立 context の全 presentation を拒否する。
+- 共通確定点では実切替または不適格な切替先で `set_fs_exclusive_view(None, cause)` を通して終了する。
+  同じ適格な presentation の再確定は継続。MainWindow ⇔ Fullscreen の終了は実効キー（既定 D）で再入場できると通知し、キー割り当てなしなら上部3Dボタンを案内する。
+  source phase・LRU・要求 receiver・GPU slot は既存 owner の Drop で退役し、新しい D は空 LRU から始まる。
+- 既存 ROOT embedded と child は同じ canvas／パネル／ダイアログを通る。root tail への追加、
+  worker の通知先移管、継続用の追加 repaint はない。fork／park、bundle swap、window ID／HWND／placement は変更しない。
+- 状態 matrix、F11 両方向・F12・close／fork／park、旧要求の遅着と新 owner／slot の保持、
+  ROOT 実描画・書き出し全 phase の modal／小画面 geometry を検証した。限定975件・UI snapshot245件が成功し、独立 Sol / xhigh の最終レビューは受入可・未解決指摘なし。実行ログと詳細は
+  [3D 設計 §10](depth-parallax-plan.md#10-実装の段階-codex-への委任単位) の今回の実装記録に集約する。
+
+追補P3（2026-11-08）: 共通内部commitから終了通知文を返し、通常F12のON/OFF・メディア別窓の同期案内へ統合して最後に1回だけ発行する。通知の組み立てだけを変え、detached述語・表示切替・fork／park・通知slotは変更しない。
+
+評価の経路でpresentationが変わって3Dが終わるときは、後の評価の通知が案内を上書きし得る。まれで、3Dは正しく終わるので割り切る（2026-11-08 設計担当判断）。
+
+まれな失敗は既定のログ＋通知で閉じる。製品起動・実機確認・build-dev は今回実施しない。
+
 ### 2026-11-07: 3D写真 段Cの書き出し取消とviewer終了（BA-7）
 
 設計担当の段C §7.3「窓を閉じる…取り消し」を、既存のfullscreen終了境界へ接続する。

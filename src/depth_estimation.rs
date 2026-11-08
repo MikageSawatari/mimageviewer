@@ -64,23 +64,40 @@ impl DepthPending {
         request_id: u64,
         map: DepthMap,
     ) -> Self {
+        let (pending, complete) = Self::deferred_for_test(context, request_id, map.key);
+        assert!(complete(map));
+        pending
+    }
+
+    /// Hold an old worker reply until after a viewer owner has been retired.
+    #[cfg(test)]
+    pub(crate) fn deferred_for_test(
+        context: ViewerContextId,
+        request_id: u64,
+        key: DepthSourceKey,
+    ) -> (Self, impl FnOnce(DepthMap) -> bool) {
         let stamp = RequestStamp {
             context,
             request_id,
-            key: map.key,
+            key,
         };
         let (reply, rx) = mpsc::channel();
-        reply
-            .send(DepthReply {
+        let complete = move |map| {
+            reply
+                .send(DepthReply {
+                    stamp,
+                    result: Ok(map),
+                })
+                .is_ok()
+        };
+        (
+            Self {
                 stamp,
-                result: Ok(map),
-            })
-            .unwrap();
-        Self {
-            stamp,
-            cancel: Arc::new(AtomicBool::new(false)),
-            rx,
-        }
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx,
+            },
+            complete,
+        )
     }
 
     pub(crate) fn request_id(&self) -> u64 {

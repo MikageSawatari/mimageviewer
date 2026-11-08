@@ -6,6 +6,10 @@ use crate::depth_export::{
 };
 use crate::ui_depth_export::{self as ui, Action};
 
+#[cfg(all(test, windows))]
+#[path = "depth_export_main_window_tests.rs"]
+mod main_window_tests;
+
 #[derive(Clone)]
 pub(crate) struct DisplaySnapshot {
     resource_id: u64,

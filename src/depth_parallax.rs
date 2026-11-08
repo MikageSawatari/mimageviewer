@@ -141,20 +141,19 @@ impl MouseFollow {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct DepthEntryInput {
-    pub image_fullscreen: bool,
+    pub image_viewer: bool,
     pub is_video: bool,
     pub is_animation: bool,
     pub spread_double: bool,
     pub continuous_reading: bool,
-    pub main_context: bool,
-    pub main_presentation: bool,
+    pub main_viewer_presentation: bool,
     pub wgpu_available: bool,
     pub editing: bool,
     pub page_turning: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DepthEntryBlock {
-    NotImageFullscreen,
+    NotImageViewer,
     Video,
     Animation,
     Spread,
@@ -167,12 +166,12 @@ pub(crate) enum DepthEntryBlock {
 impl DepthEntryBlock {
     pub(crate) fn message(self) -> &'static str {
         match self {
-            Self::NotImageFullscreen => "3D 写真は画像のフルスクリーンで使えます",
+            Self::NotImageViewer => "3D 写真は画像の表示中に使えます",
             Self::Video => "動画は 3D 写真に対応していません",
             Self::Animation => "アニメーション画像は 3D 写真に対応していません",
             Self::Spread => "3D 写真は 1 ページ表示で使えます",
             Self::ContinuousReading => "3D 写真はページ表示で使えます",
-            Self::Detached => "3D 写真はメインウィンドウのフルスクリーンで使えます",
+            Self::Detached => "3D 写真はメインウィンドウの画像表示で使えます",
             Self::NoWgpu => "3D 写真には GPU 描画が必要です",
             Self::Editing => "編集モードを終了してから 3D 写真を使ってください",
             Self::PageTurning => "ページめくりの完了後に 3D 写真を使ってください",
@@ -182,15 +181,15 @@ impl DepthEntryBlock {
 pub(crate) fn entry_allowed(i: DepthEntryInput) -> Result<(), DepthEntryBlock> {
     let block = if i.is_video {
         Some(DepthEntryBlock::Video)
-    } else if !i.image_fullscreen {
-        Some(DepthEntryBlock::NotImageFullscreen)
+    } else if !i.image_viewer {
+        Some(DepthEntryBlock::NotImageViewer)
     } else if i.is_animation {
         Some(DepthEntryBlock::Animation)
     } else if i.spread_double {
         Some(DepthEntryBlock::Spread)
     } else if i.continuous_reading {
         Some(DepthEntryBlock::ContinuousReading)
-    } else if !i.main_context || !i.main_presentation {
+    } else if !i.main_viewer_presentation {
         Some(DepthEntryBlock::Detached)
     } else if !i.wgpu_available {
         Some(DepthEntryBlock::NoWgpu)
@@ -530,9 +529,8 @@ mod tests {
     #[test]
     fn entry_rejects_each_incompatible_state() {
         let good = DepthEntryInput {
-            image_fullscreen: true,
-            main_context: true,
-            main_presentation: true,
+            image_viewer: true,
+            main_viewer_presentation: true,
             wgpu_available: true,
             ..Default::default()
         };
@@ -568,14 +566,14 @@ mod tests {
             ),
             (
                 DepthEntryInput {
-                    main_context: false,
+                    image_viewer: false,
                     ..good
                 },
-                DepthEntryBlock::Detached,
+                DepthEntryBlock::NotImageViewer,
             ),
             (
                 DepthEntryInput {
-                    main_presentation: false,
+                    main_viewer_presentation: false,
                     ..good
                 },
                 DepthEntryBlock::Detached,

@@ -743,6 +743,8 @@ mod depth_export;
 mod depth_view;
 pub(crate) use depth_view::DepthEntryRequest;
 #[cfg(all(test, windows))]
+pub(crate) mod depth_main_window_tests;
+#[cfg(all(test, windows))]
 mod depth_setup_entry_tests;
 #[cfg(all(test, windows))]
 mod depth_view_tests;
@@ -91809,19 +91811,22 @@ impl App {
         idx: usize,
         target_presentation: ViewerPresentation,
         reason: &'static str,
-    ) {
+    ) -> Option<String> {
         if matches!(target_presentation, ViewerPresentation::DetachedWindow)
             && self.remote_session_blocks_local_control()
         {
             crate::logger::log(
                 "remote_ipc: rejected detached presentation open outside Local phase",
             );
-            return;
+            return None;
         }
         if self.viewer_presentation != target_presentation {
             self.fs_front_pointer = Default::default();
         }
-        self.commit_viewer_presentation(target_presentation, "presentation_commit");
+        let depth_feedback = self.commit_viewer_presentation_deferred_feedback(
+            target_presentation,
+            "presentation_commit",
+        );
         #[cfg(windows)]
         self.publish_effetune_auto_fullscreen();
         self.native_video_in_window_active =
@@ -91859,6 +91864,7 @@ impl App {
             self.detached_viewer_independent_active,
             self.detached_image_windows.len()
         ));
+        depth_feedback
     }
 
     pub(crate) fn set_always_on_top(
@@ -91975,14 +91981,18 @@ impl App {
                     } else if let Some(idx) = self.fullscreen_idx
                         && self.viewer_item_supports_egui_detached_viewport(idx)
                     {
-                        self.apply_egui_viewer_presentation_for_current_item(
+                        let depth_feedback = self.apply_egui_viewer_presentation_for_current_item(
                             idx,
                             target_presentation,
                             "always_new_media_f12",
                         );
                         // egui 経路は同期適用なのでここで即案内する。
                         if announce_main_hint {
-                            self.show_media_window_main_hint_toast();
+                            self.show_media_window_main_hint_toast_with_depth_feedback(
+                                depth_feedback,
+                            );
+                        } else if let Some(message) = depth_feedback {
+                            self.show_feedback_toast(message);
                         }
                     }
                 }
@@ -91991,6 +92001,8 @@ impl App {
         }
         self.settings.detached_viewer_enabled = !self.settings.detached_viewer_enabled;
         self.settings.save();
+        #[cfg(windows)]
+        let mut depth_feedback = None;
         #[cfg(windows)]
         {
             self.log_detached_image_window_debug(format!(
@@ -92014,7 +92026,7 @@ impl App {
                     if matches!(self.items.get(idx), Some(GridItem::Video(_))) {
                         self.switch_native_video_viewer_presentation(target_presentation, true);
                     } else if self.viewer_item_supports_egui_detached_viewport(idx) {
-                        self.apply_egui_viewer_presentation_for_current_item(
+                        depth_feedback = self.apply_egui_viewer_presentation_for_current_item(
                             idx,
                             target_presentation,
                             if matches!(target_presentation, ViewerPresentation::DetachedWindow) {
@@ -92027,11 +92039,17 @@ impl App {
                 }
             }
         }
-        self.show_feedback_toast(if self.settings.detached_viewer_enabled {
+        let message = if self.settings.detached_viewer_enabled {
             "別ウィンドウモード ON".to_string()
         } else {
             "別ウィンドウモード OFF".to_string()
-        });
+        };
+        #[cfg(windows)]
+        let message = match depth_feedback {
+            Some(reason) => format!("{message} ({reason})"),
+            None => message,
+        };
+        self.show_feedback_toast(message);
     }
 
     /// Explicit seconds are standard-time bases; the publisher applies the preference once.
@@ -92184,12 +92202,20 @@ impl App {
     /// egui 経路は切替と同期に、native 動画経路は `PlacementSwitched` 確定時に呼ばれる。
     #[cfg(windows)]
     pub(crate) fn show_media_window_main_hint_toast(&mut self) {
-        self.show_feedback_warning_on_with_duration(
-            "メインウィンドウ表示に切り替えました。グリッドから開き直すと別ウィンドウで再生されます"
-                .to_string(),
-            ActionSurface::Viewer,
-            3.5,
-        );
+        self.show_media_window_main_hint_toast_with_depth_feedback(None);
+    }
+
+    #[cfg(windows)]
+    fn show_media_window_main_hint_toast_with_depth_feedback(
+        &mut self,
+        depth_feedback: Option<String>,
+    ) {
+        let message = "メインウィンドウ表示に切り替えました。グリッドから開き直すと別ウィンドウで再生されます";
+        let message = match depth_feedback {
+            Some(reason) => format!("{message} ({reason})"),
+            None => message.to_string(),
+        };
+        self.show_feedback_warning_on_with_duration(message, ActionSurface::Viewer, 3.5);
     }
 
     /// native ファイル D&D 完了後のトーストをまとめて出す。

@@ -22,7 +22,7 @@
 
 ### v1 に含める
 
-- 画像フルスクリーンの **3D 表示モード** (以下「3D モード」)。ON/OFF はキーとフルスクリーン上部の
+- メイン context のウィンドウ表示 / 全画面の **3D 表示モード** (以下「3D モード」)。ON/OFF はキーと閲覧上部の
   ボタン。入ると右側に **3D パネル**が出る。
 - 動き: **マウス追従 / 左右 / 円 / 8 の字 / 上下**。強さ・周期・止まる深さ・奥行き整形をパネルで選ぶ。
   設定は画像ごとではなく全体の設定として保存する。
@@ -37,7 +37,7 @@
 | --- | --- |
 | 動画、アニメーション画像 (GIF / APNG / WebP) | フレームごとに深度が変わりちらつく。研究調査 §6 と同じ |
 | 見開き・連結読み | 2 ページを 1 つの奥行きとして扱えない。360° と同じく入口で弾く |
-| **別ウィンドウ (F12 の detached viewer)** | §6.4。状態の組み合わせを減らすため、v1 はメインのフルスクリーンだけ |
+| **別ウィンドウ (F12 の DetachedWindow)、独立 context** | §6.4。v1 はメイン context の MainWindow / Fullscreen だけ。F11 のウィンドウ表示は対象に含める |
 | 360° パノラマ表示との同時使用 | どちらも表示を占有するモード。3D に入ると 360° は終わり、3D 中は 360° に入れない (§6.2) |
 | 深度の手修正、左右並び (SBS)、2 層化と背景補完 | 研究調査 §6 の v1.x / v2 |
 | 先読み (次のページの深度を前もって計算) | dGPU では 30〜50 ms で不要。内蔵 GPU で 1 秒待つ点は試験実装で評価してから |
@@ -300,9 +300,9 @@ hidden / minimized は予約せず、Ready / Failed / OFFでは箱と箱由来�
 `depth_parallax::entry_allowed(...) -> Result<(), DepthEntryBlock>` を 1 つだけ作り、キー・上部ボタン・
 パネルの表示判定が同じ答えを使う (360° の `panorama::entry_allowed` と同じ考え方)。弾く条件:
 
-- 画像フルスクリーンでない、動画、アニメーション画像
+- 画像の閲覧中でない、動画、アニメーション画像
 - 見開きの 2 ページ表示中、連結読み
-- メインの viewer の、メイン窓のフルスクリーン表示でない (§6.4)
+- メイン context の MainWindow / Fullscreen でない (§6.4)。共通の `App::depth_presentation_eligible` で context と許可集合の両方を照合する
 - wgpu の描画状態が無い
 - 編集系のモード (消しゴム・隠蔽加工・補正レイヤー・テキスト注釈・切り取り・SNS 分割) の最中
 
@@ -365,7 +365,7 @@ pub enum DepthSourcePhase {
 - 相互に排他な段階を bool / Option の組で持たず、1 つの enum にする (CLAUDE.md「バグ修正の一般原則」)。
 - パネルの設定 (動き・強さ・周期・焦点・整形) は `Settings` に置く。**画像ごと・context ごとには持たない**。
   `Settings` への項目追加は既存の serde 既定値で読めるので移行は要らない (機能は未リリース)。
-- 3D の ON/OFF をフルスクリーンの外へ持ち越さない。360° の `panorama_intent` に当たるものは作らない
+- 3D の ON/OFF を閲覧終了や presentation の実切替の後へ持ち越さない。360° の `panorama_intent` に当たるものは作らない
   (§6.3 の「閉じたら終わり」で済ませる)。
 
 ### 6.3 遷移
@@ -373,8 +373,9 @@ pub enum DepthSourcePhase {
 | きっかけ | 動作 |
 | --- | --- |
 | D キー / 上部の 3D ボタン | 入口条件を通れば ON。ON なら OFF |
-| 上部バーの × | 3D を OFF (フルスクリーンは閉じない。360° と同じ) |
-| Esc / 一覧へ戻る / フォルダ移動 | フルスクリーンごと閉じ、3D も終わる |
+| 上部バーの × | 3D を OFF (閲覧表示は閉じない。360° と同じ) |
+| Esc / 一覧へ戻る / フォルダ移動 | 既存の閲覧終了で 3D も終わる |
+| MainWindow ⇔ Fullscreen (F11) の実切替 | 共通の `commit_viewer_presentation` で 3D を終了し、D で再入場できるとトーストで知らせる。同じ presentation の再確定では継続 |
 | 静止画の次 / 前ページへ移動 | ON のまま。新しいページの表示が安定したら深度を作る |
 | **続ける条件を満たさなくなった** (動画・アニメーション画像のページへ移った、同じページでアニメーションと後から分かった、見開き・連結読みに切り替わった、F12 で別ウィンドウ表示になった) | **3D を OFF にする** (§6.2 の持ち主を通る)。トーストで知らせる |
 | 3D パネルの「書き出し…」 | モーダルの書き出しダイアログ (§7) |
@@ -406,20 +407,20 @@ pub enum DepthSourcePhase {
 
 ### 6.4 別ウィンドウ (detached viewer) と 3D モード
 
-- **v1 はメインの viewer のフルスクリーンだけ**で使える。理由: 3D モードは毎フレームの再描画・
+- **v1 はメイン context の MainWindow / Fullscreen だけ**で使える。理由: 3D モードは毎フレームの再描画・
   GPU 資源・深度 worker を持つ。複数の viewer で同時に動かすと、`callback_resources` の slot、
   worker の要求の取り合い、park / fork 時の移動先、と組み合わせが増える。v1 では入口で弾いて
   組み合わせを作らない。
 - それでも状態は `ViewerContextBundle` に置く。メインの bundle が mount を外れる間 (active detached を
   mount している間) に App の field として見えてしまわないため。
 - **「メイン」の定義**: context の識別子 (メインの bundle か) と、**今の presentation** (メイン窓の
-  フルスクリーンか、別ウィンドウか) の両方で決める。メインの context 自身も F12 で別ウィンドウ表示に
+  MainWindow / Fullscreen か、別ウィンドウか) の両方で決める。メインの context 自身も F12 で別ウィンドウ表示に
   なる (viewer_context_registry.rs:4936、app.rs:63053) ので、識別子の比較だけでは足りない。
 - **presentation の切替を確定する所で 3D を終える**: 通常の F12 は
   `apply_egui_viewer_presentation_for_current_item` (app.rs:91819 → 91624) で presentation を変え、
   `reset_detached_pause_foreground_modes` は通らない。F12 のキー処理に OFF を足すのではなく、
   **viewer の presentation を書き換える共通の確定点** (実装担当が特定する。F12 の ON / OFF・その他の
-  presentation の切替が共通に通る所) で、切替先がメイン窓のフルスクリーンでなければ §6.2 の持ち主で
+  presentation の切替が共通に通る `commit_viewer_presentation`) で、実際の表示切替または切替先が共通適格性を満たさなければ §6.2 の持ち主で
   `Depth` を終える。360° は別ウィンドウでも使えるので、ここでは `Depth` だけを終える。
   - 加えて §6.3 の描画直前の照合が、確定点を通らない経路があっても別ウィンドウの viewport で 3D を
     描かないことを保証する (2 つは役割が違う: 確定点は状態の持ち主の後始末、照合は描画の安全)。
@@ -430,18 +431,19 @@ pub enum DepthSourcePhase {
   CLAUDE.md「Detached viewer リワーク中のルール」に従い、**ClaudeCode と Codex の双方のレビューで
   症状パッチではない構造的な変更だと合意**し、detached-rework-plan.md §11 に記録する。
 
-#### 6.4.1 MainWindow 対応の設計案 (2026-11-08、未採択・未実装)
+#### 6.4.1 MainWindow 対応 (2026-11-08、案1を採択・実装済み)
 
 対象は **メイン context の `MainWindow` と `Fullscreen`**。`DetachedWindow` と独立 context は
 引き続き対象外で、§6.4 の複数 viewer・GPU slot・worker・park/fork の理由を変更しない。
-以下は設計担当の判断用の案であり、現行の入口・presentation 確定点・描画コードは変更していない。
-参照行は基点 `58816f030`（関数名を追跡の正本とする）。
+設計担当 ClaudeCode が案1を採択し、独立 Sol / xhigh と症状パッチではない構造変更であることに合意した。
+入口と確定点の適格性を共有し、実切替で既存 owner を終える。完了通知の宛先移管や追加 repaint は作らない。
+以下の経路表の参照行は調査基点 `58816f030`（関数名を追跡の正本とする）。実装基点は `29bb7f54b`、証拠は§10。
 
 **描画までの経路と依存先**
 
 | 対象 | MainWindow で通る経路／参照 | 全画面への依存・設計上の扱い |
 | --- | --- | --- |
-| 入口と継続 | `app/depth_view.rs::depth_entry_allowed`:123、`depth_view_may_continue`:156 | 現在 `main_presentation` が Fullscreen 限定。メイン context かつ MainWindow / Fullscreen の共通許可条件へ拡張する。単ページ・静止画・編集・wgpu 等の他条件は維持 |
+| 入口と継続 | `app/depth_view.rs::depth_entry_allowed`、`depth_view_may_continue`、`depth_presentation_eligible` | メイン context かつ MainWindow / Fullscreen の共通許可条件へ拡張済み。単ページ・静止画・編集・wgpu 等の他条件は維持 |
 | F11 / F12 の表示確定 | F11: `ui_fullscreen.rs`:36329 → `native_video.rs::toggle_egui_viewer_window_mode_for_input`:5229 → `toggle_still_window_mode`:5170 → `depth_view.rs::commit_viewer_presentation`:171。F12: `app.rs::apply_egui_viewer_presentation_for_current_item`:91808 → 同じ確定点 | `viewer_presentation` と `native_video_in_window_active` が既存経路で更新される。Depth 用の別 viewport や表示切替 owner は作らない |
 | 静止画 canvas | `ui_fullscreen.rs::fullscreen_embedded_still_active`:32568、`render_fullscreen_viewport_with_root_input`:27376 / `render_fs_body` 呼出し:30172 | MainWindow は root の CentralPanel、Fullscreen は `show_viewport_immediate(fs_id, ...)`。**同じ render_fs_body** を通る。静止画は native fullscreen video presenter / D3D11 HWND を使わない |
 | 表示素材・Depth 描画 | `ui_fullscreen.rs::resolve_fs_processed_payload_and_depth`:13268 → `advance_depth_source`:28777 → `draw_fs_image_with_receipt` → `try_paint_depth`:44604、`depth_view.rs`:252 | 素材選択・fit transform・UV・回転・下地は共通。Depth は表示画素の texture ID を使い、fullscreen の面積を素材 key に含めない。各 pass 先頭:27387 と描画直前:44603 の継続照合は両方残す |
@@ -462,14 +464,15 @@ pub enum DepthSourcePhase {
 | 1: MainWindow ⇔ Fullscreen の実際の切替で Depth を終了し、D で再入場 | 共通確定点で既存 setter を通して終了。推論取消・slot 破棄・旧 viewport の wake の移管を扱わずに済む。終了後は通常2Dの既存 F11 経路だけになる | 切替後に D がもう1回必要。**深度 LRU は DepthViewState 所有で Drop される** (`depth_parallax.rs`:283 / 294 / 488)。新しい D は `new` で空 LRU、readback と推論をやり直す。表示側の色テクスチャが残っていても「キャッシュで即復帰」とは言えない。動きの時刻・mouse offset・panel の開閉も新規状態になる（Settings の値は残る） |
 | 2: 同じ Depth を継続 | context が同じで renderer も共通なので、Ready の色・深度・LRU、Settings、panel_visible、動きの時刻を保持できる。fit / UV / aspect は次 pass の transform から再計算。切替のための再推論と D の手間が無い | ReadingBack / Estimating での切替も普通に起きる。worker 完了の repaint 宛先が旧 viewport に固定されており、現在は移管が無い。パネル rect・pointer・表示 snapshot は新 viewport で描き直す必要がある。Ready だけを扱って継続できたとする実装にはできない |
 
-**推奨は案1**。表示切替中の pending 推論の宛先移管を新設せず、既存の終了経路で組合せを減らせる。
+**採択したのは案1**。表示切替中の pending 推論の宛先移管を新設せず、既存の終了経路で組合せを減らせる。
 現行 Fullscreen → MainWindow も Depth を終了するので、その方向の挙動を悪化させない。
 逆方向にも同じ規則を適用する。ただし新たに使える MainWindow から全画面へ広げる際にも D と再推論が要る。
-この操作負担を受け入れるかは**設計担当の判断待ち**。採択前に実装しない。案2を選ぶなら worker の完了通知先と
-表示切替 owner の接続を別の設計レビュー対象とし、単なる追加 repaint・継続不能 guard で隠さない。
+設計担当がこの再操作・再推論の負担を了承した（2026-11-08）。案2は不採択。
 同じ presentation への再確定は切替でなく、Depth を終了しない。
+終了の案内は `FsDepthParallax` の実効キー割り当て（既定 D）を既存helperで表示する。
+割り当てなしの場合は上部の3Dボタンを案内し、解除したDキーを案内しない。
 
-**MainWindow 特有の組合せ（案1を採る場合）**
+**MainWindow 特有の組合せ（採択仕様）**
 
 | 操作・状態 | 扱い |
 | --- | --- |
@@ -481,31 +484,30 @@ pub enum DepthSourcePhase {
 | ページ一覧（O）、見開き・連結、編集、360° | ページ一覧は `page_overview_available` の占有中入場禁止を維持 (`app/page_overview.rs`:230付近)。Depth中はOを止める。既にページ一覧ならその実行可能キー集合にDは含めない。見開き・連結等へ状態が変わった場合は共通継続照合で終了。3Dから360°への切替を新しく許さない |
 | 書き出し Settings / Running / Finished | modal のまま。F11/F12・D・ページ移動・Shift+B・panel操作を止め、開く要求とRemote取得も拒否する。ROOT上のbackdrop＋dialogでpanel/canvasより前面を保証。native保存先選択もそのmodalの内側。外クリックでcanvasやpanelが動くならNG（依頼19 NG1と同じ受入条件） |
 
-**detached 述語に触れる範囲と合意後の記録案**
+**detached 述語に触れる範囲と構造合意**
 
-- 入口 `DepthEntryInput.main_context / main_presentation` と `commit_viewer_presentation` の終了規則を、
+- 入口 `DepthEntryInput.main_viewer_presentation` と `commit_viewer_presentation` の終了規則を、
   同じ「メイン context かつ MainWindow / Fullscreen」の適格性へ接続する。許可集合を明記するので
   `DetachedWindow` は引き続き除外される。context 比較を落としたり `!= DetachedWindow` だけにしない。
-  案1では適格性に加え「両表示間の実切替で終了」の規則が確定点に必要。
+  `App::depth_presentation_eligible` へ接続した。適格性に加え「実切替で終了」の規則を確定点に置く。
 - `fullscreen_embedded_still_active`、`render_fs_body` の root/child routing、
   `handle_fullscreen_root_key_input`、`apply_egui_viewer_presentation_for_current_item` は読み取り監査対象。
   それらの変更が必要になれば detached viewport 経路に触れる変更として扱う。
   `reset_detached_pause_foreground_modes`、fork/park、bundle swap、window_id/HWND/placement は今回拡張しない。
 - CLAUDE.md「Detached viewer リワーク中のルール」と detached-rework-plan §2 の対象。
-  実装着手前に ClaudeCode と独立Codexレビューで、適格な単一contextの表示許可を広げる構造変更であり、
-  detached の症状を guard 等で隠す変更ではないと合意する。
-- 合意後に detached-rework-plan §11 へ記録する案: 日付・基点・合意者、変更した共通適格性と確定点、
+  実装着手前に ClaudeCode と独立 Sol / xhigh レビューで、適格な単一contextの表示許可を広げる構造変更であり、
+  detached の症状を guard 等で隠す変更ではないと合意済み（2026-11-08）。
+- detached-rework-plan §11 へ記録: 日付・基点・合意者、変更した共通適格性と確定点、
   MainWindow/Fullscreen許可・DetachedWindow/独立context拒否、案1の切替時終了、fork/park不変、
-  ROOT/child双方の照合・slot破棄・モーダルテストの証拠。**今回は§11へ追記しない**。
+  ROOT/child双方の照合・slot破棄・モーダルテストの証拠。実装と併せて§11へ記録する。
 
-**実装の分け方と受入テスト案**
+**受入テスト計画（実行結果は§10）**
 
-1. 設計担当が案1/2と操作負担を決定し、上記の構造合意を取る。現行§6.1/6.3/6.4の全画面限定を
-   採択した仕様へ更新してから、入口・確定点の共通適格性を一塊で実装する。
+1. 採択した案1の入口・確定点の共通適格性を一塊で検査する。
    状態遷移テストは main × MainWindow/Fullscreen/DetachedWindow、独立contextの全表示、
    同じpresentationへの再確定、F11両方向、F12両方向、close/fork/parkを含める。
-   案1ではpending取消・slot退役・D再入場で空LRUを確認。案2なら両方向×全source phaseの継続と
-   旧viewport完了通知から新viewportで無入力のReady到達までを受入条件にする。
+   pending取消・slot退役・D再入場で空LRUを確認。ReadingBack / Estimating 中にF11で切替し、
+   D再入場後に旧結果が届いても新ownerとslotが保たれることを確認する。
 2. ROOT embedded の実viewer headless passで、入口直後と描画直前の照合、同pass内の動画・見開き等への変更、
    不一致素材のcallback不送出、fit固定・下地・回転・リサイズ・panel rectを検査。
    既存Fullscreenの入力・ページ送り・2D transform保存・推論/描画テストを再利用する。
@@ -515,14 +517,14 @@ pub enum DepthSourcePhase {
 4. 1093×614 logical points と通常サイズ、UI倍率100%/200%で、右panelの×・書き出しボタン、
    dialogの見出し・全固定操作行が収まり、必要時だけ本文scrollで末尾へ届くことをgeometryとsnapshotで確認。
    リサイズ・最小化復帰・Alt+Tab・OS保存先dialogのowner/focusは、実装後の承認済みportable実機枠で確認する。
-   今回は実機起動もBのコード変更も行わない。
+   今回は製品起動・実機操作を行わない。
 
 まれな失敗は既定の割り切り（ログ＋通知）で閉じ、失敗別の回復設計は加えない。
 公開文書は段Dでまとめて更新する。現時点の `htdocs/mimageviewer/manual/` のgrepでは「3D 写真」の節自体が
 未追加だった。更新予定は `manual/fullscreen.html` の3D写真節（使用できる表示、F11、F12対象外、Dで再入場の有無、
 パネル・背景・書き出し）、`manual/shortcuts.html`（DとF11）、`manual/faq.html`（対応範囲）、
 `index.html` の3D紹介・対応表示説明。既存Creative 3D LUTの説明は別機能なので対象にしない。
-設計担当への未確定点は案1の再操作・再推論の許容、案2を求める場合のwake所有設計、段Dでの公開説明の採択。
+段Dで公開説明を更新する。案1の再操作・再推論は採択済みであり、wake所有の移管は対象外。
 
 ### 6.5 他の機能との関係 — 「表示を占有するモード」を 1 つの述語にする
 
@@ -1720,6 +1722,112 @@ MainWindow案は§6.4.1だけに記録し、Bの製品コード・detached-rewor
   build-dev・製品起動・stage・commitも行わない。UI文言の追加変更はない。
 - 独立GPT-6.1 Sol / xhighレビュー: BのF11参照誤りを訂正し、未解決指摘なし。
   Bの採択とdetached構造合意は別途ClaudeCodeの判断待ち。
+
+#### 段 C 続き: MainWindow 対応・案1 (2026-11-08、基点 `29bb7f54b`)
+
+設計担当 ClaudeCode の採択と独立 Sol / xhigh の構造合意に従い、§6.4.1 の案1を実装した。
+
+- `app/depth_view.rs::depth_presentation_eligible` に projected main context と
+  `MainWindow | Fullscreen` の共通適格性を置く。入口の pure input はこの結果1つを受け取り、
+  context と presentation を別々に判断する経路を持たない。`DepthEntryBlock` の画像表示・メイン表示の文言を更新した。
+- `commit_viewer_presentation` は実切替または不適格な切替先で既存 setter を通して終了する。
+  同じ適格な presentation では要求・LRU・slot・動きの時計を維持する。終了後のDは空LRUで新規開始。
+  適格な切替先では終了トーストに実効キー（既定D）の再入場案内を出し、割り当てなしなら上部3Dボタンを案内する。
+  対象外の別窓には再入場できるとの案内を出さない。
+- MainWindow の canvas・fit・下地・回転・パネル・待機表示・マウス追従・書き出し・modal は
+  既存共通経路を利用する。ROOT tail・入力側のOFF・推論通知先移管・追加repaint・fork/parkの変更はない。
+- 状態遷移の全context/presentation matrix、同じ表示への再確定、F11両方向、F12、close/fork/parkを検査する。
+  新しい遅延reply fixtureは本物のper-request channelを保持し、ReadingBack / Estimating 中のF11→D後に
+  旧要求の完了が新owner／slotへ採用されないことを検査する。同じcontext／texture keyで再要求し、空LRUからの開始も確認する。
+- ROOT embedded の実passでcallback、通常の素材再採用後に旧Depth描画を送らないこと、入口／描画直前の照合、保存2D transform不変、
+  fit・下地・回転・リサイズ・パネルrect、待機／マウス／modal／小画面を検査する。
+  書き出しは実パネルから開き、Settings／Running／Finishedの初回・後続・再open、
+  外click／wheel／key／ring、dialog内操作、Remote leaseと外部openの拒否を確認する。
+  素材再採用は既存 `FsUploadResult` → `poll_prefetch` を使い、source世代・新texture ID・旧edit/final失効を確認する。
+  旧Readyを人工的に残してpayload ID guardだけを直接実行する検査ではない。同guardは変更せず、callback／receipt発行より前にあることを独立レビューで確認した。
+
+変更ファイル（12本）:
+
+- 製品境界・文言: `src/app/depth_view.rs`, `src/depth_parallax.rs`。
+- 状態回帰・遅延reply fixture: `src/app/depth_view_tests.rs`, `src/depth_estimation.rs`（後者の変更は`cfg(test)`だけ）。
+- 新規ROOT回帰: `src/app/depth_main_window_tests.rs`, `src/app/depth_export_main_window_tests.rs`,
+  `src/ui_fullscreen/depth_main_window_tests.rs`。追加は計11テスト（状態・案内3、ROOT8）。
+- テストmodule登録だけ: `src/app.rs`, `src/app/depth_export.rs`, `src/ui_fullscreen.rs`。
+- 本書と `docs/detached-rework-plan.md` §11。公開文書・PNGは変更しない。
+
+**検証記録**（全Cargoに `MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=1`、通常feature/test profile、基点＋今回の未コミット差分）:
+
+| 実行 | 結果・証拠 |
+| --- | --- |
+| 最終 `cargo nextest run --offline -p mimageviewer --lib -E 'test(/depth\|export\|presentation\|window_mode/)' --test-threads 4` | **975/975成功**、exit0、116.616秒（compile1.22秒）。今回の11件と既存全画面3D・書き出し・表示切替の回帰を含む。`target/depth-mainwindow-final-related.log` |
+| 初回の関連run（通知の実効キー対応前） | **974/974成功**、exit0、123.643秒。`target/depth-mainwindow-related.log`。最終runと重複加算しない |
+| 素材再採用1件の先行確認（上記と重複加算しない） | **1/1成功**、exit0、1.523秒（compile3分05秒）。`target/depth-mainwindow-material.log` |
+| 通知の実効キーと共通matrixの限定確認 | **2/2成功**、exit0、1.294秒（compile3分44秒）。`target/depth-mainwindow-toast.log`。既定D／F13／none×両方向を含む |
+| `cargo test --offline -p mimageviewer --test ui_snapshot`（更新指定なし） | **245/245成功**、exit0、45.68秒。PNG変更なし。`target/depth-mainwindow-ui.log`。後続の通知文だけの修正はこのpure描画fixture群から呼ばれず、描画・fixtureも変わらないため独立レビューで結果の再利用を確認 |
+| `cargo check --offline -p mimageviewer --bin mimageviewer-core` | 成功、exit0、28.37秒（既存warningあり）。`target/depth-mainwindow-check.log` |
+| 最後にworkspace全体へ引数なし `cargo fmt` → `cargo fmt --check` | 両方成功、exit0。`target/depth-mainwindow-fmt.log` |
+| `python scripts/check_ui_glyphs.py` / `git diff --check` | 両方成功、exit0、危険なUI glyph **0件**。`target/depth-mainwindow-glyphs.log` |
+| 独立レビュー（GPT-6.1 Sol / xhigh、同じcontextで継続） | **最終受入可、未解決指摘なし**。固定D案内のP2・fixture修正と上記証跡を照合し、症状パッチではない構造変更として確認。レビュー側の重複Cargo・製品起動なし |
+
+反復中の失敗はfixtureの問題として修正した。最初のcompile2件（MouseWheelのphase/source、モデルpathの借用順）と
+後のprivate入力surface helper呼出し1件はコンパイルエラーであり、テスト成功・失敗の実行件数には算入しない。
+初回実行は11件中5成功・6失敗。通常2D callbackの誤計数を同passのDepth receipt＋callbackで区別し、
+初回Area sizingを済ませてからpanel geometryを検査する形にした。modal検査は下流のring関数直呼びから
+実gamepad dispatchへ変更し、透明素材とdismiss後のpositive controlを追加した。再openも実パネルclickへ揃え、
+非同期workerの終端を復帰1passで決め打ちしない。続く8件は7成功・1失敗（素材のseedだけでは採用にならないfixture）。
+通常の `FsUploadResult` 採用へ直し、上記1件と初回の関連974件で成功した。ここまでのfixture対応はテスト側だけで行った。
+974件成功後の独立レビューP2は、再入場トーストの固定Dが再割り当て・解除に合わない点。
+既存 `first_chord_label(FsDepthParallax)` と割り当てなしの上部3Dボタン案内に修正し、既定D／F13／none×両方向の回帰を追加した。
+限定libのfilterなし全件・workspace full gateは指示どおり実施していない。
+製品起動・実機操作・build-dev・stage／commitは今回の指示に従い実施しない。公開文書は段Dへ残す。
+
+#### 段 C 独立レビュー P3: F12 の終了案内を最後の通知へ統合 (2026-11-08、基点 `29bb7f54b`＋MainWindow対応差分)
+
+MainWindow／Fullscreen の3D中に通常F12を使うと、共通commitが出した終了案内を
+`toggle_detached_viewer_mode` 末尾の「別ウィンドウモード ON」が上書きしていた。
+通知欄は既存の1値を維持し、発行順や追加slotで対処しない。
+
+- `commit_viewer_presentation_deferred_feedback` を共通内部commitとし、既存と同じ適格性・setterでの退役・
+  presentation代入を行って、終了時だけ通知文 `Option<String>` を返す。
+  既存 `commit_viewer_presentation` はその文を発行するwrapperとして残し、他の単独通知callsiteは変更しない。
+- F12専用 `apply_egui_viewer_presentation_for_current_item` は通知文を呼び出し元へ返し、
+  通常F12はON/OFFの最後の1通知へ理由を括弧付きで統合する。途中の終了通知は発行しない。
+- もう一つの同helper呼出し（メディア別窓の同期案内）も同じ規則で統合し、既存のViewer面・Warning・3.5秒を維持する。
+  この枝は現在media限定でDepth対象外だが、返却した通知を捨てたり2回発行する経路を作らない。
+  native動画の非同期確定にも既存案内があるが、Depthに入れないため非同期ownerへ変更を広げない。
+- F11の後段には同型の通知上書きはない。新context構築、fork／park、close／openの各commitも監査した。
+  detached述語・表示切替規則・資源寿命・通知slotは変更しない。
+- 実際のF12処理関数を通す回帰を強化し、main×MainWindow／Fullscreenからの終了で
+  最後の通知がONと3D終了理由を両方含み、発行は1回だけであることを検査する。
+  3DなしのON/OFFの既存文言、メディア案内の文言・面・種類・時間も検査する。
+
+今回追加で変更したファイルは `src/app/depth_view.rs`, `src/app.rs`, `src/app/depth_view_tests.rs`,
+本書と `docs/detached-rework-plan.md` の5本。直前の未コミットMainWindow対応差分を維持する。
+
+評価の経路でpresentationが変わって3Dが終わるときは、後の評価の通知が案内を上書きし得る。まれで、3Dは正しく終わるので割り切る（2026-11-08 設計担当判断）。
+
+検証記録（全Cargoに `MSBUILDDISABLENODEREUSE=1`, `CARGO_BUILD_JOBS=1`、通常feature/test profile）:
+
+| 実行 | 結果・証拠 |
+| --- | --- |
+| F12／表示切替の先行限定run | **624/624成功**、exit0、81.427秒（compile4分39秒）。`target/depth-mainwindow-p3-tests.log`。後続runと重複加算しない |
+
+再レビュー後、評価の3ファイルと `app.rs` のrating publication部分を基点 `29bb7f54b` へ完全に戻した。
+所有境界テスト・評価の既存通知を維持し、F12とメディア案内の統合だけを残す。
+
+復元後の検証（同じ環境変数・通常feature/test profile）:
+
+| 実行 | 結果・証拠 |
+| --- | --- |
+| `grid_cursor_live_selection_writes_are_owned_not_input_helpers` のexact filter | **1/1成功**、exit0、1.291秒（compile5分20秒）。`target/depth-mainwindow-rating-revert-grid.log`。テスト本体・許可リストは変更していない |
+| `cargo nextest run --offline -p mimageviewer --lib -E 'test(/rating_membership\|undo_ops\|undo_stack\|meta_undo\|f12\|media_window_main_hint/)' --test-threads 4` | **134/134成功**、exit0、34.357秒（compile2.14秒）。`target/depth-mainwindow-rating-revert-related.log`。基点へ戻した評価・Undoと、残すF12通知の回帰を含む |
+| `depth_media_main_hint_combines_feedback_without_changing_its_surface` のexact filter | **1/1成功**、exit0、0.417秒。`target/depth-mainwindow-rating-revert-hint.log`。メディア案内の合成・属性を維持 |
+| `cargo check --offline -p mimageviewer --bin mimageviewer-core` | 成功、exit0、1分00秒（既存warningあり）。`target/depth-mainwindow-rating-revert-check.log` |
+| 最後にworkspace全体へ引数なし `cargo fmt` → `cargo fmt --check` | 両方成功、exit0。`target/depth-mainwindow-rating-revert-fmt.log` |
+| `python scripts/check_ui_glyphs.py` / `git diff --check` | 両方成功、exit0、危険なUI glyph **0件**。`target/depth-mainwindow-rating-revert-glyphs.log` |
+| 基点との一致 | fmt後も指定3ファイルはバイト単位で基点と一致し、指定の `git diff 29bb7f54b -- src/app/rating_membership_ops.rs src/app/rating_membership_tests.rs src/undo_ops.rs` は空・exit0。`app.rs` のrating publication部分も基点と一致。`target/depth-mainwindow-rating-revert-parity.log` |
+
+stage／commit・製品起動・build-dev・filterなし全件は実施しない。
 
 ## 11. テスト
 

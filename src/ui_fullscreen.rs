@@ -22,6 +22,8 @@ pub(crate) mod canonical_demand;
 mod compare_original;
 #[cfg(test)]
 mod continuous_quality_tests;
+#[cfg(all(test, windows))]
+mod depth_main_window_tests;
 #[cfg(test)]
 mod depth_tests;
 #[cfg(test)]
