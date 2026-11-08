@@ -7158,3 +7158,23 @@ App field・detached 述語・registry・viewport の追加変更はない。追
 詳細は内部本計画 §9 に記録した。
 全件 gate・製品起動は行っていない。
 前提差分・試験結果・段階の完了状態は内部本計画 §9／§10 に集約する。製品起動・実機確認は未実施。
+
+#### S1 実装レビュー R1: main 帰還と active sibling の分離
+
+`875166c1b` の内部一覧帰還にあった App 全体の active detached session close は、別 context の
+reader が active になった場合にその runtime／viewport を終了し得る P2 と確認した。
+専用の close 手順を除き、物理一覧の採用と同じ main context 専用 teardown を共用する。
+帰還先の Bookmark 方針は既存の同期引数で渡し、独立側の lease／session／viewport に触れない。
+close 受理時の plan を既存 continuation の排他的 variant に保持し、nav の Live／Terminal も型で区別する。
+stale Live は現在の一覧へ閉じ、stale Terminal は後発 reader を閉じず破棄する。
+実独立 reader の session／runtime／viewport 登録／bundle 不変の回帰を追加した。
+存在する cancel token も照合するが、この fixture では pending decode の存在までは保証しない。
+独立 Sol/xhigh reviewer は追加 P1/P2 なしで ACCEPT、症状 guard ではなく既存の所有境界へ戻す構造修正と評価した。
+embedded root 入力は通常時／page-turn barrier 中ともグリッドの keyboard 処理を抑止し、予約を
+既存の描画後 dispatcher に残す。先取りされた予約が embedded early-return で失われる経路を除く構造修正と
+独立 reviewer が確認した。detached 述語・registry の本体・viewport 経路・HWND／rect capture・placement storage・timer は変更しない。
+実行結果は [内部本計画 §9](archive-inner-book-open-return-plan.md) に記録する。
+
+Terminal capture 前から失効していた帰還 plan についても、teardown 宛先を導出する時点で
+配送と同じ currentness helper を使い、CurrentList の Bookmark 方針を適用する。
+保存済み recipe は再計画せず後段で破棄する。独立 reviewer はこの限定補修も ACCEPT と確認した。

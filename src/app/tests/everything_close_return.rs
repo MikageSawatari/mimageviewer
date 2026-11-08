@@ -794,9 +794,12 @@ fn section1708_physical_result_open_retires_search_focus_without_resubmitting() 
 }
 
 // Master bec01bf11 has the same zip_nav_enter/show_current_level bodies.
-// This records that pre-existing boundary; it is not an S1 desired behavior.
+// No search origin yields no folder-history entry, so show_current_level
+// returns after enter already moved nav. The ignored contract asserts the
+// desired consistency until that separate backlog item is fixed.
 #[test]
-fn investigation_master_everything_no_origin_zipdir_list_keeps_rows_while_nav_moves() {
+#[ignore = "pre-existing master bug: Everything without search origin; separate backlog item"]
+fn investigation_master_everything_no_origin_zipdir_rows_match_nav() {
     let mut app = setup_app_for_test();
     let ctx = egui::Context::default();
     app.indexer_init = IndexerInit::Unavailable;
@@ -832,13 +835,19 @@ fn investigation_master_everything_no_origin_zipdir_list_keeps_rows_while_nav_mo
             .iter()
             .all(|item| matches!(item, GridItem::ZipDir { .. }))
     );
-    let rows = app.items.clone();
     let generation = app.items_generation;
-    // The released OFF path: mutate nav, then attempt ExplicitList install.
+    // The released OFF path must adopt rows for the level entered by nav.
     app.zip_nav_enter("A/");
+    app.finish_page_identity_preparation_for_test();
     assert_eq!(app.zip_nav.as_ref().unwrap().current(), &["A"]);
-    assert_eq!(app.items, rows);
-    assert_eq!(app.items_generation, generation);
+    assert_eq!(
+        app.items,
+        vec![GridItem::ZipImage {
+            zip_path: backing,
+            entry_name: "A/001.png".into(),
+        }]
+    );
+    assert!(app.items_generation > generation);
     assert!(app.fullscreen_idx.is_none());
     assert!(!app.sidecar_restore_active());
     assert!(

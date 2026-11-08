@@ -904,7 +904,9 @@ ON のとき、**grid から ZIP/PDF を Enter / ダブルクリックで開く�
 最優先の帰路として加える。「ページを表示」が有効で、現在の本の厳密な祖先に `Chosen` がある場合に限る。
 `AddressBarNav::ZipListReturn` は同一ツリーと階層を検証し、旧ページの close 処理を済ませてから
 メモリ上の一覧へ戻す。読んでいた本のセルを選び、row anchor と reveal を組にして位置を復元する。
-DFS で A から B へ移った場合は B を選ぶ。古い plan はログを出して捨て、別の帰路には置き換えない。
+DFS で A から B へ移った場合は B を選ぶ。帰還先は close 受理時に確定する。
+古い Live plan は理由をログに出し、帰還先だけを捨てて現在の一覧へ閉じる。close 済みの Terminal は捨てるだけ。
+teardown は物理一覧への帰還と同じ main context 専用処理を使い、兄弟ビューアの active session を終了しない。
 Everything・Collection・ブックマーク等の外側の帰路は消費せず残すため、その後の Backspace で
 root から従来の外側へ抜けられる。記録のない直接 open は以下の既存規則を使う。
 Backspace による L2 表示・設定 OFF の通常 close・独立ビューアの close は変更しない。

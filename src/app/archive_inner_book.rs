@@ -16,6 +16,24 @@ pub(crate) enum ZipDirActivationOutcome {
     BookRequested,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum ZipListReturnRequest {
+    Live(crate::zip_tree::ZipListReturnPlan),
+    Terminal(crate::zip_tree::ZipListReturnPlan),
+}
+
+impl ZipListReturnRequest {
+    pub(super) fn plan(&self) -> &crate::zip_tree::ZipListReturnPlan {
+        let (Self::Live(plan) | Self::Terminal(plan)) = self;
+        plan
+    }
+
+    pub(super) fn into_terminal(self) -> Self {
+        let (Self::Live(plan) | Self::Terminal(plan)) = self;
+        Self::Terminal(plan)
+    }
+}
+
 enum ArchiveLevelOpenIntent {
     List,
     Book(ArchiveBookTarget),
@@ -199,27 +217,42 @@ impl App {
         self.zip_nav.as_ref()?.chosen_list_return_plan()
     }
 
-    pub(super) fn apply_zip_list_return(&mut self, plan: crate::zip_tree::ZipListReturnPlan) {
-        if self.projected_viewer_context_id() != self.viewer_context_main()
-            || self.is_snapshot_active()
-            || self
-                .zip_nav
-                .as_ref()
-                .is_none_or(|nav| !nav.matches_list_return_plan(&plan))
-        {
-            crate::logger::log("archive list return dropped: stale tree/choice/context");
+    pub(super) fn zip_list_return_stale_reason(
+        &self,
+        plan: &crate::zip_tree::ZipListReturnPlan,
+    ) -> Option<&'static str> {
+        if self.is_snapshot_active() {
+            Some("snapshot active")
+        } else {
+            match self.zip_nav.as_ref() {
+                None => Some("archive navigation missing"),
+                Some(nav) if !nav.matches_list_return_plan(plan) => {
+                    Some("archive tree/current level/choice changed")
+                }
+                Some(_) => None,
+            }
+        }
+    }
+
+    pub(super) fn apply_zip_list_return(&mut self, request: ZipListReturnRequest) {
+        if self.projected_viewer_context_id() != self.viewer_context_main() {
+            crate::logger::log("archive list return dropped: foreign context");
             return;
         }
-        // A Terminal recipe has already torn its viewer down. A Live recipe must
-        // finish on the OLD page rows, before replacing indices with list cells.
-        if self.fullscreen_idx.is_some() {
-            #[cfg(windows)]
-            {
-                self.transfer_fullscreen_viewport_retirement();
-                self.begin_active_detached_session_close("archive_list_return");
-                self.finish_active_detached_session_close("archive_list_return");
+        let needs_close = matches!(&request, ZipListReturnRequest::Live(_));
+        let (ZipListReturnRequest::Live(plan) | ZipListReturnRequest::Terminal(plan)) = request;
+        if let Some(reason) = self.zip_list_return_stale_reason(&plan) {
+            crate::logger::log(format!("archive list return destination dropped: {reason}"));
+            if needs_close && self.fullscreen_idx.is_some() {
+                self.accept_current_page_list_request();
+                self.finish_main_fullscreen_list_return(FullscreenCloseDestination::CurrentList);
             }
-            self.close_fullscreen_for_destination(FullscreenCloseDestination::ChosenZipList);
+            return;
+        }
+        // Live must close its owning reader on OLD rows. Terminal has already
+        // completed that close and must never tear down a later viewer.
+        if needs_close && self.fullscreen_idx.is_some() {
+            self.finish_main_fullscreen_list_return(FullscreenCloseDestination::ChosenZipList);
         }
         let Some(nav) = self.zip_nav.as_mut() else {
             return;

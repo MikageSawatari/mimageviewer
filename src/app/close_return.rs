@@ -20,39 +20,27 @@ pub(crate) enum FullscreenCloseContinuation {
     #[default]
     None,
     Live,
+    LiveZipListReturn(crate::zip_tree::ZipListReturnPlan),
     Terminal(Box<CloseReturn>),
 }
 
 impl FullscreenCloseContinuation {
-    pub(super) fn terminal_destination(&self) -> FullscreenCloseDestination {
-        match self {
-            Self::Terminal(request)
-                if matches!(
-                    &request.effect,
-                    CloseReturnEffect::Navigation {
-                        nav: crate::ui_main::AddressBarNav::ZipListReturn(_),
-                        ..
-                    }
-                ) =>
-            {
-                FullscreenCloseDestination::ChosenZipList
-            }
-            _ => FullscreenCloseDestination::CurrentList,
-        }
+    pub(super) fn is_live(&self) -> bool {
+        matches!(self, Self::Live | Self::LiveZipListReturn(_))
     }
     pub(crate) fn is_pending(&self) -> bool {
-        matches!(self, Self::Live | Self::Terminal(_))
+        self.is_live() || matches!(self, Self::Terminal(_))
     }
     pub(crate) fn clear(&mut self) {
         *self = Self::None;
     }
     pub(crate) fn request_live(&mut self) {
-        if !matches!(self, Self::Terminal(_)) {
+        if !matches!(self, Self::Terminal(_) | Self::LiveZipListReturn(_)) {
             *self = Self::Live;
         }
     }
     pub(super) fn cancel_live_request(&mut self) {
-        if matches!(self, Self::Live) {
+        if self.is_live() {
             self.clear();
         }
     }
@@ -82,6 +70,23 @@ enum CloseReturnEffect {
 }
 
 impl App {
+    /// A captured Terminal recipe still has to be current when its reader is
+    /// torn down. Later delivery cannot repair a stale bookmark-preserve policy.
+    pub(super) fn fullscreen_close_destination(&self) -> FullscreenCloseDestination {
+        if self.projected_viewer_context_id() == self.viewer_context_main()
+            && let FullscreenCloseContinuation::Terminal(request) = &self.pending_return_to_parent
+            && let CloseReturnEffect::Navigation {
+                nav: crate::ui_main::AddressBarNav::ZipListReturn(request),
+                ..
+            } = &request.effect
+            && self.zip_list_return_stale_reason(request.plan()).is_none()
+        {
+            FullscreenCloseDestination::ChosenZipList
+        } else {
+            FullscreenCloseDestination::CurrentList
+        }
+    }
+
     /// Capture existing navigation identity without taking selection or adopting rows.
     pub(super) fn close_return_origin(&self) -> Option<CloseReturnOrigin> {
         if self.projected_viewer_context_id() != self.viewer_context_main() {
@@ -148,7 +153,28 @@ impl App {
             let Some(origin) = app.close_return_origin() else {
                 return;
             };
-            let parent = if app.chosen_zip_list_return().is_some()
+            if matches!(
+                app.pending_return_to_parent,
+                FullscreenCloseContinuation::Terminal(_)
+            ) {
+                return;
+            }
+            let parent = if matches!(
+                app.pending_return_to_parent,
+                FullscreenCloseContinuation::LiveZipListReturn(_)
+            ) {
+                let FullscreenCloseContinuation::LiveZipListReturn(plan) =
+                    std::mem::take(&mut app.pending_return_to_parent)
+                else {
+                    unreachable!()
+                };
+                Some((
+                    crate::ui_main::AddressBarNav::ZipListReturn(ZipListReturnRequest::Terminal(
+                        plan,
+                    )),
+                    None,
+                ))
+            } else if app.chosen_zip_list_return().is_some()
                 || app.bookmark_view_back_nav().is_some()
                 || app.auto_open_for_current_container()
             {
@@ -159,9 +185,9 @@ impl App {
             let Some((nav, selection)) = parent else {
                 return;
             };
-            let effect = if matches!(&nav, crate::ui_main::AddressBarNav::ZipListReturn(_)) {
+            let effect = if let crate::ui_main::AddressBarNav::ZipListReturn(request) = nav {
                 CloseReturnEffect::Navigation {
-                    nav,
+                    nav: crate::ui_main::AddressBarNav::ZipListReturn(request.into_terminal()),
                     select_after_load: selection,
                 }
             } else if let Some(BookmarkViewState::Opening { target, grid }) =
@@ -244,7 +270,10 @@ impl App {
         &self,
     ) -> Option<(crate::ui_main::AddressBarNav, Option<String>)> {
         if let Some(plan) = self.chosen_zip_list_return() {
-            return Some((crate::ui_main::AddressBarNav::ZipListReturn(plan), None));
+            return Some((
+                crate::ui_main::AddressBarNav::ZipListReturn(ZipListReturnRequest::Live(plan)),
+                None,
+            ));
         }
         if self.everything_book_close_return_available() {
             // The accepted Search owner holds the logical source and full-path anchor,
@@ -286,6 +315,9 @@ impl App {
         use FullscreenCloseContinuation as State;
         match std::mem::take(&mut self.pending_return_to_parent) {
             State::None => None,
+            State::LiveZipListReturn(plan) => Some(crate::ui_main::AddressBarNav::ZipListReturn(
+                ZipListReturnRequest::Live(plan),
+            )),
             State::Live => {
                 if let Some((nav, selection)) = self.resolve_close_return_navigation() {
                     if selection.is_some() {

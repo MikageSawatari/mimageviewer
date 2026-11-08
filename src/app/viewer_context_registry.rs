@@ -6324,7 +6324,7 @@ mod tests {
                     app.handle_fullscreen_close_request();
                     assert!(matches!(
                         app.pending_return_to_parent,
-                        FullscreenCloseContinuation::Live
+                        FullscreenCloseContinuation::LiveZipListReturn(_)
                     ));
                 }
                 // Keep the actual Terminal recipe identity, not merely its enum tag.
@@ -6394,7 +6394,14 @@ mod tests {
                         .matches_list_return_plan(&plan)
                 );
                 match (&app.pending_return_to_parent, terminal_pointer) {
-                    (FullscreenCloseContinuation::Live, None) => {}
+                    (FullscreenCloseContinuation::LiveZipListReturn(request), None) => {
+                        assert!(
+                            app.zip_nav
+                                .as_ref()
+                                .unwrap()
+                                .matches_list_return_plan(request)
+                        );
+                    }
                     (FullscreenCloseContinuation::Terminal(request), Some(pointer)) => {
                         assert_eq!(std::ptr::from_ref(request.as_ref()), pointer);
                     }

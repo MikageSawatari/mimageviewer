@@ -101,17 +101,27 @@ enum ZipListChoice {
 - `startup_list_restore` (保存される「最後に明示的に開いた一覧」) は使わない・変えない。プロセスをまたぐ保存値で、
   今のツリーとの相関も DFS で作った階層の未表示性も示せないため。
 - 帰路の解決: close の時点で、**現在の本を含む最も深い `Chosen` の厳密な祖先階層**を探す。
-- 配送: 既存の `FullscreenCloseContinuation` / `CloseReturnEffect::Navigation` に、typed な nav
-  `AddressBarNav::ZipListReturn(plan)` を載せる。plan は owner から導いた一回限りの値で、
+- 配送: close を受理した時点で帰還先を確定し、既存の `FullscreenCloseContinuation::LiveZipListReturn(plan)`
+  に保持する。配送までに refresh 等で記録が消えても、帰還先を再解決しない。
+  `AddressBarNav::ZipListReturn(ZipListReturnRequest::{Live, Terminal}(plan))` で close 済みかも型で運ぶ。
+  plan は owner から導いた一回限りの値で、
   別の来歴 owner ではない (中身: 帰還する階層の深さと display prefix、読んでいた本の prefix、`rows_above`、
   ツリーの identity)。`transfer_terminal_close_return` は解決済みの帰還先から effect を選び、`ZipListReturn` なら
   `Navigation` のまま保持する (`BookmarkViewState::Opening` で `BookmarkNavigation` に置き換えない・消費しない)。
 - 適用の順序 (Live / Terminal / `handle_fullscreen_close_request_immediate` / in-window 静止画の early-return は、
   すべて既存の `apply_fullscreen_close_nav_immediate` の新しい分岐へ集める):
+  embedded の root 入力は通常時／page-turn barrier 中ともグリッド keyboard 処理を抑止し、
+  close continuation を既存の描画後 dispatcher まで保持する。
   1. plan が現在の main の同じツリー (`Arc` の同一性) と、まだ `Chosen` の階層を指すことを確かめる。
-     外れていたら**plan を捨ててログを出すだけ**にする (別の帰路へ置き換えない)。
-  2. 旧 items が有効なうちに、既存の close teardown (`close_fullscreen`、linked viewport の退役、
-     旧ページの編集プレビュー捕捉) を完了する。Terminal はすでに teardown 済みなので、共通の consumer で区別する。
+     外れていたら帰還先だけを捨てて理由をログに出す。**Live で owner の fullscreen がまだ開いていれば、
+     `FullscreenCloseDestination::CurrentList` として現在の一覧へ閉じる**。外側の親など別の帰還先は再解決しない。
+     Terminal は close 済みなので捨てるだけとし、後から開いた reader を閉じない。別 context への配送も捨てる。
+  2. 旧 items が有効なうちに、物理一覧へ戻る既存経路と同じ main context 専用 teardown
+     (`change_main_context_for_visible_grid_for_destination`) を実行する。帰還先を引数で渡すだけで、
+     App 全体の active detached session を閉じる処理は追加しない。linked viewport の後処理も既存の経路に任せる。
+     Terminal は close 済みなので teardown しない。`fullscreen_idx` の有無から Live/Terminal を推定しない。
+     Terminal capture 前から plan が失効していた場合も、teardown の宛先導出時に同じ currentness 検証を行い、
+     `CurrentList` の方針で閉じる。保存した recipe は再計画せず、後段で stale Terminal として破棄する。
   3. 帰還する階層まで stack を pop し、`zip_nav_show_current_level(ExplicitList)` で表示する。
   4. 読んでいた本のセルを選び、`set_row_anchor(rows_above)` と `set_reveal_requested(true)` を**常に組で**設定する
      (install は位置を 0 にして reveal を解除し、anchor は reveal 時にだけ消費されるため)。実際の layout で
@@ -125,7 +135,7 @@ enum ZipListChoice {
 | 同じ書庫内の本の切替 (フルスクリーン DFS) | DFS は clone 上で stack を pop / push して確定するだけなので、共通の祖先階層の値はそのまま残る。新しく push した階層は `Unseen` |
 | Backspace で階層を戻る | pop するだけ。親の `Chosen` は残る |
 | 別の書庫・フォルダの採用 | `zip_nav` ごと破棄される (既存) |
-| refresh (ツリーの作り直し) | 記録を捨てる (全階層 `Unseen`)。書庫の中身が読書中に変わるのはまれなので、今の帰路へ戻る割り切り |
+| refresh (ツリーの作り直し) | 記録を捨てる (全階層 `Unseen`)。受理済みの Live plan が stale なら帰還先だけを捨て、現在の一覧へ閉じる |
 | 同じ階層の再 materialize (ソート・ピン) | stack を変えないので維持 |
 | 履歴 Back/Forward | `restore_prefix` で作った祖先は `Unseen` |
 | 同じ書庫内へのブックマーク移動・Required leaf (`enter` で既存 stack に積む経路を含む) | 直接 open の意味なので、**全階層の記録を捨てる** |
@@ -748,9 +758,82 @@ FFmpeg DLL を `target/debug/deps` へ実体コピーした）:
 - `zip_nav_enter` は先に nav を A へ進めるが、main の `zip_nav_show_current_level` は履歴採用に必要な source entry を
   取得できず master `:40207`〜`:40208` で return する。items・items generation・address の install は実行されず、
   **nav は A、表示は元の A/B 一覧**という不整合になる。「ページを表示」OFF の既存経路でも成立し、S1 が作った不具合ではない。
-- 調査テスト `everything_close_return::investigation_master_everything_no_origin_zipdir_list_keeps_rows_while_nav_moves`
-  は、OFF／origin なし／変更していない `zip_nav_enter` でこの境界を確認する。S1 の正常動作契約には含めず、
-  別 backlog で Search の一覧採用 owner を直す際に更新する。今回、Everything の製品コードは変更していない。
+- 調査テストは実装レビュー R1 の指示により、望ましい「表示と nav が一致する」契約
+  `everything_close_return::investigation_master_everything_no_origin_zipdir_rows_match_nav` へ変更した。
+  `#[ignore = "pre-existing master bug: Everything without search origin; separate backlog item"]` とし、
+  不具合のある挙動を正常な契約にはしない。根因コメントを残し、別 backlog で修正したときに有効化する。
+  今回、Everything の製品コードは変更していない。
+
+### S1 実装レビュー R1 修正（`875166c1b` に対する追補）
+
+- レビュー要約の P2／P3 3 件はすべてコードで確認した（指摘本文ファイルは worktree に見つからず、依頼文の要約を使用）。
+- P2: 内部一覧の consumer だけが App 全体の active detached session を終了していた。
+  物理一覧へ戻る経路の main context 専用 teardown を共用し、帰還先の Bookmark 方針だけ同期引数で渡す。
+  これで main の Live 配送までに別 reader が active になっても、その session／runtime／viewport／bundle に触れない。
+- 設計担当の追加判断: close 受理時に `LiveZipListReturn(plan)` へ確定し、配送時に新しい帰還先を作らない。
+  nav の payload は `ZipListReturnRequest::{Live, Terminal}` とし、stale Live は現在の一覧への close を完了する。
+  stale Terminal は破棄するだけで、後発 reader を閉じない。新しい App field／pending は追加しない。
+- P3-1: scroll 回帰を `render_grid` の実 headless frame へ置換した。details、6→8 列、最終行について、
+  選択セル・描画 geometry による offset・anchor と reveal の消費を検証する。in-window は pending 無しから
+  実 App update に Esc を渡し、embedded 描画内で生じた close を描画後に配送する。
+- stale Live の実 update 試験により、既存の embedded root routing が予約を `handle_keyboard` に先取りさせ、
+  embedded early-return で失う経路も確認した。embedded は通常時／page-turn barrier 中とも入力を所有し続け、
+  予約は既存の描画後 dispatcher に残す。同じ continuation の消費箇所を揃える構造修正であると独立 reviewer と合意した。
+- P3-2: 上記の origin 無し Everything 調査を ignored な期待契約へ変更した。正常な S1／Everything 回帰は維持する。
+- 既存テストの期待変更: `section1676_real_refresh_clears_choice_and_rejects_old_plan` を
+  `section1676_real_refresh_stale_live_plan_closes_to_current_list` へ変更し、stale Live でも閉じる採択仕様を検証する。
+  `section1676_choice_independent_close_preserves_main_live_terminal_and_sibling_queues` は main の Live variant が
+  確定 plan を持つことを検証する。調査テストの改名・ignore は上記のとおり。弱化・削除は行わない。
+  `embedded_container_close_request_allows_parent_return_to_be_consumed` は、グリッドへの委譲を期待していた箇所を
+  embedded owner と pending の保持へ変更する。帰還そのものの既存 assertion は維持する。
+- 独立 Sol/xhigh reviewer は本追補を **ACCEPT（追加 P1/P2 なし）**、所有境界を正す構造修正と評価した。
+  自動検証結果は下記に追記する。HWND／rect capture、viewport identity、placement storage、timer は変更しない。
+- 途中版 S1 は 46 件中 43 成功・3 失敗（exit 100）。うち embedded の予約先取りによる 2 件は、
+  コンパイル中に上記の入力所有修正と実 Esc 試験へ更新した。残る兄弟 fixture は一覧用の設定 OFF のまま
+  independent descriptor を呼び、通常 fullscreen の表示方針を選んでいた。実 caller と同じ独立表示設定を
+  main close 受付後に設定し、descriptor 前に deferred viewport を有効化した。実 sibling の fullscreen／
+  DetachedWindow／独立 owner の assertion を追加し、session／runtime／viewport／items の不変条件は維持した。
+  最終 core check は入力所有修正後も成功（exit 0）。途中版のテスト結果を最終成功証跡には使わない。
+- 追加の限定レビューで、失効済み frozen Live を Terminal に移した後の teardown が
+  `ChosenZipList` 方針を使い続ける契約漏れも確認した。宛先導出を `App::fullscreen_close_destination` に集約し、
+  配送と同じ plan currentness helper を参照する。失効済みなら `CurrentList` として Bookmark owner を破棄し、
+  Terminal recipe 自体は変えず後段で捨てる。新しい状態・再計画は追加しない。
+  独立 reviewer は限定差分を ACCEPT、新規 P1/P2 なしと確認した。以下の 47 件等はこの追加補修前の有効証跡であり、
+  補修後の指定検証を別途記録する。
+
+レビュー R1 修正の追加 Terminal 補修前の検証（`MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=1`、
+`TEMP`／`TMP` は worktree の `target/codex-tmp`、既存 native 依存物を再利用）:
+
+| コマンド／filter | 結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 最終製品コードで成功、exit 0 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/section167[56]/)'` | **47/47 成功、失敗 0、exit 0**。新規の in-window 実 Esc、barrier、stale Live 実 update、兄弟 session／runtime／viewport 不変を含む |
+| 上記の指定既存回帰 filter（変更なし） | **344/344 成功、失敗 0、exit 0**。origin 無し Everything の既知不具合契約 1 件は指定の理由で ignore |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/detached_binding_identity\|detached_window_manager::tests\|main_context_change\|main_context_preserve_hands_off_active_viewport_to_passive\|main_non_detached_open_does_not_close_active_detached_context_session\|active_detached_session_owns_visible_viewport_until_closed\|detached_viewer_close_ends_session_but_keeps_mode_enabled\|embedded_container_close_request_allows_parent_return_to_be_consumed\|page_turn_.*barrier/)'` | **48/48 成功、失敗 0、exit 0** |
+| `cargo fmt`／`cargo fmt --check`／`git -c core.safecrlf=false diff --check` | すべて exit 0 |
+| `python scripts/check_ui_glyphs.py` | 違反 0、exit 0 |
+
+追加 Terminal 補修後の最終検証（同じ環境変数、filter、native 依存物）:
+
+| コマンド／filter | 結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 成功、exit 0 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/section167[56]/)'` | **48/48 成功、失敗 0、exit 0**。失効済み frozen Live→Terminal capture→CurrentList teardown の回帰を追加 |
+| 上記の指定既存回帰 filter（変更なし） | **344/344 成功、失敗 0、exit 0**。origin 無し Everything の既知不具合契約 1 件は ignore |
+| 上記の追加 detached／main context／barrier filter（変更なし） | **48/48 成功、失敗 0、exit 0** |
+| `cargo fmt`／`cargo fmt --check`／`git -c core.safecrlf=false diff --check` | すべて exit 0 |
+| `python scripts/check_ui_glyphs.py` | 違反 0、exit 0 |
+
+確認用の `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-dev.ps1 -PreserveRuntime` は、
+core と全 companion のコンパイル・FFmpeg／CRT 配置後に、worktree の `vendor/miv-sound` が欠けており exit 1。
+`C:\home\mimageviewer_vendor_backup\miv-sound-0.15.0-miv.7\artifact` を現在の追跡済み manifest で全ファイル照合し、
+復元先の workspace 内 containment／reparse point 不在を確認して実体コピーした。
+コピー後も manifest・VERSION・PE・通知の検査に成功。新しい候補の承認や追跡ファイルの更新は行っていない。
+復元後、同じ `build-dev.ps1 -PreserveRuntime` は **exit 0** で完了した。
+core・remote・EPUB PDF worker・MCP adapter・music-video editor と必要 DLL／承認済み bundle を
+`target/dev-runtime` に配置し、最終 PE 検査も runtime 4 本／PE 5 本で成功。
+core は normal feature set（portable 無効）であり、製品起動・通常 profile のデータ操作・全 lib／workspace suite は行っていない。
+S1 の追補差分は未コミット。S2／S3 の内部 resume・複数窓の内部本 activation は未変更。
 
 ## 10. 実装段階と規模
 
@@ -763,8 +846,8 @@ FFmpeg DLL を `target/debug/deps` へ実体コピーした）:
 
 各段階で独立レビューを行い、修正済みfindingの影響範囲だけを再検証する。S1単独を今回要求の完成・リリース可能状態とは扱わない。
 
-S1 の差分・追補・指定 focused 検証は完了（上記 §9）。未コミットの差分は設計担当が受け取り、
-検証結果と独立レビューを確認して段階の commit 境界を確定する。S2／S3／S4 は未着手。
+S1 本体は `875166c1b` に commit 済み。実装レビュー R1 の修正は未コミットで設計担当へ返し、
+上記 §9 の検証結果と独立レビューを確認して追補の commit 境界を確定する。S2／S3／S4 は未着手。
 
 追加対象には `book_resume_key` 相当の共通module、`book_resume_db`、`rename_key_migration`、Remoteのcontainer/session/ui、descriptorを構築する `startup_ops`、archive conversion continuationを含む。
 

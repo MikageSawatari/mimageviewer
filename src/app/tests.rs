@@ -42743,9 +42743,8 @@ mod favorite_adjustment_defaults_tests {
     }
 
     /// ウィンドウ内フルスクリーン (embedded still) では root 側キー処理が
-    /// `handle_keyboard` を毎フレーム抑止する。ただし「ページを直接開く」設定 ON の
-    /// ZIP/PDF close 要求で `pending_return_to_parent` が立っているときは、入力ナビ合流点に
-    /// 親一覧へのナビ予約を消費させる必要がある。
+    /// `handle_keyboard` を毎フレーム抑止する。ZIP/PDF close の continuation も
+    /// グリッドに先取りさせず、描画後の dispatcher に渡して early-return 前に消費する。
     #[cfg(windows)]
     #[test]
     fn embedded_container_close_request_allows_parent_return_to_be_consumed() {
@@ -42771,9 +42770,10 @@ mod favorite_adjustment_defaults_tests {
 
         app.pending_return_to_parent.request_live();
         assert!(
-            !app.handle_fullscreen_root_key_input(&egui::Context::default()),
-            "parent-return reservation must reach handle_keyboard on the next frame"
+            app.handle_fullscreen_root_key_input(&egui::Context::default()),
+            "embedded close must remain owned by the post-render dispatcher"
         );
+        assert!(app.pending_return_to_parent.is_pending());
         let nav = app
             .take_pending_return_to_parent_nav()
             .expect("parent return request should become a direct nav");

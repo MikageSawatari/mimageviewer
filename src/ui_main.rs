@@ -850,7 +850,7 @@ enum PinButtonClick {
 
 #[derive(Debug)]
 pub(crate) enum AddressBarNav {
-    ZipListReturn(crate::zip_tree::ZipListReturnPlan),
+    ZipListReturn(crate::app::ZipListReturnRequest),
     Direct(PathBuf, crate::app::StartupListIntent),
     GridVirtual(crate::app::GridVirtualOpenIntent),
     RatingSource {

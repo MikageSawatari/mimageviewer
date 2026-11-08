@@ -374,40 +374,117 @@ fn section1676_unseen_parent_keeps_old_return() {
 
 #[test]
 fn section1676_scroll_restored_after_layout() {
-    for (cols, cell_h, selected) in [(5, 150.0, 22), (1, 28.0, 39)] {
+    for (details, selected) in [(false, 72), (true, 72), (false, 119)] {
         let mut app = setup_app_for_test();
-        let ctx = egui::Context::default();
         let book = app.tmp.path().join("outer.zip");
-        let names = (0..40)
-            .map(|i| format!("book-{i:02}/001.png"))
+        let names = (0..120)
+            .map(|i| format!("book-{i:03}/001.png"))
             .collect::<Vec<_>>();
         write_pages(&book, &names.iter().map(String::as_str).collect::<Vec<_>>());
+        let ctx = egui::Context::default();
         open_list(&mut app, &ctx, &book);
-        app.grid_scroll
-            .record_geometry(GridScrollGeometry::new(4, 200.0, 600.0, 2000.0));
-        app.grid_scroll
-            .set_position(((selected / 4) - 2) as f32 * 200.0);
-        app.selected = Some(selected);
-        let prefix = format!("book-{selected:02}/");
-        app.settings.auto_fullscreen_zip_pdf = true;
-        activate(&mut app, &ctx, &prefix, true);
-        app.handle_fullscreen_close_request_immediate();
-        settle(&mut app, &ctx);
-        assert_returned(&app, &[], &prefix);
-        assert_eq!(app.grid_scroll.row_anchor(), Some(2));
-        assert!(app.grid_scroll.reveal_requested());
-        let viewport_h = cell_h * 3.0;
-        let natural_h = app.items.len().div_ceil(cols) as f32 * cell_h;
-        app.last_viewport_h = viewport_h;
-        app.grid_scroll
-            .record_geometry(GridScrollGeometry::new(cols, cell_h, viewport_h, natural_h));
-        app.apply_scroll_to_selected(cols, cell_h);
-        let wanted = (selected / cols).saturating_sub(2) as f32 * cell_h;
-        assert_eq!(
-            app.grid_scroll.offset(),
-            wanted.min((natural_h - viewport_h).max(0.0))
+        app.settings.grid_cols = 6;
+        app.settings.thumb_aspect_auto = false;
+        app.settings.grid_view_mode = if details {
+            crate::settings::GridViewMode::Details
+        } else {
+            crate::settings::GridViewMode::Thumbnail
+        };
+        app.settings.details_sort_key = crate::settings::DetailsSortKey::Name;
+        app.settings.details_sort_ascending = true;
+        let mut configured = false;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(1280.0, 1000.0))
+            .with_step_dt(0.01)
+            .build_ui_state(
+                move |ui, app: &mut AppTestEnvForTest| {
+                    let ctx = ui.ctx().clone();
+                    if !configured {
+                        crate::ui_fonts::configure_fonts(&ctx);
+                        configured = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    app.begin_grid_click_input_frame(&ctx);
+                    assert!(app.render_grid(ui).is_none());
+                },
+                app,
+            );
+        harness.run_steps(6);
+        let prefix = format!("book-{selected:03}/");
+        let index = child(harness.state(), &prefix);
+        let geometry = harness.state().grid_scroll.geometry();
+        let position = harness
+            .state()
+            .current_grid_order()
+            .iter()
+            .position(|&idx| idx == index)
+            .unwrap();
+        harness.state_mut().selected = Some(index);
+        // Position an actual rendered list as a user scroll would. Geometry is
+        // supplied exclusively by render_grid, never by a fixture constructor.
+        harness.state_mut().grid_scroll.set_position(
+            ((position / geometry.cols).saturating_sub(2) as f32 * geometry.row_h)
+                .min(geometry.max_offset),
         );
+        harness.run_steps(4);
+        let rows_above = harness.state().selected_rows_below_view_top(index);
+        if selected == 119 {
+            assert!(
+                rows_above >= 2,
+                "last-row departure must retain the rendered bottom clamp"
+            );
+        } else {
+            assert_eq!(
+                rows_above, 2,
+                "departure must paint the chosen cell two rows below its top"
+            );
+        }
+        let departure_offset = harness.state().grid_scroll.offset();
+        let ctx = harness.ctx.clone();
+        {
+            let app = harness.state_mut();
+            app.settings.auto_fullscreen_zip_pdf = true;
+            activate(app, &ctx, &prefix, true);
+            if !details {
+                app.settings.grid_cols = 8;
+            }
+            app.handle_fullscreen_close_request_immediate();
+            settle(app, &ctx);
+            assert_returned(app, &[], &prefix);
+            assert_eq!(app.grid_scroll.row_anchor(), Some(rows_above));
+            assert!(app.grid_scroll.reveal_requested());
+        }
+        // Only real destination frames may consume the returned anchor.
+        harness.run_steps(4);
+        let app = harness.state();
+        assert_returned(app, &[], &prefix);
         assert!(app.grid_scroll.row_anchor().is_none());
+        assert!(!app.grid_scroll.reveal_requested());
+        let geometry = app.grid_scroll.geometry();
+        assert_eq!(geometry.cols, if details { 1 } else { 8 });
+        let selected = app.selected.unwrap();
+        let position = app
+            .current_grid_order()
+            .iter()
+            .position(|&idx| idx == selected)
+            .unwrap();
+        let expected = ((position / geometry.cols).saturating_sub(rows_above as usize) as f32
+            * geometry.row_h)
+            .min(geometry.max_offset);
+        assert!(
+            (app.grid_scroll.offset() - expected).abs() < 0.5,
+            "details={details}, selected={prefix}, actual={}, expected={expected}, painted={geometry:?}",
+            app.grid_scroll.offset()
+        );
+        let snapped = app.grid_scroll.offset() / geometry.row_h;
+        assert!((snapped - snapped.round()).abs() < 0.01);
+        if !details && prefix != "book-119/" {
+            assert!(
+                (app.grid_scroll.offset() - departure_offset).abs() > geometry.row_h,
+                "changed columns must recompute position instead of retaining the old absolute offset"
+            );
+        }
     }
 }
 
@@ -859,6 +936,83 @@ fn section1676_terminal_and_live_preserve_bookmark_owner() {
 
 #[test]
 #[cfg(windows)]
+fn section1676_invalidated_frozen_live_terminal_uses_current_list_teardown() {
+    use crate::bookmark_browser::BookmarkViewReturnTarget;
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    let book = app.tmp.path().join("outer.zip");
+    write_pages(&book, &["A/001.png", "A/002.png", "B/001.png"]);
+    open_list(&mut app, &ctx, &book);
+    app.bookmark_view_state = Some(BookmarkViewState::Opening {
+        target: BookmarkViewReturnTarget::Book(book.clone()),
+        grid: BookmarkViewReturnGridState {
+            row_keys: vec![(1, 4)],
+            selected_key: Some((1, 4)),
+            opened_key: Some((1, 4)),
+            scroll_offset_y: 123.0,
+        },
+    });
+    app.settings.auto_fullscreen_zip_pdf = true;
+    activate(&mut app, &ctx, "A/", true);
+    assert!(matches!(
+        app.bookmark_view_state,
+        Some(BookmarkViewState::Opening { .. })
+    ));
+    app.handle_fullscreen_close_request();
+    assert!(matches!(
+        app.pending_return_to_parent,
+        FullscreenCloseContinuation::LiveZipListReturn(_)
+    ));
+    app.zip_nav.as_mut().unwrap().clear_list_choices();
+    let main = app.viewer_context_main();
+    app.transfer_terminal_close_return(main, ViewerCloseCause::User);
+    assert!(matches!(
+        app.pending_return_to_parent,
+        FullscreenCloseContinuation::Terminal(_)
+    ));
+    let rows = app.items.clone();
+    let generation = app.items_generation;
+    // Expiration happened before terminal capture. Its teardown therefore has
+    // ordinary CurrentList semantics even though the old recipe still travels
+    // as Terminal until the consumer discards its stale destination.
+    app.close_fullscreen_now();
+    assert!(app.fullscreen_idx.is_none());
+    assert!(
+        app.bookmark_view_state.is_none(),
+        "expired chosen destination must not preserve the outer bookmark owner during terminal teardown"
+    );
+    assert!(matches!(
+        app.pending_return_to_parent,
+        FullscreenCloseContinuation::Terminal(_)
+    ));
+    assert_eq!(app.items, rows);
+    assert_eq!(app.items_generation, generation);
+    let nav = app
+        .take_pending_return_to_parent_nav()
+        .expect("terminal recipe remains deliverable after teardown");
+    assert!(matches!(
+        &nav,
+        AddressBarNav::ZipListReturn(ZipListReturnRequest::Terminal(_))
+    ));
+    assert!(app.apply_fullscreen_close_nav_immediate(nav));
+    settle(&mut app, &ctx);
+    assert!(app.fullscreen_idx.is_none());
+    assert!(app.bookmark_view_state.is_none());
+    assert!(!app.pending_return_to_parent.is_pending());
+    assert_eq!(app.items, rows);
+    assert_eq!(app.items_generation, generation);
+    assert_eq!(app.zip_nav.as_ref().unwrap().current(), &["A"]);
+    assert!(
+        app.zip_nav
+            .as_ref()
+            .unwrap()
+            .chosen_list_return_plan()
+            .is_none()
+    );
+}
+
+#[test]
+#[cfg(windows)]
 fn section1675_multiwindow_branch_stays_main_list() {
     let mut app = setup_app_for_test();
     let ctx = egui::Context::default();
@@ -1175,7 +1329,7 @@ fn section1676_sort_and_pin_rematerialization_keep_chosen_list() {
 }
 
 #[test]
-fn section1676_real_refresh_clears_choice_and_rejects_old_plan() {
+fn section1676_real_refresh_stale_live_plan_closes_to_current_list() {
     let mut app = setup_app_for_test();
     let ctx = egui::Context::default();
     let book = app.tmp.path().join("outer.zip");
@@ -1207,29 +1361,30 @@ fn section1676_real_refresh_clears_choice_and_rejects_old_plan() {
     );
     app.open_fullscreen(1, HistoryTrigger::UserChosen);
     app.spread_popup_open = true;
-    let before = (
-        app.items.clone(),
-        app.items_generation,
-        app.fullscreen_idx,
-        app.selected,
-        app.grid_scroll.offset(),
+    let before = (app.items.clone(), app.items_generation);
+    assert!(
+        app.apply_fullscreen_close_nav_immediate(AddressBarNav::ZipListReturn(
+            ZipListReturnRequest::Live(plan),
+        ))
     );
-    assert!(app.apply_fullscreen_close_nav_immediate(AddressBarNav::ZipListReturn(plan)));
-    assert_eq!(
-        (
-            app.items.clone(),
-            app.items_generation,
-            app.fullscreen_idx,
-            app.selected,
-            app.grid_scroll.offset()
-        ),
-        before
+    assert_eq!((app.items.clone(), app.items_generation), before);
+    assert!(
+        app.fullscreen_idx.is_none(),
+        "an expired Live destination still fulfills its accepted Close at CurrentList"
     );
     assert!(
-        app.spread_popup_open,
-        "stale plan must be rejected before teardown"
+        !app.spread_popup_open,
+        "stale Live close still runs fullscreen teardown"
     );
+    assert!(!app.pending_return_to_parent.is_pending());
     assert_eq!(app.zip_nav.as_ref().unwrap().current(), &["A"]);
+    assert!(
+        app.zip_nav
+            .as_ref()
+            .unwrap()
+            .chosen_list_return_plan()
+            .is_none()
+    );
 }
 
 #[test]
@@ -1836,4 +1991,443 @@ fn section1676_subfolder_origin_keeps_existing_physical_backout_after_chosen_clo
         assert!(app.folder_nav_subfolder_restore.is_some());
         assert!(!app.items_are_subfolder_expansion_view);
     }
+}
+
+#[cfg(windows)]
+fn headless_update_frame(
+    app: &mut App,
+    backend: &mut eframe::HeadlessEpiIntegration,
+    frame: u64,
+    events: Vec<egui::Event>,
+) {
+    headless_update_frame_with_focus(app, backend, frame, events, false);
+}
+
+#[cfg(windows)]
+fn headless_update_frame_with_focus(
+    app: &mut App,
+    backend: &mut eframe::HeadlessEpiIntegration,
+    frame: u64,
+    events: Vec<egui::Event>,
+    focused: bool,
+) {
+    let mut raw = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1280.0, 800.0),
+        )),
+        time: Some(frame as f64 / 60.0),
+        focused,
+        events,
+        ..Default::default()
+    };
+    raw.viewports
+        .get_mut(&egui::ViewportId::ROOT)
+        .unwrap()
+        .focused = Some(focused);
+    backend.update(app, raw).drop_without_applying_deltas();
+}
+
+#[test]
+#[cfg(windows)]
+fn section1676_in_window_update_early_close_delivers_chosen_return_once() {
+    let _native_input = crate::key_input::lock_test_input();
+    crate::key_input::clear_test_frame();
+    let _focus = crate::test_native_focus::scoped(1, 1, true);
+    let mut app = setup_app_for_test();
+    app.initialized = true;
+    app.settings.update_check_enabled = false;
+    app.settings.minimize_to_tray_on_close = false;
+    app.last_main_focused = false;
+    let ctx = egui::Context::default();
+    crate::ui_fonts::configure_fonts(&ctx);
+    crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
+    let book = app.tmp.path().join("outer.zip");
+    write_pages(&book, &["A/001.png", "A/002.png", "B/001.png"]);
+    open_list(&mut app, &ctx, &book);
+    app.settings.video_in_window_mode = true;
+    app.settings.detached_viewer_enabled = false;
+    app.settings.auto_fullscreen_zip_pdf = true;
+    activate(&mut app, &ctx, "A/", true);
+    assert_eq!(app.viewer_presentation, ViewerPresentation::MainWindow);
+    assert!(app.fullscreen_embedded_still_active());
+    let mut backend = eframe::HeadlessEpiIntegration::new(ctx.clone());
+    // Warm a focused embedded frame, then deliver Escape with no pending
+    // navigation. Root input delegates to the embedded fullscreen renderer;
+    // only that rendering pass can produce the Close for the late consumer.
+    headless_update_frame_with_focus(&mut app, &mut backend, 1, Vec::new(), true);
+    assert!(app.fullscreen_embedded_still_active());
+    assert!(!app.pending_return_to_parent.is_pending());
+    headless_update_frame_with_focus(
+        &mut app,
+        &mut backend,
+        2,
+        vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        true,
+    );
+    settle(&mut app, &ctx);
+    assert_returned(&app, &[], "A/");
+    assert!(!app.fullscreen_embedded_still_active());
+    let generation = app.items_generation;
+    headless_update_frame_with_focus(
+        &mut app,
+        &mut backend,
+        3,
+        vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        true,
+    );
+    assert_returned(&app, &[], "A/");
+    assert_eq!(
+        app.items_generation, generation,
+        "early close must consume its return only once"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn section1676_embedded_page_turn_barrier_keeps_pending_close_for_update_delivery() {
+    let _native_input = crate::key_input::lock_test_input();
+    crate::key_input::clear_test_frame();
+    let mut app = setup_app_for_test();
+    app.initialized = true;
+    app.settings.update_check_enabled = false;
+    app.settings.minimize_to_tray_on_close = false;
+    app.last_main_focused = false;
+    let ctx = egui::Context::default();
+    crate::ui_fonts::configure_fonts(&ctx);
+    crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
+    let book = app.tmp.path().join("outer.zip");
+    write_pages(
+        &book,
+        &[
+            "A/001.png",
+            "A/002.png",
+            "A/003.png",
+            "A/004.png",
+            "B/001.png",
+        ],
+    );
+    open_list(&mut app, &ctx, &book);
+    app.settings.video_in_window_mode = true;
+    app.settings.auto_fullscreen_zip_pdf = true;
+    activate(&mut app, &ctx, "A/", true);
+    app.spread_mode = crate::settings::SpreadMode::Single;
+    app.reading_flow = crate::settings::ReadingFlow::Paged;
+    // Replace decoding only. The archive level, chosen return, registry and
+    // close request are production-owned; real painted receipts create the turn.
+    for idx in 0..4 {
+        app.cancel_fs_page_load(idx);
+        crate::app::source_texture_test_support::seed(&mut app, &ctx, idx);
+        app.record_page_dims_for_spread(idx, (400, 600));
+    }
+    app.handle_fullscreen_close_request();
+    assert!(matches!(
+        app.pending_return_to_parent,
+        FullscreenCloseContinuation::LiveZipListReturn(_)
+    ));
+    // True-close cancels old page-turn state, so establish this specific ingress
+    // interleaving after request acceptance using the existing painted fixture.
+    crate::ui_fullscreen::page_turn_submission_tests::seed_leaf(&ctx, &mut app);
+    assert!(app.page_turn_barrier_active());
+    assert!(app.fullscreen_embedded_still_active());
+    assert!(matches!(
+        app.pending_return_to_parent,
+        FullscreenCloseContinuation::LiveZipListReturn(_)
+    ));
+    ctx.run_pass(Default::default(), |ctx| {
+        let (handled, forwarded) = app.fullscreen_root_input_for_frame(ctx);
+        assert!(
+            handled,
+            "embedded barrier must suppress the grid keyboard consumer"
+        );
+        assert!(
+            forwarded.is_none(),
+            "embedded presentation owns input in its main Context"
+        );
+        assert!(app.pending_return_to_parent.is_pending());
+    })
+    .drop_without_applying_deltas();
+    assert!(app.page_turn_barrier_active());
+    let mut backend = eframe::HeadlessEpiIntegration::new(ctx.clone());
+    headless_update_frame(&mut app, &mut backend, 1, Vec::new());
+    settle(&mut app, &ctx);
+    assert_returned(&app, &[], "A/");
+    assert!(!app.page_turn_barrier_active());
+    assert!(!app.fullscreen_embedded_still_active());
+}
+
+#[test]
+#[cfg(windows)]
+fn section1676_pending_main_live_return_preserves_newly_active_sibling_session() {
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    crate::ui_fonts::configure_fonts(&ctx);
+    crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
+    let book = app.tmp.path().join("outer.zip");
+    write_pages(&book, &["A/001.png", "A/002.png", "B/001.png", "B/002.png"]);
+    open_list(&mut app, &ctx, &book);
+    app.settings.auto_fullscreen_zip_pdf = true;
+    activate(&mut app, &ctx, "A/", true);
+    app.handle_fullscreen_close_request();
+    assert!(matches!(
+        app.pending_return_to_parent,
+        FullscreenCloseContinuation::LiveZipListReturn(_)
+    ));
+    // A real independent descriptor open publishes its context/window binding
+    // and active session after main has already accepted its own Live close.
+    // The descriptor helper is the independent route's implementation seam;
+    // its real caller enables this open policy before initial fullscreen open.
+    app.settings.detached_viewer_open_images_in_window = true;
+    ctx.set_embed_viewports(false);
+    assert!(app.start_active_detached_book_context(
+        ViewerContextDescriptor::Zip {
+            path: book.clone(),
+            entry_name: Some("B/001.png".into()),
+            archive_source_override: None,
+        },
+        &ctx,
+        None,
+        None,
+    ));
+    let sibling = app.active_viewer_context_id().unwrap();
+    assert_ne!(sibling, app.viewer_context_main());
+    app.with_active_viewer_context(|viewer| {
+        settle(viewer, &ctx);
+        assert!(
+            viewer.fullscreen_idx.is_some(),
+            "sibling descriptor must open its explicit leaf"
+        );
+        assert_eq!(
+            viewer.viewer_presentation,
+            ViewerPresentation::DetachedWindow
+        );
+        assert!(viewer.detached_viewer_independent_active);
+    })
+    .unwrap();
+    assert_eq!(app.active_viewer_context_id(), Some(sibling));
+    ctx.run_ui(Default::default(), |ui| {
+        assert!(app.update_active_viewer_context(ui, None).updated);
+    })
+    .drop_without_applying_deltas();
+    let session = app.active_detached_session.expect("real sibling session");
+    assert_eq!(session.content_phase, DetachedSessionContentPhase::Ready);
+    let window = session.window_id;
+    let viewport = App::detached_image_window_viewport_id(window);
+    ctx.run_ui(Default::default(), |ui| {
+        ctx.show_viewport_deferred(viewport, egui::ViewportBuilder::default(), |_, _| {});
+        app.capture_detached_viewport_registration(ui.ctx(), window);
+    })
+    .drop_without_applying_deltas();
+    let registration = format!(
+        "{:?}",
+        ctx.viewport_registration(viewport)
+            .expect("registered sibling viewport")
+    );
+    let runtime = format!(
+        "{:?}",
+        app.detached_window_manager
+            .runtime(window)
+            .expect("sibling runtime")
+    );
+    let session_before = (session.window_id, session.source, session.content_phase);
+    let state = |viewer: &mut App| {
+        (
+            viewer.items.clone(),
+            viewer.visible_indices.clone(),
+            viewer.items_generation,
+            viewer.selected,
+            viewer.fullscreen_idx,
+            viewer.grid_scroll.offset(),
+            viewer.fs_viewport_shown,
+            viewer.fs_viewport_presentation,
+            viewer.viewer_presentation,
+            viewer.zip_nav.as_ref().unwrap().current().to_vec(),
+        )
+    };
+    let before = app.with_viewer_context_state(sibling, state).unwrap();
+    let pending = app
+        .with_viewer_context_state(sibling, |viewer| {
+            viewer
+                .fs_pending
+                .iter()
+                .map(|(&idx, value)| (idx, Arc::clone(&value.cancel)))
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+    assert!(matches!(
+        app.pending_return_to_parent,
+        FullscreenCloseContinuation::LiveZipListReturn(_)
+    ));
+    consume_close(&mut app);
+    settle(&mut app, &ctx);
+    assert_returned(&app, &[], "A/");
+    assert_eq!(app.active_viewer_context_id(), Some(sibling));
+    assert_eq!(
+        app.active_detached_session
+            .map(|s| (s.window_id, s.source, s.content_phase)),
+        Some(session_before)
+    );
+    assert_eq!(
+        format!(
+            "{:?}",
+            app.detached_window_manager
+                .runtime(window)
+                .expect("sibling runtime survived main close")
+        ),
+        runtime
+    );
+    assert_eq!(
+        format!(
+            "{:?}",
+            ctx.viewport_registration(viewport)
+                .expect("main close did not retire sibling viewport")
+        ),
+        registration
+    );
+    assert_eq!(
+        app.locate_window_context(window).map(|(owner, _)| owner),
+        Some(sibling)
+    );
+    assert_eq!(
+        app.with_viewer_context_state(sibling, state).unwrap(),
+        before
+    );
+    app.with_viewer_context_state(sibling, |viewer| {
+        for (idx, cancel) in &pending {
+            let current = viewer
+                .fs_pending
+                .get(idx)
+                .expect("main close did not cancel sibling load");
+            assert!(Arc::ptr_eq(cancel, &current.cancel));
+            assert!(!cancel.load(Ordering::Relaxed));
+        }
+    })
+    .unwrap();
+}
+
+#[test]
+#[cfg(windows)]
+fn section1676_stale_live_choice_delivers_current_list_through_real_update() {
+    let _native_input = crate::key_input::lock_test_input();
+    crate::key_input::clear_test_frame();
+    let mut app = setup_app_for_test();
+    app.initialized = true;
+    app.settings.update_check_enabled = false;
+    app.settings.minimize_to_tray_on_close = false;
+    app.last_main_focused = false;
+    let ctx = egui::Context::default();
+    crate::ui_fonts::configure_fonts(&ctx);
+    crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
+    let book = app.tmp.path().join("outer.zip");
+    write_pages(&book, &["A/001.png", "A/002.png", "B/001.png"]);
+    open_list(&mut app, &ctx, &book);
+    app.settings.video_in_window_mode = true;
+    app.settings.auto_fullscreen_zip_pdf = true;
+    activate(&mut app, &ctx, "A/", true);
+    app.handle_fullscreen_close_request();
+    assert!(matches!(
+        app.pending_return_to_parent,
+        FullscreenCloseContinuation::LiveZipListReturn(_)
+    ));
+    // A refresh/restore removes the old tree's Chosen facts. Exercise the
+    // invalidation boundary before delivery while the current reader is still
+    // present; do not create another open or resolve another return plan.
+    app.zip_nav.as_mut().unwrap().clear_list_choices();
+    assert!(
+        app.zip_nav
+            .as_ref()
+            .unwrap()
+            .chosen_list_return_plan()
+            .is_none()
+    );
+    let before = (app.items.clone(), app.items_generation, app.input_seq);
+    app.spread_popup_open = true;
+    let mut backend = eframe::HeadlessEpiIntegration::new(ctx.clone());
+    headless_update_frame(&mut app, &mut backend, 1, Vec::new());
+    settle(&mut app, &ctx);
+    assert!(app.fullscreen_idx.is_none());
+    assert!(!app.spread_popup_open);
+    assert!(!app.pending_return_to_parent.is_pending());
+    assert_eq!(app.current_folder.as_deref(), Some(book.as_path()));
+    assert_eq!(app.zip_nav.as_ref().unwrap().current(), &["A"]);
+    assert!(
+        app.zip_nav
+            .as_ref()
+            .unwrap()
+            .chosen_list_return_plan()
+            .is_none()
+    );
+    assert_eq!(
+        (app.items.clone(), app.items_generation, app.input_seq),
+        before,
+        "stale Live delivers Close at the current rows without opening or installing another destination"
+    );
+    let generation = app.items_generation;
+    headless_update_frame(&mut app, &mut backend, 2, Vec::new());
+    assert!(app.fullscreen_idx.is_none());
+    assert!(!app.pending_return_to_parent.is_pending());
+    assert_eq!(app.items_generation, generation);
+}
+
+#[test]
+#[cfg(windows)]
+fn section1676_stale_terminal_return_cannot_close_a_later_reader() {
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    let book = app.tmp.path().join("outer.zip");
+    write_pages(&book, &["A/001.png", "A/002.png", "B/001.png"]);
+    open_list(&mut app, &ctx, &book);
+    app.settings.auto_fullscreen_zip_pdf = true;
+    activate(&mut app, &ctx, "A/", true);
+    let main = app.viewer_context_main();
+    app.transfer_terminal_close_return(main, ViewerCloseCause::User);
+    assert!(matches!(
+        app.pending_return_to_parent,
+        FullscreenCloseContinuation::Terminal(_)
+    ));
+    app.close_fullscreen_now();
+    let nav = app
+        .take_pending_return_to_parent_nav()
+        .expect("terminal return outlives the closed reader");
+    assert!(matches!(
+        &nav,
+        AddressBarNav::ZipListReturn(ZipListReturnRequest::Terminal(_))
+    ));
+    app.zip_nav.as_mut().unwrap().clear_list_choices();
+    // A later real open has its own fullscreen lifetime. Delivery of the old
+    // Terminal recipe must only discard the stale navigation, never close it.
+    app.open_fullscreen(1, HistoryTrigger::UserChosen);
+    app.spread_popup_open = true;
+    let before = (
+        app.items.clone(),
+        app.items_generation,
+        app.fullscreen_idx,
+        app.input_seq,
+    );
+    assert!(app.apply_fullscreen_close_nav_immediate(nav));
+    assert_eq!(
+        (
+            app.items.clone(),
+            app.items_generation,
+            app.fullscreen_idx,
+            app.input_seq
+        ),
+        before
+    );
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert!(app.spread_popup_open);
+    assert_eq!(app.zip_nav.as_ref().unwrap().current(), &["A"]);
+    assert!(!app.pending_return_to_parent.is_pending());
 }

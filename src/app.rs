@@ -675,9 +675,9 @@ use raw_page_store::*;
 mod ai_terminal_service;
 mod archive_inner_book;
 mod close_return;
-pub(crate) use archive_inner_book::ArchiveBookTarget;
 #[cfg(test)]
 use archive_inner_book::ZipDirActivationOutcome;
+pub(crate) use archive_inner_book::{ArchiveBookTarget, ZipListReturnRequest};
 #[cfg(all(test, windows))]
 mod context_state_tests;
 mod logic_service;
@@ -68259,10 +68259,7 @@ impl App {
                 app.keep_fullscreen_viewport_alive(ctx);
                 app.render_fullscreen_viewport(ui);
 
-                if matches!(
-                    app.pending_return_to_parent,
-                    FullscreenCloseContinuation::Live
-                ) {
+                if app.pending_return_to_parent.is_live() {
                     let id = app.projected_viewer_context_id();
                     app.transfer_terminal_close_return(id, ViewerCloseCause::User);
                     app.pending_return_to_parent.clear();
@@ -69266,6 +69263,30 @@ impl App {
         block_locked_media: bool,
         boundary: FsMetadataBoundary,
     ) -> CollectionMainContextChange {
+        self.change_main_context_for_visible_grid_for_destination(
+            block_locked_media,
+            boundary,
+            self.fullscreen_close_destination(),
+        )
+    }
+
+    /// Close-return uses the same context-owned handoff/content teardown as a
+    /// physical list adoption, with its already-resolved bookmark policy.
+    fn finish_main_fullscreen_list_return(&mut self, destination: FullscreenCloseDestination) {
+        self.finish_fullscreen_navigation_for_true_close();
+        self.change_main_context_for_visible_grid_for_destination(
+            false,
+            FsMetadataBoundary::Manual,
+            destination,
+        );
+    }
+
+    fn change_main_context_for_visible_grid_for_destination(
+        &mut self,
+        block_locked_media: bool,
+        boundary: FsMetadataBoundary,
+        destination: FullscreenCloseDestination,
+    ) -> CollectionMainContextChange {
         #[cfg(windows)]
         {
             if block_locked_media
@@ -69279,9 +69300,9 @@ impl App {
                 self.preserve_active_detached_image_window_for_main_context_change();
                 self.retire_direct_media_reader_for_source_adoption();
                 if matches!(boundary, FsMetadataBoundary::BookAppend(_)) {
-                    self.close_fullscreen_now_with_metadata_boundary(boundary);
+                    self.close_fullscreen_now_for_destination(boundary, destination);
                 } else {
-                    self.close_fullscreen_content();
+                    self.close_fullscreen_content_for_destination(destination);
                 }
             }
         }
@@ -69290,9 +69311,9 @@ impl App {
             let _ = block_locked_media;
             self.retire_direct_media_reader_for_source_adoption();
             if matches!(boundary, FsMetadataBoundary::BookAppend(_)) {
-                self.close_fullscreen_now_with_metadata_boundary(boundary);
+                self.close_fullscreen_now_for_destination(boundary, destination);
             } else {
-                self.close_fullscreen_content();
+                self.close_fullscreen_content_for_destination(destination);
             }
         }
         self.retire_direct_media_reader_for_source_adoption();
@@ -81014,6 +81035,18 @@ impl App {
             return;
         }
         self.finish_fullscreen_navigation_for_true_close();
+        if self.projected_viewer_context_id() == self.viewer_context_main() {
+            // One accepted close owns one frozen destination. Later refreshes
+            // invalidate only that destination; they must not choose a new route.
+            if self.pending_return_to_parent.is_pending() {
+                return;
+            }
+            if let Some(plan) = self.chosen_zip_list_return() {
+                self.pending_return_to_parent =
+                    FullscreenCloseContinuation::LiveZipListReturn(plan);
+                return;
+            }
+        }
         // Detached bookmark viewers never navigate their own bundle to the bookmark surface: the
         // origin grid is still mounted in main. Embedded viewers instead use the normal Bookmarks
         // navigation transition. Ownership is explicit in BookmarkViewState, not inferred from a
@@ -81029,7 +81062,7 @@ impl App {
             return;
         }
         if self.projected_viewer_context_id() == self.viewer_context_main()
-            && (self.chosen_zip_list_return().is_some() || self.auto_open_for_current_container())
+            && self.auto_open_for_current_container()
         {
             self.pending_return_to_parent.request_live();
             return;
@@ -81212,7 +81245,7 @@ impl App {
     /// `keep_fullscreen_viewport_alive` がこのフラグを見て Visible(false) を
     /// 送信し、その直後に false に落とす。ここで先に落とすと送信が抑止される。
     pub(crate) fn close_fullscreen(&mut self) {
-        self.close_fullscreen_for_destination(self.pending_return_to_parent.terminal_destination());
+        self.close_fullscreen_for_destination(self.fullscreen_close_destination());
     }
 
     fn close_fullscreen_for_destination(&mut self, destination: FullscreenCloseDestination) {
@@ -81226,9 +81259,7 @@ impl App {
     /// Content-only teardown for an owner that will reopen or transfer this reader.
     /// True session exits must use close_fullscreen / close_fullscreen_to_completion.
     pub(super) fn close_fullscreen_content(&mut self) {
-        self.close_fullscreen_content_for_destination(
-            self.pending_return_to_parent.terminal_destination(),
-        );
+        self.close_fullscreen_content_for_destination(self.fullscreen_close_destination());
     }
 
     fn close_fullscreen_content_for_destination(
@@ -81420,10 +81451,7 @@ impl App {
     }
 
     fn close_fullscreen_now_with_metadata_boundary(&mut self, boundary: FsMetadataBoundary) {
-        self.close_fullscreen_now_for_destination(
-            boundary,
-            self.pending_return_to_parent.terminal_destination(),
-        );
+        self.close_fullscreen_now_for_destination(boundary, self.fullscreen_close_destination());
     }
 
     fn close_fullscreen_now_for_destination(
