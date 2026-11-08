@@ -1728,6 +1728,7 @@ fn stage2_metadata_tools_transport_typed_commands_and_results_on_all_protocols()
 
 #[test]
 fn stage2_complete_tool_discovery_fits_final_envelope_budget() {
+    let mut largest = (0, String::new());
     for level in [
         AgentLevel::Disabled,
         AgentLevel::ReadOnly,
@@ -1751,6 +1752,12 @@ fn stage2_complete_tool_discovery_fits_final_envelope_budget() {
                         ] {
                             let response = success(id, json!({"tools":tools}), modern);
                             let chars = response_non_image_chars(&response);
+                            if chars > largest.0 {
+                                largest = (
+                                    chars,
+                                    format!("{level:?}/{thumbnails}/{gps}/{ai_captions}/{modern}"),
+                                );
+                            }
                             assert!(
                                 chars + 512 <= MAX_MCP_RESPONSE_CHARS,
                                 "discovery {level:?}/{thumbnails}/{gps}/{ai_captions}/{modern}: {chars} chars, needs 512 reserve"
@@ -1767,6 +1774,7 @@ fn stage2_complete_tool_discovery_fits_final_envelope_budget() {
             }
         }
     }
+    eprintln!("Largest tools/list: {} chars ({})", largest.0, largest.1);
 }
 
 #[test]

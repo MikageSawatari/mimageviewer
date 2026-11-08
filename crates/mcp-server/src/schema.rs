@@ -418,9 +418,9 @@ pub fn tools() -> Vec<Value> {
             "items_by_tag"=>"List via mImageViewer (mIV)'s tag-view query.",
             "list_collections"=>"List mImageViewer (mIV) collection IDs/names/item counts.",
             "get_collection"=>"Read a mImageViewer (mIV) collection by exactly one ID or name, in view order.",
-            "list_library"=>"List mIV favorites, reading history, bookshelf, bookmarks or rated items. Rated: stars minimum (default 1; 0 means 1), max_stars ceiling; rating descending, newest rating time, path. Times: UTC Unix ms.",
+            "list_library"=>"List mImageViewer (mIV) favorites, reading history, bookshelf, bookmarks or rated items. Rated: stars minimum (default 1; 0 means 1), max_stars ceiling; rating descending, newest rating time, path. Times: UTC Unix ms.",
             "get_item_info"=>"Read metadata for 1-50 path/subresource references, input order; cursor resumes at next input. Field status: unavailable/inapplicable vs empty. GPS and AI captions require permission. Captions: present/none/not_permitted; stale compares source and saved rotation, null when the current source cannot be resolved. No raw metadata/workflow JSON/UserComment/external sidecars. Text marks truncation.",
-            "list_folder"=>"List mIV's physical folder/ZIP/CBZ/PDF base grid with saved visibility/order, duplicates and book composition/hidden pages. AND filters: min_stars/max_stars (0-5; 0 unrated), kinds. Rows: rating (null if not ratable), tags (null for subresources). Excludes UI search/facet/color/bookmark/history filters and prefix stacks. ZIP subresource ends in /; nested ZIPs included. Other archives/EPUB unsupported. Limit 100, max 200 clamped. Listing changes void cursors, including star changes in rating-ordered listings. Times: UTC Unix ms.",
+            "list_folder"=>"List mImageViewer (mIV)'s physical folder/ZIP/CBZ/PDF base grid with saved visibility/order, duplicates and book composition/hidden pages. AND filters: min_stars/max_stars (0-5; 0 unrated), kinds. Rows: rating (null if not ratable), tags (null for subresources). Excludes UI search/facet/color/bookmark/history filters and prefix stacks. ZIP subresource ends in /; nested ZIPs included. Other archives/EPUB unsupported. Limit 100, max 200 clamped. Listing changes void cursors, including star changes in rating-ordered listings. Times: UTC Unix ms.",
             "get_thumbnail"=>"mImageViewer (mIV) WebP thumbnails: 1-20 explicit images/ZIP images/PDF pages, input order; requires thumbnail permission. Long side: default 256; >512 clamped, <256 rejected. No folder/archive representatives. Orientation/saved rotation only; withhold edited-hidden images. Image blocks follow ok rows in page order. Structured: references/statuses/dimensions only. Max 256 KiB/image, 1 MiB total; opaque cursor resumes at next input.",
             "open_in_viewer"=>"Open an existing absolute path in the main mImageViewer (mIV) viewer. Images/video/audio: open folder, select file, enter fullscreen (as on second launch). Other files: open folder; ZIP/PDF: open contents. No subresource. Accepted means opening started, not that display completed.",
             "create_collection"=>"Create a mImageViewer (mIV) collection; ID after actor completion. Duplicate names allowed. Organize only. Not idempotent.",
@@ -459,6 +459,26 @@ pub fn tools() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tool_descriptions_name_product_in_first_sentence() {
+        for tool in tools() {
+            let name = tool["name"].as_str().unwrap();
+            if name == "get_item_info" {
+                continue;
+            }
+            let first_sentence = tool["description"]
+                .as_str()
+                .unwrap()
+                .split(". ")
+                .next()
+                .unwrap();
+            assert!(
+                first_sentence.contains("mImageViewer (mIV)"),
+                "{name}: {first_sentence}"
+            );
+        }
+    }
+
     #[test]
     fn folder_and_library_filter_schema_contracts() {
         let tools = tools();
