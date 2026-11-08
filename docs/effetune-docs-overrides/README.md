@@ -22,23 +22,25 @@ python scripts/gen-effetune-docs.py
 python scripts/test_gen_effetune_docs.py
 python scripts/gen-effetune-docs.py --check
 python scripts/check_site_cards.py
+# htdocs をコミットした後、公開担当が実行する
 python scripts/gen-sitemap-xml.py
 python scripts/gen-sitemap-xml.py --check
 ```
 
-版の正本は `config/miv-sound.rs`。`VERSION` に `v` を付けた版が公開 URL となり、`--version` より優先する。
+版の正本は `config/miv-sound.rs`。`VERSION` に `v` を付けた版を目次本文の1か所だけに表示し、`--version` より優先する。
+公開 URL は版番号なしの `manual/sound/` に固定する。版だけの更新では目次以外のページ・URL・転送規則は変わらない。
 `DOCS_VERSION` は元の上流説明書の版。`SOURCE.md` の `mIV Sound` と `Docs version` の両方を照合し、
 同じ snapshot の無審査の付け替えを拒否する。本文・title・description の「EffeTune」は訂正後に「mIV Sound」へ置換する。
 上流サービスの案内は訂正で「上流の Web アプリ」などにしてから置換し、URL・拡張子・上流のクレジットを保つ。
 
 ## 出力とリンク
 
-- `htdocs/mimageviewer/manual/sound/index.html`: 同梱版の目次への入口。
-  meta refresh、canonical、表示リンクを持ち、noindex のためサイトマップには入らない。
-- `<version>/<category>.html`: カテゴリの導入・共通操作・プラグイン一覧。
-- `<version>/<category>-<heading-id>.html`: 一覧で指定された各プラグインの説明。
+- `htdocs/mimageviewer/manual/sound/index.html`: 同梱版の目次そのもの。
+  canonical は自分自身で、noindex・meta refresh は付けずサイトマップに掲載する。
+- `<category>.html`: カテゴリの導入・共通操作・プラグイン一覧。
+- `<category>-<heading-id>.html`: 一覧で指定された各プラグインの説明。
 - バス機能、Visualizer、README から選別した基本操作は単一ページ。
-  版ごとの目次、ライセンス、画像も生成する。
+  目次、ライセンス、`images/` の画像も同じ固定パスに生成する。
 
 カテゴリの `プラグイン一覧` のリンクと実際の h2 を照合する。一覧以降の h2 が
 未掲載、一致しない、重複している場合は失敗する。導入の h2 は一覧までに置く。
@@ -50,11 +52,13 @@ python scripts/gen-sitemap-xml.py --check
 非掲載 Markdown へのリンクは従来どおりテキストにする。外部リンクは維持し、
 `/dsp/...` などは上流サイトを指す。
 
-`--check` は版フォルダー内のファイルに加え入口ページの欠落・古い内容も検出する。
-現在版だけを公開する。入口の切り替え後は、以前の版フォルダーを明示的に公開ツリーから除く。
-旧 `manual/effetune/` の入口・全版と `manual/sound/` の他版は `.htaccess` の生成ブロックで現在版へ301転送する。同名ページが無ければ目次へ送る。
-`--check` は空の旧版フォルダーも拒否する。予期しないファイルがある場合、通常生成も
-勝手に削除せず失敗する。
+`--check` は `manual/sound/` 直下（images/ を含む）の欠落・古い内容・余分なファイルと転送規則を検査する。
+`manual/sound/v*/` は現行版を含め空でも拒否し、旧 `manual/effetune/` の残存も拒否する。
+通常生成はこれらの残存を警告して続行するが削除はしない。移行時に明示的に公開ツリーから除く。
+旧 EffeTune の入口・全版と Sound の全版は `.htaccess` の生成ブロックで同名の固定 URL へ1回の301で転送する。
+現行生成物一覧に無い名前は目次へ送り、固定 URL の消えたページも同様に扱う。
+`manual/sound/` 自体は DirectoryIndex に任せる。ファイル存在検査は使わず、一覧はページ・画像の増減時だけ変わる。
+版ディレクトリ以外の予期しないファイルがある場合、通常生成も勝手に削除せず失敗する。
 生成 HTML には `.gitattributes` の `sound/**/*.html` の LF 指定が適用される。案内ページ `manual/effetune.html` は外部リンクと検索のため維持する。
 
 ## 訂正ルールと分割
@@ -115,10 +119,10 @@ README の Web アプリ用 HTML は変換対象に入らない。
 | トラブルシューティングとFAQ、技術情報（ブラウザ互換性、ブラウザサポートの詳細、推奨サンプルレート） | ブラウザ／独立アプリの要件・設定。mIV の利用条件は mIV ページで案内 |
 | 利用可能なエフェクト、開発ガイド | エフェクト一覧は生成目次に全111件掲載済み。開発ガイドは利用者向け操作の対象外 |
 
-## mIV Sound 向け訂正 (F3・F4 統合、2026-11-04 更新)
+## mIV Sound 向け訂正 (F3・F4 統合、2026-11-08 更新)
 
-- 原文は `c506bbab` の日本語 snapshot（上流 v0.15.0）。派生版 `0.15.0-miv.4` と対応づけて
-  `manual/sound/v0.15.0-miv.7/` に133 HTML＋4画像を生成する。上流原文・LICENSE・画像は変更しない。
+- 原文は `c506bbab` の日本語 snapshot（上流 v0.15.0）。`config/miv-sound.rs` と `SOURCE.md` の派生版を対応づけて
+  `manual/sound/` に133 HTML＋4画像を生成する。上流原文・LICENSE・画像は変更しない。
 - 転載注記に [mIV Sound のソース](https://github.com/MikageSawatari/miv-sound)を案内する。
   原作・作者・MIT のクレジットと、原文ドキュメントの参照先は維持する。
 - `selection.json` の完全なページ台帳と README の見出し選別で、内蔵プレーヤー・ライブラリ・LAN・MCP・
