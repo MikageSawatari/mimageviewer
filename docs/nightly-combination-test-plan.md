@@ -1,6 +1,7 @@
 # 夜間の組み合わせ実アプリ試験 (設計案)
 
-2026-11-08 作成。状態: **設計案・独立レビュー前・未実装**。設計担当 ClaudeCode Opus 5.5。
+2026-11-08 作成。状態: **設計案 R2 (独立レビュー 1 回目の指摘を反映)・未実装**。設計担当 ClaudeCode Opus 5.5。
+レビュー記録は §14。
 
 ## 1. 目的
 
@@ -13,10 +14,12 @@ viewport テスト (第 1 層)・承認つき実アプリ smoke (第 2 層、[ui
 
 1. 設定・内容・操作の組み合わせを機械的に作って実アプリで流す
 2. 落ちた・固まった・不変条件が破れたものを集め、同じ原因ごとにまとめる
-3. 再現する手順を短く縮めて、朝に一覧で渡す
+3. 再現する手順を予算内で縮めて、朝に一覧で渡す
 
 見つけた不具合の修正は、従来どおり通常の開発手順 (設計・Codex 実装・独立レビュー) で行う。
-この仕組みは**見つけるところまで**を受け持つ。
+この仕組みは**見つけるところまで**を受け持つ。[複数ウィンドウ試験](multiwindow-scenario-test-plan.md)
+の T2 (pairwise の組み合わせ) の一部を実アプリ側で受け持つが、T2 全体の完了とは扱わない
+(headless 側の完了順制御などは T2 に残る)。
 
 ## 2. 確認済みの前提
 
@@ -28,7 +31,7 @@ viewport テスト (第 1 層)・承認つき実アプリ smoke (第 2 層、[ui
 - `--permission-mode bypassPermissions` は Windows でも使える。公式は「隔離された環境
   (コンテナ・VM) でのみ使う」よう求めている。ネイティブ Windows では Bash のサンドボックスも無い。
 - 以上から、**試験の実行ループに Claude を入れない**。実行は PowerShell と mIV 自身の
-  `--test-script` だけで完結させ、Claude は結果の整理 (§8) と任意の探索試験 (§9) だけを受け持つ。
+  `--test-script` だけで完結させ、Claude は朝の結果の整理 (§8) だけを受け持つ。
 
 ### 2.2 Windows Sandbox での無人実行 (サブ PC)
 
@@ -36,272 +39,350 @@ viewport テスト (第 1 層)・承認つき実アプリ smoke (第 2 層、[ui
 
 | 日付 | 内容 | 結果 | 観測者 |
 | --- | --- | --- | --- |
-| 2026-11-07 | `C:\miv-sandbox\v500.ps1`: ホストのスクリプトが `.wsb` を起動 → Sandbox 内の LogonCommand がインストール・起動・監視・画面保存・ログ回収 → ホストへ結果を戻す | 人の操作なしで完走 (約 5 分半) | サブ PC 担当 (スクリプト出力) |
-| 2026-11-08 | `C:\miv-sandbox\probe\`: Sandbox 内から SendInput でフォームへクリックと文字入力。1 回目は Sandbox 窓を表示、2 回目はホストのスクリプトが窓を最小化 | 両方で入力が届いた。最小化中の画面保存も正常 (黒画面ではない)。約 50 秒 | サブ PC 担当 (スクリプト出力)、メイン PC の ClaudeCode が保存 PNG を確認 |
+| 2026-11-07 | `C:\miv-sandbox\v500.ps1`: ホストのスクリプトが `.wsb` を起動 → Sandbox 内の LogonCommand がインストール・`explorer.exe` 経由で起動・process 列挙で監視・画面保存・ログ回収 → ホストへ結果を戻す | 人の操作なしで完走 (約 5 分半) | サブ PC 担当 (スクリプト出力) |
+| 2026-11-08 | `C:\miv-sandbox\probe\`: LogonCommand から直接起動した PowerShell が、SendInput で**WinForms のフォーム**へクリックと文字入力。1 回目は Sandbox 窓を表示、2 回目はホストのスクリプトが窓を最小化 | 両方で入力が届いた。最小化中の画面保存も正常 (黒画面ではない)。約 50 秒 | サブ PC 担当 (スクリプト出力)、メイン PC の ClaudeCode が保存 PNG を確認 |
 
-この 2 件から分かること:
+この 2 件から言えること (範囲はこれだけ):
 
-- Sandbox 内の LogonCommand は**管理者として**動く (2026-11-08 の画面保存で窓の題が
-  `Administrator: Windows PowerShell`)。利用者の通常の起動と揃えるため、mIV は昇格なしで起動する
-  (11-07 のキットは `explorer.exe` 経由で起動している)。
-- Sandbox 内の入力 desktop は `Default`、mIV が前面を取れる。Codex サンドボックスで起きた
-  「入力 desktop の不一致」([実行確認](interactive-release-verification.md) 末尾) は Sandbox 内では起きていない。
-- ホストの Sandbox 窓が最小化されていても、Sandbox 内の入力と描画は続く。
-
-**まだ確認していないこと** (S0 で確かめる):
-
-- サブ PC の利用者セッションが**切断・ロック**されているとき (RDP を閉じた後) に、タスク
-  スケジューラから Sandbox を起動でき、中の入力が届くか。2 件とも RDP 接続中の実行。
-- `--features portable,test-script` の mIV が Sandbox 内で `--test-script` を完走するか。
-  vGPU 有効 / 無効 (WARP) の両方。
-- RDP 無しでメイン PC とサブ PC の間で成果物と結果を受け渡す方法 (`\\tsclient` は RDP 接続中だけ見える)。
+- Sandbox 内の LogonCommand は**管理者として**動く (11-08 の画面保存で窓の題が `Administrator: Windows PowerShell`)。
+- LogonCommand から直接起動した process では、入力 desktop は `Default`、WinForms の窓が前面になり、
+  SendInput のクリックと文字入力が届いた。ホストの Sandbox 窓が最小化されていても続いた。
+- **mIV 自体**の前面取得・targeted action・非昇格での入力成立は、まだ確かめていない (S0)。
 
 ### 2.3 mIV 側の自動操作の仕組み (コードから)
 
-既存の `--test-script` (Rhai、[src/test_script.rs](../src/test_script.rs)) をそのまま実行器にする。要点:
+既存の `--test-script` (Rhai、[src/test_script.rs](../src/test_script.rs)) を実行器にする。要点:
 
 - 起動: `--test-script <file.rhai> --test-evidence-dir <dir> --data-dir <dir>` と、開く場所の位置引数。
   `--settings-override <json>` で `Settings` の直列化済み項目を深い merge で上書きできる
   (allow-list なし、存在しない項目は exit 2)。単一起動の確認と常駐 listener は script 実行時に省かれる。
 - 結果: exit code (0 成功 / 1 script 失敗・`wait_until` timeout / 2 環境失敗)、`logs/mimageviewer.log` の
-  `[test-script] finished` 行、`--perf-log` 時の perf event、失敗時の全 viewport capture。
-- 操作語彙: `tap_key` / `hold_key`、`run_action(<KeyAction ini 名>)` (consumer の受理まで待つ)、
-  `click_widget` / `double_click_widget` / `hover_widget`、`select_root` / `select_window`、
-  `root_history_input`、`always_on_top_smoke` などの smoke 操作、native 動画の実マウス入力、clipboard 系。
+  `[test-script] finished` 行と `shutdown path=run-native-return` / `shutdown path=forced-watchdog` 行。
+  **終了 watchdog は、終了処理が固まって強制終了したときも確定済みの script 結果を exit code にする**
+  ([src/test_script.rs:5018](../src/test_script.rs))。exit code だけでは正常終了と区別できない。
+- 操作語彙: `tap_key` / `hold_key`、`run_action(<KeyAction ini 名>)`、`click_widget` などの widget 操作、
+  `select_root` / `select_window`、`root_history_input`、smoke 操作、native 動画の実マウス入力、clipboard 系。
   観測は `snapshot()` と `wait_until(述語, timeout)`。
-- 制約: `import` / `eval` は無効 (script は 1 ファイルに連結する)。任意の path を開く命令は無い
-  (`release_check_open` は release-check session 内だけ)。共通の「安定した」判定は無い (各 script が自前で待つ)。
-- 失敗の痕跡 (いずれも `--data-dir` 配下): `logs/panic.log` (panic hook、`UI THREAD HANG suspected`)、
-  `logs/native-exception.log`、`logs/mimageviewer.log`、`logs/perf_events.jsonl`。**minidump は作らない**。
-- 試験用ビルドは `prepare-portable-smoke.ps1 -TestScript` → `build-portable.ps1 -SmokeTestScript`
-  (`target-portable-test-script`、`.test-script-build.json` に source の指紋と exe の SHA256)。
-- 組み合わせの生成器・pairwise 展開はまだ無い。[複数ウィンドウのシナリオ試験](multiwindow-scenario-test-plan.md)
-  §3.4 / §6 に「fixture × 設定 × 操作順を pairwise で」という残作業 (T2) として書かれている。この設計はその T2 を
-  夜間の無人実行として実装する。
+- 待ちの意味 (レビューで確認): `run_action` が待つのは consumer への到達で、操作結果の公開ではない。
+  `wait_until` は最新の公開値を読むので、操作前の値で即座に成り立つことがある。`select_window` は
+  semantic action の対象を決めるだけで activation を起こさない。`tap_key` は別の synthetic routing を使い、
+  呼び出しの完了は配送・解放の完了を意味しない。
+- snapshot の限界 (レビューで確認): `pending_thumbs` は mounted な一覧の要求数と upload backlog の合計で、
+  別窓ごとの列挙・復元・decode の完了を表さない。`paint_matches_current_page` は過去の描画証拠から立つので、
+  設定やレイアウト変更の後の最新描画を保証しない。対象窓自身の error 表示を示す値は window snapshot に無い。
+- `log()` は UI command として送られ、通常 logger (非同期・有界) へ渡る。落ちる直前の記録は残らないことがある。
+- 制約: `import` / `eval` は無効 (script は 1 ファイルに連結する)。任意の path を開く命令は無い。
+- 失敗の痕跡 (いずれも `--data-dir` 配下): `logs/panic.log` (セッションをまたいで追記・4 MiB で `.bak` へ
+  rotate、`UI THREAD HANG suspected` もここ)、`logs/native-exception.log`、`logs/mimageviewer.log`、
+  `logs/perf_events.jsonl`。**minidump は作らない**。
+- 試験用ビルドは `prepare-portable-smoke.ps1 -TestScript` → `build-portable.ps1 -SmokeTestScript`。
+  **portable の package では core が `mimageviewer.exe` に改名される** ([scripts/build-portable.ps1](../scripts/build-portable.ps1) の copies 表)。
 
 ## 3. 全体構成
 
 ```
 メイン PC                               サブ PC (ホスト)                  Windows Sandbox (使い捨て)
 -----------                             ----------------                  ---------------------------
-試験用ビルドを作る ──(受け渡し)──▶  タスクスケジューラ (夜間)  ──.wsb──▶  LogonCommand (管理者)
-fixture pack を作る                      └ combo-host.ps1                    ├ WER LocalDumps を設定
-                                            ├ 回ごとに Sandbox を起動          └ explorer 経由で runner を昇格なしで起動
-朝: 結果を読む ◀──(受け渡し)──────   ├ 結果を回収                          combo-runner.ps1
-   ClaudeCode が整理 (§8)                  └ 時間枠の終わりで止める               ├ 生成器で scenario を作る
-                                                                              ├ mIV --test-script を 1 本ずつ起動
+試験用ビルドを作る ──(共有)──▶  タスクスケジューラ (夜間)  ──.wsb──▶  LogonCommand (管理者)
+fixture pack を作る                      └ combo-host.ps1                    ├ WER LocalDumps と dump 置き場を設定
+                                            ├ 回ごとに Sandbox を起動          └ runner を昇格なしで起動
+朝: 結果を読む ◀──(共有)──────────   ├ 結果を回収                          combo-runner.ps1 (非昇格)
+   ClaudeCode が整理 (§8)                  └ 時間枠の終わりで止める               ├ mIV を直接起動 (handle で exit を取る)
                                                                               ├ 判定 (§6) と痕跡の採取
-                                                                              └ 失敗は縮小・再現確認 (§7)
+                                                                              └ 再現確認・縮小 (§7)
 ```
 
 - **1 回の Sandbox 起動 = 1 batch** (目安 60 分、上限を設定)。batch が終わると Sandbox は自分で
   シャットダウンし、ホストが結果を回収して次の batch を新しい Sandbox で始める。環境の汚れは
   batch 単位で必ず消える。
-- 1 batch の中では scenario ごとに `--data-dir` を作り直す。scenario 同士で設定・キャッシュ・DB を共有しない。
 - Sandbox は同時に 1 つしか起動できない。並列化はしない。
 
 ## 4. 生成器: scenario の作り方
 
-### 4.1 scenario の中身
+### 4.1 v1 の範囲
 
-1 本の scenario は次の 4 つで決まる。これを `scenario.json` として保存し、同じものを何度でも再実行できる。
+v1 は**静止画と本 (画像フォルダ・ZIP・PDF) を 1 つの窓で読む**範囲に限る。一覧 → フルスクリーン →
+ページ送り・見開き・読み方向・拡大 → 一覧へ戻る、の骨格で成立させてから、別窓 (F12)・コレクション・
+動画・音声へ段階的に広げる (S4)。動画・音声は「安定」の意味が静止画と違う (§6.1) ので、v1 では扱わない。
 
-| 要素 | 内容 |
-| --- | --- |
-| build | 試験用ビルドの `.test-script-build.json` の SHA256 |
-| fixture | fixture pack の版 (§4.4) |
-| settings | 既定値からの差分 (settings-override JSON) |
-| steps | 操作の線形な列。各 step は「操作」と「その操作を出してよい状態の条件」 |
+### 4.2 scenario の構成: 骨格 + 設定の組 + ランダムな後半
 
-### 4.2 設定の組み合わせ: 2 つずつを漏れなく
+設定を覚えても、その設定が効く画面へ操作が届かなければ試したことにならない。そこで 1 本の scenario を
+次の形にする。
+
+1. **骨格**: 対象機能へ確実に届く短い固定の操作列 (例: 「PDF を開いてフルスクリーンで 3 ページ送る」)。
+   骨格は機能ごとに数本だけ人が書く。
+2. **設定**: その骨格で意味のある軸だけを、2 つずつの組 (pairwise) が漏れなく現れるように割り当てる。
+3. **後半**: 骨格の後に、状態に応じて選ぶランダムな操作を 10〜30 step 足す (§4.4)。
+
+集計では「生成した設定の組」と「実際に対象の状態へ届いて検査まで済んだ組」を分けて数える。
+
+### 4.3 設定のカタログ
 
 設定は**軸**のカタログ `scripts/combo/axes.toml` に書く。1 軸 = 利用者から見た 1 つの選択
 (例: 見開き、読み方向、ビューワモード、サムネイル比率、AI 処理なし/軽量、キャッシュ方針、ファイル種類の表示)。
-各値は settings-override の断片に対応させる。
+各値は settings-override の断片に対応させ、どの骨格で意味を持つかを書く。
 
-- 毎晩、全軸の**2 つずつの値の組 (pairwise)** を最低 1 回含む設定集合を、seed つきの貪欲法で作る。
-  総当たりより桁違いに少ない数で、2 つの設定の組み合わせで起きる不具合を拾える。
-- 既知の危ない組 (過去の不具合の組) は「必ず含める組」としてカタログに明記する。
-- **カタログの検証は cargo test にする**。全軸・全値の断片を既定の `Settings` に本番と同じ
-  merge 関数で当て、`UnknownSetting` や型違いが無いことを確かめる。設定名を変えたら試験が落ちて気づける
-  (§1.239 で Stills が exit 2 になった再発を防ぐ)。
+- 毎晩、骨格ごとに対象軸の pairwise を seed つきの貪欲法で作る。既知の危ない組 (過去の不具合の組) は
+  「必ず含める組」としてカタログに明記する。
+- **カタログの検証は cargo test にする** (`settings_override` は `cfg(test)` でも compile される)。
+  全断片と生成済みの設定行それぞれについて、本番と同じ `apply` を既定の `Settings` に当て、
+  **再直列化した値が要求値と一致すること**まで確かめる。merge が成功するだけでは、既定値が `null` の
+  `Option<構造体>` の中の誤記を serde が黙って既定値にしてしまうため。同じ設定パスを複数の軸が
+  上書きする競合も検出する。
 - 未リリースの設定・`serde(skip)` の項目は対象外 (上書きできない)。
 
-### 4.3 操作の列: 状態に応じて選び、実行した列を記録する
+### 4.4 step の契約と、状態に応じた選択
 
-生成器は App の実行時状態を知らないので、**操作の選択は script 内で行う**。
+生成器は App の実行時状態を知らないので、後半の操作は script 内で選ぶ。各 step は次の項目を持つ。
 
-- 生成器は seed と重みつきの操作語彙を埋め込んだ Rhai script を 1 本作る (helper は連結する)。
-- script は step ごとに `snapshot()` を見て、その状態で出せる操作 (例: 一覧なら開く・列数・並べ替え・
-  F12、フルスクリーンならページ送り・見開き切替・閉じる、別窓があれば窓の選択) から、
-  script 内の決定的な擬似乱数で 1 つ選ぶ。
-- 実行した操作は 1 行ずつ `log()` で記録する。**再現と縮小は、この記録した線形の列で行う**
-  (seed からの再生成に頼らない。タイミングで状態が変わると同じ seed でも別の列になるため)。
-- 1 本の長さは 20〜60 step、時間上限 3 分を目安にする。長い 1 本より短い多数の方が縮小が速い。
+| 項目 | 内容 |
+| --- | --- |
+| 論理対象 | 「root」「2 番目に開いた窓」のような生成順の名前。HWND や serial は記録しない。replay ごとに現在の窓・context に結び付け直す |
+| 入力方式 | `run_action` / `tap_key` / `click_widget` などのどれか |
+| 前提 | その操作を出してよい状態 (例: フルスクリーンで、次のページがある) |
+| 操作 | 実際の呼び出し |
+| 期待結果 | 操作後に成り立つべき状態 (例: ページ位置が 1 進む) |
+| 完了の待ち | 操作後の**新しい**状態公開と、対象窓の新しい描画を待つ。キー操作は入力の解放まで待つ |
+| 期限 | 完了の待ちの上限 |
 
-### 4.4 内容 (fixture pack)
+- 後半では、step ごとに `snapshot()` から前提が成り立つ操作を集め、script 内の決定的な擬似乱数で 1 つ選ぶ。
+- 実行した step は、**script worker が操作を送る前に**、専用の trace ファイルへ構造化した 1 行として書く
+  (受理・結果は後続の行)。UI スレッドに保存待ちは入れない。trace の書き込みに失敗したら、その run は
+  不成立として止める (回復はしない)。通常ログは補助の証拠にする。
+- **再現と縮小は、この trace の線形の列で行う** (seed からの再生成に頼らない)。replay で前提が成り立たない
+  step があれば、選び直したり黙って飛ばしたりせず「再現の前提不成立」とし、縮小の候補に採らない。
+  worker の完了順・focus 取得・描画の順序は線形の列では固定できないので、これが replay の非決定性の
+  主な原因になる。
+- 1 本の長さは 20〜40 step、時間上限 3 分を目安にする。
+
+### 4.5 内容 (fixture pack)
 
 既存の fixture 生成器 (`scripts/ui-smoke/` と `scripts/ui-smoke/page-turn/` の Python、`testdata/`) を流用し、
 メイン PC で 1 つの fixture pack にまとめる。中身は 1 つの root フォルダの下に、静止画フォルダ、
-ZIP、PDF、RAR/CBR、動画 (ffmpeg で生成)、音声、sidecar つきフォルダ、画像だけのフォルダを並べたもの。
+ZIP、PDF、RAR/CBR、sidecar つきフォルダ、画像だけのフォルダを並べたもの (動画・音声は S4)。
 コレクション・★は `--seed-db` で data に入れる。
 
 - 開く入口は「起動時の位置引数 = pack の root」とし、そこからの移動は一覧の操作で行う。
-  任意 path を開く命令 (`open_path`) は、一覧操作でたどれない入口が必要になったときだけ足す
-  ([複数ウィンドウ試験](multiwindow-scenario-test-plan.md) の方針と同じ)。
+  任意 path を開く命令 (`open_path`) は、一覧操作でたどれない入口が必要になったときだけ足す。
 - pack は SHA256 つきの版で配り、scenario に版を記録する。
+- 書き込みを伴う操作 (★・タグ・並べ替えの保存) を含む scenario は、**試行ごとに pack を複製**して使う。
 
-### 4.5 GPU の有無も軸にする
+### 4.6 GPU の有無
 
 `.wsb` の `vGPU Enable/Disable` を batch 単位の軸にする。Disable は WARP (ソフトウェア描画) になり、
-GPU の弱い環境に近い。ただし描画が遅いので、待ち時間の上限は GPU 無しの batch だけ長くする (§6.3)。
+GPU の弱い環境に近い。描画が遅いので、期限は GPU 無しの batch だけ長くする。解像度・DPI・メモリは
+`.wsb` と Sandbox の既定で固定し、`machine.txt` に記録する。
 
 ## 5. 実行器
 
 ### 5.1 ホスト側 (サブ PC): `combo-host.ps1`
 
-- タスクスケジューラから起動。時間枠 (例 01:00〜07:00) の中で batch を繰り返し、枠の終わりで新しい
-  batch を始めない。
-- batch ごとに: 受け渡し場所から最新の試験用ビルドと fixture pack を Sandbox 用フォルダへ置く →
-  `.wsb` を起動 → 終了印を待つ (上限つき) → 結果を受け渡し場所へ戻す。
-- 上限を超えたら Sandbox を止めて「batch timeout」として記録し、次へ進む。再試行の仕組みは作らない。
+- タスクスケジューラから起動する。ログオン条件 (「ユーザーがログオンしているときのみ」か否か) は S0 で
+  ロック中・RDP 切断中の動作を確かめてから決める。
+- 時間枠 (例 01:00〜07:00) の終わりは**全実行の期限**とする。残り時間が batch の上限より短ければ
+  新しい batch を始めない。batch の中でも、runner は終了処理と痕跡回収の余裕を残して新しい試行を止める。
+- batch ごとに: 共有から試験用ビルドと fixture pack を Sandbox 用フォルダへ置く → `.wsb` を起動 →
+  終了印を待つ (上限つき) → 結果を共有へ戻す。上限を超えたら Sandbox を止めて「batch timeout」と記録し、
+  次へ進む。再試行の仕組みは作らない。
 
 ### 5.2 Sandbox 内: LogonCommand と `combo-runner.ps1`
 
-- LogonCommand (管理者) は 2 つだけ行う: WER LocalDumps (`HKLM\...\Windows Error Reporting\LocalDumps\mimageviewer-core.exe`)
-  を設定して落ちたときの dump を取れるようにする、`explorer.exe` 経由で runner を**昇格なしで**起動する。
-- runner は**Sandbox の中でしか動かない**ことを自分で確かめる (利用者名 `WDAGUtilityAccount` と
-  キットの印)。合わなければ何もせず終わる。これで実 PC で誤って動かすことを構造的に防ぐ。
-- runner は scenario を 1 本ずつ: data を作り直す → mIV を起動 → 終了または timeout を待つ →
-  判定と痕跡の採取 → 次へ。batch の残り時間が少なくなったら新しい scenario を始めない。
-- 既存の `ui-smoke.ps1` は流用しない (exe と data の場所が固定、承認 flag 前提、Sandbox を想定していない)。
-  起動引数・痕跡の保存形式・timeout 時の exact PID kill など、共通にできる部分は関数として切り出して両方から使う。
+- `.wsb` の mapped folder は 2 つに分ける: 入力 (ビルド・pack・runner) は **read-only**、出力は batch 専用の
+  書き込み先。clipboard の共有 (`ClipboardRedirection`) とネットワークは無効にする。
+- LogonCommand (管理者) が行うのは次の 2 つだけ。
+  1. WER LocalDumps を、**実際に起動する basename `mimageviewer.exe`** について設定する。保存先は guest 内の
+     固定フォルダとし、非昇格の process が書ける ACL を付ける。DumpType・DumpCount も決める。
+  2. runner を昇格なしで起動する。方法 (`explorer.exe` 経由か、制限 token での起動か) は S0 で実際の
+     token の昇格状態・integrity level を記録して決める。
+- runner は mIV を**自分で直接起動**し、その process handle から exit code を取る (explorer の終了値は使わない)。
+- 実 PC で誤って動かさないための境界は、固定の使い捨て path・ビルドの manifest と hash の照合・
+  reparse point の拒否とする。利用者名 `WDAGUtilityAccount` とキットの印の確認は補助にする。
+- **試行 (mIV の起動 1 回) ごとに**新しい data と evidence の領域を作る。panic.log とその `.bak`、dump は
+  その試行に帰属させる。
+- 異常終了 (crash・timeout・強制終了) の後は、その batch の残りの試行をやめて batch を終える。残った子
+  process・clipboard などを復元する仕組みは作らず、再現確認と縮小は次の新しい Sandbox で行う。
+- 既存の `ui-smoke.ps1` はそのままは流用しない (exe と data の場所が固定、承認 flag 前提、Sandbox を
+  想定していない)。起動引数・痕跡の保存形式・timeout 時の exact PID kill など共通にできる部分は、
+  関数として切り出して両方から使う。
 
 ### 5.3 受け渡し
 
 RDP 無しで動くよう、受け渡しは共有フォルダにする。案: サブ PC に共有 `miv-combo` (中に `drop\` と `results\`) を作り、
-メイン PC が `drop\` へ書き、`results\` を読む。共有の作り方は利用者の環境判断 (§11 Q3)。
+メイン PC が `drop\` へ書き、`results\` を読む。共有の作り方は利用者の環境判断 (§11 Q4)。
 
 ## 6. 判定 (何を不具合とみなすか)
 
-### 6.1 共通の不変条件 (script 内、各 step の後)
+### 6.1 「安定」の定義と、そのために足す観測
 
-各 step の後に**共通の安定待ち**を置く (複数ウィンドウ試験の残作業「安定化判定の共通化」をここで作る)。
-安定 = 読み込み待ち・サムネイル待ちが空、現在ページの描画が現在の状態と一致、の両方。
-安定した時点で次を確かめる。
+「全部の裏の処理が止まった」ではなく、**その step の対象と媒体に必要な完了**を安定とする。
+v1 (静止画・本) では: 対象 context の一覧の列挙が終わっている、現在ページの読み込みと upload が終わっている、
+対象窓の最新の描画が「操作後の状態」に対応している、synthetic input が解放されている。
+
+今の snapshot ではこれを判定できない (§2.3)。そこで **S2 の前に**、`test-script` feature 限定・読み取り専用の
+観測を足す (製品の処理は変えない)。
+
+- context ごとの item 数と、対象操作を妨げている pending の理由 (既存の `ContextAsyncOwner` / `ContextRef`
+  を使って棚卸しする)
+- 状態の公開と描画を対応付ける revision (操作の受理で進み、描画がどの revision の状態を描いたかを記録する)。
+  設定・レイアウトの変更も revision を進める
+- synthetic input が解放済みか、対象窓の実際の focus と foreground
+- 対象窓自身の loading / error / 終端の状態
+
+snapshot のために mount・drain・追加の repaint をしない。製品の状態を複製しない。この追加は製品コードの
+変更なので、通常どおり設計レビュー・Codex 実装・独立レビューを経る。
+
+### 6.2 不変条件 (script 内、各 step の完了の待ちの後)
 
 | 記号 | 内容 |
 | --- | --- |
-| C1 | 安定待ちが上限内に終わる (終わらなければ「収束しない」として失敗) |
-| C2 | フルスクリーンならページ位置が範囲内で、描画が現在ページと一致する |
-| C3 | 開いた窓は、描くか自分の窓のエラー表示まで消えない (既存の I1) |
-| C4 | 窓の切り替えだけで、どの窓の描画も変わらない (既存の I2、別窓がある step だけ) |
-| C5 | `run_action` が consumer に届く (届かなければ既存どおり環境失敗) |
+| C1 | 完了の待ちが期限内に終わる (終わらなければ「収束しない」として失敗) |
+| C2 | step の期待結果が成り立つ |
+| C3 | 開いた窓は、描くか自分の窓のエラー表示まで消えない。「開く」step が期待した窓を台帳に載せ、閉じる・エラーになるまで追う (消えた窓は snapshot に出てこないので、台帳との突き合わせで見つける) |
+| C4 | (別窓を扱う S4 から) 既存の activation 経路を通す明示的な focus 操作の後、各窓の**新しい**描画を待ってから比べ、窓の切り替えだけで描画が変わらない。比べるのは内容・頂点・UV・可視 clip で、正当に変わる texture ID は除く |
 
-最後に全部を閉じて、6 秒の終了 watchdog 内に exit 0 で終わることも確かめる。
+最後に全部を閉じて終わる step を置く。
 
-### 6.2 プロセスの外から見る痕跡 (runner)
+### 6.3 試行の判定 (runner)
 
-| 痕跡 | 判定 |
+| 結果 | 条件 |
 | --- | --- |
-| exit code ≠ 0 / timeout | 失敗 (exit 2 は環境失敗として別に数える) |
-| `panic.log` に新しい記録 | 失敗。`docs/panic-acknowledged.tsv` にある既知のものは既知として分ける |
-| `UI THREAD HANG suspected` | 失敗 (固まり) |
-| WER dump の生成 | 失敗 (native crash) |
-| `native-exception.log` | 単独では失敗にしない (first-chance 例外は正常系でも出る)。失敗時の手がかりとして保存する |
+| 成功 | `finished kind=Success`、exit 0、`shutdown path=run-native-return` の 3 つがそろう |
+| 終了処理の固まり | script は成功したが `shutdown path=forced-watchdog`。script の成否とは別の欄に記録する |
+| 失敗 | exit 1、外部 timeout による kill、新しい panic 記録、WER dump、`UI THREAD HANG suspected` |
+| 環境失敗 | exit 2、終了の証跡が欠けている。不具合とは別に数え、率が高ければ実行器の不調として報告する |
 
-### 6.3 待ち時間の上限
+- `panic.log` の既知のもの (`docs/panic-acknowledged.tsv`) も成功には読み替えない。「既知」として分けて数え、
+  修正済み (`fixed`) の記録が再び出たら退行として扱う。
+- `native-exception.log` は単独では失敗にしない (first-chance 例外は正常系でも出る)。失敗時の手がかりとして保存する。
+- `UI THREAD HANG suspected` は main 窓の `IsHungAppWindow` 等に頼る「疑い」の証拠で、すべての停滞は拾えない。
+  外部の期限による kill を併用する。
 
-上限は「遅い」を不具合と誤判定しない値にする (GPU 無しの batch は長くする)。性能の退行は
-この仕組みの対象外 (§10)。
+### 6.4 期限
 
-### 6.4 同じ原因をまとめる (署名)
+期限は「遅い」を不具合と誤判定しない値にする (GPU 無しの batch は長くする)。性能の退行は対象外 (§10)。
 
-失敗ごとに署名を作り、同じ署名をまとめて数える。panic は発生場所 (file:line)、native crash は
-dump の例外コードと module+offset、不変条件違反は C 番号と直前の操作名、固まりは止まっていた
-直前の操作名。
+### 6.5 署名: 集計用と縮小用を分ける
 
-## 7. 縮小と再現確認
+- **集計用の署名**: 同じ原因らしいものを数えるための粗い署名。panic は発生場所 (file:line)、native crash は
+  dump の例外コードと module+offset、不変条件違反は C 番号と直前の操作名、固まりは止まっていた直前の操作名。
+- **縮小で「同じ失敗」と認める条件**: 集計用の署名に加えて、対象 (論理対象と媒体)・違反の中身 (期待値と実際の値)・
+  前提がすべて成り立っていたこと、の一致を求める。粗い署名だけで ddmin を進めると、別の原因の失敗へ縮んでしまうため。
 
-失敗した scenario は、同じ batch の残り時間で次を行う (時間が足りなければ翌晩へ持ち越す)。
+## 7. 再現確認と縮小
 
-1. **再現確認**: 記録した線形の列をそのまま 3 回流す。1 回も再現しなければ「1 回だけ」として別欄に載せ、縮小しない。
-2. **操作の縮小**: 列を半分・4 分の 1…と削っていき (ddmin)、同じ署名で落ちる最短の列を探す。
-3. **設定の縮小**: 既定値からの差分を 1 項目ずつ既定に戻し、落ちなくなる項目だけを残す。
-4. 縮小結果を `minimal.rhai` + `settings-override.json` として保存し、手元の `ui-smoke` と同じ形式で
-   再実行できるようにする。
+失敗した scenario は、次の新しい Sandbox の batch で次を行う。**時間の配分は先に固定する**:
+1 晩の時間のうち縮小に使うのは最大 1/3 とし、1 つの署名あたりの縮小は最大 15 分・試行 10 回までとする。
+残りは新しい scenario の探索に使う。
 
-縮小の再実行回数には上限を置く。上限に達したら、その時点で最短のものを出す。
+1. **再現確認**: trace の線形の列をそのまま最大 3 回流し、1 回でも同じ失敗 (§6.5) になれば「再現あり」。
+   3 回とも再現しなければ「1 回だけ」として別欄に載せ、縮小しない (同じ署名が別の夜にまた出たら再現確認をやり直す)。
+2. **操作の縮小**: 骨格を残し、後半の step を ddmin で削る。
+3. **設定の縮小**: 軸の単位で既定値に戻し、落ちなくなる軸だけを残す。戻した後の設定がカタログ上有効かも確かめる。
+4. 結果を `minimal.rhai` + `settings-override.json` として保存し、手元でも同じ形式で再実行できるようにする。
+
+ddmin の結果は「最短」ではなく、「予算内で得た、所定の削除ではもう再現しなくなる列」である。
+予算に達したら、その時点で一番短いものを出す。
+
+1 晩の本数の見込み: 6 時間で 1 本平均 2〜3 分なら、探索に使えるのは 80〜120 本程度。実測して見直す。
 
 ## 8. 朝の報告と Claude の役割
 
-- batch の結果は `results/<日付>/` に、`summary.json` (scenario 数、成功・失敗・環境失敗の数、署名ごとの件数) と、
-  失敗ごとのフォルダ (縮小済み script・設定・ログ・画面・dump) で置く。
-- 朝、メイン PC の ClaudeCode が `summary.json` と新しい署名を読み、次を書いた短い報告を作る:
-  新しく見つかった署名、増えた・消えた署名、原因の当たり (該当コードの参照)、バックログ案。
-  読むだけの作業なので確認なしのモードは要らない (Desktop の定時タスクか、利用者が会話で頼む)。
-- バックログへの登録・修正の着手は利用者の判断を経てから行う。修正の検証は、縮小済み script を
-  夜間に流し直して「その署名が消えた」ことで確かめる。
+- 結果は `results/<日付>/` に、`summary.json` (試行数、成功・失敗・終了処理の固まり・環境失敗の数、
+  集計用署名ごとの件数、生成した設定の組と検査まで届いた組の数) と、失敗ごとのフォルダ
+  (trace・縮小済み script・設定・ログ・画面・dump) で置く。
+- 朝、メイン PC の ClaudeCode が `summary.json` と新しい署名を読み、短い報告を作る: 新しく見つかった署名、
+  増えた・消えた署名、原因の当たり (該当コードの参照)、バックログ案。読むだけなので確認なしのモードは要らない
+  (Desktop の定時タスクか、利用者が会話で頼む)。
+- バックログへの登録・修正の着手は利用者の判断を経てから行う。
+- 修正の確認は「その署名が消えた」だけでは足りない。縮小済み script を流し、**必要な操作と不変条件の検査まで
+  完走して成功した**ことを確かめる (前提不成立や途中終了で署名が出なかっただけの場合を除くため)。
 - 報告の事実は出どころを書く (CLAUDE.md「観測の出どころを落とさない」)。この仕組みの観測者は
   「夜間試験 (Sandbox、ビルド <SHA>)」と書く。
 
-## 9. 任意: Claude による探索試験 (補助)
+## 9. 保留: Claude による探索試験
 
-決められた語彙では届かない操作 (メニューを開いて項目を選ぶ、ダイアログの中を触る) を、Claude が
-画面を見ながら試す段。§2.1 のとおり Windows の CLI に画面操作は無いので、次の形にする。
+決められた語彙では届かない操作を Claude が画面を見ながら試す案 (Sandbox 内で Claude Code CLI を
+`bypassPermissions` で動かし、自前の MCP で画面保存・クリック・キー入力を渡す) は、**今回の範囲から外し、
+別の設計と別の承認で扱う**。レビューで次の問題が挙がった。
 
-- Sandbox 内で Claude Code CLI を `bypassPermissions` で動かす (Sandbox は使い捨てで、公式の
-  「隔離環境」の条件に合う)。
-- 画面操作は**自前の小さな MCP サーバ**で渡す: 画面保存、クリック、キー入力 (SendInput)、
-  mIV の終了。対象は mIV の窓だけに限る。2026-11-08 の確認で、Sandbox 内の SendInput は届いている。
-- Claude には「操作して、おかしな挙動を見つけたら手順を記録する」役割だけを与え、見つけた手順は
-  §7 と同じ縮小にかける (再現できるものだけ報告する)。
+- 「MCP の対象を mIV の窓に限る」だけでは、Claude が使える shell・ファイル操作全体は制限できない。
+- mapped folder への書き込みは Sandbox を捨てた後もホストに残る。clipboard も既定では共有される。
+- 認証トークンを汎用の受け渡し場所に置けない。置き場所・権限・破棄・外向き通信の範囲を決める必要がある。
 
-前提と費用 (利用者判断、§11 Q5):
-
-- Claude Code の実行ファイルは Sandbox の起動ごとに置く必要がある。サブ PC はネットから取得しない
-  決まりなので、メイン PC から受け渡し場所へ置く。
-- 認証は利用者が `claude setup-token` で作る専用のトークンを受け渡し場所に置く。トークンは取り消せるものを使い、
-  Sandbox はネットワーク有効にする必要がある (探索試験の batch だけ)。
-- 画面を 1 回見るごとに利用枠を使う。決定的な試験 (§4〜§7) より費用がかかるので、決定的な試験が回り始めてから
-  1 晩あたりの上限を決めて始める。
+決定的な試験 (§4〜§8) が回り始めてから、必要性と費用を見て判断する。
 
 ## 10. 範囲外
 
-- 性能の退行 (遅くなった) の検出。待ち時間の上限は誤判定を防ぐためだけに使う。perf の比較は既存の
-  ReleaseChecks に任せる。
+- 性能の退行 (遅くなった) の検出。期限は誤判定を防ぐためだけに使う。perf の比較は既存の ReleaseChecks に任せる。
 - 見た目の正しさ (色・配置)。スナップショット比較は既存の `ui_snapshot` に任せる。
-- mIV Remote、MCP、ネットワークを使う機能、AI モデルのダウンロード。決定的な batch は Sandbox の
-  ネットワークを無効にする。
+- mIV Remote、MCP、ネットワークを使う機能、AI モデルのダウンロード。Sandbox のネットワークは無効にする。
 - 利用者の実データ・実設定での試験。
+- 操作の重なり (前の操作が終わる前に次を出す)。v1 では各 step の完了を待つ。試したくなったら、
+  重なりを明示した操作語彙として別に足す。
 
 ## 11. 利用者に決めてもらうこと
 
 | # | 内容 | 設計の案 |
 | --- | --- | --- |
-| Q1 | [実行確認の規則](interactive-release-verification.md) は実アプリ試験に毎回の承認を求めている (理由: 利用者の PC の前面・入力を奪う)。サブ PC の Windows Sandbox 内に限り、常設で実行してよいか | Sandbox 内に限って常設の許可とし、その範囲を同文書に追記する。runner は Sandbox の外では動かない (§5.2) |
+| Q1 | [実行確認の規則](interactive-release-verification.md) は実アプリ試験に毎回の承認を求めている (理由: 利用者の PC の前面・入力を奪う)。**サブ PC の Windows Sandbox 内**に限り、常設で実行してよいか | S0 で mIV を起動する前に決める。許可の範囲は「サブ PC・Sandbox 内・試験用 portable ビルド・使い捨ての path・決めた時間枠」に限り、同文書と CLAUDE.md の起動の規則の例外として追記する |
 | Q2 | 実行する時間帯 | サブ PC を使わない夜間 (例 01:00〜07:00) |
-| Q3 | 試験するビルドの渡し方 | 案 A: 利用者か ClaudeCode が master に入れた区切りで試験用ビルドを作って置く (手動、確実)。案 B: メイン PC で毎晩 master を専用 worktree からビルドして置く (メイン PC を夜も起動しておく必要あり)。まず A で始める |
+| Q3 | 試験するビルドの渡し方 | 案 A: master に入れた区切りで試験用ビルドを作って共有に置く (手動、確実)。案 B: メイン PC で毎晩 master を専用 worktree からビルドして置く (メイン PC を夜も起動しておく必要あり)。まず A で始める |
 | Q4 | 受け渡しの共有フォルダ | サブ PC に共有を作る (§5.3) |
-| Q5 | §9 の探索試験をするか、するなら 1 晩の上限 | 決定的な試験が回ってから判断 |
 
 ## 12. 段階
 
 | 段 | 内容 | 終わりの条件 |
 | --- | --- | --- |
-| S0 | §2.2 の未確認 3 点の確認 (セッション切断・ロック中の起動と入力、試験用ビルドの Sandbox 内での完走 (vGPU 有無)、共有フォルダでの受け渡し) | 3 点の結果を本書に記録。切断中に入力が届かない場合は、自動ログオンした常時接続のセッションか Hyper-V VM へ切り替える案を検討する |
-| S1 | 最小の一周: 既存の `multi-window-stills.rhai` 1 本を、タスクスケジューラ → Sandbox → 結果回収で流す | 人の操作なしに 1 晩で結果が戻る |
-| S2 | 生成器 v1: 設定カタログ + pairwise、状態に応じた操作の選択と記録、共通の安定待ち、C1〜C5、痕跡の判定、署名、`summary.json` | 1 晩に数百本流れ、失敗が署名ごとにまとまる。カタログ検証の cargo test が通る |
-| S3 | 縮小と再現確認 | 失敗に最短の再現 script と設定が付く |
-| S4 | 語彙と軸を広げる (F12 別窓、コレクション、動画・音声、`click_widget` の対象を増やす、GPU 軸) | 段ごとに語彙を足し、追加した語彙を使う scenario が流れる |
-| S5 | (Q5 次第) Claude による探索試験 | 別途の設計で決める |
+| S0 | 環境の確認 (下の一覧)。Q1 の後に行う | 結果を本書に記録。ロック・切断中に動かない場合は、自動ログオンした常時接続のセッションか Hyper-V VM へ切り替える案を検討する |
+| S1 | 最小の一周: 既存の `multi-window-stills.rhai` 1 本を、タスクスケジューラ → Sandbox → 結果回収で流す | 人の操作なしに 1 晩で結果が戻り、§6.3 の判定が付く |
+| S2a | `test-script` 限定の観測の追加 (§6.1) と、script worker 側の trace (§4.4) | 製品コードの変更として設計レビュー・実装・独立レビューを通る |
+| S2b | 生成器 v1: 骨格・設定カタログと pairwise・後半の選択・step の契約・C1〜C3・試行の判定・署名・`summary.json`。カタログ検証の cargo test | 1 晩に流れ、失敗が署名ごとにまとまり、届いた組の数が出る |
+| S3 | 再現確認と縮小 | 再現した失敗に縮小済みの script と設定が付く |
+| S4 | 範囲を広げる (F12 別窓と C4、コレクション、動画・音声とその「安定」の定義、`click_widget` の対象、GPU 軸) | 段ごとに語彙を足し、その語彙を使う scenario が流れる |
+
+S0 の確認項目:
+
+1. サブ PC の利用者セッションがロック中・RDP 切断中に、タスクスケジューラから Sandbox を起動でき、中で入力が届くか
+2. runner と mIV の実際の token (昇格の有無・integrity level)・session・desktop・foreground の記録
+3. 試験用ビルドが Sandbox 内で `--test-script` を完走するか (vGPU 有・無)。exit 0 / 1 / 2 と timeout がそれぞれ
+   runner に正しく返るか (わざと失敗・環境失敗にする小さな script で確かめる)
+4. 正常終了 (`run-native-return`) と強制終了 (`forced-watchdog`) を runner が区別できるか
+5. わざと落とす試験用の操作で、WER dump が作られ、ホストまで回収できるか (ネットワーク無効の条件で)
+6. runner が Sandbox の外では起動を拒否するか (固定 path・manifest・reparse の検査)
+7. 共有フォルダでの受け渡し (RDP 無し)
 
 ## 13. 設計の簡素化について (CLAUDE.md の方針)
 
-- **組み合わせを減らす**: 環境は batch ごとに必ず捨て、scenario ごとに data を作り直す。環境の
-  前の状態を引きずる組み合わせを考えなくてよい。scenario の中では操作を 1 つずつ出し、安定するまで
-  次を出さない (操作の重なりは対象外。重なりを試したくなったら、別の操作語彙として明示的に足す)。
-- **まれな失敗は割り切る**: 実行器の失敗 (Sandbox が起動しない、受け渡しの失敗、batch の timeout) は、
-  ログを残して次の batch か翌晩へ進むだけにする。再試行・途中状態の保存・失敗の種類分けは作らない。
-  失うのは 1 晩分の試験結果だけで、利用者のデータは関わらない。
+- **組み合わせを減らす**: 環境は batch ごとに必ず捨て、試行ごとに data を作り直す。異常終了の後は batch ごと
+  終えて新しい Sandbox で続ける (残った process や clipboard を戻す仕組みを作らない)。scenario の中では操作を
+  1 つずつ出し、完了を待ってから次を出す。v1 は静止画と本・1 窓に限る。
+- **まれな失敗は割り切る**: 実行器の失敗 (Sandbox が起動しない、受け渡しの失敗、batch の timeout、trace の
+  書き込み失敗) は、ログを残して次の batch か翌晩へ進むだけにする。再試行・途中状態の保存・失敗の種類分けは
+  作らない。失うのは 1 晩分の試験結果だけで、利用者のデータは関わらない。
 - 再現確認 (§7) は「不具合の判定」のための仕組みで、実行器の失敗を回復する仕組みではない。
+
+## 14. レビュー記録
+
+### 14.1 独立設計レビュー 1 回目 (2026-11-08、GPT-6.1 Sol / xhigh、対象 9b273097a)
+
+指摘 12 件 (P1 4・P2 7・P3 1)。ClaudeCode が該当コードを読み、すべて妥当と判断して R2 に反映した。
+
+| # | 指摘 | 反映先 |
+| --- | --- | --- |
+| P1-1 | 終了 watchdog の強制終了も exit 0 になり成功と誤判定する | §2.3、§6.3 (3 条件の成功、終了処理の固まりの欄)、S0-4 |
+| P1-2 | 共通の安定判定は今の snapshot では作れない | §2.3、§6.1 (`test-script` 限定の観測を足す)、S2a |
+| P1-3 | step の前提だけでは replay が固まらない。完了の待ちと前提不成立の扱いが要る | §4.4 (step の契約、論理対象、前提不成立) |
+| P1-4 | 探索試験の bypass と mapped folder にホストを守る境界が無い | §9 (保留・別設計)、§5.2 (read-only 入力・clipboard 無効) |
+| P2-5 | WER の対象名が portable の `mimageviewer.exe` と合わない | §2.3、§5.2、S0-5 |
+| P2-6 | 非昇格起動と mIV の入力成立は probe で確かめていない | §2.2 (観測範囲の訂正)、§5.2、S0-2 |
+| P2-7 | `log()` では落ちる直前の step が残らない | §2.3、§4.4 (worker 側の trace) |
+| P2-8 | C3・C4 は現存窓を調べるだけでは成り立たない | §6.2 (台帳、明示 focus と新しい描画) |
+| P2-9 | 設定の pairwise を機能の組み合わせの被覆と数えてしまう | §4.2 (骨格 + 設定 + 後半、届いた組を別に集計)、§1 (T2 全体の完了と扱わない) |
+| P2-10 | 縮小の採用条件と時間配分が弱い | §6.5 (署名を分ける)、§7 (予算の固定、本数の見込み)、§8 (修正確認の条件) |
+| P2-11 | data-dir の作り直しだけでは replay の初期状態が揃わない | §5.2 (試行ごとの領域、異常終了で batch を終える)、§4.5 (書き込みのある pack は複製)、§6.3 (既知 panic・HANG の扱い) |
+| P3-12 | カタログ検証は merge 成功だけでは誤記を見逃す | §4.3 (再直列化の一致、競合検出) |
+
+レビューが挙げた設計者への質問への回答: v1 は静止画と本・1 窓 (§4.1)。S0 に token・終了コード・強制終了・
+dump・実行場所の拒否を追加した (§12)。時間枠の終わりは全実行の期限 (§5.1)。Q1 は S0 の mIV 起動前に決める (§11)。
+§9 は範囲外にした。
