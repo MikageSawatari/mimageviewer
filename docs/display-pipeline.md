@@ -3425,6 +3425,9 @@ previous に属するなら提示とは数えない。
 初めて「提示済み」と判定し sequence を解放する。旧 unit と target unit が同じページを共有して
 同じ texture id を使っても、選択元が live なら `Live` であり、texture id の包含から ownership を
 推測しない。previous overlay を実際に描いたページは `Holdover` なので解放しない。
+通常 flat の receipt は、pan によって相方が viewport 外になっても、提出した表示単位全体の
+occurrence / source / paint ID を照合する。各ページの正の可視面積は navigation 退役の条件にしない。
+出力の採用確認・全ページの `Live` 確認・部分的な curl を退役証拠にしない条件は維持する。
 したがって次の同 frame repeat が受理される場合でも、その前に target の draw command は確定済みで
 あり、見開き片側だけを提示済みと数えることはない。
 

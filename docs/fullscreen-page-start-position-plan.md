@@ -317,7 +317,7 @@ cargo nextest run -p mimageviewer --lib --build-jobs 4 --test-threads 4 -E 'test
 
 ### 9.3 追加・拡充した回帰名
 
-`initial_placement_` 系は 48 件（前回の候補と §9.4 の追加 2 件を含む）。全件を同じ filter で実行した。
+r4 時点の `initial_placement_` 系は 48 件（前回の候補と §9.4 の追加 2 件を含む）。全件を同じ filter で実行した。以後の D2 回帰は §9.5。
 
 ```text
 initial_placement_r4_original_thumbnail_then_full_aligns_first_complete_frame
@@ -423,6 +423,90 @@ cargo check -p mimageviewer --bin mimageviewer-core --jobs 4
 - 最後に `$env:MSBUILDDISABLENODEREUSE='1'; cargo fmt` (引数なし) を実行して成功した。
   整形後の Rust 変更は整形のみで、機能の追加変更はない。`git diff --check` も成功した。
 - UI・公開文言は変更していない。製品起動・full gate・build-dev・コミットは行わない。
+
+### 9.5 実機確認・依頼 25 D2: 原寸見開きの待ち表示 (2026-11-09)
+
+サブ PC 担当の報告: 2400×3400 の縦長画像、原寸・右→左の見開き・読み始めで [2,1] から [4,3] へ
+送ると、位置は期待どおりだが中央の「読み込み中」が残った。設計担当のログ確認では cache hit の後に再描画が止まった。
+この作業では製品を起動していない。`34eb5c469` の clean な作業ツリーから App の headless 描画回帰を追加した。
+負荷を抑えて同じ縦横比の 720×1020 の完成素材を 4 ページ、600×400 の viewport とし、通常の source 選択、
+受理済みナビゲーション、実描画、output hook、次 frame の採用反映まで通した。
+
+修正前の 3 条件の結果 (`target/1726-d2-repro.log`、run ID `be274f62-cc81-49cb-ba60-cb82cdfb4532`):
+
+| 条件 | 結果 | 最後の提示証拠 |
+| --- | --- | --- |
+| 読み始め・右→左 | 失敗、6 frame 後も sequence が残る | 両ページ `Live`、receipt 採用済み、面積 `[0, 240000]`、照合失敗 |
+| 中央・手動パンなし | 成功 | pan 0、両ページ正の面積、sequence 退役 |
+| 中央・送る前に手動パン | 成功 | open で pan 0 に戻る、sequence 退役 |
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+cargo nextest run -p mimageviewer --lib --build-jobs 4 --test-threads 4 --success-output immediate -E 'test(~cached_original_rtl_spread)'
+```
+
+原因と経路: `draw_fs_spread_with_placement` → `submit_fs_spread_prepared` は、実際に選んだ current の両ページを
+`Live` として記録していた。output hook も flat receipt を採用していた。しかし
+`emit_fs_page_turn_ready_for_display_unit` → `SubmittedUnitReceipt::matches` / `matches_sources` が全ページに
+正の可視面積を要求し、原寸で viewport 外になった相方のため照合に失敗した。採用待ちの記録にも進めず、
+`observe_fs_navigation_sequence_presented` が呼ばれないまま待ち表示が残っていた。
+NavigationPrevious placement や provenance の記録漏れではない。
+
+面積条件は取り込んだ master 側 (`git show 'HEAD^2:src/ui_fullscreen/page_turn.rs'`) にも存在する。
+今回の読み始めが最初の current frame から pan を入れ、相方を画面外へ置くことで顕在化した。
+中央＋送る前の手動パンは open の reset があるので、この条件の比較では発生しない。
+master を別途ビルドした結果ではなく、上記の条件比較と source inspection による切り分けである。
+
+修正は `src/ui_fullscreen/page_turn.rs` の `SubmittedUnitReceipt::matches_sources` に限定し、通常 flat の
+提出済み occurrence / source / paint ID の完全一致から可視面積条件を外した。
+出力採用、current の完全な page set、全ページの `Live`、`!curl` は維持する。
+紙めくりの適格条件・可視性 ledger・canonical completion の条件は変更していない。
+既存の照合の責務を正す小さな修正で、新しい状態・所有経路・guard・delay・repaint・reset を追加する構造変更は不要だった。
+対象外の B5 / C4 / E3 と detached 述語・viewport 経路は触っていない。
+
+追加した回帰 (`src/ui_fullscreen/page_turn/wait_indicator_tests.rs`):
+
+```text
+initial_placement_cached_original_rtl_spread_navigation_retires_wait
+page_wait_cached_original_rtl_spread_center_navigation_retires
+page_wait_cached_original_rtl_spread_center_manual_pan_before_navigation_retires
+initial_placement_cached_original_ltr_spread_navigation_retires_wait
+initial_placement_cached_original_single_navigation_retires_wait
+initial_placement_cached_original_split_navigation_retires_wait
+initial_placement_provisional_then_complete_spread_navigation_retires_wait
+```
+
+仮素材の回帰は、受理済み target の full cache が描画前に失われた状況で実際の thumbnail を選び、
+要求を保持した後、次 frame の完成素材で要求を確定する。古い thumbnail の receipt は現在の source と一致しないため
+採用し直さず、新しい完成素材の出力で sequence が退役することを検査する。
+
+- 修正後の 7 件は成功 (0.885 秒、`target/1726-d2-fix-focused.log`、run ID `dcb55d07-cc7b-4d6f-9e65-5dde623d1227`)。
+  その後、受理済み receipt・全 `Live`・画面外の相方を実際に含むこと・完成素材の最初の frame では旧 receipt で退役しないことの assert を追加した。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+cargo nextest run -p mimageviewer --lib --build-jobs 4 --test-threads 4 --success-output immediate -E 'test(~cached_original) | test(~provisional_then_complete_spread_navigation)'
+```
+
+- 前回の集合に prepare_boundary 全体・待ち表示関連・部分 curl の除外回帰を加えた **253 件が成功・16,760 件除外**
+  (27.302 秒、コンパイル 2 分 31 秒)。ログ: `target/1726-d2-regression.log`、run ID: `c631c23d-312c-4bc7-a308-87a24b16c7bc`。
+  既存テストの期待値変更・削除・弱体化はない。上記の追加 assert を含む最終ソースで検証した。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+cargo nextest run -p mimageviewer --lib --build-jobs 4 --test-threads 4 -E 'test(~initial_placement) | test(~page_start_position) | test(~settings_transfer) | test(~search_index) | (test(~viewer_context_registry) & (test(~bundle) | test(~swap) | test(~context_async_owner_registry))) | test(~holdover) | test(~page_turn_submission_tests) | test(~page_material_kind) | test(~pdf_metadata_readoption) | test(~source_absent_changed_view_or_prepare_key_uses_existing_fallback) | test(~source_absent_stable_view_keeps_native_single_and_pair) | test(~page_turn::prepare_boundary_tests) | test(~page_turn::wait_indicator_tests) | test(~partial_leaf_receipt_cannot_complete_navigation)'
+```
+
+- core check は成功 (19.84 秒、`target/1726-d2-core.log`)。既存 warning は残る。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+cargo check -p mimageviewer --bin mimageviewer-core --jobs 4
+```
+
+- 最後に `$env:MSBUILDDISABLENODEREUSE='1'; cargo fmt` (引数なし) を実行して成功した。
+  整形後の Rust 変更は整形のみで、追加の機能変更はない。`git diff --check` も成功した。
+コミット・製品起動・full gate・build-dev は行わない。
 
 ## 10. r4: 仮の素材の frame と確定 (設計担当の決定、2026-11-08)
 

@@ -402,13 +402,16 @@ impl SubmittedUnitReceipt {
                 .pages
                 .as_slice()
                 .iter()
-                .all(|(occurrence, source, native, area)| {
-                    *area > 0.0
-                        && sources.pages.iter().any(|p| {
-                            p.occurrence == *occurrence
-                                && p.resource.source_texture_id() == *source
-                                && p.resource.paint_texture_id() == *native
-                        })
+                .all(|(occurrence, source, native, _area)| {
+                    // A complete ordinary flat can have a page outside the viewport
+                    // after pan. Match its submitted occurrence/material, not pixel
+                    // visibility. Partial curls are excluded by `!self.curl` above;
+                    // animation visibility remains owned by its completion ledger.
+                    sources.pages.iter().any(|p| {
+                        p.occurrence == *occurrence
+                            && p.resource.source_texture_id() == *source
+                            && p.resource.paint_texture_id() == *native
+                    })
                 })
     }
     pub(super) fn was_accepted(&self) -> bool {
