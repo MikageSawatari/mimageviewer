@@ -61,7 +61,11 @@ fn draw_current_with_initial_placement(
         .begin(FullscreenPageLayoutKind::Single);
     app.fullscreen_page_layout
         .push_occurrence(transform, screen[0]);
-    assert!(sources.rebind_occurrences(&screen));
+    assert!(sources.rebind_occurrences(&screen, || {
+        screen
+            .first()
+            .and_then(|o| app.page_turn_unit_binding(o.navigation_anchor_idx))
+    }));
     app.emit_fs_page_turn_ready_for_display_unit(ctx, &composition, decision, &sources);
     sources
 }

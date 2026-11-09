@@ -70359,7 +70359,11 @@ mod tests {
 
         let pending = PendingFsPageTurnReady {
             items_generation: 3,
-            units: Arc::new(Vec::new()),
+            binding: page_turn::PageTurnUnitBinding::for_test(page_turn::PresentationDestination {
+                context: crate::app::ViewerContextId::for_test(0),
+                window: None,
+                viewport: egui::ViewportId::ROOT,
+            }),
             mode: SpreadMode::Single,
             slice: crate::page_split::PageSlice::Full,
             composition: SpreadDisplayComposition::from_navigation_pages(0, &[0]).unwrap(),
@@ -96138,7 +96142,11 @@ pub(crate) mod page_turn_submission_tests {
                     )
                     .unwrap();
                 app.fullscreen_page_layout.push_occurrence(transform, *page);
-                assert!(sources.rebind_occurrences(&screen));
+                assert!(sources.rebind_occurrences(&screen, || {
+                    screen
+                        .first()
+                        .and_then(|o| app.page_turn_unit_binding(o.navigation_anchor_idx))
+                }));
                 sources
             }
             [left, right] => app.draw_fs_spread_with_submission(
@@ -96308,13 +96316,13 @@ pub(crate) mod page_turn_submission_tests {
         let _serial = crate::key_input::lock_test_input();
         let ctx = egui::Context::default();
         let mut app = ready_app(&ctx, SpreadMode::Single);
-        seed_interrupted_leaf(&ctx, &mut app, 2);
-        adopt_interrupted_target(&ctx, &mut app);
         app.items[2] = GridItem::PdfPage {
             pdf_path: PathBuf::from("c:/page-turn/next.pdf"),
             page_num: 2,
             content_type: Some(PdfPageContentType::Raster { w: 80, h: 120 }),
         };
+        seed_interrupted_leaf(&ctx, &mut app, 2);
+        adopt_interrupted_target(&ctx, &mut app);
         let requests = app.book_bookmark_request_seq;
         frame_with_events(&ctx, vec![pressed(egui::Key::B)], |ctx| {
             assert!(matches!(
@@ -96334,6 +96342,37 @@ pub(crate) mod page_turn_submission_tests {
         });
         #[cfg(windows)]
         crate::key_input::clear_test_frame();
+    }
+
+    #[test]
+    fn regression_1750_continuation_rejects_post_capture_pdf_replacement() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        let ctx = egui::Context::default();
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        seed_interrupted_leaf(&ctx, &mut app, 2);
+        adopt_interrupted_target(&ctx, &mut app);
+        let generation = app.items_generation;
+        let item_id = app.current_edit_result_key(2).item_id;
+        app.items[2] = GridItem::PdfPage {
+            pdf_path: PathBuf::from("c:/page-turn/next.pdf"),
+            page_num: 2,
+            content_type: Some(PdfPageContentType::Raster { w: 80, h: 120 }),
+        };
+        assert_eq!(app.items_generation, generation);
+        assert_ne!(app.current_edit_result_key(2).item_id, item_id);
+        frame_with_events(&ctx, vec![], |ctx| {
+            assert!(matches!(
+                app.begin_current_page_turn_frame_for_test(ctx),
+                PageTurnFrameEntry::Continue {
+                    committed: false,
+                    ..
+                }
+            ));
+            assert_eq!(app.fullscreen_idx, Some(1));
+            assert!(!app.page_turn_barrier_active());
+            assert!(!app.commit_page_turn_continuation(ctx));
+        });
     }
 
     #[test]
@@ -96522,9 +96561,9 @@ pub(crate) mod page_turn_submission_tests {
             let ctx = egui::Context::default();
             let mut app = ready_app(&ctx, SpreadMode::Single);
             app.native_video_in_window_active = embedded;
+            app.items[2] = GridItem::Video(PathBuf::from("c:/page-turn/next.mp4"));
             seed_interrupted_leaf(&ctx, &mut app, 2);
             adopt_interrupted_target(&ctx, &mut app);
-            app.items[2] = GridItem::Video(PathBuf::from("c:/page-turn/next.mp4"));
             frame_with_events(&ctx, vec![], |ctx| {
                 assert!(matches!(
                     app.begin_page_turn_viewer_frame(ctx, embedded, None),
@@ -96547,9 +96586,9 @@ pub(crate) mod page_turn_submission_tests {
         let mut app = ready_app(&ctx, SpreadMode::Single);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
         app.detached_viewer_independent_active = true;
+        app.items[2] = GridItem::Video(PathBuf::from("c:/page-turn/next.mp4"));
         seed_interrupted_leaf(&ctx, &mut app, 2);
         adopt_interrupted_target(&ctx, &mut app);
-        app.items[2] = GridItem::Video(PathBuf::from("c:/page-turn/next.mp4"));
         frame_with_events(&ctx, vec![], |ctx| {
             assert!(app.should_block_detached_independent_still_navigation_to_video(2));
             assert!(matches!(
@@ -96955,7 +96994,9 @@ pub(crate) mod page_turn_submission_tests {
                     }
                     app.pending_fs_page_turn_ready = Some(PendingFsPageTurnReady {
                         items_generation: app.items_generation,
-                        units: Arc::clone(&app.spread_display_units_cache.units),
+                        binding: app
+                            .page_turn_unit_binding(composition.navigation_anchor_idx())
+                            .unwrap(),
                         mode: app.spread_mode,
                         slice: app.fullscreen_page_slice,
                         composition,
@@ -97280,7 +97321,9 @@ pub(crate) mod page_turn_submission_tests {
                 .map(|p| SpreadPageOccurrence::navigation(p.idx(), 3))
                 .collect();
             assert!(
-                !sources.rebind_occurrences(&wrong_roles),
+                !sources.rebind_occurrences(&wrong_roles, || wrong_roles
+                    .first()
+                    .and_then(|o| app.page_turn_unit_binding(o.navigation_anchor_idx))),
                 "proof cannot invent navigation roles after submission"
             );
         });

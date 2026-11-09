@@ -4047,13 +4047,15 @@ mod tests {
             outgoing,
             offer: AcceptedOffer {
                 fact,
-                ready_sources: Arc::new(AcceptedSources(vec![AcceptedSource {
-                    occurrence: SpreadPageOccurrence::navigation(0, 0),
-                    resource: held,
-                    source_mipmapped: false,
-                    quality: "native_output",
-                    content: app.page_turn_content(0),
-                }])),
+                ready_sources: Arc::new(AcceptedSources(
+                    vec![AcceptedSource {
+                        occurrence: SpreadPageOccurrence::navigation(0, 0),
+                        resource: held,
+                        source_mipmapped: false,
+                        quality: "native_output",
+                    }],
+                    app.page_turn_unit_binding(0).unwrap(),
+                )),
                 resident_bytes: 24,
                 pin_bytes: 24,
                 accepted_at: presentation_now(),
@@ -4177,12 +4179,7 @@ mod tests {
         )
         .unwrap();
         Arc::new(PaintedUnit {
-            destination: destination(serial),
-            items: 1,
-            layout: Arc::new(Vec::new()),
-            mode: SpreadMode::Single,
-            reading_rtl: false,
-            slice: crate::page_split::PageSlice::Full,
+            binding: PageTurnUnitBinding::for_test(destination(serial)),
             pages: vec![PreparedPagedPage {
                 crop: None,
                 occurrence: SpreadPageOccurrence::navigation(0, 0),
@@ -4201,7 +4198,6 @@ mod tests {
             white: None,
             reserved_bytes: Arc::new(AtomicU64::new(0)),
             evidence: AcceptanceEvidence::Immediate,
-            content: Vec::new(),
         })
     }
 
@@ -4352,7 +4348,7 @@ mod tests {
         let trim_clip = egui::Rect::from_min_max(egui::pos2(0.0, 2.0), egui::pos2(80.0, 30.0));
         let white_rect = egui::Rect::from_min_size(egui::pos2(40.0, 0.0), egui::vec2(32.0, 32.0));
         let actual = Arc::get_mut(&mut painted).unwrap();
-        actual.mode = SpreadMode::Ltr;
+        actual.binding.mode = SpreadMode::Ltr;
         let real_rect = actual.pages[0].transform.paint_rect;
         actual.pages[0].transform = DisplayedImageTransform::from_resolved_rect(
             DisplayedImageTransformInput {
@@ -4468,7 +4464,7 @@ mod tests {
             let destination = owner.page_turn_destination();
             let accepted = Arc::new(AtomicBool::new(true));
             let incoming = Arc::new(PaintedUnit {
-                destination,
+                binding: PageTurnUnitBinding::for_test(destination),
                 evidence: AcceptanceEvidence::Deferred(accepted.clone()),
                 reserved_bytes: Arc::new(AtomicU64::new(expected_bytes)),
                 ..(*unit(&ctx, texture.clone(), batch)).clone()
@@ -4512,7 +4508,7 @@ mod tests {
             }
             owner.pending_fs_page_turn_ready = Some(PendingFsPageTurnReady {
                 items_generation: owner.items_generation,
-                units: owner.spread_display_units_cache.units.clone(),
+                binding: owner.page_turn_unit_binding(0).unwrap().for_pending(&ctx),
                 mode: owner.spread_mode,
                 slice: owner.fullscreen_page_slice,
                 composition: SpreadDisplayComposition::from_navigation_pages(0, &[0]).unwrap(),
@@ -4967,9 +4963,9 @@ mod tests {
             egui::TextureOptions::LINEAR,
         );
         let mut previous = unit(&ctx, texture, 1);
-        Arc::make_mut(&mut previous).content = vec![app.page_turn_content(0)];
+        Arc::make_mut(&mut previous).binding.content = vec![app.page_turn_content(0)];
         let mut current = Arc::new((*previous).clone());
-        Arc::make_mut(&mut current).content[0].gap += 1;
+        Arc::make_mut(&mut current).binding.content[0].gap += 1;
         assert!(previous.evidence.was_accepted());
         assert!(previous.same_material_and_geometry(&current));
         assert_ne!(previous.content[0].gap, current.content[0].gap);
@@ -5000,7 +4996,7 @@ mod tests {
             outgoing: outgoing.clone(),
             offer: AcceptedOffer {
                 fact: fact(1),
-                ready_sources: Arc::new(AcceptedSources(Vec::new())),
+                ready_sources: Arc::new(AcceptedSources(Vec::new(), outgoing.binding.clone())),
                 resident_bytes: bytes,
                 pin_bytes: bytes,
                 accepted_at: presentation_now(),
@@ -5262,7 +5258,11 @@ mod tests {
             .expect("accepted fit metadata permits ordinary drawing");
         app.fullscreen_page_layout
             .push_occurrence(transform, pages[0]);
-        assert!(sources.rebind_occurrences(&pages));
+        assert!(sources.rebind_occurrences(&pages, || {
+            pages
+                .first()
+                .and_then(|o| app.page_turn_unit_binding(o.navigation_anchor_idx))
+        }));
         let FsDisplayUnitSubmission::Paged(receipt) = &sources.submission else {
             panic!("ordinary draw must submit its page-turn receipt");
         };
@@ -5686,7 +5686,10 @@ mod tests {
                     incoming: incoming.clone(),
                     offer: AcceptedOffer {
                         fact: old_fact,
-                        ready_sources: Arc::new(AcceptedSources(Vec::new())),
+                        ready_sources: Arc::new(AcceptedSources(
+                            Vec::new(),
+                            outgoing.binding.clone(),
+                        )),
                         resident_bytes: 0,
                         pin_bytes: 0,
                         accepted_at: presentation_now(),

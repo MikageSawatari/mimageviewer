@@ -2375,7 +2375,11 @@ fn paint_submitted_single(
     app.fullscreen_page_layout.push(transform);
     let composition = app.spread_display_composition_for_anchor(idx);
     let occurrences = composition.pages_in_screen_order(app.spread_mode);
-    assert!(sources.rebind_occurrences(&occurrences));
+    assert!(sources.rebind_occurrences(&occurrences, || {
+        occurrences
+            .first()
+            .and_then(|o| app.page_turn_unit_binding(o.navigation_anchor_idx))
+    }));
     (transform, sources)
 }
 
