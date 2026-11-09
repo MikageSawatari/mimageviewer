@@ -14,7 +14,12 @@ impl PaintedUnit {
         diff!("content", self.content == other.content);
         diff!("destination", self.destination == other.destination);
         diff!("items", self.items == other.items);
-        diff!("layout_arc", Arc::ptr_eq(&self.layout, &other.layout));
+        diff!("unit_binding", self.binding.layout == other.binding.layout);
+        diff!("reading_flow", self.reading_flow == other.reading_flow);
+        diff!(
+            "prepare_policy",
+            self.binding.same_view_policy(&other.binding)
+        );
         diff!("mode", self.mode == other.mode);
         diff!("reading_rtl", self.reading_rtl == other.reading_rtl);
         diff!("slice", self.slice == other.slice);
@@ -68,29 +73,24 @@ impl PaintedUnit {
             page_diff!("clip_rect", a.painter.clip_rect() == b.painter.clip_rect());
             page_diff!("underlay", same_underlay(&a.underlay, &b.underlay));
         }
+        if self.binding != other.binding && fields.is_empty() {
+            fields.push("prepared_binding".to_owned());
+        }
         fields
     }
 
     fn layout_comparison(
         &self,
-        layout: &[SpreadDisplayUnit],
+        layout: &PageTurnLayoutBinding,
         pages: &[PreparedPagedPage],
     ) -> serde_json::Value {
-        let anchor = self
-            .pages
-            .first()
-            .map(|p| p.occurrence.navigation_anchor_idx);
-        let old = self
-            .layout
-            .iter()
-            .find(|unit| Some(unit.anchor_idx()) == anchor);
-        let new = layout.iter().find(|unit| Some(unit.anchor_idx()) == anchor);
         serde_json::json!({
-            "occurrences_equal": old.map(|u| &u.pages) == new.map(|u| &u.pages)
+            "occurrences_equal": self.binding.layout.pages == layout.pages
                 && self.pages.iter().map(|p| p.occurrence).eq(pages.iter().map(|p| p.occurrence)),
-            "formation_equal": old.map(|u| u.formation) == new.map(|u| u.formation),
-            "placement_equal": self.pages.len() == pages.len()
-                && self.pages.iter().zip(pages).all(|(a, b)| a.transform.placement == b.transform.placement),
+            "formation_equal": self.binding.layout.formation == layout.formation,
+            "placement_equal": self.binding.layout.composition.singleton_placement == layout.composition.singleton_placement
+                && self.pages.len() == pages.len()
+                && self.pages.iter().zip(pages).all(|(a,b)| a.transform.placement == b.transform.placement),
         })
     }
 
@@ -103,10 +103,10 @@ impl PaintedUnit {
             ("origin", origin.into()),
             ("different_fields", self.different_fields(other).into()),
         ];
-        if !Arc::ptr_eq(&self.layout, &other.layout) {
+        if self.binding.layout != other.binding.layout {
             fields.push((
                 "layout",
-                self.layout_comparison(&other.layout, &other.pages),
+                self.layout_comparison(&other.binding.layout, &other.pages),
             ));
         }
         fields
@@ -141,9 +141,19 @@ impl App {
             diff!("items", incoming.items == self.items_generation);
             diff!("mode", incoming.mode == self.spread_mode);
             diff!("slice", incoming.slice == self.fullscreen_page_slice);
+            let current_layout = self.page_turn_resolved_layout(incoming.binding.layout.anchor);
             diff!(
-                "layout_arc",
-                Arc::ptr_eq(&incoming.layout, &self.spread_display_units_cache.units)
+                "unit_binding",
+                current_layout.as_ref() == Some(&incoming.binding.layout)
+            );
+            diff!("reading_flow", incoming.reading_flow == self.reading_flow);
+            diff!(
+                "reading_rtl",
+                incoming.reading_rtl == self.page_turn_reading_rtl()
+            );
+            diff!(
+                "prepare_policy",
+                incoming.binding.matches_prepare_policy(self)
             );
             diff!("live", !self.settings.page_turn_animation_enabled || live);
             if let Some(old) = incoming
@@ -211,7 +221,8 @@ impl App {
             } else {
                 different.push("page_idx");
             }
-            if !Arc::ptr_eq(&incoming.layout, &self.spread_display_units_cache.units) {
+            if let Some(layout) = current_layout.filter(|layout| *layout != incoming.binding.layout)
+            {
                 let mut pages = incoming.pages.clone();
                 if let Some(page) = pages
                     .iter_mut()
@@ -219,10 +230,7 @@ impl App {
                 {
                     page.transform = *transform;
                 }
-                fields.push((
-                    "layout",
-                    incoming.layout_comparison(&self.spread_display_units_cache.units, &pages),
-                ));
+                fields.push(("layout", incoming.layout_comparison(&layout, &pages)));
             }
         }
         fields.push(("different_fields", different.into()));
