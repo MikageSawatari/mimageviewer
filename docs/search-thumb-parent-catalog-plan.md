@@ -1,8 +1,8 @@
 # 検索結果などで作ったサムネイルを親フォルダのキャッシュにも置く (§1.741)
 
-作成: 2026-11-08。状態: **実装済み (独立再レビュー待ち)**。
+作成: 2026-11-08。状態: **実装済み・実機確認待ち** (独立実装レビュー: 1 回目 REVISE → 修正後 ACCEPT、2026-11-09、Codex GPT-6.1 Sol / xhigh)。
 独立設計レビュー: r1〜r4 REVISE → r5 ACCEPT、2026-11-09、Codex GPT-6.1 Sol / xhigh。
-対象版: 利用者判断 (§12)。
+対象版: v5.1.0 後の版 (利用者決定 2026-11-09)。
 バックログ: [next-release-backlog.md §1.741](next-release-backlog.md)。報告: 5ch >>746。
 
 ## 1. 問題
@@ -393,7 +393,7 @@ struct ThumbnailCatalogProvider {
   既存の旧行は消さない (キャッシュの削除・期限で消える)。
 - 公開文書の文言は変えない (偽になる文は無い)。
 
-## 16. 実装メモ (2026-11-09、独立再レビュー待ち)
+## 16. 実装メモ (2026-11-09)
 
 - 検索 pool の所有、Parent 要求・遅延 catalog、observed と要求メモリ署名の分離、RAW/EPUB、
   親 PDF メタ保存・親 DB hit の catch-up、release check の保存先 witness を実装した。
