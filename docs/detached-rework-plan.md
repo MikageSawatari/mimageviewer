@@ -1467,7 +1467,9 @@ SpreadShift の continuation だけは本全体 topology 照合を残す (ずら
 兄弟の資源・世代・queue・提示状態を変えない headless 対照を含める。
 
 設計担当 ClaudeCode と独立 Sol / xhigh 設計レビュー (r1 REVISE P2 → r2 ACCEPT) は、提示資格の所有単位を
-本全体から表示単位へ移す構造修正であり症状パッチではないと合意した。正本は
+本全体から表示単位へ移す構造修正であり症状パッチではないと合意した。初回実装の停止を受けた改訂 (r3 REVISE P2 → r4 ACCEPT)
+では、singleton 配置を表示条件へ移し、base に無い owning viewport / frame の照合は足さない (ROOT/子 viewport の
+配送規則は変えない) とした。合意は改訂後も維持。正本は
 [ページめくりの表示単位 binding](page-turn-layout-binding-plan.md)。
 
 ### 2026-11-08: ページ切替後の初期表示位置 (§1.726)
