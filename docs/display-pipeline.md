@@ -21,13 +21,24 @@ mouse / touch の zoom・pan と navigator は Depth 中だけ止め、通常2D�
 保存flagではなく `fs_zoom_owner()` に基づく実効helperを使い、通常のtouchページ送りを止めない。
 占有 owner、readiness、全入口の分類と検証状況の正本は [3D 設計](depth-parallax-plan.md)。
 
-§1.668（案C）: PC Collection rootのgeneric thumbnailは可視workerでdrive/UNC保持の実親catalogを
-既存DBだけROで個別lookupし、既存stamp/proof・preview優先・cache/source分岐を通る。
+§1.668/§1.741: generic poolは固定catalogと遅延catalogを持ち、受付時の `RequestCatalog` と
+`CatalogWork` が保存先/admissionを決める。Collection rootはdrive/UNC保持の元親namespaceとfull-path行を維持し、
+通常catalogの旧行をseedせず、旧catalog由来の再帰CachedPinnedも新namespaceへmirrorしない。
+検索・★・履歴等のMultiParentではピンなし画像/ZIP/PDF・EPUB表紙だけ通常親catalogの通常row keyへ保存する。
+通常folder/ZIP・PDF内/Collection PhysicalSourceはFixed、folder/pin/変換書庫/Stack/内部page/集約行は従来の宛先。
+音声/動画/Remoteの専用経路も維持する。
+
+Parentは既存EPUB stamp準備の後、一覧自身のメモリを要求キー/要求stampで先に引き、hitならstatしない。
+miss時に通常scanと同じobserved（EPUBは解決済みgeneration）で親DBをRO lookupし、必要時だけ生成する。
+親DB hitと生成・保存時のメモリは要求キー/要求stamp、DBは親row key/observedで保持する。
+stat失敗時は要求stampでRO lookupだけ行い、保存しない。SourceOnlyはメモリ/DB lookupを省き、
+CacheOnlyはstat/生成/保存をしない。RAW follow-upはobservedと受付時の宛先を継承する。
 typedな保存targetは実測policy/forceで保存が確定した後だけRWを開き、非保存Autoで空DBを作らない。
-行keyはfull-pathのまま、
-通常catalogの旧行はseedしない。video pinの準備済みメモリseedは優先を維持し、旧catalog由来の
-再帰CachedPinnedは新DBへmirrorしない。保存policyとidle品質更新、音声/動画/Remoteの専用経路は
-維持する。所有と削除は [catalog設計](catalog-design.md) を参照。
+ParentのPDFメタ補完/catch-upも同じtargetのRWを使い、lookupのROを書込へ渡さない。
+video pinの準備済みメモリseed・preview優先・stamp/proof・保存policy・idle品質更新は維持する。
+検索pool/seedのownerは `__search_results__` 自身で、元一覧や兄弟contextへ書かない。
+旧合成DB行は従来のメモリから表示し、コピー/移行しない。新規生成・idle再生成だけ親DBと共有し、schema/hashは変えない。
+所有と削除は [catalog設計](catalog-design.md)、契約は [§1.741設計](search-thumb-parent-catalog-plan.md) を参照。
 
 ### GPU の初期化（§1.448）
 

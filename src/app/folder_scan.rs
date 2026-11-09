@@ -1101,10 +1101,7 @@ where
                 meta.as_ref()
                     .and_then(|m| m.modified().ok().map(|modified| (modified, m.len()))),
             );
-            let mtime = meta
-                .as_ref()
-                .map_or(0, |m| crate::ui_helpers::mtime_secs(m));
-            let file_size = meta.as_ref().map_or(0, |m| m.len() as i64);
+            let (mtime, file_size) = meta.as_ref().map_or((0, 0), crate::catalog::file_stamp);
             let sort_meta = crate::settings::ListingSortMetadata::new(
                 mtime,
                 meta.as_ref().map(|m| m.len() as i64),

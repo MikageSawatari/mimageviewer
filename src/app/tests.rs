@@ -820,6 +820,9 @@ mod same_position_double_click;
 #[path = "tests/collection_thumb_1668.rs"]
 mod collection_thumb_1668;
 
+#[path = "tests/search_thumb_1741.rs"]
+mod search_thumb_1741;
+
 #[cfg(windows)]
 #[path = "tests/audio_plugin_migration.rs"]
 mod audio_plugin_migration;

@@ -4,13 +4,28 @@
 
 `book_order`が本棚直下の`mimageviewer.book-order.json`を読み、名前順または手動順を解決する。既存の本・設定の保存形式は維持する。`app/book_shelf`はApp共通のroot/選択epoch/表示revision付きsnapshotと型付き読込・保存・未保存phaseを所有し、番号・固定集合・追加先候補を同じrowsから導く。Remoteは共通reader/resolverで保存済み順を読む。順序読取異常は名前順＋書込停止で原本を保持する。閲覧contextのitems・cache・generation・channelは変更しない。[設計と検証](book-order-plan.md)。
 
-## コレクション一覧の永続サムネイル（§1.668、案C）
+## 一覧の永続サムネイルと保存先の所有（§1.668、§1.741）
 
-`thumb_loader/catalog_provider.rs` は既存generic poolの固定catalog/実親catalog providerを所有する。
-PC Collectionの元GridItemからdrive/UNC保持の実親scopeを固定し、workerの16 slot LRUで個別lookup/saveする。
+`thumb_loader/catalog_provider.rs` の `ThumbnailCatalogProvider` はpoolの固定catalogと
+`LazyCatalogs` を所有する。共通受付で `RequestCatalog` (Fixed / Parent / CollectionSourceParent)
+と `CatalogWork` のadmissionを一つに決め、workerが個別lookup/saveする。
+Collection元親と通常親の種類・path・cache dir・admission・RO/RWを区別し、poolごと合計16 slotのLRUを使う。
 lookupは既存DBをROで開くだけで、typedな保存targetがpolicy/実測で保存を選んだ後だけRWを開く。
-新namespaceのキャッシュだけを追加し、通常Folder/Smart/Search/Remoteの保存先と `collection.db` は変更しない。
-寿命は元フォルダ単位で、参照解除では消さない。接続/削除familyの詳細は [catalog設計](catalog-design.md)。
+PC Collection rootは§1.668のdrive/UNC保持namespaceとfull-path行を維持し、`collection.db` は変更しない。
+寿命は元フォルダ単位で、参照解除では消さない。
+
+§1.741では検索・★・履歴等の `MultiParent` 一覧にあるピンなしの画像・ZIP・PDF/EPUB表紙を、
+通常親catalogの通常キー/workerで確定したobserved stampで保存する。メモリは一覧自身の要求キー/要求stampを
+使い、メモリhitにはstatを足さない。親DB hitも同じメモリへ戻し、ParentのPDFメタ補完は保存targetのRWを使う。
+通常folder/ZIP/PDF内/Collection PhysicalSourceはFixed、folder行/pin/変換書庫/Stack/内部page/集約行は従来の保存先。
+音声・動画・Remoteは専用経路を維持する。
+
+Ctrl+G/Ctrl+Rは元一覧のpoolを借りず、`__search_results__` のpool/catalog/cache_mapを所有する。
+準備はCurrentかPrepare（置換元identity付き）を一つの契約とし、Everythingのfolder video-pin seedも
+検索ownerへcommitする。Readyでidentityを照合し、同じ検索内のrebuildではpoolを作り直さない。
+channel/queue/cancelとpool catalogの型は同じviewer contextで移譲・退役し、兄弟contextを失効させない。
+旧schema/hash/行は維持し、合成DBの旧行はメモリから読む。コピー/一括移行は行わず、新規生成・idle再生成だけを共有する。
+接続/削除familyは [catalog設計](catalog-design.md)、ownerと保存先の契約は [§1.741設計](search-thumb-parent-catalog-plan.md) を参照。
 
 ## 前回 GUI 終了の診断と現役AI失敗の通知（§1.482 段A〜D）
 
@@ -103,7 +118,8 @@ Everything ファイル名検索（§1.374、実装中・検証待ち）は `eve
 `TopLevelGridView::Search` に置く。`SearchSource`、排他的pending `SearchProducer`、
 accepted `SearchAccepted` / `EverythingPosition` がdraft・取得中・表示中の位置を区別する。
 `SearchPageEditPrepare` がimmutable datasetからsort/★/tag/編集情報を準備し、既存adoptionへ渡す。
-通常thumbnail・物理本open/back・F12 fork/park/promoteを利用し、検索専用の第二items/cache/worker群を作らない。
+通常thumbnailのpool lifecycle・物理本open/back・F12 fork/park/promoteを利用する。
+検索のthumbnail poolは§1.741の `__search_results__` ownerへ置き換え、別のitems/prepare機構を追加しない。
 Everything本体/SDK DLLは同梱せず、同PCで起動中の既定clientへ直接IPCする。
 IPCのHWND/send/pump/packetは検索ごとの`everything-ipc` runが一括所有し、検索prepare workerは
 完了event/取消eventで待つ。native sendが遅くても取消は先に返し、旧runは有限deadlineで自然退役する。

@@ -4542,6 +4542,33 @@ impl ContinuousReadingScrollTransition {
 /// push 側が notify_one() で起こす。
 pub(crate) type NotifyQueue = (Mutex<Vec<LoadRequest>>, Condvar);
 
+/// Installed with the channel, queues and cancel token of one viewer context.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ThumbnailPoolCatalog {
+    #[default]
+    None,
+    Folder(PathBuf),
+    View(PathBuf),
+    Collection,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ThumbStorageScope {
+    SingleFolder { full_path_keys: bool },
+    MultiParent,
+    CollectionRoot,
+    DriveList,
+}
+
+impl ThumbStorageScope {
+    fn full_path_keys(self) -> bool {
+        match self {
+            Self::SingleFolder { full_path_keys } => full_path_keys,
+            Self::MultiParent | Self::CollectionRoot | Self::DriveList => true,
+        }
+    }
+}
+
 fn should_close_fullscreen_from_main_focus(
     fs_focus_grace_elapsed: bool,
     main_viewport_focused: bool,
@@ -16633,6 +16660,7 @@ pub struct App {
     /// 永続ワーカーがサムネイルを処理するためのキュー（UI からは push のみ）
     /// 通常画像 (Image, ZipImage, PdfPage) + PdfFile (フォルダ代表画、IPC 待ち) 用
     pub(crate) reload_queue: Option<Arc<NotifyQueue>>,
+    pub(crate) thumbnail_pool_catalog: ThumbnailPoolCatalog,
     /// 重い同期 I/O (Folder, ZipFile, ConvertibleArchive, ZipDir) 用の専用キュー。
     /// 専用 I/O ワーカー (2本) が priority 順に取り出す。
     /// PdfFile は別プロセス IPC のため通常キュー側に振り分けて
@@ -21092,6 +21120,7 @@ impl App {
             cache_gen_done: Arc::new(AtomicUsize::new(0)),
             image_metas: Vec::new(),
             reload_queue: None,
+            thumbnail_pool_catalog: ThumbnailPoolCatalog::None,
             heavy_io_queue: None,
             requested: ThumbnailRequests::default(),
             raw_thumb_develop: Arc::new(Mutex::new(ItemsGenerationMap::new("raw_thumb_develop"))),
@@ -29673,6 +29702,7 @@ impl App {
 
         self.finish_main_list_open(StartupListIntent::ExplicitList);
         if self.folder_pin_map.is_empty() {
+            self.thumbnail_pool_catalog = ThumbnailPoolCatalog::None;
             self.reload_queue = None;
             self.heavy_io_queue = None;
             return;
@@ -29689,6 +29719,7 @@ impl App {
         ));
         self.current_color_cache_map = Some(Arc::clone(&cache_map));
         self.current_color_catalog = catalog_arc.clone();
+        self.thumbnail_pool_catalog = ThumbnailPoolCatalog::View(drive_list_catalog_path());
         self.seed_drive_list_pin_thumbs_from_catalog(&cache_map, catalog_arc.as_ref());
         self.cache_gen_total = 0;
         self.cache_gen_done = Arc::new(AtomicUsize::new(0));
@@ -44607,6 +44638,11 @@ impl App {
         crate::logger::log(format!("  catalog: {catalog_entries} entries in DB"));
         self.current_color_cache_map = Some(Arc::clone(&cache_map));
         self.current_color_catalog = catalog_arc.clone();
+        self.thumbnail_pool_catalog = if is_synthetic_view_path(&source_path) {
+            ThumbnailPoolCatalog::View(source_path.clone())
+        } else {
+            ThumbnailPoolCatalog::Folder(source_path.clone())
+        };
 
         // PDF / ZIP を仮想フォルダとして開いた場合、親フォルダ catalog の
         // pdfthumb: / zipthumb: 先頭サムネを仮想 catalog の page_0000 / 最初の
@@ -49915,6 +49951,10 @@ impl App {
 
     fn restart_thumbnail_workers_after_metadata_pin_refresh(&mut self) {
         let had_workers = self.reload_queue.is_some() || self.heavy_io_queue.is_some();
+        self.replace_thumbnail_workers(had_workers);
+    }
+
+    fn replace_thumbnail_workers(&mut self, install_pool: bool) {
         let cache_map = self.current_color_cache_map.clone();
 
         if self.projected_viewer_context_id() == self.viewer_context_main()
@@ -49933,8 +49973,11 @@ impl App {
         self.tx = tx.clone();
         self.rx = rx;
         self.cancel_token = Arc::clone(&cancel);
-        self.reload_queue = had_workers.then(|| Arc::clone(&reload_queue));
-        self.heavy_io_queue = had_workers.then(|| Arc::clone(&heavy_io_queue));
+        self.reload_queue = install_pool.then(|| Arc::clone(&reload_queue));
+        self.heavy_io_queue = install_pool.then(|| Arc::clone(&heavy_io_queue));
+        if !install_pool {
+            self.thumbnail_pool_catalog = ThumbnailPoolCatalog::None;
+        }
         crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
         self.requested.clear();
         self.cache_gen_total = 0;
@@ -49942,7 +49985,7 @@ impl App {
 
         // Lightweight search requests also own their result channel. Replace it even without
         // persistent workers, so cancelled old video/image results cannot overwrite fresh pins.
-        let Some(cache_map) = cache_map.filter(|_| had_workers) else {
+        let Some(cache_map) = cache_map.filter(|_| install_pool) else {
             return;
         };
         self.spawn_thumbnail_workers(
@@ -55745,6 +55788,7 @@ impl App {
             old.store(true, Ordering::Relaxed);
         }
         self.wake_all_workers();
+        self.thumbnail_pool_catalog = ThumbnailPoolCatalog::None;
         self.cancel_token = Arc::new(AtomicBool::new(false));
         // Catchup keeps its existing main-only contract. PDF invalidation belongs
         // to the projected viewer, including a detached viewer replacing its list.
@@ -55786,19 +55830,29 @@ impl App {
         req.items_gen = self.items_generation;
         req.pdf_render_validity =
             crate::pdf_loader::PdfRenderValidity::Viewer(self.pdf_render_epoch.snapshot());
-        if matches!(
-            self.top_level_grid_view.surface(),
-            top_level_grid_view::TopLevelGridSurface::Collection(_)
-        ) && let Some(source) = self.items.get(req.idx).and_then(GridItem::drag_source_path)
-        {
-            // Capture a fallback parent/admission, not the actual destination.
-            // PhysicalSource retains the Collection surface, but its worker's
-            // FixedCatalog takes precedence for lookup, retirement and saving.
-            req.catalog_target = crate::thumb_loader::RequestCatalog::collection(
-                source,
-                crate::catalog::CatalogWork::default(),
-            );
-        }
+        req.catalog_target =
+            match self.thumb_storage_scope() {
+                ThumbStorageScope::MultiParent => req.parent_row.take().map_or(
+                    crate::thumb_loader::RequestCatalog::Fixed,
+                    |row| crate::thumb_loader::RequestCatalog::Parent {
+                        row,
+                        work: crate::catalog::CatalogWork::default(),
+                    },
+                ),
+                ThumbStorageScope::CollectionRoot => self
+                    .items
+                    .get(req.idx)
+                    .and_then(GridItem::drag_source_path)
+                    .map_or(crate::thumb_loader::RequestCatalog::Fixed, |source| {
+                        crate::thumb_loader::RequestCatalog::collection(
+                            source,
+                            crate::catalog::CatalogWork::default(),
+                        )
+                    }),
+                ThumbStorageScope::SingleFolder { .. } | ThumbStorageScope::DriveList => {
+                    crate::thumb_loader::RequestCatalog::Fixed
+                }
+            };
     }
 
     fn promote_viewer_pdf_keys(
@@ -55829,45 +55883,32 @@ impl App {
         }
     }
 
-    /// Install worker-prepared resources only for a Search whose mounted context has no pool.
-    /// The ordinary context token/channel own the pool and the existing load/exit cancels it.
-    pub(crate) fn install_missing_search_thumbnail_workers(
+    pub(crate) fn thumbnail_pool_identity(&self) -> Option<Arc<AtomicBool>> {
+        (self.reload_queue.is_some() && self.thumbnail_pool_catalog != ThumbnailPoolCatalog::None)
+            .then(|| Arc::clone(&self.cancel_token))
+    }
+
+    /// Adopt Search's prepared catalog and memory, retiring only this context's pool.
+    pub(crate) fn install_search_thumbnail_workers(
         &mut self,
         cache_map: Arc<std::sync::RwLock<HashMap<String, crate::catalog::CacheEntry>>>,
         catalog: Option<Arc<crate::catalog::CatalogDb>>,
     ) {
-        if self.reload_queue.is_some() {
+        if self.reload_queue.is_some()
+            && self.thumbnail_pool_catalog
+                == ThumbnailPoolCatalog::View(search_results_synthetic_path())
+        {
             return;
         }
-        debug_assert!(self.heavy_io_queue.is_none());
-        self.cache_gen_total = 0;
-        self.cache_gen_done = Arc::new(AtomicUsize::new(0));
-        if let Some(catalog) = catalog.as_ref()
-            && self
-                .current_color_catalog
-                .as_ref()
-                .is_none_or(|existing| !Arc::ptr_eq(existing, catalog))
-        {
+        if let Some(catalog) = catalog.as_ref() {
             self.cache_preopened_catalog(&search_results_synthetic_path(), Arc::clone(catalog));
         }
-        self.current_color_cache_map = Some(Arc::clone(&cache_map));
-        self.current_color_catalog = catalog.clone();
-        let reload_queue: Arc<NotifyQueue> = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
-        let heavy_io_queue: Arc<NotifyQueue> = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
-        self.reload_queue = Some(Arc::clone(&reload_queue));
-        self.heavy_io_queue = Some(Arc::clone(&heavy_io_queue));
-        self.spawn_thumbnail_workers(
-            &self.tx,
-            Arc::clone(&self.cancel_token),
-            reload_queue,
-            heavy_io_queue,
-            cache_map,
-            catalog,
-            self.folder_thumb_pin_db.clone(),
-        );
+        self.current_color_cache_map = Some(cache_map);
+        self.current_color_catalog = catalog;
+        self.thumbnail_pool_catalog = ThumbnailPoolCatalog::View(search_results_synthetic_path());
+        self.replace_thumbnail_workers(true);
     }
 
-    /// 永続サムネイルワーカープールを `parallelism.thread_count()` 個 spawn する。
     /// 各ワーカーは `reload_queue` を `scroll_hint` 優先度で消費し続け、
     /// `cancel` が立つまで動作する。
     fn spawn_thumbnail_workers(
@@ -55884,10 +55925,7 @@ impl App {
     ) {
         // The provider is owned solely by this context's worker pool. No DB is
         // opened here; final LRU/connection drop occurs on an exiting worker.
-        let catalog_provider = match catalog_arc {
-            Some(db) => crate::thumb_loader::ThumbnailCatalogProvider::FixedCatalog(Some(db)),
-            None => crate::thumb_loader::ThumbnailCatalogProvider::collection(),
-        };
+        let catalog_provider = crate::thumb_loader::ThumbnailCatalogProvider::fixed(catalog_arc);
         let total_threads = self.settings.parallelism.thread_count();
         // I/O ワーカー数: 2 本 (HDD シーク競合と並列性のバランス)
         // ただし全体が 4 本以下なら 1 本に制限
@@ -101568,26 +101606,50 @@ impl App {
     /// Collection は複数の親を並べる root だけが対象。PhysicalSource は通常経路と
     /// 同じ場所のキーを共有し、Collection の帰路を持つことではキーを変えない。
     /// サムネ読み出し側、`delete_missing` の存続キー、seed 側で必ず同じ判定を共有すること。
-    pub(crate) fn use_full_path_cache_keys(&self) -> bool {
-        self.current_folder
-            .as_deref()
-            .is_some_and(use_full_path_cache_keys_for_folder)
-            || self.items_are_global_search_view
+    pub(crate) fn thumb_storage_scope(&self) -> ThumbStorageScope {
+        if self.items_are_global_search_view
             || self.items_are_tag_view
             || self.items_are_reading_history_view
             || self.items_are_rating_view
-            || (matches!(
-                self.top_level_grid_view.surface(),
-                top_level_grid_view::TopLevelGridSurface::Collection(_)
-            ) && self
-                .top_level_grid_view
-                .collection_session()
-                .is_some_and(|session| {
-                    matches!(
-                        session.position,
-                        top_level_grid_view::CollectionGridPosition::Root
-                    )
-                }))
+            || self.items_are_bookmark_view
+        {
+            return ThumbStorageScope::MultiParent;
+        }
+        if self.items_are_drive_list {
+            return ThumbStorageScope::DriveList;
+        }
+        if matches!(
+            self.top_level_grid_view.surface(),
+            top_level_grid_view::TopLevelGridSurface::Collection(_)
+        ) && self
+            .top_level_grid_view
+            .collection_session()
+            .is_some_and(|session| {
+                matches!(
+                    session.position,
+                    top_level_grid_view::CollectionGridPosition::Root
+                )
+            })
+        {
+            return ThumbStorageScope::CollectionRoot;
+        }
+        if self
+            .current_folder
+            .as_deref()
+            .is_some_and(is_synthetic_view_path)
+        {
+            return ThumbStorageScope::MultiParent;
+        }
+        ThumbStorageScope::SingleFolder {
+            full_path_keys: self
+                .current_folder
+                .as_deref()
+                .is_some_and(use_full_path_cache_keys_for_folder),
+        }
+    }
+
+    pub(crate) fn use_full_path_cache_keys(&self) -> bool {
+        self.thumb_storage_scope().full_path_keys()
     }
 }
 
@@ -102165,6 +102227,40 @@ fn make_load_request(
     )
 }
 
+/// Pure path computation at UI admission; no filesystem or catalog access.
+fn parent_row_for_item(
+    item: &GridItem,
+    source: &Path,
+    sort: Option<crate::settings::SortOrder>,
+    depth: u32,
+) -> Option<crate::thumb_loader::ParentRow> {
+    let folder = source
+        .parent()
+        .filter(|folder| !folder.as_os_str().is_empty())?;
+    if !source.is_absolute() || is_synthetic_view_path(folder) {
+        return None;
+    }
+    let full_path = use_full_path_cache_keys_for_folder(folder);
+    let row_key = match item {
+        GridItem::Image(_) => {
+            if full_path {
+                image_full_path_cache_key(source)
+            } else {
+                source.file_name()?.to_str()?.to_owned()
+            }
+        }
+        GridItem::ZipFile(_) | GridItem::PdfFile(_) => {
+            container_cache_base_key(item, full_path, sort, depth)?
+        }
+        _ => return None,
+    };
+    Some(crate::thumb_loader::ParentRow {
+        source: source.to_path_buf(),
+        folder: folder.to_path_buf(),
+        row_key,
+    })
+}
+
 fn make_load_request_with_visibility(
     item: &GridItem,
     idx: usize,
@@ -102214,6 +102310,7 @@ fn make_load_request_with_visibility(
             Some(LoadRequest {
                 path: p.clone(),
                 cache_key_override,
+                parent_row: parent_row_for_item(item, p, folder_thumb_sort, folder_thumb_depth),
                 ..base
             })
         }
@@ -102413,6 +102510,7 @@ fn make_load_request_with_visibility(
             )?;
             let req = LoadRequest {
                 path: p.clone(),
+                parent_row: parent_row_for_item(item, p, folder_thumb_sort, folder_thumb_depth),
                 cache_key_override: Some(base_key.clone()),
                 folder_thumb_sort,
                 folder_thumb_depth,
@@ -102440,6 +102538,7 @@ fn make_load_request_with_visibility(
             )?;
             let req = LoadRequest {
                 path: p.clone(),
+                parent_row: parent_row_for_item(item, p, folder_thumb_sort, folder_thumb_depth),
                 pdf_page: Some(0),
                 pdf_stamp_policy: pdf_stamp_policy_for_path(p),
                 pdf_password: pdf_password.map(String::from),
@@ -102962,6 +103061,9 @@ fn apply_folder_thumb_pin(
         return LoadRequest {
             file_type_visibility: base_req.file_type_visibility.clone(),
             catalog_target: base_req.catalog_target.clone(),
+            parent_row: None,
+            parent_observed: Default::default(),
+            parent_request_key: None,
             path: container.to_path_buf(),
             relative_page_provenance: None,
             zip_entry: None,
@@ -103066,6 +103168,9 @@ fn apply_folder_thumb_pin(
     LoadRequest {
         file_type_visibility: base_req.file_type_visibility.clone(),
         catalog_target: base_req.catalog_target.clone(),
+        parent_row: None,
+        parent_observed: Default::default(),
+        parent_request_key: None,
         path: request_path,
         relative_page_provenance: None,
         zip_entry,

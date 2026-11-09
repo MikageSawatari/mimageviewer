@@ -3800,6 +3800,7 @@ impl App {
             .store(initial_display_px, Ordering::Relaxed);
 
         if self.items.is_empty() {
+            self.thumbnail_pool_catalog = super::ThumbnailPoolCatalog::None;
             self.reload_queue = None;
             self.heavy_io_queue = None;
             return;
@@ -3809,6 +3810,7 @@ impl App {
             Arc::new((std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new()));
         let heavy_io_queue: Arc<super::NotifyQueue> =
             Arc::new((std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new()));
+        self.thumbnail_pool_catalog = super::ThumbnailPoolCatalog::Collection;
         self.reload_queue = Some(Arc::clone(&reload_queue));
         self.heavy_io_queue = Some(Arc::clone(&heavy_io_queue));
         self.spawn_thumbnail_workers(
@@ -11044,7 +11046,7 @@ mod tests {
             .enumerate()
             .map(|(index, item)| {
                 let (mtime, size) = app.image_metas[index].unwrap_or_default();
-                let request = super::super::make_load_request(
+                let mut request = super::super::make_load_request(
                     item,
                     index,
                     mtime,
@@ -11062,6 +11064,19 @@ mod tests {
                     app.use_full_path_cache_keys(),
                 )
                 .expect("thumbnail request");
+                app.attach_viewer_thumbnail_context(&mut request);
+                if matches!(
+                    app.thumb_storage_scope(),
+                    super::super::ThumbStorageScope::SingleFolder { .. }
+                ) {
+                    assert!(
+                        matches!(
+                            request.catalog_target,
+                            crate::thumb_loader::RequestCatalog::Fixed
+                        ),
+                        "ordinary and Collection PhysicalSource requests stay Fixed"
+                    );
+                }
                 crate::thumb_loader::cache_key_for_request(&request)
                     .unwrap()
                     .into_owned()
@@ -11127,6 +11142,10 @@ mod tests {
                 app.open_collection_grid(snapshot.collection_id(), None);
                 wait_for_grid(app, snapshot.collection_id());
                 assert!(app.use_full_path_cache_keys(), "root keeps full-path keys");
+                assert_eq!(
+                    app.thumb_storage_scope(),
+                    super::super::ThumbStorageScope::CollectionRoot
+                );
                 super::super::OpenRequestOwner::CollectionGridPhysical(
                     app.collection_grid_physical_load_owner(0, &folder).unwrap(),
                 )
@@ -11134,6 +11153,12 @@ mod tests {
                 super::super::OpenRequestOwner::Navigation
             };
             load_thumbnail_test_folder(app, &folder, owner);
+            assert_eq!(
+                app.thumb_storage_scope(),
+                super::super::ThumbStorageScope::SingleFolder {
+                    full_path_keys: false
+                }
+            );
             assert_eq!(
                 matches!(
                     app.top_level_grid_view.surface(),

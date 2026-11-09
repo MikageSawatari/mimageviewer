@@ -11,34 +11,45 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// The existing thumbnail owner, captured afresh for each Everything view request.
+/// Search-owned thumbnail memory and optional persistence, captured for each view request.
 #[derive(Clone)]
 pub(crate) struct FolderThumbnailResources {
     pub(crate) cache: Arc<std::sync::RwLock<HashMap<String, crate::catalog::CacheEntry>>>,
-    pub(crate) catalog: Arc<crate::catalog::CatalogDb>,
+    pub(crate) catalog: Option<Arc<crate::catalog::CatalogDb>>,
+    pub(crate) catalog_work: crate::catalog::CatalogWork,
     pub(crate) sort: crate::settings::SortOrder,
     pub(crate) depth: u32,
 }
 
 impl FolderThumbnailResources {
-    fn identity(&self) -> (usize, usize, crate::settings::SortOrder, u32) {
+    pub(crate) fn identity(&self) -> (usize, Option<usize>, crate::settings::SortOrder, u32) {
         (
             Arc::as_ptr(&self.cache) as usize,
-            Arc::as_ptr(&self.catalog) as usize,
+            self.catalog
+                .as_ref()
+                .map(|catalog| Arc::as_ptr(catalog) as usize),
             self.sort,
             self.depth,
         )
+    }
+
+    fn is_admitted(&self) -> bool {
+        self.catalog_work
+            .access()
+            .is_admitted(self.catalog_work.identity().1)
+            && self
+                .catalog
+                .as_ref()
+                .is_none_or(|catalog| !catalog.is_retired())
     }
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct SearchMetadataResources {
-    /// Missing-pool admission captured on the UI, opened only on the existing Search worker.
-    pub(crate) thumbnail_init: Option<super::super::SearchThumbnailInitRequest>,
+    pub(crate) thumbnail_owner: super::super::SearchThumbnailOwner,
     pub(crate) pin_db: Option<Arc<FolderThumbPinDb>>,
     pub(crate) tags_db_path: Option<PathBuf>,
     pub(crate) video_pins: Option<crate::video_pins::VideoPinReadSource>,
-    pub(crate) folder_thumbnails: Option<FolderThumbnailResources>,
 }
 
 pub(crate) enum SearchMetadataInstall {
@@ -56,7 +67,7 @@ pub(crate) struct EverythingMetadata {
     pin_stamp: Option<FolderPinMutationStamp>,
     tags_db_path: Option<PathBuf>,
     video_pin_stamp: Option<crate::video_pins::VideoPinMutationStamp>,
-    folder_thumbnail_identity: Option<(usize, usize, crate::settings::SortOrder, u32)>,
+    thumbnail_owner: super::super::SearchThumbnailOwner,
 }
 
 impl SearchMetadataInstall {
@@ -73,11 +84,7 @@ impl SearchMetadataInstall {
 impl EverythingMetadata {
     pub(crate) fn is_current(&self, resources: &SearchMetadataResources) -> bool {
         self.tags_db_path == resources.tags_db_path
-            && self.folder_thumbnail_identity
-                == resources
-                    .folder_thumbnails
-                    .as_ref()
-                    .map(FolderThumbnailResources::identity)
+            && self.thumbnail_owner.is_current(&resources.thumbnail_owner)
             && self.pin_stamp == resources.pin_db.as_ref().map(|db| db.mutation_stamp())
             && TAG_WRITES.accepts(self.tag_stamp)
             && self.video_pin_stamp
@@ -94,6 +101,7 @@ pub(crate) fn prepare(
     items: &[GridItem],
     metas: &[Option<(i64, i64)>],
     resources: &SearchMetadataResources,
+    folder_thumbnails: Option<&FolderThumbnailResources>,
     cancel: &AtomicBool,
     visibility: &crate::file_type_visibility::FileTypeVisibility,
 ) -> Result<SearchMetadataInstall, String> {
@@ -131,7 +139,7 @@ pub(crate) fn prepare(
     let video_pin_blobs = video_db
         .as_ref()
         .map_or_else(HashMap::new, |db| db.lookup_webps_many(video_paths));
-    if let Some(owner) = &resources.folder_thumbnails {
+    if let Some(owner) = folder_thumbnails {
         let seeds = crate::app::smart_folder::prepare_video_folder_pin_seeds(
             items,
             &pins,
@@ -173,6 +181,8 @@ pub(crate) fn prepare(
         // Cache-only publication to the captured thumbnail owner, on this worker.
         // Never reset a sibling's rows, generation, queues or cancellation token.
         if (!entries.is_empty() || !deletes.is_empty())
+            && !cancel.load(Ordering::Relaxed)
+            && owner.is_admitted()
             && pin_stamp == resources.pin_db.as_ref().map(|db| db.mutation_stamp())
             && video_pin_stamp
                 == resources
@@ -180,24 +190,36 @@ pub(crate) fn prepare(
                     .as_ref()
                     .map(|source| source.mutation_stamp())
         {
-            match owner
-                .catalog
-                .commit_pin_materializations(&deletes, &entries, cancel)
-            {
-                Ok(true) => {
-                    if let Ok(mut cache) = owner.cache.write() {
-                        for key in deletes {
-                            cache.remove(&key);
+            let publish_memory = match owner.catalog.as_ref() {
+                Some(catalog) => {
+                    match catalog.commit_pin_materializations(&deletes, &entries, cancel) {
+                        Ok(committed) => committed,
+                        Err(error) => {
+                            catalog.record_cache_error(format!("search folder pin seed: {error}"));
+                            crate::logger::log(format!(
+                                "search: folder pin seed catalog write failed: {error}"
+                            ));
+                            owner.is_admitted()
                         }
-                        cache.extend(entries);
                     }
                 }
-                Ok(false) => {}
-                Err(error) => {
-                    return Err(format!(
-                        "検索結果の代表サムネイルを準備できませんでした: {error}"
-                    ));
+                None => true,
+            };
+            if publish_memory
+                && !cancel.load(Ordering::Relaxed)
+                && owner.is_admitted()
+                && pin_stamp == resources.pin_db.as_ref().map(|db| db.mutation_stamp())
+                && video_pin_stamp
+                    == resources
+                        .video_pins
+                        .as_ref()
+                        .map(|source| source.mutation_stamp())
+                && let Ok(mut cache) = owner.cache.write()
+            {
+                for key in deletes {
+                    cache.remove(&key);
                 }
+                cache.extend(entries);
             }
         }
     }
@@ -254,10 +276,7 @@ pub(crate) fn prepare(
         pin_stamp,
         tags_db_path: resources.tags_db_path.clone(),
         video_pin_stamp,
-        folder_thumbnail_identity: resources
-            .folder_thumbnails
-            .as_ref()
-            .map(FolderThumbnailResources::identity),
+        thumbnail_owner: resources.thumbnail_owner.clone(),
     }))
 }
 
@@ -276,6 +295,7 @@ mod tests {
             items,
             metas,
             resources,
+            resources.thumbnail_owner.folder_resources(),
             &AtomicBool::new(false),
             &Default::default(),
         )

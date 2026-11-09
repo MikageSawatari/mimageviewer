@@ -84,36 +84,42 @@ basename / full-path key で持つため、ドライブ文字を落とすと `C:
 PC Collection root の generic worker は、元の論理項目の実親を `CollectionSourcePath` の
 lexical規則で正規化し、drive/UNC保持のSHA-256を `__collection_source_parent_v1__/<hash>`
 として既存 `db_path_for` へ渡す。行は従来のfull-path request keyのまま。Collection間で共有する。
-通常Folder/Smart/Search/Remoteの宛先、旧hash/schema/行は変えず、旧行のコピー・移行はない。
-新規cacheだけを追加し、出荷済み `collection.db` は変更しない。
+§1.668ではCollection rootだけに新namespaceのcacheを追加し、出荷済み `collection.db` は変更しない。
+旧hash/schema/行のコピー・移行はない。§1.741によるSearch/Smart等の親catalog共有は次節を参照。
 
-全件prepareでcatalogを読まない。共通要求受付で元GridItemの親と `CatalogWork` を固定し、
-`ThumbnailCatalogProvider` の FixedCatalog / CollectionSourceParents を既存poolが所有する。
+全件prepareでcatalogを読まない。§1.741で一般化した `ThumbnailCatalogProvider` は、poolの
+固定catalog (`fixed: Option<Arc<CatalogDb>>`) と `LazyCatalogs` を所有する。共通要求受付で
+`RequestCatalog` を `Fixed` / `Parent` / `CollectionSourceParent` のいずれか一つに決め、
+元GridItemの親と受付時の `CatalogWork` (cache dir/admission) を固定する。
 workerだけで個別lookup、stamp/proof検証、miss生成と既存policyによる保存を行う。
-LRUはpoolごとに16 slot。lock下はslotの移動だけ、open/SQL/closeはlock外。
-同一slotの初期化はOnceLockに集約する。RO/RWを区別した合計16 slotを保持し、これに加えて
-実行中workerごと最大2接続（lookupのROと保存時のRW）を保持し得る。
+LRUはpoolごとにRO/RW合計16 slot。識別子は種類（Collection元親/通常親）・path・cache dir・
+admission・RO/RWで、両種類を別枠にしない。lock下はslotの移動だけ、open/SQL/closeはlock外。
+同一slotの初期化はOnceLockに集約する。これに加えて実行中workerごと最大2接続
+（lookupのROと保存時のRW）を保持し得る。
 RAW follow-upは接続ではなく元scope/admission、FixedのPDF catch-upは既存有界queueの接続leaseを保持する。
 新providerの接続をUIへ置かず、空一覧/context retire/App dropも最後のpool Arcを退出workerで解放する。
 
-lookupはpolicyにかかわらず存在する新DBだけROで開き、warm RW slotを借りない。
+遅延lookupはpolicyにかかわらず存在するDBだけROで開き、warm RW slotを借りない。
 不存在はファイル存在確認だけでmissとし、空DB・hash directory・schemaを作らない。
-新namespaceのRO接続は必須thumbnail列を一つのSQLite snapshotで確かめてから登録・公開する。
+遅延catalogのRO接続は必須thumbnail列を一つのSQLite snapshotで確かめてから登録・公開する。
 初回RW作成中の未完成schemaはmissとし、不完全な列情報の接続をLRUへ残さない。
 従来のlegacy互換RO openは変更しない。SQLite/I/Oの実エラーは既存のログ・一回通知を使う。
 SourceOnlyはlookupを行わない。missはLRUへ固定せず、後続要求や兄弟contextの保存を次回参照できる。
-`ThumbnailSaveTarget` がFixedの既存接続またはCollectionの元親・pool・受付時`CatalogWork`を所有し、
+`ThumbnailSaveTarget` がFixedの既存接続または遅延catalogの親・種類・pool・受付時`CatalogWork`を所有し、
 force例外または既存policyの実測判定が保存を選んだ後だけRWを開く（なければ作る）。
 lookup接続の有無を保存可否へ使わず、非保存Autoは空DBを作らない。
-RO接続を保存/PDFメタ補完へ渡さず、メタ補完は従来のFixed writableだけで行う。
+RO接続を保存/PDFメタ補完へ渡さない。メタ補完はFixed writableに加え、§1.741のParentでも
+同じ保存targetのRWと受付時admissionを使い、既存のpassword安全条件を維持する。
+CollectionSourceParentのメタ補完の対象範囲は§1.668のまま。
 PDF Harvestの静的資格は保存targetから判定し、Fixedの従来gateとCollectionのOff/force条件を維持する。
 削除前のwriter epochを更新せず、CacheOnlyだけ既存の一回RO継続を使う。
 pin/EPUB/RAW派生は元scopeを継承する。EPUB fallback再帰も元providerを引き継ぎ、
 lookup済みROをFixed保存先へ付け替えない。video/frame-pin seedは従来のメモリ優先。
 旧catalog由来の再帰 `CachedPinned` は表示を維持し、新DBへmirrorしない。
-保存先はproviderの `save_target` だけで決める。要求のCollection親scopeは候補のidentity/admissionであり、
-Collectionから開いた実フォルダ（PhysicalSource）ではFixedが優先する。Fixed宛ての再帰pinは
-要求scopeに関係なく従来どおり保存・map反映し、再訪時に再帰探索を省く。
+保存先は受付時の `RequestCatalog` とproviderの `save_target` で決める。
+Collectionから開いた実フォルダ（PhysicalSource）は `SingleFolder` として `Fixed` を付け、
+provider内の「Fixedが常に優先」という推測を不要にする。Fixed宛ての再帰pinは
+従来どおり保存・map反映し、再訪時に再帰探索を省く。
 mtime秒/size、policy、pin世代、Folder proof、PDF source/layout寸法、idle品質更新は維持する。
 
 参照解除/Collection削除ではDBを消さず、inventory pruneも追加しない。未使用行やvariantは
@@ -127,6 +133,52 @@ source生成可能なら元decodeへ進み、CacheOnly missは元ファイルを
 簡素化: UUID寿命・参照解除prune・専用worker・全件BLOB seedを持たせず、既存poolと元親単位へ集約。
 modal化/別windowの閉じ直しはスクロールと並行閲覧を制限するため採用しない。
 検証・計測は [backlog §1.668](next-release-backlog.md) の実装記録を参照。
+
+#### 複数の親を並べる一覧の通常親catalog共有（§1.741）
+
+Ctrl+G/Ctrl+R、Ctrl+S/お気に入り横断検索、タグ、★一覧、閲覧履歴、ブックマーク、
+スマートフォルダ、サブフォルダ展開は `ThumbStorageScope::MultiParent` とする。
+単体ファイルのピンなしの画像・ZIP・PDF/EPUB表紙だけ、要求を作った分岐が `ParentRow`
+（元source・実親folder・通常一覧と同じrow key）を返し、受付で `RequestCatalog::Parent`
+と `CatalogWork` を付ける。要求キーは一覧のfull-path keyのまま。親DBは通常の
+`db_path_for`、行キーは既存helperで作るbasename（ドライブ/共有ルート直下だけfull-path）を使う。
+種類policyのsuffixは要求キーと親row keyの両方へ同じ箇所で付ける。
+
+通常フォルダ・ZIP/PDF内・ドライブ/共有ルート・Collection PhysicalSource・固定検索のLocalは `SingleFolder`
+として従来のFixed。Collection rootは§1.668のnamespace/full-path行を維持し、通常親へ寄せない。
+MultiParentのフォルダ行・pin・変換対象書庫・Stack・ZIP/PDF内のページ・SearchContainerとドライブ一覧は
+親共有の対象外で、従来のFixedを使う。音声・動画・Remoteの専用経路も変えない。
+
+Parent要求はworkerの既存stamp準備（EPUB read target/世代解決）を先に行った後、次の順で処理する。
+
+| policy | lookup・生成・保存 |
+| --- | --- |
+| CacheOrSource | 一覧自身のメモリを要求キー/要求stampで引く。missならobservedを確定し、親DBをROで引く。miss時だけ生成し、既存保存policyが選べば親DBへ保存する |
+| SourceOnly | メモリ/DB lookupを省き、observedを確定して再生成する。保存先は親DBだけ |
+| CacheOnly | observed用statをせず、メモリと要求stampによる親DBのRO lookupだけ。生成・保存しない |
+
+メモリhitには新しいstatを足さない。observedは画像/ZIP/PDFでは通常folder scanと同じ
+mtime秒/size helper、EPUBでは解決済みgenerationのstampを使う。RAW follow-upは確定済みobservedを
+継承し、再statしない。stat失敗時は要求stampで親DBを読むだけとし、その要求は親DBへ書かない。
+親DB hitと生成・保存時のどちらでも、一覧自身のcache_mapへ要求キー/準備後の要求stampで入れる。
+親row key/observedをメモリのidentityに使わず、退避後のオフライン再表示も維持する。
+派生要求は外側の `RequestCatalog` / `CatalogWork` / observedを継承し、Parentの要求キーが
+外側から変わればassert/logで止め、親DBへ書かない。
+PDFの表紙保存とcache-hit catch-upは同じParent保存targetのRWでpdf_metaも補完する。
+clearを跨いだ要求は受付時admissionで保存を禁じ、CacheOnlyだけ旧メモリを使わず一回RO継続する。
+
+各一覧は自身のpool/メモリを所有する。Ctrl+G/Ctrl+Rは元一覧のpoolを借りず、
+`__search_results__` のFixedとload_all済みメモリを準備workerで作る。既に検索poolなら
+streaming/再検索/sortで作り直さない。Everythingのfolder video-pin seedもこの検索ownerへ書く。
+兄弟contextのitems/cache/generation/queue/cancelは変更せず、共有epochも進めない。
+
+互換性: schema、CATALOG_VERSION、既存DBのhash配置・行を変更しない。合成DBの旧full-path行は
+従来どおりload_allしたメモリから表示し、親DBへコピー・移行しない。新規生成と既存のidle品質更新
+（SourceOnly）による再生成だけ親DBへ入り、この範囲で通常一覧と相互再利用できる。
+親の自動代表は既存のZIP/PDF候補lookupでこの行を使い、画像候補は従来どおり直接decodeする。
+元一覧へ過去の検索が書いた旧行は従来のdelete_missingに任せ、利用者の設定/タグ/★/Collection/pinは触らない。
+通常DBのドライブ文字除去とmtime秒/sizeが同じ別内容を区別できない制約も維持する。
+設計・対象外の理由・既存ZIP内部行の残件は [§1.741設計](search-thumb-parent-catalog-plan.md) を参照。
 
 #### 既存の削除境界と検証記録（§2.12）
 

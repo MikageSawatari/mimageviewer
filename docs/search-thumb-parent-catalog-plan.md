@@ -1,7 +1,8 @@
 # 検索結果などで作ったサムネイルを親フォルダのキャッシュにも置く (§1.741)
 
-作成: 2026-11-08。状態: **設計確定 (独立設計レビュー r1〜r4 REVISE → r5 ACCEPT、2026-11-09、Codex GPT-6.1 Sol / xhigh)・
-実装は未着手 (利用者判断待ち)**。対象版: 利用者判断 (§12)。
+作成: 2026-11-08。状態: **実装中 (PDF メモリ hit 後のメタ補完について設計確認待ち)**。
+独立設計レビュー: r1〜r4 REVISE → r5 ACCEPT、2026-11-09、Codex GPT-6.1 Sol / xhigh。
+対象版: 利用者判断 (§12)。
 バックログ: [next-release-backlog.md §1.741](next-release-backlog.md)。報告: 5ch >>746。
 
 ## 1. 問題
@@ -373,3 +374,19 @@ struct ThumbnailCatalogProvider {
   そこへ新しく入らず、フォルダ行などは今と同じく入る (サムネイルキャッシュとして、今の公開文言の範囲)。
   既存の旧行は消さない (キャッシュの削除・期限で消える)。
 - 公開文書の文言は変えない (偽になる文は無い)。
+
+## 16. 実装メモ (2026-11-09、独立レビュー前)
+
+- 検索 pool の所有、Parent 要求・遅延 catalog、observed と要求メモリ署名の分離、RAW/EPUB、
+  親 PDF メタ保存・親 DB hit の catch-up、release check の保存先 witness を実装した。
+  製品起動・コミット・独立レビュー・検収は行っていない。
+- 機械的な調整: `Current` は名前付き field、pool 置換は既存 metadata refresh と共通 helper、
+  通常 folder scan と Parent stat は共通 `file_stamp` を使用する。seed resources は cache 必須・
+  catalog 任意とし、DB 障害でも §9 のメモリ表示を維持する。新しい再試行はない。
+- **未確定**: §5.4 の表はメモリ hit 後に stat せず終了する一方、後段は PDF の cache-hit catch-up を
+  Parent でも維持するとしている。既存 Fixed はメモリ hit でも別 worker の catch-up を開始する。
+  現差分では Parent の observed が無いメモリ hit では RW target を得られず、この補完を開始しない。
+  既存補完を維持するか、Parent DB hit に限るかを設計担当へ確認中で、ここを完了扱いにしていない。
+  この判断が残るため、状態を「実装済み (独立レビュー前)」へ変更することと確認用 build は保留した。
+- 自動検証の対象・全テスト名・実行結果は
+  [実装検証記録](search-thumb-parent-catalog-verification.md) を参照。本体 lib 全件は依頼どおり設計担当が行う。

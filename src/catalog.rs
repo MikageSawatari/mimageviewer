@@ -262,6 +262,11 @@ struct CatalogAccessInner {
     audio_art_notice: AudioArtCacheNotice,
 }
 
+/// Ordinary listing and parent-thumbnail requests use the same persisted stamp.
+pub(crate) fn file_stamp(meta: &std::fs::Metadata) -> (i64, i64) {
+    (crate::ui_helpers::mtime_secs(meta), meta.len() as i64)
+}
+
 /// Captured before handing a general catalog job to a worker. A job may
 /// display source pixels after maintenance, but must never adopt a newer epoch
 /// in order to recreate or populate catalogs deleted since its acceptance.
@@ -295,9 +300,9 @@ impl CatalogWork {
         CatalogDb::open_existing_read_only_admitted(&self.cache_dir, folder, self.admission)
     }
 
-    /// Collection's new namespace has no legacy thumbnail schema. Publish only
-    /// readers with all current columns, never a reader of a newly created file
-    /// whose writer has not installed `thumbnails` yet.
+    /// Lazy Collection and ordinary-parent lookups require the current columns.
+    /// Publish one complete schema snapshot, never a reader of a newly created
+    /// file whose writer has not installed `thumbnails` yet. Do not migrate on lookup.
     pub(crate) fn open_existing_collection_parent(
         &self,
         identity: &Path,

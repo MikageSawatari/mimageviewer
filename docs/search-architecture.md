@@ -88,14 +88,26 @@ Folder は拡張子によらず採用し、通常 scan と同じ mtime／size un
 同名collapseやsidecar探索で検索hitを別のファイルへ置換しない。通常sort/★/tag/編集準備は
 共通workerで行い、UIは完成したitems/metasと副作用を一つのadoption closureでinstallする。
 Everythingの動画pin WebPもprepare workerのreadonly DBで取得し、完成Arcマップを
-動画thumbnail workerへ渡す。Folder の動画 pin（cascade を含む）は既存 helper で同じ prepare worker 上から full-path key の catalog/cache map へ seed する。再投影ごとに現在の thumbnail owner を捕捉・照合する。採用時の`lookup_webps_many`やBLOB再取得は行わない。
+動画thumbnail workerへ渡す。Folderの動画pin（cascadeを含む）は同じprepare workerの既存helperで、
+検索自身の `__search_results__` catalog/cache mapへfull-path keyでseedする（§1.741）。
+検索poolがあれば `SearchThumbnailOwner::Current`、poolなし/別一覧なら置換元identity付き
+`Prepare` とし、workerが新しい検索catalogをopen/load_allしてからそのownerへcommitする。
+再投影ごとにresourcesを渡し、ReadyではCurrentのidentityまたはPrepareの置換元identityを照合する。
+交換済みなら既存prepare再試行で取り直し、元一覧や兄弟contextのcatalog/cacheへseedしない。
+採用時の`lookup_webps_many`やBLOB再取得は行わない。
 pin変更stampが古ければ同じprepareで再準備する。Ctrl+Gの既存同期bulk lookupは確認済みだが、
 EverythingのP2修正とは別件として残す（[対応範囲](everything-search-plan.md#16-p2-動画pinのworker準備2026-10-12)）。
 
 採用済みEverythingの位置は `EverythingPosition::Root` / `PhysicalChild`。
 実フォルダ・画像フォルダ本・ZIP/PDF/EPUB/変換書庫の main 物理表示が受理された境界だけでlogical source/return anchor/routeを保持し、
 取消や失敗で未採用のchildへ進めない。結果へ戻ると保持datasetを共通prepareで再投影し、IPCを再送しない。
-Parent（BS／grid 親／gamepad Back）は ZIP 内部を一段、それ以外は effective_folder が logical_source の厳密な物理子孫なら通常の物理親へ移動し、起点なら Root へ戻す。Results ボタンは階層を飛ばして Root へ戻す。既存thumbnail ownerを利用し、独立 viewer open は main を Root に残す。F12 fork/park/promoteではmain検索ownerを複製しない。
+Parent（BS／grid 親／gamepad Back）は ZIP 内部を一段、それ以外は effective_folder が logical_source の厳密な物理子孫なら通常の物理親へ移動し、起点なら Root へ戻す。Results ボタンは階層を飛ばして Root へ戻す。
+結果の採用では既存thumbnail lifecycleで `__search_results__` poolへ切り替え、元一覧のpoolを借りない。
+pool catalog型/channel/queue/cancelは同じcontextで置換し、同じ検索のstreaming/再検索/sortでは維持する。
+ピンなし画像/ZIP/PDF・EPUB表紙だけ要求単位で通常親catalogを使い、folder/pin/内部page等は検索Fixedを使う。
+旧合成DB行はメモリから従来どおり読み、schema/hash変更やコピー/移行は行わない。
+独立viewer openはmainをRootに残し、F12 fork/park/promoteではmain検索ownerを複製しない。
+保存先・互換性の詳細は [§1.741設計](search-thumb-parent-catalog-plan.md) を参照。
 PDF先行改修は `4510346f5`（master統合 `c1e66f589`）のcontext-owned render epochを前提とする。
 
 Remote query endpoint/result共有、新しい永続設定/索引/検索履歴は追加しない。

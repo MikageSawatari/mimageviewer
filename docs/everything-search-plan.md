@@ -164,6 +164,18 @@ Everything は completed candidates を一回渡し、prepare の final Ready �
 
 `TopLevelSearchView::Global` は共通検索 surface のまま利用し、Metadata／Everything の区別を session が所有する。UI 説明を明確にするため名称を共通 Search へ変える場合も新 surface owner は追加しない。F/S/T と source 切替は現在の origin を restore せず移譲する。Metadata→Everything の際に `open_global_search` の active early return や `SearchMode::Global` の keep 処理で旧 source が残らないよう、**source 切替を共通 entry transaction** にする。
 
+§1.741のthumbnail owner契約: Ctrl+G/Ctrl+Rは元一覧のpoolを借りず、Fixedが
+`__search_results__` のpool/catalog/cache_mapを使う。`SearchMetadataResources::for_app` は
+検索poolなら `SearchThumbnailOwner::Current`、poolなし/他一覧なら
+`Prepare { request, replaced }` とする。Prepareは他一覧のfolder_thumbnailsを捕捉せず、
+準備workerが検索catalogをopen/load_allし、その新ownerへfolder video-pin seedをcommitする。
+ReadyはCurrentのowner identityかPrepareの置換元identityを検証し、交換済みなら棄却して準備を取り直す。
+採用でpool catalogの型・channel・queue・cancelを同じcontextで一緒に置換し、同じ検索の
+streaming/再検索/sortのrebuildでは作り直さない。検索closeは元一覧の通常reloadを維持する。
+単体ファイルのピンなし画像/ZIP/PDF・EPUB表紙は要求単位で通常親catalogを使い、その他の行は
+検索Fixedを使う。旧行の読み込みを保ち、schema/hash変更・コピー/移行は行わない。
+詳細は [検索サムネイル共有の設計 §4/5](search-thumb-parent-catalog-plan.md) を参照。
+
 ### 6.3 簡素化と UI 入力
 
 §1.409: 入力は `metadata_draft / everything_draft` に分離し、固定ONの終了・source切替では
@@ -981,11 +993,13 @@ Folder を返さないため、フォルダを含む検索行 identity の照合
 
 Folder の代表サムネイルは既存 full-path cache key を使う。共通 Search prepare は
 直接 Video の WebP に加え、既存 `prepare_video_folder_pin_seeds` で Folder→Video／
-Folder→Folder→Video を解決し、捕捉した既存 thumbnail owner の catalog／cache map へ
-worker 上で seed する。UI から同期 seed は呼ばない。物理 child で thumbnail owner が
-替わるため、再投影ごとに `MetadataResources` を worker へ渡し、採用時もその identity を照合する。
-採用待ちにピン更新が cache map を置き換えた場合も、既存 prepare の再試行送信で現在の
-resources を取り直す。古い owner を参照したまま Ready の棄却を繰り返さない。
+Folder→Folder→Video を解決し、検索自身の `__search_results__` catalog／cache mapへ
+worker 上でseedする（§1.741、§6.2）。検索ownerが既存ならCurrentを捕捉し、物理child等の
+別poolから戻る場合はPrepareで新しい検索ownerを用意して、そのownerにcommitする。
+UIから同期seedは呼ばず、元一覧のcatalog/cache mapへ書かない。再投影ごとに `MetadataResources`
+をworkerへ渡し、ReadyではCurrentのidentityまたはPrepareの置換元identityを照合する。
+採用待ちにpoolやpin更新でownerが替わった場合は、既存prepareの再試行送信でresourcesを取り直す。
+古いownerを参照したままReadyの棄却を繰り返さない。
 兄弟 context の rows／世代／queue／cancel へは変更を発行しない。
 
 検証対象は `8b9205743`（§1.425）からの未コミット差分、branch は

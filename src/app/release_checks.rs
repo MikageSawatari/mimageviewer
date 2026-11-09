@@ -1,9 +1,51 @@
 //! Read-only witnesses and normal producers for the isolated release-check recipe.
 use super::{App, GridItem, ThumbnailState, container_cache_base_key};
-use crate::test_script::release_checks::{self as protocol, Observation, Operation};
+use crate::test_script::release_checks::{
+    self as protocol, CatalogProbeTarget, Observation, Operation,
+};
 use serde_json::{Value, json};
 
 impl App {
+    fn release_check_catalog_target(&self, item: &GridItem) -> CatalogProbeTarget {
+        match self.thumb_storage_scope() {
+            super::ThumbStorageScope::MultiParent => {
+                let source = match item {
+                    GridItem::Image(path) => path,
+                    GridItem::ZipFile(path) | GridItem::PdfFile(path) => {
+                        // Resolving pin fallback can stat/open sources. The diagnostic
+                        // fixture has no container pins; never guess its actual route.
+                        if self
+                            .folder_pin_map
+                            .contains_key(&crate::path_key::normalize_keep_drive(path))
+                        {
+                            return CatalogProbeTarget::Unsupported(
+                                "multi-parent ZIP/PDF pin resolution",
+                            );
+                        }
+                        path
+                    }
+                    _ => return CatalogProbeTarget::Fixed,
+                };
+                match super::parent_row_for_item(
+                    item,
+                    source,
+                    Some(self.settings.folder_thumb_sort),
+                    self.settings.folder_thumb_depth,
+                ) {
+                    Some(row) => CatalogProbeTarget::Parent {
+                        row,
+                        work: crate::catalog::CatalogWork::default(),
+                    },
+                    None => CatalogProbeTarget::Fixed,
+                }
+            }
+            super::ThumbStorageScope::CollectionRoot => {
+                CatalogProbeTarget::Unsupported("collection root is outside release fixtures")
+            }
+            _ => CatalogProbeTarget::Fixed,
+        }
+    }
+
     // Persistence is not navigation readiness: normal pin consumers can still
     // start a same-folder reload whose sidecar restore refuses the next open.
     // Project the existing owners; never drain them or bypass their UI paths.
@@ -99,6 +141,7 @@ impl App {
                     .is_some_and(ThumbnailState::is_terminal)
             })
             .count();
+        let mut catalog_targets = std::collections::HashMap::new();
         let targets: Vec<_> = keep.iter().filter_map(|&i| {
             let item=self.items.get(i)?;
             let base=match item {
@@ -106,7 +149,10 @@ impl App {
                     crate::thumb_loader::folder_thumb_cache_key_for_path(path,self.use_full_path_cache_keys(),self.settings.folder_thumb_sort,self.settings.folder_thumb_depth,crate::catalog::FolderThumbProvenance::Seeded),
                 _=>container_cache_base_key(item,self.use_full_path_cache_keys(),Some(self.settings.folder_thumb_sort),self.settings.folder_thumb_depth),
             }
-                .or_else(|| match item { GridItem::Image(p)|GridItem::Video(p) => p.file_name().map(|p|p.to_string_lossy().into_owned()), _=>None })?;
+                .or_else(|| match item {
+                    GridItem::Image(p) if self.use_full_path_cache_keys() => Some(super::image_full_path_cache_key(p)),
+                    GridItem::Image(p)|GridItem::Video(p) => p.file_name().map(|p|p.to_string_lossy().into_owned()), _=>None })?;
+            catalog_targets.insert(i, self.release_check_catalog_target(item));
             Some(json!({"key":item.perf_key(),"idx":i,"items_gen":self.items_generation,"cache_base_key":base}))
         }).collect();
         // Match the grid's ordinary-work projection: video waits are accounted for
@@ -141,6 +187,7 @@ impl App {
                 "ai_backend":self.ai_runtime_init.ready_runtime().map(|r|r.active_backend().effective.as_str()),
                 "tray_available":self.tray_controller.is_some(),"targets":targets}),
             catalog: self.current_color_catalog.clone(),
+            catalog_targets,
             cache: self.current_color_cache_map.clone(),
             pins: self.folder_thumb_pin_db.clone(),
         }
@@ -272,6 +319,63 @@ pub(crate) fn record_tray_hide(app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn section1741_release_search_image_observation_captures_parent_and_request_keys() {
+        let mut app = crate::app::setup_app_for_test();
+        let origin = app.tmp.path().join("origin");
+        let parent = app.tmp.path().join("search-hit-parent");
+        let image = parent.join("cover.png");
+        app.current_folder = Some(origin);
+        app.items_are_global_search_view = true;
+        app.items = vec![GridItem::Image(image.clone())];
+        app.keep_set.insert(0);
+
+        // The source and parent do not exist: observation must remain pure.
+        let observation = app.release_check_observation(&egui::Context::default());
+        assert_eq!(
+            observation.value["targets"][0]["cache_base_key"],
+            super::super::image_full_path_cache_key(&image)
+        );
+        match observation.catalog_targets.get(&0).unwrap() {
+            CatalogProbeTarget::Parent { row, .. } => {
+                assert_eq!(row.folder, parent);
+                assert_eq!(row.source, image);
+                assert_eq!(row.row_key, "cover.png");
+            }
+            _ => panic!("a search image must witness its physical parent catalog"),
+        }
+        assert!(!parent.exists());
+    }
+
+    #[test]
+    fn section1741_release_container_pin_witness_is_explicitly_unsupported() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items_are_global_search_view = true;
+        let path = app.tmp.path().join("book.zip");
+        let item = GridItem::ZipFile(path.clone());
+        assert!(matches!(
+            app.release_check_catalog_target(&item),
+            CatalogProbeTarget::Parent { .. }
+        ));
+        app.folder_pin_map.insert(
+            crate::path_key::normalize_keep_drive(&path),
+            crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+                zip_rel: String::new(),
+                entry: "cover.png".into(),
+            },
+        );
+        assert!(matches!(
+            app.release_check_catalog_target(&item),
+            CatalogProbeTarget::Unsupported(_)
+        ));
+        for item in [GridItem::Folder(path.clone()), GridItem::Video(path)] {
+            assert!(matches!(
+                app.release_check_catalog_target(&item),
+                CatalogProbeTarget::Fixed
+            ));
+        }
+    }
 
     #[test]
     fn release_pin_refresh_must_finish_before_a_following_open() {

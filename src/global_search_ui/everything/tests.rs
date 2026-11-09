@@ -1106,17 +1106,23 @@ fn cold_folder_video_pin_seed_cascades_and_retargets_thumbnail_owner_on_return()
         .file_type_visibility
         .excluded_extensions
         .insert("png".into());
-    let catalog =
-        Arc::new(crate::catalog::CatalogDb::open(&app.tmp.path().join("cache"), &folder).unwrap());
-    let first_cache = Arc::new(std::sync::RwLock::new(HashMap::new()));
-    app.current_color_catalog = Some(Arc::clone(&catalog));
-    app.current_color_cache_map = Some(Arc::clone(&first_cache));
-    app.current_folder = Some(app.tmp.path().to_path_buf());
+    let origin = app.tmp.path().join("origin");
+    std::fs::create_dir(&origin).unwrap();
+    app.load_folder(origin.clone());
+    app.finish_page_identity_preparation_for_test();
+    let origin_catalog = Arc::clone(app.current_color_catalog.as_ref().unwrap());
+    let origin_cache = Arc::clone(app.current_color_cache_map.as_ref().unwrap());
     let result = dataset(vec![
         GridItem::Folder(folder.clone()),
         GridItem::Folder(child.clone()),
     ]);
     adopt(&mut app, &ctx, "folders", Arc::clone(&result));
+    let first_cache = Arc::clone(app.current_color_cache_map.as_ref().unwrap());
+    let catalog = Arc::clone(app.current_color_catalog.as_ref().unwrap());
+    assert!(!Arc::ptr_eq(&first_cache, &origin_cache));
+    assert!(!Arc::ptr_eq(&catalog, &origin_catalog));
+    assert!(origin_cache.read().unwrap().is_empty());
+    assert!(origin_catalog.load_all().unwrap().is_empty());
     let keys = first_cache
         .read()
         .unwrap()
@@ -1151,15 +1157,23 @@ fn cold_folder_video_pin_seed_cascades_and_retargets_thumbnail_owner_on_return()
         "UI must not read pin BLOBs from its connection"
     );
     assert!(app.accept_everything_physical_child(&folder));
-    // A physical child replaces the existing thumbnail owner. Retained search prepare
-    // must seed that new owner, rather than the one captured at the first query.
-    let return_cache = Arc::new(std::sync::RwLock::new(HashMap::new()));
-    app.current_color_cache_map = Some(Arc::clone(&return_cache));
+    // A physical child owns a different pool. Returning must prepare a fresh search
+    // owner and seed it, without publishing search keys into the child's resources.
+    app.load_folder(folder.clone());
+    app.finish_page_identity_preparation_for_test();
+    let child_cache = Arc::clone(app.current_color_cache_map.as_ref().unwrap());
+    let child_catalog = Arc::clone(app.current_color_catalog.as_ref().unwrap());
     assert!(app.return_from_everything_child(EverythingReturn::Results));
     assert_return_only(&app);
     poll_until(&mut app, &ctx, "folder pin return did not adopt", |app| {
         !app.everything_has_physical_child()
     });
+    let return_cache = Arc::clone(app.current_color_cache_map.as_ref().unwrap());
+    assert!(!Arc::ptr_eq(&return_cache, &child_cache));
+    for key in &keys {
+        assert!(!child_cache.read().unwrap().contains_key(key));
+        assert!(child_catalog.load_one(key).unwrap().is_none());
+    }
     assert_eq!(return_cache.read().unwrap().len(), 2);
     assert!(Arc::ptr_eq(accepted_dataset(&app), &result));
     // The source pin changes without changing video stat: replace the actual bytes.
@@ -1220,6 +1234,123 @@ fn thumbnail_owner_replaced_while_ready_is_pending_is_recaptured_on_retry() {
     );
     assert!(!cancel.load(Ordering::Relaxed));
     assert!(Arc::ptr_eq(accepted_dataset(&app), &result));
+}
+
+#[test]
+fn section1741_search_from_folder_replaces_pool_once_for_both_producers() {
+    for everything in [false, true] {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let origin = app.tmp.path().join("origin");
+        std::fs::create_dir(&origin).unwrap();
+        app.load_folder(origin.clone());
+        app.finish_page_identity_preparation_for_test();
+        let old_cancel = Arc::clone(&app.cancel_token);
+        let old_queue = Arc::clone(app.reload_queue.as_ref().unwrap());
+        let old_cache = Arc::clone(app.current_color_cache_map.as_ref().unwrap());
+        let image = app.tmp.path().join("result.jpg");
+        std::fs::write(&image, b"image").unwrap();
+        if everything {
+            adopt(
+                &mut app,
+                &ctx,
+                "result",
+                dataset(vec![GridItem::Image(image)]),
+            );
+        } else {
+            crate::global_search_ui::tests::g1_publish_search_hits(&mut app, &ctx, &[image]);
+        }
+        assert!(matches!(
+            &app.thumbnail_pool_catalog,
+            crate::app::ThumbnailPoolCatalog::View(path)
+                if *path == crate::app::search_results_synthetic_path()
+        ));
+        assert!(old_cancel.load(Ordering::Relaxed));
+        assert!(!Arc::ptr_eq(app.reload_queue.as_ref().unwrap(), &old_queue));
+        assert!(!Arc::ptr_eq(
+            app.current_color_cache_map.as_ref().unwrap(),
+            &old_cache
+        ));
+        assert!(old_cache.read().unwrap().is_empty());
+        let search_cancel = Arc::clone(&app.cancel_token);
+        let search_queue = Arc::clone(app.reload_queue.as_ref().unwrap());
+        let search_cache = Arc::clone(app.current_color_cache_map.as_ref().unwrap());
+        let generation = app.items_generation;
+        app.rebuild_items_from_global_search();
+        poll_until(
+            &mut app,
+            &ctx,
+            "search reprojection did not settle",
+            |app| app.items_generation != generation,
+        );
+        assert!(Arc::ptr_eq(&app.cancel_token, &search_cancel));
+        assert!(Arc::ptr_eq(
+            app.reload_queue.as_ref().unwrap(),
+            &search_queue
+        ));
+        assert!(Arc::ptr_eq(
+            app.current_color_cache_map.as_ref().unwrap(),
+            &search_cache
+        ));
+        assert!(!search_cancel.load(Ordering::Relaxed));
+        app.close_global_search();
+        app.finish_history_restore_preparation_for_test();
+        app.finish_page_identity_preparation_for_test();
+        assert_eq!(app.current_folder.as_ref(), Some(&origin));
+        assert!(matches!(
+            &app.thumbnail_pool_catalog,
+            crate::app::ThumbnailPoolCatalog::Folder(path) if *path == origin
+        ));
+        assert!(search_cancel.load(Ordering::Relaxed));
+    }
+}
+
+#[test]
+fn section1741_prepare_owner_replaced_before_ready_retries_with_current_search_pool() {
+    for had_pool in [false, true] {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let origin = app.tmp.path().join("origin");
+        std::fs::create_dir(&origin).unwrap();
+        if had_pool {
+            app.load_folder(origin);
+            app.finish_page_identity_preparation_for_test();
+        } else {
+            app.enter_drive_list(None);
+        }
+        start_fake_run(&mut app, &ctx, "result");
+        app.hold_next_search_ready_for_test();
+        let result = dataset(vec![GridItem::Image(app.tmp.path().join("result.jpg"))]);
+        queue(&mut app, Arc::clone(&result));
+        poll_until(
+            &mut app,
+            &ctx,
+            "initial Prepare Ready was not held",
+            App::search_ready_is_held_for_test,
+        );
+        let replacement = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let catalog = Arc::new(
+            crate::catalog::CatalogDb::open(
+                &app.tmp.path().join("replacement-cache"),
+                &crate::app::search_results_synthetic_path(),
+            )
+            .unwrap(),
+        );
+        app.install_search_thumbnail_workers(Arc::clone(&replacement), Some(catalog));
+        let replacement_cancel = Arc::clone(&app.cancel_token);
+        app.release_search_ready_for_test();
+        poll_until(&mut app, &ctx, "stale Prepare did not retry", |app| {
+            matches!(&app.global_search.accepted, SearchAccepted::Everything { dataset: accepted, .. } if Arc::ptr_eq(accepted, &result))
+                && app.global_search.pending.is_none()
+        });
+        assert!(app.search_prepare_metrics_for_test().stale_rejections > 0);
+        assert!(Arc::ptr_eq(
+            app.current_color_cache_map.as_ref().unwrap(),
+            &replacement
+        ));
+        assert!(Arc::ptr_eq(&app.cancel_token, &replacement_cancel));
+        assert!(!replacement_cancel.load(Ordering::Relaxed));
+    }
 }
 
 #[cfg(windows)]

@@ -31,6 +31,8 @@ use crate::indexer_manager::SearchHandle;
 
 mod everything;
 #[cfg(test)]
+mod thumbnail_owner_tests;
+#[cfg(test)]
 pub(crate) use everything::tests::{
     adopt as adopt_everything_for_test,
     assert_return_only as assert_everything_return_only_for_test,
@@ -40,30 +42,136 @@ use everything::{SearchMetadataInstall, SearchMetadataResources};
 
 impl SearchMetadataResources {
     fn for_app(app: &App) -> Self {
-        Self {
-            thumbnail_init: app
-                .reload_queue
-                .is_none()
-                .then(|| SearchThumbnailInitRequest {
+        let identity = app.thumbnail_pool_identity();
+        let thumbnail_owner = if matches!(
+            &app.thumbnail_pool_catalog,
+            crate::app::ThumbnailPoolCatalog::View(path)
+                if *path == crate::app::search_results_synthetic_path()
+        ) && let Some(identity) = identity.as_ref()
+        {
+            SearchThumbnailOwner::Current {
+                identity: Arc::clone(identity),
+                resources: everything::metadata::FolderThumbnailResources {
+                    cache: Arc::clone(
+                        app.current_color_cache_map
+                            .as_ref()
+                            .expect("installed search pool owns its thumbnail memory"),
+                    ),
+                    catalog: app.current_color_catalog.clone(),
                     catalog_work: crate::catalog::CatalogWork::default(),
                     sort: app.settings.folder_thumb_sort,
                     depth: app.settings.folder_thumb_depth,
-                }),
+                },
+            }
+        } else {
+            SearchThumbnailOwner::Prepare {
+                request: SearchThumbnailInitRequest {
+                    catalog_work: crate::catalog::CatalogWork::default(),
+                    sort: app.settings.folder_thumb_sort,
+                    depth: app.settings.folder_thumb_depth,
+                },
+                replaced: identity,
+            }
+        };
+        Self {
+            thumbnail_owner,
             pin_db: app.folder_thumb_pin_db.clone(),
             tags_db_path: app.tags_db.as_ref().map(|db| db.read_path().to_path_buf()),
             video_pins: app.video_pin_db.as_ref().and_then(|db| db.read_source()),
-            folder_thumbnails: app
-                .current_color_cache_map
-                .as_ref()
-                .zip(app.current_color_catalog.as_ref())
-                .map(
-                    |(cache, catalog)| everything::metadata::FolderThumbnailResources {
-                        cache: Arc::clone(cache),
-                        catalog: Arc::clone(catalog),
-                        sort: app.settings.folder_thumb_sort,
-                        depth: app.settings.folder_thumb_depth,
-                    },
-                ),
+        }
+    }
+}
+
+/// Captures either the search pool, or the owner that a new search pool replaces.
+/// Prepare deliberately contains no resources belonging to the outgoing list.
+#[derive(Clone)]
+pub(crate) enum SearchThumbnailOwner {
+    Current {
+        identity: Arc<AtomicBool>,
+        resources: everything::metadata::FolderThumbnailResources,
+    },
+    Prepare {
+        request: SearchThumbnailInitRequest,
+        replaced: Option<Arc<AtomicBool>>,
+    },
+}
+
+impl Default for SearchThumbnailOwner {
+    fn default() -> Self {
+        Self::Prepare {
+            request: SearchThumbnailInitRequest {
+                catalog_work: crate::catalog::CatalogWork::default(),
+                sort: Default::default(),
+                depth: 0,
+            },
+            replaced: None,
+        }
+    }
+}
+
+impl SearchThumbnailOwner {
+    fn is_current(&self, current: &Self) -> bool {
+        match (self, current) {
+            (
+                Self::Current {
+                    identity,
+                    resources,
+                },
+                Self::Current {
+                    identity: now,
+                    resources: now_resources,
+                },
+            ) => {
+                Arc::ptr_eq(identity, now)
+                    && resources.identity() == now_resources.identity()
+                    && resources.catalog_work.identity() == now_resources.catalog_work.identity()
+            }
+            (
+                Self::Prepare { request, replaced },
+                Self::Prepare {
+                    request: now_request,
+                    replaced: now,
+                },
+            ) => {
+                let same_owner = match (replaced, now) {
+                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                    (None, None) => true,
+                    _ => false,
+                };
+                same_owner
+                    && request.sort == now_request.sort
+                    && request.depth == now_request.depth
+                    && request.catalog_work.identity() == now_request.catalog_work.identity()
+            }
+            _ => false,
+        }
+    }
+
+    fn folder_resources(&self) -> Option<&everything::metadata::FolderThumbnailResources> {
+        match self {
+            Self::Current { resources, .. } => Some(resources),
+            Self::Prepare { .. } => None,
+        }
+    }
+
+    fn prepare(&self) -> Option<PreparedSearchThumbnails> {
+        match self {
+            Self::Current { .. } => None,
+            Self::Prepare { request, .. } => Some(request.prepare()),
+        }
+    }
+
+    fn prepared_folder_resources(
+        &self,
+        prepared: Option<&PreparedSearchThumbnails>,
+    ) -> Option<everything::metadata::FolderThumbnailResources> {
+        match self {
+            Self::Current { .. } => self.folder_resources().cloned(),
+            Self::Prepare { request, .. } => Some(prepared?.folder_resources(
+                request.sort,
+                request.depth,
+                request.catalog_work.clone(),
+            )),
         }
     }
 }
@@ -81,16 +189,7 @@ struct PreparedSearchThumbnails {
 }
 
 impl SearchThumbnailInitRequest {
-    fn prepare(
-        &self,
-        existing: Option<&everything::metadata::FolderThumbnailResources>,
-    ) -> PreparedSearchThumbnails {
-        if let Some(existing) = existing {
-            return PreparedSearchThumbnails {
-                cache: Arc::clone(&existing.cache),
-                catalog: Some(Arc::clone(&existing.catalog)),
-            };
-        }
+    fn prepare(&self) -> PreparedSearchThumbnails {
         // Use the same admitted catalog open / load as other aggregate preparations.
         // A failed cache open still permits ordinary in-memory thumbnail generation.
         let catalog = match self
@@ -99,6 +198,10 @@ impl SearchThumbnailInitRequest {
         {
             Ok(db) => Some(Arc::new(db)),
             Err(error) => {
+                let access = self.catalog_work.access();
+                if access.is_admitted(self.catalog_work.identity().1) {
+                    access.record_cache_error(format!("search thumbnail catalog open: {error}"));
+                }
                 crate::logger::log(format!(
                     "search: catalog open failed in prepare worker: {error}"
                 ));
@@ -110,6 +213,7 @@ impl SearchThumbnailInitRequest {
             .and_then(|db| {
                 db.load_all()
                     .map_err(|error| {
+                        db.record_cache_error(format!("search thumbnail catalog load: {error}"));
                         crate::logger::log(format!(
                             "search: catalog load failed in prepare worker: {error}"
                         ));
@@ -129,15 +233,15 @@ impl PreparedSearchThumbnails {
         &self,
         sort: crate::settings::SortOrder,
         depth: u32,
-    ) -> Option<everything::metadata::FolderThumbnailResources> {
-        self.catalog
-            .as_ref()
-            .map(|catalog| everything::metadata::FolderThumbnailResources {
-                cache: Arc::clone(&self.cache),
-                catalog: Arc::clone(catalog),
-                sort,
-                depth,
-            })
+        catalog_work: crate::catalog::CatalogWork,
+    ) -> everything::metadata::FolderThumbnailResources {
+        everything::metadata::FolderThumbnailResources {
+            cache: Arc::clone(&self.cache),
+            catalog: self.catalog.clone(),
+            catalog_work,
+            sort,
+            depth,
+        }
     }
 }
 pub(crate) use everything::SearchOpenOrigin;
@@ -447,6 +551,7 @@ enum SearchPrepareOutput {
 }
 
 struct SearchPreparedItems {
+    thumbnail_owner: SearchThumbnailOwner,
     thumbnail_init: Option<PreparedSearchThumbnails>,
     metadata: SearchMetadataInstall,
     rating_provenance: SearchRatingProvenance,
@@ -2297,24 +2402,18 @@ fn search_prepare_worker(
                             wish.visibility.clone(),
                         ),
                     );
-                    let thumbnail_init = resources
-                        .thumbnail_init
-                        .as_ref()
-                        .map(|request| request.prepare(resources.folder_thumbnails.as_ref()));
-                    let mut metadata_resources = resources.clone();
-                    if let (Some(request), Some(prepared)) =
-                        (resources.thumbnail_init.as_ref(), thumbnail_init.as_ref())
-                    {
-                        metadata_resources.folder_thumbnails =
-                            prepared.folder_resources(request.sort, request.depth);
-                    }
+                    let thumbnail_init = resources.thumbnail_owner.prepare();
+                    let folder_thumbnails = resources
+                        .thumbnail_owner
+                        .prepared_folder_resources(thumbnail_init.as_ref());
                     let metadata = match &wish.source {
                         SearchProjection::Metadata => SearchMetadataInstall::Existing,
                         SearchProjection::Everything { .. } => {
                             match everything::prepare_everything_metadata(
                                 &items,
                                 &image_metas,
-                                &metadata_resources,
+                                &resources,
+                                folder_thumbnails.as_ref(),
                                 &cancel,
                                 &wish.visibility,
                             ) {
@@ -2342,6 +2441,7 @@ fn search_prepare_worker(
                     let _ = tx.send(SearchPrepareOutput::Ready(
                         wish,
                         SearchPreparedItems {
+                            thumbnail_owner: resources.thumbnail_owner.clone(),
                             thumbnail_init,
                             metadata,
                             rating_provenance,
@@ -3444,16 +3544,10 @@ impl App {
                         && wish.rating_filter == self.effective_rating_filter()
                         && wish.rating_preview == self.rating_preview_recipe()
                         && wish.done == self.global_search.done;
-                    let mut resources = SearchMetadataResources::for_app(self);
-                    if resources.thumbnail_init.is_some()
-                        && resources.folder_thumbnails.is_none()
-                        && let Some(thumbnails) = prepared.thumbnail_init.as_ref()
-                    {
-                        resources.folder_thumbnails = thumbnails.folder_resources(
-                            self.settings.folder_thumb_sort,
-                            self.settings.folder_thumb_depth,
-                        );
-                    }
+                    let resources = SearchMetadataResources::for_app(self);
+                    same_surface &= prepared
+                        .thumbnail_owner
+                        .is_current(&resources.thumbnail_owner);
                     same_surface &= prepared.metadata.is_current(&resources);
                     if latest && same_surface {
                         if matches!(wish.source, SearchProjection::Everything { .. }) {
@@ -3548,7 +3642,7 @@ impl App {
                             app.video_thumb_overrides = prepared.video_thumb_overrides;
                             app.search_drilled_folder_counts = prepared.drilled_counts;
                             if let Some(thumbnails) = prepared.thumbnail_init {
-                                app.install_missing_search_thumbnail_workers(
+                                app.install_search_thumbnail_workers(
                                     thumbnails.cache,
                                     thumbnails.catalog,
                                 );

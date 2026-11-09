@@ -25,8 +25,19 @@ pub(crate) enum Operation {
 pub(crate) struct Observation {
     pub(crate) value: Value,
     pub(crate) catalog: Option<Arc<crate::catalog::CatalogDb>>,
+    pub(crate) catalog_targets: HashMap<usize, CatalogProbeTarget>,
     pub(crate) cache: Option<Arc<RwLock<HashMap<String, crate::catalog::CacheEntry>>>>,
     pub(crate) pins: Option<Arc<crate::folder_thumb_pins::FolderThumbPinDb>>,
+}
+
+// Captured without I/O by ROOT; only the recipe worker opens a parent reader.
+pub(crate) enum CatalogProbeTarget {
+    Fixed,
+    Parent {
+        row: crate::thumb_loader::ParentRow,
+        work: crate::catalog::CatalogWork,
+    },
+    Unsupported(&'static str),
 }
 
 pub(crate) struct Request {
@@ -401,18 +412,15 @@ fn open(bridge: &RunnerBridge, path: &str) -> Result<(), String> {
     Ok(())
 }
 fn cache_probe(observation: &Observation) -> Result<Value, String> {
-    let catalog = observation
-        .catalog
-        .as_ref()
-        .ok_or("environment: catalog unavailable")?
-        .load_all()
-        .map_err(|e| e.to_string())?;
-    let cache = observation
+    let cache_keys = observation
         .cache
         .as_ref()
         .ok_or("environment: cache map unavailable")?
         .read()
-        .map_err(|_| "environment: cache map poisoned")?;
+        .map_err(|_| "environment: cache map poisoned")?
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
     let mut targets = observation.value["targets"]
         .as_array()
         .cloned()
@@ -422,9 +430,59 @@ fn cache_probe(observation: &Observation) -> Result<Value, String> {
             .as_str()
             .ok_or("environment: missing cache key")?;
         let base = base.to_owned();
-        let present = |keys: Vec<&String>| keys.iter().any(|k| k.starts_with(&base));
-        target["catalog_absent"] = json!(!present(catalog.keys().collect()));
-        target["cache_map_absent"] = json!(!present(cache.keys().collect()));
+        let idx = target["idx"]
+            .as_u64()
+            .and_then(|idx| usize::try_from(idx).ok())
+            .ok_or("environment: missing cache target index")?;
+        let catalog_target = observation
+            .catalog_targets
+            .get(&idx)
+            .ok_or("environment: missing catalog target")?;
+        let (present, scope, row_key, folder) = match catalog_target {
+            CatalogProbeTarget::Fixed => {
+                let catalog = observation
+                    .catalog
+                    .as_ref()
+                    .ok_or("environment: catalog unavailable")?;
+                (
+                    catalog
+                        .load_latest_with_prefix(&base)
+                        .map_err(|e| e.to_string())?
+                        .is_some(),
+                    "fixed",
+                    base.as_str(),
+                    None,
+                )
+            }
+            CatalogProbeTarget::Parent { row, work } => {
+                let catalog = work
+                    .open_existing_collection_parent(&row.folder)
+                    .map_err(|e| e.to_string())?;
+                let present = catalog
+                    .as_ref()
+                    .map(|db| db.load_latest_with_prefix(&row.row_key))
+                    .transpose()
+                    .map_err(|e| e.to_string())?
+                    .flatten()
+                    .is_some();
+                (
+                    present,
+                    "parent",
+                    row.row_key.as_str(),
+                    Some(row.folder.as_path()),
+                )
+            }
+            CatalogProbeTarget::Unsupported(reason) => {
+                return Err(format!(
+                    "environment: unsupported release cache witness: {reason}"
+                ));
+            }
+        };
+        target["catalog_absent"] = json!(!present);
+        target["catalog_scope"] = json!(scope);
+        target["catalog_row_key"] = json!(row_key);
+        target["catalog_folder_path"] = json!(folder);
+        target["cache_map_absent"] = json!(!cache_keys.iter().any(|key| key.starts_with(&base)));
     }
     Ok(
         json!({"targets":targets,"folder_path":observation.value["current_folder_path"],
@@ -830,6 +888,133 @@ fn protocol_ai_trace(proof: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parent_observation(cache_dir: &Path, source: &Path) -> Observation {
+        let request_key = crate::path_key::normalize_keep_drive(source);
+        Observation {
+            value: json!({"targets":[{"idx":0,"key":source,"cache_base_key":request_key}],
+                "items_generation":17,"current_folder_path":"__search_results__"}),
+            catalog: None,
+            catalog_targets: HashMap::from([(
+                0,
+                CatalogProbeTarget::Parent {
+                    row: crate::thumb_loader::ParentRow {
+                        source: source.to_owned(),
+                        folder: source.parent().unwrap().to_owned(),
+                        row_key: source.file_name().unwrap().to_string_lossy().into_owned(),
+                    },
+                    work: crate::catalog::CatalogWork::capture(cache_dir),
+                },
+            )]),
+            cache: Some(Arc::new(RwLock::new(HashMap::new()))),
+            pins: None,
+        }
+    }
+
+    #[test]
+    fn section1741_release_probe_checks_parent_catalog_and_request_memory_independently() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("physical-parent").join("cover.png");
+        let mut observation = parent_observation(temp.path(), &source);
+        let request_key = observation.value["targets"][0]["cache_base_key"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let synthetic =
+            crate::catalog::CatalogDb::open(temp.path(), Path::new("__search_results__")).unwrap();
+        synthetic
+            .save(&request_key, 1, 2, 1, 1, None, &[1, 2, 3])
+            .unwrap();
+        observation.catalog = Some(Arc::new(synthetic));
+        let before = cache_probe(&observation).unwrap();
+        assert_eq!(
+            before["targets"][0]["catalog_absent"], true,
+            "a synthetic row is not proof of the parent save target"
+        );
+        let parent =
+            crate::catalog::CatalogDb::open(temp.path(), source.parent().unwrap()).unwrap();
+        parent
+            .save("cover.png", 3, 4, 1, 1, None, &[4, 5, 6])
+            .unwrap();
+        let entry = parent.load_one("cover.png").unwrap().unwrap();
+        let cache = observation.cache.as_ref().unwrap();
+        cache.write().unwrap().insert(request_key, entry.clone());
+        let proof = cache_probe(&observation).unwrap();
+        assert_eq!(proof["targets"][0]["catalog_absent"], false);
+        assert_eq!(proof["targets"][0]["catalog_scope"], "parent");
+        assert_eq!(proof["targets"][0]["catalog_row_key"], "cover.png");
+        assert_eq!(
+            proof["targets"][0]["catalog_folder_path"],
+            json!(source.parent().unwrap())
+        );
+        assert_eq!(proof["targets"][0]["cache_map_absent"], false);
+        cache.write().unwrap().clear();
+        cache.write().unwrap().insert("cover.png".into(), entry);
+        assert_eq!(
+            cache_probe(&observation).unwrap()["targets"][0]["cache_map_absent"],
+            true,
+            "a parent basename must not stand in for the request memory key"
+        );
+        observation
+            .catalog_targets
+            .insert(0, CatalogProbeTarget::Fixed);
+        let fixed = cache_probe(&observation).unwrap();
+        assert_eq!(fixed["targets"][0]["catalog_scope"], "fixed");
+        assert_eq!(fixed["targets"][0]["catalog_absent"], false);
+    }
+
+    #[test]
+    fn section1741_release_probe_is_read_only_and_refuses_unknown_routes() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("physical-parent").join("cover.png");
+        let mut observation = parent_observation(temp.path(), &source);
+        let proof = cache_probe(&observation).unwrap();
+        assert_eq!(proof["targets"][0]["catalog_absent"], true);
+        assert_eq!(
+            std::fs::read_dir(temp.path()).unwrap().count(),
+            0,
+            "an absence probe must not create a DB or hash directory"
+        );
+        observation
+            .catalog_targets
+            .insert(0, CatalogProbeTarget::Unsupported("container pin"));
+        assert!(
+            cache_probe(&observation)
+                .unwrap_err()
+                .contains("unsupported release cache witness: container pin")
+        );
+        observation
+            .catalog_targets
+            .insert(0, CatalogProbeTarget::Fixed);
+        assert!(
+            cache_probe(&observation)
+                .unwrap_err()
+                .contains("catalog unavailable")
+        );
+    }
+
+    #[test]
+    fn section1741_release_probe_preserves_captured_catalog_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("physical-parent").join("cover.png");
+        let observation = parent_observation(temp.path(), &source);
+        let work = match &observation.catalog_targets[&0] {
+            CatalogProbeTarget::Parent { work, .. } => work,
+            _ => unreachable!(),
+        };
+        let access = work.access();
+        drop(
+            access
+                .begin_delete(crate::catalog::CatalogDeleteOperation::All)
+                .unwrap(),
+        );
+        assert!(
+            cache_probe(&observation).is_err(),
+            "a witness accepted before clear must not adopt a new admission"
+        );
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
     #[test]
     fn foreground_grant_requires_background_case_exact_root_and_one_runner() {
         for case in ["static-background", "video-pin-background"] {

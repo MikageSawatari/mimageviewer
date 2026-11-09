@@ -1,15 +1,33 @@
-//! Worker-only lazy catalogs. The LRU contains idle references, never I/O under its lock.
+//! Worker-only lazy catalogs. The LRU never performs I/O under its lock.
 use super::*;
 use crate::catalog::{CatalogDb, CatalogWork};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
-/// Request-owned fallback scope/admission. The pool's provider selects the
-/// actual destination; a FixedCatalog always takes precedence over this scope.
+#[derive(Clone, Debug)]
+pub(crate) struct ParentRow {
+    pub(crate) source: PathBuf,
+    pub(crate) folder: PathBuf,
+    pub(crate) row_key: String,
+}
+
+/// Observation belongs to the accepted request, including RAW continuations.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ParentObservedStamp {
+    #[default]
+    Unresolved,
+    Observed(i64, i64),
+    Unavailable,
+}
+
 #[derive(Clone, Default)]
 pub(crate) enum RequestCatalog {
     #[default]
     Fixed,
+    Parent {
+        row: ParentRow,
+        work: CatalogWork,
+    },
     CollectionSourceParent {
         identity: PathBuf,
         work: CatalogWork,
@@ -18,10 +36,10 @@ pub(crate) enum RequestCatalog {
 
 impl RequestCatalog {
     pub(crate) fn collection(source: &Path, work: CatalogWork) -> Self {
-        let identity = source
+        match source
             .parent()
-            .and_then(crate::catalog::collection_source_parent_identity);
-        match identity {
+            .and_then(crate::catalog::collection_source_parent_identity)
+        {
             Some(identity) => Self::CollectionSourceParent { identity, work },
             None => {
                 crate::logger::log(format!(
@@ -36,19 +54,43 @@ impl RequestCatalog {
     pub(crate) fn is_retired(&self) -> bool {
         match self {
             Self::Fixed => false,
-            Self::CollectionSourceParent { work, .. } => {
+            Self::Parent { work, .. } | Self::CollectionSourceParent { work, .. } => {
                 !work.access().is_admitted(work.identity().1)
+            }
+        }
+    }
+
+    fn lazy_scope(&self) -> Option<(LazyCatalogKind, &Path, &CatalogWork)> {
+        match self {
+            Self::Fixed => None,
+            Self::Parent { row, work } => Some((LazyCatalogKind::Parent, &row.folder, work)),
+            Self::CollectionSourceParent { identity, work } => {
+                Some((LazyCatalogKind::Collection, identity, work))
             }
         }
     }
 }
 
-#[derive(Default)]
-pub struct CollectionParentCatalogs {
-    idle: Mutex<VecDeque<ParentCatalog>>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LazyCatalogKind {
+    Collection,
+    Parent,
+}
+impl LazyCatalogKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Collection => "collection",
+            Self::Parent => "parent",
+        }
+    }
 }
 
+#[derive(Default)]
+pub struct LazyCatalogs {
+    idle: Mutex<VecDeque<ParentCatalog>>,
+}
 struct ParentCatalog {
+    kind: LazyCatalogKind,
     identity: PathBuf,
     cache_dir: PathBuf,
     admission: crate::catalog::CatalogAdmission,
@@ -56,35 +98,30 @@ struct ParentCatalog {
     db: Arc<std::sync::OnceLock<Option<Arc<CatalogDb>>>>,
 }
 
-/// The single target choice for a worker pool. Fixed callers retain their exact
-/// catalog destination. A Collection pool only resolves request-owned parents.
 #[derive(Clone)]
-pub enum ThumbnailCatalogProvider {
-    FixedCatalog(Option<Arc<CatalogDb>>),
-    CollectionSourceParents(Arc<CollectionParentCatalogs>),
+pub struct ThumbnailCatalogProvider {
+    fixed: Option<Arc<CatalogDb>>,
+    lazy: Arc<LazyCatalogs>,
 }
 
-/// A destination and its write admission, independent of the lookup connection.
-/// Only `open_if` may turn a Collection destination into a writable catalog.
 #[derive(Clone, Copy)]
 pub struct ThumbnailSaveTarget<'a>(SaveTarget<'a>);
-
 #[derive(Clone, Copy)]
 enum SaveTarget<'a> {
     Unavailable,
     Fixed(&'a CatalogDb),
-    CollectionSourceParent {
-        pool: &'a CollectionParentCatalogs,
+    Lazy {
+        pool: &'a LazyCatalogs,
+        kind: LazyCatalogKind,
         identity: &'a Path,
         work: &'a CatalogWork,
+        row: Option<(&'a str, i64, i64)>,
     },
 }
-
 pub(super) enum SaveCatalog<'a> {
     Fixed(&'a CatalogDb),
     Parent(Arc<CatalogDb>),
 }
-
 impl AsRef<CatalogDb> for SaveCatalog<'_> {
     fn as_ref(&self) -> &CatalogDb {
         match self {
@@ -93,13 +130,11 @@ impl AsRef<CatalogDb> for SaveCatalog<'_> {
         }
     }
 }
-
 impl<'a> From<Option<&'a CatalogDb>> for ThumbnailSaveTarget<'a> {
     fn from(db: Option<&'a CatalogDb>) -> Self {
         Self(db.map_or(SaveTarget::Unavailable, SaveTarget::Fixed))
     }
 }
-
 impl<'a> ThumbnailSaveTarget<'a> {
     pub(super) fn fixed_catalog(self) -> Option<&'a CatalogDb> {
         match self.0 {
@@ -107,18 +142,34 @@ impl<'a> ThumbnailSaveTarget<'a> {
             _ => None,
         }
     }
-
+    pub(super) fn row_identity<'b>(self, key: &'b str, mtime: i64, size: i64) -> (&'b str, i64, i64)
+    where
+        'a: 'b,
+    {
+        match self.0 {
+            SaveTarget::Lazy { row: Some(row), .. } => row,
+            _ => (key, mtime, size),
+        }
+    }
+    pub(super) fn is_parent(self) -> bool {
+        matches!(
+            self.0,
+            SaveTarget::Lazy {
+                kind: LazyCatalogKind::Parent,
+                ..
+            }
+        )
+    }
     pub(super) fn can_harvest(self, force: bool, decision: CacheDecision) -> bool {
         match self.0 {
             SaveTarget::Unavailable => false,
             SaveTarget::Fixed(_) => true,
-            SaveTarget::CollectionSourceParent { work, .. } => {
+            SaveTarget::Lazy { work, .. } => {
                 (force || decision.policy != crate::settings::CachePolicy::Off)
                     && work.access().is_admitted(work.identity().1)
             }
         }
     }
-
     pub(super) fn open_if(self, force: bool, policy_should_save: bool) -> Option<SaveCatalog<'a>> {
         if !(force || policy_should_save) {
             return None;
@@ -126,104 +177,131 @@ impl<'a> ThumbnailSaveTarget<'a> {
         match self.0 {
             SaveTarget::Unavailable => None,
             SaveTarget::Fixed(db) => Some(SaveCatalog::Fixed(db)),
-            SaveTarget::CollectionSourceParent {
+            SaveTarget::Lazy {
                 pool,
+                kind,
                 identity,
                 work,
+                ..
             } => {
-                // Keep the captured epoch even if decode/encode crosses a clear.
-                // CatalogWork's open and every later SQL operation also take leases.
                 if !work.access().is_admitted(work.identity().1) {
                     return None;
                 }
-                pool.open(identity, work, true).map(SaveCatalog::Parent)
+                pool.open(kind, identity, work, true)
+                    .map(SaveCatalog::Parent)
             }
         }
     }
 }
-
 impl From<Option<&Arc<CatalogDb>>> for ThumbnailCatalogProvider {
     fn from(value: Option<&Arc<CatalogDb>>) -> Self {
-        Self::FixedCatalog(value.cloned())
+        Self::fixed(value.cloned())
     }
 }
-
 impl ThumbnailCatalogProvider {
+    pub fn fixed(fixed: Option<Arc<CatalogDb>>) -> Self {
+        Self {
+            fixed,
+            lazy: Arc::default(),
+        }
+    }
+    pub(crate) fn collection() -> Self {
+        Self::fixed(None)
+    }
     pub(super) fn uses_collection_source_parents(&self, req: &LoadRequest) -> bool {
         matches!(
-            (self, &req.catalog_target),
-            (
-                Self::CollectionSourceParents(_),
-                RequestCatalog::CollectionSourceParent { .. }
-            )
+            req.catalog_target,
+            RequestCatalog::CollectionSourceParent { .. }
         )
     }
-
-    pub(crate) fn collection() -> Self {
-        Self::CollectionSourceParents(Arc::default())
+    pub(super) fn uses_lazy_catalog(&self, req: &LoadRequest) -> bool {
+        req.catalog_target.lazy_scope().is_some()
     }
-
-    pub(super) fn save_target<'a>(&'a self, req: &'a LoadRequest) -> ThumbnailSaveTarget<'a> {
-        let target = match self {
-            Self::FixedCatalog(db) => {
-                return db.as_deref().filter(|db| !db.is_read_only()).into();
-            }
-            Self::CollectionSourceParents(pool) => match &req.catalog_target {
-                RequestCatalog::CollectionSourceParent { identity, work }
-                    if req.source_policy.allows_source() && !req.uses_memory_pin_seed() =>
+    pub(super) fn lookup_identity<'a>(
+        &self,
+        req: &'a LoadRequest,
+        key: &'a str,
+    ) -> (String, i64, i64) {
+        if let RequestCatalog::Parent { row, .. } = &req.catalog_target {
+            let (mtime, size) = match req.parent_observed {
+                ParentObservedStamp::Observed(mtime, size)
+                    if req.source_policy != LoadSourcePolicy::CacheOnly =>
                 {
-                    SaveTarget::CollectionSourceParent {
-                        pool,
-                        identity,
-                        work,
-                    }
+                    (mtime, size)
                 }
-                _ => SaveTarget::Unavailable,
-            },
+                _ => (req.mtime, req.file_size),
+            };
+            (
+                representative_cache_key_for_policy(&row.row_key, &req.file_type_visibility),
+                mtime,
+                size,
+            )
+        } else {
+            (key.to_owned(), req.mtime, req.file_size)
+        }
+    }
+    pub(super) fn save_target<'a>(&'a self, req: &'a LoadRequest) -> ThumbnailSaveTarget<'a> {
+        let target = match &req.catalog_target {
+            RequestCatalog::Fixed => {
+                return self.fixed.as_deref().filter(|db| !db.is_read_only()).into();
+            }
+            _ if !req.source_policy.allows_source() || req.uses_memory_pin_seed() => {
+                SaveTarget::Unavailable
+            }
+            _ => {
+                let (kind, identity, work) = req.catalog_target.lazy_scope().unwrap();
+                let row = match &req.catalog_target {
+                    RequestCatalog::Parent { row, .. } => match req.parent_observed {
+                        ParentObservedStamp::Observed(mtime, size) => {
+                            Some((row.row_key.as_str(), mtime, size))
+                        }
+                        _ => return ThumbnailSaveTarget(SaveTarget::Unavailable),
+                    },
+                    _ => None,
+                };
+                SaveTarget::Lazy {
+                    pool: &self.lazy,
+                    kind,
+                    identity,
+                    work,
+                    row,
+                }
+            }
         };
         ThumbnailSaveTarget(target)
     }
-
     pub(crate) fn resolve(
         &self,
         req: &LoadRequest,
         cancel: Option<&Arc<AtomicBool>>,
     ) -> Option<Arc<CatalogDb>> {
-        let Self::CollectionSourceParents(pool) = self else {
-            let Self::FixedCatalog(db) = self else {
-                unreachable!()
-            };
-            return db.clone();
+        let Some((kind, identity, work)) = req.catalog_target.lazy_scope() else {
+            return self.fixed.clone();
         };
-        let RequestCatalog::CollectionSourceParent { identity, work } = &req.catalog_target else {
-            return None;
-        };
-        // SourceOnly and authoritative memory pins never need a disk lookup.
         if !req.source_policy.allows_cache() || req.uses_memory_pin_seed() {
             return None;
         }
         let started = std::time::Instant::now();
         let access = work.access();
         let db = if !access.is_admitted(work.identity().1) {
-            // Only CacheOnly may take the existing one-shot RO continuation.
-            // Its original writer admission never changes; do not cache this handle.
             if req.source_policy != LoadSourcePolicy::CacheOnly {
                 return None;
             }
             let admission = access.wait_read_admission_with(&|| {
                 cancel.is_some_and(|flag| flag.load(Ordering::Acquire))
             })?;
-            CollectionParentCatalogs::open_catalog(
+            LazyCatalogs::open_catalog(
+                kind,
                 identity,
                 &CatalogWork::with_admission(work.identity().0, admission),
                 false,
             )
         } else {
-            pool.open(identity, work, false)
+            self.lazy.open(kind, identity, work, false)
         };
         if crate::perf::is_enabled() {
             crate::perf::event(
-                "collection",
+                "thumb",
                 "thumb_catalog_open",
                 None,
                 req.input_seq,
@@ -232,6 +310,7 @@ impl ThumbnailCatalogProvider {
                         "ms",
                         serde_json::json!(started.elapsed().as_secs_f64() * 1000.0),
                     ),
+                    ("catalog_kind", serde_json::json!(kind.label())),
                     ("writable", serde_json::json!(false)),
                     ("opened", serde_json::json!(db.is_some())),
                 ],
@@ -239,7 +318,6 @@ impl ThumbnailCatalogProvider {
         }
         db
     }
-
     pub(super) fn resume_cache_only_lookup(
         &self,
         req: &LoadRequest,
@@ -248,31 +326,30 @@ impl ThumbnailCatalogProvider {
         cancel: Option<&Arc<AtomicBool>>,
     ) -> rusqlite::Result<Option<crate::catalog::CacheEntry>> {
         let canceled = || cancel.is_some_and(|flag| flag.load(Ordering::Relaxed));
-        match self {
-            Self::FixedCatalog(_) => previous.resume_cache_only_after_maintenance(key, &canceled),
-            Self::CollectionSourceParents(_) => {
-                // A clear can retire the RO after the initial resolve. Its
-                // successor must pass the same Collection schema publication
-                // boundary; the legacy-compatible generic resume is not valid.
-                if canceled() {
-                    return Ok(None);
-                }
-                let Some(db) = self.resolve(req, cancel) else {
-                    return Ok(None);
-                };
-                let entry = db.load_one(key)?;
-                if canceled() { Ok(None) } else { Ok(entry) }
-            }
+        if !self.uses_lazy_catalog(req) {
+            return previous.resume_cache_only_after_maintenance(key, &canceled);
         }
+        if canceled() {
+            return Ok(None);
+        }
+        let Some(db) = self.resolve(req, cancel) else {
+            return Ok(None);
+        };
+        let entry = db.load_one(key)?;
+        if canceled() { Ok(None) } else { Ok(entry) }
     }
 }
-
-impl CollectionParentCatalogs {
-    fn open_catalog(identity: &Path, work: &CatalogWork, writable: bool) -> Option<Arc<CatalogDb>> {
+impl LazyCatalogs {
+    fn open_catalog(
+        kind: LazyCatalogKind,
+        identity: &Path,
+        work: &CatalogWork,
+        writable: bool,
+    ) -> Option<Arc<CatalogDb>> {
         let result = if writable {
             work.open(identity).map(Some)
         } else {
-            // No mkdir, schema initialization or empty DB creation on lookup.
+            // Both lazy namespaces publish one complete required-column snapshot.
             work.open_existing_collection_parent(identity)
         };
         match result {
@@ -280,22 +357,30 @@ impl CollectionParentCatalogs {
             Err(error) => {
                 let access = work.access();
                 if access.is_admitted(work.identity().1) {
-                    access.record_cache_error(format!("collection thumbnail catalog: {error}"));
+                    access
+                        .record_cache_error(format!("{} thumbnail catalog: {error}", kind.label()));
                 }
                 crate::logger::log(format!(
-                    "collection thumbnail catalog open failed: {}: {error}",
+                    "{} thumbnail catalog open failed: {}: {error}",
+                    kind.label(),
                     identity.display()
                 ));
                 None
             }
         }
     }
-
-    fn open(&self, identity: &Path, work: &CatalogWork, writable: bool) -> Option<Arc<CatalogDb>> {
+    fn open(
+        &self,
+        kind: LazyCatalogKind,
+        identity: &Path,
+        work: &CatalogWork,
+        writable: bool,
+    ) -> Option<Arc<CatalogDb>> {
         let (slot, retired) = {
             let mut idle = self.idle.lock().unwrap();
             let pos = idle.iter().position(|entry| {
-                entry.identity == identity
+                entry.kind == kind
+                    && entry.identity == identity
                     && entry.cache_dir == work.identity().0
                     && entry.admission == work.identity().1
                     && entry.writable == writable
@@ -308,6 +393,7 @@ impl CollectionParentCatalogs {
             } else {
                 let slot = Arc::new(std::sync::OnceLock::new());
                 idle.push_back(ParentCatalog {
+                    kind,
                     identity: identity.to_owned(),
                     cache_dir: work.identity().0.to_path_buf(),
                     admission: work.identity().1,
@@ -319,13 +405,10 @@ impl CollectionParentCatalogs {
             }
         };
         drop(retired);
-        // Same-pool opens share a slot; initialization/SQL never holds the LRU lock.
-        // The native catalog gate handles other pools and deletion.
         let db = slot
-            .get_or_init(|| Self::open_catalog(identity, work, writable))
+            .get_or_init(|| Self::open_catalog(kind, identity, work, writable))
             .clone();
         if db.is_none() {
-            // Do not memoize absence: another request/context may save this parent.
             let removed = {
                 let mut idle = self.idle.lock().unwrap();
                 idle.iter()
@@ -481,9 +564,7 @@ mod tests {
         // A sibling worker/pool can observe this valid, still empty SQLite file.
         let creating = rusqlite::Connection::open(&path).unwrap();
         assert!(provider.resolve(&req, None).is_none());
-        let ThumbnailCatalogProvider::CollectionSourceParents(pool) = &provider else {
-            unreachable!()
-        };
+        let pool = &provider.lazy;
         assert!(pool.idle.lock().unwrap().is_empty());
         assert!(
             CatalogAccess::for_cache_dir(&cache)
@@ -623,7 +704,7 @@ mod tests {
         // Existing physical/aggregate callers both supply an already-open catalog.
         for folder in [source.parent().unwrap(), Path::new("__smart__/test")] {
             let db = Arc::new(CatalogDb::open(&temp.path().join("cache"), folder).unwrap());
-            let provider = ThumbnailCatalogProvider::FixedCatalog(Some(db.clone()));
+            let provider = ThumbnailCatalogProvider::fixed(Some(db.clone()));
             for (policy, force, saves) in [
                 (CachePolicy::Off, false, false),
                 (CachePolicy::Auto, false, false),
@@ -1141,9 +1222,7 @@ mod tests {
             provider.writer(&req).unwrap();
             assert!(provider.resolve(&req, None).unwrap().is_read_only());
         }
-        let ThumbnailCatalogProvider::CollectionSourceParents(pool) = &provider else {
-            unreachable!()
-        };
+        let pool = &provider.lazy;
         assert_eq!(pool.idle.lock().unwrap().len(), 16);
         drop(provider);
         assert!(!sibling_db.is_retired());
@@ -1167,5 +1246,596 @@ mod tests {
             )
             .exists()
         );
+    }
+
+    fn parent_request(source: &Path, cache: &Path) -> LoadRequest {
+        let mut req = request(source, cache);
+        req.catalog_target = RequestCatalog::Parent {
+            row: ParentRow {
+                source: source.to_owned(),
+                folder: source.parent().unwrap().to_owned(),
+                row_key: source.file_name().unwrap().to_str().unwrap().to_owned(),
+            },
+            work: CatalogWork::capture(cache),
+        };
+        req
+    }
+
+    fn valid_webp() -> Vec<u8> {
+        let image = image::DynamicImage::new_rgb8(8, 6);
+        crate::catalog::encode_thumb_webp(&image, 64, 75.0)
+            .unwrap()
+            .0
+    }
+
+    fn seed_parent(req: &LoadRequest, cache: &Path, stamp: (i64, i64)) -> CatalogDb {
+        let RequestCatalog::Parent { row, .. } = &req.catalog_target else {
+            unreachable!()
+        };
+        let db = CatalogDb::open(cache, &row.folder).unwrap();
+        db.save(
+            &row.row_key,
+            stamp.0,
+            stamp.1,
+            8,
+            6,
+            Some((8, 6)),
+            &valid_webp(),
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn parent_generated_row_uses_observed_but_memory_uses_request_and_survives_offline() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let source = image_source(temp.path());
+        let fixed = Arc::new(CatalogDb::open(&cache, Path::new("__search_results__")).unwrap());
+        let provider = ThumbnailCatalogProvider::fixed(Some(fixed.clone()));
+        let mut req = parent_request(&source, &cache);
+        req.file_size = 0;
+        let map = RwLock::default();
+        PARENT_STAT_COUNT.with(|count| count.set(0));
+        let messages = run(&mut req, &provider, CachePolicy::Always, &map);
+        assert!(matches!(
+            messages[0].payload,
+            ThumbMsgPayload::SourcePixels(_)
+        ));
+        assert_eq!(PARENT_STAT_COUNT.with(|count| count.get()), 1);
+        let parent = CatalogDb::open(&cache, source.parent().unwrap()).unwrap();
+        let entry = parent.load_one("image.png").unwrap().unwrap();
+        assert_eq!(
+            (entry.mtime, entry.file_size),
+            crate::catalog::file_stamp(&std::fs::metadata(&source).unwrap())
+        );
+        let request_key = req.cache_key_override.as_ref().unwrap();
+        assert!(fixed.load_one(request_key).unwrap().is_none());
+        assert!(fixed.load_one("image.png").unwrap().is_none());
+        assert!(!map.read().unwrap().contains_key("image.png"));
+        assert_eq!(map.read().unwrap().get(request_key).unwrap().file_size, 0);
+        std::fs::remove_file(&source).unwrap();
+        let messages = run(&mut req, &provider, CachePolicy::Off, &map);
+        assert_eq!(
+            messages[0].pixels().unwrap().origin,
+            ThumbLoadOrigin::UpgradeableCache
+        );
+        assert_eq!(PARENT_STAT_COUNT.with(|count| count.get()), 1);
+    }
+
+    #[test]
+    fn parent_inverse_lookup_observed_hit_populates_request_memory_without_rewrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let source = image_source(temp.path());
+        let mut req = parent_request(&source, &cache);
+        req.file_size = 0;
+        let observed = crate::catalog::file_stamp(&std::fs::metadata(&source).unwrap());
+        let db = seed_parent(&req, &cache, observed);
+        let original = db.load_one("image.png").unwrap().unwrap().jpeg_data;
+        let provider = ThumbnailCatalogProvider::fixed(None);
+        let map = RwLock::default();
+        let messages = run(&mut req, &provider, CachePolicy::Off, &map);
+        assert_eq!(
+            messages[0].pixels().unwrap().origin,
+            ThumbLoadOrigin::UpgradeableCache
+        );
+        assert_eq!(
+            db.load_one("image.png").unwrap().unwrap().jpeg_data,
+            original
+        );
+        std::fs::remove_file(&source).unwrap();
+        PARENT_STAT_COUNT.with(|count| count.set(0));
+        let messages = run(&mut req, &provider, CachePolicy::Off, &map);
+        assert_eq!(
+            messages[0].pixels().unwrap().origin,
+            ThumbLoadOrigin::UpgradeableCache
+        );
+        assert_eq!(PARENT_STAT_COUNT.with(|count| count.get()), 0);
+    }
+
+    #[test]
+    fn parent_legacy_memory_hit_and_cache_only_never_stat_or_migrate() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let source = temp.path().join("offline/image.png");
+        let mut req = parent_request(&source, &cache);
+        let map = RwLock::new(std::collections::HashMap::from([(
+            req.cache_key_override.clone().unwrap(),
+            crate::catalog::CacheEntry {
+                mtime: req.mtime,
+                file_size: req.file_size,
+                jpeg_data: valid_webp(),
+                source_dims: Some((8, 6)),
+                layout_dims: None,
+                folder_provenance: None,
+                selection_proof: None,
+            },
+        )]));
+        let provider = ThumbnailCatalogProvider::fixed(None);
+        PARENT_STAT_COUNT.with(|count| count.set(0));
+        let messages = run(&mut req, &provider, CachePolicy::Always, &map);
+        assert_eq!(
+            messages[0].pixels().unwrap().origin,
+            ThumbLoadOrigin::UpgradeableCache
+        );
+        assert!(!cache.exists());
+        req.source_policy = LoadSourcePolicy::CacheOnly;
+        let messages = run(&mut req, &provider, CachePolicy::Always, &RwLock::default());
+        assert!(matches!(
+            messages[0].payload,
+            ThumbMsgPayload::CacheOnlyMiss
+        ));
+        assert_eq!(PARENT_STAT_COUNT.with(|count| count.get()), 0);
+        assert!(!cache.exists());
+    }
+
+    #[test]
+    fn parent_stat_failure_reads_request_signature_but_never_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let source = temp.path().join("offline/image.png");
+        let mut req = parent_request(&source, &cache);
+        seed_parent(&req, &cache, (req.mtime, req.file_size));
+        let provider = ThumbnailCatalogProvider::fixed(None);
+        let messages = run(&mut req, &provider, CachePolicy::Always, &RwLock::default());
+        assert_eq!(
+            messages[0].pixels().unwrap().origin,
+            ThumbLoadOrigin::UpgradeableCache
+        );
+        observe_parent_stamp(&mut req);
+        assert_eq!(req.parent_observed, ParentObservedStamp::Unavailable);
+        assert!(provider.save_target(&req).open_if(true, true).is_none());
+    }
+
+    #[test]
+    fn parent_source_only_and_auto_no_save_do_not_create_or_read_catalogs() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let source = image_source(temp.path());
+        let mut req = parent_request(&source, &cache);
+        req.source_policy = LoadSourcePolicy::SourceOnly;
+        let provider = ThumbnailCatalogProvider::fixed(None);
+        let mut cheap = decision(CachePolicy::Auto);
+        cheap.threshold_ms = u32::MAX;
+        cheap.size_threshold = u64::MAX;
+        run_decided(&mut req, &provider, cheap, &RwLock::default());
+        assert!(!cache.exists());
+        assert!(provider.lazy.idle.lock().unwrap().is_empty());
+        let db = seed_parent(&req, &cache, (7, 9));
+        let messages = run(&mut req, &provider, CachePolicy::Always, &RwLock::default());
+        assert!(matches!(
+            messages[0].payload,
+            ThumbMsgPayload::SourcePixels(_)
+        ));
+        assert_ne!(db.load_one("image.png").unwrap().unwrap().file_size, 9);
+    }
+
+    #[test]
+    fn parent_raw_continuation_inherits_observation_without_second_stat() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = image_source(temp.path());
+        let mut outer = parent_request(&source, &temp.path().join("cache"));
+        PARENT_STAT_COUNT.with(|count| count.set(0));
+        observe_parent_stamp(&mut outer);
+        let mut derived = LoadRequest::default();
+        derived.inherit_request_identity_from(&outer);
+        std::fs::remove_file(&source).unwrap();
+        observe_parent_stamp(&mut derived);
+        assert_eq!(derived.parent_observed, outer.parent_observed);
+        derived.path = source.clone();
+        derived.cache_key_override = outer.cache_key_override.clone();
+        derived.mtime = outer.mtime;
+        derived.file_size = outer.file_size;
+        derived.raw_source = LoadRequestSource::RawHalfDeveloped {
+            image: image::DynamicImage::new_rgb8(8, 6),
+            developed_dims: [80, 60],
+            decode_ms: 2.0,
+            folder_selection_proof: None,
+        };
+        let map = RwLock::default();
+        let messages = run(
+            &mut derived,
+            &ThumbnailCatalogProvider::fixed(None),
+            CachePolicy::Always,
+            &map,
+        );
+        assert!(matches!(
+            messages[0].payload,
+            ThumbMsgPayload::SourcePixels(_)
+        ));
+        let RequestCatalog::Parent { row, work } = &derived.catalog_target else {
+            unreachable!()
+        };
+        let saved = work
+            .open(&row.folder)
+            .unwrap()
+            .load_one(&row.row_key)
+            .unwrap()
+            .unwrap();
+        let ParentObservedStamp::Observed(mtime, size) = outer.parent_observed else {
+            unreachable!()
+        };
+        assert_eq!((saved.mtime, saved.file_size), (mtime, size));
+        assert_eq!(PARENT_STAT_COUNT.with(|count| count.get()), 1);
+    }
+
+    #[test]
+    fn parent_epub_observation_uses_prepared_generation_without_source_stat() {
+        let mut req = parent_request(
+            Path::new(r"C:\offline\book.epub"),
+            Path::new("unused-cache"),
+        );
+        req.pdf_page = Some(0);
+        let target = crate::pdf_loader::generation_target_for_test(&req.path, 17, 4096);
+        let mut prepared = stamp_resolved_pdf_request(&req, &target).unwrap();
+        PARENT_STAT_COUNT.with(|count| count.set(0));
+        observe_parent_stamp(&mut prepared);
+        assert_eq!(
+            prepared.parent_observed,
+            ParentObservedStamp::Observed(17, 4096)
+        );
+        assert_eq!(PARENT_STAT_COUNT.with(|count| count.get()), 0);
+    }
+
+    #[test]
+    fn parent_clear_keeps_cache_only_ro_continuation_and_rejects_old_saves() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let source = image_source(temp.path());
+        let mut req = parent_request(&source, &cache);
+        observe_parent_stamp(&mut req);
+        let provider = ThumbnailCatalogProvider::fixed(None);
+        let target = provider.save_target(&req);
+        seed_parent(&req, &cache, (7, 9));
+        let reader = provider.resolve(&req, None).unwrap();
+        crate::catalog::delete_all_cache(&cache);
+        assert!(reader.is_retired());
+        assert!(target.open_if(true, true).is_none());
+        let successor = seed_parent(&req, &cache, (7, 9));
+        req.source_policy = LoadSourcePolicy::CacheOnly;
+        let messages = run(&mut req, &provider, CachePolicy::Always, &RwLock::default());
+        assert_eq!(
+            messages[0].pixels().unwrap().origin,
+            ThumbLoadOrigin::UpgradeableCache
+        );
+        assert!(!successor.is_retired());
+    }
+
+    #[test]
+    fn parent_same_names_use_distinct_dbs_and_lazy_kinds_do_not_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let provider = ThumbnailCatalogProvider::fixed(None);
+        for folder in ["F01", "F02"] {
+            let source = image_source(&temp.path().join(folder));
+            let mut req = parent_request(&source, &cache);
+            observe_parent_stamp(&mut req);
+            let parent = provider.writer(&req).unwrap();
+            let (identity, work) = match &req.catalog_target {
+                RequestCatalog::Parent { row, work } => (&row.folder, work),
+                _ => unreachable!(),
+            };
+            let collection = provider
+                .lazy
+                .open(LazyCatalogKind::Collection, identity, work, true)
+                .unwrap();
+            assert!(!Arc::ptr_eq(&parent, &collection));
+        }
+        assert_eq!(provider.lazy.idle.lock().unwrap().len(), 4);
+        assert_ne!(
+            db_path_for(&cache, &temp.path().join("F01/source")),
+            db_path_for(&cache, &temp.path().join("F02/source"))
+        );
+    }
+
+    #[test]
+    fn parent_catalog_open_failure_keeps_source_display_and_records_notice() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = image_source(temp.path());
+        let cache = temp.path().join("cache-is-a-file");
+        std::fs::write(&cache, b"blocked").unwrap();
+        let mut req = parent_request(&source, &cache);
+        let messages = run(
+            &mut req,
+            &ThumbnailCatalogProvider::fixed(None),
+            CachePolicy::Always,
+            &RwLock::default(),
+        );
+        assert!(matches!(
+            messages[0].payload,
+            ThumbMsgPayload::SourcePixels(_)
+        ));
+        assert!(
+            CatalogAccess::for_cache_dir(&cache)
+                .take_cache_notice()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn parent_pdf_meta_uses_admitted_writer_observed_stamp_and_password_rules() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("book.pdf");
+        std::fs::write(&source, b"source attributes only").unwrap();
+        let cache = temp.path().join("cache");
+        let mut req = parent_request(&source, &cache);
+        req.pdf_page = Some(0);
+        req.cache_key_override = Some(format!("pdfthumb:{}", source.display()));
+        if let RequestCatalog::Parent { row, .. } = &mut req.catalog_target {
+            row.row_key = "pdfthumb:book.pdf".into();
+        }
+        observe_parent_stamp(&mut req);
+        let provider = ThumbnailCatalogProvider::fixed(None);
+        let target = provider.save_target(&req);
+        assert!(target.open_if(false, false).is_none());
+        let writer = target.open_if(false, true).unwrap();
+        let (_, mtime, size) = target.row_identity("ignored", req.mtime, req.file_size);
+        let db = writer.as_ref();
+        save_rendered_pdf_meta(db, "book.pdf", mtime, size, 5, Some("session-password")).unwrap();
+        assert!(db.get_pdf_meta("book.pdf", mtime, size).unwrap().is_none());
+        save_rendered_pdf_meta(db, "book.pdf", mtime, size, 5, None).unwrap();
+        assert_eq!(
+            db.get_pdf_meta("book.pdf", mtime, size).unwrap(),
+            Some((5, false))
+        );
+        db.set_pdf_meta("book.pdf", mtime, size, 5, true).unwrap();
+        save_rendered_pdf_meta(db, "book.pdf", mtime, size, 6, None).unwrap();
+        assert_eq!(
+            db.get_pdf_meta("book.pdf", mtime, size).unwrap(),
+            Some((6, false))
+        );
+        assert!(provider.resolve(&req, None).unwrap().is_read_only());
+        crate::catalog::delete_all_cache(&cache);
+        assert!(target.open_if(true, true).is_none());
+    }
+
+    #[test]
+    fn parent_pdf_meta_catchup_writes_parent_writer_without_touching_view_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("book.pdf");
+        std::fs::write(&source, b"source attributes only").unwrap();
+        let cache = temp.path().join("cache");
+        let mut req = parent_request(&source, &cache);
+        observe_parent_stamp(&mut req);
+        let fixed = Arc::new(CatalogDb::open(&cache, Path::new("__search_results__")).unwrap());
+        let provider = ThumbnailCatalogProvider::fixed(Some(fixed.clone()));
+        let writer = provider.save_target(&req).open_if(true, false).unwrap();
+        process_meta_only_with(
+            &source,
+            writer.as_ref(),
+            &Arc::new(AtomicBool::new(false)),
+            |_, _, _| Ok(12),
+        );
+        let stamp = crate::catalog::file_stamp(&std::fs::metadata(&source).unwrap());
+        assert_eq!(
+            writer
+                .as_ref()
+                .get_pdf_meta("book.pdf", stamp.0, stamp.1)
+                .unwrap(),
+            Some((12, false))
+        );
+        assert!(
+            fixed
+                .get_pdf_meta("book.pdf", stamp.0, stamp.1)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    fn fake_pdf_render(page_count: u32) -> crate::pdf_loader::RenderResult {
+        crate::pdf_loader::RenderResult {
+            image: image::DynamicImage::new_rgb8(12, 8),
+            content_type: crate::pdf_loader::PdfPageContentType::Vector,
+            page_count,
+            page_size_points: crate::pdf_loader::PdfPageSizePoints {
+                width: 120.0,
+                height: 80.0,
+            },
+        }
+    }
+
+    fn parent_pdf_request(source: &Path, cache: &Path) -> LoadRequest {
+        let mut req = parent_request(source, cache);
+        req.pdf_page = Some(0);
+        req.cache_key_override = Some(format!("pdfthumb:{}", source.display()));
+        if let RequestCatalog::Parent { row, .. } = &mut req.catalog_target {
+            row.row_key = format!("pdfthumb:{}", source.file_name().unwrap().to_str().unwrap());
+        }
+        req
+    }
+
+    #[test]
+    fn parent_pdf_worker_render_saves_observed_thumb_and_meta_only_to_parent() {
+        for password in [None, Some("session-password")] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("book.pdf");
+            std::fs::write(&source, b"fake backend source").unwrap();
+            let cache = temp.path().join("cache");
+            let fixed = Arc::new(CatalogDb::open(&cache, Path::new("__search_results__")).unwrap());
+            let provider = ThumbnailCatalogProvider::fixed(Some(fixed.clone()));
+            let mut req = parent_pdf_request(&source, &cache);
+            req.file_size = 0;
+            req.pdf_password = password.map(str::to_owned);
+            let memory = RwLock::default();
+            PARENT_STAT_COUNT.with(|count| count.set(0));
+            let messages = with_test_pdf_render_result(fake_pdf_render(12), || {
+                run(&mut req, &provider, CachePolicy::Always, &memory)
+            });
+            assert!(matches!(
+                messages[0].payload,
+                ThumbMsgPayload::SourcePixels(_)
+            ));
+            assert_eq!(PARENT_STAT_COUNT.with(|count| count.get()), 1);
+            let stamp = crate::catalog::file_stamp(&std::fs::metadata(&source).unwrap());
+            let db = CatalogDb::open(&cache, source.parent().unwrap()).unwrap();
+            let row = db.load_one("pdfthumb:book.pdf").unwrap().unwrap();
+            assert_eq!((row.mtime, row.file_size), stamp);
+            assert_eq!(
+                db.get_pdf_meta("book.pdf", stamp.0, stamp.1).unwrap(),
+                password.is_none().then_some((12, false))
+            );
+            assert!(
+                fixed
+                    .load_one(req.cache_key_override.as_deref().unwrap())
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                fixed
+                    .get_pdf_meta("book.pdf", stamp.0, stamp.1)
+                    .unwrap()
+                    .is_none()
+            );
+            let memory = memory.read().unwrap();
+            let row = memory
+                .get(req.cache_key_override.as_ref().unwrap())
+                .unwrap();
+            assert_eq!((row.mtime, row.file_size), (7, 0));
+        }
+    }
+
+    #[test]
+    fn parent_epub_worker_legacy_memory_hit_then_source_only_saves_generation() {
+        let fixture = crate::epub_cache::reconverted_for_worker_test();
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let mut req = parent_pdf_request(&fixture.source, &cache);
+        req.file_size = 0;
+        req.pdf_stamp_policy = PdfStampPolicy::ResolveInWorker;
+        let key = req.cache_key_override.clone().unwrap();
+        let generation = (
+            fixture.current.generation_id,
+            fixture.current.pdf_size as i64,
+        );
+        let map = RwLock::new(std::collections::HashMap::from([(
+            key.clone(),
+            crate::catalog::CacheEntry {
+                mtime: generation.0,
+                file_size: generation.1,
+                jpeg_data: valid_webp(),
+                source_dims: Some((8, 6)),
+                layout_dims: None,
+                folder_provenance: None,
+                selection_proof: None,
+            },
+        )]));
+        let provider = ThumbnailCatalogProvider::fixed(None);
+        PARENT_STAT_COUNT.with(|count| count.set(0));
+        let messages = run(&mut req, &provider, CachePolicy::Always, &map);
+        assert_eq!(
+            messages[0].pixels().unwrap().origin,
+            ThumbLoadOrigin::UpgradeableCache
+        );
+        assert_eq!(PARENT_STAT_COUNT.with(|count| count.get()), 0);
+        assert!(
+            !cache.exists(),
+            "displaying the legacy memory row must not migrate it"
+        );
+        req.source_policy = LoadSourcePolicy::SourceOnly;
+        let messages =
+            with_test_pdf_render_result(fake_pdf_render(fixture.current.page_count), || {
+                run(&mut req, &provider, CachePolicy::Always, &map)
+            });
+        assert!(matches!(
+            messages[0].payload,
+            ThumbMsgPayload::SourcePixels(_)
+        ));
+        assert_eq!(PARENT_STAT_COUNT.with(|count| count.get()), 0);
+        let db = CatalogDb::open(&cache, fixture.source.parent().unwrap()).unwrap();
+        let row_key = format!(
+            "pdfthumb:{}",
+            fixture.source.file_name().unwrap().to_str().unwrap()
+        );
+        let row = db.load_one(&row_key).unwrap().unwrap();
+        assert_eq!((row.mtime, row.file_size), generation);
+        let memory = map.read().unwrap();
+        let row = memory.get(&key).unwrap();
+        assert_eq!((row.mtime, row.file_size), generation);
+        assert!(memory.get(&row_key).is_none());
+    }
+
+    #[test]
+    fn parent_source_only_worker_applies_kind_suffix_to_parent_and_request_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("book.pdf");
+        std::fs::write(&source, b"fake backend source").unwrap();
+        let cache = temp.path().join("cache");
+        let mut req = parent_pdf_request(&source, &cache);
+        req.source_policy = LoadSourcePolicy::SourceOnly;
+        req.file_type_visibility
+            .excluded_categories
+            .insert(crate::file_type_visibility::FileTypeCategory::Audio);
+        let memory_key = representative_cache_key_for_policy(
+            req.cache_key_override.as_deref().unwrap(),
+            &req.file_type_visibility,
+        );
+        let parent_key =
+            representative_cache_key_for_policy("pdfthumb:book.pdf", &req.file_type_visibility);
+        assert!(parent_key.contains("|types:"));
+        let map = RwLock::default();
+        let messages = with_test_pdf_render_result(fake_pdf_render(2), || {
+            run(
+                &mut req,
+                &ThumbnailCatalogProvider::fixed(None),
+                CachePolicy::Always,
+                &map,
+            )
+        });
+        assert!(matches!(
+            messages[0].payload,
+            ThumbMsgPayload::SourcePixels(_)
+        ));
+        let db = CatalogDb::open(&cache, source.parent().unwrap()).unwrap();
+        assert!(db.load_one(&parent_key).unwrap().is_some());
+        assert!(db.load_one("pdfthumb:book.pdf").unwrap().is_none());
+        let map = map.read().unwrap();
+        assert!(map.contains_key(&memory_key));
+        assert!(!map.contains_key(&parent_key));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn parent_derived_key_mismatch_asserts_before_any_parent_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = image_source(temp.path());
+        let cache = temp.path().join("cache");
+        let mut req = parent_request(&source, &cache);
+        req.parent_request_key = Some("original-outer-key".into());
+        let map = RwLock::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run(
+                &mut req,
+                &ThumbnailCatalogProvider::fixed(None),
+                CachePolicy::Always,
+                &map,
+            )
+        }));
+        assert!(
+            result.is_err(),
+            "derived request must preserve its outer identity"
+        );
+        assert!(!cache.exists());
+        assert!(map.read().unwrap().is_empty());
     }
 }

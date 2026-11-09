@@ -8644,6 +8644,7 @@ impl App {
         self.converted_archive_cache_paths = converted_archive_cache_paths;
         self.current_color_cache_map = color_cache_map;
         self.current_color_catalog = color_catalog;
+        self.thumbnail_pool_catalog = super::ThumbnailPoolCatalog::View(synthetic);
 
         let (tx, rx) = mpsc::channel();
         self.tx = tx.clone();
@@ -8665,6 +8666,7 @@ impl App {
                 self.folder_thumb_pin_db.clone(),
             );
         } else {
+            self.thumbnail_pool_catalog = super::ThumbnailPoolCatalog::None;
             self.reload_queue = None;
             self.heavy_io_queue = None;
         }

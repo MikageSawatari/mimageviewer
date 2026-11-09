@@ -742,20 +742,35 @@ nodeは成功cacheと排他的な走査状態を持ち、private Receiverの寿�
 | --- | --- | --- |
 | `folder-pane-scan` | pane nodeごとのprivate mpsc/cancel、1 pump開始4件・採用4件まで | 実directory直下列挙・分類・hidden投影・6sort・membershipをworkerで確定。Queued残存中もUIは各passで短いrepaintを要求。需要離脱/options/reload/表示中断/Dropで取消し、UIはjoinしない。失敗は旧cache+row警告+logで終端し、同表示機会のretryをしない |
 
-### コレクション一覧の遅延catalog（§1.668、案C、2026-11-01）
+### 一覧の遅延catalogと検索pool（§1.668、§1.741）
 
-追加threadなし。既存generic poolが `ThumbnailCatalogProvider` のFixedCatalogまたは
-CollectionSourceParentsを所有する。共通UI enqueueで元GridItemの実親identityと `CatalogWork`
-を要求へ固定し、全件prepareにI/Oを足さない。pin/変換先へ宛先を付け替えず、EPUB fallback/RAW
-deferredもCloneで継承する。16親LRUはslot取得だけをlockし、open/lookup/保存/closeはlock外の
-worker。pool/要求は所有contextのqueue/cancelに従い、最後のArcはworkerでdropする。
-兄弟のopen/close/removeでは共有epochを進めず、明示cache clearだけ既存admission/drain/retireへ
-接続する。lookupは全policyで既存DBのRO専用slot、SourceOnlyはlookupを省く。
-`ThumbnailSaveTarget` が既存Fixed接続か元親・pool・受付epochを一つに保持し、実測policy/forceで
-保存が確定した後だけRWを開く。RO/RWは合計16 slotで、実行中要求は最大2接続を保持し得る。
-保存/catch-upへROを渡さず、EPUB fallback再帰も元providerを継承する。
-`collection.thumb_catalog_open` / `thumb_catalog_lookup` はms・書込可否・hitを記録する。
-既存thumb encode/save計装も維持。配置/寿命/削除familyは [catalog設計](catalog-design.md) を参照。
+追加threadなし。既存generic poolの `ThumbnailCatalogProvider` が固定catalogと `LazyCatalogs` を所有する。
+共通UI enqueueはI/Oなしで `ThumbStorageScope` と要求を作った分岐から
+`RequestCatalog` (Fixed / Parent / CollectionSourceParent) と受付時の `CatalogWork` を固定する。
+SingleFolder（Collection PhysicalSourceを含む）は明示的にFixed、Collection rootは§1.668の元親namespace、
+MultiParentのピンなし画像/ZIP/PDF・EPUB表紙だけParentを使う。folder/pin/変換書庫/Stack/内部page/集約行、
+音声/動画/Remoteは従来経路。EPUB fallback/RAW deferred/PDF catch-upも元の要求先/admissionを継承する。
+種類（Collection元親/通常親）・path・cache dir・admission・RO/RWを区別した合計16 slotのLRUは
+slot取得だけをlockし、OnceLock初期化・open/lookup/保存/closeはworker、lock外で行う。
+pool/要求は所有contextのqueue/cancelに従い、最後のArcはworkerでdropする。
+
+Parentは既存EPUB世代解決の後、一覧自身のメモリを要求キー/要求stampで先に引き、hitならstatしない。
+miss時だけ通常scanと同じobserved（EPUBは解決済みgeneration）で親DBをRO lookupし、RAW再開ではobservedを継承する。
+親DB hitと生成・保存時にはメモリを要求キー/要求stampで更新する。SourceOnlyは両lookupを省き、
+CacheOnlyはstat/生成/保存をしない。stat失敗時の親DBは要求stampによるRO lookupだけで、保存しない。
+`ThumbnailSaveTarget` が既存Fixed接続か親・種類・pool・受付epochを一つに保持し、実測policy/forceで
+保存が確定した後だけRWを開く。非保存AutoはDBを作らず、実行中要求はLRU外に最大2接続を保持し得る。
+ParentのPDF保存/catch-upも同じtargetのRWを使い、ROを書込へ転用しない。
+clearを跨いだ要求の保存を受付admissionで禁じ、CacheOnlyだけ旧メモリを使わず一回RO継続する。
+
+検索に入るprepareは、検索poolなら `Current`、それ以外なら置換元identity付き `Prepare` を捕捉する。
+Prepareのworkerが `__search_results__` をopen/load_allし、新ownerへEverythingのfolder video-pin seedをcommitする。
+ReadyはCurrentのownerまたはPrepareの置換元identityを照合し、変化していれば既存prepare再試行へ戻す。
+採用はそのcontextのpool catalog型/channel/queue/cancelを一緒に置換し、同じ検索内のstreaming/rebuildでは維持する。
+検索を閉じた元一覧の通常reloadも維持し、兄弟contextのrows/cache/generation/queue/cancelや共有epochは変更しない。
+旧合成DB行は従来のメモリで読み、移送・追加statをしない。schema/hashの変更や一括移行もない。
+catalog open/lookup計装は種類をfieldで区別し、Parent statと既存encode/save計装も記録する。
+配置/寿命/削除familyは [catalog設計](catalog-design.md)、契約は [§1.741設計](search-thumb-parent-catalog-plan.md) を参照。
 
 クリップボードの既定保存先は、App 起動後に `clipboard-capture-destination` thread が
 process ごとに一度だけ Shell で解決し、共有 owner に結果を公開する。監視・設定画面・場所▼は

@@ -1,0 +1,107 @@
+# §1.741 実装の自動検証記録 (2026-11-09)
+
+対象は `G:\home\mimageviewer-1741` / `fix-1741-search-thumb-reuse` の未コミット差分。
+設計担当への PDF メモリ hit 後のメタ補完の確認が残っており、実装完了・独立レビュー済みとは扱わない。
+正本と残件は [設計 §16](search-thumb-parent-catalog-plan.md#16-実装メモ-2026-11-09独立レビュー前)。
+
+## 実行条件と結果
+
+Windows / 通常 feature の test profile / nextest default。全 Cargo コマンドで
+`MSBUILDDISABLENODEREUSE=1` を設定、build jobs は4。製品バイナリは起動していない。
+App テストは既存の一時 data-dir fixture、PDF は既存の fake render injection を使う。
+
+| 検査 | 結果・ログ |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core -j 4` | 最終製品コードで exit 0、20.99秒。`target/section1741-check-final.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core --features test-script -j 4` | exit 0、1分06秒。`target/section1741-check-test-script.log` |
+| 最初の focused nextest | 47/47成功、exit 0。run `a87118d7-2f27-40b7-b9d2-c8396bb94504`、`target/section1741-focused-final.log`。後続の seed 障害時対応・scope assertion 補強前 |
+| 関連回帰 nextest | 420実行 / 419成功 / 1失敗、exit 100。run `07675dea-3ac5-4f32-b9b4-67d5b59e78e3`、`target/section1741-regression.log` |
+| assertion 修正後の影響範囲 nextest | 54/54成功、exit 0、5.935秒（compile 1分51秒）。run `e08c206f-30d2-4c54-81cd-0c2b59f6a1aa`、`target/section1741-correction.log` |
+| `cargo fmt` / `cargo fmt --check` | workspace 全体で実行、exit 0 |
+| `git diff --check` | exit 0。既存の autocrlf によるソースの改行警告は差分エラーではない |
+| 文書の encoding | 更新した6設計文書は UTF-8 BOMなし / CRLF保持 |
+
+回帰1失敗は追加したテスト helper の誤った assertion。
+`collection_physical_stack_and_expansion_use_destination_key_policy` が使う展開一覧まで
+「常に Fixed」を要求していた。設計は展開一覧を MultiParent としているため、
+assertion を SingleFolder に限定した。製品コードや既存の期待キーを変えていない。
+修正後54件は関連420件の部分集合で、残る366件は同じ製品コードでの直前の成功証拠を再利用する。
+
+初回 test compile は新規 App テストの `setup_app` import 漏れ3件で exit 101（実行0件）。
+修正後に上記を実行した。`target/section1741-focused.log` はこの準備失敗のログ。
+本体 lib 全件・全 workspace gate は設計担当へ引き継ぎ、確認用 build は設計確認待ち。
+UI 文言・レイアウトは変更していないため snapshot / glyph 検査は追加実行していない。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE = '1'
+cargo nextest run -p mimageviewer --lib -j 4 -E 'test(/^thumb_loader::/) | test(/^global_search_ui::/) | test(/^catalog::tests::/) | test(/section1741|auto_aspect|idle_upgrade|collection_physical/)' --no-fail-fast
+cargo nextest run -p mimageviewer --lib -j 4 -E 'test(/section1741/) | test(/^thumb_loader::catalog_provider::tests::/) | test(/collection_physical/)' --no-fail-fast
+```
+
+## 追加したテスト (34件)
+
+以下は HEAD と関数名を比較した新規 `#[test]` の一覧。
+
+### `src/app/tests/search_thumb_1741.rs` (3)
+
+- `section1741_everything_zip_generation_reuses_parent_catalog_and_folder_selection`
+- `section1741_parent_rows_are_only_unpinned_single_file_cover_branches`
+- `section1741_storage_scope_and_root_keys_preserve_single_folder_contract`
+
+### `src/global_search_ui/thumbnail_owner_tests.rs` (8)
+
+- `section1741_nonsearch_pool_capture_never_borrows_outgoing_resources`
+- `section1741_prepare_checks_replaced_owner_and_settings`
+- `section1741_current_catalog_failure_retains_pool_identity`
+- `section1741_prepare_loads_search_catalog_instead_of_origin_catalog`
+- `section1741_prepare_catalog_failure_notifies_once_and_keeps_memory_owner`
+- `section1741_prepare_catalog_open_failure_preserves_video_pin_seed_in_memory`
+- `section1741_seed_catalog_write_failure_preserves_memory_without_retry_or_stale_seed`
+- `section1741_search_pool_adoption_leaves_sibling_context_unchanged`
+
+### `src/global_search_ui/everything/tests.rs` (2)
+
+- `section1741_search_from_folder_replaces_pool_once_for_both_producers`
+- `section1741_prepare_owner_replaced_before_ready_retries_with_current_search_pool`
+
+### `src/app/release_checks.rs` (2)
+
+- `section1741_release_search_image_observation_captures_parent_and_request_keys`
+- `section1741_release_container_pin_witness_is_explicitly_unsupported`
+
+### `src/test_script/release_checks.rs` (3)
+
+- `section1741_release_probe_checks_parent_catalog_and_request_memory_independently`
+- `section1741_release_probe_is_read_only_and_refuses_unknown_routes`
+- `section1741_release_probe_preserves_captured_catalog_admission`
+
+### `src/thumb_loader/catalog_provider.rs` (16)
+
+- `parent_generated_row_uses_observed_but_memory_uses_request_and_survives_offline`
+- `parent_inverse_lookup_observed_hit_populates_request_memory_without_rewrite`
+- `parent_legacy_memory_hit_and_cache_only_never_stat_or_migrate`
+- `parent_stat_failure_reads_request_signature_but_never_writes`
+- `parent_source_only_and_auto_no_save_do_not_create_or_read_catalogs`
+- `parent_raw_continuation_inherits_observation_without_second_stat`
+- `parent_epub_observation_uses_prepared_generation_without_source_stat`
+- `parent_clear_keeps_cache_only_ro_continuation_and_rejects_old_saves`
+- `parent_same_names_use_distinct_dbs_and_lazy_kinds_do_not_alias`
+- `parent_catalog_open_failure_keeps_source_display_and_records_notice`
+- `parent_pdf_meta_uses_admitted_writer_observed_stamp_and_password_rules`
+- `parent_pdf_meta_catchup_writes_parent_writer_without_touching_view_catalog`
+- `parent_pdf_worker_render_saves_observed_thumb_and_meta_only_to_parent`
+- `parent_epub_worker_legacy_memory_hit_then_source_only_saves_generation`
+- `parent_source_only_worker_applies_kind_suffix_to_parent_and_request_keys`
+- `parent_derived_key_mismatch_asserts_before_any_parent_write`
+
+## 既存テストの補強
+
+- `collection_physical_thumbnail_keys_match_ordinary_folder`
+- `collection_physical_load_preserves_ordinary_thumbnail_rows`
+- `ordinary_load_preserves_collection_physical_thumbnail_rows`
+
+上記 §1.731 の3件に、Collection root / PhysicalSource の storage scope と Fixed admission の検査を追加。
+同じ helper を使用する `collection_physical_stack_and_expansion_use_destination_key_policy` も再検査した。
+既存 Everything の動画 pin seed / owner freshness テストは、新しい検索 owner の契約へ更新している。
+既存 provider テストの Fixed ケースは、受付時に `RequestCatalog::Fixed` を選ぶ契約へ更新した。
+既存のキー・署名・password 安全条件の期待は保持した。

@@ -1640,6 +1640,7 @@ pub(in crate::app) struct ViewerContextBundle {
     rx: mpsc::Receiver<ThumbMsg>,
     cancel_token: Arc<AtomicBool>,
     reload_queue: Option<Arc<NotifyQueue>>,
+    thumbnail_pool_catalog: super::ThumbnailPoolCatalog,
     heavy_io_queue: Option<Arc<NotifyQueue>>,
     // worker が out-of-keep skip / 優先度計算に読む共有 atomic も per-context にする。
     // global のままだと (a) detached ロードの初期化 (0,0 store) が main の keep range を
@@ -2945,6 +2946,7 @@ impl ViewerContextBundle {
             rx,
             cancel_token: Arc::new(AtomicBool::new(false)),
             reload_queue: None,
+            thumbnail_pool_catalog: super::ThumbnailPoolCatalog::None,
             heavy_io_queue: None,
             scroll_hint: Arc::new(AtomicUsize::new(0)),
             visible_end_shared: Arc::new(AtomicUsize::new(0)),
@@ -3378,6 +3380,7 @@ impl App {
             rx,
             cancel_token,
             reload_queue,
+            thumbnail_pool_catalog,
             heavy_io_queue,
             scroll_hint,
             visible_end_shared,
@@ -3703,6 +3706,7 @@ impl App {
         swap_field!(rx);
         swap_field!(cancel_token);
         swap_field!(reload_queue);
+        swap_field!(thumbnail_pool_catalog);
         swap_field!(heavy_io_queue);
         swap_field!(scroll_hint);
         swap_field!(visible_end_shared);
@@ -4101,6 +4105,7 @@ impl App {
             rx,
             cancel_token,
             reload_queue,
+            thumbnail_pool_catalog,
             heavy_io_queue,
             scroll_hint,
             visible_end_shared,
@@ -4552,6 +4557,7 @@ impl App {
             rx,
             cancel_token,
             reload_queue,
+            thumbnail_pool_catalog,
             heavy_io_queue,
             scroll_hint,
             visible_end_shared,

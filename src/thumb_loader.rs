@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 mod catalog_provider;
-pub(crate) use catalog_provider::RequestCatalog;
+pub(crate) use catalog_provider::{ParentObservedStamp, ParentRow, RequestCatalog};
 pub use catalog_provider::{ThumbnailCatalogProvider, ThumbnailSaveTarget};
 
 // -----------------------------------------------------------------------
@@ -69,6 +69,8 @@ impl LoadRequest {
         self.pdf_render_validity = outer.pdf_render_validity.clone();
         self.priority = outer.priority;
         self.catalog_target = outer.catalog_target.clone();
+        self.parent_observed = outer.parent_observed;
+        self.parent_request_key = outer.parent_request_key.clone();
     }
 
     /// The source variant owns this distinction; idx is unused for catalog work.
@@ -1099,6 +1101,10 @@ pub(crate) fn resolve_read_after_cache_miss(
 pub struct LoadRequest {
     /// Logical owner and acceptance epoch, fixed before pin/conversion resolution.
     pub(crate) catalog_target: RequestCatalog,
+    pub(crate) parent_row: Option<ParentRow>,
+    pub(crate) parent_observed: ParentObservedStamp,
+    /// Original outer memory identity; derived requests must keep it.
+    pub(crate) parent_request_key: Option<String>,
     pub idx: usize,
     pub request_id: ThumbnailRequestId,
     /// 通常画像ならファイルパス、ZIP 画像なら ZIP ファイルのパス
@@ -2767,6 +2773,57 @@ pub fn process_load_request(
     );
 }
 
+fn observe_parent_stamp(req: &mut LoadRequest) {
+    let RequestCatalog::Parent { row, work } = &req.catalog_target else {
+        return;
+    };
+    if req.parent_observed != ParentObservedStamp::Unresolved {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let pair = if is_epub_path(&row.source) {
+        Some((req.mtime, req.file_size))
+    } else {
+        #[cfg(test)]
+        PARENT_STAT_COUNT.with(|count| count.set(count.get() + 1));
+        match std::fs::metadata(&row.source) {
+            Ok(meta) => Some(crate::catalog::file_stamp(&meta)),
+            Err(error) => {
+                crate::logger::log(format!(
+                    "parent thumbnail stat failed: {}: {error}",
+                    row.source.display()
+                ));
+                let access = work.access();
+                if access.is_admitted(work.identity().1) {
+                    access.record_cache_error(format!("parent thumbnail stat: {error}"));
+                }
+                None
+            }
+        }
+    };
+    req.parent_observed = pair.map_or(ParentObservedStamp::Unavailable, |(mtime, size)| {
+        ParentObservedStamp::Observed(mtime, size)
+    });
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "thumb",
+            "thumb_catalog_stat",
+            None,
+            req.input_seq,
+            &[
+                ("catalog_kind", serde_json::json!("parent")),
+                (
+                    "ms",
+                    serde_json::json!(started.elapsed().as_secs_f64() * 1000.0),
+                ),
+                ("observed", serde_json::json!(pair.is_some())),
+            ],
+        );
+    }
+}
+#[cfg(test)]
+thread_local! { static PARENT_STAT_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 #[allow(clippy::too_many_arguments)]
 fn process_load_request_with_provider(
     req: &mut LoadRequest,
@@ -2799,6 +2856,26 @@ fn process_load_request_with_provider(
     trace_request_begin(req, display_px);
     if let Some(key) = req.cache_key_override.as_mut() {
         *key = representative_cache_key_for_policy(key, &req.file_type_visibility);
+    }
+    if let RequestCatalog::Parent { row, .. } = &mut req.catalog_target {
+        row.row_key = representative_cache_key_for_policy(&row.row_key, &req.file_type_visibility);
+    }
+    if matches!(req.catalog_target, RequestCatalog::Parent { .. }) {
+        let key = cache_key_for_request(req)
+            .map(|key| key.into_owned())
+            .unwrap_or_default();
+        if let Some(outer_key) = &req.parent_request_key {
+            if *outer_key != key {
+                crate::logger::log(format!(
+                    "parent thumbnail derived key mismatch: {outer_key} != {key}"
+                ));
+                debug_assert_eq!(*outer_key, key, "Parent request changed its outer key");
+                send_thumb_failed(req, tx, gen_done);
+                return;
+            }
+        } else {
+            req.parent_request_key = Some(key);
+        }
     }
     if let LoadRequestSource::AudioThumbnail(audio) = &req.raw_source {
         // Display/ordering stamps (notably bookmarks/history) never participate in Audio source identity.
@@ -2864,9 +2941,12 @@ fn process_load_request_with_provider(
         gen_done.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    let resolved_catalog = provider.resolve(req, cancel);
-    let catalog = resolved_catalog.as_ref();
-    let writable_catalog = catalog.filter(|db| !db.is_read_only());
+    let initial_catalog = if provider.uses_lazy_catalog(req) {
+        None
+    } else {
+        provider.resolve(req, cancel)
+    };
+    let catalog = initial_catalog.as_ref();
     if matches!(req.raw_source, LoadRequestSource::RawHalfDeveloped { .. }) {
         let raw_source = std::mem::take(&mut req.raw_source);
         let proof = match &raw_source {
@@ -3031,14 +3111,15 @@ fn process_load_request_with_provider(
         }
     };
     let epub_read = resolved_request.as_ref().map(|(_, read)| read);
-    let req = resolved_request
+    let mut effective_request = resolved_request
         .as_ref()
-        .map_or(&*req, |(stamped, _)| stamped);
-
-    let save_target = provider.save_target(req);
+        .map_or_else(|| req.clone(), |(stamped, _)| stamped.clone());
+    let req = &mut effective_request;
     // カタログキーを共通 helper で組み立て (auto_aspect の seed フェーズと共有)。
     // None ケース (path に file_name が無い等の異常) は既存挙動に合わせて空文字 fallback。
-    let key_cow = cache_key_for_request(req).unwrap_or(std::borrow::Cow::Borrowed(""));
+    let key_cow = cache_key_for_request(req)
+        .map(|key| key.into_owned())
+        .unwrap_or_default();
     let filename: &str = key_cow.as_ref();
 
     // 編集済みページは通常 catalog より先に、source 解像度 edit-result 由来の
@@ -3138,72 +3219,78 @@ fn process_load_request_with_provider(
 
     // 段階 E: SourceOnly のときはキャッシュヒット判定を飛ばして
     // 必ず元画像からデコードする (アイドル時の画質アップグレード用)
-    if req.source_policy.allows_cache() {
-        // read ロックは最短に保つ: エントリのデータだけ clone して即解放。
-        // WebP デコード (2-3 ms) をロック外で実行することで、
-        // 他ワーカーの write (キャッシュ保存) をブロックしない。
-        let retired_cache_only = req.source_policy == LoadSourcePolicy::CacheOnly
-            && (catalog.is_some_and(|catalog| catalog.is_retired())
-                || (provider.uses_collection_source_parents(req)
-                    && req.catalog_target.is_retired()
-                    && !req.uses_memory_pin_seed()));
-        let cached = if retired_cache_only {
-            catalog
-                .and_then(|catalog| {
-                    if catalog.is_retired() {
-                        provider.resume_cache_only_lookup(req, catalog, filename, cancel)
-                    } else {
-                        // The Collection provider already performed its one RO continuation.
-                        catalog.load_one(filename)
-                    }
-                    .ok()
-                    .flatten()
-                })
+    let retired_cache_only = req.source_policy == LoadSourcePolicy::CacheOnly
+        && (catalog.is_some_and(|db| db.is_retired())
+            || (provider.uses_lazy_catalog(req)
+                && req.catalog_target.is_retired()
+                && !req.uses_memory_pin_seed()));
+    let memory = if req.source_policy.allows_cache() && !retired_cache_only {
+        cache_map.read().ok().and_then(|map| {
+            map.get(filename)
                 .filter(|entry| entry.mtime == req.mtime && entry.file_size == req.file_size)
-        } else {
-            let memory = cache_map.read().ok().and_then(|map| {
-                let entry = map.get(filename)?;
-                if entry.mtime == req.mtime && entry.file_size == req.file_size {
-                    Some(entry.clone())
-                } else {
+                .cloned()
+        })
+    } else {
+        None
+    };
+    if memory.is_none() && req.source_policy.allows_source() {
+        observe_parent_stamp(req);
+    }
+    let resolved_catalog = if memory.is_none() {
+        provider.resolve(req, cancel)
+    } else {
+        None
+    };
+    let (lookup_key, lookup_mtime, lookup_size) = provider.lookup_identity(req, filename);
+    if req.source_policy.allows_cache() {
+        let cached = memory.or_else(|| {
+            let db = resolved_catalog.as_ref()?;
+            if !provider.uses_lazy_catalog(req) && !retired_cache_only {
+                return None;
+            }
+            let started = std::time::Instant::now();
+            let entry = if retired_cache_only && db.is_retired() {
+                provider.resume_cache_only_lookup(req, db, &lookup_key, cancel)
+            } else {
+                db.load_one(&lookup_key)
+            };
+            let entry = match entry {
+                Ok(entry) => entry
+                    .filter(|entry| entry.mtime == lookup_mtime && entry.file_size == lookup_size),
+                Err(error) => {
+                    crate::logger::log(format!("thumbnail catalog lookup failed: {error}"));
+                    db.record_cache_error(format!("thumbnail catalog lookup: {error}"));
                     None
                 }
-            });
-            memory.or_else(|| {
-                if !provider.uses_collection_source_parents(req) {
-                    return None;
-                }
-                let started = std::time::Instant::now();
-                let entry = catalog
-                    .and_then(|db| match db.load_one(filename) {
-                        Ok(entry) => entry,
-                        Err(error) => {
-                            crate::logger::log(format!(
-                                "collection thumbnail lookup failed: {error}"
-                            ));
-                            db.record_cache_error(format!("collection thumbnail lookup: {error}"));
-                            None
-                        }
-                    })
-                    .filter(|entry| entry.mtime == req.mtime && entry.file_size == req.file_size);
-                if crate::perf::is_enabled() {
-                    crate::perf::event(
-                        "collection",
-                        "thumb_catalog_lookup",
-                        None,
-                        req.input_seq,
-                        &[
-                            (
-                                "ms",
-                                serde_json::json!(started.elapsed().as_secs_f64() * 1000.0),
-                            ),
-                            ("hit", serde_json::json!(entry.is_some())),
-                        ],
-                    );
-                }
-                entry
-            })
-        };
+            };
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "thumb",
+                    "thumb_catalog_lookup",
+                    None,
+                    req.input_seq,
+                    &[
+                        (
+                            "catalog_kind",
+                            serde_json::json!(if matches!(
+                                req.catalog_target,
+                                RequestCatalog::Parent { .. }
+                            ) {
+                                "parent"
+                            } else {
+                                "collection"
+                            }),
+                        ),
+                        (
+                            "ms",
+                            serde_json::json!(started.elapsed().as_secs_f64() * 1000.0),
+                        ),
+                        ("hit", serde_json::json!(entry.is_some())),
+                    ],
+                );
+            }
+            entry
+        });
         if let Some(entry) = cached.filter(|entry| folder_cached_row_usable(req, entry, pin_db)) {
             let ci = crate::catalog::decode_thumb_to_color_image(&entry.jpeg_data).map(|image| {
                 match pinned_page_adjustment.as_ref() {
@@ -3211,14 +3298,22 @@ fn process_load_request_with_provider(
                     None => image,
                 }
             });
-            if provider.uses_collection_source_parents(req) && ci.is_none() {
+            if provider.uses_lazy_catalog(req) && ci.is_none() {
                 crate::logger::log(format!(
                     "collection thumbnail: invalid cached WebP: {filename}"
                 ));
-                if let Some(db) = catalog {
+                if let Some(db) = resolved_catalog.as_ref() {
                     db.record_cache_error("collection thumbnail: invalid cached WebP");
                 }
             } else {
+                if matches!(req.catalog_target, RequestCatalog::Parent { .. }) {
+                    let mut memory_entry = entry.clone();
+                    memory_entry.mtime = req.mtime;
+                    memory_entry.file_size = req.file_size;
+                    if let Ok(mut map) = cache_map.write() {
+                        map.insert(filename.to_owned(), memory_entry);
+                    }
+                }
                 let cache_ms = req_t0.elapsed().as_secs_f64() * 1000.0;
                 // 通常 cache hit: 元ソースからの idle quality-upgrade 対象
                 // source_dims はカタログ由来 (旧バージョンで作成された
@@ -3263,11 +3358,31 @@ fn process_load_request_with_provider(
                 // サムネ済みユーザーがアップグレードした場合、初回 Enter で cache miss
                 // になり 800ms 級の待ちが入る。サムネを表示した直後に裏で enumerate して
                 // pdf_meta を埋めることで、その PDF の初回 Enter から瞬時にする。
-                maybe_spawn_pdf_meta_catchup(req, writable_catalog);
+                if req.pdf_page.is_some()
+                    && !provider.uses_collection_source_parents(req)
+                    && req
+                        .cache_key_override
+                        .as_deref()
+                        .is_some_and(|key| key.starts_with(CACHE_KEY_PDF))
+                {
+                    let catchup_catalog = provider.save_target(req).open_if(true, false);
+                    let catchup_arc = match catchup_catalog {
+                        Some(catalog_provider::SaveCatalog::Parent(db)) => Some(db),
+                        Some(catalog_provider::SaveCatalog::Fixed(_)) => initial_catalog.clone(),
+                        None => None,
+                    };
+                    let mut catchup_request = req.clone();
+                    if let ParentObservedStamp::Observed(mtime, size) = req.parent_observed {
+                        catchup_request.mtime = mtime;
+                        catchup_request.file_size = size;
+                    }
+                    maybe_spawn_pdf_meta_catchup(&catchup_request, catchup_arc.as_ref());
+                }
                 return;
             }
         }
     }
+    let save_target = provider.save_target(req);
 
     // CacheOnly miss completes both worker and image terminals without opening the source.
     // The UI owner retires this request and retains only archive-judgement demand admission.
@@ -4120,6 +4235,21 @@ fn process_neighbor_prefetch(
 // ── enqueue API ──
 
 /// WebP cache hit 経由の catch-up enqueue。`process_load_request` の cache hit 分岐から呼ばれる。
+fn save_rendered_pdf_meta(
+    catalog: &crate::catalog::CatalogDb,
+    filename: &str,
+    mtime: i64,
+    file_size: i64,
+    page_count: u32,
+    password: Option<&str>,
+) -> rusqlite::Result<()> {
+    if password.is_none() {
+        catalog.set_pdf_meta_safe(filename, mtime, file_size, page_count)
+    } else {
+        catalog.set_pdf_meta_thumb(filename, mtime, file_size, page_count)
+    }
+}
+
 fn maybe_spawn_pdf_meta_catchup(
     req: &LoadRequest,
     catalog: Option<&Arc<crate::catalog::CatalogDb>>,
@@ -4708,6 +4838,20 @@ fn resolve_folder_thumb_image(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn parent_cached_selection_for_test(folder: &Path, cache_dir: &Path) -> Option<String> {
+    match resolve_folder_thumb_image_with_cache_dir(
+        folder,
+        crate::settings::SortOrder::Numeric,
+        3,
+        None,
+        cache_dir,
+    ) {
+        Some(FolderThumbResolution::CachedPinned(cached)) => Some(cached.cache_key),
+        _ => None,
+    }
+}
+
 fn resolve_folder_thumb_image_with_cache_dir(
     folder: &Path,
     sort: crate::settings::SortOrder,
@@ -5286,6 +5430,7 @@ pub fn load_one_cached(
             (n, n)
         }
     };
+    let (save_name, save_mtime, save_file_size) = save_target.row_identity(name, mtime, file_size);
     let t = std::time::Instant::now();
 
     // ── デコード経路 ──
@@ -5305,6 +5450,7 @@ pub fn load_one_cached(
     // PDF thumbnail の整数丸め後 raster ではなく、PDFium が読んだ page box の
     // 縦横比を catalog に残す。値は 1/1000 point の固定小数点レイアウト寸法。
     let mut pdf_layout_dims: Option<(u32, u32)> = None;
+    let mut parent_pdf_page_count: Option<u32> = None;
     let mut byte_orientation: u16 = 1;
     let mut render_ms: Option<f64> = None;
     let has_verified_source = verified_source_bytes.is_some();
@@ -5536,6 +5682,11 @@ pub fn load_one_cached(
         render_result
             .map(|res| {
                 pdf_layout_dims = res.page_size_points.catalog_layout_dims();
+                if save_target.is_parent()
+                    && cache_key_override.is_some_and(|key| key.starts_with(CACHE_KEY_PDF))
+                {
+                    parent_pdf_page_count = Some(res.page_count);
+                }
                 // C-thumb (v1.0.0): 親フォルダ内の PDF サムネ render の場合、ついでに
                 // pdf_meta テーブルへページ数を書き込む。`cache_key_override` が
                 // "pdfthumb:" 始まりのときが「親フォルダ catalog 経路」の signature。
@@ -5554,11 +5705,14 @@ pub fn load_one_cached(
                 if let (Some(cat), Some(key)) = (catalog, cache_key_override) {
                     if key.starts_with(CACHE_KEY_PDF) {
                         if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                            let write_result = if pdf_password.is_none() {
-                                cat.set_pdf_meta_safe(filename, mtime, file_size, res.page_count)
-                            } else {
-                                cat.set_pdf_meta_thumb(filename, mtime, file_size, res.page_count)
-                            };
+                            let write_result = save_rendered_pdf_meta(
+                                cat,
+                                filename,
+                                mtime,
+                                file_size,
+                                res.page_count,
+                                pdf_password,
+                            );
                             if let Err(e) = write_result {
                                 crate::logger::log(format!(
                                     "thumb_loader: pdf_meta write failed for {filename}: {e}"
@@ -5995,6 +6149,24 @@ pub fn load_one_cached(
 
     if let Some(save_catalog) = save_catalog {
         let cat = save_catalog.as_ref();
+        if let Some(page_count) = parent_pdf_page_count {
+            if let Some(filename) = path.file_name().and_then(|name| name.to_str()) {
+                let result = save_rendered_pdf_meta(
+                    cat,
+                    filename,
+                    save_mtime,
+                    save_file_size,
+                    page_count,
+                    pdf_password,
+                );
+                if let Err(error) = result {
+                    crate::logger::log(format!(
+                        "thumb_loader: parent pdf_meta write failed for {filename}: {error}"
+                    ));
+                    cat.record_cache_error(format!("parent pdf_meta write: {error}"));
+                }
+            }
+        }
         if row_kind.save_dims_only(cache_decision) {
             let cache_save_started = std::time::Instant::now();
             if let Err(error) = cat.save_page_dims(name, mtime, file_size, source_dims, layout_dims)
@@ -6022,9 +6194,9 @@ pub fn load_one_cached(
                     let encode_ms = cache_encode_ms;
                     let cache_save_started = std::time::Instant::now();
                     let save_result = cat.save_with_folder_proof(
-                        name,
-                        mtime,
-                        file_size,
+                        save_name,
+                        save_mtime,
+                        save_file_size,
                         w,
                         h,
                         source_dims,
@@ -10384,7 +10556,7 @@ mod tests {
             folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
             ..Default::default()
         };
-        if collection_scope {
+        if collection_scope && collection {
             req.catalog_target = RequestCatalog::collection(
                 &fixture.root,
                 crate::catalog::CatalogWork::capture(&fixture.cache_dir),
@@ -10393,7 +10565,7 @@ mod tests {
         let provider = if collection {
             ThumbnailCatalogProvider::collection()
         } else {
-            ThumbnailCatalogProvider::FixedCatalog(Some(Arc::new(
+            ThumbnailCatalogProvider::fixed(Some(Arc::new(
                 crate::catalog::CatalogDb::open(&fixture.cache_dir, fixture.root.parent().unwrap())
                     .unwrap(),
             )))
@@ -10475,7 +10647,7 @@ mod tests {
             let revisit = run(
                 &mut req,
                 &reloaded_map,
-                ThumbnailCatalogProvider::FixedCatalog(Some(reopened)),
+                ThumbnailCatalogProvider::fixed(Some(reopened)),
             );
             assert_eq!(
                 revisit.pixels().unwrap().origin,
