@@ -5,6 +5,9 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 mod barrier;
+mod binding;
+pub(super) use binding::PageTurnUnitBinding;
+use binding::{PageTurnLayoutBinding, same_page_turn_view};
 mod cancel_diagnostics;
 #[cfg(test)]
 mod clock_tests;
@@ -312,7 +315,7 @@ pub(super) struct SubmittedUnitReceipt {
 #[derive(Clone)]
 enum SubmittedContentBinding {
     Ordinary,
-    Presentation(Vec<PageTurnContent>),
+    Presentation(PageTurnUnitBinding),
 }
 
 type ReceiptPage = (SpreadPageOccurrence, egui::TextureId, egui::TextureId, f32);
@@ -365,20 +368,17 @@ impl SubmittedUnitReceipt {
     }
 
     pub(super) fn content_matches(&self, app: &App) -> bool {
-        let SubmittedContentBinding::Presentation(content) = &self.binding else {
+        let SubmittedContentBinding::Presentation(binding) = &self.binding else {
             return false;
         };
-        content.len() == self.pages.as_slice().len()
-            && content
-                .iter()
-                .zip(self.pages.as_slice())
-                .all(|(saved, (page, _, _, _))| *saved == app.page_turn_content(page.idx))
+        binding.matches_current(app) && binding.prepared_matches_view(app)
     }
 
-    fn capture_binding(&mut self, unit: &PaintedUnit) {
-        if unit.content.len() == self.pages.as_slice().len()
-            && unit.pages.len() == self.pages.as_slice().len()
-            && unit.pages.iter().zip(self.pages.as_slice()).all(
+    fn capture_binding(&mut self, binding: PageTurnUnitBinding, pages: &[PreparedPagedPage]) {
+        if binding.matches_prepared_occurrences(pages)
+            && binding.content.len() == self.pages.as_slice().len()
+            && pages.len() == self.pages.as_slice().len()
+            && pages.iter().zip(self.pages.as_slice()).all(
                 |(page, (occurrence, source, paint, _))| {
                     page.occurrence == *occurrence
                         && page.resource.source_texture_id() == *source
@@ -386,7 +386,7 @@ impl SubmittedUnitReceipt {
                 },
             )
         {
-            self.binding = SubmittedContentBinding::Presentation(unit.content.clone());
+            self.binding = SubmittedContentBinding::Presentation(binding);
         }
     }
 
@@ -421,22 +421,24 @@ impl SubmittedUnitReceipt {
     fn matches_flat_pages(
         &self,
         destination: PresentationDestination,
-        mut pages: impl ExactSizeIterator<Item = FlatPageIdentity>,
+        pages: impl ExactSizeIterator<Item = FlatPageIdentity>,
     ) -> bool {
         !self.curl
             && self.destination == destination
             && self.pages.as_slice().len() == pages.len()
-            && pages.all(|(occurrence, source, paint)| {
-                self.pages
-                    .as_slice()
-                    .iter()
-                    .any(|(actual, actual_source, actual_paint, _)| {
-                        occurrence == *actual && source == *actual_source && paint == *actual_paint
-                    })
-            })
+            && self.pages.as_slice().iter().zip(pages).all(
+                |((actual, actual_source, actual_paint, _), (occurrence, source, paint))| {
+                    occurrence == *actual && source == *actual_source && paint == *actual_paint
+                },
+            )
     }
 
     fn matches_flat_unit(&self, unit: &PaintedUnit) -> bool {
+        matches!(&self.binding, SubmittedContentBinding::Presentation(binding) if *binding == unit.binding)
+            && self.matches_flat_materials(unit)
+    }
+
+    fn matches_flat_materials(&self, unit: &PaintedUnit) -> bool {
         self.matches_flat_pages(
             unit.destination,
             unit.pages.iter().map(|page| {
@@ -469,7 +471,28 @@ impl SubmittedUnitReceipt {
             AcceptanceEvidence::Deferred(accepted) => Some(accepted.clone()),
         }
     }
-    pub(super) fn rebind(&mut self, occurrences: &[SpreadPageOccurrence]) {
+    pub(super) fn rebind(
+        &mut self,
+        occurrences: &[SpreadPageOccurrence],
+        current: impl FnOnce() -> Option<PageTurnUnitBinding>,
+    ) {
+        if !self
+            .pages
+            .as_slice()
+            .iter()
+            .map(|p| p.0)
+            .eq(occurrences.iter().copied())
+        {
+            self.binding = match &self.binding {
+                SubmittedContentBinding::Presentation(saved) => current()
+                    .and_then(|current| saved.reanchored(current, occurrences))
+                    .map_or(
+                        SubmittedContentBinding::Ordinary,
+                        SubmittedContentBinding::Presentation,
+                    ),
+                _ => SubmittedContentBinding::Ordinary,
+            };
+        }
         for (page, _, _, _) in self.pages.as_mut_slice() {
             if let Some(occurrence) = occurrences
                 .iter()
@@ -798,6 +821,11 @@ impl egui::Plugin for SubmissionPlugin {
 
 fn same_submitted_pages(a: &SubmittedUnitReceipt, b: &SubmittedUnitReceipt) -> bool {
     !b.curl
+        && match (&a.binding, &b.binding) {
+            (SubmittedContentBinding::Ordinary, SubmittedContentBinding::Ordinary) => true,
+            (SubmittedContentBinding::Presentation(a), SubmittedContentBinding::Presentation(b)) => a == b,
+            _ => false,
+        }
         && a.matches_flat_pages(b.destination, b.pages.as_slice().iter().map(|(o, s, p, _)| (*o, *s, *p)))
         // Replaying an output also preserves its exact screen order.
         && a.pages.as_slice().iter().map(|p| p.0).eq(b.pages.as_slice().iter().map(|p| p.0))
@@ -816,17 +844,19 @@ fn cancel_pending_submission(pending: PendingSubmission, reason: &'static str) {
 
 #[derive(Clone)]
 struct PaintedUnit {
-    destination: PresentationDestination,
-    items: u64,
-    layout: Arc<Vec<SpreadDisplayUnit>>,
-    mode: SpreadMode,
-    reading_rtl: bool,
-    slice: crate::page_split::PageSlice,
+    binding: PageTurnUnitBinding,
     pages: Vec<PreparedPagedPage>,
     white: Option<(egui::Rect, egui::Rect)>,
     reserved_bytes: Arc<AtomicU64>,
     evidence: AcceptanceEvidence,
-    content: Vec<PageTurnContent>,
+}
+
+// These read-only projections all come from the single immutable binding owner.
+impl std::ops::Deref for PaintedUnit {
+    type Target = PageTurnUnitBinding;
+    fn deref(&self) -> &Self::Target {
+        &self.binding
+    }
 }
 
 /// Quality publication changes source_gen, not the document edits or viewing policy.
@@ -837,6 +867,8 @@ struct PageTurnContent {
     params: crate::adjustment::AdjustParams,
     comic_generation: u64,
     gap: u32,
+    rotation: crate::rotation_db::Rotation,
+    free_rotation_rad: f32,
 }
 
 #[derive(Clone)]
@@ -845,10 +877,9 @@ struct AcceptedSource {
     resource: crate::gpu_lanczos::FullscreenPaintPayload,
     source_mipmapped: bool,
     quality: &'static str,
-    content: PageTurnContent,
 }
 
-struct AcceptedSources(Vec<AcceptedSource>);
+struct AcceptedSources(Vec<AcceptedSource>, PageTurnUnitBinding);
 
 impl AcceptedSources {
     fn diagnostics(&self) -> serde_json::Value {
@@ -924,32 +955,9 @@ impl PaintedUnit {
         }
     }
     fn same_material_and_geometry(&self, other: &Self) -> bool {
-        self.destination == other.destination
-            && self.items == other.items
-            && Arc::ptr_eq(&self.layout, &other.layout)
-            && self.mode == other.mode
-            && self.reading_rtl == other.reading_rtl
-            && self.slice == other.slice
-            && self.white == other.white
-            && self.pages.len() == other.pages.len()
-            && self.pages.iter().zip(&other.pages).all(|(a, b)| {
-                a.occurrence == b.occurrence
-                    && a.crop == b.crop
-                    && a.resource.source_texture_id() == b.resource.source_texture_id()
-                    && a.resource.paint_texture_id() == b.resource.paint_texture_id()
-                    && a.resource.source_generation() == b.resource.source_generation()
-                    && a.resource.visible_source_uv_rect() == b.resource.visible_source_uv_rect()
-                    && a.resource.source_coverage() == b.resource.source_coverage()
-                    && a.transform.paint_quad() == b.transform.paint_quad()
-                    && a.transform.uv_rect == b.transform.uv_rect
-                    && a.transform.fit_input == b.transform.fit_input
-                    && a.transform.fit_scale_limits == b.transform.fit_scale_limits
-                    && a.transform.pixels_per_point == b.transform.pixels_per_point
-                    && a.spine == b.spine
-                    && a.painter.clip_rect() == b.painter.clip_rect()
-                    && same_underlay(&a.underlay, &b.underlay)
-            })
+        self.binding.same_prepared_output(&other.binding)
     }
+
     fn retained_bytes(&self) -> u64 {
         let mut accountant = crate::vram_budget::VramAccountant::default();
         self.account(&mut accountant);
@@ -1614,7 +1622,7 @@ impl App {
             && receipt.pass == ctx.cumulative_pass_nr()
             && receipt.destination == unit.destination
             && self.page_turn_unit_matches_current(unit)
-            && *content == unit.content
+            && *content == unit.binding
             && receipt.content_matches(self)
             && unit.pages.len() == receipt.pages().len()
             && unit.pages.len() == sources.pages.len()
@@ -1639,8 +1647,8 @@ impl App {
             })
     }
 
-    fn page_turn_presented_current_unit(&self) -> Option<&PaintedUnit> {
-        let unit = match &self.page_turn_presentation.state {
+    fn page_turn_presented_unit(&self) -> Option<&PaintedUnit> {
+        Some(match &self.page_turn_presentation.state {
             PresentationState::Flat(unit) if unit.evidence.was_accepted() => unit,
             PresentationState::Turning {
                 incoming,
@@ -1651,21 +1659,26 @@ impl App {
                 incoming
             }
             _ => return None,
-        };
+        })
+    }
+
+    /// Evidence admission precedes topology resolution. It does not authorize
+    /// work until the same unit's current semantic binding is checked as well.
+    pub(super) fn page_turn_has_output_evidence(&self) -> bool {
+        self.page_turn_presented_unit().is_some()
+    }
+
+    fn page_turn_presented_current_unit(&self) -> Option<&PaintedUnit> {
+        let unit = self.page_turn_presented_unit()?;
         self.page_turn_unit_matches_current(unit).then_some(unit)
     }
 
     fn page_turn_unit_matches_current(&self, unit: &PaintedUnit) -> bool {
-        unit.destination == self.page_turn_destination()
-            && unit.items == self.items_generation
-            && unit.mode == self.spread_mode
-            && unit.slice == self.fullscreen_page_slice
-            && Arc::ptr_eq(&unit.layout, &self.spread_display_units_cache.units)
-            && self.fullscreen_idx.is_some_and(|idx| {
-                unit.pages
-                    .iter()
-                    .any(|page| page.occurrence.navigation_anchor_idx == idx)
-            })
+        // This is proof that this unit has been presented. Current view inputs
+        // belong to prepare/Turning comparisons and each actual output receipt.
+        self.fullscreen_idx == Some(unit.binding.layout.anchor)
+            && unit.binding.matches_prepared_occurrences(&unit.pages)
+            && unit.binding.matches_current(self)
     }
 
     /// Accepted output evidence is independent of current cache quality. Match
@@ -1681,10 +1694,7 @@ impl App {
             && receipt.content_matches(self)
             && receipt.destination() == self.page_turn_destination()
             && unit.destination == receipt.destination()
-            && unit.items == self.items_generation
-            && unit.mode == self.spread_mode
-            && unit.slice == self.fullscreen_page_slice
-            && Arc::ptr_eq(&unit.layout, &self.spread_display_units_cache.units)
+            && unit.binding.matches_current(self)
             && receipt.matches_flat_unit(unit)
     }
 
@@ -1989,6 +1999,13 @@ impl App {
             params: self.effective_params(idx).clone(),
             comic_generation: self.comic_generation,
             gap: self.settings.spread_page_gap_px,
+            rotation: self
+                .rotation_cache
+                .get(&idx)
+                .copied()
+                .or_else(|| self.prepared_composed_rotation(idx))
+                .unwrap_or(crate::rotation_db::Rotation::None),
+            free_rotation_rad: self.fs_free_rotation,
         }
     }
 
@@ -2001,54 +2018,33 @@ impl App {
         idx: usize,
         legacy: crate::export_crop::CropSettings,
     ) -> Option<crate::export_crop::CropSettings> {
-        let destination = self.page_turn_destination();
-        let matches_unit = |unit: &PaintedUnit| {
-            unit.destination == destination
-                && unit.items == self.items_generation
-                && unit.mode == self.spread_mode
-                && unit.reading_rtl
-                    == (self
-                        .spread_mode
-                        .canonical_reading_direction()
-                        .unwrap_or(self.reading_direction)
-                        == ReadingDirection::Rtl)
-                && unit.slice == self.fullscreen_page_slice
-                && Arc::ptr_eq(&unit.layout, &self.spread_display_units_cache.units)
-        };
-        let content = match &self.page_turn_presentation.state {
-            PresentationState::Offered { outgoing, offer }
-                if matches_unit(outgoing) && offer.fact.destination == destination =>
+        let binding = match &self.page_turn_presentation.state {
+            PresentationState::Offered { offer, .. }
+                if offer.fact.destination == self.page_turn_destination() =>
             {
-                &offer
-                    .ready_sources
-                    .0
-                    .iter()
-                    .find(|source| source.occurrence.idx == idx)?
-                    .content
+                &offer.ready_sources.1
             }
             PresentationState::Turning { incoming, .. }
-            | PresentationState::Completing { incoming, .. }
-                if matches_unit(incoming) =>
-            {
-                incoming
-                    .pages
-                    .iter()
-                    .zip(&incoming.content)
-                    .find(|(page, _)| page.occurrence.idx == idx)?
-                    .1
-            }
+            | PresentationState::Completing { incoming, .. } => &incoming.binding,
             _ => return None,
         };
+        // This projection reads raw edits only. Resolving crop/content here would recurse.
+        if !binding.matches_current(self) {
+            return None;
+        }
+        let pages = binding
+            .layout
+            .composition
+            .pages_in_screen_order(binding.mode);
+        let content = pages
+            .iter()
+            .zip(&binding.content)
+            .find(|(page, _)| page.idx == idx)?
+            .1;
         let crop = content.crop?;
-        let mut edit = self.current_edit_result_key(idx);
-        edit.source_gen = 0;
         (legacy.valid_source_size().is_none()
             && legacy.rect == crop.rect
-            && legacy.aspect_mode == crop.aspect_mode
-            && content.edit == edit
-            && content.params == *self.effective_params(idx)
-            && content.comic_generation == self.comic_generation
-            && content.gap == self.settings.spread_page_gap_px)
+            && legacy.aspect_mode == crop.aspect_mode)
             .then_some(crop)
     }
 
@@ -2204,34 +2200,24 @@ impl App {
         }
         match &self.page_turn_presentation.state {
             PresentationState::Offered { offer, .. }
-                if offer.fact.destination == self.page_turn_destination() =>
+                if offer.ready_sources.1.matches_current(self) =>
             {
                 offer
                     .ready_sources
                     .0
                     .iter()
-                    .find(|source| {
-                        source.occurrence.idx == idx
-                            && source.content == self.page_turn_content(idx)
-                    })
+                    .find(|source| source.occurrence.idx == idx)
                     .map(|source| source.resource.clone())
             }
             PresentationState::Turning { incoming, .. }
             | PresentationState::Completing { incoming, .. }
-                if incoming.destination == self.page_turn_destination()
-                    && incoming.items == self.items_generation
-                    && incoming.mode == self.spread_mode
-                    && incoming.slice == self.fullscreen_page_slice
-                    && Arc::ptr_eq(&incoming.layout, &self.spread_display_units_cache.units) =>
+                if incoming.binding.matches_current(self) =>
             {
                 incoming
                     .pages
                     .iter()
-                    .zip(&incoming.content)
-                    .find(|(page, content)| {
-                        page.occurrence.idx == idx && **content == self.page_turn_content(idx)
-                    })
-                    .map(|(page, _)| page.resource.clone())
+                    .find(|page| page.occurrence.idx == idx)
+                    .map(|page| page.resource.clone())
             }
             _ => None,
         }
@@ -2279,17 +2265,10 @@ impl App {
         let b = transform;
         // Only raster quality/layout metadata may change during the frozen turn.
         // A real viewport/view change remains ordinary cancellation/rebinding.
-        if a.viewport_rect != b.viewport_rect
-            || a.placement != b.placement
-            || a.pixels_per_point != b.pixels_per_point
-            || a.rotation != b.rotation
-            || a.free_rotation_rad != b.free_rotation_rad
-            || a.content_bbox != b.content_bbox
-            || a.fit_mode != b.fit_mode
-            || a.fit_scale_limits != b.fit_scale_limits
+        if !same_page_turn_view(a, b)
+            || !incoming.binding.matches_prepare_policy(self)
             || old.painter.clip_rect() != painter.clip_rect()
             || !same_underlay(&old.underlay, underlay)
-            || !same_fit_policy(a.fit_input, b.fit_input)
         {
             return None;
         }
@@ -2519,10 +2498,12 @@ impl App {
                 resource,
                 source_mipmapped,
                 quality,
-                content: self.page_turn_content(occurrence.idx),
             });
         }
-        let ready_sources = Arc::new(AcceptedSources(ready_sources));
+        let Some(binding) = self.page_turn_unit_binding(target) else {
+            return;
+        };
+        let ready_sources = Arc::new(AcceptedSources(ready_sources, binding));
         emit(
             &fact,
             "opportunity",
@@ -2735,6 +2716,7 @@ impl App {
             pages.len() <= 2,
             "normal paged units have at most two real occurrences"
         );
+        self.resolve_page_turn_layout_before_lookup();
         self.refresh_page_turn_completion_pages(ctx, pages, white);
         // OFF does no effect clock, snapshot/inventory work, geometry projection or input diagnostics.
         if !self.settings.page_turn_animation_enabled {
@@ -2748,8 +2730,11 @@ impl App {
             let mut receipt = flat_receipt(self.page_turn_destination(), ctx, pages, !completing);
             if let PresentationState::Completing { incoming, .. } =
                 &self.page_turn_presentation.state
+                && receipt.matches_flat_materials(incoming)
+                && let Some(binding) =
+                    self.page_turn_unit_binding(pages[0].occurrence.navigation_anchor_idx)
             {
-                receipt.capture_binding(incoming);
+                receipt.capture_binding(binding.with_prepared(pages, white), pages);
             }
             let event = self.page_turn_completion_event(&receipt);
             self.record_page_turn_completion_flat(&receipt);
@@ -2770,10 +2755,15 @@ impl App {
                 paint_white_companion(&pages[0].painter, rect, clip);
             }
             let mut receipt = flat_receipt(self.page_turn_destination(), ctx, pages, false);
+            // Preview/nonfinal/passthrough output keeps its ordinary source policy.
+            // Only retained presentation materials can carry completion proof here.
             if let PresentationState::Completing { incoming, .. } =
                 &self.page_turn_presentation.state
+                && receipt.matches_flat_materials(incoming)
+                && let Some(binding) =
+                    self.page_turn_unit_binding(pages[0].occurrence.navigation_anchor_idx)
             {
-                receipt.capture_binding(incoming);
+                receipt.capture_binding(binding.with_prepared(pages, white), pages);
             }
             let event = self.page_turn_completion_event(&receipt);
             self.record_page_turn_completion_flat(&receipt);
@@ -2781,17 +2771,11 @@ impl App {
             return Some(receipt);
         }
         let mut receipt = flat_receipt(self.page_turn_destination(), ctx, pages, false);
+        let binding = self
+            .page_turn_unit_binding(pages[0].occurrence.navigation_anchor_idx)?
+            .with_prepared(pages, white);
         let unit = Arc::new(PaintedUnit {
-            destination: self.page_turn_destination(),
-            items: self.items_generation,
-            layout: Arc::clone(&self.spread_display_units_cache.units),
-            mode: self.spread_mode,
-            reading_rtl: self
-                .spread_mode
-                .canonical_reading_direction()
-                .unwrap_or(self.reading_direction)
-                == ReadingDirection::Rtl,
-            slice: self.fullscreen_page_slice,
+            binding,
             pages: pages
                 .iter()
                 .map(|page| PreparedPagedPage {
@@ -2804,10 +2788,6 @@ impl App {
             white,
             reserved_bytes: Arc::new(AtomicU64::new(0)),
             evidence: receipt.accepted.clone(),
-            content: pages
-                .iter()
-                .map(|p| self.page_turn_content(p.occurrence.idx))
-                .collect(),
         });
         let old = std::mem::replace(
             &mut self.page_turn_presentation.state,
@@ -2825,7 +2805,11 @@ impl App {
                     && outgoing.mode == unit.mode
                     && outgoing.reading_rtl == unit.reading_rtl
                     && outgoing.slice == unit.slice
-                    && Arc::ptr_eq(&outgoing.layout, &unit.layout)
+                    && outgoing.binding.matches_current(self)
+                    && outgoing.binding.matches_prepare_policy(self)
+                    && outgoing.binding.matches_viewport_geometry(ctx)
+                    && offer.ready_sources.1.matches_prepare_policy(self)
+                    && offer.ready_sources.1.same_unit_content(&unit.binding)
                     && stage_one_shape_reason(
                         outgoing.mode,
                         outgoing.pages.iter().map(|page| page.occurrence),
@@ -2844,17 +2828,12 @@ impl App {
                         .0
                         .iter()
                         .zip(&unit.pages)
-                        .zip(&unit.content)
-                        .all(|((source, p), content)| {
+                        .all(|(source, p)| {
                             source.occurrence == p.occurrence
                                 && source.resource.source_texture_id()
                                     == p.resource.source_texture_id()
                                 && source.resource.source_generation()
                                     == p.resource.source_generation()
-                                // Content was resolved while the presentation owner
-                                // was installed. Do not resolve it again after taking
-                                // that owner out for this transition.
-                                && source.content == *content
                         });
                 if matching {
                     match prepare_leaf(&outgoing, &unit, offer.forward) {
@@ -2874,6 +2853,7 @@ impl App {
                                         ..source.clone()
                                     })
                                     .collect(),
+                                unit.binding.clone(),
                             ));
                             self.page_turn_leases
                                 .sources
@@ -2947,7 +2927,11 @@ impl App {
                 projection,
                 clock,
             } => {
-                if incoming.content == unit.content && incoming.same_material_and_geometry(&unit) {
+                if outgoing.binding.matches_current(self)
+                    && outgoing.binding.matches_unit_view(self)
+                    && incoming.content == unit.content
+                    && incoming.same_material_and_geometry(&unit)
+                {
                     PresentationState::Turning {
                         outgoing,
                         incoming,
@@ -3181,12 +3165,9 @@ impl App {
                 retained,
             );
         }
-        match &final_state {
-            PresentationState::Flat(unit)
-            | PresentationState::Turning { incoming: unit, .. }
-            | PresentationState::Completing { incoming: unit, .. } => receipt.capture_binding(unit),
-            _ => {}
-        }
+        // An adopted completion can retain its old output while a new draw runs.
+        // Capture this submission's geometry, never the retained completion's pose.
+        receipt.capture_binding(unit.binding.clone(), &unit.pages);
         self.page_turn_presentation.state = final_state;
         if !curl {
             if submission_event.is_none() {
@@ -3250,20 +3231,18 @@ impl App {
         else {
             return;
         };
+        // Adoption completes this flat obligation. As in the base, a later resize
+        // does not reopen it before the pre-draw continuation commit (design r5).
         if matches!(completion, FlatCompletion::Submitted(receipt) if receipt.was_accepted()) {
             return;
         }
-        if incoming.destination != self.page_turn_destination()
-            || incoming.items != self.items_generation
-            || incoming.mode != self.spread_mode
-            || incoming.slice != self.fullscreen_page_slice
-            || !Arc::ptr_eq(&incoming.layout, &self.spread_display_units_cache.units)
+        let Some(binding) = self.page_turn_unit_binding(incoming.binding.layout.anchor) else {
+            self.page_turn_presentation
+                .deactivate("completion_binding_unavailable");
+            return;
+        };
+        if !incoming.binding.same_unit_content(&binding)
             || incoming.pages.len() != pages.len()
-            || incoming
-                .pages
-                .iter()
-                .zip(&incoming.content)
-                .any(|(page, content)| *content != self.page_turn_content(page.occurrence.idx))
             || !incoming.pages.iter().zip(pages).all(|(old, new)| {
                 old.occurrence == new.occurrence
                     && old.resource.source_texture_id() == new.resource.source_texture_id()
@@ -3275,6 +3254,7 @@ impl App {
             return;
         }
         let fresh = Arc::new(PaintedUnit {
+            binding: binding.with_prepared(pages, white),
             pages: pages
                 .iter()
                 .map(|page| PreparedPagedPage {
@@ -3796,16 +3776,13 @@ fn canonical_unit(
                 ResolvedDisplayPlacement::Normal { .. } => (SingletonSpreadPlacement::Center, 0.0),
             };
             if unit.mode.has_cover()
-                && unit
-                    .layout
-                    .first()
-                    .is_some_and(|first| first.pages.first() == Some(&page.occurrence.idx))
-                && unit.layout[0].formation
+                && unit.binding.layout.automatic_front_cover
+                && unit.binding.layout.formation
                     != SpreadDisplayUnitFormation::Singleton(
                         SpreadDisplaySingletonCause::ExplicitAlone,
                     )
             {
-                let first = &unit.layout[0];
+                let first = &unit.binding.layout;
                 let cover_side = if unit.mode.is_rtl() {
                     SingletonSpreadPlacement::Left
                 } else {

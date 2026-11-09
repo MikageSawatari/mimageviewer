@@ -2739,7 +2739,7 @@ enum FsSubmittedSourcePolicy {
 
 pub(crate) struct PendingFsPageTurnReady {
     items_generation: u64,
-    units: Arc<Vec<SpreadDisplayUnit>>,
+    binding: page_turn::PageTurnUnitBinding,
     mode: SpreadMode,
     slice: crate::page_split::PageSlice,
     composition: SpreadDisplayComposition,
@@ -2961,7 +2961,11 @@ impl FsNavigatorTextureSources {
         }
     }
 
-    fn rebind_occurrences(&mut self, occurrences: &[SpreadPageOccurrence]) -> bool {
+    fn rebind_occurrences(
+        &mut self,
+        occurrences: &[SpreadPageOccurrence],
+        binding: impl FnOnce() -> Option<page_turn::PageTurnUnitBinding>,
+    ) -> bool {
         if self.pages.len() != occurrences.len()
             || self
                 .pages
@@ -2984,7 +2988,7 @@ impl FsNavigatorTextureSources {
             page.occurrence = *occurrence;
         }
         if let FsDisplayUnitSubmission::Paged(receipt) = &mut self.submission {
-            receipt.rebind(occurrences);
+            receipt.rebind(occurrences, binding);
         }
         true
     }
@@ -14187,6 +14191,7 @@ impl App {
     pub(crate) fn service_final_prepare_before_lookup(&mut self, ctx: &egui::Context) {
         self.reflect_held_page_turn_receipt_before_lookup(ctx);
         self.poll_final_effects(ctx);
+        self.resolve_page_turn_layout_before_lookup();
     }
 
     pub(crate) fn fs_navigation_rendition_target_pages(&self, fs_idx: usize) -> Option<Vec<usize>> {
@@ -20942,7 +20947,7 @@ impl App {
 
     /// A currently shown page may outlive a temporary facet. Keep that one real
     /// page without importing excluded neighbors or automatic endpoint companions.
-    fn facet_outside_composition(&self, idx: usize) -> SpreadDisplayComposition {
+    fn facet_outside_unit(&self, idx: usize) -> SpreadDisplayUnit {
         let directive = self
             .composed_book_layout()
             .and_then(|layout| layout.page_override(idx));
@@ -20969,8 +20974,16 @@ impl App {
             },
             |_| true,
         );
+        units
+            .into_iter()
+            .next()
+            .expect("facet singleton contains its anchor")
+    }
+
+    fn facet_outside_composition(&self, idx: usize) -> SpreadDisplayComposition {
+        let unit = self.facet_outside_unit(idx);
         resolve_spread_display_composition(
-            &units,
+            std::slice::from_ref(&unit),
             0,
             self.spread_mode,
             false,
@@ -28993,7 +29006,7 @@ impl App {
                             let layout_rebound =
                                 self.fullscreen_page_layout.rebind_occurrences(&occurrences);
                             let sources_rebound =
-                                navigator_texture_sources.rebind_occurrences(&occurrences);
+                                navigator_texture_sources.rebind_occurrences(&occurrences, || occurrences.first().and_then(|o| self.page_turn_unit_binding(o.navigation_anchor_idx)));
                             debug_assert_eq!(layout_rebound, sources_rebound);
                         }
                         fs_media_ms = media_t0.elapsed().as_secs_f64() * 1000.0;
@@ -31670,6 +31683,10 @@ impl App {
     /// selected (including holdovers). Spread pages are accepted only as a complete
     /// unit, so the trace cannot report a half-painted pair as ready.
     fn take_matching_submitted_page_turn_ready(&mut self) -> Option<PendingFsPageTurnReady> {
+        if self.pending_fs_page_turn_ready.is_none() {
+            return None;
+        }
+        self.resolve_page_turn_layout_before_lookup();
         let pending = self.pending_fs_page_turn_ready.take()?;
         let FsDisplayUnitSubmission::Paged(receipt) = &pending.sources.submission else {
             return None;
@@ -31681,7 +31698,8 @@ impl App {
         if pending.items_generation != self.items_generation
             || pending.mode != self.spread_mode
             || pending.slice != self.fullscreen_page_slice
-            || !Arc::ptr_eq(&pending.units, &self.spread_display_units_cache.units)
+            || !pending.binding.matches_current(self)
+            || !pending.binding.matches_prepare_policy(self)
             || self.fullscreen_idx != Some(pending.composition.navigation_anchor_idx())
             || !receipt.matches_sources(self.page_turn_destination(), &pending.sources)
         {
@@ -31837,7 +31855,12 @@ impl App {
                 if !receipt.was_accepted() {
                     self.pending_fs_page_turn_ready = Some(PendingFsPageTurnReady {
                         items_generation: self.items_generation,
-                        units: Arc::clone(&self.spread_display_units_cache.units),
+                        binding: match self
+                            .page_turn_unit_binding(composition.navigation_anchor_idx())
+                        {
+                            Some(binding) => binding.for_pending(ctx),
+                            None => return,
+                        },
                         mode: self.spread_mode,
                         slice: self.fullscreen_page_slice,
                         composition: composition.clone(),
@@ -50515,12 +50538,18 @@ impl App {
                 );
                 let occurrences = [left.occurrence, right.occurrence];
                 debug_assert!(self.fullscreen_page_layout.rebind_occurrences(&occurrences));
-                debug_assert!(sources.rebind_occurrences(&occurrences));
+                debug_assert!(sources.rebind_occurrences(&occurrences, || {
+                    occurrences
+                        .first()
+                        .and_then(|o| self.page_turn_unit_binding(o.navigation_anchor_idx))
+                }));
             }
             _ => debug_assert!(false, "display unit must contain one or two pages"),
         }
         if let [page] = unit.pages.as_slice() {
-            let _ = sources.rebind_occurrences(&[page.occurrence]);
+            let _ = sources.rebind_occurrences(&[page.occurrence], || {
+                self.page_turn_unit_binding(page.occurrence.navigation_anchor_idx)
+            });
         }
         sources
     }

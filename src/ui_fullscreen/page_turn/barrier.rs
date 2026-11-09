@@ -18,10 +18,11 @@ pub(super) struct ResolvedPageTurnNavigation {
     intent: ResolvedNavigationIntent,
     pub(super) contract: crate::fs_page_load_scheduler::FsPageLoadContract,
     pub(super) items: u64,
-    pub(super) layout: Arc<Vec<SpreadDisplayUnit>>,
+    from_binding: PageTurnUnitBinding,
+    target_binding: PageTurnUnitBinding,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ResolvedNavigationIntent {
     Page {
         slice: Option<crate::page_split::PageSlice>,
@@ -32,6 +33,7 @@ enum ResolvedNavigationIntent {
     },
     SpreadShift {
         anchor: usize,
+        topology: Arc<Vec<SpreadDisplayUnit>>,
     },
 }
 
@@ -47,8 +49,8 @@ impl PageTurnPresentation {
         else {
             return None;
         };
-        match command.intent {
-            ResolvedNavigationIntent::Slideshow { purpose, .. } => Some(purpose),
+        match &command.intent {
+            ResolvedNavigationIntent::Slideshow { purpose, .. } => Some(*purpose),
             _ => None,
         }
     }
@@ -178,12 +180,19 @@ impl App {
         operation: Option<ViewerOperationId>,
         anchor: usize,
     ) -> bool {
+        if !self.page_turn_barrier_active() {
+            return false;
+        }
+        self.resolve_page_turn_layout_before_lookup();
         self.page_turn_defer_navigation_intent(
             ctx,
             target_idx,
             crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
             operation,
-            ResolvedNavigationIntent::SpreadShift { anchor },
+            ResolvedNavigationIntent::SpreadShift {
+                anchor,
+                topology: Arc::clone(&self.spread_display_units_cache.units),
+            },
         )
     }
 
@@ -241,17 +250,21 @@ impl App {
                 })
                 .copied()
         };
+        // Targets are already resolved by the navigation owner. Resolve the normal
+        // topology before capturing the two local witnesses, never reselect next on commit.
+        self.resolve_page_turn_layout_before_lookup();
         let command = fact.and_then(|fact| {
-            self.fullscreen_idx
-                .map(|from_idx| ResolvedPageTurnNavigation {
-                    fact,
-                    from_idx,
-                    target_idx,
-                    intent,
-                    contract,
-                    items: self.items_generation,
-                    layout: Arc::clone(&self.spread_display_units_cache.units),
-                })
+            let from_idx = self.fullscreen_idx?;
+            Some(ResolvedPageTurnNavigation {
+                fact,
+                from_idx,
+                target_idx,
+                intent,
+                contract,
+                items: self.items_generation,
+                from_binding: self.page_turn_unit_binding(from_idx)?,
+                target_binding: self.page_turn_unit_binding(target_idx)?,
+            })
         });
         if let PresentationState::Completing {
             continuation,
@@ -284,27 +297,17 @@ impl App {
         ctx: &egui::Context,
     ) -> Option<ResolvedPageTurnNavigation> {
         let destination = self.page_turn_destination();
+        self.resolve_page_turn_layout_before_lookup();
         let invalid = match &self.page_turn_presentation.state {
             PresentationState::Completing {
                 incoming,
                 continuation,
                 ..
             } => {
-                incoming.destination != destination
-                    || incoming.items != self.items_generation
-                    || incoming.mode != self.spread_mode
-                    || incoming.slice != self.fullscreen_page_slice
-                    || !Arc::ptr_eq(&incoming.layout, &self.spread_display_units_cache.units)
+                !incoming.binding.matches_current(self)
                     || continuation
                         .as_ref()
                         .is_some_and(|command| self.fullscreen_idx != Some(command.from_idx))
-                    || incoming
-                        .pages
-                        .iter()
-                        .zip(&incoming.content)
-                        .any(|(page, content)| {
-                            *content != self.page_turn_content(page.occurrence.idx)
-                        })
             }
             _ => false,
         };
@@ -323,10 +326,7 @@ impl App {
                     && receipt.frame() < ctx.cumulative_frame_nr()
                     && receipt.destination() == destination
                     && incoming.destination == destination
-                    && incoming.items == self.items_generation
-                    && incoming.mode == self.spread_mode
-                    && incoming.slice == self.fullscreen_page_slice
-                    && Arc::ptr_eq(&incoming.layout, &self.spread_display_units_cache.units)
+                    && incoming.binding.matches_current(self)
                     && receipt.matches_flat_unit(incoming)
             }
             _ => false,
@@ -358,7 +358,10 @@ impl App {
         let command = continuation?;
         if command.fact.destination != destination
             || command.items != self.items_generation
-            || !Arc::ptr_eq(&command.layout, &self.spread_display_units_cache.units)
+            || !command.from_binding.matches_navigation(self)
+            || !command.target_binding.matches_navigation(self)
+            || matches!(&command.intent, ResolvedNavigationIntent::SpreadShift { topology, .. }
+                if !Arc::ptr_eq(topology, &self.spread_display_units_cache.units))
             || self.fullscreen_idx != Some(command.from_idx)
         {
             emit(&command.fact, "skip", "continuation_binding_changed", &[]);
@@ -391,24 +394,24 @@ impl App {
             "stage1_continuation_instant",
             &[("target_idx", command.target_idx.into())],
         );
-        let slice = match command.intent {
+        let slice = match &command.intent {
             ResolvedNavigationIntent::Page { slice }
-            | ResolvedNavigationIntent::Slideshow { slice, .. } => slice,
+            | ResolvedNavigationIntent::Slideshow { slice, .. } => *slice,
             ResolvedNavigationIntent::SpreadShift { .. } => None,
         };
-        if let ResolvedNavigationIntent::SpreadShift { anchor } = command.intent {
-            if !self.set_live_spread_shift(anchor) {
+        if let ResolvedNavigationIntent::SpreadShift { anchor, .. } = &command.intent {
+            if !self.set_live_spread_shift(*anchor) {
                 return true;
             }
             self.adjust_spread_target = None;
         }
-        if let ResolvedNavigationIntent::Slideshow { slice, purpose } = command.intent {
-            self.complete_book_slideshow_target(ctx, command.target_idx, slice, purpose);
+        if let ResolvedNavigationIntent::Slideshow { slice, purpose } = &command.intent {
+            self.complete_book_slideshow_target(ctx, command.target_idx, *slice, *purpose);
         } else {
             if command.target_idx == command.from_idx
-                && let ResolvedNavigationIntent::Page { slice: Some(slice) } = command.intent
+                && let ResolvedNavigationIntent::Page { slice: Some(slice) } = &command.intent
             {
-                self.set_fullscreen_page_slice_for_display_unit(slice);
+                self.set_fullscreen_page_slice_for_display_unit(*slice);
                 self.update_fs_page_turn_burst_after_navigation(ctx, command.from_idx, None);
                 ctx.request_repaint();
                 return true;
