@@ -493,7 +493,7 @@ fn initial_placement_composition_switch_center_keeps_manual_pan_and_zoom() {
 }
 
 #[test]
-fn initial_placement_composition_switch_reanchors_pair_without_resetting_zoom() {
+fn initial_placement_composition_switch_reanchors_pair_with_normal_open_zoom() {
     for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
         let ctx = egui::Context::default();
         let mut app =
@@ -507,13 +507,13 @@ fn initial_placement_composition_switch_reanchors_pair_without_resetting_zoom() 
         .drop_without_applying_deltas();
         assert!(app.apply_fullscreen_spread_mode(&ctx, 1, mode));
         assert_eq!(app.fullscreen_idx, Some(0), "normalize to the pair anchor");
-        assert_eq!(app.fs_zoom, 1.5);
+        assert_eq!(app.fs_zoom, 1.0);
         assert_eq!(app.fs_pan, egui::Vec2::ZERO);
         let request = app.fs_initial_placement_request.expect("new pair entry");
         assert_eq!(request.anchor_idx, 0);
         assert_eq!(
             (request.origin_zoom, request.origin_pan),
-            (1.5, egui::Vec2::ZERO)
+            (1.0, egui::Vec2::ZERO)
         );
         frame(&ctx, |ui, ctx| {
             let unit = paint_composition_switch_unit(&mut app, ui, ctx);
@@ -528,10 +528,171 @@ fn initial_placement_composition_switch_reanchors_pair_without_resetting_zoom() 
                 ReadingDirection::Ltr => close_to(unit.left(), arrival_viewport().left()),
                 ReadingDirection::Rtl => close_to(unit.right(), arrival_viewport().right()),
             }
-            assert_eq!(app.fs_zoom, 1.5);
+            assert_eq!(app.fs_zoom, 1.0);
             assert!(app.fs_initial_placement_request.is_none());
         })
         .drop_without_applying_deltas();
+    }
+}
+
+#[test]
+fn initial_placement_composition_request_matches_synchronous_normalize_open() {
+    for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
+        let ctx = egui::Context::default();
+        let mut app =
+            composition_switch_app(&ctx, SpreadMode::Single, false, ReadingDirection::Rtl);
+        app.fullscreen_idx = Some(1);
+        app.fs_zoom = 1.5;
+        app.set_fs_pan_from_input(1.5, egui::vec2(53.0, -71.0));
+        app.spread_mode = mode;
+        app.normalize_spread_position(&ctx);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!((app.fs_zoom, app.fs_pan), (1.0, egui::Vec2::ZERO));
+        let open_request = app
+            .fs_initial_placement_request
+            .expect("synchronous normalize open creates the request first");
+        assert_eq!(
+            open_request,
+            FsInitialPlacementRequest {
+                items_generation: app.items_generation,
+                anchor_idx: 0,
+                origin_zoom: 1.0,
+                origin_pan: egui::Vec2::ZERO,
+                applied_zoom: 1.0,
+                applied_pan: egui::Vec2::ZERO,
+            }
+        );
+        app.request_fs_initial_placement_after_composition_change();
+        assert_eq!(app.fs_initial_placement_request, Some(open_request));
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!((app.fs_zoom, app.fs_pan), (1.0, egui::Vec2::ZERO));
+    }
+}
+
+#[test]
+fn initial_placement_composition_switch_deferred_normalize_uses_resumed_open_zoom() {
+    use crate::app::book_composition_runtime::ViewerBookComposition;
+    use crate::book_composition::{
+        BookCompositionService, CompositionProjectionOutcome, PageDomain, PresentationDecision,
+        ReadingDirection as CompositionDirection, fixtures,
+    };
+    use std::time::Duration;
+
+    for direction in [CompositionDirection::Ltr, CompositionDirection::Rtl] {
+        let ctx = egui::Context::default();
+        let book = fixtures::four_page_book(direction);
+        let mut app = crate::ui_fullscreen::book_composition_tests::composed_app(&book);
+        let scope = app.composed_layout_token().unwrap().0;
+        let (service, owner) = BookCompositionService::spawn_at(
+            app.tmp.path().join("initial-placement-deferred-normalize"),
+            None,
+        )
+        .unwrap();
+        service
+            .save(scope.clone(), PageDomain::Document, book)
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap()
+            .status
+            .unwrap();
+        // Keep the accepted fixture current so normalize tests permission
+        // deferral, rather than initiating an unrelated composition reload.
+        // Its unavailable source still requires worker qualification.
+        let ViewerBookComposition::Accepted {
+            token,
+            layout: CompositionProjectionOutcome::Composed(projection),
+            ..
+        } = &mut app.book_composition
+        else {
+            panic!("accepted composed fixture");
+        };
+        *token = service.snapshot().token_for(&scope);
+        Arc::make_mut(projection).token = *token;
+        app.install_book_composition_runtime(service.clone());
+        app.fullscreen_idx = Some(1);
+        app.spread_mode = SpreadMode::Single;
+        app.reading_flow = ReadingFlow::Paged;
+        app.settings.fullscreen_fit_mode = FullscreenFitMode::Original;
+        app.settings.fullscreen_page_start_position = FullscreenPageStartPosition::ReadingStart;
+        app.settings.page_turn_animation_enabled = false;
+        install_composition_switch_materials(&mut app, &ctx, false);
+        let old_demand = app.book_target_presentation_demand(1);
+        app.install_allowed_presentation_for_test(&old_demand);
+        app.fs_zoom = 1.5;
+        app.set_fs_pan_from_input(1.5, egui::vec2(53.0, -71.0));
+        frame(&ctx, |ui, ctx| {
+            paint_composition_switch_unit(&mut app, ui, ctx);
+        })
+        .drop_without_applying_deltas();
+        assert!(app.fs_initial_placement_request.is_none());
+
+        let (worker_entered, release_worker) = service.hold_worker_for_test();
+        worker_entered
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap();
+        app.apply_fullscreen_view_mode(&ctx, 1, FullscreenViewMode::Spread);
+        assert!(app.spread_mode.is_spread());
+        assert_eq!(app.fullscreen_idx, Some(1), "normalize open is deferred");
+        assert_eq!((app.fs_zoom, app.fs_pan), (1.5, egui::Vec2::ZERO));
+        let provisional = app
+            .fs_initial_placement_request
+            .expect("composition request still belongs to the old anchor");
+        assert_eq!(provisional.anchor_idx, 1);
+        assert_eq!(
+            (provisional.origin_zoom, provisional.origin_pan),
+            (1.5, egui::Vec2::ZERO)
+        );
+        let new_demand = app.book_target_presentation_demand(0);
+        assert_eq!(app.pending_book_target_demand_for_test(), new_demand);
+        assert_eq!(
+            app.book_presentation_current(&new_demand),
+            PresentationDecision::Checking
+        );
+        app.poll_book_presentation_permission(&ctx);
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert_eq!(app.fs_initial_placement_request, Some(provisional));
+
+        release_worker.send(()).unwrap();
+        // The FIFO read completes after the actual permission requests, making
+        // the UI poll deterministic without replacing their real receivers.
+        service
+            .prepare(scope, PageDomain::Document)
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap()
+            .status
+            .unwrap();
+        app.poll_book_presentation_permission(&ctx);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!((app.fs_zoom, app.fs_pan), (1.0, egui::Vec2::ZERO));
+        assert_eq!(
+            app.fs_initial_placement_request,
+            Some(FsInitialPlacementRequest {
+                items_generation: app.items_generation,
+                anchor_idx: 0,
+                origin_zoom: 1.0,
+                origin_pan: egui::Vec2::ZERO,
+                applied_zoom: 1.0,
+                applied_pan: egui::Vec2::ZERO,
+            })
+        );
+        assert!(app.pending_book_target_demand_for_test().is_empty());
+        assert_eq!(
+            app.book_presentation_current(&new_demand),
+            PresentationDecision::Allowed(vec![true, true])
+        );
+        frame(&ctx, |ui, ctx| {
+            let unit = paint_composition_switch_unit(&mut app, ui, ctx);
+            assert!(unit.width() > arrival_viewport().width());
+            assert!(unit.height() > arrival_viewport().height());
+            close_to(unit.top(), arrival_viewport().top());
+            match direction {
+                CompositionDirection::Ltr => close_to(unit.left(), arrival_viewport().left()),
+                CompositionDirection::Rtl => close_to(unit.right(), arrival_viewport().right()),
+            }
+            assert_eq!(app.fs_zoom, 1.0);
+            assert!(app.fs_initial_placement_request.is_none());
+        })
+        .drop_without_applying_deltas();
+        owner.shutdown_and_join();
     }
 }
 
@@ -657,9 +818,8 @@ fn initial_placement_composition_switch_same_mode_shift_reset_aligns_new_pair() 
                 .navigation_pages(),
             vec![0, 1]
         );
-        // Center retains the released open-on-normalize reset. ReadingStart
-        // preserves the mode operation's zoom across that same normalization.
-        let expected_zoom = if reading_start { 1.5 } else { 1.0 };
+        // Both start positions retain the released open-on-normalize zoom reset.
+        let expected_zoom = 1.0;
         assert_eq!(app.fs_zoom, expected_zoom);
         assert_eq!(app.fs_pan, egui::Vec2::ZERO);
         assert_eq!(app.fs_initial_placement_request.is_some(), reading_start);
@@ -667,7 +827,7 @@ fn initial_placement_composition_switch_same_mode_shift_reset_aligns_new_pair() 
             assert_eq!(request.anchor_idx, 0);
             assert_eq!(
                 (request.origin_zoom, request.origin_pan),
-                (1.5, egui::Vec2::ZERO)
+                (1.0, egui::Vec2::ZERO)
             );
         }
         frame(&ctx, |ui, ctx| {

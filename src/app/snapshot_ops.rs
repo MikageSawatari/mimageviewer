@@ -247,7 +247,6 @@ impl App {
 
     fn restore_snapshot_viewing_state(&mut self, state: crate::snapshot::SnapshotViewingState) {
         let previous_mode = self.spread_mode;
-        let previous_zoom = self.fs_zoom;
         self.spread_mode = state.mode;
         self.reading_direction = state.direction;
         self.reading_flow = state.flow;
@@ -258,7 +257,7 @@ impl App {
         self.singleton_spread_endpoint_preferences = state.endpoints;
         self.page_alone_preferences = state.page_alone;
         if self.spread_mode != previous_mode {
-            self.request_fs_initial_placement_after_composition_change(previous_zoom);
+            self.request_fs_initial_placement_after_composition_change();
         }
     }
 

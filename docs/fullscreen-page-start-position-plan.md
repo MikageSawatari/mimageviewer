@@ -14,7 +14,7 @@
   - 縦にはみ出す (表示単位の高さ > 表示領域の高さ): 上端を表示領域の上端に合わせる。
   - 横にはみ出す: 実効の読書方向が右→左なら右端、左→右なら左端を表示領域の端に合わせる。
   - はみ出さない軸は従来の配置 (pan 0。見開き端の単ページを片側へ置く既存配置もそのまま) を保つ。
-- 倍率 (`fs_zoom`) は変えない。変えるのは切替直後の `fs_pan` の初期値だけ。
+- 初期配置処理は倍率 (`fs_zoom`) を変えない。open や構成正規化の既存の倍率リセットには従い、`fs_pan` の初期値だけを求める。
 
 ### 1.1 適用する切替・しない切替 (入口の棚卸し)
 
@@ -38,7 +38,7 @@ setter は寸法判明・分割モード変更・回転による整合 (`reconci
 
 **第 3 の適用入口 (依頼 27 追補)**: paged のページ構成を実際に変更したときも適用する。
 単ページ・見開き・表紙付き見開き・横長分割の間の切替は、新しい表示単位の pan を 0 に戻して要求を作る。
-切替前の倍率は保つ。手動で拡大・移動した後も、新しい構成では読み始めへ合わせる。
+倍率は既存の構成正規化の結果に従う。手動で拡大・移動した後も、新しい構成では読み始めへ合わせる。
 正規化後に同じ構成となる場合や拒否された切替では何もしない。`中央` は従来の適用経路を変えない。
 読書方向だけの切替 (`7`) と、編集ツールの一時的な単ページ化・復帰は従来どおり要求を消す側に保つ。
 
@@ -58,7 +58,7 @@ setter は寸法判明・分割モード変更・回転による整合 (`reconci
 ## 2. 幾何: どの時点の何に合わせるか
 
 要求を作る入口は、open の zoom/pan リセット、受理した分割片側移動、paged のページ構成切替の 3 つ。
-構成切替は倍率を保持し pan 0 を配置基準にする。消費・仮素材から完成素材への確定は共通で、別の配置状態は追加しない。
+構成切替は pan 0 を配置基準にし、倍率は既存の正規化・open 経路が決める値を使う。消費・仮素材から完成素材への確定は共通で、別の配置状態は追加しない。
 
 **r4 では確定時点を §10 が上書きする。** 仮素材にもその frame の幾何を適用し、実際の完成素材が表示単位全体で揃った最初の current frame に確定する。
 
@@ -621,12 +621,16 @@ e9099ac8f の独立再レビュー (GPT-6.1 Sol / xhigh): P2-1 / P2-2 は解消�
 依頼 25 の単ページ→見開きでも、旧単位の pan を持ち越す見え方が報告されていた。
 
 設計担当の決定に従い、paged の実際のページ構成変更を要求生成の第 3 の入口にした (§1.1・§2・§3)。
-`request_fs_initial_placement_after_composition_change(previous_zoom)` に方針をまとめ、ReadingStart のときだけ
-pan を 0 に戻し、元の倍率と現在の anchor で既存の `request_fs_initial_placement` を呼ぶ。
+`request_fs_initial_placement_after_composition_change()` に方針をまとめ、ReadingStart のときだけ
+pan を 0 に戻し、現在の倍率・anchor で既存の `request_fs_initial_placement` を呼ぶ。
 受理・構成変化の判定は各入口が持つ既存の分岐を使い、別の状態や request は追加していない。
 `normalize_spread_position` は anchor を揃えるため open を通り、倍率を 1 に戻す場合がある。
-その場合も ReadingStart は正規化前の倍率を復元してから要求を作る。Center は従来の経路をそのまま通す。
-通常の構成変更での Center の pan/zoom 持越しに加え、この既存の anchor 正規化 open のリセットも保つ。
+ReadingStart も Center と同じく、この既存の正規化結果を使う。open を通らなければ倍率はそのまま、通れば fit に戻る。
+独立レビュー P2 を受けた設計担当の決定で、当初の「構成切替前の倍率を保持」は廃止した。
+権限確認で正規化の open が保留されると、以前の helper が保持した倍率は後で再開する通常 open により失われ、
+同期経路と結果が食い違う。保持倍率を typed continuation に加える案を採らず、倍率の保存・復元そのものを削除した。
+保留中は現在の anchor に要求を作り、解除後の通常 open がその reset point で新しい anchor・倍率の要求を作る。
+同期 open が先に作った要求を helper が作り直しても、同じ anchor・倍率・pan 0 のため値は同じになる。
 
 入口の棚卸し:
 
@@ -653,7 +657,9 @@ slice の setter / reconcile に要求は追加せず、既存の半分選択の
 ```text
 initial_placement_composition_switch_aligns_first_complete_frame_and_keeps_zoom
 initial_placement_composition_switch_center_keeps_manual_pan_and_zoom
-initial_placement_composition_switch_reanchors_pair_without_resetting_zoom
+initial_placement_composition_switch_reanchors_pair_with_normal_open_zoom
+initial_placement_composition_request_matches_synchronous_normalize_open
+initial_placement_composition_switch_deferred_normalize_uses_resumed_open_zoom
 initial_placement_composition_same_mode_preserves_position_and_request
 initial_placement_composition_switch_extracted_mode_uses_normalized_direction
 initial_placement_composition_switch_owned_view_mode_aligns_without_changing_book
@@ -667,6 +673,16 @@ App 描画は 6000×3000 と同じ比率の 1600×800 を使い、単ページ�
 見開き→単ページを、最初の完成 frame の unit rect と split UV で検査する。手動パン・倍率 1.5 の後も検査し、
 Center の持越し・同構成の no-op・非先頭 anchor の正規化・ずらし解除・本/抽出結果の経路・編集 pivot の除外も検査する。
 live projection は実 worker/poll で並べ替えと方向変更を採用し、物理ページを保ちながら新世代・新 anchor の要求に置き換わることを検査する。
+
+独立レビュー P2 後は、非先頭 anchor の正規化と見開きずらし解除の期待倍率を 1.5 から 1.0 に変更した。
+これらは通常 open を通るため、倍率保持を廃止する設計判断に従い、既存の open のリセットを期待する。
+open を通らない構成切替は、従来の倍率 1.5 を保持する検査を維持した。
+同期正規化では open が先に作った要求と helper の再作成した要求が同一であることも検査する。
+追加の保留回帰は、本の単ページの第 2 ページを倍率 1.5 で描画してから実 worker を保留し、
+見開きへの変更、権限確認の保留、worker 解除、poll、最初の完成素材の描画まで LTR/RTL で通す。
+保留中は旧 anchor の要求、再開後は新 anchor・倍率 1.0 の要求になり、その完成 frame で読み始めに確定して消えることを検査する。
+
+`bb9529f47` 時点の検証記録 (以下は倍率保持を廃止する前の結果):
 
 - 最初のコンパイルで新 fixture の `source_dims` を u32 にしていた型誤りを修正した (`target/1726-composition-repro.log`)。
 - 修正前の App 回帰は **7 件中 3 成功・4 失敗** (4.269 秒)。既存の pan 持越し、要求なし、anchor 正規化による倍率リセットで失敗。
@@ -700,6 +716,25 @@ cargo check -p mimageviewer --bin mimageviewer-core --jobs 4
 - 最後に `$env:MSBUILDDISABLENODEREUSE='1'; cargo fmt` (引数なし) を実行して成功した。
   整形後の Rust 変更は整形のみで、追加の機能変更はない。`git diff --check` も成功した。
 製品起動・修正後の実機確認・full gate・build-dev・コミットは行わない。
+
+独立レビュー P2 対応後の検証:
+
+- 構成切替・snapshot・live projection の絞り込みは **12 件成功・17,019 件除外** (5.656 秒、コンパイル 2 分 32 秒)。
+  新しい同期要求同一性と worker 保留解除の 2 回帰を含む。
+  `target/1726-normalize-zoom-focused.log`、run ID `0c33e469-173b-4a42-98bd-eee27ff6b3d1`。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+cargo nextest run -p mimageviewer --lib --build-jobs 4 --test-threads 4 -E 'test(~initial_placement_composition_) | test(~initial_placement_snapshot_mode_restore) | test(~initial_placement_live_projection)'
+```
+
+- 上記の 527 件と同じ nextest コマンドを再実行し、新規 2 回帰を含めて **529 件成功・16,502 件除外**
+  (100.087 秒、コンパイル 1.08 秒)。`MSBUILDDISABLENODEREUSE=1`、`--build-jobs 4 --test-threads 4`。
+  `target/1726-normalize-zoom-regression.log`、run ID `96d5080f-3967-4e84-ad4f-778bbc8f2f0f`。
+- `$env:MSBUILDDISABLENODEREUSE='1'; cargo check -p mimageviewer --bin mimageviewer-core --jobs 4` は成功
+  (20.12 秒、`target/1726-normalize-zoom-core.log`)。既存 warning は残る。
+- 最後に `$env:MSBUILDDISABLENODEREUSE='1'; cargo fmt` (引数なし) を実行して成功した。
+  `git diff --check` も成功。製品起動・full gate・build-dev・コミットは行っていない。
 
 ## 10. r4: 仮の素材の frame と確定 (設計担当の決定、2026-11-08)
 
