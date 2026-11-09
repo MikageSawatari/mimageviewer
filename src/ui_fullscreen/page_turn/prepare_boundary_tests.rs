@@ -25,7 +25,7 @@ pub(super) fn normal_source_for_page(
     resource
 }
 
-fn native_pages(app: &App, pages: &[PreparedPagedPage]) -> Vec<PreparedPagedPage> {
+pub(super) fn native_pages(app: &App, pages: &[PreparedPagedPage]) -> Vec<PreparedPagedPage> {
     pages
         .iter()
         .map(|page| {
@@ -296,7 +296,7 @@ fn stable_presentation_quality_publication_defers_new_source_prepare_single_and_
 }
 
 #[derive(Clone, Copy, Debug)]
-enum ViewChange {
+pub(super) enum ViewChange {
     Resize,
     Dpi,
     Fit,
@@ -305,7 +305,7 @@ enum ViewChange {
     Filter,
 }
 
-fn changed_transform(
+pub(super) fn changed_transform(
     old: &DisplayedImageTransform,
     texture_size: egui::Vec2,
     change: ViewChange,

@@ -27,6 +27,8 @@ mod input_regression_tests;
 #[cfg(test)]
 mod landscape_tests;
 #[cfg(test)]
+mod layout_epoch_tests;
+#[cfg(test)]
 mod material_budget_tests;
 #[cfg(all(test, windows))]
 mod merge_master_tests;

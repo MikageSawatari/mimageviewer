@@ -183,6 +183,14 @@
   - 同じ起動の 690〜701 秒では、同じ条件 (AI 済み・同じ縮小) の送りが最後まで完了していた (finish 197 件)。キーの押しっぱなしで先へ飛んだ後、約 9 秒置いて送り始めた 710 秒から、キー送り・スライドショー送りとも、ほぼ毎回取り消されるようになった (710〜782 秒で約 30 件)。
   - 取り消しの判定は `src/ui_fullscreen/page_turn.rs` の Turning 状態の `incoming.same_material_and_geometry(&unit)` (v5.0.0 では 2871 行付近)。描くページの texture・source generation・layout (`Arc::ptr_eq`)・変換などが 1 つでも変わると取り消す。どれが変わったかはログに出ていない。
 - 調べること: 演出中にどの項目が変わったか (texture の差し替え、layout の作り直し、prefetch の到着など)、それが正当な変化か。AI アップスケール・見開きとの関係。v5.0.0 以降の master (§1.726 で完了判定を変更) でも起きるか。原因が分からない間は、取り消し理由に「どの項目が変わったか」を出す計装を先に足す。
+- 段階1の開発側検証 (2026-11-10、基点 `c6a0db6fd` + `fix-1750-page-turn-layout` の計装・回帰差分。構造修正なし):
+  - 未知の遠方ページへ `record_thumbnail_page_dims_for_spread` で横長寸法を配送し、通常resolverによるlayout再構築を通すheadless回帰を追加した。Managed通常描画／Native実prepare・bind境界 × LTR／RTLの4件すべてで、`different_fields=["layout_arc"]` だけが変わり、対象unitのoccurrences・formation・placementは一致したまま取消になる。素材ID・source generation・content・描画geometryは変わっていない。Native allocationは既存の合成fixtureで、実GPUのlookup hitや利用者の各取消を直接確認したものではない。
+  - 4件はcurl継続を期待するassertで意図的に失敗する。`ignore` / `should_panic` は付けず、修正後の同一素材によるcanonical flat着地の検査も残した（現状は継続assertより先へ到達しない）。相方の実回転でpaired→singletonになる対照と、Native resize／clip対照は成功（2テスト、両方向の計6ケース）。
+  - `source_geometry_or_binding_changed` の通常／perfログへ `origin=turn_compare|prepare_reuse` と差分項目、Arc不一致時の対象unit一致情報を追加。landscape反転時だけidx・旧新判定・epochも記録する。判定・表示仕様は維持し、名前・パス・画像内容を新たに出力しない。
+  - 検証は通常feature／test profile、`CARGO_BUILD_JOBS=1`。`cargo nextest run -p mimageviewer --lib -E 'test(/regression_1750/)' --no-fail-fast` は6実行、2成功／期待4失敗。`cargo nextest run -p mimageviewer --lib -E 'test(/page_turn/)' --no-fail-fast` は328実行、324成功／同じ期待4失敗、exit 100。`cargo fmt`・`cargo fmt --check`・`git diff --check` は成功。ログ: `target/1750/regression-final.log`、`page-turn-final.log`、`fmt-final.log`。
+  - 初回はTurboJPEGのMSBuild並列実行が失敗し、直列ビルドで通過した。テスト実行体の初回起動はFFmpeg DLL不足（0xc0000135）で止まり、`vendor/ffmpeg/bin/*.dll` 6本を `target/debug/deps/` へ実体コピー後に実行できた。相方対照の初回fixtureはresident寸法が配送寸法より優先されて組が変わらず失敗したため、実回転入力へ修正して再検証した。
+  - 独立コードレビューはP1/P2指摘なし。detached述語・viewport分岐は変更していない（共有presentationへの計装だけ）。製品起動・通常APPDATAへのアクセス・実GPU確認は未実施。意図的なredを残す修正前段階のため、確認用アプリbuildは作成していない。
+  - この結果は仮説のコード経路を再現した証拠で、利用者ログの個々の取消原因の確定ではない。意味的bindingによる有効性の構造修正は設計レビュー後の別段階とする。
 - 関連: §1.341 (ページめくり演出)、§1.726、§1.749。
 
 ### 1.749 ページめくり演出を取り消した着地で、画面外のページも「見えた」と診断ログに記録される (2026-11-09)
