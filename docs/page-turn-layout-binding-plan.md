@@ -34,7 +34,7 @@ Managed × LTR/RTL は `turn_compare`、合成 Native × LTR/RTL は実 prepare/
 | PT:2828 Offered → Turning | outgoing と新 incoming が同じ閲覧条件で接続可能か | **outgoing と incoming は異なる単位なので互いの binding 等値では代替不可**。それぞれの保存 binding を現在の自身の anchor へ照合し、共通 context/items/mode/方向/slice と incoming の受理素材を照合 |
 | PT:3260 `refresh_page_turn_completion_pages` | 必須 flat の対象・source/configuration の維持 | 同じ局所構成/content なら、view 変更時も通常 prepare の新 geometry/material へ再束縛可。古い flat 証拠で完了させない（§4） |
 | B:297 / 329 `page_turn_take_continuation` | Completing の失効判定／採用済み flat の退役資格 | incoming の局所 binding と receipt の完全一致へ統一。遠方更新だけなら同じ continuation を保持 |
-| B:361、保持元 B:253 `ResolvedPageTurnNavigation.layout` | 受理済み from/target 操作の commit 資格 | incoming だけの比較では不足。from と target の局所構成を受理時に保存して各々再照合。操作 ID・destination・items・from_idx・intent/contract は維持（§4） |
+| B:361、保持元 B:253 `ResolvedPageTurnNavigation.layout` | 受理済み from/target 操作の commit 資格 | incoming だけの比較では不足。from と target の局所構成を受理時に保存して各々再照合。操作 ID・destination・items・from_idx・intent/contract は維持。**SpreadShift だけは全体 Arc 照合も維持**（§4、r1 P2） |
 | FS:31684、保持元 FS:31840 `PendingFsPageTurnReady.units` | 遅延 output receipt が現表示のものか | pending の局所 binding に置換。既存 composition・layout kind・各頁 geometry・anchor・採用証拠・source policy の照合も維持 |
 | FS:17658–17666 `FinalDemandTopologies::same_visible` | 本全体の Current/Next/Previous topology キャッシュ | **維持**。遠方の変更も next demand を変え得るので、unit 比較は同等でない。nav Arc と全体 token/units を識別する用途 |
 | FS:17735–17736 `ContinuousAdmissionBinding::same_request` | 連結読みの探索範囲・不可視区間の request | **維持**。全体順序/探索範囲の識別であり paged presentation の有効性ではない |
@@ -128,7 +128,7 @@ curl の可視性 ledger・frame/pass・operation tracker は別の証拠とし�
 | 近傍 flip / 回転 / 編集 | 当該頁または相方の formation/occurrence/content/view の変化を検出。Offered は skip、Turning は既存取消→通常の最新 flat。無効な held を返さず、新 composition へ通常 navigation owner が再束縛する。outgoing 側の実変更も照合対象 |
 | resize / fit / clip | 同じ内容でも curl は取消。Completing では同一単位/content/source を保つ範囲で通常 prepare の新出力へ再束縛し `NeedFlat`。full binding が変わるので古い geometry の receipt は完了資格を持たない |
 | cancel / 設定OFF | 既存 Completing が必要な canonical flat を所有。内容/構成は同じまま view のみ変わる場合は上記再束縛。それ以外は古い completion を退役し通常の新 flat に任せる。OFF由来の通常経路は増やさない |
-| 新操作 | 既存一件 continuation と flat barrier を使う。command は fact/from/target/intent/contract と from/target の局所構成証拠を持つ。両単位が同じなら遠方更新後も同じ target を一回 commit。target が実際に変わった/許可を失った場合は既存 skip とし、別の next へ勝手に解き直さない。SpreadShift は commit 前の単位を照合してから既存 shift を適用する |
+| 新操作 | 既存一件 continuation と flat barrier を使う。command は fact/from/target/intent/contract と from/target の局所構成証拠を持つ。両単位が同じなら遠方更新後も同じ target を一回 commit。target が実際に変わった/許可を失った場合は既存 skip とし、別の next へ勝手に解き直さない。**SpreadShift の continuation だけは、既存の本全体 topology 照合 (layout Arc) を残す**。ずらしの基点は対象より前の直近の横長境界で決まり (`ui_fullscreen.rs` 18848 付近)、遠方の横長化で from/target の局所構成が同じまま基点だけが変わり得るため (独立レビュー r1 P2)。不一致なら既存どおり退役し、古い基点を適用しない |
 | close / context/window 切替 | 既存 owner の退役/値移譲に従う。close は自身の held/pending を解放し、遅い hook が旧 operation を復活させない。mount/park は兄弟を reset しない。destination が変わる証拠は再利用しない |
 
 Completing の再束縛では「単位/content/source が同じか」と「prepared 出力が同じか」を同じ binding の
@@ -148,6 +148,9 @@ owning frame が現在 binding と照合して退役/continuation commit を決�
 - Offered と Turning と Completing のそれぞれで遠方 flip。特に flat 提出後/採用前および採用後/owning frame 前に
   flip を入れ、pending ready・navigation observer が退役し、一件 continuation が一回だけ commit すること。
   command target 自体の構成変更、旧 binding/別 destination/別 generation の receipt 拒否も検証する。
+- SpreadShift の対照 (r1 P2): LTR・表紙なし・shift なし・全頁縦長の `[10,11]` から `+1` ずらしを受理した後、
+  遠方の頁 3 に横長寸法が届く → 古い基点の shift を適用せず、barrier が退役する。Page/Slideshow の continuation は
+  同じ遠方更新で継続する。
 - 同一 pages でも formation/placement/補助表紙/白紙/方向/slice が変わる対照、対象回転・crop/erase/params/comic 編集、
   outgoing 側変更を追加/再利用。同じ内容の Arc 再生成、ordinal/nav_start のみの変化は継続する。
 - `crop_binding_tests.rs`:361 の「等値 Arc 再生成なら legacy crop を拒否」は本欠陥を固定する旧期待。
