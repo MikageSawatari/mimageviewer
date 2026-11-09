@@ -613,7 +613,10 @@ pub(crate) use gamepad_input::{RightDragGuide, draw_right_drag_guide};
 pub(crate) use grid_scroll::{
     GRID_SCROLL_MIN_VIEWPORT_H, GridAspectLayout, GridScrollGeometry, GridScrollState,
 };
+mod container_type_icon_fixture;
 mod grid_paint;
+#[doc(hidden)]
+pub use container_type_icon_fixture::draw_container_type_icon_snapshot_fixture;
 mod media_metadata_mutation;
 pub(crate) mod metadata_import_refresh;
 mod metadata_ops;
@@ -23101,6 +23104,14 @@ impl App {
         // 念のため)。current や switches_done など state はそのまま。
         self.auto_aspect.samples.clear();
         for (idx, state) in self.thumbnails.iter().enumerate() {
+            if self.items.get(idx).is_some_and(|item| {
+                crate::grid_item::container_icon_only(
+                    item,
+                    self.settings.thumb_container_type_icon_only,
+                )
+            }) {
+                continue;
+            }
             if let ThumbnailState::Loaded {
                 source_dims,
                 layout_dims,
@@ -23139,6 +23150,30 @@ impl App {
         }
     }
 
+    fn icon_only_container_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| {
+                crate::grid_item::container_icon_only(
+                    item,
+                    self.settings.thumb_container_type_icon_only,
+                )
+            })
+            .count()
+    }
+
+    fn auto_aspect_thumbnails_terminal(&self) -> bool {
+        self.items.iter().enumerate().all(|(idx, item)| {
+            crate::grid_item::container_icon_only(
+                item,
+                self.settings.thumb_container_type_icon_only,
+            ) || self
+                .thumbnails
+                .get(idx)
+                .is_some_and(ThumbnailState::is_terminal)
+        })
+    }
+
     /// auto_aspect の集計対象母数。**items ベース** で計算 (image_metas ベースでは
     /// 動画が抜けて動画オンリーフォルダで判定が走らない問題があった、ユーザー報告 +
     /// Codex P2 #2 2026-05)。
@@ -23146,6 +23181,7 @@ impl App {
     /// Image / Video / ZipImage / PdfPage / Folder / ZipFile / PdfFile は代表サムネ経由で
     /// `source_dims` がいずれ来る可能性があるので分母に入れる。
     pub(crate) fn auto_aspect_eligible_total(&self) -> usize {
+        let icon_only = self.icon_only_container_count();
         let terminal_audio = self
             .items
             .iter()
@@ -23177,9 +23213,13 @@ impl App {
             }
             return prepared
                 .auto_aspect_eligible_total
-                .saturating_sub(terminal_audio);
+                .saturating_sub(terminal_audio)
+                .saturating_sub(icon_only);
         }
-        self.items.len().saturating_sub(terminal_audio)
+        self.items
+            .len()
+            .saturating_sub(terminal_audio)
+            .saturating_sub(icon_only)
     }
 
     /// `auto_aspect` を新フォルダ用にリセットし、catalog の既存比率を一括投入する。
@@ -23222,19 +23262,11 @@ impl App {
         self.restore_cached_auto_aspect(aspect_seed);
 
         // 集計対象母数は items ベース (動画含む)。
-        let eligible_total =
-            prepared_eligible_total.unwrap_or_else(|| self.auto_aspect_eligible_total());
+        let eligible_total = prepared_eligible_total
+            .map(|total| total.saturating_sub(self.icon_only_container_count()))
+            .unwrap_or_else(|| self.auto_aspect_eligible_total());
         if eligible_total == 0 {
-            if !self.items.is_empty()
-                && self.thumbnails.iter().all(|state| {
-                    matches!(
-                        state,
-                        ThumbnailState::Loaded { .. }
-                            | ThumbnailState::NoArt
-                            | ThumbnailState::Failed
-                    )
-                })
-            {
+            if !self.items.is_empty() && self.auto_aspect_thumbnails_terminal() {
                 self.auto_aspect.current = Some(self.effective_thumb_aspect());
                 self.auto_aspect.streak = None;
             }
@@ -23252,6 +23284,12 @@ impl App {
                 return;
             };
             for (idx, item) in self.items.iter().enumerate() {
+                if crate::grid_item::container_icon_only(
+                    item,
+                    self.settings.thumb_container_type_icon_only,
+                ) {
+                    continue;
+                }
                 if staged.len() >= min_samples {
                     break;
                 }
@@ -23377,7 +23415,7 @@ impl App {
         // 集計対象母数は items ベース (動画含む)。seed と同じ helper。
         let eligible_total: usize = self.auto_aspect_eligible_total();
         if eligible_total == 0 {
-            if !self.items.is_empty() && self.thumbnails.iter().all(ThumbnailState::is_terminal) {
+            if !self.items.is_empty() && self.auto_aspect_thumbnails_terminal() {
                 self.auto_aspect.current = Some(self.effective_thumb_aspect());
                 self.auto_aspect.streak = None;
                 self.auto_aspect.cached_sample_gate = None;
@@ -23392,7 +23430,20 @@ impl App {
         const LOG_MARGIN: f32 = 0.10;
 
         // 純関数で判定。samples は HashMap なので Vec に展開して渡す。
-        let samples: Vec<f32> = self.auto_aspect.samples.values().copied().collect();
+        let samples: Vec<f32> = self
+            .auto_aspect
+            .samples
+            .iter()
+            .filter(|(idx, _)| {
+                self.items.get(**idx).is_some_and(|item| {
+                    !crate::grid_item::container_icon_only(
+                        item,
+                        self.settings.thumb_container_type_icon_only,
+                    )
+                })
+            })
+            .map(|(_, ratio)| *ratio)
+            .collect();
 
         // Cache 復元済みの場合は、前回その比率を決めた sample 数と同等以上の
         // 実測が集まるまで上書きしない。これにより「前回 36 件で 1:1 と判定した
@@ -23445,7 +23496,7 @@ impl App {
         // immediate=true (seed / 「自動」クリック直後) は streak を待たず即採用。
         const STREAK_DURATION: std::time::Duration = std::time::Duration::from_millis(750);
         const STREAK_SAMPLES_DELTA: usize = 8;
-        let cur_samples = self.auto_aspect.samples.len();
+        let cur_samples = samples.len();
         let streak_ok = if immediate {
             true
         } else {
@@ -56698,7 +56749,13 @@ impl App {
                 // auto_aspect: グリッド消費者だけが新規 Loaded の比率を記録。
                 // source_dims が None なら ColorImage の (w, h) を fallback として使う
                 // (動画 Shell サムネ / 旧 cache 由来などで source_dims が無いケース)。
-                if consumption.drives_auto_aspect() && self.settings.thumb_aspect_auto {
+                if consumption.drives_auto_aspect()
+                    && self.settings.thumb_aspect_auto
+                    && !crate::grid_item::container_icon_only(
+                        &self.items[i],
+                        self.settings.thumb_container_type_icon_only,
+                    )
+                {
                     let listing_dims = if from_edit_preview {
                         source_dims
                     } else {
@@ -57386,6 +57443,14 @@ impl App {
         if self.sidecar_restore_active() {
             return PriorityThumbnailAdmission::SidecarRestore;
         }
+        if self.items.get(idx).is_some_and(|item| {
+            crate::grid_item::container_icon_only(
+                item,
+                self.settings.thumb_container_type_icon_only,
+            )
+        }) {
+            return PriorityThumbnailAdmission::NoArt;
+        }
         let loaded = matches!(
             self.thumbnails.get(idx),
             Some(ThumbnailState::Loaded { .. })
@@ -57785,6 +57850,22 @@ impl App {
         let mut suppressed_regular: usize = 0;
         let mut suppressed_heavy: usize = 0;
         for i in self.keep_set_sorted() {
+            if crate::grid_item::container_icon_only(
+                &self.items[i],
+                self.settings.thumb_container_type_icon_only,
+            ) {
+                // Display state is not a request terminal. Leave in-flight owners and
+                // their pixels/finalization untouched, including across a preference toggle.
+                if self.requested.id(i).is_none()
+                    && matches!(
+                        self.thumbnails[i],
+                        ThumbnailState::Pending | ThumbnailState::Evicted
+                    )
+                {
+                    self.thumbnails[i] = ThumbnailState::NoArt;
+                }
+                continue;
+            }
             let foreground =
                 thumbnail_is_foreground(i, cur_vis_range, &interactive_thumbnail_pages);
             let loaded = matches!(self.thumbnails[i], ThumbnailState::Loaded { .. });
@@ -58408,6 +58489,12 @@ impl App {
         //    keep_set 外なら自動破棄される)。
         let mut upgrade_reqs: Vec<LoadRequest> = Vec::new();
         for i in self.keep_set_sorted() {
+            if crate::grid_item::container_icon_only(
+                &self.items[i],
+                self.settings.thumb_container_type_icon_only,
+            ) {
+                continue;
+            }
             if self.idle_upgrade_cache_bypass_ineligible.contains(&i) {
                 continue;
             }

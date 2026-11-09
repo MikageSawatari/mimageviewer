@@ -148,6 +148,34 @@ pub enum SearchContainerKind {
     Zip,
 }
 
+/// Whether the main grid substitutes the existing no-art container presentation.
+/// Keep the kind list here so demand, layout and image-wait aggregates agree.
+pub fn container_icon_only(item: &GridItem, enabled: bool) -> bool {
+    enabled
+        && matches!(
+            item,
+            GridItem::Folder(_)
+                | GridItem::ZipFile(_)
+                | GridItem::PdfFile(_)
+                | GridItem::ConvertibleArchive { .. }
+                | GridItem::ZipDir { .. }
+                | GridItem::SearchContainer { .. }
+        )
+}
+
+/// A presentation projection only: never completes an outstanding thumbnail request.
+pub fn effective_thumbnail_state<'a>(
+    item: &GridItem,
+    thumbnail: &'a ThumbnailState,
+    enabled: bool,
+) -> &'a ThumbnailState {
+    if container_icon_only(item, enabled) {
+        &ThumbnailState::NoArt
+    } else {
+        thumbnail
+    }
+}
+
 /// `SearchContainer` の代表サムネ (v0.8.1)。
 /// Ctrl+G アグリゲートビューで、コンテナ内のヒットから 1 件をサムネ表示するための参照。
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

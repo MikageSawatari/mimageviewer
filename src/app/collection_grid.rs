@@ -6389,6 +6389,82 @@ mod tests {
     }
 
     #[test]
+    fn thumb_container_type_icon_only_preferences_preserve_collection_root_and_denominator() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("folder");
+        let other_folder = temp.path().join("other-folder");
+        let image = temp.path().join("picture.png");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::create_dir(&other_folder).unwrap();
+        image::RgbImage::new(2, 3).save(&image).unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let created = collection_with_sources(
+            &client,
+            &[
+                (folder, CollectionResolvedKind::Folder),
+                (other_folder, CollectionResolvedKind::Folder),
+                (image, CollectionResolvedKind::Image),
+            ],
+        );
+        app.settings.thumb_container_type_icon_only = true;
+        app.settings.thumb_aspect_auto = true;
+        app.open_collection_grid(created.collection_id(), None);
+        wait_for_grid(&mut app, created.collection_id());
+        let presentation = app
+            .top_level_grid_view
+            .collection_session()
+            .unwrap()
+            .installed_presentation()
+            .unwrap()
+            .clone();
+        assert_eq!(presentation.prepared.auto_aspect_eligible_total, 3);
+        assert_eq!(app.auto_aspect_eligible_total(), 1);
+        for idx in 0..app.items.len() {
+            if crate::grid_item::container_icon_only(&app.items[idx], true) {
+                app.thumbnails[idx] = ThumbnailState::NoArt;
+            }
+        }
+        app.selected = Some(1);
+        app.grid_scroll.set_position(200.0);
+        let items = app.items.clone();
+        let scroll = app.grid_scroll.clone();
+        let folder = app.current_folder.clone();
+        let generation = app.items_generation;
+        let surface = app.top_level_grid_view.surface().clone();
+        let visibility = app.settings.file_type_visibility.clone();
+        app.set_visibility_preferences_for_test(visibility);
+        app.pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .thumb_container_type_icon_only = false;
+        app.apply_preferences_dialog(&egui::Context::default());
+        assert!(!app.settings.thumb_container_type_icon_only);
+        assert_eq!(app.auto_aspect_eligible_total(), 3);
+        assert_eq!(app.items, items);
+        assert_eq!(app.current_folder, folder);
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.grid_scroll, scroll);
+        assert_eq!(app.top_level_grid_view.surface(), &surface);
+        assert!(Arc::ptr_eq(
+            app.top_level_grid_view
+                .collection_session()
+                .unwrap()
+                .installed_presentation()
+                .unwrap(),
+            &presentation,
+        ));
+        for (item, thumb) in app.items.iter().zip(&app.thumbnails) {
+            if crate::grid_item::container_icon_only(item, true) {
+                assert!(matches!(thumb, ThumbnailState::Pending));
+            }
+        }
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
     fn root_auto_aspect_restores_before_real_rows_and_excludes_unsampleable_items() {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         use crate::auto_aspect_cache::CollectionAutoAspectCache;
