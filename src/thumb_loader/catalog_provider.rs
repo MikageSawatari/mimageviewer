@@ -20,10 +20,13 @@ pub(crate) enum ParentObservedStamp {
     Unavailable,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) enum RequestCatalog {
-    #[default]
-    Fixed,
+    Fixed {
+        /// Late source resolution retains its request admission as well as the
+        /// Fixed connection's own admission. Ordinary Fixed work uses the latter.
+        work: Option<CatalogWork>,
+    },
     Parent {
         row: ParentRow,
         work: CatalogWork,
@@ -34,7 +37,22 @@ pub(crate) enum RequestCatalog {
     },
 }
 
+impl Default for RequestCatalog {
+    fn default() -> Self {
+        Self::Fixed { work: None }
+    }
+}
+
 impl RequestCatalog {
+    pub(crate) fn for_pinned(&self) -> Self {
+        match self {
+            Self::Parent { work, .. } => Self::Fixed {
+                work: Some(work.clone()),
+            },
+            _ => self.clone(),
+        }
+    }
+
     pub(crate) fn collection(source: &Path, work: CatalogWork) -> Self {
         match source
             .parent()
@@ -46,14 +64,15 @@ impl RequestCatalog {
                     "collection thumbnail: invalid source parent: {}",
                     source.display()
                 ));
-                Self::Fixed
+                Self::default()
             }
         }
     }
 
     pub(crate) fn is_retired(&self) -> bool {
         match self {
-            Self::Fixed => false,
+            Self::Fixed { work: None } => false,
+            Self::Fixed { work: Some(work) } => !work.access().is_admitted(work.identity().1),
             Self::Parent { work, .. } | Self::CollectionSourceParent { work, .. } => {
                 !work.access().is_admitted(work.identity().1)
             }
@@ -62,7 +81,7 @@ impl RequestCatalog {
 
     fn lazy_scope(&self) -> Option<(LazyCatalogKind, &Path, &CatalogWork)> {
         match self {
-            Self::Fixed => None,
+            Self::Fixed { .. } => None,
             Self::Parent { row, work } => Some((LazyCatalogKind::Parent, &row.folder, work)),
             Self::CollectionSourceParent { identity, work } => {
                 Some((LazyCatalogKind::Collection, identity, work))
@@ -242,7 +261,10 @@ impl ThumbnailCatalogProvider {
     }
     pub(super) fn save_target<'a>(&'a self, req: &'a LoadRequest) -> ThumbnailSaveTarget<'a> {
         let target = match &req.catalog_target {
-            RequestCatalog::Fixed => {
+            RequestCatalog::Fixed { .. } => {
+                if req.catalog_target.is_retired() {
+                    return ThumbnailSaveTarget(SaveTarget::Unavailable);
+                }
                 return self.fixed.as_deref().filter(|db| !db.is_read_only()).into();
             }
             _ if !req.source_policy.allows_source() || req.uses_memory_pin_seed() => {
@@ -276,7 +298,10 @@ impl ThumbnailCatalogProvider {
         cancel: Option<&Arc<AtomicBool>>,
     ) -> Option<Arc<CatalogDb>> {
         let Some((kind, identity, work)) = req.catalog_target.lazy_scope() else {
-            return self.fixed.clone();
+            return (!req.catalog_target.is_retired()
+                || req.source_policy == LoadSourcePolicy::CacheOnly)
+                .then(|| self.fixed.clone())
+                .flatten();
         };
         if !req.source_policy.allows_cache() || req.uses_memory_pin_seed() {
             return None;
@@ -726,7 +751,7 @@ mod tests {
                 (CachePolicy::Auto, false, true),
             ] {
                 let mut req = request(&source, &temp.path().join("unused"));
-                req.catalog_target = RequestCatalog::Fixed;
+                req.catalog_target = RequestCatalog::default();
                 req.source_policy = LoadSourcePolicy::SourceOnly;
                 req.force_cache = force;
                 req.cache_key_override = Some(format!("{policy:?}-{force}-{saves}"));
@@ -1825,7 +1850,7 @@ mod tests {
         std::fs::write(&source, b"source attributes only").unwrap();
         let cache = temp.path().join("cache");
         let mut req = parent_pdf_request(&source, &cache);
-        req.catalog_target = RequestCatalog::Fixed;
+        req.catalog_target = RequestCatalog::default();
         (req.mtime, req.file_size) =
             crate::catalog::file_stamp(&std::fs::metadata(&source).unwrap());
         let fixed = Arc::new(CatalogDb::open(&cache, Path::new("__search_results__")).unwrap());
@@ -2016,15 +2041,17 @@ mod tests {
         let source = image_source(temp.path());
         let cache = temp.path().join("cache");
         let mut req = parent_request(&source, &cache);
-        req.parent_request_key = Some("original-outer-key".into());
+        // Admission owns the key even if a derived branch clears parent_row before
+        // its first worker invocation (the late color-filter pin regression).
+        req.capture_parent_request_key();
+        req.parent_row = None;
+        req.cache_key_override = Some("different-pinned-key#pin:leaf".into());
+        let provider = ThumbnailCatalogProvider::fixed(None);
+        PARENT_STAT_COUNT.with(|count| count.set(0));
+        LAZY_CATALOG_OPEN_COUNTS.with(|counts| counts.set((0, 0)));
         let map = RwLock::default();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run(
-                &mut req,
-                &ThumbnailCatalogProvider::fixed(None),
-                CachePolicy::Always,
-                &map,
-            )
+            run(&mut req, &provider, CachePolicy::Always, &map)
         }));
         assert!(
             result.is_err(),
@@ -2032,5 +2059,81 @@ mod tests {
         );
         assert!(!cache.exists());
         assert!(map.read().unwrap().is_empty());
+        assert_eq!(PARENT_STAT_COUNT.with(|count| count.get()), 0);
+        assert_eq!(LAZY_CATALOG_OPEN_COUNTS.with(|counts| counts.get()), (0, 0));
+    }
+
+    #[test]
+    fn parent_late_pin_fixed_preserves_admission_and_cache_only_continuation() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = image_source(temp.path());
+        let cache = temp.path().join("cache");
+        let mut req = parent_request(&source, &cache);
+        let RequestCatalog::Parent { work, .. } = &req.catalog_target else {
+            unreachable!()
+        };
+        let work = work.clone();
+        let fixed_folder = Path::new("__search_results__");
+        let old_fixed = Arc::new(work.open(fixed_folder).unwrap());
+        req.capture_parent_request_key();
+        req.catalog_target = req.catalog_target.for_pinned();
+        req.cache_key_override = Some("pinned-row#pin:leaf".into());
+        let RequestCatalog::Fixed {
+            work: Some(pin_work),
+        } = &req.catalog_target
+        else {
+            unreachable!()
+        };
+        assert_eq!(pin_work.identity(), work.identity());
+        let map = RwLock::new(std::collections::HashMap::from([(
+            req.cache_key_override.clone().unwrap(),
+            crate::catalog::CacheEntry {
+                mtime: req.mtime,
+                file_size: req.file_size,
+                jpeg_data: valid_webp(),
+                source_dims: Some((1, 1)),
+                layout_dims: None,
+                folder_provenance: None,
+                selection_proof: None,
+            },
+        )]));
+        crate::catalog::delete_all_cache(&cache);
+        let successor = Arc::new(CatalogDb::open(&cache, fixed_folder).unwrap());
+        let key = req.cache_key_override.clone().unwrap();
+        successor
+            .save(
+                &key,
+                req.mtime,
+                req.file_size,
+                8,
+                6,
+                Some((16, 12)),
+                &valid_webp(),
+            )
+            .unwrap();
+        req.source_policy = LoadSourcePolicy::CacheOnly;
+        let messages = run(
+            &mut req,
+            &ThumbnailCatalogProvider::fixed(Some(old_fixed)),
+            CachePolicy::Always,
+            &map,
+        );
+        assert_eq!(messages[0].pixels().unwrap().source_dims, Some((16, 12)));
+        // Even if a caller supplies a successor Fixed connection, a source request
+        // must not upgrade the old CatalogWork admission and save into it.
+        req.source_policy = LoadSourcePolicy::SourceOnly;
+        let provider = ThumbnailCatalogProvider::fixed(Some(successor.clone()));
+        assert!(provider.resolve(&req, None).is_none());
+        assert!(provider.save_target(&req).open_if(true, true).is_none());
+        let messages = run(&mut req, &provider, CachePolicy::Always, &map);
+        assert!(matches!(
+            messages[0].payload,
+            ThumbMsgPayload::SourcePixels(_)
+        ));
+        assert_eq!(
+            successor.load_one(&key).unwrap().unwrap().source_dims,
+            Some((16, 12))
+        );
+        assert!(!db_path_for(&cache, source.parent().unwrap()).exists());
     }
 }

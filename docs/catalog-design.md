@@ -164,6 +164,9 @@ mtime秒/size helper、EPUBでは解決済みgenerationのstampを使う。RAW f
 親row key/observedをメモリのidentityに使わず、退避後のオフライン再表示も維持する。
 派生要求は外側の `RequestCatalog` / `CatalogWork` / observedを継承し、Parentの要求キーが
 外側から変わればassert/logで止め、親DBへ書かない。
+外側キーは受付時に捕捉する。受付後のピン解決でParentの表紙がピン付きへ変わる場合は、
+同じCatalogWorkを保持して一覧のFixedへ切り替え、親の通常表紙を読まず上書きもしない。
+Fixedの先行色判定lookupと保存もこの受付証明を検証し、clear後はCacheOnlyの一回RO継続だけを許す。
 PDFの表紙保存とobserved署名のある親DB hitのcatch-upは、同じParent保存targetのRWでpdf_metaも補完する。
 Parentのメモリhitではstat/DB open/catch-upを行わず、stat失敗後のRO hitでも補完しない。Fixedは従来どおり。
 clearを跨いだ要求は受付時admissionで保存を禁じ、CacheOnlyだけ旧メモリを使わず一回RO継続する。

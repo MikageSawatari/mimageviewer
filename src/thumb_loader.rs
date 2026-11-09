@@ -52,6 +52,15 @@ pub(crate) fn request_worker_priority_key(
 }
 
 impl LoadRequest {
+    /// Capture the admitted outer row before worker-side pin/source derivation.
+    pub(crate) fn capture_parent_request_key(&mut self) {
+        if matches!(self.catalog_target, RequestCatalog::Parent { .. })
+            && self.parent_request_key.is_none()
+        {
+            self.parent_request_key = cache_key_for_request(self).map(|key| key.into_owned());
+        }
+    }
+
     /// A video/frame pin is a prepared memory asset with no source decode route.
     pub(crate) fn uses_memory_pin_seed(&self) -> bool {
         self.folder_thumb_provenance == Some(crate::catalog::FolderThumbProvenance::Seeded)
@@ -1099,7 +1108,7 @@ pub(crate) fn resolve_read_after_cache_miss(
 
 #[derive(Clone, Default)]
 pub struct LoadRequest {
-    /// Logical owner and acceptance epoch, fixed before pin/conversion resolution.
+    /// Final storage branch; pin/conversion derivation retains the acceptance epoch.
     pub(crate) catalog_target: RequestCatalog,
     pub(crate) parent_row: Option<ParentRow>,
     pub(crate) parent_observed: ParentObservedStamp,
@@ -2874,7 +2883,9 @@ fn process_load_request_with_provider(
                 return;
             }
         } else {
-            req.parent_request_key = Some(key);
+            // Direct worker callers have no UI admission step. Capture their identity
+            // here too; admitted requests already carry it across all derivations.
+            req.capture_parent_request_key();
         }
     }
     if let LoadRequestSource::AudioThumbnail(audio) = &req.raw_source {
@@ -3221,9 +3232,7 @@ fn process_load_request_with_provider(
     // 必ず元画像からデコードする (アイドル時の画質アップグレード用)
     let retired_cache_only = req.source_policy == LoadSourcePolicy::CacheOnly
         && (catalog.is_some_and(|db| db.is_retired())
-            || (provider.uses_lazy_catalog(req)
-                && req.catalog_target.is_retired()
-                && !req.uses_memory_pin_seed()));
+            || (req.catalog_target.is_retired() && !req.uses_memory_pin_seed()));
     let memory = if req.source_policy.allows_cache() && !retired_cache_only {
         cache_map.read().ok().and_then(|map| {
             map.get(filename)
@@ -3363,7 +3372,7 @@ fn process_load_request_with_provider(
                 // carries an earlier observation. Only an observed parent-DB hit
                 // can start catch-up; Fixed retains its existing memory-hit behavior.
                 let catchup_allowed = match &req.catalog_target {
-                    RequestCatalog::Fixed => true,
+                    RequestCatalog::Fixed { .. } => true,
                     RequestCatalog::Parent { .. } => {
                         !memory_hit
                             && matches!(req.parent_observed, ParentObservedStamp::Observed(..))

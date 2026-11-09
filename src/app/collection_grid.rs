@@ -11072,7 +11072,7 @@ mod tests {
                     assert!(
                         matches!(
                             request.catalog_target,
-                            crate::thumb_loader::RequestCatalog::Fixed
+                            crate::thumb_loader::RequestCatalog::Fixed { .. }
                         ),
                         "ordinary and Collection PhysicalSource requests stay Fixed"
                     );

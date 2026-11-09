@@ -55830,29 +55830,29 @@ impl App {
         req.items_gen = self.items_generation;
         req.pdf_render_validity =
             crate::pdf_loader::PdfRenderValidity::Viewer(self.pdf_render_epoch.snapshot());
-        req.catalog_target =
-            match self.thumb_storage_scope() {
-                ThumbStorageScope::MultiParent => req.parent_row.take().map_or(
-                    crate::thumb_loader::RequestCatalog::Fixed,
-                    |row| crate::thumb_loader::RequestCatalog::Parent {
-                        row,
-                        work: crate::catalog::CatalogWork::default(),
-                    },
-                ),
-                ThumbStorageScope::CollectionRoot => self
-                    .items
-                    .get(req.idx)
-                    .and_then(GridItem::drag_source_path)
-                    .map_or(crate::thumb_loader::RequestCatalog::Fixed, |source| {
-                        crate::thumb_loader::RequestCatalog::collection(
-                            source,
-                            crate::catalog::CatalogWork::default(),
-                        )
-                    }),
-                ThumbStorageScope::SingleFolder { .. } | ThumbStorageScope::DriveList => {
-                    crate::thumb_loader::RequestCatalog::Fixed
-                }
-            };
+        req.catalog_target = match self.thumb_storage_scope() {
+            ThumbStorageScope::MultiParent => req.parent_row.take().map_or(
+                crate::thumb_loader::RequestCatalog::default(),
+                |row| crate::thumb_loader::RequestCatalog::Parent {
+                    row,
+                    work: crate::catalog::CatalogWork::default(),
+                },
+            ),
+            ThumbStorageScope::CollectionRoot => self
+                .items
+                .get(req.idx)
+                .and_then(GridItem::drag_source_path)
+                .map_or(crate::thumb_loader::RequestCatalog::default(), |source| {
+                    crate::thumb_loader::RequestCatalog::collection(
+                        source,
+                        crate::catalog::CatalogWork::default(),
+                    )
+                }),
+            ThumbStorageScope::SingleFolder { .. } | ThumbStorageScope::DriveList => {
+                crate::thumb_loader::RequestCatalog::default()
+            }
+        };
+        req.capture_parent_request_key();
     }
 
     fn promote_viewer_pdf_keys(
@@ -103060,10 +103060,10 @@ fn apply_folder_thumb_pin(
         // pinned_key 下に書き戻してしまい、video frame が消える。
         return LoadRequest {
             file_type_visibility: base_req.file_type_visibility.clone(),
-            catalog_target: base_req.catalog_target.clone(),
+            catalog_target: base_req.catalog_target.for_pinned(),
             parent_row: None,
             parent_observed: Default::default(),
-            parent_request_key: None,
+            parent_request_key: base_req.parent_request_key.clone(),
             path: container.to_path_buf(),
             relative_page_provenance: None,
             zip_entry: None,
@@ -103167,10 +103167,10 @@ fn apply_folder_thumb_pin(
         .then(|| Box::new(base_req.clone()));
     LoadRequest {
         file_type_visibility: base_req.file_type_visibility.clone(),
-        catalog_target: base_req.catalog_target.clone(),
+        catalog_target: base_req.catalog_target.for_pinned(),
         parent_row: None,
         parent_observed: Default::default(),
-        parent_request_key: None,
+        parent_request_key: base_req.parent_request_key.clone(),
         path: request_path,
         relative_page_provenance: None,
         zip_entry,

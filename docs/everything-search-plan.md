@@ -170,6 +170,7 @@ Everything は completed candidates を一回渡し、prepare の final Ready �
 `Prepare { request, replaced }` とする。Prepareは他一覧のfolder_thumbnailsを捕捉せず、
 準備workerが検索catalogをopen/load_allし、その新ownerへfolder video-pin seedをcommitする。
 ReadyはCurrentのowner identityかPrepareの置換元identityを検証し、交換済みなら棄却して準備を取り直す。
+再試行のresources更新はMetadata/Everything共通で、owner交換とcache clearによるadmission変更の双方を取り直す。
 採用でpool catalogの型・channel・queue・cancelを同じcontextで一緒に置換し、同じ検索の
 streaming/再検索/sortのrebuildでは作り直さない。検索closeは元一覧の通常reloadを維持する。
 単体ファイルのピンなし画像/ZIP/PDF・EPUB表紙は要求単位で通常親catalogを使い、その他の行は

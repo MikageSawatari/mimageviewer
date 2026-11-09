@@ -1,6 +1,6 @@
 # 検索結果などで作ったサムネイルを親フォルダのキャッシュにも置く (§1.741)
 
-作成: 2026-11-08。状態: **実装済み (独立レビュー前)**。
+作成: 2026-11-08。状態: **実装済み (独立再レビュー待ち)**。
 独立設計レビュー: r1〜r4 REVISE → r5 ACCEPT、2026-11-09、Codex GPT-6.1 Sol / xhigh。
 対象版: 利用者判断 (§12)。
 バックログ: [next-release-backlog.md §1.741](next-release-backlog.md)。報告: 5ch >>746。
@@ -78,6 +78,7 @@
   - Ready の検証 (`is_current`): `Current` は今と同じく現在の owner と identity を比べる。`Prepare` は「現在の pool が
     まだ `replaced` と同じ (Ready 待ちの間に別の owner へ変わっていない)」ことを確かめる。変わっていれば今と同じく
     棄却して準備を取り直す。identity の検証自体は外さない。
+    再試行では Metadata / Everything 共通の送信経路で、owner と catalog admission を含む resources を取り直す。
   - 採用 (`install_missing_search_thumbnail_workers` を一般化) で、`Prepare` の owner の catalog・メモリで pool を
     作り直す (pool なしなら作る)。以後の rebuild は `Current` として現在の検索 owner を捕捉する今の経路に戻る。
   - `ThumbnailPoolCatalog` は pool の channel・queue・cancel token と同じ context の所有単位に置き、pool を作る・作り直す・
@@ -153,6 +154,8 @@ enum ThumbStorageScope {
   いても、検索・タグ等の flag があれば `MultiParent`。
 - `SingleFolder` の要求は今と同じ `Fixed`。`ParentRow` は付けない (そのフォルダの Fixed が親 DB そのもの)。
 - 受付時の `CatalogWork` (cache dir と admission) を持ち、派生要求は継承する (r1 指摘 7)。
+  色フィルター等が受付後にピンを解決した場合、最終分岐に従い Parent から一覧の Fixed へ切り替える。
+  Fixed は既存接続の admission に加えて、引き継いだ `CatalogWork` も保持・検証する。新しい admission を取り直さない。
 
 ### 5.3 provider
 
@@ -212,6 +215,8 @@ struct ThumbnailCatalogProvider {
 - 派生要求 (EPUB fallback、RAW follow-up、PDF catch-up) は外側の `RequestCatalog` と `CatalogWork` を継承する。
   `ParentRow` はピンなしの表紙だけに付くので、キーが外側と変わる派生 (ピンの再帰、EPUB のピンの世代付け足し) は
   起きない。worker で Parent の要求のキーが外側の要求キーと違えば、debug_assert + ログで止め、親 DB に書かない。
+  外側のキーは UI の受付時に捕捉し、worker 初回処理より前の遅延ピン解決でも消さない。
+  遅延解決でピン付きになった要求は §8 の Fixed に切り替えるため、親 DB のピンなし行を読まず、上書きもしない。
 - **PDF メタ補完は Parent の保存先でも行う** (r3 指摘 5)。今 Fixed の書き込み接続で行っている PDF メタの保存
   (表紙のレンダリング結果からのページ数等の保存、**observed 署名のある親 DB hit 時だけ**の catch-up) を、保存先が Parent のときは親 DB の
   書き込み接続 (受付時の `CatalogWork` の admission の下、表紙の保存と同じ `ThumbnailSaveTarget` から開くもの) で、
@@ -279,7 +284,8 @@ struct ThumbnailCatalogProvider {
 
 ## 9. 状態の組み合わせ・失敗の扱い
 
-- 保存先は受付時の型 (`Fixed` / `Parent` / `CollectionSourceParent`) で 1 つに決まる。複数の親を並べる一覧は必ず
+- 保存先は受付時の型 (`Fixed` / `Parent` / `CollectionSourceParent`) と最終分岐で 1 つに決まる。
+  受付後に Parent からピン付きへ変わる場合だけ Fixed に移り、受付 admission は維持する。複数の親を並べる一覧は必ず
   自分の pool を持つので、「借りた pool × 要求の scope」の組み合わせが無くなる。
 - clear (キャッシュ削除) を跨いだ要求は、受付時の `CatalogWork` の admission で今の Collection と同じく保存しない。
 - 兄弟 context (F12・別ウィンドウ) が同じ親フォルダを通常に開いていても、pool ごとの別接続で同じ DB に書くだけで、
@@ -387,12 +393,12 @@ struct ThumbnailCatalogProvider {
   既存の旧行は消さない (キャッシュの削除・期限で消える)。
 - 公開文書の文言は変えない (偽になる文は無い)。
 
-## 16. 実装メモ (2026-11-09、独立レビュー前)
+## 16. 実装メモ (2026-11-09、独立再レビュー待ち)
 
 - 検索 pool の所有、Parent 要求・遅延 catalog、observed と要求メモリ署名の分離、RAW/EPUB、
   親 PDF メタ保存・親 DB hit の catch-up、release check の保存先 witness を実装した。
-  初回差分は設計担当が WIP `8c4fd0def` としてコミットした。今回の追補は未コミット。
-  実装担当は製品バイナリを起動しておらず、独立レビュー・検収も未実施。
+  設計担当が `8c4fd0def` と PDF 追補 `9960419d2` をコミットした。独立実装レビューは P2 2件で REVISE。
+  今回の指摘修正は未コミット・再レビュー待ち。実装担当は製品バイナリを起動しておらず、検収も未実施。
 - 機械的な調整: `Current` は名前付き field、pool 置換は既存 metadata refresh と共通 helper、
   通常 folder scan と Parent stat は共通 `file_stamp` を使用する。seed resources は cache 必須・
   catalog 任意とし、DB 障害でも §9 のメモリ表示を維持する。新しい再試行はない。
@@ -402,3 +408,13 @@ struct ThumbnailCatalogProvider {
   親フォルダ＋basename lookup。3 reader のコードを実装側でも照合した。
 - 自動検証の対象・全テスト名・実行結果は
   [実装検証記録](search-thumb-parent-catalog-verification.md) を参照。本体 lib 全件は依頼どおり設計担当が行う。
+- 独立レビュー P2 修正: Ready 棄却後の resources 更新を両 producer の共通経路に揃え、Ctrl+G でも
+  owner 交換・clear 後の再投影が採用へ収束する。identity 検証は維持し、pool の不要な再作成はしない。
+- 独立レビュー P2 修正: `apply_folder_thumb_pin` の成功分岐は Parent だけを Fixed に変更し、元の
+  `CatalogWork` を `Fixed { work: Some(..) }` へ保持する。通常の Fixed は `work: None` で既存接続の admission を使う。
+  色フィルターの先行 Fixed lookup も同じ受付証明を検証する。clear 後の保存は禁止し、CacheOnly の一回 RO 継続は維持。
+  これは §8 の保存先を最終分岐へ適用する型の機械的拡張で、対象範囲を広げる変更ではない。
+- 派生経路を点検: RAW は clone、EPUB fallback は `inherit_request_identity_from`、PDF catch-up は clone で
+  要求先・受付証明・外側キーを継承する。seed/child のキー差替えは対象外の folder/drive 専用。
+  外側キーを受付時に捕捉し、ピン要求でも消さないことで、誤って Parent のまま異なるキーを渡した場合の
+  debug_assert + log は初回 worker の stat/親 DB lookup より前に働く。

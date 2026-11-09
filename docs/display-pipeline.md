@@ -27,6 +27,8 @@ mouse / touch の zoom・pan と navigator は Depth 中だけ止め、通常2D�
 検索・★・履歴等のMultiParentではピンなし画像/ZIP/PDF・EPUB表紙だけ通常親catalogの通常row keyへ保存する。
 通常folder/ZIP・PDF内/Collection PhysicalSourceはFixed、folder/pin/変換書庫/Stack/内部page/集約行は従来の宛先。
 音声/動画/Remoteの専用経路も維持する。
+色フィルター等の受付後にピンを解決した表紙は、元のCatalogWorkを保持してParentから一覧のFixedへ切り替える。
+外側キーは受付時に捕捉し、誤ってParentのまま別キーになった要求はstat/親lookup前に止める。
 
 Parentは既存EPUB stamp準備の後、一覧自身のメモリを要求キー/要求stampで先に引き、hitならstatしない。
 miss時に通常scanと同じobserved（EPUBは解決済みgeneration）で親DBをRO lookupし、必要時だけ生成する。

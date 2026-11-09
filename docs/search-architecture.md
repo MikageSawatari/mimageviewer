@@ -94,6 +94,7 @@ Everythingの動画pin WebPもprepare workerのreadonly DBで取得し、完成A
 `Prepare` とし、workerが新しい検索catalogをopen/load_allしてからそのownerへcommitする。
 再投影ごとにresourcesを渡し、ReadyではCurrentのidentityまたはPrepareの置換元identityを照合する。
 交換済みなら既存prepare再試行で取り直し、元一覧や兄弟contextのcatalog/cacheへseedしない。
+再試行時のresources再捕捉はMetadata/Everything共通で、cache clearによるadmission変更も同じ経路を通る。
 採用時の`lookup_webps_many`やBLOB再取得は行わない。
 pin変更stampが古ければ同じprepareで再準備する。Ctrl+Gの既存同期bulk lookupは確認済みだが、
 EverythingのP2修正とは別件として残す（[対応範囲](everything-search-plan.md#16-p2-動画pinのworker準備2026-10-12)）。

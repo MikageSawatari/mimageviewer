@@ -66,6 +66,199 @@ fn prepare_pin_metadata(
     .unwrap()
 }
 
+fn poll_metadata_until(
+    app: &mut App,
+    ctx: &egui::Context,
+    reason: &str,
+    ready: impl Fn(&App) -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !ready(app) {
+        app.poll_global_search_events(ctx);
+        assert!(Instant::now() < deadline, "{reason}");
+        std::thread::yield_now();
+    }
+}
+
+fn queue_metadata_with_held_ready(app: &mut App, ctx: &egui::Context, path: &Path) {
+    app.open_global_search();
+    app.global_search.metadata_draft = "test".into();
+    app.global_search.aggregate_auto = false;
+    app.begin_search_page_edit_prepare_for_test(ctx);
+    app.hold_next_search_ready_for_test();
+    let (stream, rx) = crossbeam_channel::unbounded();
+    app.global_search.pending = Some(everything::SearchProducer::Metadata(SearchHandle {
+        cancel: Arc::new(AtomicBool::new(false)),
+        rx,
+    }));
+    stream
+        .send(SearchStreamEvent::Batch {
+            hits: vec![GlobalHit {
+                kind: IndexKind::Image,
+                path: path.to_string_lossy().into_owned(),
+                score: 1.0,
+                stars: 0,
+                mtime: 0,
+                file_size: Some(0),
+            }],
+            scanned_candidates: 1,
+            valid_hits: 1,
+            visibility_notice: None,
+        })
+        .unwrap();
+    stream
+        .send(SearchStreamEvent::Done {
+            truncated: false,
+            reason: DoneReason::Complete,
+        })
+        .unwrap();
+    poll_metadata_until(
+        app,
+        ctx,
+        "initial Metadata Ready was not held",
+        App::search_ready_is_held_for_test,
+    );
+}
+
+fn metadata_adopted(app: &App, path: &Path) -> bool {
+    let prepare = app.global_search.page_edit_prepare.as_ref().unwrap();
+    app.global_search.done
+        && app.items == [GridItem::Image(path.to_path_buf())]
+        && matches!(
+            &app.global_search.accepted,
+            everything::SearchAccepted::Metadata { applied: Some(spec) } if spec.query == "test"
+        )
+        && prepare.in_flight.is_none()
+        && prepare.desired.is_none()
+}
+
+#[test]
+fn section1741_metadata_current_owner_replaced_while_ready_pending_retries_and_adopts() {
+    let mut app = crate::app::setup_app_for_test();
+    let ctx = egui::Context::default();
+    let image = app.tmp.path().join("result.jpg");
+    super::tests::g1_publish_search_hits(&mut app, &ctx, std::slice::from_ref(&image));
+    app.global_search.metadata_draft = "test".into();
+    app.hold_next_search_ready_for_test();
+    app.rebuild_items_from_global_search();
+    poll_metadata_until(
+        &mut app,
+        &ctx,
+        "Metadata Ready was not held before owner replacement",
+        App::search_ready_is_held_for_test,
+    );
+    let generation = app.items_generation;
+    let prepare_cancel = app.search_prepare_cancel_for_test();
+    let replacement = Arc::new(std::sync::RwLock::new(HashMap::new()));
+    app.current_color_cache_map = Some(Arc::clone(&replacement));
+    let replacement_cancel = Arc::clone(&app.cancel_token);
+    app.release_search_ready_for_test();
+    poll_metadata_until(
+        &mut app,
+        &ctx,
+        "Metadata retry kept using the retired thumbnail owner",
+        |app| app.items_generation != generation && metadata_adopted(app, &image),
+    );
+    assert!(app.search_prepare_metrics_for_test().stale_rejections > 0);
+    assert!(Arc::ptr_eq(
+        app.current_color_cache_map.as_ref().unwrap(),
+        &replacement
+    ));
+    assert!(Arc::ptr_eq(&app.cancel_token, &replacement_cancel));
+    assert!(!replacement_cancel.load(Ordering::Relaxed));
+    assert!(Arc::ptr_eq(
+        &app.search_prepare_cancel_for_test(),
+        &prepare_cancel
+    ));
+    assert!(!prepare_cancel.load(Ordering::Relaxed));
+}
+
+#[test]
+fn section1741_metadata_prepare_owner_replaced_before_ready_retries_and_adopts() {
+    for had_pool in [false, true] {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        if had_pool {
+            let origin = app.tmp.path().join("origin");
+            std::fs::create_dir(&origin).unwrap();
+            app.load_folder(origin);
+            app.finish_page_identity_preparation_for_test();
+        } else {
+            app.enter_drive_list(None);
+        }
+        let image = app.tmp.path().join("result.jpg");
+        queue_metadata_with_held_ready(&mut app, &ctx, &image);
+        let replacement = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        app.install_search_thumbnail_workers(Arc::clone(&replacement), None);
+        let replacement_cancel = Arc::clone(&app.cancel_token);
+        app.release_search_ready_for_test();
+        poll_metadata_until(
+            &mut app,
+            &ctx,
+            "stale Metadata Prepare did not retry with the replacement owner",
+            |app| metadata_adopted(app, &image),
+        );
+        assert!(app.search_prepare_metrics_for_test().stale_rejections > 0);
+        assert!(Arc::ptr_eq(
+            app.current_color_cache_map.as_ref().unwrap(),
+            &replacement
+        ));
+        assert!(Arc::ptr_eq(&app.cancel_token, &replacement_cancel));
+        assert!(!replacement_cancel.load(Ordering::Relaxed));
+    }
+}
+
+#[test]
+fn section1741_metadata_ready_after_cache_clear_recaptures_admission_and_adopts() {
+    for initial_prepare in [false, true] {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let image = app.tmp.path().join("result.jpg");
+        if initial_prepare {
+            app.enter_drive_list(None);
+            queue_metadata_with_held_ready(&mut app, &ctx, &image);
+        } else {
+            super::tests::g1_publish_search_hits(&mut app, &ctx, std::slice::from_ref(&image));
+            app.global_search.metadata_draft = "test".into();
+            app.hold_next_search_ready_for_test();
+            app.rebuild_items_from_global_search();
+            poll_metadata_until(
+                &mut app,
+                &ctx,
+                "Metadata Ready was not held before cache clear",
+                App::search_ready_is_held_for_test,
+            );
+        }
+        let generation = app.items_generation;
+        let prepare_cancel = app.search_prepare_cancel_for_test();
+        let captured = SearchMetadataResources::for_app(&app);
+        let work = crate::catalog::CatalogWork::default();
+        crate::catalog::delete_all_cache(work.identity().0);
+        assert!(
+            !captured
+                .thumbnail_owner
+                .is_current(&SearchMetadataResources::for_app(&app).thumbnail_owner)
+        );
+        app.release_search_ready_for_test();
+        poll_metadata_until(
+            &mut app,
+            &ctx,
+            "Metadata retry kept using the catalog admission from before clear",
+            |app| app.items_generation != generation && metadata_adopted(app, &image),
+        );
+        assert!(app.search_prepare_metrics_for_test().stale_rejections > 0);
+        assert!(Arc::ptr_eq(
+            &app.search_prepare_cancel_for_test(),
+            &prepare_cancel
+        ));
+        assert!(!prepare_cancel.load(Ordering::Relaxed));
+        assert_eq!(
+            app.thumbnail_pool_catalog,
+            ThumbnailPoolCatalog::View(crate::app::search_results_synthetic_path())
+        );
+    }
+}
+
 #[test]
 fn section1741_nonsearch_pool_capture_never_borrows_outgoing_resources() {
     let mut app = crate::app::setup_app_for_test();

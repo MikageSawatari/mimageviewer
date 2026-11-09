@@ -750,6 +750,8 @@ nodeは成功cacheと排他的な走査状態を持ち、private Receiverの寿�
 SingleFolder（Collection PhysicalSourceを含む）は明示的にFixed、Collection rootは§1.668の元親namespace、
 MultiParentのピンなし画像/ZIP/PDF・EPUB表紙だけParentを使う。folder/pin/変換書庫/Stack/内部page/集約行、
 音声/動画/Remoteは従来経路。EPUB fallback/RAW deferred/PDF catch-upも元の要求先/admissionを継承する。
+受付後の遅延ピン解決でParentの表紙がピン付きになれば、同じCatalogWorkを保持して一覧のFixedへ切り替える。
+外側キーは受付時に捕捉し、Parentのまま異なるキーへ派生した要求はstat/親lookup前にassert/logで止める。
 種類（Collection元親/通常親）・path・cache dir・admission・RO/RWを区別した合計16 slotのLRUは
 slot取得だけをlockし、OnceLock初期化・open/lookup/保存/closeはworker、lock外で行う。
 pool/要求は所有contextのqueue/cancelに従い、最後のArcはworkerでdropする。
@@ -767,6 +769,7 @@ clearを跨いだ要求の保存を受付admissionで禁じ、CacheOnlyだけ旧
 検索に入るprepareは、検索poolなら `Current`、それ以外なら置換元identity付き `Prepare` を捕捉する。
 Prepareのworkerが `__search_results__` をopen/load_allし、新ownerへEverythingのfolder video-pin seedをcommitする。
 ReadyはCurrentのownerまたはPrepareの置換元identityを照合し、変化していれば既存prepare再試行へ戻す。
+Metadata/Everything共通の再試行経路でresourcesを取り直し、owner交換・admission変更後も新しいReadyを採用する。
 採用はそのcontextのpool catalog型/channel/queue/cancelを一緒に置換し、同じ検索内のstreaming/rebuildでは維持する。
 検索を閉じた元一覧の通常reloadも維持し、兄弟contextのrows/cache/generation/queue/cancelや共有epochは変更しない。
 旧合成DB行は従来のメモリで読み、移送・追加statをしない。schema/hashの変更や一括移行もない。

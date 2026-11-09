@@ -1,8 +1,59 @@
 # §1.741 実装の自動検証記録 (2026-11-09)
 
-対象は `G:\home\mimageviewer-1741` / `fix-1741-search-thumb-reuse` の WIP `8c4fd0def` と、その後の未コミット差分。
-PDF メタ補完の確認事項は設計担当決定で解決した。独立レビュー・検収は未実施。
-正本は [設計 §16](search-thumb-parent-catalog-plan.md#16-実装メモ-2026-11-09独立レビュー前)。
+対象は `G:\home\mimageviewer-1741` / `fix-1741-search-thumb-reuse` の `8c4fd0def` + `9960419d2` と、その後の未コミット差分。
+独立実装レビューの REVISE (P2 2件) を設計担当が確認し、今回修正した。独立再レビュー・検収は未実施。
+正本は [設計 §16](search-thumb-parent-catalog-plan.md#16-実装メモ-2026-11-09独立再レビュー待ち)。
+
+## 独立レビュー指摘の修正
+
+- P2 (Ctrl+G): Ready 棄却後の `MetadataResources` 更新を Metadata / Everything 共通にした。
+  owner 交換・cache clear 後も新しい resources で再投影し、identity 検証を通った結果を採用する。
+- P2 (遅延ピン): 最終分岐がピン付きなら Parent から Fixed へ移し、同じ `CatalogWork` を保持する。
+  親の通常表紙を読まず上書きせず、ピン行を一覧の Fixed へ保存する。先行色判定lookupも受付証明を検証する。
+  外側キーは受付時に捕捉・継承し、誤った Parent 派生は stat/親DB lookup 前に assert/log で拒否する。
+  clear を跨いだ保存は禁止し、CacheOnly の一回 RO 継続を維持する。
+
+新規9件：
+
+- `section1741_metadata_current_owner_replaced_while_ready_pending_retries_and_adopts`
+- `section1741_metadata_prepare_owner_replaced_before_ready_retries_and_adopts`
+- `section1741_metadata_ready_after_cache_clear_recaptures_admission_and_adopts`
+- `section1741_color_pinned_zip_ignores_existing_unpinned_parent_row`
+- `section1741_color_pinned_zip_saves_fixed_without_unpinned_parent_row`
+- `section1741_color_pinned_pdf_ignores_existing_unpinned_parent_row`
+- `section1741_color_pinned_pdf_saves_fixed_without_unpinned_parent_row`
+- `section1741_color_late_pin_catalog_read_keeps_captured_admission`
+- `parent_late_pin_fixed_preserves_admission_and_cache_only_continuation`
+
+ZIP/PDF の4件はそれぞれスマートフォルダ・サブフォルダ展開の両 MultiParent で実行する。
+既存 `parent_derived_key_mismatch_asserts_before_any_parent_write` も、初回 worker 前の派生キー変更・
+parent_row 消去に対し stat 0 / catalog open 0 を検査する形へ補強した。
+§1.731 と §1.741 の既存 Fixed assertion は variant の field 追加に合わせた機械的更新だけ。
+
+実行条件は引き続き `MSBUILDDISABLENODEREUSE=1` / build jobs 4 / 通常 feature / test profile。
+本体 lib 全件の外部実行とは Cargo lock を共有する。新規9件と補強1件の focused は10/10成功。
+初回 compile は既存 Collection assertion のパターン更新漏れ1か所で exit 101（実行0件）。
+型の field 追加に合わせて修正し、同じフィルターを再実行した。
+
+| 検査 | 結果・ログ |
+| --- | --- |
+| 新規9件＋補強1件 focused nextest | **10/10成功**、exit 0、1.395秒（compile 4分40秒）。run `19e8fd76-af92-4013-a37b-1046a98ff586`、`target/section1741-review-fixes-focused-final.log` |
+| 初回 compile の準備失敗 | exit 101、実行0件。`target/section1741-review-fixes-focused.log`。上記再実行で解消 |
+| 関連回帰 nextest | **533/533成功**、exit 0、43.793秒（compile 1分13秒）。run `b9036848-c0c1-429a-94cc-a289020dbcd9`、`target/section1741-review-fixes-regression.log`。検索・Parent・色フィルター・ピン・EPUB・§1.731を含む |
+| `cargo check -p mimageviewer --bin mimageviewer-core -j 4` | exit 0、46.57秒。`target/section1741-review-fixes-check.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core --features test-script -j 4` | exit 0、47.72秒。`target/section1741-review-fixes-check-test-script.log` |
+| `cargo fmt` / `cargo fmt --check` | workspace 全体で実行、exit 0 |
+| `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | exit 0。通常 feature の dev-runtime core（4分12秒）と companion 4本を生成。VCRT 検査も runtime 4 DLL / PE 5本で成功。`target/section1741-review-fixes-build-dev.log`、`target/vcrt-pe-reports/dev-runtime.json`。製品バイナリは起動していない |
+| `git diff --check` / 文書 encoding | exit 0。更新7文書は UTF-8 BOMなし / CRLF保持 |
+
+lib 全件は今回の実装担当から追加実行していない。設計担当が管理する全件 gate と独立再レビューへ引き継ぐ。
+UI 文言・レイアウトの変更はなく、snapshot / glyph 検査は追加実行していない。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE = '1'
+cargo nextest run -p mimageviewer --lib -j 4 -E 'test(/section1741_metadata_|section1741_color_|parent_late_pin_fixed|parent_derived_key_mismatch/)' --no-fail-fast
+cargo nextest run -p mimageviewer --lib -j 4 -E 'test(/^thumb_loader::/) | test(/^global_search_ui::/) | test(/^catalog::tests::/) | test(/^app::color_filter::/) | test(/section1741|auto_aspect|idle_upgrade|collection_physical|folder_thumb_pin|folder_pin_to|zipdir_thumb_request|epub.*pin|pin.*epub/)' --no-fail-fast
+```
 
 ## WIP 後の PDF メタ補完 (設計担当決定の実装)
 

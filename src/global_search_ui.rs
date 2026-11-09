@@ -3789,13 +3789,11 @@ impl App {
                 wish.rating_write_generation = self.rating_session_write_generation;
                 wish.rating_preview = self.rating_preview_recipe();
                 wish.done = self.global_search.done;
-                if matches!(wish.source, SearchProjection::Everything { .. }) {
-                    // A pin refresh can replace the thumbnail owner while Ready is
-                    // pending. Retry against that owner, not the rejected one's snapshot.
-                    let _ = prepare.tx.send(SearchPrepareCommand::MetadataResources(
-                        SearchMetadataResources::for_app(self),
-                    ));
-                }
+                // Both producers validate the thumbnail owner and catalog admission.
+                // Retry with current resources after an owner replacement or cache clear.
+                let _ = prepare.tx.send(SearchPrepareCommand::MetadataResources(
+                    SearchMetadataResources::for_app(self),
+                ));
                 let _ = prepare.tx.send(SearchPrepareCommand::RatingWrites {
                     updates: self.rating_session_writes_after(0),
                     through_generation: self.rating_session_write_generation,

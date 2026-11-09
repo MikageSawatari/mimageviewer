@@ -146,7 +146,10 @@ fn section1741_everything_zip_generation_reuses_parent_catalog_and_folder_select
     env.finish_page_identity_preparation_for_test();
     let mut normal = request(&env, &GridItem::ZipFile(zip), observed).unwrap();
     env.attach_viewer_thumbnail_context(&mut normal);
-    assert!(matches!(normal.catalog_target, RequestCatalog::Fixed));
+    assert!(matches!(
+        normal.catalog_target,
+        RequestCatalog::Fixed { .. }
+    ));
     assert!(
         process(&env, &mut normal)
             .iter()
@@ -232,7 +235,7 @@ fn section1741_parent_rows_are_only_unpinned_single_file_cover_branches() {
             assert!(req.parent_row.is_none(), "{item:?}");
             env.attach_viewer_thumbnail_context(&mut req);
             assert!(
-                matches!(req.catalog_target, RequestCatalog::Fixed),
+                matches!(req.catalog_target, RequestCatalog::Fixed { .. }),
                 "{item:?}"
             );
         }
@@ -273,7 +276,7 @@ fn section1741_parent_rows_are_only_unpinned_single_file_cover_branches() {
         );
         assert!(req.parent_row.is_none());
         env.attach_viewer_thumbnail_context(&mut req);
-        assert!(matches!(req.catalog_target, RequestCatalog::Fixed));
+        assert!(matches!(req.catalog_target, RequestCatalog::Fixed { .. }));
     }
 }
 
@@ -341,6 +344,6 @@ fn section1741_storage_scope_and_root_keys_preserve_single_folder_contract() {
         let mut req = request(&env, &item, (1, 2)).unwrap();
         assert_eq!(req.parent_row.as_ref().unwrap().row_key, expected);
         env.attach_viewer_thumbnail_context(&mut req);
-        assert!(matches!(req.catalog_target, RequestCatalog::Fixed));
+        assert!(matches!(req.catalog_target, RequestCatalog::Fixed { .. }));
     }
 }

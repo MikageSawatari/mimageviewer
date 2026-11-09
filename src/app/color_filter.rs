@@ -71,7 +71,7 @@ fn color_representative_catalog_cache(
     cache_map: &std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
     catalog: Option<&Arc<crate::catalog::CatalogDb>>,
 ) -> Option<Arc<std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>>> {
-    if !color_representative_request(req) {
+    if !color_representative_request(req) || req.catalog_target.is_retired() {
         return None;
     }
     let key = crate::thumb_loader::cache_key_for_request(req)?;
@@ -1887,6 +1887,232 @@ mod tests {
                 0.0,
             )
         );
+    }
+
+    #[test]
+    fn section1741_color_late_pin_catalog_read_keeps_captured_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let work = crate::catalog::CatalogWork::capture(&cache);
+        let req = LoadRequest {
+            catalog_target: crate::thumb_loader::RequestCatalog::Parent {
+                row: crate::thumb_loader::ParentRow {
+                    source: temp.path().join("book.zip"),
+                    folder: temp.path().to_owned(),
+                    row_key: "zipthumb:book.zip".into(),
+                },
+                work: work.clone(),
+            }
+            .for_pinned(),
+            cache_key_override: Some("zipthumb:book.zip#pin:entry".into()),
+            mtime: 1,
+            file_size: 2,
+            ..Default::default()
+        };
+        crate::catalog::delete_all_cache(&cache);
+        let fixed = Arc::new(
+            crate::catalog::CatalogDb::open(&cache, Path::new("__search_results__")).unwrap(),
+        );
+        let entry = cache_entry([0, 255, 0], 1, 2);
+        fixed
+            .save_thumb_bytes(
+                req.cache_key_override.as_deref().unwrap(),
+                1,
+                2,
+                entry.source_dims,
+                &entry.jpeg_data,
+            )
+            .unwrap();
+        assert!(req.catalog_target.is_retired());
+        assert!(
+            color_representative_catalog_cache(&req, &Default::default(), Some(&fixed)).is_none()
+        );
+    }
+
+    #[test]
+    fn section1741_color_pinned_zip_ignores_existing_unpinned_parent_row() {
+        late_pin_color_scan_uses_fixed(false, true);
+    }
+
+    #[test]
+    fn section1741_color_pinned_zip_saves_fixed_without_unpinned_parent_row() {
+        late_pin_color_scan_uses_fixed(false, false);
+    }
+
+    #[test]
+    fn section1741_color_pinned_pdf_ignores_existing_unpinned_parent_row() {
+        late_pin_color_scan_uses_fixed(true, true);
+    }
+
+    #[test]
+    fn section1741_color_pinned_pdf_saves_fixed_without_unpinned_parent_row() {
+        late_pin_color_scan_uses_fixed(true, false);
+    }
+
+    fn late_pin_color_scan_uses_fixed(pdf: bool, seed_unpinned: bool) {
+        use crate::thumb_loader::RequestCatalog;
+        use std::io::Write;
+
+        // Both released MultiParent color-filter entry points admit without resolving pins.
+        for smart in [false, true] {
+            let mut app = setup_app_for_test();
+            let parent = app.tmp.path().join("F01");
+            std::fs::create_dir(&parent).unwrap();
+            let path = parent.join(if pdf { "book.pdf" } else { "book.zip" });
+            if pdf {
+                // Rendering is supplied at the normal worker boundary below.
+                std::fs::write(&path, b"fake PDF backend source").unwrap();
+            } else {
+                let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+                for (name, rgb) in [("cover.png", [255, 0, 0]), ("pinned.png", [0, 0, 255])] {
+                    zip.start_file(name, zip::write::SimpleFileOptions::default())
+                        .unwrap();
+                    let mut png = std::io::Cursor::new(Vec::new());
+                    image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                        16,
+                        12,
+                        image::Rgb(rgb),
+                    ))
+                    .write_to(&mut png, image::ImageFormat::Png)
+                    .unwrap();
+                    zip.write_all(png.get_ref()).unwrap();
+                }
+                zip.finish().unwrap();
+            }
+            let stamp = crate::catalog::file_stamp(&std::fs::metadata(&path).unwrap());
+            app.current_folder = Some(if smart {
+                super::super::smart_folder::smart_folder_synthetic_path(uuid::Uuid::new_v4())
+            } else {
+                subfolder_expansion_synthetic_path()
+            });
+            app.items_are_subfolder_expansion_view = !smart;
+            app.items = vec![if pdf {
+                GridItem::PdfFile(path.clone())
+            } else {
+                GridItem::ZipFile(path.clone())
+            }];
+            app.image_metas = vec![Some(stamp)];
+            let pin = if pdf {
+                crate::folder_thumb_pins::FolderPinSource::PdfPage {
+                    pdf_rel: String::new(),
+                    page: 2,
+                }
+            } else {
+                crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+                    zip_rel: String::new(),
+                    entry: "pinned.png".into(),
+                }
+            };
+            app.folder_pin_map
+                .insert(crate::path_key::normalize_keep_drive(&path), pin.clone());
+            assert_eq!(app.thumb_storage_scope(), ThumbStorageScope::MultiParent);
+            let (_, req) = app.color_work_identity_for_idx(0).unwrap();
+            let RequestCatalog::Parent { row, work } = &req.catalog_target else {
+                panic!("color admission must defer pin resolution");
+            };
+            let row_key = row.row_key.clone();
+            let work = work.clone();
+            let original_key = crate::thumb_loader::cache_key_for_request(&req)
+                .unwrap()
+                .into_owned();
+            assert_eq!(
+                req.parent_request_key.as_deref(),
+                Some(original_key.as_str())
+            );
+            let parent_db = seed_unpinned.then(|| work.open(&parent).unwrap());
+            let green = cache_entry([0, 255, 0], stamp.0, stamp.1);
+            if let Some(db) = &parent_db {
+                db.save_thumb_bytes(
+                    &row_key,
+                    stamp.0,
+                    stamp.1,
+                    green.source_dims,
+                    &green.jpeg_data,
+                )
+                .unwrap();
+            }
+            let fixed = Arc::new(work.open(app.current_folder.as_deref().unwrap()).unwrap());
+            let pinned = apply_folder_thumb_pin(
+                req.clone(),
+                &path,
+                &original_key,
+                false,
+                if pdf {
+                    ContainerKindForPin::PdfFile
+                } else {
+                    ContainerKindForPin::ZipFile
+                },
+                &app.folder_pin_map,
+                &Default::default(),
+                None,
+                None,
+                None,
+            );
+            let RequestCatalog::Fixed {
+                work: Some(pin_work),
+            } = &pinned.catalog_target
+            else {
+                panic!("resolved pin must use the list's Fixed catalog");
+            };
+            assert_eq!(pin_work.identity(), work.identity());
+            assert!(pinned.parent_row.is_none());
+            assert_eq!(pinned.parent_request_key, req.parent_request_key);
+            let pinned_key = crate::thumb_loader::cache_key_for_request(&pinned)
+                .unwrap()
+                .into_owned();
+            assert!(pinned_key.contains("#pin:"));
+            let scan = || scan_one(req, Some(pin), Default::default(), Some(fixed.clone()));
+            let palette = if pdf {
+                crate::thumb_loader::with_test_pdf_render_result(
+                    crate::pdf_loader::RenderResult {
+                        image: image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                            16,
+                            12,
+                            image::Rgb([0, 0, 255]),
+                        )),
+                        content_type: crate::pdf_loader::PdfPageContentType::Vector,
+                        page_count: 3,
+                        page_size_points: crate::pdf_loader::PdfPageSizePoints {
+                            width: 160.0,
+                            height: 120.0,
+                        },
+                    },
+                    scan,
+                )
+            } else {
+                scan()
+            };
+            assert!(crate::color_search::palette_matches(
+                &palette,
+                crate::color_search::srgb_to_lab([0, 0, 255]),
+                6.0
+            ));
+            assert!(!crate::color_search::palette_matches(
+                &palette,
+                crate::color_search::srgb_to_lab([0, 255, 0]),
+                6.0
+            ));
+            assert!(!crate::color_search::palette_matches(
+                &palette,
+                crate::color_search::srgb_to_lab([255, 0, 0]),
+                6.0
+            ));
+            let saved = fixed
+                .load_one(&pinned_key)
+                .unwrap()
+                .expect("pinned row saved to Fixed");
+            assert_eq!((saved.mtime, saved.file_size), stamp);
+            assert!(fixed.load_one(&row_key).unwrap().is_none());
+            assert!(fixed.load_one(&original_key).unwrap().is_none());
+            if let Some(db) = &parent_db {
+                let rows = db.load_all().unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[&row_key].jpeg_data, green.jpeg_data);
+                assert_eq!((rows[&row_key].mtime, rows[&row_key].file_size), stamp);
+            } else {
+                assert!(!crate::catalog::db_path_for(work.identity().0, &parent).exists());
+            }
+        }
     }
 
     #[test]
