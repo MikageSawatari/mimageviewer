@@ -1,6 +1,6 @@
 # ページ切替後の初期表示位置「中央 / 読み始め」(§1.726)
 
-- 状態: **r4 再レビュー承認済み。ページ構成切替の追補は実装済み・レビュー／実機再確認待ち** (2026-11-09、§9.7・§9.8)。設計担当の §10 の決定を実装し、core check・絞り込み nextest・UI snapshot を通過した。独立設計レビュー (GPT-6.1 Sol / xhigh) r1 の P2 5 件、r2 の P2 2 件を反映した r3 の記録は §8。
+- 状態: **r4 再レビュー承認済み。ページ構成切替の同一 frame 修正は実装済み・レビュー／実機再確認待ち** (2026-11-09、§9.7〜§9.9)。設計担当の §10 の決定を実装し、core check・絞り込み nextest・UI snapshot を通過した。独立設計レビュー (GPT-6.1 Sol / xhigh) r1 の P2 5 件、r2 の P2 2 件を反映した r3 の記録は §8。
 - 要望: 5ch >>739 (2026-11-07)。ズーム/フィット設定で画像が画面からはみ出すと、ページを送った先が
   中央から表示されるので、上から読みたい。拡大操作の中心点やマウスカーソルの移動を変える要望ではない。
 - 利用者決定 (backlog §1.726): 設定を追加する。既定は従来どおり「中央」。
@@ -103,6 +103,8 @@ struct FsInitialPlacementRequest {
   2. `fs_zoom == applied_zoom` かつ `fs_pan == applied_pan` (最後の自動適用後に誰かが位置・倍率を動かしていない。補助条件で、主は下の明示消去)
   3. この frame で選んだ表示単位が current である (holdover を選んでいない。`selected_display_unit.is_current()` を両描画経路へ渡す。
      current を描いた上に holdover を重ねる経路があるので、`CurrentItem` かどうかでは判定しない。紙めくり条件を含む `live_eligible` は代用しない)
+     構成キーで単位が変わった frame は、既存の `FsKeyPageTransition::Rebased` により同じ frame の描画準備を更新し、
+     新しい構成・整合後の slice の幾何を使う。入力前の `spread_pair` を current として使い回さない (§9.9)。
   4. **実際に選んだ素材と今の fit / view から、この表示単位の幾何を解決できた** (`MaterialDisplayBasis` の single / spread / specified の契約に従う)
 
   1・2 が不成立なら要求を捨てる。3・4 が不成立なら要求を残し、次の frame で再評価する
@@ -735,6 +737,88 @@ cargo nextest run -p mimageviewer --lib --build-jobs 4 --test-threads 4 -E 'test
   (20.12 秒、`target/1726-normalize-zoom-core.log`)。既存 warning は残る。
 - 最後に `$env:MSBUILDDISABLENODEREUSE='1'; cargo fmt` (引数なし) を実行して成功した。
   `git diff --check` も成功。製品起動・full gate・build-dev・コミットは行っていない。
+
+### 9.9 依頼 27b: 構成キーと同じ frame の旧幾何で要求を消費する問題 (2026-11-09)
+
+設計担当から、`a837fb9ed` のサブ PC 確認 (依頼 27b) で A2・B2・B4 が NG だったと報告された。
+観測者はサブ PC 担当、資料は `C:\miv-subpc\results-27b\notes.md` と logs。実装担当はこの PC 上でそれらの資料を直接閲覧していない。
+単ページ→分割 RTL、単ページ→見開き RTL、手動移動後の見開き LTR→単ページで、縦は上端になるが横が旧単位の幅で配置された。
+幅が変わらない切替、同じ構成の no-op、Center の持越しは OK だった。
+
+原因と実経路:
+
+- `render_fullscreen_viewport_with_root_input` は、viewport のキー処理前に `prepare_paged_viewer_frame` で
+  `FsFrameState`・`FsBookPresentation`・`spread_pair` を解決する。
+- `handle_fs_key_input_with_operation` の既存の rebase 通知は rating 等の publication 後にあるが、構成キーの適用はさらに後だった。
+  同じ anchor の構成変更が通知されず、準備した旧 `spread_pair`・composition のまま新しい `spread_mode`・要求を使って描いた。
+- 旧単位も完成素材なので、current 選択として旧幅の pan を計算し要求を確定・消去した。次 frame は新単位を描くが、再配置する要求が残っていなかった。
+  cache の失効遅れや holdover 選択が原因ではなく、入力前の描画準備を更新しないことが原因だった。
+
+対処と簡素化:
+
+構成キーの受理前後で既存の `spread_mode`・`fullscreen_page_slice`・`SpreadDisplayComposition` を比較し、
+実際に変わったときだけ既存の `FsKeyPageTransition::Rebased { idx }` を返す。
+通常キーと本の構成を使う generic view mode の両方を同じ箇所で扱い、同じ構成でも見開きずらし解除でページの組が変われば通知する。
+既存の rebase consumer が同じ frame に `prepare_paged_viewer_frame` をやり直し、split の slice 整合も終えた新単位を描く。
+拒否と no-op は通知しない。6/7、編集 pivot の一時表示、detached の述語・viewport routing は変更しない。
+
+要求に構成・slice の識別を追加する案は採らない。古い描画準備と新しい入力状態の混在を許したまま要求側で照合すると、
+同じ構成の所有を重複させ、slice の後着整合も別に扱う必要がある。既存の入力→再準備の経路に揃えれば状態を追加せず、
+新しい単位の最初の描画で配置できる。消費を遅らせる guard、delay、追加 repaint は入れていない。
+
+3 入口の棚卸し: open は描画準備より前の受理、または現 frame の描画後の navigation commit で要求を作る。
+分割片側移動も同じ navigation commit で slice と要求を同時に更新し、次の描画準備で新しい半分を解く。
+構成キーだけが描画準備と paint の間で単位を直接変えるため、その既存の rebase 通知を補った。
+メニューの構成適用は現 frame の画像描画後、snapshot 復元・live projection 採用は後続の描画準備前なので旧幾何を消費しない。
+
+追加した App 描画回帰 (`src/ui_fullscreen/initial_placement/tests/viewport_input.rs`):
+
+```text
+initial_placement_viewport_key9_single_landscape_to_split_rtl_uses_new_half_geometry
+initial_placement_viewport_key4_single_portrait_to_rtl_spread_uses_new_pair_geometry
+initial_placement_viewport_key1_panned_ltr_spread_to_single_uses_new_page_geometry
+initial_placement_viewport_accepted_open_resets_before_complete_unit_consumes_request
+initial_placement_viewport_accepted_same_image_split_key_keeps_old_paint_from_consuming_request
+```
+
+raw key → 実 viewport の入力・準備・paint → 次 frame を通し、unit rect・UV・pan・要求の寿命を検査する。
+Windows の embedded viewer を headless で描画し、通常 fullscreen と共通の viewport 内の入力・描画処理を通す。製品は起動しない。
+構成変更の 3 件は、新素材が cache 済みなのでキーと同じ frame で新単位の読み始めに確定することを要求する。
+open の回帰も矢印キーから実際の navigation commit・通常 open を通す。旧単位を描いた frame の末尾で reset と要求生成、
+次の新ページの完成 frame で配置・要求消費、それ以後の安定を検査する。分割片側移動も同じ commit 境界を検査する。
+従来の構成回帰は直接 apply の後で新しい composition を解くため、入力前の準備が残る同一 frame を通っていなかった。
+既存テストの期待値変更・削除・弱体化はしていない。
+
+修正前の再現は **3 件すべて失敗** (0.543 秒、コンパイル 2 分 46 秒)。いずれも旧幾何の frame で要求が既に消費されていた。
+`target/1726-same-frame-repro.log`、run ID `e90d32f9-d754-4ff3-8292-06c083831995`。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+cargo nextest run -p mimageviewer --lib --build-jobs 4 --test-threads 4 -E 'test(~initial_placement_viewport_)'
+```
+
+- 修正後の追加 5 件は **5 件成功・17,031 件除外** (0.991 秒、コンパイル 3 分 14 秒)。
+  `target/1726-same-frame-fixed.log`、run ID `14cb3fe4-6c91-43d3-8d5c-83c8c7424a96`。
+  その後、構成キーの同じ frame に新単位が描かれる条件を厳密化し、open 回帰も raw key からの実 navigation 経路に揃えた。
+- 最終の絞り込みは、§9.8 の 529 件に上記 5 件を加えて **534 件成功・16,502 件除外**
+  (98.219 秒、コンパイル 2 分 05 秒)。既存テストの期待値は変更していない。
+  `target/1726-same-frame-regression.log`、run ID `356f9d39-3ac0-4ebb-bc68-8dae87468c9f`。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+cargo nextest run -p mimageviewer --lib --build-jobs 4 --test-threads 4 -E 'test(~initial_placement) | test(~page_start_position) | test(~settings_transfer) | test(~search_index) | (test(~viewer_context_registry) & (test(~bundle) | test(~swap) | test(~context_async_owner_registry))) | test(~holdover) | test(~page_turn_submission_tests) | test(~page_material_kind) | test(~pdf_metadata_readoption) | test(~source_absent_changed_view_or_prepare_key_uses_existing_fallback) | test(~source_absent_stable_view_keeps_native_single_and_pair) | test(~ui_fullscreen::page_turn::) | test(~book_composition_runtime_tests) | test(~snapshot_ops::tests) | test(~spread_mode)'
+```
+
+- core check は成功 (19.76 秒、`target/1726-same-frame-core.log`)。既存 warning は残る。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+cargo check -p mimageviewer --bin mimageviewer-core --jobs 4
+```
+
+- 最後に `$env:MSBUILDDISABLENODEREUSE='1'; cargo fmt` (引数なし) を実行して成功した。
+  整形後の Rust 差分は整形のみで、追加の機能変更はない。`git diff --check` も成功。
+  製品起動・修正後の実機確認・full gate・build-dev・コミットは行っていない。
 
 ## 10. r4: 仮の素材の frame と確定 (設計担当の決定、2026-11-08)
 

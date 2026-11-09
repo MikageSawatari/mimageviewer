@@ -36591,9 +36591,6 @@ impl App {
             } else {
                 None
             };
-        if let Some(view_mode) = generic_view_mode {
-            self.apply_fullscreen_view_mode(ctx, fs_idx, view_mode);
-        }
         let new_spread = if key_1 {
             Some(SpreadMode::Single)
         } else if key_2 {
@@ -36611,6 +36608,17 @@ impl App {
         } else {
             None
         };
+
+        let composition_before = (generic_view_mode.is_some() || new_spread.is_some()).then(|| {
+            (
+                self.spread_mode,
+                self.fullscreen_page_slice,
+                self.spread_display_composition_for_anchor(fs_idx),
+            )
+        });
+        if let Some(view_mode) = generic_view_mode {
+            self.apply_fullscreen_view_mode(ctx, fs_idx, view_mode);
+        }
 
         if let Some(mode) = new_spread {
             let accepted = if mode == SpreadMode::Single {
@@ -36637,6 +36645,23 @@ impl App {
             };
             if accepted && self.spread_mode == mode {
                 self.show_feedback_toast(format!("[{}:{}]", key_num, mode.label()));
+            }
+        }
+        if let Some(before) = composition_before {
+            let Some(idx) = self.fullscreen_idx else {
+                action.page_transition = FsKeyPageTransition::Closed;
+                return action;
+            };
+            let after = (
+                self.spread_mode,
+                self.fullscreen_page_slice,
+                self.spread_display_composition_for_anchor(idx),
+            );
+            if before != after {
+                // Preparation preceded these keys. Reuse the ordinary rebase so
+                // this pass paints the new unit, including its reconciled half,
+                // rather than consuming its placement with the old geometry.
+                action.page_transition = FsKeyPageTransition::Rebased { idx };
             }
         }
         // 表示操作の数字キーは、連結読みで画面中央に来る ZIP 区切りページ上でも有効にする。
