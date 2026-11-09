@@ -82,14 +82,38 @@ UIでDBを開かず、古い投影処理による上書きを防ぐ。詳細は[
 
 ### 紙めくりpresentationのA0実装 (§1.341、2026-10-11、受入れ待ち)
 
-§1.750 調査計装（2026-11-10）: `source_geometry_or_binding_changed` の取消に
-`origin=turn_compare|prepare_reuse` と、比較で異なる項目だけの `different_fields` を
-通常ログ・perfへ記録する。`content` と本全体の `layout_arc` も対象とし、Arc不一致時は
-演出対象unitのoccurrences／formation／placementの一致を併記する。
-`reconcile_landscape` の判定反転時だけidx・旧新判定・新epochを記録する。
-名前・パス・画像内容は出力せず、取消条件や素材保持・表示の仕様は変更しない。
-遠方の未知寸法の到着によるArc更新が不要な取消を起こす仮説を検証する段階であり、
-意味的bindingによる有効性の構造修正は別途設計レビュー後に行う。
+§1.750（2026-11-10、r5判断をブランチへ実装済み・本件/関連回帰成功、実機未確認）:
+提示資格は本全体の `Arc<Vec<SpreadDisplayUnit>>` ではなく、context所有のimmutable
+`PageTurnUnitBinding` で照合する。通常resolverが採用した単位のanchor・canonical pages・formation・
+画面順occurrence/role・補助表紙/白companion、items/item identity、内容・実効回転、view政策と
+prepared出力証拠を束縛する。遠方の未知寸法到着で全体layoutが再構築されても、この局所値が等しければ
+受理済み素材・projection・時計を保ち、canonical flat採用まで進む。ordinal/nav_start・allocation・
+全体landscape epoch・source品質publicationは単位の意味に含めない。
+
+singleton Left/Right/Centerは表示条件として扱う。Offered/Turningは表示条件の変更でもskip/cancelするが、
+採用前のCompletingでは意味・内容・受理素材が等しければ通常prepareで再束縛してNeedFlatへ戻す。
+旧配置のreceiptは新しい出力の証明にならず、完全なbindingと実occurrence/source/paint順・
+geometry・output採用が一致したflatだけで完了する。canonical flat採用後のresizeはbaseどおり
+pre-drawのcontinuation確定を止めず、次targetを通常prepareで新しい寸法へ描く。
+採用後にdrawが先行しても、新しいreceiptには実際にpaintした新geometryのbindingを保存し、
+旧採用済みreceiptの資格と新出力の証明を分ける。継続操作はfrom/targetそれぞれの意味と
+occurrenceごとのitem identityを照合し、配置変更だけでは捨てない。SpreadShiftだけは
+ずらし基点が遠方の横長境界にも依存するため、既存の全体topology Arc照合も保持する。
+
+held lookup・legacy crop basis・prepare/bind・Turning比較・pending ready・receipt・barrierで
+同じbindingの投影を使う。保存済みAの既提示資格はAのanchorの意味・内容で判定し、最後に描いたBのlayoutや
+採用後に変わったfit政策で失効させない。現在viewはprepare/Turning比較と実receiptで別に照合する。
+通常adoption/landscape reconcile後にcanonical単位を解決し、read-only matcherは
+builder/producer/I/Oを起動しない。Nativeのexact key/coverageと受理済みbasisの保持は維持する。
+FinalDemandTopologiesと連結admissionの全体Arc、viewport配送規則、既存destination/frame照合は変更しない。
+
+取消診断の `different_fields` は同じ局所bindingの差分を報告する。layout差分時はoccurrences・formation・
+placementの一致を併記し、landscape反転時だけidx・旧新判定・epochを記録する。
+名前・パス・画像内容は追加出力しない。実装と検証記録の正本は
+[ページめくりの表示単位binding](page-turn-layout-binding-plan.md)。
+本体lib全件は17,004成功/未変更IPCのnamed pipe作成アクセス拒否2件で未通過。各単独でも再現し、
+全件greenとは扱わない。通常profile確認用 `build-dev.ps1` は初回MSBuild並列失敗後、
+`CARGO_BUILD_JOBS=1` の再実行で成功し、5バイナリとDLL配置・PE検査を完了した。製品起動・実機確認は未実施。
 
 ページ間の紙めくりは`ui_fullscreen/page_turn.rs`のcontext単位presentationと、
 `page_turn_animation.rs`のcanonical unit projectionへ分離する。既存navigation target、
