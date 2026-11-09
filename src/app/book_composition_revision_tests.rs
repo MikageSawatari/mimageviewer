@@ -127,7 +127,7 @@ fn g3_hidden_required_detached_open_terminates_session_runtime_and_preserves_sib
                     pdf_path: root.clone(),
                     page_num: 0,
                 }),
-                resume_to_last_page: false,
+                resume_to_last_page: (false).into(),
                 from_explicit_open: true,
                 preserve_after_password_prompt: true,
             };

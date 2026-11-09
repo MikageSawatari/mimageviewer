@@ -918,10 +918,10 @@ Shift を伴う一覧カーソル移動と Shift+クリックは起点を保持�
 
 | 入力 | 動作 |
 |---|---|
-| <kbd>Esc</kbd> | フルスクリーン解除。**環境設定 `auto_fullscreen_zip_pdf` が ON で ZIP/PDF/変換アーカイブ内のページを表示している場合は、ページ一覧 (L2) を経由せず親フォルダの一覧 (L1) へ直帰**。追加設定 `auto_fullscreen_image_folders` も ON で、画像のみ通常フォルダを直接ページ表示している場合も同じ (`handle_fullscreen_close_request` → `pending_return_to_parent` → 入力ナビ合流点が親へナビ) |
-| <kbd>Enter</kbd> | (画像) フルスクリーン解除。Action: `FsClose`。グリッドで Enter / ダブルクリックで開く動作とトグル成立。`auto_fullscreen_zip_pdf` ON のコンテナページ、または追加設定 ON の画像のみ通常フォルダでは親直帰も Esc と同じ / (動画) 再生・一時停止トグル。Action: `VideoPlayPause` |
+| <kbd>Esc</kbd> | フルスクリーン解除。main／linked F12 でページ直接表示が有効な本を閉じるときは、**記録された選択元の内部一覧があれば最優先で戻り、現在読んでいる本の選択と一覧内の表示位置を復元**する。それがなければ既存の検索・閲覧履歴・コレクション等の専用帰路、または実親フォルダへ戻る。追加設定 `auto_fullscreen_image_folders` ON の画像のみ通常フォルダも既存の専用帰路／実親への退出に従う。ページ一覧設定では現在の本のページ一覧 (L2) へ戻る。独立ウィンドウの close はその窓だけを閉じ、main を変更しない。`handle_fullscreen_close_request` と既存 close continuation が配送する |
+| <kbd>Enter</kbd> | (画像) フルスクリーン解除。Action: `FsClose`。グリッドで Enter / ダブルクリックで開く動作とトグル成立。一覧への戻り先と独立ウィンドウの close は Esc と同じ / (動画) 再生・一時停止トグル。Action: `VideoPlayPause` |
 | <kbd>Space</kbd> | (画像) 選択 (チェック) トグル — スライドショー再生中なら停止 / (動画) 再生・一時停止トグル |
-| <kbd>Backspace</kbd> | フルスクリーンを 1 段閉じてグリッドビューへ戻る。Action: `FsBackToList`。ZIP/PDF/変換アーカイブ内のページ、または追加設定 ON の画像のみ通常フォルダでは、そのコンテナ / フォルダのページ一覧 (L2) を表示 (= Esc/Enter の「L1 へ直帰」と対をなす) |
+| <kbd>Backspace</kbd> | フルスクリーンを 1 段閉じてグリッドビューへ戻る。Action: `FsBackToList`。ZIP/PDF/変換アーカイブ内のページ、または追加設定 ON の画像のみ通常フォルダでは、そのコンテナ / フォルダのページ一覧 (L2) を表示。ページ直接表示時の Esc/Enter と異なり、選択元の内部一覧への帰還や親への退出は行わない |
 | <kbd>Home</kbd> / <kbd>End</kbd> | フルスクリーン中の先頭 / 末尾の項目へ移動する。Action: `FsJumpFirst` / `FsJumpLast`。動画 native presenter 経路でも App 側へ転送する |
 | <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 前 / 次の兄弟フォルダへ。同じ親の直下だけを対象にし、移動先に image-like があればフルスクリーンを維持して先頭 image-like を開く。なければ一覧へ戻る。切り離した detached 窓 / always-new 窓では、メイン bundle との境界をまたがないため無効化し案内だけ出す |
 | マウスホイール | 前 / 次のファイル。縦/横連結モードでは連結方向へスクロール |

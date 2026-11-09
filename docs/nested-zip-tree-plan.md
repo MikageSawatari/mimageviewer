@@ -153,13 +153,48 @@ navigation でこの関数を呼ぶだけ (再列挙なし = in-memory)。見開
 
 | 操作 | 挙動 |
 | --- | --- |
-| ZipDir を Enter/ダブルクリック | `prefix.push(seg)` → `materialize_level` で再表示 |
+| ZipDir を Enter/ダブルクリック/パッド決定 | 共通 `activate_main_zipdir`。collapse 後の階層を採用し、「ページを表示」が有効なら直下ページを本として開く（§1.675 S1、下記） |
 | Backspace | `prefix.pop()`。空なら ZIP を出て実フォルダ親へ ([`effective_folder`](../src/app.rs)`.parent()`) |
 | アドレスバー/パンくず | `vol.zip > chapters > ch01.zip` (Ctrl+G drill breadcrumb 形式) |
 | Ctrl+↑↓ | **DFS 前順トラバーサル** (`ZipNavState::dfs_step`)。実フォルダの Ctrl+↑↓ と同じ規則 (次 = 最初の子 → 次の兄弟 → 祖先の次の兄弟、前 = 前の兄弟の最後の子孫 → 親) を ZIP ツリーに適用。ツリーの端で `false` → 呼び出し側が ZIP を抜けて実フォルダ DFS へ続く (実機 3 巡目 #6。当初の「兄弟のみ + ルート即脱出」を置換)。FS 中は直下画像なしノードを自動スキップ |
 
 - 状態リセット境界: 同一 ZIP 内のナビでは `ZipNavState.tree` を保持し再列挙しない。
   別 ZIP/フォルダへ出るときのみ `clear_nested_cache` + tree 破棄。
+
+§1.675/§1.676 S1〜S3（実装・自動検証済み）:
+
+- 内部フォルダ／入れ子書庫とも「ページを表示」の実効値に従う。候補判定はメモリ上の直下ページ、
+  最終判定は既存の index 準備と構成適用後の順序・可視集合を使う。表示可能なページがなければ
+  その階層の一覧に留まり、子の本へ DFS しない。S2 では内部本ごとの保存位置を使う。
+- 内部 resume は論理元書庫＋case を保つ `current_raw()` の専用名前空間へ保存する。root の旧キーは維持する。
+  直接 open は `book_open_resume`、fullscreen DFS は index／fence／構成準備後に `book_nav_resume` を適用する。
+  slideshow は先頭固定。構成・★等で保存ページが対象外なら通知して先頭を探索する。
+  fence の saved／unsaved は既存 deferred request に固定し、構成待ちの後に DB を再読取しない。
+  構成採用前に同 request を既存 owner へ移し、採用の終了後に保存拒否の fallback／DFS 継続を再開する。
+  editor・meter・Remote は同じキーを使う。管理移動はキーと PageIdentity を同時更新し、cache 再生成では保持する。
+- 直接表示候補は `PageContinuation`、一覧移動は `ExplicitList` で install する。取消は既存の
+  sidecar／構成継続を取消し、古い完了から開かない。★固定中は一覧移動を維持する。
+- S3 の複数ウィンドウでは、本候補は main を動かさず独立 bundle へ渡し、分岐だけを main で一覧移動する。
+  `DetachedZipTarget` が root／scope／Required leaf を区別し、scope は初回の一覧生成前に literal prefix で
+  復元して raw scope の一致を確認する。列挙 owner の要求は Live hydration→permission に一度ずつ移す。
+  saved／unsaved はその Live fence から捕捉する。消失・scope変更・全非表示・失敗は通知＋初回終端、staleは破棄。
+  変換の owner も同じ target／lease を保持し、workerでcache・RAR probeを解決する。独立closeはmainを変更しない。
+  同じ書庫を開く scope dispatch は共有nested bytesを一括clearせず、既存の書庫identityによる更新検証を使う。
+- scope は本候補だけで検証する。通常モードの非対応 prefix は Chosen を保った `ExplicitList`／`List` に終え、
+  ログ＋情報通知 1 回。scope を作れない候補は複数窓でも本として dispatch せず、この既存一覧経路を保つ。
+  設定 OFF／分岐等の非本候補は従来どおり一覧へ入る。
+- 共通入口だけが出発階層に `ZipListChoice::Chosen { rows_above }` を記録する。通常 close は現在本の
+  最も深い記録済み祖先へ戻り、旧ページの teardown 後に一覧を作り、現在の本のセルと row anchor を復元する。
+  close 受理時に帰還先を確定し、main context 専用の既存 teardown を使う。stale Live は帰還先だけを捨てて
+  現在の一覧へ閉じ、close 済みの Terminal はログを出して捨てる。兄弟の active session は終了しない。
+  take 後も close slot が plan と配送権限を保持し、同じ context の新 reader 受理で終了する。
+  nav は Weak ticket のみを持ち、失効後は Chosen が残っていても後発 reader を変更しない。
+  Backspace は従来どおり現在本の L2。見ていない祖先を推測して帰路にはしない。
+- DFS・ソート・ピンで記録を維持し、refresh・履歴・同一書庫へのブックマーク／Required jump で消す。
+  snapshot の退避には同行するが固定中は帰路を出さない。独立 build／fork／promote は独立側の
+  通常／退避 stack の記録を消し、main と兄弟の items・世代・queue を変更しない。
+- 外側の Collection 等への帰路は保持する。内部一覧から root、さらに外側へ Backspace で戻れる。
+  実装段階と内部本 resume／複数窓の後続作業は [archive-inner-book-open-return-plan.md](archive-inner-book-open-return-plan.md) §10。
 
 ### ⚠ 実効 prefix スタック方式で Backspace 罠を回避 (Phase 1 Codex P2 → Phase 3a 実装で確定)
 当初案は「`ZipNavState.prefix` に論理 prefix を持ち、collapse は materialize 直前の
@@ -336,14 +371,14 @@ ZIP↔RAR/7z/LZH が混在した入れ子は、どちらの向きも従来は中
   降りて継続するようになった。
 
 **非目標 (v1.3.0 では扱わない)**:
-- per-book の読書再開位置 (cross-book resume、将来)
+- per-book の読書再開位置（当初は非目標。§1.675 S2 で内部本ごとの保存・復元を追加）
 - 書き込み系 (ZIP 内ファイルの編集/移動) — 従来どおり read-only
 
 **既知の制限 (将来)**:
 - **複数本 ZIP の auto-fullscreen 着地 / cross-book resume**: ルートが ZipDir のみのとき
-  自動フルスクリーンは画像を見つけられず本一覧表示に留まる。「続きから」の記録は
-  **ルート階層のみ** (本の中では記録しない。idx が階層ローカルなため、再オープン時に
-  ルート階層の同 idx へ誤着地するのを防ぐ)。先頭本への自動進入 / 深い階層への resume は将来。
+  自動フルスクリーンは画像を見つけられず本一覧表示に留まる。先頭本への自動進入は別件 §1.678。
+  内部階層へ入った後の「続きから」は S2 の専用 scope キーと完全 PageIdentity で復元するため、
+  外側 root の同じ idx を代用しない。
 - **ドリル中の Ctrl+G** は ZIP ルートに戻る (状態ロスト、データ破壊なし。ソート変更は修正済み)。
 - **フルスクリーン本またぎで移動先がレーティングフィルタで全 hidden** の場合は、
   フルスクリーンを閉じてグリッドにその階層を見せる (= グリッド Ctrl+↓ と同じ着地)。

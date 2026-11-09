@@ -1615,6 +1615,14 @@ fn copy_stores_impl(
         .copied()
         .filter(|store| store.unique && (include_identity || store.file != "content_identity.db"))
     {
+        // Logical archive resume sources retain drives, even when the released
+        // physical row would normalize to the same DriveStripped key.
+        if descriptor.table == "book_resume" {
+            copy_resume_store(data_dir, descriptor, mappings, &mut report);
+            processed += mappings.len();
+            on_progress(processed, total);
+            continue;
+        }
         let normalized = mappings
             .iter()
             .filter_map(|mapping| match mapping {
@@ -1762,6 +1770,11 @@ fn store_keys_with_rows(
     );
     let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
     let mut found = Vec::new();
+    let archive_resume = if descriptor.table == "book_resume" {
+        archive_resume_rows(&conn).map_err(|error| error.to_string())?
+    } else {
+        Vec::new()
+    };
     for file_key in file_keys {
         let store_key = descriptor.normalize_path(Path::new(file_key));
         let prefix = restore_family_prefix(&store_key, descriptor.restore_family);
@@ -1769,7 +1782,11 @@ fn store_keys_with_rows(
         let exists = statement
             .exists(rusqlite::params![store_key, prefix, upper,])
             .map_err(|error| error.to_string())?;
-        if exists {
+        if exists
+            || archive_resume
+                .iter()
+                .any(|(_, key)| key.matches_source_family(Path::new(file_key), false))
+        {
             found.push(file_key.clone());
         }
     }
@@ -1873,6 +1890,10 @@ fn run_at_with_epub_acquisition(
     let rating_write = crate::rating_db::RATING_WRITES.begin();
     let tag_write = crate::tags_db::TAG_WRITES.begin();
     for descriptor in STORES.iter().filter(|store| store.rename_generic) {
+        if descriptor.table == "book_resume" {
+            migrate_resume_store(data_dir, descriptor, old_path, new_path, &mut report);
+            continue;
+        }
         let (old_key, new_key) = match descriptor.normalization {
             StoreKeyNormalization::KeepDrive => (&old_k, &new_k),
             StoreKeyNormalization::DriveStripped => (&old_s, &new_s),
@@ -1993,7 +2014,14 @@ pub(crate) fn migrate_book_paths_at(
             crate::edit_preview_cache::migrate_book_paths_at(data_dir, &store_moves, &store_copies)
                 .map(|rows| (rows, BTreeSet::new()))
         } else {
-            migrate_book_store(&db_path, descriptor, &store_moves, &store_copies, moves)
+            migrate_book_store_with_resume(
+                &db_path,
+                descriptor,
+                &store_moves,
+                &store_copies,
+                moves,
+                copies,
+            )
         };
         match result {
             Ok((rows, rotation_keys)) => {
@@ -2033,12 +2061,361 @@ pub(crate) fn rewrite_book_key(key: &str, mappings: &[(String, String)]) -> Opti
     })
 }
 
+fn archive_resume_rows(
+    conn: &rusqlite::Connection,
+) -> rusqlite::Result<Vec<(String, crate::book_resume_key::BookResumeKey)>> {
+    let mut statement = conn.prepare(
+        "SELECT path FROM book_resume WHERE path >= 'miv:zipbook:' AND path < 'miv:zipbook;'",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let mut result = Vec::new();
+    for row in rows {
+        let key = row?;
+        if let Ok(scope @ crate::book_resume_key::BookResumeKey::ArchiveLevel { .. }) =
+            crate::book_resume_key::BookResumeKey::from_storage_key(&key)
+        {
+            result.push((key, scope));
+        }
+    }
+    Ok(result)
+}
+
+fn resume_source_mappings(pairs: &[(PathBuf, PathBuf)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(old, new)| {
+            (
+                crate::path_key::normalize_keep_drive(old)
+                    .trim_end_matches('/')
+                    .to_owned(),
+                crate::path_key::normalize_keep_drive(new)
+                    .trim_end_matches('/')
+                    .to_owned(),
+            )
+        })
+        .filter(|(old, new)| !old.is_empty() && old != new)
+        .collect()
+}
+
+fn rewrite_archive_resume_identity(
+    tx: &rusqlite::Transaction<'_>,
+    columns: &[String],
+    key: &str,
+    mappings: &[(String, String)],
+) -> rusqlite::Result<usize> {
+    if !columns.iter().any(|column| column == "page_identity") {
+        return Ok(0);
+    }
+    let json: Option<String> = tx.query_row(
+        "SELECT page_identity FROM book_resume WHERE path = ?1",
+        [key],
+        |row| row.get(0),
+    )?;
+    let Some(json) = json else {
+        return Ok(0);
+    };
+    let Ok(crate::book_resume_db::PageIdentity::Archive {
+        container,
+        entry_name,
+    }) = serde_json::from_str(&json)
+    else {
+        return Ok(0);
+    };
+    let Some(container) = rewrite_book_key(&container, mappings) else {
+        return Ok(0);
+    };
+    let json = serde_json::to_string(&crate::book_resume_db::PageIdentity::Archive {
+        container,
+        entry_name,
+    })
+    .expect("serializable archive identity");
+    tx.execute(
+        "UPDATE book_resume SET page_identity = ?1 WHERE path = ?2",
+        rusqlite::params![json, key],
+    )
+}
+
+fn purge_archive_resume_rows(
+    tx: &rusqlite::Transaction<'_>,
+    scopes: &[(PathBuf, bool)],
+) -> rusqlite::Result<usize> {
+    let mut changed = 0;
+    for (key, scope) in archive_resume_rows(tx)? {
+        if scopes
+            .iter()
+            .any(|(path, tree)| scope.matches_source_family(path, *tree))
+        {
+            changed += tx.execute("DELETE FROM book_resume WHERE path = ?1", [key])?;
+        }
+    }
+    Ok(changed)
+}
+
+/// Decode only the namespace. Temporary evacuation preserves simultaneous move
+/// semantics, while updating the key and its page identity in this transaction.
+fn migrate_archive_resume_rows(
+    tx: &rusqlite::Transaction<'_>,
+    columns: &[String],
+    pairs: &[(PathBuf, PathBuf)],
+    collision: PathMigrationCollision,
+) -> rusqlite::Result<usize> {
+    let mappings = resume_source_mappings(pairs);
+    let mut staged = Vec::new();
+    let mut changed = 0;
+    for (key, scope) in archive_resume_rows(tx)? {
+        let crate::book_resume_key::BookResumeKey::ArchiveLevel {
+            logical_source,
+            raw_prefix,
+        } = scope
+        else {
+            unreachable!()
+        };
+        let Some(source) = rewrite_book_key(
+            &crate::path_key::normalize_keep_drive(&logical_source),
+            &mappings,
+        ) else {
+            continue;
+        };
+        let destination =
+            crate::book_resume_key::BookResumeKey::archive(Path::new(&source), &[raw_prefix])
+                .map_err(rusqlite::Error::InvalidParameterName)?
+                .storage_key();
+        let temporary = book_migration_temporary_key(staged.len());
+        changed += tx.execute(
+            "UPDATE book_resume SET path = ?1 WHERE path = ?2",
+            rusqlite::params![temporary, key],
+        )?;
+        staged.push((temporary, destination));
+    }
+    if collision == PathMigrationCollision::SourceWins {
+        let destinations = mappings
+            .iter()
+            .map(|(_, new)| (PathBuf::from(new), true))
+            .collect::<Vec<_>>();
+        changed += purge_archive_resume_rows(tx, &destinations)?;
+    }
+    for (temporary, destination) in staged {
+        let moved = tx.execute(
+            "UPDATE OR IGNORE book_resume SET path = ?1 WHERE path = ?2",
+            rusqlite::params![destination, temporary],
+        )?;
+        changed += moved;
+        if moved > 0 {
+            changed += rewrite_archive_resume_identity(tx, columns, &destination, &mappings)?;
+        }
+        changed += tx.execute("DELETE FROM book_resume WHERE path = ?1", [temporary])?;
+    }
+    Ok(changed)
+}
+
+fn migrate_resume_store(
+    data_dir: &Path,
+    descriptor: &StoreDescriptor,
+    old: &Path,
+    new: &Path,
+    report: &mut RenameMigrationReport,
+) {
+    let path = data_dir.join(descriptor.file);
+    if !path.exists() {
+        return;
+    }
+    let result = (|| -> Result<usize, String> {
+        let mut conn = open_store_for_write(&path, descriptor)?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let columns = table_columns(&tx, descriptor.table).map_err(|e| e.to_string())?;
+        let mut changed = migrate_archive_resume_rows(
+            &tx,
+            &columns,
+            &[(old.to_path_buf(), new.to_path_buf())],
+            PathMigrationCollision::DestinationWins,
+        )
+        .map_err(|e| e.to_string())?;
+        changed += migrate_store_family(
+            &tx,
+            descriptor,
+            &descriptor.normalize_path(old),
+            &descriptor.normalize_path(new),
+            PathMigrationCollision::DestinationWins,
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(changed)
+    })();
+    match result {
+        Ok(rows) => {
+            report.rows += rows;
+            report.store_mutations.record_rows_changed(descriptor, rows);
+        }
+        Err(error) => report.errors.push(format!("{}: {error}", descriptor.file)),
+    }
+}
+
+fn copy_resume_store(
+    data_dir: &Path,
+    descriptor: StoreDescriptor,
+    mappings: &[StoreCopyPathMapping],
+    report: &mut StoreCopyReport,
+) {
+    let path = data_dir.join(descriptor.file);
+    if !path.exists() {
+        return;
+    }
+    report.database_opens += 1;
+    let result = (|| -> Result<usize, String> {
+        let mut conn = open_store_for_write(&path, &descriptor)?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let columns = table_columns(&tx, descriptor.table).map_err(|e| e.to_string())?;
+        let mut changed = 0;
+        for mapping in mappings {
+            let (old, new) = match mapping {
+                StoreCopyPathMapping::Exact { old_path, new_path }
+                | StoreCopyPathMapping::VirtualPrefix { old_path, new_path } => {
+                    (old_path, new_path)
+                }
+            };
+            let source_mappings = resume_source_mappings(&[(old.clone(), new.clone())]);
+            for (key, scope) in archive_resume_rows(&tx).map_err(|e| e.to_string())? {
+                if !scope.matches_source_family(old, false) {
+                    continue;
+                }
+                let crate::book_resume_key::BookResumeKey::ArchiveLevel { raw_prefix, .. } = scope
+                else {
+                    unreachable!()
+                };
+                let destination =
+                    crate::book_resume_key::BookResumeKey::archive(new, &[raw_prefix])?
+                        .storage_key();
+                let copied = copy_exact(
+                    &tx,
+                    descriptor.table,
+                    descriptor.column,
+                    &columns,
+                    &key,
+                    &destination,
+                )
+                .map_err(|e| e.to_string())?;
+                changed += copied;
+                if copied > 0 {
+                    changed += rewrite_archive_resume_identity(
+                        &tx,
+                        &columns,
+                        &destination,
+                        &source_mappings,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+            let old_key = descriptor.normalize_path(old);
+            let new_key = descriptor.normalize_path(new);
+            if old_key == new_key {
+                continue;
+            }
+            changed += match mapping {
+                StoreCopyPathMapping::Exact { .. } => copy_exact(
+                    &tx,
+                    descriptor.table,
+                    descriptor.column,
+                    &columns,
+                    &old_key,
+                    &new_key,
+                )
+                .map_err(|e| e.to_string())?,
+                StoreCopyPathMapping::VirtualPrefix { .. } => {
+                    copy_prefix(
+                        &tx,
+                        descriptor.table,
+                        descriptor.column,
+                        &columns,
+                        &format!("{old_key}::"),
+                        &format!("{new_key}::"),
+                    )
+                    .map_err(|e| e.to_string())?
+                    .rows
+                }
+            };
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(changed)
+    })();
+    match result {
+        Ok(rows) => {
+            report.rows += rows;
+            report
+                .store_mutations
+                .record_rows_changed(&descriptor, rows);
+        }
+        Err(error) => report.errors.push(format!("{}: {error}", descriptor.file)),
+    }
+}
+
+fn purge_resume_store(
+    data_dir: &Path,
+    descriptor: &StoreDescriptor,
+    legacy_keys: &[String],
+    scopes: &[crate::delete_worker::DeleteSourceScope],
+    report: &mut PurgeReport,
+) {
+    let path = data_dir.join(descriptor.file);
+    if !path.exists() {
+        return;
+    }
+    report.db_open_count += 1;
+    let result = (|| -> Result<usize, String> {
+        let mut conn = open_store_for_write(&path, descriptor)?;
+        let table_exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='book_resume')", [], |row| row.get(0)).map_err(|e| e.to_string())?;
+        if !table_exists {
+            return Ok(0);
+        }
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let mut changed = 0;
+        for key in legacy_keys {
+            changed += delete_store_family(&tx, descriptor.table, descriptor.column, key)
+                .map_err(|e| e.to_string())?;
+        }
+        let sources = scopes
+            .iter()
+            .map(|scope| match scope {
+                crate::delete_worker::DeleteSourceScope::Exact(path) => (path.clone(), false),
+                crate::delete_worker::DeleteSourceScope::Tree(path) => (path.clone(), true),
+            })
+            .collect::<Vec<_>>();
+        changed += purge_archive_resume_rows(&tx, &sources).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(changed)
+    })();
+    match result {
+        Ok(rows) => {
+            report.rows += rows;
+            report.store_mutations.record_rows_changed(descriptor, rows);
+        }
+        Err(error) => report.errors.push(format!("{}: {error}", descriptor.file)),
+    }
+}
+
+#[cfg(test)]
 fn migrate_book_store(
     db_path: &Path,
     descriptor: &StoreDescriptor,
     moves: &[(String, String)],
     copies: &[(String, String)],
     raw_moves: &[(PathBuf, PathBuf)],
+) -> Result<(usize, BTreeSet<String>), String> {
+    migrate_book_store_with_resume(db_path, descriptor, moves, copies, raw_moves, &[])
+}
+
+fn migrate_book_store_with_resume(
+    db_path: &Path,
+    descriptor: &StoreDescriptor,
+    moves: &[(String, String)],
+    copies: &[(String, String)],
+    raw_moves: &[(PathBuf, PathBuf)],
+    raw_copies: &[(PathBuf, PathBuf)],
 ) -> Result<(usize, BTreeSet<String>), String> {
     let mut conn = open_store_for_write(db_path, descriptor)?;
     let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
@@ -2066,6 +2443,22 @@ fn migrate_book_store(
             return Err(rusqlite::Error::InvalidColumnName(descriptor.column.into()));
         }
         let mut changed = rewrite_book_store_values(&tx, descriptor, &columns, raw_moves)?;
+        if descriptor.table == "book_resume" {
+            changed += migrate_archive_resume_rows(
+                &tx,
+                &columns,
+                raw_moves,
+                PathMigrationCollision::SourceWins,
+            )?;
+            // Resume is intentionally not copied with a managed book page. Its
+            // destination is reset under the same existing descriptor policy.
+            for (source, destination) in raw_copies {
+                if crate::path_key::eq_keep_drive(source, destination) {
+                    continue;
+                }
+                changed += purge_archive_resume_rows(&tx, &[(destination.clone(), true)])?;
+            }
+        }
         let temporary = moves
             .iter()
             .enumerate()
@@ -2446,6 +2839,16 @@ fn purge_removed_scopes_impl(
     let rating_write = crate::rating_db::RATING_WRITES.begin();
     let tag_write = crate::tags_db::TAG_WRITES.begin();
     for descriptor in STORES {
+        if descriptor.table == "book_resume" {
+            purge_resume_store(
+                data_dir,
+                descriptor,
+                &drive_stripped_keys,
+                scopes,
+                &mut report,
+            );
+            continue;
+        }
         let keys = match descriptor.normalization {
             StoreKeyNormalization::KeepDrive => &keep_drive_keys,
             StoreKeyNormalization::DriveStripped => &drive_stripped_keys,
@@ -3410,6 +3813,261 @@ fn migrate_reading_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn inner_resume_fixture(dir: &Path) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(dir.join("book_resume.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE book_resume (
+            path TEXT PRIMARY KEY, page INTEGER NOT NULL, page_identity TEXT,
+            page_ordinal INTEGER, page_total INTEGER);
+            CREATE TRIGGER invalidate_resume_identity AFTER UPDATE OF page ON book_resume
+            BEGIN UPDATE book_resume SET page_identity = NULL WHERE path = NEW.path; END;",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_inner_resume(
+        conn: &rusqlite::Connection,
+        source: &str,
+        prefix: &str,
+        page: i64,
+    ) -> crate::book_resume_key::BookResumeKey {
+        let key =
+            crate::book_resume_key::BookResumeKey::archive(Path::new(source), &[prefix.into()])
+                .unwrap();
+        let identity = crate::book_resume_db::PageIdentity::Archive {
+            container: crate::path_key::normalize_keep_drive(Path::new(source)),
+            entry_name: format!("{prefix}/page.jpg"),
+        };
+        conn.execute(
+            "INSERT INTO book_resume VALUES (?1,?2,?3,?4,100)",
+            rusqlite::params![
+                key.storage_key(),
+                page,
+                serde_json::to_string(&identity).unwrap(),
+                page + 1,
+            ],
+        )
+        .unwrap();
+        key
+    }
+
+    fn inner_resume_row(
+        conn: &rusqlite::Connection,
+        key: &crate::book_resume_key::BookResumeKey,
+    ) -> Option<(i64, crate::book_resume_db::PageIdentity, i64, i64)> {
+        use rusqlite::OptionalExtension;
+        conn.query_row(
+            "SELECT page,page_identity,page_ordinal,page_total FROM book_resume WHERE path=?1",
+            [key.storage_key()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                ))
+            },
+        )
+        .optional()
+        .unwrap()
+        .map(|(page, identity, ordinal, total)| {
+            (
+                page,
+                serde_json::from_str(&identity).unwrap(),
+                ordinal,
+                total,
+            )
+        })
+    }
+
+    #[test]
+    fn section1675_inner_resume_cross_drive_rename_and_copy_keep_destination_priority() {
+        for copy in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let conn = inner_resume_fixture(dir.path());
+            let old = Path::new("C:/Books/A.zip");
+            let new = Path::new("D:/Books/A.zip");
+            let old_a = insert_inner_resume(&conn, "C:/Books/A.zip", "A", 2);
+            let old_b = insert_inner_resume(&conn, "C:/Books/A.zip", "B/inner.zip", 7);
+            let new_a = insert_inner_resume(&conn, "D:/Books/A.zip", "A", 90);
+            let new_b =
+                crate::book_resume_key::BookResumeKey::archive(new, &["B/inner.zip".into()])
+                    .unwrap();
+            let adjacent = insert_inner_resume(&conn, "C:/Books/A.zip.more", "A", 11);
+            conn.execute(
+                "INSERT INTO book_resume(path,page) VALUES ('/books/a.zip',9)",
+                [],
+            )
+            .unwrap();
+            if copy {
+                let report = copy_stores_at(dir.path(), &[StoreCopyPathMapping::exact(old, new)]);
+                assert!(report.errors.is_empty(), "{:?}", report.errors);
+            } else {
+                let report = run_at(dir.path(), old, new);
+                assert!(report.errors.is_empty(), "{:?}", report.errors);
+            }
+            assert_eq!(inner_resume_row(&conn, &new_a).unwrap().0, 90);
+            let row = inner_resume_row(&conn, &new_b).unwrap();
+            assert_eq!((row.0, row.2, row.3), (7, 8, 100));
+            assert_eq!(
+                row.1,
+                crate::book_resume_db::PageIdentity::Archive {
+                    container: "d:/books/a.zip".into(),
+                    entry_name: "B/inner.zip/page.jpg".into(),
+                }
+            );
+            assert_eq!(inner_resume_row(&conn, &old_a).is_some(), copy);
+            assert_eq!(inner_resume_row(&conn, &old_b).is_some(), copy);
+            assert_eq!(inner_resume_row(&conn, &adjacent).unwrap().0, 11);
+            assert_eq!(
+                conn.query_row(
+                    "SELECT page FROM book_resume WHERE path='/books/a.zip'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                9
+            );
+        }
+    }
+
+    #[test]
+    fn section1675_inner_resume_parent_rename_matches_logical_source_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = inner_resume_fixture(dir.path());
+        let old = insert_inner_resume(&conn, "C:/Books_%/日本語.zip", "A/内側.zip/章", 4);
+        let adjacent = insert_inner_resume(&conn, "C:/Books_%extra/日本語.zip", "A", 8);
+        let other_drive = insert_inner_resume(&conn, "D:/Books_%/日本語.zip", "A", 9);
+        let report = run_at(dir.path(), Path::new("C:/Books_%"), Path::new("E:/Moved"));
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(inner_resume_row(&conn, &old).is_none());
+        let new = crate::book_resume_key::BookResumeKey::archive(
+            Path::new("E:/Moved/日本語.zip"),
+            &["A/内側.zip/章".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            inner_resume_row(&conn, &new).unwrap().1,
+            crate::book_resume_db::PageIdentity::Archive {
+                container: "e:/moved/日本語.zip".into(),
+                entry_name: "A/内側.zip/章/page.jpg".into(),
+            }
+        );
+        assert_eq!(inner_resume_row(&conn, &adjacent).unwrap().0, 8);
+        assert_eq!(inner_resume_row(&conn, &other_drive).unwrap().0, 9);
+    }
+
+    #[test]
+    fn section1675_inner_resume_managed_move_swaps_and_copy_keeps_existing_reset_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = inner_resume_fixture(dir.path());
+        let a = PathBuf::from("C:/Books/A.zip");
+        let b = PathBuf::from("D:/Books/A.zip");
+        let key_a = insert_inner_resume(&conn, "C:/Books/A.zip", "Chapter", 2);
+        let key_b = insert_inner_resume(&conn, "D:/Books/A.zip", "Chapter", 6);
+        let stale_b = insert_inner_resume(&conn, "D:/Books/A.zip", "Stale", 80);
+        let guard = acquire_store_maintenance(dir.path(), &[]).unwrap();
+        let report = migrate_book_paths_at(
+            dir.path(),
+            &[(a.clone(), b.clone()), (b.clone(), a.clone())],
+            &[],
+            &guard,
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(inner_resume_row(&conn, &key_a).unwrap().0, 6);
+        assert_eq!(inner_resume_row(&conn, &key_b).unwrap().0, 2);
+        assert!(inner_resume_row(&conn, &stale_b).is_none());
+        let moved_stale =
+            crate::book_resume_key::BookResumeKey::archive(&a, &["Stale".into()]).unwrap();
+        assert_eq!(inner_resume_row(&conn, &moved_stale).unwrap().0, 80);
+        let report = migrate_book_paths_at(dir.path(), &[], &[(a, b)], &guard);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(inner_resume_row(&conn, &key_a).unwrap().0, 6);
+        assert!(
+            inner_resume_row(&conn, &key_b).is_none(),
+            "resume is not a copies_with_book_page store"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM book_resume WHERE path LIKE '__miv_book_migration_%'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn section1675_inner_resume_delete_exact_tree_and_cache_lifetimes() {
+        use crate::delete_worker::DeleteSourceScope;
+        let dir = tempfile::tempdir().unwrap();
+        let conn = inner_resume_fixture(dir.path());
+        let exact = insert_inner_resume(&conn, "C:/Books/A.zip", "A", 2);
+        let nested = insert_inner_resume(&conn, "C:/Books/Sub/B.rar", "B", 3);
+        let adjacent = insert_inner_resume(&conn, "C:/BooksExtra/A.zip", "A", 4);
+        let other_drive = insert_inner_resume(&conn, "D:/Books/A.zip", "A", 5);
+        let report = purge_removed_scopes_at(
+            dir.path(),
+            &[DeleteSourceScope::Exact(PathBuf::from(
+                "C:/Cache/backing.zip",
+            ))],
+            &[],
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(inner_resume_row(&conn, &exact).is_some());
+        let report = purge_removed_scopes_at(
+            dir.path(),
+            &[DeleteSourceScope::Exact(PathBuf::from("C:/Books/A.zip"))],
+            &[],
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(inner_resume_row(&conn, &exact).is_none());
+        assert!(inner_resume_row(&conn, &nested).is_some());
+        let report = purge_removed_scopes_at(
+            dir.path(),
+            &[DeleteSourceScope::Tree(PathBuf::from("C:/Books"))],
+            &[],
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(inner_resume_row(&conn, &nested).is_none());
+        assert!(inner_resume_row(&conn, &adjacent).is_some());
+        assert!(inner_resume_row(&conn, &other_drive).is_some());
+    }
+
+    #[test]
+    fn section1675_inner_resume_identity_and_key_rollback_together_and_probe_sees_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = inner_resume_fixture(dir.path());
+        let old = insert_inner_resume(&conn, "C:/Books/A.zip", "A", 4);
+        let source = "c:/books/a.zip".to_owned();
+        let backed = ledger_keys_with_restorable_rows_at(
+            dir.path(),
+            &[source.clone(), "c:/books/missing.zip".into()],
+        );
+        assert_eq!(backed, BTreeSet::from([source]));
+        conn.execute_batch(
+            "CREATE TRIGGER fail_resume_identity BEFORE UPDATE OF page_identity ON book_resume
+            BEGIN SELECT RAISE(ABORT, 'injected identity write failure'); END;",
+        )
+        .unwrap();
+        let before = inner_resume_row(&conn, &old).unwrap();
+        let report = run_at(
+            dir.path(),
+            Path::new("C:/Books/A.zip"),
+            Path::new("D:/Books/A.zip"),
+        );
+        assert!(!report.errors.is_empty());
+        assert_eq!(inner_resume_row(&conn, &old).unwrap(), before);
+        let new = crate::book_resume_key::BookResumeKey::archive(
+            Path::new("D:/Books/A.zip"),
+            &["A".into()],
+        )
+        .unwrap();
+        assert!(inner_resume_row(&conn, &new).is_none());
+    }
     use rusqlite::OptionalExtension;
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;

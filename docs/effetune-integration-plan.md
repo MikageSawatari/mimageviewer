@@ -417,7 +417,8 @@ enum EffectiveState {
 
 派生版の配置・版・承認は [派生版計画 §7](effetune-fork-plan.md#7-派生版のソースとビルド) が正本で、
 手順は [mIV Sound のビルド・確認・承認](miv-sound-build.md#build-verify-approve)。
-公開説明書は `manual/sound/<v付きVERSION>/` に生成し、旧 `manual/effetune/` は 301 で転送する。
+公開説明書は版番号なしの `manual/sound/` に生成し、版は目次本文だけに示す。
+旧 `manual/effetune/` の入口・版付き URL と Sound の版付き URL は固定 URL へ 301 で転送する。
 F4 のポータブル版は署名済み host と mIV Sound を exe 隣へ同梱し、保存は `data/effetune`、旧共有先からの移行は対象外。
 以下の旧 bundle 名・配置はサンプル版の履歴。
 `vendor/miv-sound` の承認原本と `third_party/miv-sound/<ver>` のmanifestを使い、署名時も原本を変更しない。
@@ -782,18 +783,23 @@ F4 ではこの制限を撤去した。音響調整とユーザー VST は通常
 ### 10.5 説明ページの版を上げる手順 (2026-10-12)
 
 説明書の正本は [派生版計画 §10](effetune-fork-plan.md#10-マニュアル製品ページ公開文書)。
-`config/miv-sound.rs` の `VERSION` に `v` を付けた版を公開 URL `manual/sound/<ver>/` に使い、
-`DOCS_VERSION` は元の上流説明書の版として分ける。両方を snapshot の `SOURCE.md` と照合する。
+公開 URL は版番号なしの `manual/sound/` に固定する。`config/miv-sound.rs` の `VERSION` に
+`v` を付けた版は目次本文の1か所だけに表示し、`DOCS_VERSION` は元の上流説明書の版として分ける。
+両方を snapshot の `SOURCE.md` と照合する。版だけの更新では目次以外のページ・URL・転送規則は変わらない。
 
 1. 承認版に対応する上流 snapshot と `SOURCE.md` を確認し、訂正ルールを派生版の実装と照合する。
    [再生成の説明](effetune-docs-overrides/README.md) に従い、原文・LICENSE・画像は改変しない。
-2. `python scripts/gen-effetune-docs.py` で生成する。`manual/sound/v*/` の他版と旧 `manual/effetune/` の
-   生成物を明示的に除き、`python scripts/test_gen_effetune_docs.py` と生成器の `--check` を通す。
-   自動削除を行わず残存検査で止める。
-3. `.htaccess` の生成ブロックは旧 EffeTune の全版・入口と Sound の他版を 301 で転送する。
-   同名ファイルがあれば保ち、無ければ現在の目次へ送る。`manual/effetune.html` は案内ページの URL として維持する。
-4. 相対リンクと `python scripts/check_site_cards.py` を確認し、`python scripts/gen-sitemap-xml.py` を実行する。
-   公開時は生成物・旧ファイルの削除・`.htaccess`・sitemap を同時反映する。コミット後は日付確定のため sitemap を再生成する。
+2. `python scripts/gen-effetune-docs.py` で `manual/sound/` 直下の生成物を更新する。
+   移行時に残る `manual/sound/v*/` と旧 `manual/effetune/` は明示的に除く。
+   自動削除はせず、通常生成は残存を警告し、`--check` は空の版ディレクトリも拒否する。
+   `python scripts/test_gen_effetune_docs.py` と生成器の `--check` を通す。
+3. `.htaccess` の生成ブロックは旧 EffeTune の全版・入口と Sound の全版を1回の301で固定 URL へ送る。
+   現行生成物一覧に同名が無ければ目次へ送り、固定 URL の消えたページも同様に扱う。
+   ファイル存在検査は使わず、規則はページ・画像の増減時だけ変わる。
+   `manual/sound/` 自体は DirectoryIndex に任せ、`manual/effetune.html` は案内ページとして維持する。
+4. 相対リンクと `python scripts/check_site_cards.py` を確認する。htdocs のコミット後に公開担当が
+   `python scripts/gen-sitemap-xml.py` で日付を確定する。公開時は固定 URL の生成物・転送規則・sitemap を同時反映する。
+   deploy はサーバだけにある旧ファイルを削除しないが、現行一覧に基づく301が先に効く。
 
 ### 10.6 同梱版更新 (2026-10-18)
 

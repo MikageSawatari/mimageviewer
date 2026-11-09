@@ -127,6 +127,7 @@ pub mod book_composition;
 mod book_fs_journal;
 pub mod book_order;
 pub mod book_resume_db;
+pub mod book_resume_key;
 pub(crate) mod book_scope;
 pub mod bookmark_browser;
 pub mod books;

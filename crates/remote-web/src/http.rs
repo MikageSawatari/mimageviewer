@@ -3518,6 +3518,27 @@ fn api_write(
         Ok(request) => request,
         Err(_) => return HttpResponse::text(400, "Bad Request"),
     };
+    // Asset-token reconciliation can leave a stale tab running (e.g. storage is
+    // unavailable). Refuse its old displayed-context meaning before any write
+    // is validated or admitted to core. Other write contracts are unchanged.
+    if matches!(
+        write_request,
+        RemoteWriteRequest::RecordReadingProgress { .. }
+    ) {
+        let client_version = header_value(request, "X-mIV-Remote-Protocol")
+            .and_then(|value| value.parse::<u32>().ok());
+        if client_version != Some(mimageviewer_ipc::PROTOCOL_VERSION) {
+            let body = serde_json::to_vec(&json!({
+                "error": "protocol_version_mismatch",
+                "message": "Web の版が一致しないため読書位置を保存できません。ページを再読み込みしてください。",
+                "client_version": client_version,
+                "server_version": mimageviewer_ipc::PROTOCOL_VERSION,
+            }))
+            .unwrap_or_default();
+            return HttpResponse::bytes(409, "application/json; charset=utf-8", body)
+                .with_header("Cache-Control", "no-store");
+        }
+    }
     if let Some(address) = write_request.address()
         && let Err(error) = state.library.validate_remote_address(address)
     {
@@ -6577,6 +6598,59 @@ mod tests {
         let body: Value = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(body["error"], "miv_write_error");
         assert!(body["message"].as_str().unwrap().contains("UI"));
+    }
+
+    #[test]
+    fn reading_progress_refuses_old_web_protocol_before_write_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_state(&temp);
+        let owner = RemoteSessionIdentity {
+            client_id: "browser-client".into(),
+            session_id: "0123456789abcdef0123456789abcdef".into(),
+        };
+        let missing = temp
+            .path()
+            .join("missing.zip")
+            .to_string_lossy()
+            .into_owned();
+        let body = r#"{"kind":"record_reading_progress",
+            "address":{"path_query_index":0,"subresource":{"kind":"zip_entry","entry_name":"A/02.jpg"}},
+            "context_address":{"path_query_index":1,"subresource":{"kind":"zip_directory","prefix":"A/"}},
+            "page_index":1,"page_number":2,"page_count":2,"record_resume":true,"record_history":true}"#;
+        let query = [("path".into(), missing.clone()), ("path".into(), missing)];
+        for version in [None, Some("73"), Some("invalid"), Some("74")] {
+            let mut request = TestRequest::new().with_method(Method::Post).with_body(body);
+            if let Some(version) = version {
+                request = request
+                    .with_header(Header::from_bytes("X-mIV-Remote-Protocol", version).unwrap());
+            }
+            let mut request = request.into();
+            let response = api_write(&mut request, &state, &query, &owner);
+            if version == Some("74") {
+                assert_eq!(
+                    response.status, 404,
+                    "current client reaches ordinary path validation"
+                );
+            } else {
+                assert_eq!(response.status, 409);
+                let body: Value = serde_json::from_slice(&response.body).unwrap();
+                assert_eq!(body["error"], "protocol_version_mismatch");
+                assert_eq!(body["server_version"], 74);
+                assert!(
+                    response
+                        .headers
+                        .iter()
+                        .any(|(name, value)| *name == "Cache-Control" && value == "no-store")
+                );
+            }
+        }
+        assert!(
+            include_str!("../web/app.js").contains(&format!(
+                "const REMOTE_PROTOCOL_VERSION = {};",
+                mimageviewer_ipc::PROTOCOL_VERSION
+            )),
+            "the script's semantic version must match the IPC handshake"
+        );
     }
 
     #[test]

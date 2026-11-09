@@ -296,7 +296,7 @@ impl PreparedCollectionPhysicalNavigation {
                     .continuation()
                     .map(super::DeferredFsTarget::CollectionNavigation)
                     .unwrap_or(super::DeferredFsTarget::None),
-                resume_to_last_page: app.settings.book_nav_resume.resumes(),
+                resume_to_last_page: (app.settings.book_nav_resume.resumes()).into(),
                 from_explicit_open: false,
                 preserve_after_password_prompt: false,
             });
@@ -4287,7 +4287,7 @@ impl App {
                             )
                         })
                         .unwrap_or(super::DeferredFsTarget::None),
-                    resume_to_last_page: self.settings.book_nav_resume.resumes(),
+                    resume_to_last_page: (self.settings.book_nav_resume.resumes()).into(),
                     from_explicit_open: false,
                     preserve_after_password_prompt: false,
                 });
@@ -4419,7 +4419,7 @@ impl App {
                             )
                         })
                         .unwrap_or(super::DeferredFsTarget::None),
-                    resume_to_last_page: self.settings.book_nav_resume.resumes(),
+                    resume_to_last_page: (self.settings.book_nav_resume.resumes()).into(),
                     from_explicit_open: false,
                     preserve_after_password_prompt: false,
                 });

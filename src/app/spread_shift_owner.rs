@@ -26,7 +26,7 @@ enum FencedResume {
     #[default]
     Unprepared,
     Ready {
-        key: String,
+        key: crate::book_resume_key::BookResumeKey,
         position: Option<crate::book_resume_db::ReadingPosition>,
     },
 }
@@ -273,7 +273,7 @@ impl ViewerSpreadShift {
 pub(super) struct ViewerBookRestore {
     receipt: RestoreReceipt,
     reads: RestoreReadDependencies,
-    resume_key: Option<String>,
+    resume_key: Option<crate::book_resume_key::BookResumeKey>,
     memory: ShiftMemoryPolicy,
     cause: ShiftRestoreCause,
     layout_eligibility: PairingEditAvailability,
@@ -560,10 +560,7 @@ impl App {
         // Use the same root qualification and physical key as the resume producer,
         // including collapsed wrappers and converted archives.
         let resume_key = (!retained)
-            .then(|| {
-                self.book_resume_recording_folder()
-                    .map(crate::path_key::normalize)
-            })
+            .then(|| self.current_book_resume_key())
             .flatten();
         let memory = self.settings.remember_spread_shift_per_book;
         let reads = RestoreReadDependencies::admit(
@@ -574,7 +571,7 @@ impl App {
             (!retained)
                 .then_some(self.book_resume_writer.as_ref())
                 .flatten(),
-            resume_key.as_deref(),
+            resume_key.as_ref().map(|key| key.storage_key()).as_deref(),
         );
         Some(ViewerBookRestore {
             receipt,
@@ -940,16 +937,22 @@ impl App {
         true
     }
 
+    pub(super) fn fenced_book_resume_key(
+        &self,
+        resume_key: &crate::book_resume_key::BookResumeKey,
+    ) -> Option<Option<crate::book_resume_db::ReadingPosition>> {
+        match &self.spread_shift.resume {
+            FencedResume::Ready { key, position } if key == resume_key => Some(position.clone()),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn fenced_book_resume(
         &self,
         folder: &Path,
     ) -> Option<Option<crate::book_resume_db::ReadingPosition>> {
-        match &self.spread_shift.resume {
-            FencedResume::Ready { key, position } if *key == crate::path_key::normalize(folder) => {
-                Some(position.clone())
-            }
-            _ => None,
-        }
+        self.fenced_book_resume_key(&crate::book_resume_key::BookResumeKey::legacy(folder))
     }
 
     #[cfg(test)]

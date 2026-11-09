@@ -150,6 +150,10 @@ export { ADJUSTMENT_PANEL_TABS };
 // このモジュールが実行され始めたということ。この後の遅さはアプリ自身が画面で伝える。
 if (typeof window !== "undefined") window.__mivRemoteAppStarted = true;
 
+// Keep this in sync with remote-ipc. A progress POST must attest that its
+// context_address is the requested raw book scope, even from an already-open tab.
+const REMOTE_PROTOCOL_VERSION = 74;
+
 const app = document.querySelector("#app");
 const hudElement = document.querySelector("#telemetry-hud");
 const sessionOwnerBadgeElement = document.querySelector(
@@ -4579,7 +4583,7 @@ async function showFolder(path) {
   renderFolder(loaded.metrics, loaded.requestController);
 }
 
-async function showContainer(address) {
+export async function showContainer(address) {
   renderLoading("コンテナを読み込んでいます");
   const loaded = await loadContainer(address);
   if (!loaded) return;
@@ -4620,6 +4624,11 @@ async function showContainer(address) {
     mediaHash(entryAddress(entry))
   );
   renderImageViewer(initialImageIndex, performance.now());
+  const resumeNotice = containerResumeRefusalNotice(
+    state.container?.resumeRefusal,
+    state.container?.openMode
+  );
+  if (resumeNotice) state.viewer?.showBoundaryMessage(resumeNotice);
 }
 
 async function loadContainer(address, options = {}) {
@@ -4817,18 +4826,21 @@ export function containerRuntimeStateForTest() {
   };
 }
 
-export function containerResumeRefusalNotice(reason) {
+export function containerResumeRefusalNotice(reason, openMode = "grid") {
+  const nextStep = openMode === "grid"
+    ? "一覧からページを選んでください。"
+    : "先頭ページから表示します。";
   if (reason === "saved_page_unavailable") {
-    return "保存したページを現在の一覧で確認できません。一覧からページを選んでください。";
+    return `保存したページを現在の一覧で確認できません。${nextStep}`;
   }
   if (reason === "legacy_position_unverified") {
-    return "現在の表示設定では保存した読書位置を確認できません。一覧からページを選んでください。";
+    return `現在の表示設定では保存した読書位置を確認できません。${nextStep}`;
   }
   return "";
 }
 
-export function containerInitialImageIndex({ openMode, resumePage, resumeRefusal, images }) {
-  if (openMode === "grid" || containerResumeRefusalNotice(resumeRefusal) || !images.length) return -1;
+export function containerInitialImageIndex({ openMode, resumePage, images }) {
+  if (openMode === "grid" || !images.length) return -1;
   if (openMode === "resume_page" && resumePage) {
     const resumeIndex = images.findIndex(
       (entry) =>
@@ -5936,17 +5948,20 @@ function currentRemotePageTarget() {
 function readingProgressValue() {
   const target = currentRemotePageTarget();
   if (!target) return null;
+  // Resume belongs to the requested raw book scope. The displayed context can
+  // collapse further after the file-type policy removes direct pages.
+  const contextAddress = state.container?.requestedAddress ?? target.contextAddress;
   const imageIndex = state.images.findIndex(
     (entry) => addressIdentity(entryAddress(entry)) === addressIdentity(target.address)
   );
-  const contextIdentity = addressIdentity(target.contextAddress);
+  const contextIdentity = addressIdentity(contextAddress);
   return {
     contextIdentity,
     identity: `${contextIdentity}\n${addressIdentity(target.address)}`,
     request: {
       kind: "record_reading_progress",
       address: target.address,
-      context_address: target.contextAddress,
+      context_address: contextAddress,
       page_index: target.pageIndex,
       page_number: Math.max(1, imageIndex + 1),
       page_count: state.images.length,
@@ -16476,6 +16491,7 @@ async function pageResourceResponseError(response) {
 
 function remoteHeaders(initial = {}) {
   const headers = new Headers(initial);
+  headers.set("X-mIV-Remote-Protocol", String(REMOTE_PROTOCOL_VERSION));
   headers.set("X-mIV-Remote-Client", REMOTE_CLIENT_ID);
   if (state.remoteSessionId) {
     headers.set("X-mIV-Remote-Session", state.remoteSessionId);

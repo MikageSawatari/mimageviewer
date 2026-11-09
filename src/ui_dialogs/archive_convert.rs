@@ -63,6 +63,7 @@ pub(crate) enum ArchiveScanOutcome {
 enum ArchiveScanPurpose {
     Open {
         cache_db: Option<Arc<ArchiveCacheDb>>,
+        visibility: crate::file_type_visibility::FileTypeVisibility,
     },
     SiblingZip,
 }
@@ -281,10 +282,12 @@ fn spawn_archive_scan(
         check_cancel()?;
         let source = src;
         let mut inspected_summary = None;
-        if format == ArchiveFormat::Rar
-            && let ArchiveScanPurpose::Open { cache_db } = purpose
+        if let ArchiveScanPurpose::Open {
+            cache_db,
+            visibility,
+        } = purpose
         {
-            if password.is_none() {
+            if format == ArchiveFormat::Rar && password.is_none() {
                 match crate::rar_loader::inspect_for_direct_read_cancelable_traced(
                     &source,
                     cancel,
@@ -306,14 +309,16 @@ fn spawn_archive_scan(
                 }
             }
             check_cancel()?;
-            // Keep first/single-archive cache hits at the DB's actual saved ZIP path.
-            // No subsequent-volume source substitution or compatibility cache lookup.
+            // Resolve every open's cache on this worker, including internal-book aliases.
+            // RAR volume validation and direct-read selection above retain precedence.
+            // Keep the DB's actual saved ZIP path without source substitution.
             if let Some(db) = cache_db
                 && let Ok(meta) = std::fs::metadata(&source)
-                && let Some(path) = db.lookup(
+                && let Some(path) = db.lookup_with_visibility(
                     &source,
                     crate::ui_helpers::mtime_secs(&meta),
                     meta.len() as i64,
+                    &visibility,
                 )
             {
                 check_cancel()?;
@@ -538,7 +543,8 @@ impl App {
         if let Some(pending) = self.zip_enumerate_pending.as_mut()
             && crate::folder_tree::path_eq(&pending.zip_path, cached_zip)
         {
-            pending.restore_intent = restore_intent.for_book();
+            pending.presentation =
+                crate::app::ZipEnumerationPresentation::Existing(restore_intent.for_book());
         } else if self
             .current_folder
             .as_ref()
@@ -688,6 +694,7 @@ impl App {
             None,
             ArchiveScanPurpose::Open {
                 cache_db: self.archive_cache_db.clone(),
+                visibility: self.settings.file_type_visibility.clone(),
             },
             self.input_seq,
             Arc::clone(&cancel),
@@ -1825,6 +1832,7 @@ impl App {
                         } else {
                             ArchiveScanPurpose::Open {
                                 cache_db: self.archive_cache_db.clone(),
+                                visibility: self.settings.file_type_visibility.clone(),
                             }
                         },
                         state.input_seq,
@@ -2039,6 +2047,124 @@ mod tests {
     }
 
     #[test]
+    fn non_rar_open_scan_reuses_cache_before_scanning_source() {
+        let guard = crate::data_dir::TestDataDirGuard::new();
+        let db = Arc::new(ArchiveCacheDb::open().unwrap());
+        for (extension, format) in [
+            ("7z", ArchiveFormat::SevenZ),
+            ("lzh", ArchiveFormat::Lzh),
+            ("zip", ArchiveFormat::Zip),
+        ] {
+            let source = guard.path().join(format!("source.{extension}"));
+            let cached = guard.path().join(format!("cached-{extension}.zip"));
+            // Deliberately unreadable as an archive: a content scan would fail rather than
+            // return the saved backing. Only the source metadata should be needed here.
+            std::fs::write(&source, b"invalid archive content").unwrap();
+            write_scan_test_zip(&cached);
+            let metadata = std::fs::metadata(&source).unwrap();
+            db.record(
+                &source,
+                crate::ui_helpers::mtime_secs(&metadata),
+                metadata.len() as i64,
+                format,
+                &cached,
+                std::fs::metadata(&cached).unwrap().len() as i64,
+                1,
+                false,
+            )
+            .unwrap();
+
+            let rx = spawn_archive_scan(
+                source.clone(),
+                format,
+                None,
+                ArchiveScanPurpose::Open {
+                    cache_db: Some(Arc::clone(&db)),
+                    visibility: crate::file_type_visibility::FileTypeVisibility::default(),
+                },
+                0,
+                Arc::new(AtomicBool::new(false)),
+            );
+            assert!(matches!(
+                rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+                ArchiveConvertMsg::ScanDone(Ok(ArchiveScanOutcome::CachedZip {
+                    source: actual_source,
+                    path,
+                })) if actual_source == source && path == cached
+            ));
+        }
+    }
+
+    #[test]
+    fn non_rar_open_scan_legacy_cache_requires_origins_for_nested_exclusions() {
+        use crate::file_type_visibility::{FileTypeCategory, FileTypeVisibility};
+
+        let guard = crate::data_dir::TestDataDirGuard::new();
+        let db = Arc::new(ArchiveCacheDb::open().unwrap());
+        let source = guard.path().join("source.zip");
+        let cached = guard.path().join("cached.zip");
+        write_scan_test_zip(&source);
+        write_scan_test_zip(&cached);
+        let metadata = std::fs::metadata(&source).unwrap();
+        db.record(
+            &source,
+            crate::ui_helpers::mtime_secs(&metadata),
+            metadata.len() as i64,
+            ArchiveFormat::Zip,
+            &cached,
+            std::fs::metadata(&cached).unwrap().len() as i64,
+            1,
+            false,
+        )
+        .unwrap();
+        rusqlite::Connection::open(crate::archive_cache::db_path())
+            .unwrap()
+            .execute(
+                "UPDATE converted_archives SET origin_manifest_version=0",
+                [],
+            )
+            .unwrap();
+
+        for requires_origins in [false, true, false] {
+            let mut visibility = FileTypeVisibility::default();
+            if requires_origins {
+                visibility.excluded_categories.insert(FileTypeCategory::Zip);
+            }
+            let rx = spawn_archive_scan(
+                source.clone(),
+                ArchiveFormat::Zip,
+                None,
+                ArchiveScanPurpose::Open {
+                    cache_db: Some(Arc::clone(&db)),
+                    visibility,
+                },
+                0,
+                Arc::new(AtomicBool::new(false)),
+            );
+            let message = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            if requires_origins {
+                assert!(matches!(
+                    message,
+                    ArchiveConvertMsg::ScanDone(Ok(ArchiveScanOutcome::NeedsConversion {
+                        source: actual_source,
+                        summary,
+                    })) if actual_source == source && summary.image_count == 1
+                ));
+            } else {
+                assert!(matches!(
+                    message,
+                    ArchiveConvertMsg::ScanDone(Ok(ArchiveScanOutcome::CachedZip {
+                        source: actual_source,
+                        path,
+                    })) if actual_source == source && path == cached
+                ));
+            }
+        }
+        assert!(cached.exists());
+        assert_eq!(db.list_all().unwrap().len(), 1);
+    }
+
+    #[test]
     fn cancelled_scan_worker_stops_and_followup_scan_completes() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("scan.zip");
@@ -2165,7 +2291,9 @@ mod tests {
         let (_tx, rx) = mpsc::channel();
         app.zip_enumerate_pending = Some(crate::app::ZipEnumeratePending {
             zip_path: cached.clone(),
-            restore_intent: crate::app::StartupListIntent::InternalInstall,
+            presentation: crate::app::ZipEnumerationPresentation::Existing(
+                crate::app::StartupListIntent::InternalInstall,
+            ),
             input_seq: 7,
             cancel: Arc::new(AtomicBool::new(false)),
             rx,
@@ -2179,8 +2307,8 @@ mod tests {
         };
         app.finish_converted_archive_list_open(&cached, intent.clone());
         assert_eq!(
-            app.zip_enumerate_pending.as_ref().unwrap().restore_intent,
-            intent
+            app.zip_enumerate_pending.as_ref().unwrap().presentation,
+            crate::app::ZipEnumerationPresentation::Existing(intent)
         );
         assert_eq!(app.settings.startup_list_restore, before);
     }

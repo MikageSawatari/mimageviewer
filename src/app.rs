@@ -542,6 +542,10 @@ fn thumbnail_keep_bounds_for_count(
     (anchor - back, anchor + forward)
 }
 
+#[cfg(test)]
+mod archive_inner_book_s2;
+#[cfg(all(test, windows))]
+mod archive_inner_book_s3;
 pub(crate) mod book_resume_meter;
 #[cfg(test)]
 mod book_resume_meter_tests;
@@ -676,7 +680,13 @@ pub(crate) mod smart_folder;
 mod snapshot_ops;
 use raw_page_store::*;
 mod ai_terminal_service;
+mod archive_inner_book;
 mod close_return;
+pub(crate) use archive_inner_book::ZipDirActivationOutcome;
+pub(crate) use archive_inner_book::{
+    ArchiveBookEntry, ArchiveBookOpenOutcome, ArchiveBookTarget, DetachedZipTarget,
+    ZipListReturnRequest,
+};
 #[cfg(all(test, windows))]
 mod context_state_tests;
 mod logic_service;
@@ -685,7 +695,9 @@ pub(crate) mod root_lifecycle;
 mod startup_ops;
 mod subfolder_expansion;
 mod update_phases;
-pub(crate) use close_return::{FullscreenCloseContinuation, ViewerCloseCause};
+pub(crate) use close_return::{
+    FullscreenCloseContinuation, FullscreenCloseDestination, ViewerCloseCause,
+};
 #[cfg(all(test, windows))]
 mod close_return_tests;
 #[cfg(test)]
@@ -1754,6 +1766,7 @@ pub(crate) struct DetachedGridArchiveOpenRequestOwner {
     /// The path selected in the main grid. A multi-volume RAR probe may resolve a different
     /// backing volume, but the detached reader must retain this user-facing identity.
     pub(crate) source_path: PathBuf,
+    pub(crate) target: DetachedZipTarget,
     /// Collection origin captured before the main-owned probe/conversion starts.
     pub(crate) collection_restore: Option<top_level_grid_view::CollectionGridRestore>,
 }
@@ -1910,7 +1923,7 @@ pub(crate) enum FsMetadataBoundary {
 /// A resume refusal travels with the existing open request until its target is admitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BookResumeNotice {
-    path: PathBuf,
+    label: String,
     resolution: file_type_resume::PositionResolution,
 }
 
@@ -4126,7 +4139,7 @@ pub(crate) enum ViewerContextDescriptor {
     },
     Zip {
         path: PathBuf,
-        entry_name: Option<String>,
+        target: DetachedZipTarget,
         archive_source_override: Option<PathBuf>,
     },
     /// A directory-backed image book (plain image folder or compiled book root).
@@ -4190,6 +4203,7 @@ enum DetachedGridItemOpenPlan {
     /// a new detached context without publishing a main-grid navigation.
     ConvertibleArchiveCandidate {
         path: PathBuf,
+        target: DetachedZipTarget,
         collection_restore: Option<top_level_grid_view::CollectionGridRestore>,
     },
     /// ZIP/PDF and explicit leaf sources already have an unambiguous detached owner.
@@ -4664,6 +4678,34 @@ pub(crate) enum FolderNavMode {
     SlideshowNext,
 }
 
+/// One resume read owned by a reader admission, including a definite unsaved result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DeferredBookResume {
+    First,
+    AwaitingFence,
+    Refused(BookResumeNotice),
+    Captured {
+        key: crate::book_resume_key::BookResumeKey,
+        position: Option<crate::book_resume_db::ReadingPosition>,
+    },
+}
+
+impl From<bool> for DeferredBookResume {
+    fn from(resume: bool) -> Self {
+        if resume {
+            Self::AwaitingFence
+        } else {
+            Self::First
+        }
+    }
+}
+
+impl DeferredBookResume {
+    fn resumes(&self) -> bool {
+        !matches!(self, Self::First)
+    }
+}
+
 /// 非同期 PDF / ZIP 列挙完了後に fullscreen を開き直すための deferred reopen 状態。
 /// (旧来は `Option<bool>` で forward だけ持っていたが、スライドショー NextFolder の
 /// resume を deferred 経路でも引き継ぐため struct 化した。resume は自由 bool ではなく
@@ -4684,7 +4726,7 @@ pub(crate) struct DeferredFsReopen {
     /// grid から本を開いた経路は設定 `book_open_resume`、Ctrl+↑↓ フォルダナビ経路は
     /// `book_nav_resume` で true/false を決める (位置復元マトリクス)。既定は grid=続き /
     /// nav=先頭で従来挙動を維持。
-    pub resume_to_last_page: bool,
+    pub resume_to_last_page: DeferredBookResume,
     /// grid / CLI / SendTo など、ユーザーが明示的にコンテナを開いた後の自動 fullscreen。
     /// PDF / ZIP は列挙完了後に遅れて `open_fullscreen` するため、この意図を保持して
     /// detached viewer の focus / always-new window 判定へ渡す。
@@ -4694,9 +4736,22 @@ pub(crate) struct DeferredFsReopen {
     pub preserve_after_password_prompt: bool,
 }
 
+impl DeferredFsReopen {
+    fn zip_dfs_continuation(&self) -> Option<book_composition_permission::BookDfsContinuation> {
+        match &self.target {
+            DeferredFsTarget::CurrentArchiveBook(ArchiveBookTarget {
+                entry: ArchiveBookEntry::Dfs(continuation),
+                ..
+            }) => Some(*continuation),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DeferredFsTarget {
     None,
+    CurrentArchiveBook(ArchiveBookTarget),
     Preferred(crate::snapshot::SnapshotTarget),
     Required(crate::snapshot::SnapshotTarget),
     CollectionNavigation(CollectionArchiveNavigationContinuation),
@@ -4707,6 +4762,10 @@ enum DeferredFsOpenOutcome {
     Opened,
     WaitingComposition,
     NoPlayableItem,
+    ArchiveBookList,
+    ArchiveDfsNoPage,
+    ArchiveDfsContinue(book_composition_permission::BookDfsContinuation),
+    StaleArchiveBook,
     RequiredTargetMissing,
     RequiredTargetHidden,
 }
@@ -4838,9 +4897,24 @@ pub(crate) enum FolderNavScanResult {
 /// ZIP 中央ディレクトリ列挙の非同期ハンドル。ネスト ZIP が多いと `enumerate_image_entries`
 /// が数秒かかるため worker に逃がす。Drop で `cancel` を立てるので、新しい load_folder が
 /// 来たら自動で破棄される (worker は cancel を見て早期 return する)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ZipEnumerationPresentation {
+    Existing(StartupListIntent),
+    ArchiveBook(DeferredFsReopen),
+}
+
+impl ZipEnumerationPresentation {
+    fn restore_intent(&self) -> StartupListIntent {
+        match self {
+            Self::Existing(intent) => intent.clone(),
+            Self::ArchiveBook(_) => StartupListIntent::PageContinuation,
+        }
+    }
+}
+
 pub(crate) struct ZipEnumeratePending {
     pub zip_path: PathBuf,
-    pub restore_intent: StartupListIntent,
+    pub presentation: ZipEnumerationPresentation,
     pub input_seq: u64,
     pub cancel: Arc<AtomicBool>,
     pub rx: mpsc::Receiver<Result<crate::zip_loader::PreparedZipEnumeration, String>>,
@@ -18045,7 +18119,7 @@ pub struct App {
     /// 直近に受け付けた `(コンテナパス, page idx, meter)`。フルスクリーンのページ送り毎の
     /// 重複書き込みを抑止する dedup。
     pub(crate) last_book_resume: Option<(
-        PathBuf,
+        crate::book_resume_key::BookResumeKey,
         usize,
         Option<crate::book_resume_db::ReadingMeterValue>,
         Option<crate::book_resume_db::PageIdentity>,
@@ -24940,6 +25014,10 @@ impl App {
         nav: crate::ui_main::AddressBarNav,
     ) -> bool {
         match nav {
+            crate::ui_main::AddressBarNav::ZipListReturn(plan) => {
+                self.apply_zip_list_return(plan);
+                true
+            }
             crate::ui_main::AddressBarNav::Direct(path, restore_intent) => {
                 let outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
                     path,
@@ -37899,7 +37977,7 @@ impl App {
                     history_trigger: HistoryTrigger::UserChosen,
                     resume_slideshow: false,
                     target: DeferredFsTarget::None,
-                    resume_to_last_page: app.settings.book_open_resume.resumes(),
+                    resume_to_last_page: (app.settings.book_open_resume.resumes()).into(),
                     from_explicit_open: true,
                     preserve_after_password_prompt: true,
                 });
@@ -38028,7 +38106,7 @@ impl App {
                 seq,
                 prepared,
                 authority,
-                restore_intent.clone(),
+                ZipEnumerationPresentation::Existing(restore_intent.clone()),
                 token,
             ),
             PreparedPhysicalListing::Pdf {
@@ -39372,7 +39450,26 @@ impl App {
 
         restore_intent: crate::app::StartupListIntent,
     ) {
-        let restore_intent = restore_intent.for_book();
+        self.load_zip_as_folder_with_presentation(
+            zip_path,
+            input_seq,
+            prepared,
+            cache_routing,
+            logical_source,
+            ZipEnumerationPresentation::Existing(restore_intent),
+        );
+    }
+
+    fn load_zip_as_folder_with_presentation(
+        &mut self,
+        zip_path: PathBuf,
+        input_seq: u64,
+        prepared: Option<crate::zip_loader::PreparedZipEnumeration>,
+        cache_routing: ZipCacheRouting,
+        logical_source: Option<&Path>,
+        presentation: ZipEnumerationPresentation,
+    ) {
+        let restore_intent = presentation.restore_intent().for_book();
 
         if restore_intent.captures_list_departure() {
             self.capture_main_list_restore_cursor();
@@ -39437,7 +39534,9 @@ impl App {
         self.archive_auto_fs_paint_trace = None;
         // 自動 1 ページ目フルスクリーン (環境設定 ON で grid から ZIP を開いた) の予約を、
         // enumerate 完了で先頭ページを開く既存 deferred 機構へ載せ替える。
-        if std::mem::take(&mut self.pending_auto_fs_open) {
+        if std::mem::take(&mut self.pending_auto_fs_open)
+            && matches!(presentation, ZipEnumerationPresentation::Existing(_))
+        {
             if crate::perf::is_enabled() {
                 let archive_key = crate::path_key::normalize_keep_drive(&zip_path);
                 crate::perf::event(
@@ -39460,7 +39559,7 @@ impl App {
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
                 // 「ZIP/PDF × 一覧から開く」: 続きから / 先頭から を設定で切替。
-                resume_to_last_page: self.settings.book_open_resume.resumes(),
+                resume_to_last_page: (self.settings.book_open_resume.resumes()).into(),
                 from_explicit_open: true,
                 preserve_after_password_prompt: true,
             });
@@ -39475,7 +39574,9 @@ impl App {
         // 複数 ZIP を連打したときに旧 worker の遅れた clear が新 worker の populate を
         // 上書き消去するレースが起きる。ここで同期実行すれば load_zip_as_folder 呼び出し
         // の直列順で確実にクリアされる (clear 自体は軽量: NESTED_CACHE.clear())。
-        crate::zip_loader::clear_nested_cache();
+        if matches!(presentation, ZipEnumerationPresentation::Existing(_)) {
+            crate::zip_loader::clear_nested_cache();
+        }
         // 旧 ZIP のツリーナビ状態を破棄 (新ツリーは finalize_zip_enumerate が設定)。
         // enumerate pending 窓中に stale nav を参照しないよう早期クリア。
         self.zip_nav = None;
@@ -39527,6 +39628,9 @@ impl App {
             self.archive_source_override = None;
         }
         self.display_epub_source = None;
+        self.archive_source_override = logical_source
+            .map(Path::to_path_buf)
+            .or(self.archive_source_override.take());
         self.current_folder = Some(zip_path.clone());
         self.current_folder_rating_cache = None;
         self.current_folder_last_mtime = None;
@@ -39552,7 +39656,7 @@ impl App {
                 Ok(enumeration),
                 logical_source,
                 authority,
-                restore_intent.clone(),
+                presentation,
             );
             return;
         }
@@ -39595,6 +39699,11 @@ impl App {
             });
 
         if let Err(e) = spawn_result {
+            if matches!(presentation, ZipEnumerationPresentation::ArchiveBook(_)) {
+                crate::logger::log(format!("archive book enumeration worker spawn failed: {e}"));
+                self.finalize_archive_book_open_outcome(ArchiveBookOpenOutcome::Failed);
+                return;
+            }
             // リソース枯渇等でスレッド spawn に失敗した場合は panic せず、UI スレッドで
             // 同期的に enumerate してそのまま start_loading_items に流す
             // (PDF 側と揃えた fallback)。UI は多少詰まるが「アプリが落ちる」よりは遥かにマシ。
@@ -39621,7 +39730,7 @@ impl App {
                 result,
                 None,
                 VisibleInstallAuthority::Ordinary,
-                restore_intent.clone(),
+                presentation,
             );
             return;
         }
@@ -39632,7 +39741,7 @@ impl App {
             cancel,
             rx,
 
-            restore_intent: restore_intent.clone(),
+            presentation,
         });
     }
 
@@ -39647,7 +39756,15 @@ impl App {
         };
         // 新しい load_folder 等で cancel が立った (実質 Drop 直前) 場合は結果を適用しない
         if pending.cancel.load(Ordering::Relaxed) {
+            let scope_open = matches!(
+                pending.presentation,
+                ZipEnumerationPresentation::ArchiveBook(_)
+            );
             self.zip_enumerate_pending = None;
+            if scope_open {
+                self.finalize_archive_book_open_outcome(ArchiveBookOpenOutcome::Cancelled);
+                return;
+            }
             // cancel された pending ではフルスクリーン復帰は不成立。defer フラグを
             // 放置すると grid 抑止 / holdover 維持が永続化するので明示的に破棄する
             // (PDF 側 cancel ガードと対称)。
@@ -39662,7 +39779,15 @@ impl App {
             Err(mpsc::TryRecvError::Empty) => return,
             Err(mpsc::TryRecvError::Disconnected) => {
                 let zip_path = pending.zip_path.clone();
+                let scope_open = matches!(
+                    pending.presentation,
+                    ZipEnumerationPresentation::ArchiveBook(_)
+                );
                 self.zip_enumerate_pending = None;
+                if scope_open {
+                    self.finalize_archive_book_open_outcome(ArchiveBookOpenOutcome::Failed);
+                    return;
+                }
                 // ワーカー切断ではフルスクリーン復帰が起きない: defer フラグを破棄。
                 self.fs_nav_after_pdf_enumerate = None;
                 self.finish_visible_container_fs_nav_failed();
@@ -39686,21 +39811,35 @@ impl App {
             .as_ref()
             .is_ok_and(|prepared| prepared.policy != self.settings.file_type_visibility)
         {
+            let scope_open = matches!(
+                pending.presentation,
+                ZipEnumerationPresentation::ArchiveBook(_)
+            );
             self.zip_enumerate_pending = None;
-            self.pending_reload = true;
+            if scope_open {
+                self.finalize_archive_book_open_outcome(ArchiveBookOpenOutcome::ScopeChanged);
+            } else {
+                self.pending_reload = true;
+            }
             return;
         }
         let zip_path = pending.zip_path.clone();
         let input_seq = pending.input_seq;
-        let restore_intent = pending.restore_intent.clone();
+        let presentation = pending.presentation.clone();
         self.zip_enumerate_pending = None;
+        let logical = self.archive_source_override.clone();
+        let authority = logical
+            .as_deref()
+            .map_or(VisibleInstallAuthority::Ordinary, |logical_source| {
+                VisibleInstallAuthority::StagedArchive { logical_source }
+            });
         self.finalize_zip_enumerate(
             zip_path,
             input_seq,
             result,
-            None,
-            VisibleInstallAuthority::Ordinary,
-            restore_intent,
+            logical.as_deref(),
+            authority,
+            presentation,
         );
     }
 
@@ -39713,6 +39852,23 @@ impl App {
         logical_pin_source: Option<&Path>,
 
         restore_intent: crate::app::StartupListIntent,
+    ) -> PreparedZipGrid {
+        self.prepare_zip_grid_with_nav(
+            zip_path,
+            enumeration,
+            logical_pin_source,
+            restore_intent,
+            None,
+        )
+    }
+
+    fn prepare_zip_grid_with_nav(
+        &self,
+        zip_path: PathBuf,
+        enumeration: crate::zip_loader::PreparedZipEnumeration,
+        logical_pin_source: Option<&Path>,
+        restore_intent: StartupListIntent,
+        book_nav: Option<crate::zip_tree::ZipNavState>,
     ) -> PreparedZipGrid {
         let crate::zip_loader::PreparedZipEnumeration { raw, tree, .. } = enumeration;
         let has_foreign_archives = raw.has_foreign_archives;
@@ -39807,14 +39963,33 @@ impl App {
                 .collect();
             pinned_keys = pinned;
         }
-        let mut prepared = Self::materialize_zip_grid(
-            tree,
-            existing_keys,
-            pinned_keys,
-            has_foreign_archives,
-            &self.settings.grid_display_order,
-            restore_intent.clone(),
-        );
+        let mut prepared = if let Some(nav) = book_nav {
+            let (items, image_metas) = book_materialization::materialize_archive_level(
+                &nav.tree,
+                nav.current(),
+                BOOK_READING_PAGE_ORDER,
+                Some(&self.settings.grid_display_order),
+            );
+            let mut existing_keys = existing_keys;
+            existing_keys.extend(pinned_keys);
+            PreparedZipGrid {
+                nav,
+                items,
+                image_metas,
+                existing_keys,
+                has_foreign_archives,
+                refresh_position: crate::zip_tree::ZipRefreshPosition::Open,
+            }
+        } else {
+            Self::materialize_zip_grid(
+                tree,
+                existing_keys,
+                pinned_keys,
+                has_foreign_archives,
+                &self.settings.grid_display_order,
+                restore_intent.clone(),
+            )
+        };
         let incoming_logical_source = logical_pin_source.or_else(|| {
             self.current_folder.as_deref().and_then(|current| {
                 crate::folder_tree::path_eq(current, &zip_path)
@@ -39906,15 +40081,25 @@ impl App {
         logical_pin_source: Option<&Path>,
         authority: VisibleInstallAuthority<'_>,
 
-        restore_intent: crate::app::StartupListIntent,
+        presentation: ZipEnumerationPresentation,
     ) {
+        let restore_intent = presentation.restore_intent();
         let enumeration = match result {
             Ok(e) if e.policy != self.settings.file_type_visibility => {
-                self.pending_reload = true;
+                if matches!(presentation, ZipEnumerationPresentation::ArchiveBook(_)) {
+                    self.finalize_archive_book_open_outcome(ArchiveBookOpenOutcome::ScopeChanged);
+                } else {
+                    self.pending_reload = true;
+                }
                 return;
             }
             Ok(e) => e,
             Err(e) => {
+                if matches!(presentation, ZipEnumerationPresentation::ArchiveBook(_)) {
+                    crate::logger::log(format!("archive book enumeration failed: {e}"));
+                    self.finalize_archive_book_open_outcome(ArchiveBookOpenOutcome::Failed);
+                    return;
+                }
                 // 失敗時はフルスクリーンを開き直さないので defer フラグを破棄する
                 // (line 6142 の `.take()` には到達しない早期 return パス)。
                 self.fs_nav_after_pdf_enumerate = None;
@@ -39942,18 +40127,47 @@ impl App {
                 return;
             }
         };
-        let prepared = self.prepare_zip_grid(
+        let logical_source = logical_pin_source
+            .map(Path::to_path_buf)
+            .or_else(|| self.archive_source_override.clone());
+        let book_nav = match &presentation {
+            ZipEnumerationPresentation::ArchiveBook(deferred) => {
+                let DeferredFsTarget::CurrentArchiveBook(target) = &deferred.target else {
+                    self.finalize_archive_book_open_outcome(ArchiveBookOpenOutcome::Failed);
+                    return;
+                };
+                match Self::resolve_archive_book_nav(
+                    enumeration.tree.clone(),
+                    logical_source.as_deref().unwrap_or(&zip_path),
+                    target,
+                ) {
+                    Ok(nav) => Some(nav),
+                    Err(outcome) => {
+                        self.finalize_archive_book_open_outcome(outcome);
+                        return;
+                    }
+                }
+            }
+            ZipEnumerationPresentation::Existing(_) => None,
+        };
+        let prepared = self.prepare_zip_grid_with_nav(
             zip_path.clone(),
             enumeration,
-            logical_pin_source,
+            logical_source.as_deref(),
             restore_intent.clone(),
+            book_nav,
         );
         self.finalize_prepared_zip_grid(
             zip_path,
             input_seq,
             prepared,
-            authority,
-            restore_intent.clone(),
+            match (logical_source.as_deref(), &presentation) {
+                (Some(logical_source), ZipEnumerationPresentation::ArchiveBook(_)) => {
+                    VisibleInstallAuthority::StagedArchive { logical_source }
+                }
+                _ => authority,
+            },
+            presentation,
         );
     }
 
@@ -39967,7 +40181,7 @@ impl App {
         prepared: PreparedZipGrid,
         authority: VisibleInstallAuthority<'_>,
 
-        restore_intent: crate::app::StartupListIntent,
+        presentation: ZipEnumerationPresentation,
     ) {
         let logical = match &authority {
             VisibleInstallAuthority::StagedArchive { logical_source }
@@ -39979,7 +40193,12 @@ impl App {
         let token = match self.prepare_visible_install(&zip_path, &prepared.items, logical) {
             Ok(token) => token,
             Err(reason) => {
-                self.show_open_admission_refusal(reason);
+                if matches!(presentation, ZipEnumerationPresentation::ArchiveBook(_)) {
+                    crate::logger::log(format!("archive book install refused: {reason:?}"));
+                    self.finalize_archive_book_open_outcome(ArchiveBookOpenOutcome::Failed);
+                } else {
+                    self.show_open_admission_refusal(reason);
+                }
                 return;
             }
         };
@@ -39988,7 +40207,7 @@ impl App {
             input_seq,
             prepared,
             authority,
-            restore_intent,
+            presentation,
             token,
         );
         self.hydrate_installed_main_list(hydration);
@@ -40001,7 +40220,7 @@ impl App {
         prepared: PreparedZipGrid,
         authority: VisibleInstallAuthority<'_>,
 
-        restore_intent: crate::app::StartupListIntent,
+        presentation: ZipEnumerationPresentation,
         prepared_visible: PreparedVisibleInstall,
     ) -> MainListHydration {
         let PreparedZipGrid {
@@ -40012,6 +40231,7 @@ impl App {
             has_foreign_archives,
             refresh_position: _,
         } = prepared;
+        let restore_intent = presentation.restore_intent();
         let installed_items = items.len();
 
         let mut hydration = self.install_loading_items_inner(
@@ -40079,8 +40299,15 @@ impl App {
         // - グリッドからの自動フルスクリーン予約 (lock なし): FS 予約を取り下げて提案を
         //   出し、変換完了後の自動フルスクリーンへ引き継ぐ (ConvertState.auto_fullscreen)
         if let Some((continuation, _)) = hydration.as_mut() {
-            continuation.first_display_action = sidecar_restore::FirstDisplayAction::Zip {
-                has_foreign_archives,
+            continuation.first_display_action = match presentation {
+                ZipEnumerationPresentation::Existing(_) => {
+                    sidecar_restore::FirstDisplayAction::Zip {
+                        has_foreign_archives,
+                    }
+                }
+                ZipEnumerationPresentation::ArchiveBook(deferred) => {
+                    sidecar_restore::FirstDisplayAction::ArchiveBook(deferred)
+                }
             };
         }
         if let Some((continuation, _)) = hydration.as_mut() {
@@ -40724,30 +40951,50 @@ impl App {
         }
         // 新しい本のページに差し替え + その本の見開き設定を適用。
         self.zip_nav_show_current_level(StartupListIntent::PageContinuation);
-        // 新しい本の先頭画像をフルスクリーンで開く (Ctrl+↑↓ 慣習: 常に先頭着地)。
-        if let Some(new_idx) = self.find_fullscreen_nav_target_filtered(true) {
-            let continuation = if sequence_ctx.is_some() {
-                book_composition_permission::BookDfsContinuation::Navigation { forward }
-            } else {
-                book_composition_permission::BookDfsContinuation::Slideshow
-            };
-            let ctx = sequence_ctx.cloned().unwrap_or_default();
-            self.complete_book_zip_dfs_target(&ctx, new_idx, continuation);
+        let continuation = if sequence_ctx.is_some() {
+            book_composition_permission::BookDfsContinuation::Navigation { forward }
         } else {
-            // 直下画像はあるがレーティングフィルタで全 hidden のケース。
-            // open_fullscreen に到達しないまま放置すると、
-            // ① 旧 fs_idx が新 items の範囲外なら poll_fs_nav_lock の解除条件
-            //    (thumbnails[idx] Loaded / fs_cache) に永遠に達せず holdover lock が
-            //    残留して以降の Ctrl+↑↓ が全部無視される、
-            // ② 範囲内なら ZipDir セルをフルスクリーン表示してしまう (レビュー P1)。
-            // lock を明示解放してフルスクリーンを閉じ、グリッドにこの階層を見せる
-            // (= グリッド側 Ctrl+↓ でこの階層へ移動したときと同じ着地)。
-            self.release_fs_nav_lock();
-            self.slideshow_playing = false;
-            self.slideshow_anchor_idx = None;
-            self.continuous_reading_scroll_transition = None;
-            self.slideshow_scroll_range_cache = None;
-            self.close_fullscreen();
+            book_composition_permission::BookDfsContinuation::Slideshow
+        };
+        let nav = self.zip_nav.as_ref().unwrap();
+        let logical = self
+            .archive_source_override
+            .as_deref()
+            .unwrap_or(&nav.tree.zip_path);
+        let target =
+            crate::book_scope::BookScopeKey::archive(logical, nav.current_raw()).map(|scope| {
+                ArchiveBookTarget {
+                    requested_prefix: nav.current().join("/"),
+                    scope,
+                    entry: ArchiveBookEntry::Dfs(continuation),
+                }
+            });
+        match target {
+            Ok(target) => {
+                let deferred = DeferredFsReopen {
+                    history_trigger: HistoryTrigger::UserChosen,
+                    resume_slideshow: sequence_ctx.is_none(),
+                    target: DeferredFsTarget::CurrentArchiveBook(target),
+                    resume_to_last_page: (sequence_ctx.is_some()
+                        && self.settings.book_nav_resume.resumes())
+                    .into(),
+                    from_explicit_open: false,
+                    preserve_after_password_prompt: false,
+                };
+                if !self.attach_archive_book_index_continuation(deferred) {
+                    crate::logger::log("archive DFS: missing index continuation");
+                    self.finish_visible_container_fs_nav_failed();
+                }
+            }
+            Err(reason) => {
+                crate::logger::log(format!("archive DFS: unsupported book scope: {reason}"));
+                if let Some(idx) = self.find_fullscreen_nav_target_filtered(true) {
+                    let ctx = sequence_ctx.cloned().unwrap_or_default();
+                    self.complete_book_zip_dfs_target(&ctx, idx, continuation);
+                } else {
+                    self.finish_visible_container_fs_nav_failed();
+                }
+            }
         }
         true
     }
@@ -41382,7 +41629,7 @@ impl App {
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
                 // 「ZIP/PDF × 一覧から開く」: 続きから / 先頭から を設定で切替。
-                resume_to_last_page: self.settings.book_open_resume.resumes(),
+                resume_to_last_page: (self.settings.book_open_resume.resumes()).into(),
                 from_explicit_open: true,
                 preserve_after_password_prompt: true,
             });
@@ -41606,9 +41853,22 @@ impl App {
 
     fn open_deferred_fullscreen_after_enumerate(
         &mut self,
-        deferred: DeferredFsReopen,
+        mut deferred: DeferredFsReopen,
     ) -> DeferredFsOpenOutcome {
+        self.capture_deferred_book_resume(&mut deferred);
+        if let DeferredFsTarget::CurrentArchiveBook(target) = &deferred.target
+            && !self.archive_book_target_is_current(target)
+        {
+            return DeferredFsOpenOutcome::StaleArchiveBook;
+        }
         let ctx = self.edit_preview_repaint_ctx.clone().unwrap_or_default();
+        if self.book_composition.is_pending() {
+            // Transfer the request before adoption can replace the page rows.
+            // A DFS with no landing still owns its continuation at that boundary.
+            self.defer_book_projection_open(deferred);
+            self.poll_book_composition_read(&ctx);
+            return DeferredFsOpenOutcome::WaitingComposition;
+        }
         self.poll_book_composition_read(&ctx);
         if self.book_composition.is_pending() {
             self.defer_book_projection_open(deferred);
@@ -41622,7 +41882,7 @@ impl App {
         // fallback する。一方、detached の明示 leaf open は Required で、対象が列挙結果に
         // 無ければ別ページを開かず terminal close へ進める。
         let mut new_idx = match &deferred.target {
-            DeferredFsTarget::None => None,
+            DeferredFsTarget::None | DeferredFsTarget::CurrentArchiveBook(_) => None,
             DeferredFsTarget::Preferred(target) => self.resolve_snapshot_target_idx(target),
             DeferredFsTarget::Required(target) => {
                 let resolved = self.resolve_required_snapshot_target_idx(target);
@@ -41639,18 +41899,37 @@ impl App {
         };
         let mut resume_notice = None;
         // grid から本を開いた場合は保存済み読書位置 (続きから) を優先。
-        if new_idx.is_none() && deferred.resume_to_last_page {
-            (new_idx, resume_notice) = self.resolve_book_resume_for_container().into_parts();
-        }
+        let current_archive_book =
+            matches!(deferred.target, DeferredFsTarget::CurrentArchiveBook(_));
         if new_idx.is_none() {
-            new_idx = match self.composed_book_layout() {
-                Some(layout) => layout.visible_pages.first().map(|page| page.item_index),
-                None => self.find_fullscreen_nav_target_filtered(!deferred.resume_slideshow),
+            match &deferred.resume_to_last_page {
+                DeferredBookResume::Captured {
+                    key,
+                    position: Some(position),
+                } => {
+                    (new_idx, resume_notice) = self
+                        .resolve_captured_book_resume(key, position)
+                        .into_parts();
+                }
+                DeferredBookResume::Refused(notice) => resume_notice = Some(notice.clone()),
+                _ => {}
+            }
+        }
+        let restored_position = new_idx.is_some();
+        if new_idx.is_none() {
+            new_idx = if current_archive_book {
+                self.first_visible_archive_book_page()
+            } else {
+                match self.composed_book_layout() {
+                    Some(layout) => layout.visible_pages.first().map(|page| page.item_index),
+                    None => self.find_fullscreen_nav_target_filtered(!deferred.resume_slideshow),
+                }
             };
         }
         if let Some(new_idx) = new_idx {
-            let purpose = if matches!(deferred.target, DeferredFsTarget::None)
-                && !deferred.resume_to_last_page
+            let purpose = if (current_archive_book && !restored_position)
+                || (matches!(deferred.target, DeferredFsTarget::None)
+                    && !deferred.resume_to_last_page.resumes())
             {
                 book_composition_permission::BookTargetPurpose::FirstInBook
             } else {
@@ -41678,6 +41957,20 @@ impl App {
                 self.resume_collection_archive_navigation(continuation);
             }
             DeferredFsOpenOutcome::Opened
+        } else if current_archive_book {
+            self.notify_book_resume(resume_notice);
+            if let Some(continuation) = deferred.zip_dfs_continuation() {
+                if self
+                    .composed_book_layout()
+                    .is_some_and(|layout| layout.visible_pages.is_empty())
+                {
+                    DeferredFsOpenOutcome::ArchiveDfsContinue(continuation)
+                } else {
+                    DeferredFsOpenOutcome::ArchiveDfsNoPage
+                }
+            } else {
+                DeferredFsOpenOutcome::ArchiveBookList
+            }
         } else {
             DeferredFsOpenOutcome::NoPlayableItem
         }
@@ -41688,9 +41981,59 @@ impl App {
         self.handle_deferred_fs_open_outcome(outcome);
     }
 
+    pub(super) fn refuse_deferred_saved_book_page(
+        &mut self,
+        mut deferred: DeferredFsReopen,
+    ) -> bool {
+        if !matches!(deferred.target, DeferredFsTarget::CurrentArchiveBook(_)) {
+            return false;
+        }
+        let DeferredBookResume::Captured {
+            key,
+            position: Some(_),
+        } = &deferred.resume_to_last_page
+        else {
+            return false;
+        };
+        deferred.resume_to_last_page = DeferredBookResume::Refused(
+            self.book_resume_notice(key, file_type_resume::PositionResolution::HiddenIdentity),
+        );
+        // Projection adoption is still replacing rows. The same request resumes
+        // from its owner in the permission poll after that adoption has finished.
+        self.defer_book_projection_open(deferred);
+        true
+    }
+
     fn handle_deferred_fs_open_outcome(&mut self, outcome: DeferredFsOpenOutcome) {
         match outcome {
             DeferredFsOpenOutcome::Opened | DeferredFsOpenOutcome::WaitingComposition => {}
+            DeferredFsOpenOutcome::ArchiveBookList => {
+                if matches!(
+                    self.navigation_scope,
+                    ViewerNavigationScope::DetachedPhysical
+                ) {
+                    self.finalize_archive_book_open_outcome(
+                        ArchiveBookOpenOutcome::NoDisplayablePages,
+                    );
+                } else {
+                    self.finish_main_list_open(StartupListIntent::ExplicitList);
+                }
+            }
+            DeferredFsOpenOutcome::ArchiveDfsNoPage => {
+                self.release_fs_nav_lock();
+                self.slideshow_playing = false;
+                self.slideshow_anchor_idx = None;
+                self.continuous_reading_scroll_transition = None;
+                self.slideshow_scroll_range_cache = None;
+                self.close_fullscreen();
+            }
+            DeferredFsOpenOutcome::ArchiveDfsContinue(continuation) => {
+                let ctx = self.edit_preview_repaint_ctx.clone().unwrap_or_default();
+                self.continue_book_zip_dfs_after_hidden(&ctx, continuation);
+            }
+            DeferredFsOpenOutcome::StaleArchiveBook => {
+                crate::logger::log("archive book open dropped: stale scope");
+            }
             DeferredFsOpenOutcome::NoPlayableItem => {
                 self.finish_visible_container_fs_nav_failed();
                 #[cfg(windows)]
@@ -44516,8 +44859,18 @@ impl App {
         // 同セッション履歴 (folder_history) に位置が無い (= 再起動後の初回など) かつ
         // select_after_load も無い場合、永続化した読書位置 (book_resume_db) をグリッド選択に
         // 復元する (= 再起動を跨いだ「続きから」)。
-        if !restored && history_state.is_none() {
-            let resume = self.resume_page_for_path(&source_path);
+        if !restored
+            && history_state.is_none()
+            && !matches!(
+                self.fs_nav_after_pdf_enumerate
+                    .as_ref()
+                    .map(|request| &request.target),
+                Some(DeferredFsTarget::CurrentArchiveBook(_))
+            )
+        {
+            // An accepted inner-book request owns its cursor and refusal notice.
+            // A cancelled request leaves the ordinary list restore in charge.
+            let resume = self.resume_page_for_container();
             if let Some(page) = resume {
                 self.move_grid_cursor(Some(page), crate::app::GridCursorIntent::Automatic);
                 self.grid_scroll.set_reveal_requested(true);
@@ -44610,26 +44963,40 @@ impl App {
                 }
             }
         }
-        if let sidecar_restore::FirstDisplayAction::Zip {
-            has_foreign_archives,
-        } = first_display_action
-        {
-            self.finish_installed_zip_first_display(has_foreign_archives, restore_intent.clone());
-        }
-        if matches!(
-            first_display_action,
-            sidecar_restore::FirstDisplayAction::WarmPdf
-        ) {
-            self.finish_main_list_open(restore_intent.clone());
-        }
-        if let sidecar_restore::FirstDisplayAction::Pdf { pages, password } = first_display_action {
-            self.finish_pdf_enumerate_success_inner(
-                source_path.clone(),
-                password,
-                pages,
-                restore_intent.clone(),
-                true,
-            );
+        match first_display_action {
+            sidecar_restore::FirstDisplayAction::ArchiveBook(deferred) => {
+                let outcome = match self.open_deferred_fullscreen_after_enumerate(deferred) {
+                    DeferredFsOpenOutcome::Opened => ArchiveBookOpenOutcome::Opened,
+                    DeferredFsOpenOutcome::WaitingComposition => ArchiveBookOpenOutcome::Waiting,
+                    DeferredFsOpenOutcome::ArchiveBookList => {
+                        ArchiveBookOpenOutcome::NoDisplayablePages
+                    }
+                    DeferredFsOpenOutcome::StaleArchiveBook => ArchiveBookOpenOutcome::Stale,
+                    _ => ArchiveBookOpenOutcome::Failed,
+                };
+                self.finalize_archive_book_open_outcome(outcome);
+            }
+            sidecar_restore::FirstDisplayAction::Zip {
+                has_foreign_archives,
+            } => {
+                self.finish_installed_zip_first_display(
+                    has_foreign_archives,
+                    restore_intent.clone(),
+                );
+            }
+            sidecar_restore::FirstDisplayAction::WarmPdf => {
+                self.finish_main_list_open(restore_intent.clone())
+            }
+            sidecar_restore::FirstDisplayAction::Pdf { pages, password } => {
+                self.finish_pdf_enumerate_success_inner(
+                    source_path.clone(),
+                    password,
+                    pages,
+                    restore_intent.clone(),
+                    true,
+                );
+            }
+            _ => {}
         }
         self.finish_refresh_search(&restore_intent);
         self.finish_main_list_open(restore_intent);
@@ -48667,7 +49034,11 @@ impl App {
         if self
             .last_book_resume
             .as_ref()
-            .is_some_and(|(path, _, _, _)| matches_key(&crate::adjustment_db::normalize_path(path)))
+            .is_some_and(|(key, _, _, _)| {
+                removed
+                    .iter()
+                    .any(|path| key.matches_source_family(path, true))
+            })
         {
             self.last_book_resume = None;
         }
@@ -52899,6 +53270,7 @@ impl App {
         let Some(nav) = self.zip_nav.as_mut() else {
             return false;
         };
+        nav.clear_list_choices();
         nav.enter(&target.effective_prefix);
         self.zip_nav_show_current_level(crate::app::StartupListIntent::PageContinuation);
         true
@@ -54253,6 +54625,9 @@ impl App {
         idx: usize,
         provenance: Option<crate::book_bookmarks::RelativePageProvenance>,
     ) {
+        if let Some(nav) = self.zip_nav.as_mut() {
+            nav.clear_list_choices();
+        }
         self.bookmark_relative_page_open_once = provenance.map(|value| (idx, value));
         self.open_fullscreen_from_fs_navigation(ctx, idx, crate::app::HistoryTrigger::UserChosen);
         self.bookmark_relative_page_open_once = None;
@@ -59179,6 +59554,11 @@ impl App {
                     if !self.guard_reading_history_open(idx) {
                         return None;
                     }
+                    if self.activate_main_zipdir(idx, ctx)
+                        != crate::app::ZipDirActivationOutcome::NotApplicable
+                    {
+                        return None;
+                    }
                     self.capture_main_list_restore_cursor();
                     // ファイル名スタックの集約グリッドでメディアセルを Enter したら、フラット読書
                     // フルスクリーンへ (スタック/単独画像/動画を直接開く)。コンテナは false で通常へ。
@@ -59266,13 +59646,9 @@ impl App {
                         }) if self.items_are_rating_view => {
                             self.open_rating_view_zipdir(zip_path.clone(), dir_prefix.clone());
                         }
-                        // ネスト ZIP ツリーの子コンテナへ Enter で降りる (Phase 3)。
-                        Some(GridItem::ZipDir { dir_prefix, .. }) => {
-                            let dp = dir_prefix.clone();
-                            // ★付きの本を絞り込み中に開くと中身が空表示になるのを防ぐ
-                            // (Codex P2)。enter 前に抑制を仕込む。
-                            self.maybe_suppress_rating_filter_for_opened_zip_book(idx);
-                            self.zip_nav_enter(&dp);
+                        // ZipDir activation はマウス・パッドと同じ入口で意図を決める。
+                        Some(GridItem::ZipDir { .. }) => {
+                            // Main activation was consumed before the generic detached router.
                         }
                         // ファイル名スタック (v2.0.0): 集約グリッドのセルは上の
                         // stack_try_open_from_grid で処理済み (フラットフルスクリーンへ)。
@@ -61236,7 +61612,7 @@ impl App {
                 resume_slideshow,
                 target: DeferredFsTarget::None,
                 // 「ZIP/PDF × Ctrl+↑↓ 移動」: 続きから / 先頭から を設定で切替。
-                resume_to_last_page: self.settings.book_nav_resume.resumes(),
+                resume_to_last_page: (self.settings.book_nav_resume.resumes()).into(),
                 from_explicit_open: false,
                 preserve_after_password_prompt: false,
             });
@@ -61275,7 +61651,7 @@ impl App {
                 resume_slideshow,
                 target: DeferredFsTarget::None,
                 // 「ZIP/PDF × Ctrl+↑↓ 移動」: 続きから / 先頭から を設定で切替。
-                resume_to_last_page: self.settings.book_nav_resume.resumes(),
+                resume_to_last_page: (self.settings.book_nav_resume.resumes()).into(),
                 from_explicit_open: false,
                 preserve_after_password_prompt: false,
             });
@@ -62851,12 +63227,18 @@ impl App {
         )
     }
 
-    /// The producer and fresh-open fence share the same root eligibility and physical key.
-    pub(super) fn book_resume_recording_folder(&self) -> Option<&Path> {
-        if self.zip_nav.as_ref().is_some_and(|nav| !nav.at_root()) {
-            return None;
+    /// Resume, its FIFO fence and editor intents share one book identity.
+    pub(super) fn current_book_resume_key(&self) -> Option<crate::book_resume_key::BookResumeKey> {
+        let legacy = self.current_folder.as_deref()?;
+        if let Some(nav) = &self.zip_nav {
+            let logical = self
+                .archive_source_override
+                .as_deref()
+                .unwrap_or(&nav.tree.zip_path);
+            crate::book_resume_key::BookResumeKey::for_archive(logical, legacy, nav).ok()
+        } else {
+            Some(crate::book_resume_key::BookResumeKey::legacy(legacy))
         }
-        self.current_folder.as_deref()
     }
 
     /// 現在のフルスクリーンページを「最後に読んだページ」として永続記録する。
@@ -62877,13 +63259,7 @@ impl App {
         if !self.is_readable_page_idx(idx) {
             return;
         }
-        // ネスト ZIP の本の中 (スタック深さ ≥ 2) では記録しない: ここでの idx は
-        // 「現在の階層」ローカルだが、resume_page_for_container は再オープン時の
-        // ルート階層 items に対して idx を検証するため、同 idx の別アイテムに誤って
-        // 「続きから」着地し得る (レビュー P3)。ルート表示 (フラット ZIP / collapse 済み
-        // 単一ラッパー) は再オープン時と同じ階層が materialize されるので従来どおり記録する。
-        // 深い階層への cross-book resume は将来課題 (docs/nested-zip-tree-plan.md §14)。
-        let Some(folder) = self.book_resume_recording_folder().map(Path::to_path_buf) else {
+        let Some(key) = self.current_book_resume_key() else {
             return;
         };
         let indices = self.get_still_image_indices();
@@ -62908,11 +63284,11 @@ impl App {
             _ => idx,
         };
         if self.last_book_resume.as_ref()
-            == Some(&(folder.clone(), raw_index, meter, identity.clone()))
+            == Some(&(key.clone(), raw_index, meter, identity.clone()))
         {
             return;
         }
-        self.persist_book_resume_with_identity(folder, raw_index, meter, identity);
+        self.persist_book_resume_key_with_identity(key, raw_index, meter, identity);
         if writer_available {
             self.record_current_container_content_identity(
                 crate::content_identity::ContentIdentityTrigger::ViewingState,
@@ -63099,8 +63475,9 @@ impl App {
     /// 現在のコンテナ (`current_folder`) の保存済み読書位置を、現在の `items` に対して
     /// 検証して返す。範囲外 / 本ページでない場合は None (= 先頭にフォールバック)。
     pub(crate) fn resume_page_for_container(&mut self) -> Option<usize> {
-        let folder = self.current_folder.clone()?;
-        self.resume_page_for_path(&folder)
+        let (page, notice) = self.resolve_book_resume_for_container().into_parts();
+        self.notify_book_resume(notice);
+        page
     }
 
     fn resume_page_for_path(&mut self, folder: &Path) -> Option<usize> {
@@ -63110,53 +63487,118 @@ impl App {
     }
 
     fn resolve_book_resume_for_container(&self) -> ResolvedBookResume {
-        self.current_folder
-            .as_deref()
-            .map(|folder| self.resolve_book_resume_for_path(folder))
+        self.current_book_resume_key()
+            .map(|key| self.resolve_book_resume_for_key(&key))
             .unwrap_or_default()
     }
 
     fn resolve_book_resume_for_path(&self, folder: &Path) -> ResolvedBookResume {
-        let Some(position) = self.fenced_book_resume(folder).unwrap_or_else(|| {
-            self.book_resume_db
-                .as_ref()
-                .and_then(|db| db.get_position(folder))
-        }) else {
+        self.resolve_book_resume_for_key(&crate::book_resume_key::BookResumeKey::legacy(folder))
+    }
+
+    fn book_resume_position_for_key(
+        &self,
+        key: &crate::book_resume_key::BookResumeKey,
+    ) -> Option<crate::book_resume_db::ReadingPosition> {
+        self.fenced_book_resume_key(key)
+            .unwrap_or_else(|| match key {
+                crate::book_resume_key::BookResumeKey::LegacyPath(_) => self
+                    .book_resume_db
+                    .as_ref()
+                    .and_then(|db| db.get_position_key(key)),
+                crate::book_resume_key::BookResumeKey::ArchiveLevel { .. } => self
+                    .book_resume_writer
+                    .as_ref()
+                    .and_then(|writer| writer.position_snapshot())
+                    .and_then(|snapshot| snapshot.values.get(&key.storage_key()).cloned()),
+            })
+    }
+
+    fn resolve_book_resume_for_key(
+        &self,
+        key: &crate::book_resume_key::BookResumeKey,
+    ) -> ResolvedBookResume {
+        let Some(position) = self.book_resume_position_for_key(key) else {
             return ResolvedBookResume::default();
         };
+        self.resolve_captured_book_resume(key, &position)
+    }
+
+    fn resolve_captured_book_resume(
+        &self,
+        key: &crate::book_resume_key::BookResumeKey,
+        position: &crate::book_resume_db::ReadingPosition,
+    ) -> ResolvedBookResume {
+        let inner = matches!(
+            key,
+            crate::book_resume_key::BookResumeKey::ArchiveLevel { .. }
+        );
         match self.resolve_current_book_position(&position) {
             file_type_resume::PositionResolution::Restored(index)
-                if self.is_readable_page_idx(index) =>
+                if self.is_readable_page_idx(index)
+                    && (!inner || self.visible_indices.contains(&index)) =>
             {
                 ResolvedBookResume::Page(index)
             }
             resolution @ (file_type_resume::PositionResolution::HiddenIdentity
             | file_type_resume::PositionResolution::LegacyWithExclusions) => {
-                ResolvedBookResume::Refused(BookResumeNotice {
-                    path: folder.to_path_buf(),
-                    resolution,
-                })
+                ResolvedBookResume::Refused(self.book_resume_notice(key, resolution))
             }
+            _ if inner => ResolvedBookResume::Refused(
+                self.book_resume_notice(key, file_type_resume::PositionResolution::HiddenIdentity),
+            ),
             _ => ResolvedBookResume::default(),
         }
     }
 
+    /// Freeze both saved and unsaved reads before composition can suspend this request.
+    fn capture_deferred_book_resume(&self, deferred: &mut DeferredFsReopen) {
+        if matches!(
+            deferred.resume_to_last_page,
+            DeferredBookResume::AwaitingFence
+        ) {
+            deferred.resume_to_last_page = match self.current_book_resume_key() {
+                Some(key) => {
+                    let position = self.book_resume_position_for_key(&key);
+                    DeferredBookResume::Captured { key, position }
+                }
+                None => DeferredBookResume::First,
+            };
+        }
+    }
+
+    fn book_resume_notice(
+        &self,
+        key: &crate::book_resume_key::BookResumeKey,
+        resolution: file_type_resume::PositionResolution,
+    ) -> BookResumeNotice {
+        let label = match key {
+            crate::book_resume_key::BookResumeKey::LegacyPath(_) => self
+                .archive_source_override
+                .as_deref()
+                .map(|source| source.display().to_string())
+                .unwrap_or_else(|| key.display_label()),
+            _ => key.display_label(),
+        };
+        BookResumeNotice { label, resolution }
+    }
+
     fn notify_book_resume(&mut self, notice: Option<BookResumeNotice>) {
-        let Some(BookResumeNotice { path, resolution }) = notice else {
+        let Some(BookResumeNotice { label, resolution }) = notice else {
             return;
         };
         match resolution {
             file_type_resume::PositionResolution::HiddenIdentity => {
                 crate::logger::log(format!(
                     "book resume skipped: reason=HiddenIdentity path={}",
-                    path.display()
+                    label
                 ));
                 self.show_feedback_warning("保存した読書位置のページは非表示になっています".into());
             }
             file_type_resume::PositionResolution::LegacyWithExclusions => {
                 crate::logger::log(format!(
                     "book resume skipped: reason=LegacyWithExclusions path={}",
-                    path.display()
+                    label
                 ));
                 self.show_feedback_warning(
                     "以前の読書位置はファイル種類の絞り込み中に復元できません".into(),
@@ -63509,7 +63951,9 @@ impl App {
                 entry_name,
             }) => DetachedBuild::Built(ViewerContextDescriptor::Zip {
                 path: zip_path.clone(),
-                entry_name: Some(entry_name.clone()),
+                target: DetachedZipTarget::RequiredPage {
+                    entry_name: entry_name.clone(),
+                },
                 archive_source_override: self.archive_source_override.clone(),
             }),
             Some(GridItem::PdfFile(path)) => {
@@ -63527,7 +63971,7 @@ impl App {
             Some(GridItem::ZipFile(path)) if auto_fullscreen => {
                 DetachedBuild::Built(ViewerContextDescriptor::Zip {
                     path: path.clone(),
-                    entry_name: None,
+                    target: DetachedZipTarget::RootBook,
                     archive_source_override: None,
                 })
             }
@@ -63560,7 +64004,7 @@ impl App {
             }),
             ViewerContextDescriptor::Zip {
                 path,
-                entry_name: Some(entry_name),
+                target: DetachedZipTarget::RequiredPage { entry_name },
                 ..
             } => Some(crate::snapshot::SnapshotTarget::ZipImage {
                 zip_path: path.clone(),
@@ -63840,6 +64284,7 @@ impl App {
         }
         self.pdf_enumerate_pending = None;
         self.zip_enumerate_pending = None;
+        self.cancel_sidecar_restore_fullscreen_reopen();
         self.fs_nav_after_pdf_enumerate = None;
         self.retire_book_presentation_permission();
         self.archive_auto_fs_paint_trace = None;
@@ -67033,14 +67478,36 @@ impl App {
         match descriptor {
             ViewerContextDescriptor::Zip {
                 path,
+                target,
                 archive_source_override,
-                ..
             } => {
-                self.load_zip_as_folder(path, crate::app::StartupListIntent::ExplicitList);
-                if let Some(source) = archive_source_override {
-                    self.archive_source_override = Some(source.clone());
-                    self.address = source.to_string_lossy().to_string();
-                }
+                let scope_open = matches!(target, DetachedZipTarget::BookScope(_));
+                let presentation = match target {
+                    DetachedZipTarget::BookScope(target) => {
+                        ZipEnumerationPresentation::ArchiveBook(DeferredFsReopen {
+                            history_trigger: HistoryTrigger::UserChosen,
+                            resume_slideshow: false,
+                            target: DeferredFsTarget::CurrentArchiveBook(target),
+                            resume_to_last_page: self.settings.book_open_resume.resumes().into(),
+                            from_explicit_open: true,
+                            preserve_after_password_prompt: false,
+                        })
+                    }
+                    _ => ZipEnumerationPresentation::Existing(StartupListIntent::ExplicitList),
+                };
+                let routing = if scope_open || archive_source_override.is_some() {
+                    ZipCacheRouting::ProvenBacking
+                } else {
+                    ZipCacheRouting::Lookup
+                };
+                self.load_zip_as_folder_with_presentation(
+                    path,
+                    self.input_seq,
+                    None,
+                    routing,
+                    archive_source_override.as_deref(),
+                    presentation,
+                );
                 FolderOpenOutcome::Loaded
             }
             ViewerContextDescriptor::Pdf { path, .. } => self.load_pdf_as_folder_owned(
@@ -67076,8 +67543,15 @@ impl App {
         let target = Self::detached_book_context_target(&descriptor);
         let bookmark_open = self.bookmark_open_pending.is_some();
         let is_image_reopen = matches!(descriptor, ViewerContextDescriptor::Image { .. });
-        self.pending_auto_fs_open = !is_image_reopen && !bookmark_open;
-        self.fs_open_intent_from_grid = !is_image_reopen && !bookmark_open;
+        let is_archive_scope = matches!(
+            descriptor,
+            ViewerContextDescriptor::Zip {
+                target: DetachedZipTarget::BookScope(_),
+                ..
+            }
+        );
+        self.pending_auto_fs_open = !is_image_reopen && !is_archive_scope && !bookmark_open;
+        self.fs_open_intent_from_grid = !is_image_reopen && !is_archive_scope && !bookmark_open;
 
         let outcome = self.with_detached_viewer_main_history_suppressed(|app| {
             app.load_detached_book_descriptor(descriptor.clone())
@@ -67110,7 +67584,7 @@ impl App {
                 history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::Required(target),
-                resume_to_last_page: false,
+                resume_to_last_page: (false).into(),
                 from_explicit_open: true,
                 preserve_after_password_prompt: true,
             });
@@ -67203,9 +67677,17 @@ impl App {
                 // Image はフォルダ load 後に明示 open_fullscreen するので auto-fullscreen 予約を
                 // 立てない (立てると「画像のみフォルダ」設定次第で先頭画像が先に開いて二重になる)。
                 let is_image_reopen = matches!(descriptor, ViewerContextDescriptor::Image { .. });
+                let is_archive_scope = matches!(
+                    descriptor,
+                    ViewerContextDescriptor::Zip {
+                        target: DetachedZipTarget::BookScope(_),
+                        ..
+                    }
+                );
                 let bookmark_open = app.bookmark_open_pending.is_some();
-                app.pending_auto_fs_open = !is_image_reopen && !bookmark_open;
-                app.fs_open_intent_from_grid = !is_image_reopen && !bookmark_open;
+                app.pending_auto_fs_open = !is_image_reopen && !is_archive_scope && !bookmark_open;
+                app.fs_open_intent_from_grid =
+                    !is_image_reopen && !is_archive_scope && !bookmark_open;
 
                 let outcome = app.with_detached_viewer_main_history_suppressed(|app| match start {
                     DetachedBookContextStart::Descriptor(descriptor) => {
@@ -67249,7 +67731,7 @@ impl App {
                         history_trigger: crate::app::HistoryTrigger::UserChosen,
                         resume_slideshow: false,
                         target: DeferredFsTarget::Required(target),
-                        resume_to_last_page: false,
+                        resume_to_last_page: (false).into(),
                         from_explicit_open: true,
                         preserve_after_password_prompt: true,
                     });
@@ -67316,6 +67798,7 @@ impl App {
         if let Some(GridItem::ConvertibleArchive { path, .. }) = self.items.get(idx) {
             return DetachedBuild::Built(DetachedGridItemOpenPlan::ConvertibleArchiveCandidate {
                 path: path.clone(),
+                target: DetachedZipTarget::RootBook,
                 collection_restore: self.collection_grid_restore_for_source(idx, path),
             });
         }
@@ -67377,6 +67860,7 @@ impl App {
         &mut self,
         lease: DetachedSessionLease,
         source_path: PathBuf,
+        target: DetachedZipTarget,
         collection_restore: Option<top_level_grid_view::CollectionGridRestore>,
     ) -> DetachedGridArchiveOpenRequestOwner {
         self.detached_grid_archive_open_request_seq = self
@@ -67387,6 +67871,7 @@ impl App {
             request_id: self.detached_grid_archive_open_request_seq,
             lease,
             source_path,
+            target,
             collection_restore,
         }
     }
@@ -67567,6 +68052,44 @@ impl App {
             }
         };
 
+        self.execute_detached_grid_item_open_plan(ctx, plan, classified_kind)
+    }
+
+    #[cfg(windows)]
+    fn execute_detached_grid_item_open_plan(
+        &mut self,
+        ctx: &egui::Context,
+        plan: DetachedGridItemOpenPlan,
+        classified_kind: Option<OpenPathKind>,
+    ) -> bool {
+        // Both preclassified ZipDir scopes and ordinary grid plans must admit
+        // local control before parking any current reader.
+        if self.remote_session_blocks_local_control()
+            || self.document_open_modal_admission_blocked()
+        {
+            crate::logger::log("detached grid plan refused before park: admission blocked");
+            return false;
+        }
+        // An alias/direct-RAR scope must re-resolve its readable backing on the
+        // existing archive worker, retaining the exact scope across conversion.
+        let plan = match plan {
+            DetachedGridItemOpenPlan::Descriptor {
+                descriptor:
+                    ViewerContextDescriptor::Zip {
+                        path,
+                        target: DetachedZipTarget::BookScope(target),
+                        archive_source_override,
+                    },
+                collection_restore,
+            } if archive_source_override.is_some() || crate::rar_loader::is_rar_path(&path) => {
+                DetachedGridItemOpenPlan::ConvertibleArchiveCandidate {
+                    path: archive_source_override.unwrap_or(path),
+                    target: DetachedZipTarget::BookScope(target),
+                    collection_restore,
+                }
+            }
+            plan => plan,
+        };
         let descriptor = match plan {
             DetachedGridItemOpenPlan::CollectionRootUnavailable => {
                 self.show_feedback_warning(
@@ -67662,6 +68185,7 @@ impl App {
             }
             DetachedGridItemOpenPlan::ConvertibleArchiveCandidate {
                 path,
+                target,
                 collection_restore,
             } => {
                 if self.settings.archive_file_handling_ignores_convertible() {
@@ -67696,8 +68220,36 @@ impl App {
                 let owner = self.next_detached_grid_archive_open_owner(
                     Self::detached_session_lease(window_id),
                     path.clone(),
+                    target.clone(),
                     collection_restore,
                 );
+                if matches!(target, DetachedZipTarget::BookScope(_)) {
+                    let format = path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .and_then(crate::archive_converter::ArchiveFormat::nested_from_extension);
+                    let started = format.is_some_and(|format| {
+                        self.with_window_viewer_context(window_id, |app| {
+                            let open_owner = OpenRequestOwner::DetachedGridArchive(owner.clone());
+                            app.claim_open_request_owner(&path, &open_owner)
+                                && app.request_archive_convert_owned(
+                                    path.clone(),
+                                    format,
+                                    false,
+                                    open_owner,
+                                    StartupListIntent::PageContinuation,
+                                )
+                        })
+                        .unwrap_or(false)
+                    });
+                    if !started {
+                        self.fail_detached_grid_archive_open(
+                            &owner,
+                            "archive_book_scope_request_failed",
+                        );
+                    }
+                    return started;
+                }
                 let open_owner = OpenRequestOwner::DetachedGridArchive(owner.clone());
                 let auto_fullscreen = self.settings.effective_auto_fullscreen_zip_pdf();
                 let format = path
@@ -67815,7 +68367,7 @@ impl App {
         }
         let descriptor = ViewerContextDescriptor::Zip {
             path: backing_archive,
-            entry_name: None,
+            target: owner.target.clone(),
             archive_source_override: Some(owner.source_path.clone()),
         };
         let opened = self
@@ -67888,7 +68440,7 @@ impl App {
         if owner.detached_lease.is_some() {
             let descriptor = ViewerContextDescriptor::Zip {
                 path: backing_archive,
-                entry_name: None,
+                target: DetachedZipTarget::RootBook,
                 archive_source_override: Some(bookmark_container),
             };
             let opened = self.continue_active_detached_book_context_from_descriptor(descriptor);
@@ -67916,7 +68468,7 @@ impl App {
             .then(|| self.offset_detached_image_window_placement(base_placement));
         let descriptor = ViewerContextDescriptor::Zip {
             path: backing_archive,
-            entry_name: None,
+            target: DetachedZipTarget::RootBook,
             // Keep the DB identity as effective_folder even when a multi-volume RAR probe
             // resolves a different first-volume backing path.
             archive_source_override: Some(bookmark_container),
@@ -68355,10 +68907,7 @@ impl App {
                 app.keep_fullscreen_viewport_alive(ctx);
                 app.render_fullscreen_viewport(ui);
 
-                if matches!(
-                    app.pending_return_to_parent,
-                    FullscreenCloseContinuation::Live
-                ) {
+                if app.pending_return_to_parent.is_live() {
                     let id = app.projected_viewer_context_id();
                     app.transfer_terminal_close_return(id, ViewerCloseCause::User);
                     app.pending_return_to_parent.clear();
@@ -69368,6 +69917,30 @@ impl App {
         block_locked_media: bool,
         boundary: FsMetadataBoundary,
     ) -> CollectionMainContextChange {
+        self.change_main_context_for_visible_grid_for_destination(
+            block_locked_media,
+            boundary,
+            self.fullscreen_close_destination(),
+        )
+    }
+
+    /// Close-return uses the same context-owned handoff/content teardown as a
+    /// physical list adoption, with its already-resolved bookmark policy.
+    fn finish_main_fullscreen_list_return(&mut self, destination: FullscreenCloseDestination) {
+        self.finish_fullscreen_navigation_for_true_close();
+        self.change_main_context_for_visible_grid_for_destination(
+            false,
+            FsMetadataBoundary::Manual,
+            destination,
+        );
+    }
+
+    fn change_main_context_for_visible_grid_for_destination(
+        &mut self,
+        block_locked_media: bool,
+        boundary: FsMetadataBoundary,
+        destination: FullscreenCloseDestination,
+    ) -> CollectionMainContextChange {
         #[cfg(windows)]
         {
             if block_locked_media
@@ -69381,9 +69954,9 @@ impl App {
                 self.preserve_active_detached_image_window_for_main_context_change();
                 self.retire_direct_media_reader_for_source_adoption();
                 if matches!(boundary, FsMetadataBoundary::BookAppend(_)) {
-                    self.close_fullscreen_now_with_metadata_boundary(boundary);
+                    self.close_fullscreen_now_for_destination(boundary, destination);
                 } else {
-                    self.close_fullscreen_content();
+                    self.close_fullscreen_content_for_destination(destination);
                 }
             }
         }
@@ -69392,9 +69965,9 @@ impl App {
             let _ = block_locked_media;
             self.retire_direct_media_reader_for_source_adoption();
             if matches!(boundary, FsMetadataBoundary::BookAppend(_)) {
-                self.close_fullscreen_now_with_metadata_boundary(boundary);
+                self.close_fullscreen_now_for_destination(boundary, destination);
             } else {
-                self.close_fullscreen_content();
+                self.close_fullscreen_content_for_destination(destination);
             }
         }
         self.retire_direct_media_reader_for_source_adoption();
@@ -71427,6 +72000,7 @@ impl App {
             self.cleanup_normalize_state_for_fs_idx(previous_idx);
         }
         if self.fullscreen_idx.is_none() {
+            self.retire_zip_close_return_for_reader_acceptance();
             self.retire_result_search_input_focus();
             if self.extracted_result_surface().is_some() {
                 self.begin_extracted_result_view();
@@ -81105,8 +81679,8 @@ impl App {
     ///
     /// **「ページを直接開く」設定が ON で ZIP/PDF ページ、または追加設定 ON の画像のみ
     /// 通常フォルダを見ているとき**は、ページ一覧 (L2) を経由せずファイル一覧 (L1) まで戻る。
-    /// 判定は `auto_open_for_current_container()` (= 設定 ON & 対象コンテナ内 & 帰路あり) のみで、
-    /// 直接オープン由来かどうかは見ない。それ以外 (設定 OFF / 対象外の通常画像) は 1 段だけ閉じる
+    /// 設定 ON なら、利用者が本を選んだ書庫内一覧を最優先にし、それがなければ
+    /// `auto_open_for_current_container()` の既存帰路を使う。それ以外 (設定 OFF / 対象外の通常画像) は 1 段だけ閉じる
     /// (`close_fullscreen`: コンテナなら L2 ページ一覧、通常画像なら親フォルダグリッド)。
     /// Everything の PhysicalChild では実親へ移らず、既存 Search owner が保持した結果へ戻る。
     ///
@@ -81119,6 +81693,18 @@ impl App {
             return;
         }
         self.finish_fullscreen_navigation_for_true_close();
+        if self.projected_viewer_context_id() == self.viewer_context_main() {
+            // One accepted close owns one frozen destination. Later refreshes
+            // invalidate only that destination; they must not choose a new route.
+            if self.pending_return_to_parent.has_accepted_request() {
+                return;
+            }
+            if let Some(plan) = self.chosen_zip_list_return() {
+                self.pending_return_to_parent =
+                    FullscreenCloseContinuation::LiveZipListReturn(plan);
+                return;
+            }
+        }
         // Detached bookmark viewers never navigate their own bundle to the bookmark surface: the
         // origin grid is still mounted in main. Embedded viewers instead use the normal Bookmarks
         // navigation transition. Ownership is explicit in BookmarkViewState, not inferred from a
@@ -81320,16 +81906,27 @@ impl App {
     /// `keep_fullscreen_viewport_alive` がこのフラグを見て Visible(false) を
     /// 送信し、その直後に false に落とす。ここで先に落とすと送信が抑止される。
     pub(crate) fn close_fullscreen(&mut self) {
+        self.close_fullscreen_for_destination(self.fullscreen_close_destination());
+    }
+
+    fn close_fullscreen_for_destination(&mut self, destination: FullscreenCloseDestination) {
         if self.book_append_undo_in_progress() {
             return;
         }
         self.finish_fullscreen_navigation_for_true_close();
-        self.close_fullscreen_content();
+        self.close_fullscreen_content_for_destination(destination);
     }
 
     /// Content-only teardown for an owner that will reopen or transfer this reader.
     /// True session exits must use close_fullscreen / close_fullscreen_to_completion.
     pub(super) fn close_fullscreen_content(&mut self) {
+        self.close_fullscreen_content_for_destination(self.fullscreen_close_destination());
+    }
+
+    fn close_fullscreen_content_for_destination(
+        &mut self,
+        destination: FullscreenCloseDestination,
+    ) {
         if self.book_append_undo_in_progress() {
             return;
         }
@@ -81346,7 +81943,7 @@ impl App {
                 .dispatch(PresentationTransitionEvent::TerminalClose);
             return;
         }
-        self.close_fullscreen_now();
+        self.close_fullscreen_now_for_destination(FsMetadataBoundary::Manual, destination);
     }
 
     /// 「後で」が無い経路から、フルスクリーンを終端まで閉じる。
@@ -81515,6 +82112,14 @@ impl App {
     }
 
     fn close_fullscreen_now_with_metadata_boundary(&mut self, boundary: FsMetadataBoundary) {
+        self.close_fullscreen_now_for_destination(boundary, self.fullscreen_close_destination());
+    }
+
+    fn close_fullscreen_now_for_destination(
+        &mut self,
+        boundary: FsMetadataBoundary,
+        destination: FullscreenCloseDestination,
+    ) {
         self.cancel_original_material_entry_intents(None);
         self.pending_fs_page_turn_ready = None;
         self.page_turn_presentation.deactivate("closed");
@@ -81652,6 +82257,7 @@ impl App {
         let cf_fs_cache = self.fs_cache.len();
         let cf_ai_cache = self.ai_upscale_cache.len();
         if cf_was_open
+            && destination == FullscreenCloseDestination::CurrentList
             && matches!(
                 self.bookmark_view_state,
                 Some(BookmarkViewState::Opening { .. })

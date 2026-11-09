@@ -7210,3 +7210,115 @@ Modal化や独立した予約世代/保留stateは不要で、既存の採用own
 
 本追補の関連717件は全成功、core check・fmt/glyph・diff checkも成功。
 独立reviewerが証拠と本記録を確認して最終ACCEPTとした。製品起動・実機確認は未実施。
+
+### 2026-11-08: §1.675／§1.676 S1〜S3 内部本openと選択元一覧の所有（実装・独立レビュー ACCEPT）
+
+S1〜S3 の最終記録。設計担当 ClaudeCode と独立 Codex reviewer は、各段階を**症状パッチではなく所有境界の構造修正**として合意し、実装の独立レビューも ACCEPT。
+確定 commit は S1 `875166c1b`・`75f796a6e`・`73a478805`、S2 `e7804a2ea`・`871439372`、S3 `7b3960558`。
+branch `fix-1675-1676-zipdir-book` で実装済み、master 未マージ・実機確認待ち。以下の初回 REVISE や未完了の記述は各時点の履歴として残す。
+
+| 段階 | 変更範囲 | 構造修正とする根拠・合意 |
+|---|---|---|
+| S1 | 三入力の共通 activation、IndexOnly 継続、main／linked の close executor、registry の独立 build／fork／promote 境界（`saved_zip_nav` を含む） | 選択元は `ZipNavLevel`、帰還要求は既存 close owner が所有する。teardown は帰還元の context だけへ作用し、新 reader 受理で旧 ZipListReturn の寿命を終える。独立 bundle は Unseen で main の帰路を持たない。設計担当・独立 reviewer とも構造修正に合意、R1／R2 修正後 ACCEPT |
+| S2 | 共通 resume key、IndexOnly／Live continuation の fence 捕捉、構成待ち前後の要求所有 | saved／unsaved を同じ要求が待機前に確定し、待機後の再照会や別 pending を作らない。構成採用が後発 reader を閉じないよう既存 owner 内で継続する。設計担当・独立 reviewer とも構造修正に合意、IPC 版照合修正後 ACCEPT |
+| S3 | descriptor producer／load、grid plan 共用、列挙 presentation／hydration、待機・取消述語、archive worker／conversion completion | RootBook／BookScope／RequiredPage と source／backing を初回 install 前に解決し、同じ target・lease を列挙から表示許可・終端まで引き継ぐ。既存 park／新窓・配置・focus の経路を共用し、main や兄弟の items・queue・世代を変えない。設計担当・独立 reviewer とも構造修正に合意、source 追レビュー ACCEPT |
+
+HWND／rect capture、viewport identity、registry transaction、placement storage、timer は全段階で変更しない。
+新しい App bool／Option／pending、keepalive 用ガード・遅延・retry・追加 repaint は加えない。独立 close は main を変更しない §1.670 A を維持する。
+各段階の検証証跡と残る実機確認・マージ判断は[内部本計画 §9／§10](archive-inner-book-open-return-plan.md)を正本とする。S4 は本記録を確定する文書変更だけである。
+
+#### S1 初回実装・追補の記録
+
+設計担当 ClaudeCode と独立設計 reviewer は
+[内部本計画 R4](archive-inner-book-open-return-plan.md) §7／§9 で構造的修正に合意した。
+S1 は main の ZipDir activation と、main／linked F12 の通常 close を既存の継続 owner へ接続する。
+選択元の記録は `ZipNavLevel`、配送は既存 close continuation が所有し、close 時のパス推測や
+独立ビューアからの main 復元を追加しない。
+
+接点は sidecar の既存待機述語（IndexOnly の型付き本openを含める）、main／linked の既存
+close executor、registry の独立 build／fork／promote 境界である。独立 bundle になる側だけから
+選択元記録（snapshot の `saved_zip_nav` も含む）を除き、main の原本と兄弟の items・queue・世代を維持する。
+複数ウィンドウモードの ZipDir は S1 では一覧移動を維持し、descriptor の拡張は S3。
+HWND／rect capture、viewport identity、placement storage、timer は変更しない。
+
+独立実装 reviewer も基本方針を症状パッチではなく所有境界の構造修正と評価したが、初回は
+Everything 採用境界と構成非対応 prefix の閲覧維持に関する P2 で REVISE。この時点では最終 ACCEPT は未取得だった。
+Everything の「常に install できない」という断定は撤回し、検索前 origin がない条件の既存境界へ訂正した。
+Bookmark teardown は同期的な `FullscreenCloseDestination` を追加して帰還先を区別し、Live は consumer、
+Terminal は既存 effect が値を与える。独立 reviewer はこの補修にも追加 P1/P2 なし・構造修正と確認した。
+動画 transition／metadata boundary の意味や App の保存状態を増やさず、Backspace の既存動作を保つ。
+初回引継ぎ時の最終製品コードでは指定既存回帰 344/344 成功、新規 S1 は 43 件中 41 成功・
+前提差分 2 件が失敗した。その後、設計担当の判断で非対応 prefix は候補だけ scope 検証し
+一覧終端＋情報通知とする修正を加え、origin 無し Everything は master 既存の別件として切り分けた。
+通知は既存の generation/token 所有の Unsupported 状態を共用し、通常 projection の Warning は維持する。
+App field・detached 述語・registry・viewport の追加変更はない。追補の独立レビューは限定差分 ACCEPT、
+追加 P1/P2 なし・構造修正との評価。追補の core check、S1 42/42、指定既存回帰 345/345
+（master 挙動調査 1 件を含む、nextest の leaky 表示 4 件）、追加 Unsupported 回帰 3/3 はすべて exit 0。
+詳細は内部本計画 §9 に記録した。
+全件 gate・製品起動は行っていない。
+前提差分・試験結果・段階の完了状態は内部本計画 §9／§10 に集約する。製品起動・実機確認は未実施。
+
+#### S1 実装レビュー R1: main 帰還と active sibling の分離
+
+`875166c1b` の内部一覧帰還にあった App 全体の active detached session close は、別 context の
+reader が active になった場合にその runtime／viewport を終了し得る P2 と確認した。
+専用の close 手順を除き、物理一覧の採用と同じ main context 専用 teardown を共用する。
+帰還先の Bookmark 方針は既存の同期引数で渡し、独立側の lease／session／viewport に触れない。
+close 受理時の plan を既存 continuation の排他的 variant に保持し、nav の Live／Terminal も型で区別する。
+stale Live は現在の一覧へ閉じ、stale Terminal は後発 reader を閉じず破棄する。
+実独立 reader の session／runtime／viewport 登録／bundle 不変の回帰を追加した。
+存在する cancel token も照合するが、この fixture では pending decode の存在までは保証しない。
+独立 Sol/xhigh reviewer は追加 P1/P2 なしで ACCEPT、症状 guard ではなく既存の所有境界へ戻す構造修正と評価した。
+embedded root 入力は通常時／page-turn barrier 中ともグリッドの keyboard 処理を抑止し、予約を
+既存の描画後 dispatcher に残す。先取りされた予約が embedded early-return で失われる経路を除く構造修正と
+独立 reviewer が確認した。detached 述語・registry の本体・viewport 経路・HWND／rect capture・placement storage・timer は変更しない。
+実行結果は [内部本計画 §9](archive-inner-book-open-return-plan.md) に記録する。
+
+Terminal capture 前から失効していた帰還 plan についても、teardown 宛先を導出する時点で
+配送と同じ currentness helper を使い、CurrentList の Bookmark 方針を適用する。
+保存済み recipe は再計画せず後段で破棄する。独立 reviewer はこの限定補修も ACCEPT と確認した。
+
+#### S1 実装レビュー R2: reader 受理が終わらせる Zip 帰還の寿命
+
+Terminal nav を take 後、同じ階層の reader を開いてから旧 nav を適用すると、tree／Chosen だけの検証では
+後発 reader の items が親一覧に置換される P2 を確認した。既存 close slot の排他的 Issued owner に
+唯一の plan と strong identity を移し、nav は phase と Weak ticket だけを持つ。
+共通 open の既存 None→Some 受理境界が現在の context の Zip 帰還だけを終端する。
+通常のページ送り、兄弟 context の reader 受理、拒否／defer はその owner を終了しない。
+Issued 中の terminal teardown も保存済み plan を使い、consumer は exact owner を一回消費してから plan を検証する。
+nav の全 drop は ticket の終了であり、新しい close を妨げない。新しい App field／flag／timer は追加しない。
+独立 Sol/xhigh reviewer はこの所有境界の修正に合意した。Direct にもある既存の同型穴は報告し、今回修正しない。
+detached 述語・registry 本体・viewport identity／HWND／rect／placement／timer は変更しない。
+検証結果は [内部本計画 §9](archive-inner-book-open-return-plan.md) に記録する。
+
+#### S2: 共有 Live continuation の resume cutoff（2026-11-08、独立 ACCEPT）
+
+内部本 resume の追加では、既存 deferred request の resume 指示を排他 enum に置き換え、
+IndexOnly と独立 context の初回 Live continuation が同じ FIFO fence の saved／unsaved を
+構成待ちの前に捕捉する。待機後に DB を再照会せず、既存 context／generation の終端で破棄する。
+独立 context の試験は実 `begin_sidecar_restore` からの read と main の items／世代／選択不変を検査する。
+S2 では S3 の BookScope descriptor を先行実装せず、detached 述語・registry 本体・viewport identity・
+HWND／rect 捕捉・placement 保存・timer は変更しない。新しい App pending も加えない。
+承認済み内部本設計の共有 owner 修正であり、独立 reviewer は production に追加 P1/P2 なしと確認した。
+構成採用時も、現在の内部本 request を既存 `AwaitingProjection` に保全する。
+linked F12 中の main activation と DFS の双方が対象で、保存拒否後の fallback は採用完了後に同 owner から再開する。
+旧採用の末尾が後発 reader を close する組合せを除き、新しい待機状態や viewport 側の条件分岐は加えない。
+検証結果は [内部本計画 §9](archive-inner-book-open-return-plan.md) に記録する。
+
+#### S3: 独立内部本のscope要求（2026-11-08、実装・自動検証完了・独立 ACCEPT）
+
+承認済みR4の構造合意に基づき、三入力の共通入口からmainを変えず既存plan実行へscope descriptorを渡す。
+`DetachedZipTarget` でroot／本scope／Required leafを区別し、列挙前にliteral prefixとraw scopeを解決する。
+`ZipEnumerationPresentation`→Live first-display→構成permissionへ同じrequestを移し、root予約を重複させない。
+Liveのresume fenceのsaved／unsavedも同requestが捕捉し、取消はそのleaseの列挙・sidecar・permissionを消費する。
+変換元を持つscopeとdirect RARは既存loading shell／archive ownerへ渡し、workerがcacheとRAR direct probeを解決する。
+完了は同じtargetを同じleaseへ戻す。初回失敗は既存 `terminate_active_detached_open_before_viewport`、
+staleは破棄し、mainや後発readerへの帰還・teardownを作らない。
+
+変更範囲はdescriptor producer／load、grid plan実行の共用、ZIP列挙・hydrationの要求所有、
+既存待機／取消述語、archive workerとconversion completion。registryの既存独立buildでChosenを消す規則を再利用する。
+新しいApp field、HWND／rect捕捉、viewport identity、registry transaction、placement保存、timerは変更しない。
+keepaliveの症状条件を足す修正ではなく、対象と寿命を既存ownerに一貫して持たせる構造修正である。
+実装レビュー・自動検証の結果は [内部本計画 §9](archive-inner-book-open-return-plan.md) に記録する。
+独立source追レビューはACCEPT（追加P1/P2なし）。Ready close／parkの2件、S1〜S3の110件、
+既存detached／close／archiveの1,085件が全成功。core check・fmt・glyph・検証用buildも成功し、製品は起動していない。

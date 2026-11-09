@@ -328,6 +328,46 @@ pub struct ZipNavState {
 struct ZipNavLevel {
     display: Vec<String>,
     raw: Vec<String>,
+    list_choice: ZipListChoice,
+}
+
+/// Only an explicit choice in main's list grants a return to that list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZipListChoice {
+    Unseen,
+    Chosen { rows_above: Option<u32> },
+}
+
+/// A close continuation derived from the navigation owner, never a second owner.
+#[derive(Clone)]
+pub(crate) struct ZipListReturnPlan {
+    tree: Arc<ZipTree>,
+    ancestor_depth: usize,
+    ancestor_display: Vec<String>,
+    left_prefix: Vec<String>,
+    rows_above: Option<u32>,
+}
+
+impl std::fmt::Debug for ZipListReturnPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZipListReturnPlan")
+            .field("tree", &Arc::as_ptr(&self.tree))
+            .field("ancestor_depth", &self.ancestor_depth)
+            .field("ancestor_display", &self.ancestor_display)
+            .field("left_prefix", &self.left_prefix)
+            .field("rows_above", &self.rows_above)
+            .finish()
+    }
+}
+
+impl ZipListReturnPlan {
+    pub(crate) fn left_prefix(&self) -> &[String] {
+        &self.left_prefix
+    }
+
+    pub(crate) fn rows_above(&self) -> Option<u32> {
+        self.rows_above
+    }
 }
 
 impl ZipNavLevel {
@@ -335,6 +375,7 @@ impl ZipNavLevel {
         Self {
             display: tree.collapse_redundant(requested),
             raw: tree.raw_source().collapse_redundant(requested),
+            list_choice: ZipListChoice::Unseen,
         }
     }
 }
@@ -410,6 +451,63 @@ impl ZipNavState {
             .iter()
             .map(|level| level.display.clone())
             .collect()
+    }
+
+    pub(crate) fn choose_current_list(&mut self, rows_above: Option<u32>) {
+        self.stack
+            .last_mut()
+            .expect("ZipNavState stack is never empty")
+            .list_choice = ZipListChoice::Chosen { rows_above };
+    }
+
+    pub(crate) fn clear_list_choices(&mut self) {
+        for level in &mut self.stack {
+            level.list_choice = ZipListChoice::Unseen;
+        }
+    }
+
+    pub(crate) fn chosen_list_return_plan(&self) -> Option<ZipListReturnPlan> {
+        let current = self.current();
+        self.stack
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(depth, level)| {
+                let ZipListChoice::Chosen { rows_above } = level.list_choice else {
+                    return None;
+                };
+                (level.display.len() < current.len() && current.starts_with(&level.display)).then(
+                    || ZipListReturnPlan {
+                        tree: Arc::clone(&self.tree),
+                        ancestor_depth: depth,
+                        ancestor_display: level.display.clone(),
+                        left_prefix: current.to_vec(),
+                        rows_above,
+                    },
+                )
+            })
+    }
+
+    pub(crate) fn matches_list_return_plan(&self, plan: &ZipListReturnPlan) -> bool {
+        Arc::ptr_eq(&self.tree, &plan.tree)
+            && self.current() == plan.left_prefix
+            && plan.ancestor_display.len() < plan.left_prefix.len()
+            && plan.left_prefix.starts_with(&plan.ancestor_display)
+            && self.stack.get(plan.ancestor_depth).is_some_and(|level| {
+                level.display == plan.ancestor_display
+                    && level.list_choice
+                        == ZipListChoice::Chosen {
+                            rows_above: plan.rows_above,
+                        }
+            })
+    }
+
+    pub(crate) fn apply_list_return_plan(&mut self, plan: &ZipListReturnPlan) -> bool {
+        if !self.matches_list_return_plan(plan) {
+            return false;
+        }
+        self.stack.truncate(plan.ancestor_depth + 1);
+        true
     }
 
     /// 現在描画すべき実効 prefix。
@@ -720,6 +818,130 @@ mod tests {
             PathBuf::from("C:/test/outer.zip"),
             names.iter().map(|n| e(n)).collect(),
         )
+    }
+
+    #[test]
+    fn section1676_choice_nearest_strict_ancestor_and_one_time_return() {
+        let mut nav =
+            ZipNavState::new(Arc::new(tree(&["root.jpg", "A/cover.jpg", "A/B/page.jpg"])));
+        nav.choose_current_list(Some(7));
+        assert!(nav.chosen_list_return_plan().is_none());
+        nav.enter("A/");
+        nav.choose_current_list(None);
+        nav.enter("A/B/");
+        nav.choose_current_list(Some(2));
+        let plan = nav.chosen_list_return_plan().unwrap();
+        assert_eq!(plan.ancestor_display, vec!["A"]);
+        assert_eq!(plan.left_prefix(), &["A".to_owned(), "B".to_owned()]);
+        assert_eq!(plan.rows_above(), None);
+        assert!(nav.apply_list_return_plan(&plan));
+        assert_eq!(nav.current(), &["A".to_owned()]);
+        assert!(!nav.apply_list_return_plan(&plan));
+        let outer = nav.chosen_list_return_plan().unwrap();
+        assert!(outer.ancestor_display.is_empty());
+        assert_eq!(outer.rows_above(), Some(7));
+    }
+
+    #[test]
+    fn section1676_choice_dfs_siblings_preserve_only_shared_ancestors() {
+        let mut nav = ZipNavState::new(Arc::new(tree(&[
+            "root.jpg",
+            "A/cover.jpg",
+            "A/one/page.jpg",
+            "A/two/page.jpg",
+            "B/page.jpg",
+        ])));
+        nav.choose_current_list(Some(4));
+        nav.enter("A/");
+        nav.choose_current_list(Some(1));
+        nav.enter("A/one/");
+        nav.choose_current_list(Some(9));
+        assert!(nav.dfs_step(true, SortOrder::FileName));
+        assert_eq!(nav.current(), &["A".to_owned(), "two".to_owned()]);
+        let plan = nav.chosen_list_return_plan().unwrap();
+        assert_eq!(plan.ancestor_display, vec!["A"]);
+        assert_eq!(plan.rows_above(), Some(1));
+        assert_eq!(nav.stack.last().unwrap().list_choice, ZipListChoice::Unseen);
+        assert!(nav.dfs_step(true, SortOrder::FileName));
+        assert_eq!(nav.current(), &["B".to_owned()]);
+        let plan = nav.chosen_list_return_plan().unwrap();
+        assert!(plan.ancestor_display.is_empty());
+        assert_eq!(plan.rows_above(), Some(4));
+        assert!(nav.dfs_step(false, SortOrder::FileName));
+        assert_eq!(nav.current(), &["A".to_owned(), "two".to_owned()]);
+        assert!(
+            nav.chosen_list_return_plan()
+                .unwrap()
+                .ancestor_display
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn section1676_choice_collapse_retains_effective_ancestor_and_left_book() {
+        let mut nav = ZipNavState::new(Arc::new(tree(&[
+            "wrapper/A/only/page.jpg",
+            "wrapper/B/page.jpg",
+        ])));
+        assert_eq!(nav.current(), &["wrapper".to_owned()]);
+        nav.choose_current_list(Some(3));
+        nav.enter("wrapper/A/");
+        let plan = nav.chosen_list_return_plan().unwrap();
+        assert_eq!(plan.ancestor_display, vec!["wrapper"]);
+        assert_eq!(
+            plan.left_prefix(),
+            &["wrapper".to_owned(), "A".to_owned(), "only".to_owned()]
+        );
+        assert!(nav.apply_list_return_plan(&plan));
+        assert!(nav.at_root());
+        assert_eq!(nav.current(), &["wrapper".to_owned()]);
+    }
+
+    #[test]
+    fn section1676_choice_stale_tree_current_and_choice_are_rejected() {
+        let source = Arc::new(tree(&["A/page.jpg", "B/page.jpg"]));
+        let mut nav = ZipNavState::new(source.clone());
+        nav.choose_current_list(Some(2));
+        nav.enter("A/");
+        let plan = nav.chosen_list_return_plan().unwrap();
+        let mut other_tree = nav.clone();
+        other_tree.tree = Arc::new((*source).clone());
+        assert!(!other_tree.apply_list_return_plan(&plan));
+        assert_eq!(other_tree.current(), nav.current());
+        let mut other_current = nav.clone();
+        other_current.back();
+        other_current.enter("B/");
+        assert!(!other_current.apply_list_return_plan(&plan));
+        assert_eq!(other_current.current(), &["B".to_owned()]);
+        nav.back();
+        nav.choose_current_list(Some(3));
+        nav.enter("A/");
+        assert!(!nav.apply_list_return_plan(&plan));
+        nav.clear_list_choices();
+        assert!(!nav.matches_list_return_plan(&plan));
+        assert!(nav.chosen_list_return_plan().is_none());
+    }
+
+    #[test]
+    fn section1676_choice_fresh_restoration_and_refresh_reset_choices() {
+        let source = Arc::new(tree(&["root.jpg", "A/cover.jpg", "A/B/page.jpg"]));
+        let mut nav = ZipNavState::new(source.clone());
+        nav.choose_current_list(Some(2));
+        nav.enter("A/");
+        nav.choose_current_list(Some(3));
+        nav.enter("A/B/");
+        assert!(nav.chosen_list_return_plan().is_some());
+        let restored = ZipNavState::restore_prefix(source.clone(), "A/B/").unwrap();
+        let (refreshed, _) = ZipNavState::refresh_prefix(source.clone(), "A/B/");
+        for fresh in [ZipNavState::new(source), restored, refreshed] {
+            assert!(fresh.chosen_list_return_plan().is_none());
+            assert!(
+                fresh
+                    .stack
+                    .iter()
+                    .all(|level| level.list_choice == ZipListChoice::Unseen)
+            );
+        }
     }
 
     #[test]
