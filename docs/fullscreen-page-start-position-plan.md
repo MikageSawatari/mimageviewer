@@ -596,6 +596,14 @@ cargo check -p mimageviewer --bin mimageviewer-core --jobs 4
   整形後の Rust 差分は整形のみで、追加の機能変更はない。`git diff --check` も成功した。
 製品起動・実機確認・full gate・build-dev・コミットは行わない。
 
+### 9.7 再レビュー結果と残件 (2026-11-09、設計担当)
+
+e9099ac8f の独立再レビュー (GPT-6.1 Sol / xhigh): P2-1 / P2-2 は解消、追加の P1 / P2 なし、master へ入れてよい。
+残件 P3 (診断のみ、未対応): canonical completion が面積 0 のページを受理するようになったため、演出開始直後に拡大・パンで
+片側を画面外へ出して取り消すと、まだ見えていないページにも `first_visible` (`visible_area=0`) と `fully_visible` が
+記録される (page_turn.rs の completion event の `visible_pages`)。完了・再開の条件は正しく、通常操作は止まらない。
+直すなら、可視性イベントの mask を receipt の実面積から求め、全ページが見えていない取消着地では `fully_visible` を出さない。
+
 ## 10. r4: 仮の素材の frame と確定 (設計担当の決定、2026-11-08)
 
 §9 の差異への対応。§2 の「最初の current frame で一度だけ確定」を次の 2 段に置き換える。§3 の条件 1〜4・消去・退役はそのまま。
