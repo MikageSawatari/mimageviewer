@@ -1,6 +1,6 @@
 # 検索結果などで作ったサムネイルを親フォルダのキャッシュにも置く (§1.741)
 
-作成: 2026-11-08。状態: **実装済み・実機確認待ち** (独立実装レビュー: 1 回目 REVISE → 修正後 ACCEPT、2026-11-09、Codex GPT-6.1 Sol / xhigh)。
+作成: 2026-11-08。状態: **実装済み・実機確認済み (サブ PC 担当、依頼 26、2026-11-09。結果は backlog §1.741)・master 取り込み待ち** (独立実装レビュー: 1 回目 REVISE → 修正後 ACCEPT、2026-11-09、Codex GPT-6.1 Sol / xhigh)。
 独立設計レビュー: r1〜r4 REVISE → r5 ACCEPT、2026-11-09、Codex GPT-6.1 Sol / xhigh。
 対象版: v5.1.0 後の版 (利用者決定 2026-11-09)。
 バックログ: [next-release-backlog.md §1.741](next-release-backlog.md)。報告: 5ch >>746。
