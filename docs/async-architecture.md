@@ -760,7 +760,8 @@ miss時だけ通常scanと同じobserved（EPUBは解決済みgeneration）で�
 CacheOnlyはstat/生成/保存をしない。stat失敗時の親DBは要求stampによるRO lookupだけで、保存しない。
 `ThumbnailSaveTarget` が既存Fixed接続か親・種類・pool・受付epochを一つに保持し、実測policy/forceで
 保存が確定した後だけRWを開く。非保存AutoはDBを作らず、実行中要求はLRU外に最大2接続を保持し得る。
-ParentのPDF保存/catch-upも同じtargetのRWを使い、ROを書込へ転用しない。
+ParentのPDF保存とobserved署名のある親DB hitのcatch-upも同じtargetのRWを使い、ROを書込へ転用しない。
+Parentのメモリhitはstat/DB open/catch-upを省き、stat失敗のRO hitも補完しない。Fixedの補完は従来どおり。
 clearを跨いだ要求の保存を受付admissionで禁じ、CacheOnlyだけ旧メモリを使わず一回RO継続する。
 
 検索に入るprepareは、検索poolなら `Current`、それ以外なら置換元identity付き `Prepare` を捕捉する。

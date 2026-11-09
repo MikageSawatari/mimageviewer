@@ -34,7 +34,8 @@ miss時に通常scanと同じobserved（EPUBは解決済みgeneration）で親DB
 stat失敗時は要求stampでRO lookupだけ行い、保存しない。SourceOnlyはメモリ/DB lookupを省き、
 CacheOnlyはstat/生成/保存をしない。RAW follow-upはobservedと受付時の宛先を継承する。
 typedな保存targetは実測policy/forceで保存が確定した後だけRWを開き、非保存Autoで空DBを作らない。
-ParentのPDFメタ補完/catch-upも同じtargetのRWを使い、lookupのROを書込へ渡さない。
+ParentのPDFメタ保存とobserved署名のある親DB hitのcatch-upも同じtargetのRWを使い、lookupのROを書込へ渡さない。
+Parentのメモリhitではstat/DB open/catch-upを行わず、stat失敗後のRO hitも補完しない。Fixedは従来どおり。
 video pinの準備済みメモリseed・preview優先・stamp/proof・保存policy・idle品質更新は維持する。
 検索pool/seedのownerは `__search_results__` 自身で、元一覧や兄弟contextへ書かない。
 旧合成DB行は従来のメモリから表示し、コピー/移行しない。新規生成・idle再生成だけ親DBと共有し、schema/hashは変えない。

@@ -346,6 +346,14 @@ impl LazyCatalogs {
         work: &CatalogWork,
         writable: bool,
     ) -> Option<Arc<CatalogDb>> {
+        #[cfg(test)]
+        LAZY_CATALOG_OPEN_COUNTS.with(|counts| {
+            let (reads, writes) = counts.get();
+            counts.set((
+                reads + usize::from(!writable),
+                writes + usize::from(writable),
+            ));
+        });
         let result = if writable {
             work.open(identity).map(Some)
         } else {
@@ -419,6 +427,11 @@ impl LazyCatalogs {
         }
         db
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static LAZY_CATALOG_OPEN_COUNTS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 #[cfg(test)]
@@ -1663,6 +1676,188 @@ mod tests {
             row.row_key = format!("pdfthumb:{}", source.file_name().unwrap().to_str().unwrap());
         }
         req
+    }
+
+    fn pdf_memory(
+        req: &LoadRequest,
+    ) -> RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>> {
+        RwLock::new(std::collections::HashMap::from([(
+            req.cache_key_override.clone().unwrap(),
+            crate::catalog::CacheEntry {
+                mtime: req.mtime,
+                file_size: req.file_size,
+                jpeg_data: valid_webp(),
+                source_dims: Some((8, 6)),
+                layout_dims: None,
+                folder_provenance: None,
+                selection_proof: None,
+            },
+        )]))
+    }
+
+    #[test]
+    fn parent_pdf_memory_hit_does_not_stat_open_or_enqueue_catchup() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("book.pdf");
+        std::fs::write(&source, b"source attributes only").unwrap();
+        let (mtime, size) = crate::catalog::file_stamp(&std::fs::metadata(&source).unwrap());
+        for (case, observation) in [
+            ParentObservedStamp::Unresolved,
+            ParentObservedStamp::Observed(mtime, size),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let cache = temp.path().join(format!("cache-{case}"));
+            let provider = ThumbnailCatalogProvider::fixed(None);
+            let mut req = parent_pdf_request(&source, &cache);
+            req.file_size = 0;
+            req.parent_observed = observation;
+            let memory = pdf_memory(&req);
+            PARENT_STAT_COUNT.with(|count| count.set(0));
+            LAZY_CATALOG_OPEN_COUNTS.with(|counts| counts.set((0, 0)));
+            let (messages, jobs) = with_test_pdf_meta_catchup_capture(|| {
+                run(&mut req, &provider, CachePolicy::Always, &memory)
+            });
+            assert_eq!(
+                messages[0].pixels().unwrap().origin,
+                ThumbLoadOrigin::UpgradeableCache
+            );
+            assert!(jobs.is_empty(), "memory hits never enqueue Parent catch-up");
+            assert_eq!(PARENT_STAT_COUNT.with(|count| count.get()), 0);
+            assert_eq!(LAZY_CATALOG_OPEN_COUNTS.with(|counts| counts.get()), (0, 0));
+            assert!(provider.lazy.idle.lock().unwrap().is_empty());
+            assert!(!cache.exists());
+        }
+    }
+
+    #[test]
+    fn parent_pdf_observed_db_hit_enqueues_writable_parent_catchup_with_observed_meta() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("book.pdf");
+        std::fs::write(&source, b"source attributes only").unwrap();
+        let cache = temp.path().join("cache");
+        let mut req = parent_pdf_request(&source, &cache);
+        req.file_size = 0;
+        let observed = crate::catalog::file_stamp(&std::fs::metadata(&source).unwrap());
+        let parent = seed_parent(&req, &cache, observed);
+        let fixed = Arc::new(CatalogDb::open(&cache, Path::new("__search_results__")).unwrap());
+        let provider = ThumbnailCatalogProvider::fixed(Some(fixed.clone()));
+        PARENT_STAT_COUNT.with(|count| count.set(0));
+        LAZY_CATALOG_OPEN_COUNTS.with(|counts| counts.set((0, 0)));
+        let (messages, jobs) = with_test_pdf_meta_catchup_capture(|| {
+            run(&mut req, &provider, CachePolicy::Off, &RwLock::default())
+        });
+        assert_eq!(
+            messages[0].pixels().unwrap().origin,
+            ThumbLoadOrigin::UpgradeableCache
+        );
+        assert_eq!(PARENT_STAT_COUNT.with(|count| count.get()), 1);
+        assert_eq!(LAZY_CATALOG_OPEN_COUNTS.with(|counts| counts.get()), (1, 1));
+        assert_eq!(jobs.len(), 1);
+        let (path, writer) = &jobs[0];
+        assert_eq!(path, &source);
+        assert!(!writer.is_read_only());
+        assert!(!Arc::ptr_eq(writer, &fixed));
+        process_meta_only_with(
+            path,
+            writer,
+            &Arc::new(AtomicBool::new(false)),
+            |_, _, _| Ok(12),
+        );
+        assert_eq!(
+            parent
+                .get_pdf_meta("book.pdf", observed.0, observed.1)
+                .unwrap(),
+            Some((12, false))
+        );
+        assert!(
+            parent
+                .get_pdf_meta("book.pdf", req.mtime, req.file_size)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fixed
+                .get_pdf_meta("book.pdf", observed.0, observed.1)
+                .unwrap()
+                .is_none()
+        );
+        // The list's size=0 must not make the next DB hit re-enqueue existing observed metadata.
+        let (_, jobs) = with_test_pdf_meta_catchup_capture(|| {
+            run(&mut req, &provider, CachePolicy::Off, &RwLock::default())
+        });
+        assert!(jobs.is_empty());
+    }
+
+    #[test]
+    fn parent_pdf_stat_failure_ro_hit_does_not_enqueue_catchup() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("missing.pdf");
+        let cache = temp.path().join("cache");
+        let mut req = parent_pdf_request(&source, &cache);
+        let parent = seed_parent(&req, &cache, (req.mtime, req.file_size));
+        let provider = ThumbnailCatalogProvider::fixed(None);
+        PARENT_STAT_COUNT.with(|count| count.set(0));
+        LAZY_CATALOG_OPEN_COUNTS.with(|counts| counts.set((0, 0)));
+        let (messages, jobs) = with_test_pdf_meta_catchup_capture(|| {
+            run(&mut req, &provider, CachePolicy::Always, &RwLock::default())
+        });
+        assert_eq!(
+            messages[0].pixels().unwrap().origin,
+            ThumbLoadOrigin::UpgradeableCache
+        );
+        assert_eq!(PARENT_STAT_COUNT.with(|count| count.get()), 1);
+        assert_eq!(LAZY_CATALOG_OPEN_COUNTS.with(|counts| counts.get()), (1, 0));
+        assert!(jobs.is_empty());
+        assert!(
+            parent
+                .get_pdf_meta("missing.pdf", req.mtime, req.file_size)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn fixed_pdf_memory_hit_keeps_existing_catchup() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("book.pdf");
+        std::fs::write(&source, b"source attributes only").unwrap();
+        let cache = temp.path().join("cache");
+        let mut req = parent_pdf_request(&source, &cache);
+        req.catalog_target = RequestCatalog::Fixed;
+        (req.mtime, req.file_size) =
+            crate::catalog::file_stamp(&std::fs::metadata(&source).unwrap());
+        let fixed = Arc::new(CatalogDb::open(&cache, Path::new("__search_results__")).unwrap());
+        let provider = ThumbnailCatalogProvider::fixed(Some(fixed.clone()));
+        let memory = pdf_memory(&req);
+        PARENT_STAT_COUNT.with(|count| count.set(0));
+        LAZY_CATALOG_OPEN_COUNTS.with(|counts| counts.set((0, 0)));
+        let (messages, jobs) = with_test_pdf_meta_catchup_capture(|| {
+            run(&mut req, &provider, CachePolicy::Off, &memory)
+        });
+        assert_eq!(
+            messages[0].pixels().unwrap().origin,
+            ThumbLoadOrigin::UpgradeableCache
+        );
+        assert_eq!(PARENT_STAT_COUNT.with(|count| count.get()), 0);
+        assert_eq!(LAZY_CATALOG_OPEN_COUNTS.with(|counts| counts.get()), (0, 0));
+        assert_eq!(jobs.len(), 1);
+        let (path, writer) = &jobs[0];
+        assert!(Arc::ptr_eq(writer, &fixed));
+        process_meta_only_with(
+            path,
+            writer,
+            &Arc::new(AtomicBool::new(false)),
+            |_, _, _| Ok(8),
+        );
+        assert_eq!(
+            fixed
+                .get_pdf_meta("book.pdf", req.mtime, req.file_size)
+                .unwrap(),
+            Some((8, false))
+        );
+        assert!(!db_path_for(&cache, source.parent().unwrap()).exists());
     }
 
     #[test]

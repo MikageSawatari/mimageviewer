@@ -1,6 +1,6 @@
 # 検索結果などで作ったサムネイルを親フォルダのキャッシュにも置く (§1.741)
 
-作成: 2026-11-08。状態: **実装中 (PDF メモリ hit 後のメタ補完について設計確認待ち)**。
+作成: 2026-11-08。状態: **実装済み (独立レビュー前)**。
 独立設計レビュー: r1〜r4 REVISE → r5 ACCEPT、2026-11-09、Codex GPT-6.1 Sol / xhigh。
 対象版: 利用者判断 (§12)。
 バックログ: [next-release-backlog.md §1.741](next-release-backlog.md)。報告: 5ch >>746。
@@ -213,11 +213,21 @@ struct ThumbnailCatalogProvider {
   `ParentRow` はピンなしの表紙だけに付くので、キーが外側と変わる派生 (ピンの再帰、EPUB のピンの世代付け足し) は
   起きない。worker で Parent の要求のキーが外側の要求キーと違えば、debug_assert + ログで止め、親 DB に書かない。
 - **PDF メタ補完は Parent の保存先でも行う** (r3 指摘 5)。今 Fixed の書き込み接続で行っている PDF メタの保存
-  (表紙のレンダリング結果からのページ数等の保存、cache hit 時の catch-up) を、保存先が Parent のときは親 DB の
+  (表紙のレンダリング結果からのページ数等の保存、**observed 署名のある親 DB hit 時だけ**の catch-up) を、保存先が Parent のときは親 DB の
   書き込み接続 (受付時の `CatalogWork` の admission の下、表紙の保存と同じ `ThumbnailSaveTarget` から開くもの) で、
   今と同じ password の安全条件で行う。今は検索が PDF の親フォルダの pool を借りたときだけ親 DB に入っていた
   pdf_meta が、どこから検索しても親 DB に入る (Enter の即時 placeholder が使える場面が増える)。
   RO の lookup 接続を書き込みに使わない (§1.668 と同じ)。
+  - **設計担当決定 (2026-11-09、WIP `8c4fd0def` 後)**: Parent のメモリ hit では catch-up を開始せず、
+    stat も親 DB の RO/RW open も行わない。過去の observed を持つ派生要求でも同じ。
+    stat 失敗後の RO hit は observed が無いので catch-up しない。生成時のメタ保存と Fixed の従来の補完は維持する。
+  - 根拠: `PdfFile` のメタ reader はすべて親フォルダの catalog を basename で引く。
+    Enter の [`peek_pdf_meta_cache`](../src/app.rs) は `peek_warm_catalog(&parent)`、詳細列の
+    [`details_catalog_lookup_for_item`](../src/app.rs) は `path.parent()` と basename、agent IPC の
+    [`document_folder`](../src/agent_ipc/folder.rs) は親の `open_existing_read_only` と basename を使う。
+    旧合成 DB のメモリ行に対する従来 Fixed の補完は合成 DB に書かれ、これらの reader は読まない。
+    セッション内で親 DB hit / 保存から入れたメモリ行は、その最初の処理で既に補完・保存する。
+    従ってメモリ hit の補完を省いても、既存の利用者向け機能を失わない。
 - perf: 今の `collection/thumb_catalog_open`・`thumb_catalog_lookup` を一般化して種類を field で分け、Parent の stat にも区間を付ける。
 
 ## 6. 同名項目の衝突
@@ -346,7 +356,9 @@ struct ThumbnailCatalogProvider {
 - オフライン再表示 (アイドル時の高画質化を OFF にして、問題が隠れないようにする): (a) 生成・保存、(b) 既存の親 DB の
   行に observed で当たる、のそれぞれの後に、表示範囲から外す (Evicted) → ドライブを外した状態で戻る → メモリから
   再表示される (要求の署名が size 0 のお気に入り横断検索でも)。
-- PDF メタ: Parent で表紙を保存したとき・cache hit の catch-up で、PDF の親 DB に pdf_meta が入る (password の条件は今と同じ)。
+- PDF メタ: Parent で表紙を保存したとき・observed のある親 DB hit の catch-up で、PDF の親 DB に pdf_meta が入る
+  (password の条件は今と同じ)。メモリ hit は stat/親 DB open/補完の受付なし、stat 失敗の RO hit は補完なし。
+  Fixed のメモリ hit の補完は従来どおりであることも検査する。
 - 順序: メモリで当たる項目は stat しない (stat の呼び出し回数を数える)。`SourceOnly` はメモリ・DB を引かず親 DB へ保存、
   `CacheOnly` は生成・保存をしない。clear を跨いだ `CacheOnly` の一回 RO 継続、clear を跨いだ要求の保存禁止。
 - 互換: ★一覧の合成 DB の旧フルパス行が今と同じく表示される (EPUB を含む)。`SourceOnly` で作り直すと親 DB に入る。
@@ -379,14 +391,14 @@ struct ThumbnailCatalogProvider {
 
 - 検索 pool の所有、Parent 要求・遅延 catalog、observed と要求メモリ署名の分離、RAW/EPUB、
   親 PDF メタ保存・親 DB hit の catch-up、release check の保存先 witness を実装した。
-  製品起動・コミット・独立レビュー・検収は行っていない。
+  初回差分は設計担当が WIP `8c4fd0def` としてコミットした。今回の追補は未コミット。
+  実装担当は製品バイナリを起動しておらず、独立レビュー・検収も未実施。
 - 機械的な調整: `Current` は名前付き field、pool 置換は既存 metadata refresh と共通 helper、
   通常 folder scan と Parent stat は共通 `file_stamp` を使用する。seed resources は cache 必須・
   catalog 任意とし、DB 障害でも §9 のメモリ表示を維持する。新しい再試行はない。
-- **未確定**: §5.4 の表はメモリ hit 後に stat せず終了する一方、後段は PDF の cache-hit catch-up を
-  Parent でも維持するとしている。既存 Fixed はメモリ hit でも別 worker の catch-up を開始する。
-  現差分では Parent の observed が無いメモリ hit では RW target を得られず、この補完を開始しない。
-  既存補完を維持するか、Parent DB hit に限るかを設計担当へ確認中で、ここを完了扱いにしていない。
-  この判断が残るため、状態を「実装済み (独立レビュー前)」へ変更することと確認用 build は保留した。
+- PDF メタの確認事項は、§5.4 に記録した設計担当決定で解決した。Parent の catch-up は observed のある
+  親 DB hit だけとし、メモリ hit / stat 失敗の RO hit では開始しない。生成時のメタ保存と Fixed の挙動は維持した。
+  根拠は Enter `peek_pdf_meta_cache`、詳細列 `details_catalog_lookup_for_item`、agent IPC `document_folder` の
+  親フォルダ＋basename lookup。3 reader のコードを実装側でも照合した。
 - 自動検証の対象・全テスト名・実行結果は
   [実装検証記録](search-thumb-parent-catalog-verification.md) を参照。本体 lib 全件は依頼どおり設計担当が行う。

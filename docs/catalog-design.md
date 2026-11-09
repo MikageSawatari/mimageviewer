@@ -164,7 +164,8 @@ mtime秒/size helper、EPUBでは解決済みgenerationのstampを使う。RAW f
 親row key/observedをメモリのidentityに使わず、退避後のオフライン再表示も維持する。
 派生要求は外側の `RequestCatalog` / `CatalogWork` / observedを継承し、Parentの要求キーが
 外側から変わればassert/logで止め、親DBへ書かない。
-PDFの表紙保存とcache-hit catch-upは同じParent保存targetのRWでpdf_metaも補完する。
+PDFの表紙保存とobserved署名のある親DB hitのcatch-upは、同じParent保存targetのRWでpdf_metaも補完する。
+Parentのメモリhitではstat/DB open/catch-upを行わず、stat失敗後のRO hitでも補完しない。Fixedは従来どおり。
 clearを跨いだ要求は受付時admissionで保存を禁じ、CacheOnlyだけ旧メモリを使わず一回RO継続する。
 
 各一覧は自身のpool/メモリを所有する。Ctrl+G/Ctrl+Rは元一覧のpoolを借りず、

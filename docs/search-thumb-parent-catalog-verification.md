@@ -1,18 +1,65 @@
 # §1.741 実装の自動検証記録 (2026-11-09)
 
-対象は `G:\home\mimageviewer-1741` / `fix-1741-search-thumb-reuse` の未コミット差分。
-設計担当への PDF メモリ hit 後のメタ補完の確認が残っており、実装完了・独立レビュー済みとは扱わない。
-正本と残件は [設計 §16](search-thumb-parent-catalog-plan.md#16-実装メモ-2026-11-09独立レビュー前)。
+対象は `G:\home\mimageviewer-1741` / `fix-1741-search-thumb-reuse` の WIP `8c4fd0def` と、その後の未コミット差分。
+PDF メタ補完の確認事項は設計担当決定で解決した。独立レビュー・検収は未実施。
+正本は [設計 §16](search-thumb-parent-catalog-plan.md#16-実装メモ-2026-11-09独立レビュー前)。
 
-## 実行条件と結果
+## WIP 後の PDF メタ補完 (設計担当決定の実装)
+
+Parent の catch-up を、observed のある親 DB hit に限定した。メモリ hit では過去の observed があっても
+stat/親 DB open/catch-up を行わず、stat 失敗の RO hit でも補完しない。Fixed のメモリ hit と生成時の保存は維持する。
+`maybe_spawn_pdf_meta_catchup` の受付境界をテストだけで捕捉し、実 PDF worker を起動せずに、
+RW 接続が親 DB に渡されることと通常の MetaOnly handler による保存まで検査する。
+
+追加4件 (`src/thumb_loader/catalog_provider.rs`)：
+
+- `parent_pdf_memory_hit_does_not_stat_open_or_enqueue_catchup`
+- `parent_pdf_observed_db_hit_enqueues_writable_parent_catchup_with_observed_meta`
+- `parent_pdf_stat_failure_ro_hit_does_not_enqueue_catchup`
+- `fixed_pdf_memory_hit_keeps_existing_catchup`
+
+追補の全 Cargo コマンドも `MSBUILDDISABLENODEREUSE=1`。型チェック/nextest は build jobs 4。
+追補の Rust 型チェックとテストは失敗0。確認用 build の native 準備結果は別記する。
+
+| 検査 | 結果・ログ |
+| --- | --- |
+| 新規4テストの focused nextest | 4/4成功、exit 0、0.217秒（compile 2分23秒）。run `6f23bda8-fcb2-4b39-89d8-f1f8342ba00d`、`target/section1741-pdf-meta-focused.log` |
+| 関連回帰 nextest | **424/424成功**、exit 0、34.665秒（compile 1.03秒）。run `79b63097-d397-4912-858e-acc5cbef19bf`、`target/section1741-pdf-meta-regression.log`。前回の成功証拠の再利用に加え、設計判断後の製品コードで全対象を再実行 |
+| `cargo check -p mimageviewer --bin mimageviewer-core -j 4` | exit 0、19.30秒。`target/section1741-pdf-meta-check.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core --features test-script -j 4` | exit 0、19.37秒。`target/section1741-pdf-meta-check-test-script.log` |
+| `cargo fmt` / `cargo fmt --check` | 最後のソース変更後に workspace 全体で実行、exit 0 |
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE = '1'
+cargo nextest run -p mimageviewer --lib -j 4 -E 'test(/parent_pdf_memory_hit_does_not_stat_open_or_enqueue_catchup|parent_pdf_observed_db_hit_enqueues_writable_parent_catchup_with_observed_meta|parent_pdf_stat_failure_ro_hit_does_not_enqueue_catchup|fixed_pdf_memory_hit_keeps_existing_catchup/)' --no-fail-fast
+cargo nextest run -p mimageviewer --lib -j 4 -E 'test(/^thumb_loader::/) | test(/^global_search_ui::/) | test(/^catalog::tests::/) | test(/section1741|auto_aspect|idle_upgrade|collection_physical/)' --no-fail-fast
+```
+
+確認用 build の準備：
+
+- `CARGO_BUILD_JOBS=4` での `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` は
+  初回の `turbojpeg-sys` CMake/MSBuild 段階で exit 101。製品テストの失敗ではない。
+  script host の transcript は `target/section1741-pdf-meta-build-dev.log`。
+- 生成済み TurboJPEG project を `cmake --build .\target\dev-runtime\build\turbojpeg-sys-ad9ab6b47bbc75e3\out\build --target install --config RelWithDebInfo --parallel 1`
+  で直列ビルドし、exit 0。`target/section1741-turbojpeg-serial.log`。
+  ソース・build script・個人設定は変更していない。
+- ランタイム全体を `CARGO_BUILD_JOBS=1` で
+  `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` により再ビルドし、exit 0。
+  core、remote、EPUB PDF worker、MCP adapter、music-video editor の5本を生成した。
+  VCRT PE 依存検査も runtime 4 DLL / PE 5本で成功。
+  script host transcript は `target/section1741-pdf-meta-build-dev-serial.log`、
+  PE 検査結果は `target/vcrt-pe-reports/dev-runtime.json`。
+  実装担当は製品バイナリを起動していない。
+
+## 初回 WIP の実行条件と結果
 
 Windows / 通常 feature の test profile / nextest default。全 Cargo コマンドで
-`MSBUILDDISABLENODEREUSE=1` を設定、build jobs は4。製品バイナリは起動していない。
+`MSBUILDDISABLENODEREUSE=1` を設定、build jobs は4。実装担当は製品バイナリを起動していない。
 App テストは既存の一時 data-dir fixture、PDF は既存の fake render injection を使う。
 
 | 検査 | 結果・ログ |
 | --- | --- |
-| `cargo check -p mimageviewer --bin mimageviewer-core -j 4` | 最終製品コードで exit 0、20.99秒。`target/section1741-check-final.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core -j 4` | 初回 WIP の製品コードで exit 0、20.99秒。`target/section1741-check-final.log` |
 | `cargo check -p mimageviewer --bin mimageviewer-core --features test-script -j 4` | exit 0、1分06秒。`target/section1741-check-test-script.log` |
 | 最初の focused nextest | 47/47成功、exit 0。run `a87118d7-2f27-40b7-b9d2-c8396bb94504`、`target/section1741-focused-final.log`。後続の seed 障害時対応・scope assertion 補強前 |
 | 関連回帰 nextest | 420実行 / 419成功 / 1失敗、exit 100。run `07675dea-3ac5-4f32-b9b4-67d5b59e78e3`、`target/section1741-regression.log` |
@@ -29,7 +76,7 @@ assertion を SingleFolder に限定した。製品コードや既存の期待�
 
 初回 test compile は新規 App テストの `setup_app` import 漏れ3件で exit 101（実行0件）。
 修正後に上記を実行した。`target/section1741-focused.log` はこの準備失敗のログ。
-本体 lib 全件・全 workspace gate は設計担当へ引き継ぎ、確認用 build は設計確認待ち。
+本体 lib 全件・全 workspace gate は設計担当へ引き継ぐ。確認用 build の最新結果は上記追補に記録する。
 UI 文言・レイアウトは変更していないため snapshot / glyph 検査は追加実行していない。
 
 ```powershell
@@ -38,9 +85,9 @@ cargo nextest run -p mimageviewer --lib -j 4 -E 'test(/^thumb_loader::/) | test(
 cargo nextest run -p mimageviewer --lib -j 4 -E 'test(/section1741/) | test(/^thumb_loader::catalog_provider::tests::/) | test(/collection_physical/)' --no-fail-fast
 ```
 
-## 追加したテスト (34件)
+## 初回 WIP で追加したテスト (34件)
 
-以下は HEAD と関数名を比較した新規 `#[test]` の一覧。
+以下は WIP `8c4fd0def` の親と関数名を比較した新規 `#[test]` の一覧。上記追補4件と合わせて38件。
 
 ### `src/app/tests/search_thumb_1741.rs` (3)
 

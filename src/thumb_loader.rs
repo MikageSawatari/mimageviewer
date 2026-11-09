@@ -3241,6 +3241,7 @@ fn process_load_request_with_provider(
     } else {
         None
     };
+    let memory_hit = memory.is_some();
     let (lookup_key, lookup_mtime, lookup_size) = provider.lookup_identity(req, filename);
     if req.source_policy.allows_cache() {
         let cached = memory.or_else(|| {
@@ -3358,8 +3359,19 @@ fn process_load_request_with_provider(
                 // サムネ済みユーザーがアップグレードした場合、初回 Enter で cache miss
                 // になり 800ms 級の待ちが入る。サムネを表示した直後に裏で enumerate して
                 // pdf_meta を埋めることで、その PDF の初回 Enter から瞬時にする。
+                // Parent memory hits must not open a DB, even when a derived request
+                // carries an earlier observation. Only an observed parent-DB hit
+                // can start catch-up; Fixed retains its existing memory-hit behavior.
+                let catchup_allowed = match &req.catalog_target {
+                    RequestCatalog::Fixed => true,
+                    RequestCatalog::Parent { .. } => {
+                        !memory_hit
+                            && matches!(req.parent_observed, ParentObservedStamp::Observed(..))
+                    }
+                    RequestCatalog::CollectionSourceParent { .. } => false,
+                };
                 if req.pdf_page.is_some()
-                    && !provider.uses_collection_source_parents(req)
+                    && catchup_allowed
                     && req
                         .cache_key_override
                         .as_deref()
@@ -4279,6 +4291,19 @@ fn maybe_spawn_pdf_meta_catchup(
         return;
     }
 
+    #[cfg(test)]
+    if PDF_META_CATCHUP_CAPTURE.with(|capture| {
+        let mut capture = capture.borrow_mut();
+        if let Some(jobs) = capture.as_mut() {
+            jobs.push((req.path.clone(), Arc::clone(cat_arc)));
+            true
+        } else {
+            false
+        }
+    }) {
+        return;
+    }
+
     let queue = catchup_queue();
     let mut state = queue.state.lock().unwrap();
     // dedup: 同 path が既に queue or 処理中なら skip
@@ -4300,6 +4325,29 @@ fn maybe_spawn_pdf_meta_catchup(
     });
     drop(state);
     queue.cv.notify_one();
+}
+
+#[cfg(test)]
+type CapturedPdfMetaCatchups = Vec<(std::path::PathBuf, Arc<crate::catalog::CatalogDb>)>;
+
+#[cfg(test)]
+thread_local! {
+    // Capture the normal enqueue boundary without starting a PDF worker process.
+    static PDF_META_CATCHUP_CAPTURE: std::cell::RefCell<Option<CapturedPdfMetaCatchups>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn with_test_pdf_meta_catchup_capture<T>(run: impl FnOnce() -> T) -> (T, CapturedPdfMetaCatchups) {
+    struct Reset(Option<CapturedPdfMetaCatchups>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PDF_META_CATCHUP_CAPTURE.with(|capture| *capture.borrow_mut() = self.0.take());
+        }
+    }
+    let _reset = Reset(PDF_META_CATCHUP_CAPTURE.with(|capture| capture.replace(Some(Vec::new()))));
+    let result = run();
+    let jobs = PDF_META_CATCHUP_CAPTURE.with(|capture| capture.borrow_mut().take().unwrap());
+    (result, jobs)
 }
 
 /// 隣接 PDF prefetch enqueue。`load_pdf_as_folder` の最後で呼ばれる。
