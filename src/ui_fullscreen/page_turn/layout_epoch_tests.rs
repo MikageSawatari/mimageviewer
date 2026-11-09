@@ -946,6 +946,53 @@ fn regression_1750_flat_receipt_rejects_different_binding_destination_and_genera
 }
 
 #[test]
+fn regression_1750_outgoing_only_edit_cancel_diagnostic_identifies_its_binding() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    for change in ["rotation", "erase"] {
+        let _clock = TestClock::at(Instant::now());
+        let ctx = egui::Context::default();
+        let (mut app, _, tracker) = start(&ctx, SpreadMode::Ltr, false, false);
+        let PresentationState::Turning {
+            outgoing, incoming, ..
+        } = &app.page_turn_presentation.state
+        else {
+            panic!("fixture must be turning");
+        };
+        let outgoing = outgoing.clone();
+        let incoming = incoming.clone();
+        assert_eq!(outgoing.binding.layout.anchor, 0);
+        assert_eq!(incoming.binding.layout.anchor, 1);
+        match change {
+            "rotation" => {
+                app.rotation_cache
+                    .insert(0, crate::rotation_db::Rotation::Cw180);
+            }
+            "erase" => {
+                app.erase_mask_generation.insert(0, 1);
+            }
+            _ => unreachable!(),
+        }
+        assert!(!outgoing.binding.matches_current(&app), "{change}");
+        assert!(incoming.binding.matches_current(&app), "{change}");
+        frame(&ctx, |ui, ctx| {
+            assert!(!draw_receipt(&mut app, ui, ctx).curl, "{change}");
+        });
+        assert_eq!(tracker.status(), SubmissionStatus::Cancelled, "{change}");
+        let differences = diagnostics();
+        assert_eq!(differences.len(), 1, "{change}: {differences:?}");
+        assert_eq!(differences[0]["origin"], "turn_compare");
+        // Incoming is unchanged: the sole difference must name outgoing, not
+        // silently emit an empty list or blame the current incoming paint.
+        assert_eq!(
+            differences[0]["different_fields"],
+            serde_json::json!(["outgoing.current_binding"]),
+            "{change}: {differences:?}"
+        );
+    }
+}
+
+#[test]
 fn regression_1750_incoming_and_outgoing_edits_invalidate_their_own_units() {
     #[cfg(windows)]
     let _serial = crate::key_input::lock_test_input();

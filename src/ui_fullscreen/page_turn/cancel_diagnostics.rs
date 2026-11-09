@@ -94,14 +94,24 @@ impl PaintedUnit {
         })
     }
 
-    pub(super) fn cancel_comparison_fields(
+    pub(super) fn turn_cancel_comparison_fields(
         &self,
         other: &Self,
-        origin: &'static str,
+        outgoing: &Self,
+        app: &App,
     ) -> Vec<(&'static str, serde_json::Value)> {
+        let mut different = self.different_fields(other);
+        // The current prepared unit is incoming. Outgoing has no new paint to
+        // compare with, so diagnose the same binding projections used to cancel.
+        if !outgoing.binding.matches_current(app) {
+            different.push("outgoing.current_binding".to_owned());
+        }
+        if !outgoing.binding.matches_unit_view(app) {
+            different.push("outgoing.unit_view".to_owned());
+        }
         let mut fields = vec![
-            ("origin", origin.into()),
-            ("different_fields", self.different_fields(other).into()),
+            ("origin", "turn_compare".into()),
+            ("different_fields", different.into()),
         ];
         if self.binding.layout != other.binding.layout {
             fields.push((

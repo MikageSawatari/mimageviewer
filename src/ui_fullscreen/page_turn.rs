@@ -2953,7 +2953,7 @@ impl App {
                                 "skip"
                             },
                             "source_geometry_or_binding_changed",
-                            &incoming.cancel_comparison_fields(&unit, "turn_compare"),
+                            &incoming.turn_cancel_comparison_fields(&unit, &outgoing, self),
                         );
                     }
                     PresentationState::Flat(unit.clone())

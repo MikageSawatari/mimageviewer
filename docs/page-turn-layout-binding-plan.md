@@ -1,7 +1,7 @@
 # §1.750 ページめくりの表示単位 binding
 
 2026-11-10、設計基点 `fix-1750-page-turn-layout` / `2b51ea3a5`。r4 ACCEPT後の実装基点は `8ef140539`。
-現状は同ブランチでr5判断を適用済み。本件・関連回帰は成功し、本体lib全件はIPC作成のアクセス拒否2件が未通過。
+現状は同ブランチでr5判断を適用済み。設計担当によるsandbox外の本体lib全件は17,006/17,006成功（§8.4）。
 master未統合、利用者実機確認待ち。
 実装・検証の記録は§8。初回の差戻しは§8.1、再開後の結果は§8.3。
 参照: [表示パイプライン](display-pipeline.md)、[backlog §1.750](next-release-backlog.md)、
@@ -413,3 +413,19 @@ FFmpeg/VCRT配置とPE依存検査（runtime=4、pe=5）も成功し、スクリ
 最終formatter後も `test-source-r5.json` のRust14ファイルSHA-256は全て一致し、検証したsourceを保持した。
 検証結果追記だけの文書更新はその後に行う。分割パッチは再生成して使い捨てコピーで順次適用照合し、
 最終成果物の照合と独立reviewerの追補確認記録は同じ `handoff.md` に保存する。
+
+### 8.4 outgoing単独失効の取消診断（P3追補）
+
+r5差分は設計担当が `0f78444f6`・`7258a6600`・`bfc2079ef`・`8ca75da6f` へコミットした。
+設計担当から、同一内容（CRLF差のみ）のsandbox外lib全件 **17,006/17,006成功**、
+§8.3のIPC2失敗はsandbox制約だったとの報告を受けた。これは追補前のr5に対する結果である。
+
+独立実装レビューACCEPTのP3に従い、Turning取消の診断へ `outgoing.current_binding` と
+`outgoing.unit_view` を追加した。取消条件と同じ `matches_current` / `matches_unit_view` の投影を使い、
+incomingの既存差分を保持する。取消動作は変更せず、パス・画像内容もログへ追加しない。
+outgoingだけの消しゴム世代／180度回転変更で、incomingは有効のまま取消となり、
+診断の差分が空にならずoutgoingへ帰属するheadless回帰を追加した。
+追補の焦点回帰は **21/21成功**（3.510秒）、page_turn全件は **343/343成功**（49.016秒）、いずれもexit 0。
+証拠は `target/1750/impl3/regression-1750.log` と `page-turn.log`。
+`cargo fmt`（引数なし）・`cargo fmt --check` も成功（同ディレクトリの `fmt.log`・`fmt-check.log`）。
+利用者指示によりlib全件・build-devは再実行せず、設計担当のsandbox外検証へ引き継ぐ。
