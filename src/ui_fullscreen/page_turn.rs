@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 mod barrier;
+mod cancel_diagnostics;
 #[cfg(test)]
 mod clock_tests;
 #[cfg(test)]
@@ -1254,6 +1255,13 @@ impl PageTurnPresentation {
         self.transaction = OperationTransaction::default();
     }
     pub(crate) fn cancel(&mut self, reason: &'static str) {
+        self.cancel_with_fields(reason, &[]);
+    }
+    pub(super) fn cancel_with_fields(
+        &mut self,
+        reason: &'static str,
+        extra: &[(&str, serde_json::Value)],
+    ) {
         let old = std::mem::replace(&mut self.state, PresentationState::Inactive);
         match old {
             PresentationState::Turning {
@@ -1264,6 +1272,8 @@ impl PageTurnPresentation {
                     previous,
                     SubmissionStatus::Offered | SubmissionStatus::Started
                 ) {
+                    let mut fields = extra.to_vec();
+                    fields.push(("retain_bytes", incoming.retained_bytes().into()));
                     emit(
                         &offer.fact,
                         if previous == SubmissionStatus::Started {
@@ -1272,7 +1282,7 @@ impl PageTurnPresentation {
                             "skip"
                         },
                         reason,
-                        &[("retain_bytes", incoming.retained_bytes().into())],
+                        &fields,
                     );
                 }
                 self.state = PresentationState::Completing {
@@ -1284,7 +1294,7 @@ impl PageTurnPresentation {
                 self.transaction.disposition = OperationDisposition::Cancelled;
             }
             PresentationState::Offered { outgoing, offer } => {
-                emit(&offer.fact, "skip", reason, &[]);
+                emit(&offer.fact, "skip", reason, extra);
                 offer.submission.end();
                 // No projected batch existed; ordinary flat leases remain accounted.
                 outgoing.reserved_bytes.store(0, Ordering::Relaxed);
@@ -1416,6 +1426,17 @@ fn emit(
 ) {
     #[cfg(test)]
     TEST_EVENTS.with(|events| events.borrow_mut().push((*fact, kind, reason)));
+    #[cfg(test)]
+    if reason == "source_geometry_or_binding_changed" {
+        TEST_CANCEL_DIAGNOSTICS.with(|events| {
+            events.borrow_mut().push(serde_json::Value::Object(
+                extra
+                    .iter()
+                    .map(|(key, value)| ((*key).into(), value.clone()))
+                    .collect(),
+            ));
+        });
+    }
     // One line per lifecycle transition, never per projected frame. A normal
     // log must distinguish an unoffered turn from a submitted curl cancelled
     // before the observer saw it; perf logging is optional in real reports.
@@ -1429,6 +1450,17 @@ fn emit(
             "[page-turn] {kind} reason={reason} sub_check={sub_check} operation={:?} context={:?}",
             fact.operation_id, fact.destination.context
         ));
+        if reason == "source_geometry_or_binding_changed" {
+            crate::logger::log(format!(
+                "[page-turn] binding_mismatch {}",
+                serde_json::Value::Object(
+                    extra
+                        .iter()
+                        .map(|(key, value)| ((*key).into(), value.clone()))
+                        .collect()
+                )
+            ));
+        }
     }
     if !crate::perf::is_enabled() {
         return;
@@ -1465,6 +1497,7 @@ fn emit(
 #[cfg(test)]
 thread_local! {
     static TEST_EVENTS: std::cell::RefCell<Vec<(ViewerOperationFact, &'static str, &'static str)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static TEST_CANCEL_DIAGNOSTICS: std::cell::RefCell<Vec<serde_json::Value>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -2934,7 +2967,7 @@ impl App {
                                 "skip"
                             },
                             "source_geometry_or_binding_changed",
-                            &[],
+                            &incoming.cancel_comparison_fields(&unit, "turn_compare"),
                         );
                     }
                     PresentationState::Flat(unit.clone())

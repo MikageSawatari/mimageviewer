@@ -82,6 +82,15 @@ UIでDBを開かず、古い投影処理による上書きを防ぐ。詳細は[
 
 ### 紙めくりpresentationのA0実装 (§1.341、2026-10-11、受入れ待ち)
 
+§1.750 調査計装（2026-11-10）: `source_geometry_or_binding_changed` の取消に
+`origin=turn_compare|prepare_reuse` と、比較で異なる項目だけの `different_fields` を
+通常ログ・perfへ記録する。`content` と本全体の `layout_arc` も対象とし、Arc不一致時は
+演出対象unitのoccurrences／formation／placementの一致を併記する。
+`reconcile_landscape` の判定反転時だけidx・旧新判定・新epochを記録する。
+名前・パス・画像内容は出力せず、取消条件や素材保持・表示の仕様は変更しない。
+遠方の未知寸法の到着によるArc更新が不要な取消を起こす仮説を検証する段階であり、
+意味的bindingによる有効性の構造修正は別途設計レビュー後に行う。
+
 ページ間の紙めくりは`ui_fullscreen/page_turn.rs`のcontext単位presentationと、
 `page_turn_animation.rs`のcanonical unit projectionへ分離する。既存navigation target、
 ready判定、captureのfit/UV/occurrenceを正本にし、unit全体の通常prepare後にflat/curlを選ぶ。

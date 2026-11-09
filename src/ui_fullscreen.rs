@@ -12041,8 +12041,10 @@ impl App {
             }
             // A Native allocation is paint-only. A rejected view/key/coverage
             // cannot turn it into an input for ordinary preparation.
+            let fields =
+                self.page_turn_prepare_cancel_fields(resource, transform, painter, underlay, live);
             self.page_turn_presentation
-                .cancel("source_geometry_or_binding_changed");
+                .cancel_with_fields("source_geometry_or_binding_changed", &fields);
             return None;
         };
         Some(match layout_source {
@@ -18004,6 +18006,24 @@ impl SpreadDisplayUnitsCache {
             self.landscape_indices.remove(&idx);
         }
         self.landscape_epoch = self.landscape_epoch.wrapping_add(1);
+        crate::logger::log(format!(
+            "[spread-layout] landscape_flip idx={idx} old={was_landscape} new={landscape} epoch={}",
+            self.landscape_epoch
+        ));
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "spread_layout",
+                "landscape_flip",
+                None,
+                0,
+                &[
+                    ("idx", idx.into()),
+                    ("old", was_landscape.into()),
+                    ("new", landscape.into()),
+                    ("landscape_epoch", self.landscape_epoch.into()),
+                ],
+            );
+        }
     }
 
     pub(crate) fn mark_rotation_for_recheck(&mut self, items_generation: u64, idx: usize) {
