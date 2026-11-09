@@ -1,6 +1,6 @@
 # 一覧のコンテナを種類アイコンで表示する (§1.697)
 
-作成: 2026-11-08。状態: **実装・focused 自動検証済み (設計レビュー r3 / 独立実装レビュー ACCEPT)**。対象版: v5.1.0 候補。
+作成: 2026-11-08。状態: **実装・自動検証済み (設計レビュー r3 / 独立実装レビュー ACCEPT)、サブ PC の実機確認で NG なし (2026-11-09)、master 未取り込み**。対象版: v5.1.0 候補。
 要望: 5ch >>728・730。バックログ: [next-release-backlog.md §1.697](next-release-backlog.md)。
 
 ## 1. 要件
@@ -323,4 +323,10 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
   文言を直した (470db253a)。実装上の P1/P2 なし。
 - 最終確認 (ClaudeCode、2026-11-09): `test-lib-full.ps1` 16,791 件成功 (74 skipped)、
   `cargo test --test ui_snapshot` 247 件成功、`scripts/test_analyze_perf.py` 106 件成功、
-  `check_ui_glyphs.py` 成功。製品の起動による確認は未実施 (利用者の実機確認待ち)。
+  `check_ui_glyphs.py` 成功。製品の起動による確認はこの時点では未実施。
+- サブ PC 実機確認 (依頼 24、2026-11-09、観測者はサブ PC 担当 Claude の画面操作、隔離 data-dir、
+  ビルド 9652331be = code 0c9b4003d の dev-runtime): A〜D に NG なし。通常一覧の ON/OFF で選択・スクロールが
+  変わらない、OFF 中・ON 中に固定した表紙が OFF で出る、書庫内フォルダはアイコン・ページは画像、
+  詳細表示の hover プレビューは本で出ない、閲覧履歴・ドライブ一覧・Everything (OFF で同じ 5 件のまま表紙が戻る)、
+  自動比率 (本だけのフォルダは 1:1 のまま待ちなし、混在フォルダは画像に合わせて 3:2)。ログに ERROR / WARN / panic なし。
+  未確認: 本棚・コレクション・複数ウィンドウ・Remote (自動テストのみ)。結果は `C:\miv-subpc\results-24\`。
