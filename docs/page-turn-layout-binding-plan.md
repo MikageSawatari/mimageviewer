@@ -101,7 +101,10 @@ ROOT frame で子 viewport 宛を処理する fixture が合わないもの)。
    Completing・保持素材・予約・受理済み continuation を保ち、新しい通常 flat の採用後に一度だけ完了する。
    使い分け: Offered/Turning は意味・内容・表示条件のどれが変わっても skip/cancel。Completing は意味・内容・
    受理素材が同じなら表示条件の変更を通常 prepare で再束縛して `NeedFlat` へ戻す。continuation は from/target の
-   意味だけを照合し、配置の変更では退役させない (SpreadShift の本全体 topology 照合は維持)。receipt 採用は
+   意味と **occurrence ごとの item identity** を照合し、配置の変更では退役させない (SpreadShift の本全体 topology
+   照合は維持)。item identity は generation だけでは防げない差し替えを識別するので (`app.rs` 10700 付近)、
+   受理後に同じ idx・型・generation のまま Image A→Image B へ差し替わった場合は拒否する (r4、レビュー r3 P2)。
+   対照テスト: 配置だけの変更では継続し、Image A→Image B の差し替えでは退役する。receipt 採用は
    完全な binding と実出力証拠を照合し、旧側配置の receipt を Center 出力の証明に流用しない。
    新しい可変 owner は作らず、同じ immutable binding から「意味」「表示条件」「完全出力」の 3 投影を定義する。
 2. **既存に無い owning viewport / frame の照合を足さない**。destination の照合は base (`fd0d80bc3`) の
