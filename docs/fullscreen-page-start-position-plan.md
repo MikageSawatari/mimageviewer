@@ -508,6 +508,94 @@ cargo check -p mimageviewer --bin mimageviewer-core --jobs 4
   整形後の Rust 変更は整形のみで、追加の機能変更はない。`git diff --check` も成功した。
 コミット・製品起動・full gate・build-dev は行わない。
 
+### 9.6 D2 独立レビュー P2-1 / P2-2 の対応 (2026-11-09)
+
+設計担当が `8bbeab035` をコミット後、独立レビュー (GPT-6.1 Sol / xhigh) の P2 2 件をコードで確認し、
+修正を指示した。D2 の修正方針と追加 7 件の実経路については、同レビューで妥当と判断された。
+
+- **P2-1**: 取消後の canonical flat に画面外のページがあると、`barrier.rs` の記録・採用と
+  `page_turn.rs` の照合に残っていた正の面積条件で `Completing / NeedFlat` が終わらない。
+  `SubmittedUnitReceipt::matches_flat_pages` を唯一の flat identity 述語とし、`matches_sources`、
+  出力再提出の `same_submitted_pages`、held receipt の照合、canonical completion event、
+  barrier の flat 記録・採用をそこへ集約した。`matches_flat_unit` はその prepared unit 用の adapter。
+  完全な occurrence / source / paint ID、destination、`!curl` を検査し、面積は条件にしない。
+  caller が確認する出力採用・frame・generation・content binding は保ち、出力再提出の画面順も維持した。
+  `capture_binding` は curl と flat の両方の内容 binding、geometry 再 binding は source 世代の照合なので、
+  この flat 完了の述語へ混ぜない。curl の可視性計測・visibility ledger は変更していない。
+- **P2-2**: `page_turn_resident_source` は未完成 final を既定の `Complete` resource で受理し、
+  完成状態を quality 文字列 `provisional` にしか持たせていなかった。Offered の素材が通常 resolver より優先され、
+  要求が未完成素材で消える。resident でも `FinalCompositeEntry::complete` から型を付け、quality は段階名 `final` に統一した。
+  通常の下段代替も `Provisional` とし、安定 RAW preview の例外は通常 resolver と共通の
+  `App::fs_lower_layer_material_kind` へまとめた。cached faithful rendition も `Provisional` とし、
+  blocked RAW preview と thumbnail は生成元の型を保持する。注釈待ちの下地も `Provisional` とし、
+  `App::cached_comic_doc_has_objects` を通常 resolver と共有して読み込み済みの情報だけで判定する。
+  新しい owner・状態・producer・I/O は追加しない。
+
+修正前に追加した App 描画回帰 3 件は **0 成功・3 失敗** (0.516 秒、コンパイル 2 分 58 秒)。
+取消の 2 件は flat が `NeedFlat` に残り、resident の 1 件は Offered の型が `Complete` となる期待違反で失敗した。
+ログ: `target/1726-review-repro.log`、run ID: `a5d9ad1a-4168-4917-8a51-463c04939151`。
+その後、resident の型分類を source ID・選択枝とともに確認する 3 件を追加した。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+cargo nextest run -p mimageviewer --lib --build-jobs 4 --test-threads 4 -E 'test(~completion_placement_tests) | test(~resident_placement_tests)'
+```
+
+追加回帰 (`src/ui_fullscreen/page_turn/completion_placement_tests.rs` / `resident_placement_tests.rs`):
+
+```text
+initial_placement_cancelled_spread_offscreen_flat_releases_navigation_barrier
+initial_placement_discarded_offscreen_completion_replay_releases_navigation_barrier
+initial_placement_offered_incomplete_final_retains_until_completed_material_is_painted
+resident_lower_stages_remain_provisional_until_final_is_available
+resident_stable_raw_preview_preserves_complete_contract
+resident_comic_on_completed_final_preserves_complete_contract
+```
+
+取消回帰は LTR / RTL の両方で実際の Turning を始め、拡大・パン後の通常描画で片側の面積 0 を検査し、
+Completing の採用まで次の受理済みナビゲーションを保留し、その後 owning frame で再開する。
+discard の回帰は同じ flat の再提出を経て採用する。resident の App 回帰は、受理後・描画前に新しい完成素材を公開し、
+ordinary は新しい Complete、実際の描画は Offered の旧 Provisional であることを素材 ID で示す。
+その frame は要求を保持し、最初の 1600×2400 の完成素材 frame で上端へ揃えて確定する。
+
+修正途中の一次実行は 6 件中 4 成功・取消の 2 件が失敗した (1.453 秒、コンパイル 8 分 02 秒)。
+ログ: `target/1726-review-fixed.log`、run ID: `293e621d-1951-4bf3-bdfc-55243ce259e1`。
+新しい取消テストが「取消直後の最初の flat で Submitted」と仮定していたが、通常 prepare の後に取消が起きた場合、
+既存の `refresh_page_turn_completion_pages` は次の Completing 描画で新しい幾何・paint ID へ再結合する。
+そこで最初の取消・保留を検査し、再結合後の canonical flat で Submitted・採用・ナビゲーション再開を検査する形に修正した。
+画面外ページの検査と、採用前は保留・採用後は再開という期待値は維持している。既存テストは変更していない。
+次の fixture 実行も 4/6 成功 (`target/1726-review-fixed-final.log`、0.787 秒、run ID `89d82abf-5b25-4fbf-aabd-30a0819680dd`)。
+incoming の completed final を prepare せず RAW の下段素材から受理しており、source 更新も混在していた。
+通常描画で incoming / outgoing を先に prepare し、Offer 全素材の `Complete` を明示検査する形に直した。
+その実行は 5/6 成功 (`target/1726-review-final-targeted.log`、0.819 秒、run ID `a5402e18-f0c7-41c2-9b20-c790c6d5db9d`)。
+残る新テストの失敗は frame 入口の既存取消後にも Turning を要求していたもの。前 frame の Turning 検査は保ち、
+取消 frame はどちらの取消入口でも同じ flat の提出・採用を満たすことを検査するようにした。
+関連集合の最初の実行は 404 件中 403 成功・新しい discard テスト 1 件失敗
+(`target/1726-review-regression.log`、70.736 秒、run ID `d768d9f3-2562-49eb-9901-29c064d52c9c`)。
+`run_pass` が discard 時に同じ frame の closure を再実行するのを、テストが次 frame の再提出として扱っていた。
+pass ごとの receipt を記録し、最初の pass は未採用・再実行の flat は採用済み、次の owning frame で再開することへ検査を修正した。
+同じ操作を pass 間で再利用し、continuation の identity も保つ。ここまで既存テスト・製品の判定に追加変更はない。
+
+- 最終の絞り込みは **404 件成功・16,615 件除外** (73.421 秒、コンパイル 2 分 01 秒)。
+  前回 §9.5 の 253 件と、新規 6 件、flat 照合の共有範囲に当たる page_turn 全体を含む。
+  ログ: `target/1726-review-regression-final.log`、run ID: `460b193c-58d2-4e5b-a420-0a4d0bced9bf`。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+cargo nextest run -p mimageviewer --lib --build-jobs 4 --test-threads 4 -E 'test(~initial_placement) | test(~page_start_position) | test(~settings_transfer) | test(~search_index) | (test(~viewer_context_registry) & (test(~bundle) | test(~swap) | test(~context_async_owner_registry))) | test(~holdover) | test(~page_turn_submission_tests) | test(~page_material_kind) | test(~pdf_metadata_readoption) | test(~source_absent_changed_view_or_prepare_key_uses_existing_fallback) | test(~source_absent_stable_view_keeps_native_single_and_pair) | test(~ui_fullscreen::page_turn::)'
+```
+
+- core check は成功 (25.08 秒、`target/1726-review-core.log`)。既存 warning は残る。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+cargo check -p mimageviewer --bin mimageviewer-core --jobs 4
+```
+
+- 最後に `$env:MSBUILDDISABLENODEREUSE='1'; cargo fmt` (引数なし) を実行して成功した。
+  整形後の Rust 差分は整形のみで、追加の機能変更はない。`git diff --check` も成功した。
+製品起動・実機確認・full gate・build-dev・コミットは行わない。
+
 ## 10. r4: 仮の素材の frame と確定 (設計担当の決定、2026-11-08)
 
 §9 の差異への対応。§2 の「最初の current frame で一度だけ確定」を次の 2 段に置き換える。§3 の条件 1〜4・消去・退役はそのまま。

@@ -106,9 +106,6 @@ impl App {
         )
     }
     pub(super) fn record_page_turn_completion_flat(&mut self, receipt: &SubmittedUnitReceipt) {
-        if receipt.curl {
-            return;
-        }
         let PresentationState::Completing {
             incoming,
             completion,
@@ -117,20 +114,7 @@ impl App {
         else {
             return;
         };
-        if receipt.destination() != incoming.destination
-            || receipt.pages().len() != incoming.pages.len()
-            || !incoming.pages.iter().all(|page| {
-                receipt
-                    .pages()
-                    .iter()
-                    .any(|(occurrence, source, paint, area)| {
-                        *occurrence == page.occurrence
-                            && *source == page.resource.source_texture_id()
-                            && *paint == page.resource.paint_texture_id()
-                            && *area > 0.0
-                    })
-            })
-        {
+        if !receipt.matches_flat_unit(incoming) {
             return;
         }
         if let FlatCompletion::Submitted(previous) = completion
@@ -335,8 +319,7 @@ impl App {
                 completion: FlatCompletion::Submitted(receipt),
                 ..
             } => {
-                !receipt.curl
-                    && receipt.was_accepted()
+                receipt.was_accepted()
                     && receipt.frame() < ctx.cumulative_frame_nr()
                     && receipt.destination() == destination
                     && incoming.destination == destination
@@ -344,17 +327,7 @@ impl App {
                     && incoming.mode == self.spread_mode
                     && incoming.slice == self.fullscreen_page_slice
                     && Arc::ptr_eq(&incoming.layout, &self.spread_display_units_cache.units)
-                    && incoming.pages.iter().all(|page| {
-                        receipt
-                            .pages()
-                            .iter()
-                            .any(|(occurrence, source, paint, area)| {
-                                *occurrence == page.occurrence
-                                    && *source == page.resource.source_texture_id()
-                                    && *paint == page.resource.paint_texture_id()
-                                    && *area > 0.0
-                            })
-                    })
+                    && receipt.matches_flat_unit(incoming)
             }
             _ => false,
         };

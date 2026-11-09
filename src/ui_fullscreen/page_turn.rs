@@ -8,6 +8,8 @@ mod barrier;
 #[cfg(test)]
 mod clock_tests;
 #[cfg(test)]
+mod completion_placement_tests;
+#[cfg(test)]
 mod cover_tests;
 #[cfg(test)]
 mod coverage_lifecycle_tests;
@@ -37,6 +39,8 @@ mod permission_service_regression_tests;
 mod plain_folder_regression_tests;
 #[cfg(test)]
 mod prepare_boundary_tests;
+#[cfg(test)]
+mod resident_placement_tests;
 #[cfg(test)]
 mod roi_tests;
 #[cfg(test)]
@@ -309,6 +313,7 @@ enum SubmittedContentBinding {
 }
 
 type ReceiptPage = (SpreadPageOccurrence, egui::TextureId, egui::TextureId, f32);
+type FlatPageIdentity = (SpreadPageOccurrence, egui::TextureId, egui::TextureId);
 
 #[derive(Clone, Copy)]
 enum ReceiptPages {
@@ -395,24 +400,50 @@ impl SubmittedUnitReceipt {
         destination: PresentationDestination,
         sources: &FsNavigatorTextureSources,
     ) -> bool {
+        self.matches_flat_pages(
+            destination,
+            sources.pages.iter().map(|page| {
+                (
+                    page.occurrence,
+                    page.resource.source_texture_id(),
+                    page.resource.paint_texture_id(),
+                )
+            }),
+        )
+    }
+
+    /// Complete flat identity includes pages clipped out by pan. Output adoption,
+    /// content binding and frame ownership are checked by the caller; curl's
+    /// per-page visibility remains a separate question owned by its ledger.
+    fn matches_flat_pages(
+        &self,
+        destination: PresentationDestination,
+        mut pages: impl ExactSizeIterator<Item = FlatPageIdentity>,
+    ) -> bool {
         !self.curl
             && self.destination == destination
-            && self.pages.as_slice().len() == sources.pages.len()
-            && self
-                .pages
-                .as_slice()
-                .iter()
-                .all(|(occurrence, source, native, _area)| {
-                    // A complete ordinary flat can have a page outside the viewport
-                    // after pan. Match its submitted occurrence/material, not pixel
-                    // visibility. Partial curls are excluded by `!self.curl` above;
-                    // animation visibility remains owned by its completion ledger.
-                    sources.pages.iter().any(|p| {
-                        p.occurrence == *occurrence
-                            && p.resource.source_texture_id() == *source
-                            && p.resource.paint_texture_id() == *native
+            && self.pages.as_slice().len() == pages.len()
+            && pages.all(|(occurrence, source, paint)| {
+                self.pages
+                    .as_slice()
+                    .iter()
+                    .any(|(actual, actual_source, actual_paint, _)| {
+                        occurrence == *actual && source == *actual_source && paint == *actual_paint
                     })
-                })
+            })
+    }
+
+    fn matches_flat_unit(&self, unit: &PaintedUnit) -> bool {
+        self.matches_flat_pages(
+            unit.destination,
+            unit.pages.iter().map(|page| {
+                (
+                    page.occurrence,
+                    page.resource.source_texture_id(),
+                    page.resource.paint_texture_id(),
+                )
+            }),
+        )
     }
     pub(super) fn was_accepted(&self) -> bool {
         self.accepted.was_accepted()
@@ -763,11 +794,10 @@ impl egui::Plugin for SubmissionPlugin {
 }
 
 fn same_submitted_pages(a: &SubmittedUnitReceipt, b: &SubmittedUnitReceipt) -> bool {
-    a.destination == b.destination
-        && a.pages.as_slice().len() == b.pages.as_slice().len()
-        && a.pages.as_slice().iter().zip(b.pages.as_slice()).all(
-            |((oa, sa, na, _), (ob, sb, nb, area))| oa == ob && sa == sb && na == nb && *area > 0.0,
-        )
+    !b.curl
+        && a.matches_flat_pages(b.destination, b.pages.as_slice().iter().map(|(o, s, p, _)| (*o, *s, *p)))
+        // Replaying an output also preserves its exact screen order.
+        && a.pages.as_slice().iter().map(|p| p.0).eq(b.pages.as_slice().iter().map(|p| p.0))
 }
 
 fn cancel_pending_submission(pending: PendingSubmission, reason: &'static str) {
@@ -1620,18 +1650,7 @@ impl App {
             && unit.mode == self.spread_mode
             && unit.slice == self.fullscreen_page_slice
             && Arc::ptr_eq(&unit.layout, &self.spread_display_units_cache.units)
-            && unit.pages.len() == receipt.pages().len()
-            && unit.pages.iter().all(|page| {
-                receipt
-                    .pages()
-                    .iter()
-                    .any(|(occurrence, source, paint, area)| {
-                        *occurrence == page.occurrence
-                            && *source == page.resource.source_texture_id()
-                            && *paint == page.resource.paint_texture_id()
-                            && *area > 0.0
-                    })
-            })
+            && receipt.matches_flat_unit(unit)
     }
 
     /// Preferences and HUD adopt the same global setting before any next turn.
@@ -2030,6 +2049,11 @@ impl App {
             self.resolve_original_preview_material(idx)
                 .map(|t| (t, "preview"))
         } else if let Some(entry) = final_entry {
+            let kind = if entry.complete {
+                FullscreenPageMaterialKind::Complete
+            } else {
+                FullscreenPageMaterialKind::Provisional
+            };
             let comic = self.comic_cache.get(&idx).filter(|comic| {
                 comic.comic_gen == self.comic_generation
                     && comic.preview_scale == 1
@@ -2043,29 +2067,39 @@ impl App {
                         comic.texture.clone(),
                         crate::source_coverage::SourceCoverage::FullSource,
                         comic.display_basis,
-                    ),
+                    )
+                    .with_page_material_kind(kind),
                     "comic",
                 ))
             } else {
+                let annotation_waiting = self
+                    .page_path_key(idx)
+                    .is_some_and(|key| self.cached_comic_doc_has_objects(&key));
+                let kind = if annotation_waiting {
+                    FullscreenPageMaterialKind::Provisional
+                } else {
+                    kind
+                };
                 Some((
                     self.fs_resource_for_accepted_texture(
                         idx,
                         entry.texture.clone(),
                         crate::source_coverage::SourceCoverage::FullSource,
                         entry.display_basis,
-                    ),
-                    if entry.complete {
-                        "final"
-                    } else {
-                        "provisional"
-                    },
+                    )
+                    .with_page_material_kind(kind),
+                    "final",
                 ))
             }
         } else if self.colorize_display_requires_final_effect(idx) {
             // Ordinary waiting display also uses a faithful catalog rendition.
             // Never create the rendition at acceptance.
-            self.cached_passthrough_material(idx)
-                .map(|t| (t, "faithful_preview"))
+            self.cached_passthrough_material(idx).map(|t| {
+                (
+                    t.with_page_material_kind(FullscreenPageMaterialKind::Provisional),
+                    "faithful_preview",
+                )
+            })
         } else if let Some(entry) = self.edit_result_cache.get(&edit_key)
             && let Some(texture) = entry.texture.as_ref()
         {
@@ -2075,11 +2109,15 @@ impl App {
                     texture.clone(),
                     crate::source_coverage::SourceCoverage::FullSource,
                     entry.display_basis,
-                ),
+                )
+                .with_page_material_kind(self.fs_lower_layer_material_kind(idx)),
                 "edit",
             ))
         } else if let Some((material, _, quality)) = self.exact_resident_edit_stage(idx) {
-            Some((material, quality))
+            Some((
+                material.with_page_material_kind(self.fs_lower_layer_material_kind(idx)),
+                quality,
+            ))
         } else {
             self.resolve_original_preview_material(idx)
                 .map(|t| {
@@ -2091,7 +2129,10 @@ impl App {
                     } else {
                         "normal"
                     };
-                    (t, quality)
+                    (
+                        t.with_page_material_kind(self.fs_lower_layer_material_kind(idx)),
+                        quality,
+                    )
                 })
                 .or_else(|| {
                     self.fs_thumbnail_resource_for_display(idx)
@@ -3137,18 +3178,7 @@ impl App {
         else {
             return None;
         };
-        if receipt.curl
-            || receipt.destination != incoming.destination
-            || receipt.pages().len() != incoming.pages.len()
-            || !incoming.pages.iter().all(|page| {
-                receipt.pages().iter().any(|(o, source, paint, area)| {
-                    *o == page.occurrence
-                        && *source == page.resource.source_texture_id()
-                        && *paint == page.resource.paint_texture_id()
-                        && *area > 0.0
-                })
-            })
-        {
+        if !receipt.matches_flat_unit(incoming) {
             return None;
         }
         Some(SubmissionEvent {

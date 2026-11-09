@@ -1936,6 +1936,9 @@ paint rect の和（描く白 companion を含む）から初期 pan を求め�
 
 素材の `FullscreenPageMaterialKind` は通常サムネイル・通過 rendition・未完成 final／完成待ち代役を
 `Provisional`、完成素材を `Complete` として生成元・選択元で付け、Native 化・capture 後も保持する。
+紙めくりの resident 受理でも同じ型を保持する。未完成 final と通常の下段代替は `Provisional`、
+安定 RAW preview の例外は通常 resolver と共通の `fs_lower_layer_material_kind` で判定する。
+受理の quality ラベルは素材の段階を示すだけとし、完成状態は `FullscreenPageMaterialKind` に持たせる。
 要求作成時の `origin_zoom` / `origin_pan` は幾何と収まる軸の配置基準として保つ。仮素材の frame は
 配置後の zoom/pan を CAS 用の `applied_zoom` / `applied_pan` だけへ更新して要求を保持し、単ページならそのページ、見開きなら
 全ページの実際に準備できた素材が完成した最初の current frame で消す。原寸では素材差し替えで矩形が変わる
@@ -3428,6 +3431,9 @@ previous に属するなら提示とは数えない。
 通常 flat の receipt は、pan によって相方が viewport 外になっても、提出した表示単位全体の
 occurrence / source / paint ID を照合する。各ページの正の可視面積は navigation 退役の条件にしない。
 出力の採用確認・全ページの `Live` 確認・部分的な curl を退役証拠にしない条件は維持する。
+取消後の `Completing` とその continuation も同じ flat の occurrence / source / paint ID 照合を使い、
+画面外のページの面積 0 を拒否理由にしない。出力再提出時は画面順も維持する。
+照合の正本は `SubmittedUnitReceipt::matches_flat_pages`。curl の可視性 ledger は別の問いとして保つ。
 したがって次の同 frame repeat が受理される場合でも、その前に target の draw command は確定済みで
 あり、見開き片側だけを提示済みと数えることはない。
 

@@ -91196,8 +91196,12 @@ impl App {
             return false; // Folder / Video 等 (page_path_key 無し) は対象外
         };
         self.ensure_comic_doc_loaded(&key);
-        let has_persisted = self.comic_docs.get(&key).is_some_and(|v| !v.is_empty());
-        has_persisted || self.comic_demo_enabled
+        self.cached_comic_doc_has_objects(&key)
+    }
+
+    /// Resident selection can inspect loaded annotation requirements without I/O.
+    pub(crate) fn cached_comic_doc_has_objects(&self, key: &str) -> bool {
+        self.comic_docs.get(key).is_some_and(|v| !v.is_empty()) || self.comic_demo_enabled
     }
 
     /// 注釈フォントの列挙結果 (ピッカー一覧 + 表示名→パス) を 1 度だけ作る。pack 同梱 /

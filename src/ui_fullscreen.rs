@@ -13332,6 +13332,21 @@ impl App {
             .and_then(|resource| resource.source_texture().cloned())
     }
 
+    /// Stable RAW previews are complete displays in their own right. Other
+    /// lower stages are substitutes while the selected final producer finishes.
+    fn fs_lower_layer_material_kind(&self, idx: usize) -> FullscreenPageMaterialKind {
+        if matches!(
+            self.fs_cache.get(&idx),
+            Some(FsCacheEntry::RawPreview { .. })
+        ) || self.raw_page_load_state(idx)
+            == Some(crate::app::raw_page_store::RawPageLoadState::PreviewShown)
+        {
+            FullscreenPageMaterialKind::Complete
+        } else {
+            FullscreenPageMaterialKind::Provisional
+        }
+    }
+
     fn resolve_fs_processed_material_from_caches(
         &mut self,
         ctx: &egui::Context,
@@ -13479,11 +13494,8 @@ impl App {
         // A lower layer remains a valid 2D fallback while the selected final
         // producer is pending. It is not yet the stable input for inference.
         // RAW development previews are the explicit stable-preview exception.
-        let raw_preview = matches!(
-            self.fs_cache.get(&idx),
-            Some(FsCacheEntry::RawPreview { .. })
-        ) || self.raw_page_load_state(idx)
-            == Some(crate::app::raw_page_store::RawPageLoadState::PreviewShown);
+        let fallback_kind = self.fs_lower_layer_material_kind(idx);
+        let raw_preview = fallback_kind == FullscreenPageMaterialKind::Complete;
         if !raw_preview {
             depth_wait.get_or_insert(crate::depth_parallax::DepthSourceWait::IncompleteComposite);
         }
@@ -13505,13 +13517,8 @@ impl App {
         ) {
             return self.source_material_for_idx(idx);
         }
-        self.resolve_fs_pre_overlay_material(idx).map(|material| {
-            material.with_page_material_kind(if raw_preview {
-                FullscreenPageMaterialKind::Complete
-            } else {
-                FullscreenPageMaterialKind::Provisional
-            })
-        })
+        self.resolve_fs_pre_overlay_material(idx)
+            .map(|material| material.with_page_material_kind(fallback_kind))
     }
 
     pub(crate) fn fs_navigation_sequence_blocks_new_target(&self) -> bool {
