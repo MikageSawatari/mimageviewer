@@ -1455,6 +1455,21 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-10: ページめくり提示資格を表示単位の binding へ移す (§1.750)
+
+遠方ページの横長寸法の到着で本全体の `Arc<Vec<SpreadDisplayUnit>>` が作り直されると、演出中の単位が同じでも
+ページめくりが取り消される (§1.750)。提示資格 (held lookup・prepare/bind・Turning 比較・receipt・barrier) を、
+本全体 Arc の同一性から、表示単位ごとの意味的 binding (`PageTurnUnitBinding`) の値照合へ移す。
+SpreadShift の continuation だけは本全体 topology 照合を残す (ずらし基点が本全体の横長境界に依存するため)。
+`page_turn_destination` の context/window/viewport 生成、detached 述語、viewport routing、HWND/focus/z-order は変更しない。
+変わるのは main/detached 共用の lookup/prepare/receipt/barrier と、その導出順序 (canonical 解決を先に済ませる prefix)。
+受入には main と detached の同一本・同頁で、別 context の binding/receipt を混用せず、片方の遠方更新・open/close が
+兄弟の資源・世代・queue・提示状態を変えない headless 対照を含める。
+
+設計担当 ClaudeCode と独立 Sol / xhigh 設計レビュー (r1 REVISE P2 → r2 ACCEPT) は、提示資格の所有単位を
+本全体から表示単位へ移す構造修正であり症状パッチではないと合意した。正本は
+[ページめくりの表示単位 binding](page-turn-layout-binding-plan.md)。
+
 ### 2026-11-08: ページ切替後の初期表示位置 (§1.726)
 
 `ViewerContextBundle` へ一般の表示状態 1 フィールドを追加 (§1.726)。detached 述語・viewport 経路は不変。
