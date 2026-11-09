@@ -1,6 +1,6 @@
 # ページ切替後の初期表示位置「中央 / 読み始め」(§1.726)
 
-- 状態: **r4 独立実装レビュー P2 修正済み・再確認待ち** (2026-11-09、§9.4)。設計担当の §10 の決定を実装し、core check・絞り込み nextest・UI snapshot を通過した。独立設計レビュー (GPT-6.1 Sol / xhigh) r1 の P2 5 件、r2 の P2 2 件を反映した r3 の記録は §8。
+- 状態: **r4 再レビュー承認済み。ページ構成切替の追補は実装済み・レビュー／実機再確認待ち** (2026-11-09、§9.7・§9.8)。設計担当の §10 の決定を実装し、core check・絞り込み nextest・UI snapshot を通過した。独立設計レビュー (GPT-6.1 Sol / xhigh) r1 の P2 5 件、r2 の P2 2 件を反映した r3 の記録は §8。
 - 要望: 5ch >>739 (2026-11-07)。ズーム/フィット設定で画像が画面からはみ出すと、ページを送った先が
   中央から表示されるので、上から読みたい。拡大操作の中心点やマウスカーソルの移動を変える要望ではない。
 - 利用者決定 (backlog §1.726): 設定を追加する。既定は従来どおり「中央」。
@@ -36,6 +36,12 @@
 setter は寸法判明・分割モード変更・回転による整合 (`reconcile_fullscreen_page_slice`) からも呼ばれるので、そこで要求を作ると
 手動パン後にも初期位置へ戻ってしまう。整合処理は要求を作らず、消えた要求を復活させない。
 
+**第 3 の適用入口 (依頼 27 追補)**: paged のページ構成を実際に変更したときも適用する。
+単ページ・見開き・表紙付き見開き・横長分割の間の切替は、新しい表示単位の pan を 0 に戻して要求を作る。
+切替前の倍率は保つ。手動で拡大・移動した後も、新しい構成では読み始めへ合わせる。
+正規化後に同じ構成となる場合や拒否された切替では何もしない。`中央` は従来の適用経路を変えない。
+読書方向だけの切替 (`7`) と、編集ツールの一時的な単ページ化・復帰は従来どおり要求を消す側に保つ。
+
 **適用しない** (現行どおり):
 
 - 連結読み (縦・横)。ページ送りは scroll で、`fs_pan` は交差軸の位置しか持たない
@@ -50,6 +56,9 @@ setter は寸法判明・分割モード変更・回転による整合 (`reconci
 - mIV Remote の Web 表示 (本体の `fs_pan` を使わない別の表示)
 
 ## 2. 幾何: どの時点の何に合わせるか
+
+要求を作る入口は、open の zoom/pan リセット、受理した分割片側移動、paged のページ構成切替の 3 つ。
+構成切替は倍率を保持し pan 0 を配置基準にする。消費・仮素材から完成素材への確定は共通で、別の配置状態は追加しない。
 
 **r4 では確定時点を §10 が上書きする。** 仮素材にもその frame の幾何を適用し、実際の完成素材が表示単位全体で揃った最初の current frame に確定する。
 
@@ -86,7 +95,7 @@ struct FsInitialPlacementRequest {
 }
 ```
 
-- **作る**: 設定が `読み始め` のときだけ、§1.1 の適用入口 (受理済みの open と、受理済みの分割片側移動) で作る (前の要求は上書き)。`中央` では作らない。
+- **作る**: 設定が `読み始め` のときだけ、§1.1 の適用入口 (受理済みの open、分割片側移動、paged のページ構成切替) で作る (前の要求は上書き)。`中央` では作らない。
   要求の identity は `items_generation` + `anchor_idx` とし、slice は identity に含めない (未消費の間に整合処理が slice を直すことがあるため。
   分割片側移動の要求は、その移動後の slice を描く frame で解く)。
 - **解く (唯一の consumer)**: 単ページ / 見開きの paint で、placement を解く**直前**に 1 回。条件:
@@ -603,6 +612,94 @@ e9099ac8f の独立再レビュー (GPT-6.1 Sol / xhigh): P2-1 / P2-2 は解消�
 片側を画面外へ出して取り消すと、まだ見えていないページにも `first_visible` (`visible_area=0`) と `fully_visible` が
 記録される (page_turn.rs の completion event の `visible_pages`)。完了・再開の条件は正しく、通常操作は止まらない。
 直すなら、可視性イベントの mask を receipt の実面積から求め、全ページが見えていない取消着地では `fully_visible` を出さない。
+
+### 9.8 依頼 27 追補: ページ構成切替時の読み始め (2026-11-09)
+
+設計担当から、`e9099ac8f` の独立再レビュー承認とサブ PC 再確認 A〜C の成功が報告された。
+別件のサブ PC 担当の観測では、6000×3000 の単ページを原寸・左→右・読み始めで開いて `9` を押すと、
+単ページ左端合わせの大きな pan が分割片側へ持ち越され、左側が黒くなった。開き直すと正しい位置だった。
+依頼 25 の単ページ→見開きでも、旧単位の pan を持ち越す見え方が報告されていた。
+
+設計担当の決定に従い、paged の実際のページ構成変更を要求生成の第 3 の入口にした (§1.1・§2・§3)。
+`request_fs_initial_placement_after_composition_change(previous_zoom)` に方針をまとめ、ReadingStart のときだけ
+pan を 0 に戻し、元の倍率と現在の anchor で既存の `request_fs_initial_placement` を呼ぶ。
+受理・構成変化の判定は各入口が持つ既存の分岐を使い、別の状態や request は追加していない。
+`normalize_spread_position` は anchor を揃えるため open を通り、倍率を 1 に戻す場合がある。
+その場合も ReadingStart は正規化前の倍率を復元してから要求を作る。Center は従来の経路をそのまま通す。
+通常の構成変更での Center の pan/zoom 持越しに加え、この既存の anchor 正規化 open のリセットも保つ。
+
+入口の棚卸し:
+
+| 経路 | 対応 |
+| --- | --- |
+| キー 1/2/3/4/5/8/9、ゲームパッド Select、一般の構成操作 | `apply_fullscreen_spread_mode` の受理後・anchor 正規化後に共通 helper |
+| 本の構成が view settings を持つ場合 | `apply_fullscreen_view_mode` の受理後・正規化後に共通 helper |
+| 抽出結果の view mode | 同じ入口で読書方向による mode 正規化後の実変更だけを採用。同じ正規化結果は no-op |
+| ホバーバーの構成メニュー | 既存の一括保存成功後、mode/flow/direction の整合・reset 後に共通 helper。方向だけの変更は除外 |
+| 同じキーで既存の見開きずらしを解除 | 実際に組が変わる受理側で helper。ずらしも無い通常の同構成 no-op は要求・位置を変えない |
+| 本の構成の live projection 採用 | mode が変わった場合だけ、rows・世代・landing を採用した後、現在の anchor で helper |
+| snapshot の保存表示の復元 | 保存状態には camera が含まれない。mode が実際に変わる場合だけ復元後に helper。Center と同 mode は不変 |
+| `7` / popup の読書方向だけの変更 | 既存の `reset_continuous_reading_transform` による中央へのリセットを維持。新要求は作らない |
+| `enter/leave_page_edit_single_view`、`leave_local_page_edit_single_view` | 編集の一時的な単ページ化／復帰であり、従来どおり要求を消す。新入口へ含めない |
+| 新規一覧の `begin_extracted_result_view`、永続値の水和 | 新しい閲覧 source の初期化。後続の既存 open の入口に任せ、途中で別の要求を作らない |
+| viewer bundle の swap、detached の保存 zoom/pan 復元 | 構成の適用操作ではなく所有移動／復元。既存の context 所有・明示消去を維持 |
+
+初期配置の consumer、仮素材→完成素材の確定、入力での消去、Z/360/depth/連結等での退役は変更していない。
+slice の setter / reconcile に要求は追加せず、既存の半分選択の規則も変えない。
+単ページ化／復帰の編集 pivot を除外する理由は、文書を読む切替ではなく編集対象を一時表示する操作だからである。
+
+追加回帰:
+
+```text
+initial_placement_composition_switch_aligns_first_complete_frame_and_keeps_zoom
+initial_placement_composition_switch_center_keeps_manual_pan_and_zoom
+initial_placement_composition_switch_reanchors_pair_without_resetting_zoom
+initial_placement_composition_same_mode_preserves_position_and_request
+initial_placement_composition_switch_extracted_mode_uses_normalized_direction
+initial_placement_composition_switch_owned_view_mode_aligns_without_changing_book
+initial_placement_composition_edit_pivot_clears_without_requesting_entry_alignment
+initial_placement_composition_switch_same_mode_shift_reset_aligns_new_pair
+initial_placement_snapshot_mode_restore_aligns_only_changed_paged_composition
+initial_placement_live_projection_mode_change_uses_adopted_generation_and_anchor
+```
+
+App 描画は 6000×3000 と同じ比率の 1600×800 を使い、単ページ→分割 LTR/RTL、単ページ→見開き LTR/RTL・表紙、
+見開き→単ページを、最初の完成 frame の unit rect と split UV で検査する。手動パン・倍率 1.5 の後も検査し、
+Center の持越し・同構成の no-op・非先頭 anchor の正規化・ずらし解除・本/抽出結果の経路・編集 pivot の除外も検査する。
+live projection は実 worker/poll で並べ替えと方向変更を採用し、物理ページを保ちながら新世代・新 anchor の要求に置き換わることを検査する。
+
+- 最初のコンパイルで新 fixture の `source_dims` を u32 にしていた型誤りを修正した (`target/1726-composition-repro.log`)。
+- 修正前の App 回帰は **7 件中 3 成功・4 失敗** (4.269 秒)。既存の pan 持越し、要求なし、anchor 正規化による倍率リセットで失敗。
+  `target/1726-composition-repro-final.log`、run ID `4b16dde6-cfcd-4d30-8ec6-7a2983f6ac5b`。
+- 実装途中は 7 件中 6 成功。残る新 fixture は pan setter の proposed_zoom が fs_zoom も更新すると思い込んでいたため、
+  明示的に倍率を設定して修正した (`target/1726-composition-fixed.log`)。既存テストは変更していない。
+- 構成切替の最終 8 件は **8 件成功** (4.624 秒、コンパイル 2 分 34 秒)。`target/1726-composition-fixed-final.log`、
+  run ID `7f6c8f2c-1671-4120-8933-0bba40d74365`。その後、snapshot と live projection の 2 回帰を追加した。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+cargo nextest run -p mimageviewer --lib --build-jobs 4 --test-threads 4 -E 'test(~initial_placement_composition_)'
+```
+
+- 最終の絞り込みは **527 件成功・16,502 件除外** (93.770 秒、コンパイル 2 分 19 秒)。
+  前回の 404 件、新規 10 件、本の構成 runtime / snapshot / spread mode の関連回帰を含む。
+  `target/1726-composition-regression.log`、run ID `413f05e1-72bb-4238-a1db-10fde2b0a162`。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+cargo nextest run -p mimageviewer --lib --build-jobs 4 --test-threads 4 -E 'test(~initial_placement) | test(~page_start_position) | test(~settings_transfer) | test(~search_index) | (test(~viewer_context_registry) & (test(~bundle) | test(~swap) | test(~context_async_owner_registry))) | test(~holdover) | test(~page_turn_submission_tests) | test(~page_material_kind) | test(~pdf_metadata_readoption) | test(~source_absent_changed_view_or_prepare_key_uses_existing_fallback) | test(~source_absent_stable_view_keeps_native_single_and_pair) | test(~ui_fullscreen::page_turn::) | test(~book_composition_runtime_tests) | test(~snapshot_ops::tests) | test(~spread_mode)'
+```
+
+- core check は成功 (22.24 秒、`target/1726-composition-core.log`)。既存 warning は残る。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+cargo check -p mimageviewer --bin mimageviewer-core --jobs 4
+```
+
+- 最後に `$env:MSBUILDDISABLENODEREUSE='1'; cargo fmt` (引数なし) を実行して成功した。
+  整形後の Rust 変更は整形のみで、追加の機能変更はない。`git diff --check` も成功した。
+製品起動・修正後の実機確認・full gate・build-dev・コミットは行わない。
 
 ## 10. r4: 仮の素材の frame と確定 (設計担当の決定、2026-11-08)
 

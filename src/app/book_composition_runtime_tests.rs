@@ -1744,6 +1744,78 @@ fn g3_hidden_refresh_follows_next_previous_first_and_closes_without_resume_write
 }
 
 #[test]
+fn initial_placement_live_projection_mode_change_uses_adopted_generation_and_anchor() {
+    use crate::book_composition::{BookComposition, fixtures::document_page};
+    use crate::settings::{FullscreenPageStartPosition, ReadingFlow, SpreadMode};
+    let mut env = setup_app();
+    let root = env.tmp.path().join("initial-placement-refresh.pdf");
+    let data = env.tmp.path().join("initial-placement-refresh-data");
+    let scope = install_document(&mut env, &root);
+    let (service, owner) = runtime(&mut env, &data);
+    save(&service, &scope, ReadingDirection::Ltr);
+    adopt(&mut env, &service, &scope);
+    assert_eq!(env.spread_mode, SpreadMode::Ltr);
+    assert!(env.fullscreen_idx.is_none());
+    env.settings.fullscreen_page_start_position = FullscreenPageStartPosition::ReadingStart;
+    env.reading_flow = ReadingFlow::Paged;
+    env.fullscreen_idx = Some(2);
+    env.fs_zoom = 1.5;
+    env.fs_pan = egui::vec2(53.0, -71.0);
+    env.request_fs_initial_placement(2);
+    let old_request = env.fs_initial_placement_request.unwrap();
+    let old_generation = env.items_generation;
+    assert_eq!(old_request.items_generation, old_generation);
+    assert_eq!(old_request.anchor_idx, 2);
+    service
+        .save(
+            scope.clone(),
+            PageDomain::Document,
+            BookComposition::new(
+                ReadingDirection::Rtl,
+                vec![
+                    document_page(2),
+                    document_page(3),
+                    document_page(0),
+                    document_page(1),
+                ],
+            ),
+        )
+        .recv_timeout(WAIT)
+        .unwrap()
+        .status
+        .unwrap();
+    // Admit and complete the actual worker through the production poll path.
+    // Reordering moves the current physical page to a different numeric anchor.
+    admit_projection(&mut env, &service, &scope);
+    settle_projection(&mut env);
+    assert_accepted_token(&env, &service, &scope);
+    assert_eq!(env.spread_mode, SpreadMode::Rtl);
+    assert_eq!(
+        env.reading_direction,
+        crate::settings::ReadingDirection::Rtl
+    );
+    assert_eq!(current_physical_page(&env), Some(2));
+    assert_eq!(env.fullscreen_idx, Some(0));
+    assert_ne!(env.items_generation, old_generation);
+    assert_eq!((env.fs_zoom, env.fs_pan), (1.5, egui::Vec2::ZERO));
+    let request = env
+        .fs_initial_placement_request
+        .expect("new adopted display unit");
+    assert_ne!(request, old_request);
+    assert_eq!(request.items_generation, env.items_generation);
+    assert_eq!(request.anchor_idx, env.fullscreen_idx.unwrap());
+    assert_eq!(
+        (request.origin_zoom, request.origin_pan),
+        (1.5, egui::Vec2::ZERO)
+    );
+    assert_eq!(
+        (request.applied_zoom, request.applied_pan),
+        (1.5, egui::Vec2::ZERO)
+    );
+    owner.shutdown_and_join();
+}
+
+#[test]
 fn g3_refresh_keeps_latest_navigation_and_ignores_superseded_source_generation() {
     use crate::book_composition::{BookComposition, fixtures::document_page};
     let mut env = setup_app();

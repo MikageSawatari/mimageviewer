@@ -255,6 +255,573 @@ fn placement_frame_in_rect(
     .drop_without_applying_deltas();
 }
 
+fn composition_switch_cases() -> [(SpreadMode, SpreadMode, ReadingDirection); 8] {
+    [
+        (
+            SpreadMode::Single,
+            SpreadMode::SplitLtr,
+            ReadingDirection::Rtl,
+        ),
+        (
+            SpreadMode::Single,
+            SpreadMode::SplitRtl,
+            ReadingDirection::Ltr,
+        ),
+        (SpreadMode::Single, SpreadMode::Ltr, ReadingDirection::Rtl),
+        (
+            SpreadMode::Single,
+            SpreadMode::LtrCover,
+            ReadingDirection::Rtl,
+        ),
+        (SpreadMode::Single, SpreadMode::Rtl, ReadingDirection::Ltr),
+        (
+            SpreadMode::Single,
+            SpreadMode::RtlCover,
+            ReadingDirection::Ltr,
+        ),
+        (SpreadMode::Ltr, SpreadMode::Single, ReadingDirection::Ltr),
+        (SpreadMode::Rtl, SpreadMode::Single, ReadingDirection::Rtl),
+    ]
+}
+
+fn composition_switch_app(
+    ctx: &egui::Context,
+    mode: SpreadMode,
+    landscape: bool,
+    direction: ReadingDirection,
+) -> crate::app::AppTestEnvForTest {
+    let mut app = reading_app(ctx, mode);
+    app.settings.fullscreen_fit_mode = FullscreenFitMode::Original;
+    app.settings.page_turn_animation_enabled = false;
+    app.reading_direction = direction;
+    install_composition_switch_materials(&mut app, ctx, landscape);
+    app.reconcile_fullscreen_page_slice(0);
+    app
+}
+
+fn install_composition_switch_materials(app: &mut App, ctx: &egui::Context, landscape: bool) {
+    // The landscape has the reported 6000x3000 aspect ratio. Both its half
+    // and the portrait overflow the 600x400 viewport at physical 100%.
+    let size = if landscape { [1600, 800] } else { [720, 1020] };
+    let pixels = Arc::new(egui::ColorImage::filled(size, egui::Color32::WHITE));
+    for idx in 0..app.items.len() {
+        let pdf_metadata = matches!(app.items[idx], GridItem::PdfPage { .. }).then_some(
+            crate::app::PdfPageMetadataSnapshot {
+                layout_dims: (size[0] as u32, size[1] as u32),
+                content_type: crate::pdf_loader::PdfPageContentType::Vector,
+            },
+        );
+        let tex = ctx.load_texture(
+            format!("composition-switch-{idx}"),
+            (*pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata,
+                tex,
+                pixels: pixels.clone(),
+                source_dims: Some(size),
+                load_seq: 2,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        app.record_page_dims_for_spread(idx, (size[0] as u32, size[1] as u32));
+    }
+}
+
+fn paint_composition_switch_unit(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+) -> egui::Rect {
+    let anchor = app.fullscreen_idx.expect("selected anchor");
+    // The ordinary viewport reconciles the active half before selecting its
+    // composition and painting. This is not an initial-placement producer.
+    app.reconcile_fullscreen_page_slice(anchor);
+    let composition = app.spread_display_composition_for_anchor(anchor);
+    let pages = composition.pages_in_screen_order(app.spread_mode);
+    for page in &pages {
+        let material = app
+            .resolve_fs_processed_material(ctx, page.idx, false)
+            .expect("resident complete material");
+        assert_eq!(
+            material.page_material_kind(),
+            FullscreenPageMaterialKind::Complete
+        );
+    }
+    match pages.as_slice() {
+        [_] => {
+            let transform = paint_single(
+                app,
+                ui,
+                ctx,
+                arrival_viewport(),
+                true,
+                crate::rotation_db::Rotation::None,
+                None,
+                composition.singleton_placement(),
+            );
+            if app.spread_mode.is_split() {
+                let direction = app.split_direction_now().expect("split direction");
+                assert_eq!(app.fullscreen_page_slice, direction.first());
+                close_to(transform.uv_rect.width(), 0.5);
+                assert_eq!(
+                    transform.uv_rect,
+                    direction
+                        .first()
+                        .source_bbox(crate::rotation_db::Rotation::None)
+                );
+            }
+            white_companion_rect(&transform).map_or(transform.paint_rect, |white| {
+                transform.paint_rect.union(white)
+            })
+        }
+        [_, _] => {
+            paint_spread(app, ui, ctx, arrival_viewport(), true);
+            let left = app
+                .fullscreen_page_layout
+                .page_by_idx(pages[0].idx)
+                .unwrap();
+            let right = app
+                .fullscreen_page_layout
+                .page_by_idx(pages[1].idx)
+                .unwrap();
+            left.transform.paint_rect.union(right.transform.paint_rect)
+        }
+        _ => panic!("paged display unit"),
+    }
+}
+
+#[test]
+fn initial_placement_composition_switch_aligns_first_complete_frame_and_keeps_zoom() {
+    for (from, to, direction) in composition_switch_cases() {
+        for manual_input in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = composition_switch_app(&ctx, from, to.is_split(), direction);
+            app.request_fs_initial_placement(0);
+            frame(&ctx, |ui, ctx| {
+                paint_composition_switch_unit(&mut app, ui, ctx);
+            })
+            .drop_without_applying_deltas();
+            assert!(app.fs_initial_placement_request.is_none());
+            if manual_input {
+                app.fs_zoom = 1.5;
+                app.set_fs_pan_from_input(1.5, egui::vec2(53.0, -71.0));
+            }
+            let zoom = app.fs_zoom;
+            assert!(app.apply_fullscreen_spread_mode(&ctx, 0, to));
+            assert_eq!(app.spread_mode, to);
+            assert_eq!(app.fs_zoom, zoom, "{from:?} -> {to:?}");
+            assert_eq!(app.fs_pan, egui::Vec2::ZERO, "{from:?} -> {to:?}");
+            let request = app
+                .fs_initial_placement_request
+                .expect("new composition entry");
+            assert_eq!(request.anchor_idx, app.fullscreen_idx.unwrap());
+            assert_eq!(
+                (request.origin_zoom, request.origin_pan),
+                (zoom, egui::Vec2::ZERO)
+            );
+            assert_eq!(
+                (request.applied_zoom, request.applied_pan),
+                (zoom, egui::Vec2::ZERO)
+            );
+            let effective_direction = to.reading_direction().unwrap_or(app.reading_direction);
+            assert_eq!(
+                effective_direction,
+                to.reading_direction().unwrap_or(direction)
+            );
+            frame(&ctx, |ui, ctx| {
+                let unit = paint_composition_switch_unit(&mut app, ui, ctx);
+                let composition = app.spread_display_composition_for_anchor(0);
+                let count = composition.pages_in_screen_order(to).len();
+                assert_eq!(
+                    count,
+                    if to.is_spread() && !to.has_cover() {
+                        2
+                    } else {
+                        1
+                    }
+                );
+                assert!(unit.width() > arrival_viewport().width(), "{to:?}");
+                assert!(unit.height() > arrival_viewport().height(), "{to:?}");
+                close_to(unit.top(), arrival_viewport().top());
+                match effective_direction {
+                    ReadingDirection::Ltr => close_to(unit.left(), arrival_viewport().left()),
+                    ReadingDirection::Rtl => close_to(unit.right(), arrival_viewport().right()),
+                }
+                assert!(app.fs_initial_placement_request.is_none());
+                assert_eq!(app.fs_zoom, zoom);
+            })
+            .drop_without_applying_deltas();
+            let settled_pan = app.fs_pan;
+            frame(&ctx, |ui, ctx| {
+                paint_composition_switch_unit(&mut app, ui, ctx);
+                assert_eq!(app.fs_pan, settled_pan, "entry is consumed exactly once");
+                assert!(app.fs_initial_placement_request.is_none());
+            })
+            .drop_without_applying_deltas();
+        }
+    }
+}
+
+#[test]
+fn initial_placement_composition_switch_center_keeps_manual_pan_and_zoom() {
+    for (from, to, direction) in composition_switch_cases() {
+        let ctx = egui::Context::default();
+        let mut app = composition_switch_app(&ctx, from, to.is_split(), direction);
+        app.settings.fullscreen_page_start_position = FullscreenPageStartPosition::Center;
+        app.fs_zoom = 1.5;
+        app.set_fs_pan_from_input(1.5, egui::vec2(53.0, -71.0));
+        frame(&ctx, |ui, ctx| {
+            paint_composition_switch_unit(&mut app, ui, ctx);
+        })
+        .drop_without_applying_deltas();
+        let before = (app.fs_zoom, app.fs_pan);
+        assert!(app.apply_fullscreen_spread_mode(&ctx, 0, to));
+        assert_eq!((app.fs_zoom, app.fs_pan), before, "{from:?} -> {to:?}");
+        assert!(app.fs_initial_placement_request.is_none());
+        frame(&ctx, |ui, ctx| {
+            paint_composition_switch_unit(&mut app, ui, ctx);
+            assert_eq!((app.fs_zoom, app.fs_pan), before);
+            assert!(app.fs_initial_placement_request.is_none());
+        })
+        .drop_without_applying_deltas();
+    }
+}
+
+#[test]
+fn initial_placement_composition_switch_reanchors_pair_without_resetting_zoom() {
+    for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
+        let ctx = egui::Context::default();
+        let mut app =
+            composition_switch_app(&ctx, SpreadMode::Single, false, ReadingDirection::Rtl);
+        app.fullscreen_idx = Some(1);
+        app.fs_zoom = 1.5;
+        app.set_fs_pan_from_input(1.5, egui::vec2(53.0, -71.0));
+        frame(&ctx, |ui, ctx| {
+            paint_composition_switch_unit(&mut app, ui, ctx);
+        })
+        .drop_without_applying_deltas();
+        assert!(app.apply_fullscreen_spread_mode(&ctx, 1, mode));
+        assert_eq!(app.fullscreen_idx, Some(0), "normalize to the pair anchor");
+        assert_eq!(app.fs_zoom, 1.5);
+        assert_eq!(app.fs_pan, egui::Vec2::ZERO);
+        let request = app.fs_initial_placement_request.expect("new pair entry");
+        assert_eq!(request.anchor_idx, 0);
+        assert_eq!(
+            (request.origin_zoom, request.origin_pan),
+            (1.5, egui::Vec2::ZERO)
+        );
+        frame(&ctx, |ui, ctx| {
+            let unit = paint_composition_switch_unit(&mut app, ui, ctx);
+            assert!(unit.width() > arrival_viewport().width());
+            assert!(unit.height() > arrival_viewport().height());
+            close_to(unit.top(), arrival_viewport().top());
+            match app
+                .spread_mode
+                .reading_direction()
+                .unwrap_or(app.reading_direction)
+            {
+                ReadingDirection::Ltr => close_to(unit.left(), arrival_viewport().left()),
+                ReadingDirection::Rtl => close_to(unit.right(), arrival_viewport().right()),
+            }
+            assert_eq!(app.fs_zoom, 1.5);
+            assert!(app.fs_initial_placement_request.is_none());
+        })
+        .drop_without_applying_deltas();
+    }
+}
+
+#[test]
+fn initial_placement_composition_same_mode_preserves_position_and_request() {
+    for (_, mode, direction) in composition_switch_cases() {
+        for pending in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = composition_switch_app(&ctx, mode, mode.is_split(), direction);
+            app.fs_zoom = 1.5;
+            app.set_fs_pan_from_input(1.5, egui::vec2(53.0, -71.0));
+            if pending {
+                app.request_fs_initial_placement(0);
+            }
+            let before = (app.fs_zoom, app.fs_pan, app.fs_initial_placement_request);
+            assert!(app.apply_fullscreen_spread_mode(&ctx, 0, mode));
+            assert_eq!(
+                (app.fs_zoom, app.fs_pan, app.fs_initial_placement_request),
+                before,
+                "same {mode:?}, pending={pending}"
+            );
+            if !pending {
+                frame(&ctx, |ui, ctx| {
+                    paint_composition_switch_unit(&mut app, ui, ctx);
+                    assert_eq!((app.fs_zoom, app.fs_pan), (before.0, before.1));
+                    assert!(app.fs_initial_placement_request.is_none());
+                })
+                .drop_without_applying_deltas();
+            }
+        }
+    }
+}
+
+#[test]
+fn initial_placement_composition_switch_extracted_mode_uses_normalized_direction() {
+    for reading_start in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app =
+            composition_switch_app(&ctx, SpreadMode::Single, false, ReadingDirection::Rtl);
+        app.projection_recipe = crate::app::book_materialization::ProjectionRecipe::ExtractedResult(
+            crate::app::book_materialization::ExtractedSurface::Rating,
+        );
+        if !reading_start {
+            app.settings.fullscreen_page_start_position = FullscreenPageStartPosition::Center;
+        }
+        app.fs_zoom = 1.5;
+        app.set_fs_pan_from_input(1.5, egui::vec2(53.0, -71.0));
+        frame(&ctx, |ui, ctx| {
+            paint_composition_switch_unit(&mut app, ui, ctx);
+        })
+        .drop_without_applying_deltas();
+        let before = (app.fs_zoom, app.fs_pan);
+        assert!(app.apply_fullscreen_spread_mode(&ctx, 0, SpreadMode::Ltr));
+        assert_eq!(
+            app.spread_mode,
+            SpreadMode::Rtl,
+            "the extracted owner keeps its direction"
+        );
+        assert_eq!(app.fs_zoom, before.0);
+        assert_eq!(app.fs_initial_placement_request.is_some(), reading_start);
+        if reading_start {
+            assert_eq!(app.fs_pan, egui::Vec2::ZERO);
+            let request = app.fs_initial_placement_request.unwrap();
+            assert_eq!(
+                (request.origin_zoom, request.origin_pan),
+                (before.0, egui::Vec2::ZERO)
+            );
+        } else {
+            assert_eq!((app.fs_zoom, app.fs_pan), before);
+        }
+        frame(&ctx, |ui, ctx| {
+            let unit = paint_composition_switch_unit(&mut app, ui, ctx);
+            assert!(unit.width() > arrival_viewport().width());
+            assert!(unit.height() > arrival_viewport().height());
+            if reading_start {
+                close_to(unit.top(), arrival_viewport().top());
+                close_to(unit.right(), arrival_viewport().right());
+            } else {
+                assert_eq!((app.fs_zoom, app.fs_pan), before);
+            }
+            assert!(app.fs_initial_placement_request.is_none());
+            assert_eq!(app.fs_zoom, before.0);
+        })
+        .drop_without_applying_deltas();
+        let settled = (app.fs_zoom, app.fs_pan, app.fs_initial_placement_request);
+        assert!(app.apply_fullscreen_spread_mode(&ctx, 0, SpreadMode::Ltr));
+        assert_eq!(
+            (app.fs_zoom, app.fs_pan, app.fs_initial_placement_request),
+            settled,
+            "the same normalized mode is a no-op"
+        );
+    }
+}
+
+#[test]
+fn initial_placement_composition_switch_same_mode_shift_reset_aligns_new_pair() {
+    for reading_start in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = composition_switch_app(&ctx, SpreadMode::Ltr, false, ReadingDirection::Ltr);
+        if !reading_start {
+            app.settings.fullscreen_page_start_position = FullscreenPageStartPosition::Center;
+        }
+        assert!(app.set_live_spread_shift(1));
+        assert_eq!(app.spread_shift_anchor_idx(), Some(1));
+        app.fullscreen_idx = Some(1);
+        assert_eq!(
+            app.spread_display_composition_for_anchor(1)
+                .navigation_pages(),
+            vec![1, 2]
+        );
+        app.fs_zoom = 1.5;
+        app.set_fs_pan_from_input(1.5, egui::vec2(53.0, -71.0));
+        frame(&ctx, |ui, ctx| {
+            paint_composition_switch_unit(&mut app, ui, ctx);
+        })
+        .drop_without_applying_deltas();
+        assert!(app.fs_initial_placement_request.is_none());
+        assert!(app.apply_fullscreen_spread_mode(&ctx, 1, SpreadMode::Ltr));
+        assert_eq!(app.spread_shift_anchor_idx(), None);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!(
+            app.spread_display_composition_for_anchor(0)
+                .navigation_pages(),
+            vec![0, 1]
+        );
+        // Center retains the released open-on-normalize reset. ReadingStart
+        // preserves the mode operation's zoom across that same normalization.
+        let expected_zoom = if reading_start { 1.5 } else { 1.0 };
+        assert_eq!(app.fs_zoom, expected_zoom);
+        assert_eq!(app.fs_pan, egui::Vec2::ZERO);
+        assert_eq!(app.fs_initial_placement_request.is_some(), reading_start);
+        if let Some(request) = app.fs_initial_placement_request {
+            assert_eq!(request.anchor_idx, 0);
+            assert_eq!(
+                (request.origin_zoom, request.origin_pan),
+                (1.5, egui::Vec2::ZERO)
+            );
+        }
+        frame(&ctx, |ui, ctx| {
+            let unit = paint_composition_switch_unit(&mut app, ui, ctx);
+            assert!(unit.width() > arrival_viewport().width());
+            assert!(unit.height() > arrival_viewport().height());
+            if reading_start {
+                close_to(unit.top(), arrival_viewport().top());
+                close_to(unit.left(), arrival_viewport().left());
+            } else {
+                close_to(unit.center().x, arrival_viewport().center().x);
+                close_to(unit.center().y, arrival_viewport().center().y);
+            }
+            assert_eq!(app.fs_zoom, expected_zoom);
+            assert!(app.fs_initial_placement_request.is_none());
+        })
+        .drop_without_applying_deltas();
+    }
+}
+
+#[test]
+fn initial_placement_composition_switch_owned_view_mode_aligns_without_changing_book() {
+    use crate::book_composition::{
+        BookCompositionService, ReadingDirection as CompositionDirection,
+    };
+    for direction in [CompositionDirection::Ltr, CompositionDirection::Rtl] {
+        for reading_start in [false, true] {
+            let ctx = egui::Context::default();
+            let book = crate::book_composition::fixtures::four_page_book(direction);
+            let mut app = crate::ui_fullscreen::book_composition_tests::composed_app(&book);
+            app.fullscreen_idx = Some(0);
+            app.spread_mode = SpreadMode::Single;
+            app.reading_flow = ReadingFlow::Paged;
+            app.settings.fullscreen_fit_mode = FullscreenFitMode::Original;
+            app.settings.page_turn_animation_enabled = false;
+            app.settings.fullscreen_page_start_position = if reading_start {
+                FullscreenPageStartPosition::ReadingStart
+            } else {
+                FullscreenPageStartPosition::Center
+            };
+            install_composition_switch_materials(&mut app, &ctx, false);
+            let (service, owner) = BookCompositionService::spawn_at(
+                app.tmp.path().join("initial-placement-view-mode"),
+                None,
+            )
+            .unwrap();
+            app.install_book_composition_runtime(service);
+            assert!(app.composition_owns_view_settings());
+            let token = app.composed_layout_token();
+            let layout = app.composed_book_layout().unwrap().clone();
+            for requested in [FullscreenViewMode::Spread, FullscreenViewMode::Single] {
+                app.fs_zoom = 1.5;
+                app.set_fs_pan_from_input(1.5, egui::vec2(53.0, -71.0));
+                let before = (app.fs_zoom, app.fs_pan);
+                app.apply_fullscreen_view_mode(&ctx, 0, requested);
+                assert_eq!(FullscreenViewMode::from_legacy(app.spread_mode), requested);
+                assert_eq!(app.composed_layout_token(), token);
+                assert_eq!(app.composed_book_layout().unwrap(), &layout);
+                assert_eq!(app.fs_zoom, before.0);
+                assert_eq!(app.fs_initial_placement_request.is_some(), reading_start);
+                if reading_start {
+                    assert_eq!(app.fs_pan, egui::Vec2::ZERO);
+                    let request = app.fs_initial_placement_request.unwrap();
+                    assert_eq!(request.anchor_idx, 0);
+                    assert_eq!(
+                        (request.origin_zoom, request.origin_pan),
+                        (before.0, egui::Vec2::ZERO)
+                    );
+                } else {
+                    assert_eq!((app.fs_zoom, app.fs_pan), before);
+                }
+                frame(&ctx, |ui, ctx| {
+                    let unit = paint_composition_switch_unit(&mut app, ui, ctx);
+                    assert!(unit.width() > arrival_viewport().width());
+                    assert!(unit.height() > arrival_viewport().height());
+                    if reading_start {
+                        close_to(unit.top(), arrival_viewport().top());
+                        match app
+                            .spread_mode
+                            .reading_direction()
+                            .unwrap_or(app.reading_direction)
+                        {
+                            ReadingDirection::Ltr => {
+                                close_to(unit.left(), arrival_viewport().left())
+                            }
+                            ReadingDirection::Rtl => {
+                                close_to(unit.right(), arrival_viewport().right())
+                            }
+                        }
+                    } else {
+                        assert_eq!((app.fs_zoom, app.fs_pan), before);
+                    }
+                    assert_eq!(app.fs_zoom, before.0);
+                    assert!(app.fs_initial_placement_request.is_none());
+                })
+                .drop_without_applying_deltas();
+                let settled = (app.fs_zoom, app.fs_pan, app.fs_initial_placement_request);
+                app.apply_fullscreen_view_mode(&ctx, 0, requested);
+                assert_eq!(
+                    (app.fs_zoom, app.fs_pan, app.fs_initial_placement_request),
+                    settled
+                );
+            }
+            owner.shutdown_and_join();
+        }
+    }
+}
+
+#[test]
+fn initial_placement_composition_edit_pivot_clears_without_requesting_entry_alignment() {
+    for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
+        let ctx = egui::Context::default();
+        let mut app = composition_switch_app(&ctx, mode, false, ReadingDirection::Rtl);
+        frame(&ctx, |ui, ctx| {
+            paint_composition_switch_unit(&mut app, ui, ctx);
+        })
+        .drop_without_applying_deltas();
+        let (target, pivot) = app.plan_page_edit_pivot(0);
+        assert!(
+            pivot.is_some(),
+            "the edit must temporarily leave an actual spread"
+        );
+        app.fs_zoom = 1.5;
+        app.set_fs_pan_from_input(1.5, egui::vec2(53.0, -71.0));
+        app.request_fs_initial_placement(0);
+        app.enter_page_edit_single_view(target);
+        assert_eq!(app.spread_mode, SpreadMode::Single);
+        assert_eq!((app.fs_zoom, app.fs_pan), (1.0, egui::Vec2::ZERO));
+        assert!(app.fs_initial_placement_request.is_none());
+        frame(&ctx, |ui, ctx| {
+            let unit = paint_composition_switch_unit(&mut app, ui, ctx);
+            close_to(unit.center().y, arrival_viewport().center().y);
+            assert!(unit.top() < arrival_viewport().top());
+            assert!(app.fs_initial_placement_request.is_none());
+        })
+        .drop_without_applying_deltas();
+        app.fs_zoom = 1.5;
+        app.set_fs_pan_from_input(1.5, egui::vec2(53.0, -71.0));
+        app.request_fs_initial_placement(target);
+        app.leave_page_edit_single_view(pivot);
+        assert_eq!(app.spread_mode, mode);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!((app.fs_zoom, app.fs_pan), (1.0, egui::Vec2::ZERO));
+        assert!(app.fs_initial_placement_request.is_none());
+        frame(&ctx, |ui, ctx| {
+            let unit = paint_composition_switch_unit(&mut app, ui, ctx);
+            close_to(unit.center().y, arrival_viewport().center().y);
+            assert!(unit.top() < arrival_viewport().top());
+            assert!(app.fs_initial_placement_request.is_none());
+        })
+        .drop_without_applying_deltas();
+    }
+}
+
 #[test]
 fn initial_placement_single_provisional_resize_restores_origin_before_complete_arrival() {
     let small = arrival_viewport();

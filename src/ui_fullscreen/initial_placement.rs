@@ -56,6 +56,25 @@ impl App {
                 });
     }
 
+    /// Accepted composition changes start a new unit at the retained magnification.
+    /// Normalizing its anchor may have gone through open and reset that zoom.
+    pub(crate) fn request_fs_initial_placement_after_composition_change(
+        &mut self,
+        previous_zoom: f32,
+    ) {
+        if !self.reading_flow.is_paged()
+            || self.settings.fullscreen_page_start_position.normalized()
+                != crate::settings::FullscreenPageStartPosition::ReadingStart
+        {
+            return;
+        }
+        if let Some(anchor_idx) = self.fullscreen_idx {
+            self.fs_zoom = previous_zoom;
+            self.fs_pan = egui::Vec2::ZERO;
+            self.request_fs_initial_placement(anchor_idx);
+        }
+    }
+
     /// Run after this context's input, including on native media's early return.
     pub(super) fn retire_fs_initial_placement_request(&mut self) {
         if self.fs_initial_placement_request.is_some()

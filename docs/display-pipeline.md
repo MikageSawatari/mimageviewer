@@ -1929,7 +1929,9 @@ PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行
 #### ページ切替直後の初期 pan (§1.726)
 
 `fullscreen_page_start_position` は `Center` (既定) / `ReadingStart`。後者だけが、受理済み open と
-同一画像内の受理済み分割移動で context 所有の要求を作る。現在の表示単位を描く
+同一画像内の受理済み分割移動、paged のページ構成切替で context 所有の要求を作る。
+構成が実際に変わったときは pan を 0 に戻し、切替前の倍率を保って新しい表示単位を配置する。
+同じ構成の選び直し・編集ツールの一時的な単ページ化／復帰・読書方向だけの切替は新入口に含めない。現在の表示単位を描く
 frame で、固定 HUD・パネルを除いた viewport と pan 0 の canonical placement を使い、描くページの
 paint rect の和（描く白 companion を含む）から初期 pan を求める。縦の超過は上端、横の超過は
 実効読書方向の始端へ合わせ、収まる軸の既存配置と倍率は保つ。同じ frame の最終 placement に反映する。

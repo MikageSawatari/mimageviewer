@@ -29957,6 +29957,7 @@ impl App {
                             || requested_flow != reading_flow_before
                             || requested_direction != reading_direction_before
                         {
+                            let composition_zoom_before = self.fs_zoom;
                             let extracted = self.extracted_result_surface().is_some();
                             let requested_spread = if extracted {
                                 crate::app::book_materialization::extracted_view_mode(requested_spread, reading_direction_before)
@@ -30016,6 +30017,11 @@ impl App {
                                         self.disable_non_paged_fullscreen_modes(fs_idx);
                                     }
                                     ctx.request_repaint();
+                                }
+                                if requested_spread != spread_before && self.spread_mode != spread_before {
+                                    self.request_fs_initial_placement_after_composition_change(
+                                        composition_zoom_before,
+                                    );
                                 }
                             }
                         }
@@ -45748,8 +45754,10 @@ impl App {
             mode
         };
         if mode == self.spread_mode {
+            let previous_zoom = self.fs_zoom;
             if self.reset_live_spread_shift(false) {
                 self.normalize_spread_position(ctx);
+                self.request_fs_initial_placement_after_composition_change(previous_zoom);
             }
             return true;
         }
@@ -45760,6 +45768,7 @@ impl App {
             return false;
         }
         self.invalidate_similar_preview();
+        let previous_zoom = self.fs_zoom;
         self.spread_mode = mode;
         if self.extracted_result_surface().is_none() {
             self.settings.update_active_favorite_spread_mode(mode);
@@ -45784,6 +45793,7 @@ impl App {
                 ContinuousAdmissionEpisode::ModeTransition(previous);
         }
         self.normalize_spread_position(ctx);
+        self.request_fs_initial_placement_after_composition_change(previous_zoom);
         true
     }
 
@@ -46067,6 +46077,7 @@ impl App {
             return;
         }
         self.invalidate_similar_preview();
+        let previous_zoom = self.fs_zoom;
         self.spread_mode = mode;
         self.reading_direction = direction;
         self.spread_popup_open = false;
@@ -46085,6 +46096,7 @@ impl App {
                 ContinuousAdmissionEpisode::ModeTransition(previous);
         }
         self.normalize_spread_position(ctx);
+        self.request_fs_initial_placement_after_composition_change(previous_zoom);
     }
 
     pub(crate) fn set_reading_flow_for_fullscreen(
