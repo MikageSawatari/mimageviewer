@@ -58,12 +58,13 @@ binding の値は次の三部分。比較 helper はこの owner の読み取り
 1. **単位の意味**: `PresentationDestination` 全体（context/window/viewport）、items generation、
    mode、reading flow、実効 reading direction、slice、要求 anchor、canonical navigation pages と
    `SpreadDisplayUnitFormation`、描画順の全 occurrence（idx/role/navigation_anchor_idx）、
-   singleton placement、supplemented navigation side、白 companion の有無。
+   supplemented navigation side、白 companion の有無。**singleton placement (Left/Right/Center) は
+   意味に含めず、3 の表示条件に置く** (r3 改訂。下の「r3 改訂」参照)。
 2. **内容**: occurrence ごとの item identity と既存 `PageTurnContent` 相当
    （crop、`EditResultKey` の source_gen を除く全項目、実効 params、comic generation、gap）、
    実効の直角/自由回転。source の品質 publication 世代や全体 landscape epoch は含めない。
    source_gen を無視するのは内容の照合だけで、受理した素材の ID/世代の proof は残す。
-3. **view 条件**: viewport rect、placement、pixels_per_point、回転、content_bbox、fit mode/limits、
+3. **view 条件**: singleton placement (Left/Right/Center)、viewport rect、placement、pixels_per_point、回転、content_bbox、fit mode/limits、
    `same_fit_policy` 相当の指定値、clip、underlay と、Native prepare の post-filter/bypass・smoothing・
    upscale source limit。prepared 後は各頁の paint quad/UV/fit input/spine、白 companion rect/clip と
    source/paint ID・世代・coverage/ROI を同じ snapshot の出力証拠として照合する。
@@ -86,6 +87,40 @@ cache 不在を「同じ単位」と見なす fallback や本全体探索は追�
 したがって別 Arc でもこの導出値が同じなら binding は等しい。相方/形成理由/役割/配置の変更、
 同じ singleton のままの回転、resize/clip、編集は上記のいずれかで必ず異なる。
 内容・view は unit 単独からは導けないので、同じ通常 resolver/prepare の入力と出力を併せて束縛する。
+
+### r3 改訂 (2026-11-10、初回実装の停止を受けて)
+
+初回実装 (`fix-1750-wip-impl1` / `4c9416ab2`、未 merge) は、既存契約との矛盾で停止した。読み取り専用の切り分け
+(Sol / xhigh) では、page_turn 関連 47 件の失敗が次のとおりだった。設計矛盾 2、WIP の実装誤り 1、
+テストの準備の問題 44 (うち 42 件は WIP が新しく足した owning viewport / frame の照合に、
+ROOT frame で子 viewport 宛を処理する fixture が合わないもの)。
+
+1. **singleton placement は表示条件**。表紙演出 ON→OFF で側配置から保存済み Center へ戻っても、既存契約
+   (`cover_tests` の `page_turn_cover_cancel_to_off_repaints_saved_center_before_completing` と
+   `page_turn_cover_setting_change_retires_old_flat_evidence_and_commits_continuation_once`) どおり、
+   Completing・保持素材・予約・受理済み continuation を保ち、新しい通常 flat の採用後に一度だけ完了する。
+   使い分け: Offered/Turning は意味・内容・表示条件のどれが変わっても skip/cancel。Completing は意味・内容・
+   受理素材が同じなら表示条件の変更を通常 prepare で再束縛して `NeedFlat` へ戻す。continuation は from/target の
+   意味だけを照合し、配置の変更では退役させない (SpreadShift の本全体 topology 照合は維持)。receipt 採用は
+   完全な binding と実出力証拠を照合し、旧側配置の receipt を Center 出力の証明に流用しない。
+   新しい可変 owner は作らず、同じ immutable binding から「意味」「表示条件」「完全出力」の 3 投影を定義する。
+2. **既存に無い owning viewport / frame の照合を足さない**。destination の照合は base (`fd0d80bc3`) の
+   `same_material_and_geometry` 等にある範囲のまま binding へ移す。continuation 消費・pending ready 配送に
+   新しい「所有 viewport の frame でだけ処理する」条件を加えない。§1.750 の修正に不要で、42 件の fixture の
+   書き直しと、ROOT/子 viewport の配送規則の変更 (detached 凍結の範囲) を伴うため。必要なら別項目で扱う。
+3. **WIP の誤り**: `page_turn_unit_matches_current` は、保存済みの単位 A の資格を、最後に描いた別単位 B の
+   `fullscreen_page_layout` と比べてはならない。A の現在の意味・表示条件は A の anchor から通常 resolver で導き、
+   「今回の出力が A だった」証明とは分けて照合する (`wait_indicator_tests` の
+   `page_wait_indicator_appears_for_holdover_after_returning_to_a_stale_flat_unit`)。
+4. **テストの準備の修正は 2 件だけ**: 動画の拒否を確かめる 2 件 (`page_turn_actual_f12_continuation_keeps_existing_video_refusal`、
+   `page_turn_actual_completion_video_hands_off_both_still_routes`) は、continuation 捕捉後に item を Image→Video へ
+   直接書き換えている。動画拒否の契約は保ち、Video を捕捉前から置く形にする。捕捉後の item 変更の拒否は別の
+   binding 失効テストにする。§1.750 の回帰のうち child viewport の frame 順を前提にした 2 件
+   (`regression_1750_root_service_preserves_child_ready_until_its_own_frame` ほか) は、2 の方針に合わせて
+   既存の配送規則の範囲で書き直すか削る。
+5. 進め方: 製品修正は一つのまとまりのまま。base で成功していた 324 件 (うち既知の更新対象は
+   `crop_legacy_accepted_basis_rejects_changed_document_and_owner` の等値 Arc 再生成の期待だけ) をすべて維持し、
+   §1.750 の 4 件を成功させる。
 
 ### 導出の順序と共用
 
