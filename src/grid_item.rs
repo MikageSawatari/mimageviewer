@@ -551,6 +551,7 @@ pub enum ThumbnailState {
     /// `source_coverage` は素材の生成時に収録した範囲と crop 前の座標寸法を保持する。
     /// `layout_dims` は PDF page box の 1/1000 point 寸法で、raster の丸めと独立する。
     Loaded {
+        cover: crate::cover_source_scope::LoadedCoverIdentity,
         tex: egui::TextureHandle,
         origin: crate::thumb_loader::ThumbLoadOrigin,
         /// 非破壊編集プレビュー由来。通常の低品質 catalog cache と異なり、
@@ -585,6 +586,7 @@ impl ThumbnailState {
         let display_basis =
             Self::raster_thumbnail_display_basis(tex.size(), source_coverage, source_dims);
         Self::Loaded {
+            cover: crate::cover_source_scope::LoadedCoverIdentity::Unrotatable,
             tex,
             origin,
             from_edit_preview,

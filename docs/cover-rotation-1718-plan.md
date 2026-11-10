@@ -1,6 +1,7 @@
 # §1.718 本のタイルの表紙を、表紙ページの回転に合わせる (設計)
 
-- 状態: 設計 (2026-11-10)。前回 (2026-11-06) は設計段階で止めた。経緯・退けた案・前回の指摘は
+- 状態: 実装済み・関連自動テスト成功 (2026-11-10、`fix-718-cover-rotation`、未コミット)。独立 completion review、
+  全体 gate、検証ビルド・実機確認は設計担当へ引き継ぐ。前回 (2026-11-06) は設計段階で止めた。経緯・退けた案・前回の指摘は
   [next-release-backlog.md §1.718](next-release-backlog.md) と下の §8。
 - 範囲: 一覧の本のタイル (Folder / ZipFile / PdfFile (EPUB 含む) / ConvertibleArchive / ZipDir /
   SearchContainer / Stack)、詳細表示の hover サムネ、mIV Remote の本のタイル。
@@ -315,3 +316,18 @@ pub(crate) enum CoverIdentity {
 - [catalog-design.md](catalog-design.md) に `cover_key` 列と `Legacy` の扱い。
 - Remote の本のタイルの回転を [web-remote-plan.md](web-remote-plan.md) の該当節へ。
 - バックログ §1.718 の状態。製品ページ・マニュアルは回転の説明を確かめ、本のタイルに触れていなければ変更しない。
+
+## 12. 実装メモ
+
+- 角度は既存のApp所有フィールド `rotation_page_keys` 自体を `BTreeMap<String, Rotation>` に置換し、更新・snapshot置換helperを経由する。
+  既存の存在判定は `PageEditKeys` traitで集合とmapのキーに共通化した。
+- workerの `CoverIdentity` と表示素材の `LoadedCoverIdentity` を分け、後者の `Legacy` だけが要求ownerから受け取ったscopeを保持する。
+  現行のサムネイルCPU待ち行列は `ThumbnailRequests` 内の `ThumbMsg` であり、画素とidentityをそのまま保持する。
+  `fs_upload_backlog` は別系統の全画面素材の待ち行列なので、新しいサムネイル状態は追加しない。
+- Legacyを元ソースから作り直せなかった結果は既存の `FinalCache` originで返す。既に元ソースを試した同じ表示中に
+  idle upgradeが再試行して旧画素を消さないためで、次の回転操作または再入場は通常の要求として扱う。
+- 共通encoderの保存APIはidentityを必須引数とし、呼出元が実際にencodeしたページを渡す。
+- 製品ページ・マニュアルの回転説明は本のタイルの向きを規定していないため、公開文面は変更しない。
+- 検証は関連 nextest 375 件と追加 producer 19 件が成功 (一部は重複)。既存の loaded grid snapshot 1 件も成功、PNG 変更なし。
+  実行コマンド・途中の失敗と修正・ログは
+  `target/cover-rotation-1718/report.txt` に記録。実機・全体 gate は未実施で、製品 binary は起動していない。

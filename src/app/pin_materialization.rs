@@ -1,6 +1,7 @@
 //! Worker-only pin cache preparation. Terminal data contains memory resources only.
 use super::{CurrentViewRefresh, GridItem};
 use crate::catalog::{CacheEntry, CatalogDb, FolderThumbProvenance};
+use crate::cover_identity::CoverIdentity;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
@@ -215,10 +216,13 @@ impl Request {
                 }
                 continue;
             };
+            let cover =
+                CoverIdentity::Page(crate::adjustment_db::normalize_path(&resolved.abs_path));
             if map.get(&key).is_some_and(|entry| {
                 entry.mtime == resolved.mtime
                     && entry.file_size == resolved.file_size
                     && entry.jpeg_data == webp
+                    && entry.cover == cover
             }) {
                 continue;
             }
@@ -228,6 +232,7 @@ impl Request {
                     mtime: resolved.mtime,
                     file_size: resolved.file_size,
                     jpeg_data: webp,
+                    cover,
                     source_dims: None,
                     layout_dims: None,
                     folder_provenance: Some(FolderThumbProvenance::Seeded),

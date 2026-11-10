@@ -66,6 +66,8 @@ pub mod ai;
 pub mod ai_caption_db;
 mod app;
 pub(crate) mod caption_display_cache;
+pub mod cover_identity;
+pub mod cover_source_scope;
 pub mod depth_addon;
 pub(crate) mod depth_estimation;
 pub(crate) mod depth_preprocess;

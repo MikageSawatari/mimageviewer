@@ -92,11 +92,17 @@ impl App {
             &mut self.mask_page_keys,
             &mut self.conceal_page_keys,
             &mut self.comic_page_keys,
-            &mut self.rotation_page_keys,
             &mut self.export_crop_page_keys,
         ] {
             keys.retain(|key| !deleted.contains(key.as_str()));
         }
+        let removed_rotations = self
+            .rotation_page_keys
+            .keys()
+            .filter(|key| deleted.contains(key.as_str()))
+            .map(|key| (key.clone(), crate::rotation_db::Rotation::None))
+            .collect::<Vec<_>>();
+        self.update_rotation_page_owner(removed_rotations);
         self.invalidate_tag_apply_suggestions();
         self.reload_open_metadata_views_after_cleanup();
     }

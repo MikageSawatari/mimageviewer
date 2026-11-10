@@ -1,4 +1,5 @@
 mod ai_failure_feedback;
+mod cover_rotation;
 mod diagnostic_checkpoint;
 use crate::previous_run_diagnostics::checkpoint::{
     ActivityLease, CheckpointPublisher, JobLease, JobMetadata, JobStage, JobUpdate,
@@ -18813,8 +18814,8 @@ pub struct App {
     pub(crate) conceal_page_keys: std::collections::BTreeSet<String>,
     /// テキスト注釈を持つ page_path キー集合 (状態フィルタの親コンテナ判定用)。
     pub(crate) comic_page_keys: std::collections::BTreeSet<String>,
-    /// 非破壊回転を持つ page_path / video key 集合 (状態フィルタの親コンテナ判定用)。
-    pub(crate) rotation_page_keys: std::collections::BTreeSet<String>,
+    /// 非破壊回転の非 0 角度の正本 (page_path / video key)。
+    pub(crate) rotation_page_keys: std::collections::BTreeMap<String, crate::rotation_db::Rotation>,
     /// 最後段 crop を持つ page_path キー集合 (親コンテナへの「切」状態ロールアップ用)。
     pub(crate) export_crop_page_keys: std::collections::BTreeSet<String>,
     /// お気に入り単位の標準パラメータ: favorite_id → AdjustParams。
@@ -43053,6 +43054,7 @@ impl App {
                 entry.source_dims,
                 entry.layout_dims,
                 &entry.jpeg_data,
+                &entry.cover,
             ) {
                 Ok(b) => b,
                 Err(e) => {
@@ -43138,6 +43140,7 @@ impl App {
                 entry.source_dims,
                 entry.layout_dims,
                 &entry.jpeg_data,
+                &entry.cover,
             );
             crate::perf::event("nav", "virtual_writeback", Some(&parent_key), 0, &[]);
         }
@@ -46105,7 +46108,10 @@ impl App {
                 continue;
             };
 
-            // 既存 seed が完全一致 (mtime/size + bytes) なら書き直さない (典型ケース)。
+            let cover = crate::cover_identity::CoverIdentity::Page(
+                crate::adjustment_db::normalize_path(&resolved.abs_path),
+            );
+            // Identity is part of the seed: old rows are upgraded even if pixels match.
             let already_seeded = cache_map
                 .read()
                 .ok()
@@ -46114,6 +46120,7 @@ impl App {
                         entry.mtime == resolved.mtime
                             && entry.file_size == resolved.file_size
                             && entry.jpeg_data == webp
+                            && entry.cover == cover
                     })
                 })
                 .unwrap_or(false);
@@ -46126,6 +46133,7 @@ impl App {
                 resolved.file_size,
                 None,
                 &webp,
+                &cover,
             ) {
                 Ok(true) => {}
                 Ok(false) => {
@@ -46156,6 +46164,7 @@ impl App {
                         mtime: resolved.mtime,
                         file_size: resolved.file_size,
                         jpeg_data: webp,
+                        cover,
                         source_dims: None,
                         layout_dims: None,
                         folder_provenance: Some(crate::catalog::FolderThumbProvenance::Seeded),
@@ -46209,6 +46218,9 @@ impl App {
                             mtime: 0,
                             file_size: 0,
                             jpeg_data: webp,
+                            cover: crate::cover_identity::CoverIdentity::Page(
+                                crate::adjustment_db::normalize_path(&video_path),
+                            ),
                             source_dims: None,
                             layout_dims: None,
                             folder_provenance: None,
@@ -46424,6 +46436,7 @@ impl App {
                     cached.mtime == entry.mtime
                         && cached.file_size == entry.file_size
                         && cached.jpeg_data == entry.jpeg_data
+                        && cached.cover == entry.cover
                 });
             if already_cached {
                 continue;
@@ -46434,6 +46447,7 @@ impl App {
                 entry.file_size,
                 entry.source_dims,
                 &entry.jpeg_data,
+                &entry.cover,
             ) {
                 Ok(true) => {
                     if let Ok(mut map) = cache_map.write() {
@@ -49062,11 +49076,18 @@ impl App {
             &mut self.mask_page_keys,
             &mut self.conceal_page_keys,
             &mut self.comic_page_keys,
-            &mut self.rotation_page_keys,
             &mut self.export_crop_page_keys,
         ] {
             set.retain(|key| !matches_key(key));
         }
+
+        let removed_rotations = self
+            .rotation_page_keys
+            .keys()
+            .filter(|key| matches_key(key))
+            .map(|key| (key.clone(), crate::rotation_db::Rotation::None))
+            .collect::<Vec<_>>();
+        self.update_rotation_page_owner(removed_rotations);
 
         if self
             .last_book_resume
@@ -49448,7 +49469,7 @@ impl App {
                     || self.mask_page_keys.contains(key)
                     || self.conceal_page_keys.contains(key)
                     || self.comic_page_keys.contains(key)
-                    || self.rotation_page_keys.contains(key)
+                    || self.rotation_page_keys.contains_key(key)
                     || self.export_crop_page_keys.contains(key)
             }) || self.adjustment_page_params.contains_key(&item_index)
                 || self.local_adjust_pages.contains(&item_index)
@@ -50298,7 +50319,7 @@ impl App {
         self.mask_page_keys = snapshot.masked;
         self.conceal_page_keys = snapshot.concealed;
         self.comic_page_keys = snapshot.comic;
-        self.rotation_page_keys = snapshot.rotated;
+        self.replace_rotation_page_owner(snapshot.rotated);
         self.export_crop_page_keys = snapshot.cropped;
     }
 
@@ -51561,7 +51582,17 @@ impl App {
         rewrite_key_set_for_rename(&mut self.mask_page_keys, &old_k, &new_k);
         rewrite_key_set_for_rename(&mut self.conceal_page_keys, &old_k, &new_k);
         rewrite_key_set_for_rename(&mut self.comic_page_keys, &old_k, &new_k);
-        rewrite_key_set_for_rename(&mut self.rotation_page_keys, &old_k, &new_k);
+        // Shell rename can be adopted twice. Preserve destination writes and do not
+        // clear the destination when the old keys have already been transferred.
+        let mut updates = Vec::new();
+        for (key, angle) in Self::rotation_page_scope_rows(&self.rotation_page_keys, &old_k) {
+            let destination = renamed_key_for(&key, &old_k, &new_k).expect("source scope");
+            if !self.rotation_page_keys.contains_key(&destination) {
+                updates.push((destination, angle));
+            }
+            updates.push((key, crate::rotation_db::Rotation::None));
+        }
+        self.update_rotation_page_owner(updates);
         rewrite_key_set_for_rename(&mut self.export_crop_page_keys, &old_k, &new_k);
     }
 
@@ -55878,6 +55909,8 @@ impl App {
     /// UI admission stamps the projected context once. Derived worker requests
     /// inherit this immutable ticket; the request owner assigns its ID at begin.
     fn attach_viewer_thumbnail_context(&self, req: &mut LoadRequest) {
+        req.books_root = self.settings.book_root.clone();
+        req.prepare_cover_refresh(&self.rotation_page_keys);
         req.input_seq = self.input_seq;
         req.items_gen = self.items_generation;
         req.pdf_render_validity =
@@ -56683,6 +56716,7 @@ impl App {
             }
             let pixels = msg.into_pixels().expect("owner queues only image messages");
             let crate::thumb_loader::ThumbPixels {
+                cover,
                 image: color_image,
                 origin,
                 from_edit_preview,
@@ -56691,6 +56725,20 @@ impl App {
                 source_dims,
                 layout_dims,
             } = pixels;
+            let (scope, refreshed_legacy) = self
+                .requested
+                .cover_facts(i, request_id)
+                .expect("queued thumbnail retains immutable request facts");
+            if cover == crate::cover_identity::CoverIdentity::Legacy
+                && !refreshed_legacy
+                && scope
+                    .as_ref()
+                    .is_some_and(|scope| scope.has_rotation(&self.rotation_page_keys))
+            {
+                self.evict_thumbnail_for_reload(i);
+                ctx.request_repaint();
+                continue;
+            }
             if self.reject_stale_edit_preview_thumbnail_result(i, origin) {
                 continue;
             }
@@ -56756,6 +56804,9 @@ impl App {
                     layout_dims,
                 );
                 self.thumbnails[i] = ThumbnailState::Loaded {
+                    cover: crate::cover_source_scope::LoadedCoverIdentity::from_material(
+                        cover, scope,
+                    ),
                     display_basis,
                     tex: handle,
                     origin,
@@ -57586,9 +57637,8 @@ impl App {
             .edit_preview_cache
             .as_ref()
             .map(crate::edit_preview_cache::EditPreviewCacheService::epoch);
-        let Some(request_id) = self.requested.begin(
-            idx,
-            req.items_gen,
+        let Some(request_id) = self.requested.begin_for_request(
+            &req,
             ThumbnailRequestKind::Normal,
             edit_preview_epoch,
         ) else {
@@ -58087,9 +58137,8 @@ impl App {
             }
             let _q_before = q.len();
             for mut r in new_regular {
-                if let Some(id) = requested.begin(
-                    r.idx,
-                    r.items_gen,
+                if let Some(id) = requested.begin_for_request(
+                    &r,
                     ThumbnailRequestKind::Normal,
                     edit_preview_epoch,
                 ) {
@@ -58139,9 +58188,8 @@ impl App {
                     thumbnail_is_foreground(r.idx, cur_vis_range, interactive_thumbnail_pages);
             }
             for mut r in new_heavy {
-                if let Some(id) = requested.begin(
-                    r.idx,
-                    r.items_gen,
+                if let Some(id) = requested.begin_for_request(
+                    &r,
                     ThumbnailRequestKind::Normal,
                     edit_preview_epoch,
                 ) {
@@ -58692,9 +58740,8 @@ impl App {
                 .as_ref()
                 .map(crate::edit_preview_cache::EditPreviewCacheService::epoch);
             for mut r in reqs {
-                if let Some(id) = self.requested.begin(
-                    r.idx,
-                    r.items_gen,
+                if let Some(id) = self.requested.begin_for_request(
+                    &r,
                     ThumbnailRequestKind::Upgrade,
                     edit_preview_epoch,
                 ) {
@@ -74984,8 +75031,8 @@ impl App {
         }
     }
 
-    fn page_key_set_has_prefix(keys: &std::collections::BTreeSet<String>, prefix: &str) -> bool {
-        keys.range(prefix.to_owned()..)
+    fn page_key_set_has_prefix(keys: &impl crate::rotation_db::PageEditKeys, prefix: &str) -> bool {
+        keys.page_keys_from(prefix.to_owned())
             .next()
             .is_some_and(|key| key.starts_with(prefix))
     }
@@ -75031,7 +75078,7 @@ impl App {
     }
 
     fn folder_contains_page_key(
-        keys: &std::collections::BTreeSet<String>,
+        keys: &impl crate::rotation_db::PageEditKeys,
         path: &std::path::Path,
         include_descendants: bool,
     ) -> bool {
@@ -75039,7 +75086,7 @@ impl App {
         if include_descendants {
             return Self::page_key_set_has_prefix(keys, &prefix);
         }
-        for key in keys.range(prefix.clone()..) {
+        for key in keys.page_keys_from(prefix.clone()) {
             if !key.starts_with(&prefix) {
                 break;
             }
@@ -75051,11 +75098,11 @@ impl App {
     }
 
     fn folder_contains_one_level_edit_key(
-        keys: &std::collections::BTreeSet<String>,
+        keys: &impl crate::rotation_db::PageEditKeys,
         path: &std::path::Path,
     ) -> bool {
         let prefix = Self::normalized_folder_page_prefix(path);
-        for key in keys.range(prefix.clone()..) {
+        for key in keys.page_keys_from(prefix.clone()) {
             if !key.starts_with(&prefix) {
                 break;
             }
@@ -75067,7 +75114,7 @@ impl App {
     }
 
     fn archive_contains_page_key(
-        keys: &std::collections::BTreeSet<String>,
+        keys: &impl crate::rotation_db::PageEditKeys,
         path: &std::path::Path,
     ) -> bool {
         let prefix = Self::normalized_archive_page_prefix(path);
@@ -75082,7 +75129,7 @@ impl App {
 
     fn archive_or_converted_cache_contains_page_key(
         &self,
-        keys: &std::collections::BTreeSet<String>,
+        keys: &impl crate::rotation_db::PageEditKeys,
         path: &std::path::Path,
     ) -> bool {
         Self::archive_contains_page_key(keys, path)
@@ -75092,7 +75139,7 @@ impl App {
     }
 
     fn zip_dir_contains_page_key(
-        keys: &std::collections::BTreeSet<String>,
+        keys: &impl crate::rotation_db::PageEditKeys,
         zip_path: &std::path::Path,
         dir_prefix: &str,
     ) -> bool {
@@ -75106,7 +75153,7 @@ impl App {
 
     fn zip_dir_or_converted_cache_contains_page_key(
         &self,
-        keys: &std::collections::BTreeSet<String>,
+        keys: &impl crate::rotation_db::PageEditKeys,
         zip_path: &std::path::Path,
         dir_prefix: &str,
     ) -> bool {
@@ -75119,7 +75166,7 @@ impl App {
     }
 
     fn zip_dir_contains_one_level_edit_key(
-        keys: &std::collections::BTreeSet<String>,
+        keys: &impl crate::rotation_db::PageEditKeys,
         zip_path: &std::path::Path,
         dir_prefix: &str,
         is_archive: bool,
@@ -75132,7 +75179,7 @@ impl App {
         if is_archive {
             return Self::page_key_set_has_prefix(keys, &prefix);
         }
-        for key in keys.range(prefix.clone()..) {
+        for key in keys.page_keys_from(prefix.clone()) {
             if !key.starts_with(&prefix) {
                 break;
             }
@@ -75145,7 +75192,7 @@ impl App {
 
     fn zip_dir_or_converted_cache_contains_one_level_edit_key(
         &self,
-        keys: &std::collections::BTreeSet<String>,
+        keys: &impl crate::rotation_db::PageEditKeys,
         zip_path: &std::path::Path,
         dir_prefix: &str,
         is_archive: bool,
@@ -75163,7 +75210,7 @@ impl App {
     fn item_has_one_level_edit_key(
         &self,
         idx: usize,
-        keys: &std::collections::BTreeSet<String>,
+        keys: &impl crate::rotation_db::PageEditKeys,
     ) -> bool {
         let Some(item) = self.items.get(idx) else {
             return false;
@@ -75171,7 +75218,7 @@ impl App {
         match item {
             GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => self
                 .page_path_key(idx)
-                .is_some_and(|key| keys.contains(&key)),
+                .is_some_and(|key| keys.contains_page_key(&key)),
             GridItem::Folder(path) => Self::folder_contains_one_level_edit_key(keys, path),
             GridItem::ZipFile(path) | GridItem::PdfFile(path) => {
                 Self::archive_contains_page_key(keys, path)
@@ -75205,7 +75252,7 @@ impl App {
     fn item_has_page_edit_key(
         &self,
         idx: usize,
-        keys: &std::collections::BTreeSet<String>,
+        keys: &impl crate::rotation_db::PageEditKeys,
         include_descendants: bool,
     ) -> bool {
         let Some(item) = self.items.get(idx) else {
@@ -75214,7 +75261,7 @@ impl App {
         match item {
             GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => self
                 .page_path_key(idx)
-                .is_some_and(|key| keys.contains(&key)),
+                .is_some_and(|key| keys.contains_page_key(&key)),
             GridItem::Folder(path) => {
                 Self::folder_contains_page_key(keys, path, include_descendants)
             }
@@ -75255,7 +75302,7 @@ impl App {
                     .is_some_and(|rot| !rot.is_none())
                     || self
                         .rotation_key_for_idx(idx)
-                        .is_some_and(|key| self.rotation_page_keys.contains(&key))
+                        .is_some_and(|key| self.rotation_page_keys.contains_key(&key))
             }
             _ => self.item_has_one_level_edit_key(idx, &self.rotation_page_keys),
         }
@@ -76743,6 +76790,81 @@ impl App {
         self.apply_rotation(idx, rotation)
     }
 
+    /// Memory-only lookup for cover tiles and hover previews.
+    pub(crate) fn rotation_for_page_key(&self, key: &str) -> crate::rotation_db::Rotation {
+        self.rotation_page_keys
+            .get(key)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn update_rotation_page_owner(
+        &mut self,
+        updates: impl IntoIterator<Item = (String, crate::rotation_db::Rotation)>,
+    ) {
+        let changed =
+            crate::rotation_db::update_page_rotations(&mut self.rotation_page_keys, updates);
+        self.rotation_page_owner_changed(changed);
+    }
+
+    pub(crate) fn replace_rotation_page_owner(
+        &mut self,
+        replacement: std::collections::BTreeMap<String, crate::rotation_db::Rotation>,
+    ) {
+        let changed =
+            crate::rotation_db::replace_page_rotations(&mut self.rotation_page_keys, replacement);
+        self.rotation_page_owner_changed(changed);
+    }
+
+    fn rotation_page_owner_changed(&mut self, changed: Vec<String>) {
+        if changed.is_empty() {
+            return;
+        }
+        self.caption_display
+            .invalidate_rotation_keys(changed.iter().map(String::as_str));
+        self.evict_legacy_cover_thumbnails();
+    }
+
+    /// Preserve snapshot semantics for swaps; destination rows are replaced even for empty sources.
+    pub(crate) fn rotation_page_rename_updates(
+        owner: &std::collections::BTreeMap<String, crate::rotation_db::Rotation>,
+        mappings: &[(String, String)],
+    ) -> Vec<(String, crate::rotation_db::Rotation)> {
+        let scoped = |root: &str| Self::rotation_page_scope_rows(owner, root);
+        let mut updates = std::collections::BTreeMap::new();
+        for (from, to) in mappings {
+            for (key, _) in scoped(from).into_iter().chain(scoped(to)) {
+                updates.insert(key, crate::rotation_db::Rotation::None);
+            }
+        }
+        for (from, to) in mappings {
+            for (key, angle) in scoped(from) {
+                updates.insert(format!("{to}{}", &key[from.len()..]), angle);
+            }
+        }
+        updates.into_iter().collect()
+    }
+
+    pub(crate) fn rotation_page_scope_rows(
+        owner: &std::collections::BTreeMap<String, crate::rotation_db::Rotation>,
+        root: &str,
+    ) -> Vec<(String, crate::rotation_db::Rotation)> {
+        let mut rows = Vec::new();
+        if let Some(angle) = owner.get(root) {
+            rows.push((root.to_owned(), *angle));
+        }
+        for separator in ["/", "::"] {
+            let prefix = format!("{root}{separator}");
+            rows.extend(
+                owner
+                    .range(prefix.clone()..)
+                    .take_while(|(key, _)| key.starts_with(&prefix))
+                    .map(|(key, angle)| (key.clone(), *angle)),
+            );
+        }
+        rows
+    }
+
     fn apply_rotation(
         &mut self,
         idx: usize,
@@ -76764,16 +76886,12 @@ impl App {
                 db.set_key_if_changed(&key, rot)
                     .map_err(|error| format!("回転を保存できませんでした: {error}"))
             });
-        if persist_result.as_ref().is_ok_and(|changed| *changed) {
-            self.caption_display
-                .invalidate_rotation_keys([key.as_str()]);
-        }
         if self.rotation_cache.insert(idx, rot) != Some(rot) {
             self.similar_panel.reset_info_target();
         }
         self.update_prepared_composed_rotation(idx, rot);
         self.reconcile_spread_landscape_with_rotation(idx, rot);
-        Self::set_page_key_presence(&mut self.rotation_page_keys, &key, !rot.is_none());
+        self.update_rotation_page_owner([(key, rot)]);
         self.schedule_current_smart_folder_metadata_refresh(
             smart_folder::SmartFolderMetadataDependency::Edits,
         );
@@ -93095,11 +93213,12 @@ impl App {
             .as_ref()
             .map(crate::comic_db::ComicDb::load_all_comic_keys)
             .unwrap_or_default();
-        self.rotation_page_keys = self
+        let rotations = self
             .rotation_db
             .as_ref()
             .map(crate::rotation_db::RotationDb::load_rotated_keys)
             .unwrap_or_default();
+        self.replace_rotation_page_owner(rotations);
         self.export_crop_page_keys = self
             .export_crop_db
             .as_ref()
@@ -102396,6 +102515,38 @@ fn make_load_request_with_visibility(
     // 共通フィールド (idx/path/mtime/file_size/source_policy) 以外は Default (0/None/false)
     // を基底にして差分だけ上書きする。入力 seq / items_gen は後段のエンキューで上書きされる。
     let base = LoadRequest {
+        cover_scope: {
+            use crate::cover_source_scope::CoverSourceScope as S;
+            match item {
+                GridItem::Folder(path) => Some(S::folder(path)),
+                GridItem::ZipFile(path) | GridItem::PdfFile(path) => Some(S::archive(path)),
+                GridItem::ConvertibleArchive { path, .. } => {
+                    let scope = S::archive(path);
+                    Some(
+                        converted_archive_cache_paths
+                            .get(&crate::path_key::normalize_keep_drive(path))
+                            .and_then(ConvertedArchiveSourceState::load_path)
+                            .map_or(scope.clone(), |load| scope.union(S::archive(load))),
+                    )
+                }
+                GridItem::ZipDir {
+                    zip_path,
+                    dir_prefix,
+                    ..
+                } => {
+                    let scope = S::zip_dir(zip_path, dir_prefix);
+                    Some(
+                        converted_archive_cache_paths
+                            .get(&crate::path_key::normalize_keep_drive(zip_path))
+                            .and_then(ConvertedArchiveSourceState::load_path)
+                            .map_or(scope.clone(), |load| {
+                                scope.union(S::zip_dir(load, dir_prefix))
+                            }),
+                    )
+                }
+                _ => None,
+            }
+        },
         file_type_visibility: visibility.clone(),
         idx,
         mtime,
@@ -102471,6 +102622,16 @@ fn make_load_request_with_visibility(
                         if zip_rel.is_empty() && !entry.is_empty() =>
                     {
                         return Some(LoadRequest {
+                            cover_scope: Some(
+                                crate::cover_source_scope::CoverSourceScope::page(
+                                    crate::adjustment_db::zip_entry_key(load_zip_path, entry),
+                                )
+                                .union(
+                                    crate::cover_source_scope::CoverSourceScope::page(
+                                        crate::adjustment_db::zip_entry_key(zip_path, entry),
+                                    ),
+                                ),
+                            ),
                             path: load_zip_path.to_path_buf(),
                             zip_entry: Some(entry.clone()),
                             edit_preview_key: Some(crate::adjustment_db::zip_entry_key(
@@ -102516,6 +102677,21 @@ fn make_load_request_with_visibility(
                                             resolved.pdf_page,
                                         );
                                     return Some(LoadRequest {
+                                        cover_scope: resolved.zip_entry.as_ref().map(|entry| {
+                                            crate::cover_source_scope::CoverSourceScope::page(
+                                                crate::adjustment_db::zip_entry_key(
+                                                    load_zip_path,
+                                                    entry,
+                                                ),
+                                            )
+                                            .union(
+                                                crate::cover_source_scope::CoverSourceScope::page(
+                                                    crate::adjustment_db::zip_entry_key(
+                                                        zip_path, entry,
+                                                    ),
+                                                ),
+                                            )
+                                        }),
                                         path: load_zip_path.to_path_buf(),
                                         zip_entry: resolved.zip_entry,
                                         pinned_page_adjustment_key: edit_preview_key.clone(),
@@ -102529,6 +102705,8 @@ fn make_load_request_with_visibility(
                                 }
                                 crate::folder_thumb_pins::ResolvedKind::ZipDirRepresentative => {
                                     return Some(LoadRequest {
+                                        cover_scope: resolved.zip_dir_prefix.as_ref().map(|prefix| crate::cover_source_scope::CoverSourceScope::zip_dir(load_zip_path, prefix)
+                                            .union(crate::cover_source_scope::CoverSourceScope::zip_dir(zip_path, prefix))),
                                         path: load_zip_path.to_path_buf(),
                                         zip_dir_prefix: resolved.zip_dir_prefix,
                                         cache_key_override: Some(cache_key),
@@ -103169,6 +103347,9 @@ fn apply_folder_thumb_pin(
         // pinned_key 下に書き戻してしまい、video frame が消える。
         return LoadRequest {
             file_type_visibility: base_req.file_type_visibility.clone(),
+            cover_scope: None,
+            refresh_legacy_cover: false,
+            books_root: base_req.books_root.clone(),
             catalog_target: base_req.catalog_target.for_pinned(),
             parent_row: None,
             parent_observed: Default::default(),
@@ -103274,8 +103455,57 @@ fn apply_folder_thumb_pin(
             && pdf_stamp_policy_for_path(&resolved.abs_path)
                 == crate::thumb_loader::PdfStampPolicy::ResolveInWorker))
         .then(|| Box::new(base_req.clone()));
+    let cover_scope = {
+        use crate::cover_source_scope::CoverSourceScope as S;
+        let scope = match resolved.kind {
+            ResolvedKind::Image => S::page(crate::adjustment_db::normalize_path(&request_path)),
+            ResolvedKind::Folder => S::folder(&request_path),
+            ResolvedKind::ZipEntry => S::page(crate::adjustment_db::zip_entry_key(
+                &request_path,
+                resolved.zip_entry.as_deref().expect("resolved entry"),
+            )),
+            ResolvedKind::PdfPage => S::page(crate::edit_source::page_key_for_pdf(
+                &request_path,
+                resolved.pdf_page.expect("resolved page"),
+            )),
+            ResolvedKind::ZipDirRepresentative => S::zip_dir(
+                &request_path,
+                resolved.zip_dir_prefix.as_deref().unwrap_or(""),
+            ),
+            ResolvedKind::ZipFirstImage
+            | ResolvedKind::ArchiveFirstImage
+            | ResolvedKind::PdfFirstPage => S::archive(&request_path),
+            ResolvedKind::Video => unreachable!("video seed handled above"),
+        };
+        let scope = if matches!(
+            resolved.kind,
+            ResolvedKind::ZipEntry
+                | ResolvedKind::ZipDirRepresentative
+                | ResolvedKind::ArchiveFirstImage
+        ) && request_path != resolved.abs_path
+        {
+            let original = match resolved.kind {
+                ResolvedKind::ZipEntry => S::page(crate::adjustment_db::zip_entry_key(
+                    &resolved.abs_path,
+                    resolved.zip_entry.as_deref().expect("resolved entry"),
+                )),
+                ResolvedKind::ZipDirRepresentative => S::zip_dir(
+                    &resolved.abs_path,
+                    resolved.zip_dir_prefix.as_deref().unwrap_or(""),
+                ),
+                _ => S::archive(&resolved.abs_path),
+            };
+            scope.union(original)
+        } else {
+            scope
+        };
+        Some(scope)
+    };
     LoadRequest {
         file_type_visibility: base_req.file_type_visibility.clone(),
+        cover_scope,
+        refresh_legacy_cover: base_req.refresh_legacy_cover,
+        books_root: base_req.books_root.clone(),
         catalog_target: base_req.catalog_target.for_pinned(),
         parent_row: None,
         parent_observed: Default::default(),
@@ -103847,6 +104077,8 @@ fn finite_video_target_secs(target_secs: f64, duration_secs: f64) -> f64 {
 // `phase_c_support::setup_app` を使う (production 配線を通した回帰は App が要る)。
 #[cfg(test)]
 pub(crate) mod composite_pixels_revision_tests;
+#[cfg(test)]
+mod cover_scope_tests;
 #[cfg(test)]
 mod folder_pane_refresh_tests;
 #[cfg(test)]

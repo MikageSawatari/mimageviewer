@@ -26,7 +26,7 @@ pub(crate) struct RestorePresence {
     pub(crate) conceals: BTreeSet<String>,
     pub(crate) local_adjustments: BTreeSet<String>,
     pub(crate) comics: BTreeSet<String>,
-    pub(crate) rotations: BTreeSet<String>,
+    pub(crate) rotations: BTreeMap<String, crate::rotation_db::Rotation>,
     pub(crate) crops: BTreeSet<String>,
     /// Destination page keys with any restored sidecar-backed edit. The UI uses this union to
     /// evict only thumbnails that may have materialized the pre-restore edit-preview state.
@@ -865,7 +865,7 @@ fn load_restore_runtime_updates(
             Ok(())
         },
     )?;
-    let mut rotations = BTreeSet::new();
+    let mut rotations = BTreeMap::new();
     database_opens += query_family_rows(
         data_dir,
         "rotation.db",
@@ -875,7 +875,12 @@ fn load_restore_runtime_updates(
         &families,
         |row| {
             let key: String = row.get(0).map_err(|error| error.to_string())?;
-            rotations.insert(key);
+            let angle = crate::rotation_db::Rotation::from_degrees(
+                row.get(1).map_err(|error| error.to_string())?,
+            );
+            if !angle.is_none() {
+                rotations.insert(key, angle);
+            }
             Ok(())
         },
     )?;
@@ -2481,7 +2486,7 @@ mod tests {
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(app.comic_docs.get(&target_key), Some(&Vec::new()));
         assert!(report.presence.comics.contains(&target_key));
-        assert!(report.presence.rotations.contains(&target_key));
+        assert!(report.presence.rotations.contains_key(&target_key));
 
         app.apply_content_restore_presence(report.presence);
         app.finish_content_identity_restore(report.errors);

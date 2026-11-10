@@ -1374,6 +1374,7 @@ mod tests {
                         stale.file_size,
                         stale.source_dims,
                         &stale.jpeg_data,
+                        &stale.cover,
                     )
                     .unwrap();
                 }
@@ -1525,6 +1526,7 @@ mod tests {
         ));
         let (jpeg_data, _, _) = crate::catalog::encode_thumb_webp(&image, 8, 100.0).unwrap();
         crate::catalog::CacheEntry {
+            cover: crate::cover_identity::CoverIdentity::Legacy,
             mtime,
             file_size,
             jpeg_data,
@@ -1557,6 +1559,7 @@ mod tests {
             req.file_size,
             green.source_dims,
             &green.jpeg_data,
+            &crate::cover_identity::CoverIdentity::Legacy,
         )
         .unwrap();
         let palette = scan_one(req, None, Default::default(), Some(db));
@@ -1622,6 +1625,7 @@ mod tests {
             pinned.file_size,
             blue.source_dims,
             &blue.jpeg_data,
+            &crate::cover_identity::CoverIdentity::Legacy,
         )
         .unwrap();
         let palette = scan_one(
@@ -1673,6 +1677,7 @@ mod tests {
         ));
         let (bytes, _, _) = crate::catalog::encode_thumb_webp(&image, 8, 100.0).unwrap();
         let entry = crate::catalog::CacheEntry {
+            cover: crate::cover_identity::CoverIdentity::Legacy,
             mtime: 10,
             file_size: 20,
             jpeg_data: bytes.clone(),
@@ -1697,8 +1702,15 @@ mod tests {
         db.set_pdf_meta("nonexistent.pdf", 10, 20, 1, false)
             .unwrap();
         assert!(
-            db.save_thumb_bytes("pdfthumb:nonexistent.pdf", 10, 20, Some((8, 8)), &bytes)
-                .unwrap()
+            db.save_thumb_bytes(
+                "pdfthumb:nonexistent.pdf",
+                10,
+                20,
+                Some((8, 8)),
+                &bytes,
+                &crate::cover_identity::CoverIdentity::Legacy
+            )
+            .unwrap()
         );
         let catalog = scan_one(req, None, Default::default(), Some(db));
         assert!(crate::color_search::palette_matches(
@@ -1756,6 +1768,7 @@ mod tests {
         ));
         let (bytes, _, _) = crate::catalog::encode_thumb_webp(&green, 8, 100.0).unwrap();
         let entry = crate::catalog::CacheEntry {
+            cover: crate::cover_identity::CoverIdentity::Legacy,
             mtime: req.mtime - 1,
             file_size: req.file_size,
             jpeg_data: bytes,
@@ -1771,6 +1784,7 @@ mod tests {
             entry.file_size,
             entry.source_dims,
             &entry.jpeg_data,
+            &crate::cover_identity::CoverIdentity::Legacy,
         )
         .unwrap();
         let cover = scan_one(
@@ -1921,6 +1935,7 @@ mod tests {
                 2,
                 entry.source_dims,
                 &entry.jpeg_data,
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
         assert!(req.catalog_target.is_retired());
@@ -2028,6 +2043,7 @@ mod tests {
                     stamp.1,
                     green.source_dims,
                     &green.jpeg_data,
+                    &crate::cover_identity::CoverIdentity::Legacy,
                 )
                 .unwrap();
             }

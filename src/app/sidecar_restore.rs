@@ -2992,7 +2992,7 @@ impl App {
             self.mask_page_keys = snapshot.masked;
             self.conceal_page_keys = snapshot.concealed;
             self.comic_page_keys = snapshot.comic;
-            self.rotation_page_keys = snapshot.rotated;
+            self.replace_rotation_page_owner(snapshot.rotated);
             self.export_crop_page_keys = snapshot.cropped;
         }
         self.adjusted_page_keys.extend(effects.edit_delta.adjusted);

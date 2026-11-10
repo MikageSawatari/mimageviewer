@@ -9,12 +9,7 @@ impl crate::app::App {
         }
         let deleted = match self.rotation_db.as_ref().unwrap().clear_all() {
             Ok(deleted) => {
-                if deleted > 0 {
-                    self.caption_display.invalidate_rotation_keys(
-                        self.rotation_page_keys.iter().map(String::as_str),
-                    );
-                }
-                self.rotation_page_keys.clear();
+                self.replace_rotation_page_owner(Default::default());
                 deleted
             }
             Err(error) => {

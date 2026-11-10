@@ -3877,6 +3877,50 @@ fn details_shared_preview_hover_text(
         .then_some("この設定は一覧側に反映されます。下部バーはプレビューを表示しません")
 }
 
+fn details_thumbnail_preview_size(
+    texture_size: egui::Vec2,
+    rotation: crate::rotation_db::Rotation,
+) -> egui::Vec2 {
+    if texture_size.x <= 0.0 || texture_size.y <= 0.0 {
+        return egui::vec2(180.0, 120.0);
+    }
+    let display_size = match rotation {
+        crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
+            egui::vec2(texture_size.y, texture_size.x)
+        }
+        _ => texture_size,
+    };
+    let scale = (320.0 / display_size.x)
+        .min(320.0 / display_size.y)
+        .min(1.0);
+    display_size * scale
+}
+
+#[cfg(test)]
+mod details_thumbnail_preview_tests {
+    use super::*;
+
+    #[test]
+    fn details_thumbnail_hover_fits_rotated_pixels_without_upscaling() {
+        use crate::rotation_db::Rotation;
+        for (rotation, expected) in [
+            (Rotation::None, egui::vec2(320.0, 160.0)),
+            (Rotation::Cw90, egui::vec2(160.0, 320.0)),
+            (Rotation::Cw180, egui::vec2(320.0, 160.0)),
+            (Rotation::Cw270, egui::vec2(160.0, 320.0)),
+        ] {
+            assert_eq!(
+                details_thumbnail_preview_size(egui::vec2(640.0, 320.0), rotation),
+                expected
+            );
+            assert_eq!(
+                details_thumbnail_preview_size(egui::vec2(64.0, 32.0), rotation),
+                expected * 0.2
+            );
+        }
+    }
+}
+
 fn toggle_details_selection_bar_mode_from_menu(settings: &mut crate::settings::Settings) -> bool {
     let old_mode = settings.details_selection_bar_mode.normalized();
     let new_mode = if old_mode == DetailsSelectionBarMode::Dedicated {
@@ -17549,7 +17593,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     self.settings.thumb_show_type_icon,
                     is_cut,
                 );
-                let rotation = self.get_rotation(idx);
+                let rotation = self.grid_tile_rotation(idx);
                 let resume = self.thumbnail_resume_meter(idx);
                 let adjusted = if self.adjustment_dragging
                     || crate::grid_item::container_icon_only(
@@ -18919,18 +18963,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     self.settings.audio_thumbnail_indicator,
                 )
             });
+        let rotation = self.grid_tile_rotation_memory(idx);
         let image_size = texture
             .as_ref()
-            .map(|tex| {
-                let tex_size = tex.size_vec2();
-                let max_side = 320.0;
-                if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
-                    egui::vec2(180.0, 120.0)
-                } else {
-                    let scale = (max_side / tex_size.x).min(max_side / tex_size.y).min(1.0);
-                    egui::vec2(tex_size.x * scale, tex_size.y * scale)
-                }
-            })
+            .map(|tex| details_thumbnail_preview_size(tex.size_vec2(), rotation))
             .unwrap_or_else(|| egui::vec2(180.0, 120.0));
         let padding = 8.0;
         let viewport_size = image_size + egui::vec2(padding * 2.0, padding * 2.0);
@@ -18974,12 +19010,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     let rect = ui.max_rect().shrink(padding);
                     if let Some(tex) = texture.as_ref() {
                         let img_rect = egui::Rect::from_center_size(rect.center(), image_size);
-                        ui.painter().image(
-                            tex.id(),
-                            img_rect,
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            egui::Color32::WHITE,
-                        );
+                        crate::app::draw_rotated_image(ui.painter(), tex.id(), img_rect, rotation);
                         if is_audio && let Some(parts) = audio_parts {
                             let marker_rect = if parts.music_icon {
                                 egui::Rect::from_center_size(
@@ -21272,7 +21303,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 let selected_before = self.selected == Some(idx);
                                 let painted_generation = self.items_generation;
                                 let hit_areas = if self.settings.grid_background_double_click_parent {
-                                    let rot = self.get_rotation(idx);
+                                    let rot = self.grid_tile_rotation(idx);
                                     let resume = self.thumbnail_resume_meter(idx);
                                     if !self.adjustment_dragging {
                                         self.maybe_apply_thumb_adjustment(ctx, idx, "visible");
@@ -21407,7 +21438,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     || is_cut != initially_cut;
                                 if repaint_cell {
                                     let book_resume_meter = self.thumbnail_resume_meter(idx);
-                                    let rot = self.get_rotation(idx);
+                                    let rot = self.grid_tile_rotation(idx);
                                     // 可視セルは同期適用 (~3ms/枚)。先読み分は背後の
                                     // process_thumb_adjust_budget が逐次処理する。
                                     // ドラッグ中は両経路ともスキップして生サムネ表示に戻す

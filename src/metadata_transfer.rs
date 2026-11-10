@@ -226,7 +226,7 @@ pub struct ImportPageStateSnapshot {
     pub masked: std::collections::BTreeSet<String>,
     pub concealed: std::collections::BTreeSet<String>,
     pub comic: std::collections::BTreeSet<String>,
-    pub rotated: std::collections::BTreeSet<String>,
+    pub rotated: std::collections::BTreeMap<String, crate::rotation_db::Rotation>,
     pub cropped: std::collections::BTreeSet<String>,
 }
 
@@ -269,11 +269,25 @@ pub fn load_import_page_state_snapshot_cancellable(
         "SELECT page_path FROM comic_entries",
         cancel,
     )?;
-    let rotated = load_import_key_set(
-        &data_dir.join("rotation.db"),
-        "SELECT path FROM rotations WHERE angle != 0",
-        cancel,
-    )?;
+    check_cancel(cancel)?;
+    let conn = open_readonly(&data_dir.join("rotation.db"))?;
+    let mut statement = conn
+        .prepare("SELECT path, angle FROM rotations WHERE angle != 0")
+        .map_err(db_error)?;
+    let mut rows = statement.query([]).map_err(db_error)?;
+    let mut rotated = std::collections::BTreeMap::new();
+    let mut processed = 0usize;
+    while let Some(row) = rows.next().map_err(db_error)? {
+        if processed % 512 == 0 {
+            check_cancel(cancel)?;
+        }
+        let angle = crate::rotation_db::Rotation::from_degrees(row.get(1).map_err(db_error)?);
+        if !angle.is_none() {
+            rotated.insert(row.get::<_, String>(0).map_err(db_error)?, angle);
+        }
+        processed = processed.saturating_add(1);
+    }
+    check_cancel(cancel)?;
     let cropped = load_import_key_set(
         &data_dir.join("export_crop.db"),
         "SELECT page_path FROM export_crop_pages",
@@ -11150,7 +11164,7 @@ mod tests {
             90
         );
         let snapshot = load_import_page_state_snapshot(&data_dir).unwrap();
-        assert!(snapshot.rotated.contains(&canonical_key));
+        assert!(snapshot.rotated.contains_key(&canonical_key));
         let stripped_base = crate::path_key::normalize(&root.join("book.zip"));
         let canonical_container_key = join_container_key(&stripped_base, mixed_container);
         let raw_container_key = format!("{stripped_base}/{mixed_container}");

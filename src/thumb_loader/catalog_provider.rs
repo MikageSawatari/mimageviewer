@@ -633,6 +633,7 @@ mod tests {
                 b"bytes",
                 Some(crate::catalog::FolderThumbProvenance::AutoSelected),
                 Some(&proof),
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
         let reader = provider.resolve(&req, None).unwrap();
@@ -676,6 +677,7 @@ mod tests {
                 b"bytes",
                 row.folder_provenance,
                 row.selection_proof.as_ref(),
+                &row.cover,
             )
             .unwrap();
         let continued = provider
@@ -901,6 +903,7 @@ mod tests {
             8,
             None,
             b"broken WebP",
+            &crate::cover_identity::CoverIdentity::Legacy,
         )
         .unwrap();
         req.force_cache = false;
@@ -983,7 +986,16 @@ mod tests {
         drop(first);
         assert!(!second_db.is_retired());
         second_db
-            .save("after sibling close", 7, 9, 1, 1, None, b"still live")
+            .save(
+                "after sibling close",
+                7,
+                9,
+                1,
+                1,
+                None,
+                b"still live",
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
     }
 
@@ -1016,7 +1028,16 @@ mod tests {
         );
         let legacy = CatalogDb::open(temp.path(), c).unwrap();
         legacy
-            .save("same.jpg", 7, 9, 1, 1, None, b"C contents")
+            .save(
+                "same.jpg",
+                7,
+                9,
+                1,
+                1,
+                None,
+                b"C contents",
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
         assert_eq!(
             CatalogDb::open(temp.path(), d)
@@ -1048,6 +1069,7 @@ mod tests {
                 h,
                 Some((8, 8)),
                 &bytes,
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
         }
@@ -1077,7 +1099,16 @@ mod tests {
         let cache = temp.path().join("cache");
         let legacy = CatalogDb::open(&cache, source.parent().unwrap()).unwrap();
         legacy
-            .save("image.png", 7, 9, 1, 1, None, b"ambiguous old row")
+            .save(
+                "image.png",
+                7,
+                9,
+                1,
+                1,
+                None,
+                b"ambiguous old row",
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
         let identity =
             crate::catalog::collection_source_parent_identity(source.parent().unwrap()).unwrap();
@@ -1162,7 +1193,18 @@ mod tests {
         let db = provider.writer(&old).unwrap();
         let other_db = sibling.writer(&request(other, cache)).unwrap();
         let legacy = CatalogDb::open(cache, source.parent().unwrap()).unwrap();
-        legacy.save("old", 1, 1, 1, 1, None, b"old").unwrap();
+        legacy
+            .save(
+                "old",
+                1,
+                1,
+                1,
+                1,
+                None,
+                b"old",
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
+            .unwrap();
         let c_path = db_path_for(
             cache,
             &crate::catalog::collection_source_parent_identity(source.parent().unwrap()).unwrap(),
@@ -1211,7 +1253,17 @@ mod tests {
         let image = image::DynamicImage::new_rgb8(8, 8);
         let (bytes, w, h) = crate::catalog::encode_thumb_webp(&image, 8, 75.0).unwrap();
         let key = req.cache_key_override.clone().unwrap();
-        db.save(&key, 7, 9, w, h, Some((8, 8)), &bytes).unwrap();
+        db.save(
+            &key,
+            7,
+            9,
+            w,
+            h,
+            Some((8, 8)),
+            &bytes,
+            &crate::cover_identity::CoverIdentity::Legacy,
+        )
+        .unwrap();
         let map = RwLock::new(std::collections::HashMap::from([(
             key.clone(),
             db.load_one(&key).unwrap().unwrap(),
@@ -1232,7 +1284,16 @@ mod tests {
         ));
         let (bytes, w, h) = crate::catalog::encode_thumb_webp(&image, 8, 75.0).unwrap();
         successor
-            .save(&key, 7, 9, w, h, Some((8, 8)), &bytes)
+            .save(
+                &key,
+                7,
+                9,
+                w,
+                h,
+                Some((8, 8)),
+                &bytes,
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
         let messages = run(&mut req, &provider, CachePolicy::Always, &map);
         let pixel = messages[0].pixels().unwrap().image.pixels[0];
@@ -1265,7 +1326,16 @@ mod tests {
         drop(provider);
         assert!(!sibling_db.is_retired());
         sibling_db
-            .save("sibling", 1, 1, 1, 1, None, b"still writable")
+            .save(
+                "sibling",
+                1,
+                1,
+                1,
+                1,
+                None,
+                b"still writable",
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
         assert!(!db.is_retired());
         assert!(
@@ -1319,6 +1389,7 @@ mod tests {
             6,
             Some((8, 6)),
             &valid_webp(),
+            &crate::cover_identity::CoverIdentity::Legacy,
         )
         .unwrap();
         db
@@ -1401,6 +1472,7 @@ mod tests {
         let map = RwLock::new(std::collections::HashMap::from([(
             req.cache_key_override.clone().unwrap(),
             crate::catalog::CacheEntry {
+                cover: crate::cover_identity::CoverIdentity::Legacy,
                 mtime: req.mtime,
                 file_size: req.file_size,
                 jpeg_data: valid_webp(),
@@ -1709,6 +1781,7 @@ mod tests {
         RwLock::new(std::collections::HashMap::from([(
             req.cache_key_override.clone().unwrap(),
             crate::catalog::CacheEntry {
+                cover: crate::cover_identity::CoverIdentity::Legacy,
                 mtime: req.mtime,
                 file_size: req.file_size,
                 jpeg_data: valid_webp(),
@@ -1951,6 +2024,7 @@ mod tests {
         let map = RwLock::new(std::collections::HashMap::from([(
             key.clone(),
             crate::catalog::CacheEntry {
+                cover: crate::cover_identity::CoverIdentity::Legacy,
                 mtime: generation.0,
                 file_size: generation.1,
                 jpeg_data: valid_webp(),
@@ -2088,6 +2162,7 @@ mod tests {
         let map = RwLock::new(std::collections::HashMap::from([(
             req.cache_key_override.clone().unwrap(),
             crate::catalog::CacheEntry {
+                cover: crate::cover_identity::CoverIdentity::Legacy,
                 mtime: req.mtime,
                 file_size: req.file_size,
                 jpeg_data: valid_webp(),
@@ -2109,6 +2184,7 @@ mod tests {
                 6,
                 Some((16, 12)),
                 &valid_webp(),
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
         req.source_policy = LoadSourcePolicy::CacheOnly;

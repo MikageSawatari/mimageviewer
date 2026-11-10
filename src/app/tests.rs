@@ -212,7 +212,14 @@ mod section1452_book_cover_cache {
                 let parent_key = format!("{prefix}book.{extension}");
                 let parent_db = crate::catalog::CatalogDb::open(&cache_dir, &parent).unwrap();
                 parent_db
-                    .save_thumb_bytes(&parent_key, 1, 2, Some((8, 12)), &webp)
+                    .save_thumb_bytes(
+                        &parent_key,
+                        1,
+                        2,
+                        Some((8, 12)),
+                        &webp,
+                        &crate::cover_identity::CoverIdentity::Legacy,
+                    )
                     .unwrap();
                 let catalog = crate::catalog::CatalogDb::open(&cache_dir, &path).unwrap();
                 catalog
@@ -263,6 +270,47 @@ mod section1452_book_cover_cache {
                 }
             }
         }
+    }
+
+    #[test]
+    fn virtual_folder_seed_and_writeback_preserve_pixels_page_when_list_order_differs() {
+        let mut app = setup_app_for_test();
+        app.settings.cache_book_cover_only = false;
+        let parent = app.tmp.path().join("identity-seed");
+        std::fs::create_dir_all(&parent).unwrap();
+        let zip_path = parent.join("book.zip");
+        fixture_zip(&zip_path);
+        let cache_dir = crate::catalog::default_cache_dir();
+        let parent_db = crate::catalog::CatalogDb::open(&cache_dir, &parent).unwrap();
+        let zip_db = crate::catalog::CatalogDb::open(&cache_dir, &zip_path).unwrap();
+        let webp =
+            crate::catalog::encode_thumb_webp(&image::DynamicImage::new_rgb8(8, 12), 64, 75.0)
+                .unwrap()
+                .0;
+        let parent_key = "zipthumb:book.zip";
+        let cover = crate::cover_identity::CoverIdentity::Page(
+            crate::adjustment_db::zip_entry_key(&zip_path, "root.png"),
+        );
+        parent_db
+            .save_thumb_bytes(parent_key, 1, 2, None, &webp, &cover)
+            .unwrap();
+        // The projected first row differs from the source page of the parent's pixels.
+        let target_key = "chapter/page.png";
+        app.items = vec![GridItem::ZipImage {
+            zip_path: zip_path.clone(),
+            entry_name: target_key.into(),
+        }];
+        app.image_metas = vec![Some((1, 2))];
+        let map = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        app.setup_virtual_folder_seed_and_writeback(&zip_path, &zip_db, &map);
+        assert_eq!(zip_db.load_one(target_key).unwrap().unwrap().cover, cover);
+        assert_eq!(map.read().unwrap()[target_key].cover, cover);
+        parent_db.delete_one(parent_key).unwrap();
+        app.fire_virtual_folder_writeback_if_ready(0);
+        assert_eq!(
+            parent_db.load_one(parent_key).unwrap().unwrap().cover,
+            cover
+        );
     }
 
     #[test]
@@ -408,7 +456,14 @@ mod section1452_book_cover_cache {
                     .unwrap()
                     .0;
                 catalog
-                    .save_thumb_bytes(&key, 1, 2, Some((4, 6)), &webp)
+                    .save_thumb_bytes(
+                        &key,
+                        1,
+                        2,
+                        Some((4, 6)),
+                        &webp,
+                        &crate::cover_identity::CoverIdentity::Legacy,
+                    )
                     .unwrap();
             }
             let map = Arc::new(std::sync::RwLock::new(catalog.load_all().unwrap()));
@@ -2134,6 +2189,80 @@ fn prepared_pin_materializations_for_test(
 }
 
 #[test]
+fn ordinary_video_folder_seed_upgrades_identity_only_and_then_preserves_the_row() {
+    use crate::cover_identity::CoverIdentity;
+    use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+    let mut app = setup_app_for_test();
+    let parent = app.tmp.path().join("ordinary-video-seed");
+    let folder = parent.join("book");
+    std::fs::create_dir_all(&folder).unwrap();
+    let video = folder.join("clip.mp4");
+    std::fs::write(&video, b"video metadata only").unwrap();
+    let webp = crate::catalog::encode_thumb_webp(&image::DynamicImage::new_rgb8(8, 12), 32, 80.0)
+        .unwrap()
+        .0;
+    app.video_pin_db
+        .as_ref()
+        .unwrap()
+        .set_pin(&video, 1.0, &webp)
+        .unwrap();
+    let source = FolderPinSource::File {
+        rel: "clip.mp4".into(),
+        kind: FileKind::Video,
+    };
+    app.folder_thumb_pin_db
+        .as_ref()
+        .unwrap()
+        .set(&folder, &source)
+        .unwrap();
+    app.folder_pin_map.insert(
+        crate::path_key::normalize_keep_drive(&folder),
+        source.clone(),
+    );
+    app.current_folder = Some(parent.clone());
+    app.items = vec![GridItem::Folder(folder.clone())];
+    let resolved = crate::folder_thumb_pins::resolve_pin_target(&folder, &source).unwrap();
+    let base = crate::thumb_loader::folder_thumb_cache_key_for_path(
+        &folder,
+        app.use_full_path_cache_keys(),
+        app.settings.folder_thumb_sort,
+        app.settings.folder_thumb_depth,
+        crate::catalog::FolderThumbProvenance::Seeded,
+    )
+    .unwrap();
+    let key = crate::thumb_loader::pinned_folder_row_key(&base, &resolved.source_id, None);
+    let catalog = Arc::new(
+        crate::catalog::CatalogDb::open(&app.tmp.path().join("seed-cache"), &parent).unwrap(),
+    );
+    catalog
+        .save_seeded_folder_bytes(
+            &key,
+            resolved.mtime,
+            resolved.file_size,
+            None,
+            &webp,
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
+    let map = Arc::new(std::sync::RwLock::new(catalog.load_all().unwrap()));
+    let before = catalog.revision_state();
+    app.seed_folder_video_pin_thumbs(&map, Some(&catalog), None);
+    let expected = CoverIdentity::Page(crate::adjustment_db::normalize_path(&video));
+    assert_eq!(map.read().unwrap()[&key].cover, expected);
+    let row = catalog.load_one(&key).unwrap().unwrap();
+    assert_eq!(row.cover, expected);
+    assert_eq!(row.jpeg_data, webp);
+    assert_eq!(
+        (row.mtime, row.file_size),
+        (resolved.mtime, resolved.file_size)
+    );
+    let upgraded = catalog.revision_state();
+    assert_ne!(before, upgraded);
+    app.seed_folder_video_pin_thumbs(&map, Some(&catalog), None);
+    assert_eq!(catalog.revision_state(), upgraded);
+}
+
+#[test]
 fn mutation_refresh_synthetic_worker_prepares_cascade_and_video_seed_before_ui_apply() {
     use crate::folder_thumb_pins::{FileKind, FolderPinSource};
     let mut app = setup_app_for_test();
@@ -2200,7 +2329,51 @@ fn mutation_refresh_synthetic_worker_prepares_cascade_and_video_seed_before_ui_a
     let catalog = Arc::new(
         crate::catalog::CatalogDb::open(&app.tmp.path().join("boundary-cache"), &folder).unwrap(),
     );
-    catalog.save(&stale, 1, 1, 4, 4, None, &webp).unwrap();
+    catalog
+        .save(
+            &stale,
+            1,
+            1,
+            4,
+            4,
+            None,
+            &webp,
+            &crate::cover_identity::CoverIdentity::Legacy,
+        )
+        .unwrap();
+    let source = app
+        .folder_pin_map
+        .get(&crate::path_key::normalize_keep_drive(&folder))
+        .unwrap();
+    let resolved = resolve_pin_target_cascaded(
+        &folder,
+        source,
+        app.folder_thumb_pin_db.as_deref(),
+        app.settings.folder_thumb_depth as usize,
+    )
+    .unwrap();
+    let current_key = folder_thumb_existing_keys_for(
+        &app.items[0],
+        None,
+        &app.folder_pin_map,
+        app.folder_thumb_pin_db.as_deref(),
+        Some(app.settings.folder_thumb_sort),
+        app.settings.folder_thumb_depth,
+        app.use_full_path_cache_keys(),
+    )
+    .last()
+    .unwrap()
+    .clone();
+    catalog
+        .save_seeded_folder_bytes(
+            &current_key,
+            resolved.mtime,
+            resolved.file_size,
+            None,
+            &webp,
+            &crate::cover_identity::CoverIdentity::Legacy,
+        )
+        .unwrap();
     let old_map = Arc::new(std::sync::RwLock::new(catalog.load_all().unwrap()));
     app.current_color_catalog = Some(catalog.clone());
     app.current_color_cache_map = Some(old_map.clone());
@@ -2229,6 +2402,8 @@ fn mutation_refresh_synthetic_worker_prepares_cascade_and_video_seed_before_ui_a
     let _: pin_materialization::Identity = identity;
     assert_eq!(reset_indices, vec![0]);
     let prepared_map = replacement.as_ref().unwrap().clone();
+    let cover =
+        crate::cover_identity::CoverIdentity::Page(crate::adjustment_db::normalize_path(&video));
     let seed = prepared_map
         .read()
         .unwrap()
@@ -2238,6 +2413,9 @@ fn mutation_refresh_synthetic_worker_prepares_cascade_and_video_seed_before_ui_a
         })
         .map(|(key, _)| key.clone())
         .unwrap();
+    assert_eq!(seed, current_key);
+    assert_eq!(prepared_map.read().unwrap()[&seed].cover, cover);
+    assert_eq!(catalog.load_one(&seed).unwrap().unwrap().cover, cover);
     assert!(!prepared_map.read().unwrap().contains_key(&stale));
     assert!(
         old_map.read().unwrap().contains_key(&stale),
@@ -2422,7 +2600,14 @@ fn mutation_refresh_synthetic_worker_seed_failure_purges_same_key_old_frame() {
     .unwrap();
     assert!(
         catalog
-            .save_seeded_folder_bytes(&key, resolved.mtime, resolved.file_size, None, &old_bytes)
+            .save_seeded_folder_bytes(
+                &key,
+                resolved.mtime,
+                resolved.file_size,
+                None,
+                &old_bytes,
+                &crate::cover_identity::CoverIdentity::Legacy
+            )
             .unwrap()
     );
     let old_map = Arc::new(std::sync::RwLock::new(catalog.load_all().unwrap()));
@@ -5367,6 +5552,7 @@ fn epub_auto_aspect_seed_ignores_source_metadata_cache_hit() {
     let map = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::from([(
         key,
         crate::catalog::CacheEntry {
+            cover: crate::cover_identity::CoverIdentity::Legacy,
             mtime: 123,
             file_size: 456,
             jpeg_data: Vec::new(),
@@ -9083,12 +9269,22 @@ fn metadata_folder_pin_refresh_does_not_navigate_or_close_detached_viewers() {
         crate::catalog::CatalogDb::open(&temp.path().join("cache"), &folder).unwrap(),
     );
     catalog
-        .save(&stale_pin_key, 1, 1, 1, 1, None, b"x")
+        .save(
+            &stale_pin_key,
+            1,
+            1,
+            1,
+            1,
+            None,
+            b"x",
+            &crate::cover_identity::CoverIdentity::Legacy,
+        )
         .unwrap();
     let cache_map =
         std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::from([(
             stale_pin_key.clone(),
             crate::catalog::CacheEntry {
+                cover: crate::cover_identity::CoverIdentity::Legacy,
                 mtime: 1,
                 file_size: 1,
                 jpeg_data: vec![0],
@@ -19814,6 +20010,7 @@ mod phase_c_key_tests {
                 4,
                 Some((80, 60)),
                 &webp_bytes,
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
         let auto_key = container_cache_base_key(
@@ -19832,6 +20029,7 @@ mod phase_c_key_tests {
                 4,
                 Some((80, 60)),
                 &webp_bytes,
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
 
@@ -19859,6 +20057,33 @@ mod phase_c_key_tests {
             app.folder_thumb_pin_db.as_deref(),
         )
         .expect("drive-list folder pin should create a cache-only request");
+        let seeded_key = cache_map.read().unwrap().keys().next().unwrap().clone();
+        assert_eq!(
+            cache_map.read().unwrap()[&seeded_key].cover,
+            crate::cover_identity::CoverIdentity::Legacy
+        );
+        let cover = crate::cover_identity::CoverIdentity::Page(
+            crate::adjustment_db::normalize_path(&pinned_folder.join("cover.epub.png")),
+        );
+        parent_db
+            .save(
+                &pinned_parent_key,
+                resolved.mtime,
+                resolved.file_size,
+                4,
+                4,
+                Some((80, 60)),
+                &webp_bytes,
+                &cover,
+            )
+            .unwrap();
+        // An identity-only source upgrade must replace the copied drive seed.
+        app.seed_drive_list_pin_thumbs_from_catalog(&cache_map, Some(&drive_list_db));
+        assert_eq!(cache_map.read().unwrap()[&seeded_key].cover, cover);
+        assert_eq!(
+            drive_list_db.load_one(&seeded_key).unwrap().unwrap().cover,
+            cover
+        );
         req.items_gen = app.items_generation;
         assert!(
             req.pinned_only.as_ref().unwrap().seed_proof.is_none(),
@@ -20002,10 +20227,20 @@ mod phase_c_key_tests {
                 4,
                 None,
                 &webp,
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
         parent
-            .save(&auto_key, writer.mtime, writer.file_size, 4, 4, None, &webp)
+            .save(
+                &auto_key,
+                writer.mtime,
+                writer.file_size,
+                4,
+                4,
+                None,
+                &webp,
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
         app.items = vec![GridItem::Folder(drive.clone())];
         app.image_metas = vec![None];
@@ -20344,6 +20579,7 @@ mod phase_c_key_tests {
                 &old_webp,
                 Some(crate::catalog::FolderThumbProvenance::AutoSelected),
                 Some(&proof),
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
         app.items = vec![GridItem::Folder(drive.clone())];
@@ -20463,6 +20699,7 @@ mod phase_c_key_tests {
                 &old_webp,
                 Some(crate::catalog::FolderThumbProvenance::AutoSelected),
                 Some(&current_proof),
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
         app.seed_drive_list_pin_thumbs_from_catalog(&map, Some(&target));
@@ -20527,6 +20764,7 @@ mod phase_c_key_tests {
                 4,
                 None,
                 &old_webp,
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
         map.write()
@@ -20552,6 +20790,7 @@ mod phase_c_key_tests {
                 4,
                 None,
                 &old_webp,
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
         app.seed_drive_list_pin_thumbs_from_catalog(&map, Some(&target));
@@ -20609,6 +20848,7 @@ mod phase_c_key_tests {
                 4,
                 None,
                 &page_one_webp,
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
         if case == "new_generation" {
@@ -20637,6 +20877,7 @@ mod phase_c_key_tests {
                     &old_webp,
                     Some(crate::catalog::FolderThumbProvenance::AutoSelected),
                     Some(&old_proof),
+                    &crate::cover_identity::CoverIdentity::Legacy,
                 )
                 .unwrap();
             map.write()
@@ -20663,6 +20904,7 @@ mod phase_c_key_tests {
                     4,
                     None,
                     &new_webp,
+                    &crate::cover_identity::CoverIdentity::Legacy,
                 )
                 .unwrap();
             let (seed, final_red, finalized, messages) = load(&app, &map);
@@ -20842,10 +21084,28 @@ mod phase_c_key_tests {
             data
         };
         parent
-            .save(&page_one_key, 901, 19, 4, 4, None, &webp(240))
+            .save(
+                &page_one_key,
+                901,
+                19,
+                4,
+                4,
+                None,
+                &webp(240),
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
         parent
-            .save(&page_zero_key, 901, 19, 4, 4, None, &webp(40))
+            .save(
+                &page_zero_key,
+                901,
+                19,
+                4,
+                4,
+                None,
+                &webp(40),
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
         app.items = vec![GridItem::Folder(drive.clone())];
         app.image_metas = vec![None];
@@ -21017,7 +21277,16 @@ mod phase_c_key_tests {
             )
             .unwrap();
         parent_db
-            .save(&parent_key, 222, 0, 4, 4, Some((100, 50)), &webp_bytes)
+            .save(
+                &parent_key,
+                222,
+                0,
+                4,
+                4,
+                Some((100, 50)),
+                &webp_bytes,
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
 
         app.items = vec![GridItem::Folder(drive_root.clone())];
@@ -21111,6 +21380,7 @@ mod phase_c_key_tests {
                 4,
                 Some((120, 80)),
                 &wrong_webp_bytes,
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
 
@@ -27108,6 +27378,7 @@ mod phase_c_folder_nav_history_tests {
                     48,
                     Some((36, 48)),
                     root_png.get_ref(),
+                    &crate::cover_identity::CoverIdentity::Legacy,
                 )
                 .unwrap();
         }
@@ -27425,6 +27696,7 @@ mod phase_c_folder_nav_history_tests {
                         128,
                         Some((96, 128)),
                         encoded.get_ref(),
+                        &crate::cover_identity::CoverIdentity::Legacy,
                     )
                     .unwrap();
             }
@@ -31618,7 +31890,8 @@ mod phase_c_drill_nav_tests {
 
         app.settings.facet_filter.edits.clear();
         app.local_adjust_page_keys.clear();
-        app.rotation_page_keys.insert(key);
+        app.rotation_page_keys
+            .insert(key, crate::rotation_db::Rotation::Cw90);
         app.settings
             .facet_filter
             .edits
@@ -35977,6 +36250,7 @@ fn begin_detached_bookmark_media_test(
         std::collections::HashMap::from([(
             "main-grid-color".to_string(),
             crate::catalog::CacheEntry {
+                cover: crate::cover_identity::CoverIdentity::Legacy,
                 mtime: 1,
                 file_size: 2,
                 jpeg_data: Vec::new(),
@@ -47117,6 +47391,7 @@ mod favorite_adjustment_defaults_tests {
         let cache_map = std::sync::RwLock::new(std::collections::HashMap::from([(
             key,
             crate::catalog::CacheEntry {
+                cover: crate::cover_identity::CoverIdentity::Legacy,
                 mtime: 11,
                 file_size: 22,
                 jpeg_data: webp,
@@ -48609,6 +48884,7 @@ mod favorite_adjustment_defaults_tests {
         let cache_map = std::sync::RwLock::new(std::collections::HashMap::from([(
             pinned_key,
             crate::catalog::CacheEntry {
+                cover: crate::cover_identity::CoverIdentity::Legacy,
                 mtime: 333,
                 file_size: 444,
                 jpeg_data: webp,
@@ -52811,6 +53087,7 @@ mod favorite_adjustment_defaults_tests {
                     archive_meta.len() as i64,
                     Some((8, 8)),
                     &webp,
+                    &crate::cover_identity::CoverIdentity::Legacy,
                 )
                 .unwrap();
             let folder_meta = std::fs::metadata(&folder).unwrap();
@@ -52923,6 +53200,7 @@ mod favorite_adjustment_defaults_tests {
                 4,
                 Some((100, 100)),
                 &webp_bytes,
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
 
@@ -53031,6 +53309,7 @@ mod favorite_adjustment_defaults_tests {
         cache_map.write().unwrap().insert(
             target_key.clone(),
             crate::catalog::CacheEntry {
+                cover: crate::cover_identity::CoverIdentity::Legacy,
                 mtime: 999,
                 file_size: 4096,
                 jpeg_data: webp_bytes.clone(),
@@ -53165,7 +53444,16 @@ mod favorite_adjustment_defaults_tests {
         let parent_key = format!("{}{}", crate::thumb_loader::CACHE_KEY_PDF, "corrupt.pdf");
         // 直接 save() で壊れたバイトを置く (= 旧版や外部経路で壊れた行が残った状況を再現)。
         parent_db
-            .save(&parent_key, 0, 0, 1, 1, None, &bad_bytes)
+            .save(
+                &parent_key,
+                0,
+                0,
+                1,
+                1,
+                None,
+                &bad_bytes,
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
 
         let pdf_db = crate::catalog::CatalogDb::open(&cache_dir, &pdf_path).unwrap();
@@ -53202,7 +53490,14 @@ mod favorite_adjustment_defaults_tests {
         let db = crate::catalog::CatalogDb::open(&cache_dir, &dir).unwrap();
         let bad: Vec<u8> = b"DEADBEEF-NOT-AN-IMAGE".to_vec();
         let saved = db
-            .save_thumb_bytes("k1", 1, 2, None, &bad)
+            .save_thumb_bytes(
+                "k1",
+                1,
+                2,
+                None,
+                &bad,
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .expect("Err なし、Ok(false) で skip 表現");
         assert!(!saved, "壊れたバイト列は save 断念 → false");
         assert!(db.load_one("k1").unwrap().is_none(), "DB にも何も書かない");
@@ -54982,8 +55277,10 @@ mod favorite_adjustment_defaults_tests {
         app.tags_cache
             .insert(target_key.clone(), vec!["delete".to_string()]);
         app.adjusted_page_keys.insert(target_key.clone());
-        app.rotation_page_keys
-            .insert(format!("{target_key}::page_1"));
+        app.rotation_page_keys.insert(
+            format!("{target_key}::page_1"),
+            crate::rotation_db::Rotation::Cw90,
+        );
         app.adjusted_page_keys
             .insert(format!("{target_key}2/keep.jpg"));
 
@@ -55038,7 +55335,7 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.adjusted_page_keys.contains(&target_key));
         assert!(
             !app.rotation_page_keys
-                .contains(&format!("{target_key}::page_1"))
+                .contains_key(&format!("{target_key}::page_1"))
         );
         assert!(
             app.adjusted_page_keys
@@ -76474,7 +76771,16 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             .get_or_open_catalog(&folder)
             .expect("open folder catalog");
         catalog
-            .save("keep.jpg", 1, 1, 1, 1, None, b"cached-thumbnail")
+            .save(
+                "keep.jpg",
+                1,
+                1,
+                1,
+                1,
+                None,
+                b"cached-thumbnail",
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
         assert!(catalog.load_one("keep.jpg").unwrap().is_some());
 
@@ -96823,7 +97129,8 @@ fn metadata_cleanup_result_invalidates_counts_and_presence_sets() {
     app.mask_page_keys.insert(key.clone());
     app.conceal_page_keys.insert(key.clone());
     app.comic_page_keys.insert(key.clone());
-    app.rotation_page_keys.insert(key.clone());
+    app.rotation_page_keys
+        .insert(key.clone(), crate::rotation_db::Rotation::Cw90);
     app.export_crop_page_keys.insert(key.clone());
     app.tags_cache.insert(key.clone(), vec!["old".into()]);
 
@@ -96838,7 +97145,7 @@ fn metadata_cleanup_result_invalidates_counts_and_presence_sets() {
     assert!(!app.mask_page_keys.contains(&key));
     assert!(!app.conceal_page_keys.contains(&key));
     assert!(!app.comic_page_keys.contains(&key));
-    assert!(!app.rotation_page_keys.contains(&key));
+    assert!(!app.rotation_page_keys.contains_key(&key));
     assert!(!app.export_crop_page_keys.contains(&key));
     assert!(!app.tags_cache.contains_key(&key));
 }
@@ -112304,7 +112611,16 @@ fn excluded_png_zip_parent_seed_never_becomes_first_visible_jpg_cache() {
     )
     .unwrap();
     parent_db
-        .save(&old_key, 1, 1, 2, 2, None, &old_png)
+        .save(
+            &old_key,
+            1,
+            1,
+            2,
+            2,
+            None,
+            &old_png,
+            &crate::cover_identity::CoverIdentity::Legacy,
+        )
         .unwrap();
     app.settings
         .file_type_visibility

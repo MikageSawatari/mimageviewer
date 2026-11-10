@@ -5,6 +5,73 @@
 
 use std::path::{Path, PathBuf};
 
+/// Ordered page-key lookup shared by edit presence sets and the rotation owner.
+pub(crate) trait PageEditKeys {
+    fn contains_page_key(&self, key: &str) -> bool;
+    fn page_keys_from(&self, start: String) -> impl Iterator<Item = &String>;
+}
+
+impl PageEditKeys for std::collections::BTreeSet<String> {
+    fn contains_page_key(&self, key: &str) -> bool {
+        self.contains(key)
+    }
+
+    fn page_keys_from(&self, start: String) -> impl Iterator<Item = &String> {
+        self.range(start..)
+    }
+}
+
+impl PageEditKeys for std::collections::BTreeMap<String, Rotation> {
+    fn contains_page_key(&self, key: &str) -> bool {
+        self.contains_key(key)
+    }
+
+    fn page_keys_from(&self, start: String) -> impl Iterator<Item = &String> {
+        self.range(start..).map(|(key, _)| key)
+    }
+}
+
+/// Update the sole nonzero-angle owner and return only effective changes.
+pub(crate) fn update_page_rotations(
+    owner: &mut std::collections::BTreeMap<String, Rotation>,
+    updates: impl IntoIterator<Item = (String, Rotation)>,
+) -> Vec<String> {
+    let mut changed = Vec::new();
+    for (key, angle) in updates
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>()
+    {
+        let previous = owner.get(&key).copied().unwrap_or_default();
+        if previous == angle {
+            continue;
+        }
+        if angle.is_none() {
+            owner.remove(&key);
+        } else {
+            owner.insert(key.clone(), angle);
+        }
+        changed.push(key);
+    }
+    changed
+}
+
+pub(crate) fn replace_page_rotations(
+    owner: &mut std::collections::BTreeMap<String, Rotation>,
+    mut replacement: std::collections::BTreeMap<String, Rotation>,
+) -> Vec<String> {
+    replacement.retain(|_, angle| !angle.is_none());
+    let changed = owner
+        .keys()
+        .chain(replacement.keys())
+        .filter(|key| owner.get(*key) != replacement.get(*key))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    *owner = replacement;
+    changed
+}
+
 #[cfg(test)]
 thread_local! {
     static READ_OPERATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -267,21 +334,29 @@ impl RotationDb {
     ///
     /// `set_key(..., Rotation::None)` は行を削除するため、通常は全行が対象だが、
     /// 念のため angle=0 の旧/手動行は除外する。
-    pub fn load_rotated_keys(&self) -> std::collections::BTreeSet<String> {
-        let mut set = std::collections::BTreeSet::new();
-        let Ok(mut stmt) = self
-            .conn
-            .prepare_cached("SELECT path FROM rotations WHERE angle != 0")
-        else {
-            return set;
+    pub fn load_rotated_keys(&self) -> std::collections::BTreeMap<String, Rotation> {
+        let read = || -> rusqlite::Result<std::collections::BTreeMap<String, Rotation>> {
+            let mut stmt = self
+                .conn
+                .prepare_cached("SELECT path, angle FROM rotations WHERE angle != 0")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    Rotation::from_degrees(row.get(1)?),
+                ))
+            })?;
+            rows.collect()
         };
-        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
-            return set;
-        };
-        for row in rows.flatten() {
-            set.insert(row);
+        match read() {
+            Ok(mut rotations) => {
+                rotations.retain(|_, angle| !angle.is_none());
+                rotations
+            }
+            Err(error) => {
+                crate::logger::log(format!("rotation owner read failed: {error}"));
+                Default::default()
+            }
         }
-        set
     }
 }
 
@@ -293,6 +368,83 @@ fn normalize_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rotation_owner_updates_angles_and_removes_zero_without_false_changes() {
+        use std::collections::BTreeMap;
+        let mut owner = BTreeMap::new();
+        assert_eq!(
+            update_page_rotations(&mut owner, [("book::a".into(), Rotation::Cw90)]),
+            ["book::a"]
+        );
+        assert!(update_page_rotations(&mut owner, [("book::a".into(), Rotation::Cw90)]).is_empty());
+        assert_eq!(
+            update_page_rotations(&mut owner, [("book::a".into(), Rotation::Cw270)]),
+            ["book::a"]
+        );
+        assert_eq!(owner.get("book::a"), Some(&Rotation::Cw270));
+        assert!(
+            update_page_rotations(
+                &mut owner,
+                [
+                    ("book::a".into(), Rotation::Cw180),
+                    ("book::a".into(), Rotation::Cw270),
+                    ("absent".into(), Rotation::None),
+                ]
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            update_page_rotations(&mut owner, [("book::a".into(), Rotation::None)]),
+            ["book::a"]
+        );
+        assert!(owner.is_empty());
+    }
+
+    #[test]
+    fn rotation_owner_snapshot_only_reports_effective_differences() {
+        use std::collections::BTreeMap;
+        let mut owner = BTreeMap::from([
+            ("same".into(), Rotation::Cw90),
+            ("changed".into(), Rotation::Cw180),
+            ("removed".into(), Rotation::Cw270),
+        ]);
+        let replacement = BTreeMap::from([
+            ("same".into(), Rotation::Cw90),
+            ("changed".into(), Rotation::Cw270),
+            ("added".into(), Rotation::Cw180),
+            ("zero".into(), Rotation::None),
+        ]);
+        assert_eq!(
+            replace_page_rotations(&mut owner, replacement),
+            ["added", "changed", "removed"]
+        );
+        assert!(!owner.contains_key("zero"));
+        let same = owner.clone();
+        assert!(replace_page_rotations(&mut owner, same).is_empty());
+        assert_eq!(
+            owner.page_keys_from("changed".into()).collect::<Vec<_>>(),
+            [&"changed".to_owned(), &"same".to_owned()]
+        );
+    }
+
+    #[test]
+    fn load_rotated_keys_keeps_angles_and_ignores_zero_or_invalid_rows() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = RotationDb::open_at(&temp.path().join("rotation.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "INSERT INTO rotations VALUES ('a', 90), ('b', 270), ('zero', 0), ('invalid', 45)",
+            )
+            .unwrap();
+        assert_eq!(
+            db.load_rotated_keys(),
+            std::collections::BTreeMap::from([
+                ("a".into(), Rotation::Cw90),
+                ("b".into(), Rotation::Cw270),
+            ])
+        );
+    }
 
     #[test]
     fn rotation_degrees_roundtrip() {

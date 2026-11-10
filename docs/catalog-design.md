@@ -311,7 +311,8 @@ CREATE TABLE thumbnails (
     source_width  INTEGER,                     -- 元画像 / PDF raster の幅（ピクセル）
     source_height INTEGER,                     -- 元画像 / PDF raster の高さ（ピクセル）
     layout_width  INTEGER,                     -- PDF page box 幅（1/1000 point、他はNULL）
-    layout_height INTEGER                      -- PDF page box 高さ（1/1000 point、他はNULL）
+    layout_height INTEGER,                     -- PDF page box 高さ（1/1000 point、他はNULL）
+    cover_key     TEXT                         -- 表紙の画素の由来（下記）
 );
 
 -- 本のページで WebP 保存を抑えた場合の寸法 (§1.452)
@@ -332,6 +333,15 @@ PDF の raster 丸めに依存しないページ矩形比だけを `layout_*` �
 v1 は PDF の `source_*` へ page-box 単位を書いていた。どちらも WebP から正確には補えないため、
 `pdf_layout_dims_version=2` への移行時に PDF catalog の全 page 行と通常 catalog の `pdfthumb:` 行を
 一度だけ削除・再生成し、無関係な画像 / ZIP 行は保持する。
+
+`cover_key` は `add_thumbnail_column_if_missing` で追加し、`CATALOG_VERSION=2` は変えない。
+NULL / 列なしは `Legacy`、`u` は `Unknown`、`n` は `Unrotatable`、`p:<key>` は実際に読んだページのキー。
+画素は未回転のまま保持し、メモリ・seed・writebackでも由来を同じ素材としてコピーする。
+read-only の全件・単件・prefix読取は列の有無を検出して旧DBも読み、Collectionの必須列には加えない。
+`Legacy` は回転済みの出どころを持つ通常要求だけが元ソースから作り直し、既存行は保存方針にかかわらず置換する。
+元ソースを読めなければ旧画素を保持し、CacheOnlyでは作り直さない。syntheticメモリ由来だけの旧行は親DBを新設しない。
+旧行の子を表紙に流用した結果は `Unknown` とし、具体的な固定ページが判明している場合だけその `Page` とする。
+詳細と既知の制限は [§1.718 の設計](cover-rotation-1718-plan.md) §5を参照。
 
 `page_dims` は既存 schema version を変えない追加表で、通常の writable open だけで作る。
 `save_page_dims` は元の WebP と同じキー・stamp・source/layout 寸法を記録し、既存 `thumbnails` 行の

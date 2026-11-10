@@ -5887,7 +5887,9 @@ fn load_edit_key_sets(
     if wanted.contains(&FacetEditFlag::Rotation) {
         result.rotation = crate::rotation_db::RotationDb::open()
             .map_err(|error| format!("回転 DB を読み込めませんでした: {error}"))?
-            .load_rotated_keys();
+            .load_rotated_keys()
+            .into_keys()
+            .collect();
     }
     Ok(result)
 }
@@ -5946,7 +5948,9 @@ fn load_edit_key_sets_readonly(
     {
         result.rotation = crate::rotation_db::RotationDb::open_readonly()
             .map_err(|error| format!("回転 DB を読み込めませんでした: {error}"))?
-            .load_rotated_keys();
+            .load_rotated_keys()
+            .into_keys()
+            .collect();
     }
     Ok(result)
 }
@@ -7043,10 +7047,14 @@ fn prepare_smart_folder(
                         return Ok(None);
                     }
                     if let Some(webp) = webp {
+                        let cover = crate::cover_identity::CoverIdentity::Page(
+                            crate::adjustment_db::normalize_path(&seed.video_path),
+                        );
                         let unchanged = entries.get(&seed.cache_key).is_some_and(|entry| {
                             entry.mtime == seed.mtime
                                 && entry.file_size == seed.file_size
                                 && entry.jpeg_data == webp
+                                && entry.cover == cover
                         });
                         if !unchanged
                             && !matches!(
@@ -7056,6 +7064,7 @@ fn prepare_smart_folder(
                                     seed.file_size,
                                     None,
                                     &webp,
+                                    &cover,
                                 ),
                                 Ok(true)
                             )
@@ -13563,6 +13572,144 @@ mod tests {
             &crate::bookmark_browser::BookmarkPresence::default(),
             &converted,
         ));
+    }
+
+    #[test]
+    fn smart_full_prepare_video_seed_upgrades_identity_only_and_then_preserves_the_row() {
+        use crate::cover_identity::CoverIdentity;
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource};
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let root = data.path().join("sources");
+        let folder = root.join("pinned");
+        std::fs::create_dir_all(&folder).unwrap();
+        let video = folder.join("clip.mp4");
+        std::fs::write(&video, b"video metadata only").unwrap();
+        let webp =
+            crate::catalog::encode_thumb_webp(&image::DynamicImage::new_rgb8(8, 12), 32, 80.0)
+                .unwrap()
+                .0;
+        let video_db = crate::video_pins::VideoPinDb::open().unwrap();
+        video_db.set_pin(&video, 1.0, &webp).unwrap();
+        let pins = Arc::new(
+            crate::folder_thumb_pins::FolderThumbPinDb::open_at(&data.path().join("pins.db"))
+                .unwrap(),
+        );
+        let source = FolderPinSource::File {
+            rel: "clip.mp4".into(),
+            kind: FileKind::Video,
+        };
+        pins.set(&folder, &source).unwrap();
+        let mut definition = crate::settings::SmartFolderDefinition::new("video seed");
+        definition.rules.push(rule(
+            uuid::Uuid::new_v4(),
+            root.clone(),
+            true,
+            true,
+            Default::default(),
+        ));
+        let mut entry = smart_entry(folder.to_str().unwrap(), 0, "");
+        entry.source_root = root;
+        entry.source_id = definition.rules[0].id;
+        entry.kind = SmartFolderEntryKind::Folder;
+        let snapshot = SmartFolderSnapshot {
+            file_type_visibility: Default::default(),
+            definition,
+            entries: Arc::new(vec![entry]),
+            video_thumb_overrides: HashMap::new(),
+            diag: SmartFolderDiag::default(),
+        };
+        let cache = data.path().join("catalogs");
+        let resources = SmartFolderPrepareResources {
+            catalog_work: crate::catalog::CatalogWork::capture(&cache),
+            prepare_catalog: true,
+            load_video_pins: true,
+            folder_thumb_sort: crate::settings::SortOrder::Numeric,
+            folder_thumb_depth: 3,
+            folder_pin_db: Some(pins),
+            ..Default::default()
+        };
+        let resolved = crate::folder_thumb_pins::resolve_pin_target(&folder, &source).unwrap();
+        let base = crate::thumb_loader::folder_thumb_cache_key_for_path(
+            &folder,
+            true,
+            resources.folder_thumb_sort,
+            resources.folder_thumb_depth,
+            crate::catalog::FolderThumbProvenance::Seeded,
+        )
+        .unwrap();
+        let key = crate::thumb_loader::pinned_folder_row_key(&base, &resolved.source_id, None);
+        let catalog = crate::catalog::CatalogDb::open(
+            &cache,
+            &smart_folder_synthetic_path(snapshot.definition.id),
+        )
+        .unwrap();
+        catalog
+            .save_seeded_folder_bytes(
+                &key,
+                resolved.mtime,
+                resolved.file_size,
+                None,
+                &webp,
+                &CoverIdentity::Legacy,
+            )
+            .unwrap();
+        let before = catalog.revision_state();
+        let cancel = AtomicBool::new(false);
+        let (tx, _rx) = mpsc::channel();
+        let prepare = || {
+            prepare_smart_folder(
+                snapshot.clone(),
+                crate::rating_sort::ListingOrderRequest::Standard(
+                    crate::settings::SortOrder::FileName,
+                ),
+                0,
+                Default::default(),
+                false,
+                false,
+                HashSet::new(),
+                HashSet::new(),
+                false,
+                false,
+                false,
+                None,
+                None,
+                resources.clone(),
+                &cancel,
+                &tx,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let prepared = prepare();
+        let aggregate = prepared.metadata.aggregate.as_ref().unwrap();
+        let prepared_catalog = aggregate.catalog.as_ref().unwrap();
+        let expected = CoverIdentity::Page(crate::adjustment_db::normalize_path(&video));
+        assert_eq!(prepared_catalog.entries[&key].cover, expected);
+        let row = prepared_catalog.db.load_one(&key).unwrap().unwrap();
+        assert_eq!(row.cover, expected);
+        assert_eq!(row.jpeg_data, webp);
+        assert_eq!(
+            (row.mtime, row.file_size),
+            (resolved.mtime, resolved.file_size)
+        );
+        let upgraded = catalog.revision_state();
+        assert_ne!(before, upgraded);
+        drop(prepared);
+        let prepared = prepare();
+        assert_eq!(
+            prepared
+                .metadata
+                .aggregate
+                .as_ref()
+                .unwrap()
+                .catalog
+                .as_ref()
+                .unwrap()
+                .entries[&key]
+                .cover,
+            expected
+        );
+        assert_eq!(catalog.revision_state(), upgraded);
     }
 
     #[test]

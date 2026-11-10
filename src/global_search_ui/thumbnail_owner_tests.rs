@@ -374,14 +374,32 @@ fn section1741_prepare_loads_search_catalog_instead_of_origin_catalog() {
         .open(&crate::app::search_results_synthetic_path())
         .unwrap();
     search
-        .save("search-row", 11, 22, 1, 1, None, &[1, 2, 3])
+        .save(
+            "search-row",
+            11,
+            22,
+            1,
+            1,
+            None,
+            &[1, 2, 3],
+            &crate::cover_identity::CoverIdentity::Legacy,
+        )
         .unwrap();
     let origin = request
         .catalog_work
         .open(&temp.path().join("origin"))
         .unwrap();
     origin
-        .save("origin-row", 33, 44, 1, 1, None, &[4, 5, 6])
+        .save(
+            "origin-row",
+            33,
+            44,
+            1,
+            1,
+            None,
+            &[4, 5, 6],
+            &crate::cover_identity::CoverIdentity::Legacy,
+        )
         .unwrap();
     let owner = SearchThumbnailOwner::Prepare {
         request,

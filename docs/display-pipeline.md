@@ -720,7 +720,7 @@ seed する。worker は通常の cache_hit で取り出すので、Shell API �
 
 | 変換 | 適用場所 | 備考 |
 | --- | --- | --- |
-| 回転 (DB) | 描画時の GPU 行列 | `get_rotation(idx)` で毎フレーム参照、結果は `rotation_cache` にキャッシュ |
+| 回転 (DB) | 描画時の GPU 行列 | ページは `get_rotation(idx)` / `rotation_cache`。本のタイルは画素に付いた `CoverIdentity::Page` のキーから在メモリの角度 owner を参照。Stack / SearchContainer は既知の代表ページキーを使う。詳細 hover はページも含めてメモリのみを参照し、90°/270°で表示枠の寸法も交換する |
 | EXIF Orientation | **デコード時**に適用 | 通常画像はファイル path、ZIP 内画像はエントリ bytes から読む。PDF は対象外 |
 | 非破壊編集結果 | **編集プレビューキャッシュ** | 消しゴム・補正レイヤー・隠蔽加工・テキスト／スタンプ・切り取り。編集終了時に非同期生成し、次回一覧から利用 |
 | プリセット補正 (色調のみ) | **UI スレッド同期適用** | `thumb_adjust_tex[idx]` に保持、§1.5 参照 |

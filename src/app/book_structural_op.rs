@@ -513,12 +513,20 @@ impl App {
             replace_presence(set, &moves, false);
             replace_presence(set, &copies, true);
         }
-        replace_presence(&mut self.rotation_page_keys, &moves, false);
+        let mut rotation_updates =
+            Self::rotation_page_rename_updates(&self.rotation_page_keys, &moves)
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>();
+        // Copies deliberately do not copy rotation; match the existing store policy.
         for (_, target) in &copies {
-            for key in scoped_keys(&self.rotation_page_keys, target) {
-                self.rotation_page_keys.remove(&key);
-            }
+            let cleared = Self::rotation_page_scope_rows(&self.rotation_page_keys, target)
+                .into_iter()
+                .chain(Self::rotation_page_scope_rows(&rotation_updates, target))
+                .map(|(key, _)| (key, crate::rotation_db::Rotation::None))
+                .collect::<Vec<_>>();
+            rotation_updates.extend(cleared);
         }
+        self.update_rotation_page_owner(rotation_updates);
         replace_key_map(&mut self.rating_session_writes, &moves, false);
         replace_key_map(&mut self.rating_session_writes, &copies, true);
         self.invalidate_rating_counts_cache();
@@ -707,6 +715,31 @@ fn replace_key_map<V: Clone>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rotation_owner_structural_swap_preserves_angles_and_empty_source_replaces_destination() {
+        use crate::rotation_db::{Rotation, update_page_rotations};
+        let mut owner = std::collections::BTreeMap::from([
+            ("a/page.jpg".into(), Rotation::Cw90),
+            ("b/page.jpg".into(), Rotation::Cw270),
+            ("ab/neighbor.jpg".into(), Rotation::Cw180),
+            ("a::page_1".into(), Rotation::Cw180),
+        ]);
+        let updates = App::rotation_page_rename_updates(
+            &owner,
+            &[("a".into(), "b".into()), ("b".into(), "a".into())],
+        );
+        update_page_rotations(&mut owner, updates);
+        assert_eq!(owner.get("a/page.jpg"), Some(&Rotation::Cw270));
+        assert_eq!(owner.get("b/page.jpg"), Some(&Rotation::Cw90));
+        assert_eq!(owner.get("b::page_1"), Some(&Rotation::Cw180));
+        assert!(!owner.contains_key("a::page_1"));
+        assert_eq!(owner.get("ab/neighbor.jpg"), Some(&Rotation::Cw180));
+        let updates = App::rotation_page_rename_updates(&owner, &[("missing".into(), "b".into())]);
+        update_page_rotations(&mut owner, updates);
+        assert!(!owner.contains_key("b/page.jpg"));
+        assert!(!owner.contains_key("b::page_1"));
+    }
 
     fn request(
         app: &mut App,

@@ -1164,6 +1164,108 @@ impl App {
             .extend(keys.iter().cloned());
     }
 
+    /// Only refreshable old book materials lose their request/pixels in their own context.
+    /// New identity-bearing pixels follow the shared angle owner without reloading.
+    pub(crate) fn evict_legacy_cover_thumbnails(&mut self) {
+        let matching = self
+            .items
+            .iter()
+            .zip(&self.thumbnails)
+            .enumerate()
+            .filter_map(|(idx, (item, thumbnail))| {
+                super::cover_rotation::legacy_book_cover_needs_reload(
+                    item,
+                    thumbnail,
+                    &self.rotation_page_keys,
+                )
+                .then_some(idx)
+            })
+            .collect::<Vec<_>>();
+        let mut changed = !matching.is_empty();
+        for idx in matching {
+            self.evict_thumbnail_for_reload(idx);
+        }
+        #[cfg(windows)]
+        {
+            let main = self.viewer_context_main();
+            let mut color_filter_keys = std::collections::HashSet::new();
+            for (id, slot) in self.viewer_contexts.table.slots.iter_mut() {
+                let state = match slot {
+                    Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
+                };
+                let matching = state
+                    .items
+                    .iter()
+                    .zip(&state.thumbnails)
+                    .enumerate()
+                    .filter_map(|(idx, (item, thumbnail))| {
+                        super::cover_rotation::legacy_book_cover_needs_reload(
+                            item,
+                            thumbnail,
+                            &self.rotation_page_keys,
+                        )
+                        .then_some(idx)
+                    })
+                    .collect::<std::collections::HashSet<_>>();
+                if matching.is_empty() {
+                    continue;
+                }
+                changed = true;
+                for queue in [&state.reload_queue, &state.heavy_io_queue]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Ok(mut pending) = queue.0.lock() {
+                        pending.retain(|request| {
+                            !request
+                                .grid_index()
+                                .is_some_and(|idx| matching.contains(&idx))
+                        });
+                    }
+                }
+                for idx in matching {
+                    if *id == main
+                        && let Some(item) = state.items.get(idx)
+                        && super::color_filter::color_filter_representative_supported(item)
+                    {
+                        color_filter_keys.insert(item.perf_key());
+                    }
+                    state.requested.remove(&idx);
+                    state.thumb_pixels.remove(&idx);
+                    state.thumb_edit_preview_layers.remove(&idx);
+                    state.thumb_adjust_tex.remove(&idx);
+                    state.idle_upgrade_cache_bypass_ineligible.remove(&idx);
+                    if let Some(thumbnail) = state.thumbnails.get_mut(idx) {
+                        *thumbnail = ThumbnailState::Evicted;
+                    }
+                }
+            }
+            // Color filtering retains its existing main-only authority while main is parked.
+            if !color_filter_keys.is_empty() {
+                for key in color_filter_keys {
+                    let revision = self
+                        .color_filter
+                        .palettes
+                        .representative_revisions
+                        .entry(key)
+                        .or_default();
+                    *revision = revision.wrapping_add(1);
+                }
+                self.mark_color_filter_scope_dirty();
+            }
+        }
+        if changed {
+            if let Some(ctx) = self
+                .edit_preview_repaint_ctx
+                .as_ref()
+                .cloned()
+                .or_else(|| crate::page_edit_write_epoch::PAGE_EDIT_WRITES.repaint_context())
+            {
+                ctx.request_repaint();
+            }
+        }
+    }
+
     /// Reopen baked representatives in every owner before consuming the shared refresh keys.
     pub(super) fn evict_pinned_adjustment_materializations(
         &mut self,

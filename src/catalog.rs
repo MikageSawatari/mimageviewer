@@ -7,6 +7,8 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::cover_identity::CoverIdentity;
+
 const CATALOG_VERSION: &str = "2";
 const PDF_LAYOUT_DIMS_META_KEY: &str = "pdf_layout_dims_version";
 const PDF_LAYOUT_DIMS_VERSION: &str = "2";
@@ -59,6 +61,8 @@ pub struct CacheEntry {
     pub mtime: i64,
     pub file_size: i64,
     pub jpeg_data: Vec<u8>,
+    /// The page represented by these pixels, independently of display rotation.
+    pub cover: CoverIdentity,
     /// 元画像 / PDF thumbnail raster のピクセル寸法 (幅, 高さ)。
     /// 旧バージョンで保存されたエントリには NULL が入るため Option で表現する。
     pub source_dims: Option<(u32, u32)>,
@@ -344,6 +348,7 @@ impl CatalogWork {
             self.admission,
             true,
             true,
+            columns.contains("cover_key"),
         )))
     }
 
@@ -735,35 +740,46 @@ pub fn lookup_audio_art(
     };
     let conn = db.phase()?;
     let has_absence: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='audio_art_absence')", [], |row| row.get(0))?;
-    let sql = if has_absence {
-        "SELECT thumb_data, source_width, source_height FROM thumbnails WHERE filename=?1 AND mtime=?2 AND file_size=?3 UNION ALL SELECT NULL, NULL, NULL FROM audio_art_absence WHERE filename=?1 AND mtime=?2 AND file_size=?3 LIMIT 1"
+    let cover_column = if db.has_cover_key_column {
+        "cover_key"
     } else {
-        "SELECT thumb_data, source_width, source_height FROM thumbnails WHERE filename=?1 AND mtime=?2 AND file_size=?3 LIMIT 1"
+        "NULL"
+    };
+    let sql = if has_absence {
+        format!(
+            "SELECT thumb_data, source_width, source_height, {cover_column} FROM thumbnails WHERE filename=?1 AND mtime=?2 AND file_size=?3 UNION ALL SELECT NULL, NULL, NULL, NULL FROM audio_art_absence WHERE filename=?1 AND mtime=?2 AND file_size=?3 LIMIT 1"
+        )
+    } else {
+        format!(
+            "SELECT thumb_data, source_width, source_height, {cover_column} FROM thumbnails WHERE filename=?1 AND mtime=?2 AND file_size=?3 LIMIT 1"
+        )
     };
     let row = conn
         .query_row(
-            sql,
+            &sql,
             params![key, stamp.mtime_secs, stamp.file_size],
             |row| {
                 Ok((
                     row.get::<_, Option<Vec<u8>>>(0)?,
                     row.get::<_, Option<u32>>(1)?,
                     row.get::<_, Option<u32>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             },
         )
         .optional()?;
     Ok(match row {
-        Some((Some(jpeg_data), width, height)) => AudioArtCached::Pixels(CacheEntry {
+        Some((Some(jpeg_data), width, height, cover)) => AudioArtCached::Pixels(CacheEntry {
             mtime: stamp.mtime_secs,
             file_size: stamp.file_size,
             jpeg_data,
+            cover: CoverIdentity::from_sql(cover.as_deref()),
             source_dims: valid_dims(width, height),
             layout_dims: None,
             folder_provenance: None,
             selection_proof: None,
         }),
-        Some((None, _, _)) => AudioArtCached::NoArt,
+        Some((None, _, _, _)) => AudioArtCached::NoArt,
         None => AudioArtCached::Miss,
     })
 }
@@ -804,7 +820,7 @@ pub fn save_audio_art_pixels_with_cancel_check(
     ensure_audio_art_schema(&conn)?;
     let tx = conn.unchecked_transaction()?;
     tx.execute("DELETE FROM audio_art_absence WHERE filename=?1", [key])?;
-    tx.execute("INSERT OR REPLACE INTO thumbnails (filename,mtime,file_size,width,height,thumb_data,source_width,source_height) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", params![key,entry.mtime,entry.file_size,width,height,entry.jpeg_data,entry.source_dims.map(|d| d.0),entry.source_dims.map(|d| d.1)])?;
+    tx.execute("INSERT OR REPLACE INTO thumbnails (filename,mtime,file_size,width,height,thumb_data,source_width,source_height,cover_key) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![key,entry.mtime,entry.file_size,width,height,entry.jpeg_data,entry.source_dims.map(|d| d.0),entry.source_dims.map(|d| d.1),CoverIdentity::Unrotatable.to_sql()])?;
     if should_cancel() {
         return Ok(false);
     }
@@ -911,6 +927,7 @@ pub struct CatalogDb {
     database_path: Option<PathBuf>,
     has_layout_dims_columns: bool,
     has_folder_proof_columns: bool,
+    has_cover_key_column: bool,
     read_only: bool,
 }
 
@@ -1027,6 +1044,7 @@ impl CatalogDb {
         admission: CatalogAdmission,
         has_layout_dims_columns: bool,
         has_folder_proof_columns: bool,
+        has_cover_key_column: bool,
     ) -> Self {
         let read_only = connection
             .is_readonly(rusqlite::DatabaseName::Main)
@@ -1044,6 +1062,7 @@ impl CatalogDb {
             database_path,
             has_layout_dims_columns,
             has_folder_proof_columns,
+            has_cover_key_column,
             read_only,
         }
     }
@@ -1222,6 +1241,7 @@ impl CatalogDb {
             admission,
             true,
             true,
+            true,
         ))
     }
 
@@ -1260,12 +1280,14 @@ impl CatalogDb {
             && thumbnail_column_exists(&conn, "layout_height")?;
         let has_folder_proof_columns = thumbnail_column_exists(&conn, "folder_provenance")?
             && thumbnail_column_exists(&conn, "selection_proof")?;
+        let has_cover_key_column = thumbnail_column_exists(&conn, "cover_key")?;
         Ok(Self::from_connection(
             conn,
             access.clone(),
             admission,
             has_layout_dims_columns,
             has_folder_proof_columns,
+            has_cover_key_column,
         ))
     }
 
@@ -1373,9 +1395,14 @@ impl CatalogDb {
         } else {
             "NULL, NULL"
         };
+        let cover_column = if self.has_cover_key_column {
+            "cover_key"
+        } else {
+            "NULL"
+        };
         let sql = format!(
             "SELECT filename, mtime, file_size, thumb_data, source_width, source_height, \
-                    {layout_columns}, {proof_columns} FROM thumbnails WHERE substr(filename,1,9) <> 'audioart:'"
+                    {layout_columns}, {proof_columns}, {cover_column} FROM thumbnails WHERE substr(filename,1,9) <> 'audioart:'"
         );
         let mut stmt = conn.prepare(&sql)?;
         let mut map = HashMap::new();
@@ -1391,6 +1418,7 @@ impl CatalogDb {
                 row.get::<_, Option<u32>>(7)?,
                 row.get::<_, Option<String>>(8)?,
                 row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
             ))
         })?;
         for item in iter.flatten() {
@@ -1405,6 +1433,7 @@ impl CatalogDb {
                 layout_h,
                 provenance,
                 proof,
+                cover,
             ) = item;
             let source_dims = match (src_w, src_h) {
                 (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
@@ -1416,6 +1445,7 @@ impl CatalogDb {
                     mtime,
                     file_size,
                     jpeg_data,
+                    cover: CoverIdentity::from_sql(cover.as_deref()),
                     source_dims,
                     layout_dims: valid_dims(layout_w, layout_h),
                     folder_provenance: provenance
@@ -1441,9 +1471,14 @@ impl CatalogDb {
         } else {
             "NULL, NULL"
         };
+        let cover_column = if self.has_cover_key_column {
+            "cover_key"
+        } else {
+            "NULL"
+        };
         let sql = format!(
             "SELECT mtime, file_size, thumb_data, source_width, source_height, \
-                    {layout_columns}, {proof_columns} FROM thumbnails WHERE filename = ?1"
+                    {layout_columns}, {proof_columns}, {cover_column} FROM thumbnails WHERE filename = ?1"
         );
         let mut stmt = conn.prepare(&sql)?;
         let mut iter = stmt.query_map(params![filename], |row| {
@@ -1457,11 +1492,22 @@ impl CatalogDb {
                 row.get::<_, Option<u32>>(6)?,
                 row.get::<_, Option<String>>(7)?,
                 row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         })?;
         if let Some(item) = iter.next() {
-            let (mtime, file_size, jpeg_data, src_w, src_h, layout_w, layout_h, provenance, proof) =
-                item?;
+            let (
+                mtime,
+                file_size,
+                jpeg_data,
+                src_w,
+                src_h,
+                layout_w,
+                layout_h,
+                provenance,
+                proof,
+                cover,
+            ) = item?;
             let source_dims = match (src_w, src_h) {
                 (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
                 _ => None,
@@ -1470,6 +1516,7 @@ impl CatalogDb {
                 mtime,
                 file_size,
                 jpeg_data,
+                cover: CoverIdentity::from_sql(cover.as_deref()),
                 source_dims,
                 layout_dims: valid_dims(layout_w, layout_h),
                 folder_provenance: provenance.and_then(|value| serde_json::from_str(&value).ok()),
@@ -1506,9 +1553,14 @@ impl CatalogDb {
         } else {
             "NULL, NULL"
         };
+        let cover_column = if self.has_cover_key_column {
+            "cover_key"
+        } else {
+            "NULL"
+        };
         let sql = format!(
             "SELECT filename, mtime, file_size, thumb_data, source_width, source_height, \
-                    {layout_columns}, {proof_columns} FROM thumbnails \
+                    {layout_columns}, {proof_columns}, {cover_column} FROM thumbnails \
              WHERE substr(filename, 1, ?1) = ?2 AND (?3 IS NULL OR (mtime = ?3 AND file_size = ?4)) \
              ORDER BY mtime DESC, file_size DESC, filename DESC \
              LIMIT 1"
@@ -1533,6 +1585,7 @@ impl CatalogDb {
                     row.get::<_, Option<u32>>(7)?,
                     row.get::<_, Option<String>>(8)?,
                     row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
                 ))
             },
         )?;
@@ -1548,6 +1601,7 @@ impl CatalogDb {
                 layout_h,
                 provenance,
                 proof,
+                cover,
             ) = item?;
             let source_dims = match (src_w, src_h) {
                 (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
@@ -1559,6 +1613,7 @@ impl CatalogDb {
                     mtime,
                     file_size,
                     jpeg_data,
+                    cover: CoverIdentity::from_sql(cover.as_deref()),
                     source_dims,
                     layout_dims: valid_dims(layout_w, layout_h),
                     folder_provenance: provenance
@@ -1574,6 +1629,7 @@ impl CatalogDb {
     ///
     /// `width` / `height` はキャッシュされる WebP サムネイルの寸法、
     /// `source_dims` は元画像 / PDF raster のピクセル寸法 (未取得なら None)。
+    /// `cover` identifies the page represented by the unrotated pixels.
     #[allow(clippy::too_many_arguments)]
     pub fn save(
         &self,
@@ -1584,6 +1640,7 @@ impl CatalogDb {
         height: u32,
         source_dims: Option<(u32, u32)>,
         jpeg_data: &[u8],
+        cover: &CoverIdentity,
     ) -> rusqlite::Result<()> {
         self.save_with_layout_dims(
             filename,
@@ -1594,6 +1651,7 @@ impl CatalogDb {
             source_dims,
             None,
             jpeg_data,
+            cover,
         )
     }
 
@@ -1609,6 +1667,7 @@ impl CatalogDb {
         source_dims: Option<(u32, u32)>,
         layout_dims: Option<(u32, u32)>,
         jpeg_data: &[u8],
+        cover: &CoverIdentity,
     ) -> rusqlite::Result<()> {
         self.save_with_folder_proof(
             filename,
@@ -1621,6 +1680,7 @@ impl CatalogDb {
             jpeg_data,
             None,
             None,
+            cover,
         )
     }
 
@@ -1637,6 +1697,7 @@ impl CatalogDb {
         jpeg_data: &[u8],
         provenance: Option<FolderThumbProvenance>,
         proof: Option<&FolderSelectionProof>,
+        cover: &CoverIdentity,
     ) -> rusqlite::Result<()> {
         let conn = self.phase()?;
         let src_w: Option<u32> = source_dims.map(|(w, _)| w);
@@ -1654,8 +1715,8 @@ impl CatalogDb {
         conn.execute(
             "INSERT OR REPLACE INTO thumbnails \
               (filename, mtime, file_size, width, height, thumb_data, source_width, source_height, \
-               layout_width, layout_height, folder_provenance, selection_proof) \
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+               layout_width, layout_height, folder_provenance, selection_proof, cover_key) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 filename,
                 mtime,
@@ -1668,7 +1729,8 @@ impl CatalogDb {
                 layout_w,
                 layout_h,
                 provenance_json,
-                proof_json
+                proof_json,
+                cover.to_sql()
             ],
         )?;
         Ok(())
@@ -1690,6 +1752,7 @@ impl CatalogDb {
         file_size: i64,
         source_dims: Option<(u32, u32)>,
         jpeg_data: &[u8],
+        cover: &CoverIdentity,
     ) -> rusqlite::Result<bool> {
         self.save_thumb_bytes_with_layout_dims(
             filename,
@@ -1698,6 +1761,7 @@ impl CatalogDb {
             source_dims,
             None,
             jpeg_data,
+            cover,
         )
     }
 
@@ -1710,6 +1774,7 @@ impl CatalogDb {
         source_dims: Option<(u32, u32)>,
         layout_dims: Option<(u32, u32)>,
         jpeg_data: &[u8],
+        cover: &CoverIdentity,
     ) -> rusqlite::Result<bool> {
         let Some((w, h)) = decode_thumb_dims(jpeg_data) else {
             // 寸法が取れない (= 壊れたバイト列) なら保存を断念。SQLite スキーマ上
@@ -1725,6 +1790,7 @@ impl CatalogDb {
             source_dims,
             layout_dims,
             jpeg_data,
+            cover,
         )?;
         Ok(true)
     }
@@ -1738,6 +1804,7 @@ impl CatalogDb {
         layout_dims: Option<(u32, u32)>,
         data: &[u8],
         proof: Option<&FolderSelectionProof>,
+        cover: &CoverIdentity,
     ) -> rusqlite::Result<bool> {
         let Some((width, height)) = decode_thumb_dims(data) else {
             return Ok(false);
@@ -1753,6 +1820,7 @@ impl CatalogDb {
             data,
             Some(FolderThumbProvenance::AutoSelected),
             proof,
+            cover,
         )?;
         Ok(true)
     }
@@ -1764,6 +1832,7 @@ impl CatalogDb {
         file_size: i64,
         source_dims: Option<(u32, u32)>,
         data: &[u8],
+        cover: &CoverIdentity,
     ) -> rusqlite::Result<bool> {
         let Some((width, height)) = decode_thumb_dims(data) else {
             return Ok(false);
@@ -1779,6 +1848,7 @@ impl CatalogDb {
             data,
             Some(FolderThumbProvenance::Seeded),
             None,
+            cover,
         )?;
         Ok(true)
     }
@@ -1827,10 +1897,10 @@ impl CatalogDb {
             tx.execute(
                 "INSERT OR REPLACE INTO thumbnails \
                  (filename, mtime, file_size, width, height, thumb_data, source_width, source_height, \
-                  layout_width, layout_height, folder_provenance, selection_proof) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, NULL, ?7, NULL)",
+                  layout_width, layout_height, folder_provenance, selection_proof, cover_key) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, NULL, ?7, NULL, ?8)",
                 params![key, entry.mtime, entry.file_size, width, height, entry.jpeg_data,
-                    serde_json::to_string(&FolderThumbProvenance::Seeded).unwrap()],
+                    serde_json::to_string(&FolderThumbProvenance::Seeded).unwrap(), entry.cover.to_sql()],
             )?;
         }
         if cancel.load(Ordering::Relaxed) {
@@ -2187,7 +2257,8 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              layout_width   INTEGER,
               layout_height  INTEGER,
               folder_provenance TEXT,
-              selection_proof TEXT
+              selection_proof TEXT,
+              cover_key TEXT
          );
          CREATE TABLE IF NOT EXISTS page_dims (
              filename       TEXT    NOT NULL PRIMARY KEY,
@@ -2266,6 +2337,12 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
     )?;
 
     // バージョン不一致（スキーマ変更）の場合は全削除して再生成
+    add_thumbnail_column_if_missing(
+        conn,
+        "cover_key",
+        "ALTER TABLE thumbnails ADD COLUMN cover_key TEXT",
+    )?;
+
     let version: Option<String> = conn
         .query_row("SELECT value FROM meta WHERE key = 'version'", [], |r| {
             r.get(0)
@@ -2875,13 +2952,15 @@ mod tests {
             CatalogAdmission::Admitted(0),
             true,
             true,
+            true,
         )
     }
 
     #[test]
     fn pin_materialization_batch_rolls_back_delete_when_seed_fails() {
         let db = open_in_memory();
-        db.save("old", 1, 1, 1, 1, None, b"old").unwrap();
+        db.save("old", 1, 1, 1, 1, None, b"old", &CoverIdentity::Legacy)
+            .unwrap();
         db.conn.lock().unwrap().execute_batch("CREATE TRIGGER reject_seed BEFORE INSERT ON thumbnails WHEN NEW.filename = 'seed' BEGIN SELECT RAISE(ABORT, 'rejected seed'); END;").unwrap();
         let mut bytes = Vec::new();
         image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
@@ -2898,6 +2977,7 @@ mod tests {
             mtime: 2,
             file_size: 2,
             jpeg_data: bytes,
+            cover: CoverIdentity::Legacy,
             source_dims: None,
             layout_dims: None,
             folder_provenance: Some(FolderThumbProvenance::Seeded),
@@ -2918,7 +2998,8 @@ mod tests {
     #[test]
     fn pin_materialization_cancelled_owner_cannot_delete_newer_seed() {
         let db = std::sync::Arc::new(open_in_memory());
-        db.save("newer", 2, 2, 1, 1, None, b"newer").unwrap();
+        db.save("newer", 2, 2, 1, 1, None, b"newer", &CoverIdentity::Legacy)
+            .unwrap();
         let guard = db.conn.lock().unwrap();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_db = db.clone();
@@ -2954,10 +3035,12 @@ mod tests {
             "folderthumb:auto-v2:numeric:d3:child#pin:video",
             "folderthumb:auto-v3:numeric:d3:C:\\child#pin:folder",
         ] {
-            db.save(key, 1, 2, 1, 1, None, b"bytes").unwrap();
+            db.save(key, 1, 2, 1, 1, None, b"bytes", &CoverIdentity::Legacy)
+                .unwrap();
             expected += 1;
             assert_eq!(revision(&db).revision, expected, "insert {key}");
-            db.save(key, 2, 3, 1, 1, None, b"bytes2").unwrap();
+            db.save(key, 2, 3, 1, 1, None, b"bytes2", &CoverIdentity::Legacy)
+                .unwrap();
             expected += 1;
             assert_eq!(revision(&db).revision, expected, "replace {key}");
             db.delete_one(key).unwrap();
@@ -2972,9 +3055,20 @@ mod tests {
             1,
             None,
             b"bytes",
+            &CoverIdentity::Legacy,
         )
         .unwrap();
-        db.save("image.jpg", 1, 2, 1, 1, None, b"bytes").unwrap();
+        db.save(
+            "image.jpg",
+            1,
+            2,
+            1,
+            1,
+            None,
+            b"bytes",
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
         assert_eq!(
             revision(&db).revision,
             expected,
@@ -3011,8 +3105,17 @@ mod tests {
         let folder = temp.path().join("folder");
         let db = CatalogDb::open(&cache, &folder).unwrap();
         let first_instance = revision(&db).instance_id;
-        db.save("zipthumb:book.zip", 1, 2, 1, 1, None, b"bytes")
-            .unwrap();
+        db.save(
+            "zipthumb:book.zip",
+            1,
+            2,
+            1,
+            1,
+            None,
+            b"bytes",
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
         let before = revision(&db).revision;
         db.delete_missing(&HashSet::new()).unwrap();
         assert_eq!(revision(&db).revision, before + 1);
@@ -3098,7 +3201,16 @@ mod tests {
         // Opening an old schema may prune released rows; triggers were installed
         // before that migration. Exercise a fresh row through the public writer.
         writable
-            .save("zipthumb:book.zip", 1, 2, 1, 1, None, b"bytes")
+            .save(
+                "zipthumb:book.zip",
+                1,
+                2,
+                1,
+                1,
+                None,
+                b"bytes",
+                &CoverIdentity::Legacy,
+            )
             .unwrap();
         let before = revision(&writable).revision;
         writable.delete_one("zipthumb:book.zip").unwrap();
@@ -3339,7 +3451,17 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let folder = temp.path().join("music");
         let db = std::sync::Arc::new(CatalogDb::open(temp.path(), &folder).unwrap());
-        db.save("photo.jpg", 1, 2, 1, 1, None, b"pixels").unwrap();
+        db.save(
+            "photo.jpg",
+            1,
+            2,
+            1,
+            1,
+            None,
+            b"pixels",
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
         assert_eq!(delete_all_cache(temp.path()), 1);
         assert!(!db_path_for(temp.path(), &folder).exists());
         assert!(db.load_one("photo.jpg").is_err());
@@ -3368,6 +3490,7 @@ mod tests {
             mtime: 7,
             file_size: 13,
             jpeg_data: encode_thumb_webp(&image, 2, 80.0).unwrap().0,
+            cover: CoverIdentity::Legacy,
             source_dims: Some((2, 3)),
             layout_dims: None,
             folder_provenance: None,
@@ -3380,14 +3503,24 @@ mod tests {
         save_audio_art_absence(temp.path(), &c, &cn, stamp, admission, &cancel).unwrap();
         save_audio_art_absence(temp.path(), &d, &dn, stamp, admission, &cancel).unwrap();
         let db = CatalogDb::open(temp.path(), &c.parent).unwrap();
-        db.save("photo.jpg", 1, 1, 1, 1, None, b"photo").unwrap();
+        db.save(
+            "photo.jpg",
+            1,
+            1,
+            1,
+            1,
+            None,
+            b"photo",
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
         assert_eq!(db.load_all().unwrap().len(), 1);
         assert_eq!(db.load_source_dims().unwrap().len(), 1);
         assert!(db.load_source_dims_matching(7, 13).unwrap().is_empty());
         db.delete_missing(&HashSet::new()).unwrap();
         assert!(matches!(
             lookup_audio_art(temp.path(), &c, &ck, stamp, admission).unwrap(),
-            AudioArtCached::Pixels(_)
+            AudioArtCached::Pixels(entry) if entry.cover == CoverIdentity::Unrotatable
         ));
         assert!(matches!(
             lookup_audio_art(temp.path(), &d, &dk, stamp, admission).unwrap(),
@@ -3480,6 +3613,7 @@ mod tests {
             layout_dims: None,
             folder_provenance: None,
             selection_proof: None,
+            cover: CoverIdentity::Legacy,
         };
         save_audio_art_pixels(temp.path(), &scope, &key, &entry, admission, &cancel).unwrap();
         assert!(matches!(
@@ -3523,8 +3657,17 @@ mod tests {
         ));
         assert!(!db_path_for(temp.path(), &scope.parent).exists());
         let db = CatalogDb::open(temp.path(), &scope.parent).unwrap();
-        db.save("original.jpg", 1, 2, 1, 1, None, b"released")
-            .unwrap();
+        db.save(
+            "original.jpg",
+            1,
+            2,
+            1,
+            1,
+            None,
+            b"released",
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
         assert!(matches!(
             lookup_audio_art(temp.path(), &scope, &key, stamp, admission).unwrap(),
             AudioArtCached::Miss
@@ -3620,7 +3763,17 @@ mod tests {
             let parent = Path::new(r"C:\clear-wal");
             let path = db_path_for(temp.path(), parent);
             let db = CatalogDb::open(temp.path(), parent).unwrap();
-            db.save("photo.jpg", 1, 2, 1, 1, None, b"cached").unwrap();
+            db.save(
+                "photo.jpg",
+                1,
+                2,
+                1,
+                1,
+                None,
+                b"cached",
+                &CoverIdentity::Legacy,
+            )
+            .unwrap();
             let reader = CatalogDb::open_existing_read_only(temp.path(), parent)
                 .unwrap()
                 .unwrap();
@@ -3692,7 +3845,18 @@ mod tests {
         let parent = Path::new(r"C:\same-folder");
         let cleared = CatalogDb::open(&cleared_cache, parent).unwrap();
         let other = CatalogDb::open(&other_cache, parent).unwrap();
-        other.save("keep.jpg", 1, 2, 1, 1, None, b"keep").unwrap();
+        other
+            .save(
+                "keep.jpg",
+                1,
+                2,
+                1,
+                1,
+                None,
+                b"keep",
+                &CoverIdentity::Legacy,
+            )
+            .unwrap();
         let other_path = db_path_for(&other_cache, parent);
         let wal = catalog_test_sidecar(&other_path, "-wal");
         let before = std::fs::read(&wal).unwrap();
@@ -3806,7 +3970,17 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let parent = temp.path().join("music");
         let db = CatalogDb::open(temp.path(), &parent).unwrap();
-        db.save("photo.jpg", 1, 2, 1, 1, None, b"released").unwrap();
+        db.save(
+            "photo.jpg",
+            1,
+            2,
+            1,
+            1,
+            None,
+            b"released",
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
         assert_eq!(delete_old_cache(temp.path(), 365), 0);
         assert!(db.is_retired());
         let entry = db
@@ -4001,6 +4175,7 @@ mod tests {
             layout_dims: None,
             folder_provenance: None,
             selection_proof: None,
+            cover: CoverIdentity::Legacy,
         };
         save_audio_art_pixels(temp.path(), &scope, &key, &entry, admission, &cancel).unwrap();
         let calls = std::cell::Cell::new(0);
@@ -4080,7 +4255,17 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let parent = temp.path().join("music");
         let db = std::sync::Arc::new(CatalogDb::open(temp.path(), &parent).unwrap());
-        db.save("photo.jpg", 1, 2, 1, 1, None, b"released").unwrap();
+        db.save(
+            "photo.jpg",
+            1,
+            2,
+            1,
+            1,
+            None,
+            b"released",
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
         let access = CatalogAccess::for_cache_dir(temp.path());
         let deletion = access.begin_delete(CatalogDeleteOperation::All).unwrap();
         deletion.retire_connections();
@@ -4109,7 +4294,16 @@ mod tests {
         assert!(db.load_one("photo.jpg").is_err());
         let in_memory = open_in_memory();
         in_memory
-            .save("photo.jpg", 1, 2, 1, 1, None, b"pixels")
+            .save(
+                "photo.jpg",
+                1,
+                2,
+                1,
+                1,
+                None,
+                b"pixels",
+                &CoverIdentity::Legacy,
+            )
             .unwrap();
         assert!(
             in_memory
@@ -4141,6 +4335,196 @@ mod tests {
         assert!(columns.contains("source_height"));
         assert!(columns.contains("layout_width"));
         assert!(columns.contains("layout_height"));
+        assert!(columns.contains("cover_key"));
+    }
+
+    #[test]
+    fn cover_identity_additive_migration_preserves_legacy_rows_and_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("photos");
+        let path = db_path_for(temp.path(), &folder);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta VALUES ('version', '2');
+             CREATE TABLE thumbnails (
+                 filename TEXT PRIMARY KEY, mtime INTEGER, file_size INTEGER,
+                 width INTEGER, height INTEGER, thumb_data BLOB,
+                 source_width INTEGER, source_height INTEGER,
+                 layout_width INTEGER, layout_height INTEGER,
+                 folder_provenance TEXT, selection_proof TEXT
+             );
+             INSERT INTO thumbnails VALUES
+                 ('image.jpg', 1, 2, 3, 4, X'0102', 30, 40, NULL, NULL, NULL, NULL);",
+        )
+        .unwrap();
+        drop(conn);
+
+        // The lazy reader must accept the pre-cover schema without migrating it.
+        let work = CatalogWork::capture(temp.path());
+        let reader = work
+            .open_existing_collection_parent(&folder)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reader.load_all().unwrap()["image.jpg"].cover,
+            CoverIdentity::Legacy
+        );
+        assert_eq!(
+            reader.load_one("image.jpg").unwrap().unwrap().cover,
+            CoverIdentity::Legacy
+        );
+        assert_eq!(
+            reader
+                .load_latest_with_prefix("image")
+                .unwrap()
+                .unwrap()
+                .1
+                .cover,
+            CoverIdentity::Legacy
+        );
+        assert!(!thumbnail_column_exists(&reader.phase().unwrap(), "cover_key").unwrap());
+        drop(reader);
+
+        let db = CatalogDb::open(temp.path(), &folder).unwrap();
+        let entry = db.load_one("image.jpg").unwrap().unwrap();
+        assert_eq!(entry.jpeg_data, [1, 2]);
+        assert_eq!(entry.cover, CoverIdentity::Legacy);
+        let conn = db.phase().unwrap();
+        assert!(thumbnail_column_exists(&conn, "cover_key").unwrap());
+        let version: String = conn
+            .query_row("SELECT value FROM meta WHERE key='version'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, "2");
+        assert_eq!(CATALOG_VERSION, "2");
+    }
+
+    #[test]
+    fn cover_identity_round_trips_all_catalog_readers() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("photos");
+        let db = CatalogDb::open(temp.path(), &folder).unwrap();
+        let covers = [
+            CoverIdentity::Legacy,
+            CoverIdentity::Unknown,
+            CoverIdentity::Unrotatable,
+            CoverIdentity::Page("c:/book.zip::nested/001.png".into()),
+        ];
+        for (index, cover) in covers.iter().enumerate() {
+            db.save(&format!("row{index}"), 1, 2, 3, 4, None, b"pixels", cover)
+                .unwrap();
+        }
+        drop(db);
+        let db = CatalogDb::open_existing_read_only(temp.path(), &folder)
+            .unwrap()
+            .unwrap();
+        let all = db.load_all().unwrap();
+        for (index, cover) in covers.iter().enumerate() {
+            let key = format!("row{index}");
+            assert_eq!(&all[&key].cover, cover);
+            assert_eq!(&db.load_one(&key).unwrap().unwrap().cover, cover);
+            assert_eq!(
+                &db.load_latest_with_prefix_matching(&key, Some((1, 2)))
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .cover,
+                cover
+            );
+        }
+    }
+
+    #[test]
+    fn cover_identity_audio_art_reads_legacy_schema_with_and_without_absence_table() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = AudioArtCatalogScope::new(&temp.path().join("music"));
+        let key = scope.key_for(&scope.parent.join("song.mp3"));
+        let path = db_path_for(temp.path(), &scope.parent);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE thumbnails (
+                filename TEXT PRIMARY KEY, mtime INTEGER, file_size INTEGER,
+                thumb_data BLOB, source_width INTEGER, source_height INTEGER
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO thumbnails VALUES (?1, 1, 2, X'0102', 30, 40)",
+            [&key],
+        )
+        .unwrap();
+        let stamp = AudioArtSourceStamp {
+            mtime_secs: 1,
+            file_size: 2,
+        };
+        let admission = CatalogAccess::for_cache_dir(temp.path()).admit();
+        for has_absence in [false, true] {
+            if has_absence {
+                ensure_audio_art_schema(&conn).unwrap();
+            }
+            let AudioArtCached::Pixels(entry) =
+                lookup_audio_art(temp.path(), &scope, &key, stamp, admission).unwrap()
+            else {
+                panic!("legacy audio thumbnail must remain readable");
+            };
+            assert_eq!(entry.cover, CoverIdentity::Legacy);
+            assert_eq!(entry.jpeg_data, [1, 2]);
+            assert_eq!(entry.source_dims, Some((30, 40)));
+        }
+        assert!(!thumbnail_column_exists(&conn, "cover_key").unwrap());
+    }
+
+    #[test]
+    fn cover_identity_is_written_by_every_thumbnail_save_boundary() {
+        let db = open_in_memory();
+        let data = encode_thumb_webp(&image::DynamicImage::new_rgb8(2, 3), 3, 80.0)
+            .unwrap()
+            .0;
+        let cover = CoverIdentity::Page("c:/book.zip::001.png".into());
+        db.save("save", 1, 2, 2, 3, None, &data, &cover).unwrap();
+        db.save_with_layout_dims("layout", 1, 2, 2, 3, None, None, &data, &cover)
+            .unwrap();
+        db.save_with_folder_proof("proof", 1, 2, 2, 3, None, None, &data, None, None, &cover)
+            .unwrap();
+        assert!(
+            db.save_thumb_bytes("bytes", 1, 2, None, &data, &cover)
+                .unwrap()
+        );
+        assert!(
+            db.save_thumb_bytes_with_layout_dims("bytes_layout", 1, 2, None, None, &data, &cover)
+                .unwrap()
+        );
+        assert!(
+            db.save_auto_folder_bytes("auto", 1, 2, None, None, &data, None, &cover)
+                .unwrap()
+        );
+        assert!(
+            db.save_seeded_folder_bytes("seed", 1, 2, None, &data, &cover)
+                .unwrap()
+        );
+        let entry = CacheEntry {
+            mtime: 1,
+            file_size: 2,
+            jpeg_data: data,
+            cover: cover.clone(),
+            source_dims: None,
+            layout_dims: None,
+            folder_provenance: None,
+            selection_proof: None,
+        };
+        assert!(
+            db.commit_pin_materializations(&[], &[("pin".into(), entry)], &AtomicBool::new(false))
+                .unwrap()
+        );
+        let rows = db.load_all().unwrap();
+        assert_eq!(rows.len(), 8);
+        for entry in rows.values() {
+            assert_eq!(entry.cover, cover);
+        }
     }
 
     #[test]
@@ -4157,6 +4541,7 @@ mod tests {
             473,
             Some((595_276, 841_890)),
             b"development-v1",
+            &CoverIdentity::Legacy,
         )
         .unwrap();
         db.conn
@@ -4181,6 +4566,7 @@ mod tests {
                 Some((327, 473)),
                 Some((595_276, 841_890)),
                 b"fixed",
+                &CoverIdentity::Legacy,
             )
             .unwrap();
         drop(migrated);
@@ -4203,8 +4589,17 @@ mod tests {
         let cache_dir = tmp.path().join("cache");
         let folder = tmp.path().join("photos");
         let db = CatalogDb::open(&cache_dir, &folder).unwrap();
-        db.save("image.jpg", 1, 10, 8, 8, Some((4000, 3000)), b"image")
-            .unwrap();
+        db.save(
+            "image.jpg",
+            1,
+            10,
+            8,
+            8,
+            Some((4000, 3000)),
+            b"image",
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
         db.save(
             "pdfthumb:book.pdf",
             1,
@@ -4213,6 +4608,7 @@ mod tests {
             8,
             Some((327, 473)),
             b"legacy-pdf",
+            &CoverIdentity::Legacy,
         )
         .unwrap();
         db.conn
@@ -4244,6 +4640,7 @@ mod tests {
             192,
             Some((4000, 3000)),
             b"fake_webp",
+            &CoverIdentity::Legacy,
         )
         .unwrap();
 
@@ -4269,6 +4666,7 @@ mod tests {
             Some((273, 416)),
             Some((468_600, 714_360)),
             b"fake_webp",
+            &CoverIdentity::Legacy,
         )
         .unwrap();
 
@@ -4338,7 +4736,12 @@ mod tests {
         let all = db.load_all().unwrap();
         assert_eq!(all["image.jpg"].source_dims, Some((4000, 3000)));
         assert_eq!(all["image.jpg"].layout_dims, None);
+        assert_eq!(all["image.jpg"].cover, CoverIdentity::Legacy);
         assert_eq!(db.load_one("image.jpg").unwrap().unwrap().layout_dims, None);
+        assert_eq!(
+            db.load_one("image.jpg").unwrap().unwrap().cover,
+            CoverIdentity::Legacy
+        );
         assert_eq!(
             db.load_latest_with_prefix("image")
                 .unwrap()
@@ -4347,15 +4750,42 @@ mod tests {
                 .layout_dims,
             None
         );
+        assert_eq!(
+            db.load_latest_with_prefix("image")
+                .unwrap()
+                .unwrap()
+                .1
+                .cover,
+            CoverIdentity::Legacy
+        );
+        assert!(!thumbnail_column_exists(&db.phase().unwrap(), "cover_key").unwrap());
     }
 
     #[test]
     fn catalog_save_overwrites() {
         let db = open_in_memory();
-        db.save("img.jpg", 100, 500, 128, 96, None, b"data1")
-            .unwrap();
-        db.save("img.jpg", 200, 600, 128, 96, None, b"data2")
-            .unwrap();
+        db.save(
+            "img.jpg",
+            100,
+            500,
+            128,
+            96,
+            None,
+            b"data1",
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
+        db.save(
+            "img.jpg",
+            200,
+            600,
+            128,
+            96,
+            None,
+            b"data2",
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
 
         let map = db.load_all().unwrap();
         assert_eq!(map.len(), 1);
@@ -4366,8 +4796,17 @@ mod tests {
     #[test]
     fn catalog_source_dims_none() {
         let db = open_in_memory();
-        db.save("no_dims.jpg", 100, 500, 128, 96, None, b"data")
-            .unwrap();
+        db.save(
+            "no_dims.jpg",
+            100,
+            500,
+            128,
+            96,
+            None,
+            b"data",
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
 
         let map = db.load_all().unwrap();
         assert_eq!(map["no_dims.jpg"].source_dims, None);
@@ -4378,10 +4817,28 @@ mod tests {
         // Callers use the difference to decide whether reading a thumbnail is worth it:
         // a missing row has nothing to recover, an empty one predates the columns.
         let db = open_in_memory();
-        db.save("wide.jpg", 1, 10, 128, 96, Some((4000, 3000)), b"thumb")
-            .unwrap();
-        db.save("legacy.jpg", 2, 20, 128, 96, None, b"thumb")
-            .unwrap();
+        db.save(
+            "wide.jpg",
+            1,
+            10,
+            128,
+            96,
+            Some((4000, 3000)),
+            b"thumb",
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
+        db.save(
+            "legacy.jpg",
+            2,
+            20,
+            128,
+            96,
+            None,
+            b"thumb",
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
 
         let dims = db.load_source_dims().unwrap();
         assert_eq!(dims.get("wide.jpg"), Some(&Some((4000, 3000))));
@@ -4393,11 +4850,30 @@ mod tests {
     #[test]
     fn source_dims_query_agrees_with_the_full_load_it_replaces() {
         let db = open_in_memory();
-        db.save("a.jpg", 1, 10, 128, 96, Some((1200, 1800)), b"a")
+        db.save(
+            "a.jpg",
+            1,
+            10,
+            128,
+            96,
+            Some((1200, 1800)),
+            b"a",
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
+        db.save(
+            "b.jpg",
+            2,
+            20,
+            128,
+            96,
+            Some((1800, 1200)),
+            b"b",
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
+        db.save("c.jpg", 3, 30, 128, 96, None, b"c", &CoverIdentity::Legacy)
             .unwrap();
-        db.save("b.jpg", 2, 20, 128, 96, Some((1800, 1200)), b"b")
-            .unwrap();
-        db.save("c.jpg", 3, 30, 128, 96, None, b"c").unwrap();
 
         let full = db.load_all().unwrap();
         let dims = db.load_source_dims().unwrap();
@@ -4410,8 +4886,17 @@ mod tests {
     #[test]
     fn page_dims_preserves_old_webp_and_returns_new_dimensions() {
         let db = open_in_memory();
-        db.save("page_0000", 1, 10, 8, 12, Some((800, 1200)), b"old_webp")
-            .unwrap();
+        db.save(
+            "page_0000",
+            1,
+            10,
+            8,
+            12,
+            Some((800, 1200)),
+            b"old_webp",
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
         db.save_page_dims(
             "page_0000",
             2,
@@ -4439,8 +4924,17 @@ mod tests {
     #[test]
     fn page_dims_updates_legacy_null_dimensions_without_replacing_webp() {
         let db = open_in_memory();
-        db.save("page.jpg", 1, 10, 8, 12, None, b"legacy_webp")
-            .unwrap();
+        db.save(
+            "page.jpg",
+            1,
+            10,
+            8,
+            12,
+            None,
+            b"legacy_webp",
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
         db.save_page_dims("page.jpg", 1, 10, Some((1200, 800)), None)
             .unwrap();
         assert_eq!(
@@ -4459,8 +4953,17 @@ mod tests {
     #[test]
     fn page_dims_matching_filters_each_epub_generation_before_merging() {
         let db = open_in_memory();
-        db.save("page_0000", 1, 10, 8, 12, Some((800, 1200)), b"old")
-            .unwrap();
+        db.save(
+            "page_0000",
+            1,
+            10,
+            8,
+            12,
+            Some((800, 1200)),
+            b"old",
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
         db.save_page_dims("page_0000", 2, 20, Some((1600, 900)), None)
             .unwrap();
         db.save_page_dims("page_0001", 2, 20, Some((900, 1600)), None)
@@ -4497,8 +5000,17 @@ mod tests {
             db.save_page_dims(key, 1, 10, Some((900, 1600)), None)
                 .unwrap();
         }
-        db.save("save", 2, 20, 2, 3, Some((1600, 900)), &bytes)
-            .unwrap();
+        db.save(
+            "save",
+            2,
+            20,
+            2,
+            3,
+            Some((1600, 900)),
+            &bytes,
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
         db.save_with_layout_dims(
             "layout",
             2,
@@ -4508,11 +5020,19 @@ mod tests {
             Some((1600, 900)),
             Some((160_000, 90_000)),
             &bytes,
+            &CoverIdentity::Legacy,
         )
         .unwrap();
         assert!(
-            db.save_thumb_bytes("bytes", 2, 20, Some((1600, 900)), &bytes)
-                .unwrap()
+            db.save_thumb_bytes(
+                "bytes",
+                2,
+                20,
+                Some((1600, 900)),
+                &bytes,
+                &CoverIdentity::Legacy
+            )
+            .unwrap()
         );
         assert!(
             db.save_thumb_bytes_with_layout_dims(
@@ -4521,22 +5041,40 @@ mod tests {
                 20,
                 Some((1600, 900)),
                 None,
-                &bytes
+                &bytes,
+                &CoverIdentity::Legacy
             )
             .unwrap()
         );
         assert!(
-            db.save_auto_folder_bytes("auto", 2, 20, Some((1600, 900)), None, &bytes, None)
-                .unwrap()
+            db.save_auto_folder_bytes(
+                "auto",
+                2,
+                20,
+                Some((1600, 900)),
+                None,
+                &bytes,
+                None,
+                &CoverIdentity::Legacy
+            )
+            .unwrap()
         );
         assert!(
-            db.save_seeded_folder_bytes("seed", 2, 20, Some((1600, 900)), &bytes)
-                .unwrap()
+            db.save_seeded_folder_bytes(
+                "seed",
+                2,
+                20,
+                Some((1600, 900)),
+                &bytes,
+                &CoverIdentity::Legacy
+            )
+            .unwrap()
         );
         let entry = CacheEntry {
             mtime: 2,
             file_size: 20,
             jpeg_data: bytes,
+            cover: CoverIdentity::Legacy,
             source_dims: None,
             layout_dims: None,
             folder_provenance: None,
@@ -4572,8 +5110,17 @@ mod tests {
             .unwrap();
         db.conn.lock().unwrap().execute_batch("CREATE TRIGGER reject_dims_delete BEFORE DELETE ON page_dims BEGIN SELECT RAISE(ABORT, 'reject deletion'); END;").unwrap();
         assert!(
-            db.save("save", 4, 40, 1, 1, Some((1, 1)), b"rejected")
-                .is_err()
+            db.save(
+                "save",
+                4,
+                40,
+                1,
+                1,
+                Some((1, 1)),
+                b"rejected",
+                &CoverIdentity::Legacy
+            )
+            .is_err()
         );
         assert_eq!(db.load_one("save").unwrap().unwrap().mtime, 2);
         assert_eq!(db.load_source_dims().unwrap()["save"], Some((100, 200)));
@@ -4596,6 +5143,7 @@ mod tests {
             layout_dims: None,
             folder_provenance: None,
             selection_proof: None,
+            cover: CoverIdentity::Legacy,
         };
         assert!(
             save_audio_art_pixels(
@@ -4625,8 +5173,17 @@ mod tests {
         let folder = temp.path().join("pages");
         for with_page_dims in [true, false] {
             let db = CatalogDb::open(temp.path(), &folder).unwrap();
-            db.save("page_0000", 1, 10, 1, 1, Some((800, 1200)), b"old")
-                .unwrap();
+            db.save(
+                "page_0000",
+                1,
+                10,
+                1,
+                1,
+                Some((800, 1200)),
+                b"old",
+                &CoverIdentity::Legacy,
+            )
+            .unwrap();
             db.save_page_dims("page_0000", 2, 20, Some((1600, 900)), None)
                 .unwrap();
             if !with_page_dims {
@@ -4684,8 +5241,17 @@ mod tests {
     #[test]
     fn page_dims_delete_missing_preserves_present_keys_and_webp() {
         let db = open_in_memory();
-        db.save("keep", 1, 10, 1, 1, Some((800, 1200)), b"old")
-            .unwrap();
+        db.save(
+            "keep",
+            1,
+            10,
+            1,
+            1,
+            Some((800, 1200)),
+            b"old",
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
         for key in ["keep", "dims_only", "remove"] {
             db.save_page_dims(key, 2, 20, Some((1600, 900)), None)
                 .unwrap();
@@ -4704,11 +5270,39 @@ mod tests {
     #[test]
     fn catalog_delete_missing() {
         let db = open_in_memory();
-        db.save("keep.jpg", 100, 500, 128, 96, None, b"a").unwrap();
-        db.save("remove.jpg", 200, 600, 128, 96, None, b"b")
-            .unwrap();
-        db.save("also_remove.jpg", 300, 700, 128, 96, None, b"c")
-            .unwrap();
+        db.save(
+            "keep.jpg",
+            100,
+            500,
+            128,
+            96,
+            None,
+            b"a",
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
+        db.save(
+            "remove.jpg",
+            200,
+            600,
+            128,
+            96,
+            None,
+            b"b",
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
+        db.save(
+            "also_remove.jpg",
+            300,
+            700,
+            128,
+            96,
+            None,
+            b"c",
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
 
         let existing: HashSet<String> = ["keep.jpg".to_string()].into_iter().collect();
         db.delete_missing(&existing).unwrap();
@@ -4721,8 +5315,10 @@ mod tests {
     #[test]
     fn catalog_delete_one_removes_only_target() {
         let db = open_in_memory();
-        db.save("a.jpg", 1, 10, 8, 8, None, b"a").unwrap();
-        db.save("b.jpg", 1, 10, 8, 8, None, b"b").unwrap();
+        db.save("a.jpg", 1, 10, 8, 8, None, b"a", &CoverIdentity::Legacy)
+            .unwrap();
+        db.save("b.jpg", 1, 10, 8, 8, None, b"b", &CoverIdentity::Legacy)
+            .unwrap();
         db.delete_one("a.jpg").unwrap();
         let map = db.load_all().unwrap();
         assert_eq!(map.len(), 1);
@@ -4736,8 +5332,17 @@ mod tests {
     #[test]
     fn catalog_load_latest_with_prefix_picks_newest_matching_pin_entry() {
         let db = open_in_memory();
-        db.save("folderthumb:child", 10, 1, 8, 8, None, b"base")
-            .unwrap();
+        db.save(
+            "folderthumb:child",
+            10,
+            1,
+            8,
+            8,
+            None,
+            b"base",
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
         db.save(
             "folderthumb:child#pin:image|cover|-|-|20|2",
             20,
@@ -4746,10 +5351,20 @@ mod tests {
             8,
             None,
             b"pin",
+            &CoverIdentity::Legacy,
         )
         .unwrap();
-        db.save("folderthumb:child-other", 99, 9, 8, 8, None, b"other")
-            .unwrap();
+        db.save(
+            "folderthumb:child-other",
+            99,
+            9,
+            8,
+            8,
+            None,
+            b"other",
+            &CoverIdentity::Legacy,
+        )
+        .unwrap();
 
         let (filename, entry) = db
             .load_latest_with_prefix("folderthumb:child#pin:")
@@ -4843,7 +5458,8 @@ mod tests {
         let writer = CatalogDb::open(&cache, temp.path()).unwrap();
         let ui = CatalogDb::open(&cache, temp.path()).unwrap();
         let pin_key = "folderthumb:auto-v3:numeric:d3:child#pin:video";
-        ui.save(pin_key, 1, 2, 1, 1, None, b"pin").unwrap();
+        ui.save(pin_key, 1, 2, 1, 1, None, b"pin", &CoverIdentity::Legacy)
+            .unwrap();
         ui.conn
             .lock()
             .unwrap()

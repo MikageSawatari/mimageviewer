@@ -157,6 +157,7 @@ mod epub_stamp_tests {
                 mtime: 17,
                 file_size: 4096,
                 jpeg_data: Vec::new(),
+                cover: crate::cover_identity::CoverIdentity::Legacy,
                 source_dims: None,
                 layout_dims: None,
                 folder_provenance: None,
@@ -453,6 +454,7 @@ impl App {
         let threads = self.settings.parallelism.thread_count();
         let batch_zip = self.settings.batch_cache_zip_contents;
         let batch_pdf = self.settings.batch_cache_pdf_contents;
+        let books_root = self.settings.book_root.clone();
 
         let catalog_work = crate::catalog::CatalogWork::default();
         std::thread::spawn(move || {
@@ -586,6 +588,7 @@ impl App {
                                 thumb_px,
                                 thumb_quality,
                                 &raw_executor,
+                                books_root.as_deref(),
                             ) {
                                 size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
                             }
@@ -644,6 +647,13 @@ impl App {
                                         return;
                                     }
                                 }
+                                let cover = crate::thumb_loader::cover_identity_for_location(
+                                    &crate::thumb_loader::ReadLocation::ArchiveEntry {
+                                        archive: zip_path.clone(),
+                                        entry: entry.entry_name.clone(),
+                                    },
+                                    None,
+                                );
                                 let raw = match crate::zip_loader::read_entry_bytes(
                                     zip_path,
                                     &entry.entry_name,
@@ -666,7 +676,7 @@ impl App {
                                     if let Some(bytes) = encode_and_save_with_source_dims(
                                         &raster.image, source_dims, &entry.entry_name,
                                         &zip_catalog, entry.mtime, entry.uncompressed_size as i64,
-                                        thumb_px, thumb_quality,
+                                        thumb_px, thumb_quality, &cover,
                                     ) {
                                         size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
                                     }
@@ -709,6 +719,7 @@ impl App {
                                     entry.uncompressed_size as i64,
                                     thumb_px,
                                     thumb_quality,
+                                    &cover,
                                 ) {
                                     size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
                                 }
@@ -718,7 +729,14 @@ impl App {
                         // 先頭1枚を親フォルダの DB にも保存（フォルダ一覧用サムネイル）
                         if !cache_map.contains_key(&folder_key) {
                             let captured = first_webp.lock().unwrap().take();
-                            if let Some((img, source_dims, _)) = captured {
+                            if let Some((img, source_dims, entry_name)) = captured {
+                                let cover = crate::thumb_loader::cover_identity_for_location(
+                                    &crate::thumb_loader::ReadLocation::ArchiveEntry {
+                                        archive: zip_path.clone(),
+                                        entry: entry_name,
+                                    },
+                                    None,
+                                );
                                 if let Some(bytes) = encode_and_save_with_source_dims(
                                     &img,
                                     source_dims,
@@ -728,6 +746,7 @@ impl App {
                                     *zip_file_size,
                                     thumb_px,
                                     thumb_quality,
+                                    &cover,
                                 ) {
                                     size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
                                 }
@@ -741,6 +760,13 @@ impl App {
                         if let Some(first_entry) =
                             crate::zip_loader::first_image_entry(zip_path, None)
                         {
+                            let cover = crate::thumb_loader::cover_identity_for_location(
+                                &crate::thumb_loader::ReadLocation::ArchiveEntry {
+                                    archive: zip_path.clone(),
+                                    entry: first_entry.clone(),
+                                },
+                                None,
+                            );
                             if let Ok(raw) =
                                 crate::zip_loader::read_entry_bytes(zip_path, &first_entry)
                             {
@@ -761,6 +787,7 @@ impl App {
                                             *zip_file_size,
                                             thumb_px,
                                             thumb_quality,
+                                            &cover,
                                         ) {
                                             size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
                                         }
@@ -796,6 +823,7 @@ impl App {
                                     *zip_file_size,
                                     thumb_px,
                                     thumb_quality,
+                                    &cover,
                                 ) {
                                     size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
                                 }
@@ -842,6 +870,13 @@ impl App {
                         let password = pw_store.get(pdf_path);
                         let pw_ref = password.as_deref();
                         let folder_key = format!("{}{}", CACHE_KEY_PDF, pdf_fname);
+                        let cover = crate::thumb_loader::cover_identity_for_location(
+                            &crate::thumb_loader::ReadLocation::PdfPage {
+                                pdf: pdf_path.clone(),
+                                page: 0,
+                            },
+                            None,
+                        );
 
                         if batch_pdf {
                             // enumerate_pages がパスワード不正時に Err を返すので
@@ -970,6 +1005,7 @@ impl App {
                                         *pdf_file_size,
                                         thumb_px,
                                         thumb_quality,
+                                        &cover,
                                     )
                                 {
                                     size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
@@ -1082,6 +1118,7 @@ impl App {
                                     *pdf_file_size,
                                     thumb_px,
                                     thumb_quality,
+                                    &cover,
                                 ) {
                                     size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
                                 }
@@ -1095,6 +1132,80 @@ impl App {
 
             finished.store(true, Ordering::Relaxed);
         });
+    }
+}
+
+#[cfg(test)]
+mod cover_identity_producer_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn bulk_cache_zip_modes_save_the_actual_first_entry_and_each_page_identity() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.thumb_px = 32;
+        for full_contents in [false, true] {
+            let folder = app
+                .tmp
+                .path()
+                .join(format!("bulk-identity-{full_contents}"));
+            std::fs::create_dir(&folder).unwrap();
+            let path = folder.join("book.zip");
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(12, 8)
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+            for name in ["02.png", "01.png"] {
+                zip.start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(png.get_ref()).unwrap();
+            }
+            zip.finish().unwrap();
+            app.settings.favorites = vec![crate::settings::FavoriteEntry::new(
+                "fixture".into(),
+                folder.clone(),
+            )];
+            app.settings.batch_cache_zip_contents = full_contents;
+            app.cc.checked = vec![true];
+            app.start_cache_creation();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while !app.cc.finished.load(Ordering::Relaxed) {
+                if std::time::Instant::now() >= deadline {
+                    app.cc.cancel.store(true, Ordering::Relaxed);
+                    panic!("headless ZIP cache creation did not finish");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(app.cc.done.load(Ordering::Relaxed), 1);
+            let cache = crate::catalog::default_cache_dir();
+            let parent = crate::catalog::CatalogDb::open_existing_read_only(&cache, &folder)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                parent.load_one("zipthumb:book.zip").unwrap().unwrap().cover,
+                crate::cover_identity::CoverIdentity::Page(crate::adjustment_db::zip_entry_key(
+                    &path, "02.png"
+                ))
+            );
+            let pages = crate::catalog::CatalogDb::open_existing_read_only(&cache, &path).unwrap();
+            if full_contents {
+                let pages = pages.unwrap();
+                for name in ["02.png", "01.png"] {
+                    assert_eq!(
+                        pages.load_one(name).unwrap().unwrap().cover,
+                        crate::cover_identity::CoverIdentity::Page(
+                            crate::adjustment_db::zip_entry_key(&path, name)
+                        )
+                    );
+                }
+            } else {
+                assert!(
+                    pages.is_none(),
+                    "first-only mode must not create a page catalog"
+                );
+            }
+        }
     }
 }
 
@@ -1280,6 +1391,13 @@ mod avif_cache_entry_tests {
             crate::catalog::CatalogDb::open(&temp.path().join("cache"), temp.path()).unwrap();
         // Both start_cache_creation branches use this worker boundary and save
         // path: per-entry ZIP catalog and representative parent catalog key.
+        let cover = crate::thumb_loader::cover_identity_for_location(
+            &crate::thumb_loader::ReadLocation::ArchiveEntry {
+                archive: zip_path.clone(),
+                entry: "page.AVIF".into(),
+            },
+            None,
+        );
         for key in ["page.AVIF", "zipthumb:book.zip"] {
             let (image, dims) = decode_cache_zip_image(&raw, "page.AVIF", None, &cancel).unwrap();
             assert_eq!(dims, Some((64, 32)));
@@ -1293,11 +1411,19 @@ mod avif_cache_entry_tests {
                     1,
                     raw.len() as i64,
                     64,
-                    90
+                    90,
+                    &cover,
                 )
                 .is_some()
             );
             assert_eq!(catalog.load_all().unwrap()[key].source_dims, Some((64, 32)));
+            assert_eq!(
+                catalog.load_one(key).unwrap().unwrap().cover,
+                crate::cover_identity::CoverIdentity::Page(crate::adjustment_db::zip_entry_key(
+                    &zip_path,
+                    "page.AVIF"
+                ),),
+            );
         }
         let dct = image::DynamicImage::new_rgb8(8, 4);
         let (image, dims) = decode_cache_zip_image(

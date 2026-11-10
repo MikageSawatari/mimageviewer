@@ -439,6 +439,7 @@ fn container_type_icons_auto_aspect_loaded_rebuild_and_cache_seed_exclude_contai
     let map = Arc::new(std::sync::RwLock::new(HashMap::from([(
         "page.png".into(),
         crate::catalog::CacheEntry {
+            cover: crate::cover_identity::CoverIdentity::Legacy,
             mtime: 10,
             file_size: 20,
             jpeg_data: Vec::new(),
@@ -472,6 +473,7 @@ fn container_type_icons_auto_aspect_loaded_rebuild_and_cache_seed_exclude_contai
     map.write().unwrap().insert(
         container_key,
         crate::catalog::CacheEntry {
+            cover: crate::cover_identity::CoverIdentity::Legacy,
             mtime: request.mtime,
             file_size: request.file_size,
             jpeg_data: Vec::new(),
@@ -588,6 +590,7 @@ fn container_type_icons_preferences_restore_pinned_and_plain_cache_without_delet
                 60,
                 Some((40, 60)),
                 encoded.get_ref(),
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
         // The first demand is canceled before execution; the next keep pass owns NoArt.
