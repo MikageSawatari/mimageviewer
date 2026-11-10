@@ -171,7 +171,7 @@
 
 ### 1.757 配布物と About に PDFium とその内部部品のライセンス全文が入っていない (2026-11-10)
 
-- 状態: **未着手・次の版で直す (設計担当の提案、2026-11-10。§1.754 の作業中に判明)**。PDFium 8125 以前からの状態で、§1.754 の更新とは別の既存の問題。
+- 状態: **対応済み・master 入り (2026-11-11、§1.754 と同じ取り込み `a2b383bb1`)・次の版で出荷**。`PDFIUM-LICENSE.txt` (PDFium と内部部品の全文、`scripts/generate-pdfium-license.py` で生成・`--check` で照合) を配布物に同梱し、About・readme・製品ページに追加。独立レビューの指摘 (FreeType の帰属文) も対応済み。About の新しい行は実機では未確認。以前の状態: 未着手・次の版で直す (設計担当の提案、2026-11-10。§1.754 の作業中に判明)。PDFium 8125 以前からの状態で、§1.754 の更新とは別の既存の問題。
 - 現状 (コード・ファイル): About のサードパーティ ライセンス (`src/ui_dialogs/about.rs`) に PDFium が無い。インストーラ・ポータブル版の readme は「PDFium (BSD-3-Clause): Google Chrome の PDF エンジン」の 1 行だけ (`installer/readme.txt` 232 行付近)。PDFium の配布元は `vendor/pdfium/LICENSE` (PDFium 自身) と `vendor/pdfium/licenses/` に 18 個 (pdfium・abseil・agg23・dragonbox 2 種・fast_float・freetype・harfbuzz・highway・icu・lcms・libjpeg_turbo 2 種・libopenjpeg・libpng・llvm-libc・simdutf・zlib) のライセンス文を同梱しているが、mIV の配布物には入れていない。
 - なぜ直すか: BSD-3-Clause をはじめ、これらの多くはバイナリ配布物の文書等にライセンス文 (著作権表示と条件) を含めることを求める。FFmpeg・LibRaw・LibAVIF などは全文を同梱済みで、PDFium だけ漏れている。
 - 直し方の案: 他の依存物と同じ形で、`PDFIUM-LICENSE.txt` (PDFium と内部部品の全文をまとめたもの) をインストーラ・ポータブル版・単体 exe の展開先に同梱し、About の一覧にも足す。PDFium を更新したら全文も更新する手順を `docs/native-dependencies.md` と release-checklist の依存物確認に足す。公開文書 (製品ページのライセンス表記・readme) も合わせる。
@@ -193,7 +193,7 @@
 
 ### 1.754 PDFium を chromium/8125 から最新 (2026-11-10 時点で chromium/8138) へ上げる (2026-11-10)
 
-- 状態: **次の版に入れる (利用者決定 2026-11-10)**。v5.0.0・v5.1.0 のリリース時の依存確認で新版が出ていたが、公開直前のため見送っていた。
+- 状態: **対応済み・master 入り (2026-11-11、`a2b383bb1`)・次の版で出荷**。chromium/8138 (`pdfium.dll` 159.0.8138.0、sha256 `71a3e63e…821943`)。コードの変更なし。master の lib 全件 17,063 件成功。サブ PC 担当の実機確認 (依頼 30) で、グラデーション・半透明・切り抜きの PDF の全画面 4 枚が前の版と画素単位で同じ、ほかの手順も問題なし。記録は [依存物の更新 2026-11-10](dependency-update-20261110.md)。この作業ツリーの `vendor/pdfium` も 8138 に入れ替え済み。v5.0.0・v5.1.0 のリリース時の依存確認で新版が出ていたが、公開直前のため見送っていた。
 - 進捗 (2026-11-10): ブランチ `deps-754-pdfium` で 8138 へ更新。コード変更なし (ヘッダ・import library・ライセンス文が 8125 と同一)。本体 lib 全件 17,062 件成功、`build-dev.ps1` の検証用ビルドあり。サブ PC 担当の実機確認 (依頼 30、`6f502b888` のビルド): 試験用 PDF の全画面 4 枚が 8125 と画素単位で同じ、400 ページの連打・ページ一覧・見開き・画像 PDF・パスワード・サムネイルに問題なし、エラーのログなし。→ の押しっぱなしは未確認。利用者自身の確認はまだ。ライセンス全文の同梱 (§1.757) も同じブランチで対応。master へは未 merge。記録は [PDFium 更新 2026-11-10](dependency-update-20261110.md)。
 - 手順: [ネイティブ依存物](native-dependencies.md) の PDFium 管理の節と `scripts/setup-pdfium.sh`。PDF 表示・サムネイル・PDF ワーカーの回帰 (全件テストと実機の PDF 表示) を確かめる。ライセンス・同梱ファイルの差分も見る。
 - 規模 / 優先度: Small / P2。
