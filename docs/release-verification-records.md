@@ -12,6 +12,23 @@
 
 ---
 
+## v5.1.0 (2026-11-10)
+
+- **対象**: master `abdce7690` (配布ビルドの入力)。v5.0.0 以降の 3D 写真 (depth-parallax)、§1.452・§1.675/§1.676・§1.691・§1.697・§1.726・§1.731・§1.735・§1.741・§1.750 と、一覧の行が窓より高いときの表示位置の修正。更新履歴 (4,782 バイト、8 KB 以内なので短縮版なし) と「重要な変更点」の must_read (書庫内フォルダの直接表示) は利用者承認済み。
+- **CI 相当**: `viewer_context_audit` を手元で実行し、3D 写真 stage B (`dee2fd1ec`) が足した、どこからも呼ばれていない `ViewerContextBundle::panorama_state` で A4 違反 1 件。`#[cfg(test)]` を付けて解消 (`be455e281`、Codex 実装、GPT-6.1 Sol / xhigh 独立レビュー ACCEPT)。違反 0、`cargo fmt --all --check` 成功。CI 自体は v5.0.0 以降 push していないので未実行。
+- **自動テスト**: 配布ビルド内の全体テスト 19,123 件成功 (slow 10 件、再試行なし)。test-script feature の lib 全件 17,214 件成功。1 回目の配布ビルドは `startup_dialogs_small_viewport` のスナップショット不一致で止まった (v5.1.0 の「重要な変更点」を足したための想定どおりの変化)。PNG 2 枚を目視で確かめて更新 (`abdce7690`) し、配布ビルドをやり直した。
+- **ReleaseChecks (ClaudeCode が実行、利用者了承 2026-11-10、`-IncludeFirstAi` 付き)**: run `release-checks-20261110-041427-f8b7e465`。AI / GPU 経路 (3D 写真の深度モデル・§1.726 の描画素材の種類) を変えたため first-ai を含めた。
+  - seed 2・idle 5・perf 2 は PASS。idle は CPU 1 コア比 0.003〜0.009、測定中の描画 0 フレーム。perf-cached は drawn 16ms 未満 303/304 (99.67%)・p95 12ms・max 38ms、perf-uncached は 304/305 (99.67%)・p95 12ms・max 28ms。pre_grid raw p95 0.108ms。100ms 超の gap / update 0。
+  - **first-ai は FAIL (既知のテスト台本の不具合 §1.483、AI 未計測)**: 10-29 と同じく、台本が全画面を開いた後に AI の action をメイン窓へ送り、main focus guard が全画面を閉じて「actual isolated AI inference did not complete」で 180 秒後に停止。モデルは DirectML で読み込めている。AI アップスケールの推論コードは v5.0.0 から変わっていない (変更は深度モデルの種類の追加と §1.726 の素材の種類だけ)。代わりの根拠: 同じ AI コードを含むビルドで、利用者が 2026-11-10 朝に AI アップスケール + 見開きの実機確認 (§1.750) を行い、問題を報告していない。
+- **bench**: 検索の採点・索引のコードと toolchain・tantivy に変更がないため実施していない (§1.741 は検索結果のサムネイルの保存先だけの変更)。
+- **依存**: crate の patch 対象 (egui 系・tantivy・mimalloc・unrar)・LibRaw・LibAVIF・ONNX Runtime・VST3 SDK・Rust は最新。PDFium (chromium/8138)・EffeTune 上流 v0.17.0 は新版があるが、公開直前のため上げず次の版以降で検討。FFmpeg は従来どおりの誤検知 (同梱 n7.1.5-16 の方が新しい)。VST3 host と Susie worker のソースは v5.0.0 から変更なし (`-SkipVst3Bridge`)。
+- **panic.log**: 54 件 17 種すべて disposition あり (`check-panic-log.ps1` exit 0)。
+- **署名・成果物**: `build-dist.ps1 -PreserveRuntime -SkipVst3Bridge` (署名あり) で単体exe / setup.exe / portable zip を生成。3 つの mimageviewer.exe / setup.exe を `signtool verify /pa /v` で確認 (Open Source Developer Taku Sano、Certum Timestamp 2026)。Vector 用 `mImageViewer_installer_v5.1.0.zip` を作成 (setup.exe + readme.txt)。
+- **VirusTotal (2026-11-10、送信は利用者の了承のうえ利用者が実行)**:
+  - `mimageviewer-vst3-host.exe` (署名済み、1,239,128 bytes) sha256 `99ffe3610db7b96e66a4951c8d650f46f9d6c77e9226a1bdc3c887532ff7fdf3` — 0/71 (利用者の結果ページの写しで確認)。https://www.virustotal.com/gui/file/99ffe3610db7b96e66a4951c8d650f46f9d6c77e9226a1bdc3c887532ff7fdf3
+  - `effetune/mIV Sound.vst3/Contents/x86_64-win/mIV Sound.vst3` (DLL、署名済み、5,894,232 bytes) sha256 `30ea45a2c684822014981507f9d56eb3fdd4835ef1514318c9822c026f708a32` — 0/71 (同上)。https://www.virustotal.com/gui/file/30ea45a2c684822014981507f9d56eb3fdd4835ef1514318c9822c026f708a32
+  - Google・Microsoft の行: 両ファイルとも Google・Microsoft は Undetected (利用者が結果ページで確認、2026-11-10)。
+
 ## v5.0.0 (2026-11-07)
 
 - **対象**: master `d073af54a` (配布ビルドの入力)。v4.11.0 以降の v5 系 (MCP・AI 説明文・mIV Sound・音楽ビデオ) と §1.681〜§1.730 の修正。更新履歴は利用者承認済み (`3bb93924e`)、アプリ内通知用の短縮版 `docs/release-body-v5.0.0.md` (5.2 KB) も承認済み。
