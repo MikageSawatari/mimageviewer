@@ -28,6 +28,9 @@
   - `mimageviewer-vst3-host.exe` (署名済み、1,239,128 bytes) sha256 `99ffe3610db7b96e66a4951c8d650f46f9d6c77e9226a1bdc3c887532ff7fdf3` — 0/71 (利用者の結果ページの写しで確認)。https://www.virustotal.com/gui/file/99ffe3610db7b96e66a4951c8d650f46f9d6c77e9226a1bdc3c887532ff7fdf3
   - `effetune/mIV Sound.vst3/Contents/x86_64-win/mIV Sound.vst3` (DLL、署名済み、5,894,232 bytes) sha256 `30ea45a2c684822014981507f9d56eb3fdd4835ef1514318c9822c026f708a32` — 0/71 (同上)。https://www.virustotal.com/gui/file/30ea45a2c684822014981507f9d56eb3fdd4835ef1514318c9822c026f708a32
   - Google・Microsoft の行: 両ファイルとも Google・Microsoft は Undetected (利用者が結果ページで確認、2026-11-10)。
+- **公開後 (2026-11-10 夜)**: GitHub Release v5.1.0 (タグ・main = `fa614117a`)、資産 4 点のサイズ一致・latest・CI 緑。mikage.to 反映 154 ファイル + sitemap.xml (権限の都合で scp 上書き)、verify-site は `.htaccess` の 403 のみ、DL 3 点 200・サイズ一致。§1.737 の旧 URL (版付き sound / effetune) はすべて 1 回の 301 で固定 URL の 200 に着き、canonical は自分自身、公開中の sitemap に版付き URL 0 件。Vector 申請・X 告知は利用者が実施。
+- **Store 用インストーラ**: R2 `https://dl.mikage.jp/mimageviewer/v5.1.0/mImageViewer_setup.exe` (269,205,720 bytes、sha256 `ccb25d5adde6189e4c825196421f50b0f4cd8cba56123278e4b219c835294c1f`) に配置し、200・転送なし・配信内容の sha256 一致を `upload-store-installer.ps1` で確認。
+- **Store 申請前の Sandbox 起動確認 (サブ PC 依頼 29、vGPU=Disable、`/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-`、観測者はサブ PC 担当、取得は利用者)**: R2 から取得した setup.exe (sha256 一致・署名 Valid) で install exit 0 (約 26 秒)。初回 180 秒・2 回目 90 秒とも responding=False 0 件、タイトル「Desktop - mimageviewer」、初回設定の窓を表示。描画は Microsoft Basic Render Driver。ERROR / WARN / panic・Application Hang / WER なし。結果は `C:\miv-subpc\results-29\`。vGPU=Enable (§1.736) は今回行っていない。
 
 ## v5.0.0 (2026-11-07)
 
