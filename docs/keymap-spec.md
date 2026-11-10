@@ -22,6 +22,14 @@ main viewer の単ページ静止画だけを対象とし、動画・アニメ�
 案内は「左Ctrl+クリック」とし、右Ctrlの既定 `FsOriginalPreviewHold` は元画像の一時表示を優先する。
 元画像ホールド中は深さを変更せずページも送らない。修飾なしクリックとタッチのタップは従来のページ送りを保つ。
 
+3Dパネル下部の固定案内は、Ctrl+クリックの固定文言と、現在の
+`keymap.chord_labels(KeyAction::FsToggleMetadata)` を ` / ` で結んだ
+「パネルを隠す・出す」の行を表示する。既定は `I / Tab`、未割り当てなら後者の行を出さない。
+Appが描画ごとに案内を作り、UI側はkeymapを参照しない。
+キーとリングの `ImageToggleMetadata` は共通の `App::toggle_depth_panel` を通り、
+隠すたびに現在のキーで再表示する案内を1回通知する。未割り当てなら隠した事実だけを通知し、
+表示へ戻すときは通知しない。
+
 ## 左右ドラッグによる連続ズーム
 
 既定は Ctrl+Space を押しながら primary pointer（ペン／マウス左ボタン）で左右ドラッグ。

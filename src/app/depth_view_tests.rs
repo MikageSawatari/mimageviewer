@@ -1544,6 +1544,164 @@ fn depth_i_and_tab_toggle_only_the_depth_panel_through_the_shared_key_handler() 
 
 #[cfg(windows)]
 #[test]
+fn depth_panel_footer_uses_live_keymap_through_app_draw() {
+    fn collect_text(shape: &egui::Shape, texts: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(text) => texts.push(text.galley.text().to_owned()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_text(shape, texts);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let ctx = egui::Context::default();
+    let mut app = setup_app_for_test();
+    install_pages(&mut app, &ctx);
+    depth(&mut app);
+    // Keep the same App and panel alive while changing the keymap: the footer
+    // must be regenerated on drawing, rather than cached when Depth opens.
+    for (ini, expected) in [
+        ("", Some("I / Tab: パネルを隠す・出す")),
+        (
+            "[FsCommon]\nFsToggleMetadata = F13\n",
+            Some("F13: パネルを隠す・出す"),
+        ),
+        (
+            "[FsCommon]\nFsToggleMetadata = F13\nFsToggleMetadata.2 = F14\n",
+            Some("F13 / F14: パネルを隠す・出す"),
+        ),
+        ("[FsCommon]\nFsToggleMetadata = none\n", None),
+    ] {
+        app.keymap = crate::keymap::Keymap::from_ini_str(ini);
+        assert!(app.keymap.warnings().is_empty(), "{ini}");
+        let mut texts = Vec::new();
+        // Area uses the first pass to measure its initial size.
+        for _ in 0..3 {
+            let output = ctx.run_pass(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1093.0, 614.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    assert!(!app.draw_depth_panel(ctx, 0));
+                },
+            );
+            texts.clear();
+            for shape in &output.shapes {
+                collect_text(&shape.shape, &mut texts);
+            }
+            output.drop_without_applying_deltas();
+        }
+        let hints: Vec<_> = texts
+            .iter()
+            .filter(|text| text.ends_with(": パネルを隠す・出す"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(hints, expected.into_iter().collect::<Vec<_>>(), "{ini}");
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|text| text.as_str() == "左 Ctrl+クリック: その場所の深さで止める")
+                .count(),
+            1,
+            "the mouse guidance must remain visible even when the key is unbound: {ini}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn depth_panel_hide_toast_is_once_per_hide_and_show_is_silent_through_key_and_ring() {
+    use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+    let _input_guard = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let mut app = setup_app_for_test();
+    install_pages(&mut app, &ctx);
+    depth(&mut app);
+    let side_panel_mode = app.settings.fullscreen_side_panel_mode;
+    for (ini, keys, hint) in [
+        ("", vec![egui::Key::I, egui::Key::Tab], "I / Tab"),
+        (
+            "[FsCommon]\nFsToggleMetadata = F13\n",
+            vec![egui::Key::F13],
+            "F13",
+        ),
+        (
+            "[FsCommon]\nFsToggleMetadata = F13\nFsToggleMetadata.2 = F14\n",
+            vec![egui::Key::F13, egui::Key::F14],
+            "F13 / F14",
+        ),
+        ("[FsCommon]\nFsToggleMetadata = none\n", vec![], ""),
+    ] {
+        app.keymap = crate::keymap::Keymap::from_ini_str(ini);
+        assert!(app.keymap.warnings().is_empty(), "{ini}");
+        let message = if hint.is_empty() {
+            "3D 写真のパネルを隠しました".to_owned()
+        } else {
+            format!("3D 写真のパネルを隠しました。{hint} でもう一度表示します")
+        };
+        if hint.is_empty() {
+            app.feedback_toasts_for_test.clear();
+            for key in [egui::Key::I, egui::Key::Tab, egui::Key::F13, egui::Key::F14] {
+                depth_key_frame(&mut app, &ctx, &[(key, true)]);
+                depth_key_frame(&mut app, &ctx, &[(key, false)]);
+                assert!(
+                    matches!(&app.fs_exclusive_view, FsExclusiveView::Depth(state)
+                    if state.panel_visible)
+                );
+                assert!(app.feedback_toasts_for_test.is_empty());
+            }
+        }
+        // Every bound chord and the ring reach the shared owner. With no bound
+        // chord the ring must still hide/show, without inventing a keyboard hint.
+        for key in keys.into_iter().map(Some).chain(std::iter::once(None)) {
+            app.feedback_toasts_for_test.clear();
+            for cycle in 1..=2 {
+                for visible in [false, true] {
+                    if let Some(key) = key {
+                        depth_key_frame(&mut app, &ctx, &[(key, true)]);
+                        depth_key_frame(&mut app, &ctx, &[(key, false)]);
+                    } else {
+                        app.apply_ring_action(
+                            &ctx,
+                            RingShortcutContext::ImageFullscreen,
+                            RingActionId::ImageToggleMetadata,
+                            "depth_panel_hint_test",
+                        );
+                    }
+                    let FsExclusiveView::Depth(state) = &app.fs_exclusive_view else {
+                        panic!("panel toggle must preserve the Depth owner");
+                    };
+                    assert_eq!(state.panel_visible, visible, "{ini}, {key:?}");
+                    assert_eq!(
+                        app.feedback_toasts_for_test.len(),
+                        cycle,
+                        "exactly one notification per hide, none on show: {ini}, {key:?}"
+                    );
+                    assert!(
+                        app.feedback_toasts_for_test
+                            .iter()
+                            .all(|(text, _)| text == &message),
+                        "{ini}, {key:?}: {:?}",
+                        app.feedback_toasts_for_test
+                    );
+                    assert_eq!(app.settings.fullscreen_side_panel_mode, side_panel_mode);
+                    assert!(!app.show_metadata_panel);
+                }
+            }
+        }
+    }
+    crate::key_input::clear_test_frame();
+}
+
+#[cfg(windows)]
+#[test]
 fn depth_exclusive_owner_survives_sibling_open_close_without_cross_context_reset() {
     let ctx = egui::Context::default();
     let mut app = setup_app_for_test();

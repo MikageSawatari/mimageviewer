@@ -281,7 +281,23 @@ impl App {
     pub(crate) fn toggle_depth_panel(&mut self) {
         if let FsExclusiveView::Depth(state) = &mut self.fs_exclusive_view {
             state.panel_visible = !state.panel_visible;
+            if !state.panel_visible {
+                let keys = self.depth_panel_toggle_keys();
+                self.show_feedback_toast(match keys {
+                    Some(keys) => {
+                        format!("3D 写真のパネルを隠しました。{keys} でもう一度表示します")
+                    }
+                    None => "3D 写真のパネルを隠しました".to_owned(),
+                });
+            }
         }
+    }
+
+    fn depth_panel_toggle_keys(&self) -> Option<String> {
+        let labels = self
+            .keymap
+            .chord_labels(crate::keymap::KeyAction::FsToggleMetadata);
+        (!labels.is_empty()).then(|| labels.join(" / "))
     }
 
     pub(crate) fn try_paint_depth(
@@ -438,11 +454,15 @@ impl App {
         }
         let status = self.depth_panel_status();
         let export_enabled = self.depth_export_available(ctx);
+        let panel_toggle_hint = self
+            .depth_panel_toggle_keys()
+            .map(|keys| format!("{keys}: パネルを隠す・出す"));
         let response = crate::ui_depth_parallax::draw_depth_parallax_panel_with_export(
             ctx,
             &mut self.settings.depth_parallax,
             &status,
             export_enabled,
+            panel_toggle_hint,
         );
         ctx.data_mut(|data| data.insert_temp(egui::Id::unique("depth_panel_rect"), response.rect));
         if response.changed {

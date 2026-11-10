@@ -20,7 +20,12 @@ fn harness(size: egui::Vec2, batched_clicks: bool) -> Harness<'static, State> {
         .build_ui_state(
             |ui, state: &mut State| {
                 if !state.hidden {
-                    let panel = super::draw_depth_parallax_panel(ui.ctx(), &mut state.settings, "");
+                    let panel = super::draw_depth_parallax_panel(
+                        ui.ctx(),
+                        &mut state.settings,
+                        "",
+                        Some("I / Tab: パネルを隠す・出す".into()),
+                    );
                     state.close_requested |= panel.close_requested;
                     state.focus_adjustments += usize::from(panel.focus_adjusting);
                 }

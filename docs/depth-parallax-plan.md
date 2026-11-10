@@ -2404,3 +2404,46 @@ ScrollArea の外に見え、本文が末尾まで届く高さ検査。UI スナ
 
 **文書**: マニュアル (3D 写真の節) に「パネル下部に操作の案内が出る」「隠したときの通知」を足す。
 `docs/keymap-spec.md` に、3D パネルの案内が `FsToggleMetadata` の割り当てから作られることを書く。
+
+### 17.11 実装記録 (§17.10)
+
+2026-11-11、`feat-3d-751`、基点 `da4485dcc`。§17.10からの仕様変更なし。
+
+前提のコード確認:
+
+- パネル表示の切替は `src/app/depth_view.rs:281` の `App::toggle_depth_panel` が所有する。
+  `src/ui_fullscreen.rs:36920` の `key_i` と `src/app/gamepad_input.rs:8099` の `ImageToggleMetadata` は
+  両方この関数を通る。入口の受付条件やkeymap自体は変更していない。
+- `App::draw_depth_panel` (`src/app/depth_view.rs:445`) が状態と書き出し可否を純描画関数へ渡し、返されたパネル矩形を
+  入力除外へ渡す既存の境界を維持する。
+- `src/ui_depth_parallax.rs:58,102` は固定headerと明示的に確保したScrollAreaの親領域を持つ。
+  描画するフッター文字の折り返し済みgalleyを実測し、行間と本文との間隔も含めて本文高から差し引く。
+  本文の上限380ptと既定値ボタンを維持し、旧スライダー下の説明は撤去した。
+
+| ファイル | 変更 |
+| --- | --- |
+| `src/app/depth_view.rs` | 毎回現在の `FsToggleMetadata` のchord表示を結合し、案内文字列を渡す。隠すときだけ共通の通知を1回発行。割り当てなしではキー案内を省略 |
+| `src/ui_depth_parallax.rs` | 小さい弱い文字色の固定フッター2行。純描画APIへ `Option<String>` を追加し、keymap参照・I/O・状態の追加なし |
+| `src/app/depth_view_tests.rs` | 実App描画で既定・変更・複数・空の割り当てに追従。キーとリングの両入口から2周ずつ、隠す通知1回／出す通知なしを検査 |
+| `src/ui_depth_parallax_tests.rs`、`src/ui_depth_export_tests.rs` | 共通描画APIへ案内文字列を渡し、既存のパネル操作・書き出し回帰を維持 |
+| `tests/ui_snapshot.rs`、パネルPNG | 1093×614と546.5×307でheader/footerの可視性とScrollArea外の固定配置、実wheelによる末尾と各controlへの到達を検査。小画面の代表snapshotを追加 |
+| `htdocs/mimageviewer/manual/fullscreen.html`、`docs/keymap-spec.md`、本書 | 固定案内・現在の割り当て・隠した通知の説明を同期。製品ページの3Dカードの主張は変わらないため変更なし |
+
+検証（Windows、通常feature、同worktreeの未コミット差分）。利用者の実機確認中のcoreを保護するため、
+`build-dev.ps1` は実行していない。確認用成果物の再作成と全件suiteはcoordinatorが担当する。
+本作業ではコミット・push・製品起動を行っていない。
+
+| コマンド | 結果・証拠 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth/)'` | **179成功 / 0失敗**、exit 0。`target/depth-panel-1760-tests.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/keymap/)'` | **210成功 / 0失敗**、exit 0。`target/depth-panel-1760-keymap.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険グリフ0件 |
+| `UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot depth_parallax` | **3成功 / 0失敗**、exit 0。`target/depth-panel-1760-snapshot-update.log`。既存の通常サイズPNGを更新し、小画面PNGを追加 |
+| `cargo test --test ui_snapshot depth_parallax` | 更新指定なしの通常比較も **3成功 / 0失敗**、exit 0。`target/depth-panel-1760-snapshot-compare.log` |
+| `cargo fmt`（引数なし）、`git diff --check` | exit 0 |
+
+`tests/snapshots/depth_parallax_panel_dark.png`（1093×614、46,626 bytes）と
+`depth_parallax_panel_small_dark.png`（546×307、19,219 bytes）を目視確認した。
+小画面の入力は546.5×307 logical points。両方で見出し・×・固定案内2行が収まり、文字の欠けや重なりなし。
+小画面の本文にはscrollbarがあり、別の高さ検査で実wheelによる末尾と各controlへの到達を確認した。
+純描画snapshotとheadless handlerテストの結果であり、製品起動・実機操作の確認とは分ける。
