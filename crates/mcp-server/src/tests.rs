@@ -6,6 +6,169 @@ struct Input {
 }
 
 #[test]
+fn folder_filters_and_library_ceiling_forward_validate_and_default() {
+    let arguments =
+        json!({"path":"C:/photos","min_stars":0,"max_stars":2,"kinds":["video","image"]});
+    let (_, command) = parse_tool(&json!({"name":"list_folder","arguments":arguments})).unwrap();
+    assert_eq!(
+        command,
+        Command::ListFolder {
+            path: "C:/photos".into(),
+            subresource: None,
+            min_stars: Some(0),
+            max_stars: Some(2),
+            kinds: Some(vec![FolderKind::Image, FolderKind::Video]),
+            limit: None,
+            cursor: None,
+        }
+    );
+    let (_, command) = parse_tool(
+        &json!({"name":"list_library","arguments":{"kind":"rated","stars":2,"max_stars":2}}),
+    )
+    .unwrap();
+    assert_eq!(
+        command,
+        Command::ListLibrary {
+            kind: LibraryKind::Rated,
+            stars: Some(2),
+            max_stars: Some(2),
+            limit: None,
+            cursor: None,
+        }
+    );
+    for (name, omitted, explicit) in [
+        (
+            "list_folder",
+            json!({"path":"C:/photos"}),
+            json!({"path":"C:/photos","min_stars":null,"max_stars":null,"kinds":null}),
+        ),
+        (
+            "list_library",
+            json!({"kind":"rated"}),
+            json!({"kind":"rated","max_stars":null}),
+        ),
+    ] {
+        let (_, old) = parse_tool(&json!({"name":name,"arguments":omitted})).unwrap();
+        let (_, new) = parse_tool(&json!({"name":name,"arguments":explicit})).unwrap();
+        assert_eq!(old, new);
+    }
+    let tools = schema::tools();
+    let folder = tools
+        .iter()
+        .find(|tool| tool["name"] == "list_folder")
+        .unwrap();
+    assert!(accepts_schema(&folder["inputSchema"], &arguments));
+    for filters in [
+        json!({"min_stars":6}),
+        json!({"max_stars":-1}),
+        json!({"min_stars":1.5}),
+        json!({"min_stars":"2"}),
+        json!({"min_stars":3,"max_stars":2}),
+        json!({"kinds":[]}),
+        json!({"kinds":["image","image"]}),
+        json!({"kinds":["unknown"]}),
+        json!({"kinds":"image"}),
+    ] {
+        let mut arguments = json!({"path":"C:/photos"});
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(filters.as_object().unwrap().clone());
+        assert!(
+            parse_tool(&json!({"name":"list_folder","arguments":arguments})).is_err(),
+            "{arguments}"
+        );
+        // Cross-field range validation belongs to parse_tool/core, as with existing tools.
+        if arguments.get("min_stars") != Some(&json!(3)) {
+            assert!(
+                !accepts_schema(&folder["inputSchema"], &arguments),
+                "{arguments}"
+            );
+        }
+    }
+    let library = tools
+        .iter()
+        .find(|tool| tool["name"] == "list_library")
+        .unwrap();
+    for max in [0, 1, 2, 5, 6] {
+        let arguments = json!({"kind":"rated","stars":2,"max_stars":max});
+        assert_eq!(
+            parse_tool(&json!({"name":"list_library","arguments":arguments})).is_ok(),
+            (2..=5).contains(&max)
+        );
+        assert_eq!(
+            accepts_schema(&library["inputSchema"], &arguments),
+            max <= 5
+        );
+    }
+    for kind in ["favorites", "reading_history", "bookshelf", "bookmarks"] {
+        assert!(
+            parse_tool(&json!({"name":"list_library","arguments":{"kind":kind,"max_stars":5}}))
+                .is_err()
+        );
+        assert!(
+            parse_tool(&json!({"name":"list_library","arguments":{"kind":kind,"max_stars":null}}))
+                .is_ok()
+        );
+    }
+}
+
+#[test]
+fn folder_rating_and_tags_output_schema_matches_rows_and_markers() {
+    let tool = schema::tools()
+        .into_iter()
+        .find(|tool| tool["name"] == "list_folder")
+        .unwrap();
+    let mut physical = FolderItem {
+        path: "C:/photos/cat.png".into(),
+        subresource: None,
+        name: "cat.png".into(),
+        kind: FolderKind::Image,
+        size: Some(10),
+        modified: None,
+        rating: Some(0),
+        tags: Some(vec!["#cat".into()]),
+    };
+    let virtual_row = FolderItem {
+        path: "C:/book.zip".into(),
+        subresource: Some("cat.png".into()),
+        name: "cat.png".into(),
+        kind: FolderKind::ZipEntry,
+        size: None,
+        modified: None,
+        rating: Some(5),
+        tags: None,
+    };
+    physical.tags = Some(vec!["x".repeat(MAX_ITEM_CHARS)]);
+    let marker = PageRow::too_long(&physical).unwrap();
+    physical.tags = Some(vec!["#cat".into()]);
+    let result = tool_result(
+        "list_folder",
+        Ok(Payload::Folder(FolderPage {
+            items: vec![physical.into(), virtual_row.into(), marker],
+            cursor: None,
+            truncated: false,
+            book_composition_applied: false,
+        })),
+    );
+    let content = &result["structuredContent"];
+    assert!(accepts_schema(&tool["outputSchema"], content));
+    for invalid in [json!(6), json!(-1), json!("2")] {
+        let mut bad = content.clone();
+        bad["items"][0]["rating"] = invalid;
+        assert!(!accepts_schema(&tool["outputSchema"], &bad));
+    }
+    for key in ["rating", "tags"] {
+        let mut bad = content.clone();
+        bad["items"][0].as_object_mut().unwrap().remove(key);
+        assert!(!accepts_schema(&tool["outputSchema"], &bad));
+    }
+    let mut null = content.clone();
+    null["items"][0]["rating"] = Value::Null;
+    assert!(accepts_schema(&tool["outputSchema"], &null));
+}
+
+#[test]
 fn catalog_tools_forward_and_validate_paging_arguments() {
     for name in ["list_tags", "list_collections"] {
         let mut arguments = json!({"limit":17,"cursor":"opaque"});
@@ -93,6 +256,9 @@ fn stage1b_argument_contracts_and_schema() {
     assert_eq!(
         folder,
         Command::ListFolder {
+            min_stars: None,
+            max_stars: None,
+            kinds: None,
             path: "C:/book.zip".into(),
             subresource: Some("pages/".into()),
             limit: Some(200),
@@ -191,6 +357,8 @@ fn stage1b_argument_contracts_and_schema() {
         Ok(Payload::Folder(FolderPage {
             items: vec![
                 FolderItem {
+                    rating: Some(0),
+                    tags: None,
                     path: "C:/book.zip".into(),
                     subresource: Some("pages/".into()),
                     name: "pages".into(),
@@ -1560,6 +1728,7 @@ fn stage2_metadata_tools_transport_typed_commands_and_results_on_all_protocols()
 
 #[test]
 fn stage2_complete_tool_discovery_fits_final_envelope_budget() {
+    let mut largest = (0, String::new());
     for level in [
         AgentLevel::Disabled,
         AgentLevel::ReadOnly,
@@ -1583,6 +1752,12 @@ fn stage2_complete_tool_discovery_fits_final_envelope_budget() {
                         ] {
                             let response = success(id, json!({"tools":tools}), modern);
                             let chars = response_non_image_chars(&response);
+                            if chars > largest.0 {
+                                largest = (
+                                    chars,
+                                    format!("{level:?}/{thumbnails}/{gps}/{ai_captions}/{modern}"),
+                                );
+                            }
                             assert!(
                                 chars + 512 <= MAX_MCP_RESPONSE_CHARS,
                                 "discovery {level:?}/{thumbnails}/{gps}/{ai_captions}/{modern}: {chars} chars, needs 512 reserve"
@@ -1599,6 +1774,7 @@ fn stage2_complete_tool_discovery_fits_final_envelope_budget() {
             }
         }
     }
+    eprintln!("Largest tools/list: {} chars ({})", largest.0, largest.1);
 }
 
 #[test]
@@ -3414,6 +3590,14 @@ fn accepts_schema_root(schema: &Value, value: &Value, root: &Value) -> bool {
         }
     }
     if let Some(array) = value.as_array() {
+        if schema.get("uniqueItems") == Some(&json!(true))
+            && array
+                .iter()
+                .enumerate()
+                .any(|(index, value)| array[..index].contains(value))
+        {
+            return false;
+        }
         if schema
             .get("minItems")
             .and_then(Value::as_u64)

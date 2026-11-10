@@ -11,7 +11,7 @@ pub use read_types::*;
 mod folder_types;
 pub use folder_types::*;
 
-pub const AGENT_PROTOCOL_VERSION: u32 = 2;
+pub const AGENT_PROTOCOL_VERSION: u32 = 3;
 pub const MAX_CLIENT_NAME_CHARS: usize = 128;
 pub const MAX_CLIENT_VERSION_CHARS: usize = 64;
 
@@ -111,6 +111,8 @@ pub enum Command {
     ListLibrary {
         kind: LibraryKind,
         stars: Option<u8>,
+        #[serde(default)]
+        max_stars: Option<u8>,
         limit: Option<u32>,
         cursor: Option<String>,
     },
@@ -122,6 +124,12 @@ pub enum Command {
     ListFolder {
         path: String,
         subresource: Option<String>,
+        #[serde(default)]
+        min_stars: Option<u8>,
+        #[serde(default)]
+        max_stars: Option<u8>,
+        #[serde(default)]
+        kinds: Option<Vec<FolderKind>>,
         limit: Option<u32>,
         cursor: Option<String>,
     },
@@ -544,7 +552,7 @@ mod tests {
     use super::*;
     #[test]
     fn handshake_version_requires_exact_equality() {
-        for version in [0, 1, 2, u32::MAX] {
+        for version in [0, 1, 2, AGENT_PROTOCOL_VERSION, u32::MAX] {
             if version == AGENT_PROTOCOL_VERSION {
                 assert!(check_version(version).is_ok());
             } else {
@@ -646,7 +654,7 @@ mod tests {
         );
     }
     #[test]
-    fn handshake_identity_and_request_kind_are_explicit_in_unreleased_v2() {
+    fn handshake_identity_and_request_kind_are_explicit() {
         let hello = serde_json::json!({
             "id": 1,
             "command": {
@@ -669,7 +677,7 @@ mod tests {
             incomplete["command"].as_object_mut().unwrap().remove(field);
             assert!(serde_json::from_value::<Request>(incomplete).is_err());
         }
-        assert_eq!(AGENT_PROTOCOL_VERSION, 2);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 3);
     }
 
     #[test]
@@ -704,6 +712,7 @@ mod tests {
                 cursor: None,
             },
             Command::ListLibrary {
+                max_stars: None,
                 kind: LibraryKind::Rated,
                 stars: Some(3),
                 limit: Some(2),
@@ -781,7 +790,7 @@ mod tests {
 
     #[test]
     fn collection_write_wire_roundtrips_grouped_input_positions() {
-        assert_eq!(AGENT_PROTOCOL_VERSION, 2);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 3);
         let reference = ItemRef {
             path: "C:/本.zip".into(),
             subresource: Some("001.png".into()),
@@ -851,12 +860,12 @@ mod tests {
             .unwrap(),
             permission
         );
-        assert_eq!(AGENT_PROTOCOL_VERSION, 2);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 3);
     }
 
     #[test]
     fn metadata_write_wire_roundtrips_and_full_batch_outcomes_fit_budget() {
-        assert_eq!(AGENT_PROTOCOL_VERSION, 2);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 3);
         let reference = ItemRef {
             path: "C:/本.zip".into(),
             subresource: Some("001.png".into()),
@@ -933,7 +942,7 @@ mod tests {
 
     #[test]
     fn open_wire_uses_typed_accepted_result_without_changing_protocol_version() {
-        assert_eq!(AGENT_PROTOCOL_VERSION, 2);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 3);
         assert_eq!(
             serde_json::to_value(Command::OpenInViewer {
                 path: "C:/猫.png".into(),

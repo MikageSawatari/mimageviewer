@@ -486,6 +486,9 @@ fn continued_search_and_folder_reject_every_permission_change_from_admission_gra
             panic!()
         };
         let folder_command = |cursor| Command::ListFolder {
+            min_stars: None,
+            max_stars: None,
+            kinds: None,
             path: root.to_string_lossy().into_owned(),
             subresource: None,
             limit: Some(1),

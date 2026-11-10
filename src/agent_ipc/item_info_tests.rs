@@ -1202,6 +1202,9 @@ fn list_folder_zip_books_round_trip_through_item_info_and_rating_preparation() {
                 prefix.map(str::to_owned),
                 None,
                 None,
+                None,
+                None,
+                None,
                 &ctx,
             )
             .unwrap()
@@ -1276,6 +1279,37 @@ fn list_folder_zip_books_round_trip_through_item_info_and_rating_preparation() {
                 assert_eq!(output.generation, InfoField::NotApplicable);
                 books.push(prefix.to_owned());
             }
+        }
+        let Payload::Folder(rated_page) = fixture
+            .handlers
+            .list_folder(
+                path.to_string_lossy().into_owned(),
+                prefix.map(str::to_owned),
+                None,
+                None,
+                None,
+                None,
+                None,
+                &ctx,
+            )
+            .unwrap()
+        else {
+            panic!("folder page")
+        };
+        for row in rated_page.items {
+            let PageRow::Value(row) = row else {
+                panic!("fixture row")
+            };
+            assert_eq!(row.rating, Some(2));
+            assert_eq!(row.tags, None);
+            let input = ItemRef {
+                path: row.path,
+                subresource: row.subresource,
+            };
+            assert_eq!(
+                row.rating,
+                Some(read(&input, permission(false), &ctx.cancel).unwrap().rating)
+            );
         }
     }
     books.sort();
@@ -1552,8 +1586,10 @@ fn oversized_zip_metadata_is_rejected_before_decompression_and_actual_read_is_ca
 
 #[test]
 fn pdf_page_rating_and_container_tags_match_ui_without_starting_pdf_worker() {
-    let directory = crate::settings_db::DataDirOverrideGuard::new();
-    let path = directory.path().join("book.pdf");
+    use crate::agent_ipc::{ReadContext, tests::Fixture};
+    use crate::book_composition::{BookCompositionService, PageDomain};
+    let fixture = Fixture::new();
+    let path = fixture._dir.path().join("book.pdf");
     std::fs::write(&path, b"fixture").unwrap();
     seed_tags(&path, "pdf-tag");
     let ratings = crate::rating_db::RatingDb::open().unwrap();
@@ -1563,7 +1599,33 @@ fn pdf_page_rating_and_container_tags_match_ui_without_starting_pdf_worker() {
     ratings
         .set(&crate::edit_source::page_key_for_pdf(&path, 2), 3)
         .unwrap();
-    drop(ratings);
+    let metadata = std::fs::metadata(&path).unwrap();
+    let catalog = crate::catalog::CatalogDb::open(
+        &crate::catalog::default_cache_dir(),
+        path.parent().unwrap(),
+    )
+    .unwrap();
+    catalog
+        .set_pdf_meta(
+            "book.pdf",
+            crate::ui_helpers::mtime_secs(&metadata),
+            metadata.len() as i64,
+            3,
+            false,
+        )
+        .unwrap();
+    let (service, owner) = BookCompositionService::spawn_at(crate::data_dir::get(), None).unwrap();
+    service
+        .prepare(
+            crate::book_scope::BookScopeKey::document(&path).unwrap(),
+            PageDomain::Document,
+        )
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap()
+        .status
+        .unwrap();
+    fixture.handlers.readers.install_book_composition(service);
+    let before = std::fs::read(crate::rating_db::RatingDb::db_path()).unwrap();
     let mut output = ItemInfo {
         item: item(&path, Some("page_2")),
         name: "Page 3".into(),
@@ -1595,6 +1657,38 @@ fn pdf_page_rating_and_container_tags_match_ui_without_starting_pdf_worker() {
     assert_eq!(output.rating, 3);
     assert_eq!(output.tags, InfoField::NotApplicable);
     assert_eq!(output.container_tags, vec!["#pdf-tag"]);
+    let ctx = ReadContext::new(
+        &fixture.handlers,
+        (permission(false), 0),
+        std::sync::Arc::new(AtomicBool::new(false)),
+    );
+    let Payload::Folder(page) = fixture
+        .handlers
+        .list_folder(
+            path.to_string_lossy().into_owned(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &ctx,
+        )
+        .unwrap()
+    else {
+        panic!("folder page")
+    };
+    let PageRow::Value(row) = &page.items[2] else {
+        panic!("small row")
+    };
+    assert_eq!(row.subresource.as_deref(), Some("page_2"));
+    assert_eq!(row.rating, Some(output.rating));
+    assert_eq!(row.tags, None);
+    assert_eq!(
+        std::fs::read(crate::rating_db::RatingDb::db_path()).unwrap(),
+        before
+    );
+    owner.shutdown_and_join();
 }
 
 fn jpeg_with_gps() -> Vec<u8> {

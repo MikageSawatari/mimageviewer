@@ -703,6 +703,7 @@ struct CollectionArgs {
 struct LibraryArgs {
     kind: LibraryKind,
     stars: Option<u8>,
+    max_stars: Option<u8>,
     limit: Option<u32>,
     cursor: Option<String>,
 }
@@ -724,6 +725,9 @@ struct InfoRefArgs {
 struct FolderArgs {
     path: String,
     subresource: Option<String>,
+    min_stars: Option<u8>,
+    max_stars: Option<u8>,
+    kinds: Option<Vec<FolderKind>>,
     limit: Option<u32>,
     cursor: Option<String>,
 }
@@ -968,7 +972,11 @@ fn parse_tool(params: &Value) -> Result<(Action, Command), &'static str> {
         Some("list_library") => {
             let a: LibraryArgs = serde_json::from_value(args).map_err(bad)?;
             validate_paging(a.limit, a.cursor.as_deref())?;
-            if a.stars.is_some_and(|stars| stars > 5) {
+            if a.stars.is_some_and(|stars| stars > 5)
+                || a.max_stars.is_some_and(|max| {
+                    max > 5 || a.kind != LibraryKind::Rated || max < a.stars.unwrap_or(1).max(1)
+                })
+            {
                 return Err("Invalid stars threshold");
             }
             (
@@ -976,6 +984,7 @@ fn parse_tool(params: &Value) -> Result<(Action, Command), &'static str> {
                 Command::ListLibrary {
                     kind: a.kind,
                     stars: a.stars.map(|stars| stars.max(1)),
+                    max_stars: a.max_stars,
                     limit: clamp_limit(a.limit),
                     cursor: a.cursor,
                 },
@@ -1007,16 +1016,33 @@ fn parse_tool(params: &Value) -> Result<(Action, Command), &'static str> {
             )
         }
         Some("list_folder") => {
-            let a: FolderArgs = serde_json::from_value(args).map_err(bad)?;
+            let mut a: FolderArgs = serde_json::from_value(args).map_err(bad)?;
             validate_paging(a.limit, a.cursor.as_deref())?;
             if a.path.is_empty() {
                 return Err("Specify a nonempty folder path");
+            }
+            if a.min_stars.is_some_and(|stars| stars > 5)
+                || a.max_stars.is_some_and(|stars| stars > 5)
+                || a.min_stars
+                    .zip(a.max_stars)
+                    .is_some_and(|(min, max)| min > max)
+            {
+                return Err("Invalid stars range");
+            }
+            if let Some(kinds) = &mut a.kinds {
+                kinds.sort_unstable();
+                if kinds.is_empty() || kinds.windows(2).any(|pair| pair[0] == pair[1]) {
+                    return Err("Specify one or more unique row kinds");
+                }
             }
             (
                 "list_folder",
                 Command::ListFolder {
                     path: a.path,
                     subresource: a.subresource,
+                    min_stars: a.min_stars,
+                    max_stars: a.max_stars,
+                    kinds: a.kinds,
                     limit: clamp_limit(a.limit),
                     cursor: a.cursor,
                 },

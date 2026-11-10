@@ -424,31 +424,13 @@ fn enrich(
     path: &Path,
     legacy_rating_key: Option<&str>,
 ) -> Result<(), AgentError> {
-    // Match set_rating's virtual-book key as well as App's physical/page keys;
-    // neither a ZIP directory nor a page inherits the outer container's stars.
-    let rating_key = match item {
-        GridItem::ZipDir {
-            zip_path,
-            dir_prefix,
-            ..
-        } => super::metadata_write::zip_directory_rating_key(zip_path, dir_prefix),
-        _ => crate::edit_source::page_key_for_grid_item(item)
-            .unwrap_or_else(|| crate::adjustment_db::normalize_path(path)),
-    };
+    let rating_key = super::rating::RatingKey::for_item(item, legacy_rating_key.map(str::to_owned));
     let ratings_path = crate::rating_db::RatingDb::db_path();
     if ratings_path.try_exists().map_err(|_| super::internal())? {
         let db = crate::rating_db::RatingDb::open_readonly(ratings_path)
             .map_err(|_| super::internal())?;
-        // Presence matters: a current zero-star row must override old stars.
-        let keys: Vec<_> = std::iter::once(rating_key.clone())
-            .chain(legacy_rating_key.map(str::to_owned))
-            .collect();
-        let ratings = db.get_many(&keys);
-        output.rating = ratings
-            .get(&rating_key)
-            .copied()
-            .or_else(|| legacy_rating_key.and_then(|key| ratings.get(key).copied()))
-            .unwrap_or(0);
+        let keys = rating_key.keys().cloned().collect::<Vec<_>>();
+        output.rating = rating_key.resolve(&db.get_many(&keys));
     }
     let tags = super::optional_tags(&crate::tags_db::TagsDb::db_path())?;
     let tags = tags.map_or_else(Vec::new, |db| {

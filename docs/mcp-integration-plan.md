@@ -5927,3 +5927,154 @@ cached / 再表示時の Focus、選択可能ラベルの捕捉・キー・Escap
 6 件目 (2026-11-06): 設計担当が、ChatGPT.exe の子・孫として `%LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\codex.exe` が動き、MCP server を起動することを確認した。この場所の `codex.exe` をアプリ側へ分類し直し、アプリだけの利用時に CLI・IDE 拡張の終了を求めない。他の場所の `codex.exe` と daemon 除外、何かが動いていれば書かない条件は維持する。
 
 6 件目の検証 (`2724818f5` 上の未コミット差分): 指定 focused は exit 0、59/59 成功 (`target/agent-codex-app-bin-focused.log`)。`cargo fmt` / `cargo fmt --check` / 差分の空白検査は成功、独立レビュー ACCEPT。指定どおり build-dev・製品起動・commit・ブランチ切替は行っていない。
+
+## 42. フォルダ一覧の★・種類・タグ (§1.735、2026-11-08、v5.1.0)
+
+### A. きっかけと範囲
+
+v5.0.0 の利用者の試験で、Claude Desktop に「G:\...\フォルダ の★2 から 3 枚選んで★4 に」と頼むと、AI アプリが★2 だけを
+取り出せず、300 件余りの `list_folder` と 50 件ずつの `get_item_info` を組み合わせる遠回りになった (利用者の観測)。
+`list_folder` の行に★が無く、★で絞る手段は索引 (`search_items`) かライブラリ全体 (`list_library` の rated、★N 以上) しかない。
+
+利用者の方針 (2026-11-07・11-08): MCP ツール全体を、いろいろな依頼に柔軟に応えられるよう拡充する。v5.1.0 にはこの節の範囲を入れ、
+それ以外の拡充は backlog (§1.740) に起票して後で進める。
+
+v5.1.0 の範囲 (利用者決定 2026-11-08):
+
+1. `list_folder` の各行に `rating` と `tags` を付ける。
+2. `list_folder` に★の範囲 (`min_stars` / `max_stars`) と種類 (`kinds`) の絞り込みを足す。
+3. `list_library` の rated に `max_stars` を足し、「ちょうど★N」を取れるようにする。
+
+### B. `list_folder` の入力
+
+既存の `path` / `subresource` / `limit` / `cursor` に、省略可能な 3 つを足す。省略時は v5.0.0 と同じ一覧を返す。
+
+- `min_stars` / `max_stars`: 0〜5 の整数または null。どちらか一方でも指定すると、★を付けられない行 (`rating` が null) は除く。
+  `min_stars` だけなら「★N 以上」、`max_stars` だけなら「★N 以下 (0 なら未評価だけ)」、両方同じなら「ちょうど★N」。
+  `min_stars > max_stars` は `bad_request`。`list_library` の `stars` と違い、0 を 1 に読み替えない (0 は未評価を表す)。
+- `kinds`: 行の `kind` の enum (`folder` `image` `video` `audio` `zip` `pdf` `epub` `archive` `zip_folder` `pdf_page` `zip_entry`) の配列、
+  1 件以上・重複なし。指定した種類の行だけを返す。null・省略は全種類。
+- 複数の条件は AND。絞り込みは基本一覧 (保存済みの種類の表示・並び・本の構成・隠したページ・重複の畳み込み) を作った後、ページ分けの前に行う。
+  一覧画面の検索・ファセット・色・しおり・履歴の絞り込みには従わない (今と同じ)。
+
+### C. `list_folder` の出力
+
+- 行に `rating` を足す: 0〜5 の整数、または★を付けられない行 (`GridItem::accepts_rating()` が偽) なら null。
+  key は `item_info.rs` の `enrich` と 1 つの解決関数を共有する (同じ意味を 2 か所に書かない)。入力は「現在の key」と「旧 key の候補 (省略可)」で、
+  現在の key に行があればその値 (明示の★0 も含む) を使い、無ければ旧 key の値、どちらも無ければ 0。
+  - 現在の key: ZIP 内のフォルダ・入れ子の ZIP の本は `zip_directory_rating_key`、ZIP 内の画像・PDF のページ・画像は `page_key_for_grid_item`、
+    それ以外は `normalize_path` (今の `enrich` と同じ)。
+  - ZIP 内の画像の旧 key (CP932 対応前の名前、v1.3.x まで): `list_folder` は列挙結果の `ZipEnumeration::legacy_renames` (旧名 → 現在名) を
+    `PreparedZipEnumeration::prepare` に渡す前に取り出して持ち、行の現在名から旧名を引いて `zip_entry_key(path, 旧名)` を候補にする。
+    画面側はこの対応で旧 key を移行している (`zip_key_migration`) ので、これで `get_item_info` と画面の両方に一致する。
+  - ZIP 内のフォルダ (`ZipDir`) の旧 key は `list_folder` では読まない。画面も読まず移行もしない (`zip_key_migration.rs` の「対象外」)。
+    旧名の境界は CP932 の 0x5c のため列挙結果からは安全に切り出せない (`item_info.rs` の `zip_directory_entry_identity`)。
+    このため、v1.3.x までに★を付け、その後付け直していない ZIP 内フォルダだけは、`get_item_info` (旧 key も読む) と `list_folder` (画面と同じ) で★が食い違い得る。
+    この食い違いは既知の制限として記録し、`get_item_info` の既存の挙動は変えない。
+  - 検査で一致を保証するのは「`get_item_info` と同じ値」(ZipDir の旧 key だけの行を除く) と「画面の★と同じ key」。
+- 行に `tags` を足す: 物理 path の行 (subresource が null) は表示用のタグの配列 (`display_tags_for_item(item_key_for_path)`、`search_items` と同じ)。
+  subresource のある行 (ZIP 内・PDF のページ) は null (タグはファイル単位で、ページや ZIP 内の項目には付かない)。
+  タグの多い行は、既存の行の上限 (`MAX_ITEM_CHARS`) により今と同じ `too_long` の行になる。
+- ZIP / PDF そのもののタグ (container の tags) は `list_folder` に入れない。AI は `get_item_info` にその ZIP / PDF の path を 1 件渡して読む。
+  ページに共通の欄を置くと、タグが多いときに行を削っても上限に収まらない出口が要るため (独立レビュー指摘)。
+- 既存の `size` / `modified` / `book_composition_applied` の意味は変えない。
+
+### D. ページ分けと cursor
+
+- **cursor は絞り込み前の基本一覧の位置を持つ**。次のページは、その位置から先の基本一覧を順に見て、条件に合う行を `limit` 件まで返す。
+  実装は `(基本一覧の index, 行)` の組で絞り込み、返した最後の行の index + 1 を cursor に入れる。
+  これで、保存済みの並びが★に依らないなら、ページの間に AI が★を変えても (例: ★2 の一覧の途中で何枚かを★4 にする)、
+  次のページの取得は失敗せず、残りの★2 を飛ばさず、重複もしない。
+- `listing_digest` は今と同じく基本一覧の行の識別子 (path + subresource) を並び順のまま使う。
+  **保存済みの並びが★順のとき**は、★の変更で基本一覧の並びが変わるので、次のページは今と同じ「一覧が変わりました。最初から取り直してください」
+  (`bad_request`) になる (既存の契約のまま)。初回の並びを保持する仕組みは足さない (状態を増やさない。★で絞る一覧は通常 1 ページに収まり、
+  取り直しで足りる)。この制限はツールの説明の「一覧が変わると cursor は無効」で既に伝わっている。
+- `args_digest` には `min_stars` / `max_stars` / `kinds` を正規化して含める (`kinds` は並べ替えて重複なし)。条件を変えて続きを取ろうとすると、
+  今と同じ「最初からやり直してください」(`bad_request`)。
+- `truncated` は「この位置より後に条件に合う行が残っているか」。最後に返した行の後に合う行が無ければ false で cursor は null。
+  条件に合う行が 1 件も無い場合は、空の `items`・`truncated` false・cursor null を返す (エラーにしない)。
+- ページの文字数の上限 (`MAX_PAGE_CHARS`) で行を落とすときも、cursor は最後に返した行の基本一覧での次の位置にする。
+- cursor の版 (`FolderCursor.version`) を 3 → 4 に上げる。旧版の cursor は `bad_request` で拒否する (cursor は短命で、移行は要らない)。
+
+### E. 読み取りの経路
+
+- ★・タグの読み取りは、今の `list_folder` と同じ agent の読み取り worker (`ReadContext`) の中で、`RatingDb::open_readonly` と
+  `TagsDb::open_readonly` (`optional_tags`) を 1 回ずつ開いて行う。DB が無ければ★は 0 (★を付けられる行)、タグは空。UI スレッドは通らない。
+- ★は一覧全体 (絞り込みの判定に要る) を `get_many` でまとめて読む。タグは返す行の分だけ読む (`get_many_display_tags` が使えれば使う)。
+  どちらも一括取得の API を使い、内部の照会は 500 キー単位 (`rating_db.rs` の `get_many`)。行ごとに DB を開き直さない。読み取りは DB を変えない (旧 key の移行もしない)。
+- 物理フォルダの基本一覧は、★の並べ替えのために既に RatingDb を読むことがある (`materialize_local_folder_listing_with_order`)。
+  これは並べ替えの経路のまま残し、行の★の値は C の共有の key 解決関数で読む (並べ替えの結果を行の★として流用しない。ZIP の旧キー等の扱いが違うため)。
+- 権限: `list_folder` は今と同じ「読み取りのみ」以上で使える。★・タグは `search_items` / `get_item_info` で既に読み取り段に見せている情報で、
+  新しい許可項目は要らない。GPS・AI 説明文・縮小画像の許可には触れない。
+- 処理中の取り消し (`ctx.checkpoint()`) は DB の読み取りの前後にも置く。
+
+### F. `list_library` の rated
+
+- `max_stars` (0〜5 または null) を足す。kind が rated のときだけ使い、他の kind で指定したら `bad_request`。
+- 返す範囲は「`stars` (既存の意味のまま、既定 1・0 は 1) 以上、`max_stars` 以下」。`max_stars` が実効の最小値より小さい (0 を含む) なら `bad_request`。
+  rated は★1 以上の行しか持たないので、未評価は返さない (未評価の取り出しは `list_folder` の `max_stars: 0`)。
+- 並び (★の多い順・新しい評価時刻・path) と cursor の形は今と同じ。`args` に `max_stars` を含める。
+- DB 側は既存の `list_at_least_stars` の結果を `max_stars` で絞るか、範囲の照会を足す (実装担当が選ぶ。結果は同じ)。
+
+### G. 版と互換
+
+- 本体と MCP の exe は同梱で、組で更新される。行の形 (`outputSchema` の `additionalProperties: false`) が変わるので、
+  `AGENT_PROTOCOL_VERSION` を 2 → 3 に上げる。版は pipe 名にも入るので、古い組み合わせ (v5.0.0 の MCP の exe が動いたまま本体だけ更新した等) は
+  握手まで届かず「mIV が起動していない」扱い (`not_ready`、tools/list は `miv_status` だけ) になる。AI アプリを再起動すると新しい MCP の exe が起動して直る。
+  AI アプリへの登録の形 (launcher の `--mcp`) は変えない。launcher が内包する MCP の exe は通常のリリースビルドで新しくなる。
+- 永続データ (DB の schema・保存内容) は変えない。読むだけ。
+- ツールの説明 (AI アプリが読む文) を更新する。`list_folder` の「★などの絞り込みを除く」は「一覧画面の検索・ファセット・色・しおり・履歴の絞り込みは除く。
+  ★の範囲と種類では絞れる。行に★とタグを付ける」の趣旨に改める。`list_library` は `max_stars` を説明する。説明の変更は AI アプリの再読み込み後に効く。
+- 入力の検査は MCP 側 (`crates/mcp-server/src/lib.rs` の `FolderArgs` / `LibraryArgs`・`parse_tool`・wire の `Command` への転送) と
+  本体側 (`folder.rs` / `library.rs`) の両方で、今のツールと同じ方針で行う。新しい引数の省略・null は v5.0.0 と同じ動きにする。
+- 公開文書: マニュアル「AI アプリとの連携」に、フォルダの中を★の範囲・種類・未評価で取り出せることと、索引の検索 (お気に入りの「アイテム索引」の場所だけ)
+  との違いを書く。製品ページのカード (「検索やタグ・★・コレクションの整理を頼めます」) は今も正しく、文字数の上限もあるので変えない (確認済み)。
+  頼めることの例の表は「テスト用の画像で動作を確かめた頼み方」なので、利用者の実機確認の後に足す。
+
+### H. 検査
+
+- ★の値: 物理フォルダ・ZIP (直下・中のフォルダ・入れ子の ZIP の本・CP932 の旧 key だけの画像・現在 key の明示の★0 が旧 key に勝つ)・PDF のページで、
+  `list_folder` の `rating` が同じ参照の `get_item_info` の `rating` と一致すること (ZipDir の旧 key だけの行は C の制限どおり食い違うことを固定する)。
+  ★を付けられない行は null。読み取りの前後で rating DB が変わらないこと。
+- 絞り込み: 以上・以下・ちょうど・未評価 (`max_stars: 0`)、`kinds` 単独と★との AND、0 件、`min_stars > max_stars` の拒否、`kinds` の空配列・重複の拒否。
+- cursor: 絞り込み付きで複数ページにわたり、★に依らない並びでは、ページの間に既出の行・未返却の行の★を変えても続きが取れ、残りを飛ばさず重複もしないこと。
+  ★順 (昇順・降順) の並びで★を変えると「一覧が変わりました」になること。条件を変えた cursor・旧版の cursor の拒否。
+  まばらに一致する行・末尾の不一致の行・`too_long` の行・`MAX_PAGE_CHARS` で行を落とした後の続き。
+- タグ: 物理の行のタグ、subresource の行の null、タグの多い行の `too_long`。
+- MCP 側: 新しい引数の転送、省略・null が v5.0.0 と同じ wire になること。版の不一致で `not_ready` になること (既存の検査の版の値を更新)。
+- `list_library` rated: `max_stars` の範囲、他の kind での拒否、範囲の逆転の拒否、cursor の継続。
+- schema: tools/list の `inputSchema` / `outputSchema` と実際の応答の一致 (既存の schema の検査に足す)。
+
+### I. 採らなかった案
+
+(設計レビュー 2 巡目 `f41ddf784` で ready、残りの P3 (読み取りの説明) を反映。1 巡目 `a9f7292ce` の指摘 P2×3・P3×3 を反映: ★順の cursor、ZIP の旧 key の出どころ、container のタグの上限、版の不一致の実際のエラー、MCP 側の変更先、公開文書。)
+
+- `list_library` の rated に path の接頭辞を足す案: 「このフォルダの★N」はこの節の `list_folder` の絞り込みで足りる。
+  サブフォルダを含む★の取り出しは、rating DB のキー (ZIP 内・合成の本のキー) と path の接頭辞の照合を別に設計する必要があり、§1.740 へ回した。
+- container のタグを行ごと (`search_items` の形) またはページに 1 回置く案: 行ごとは同じ値の繰り返し、ページに置くとタグが多いとき上限の出口が要る。
+  `get_item_info` で 1 回読めば足りるので入れない。
+- ★順の一覧で初回の並びを cursor に保持する案: 状態が増え、★で絞った一覧は通常 1 ページに収まるので、既存の取り直しの契約にした。
+- ZIP 内フォルダの旧 key を `list_folder` でも読む案: 画面が読まない値を AI にだけ見せることになり、境界の切り出しも安全にできないため採らない。
+- 状態の組み合わせの検討 (CLAUDE.md): 読み取り専用で、書き込み・非同期の割り込みは増えない。ページの間の★の変更は D の cursor の作りで扱い、
+  専用の再試行や回復の仕組みは足さない。まれな失敗 (DB が読めない等) は既存どおり `internal` で返す (既定の割り切り)。
+
+### J. 実装と検証の記録 (2026-11-09)
+
+- 実装: Codex GPT-6.1 Sol / high。`c76ad4d57` (本体)、`e7195eda9` (説明文の製品名)、`dff903da3` (テストの準備)。
+  共有の key 解決は `src/agent_ipc/rating.rs` (`RatingKey`)。仕様からの逸脱はない。
+- 設計担当の検収で見つけた点: 実装担当は tools/list の文字数上限 (40,000 文字・余裕 512) に収めるため、`list_folder` と `list_library` の
+  説明の書き出しを「mIV」に縮めていた。§34 の製品名による道具の選択に反するので「mImageViewer (mIV)」に戻し、
+  `get_item_info` 以外の全ツールの書き出しに製品名があることを検査に足した。tools/list の最大 (整理まで) は 39,464 文字で、余裕は 536 文字。
+  **次にツールや説明を足すときは、文字数の上限に余裕がほとんど無い** (§1.740 の拡充では schema の重複を `$defs` にまとめる等を先に行う)。
+- 独立レビュー: Codex GPT-6.1 Sol / xhigh。設計は 2 巡で ready、実装は `c76ad4d57` で指摘なし、追加の 2 コミットも指摘なしで accept。
+- テスト (設計担当がサンドボックスの外で実行): `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp` 17 + 71 件成功 (実 pipe の 2 件を含む)、
+  `cargo nextest run -p mimageviewer --lib -E 'test(/agent/)'` 271 件成功。`cargo check -p mimageviewer --bin mimageviewer-core` 成功 (新しい警告なし)。
+  初回の本体テストでは新しい ZIP の旧 key の検査 2 件が、データフォルダ作成直後の設定 DB の初期化書き込みを「書き込み」と判定して落ちた。
+  v5.0.0 からの設定読み込みの動きで、既存の検査と同じく設定を先に一度保存してから検査するよう直した。
+- MCP 経由の確認 (2026-11-09、観測者 = 設計担当 ClaudeCode): `build-dev.ps1` の core を隔離データフォルダ (`--data-dir target\dev-runtime\data-1735`) で起動し、
+  `scripts/mcp_stdio_check.py` で `target\dev-runtime\mimageviewer-mcp.exe --data-dir …` に stdio でつないだ。PNG 8 枚と子フォルダ 1 つの試験フォルダに
+  `set_rating` で★2 を 3 枚・★4 を 1 枚付け、`add_tags` でタグを 1 つ付けたあと、`list_folder` の `min_stars: 2, max_stars: 2` は★2 の 3 枚だけ (タグ付き 1 枚を含む)、
+  `max_stars: 0, kinds: ["image"]` は未評価の画像 4 枚、`kinds: ["folder"]` は子フォルダだけ、`min_stars: 2, limit: 2` は 2 件と基本一覧の位置 4 を持つ cursor を返した。
+  `list_library` rated の `stars: 2, max_stars: 2` は★2 の 3 枚だけを返した。範囲の逆転・空の `kinds`・`max_stars` が最小より小さい rated は `-32602` で拒否された。
+  起動中の本体は許可をメモリに持つので、設定 DB を直接書き換えた後は再起動が要った (確認手順上の注意で、製品の挙動の変更ではない)。
+  AI アプリからの確認 (サブ PC 担当、依頼 28 第 2 部、2026-11-10、ビルド `7ca83f645` = master を取り込んだ後、codex-cli 0.166.0、`C:\miv-subpc\results-28\1735\`): Codex を「整理まで」で登録し、`codex exec` で 1 回ずつ新しい会話として頼んだ。4 回とも期待どおりで、★の絞り込みを自分で使った。「C:\miv-test-v5\rate1735 の★2 の画像から 3 枚選んで★4 に」は `list_folder` (`min_stars: 2, max_stars: 2`) 1 回 + `set_rating` 1 回 (3 件) で 19 秒。★2 と★4 の枚数は `list_folder` 2 回、未評価の枚数 (283) は `list_folder` (`max_stars: 0`) を cursor で続けて取得、ライブラリ全体のちょうど★3 は `list_library` rated (`stars: 3, max_stars: 3`) 1 回。一覧を取り直しながら★を読む遠回りは無かった。設計担当が rating.db の写しを数え、★2 = 9・★3 = 5・★4 = 3 で一致。登録を外した後の config.toml のハッシュは登録前と一致。ERROR / WARN / panic なし。 Claude Desktop・ChatGPT アプリ (画面) からは未確認。

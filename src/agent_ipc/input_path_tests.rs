@@ -224,15 +224,23 @@ fn concealed_file_and_virtual_items_reject_aliases_in_all_three_handlers() {
                 ctx.granted.0,
                 &ctx.cancel,
             ));
-            assert_path_error(
-                fixture
-                    .handlers
-                    .list_folder(alias.clone(), None, None, None, &ctx),
-            );
+            assert_path_error(fixture.handlers.list_folder(
+                alias.clone(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &ctx,
+            ));
             if member.is_some() {
                 assert_path_error(fixture.handlers.list_folder(
                     alias,
                     Some("inner/".into()),
+                    None,
+                    None,
+                    None,
                     None,
                     None,
                     &ctx,

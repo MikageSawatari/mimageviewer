@@ -273,6 +273,9 @@ fn media_deadline_keeps_both_slots_until_actual_reads_finish() {
             &b,
             20,
             Command::ListFolder {
+                min_stars: None,
+                max_stars: None,
+                kinds: None,
                 path: "C:/fixture".into(),
                 subresource: None,
                 limit: None,

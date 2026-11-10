@@ -1,20 +1,31 @@
 //! Read projections only: borrow the shared readers/actor and preserve source ordering.
 use super::*;
 
+#[cfg(test)]
+#[path = "library_tests.rs"]
+mod filter_tests;
+
 impl Handlers {
     pub(super) fn library(
         &self,
         kind: LibraryKind,
         stars: Option<u8>,
+        max_stars: Option<u8>,
         limit: Option<u32>,
         cursor: Option<String>,
         ctx: &ReadContext,
     ) -> Result<LibraryPage, AgentError> {
         ctx.checkpoint()?;
-        if stars.is_some_and(|value| value > 5) {
+        if stars.is_some_and(|value| value > 5) || max_stars.is_some_and(|value| value > 5) {
             return Err(error(ErrorCode::BadRequest, "★は0～5で指定してください"));
         }
         let threshold = stars.unwrap_or(1).clamp(1, 5);
+        if max_stars.is_some_and(|max| kind != LibraryKind::Rated || max < threshold) {
+            return Err(error(
+                ErrorCode::BadRequest,
+                "★の上限は評価済みの範囲で指定してください",
+            ));
+        }
         let args = serde_json::json!([
             kind,
             if kind == LibraryKind::Rated {
@@ -22,6 +33,7 @@ impl Handlers {
             } else {
                 None
             },
+            max_stars,
             "source_order"
         ]);
         let offset = decode_cursor(cursor.as_deref(), "list_library", &args, ctx.granted.1)?;
@@ -107,7 +119,9 @@ impl Handlers {
                     ctx.checkpoint()?;
                     for rating in rated {
                         ctx.checkpoint()?;
-                        rows.push(rated_row(rating));
+                        if max_stars.is_none_or(|max| rating.stars <= max) {
+                            rows.push(rated_row(rating));
+                        }
                     }
                 }
             }
@@ -467,6 +481,7 @@ mod tests {
                 &connection,
                 1,
                 Command::ListLibrary {
+                    max_stars: None,
                     kind,
                     stars,
                     limit,
@@ -559,6 +574,7 @@ mod tests {
             execute: Box::new(move |command, ctx| match command {
                 Command::Hello { version, .. } => Ok(Payload::Hello { version }),
                 Command::ListLibrary {
+                    max_stars: None,
                     kind: LibraryKind::Favorites,
                     ..
                 } => {
@@ -583,6 +599,7 @@ mod tests {
                 Request {
                     id: 1,
                     command: Command::ListLibrary {
+                        max_stars: None,
                         kind: LibraryKind::Favorites,
                         stars: None,
                         limit: None,
@@ -660,6 +677,7 @@ mod tests {
                 &connection,
                 2,
                 Command::ListLibrary {
+                    max_stars: None,
                     kind: LibraryKind::Rated,
                     stars: Some(255),
                     limit: None,
