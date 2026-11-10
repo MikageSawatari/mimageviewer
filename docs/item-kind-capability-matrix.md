@@ -101,7 +101,7 @@ Copy/Cut → Paste の表は、mIV が持つ OLE clipboard shortcut / paste verb
 | ファイル Copy/Cut — 右クリック・グリッド | **対応**。単一は先頭の「切り取り」「コピー」、checked は件数付きで表示し、解決済み `shell_paths` を渡す。 | **対応**。単一・Space でチェックした集合のどちらも実フォルダ path を渡す。 | **対応**。単一・checked とも ZIP/PDF 実 path を渡す。 | **拒否**。単一では項目を隠し、VirtualOnly / Mixed checked では理由付き disabled にする。 | **拒否**。`ZipImage` と同じ。 | **拒否**。単一では項目を隠し、仮想 checked なら理由付き disabled。 | **拒否**。単一では項目を隠し、仮想 checked なら理由付き disabled。 | enabled 時はキー入口と同じ OLE clipboard helper へ、右クリック時に確定した path 集合と Copy / Cut verb を渡す。 |
 | ファイル Copy/Cut — 右クリック・ビューア | **対応**。実ファイルページでは先頭の「切り取り」「コピー」から OLE clipboard へ渡す。 | **拒否**。Folder 自体は viewer leaf にならない。 | **拒否**。コンテナ自身でなく子 page が viewer target になる。 | **拒否**。実 filesystem path がないため項目を隠す。 | **拒否**。実 filesystem path がないため項目を隠す。 | **拒否**。Stack 自体は viewer 前に member Image へ展開される。 | **拒否**。ZipDir 自体は viewer leaf にならない。 | enabled 時はグリッドと同じ OLE clipboard helper へ単一の実 path と Copy / Cut verb を渡す。 |
 | 外向き file D&D — グリッド・単一 | **対応**。実 path を `SHDoDragDrop` に COPY effect で渡す (`src/ui_main.rs:1691-1744`, `src/file_drag.rs:160-199`)。 | **対応**。Folder の `drag_source_path` を渡す (`src/grid_item.rs:288-307`, `src/ui_main.rs:1736-1744`)。 | **対応**。ZIP/PDF 実 path を渡す (`src/grid_item.rs:288-307`, `src/ui_main.rs:1736-1744`)。 | **拒否**。種別ごとの理由をトーストで返す (2026-08-30 修正、`GridItem::file_operation_refusal`)。 | **拒否**。同上。 | **拒否**。同上 (スタック向けの文言)。 | **拒否**。同上 (書庫内フォルダ向けの文言)。 | destination Shell へ COPY だけを要求する。元 path / mIV DB は変更しない (`src/file_drag.rs:160-199`)。 |
-| 外向き file D&D — グリッド・checked（実項目だけ / 仮想 page だけ） (`src/ui_main.rs`) | **対応**。checked が実項目だけなら実 path 全件を drag する。 | **対応**。サブフォルダ展開可能な一覧で Space によりチェックした Folder も `drag_source_path` を渡す。 | **対応**。checked が実項目だけなら ZIP/PDF path 全件を drag する。 | **拒否**。仮想 page だけの checked は事前トーストを出して drag しない。 | **拒否**。仮想 page だけの checked は事前トーストを出して drag しない。 | **拒否**。checkbox 対象外。 | **拒否**。checkbox 対象外。 | 実項目だけなら destination Shell へ COPY。仮想 page だけなら file / DB とも変更なし。 |
+| 外向き file D&D — グリッド・checked（実項目だけ / 仮想 page だけ） (`src/ui_main.rs`) | **対応**。checked が実項目だけなら実 path 全件を drag する。 | **対応**。ドライブ一覧以外でチェックした Folder も `drag_source_path` を渡す。 | **対応**。checked が実項目だけなら ZIP/PDF path 全件を drag する。 | **拒否**。仮想 page だけの checked は事前トーストを出して drag しない。 | **拒否**。仮想 page だけの checked は事前トーストを出して drag しない。 | **拒否**。checkbox 対象外。 | **拒否**。checkbox 対象外。 | 実項目だけなら destination Shell へ COPY。仮想 page だけなら file / DB とも変更なし。 |
 | 外向き file D&D — グリッド・実 / 仮想 page 混在 checked (`src/ui_main.rs`) | **対応**。実 path は drag 対象に残り、部分実行される。 | **対応**。Space でチェックした Folder は実 path として部分実行側に残る。 | **対応**。ZIP/PDF の実 path は drag 対象に残り、部分実行される。 | **拒否**。この page は対象から除外されるが、実 path の COPY は部分実行し、完了後にトーストを出す。 | **拒否**。この page は対象から除外されるが、実 path の COPY は部分実行し、完了後にトーストを出す。 | **拒否**。checkbox 対象外。 | **拒否**。checkbox 対象外。 | 残った実 path だけ destination Shell へ COPY。除外 page と元 path / DB は変更しない。 |
 | 外向き file D&D — ビューア | **拒否**。drag start は grid cell response にだけ接続される (`src/ui_main.rs:13319-13335`)。 | **拒否**。grid cell drag 入口がなく viewer leaf でもない (`src/ui_main.rs:13319-13335`)。 | **拒否**。grid cell drag 入口がなく viewer leaf でもない (`src/ui_main.rs:13319-13335`)。 | **拒否**。grid cell drag 入口がない (`src/ui_main.rs:13319-13335`)。 | **拒否**。grid cell drag 入口がない (`src/ui_main.rs:13319-13335`)。 | **拒否**。grid cell drag 入口がない (`src/ui_main.rs:13319-13335`)。 | **拒否**。grid cell drag 入口がない (`src/ui_main.rs:13319-13335`)。 | D&D 処理が起動しないため変更なし (`src/ui_main.rs:13319-13335`)。 |
 | パス文字列コピー — グリッド・単一 (`src/context_menu_model.rs:328-368`) | **対応**。実 path を clipboard text にする (`src/ui_dialogs/context_menu.rs:475-501`, `src/ui_dialogs/context_menu.rs:1366-1389`)。 | **対応**。folder の実 path を text にする (`src/ui_dialogs/context_menu.rs:475-501`)。 | **対応**。コンテナの実 path を text にする (`src/ui_dialogs/context_menu.rs:475-501`)。 | **対応**。filesystem path ではなく `zip_path:entry` の合成表示文字列 (`src/ui_dialogs/context_menu.rs:489-497`)。 | **対応**。filesystem path ではなく `pdf_path:Page N` の合成表示文字列 (`src/ui_dialogs/context_menu.rs:498-500`)。 | **対応**。「代表画像のパス」をコピーする (`src/context_menu_model.rs:328-343`, `src/ui_dialogs/context_menu.rs:485-488`)。 | **対応**。filesystem path ではなく `zip_path:prefix` の合成表示文字列 (`src/ui_dialogs/context_menu.rs:489-497`)。 | OS clipboard の text のみ。file / DB は変更しない (`src/ui_dialogs/context_menu.rs:471-473`, `src/ui_dialogs/context_menu.rs:1388-1389`)。 |
@@ -163,6 +163,7 @@ adjustment 等の別 action になる (`src/keymap.rs:5438-5446`, `src/ui_fullsc
 
 > **2026-08-30 時点の進捗**: 5 / 8 / 11 / 12 は修正済み (本文の該当セルも更新済み)。
 > 残りは主に **1 / 2 / 3 / 4 / 9 / 10 = タグとページの関係**に集約される。
+> **2026-11-10 追記**: 6 のフォルダ選択と Ctrl+A の不一致は §1.732 で解消。
 > 14 (checked を無視する ExternalTool) と 15 (Windows 側削除) は現行仕様として意図的。
 
 1. **★ / タグ × `ZipImage` / `PdfPage`** — ★ はページ固有 key・kind で付き、タグは
@@ -186,10 +187,12 @@ adjustment 等の別 action になる (`src/keymap.rs:5438-5446`, `src/ui_fullsc
 6. **実ファイル操作 × checkable item** — `drag_source_path` は実ファイル / 実フォルダを返し、
    ZIP / PDF 内 page を除外する一方、`is_checkable` は page を含む。そのため checked 後の
    Copy/Cut、パスコピー、削除は仮想 page を含む全選択を拒否する。右クリックでは先頭の
-   「切り取り」「コピー」を理由付き disabled で残す。サブフォルダ展開可能な通常一覧では
-   Space が Folder もチェック可能にし、Shell menu / Copy/Cut / D&D / パスコピー / 削除の
-   全入口が同じ実 Folder path を扱う。ただし Ctrl+A は `is_checkable` だけを見るため Folder を
-   含めない (`src/app/subfolder_expansion.rs`, `src/app.rs`, `src/ui_dialogs/context_menu.rs`)。
+   「切り取り」「コピー」を理由付き disabled で残す。**フォルダ選択の入口差は解消済み (§1.732)**。
+   ドライブ一覧以外では Space / Ctrl・Shift+クリック / Shift+矢印 / Ctrl+A / ゲームパッドが
+   共通の `grid_item_can_be_checked` / `grid_item_checkable` 判定で Folder を含める。
+   Shell menu / Copy/Cut / D&D / パスコピー / 削除は同じ実 Folder path を扱う
+   (`src/app/subfolder_expansion.rs`, `src/grid_item.rs`, `src/app/update_phases.rs`,
+   `src/app/gamepad_input.rs`, `src/ui_dialogs/context_menu.rs`)。
 7. **仮想 item 混在選択 × file 操作** — キーと右クリックの Copy/Cut、パスコピー、削除は
    全体拒否する。右クリックの Copy/Cut は `Mixed` / `VirtualOnly` を分類して項目を disabled にし、
    Windows menu 用 `shell_paths` も作らない。一方 D&D は仮想 page だけ除外して実 path を

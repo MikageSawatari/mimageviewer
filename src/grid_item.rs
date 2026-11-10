@@ -375,8 +375,8 @@ impl GridItem {
 
     /// `is_checkable` の基礎となる、フォルダを除く実ファイルのパス。
     ///
-    /// 画像・動画・ZIP/PDF 本体・変換前アーカイブはディスク上に実体があるため対象。
-    /// `is_checkable` 自体はフォルダを含めないが、サブフォルダ展開可能な一覧では
+    /// 画像・動画・音声・ZIP/PDF 本体・変換前アーカイブはディスク上に実体があるため対象。
+    /// `is_checkable` 自体はフォルダを含めないが、ドライブ一覧以外では
     /// `App::grid_item_can_be_checked` がフォルダを追加で認める。単一・チェック選択を問わず、
     /// Shell コピー/カット、D&D、削除の実パス解決には [`Self::drag_source_path`] を使う。
     /// ZIP/PDF 内ページなど仮想フォルダ内アイテムは独立した実パスを持たないため対象外。
@@ -440,11 +440,12 @@ impl GridItem {
         }
     }
 
-    /// チェックボックスで選択できるアイテムか。
+    /// 項目の種類だけで決まる、フォルダ以外のチェック対象か。
     ///
-    /// 画像・動画・ZIP/PDF 本体・変換前アーカイブに加えて、ZIP/PDF 内ページも
-    /// ページ操作用に対象にする。**フォルダ** (チェック対象外)・ZIP セパレータ・
-    /// 検索集約コンテナは対象外。
+    /// 画像・動画・音声・ZIP/PDF 本体・変換前アーカイブに加えて、ZIP/PDF 内ページも
+    /// ページ操作用に対象にする。フォルダは一覧の条件を含む
+    /// [`grid_item_checkable`] / `App::grid_item_can_be_checked` で追加する。
+    /// ZIP セパレータ・スタック・検索集約コンテナ・取得できない登録項目は対象外。
     pub fn is_checkable(&self) -> bool {
         self.file_operation_path().is_some()
             || matches!(self, Self::ZipImage { .. } | Self::PdfPage { .. })
@@ -964,6 +965,11 @@ pub(crate) fn display_kind(item: &GridItem) -> Option<crate::settings::GridItemD
     }
 }
 
+/// 一覧でチェック選択できる項目か。フォルダの許可だけを一覧の所有者から受け取る。
+pub(crate) fn grid_item_checkable(item: &GridItem, folders_allowed: bool) -> bool {
+    item.is_checkable() || (folders_allowed && matches!(item, GridItem::Folder(_)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1107,8 +1113,11 @@ mod tests {
 
     #[test]
     fn checkable_includes_real_files_except_folders() {
-        // フォルダは単一選択の Shell 操作で扱い、複数チェック対象にはしない。
+        // 種類だけの判定ではフォルダを含めず、一覧の許可を共通判定へ渡す。
         assert!(!GridItem::Folder(PathBuf::from(r"C:\books")).is_checkable());
+        let folder = GridItem::Folder(PathBuf::from(r"C:\books"));
+        assert!(grid_item_checkable(&folder, true));
+        assert!(!grid_item_checkable(&folder, false));
         assert!(GridItem::Image(PathBuf::from(r"C:\books\a.jpg")).is_checkable());
         assert!(GridItem::Video(PathBuf::from(r"C:\books\a.mp4")).is_checkable());
         assert!(GridItem::ZipFile(PathBuf::from(r"C:\books\a.zip")).is_checkable());
@@ -1148,7 +1157,7 @@ mod tests {
 
     #[test]
     fn file_operation_path_is_only_for_movable_files() {
-        // フォルダは複数チェックの file_operation_path ではなく drag_source_path で扱う。
+        // フォルダの Shell 操作は単一・複数選択とも drag_source_path で扱う。
         assert!(
             GridItem::Folder(PathBuf::from(r"C:\books"))
                 .file_operation_path()

@@ -1,6 +1,6 @@
 # §1.732 どの一覧でもフォルダを複数選択・Ctrl+A の対象にする — 設計
 
-- 状態: 設計 (2026-11-10)。ブランチ `feat-732-folder-select`。設計の独立レビュー (GPT-6.1 Sol / xhigh、2026-11-10) は ACCEPT WITH CHANGES。指摘 P2×3・P3×2 を本書に反映済み (ブックマーク一覧の代理フォルダ行、Windows 標準の削除は対象外、外部ツールの件数への影響、判定式の純関数への集約、テストの追加)。
+- 状態: 実装済み (ブランチ feat-732-folder-select、実機確認待ち、2026-11-10)。設計の独立レビュー (GPT-6.1 Sol / xhigh、2026-11-10) は ACCEPT WITH CHANGES。指摘 P2×3・P3×2 を本書に反映済み (ブックマーク一覧の代理フォルダ行、Windows 標準の削除は対象外、外部ツールの件数への影響、判定式の純関数への集約、テストの追加)。
 - 発端: メール報告 (報告者の観測)。レーティング一覧やコレクションで Ctrl/Shift+クリックでフォルダを複数選択できない (ファイルはできる)。どの一覧でも Ctrl+A でフォルダが選ばれない。
 - 利用者決定 (2026-11-07): 仕様を変える。既存の動きが変わる点はリリースノート (必要なら「重要な変更点」) で知らせる。削除の確認・本へ追加・AI 説明文の扱いは下の §3 のとおり (削除の確認は利用者決定、本へ追加の ZIP と AI 説明文は本書で決めた)。
 
@@ -104,6 +104,7 @@
 - 動画・音声・同じ本のページなど、今「理由を出して中止」している項目は今のまま中止する (本件の対象外。動画の案内 `BOOK_GRID_VIDEO_HINT` は残す)。
 - ファイル名スタックの展開経路は変えない。
 - 判定は `book_page_source_for_idx` の前に種類で振り分ける (エラー文字列で判別しない)。メニュー・ツールバーの有効判定 (`ui_main.rs` の本へ追加の enable) が「対象外だけの選択」をどう扱うかも同じ規則に合わせる。
+- 実装判断 (2026-11-10): 本体だけの選択でもメニュー・ツールバーは有効のままにして、実行時に中の画像を選ぶ案内を出す。対象決定は共通 helper に集約し、チェック済みを優先、なければカーソル単独へ fallback し、スマートフォルダのルールによる対象絞り込みも同じ規則で行う。
 
 ### 3.3 選択の合計サイズ (本書で決定)
 
@@ -159,9 +160,95 @@
 
 - どの一覧 (★の一覧・コレクション・タグ・検索結果・閲覧履歴など) でも、フォルダを Ctrl+クリック・Shift+クリック・Space で複数選択できるようになった。Ctrl+A もフォルダを選ぶ。ドライブ一覧は対象外。
 - 変わる動き (⚠️ として書く候補):
-  - Ctrl+A はフォルダも選ぶ。ファイルだけを選ぶときは、Ctrl+A の後に Ctrl+クリックで外す (種類の絞り込みでフォルダを隠せるなら、隠してから Ctrl+A も書く。隠せるかは実装時にコードで確かめ、確かめられなければ書かない)。
+  - Ctrl+A はフォルダも選ぶ。ファイルだけを選ぶときは、種類の絞り込みでフォルダ以外の必要な種類を選んでから Ctrl+A を押すか、Ctrl+A の後に Ctrl+クリックでフォルダを外す。
   - 通常フォルダで Ctrl+A の後にサブフォルダ展開を押すと、選んだフォルダだけを展開する。
   - フォルダを含む削除は、「ごみ箱へ移すときは確認しない」が ON でも確認を出す。
   - Ctrl+A の後のコピー・移動・D&D・外部ツール・★・タグ・AI 説明文は、フォルダも対象になる。外部ツールで複数選択の設定が「1 件」のものは、フォルダを含めて 2 件以上になると起動しない。
   - ブックマーク一覧で、ページが見つからないブックマークも Ctrl+A で選ばれる。
   - 本へ追加は、フォルダや ZIP・PDF などの本を飛ばして残りのページを追加するようになった (以前は全体を中止)。
+
+### 種類フィルタのコード確認 (2026-11-10)
+
+- **フォルダを隠せる**。`src/settings.rs` の `FacetItemKind::Folder` は「フォルダ」と表示され、`src/app/metadata_ops.rs` の `facet_kind_for_item` は `GridItem::Folder` をその種類へ対応付ける。
+- `src/ui_main.rs` の `draw_facet_kind_menu` は選んだ種類を `facet_filter.kinds` に追加する包含式の絞り込み。`src/app.rs` の `passes_facet_filter` は集合が非空なら集合にない種類の行を除くため、フォルダ以外の必要な種類を選べば実フォルダが非表示になる。
+- 種類を何も選ばない状態は「すべて」であり、フォルダを除外する操作ではない。そのため公開文書は「フォルダのチェックを外す」ではなく「フォルダ以外の必要な種類へ絞ってから Ctrl+A」と書く。
+- この確認は一覧の種類フィルタの挙動であり、サブフォルダ展開の走査対象フィルタとは別。`ZipDir` も種類上は Folder だが、そもそも複数選択は対象外のまま。
+
+## 7. 実装と検証の記録（2026-11-10）
+
+設計方針からの逸脱なし。設定画面の旧説明もフォルダ必須確認へ合わせ、削除説明の既存の Enter 記述の不一致は現行 handler に合わせて修正した。製品のキー操作は変更していない。独立実装レビュー（GPT-6.1 Sol / xhigh）は追補も ACCEPT、未解決の指摘なし。
+
+### 追加したテスト（19件）
+
+`src/app/tests.rs` の `section1732_folder_selection_tests`:
+
+- `folders_are_checkable_across_list_kinds_except_drives`
+- `ctrl_a_and_gamepad_select_all_include_visible_folders_in_rating_and_collection`
+- `shift_arrow_and_space_check_folders_in_rating_and_collection_but_not_drives`
+- `ctrl_a_subfolder_expansion_roots_are_checked_folders_only`
+- `collection_root_ctrl_a_delete_requests_unregistration_and_preserves_folder`
+- `collection_physical_child_delete_keeps_folder_confirmation_with_skip_enabled`
+- `ctrl_a_bookmark_delete_includes_missing_page_folder_proxy_without_deleting_files`
+- `main_folder_checks_survive_detached_drive_context_creation_and_retirement`
+- `ctrl_a_external_tool_count_includes_folder_and_preserves_container_target`
+
+`src/ui_main.rs`:
+
+- `section1732_selection_total_excludes_folders_with_or_without_metadata`
+- `section1732_folder_only_selection_has_no_total_size`
+- `section1732_folder_click_selection_preserves_checks_and_includes_shift_range`
+- `section1732_collection_root_folder_clicks_are_checkable`
+
+`src/ui_dialogs/context_menu.rs`:
+
+- `section1732_collection_root_physical_delete_confirms_folders_with_skip_enabled`
+- `section1732_mixed_delete_counts_folders_on_the_count_line`
+
+`src/ui_fullscreen.rs`:
+
+- `grid_book_add_selection_admission_keeps_container_guidance_and_checked_priority`
+- `grid_book_add_skips_all_container_types_and_starts_remaining_page`
+- `grid_book_add_container_only_selection_guides_without_starting_worker`
+- `grid_book_add_container_skips_preserve_media_and_same_book_rejections`
+
+### 変更した既存テスト
+
+- `grid_item::tests::checkable_includes_real_files_except_folders`: 基礎判定は Folder を含まず、一覧の許可を受け取る純関数では選べることも検査。
+- `folders_confirm_but_archive_containers_skip_when_setting_is_on`: 旧 `folders_and_archive_containers_skip_confirmation_when_setting_is_on` を新仕様へ変更。
+- `delete_confirm_label_keeps_recycle_bin_wording_for_normal_targets` / `delete_confirm_label_warns_when_delete_may_be_permanent` / `delete_confirm_always_warns_for_folders_but_not_file_only_targets`: フォルダ有無の bool を件数に変更。
+- `delete_target_kind_is_derived_from_the_existing_grid_item_without_io`: 単独 Folder の既存文言・件数・省略禁止も検査。
+- `grid_book_add_rejects_mixed_audio_without_partial_copy`: 旧 `grid_book_add_rejects_mixed_invalid_items_without_partial_copy` の Folder を Audio に替え、全体中止の従来仕様を維持する試験へ変更。本体混在で続行する試験は上の新規試験が担当。
+- `preferences_recycle_bin_delete_confirmation_snapshot`: 説明文に合わせ既存 PNG 1枚を更新。`preferences_folder_edit_restore_snapshot` も再生成したが PNG は byte 単位で不変。両方の更新指定なし比較も成功。
+
+### 選択入口の監査
+
+`rg -n '\.is_checkable\(' src crates tests` の残存は `src/grid_item.rs` の12箇所だけ。製品の呼び出しは `grid_item_checkable` 内の1箇所、残り11箇所は基礎判定の単体テスト。選択の入口には直接呼び出しがない。Ctrl+A・ゲームパッドは `grid_item_can_be_checked`、クリックの許可条件は `grid_folders_checkable` を使う。Space・Shift+カーソルの既存入口も同じ App 判定を使う。
+
+### 検証のコマンドと結果
+
+未コミットの本ブランチ差分、通常 feature、dev/test profile。nextest は 0.9.148、default profile、retry なし。nextest のビルドには `MSBUILDDISABLENODEREUSE=1` と `--build-jobs 1` を明示した。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0、2分40秒。既存警告あり |
+| `cargo fmt`（引数なし、workspace 全体） / `cargo fmt --check` | exit 0 |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険な文字 0件 |
+| `python scripts/check_site_cards.py` | exit 0、53件中違反 0件 |
+| 下記の focused filter を指定した nextest | 237件実行、236件成功・追加テスト1件の期待値誤りで失敗。`target/section1732/focused.log`、`focused-initial-junit.xml` |
+| `cargo nextest run --build-jobs 1 -p mimageviewer --lib -E 'test(section1732_collection_root_folder_clicks_are_checkable)' --no-tests fail` | 最終修正後 exit 0、1件成功（Check/Explorer × Ctrl/Shift の4条件）。`target/section1732/collection-click-isolated-final.log`、`collection-click-isolated-final-junit.xml` |
+| `UPDATE_SNAPSHOTS=1` と2件の設定 snapshot filter を指定した nextest | 2件成功。`target/section1732/snapshot-update-ready.log`。画像は実装担当と独立 reviewer が目視確認 |
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE = '1'
+cargo nextest run --build-jobs 1 -p mimageviewer --lib -E 'test(section1732) | test(grid_book_add) | test(grid_click_selection_tests::) | test(grid_reclick_open_tests::) | test(selection_info_tests::) | test(delete_confirm_tests::) | test(grid_item::tests::) | test(folder_target_) | test(subfolder_expansion_toggle_uses_checked_folder_roots) | test(stale_aggregate_gamepad_item_actions) | test(stale_aggregate_ring_actions) | test(preferences_recycle_bin_delete_confirmation_snapshot) | test(preferences_folder_edit_restore_snapshot)' --no-tests fail
+```
+
+設定 snapshot の filter は `test(preferences_recycle_bin_delete_confirmation_snapshot) | test(preferences_folder_edit_restore_snapshot)`。更新指定を外した通常比較の2件も上記 focused 実行で成功した。
+
+失敗した `section1732_collection_root_folder_clicks_are_checkable` は、Explorer方式の単独選択を `checked` に持つという試験側の誤解だった。既存 handler の `selected` / `checked` の表現に期待値を合わせ、Shift+クリックで Folder のチェックが必ず入る検査を追加した（旧フォルダ不可の実装では失敗する）。さらに Ctrl→Shift を同一セルへ連続送信すると既存の double-click pairing に入るため、各方式と各修飾キーを独立した harness の単独クリックへ分けた。2回目の再実行は選択の assertion をすべて通過し、最後の activation 数だけがこの入力列のため失敗した（`target/section1732/collection-click-final.log`）。いずれの試験修正も独立 reviewer が原因と検出力を確認済み。製品コード・待機処理とほかの236件は変更していないので、その成功結果は再利用する。
+
+最終の単独再実行は1件成功。JUnitの集合を照合し、再利用した236件と合わせて **237件の異なるテストが成功**していることを確認した。追加した19件はすべてこの集合に含まれる。設定 snapshot 更新の2件を別の成功件数として重複加算しない。
+
+初回の native 依存ビルドは TurboJPEG の並列 MSBuild で exit 1。ビルドジョブを直列にして準備を完了した。追加した一覧種別テストの `match` の型不一致も修正した後、libtest のコンパイルは成功（12分34秒）。続くテスト一覧の取得が `0xc0000135` で止まったため、依頼の手順どおり `vendor/ffmpeg/bin/*.dll` を `target/debug/deps/` へコピーして実行を再開した。これらの段階はテスト実行成功として数えない。
+
+`test-lib-full.ps1` と `build-dev.ps1` は依頼どおり設計担当へ引き継ぎ、今回は実行していない。製品アプリの起動・実機確認・git commit/add/stash/reset/ブランチ切替も行っていない。

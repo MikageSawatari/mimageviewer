@@ -173,6 +173,7 @@ struct DeleteConfirmModalResponse {
 struct DeleteConfirmContent {
     label: String,
     kind: DeleteConfirmKind,
+    folder_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -548,10 +549,11 @@ fn delete_confirm_label_for_targets(
             .unwrap_or("?")
     });
     // 対象決定時の GridItem だけを参照する。確認表示のための metadata/read_dir は行わない。
-    let includes_folder = targets
+    let folder_count = targets
         .iter()
-        .any(|(idx, _)| matches!(items.get(*idx), Some(GridItem::Folder(_))));
-    let mut label = build_delete_confirm_label(count, single_name, kind, includes_folder);
+        .filter(|(idx, _)| matches!(items.get(*idx), Some(GridItem::Folder(_))))
+        .count();
+    let mut label = build_delete_confirm_label(count, single_name, kind, folder_count);
     if count > 1 {
         label.push_str("\n\n対象:");
         for (_, path) in targets.iter().take(DELETE_CONFIRM_VISIBLE_TARGET_LIMIT) {
@@ -567,21 +569,27 @@ fn delete_confirm_label_for_targets(
             label.push_str(&format!("\n・他 {remaining} 件"));
         }
     }
-    DeleteConfirmContent { label, kind }
+    DeleteConfirmContent {
+        label,
+        kind,
+        folder_count,
+    }
 }
 
 fn should_skip_delete_confirmation(
     skip_recycle_bin_delete_confirmation: bool,
     content: &DeleteConfirmContent,
 ) -> bool {
-    skip_recycle_bin_delete_confirmation && content.kind == DeleteConfirmKind::RecycleBin
+    skip_recycle_bin_delete_confirmation
+        && content.kind == DeleteConfirmKind::RecycleBin
+        && content.folder_count == 0
 }
 
 fn build_delete_confirm_label(
     count: usize,
     single_name: Option<&str>,
     kind: DeleteConfirmKind,
-    includes_folder: bool,
+    folder_count: usize,
 ) -> String {
     let mut label = match (kind, count, single_name) {
         (DeleteConfirmKind::RecycleBin, 1, Some(name)) => {
@@ -599,7 +607,12 @@ fn build_delete_confirm_label(
              完全に削除される場合があります。削除しますか？"
         ),
     };
-    if includes_folder {
+    if count > 1 && folder_count > 0 {
+        let suffix = format!("（うちフォルダ {folder_count} 個）");
+        let first_line_end = label.find('\n').unwrap_or(label.len());
+        label.insert_str(first_line_end, &suffix);
+    }
+    if folder_count > 0 {
         label.push_str("\n\n");
         label.push_str(DELETE_FOLDER_OMITTED_FILES_WARNING);
     }
@@ -2306,8 +2319,8 @@ impl crate::app::App {
     }
     /// チェック済みアイテムの Shell ファイル操作対象 (idx, path) を収集する。
     ///
-    /// サブフォルダ展開が使える通常のローカルフォルダ一覧では、Space でフォルダも
-    /// チェックできる。ファイルとフォルダのどちらも返す `drag_source_path` を正本の
+    /// ドライブ一覧以外ではフォルダもチェックできる。
+    /// ファイルとフォルダのどちらも返す `drag_source_path` を正本の
     /// 述語とし、削除時にインデックスがずれないよう降順で返す。
     pub(crate) fn collect_checked_indexed_paths(&self) -> Vec<(usize, PathBuf)> {
         let mut targets: Vec<(usize, PathBuf)> = Vec::new();
@@ -4738,6 +4751,53 @@ mod delete_confirm_tests {
         }));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn section1732_collection_root_physical_delete_confirms_folders_with_skip_enabled() {
+        let mut app = crate::app::setup_app_for_test();
+        let folder = app.tmp.path().join("registered-folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("keep.txt"), b"preserve").unwrap();
+        crate::app::tests::install_collection_item_for_detached_plan(
+            &mut app,
+            &folder,
+            crate::collection_store::CollectionResolvedKind::Folder,
+        );
+        app.collection_ui.set_read_phase_for_test(false);
+        app.checked.insert(0);
+        app.settings.skip_recycle_bin_delete_confirmation = true;
+        let target = app.context_menu_target(
+            0,
+            app.items[0].clone(),
+            false,
+            true,
+            None,
+            ContextMenuSurface::Grid,
+            Some(folder.clone()),
+        );
+        assert!(target.collection_root_delete.is_collection_root());
+        assert_eq!(target.delete_targets, vec![(0, folder.clone())]);
+        let ctx = egui::Context::default();
+        app.dispatch_native_grid_context_command(&ctx, MenuCommand::MoveToRecycleBin, &target);
+        assert!(app.show_delete_confirm);
+        ctx.run_pass(Default::default(), |ctx| {
+            app.show_delete_confirm_dialog(ctx)
+        })
+        .drop_without_applying_deltas();
+        assert!(
+            app.show_delete_confirm,
+            "skip ON must still show the folder confirmation"
+        );
+        assert!(
+            app.delete_confirm_label
+                .as_ref()
+                .unwrap()
+                .contains(DELETE_FOLDER_OMITTED_FILES_WARNING)
+        );
+        assert!(app.delete_pending.is_none());
+        assert_eq!(std::fs::read(folder.join("keep.txt")).unwrap(), b"preserve");
+    }
+
     #[test]
     fn virtual_item_keeps_a_native_miv_only_target() {
         let mut app = crate::app::setup_app_for_test();
@@ -5398,6 +5458,7 @@ mod delete_confirm_tests {
         DeleteConfirmContent {
             label: String::new(),
             kind,
+            folder_count: 0,
         }
     }
 
@@ -5435,7 +5496,7 @@ mod delete_confirm_tests {
     }
 
     #[test]
-    fn folders_and_archive_containers_skip_confirmation_when_setting_is_on() {
+    fn folders_confirm_but_archive_containers_skip_when_setting_is_on() {
         let items = vec![
             GridItem::Folder(PathBuf::from(r"C:\pictures\album")),
             GridItem::ZipFile(PathBuf::from(r"C:\pictures\book.zip")),
@@ -5472,8 +5533,10 @@ mod delete_confirm_tests {
                 item.drag_source_path().is_some(),
                 "container test item should have a real delete target"
             );
-            let content = delete_content(DeleteConfirmKind::RecycleBin);
-            assert!(should_skip_delete_confirmation(true, &content));
+            let path = item.drag_source_path().unwrap().to_path_buf();
+            let is_folder = matches!(item, GridItem::Folder(_));
+            let content = delete_confirm_label_for_targets(&[(0, path)], &[item]);
+            assert_eq!(should_skip_delete_confirmation(true, &content), !is_folder);
             assert!(!should_skip_delete_confirmation(false, &content));
         }
     }
@@ -5493,21 +5556,17 @@ mod delete_confirm_tests {
     #[test]
     fn delete_confirm_label_keeps_recycle_bin_wording_for_normal_targets() {
         let label =
-            build_delete_confirm_label(1, Some("sample.jpg"), DeleteConfirmKind::RecycleBin, false);
+            build_delete_confirm_label(1, Some("sample.jpg"), DeleteConfirmKind::RecycleBin, 0);
         assert_eq!(label, "「sample.jpg」をゴミ箱に移動しますか？");
 
-        let label = build_delete_confirm_label(3, None, DeleteConfirmKind::RecycleBin, false);
+        let label = build_delete_confirm_label(3, None, DeleteConfirmKind::RecycleBin, 0);
         assert_eq!(label, "3 件の項目をゴミ箱に移動しますか？");
     }
 
     #[test]
     fn delete_confirm_label_warns_when_delete_may_be_permanent() {
-        let label = build_delete_confirm_label(
-            1,
-            Some("sample.jpg"),
-            DeleteConfirmKind::MayPermanent,
-            false,
-        );
+        let label =
+            build_delete_confirm_label(1, Some("sample.jpg"), DeleteConfirmKind::MayPermanent, 0);
         assert!(
             label.contains("完全に削除される場合があります"),
             "single-target warning should mention permanent deletion: {label}"
@@ -5517,7 +5576,7 @@ mod delete_confirm_tests {
             "single-target warning should include the file name: {label}"
         );
 
-        let label = build_delete_confirm_label(2, None, DeleteConfirmKind::MayPermanent, false);
+        let label = build_delete_confirm_label(2, None, DeleteConfirmKind::MayPermanent, 0);
         assert!(
             label.contains("ゴミ箱に移動できない場所"),
             "multi-target warning should mention non-recyclable locations: {label}"
@@ -5530,13 +5589,13 @@ mod delete_confirm_tests {
             DeleteConfirmKind::RecycleBin,
             DeleteConfirmKind::MayPermanent,
         ] {
-            let folder_label = build_delete_confirm_label(1, Some("album"), kind, true);
+            let folder_label = build_delete_confirm_label(1, Some("album"), kind, 1);
             assert!(
                 folder_label.contains(DELETE_FOLDER_OMITTED_FILES_WARNING),
                 "folder warning is required for every delete route: {folder_label}"
             );
 
-            let file_label = build_delete_confirm_label(1, Some("photo.jpg"), kind, false);
+            let file_label = build_delete_confirm_label(1, Some("photo.jpg"), kind, 0);
             assert!(
                 !file_label.contains(DELETE_FOLDER_OMITTED_FILES_WARNING),
                 "file-only deletion must not show the folder warning: {file_label}"
@@ -5555,12 +5614,49 @@ mod delete_confirm_tests {
                 .label
                 .contains(DELETE_FOLDER_OMITTED_FILES_WARNING)
         );
+        assert_eq!(folder_label.folder_count, 1);
+        assert!(!should_skip_delete_confirmation(true, &folder_label));
+        assert_eq!(
+            folder_label.label,
+            format!("「album」をゴミ箱に移動しますか？\n\n{DELETE_FOLDER_OMITTED_FILES_WARNING}")
+        );
 
         let file_label = delete_confirm_label_for_targets(&targets, &[GridItem::Image(folder)]);
         assert!(
             !file_label
                 .label
                 .contains(DELETE_FOLDER_OMITTED_FILES_WARNING)
+        );
+    }
+
+    #[test]
+    fn section1732_mixed_delete_counts_folders_on_the_count_line() {
+        let items = vec![
+            GridItem::Folder(PathBuf::from(r"C:\pictures\album")),
+            GridItem::Image(PathBuf::from(r"C:\pictures\a.jpg")),
+            GridItem::Folder(PathBuf::from(r"C:\pictures\other")),
+        ];
+        let targets = items
+            .iter()
+            .enumerate()
+            .map(|(idx, item)| (idx, item.drag_source_path().unwrap().to_path_buf()))
+            .collect::<Vec<_>>();
+        let content = delete_confirm_label_for_targets(&targets, &items);
+        assert_eq!(content.folder_count, 2);
+        assert_eq!(
+            content.label.lines().next(),
+            Some("3 件の項目をゴミ箱に移動しますか？（うちフォルダ 2 個）")
+        );
+        assert!(content.label.contains(DELETE_FOLDER_OMITTED_FILES_WARNING));
+        assert!(!should_skip_delete_confirmation(true, &content));
+
+        let permanent = build_delete_confirm_label(3, None, DeleteConfirmKind::MayPermanent, 2);
+        assert!(
+            permanent
+                .lines()
+                .next()
+                .unwrap()
+                .ends_with("（うちフォルダ 2 個）")
         );
     }
 

@@ -6878,9 +6878,9 @@ fn format_reading_history_media_time(value_ms: i64) -> String {
 }
 
 fn grid_selection_item_is_checkable(items: &[GridItem], allow_folders: bool, idx: usize) -> bool {
-    items.get(idx).is_some_and(|item| {
-        item.is_checkable() || (allow_folders && matches!(item, GridItem::Folder(_)))
-    })
+    items
+        .get(idx)
+        .is_some_and(|item| crate::grid_item::grid_item_checkable(item, allow_folders))
 }
 
 fn add_grid_selection_range(
@@ -8886,7 +8886,7 @@ impl App {
                                 }
                                 ui.separator();
                                 let has_selection = self.grid_item_input_allowed()
-                                    && (self.selected.is_some() || !self.checked.is_empty());
+                                    && self.grid_book_add_has_selection();
                                 for &command in books_menu_commands {
                                     match command {
                                         MenuCommandId::BooksAddSelectionToActiveBook => {
@@ -11066,8 +11066,8 @@ impl App {
             .map(|snapshot| snapshot.rows.clone());
         let toolbar_pinned_books = self.settings.pinned_books.clone();
         let toolbar_smart_folder_definitions = self.settings.smart_folders.clone();
-        let has_book_add_target = self.selected.is_some() || !self.checked.is_empty();
-        let has_rating_selection = has_book_add_target;
+        let has_book_add_target = self.grid_book_add_has_selection();
+        let has_rating_selection = self.selected.is_some() || !self.checked.is_empty();
         let toolbar_section_order =
             crate::settings::ToolbarSectionId::render_order(&self.settings.toolbar_section_order)
                 .into_iter()
@@ -17669,7 +17669,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             } else {
                 Vec::new()
             };
-            let allow_folders = self.subfolder_expansion_available();
+            let allow_folders = self.grid_folders_checkable();
             self.select_grid_cell(idx, ctrl, shift, &display_order, allow_folders);
             self.update_last_selected_image();
             activate = click.paired
@@ -21618,17 +21618,31 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         if checked_indices.len() > 1 {
             let mut lines = vec![format!("{} 個選択", checked_indices.len())];
             if self.settings.thumb_tooltip_show_file_size {
-                let total_size = checked_indices.iter().try_fold(0u64, |total, &idx| {
+                let includes_folder = checked_indices
+                    .iter()
+                    .any(|&idx| matches!(self.items.get(idx), Some(GridItem::Folder(_))));
+                let mut file_indices = checked_indices
+                    .iter()
+                    .copied()
+                    .filter(|&idx| !matches!(self.items.get(idx), Some(GridItem::Folder(_))))
+                    .peekable();
+                let has_files = file_indices.peek().is_some();
+                let total_size = file_indices.try_fold(0u64, |total, idx| {
                     let (_, size) = self.image_metas.get(idx).copied().flatten()?;
                     total.checked_add(u64::try_from(size).ok()?)
                 });
-                if let Some(total_size) = total_size {
+                if let Some(total_size) = total_size.filter(|_| has_files) {
                     lines.push(format!(
-                        "合計サイズ {}",
+                        "合計サイズ {}{}",
                         crate::ui_helpers::format_details_size(
                             total_size,
                             self.settings.details_size_display_mode,
-                        )
+                        ),
+                        if includes_folder {
+                            " (フォルダを除く)"
+                        } else {
+                            ""
+                        }
                     ));
                 }
             }
@@ -23807,6 +23821,44 @@ mod selection_info_tests {
         app.checked = [0usize, 1].into_iter().collect();
         app.settings.thumb_tooltip_show_file_size = true;
 
+        assert_eq!(
+            app.selection_info_content().unwrap().lines,
+            vec!["2 個選択"]
+        );
+    }
+
+    #[test]
+    fn section1732_selection_total_excludes_folders_with_or_without_metadata() {
+        for folder_meta in [None, Some((1, 0)), Some((1, 9999))] {
+            let mut app = setup_app_for_test();
+            app.items = vec![
+                GridItem::Folder(PathBuf::from(r"C:\pics\album")),
+                GridItem::Image(PathBuf::from(r"C:\pics\a.jpg")),
+                GridItem::Image(PathBuf::from(r"C:\pics\b.jpg")),
+            ];
+            app.image_metas = vec![folder_meta, Some((1, 1024)), Some((1, 2048))];
+            app.checked = HashSet::from([0, 1, 2]);
+            app.settings.thumb_tooltip_show_file_size = true;
+            assert_eq!(
+                app.selection_info_content().unwrap().lines,
+                vec!["3 個選択", "合計サイズ 3.0 KB (フォルダを除く)"]
+            );
+
+            app.image_metas[2] = None;
+            assert_eq!(
+                app.selection_info_content().unwrap().lines,
+                vec!["3 個選択"]
+            );
+        }
+    }
+
+    #[test]
+    fn section1732_folder_only_selection_has_no_total_size() {
+        let mut app = setup_app_for_test();
+        app.items = vec![GridItem::Folder("a".into()), GridItem::Folder("b".into())];
+        app.image_metas = vec![None, Some((1, 0))];
+        app.checked = HashSet::from([0, 1]);
+        app.settings.thumb_tooltip_show_file_size = true;
         assert_eq!(
             app.selection_info_content().unwrap().lines,
             vec!["2 個選択"]
@@ -32146,6 +32198,88 @@ mod grid_reclick_open_tests {
             );
             click_cell(&mut harness, 0, modifiers);
             assert_eq!(harness.state().activations, 0);
+        }
+    }
+
+    #[test]
+    fn section1732_folder_click_selection_preserves_checks_and_includes_shift_range() {
+        for mode in [
+            GridClickSelectionMode::Check,
+            GridClickSelectionMode::Explorer,
+        ] {
+            for drive_list in [false, true] {
+                let mut harness = handler_harness(mode, false, Some(0), false, false);
+                {
+                    let app = &mut harness.state_mut().app;
+                    app.items = vec![
+                        GridItem::Image("a.jpg".into()),
+                        GridItem::Folder("album".into()),
+                        GridItem::Image("b.jpg".into()),
+                    ];
+                    app.items_are_rating_view = !drive_list;
+                    app.items_are_drive_list = drive_list;
+                    app.checked = HashSet::from([0]);
+                    assert!(!app.subfolder_expansion_available());
+                }
+                click_cell(&mut harness, 1, egui::Modifiers::CTRL);
+                assert_eq!(harness.state().activations, 0);
+                if drive_list {
+                    assert!(!harness.state().app.checked.contains(&1));
+                } else {
+                    assert_eq!(harness.state().app.checked, HashSet::from([0, 1]));
+                }
+                // Reset the existing anchor through the real selection handler, then
+                // extend across the Folder row to the image at the other end.
+                click_cell(&mut harness, 0, egui::Modifiers::NONE);
+                click_cell(&mut harness, 2, egui::Modifiers::SHIFT);
+                assert_eq!(harness.state().app.checked.contains(&1), !drive_list);
+                assert_eq!(harness.state().activations, 0);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1732_collection_root_folder_clicks_are_checkable() {
+        for mode in [
+            GridClickSelectionMode::Check,
+            GridClickSelectionMode::Explorer,
+        ] {
+            for modifiers in [egui::Modifiers::CTRL, egui::Modifiers::SHIFT] {
+                // Each case is one selection click, independent of double-click pairing.
+                let mut harness = handler_harness(mode, false, None, false, false);
+                {
+                    let app = &mut harness.state_mut().app;
+                    let folder = app.tmp.path().join("collection-folder");
+                    std::fs::create_dir_all(&folder).unwrap();
+                    crate::app::tests::install_collection_item_for_detached_plan(
+                        app,
+                        &folder,
+                        crate::collection_store::CollectionResolvedKind::Folder,
+                    );
+                    app.collection_ui.set_read_phase_for_test(false);
+                    app.selected = modifiers.shift.then_some(0);
+                    assert!(!app.subfolder_expansion_available());
+                }
+                click_cell(&mut harness, 0, modifiers);
+                // Explorer keeps a lone Ctrl-selected item in `selected`;
+                // Check mode and Shift ranges explicitly check even one item.
+                assert_eq!(
+                    harness.state().app.selected,
+                    Some(0),
+                    "{mode:?} {modifiers:?}"
+                );
+                assert_eq!(
+                    harness.state().app.checked,
+                    if mode == GridClickSelectionMode::Check || modifiers.shift {
+                        HashSet::from([0])
+                    } else {
+                        HashSet::new()
+                    },
+                    "{mode:?} {modifiers:?}",
+                );
+                assert_eq!(harness.state().activations, 0, "{mode:?} {modifiers:?}");
+            }
         }
     }
 
