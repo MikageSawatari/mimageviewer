@@ -4,10 +4,12 @@
 //! ページ index を保存し、アプリ再起動を跨いで読書位置を復元する (動画の
 //! `video_resume_positions` の画像本版)。
 //!
-//! キーは `path_key::normalize` (= ドライブ文字除去・小文字化・スラッシュ統一) で、
+//! 既存rootのキーは `path_key::normalize` (= ドライブ文字除去・小文字化・スラッシュ統一) で、
 //! USB / 外付け HDD のドライブレター変化に追従する点を優先する `spread_db.rs` と
 //! 同じ規則。`rotation_db.rs` 等の per-item DB はドライブ文字を保持する別規則なので
 //! 混同しないこと (別ドライブの同名パスは同一キーに畳まれるトレードオフがある)。
+//! 非rootの書庫内本だけは `BookResumeKey` の名前空間を使い、logical sourceの
+//! ドライブと、元の大文字小文字を保つraw prefixを独立した保存行にする。
 //!
 //! 従来の `items` index と optional な論理ページ identity を同じ transaction で保存する。
 //! 新版の復元は同じ identity を照合し、種類除外後の同じ index の別画像を代用しない。
@@ -27,6 +29,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use crate::book_resume_key::BookResumeKey;
 use crate::path_key;
 
 /// Logical page identity. Physical cache paths never identify converted documents.
@@ -250,10 +253,14 @@ impl BookResumeDb {
     }
 
     pub fn get_position(&self, path: &Path) -> Option<ReadingPosition> {
+        self.get_position_key(&BookResumeKey::legacy(path))
+    }
+
+    pub fn get_position_key(&self, key: &BookResumeKey) -> Option<ReadingPosition> {
         self.conn
             .query_row(
                 "SELECT page,page_identity FROM book_resume WHERE path=?1",
-                [normalize_path(path)],
+                [key.storage_key()],
                 |row| {
                     let page: i64 = row.get(0)?;
                     let encoded: Option<String> = row.get(1)?;
@@ -362,6 +369,7 @@ impl BookResumeDb {
         .collect()
     }
 
+    #[cfg(test)]
     fn set_position(
         &mut self,
         path: &Path,
@@ -370,8 +378,25 @@ impl BookResumeDb {
         identity: Option<&PageIdentity>,
         meter_ready: bool,
     ) -> Result<(), rusqlite::Error> {
+        self.set_position_key(
+            &BookResumeKey::legacy(path),
+            page,
+            meter,
+            identity,
+            meter_ready,
+        )
+    }
+
+    fn set_position_key(
+        &mut self,
+        key: &BookResumeKey,
+        page: usize,
+        meter: Option<ReadingMeterValue>,
+        identity: Option<&PageIdentity>,
+        meter_ready: bool,
+    ) -> Result<(), rusqlite::Error> {
         let tx = self.conn.transaction()?;
-        let key = normalize_path(path);
+        let key = key.storage_key();
         let meter = meter.and_then(|v| ReadingMeterValue::new(v.ordinal, v.total));
         if meter_ready {
             tx.execute("INSERT INTO book_resume(path,page,page_ordinal,page_total)
@@ -494,7 +519,7 @@ fn normalize_path(path: &Path) -> String {
 }
 
 /// 読書位置の書き込みを UI スレッドから外す background writer。自前の write 用
-/// Connection を持つ専用スレッドへ `(path, page, meter)` を送って upsert する。ページ送りの
+/// Connection を持つ専用スレッドへ `(BookResumeKey, page, meter)` を送って upsert する。ページ送りの
 /// たびに走る書き込みで UI が引っかからないようにするのが目的 ([docs/ui-responsiveness.md]
 /// の「UI スレッドの同期 I/O は worker 化」)。メーターの移行/全行読込/clearも同じFIFO。
 /// Released raw/meter APIs remain available; new restores use the fenced read.
@@ -508,7 +533,7 @@ enum Command {
         mpsc::Sender<crate::image_folder_zip_metadata::CopyReply>,
     ),
     Record(
-        PathBuf,
+        BookResumeKey,
         usize,
         Option<ReadingMeterValue>,
         Option<PageIdentity>,
@@ -594,9 +619,14 @@ impl BookResumeWriter {
                 }) = rx.recv()
                 {
                     match command {
-                        Command::Record(path, page, value, identity) => {
-                            let result =
-                                db.set_position(&path, page, value, identity.as_ref(), meter_ready);
+                        Command::Record(key, page, value, identity) => {
+                            let result = db.set_position_key(
+                                &key,
+                                page,
+                                value,
+                                identity.as_ref(),
+                                meter_ready,
+                            );
                             if let Err(e) = &result {
                                 crate::logger::log(format!("book-resume writer: set failed: {e}"));
                             }
@@ -610,7 +640,7 @@ impl BookResumeWriter {
                             match result {
                                 Ok(()) => {
                                     snapshot.values.insert(
-                                        normalize_path(&path),
+                                        key.storage_key(),
                                         ReadingPosition {
                                             page: (page as i64).max(0) as usize,
                                             identity,
@@ -862,7 +892,17 @@ impl BookResumeWriter {
         value: Option<ReadingMeterValue>,
         identity: Option<PageIdentity>,
     ) -> bool {
-        self.send(Command::Record(path.to_path_buf(), page, value, identity))
+        self.record_key_identity(&BookResumeKey::legacy(path), page, value, identity)
+    }
+
+    pub fn record_key_identity(
+        &self,
+        key: &BookResumeKey,
+        page: usize,
+        value: Option<ReadingMeterValue>,
+        identity: Option<PageIdentity>,
+    ) -> bool {
+        self.send(Command::Record(key.clone(), page, value, identity))
     }
 
     pub(crate) fn read_all(&self) -> mpsc::Receiver<MeterReadResult> {
@@ -972,6 +1012,109 @@ impl Drop for BookResumeWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn section1675_inner_resume_typed_fifo_rows_keep_legacy_root_and_case_distinct_books() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("book_resume.db");
+        let writer = BookResumeWriter::spawn_at(path.clone()).unwrap();
+        let logical = Path::new("C:/Books/original.rar");
+        let backing = Path::new("D:/cache/backing.zip");
+        assert!(writer.record_identity(backing, 9, ReadingMeterValue::new(10, 20), None));
+        let pause = writer.pause_for_test();
+        let keys =
+            ["A", "a"].map(|prefix| BookResumeKey::archive(logical, &[prefix.into()]).unwrap());
+        for (index, key) in keys.iter().enumerate() {
+            let entry_name = format!("{}/page.jpg", if index == 0 { "A" } else { "a" });
+            let identity = PageIdentity::Archive {
+                container: path_key::normalize_keep_drive(logical),
+                entry_name,
+            };
+            assert!(writer.record_key_identity(
+                key,
+                index + 2,
+                ReadingMeterValue::new(index + 3, 10),
+                Some(identity)
+            ));
+        }
+        let cutoff = writer.watermark_reader().watermarks().admitted;
+        let read = writer.read_position_after(&keys[1].storage_key(), cutoff);
+        assert!(matches!(read.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        pause.send(()).unwrap();
+        let reply = read.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(reply.status.is_ok());
+        assert_eq!(reply.position.as_ref().unwrap().page, 3);
+        drop(writer);
+        let db = BookResumeDb::open_at(&path).unwrap();
+        assert_eq!(db.get(backing), Some(9));
+        assert_eq!(
+            db.get_position(logical),
+            None,
+            "inner positions never create a logical root row"
+        );
+        for (index, key) in keys.iter().enumerate() {
+            let position = db.get_position_key(key).unwrap();
+            assert_eq!(position.page, index + 2);
+            assert!(
+                matches!(position.identity, Some(PageIdentity::Archive { ref container, .. }) if container == "c:/books/original.rar")
+            );
+        }
+        // A released reader sees the existing JSON variant and can clear all rows.
+        let positions = db.read_positions().unwrap();
+        assert_eq!(positions.len(), 3);
+        assert_eq!(db.clear_all().unwrap(), 3);
+    }
+
+    #[test]
+    fn section1675_inner_resume_maintenance_reload_replaces_writer_snapshot_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("book_resume.db");
+        let writer = BookResumeWriter::spawn_at(path).unwrap();
+        let old_source = Path::new("C:/Books/A.zip");
+        let new_source = Path::new("D:/Books/A.zip");
+        let old = BookResumeKey::archive(old_source, &["A".into()]).unwrap();
+        let new = BookResumeKey::archive(new_source, &["A".into()]).unwrap();
+        assert!(writer.record_key_identity(
+            &old,
+            4,
+            None,
+            Some(PageIdentity::Archive {
+                container: path_key::normalize_keep_drive(old_source),
+                entry_name: "A/page.jpg".into(),
+            })
+        ));
+        let cutoff = writer.watermark_reader().watermarks().admitted;
+        assert_eq!(
+            writer
+                .read_position_after(&old.storage_key(), cutoff)
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .position
+                .unwrap()
+                .page,
+            4
+        );
+        let previous = writer.position_snapshot().unwrap();
+        let report = crate::rename_key_migration::run_at(temp.path(), old_source, new_source);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(
+            writer
+                .read_all()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .is_ok()
+        );
+        let current = writer.position_snapshot().unwrap();
+        assert!(previous.values.contains_key(&old.storage_key()));
+        assert!(!current.values.contains_key(&old.storage_key()));
+        assert_eq!(
+            current.values[&new.storage_key()].identity,
+            Some(PageIdentity::Archive {
+                container: path_key::normalize_keep_drive(new_source),
+                entry_name: "A/page.jpg".into(),
+            })
+        );
+    }
 
     fn folder_zip_fixture() -> (
         tempfile::TempDir,
@@ -1428,6 +1571,165 @@ mod tests {
         }
         db.set(book, 1).unwrap();
         assert!(db.get_position(book).unwrap().identity.is_none());
+    }
+
+    #[test]
+    fn section1675_inner_resume_legacy_roundtrip() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("legacy-resume.db");
+        let root = Path::new("C:/Books/A.zip");
+        let root_key = "/books/a.zip";
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE book_resume(path TEXT PRIMARY KEY,page INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO book_resume(path,page) VALUES ('/books/a.zip',7);",
+        )
+        .unwrap();
+        let version: i64 = old
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        drop(old);
+        let initialized = BookResumeDb::open_at(&path).unwrap();
+        assert_eq!(
+            initialized.get_position(root),
+            Some(ReadingPosition {
+                page: 7,
+                identity: None
+            })
+        );
+        drop(initialized);
+        let inner = BookResumeKey::archive(root, &["A".into()]).unwrap();
+        let inner_identity = PageIdentity::Archive {
+            container: path_key::normalize_keep_drive(root),
+            entry_name: "A/003.jpg".into(),
+        };
+        let writer = BookResumeWriter::spawn_at(path.clone()).unwrap();
+        assert!(writer.record_identity(
+            root,
+            7,
+            ReadingMeterValue::new(8, 20),
+            Some(PageIdentity::Archive {
+                container: path_key::normalize_keep_drive(root),
+                entry_name: "root.jpg".into(),
+            })
+        ));
+        assert!(writer.record_key_identity(
+            &inner,
+            2,
+            ReadingMeterValue::new(3, 9),
+            Some(inner_identity.clone())
+        ));
+        let cutoff = writer.watermarks().admitted;
+        assert!(
+            writer
+                .read_position_after(&inner.storage_key(), cutoff)
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .status
+                .is_ok()
+        );
+        drop(writer);
+
+        // The released path/page reader can still read the old root and all rows.
+        let old = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            old.query_row(
+                "SELECT page FROM book_resume WHERE path=?1",
+                [root_key],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            7
+        );
+        let rows = old
+            .prepare("SELECT path,page FROM book_resume ORDER BY path")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(root_key.to_owned(), 7), (inner.storage_key(), 2)]
+        );
+        let json: String = old
+            .query_row(
+                "SELECT page_identity FROM book_resume WHERE path=?1",
+                [inner.storage_key()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()["kind"],
+            "archive"
+        );
+        old.execute("UPDATE book_resume SET page=11 WHERE path=?1", [root_key])
+            .unwrap();
+        drop(old);
+
+        let current = BookResumeDb::open_at(&path).unwrap();
+        assert_eq!(
+            current.get_position(root),
+            Some(ReadingPosition {
+                page: 11,
+                identity: None
+            })
+        );
+        assert_eq!(
+            current.get_position_key(&inner),
+            Some(ReadingPosition {
+                page: 2,
+                identity: Some(inner_identity)
+            })
+        );
+        assert_eq!(current.count(), 2);
+        assert_eq!(
+            current
+                .conn
+                .query_row("SELECT path FROM book_resume WHERE page=11", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            root_key
+        );
+        let columns = current
+            .conn
+            .prepare("PRAGMA table_info(book_resume)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            [
+                "path",
+                "page",
+                "page_identity",
+                "page_ordinal",
+                "page_total"
+            ]
+        );
+        assert_eq!(
+            current
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            version
+        );
+        assert_eq!(
+            current
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

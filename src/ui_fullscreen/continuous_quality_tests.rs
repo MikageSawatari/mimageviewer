@@ -358,7 +358,7 @@ fn section1674_grid_double_click_direct_open_and_scroll_share_display_loading() 
                             history_trigger: crate::app::HistoryTrigger::UserChosen,
                             resume_slideshow: false,
                             target: crate::app::DeferredFsTarget::None,
-                            resume_to_last_page: false,
+                            resume_to_last_page: (false).into(),
                             from_explicit_open: true,
                             preserve_after_password_prompt: true,
                         });

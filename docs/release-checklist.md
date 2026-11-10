@@ -6,8 +6,10 @@
 
 mIV Sound の名称・クレジット・保存先・初回移行・公開文書は [派生版計画 §2・§4・§5・§10](effetune-fork-plan.md) が正本。
 公開前に `python scripts/gen-effetune-docs.py --check`、`python scripts/test_gen_effetune_docs.py`、
-`python scripts/check_site_cards.py` と sitemap の再生成・検査を行う。`manual/sound/`、旧生成物の削除と
-`.htaccess` の 301 を同時反映する。F3・F4 統合後のポータブル文言・Counter・説明書の照合記録は同計画 §19 を参照。
+`python scripts/check_site_cards.py` と、htdocs コミット後の sitemap 再生成・検査を行う。
+説明書は版番号なしの `manual/sound/` に上書きし、版は目次本文だけに示す。版だけの更新では URL・転送規則は不変。
+固定 URL への移行時は残存版ディレクトリ・旧生成物を明示的に除き、旧 URL からの1回の301と同時反映する。
+F3・F4 統合後のポータブル文言・Counter・説明書の照合記録は同計画 §19 を参照。
 
 3 つの配布形態がある (v1.1.0 以降):
 

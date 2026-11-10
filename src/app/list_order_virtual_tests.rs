@@ -357,7 +357,7 @@ fn list_order_virtual_pending_pdf_reopen_captures_navigation_resume_and_not_open
                 "enumerate_defer"
             );
             let deferred = app.fs_nav_after_pdf_enumerate.as_ref().unwrap();
-            assert_eq!(deferred.resume_to_last_page, resume);
+            assert_eq!(deferred.resume_to_last_page.resumes(), resume);
             assert!(!deferred.from_explicit_open);
             assert!(!deferred.preserve_after_password_prompt);
             app.pdf_enumerate_pending.as_mut().unwrap().2 =
@@ -399,7 +399,7 @@ fn list_order_virtual_pending_zip_reopen_captures_navigation_resume_and_restores
             "enumerate_defer"
         );
         let deferred = app.fs_nav_after_pdf_enumerate.as_ref().unwrap();
-        assert_eq!(deferred.resume_to_last_page, resume);
+        assert_eq!(deferred.resume_to_last_page.resumes(), resume);
         assert!(!deferred.from_explicit_open);
         assert!(!deferred.preserve_after_password_prompt);
         finish_reopen(&mut app, &ctx);

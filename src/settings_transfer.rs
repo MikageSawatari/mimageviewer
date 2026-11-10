@@ -289,6 +289,7 @@ preferences_policy! {
         thumb_name_font_scale_percent: u32 => ("サムネイル一覧の名前の文字サイズ", |v, _raw| (THUMB_NAME_FONT_SCALE_PERCENT_MIN..=THUMB_NAME_FONT_SCALE_PERCENT_MAX).contains(v), plain, plain);
         thumb_name_max_lines: u32 => ("サムネイル一覧の名前の最大行数", |v, _raw| (THUMB_NAME_MAX_LINES_MIN..=THUMB_NAME_MAX_LINES_MAX).contains(v), plain, plain);
         thumb_show_type_icon: bool => ("サムネイルに種類アイコンを表示する", |_, _raw| true, plain, plain);
+        thumb_container_type_icon_only: bool => ("フォルダ・書庫・PDF を種類のアイコンで表示する", |_, _raw| true, plain, plain);
         thumb_name_prioritize_width: bool => ("ファイル名の表示幅を優先する", |_, _raw| true, plain, plain);
         selection_info_display_mode: SelectionInfoDisplayMode => ("選択項目の情報表示", |v, _raw| !matches!(v, SelectionInfoDisplayMode::Unknown), plain, plain);
         thumb_tooltip_show_filename: bool => ("サムネイルツールチップ：ファイル名", |_, _| true, plain, plain);
@@ -360,6 +361,7 @@ preferences_policy! {
         continuous_reading_gap_px: u32 => ("連結読書のページ間隔", |v, _raw| (0..=200).contains(v), plain, plain);
         fullscreen_image_margin_color: [u8; 3] => ("閲覧表示の余白色", |_, _| true, plain, plain);
         fullscreen_fit_mode: FullscreenFitMode => ("閲覧表示のフィット方法", |v, _raw| FullscreenFitMode::all().contains(v), plain, plain);
+        fullscreen_page_start_position: FullscreenPageStartPosition => ("ページ切替後の表示位置", |v, _raw| FullscreenPageStartPosition::all().contains(v), plain, plain);
         fullscreen_specified_scale: FullscreenSpecifiedScale => ("指定サイズの幅・高さ", |v, _| v.is_valid(), specified_scale, specified_scale);
         fullscreen_specified_scale_max_tenths: u32 => ("指定サイズの最大倍率", |v, raw| raw.as_u64().is_some() && (FULLSCREEN_SPECIFIED_SCALE_MAX_MIN_TENTHS..=FULLSCREEN_SPECIFIED_SCALE_MAX_MAX_TENTHS).contains(v), plain, plain);
         fullscreen_fit_cycle_excluded: Vec<String> => ("フィット循環に含めるモード", |v, _| FullscreenFitMode::all().iter().any(|mode| mode.cycle_enabled(v)), plain, plain);
@@ -1280,6 +1282,10 @@ mod tests {
             ],
         );
         settings.fullscreen_fit_cycle_excluded = vec!["Width".into(), "FutureScale".into()];
+        settings.fullscreen_page_start_position = different_enum(
+            &settings.fullscreen_page_start_position,
+            FullscreenPageStartPosition::all(),
+        );
         settings.fullscreen_fit_no_upscale = !settings.fullscreen_fit_no_upscale;
         settings.fullscreen_fit_no_downscale = !settings.fullscreen_fit_no_downscale;
         settings.fullscreen_side_panel_mode = different_enum(
@@ -2024,15 +2030,86 @@ mod tests {
     }
 
     #[test]
+    fn page_start_position_transfer_roundtrip_missing_and_invalid_preserve_value() {
+        for &position in FullscreenPageStartPosition::all() {
+            let source = Settings {
+                fullscreen_page_start_position: position,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            let mut destination = Settings {
+                fullscreen_page_start_position: different_enum(
+                    &position,
+                    FullscreenPageStartPosition::all(),
+                ),
+                ..Settings::default()
+            };
+            parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.fullscreen_page_start_position, position);
+            parse_preferences(&document(json!({})))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.fullscreen_page_start_position, position);
+            for invalid in [json!("FuturePosition"), json!("Unknown"), json!(true)] {
+                let report = parse_preferences(&document(
+                    json!({"fullscreen_page_start_position": invalid}),
+                ))
+                .unwrap()
+                .apply_to(&mut destination);
+                assert_eq!(report.issues.len(), 1);
+                assert_eq!(destination.fullscreen_page_start_position, position);
+            }
+        }
+    }
+
+    #[test]
+    fn thumb_container_type_icon_only_transfer_roundtrip_missing_invalid() {
+        for enabled in [false, true] {
+            let source = Settings {
+                thumb_container_type_icon_only: enabled,
+                ..Settings::default()
+            };
+            let mut destination = Settings {
+                thumb_container_type_icon_only: !enabled,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            let report = parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert!(report.changed_fields.iter().any(|label| {
+                label == "フォルダ・書庫・PDF を種類のアイコンで表示する"
+            }));
+            assert_eq!(destination.thumb_container_type_icon_only, enabled);
+            parse_preferences(&document(json!({})))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.thumb_container_type_icon_only, enabled);
+            for invalid in [json!("true"), json!(1), Value::Null] {
+                let report = parse_preferences(&document(
+                    json!({"thumb_container_type_icon_only": invalid}),
+                ))
+                .unwrap()
+                .apply_to(&mut destination);
+                assert_eq!(report.issues.len(), 1);
+                assert_eq!(destination.thumb_container_type_icon_only, enabled);
+            }
+        }
+    }
+
+    #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 490);
+        assert_eq!(entries.len(), 492);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            155
+            157
         );
         assert_eq!(
             entries
@@ -2068,7 +2145,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 153);
+        assert_eq!(wire.len(), 155);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -2891,6 +2968,8 @@ mod tests {
             ("fullscreen_side_panel_mode", json!("Unknown")),
             ("panorama_projection", json!("unknown")),
             ("fullscreen_fit_mode", json!("MarginFit")),
+            ("fullscreen_page_start_position", json!("FuturePosition")),
+            ("fullscreen_page_start_position", json!("Unknown")),
             ("default_spread_mode", json!("Vertical")),
             ("folder_thumb_sort", json!("SizeAsc")),
             ("show_hidden_files", json!(1)),

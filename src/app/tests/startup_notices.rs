@@ -32,7 +32,7 @@ fn deferred_navigation_reopen() -> DeferredFsReopen {
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::None,
-        resume_to_last_page: false,
+        resume_to_last_page: (false).into(),
         from_explicit_open: false,
         preserve_after_password_prompt: false,
     }
@@ -264,7 +264,9 @@ fn startup_notices_settings_and_list_exits_retire_enumeration_before_late_succes
                     input_seq: 1,
                     cancel: Arc::clone(&cancel),
                     rx,
-                    restore_intent: StartupListIntent::PageContinuation,
+                    presentation: crate::app::ZipEnumerationPresentation::Existing(
+                        StartupListIntent::PageContinuation,
+                    ),
                 });
                 cancel
             };

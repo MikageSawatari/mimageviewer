@@ -1,6 +1,24 @@
 use super::*;
 use std::collections::HashMap;
 
+#[cfg(windows)]
+fn clear_independent_zip_list_choices(
+    zip_nav: &mut Option<crate::zip_tree::ZipNavState>,
+    snapshot: &mut Option<crate::snapshot::SnapshotState>,
+) {
+    // The saved list can be restored later, so its authority belongs to this
+    // same ownership boundary even while the active list has no ZIP nav.
+    if let Some(nav) = zip_nav.as_mut() {
+        nav.clear_list_choices();
+    }
+    if let Some(nav) = snapshot
+        .as_mut()
+        .and_then(|snapshot| snapshot.saved_zip_nav.as_mut())
+    {
+        nav.clear_list_choices();
+    }
+}
+
 impl App {
     /// Terminal ownership boundary, shared by accepted viewer closes and context retirement.
     /// Content-only close/reopen never comes here. Workers/list adoption remain alive.
@@ -1784,6 +1802,7 @@ pub(in crate::app) struct ViewerContextBundle {
     video_presentation_transition: PresentationTransitionOwner,
     fs_zoom: f32,
     fs_pan: egui::Vec2,
+    fs_initial_placement_request: Option<crate::ui_fullscreen::FsInitialPlacementRequest>,
     fs_zoom_active: bool,
     fs_zoom_aiming: bool,
     fs_zoom_factor: f32,
@@ -3044,6 +3063,7 @@ impl ViewerContextBundle {
             video_presentation_transition: PresentationTransitionOwner::default(),
             fs_zoom: 1.0,
             fs_pan: egui::Vec2::ZERO,
+            fs_initial_placement_request: None,
             fs_zoom_active: false,
             fs_zoom_aiming: false,
             fs_zoom_factor: 1.0,
@@ -3474,6 +3494,7 @@ impl App {
             video_presentation_transition,
             fs_zoom,
             fs_pan,
+            fs_initial_placement_request,
             fs_zoom_active,
             fs_zoom_aiming,
             fs_zoom_factor,
@@ -3807,6 +3828,7 @@ impl App {
         swap_field!(video_presentation_transition);
         swap_field!(fs_zoom);
         swap_field!(fs_pan);
+        swap_field!(fs_initial_placement_request);
         swap_field!(fs_zoom_active);
         swap_field!(fs_zoom_aiming);
         swap_field!(fs_zoom_factor);
@@ -4196,6 +4218,7 @@ impl App {
             video_presentation_transition,
             fs_zoom,
             fs_pan,
+            fs_initial_placement_request,
             fs_zoom_active,
             fs_zoom_aiming,
             fs_zoom_factor,
@@ -4426,6 +4449,7 @@ impl App {
             video_presentation_transition,
             fs_zoom,
             fs_pan,
+            fs_initial_placement_request,
             fs_zoom_active,
             fs_zoom_aiming,
             fs_zoom_factor,
@@ -4666,6 +4690,7 @@ impl App {
         if let Some(record) = parked.folder_observation.as_mut() {
             record.generation = parked.items_generation;
         }
+        clear_independent_zip_list_choices(&mut parked.zip_nav, &mut parked.snapshot);
         parked
     }
 
@@ -5260,6 +5285,7 @@ impl App {
             bundle.fullscreen_page_layout.clear();
             bundle.fs_vertical_scroll = 0.0;
             bundle.fs_pan = egui::Vec2::ZERO;
+            bundle.fs_initial_placement_request = None;
             bundle.fs_free_rotation = 0.0;
             bundle.fs_vertical_cache_keep_set.clear();
             bundle.continuous_page_transitions.clear();
@@ -5300,6 +5326,7 @@ impl App {
             bundle.fullscreen_page_layout.clear();
             bundle.fs_vertical_scroll = 0.0;
             bundle.fs_pan = egui::Vec2::ZERO;
+            bundle.fs_initial_placement_request = None;
             bundle.fs_free_rotation = 0.0;
             bundle.fs_vertical_cache_keep_set.clear();
             bundle.continuous_page_transitions.clear();
@@ -5342,6 +5369,7 @@ impl App {
             bundle.fullscreen_page_layout.clear();
             bundle.fs_vertical_scroll = 0.0;
             bundle.fs_pan = egui::Vec2::ZERO;
+            bundle.fs_initial_placement_request = None;
             bundle.fs_free_rotation = 0.0;
             bundle.fs_vertical_cache_keep_set.clear();
             bundle.continuous_page_transitions.clear();
@@ -5593,6 +5621,7 @@ impl App {
     ) -> Option<ViewerContextId> {
         match outcome {
             BuildOutcome::Commit => {
+                clear_independent_zip_list_choices(&mut self.zip_nav, &mut self.snapshot);
                 let ops = self.viewer_contexts.table.plan_commit_build();
                 self.execute_viewer_context_ops(ops, None);
                 let finished = self.viewer_contexts.table.finish_commit_build();
@@ -5848,6 +5877,7 @@ impl App {
         // delivery in that same bundle rather than handing it to the new main.
         self.retire_passive_folder_observation();
         let ops = self.viewer_contexts.table.plan_promote();
+        clear_independent_zip_list_choices(&mut self.zip_nav, &mut self.snapshot);
         self.execute_viewer_context_ops(ops, None);
         let stashed = self.viewer_contexts.table.finish_promote();
         self.publish_mounted_context_rating_writes_at_boundary("promote_incoming");
@@ -6074,6 +6104,346 @@ mod tests {
     use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
+
+    #[cfg(windows)]
+    fn seed_zip_list_choices_for_test(app: &mut App, source: &Path) {
+        let tree = Arc::new(crate::zip_tree::ZipTree::build(
+            source.to_path_buf(),
+            ["A/page.jpg", "B/page.jpg"]
+                .into_iter()
+                .map(|name| crate::zip_loader::ZipImageEntry {
+                    entry_name: name.into(),
+                    uncompressed_size: 0,
+                    mtime: 0,
+                    container_ancestry: Vec::new(),
+                })
+                .collect(),
+        ));
+        let mut nav = crate::zip_tree::ZipNavState::new(tree);
+        nav.choose_current_list(Some(4));
+        nav.enter("A/");
+        let (items, metas) = nav.materialize_current(crate::settings::SortOrder::FileName);
+        app.current_folder = Some(source.to_path_buf());
+        app.thumbnails = vec![ThumbnailState::Pending; items.len()];
+        app.image_metas = metas;
+        app.visible_indices = (0..items.len()).collect();
+        app.items = items;
+        app.zip_nav = Some(nav.clone());
+        app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+        // Model a physical child while its origin list remains saved.
+        app.zip_nav = Some(nav);
+        app.fullscreen_idx = Some(0);
+    }
+
+    #[cfg(windows)]
+    fn assert_zip_list_choices_for_test(app: &App, expected: bool) {
+        for nav in [
+            app.zip_nav.as_ref().unwrap(),
+            app.snapshot
+                .as_ref()
+                .unwrap()
+                .saved_zip_nav
+                .as_ref()
+                .unwrap(),
+        ] {
+            assert_eq!(nav.chosen_list_return_plan().is_some(), expected);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1676_choice_registry_forks_clear_child_and_preserve_main_saved_nav() {
+        for live in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let source = app.tmp.path().join("choice-fork.zip");
+            seed_zip_list_choices_for_test(&mut app, &source);
+            let main = app.viewer_context_main();
+            let plan = app
+                .zip_nav
+                .as_ref()
+                .unwrap()
+                .chosen_list_return_plan()
+                .unwrap();
+            let child = if live {
+                app.bind_window(main, 91676).unwrap();
+                app.fork_mounted_live_media_context(91676)
+            } else {
+                app.fork_materialized_still_context(&source, 0)
+            };
+            assert_zip_list_choices_for_test(&app, true);
+            assert!(
+                app.zip_nav
+                    .as_ref()
+                    .unwrap()
+                    .matches_list_return_plan(&plan)
+            );
+            app.with_viewer_context_state(child, |owner| {
+                let nav = owner
+                    .zip_nav
+                    .as_ref()
+                    .expect("fork retains its physical ZIP nav");
+                assert!(nav.chosen_list_return_plan().is_none());
+                if live {
+                    assert_zip_list_choices_for_test(owner, false);
+                    owner.deactivate_snapshot();
+                    assert!(owner.snapshot.is_none());
+                    let restored = owner.zip_nav.as_ref().expect("saved ZIP nav restored");
+                    assert_eq!(restored.current(), &["A".to_owned()]);
+                    assert!(restored.chosen_list_return_plan().is_none());
+                } else {
+                    // A physical book fork leaves the source fixed-list lifetime
+                    // in main; it intentionally has no snapshot to restore.
+                    assert!(owner.snapshot.is_none());
+                }
+            })
+            .unwrap();
+            assert_zip_list_choices_for_test(&app, true);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1676_choice_registry_build_and_promote_clear_only_independent_owner() {
+        let mut app = crate::app::setup_app_for_test();
+        let source = app.tmp.path().join("choice-main.zip");
+        seed_zip_list_choices_for_test(&mut app, &source);
+        let old_main = app.viewer_context_main();
+        // The first real capture may have started sidecar preparation. Repeating
+        // that producer inside Building would be rejected by its existing modal
+        // gate, so give the new owner the already captured read model instead.
+        let child_snapshot = app.snapshot.clone();
+        let child_nav = app.zip_nav.clone();
+        let child_items = app.items.clone();
+        let child_thumbnails = app.thumbnails.clone();
+        let child_metas = app.image_metas.clone();
+        let child_visible = app.visible_indices.clone();
+        let child = app.build_window_context_for_test(91677, |owner| {
+            owner.current_folder = Some(source.clone());
+            owner.items = child_items;
+            owner.thumbnails = child_thumbnails;
+            owner.image_metas = child_metas;
+            owner.visible_indices = child_visible;
+            owner.zip_nav = child_nav;
+            owner.snapshot = child_snapshot;
+            assert_zip_list_choices_for_test(owner, true);
+        });
+        assert_zip_list_choices_for_test(&app, true);
+        app.with_viewer_context_state(child, |owner| {
+            assert_zip_list_choices_for_test(owner, false);
+        })
+        .unwrap();
+        assert_eq!(
+            app.stash_mounted_and_start_fresh("choice_promote"),
+            old_main
+        );
+        assert!(app.zip_nav.is_none());
+        assert!(app.snapshot.is_none(), "promote creates an empty new main");
+        app.with_viewer_context_state(old_main, |owner| {
+            assert_zip_list_choices_for_test(owner, false);
+            owner.deactivate_snapshot();
+            assert!(owner.snapshot.is_none());
+            let restored = owner
+                .zip_nav
+                .as_ref()
+                .expect("promoted saved ZIP nav restored");
+            assert_eq!(restored.current(), &["A".to_owned()]);
+            assert!(restored.chosen_list_return_plan().is_none());
+        })
+        .unwrap();
+        app.with_viewer_context_state(child, |owner| {
+            assert_zip_list_choices_for_test(owner, false);
+            owner.deactivate_snapshot();
+            assert!(owner.snapshot.is_none());
+            let restored = owner
+                .zip_nav
+                .as_ref()
+                .expect("built saved ZIP nav restored");
+            assert_eq!(restored.current(), &["A".to_owned()]);
+            assert!(restored.chosen_list_return_plan().is_none());
+        })
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1676_choice_independent_close_preserves_main_live_terminal_and_sibling_queues() {
+        for parked in [false, true] {
+            for terminal in [false, true] {
+                let mut app = crate::app::setup_app_for_test();
+                let ctx = egui::Context::default();
+                app.settings.auto_fullscreen_zip_pdf = true;
+                let source = app.tmp.path().join("choice-close-main.zip");
+                seed_zip_list_choices_for_test(&mut app, &source);
+                // Keep the seeded physical book active instead of its fixed-list fixture.
+                app.snapshot = None;
+                let plan = app.chosen_zip_list_return().unwrap();
+                let child_nav = app.zip_nav.clone();
+                let child_items = app.items.clone();
+                let child =
+                    app.build_active_context_for_test(Some(91678), DetachedSource::Book, |owner| {
+                        owner.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+                        owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+                        owner.detached_viewer_independent_active = true;
+                        owner.current_folder = Some(source.clone());
+                        owner.zip_nav = child_nav;
+                        owner.items = child_items;
+                        owner.thumbnails = vec![ThumbnailState::Pending; owner.items.len()];
+                        owner.image_metas = vec![None; owner.items.len()];
+                        owner.visible_indices = (0..owner.items.len()).collect();
+                        owner.fullscreen_idx = Some(0);
+                    });
+                app.update_detached_window_runtime_flags(91678, false, "choice_close_fixture");
+                if parked {
+                    app.transition_detached_window_state(
+                        91678,
+                        DetachedWindowState::Parked,
+                        "choice_close_parked",
+                    );
+                }
+                let queue = |idx| {
+                    Arc::new((
+                        Mutex::new(vec![LoadRequest {
+                            idx,
+                            ..Default::default()
+                        }]),
+                        Condvar::new(),
+                    ))
+                };
+                let main_reload = queue(31);
+                let main_heavy = queue(32);
+                app.reload_queue = Some(main_reload.clone());
+                app.heavy_io_queue = Some(main_heavy.clone());
+                let sibling_reload = queue(41);
+                let sibling_heavy = queue(42);
+                let sibling_cancel = Arc::new(AtomicBool::new(false));
+                let sibling = app.build_window_context_for_test(91679, |owner| {
+                    owner.items = vec![GridItem::Image(source.with_file_name("sibling.png"))];
+                    owner.visible_indices = vec![0];
+                    owner.selected = Some(0);
+                    owner.grid_scroll.set_position(321.0);
+                    owner.cancel_token = sibling_cancel.clone();
+                    owner.reload_queue = Some(sibling_reload.clone());
+                    owner.heavy_io_queue = Some(sibling_heavy.clone());
+                });
+                app.with_viewer_context_state(child, |owner| {
+                    assert!(
+                        owner
+                            .zip_nav
+                            .as_ref()
+                            .unwrap()
+                            .chosen_list_return_plan()
+                            .is_none()
+                    );
+                    assert!(owner.chosen_zip_list_return().is_none());
+                    assert!(owner.close_return_origin().is_none());
+                    assert!(!owner.pending_return_to_parent.is_pending());
+                })
+                .unwrap();
+                if terminal {
+                    let main = app.viewer_context_main();
+                    app.transfer_terminal_close_return(main, ViewerCloseCause::User);
+                    assert!(matches!(
+                        app.pending_return_to_parent,
+                        FullscreenCloseContinuation::Terminal(_)
+                    ));
+                } else {
+                    app.handle_fullscreen_close_request();
+                    assert!(matches!(
+                        app.pending_return_to_parent,
+                        FullscreenCloseContinuation::LiveZipListReturn(_)
+                    ));
+                }
+                // Keep the actual Terminal recipe identity, not merely its enum tag.
+                let terminal_pointer = match &app.pending_return_to_parent {
+                    FullscreenCloseContinuation::Terminal(request) => {
+                        Some(std::ptr::from_ref(request.as_ref()))
+                    }
+                    _ => None,
+                };
+                let snapshot = |owner: &App| {
+                    (
+                        owner.items.clone(),
+                        owner.visible_indices.clone(),
+                        owner.selected,
+                        owner.items_generation,
+                        owner.grid_scroll.clone(),
+                        Arc::as_ptr(&owner.cancel_token),
+                        owner.cancel_token.load(Ordering::Relaxed),
+                        [
+                            owner.reload_queue.as_ref().unwrap(),
+                            owner.heavy_io_queue.as_ref().unwrap(),
+                        ]
+                        .map(|queue| {
+                            (
+                                Arc::as_ptr(queue),
+                                queue
+                                    .0
+                                    .lock()
+                                    .unwrap()
+                                    .iter()
+                                    .map(|request| request.idx)
+                                    .collect::<Vec<_>>(),
+                            )
+                        }),
+                    )
+                };
+                let main_before = snapshot(&app);
+                let sibling_before = app
+                    .with_viewer_context_state(sibling, |owner| snapshot(owner))
+                    .unwrap();
+                let viewport = App::detached_image_window_viewport_id(91678);
+                ctx.set_embed_viewports(false);
+                ctx.run_ui(Default::default(), |ui| {
+                    ctx.show_viewport_deferred(
+                        viewport,
+                        egui::ViewportBuilder::default(),
+                        |_, _| {},
+                    );
+                    app.capture_detached_viewport_registration(ui.ctx(), 91678);
+                })
+                .drop_without_applying_deltas();
+                // Invoke the real OS-close handler without polling main's unrelated pending nav.
+                assert_eq!(
+                    eframe::App::on_viewport_close_requested(&mut app.app, &ctx, viewport),
+                    eframe::ViewportCloseResponse::RetirementTransferred
+                );
+                assert!(app.with_viewer_context_ref(child, |_| ()).is_none());
+                assert_eq!(
+                    snapshot(&app),
+                    main_before,
+                    "parked={parked} terminal={terminal}"
+                );
+                assert!(
+                    app.zip_nav
+                        .as_ref()
+                        .unwrap()
+                        .matches_list_return_plan(&plan)
+                );
+                match (&app.pending_return_to_parent, terminal_pointer) {
+                    (FullscreenCloseContinuation::LiveZipListReturn(request), None) => {
+                        assert!(
+                            app.zip_nav
+                                .as_ref()
+                                .unwrap()
+                                .matches_list_return_plan(request)
+                        );
+                    }
+                    (FullscreenCloseContinuation::Terminal(request), Some(pointer)) => {
+                        assert_eq!(std::ptr::from_ref(request.as_ref()), pointer);
+                    }
+                    (state, _) => {
+                        panic!("main continuation changed after independent close: {state:?}")
+                    }
+                }
+                assert_eq!(
+                    app.with_viewer_context_state(sibling, |owner| snapshot(owner))
+                        .unwrap(),
+                    sibling_before
+                );
+                assert!(!sibling_cancel.load(Ordering::Relaxed));
+            }
+        }
+    }
 
     #[cfg(windows)]
     fn seed_grid_scroll_owner_for_test(

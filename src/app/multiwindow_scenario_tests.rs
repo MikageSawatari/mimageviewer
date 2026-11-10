@@ -1594,7 +1594,7 @@ fn run_multiwindow_rar_tree_nav(
         .expect("solid RAR fixture converts to a cache ZIP");
         ViewerContextDescriptor::Zip {
             path: backing,
-            entry_name: None,
+            target: crate::app::DetachedZipTarget::RootBook,
             archive_source_override: Some(start.clone()),
         }
     } else if start_name.ends_with(".rar") || start_name.ends_with(".cbr") {
@@ -1606,13 +1606,13 @@ fn run_multiwindow_rar_tree_nav(
         );
         ViewerContextDescriptor::Zip {
             path: start.clone(),
-            entry_name: None,
+            target: crate::app::DetachedZipTarget::RootBook,
             archive_source_override: Some(start.clone()),
         }
     } else if start_name.ends_with(".zip") {
         ViewerContextDescriptor::Zip {
             path: start.clone(),
-            entry_name: None,
+            target: crate::app::DetachedZipTarget::RootBook,
             archive_source_override: None,
         }
     } else {

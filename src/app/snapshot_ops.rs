@@ -246,6 +246,7 @@ impl App {
     }
 
     fn restore_snapshot_viewing_state(&mut self, state: crate::snapshot::SnapshotViewingState) {
+        let previous_mode = self.spread_mode;
         self.spread_mode = state.mode;
         self.reading_direction = state.direction;
         self.reading_flow = state.flow;
@@ -255,6 +256,9 @@ impl App {
         self.final_cover_spread_preference = state.final_cover;
         self.singleton_spread_endpoint_preferences = state.endpoints;
         self.page_alone_preferences = state.page_alone;
+        if self.spread_mode != previous_mode {
+            self.request_fs_initial_placement_after_composition_change();
+        }
     }
 
     fn finish_snapshot_viewer_index_swap(&mut self, swap: Option<SnapshotViewerIndexSwap>) {
@@ -2149,7 +2153,7 @@ impl App {
                     crate::app::DeferredFsTarget::None,
                     crate::app::DeferredFsTarget::Preferred,
                 ),
-                resume_to_last_page: false,
+                resume_to_last_page: (false).into(),
                 from_explicit_open: false,
                 preserve_after_password_prompt: false,
             });
@@ -2327,7 +2331,7 @@ impl App {
                     history_trigger,
                     resume_slideshow,
                     target: crate::app::DeferredFsTarget::None,
-                    resume_to_last_page,
+                    resume_to_last_page: resume_to_last_page.into(),
                     from_explicit_open: false,
                     preserve_after_password_prompt: false,
                 },
@@ -2367,7 +2371,7 @@ impl App {
                 history_trigger,
                 resume_slideshow: false,
                 target: crate::app::DeferredFsTarget::Required(target),
-                resume_to_last_page: false,
+                resume_to_last_page: (false).into(),
                 from_explicit_open: false,
                 preserve_after_password_prompt: true,
             });
@@ -2377,7 +2381,7 @@ impl App {
             history_trigger,
             resume_slideshow: false,
             target: crate::app::DeferredFsTarget::Required(target),
-            resume_to_last_page: false,
+            resume_to_last_page: (false).into(),
             from_explicit_open: false,
             preserve_after_password_prompt: true,
         });
@@ -2545,6 +2549,9 @@ impl App {
                 crate::book_bookmarks::resolve_archive_bookmark_target(&nav.tree, requested_entry)?;
             (tree_path, target)
         };
+        // Required leaf opens are direct navigation, including a leaf whose
+        // level is already installed. Earlier list choices grant no return.
+        self.zip_nav.as_mut()?.clear_list_choices();
         let already_materialized = self.zip_nav.as_ref().is_some_and(|nav| {
             let current = nav.current().join("/");
             current == target.effective_prefix.trim_end_matches('/')
@@ -2955,6 +2962,56 @@ mod tests {
         app
     }
 
+    #[test]
+    fn initial_placement_snapshot_mode_restore_aligns_only_changed_paged_composition() {
+        use crate::settings::{FullscreenPageStartPosition, ReadingFlow, SpreadMode};
+        for reading_start in [false, true] {
+            for changed in [false, true] {
+                for flow in [ReadingFlow::Paged, ReadingFlow::Vertical] {
+                    let mut app = test_app_with_items(vec![GridItem::Image(PathBuf::from(
+                        "E:/test/page.png",
+                    ))]);
+                    app.fullscreen_idx = Some(0);
+                    app.settings.fullscreen_page_start_position = if reading_start {
+                        FullscreenPageStartPosition::ReadingStart
+                    } else {
+                        FullscreenPageStartPosition::Center
+                    };
+                    app.spread_mode = if changed {
+                        SpreadMode::Rtl
+                    } else {
+                        SpreadMode::Single
+                    };
+                    app.reading_flow = flow;
+                    let saved = app.capture_snapshot_viewing_state();
+                    app.spread_mode = SpreadMode::Single;
+                    app.fs_zoom = 1.75;
+                    app.fs_pan = egui::vec2(45.0, -62.0);
+                    app.restore_snapshot_viewing_state(saved);
+                    let expected = reading_start && changed && flow.is_paged();
+                    assert_eq!(app.fs_zoom, 1.75);
+                    assert_eq!(
+                        app.fs_pan,
+                        if expected {
+                            egui::Vec2::ZERO
+                        } else {
+                            egui::vec2(45.0, -62.0)
+                        }
+                    );
+                    assert_eq!(app.fs_initial_placement_request.is_some(), expected);
+                    if let Some(request) = app.fs_initial_placement_request {
+                        assert_eq!(request.anchor_idx, 0);
+                        assert_eq!(request.items_generation, app.items_generation);
+                        assert_eq!(
+                            (request.origin_zoom, request.origin_pan),
+                            (1.75, egui::Vec2::ZERO)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn drain_snapshot_identity_preparation(app: &mut App) {
         let ctx = egui::Context::default();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -3363,6 +3420,41 @@ mod tests {
     }
 
     #[test]
+    fn section1676_choice_required_leaf_clears_same_archive_choices_even_when_materialized() {
+        let source = PathBuf::from(r"E:\test\choice-required.zip");
+        let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(
+            source.clone(),
+            ["A/page.jpg", "B/page.jpg"]
+                .into_iter()
+                .map(|entry| crate::zip_loader::ZipImageEntry {
+                    entry_name: entry.into(),
+                    uncompressed_size: 0,
+                    mtime: 0,
+                    container_ancestry: Vec::new(),
+                })
+                .collect(),
+        ));
+        for already_materialized in [false, true] {
+            let mut nav = crate::zip_tree::ZipNavState::new(tree.clone());
+            nav.choose_current_list(Some(5));
+            nav.enter(if already_materialized { "A/" } else { "B/" });
+            assert!(nav.chosen_list_return_plan().is_some());
+            let (items, _) = nav.materialize_current(crate::settings::SortOrder::FileName);
+            let mut app = test_app_with_items(items);
+            app.current_folder = Some(source.clone());
+            app.zip_nav = Some(nav);
+            let resolved = app.materialize_required_archive_target(&source, "A/page.jpg");
+            assert!(resolved.is_some());
+            let nav = app.zip_nav.as_mut().unwrap();
+            assert_eq!(nav.current(), &["A".to_owned()]);
+            assert!(nav.chosen_list_return_plan().is_none());
+            while nav.back() {
+                assert!(nav.chosen_list_return_plan().is_none());
+            }
+        }
+    }
+
+    #[test]
     fn required_virtual_leaf_stages_before_filesystem_preflight() {
         use crate::snapshot::SnapshotTarget;
 
@@ -3736,7 +3828,9 @@ mod tests {
         ];
         let tree = std::sync::Arc::new(crate::zip_tree::ZipTree::build(zip_path, entries));
         let mut nav = crate::zip_tree::ZipNavState::new(tree);
+        nav.choose_current_list(Some(3));
         nav.enter("bookA/"); // 本の中 (スタック深さ 2)
+        let return_plan = nav.chosen_list_return_plan().unwrap();
         app.zip_nav = Some(nav);
 
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
@@ -3744,6 +3838,15 @@ mod tests {
         assert!(
             app.zip_nav.is_none(),
             "snapshot 中に zip_nav が残ると BS が ZIP 階層を復活させる"
+        );
+        assert!(
+            app.snapshot
+                .as_ref()
+                .unwrap()
+                .saved_zip_nav
+                .as_ref()
+                .unwrap()
+                .matches_list_return_plan(&return_plan)
         );
 
         // at_origin (= current_folder 不変) の解除で nav も復元される。
@@ -3754,6 +3857,7 @@ mod tests {
             !nav.at_root(),
             "退避時のスタック深さ (本の中) ごと復元される"
         );
+        assert!(nav.matches_list_return_plan(&return_plan));
     }
 
     #[test]

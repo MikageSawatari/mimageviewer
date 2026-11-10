@@ -39,9 +39,36 @@
 
 ## 1. 優先候補
 
+### 1.741 Everything 検索で作った ZIP・PDF のサムネイルが、親フォルダの代表サムネイルに使われない (検索を閉じると消える) — 5ch >>746 (2026-11-08)
+
+- 状態: **未着手・利用者決定 2026-11-08: 起票して設計へ**。5ch へは 2026-11-09 に利用者が返信済み (検証用 PC で報告どおりだったこと、検索で作ったサムネイルが検索を閉じると残らない作りであること、改善を検討すること)。[>>746](https://egg.5ch.io/test/read.cgi/software/1782419551/746) は、Everything 検索で複数フォルダの ZIP のサムネイルを一気に作ったのに、フォルダのサムネイルには使われず、1 つずつ開かないと作られないのか、という質問。
+- 実機確認 (サブ PC 担当、依頼 23、build-1731 = v5.0.0 + §1.731 修正、`C:\miv-subpc\results-23\`): どのフォルダも開かずに Ctrl+R で `thumb746\ ext:zip` を検索 → 6 個の ZIP の表紙が約 1 秒で揃った。検索を閉じて親 `root` を開く → F01〜F06 はすべてフォルダのアイコン (直後・10 秒後とも)。F01 を開いて戻る → F01 だけ表紙。「最新の情報に更新」後も F02〜F06 はアイコンのまま。ログでは `resolve_folder_thumb_image` が F01〜F06 とも `<none>`、F01 を開いた後だけ `<cached-pin:zipthumb:vol01.zip>`。ERROR / WARN / panic なし。
+- 原因 (設計担当がサブ PC のキャッシュの写しを読んで確認、ハッシュでどのフォルダの DB かを照合):
+  - Ctrl+R の検索結果は、**検索を始めたときに開いていたフォルダ** (今回は `OneDrive\Desktop`) の catalog DB に、フルパスのキー `zipthumb:C:\...\F01\vol01.zip` で保存された (`use_full_path_cache_keys` が `items_are_global_search_view` で true、catalog folder は `current_folder` のまま)。
+  - 検索を閉じてそのフォルダへ戻ると、一覧に無いキーとして 6 行とも削除された (写し s1 で 6 行 → s2 で 0 行)。
+  - フォルダの代表選定 (`src/thumb_loader.rs` の `cached_candidate`) は ZIP・PDF を新たに開かず、各フォルダ自身の catalog DB を basename キー (`zipthumb:vol01.zip`) で引く。検索側の行は DB もキーも違うので、消えていなくても届かない。
+- 関連: §1.731 (コレクションとレーティング一覧でキーを消し合う) と同じ「複数の親を並べる一覧のサムネの保存先」の問題。§1.731 はコレクションの root だけを full-path キーにして直した。
+- 設計で決めること: 実在の親を持つ項目のサムネを、検索結果でも親フォルダの catalog に通常キーで保存する (または読む) か。検索を始めた元のフォルダの DB へ無関係な行を書かない形にする。Ctrl+G・タグ・レーティング・閲覧履歴など、同じ判定を使う他の一覧への波及。「検索語と結果は保存しません」(製品の説明) との関係。サムネキャッシュはリリース済みなので、キーや保存先を変えるならマイグレーションの要否を判断表で決める。
+- ついでの観測 (サブ PC 担当、build-1731 は §1.691 の修正前): Everything 検索欄で Enter を押しても検索が始まらず、「検索」ボタンで始まった。既存の動きかは未確認。
+
+### 1.739 Terminal から取り出した Direct 帰路が、同じ窓で後から開いた reader を置き換える (2026-11-08、§1.676 調査で確認)
+
+- 状態: **未着手・master 既存の別件。§1.675／§1.676 の対象外**。S1 実装レビュー R2 で同型の寿命問題を調査し、ZipListReturn だけを修正した。Direct への横展開は未実施。調査記録は[内部本計画 §9](archive-inner-book-open-return-plan.md)。実機確認は未実施。
+- 現状: ZIP の root ページを直接読む → Terminal close で teardown → 親フォルダへの Direct nav を take → 同じ context でページを再 open → 古い Direct を配送すると、後発 reader の items が置き換わる。現在の `src/app/close_return.rs:404`（`take_close_return_navigation`）は Terminal の Navigation から nav を返す際に origin を保持しない。`src/app.rs:71865` の reader 受理で呼ぶ `retire_zip_close_return_for_reader_acceptance`（`src/app/close_return.rs:80`）は ZipListReturn 専用で、`src/app.rs:24952` の Direct consumer も reader の受付寿命を照合せず load を始める。
+- 方針: 同じ context に新しい reader が受理されたら、その context の旧 close return を終了させる所有規則を Direct の take／配送まで設計する。consumer に `fullscreen_idx` の有無を見るガードや並列 pending を追加して済ませない。別 context の reader や専用帰路を終了しないことを先に整理する。§1.676 で採択した ZipListReturn の修正を勝手に他 variant へ広げず、独立した設計・レビューで扱う。
+- 検証: Terminal take → 同じ窓でキーボード／ページセルのダブルクリックによる再 open → 旧 Direct 配送を handler-level で再現し、後発 reader の items・fullscreen_idx・zip_nav が不変で、何も install されないことを確認する。別 context の session・runtime・viewport も不変とする。今回の起票では製品コード・既存テストを変更しない。
+
+### 1.738 検索前の場所がない Everything 結果から書庫内へ入ると、階層だけが進んで一覧が変わらない (2026-11-08、§1.675 調査で確認)
+
+- 状態: **未着手・master 既存の別件。§1.675／§1.676 の対象外**。master `bec01bf11` の「ページを表示」OFF の既存経路でも成立することをソースと headless 調査で確認した。報告者の実機再現とは区別する。調査記録は[内部本計画 §9](archive-inner-book-open-return-plan.md)。
+- 現状: 検索前の origin folder を持たない Everything 結果を採用し、そこから開いた書庫の内部 A/B 一覧で A へ入ると、`zip_nav_enter` は先に nav を A へ進めるが、表示は A/B 一覧のままになる。Search の `TopLevelGridView.return_to` に履歴の source entry がなく、`current_top_level_restore_snapshot` → `folder_nav_current_target` → `folder_nav_current_entry` が None を返すため、`zip_nav_show_current_level` が items・世代・address を install する前に return する。
+- コード: master `bec01bf11` の `src/app.rs:40520`（enter）、`:40190`／`:40207`〜`:40208`（表示採用の early return）、`:25237`（current entry）、`:26269`（current target）、`:26465`／`:26512`（Search snapshot）。現在の対応箇所は `src/app.rs:40747`、`:40417`／`:40434`〜`:40435`、`:25315`、`:26347`、`:26543`。欠けているのは Search 側の履歴 source entry で、書庫 tree の列挙結果ではない。
+- 方針: origin がない検索結果でも、ZIP 階層と表示一覧を同じ採用単位で更新できる所有境界を設計する。見ていない実フォルダを origin として捏造したり、nav だけの症状修正に留めたりしない。検索へ戻る経路と履歴 Back／Forward の意味を確認してから着手する。
+- 検証: `src/app/tests/everything_close_return.rs` の `investigation_master_everything_no_origin_zipdir_rows_match_nav` は、望ましい「表示行と nav が一致する」契約を assert し、`#[ignore = "pre-existing master bug: Everything without search origin; separate backlog item"]` として保持している。別件修正時に有効化し、設定 OFF の一覧移動と origin ありの検索帰路を回帰する。今回の起票では製品コードを変更しない。
+
 ### 1.737 mIV Sound 説明書の URL から版番号を外し、固定 URL にする (2026-11-08、v5.1.0)
 
-- 状態: **未着手・利用者決定 2026-11-08: 固定 URL にする。v5.1.0 で対応**。正本は申し送り [docs/briefs/sound-docs-fixed-url.md](briefs/sound-docs-fixed-url.md) (サイト点検セッション起票)。
+- 状態: **実装・自動検証・独立レビュー ACCEPT (2026-11-08、Codex gpt-6.1-sol/xhigh、指摘なし)、master 未統合・未公開** (ブランチ `fix-1737-sound-fixed-url`)。固定 URL の生成物133 HTML＋4画像、転送規則、運用手順を更新した。`python -m unittest scripts/test_gen_effetune_docs.py` 35件成功、生成器の `--check` 成功、sitemap 再生成済み (216 件、`manual/sound/` 133 件、版付き URL 0 件)。redirect 規則は Apache の仕様・ソースとの照合とテスト内 emulator による検査で、実 Apache での確認は公開後の §5 (curl) で行う。正本は申し送り [docs/briefs/sound-docs-fixed-url.md](briefs/sound-docs-fixed-url.md) (サイト点検セッション起票)。
 - 問題: 説明書は `manual/sound/<版>/` に生成され、版を上げるたびに URL 全体が変わる (`effetune/v0.12.0/` → … → `sound/v0.15.0-miv.7/`)。旧 URL は 301 で送っているのでリンク切れは無いが、Search Console では Google の切り替えが版の更新に追いつかず、古い URL ばかりが表示されている (申し送り §1 の表、2026-11-08 点検)。
 - 目標: 正規 URL を `manual/sound/<ページ名>.html` (画像は `manual/sound/images/`) に固定し、`manual/sound/index.html` を目次そのものにする。版は本文で示す。旧 `manual/effetune/<版>/`・`manual/sound/<版>/` は 1 回の 301 で同名の固定ページへ (無ければ目次へ)。版の更新で `.htaccess` を書き換えずに済む規則にし、ループしないこと・www 経由が 2 ホップで着くことを確かめる。
 - 作業 (申し送り §3): `scripts/gen-effetune-docs.py` の出力先・canonical・相対リンク・redirect 生成・`--check` の版ディレクトリ検査、`htdocs/.../manual/sound/` の作り直し、`manual/effetune.html` の 2 リンク、`scripts/test_gen_effetune_docs.py` の版付きパス前提の検査と新しい検査 (版を変えても URL 不変・旧 URL が 1 回で届く)、`docs/effetune-integration-plan.md`・`docs/effetune-fork-plan.md`・`docs/release-checklist.md`・`docs/release-operations.md` の手順の記述、sitemap の再生成。
@@ -130,12 +157,62 @@
 
 ### 1.726 ページ切替時の初期表示位置を「中央 / 読み始め」から選べるようにする — 5ch >>739 (2026-11-07)
 
-- 状態: **未着手・利用者が設定追加を採択**。既定は従来どおり「中央」。収録版は未指定。[>>739](https://egg.5ch.io/test/read.cgi/software/1782419551/739) は、ズーム/フィット設定で画像が画面からはみ出すと、ページを送った先が中央から表示されるため、画像上部から見たいという要望。拡大操作の中心点やマウスカーソルの移動を変える要望とは区別する。
-- 現状（ソース確認）: `src/app.rs` の通常の画像切替は `fs_zoom = 1.0` / `fs_pan = Vec2::ZERO` に戻し、`src/displayed_image_transform.rs` は viewport の中央を基準に配置する。幅フィット・原寸・指定スケール等では、はみ出した部分を読み始めから表示する専用の初期配置がない。実アプリでの再現試験は今回行っていない。
+- 状態: **実装・独立レビュー承認、サブ PC の実機確認で NG なし (2026-11-09〜10、依頼 25・27・27b・27c、観測者はサブ PC 担当。ブランチ `feat-1726-page-start-position`。2026-11-10 利用者判断で master 取り込み済み、v5.1.0 に収録)**。実機確認で見つかった 3 件 (見開きの待ち表示が残る、ページ構成の切替で位置が持ち越される、切替 frame を旧単位の幅で確定する) は修正済み ([計画 §9.5〜§9.9](fullscreen-page-start-position-plan.md))。残件は §1.745〜§1.749。仮素材の間も読み始めへ合わせ、全ページが完成素材で描かれる最初の current frame で確定する設計担当の決定を実装した。停止理由・実装・検証記録は [初期表示位置の計画 §9](fullscreen-page-start-position-plan.md#92-r4-実装検証記録-2026-11-09)。既定は従来どおり「中央」。収録版は未指定。[>>739](https://egg.5ch.io/test/read.cgi/software/1782419551/739) は、ズーム/フィット設定で画像が画面からはみ出すと、ページを送った先が中央から表示されるため、画像上部から見たいという要望。拡大操作の中心点やマウスカーソルの移動を変える要望とは区別する。
+- 実装・自動検証: 設定・転送・context 所有の要求・単ページ／見開き／分割・navigation previous の位置保持を実装。絞り込み nextest 235 件、本体 lib 全件 (`test-lib-full.ps1`) 16,819 件、UI スナップショット 246 件がすべて成功 (2026-11-09)。原寸の thumbnail→full、未完成 AI→完成、Native 代替・部分描画、入力取消、別窓復元・兄弟 context、紙めくりの着地を含む。製品起動・実機確認は行っていない。
 - 採択仕様: 通常のページ送りでページ（見開きなら表示単位）を切り替えた直後の位置を「中央 / 読み始め」で選べるようにする。「読み始め」は縦にはみ出す場合に上端、横にはみ出す場合に実効読書方向が右→左なら右端・左→右なら左端へ合わせる。はみ出さない軸は従来の配置（通常は中央）を維持し、見開き端の単ページを片側に置く既存設定まで上書きしない。既存環境・設定未保存時は中央を維持する。
 - 実装時の境界: fit倍率と表示領域・ロックHUD/パネルによる予約領域が確定した幾何に対して初期位置を求め、元画像の読み込み後や高画質化で勝手に初期位置へ戻し続けない。その後の手動パン/ズーム、キー拡大の中心点、マウス位置基準の拡大、Zズームの照準、連結読み・360度表示の既存操作は変更しない。main/F12/独立viewerの位置は各context内で扱う。
-- 検証: 幅フィットで縦だけ、縦フィットで横だけ、原寸/指定スケールで両軸がはみ出す場合と、全体が収まる場合を両読書方向で確認する。見開き/分割、回転・トリム、HUD予約領域、画質差し替え後と手動移動後の位置、設定保存・既定の中央での従来動作を回帰する。初回open・シーク等の適用範囲は既存のページ切替入口を棚卸しして設計に明記する。
+- 検証範囲: 幅フィットで縦だけ、縦フィットで横だけ、原寸/指定スケールで両軸がはみ出す場合と、全体が収まる場合の両読書方向、見開き/分割、回転・トリム、HUD予約領域、画質差し替え後と手動移動後の位置、設定保存・既定の中央での従来動作。初回open・シーク等の入口と除外モード、holdover・兄弟 context・要求退役・紙めくり着地も設計 r4 に明記。自動検証結果は同計画の実装記録に集約する。
 - 関連: [表示パイプライン](display-pipeline.md)、[指定スケール設計](fullscreen-specified-scale-plan.md)、`src/ui_fullscreen.rs` / `src/displayed_image_transform.rs`。保留側§1.268のZズーム時のカーソル移動とは別件。規模: 設計時に確定 / 優先度: P3。
+
+### 1.745 拡大していない状態で位置だけ動かしたとき、ダブルクリックが表示リセットではなく 2 回のページ送りになる (2026-11-09)
+
+- 状態: **未着手**。§1.726 の実機確認 (依頼 25 B5、サブ PC 担当の観測) で判明。master からの挙動 (コード読み)。
+- 原因 (コード): `fullscreen_click_belongs_to_view` が倍率と回転だけを見るため、fit 倍率で pan だけある状態の 1 回目のクリックがページ送りになり、2 回目は送り先のページで処理される。マニュアルの「ダブルクリックで表示リセット」は、拡大中にしか届かない。§1.726 の「読み始め」では開くたびに pan が入るので目に付きやすい。
+- 検討: クリックのページ送りとダブルクリックのリセットの両立 (マニュアルの「動かしたあともクリックでのページ送りはそのまま使えます」を保つ) をどう決めるか。規模 / 優先度: Small〜Medium / P3。
+
+### 1.746 1 ページ表示で `7` を押して右→左にしても、矢印キー・クリックのページ送りの向きが変わらない (2026-11-09)
+
+- 状態: **未着手**。§1.726 の実機確認 (依頼 25 C4、サブ PC 担当の観測) で判明。master からの挙動 (コード読み)。
+- 原因 (コード): 矢印・クリックの前後は `spread_mode.advances_right_to_left()` で決まり、1 ページ表示では常に左→右。シークバーと「読み始め」の位置は `spread_mode.reading_direction().unwrap_or(self.reading_direction)` に従うので、1 ページ表示で右→左にすると、右端から表示されるのに `→` が次になる。
+- 検討: 1 ページ表示の送り方向を読み方向に従わせるか (既存利用者への影響を相談)。規模 / 優先度: Small / P3。
+
+### 1.747 横長分割で一覧から開き直すと、前に見ていた側の半分から始まる (2026-11-09)
+
+- 状態: **未着手**。§1.726 の実機確認 (依頼 25 E3、依頼 27b/27c A3、サブ PC 担当の観測) で判明。master からの挙動 (コード読み)。
+- 原因 (コード): `open_fullscreen` が `fullscreen_page_slice` を Full に戻さず、`reconcile_fullscreen_page_slice` が半分の状態を保つ。右→左で左半分まで読んでから `8` (左→右) にして開き直すと右半分から始まる。`9`→`8` の切替でも半分が残る。detached の開始 (`viewer_context_registry.rs`) では「新しく開くページは最初の半分から」と Full に戻しており、通常の open と食い違う。マニュアル (fullscreen.html 横長分割) の「開き直したときは、選んでいる向きの最初の半分から表示されます」とも合わない。
+- 規模 / 優先度: Small / P3。
+
+### 1.748 Esc で一覧に戻った直後、アドレス欄の 1 回目のクリックが効かないことがある (2026-11-09)
+
+- 状態: **未調査**。§1.726 の実機確認 (依頼 25・27・27c、サブ PC 担当の観測、画面操作ツール) で複数回。効かなかったクリックの後の Enter・Ctrl+A が一覧に効いた。普通のマウスで起きるかは未確認。
+- 規模 / 優先度: 調査次第 / P3。
+
+### 1.750 AI アップスケール中の横長画像で、ページめくり演出が始まってすぐ取り消され、次の画像へ切り替わる (2026-11-10)
+
+- 状態: **対応済み・master 入り (2026-11-10、`fix-1750-page-turn-layout` を早送り、0f78444f6〜25102d3bf)・v5.1.0 に入れる (利用者決定)**。利用者の実機確認で「なおってそう」(2026-11-10)。独立レビュー (Sol/xhigh) は ACCEPT、P3 2 件は対応済み。本体 lib 全件 17,007 件成功 (サンドボックス外、2026-11-10)。実装担当のサンドボックス内で出た IPC 2 件の失敗は named pipe 作成の拒否で、サンドボックス外では成功。報告は利用者 (インストール版 v5.0.0、AI アップスケール ON、`5` の見開きモード、横長画像)。「アニメーションが一瞬動いた後キャンセルされたように、すぐ次の画像に切り替わることがある」。
+- ログから読めたこと (設計担当が利用者のログ `%APPDATA%\mimageviewer\logs\mimageviewer.log(.bak)` と `perf_events.jsonl` の末尾を読んだ。製品は起動していない。画像の中身は見ていない):
+  - 演出は始まっている (`[page-turn] start reason=curl_submitted`、perf `page_turn_animation start/frame/first_visible`)。10〜30 ms 後に `cancel reason=source_geometry_or_binding_changed` で取り消され、平らな表示へ切り替わる。
+  - 取り消しの間、フレームは 5〜6 ms 間隔で出ており (perf `motion_max_gap_ms` 6.3)、コマ落ちではない。AI のアップスケール完了・保存も、取り消しの時刻とは重なっていない (別スレッドで次々ページを先読み中)。
+  - 表示中のページはどれも AI 済み (3200x2400、`DisplayReady(ResidentFinalComposite)`)。画面には Lanczos 縮小 (1780x1335、native) で描いている。
+  - 同じ起動の 690〜701 秒では、同じ条件 (AI 済み・同じ縮小) の送りが最後まで完了していた (finish 197 件)。キーの押しっぱなしで先へ飛んだ後、約 9 秒置いて送り始めた 710 秒から、キー送り・スライドショー送りとも、ほぼ毎回取り消されるようになった (710〜782 秒で約 30 件)。
+  - 取り消しの判定は `src/ui_fullscreen/page_turn.rs` の Turning 状態の `incoming.same_material_and_geometry(&unit)` (v5.0.0 では 2871 行付近)。描くページの texture・source generation・layout (`Arc::ptr_eq`)・変換などが 1 つでも変わると取り消す。どれが変わったかはログに出ていない。
+- 調べること: 演出中にどの項目が変わったか (texture の差し替え、layout の作り直し、prefetch の到着など)、それが正当な変化か。AI アップスケール・見開きとの関係。v5.0.0 以降の master (§1.726 で完了判定を変更) でも起きるか。原因が分からない間は、取り消し理由に「どの項目が変わったか」を出す計装を先に足す。
+- 段階1の開発側検証 (2026-11-10、基点 `c6a0db6fd` + `fix-1750-page-turn-layout` の計装・回帰差分。構造修正なし):
+  - 未知の遠方ページへ `record_thumbnail_page_dims_for_spread` で横長寸法を配送し、通常resolverによるlayout再構築を通すheadless回帰を追加した。Managed通常描画／Native実prepare・bind境界 × LTR／RTLの4件すべてで、`different_fields=["layout_arc"]` だけが変わり、対象unitのoccurrences・formation・placementは一致したまま取消になる。素材ID・source generation・content・描画geometryは変わっていない。Native allocationは既存の合成fixtureで、実GPUのlookup hitや利用者の各取消を直接確認したものではない。
+  - 4件はcurl継続を期待するassertで意図的に失敗する。`ignore` / `should_panic` は付けず、修正後の同一素材によるcanonical flat着地の検査も残した（現状は継続assertより先へ到達しない）。相方の実回転でpaired→singletonになる対照と、Native resize／clip対照は成功（2テスト、両方向の計6ケース）。
+  - `source_geometry_or_binding_changed` の通常／perfログへ `origin=turn_compare|prepare_reuse` と差分項目、Arc不一致時の対象unit一致情報を追加。landscape反転時だけidx・旧新判定・epochも記録する。判定・表示仕様は維持し、名前・パス・画像内容を新たに出力しない。
+  - 検証は通常feature／test profile、`CARGO_BUILD_JOBS=1`。`cargo nextest run -p mimageviewer --lib -E 'test(/regression_1750/)' --no-fail-fast` は6実行、2成功／期待4失敗。`cargo nextest run -p mimageviewer --lib -E 'test(/page_turn/)' --no-fail-fast` は328実行、324成功／同じ期待4失敗、exit 100。`cargo fmt`・`cargo fmt --check`・`git diff --check` は成功。ログ: `target/1750/regression-final.log`、`page-turn-final.log`、`fmt-final.log`。
+  - 初回はTurboJPEGのMSBuild並列実行が失敗し、直列ビルドで通過した。テスト実行体の初回起動はFFmpeg DLL不足（0xc0000135）で止まり、`vendor/ffmpeg/bin/*.dll` 6本を `target/debug/deps/` へ実体コピー後に実行できた。相方対照の初回fixtureはresident寸法が配送寸法より優先されて組が変わらず失敗したため、実回転入力へ修正して再検証した。
+  - 独立コードレビューはP1/P2指摘なし。detached述語・viewport分岐は変更していない（共有presentationへの計装だけ）。製品起動・通常APPDATAへのアクセス・実GPU確認は未実施。意図的なredを残す修正前段階のため、確認用アプリbuildは作成していない。
+  - この結果は仮説のコード経路を再現した証拠で、利用者ログの個々の取消原因の確定ではない。意味的bindingによる有効性の構造修正は設計レビュー後の別段階とする。
+- 段階4: 局所bindingと全consumerへの接続差分を実装。設計担当判断r5・独立reviewer AGREE（P3適用）で再開し、採用後resizeはbaseどおりpre-draw確定、採用前だけNeedFlat再束縛とした。PDFを捕捉前へ配置し、置換拒否を別回帰へ分離。最終は焦点20、page_turn342、canonical15、関連779件が全成功。lib全件は17,006中17,004成功/未変更IPCのアクセス拒否2失敗（各単独でも再現）。formatter成功。確認用 `build-dev.ps1` は初回MSBuild並列失敗後、`CARGO_BUILD_JOBS=1` で成功（5バイナリ・DLL配置・PE検査完了）。独立コードレビューACCEPT・未解決findingなし。履歴と最終結果は[表示単位binding計画§8](page-turn-layout-binding-plan.md#8-改訂設計の実装検証2026-11-10)。製品起動・通常APPDATAへのアクセスなし。
+- 関連: §1.341 (ページめくり演出)、§1.726、§1.749。
+
+### 1.749 ページめくり演出を取り消した着地で、画面外のページも「見えた」と診断ログに記録される (2026-11-09)
+
+- 状態: **未着手**。§1.726 の独立再レビュー (GPT-6.1 Sol / xhigh) の P3。診断だけで、操作には影響しない。
+- 内容: §1.726 で canonical flat の完了を画面外ページ (可視面積 0) でも認めるようにした結果、演出開始直後に拡大・パンで片側を画面外へ出して取り消すと、まだ見えていないページにも `first_visible` (`visible_area=0`) と `fully_visible` が出る。直すなら可視性イベントの mask を receipt の実面積から求め、全ページが見えていない取消着地では `fully_visible` を出さない ([計画 §9.7](fullscreen-page-start-position-plan.md))。
+- 規模 / 優先度: Small / P3。
 
 ### 1.723 Undo を Shift+Esc に割り当てると、固定の Esc と Undo が同じ押下を二重に使う (2026-11-07)
 
@@ -265,7 +342,7 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.697 一覧でフォルダ・書庫・PDFなどを代表サムネイルではなく種類アイコンで表示するオプション — 5ch >>728・730 (2026-11-03)
 
-- 状態: **未着手・オプション追加の方針を利用者が採択**。収録版は未定。[>>728](https://egg.5ch.io/test/read.cgi/software/1782419551/728) の質問に [>>729](https://egg.5ch.io/test/read.cgi/software/1782419551/729) で対象を確認し、[>>730](https://egg.5ch.io/test/read.cgi/software/1782419551/730) で「単体画像のサムネイルはそのまま、フォルダやZIP・PDFなどは種類のアイコン」との理解で合っていると回答された。
+- 状態: **実装・自動検証済み、サブ PC の実機確認で NG なし (2026-11-09、依頼 24、観測者はサブ PC 担当。ブランチ `feat-1697-container-type-icons`。2026-11-09 利用者判断で master 取り込み済み、v5.1.0 に収録)**。環境設定 → 表示 → サムネイルの「フォルダ・書庫・PDF を種類のアイコンで表示する」(既定 OFF)。設計書は [container-type-icon-plan.md](container-type-icon-plan.md)。オプション追加の方針は利用者が採択済み。収録版は v5.1.0 候補。[>>728](https://egg.5ch.io/test/read.cgi/software/1782419551/728) の質問に [>>729](https://egg.5ch.io/test/read.cgi/software/1782419551/729) で対象を確認し、[>>730](https://egg.5ch.io/test/read.cgi/software/1782419551/730) で「単体画像のサムネイルはそのまま、フォルダやZIP・PDFなどは種類のアイコン」との理解で合っていると回答された。
 - 要件: 一覧の表示設定に切り替えを設け、既定では従来の代表サムネイル表示を維持する。切り替え時は対象の代表画像の代わりに既存の種類アイコンを使い、単体画像や本を開いた後の各ページのサムネイルは変えない。既存の「サムネイルに種類アイコンを表示する」（左上のバッジ）とは別の機能。
 - 設計時の確認: 自動選定・手動固定の代表画像をどう扱うか、対象とするコンテナや一覧の範囲を明記する。表示切り替えで手動固定の指定や既存キャッシュを消さず、元に戻せば再利用できるようにする。表示しない代表画像の探索・生成を省ける範囲は、他の利用経路への影響を確認して決める。
 - 検証: 設定切り替え前後で、フォルダ・ZIP・PDF等の既存アイコン表示、自動・手動の代表画像の復元、単体画像と本のページ一覧が変わらないことを確認する。関連: [表示パイプライン](display-pipeline.md)、[サムネイル要求の設計](thumbnail-request-lifecycle-plan.md)。
@@ -370,6 +447,11 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.675 書庫内フォルダ・入れ子書庫にも、ページを直接表示する設定を適用する — 5ch >>694・696 (2026-11-01)
 
+- 状態: **branch `fix-1675-1676-zipdir-book`（worktree `G:\home\mimageviewer-zipdir-book`）で実装済み。S1〜S3 の実装レビューと S4 の文書レビューは ACCEPT。本体 lib 全件 16,684 件・test-full 18,732 件成功。2026-11-09 に利用者の判断 (v5.1.0 に含める) で master へ取り込んだ (ef2310a3b)。取り込み後の全件 2 回は、回ごとに別の時間制限テストが負荷で失敗し (計 6 件、どれも単独では成功、5 件は本ブランチで触っていないファイル)、退行は見つからなかった。** 実機確認: サブ PC 依頼 22 (2026-11-08、build 7931dc7b0 = code 7b3960558、隔離 data-dir) で、観測者 = サブ PC 担当 (Claude) が、フル機能ウィンドウの ZIP 内フォルダ・入れ子 ZIP の直接表示、Esc / × / Enter 閉じでの内部一覧への帰還と選択・スクロール位置、内部本ごとの「続きから」、子フォルダだけの階層での一覧表示、Backspace、Ctrl+↓ 後の帰還、変換 RAR での同じ動き (RAR と ZIP は別の読書位置)、複数ウィンドウモードでの別ウィンドウ open / close 後もメインの一覧・選択・スクロールが不変、複数の別ウィンドウ同士の独立を確認し、NG なし。mIV Remote (PIN 入力が要るため) とウィンドウ表示 (F11) での帰還は未確認。RAR は試験データの作りの都合で同名 ZIP に隠れたため、アドレス欄から開いた (既存の同名ファイル設定の動作)。 設計・実装・検証の正本は[内部本計画](archive-inner-book-open-return-plan.md)。
+- 対象外: §1.678（子の本だけの ZIP へ Ctrl+↓）と、独立 reader の Ctrl 移動順（物理 DFS が内部 DFS より先）は今回変更しない。
+
+#### 起票時の記録（以下は修正前の調査・方針）
+
 - 状態: **未着手・利用者からバックログへの起票依頼 (2026-11-01)**。[>>694](https://egg.5ch.io/test/read.cgi/software/1782419551/694) は「開いたとき、ページを表示」と「画像のみフォルダは、PDF/ZIPのように本として扱う」を有効にすると、通常フォルダはダブルクリックでページ表示になるが、書庫内フォルダはページ一覧で止まるという報告。[>>696](https://egg.5ch.io/test/read.cgi/software/1782419551/696) で入れ子書庫のダブルクリックでも同じと追記され、通常のフォルダ・書庫と同様に扱う設定が求められた。ウィンドウモードは明記されていない。開発側は今回、コード確認のみで実機再現・修正・回帰テストの実行はしていない。
 - 現状の処理: ダブルクリック (`src/ui_main.rs`)・Enter (`src/app.rs`)・ゲームパッド (`src/app/gamepad_input.rs`) の `GridItem::ZipDir` は `zip_nav_enter` を呼ぶ。`src/app.rs::zip_nav_enter` は内部階層を進めた後、常に `zip_nav_show_current_level(StartupListIntent::ExplicitList)` とする。通常の Folder / ZipFile / PdfFile が使う自動ページ表示の受付とは別であり、内部階層に同じ設定を適用する処理がない。書庫内フォルダと入れ子書庫が同じ ZipDir 経路を通るため、両報告と整合する。現段階では「新しい不具合を実機で再現した」とは扱わない。
 - 改善の方向: 通常のフォルダ・本と同様、内部で選んだ本にもページ表示 / 一覧表示の設定を適用できるようにする。画像のみフォルダを本扱いする設定の適用範囲、実フォルダと内部フォルダ・内部書庫の分類、既存利用者への既定の扱いは設計時に整理する。別のオプションが必要かはそこで決め、すべての ZipDir を無条件にページ表示へ変えない。直下に表示対象ページがない分岐は一覧に留め、勝手に最初の子の本へ DFS で潜る変更や、書庫のフラット化は含めない。
@@ -378,6 +460,10 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 - 対象: `src/app.rs` の `zip_nav_enter` / `zip_nav_show_current_level`、`src/ui_main.rs`、`src/app/gamepad_input.rs`、既存の本open・表示continuation、関連テスト・設定説明。[仮想フォルダ](virtual-folders.md)、[内部書庫ツリー設計](nested-zip-tree-plan.md) を参照。規模: 設計時に確定 / 優先度: P3。リリース時期は未指定。
 
 ### 1.676 書庫内の本を閉じたら、その本を選んだ内部一覧へ戻す — 5ch >>697 (2026-11-01)
+
+- 状態: **branch `fix-1675-1676-zipdir-book`（worktree `G:\home\mimageviewer-zipdir-book`）で実装済み。S1〜S3 の実装レビューと S4 の文書レビューは ACCEPT。本体 lib 全件 16,684 件・test-full 18,732 件成功。2026-11-09 に利用者の判断 (v5.1.0 に含める) で master へ取り込んだ (ef2310a3b)。取り込み後の全件 2 回は、回ごとに別の時間制限テストが負荷で失敗し (計 6 件、どれも単独では成功、5 件は本ブランチで触っていないファイル)、退行は見つからなかった。** 実機確認: サブ PC 依頼 22 (2026-11-08、build 7931dc7b0 = code 7b3960558、隔離 data-dir) で、観測者 = サブ PC 担当 (Claude) が、フル機能ウィンドウの ZIP 内フォルダ・入れ子 ZIP の直接表示、Esc / × / Enter 閉じでの内部一覧への帰還と選択・スクロール位置、内部本ごとの「続きから」、子フォルダだけの階層での一覧表示、Backspace、Ctrl+↓ 後の帰還、変換 RAR での同じ動き (RAR と ZIP は別の読書位置)、複数ウィンドウモードでの別ウィンドウ open / close 後もメインの一覧・選択・スクロールが不変、複数の別ウィンドウ同士の独立を確認し、NG なし。mIV Remote (PIN 入力が要るため) とウィンドウ表示 (F11) での帰還は未確認。RAR は試験データの作りの都合で同名 ZIP に隠れたため、アドレス欄から開いた (既存の同名ファイル設定の動作)。 設計・実装・検証の正本は[内部本計画](archive-inner-book-open-return-plan.md)。
+
+#### 起票時の記録（以下は修正前の調査・方針）
 
 - 状態: **未着手・利用者からバックログへの起票依頼 (2026-11-01)**。[>>697](https://egg.5ch.io/test/read.cgi/software/1782419551/697) は、外側 `A.rar` 内の「書庫内フォルダA / B」(または入れ子書庫A / B) が並ぶ一覧からAを開いてページを閲覧した後、閉じると外側 `A.rar / B.rar` の並ぶ実フォルダまで戻るという報告。希望は、Aを選んだ書庫内のA / B一覧へ戻ること。閉じた入力が Esc・×・Backspace のどれかは未記載。開発側は実機再現しておらず、当該利用者の具体的な終了経路は未確定。
 - コードで確認: `auto_open_for_current_container` はページ直接表示設定と現在の外側コンテナから退出を決め、`handle_fullscreen_close_request` が close return を要求する。`src/app/close_return.rs::resolve_close_return_navigation` は検索・閲覧履歴等の専用帰路がない場合、`effective_folder().parent()` へ戻す。内部の `zip_nav` の階層をこの通常分岐では使わないため、RARの元sourceを保持する場合も、内部Aの親ではなく外側RARの置き場所へ抜け得る。コードは報告と整合するが、RARだけの原因・実機確認済みの診断とはしない。

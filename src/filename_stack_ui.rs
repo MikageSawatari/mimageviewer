@@ -2614,7 +2614,7 @@ mod tests {
                 history_trigger: HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
-                resume_to_last_page: false,
+                resume_to_last_page: (false).into(),
                 from_explicit_open: false,
                 preserve_after_password_prompt: false,
             });

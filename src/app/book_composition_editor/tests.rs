@@ -318,7 +318,7 @@ fn egui037_continuation_context_state_real_logic_receipt_keeps_sibling_ui_unadop
     worker
         .send(SaveCompletion {
             status: Ok(Some(ResumeCommit {
-                key: path.clone(),
+                key: crate::book_resume_key::BookResumeKey::legacy(&path),
                 position: ReadingPosition {
                     page: 2,
                     identity: None,
@@ -2034,14 +2034,14 @@ fn retired_owner_save_receipt_records_once_without_reviving_owner_or_touching_ma
             let (path, page, meter, identity) = f.app.last_book_resume.clone().unwrap();
             let position = reply.position.as_ref().unwrap();
             assert_eq!(
-                crate::path_key::normalize(&path),
+                path.storage_key(),
                 crate::path_key::normalize(&f.scope.logical_root)
             );
             assert_eq!(page, position.page);
             assert_eq!(identity, position.identity);
             assert!(meter.is_some());
             f.app
-                .persist_book_resume_with_identity(path, page, meter, identity);
+                .persist_book_resume_key_with_identity(path, page, meter, identity);
             assert_eq!(
                 f.app
                     .book_resume_writer

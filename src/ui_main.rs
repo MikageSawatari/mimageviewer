@@ -850,6 +850,7 @@ enum PinButtonClick {
 
 #[derive(Debug)]
 pub(crate) enum AddressBarNav {
+    ZipListReturn(crate::app::ZipListReturnRequest),
     Direct(PathBuf, crate::app::StartupListIntent),
     GridVirtual(crate::app::GridVirtualOpenIntent),
     RatingSource {
@@ -15937,6 +15938,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     Some(
                                         AddressBarNav::HistoryBack
                                         | AddressBarNav::HistoryForward
+                                        | AddressBarNav::ZipListReturn(_)
                                         | AddressBarNav::EverythingResults
                                         | AddressBarNav::SavedGroupReady(_),
                                     )
@@ -17528,7 +17530,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     },
                     rating,
                     &self.items[idx],
-                    &self.thumbnails[idx],
+                    crate::grid_item::effective_thumbnail_state(
+                        &self.items[idx],
+                        &self.thumbnails[idx],
+                        self.settings.thumb_container_type_icon_only,
+                    ),
                     &tags,
                     bookmark_time.as_deref(),
                     bookmark_title.as_deref(),
@@ -17545,7 +17551,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 );
                 let rotation = self.get_rotation(idx);
                 let resume = self.thumbnail_resume_meter(idx);
-                let adjusted = if self.adjustment_dragging {
+                let adjusted = if self.adjustment_dragging
+                    || crate::grid_item::container_icon_only(
+                        &self.items[idx],
+                        self.settings.thumb_container_type_icon_only,
+                    ) {
                     None
                 } else {
                     self.thumb_adjust_tex.get(&idx)
@@ -17558,7 +17568,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     spread_cursor,
                     &overlay,
                     &self.items[idx],
-                    &self.thumbnails[idx],
+                    crate::grid_item::effective_thumbnail_state(
+                        &self.items[idx],
+                        &self.thumbnails[idx],
+                        self.settings.thumb_container_type_icon_only,
+                    ),
                     rotation,
                     adjusted,
                     self.items_are_drive_list,
@@ -17839,6 +17853,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             None
         };
         if activation_allowed {
+            if self.activate_main_zipdir(idx, ctx)
+                != crate::app::ZipDirActivationOutcome::NotApplicable
+            {
+                return nav;
+            }
             self.capture_main_list_restore_cursor();
             // ファイル名スタックの集約グリッドでメディアセルをダブルクリックしたら、フラット読書
             // フルスクリーンへ (スタック/単独画像/動画を直接開く)。コンテナは false で通常ナビへ。
@@ -17962,13 +17981,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 }) if self.items_are_rating_view => {
                     self.open_rating_view_zipdir(zip_path.clone(), dir_prefix.clone());
                 }
-                // ネスト ZIP ツリーの子コンテナへダブルクリックで降りる (Phase 3)。
-                Some(GridItem::ZipDir { dir_prefix, .. }) => {
-                    let dp = dir_prefix.clone();
-                    // ★付きの本を絞り込み中に開くと中身が空表示になるのを防ぐ
-                    // (Codex P2)。enter 前に抑制を仕込む。
-                    self.maybe_suppress_rating_filter_for_opened_zip_book(idx);
-                    self.zip_nav_enter(&dp);
+                // ZipDir activation はキーボード・パッドと同じ入口で意図を決める。
+                Some(GridItem::ZipDir { .. }) => {
+                    // Main activation was consumed before the generic detached router.
                 }
                 // ファイル名スタック (v2.0.0): 集約グリッドのセルは上の stack_try_open_from_grid
                 // で処理済み (フラットフルスクリーンへ)。非スタックモードでは Stack セルは存在
@@ -18861,6 +18876,14 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         ctx: &egui::Context,
         hovered_preview: Option<(usize, egui::Rect)>,
     ) {
+        let hovered_preview = hovered_preview.filter(|(idx, _)| {
+            self.items.get(*idx).is_some_and(|item| {
+                !crate::grid_item::container_icon_only(
+                    item,
+                    self.settings.thumb_container_type_icon_only,
+                )
+            })
+        });
         let viewport_id = egui::ViewportId::from_hash_of("details_thumbnail_tooltip");
         if self.items_are_drive_list || hovered_preview.is_none() {
             self.set_details_hover_thumbnail_idx(None);
@@ -21226,7 +21249,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     edit_flags,
                                     rating,
                                     &self.items[idx],
-                                    &self.thumbnails[idx],
+                                    crate::grid_item::effective_thumbnail_state(
+                                        &self.items[idx],
+                                        &self.thumbnails[idx],
+                                        self.settings.thumb_container_type_icon_only,
+                                    ),
                                     &tags,
                                     bookmark_time.as_deref(),
                                     bookmark_title.as_deref(),
@@ -21250,7 +21277,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     if !self.adjustment_dragging {
                                         self.maybe_apply_thumb_adjustment(ctx, idx, "visible");
                                     }
-                                    let adjusted = if self.adjustment_dragging {
+                                    let adjusted = if self.adjustment_dragging
+                                        || crate::grid_item::container_icon_only(
+                                            &self.items[idx],
+                                            self.settings.thumb_container_type_icon_only,
+                                        ) {
                                         None
                                     } else {
                                         self.thumb_adjust_tex.get(&idx)
@@ -21266,7 +21297,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         spread_pair_cursor_idx == Some(idx),
                                         &overlay_layout,
                                         &self.items[idx],
-                                        &self.thumbnails[idx],
+                                        crate::grid_item::effective_thumbnail_state(
+                                            &self.items[idx],
+                                            &self.thumbnails[idx],
+                                            self.settings.thumb_container_type_icon_only,
+                                        ),
                                         rot,
                                         adjusted,
                                         self.items_are_drive_list,
@@ -21343,7 +21378,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         edit_flags,
                                         rating,
                                         &self.items[idx],
-                                        &self.thumbnails[idx],
+                                        crate::grid_item::effective_thumbnail_state(
+                                            &self.items[idx],
+                                            &self.thumbnails[idx],
+                                            self.settings.thumb_container_type_icon_only,
+                                        ),
                                         &tags,
                                         bookmark_time.as_deref(),
                                         bookmark_title.as_deref(),
@@ -21376,7 +21415,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     if hit_areas.is_none() && !self.adjustment_dragging {
                                         self.maybe_apply_thumb_adjustment(ctx, idx, "visible");
                                     }
-                                    let adjusted_tex = if self.adjustment_dragging {
+                                    let adjusted_tex = if self.adjustment_dragging
+                                        || crate::grid_item::container_icon_only(
+                                            &self.items[idx],
+                                            self.settings.thumb_container_type_icon_only,
+                                        ) {
                                         None
                                     } else {
                                         self.thumb_adjust_tex.get(&idx)
@@ -21400,7 +21443,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         spread_pair_cursor_idx == Some(idx),
                                         &overlay_layout,
                                         &self.items[idx],
-                                        &self.thumbnails[idx],
+                                        crate::grid_item::effective_thumbnail_state(
+                                            &self.items[idx],
+                                            &self.thumbnails[idx],
+                                            self.settings.thumb_container_type_icon_only,
+                                        ),
                                         rot,
                                         adjusted_tex,
                                         self.items_are_drive_list,
@@ -36558,6 +36605,31 @@ mod pinned_search_review_tests {
                 "{kind:?}"
             );
             assert!(!app.borrow().settings.toolbar_section_drag_enabled);
+        }
+    }
+}
+
+#[cfg(test)]
+mod container_type_icon_hover_tests {
+    use super::*;
+
+    #[test]
+    fn container_type_icons_hover_does_not_open_and_closes_existing_preview() {
+        let mut env = crate::app::tests::phase_c_support::setup_app();
+        let app = &mut env.app;
+        let ctx = egui::Context::default();
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.settings.thumb_container_type_icon_only = true;
+        app.items = vec![GridItem::Folder("c:/shelf/book".into())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        let anchor = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(32.0, 32.0));
+        for already_open in [false, true] {
+            app.details_hover_thumb_viewport_open = already_open;
+            app.render_details_thumbnail_tooltip(&ctx, Some((0, anchor)));
+            assert!(!app.details_hover_thumb_viewport_open);
+            assert_eq!(app.details_hover_thumb_idx, None);
+            assert!(app.requested.is_empty());
+            assert!(matches!(app.thumbnails[0], ThumbnailState::Pending));
         }
     }
 }

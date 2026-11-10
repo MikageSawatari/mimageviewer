@@ -103,6 +103,7 @@ pub(super) enum FirstDisplayAction {
     Zip {
         has_foreign_archives: bool,
     },
+    ArchiveBook(super::DeferredFsReopen),
     WarmPdf,
     Pdf {
         pages: crate::pdf_loader::PdfEnumerateResult,
@@ -143,7 +144,10 @@ pub(crate) struct SidecarLoadContinuation {
 
 impl SidecarLoadContinuation {
     fn fullscreen_reopen_pending(&self) -> bool {
-        match &self.navigation_after_hydration {
+        matches!(
+            self.first_display_action,
+            FirstDisplayAction::ArchiveBook(_)
+        ) || match &self.navigation_after_hydration {
             Some(super::MainListAfterHydration::Dfs { continuation, .. }) => {
                 continuation.fullscreen
             }
@@ -206,17 +210,29 @@ impl DeferredFullscreen {
     }
 }
 
+#[derive(Default)]
+pub(super) enum IndexOnlyAfterPrepare {
+    #[default]
+    None,
+    OpenArchiveBook(DeferredFsReopen),
+}
+
 enum ContinuationOwner {
     Live(SidecarLoadContinuation),
-    IndexOnly { cancel: Arc<AtomicBool> },
-    Discarded { cancel: Arc<AtomicBool> },
+    IndexOnly {
+        cancel: Arc<AtomicBool>,
+        after_prepare: IndexOnlyAfterPrepare,
+    },
+    Discarded {
+        cancel: Arc<AtomicBool>,
+    },
 }
 
 impl ContinuationOwner {
     fn cancel(&self) -> &Arc<AtomicBool> {
         match self {
             Self::Live(continuation) => &continuation.cancel,
-            Self::IndexOnly { cancel } | Self::Discarded { cancel } => cancel,
+            Self::IndexOnly { cancel, .. } | Self::Discarded { cancel } => cancel,
         }
     }
 
@@ -665,6 +681,18 @@ impl SidecarRestoreState {
         if !self.target_matches(context, generation) {
             return false;
         }
+        if let ContinuationOwner::IndexOnly { after_prepare, .. } = &mut self.common.continuation {
+            // A manual exact page open supersedes the automatic book demand.
+            *after_prepare = IndexOnlyAfterPrepare::None;
+        }
+        if let ContinuationOwner::Live(continuation) = &mut self.common.continuation
+            && matches!(
+                continuation.first_display_action,
+                FirstDisplayAction::ArchiveBook(_)
+            )
+        {
+            continuation.first_display_action = FirstDisplayAction::None;
+        }
         self.common.deferred_fullscreen = Some(DeferredFullscreen {
             idx,
             trigger,
@@ -806,11 +834,19 @@ impl App {
     pub(crate) fn sidecar_restore_navigation_fullscreen_wait_active(&self) -> bool {
         self.sidecar_restore.as_ref().is_some_and(|state| {
             self.sidecar_restore_context_current(&state.common)
-                && matches!(&state.common.continuation,
-                    ContinuationOwner::Live(continuation)
-                        if continuation.items_len == self.items.len()
-                            && !continuation.cancel.load(Ordering::Relaxed)
-                            && continuation.fullscreen_reopen_pending())
+                && match &state.common.continuation {
+                    ContinuationOwner::Live(continuation) => continuation.items_len == self.items.len()
+                        && !continuation.cancel.load(Ordering::Relaxed)
+                        && continuation.fullscreen_reopen_pending()
+                        && match &continuation.first_display_action {
+                            FirstDisplayAction::ArchiveBook(deferred) => matches!(&deferred.target,
+                                DeferredFsTarget::CurrentArchiveBook(target) if self.archive_book_target_is_current(target)),
+                            _ => true,
+                        },
+                    ContinuationOwner::IndexOnly { cancel, after_prepare: IndexOnlyAfterPrepare::OpenArchiveBook(deferred) } =>
+                        !cancel.load(Ordering::Relaxed) && matches!(&deferred.target, DeferredFsTarget::CurrentArchiveBook(target) if self.archive_book_target_is_current(target)),
+                    _ => false,
+                }
         })
     }
 
@@ -826,11 +862,20 @@ impl App {
         }
         let common = &mut self.sidecar_restore.as_mut().unwrap().common;
         common.deferred_fullscreen = None;
+        if let ContinuationOwner::IndexOnly { after_prepare, .. } = &mut common.continuation {
+            *after_prepare = IndexOnlyAfterPrepare::None;
+        }
         if let ContinuationOwner::Live(continuation) = &mut common.continuation
             && continuation.fullscreen_reopen_pending()
         {
             // Drop the DFS tail as well: queued navigation must not restart a closed viewer.
             continuation.navigation_after_hydration = None;
+            if matches!(
+                continuation.first_display_action,
+                FirstDisplayAction::ArchiveBook(_)
+            ) {
+                continuation.first_display_action = FirstDisplayAction::None;
+            }
         }
     }
 
@@ -860,7 +905,7 @@ impl App {
         .then_some(deferred.idx)
     }
 
-    /// The accepted detached folder owns its first display until index/hydration completion.
+    /// The accepted detached book owns its first display until index/hydration completion.
     /// An ordinary grid, stale source, or discarded continuation cannot keep its shell alive.
     pub(crate) fn sidecar_restore_detached_auto_fullscreen_wait_active(&self) -> bool {
         self.sidecar_restore.as_ref().is_some_and(|state| {
@@ -868,8 +913,12 @@ impl App {
                 && matches!(&state.common.continuation,
                     ContinuationOwner::Live(continuation)
                         if continuation.detached_physical
-                            && matches!(continuation.first_display_action,
-                                FirstDisplayAction::AutoFullscreenFolder)
+                            && match &continuation.first_display_action {
+                                FirstDisplayAction::AutoFullscreenFolder => true,
+                                FirstDisplayAction::ArchiveBook(deferred) => matches!(&deferred.target,
+                                    DeferredFsTarget::CurrentArchiveBook(target) if self.archive_book_target_is_current(target)),
+                                _ => false,
+                            }
                             && continuation.items_len == self.items.len()
                             && !continuation.cancel.load(Ordering::Relaxed))
         })
@@ -1191,7 +1240,10 @@ impl App {
             {
                 // Acceptance consumes the older demand now. Cancelling this Rating target
                 // later must not revive first-display navigation at hydration completion.
-                if continuation.first_display_action == FirstDisplayAction::AutoFullscreenFolder {
+                if matches!(
+                    continuation.first_display_action,
+                    FirstDisplayAction::AutoFullscreenFolder | FirstDisplayAction::ArchiveBook(_)
+                ) {
                     continuation.first_display_action = FirstDisplayAction::None;
                 }
                 if matches!(
@@ -1474,6 +1526,41 @@ impl App {
         );
     }
 
+    pub(super) fn attach_archive_book_index_continuation(
+        &mut self,
+        deferred: DeferredFsReopen,
+    ) -> bool {
+        let Some(state) = self.sidecar_restore.as_ref() else {
+            return false;
+        };
+        if !self.sidecar_restore_context_current(&state.common) {
+            return false;
+        }
+        // A/a share a composition scope, but are distinct resume books. A new
+        // book-open request always owns a fresh FIFO read, even in that case.
+        let restore = state
+            .common
+            .book_restore
+            .is_none()
+            .then(|| state.common.request_id);
+        let restore = restore.and_then(|request_id| self.begin_book_shift_restore(request_id));
+        let state = self.sidecar_restore.as_mut().unwrap();
+        if restore.is_some() {
+            state.common.book_restore = restore;
+        }
+        if let ContinuationOwner::IndexOnly {
+            after_prepare,
+            cancel,
+        } = &mut state.common.continuation
+        {
+            if !cancel.load(Ordering::Relaxed) {
+                *after_prepare = IndexOnlyAfterPrepare::OpenArchiveBook(deferred);
+                return true;
+            }
+        }
+        false
+    }
+
     pub(crate) fn prepare_current_listing_page_identity_index(
         &mut self,
         policy: crate::file_type_visibility::FileTypeVisibility,
@@ -1571,7 +1658,10 @@ impl App {
                 },
                 tag_item_keys: Vec::new(),
                 source_path,
-                continuation: ContinuationOwner::IndexOnly { cancel },
+                continuation: ContinuationOwner::IndexOnly {
+                    cancel,
+                    after_prepare: IndexOnlyAfterPrepare::None,
+                },
                 deferred_fullscreen: None,
                 favorite_failures: Vec::new(),
                 warning: None,
@@ -2574,10 +2664,11 @@ impl App {
             return;
         }
 
-        if matches!(
-            state.common.continuation,
-            ContinuationOwner::IndexOnly { .. }
-        ) {
+        if let ContinuationOwner::IndexOnly { after_prepare, .. } = &mut state.common.continuation {
+            let mut after_prepare = std::mem::take(after_prepare);
+            if let IndexOnlyAfterPrepare::OpenArchiveBook(deferred) = &mut after_prepare {
+                self.capture_deferred_book_resume(deferred);
+            }
             if let Some(warning) = state.common.warning.take() {
                 crate::logger::log(format!("snapshot page index preparation: {warning}"));
                 self.show_feedback_warning(warning);
@@ -2601,6 +2692,9 @@ impl App {
                 }
             }
             self.spread_shift.finish_fenced_book_resume();
+            if let IndexOnlyAfterPrepare::OpenArchiveBook(deferred) = after_prepare {
+                self.complete_deferred_book_composition_open(deferred);
+            }
             ctx.request_repaint();
             return;
         }
@@ -2619,7 +2713,14 @@ impl App {
         let continuation = state.common.continuation.take_live();
         let continuation_discarded = continuation.is_none();
         self.resume_metadata_transfer_context_readers();
-        if let Some(continuation) = continuation {
+        if let Some(mut continuation) = continuation {
+            if let FirstDisplayAction::ArchiveBook(deferred) =
+                &mut continuation.first_display_action
+            {
+                // Keep the request's saved/unsaved position from this hydration fence before
+                // first display can transfer it to composition or retire the fenced result.
+                self.capture_deferred_book_resume(deferred);
+            }
             self.resume_loading_items_after_sidecar(continuation);
         }
         for command in favorite_failures {
@@ -4018,6 +4119,7 @@ mod tests {
             let state = app.sidecar_restore.as_mut().unwrap();
             state.common.continuation = ContinuationOwner::IndexOnly {
                 cancel: Arc::new(AtomicBool::new(false)),
+                after_prepare: IndexOnlyAfterPrepare::None,
             };
             state.phase = Phase::PreparingPageIndex(PreparingPageIndex {
                 rx,
@@ -4148,7 +4250,7 @@ mod tests {
                         history_trigger: HistoryTrigger::UserChosen,
                         resume_slideshow: false,
                         target: crate::app::DeferredFsTarget::None,
-                        resume_to_last_page: true,
+                        resume_to_last_page: (true).into(),
                         from_explicit_open: true,
                         preserve_after_password_prompt: false,
                     });
@@ -4995,10 +5097,11 @@ mod tests {
                 app.sidecar_restore.as_mut().unwrap().common.continuation =
                     ContinuationOwner::IndexOnly {
                         cancel: Arc::new(AtomicBool::new(false)),
+                        after_prepare: IndexOnlyAfterPrepare::None,
                     };
             }
             let notice = BookResumeNotice {
-                path: folder,
+                label: crate::book_resume_key::BookResumeKey::legacy(&(folder)).display_label(),
                 resolution: file_type_resume::PositionResolution::LegacyWithExclusions,
             };
             app.open_fullscreen_with_resume_notice(
@@ -5279,6 +5382,7 @@ mod tests {
                     app.sidecar_restore.as_mut().unwrap().common.continuation =
                         ContinuationOwner::IndexOnly {
                             cancel: Arc::new(AtomicBool::new(false)),
+                            after_prepare: IndexOnlyAfterPrepare::None,
                         }
                 }
                 _ => {}

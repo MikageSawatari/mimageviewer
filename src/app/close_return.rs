@@ -9,28 +9,43 @@ pub(crate) enum ViewerCloseCause {
     AppExit,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FullscreenCloseDestination {
+    CurrentList,
+    ChosenZipList,
+}
+
 #[derive(Debug, Default)]
 pub(crate) enum FullscreenCloseContinuation {
     #[default]
     None,
     Live,
+    LiveZipListReturn(crate::zip_tree::ZipListReturnPlan),
     Terminal(Box<CloseReturn>),
+    IssuedZipListReturn(archive_inner_book::ZipListReturnOwner),
 }
 
 impl FullscreenCloseContinuation {
+    pub(super) fn is_live(&self) -> bool {
+        matches!(self, Self::Live | Self::LiveZipListReturn(_))
+    }
     pub(crate) fn is_pending(&self) -> bool {
-        matches!(self, Self::Live | Self::Terminal(_))
+        self.is_live() || matches!(self, Self::Terminal(_))
+    }
+    pub(super) fn has_accepted_request(&self) -> bool {
+        self.is_pending()
+            || matches!(self, Self::IssuedZipListReturn(owner) if owner.has_outstanding_tickets())
     }
     pub(crate) fn clear(&mut self) {
         *self = Self::None;
     }
     pub(crate) fn request_live(&mut self) {
-        if !matches!(self, Self::Terminal(_)) {
+        if !self.has_accepted_request() {
             *self = Self::Live;
         }
     }
     pub(super) fn cancel_live_request(&mut self) {
-        if matches!(self, Self::Live) {
+        if self.is_live() {
             self.clear();
         }
     }
@@ -60,6 +75,107 @@ enum CloseReturnEffect {
 }
 
 impl App {
+    /// The accepted None -> Some reader transition ends only this context's
+    /// Zip return. Other navigation variants keep their existing contract.
+    pub(super) fn retire_zip_close_return_for_reader_acceptance(&mut self) {
+        let is_zip_return = match &self.pending_return_to_parent {
+            FullscreenCloseContinuation::LiveZipListReturn(_)
+            | FullscreenCloseContinuation::IssuedZipListReturn(_) => true,
+            FullscreenCloseContinuation::Terminal(request) => matches!(
+                request.effect,
+                CloseReturnEffect::Navigation {
+                    nav: crate::ui_main::AddressBarNav::ZipListReturn(_),
+                    ..
+                }
+            ),
+            _ => false,
+        };
+        if is_zip_return {
+            self.pending_return_to_parent.clear();
+            crate::logger::log(
+                "archive list return retired: new reader accepted in owning context",
+            );
+        }
+    }
+
+    pub(super) fn consume_issued_zip_list_return(
+        &mut self,
+        ticket: &archive_inner_book::ZipListReturnTicket,
+    ) -> Option<crate::zip_tree::ZipListReturnPlan> {
+        if matches!(&self.pending_return_to_parent,
+            FullscreenCloseContinuation::IssuedZipListReturn(owner) if owner.accepts(ticket))
+        {
+            let FullscreenCloseContinuation::IssuedZipListReturn(owner) =
+                std::mem::take(&mut self.pending_return_to_parent)
+            else {
+                unreachable!()
+            };
+            Some(owner.into_plan())
+        } else {
+            None
+        }
+    }
+
+    fn issue_zip_list_return_navigation(
+        &mut self,
+        nav: crate::ui_main::AddressBarNav,
+    ) -> crate::ui_main::AddressBarNav {
+        let crate::ui_main::AddressBarNav::ZipListReturn(request) = nav else {
+            return nav;
+        };
+        let (owner, request) = match request {
+            ZipListReturnRequest::PreparedLive(plan) => {
+                let owner = archive_inner_book::ZipListReturnOwner::new(plan);
+                let request = ZipListReturnRequest::Live {
+                    ticket: owner.ticket(),
+                };
+                (owner, request)
+            }
+            ZipListReturnRequest::PreparedTerminal(plan) => {
+                let owner = archive_inner_book::ZipListReturnOwner::new(plan);
+                let request = ZipListReturnRequest::Terminal {
+                    ticket: owner.ticket(),
+                };
+                (owner, request)
+            }
+            // Re-delivery must never renew an already-issued ticket.
+            issued
+            @ (ZipListReturnRequest::Live { .. } | ZipListReturnRequest::Terminal { .. }) => {
+                return crate::ui_main::AddressBarNav::ZipListReturn(issued);
+            }
+        };
+        self.pending_return_to_parent = FullscreenCloseContinuation::IssuedZipListReturn(owner);
+        crate::ui_main::AddressBarNav::ZipListReturn(request)
+    }
+
+    /// A captured Terminal recipe still has to be current when its reader is
+    /// torn down. Later delivery cannot repair a stale bookmark-preserve policy.
+    pub(super) fn fullscreen_close_destination(&self) -> FullscreenCloseDestination {
+        if self.projected_viewer_context_id() != self.viewer_context_main() {
+            return FullscreenCloseDestination::CurrentList;
+        }
+        let plan = match &self.pending_return_to_parent {
+            FullscreenCloseContinuation::Terminal(request) => match &request.effect {
+                CloseReturnEffect::Navigation {
+                    nav: crate::ui_main::AddressBarNav::ZipListReturn(request),
+                    ..
+                } => request.prepared_plan(),
+                _ => None,
+            },
+            FullscreenCloseContinuation::IssuedZipListReturn(owner)
+                if owner.has_outstanding_tickets() =>
+            {
+                Some(owner.plan())
+            }
+            _ => None,
+        };
+        if plan.is_some_and(|plan| self.zip_list_return_stale_reason(plan).is_none()) {
+            FullscreenCloseDestination::ChosenZipList
+        } else {
+            FullscreenCloseDestination::CurrentList
+        }
+    }
+
     /// Capture existing navigation identity without taking selection or adopting rows.
     pub(super) fn close_return_origin(&self) -> Option<CloseReturnOrigin> {
         if self.projected_viewer_context_id() != self.viewer_context_main() {
@@ -126,7 +242,28 @@ impl App {
             let Some(origin) = app.close_return_origin() else {
                 return;
             };
-            let parent = if app.bookmark_view_back_nav().is_some()
+            if matches!(app.pending_return_to_parent, FullscreenCloseContinuation::Terminal(_))
+                || matches!(&app.pending_return_to_parent,
+                    FullscreenCloseContinuation::IssuedZipListReturn(owner) if owner.has_outstanding_tickets()) {
+                return;
+            }
+            let parent = if matches!(
+                app.pending_return_to_parent,
+                FullscreenCloseContinuation::LiveZipListReturn(_)
+            ) {
+                let FullscreenCloseContinuation::LiveZipListReturn(plan) =
+                    std::mem::take(&mut app.pending_return_to_parent)
+                else {
+                    unreachable!()
+                };
+                Some((
+                    crate::ui_main::AddressBarNav::ZipListReturn(
+                        ZipListReturnRequest::PreparedTerminal(plan),
+                    ),
+                    None,
+                ))
+            } else if app.chosen_zip_list_return().is_some()
+                || app.bookmark_view_back_nav().is_some()
                 || app.auto_open_for_current_container()
             {
                 app.resolve_close_return_navigation()
@@ -136,7 +273,12 @@ impl App {
             let Some((nav, selection)) = parent else {
                 return;
             };
-            let effect = if let Some(BookmarkViewState::Opening { target, grid }) =
+            let effect = if let crate::ui_main::AddressBarNav::ZipListReturn(request) = nav {
+                CloseReturnEffect::Navigation {
+                    nav: crate::ui_main::AddressBarNav::ZipListReturn(request.into_terminal()),
+                    select_after_load: selection,
+                }
+            } else if let Some(BookmarkViewState::Opening { target, grid }) =
                 app.bookmark_view_state.as_ref()
             {
                 let target = target.clone();
@@ -215,6 +357,14 @@ impl App {
     pub(super) fn resolve_close_return_navigation(
         &self,
     ) -> Option<(crate::ui_main::AddressBarNav, Option<String>)> {
+        if let Some(plan) = self.chosen_zip_list_return() {
+            return Some((
+                crate::ui_main::AddressBarNav::ZipListReturn(ZipListReturnRequest::PreparedLive(
+                    plan,
+                )),
+                None,
+            ));
+        }
         if self.everything_book_close_return_available() {
             // The accepted Search owner holds the logical source and full-path anchor,
             // including converted books. Never infer this return from a cache's parent.
@@ -253,8 +403,16 @@ impl App {
 
     pub(super) fn take_close_return_navigation(&mut self) -> Option<crate::ui_main::AddressBarNav> {
         use FullscreenCloseContinuation as State;
-        match std::mem::take(&mut self.pending_return_to_parent) {
+        // Input and post-render dispatch may both poll in one frame. A taken
+        // return keeps its authority until execution or a new reader/admission.
+        if matches!(self.pending_return_to_parent, State::IssuedZipListReturn(_)) {
+            return None;
+        }
+        let nav = match std::mem::take(&mut self.pending_return_to_parent) {
             State::None => None,
+            State::LiveZipListReturn(plan) => Some(crate::ui_main::AddressBarNav::ZipListReturn(
+                ZipListReturnRequest::PreparedLive(plan),
+            )),
             State::Live => {
                 if let Some((nav, selection)) = self.resolve_close_return_navigation() {
                     if selection.is_some() {
@@ -288,6 +446,11 @@ impl App {
                     }
                 }
             }
-        }
+            State::IssuedZipListReturn(owner) => {
+                self.pending_return_to_parent = State::IssuedZipListReturn(owner);
+                None
+            }
+        }?;
+        Some(self.issue_zip_list_return_navigation(nav))
     }
 }

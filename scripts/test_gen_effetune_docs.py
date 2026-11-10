@@ -8,10 +8,71 @@ import shutil
 import unittest
 import uuid
 from unittest.mock import patch
+from urllib.parse import urlsplit
 
 SPEC = importlib.util.spec_from_file_location('effetune_docs', Path(__file__).with_name('gen-effetune-docs.py'))
 docs = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(docs)
+
+
+class RewriteEmulator:
+    """Only the mod_rewrite directives/flags used in this site's .htaccess.
+
+    Match each per-directory Rule before its Conds, so $N is available there.
+    OR groups short-circuit; %N belongs to the last successful condition.
+    No filesystem is consulted (including obsolete files left on the server).
+    """
+    def __init__(self, data):
+        self.rules = []
+        conditions = []
+        for line in data.decode().splitlines():
+            fields = line.split()
+            if not fields or fields[0] not in {'RewriteCond', 'RewriteRule'}:
+                continue
+            directive, value, pattern, *flags = fields
+            if directive == 'RewriteCond':
+                options = flags[0].strip('[]').split(',') if flags else []
+                assert set(options) <= {'OR', 'NC'}, options
+                negative = pattern.startswith('!')
+                conditions.append((value, re.compile(pattern[1:] if negative else pattern,
+                                                     re.I if 'NC' in options else 0),
+                                   negative, 'OR' in options))
+            else:
+                assert flags == ['[R=301,L]'], flags
+                self.rules.append((re.compile(value), pattern, conditions))
+                conditions = []
+        assert not conditions
+
+    @staticmethod
+    def expand(value, rule_match, condition_match=None):
+        def capture(match):
+            source = rule_match if match[1] == '$' else condition_match
+            group = int(match[2])
+            return (source[group] or '') if source and group <= source.re.groups else ''
+        return re.sub(r'([$%])([0-9])', capture, value)
+
+    def redirect(self, path, host='mikage.to'):
+        for pattern, target, conditions in self.rules:
+            rule_match = pattern.search(path)
+            if not rule_match:
+                continue
+            condition_match = None
+            allowed, group_ok = True, False
+            for value, regex, negative, or_next in conditions:
+                if not group_ok:
+                    value = value.replace('%{HTTP_HOST}', host)
+                    match = regex.search(self.expand(value, rule_match, condition_match))
+                    group_ok = (match is None) if negative else (match is not None)
+                    if group_ok and not negative:
+                        condition_match = match
+                if not or_next:
+                    if not group_ok:
+                        allowed = False
+                        break
+                    group_ok = False
+            if allowed:
+                return self.expand(target, rule_match, condition_match)
+        return None
 
 
 @contextlib.contextmanager
@@ -178,7 +239,7 @@ class GenerationTests(unittest.TestCase):
                 continue
             page = data.decode()
             with self.subTest(page=name):
-                self.assertIn('manual/sound/v0.15.0-miv.7/' + name, page)
+                self.assertIn('manual/sound/' + name, page)
                 self.assertIn('EffeTune / EffeTune Mixwright (作者: Frieve、MIT License)', page)
                 self.assertIn('<a href="https://github.com/MikageSawatari/miv-sound">mIV Sound のソース</a>', page)
                 self.assertIn('https://github.com/Frieve-A/effetune/tree/c506bbab8a3dcd75bc5049ebb9b92572b526c557/docs/i18n/ja', page)
@@ -212,11 +273,11 @@ class GenerationTests(unittest.TestCase):
         self.assertEqual(len(output), 137)  # 20 category/guide/index/license + 113 plugin pages + 4 images
         for name, data in output.items():
             with self.subTest(name=name):
-                self.assertEqual((docs.MANUAL / 'sound/v0.15.0-miv.7' / name).read_bytes(), data)
+                self.assertEqual((docs.MANUAL / 'sound' / name).read_bytes(), data)
                 if name.endswith('.html'):
                     text = data.decode()
                     self.assertNotIn('sidebar-section', text)
-                    self.assertIn('href="../../style.css"', text)
+                    self.assertIn('href="../style.css"', text)
                     self.assertIn('href="license.html"', text)
                     self.assertIn('c506bbab8a3dcd75bc5049ebb9b92572b526c557', text)
                     self.assertNotIn('{%', text)
@@ -383,14 +444,58 @@ class GenerationTests(unittest.TestCase):
         self.assertNotIn('曲の頭から解析が自動でやり直されます', rhythm)
         self.assertNotIn('ほかのアプリで曲を切り替えたときなどに使います', rhythm)
 
-    def test_entry_redirect(self):
-        text = docs.entry_page('v0.12.0').decode()
-        self.assertIn('<meta name="robots" content="noindex">', text)
-        self.assertIn('<meta http-equiv="refresh" content="0; url=v0.12.0/index.html">', text)
-        self.assertIn('<link rel="canonical" href="https://mikage.to/mimageviewer/manual/sound/v0.12.0/index.html">', text)
-        self.assertIn('<a href="v0.12.0/index.html">', text)
-        self.assertNotEqual(docs.entry_page('v0.12.0'), docs.entry_page('v0.15.0-miv.7'))
-        self.assertEqual((docs.MANUAL / 'sound/index.html').read_bytes(), docs.entry_page('v0.15.0-miv.7'))
+    def test_index_is_self_canonical_contents_without_redirect(self):
+        text = docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.7')['index.html'].decode()
+        self.assertNotIn('noindex', text)
+        self.assertNotIn('refresh', text)
+        self.assertIn('<link rel="canonical" href="https://mikage.to/mimageviewer/manual/sound/index.html">', text)
+        self.assertIn('href="eq-15band-peq.html"', text)
+        self.assertEqual(text.count('mIV Sound v0.15.0-miv.7 の説明です。'), 1)
+
+    def test_version_changes_only_index_body_and_never_urls_or_redirects(self):
+        first_version, second_version = 'v0.15.0-miv.7', 'v1.2.3-beta.1'
+        first = docs.generate(docs.DEFAULT_SOURCE, first_version)
+        with workspace_temporary_directory() as temporary:
+            snapshot = Path(temporary) / 'snapshot'
+            shutil.copytree(docs.DEFAULT_SOURCE, snapshot)
+            provenance = snapshot / 'SOURCE.md'
+            text = provenance.read_text(encoding='utf-8')
+            text, count = re.subn(r'^- mIV Sound: .+$', '- mIV Sound: ' + second_version[1:], text, flags=re.M)
+            self.assertEqual(count, 1)
+            provenance.write_text(text, encoding='utf-8')
+            second = docs.generate(snapshot, second_version)
+        self.assertEqual(set(first), set(second))
+        self.assertEqual(docs.redirect_block(first), docs.redirect_block(second))
+        for name, data in first.items():
+            with self.subTest(name=name):
+                if name.endswith('.html'):
+                    before, after = data.decode(), second[name].decode()
+                    self.assertEqual(re.findall(r'<link rel="canonical" href="([^"]+)"', before),
+                                     re.findall(r'<link rel="canonical" href="([^"]+)"', after))
+                    self.assertEqual(set(re.findall(r'href="([^"]+)"', before)),
+                                     set(re.findall(r'href="([^"]+)"', after)))
+                if name == 'index.html':
+                    self.assertEqual(data.replace(first_version.encode(), second_version.encode()), second[name])
+                    self.assertNotEqual(data, second[name])
+                else:
+                    self.assertNotIn(first_version.encode(), data)
+                    self.assertEqual(data, second[name])
+
+    def test_parent_links_resolve_at_fixed_depth_and_missing_links_fail(self):
+        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.7')
+        for name, data in output.items():
+            if not name.endswith('.html'):
+                continue
+            text = data.decode()
+            for target in ['../effetune.html', '../index.html', '../style.css', '../../index.html']:
+                with self.subTest(name=name, target=target):
+                    self.assertIn('href="' + target + '"', text)
+                    self.assertTrue((docs.MANUAL / 'sound' / target).resolve().is_file())
+        original = docs.chrome
+        def broken(*args, **kwargs):
+            return original(*args, **kwargs).replace('../effetune.html', '../missing.html')
+        with patch.object(docs, 'chrome', side_effect=broken), self.assertRaisesRegex(docs.ConversionError, 'Broken generated link'):
+            docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.7')
 
     def test_check_exit_status_and_version_fallback_without_writes(self):
         with workspace_temporary_directory() as temporary:
@@ -403,35 +508,31 @@ class GenerationTests(unittest.TestCase):
                 self.assertEqual(run('--version', 'v0.12.0', '--check'), 1)
                 self.assertFalse((root / 'manual').exists())
                 self.assertEqual(run('--version', 'v0.12.0'), 0)
-                output = root / 'manual/sound/v0.12.0/index.html'
-                entry = root / 'manual/sound/index.html'
+                output = root / 'manual/sound/index.html'
                 self.assertEqual(run('--version', 'v0.12.0', '--check'), 0)
-                self.assertEqual(entry.read_bytes(), docs.entry_page('v0.12.0'))
-                entry.unlink()
+                self.assertEqual(output.read_bytes(), b'current')
+                output.unlink()
                 self.assertEqual(run('--version', 'v0.12.0', '--check'), 1)
-                self.assertFalse(entry.exists())
-                self.assertEqual(run('--version', 'v0.12.0'), 0)
-                entry.write_bytes(b'stale entry')
-                self.assertEqual(run('--version', 'v0.12.0', '--check'), 1)
-                self.assertEqual(entry.read_bytes(), b'stale entry')
+                self.assertFalse(output.exists())
                 self.assertEqual(run('--version', 'v0.12.0'), 0)
                 output.write_bytes(b'stale')
                 self.assertEqual(run('--version', 'v0.12.0', '--check'), 1)
                 self.assertEqual(output.read_bytes(), b'stale')
-                output.write_bytes(b'current')
-                output.with_name('obsolete.html').write_bytes(b'extra')
+                self.assertEqual(run('--version', 'v0.12.0'), 0)
+                extra = output.with_name('obsolete.html')
+                extra.write_bytes(b'extra')
+                before = {p.relative_to(root): p.read_bytes() for p in root.rglob('*') if p.is_file()}
                 self.assertEqual(run('--version', 'v0.12.0', '--check'), 1)
                 self.assertEqual(run('--version', 'v0.12.0'), 1)
+                self.assertEqual({p.relative_to(root): p.read_bytes() for p in root.rglob('*') if p.is_file()}, before)
+                extra.unlink()
                 vendor = root / 'config'
                 vendor.mkdir(parents=True)
-                (vendor / 'miv-sound.rs').write_text('pub const VERSION: &str = \"0.15.0-miv.7\";\npub const DOCS_VERSION: &str = \"v0.15.0\";\n', encoding='utf-8')
+                (vendor / 'miv-sound.rs').write_text('pub const VERSION: &str = "0.15.0-miv.7";\npub const DOCS_VERSION: &str = "v0.15.0";\n', encoding='utf-8')
                 self.assertEqual(run('--version', 'v0.12.0'), 0)
-                self.assertTrue((root / 'manual/sound/v0.15.0-miv.7/index.html').exists())
-                self.assertEqual(entry.read_bytes(), docs.entry_page('v0.15.0-miv.7'))
-                self.assertEqual(output.read_bytes(), b'current')  # Check mode flags old versions without deleting them.
-                self.assertEqual(run('--check'), 1)
-                shutil.rmtree(output.parent)
+                self.assertEqual(output.read_bytes(), b'current')
                 self.assertEqual(run('--check'), 0)
+                self.assertEqual(docs.generate.call_args.args[1:], ('v0.15.0-miv.7', 'v0.15.0'))
 
     def test_check_rejects_legacy_tree_without_removing_it(self):
         with workspace_temporary_directory() as temporary:
@@ -444,14 +545,19 @@ class GenerationTests(unittest.TestCase):
                 self.assertEqual(run(), 0)
                 legacy = root / 'manual/effetune'
                 legacy.mkdir()
+                (legacy / 'preserve.html').write_bytes(b'legacy')
+                before = {p.relative_to(root): p.read_bytes() for p in root.rglob('*') if p.is_file()}
                 self.assertEqual(run('--check'), 1)
-                self.assertTrue(legacy.exists())
+                self.assertEqual({p.relative_to(root): p.read_bytes() for p in root.rglob('*') if p.is_file()}, before)
+                self.assertEqual(run(), 0)  # Warn, but never delete legacy output.
+                self.assertEqual((legacy / 'preserve.html').read_bytes(), b'legacy')
+                (legacy / 'preserve.html').unlink()
                 legacy.rmdir()
                 self.assertEqual(run('--check'), 0)
                 htaccess = root / '.htaccess'
                 original = htaccess.read_bytes()
-                self.assertIn(b'/v0.15.0-miv.7/%1 [R=301,L]', original)
-                htaccess.write_bytes(original.replace(b'v0.15.0-miv.7/%1', b'v0.12.0/%1'))
+                self.assertIn(b'/sound/%1 [R=301,L]', original)
+                htaccess.write_bytes(original.replace(b'/sound/%1', b'/sound/stale/%1'))
                 self.assertEqual(run('--check'), 1)
                 self.assertNotEqual(htaccess.read_bytes(), original)
                 self.assertEqual(run(), 0)
@@ -472,12 +578,19 @@ class GenerationTests(unittest.TestCase):
                 (base / 'notes').mkdir()
                 self.assertEqual(run('--check'), 0)
                 before = htaccess.read_bytes()
-                for name in ['v0.13.0', 'v0.12.0', 'v0.15.0-beta.1', 'v-archive']:
+                for name in ['v0.15.0-miv.7', 'v0.13.0', 'v0.12.0', 'v0.15.0-beta.1', 'v-archive']:
                     old = base / name
                     old.mkdir()
                     self.assertEqual(run('--check'), 1)
                     self.assertTrue(old.is_dir())
                     self.assertEqual(htaccess.read_bytes(), before)
+                    (old / 'preserve.html').write_bytes(b'old')
+                    all_before = {p.relative_to(root): p.read_bytes() for p in root.rglob('*') if p.is_file()}
+                    self.assertEqual(run('--check'), 1)
+                    self.assertEqual({p.relative_to(root): p.read_bytes() for p in root.rglob('*') if p.is_file()}, all_before)
+                    self.assertEqual(run(), 0)  # Version trees aren't arbitrary extras.
+                    self.assertEqual((old / 'preserve.html').read_bytes(), b'old')
+                    (old / 'preserve.html').unlink()
                     old.rmdir()
                 self.assertEqual(run('--check'), 0)
 
@@ -487,65 +600,62 @@ class RedirectTests(unittest.TestCase):
 
     def test_redirects_cover_all_legacy_files_and_entries_without_loops(self):
         output = docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.7')
-        lines = [line.split() for line in docs.redirect_block('v0.15.0-miv.7', output).splitlines() if line.strip().startswith('Rewrite')]
-        keep, fallback, legacy, entry, sound_keep, sound_fallback, sound = lines
-        self.assertEqual(keep, sound_keep)
-        self.assertEqual(fallback, sound_fallback)
-        for rule in [legacy, entry, sound]:
-            self.assertEqual(rule[3], '[R=301,L]')
-
-        def target(path):
-            for rule in [legacy, entry, sound]:
-                match = re.fullmatch(rule[1], path)
-                if match:
-                    if rule == entry:
-                        return rule[2]
-                    condition = re.fullmatch(keep[2], match[1] or '') or re.fullmatch(fallback[2], fallback[1])
-                    return rule[2].replace('%1', condition[1])
-            return None
-
-        current = 'https://mikage.to/mimageviewer/manual/sound/v0.15.0-miv.7/'
-        # Every actually published old file, including images, must redirect.
-        previous = docs.MANUAL / 'effetune/v0.15.0'
-        old_files = {p.relative_to(previous).as_posix() for p in previous.rglob('*') if p.is_file()}
-        # Inventory remains checked after old generated files are removed.
+        configurations = [docs.updated_htaccess(self.HTACCESS, output),
+                          (docs.MANUAL.parent / '.htaccess').read_bytes()]
+        current = 'https://mikage.to/mimageviewer/manual/sound/'
+        cases = {}
         self.assertEqual(len(output), 137)
         for base in ['manual/effetune/', 'manual/sound/']:
-            for version in ['v0.15.0-miv.6', 'v0.15.0-miv.5', 'v0.15.0-miv.4', 'v0.15.0-miv.3', 'v0.15.0-miv.2', 'v0.15.0', 'v0.14.0', 'v0.13.0', 'v0.12.0', 'v0.11.1', 'v1.2.3-beta.1']:
-                for name in set(output) | old_files:
-                    with self.subTest(base=base, version=version, name=name):
-                        self.assertEqual(target(base + version + '/' + name), current + (name if name in output else 'index.html'))
-                for removed in ['', '/', '/removed.html', '/nested/removed.html', '/eq-15band-peq.html/extra', '/images/missing.png']:
-                    self.assertEqual(target(base + version + removed), current + 'index.html')
-        for name in output:
-            self.assertEqual(target('manual/effetune/v0.15.0-miv.7/' + name), current + name)
-            self.assertIsNone(target('manual/sound/v0.15.0-miv.7/' + name))
-        for path in ['manual/effetune', 'manual/effetune/', 'manual/effetune/index.html']:
-            self.assertEqual(target(path), current + 'index.html')
-        for path in ['manual/effetune.html', 'manual/sound/index.html', 'manual/sound/v0.15.0-miv.7', 'manual/effetune/vfoo/index.html', 'manual/other/v0.12.0/index.html']:
-            self.assertIsNone(target(path))
+            for version in ['v0.15.0-miv.7', 'v0.15.0-miv.6', 'v0.15.0', 'v0.14.0', 'v0.13.0', 'v0.12.0', 'v0.11.1', 'v1.2.3-beta.1']:
+                for name in output:
+                    cases[base + version + '/' + name] = current + name
+                for removed in ['', '/', '//', '/removed.html', '/nested/removed.html', '/eq-15band-peq.html/extra', '/images/missing.png']:
+                    cases[base + version + removed] = current + 'index.html'
+        for path in ['manual/effetune', 'manual/effetune/', 'manual/effetune/index.html',
+                     'manual/sound/removed.html', 'manual/sound/images/missing.png',
+                     'manual/sound/nested/removed.html']:
+            cases[path] = current + 'index.html'
+        for data in configurations:
+            emulator = RewriteEmulator(data)
+            for path, expected in cases.items():
+                with self.subTest(path=path, actual_htaccess=data == configurations[1]):
+                    self.assertEqual(emulator.redirect(path), expected)
+                    final_path = urlsplit(expected).path.removeprefix('/mimageviewer/')
+                    self.assertIsNone(emulator.redirect(final_path))
+                    intermediate = emulator.redirect(path, host='www.mikage.to')
+                    self.assertEqual(intermediate, 'https://mikage.to/mimageviewer/' + path)
+                    second_path = urlsplit(intermediate).path.removeprefix('/mimageviewer/')
+                    self.assertEqual(emulator.redirect(second_path), expected)
+                    self.assertIsNone(emulator.redirect(final_path))
+            for path in ['manual/sound/' + name for name in output] + [
+                    'manual/sound/', 'manual/effetune.html',
+                    'manual/effetune/vfoo/index.html', 'manual/other/v0.12.0/index.html']:
+                with self.subTest(unchanged=path):
+                    self.assertIsNone(emulator.redirect(path))
+            self.assertEqual(emulator.redirect('manual/effetune/', host='WWW.MIKAGE.TO'),
+                             'https://mikage.to/mimageviewer/manual/effetune/')
 
     def test_marked_block_updates_only_generated_section_and_keeps_lf(self):
-        first = docs.updated_htaccess(self.HTACCESS, 'v0.14.0', {'index.html': b'', 'retired.html': b''})
-        self.assertEqual(docs.updated_htaccess(first, 'v0.14.0', {'retired.html': b'', 'index.html': b''}), first)
-        second = docs.updated_htaccess(first, 'v0.15.0-miv.7', {'index.html': b''})
+        first = docs.updated_htaccess(self.HTACCESS, {'index.html': b'', 'retired.html': b''})
+        self.assertEqual(docs.updated_htaccess(first, {'retired.html': b'', 'index.html': b''}), first)
+        second = docs.updated_htaccess(first, {'index.html': b''})
         self.assertNotIn(b'v0.14.0', second)
         self.assertNotIn(b'retired', second)
         self.assertEqual(second.count(docs.REDIRECT_BEGIN.encode()), 1)
         start = second.index(docs.REDIRECT_BEGIN.encode())
         end = second.index(docs.REDIRECT_END.encode()) + len(docs.REDIRECT_END) + 1
         self.assertEqual(second[:start] + second[end:], self.HTACCESS.replace(b'</IfModule>', b'\n</IfModule>'))
-        self.assertEqual(docs.updated_htaccess(self.HTACCESS.replace(b'\n', b'\r\n'), 'v0.15.0-miv.7', {'index.html': b''}), second)
+        self.assertEqual(docs.updated_htaccess(self.HTACCESS.replace(b'\n', b'\r\n'), {'index.html': b''}), second)
         self.assertNotIn(b'\r', second)
 
     def test_invalid_configuration_fails_instead_of_overwriting_unrelated_rules(self):
-        block = docs.redirect_block('v0.15.0-miv.7', {'index.html': b''}).encode()
+        block = docs.redirect_block({'index.html': b''}).encode()
         for data in [b'', self.HTACCESS * 2, self.HTACCESS + block,
                      self.HTACCESS.replace(b'</IfModule>', docs.REDIRECT_BEGIN.encode() + b'\n</IfModule>'),
                      self.HTACCESS.replace(b'</IfModule>', block + block + b'</IfModule>'),
                      self.HTACCESS.replace(b'</IfModule>', block.replace(docs.REDIRECT_END.encode(), b'') + b'</IfModule>')]:
             with self.subTest(data=data), self.assertRaises(docs.ConversionError):
-                docs.updated_htaccess(data, 'v0.15.0-miv.7', {'index.html': b''})
+                docs.updated_htaccess(data, {'index.html': b''})
 
 
 class SplitTests(unittest.TestCase):

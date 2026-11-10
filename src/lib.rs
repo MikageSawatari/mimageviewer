@@ -84,6 +84,8 @@ pub mod raw_format;
 pub use app::LocalAiActivityLease;
 pub use app::draw_audio_thumbnail_indicator_snapshot_fixture;
 pub use app::draw_collection_placeholder_snapshot_fixture;
+#[doc(hidden)]
+pub use app::draw_container_type_icon_snapshot_fixture;
 pub use app::draw_thumbnail_filename_width_snapshot_fixture;
 #[doc(hidden)]
 pub use app::draw_thumbnail_name_style_snapshot_fixture;
@@ -125,6 +127,7 @@ pub mod book_composition;
 mod book_fs_journal;
 pub mod book_order;
 pub mod book_resume_db;
+pub mod book_resume_key;
 pub(crate) mod book_scope;
 pub mod bookmark_browser;
 pub mod books;

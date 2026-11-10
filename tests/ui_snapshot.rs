@@ -336,6 +336,17 @@ fn thumbnail_name_style_multiline_dark() {
 }
 
 #[test]
+fn container_type_icon_loaded_grid_dark() {
+    snapshot_with_theme_at_size(
+        "container_type_icon_loaded_grid_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(744.0, 488.0),
+        None,
+        mimageviewer::draw_container_type_icon_snapshot_fixture,
+    );
+}
+
+#[test]
 fn toolbar_pinned_search_light() {
     snapshot_with_theme_at_size(
         "toolbar_pinned_search_light",

@@ -1238,6 +1238,12 @@ impl App {
                 higher_priority_direct_nav
             } else if let Some(nav) = input_nav.or(address_nav) {
                 match nav {
+                    crate::ui_main::AddressBarNav::ZipListReturn(plan) => {
+                        self.apply_fullscreen_close_nav_immediate(
+                            crate::ui_main::AddressBarNav::ZipListReturn(plan),
+                        );
+                        None
+                    }
                     crate::ui_main::AddressBarNav::Direct(path, restore_intent) => {
                         navigate_restore_intent = restore_intent;
                         Some(path)
@@ -1329,6 +1335,12 @@ impl App {
                     } => self
                         .open_grid_container_with_mode(ctx, idx, mode, "grid_context_menu")
                         .and_then(|nav| match nav {
+                            crate::ui_main::AddressBarNav::ZipListReturn(plan) => {
+                                self.apply_fullscreen_close_nav_immediate(
+                                    crate::ui_main::AddressBarNav::ZipListReturn(plan),
+                                );
+                                None
+                            }
                             crate::ui_main::AddressBarNav::Direct(path, restore_intent) => {
                                 navigate_restore_intent = restore_intent;
                                 Some(path)
@@ -1487,6 +1499,12 @@ impl App {
                 }
             } else {
                 match grid_nav {
+                    Some(crate::ui_main::AddressBarNav::ZipListReturn(plan)) => {
+                        self.apply_fullscreen_close_nav_immediate(
+                            crate::ui_main::AddressBarNav::ZipListReturn(plan),
+                        );
+                        None
+                    }
                     Some(crate::ui_main::AddressBarNav::Direct(path, restore_intent)) => {
                         navigate_restore_intent = restore_intent;
                         Some(path)

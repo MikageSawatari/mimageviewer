@@ -1301,7 +1301,7 @@ fn resume_refusal_composed_fallback_saves_canonical_first_page_position() {
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::None,
-        resume_to_last_page: true,
+        resume_to_last_page: (true).into(),
         from_explicit_open: true,
         preserve_after_password_prompt: true,
     });
@@ -1381,7 +1381,7 @@ fn g3_initial_deferred_entry_waits_for_projection_then_opens_first_visible_real(
             history_trigger: HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
-            resume_to_last_page: false,
+            resume_to_last_page: (false).into(),
             from_explicit_open: true,
             preserve_after_password_prompt: true,
         });
@@ -1422,7 +1422,9 @@ fn g3_composition_poll_cannot_consume_source_owned_deferred_reopen() {
         let (source_sender, source_receiver) = mpsc::channel();
         env.zip_enumerate_pending = Some(ZipEnumeratePending {
             zip_path: root,
-            restore_intent: StartupListIntent::PageContinuation,
+            presentation: crate::app::ZipEnumerationPresentation::Existing(
+                StartupListIntent::PageContinuation,
+            ),
             input_seq: 0,
             cancel: Arc::new(AtomicBool::new(false)),
             rx: source_receiver,
@@ -1431,7 +1433,7 @@ fn g3_composition_poll_cannot_consume_source_owned_deferred_reopen() {
             history_trigger: HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
-            resume_to_last_page: false,
+            resume_to_last_page: (false).into(),
             from_explicit_open: true,
             preserve_after_password_prompt: true,
         };
@@ -1466,7 +1468,7 @@ fn g3_source_terminal_reopen_survives_automatic_projection() {
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::None,
-        resume_to_last_page: false,
+        resume_to_last_page: (false).into(),
         from_explicit_open: true,
         preserve_after_password_prompt: true,
     });
@@ -1507,7 +1509,7 @@ fn startup_notices_book_wait_escape_and_close_retire_reopen_before_late_completi
                 history_trigger: HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
-                resume_to_last_page: false,
+                resume_to_last_page: (false).into(),
                 from_explicit_open: false,
                 preserve_after_password_prompt: false,
             };
@@ -1644,7 +1646,7 @@ fn g3_source_terminal_required_hidden_or_missing_target_never_uses_another_page(
                 pdf_path: root,
                 page_num: requested_page,
             }),
-            resume_to_last_page: false,
+            resume_to_last_page: (false).into(),
             from_explicit_open: true,
             preserve_after_password_prompt: true,
         };
@@ -1691,7 +1693,7 @@ fn g3_hidden_refresh_follows_next_previous_first_and_closes_without_resume_write
     save(&service, &scope, ReadingDirection::Ltr);
     adopt(&mut env, &service, &scope);
     env.last_book_resume = Some((
-        root.clone(),
+        crate::book_resume_key::BookResumeKey::legacy(&root),
         1,
         None,
         Some(document_page(1).resume_identity(&root)),
@@ -1738,6 +1740,78 @@ fn g3_hidden_refresh_follows_next_previous_first_and_closes_without_resume_write
         );
     }
     assert!(env.fullscreen_idx.is_none());
+    owner.shutdown_and_join();
+}
+
+#[test]
+fn initial_placement_live_projection_mode_change_uses_adopted_generation_and_anchor() {
+    use crate::book_composition::{BookComposition, fixtures::document_page};
+    use crate::settings::{FullscreenPageStartPosition, ReadingFlow, SpreadMode};
+    let mut env = setup_app();
+    let root = env.tmp.path().join("initial-placement-refresh.pdf");
+    let data = env.tmp.path().join("initial-placement-refresh-data");
+    let scope = install_document(&mut env, &root);
+    let (service, owner) = runtime(&mut env, &data);
+    save(&service, &scope, ReadingDirection::Ltr);
+    adopt(&mut env, &service, &scope);
+    assert_eq!(env.spread_mode, SpreadMode::Ltr);
+    assert!(env.fullscreen_idx.is_none());
+    env.settings.fullscreen_page_start_position = FullscreenPageStartPosition::ReadingStart;
+    env.reading_flow = ReadingFlow::Paged;
+    env.fullscreen_idx = Some(2);
+    env.fs_zoom = 1.5;
+    env.fs_pan = egui::vec2(53.0, -71.0);
+    env.request_fs_initial_placement(2);
+    let old_request = env.fs_initial_placement_request.unwrap();
+    let old_generation = env.items_generation;
+    assert_eq!(old_request.items_generation, old_generation);
+    assert_eq!(old_request.anchor_idx, 2);
+    service
+        .save(
+            scope.clone(),
+            PageDomain::Document,
+            BookComposition::new(
+                ReadingDirection::Rtl,
+                vec![
+                    document_page(2),
+                    document_page(3),
+                    document_page(0),
+                    document_page(1),
+                ],
+            ),
+        )
+        .recv_timeout(WAIT)
+        .unwrap()
+        .status
+        .unwrap();
+    // Admit and complete the actual worker through the production poll path.
+    // Reordering moves the current physical page to a different numeric anchor.
+    admit_projection(&mut env, &service, &scope);
+    settle_projection(&mut env);
+    assert_accepted_token(&env, &service, &scope);
+    assert_eq!(env.spread_mode, SpreadMode::Rtl);
+    assert_eq!(
+        env.reading_direction,
+        crate::settings::ReadingDirection::Rtl
+    );
+    assert_eq!(current_physical_page(&env), Some(2));
+    assert_eq!(env.fullscreen_idx, Some(0));
+    assert_ne!(env.items_generation, old_generation);
+    assert_eq!((env.fs_zoom, env.fs_pan), (1.5, egui::Vec2::ZERO));
+    let request = env
+        .fs_initial_placement_request
+        .expect("new adopted display unit");
+    assert_ne!(request, old_request);
+    assert_eq!(request.items_generation, env.items_generation);
+    assert_eq!(request.anchor_idx, env.fullscreen_idx.unwrap());
+    assert_eq!(
+        (request.origin_zoom, request.origin_pan),
+        (1.5, egui::Vec2::ZERO)
+    );
+    assert_eq!(
+        (request.applied_zoom, request.applied_pan),
+        (1.5, egui::Vec2::ZERO)
+    );
     owner.shutdown_and_join();
 }
 

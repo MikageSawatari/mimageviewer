@@ -7790,6 +7790,114 @@ mod tests {
         ensure_database_schemas(path).unwrap();
     }
 
+    #[test]
+    fn section1675_inner_resume_transfer_excluded() {
+        use crate::book_resume_db::{BookResumeDb, BookResumeWriter, PageIdentity};
+        use crate::book_resume_key::BookResumeKey;
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        let source_book = source.join("book.zip");
+        let destination_book = destination.join("book.zip");
+        fs::write(&source_book, b"same archive fixture").unwrap();
+        fs::write(&destination_book, b"same archive fixture").unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        Connection::open(source_data.join("rating.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO ratings (path,stars,rated_at_ms,source_path,kind)
+                 VALUES (?1,4,1234,?2,?3)",
+                params![
+                    crate::path_key::normalize_keep_drive(&source_book),
+                    source_book.to_string_lossy().as_ref(),
+                    crate::rating_db::RatingItemKind::ZipFile.to_db(),
+                ],
+            )
+            .unwrap();
+        let source_inner = BookResumeKey::archive(&source_book, &["A".into()]).unwrap();
+        let source_root = BookResumeKey::legacy(&source_book);
+        let destination_root = BookResumeKey::legacy(&destination_book);
+        let destination_inner = BookResumeKey::archive(&destination_book, &["A".into()]).unwrap();
+        let destination_sibling = BookResumeKey::archive(&destination_book, &["B".into()]).unwrap();
+        for (data, root, inner, book, page, entry) in [
+            (
+                &source_data,
+                &source_root,
+                &source_inner,
+                &source_book,
+                2,
+                "A/003.jpg",
+            ),
+            (
+                &destination_data,
+                &destination_root,
+                &destination_sibling,
+                &destination_book,
+                8,
+                "B/009.jpg",
+            ),
+        ] {
+            let writer = BookResumeWriter::spawn_at(data.join("book_resume.db")).unwrap();
+            assert!(writer.record_key_identity(root, page + 40, None, None));
+            assert!(writer.record_key_identity(
+                inner,
+                page,
+                None,
+                Some(PageIdentity::Archive {
+                    container: crate::path_key::normalize_keep_drive(book),
+                    entry_name: entry.into(),
+                })
+            ));
+            // Drop drains the real typed writer before the export/import transaction.
+            drop(writer);
+        }
+        let before = BookResumeDb::open_at(&destination_data.join("book_resume.db")).unwrap();
+        let root_before = before.get_position_key(&destination_root).unwrap();
+        let sibling_before = before.get_position_key(&destination_sibling).unwrap();
+        assert_eq!(before.count(), 2);
+        drop(before);
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &source, false, &cancel, no_progress).unwrap();
+        let manifest = read_manifest(&source, &cancel).unwrap();
+        let wire = serde_json::to_string(&manifest).unwrap();
+        assert!(!wire.contains("miv:zipbook:"));
+        assert!(!wire.contains("book_resume"));
+        copy_sidecar_bundle(&source, &destination);
+        let imported = import_at(&destination_data, &destination, &cancel, no_progress).unwrap();
+        assert_eq!(imported.failed_entries, 0);
+        assert_eq!(
+            Connection::open(destination_data.join("rating.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT stars,kind FROM ratings WHERE path=?1",
+                    [crate::path_key::normalize_keep_drive(&destination_book)],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                )
+                .unwrap(),
+            (4, crate::rating_db::RatingItemKind::ZipFile.to_db())
+        );
+        let after = BookResumeDb::open_at(&destination_data.join("book_resume.db")).unwrap();
+        assert_eq!(after.count(), 2);
+        assert_eq!(after.get_position_key(&destination_root), Some(root_before));
+        assert_eq!(
+            after.get_position_key(&destination_sibling),
+            Some(sibling_before)
+        );
+        assert!(after.get_position_key(&destination_inner).is_none());
+        assert!(after.get_position_key(&source_inner).is_none());
+        let source_after = BookResumeDb::open_at(&source_data.join("book_resume.db")).unwrap();
+        assert_eq!(source_after.count(), 2);
+        assert_eq!(
+            source_after.get_position_key(&source_inner).unwrap().page,
+            2
+        );
+    }
+
     fn transfer_caption() -> PortableAiCaption {
         PortableAiCaption {
             rotation: 90,
