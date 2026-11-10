@@ -1803,6 +1803,7 @@ pub(in crate::app) struct ViewerContextBundle {
     video_presentation_transition: PresentationTransitionOwner,
     fs_zoom: f32,
     fs_pan: egui::Vec2,
+    fs_initial_placement_request: Option<crate::ui_fullscreen::FsInitialPlacementRequest>,
     fs_zoom_active: bool,
     fs_zoom_aiming: bool,
     fs_zoom_factor: f32,
@@ -3064,6 +3065,7 @@ impl ViewerContextBundle {
             video_presentation_transition: PresentationTransitionOwner::default(),
             fs_zoom: 1.0,
             fs_pan: egui::Vec2::ZERO,
+            fs_initial_placement_request: None,
             fs_zoom_active: false,
             fs_zoom_aiming: false,
             fs_zoom_factor: 1.0,
@@ -3495,6 +3497,7 @@ impl App {
             video_presentation_transition,
             fs_zoom,
             fs_pan,
+            fs_initial_placement_request,
             fs_zoom_active,
             fs_zoom_aiming,
             fs_zoom_factor,
@@ -3829,6 +3832,7 @@ impl App {
         swap_field!(video_presentation_transition);
         swap_field!(fs_zoom);
         swap_field!(fs_pan);
+        swap_field!(fs_initial_placement_request);
         swap_field!(fs_zoom_active);
         swap_field!(fs_zoom_aiming);
         swap_field!(fs_zoom_factor);
@@ -4219,6 +4223,7 @@ impl App {
             video_presentation_transition,
             fs_zoom,
             fs_pan,
+            fs_initial_placement_request,
             fs_zoom_active,
             fs_zoom_aiming,
             fs_zoom_factor,
@@ -4449,6 +4454,7 @@ impl App {
             video_presentation_transition,
             fs_zoom,
             fs_pan,
+            fs_initial_placement_request,
             fs_zoom_active,
             fs_zoom_aiming,
             fs_zoom_factor,
@@ -5285,6 +5291,7 @@ impl App {
             bundle.fullscreen_page_layout.clear();
             bundle.fs_vertical_scroll = 0.0;
             bundle.fs_pan = egui::Vec2::ZERO;
+            bundle.fs_initial_placement_request = None;
             bundle.fs_free_rotation = 0.0;
             bundle.fs_vertical_cache_keep_set.clear();
             bundle.continuous_page_transitions.clear();
@@ -5325,6 +5332,7 @@ impl App {
             bundle.fullscreen_page_layout.clear();
             bundle.fs_vertical_scroll = 0.0;
             bundle.fs_pan = egui::Vec2::ZERO;
+            bundle.fs_initial_placement_request = None;
             bundle.fs_free_rotation = 0.0;
             bundle.fs_vertical_cache_keep_set.clear();
             bundle.continuous_page_transitions.clear();
@@ -5367,6 +5375,7 @@ impl App {
             bundle.fullscreen_page_layout.clear();
             bundle.fs_vertical_scroll = 0.0;
             bundle.fs_pan = egui::Vec2::ZERO;
+            bundle.fs_initial_placement_request = None;
             bundle.fs_free_rotation = 0.0;
             bundle.fs_vertical_cache_keep_set.clear();
             bundle.continuous_page_transitions.clear();

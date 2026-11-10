@@ -937,3 +937,174 @@ fn thumbnail_type_icon_all_states_contexts_and_hit_regions() {
         }
     }
 }
+
+/// Compare the production presentation projection with the existing no-art painter,
+/// including geometry used by background input routing, rather than just its icon.
+#[test]
+fn container_type_icon_loaded_projection_matches_no_art_paint_layout_and_hits() {
+    use crate::grid_item::effective_thumbnail_state;
+
+    for theme in [
+        crate::os_theme::ResolvedTheme::Dark,
+        crate::os_theme::ResolvedTheme::Light,
+    ] {
+        for dpi in [1.0, 2.0] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(dpi);
+            crate::os_theme::apply_resolved(&ctx, theme);
+            crate::ui_fonts::configure_fonts(&ctx);
+            let loaded = thumbnail(&ctx, true);
+            let cases = [
+                (GridItem::Folder("春の写真フォルダ".into()), false),
+                (GridItem::ZipFile("春の作品集.zip".into()), false),
+                (items().remove(12).1, false),
+                (GridItem::Folder("C:/".into()), true),
+            ];
+            for (item, drive) in cases {
+                for show_type_icon in [false, true] {
+                    for prioritize_width in [false, true] {
+                        let projected = effective_thumbnail_state(&item, &loaded, true);
+                        assert!(matches!(projected, ThumbnailState::NoArt));
+                        let expected = container_projection_paint(
+                            &ctx,
+                            &item,
+                            &ThumbnailState::NoArt,
+                            drive,
+                            show_type_icon,
+                            prioritize_width,
+                        );
+                        let actual = container_projection_paint(
+                            &ctx,
+                            &item,
+                            projected,
+                            drive,
+                            show_type_icon,
+                            prioritize_width,
+                        );
+                        assert!(!expected.1.is_empty(), "no item hit regions: {item:?}");
+                        assert!(!expected.2.is_empty(), "no item paint: {item:?}");
+                        assert_eq!(actual, expected, "{item:?}, drive={drive}, dpi={dpi}");
+                        assert!(matches!(loaded, ThumbnailState::Loaded { .. }));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn container_type_icon_preserves_loaded_image_and_book_page_paint() {
+    use crate::grid_item::effective_thumbnail_state;
+
+    let ctx = egui::Context::default();
+    crate::os_theme::apply_resolved(&ctx, crate::os_theme::ResolvedTheme::Dark);
+    crate::ui_fonts::configure_fonts(&ctx);
+    let loaded = thumbnail(&ctx, true);
+    let ThumbnailState::Loaded { tex, .. } = &loaded else {
+        unreachable!("the fixture always creates a loaded image");
+    };
+    let texture_id = tex.id();
+    for item in [
+        GridItem::Image("春の写真.jpg".into()),
+        GridItem::ZipImage {
+            zip_path: "春の作品集.zip".into(),
+            entry_name: "001.jpg".into(),
+        },
+        GridItem::PdfPage {
+            pdf_path: "春の作品集.pdf".into(),
+            page_num: 0,
+            content_type: None,
+        },
+    ] {
+        let projected = effective_thumbnail_state(&item, &loaded, true);
+        assert!(std::ptr::eq(projected, &loaded));
+        let off = container_projection_paint(&ctx, &item, &loaded, false, true, false);
+        let on = container_projection_paint(&ctx, &item, projected, false, true, false);
+        assert_eq!(on, off, "{item:?}");
+        assert!(
+            on.2.iter().any(|shape| matches!(
+                &shape.shape,
+                egui::Shape::Mesh(mesh) if mesh.texture_id == texture_id
+            )),
+            "the loaded page image must still be painted: {item:?}"
+        );
+    }
+}
+
+fn container_projection_paint(
+    ctx: &egui::Context,
+    item: &GridItem,
+    thumb: &ThumbnailState,
+    drive: bool,
+    show_type_icon: bool,
+    prioritize_width: bool,
+) -> (
+    crate::thumb_overlay_layout::ThumbnailOverlayLayout,
+    Vec<egui::Rect>,
+    Vec<egui::epaint::ClippedShape>,
+) {
+    let mut result = None;
+    // Warm font/layout caches once, then retain only the final paint pass.
+    for _ in 0..2 {
+        let mut geometry = None;
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(320.0, 260.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                let rect =
+                    egui::Rect::from_min_size(egui::pos2(20.0, 30.0), egui::vec2(174.0, 132.0));
+                let layout = layout_cell_overlays(
+                    ui.painter(),
+                    rect,
+                    EditBadgeFlags::default(),
+                    4,
+                    item,
+                    thumb,
+                    &["旅行".to_owned()],
+                    None,
+                    None,
+                    drive,
+                    VideoThumbnailIndicator::BottomLeftBadge,
+                    AudioThumbnailIndicator::BottomLeftBadge,
+                    true,
+                    Some(12),
+                    None,
+                    true,
+                    ThumbnailNameStyle {
+                        prioritize_width,
+                        ..Default::default()
+                    },
+                    show_type_icon,
+                    false,
+                );
+                let hits = draw_cell_with_hit_areas(
+                    ui,
+                    rect,
+                    true,
+                    true,
+                    false,
+                    &layout,
+                    item,
+                    thumb,
+                    crate::rotation_db::Rotation::None,
+                    None,
+                    drive,
+                    VideoThumbnailIndicator::BottomLeftBadge,
+                    AudioThumbnailIndicator::BottomLeftBadge,
+                    false,
+                    Some(0.4),
+                );
+                geometry = Some((layout, hits.rects().to_vec()));
+            },
+        );
+        let output = crate::test_ui::headless_paint_output(output);
+        let (layout, hits) = geometry.unwrap();
+        result = Some((layout, hits, output.shapes));
+    }
+    result.unwrap()
+}

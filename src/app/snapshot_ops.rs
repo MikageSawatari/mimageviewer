@@ -246,6 +246,7 @@ impl App {
     }
 
     fn restore_snapshot_viewing_state(&mut self, state: crate::snapshot::SnapshotViewingState) {
+        let previous_mode = self.spread_mode;
         self.spread_mode = state.mode;
         self.reading_direction = state.direction;
         self.reading_flow = state.flow;
@@ -255,6 +256,9 @@ impl App {
         self.final_cover_spread_preference = state.final_cover;
         self.singleton_spread_endpoint_preferences = state.endpoints;
         self.page_alone_preferences = state.page_alone;
+        if self.spread_mode != previous_mode {
+            self.request_fs_initial_placement_after_composition_change();
+        }
     }
 
     fn finish_snapshot_viewer_index_swap(&mut self, swap: Option<SnapshotViewerIndexSwap>) {
@@ -2956,6 +2960,56 @@ mod tests {
         app.visible_indices = (0..app.items.len()).collect();
         app.current_folder = Some(PathBuf::from(r"E:\test"));
         app
+    }
+
+    #[test]
+    fn initial_placement_snapshot_mode_restore_aligns_only_changed_paged_composition() {
+        use crate::settings::{FullscreenPageStartPosition, ReadingFlow, SpreadMode};
+        for reading_start in [false, true] {
+            for changed in [false, true] {
+                for flow in [ReadingFlow::Paged, ReadingFlow::Vertical] {
+                    let mut app = test_app_with_items(vec![GridItem::Image(PathBuf::from(
+                        "E:/test/page.png",
+                    ))]);
+                    app.fullscreen_idx = Some(0);
+                    app.settings.fullscreen_page_start_position = if reading_start {
+                        FullscreenPageStartPosition::ReadingStart
+                    } else {
+                        FullscreenPageStartPosition::Center
+                    };
+                    app.spread_mode = if changed {
+                        SpreadMode::Rtl
+                    } else {
+                        SpreadMode::Single
+                    };
+                    app.reading_flow = flow;
+                    let saved = app.capture_snapshot_viewing_state();
+                    app.spread_mode = SpreadMode::Single;
+                    app.fs_zoom = 1.75;
+                    app.fs_pan = egui::vec2(45.0, -62.0);
+                    app.restore_snapshot_viewing_state(saved);
+                    let expected = reading_start && changed && flow.is_paged();
+                    assert_eq!(app.fs_zoom, 1.75);
+                    assert_eq!(
+                        app.fs_pan,
+                        if expected {
+                            egui::Vec2::ZERO
+                        } else {
+                            egui::vec2(45.0, -62.0)
+                        }
+                    );
+                    assert_eq!(app.fs_initial_placement_request.is_some(), expected);
+                    if let Some(request) = app.fs_initial_placement_request {
+                        assert_eq!(request.anchor_idx, 0);
+                        assert_eq!(request.items_generation, app.items_generation);
+                        assert_eq!(
+                            (request.origin_zoom, request.origin_pan),
+                            (1.75, egui::Vec2::ZERO)
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn drain_snapshot_identity_preparation(app: &mut App) {

@@ -613,7 +613,10 @@ pub(crate) use gamepad_input::{RightDragGuide, draw_right_drag_guide};
 pub(crate) use grid_scroll::{
     GRID_SCROLL_MIN_VIEWPORT_H, GridAspectLayout, GridScrollGeometry, GridScrollState,
 };
+mod container_type_icon_fixture;
 mod grid_paint;
+#[doc(hidden)]
+pub use container_type_icon_fixture::draw_container_type_icon_snapshot_fixture;
 mod media_metadata_mutation;
 pub(crate) mod metadata_import_refresh;
 mod metadata_ops;
@@ -13237,6 +13240,7 @@ impl App {
         self.publish_effetune_auto_fullscreen();
         self.fs_zoom = 1.0;
         self.fs_pan = egui::Vec2::ZERO;
+        self.clear_fs_initial_placement_request();
     }
 
     /// 編集ツールを抜けたのに見開きが戻っていない状態を解消する。
@@ -13305,6 +13309,7 @@ impl App {
         self.publish_effetune_auto_fullscreen();
         self.fs_zoom = 1.0;
         self.fs_pan = egui::Vec2::ZERO;
+        self.clear_fs_initial_placement_request();
     }
 }
 
@@ -18347,6 +18352,8 @@ pub struct App {
     pub(crate) fs_zoom: f32,
     /// 通常フルスクリーンのパンオフセット（スクリーン座標系）
     pub(crate) fs_pan: egui::Vec2,
+    pub(crate) fs_initial_placement_request:
+        Option<crate::ui_fullscreen::FsInitialPlacementRequest>,
 
     // ── ZipPla 風 全画面ズームモード (Z キー、v2.0.0) ──────────────
     // 画像の一部を画面いっぱいに拡大 (cover) し、マウス位置で表示範囲をパンする
@@ -21770,6 +21777,7 @@ impl App {
             fs_primary_suppression: Default::default(),
             fs_zoom: 1.0,
             fs_pan: egui::Vec2::ZERO,
+            fs_initial_placement_request: None,
             fs_zoom_active: false,
             fs_zoom_aiming: false,
             // 既定 1.0 = cover (縦長画像では横幅目一杯)。ZipPla 単ページの既定に合わせる。
@@ -22614,14 +22622,9 @@ impl App {
         if !self.display_texture_matches_page(tex, idx) {
             return Err(PassthroughUnavailable::IdentityMismatch);
         }
-        Ok(
-            self.fs_direct_resource_for_accepted_texture(
-                idx,
-                tex.clone(),
-                coverage,
-                *display_basis,
-            ),
-        )
+        Ok(self
+            .fs_direct_resource_for_accepted_texture(idx, tex.clone(), coverage, *display_basis)
+            .with_page_material_kind(crate::gpu_lanczos::FullscreenPageMaterialKind::Provisional))
     }
 
     /// Resolve media policy only while adopting a producer. The dimensions and
@@ -23130,6 +23133,14 @@ impl App {
         // 念のため)。current や switches_done など state はそのまま。
         self.auto_aspect.samples.clear();
         for (idx, state) in self.thumbnails.iter().enumerate() {
+            if self.items.get(idx).is_some_and(|item| {
+                crate::grid_item::container_icon_only(
+                    item,
+                    self.settings.thumb_container_type_icon_only,
+                )
+            }) {
+                continue;
+            }
             if let ThumbnailState::Loaded {
                 source_dims,
                 layout_dims,
@@ -23168,6 +23179,30 @@ impl App {
         }
     }
 
+    fn icon_only_container_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|item| {
+                crate::grid_item::container_icon_only(
+                    item,
+                    self.settings.thumb_container_type_icon_only,
+                )
+            })
+            .count()
+    }
+
+    fn auto_aspect_thumbnails_terminal(&self) -> bool {
+        self.items.iter().enumerate().all(|(idx, item)| {
+            crate::grid_item::container_icon_only(
+                item,
+                self.settings.thumb_container_type_icon_only,
+            ) || self
+                .thumbnails
+                .get(idx)
+                .is_some_and(ThumbnailState::is_terminal)
+        })
+    }
+
     /// auto_aspect の集計対象母数。**items ベース** で計算 (image_metas ベースでは
     /// 動画が抜けて動画オンリーフォルダで判定が走らない問題があった、ユーザー報告 +
     /// Codex P2 #2 2026-05)。
@@ -23175,6 +23210,7 @@ impl App {
     /// Image / Video / ZipImage / PdfPage / Folder / ZipFile / PdfFile は代表サムネ経由で
     /// `source_dims` がいずれ来る可能性があるので分母に入れる。
     pub(crate) fn auto_aspect_eligible_total(&self) -> usize {
+        let icon_only = self.icon_only_container_count();
         let terminal_audio = self
             .items
             .iter()
@@ -23206,9 +23242,13 @@ impl App {
             }
             return prepared
                 .auto_aspect_eligible_total
-                .saturating_sub(terminal_audio);
+                .saturating_sub(terminal_audio)
+                .saturating_sub(icon_only);
         }
-        self.items.len().saturating_sub(terminal_audio)
+        self.items
+            .len()
+            .saturating_sub(terminal_audio)
+            .saturating_sub(icon_only)
     }
 
     /// `auto_aspect` を新フォルダ用にリセットし、catalog の既存比率を一括投入する。
@@ -23251,19 +23291,11 @@ impl App {
         self.restore_cached_auto_aspect(aspect_seed);
 
         // 集計対象母数は items ベース (動画含む)。
-        let eligible_total =
-            prepared_eligible_total.unwrap_or_else(|| self.auto_aspect_eligible_total());
+        let eligible_total = prepared_eligible_total
+            .map(|total| total.saturating_sub(self.icon_only_container_count()))
+            .unwrap_or_else(|| self.auto_aspect_eligible_total());
         if eligible_total == 0 {
-            if !self.items.is_empty()
-                && self.thumbnails.iter().all(|state| {
-                    matches!(
-                        state,
-                        ThumbnailState::Loaded { .. }
-                            | ThumbnailState::NoArt
-                            | ThumbnailState::Failed
-                    )
-                })
-            {
+            if !self.items.is_empty() && self.auto_aspect_thumbnails_terminal() {
                 self.auto_aspect.current = Some(self.effective_thumb_aspect());
                 self.auto_aspect.streak = None;
             }
@@ -23281,6 +23313,12 @@ impl App {
                 return;
             };
             for (idx, item) in self.items.iter().enumerate() {
+                if crate::grid_item::container_icon_only(
+                    item,
+                    self.settings.thumb_container_type_icon_only,
+                ) {
+                    continue;
+                }
                 if staged.len() >= min_samples {
                     break;
                 }
@@ -23406,7 +23444,7 @@ impl App {
         // 集計対象母数は items ベース (動画含む)。seed と同じ helper。
         let eligible_total: usize = self.auto_aspect_eligible_total();
         if eligible_total == 0 {
-            if !self.items.is_empty() && self.thumbnails.iter().all(ThumbnailState::is_terminal) {
+            if !self.items.is_empty() && self.auto_aspect_thumbnails_terminal() {
                 self.auto_aspect.current = Some(self.effective_thumb_aspect());
                 self.auto_aspect.streak = None;
                 self.auto_aspect.cached_sample_gate = None;
@@ -23421,7 +23459,20 @@ impl App {
         const LOG_MARGIN: f32 = 0.10;
 
         // 純関数で判定。samples は HashMap なので Vec に展開して渡す。
-        let samples: Vec<f32> = self.auto_aspect.samples.values().copied().collect();
+        let samples: Vec<f32> = self
+            .auto_aspect
+            .samples
+            .iter()
+            .filter(|(idx, _)| {
+                self.items.get(**idx).is_some_and(|item| {
+                    !crate::grid_item::container_icon_only(
+                        item,
+                        self.settings.thumb_container_type_icon_only,
+                    )
+                })
+            })
+            .map(|(_, ratio)| *ratio)
+            .collect();
 
         // Cache 復元済みの場合は、前回その比率を決めた sample 数と同等以上の
         // 実測が集まるまで上書きしない。これにより「前回 36 件で 1:1 と判定した
@@ -23474,7 +23525,7 @@ impl App {
         // immediate=true (seed / 「自動」クリック直後) は streak を待たず即採用。
         const STREAK_DURATION: std::time::Duration = std::time::Duration::from_millis(750);
         const STREAK_SAMPLES_DELTA: usize = 8;
-        let cur_samples = self.auto_aspect.samples.len();
+        let cur_samples = samples.len();
         let streak_ok = if immediate {
             true
         } else {
@@ -45055,6 +45106,7 @@ impl App {
 
     fn set_items_generation(&mut self, items_generation: u64) {
         if self.items_generation != items_generation {
+            self.clear_fs_initial_placement_request();
             self.close_page_overview();
             self.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
             self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
@@ -56735,7 +56787,13 @@ impl App {
                 // auto_aspect: グリッド消費者だけが新規 Loaded の比率を記録。
                 // source_dims が None なら ColorImage の (w, h) を fallback として使う
                 // (動画 Shell サムネ / 旧 cache 由来などで source_dims が無いケース)。
-                if consumption.drives_auto_aspect() && self.settings.thumb_aspect_auto {
+                if consumption.drives_auto_aspect()
+                    && self.settings.thumb_aspect_auto
+                    && !crate::grid_item::container_icon_only(
+                        &self.items[i],
+                        self.settings.thumb_container_type_icon_only,
+                    )
+                {
                     let listing_dims = if from_edit_preview {
                         source_dims
                     } else {
@@ -57423,6 +57481,14 @@ impl App {
         if self.sidecar_restore_active() {
             return PriorityThumbnailAdmission::SidecarRestore;
         }
+        if self.items.get(idx).is_some_and(|item| {
+            crate::grid_item::container_icon_only(
+                item,
+                self.settings.thumb_container_type_icon_only,
+            )
+        }) {
+            return PriorityThumbnailAdmission::NoArt;
+        }
         let loaded = matches!(
             self.thumbnails.get(idx),
             Some(ThumbnailState::Loaded { .. })
@@ -57822,6 +57888,22 @@ impl App {
         let mut suppressed_regular: usize = 0;
         let mut suppressed_heavy: usize = 0;
         for i in self.keep_set_sorted() {
+            if crate::grid_item::container_icon_only(
+                &self.items[i],
+                self.settings.thumb_container_type_icon_only,
+            ) {
+                // Display state is not a request terminal. Leave in-flight owners and
+                // their pixels/finalization untouched, including across a preference toggle.
+                if self.requested.id(i).is_none()
+                    && matches!(
+                        self.thumbnails[i],
+                        ThumbnailState::Pending | ThumbnailState::Evicted
+                    )
+                {
+                    self.thumbnails[i] = ThumbnailState::NoArt;
+                }
+                continue;
+            }
             let foreground =
                 thumbnail_is_foreground(i, cur_vis_range, &interactive_thumbnail_pages);
             let loaded = matches!(self.thumbnails[i], ThumbnailState::Loaded { .. });
@@ -58445,6 +58527,12 @@ impl App {
         //    keep_set 外なら自動破棄される)。
         let mut upgrade_reqs: Vec<LoadRequest> = Vec::new();
         for i in self.keep_set_sorted() {
+            if crate::grid_item::container_icon_only(
+                &self.items[i],
+                self.settings.thumb_container_type_icon_only,
+            ) {
+                continue;
+            }
             if self.idle_upgrade_cache_bypass_ineligible.contains(&i) {
                 continue;
             }
@@ -68549,6 +68637,7 @@ impl App {
                 if let Some((zoom, pan)) = zoom_pan {
                     app.fs_zoom = zoom;
                     app.fs_pan = pan;
+                    app.clear_fs_initial_placement_request();
                 }
                 app.fs_free_rotation = free_rotation;
             })
@@ -68618,6 +68707,7 @@ impl App {
             if let Some((zoom, pan)) = activate_zoom_pan {
                 self.fs_zoom = zoom;
                 self.fs_pan = pan;
+                self.clear_fs_initial_placement_request();
             }
             self.fs_free_rotation = activate_free_rotation;
             self.log_detached_image_window_debug(format!(
@@ -72126,6 +72216,7 @@ impl App {
         self.analysis_sv_cache = None;
         self.fs_zoom = 1.0;
         self.fs_pan = egui::Vec2::ZERO;
+        self.request_fs_initial_placement(idx);
         self.fs_pan_drag_start = None;
         self.fs_vertical_scroll = 0.0;
         self.continuous_reading_scroll_transition = None;
@@ -82071,6 +82162,7 @@ impl App {
         boundary: FsMetadataBoundary,
         destination: FullscreenCloseDestination,
     ) {
+        self.clear_fs_initial_placement_request();
         self.cancel_original_material_entry_intents(None);
         self.pending_fs_page_turn_ready = None;
         self.page_turn_presentation.deactivate("closed");
@@ -91229,8 +91321,12 @@ impl App {
             return false; // Folder / Video 等 (page_path_key 無し) は対象外
         };
         self.ensure_comic_doc_loaded(&key);
-        let has_persisted = self.comic_docs.get(&key).is_some_and(|v| !v.is_empty());
-        has_persisted || self.comic_demo_enabled
+        self.cached_comic_doc_has_objects(&key)
+    }
+
+    /// Resident selection can inspect loaded annotation requirements without I/O.
+    pub(crate) fn cached_comic_doc_has_objects(&self, key: &str) -> bool {
+        self.comic_docs.get(key).is_some_and(|v| !v.is_empty()) || self.comic_demo_enabled
     }
 
     /// 注釈フォントの列挙結果 (ピッカー一覧 + 表示名→パス) を 1 度だけ作る。pack 同梱 /
@@ -96868,7 +96964,11 @@ impl App {
         mut perf: Option<&mut PassthroughRenditionPerfRecorder>,
     ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
         if self.raw_development_blocked(idx) {
-            return self.resolve_original_preview_material(idx);
+            return self.resolve_original_preview_material(idx).map(|material| {
+                material.with_page_material_kind(
+                    crate::gpu_lanczos::FullscreenPageMaterialKind::Provisional,
+                )
+            });
         }
         if !self.raw_fullscreen_fallback_allowed(idx) {
             return None;
@@ -96899,7 +96999,9 @@ impl App {
             perf.calls.push(perf_call);
         }
         match outcome {
-            Ok(texture) => Some(texture),
+            Ok(texture) => Some(texture.with_page_material_kind(
+                crate::gpu_lanczos::FullscreenPageMaterialKind::Provisional,
+            )),
             Err(reason) => {
                 self.note_passthrough_unavailable(idx, reason);
                 None
@@ -97197,7 +97299,11 @@ impl App {
         idx: usize,
     ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
         if self.raw_development_blocked(idx) {
-            return self.resolve_original_preview_material(idx);
+            return self.resolve_original_preview_material(idx).map(|material| {
+                material.with_page_material_kind(
+                    crate::gpu_lanczos::FullscreenPageMaterialKind::Provisional,
+                )
+            });
         }
         if !self.raw_fullscreen_fallback_allowed(idx) {
             return None;
@@ -97221,6 +97327,9 @@ impl App {
                     self.resolve_preview_coverage_for_display(idx, entry.source_coverage)
                         .expect("coverage checked on this entry"),
                     entry.display_basis,
+                )
+                .with_page_material_kind(
+                    crate::gpu_lanczos::FullscreenPageMaterialKind::Provisional,
                 )
             })
     }
@@ -106104,6 +106213,28 @@ mod material_display_owner_tests {
         let held = app.ensure_passthrough_material(&ctx, 0).unwrap();
         let captured = held.capture_presentation(&ctx);
         let sibling = app.ensure_passthrough_material(&ctx, 1).unwrap();
+        for material in [&held, &sibling] {
+            assert_eq!(
+                material.page_material_kind(),
+                crate::gpu_lanczos::FullscreenPageMaterialKind::Provisional
+            );
+        }
+        assert_eq!(
+            captured.page_material_kind(),
+            crate::gpu_lanczos::FullscreenPageMaterialKind::Provisional
+        );
+        assert_eq!(
+            app.fs_thumbnail_resource_for_display(0)
+                .unwrap()
+                .page_material_kind(),
+            crate::gpu_lanczos::FullscreenPageMaterialKind::Provisional
+        );
+        assert_eq!(
+            app.ensure_passthrough_material(&ctx, 0)
+                .unwrap()
+                .page_material_kind(),
+            crate::gpu_lanczos::FullscreenPageMaterialKind::Provisional
+        );
         let old = held.display_basis();
         assert_eq!(old.specified(), Err(U::PdfMetadataUnavailable));
         let thumbnail_legacy = L::SourceLayout {
@@ -106126,11 +106257,19 @@ mod material_display_owner_tests {
         );
         assert!(app.cached_passthrough_material(0).is_none());
         let unchanged = app.cached_passthrough_material(1).unwrap();
+        assert_eq!(
+            unchanged.page_material_kind(),
+            crate::gpu_lanczos::FullscreenPageMaterialKind::Provisional
+        );
         assert_eq!(unchanged.display_basis(), sibling.display_basis());
         assert_eq!(unchanged.source_texture_id(), sibling.source_texture_id());
         assert_eq!(held.display_basis(), old);
         assert_eq!(captured.display_basis(), old);
         let rebuilt = app.ensure_passthrough_material(&ctx, 0).unwrap();
+        assert_eq!(
+            rebuilt.page_material_kind(),
+            crate::gpu_lanczos::FullscreenPageMaterialKind::Provisional
+        );
         assert!(rebuilt.display_basis().specified().is_ok());
         assert_eq!(rebuilt.display_basis().legacy(V::Single), thumbnail_legacy);
         app.readopt_loaded_pdf_thumbnail_basis(0, metadata);

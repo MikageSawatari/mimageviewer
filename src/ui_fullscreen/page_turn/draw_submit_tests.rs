@@ -351,6 +351,7 @@ fn page_turn_mainwindow_submits_visible_vacant_leaf_both_directions() {
                         offer.ready_sources.0.clone(),
                         offer.fact.destination,
                         offer.accepted_at,
+                        offer.ready_sources.1.clone(),
                     ));
                 }
             });
@@ -361,7 +362,7 @@ fn page_turn_mainwindow_submits_visible_vacant_leaf_both_directions() {
                 ..
             } = &app.page_turn_presentation.state
             else {
-                let mismatch = admission.as_ref().and_then(|(old, sources, destination, accepted_at)| {
+                let mismatch = admission.as_ref().and_then(|(old, sources, destination, accepted_at, binding)| {
                 let PresentationState::Flat(current) = &app.page_turn_presentation.state else { return None; };
                 Some(serde_json::json!({
                     "accepted":old.evidence.was_accepted(),
@@ -370,11 +371,11 @@ fn page_turn_mainwindow_submits_visible_vacant_leaf_both_directions() {
                     "mode":old.mode == current.mode,
                     "reading_rtl":old.reading_rtl == current.reading_rtl,
                     "slice":old.slice == current.slice,
-                    "layout":Arc::ptr_eq(&old.layout,&current.layout),
+                    "layout":old.binding.layout == current.binding.layout,
                     "elapsed_ms":accepted_at.elapsed().as_millis(),
                     "sources":sources.iter().map(|s|format!("{:?} {:?} {:?}",s.occurrence,s.resource.source_texture_id(),s.resource.source_generation())).collect::<Vec<_>>(),
                     "actual":current.pages.iter().map(|p|format!("{:?} {:?} {:?}",p.occurrence,p.resource.source_texture_id(),p.resource.source_generation())).collect::<Vec<_>>(),
-                    "content":sources.iter().zip(&current.pages).map(|(s,p)|s.content == app.page_turn_content(p.occurrence.idx)).collect::<Vec<_>>()
+                    "content":binding.content == current.content
                 }))
             });
                 panic!(

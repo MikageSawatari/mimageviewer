@@ -32,6 +32,7 @@ from analyze_perf import (
     cmd_page_turn,
     cmd_pre_grid,
     cmd_remote_page,
+    cmd_scroll,
     cmd_thumbs,
     load_events,
     main,
@@ -2274,6 +2275,58 @@ class DeliveryCompletenessTests(unittest.TestCase):
                 with self.assertRaises(SystemExit) as caught:
                     main()
                 self.assertEqual(caught.exception.code, 2)
+
+
+class ContainerIconScrollTests(unittest.TestCase):
+    def test_scroll_reports_empty_preloaded_and_reduced_targets(self):
+        for initial_target, preloaded, final_target, latency in (
+            (0, 0, 0, 0),  # 全項目が種類アイコン
+            (3, 3, 3, 0),  # 全画像が既読込
+            (3, 0, 1, 12),  # 進行中にコンテナを対象から除外
+        ):
+            rows = [
+                {"t": 1.0, "cat": "ui", "kind": "scroll_settle", "settle_seq": 7,
+                 "visible_target_count": initial_target, "already_loaded": preloaded,
+                 "visible_first_idx": 0},
+                {"t": 1.0 + latency / 1000, "cat": "ui", "kind": "visible_thumb_all_ready",
+                 "settle_seq": 7, "target_count": final_target, "latency_ms": latency},
+            ]
+            with self.subTest(initial_target=initial_target, preloaded=preloaded), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                cmd_scroll(rows)
+            report = output.getvalue()
+            row = next(line.split() for line in report.splitlines() if line.split()[:1] == ["7"])
+            self.assertEqual(row[3], str(final_target))
+            self.assertEqual(row[5], "-")  # first_ready は新着画像だけ
+            self.assertEqual(row[6], str(latency))
+            self.assertIn(f"all_ready   latency: n=1 min={latency}ms", report)
+
+    def test_scroll_gate_requires_same_seq_endpoint_even_if_already_satisfied(self):
+        with writable_test_directory() as directory:
+            source = directory / "scroll.jsonl"
+            for target, preloaded in ((0, 0), (3, 3), (3, 0)):
+                for endpoint_seq in (None, 8, 7):
+                    rows = [
+                        {"t": 1.0, "cat": "ui", "kind": "scroll_settle", "settle_seq": 7,
+                         "visible_target_count": target, "already_loaded": preloaded},
+                    ]
+                    if endpoint_seq is not None:
+                        rows.append({"t": 1.0, "cat": "ui", "kind": "visible_thumb_all_ready",
+                                     "settle_seq": endpoint_seq, "target_count": 0,
+                                     "latency_ms": 0})
+                    source.write_text("".join(json.dumps(row) + "\n" for row in delivery_events(rows, 3)),
+                                      encoding="utf-8")
+                    with self.subTest(target=target, preloaded=preloaded, endpoint_seq=endpoint_seq), \
+                            mock.patch.object(sys, "argv", ["analyze_perf.py", str(source), "scroll"]), \
+                            contextlib.redirect_stdout(io.StringIO()) as output:
+                        if endpoint_seq == 7:
+                            main()
+                            self.assertNotIn("CannotJudge", output.getvalue())
+                        else:
+                            with self.assertRaises(SystemExit) as caught:
+                                main()
+                            self.assertEqual(caught.exception.code, 2)
+                            self.assertIn("Missing scroll completion endpoint evidence", output.getvalue())
 
 
 class PageTurnAnimationTests(unittest.TestCase):

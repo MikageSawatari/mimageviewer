@@ -392,7 +392,7 @@ impl App {
         if !self.settings.page_turn_animation_enabled
             || (position == FinalUnitPosition::Previous && self.slideshow_playing)
             || self.remote_session_blocks_local_control()
-            || !self.page_turn_current_unit_presented()
+            || !self.page_turn_has_output_evidence()
             || !self.page_turn_view_eligible(anchor)
             || self.spread_mode.is_split()
         {
@@ -409,8 +409,13 @@ impl App {
         }
         let composition = self
             .resident_final_unit_composition_from_snapshot(anchor, position)
-            .ok_or(Missing::Topology)?
-            .ok_or(Missing::Boundary)?;
+            .ok_or(Missing::Topology)?;
+        // A missing topology proof must not be disguised as an unpresented unit
+        // merely because its semantic binding cannot be resolved without that proof.
+        if !self.page_turn_current_unit_presented() {
+            return Err(Missing::Ineligible);
+        }
+        let composition = composition.ok_or(Missing::Boundary)?;
         if position == FinalUnitPosition::Previous
             && self.previous_final_prepare_occurrences(anchor).is_none()
         {

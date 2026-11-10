@@ -1455,6 +1455,34 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-10: ページめくり提示資格を表示単位の binding へ移す (§1.750)
+
+遠方ページの横長寸法の到着で本全体の `Arc<Vec<SpreadDisplayUnit>>` が作り直されると、演出中の単位が同じでも
+ページめくりが取り消される (§1.750)。提示資格 (held lookup・prepare/bind・Turning 比較・receipt・barrier) を、
+本全体 Arc の同一性から、表示単位ごとの意味的 binding (`PageTurnUnitBinding`) の値照合へ移す。
+SpreadShift の continuation だけは本全体 topology 照合を残す (ずらし基点が本全体の横長境界に依存するため)。
+`page_turn_destination` の context/window/viewport 生成、detached 述語、viewport routing、HWND/focus/z-order は変更しない。
+変わるのは main/detached 共用の lookup/prepare/receipt/barrier と、その導出順序 (canonical 解決を先に済ませる prefix)。
+受入には main と detached の同一本・同頁で、別 context の binding/receipt を混用せず、片方の遠方更新・open/close が
+兄弟の資源・世代・queue・提示状態を変えない headless 対照を含める。
+
+設計担当 ClaudeCode と独立 Sol / xhigh 設計レビュー (r1 REVISE P2 → r2 ACCEPT) は、提示資格の所有単位を
+本全体から表示単位へ移す構造修正であり症状パッチではないと合意した。初回実装の停止を受けた改訂 (r3 REVISE P2 → r4 ACCEPT)
+では、singleton 配置を表示条件へ移し、base に無い owning viewport / frame の照合は足さない (ROOT/子 viewport の
+配送規則は変えない) とした。合意は改訂後も維持。正本は
+[ページめくりの表示単位 binding](page-turn-layout-binding-plan.md)。
+
+### 2026-11-08: ページ切替後の初期表示位置 (§1.726)
+
+`ViewerContextBundle` へ一般の表示状態 1 フィールドを追加 (§1.726)。detached 述語・viewport 経路は不変。
+`fs_zoom` / `fs_pan` と同じ context が初期配置要求の生成・消費・退役を所有し、既存 bundle の移譲・swap で一緒に移す。
+新規 context は要求なしで始め、兄弟 context の位置や要求へ波及させない。detached 専用の状態や HWND・placement の経路は増やさない。
+
+設計担当 ClaudeCode と独立 Sol / xhigh 設計レビューは、bundle への一般表示状態の追加と holdover 描画入力の所有分離を、
+症状パッチではなく構造的な追加と合意した。設計担当の r4 決定に従って実装・絞り込み自動検証を完了した。
+候補配置→実素材の準備→確定の所有境界も別担当の限定レビューで構造的な整理と確認したが、全体の独立実装レビューは待ちである。
+設計 r4 と実装・検証記録の正本は [初期表示位置の計画](fullscreen-page-start-position-plan.md)。
+
 ### 2026-11-08: 3D 写真の MainWindow 対応（段 C 続き・案1）
 
 基点 `29bb7f54b`、正本は [3D 設計 §6.4.1](depth-parallax-plan.md#641-mainwindow-対応-2026-11-08案1を採択実装済み)。

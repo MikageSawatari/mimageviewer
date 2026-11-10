@@ -83,6 +83,7 @@ impl App {
         }
         self.fs_zoom = 1.0;
         self.fs_pan = egui::Vec2::ZERO;
+        self.clear_fs_initial_placement_request();
     }
 
     pub(super) fn reconcile_local_page_edit_spread_pivot(&mut self) {

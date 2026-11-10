@@ -96,6 +96,39 @@ UIでDBを開かず、古い投影処理による上書きを防ぐ。詳細は[
 
 ### 紙めくりpresentationのA0実装 (§1.341、2026-10-11、受入れ待ち)
 
+§1.750（2026-11-10、r5判断をブランチへ実装済み・本件/関連回帰成功、実機未確認）:
+提示資格は本全体の `Arc<Vec<SpreadDisplayUnit>>` ではなく、context所有のimmutable
+`PageTurnUnitBinding` で照合する。通常resolverが採用した単位のanchor・canonical pages・formation・
+画面順occurrence/role・補助表紙/白companion、items/item identity、内容・実効回転、view政策と
+prepared出力証拠を束縛する。遠方の未知寸法到着で全体layoutが再構築されても、この局所値が等しければ
+受理済み素材・projection・時計を保ち、canonical flat採用まで進む。ordinal/nav_start・allocation・
+全体landscape epoch・source品質publicationは単位の意味に含めない。
+
+singleton Left/Right/Centerは表示条件として扱う。Offered/Turningは表示条件の変更でもskip/cancelするが、
+採用前のCompletingでは意味・内容・受理素材が等しければ通常prepareで再束縛してNeedFlatへ戻す。
+旧配置のreceiptは新しい出力の証明にならず、完全なbindingと実occurrence/source/paint順・
+geometry・output採用が一致したflatだけで完了する。canonical flat採用後のresizeはbaseどおり
+pre-drawのcontinuation確定を止めず、次targetを通常prepareで新しい寸法へ描く。
+採用後にdrawが先行しても、新しいreceiptには実際にpaintした新geometryのbindingを保存し、
+旧採用済みreceiptの資格と新出力の証明を分ける。継続操作はfrom/targetそれぞれの意味と
+occurrenceごとのitem identityを照合し、配置変更だけでは捨てない。SpreadShiftだけは
+ずらし基点が遠方の横長境界にも依存するため、既存の全体topology Arc照合も保持する。
+
+held lookup・legacy crop basis・prepare/bind・Turning比較・pending ready・receipt・barrierで
+同じbindingの投影を使う。保存済みAの既提示資格はAのanchorの意味・内容で判定し、最後に描いたBのlayoutや
+採用後に変わったfit政策で失効させない。現在viewはprepare/Turning比較と実receiptで別に照合する。
+通常adoption/landscape reconcile後にcanonical単位を解決し、read-only matcherは
+builder/producer/I/Oを起動しない。Nativeのexact key/coverageと受理済みbasisの保持は維持する。
+FinalDemandTopologiesと連結admissionの全体Arc、viewport配送規則、既存destination/frame照合は変更しない。
+
+取消診断の `different_fields` は同じ局所bindingの差分を報告する。layout差分時はoccurrences・formation・
+placementの一致を併記し、landscape反転時だけidx・旧新判定・epochを記録する。
+名前・パス・画像内容は追加出力しない。実装と検証記録の正本は
+[ページめくりの表示単位binding](page-turn-layout-binding-plan.md)。
+本体lib全件は17,004成功/未変更IPCのnamed pipe作成アクセス拒否2件で未通過。各単独でも再現し、
+全件greenとは扱わない。通常profile確認用 `build-dev.ps1` は初回MSBuild並列失敗後、
+`CARGO_BUILD_JOBS=1` の再実行で成功し、5バイナリとDLL配置・PE検査を完了した。製品起動・実機確認は未実施。
+
 ページ間の紙めくりは`ui_fullscreen/page_turn.rs`のcontext単位presentationと、
 `page_turn_animation.rs`のcanonical unit projectionへ分離する。既存navigation target、
 ready判定、captureのfit/UV/occurrenceを正本にし、unit全体の通常prepare後にflat/curlを選ぶ。
@@ -488,6 +521,12 @@ SQLite 更新、LRU prune はすべて専用 worker 上で行い、UI スレッ�
 200% にしても 2048px を超えて増え続けることはない。
 
 ### 1.3.2 親コンテナの代表サムネ — 優先順位
+
+§1.697 の `thumb_container_type_icon_only`（既定 OFF）が ON の間、一覧の対象コンテナは
+共通判定で表示・レイアウトを既存の `NoArt` に置き換え、一覧由来の代表要求と idle 高画質化を省く。
+要求中の owner、固定・キャッシュは保持し、自動比率とスクロールの画像待ち集計からは除く。
+OFF への復帰は現在の App 一覧の対象 `NoArt` を `Pending` に戻す。対象と別利用者の除外範囲、
+退避 context の扱いは [コンテナ種類アイコン設計](container-type-icon-plan.md) を参照。
 
 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) の代表サムネは次の順で決まる:
 
@@ -1939,6 +1978,34 @@ PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行
 5. Zoom / Pan、または Z ズームの確定済み placement
 6. 物理ピクセル境界へ整列済みの paint rect / hit rect / UV / source↔screen 写像 / total scale
 ```
+
+#### ページ切替直後の初期 pan (§1.726)
+
+`fullscreen_page_start_position` は `Center` (既定) / `ReadingStart`。後者だけが、受理済み open と
+同一画像内の受理済み分割移動、paged のページ構成切替で context 所有の要求を作る。
+構成が実際に変わったときは pan を 0 に戻し、新しい表示単位を配置する。倍率は既存の正規化・open 経路に従う。
+キー処理で構成・slice・ページの組が変わった場合は、既存の rebase 通知で同じ frame の描画準備を更新する。
+入力前の単位の幾何で新しい初期配置要求を消費せず、整合後の新しい単位を最初から配置する。
+同じ構成の選び直し・編集ツールの一時的な単ページ化／復帰・読書方向だけの切替は新入口に含めない。現在の表示単位を描く
+frame で、固定 HUD・パネルを除いた viewport と pan 0 の canonical placement を使い、描くページの
+paint rect の和（描く白 companion を含む）から初期 pan を求める。縦の超過は上端、横の超過は
+実効読書方向の始端へ合わせ、収まる軸の既存配置と倍率は保つ。同じ frame の最終 placement に反映する。
+
+素材の `FullscreenPageMaterialKind` は通常サムネイル・通過 rendition・未完成 final／完成待ち代役を
+`Provisional`、完成素材を `Complete` として生成元・選択元で付け、Native 化・capture 後も保持する。
+紙めくりの resident 受理でも同じ型を保持する。未完成 final と通常の下段代替は `Provisional`、
+安定 RAW preview の例外は通常 resolver と共通の `fs_lower_layer_material_kind` で判定する。
+受理の quality ラベルは素材の段階を示すだけとし、完成状態は `FullscreenPageMaterialKind` に持たせる。
+要求作成時の `origin_zoom` / `origin_pan` は幾何と収まる軸の配置基準として保つ。仮素材の frame は
+配置後の zoom/pan を CAS 用の `applied_zoom` / `applied_pan` だけへ更新して要求を保持し、単ページならそのページ、見開きなら
+全ページの実際に準備できた素材が完成した最初の current frame で消す。原寸では素材差し替えで矩形が変わる
+既存契約を保ち、完成画像の最初の frame も読み始めへ揃える。準備段で代役へ fallback したら確定しない。
+
+holdover 選択中・幾何未解決なら要求を保持し、世代・anchor 不一致、利用者の位置／倍率入力、除外モード、
+close・復元・reset では退役する。確定後の高画質化や resize で再適用しない。連結読み・動画・360 度・depth・Z・分析には適用しない。
+navigation の previous holdover は capture 済みの通常 placement で前の位置を保ち、同一表示単位の
+source reload 待ちと Z holdover は既存 transform を使う。紙めくりの zoom / pan 適格条件は維持する。
+状態の所有・消去入口と検証範囲は [設計 r4](fullscreen-page-start-position-plan.md) を参照。
 
 ### 部分矩形 (content bbox) の座標系 — 2026-08-25 に分離
 
@@ -3418,6 +3485,12 @@ previous に属するなら提示とは数えない。
 初めて「提示済み」と判定し sequence を解放する。旧 unit と target unit が同じページを共有して
 同じ texture id を使っても、選択元が live なら `Live` であり、texture id の包含から ownership を
 推測しない。previous overlay を実際に描いたページは `Holdover` なので解放しない。
+通常 flat の receipt は、pan によって相方が viewport 外になっても、提出した表示単位全体の
+occurrence / source / paint ID を照合する。各ページの正の可視面積は navigation 退役の条件にしない。
+出力の採用確認・全ページの `Live` 確認・部分的な curl を退役証拠にしない条件は維持する。
+取消後の `Completing` とその continuation も同じ flat の occurrence / source / paint ID 照合を使い、
+画面外のページの面積 0 を拒否理由にしない。出力再提出時は画面順も維持する。
+照合の正本は `SubmittedUnitReceipt::matches_flat_pages`。curl の可視性 ledger は別の問いとして保つ。
 したがって次の同 frame repeat が受理される場合でも、その前に target の draw command は確定済みで
 あり、見開き片側だけを提示済みと数えることはない。
 

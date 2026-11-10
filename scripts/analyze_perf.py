@@ -3647,7 +3647,7 @@ def cmd_scroll(events: list[dict]) -> None:
     可視サムネ表示の latency を集計する。
 
     出力:
-      seq, t_rel, visible_first_idx, target_count, already_loaded,
+      seq, t_rel, visible_first_idx, target_count (completion endpoint 時点), already_loaded,
       first_ready_ms, all_ready_ms, pool snapshot 抜粋
     """
     if not events:
@@ -3695,6 +3695,9 @@ def cmd_scroll(events: list[dict]) -> None:
         rel = s.get("t", 0.0) - t0
         first = firsts.get(seq)
         all_ev = alls.get(seq)
+        # 計測中に種類アイコン表示へ切り替えると画像待ち target が減る。
+        # 完了後は endpoint の実際の母数を表示し、未完了なら開始時の母数を使う。
+        target_count = (all_ev or {}).get("target_count", s.get("visible_target_count", "?"))
         first_ms = f"{first.get('latency_ms', 0):.0f}" if first else "-"
         all_ms = f"{all_ev.get('latency_ms', 0):.0f}" if all_ev else "-"
         pool_str = (
@@ -3704,7 +3707,7 @@ def cmd_scroll(events: list[dict]) -> None:
         )
         print(
             f"  {seq:>3}  {rel:6.2f}s  {s.get('visible_first_idx', '?'):>9}  "
-            f"{s.get('visible_target_count', '?'):>6}  "
+            f"{target_count:>6}  "
             f"{s.get('already_loaded', '?'):>7}  {first_ms:>8}  {all_ms:>8}  {pool_str}"
         )
 

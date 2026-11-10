@@ -25,7 +25,7 @@ pub(super) fn normal_source_for_page(
     resource
 }
 
-fn native_pages(app: &App, pages: &[PreparedPagedPage]) -> Vec<PreparedPagedPage> {
+pub(super) fn native_pages(app: &App, pages: &[PreparedPagedPage]) -> Vec<PreparedPagedPage> {
     pages
         .iter()
         .map(|page| {
@@ -296,7 +296,7 @@ fn stable_presentation_quality_publication_defers_new_source_prepare_single_and_
 }
 
 #[derive(Clone, Copy, Debug)]
-enum ViewChange {
+pub(super) enum ViewChange {
     Resize,
     Dpi,
     Fit,
@@ -305,7 +305,7 @@ enum ViewChange {
     Filter,
 }
 
-fn changed_transform(
+pub(super) fn changed_transform(
     old: &DisplayedImageTransform,
     texture_size: egui::Vec2,
     change: ViewChange,
@@ -895,6 +895,282 @@ enum AbsentChange {
     Dpi,
     Fit,
     DownscaleSmoothing,
+}
+
+#[test]
+fn initial_placement_rejected_native_pair_commits_only_actual_thumbnail_geometry() {
+    for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
+        let (ctx, mut app, held) = start_native_turn_with_source_size(mode, Some([320, 480]));
+        prepare_absent_stage(&mut app, AbsentStage::CompletingOff);
+        evict_normal_sources(&mut app, &ctx, &held);
+        let thumbnails = install_allowed_thumbnails(&mut app, &ctx, &held);
+        app.settings.fullscreen_fit_mode = FullscreenFitMode::Original;
+        app.settings.fullscreen_page_start_position =
+            crate::settings::FullscreenPageStartPosition::ReadingStart;
+        let anchor = app.fullscreen_idx.unwrap();
+        app.request_fs_initial_placement(anchor);
+        assert_eq!(app.fs_pan, egui::Vec2::ZERO);
+        for page in &held {
+            let candidate = app
+                .fullscreen_paint_payload_for_page(page.occurrence.idx, None, false)
+                .expect("the source-free Native remains a candidate until actual prepare");
+            assert!(candidate.source_texture().is_none());
+            // Native's selected raster is 320x480 per page; actual fallback
+            // thumbnails carry the existing 80x120 spread display basis.
+            assert_eq!(candidate.full_source_size_vec2(), egui::vec2(320.0, 480.0));
+        }
+        let output = frame(&ctx, |ui, ctx| {
+            let sources = draw_with_absent_source(&mut app, ui, ctx, &held, false);
+            assert_eq!(sources.pages.len(), 2);
+            assert!(
+                sources
+                    .pages
+                    .iter()
+                    .zip(&thumbnails)
+                    .all(|(page, id)| page.resource.paint_texture_id() == *id)
+            );
+            let first = app
+                .fullscreen_page_layout
+                .page_by_idx(held[0].occurrence.idx)
+                .unwrap()
+                .transform;
+            let second = app
+                .fullscreen_page_layout
+                .page_by_idx(held[1].occurrence.idx)
+                .unwrap()
+                .transform;
+            let unit = first.paint_rect.union(second.paint_rect);
+            assert!(unit.width() < ui.max_rect().width());
+            assert!(unit.height() < ui.max_rect().height());
+            assert!((unit.center().x - ui.max_rect().center().x).abs() < 1.01);
+            assert!((unit.center().y - ui.max_rect().center().y).abs() < 1.01);
+            assert_eq!(
+                app.fs_pan,
+                egui::Vec2::ZERO,
+                "rejected large Native must not commit its initial-placement proposal"
+            );
+            let request = app
+                .fs_initial_placement_request
+                .expect("actual fallback is provisional");
+            assert_eq!(request.applied_pan, egui::Vec2::ZERO);
+            assert_eq!(request.applied_zoom, app.fs_zoom);
+        });
+        let painted = texture_ids_in_output(&output);
+        assert!(thumbnails.iter().all(|id| painted.contains(id)));
+        assert!(
+            held.iter()
+                .all(|page| !painted.contains(&page.resource.paint_texture_id()))
+        );
+        output.drop_without_applying_deltas();
+    }
+}
+
+#[test]
+fn initial_placement_one_rejected_native_side_recomputes_the_actual_mixed_unit() {
+    for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
+        let (ctx, mut app, held) = start_native_turn_with_source_size(mode, Some([320, 480]));
+        prepare_absent_stage(&mut app, AbsentStage::CompletingOff);
+        evict_normal_sources(&mut app, &ctx, &held);
+        let thumbnails = install_allowed_thumbnails(&mut app, &ctx, &held);
+        let complete_idx = held[1].occurrence.idx;
+        let pixels = Arc::new(egui::ColorImage::filled(
+            [320, 480],
+            egui::Color32::LIGHT_BLUE,
+        ));
+        let complete = ctx.load_texture(
+            "initial-placement-mixed-complete-side",
+            (*pixels).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            complete_idx,
+            FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
+                tex: complete,
+                pixels,
+                source_dims: Some([320, 480]),
+                load_seq: 2,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        app.settings.fullscreen_fit_mode = FullscreenFitMode::Original;
+        app.settings.fullscreen_page_start_position =
+            crate::settings::FullscreenPageStartPosition::ReadingStart;
+        let anchor = app.fullscreen_idx.unwrap();
+        app.request_fs_initial_placement(anchor);
+        let mut complete_id = None;
+        let output = frame(&ctx, |ui, ctx| {
+            let complete = app
+                .resolve_fs_processed_material(ctx, complete_idx, false)
+                .expect("ordinary complete-side selector");
+            assert_eq!(
+                complete.page_material_kind(),
+                crate::gpu_lanczos::FullscreenPageMaterialKind::Complete
+            );
+            complete_id = Some(complete.source_texture_id());
+            let sources = draw_with_absent_source(&mut app, ui, ctx, &held, false);
+            assert_eq!(sources.pages.len(), 2);
+            assert_eq!(sources.pages[0].resource.paint_texture_id(), thumbnails[0]);
+            assert_eq!(
+                sources.pages[1].resource.source_texture_id(),
+                complete_id.unwrap()
+            );
+            assert_eq!(
+                sources.pages[1].resource.page_material_kind(),
+                crate::gpu_lanczos::FullscreenPageMaterialKind::Complete
+            );
+            let first = app
+                .fullscreen_page_layout
+                .page_by_idx(held[0].occurrence.idx)
+                .unwrap()
+                .transform;
+            let second = app
+                .fullscreen_page_layout
+                .page_by_idx(complete_idx)
+                .unwrap()
+                .transform;
+            let unit = first.paint_rect.union(second.paint_rect);
+            assert!(
+                unit.width() < ui.max_rect().width(),
+                "actual mixed unit fits horizontally"
+            );
+            assert!(unit.height() > ui.max_rect().height());
+            assert!((unit.center().x - ui.max_rect().center().x).abs() < 1.01);
+            assert!((unit.top() - ui.max_rect().top()).abs() < 1.01);
+            assert_eq!(
+                app.fs_pan.x, 0.0,
+                "the rejected pair's horizontal alignment is not part of the accepted mixed unit"
+            );
+            let request = app
+                .fs_initial_placement_request
+                .expect("one provisional side keeps the unit request");
+            assert_eq!(request.applied_pan, app.fs_pan);
+        });
+        let painted = texture_ids_in_output(&output);
+        assert!(painted.contains(&thumbnails[0]));
+        assert!(painted.contains(&complete_id.expect("selected complete-side material")));
+        assert!(
+            held.iter()
+                .all(|page| !painted.contains(&page.resource.paint_texture_id()))
+        );
+        output.drop_without_applying_deltas();
+    }
+}
+
+#[test]
+fn initial_placement_missing_native_fallback_keeps_committed_pan_and_request_for_partial_paint() {
+    let (ctx, mut app, held) =
+        start_native_turn_with_source_size(SpreadMode::Ltr, Some([320, 480]));
+    prepare_absent_stage(&mut app, AbsentStage::CompletingOff);
+    evict_normal_sources(&mut app, &ctx, &held);
+    let complete_idx = held[1].occurrence.idx;
+    let pixels = Arc::new(egui::ColorImage::filled(
+        [320, 480],
+        egui::Color32::LIGHT_BLUE,
+    ));
+    let complete = ctx.load_texture(
+        "initial-placement-partial-only-side",
+        (*pixels).clone(),
+        egui::TextureOptions::LINEAR,
+    );
+    app.fs_cache.insert(
+        complete_idx,
+        FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
+            pdf_metadata: None,
+            tex: complete,
+            pixels,
+            source_dims: Some([320, 480]),
+            load_seq: 2,
+            animation: crate::fs_animation::StaticAnimationState::Still,
+        },
+    );
+    app.settings.fullscreen_fit_mode = FullscreenFitMode::Original;
+    app.settings.fullscreen_page_start_position =
+        crate::settings::FullscreenPageStartPosition::ReadingStart;
+    app.fs_pan = egui::vec2(7.0, 13.0);
+    let anchor = app.fullscreen_idx.unwrap();
+    app.request_fs_initial_placement(anchor);
+    let request = app.fs_initial_placement_request;
+    let pan = app.fs_pan;
+    frame(&ctx, |ui, ctx| {
+        let sources = draw_with_absent_source(&mut app, ui, ctx, &held, false);
+        assert_eq!(
+            sources.pages.len(),
+            1,
+            "the rejected side has no usable thumbnail"
+        );
+        assert_eq!(sources.pages[0].occurrence.idx, complete_idx);
+        assert_eq!(app.fs_pan, pan);
+        assert_eq!(app.fs_initial_placement_request, request);
+        let painted = app
+            .fullscreen_page_layout
+            .page_by_idx(complete_idx)
+            .unwrap()
+            .transform;
+        assert_eq!(
+            painted.placement,
+            ResolvedDisplayPlacement::Normal {
+                zoom_pan: Some((1.0, pan))
+            },
+            "partial material must paint with the same committed transform the App still owns"
+        );
+    })
+    .drop_without_applying_deltas();
+}
+
+#[test]
+fn initial_placement_center_and_reading_start_without_request_keep_existing_native_fallback_geometry()
+ {
+    let mut baseline = None;
+    for reading_start in [false, true] {
+        let (ctx, mut app, held) =
+            start_native_turn_with_source_size(SpreadMode::Ltr, Some([320, 480]));
+        prepare_absent_stage(&mut app, AbsentStage::CompletingOff);
+        evict_normal_sources(&mut app, &ctx, &held);
+        let thumbnails = install_allowed_thumbnails(&mut app, &ctx, &held);
+        app.settings.fullscreen_fit_mode = FullscreenFitMode::Original;
+        app.settings.fullscreen_page_start_position = if reading_start {
+            crate::settings::FullscreenPageStartPosition::ReadingStart
+        } else {
+            crate::settings::FullscreenPageStartPosition::Center
+        };
+        assert!(app.fs_initial_placement_request.is_none());
+        frame(&ctx, |ui, ctx| {
+            let sources = draw_with_absent_source(&mut app, ui, ctx, &held, false);
+            assert_eq!(sources.pages.len(), 2);
+            assert!(
+                sources
+                    .pages
+                    .iter()
+                    .zip(&thumbnails)
+                    .all(|(page, id)| page.resource.paint_texture_id() == *id)
+            );
+            let geometry: Vec<_> = held
+                .iter()
+                .map(|page| {
+                    app.fullscreen_page_layout
+                        .page_by_idx(page.occurrence.idx)
+                        .unwrap()
+                        .transform
+                        .paint_rect
+                })
+                .collect();
+            if reading_start {
+                assert_eq!(
+                    Some(&geometry),
+                    baseline.as_ref(),
+                    "the setting alone cannot create an entry alignment"
+                );
+            } else {
+                baseline = Some(geometry);
+            }
+            assert_eq!(app.fs_pan, egui::Vec2::ZERO);
+            assert!(app.fs_initial_placement_request.is_none());
+        })
+        .drop_without_applying_deltas();
+    }
 }
 
 #[test]

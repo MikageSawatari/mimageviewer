@@ -359,8 +359,25 @@ fn crop_legacy_accepted_basis_rejects_changed_document_and_owner() {
 
     let layout = Arc::clone(&app.spread_display_units_cache.units);
     app.spread_display_units_cache.units = Arc::new((*layout).clone());
-    assert_eq!(accepted_basis(&app), None);
+    assert_eq!(
+        accepted_basis(&app),
+        Some(legacy.with_legacy_source_size([80, 120])),
+        "equivalent layout allocation preserves the accepted legacy basis"
+    );
     app.spread_display_units_cache.units = layout;
+    app.rotation_cache
+        .insert(1, crate::rotation_db::Rotation::Cw90);
+    app.reconcile_spread_landscape_for_idx(1);
+    app.spread_display_composition_for_anchor(1);
+    assert_eq!(
+        accepted_basis(&app),
+        None,
+        "a real unit/content change rejects the old basis"
+    );
+    app.rotation_cache
+        .insert(1, crate::rotation_db::Rotation::None);
+    app.reconcile_spread_landscape_for_idx(1);
+    app.spread_display_composition_for_anchor(1);
     let PresentationState::Offered { offer, .. } = &mut app.page_turn_presentation.state else {
         panic!()
     };

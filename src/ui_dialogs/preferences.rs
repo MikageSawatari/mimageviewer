@@ -56,6 +56,8 @@ pub fn draw_fullscreen_fit_cycle_settings_snapshot_fixture(ui: &mut egui::Ui) {
         "SpecifiedScale".into(),
     ];
     pages::draw_fullscreen_fit_cycle_settings(ui, &mut settings);
+    ui.add_space(8.0);
+    pages::draw_fullscreen_page_start_position_setting(ui, &mut settings);
 }
 
 #[doc(hidden)]
@@ -2836,6 +2838,7 @@ impl App {
                 self.settings.epub_file_handling,
             );
             let old_grid_display_order = self.settings.grid_display_order.clone();
+            let old_thumb_container_type_icon_only = self.settings.thumb_container_type_icon_only;
             let old_rating_sort_unrated_position = self.settings.rating_sort_unrated_position;
             let old_show_hidden_files = self.settings.show_hidden_files;
             let file_type_visibility_changed =
@@ -2937,6 +2940,20 @@ impl App {
             }
             prepare_preferences_state_settings_for_commit(&mut state, &mut self.settings);
             self.install_preferences_settings(state.settings);
+            if old_thumb_container_type_icon_only != self.settings.thumb_container_type_icon_only {
+                if !self.settings.thumb_container_type_icon_only {
+                    // Restore only the mounted list's suppressed display states.
+                    // Requests, caches, pins and parked viewer contexts keep their owners.
+                    for (item, thumb) in self.items.iter().zip(self.thumbnails.iter_mut()) {
+                        if crate::grid_item::container_icon_only(item, true)
+                            && matches!(thumb, crate::grid_item::ThumbnailState::NoArt)
+                        {
+                            *thumb = crate::grid_item::ThumbnailState::Pending;
+                        }
+                    }
+                }
+                ctx.request_repaint();
+            }
             if old_auto_view_trim_default_enabled != self.settings.auto_view_trim_default_enabled {
                 #[cfg(windows)]
                 self.invalidate_auto_view_trim_display_in_parked_contexts();
@@ -5790,6 +5807,135 @@ mod tests {
             db.load_into_settings().unwrap().thumb_show_type_icon,
             !initial
         );
+    }
+
+    #[test]
+    fn thumb_container_type_icon_only_preferences_ok_cancel_save_and_reopen() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_view_harness(PreferencesPage::Thumbnail);
+        let label = "フォルダ・書庫・PDF を種類のアイコンで表示する";
+        let db = crate::settings_db::SettingsDb::open(harness.state().tmp.path()).unwrap();
+        for (cancel, expected) in [(true, false), (false, true), (true, true), (false, false)] {
+            if !harness.state().show_preferences {
+                harness
+                    .state_mut()
+                    .open_preferences_page(PreferencesPage::Thumbnail);
+                harness.run_steps(3);
+            }
+            let before = harness.state().settings.thumb_container_type_icon_only;
+            assert!(!harness.state().preferences_dialog_has_unsaved_changes());
+            harness.get_by_label(label).click();
+            harness.run_steps(3);
+            assert_eq!(
+                harness.state().settings.thumb_container_type_icon_only,
+                before
+            );
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .thumb_container_type_icon_only,
+                !before
+            );
+            harness
+                .get_by_label(if cancel { "キャンセル" } else { "  OK  " })
+                .click();
+            harness.run_steps(3);
+            if cancel {
+                harness.get_by_label("破棄して閉じる").click();
+                harness.run_steps(3);
+            }
+            assert!(!harness.state().show_preferences);
+            assert_eq!(
+                harness.state().settings.thumb_container_type_icon_only,
+                expected
+            );
+            assert_eq!(
+                db.load_into_settings()
+                    .unwrap()
+                    .thumb_container_type_icon_only,
+                expected
+            );
+            harness
+                .state_mut()
+                .open_preferences_page(PreferencesPage::Thumbnail);
+            harness.run_steps(3);
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .thumb_container_type_icon_only,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn thumb_container_type_icon_only_preferences_restore_only_current_container_no_art() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.current_folder = None;
+        app.items = vec![
+            GridItem::Folder("C:/books".into()),
+            GridItem::ZipFile("C:/book.zip".into()),
+            GridItem::PdfFile("C:/book.pdf".into()),
+            GridItem::Folder("C:/pending".into()),
+            GridItem::Folder("C:/failed".into()),
+            GridItem::Image("C:/picture.png".into()),
+            GridItem::Audio("C:/song.mp3".into()),
+        ];
+        app.thumbnails = vec![
+            ThumbnailState::NoArt,
+            ThumbnailState::NoArt,
+            ThumbnailState::Evicted,
+            ThumbnailState::Pending,
+            ThumbnailState::Failed,
+            ThumbnailState::NoArt,
+            ThumbnailState::NoArt,
+        ];
+        app.selected = Some(1);
+        app.grid_scroll.set_position(200.0);
+        let scroll = app.grid_scroll.clone();
+        let items = app.items.clone();
+        let generation = app.items_generation;
+        let state = |settings: &Settings, enabled| {
+            let mut state = preferences_state_for_test(settings);
+            state.settings.thumb_container_type_icon_only = enabled;
+            Box::new(state)
+        };
+        app.pref_state = Some(state(&app.settings, true));
+        app.apply_preferences_dialog(&ctx);
+        assert!(app.settings.thumb_container_type_icon_only);
+        assert!(matches!(app.thumbnails[0], ThumbnailState::NoArt));
+        assert!(matches!(app.thumbnails[2], ThumbnailState::Evicted));
+
+        // Cancel preserves both the live option and the suppressed display state.
+        app.pref_state = Some(state(&app.settings, false));
+        app.discard_preferences_dialog();
+        assert!(app.settings.thumb_container_type_icon_only);
+        assert!(matches!(app.thumbnails[0], ThumbnailState::NoArt));
+        app.pref_state = Some(state(&app.settings, false));
+        app.apply_preferences_dialog(&ctx);
+        assert!(!app.settings.thumb_container_type_icon_only);
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Pending));
+        assert!(matches!(app.thumbnails[1], ThumbnailState::Pending));
+        assert!(matches!(app.thumbnails[2], ThumbnailState::Evicted));
+        assert!(matches!(app.thumbnails[3], ThumbnailState::Pending));
+        assert!(matches!(app.thumbnails[4], ThumbnailState::Failed));
+        assert!(matches!(app.thumbnails[5], ThumbnailState::NoArt));
+        assert!(matches!(app.thumbnails[6], ThumbnailState::NoArt));
+        assert!(app.current_folder.is_none());
+        assert_eq!(app.items, items);
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.grid_scroll, scroll);
     }
 
     #[test]

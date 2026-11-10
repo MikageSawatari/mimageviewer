@@ -1258,6 +1258,7 @@ impl App {
         }
         let recipe = self.projection_recipe.clone();
         let was_fullscreen = self.fullscreen_idx.is_some();
+        let previous_mode = self.spread_mode;
         let landing = self
             .fullscreen_idx
             .and_then(|index| reply.refresh_landings.get(&index).copied())
@@ -1503,6 +1504,9 @@ impl App {
                 self.move_grid_cursor(Some(index), super::GridCursorIntent::Automatic);
             } else if !self.has_book_projection_open_continuation() {
                 self.close_fullscreen();
+            }
+            if self.spread_mode != previous_mode {
+                self.request_fs_initial_placement_after_composition_change();
             }
         }
         ctx.request_repaint();

@@ -5096,6 +5096,61 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn thumb_container_type_icon_only_preferences_preserve_everything_results() {
+        let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let folder = app.tmp.path().join("folder");
+        let image = app.tmp.path().join("picture.png");
+        std::fs::create_dir(&folder).unwrap();
+        image::RgbImage::new(2, 3).save(&image).unwrap();
+        let dataset =
+            everything_dataset_for_test(vec![GridItem::Folder(folder), GridItem::Image(image)]);
+        app.settings.thumb_container_type_icon_only = true;
+        adopt_everything_for_test(&mut app, &ctx, "picture OR folder", Arc::clone(&dataset));
+        for idx in 0..app.items.len() {
+            if crate::grid_item::container_icon_only(&app.items[idx], true) {
+                app.thumbnails[idx] = ThumbnailState::NoArt;
+            }
+        }
+        app.selected = Some(1);
+        app.grid_scroll.set_position(200.0);
+        let items = app.items.clone();
+        let scroll = app.grid_scroll.clone();
+        let folder = app.current_folder.clone();
+        let generation = app.items_generation;
+        let surface = app.top_level_grid_view.surface().clone();
+        let visibility = app.settings.file_type_visibility.clone();
+        app.set_visibility_preferences_for_test(visibility);
+        app.pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .thumb_container_type_icon_only = false;
+        app.apply_preferences_dialog(&ctx);
+        assert!(!app.settings.thumb_container_type_icon_only);
+        assert_eq!(app.items, items);
+        assert_eq!(app.current_folder, folder);
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.grid_scroll, scroll);
+        assert_eq!(app.top_level_grid_view.surface(), &surface);
+        assert_eq!(app.global_search.source, SearchSource::Everything);
+        assert_eq!(
+            app.global_search.accepted.applied_query(),
+            "picture OR folder"
+        );
+        assert!(matches!(&app.global_search.accepted,
+            SearchAccepted::Everything { dataset: accepted, position: EverythingPosition::Root, .. }
+                if Arc::ptr_eq(accepted, &dataset)));
+        for (item, thumb) in app.items.iter().zip(&app.thumbnails) {
+            if crate::grid_item::container_icon_only(item, true) {
+                assert!(matches!(thumb, ThumbnailState::Pending));
+            }
+        }
+    }
+
+    #[test]
     fn acceptance_d_display_spellings_share_container_and_drill_keys() {
         let mut state = GlobalSearchState::default();
         for (path, kind) in [

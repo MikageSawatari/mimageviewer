@@ -333,7 +333,7 @@ fn page_turn_merge_master_explicit_singletons_project_without_automatic_cover_pr
                 let first = capture_composed_flat(&ctx, &mut app, 0);
                 let pair = capture_composed_flat(&ctx, &mut app, 1);
                 assert_eq!(
-                    first.layout[0].formation,
+                    first.binding.layout.formation,
                     SpreadDisplayUnitFormation::Singleton(
                         SpreadDisplaySingletonCause::ExplicitAlone,
                     )
@@ -348,7 +348,7 @@ fn page_turn_merge_master_explicit_singletons_project_without_automatic_cover_pr
                     },
                     "explicit Alone uses the effective first endpoint policy"
                 );
-                assert_eq!(pair.layout[1].pages, vec![1, 2]);
+                assert_eq!(pair.binding.layout.pages, vec![1, 2]);
                 let canonical = canonical_unit(&first).unwrap_or_else(|reason| {
                     panic!("{direction:?}/cover={cover}/hidden={reordered_hidden}: {reason}")
                 });

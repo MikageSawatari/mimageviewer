@@ -98,7 +98,11 @@ fn draw(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) -> SubmittedUnitR
         .expect("a partial or underlay-only page still has a submitted transform");
     app.fullscreen_page_layout
         .push_occurrence(transform, screen[0]);
-    assert!(sources.rebind_occurrences(&screen));
+    assert!(sources.rebind_occurrences(&screen, || {
+        screen
+            .first()
+            .and_then(|o| app.page_turn_unit_binding(o.navigation_anchor_idx))
+    }));
     let FsDisplayUnitSubmission::Paged(receipt) = &sources.submission else {
         panic!("ordinary draw must produce the page-turn receipt");
     };

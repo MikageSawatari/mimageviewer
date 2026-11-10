@@ -17530,7 +17530,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     },
                     rating,
                     &self.items[idx],
-                    &self.thumbnails[idx],
+                    crate::grid_item::effective_thumbnail_state(
+                        &self.items[idx],
+                        &self.thumbnails[idx],
+                        self.settings.thumb_container_type_icon_only,
+                    ),
                     &tags,
                     bookmark_time.as_deref(),
                     bookmark_title.as_deref(),
@@ -17547,7 +17551,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 );
                 let rotation = self.get_rotation(idx);
                 let resume = self.thumbnail_resume_meter(idx);
-                let adjusted = if self.adjustment_dragging {
+                let adjusted = if self.adjustment_dragging
+                    || crate::grid_item::container_icon_only(
+                        &self.items[idx],
+                        self.settings.thumb_container_type_icon_only,
+                    ) {
                     None
                 } else {
                     self.thumb_adjust_tex.get(&idx)
@@ -17560,7 +17568,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     spread_cursor,
                     &overlay,
                     &self.items[idx],
-                    &self.thumbnails[idx],
+                    crate::grid_item::effective_thumbnail_state(
+                        &self.items[idx],
+                        &self.thumbnails[idx],
+                        self.settings.thumb_container_type_icon_only,
+                    ),
                     rotation,
                     adjusted,
                     self.items_are_drive_list,
@@ -18864,6 +18876,14 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         ctx: &egui::Context,
         hovered_preview: Option<(usize, egui::Rect)>,
     ) {
+        let hovered_preview = hovered_preview.filter(|(idx, _)| {
+            self.items.get(*idx).is_some_and(|item| {
+                !crate::grid_item::container_icon_only(
+                    item,
+                    self.settings.thumb_container_type_icon_only,
+                )
+            })
+        });
         let viewport_id = egui::ViewportId::from_hash_of("details_thumbnail_tooltip");
         if self.items_are_drive_list || hovered_preview.is_none() {
             self.set_details_hover_thumbnail_idx(None);
@@ -21229,7 +21249,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     edit_flags,
                                     rating,
                                     &self.items[idx],
-                                    &self.thumbnails[idx],
+                                    crate::grid_item::effective_thumbnail_state(
+                                        &self.items[idx],
+                                        &self.thumbnails[idx],
+                                        self.settings.thumb_container_type_icon_only,
+                                    ),
                                     &tags,
                                     bookmark_time.as_deref(),
                                     bookmark_title.as_deref(),
@@ -21253,7 +21277,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     if !self.adjustment_dragging {
                                         self.maybe_apply_thumb_adjustment(ctx, idx, "visible");
                                     }
-                                    let adjusted = if self.adjustment_dragging {
+                                    let adjusted = if self.adjustment_dragging
+                                        || crate::grid_item::container_icon_only(
+                                            &self.items[idx],
+                                            self.settings.thumb_container_type_icon_only,
+                                        ) {
                                         None
                                     } else {
                                         self.thumb_adjust_tex.get(&idx)
@@ -21269,7 +21297,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         spread_pair_cursor_idx == Some(idx),
                                         &overlay_layout,
                                         &self.items[idx],
-                                        &self.thumbnails[idx],
+                                        crate::grid_item::effective_thumbnail_state(
+                                            &self.items[idx],
+                                            &self.thumbnails[idx],
+                                            self.settings.thumb_container_type_icon_only,
+                                        ),
                                         rot,
                                         adjusted,
                                         self.items_are_drive_list,
@@ -21346,7 +21378,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         edit_flags,
                                         rating,
                                         &self.items[idx],
-                                        &self.thumbnails[idx],
+                                        crate::grid_item::effective_thumbnail_state(
+                                            &self.items[idx],
+                                            &self.thumbnails[idx],
+                                            self.settings.thumb_container_type_icon_only,
+                                        ),
                                         &tags,
                                         bookmark_time.as_deref(),
                                         bookmark_title.as_deref(),
@@ -21379,7 +21415,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     if hit_areas.is_none() && !self.adjustment_dragging {
                                         self.maybe_apply_thumb_adjustment(ctx, idx, "visible");
                                     }
-                                    let adjusted_tex = if self.adjustment_dragging {
+                                    let adjusted_tex = if self.adjustment_dragging
+                                        || crate::grid_item::container_icon_only(
+                                            &self.items[idx],
+                                            self.settings.thumb_container_type_icon_only,
+                                        ) {
                                         None
                                     } else {
                                         self.thumb_adjust_tex.get(&idx)
@@ -21403,7 +21443,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         spread_pair_cursor_idx == Some(idx),
                                         &overlay_layout,
                                         &self.items[idx],
-                                        &self.thumbnails[idx],
+                                        crate::grid_item::effective_thumbnail_state(
+                                            &self.items[idx],
+                                            &self.thumbnails[idx],
+                                            self.settings.thumb_container_type_icon_only,
+                                        ),
                                         rot,
                                         adjusted_tex,
                                         self.items_are_drive_list,
@@ -36561,6 +36605,31 @@ mod pinned_search_review_tests {
                 "{kind:?}"
             );
             assert!(!app.borrow().settings.toolbar_section_drag_enabled);
+        }
+    }
+}
+
+#[cfg(test)]
+mod container_type_icon_hover_tests {
+    use super::*;
+
+    #[test]
+    fn container_type_icons_hover_does_not_open_and_closes_existing_preview() {
+        let mut env = crate::app::tests::phase_c_support::setup_app();
+        let app = &mut env.app;
+        let ctx = egui::Context::default();
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.settings.thumb_container_type_icon_only = true;
+        app.items = vec![GridItem::Folder("c:/shelf/book".into())];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        let anchor = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(32.0, 32.0));
+        for already_open in [false, true] {
+            app.details_hover_thumb_viewport_open = already_open;
+            app.render_details_thumbnail_tooltip(&ctx, Some((0, anchor)));
+            assert!(!app.details_hover_thumb_viewport_open);
+            assert_eq!(app.details_hover_thumb_idx, None);
+            assert!(app.requested.is_empty());
+            assert!(matches!(app.thumbnails[0], ThumbnailState::Pending));
         }
     }
 }

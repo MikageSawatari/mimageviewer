@@ -226,12 +226,21 @@ pub(crate) struct TestPaintProvenance {
     pub(crate) page: usize,
 }
 
+/// The producer/selector's actual page-material role. Provisional materials
+/// stand in for the completed page; resampling preserves this classification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FullscreenPageMaterialKind {
+    Complete,
+    Provisional,
+}
+
 #[derive(Clone)]
 pub(crate) enum FullscreenPaintResource {
     Direct {
         source: egui::TextureHandle,
         coverage: SourceCoverage,
         display_basis: MaterialDisplayBasis,
+        page_material_kind: FullscreenPageMaterialKind,
         #[cfg(test)]
         test_paint_provenance: Option<TestPaintProvenance>,
         #[cfg(all(windows, feature = "test-script"))]
@@ -243,6 +252,7 @@ pub(crate) enum FullscreenPaintResource {
         generation: FullscreenPaintSourceGeneration,
         coverage: SourceCoverage,
         display_basis: MaterialDisplayBasis,
+        page_material_kind: FullscreenPageMaterialKind,
         #[cfg(test)]
         test_paint_provenance: Option<TestPaintProvenance>,
         #[cfg(all(windows, feature = "test-script"))]
@@ -256,6 +266,7 @@ pub(crate) enum FullscreenPaintResource {
         output: Arc<LanczosOutput>,
         coverage: SourceCoverage,
         display_basis: MaterialDisplayBasis,
+        page_material_kind: FullscreenPageMaterialKind,
         #[cfg(test)]
         test_paint_provenance: Option<TestPaintProvenance>,
         #[cfg(all(windows, feature = "test-script"))]
@@ -295,6 +306,7 @@ impl FullscreenPaintResource {
             material,
             coverage: self.source_coverage(),
             display_basis: self.display_basis(),
+            page_material_kind: self.page_material_kind(),
             #[cfg(test)]
             test_paint_provenance: self.test_paint_provenance().cloned(),
             #[cfg(all(windows, feature = "test-script"))]
@@ -309,6 +321,7 @@ impl FullscreenPaintResource {
             source,
             coverage: SourceCoverage::FullSource,
             display_basis,
+            page_material_kind: FullscreenPageMaterialKind::Complete,
             #[cfg(test)]
             test_paint_provenance: None,
             #[cfg(all(windows, feature = "test-script"))]
@@ -349,11 +362,41 @@ impl FullscreenPaintResource {
             generation,
             coverage: SourceCoverage::FullSource,
             display_basis,
+            page_material_kind: FullscreenPageMaterialKind::Complete,
             #[cfg(test)]
             test_paint_provenance: None,
             #[cfg(all(windows, feature = "test-script"))]
             test_script_content_proof: None,
         }
+    }
+
+    pub(crate) fn page_material_kind(&self) -> FullscreenPageMaterialKind {
+        match self {
+            Self::Direct {
+                page_material_kind, ..
+            }
+            | Self::Resampleable {
+                page_material_kind, ..
+            }
+            | Self::Lanczos {
+                page_material_kind, ..
+            } => *page_material_kind,
+        }
+    }
+
+    pub(crate) fn with_page_material_kind(mut self, value: FullscreenPageMaterialKind) -> Self {
+        match &mut self {
+            Self::Direct {
+                page_material_kind, ..
+            }
+            | Self::Resampleable {
+                page_material_kind, ..
+            }
+            | Self::Lanczos {
+                page_material_kind, ..
+            } => *page_material_kind = value,
+        }
+        self
     }
 
     pub(crate) fn source_texture(&self) -> &egui::TextureHandle {
@@ -675,7 +718,8 @@ impl FullscreenPaintResource {
                 let original =
                     Self::resampleable_for_source(*source_id, source.clone(), *generation)
                         .with_source_coverage(self.source_coverage())
-                        .with_display_basis(self.display_basis());
+                        .with_display_basis(self.display_basis())
+                        .with_page_material_kind(self.page_material_kind());
                 #[cfg(test)]
                 let original = if let Some(proof) = self.test_paint_provenance().cloned() {
                     original.with_test_paint_provenance(proof)
@@ -702,6 +746,7 @@ impl FullscreenPaintResource {
             output,
             coverage: self.source_coverage(),
             display_basis: self.display_basis(),
+            page_material_kind: self.page_material_kind(),
             #[cfg(test)]
             test_paint_provenance: self.test_paint_provenance().cloned(),
             #[cfg(all(windows, feature = "test-script"))]
@@ -783,6 +828,7 @@ pub(crate) struct FullscreenPresentationResource {
     material: PresentationMaterial,
     coverage: SourceCoverage,
     display_basis: MaterialDisplayBasis,
+    page_material_kind: FullscreenPageMaterialKind,
     #[cfg(test)]
     test_paint_provenance: Option<TestPaintProvenance>,
     #[cfg(all(windows, feature = "test-script"))]
@@ -800,6 +846,10 @@ enum PresentationMaterial {
 }
 
 impl FullscreenPresentationResource {
+    pub(crate) fn page_material_kind(&self) -> FullscreenPageMaterialKind {
+        self.page_material_kind
+    }
+
     pub(crate) fn display_basis(&self) -> MaterialDisplayBasis {
         self.display_basis
     }
@@ -1045,6 +1095,13 @@ impl From<FullscreenPaintResource> for FullscreenPaintPayload {
 }
 
 impl FullscreenPaintPayload {
+    pub(crate) fn page_material_kind(&self) -> FullscreenPageMaterialKind {
+        match self {
+            Self::NormalResource(resource) => resource.page_material_kind(),
+            Self::PresentationMaterial(resource) => resource.page_material_kind(),
+        }
+    }
+
     pub(crate) fn display_basis(&self) -> MaterialDisplayBasis {
         match self {
             Self::NormalResource(resource) => resource.display_basis(),
@@ -3685,6 +3742,75 @@ mod tests {
             FullscreenPaintScaleBranch::OriginalOneToOne
         );
         assert!(physical_scale_is_near_integer(0.5, 2.0));
+    }
+
+    #[test]
+    fn page_material_kind_survives_prepare_capture_and_native_reconstruction() {
+        let ctx = egui::Context::default();
+        let texture = metadata_only_texture(&ctx, [60, 80], egui::TextureOptions::LINEAR);
+        let direct = FullscreenPaintResource::direct(texture.clone());
+        let source = FullscreenPaintResource::resampleable(
+            2,
+            texture,
+            FullscreenPaintSourceGeneration { items: 4, input: 7 },
+        );
+        assert_eq!(
+            direct.page_material_kind(),
+            FullscreenPageMaterialKind::Complete
+        );
+        assert_eq!(
+            source.page_material_kind(),
+            FullscreenPageMaterialKind::Complete
+        );
+
+        // The same allocation can be selected as either a loaded page or a stand-in.
+        // Its dimensions, ID and resampling output must never determine that choice.
+        let native = test_native_resource(source.clone(), [30, 40]);
+        for kind in [
+            FullscreenPageMaterialKind::Complete,
+            FullscreenPageMaterialKind::Provisional,
+        ] {
+            let source = source.clone().with_page_material_kind(kind);
+            let native = source.with_lanczos(Arc::clone(native.lanczos_output().unwrap()), 0);
+            for resource in [
+                direct.clone().with_page_material_kind(kind),
+                source,
+                native.clone(),
+                native.original_resampleable(),
+            ] {
+                assert_eq!(resource.page_material_kind(), kind);
+                let payload = FullscreenPaintPayload::from(resource);
+                assert_eq!(payload.page_material_kind(), kind);
+                let mut cache = GpuLanczosCache::default();
+                let (prepared, _) = payload.prepare(
+                    &mut cache,
+                    None,
+                    0.5,
+                    1.0,
+                    None,
+                    PostFilter::None,
+                    0,
+                    AnimeUpscaleSourceLimit::default(),
+                );
+                assert_eq!(prepared.page_material_kind(), kind);
+                let captured = payload.capture_presentation(&ctx);
+                assert_eq!(captured.page_material_kind(), kind);
+                let held = FullscreenPaintPayload::PresentationMaterial(captured);
+                assert_eq!(held.page_material_kind(), kind);
+                assert_eq!(held.capture_presentation(&ctx).page_material_kind(), kind);
+                let (prepared_held, _) = held.prepare(
+                    &mut cache,
+                    None,
+                    2.0,
+                    1.0,
+                    None,
+                    PostFilter::None,
+                    0,
+                    AnimeUpscaleSourceLimit::default(),
+                );
+                assert_eq!(prepared_held.page_material_kind(), kind);
+            }
+        }
     }
 
     #[test]
