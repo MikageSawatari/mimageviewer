@@ -10,7 +10,8 @@ backlog §1.754 の記録。PDFium を `chromium/8125` から `chromium/8138` �
 | --- | --- | --- |
 | PDFium | `chromium/8125`, `158.0.8125.0` | `chromium/8138`, `159.0.8138.0` (2026-11-04 公開) |
 
-コードの変更はない。`vendor/` は git 管理外なので、ブランチに入るのは文書だけ。
+PDFium DLL 更新自体にコードの変更はない。`vendor/` は git 管理外。
+後続の §1.757 のライセンス同梱対応は、下記に分けて記録する。
 
 ## 取得手順
 
@@ -49,7 +50,7 @@ bash scripts/setup-pdfium.sh         # vendor/pdfium/ へ展開
 - **API・ABI**: 公開ヘッダと import library が同一なので、`pdfium-render` 0.8 から使う関数の宣言・
   エクスポートに変化はない。コードの変更は要らない。
 - **ライセンス**: 同梱のライセンス文は同一。lcms は 2.19.1 へ上がったが `licenses/lcms.txt` の本文は
-  変わっていない。インストーラの readme と About の表記の変更も要らない。
+  変わっていない。版更新に伴う条件の変更はないが、従来の全文同梱漏れは後続の §1.757 で対応する。
 
 上流の変更 (リリースノートの commit 一覧から、表示に関わるもの):
 
@@ -82,11 +83,36 @@ bash scripts/setup-pdfium.sh         # vendor/pdfium/ へ展開
 - 自動テストは描画結果の画素を比べない。上流の合成・クリップ・グラデーションの変更による見た目の差は、
   実機の表示でしか分からない。
 
-## 残っていること (この更新とは別)
+## ライセンス全文の同梱対応 (§1.757、2026-11-10)
 
-- About の「サードパーティ ライセンス」に PDFium が無い。インストーラの readme は
-  「PDFium (BSD-3-Clause)」の 1 行だけで、`vendor/pdfium/LICENSE` と `licenses/` の全文は配布物に入っていない
-  (`installer/mimageviewer.iss` と `scripts/build-portable.ps1` が同梱するライセンス文に PDFium の分が無い)。
-  8125 以前からの状態で、今回の更新では変えていない。扱いは別に判断する。
+- `PDFIUM-LICENSE.txt` に配布元の MIT と `licenses/` 全18ファイルを収録した。
+  版は `vendor/pdfium/VERSION` の `159.0.8138.0`、順序は `LICENSE`、`licenses/pdfium.txt`、残りのファイル名順。
+  `python scripts/generate-pdfium-license.py` が形式の正本で、UTF-8 (BOM なし)・LF に統一する。
+  freetype は Latin-1 として変換し、本文の文字・行末空白・末尾空白行は保持する。
+- About に PDFium の行と内部部品を含む全文を追加した。埋め込みと追跡ファイルの一致検査に加え、
+  同じスクリプトの `--check` を呼ぶテストで版・全ファイル名・数・本文の更新漏れを止める。
+- installer / portable の同梱リスト、両 readme、製品ページ、依存物更新手順とリリースチェックリストに反映した。
+  単体 exe 版は既存の LibRaw / LibAVIF と同じく About で全文を表示し、launcher の展開処理は増やさない。
+- 全件テストと確認用ビルドは設計担当が後で実施する。配布ビルド・公開は未実施。
+
+今回の未コミット差分 (基点 `6f502b888`、通常 feature / dev・test profile) の検証:
+
+| コマンド / 確認 | 結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0、7分14秒 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/about/)'` | exit 0、12件成功、対象外17,126件。コンパイル9分16秒 (check の lock 待ちを含む)、実行2.372秒。run ID `22594b69-8763-4aaf-bb98-6877b7d95d1b` |
+| `python scripts/generate-pdfium-license.py` を2回、`--check` | 成功。2回とも136,633 bytes、SHA-256 `7bf53e47c1ff6cc75a08c6c5b13f01841efb7551ae78015d1f07d1453a46e5e2` で不変 |
+| 複製資産を使う更新漏れ検査 | 追加・削除・改名・本文・版・節見出しの変更を拒否し、改行だけの変更は許容。実際の vendor は変更しない |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険グリフ0件 |
+| `python scripts/check_site_cards.py` | exit 0、53カード、超過0件 |
+| ワークスペース全体の `cargo fmt` / `cargo fmt --check` / `git diff --check` | すべて exit 0 |
+
+About の既存 `miv_sound_credits_light` / `miv_sound_credits_narrow_dark` は更新指定なしで比較成功し、
+PNG の変更は無い。PDFium の行・全文の開閉は同じ About の headless 回帰で確認した。
+root のライセンス一覧全体を照合する既存の配布物テストは見つからず、今回の installer / portable の
+登録は静的照合で確認した (VLM worker / mIV Sound の専用検査は対象外)。
+launcher の mIV Sound バンドルは内部 notice を含めて展開する別経路があるが、LibRaw / LibAVIF の
+root ライセンスファイルを展開する処理は無い。独立レビュー (Sol / xhigh) の結果は下に記録する。
+このブランチの backlog に §1.757 は無いため変更していない。コミット・製品起動はしていない。
 
 製品バイナリはエージェントが起動していない。PDF の表示の実機確認は利用者に依頼する (未確認)。

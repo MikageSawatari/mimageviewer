@@ -5,6 +5,7 @@ use eframe::egui;
 
 const EGUI_LICENSE_MIT: &str = include_str!("../../vendor/egui-wgpu/LICENSE-MIT");
 const EGUI_LICENSE_APACHE: &str = include_str!("../../vendor/egui-wgpu/LICENSE-APACHE");
+const PDFIUM_LICENSE: &str = include_str!("../../PDFIUM-LICENSE.txt");
 const LIBAVIF_LICENSE: &str = include_str!("../../LIBAVIF-LICENSE.txt");
 const DAV1D_LICENSE: &str = include_str!("../../DAV1D-LICENSE.txt");
 const LIBYUV_LICENSE: &str = include_str!("../../LIBYUV-LICENSE.txt");
@@ -194,6 +195,10 @@ impl App {
                         ui.label("LGPLv3-or-later — FFmpeg project");
                         ui.end_row();
 
+                        ui.label("PDFium");
+                        ui.label("BSD-3-Clause — The PDFium Authors");
+                        ui.end_row();
+
                         ui.label("AVIF (libavif / dav1d / libyuv)");
                         ui.label("BSD — AOMedia / VideoLAN / libyuv authors");
                         ui.end_row();
@@ -296,6 +301,12 @@ impl App {
                 );
 
                 ui.add_space(8.0);
+                draw_license_text(
+                    ui,
+                    "PDFium と内部部品のライセンス・著作権表記 全文",
+                    "about_pdfium_license",
+                    PDFIUM_LICENSE,
+                );
                 draw_raw_license_snapshot_fixture(ui);
                 ui.separator();
                 draw_avif_license_snapshot_fixture(ui);
@@ -476,13 +487,14 @@ mod tests {
 
     use super::{
         DAV1D_LICENSE, EGUI_LICENSE_APACHE, EGUI_LICENSE_MIT, IJG_ATTRIBUTION, LIBAVIF_LICENSE,
-        LIBJPEG_TURBO_LICENSE, LIBRAW_LICENSE, LIBYUV_LICENSE, ZLIB_LICENSE,
+        LIBJPEG_TURBO_LICENSE, LIBRAW_LICENSE, LIBYUV_LICENSE, PDFIUM_LICENSE, ZLIB_LICENSE,
     };
 
     #[test]
     fn embedded_raw_notices_equal_tracked_files_with_bsd_and_ijg_attribution() {
         for (file, embedded) in [
             ("LIBRAW-LICENSE.txt", LIBRAW_LICENSE),
+            ("PDFIUM-LICENSE.txt", PDFIUM_LICENSE),
             ("LIBAVIF-LICENSE.txt", LIBAVIF_LICENSE),
             ("DAV1D-LICENSE.txt", DAV1D_LICENSE),
             ("LIBYUV-LICENSE.txt", LIBYUV_LICENSE),
@@ -502,6 +514,25 @@ mod tests {
         assert!(LIBJPEG_TURBO_LICENSE.contains("Copyright (C)2009-2024 D. R. Commander."));
         assert!(LIBJPEG_TURBO_LICENSE.contains("Redistributions in binary form must reproduce"));
         assert!(LIBJPEG_TURBO_LICENSE.contains("LEGAL ISSUES"));
+    }
+
+    #[test]
+    fn pdfium_notices_match_all_vendor_files_and_version() {
+        // Keep the format in one place: generation and checking use the same script.
+        let regenerate = "python scripts/generate-pdfium-license.py";
+        let output = std::process::Command::new("python")
+            .args(["scripts/generate-pdfium-license.py", "--check"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("Cannot check PDFium notices: {error}; run {regenerate}")
+            });
+        assert!(
+            output.status.success(),
+            "PDFium notices are stale or could not be checked. Run {regenerate}\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 
     #[test]
@@ -568,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn harmnet_notice_is_drawn_and_full_license_can_be_opened_in_every_build_flavor() {
+    fn pdfium_and_harmnet_notices_are_drawn_and_can_be_opened_in_every_build_flavor() {
         use egui_kittest::kittest::Queryable;
 
         let mut app = crate::app::setup_app_for_test();
@@ -594,16 +625,30 @@ mod tests {
                 app,
             );
         harness.run();
+        harness.get_by_label("PDFium");
+        harness.get_by_label("BSD-3-Clause — The PDFium Authors");
         harness.get_by_label("EffeTune Note Spectrogram (HarmNet L)");
-        assert!(
-            harness.query_by_label(super::HARMNET_NOTICE.2).is_none(),
-            "the full text starts collapsed"
-        );
-        harness
-            .get_by_label("EffeTune Note Spectrogram (HarmNet L) — MIT License 全文")
-            .click_accesskit();
-        harness.run();
-        harness.get_by_label(super::HARMNET_NOTICE.2);
+        for (title, license) in [
+            (
+                "PDFium と内部部品のライセンス・著作権表記 全文",
+                PDFIUM_LICENSE,
+            ),
+            (
+                "EffeTune Note Spectrogram (HarmNet L) — MIT License 全文",
+                super::HARMNET_NOTICE.2,
+            ),
+        ] {
+            assert!(
+                harness.query_by_label(license).is_none(),
+                "the full text starts collapsed: {title}"
+            );
+            harness.get_by_label(title).click_accesskit();
+            harness.run();
+            harness.get_by_label(license);
+            // Close it again so later notices stay in the visible dialog area.
+            harness.get_by_label(title).click_accesskit();
+            harness.run();
+        }
     }
 
     #[test]

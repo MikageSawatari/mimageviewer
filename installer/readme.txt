@@ -230,6 +230,7 @@ https://mikage.to/mimageviewer/privacy.html
 同梱ライブラリのライセンスは以下のとおりです:
 
   - PDFium (BSD-3-Clause): Google Chrome の PDF エンジン
+    ライセンス全文と著作権表記: PDFIUM-LICENSE.txt (内部部品を含む)
   - ONNX Runtime (MIT): Microsoft
   - DirectML (Microsoft 独自ライセンス): Microsoft
   - LibRaw (CDDL-1.0): LibRaw LLC

@@ -510,6 +510,7 @@ $copies = @(
     @{ src = 'vendor\ffmpeg\LICENSE.txt';            dst = 'LICENSE-ffmpeg.txt' }
     @{ src = 'UNRAR-LICENSE.txt';                     dst = 'UNRAR-LICENSE.txt' }
     @{ src = 'LIBRAW-LICENSE.txt';                    dst = 'LIBRAW-LICENSE.txt' }
+    @{ src = 'PDFIUM-LICENSE.txt'; dst = 'PDFIUM-LICENSE.txt' }
     @{ src = 'LIBAVIF-LICENSE.txt'; dst = 'LIBAVIF-LICENSE.txt' }
     @{ src = 'DAV1D-LICENSE.txt'; dst = 'DAV1D-LICENSE.txt' }
     @{ src = 'LIBYUV-LICENSE.txt'; dst = 'LIBYUV-LICENSE.txt' }
