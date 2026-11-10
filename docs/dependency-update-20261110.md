@@ -85,6 +85,8 @@ bash scripts/setup-pdfium.sh         # vendor/pdfium/ へ展開
 
 ## ライセンス全文の同梱対応 (§1.757、2026-11-10)
 
+- 独立レビュー1回目の P2 対応: FreeType の帰属文を生成前文・About の折り畳み外・両 readme・製品ページへ追加した。
+  原文19ファイルの本文は保持し、About の描画・全文への収録をテスト、更新時の帰属条件の確認を手順へ追加した。
 - `PDFIUM-LICENSE.txt` に配布元の MIT と `licenses/` 全18ファイルを収録した。
   版は `vendor/pdfium/VERSION` の `159.0.8138.0`、順序は `LICENSE`、`licenses/pdfium.txt`、残りのファイル名順。
   `python scripts/generate-pdfium-license.py` が形式の正本で、UTF-8 (BOM なし)・LF に統一する。

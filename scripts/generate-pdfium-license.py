@@ -46,7 +46,8 @@ def generate(vendor):
     text = (
         f"Licenses and copyright notices for PDFium {version} bundled with mImageViewer\n"
         "Distribution: bblanchon/pdfium-binaries, pdfium-win-x64.tgz\n"
-        "Includes PDFium and its internal components.\n\n"
+        "Includes PDFium and its internal components.\n"
+        "This software is based in part on the work of the FreeType Team.\n\n"
     )
     separator = "=" * 78
     for path in sources:

@@ -159,6 +159,7 @@ bash scripts/setup-pdfium.sh check  # 新しいバージョンの有無を確認
    ```
 
    `PDFIUM-LICENSE.txt` の差分で、同梱版・内部部品の増減・ライセンスと著作権表記の変化を確認する。
+   内部部品のライセンスで「配布文書に帰属文を書く」条件が増えていないか確認する (現在は FreeType と IJG)。
    形式の正本はこのスクリプトだけ。`LICENSE`、`licenses/pdfium.txt`、残りのファイル名順に全文を連結し、
    freetype の Latin-1 を UTF-8 (BOM なし) へ変換、改行は既存の `LIBAVIF-LICENSE.txt` と同じ LF に揃える。
    Windows の現行メモ帳でも読める。行末空白・末尾空白行は削らず、最終改行が無い本文には改行を補い、

@@ -23,6 +23,8 @@ const HARMNET_NOTICE: (&str, &str, &str) = (
 );
 const IJG_ATTRIBUTION: &str =
     "This software is based in part on the work of the Independent JPEG Group.";
+const FREETYPE_ATTRIBUTION: &str =
+    "This software is based in part on the work of the FreeType Team.";
 
 fn draw_miv_sound_credits(ui: &mut egui::Ui) {
     ui.label(egui::RichText::new("mIV Sound (MIT)").strong());
@@ -301,6 +303,7 @@ impl App {
                 );
 
                 ui.add_space(8.0);
+                ui.add(egui::Label::new(FREETYPE_ATTRIBUTION).wrap());
                 draw_license_text(
                     ui,
                     "PDFium と内部部品のライセンス・著作権表記 全文",
@@ -486,8 +489,9 @@ mod tests {
     }
 
     use super::{
-        DAV1D_LICENSE, EGUI_LICENSE_APACHE, EGUI_LICENSE_MIT, IJG_ATTRIBUTION, LIBAVIF_LICENSE,
-        LIBJPEG_TURBO_LICENSE, LIBRAW_LICENSE, LIBYUV_LICENSE, PDFIUM_LICENSE, ZLIB_LICENSE,
+        DAV1D_LICENSE, EGUI_LICENSE_APACHE, EGUI_LICENSE_MIT, FREETYPE_ATTRIBUTION,
+        IJG_ATTRIBUTION, LIBAVIF_LICENSE, LIBJPEG_TURBO_LICENSE, LIBRAW_LICENSE, LIBYUV_LICENSE,
+        PDFIUM_LICENSE, ZLIB_LICENSE,
     };
 
     #[test]
@@ -511,6 +515,7 @@ mod tests {
         assert!(ZLIB_LICENSE.contains("1995-2022 Jean-loup Gailly and Mark Adler"));
         assert!(ZLIB_LICENSE.contains("This notice may not be removed or altered"));
         assert!(LIBJPEG_TURBO_LICENSE.contains(IJG_ATTRIBUTION));
+        assert!(PDFIUM_LICENSE.contains(FREETYPE_ATTRIBUTION));
         assert!(LIBJPEG_TURBO_LICENSE.contains("Copyright (C)2009-2024 D. R. Commander."));
         assert!(LIBJPEG_TURBO_LICENSE.contains("Redistributions in binary form must reproduce"));
         assert!(LIBJPEG_TURBO_LICENSE.contains("LEGAL ISSUES"));
@@ -627,6 +632,7 @@ mod tests {
         harness.run();
         harness.get_by_label("PDFium");
         harness.get_by_label("BSD-3-Clause — The PDFium Authors");
+        harness.get_by_label(FREETYPE_ATTRIBUTION);
         harness.get_by_label("EffeTune Note Spectrogram (HarmNet L)");
         for (title, license) in [
             (

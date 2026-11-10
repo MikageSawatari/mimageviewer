@@ -1,6 +1,7 @@
 Licenses and copyright notices for PDFium 159.0.8138.0 bundled with mImageViewer
 Distribution: bblanchon/pdfium-binaries, pdfium-win-x64.tgz
 Includes PDFium and its internal components.
+This software is based in part on the work of the FreeType Team.
 
 ==============================================================================
 LICENSE
