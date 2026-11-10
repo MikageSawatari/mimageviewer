@@ -85,7 +85,7 @@ pub(crate) enum CoverIdentity {
   フォルダ削除時の retain / `edit_bundle_bulk`。snapshot を作る worker は DB から角度も読む。
 - 画像フォルダ→ZIP 変換は、完了時に既に `page_state=true` の metadata refresh で全体 snapshot を読み直して owner を置き換えている
   (`image_folder_zip_operation.rs` → `metadata_import_refresh.rs`)。この snapshot が角度を持つようにするだけで足りる。
-- **EPUB→PDF 変換は今回の範囲から外す** (既知の制限、[バックログ §1.757](next-release-backlog.md))。`epub_convert.rs` の
+- **EPUB→PDF 変換は今回の範囲から外す** (既知の制限、[バックログ §1.761](next-release-backlog.md))。`epub_convert.rs` の
   `copy_restore_stores_without_identity_at` (単発・一括) は回転を PDF のキーへ DB だけでコピーし、今の `rotation_page_keys` も更新しない。
   これは変換機能に元からある不足で、今回の修正で悪化しない (変換後の PDF の本のタイルが回転しないのは今と同じ。次回起動で直る)。
   - 外す理由: 正しく直すには、変換 worker の DB コピーと、利用者の回転操作・snapshot の置き換えなど owner の全ての更新の間に
@@ -106,8 +106,8 @@ pub(crate) enum CoverIdentity {
 - 呼び出し元 (全描画入口): 一覧の 2 か所 (`ui_main.rs` の grid 描画)、`repaint_grid_cell_after_input`、詳細表示の hover サムネ
   (`painter.image` を直接呼ぶ箇所)。hit-area / overlay の計算が回転後の寸法を使う箇所があれば、描画と同じ値を使う。
 - **詳細表示の hover は、ページ item も含めて owner だけを引く** (メモリのみ)。`get_rotation` は cache miss で同期 SELECT をするので
-  hover から呼ばない。owner は、§1.757 (EPUB→PDF 変換でコピーした PDF のキー) を除く全非 0 回転を持つので、キーが無ければ
-  0° として描く。§1.757 の PDF のキーは次回起動 (または全体 snapshot の読み直し) まで owner に無く、その間は本のタイル・hover・
+  hover から呼ばない。owner は、§1.761 (EPUB→PDF 変換でコピーした PDF のキー) を除く全非 0 回転を持つので、キーが無ければ
+  0° として描く。§1.761 の PDF のキーは次回起動 (または全体 snapshot の読み直し) まで owner に無く、その間は本のタイル・hover・
   旧行の作り直しの判定が回転なしとして扱う (ページ一覧のタイルは `get_rotation` の DB 読みで回る)。hover の表示枠と配置の寸法も
   90°/270° で縦横を入れ替える (最後の mesh だけでなく)。ページ item の hover が回るようになるのは今回の修正に含める
   (一覧と hover の向きを揃える)。
@@ -272,7 +272,7 @@ pub(crate) enum CoverIdentity {
 
 ### 8.4 2026-11-10 確認ラウンド (同じ Sol/xhigh)
 
-判定は「文書の修正だけで実装可」。P1・P2 なし。§8.3 の 1・3 は解決。EPUB→PDF を §1.757 へ外すことは §1.718 として受け入れ可
+判定は「文書の修正だけで実装可」。P1・P2 なし。§8.3 の 1・3 は解決。EPUB→PDF を §1.761 へ外すことは §1.718 として受け入れ可
 (identity は角度の取得と独立で、owner に無いキーは誤った回転を作らない)。P3 1 件: owner が全非 0 回転を持つという記述と、
 変換直後の受け入れ条件が除外と矛盾 → §4.2 と §10 を直した。
 
@@ -327,7 +327,7 @@ evict していた。設計担当判断により、この判定は時間を隔�
   別 viewer context (別ウィンドウ) の同じ本のタイルも追従する。UI スレッドで RotationDb を読まないこと。
 - 追加 (設計レビュー 2026-11-10): 格納順と一覧順が違う ZIP で、仮想フォルダの seed / writeback を経ても表紙の identity が
   実際の画素のページのままであること。変換書庫 (RAR / 7z) の表紙を pin したフォルダで、表紙の回転が判定・再要求に掛かること。
-  (EPUB→PDF 変換の直後の確認は §1.757 へ移した。) `CachePolicy::Off` でも旧行の作り直しが
+  (EPUB→PDF 変換の直後の確認は §1.761 へ移した。) `CachePolicy::Off` でも旧行の作り直しが
   1 回で収束すること。別 context で読み込み中・CPU 待ち行列・暫定画像の段階の `Legacy` 結果が、表紙の回転後に採用されず再要求されること。
   CacheOnly で届いた `Legacy` は回転操作で evict されないこと。一括キャッシュ作成と pin 確定の行に identity が入ること。
 - 追加 (再レビュー): 元ソースが読めない回転済みの本 (旧行あり) で、旧行の表紙が表示され続け、再要求が繰り返されないこと。
