@@ -51,6 +51,8 @@ pub(crate) enum CoverIdentity {
 ```
 
 - 描画: `Page(k)` だけが回転を持つ。それ以外は回転なし (今の挙動)。
+- `Loaded` に入れるときだけ、`Legacy` に `refreshable: bool` (その結果を出した要求が元ソースを読めたか) を付ける (§5.2)。
+  永続表現と worker の結果では付けない。
 - `Legacy` と `Unknown` を分けるのは、`Legacy` だけを作り直しの対象にするため (§5)。`Unknown` を作り直し対象にすると、
   作り直しても `Unknown` に戻る経路 (旧行の子の流用) で毎回作り直しが起きる。
 - 永続表現 (`thumbnails.cover_key TEXT`): NULL = `Legacy`、`"u"` = `Unknown`、`"n"` = `Unrotatable`、`"p:<key>"` = `Page`。
@@ -70,18 +72,23 @@ pub(crate) enum CoverIdentity {
 
 ### 4.1 角度の owner (`rotation_page_keys` の拡張)
 
-- `rotation_page_keys: BTreeSet<String>` を、角度も持つ owner 型 (例 `RotationKeyIndex`) に置き換える。
-  中身は「非 0 回転のキー→角度」。既存の存在判定 (`contains`、prefix 範囲、`item_has_page_edit_key` 系の汎用 helper) は
-  owner の `keys()` 相当で今までどおり使う。集合と角度を別々に持つ場合は、owner の method だけが両方を更新し、常に一致させる。
+- `rotation_page_keys: BTreeSet<String>` を、角度も持つ **1 つの map** (「非 0 回転のキー→角度」、`BTreeMap<String, Rotation>`)
+  の owner 型に置き換える。集合と map を並べて持たない。既存の存在判定 (`contains`、prefix 範囲、`item_has_page_edit_key` 系の
+  汎用 helper) は map のキーで今までどおり使う (汎用 helper が `&BTreeSet<String>` を取るなら、キーの範囲を引ける形へ広げる)。
 - 起動時の `load_rotated_keys` は角度も読む (`SELECT path, angle ... WHERE angle != 0`)。
-- **全ての書き手が角度を渡す**。型を変えるので、書き手はコンパイルエラーで全部列挙される。今のコード上の書き手:
+- **全ての書き手が角度を渡す**。型を変えると in-process の書き手はコンパイルエラーで列挙されるが、**DB だけを書いて owner を
+  触らない書き手はコンパイラでは見つからない**ので、DB の書き手 (`RotationDb::set*` / `clear_all` / restore store のコピー) から
+  逆にたどって確かめる。今のコード上の書き手:
   `apply_rotation` / book_structural_op の移動・削除 / content_identity_restore / sidecar_restore と metadata import の snapshot
   (`ImportPageStateSnapshot.rotated` 等を「キー→角度」に) / リネーム / metadata cleanup / 全解除 / 再読み込み (app.rs の reload) /
   フォルダ削除時の retain / `edit_bundle_bulk`。snapshot を作る worker は DB から角度も読む。
-- 画像フォルダ→ZIP 変換の metadata コピー (`image_folder_zip_metadata.rs` → `image_folder_zip_operation.rs` の完了側) は、
-  今は回転キーを owner へ反映していない。コピーした回転 (キー→角度) を完了時に owner へ反映し、説明文の失効
-  (`caption_display.invalidate_rotation_keys`) も同じ helper で行う。
+- 画像フォルダ→ZIP 変換は、完了時に既に `page_state=true` の metadata refresh で全体 snapshot を読み直して owner を置き換えている
+  (`image_folder_zip_operation.rs` → `metadata_import_refresh.rs`)。この snapshot が角度を持つようにするだけで足りる。
+- **EPUB→PDF 変換** (`epub_convert.rs` の `copy_restore_stores_without_identity_at`、単発・一括の完了側) は回転を PDF のキーへ
+  コピーするが、今は owner を更新しない。画像フォルダ→ZIP と**同じ経路** (完了時の `page_state=true` の metadata refresh) に乗せる。
+  変換を始めた画面がもう表示されていなくても行う。
 - 回転の実変更を通知する helper を 1 つにまとめる (owner の更新 + 説明文の失効 + §5.2 の旧行タイルの再要求)。
+  snapshot の読み直しで値が変わらなかったキーについては失効を出さない。
 
 ### 4.2 描画時の角度 (`grid_tile_rotation(idx)`)
 
@@ -92,9 +99,12 @@ pub(crate) enum CoverIdentity {
   それ以外は回転なし。`Loaded` でない間は描くものが無い (placeholder)。
 - `get_rotation` / `rotation_key_for_idx` の本 item に対する意味 (None) は変えない。回転操作・説明文・見開き判定などはそのまま。
 - 呼び出し元 (全描画入口): 一覧の 2 か所 (`ui_main.rs` の grid 描画)、`repaint_grid_cell_after_input`、詳細表示の hover サムネ
-  (`painter.image` を直接呼ぶ箇所。ページ item も今は回転していないので、同じ helper で揃える)。
-  hit-area / overlay の計算が回転後の寸法を使う箇所があれば、描画と同じ値を使う。
-- 描画は DB を引かない。owner は在メモリ。
+  (`painter.image` を直接呼ぶ箇所)。hit-area / overlay の計算が回転後の寸法を使う箇所があれば、描画と同じ値を使う。
+- **詳細表示の hover は、ページ item も含めて owner だけを引く** (メモリのみ)。`get_rotation` は cache miss で同期 SELECT をするので
+  hover から呼ばない。owner は全非 0 回転を持つので、キーが無ければ 0° と確定してよい。hover の表示枠と配置の寸法も
+  90°/270° で縦横を入れ替える (最後の mesh だけでなく)。ページ item の hover が回るようになるのは今回の修正に含める
+  (一覧と hover の向きを揃える)。
+- 新しく足す描画経路は DB を引かない。
 
 ### 4.3 `Loaded` と CPU 待ち行列
 
@@ -107,30 +117,48 @@ pub(crate) enum CoverIdentity {
 キャッシュはリリース済み。旧行は全部 `Legacy` として読む (列の追加は §6)。旧行を一斉に作り直すと、更新後の初回の一覧表示が
 本の数だけ遅くなるので、作り直すのは「回転済みのページを含む本」だけにする。
 
+### 5.0 判定は 1 つ: `cover_source_has_rotation(idx)`
+
+- 「この本の表紙の出どころに回転済みのページがあり得るか」を在メモリだけで判定する述語を 1 つ作り、§5.1・§5.2・採用時の
+  3 か所すべてで使う (変更されたキーではなく、今の owner 全体で判定する)。
+- 中身: 本のパスについての `item_has_page_edit_key(idx, owner, include_descendants=true)` と同じ判定に加え、
+  **実効の読み先** (フォルダの pin が変換書庫の cache ZIP や別の本を指す場合のその容器、変換書庫の cache ZIP) を、
+  要求作成と同じ UI 側の解決 (`apply_folder_thumb_pin` の在メモリの pin 解決、`archive_or_converted_cache_contains_page_key`) で含める。
+  I/O なし。要求作成と述語が別々に実効の読み先を解決しないよう、解決を 1 つの helper にまとめる。
+
 ### 5.1 要求時
 
-- App は本の要求を作るとき、その本が回転済みのページを含むか (`item_has_page_edit_key(idx, rotation keys, include_descendants=true)`
-  と同じ在メモリ判定、変換書庫は `archive_or_converted_cache_contains_page_key`) を `LoadRequest.refresh_legacy_cover: bool` に載せる。
-  I/O なし。EPUB / 種類除外の代替要求 (`epub_pin_fallback`) にも同じ値を引き継ぐ。
-- worker はキャッシュ命中 (メモリ・ディスクとも) で行が `Legacy` かつ `refresh_legacy_cover` のとき、`source_policy.allows_source()`
-  なら miss として作り直す (作った行には identity が入る)。CacheOnly ではそのまま使う (回転なし、今の挙動)。
+- App は本の要求を作るとき `cover_source_has_rotation(idx)` を `LoadRequest.refresh_legacy_cover: bool` に載せる。
+  EPUB / 種類除外の代替要求 (`epub_pin_fallback`) にも同じ値を引き継ぐ。
+- worker はキャッシュ命中 (**メモリ命中の判定より前**に。ディスクも同じ) で行が `Legacy` かつ `refresh_legacy_cover` のとき、
+  `source_policy.allows_source()` なら miss として作り直す。§1.741 の親 catalog 行も同じ順序で判定し、親の stamp 観測と保存先は
+  通常の miss と同じにする。CacheOnly ではそのまま使う (回転なし、今の挙動)。
+- **作り直した結果は、保存方針 (`CachePolicy::Off`、Auto の閾値) にかかわらず既存の行を置き換えて保存する** (`force_cache` と同じ扱い)。
+  既にある行を新しい形式に書き換えるだけで、新しいキャッシュを作るわけではない。これで 1 行につき 1 回で収束する。
+  保存に失敗した場合はまれな失敗として割り切る (ログ。次に要求されたときにもう一度作り直す)。
 - フォルダ代表の選定が子の保存済み行を流用する (`ChildCached`) とき、子の行が `Legacy` なら親の identity は `Unknown`
   (子が pin で具体的なページを持つなら、その `Page`)。親の行は `Unknown` で保存され、作り直しの対象にならない。
   子の行が後で作り直されると、子のカタログの revision が上がり、親の行の proof が失効して選び直される (既存の仕組み)。
 
-### 5.2 表示中のタイル
+### 5.2 表示中のタイルと、遅れて届く結果
 
-- 回転の実変更 (§4.1 の helper) のたびに、全 viewer context の `Loaded` で identity が `Legacy` の本のタイルのうち、
-  変更キーを含む本 (同じ在メモリ判定) だけを `evict_thumbnail_for_reload` し、`request_repaint` する。
+- `Loaded` の identity は `Legacy { refreshable: bool }` として持つ。`refreshable` は、その結果を出した要求が元ソースを読めた
+  (`source_policy.allows_source()`) か。採用時に、要求 owner に残っている要求から決める。CacheOnly で届いた旧行は `refreshable=false`。
+- 回転の実変更 (§4.1 の helper) のたびに、全 viewer context の `Loaded` で `Legacy { refreshable: true }` の本のタイルのうち、
+  `cover_source_has_rotation` が真のものだけを `evict_thumbnail_for_reload` し、`request_repaint` する。
   次のフレームの要求作成で `refresh_legacy_cover=true` の要求が出て作り直される。
   既存の `evict_pinned_adjustment_materializations` (全 context を回る) と同じ形にする。
-- これは描画中ではなく、回転を変えた操作の処理の中で行う。`Legacy` 以外のタイルは触らない (表紙以外の回転で
-  無関係なタイルが消えない)。対象は「旧行のまま表示中」のタイルだけで、1 回作り直せば `Legacy` でなくなる。
+- **採用時にも同じ判定をする**: 結果が `Legacy` で、その要求の `refresh_legacy_cover` が false、元ソースを読める要求で、
+  今は `cover_source_has_rotation` が真なら、採用せずに既存の要求 owner を通して再要求する。読み込み中・CPU 待ち行列・暫定画像の
+  段階で別 context が表紙を回した場合を、これで拾う (回転の revision は要らない)。
+- これは描画中ではなく、回転を変えた操作の処理と結果の採用の中で行う。`Legacy` 以外のタイルは触らない (表紙以外の回転で
+  無関係なタイルが消えない)。作り直した行は `Legacy` でなくなるので、同じタイルが繰り返し再要求されることはない。
 
 ### 5.3 残る既知の制限 (旧行に限る)
 
 - CacheOnly の経路 (ドライブ一覧、判定待ちの変換書庫) が旧行を表示する間は回転しない。行が通常の要求で作り直されると直る。
 - 旧行の子を流用したフォルダの代表は、その子の行が作り直されるまで回転しない (子の本を含む一覧を開けば作り直される)。
+- mIV Remote は旧行を回転なしで返す (§9)。デスクトップで作り直されると直る。
 
 ## 6. 永続キャッシュ (catalog) の変更 (リリース済み → 移行あり)
 
@@ -149,10 +177,12 @@ pub(crate) enum CoverIdentity {
 | キャッシュ miss の decode (`resolve_read_after_cache_miss` → `load_one_cached`) | 実際に読んだ `ReadLocation` から §3.1。ページ item の行にも書く (Stack・仮想フォルダの seed と一致させるため) |
 | キャッシュ命中 (メモリ・ディスク) | 行の `cover_key`。§5.1 の作り直し判定 |
 | `ChildCached` (子の行の流用、`save_auto_folder_bytes`) | 子の行の identity。子が `Legacy` なら `Unknown` (pin の具体ページがあればその `Page`) |
-| 動画フレームの seed (`seed_folder_video_pin_thumbs`、smart_folder の seed) | `Page(normalize_path(video))`。既存行と bytes / stamp が同じでも identity が違えば書き直す (旧 seed 行は 1 回だけ書き直される) |
-| ドライブ一覧の seed (`drive_list_pin_seed_entry` 系) | ページ行→本の行のコピーは、そのページのキー (Image / ZipEntry / PdfPage)。本の行→本の行は列ごとコピー |
+| 動画フレームの seed (`seed_folder_video_pin_thumbs`、smart_folder の seed、metadata refresh の pin 確定 `pin_materialization.rs` → `commit_pin_materializations`) | `Page(normalize_path(video))`。既存行と bytes / stamp が同じでも identity が違えば書き直す (「変わっていない」判定に identity を含める。旧 seed 行は 1 回だけ書き直される) |
+| ドライブ一覧の seed (`drive_list_pin_seed_entry` 系) | **コピー元の行の identity をそのまま写す** (ページ行からでも本の行からでも)。コピー先の名前からページを推測しない |
 | ドライブ一覧の暫定→確定 (bytes が同じなら Finalized だけ送る経路) | bytes と identity が両方同じときだけ Finalized だけにする。違えば画素ごと送る |
-| 仮想フォルダの seed (本の行→先頭ページ行) と writeback (ページ行→本の行) | どちらもそのページのキー |
+| 仮想フォルダの seed (本の行→先頭ページ行) と writeback (ページ行→本の行) | **コピー元の行の identity をそのまま写す**。seed は「本の表紙」を「一覧で先頭のページ」の行へ写すが、ZIP の格納順と一覧順が違えば別ページの画素になる (`book-thumb-cover-only-plan.md` に既知)。行の名前から identity を付け替えると、別ページの角度が付く |
+| 一括キャッシュ作成 (`app/cache_ops.rs` の ZIP のページ行・本の表紙行、PDF / EPUB の表紙行、共通 encoder `thumb_loader.rs` の直接保存) | 実際に encode したファイル / entry / ページのキー。ZIP は取り出した entry 名を保持して渡す |
+| 音声のアートの直接 SQL (`catalog.rs` の audio-art 保存) | `Unrotatable` |
 | 編集プレビュー (`edit_preview_key` / 手動代表の `edit_preview_validate_container`) | `edit_preview_key` のページ |
 | RAW half の再投入 | 再投入する解決済みの読み先 (通常の miss と同じ) |
 | EPUB / 種類除外の代替要求 | 再帰した内側の要求が作る identity をそのまま返す |
@@ -170,12 +200,34 @@ pub(crate) enum CoverIdentity {
 7. Stack: §4.2 で代表のページキーを使う。SearchContainer は代表の path / entry / page を使う。
 8. identity を `Loaded` に束ねる: §4.3。`Legacy` / `Unknown` / `Unrotatable` を区別する。
 
+### 8.1 2026-11-10 設計レビュー (Sol/xhigh) の指摘と対応
+
+判定は「指摘を直せば実装可」。P2 × 8、P3 × 1。全件をコードで確かめ、妥当と判断して反映した。
+
+1. EPUB→PDF 変換の回転コピーが owner に届かない → §4.1。画像フォルダ→ZIP と同じ metadata refresh の経路に乗せる。
+2. seed / writeback でコピー先のページの identity を付けると、別ページの角度が付く → §7。コピー元の identity を写す。
+3. 一括キャッシュ作成・pin 確定・音声のアートの直接 SQL が producer 表に無い → §7 に追加。
+4. 回転の変更後に届く `Legacy` 結果 → §5.2。採用時にも同じ判定をする。
+5. 保存方針で作り直しが保存されず収束しない、CacheOnly の旧行を evict し続ける → §5.1 (既存行の置き換えは保存方針によらない)、
+   §5.2 (`Legacy { refreshable }`)。
+6. 変換書庫を pin したフォルダが判定から漏れる → §5.0 (実効の読み先を含む述語を 1 つにまとめる)。
+7. Remote の identity の受け渡しと反映の時期が具体的でない → §9。
+8. hover から `get_rotation` を呼ぶと同期 SELECT の経路が増える → §4.2 (hover は owner だけを引き、寸法も入れ替える)。
+9. (P3) 画像フォルダ→ZIP は既に snapshot で owner を置き換えている → §4.1 の記述を直した。
+
 ## 9. mIV Remote
 
-- Remote のページのタイルは、読み込んだ後に `rotation_for_remote_page` で回している。本のタイル (container の ZIP / PDF の表紙、
-  ZipDir、フォルダ) は、同じ catalog の行 (または worker の結果) の `CoverIdentity` が `Page(k)` なら、ページのタイルと同じ方法で k の角度を当てる。
-- 回転の変更が Remote の表示へ届く仕組み (ETag や Remote 側のキャッシュの失効) は、ページのタイルの回転と同じ経路に揃える。
-  ページのタイルと違う扱いが要るなら、実装時に報告する。
+- 今の Remote は、サムネの結果から画素だけを取り出して identity を捨てている (`remote_ipc/thumbnail.rs` のフォルダ、
+  `remote_ipc/container.rs` の container、`RemoteSourceRaster`)。container の回転は読み込み前に決めている。
+- 変更: `RemoteSourceRaster` (と folder の結果) に `CoverIdentity` を通す。本のタイル (container の ZIP / PDF の表紙、ZipDir、フォルダ) は、
+  **読み込んだ後に** identity が `Page(k)` なら k の角度を Remote の worker 側で RotationDb (read-only) から引いて回す。
+  ページのタイルの回転 (`rotation_for_remote_page`) は今のまま。本のタイルでは容器自身のパスのキーで回さない。
+- Remote は旧行の作り直し (`refresh_legacy_cover`) をしない。`Legacy` は回転なしで返し、デスクトップ側で行が作り直されると直る
+  (§5.3 に追記)。Remote が作る新しい行には identity を書く。
+- ブラウザへの反映: サムネの ETag は無い (`/api/thumb` は `private, max-age=60`、一覧の URL は session epoch 付き)。
+  回転の DB 変更で Remote の state generation は進むが、表示中の一覧のサムネは貼り直さない。**ページのタイルの回転と同じ
+  タイミング** (一覧を開き直す・キャッシュ期限) で反映される形に揃え、本のタイルだけの再取得の仕組みは足さない。
+  これは今のページのタイルの挙動と同じであることをテストではなく文書に書く。
 
 ## 10. テスト
 
@@ -188,7 +240,12 @@ pub(crate) enum CoverIdentity {
   pin で表紙を替えると新しい表紙の角度。`Legacy` の行は回転済みのページを含む本だけ作り直され、CacheOnly では作り直さない。
   表示中の `Legacy` タイルは表紙の回転で 1 回だけ再要求される。`Unknown` は再要求されない。画像フォルダ→ZIP 変換の後も owner に角度が入る。
   別 viewer context (別ウィンドウ) の同じ本のタイルも追従する。UI スレッドで RotationDb を読まないこと。
-- 描画入口: 選択変更後の再描画 (`repaint_grid_cell_after_input`) と詳細表示の hover でも回転すること。
+- 追加 (設計レビュー 2026-11-10): 格納順と一覧順が違う ZIP で、仮想フォルダの seed / writeback を経ても表紙の identity が
+  実際の画素のページのままであること。変換書庫 (RAR / 7z) の表紙を pin したフォルダで、表紙の回転が判定・再要求に掛かること。
+  EPUB→PDF 変換 (単発・一括) の後、PDF の本のタイルが表紙の角度で描かれること。`CachePolicy::Off` でも旧行の作り直しが
+  1 回で収束すること。別 context で読み込み中・CPU 待ち行列・暫定画像の段階の `Legacy` 結果が、表紙の回転後に採用されず再要求されること。
+  CacheOnly で届いた `Legacy` は回転操作で evict されないこと。一括キャッシュ作成と pin 確定の行に identity が入ること。
+- 描画入口: 選択変更後の再描画 (`repaint_grid_cell_after_input`) と詳細表示の hover でも回転すること。hover が RotationDb を読まないこと。
 - Remote: 本のタイルが表紙の角度で返ること。
 - 既存の UI snapshot は変わらない想定 (変わるなら意図を確かめて更新)。
 
