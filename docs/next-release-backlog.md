@@ -154,6 +154,13 @@
 - (起票時の制約、上の採択案で一部を変更) 関連検索の初版をタグやすべての検索方式へ一括拡張しない。既存の右クリックメニュー編集・ネイティブメニューを保ち、仮想ページ等の対応範囲も既存の種別表に従い決める。文字の部分選択が困難という報告は本体 §1.691 の不具合調査へ分離する。
 - 関連: [Everything設計](everything-search-plan.md)、[種別ごとの操作表](item-kind-capability-matrix.md)、`src/global_search_ui/everything/ui.rs` / `src/ui_pinned_search.rs`。規模 / 優先度: 仕様決定後 / P3。
 
+### 1.759 写真の GPS 欄から Google マップで撮影地点を開く (2026-11-10)
+
+- 状態: **次の版に入れる (利用者決定 2026-11-10、2 回目の組)**。指示書は [gps-open-google-maps-main-brief.md](briefs/gps-open-google-maps-main-brief.md) (正本)。
+- 要旨: 情報パネルの EXIF → GPS に、有効な緯度・経度があるときだけ「Google マップで開く」を出し、押したときだけ既定ブラウザーで `https://www.google.com/maps/search/?api=1&query=緯度%2C経度` を開く。URL に入れる写真由来の情報は緯度・経度だけ。URL と座標は診断ログ・失敗メッセージに出さない (`external_links::open_url` を通す)。見開きは情報パネルで選んでいる側。
+- **公開文書**: 押すとブラウザー経由で Google に撮影位置が渡るので、マニュアル・製品ページの「安心して使えます」・`privacy.html` の「ネットワーク通信」を合わせて書く (CLAUDE.md の公開文書の必須規則)。
+- 規模 / 優先度: Small / P2。
+
 ### 1.758 全画面で同じキーの押下が 1 フレームに 2 回届くと、ページ送りが 1 回分になることがある (2026-11-10)
 
 - 状態: **未調査・観測 1 回**。サブ PC 担当が依頼 30 (§1.754 の PDF 確認、`C:\miv-subpc\results-30\`) の手順外で観測。PDFium の更新とは無関係と見ている (設計担当の推測、未確認)。
