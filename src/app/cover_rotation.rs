@@ -7,6 +7,7 @@ use crate::rotation_db::Rotation;
 impl App {
     /// A retained list skips worker adoption. Recheck old materials once when that list
     /// becomes live, using the same predicate and reload path as a rotation change.
+    /// Synchronous reuse of the current live list must not call this restore boundary.
     pub(crate) fn reconcile_restored_cover_thumbnails(&mut self) -> bool {
         let matching = self
             .items
@@ -182,6 +183,241 @@ mod tests {
         )
         .with_request_id(req.request_id)
         .with_cover(crate::cover_identity::CoverIdentity::Legacy)
+    }
+
+    fn adopt_failed_legacy_refresh(
+        app: &mut App,
+        ctx: &egui::Context,
+        path: &std::path::Path,
+        item: GridItem,
+    ) -> (
+        std::sync::Arc<crate::catalog::CatalogDb>,
+        Vec<u8>,
+        egui::TextureId,
+    ) {
+        use crate::cover_identity::CoverIdentity;
+        use crate::thumb_loader::{LoadRequest, ThumbLoadOrigin};
+        use std::sync::{Arc, Mutex, RwLock, atomic::AtomicUsize};
+
+        assert!(!path.exists(), "the source must be unreadable");
+        app.items = vec![item];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![Some((1, 2))];
+        app.visible_indices = vec![0];
+        app.keep_set.insert(0);
+        app.keep_range = (0, 1);
+        app.settings.thumb_aspect_auto = false;
+        app.update_rotation_page_owner([(
+            crate::adjustment_db::zip_entry_key(path, "book/cover.png"),
+            Rotation::Cw90,
+        )]);
+        let mut req = LoadRequest {
+            path: path.to_owned(),
+            mtime: 1,
+            file_size: 2,
+            items_gen: app.items_generation,
+            cache_key_override: Some("failed-legacy-cover".into()),
+            cover_scope: Some(CoverSourceScope::archive(path)),
+            refresh_legacy_cover: true,
+            books_root: Some(path.parent().unwrap().join("unused-books")),
+            ..Default::default()
+        };
+        req.request_id = app
+            .requested
+            .begin_for_request(&req, super::super::ThumbnailRequestKind::Normal, None)
+            .unwrap();
+        let catalog = Arc::new(
+            crate::catalog::CatalogDb::open(
+                &path.parent().unwrap().join("failed-legacy-cache"),
+                path.parent().unwrap(),
+            )
+            .unwrap(),
+        );
+        let bytes =
+            crate::catalog::encode_thumb_webp(&image::DynamicImage::new_rgb8(12, 8), 64, 80.0)
+                .unwrap()
+                .0;
+        catalog
+            .save_thumb_bytes(
+                "failed-legacy-cover",
+                1,
+                2,
+                Some((12, 8)),
+                &bytes,
+                &CoverIdentity::Legacy,
+            )
+            .unwrap();
+        let memory = RwLock::new(catalog.load_all().unwrap());
+        let before = catalog.revision_state();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let done = Arc::new(AtomicUsize::new(0));
+        crate::thumb_loader::process_load_request(
+            &mut req,
+            &memory,
+            &tx,
+            Some(&catalog),
+            64,
+            80,
+            64,
+            crate::thumb_loader::CacheDecision::without_thumbnail(),
+            &done,
+            &Arc::new(Mutex::new(crate::stats::ThumbStats::default())),
+            None,
+            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(AtomicUsize::new(1)),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(done.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let messages: Vec<_> = rx.try_iter().collect();
+        let pixels: Vec<_> = messages
+            .iter()
+            .filter_map(|message| message.pixels())
+            .collect();
+        assert!(!pixels.is_empty());
+        assert!(pixels.iter().all(|pixels| {
+            pixels.cover == CoverIdentity::Legacy && pixels.origin == ThumbLoadOrigin::FinalCache
+        }));
+        for message in messages {
+            app.send_thumbnail_for_test(message).unwrap();
+        }
+        app.poll_thumbnails(ctx, super::super::ThumbnailConsumptionPolicy::Grid);
+        assert_eq!(catalog.revision_state(), before);
+        let ThumbnailState::Loaded {
+            tex,
+            cover: LoadedCoverIdentity::Legacy { scope: Some(_) },
+            ..
+        } = &app.thumbnails[0]
+        else {
+            panic!("failed regeneration must adopt the retained legacy pixels");
+        };
+        (catalog, bytes, tex.id())
+    }
+
+    fn assert_failed_legacy_still_loaded(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        texture: egui::TextureId,
+    ) {
+        // Rebuilding a listing starts its ordinary page-edit preparation. Observe
+        // normal thumbnail admission only after that real continuation has settled.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.sidecar_restore_active() {
+            app.poll_sidecar_restore(ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "listing preparation did not settle"
+            );
+            std::thread::yield_now();
+        }
+        assert!(matches!(&app.thumbnails[idx], ThumbnailState::Loaded {
+            tex, cover: LoadedCoverIdentity::Legacy { scope: Some(_) },
+            origin: crate::thumb_loader::ThumbLoadOrigin::FinalCache, ..
+        } if tex.id() == texture && tex.size() == [12, 8]));
+        assert!(
+            legacy_book_cover_needs_reload(
+                &app.items[idx],
+                &app.thumbnails[idx],
+                &app.rotation_page_keys,
+            ),
+            "the old restore recheck would evict this material"
+        );
+        assert_eq!(
+            app.enqueue_priority_thumbnail(idx),
+            super::super::PriorityThumbnailAdmission::Loaded
+        );
+        assert!(
+            app.requested.is_empty(),
+            "no extra decode request is admitted"
+        );
+        for queue in [&app.reload_queue, &app.heavy_io_queue]
+            .into_iter()
+            .flatten()
+        {
+            assert!(queue.0.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn cover_rotation_streaming_search_rebuild_preserves_failed_legacy_refresh() {
+        let mut app = super::super::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let path = app.tmp.path().join("unreadable.zip");
+        let book = GridItem::ZipFile(path.clone());
+        let other = GridItem::Image(app.tmp.path().join("other.png"));
+        let (catalog, bytes, texture) =
+            adopt_failed_legacy_refresh(&mut app, &ctx, &path, book.clone());
+        app.global_search.active = true;
+        app.global_search.done = false;
+        app.settings.thumb_idle_upgrade = false;
+        let queue =
+            std::sync::Arc::new((std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new()));
+        app.reload_queue = Some(queue.clone());
+        app.heavy_io_queue = Some(queue);
+        for pass in 0..4 {
+            let (items, metas, idx) = if pass % 2 == 0 {
+                (
+                    vec![other.clone(), book.clone()],
+                    vec![None, Some((1, 2))],
+                    1,
+                )
+            } else {
+                (
+                    vec![book.clone(), other.clone()],
+                    vec![Some((1, 2)), None],
+                    0,
+                )
+            };
+            app.replace_search_view_items(items, metas);
+            assert_failed_legacy_still_loaded(&mut app, &ctx, idx, texture);
+            assert_eq!(
+                catalog
+                    .load_one("failed-legacy-cover")
+                    .unwrap()
+                    .unwrap()
+                    .jpeg_data,
+                bytes
+            );
+        }
+    }
+
+    #[test]
+    fn cover_rotation_zip_level_redisplay_preserves_failed_legacy_refresh() {
+        let mut app = super::super::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let path = app.tmp.path().join("unreadable.zip");
+        let item = GridItem::ZipDir {
+            zip_path: path.clone(),
+            dir_prefix: "book/".into(),
+            is_archive: false,
+            representative: Some("book/cover.png".into()),
+        };
+        let (catalog, bytes, texture) =
+            adopt_failed_legacy_refresh(&mut app, &ctx, &path, item.clone());
+        app.current_folder = Some(path.clone());
+        app.settings.thumb_idle_upgrade = false;
+        for _ in 0..4 {
+            app.install_zip_current_level(
+                vec![item.clone()],
+                vec![Some((1, 2))],
+                path.clone(),
+                super::super::StartupListIntent::ExplicitList,
+                Default::default(),
+            );
+            assert_failed_legacy_still_loaded(&mut app, &ctx, 0, texture);
+            assert_eq!(
+                catalog
+                    .load_one("failed-legacy-cover")
+                    .unwrap()
+                    .unwrap()
+                    .jpeg_data,
+                bytes
+            );
+        }
     }
 
     #[test]

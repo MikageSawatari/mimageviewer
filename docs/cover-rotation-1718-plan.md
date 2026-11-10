@@ -288,6 +288,13 @@ pub(crate) enum CoverIdentity {
    `reconcile_restored_cover_thumbnails` を通す差分と、実 ZIP の★固定→本を開く→回転→一覧復帰の
    回帰テストを追加した。保存した元一覧の非表示行・Smart root 復帰も対象。追加差分の検証結果は §12。
 
+`eead20441` の追補レビューでは上の P2 2 件の修正が確認された。新たな P2: 検索 streaming rebuild で
+live 一覧から同じ呼出し内に作った再利用 map にも復帰時の判定を掛け、再生成失敗後の Legacy を毎回
+evict していた。設計担当判断により、この判定は時間を隔てた stash の復帰だけに限定する。
+検索と ZIP 階層再表示の map はいずれも開始時の live 一覧から同期的に作ってその場で消費するため、
+両方の呼出しを外した。実 worker が読めないソースから旧画素を返した後、複数回の検索 rebuild / ZIP
+再表示でも同じ texture・Legacy 画素を保持し、追加 decode 要求を受け付けない回帰を追加した。
+
 ## 9. mIV Remote
 
 - 今の Remote は、サムネの結果から画素だけを取り出して identity を捨てている (`remote_ipc/thumbnail.rs` のフォルダ、
@@ -348,11 +355,19 @@ pub(crate) enum CoverIdentity {
   ドライブ文字の変更後に writer の変換ファイルの回転または回転なしになる制限は §5.3 のとおり受け入れた。
   provenance の新しい状態、追加の既存行移行、描画時の I/O は足さない。
 - 復帰境界の棚卸し: `SnapshotState.saved_thumbnails` / `list_view_thumbnails` (★固定と startup の
-  DirectMedia が保存)、`SmartFolderPreparedGrid`、ZIP 階層再表示と検索結果差し替えの一時的な
-  Loaded 再利用 map。これらが一覧へ戻る時だけ共通 helper で該当 Legacy を既存の再要求経路へ戻す。
+  DirectMedia が保存)、`SmartFolderPreparedGrid` が時間を隔てる stash。これらが一覧へ戻る時だけ
+  共通 helper で該当 Legacy を既存の再要求経路へ戻す。検索 streaming rebuild と ZIP 階層再表示の
+  Loaded map は、その呼出しの live 一覧から作る同期的な再利用であり、この復帰判定の対象外。
+  回転の実変更時の eviction と worker 採用時の再判定が既にそれらの素材を扱う。
   DirectMedia の saved 復帰は snapshot 解除と registry の split 時の復帰にある。汎用の context swap は
   フレームごとにも走るため追加の再判定を置かない。`ViewerContextBundle` の live 一覧は既存の
   全 context 回転通知が扱い、未読ソースから返した Legacy を毎フレーム再要求する仕組みは作らない。
+- `eead20441` の追補レビュー修正: 検索 / ZIP の同期再利用の2か所から復帰判定を削除。新規回帰2件と、
+  F2 / F3・退避一覧復帰・検索モジュールを含む和集合 541 件が成功。通常 core の `cargo check` と
+  `cargo fmt` も exit 0。
+  初回の新規テストは通常要求の確認を page-index 準備中に行っていたため2件失敗し、テスト側の実 poll で
+  準備完了を観測してから同じ期待値を確認するよう直した。製品コードの待機は追加していない。
+  詳細コマンド・件数・ログは `target/cover-rotation-1718/review-2-report.txt`。実機・全体 gate は未実施。
 - 実装レビュー 1 の再指定後の検証: 焦点 nextest 40/40、初回の F2 / F3 と復帰経路の和集合 470/470
   (焦点40件を含む) が成功。通常 core の `cargo check`、`cargo fmt`、差分チェックも exit 0。コマンド・件数・ログは
   `target/cover-rotation-1718/review-1-final-report.txt`。全体 gate・検証ビルド・実機確認・独立 follow-up review
