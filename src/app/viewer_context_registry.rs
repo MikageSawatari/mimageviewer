@@ -1960,6 +1960,7 @@ pub(in crate::app) struct ViewerContextBundle {
 
 #[cfg(windows)]
 impl ViewerContextBundle {
+    #[cfg(test)]
     pub(crate) fn panorama_state(&self) -> Option<&crate::panorama::PanoramaState> {
         self.fs_exclusive_view.panorama_state()
     }
