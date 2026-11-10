@@ -20077,7 +20077,30 @@ mod phase_c_key_tests {
                 &cover,
             )
             .unwrap();
-        // An identity-only source upgrade must replace the copied drive seed.
+        // §1.718 §7: the provisional seed copies the selected catalog row.
+        // Updating the current pin's v2 row cannot relabel the v3 auto pixels.
+        app.seed_drive_list_pin_thumbs_from_catalog(&cache_map, Some(&drive_list_db));
+        assert_eq!(
+            cache_map.read().unwrap()[&seeded_key].cover,
+            crate::cover_identity::CoverIdentity::Legacy
+        );
+        assert_eq!(
+            drive_list_db.load_one(&seeded_key).unwrap().unwrap().cover,
+            crate::cover_identity::CoverIdentity::Legacy
+        );
+        // Upgrade the actual copy source without changing bytes, stamp or dimensions.
+        parent_db
+            .save(
+                &auto_key,
+                resolved.mtime,
+                resolved.file_size,
+                4,
+                4,
+                Some((80, 60)),
+                &webp_bytes,
+                &cover,
+            )
+            .unwrap();
         app.seed_drive_list_pin_thumbs_from_catalog(&cache_map, Some(&drive_list_db));
         assert_eq!(cache_map.read().unwrap()[&seeded_key].cover, cover);
         assert_eq!(
@@ -113403,11 +113426,24 @@ mod background_click_scroll_regression_tests {
         for ppp in [1.0, 1.25, 2.0] {
             let mut harness = letterbox_harness([40, 120]);
             harness.ctx.set_pixels_per_point(ppp);
-            harness
-                .state_mut()
-                .app
-                .rotation_cache
-                .insert(0, crate::rotation_db::Rotation::Cw90);
+            let app = &mut harness.state_mut().app;
+            let GridItem::ZipFile(path) = &app.items[0] else {
+                panic!("letterbox fixture must be a book tile");
+            };
+            let cover_key = crate::adjustment_db::zip_entry_key(path, "cover.png");
+            let ThumbnailState::Loaded { cover, .. } = &mut app.thumbnails[0] else {
+                panic!("letterbox fixture must have pixels");
+            };
+            // §1.718 §4.2: book tiles use the material's page and the shared owner.
+            // The index cache retains its page-item semantics and cannot rotate a book.
+            *cover = crate::cover_source_scope::LoadedCoverIdentity::Page(cover_key.clone());
+            app.rotation_cache
+                .insert(0, crate::rotation_db::Rotation::None);
+            app.update_rotation_page_owner([(cover_key, crate::rotation_db::Rotation::Cw90)]);
+            assert_eq!(
+                app.grid_tile_rotation(0),
+                crate::rotation_db::Rotation::Cw90
+            );
             harness.run_steps(6);
             let rect = cell_rect(&harness);
             // Rotated landscape texture leaves a top letterbox rather than a side letterbox.

@@ -348,6 +348,19 @@ evict していた。設計担当判断により、この判定は時間を隔�
 
 ## 12. 実装メモ
 
+- `2fea9e3ae` の full lib (利用者実行、17,126 件中2件失敗) は2件とも fixture の未追従だった。
+  `letterbox_real_grid_rotation_and_dpi_follow_drawn_image` は ZIP 本に idx の回転 cache だけを注入していた。
+  §4.2 のとおり `Loaded.cover=Page` と角度 owner を準備し、3 DPI の背景/画像クリックの既存検査を維持、
+  描画90°の検査も追加した。`drive_list_folder_pin_seeds_image_named_cover_epub_png` は v2 pin 行だけを
+  Legacy→Page に更新し、実際のコピー元の v3 自動行を Legacy のまま残していた。§7 は「コピー元の
+  identity をそのまま写す」ので、別行の更新では seed が Legacy のままであることも検査したうえで、
+  コピー元行を同じ bytes/stamp/寸法の Page に更新する。Page・画素・Finalized・texture ID の期待値は維持。
+  初回の行選択は `epub-pdf-integration-plan.md` §9 の S2c-2 独立レビュー fix round 4 で従来どおりと
+  明示されており、製品の読取範囲は変更しない。v2/v3 の両 prefix を読む案は関連 EPUB 2件の仮画像を
+  変えることを確認し、採用しなかった。
+  再検証は指定2件と関連 EPUB 2件が4/4、従来の F2/F3 を含む関連フィルターが597/597 成功。
+  `cargo check -p mimageviewer --bin mimageviewer-core` は exit 0。全 lib の再実行と製品起動は行っていない。
+
 - 実装レビュー 1 の再指定: SQL の `q:` 化は Page と catalog 元フォルダのドライブが一致するときだけ。
   他は `p:` の絶対キーを保持する。Collection は synthetic DB identity と実ソース親を分け、worker が
   handle を公開する前に元フォルダのドライブを固定する。回転の owner、画素、seed、Loaded は絶対キーのまま。
