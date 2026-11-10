@@ -2131,6 +2131,8 @@ v5.1.0 の配布ビルドを利用者が試して出した要望 3 件 (`next-re
   - 失敗 (`Failed`): 何もしない (失敗はパネルと既存の通知で知らせ済み。同じ鍵では再試行しない §13)。
   - 元画像ホールド中: 何もしない。
   - 描画できる (`ready()` あり): 下の「描画時の解決」へ要求を渡す。画像の外だった場合は描画時に何もしない。
+    深さが決まったCtrl+クリックは既存パネルと同じ操作時の `settings.save()` を1クリックにつき1回だけ同期実行する。
+    [UI応答性 §2.5](ui-responsiveness.md#25-静止画シーク回転-reader-の所有境界)の明示的な例外に従い、再passやハイライト中の再描画では保存しない。
 - **保証の範囲はマウスのクリック**。タッチのタップは Ctrl の有無にかかわらず従来どおり (ページ送り) で、止まる深さは
   スライダーで調整する。ただし 3D パネルの上のタップが背面のページ送りになる既存の穴は、パネルに新しい
   ボタンを置くのでこの機会に塞ぐ: 表示中の 3D パネルの矩形をタッチの除外領域 (ui_fullscreen.rs:40477 の組立て) にも加える
@@ -2286,7 +2288,10 @@ MainWindow (30278) と Fullscreen (30290) はどちらも `render_fs_body` を�
 | `src/app/depth_export.rs` (test)、`src/app/depth_main_window_tests.rs`、`src/ui_depth_parallax_tests.rs`、`tests/ui_snapshot.rs`、パネル PNG | ハイライト中の実書き出し要求で強さ0、新しい追従半径の期待値、実パネルの操作、固定 header／本文高さ・末尾到達と外観 |
 | `htdocs/mimageviewer/manual/fullscreen.html`、`docs/keymap-spec.md`、本書 | 操作と表示仕様を同期。製品ページの3Dカードは説明が引き続き正確なため変更なし |
 
-§17からの仕様変更なし。新しい非同期処理、I/O、回復経路、設定項目は追加していない。
+§17からの仕様変更なし。新しい非同期処理、回復経路、設定項目は追加していない。
+Ctrl+クリックは深さが決まった操作時に、既存パネルと同じ `settings.save()` を1クリックにつき1回同期実行する。
+[UI応答性 §2.5](ui-responsiveness.md#25-静止画シーク回転-reader-の所有境界)の明示的な例外に従い、
+毎フレーム、同じクリックの再pass、ハイライト中の再描画では保存しない。writerの新設や部分的な非同期化は行わない。
 CPU深度はGPU資源と同じArc/LRUの寿命を使い、VRAM会計は従来の値を維持する。
 操作感（半径0.25）、ハイライトの色・幅、非整数DPIでの見え方は実機確認待ち。
 
@@ -2335,3 +2340,30 @@ snapshotの成功結果は検証方針どおり再利用した。
 両presentationで左Ctrlクリックがページを送らずその深さを設定すること、右Ctrlホールド中は変更しないこと、
 既定値0.5・調整時のハイライトとフェード、中央の狭い範囲で追従の端に届くこと、書き出しにハイライトが入らないことが
 実機の確認項目。全件gate・実機確認・coordinatorによるcommitはこの実装作業では行っていない。
+
+#### Codex P2/P3 対応
+
+2026-11-10、`4299e510c` に対する独立レビュー後の対応。製品コードの変更はなく、
+`src/app/depth_main_window_tests.rs`、`src/ui_fullscreen/depth_focus_tests.rs`、本書だけを変更した。
+
+- P2: §17.2 と本節に、Ctrl+クリックが既存パネルと同じ操作時の同期 `settings.save()` を
+  1クリックにつき1回呼ぶことを明記した。UI応答性 §2.5 の明示的な例外を適用し、
+  writer の新設や非同期化は行わない。実入力から描画までのテストで、保存世代が press では進まず、
+  release に discard 再pass があっても1だけ進み、その後のハイライト付き8回の実描画では進まないことを検査する。
+- P3: 共通fixtureで深度値を指定できるようにし、x方向の0→1勾配と画像中央以外のクリックを使った
+  回転90°／resizeの2テストを追加した。release と同じ pass 内の回転変更、または同じ入力の新しい表示領域を
+  実描画経路に渡し、実際の Depth callback の矩形と描画後の transform の一致、同一 resource の維持を確認する。
+  現在と直前の transform それぞれから期待深度を計算し、差が0.1を超えること、許容誤差 `1e-4` の
+  同じ合否判定が旧 transform の値を拒否し、実際に設定された値を受理することを assert する。
+  旧テストは検査内容に合わせて pass／resource／画像外／LRU／media半径の名前へ変更した。
+
+§17からの仕様変更なし。テストと文書のみのため確認用バイナリの再buildは不要。
+全件suite、コミット、push、製品起動は行っていない。
+
+検証（同worktree、通常feature）:
+
+| コマンド | 結果・証拠 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth_focus_click_(saves_once\|uses_same_pass)/)'` | **3成功 / 0失敗**、exit 0。`target/depth-751-review-focused.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth/)'` | **177成功 / 0失敗**、exit 0。`target/depth-751-review-depth.log`。上の追加3件を含む |
+| `cargo fmt`（引数なし）、`git diff --check` | exit 0 |

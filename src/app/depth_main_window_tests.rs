@@ -44,6 +44,15 @@ impl RootDepthViewer {
     }
 
     pub(crate) fn ready(&self, app: &mut App) -> u64 {
+        self.ready_with_depth_values(app, [4, 6], vec![half::f16::from_f32(0.5); 24])
+    }
+
+    pub(crate) fn ready_with_depth_values(
+        &self,
+        app: &mut App,
+        size: [u32; 2],
+        values: Vec<half::f16>,
+    ) -> u64 {
         let source = app.ensure_final_composite_material(&self.ctx, 0).unwrap();
         let key = crate::depth_estimation::DepthSourceKey {
             texture_id: source.source_texture().id(),
@@ -72,9 +81,9 @@ impl RootDepthViewer {
         state.attach_renderer(&render);
         let map = crate::depth_estimation::DepthMap {
             key,
-            width: 4,
-            height: 6,
-            values: vec![half::f16::from_f32(0.5); 24],
+            width: size[0],
+            height: size[1],
+            values,
             median: 0.5,
         };
         state.lru.insert(
@@ -98,7 +107,7 @@ impl RootDepthViewer {
         self.frame_with_before(app, events, |_, _| {});
     }
 
-    pub(super) fn frame_with_before(
+    pub(crate) fn frame_with_before(
         &mut self,
         app: &mut App,
         events: Vec<egui::Event>,

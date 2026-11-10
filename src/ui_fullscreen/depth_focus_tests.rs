@@ -520,7 +520,214 @@ fn depth_focus_real_presentations_register_before_paint_with_deferred_wheel_and_
 }
 
 #[test]
-fn depth_focus_paint_consumes_only_same_pass_matching_resource_and_current_transform() {
+fn depth_focus_click_saves_once_across_discard_and_highlight_repaints() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let _input = crate::key_input::lock_test_input();
+    let mut app = crate::app::setup_app_for_test();
+    let mut viewer = RootDepthViewer::new(&mut app);
+    viewer.ready(&mut app);
+    app.settings.touch_still_chrome_learned = true;
+    app.settings.depth_parallax.focus = 0.2;
+    for _ in 0..2 {
+        viewer.frame(&mut app, vec![]);
+    }
+    app.fs_focus_regained_at = None;
+    // Establish that the isolated real Settings writer lands successfully, so
+    // its generation also detects an unwanted second synchronous save.
+    let before_save = crate::settings::save_generation();
+    app.settings.save();
+    assert_eq!(crate::settings::save_generation(), before_save + 1);
+    let baseline = crate::settings::save_generation();
+    let image = app
+        .fullscreen_page_layout
+        .single_page()
+        .unwrap()
+        .transform
+        .paint_rect;
+    let pos = image.min + image.size() * egui::vec2(0.3, 0.4);
+    viewer.frame(
+        &mut app,
+        vec![egui::Event::PointerMoved(pos), pointer(pos, true, true)],
+    );
+    assert_eq!(crate::settings::save_generation(), baseline);
+
+    let retry = Arc::new(AtomicBool::new(true));
+    let passes = Arc::new(AtomicUsize::new(0));
+    let retry_once = retry.clone();
+    let observed_passes = passes.clone();
+    viewer.ctx.on_end_pass(
+        "depth_focus_save_repass",
+        Arc::new(move |ui| {
+            observed_passes.fetch_add(1, Ordering::Relaxed);
+            if retry_once.swap(false, Ordering::Relaxed) {
+                ui.ctx()
+                    .request_discard("check one focus save for a physical click");
+            }
+        }),
+    );
+    viewer.frame(&mut app, vec![pointer(pos, false, true)]);
+    assert!(
+        passes.load(Ordering::Relaxed) >= 2,
+        "the click frame really discarded and ran again"
+    );
+    assert_eq!(app.settings.depth_parallax.focus, 0.5);
+    assert_eq!(
+        crate::settings::save_generation(),
+        baseline + 1,
+        "one click saves once across all passes"
+    );
+    for _ in 0..8 {
+        let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+            unreachable!()
+        };
+        assert!(state.focus_highlight.is_some());
+        assert!(state.pending_focus_click.is_none());
+        // Keep the presentation highlighted without depending on test speed.
+        state.focus_highlight =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        viewer.frame(&mut app, vec![]);
+        assert_eq!(
+            viewer.callbacks().len(),
+            1,
+            "the highlighted image really painted"
+        );
+        assert_eq!(
+            crate::settings::save_generation(),
+            baseline + 1,
+            "highlight repaint must not save settings"
+        );
+    }
+    crate::key_input::clear_test_frame();
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FocusGeometryChange {
+    QuarterTurn,
+    Resize,
+}
+
+fn assert_focus_click_uses_current_transform(change: FocusGeometryChange) {
+    let _input = crate::key_input::lock_test_input();
+    let mut app = crate::app::setup_app_for_test();
+    let mut viewer = RootDepthViewer::new(&mut app);
+    let size = [64_u32, 96_u32];
+    let values: Vec<_> = (0..size[1])
+        .flat_map(|_| (0..size[0]).map(|x| half::f16::from_f32(x as f32 / (size[0] - 1) as f32)))
+        .collect();
+    let resource_id = viewer.ready_with_depth_values(&mut app, size, values);
+    app.settings.depth_parallax.shape_depth = false;
+    app.settings.depth_parallax.focus = 0.1;
+    app.settings.touch_still_chrome_learned = true;
+    // No inference during the test; input and the real renderer still run.
+    app.window_visible = false;
+    for _ in 0..2 {
+        viewer.frame(&mut app, vec![]);
+    }
+    app.fs_focus_regained_at = None;
+    let initial = app.fullscreen_page_layout.single_page().unwrap().transform;
+    let pos = initial.paint_rect.min + initial.paint_rect.size() * egui::vec2(0.2, 0.55);
+    viewer.frame(
+        &mut app,
+        vec![egui::Event::PointerMoved(pos), pointer(pos, true, true)],
+    );
+    let previous = app.fullscreen_page_layout.single_page().unwrap().transform;
+    assert_eq!(previous.rotation, crate::rotation_db::Rotation::None);
+    assert_eq!(app.settings.depth_parallax.focus, 0.1);
+    if matches!(change, FocusGeometryChange::Resize) {
+        // begin_pass receives the new screen rectangle with the release event;
+        // no intervening frame paints or records this size before the click.
+        viewer.size = egui::vec2(820., 450.);
+    }
+    let mut release_passes = Vec::new();
+    viewer.frame_with_before(&mut app, vec![pointer(pos, false, true)], |app, ctx| {
+        release_passes.push(ctx.cumulative_pass_nr());
+        if matches!(change, FocusGeometryChange::QuarterTurn) {
+            // Publish the rotation inside the release pass, before input planning
+            // and drawing, just as the accepted cached rotation is read by them.
+            app.rotation_cache
+                .insert(0, crate::rotation_db::Rotation::Cw90);
+        }
+    });
+    let current = app.fullscreen_page_layout.single_page().unwrap().transform;
+    assert!(!release_passes.is_empty());
+    assert_eq!(
+        viewer.callbacks(),
+        vec![current.paint_rect],
+        "use the transform of the actual Depth callback"
+    );
+    assert_ne!(current.paint_rect, previous.paint_rect);
+    assert!(previous.paint_rect.contains(pos) && current.paint_rect.contains(pos));
+    match change {
+        FocusGeometryChange::QuarterTurn => {
+            assert_eq!(current.rotation, crate::rotation_db::Rotation::Cw90)
+        }
+        FocusGeometryChange::Resize => {
+            assert_eq!(viewer.ctx.content_rect().size(), egui::vec2(820., 450.));
+            assert_ne!(current.viewport_rect.size(), previous.viewport_rect.size());
+            assert_ne!(current.paint_rect.size(), previous.paint_rect.size());
+        }
+    }
+    let FsExclusiveView::Depth(state) = &app.fs_exclusive_view else {
+        unreachable!()
+    };
+    let resource = state.ready().unwrap();
+    assert_eq!(
+        resource.resource_id, resource_id,
+        "geometry changes keep the same source resource"
+    );
+    assert!(state.pending_focus_click.is_none());
+    let sample = |transform: &crate::displayed_image_transform::DisplayedImageTransform| {
+        let params = crate::depth_parallax_wgpu::DepthRenderParams::from_settings(
+            &app.settings.depth_parallax,
+            resource.depth.median,
+            egui::Vec2::ZERO,
+            transform.uv_rect,
+            transform.rotation.degrees() as u32 / 90,
+            transform.paint_rect.aspect_ratio(),
+        );
+        crate::depth_parallax_wgpu::focus_depth_at(
+            pos,
+            transform.paint_rect,
+            params,
+            resource.depth.width,
+            resource.depth.height,
+            &resource.depth.values,
+        )
+        .unwrap()
+    };
+    let expected_current = sample(&current);
+    let expected_previous = sample(&previous);
+    let tolerance = 1e-4;
+    let agrees_with_current = |focus: f32| (focus - expected_current).abs() <= tolerance;
+    assert!(
+        (expected_current - expected_previous).abs() > 0.1,
+        "{change:?}: stale geometry must differ far beyond tolerance: current={expected_current}, previous={expected_previous}, tolerance={tolerance}"
+    );
+    assert!(
+        !agrees_with_current(expected_previous),
+        "the acceptance check must reject the old transform's result"
+    );
+    assert!(
+        agrees_with_current(app.settings.depth_parallax.focus),
+        "{change:?}: actual={}, current={expected_current}, previous={expected_previous}",
+        app.settings.depth_parallax.focus
+    );
+    crate::key_input::clear_test_frame();
+}
+
+#[test]
+fn depth_focus_click_uses_same_pass_rotated_transform_with_gradient() {
+    assert_focus_click_uses_current_transform(FocusGeometryChange::QuarterTurn);
+}
+
+#[test]
+fn depth_focus_click_uses_same_pass_resized_transform_with_gradient() {
+    assert_focus_click_uses_current_transform(FocusGeometryChange::Resize);
+}
+
+#[test]
+fn depth_focus_paint_checks_pass_resource_bounds_lru_and_media_radius() {
     let _input = crate::key_input::lock_test_input();
     let mut app = crate::app::setup_app_for_test();
     let mut viewer = RootDepthViewer::new(&mut app);
