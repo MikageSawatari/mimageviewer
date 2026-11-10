@@ -31,6 +31,7 @@
 - **公開後 (2026-11-10 夜)**: GitHub Release v5.1.0 (タグ・main = `fa614117a`)、資産 4 点のサイズ一致・latest・CI 緑。mikage.to 反映 154 ファイル + sitemap.xml (権限の都合で scp 上書き)、verify-site は `.htaccess` の 403 のみ、DL 3 点 200・サイズ一致。§1.737 の旧 URL (版付き sound / effetune) はすべて 1 回の 301 で固定 URL の 200 に着き、canonical は自分自身、公開中の sitemap に版付き URL 0 件。Vector 申請・X 告知は利用者が実施。
 - **Store 用インストーラ**: R2 `https://dl.mikage.jp/mimageviewer/v5.1.0/mImageViewer_setup.exe` (269,205,720 bytes、sha256 `ccb25d5adde6189e4c825196421f50b0f4cd8cba56123278e4b219c835294c1f`) に配置し、200・転送なし・配信内容の sha256 一致を `upload-store-installer.ps1` で確認。
 - **Store 申請前の Sandbox 起動確認 (サブ PC 依頼 29、vGPU=Disable、`/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-`、観測者はサブ PC 担当、取得は利用者)**: R2 から取得した setup.exe (sha256 一致・署名 Valid) で install exit 0 (約 26 秒)。初回 180 秒・2 回目 90 秒とも responding=False 0 件、タイトル「Desktop - mimageviewer」、初回設定の窓を表示。描画は Microsoft Basic Render Driver。ERROR / WARN / panic・Application Hang / WER なし。結果は `C:\miv-subpc\results-29\`。vGPU=Enable (§1.736) は今回行っていない。
+- **Store 更新申請**: 2026-11-10 に利用者が Partner Center でパッケージ URL を R2 の v5.1.0 へ差し替え、Package validation を開始 (利用者の報告)。検証には毎回数時間かかるため、審査への送信は検証の合格後 (11-11 の見込み)。「プロパティ」の認定の注意事項は前のまま (審査手順に関わる変更なし)。
 
 ## v5.0.0 (2026-11-07)
 
