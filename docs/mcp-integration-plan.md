@@ -6077,4 +6077,4 @@ v5.1.0 の範囲 (利用者決定 2026-11-08):
   `max_stars: 0, kinds: ["image"]` は未評価の画像 4 枚、`kinds: ["folder"]` は子フォルダだけ、`min_stars: 2, limit: 2` は 2 件と基本一覧の位置 4 を持つ cursor を返した。
   `list_library` rated の `stars: 2, max_stars: 2` は★2 の 3 枚だけを返した。範囲の逆転・空の `kinds`・`max_stars` が最小より小さい rated は `-32602` で拒否された。
   起動中の本体は許可をメモリに持つので、設定 DB を直接書き換えた後は再起動が要った (確認手順上の注意で、製品の挙動の変更ではない)。
-  AI アプリ (Claude Desktop 等) からの確認は未実施 (利用者に依頼する)。
+  AI アプリからの確認 (サブ PC 担当、依頼 28 第 2 部、2026-11-10、ビルド `7ca83f645` = master を取り込んだ後、codex-cli 0.166.0、`C:\miv-subpc\results-28\1735\`): Codex を「整理まで」で登録し、`codex exec` で 1 回ずつ新しい会話として頼んだ。4 回とも期待どおりで、★の絞り込みを自分で使った。「C:\miv-test-v5\rate1735 の★2 の画像から 3 枚選んで★4 に」は `list_folder` (`min_stars: 2, max_stars: 2`) 1 回 + `set_rating` 1 回 (3 件) で 19 秒。★2 と★4 の枚数は `list_folder` 2 回、未評価の枚数 (283) は `list_folder` (`max_stars: 0`) を cursor で続けて取得、ライブラリ全体のちょうど★3 は `list_library` rated (`stars: 3, max_stars: 3`) 1 回。一覧を取り直しながら★を読む遠回りは無かった。設計担当が rating.db の写しを数え、★2 = 9・★3 = 5・★4 = 3 で一致。登録を外した後の config.toml のハッシュは登録前と一致。ERROR / WARN / panic なし。 Claude Desktop・ChatGPT アプリ (画面) からは未確認。
