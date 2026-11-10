@@ -105,7 +105,9 @@ pub(crate) enum CoverIdentity {
 - 呼び出し元 (全描画入口): 一覧の 2 か所 (`ui_main.rs` の grid 描画)、`repaint_grid_cell_after_input`、詳細表示の hover サムネ
   (`painter.image` を直接呼ぶ箇所)。hit-area / overlay の計算が回転後の寸法を使う箇所があれば、描画と同じ値を使う。
 - **詳細表示の hover は、ページ item も含めて owner だけを引く** (メモリのみ)。`get_rotation` は cache miss で同期 SELECT をするので
-  hover から呼ばない。owner は全非 0 回転を持つので、キーが無ければ 0° と確定してよい。hover の表示枠と配置の寸法も
+  hover から呼ばない。owner は、§1.757 (EPUB→PDF 変換でコピーした PDF のキー) を除く全非 0 回転を持つので、キーが無ければ
+  0° として描く。§1.757 の PDF のキーは次回起動 (または全体 snapshot の読み直し) まで owner に無く、その間は本のタイル・hover・
+  旧行の作り直しの判定が回転なしとして扱う (ページ一覧のタイルは `get_rotation` の DB 読みで回る)。hover の表示枠と配置の寸法も
   90°/270° で縦横を入れ替える (最後の mesh だけでなく)。ページ item の hover が回るようになるのは今回の修正に含める
   (一覧と hover の向きを揃える)。
 - 新しく足す描画経路は DB を引かない。
@@ -257,6 +259,12 @@ pub(crate) enum CoverIdentity {
    EPUB→PDF 変換の回転の反映は今回の範囲から外し、変換機能側の既存の不足として別項目にした (今回の修正で悪化しない)。
 3. (P3) 組み立て終わった要求には変換書庫の元のパスや ZipDir の prefix が残らない → §5.0。要求の組み立て中に範囲を作る。
 
+### 8.4 2026-11-10 確認ラウンド (同じ Sol/xhigh)
+
+判定は「文書の修正だけで実装可」。P1・P2 なし。§8.3 の 1・3 は解決。EPUB→PDF を §1.757 へ外すことは §1.718 として受け入れ可
+(identity は角度の取得と独立で、owner に無いキーは誤った回転を作らない)。P3 1 件: owner が全非 0 回転を持つという記述と、
+変換直後の受け入れ条件が除外と矛盾 → §4.2 と §10 を直した。
+
 ## 9. mIV Remote
 
 - 今の Remote は、サムネの結果から画素だけを取り出して identity を捨てている (`remote_ipc/thumbnail.rs` のフォルダ、
@@ -289,7 +297,7 @@ pub(crate) enum CoverIdentity {
   別 viewer context (別ウィンドウ) の同じ本のタイルも追従する。UI スレッドで RotationDb を読まないこと。
 - 追加 (設計レビュー 2026-11-10): 格納順と一覧順が違う ZIP で、仮想フォルダの seed / writeback を経ても表紙の identity が
   実際の画素のページのままであること。変換書庫 (RAR / 7z) の表紙を pin したフォルダで、表紙の回転が判定・再要求に掛かること。
-  EPUB→PDF 変換 (単発・一括) の後、PDF の本のタイルが表紙の角度で描かれること。`CachePolicy::Off` でも旧行の作り直しが
+  (EPUB→PDF 変換の直後の確認は §1.757 へ移した。) `CachePolicy::Off` でも旧行の作り直しが
   1 回で収束すること。別 context で読み込み中・CPU 待ち行列・暫定画像の段階の `Legacy` 結果が、表紙の回転後に採用されず再要求されること。
   CacheOnly で届いた `Legacy` は回転操作で evict されないこと。一括キャッシュ作成と pin 確定の行に identity が入ること。
 - 追加 (再レビュー): 元ソースが読めない回転済みの本 (旧行あり) で、旧行の表紙が表示され続け、再要求が繰り返されないこと。
