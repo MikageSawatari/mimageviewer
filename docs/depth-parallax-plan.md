@@ -2367,3 +2367,40 @@ snapshotの成功結果は検証方針どおり再利用した。
 | `cargo nextest run -p mimageviewer --lib -E 'test(/depth_focus_click_(saves_once\|uses_same_pass)/)'` | **3成功 / 0失敗**、exit 0。`target/depth-751-review-focused.log` |
 | `cargo nextest run -p mimageviewer --lib -E 'test(/depth/)'` | **177成功 / 0失敗**、exit 0。`target/depth-751-review-depth.log`。上の追加3件を含む |
 | `cargo fmt`（引数なし）、`git diff --check` | exit 0 |
+
+### 17.10 操作の案内: パネルを隠す・出す (§1.760、5ch >>755) と Ctrl+クリック (2026-11-11)
+
+利用者の判断 (2026-11-11): §1.751 は左 Ctrl+クリックのままとする。そのうえで、パネルを隠せることと
+Ctrl+クリックで止まる深さを決められることを、画面上から分かるようにする。
+
+現状 (コード確認): パネルの表示・非表示は `App::toggle_depth_panel` (`src/app/depth_view.rs`) の 1 か所で、
+呼び出しはキー `KeyAction::FsToggleMetadata` (既定 `I` / `Tab`、`src/ui_fullscreen.rs` の `key_i`) と
+ゲームパッドのリング `RingActionId::ImageToggleMetadata` (`src/app/gamepad_input.rs`) の 2 つ。
+Ctrl+クリックの案内は §17.5 でスライダー下 (ScrollArea の中) に置いたため、本文をスクロールすると見えない。
+
+**決定**
+
+1. **パネル下部に固定の案内欄** (フッター) を置く。ヘッダと同じく ScrollArea の**外**で、本文の高さは
+   フッターの実測高さを差し引いて確保する (固定パネルの規則、`tests/support/scroll_layout.rs`)。小さな弱い文字色で 2 行:
+   - `左 Ctrl+クリック: その場所の深さで止める` (マウス操作なので固定文言)
+   - `<キー>: パネルを隠す・出す`。`<キー>` は `keymap.chord_labels(KeyAction::FsToggleMetadata)` を ` / ` で
+     つないだもの (既定は `I / Tab`)。割り当てが空なら、この行は出さない (存在しない操作を案内しない)。
+   §17.5 のスライダー下の Ctrl+クリック説明は**消して**フッターへ移す (同じ意味を 2 か所に書かない)。
+   「既定値」ボタンはスライダーの近くに残す。
+2. **隠したときに通知を 1 回出す**。`toggle_depth_panel` が表示→非表示へ切り替えたとき、既存の
+   `show_feedback_toast` で `3D 写真のパネルを隠しました。<キー> でもう一度表示します` を出す
+   (割り当てが空なら `3D 写真のパネルを隠しました` だけ)。キーとリングの両方の入口が同じ関数を通るので、
+   通知もそこに 1 か所だけ置く。表示に戻すときは通知しない。
+   通知は毎回出す。初回だけにするには永続の「見た」状態が要り、状態を増やすため採らない。
+3. 文言は描画のたびに今の keymap から作る (キャッシュしない)。ui 関数 (`draw_depth_parallax_panel_with_export`) は
+   keymap を持たず、App が作った案内文字列 (`Option<String>`) を引数で受け取る (パネル側に I/O・設定参照を足さない)。
+
+**採らなかった案**: 隠したあと画像の隅に小さな「3D」ボタンを常に出す (隠した目的の「画像を広く見る」に反する)。
+右端ホバーで出す・鍵で固定する (backlog の未定案。状態と入力経路が増えるので今回は入れない)。
+
+**テスト**: フッター文言が keymap の今の割り当てに従う (既定・別キーへ変更・複数・空) handler/UI テスト。
+隠す切替で通知が 1 回、出す切替で通知なし (キーとリングの両方)。1093×614 と小さい画面でヘッダ・フッターが
+ScrollArea の外に見え、本文が末尾まで届く高さ検査。UI スナップショット更新。
+
+**文書**: マニュアル (3D 写真の節) に「パネル下部に操作の案内が出る」「隠したときの通知」を足す。
+`docs/keymap-spec.md` に、3D パネルの案内が `FsToggleMetadata` の割り当てから作られることを書く。
