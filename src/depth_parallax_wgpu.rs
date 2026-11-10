@@ -8,6 +8,9 @@ use std::sync::{
 };
 
 mod export;
+#[cfg(test)]
+#[path = "depth_focus_sampling_tests.rs"]
+mod focus_sampling_tests;
 pub(crate) use export::DepthFrameRenderer;
 
 // No sRGB texture format is used: egui stores sRGB-encoded bytes in Rgba8Unorm.
@@ -54,7 +57,10 @@ fn depth_at(p:vec2<f32>)->f32 {
         if depth_at(base-offset*(t-params.motion.z))>=t {far=t;} else {near=t;}
     }
     let uv=source_uv(base-offset*((near+far)*.5-params.motion.z));
-    return textureSampleGrad(color,samp,uv,dx,dy);
+    let c=textureSampleGrad(color,samp,uv,dx,dy);
+    let h=params.view.w;
+    let w=h*(1.-smoothstep(0.03,0.05,abs((near+far)*.5-params.motion.z)));
+    return vec4(mix(c.rgb*(1.-0.2*h),vec3(0.,0.85,1.)*c.a,0.55*w),c.a);
 }
 "#;
 const BLIT_SHADER: &str = r#"
@@ -77,6 +83,7 @@ pub(crate) struct DepthRenderParams {
     pub uv: egui::Rect,
     pub quarter_turns: u32,
     pub aspect: f32,
+    pub focus_highlight: f32,
 }
 impl DepthRenderParams {
     pub(crate) fn from_settings(
@@ -95,7 +102,12 @@ impl DepthRenderParams {
             uv,
             quarter_turns,
             aspect,
+            focus_highlight: 0.0,
         }
+    }
+    pub(crate) fn with_focus_highlight(mut self, intensity: f32) -> Self {
+        self.focus_highlight = intensity;
+        self
     }
     fn bytes(self) -> [u8; 48] {
         let values = [
@@ -110,7 +122,7 @@ impl DepthRenderParams {
             self.zoom,
             self.quarter_turns as f32,
             self.aspect,
-            0.,
+            self.focus_highlight,
         ];
         let mut bytes = [0; 48];
         for (chunk, v) in bytes.chunks_exact_mut(4).zip(values) {
@@ -125,6 +137,55 @@ pub(crate) fn depth_gamma(enabled: bool, median: f32) -> f32 {
     } else {
         1.
     }
+}
+
+/// Offset-zero lookup matching DEPTH_SHADER: zoom, rotation, crop, clamp-to-edge
+/// bilinear sampling at texel centers, then shaping. No previous-pass geometry.
+pub(crate) fn focus_depth_at(
+    pos: egui::Pos2,
+    paint_rect: egui::Rect,
+    params: DepthRenderParams,
+    width: u32,
+    height: u32,
+    values: &[half::f16],
+) -> Option<f32> {
+    if !paint_rect.contains(pos)
+        || paint_rect.width() <= 0.0
+        || paint_rect.height() <= 0.0
+        || width == 0
+        || height == 0
+        || values.len() != width as usize * height as usize
+    {
+        return None;
+    }
+    let p = ((pos - paint_rect.min) / paint_rect.size() - egui::Vec2::splat(0.5)) / params.zoom
+        + egui::Vec2::splat(0.5);
+    let p = match params.quarter_turns % 4 {
+        1 => egui::vec2(p.y, 1.0 - p.x),
+        2 => egui::vec2(1.0 - p.x, 1.0 - p.y),
+        3 => egui::vec2(1.0 - p.y, p.x),
+        _ => p,
+    };
+    let uv = (params.uv.min.to_vec2() + params.uv.size() * p)
+        .clamp(params.uv.min.to_vec2(), params.uv.max.to_vec2());
+    let texel = uv * egui::vec2(width as f32, height as f32) - egui::Vec2::splat(0.5);
+    let lo = texel.floor();
+    let fraction = texel - lo;
+    let at = |x: f32, y: f32| {
+        values[y.clamp(0.0, (height - 1) as f32) as usize * width as usize
+            + x.clamp(0.0, (width - 1) as f32) as usize]
+            .to_f32()
+    };
+    let top = egui::lerp(at(lo.x, lo.y)..=at(lo.x + 1.0, lo.y), fraction.x);
+    let bottom = egui::lerp(
+        at(lo.x, lo.y + 1.0)..=at(lo.x + 1.0, lo.y + 1.0),
+        fraction.x,
+    );
+    Some(
+        egui::lerp(top..=bottom, fraction.y)
+            .clamp(0.0, 1.0)
+            .powf(params.gamma),
+    )
 }
 
 fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -276,6 +337,7 @@ pub(crate) struct DepthTexture {
     pub median: f32,
     pub width: u32,
     pub height: u32,
+    pub values: Vec<half::f16>,
 }
 impl DepthTexture {
     pub(crate) fn upload(
@@ -324,6 +386,7 @@ impl DepthTexture {
             median: map.median,
             width: map.width,
             height: map.height,
+            values: map.values,
         })
     }
     pub(crate) fn byte_size(&self) -> u64 {
@@ -774,7 +837,7 @@ mod tests {
         assert_eq!(color_byte_size(4, 2), 44);
     }
 
-    fn render_egui_frame(
+    pub(super) fn render_egui_frame(
         gpu: &mut crate::egui037_stage4_gpu_tests::OffscreenGpu,
         ctx: &egui::Context,
         size: [u32; 2],
@@ -805,7 +868,7 @@ mod tests {
         pixels
     }
 
-    fn cropped_quarter_turn(
+    pub(super) fn cropped_quarter_turn(
         viewport: egui::Rect,
         crop: egui::Rect,
     ) -> crate::displayed_image_transform::DisplayedImageTransform {
@@ -835,7 +898,7 @@ mod tests {
         .unwrap()
     }
 
-    fn install_two_depth_planes(
+    pub(super) fn install_two_depth_planes(
         gpu: &mut crate::egui037_stage4_gpu_tests::OffscreenGpu,
         texture_id: egui::TextureId,
         transform: &crate::displayed_image_transform::DisplayedImageTransform,
@@ -889,6 +952,7 @@ mod tests {
                 uv: transform.uv_rect,
                 quarter_turns: transform.rotation.degrees() as u32 / 90,
                 aspect: transform.paint_rect.aspect_ratio(),
+                focus_highlight: 0.0,
             },
             target_format: crate::egui037_stage4_gpu_tests::FORMAT,
         };
@@ -1251,6 +1315,7 @@ mod tests {
             uv: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1., 1.)),
             quarter_turns: 0,
             aspect: size[0] as f32 / size[1] as f32,
+            focus_highlight: 0.0,
         };
         let job = DepthShaderCallback {
             context: owner,
@@ -1298,6 +1363,7 @@ mod tests {
         let mut mouse = crate::depth_parallax::MouseFollow::default();
         mouse.update(
             Some(egui::pos2(rect.right(), rect.center().y)),
+            rect,
             rect,
             false,
             0.05,

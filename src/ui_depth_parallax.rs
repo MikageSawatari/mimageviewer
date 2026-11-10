@@ -9,6 +9,7 @@ use eframe::egui;
 
 pub struct DepthPanelResponse {
     pub changed: bool,
+    pub focus_adjusting: bool,
     pub close_requested: bool,
     pub export_requested: bool,
     pub rect: egui::Rect,
@@ -68,6 +69,7 @@ pub fn draw_depth_parallax_panel_with_export(
                     - ui.cursor().top())
                 .clamp(0.0, 380.0);
                 let mut changed = false;
+                let mut focus_adjusting = false;
                 let mut export_rect = egui::Rect::NOTHING;
                 let mut export_requested = false;
                 let scroll = ui
@@ -133,10 +135,11 @@ pub fn draw_depth_parallax_panel_with_export(
                                         .labelled_by(period_label.id)
                                         .changed();
                                     let focus_label = ui.label("止まる深さ");
-                                    changed |= ui
+                                    let focus = ui
                                         .add(egui::Slider::new(&mut settings.focus, 0.0..=1.0))
-                                        .labelled_by(focus_label.id)
-                                        .changed();
+                                        .labelled_by(focus_label.id);
+                                    changed |= focus.changed();
+                                    focus_adjusting |= focus.dragged() || focus.changed();
                                     ui.horizontal(|ui| {
                                         ui.weak("奥");
                                         ui.with_layout(
@@ -146,6 +149,14 @@ pub fn draw_depth_parallax_panel_with_export(
                                             },
                                         );
                                     });
+                                    ui.label(egui::RichText::new(
+                                        "画像を左 Ctrl+クリックすると、その場所の深さになります"
+                                    ).small().color(ui.visuals().weak_text_color()));
+                                    if ui.small_button("既定値").clicked() {
+                                        settings.focus = 0.5;
+                                        changed = true;
+                                        focus_adjusting = true;
+                                    }
                                     ui.add_space(6.0);
                                     changed |= ui
                                         .checkbox(&mut settings.shape_depth, "奥行きを整える")
@@ -182,6 +193,7 @@ pub fn draw_depth_parallax_panel_with_export(
                     .inner;
                 (
                     changed,
+                    focus_adjusting,
                     close_requested,
                     header.response.rect,
                     close_rect,
@@ -191,10 +203,19 @@ pub fn draw_depth_parallax_panel_with_export(
                 )
             })
         });
-    let (changed, close_requested, header_rect, close_rect, export_rect, export_requested, scroll) =
-        output.inner.inner;
+    let (
+        changed,
+        focus_adjusting,
+        close_requested,
+        header_rect,
+        close_rect,
+        export_rect,
+        export_requested,
+        scroll,
+    ) = output.inner.inner;
     DepthPanelResponse {
         changed,
+        focus_adjusting,
         close_requested,
         export_requested,
         rect: output.response.rect,

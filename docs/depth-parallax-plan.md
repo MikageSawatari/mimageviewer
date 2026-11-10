@@ -262,7 +262,8 @@ CPU の画素 (`ColorImage`) を探さず、**表示中のテクスチャを GPU
 - 自動の動きは時刻だけで決まる関数 `motion_offset(kind, strength, phase)`。
   `phase = (経過時間 / 周期) mod 1`。左右 = (sin, 0)、円 = (cos, 0.6 sin)、8 の字 = (sin, 0.5 sin 2θ)、
   上下 = (0, 0.7 sin)。書き出しは同じ関数に `phase = i / N` を渡す (継ぎ目が出ない)。
-- **マウス追従**: 画像矩形の中心からのポインタ位置を −1〜1 に正規化し、`offset = −強さ × (nx, 0.6 ny)`
+- **マウス追従**: 画像矩形の中心からのポインタ位置を、呼出元の media rect の短辺 × 0.25 を半径として
+  縦横同じ分母で −1〜1 に正規化し、`offset = −強さ × (nx, 0.6 ny)`
   を目標にして時定数 0.15 秒で近づける。ポインタが 3D パネルの上にあるときは目標を動かさない
   (パネルを操作すると絵が揺れるのを防ぐ)。ポインタが窓の外なら中心へ戻す。
   基準の逆引き shader で手前がポインタから離れる向きとする (右 pointer → 手前は左)。
@@ -553,8 +554,10 @@ pub enum DepthSourcePhase {
   置き換えで 360° の挙動が変わらないことを、既存の 360° のテストで確かめる。
 - 3D 中のホイール: **通常どおりページ送り**。3D 中に固有の意味は持たせない (360° と違う点)。
   Ctrl+ホイールのズームだけ止める (§5.2)。
-- 3D 中のマウス左クリック／タップ: **通常どおりページ送り**。360°がcanvasを視線操作に使うための
-  クリック停止をDepthへ持ち込まない。判定は表示中のfit transformを使い、保存2D transformを変更しない。
+- 3D 中の修飾なしマウス左クリック／タップ: **通常どおりページ送り**。マウスの Ctrl+左クリックだけは
+  release イベントの修飾で判定し、同じ pass の描画資源・fit transform から止まる深さを決める (§17.2)。
+  計算中だけ通知し、失敗・元画像ホールド・画像外は何もせず、いずれもページは送らない。
+  表示中の3Dパネルをマウス・タッチとも除外する。保存2D transformは変更しない。
 - 3D 中の左右パネルの表示切替 (I / Tab): **3D パネルの表示・非表示を切り替える**。他のパネルは
   3D 中は出ない。
 - **透過部分の背景切替 (Shift+B / ImageBackgroundCycle)**: Depth中も許可する（利用者決定2026-11-08）。
@@ -635,6 +638,9 @@ pub enum DepthSourcePhase {
   - 強さ: 0.5〜5%、既定 2%
   - 周期: 1〜10 秒、既定 3 秒 (マウス追従のときは無効表示)
   - 止まる深さ: 奥 ↔ 手前 (0〜1)、既定 0.5 (整形 ON なら中央値の深さ)
+    - 下に「画像を左 Ctrl+クリックすると、その場所の深さになります」と小さな「既定値」ボタン。
+      スライダーのドラッグ・変更、既定値、Ctrl+クリックで1秒保持＋0.3秒フェードのハイライトを出す。
+      表示だけの状態で、書き出しには含めない (§17.4)。
   - 奥行きを整える: ON / OFF、既定 ON (説明: 手前の床などが奥行きを占めて平らに見えるのを防ぐ)
   - 「書き出し…」
   - 状態の1行: 「モデルを準備中」「奥行きを計算中」「失敗しました (理由)」。待機中は画像上にも
@@ -2263,3 +2269,69 @@ ui_fullscreen.rs:41011・30497) があり、そこへ置くと同じ pass の `t
 MainWindow (30278) と Fullscreen (30290) はどちらも `render_fs_body` を通り、入力計画 → 素材更新 (28871) → 描画 →
 `try_paint_depth` の順で、間に pass の終了は無い。両 presentation について、この遅延経路と egui の discard による
 再 pass を含めた呼出順の回帰検査を入れる。
+
+### 17.9 実装記録
+
+2026-11-10、`feat-3d-751`、基点 `6e2ed9049`。実装担当による未コミット差分。
+製品の起動・デスクトップ入力・push は行わず、全件 gate とコミットは coordinator が担当する。
+
+| 対象 | 変更 |
+| --- | --- |
+| `src/ui_fullscreen.rs` | release の位置・修飾と egui の click 判定を対応づけ、従来の除外後に `DepthFocusAt` を分類。`render_fs_body` から呼ばれる入力計画内で直ちに要求を登録し、遅延 action 適用では何もしない。表示パネルを touch の除外へ追加。media rect を Depth paint へ渡す |
+| `src/app/depth_view.rs` | 同じ pass の要求を消費し、resource key 確認後、実際の transform と params で解決。既存の設定保存経路とハイライトへ接続。既存の可視・最小化・書き出し条件の下だけ連続 repaint |
+| `src/depth_parallax.rs` | canvas 短辺の 0.25 を共通半径にした追従、pass 限りの要求、ハイライトの時刻と強さの純粋関数 |
+| `src/depth_parallax_wgpu.rs` | CPU 深度を `DepthTexture` に保持し、回転・crop・zoom・bilinear・gamma の純粋 lookup を追加。`view.w` の premultiplied ハイライト。from_settings は常に強さ0 |
+| `src/ui_depth_parallax.rs` | 弱い文字色の操作案内、既定値ボタン、`focus_adjusting`。固定 header／scroll body と本文上限380ptを維持（追加内容も収まることを高さ検査で確認） |
+| `src/depth_focus_sampling_tests.rs`、`src/ui_fullscreen/depth_focus_tests.rs` | CPU/GPU 比較、両 presentation の実入力→描画順序と discard、pass/key 不一致・画像外・LRU、タッチ・除外・repaint の回帰 |
+| `src/app/depth_export.rs` (test)、`src/app/depth_main_window_tests.rs`、`src/ui_depth_parallax_tests.rs`、`tests/ui_snapshot.rs`、パネル PNG | ハイライト中の実書き出し要求で強さ0、新しい追従半径の期待値、実パネルの操作、固定 header／本文高さ・末尾到達と外観 |
+| `htdocs/mimageviewer/manual/fullscreen.html`、`docs/keymap-spec.md`、本書 | 操作と表示仕様を同期。製品ページの3Dカードは説明が引き続き正確なため変更なし |
+
+§17からの仕様変更なし。新しい非同期処理、I/O、回復経路、設定項目は追加していない。
+CPU深度はGPU資源と同じArc/LRUの寿命を使い、VRAM会計は従来の値を維持する。
+操作感（半径0.25）、ハイライトの色・幅、非整数DPIでの見え方は実機確認待ち。
+
+検証（Windows、通常 feature、未コミット差分。実アプリの操作感・画質は未確認）:
+
+| コマンド | 結果・証拠 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth/)'` | **174成功 / 0失敗**、exit 0。`target/depth-751-final.log`。CPU/GPU・入力計画・both presentation/discard・touch・LRU・modal/Remote・repaint・実書き出し要求を含む |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/fullscreen_click\|canvas_click\|touch/)'` | **261成功 / 0失敗**、exit 0。`target/depth-751-input-tests.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険グリフ0件 |
+| `python scripts/check_site_cards.py` | exit 0、53カード / 超過0件（製品ページの変更なし） |
+| `UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot depth_parallax` | **2成功 / 0失敗**、exit 0。`target/depth-751-snapshot-update.log`。PNG 1枚（46,134 bytes）を目視確認。案内は1行で収まり、既定値・状態行・×に欠けや重なりなし |
+| `cargo test --test ui_snapshot depth_parallax` | 更新モードなしの通常比較も **2成功 / 0失敗**、exit 0。`target/depth-751-snapshot-compare.log`。1093×614で不要scrollなし、546.5×307で実wheelによる末尾・既定値の到達と固定header/×を確認 |
+| `cargo fmt`、`cargo fmt --check`、`git diff --check` | exit 0。整形は引数なしで実行。`target/depth-751-fmt.log` |
+| `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | **exit 0**。通常feature・`dev-runtime`、portableなし。core / remote / EPUB worker / MCP adapter / music-video editor とDLLを配置。CRT検査 **runtime=4 / pe=5 成功**。`target/depth-751-build.log`、`target/vcrt-pe-reports/dev-runtime.json`。製品は起動していない |
+
+途中の depth 検査は158件中157成功・旧追従感度の期待値1件を修正。
+追加テストの最初のコンパイルでは新eguiのRawInput APIとtest fixtureの借用2箇所を修正し、
+172件中170成功の段階で、書き出しのsame-pass受付をpass外から呼んでいたfixture2件を
+既存のcapture/admit経路へ直した。製品側の受付条件は変更していない。
+同じ位置の複数クリックも最後の受理primary releaseの修飾で分類する回帰を追加した。
+さらにeguiのheadless probeで、release `[300,300]` の後に同じ入力束で `[500,300]` へ移動すると、
+`Response::interact_pointer_pos` は後者になることを確認した。位置をResponseに合わせてreleaseを探すと
+CtrlクリックをPageSideへ落としてしまうため、位置と修飾を同じ受理releaseから採る形へ修正。
+マウス移動・Ctrl解放がreleaseの後に入る入力を、plannerと両presentationの実描画テストに追加した。
+Ctrl+Shift+Altも確認する。これは§17の入力所有の実装上の修正で、仕様変更ではない。
+上表はそれらを含む最終ソースでの成功結果。
+
+パネル本文の上限は、途中に440ptも検査したが、追加内容が従来の380pt内に収まると確認できたため
+380ptを維持した。上表のdepth 174件、入力261件、snapshot更新・通常比較は380ptの最終ソースで成功。
+画像を覆う面積と入力除外の範囲を不必要に広げない。
+入力座標の最終修正でpanel painter・UI harness・PNG・依存条件は変わらないため、
+snapshotの成功結果は検証方針どおり再利用した。
+
+確認用 `build-dev.ps1 -PreserveRuntime` の初回はTurboJPEGのCMake/MSBuild段階でexit 101。
+同じworktreeの生成先に対して `cmake --build target/dev-runtime/build/turbojpeg-sys-ad9ab6b47bbc75e3/out/build --target install --config RelWithDebInfo --parallel 1`
+を実行するとexit 0で依存物を構築できた（`target/depth-751-native-build.log`）。
+製品コード・ビルドscript・個人設定は変えず、一時的な `CARGO_BUILD_JOBS=1` の依存準備も経て、
+最終の入力座標修正後は通常の並列数で上表の確認用buildを完了した。ネイティブ依存構築後の再実行には
+`-WaitForOtherBuildsMinutes 0` を使用。初回失敗の原因を製品の不具合とは判定していない。
+
+確認用coreは `target/dev-runtime/mimageviewer-core.exe`。normal profileなので、引数なしの起動は
+実利用中の `%APPDATA%/mimageviewer` を使い、設定やデータを更新し得る。
+利用者がインストール版／常駐tray版を終了してから
+`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe` で起動する。
+両presentationで左Ctrlクリックがページを送らずその深さを設定すること、右Ctrlホールド中は変更しないこと、
+既定値0.5・調整時のハイライトとフェード、中央の狭い範囲で追従の端に届くこと、書き出しにハイライトが入らないことが
+実機の確認項目。全件gate・実機確認・coordinatorによるcommitはこの実装作業では行っていない。

@@ -383,7 +383,14 @@ fn depth_main_window_root_wait_and_mouse_use_current_panel_and_resized_fit_coord
             .unwrap()
             .transform
             .paint_rect;
-        let point = image.center() - image.size() * 0.25;
+        let media = app
+            .fullscreen_page_layout
+            .single_page()
+            .unwrap()
+            .transform
+            .viewport_rect;
+        let radius = media.width().min(media.height()) * 0.25;
+        let point = image.center() - egui::vec2(radius * 0.5, radius * 0.5);
         viewer.frame(&mut app, vec![egui::Event::PointerMoved(point)]);
         let FsExclusiveView::Depth(state) = &app.fs_exclusive_view else {
             unreachable!()

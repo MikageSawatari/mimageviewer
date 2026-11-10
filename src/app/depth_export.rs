@@ -60,6 +60,36 @@ mod tests {
     }
 
     #[test]
+    fn depth_export_request_created_while_screen_highlights_keeps_highlight_zero() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app_for_test();
+        install_pages(&mut app, &ctx);
+        install_ready_depth_for_export(&mut app);
+        let crate::fs_exclusive_view::FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view
+        else {
+            unreachable!()
+        };
+        state.focus_highlight = Some(std::time::Instant::now());
+        app.settings.depth_parallax.focus = 0.37;
+        remember_display(&app, &ctx);
+        let request = app.capture_depth_export(&ctx, true).unwrap().into_request(
+            app.settings.depth_parallax.clone(),
+            DepthExportOptions::default(),
+            "unused.gif".into(),
+        );
+        let params = crate::depth_parallax_wgpu::DepthRenderParams::from_settings(
+            &request.settings,
+            request.resource.depth.median,
+            egui::Vec2::ZERO,
+            request.uv,
+            request.quarter_turns,
+            1.,
+        );
+        assert_eq!(params.focus_highlight, 0.);
+        assert_eq!(params.focus, 0.37);
+    }
+
+    #[test]
     fn depth_export_completion_toast_includes_optional_worker_file_size() {
         for (bytes, expected) in [
             (Some(8_800_000), "保存しました: photo_3d.mp4 (8.4 MB)"),

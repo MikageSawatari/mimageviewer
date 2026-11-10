@@ -538,6 +538,53 @@ fn depth_parallax_panel_small_viewport_reaches_every_control_and_keeps_header_fi
         }
         let export = harness.get_by_role_and_label(egui::accesskit::Role::Button, "書き出し…");
         assert!(export.accesskit_node().is_disabled());
+        // The added hint/default control must remain reachable inside the same
+        // measured scroll body; scroll up through actual input before clicking.
+        if matches!(expected, HeightExpectation::Scrolls) {
+            harness.event(egui::Event::PointerMoved(before.inner.center()));
+            harness.event(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0., 100000.),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+            });
+            harness.run_steps(40);
+        } else {
+            let reset = harness
+                .get_by_role_and_label(egui::accesskit::Role::Button, "既定値")
+                .rect();
+            assert!(before.inner.contains_rect(reset));
+        }
+        // Locate the middle control using real scrolling, also at 200% scale.
+        for _ in 0..30 {
+            let reset = harness
+                .get_by_role_and_label(egui::accesskit::Role::Button, "既定値")
+                .rect();
+            let inner = harness.state().layout.unwrap().0.inner;
+            if inner.contains_rect(reset) {
+                break;
+            }
+            harness.event(egui::Event::PointerMoved(inner.center()));
+            harness.event(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0., if reset.top() < inner.top() { 30. } else { -30. }),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+            });
+            harness.run_steps(20);
+        }
+        let reset = harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "既定値")
+            .rect();
+        assert!(harness.state().layout.unwrap().0.inner.contains_rect(reset));
+        harness.state_mut().settings.focus = 0.2;
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "既定値")
+            .click();
+        harness.run();
+        assert_eq!(harness.state().settings.focus, 0.5);
         harness
             .get_by_role_and_label(egui::accesskit::Role::Button, "×")
             .click();

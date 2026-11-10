@@ -290,14 +290,21 @@ impl App {
         ctx: &egui::Context,
         payload: &crate::gpu_lanczos::FullscreenPaintPayload,
         transform: &crate::displayed_image_transform::DisplayedImageTransform,
+        canvas: egui::Rect,
         underlay: &crate::ui_fullscreen::FsBgStyle,
     ) -> bool {
         #[cfg(windows)]
         {
-            let Some(render) = self.wgpu_render_state.as_ref() else {
+            let FsExclusiveView::Depth(state) = &mut self.fs_exclusive_view else {
                 return false;
             };
-            let FsExclusiveView::Depth(state) = &mut self.fs_exclusive_view else {
+            // Consume even on an early return. A request belongs to this pass only.
+            let focus_click = state
+                .pending_focus_click
+                .take()
+                .filter(|(_, pass)| *pass == ctx.cumulative_pass_nr())
+                .map(|(pos, _)| pos);
+            let Some(render) = self.wgpu_render_state.as_ref() else {
                 return false;
             };
             let Some(resource) = state.ready() else {
@@ -329,6 +336,7 @@ impl App {
                 let moving = state.mouse.update(
                     pointer,
                     transform.paint_rect,
+                    canvas,
                     pointer.is_some_and(|point| panel.is_some_and(|rect| rect.contains(point))),
                     settings.strength,
                     dt,
@@ -344,10 +352,7 @@ impl App {
                     true,
                 )
             };
-            if moving && self.window_visible && visible && self.depth_export_operation.is_none() {
-                ctx.request_repaint();
-            }
-            let params = crate::depth_parallax_wgpu::DepthRenderParams::from_settings(
+            let mut params = crate::depth_parallax_wgpu::DepthRenderParams::from_settings(
                 settings,
                 resource.depth.median,
                 offset,
@@ -355,6 +360,33 @@ impl App {
                 transform.rotation.degrees() as u32 / 90,
                 transform.paint_rect.aspect_ratio(),
             );
+            let now = std::time::Instant::now();
+            if let Some(focus) = focus_click.and_then(|pos| {
+                crate::depth_parallax_wgpu::focus_depth_at(
+                    pos,
+                    transform.paint_rect,
+                    params,
+                    resource.depth.width,
+                    resource.depth.height,
+                    &resource.depth.values,
+                )
+            }) {
+                self.settings.depth_parallax.focus = focus;
+                self.settings.depth_parallax.normalize();
+                self.settings.save();
+                params.focus = self.settings.depth_parallax.focus;
+                state.focus_highlight = Some(now);
+            }
+            let intensity =
+                crate::depth_parallax::focus_highlight_intensity(state.focus_highlight, now);
+            params = params.with_focus_highlight(intensity);
+            if (moving || intensity > 0.0)
+                && self.window_visible
+                && visible
+                && self.depth_export_operation.is_none()
+            {
+                ctx.request_repaint();
+            }
             let callback = crate::depth_parallax_wgpu::DepthShaderCallback {
                 context: resource.context,
                 key: resource.key,
@@ -414,7 +446,14 @@ impl App {
         );
         ctx.data_mut(|data| data.insert_temp(egui::Id::unique("depth_panel_rect"), response.rect));
         if response.changed {
+            self.settings.depth_parallax.normalize();
             self.settings.save();
+        }
+        if response.focus_adjusting
+            && let FsExclusiveView::Depth(state) = &mut self.fs_exclusive_view
+        {
+            state.focus_highlight = Some(std::time::Instant::now());
+            ctx.request_repaint();
         }
         if response.close_requested {
             self.set_fs_exclusive_view(FsExclusiveView::None, "depth_panel_close");
