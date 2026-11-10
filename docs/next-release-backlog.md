@@ -154,6 +154,14 @@
 - (起票時の制約、上の採択案で一部を変更) 関連検索の初版をタグやすべての検索方式へ一括拡張しない。既存の右クリックメニュー編集・ネイティブメニューを保ち、仮想ページ等の対応範囲も既存の種別表に従い決める。文字の部分選択が困難という報告は本体 §1.691 の不具合調査へ分離する。
 - 関連: [Everything設計](everything-search-plan.md)、[種別ごとの操作表](item-kind-capability-matrix.md)、`src/global_search_ui/everything/ui.rs` / `src/ui_pinned_search.rs`。規模 / 優先度: 仕様決定後 / P3。
 
+### 1.757 配布物と About に PDFium とその内部部品のライセンス全文が入っていない (2026-11-10)
+
+- 状態: **未着手・次の版で直す (設計担当の提案、2026-11-10。§1.754 の作業中に判明)**。PDFium 8125 以前からの状態で、§1.754 の更新とは別の既存の問題。
+- 現状 (コード・ファイル): About のサードパーティ ライセンス (`src/ui_dialogs/about.rs`) に PDFium が無い。インストーラ・ポータブル版の readme は「PDFium (BSD-3-Clause): Google Chrome の PDF エンジン」の 1 行だけ (`installer/readme.txt` 232 行付近)。PDFium の配布元は `vendor/pdfium/LICENSE` (PDFium 自身) と `vendor/pdfium/licenses/` に 18 個 (pdfium・abseil・agg23・dragonbox 2 種・fast_float・freetype・harfbuzz・highway・icu・lcms・libjpeg_turbo 2 種・libopenjpeg・libpng・llvm-libc・simdutf・zlib) のライセンス文を同梱しているが、mIV の配布物には入れていない。
+- なぜ直すか: BSD-3-Clause をはじめ、これらの多くはバイナリ配布物の文書等にライセンス文 (著作権表示と条件) を含めることを求める。FFmpeg・LibRaw・LibAVIF などは全文を同梱済みで、PDFium だけ漏れている。
+- 直し方の案: 他の依存物と同じ形で、`PDFIUM-LICENSE.txt` (PDFium と内部部品の全文をまとめたもの) をインストーラ・ポータブル版・単体 exe の展開先に同梱し、About の一覧にも足す。PDFium を更新したら全文も更新する手順を `docs/native-dependencies.md` と release-checklist の依存物確認に足す。公開文書 (製品ページのライセンス表記・readme) も合わせる。
+- 関連: §1.754 (PDFium 8138 への更新、ブランチ `deps-754-pdfium`)。同じブランチで直すか別にするかは着手時に決める。規模 / 優先度: Small / P1 (ライセンス表記の義務)。
+
 ### 1.756 検索欄の入力履歴 (最近の検索語を選び直す) — §1.692 の簡易版 (2026-11-10)
 
 - 状態: **次の版に入れる (利用者決定 2026-11-10、既定オン)**。§1.692 (名前を付けて保存した検索、保留側) の代わりに、まず入力履歴として入れる。名前付きの保存は §1.690 の「検索要求」の型と合わせて後で判断する。
