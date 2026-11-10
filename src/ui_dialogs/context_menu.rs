@@ -127,6 +127,34 @@ fn jump_to_book_folder_request(item: &GridItem) -> Option<JumpToFolderRequest> {
     })
 }
 
+/// 削除対象を決定した時点の実パスと種類。後の一覧の並び替え・置換に依存しない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeleteTarget {
+    path: PathBuf,
+    is_folder: bool,
+}
+
+impl DeleteTarget {
+    pub(crate) fn from_grid_item(item: &GridItem) -> Option<Self> {
+        Some(Self {
+            path: item.drag_source_path()?.to_path_buf(),
+            is_folder: matches!(item, GridItem::Folder(_)),
+        })
+    }
+
+    pub(crate) fn source_scope(&self) -> crate::delete_worker::DeleteSourceScope {
+        if self.is_folder {
+            crate::delete_worker::DeleteSourceScope::Tree(self.path.clone())
+        } else {
+            crate::delete_worker::DeleteSourceScope::Exact(self.path.clone())
+        }
+    }
+
+    pub(crate) fn into_path(self) -> PathBuf {
+        self.path
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeleteConfirmKind {
     RecycleBin,
@@ -320,24 +348,20 @@ fn consume_delete_confirm_action(
     DeleteConfirmKeyResponse { selection, action }
 }
 
-/// ダイアログ状態を閉じ、Delete のときだけ worker へ渡す path 列を返す。
+/// ダイアログ状態を閉じ、Delete のときだけ種類を保持した対象列を worker 受付へ渡す。
 fn apply_delete_confirm_action(
     action: DeleteConfirmAction,
     show_delete_confirm: &mut bool,
-    delete_targets: &mut Vec<(usize, PathBuf)>,
+    delete_targets: &mut Vec<DeleteTarget>,
     delete_confirm_label: &mut Option<String>,
-) -> Option<Vec<PathBuf>> {
+) -> Option<Vec<DeleteTarget>> {
     match action {
         DeleteConfirmAction::None => None,
         DeleteConfirmAction::Delete => {
-            let paths = delete_targets
-                .iter()
-                .map(|(_, path)| path.clone())
-                .collect();
+            let targets = std::mem::take(delete_targets);
             *show_delete_confirm = false;
-            delete_targets.clear();
             *delete_confirm_label = None;
-            Some(paths)
+            Some(targets)
         }
         DeleteConfirmAction::Cancel => {
             *show_delete_confirm = false;
@@ -406,7 +430,7 @@ enum ItemCopyMenuSubject {
 struct NativeGridContextMenuTarget {
     shell_paths: Option<Vec<PathBuf>>,
     real_paths: Vec<PathBuf>,
-    delete_targets: Vec<(usize, PathBuf)>,
+    delete_targets: Vec<DeleteTarget>,
     checked_file_operation_selection: CheckedFileOperationSelection,
     item: GridItem,
     item_index: Option<usize>,
@@ -535,28 +559,23 @@ fn render_egui_menu_nodes(ui: &mut egui::Ui, nodes: &[MenuNode]) -> Option<MenuC
 const DELETE_FOLDER_OMITTED_FILES_WARNING: &str =
     "フォルダの中には一覧に表示していないファイルも含まれます";
 
-fn delete_confirm_label_for_targets(
-    targets: &[(usize, PathBuf)],
-    items: &[GridItem],
-) -> DeleteConfirmContent {
+fn delete_confirm_label_for_targets(targets: &[DeleteTarget]) -> DeleteConfirmContent {
     let kind = delete_confirm_kind_for_targets(targets);
     let count = targets.len();
     let single_name = (count == 1).then(|| {
         targets[0]
-            .1
+            .path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("?")
     });
-    // 対象決定時の GridItem だけを参照する。確認表示のための metadata/read_dir は行わない。
-    let folder_count = targets
-        .iter()
-        .filter(|(idx, _)| matches!(items.get(*idx), Some(GridItem::Folder(_))))
-        .count();
+    // 対象決定時に保存した種類だけを使い、現在の items やディスクは参照しない。
+    let folder_count = targets.iter().filter(|target| target.is_folder).count();
     let mut label = build_delete_confirm_label(count, single_name, kind, folder_count);
     if count > 1 {
         label.push_str("\n\n対象:");
-        for (_, path) in targets.iter().take(DELETE_CONFIRM_VISIBLE_TARGET_LIMIT) {
+        for target in targets.iter().take(DELETE_CONFIRM_VISIBLE_TARGET_LIMIT) {
+            let path = &target.path;
             let name = path
                 .file_name()
                 .map(|name| name.to_string_lossy())
@@ -666,10 +685,11 @@ fn context_item_path_text(item: &GridItem) -> String {
 }
 
 #[cfg(windows)]
-fn delete_confirm_kind_for_targets(targets: &[(usize, PathBuf)]) -> DeleteConfirmKind {
+fn delete_confirm_kind_for_targets(targets: &[DeleteTarget]) -> DeleteConfirmKind {
     let mut checked_roots: std::collections::HashMap<String, Option<u64>> =
         std::collections::HashMap::new();
-    DeleteConfirmKind::aggregate(targets.iter().map(|(_, path)| {
+    DeleteConfirmKind::aggregate(targets.iter().map(|target| {
+        let path = &target.path;
         let Some(root) = windows_path_root_for_file_operation(path) else {
             return DeleteConfirmKind::MayPermanent;
         };
@@ -693,7 +713,7 @@ fn delete_confirm_kind_for_targets(targets: &[(usize, PathBuf)]) -> DeleteConfir
 }
 
 #[cfg(not(windows))]
-fn delete_confirm_kind_for_targets(_targets: &[(usize, PathBuf)]) -> DeleteConfirmKind {
+fn delete_confirm_kind_for_targets(_targets: &[DeleteTarget]) -> DeleteConfirmKind {
     DeleteConfirmKind::RecycleBin
 }
 
@@ -1342,7 +1362,7 @@ impl crate::app::App {
         explorer_folder: Option<PathBuf>,
     ) -> NativeGridContextMenuTarget {
         let checked_targets = has_checked
-            .then(|| self.collect_checked_indexed_paths())
+            .then(|| self.collect_checked_delete_targets())
             .unwrap_or_default();
         let checked_file_operation_selection = if has_checked {
             classify_checked_file_operation_selection(self.checked.len(), checked_targets.len())
@@ -1354,7 +1374,7 @@ impl crate::app::App {
         } else if has_checked {
             checked_targets
                 .iter()
-                .map(|(_, path)| path.clone())
+                .map(|target| target.path.clone())
                 .collect()
         } else {
             item.drag_source_path()
@@ -1381,8 +1401,8 @@ impl crate::app::App {
         } else if is_folder_context {
             Vec::new()
         } else {
-            item.drag_source_path()
-                .map(|path| vec![(idx, path.to_path_buf())])
+            DeleteTarget::from_grid_item(&item)
+                .map(|target| vec![target])
                 .unwrap_or_default()
         };
         let external_tool_descriptor = if is_folder_context {
@@ -2321,7 +2341,7 @@ impl crate::app::App {
     ///
     /// ドライブ一覧以外ではフォルダもチェックできる。
     /// ファイルとフォルダのどちらも返す `drag_source_path` を正本の
-    /// 述語とし、削除時にインデックスがずれないよう降順で返す。
+    /// 述語とし、既存の Shell クリップボードの順序どおり index 降順で返す。
     pub(crate) fn collect_checked_indexed_paths(&self) -> Vec<(usize, PathBuf)> {
         let mut targets: Vec<(usize, PathBuf)> = Vec::new();
         for &idx in &self.checked {
@@ -2329,12 +2349,22 @@ impl crate::app::App {
                 targets.push((idx, path.to_path_buf()));
             }
         }
-        // 降順ソート (削除時にインデックスがずれないよう後ろから削除)
+        // Shell クリップボードへ渡す既存の順序を維持する。
         targets.sort_by(|a, b| b.0.cmp(&a.0));
         targets
     }
 
-    pub(crate) fn request_delete_confirm(&mut self, targets: Vec<(usize, PathBuf)>) {
+    /// index は既存の対象順を決めるためだけに使い、種類とパスをこの時点で確定する。
+    pub(crate) fn collect_checked_delete_targets(&self) -> Vec<DeleteTarget> {
+        let mut indices: Vec<_> = self.checked.iter().copied().collect();
+        indices.sort_unstable_by(|a, b| b.cmp(a));
+        indices
+            .into_iter()
+            .filter_map(|idx| self.items.get(idx).and_then(DeleteTarget::from_grid_item))
+            .collect()
+    }
+
+    pub(crate) fn request_delete_confirm(&mut self, targets: Vec<DeleteTarget>) {
         self.delete_targets = targets;
         self.delete_confirm_label = None;
         self.show_delete_confirm = true;
@@ -2353,19 +2383,19 @@ impl crate::app::App {
         }
 
         if self.delete_confirm_label.is_none() {
-            let content = delete_confirm_label_for_targets(&self.delete_targets, &self.items);
+            let content = delete_confirm_label_for_targets(&self.delete_targets);
             if should_skip_delete_confirmation(
                 self.settings.skip_recycle_bin_delete_confirmation,
                 &content,
             ) {
-                if let Some(paths) = apply_delete_confirm_action(
+                if let Some(targets) = apply_delete_confirm_action(
                     DeleteConfirmAction::Delete,
                     &mut self.show_delete_confirm,
                     &mut self.delete_targets,
                     &mut self.delete_confirm_label,
                 ) {
                     // Shell の最終判断は worker 側に委ねる。FOF_WANTNUKEWARNING は維持する。
-                    self.start_delete_files(ctx, paths);
+                    self.start_delete_files(ctx, targets);
                 }
                 return;
             }
@@ -2412,14 +2442,14 @@ impl crate::app::App {
         } else {
             DeleteConfirmAction::None
         };
-        if let Some(paths) = apply_delete_confirm_action(
+        if let Some(targets) = apply_delete_confirm_action(
             action,
             &mut self.show_delete_confirm,
             &mut self.delete_targets,
             &mut self.delete_confirm_label,
         ) {
-            // path だけを worker に渡す (idx は完了時に再解決)。
-            self.start_delete_files(ctx, paths);
+            // 確定済みのパスと種類を worker 受付へ渡す (完了時の表示反映はパスで再解決)。
+            self.start_delete_files(ctx, targets);
         }
     }
 
@@ -2515,7 +2545,7 @@ impl crate::app::App {
 
         if !self.checked.is_empty() {
             // チェック済みがある → まとめて削除
-            let targets = self.collect_checked_indexed_paths();
+            let targets = self.collect_checked_delete_targets();
             if classify_checked_file_operation_selection(self.checked.len(), targets.len())
                 != CheckedFileOperationSelection::RealOnly
             {
@@ -2530,13 +2560,13 @@ impl crate::app::App {
             let Some(item) = self.items.get(idx) else {
                 return;
             };
-            let Some(path) = item.drag_source_path().map(|p| p.to_path_buf()) else {
+            let Some(target) = DeleteTarget::from_grid_item(item) else {
                 if let Some(reason) = item.file_operation_refusal() {
                     self.show_feedback_warning(reason.message("削除"));
                 }
                 return;
             };
-            self.request_delete_confirm(vec![(idx, path)]);
+            self.request_delete_confirm(vec![target]);
         }
     }
 }
@@ -4221,7 +4251,172 @@ mod raw_clipboard_tests {
 
 #[cfg(test)]
 mod delete_confirm_tests {
+    fn delete_file_target(path: impl Into<std::path::PathBuf>) -> super::DeleteTarget {
+        super::DeleteTarget::from_grid_item(&crate::grid_item::GridItem::Image(path.into()))
+            .unwrap()
+    }
     use super::*;
+
+    fn request_delete_with_key(app: &mut crate::app::App, ctx: &egui::Context) {
+        begin_key_pass(ctx, egui::Key::Delete);
+        let _owner = app.keyboard_owner_for_pass(ctx);
+        app.handle_delete_key(ctx);
+        ctx.end_pass().drop_without_applying_deltas();
+        assert!(app.show_delete_confirm);
+        assert!(app.delete_confirm_label.is_none());
+    }
+
+    fn replace_list_and_assert_folder_confirmation(
+        app: &mut crate::app::App,
+        ctx: &egui::Context,
+        folder_count: usize,
+    ) {
+        let saved_targets = app.delete_targets.clone();
+        assert_eq!(
+            saved_targets
+                .iter()
+                .filter(|target| target.is_folder)
+                .count(),
+            folder_count
+        );
+        // Every old index now names a file, as after an external rescan adoption.
+        app.items = (0..app.items.len())
+            .map(|idx| GridItem::Image(PathBuf::from(format!("replacement-{idx}.jpg"))))
+            .collect();
+        app.items_generation = app.items_generation.wrapping_add(1);
+        ctx.run_pass(Default::default(), |ctx| {
+            app.show_delete_confirm_dialog(ctx)
+        })
+        .drop_without_applying_deltas();
+        assert!(
+            app.show_delete_confirm,
+            "folders must still confirm with skip enabled"
+        );
+        assert!(
+            app.delete_pending.is_none(),
+            "no delete worker before confirmation"
+        );
+        assert_eq!(app.delete_targets, saved_targets);
+        let content = delete_confirm_label_for_targets(&saved_targets);
+        assert_eq!(content.folder_count, folder_count);
+        assert!(!should_skip_delete_confirmation(true, &content));
+        let label = app.delete_confirm_label.as_ref().unwrap();
+        assert_eq!(label, &content.label);
+        assert!(label.contains(DELETE_FOLDER_OMITTED_FILES_WARNING));
+        assert!(!label.contains("replacement-"));
+        for target in &saved_targets {
+            assert!(label.contains(target.path.file_name().unwrap().to_str().unwrap()));
+        }
+        if saved_targets.len() > 1 {
+            assert!(label.contains(&format!("（うちフォルダ {folder_count} 個）")));
+        }
+        // Confirmation approval must preserve the same kinds through the worker seam.
+        let approved = apply_delete_confirm_action(
+            DeleteConfirmAction::Delete,
+            &mut app.show_delete_confirm,
+            &mut app.delete_targets,
+            &mut app.delete_confirm_label,
+        )
+        .unwrap();
+        assert_eq!(approved, saved_targets);
+        let scopes = approved
+            .iter()
+            .map(DeleteTarget::source_scope)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scopes
+                .iter()
+                .filter(|scope| matches!(scope, crate::delete_worker::DeleteSourceScope::Tree(_)))
+                .count(),
+            folder_count
+        );
+        assert_eq!(
+            approved
+                .into_iter()
+                .map(DeleteTarget::into_path)
+                .collect::<Vec<_>>(),
+            saved_targets
+                .into_iter()
+                .map(|target| target.path)
+                .collect::<Vec<_>>()
+        );
+        assert!(!app.show_delete_confirm);
+        assert!(app.delete_targets.is_empty());
+    }
+
+    #[test]
+    fn section1732_delete_snapshot_cursor_folder_survives_list_replacement() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.skip_recycle_bin_delete_confirmation = true;
+        let folder = app.tmp.path().join("original-folder");
+        app.items = vec![GridItem::Folder(folder)];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        let ctx = egui::Context::default();
+        request_delete_with_key(&mut app, &ctx);
+        replace_list_and_assert_folder_confirmation(&mut app, &ctx, 1);
+    }
+
+    #[test]
+    fn section1732_delete_snapshot_checked_folders_survive_list_replacement() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.skip_recycle_bin_delete_confirmation = true;
+        app.items = vec![
+            GridItem::Folder(app.tmp.path().join("first-folder")),
+            GridItem::Image(app.tmp.path().join("original-page.jpg")),
+            GridItem::Folder(app.tmp.path().join("last-folder")),
+        ];
+        app.visible_indices = vec![0, 1, 2];
+        app.checked.extend([0, 1, 2]);
+        let ctx = egui::Context::default();
+        request_delete_with_key(&mut app, &ctx);
+        assert_eq!(
+            app.delete_targets
+                .iter()
+                .map(|target| target.path.as_path())
+                .collect::<Vec<_>>(),
+            app.items
+                .iter()
+                .rev()
+                .map(|item| item.drag_source_path().unwrap())
+                .collect::<Vec<_>>()
+        );
+        replace_list_and_assert_folder_confirmation(&mut app, &ctx, 2);
+    }
+
+    #[test]
+    fn section1732_delete_snapshot_context_menu_survives_list_replacement() {
+        for has_checked in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.skip_recycle_bin_delete_confirmation = true;
+            app.items = vec![
+                GridItem::Folder(app.tmp.path().join("menu-folder")),
+                GridItem::Image(app.tmp.path().join("menu-page.jpg")),
+            ];
+            app.visible_indices = vec![0, 1];
+            app.selected = Some(0);
+            if has_checked {
+                app.checked.extend([0, 1]);
+            }
+            // The menu captures its target before another frame installs new items.
+            let target = app.context_menu_target(
+                0,
+                app.items[0].clone(),
+                false,
+                has_checked,
+                None,
+                ContextMenuSurface::Grid,
+                None,
+            );
+            app.items = vec![GridItem::Image("changed-at-index-zero.jpg".into()); 2];
+            app.items_generation = app.items_generation.wrapping_add(1);
+            let ctx = egui::Context::default();
+            app.dispatch_native_grid_context_command(&ctx, MenuCommand::MoveToRecycleBin, &target);
+            assert_eq!(app.delete_targets, target.delete_targets);
+            assert_eq!(app.delete_targets.len(), if has_checked { 2 } else { 1 });
+            replace_list_and_assert_folder_confirmation(&mut app, &ctx, 1);
+        }
+    }
 
     #[test]
     fn context_menu_musicvideo_dispatch_uses_launcher_seam_and_input_gate() {
@@ -4733,7 +4928,7 @@ mod delete_confirm_tests {
         target.checked_count = 2;
         target.checked_file_operation_selection = CheckedFileOperationSelection::Mixed;
         target.real_paths = vec![PathBuf::from(r"C:\media\real.jpg")];
-        target.delete_targets = vec![(0, PathBuf::from(r"C:\media\real.jpg"))];
+        target.delete_targets = vec![delete_file_target(r"C:\media\real.jpg")];
 
         let _ = app.dispatch_native_grid_context_command(&ctx, MenuCommand::CopyPath, &target);
         assert!(app.fs_feedback_toast.as_ref().is_some_and(|toast| {
@@ -4776,7 +4971,10 @@ mod delete_confirm_tests {
             Some(folder.clone()),
         );
         assert!(target.collection_root_delete.is_collection_root());
-        assert_eq!(target.delete_targets, vec![(0, folder.clone())]);
+        assert_eq!(
+            target.delete_targets,
+            vec![DeleteTarget::from_grid_item(&GridItem::Folder(folder.clone())).unwrap()]
+        );
         let ctx = egui::Context::default();
         app.dispatch_native_grid_context_command(&ctx, MenuCommand::MoveToRecycleBin, &target);
         assert!(app.show_delete_confirm);
@@ -5112,7 +5310,7 @@ mod delete_confirm_tests {
             // Shell paths と外部ツール対象集合は別 ownership。P2a は checked 全件を保持する。
             shell_paths: Some(vec![PathBuf::from(r"C:\media\checked-other.jpg")]),
             real_paths: vec![PathBuf::from(r"C:\media\checked-other.jpg")],
-            delete_targets: vec![(0, PathBuf::from(r"C:\media\checked-other.jpg"))],
+            delete_targets: vec![delete_file_target(r"C:\media\checked-other.jpg")],
             checked_file_operation_selection: CheckedFileOperationSelection::RealOnly,
             item: GridItem::Image(PathBuf::from(r"C:\media\clicked.jpg")),
             item_index: Some(0),
@@ -5533,9 +5731,9 @@ mod delete_confirm_tests {
                 item.drag_source_path().is_some(),
                 "container test item should have a real delete target"
             );
-            let path = item.drag_source_path().unwrap().to_path_buf();
             let is_folder = matches!(item, GridItem::Folder(_));
-            let content = delete_confirm_label_for_targets(&[(0, path)], &[item]);
+            let content =
+                delete_confirm_label_for_targets(&[DeleteTarget::from_grid_item(&item).unwrap()]);
             assert_eq!(should_skip_delete_confirmation(true, &content), !is_folder);
             assert!(!should_skip_delete_confirmation(false, &content));
         }
@@ -5606,9 +5804,9 @@ mod delete_confirm_tests {
     #[test]
     fn delete_target_kind_is_derived_from_the_existing_grid_item_without_io() {
         let folder = PathBuf::from(r"C:\pictures\album");
-        let targets = vec![(0, folder.clone())];
-        let folder_label =
-            delete_confirm_label_for_targets(&targets, &[GridItem::Folder(folder.clone())]);
+        let targets =
+            vec![DeleteTarget::from_grid_item(&GridItem::Folder(folder.clone())).unwrap()];
+        let folder_label = delete_confirm_label_for_targets(&targets);
         assert!(
             folder_label
                 .label
@@ -5621,7 +5819,7 @@ mod delete_confirm_tests {
             format!("「album」をゴミ箱に移動しますか？\n\n{DELETE_FOLDER_OMITTED_FILES_WARNING}")
         );
 
-        let file_label = delete_confirm_label_for_targets(&targets, &[GridItem::Image(folder)]);
+        let file_label = delete_confirm_label_for_targets(&[delete_file_target(folder)]);
         assert!(
             !file_label
                 .label
@@ -5638,10 +5836,9 @@ mod delete_confirm_tests {
         ];
         let targets = items
             .iter()
-            .enumerate()
-            .map(|(idx, item)| (idx, item.drag_source_path().unwrap().to_path_buf()))
+            .map(|item| DeleteTarget::from_grid_item(item).unwrap())
             .collect::<Vec<_>>();
-        let content = delete_confirm_label_for_targets(&targets, &items);
+        let content = delete_confirm_label_for_targets(&targets);
         assert_eq!(content.folder_count, 2);
         assert_eq!(
             content.label.lines().next(),
@@ -5663,20 +5860,9 @@ mod delete_confirm_tests {
     #[test]
     fn delete_confirm_lists_first_ten_targets_then_remaining_count() {
         let targets = (0..13)
-            .map(|idx| {
-                (
-                    idx,
-                    PathBuf::from(format!(r"C:\pictures\image_{idx:02}.jpg")),
-                )
-            })
+            .map(|idx| delete_file_target(format!(r"C:\pictures\image_{idx:02}.jpg")))
             .collect::<Vec<_>>();
-
-        let items = targets
-            .iter()
-            .map(|(_, path)| GridItem::Image(path.clone()))
-            .collect::<Vec<_>>();
-        let label = delete_confirm_label_for_targets(&targets, &items).label;
-
+        let label = delete_confirm_label_for_targets(&targets).label;
         for idx in 0..DELETE_CONFIRM_VISIBLE_TARGET_LIMIT {
             assert!(
                 label.contains(&format!("image_{idx:02}.jpg")),
@@ -5690,13 +5876,11 @@ mod delete_confirm_tests {
 
     #[test]
     fn delete_confirm_single_target_keeps_natural_filename_wording() {
-        let targets = vec![(0, PathBuf::from(r"C:\pictures\only_one.jpg"))];
-
-        let items = vec![GridItem::Image(targets[0].1.clone())];
-        let label = delete_confirm_label_for_targets(&targets, &items).label;
-
+        let targets = vec![delete_file_target(r"C:\pictures\only_one.jpg")];
+        let label = delete_confirm_label_for_targets(&targets).label;
         assert!(label.contains("only_one.jpg"));
         assert!(!label.contains("\n\n対象:"));
+        assert_eq!(label.lines().count(), 1);
     }
 
     fn begin_key_pass(ctx: &egui::Context, key: egui::Key) {
@@ -5880,7 +6064,7 @@ mod delete_confirm_tests {
     #[test]
     fn delete_confirm_state_transition_returns_delete_worker_seam_or_cancels() {
         let mut shown = true;
-        let mut targets = vec![(3, PathBuf::from("a.jpg")), (1, PathBuf::from("b.jpg"))];
+        let mut targets = vec![delete_file_target("a.jpg"), delete_file_target("b.jpg")];
         let mut label = Some("confirm".to_owned());
         let paths = apply_delete_confirm_action(
             DeleteConfirmAction::Delete,
@@ -5888,15 +6072,18 @@ mod delete_confirm_tests {
             &mut targets,
             &mut label,
         )
-        .expect("Delete は start_delete_files へ渡す path 列を返す");
-        assert_eq!(paths, vec![PathBuf::from("a.jpg"), PathBuf::from("b.jpg")]);
+        .expect("Delete は start_delete_files へ渡す対象列を返す");
+        assert_eq!(
+            paths,
+            vec![delete_file_target("a.jpg"), delete_file_target("b.jpg")]
+        );
         assert!(!shown);
         assert!(targets.is_empty());
         assert!(label.is_none());
 
         for action in [DeleteConfirmAction::Cancel, DeleteConfirmAction::None] {
             let mut shown = true;
-            let mut targets = vec![(0, PathBuf::from("keep.jpg"))];
+            let mut targets = vec![delete_file_target("keep.jpg")];
             let mut label = Some("confirm".to_owned());
             let paths = apply_delete_confirm_action(action, &mut shown, &mut targets, &mut label);
             assert!(paths.is_none());

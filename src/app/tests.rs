@@ -1,6 +1,7 @@
 #[cfg(windows)]
 use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, PresentationRequest};
 use super::*;
+use crate::ui_dialogs::context_menu::DeleteTarget;
 
 pub(crate) fn assert_cache_book_cover_only_worker_catalog_contract(
     app: &mut App,
@@ -44739,7 +44740,10 @@ mod favorite_adjustment_defaults_tests {
             true,
         );
         assert!(app.rename_pending.is_none());
-        app.start_delete_files(&ctx, vec![old.clone()]);
+        app.start_delete_files(
+            &ctx,
+            vec![DeleteTarget::from_grid_item(&GridItem::Image(old.clone())).unwrap()],
+        );
         assert!(app.delete_pending.is_none());
         app.start_book_rename(&ctx, "Before".into(), "After".into());
         app.start_book_delete(&ctx, "Before".into());
@@ -54935,15 +54939,18 @@ mod favorite_adjustment_defaults_tests {
     fn request_delete_confirm_resets_cached_label_for_new_targets() {
         let mut app = setup_app();
         app.show_delete_confirm = true;
-        app.delete_targets = vec![(0, PathBuf::from("C:/pics/old.jpg"))];
+        app.delete_targets =
+            vec![DeleteTarget::from_grid_item(&GridItem::Image("C:/pics/old.jpg".into())).unwrap()];
         app.delete_confirm_label = Some("old label".to_owned());
 
-        app.request_delete_confirm(vec![(1, PathBuf::from("J:/pics/new.jpg"))]);
+        app.request_delete_confirm(vec![
+            DeleteTarget::from_grid_item(&GridItem::Image("J:/pics/new.jpg".into())).unwrap(),
+        ]);
 
         assert!(app.show_delete_confirm);
         assert_eq!(
             app.delete_targets,
-            vec![(1, PathBuf::from("J:/pics/new.jpg"))]
+            vec![DeleteTarget::from_grid_item(&GridItem::Image("J:/pics/new.jpg".into())).unwrap()]
         );
         assert!(
             app.delete_confirm_label.is_none(),
@@ -66276,7 +66283,8 @@ mod native_video_rating_key_tests {
                     app.start_book_delete(&ctx, "Book".into());
                     assert!(app.book_structural_op.is_some());
                 } else {
-                    app.start_delete_files(&ctx, vec![target.clone()]);
+                    let delete_target = DeleteTarget::from_grid_item(&app.items[0]).unwrap();
+                    app.start_delete_files(&ctx, vec![delete_target]);
                     assert!(app.delete_pending.is_some());
                 }
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -95110,7 +95118,10 @@ mod file_operation_selection_tests {
         ctx.end_pass().drop_without_applying_deltas();
 
         assert!(app.show_delete_confirm);
-        assert_eq!(app.delete_targets, vec![(folder, folder_path)]);
+        assert_eq!(
+            app.delete_targets,
+            vec![DeleteTarget::from_grid_item(&GridItem::Folder(folder_path)).unwrap()]
+        );
     }
 
     #[test]
@@ -114336,7 +114347,10 @@ mod section1732_folder_selection_tests {
         key(&mut app, egui::Modifiers::CTRL, egui::Key::A);
         key(&mut app, egui::Modifiers::NONE, egui::Key::Delete);
         assert!(app.show_delete_confirm);
-        assert_eq!(app.delete_targets, vec![(0, folder.join("child"))]);
+        assert_eq!(
+            app.delete_targets,
+            vec![DeleteTarget::from_grid_item(&GridItem::Folder(folder.join("child"))).unwrap()]
+        );
         assert!(app.delete_pending.is_none());
         assert!(folder.join("child").is_dir());
     }

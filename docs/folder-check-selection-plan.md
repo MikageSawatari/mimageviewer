@@ -92,6 +92,7 @@
 - フォルダを 1 つでも含む削除 (チェック選択・カーソル単独の両方、Delete キー・右クリックの両方) は、「ごみ箱へ移すときは確認しない」(`skip_recycle_bin_delete_confirmation`) が ON でも**必ず確認を出す**。
 - 確認文: 2 件以上でフォルダを含むときは、件数の行に「(うちフォルダ N 個)」を加える (例: 「12 件の項目をゴミ箱に移動しますか？（うちフォルダ 3 個）」)。既存の「フォルダの中には一覧に表示していないファイルも含まれます」は残す。1 件のときは今の文のまま。
 - 実装: `delete_confirm_label_for_targets` が作る `DeleteConfirmContent` にフォルダの数を持たせ、`should_skip_delete_confirmation` はフォルダの数が 0 のときだけ省略を認める。判定は対象決定時の `GridItem` だけで行い、確認表示のためにディスクを読まない (今と同じ)。
+- 対象決定時の種類はパスとともに `DeleteTarget` に保存し、メニュー待ち・確認待ち・承認後の worker 受付まで保持する。確認時や worker 開始時に現在の一覧から種類を判定し直さない。index は削除要求に保存せず、表示への完了反映は既存どおりパスで再解決する。
 - コレクション root の登録解除・ブックマーク一覧の削除は対象外 (ファイルを消さない)。
 - 保証の範囲は **mIV の削除** (Delete キーと mIV のメニューの「削除」) だけ。右クリックの「Windows のメニュー」にある Windows 標準の削除は、今も mIV の確認を通らず Windows の設定に従う (`native_context_menu.rs`、`docs/item-kind-capability-matrix.md` §6-15)。本件では変えない (設計レビュー P2 で指摘、Windows の動作に合わせる方針どおり)。
 - 単独のフォルダを Delete したときも確認が出るようになる点は、設定 ON の利用者にとっての変化なのでリリースノートに書く。
@@ -252,3 +253,38 @@ cargo nextest run --build-jobs 1 -p mimageviewer --lib -E 'test(section1732) | t
 初回の native 依存ビルドは TurboJPEG の並列 MSBuild で exit 1。ビルドジョブを直列にして準備を完了した。追加した一覧種別テストの `match` の型不一致も修正した後、libtest のコンパイルは成功（12分34秒）。続くテスト一覧の取得が `0xc0000135` で止まったため、依頼の手順どおり `vendor/ffmpeg/bin/*.dll` を `target/debug/deps/` へコピーして実行を再開した。これらの段階はテスト実行成功として数えない。
 
 `test-lib-full.ps1` と `build-dev.ps1` は依頼どおり設計担当へ引き継ぎ、今回は実行していない。製品アプリの起動・実機確認・git commit/add/stash/reset/ブランチ切替も行っていない。
+
+### 独立レビュー P1 対応: 削除対象の種類を要求時に保持
+
+対象は実装コミット `ef18d7bd8` に対する独立レビューの指摘。初回実装は削除対象の index と確認時点の `items` からフォルダ数を求めていたため、外部再走査などによる一覧差し替えで Folder が別種類へ見え、確認省略設定 ON でフォルダの確認を省略する可能性があった。メニューを開いた時点とコマンド実行時点の間にも同じずれがあった。
+
+- `DeleteTarget { path, is_folder }` を導入。Delete キーのカーソル単独・チェック選択、右クリック（ビューア・コレクションの物理削除を含む）の対象構築で、同じ `from_grid_item` から種類と実パスを確定する。確認文・件数・警告・省略判定は保存した対象列だけを使い、`delete_confirm_label_for_targets` は `items` を受け取らない。
+- index の消費を調べ、削除要求には不要と確認して型から除いた。index 降順という既存の対象順は収集時だけ使って維持する。Shell クリップボードで使う既存の `collect_checked_indexed_paths` は変更せず、削除は `collect_checked_delete_targets` へ分けた。
+- 独立追補レビューで、`start_delete_files` が現在の `items` から再び Folder を推測して `Tree / Exact` を決めていた消費端も確認。このままだと元 Folder が一覧から外れた場合に、配下書庫の閲覧位置削除やコレクションの子項目の失効に影響する。同じ対象情報を承認後まで保持し、`start_delete_files` も `Vec<DeleteTarget>` を受け取り、保存値から worker の範囲を作る形へ修正した。
+- キャンセル・対象の置換・空要求・worker の終了／失敗経路は既存どおり。フォルダ判定の同期 I/O や新しい回復処理は追加しない。ユーザーが承認した物理削除・ブックマーク削除・コレクション登録解除の区別は変更しない。
+- 独立実装レビュー（GPT-6.1 Sol / xhigh）は消費端の追補を含め ACCEPT、未解決の指摘なし。画面の文言・配置は変更していない。
+
+追加した handler-level 回帰（`src/ui_dialogs/context_menu.rs`）:
+
+- `section1732_delete_snapshot_cursor_folder_survives_list_replacement`
+- `section1732_delete_snapshot_checked_folders_survive_list_replacement`
+- `section1732_delete_snapshot_context_menu_survives_list_replacement`（単独・チェック選択の両条件）
+
+削除要求／メニュー対象構築の後、旧 index がすべて画像を指す一覧へ差し替え、確認省略設定 ON で確認表示まで通す。元の名前・件数・フォルダ警告・worker 未開始を検査し、さらに確認承認の返却値も同じ対象・フォルダ数・`Tree / Exact` 範囲・パスを保持することを確認する。既存の対象列・確認状態遷移・直接 worker 受付のテストは新しい型へ更新した。
+
+最終差分の自動検証（通常 feature、dev/test profile、nextest 0.9.148 / default、retry なし）:
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo fmt`（引数なし、workspace 全体） / `cargo fmt --check` | exit 0 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0、26.21秒。既存警告あり。`target/section1732-p1/check-final.log` |
+| 下記 `test(section1732_delete_snapshot_)` の nextest | exit 0、追加3件すべて成功（0.913秒）。初回libtest再コンパイル9分36秒。`target/section1732-p1/regressions.log` / `regressions-junit.xml` |
+| 下記関連 filter の nextest | exit 0、85件すべて成功（4.572秒）。`target/section1732-p1/related.log` / `related-junit.xml` |
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE = '1'
+cargo nextest run --build-jobs 1 -p mimageviewer --lib -E 'test(section1732_delete_snapshot_)' --no-tests fail
+cargo nextest run --build-jobs 1 -p mimageviewer --lib -E 'test(delete_confirm_tests::) | test(section1732_folder_selection_tests::) | test(delete_key_) | test(request_delete_confirm_resets_cached_label_for_new_targets) | test(checked_file_operation_paths_include_real_files_and_folders_only) | test(unreadable_rename_journal_blocks_every_owned_mutation_before_worker_start) | test(xmp_hydration_cannot_restore_rating_after_normal_delete_purge) | test(delete_worker::tests::)' --no-tests fail
+```
+
+関連85件には追加3件を含むため、88件の異なるテストとは数えない。確認文・状態遷移・コレクション／ブックマーク境界・Shell共有対象・worker開始の拒否・XMP削除後の遅着・worker本体の回帰を含む。全件gateと確認用buildは従来の設計担当への引き継ぎのまま、本追補では実行していない。製品起動・git変更操作も行っていない。

@@ -17340,8 +17340,8 @@ pub struct App {
     pub(crate) edit_bundle_apply_pending: Option<crate::edit_bundle::EditBundleApplyPending>,
     /// 複数ページの貼り付け / リセット。確認・実行・キャンセルを1つの型で所有する。
     pub(crate) edit_bundle_bulk_pending: Option<crate::edit_bundle_bulk::BulkPageEditPending>,
-    /// 削除対象のファイル / フォルダパスリスト
-    pub(crate) delete_targets: Vec<(usize, PathBuf)>,
+    /// 対象決定時の実パスとフォルダ種別を保持する削除要求。
+    pub(crate) delete_targets: Vec<crate::ui_dialogs::context_menu::DeleteTarget>,
     /// 削除確認ダイアログの文言。ドライブ種別 / ゴミ箱設定 / 容量判定を毎フレーム
     /// 繰り返さないよう、ダイアログ単位でキャッシュする。
     pub(crate) delete_confirm_label: Option<String>,
@@ -51681,9 +51681,9 @@ impl App {
     pub(crate) fn start_delete_files(
         &mut self,
         ctx: &egui::Context,
-        paths: Vec<std::path::PathBuf>,
+        targets: Vec<crate::ui_dialogs::context_menu::DeleteTarget>,
     ) {
-        if paths.is_empty()
+        if targets.is_empty()
             || self.delete_pending.is_some()
             || self.metadata_cleanup_pending.is_some()
             || self.delete_purge_retry_pending.is_some()
@@ -51696,6 +51696,12 @@ impl App {
         if !self.admit_book_append_followup_mutation() {
             return;
         }
+        // 確認待ち・メニュー待ちの間に items が変わっても、対象決定時の範囲を維持する。
+        let source_scopes = targets.iter().map(|target| target.source_scope()).collect();
+        let paths = targets
+            .into_iter()
+            .map(|target| target.into_path())
+            .collect::<Vec<_>>();
         self.invalidate_xmp_rating_reads_for_removed_paths(&paths);
         self.release_viewer_surfaces_for_removed_paths(ctx, &paths, "delete_target_path");
         // 削除中に items を差し替える恐れのある in-flight pending を停止。poll_delete_pending
@@ -51708,19 +51714,6 @@ impl App {
             p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         self.global_search.pending = None;
-        let source_scopes = paths
-            .iter()
-            .map(|path| {
-                let is_tree = self.items.iter().any(|item| {
-                    matches!(item, GridItem::Folder(candidate) if crate::folder_tree::path_eq(candidate, path))
-                });
-                if is_tree {
-                    crate::delete_worker::DeleteSourceScope::Tree(path.clone())
-                } else {
-                    crate::delete_worker::DeleteSourceScope::Exact(path.clone())
-                }
-            })
-            .collect();
         let stack = self.capture_stack_deletion();
         self.delete_pending = Some(crate::delete_worker::spawn_with_stack(
             paths,
