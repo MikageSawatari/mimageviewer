@@ -2714,6 +2714,7 @@ impl App {
                 }
             }
         }
+        self.reconcile_restored_cover_thumbnails();
         self.selected = restored_selected;
         self.grid_click_selection_anchor = restored_anchor
             .map(|index| crate::app::GridClickSelectionAnchor::new(index, self.items_generation));

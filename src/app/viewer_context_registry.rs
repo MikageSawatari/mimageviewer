@@ -1167,24 +1167,7 @@ impl App {
     /// Only refreshable old book materials lose their request/pixels in their own context.
     /// New identity-bearing pixels follow the shared angle owner without reloading.
     pub(crate) fn evict_legacy_cover_thumbnails(&mut self) {
-        let matching = self
-            .items
-            .iter()
-            .zip(&self.thumbnails)
-            .enumerate()
-            .filter_map(|(idx, (item, thumbnail))| {
-                super::cover_rotation::legacy_book_cover_needs_reload(
-                    item,
-                    thumbnail,
-                    &self.rotation_page_keys,
-                )
-                .then_some(idx)
-            })
-            .collect::<Vec<_>>();
-        let mut changed = !matching.is_empty();
-        for idx in matching {
-            self.evict_thumbnail_for_reload(idx);
-        }
+        let mut changed = self.reconcile_restored_cover_thumbnails();
         #[cfg(windows)]
         {
             let main = self.viewer_context_main();
@@ -4781,6 +4764,7 @@ impl App {
                 self.folder_observation.as_mut().unwrap().generation = self.items_generation;
             }
             self.bump_render_epoch_only();
+            self.reconcile_restored_cover_thumbnails();
             self.move_grid_cursor(
                 snapshot.saved_selected,
                 crate::app::GridCursorIntent::Automatic,

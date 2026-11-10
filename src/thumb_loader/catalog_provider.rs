@@ -33,6 +33,7 @@ pub(crate) enum RequestCatalog {
     },
     CollectionSourceParent {
         identity: PathBuf,
+        source_parent: PathBuf,
         work: CatalogWork,
     },
 }
@@ -58,7 +59,11 @@ impl RequestCatalog {
             .parent()
             .and_then(crate::catalog::collection_source_parent_identity)
         {
-            Some(identity) => Self::CollectionSourceParent { identity, work },
+            Some(identity) => Self::CollectionSourceParent {
+                identity,
+                source_parent: source.parent().unwrap().to_path_buf(),
+                work,
+            },
             None => {
                 crate::logger::log(format!(
                     "collection thumbnail: invalid source parent: {}",
@@ -79,13 +84,17 @@ impl RequestCatalog {
         }
     }
 
-    fn lazy_scope(&self) -> Option<(LazyCatalogKind, &Path, &CatalogWork)> {
+    fn lazy_scope(&self) -> Option<(LazyCatalogKind, &Path, &Path, &CatalogWork)> {
         match self {
             Self::Fixed { .. } => None,
-            Self::Parent { row, work } => Some((LazyCatalogKind::Parent, &row.folder, work)),
-            Self::CollectionSourceParent { identity, work } => {
-                Some((LazyCatalogKind::Collection, identity, work))
+            Self::Parent { row, work } => {
+                Some((LazyCatalogKind::Parent, &row.folder, &row.folder, work))
             }
+            Self::CollectionSourceParent {
+                identity,
+                source_parent,
+                work,
+            } => Some((LazyCatalogKind::Collection, identity, source_parent, work)),
         }
     }
 }
@@ -111,6 +120,7 @@ pub struct LazyCatalogs {
 struct ParentCatalog {
     kind: LazyCatalogKind,
     identity: PathBuf,
+    source_parent: PathBuf,
     cache_dir: PathBuf,
     admission: crate::catalog::CatalogAdmission,
     writable: bool,
@@ -133,6 +143,7 @@ enum SaveTarget<'a> {
         pool: &'a LazyCatalogs,
         kind: LazyCatalogKind,
         identity: &'a Path,
+        source_parent: &'a Path,
         work: &'a CatalogWork,
         row: Option<(&'a str, i64, i64)>,
     },
@@ -200,13 +211,14 @@ impl<'a> ThumbnailSaveTarget<'a> {
                 pool,
                 kind,
                 identity,
+                source_parent,
                 work,
                 ..
             } => {
                 if !work.access().is_admitted(work.identity().1) {
                     return None;
                 }
-                pool.open(kind, identity, work, true)
+                pool.open(kind, identity, source_parent, work, true)
                     .map(SaveCatalog::Parent)
             }
         }
@@ -271,7 +283,8 @@ impl ThumbnailCatalogProvider {
                 SaveTarget::Unavailable
             }
             _ => {
-                let (kind, identity, work) = req.catalog_target.lazy_scope().unwrap();
+                let (kind, identity, source_parent, work) =
+                    req.catalog_target.lazy_scope().unwrap();
                 let row = match &req.catalog_target {
                     RequestCatalog::Parent { row, .. } => match req.parent_observed {
                         ParentObservedStamp::Observed(mtime, size) => {
@@ -285,6 +298,7 @@ impl ThumbnailCatalogProvider {
                     pool: &self.lazy,
                     kind,
                     identity,
+                    source_parent,
                     work,
                     row,
                 }
@@ -297,7 +311,7 @@ impl ThumbnailCatalogProvider {
         req: &LoadRequest,
         cancel: Option<&Arc<AtomicBool>>,
     ) -> Option<Arc<CatalogDb>> {
-        let Some((kind, identity, work)) = req.catalog_target.lazy_scope() else {
+        let Some((kind, identity, source_parent, work)) = req.catalog_target.lazy_scope() else {
             return (!req.catalog_target.is_retired()
                 || req.source_policy == LoadSourcePolicy::CacheOnly)
                 .then(|| self.fixed.clone())
@@ -318,11 +332,12 @@ impl ThumbnailCatalogProvider {
             LazyCatalogs::open_catalog(
                 kind,
                 identity,
+                source_parent,
                 &CatalogWork::with_admission(work.identity().0, admission),
                 false,
             )
         } else {
-            self.lazy.open(kind, identity, work, false)
+            self.lazy.open(kind, identity, source_parent, work, false)
         };
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -368,6 +383,7 @@ impl LazyCatalogs {
     fn open_catalog(
         kind: LazyCatalogKind,
         identity: &Path,
+        source_parent: &Path,
         work: &CatalogWork,
         writable: bool,
     ) -> Option<Arc<CatalogDb>> {
@@ -386,7 +402,7 @@ impl LazyCatalogs {
             work.open_existing_collection_parent(identity)
         };
         match result {
-            Ok(db) => db.map(Arc::new),
+            Ok(db) => db.map(|db| Arc::new(db.with_cover_source_folder(source_parent))),
             Err(error) => {
                 let access = work.access();
                 if access.is_admitted(work.identity().1) {
@@ -406,6 +422,7 @@ impl LazyCatalogs {
         &self,
         kind: LazyCatalogKind,
         identity: &Path,
+        source_parent: &Path,
         work: &CatalogWork,
         writable: bool,
     ) -> Option<Arc<CatalogDb>> {
@@ -414,6 +431,7 @@ impl LazyCatalogs {
             let pos = idle.iter().position(|entry| {
                 entry.kind == kind
                     && entry.identity == identity
+                    && entry.source_parent == source_parent
                     && entry.cache_dir == work.identity().0
                     && entry.admission == work.identity().1
                     && entry.writable == writable
@@ -428,6 +446,7 @@ impl LazyCatalogs {
                 idle.push_back(ParentCatalog {
                     kind,
                     identity: identity.to_owned(),
+                    source_parent: source_parent.to_owned(),
                     cache_dir: work.identity().0.to_path_buf(),
                     admission: work.identity().1,
                     writable,
@@ -439,7 +458,7 @@ impl LazyCatalogs {
         };
         drop(retired);
         let db = slot
-            .get_or_init(|| Self::open_catalog(kind, identity, work, writable))
+            .get_or_init(|| Self::open_catalog(kind, identity, source_parent, work, writable))
             .clone();
         if db.is_none() {
             let removed = {
@@ -484,6 +503,51 @@ mod tests {
             cache_key_override: Some(format!("imgthumb:{}", source.display())),
             catalog_target: RequestCatalog::collection(source, CatalogWork::capture(cache)),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cover_identity_collection_readers_keep_source_drive_outside_synthetic_identity() {
+        use crate::cover_identity::CoverIdentity;
+        let temp = tempfile::tempdir().unwrap();
+        let provider = ThumbnailCatalogProvider::collection();
+        for drive in ['d', 'e'] {
+            let source = PathBuf::from(format!("{drive}:/books/book.zip"));
+            let req = request(&source, temp.path());
+            let RequestCatalog::CollectionSourceParent {
+                identity,
+                source_parent,
+                ..
+            } = &req.catalog_target
+            else {
+                panic!("expected Collection source parent");
+            };
+            assert!(identity.starts_with("__collection_source_parent_v1__"));
+            assert_eq!(source_parent, source.parent().unwrap());
+            let cover = CoverIdentity::Page(format!("{drive}:/books/book.zip::nested/001.png"));
+            let writer = provider.writer(&req).unwrap();
+            writer
+                .save("cover", 1, 2, 3, 4, None, b"pixels", &cover)
+                .unwrap();
+            assert_eq!(writer.load_one("cover").unwrap().unwrap().cover, cover);
+            let reader = provider.resolve(&req, None).unwrap();
+            assert!(reader.is_read_only());
+            assert_eq!(reader.load_all().unwrap()["cover"].cover, cover);
+            assert_eq!(reader.load_one("cover").unwrap().unwrap().cover, cover);
+            assert_eq!(
+                reader
+                    .load_latest_with_prefix("cov")
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .cover,
+                cover
+            );
+            let successor = reader
+                .resume_cache_only_catalog_after_maintenance(&|| false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(successor.load_one("cover").unwrap().unwrap().cover, cover);
         }
     }
 
@@ -1648,7 +1712,7 @@ mod tests {
             };
             let collection = provider
                 .lazy
-                .open(LazyCatalogKind::Collection, identity, work, true)
+                .open(LazyCatalogKind::Collection, identity, identity, work, true)
                 .unwrap();
             assert!(!Arc::ptr_eq(&parent, &collection));
         }

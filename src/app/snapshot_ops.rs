@@ -1499,6 +1499,7 @@ impl App {
             // invalidate 後も保持される (= thumbnails 自体は invalidate 対象外)。
             self.bump_items_generation();
             self.invalidate_idx_state_and_queues();
+            self.reconcile_restored_cover_thumbnails();
             self.move_grid_cursor(snap.saved_selected, crate::app::GridCursorIntent::Automatic);
             self.invalidate_snapshot_details_index_state();
             self.finish_snapshot_viewer_index_swap(viewer_index_swap);
@@ -1630,6 +1631,7 @@ impl App {
         // items_generation bump + invalidate (= Codex P1-1)
         self.bump_items_generation();
         self.invalidate_idx_state_and_queues();
+        self.reconcile_restored_cover_thumbnails();
         self.invalidate_snapshot_details_index_state();
         self.clear_tags_cache();
         // snapshot list (= subset) に戻したので、ページ編集状態も subset idx で合わせ直す
@@ -3167,6 +3169,212 @@ mod tests {
             app.poll_sidecar_restore(&ctx);
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+
+    fn snapshot_cover_rotation_zip(app: &AppTestEnvForTest) -> (PathBuf, PathBuf, String) {
+        use std::io::Write;
+        let folder = app.tmp.path().join("cover-books");
+        std::fs::create_dir(&folder).unwrap();
+        let page = folder.join("cover.png");
+        image::RgbaImage::from_pixel(2, 1, image::Rgba([255, 255, 255, 255]))
+            .save(&page)
+            .unwrap();
+        let book = folder.join("book.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&book).unwrap());
+        zip.start_file("cover.png", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(&std::fs::read(page).unwrap()).unwrap();
+        zip.finish().unwrap();
+        let key = crate::adjustment_db::zip_entry_key(&book, "cover.png");
+        (folder, book, key)
+    }
+
+    fn snapshot_loaded_cover(
+        ctx: &egui::Context,
+        cover: crate::cover_source_scope::LoadedCoverIdentity,
+    ) -> ThumbnailState {
+        let texture = ctx.load_texture(
+            "snapshot-retained-cover",
+            egui::ColorImage::filled([2, 1], egui::Color32::WHITE),
+            Default::default(),
+        );
+        let mut state = ThumbnailState::loaded_raster(
+            texture,
+            crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+            false,
+            2,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((2, 1)),
+            None,
+        );
+        let ThumbnailState::Loaded {
+            cover: identity, ..
+        } = &mut state
+        else {
+            unreachable!();
+        };
+        *identity = cover;
+        state
+    }
+
+    fn snapshot_cover_texture_id(state: &ThumbnailState) -> egui::TextureId {
+        let ThumbnailState::Loaded { tex, .. } = state else {
+            panic!("retained cover lost its texture");
+        };
+        tex.id()
+    }
+
+    fn snapshot_open_zip_cover_and_rotate(app: &mut App, book: &Path, key: &str) {
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(app);
+        assert!(app.snapshot_open_entry(0, false, crate::app::HistoryTrigger::UserChosen));
+        drain_snapshot_archive_adoption(app);
+        assert_eq!(app.current_folder.as_deref(), Some(book));
+        let idx = app
+            .items
+            .iter()
+            .position(|item| {
+                matches!(item, GridItem::ZipImage { zip_path, entry_name }
+                if zip_path == book && entry_name == "cover.png")
+            })
+            .expect("real ZIP adoption exposes the cover page");
+        app.set_image_rotation(idx, crate::rotation_db::Rotation::Cw90)
+            .unwrap();
+        assert_eq!(
+            app.rotation_for_page_key(key),
+            crate::rotation_db::Rotation::Cw90,
+        );
+        assert!(app.snapshot_return_to_list_view());
+        drain_snapshot_identity_preparation(app);
+    }
+
+    fn assert_snapshot_normal_cover_refresh(app: &mut App, idx: usize) {
+        use std::sync::{Arc, Condvar, Mutex};
+        assert!(!app.settings.thumb_idle_upgrade);
+        assert!(matches!(app.thumbnails[idx], ThumbnailState::Evicted));
+        assert!(!app.requested.contains_key(&idx));
+        // Capture the ordinary enqueue result without a thumbnail worker racing the assertion.
+        let queue = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        app.heavy_io_queue = Some(queue.clone());
+        app.reload_queue = Some(queue.clone());
+        assert_eq!(
+            app.enqueue_priority_thumbnail(idx),
+            crate::app::PriorityThumbnailAdmission::Enqueued,
+        );
+        let pending = queue.0.lock().unwrap();
+        let request = pending.iter().find(|req| req.idx == idx).unwrap();
+        assert!(request.refresh_legacy_cover);
+        assert_eq!(
+            request.source_policy,
+            crate::thumb_loader::LoadSourcePolicy::CacheOrSource,
+        );
+        assert_eq!(
+            app.requested.cover_facts(idx, request.request_id),
+            Some((request.cover_scope.clone(), true)),
+        );
+    }
+
+    #[test]
+    fn cover_rotation_snapshot_return_reconciles_retained_legacy_and_preserves_current_material() {
+        use crate::cover_source_scope::{CoverSourceScope, LoadedCoverIdentity};
+        for material in 0..4 {
+            let mut app = setup_app_for_test();
+            let ctx = egui::Context::default();
+            let (_, book, key) = snapshot_cover_rotation_zip(&app);
+            let cover = match material {
+                0 => LoadedCoverIdentity::Legacy {
+                    scope: Some(CoverSourceScope::archive(&book)),
+                },
+                1 => LoadedCoverIdentity::Page(key.clone()),
+                2 => LoadedCoverIdentity::Legacy { scope: None },
+                _ => LoadedCoverIdentity::Unknown,
+            };
+            app.current_folder = Some(app.tmp.path().to_path_buf());
+            app.items = vec![GridItem::ZipFile(book.clone())];
+            app.thumbnails = vec![snapshot_loaded_cover(&ctx, cover)];
+            app.image_metas = vec![Some((1, std::fs::metadata(&book).unwrap().len() as i64))];
+            app.visible_indices = vec![0];
+            app.settings.thumb_idle_upgrade = false;
+            let texture_id = snapshot_cover_texture_id(&app.thumbnails[0]);
+
+            snapshot_open_zip_cover_and_rotate(&mut app, &book, &key);
+
+            for deactivate in [false, true] {
+                if deactivate {
+                    app.deactivate_snapshot();
+                    drain_snapshot_identity_preparation(&mut app);
+                    assert!(!app.is_snapshot_active());
+                }
+                assert_eq!(app.items, vec![GridItem::ZipFile(book.clone())]);
+                if material == 0 {
+                    assert_snapshot_normal_cover_refresh(&mut app, 0);
+                } else {
+                    assert_eq!(snapshot_cover_texture_id(&app.thumbnails[0]), texture_id);
+                    assert_eq!(
+                        app.grid_tile_rotation_memory(0),
+                        if material == 1 {
+                            crate::rotation_db::Rotation::Cw90
+                        } else {
+                            crate::rotation_db::Rotation::None
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cover_rotation_snapshot_deactivation_reconciles_saved_rows_outside_fixed_subset() {
+        use crate::cover_source_scope::{CoverSourceScope, LoadedCoverIdentity};
+        let mut app = setup_app_for_test();
+        let ctx = egui::Context::default();
+        let (folder, book, key) = snapshot_cover_rotation_zip(&app);
+        app.current_folder = Some(app.tmp.path().to_path_buf());
+        // A filtered multi-folder result retains the ancestor cover outside the fixed subset.
+        app.items = vec![
+            GridItem::Folder(folder.clone()),
+            GridItem::ZipFile(book.clone()),
+        ];
+        app.thumbnails = vec![
+            snapshot_loaded_cover(
+                &ctx,
+                LoadedCoverIdentity::Legacy {
+                    scope: Some(CoverSourceScope::folder(&folder)),
+                },
+            ),
+            snapshot_loaded_cover(
+                &ctx,
+                LoadedCoverIdentity::Legacy {
+                    scope: Some(CoverSourceScope::archive(&book)),
+                },
+            ),
+        ];
+        app.image_metas = vec![
+            Some((1, 0)),
+            Some((1, std::fs::metadata(&book).unwrap().len() as i64)),
+        ];
+        app.visible_indices = vec![1];
+        app.settings.thumb_idle_upgrade = false;
+
+        snapshot_open_zip_cover_and_rotate(&mut app, &book, &key);
+
+        assert_eq!(app.items, vec![GridItem::ZipFile(book.clone())]);
+        let saved = &app.snapshot.as_ref().unwrap().saved_thumbnails;
+        assert!(saved.iter().all(ThumbnailState::has_pixels));
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
+        app.deactivate_snapshot();
+        assert!(!app.is_snapshot_active());
+        assert_eq!(
+            app.items,
+            vec![GridItem::Folder(folder), GridItem::ZipFile(book)]
+        );
+        assert!(
+            app.thumbnails
+                .iter()
+                .all(|state| matches!(state, ThumbnailState::Evicted))
+        );
+        assert_snapshot_normal_cover_refresh(&mut app, 0);
+        assert_snapshot_normal_cover_refresh(&mut app, 1);
     }
 
     fn activate_single_archive_snapshot(app: &mut App, source: PathBuf) {

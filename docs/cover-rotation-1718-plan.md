@@ -177,11 +177,16 @@ pub(crate) enum CoverIdentity {
 - これは描画中ではなく、回転を変えた操作の処理と結果の採用の中で行う。`Legacy` 以外のタイルは触らない (表紙以外の回転で
   無関係なタイルが消えない)。作り直した行は `Legacy` でなくなるので、同じタイルが繰り返し再要求されることはない。
 
-### 5.3 残る既知の制限 (旧行に限る)
+### 5.3 残る既知の制限
 
 - CacheOnly の経路 (ドライブ一覧、判定待ちの変換書庫) が旧行を表示する間は回転しない。行が通常の要求で作り直されると直る。
 - 旧行の子を流用したフォルダの代表は、その子の行が作り直されるまで回転しない (子の本を含む一覧を開けば作り直される)。
 - mIV Remote は旧行を回転なしで返す (§9)。デスクトップで作り直されると直る。
+- 現行行にも残る変換書庫の制限 (実装レビュー 1 の設計担当判断): 別ドライブの変換 ZIP は絶対 `p:`、
+  元一覧と同じドライブの変換 ZIP は `q:` になる。mtime / size が同じ書庫を別ドライブへ複製した場合や
+  ドライブ文字の変更後は、共有行が writer の変換ファイルを指し続けるか、別ドライブの綴りになることがあり、
+  writer の変換ファイルの回転で描くか、回転なしになる場合がある。変換書庫と同一 stamp の複製または
+  ドライブ文字の変更が重なる条件であり、追加の provenance / 状態は持たずに受け入れる。
 
 ## 6. 永続キャッシュ (catalog) の変更 (リリース済み → 移行あり)
 
@@ -191,6 +196,11 @@ pub(crate) enum CoverIdentity {
   既存の layout 列と同じく列の有無を判定し、無ければ NULL (= `Legacy`) として読む。`load_all` / `load_one` / prefix 読みの全部。
   Collection の必須列には足さない (旧 cache を丸ごと拒否しない)。
 - `CacheEntry` に `cover: CoverIdentity` を足し、メモリキャッシュ (`cache_map`) でも画素と一緒に持つ。
+- SQL 保存時だけ、`Page` の先頭ドライブと catalog を開いた元フォルダのドライブが一致すれば
+  `q:<先頭2文字を除いたキー>` にする。他ドライブ・UNC・元フォルダにドライブが無い場合は絶対 `p:<キー>`。
+  `q:` の読取はその reader の元フォルダの小文字ドライブを付け直し、無ければ `Unknown`。`p:` は変更しない。
+  元フォルダの drive は handle の不変な文脈であり、Collection の synthetic identity や DB 配置先から推測しない。
+  maintenance 後の read-only 再開にも引き継ぐ。メモリ上の identity は常に絶対キーのまま。
 - 行を書く全経路で identity を書く (§7)。trigger (`folder_selection_revision`) の対象は今と同じ。
 
 ## 7. identity を作る経路 (全 producer)
@@ -266,6 +276,18 @@ pub(crate) enum CoverIdentity {
 (identity は角度の取得と独立で、owner に無いキーは誤った回転を作らない)。P3 1 件: owner が全非 0 回転を持つという記述と、
 変換直後の受け入れ条件が除外と矛盾 → §4.2 と §10 を直した。
 
+### 8.5 実装レビュー 1 (implementation review 1、Sol/xhigh)
+
+`51908dbf4` に対し P1 なし、P2 2 件。設計担当が両件をコードで確認した。
+
+1. 共有 catalog とドライブ付きの表紙キーが不一致 (P2-1)。一律 `q:` の案は別ドライブの変換 ZIP の
+   実ページキーを壊すため停止・報告した。設計担当の再指定により、元フォルダと同じドライブだけ `q:`、
+   他の `Page` は絶対 `p:` にする (§6)。D/E の共有、変換 ZIP の同一・別ドライブ、全保存・読取境界、
+   App の本タイルとページ一覧の一致を回帰に追加。残る変換書庫の制限は §5.3 のとおり受け入れた。
+2. 退避された `Loaded::Legacy` が回転変更時の走査を通らない (P2-2)。一覧を復元する境界で
+   `reconcile_restored_cover_thumbnails` を通す差分と、実 ZIP の★固定→本を開く→回転→一覧復帰の
+   回帰テストを追加した。保存した元一覧の非表示行・Smart root 復帰も対象。追加差分の検証結果は §12。
+
 ## 9. mIV Remote
 
 - 今の Remote は、サムネの結果から画素だけを取り出して identity を捨てている (`remote_ipc/thumbnail.rs` のフォルダ、
@@ -319,6 +341,23 @@ pub(crate) enum CoverIdentity {
 
 ## 12. 実装メモ
 
+- 実装レビュー 1 の再指定: SQL の `q:` 化は Page と catalog 元フォルダのドライブが一致するときだけ。
+  他は `p:` の絶対キーを保持する。Collection は synthetic DB identity と実ソース親を分け、worker が
+  handle を公開する前に元フォルダのドライブを固定する。回転の owner、画素、seed、Loaded は絶対キーのまま。
+  変換 ZIP が別ドライブの `p:` または同一ドライブの `q:` で保存され、別ドライブの同一 stamp の書庫や
+  ドライブ文字の変更後に writer の変換ファイルの回転または回転なしになる制限は §5.3 のとおり受け入れた。
+  provenance の新しい状態、追加の既存行移行、描画時の I/O は足さない。
+- 復帰境界の棚卸し: `SnapshotState.saved_thumbnails` / `list_view_thumbnails` (★固定と startup の
+  DirectMedia が保存)、`SmartFolderPreparedGrid`、ZIP 階層再表示と検索結果差し替えの一時的な
+  Loaded 再利用 map。これらが一覧へ戻る時だけ共通 helper で該当 Legacy を既存の再要求経路へ戻す。
+  DirectMedia の saved 復帰は snapshot 解除と registry の split 時の復帰にある。汎用の context swap は
+  フレームごとにも走るため追加の再判定を置かない。`ViewerContextBundle` の live 一覧は既存の
+  全 context 回転通知が扱い、未読ソースから返した Legacy を毎フレーム再要求する仕組みは作らない。
+- 実装レビュー 1 の再指定後の検証: 焦点 nextest 40/40、初回の F2 / F3 と復帰経路の和集合 470/470
+  (焦点40件を含む) が成功。通常 core の `cargo check`、`cargo fmt`、差分チェックも exit 0。コマンド・件数・ログは
+  `target/cover-rotation-1718/review-1-final-report.txt`。全体 gate・検証ビルド・実機確認・独立 follow-up review
+  は設計担当へ引き継ぎ、製品 binary 起動とコミットは行っていない。
+
 - 角度は既存のApp所有フィールド `rotation_page_keys` 自体を `BTreeMap<String, Rotation>` に置換し、更新・snapshot置換helperを経由する。
   既存の存在判定は `PageEditKeys` traitで集合とmapのキーに共通化した。
 - workerの `CoverIdentity` と表示素材の `LoadedCoverIdentity` を分け、後者の `Legacy` だけが要求ownerから受け取ったscopeを保持する。
@@ -328,6 +367,7 @@ pub(crate) enum CoverIdentity {
   idle upgradeが再試行して旧画素を消さないためで、次の回転操作または再入場は通常の要求として扱う。
 - 共通encoderの保存APIはidentityを必須引数とし、呼出元が実際にencodeしたページを渡す。
 - 製品ページ・マニュアルの回転説明は本のタイルの向きを規定していないため、公開文面は変更しない。
-- 検証は関連 nextest 375 件と追加 producer 19 件が成功 (一部は重複)。既存の loaded grid snapshot 1 件も成功、PNG 変更なし。
+- 初回実装 (`51908dbf4` まで) の検証は関連 nextest 375 件と追加 producer 19 件が成功 (一部は重複)。
+  既存の loaded grid snapshot 1 件も成功、PNG 変更なし。
   実行コマンド・途中の失敗と修正・ログは
   `target/cover-rotation-1718/report.txt` に記録。実機・全体 gate は未実施で、製品 binary は起動していない。

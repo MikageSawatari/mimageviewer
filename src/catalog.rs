@@ -56,6 +56,14 @@ pub fn db_path_for(cache_dir: &Path, folder_path: &Path) -> PathBuf {
 // キャッシュエントリ
 // -----------------------------------------------------------------------
 
+/// Reconstruct absolute page keys from the reader's source, never meta.folder_path.
+fn cover_drive_for(folder: &Path) -> Option<char> {
+    let value = folder.to_string_lossy();
+    let bytes = value.as_bytes();
+    (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        .then(|| char::from(bytes[0].to_ascii_lowercase()))
+}
+
 #[derive(Clone)]
 pub struct CacheEntry {
     pub mtime: i64,
@@ -349,6 +357,7 @@ impl CatalogWork {
             true,
             true,
             columns.contains("cover_key"),
+            cover_drive_for(identity),
         )))
     }
 
@@ -773,7 +782,7 @@ pub fn lookup_audio_art(
             mtime: stamp.mtime_secs,
             file_size: stamp.file_size,
             jpeg_data,
-            cover: CoverIdentity::from_sql(cover.as_deref()),
+            cover: CoverIdentity::from_sql(cover.as_deref(), db.cover_drive),
             source_dims: valid_dims(width, height),
             layout_dims: None,
             folder_provenance: None,
@@ -820,7 +829,7 @@ pub fn save_audio_art_pixels_with_cancel_check(
     ensure_audio_art_schema(&conn)?;
     let tx = conn.unchecked_transaction()?;
     tx.execute("DELETE FROM audio_art_absence WHERE filename=?1", [key])?;
-    tx.execute("INSERT OR REPLACE INTO thumbnails (filename,mtime,file_size,width,height,thumb_data,source_width,source_height,cover_key) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![key,entry.mtime,entry.file_size,width,height,entry.jpeg_data,entry.source_dims.map(|d| d.0),entry.source_dims.map(|d| d.1),CoverIdentity::Unrotatable.to_sql()])?;
+    tx.execute("INSERT OR REPLACE INTO thumbnails (filename,mtime,file_size,width,height,thumb_data,source_width,source_height,cover_key) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![key,entry.mtime,entry.file_size,width,height,entry.jpeg_data,entry.source_dims.map(|d| d.0),entry.source_dims.map(|d| d.1),CoverIdentity::Unrotatable.to_sql(db.cover_drive)])?;
     if should_cancel() {
         return Ok(false);
     }
@@ -928,6 +937,8 @@ pub struct CatalogDb {
     has_layout_dims_columns: bool,
     has_folder_proof_columns: bool,
     has_cover_key_column: bool,
+    /// Opened source folder's drive, independent of the shared database path.
+    cover_drive: Option<char>,
     read_only: bool,
 }
 
@@ -1031,7 +1042,8 @@ impl CatalogDb {
         if cancel() || !catalog_file_exists(path)? {
             return Ok(None);
         }
-        let db = Self::open_read_only_at_path(path, self.access.clone(), admission)?;
+        let db =
+            Self::open_read_only_at_path(path, self.access.clone(), admission, self.cover_drive)?;
         if cancel() {
             return Ok(None);
         }
@@ -1045,6 +1057,7 @@ impl CatalogDb {
         has_layout_dims_columns: bool,
         has_folder_proof_columns: bool,
         has_cover_key_column: bool,
+        cover_drive: Option<char>,
     ) -> Self {
         let read_only = connection
             .is_readonly(rusqlite::DatabaseName::Main)
@@ -1063,12 +1076,20 @@ impl CatalogDb {
             has_layout_dims_columns,
             has_folder_proof_columns,
             has_cover_key_column,
+            cover_drive,
             read_only,
         }
     }
 
     pub(crate) fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// Synthetic catalog namespaces retain their physical source separately.
+    /// Apply before publishing this handle so all readers use the same drive.
+    pub(crate) fn with_cover_source_folder(mut self, folder: &Path) -> Self {
+        self.cover_drive = cover_drive_for(folder);
+        self
     }
 
     pub(crate) fn record_cache_error(&self, detail: impl Into<String>) {
@@ -1094,8 +1115,13 @@ impl CatalogDb {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.to_string()),
         };
-        let db = Self::open_read_only_at_path(&db_path, access.clone(), admission)
-            .map_err(|error| error.to_string())?;
+        let db = Self::open_read_only_at_path(
+            &db_path,
+            access.clone(),
+            admission,
+            cover_drive_for(folder_path),
+        )
+        .map_err(|error| error.to_string())?;
         if matches!(db.revision_state(), CatalogProofState::Present(_)) {
             failed_legacy_initializations()
                 .lock()
@@ -1130,9 +1156,14 @@ impl CatalogDb {
                 .lock()
                 .unwrap()
                 .remove(&db_path);
-            return Self::open_read_only_at_path(&db_path, access.clone(), admission)
-                .map(Some)
-                .map_err(|error| error.to_string());
+            return Self::open_read_only_at_path(
+                &db_path,
+                access.clone(),
+                admission,
+                cover_drive_for(folder_path),
+            )
+            .map(Some)
+            .map_err(|error| error.to_string());
         }
         crate::logger::log(format!(
             "folder selection legacy catalog initialization failed: {}: {}",
@@ -1242,6 +1273,7 @@ impl CatalogDb {
             true,
             true,
             true,
+            cover_drive_for(folder_path),
         ))
     }
 
@@ -1266,13 +1298,20 @@ impl CatalogDb {
         if !catalog_file_exists(&db_path)? {
             return Ok(None);
         }
-        Self::open_read_only_at_path(&db_path, access.clone(), admission).map(Some)
+        Self::open_read_only_at_path(
+            &db_path,
+            access.clone(),
+            admission,
+            cover_drive_for(folder_path),
+        )
+        .map(Some)
     }
 
     fn open_read_only_at_path(
         db_path: &Path,
         access: std::sync::Arc<CatalogAccess>,
         admission: CatalogAdmission,
+        cover_drive: Option<char>,
     ) -> rusqlite::Result<Self> {
         let _lease = access.lease(admission)?;
         let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -1288,6 +1327,7 @@ impl CatalogDb {
             has_layout_dims_columns,
             has_folder_proof_columns,
             has_cover_key_column,
+            cover_drive,
         ))
     }
 
@@ -1445,7 +1485,7 @@ impl CatalogDb {
                     mtime,
                     file_size,
                     jpeg_data,
-                    cover: CoverIdentity::from_sql(cover.as_deref()),
+                    cover: CoverIdentity::from_sql(cover.as_deref(), self.cover_drive),
                     source_dims,
                     layout_dims: valid_dims(layout_w, layout_h),
                     folder_provenance: provenance
@@ -1516,7 +1556,7 @@ impl CatalogDb {
                 mtime,
                 file_size,
                 jpeg_data,
-                cover: CoverIdentity::from_sql(cover.as_deref()),
+                cover: CoverIdentity::from_sql(cover.as_deref(), self.cover_drive),
                 source_dims,
                 layout_dims: valid_dims(layout_w, layout_h),
                 folder_provenance: provenance.and_then(|value| serde_json::from_str(&value).ok()),
@@ -1613,7 +1653,7 @@ impl CatalogDb {
                     mtime,
                     file_size,
                     jpeg_data,
-                    cover: CoverIdentity::from_sql(cover.as_deref()),
+                    cover: CoverIdentity::from_sql(cover.as_deref(), self.cover_drive),
                     source_dims,
                     layout_dims: valid_dims(layout_w, layout_h),
                     folder_provenance: provenance
@@ -1730,7 +1770,7 @@ impl CatalogDb {
                 layout_h,
                 provenance_json,
                 proof_json,
-                cover.to_sql()
+                cover.to_sql(self.cover_drive)
             ],
         )?;
         Ok(())
@@ -1900,7 +1940,7 @@ impl CatalogDb {
                   layout_width, layout_height, folder_provenance, selection_proof, cover_key) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, NULL, NULL, ?7, NULL, ?8)",
                 params![key, entry.mtime, entry.file_size, width, height, entry.jpeg_data,
-                    serde_json::to_string(&FolderThumbProvenance::Seeded).unwrap(), entry.cover.to_sql()],
+                    serde_json::to_string(&FolderThumbProvenance::Seeded).unwrap(), entry.cover.to_sql(self.cover_drive)],
             )?;
         }
         if cancel.load(Ordering::Relaxed) {
@@ -2953,6 +2993,7 @@ mod tests {
             true,
             true,
             true,
+            Some('c'),
         )
     }
 
@@ -4405,7 +4446,7 @@ mod tests {
     #[test]
     fn cover_identity_round_trips_all_catalog_readers() {
         let temp = tempfile::tempdir().unwrap();
-        let folder = temp.path().join("photos");
+        let folder = PathBuf::from(r"C:\photos");
         let db = CatalogDb::open(temp.path(), &folder).unwrap();
         let covers = [
             CoverIdentity::Legacy,
@@ -4480,51 +4521,315 @@ mod tests {
 
     #[test]
     fn cover_identity_is_written_by_every_thumbnail_save_boundary() {
-        let db = open_in_memory();
-        let data = encode_thumb_webp(&image::DynamicImage::new_rgb8(2, 3), 3, 80.0)
-            .unwrap()
-            .0;
-        let cover = CoverIdentity::Page("c:/book.zip::001.png".into());
-        db.save("save", 1, 2, 2, 3, None, &data, &cover).unwrap();
-        db.save_with_layout_dims("layout", 1, 2, 2, 3, None, None, &data, &cover)
-            .unwrap();
-        db.save_with_folder_proof("proof", 1, 2, 2, 3, None, None, &data, None, None, &cover)
-            .unwrap();
-        assert!(
-            db.save_thumb_bytes("bytes", 1, 2, None, &data, &cover)
+        let temp = tempfile::tempdir().unwrap();
+        let folder = Path::new(r"D:\books");
+        let db = CatalogDb::open(temp.path(), folder).unwrap();
+        for (cover, encoded_cover, moved_cover) in [
+            (
+                CoverIdentity::Page("d:/book.zip::001.png".into()),
+                "q:/book.zip::001.png",
+                CoverIdentity::Page("e:/book.zip::001.png".into()),
+            ),
+            (
+                CoverIdentity::Page("c:/cache/book.zip::001.png".into()),
+                "p:c:/cache/book.zip::001.png",
+                CoverIdentity::Page("c:/cache/book.zip::001.png".into()),
+            ),
+        ] {
+            let data = encode_thumb_webp(&image::DynamicImage::new_rgb8(2, 3), 3, 80.0)
                 .unwrap()
-        );
-        assert!(
-            db.save_thumb_bytes_with_layout_dims("bytes_layout", 1, 2, None, None, &data, &cover)
+                .0;
+            db.save("save", 1, 2, 2, 3, None, &data, &cover).unwrap();
+            db.save_with_layout_dims("layout", 1, 2, 2, 3, None, None, &data, &cover)
+                .unwrap();
+            db.save_with_folder_proof("proof", 1, 2, 2, 3, None, None, &data, None, None, &cover)
+                .unwrap();
+            assert!(
+                db.save_thumb_bytes("bytes", 1, 2, None, &data, &cover)
+                    .unwrap()
+            );
+            assert!(
+                db.save_thumb_bytes_with_layout_dims(
+                    "bytes_layout",
+                    1,
+                    2,
+                    None,
+                    None,
+                    &data,
+                    &cover
+                )
                 .unwrap()
-        );
-        assert!(
-            db.save_auto_folder_bytes("auto", 1, 2, None, None, &data, None, &cover)
+            );
+            assert!(
+                db.save_auto_folder_bytes("auto", 1, 2, None, None, &data, None, &cover)
+                    .unwrap()
+            );
+            assert!(
+                db.save_seeded_folder_bytes("seed", 1, 2, None, &data, &cover)
+                    .unwrap()
+            );
+            let entry = CacheEntry {
+                mtime: 1,
+                file_size: 2,
+                jpeg_data: data,
+                cover: cover.clone(),
+                source_dims: None,
+                layout_dims: None,
+                folder_provenance: None,
+                selection_proof: None,
+            };
+            assert!(
+                db.commit_pin_materializations(
+                    &[],
+                    &[("pin".into(), entry)],
+                    &AtomicBool::new(false)
+                )
                 .unwrap()
-        );
-        assert!(
-            db.save_seeded_folder_bytes("seed", 1, 2, None, &data, &cover)
+            );
+            let rows = db.load_all().unwrap();
+            assert_eq!(rows.len(), 8);
+            for entry in rows.values() {
+                assert_eq!(entry.cover, cover);
+            }
+            let encoded: Vec<String> = db
+                .phase()
                 .unwrap()
-        );
-        let entry = CacheEntry {
-            mtime: 1,
-            file_size: 2,
-            jpeg_data: data,
-            cover: cover.clone(),
-            source_dims: None,
-            layout_dims: None,
-            folder_provenance: None,
-            selection_proof: None,
-        };
-        assert!(
-            db.commit_pin_materializations(&[], &[("pin".into(), entry)], &AtomicBool::new(false))
+                .prepare("SELECT cover_key FROM thumbnails")
                 .unwrap()
-        );
-        let rows = db.load_all().unwrap();
-        assert_eq!(rows.len(), 8);
-        for entry in rows.values() {
-            assert_eq!(entry.cover, cover);
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(encoded, vec![encoded_cover; 8]);
+            let moved = CatalogDb::open_existing_read_only(temp.path(), Path::new(r"E:\books"))
+                .unwrap()
+                .unwrap();
+            for entry in moved.load_all().unwrap().values() {
+                assert_eq!(entry.cover, moved_cover);
+            }
         }
+    }
+
+    #[test]
+    fn cover_identity_shared_drive_catalog_rebases_every_reader_and_maintenance_successor() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = Path::new(r"D:\books");
+        let moved = Path::new(r"E:\books");
+        assert_eq!(
+            db_path_for(temp.path(), original),
+            db_path_for(temp.path(), moved)
+        );
+        let source_cover = CoverIdentity::Page("d:/books/book.zip::nested/001.png".into());
+        let writer = CatalogDb::open(temp.path(), original).unwrap();
+        writer
+            .save("cover", 1, 2, 3, 4, None, b"pixels", &source_cover)
+            .unwrap();
+        let expected = CoverIdentity::Page("e:/books/book.zip::nested/001.png".into());
+        let work = CatalogWork::capture(temp.path());
+        let readers = [
+            CatalogDb::open(temp.path(), moved).unwrap(),
+            CatalogDb::open_existing_read_only(temp.path(), moved)
+                .unwrap()
+                .unwrap(),
+            CatalogDb::open_for_folder_selection(temp.path(), moved)
+                .unwrap()
+                .unwrap(),
+            work.open_existing_collection_parent(moved)
+                .unwrap()
+                .unwrap(),
+        ];
+        for reader in &readers {
+            assert_eq!(reader.load_all().unwrap()["cover"].cover, expected);
+            assert_eq!(reader.load_one("cover").unwrap().unwrap().cover, expected);
+            assert_eq!(
+                reader
+                    .load_latest_with_prefix("cov")
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .cover,
+                expected
+            );
+            assert_eq!(
+                reader
+                    .load_latest_with_prefix_matching("cov", Some((1, 2)))
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .cover,
+                expected
+            );
+        }
+        assert_eq!(
+            writer.load_one("cover").unwrap().unwrap().cover,
+            source_cover
+        );
+        let access = CatalogAccess::for_cache_dir(temp.path());
+        let deletion = access.begin_delete(CatalogDeleteOperation::All).unwrap();
+        deletion.retire_connections();
+        drop(deletion);
+        for reader in &readers {
+            assert_eq!(
+                reader
+                    .resume_cache_only_after_maintenance("cover", &|| false)
+                    .unwrap()
+                    .unwrap()
+                    .cover,
+                expected
+            );
+        }
+        let reverse = CatalogDb::open(temp.path(), moved).unwrap();
+        reverse
+            .save("cover", 1, 2, 3, 4, None, b"pixels", &expected)
+            .unwrap();
+        let original_reader = CatalogDb::open_existing_read_only(temp.path(), original)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            original_reader.load_one("cover").unwrap().unwrap().cover,
+            source_cover
+        );
+    }
+
+    #[test]
+    fn cover_identity_drive_less_reader_does_not_refresh_current_drive_relative_rows() {
+        let db = open_in_memory().with_cover_source_folder(Path::new(r"D:\books"));
+        let drive_cover = CoverIdentity::Page("d:/books/book.zip::001.png".into());
+        db.save("drive", 1, 2, 3, 4, None, b"pixels", &drive_cover)
+            .unwrap();
+        let db = db.with_cover_source_folder(Path::new("__synthetic__"));
+        db.save("absolute", 1, 2, 3, 4, None, b"pixels", &drive_cover)
+            .unwrap();
+        let unc_cover = CoverIdentity::Page("//server/share/book.zip::001.png".into());
+        db.save("unc", 1, 2, 3, 4, None, b"pixels", &unc_cover)
+            .unwrap();
+        assert_eq!(
+            db.load_one("drive").unwrap().unwrap().cover,
+            CoverIdentity::Unknown
+        );
+        assert_eq!(
+            db.load_all().unwrap()["drive"].cover,
+            CoverIdentity::Unknown
+        );
+        assert_eq!(
+            db.load_latest_with_prefix("drive")
+                .unwrap()
+                .unwrap()
+                .1
+                .cover,
+            CoverIdentity::Unknown
+        );
+        assert_eq!(db.load_one("absolute").unwrap().unwrap().cover, drive_cover);
+        assert_eq!(db.load_one("unc").unwrap().unwrap().cover, unc_cover);
+    }
+
+    #[test]
+    fn cover_identity_converted_archive_read_location_round_trips_same_and_other_drive() {
+        let temp = tempfile::tempdir().unwrap();
+        let library = Path::new(r"D:\library");
+        let db = CatalogDb::open(temp.path(), library).unwrap();
+        for (key, archive, encoded) in [
+            (
+                "other",
+                r"C:\cache\converted.zip",
+                "p:c:/cache/converted.zip::normalized/cover.png",
+            ),
+            (
+                "same",
+                r"D:\cache\converted.zip",
+                "q:/cache/converted.zip::normalized/cover.png",
+            ),
+        ] {
+            // A converted book stores the actual cache ZIP page, not its original RAR path.
+            let location = crate::thumb_loader::ReadLocation::ArchiveEntry {
+                archive: PathBuf::from(archive),
+                entry: "normalized/cover.png".into(),
+            };
+            let cover = crate::thumb_loader::cover_identity_for_location(
+                &location,
+                Some(Path::new(r"D:\unused-books")),
+            );
+            assert_eq!(
+                cover,
+                CoverIdentity::Page(crate::adjustment_db::zip_entry_key(
+                    Path::new(archive),
+                    "normalized/cover.png"
+                ))
+            );
+            db.save(key, 1, 2, 3, 4, None, b"pixels", &cover).unwrap();
+            let stored: String = db
+                .phase()
+                .unwrap()
+                .query_row(
+                    "SELECT cover_key FROM thumbnails WHERE filename=?1",
+                    [key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, encoded);
+            assert_eq!(db.load_one(key).unwrap().unwrap().cover, cover);
+            let reader = CatalogDb::open_existing_read_only(temp.path(), library)
+                .unwrap()
+                .unwrap();
+            assert_eq!(reader.load_all().unwrap()[key].cover, cover);
+            assert_eq!(reader.load_one(key).unwrap().unwrap().cover, cover);
+            assert_eq!(
+                reader
+                    .load_latest_with_prefix(key)
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .cover,
+                cover
+            );
+        }
+        // The other-drive source is external to the catalog and remains absolute even
+        // when its original library's shared catalog is reopened under a new drive.
+        let moved = CatalogDb::open_existing_read_only(temp.path(), Path::new(r"E:\library"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            moved.load_one("other").unwrap().unwrap().cover,
+            CoverIdentity::Page("c:/cache/converted.zip::normalized/cover.png".into())
+        );
+    }
+
+    #[test]
+    fn cover_identity_audio_lookup_uses_opened_scope_drive() {
+        let temp = tempfile::tempdir().unwrap();
+        let scope = AudioArtCatalogScope::new(Path::new(r"E:\music"));
+        let key = scope.key_for(&scope.parent.join("song.mp3"));
+        let db = CatalogDb::open(temp.path(), &scope.parent).unwrap();
+        // Audio's dedicated writer always writes Unrotatable. Exercise its custom
+        // SQL reader too, with a drive-relative current row at the shared boundary.
+        db.save(
+            &key,
+            1,
+            2,
+            3,
+            4,
+            None,
+            b"pixels",
+            &CoverIdentity::Page("e:/music/cover.jpg".into()),
+        )
+        .unwrap();
+        let AudioArtCached::Pixels(entry) = lookup_audio_art(
+            temp.path(),
+            &scope,
+            &key,
+            AudioArtSourceStamp {
+                mtime_secs: 1,
+                file_size: 2,
+            },
+            CatalogAccess::for_cache_dir(temp.path()).admit(),
+        )
+        .unwrap() else {
+            panic!("expected current audio row")
+        };
+        assert_eq!(
+            entry.cover,
+            CoverIdentity::Page("e:/music/cover.jpg".into())
+        );
     }
 
     #[test]

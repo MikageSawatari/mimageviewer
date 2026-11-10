@@ -5,6 +5,26 @@ use crate::cover_source_scope::LoadedCoverIdentity;
 use crate::rotation_db::Rotation;
 
 impl App {
+    /// A retained list skips worker adoption. Recheck old materials once when that list
+    /// becomes live, using the same predicate and reload path as a rotation change.
+    pub(crate) fn reconcile_restored_cover_thumbnails(&mut self) -> bool {
+        let matching = self
+            .items
+            .iter()
+            .zip(&self.thumbnails)
+            .enumerate()
+            .filter_map(|(idx, (item, thumbnail))| {
+                legacy_book_cover_needs_reload(item, thumbnail, &self.rotation_page_keys)
+                    .then_some(idx)
+            })
+            .collect::<Vec<_>>();
+        let changed = !matching.is_empty();
+        for idx in matching {
+            self.evict_thumbnail_for_reload(idx);
+        }
+        changed
+    }
+
     /// Ordinary page tiles retain their existing cache/DB lookup semantics.
     pub(crate) fn grid_tile_rotation(&mut self, idx: usize) -> Rotation {
         if self.items.get(idx).is_some_and(|item| {
@@ -271,6 +291,128 @@ mod tests {
             app.thumbnails[0].has_pixels(),
             "CacheOnly material has no decode path to refresh"
         );
+    }
+
+    #[test]
+    fn cover_rotation_shared_catalog_keeps_other_drive_tile_independent() {
+        let mut app = super::super::setup_app_for_test();
+        let cache = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let original = PathBuf::from("D:/books/book.zip");
+        let other = PathBuf::from("E:/books/book.zip");
+        let original_key = crate::adjustment_db::zip_entry_key(&original, "cover.png");
+        let other_key = crate::adjustment_db::zip_entry_key(&other, "cover.png");
+        let writer =
+            crate::catalog::CatalogDb::open(cache.path(), original.parent().unwrap()).unwrap();
+        writer
+            .save(
+                "archivethumb:book.zip",
+                1,
+                2,
+                2,
+                1,
+                None,
+                b"same unrotated pixels",
+                &crate::cover_identity::CoverIdentity::Page(original_key.clone()),
+            )
+            .unwrap();
+        let reader = crate::catalog::CatalogDb::open_existing_read_only(
+            cache.path(),
+            other.parent().unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let original_cover = writer
+            .load_one("archivethumb:book.zip")
+            .unwrap()
+            .unwrap()
+            .cover;
+        let other_cover = reader
+            .load_one("archivethumb:book.zip")
+            .unwrap()
+            .unwrap()
+            .cover;
+        assert_eq!(
+            original_cover,
+            crate::cover_identity::CoverIdentity::Page(original_key)
+        );
+        assert_eq!(
+            other_cover,
+            crate::cover_identity::CoverIdentity::Page(other_key)
+        );
+        app.items = vec![
+            GridItem::ZipFile(original.clone()),
+            GridItem::ZipFile(other.clone()),
+            GridItem::ZipImage {
+                zip_path: original,
+                entry_name: "cover.png".into(),
+            },
+            GridItem::ZipImage {
+                zip_path: other,
+                entry_name: "cover.png".into(),
+            },
+        ];
+        app.thumbnails = vec![
+            loaded(
+                &ctx,
+                LoadedCoverIdentity::from_material(original_cover, None),
+            ),
+            loaded(&ctx, LoadedCoverIdentity::from_material(other_cover, None)),
+            ThumbnailState::Pending,
+            ThumbnailState::Pending,
+        ];
+        app.set_image_rotation(2, Rotation::Cw90).unwrap();
+        assert_eq!(app.grid_tile_rotation(0), Rotation::Cw90);
+        assert_eq!(app.grid_tile_rotation(1), Rotation::None);
+        assert_eq!(app.grid_tile_rotation(2), Rotation::Cw90);
+        assert_eq!(app.grid_tile_rotation(3), Rotation::None);
+    }
+
+    #[test]
+    fn cover_rotation_converted_archive_catalog_round_trip_matches_actual_page_drive() {
+        for converted_drive in ['c', 'd'] {
+            let mut app = super::super::setup_app_for_test();
+            let cache = tempfile::tempdir().unwrap();
+            let ctx = egui::Context::default();
+            let library = PathBuf::from("D:/books");
+            let original = library.join("book.rar");
+            let converted =
+                PathBuf::from(format!("{converted_drive}:/data/archive_cache/book.zip"));
+            let cover = crate::thumb_loader::cover_identity_for_location(
+                &crate::thumb_loader::ReadLocation::ArchiveEntry {
+                    archive: converted.clone(),
+                    entry: "cover.png".into(),
+                },
+                Some(std::path::Path::new("D:/compiled-books")),
+            );
+            let writer = crate::catalog::CatalogDb::open(cache.path(), &library).unwrap();
+            writer
+                .save("archivethumb:book.rar", 1, 2, 2, 1, None, b"pixels", &cover)
+                .unwrap();
+            drop(writer);
+            let reader = crate::catalog::CatalogDb::open_existing_read_only(cache.path(), &library)
+                .unwrap()
+                .unwrap();
+            let cached = reader.load_one("archivethumb:book.rar").unwrap().unwrap();
+            assert_eq!(cached.cover, cover);
+            app.items = vec![
+                GridItem::ConvertibleArchive {
+                    path: original,
+                    format: crate::archive_converter::ArchiveFormat::Rar,
+                },
+                GridItem::ZipImage {
+                    zip_path: converted,
+                    entry_name: "cover.png".into(),
+                },
+            ];
+            app.thumbnails = vec![
+                loaded(&ctx, LoadedCoverIdentity::from_material(cached.cover, None)),
+                ThumbnailState::Pending,
+            ];
+            app.set_image_rotation(1, Rotation::Cw90).unwrap();
+            assert_eq!(app.grid_tile_rotation(0), Rotation::Cw90);
+            assert_eq!(app.grid_tile_rotation(1), Rotation::Cw90);
+        }
     }
 
     #[test]

@@ -8614,6 +8614,7 @@ impl App {
         self.image_metas = image_metas;
         self.bump_items_generation();
         self.invalidate_idx_state_and_queues();
+        self.reconcile_restored_cover_thumbnails();
         // The restored samples still describe these moved items, but their installed App
         // generation is new so stale child work cannot publish into the root.
         auto_aspect.items_generation = self.items_generation;
@@ -12015,6 +12016,66 @@ mod tests {
                 app.settings.file_type_visibility.clone(),
             ),
         );
+    }
+
+    #[test]
+    fn cover_rotation_prepared_smart_root_rechecks_retained_legacy_materials_on_restore() {
+        use crate::cover_source_scope::{CoverSourceScope, LoadedCoverIdentity};
+        use crate::rotation_db::Rotation;
+
+        let mut app = crate::app::setup_app_for_test();
+        let definition_id = install_smart_identity_test_root(&mut app, Default::default());
+        let ctx = egui::Context::default();
+        let book = PathBuf::from("c:/smart/book.zip");
+        let key = crate::adjustment_db::zip_entry_key(&book, "cover.png");
+        let tex = ctx.load_texture(
+            "retained-smart-cover",
+            egui::ColorImage::filled([2, 1], egui::Color32::WHITE),
+            Default::default(),
+        );
+        app.items = vec![GridItem::ZipFile(book.clone()); 4];
+        app.thumbnails = [
+            LoadedCoverIdentity::Legacy {
+                scope: Some(CoverSourceScope::archive(&book)),
+            },
+            LoadedCoverIdentity::Page(key.clone()),
+            LoadedCoverIdentity::Legacy { scope: None },
+            LoadedCoverIdentity::Unknown,
+        ]
+        .into_iter()
+        .map(|identity| {
+            let mut state = ThumbnailState::loaded_raster(
+                tex.clone(),
+                crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+                false,
+                2,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((2, 1)),
+                None,
+            );
+            if let ThumbnailState::Loaded { cover, .. } = &mut state {
+                *cover = identity;
+            }
+            state
+        })
+        .collect();
+        app.image_metas = vec![None; 4];
+        app.visible_indices = vec![0, 1, 2, 3];
+        let grid = app.take_visible_smart_folder_grid();
+        park_smart_identity_test_root(&mut app, grid);
+        app.update_rotation_page_owner([(key, Rotation::Cw90)]);
+
+        assert!(app.restore_prepared_smart_folder_session(definition_id, None));
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
+        for idx in 1..4 {
+            assert!(
+                matches!(&app.thumbnails[idx], ThumbnailState::Loaded { tex: restored, .. }
+                if restored.id() == tex.id())
+            );
+        }
+        assert_eq!(app.grid_tile_rotation(1), Rotation::Cw90);
+        assert_eq!(app.grid_tile_rotation(2), Rotation::None);
+        assert_eq!(app.grid_tile_rotation(3), Rotation::None);
     }
 
     #[test]

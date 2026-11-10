@@ -40711,6 +40711,7 @@ impl App {
         // clear して、新レベルの entry に対し DB から再 hydrate する。entry_name キーで引くので
         // 階層が変わっても各ページの保存済み補正・マスクが正しく載り、旧 idx の編集が別 entry に
         // 漏れない (Codex P1)。invalidate はこれらを意図的に触らないので明示的に呼ぶ必要がある。
+        self.reconcile_restored_cover_thumbnails();
         self.rehydrate_page_edit_state_for_current_items(&zip_path);
         self.local_adjust_generation.clear();
         self.local_adjust_cache.clear();
