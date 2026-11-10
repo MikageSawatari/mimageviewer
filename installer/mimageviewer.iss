@@ -62,8 +62,9 @@ Source: "..\vendor\ffmpeg\LICENSE.txt"; DestDir: "{app}"; DestName: "FFmpeg-LICE
 ; RAR 展開には unrar crate 経由で RARLAB UnRAR ソースを組み込むため、
 ; UnRAR ライセンス本文をインストール先にも配置する。
 Source: "..\UNRAR-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
-; Static RAW, AVIF and JPEG components: full upstream licenses and attributions.
+; PDF, RAW, AVIF and JPEG components: full upstream licenses and attributions.
 Source: "..\LIBRAW-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\PDFIUM-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LIBAVIF-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\DAV1D-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LIBYUV-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion

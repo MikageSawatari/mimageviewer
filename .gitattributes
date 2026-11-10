@@ -38,6 +38,7 @@ third_party/effetune-docs/** -text
 LIBAVIF-LICENSE.txt -text
 DAV1D-LICENSE.txt -text
 LIBYUV-LICENSE.txt -text
+PDFIUM-LICENSE.txt -text
 
 third_party/miv-sound/** -text
 

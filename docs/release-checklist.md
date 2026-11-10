@@ -274,6 +274,9 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
    失敗ログの読み方: `gh run view <run-id> --log-failed` はビルド全体の warning も含むため、
    ファイルへ落として `error[E` で絞り込む (`-->` の行に実ファイル位置が出る)。
 7. PDFium の更新確認（`bash scripts/setup-pdfium.sh check`）
+   更新時は `python scripts/generate-pdfium-license.py` で内部部品を含む全文を作り直し、
+   差分と `python scripts/generate-pdfium-license.py --check`、About の表記・全文を確認する。
+   installer / portable に `PDFIUM-LICENSE.txt` の全文が入ることを確認する。
 8. ONNX Runtime DLL の配置確認（`bash scripts/setup-ort.sh`、ort クレート更新時は必須）
 9. Susie ワーカーの再ビルド（`bash scripts/setup-susie-worker.sh`）
 10. FFmpeg LGPL shared build の更新確認（`bash scripts/setup-ffmpeg.sh check` はローリング資産を除外し、

@@ -141,8 +141,9 @@ bash scripts/setup-pdfium.sh check  # 新しいバージョンの有無を確認
 - **ソース**: [bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries)
   (毎週月曜に Chromium 最新版から自動ビルド)
 - **アセット**: `pdfium-win-x64.tgz` (V8 なし版、軽量)
-- **現在のバージョン**: `chromium/8125` (`158.0.8125.0`、2026-10-28 更新)。
-  `vendor/pdfium/VERSION` と資産照合は [更新記録](dependency-update-20261028.md) を参照
+- **現在のバージョン**: `chromium/8138` (`159.0.8138.0`、2026-11-10 更新)。
+  `vendor/pdfium/VERSION` と資産照合・hash は [更新記録](dependency-update-20261110.md) を参照
+  (前回の 8125 は [2026-10-28 の記録](dependency-update-20261028.md))
 
 ### リリース前チェック (必須)
 
@@ -150,7 +151,25 @@ bash scripts/setup-pdfium.sh check  # 新しいバージョンの有無を確認
 
 1. `bash scripts/setup-pdfium.sh check` を実行し、新しいバージョンがないか確認
 2. 新しいバージョンがある場合は `bash scripts/setup-pdfium.sh` で更新
-3. 更新後は PDF の表示が正常か動作確認してからリリース
+3. 更新した資産からライセンス全文を作り直し、検査する (利用者へも PowerShell で渡せる):
+
+   ```powershell
+   python scripts/generate-pdfium-license.py
+   python scripts/generate-pdfium-license.py --check
+   ```
+
+   `PDFIUM-LICENSE.txt` の差分で、同梱版・内部部品の増減・ライセンスと著作権表記の変化を確認する。
+   内部部品のライセンスで「配布文書に帰属文を書く」条件が増えていないか確認する (現在は FreeType と IJG)。
+   形式の正本はこのスクリプトだけ。`LICENSE`、`licenses/pdfium.txt`、残りのファイル名順に全文を連結し、
+   freetype の Latin-1 を UTF-8 (BOM なし) へ変換、改行は既存の `LIBAVIF-LICENSE.txt` と同じ LF に揃える。
+   Windows の現行メモ帳でも読める。行末空白・末尾空白行は削らず、最終改行が無い本文には改行を補い、
+   各節の後に区切り用の空行を1行加える。`--check` は改行形式だけを無視して全体を照合する。
+   About の `pdfium_notices_match_all_vendor_files_and_version` テストが同じ検査モードを実行し、
+   版・見出し・ファイルの増減・本文が一致しなければ再生成コマンド付きで失敗する (Python 必須)。
+4. About の PDFium の行と内部部品を含む全文、`installer/mimageviewer.iss` と
+   `scripts/build-portable.ps1` の配布リストを確認し、installer / portable のルートに
+   `PDFIUM-LICENSE.txt` が入ることを確認する。単体 exe 版は core の About に全文を埋め込む。
+5. 更新後は PDF の表示が正常か動作確認してからリリース
 
 ## ONNX Runtime 管理
 
