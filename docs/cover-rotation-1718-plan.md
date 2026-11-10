@@ -84,13 +84,13 @@ pub(crate) enum CoverIdentity {
   フォルダ削除時の retain / `edit_bundle_bulk`。snapshot を作る worker は DB から角度も読む。
 - 画像フォルダ→ZIP 変換は、完了時に既に `page_state=true` の metadata refresh で全体 snapshot を読み直して owner を置き換えている
   (`image_folder_zip_operation.rs` → `metadata_import_refresh.rs`)。この snapshot が角度を持つようにするだけで足りる。
-- **EPUB→PDF 変換** (`epub_convert.rs` の `copy_restore_stores_without_identity_at`、単発・一括) は回転を PDF のキーへ
-  コピーするが、今は owner を更新しない。単発の完了は、変換を始めた画面が置き換わると (`EpubConvertExit::Superseded`) 受信前に
-  捨てられるので、ダイアログの完了経路には載せない。
-  **コピーを確定した変換 worker が、コピーした回転 (PDF のキー→角度) を App 全体の受け口 (例: App が持つ mpsc の Sender を
-  worker へ渡す) へ直接送る**。App は毎フレームこの受け口を drain し、§4.1 の共通 helper で owner へ反映する。viewer context の
-  世代では捨てない。全体 snapshot は読み直さない (無関係なページ状態を巻き戻さないため)。単発・一括とも同じ受け口を使う。
-  変換はモーダルなので、受け口に届く前に利用者が同じ PDF のページを回すことはない。
+- **EPUB→PDF 変換は今回の範囲から外す** (既知の制限、[バックログ §1.757](next-release-backlog.md))。`epub_convert.rs` の
+  `copy_restore_stores_without_identity_at` (単発・一括) は回転を PDF のキーへ DB だけでコピーし、今の `rotation_page_keys` も更新しない。
+  これは変換機能に元からある不足で、今回の修正で悪化しない (変換後の PDF の本のタイルが回転しないのは今と同じ。次回起動で直る)。
+  - 外す理由: 正しく直すには、変換 worker の DB コピーと、利用者の回転操作・snapshot の置き換えなど owner の全ての更新の間に
+    順序を付ける仕組みが要る (ダイアログが置き換わっても worker はコピーを続けるため、ダイアログの寿命では順序を守れない。
+    2026-11-10 の設計レビュー 3 回目)。§1.718 の本体 (表紙の identity と描画時の角度) とは独立した、変換機能側の構造の問題。
+  - 他の書き手は、画面の操作か全体 snapshot の置き換えで owner を更新しており、この問題は無い。
 - 回転の実変更を通知する helper を 1 つにまとめる (owner の更新 + 説明文の失効 + §5.2 の旧行タイルの再要求)。
   snapshot の読み直しで値が変わらなかったキーについては失効を出さない。
 
@@ -123,12 +123,15 @@ pub(crate) enum CoverIdentity {
 
 ### 5.0 判定は 1 つ: 表紙の出どころの範囲 `CoverSourceScope`
 
-- **組み立て終わった `LoadRequest` から**、表紙の出どころになり得るページキーの範囲を純粋な関数 `cover_source_scope(&LoadRequest)` で作る。
-  pin の解決 (`apply_folder_thumb_pin`、pin DB と stat を読む既存処理) をやり直さず、その結果として書き換わった要求の
-  `path` / `zip_entry` / `zip_dir_prefix` / `pdf_page` / 種類だけを見る。I/O なし。
+- 表紙の出どころになり得るページキーの範囲 `CoverSourceScope` を、**要求を組み立てる処理の中で、元のパスと種類がまだ手元にある
+  時点で**作り、要求と一緒に持たせる (`make_load_request_with_visibility` と `apply_folder_thumb_pin` が読み先を書き換える箇所)。
+  組み立て終わった要求のフィールドからは作らない (変換書庫の元のパス、pin の `resolved.abs_path`、ZipDir の dir prefix は
+  要求に残らないため)。pin の解決 (pin DB と stat を読む既存処理) をやり直さない。新しい I/O は足さない。
   - 例: 自動選定のフォルダ → そのフォルダ以下の prefix。ZIP / PDF / EPUB → その容器のページキーの prefix。
-    変換書庫・変換書庫を指す pin → 要求の読み先 (cache ZIP) と元の書庫の両方の綴り (`archive_or_converted_cache_contains_page_key` と同じ扱い)。
-    ZipDir → ZIP のキー prefix (+ dir prefix)。具体的なページを指す pin → そのページのキー。
+    変換書庫・変換書庫を指す pin → 読み先 (cache ZIP) と元の書庫の両方の綴り (`archive_or_converted_cache_contains_page_key` と同じ扱い)。
+    ZipDir → ZIP のキー prefix + dir prefix (pin なしでも、要求作成時の dir prefix から作る)。具体的なページを指す pin → そのページのキー。
+  - **代替要求 (`epub_pin_fallback`) を持つ要求の範囲は、本体と代替要求の範囲の和** (再帰的に)。worker は除外された書庫の pin や
+    読めない EPUB で代替要求に切り替えるので、代替要求の表紙 (例: 入れ子の pin から外側のフォルダの `cover.png`) も範囲に入れる。
   - **元ソースを decode する経路が無い要求は範囲を持たない (`None`)**: CacheOnly、動画フレームの seed (`uses_memory_pin_seed`)、
     ドライブ一覧の `pinned_only` など。`allows_source()` だけでは判定しない。
 - 判定 `scope.has_rotation(owner)` = 範囲内に owner の非 0 回転キーがあるか (BTreeMap の範囲検索)。§5.1・§5.2・採用時の 3 か所で
@@ -138,8 +141,8 @@ pub(crate) enum CoverIdentity {
 
 ### 5.1 要求時
 
-- App は本の要求を組み立て終えた後 (pin の適用後)、`cover_source_scope(&req)` が `Some` でその範囲に回転があるとき
-  `LoadRequest.refresh_legacy_cover = true` にする。EPUB / 種類除外の代替要求 (`epub_pin_fallback`) にも同じ値を引き継ぐ。
+- App は本の要求を組み立て終えた後、§5.0 の範囲 (代替要求との和) が `Some` でその範囲に回転があるとき
+  `LoadRequest.refresh_legacy_cover = true` にする。代替要求 (`epub_pin_fallback`) にも同じ値を引き継ぐ。
 - worker はキャッシュ命中 (**メモリ命中の判定より前**に。ディスクも同じ) で行が `Legacy` かつ `refresh_legacy_cover` のとき、
   その旧行の画素を手元に残したまま、元ソースから作り直しを試みる。§1.741 の親 catalog 行も同じ順序で判定し、親の stamp 観測と
   保存先は通常の miss と同じにする。
@@ -245,6 +248,15 @@ pub(crate) enum CoverIdentity {
 5. Remote の完了済み受け渡しが旧行を使い回す → §9。`Legacy` の完了済み raster は使い回さない。
 6. (P3) synthetic のメモリ行からの作り直しで新しい親 DB を作ってしまう → §5.1 の例外。
 
+### 8.3 2026-11-10 設計レビュー 3 回目 (同じ Sol/xhigh) の指摘と対応
+
+判定は「指摘を直せば実装可」。P2 × 2、P3 × 1。§8.2 の 2・4・5・6 は解決。
+
+1. 範囲に代替要求の出どころが入っていない → §5.0。本体と代替要求の範囲の和にした。
+2. EPUB 変換の受け口では、DB のコピーと owner の他の更新の順序が守れない → §4.1。順序を付ける仕組みは owner の全書き手に及ぶので、
+   EPUB→PDF 変換の回転の反映は今回の範囲から外し、変換機能側の既存の不足として別項目にした (今回の修正で悪化しない)。
+3. (P3) 組み立て終わった要求には変換書庫の元のパスや ZipDir の prefix が残らない → §5.0。要求の組み立て中に範囲を作る。
+
 ## 9. mIV Remote
 
 - 今の Remote は、サムネの結果から画素だけを取り出して identity を捨てている (`remote_ipc/thumbnail.rs` のフォルダ、
@@ -281,7 +293,8 @@ pub(crate) enum CoverIdentity {
   1 回で収束すること。別 context で読み込み中・CPU 待ち行列・暫定画像の段階の `Legacy` 結果が、表紙の回転後に採用されず再要求されること。
   CacheOnly で届いた `Legacy` は回転操作で evict されないこと。一括キャッシュ作成と pin 確定の行に identity が入ること。
 - 追加 (再レビュー): 元ソースが読めない回転済みの本 (旧行あり) で、旧行の表紙が表示され続け、再要求が繰り返されないこと。
-  EPUB 変換中に画面が置き換わっても、変換後の PDF の回転が owner に入ること。Remote で同じ本の表紙を 2 回取得し、その間に
+  入れ子の pin が代替要求のフォルダの表紙へ切り替わる場合 (既存の `book.cbz::inner.zip/page.png` → `cover.png` の fixture)、
+  `cover.png` だけの回転でも範囲に入ること。pin なしの ZipDir と変換書庫を指す pin の範囲。Remote で同じ本の表紙を 2 回取得し、その間に
   デスクトップが旧行を作り直した場合、2 回目は回転した表紙になること。§1.741 の synthetic のメモリ旧行の作り直しで、
   `CachePolicy::Off` のとき親 DB が作られないこと。動画フレームの seed の要求は範囲 `None` になること。
 - 描画入口: 選択変更後の再描画 (`repaint_grid_cell_after_input`) と詳細表示の hover でも回転すること。hover が RotationDb を読まないこと。
