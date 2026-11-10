@@ -122,6 +122,7 @@
 | [name-index-write-failure-plan.md](name-index-write-failure-plan.md) | §1.369 名前／コンテナ索引の書込失敗。レビュー反映・実装と検証記録。同じDBの起動中1回の通知／予約、通常UIへの配送、Full/watch/clearの共通出口、無害なno-opの維持 |
 | [page-adjustment-owner-plan.md](page-adjustment-owner-plan.md) | §1.372 検索再配置中の補正Undo／draftの保存先。設計R2反映・実装／自動検証／確認用build完了。安定target、context所有draft、共有Undo受理順と最新受付済み文書、終了配送と§1.371 cursor ownerとの関係 |
 | [item-kind-capability-matrix.md](item-kind-capability-matrix.md) | **★ / タグ / 削除 / コピー / 外部ツール / 検索が `GridItem` の種別ごとにどう振る舞うかの現状表**。セルは 対応 / 拒否 / コンテナへ寄せる / **無反応** の 4 値。仮想ページ (ZipImage / PdfPage) を扱う機能を足すときは先にここを見る |
+| [folder-check-selection-plan.md](folder-check-selection-plan.md) | **§1.732 (実装中)**。どの一覧でもフォルダをチェック選択・Ctrl+A の対象にする設計。選べる判定の一本化 (ドライブ一覧だけ除外)、削除の確認・本へ追加・合計サイズの変更点、選択を使う各操作のフォルダの扱いの一覧 |
 | [top-level-grid-view.md](top-level-grid-view.md) | 検索・★固定・サブ展開・スマートフォルダ等の最上位一覧 ownership / 復元 snapshot と、スマートフォルダ root / scoped drill の不変条件 |
 | [section257-smart-folder-navigation.md](section257-smart-folder-navigation.md) | スマートフォルダからの PDF 読み込み取消と親復帰位置の不具合。お気に入り表示設定の適用先、root/物理子の所有境界と回帰検証 |
 | [fullscreen-folder-sidecar-transition-investigation-20260913.md](fullscreen-folder-sidecar-transition-investigation-20260913.md) | §1.233 サイドカー復元の非同期待機と画像フォルダ移動の表示保持。v3.9.0退行のログ・所有境界・修正検証 |
