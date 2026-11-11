@@ -12,6 +12,8 @@ GPS ボタンを描き、クリック時に直ちに `external_links::open_url` 
 N/S と E/W の軸、参照欠損、各要素の有限性、度の非負、分秒 [0,60)、緯度90／経度180の上限を検証し、
 検証済み座標を EXIF cache に保存する。表示フィルターで緯度・経度の両方が残る場合だけ利用する。
 参照タグの表示設定は座標の有効性を変えない。参照の元タグそのものが無ければ無効。
+参照値の前後のASCII空白は除去し、緯度N/S・経度E/Wの1文字と完全一致で判定する。
+小文字・方位の語・軸違い・ASCII以外の空白は受け付けない。
 MCP `project_exif` もこれを共用し、GPS 許可の gate と altitude の既存投影は維持する。
 
 URL の写真由来情報は座標のみ。十進度は小数7桁・指数なし・負のゼロなしで組み立てる。
@@ -47,6 +49,13 @@ GPS欄の値とボタンの文字欠け・重なりがないことを確認し�
 実行ログは `target/gps-maps-verification/target-gps-*.log`。最終結果は
 `tests-final`（57件）、`snapshot-update`／`snapshot-final`（各1件）、`check-final` にある。
 全体gate・build-dev・コミット・実機および実ブラウザー確認は今回の担当範囲外で、ClaudeCodeへ引き継ぐ。
+
+独立レビューP2/P3の追補は `efa3f62a4` 上の未コミット差分で検証した。
+前後のASCII空白を持つ実TIFF参照値とMCPのGPS許可あり／なしの回帰3件を追加し、
+起動失敗通知は各modeの3クリックに対する固定文言3件との完全一致へ変更した。
+上記と同じ関連filterで60/60成功（5.095秒）、`cargo fmt` → `cargo fmt --check` はexit 0。
+前回と同じ検証用native環境指定を使い、リポジトリのビルド設定は変更していない。
+ログは `target/gps-maps-verification/review-fixes-related.log`。製品起動・コミットは行っていない。
 
 ## 原因と不変条件
 

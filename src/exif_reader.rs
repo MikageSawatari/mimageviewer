@@ -312,7 +312,7 @@ fn gps_axis(
     if value > maximum {
         return None;
     }
-    match reference {
+    match reference.trim_matches(|c: char| c.is_ascii_whitespace()) {
         r if r == positive => Some(value),
         r if r == negative => Some(-value),
         _ => None,
@@ -1466,6 +1466,15 @@ pub(crate) mod tests {
 
     // Small TIFF with a real GPS IFD, parsed through the production reader.
     pub(crate) fn gps_fixture_bytes(latitude: u32, longitude: u32) -> Vec<u8> {
+        gps_fixture_bytes_with_refs(latitude, longitude, "S", "W")
+    }
+
+    pub(crate) fn gps_fixture_bytes_with_refs(
+        latitude: u32,
+        longitude: u32,
+        latitude_ref: &str,
+        longitude_ref: &str,
+    ) -> Vec<u8> {
         let mut bytes = b"II*\0\x08\0\0\0".to_vec();
         bytes.extend_from_slice(&1_u16.to_le_bytes());
         bytes.extend_from_slice(&0x8825_u16.to_le_bytes());
@@ -1474,23 +1483,91 @@ pub(crate) mod tests {
         bytes.extend_from_slice(&26_u32.to_le_bytes());
         bytes.extend_from_slice(&0_u32.to_le_bytes());
         bytes.extend_from_slice(&4_u16.to_le_bytes());
-        for (tag, format, count, data) in [
-            (1_u16, 2_u16, 2_u32, u32::from_le_bytes(*b"S\0\0\0")),
-            (2, 5, 3, 80),
-            (3, 2, 2, u32::from_le_bytes(*b"W\0\0\0")),
-            (4, 5, 3, 104),
-        ] {
-            bytes.extend_from_slice(&tag.to_le_bytes());
-            bytes.extend_from_slice(&format.to_le_bytes());
-            bytes.extend_from_slice(&count.to_le_bytes());
-            bytes.extend_from_slice(&data.to_le_bytes());
-        }
-        bytes.extend_from_slice(&0_u32.to_le_bytes());
-        for value in [latitude, 30, 0, longitude, 45, 0] {
-            bytes.extend_from_slice(&value.to_le_bytes());
-            bytes.extend_from_slice(&1_u32.to_le_bytes());
+        // Reserve four entries and the next-IFD pointer before appending payloads.
+        bytes.resize(80, 0);
+        let rational_bytes = |values: [u32; 3]| {
+            values
+                .into_iter()
+                .flat_map(|value| [value.to_le_bytes(), 1_u32.to_le_bytes()].concat())
+                .collect::<Vec<u8>>()
+        };
+        for (index, (tag, format, count, data)) in [
+            (
+                1_u16,
+                2_u16,
+                latitude_ref.len() as u32 + 1,
+                format!("{latitude_ref}\0").into_bytes(),
+            ),
+            (2, 5, 3, rational_bytes([latitude, 30, 0])),
+            (
+                3,
+                2,
+                longitude_ref.len() as u32 + 1,
+                format!("{longitude_ref}\0").into_bytes(),
+            ),
+            (4, 5, 3, rational_bytes([longitude, 45, 0])),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let slot = 28 + index * 12;
+            bytes[slot..slot + 2].copy_from_slice(&tag.to_le_bytes());
+            bytes[slot + 2..slot + 4].copy_from_slice(&format.to_le_bytes());
+            bytes[slot + 4..slot + 8].copy_from_slice(&count.to_le_bytes());
+            if data.len() <= 4 {
+                bytes[slot + 8..slot + 8 + data.len()].copy_from_slice(&data);
+            } else {
+                if bytes.len() % 2 != 0 {
+                    bytes.push(0);
+                }
+                let offset = bytes.len() as u32;
+                bytes[slot + 8..slot + 12].copy_from_slice(&offset.to_le_bytes());
+                bytes.extend_from_slice(&data);
+            }
         }
         bytes
+    }
+
+    #[test]
+    fn gps_reference_ascii_padding_is_accepted_from_tiff_bytes() {
+        for (latitude_ref, longitude_ref, sign) in [
+            ("S ", "W ", -1.0),
+            (" S", " W", -1.0),
+            (" \tS\r\n ", " \tW\r\n ", -1.0),
+            (" N ", " E ", 1.0),
+        ] {
+            let bytes = gps_fixture_bytes_with_refs(35, 139, latitude_ref, longitude_ref);
+            assert_eq!(
+                read_exif_from_bytes(&bytes, &[]).unwrap().gps_coordinates(),
+                Some(GpsCoordinates {
+                    latitude: sign * 35.5,
+                    longitude: sign * 139.75
+                }),
+            );
+        }
+    }
+
+    #[test]
+    fn gps_reference_padding_does_not_accept_other_directions_or_words() {
+        for (latitude_ref, longitude_ref) in [
+            (" s ", "W"),
+            ("S", " w "),
+            (" South ", "W"),
+            ("S", " West "),
+            (" E ", "W"),
+            ("S", " N "),
+            (" \t\r\n", "W"),
+            ("S", " "),
+            ("\u{a0}S\u{a0}", "W"),
+        ] {
+            let bytes = gps_fixture_bytes_with_refs(35, 139, latitude_ref, longitude_ref);
+            assert!(
+                read_exif_from_bytes(&bytes, &[])
+                    .unwrap()
+                    .gps_coordinates()
+                    .is_none()
+            );
+        }
     }
 
     #[test]

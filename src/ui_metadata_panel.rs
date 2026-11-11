@@ -6413,12 +6413,9 @@ mod metadata_info_target_tests {
             harness.run();
             assert_eq!(harness.state().1.len(), 3);
             assert!(harness.state().1[2].ends_with("-32.5000000%2C-132.7500000"));
-            assert!(
-                harness
-                    .state()
-                    .2
-                    .iter()
-                    .all(|warning| *warning == "Google マップを開けませんでした")
+            assert_eq!(
+                harness.state().2,
+                vec!["Google マップを開けませんでした"; 3]
             );
             harness.state_mut().0.fullscreen_idx = Some(3);
             harness.state_mut().0.spread_mode = SpreadMode::Single;
