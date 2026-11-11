@@ -541,6 +541,12 @@ enum ExternalCheckedTargetStep {
     Complete,
 }
 
+#[cfg(test)]
+thread_local! {
+    // Count actual checked-candidate and selection-entry visits, without production branches.
+    static EXTERNAL_CHECKED_TARGET_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Shared checked-target selection for the resolver, menu and frame-split preparation.
 /// Classification and enumeration each visit at most one display entry per call, so
 /// preparation keeps its entry/time budget even for a large folder-only selection.
@@ -560,6 +566,8 @@ fn checked_external_target_index(
                 .get(*cursor)
                 .filter(|_| *checked_seen < checked.len())
             {
+                #[cfg(test)]
+                EXTERNAL_CHECKED_TARGET_VISITS.with(|visits| visits.set(visits.get() + 1));
                 *cursor += 1;
                 if checked.contains(&index) {
                     *checked_seen += 1;
@@ -592,6 +600,8 @@ fn checked_external_target_index(
                 .get(*cursor)
                 .filter(|_| *checked_seen < checked.len())
             {
+                #[cfg(test)]
+                EXTERNAL_CHECKED_TARGET_VISITS.with(|visits| visits.set(visits.get() + 1));
                 *cursor += 1;
                 if checked.contains(&index) {
                     *checked_seen += 1;
@@ -2660,9 +2670,20 @@ impl crate::app::App {
                 ExternalTargetSource::GridContext { .. } | ExternalTargetSource::GridKey { .. }
             ) && !self.checked.is_empty()
             {
-                for index in
-                    ordered_checked_indices(&self.items, &self.checked, self.current_grid_order())
-                {
+                // Capability has no ordering requirement. Probe only checked candidates;
+                // idx_visible uses the existing sorted visibility list (O(log V) per check).
+                // Do not walk or rebuild the full display order merely to open a menu.
+                let visible_checked: Vec<_> = self
+                    .checked
+                    .iter()
+                    .copied()
+                    .filter(|index| {
+                        #[cfg(test)]
+                        EXTERNAL_CHECKED_TARGET_VISITS.with(|visits| visits.set(visits.get() + 1));
+                        self.idx_visible(*index)
+                    })
+                    .collect();
+                for index in ordered_checked_indices(&self.items, &self.checked, &visible_checked) {
                     if let Some(item) = self.items.get(index) {
                         capability.add_grid_item(item);
                     }
@@ -2991,7 +3012,9 @@ impl crate::app::App {
                                 // A sole checked current item has no ordering choice. Keep
                                 // its direct lookup without scanning the remaining grid.
                                 let single = primary.filter(|index| {
-                                    self.checked.len() == 1 && self.checked.contains(index)
+                                    self.checked.len() == 1
+                                        && self.checked.contains(index)
+                                        && self.idx_visible(*index)
                                 });
                                 let order = single.as_slice();
                                 let order = if single.is_some() {
@@ -3778,6 +3801,13 @@ impl crate::app::App {
 mod tests {
     use super::*;
 
+    fn install_external_test_display_order(app: &mut crate::app::App, order: Vec<usize>) {
+        app.visible_indices = order.clone();
+        app.visible_indices.sort_unstable();
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.details_order = order;
+    }
+
     #[test]
     fn retained_material_entry_external_tool_snapshots_canonical_metadata_without_raw_reload() {
         use crate::app::composite_pixels_revision_tests::{evict_pair_cpu, warm_final_pair};
@@ -4004,7 +4034,7 @@ mod tests {
                         .into_iter()
                         .map(|index| crate::grid_item::GridItem::Video(expected[index].clone()))
                         .collect();
-                    app.visible_indices = vec![1, 0, 2];
+                    install_external_test_display_order(&mut app, vec![1, 0, 2]);
                     app.checked.extend([2, 0, 1]);
                     app.selected = Some(2);
                     let mut tool = file_list_test_tool(selection);
@@ -4569,7 +4599,7 @@ mod tests {
         app.items = (0..300)
             .map(|index| crate::grid_item::GridItem::Video(PathBuf::from(format!("{index}.mp4"))))
             .collect();
-        app.visible_indices = (0..300).rev().collect();
+        install_external_test_display_order(&mut app, (0..300).rev().collect());
         app.checked.extend(0..300);
         app.selected = Some(10);
         let mut tool = file_list_test_tool(SelectionPolicy::Each);
@@ -4633,7 +4663,7 @@ mod tests {
                 crate::grid_item::GridItem::Video(PathBuf::from(format!("video-{index}.mp4")))
             })
             .collect();
-        app.visible_indices = (0..count).rev().collect();
+        install_external_test_display_order(&mut app, (0..count).rev().collect());
         app.checked.extend(0..count);
         app.selected = Some(17);
         let mut tool = file_list_test_tool(SelectionPolicy::Batch);
@@ -4673,7 +4703,7 @@ mod tests {
                 crate::grid_item::GridItem::Video(PathBuf::from(format!("video-{index}.mp4")))
             })
             .collect();
-        app.visible_indices = (0..4096).rev().collect();
+        install_external_test_display_order(&mut app, (0..4096).rev().collect());
         app.checked.insert(17);
         app.selected = Some(17);
         app.settings.external_tools = vec![file_list_test_tool(SelectionPolicy::Batch)];
@@ -5788,6 +5818,149 @@ mod tests {
     }
 
     #[test]
+    fn external_tool_menu_sparse_checks_visit_only_checked_candidates() {
+        use crate::grid_item::GridItem;
+        let mut app = crate::app::setup_app_for_test();
+        for count in [64, 100_000] {
+            app.items = (0..count)
+                .map(|index| GridItem::Image(format!("page-{index}.jpg").into()))
+                .collect();
+            for details in [false, true] {
+                app.visible_indices = (0..count).collect();
+                app.settings.grid_view_mode = if details {
+                    crate::settings::GridViewMode::Details
+                } else {
+                    crate::settings::GridViewMode::Thumbnail
+                };
+                app.details_order = (0..count).rev().collect();
+                for checked_count in [1, 4] {
+                    app.checked = (count - checked_count..count).collect();
+                    for source in [
+                        ExternalTargetSource::GridContext {
+                            clicked: Some(count - 1),
+                        },
+                        ExternalTargetSource::GridKey {
+                            selected: Some(count - 1),
+                        },
+                    ] {
+                        EXTERNAL_CHECKED_TARGET_VISITS.with(|visits| visits.set(0));
+                        let descriptor = app.external_tool_context_menu_descriptor(source);
+                        let visits = EXTERNAL_CHECKED_TARGET_VISITS.with(|visits| visits.get());
+                        assert_eq!(
+                            descriptor.capability,
+                            ExternalToolMenuTarget {
+                                has_target: true,
+                                ..Default::default()
+                            }
+                        );
+                        // C visibility probes, one classification entry, C target entries.
+                        // Increasing V from 64 to 100,000 must not add display-list visits.
+                        assert_eq!(
+                            visits,
+                            checked_count * 2 + 1,
+                            "count={count}, checked={checked_count}, details={details}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn external_tool_hidden_checks_match_resolver_menu_and_preparation() {
+        use crate::grid_item::GridItem;
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Folder("A".into()),
+            GridItem::Image("B.jpg".into()),
+        ];
+        // Hidden non-folders must not exclude a visible folder; hidden folders must not
+        // survive the single-current shortcut or contribute to any capability.
+        for (visible, checked, primary, expected) in [
+            (vec![1], HashSet::from([0]), 0, vec![]),
+            (vec![], HashSet::from([0]), 0, vec![]),
+            (vec![0], HashSet::from([1]), 1, vec![]),
+            (
+                vec![0],
+                HashSet::from([0, 1]),
+                0,
+                vec![LaunchTarget::RealFile("A".into())],
+            ),
+            (
+                vec![1],
+                HashSet::from([0, 1]),
+                0,
+                vec![LaunchTarget::ImagePage("B.jpg".into())],
+            ),
+        ] {
+            for details in [false, true] {
+                app.visible_indices = visible.clone();
+                app.settings.grid_view_mode = if details {
+                    crate::settings::GridViewMode::Details
+                } else {
+                    crate::settings::GridViewMode::Thumbnail
+                };
+                app.details_order = visible.iter().rev().copied().collect();
+                app.checked = checked.clone();
+                app.selected = Some(primary);
+                for source in [
+                    ExternalTargetSource::GridContext {
+                        clicked: Some(primary),
+                    },
+                    ExternalTargetSource::GridKey {
+                        selected: Some(primary),
+                    },
+                ] {
+                    let targets = resolve_external_targets(
+                        &app.items,
+                        app.current_grid_order(),
+                        &app.checked,
+                        source.clone(),
+                    );
+                    assert_eq!(targets, expected);
+                    let descriptor = app.external_tool_context_menu_descriptor(source);
+                    assert_eq!(
+                        descriptor.capability,
+                        ExternalToolMenuTarget::from_launch_targets(&targets)
+                    );
+                    app.begin_external_preparation(
+                        egui::ViewportId::ROOT,
+                        descriptor,
+                        ExternalPreparationPurpose::ForPicker(
+                            ExternalToolPickerTargetKind::GridItems,
+                        ),
+                    );
+                    let mut preparing = take_preparing(&mut app);
+                    let mut result = Ok(false);
+                    for _ in 0..16 {
+                        result = app.advance_external_preparation_mounted(&mut preparing);
+                        if !matches!(result, Ok(false)) {
+                            break;
+                        }
+                    }
+                    if expected.is_empty() {
+                        assert!(result.unwrap_err().contains("対象が選択されていません"));
+                    } else {
+                        assert_eq!(result, Ok(true));
+                    }
+                    assert_eq!(
+                        preparing
+                            .locators
+                            .iter()
+                            .map(|locator| locator.target().clone())
+                            .collect::<Vec<_>>(),
+                        expected
+                    );
+                    assert_eq!(
+                        preparing.capability,
+                        ExternalToolMenuTarget::from_launch_targets(&targets)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn external_tool_mixed_folder_capability_matches_resolver_picker_and_preparation() {
         use crate::grid_item::GridItem;
         let mut app = crate::app::setup_app_for_test();
@@ -5818,7 +5991,8 @@ mod tests {
             app.items = vec![GridItem::Folder("first".into())];
             app.items.extend(remaining);
             app.items.push(GridItem::Folder("last".into()));
-            app.visible_indices = (0..app.items.len()).rev().collect();
+            let order = (0..app.items.len()).rev().collect();
+            install_external_test_display_order(&mut app, order);
             app.checked = (0..app.items.len()).collect();
             app.selected = Some(0);
             app.settings.external_tools = vec![file_list_test_tool(SelectionPolicy::Batch)];
@@ -5828,7 +6002,7 @@ mod tests {
             ] {
                 let targets = resolve_external_targets(
                     &app.items,
-                    &app.visible_indices,
+                    app.current_grid_order(),
                     &app.checked,
                     source.clone(),
                 );
@@ -5886,7 +6060,7 @@ mod tests {
             GridItem::Folder("middle".into()),
             GridItem::Video("two.mp4".into()),
         ];
-        app.visible_indices = vec![3, 2, 1, 0];
+        install_external_test_display_order(&mut app, vec![3, 2, 1, 0]);
         app.checked = (0..4).collect();
         app.selected = Some(0);
         for selection in [SelectionPolicy::Each, SelectionPolicy::Batch] {
@@ -5951,7 +6125,7 @@ mod tests {
             GridItem::Image("page.jpg".into()),
             GridItem::Folder("last".into()),
         ];
-        app.visible_indices = vec![2, 1, 0];
+        install_external_test_display_order(&mut app, vec![2, 1, 0]);
         app.checked = HashSet::from([0, 2]);
         app.settings.external_tools = vec![file_list_test_tool(SelectionPolicy::Batch)];
         for source in [
@@ -5960,7 +6134,7 @@ mod tests {
         ] {
             let targets = resolve_external_targets(
                 &app.items,
-                &app.visible_indices,
+                app.current_grid_order(),
                 &app.checked,
                 source.clone(),
             );
@@ -6002,7 +6176,12 @@ mod tests {
             },
         ] {
             assert_eq!(
-                resolve_external_targets(&app.items, &app.visible_indices, &app.checked, source),
+                resolve_external_targets(
+                    &app.items,
+                    app.current_grid_order(),
+                    &app.checked,
+                    source
+                ),
                 vec![LaunchTarget::RealFile("first".into())]
             );
         }
@@ -6012,7 +6191,12 @@ mod tests {
             ExternalTargetSource::GridContext { clicked: Some(0) },
         ] {
             assert_eq!(
-                resolve_external_targets(&app.items, &app.visible_indices, &app.checked, source),
+                resolve_external_targets(
+                    &app.items,
+                    app.current_grid_order(),
+                    &app.checked,
+                    source
+                ),
                 vec![LaunchTarget::RealFile("first".into())]
             );
         }

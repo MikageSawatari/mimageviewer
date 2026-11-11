@@ -5148,7 +5148,9 @@ mod delete_confirm_tests {
             GridItem::Image(PathBuf::from(r"C:\media\clicked.jpg")),
             GridItem::Image(PathBuf::from(r"C:\media\two.jpg")),
         ];
-        app.visible_indices = vec![2, 0, 1];
+        app.visible_indices = vec![0, 1, 2];
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.details_order = vec![2, 0, 1];
         app.checked.extend([0, 1, 2]);
 
         let target = app.context_menu_target(

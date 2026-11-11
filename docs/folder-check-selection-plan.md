@@ -392,3 +392,78 @@ cargo nextest run --build-jobs 1 -p mimageviewer --lib -E 'test(external_tool) |
 製品バイナリ起動・外部プロセスの実起動・実機確認・git commit/add/stash/reset/ブランチ切替は
 行っていない。headless UIとfake launcherだけを使い、実workerを通す試験もlaunch authorizationを
 与えない。依頼どおり `test-lib-full.ps1`／`build-dev.ps1` は実行していない。
+
+### 独立レビュー P2・P3 対応（2026-11-11、d59ba2fe1 への追補）
+
+独立レビューの ACCEPT WITH CHANGES の2件を修正した。
+
+- P2: `external_tool_context_menu_descriptor` は現在の表示列を同期で走査せず、checked の
+  index だけを列挙する。`idx_visible` で可視性を調べた候補列を既存の
+  `ordered_checked_indices`／`checked_external_target_index` へ通す。capabilityは順序を使わないので、
+  候補をHashSetの列挙順のまま渡してもよい。フォルダ除外の規則自体は引き続き共通関数が所有する。
+- P3: 準備経路の唯一のchecked現在項目への近道にも `idx_visible` を条件として加えた。
+  非表示のチェックを単独ターゲットへ読み替えず、resolver・capabilityと同じ空集合／対象なしにする。
+
+表示集合についての調査・判断:
+
+- 全表示項目への所属をO(1)で調べる既存集合は見つからなかった。既存の `App::idx_visible` は
+  昇順の `visible_indices` に二分探索するO(log V)の判定。`keep_set` や表示近傍・settle計測用の集合は
+  一覧全体を覆わず、`ViewerNavigationCaches` にも一覧の可視性を表す所属表はない。
+- 新しいHashSet／bitsetは持たない。メニュー1回の計算量はO(C log V)、一時候補列の追加メモリは
+  O(C)（C=チェック件数、V=可視件数）。全表示列のO(V)走査・複製は行わない。
+  専用集合なら照合をO(C)にできるが、全可視件数分のメモリと、一覧採用・再構築・削除・snapshot・
+  viewer context交換等での同期が必要になる。疎なチェックでは既存の二分探索で十分小さく、
+  状態を二重管理する費用と不変条件を増やす必要がないと判断した。
+- 通常の `rebuild_visible_indices_impl` はitemsをindex順に列挙して可視列を作り、最後にcheckedを
+  その可視列へretainする。CollectionRootは全itemsを可視化するため追加のretainは不要。
+  detached physicalの分岐も昇順の列を構築し、checkedをretainする。今回の判定はこのretainに
+  正しさを依存せず、表示外チェックが残る合成入力も明示的に除く。
+- `rebuild_details_order` は `visible_indices` のcloneをそのまま使うか、全indexから作った行を
+  sortして戻す。rating順保持も可視集合との積集合＋不足indexの追加なので集合は一致する。
+  resolver／準備だけが使う表示順と、capabilityが照合する昇順の可視集合は同じメンバーを持つ。
+
+到達できない不正な表現を渡した場合の限界:
+
+- 例: `visible_indices=[1,0]`（昇順という契約違反）や、Detailsで
+  `visible_indices=[1]`／`details_order=[0]`（同じ長さだが別集合）を手動で作れば、
+  二分探索によるcapability／単独近道と表示順resolverは一致しない場合がある。
+  上記の通常builderはこの表現を作らず、同期処理の途中に外部ツールhandlerを呼ばない。
+  これらの不変条件を毎回O(V)で検査する処理は追加しない。旧試験の逆順 `visible_indices` は
+  製品と同じ昇順可視列＋Detailsの表示順へ修正し、従来の対象順の期待値を維持した。
+
+追加テスト（`src/external_tool.rs`）:
+
+- `external_tool_menu_sparse_checks_visit_only_checked_candidates`: 可視64件／10万件それぞれの末尾
+  1件／4件をチェックし、Thumbnail／Details、GridContext／GridKeyで実descriptorを検査。
+  実際のチェック候補照合＋共通選別のentry訪問は画像選択で2C+1、末尾1件なら常に3回。
+  二分探索内部の比較回数はこのentry計数に含めない。計数は `cfg(test)` のthread-localだけで行い、
+  本番バイナリにはcounterも分岐も残さない。
+- `external_tool_hidden_checks_match_resolver_menu_and_preparation`: 報告の
+  `items=[Folder(A),Image(B)]`／表示`[1]`／checked`{0}`／selected`0`を含め、空表示・
+  非表示画像単独・非表示画像＋表示フォルダ・非表示フォルダ＋表示画像の5条件を、
+  Thumbnail／Details、GridContext／GridKeyの計20条件で検査する。3経路の対象とcapabilityを比較し、
+  対象なしの準備が選択なしのエラーになることも固定する。
+
+変更ファイルは `src/external_tool.rs`（実装・回帰・既存fixtureの不変条件修正）、
+`src/ui_dialogs/context_menu.rs`（既存の表示順fixtureのみ）、本書§7。製品UI文言・公開仕様の変更なし。
+最終検証（HEAD `d59ba2fe1` 上の未コミット差分、通常feature、dev/test profile、nextest
+0.9.148／default、retryなし、`MSBUILDDISABLENODEREUSE=1`）:
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0、32.58秒。既存警告あり。`check.log` |
+| 下記の焦点nextest | exit 0、追加2件すべて成功（0.981秒）、初回再コンパイル8分25秒。`focused.log`／`focused-junit.xml` |
+| `cargo nextest run --build-jobs 1 -p mimageviewer --lib -E 'test(external_tool) \| test(section1732)' --no-tests fail` | exit 0、128件すべて成功（17.992秒）。`related.log`／`related-junit.xml` |
+| 最後の `cargo fmt`（引数なし、workspace全体）／`cargo fmt --check` | exit 0、検証したRustソースのhashは不変。`format.log` |
+| `git diff --check` | exit 0 |
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE = '1'
+cargo nextest run --build-jobs 1 -p mimageviewer --lib -E 'test(external_tool_menu_sparse_checks_visit_only_checked_candidates) | test(external_tool_hidden_checks_match_resolver_menu_and_preparation)' --no-tests fail
+cargo nextest run --build-jobs 1 -p mimageviewer --lib -E 'test(external_tool) | test(section1732)' --no-tests fail
+```
+
+ログとJUnitは `target/section1732-review-fixes/`。実行済み集合を照合し、焦点2件は関連128件の
+部分集合である（130件とは数えない）。製品UI文字列は変更していない。製品バイナリ起動・
+外部プロセスの実起動・git commit/add/stash/reset/ブランチ切替は行っていない。
+全lib gateとbuild-devは前回と同じく設計担当への引き継ぎとし、本追補では実行していない。
