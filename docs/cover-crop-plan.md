@@ -1,9 +1,9 @@
 # §1.764 書庫の代表サムネイルに使う表紙範囲 (設計)
 
-- 状態: 設計中 (2026-11-11)。独立設計レビュー前。ブランチ `feat-764-cover-crop`。
+- 状態: 設計中 (2026-11-11)。独立設計レビュー r1 = REVISE (指摘と対応は §14)。r2 待ち。ブランチ `feat-764-cover-crop`。
 - 要件の正本: [next-release-backlog.md §1.764](next-release-backlog.md)。
-- 段階: **第 1 段 = 手動の範囲指定** (この文書の §2〜§11)、**第 2 段 = 自動切り出し** (§12、第 1 段の後で詳細化して別にレビュー)。
-  手動だけでも ZipPla からの移行の用は足り、自動は誤判定の調整に時間がかかり得るため。
+- **リリース条件 (利用者決定 2026-11-11)**: 手動と自動の両方がそろってから出す (ZipPla が自動のため)。
+  実装の順は手動 (§2〜§11) → 自動 (§12)。次の版に間に合わなければ、その次の版に回す。
 - 既定の割り切り: まれな失敗 (DB の読み書き失敗・処理途中の強制終了など) はログ + 通知で割り切る (CLAUDE.md)。
 - 関連: [表示パイプライン §1.3〜1.5](display-pipeline.md#13-ワーカー側の流れ)、
   [仮想フォルダ §3.1.1](virtual-folders.md#311-親コンテナの代表サムネピン-folder-thumb-pinv09x)、
@@ -13,7 +13,7 @@
 
 - 表表紙・背・裏表紙・折り返しが 1 枚につながった画像から、表表紙の部分だけを親コンテナ
   (フォルダ / ZIP / PDF (EPUB 含む) / 変換アーカイブ / ZIP 内の ZipDir) の**代表サムネイル**にする。
-- 範囲は代表サムネイル専用。元画像、閲覧時の表示、本の中の各ページのサムネイル、編集・書き出しには適用しない。
+- 範囲は代表サムネイル専用。元画像、閲覧時の表示、本の中の各ページのサムネイル、編集・書き出し、類似画像の索引には適用しない。
 - 手動の範囲指定 (指定・変更・解除) と、設定で有効にする自動切り出し (既定 OFF)。手動が自動より優先。
 - 自動が OFF で手動の範囲が無ければ、今の表示と完全に同じ (cache key も変えない)。
 
@@ -21,277 +21,389 @@
 
 - 手動ピンは `src/folder_thumb_pins.rs` (`folder_thumb_pins.db`、**リリース済み**)。`App::apply_folder_thumb_pin`
   (`src/app.rs`) が `LoadRequest` を leaf 用に書き換え、cache key は `{base_key}#pin:{source_id}`。
-  `source_id` は直接 leaf なら `kind|rel|entry|page|mtime|size` の compact 表現、cascade なら
-  `cascade:{route_hash}:{leaf_source_id}` (`finalize_cascaded_source_id`)。
-- ピンの記録の書き手は `FolderThumbPinDb::{set, remove}` のほか、SQL を直接書く
-  `metadata_transfer.rs` (取り込み)、`rename_key_migration.rs` (`source_rel` の付け替え)、
-  `zip_key_migration.rs` (`source_entry` の付け替え・行の移し替え)。行の変更は trigger で
-  `folder_thumb_pin_revision` を進め、フォルダ代表の選定証明 (`lookup_for_selection`) を失効させる。
-- 一覧の回転は描画時の GPU 行列。§1.718 以降、本のタイルは `Loaded` の `CoverIdentity::Page(key)` (表紙ページの回転キー)
-  で角度を引く。画素に回転は焼き込まない。
-- 固定 leaf が Image / ZipEntry / PdfPage なら、その編集プレビュー (`edit_preview_cache`) と個別色調補正が
-  親タイルへ引き継がれる (display-pipeline §1.3.1 末尾)。編集プレビューは収録範囲
-  `SourceCoverage::Known(EditPreviewGeometry)` を持つ (§1.165 B1、旧行は `Unknown`)。
-- mIV Remote (`src/remote_ipc/thumbnail.rs` の `apply_supported_folder_pin`) は自前で固定 leaf の要求を組み、
-  `resolved.source_id` から同じ形の key を作って**同じ catalog に保存する**。
-- フォルダの自動代表の選定は、子フォルダの Image ピンをその画像として直接読む
-  (`thumb_loader.rs` の候補組み立て、非 Image の子ピンだけ子の WebP を読み取り専用で再利用する)。
+  `source_id` は直接 leaf なら `kind|rel|entry|page|mtime|size`、cascade なら `cascade:{route_hash}:{leaf_source_id}`。
+  ZipDir の ZipEntry ピンだけは `zipdir:{prefix}#pin:{entry}` の別綴り (app.rs:102641 / :39963)。
+- ピンの記録の書き手は `FolderThumbPinDb::{set, remove}`、SQL を直接書く `metadata_transfer.rs`・`rename_key_migration.rs`・
+  `zip_key_migration.rs`・`image_folder_zip_metadata.rs`。行の変更は trigger で `folder_thumb_pin_revision` を進め、
+  フォルダ代表の選定証明 (`lookup_for_selection`) を失効させる。
+- 一覧の回転は描画時の GPU 行列。§1.718 以降、本のタイルは `Loaded` の `CoverIdentity::Page(key)` で角度を引く。
+- 固定 leaf の編集プレビューと個別色調補正は親タイルへ引き継がれる (display-pipeline §1.3.1 末尾)。
+- mIV Remote は Image / Folder のピンだけを自前で解決し (`apply_supported_folder_pin`)、**本体と同じ catalog に保存する**。
+  ZIP / PDF / ZipDir の本のタイルは別の経路 (`remote_ipc/container.rs`) で基本 key と先頭画像を使い、ピンを見ない。
+- フォルダの自動代表の選定は、子フォルダの Image ピンをその画像として親の自動代表の行へ直接デコードする (thumb_loader.rs:5494)。
+- 縮小前の raster は類似画像索引へも渡る (`similar_index::offer_thumbnail_raster`、thumb_loader.rs:6332)。
 
 ## 2. 方針の要点
 
-1. **範囲はピンの記録の一部にする** (`folder_thumb_pins` の行に列を足す)。所有者は 1 つで、
-   既存の cascade・選定証明の revision・名前変更の付け替え・metadata の取り込み/書き出しに自然に乗る。
-2. **範囲の指定は、その画像を代表に固定することを兼ねる**。範囲を持てるのは leaf (画像 1 枚) を指すピンだけ
-   (Image / ZipEntry / PdfPage。変換アーカイブ・ネスト ZIP の entry、EPUB のページを含む)。
-   自動選定の代表は中身の追加で変わり得るので、範囲だけを残すと別の画像に当たる。
-3. **範囲は `ResolvedPinTarget` が leaf と一緒に運び、`source_id` に範囲を含める**。cache key が範囲ごとに変わるので、
-   範囲の変更・解除で古い WebP を自然に外せる。cascade (A → B → leaf) では B の範囲が A のタイルにも効く
-   (「A は B と同じ代表を出す」を保つ)。
-4. **範囲を含む key の行には、その範囲で切り出した画素だけを書く** (§5 の不変条件)。
-   key を作る処理と切り出しの指示を、同じ値 (`ResolvedPinTarget`) から同時に作る。
-5. **切り出しは thumbnail worker で、デコード後・縮小前に 1 か所で行う**。縮小済みのサムネを切らない。
-   デコード解像度は「切り出した範囲が表示寸法に足りる」ように選ぶ。
-6. **範囲の座標は、leaf の元画像の EXIF 適用後・編集前・保存回転前の正規化座標**
-   (既存の切り取り `export_crop` と編集プレビューの収録範囲と同じ空間)。描画時の回転 (§1.718) は切り出した画素に
-   そのまま掛かるので、表示と一致する。
-7. **範囲指定の画面はモーダル**。開いている間は他の操作を受け付けない。
+1. **範囲はピンの記録の一部にする** (`folder_thumb_pins` の行に列を足す)。範囲を持てるのは leaf (画像 1 枚) を指すピンだけ
+   (Image / ZipEntry / PdfPage。変換アーカイブ・ネスト ZIP の entry、EPUB のページを含む。RAW・動画は除く)。
+2. **範囲の指定は、その画像を代表に固定することを兼ねる** (自動選定の代表は中身の追加で変わり得るため)。
+3. **範囲は `ResolvedPinTarget` が leaf と一緒に運び、pinned key の `source_id` に範囲を含める**。
+   key と切り出しの指示は同じ値から 1 つの helper で同時に作る (§5)。
+4. **切り出しは thumbnail worker で 1 か所**: 元寸法の確定と類似画像索引への受け渡しの後、縮小の前 (§6)。
+5. **範囲で切る代表は元画像から作る** (編集プレビューは使わない。§6.3、利用者確認 §13-4)。
+6. **座標は leaf 元画像の EXIF 適用後・保存回転前の正規化座標**。描画時の回転 (§1.718) はそのまま掛かる。
+7. **範囲指定の画面はモーダル**。代表の解決と画像の読み込みは 1 つの worker 仕事 (§8)。
+8. **自動切り出しは記録を作らない派生値**。設定と版を key に含め、判定できないときは切らない (§12)。
 
 ## 3. 状態を減らす検討 (CLAUDE.md「設計の簡素化」)
 
-- **範囲指定の画面をモーダルにする** (採用)。開いている間にフォルダ移動・ピンの変更・回転・別ウィンドウ操作が
-  入らないので、「指定中に代表や回転が変わった」組み合わせを扱わない。画像の読み込みは worker だが、
-  画面が開いている間だけの 1 件で、閉じたら結果を捨てる。
-- **範囲をピンとは別の表・別の DB に持つ案は採らない**。名前変更・ZIP キー移行・取り込みの全書き手に
-  もう 1 つの表の同期を足すことになり、ずれると別の画像に範囲が当たる。同じ行なら行の移動に範囲が付いてくる。
-- **範囲付きの代表だけ別の cache 方式にする案は採らない**。key に範囲を含めれば、既存の cache・失効・`delete_missing`
-  の存続集合の仕組みをそのまま使える。範囲の変更で表示中のタイルを作り直す専用処理は持たず、既存のピン変更の経路
-  (`folder_thumb_pin_dirty` → 一覧の読み直し) に乗せる。
-- **画素に回転を焼き込まない** (§1.718 と同じ)。範囲は回転前の座標で持ち、回転は描画時に掛ける。
-  回転を変えても範囲・画素は作り直さない。
-- **範囲の解除はピンを残す**。範囲だけを外す操作と、既存の「固定の解除」(行ごと削除 = 範囲も消える) の 2 つにする。
-  「範囲を付けたときに自動で固定したか」の記録は持たない (状態を増やすため)。
-- **自動切り出し (第 2 段) は範囲の記録を作らない**。設定と leaf から毎回決まる派生値として key に含めるだけにし、
-  手動の範囲と同じ列に書かない。
+- **範囲指定の画面をモーダルにする** (採用)。指定中にフォルダ移動・ピンの変更・回転・別ウィンドウ操作が入らない。
+- **代表の解決と画像の読み込みを 1 つの worker 仕事にする** (採用、r1 指摘 5)。「解決済み・未読み込み」の中間状態を持たない。
+- **範囲付きの代表は編集プレビューを使わない** (推奨、§13-4)。収録範囲 Known / Unknown・共通部分の有無・注釈レイヤーの切り出し・
+  画面の表示と結果の不一致 (r1 指摘 7) の組み合わせを丸ごと消す。代償は、範囲を付けた表紙のタイルに消しゴム・注釈・編集の
+  切り取りが出ないこと (個別色調補正は出る)。
+- **RAW の leaf には範囲を付けない** (r1 指摘 10)。埋め込み preview と half 現像の画角の違いを扱わない。本の表紙に RAW は使われない。
+- **範囲をピンとは別の表に持たない**。名前変更などの書き手と行の移動に範囲が付いてくる。旧版との取り違えは束縛列で防ぐ (§4.2)。
+- **範囲の解除はピンを残す**。「範囲を付けたときに自動で固定したか」の記録は持たない。
+- **範囲の変更で表示中のタイルを作り直す専用処理を持たない**。既存のピン変更の経路 (`folder_thumb_pin_dirty` → 読み直し) に乗せる。
+- **自動の結果を記録しない**。key に版・設定を含め、判定は worker の純粋関数にする。
+- **自動は本ごとの綴じ方向を読まない** (§12.4)。読むには一覧の時点で本ごとの設定を引く仕組みが要る。試作では、綴じ方向は
+  僅差のときの加点にしか使わず、取り違えても結果がほぼ変わらなかった (§12.6)。
 
 ## 4. データ: 範囲の型と永続化
 
 ### 4.1 型
 
 ```rust
-/// 代表サムネ専用の切り出し範囲。leaf 元画像の EXIF 適用後・編集前・保存回転前の正規化座標。
-/// 単位は 1/1_000_000 (ppm)。0 <= x0 < x1 <= 1_000_000、y も同じ。
+/// 代表サムネ専用の切り出し範囲。leaf 元画像の EXIF 適用後・保存回転前の正規化座標 (1/1_000_000 単位)。
 pub(crate) struct CoverCrop { x0: u32, y0: u32, x1: u32, y1: u32 }
 ```
 
-- 整数で持つ (cache key の綴りと DB 値を安定させるため。浮動小数の丸め差で key が揺れない)。
-- 検査 (`CoverCrop::new`): 範囲内・順序・各辺の長さが 1% (10_000) 以上。全体 (0,0)-(1e6,1e6) は「範囲なし」に正規化して `None`。
-- 画素への写像は 1 つの関数 (`pixel_bounds(width, height)`、min=floor・max=ceil、`CropRect::pixel_bounds` と同じ丸め)。
-  PDF の再レンダや RAW の preview / half 現像で raster 寸法が変わっても、正規化座標なので意味は変わらない。
+- 整数で持つ (cache key と DB 値を安定させる)。検査: 範囲内・順序・各辺 1% (10_000) 以上。全体は「範囲なし」(`None`)。
+- 画素への写像は 1 つの関数 `pixel_bounds(width, height)` (min=floor・max=ceil、`CropRect::pixel_bounds` と同じ丸め)。
 
 ### 4.2 `folder_thumb_pins` の列追加 (リリース済み DB → 加法 migration)
 
-- 列 `cover_crop_x0 / cover_crop_y0 / cover_crop_x1 / cover_crop_y1 INTEGER` (NULL 可) を足す。
-  `init_schema` の既存の IMMEDIATE transaction の中で `pragma table_info` を見て、無い列だけ `ALTER TABLE ... ADD COLUMN`。
-  既存行は全部 NULL = 範囲なし。**行を消さない・作り直さない**。表の版番号は持っていないので足さない
-  (既存の revision 表・trigger の追加と同じ加法方式)。
-- 4 列すべて NULL = 範囲なし。一部だけ NULL・値の検査に落ちる行は、ログを出して**範囲なしとして扱い、ピンは有効のまま**
-  (手書きの汚染など、まれな異常。行は書き換えない)。leaf でないピン (Folder 等) に範囲がある行も同じ。
-- 読み取り専用の open (`open_readonly`、prepare worker) は schema を作らない。列が無い DB (旧版が作った DB を
-  新版の migration 前に読む経路があれば) では範囲なしとして読む。列の有無の判定は catalog の layout 列と同じ方式。
-- **旧版の動き**: 旧版は列名を明示して SELECT / INSERT するので、追加列を無視して従来どおり動く。
-  旧版の `set` の UPSERT は範囲の列を書き換えないため、「新版で範囲を指定 → 旧版に戻して別の画像を固定 → 新版に戻す」と、
-  古い範囲が新しい画像に当たる。版を戻して固定を付け替える、まれな操作なので割り切る (範囲を指定し直すか解除すれば直る)。
-  新版の書き手は必ず範囲も一緒に書く (§4.3)。
+- 列 `cover_crop_x0 / _y0 / _x1 / _y1 INTEGER` と、**束縛列 `cover_crop_source TEXT`** (範囲を書いたときの source の
+  正規化表現 `kind|rel|entry|page`) を足す。`init_schema` の既存の IMMEDIATE transaction 内で `pragma table_info` を見て
+  無い列だけ `ALTER TABLE ... ADD COLUMN`。既存行は NULL = 範囲なし。行を消さない・作り直さない。
+- **範囲が有効なのは、5 列がそろい、値が検査を通り、`cover_crop_source` が今の行の source と一致し、source が leaf のときだけ**。
+  それ以外はログを出して範囲なしとして扱い、ピンは有効のまま (行は書き換えない)。
+  - 旧版が `set` で別の画像へ固定し直しても、束縛が一致しないので古い範囲は当たらない (r1 指摘 6)。
+  - 旧版の名前変更 (`source_rel` だけを書き換える) の後も束縛が外れて範囲なしになる (範囲は失われる側に倒れる)。
+- 読み取り専用の open (`open_readonly`) は schema を作らない。列の無い DB では範囲なしとして読む (catalog の layout 列と同じ方式)。
+- 別プロセス (mIV Remote) の `open` も同じ `init_schema` を通る (同じ版の exe なので列の追加が重なっても IMMEDIATE で直列化される)。
 
 ### 4.3 書き手
 
 | 書き手 | 範囲の扱い |
 | --- | --- |
-| `FolderThumbPinDb::set(container, source)` (既存の「固定」) | **範囲を NULL にする** (別の画像に固定し直したら古い範囲は無効)。同じ画像を固定し直した場合も範囲を消す (今の「固定」操作の意味を「範囲なしの固定」に揃える) |
-| 新 `set_with_cover_crop(container, source, Option<CoverCrop>)` | ピンと範囲を 1 回の UPSERT で書く。source が leaf でなければ範囲付きの書き込みを拒否する |
-| 新 `clear_cover_crop(container)` | 範囲の列だけ NULL にする。ピンは残す |
-| `remove(container)` | 行ごと削除 (範囲も消える) |
-| `rename_key_migration` の `source_rel` 付け替え / `zip_key_migration` の `source_entry` 付け替え | 同じ leaf の名前変更なので**範囲を保つ** (UPDATE なので列はそのまま残る)。`zip_key_migration` の行の移し替え (INSERT) は範囲の列も写す |
-| `metadata_transfer` の取り込み (`insert_folder_pin`) / 書き出し | 範囲も運ぶ (§4.4) |
-
-- 列が増えるとこれらの UPDATE / DELETE / INSERT でも trigger が revision を進めるので、範囲の変更でフォルダ代表の
-  選定証明が失効する (子の Image ピンの範囲を変えると、親の自動代表も選び直される)。
+| `FolderThumbPinDb::set(container, source)` (既存の「固定」) | 範囲と束縛を NULL にする (同じ画像の固定し直しでも消す) |
+| 新 `set_with_cover_crop(container, source, Option<CoverCrop>)` | ピン・範囲・束縛を 1 回の UPSERT で書く。source が leaf でない・RAW・動画なら拒否 |
+| 新 `clear_cover_crop(container)` | 範囲と束縛だけ NULL。ピンは残す |
+| `remove(container)` | 行ごと削除 |
+| `rename_key_migration` の `source_rel` 付け替え、`zip_key_migration` の `source_entry` 付け替え・行の移し替え、`image_folder_zip_metadata` の行の写し替え | 同じ leaf の名前変更なので、**束縛列も同じ規則で付け替えて範囲を保つ** |
+| `metadata_transfer` の取り込み・書き出し | §4.4 |
 
 ### 4.4 metadata の書き出し・取り込み
 
 - `PortableFolderThumbPin` に `cover_crop: Option<[u32; 4]>` を足す (`serde(default, skip_serializing_if = "Option::is_none")`)。
-  範囲は利用者が作ったデータなので、別環境への移行で失わないようにする。
-- 取り込み時も §4.1 の検査を通し、不正なら範囲だけを捨ててピンは取り込む (その旨を skip 理由と同じ形で報告)。
-- bundle の `FORMAT_VERSION` は module の既存の規則に従って上げる (今は 12、AI 説明文で上げた版はリリース済み)。
-  同じ開発周期の別ブランチが既に 13 を使っていれば、それに相乗りする (merge 時に確認)。
+  取り込みでは束縛列を取り込む行の source から作る。不正な範囲は範囲だけ捨ててピンは取り込み、skip 理由として報告する。
+- `FORMAT_VERSION` を 13 に上げ、**受け入れる版の列挙 (metadata_transfer.rs:4204 / :4291) には 12 以前を残す** (r1 指摘 9)。
+  12 以前の bundle は `cover_crop = None` として読む。同じ開発周期の別ブランチが 13 を使っていれば相乗りする。
 
-## 5. 解決と cache key (不変条件)
+## 5. 解決と cache key
 
-**不変条件 K**: cache key に範囲の identity を含む行には、その範囲で切り出した画素だけが入る。
-範囲の無い key の行に、切り出した画素を入れない。
+### 5.1 不変条件 K (r1 指摘 3 で範囲を確定)
 
-- `FolderThumbPinDb::lookup / lookup_many / lookup_for_selection` は `FolderPinSource` ではなく
-  `FolderPin { source, cover_crop: Option<CoverCrop> }` を返す (型を変えて全呼び出し元をコンパイラで列挙する)。
-  `App::folder_pin_map` も同じ型。UI の「今の固定と同じか」の比較 (固定 / 解除のトグル表示) は `source` だけで比べる。
-- `resolve_pin_target_*` の各段は pin の記録 (`FolderPin`) を受け、leaf に解決した段の範囲を
-  `ResolvedPinTarget.cover_crop` に入れ、その段の `source_id` の末尾に `|crop:{x0},{y0},{x1},{y1}` を足す。
-  cascade の route hash は各段の `source_id` から作るので、範囲の変更で親の key も変わる。
-  非 leaf に解決した段の範囲は §4.2 の異常として無視する。
-- **key と切り出しの指示は同じ値から同時に作る**: `ResolvedPinTarget` の `source_id` と `cover_crop` を外から別々に
-  読み書きさせず、「pinned key を作る」helper と「`LoadRequest` に leaf を設定する」helper の 2 つだけが参照する
-  (field を非公開にし、`LoadRequest` への設定は 1 つの関数で key と `cover_crop` を同時に入れる)。
-  今は pinned key の綴りが次の各所に分かれているので、この helper に寄せる:
-  `apply_folder_thumb_pin` (app.rs)、`apply_supported_folder_pin` (remote)、フォルダ自動代表の候補
-  (thumb_loader.rs の `#pin:` を組む 2 か所)、`folder_thumb_existing_keys_for*` (app.rs)、ZipDir の存続 key
-  (app.rs の zip_nav 用、`#pin:{entry}` の別綴り)、smart folder・collection・pin_materialization の key 照合。
-  一覧は §7 の表で網羅する。
-- `epub_pin_fallback` (ピンが除外・EPUB が読めないときの代替要求) は `base_req` の複製なので範囲を持たない。
-- 範囲の無いピンの `source_id` は今と同じ (既存の WebP をそのまま使う)。範囲を付けた leaf だけ key が変わる。
+- **K1 (leaf の pinned 行)**: pinned key (直接 leaf・cascade・ZipDir の ZipEntry ピン・ドライブ一覧の pinned key) の行には、
+  その key が表す「実効の範囲」(leaf を指す段の範囲) で切り出した画素だけを入れる。範囲が違えば key が違う。
+- **K2 (自動代表の行)**: フォルダの自動代表 (`folderthumb:auto-v3…`、`AutoSelected`) の行は、key ではなく**検証済みの選定証明**が
+  由来を保証する (今の契約のまま)。子の Image ピンの範囲で切った画素を含んでよい。範囲の変更は pin store の revision を進め、
+  証明を失効させる。
+- **K3 (自動切り出しの行)**: 自動切り出しの identity (§12.4) を含む key の行には、その版・設定の判定結果 (切らない場合は元のまま) だけを入れる。
+- 行をコピーする経路は、コピー元とコピー先の key が同じ実効の範囲・同じ自動 identity を表す場合だけコピーする (§7)。
+
+### 5.2 key の綴り
+
+- 直接 leaf の `source_id`: 範囲なしは今と同じ `kind|rel|entry|page|mtime|size`。範囲ありは
+  **`kind|rel|entry|page|crop:x0,y0,x1,y1|mtime|size`** (範囲を page の直後に置く。r1 指摘 2 の前方一致の分離のため)。
+- cascade: 各段の `source_id` から route hash を作るので、leaf 段の範囲が親の key に効く。
+- ZipDir の ZipEntry ピン: 範囲なしは今の `zipdir:{prefix}#pin:{entry}`、範囲ありは `…#pin:{entry}|crop:x0,y0,x1,y1`。
+- 範囲の無い key は今と完全に同じ (既存 WebP をそのまま使う)。
+- 前方一致で行を探す経路 (ドライブ一覧の `drive_list_pinned_cache_key_prefix`) は、実効の範囲の部分まで含めた接頭辞で探し、
+  範囲なしで探すときは残りが `crop:` で始まる行を除く。
+
+### 5.3 所有者
+
+- `lookup / lookup_many / lookup_for_selection` は `FolderPin { source, cover_crop: Option<CoverCrop> }` を返す
+  (束縛の検査はここで済ませる)。`folder_pin_map` も同じ型。UI の固定 / 解除のトグル判定は `source` だけで比べる。
+- `resolve_pin_target_*` は leaf 段の範囲を `ResolvedPinTarget` に入れ、その段の `source_id` を §5.2 の形にする。
+- **key と切り出しの指示を外から別々に書かせない**: `ResolvedPinTarget` の `source_id` と `cover_crop` は非公開にし、
+  (a) pinned key を作る helper、(b) `LoadRequest` に leaf を設定する helper (key と `cover_crop` を同時に入れる) の 2 つだけが読む。
+  §7 の表の pinned key の綴りは全部この helper に寄せる (ZipDir の別綴り・存続 key・ドライブ一覧・Remote・自動代表の候補・
+  collection の digest・色フィルタ)。
+- 自動切り出しの identity の付与も 1 つの関数 (今の `representative_cache_key_for_policy` と同じ層) に置く (§12.4)。
 
 ## 6. worker での切り出し
 
-- `LoadRequest` に `cover_crop: Option<CoverCrop>` を足す (§5 の helper だけが設定する)。後段の `ResolvedRead` まで運ぶ。
-  フォルダ自動代表の候補が子の Image ピン (範囲付き) を直接読む場合は、その候補の `ResolvedPinTarget.cover_crop` を
-  `ResolvedRead` に入れる (要求の `cover_crop` ではなく、選んだ候補の値)。
-- **切り出しは 1 か所**: 元画像のデコード (EXIF 適用後) の直後、表示寸法への縮小の前。`CoverCrop::pixel_bounds` で
-  画素範囲を求めて切り、その後は今の縮小・WebP 保存へ進む。
-- **デコード解像度**: 縮小目標 `display_px` は切り出した範囲の長辺に掛かるので、全体のデコード目標を
-  `display_px × (全体の長辺 / 範囲の長辺)` に広げる (元画像の寸法を超えない、既存の上限に従う)。
-  JPEG の DCT 縮小 (`pick_dct_scale_num`)、PDF の render 寸法、RAW の preview / half 現像の判定、WIC の縮小デコードが
-  この目標を受け取る。範囲なしでは目標は今と同じ。
-- **編集プレビュー** (固定 leaf の `edit_preview_key`): 収録範囲が `Known(geometry)` のときは、範囲を
-  `geometry.source_uv_rect()` との共通部分として preview の raster 座標へ写し、下地と全注釈レイヤーを同じ境界で切ってから
-  縮小・合成する。共通部分が空、または `Unknown` (旧行) のときは編集プレビューを使わず元画像から切り出す
-  (旧 preview がどこを収録しているか分からないため)。今の `load_for_container(..., display_px)` は保存サイズ (最大 2048) から
-  `display_px` へ縮めて返すので、範囲付きの場合は保存サイズのまま切ってから縮める経路を足す (縮小済みを切らない)。
-- **個別色調補正** (固定 leaf の補正 key): 今と同じく切り出し・縮小後の下地へ適用する。
-- **寸法**: 親タイルへ返す `source_dims` は `CoverCrop::pixel_bounds(元画像の寸法)` の幅・高さ (JPEG の DCT 縮小でも
-  元寸法から計算)。`layout_dims` (PDF の page box) は `None` にする (縦横比は切り出した raster が持ち、page box の比で
-  縮小させると範囲の比が崩れるため)。catalog の行にも同じ値を保存する。タイルの縦横比は切り出した範囲になる。
-- **表紙 identity** (§1.718): `CoverIdentity::Page(leaf のページキー)` のまま。描画時に leaf の角度で回るので、
-  回転前の座標で切った画素が表示と一致する。
-- RAW half の再投入・idle quality-upgrade (`SourceOnly`) は要求を作り直す/引き継ぐので範囲も運ぶ。
-  `CacheOnly` は範囲付きの key で引くだけ (miss なら今と同じく元ソースを開かない)。
-- 動画のピン (`video_pins.db` の WebP を seed する経路) は範囲の対象外 (§4.3 の書き込みで拒否)。
+### 6.1 入力
+
+- `LoadRequest.cover_crop: Option<CoverCrop>` (§5.3 の helper だけが設定) を `ResolvedRead` まで運ぶ。
+- フォルダ自動代表が子の Image ピン (範囲付き) を直接読む場合は、`FolderThumbResolution::Image` に子の範囲を足し、
+  `ResolvedRead` に入れる (K2)。
+- **種類除外・EPUB 読めずの代替要求** (`epub_pin_fallback`、thumb_loader.rs:3188): 今は代替要求に元の pinned key を付け直して
+  保存する (:4963)。**元の要求が範囲付き (または §12 の自動 identity 付き) の場合は付け直さず、代替要求自身の key で保存・参照する**
+  (r1 指摘 1)。範囲付きの pinned key の行は作られないので、次回も pinned key が miss → 除外を再判定 → 代替要求の key で
+  cache hit になる (費用は cache の参照 1 回分)。代替画像に範囲を引き継がない。
+
+### 6.2 切り出しの位置と解像度
+
+- 順序: デコード → EXIF 適用 → 元寸法の確定 → 類似画像索引への受け渡し (`offer_thumbnail_raster`、元画像のまま) →
+  **切り出し** → 縮小 → WebP 保存 (r1 指摘 4)。同じ raster を使う他の consumer も切り出し前に済ませる (実装時に列挙して確認)。
+- デコード解像度: 縮小目標は切り出した範囲の長辺に掛かるので、全体の目標を `display_px × (全体の長辺 / 範囲の長辺)` に広げる
+  (元寸法・既存の上限を超えない)。JPEG の DCT 縮小 (`thumbnail_jpeg_decode_target`)、PDF の render 寸法
+  (`thumbnail_pdf_render_target`)、WIC の縮小デコードが受け取る。範囲なしでは今と同じ。
+- 返す寸法: `source_dims` = `CoverCrop::pixel_bounds(元寸法)` の幅・高さ、`layout_dims` = `None`
+  (縦横比は切り出した raster が持つ)。catalog の行にも同じ値を保存する。
+- 表紙 identity (§1.718): `CoverIdentity::Page(leaf のページキー)` のまま。回転前に切った画素が描画時に回るので表示と一致する。
+- 見開きの寸法記録 (`record_*_dims_for_spread`) には、範囲で切った結果の寸法を渡さない (ページの寸法ではない)。
+- idle quality-upgrade・`CacheOnly` は範囲付きの key をそのまま使う。RAW は範囲の対象外 (§3)。
+
+### 6.3 編集プレビュー (推奨案、§13-4 で利用者確認)
+
+- **範囲で実際に切る要求 (手動の範囲、または自動が切ると判定した場合) は、編集プレビューを使わず元画像から作る**。
+  個別色調補正 (`pinned_page_adjustment_key`) は今と同じく縮小後の下地に掛ける。範囲指定の画面も元画像を表示するので、
+  画面と結果が一致する。
+- 自動が「切らない」と判定した場合は、今と同じく編集プレビューを優先する (自動 OFF と同じ表示)。
+- 代案 (採らない場合): 収録範囲が Known の preview を、範囲と収録範囲の共通部分で下地・全注釈とも切り、寸法・coverage を
+  実効矩形から一括で作る。Unknown・非交差は元画像。画面は preview を元画像の座標に置いて表示し、選べる範囲を収録範囲に制限する。
 
 ## 7. 一覧・各経路への波及
 
-### 7.0 経路の網羅 (2026-11-11 のコード調査。行番号は c4e92e5df)
+### 7.1 経路の網羅 (2026-11-11 のコード調査。行番号は c4e92e5df)
 
-| 経路 | 今の作り | 範囲の扱い |
+| 経路 | 今の作り | 範囲・自動の扱い |
 | --- | --- | --- |
-| 通常一覧の要求 `make_load_request_with_visibility` → `apply_folder_thumb_pin` (app.rs:102487 / :103196)。呼び出し: 自動比率の seed、優先/hover、keep range、idle upgrade | `resolved.source_id` から pinned key | §5 の helper で key と `cover_crop` を同時に設定 |
-| ZipDir 分岐の ZipEntry ピン (app.rs:102641) と ZIP 一覧の存続 key (:39963) | `zipdir:{prefix}#pin:{entry}` (source_id を使わない別綴り) | 範囲なしは今の綴りのまま。範囲付きだけ同じ helper で `|crop:` を付ける。存続 key も同じ helper |
-| 存続 key `folder_thumb_existing_keys_for*` (app.rs:102909 / :102933) と各呼び出し元 (フォルダ・タグ・favsearch・履歴・★一覧・rating_view・pin_materialization) | cascade を解決して key を作る | helper 経由で範囲付き key を返す (`delete_missing` で範囲付きの行を毎回消さない) |
-| フォルダ自動代表の候補 (thumb_loader.rs:5279〜) | 子の Image ピンは `FolderThumbResolution::Image(path)` として親の行に直接デコード。非 Image の子ピンは子の pinned WebP を読み取り専用で流用 (:5059、key は `source_id` から) | `FolderThumbResolution::Image` に範囲を足し、親の自動代表の行にも切り出した画素を書く。流用の key は helper。親の行の選定証明は pin store の revision を持つので、子の範囲の変更で失効する |
-| 子ピンの drive 一覧向け送出 `send_pinned_child_folder_cached` (thumb_loader.rs:2687) | lookup + cascade | helper |
-| ドライブ一覧の seed `drive_list_pin_seed_entry` (app.rs:46184) | Image ピンは**ページの行**の画素を pinned key へ写す。key は解決せず `kind|rel|entry|page|` の前方一致 (`drive_list_pinned_cache_key_prefix`、:102116〜) | **範囲付きのピンではページ行からの seed をしない** (不変条件 K)。前方一致は範囲の部分まで一致する行だけを採る (範囲なしのピンが範囲付きの行を拾わない、逆も同じ)。worker の `send_pinned_only_cached` も同じ |
-| 仮想フォルダの seed / writeback (app.rs:42961) | 本の**基本 key** (`zipthumb:` 等) ⇔ 先頭ページ行。pinned key は使わない | 影響なし (範囲は pinned key だけ) |
-| 動画の seed (app.rs:45976、smart_folder・pin_materialization・everything metadata) | 動画ピンの WebP を pinned key へ | 動画は範囲の対象外 (書き込みで拒否) |
-| 本棚・AI 説明文・MCP `item_info` の表紙解決 `resolve_book_cover` (book_cover.rs:133) | 一覧と同じ計画で leaf の位置を返す | 位置だけを使うので範囲は付けない (§7.1)。範囲指定の画面 (§8.2) はこれで leaf を得る |
-| コレクション (collection_grid.rs:485 / 再利用 key の digest :286) | `lookup_many`、digest は `FolderPinSource` の各 field を hash | digest に範囲も含める (範囲の変更で再利用 key が変わる) |
-| 色フィルタ (color_filter.rs:692〜 / :844) | pin を Debug 表記で hash、ZIP/PDF は `apply_folder_thumb_pin` を直接呼ぶ | 型が `FolderPin` になれば hash に範囲が入る。要求は helper 経由なので切り出した表紙の色になる |
-| スマートフォルダ・サブフォルダ展開・Everything 検索の pin map (smart_folder.rs:6951、subfolder_expansion.rs:1569、global_search_ui) | `lookup_many` → `folder_pin_map` → 通常の要求 | 型変更に追従するだけ |
-| mIV Remote `apply_supported_folder_pin` (remote_ipc/thumbnail.rs:1008) | Image / Folder の leaf だけ自前で要求を組み、同じ catalog に保存 | **helper 経由で範囲も設定する** (しないと範囲付き key に切り出していない画素を書く)。回転は Remote 側が CPU で掛けているので、回転前に切った画素で一致する |
-| metadata の書き出し・取り込み (metadata_transfer.rs:3761 / :6190) と取り込み後の再読込 (metadata_import_refresh.rs:488) | 4 列を明示して読み書き | §4.4 |
-| 名前変更・ZIP キー移行・画像フォルダ→ZIP 変換の行コピー (rename_key_migration.rs:2600、zip_key_migration.rs:148 / :288、image_folder_zip_metadata.rs:201) | source の列を付け替え・行を写す | 範囲を保つ。行のコピーが列を列挙していれば範囲の列も写す (実装時に確認) |
-| UI の固定状態 (固定ボタン・右クリックの固定/解除・「ピ」バッジ・`GridPin` / `FsPin` キー・ゲームパッドのリング) | `folder_pin_map` の source と比較して toggle | `source` だけで比べる。toggle の解除は行ごと削除 (範囲も消える)、別の画像への固定は範囲を消す (§4.3) |
-| 一覧の採用 (app.rs:56713〜) | `source_dims` / `layout_dims` で自動比率と見開きの寸法記録 | 自動比率は切り出した寸法になる (意図どおり)。**見開きの寸法記録 (`record_*_dims_for_spread`) には切り出した寸法を渡さない** (ページの寸法ではないため。コンテナの idx が見開きの判定に入らないことも実装時に確認) |
-| 詳細表示の hover (ui_main.rs:18918) | 一覧の `ThumbnailState` と回転を使う | 追加なし |
+| 通常一覧の要求 `make_load_request_with_visibility` → `apply_folder_thumb_pin` (app.rs:102487 / :103196) | `resolved.source_id` から pinned key | §5.3 の helper |
+| ZipDir 分岐の ZipEntry ピン (app.rs:102641) と ZIP 一覧の存続 key (:39963) | `#pin:{entry}` の別綴り | helper (§5.2) |
+| 存続 key `folder_thumb_existing_keys_for*` (app.rs:102909 / :102933) と呼び出し元 (フォルダ・タグ・favsearch・履歴・★一覧・rating_view・pin_materialization) | cascade を解決して key を作る | helper。範囲付き・自動 identity 付きの key も存続集合に入れる |
+| 種類除外・EPUB の代替要求 (thumb_loader.rs:3188 / :4963) | 代替画素を元の pinned key で保存 | §6.1。範囲付き・自動付きの key では付け直さない |
+| フォルダ自動代表 (thumb_loader.rs:5279〜) | 子の Image ピンを直接デコード。非 Image の子ピンは子の pinned WebP を読み取り専用で流用 (:5059) | 子の範囲を `FolderThumbResolution::Image` で運ぶ (K2)。流用の key は helper |
+| 子ピンのドライブ向け送出 `send_pinned_child_folder_cached` (thumb_loader.rs:2687) | lookup + cascade | helper |
+| ドライブ一覧の seed `drive_list_pin_seed_entry` (app.rs:46184〜46471) と worker の `send_pinned_only_cached` (thumb_loader.rs:2499) | Image / ZipEntry / PdfPage の**ページ行**、Folder / ZipDir の子の**最新の pinned 行**を、ドライブの pinned key へ写す。key は前方一致 | **実効の範囲 (cascade の先の範囲を含む) があるピンは、ページ行からも子の pinned 行からも写さない**。ドライブの pinned 行は、ドライブを通常フォルダとして開いたときの worker の生成 (`force_cache`) だけが作る。前方一致は §5.2 の規則。実効の範囲は pin DB の lookup だけでたどる (stat しない) |
+| 仮想フォルダの seed / writeback (app.rs:42961) | 本の基本 key ⇔ 先頭ページ行 | 手動の範囲は影響なし (pinned key だけ)。**自動 ON では、本の基本 key 側が自動 identity 付きになるので、seed / writeback は自動 identity の無い key の間だけで行う** (K3) |
+| 動画の seed | 動画ピンの WebP | 対象外 |
+| 本棚・AI 説明文・MCP `item_info` の `resolve_book_cover` | leaf の位置 | 範囲・自動を付けない (§7.2) |
+| 範囲指定の画面の解決 (§8.2) | — | 新しい worker 仕事 |
+| コレクション (collection_grid.rs:485 / digest :286) | `FolderPinSource` の各 field を hash | digest に実効の範囲と自動 identity を含める |
+| 色フィルタ (color_filter.rs:692〜 / :844) | pin を Debug で hash、ZIP/PDF は `apply_folder_thumb_pin` | 型変更で範囲が入る。自動 identity も hash に入れる |
+| スマートフォルダ・サブフォルダ展開・Everything 検索・一覧の各 pin map | `lookup_many` → 通常の要求 | 型変更に追従 |
+| mIV Remote `apply_supported_folder_pin` (remote_ipc/thumbnail.rs:1008) | Image / Folder のピンを自前で解決し同じ catalog に保存 | **helper 経由で手動の範囲を付ける** (K1)。自動は Remote では付けない (helper に「自動 OFF」を渡す) |
+| mIV Remote の本のタイル (`remote_ipc/container.rs:8040`) | 基本 key・先頭画像。ピンを見ない | 今と同じ (ピンも範囲も自動も反映しない)。Remote の閲覧用 raster (`RemoteSourceDecodeIdentity`) は変えない。既知の違いとして記録 (r1 指摘 8) |
+| 類似画像索引 (`offer_thumbnail_raster`) | 縮小前 raster を元画像の identity で登録 | 切り出し前に渡す (§6.2) |
+| metadata の書き出し・取り込み・取り込み後の再読込 | 4 列 | §4.4 |
+| 名前変更・ZIP キー移行・画像フォルダ→ZIP 変換 | source の列を付け替え・写す | 束縛列も付け替える (§4.3) |
+| UI の固定状態 (固定ボタン・右クリック・「ピ」バッジ・`GridPin` / `FsPin`・ゲームパッドのリング) | source と比較して toggle | `source` だけで比べる。toggle の解除は行ごと削除、別画像への固定は範囲を消す |
+| 一覧の採用 (app.rs:56713〜) | 寸法で自動比率と見開きの寸法記録 | 自動比率は切り出した寸法 (意図どおり)。見開きの記録には渡さない (§6.2) |
+| 詳細表示の hover | 一覧の `ThumbnailState` | 追加なし |
 
-### 7.1 方針
+### 7.2 範囲・自動を適用しないもの
 
-- **代表サムネを出す全経路が同じ結果になる**: 通常の一覧、本棚、コレクション、スマートフォルダ、検索 (§1.741)、
-  ★固定リスト等の合成一覧、詳細表示の hover、ドライブ一覧、mIV Remote、MCP の縮小画像。
-  これらは pinned key か、それを作った `Loaded` の画素を使うので、§5 の helper を通れば揃う。
-- **範囲を適用しないもの**: フルスクリーン・ページ送り・本の中のページ一覧 (ページ key は pinned key と別)、
-  編集・書き出し・コピー、AI 説明文の表紙 (`resolve_book_cover`。表紙を高解像度で読み直す別機能であり、
-  サムネ専用という要件に従う)、3D 写真。
-- **画素をコピーする経路** (仮想フォルダの seed / writeback、ドライブ一覧の seed、子の WebP の流用) は、
-  コピー元とコピー先の key の範囲 identity が一致する場合だけコピーする (不変条件 K)。範囲付きの pinned key の行を
-  ページの行へ、ページの行を範囲付きの pinned key の行へ写さない。
+フルスクリーン・ページ送り・本の中のページ一覧、編集・書き出し・コピー、AI 説明文 (表紙を高解像度で読み直す別機能)、
+3D 写真、類似画像索引、動画のピン、RAW の leaf、mIV Remote の本のタイル。
 
-## 8. 範囲指定の画面 (第 1 段)
+## 8. 範囲指定の画面
 
-### 8.1 入口 (利用者に確認する: §13)
+### 8.1 入口 (利用者確認 §13-1)
 
 - 案 A (主): 一覧の**本のタイル** (Folder / ZipFile / PdfFile / 変換済み ConvertibleArchive / ZipDir) の右クリック
-  「代表サムネの範囲を指定…」。対象は**そのタイル自身の代表**。今の代表 leaf を worker で解決して表示する。
-  - 既存の「代表サムネに固定」は「右クリックした項目を、今開いているフォルダの代表にする」操作で、対象のコンテナが違う。
-    案 A は対象のコンテナを右クリックしたタイルにする新しい操作。
-- 案 B (副): 本の中 (フォルダ / ZIP / PDF を開いた一覧) の**ページ**の右クリック「このページを代表にして範囲を指定…」。
-  対象は今開いているコンテナ (既存の「代表サムネに固定」と同じ)。表紙が最後のページにある本などに使う。
-- egui の右クリックメニューとネイティブの右クリックメニューの両方に出す。キー割り当ては足さない
-  (矩形をマウスで指定する操作で、キーだけでは完結しないため。§11 の keymap 記録)。
-- 出さない場所: 合成一覧で実パスの無いタイル、未変換のアーカイブ (既存の固定と同じ disabled 表示)、Ctrl+G の集約表示、
-  detached viewer (リワーク中の凍結規則に触れないため。範囲の結果は通常のピン変更として反映される)。
+  「代表サムネの範囲を指定…」。対象は**そのタイル自身の代表**。
+- 案 B (副): 本の中の**ページ**の右クリック「このページを代表にして範囲を指定…」。対象は今開いているコンテナ
+  (既存の「代表サムネに固定」と同じ。source は既存の `folder_pin_selected_source` で作る)。
+- egui とネイティブの右クリックメニューの両方 (同じ `MenuCommand` モデル)。キー割り当ては足さない (矩形はマウスで指定するため)。
+- 出さない場所: 実パスの無い合成一覧のタイル、未変換のアーカイブ (既存の固定と同じ disabled)、Ctrl+G の集約、detached viewer。
 
-### 8.2 代表 leaf の解決 (案 A)
+### 8.2 代表の解決と画像の読み込み (1 つの worker 仕事、r1 指摘 5・12)
 
-- worker で、一覧と同じ計画・`apply_folder_thumb_pin`・変換アーカイブ判定を使う既存の `resolve_book_cover` (AI 説明文の表紙解決)
-  を使い、今の代表の `ReadLocation` を得る。UI スレッドで pin DB・stat・ZIP 列挙をしない。
-- 得た leaf を、対象コンテナからの `FolderPinSource` に直す (画像 → `File{Image}`、ZIP/変換アーカイブの entry → `ZipEntry`、
-  PDF/EPUB のページ → `PdfPage`、サブフォルダの中なら相対パス)。直せない・leaf が画像でない (動画・音声・アイコン・未変換) 場合は
-  画面に「この代表には範囲を指定できません。本の中を開いて表紙のページで指定してください」と出す。
-- 代表がキャッシュの流用 (子の WebP) で決まっている場合、解決し直した leaf が今の画素と違うことがまれにある (§1.718 の Astra 指摘と同じ現象)。
+- UI は「論理コンテナ (実パス + 種類、ZipDir なら外側の ZIP と実効 prefix)」と設定値 (本棚の明示パスの `Option`・sort・depth・
+  種類の表示設定・`archive_cache` の handle 等) だけを捕捉して worker へ渡す。既定の本棚パスの解決 (`SHGetKnownFolderPath`) も
+  worker 側で行う。UI で pin DB・stat・ZIP 列挙・`book_root_path()` を呼ばない。
+- worker は、一覧と同じ計画で今の代表 leaf を解決し、次をまとめて返す:
+  **永続化できる `FolderPinSource`** (対象コンテナからの相対。変換アーカイブは元アーカイブの相対パス + 変換 ZIP 内の entry 名、
+  という既存のピンと同じ表現)、**物理の読み先**、**回転キー**、**今の実効の範囲** (cascade の先の段の範囲を含む)、
+  **元画像のデコード結果** (EXIF 適用済み、長辺は画面の表示寸法 × ppp 程度で上限 2048)。
+  EPUB の `ReadTarget` lease と取得済みの ZIP bytes はこの仕事の中で使い切る。
+- 既存の `resolve_book_cover` (`BookKind` に ZipDir が無く、物理の読み先しか返さない) を、論理コンテナと上の返り値に対応させて共有する
+  (一覧・AI 説明文と同じ解決を保つため。`cover_ref` の文字列解析はしない)。
+- leaf が画像でない (動画・音声・アイコン・未変換)・RAW・解決できない場合は、画面に理由と「本の中を開いて表紙のページで指定してください」を出す。
+- 代表が子の WebP の流用で決まっている場合、解決し直した leaf が今の画素と違うことがまれにある (§1.718 の Astra 指摘と同じ現象)。
   画面に出るのは固定される画像そのものなので、利用者は指定する前に分かる。
 
 ### 8.3 画面
 
 - モーダルの `egui::Window` (`ui_dialogs/` に 1 ファイル、`common_modal_dialog_open` に「今表示されるか」の helper で登録)。
-  `default_pos()`、1093×614 logical points でも OK / キャンセルが見えること (見出しと操作行は本文の外)。
-- 画像は専用 worker で読む (EXIF 適用、長辺は画面の表示寸法 × ppp 程度、上限 2048)。読み込み中は表示、失敗は文言 + 閉じる。
-  画面を閉じたら結果を捨てる (1 件だけ、世代番号で古い結果を採用しない)。
-- 表示は leaf の保存回転を掛けた向き (在メモリの「キー→角度」owner を引く。DB は読まない)。矩形の入出力で回転前の座標と変換する。
+  `default_pos()`、1093×614 logical points でも OK / キャンセルが見える (見出しと操作行は本文の外)。
+- 状態は「読み込み中 → 表示 → 閉じる」と「失敗 → 閉じる」だけ。worker の結果は世代番号で照合し、閉じた後の結果は捨てる。
+- 表示は leaf の保存回転を掛けた向き (在メモリの「キー→角度」owner を引く。DB は読まない)。矩形は回転前の座標と相互に変換する。
 - 操作: ドラッグで新しい矩形、四隅・四辺の handle と内部ドラッグで変更 (`export_crop::CropRect::dragged` を流用)。
-  既存の範囲があれば初期表示する。
-- ボタン: 「OK」(範囲を書いて固定) / 「範囲を解除」(範囲がある場合だけ。ピンは残す) / 「キャンセル」。
-  Enter / Escape は `dialog_enter_pressed` / `dialog_escape_pressed`。
+  初期表示は今の実効の範囲 (cascade の先の段のものを含む)。
+- ボタン: 「OK」/「範囲を解除」/「キャンセル」。Enter / Escape は `dialog_enter_pressed` / `dialog_escape_pressed`。
+  - 「OK」: **対象コンテナ自身の行**に、解決した leaf への固定と範囲を書く (`set_with_cover_crop`)。
+  - 「範囲を解除」: 対象コンテナ自身の行を、**同じ leaf への範囲なしの固定**にする (r1 指摘 11)。cascade の先の段の範囲は変えない。
+    今の実効の範囲が無い場合は押せない。
 - 補足文: 「範囲は一覧の代表サムネだけに使います。画像そのものや閲覧時の表示は変わりません。」
-  「範囲を指定すると、この画像が代表に固定されます。」
-- 確定は既存のピン書き込みと同じ経路 (UI スレッドの単一 UPSERT、`folder_pin_map` 更新、`folder_thumb_pin_dirty`)。
-  書き込み失敗は既存の固定と同じくトーストで通知 (まれな失敗の割り切り)。
+  「範囲を指定すると、この画像が代表に固定されます。」(編集の扱いは §13-4 の結論を書く)
+- 書き込みは既存のピン書き込みと同じ経路 (UI スレッドの単一 UPSERT、`folder_pin_map` 更新、`folder_thumb_pin_dirty`)。
+  失敗はトースト (まれな失敗の割り切り)。
 
 ## 9. 適用しないもの (まとめ)
 
-元画像のファイル、閲覧・ページ送り・本の中のページ一覧、編集・切り取り・書き出し・コピー、AI 説明文、3D 写真、動画のピン。
+§7.2 を参照。
 
 ## 10. テスト
 
-- DB: 旧 schema の DB (列なし) を開いて列が追加され、既存行が範囲なしで読めること。旧版の SQL (列名を明示した SELECT / INSERT /
-  UPSERT) が新 schema で通ること。`set` で範囲が消え、`set_with_cover_crop` / `clear_cover_crop` / `remove` の結果。
-  不正値・一部 NULL・非 leaf の範囲が「範囲なし・ピン有効」で読まれること。rename / zip key 移行で範囲が保たれること。
-  metadata の書き出し → 取り込みの往復と、不正範囲の取り込み。
-- key: 範囲なしの key が今と一致すること (既存 WebP の再利用)。範囲の有無・値で key が変わること。cascade で子の範囲が親の key に効くこと。
-  全 key 綴りの経路 (§5) が同じ helper の値になること (存続集合・ZipDir・remote・自動代表の候補)。
-- worker: 範囲付き要求の出力寸法・内容 (既知の画素パターンの画像で、切り出し位置を検査)、EXIF 回転済み画像の座標、
-  JPEG の DCT 縮小と PDF render の目標寸法、編集プレビュー Known (共通部分の写像・注釈も同じ境界) / Unknown (元画像)、
-  `epub_pin_fallback` に範囲が付かないこと、remote の要求にも範囲が付くこと。
-- 不変条件 K: 画素をコピーする経路 (seed / writeback / ドライブ一覧 / 子の WebP の流用) が範囲の違う key の間でコピーしないこと。
-- 画面: 状態遷移 (読み込み中 → 表示 → OK / 解除 / キャンセル、失敗)、モーダル中に他の入力が通らないこと、
-  回転 90/180/270° の表示と保存座標の往復、小画面・UI 倍率のスナップショット。
-- 閲覧への非影響: 範囲付きの本を開いたとき、ページ一覧・フルスクリーンが元画像のままであること。
+- DB: 列の無い旧 DB を開いて列が足され、既存行が範囲なしで読める。旧版の SQL (列名を明示した SELECT / INSERT / UPSERT) が通る。
+  旧版の UPSERT で source が変わった行・名前変更 (束縛を付け替えない旧 SQL) の行で範囲が当たらない。`set` / `set_with_cover_crop` /
+  `clear_cover_crop` / `remove`。不正値・一部 NULL・非 leaf の範囲が「範囲なし・ピン有効」。新版の名前変更・ZIP キー移行・
+  画像フォルダ→ZIP 変換で範囲が保たれる。bundle の往復、v12 の bundle の取り込み、不正範囲の取り込み。
+- key: 範囲なしの key が今と一致 (既存の key の文字列を固定した回帰テスト)。範囲の有無・値で key が変わる。cascade で子の範囲が
+  親の key に効く。§7.1 の全綴りが helper の値になる。ドライブ一覧の前方一致が範囲の有無を分ける。
+- worker: 範囲付きの出力の寸法・内容 (既知の画素パターンで切り出し位置を検査)、EXIF 回転済み画像、JPEG の DCT 縮小と PDF の
+  render の目標寸法、類似画像索引に元画像の raster と寸法が渡る、範囲付きで編集プレビューを使わない、代替要求が範囲付きの key に
+  保存されない、Remote の要求に範囲が付く、自動代表が子の範囲で切った画素を作り子の範囲の変更で証明が失効する。
+- 不変条件 K: ドライブ一覧の seed がページ行・子の pinned 行から範囲付きの key へ写さない。seed / writeback が自動 identity の
+  違う key の間で写さない。
+- 画面: 状態遷移 (読み込み中 → 表示 → OK / 解除 / キャンセル、失敗、閉じた後の結果の破棄)、モーダル中に他の入力が通らない、
+  回転 90/180/270° の座標の往復、cascade の範囲の初期表示と「範囲を解除」が対象コンテナだけを変える、小画面・UI 倍率のスナップショット。
+- 閲覧への非影響: 範囲付きの本を開いたとき、ページ一覧・フルスクリーンが元画像のまま。
 
 ## 11. 文書
 
-- マニュアル: 代表サムネの節 (`htdocs/mimageviewer/manual/` の該当ページ) に範囲指定を追記。製品ページは必要なら 1 行。
-- 設計文書: display-pipeline §1.3.2、virtual-folders §3.1.1 (schema・key の例外規則)、ui-responsiveness §4 (新 worker)、
+- マニュアル: 代表サムネの節 (`htdocs/mimageviewer/manual/grid.html` ほか固定を説明しているページ) に範囲指定と自動を追記。
+  設定ページに自動の項目。製品ページは必要なら 1 行。
+- 設計文書: display-pipeline §1.3.2、virtual-folders §3.1.1 (schema・key の例外規則)、ui-responsiveness §4 (新 worker 仕事)、
   keymap-spec (キー割り当てを足さない理由)。
 
-## 12. 第 2 段: 自動切り出し (概要、第 1 段の後で詳細化)
+## 12. 自動切り出し
 
-- 設定 `thumb_cover_auto_crop: bool` (既定 OFF)。ON で、手動の範囲が無い代表 (自動選定・範囲なしのピン) の leaf にだけ掛ける。
-- 判定は worker で、デコード済みの leaf 画像から行う。横長 (縦横比のしきい値以上) でない画像・判定できない画像は元のまま
-  (誤爆しない側に倒す)。ZipPla の方式 (四隅の色の帯で外周の余白を対称に除く、表紙・背・折り返しの幅の比から位置を推定、
-  綴じ方向で左右を反転) を参考にするが、しきい値は検証画像で決める。
-- 綴じ方向は本ごとの見開き設定 (`SpreadMode::advances_right_to_left`) と既定値から決める。入力の取り方は第 2 段の設計で詰める。
-- cache key には自動の版・ON/OFF・綴じ方向を含める (`folderthumb:auto-v3` の版と同じ考え方)。OFF のときは key を変えない。
-  手動の範囲がある leaf では自動の部分を key に含めない。
-- 自動の結果は記録しない (§3)。
+### 12.1 ZipPla の仕組み (調査、2026-11-11)
+
+ZipPlaFork (commit 07955f52、**AGPL v3**) の公開コードを読んだ結果を、仕組みとして自分の言葉でまとめる。
+**mIV の実装はこれと独立に作り、コード・構造・定数表を写さない**。比較用の再現は評価用で Git 管理外に置く (§12.6)。
+
+- **外周の余白**: 縮小した画像の四隅の色を見て、両端の隅が似ている辺だけを調べる。辺の色から一定以上離れた画素が 1 つでも
+  現れた位置で止める。左右・上下はそれぞれ短い側に揃えて対称に除く。除く量の上限は無い。
+  - 外れやすい条件: 片側だけの余白 (スキャンの傾き・のど・シール) では対称化でその軸が除かれない。ほこり 1 点で止まる。
+    絵の端が余白の色に近いと削り込む。
+- **表紙の位置**: 枠の比率は常に 1:√2。高さ 210 に対し表紙 148・背 15・折り返し 75 の固定の比を仮定し、余白を除いた画像の
+  縦横比がどの区間に入るかで「表紙だけ」「折り返し + 表紙」「表紙 + 背 + 裏」… の並びを決め打ちし、区間ごとに決めた位置で切る。
+  左→右読みでは位置を左右反転する。区間の境目では位置が表紙幅の 3 割ほど跳ぶ (作者自身も「非常にシビア」とコメント)。
+  - 外れやすい条件: 実物の比が仮定と違う (折り返しの幅・背の厚さは本ごとに違う)、余白の取り残しで縦横比がずれる、綴じ方向の取り違え、
+    見開きのイラスト (2 等分の片方になる)、横長のイラスト (中央を切る)。画像の中身で表と裏を見分ける仕組みは無い。
+- **描画時の注目点**: サムネの枠が 1:√2 でないとき、推定範囲を縮小した画像の 2×2 の勾配から直線上に投票し、最大の点を中心に
+  枠を置く。長い直線 (枠線・バーコード) に引かれやすく、平坦な表紙では左上に寄る。
+- **候補ページ**: 先頭から順に試し、余白が無い・縦横比が極端なページだけを減点して次のページへ進む (最大 7 ページ)。
+  見開きは減点されないので先頭が見開きならその片方を使う。
+- 報告者の画像 (5ch >>760、Git 管理外の評価用) では、ZipPla は構成 2 (白い折り返しに作者のコメント) で折り返しを含む範囲を選び、
+  32 巻 (構成 3) で裏表紙 (バーコード側) を選んでいる。固定の比と区間の決め打ちが、実物の比のずれで外れる例と読める。
+
+### 12.2 mIV の方式 (利用者案 A・B を採り入れる)
+
+判定は worker の純粋関数 `cover_auto_crop(image, page_aspect, prefer_front_left) -> Result<CoverCrop, AutoCropDecline>` とし、
+理由付きで「切らない」を返す。入力の画像は解析用に高さ 256 程度へ縮小したもの (元寸法との対応は正規化座標で持つ)。
+
+1. **大きさの先読み (案 A、§12.3)**: 本の 2 ページ目以降の数ページの縦横比から、表紙 1 面の縦横比 `r` を決める。決まらなければ切らない。
+2. **入口の判定**: 余白を除いた後の縦横比 `s` が `s < 0.85` または `s < 1.25 r` なら切らない (表紙だけの画像・背が付いただけの画像)。
+3. **外周の余白**: 辺ごとに独立に、その行 (列) の 97% 以上の画素が端の色 (中央値) から距離 40 以内なら余白とみなして内へ進む。
+   各辺 20% まで。対称化しない (スキャンの片側だけの余白に対応)。
+4. **面の境目**: 縦の境目 = 隣の列との色の差が大きい行が高さの 90% 以上を占める列 (傾き 1〜2 px は近傍の最大で吸収)。
+   近すぎる境目は強いほうを残す。折り返し・表表紙・背・裏表紙の境目はほぼ縦に通るが、絵の中の線はふつう通らない。
+5. **候補**: 境目 2 本の間で幅が `r·H` の ±10% のもの、および境目 1 本から `r·H` の幅を取ったもの。**内側の境目 (画像の端以外) に
+   一度も接しない候補は捨てる**。内側の境目が 1 本も無ければ切らない (横長のイラスト・見開きのイラストはここで止まる)。
+6. **採点 (案 B)**: 候補ごとに
+   - 色の豊かさ: 反対色成分 (r−g、(r+g)/2−b) の標準偏差と平均の大きさ (Hasler–Süsstrunk の colorfulness) を正規化した値、
+   - 印刷の密度: 白に近くない画素の割合、
+   - 白地の帯の減点: 白に近い列 (印刷の密度 15% 未満) の割合、
+   - 構造の加点: 両端が境目 (+0.3)、背 (幅 `r·H` の 4〜16%、印刷の密度 60% 以上の細い面) に接する (+0.2)、
+   - 綴じ方向の加点: 背の表表紙側 (右綴じ = 背の左、左綴じ = 背の右) に接するなら +0.1、反対側なら −0.1。
+   バーコードの面は無彩色で白地が多く、白い折り返し (作者のコメント) は白地の帯の減点が大きく、単色の折り返しは標準偏差が小さいので、
+   色と絵柄のある表表紙が上に来る。
+7. **確信の判定**: 最上位の点が 0.6 以上で、半分以上重ならない次点との差が 0.25 以上のときだけ切る。そうでなければ切らない
+   (淡い色・白黒の表紙で表と裏の差が小さいとき)。
+8. **出力**: 選んだ候補の左右と、余白を除いた上下を元画像の正規化座標にした `CoverCrop`。
+
+しきい値は §12.6 の試作の値を初期値とし、実装後に評価用の道具 (§12.6) で調整する。調整したら版 (`autocrop:vN`) を上げる。
+
+### 12.3 大きさの先読みの費用 (案 A)
+
+- **入口の判定 (§12.2-2) の前段として、表紙の縦横比が 0.85 以上のときだけ**先読みする (ふつうの縦長の表紙では何も読まない)。
+- 対象: 代表 leaf と同じ本の、読む順で leaf の次から最大 8 ページ (leaf が最後なら前のページ)。画像以外 (動画等) は飛ばす。
+- 読み方 (どれも worker 内、デコードしない):
+  - ZIP / 変換アーカイブ / ネスト ZIP: entry の先頭最大 256 KB を (圧縮なら伸長しながら) 読み、`probe_image_dims_from_bytes` で
+    ヘッダーの寸法を得る。JPEG は同じ bytes の EXIF の向き 5〜8 で縦横を入れ替える。
+  - フォルダ: 同じ規則でファイルの先頭最大 256 KB。並びは本の読む順と同じ sort。
+  - PDF / EPUB (変換済み PDF): PDF ワーカーの `PageSizes` 要求 (ページを読み込まずに全ページの寸法を返す既存の要求)。
+- 判定: 読めたページが 3 以上、縦長 (`w/h < 0.9`) の割合が 70% 以上、縦長のうち中央値から ±6% に入る割合が 70% 以上のとき、
+  `r` = 縦長の中央値。横長 (見開き) のページは `r` の計算に使わない。条件を満たさなければ切らない。
+- 費用の上限: 1 冊につき最大 8 entry × 256 KB の読み取り (広い表紙の本だけ)。結果は catalog の行に入るので 2 回目からは読まない。
+
+### 12.4 設定・key・生成
+
+- 設定 `thumb_cover_auto_crop: bool` (既定 OFF)。環境設定のサムネイルの項目に「つながった表紙から表表紙を自動で切り出す」。
+- 対象: 親コンテナ (フォルダ・ZIP・PDF・EPUB・変換アーカイブ・ZipDir) の代表のうち、手動の範囲が無いもの (自動選定・範囲なしのピン)。
+  leaf が RAW・動画・音声のものは対象外。
+- 綴じ方向の加点は**既定の綴じ方向の設定値**から決め、本ごとの見開き設定 (`spread_db`) は読まない (§3)。
+- key: ON のとき、代表の key (基本 key / pinned key とも) に `|autocrop:v1:{rtl|ltr}` を 1 つの関数で付ける (OFF・手動の範囲あり・
+  Remote では付けない)。EPUB の世代の付与など既存の接尾辞との順序はこの関数が決める。OFF の key は今と同じ。
+- **ON にしたときの作り直しを減らす**: worker は自動 identity 付きの key が miss のとき、同じ catalog の自動 identity の無い行が
+  あり、その行の元寸法の縦横比が 0.85 未満 (§12.2-2 で必ず「切らない」になる) なら、その行の bytes を自動 identity 付きの key へ
+  写して返す (K3 を満たす。判定は同じ関数の入口条件を使う)。広い表紙だけがデコードし直しになる。
+- 自動で切ったときの扱いは手動の範囲と同じ (§6.2・§6.3)。切らないと判定したときは今の表示 (編集プレビューを含む) と同じ。
+- 判定の理由 (切った / 先読みで比が決まらない / 広くない / 構造なし / 僅差) を perf event と debug ログに残す。
+
+### 12.5 自動と手動の関係
+
+- 手動の範囲がある leaf では自動を使わない (key にも自動 identity を付けない)。
+- 範囲指定の画面の初期表示は、手動の範囲があればそれ、無くて自動が ON で切る判定ならその範囲 (worker 仕事で同じ関数を呼ぶ)、
+  どちらも無ければ全体。自動の結果を手直しして OK すると手動の範囲になる。
+
+### 12.6 評価用の道具と試作の結果 (Git 管理外)
+
+- 置き場所: `G:\home\mimageviewer-764-eval\` (リポジトリの外。報告者の画像と、それを切り出した構成図はコミットしない)。
+  - `proto/cover_auto.py`: 試作 (ZipPla 相当の再現 `zp_crop` と mIV 方式 `miv3_crop`)。
+  - `proto/gen_dummies.py`: 第三者の絵を使わない合成ダミー (構成 1〜6 × 通常 / 淡い色 / 白黒 × 右綴じ / 左綴じ × スキャンの余白と
+    ノイズの有無、表紙だけ・横長イラスト・見開きイラスト) 78 件と正解。
+  - `proto/eval_dummies.py` / `eval_reporter.py` / `eval_dir.py`: 両方式の結果を並べた一覧画像 (`sheet-*.png`) と集計。
+- 試作の結果 (2026-11-11、v3):
+  - 合成ダミー 78 件: mIV 方式 = 正解 63・誤った切り出し 4 (淡い色の表紙)・切らない 11。ZipPla 相当 = 正解 41・誤った切り出し 37
+    (ZipPla 相当は常に切る)。横長・見開きのイラスト 4 件は mIV 方式がすべて切らず (内側の境目が無い)、ZipPla 相当はすべて切った。
+    表紙だけ 2 件は両方式とも切らない。
+  - 綴じ方向を取り違えても mIV 方式は正解 63 → 61・誤った切り出し 4 → 5 (方向は僅差の加点だけなので)。
+    比 `r` を −5% / +5% ずらすと正解 56 / 66 (小さく見積もると境目 2 本の候補が外れやすい。許容幅は実装時に調整)。
+  - 報告者の構成図 1〜6 (右綴じ・左綴じ、低解像度。左綴じは左右反転して作った): 構成 1〜5 で表表紙との重なり
+    (横方向の IoU) 0.92〜0.99、構成 6 (表紙 + 背) は「広くない」で切らない (重なり 0.88、報告者が妥協できるとした扱いと同じ)。
+    ZipPla 相当も 0.89〜0.97 (説明図は余白が整った理想的な画像なので、実際のスキャンで起きている失敗はここでは再現しない)。
+- 実装の受け入れ: Rust 実装は、同じ合成ダミーで「横長・見開き・表紙だけで 1 件も切らない」「誤った切り出しが試作以下」
+  「正解が試作以上」を満たす。テスト用のダミーはテストコードで生成する (PNG をコミットしない)。評価用の道具は `#[ignore]` の
+  テストか開発用の example として置き、ディレクトリを環境変数で受けて一覧画像を出す (利用者に見せる比較はこれで作る)。
 
 ## 13. 利用者に確認する点
 
-1. 範囲指定の入口: 案 A (本のタイルの右クリック) + 案 B (本の中のページの右クリック) の両方でよいか。
-   ほかに欲しい場所 (アドレスバーの固定ボタン、フルスクリーンなど) があるか。
-2. 「範囲を指定すると代表が固定される」「範囲の解除ではピンは残り、固定の解除で両方消える」でよいか。
-3. 段階: 第 1 段 (手動) を先に仕上げ、第 2 段 (自動) はその後に設計・実装する進め方でよいか。
+1. (送信済み・回答待ち) 範囲指定の入口: 案 A (本のタイルの右クリック) + 案 B (本の中のページの右クリック) でよいか。
+2. (送信済み・回答待ち) 範囲を指定すると固定される。範囲の解除ではピンは残り、固定の解除で範囲も消える、でよいか。
+3. (回答済み) リリースは手動と自動がそろってから。実装は手動 → 自動の順。
+4. **範囲で切る表紙 (手動・自動) は元画像から作り、その表紙ページの消しゴム・注釈・編集の切り取りはタイルに反映しない**
+   (色調補正は反映する) でよいか。反映させる代案は作れるが、組み合わせが大きく増える (§6.3)。
+5. 自動切り出しの評価に、利用者の手元の実際の本 (表紙・背・裏がつながったスキャン) を何冊か使ってよいか。使う場合は場所を
+   教えてもらい、Git 管理外の評価用の道具で読み取り専用に使う。
+
+## 14. 独立設計レビューの記録
+
+### 14.1 r1 (Sol xhigh、2026-11-11、4a8a46df9 に対して、REVISE)
+
+| 指摘 | 対応 |
+| --- | --- |
+| P1-1 種類除外の代替要求が範囲付きの key に未切り出しの画素を書く | §6.1: 範囲・自動 identity 付きでは元の key を付け直さない |
+| P1-2 ドライブ一覧の seed が全 leaf 種別と cascade で範囲を無視、前方一致が範囲を分けられない | §5.2 で範囲を page の直後に置く、§7.1 で実効の範囲があるピンは seed しない |
+| P1-3 強い K と自動代表への伝播が矛盾 | §5.1 で K1 (pinned 行) / K2 (自動代表は選定証明) / K3 (自動) に分けた |
+| P1-4 類似画像索引に切った raster が漏れる | §6.2 の順序を変更 |
+| P1-5 `resolve_book_cover` が ZipDir と論理ピン元を扱えない | §8.2 の新しい返り値と論理コンテナの入力、解決と読み込みを 1 つの仕事に |
+| P1-6 旧版の UPSERT で範囲が別の画像に当たる | §4.2 の束縛列 |
+| P2-7 編集プレビューの共通部分と寸法・画面の不一致 | §6.3 で範囲付きは元画像から作る案を推奨 (利用者確認 §13-4)、代案も記述 |
+| P2-8 Remote の本のタイルの経路が表に無い | §7.1 に追加。今もピンを見ないので範囲・自動も反映しない (既知の違い) |
+| P2-9 bundle の版の受け入れ | §4.4 |
+| P2-10 RAW の preview と half の画角 | §3: RAW の leaf は範囲・自動の対象外 |
+| P2-11 cascade の範囲と親の「範囲を解除」 | §8.3: 対象コンテナ自身を同じ leaf の範囲なし固定にする |
+| P3-12 `book_cover_env` の Shell 呼び出し | §8.2: 設定値だけを捕捉し、既定パスは worker で解決 |
