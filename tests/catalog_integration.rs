@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use tempfile::TempDir;
 
-use mimageviewer::catalog;
+use mimageviewer::{adjustment_db, catalog, cover_identity::CoverIdentity};
 
 #[test]
 fn catalog_db_full_lifecycle() {
@@ -25,10 +25,20 @@ fn catalog_db_full_lifecycle() {
         192,
         Some((4000, 3000)),
         b"webp_data_1",
+        &CoverIdentity::Page(adjustment_db::normalize_path(&folder.join("img1.jpg"))),
     )
     .unwrap();
-    db.save("img2.png", 2000, 8000, 256, 256, None, b"webp_data_2")
-        .unwrap();
+    db.save(
+        "img2.png",
+        2000,
+        8000,
+        256,
+        256,
+        None,
+        b"webp_data_2",
+        &CoverIdentity::Page(adjustment_db::normalize_path(&folder.join("img2.png"))),
+    )
+    .unwrap();
 
     let map = db.load_all().unwrap();
     assert_eq!(map.len(), 2);
@@ -52,6 +62,7 @@ fn catalog_db_full_lifecycle() {
         192,
         Some((4000, 3000)),
         b"updated",
+        &CoverIdentity::Page(adjustment_db::normalize_path(&folder.join("img1.jpg"))),
     )
     .unwrap();
     let map = db.load_all().unwrap();
@@ -137,6 +148,7 @@ fn reopen_db_preserves_data() {
             96,
             Some((1920, 1080)),
             b"persistent_data",
+            &CoverIdentity::Page(adjustment_db::normalize_path(&folder.join("photo.jpg"))),
         )
         .unwrap();
     }
