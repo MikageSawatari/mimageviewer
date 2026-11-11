@@ -503,7 +503,7 @@ music-video companion。最終 build の後に 5 ファイルの存在・更新�
 各検索中の場所ジャンプの成功時終了 / 失敗時保持と、検索外の同等操作。
 実機結果・full suite・コミットは設計担当へ引き継ぐ。
 
-### 8.5 独立レビュー ACCEPT WITH CHANGES への追補 (3621aefec 後、未コミット)
+### 8.5 独立レビュー ACCEPT WITH CHANGES への追補 (e85c702ef でコミット)
 
 利用者が伝えた別の Sol / xhigh 独立レビューの P2 / P3 に対応した。
 変更ファイルは `src/app/location_jump.rs`、`src/app/list_order_everything_tests.rs`、本書だけ。
@@ -559,3 +559,14 @@ music-video companion。最終 build の後に 5 ファイルの存在・更新�
 確認用本体は `target/dev-runtime/mimageviewer-core.exe` を更新済み。利用者が起動する場合の
 `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`、通常 `%APPDATA%\mimageviewer` の
 実設定・データ更新の可能性、インストール版・トレイ常駐版を先に閉じる注意は §8.4 と同じ。
+
+### 8.6 受入 (設計担当 ClaudeCode、2026-11-11)
+
+- 実装の独立レビュー (Codex GPT-6.1 Sol / xhigh、実装担当とは別セッション): 初回 ACCEPT WITH CHANGES (P2: dispatch 時の共通モーダル再確認、
+  P3: 変換確認・パスワード待ちの輸送テスト) → `e85c702ef` で対応 → 再レビュー ACCEPT (追加指摘なし)。
+- 本体 lib 全件: `.\scripts\test-lib-full.ps1` (PC 共通ロック `miv-locks\test-lib-full` 取得下、`e85c702ef`)、
+  **17,185 件すべて成功、75 skip、854 秒、exit 0**。実行中にマニュアルだけの commit (`d05408552`) を入れたため、
+  スクリプトの再利用記録は残っていない (「Inputs changed during execution」)。製品コードは同じ。
+- 既存の別問題: `cargo check -p mimageviewer --lib --tests` の統合テスト `tests/catalog_integration.rs` が master の §1.718
+  (`CoverIdentity` 引数追加) に追従しておらずビルドできない。今回の変更とは無関係で、本ブランチでは直していない (`test-full.ps1` は止まる見込み)。
+- 製品は起動していない。実機の挙動は未確認。
