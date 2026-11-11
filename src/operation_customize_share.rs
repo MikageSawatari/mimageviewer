@@ -643,6 +643,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn saved_group_ring_actions_survive_shared_import_sanitize_in_all_contexts() {
+        use crate::ring_shortcut::{
+            MouseGestureBinding, MouseGestureDirection, RightDragContext, RingShortcutContext,
+        };
+        let actions: Vec<_> = RingActionId::available_for_context(RingShortcutContext::Grid)
+            .into_iter()
+            .filter(|action| action.saved_group_key_action().is_some())
+            .collect();
+        assert_eq!(actions.len(), 44);
+        for action in actions {
+            let mut bundle = OperationCustomizeBundle::defaults();
+            for &context in RingShortcutContext::all() {
+                bundle
+                    .ring_shortcuts
+                    .profile_mut(context)
+                    .slots
+                    .fill(action.clone());
+            }
+            for &context in RightDragContext::all() {
+                bundle
+                    .ring_shortcuts
+                    .mouse_gesture_profile_mut(context)
+                    .bindings = vec![MouseGestureBinding {
+                    pattern: vec![MouseGestureDirection::Up],
+                    action: action.clone(),
+                }];
+            }
+            let mouse = bundle
+                .ring_shortcuts
+                .mouse_button_profile_mut(RingShortcutContext::Grid);
+            mouse.back = action.clone();
+            mouse.forward = action.clone();
+            mouse.middle = action.clone();
+            let imported = parse_json(&to_json(&bundle).unwrap()).unwrap();
+            assert_eq!(imported.ignored_items, 0, "{action:?}");
+            assert_eq!(
+                imported.bundle.ring_shortcuts, bundle.ring_shortcuts,
+                "{action:?}"
+            );
+            let mut settings = Settings::default();
+            imported.bundle.apply_to(&mut settings);
+            assert_eq!(settings.ring_shortcuts, bundle.ring_shortcuts);
+        }
+    }
+
     /// 有効/無効は共有 bundle を往復しても保たれる。
     #[test]
     fn the_gamepad_switch_survives_a_bundle_round_trip() {

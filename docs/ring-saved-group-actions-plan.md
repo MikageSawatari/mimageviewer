@@ -1,6 +1,6 @@
 # §1.733 コレクション・本を開く操作をリング・ジェスチャー等へ割り当てる — 設計
 
-- 状態: 設計 (2026-11-11)。ブランチ `feat-733-ring-actions`。
+- 状態: 実装・関連自動検証済み (2026-11-11)。全件・実機検証は未実施。ブランチ `feat-733-ring-actions`。
 - 要望 (メール、2026-11-07): 「コレクション 1 を開く」などをマウスジェスチャーへ割り当てたい。
 - 利用者決定: 追加する (2026-11-07)、次の版に入れる (2026-11-10)。
 
@@ -178,3 +178,137 @@
 - 設計レビュー 2 回目 (同じセッション): ACCEPT WITH CHANGES。連動型を受け付ける判断は了承 (待機ダイアログが隠れる・
   状態が壊れる欠陥は無い。後片付けは既存の通常 cleanup が行う)。P2 §8 の動画遷移中の期待値の矛盾、P3 別ウィンドウの
   検証項目 → §8 を直した。
+
+## 11. 実装記録 (2026-11-11)
+
+### 実装と前提確認
+
+変更ファイル一覧と主要な実装箇所 (15ファイル):
+
+| ファイル | 設計項目・位置 |
+| --- | --- |
+| `src/ring_shortcut.rs` | §2/3/5/6: 番号表756、KeyAction対応1015、場所移動判定1270、候補順1286 |
+| `src/app/saved_group_actions.rs` | §4: 共通受付311、キー入口370、一覧コレクション回帰715 |
+| `src/app/gamepad_input.rs` | §3/4.1: 更新中1811、バッチ再判定4147、現在モーダル判定4434、リング実行8176 |
+| `src/ui_dialogs/preferences/pages.rs` | §5: ホバー2777、キー行への対応2828、行表示回帰12499 |
+| `src/keymap.rs` | §8: 既存parity全列挙の分類11803 |
+| `src/operation_customize_share.rs` | §6/8: 共有importの全44件回帰647 |
+| `src/app/tests.rs` | §8: 全画面・複数窓・native動画回帰114404以降 |
+| `docs/keymap-spec.md` | §9: 本・コレクションとマウスボタンの仕様 |
+| `docs/key-customization-impl-plan.md` | §9: 操作対応・受付の保守記録 |
+| `docs/ring-saved-group-actions-plan.md` | 実装・検証記録 (本節) |
+| `htdocs/mimageviewer/manual/shortcuts.html` | §9: 割り当て方法と使える場面 |
+| `htdocs/mimageviewer/manual/tut-books.html` | §9: 管理順・前後移動・割り当ての案内 |
+| `htdocs/mimageviewer/manual/tut-collections.html` | §9: 管理順・前後移動・割り当ての案内 |
+| `htdocs/mimageviewer/manual/books.html` | §9: 番号の意味と使える場面 |
+| `htdocs/mimageviewer/manual/collections.html` | §9: 番号の意味と使える場面 |
+
+- `src/ring_shortcut.rs`: 44 ID の保存名・固定表示名・既存 KeyAction との双方向対応を追加。
+  番号は本・コレクションそれぞれの配列定数で保持し、候補と場所移動判定をお気に入りと共有する。
+- `src/app/saved_group_actions.rs`: 既存受付を `saved_group_open_source_if_allowed` へ抽出。
+  管理画面の受付順は維持し、番号・前/次はキーとリングから同じ受付・要求 owner を使用する。
+- `src/app/gamepad_input.rs`: 全画面を閉じる前の受付、既存 terminal close、閉じた後の再受付の順に接続。
+  終了の Err または viewer 残存時はログと通知だけで終え、要求・再試行・回復処理を作らない。
+  一覧更新中も許可し、ページ一覧の既存有限集合は広げない。
+- 同ファイルのパッドバッチは各イベントと analog 操作の前に受付を再判定する。
+  モーダルが開いた後の意味操作を止め、物理 press/release/axis/session end の配送は維持する。
+  Grid 側の keyboard owner は pass 内で cache されるため、受付では現在の `common_modal_dialog_open()` も直接読む。
+  回帰は owner を先に cache してから実 dispatcher に入力し、cache の再計算に頼らず後続操作を止めることを検査する。
+- `src/ui_dialogs/preferences/pages.rs`: キー行への3文脈の割り当て表示と管理順・循環のホバー説明を追加。
+  `ring_action_has_key_action` の既存規則でリング専用の重複行を除く。
+- `smart_folder_source_lease` は投影 context と一覧 source/generation/quick slot から作り、全画面の有無を見ない。
+  連動 F12 は main context のため取得でき、独立 context は既存判定で取得できない。
+  通常の terminal close は新しい `folder_nav_pending` / `smart_folder_transition` を開始しない。
+  確認箇所: `src/app/smart_folder.rs:2148`、`src/app/snapshot_ops.rs:2264`、`src/app.rs:82086`・`82278`。
+- `close_fullscreen_to_completion` は通常表示でも content teardown を実行し、動画遷移中は terminal effects を消化する。
+  連動 F12 の session/window 結合は既存の `finalize_closed_active_detached_viewport` が終了させる。
+  detached の述語・viewport 配送・共通 lease の意味は変更していない。
+- native 動画の早期 return 判定はパッド配送後の `native_video_fullscreen_active_for_main_backdrop` による。
+  この述語は `fullscreen_idx` を必須とし、終了成功時は None になるため、そのフレームで早期 return を通らない。
+  `CollectionOpen` は通常の `post_render_main_navigation` へ届く。X release から実 dispatcher までを回帰で検査する。
+  したがって native 早期 return 内の分岐追加は不要。リング・ジェスチャ・マウスの返却 nav も既存 caller が回収する。
+  確認箇所: `src/app.rs:82119`・`100535`・`100762`、`src/app/native_video.rs:4826`、
+  `src/app/update_phases.rs:1403`・`1567`。既存経路を変更せず、headless 回帰でも確認した。
+- 保存形式・共有形式の版、既定キー、既定割り当ては変更なし。旧開発ビルド間の保持に関する §6 の注意も維持する。
+- マニュアル5ページとキー仕様・実装プランを更新。製品ページのカードの主張は変わらない。
+  UI への新しい同期 I/O は追加していない。
+
+### 検証
+
+追加した回帰テスト (17件):
+
+| 対象 | テスト名 |
+| --- | --- |
+| ID・全件対応 | `saved_group_actions_round_trip_and_match_existing_key_actions` |
+| 候補・文脈・順序 | `saved_group_candidates_follow_favorites_and_share_location_context_rules` |
+| 設定保存・sanitize | `saved_group_assignments_survive_settings_serde_and_sanitize_without_new_defaults` |
+| 共有設定 import | `saved_group_ring_actions_survive_shared_import_sanitize_in_all_contexts` |
+| 操作行・ホバー | `saved_group_ring_assignments_share_key_rows_and_describe_management_order` |
+| 一覧からコレクション | `saved_group_ring_collection_from_grid_returns_the_shared_navigation` |
+| 一覧更新中・本の要求 | `saved_group_ring_book_request_is_allowed_during_grid_refresh` |
+| ページ一覧 | `saved_group_ring_actions_do_not_execute_in_page_overview` |
+| 同一バッチのモーダル | `gamepad_batch_stops_semantics_after_any_modal_but_delivers_releases` |
+| 通常全画面 | `ring_saved_group_closes_fullscreen_before_creating_main_grid_request` |
+| 動画遷移中 | `ring_saved_group_drains_video_terminal_effects_before_request` |
+| 全画面を閉じる前の拒否 | `ring_saved_group_snapshot_and_other_navigation_refuse_before_close` |
+| UndoAppend・close Err | `ring_saved_group_pending_append_undo_keeps_viewer_and_rejects_requests` |
+| close Ok・viewer 残存 | `ring_saved_group_rejects_remaining_deferred_viewer_even_when_close_returns_ok` |
+| 連動 F12・後片付け | `ring_saved_group_linked_f12_uses_main_lease_and_normal_terminal_cleanup` |
+| 独立 context・兄弟保持 | `ring_saved_group_independent_context_refusal_preserves_main_and_sibling` |
+| native X リング・通常 dispatcher | `ring_saved_group_native_video_x_release_delivers_collection_to_main_dispatcher` |
+
+既存の `ring_actions_are_classified_for_key_action_parity` も新44 IDを含む分類へ更新した。
+
+最終ソースの関連 nextest:
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/ring|saved_group|gamepad|keymap|operation|preferences|collection_navigation/)' --no-fail-fast
+```
+
+- **1,253件実行・1,253件成功**、3件 slow、15,987件 skipped (フィルタ・既定除外)。実行時間152.907秒、exit 0。
+  ログ: `target/section733-related.log`。追加17件もすべて含む。
+- 先行する焦点検証は51件中49成功・2失敗。追加テストのストア起動待ちとリングモード有効化が不足していたため、
+  fixtureだけを修正した。修正2件の独立再実行は2件成功 (`target/section733-fixtures-final.log`)。
+  製品の期待値は変更せず、最終の上記1,253件でも成功した。
+- 初回テストビルドは TurboJPEG の並列 MSBuild が警告0・エラー0で失敗した。
+  同じ CMake build を `--parallel 1` で実行すると成功した。根因は未確定で、製品・build script は変更していない。
+  初回の本体testコンパイル後、テスト一覧取得が `0xc0000135` で0件のまま停止したため、
+  指定された FFmpeg 6 DLL を `vendor/ffmpeg/bin` から `target/debug/deps` へ実体コピーして実行を再開した。
+- 独立完成レビュー: Sol / xhigh、ソースレビュー ACCEPT・確定指摘なし。
+  初回の自己点検で発見した keyboard owner cache の gap は上記の現在 modal 判定と実 dispatcher 回帰で修正し、再レビュー済み。
+- `cargo fmt` (引数なし)、`cargo fmt --check`、`python scripts/check_ui_glyphs.py`、`git diff --check` 成功。
+  UI危険グリフ0件。
+- 最終 `cargo check -p mimageviewer --bin mimageviewer-core` 成功 (52.41秒、exit 0)。
+  既存の警告は残る。ログ: `target/section733-check.log`。
+- 焦点検証コマンド: `cargo nextest run -p mimageviewer --lib -E 'test(/saved_group|gamepad_batch_stops/)' --no-fail-fast`。
+  fixture修正2件のコマンド: `cargo nextest run -p mimageviewer --lib -E 'test(/saved_group_ring_collection_from_grid|saved_group_ring_assignments_share_key/)' --no-fail-fast`。
+- 依存物の環境対応: `cmake --build target/debug/build/turbojpeg-sys-f4a0b3122eba9190/out/build --target install --config Debug --parallel 1` 成功。
+  確認用ビルドに先立つ `cargo build --profile dev-runtime -p turbojpeg-sys -j 1` も成功 (2分11秒)。
+  ログ: `target/section733-runtime-native.log`。本体は通常の並列数でビルドする。
+- `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` 成功、exit 0。
+  TurboJPEGを先に準備したため、既存のMSBuildプロセスを止めずに待機だけ省略した。
+  normal feature set、`dev-runtime` profileでcore・remote・EPUB worker・MCP adapter・music-video editorの5本を生成。
+  FFmpeg 6 DLLとVCランタイムの配置、PE依存検査 (`runtime=4 pe=5`) も成功。
+  ログ: `target/section733-build-dev.log`、検査報告: `target/vcrt-pe-reports/dev-runtime.json`。
+  検証用coreは `target/dev-runtime/mimageviewer-core.exe`。起動はしていない。
+
+全件 `test-lib-full.ps1` は設計担当が PC 全体のロックを取って実施するため、この worktree の実装担当は実行しない。
+実アプリの起動・デスクトップ操作・コミットも実施しない。
+
+### 引き継ぐ確認・既存制限
+
+- 実装判断の未解決事項や、設計の主要な前提との矛盾はない。
+- 一覧更新中のホイールクリックは、既存 handler が短クリックを扱わないため発火しない (§3)。
+  お気に入りと同じ既存制限として残し、この項目では変更していない。
+- 全件 gate は設計担当が実施する。実際の Windows 窓の見え方・focus・native presenter の実機確認は未実施。
+  確認用 core の起動は利用者が行い、画像・native動画・連動F12で本／コレクション操作を実行した後、
+  全画面が閉じてメイン一覧が開くこと、独立した別窓では閉じずに拒否することを確認する。
+
+利用者の起動コマンド (このworktreeのルートから):
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+引数なしでは通常の `%APPDATA%\mimageviewer` を使い、実際の設定・データを更新し得る。
+single-instance mutexも共有するので、先にインストール版・常駐tray版のmImageViewerを終了する。

@@ -114399,3 +114399,437 @@ fn front_popup_presentation_open_keeps_page_owner_until_the_display_target_chang
 
 mod collection_return;
 mod edit_history_1681;
+
+#[cfg(windows)]
+mod ring_saved_group_fullscreen_tests {
+    use super::*;
+    use crate::ring_shortcut::{RingActionId, RingDirection, RingShortcutContext};
+
+    fn image_viewer(app: &mut App) {
+        seed_snapshot_context(app, "C:/ring-source", &["C:/ring-source/page.jpg"]);
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+    }
+
+    fn open_book(app: &mut App, ctx: &egui::Context) {
+        assert!(
+            app.apply_ring_action(
+                ctx,
+                RingShortcutContext::ImageFullscreen,
+                RingActionId::OpenBook1,
+                "ring-saved-group-test",
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn ring_saved_group_closes_fullscreen_before_creating_main_grid_request() {
+        let mut app = phase_c_support::setup_app();
+        let ctx = egui::Context::default();
+        image_viewer(&mut app);
+        let source = app.smart_folder_source_lease().unwrap();
+        assert!(app.projected_viewer_session_open());
+
+        open_book(&mut app, &ctx);
+
+        assert!(!app.projected_viewer_session_open());
+        assert!(app.saved_group_open_request_id_for_test().is_some());
+        assert_eq!(app.smart_folder_source_lease(), Some(source));
+        assert_eq!(app.projected_viewer_context_id(), app.viewer_context_main());
+        assert!(app.saved_group_open_modal_visible());
+    }
+
+    #[test]
+    fn ring_saved_group_drains_video_terminal_effects_before_request() {
+        let mut app = phase_c_support::setup_app();
+        let ctx = egui::Context::default();
+        let idx = install_native_deadline_player(
+            &mut app,
+            PathBuf::from("C:/clips/ring-transition.mp4"),
+            10.0,
+            30.0,
+            false,
+        );
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        begin_test_video_presentation_transition(
+            &mut app,
+            ViewerPresentation::DetachedWindow,
+            false,
+        );
+        app.spread_popup_open = true;
+        assert!(app.video_presentation_transition.is_transitioning());
+
+        assert!(
+            app.apply_ring_action(
+                &ctx,
+                RingShortcutContext::VideoFullscreen,
+                RingActionId::OpenBook1,
+                "ring-saved-group-test",
+            )
+            .is_none()
+        );
+
+        assert!(!app.projected_viewer_session_open());
+        assert!(!app.video_presentation_transition.is_transitioning());
+        assert!(app.video_presentation_transition.take_effects().is_empty());
+        assert!(!app.spread_popup_open);
+        assert!(
+            !app.fs_cache
+                .values()
+                .any(|entry| matches!(entry, FsCacheEntry::Video { .. }))
+        );
+        assert!(app.saved_group_open_modal_visible());
+    }
+
+    #[test]
+    fn ring_saved_group_snapshot_and_other_navigation_refuse_before_close() {
+        for snapshot in [true, false] {
+            let mut app = phase_c_support::setup_app();
+            let ctx = egui::Context::default();
+            image_viewer(&mut app);
+            let (_tx, rx) = std::sync::mpsc::channel();
+            let cancel = Arc::new(AtomicBool::new(false));
+            if snapshot {
+                app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+                assert!(app.is_snapshot_active());
+            } else {
+                app.folder_nav_pending = Some(FolderNavPending {
+                    cancel: Arc::clone(&cancel),
+                    rx,
+                    forward: true,
+                    mode: FolderNavMode::Grid,
+                });
+            }
+            let source = app.smart_folder_source_lease();
+            app.spread_popup_open = true;
+
+            open_book(&mut app, &ctx);
+
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert!(app.spread_popup_open, "refusal must not run teardown");
+            assert_eq!(app.smart_folder_source_lease(), source);
+            assert!(app.saved_group_open.is_none());
+            assert!(!cancel.load(Ordering::Relaxed));
+            if !snapshot {
+                assert!(app.folder_nav_pending.is_some());
+            }
+        }
+    }
+
+    fn pending_undo(
+        app: &mut App,
+        root: &Path,
+    ) -> std::sync::mpsc::Sender<Result<crate::books::BookOpResult, String>> {
+        let folder = root.join("undo-book");
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut builder =
+            crate::book_append_undo::AppendReceiptBuilder::begin(root, &folder, "undo-book".into())
+                .unwrap();
+        let page = folder.join("0001.jpg");
+        std::fs::write(&page, b"appended page").unwrap();
+        builder.record(&page).unwrap();
+        let receipt = crate::book_append_undo::BookAppendUndoReceipt {
+            files: builder.finish().unwrap(),
+            operation_id: 17,
+            source_context: app.projected_viewer_context_id(),
+            accepted_revision: app.book_append_undo_revision,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.book_op_pending = Some(crate::books::BookOpPending {
+            rx,
+            shelf_scope: None,
+            intent: crate::books::BookOpIntent::UndoAppend { receipt },
+        });
+        tx
+    }
+
+    #[test]
+    fn ring_saved_group_pending_append_undo_keeps_viewer_and_rejects_requests() {
+        for action in [RingActionId::OpenBook1, RingActionId::OpenCollection1] {
+            let mut app = phase_c_support::setup_app();
+            let ctx = egui::Context::default();
+            image_viewer(&mut app);
+            let root = app.tmp.path().join("undo-books");
+            std::fs::create_dir_all(&root).unwrap();
+            let _tx = pending_undo(&mut app, &root);
+            assert!(app.book_append_undo_in_progress());
+            // Collections pass the shelf-update admission check, reaching the real
+            // terminal-close Err; books are refused before invoking close.
+            if action == RingActionId::OpenCollection1 {
+                assert!(
+                    app.saved_group_open_source_if_allowed(
+                        crate::keymap::KeyAction::GridOpenCollection1,
+                    )
+                    .is_some()
+                );
+                assert_eq!(
+                    app.close_fullscreen_to_completion(&ctx),
+                    Err(LocalViewerCloseFailure::FullscreenTeardown)
+                );
+            }
+
+            assert!(
+                app.apply_ring_action(
+                    &ctx,
+                    RingShortcutContext::ImageFullscreen,
+                    action,
+                    "ring-saved-group-test",
+                )
+                .is_none()
+            );
+
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert!(app.projected_viewer_session_open());
+            assert!(app.saved_group_open.is_none());
+            assert!(app.book_append_undo_in_progress());
+        }
+    }
+
+    #[test]
+    fn ring_saved_group_rejects_remaining_deferred_viewer_even_when_close_returns_ok() {
+        let mut app = phase_c_support::setup_app();
+        let ctx = egui::Context::default();
+        app.items = vec![GridItem::Video(PathBuf::from("C:/clips/vst-pending.mp4"))];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.fullscreen_idx = None;
+        app.vst3_deferred_media_open = Some(0);
+        let root = app.tmp.path().join("undo-books");
+        std::fs::create_dir_all(&root).unwrap();
+        let _tx = pending_undo(&mut app, &root);
+        assert!(app.projected_viewer_session_open());
+        assert!(
+            app.saved_group_open_source_if_allowed(crate::keymap::KeyAction::GridOpenCollection1,)
+                .is_some()
+        );
+        // Terminal navigation retirement clears EPUB reopen, but VST startup is
+        // content-owned. Undo blocks that content teardown; no fullscreen index
+        // remains for close_fullscreen_to_completion's Err check to detect.
+        assert_eq!(app.close_fullscreen_to_completion(&ctx), Ok(()));
+        assert!(app.projected_viewer_session_open());
+        let source = app.smart_folder_source_lease();
+
+        assert!(
+            app.apply_ring_action(
+                &ctx,
+                RingShortcutContext::VideoFullscreen,
+                RingActionId::OpenCollection1,
+                "ring-saved-group-test",
+            )
+            .is_none()
+        );
+
+        assert_eq!(app.fullscreen_idx, None);
+        assert_eq!(app.vst3_deferred_media_open, Some(0));
+        assert!(app.projected_viewer_session_open());
+        assert_eq!(app.smart_folder_source_lease(), source);
+        assert!(app.saved_group_open.is_none());
+        assert!(app.book_append_undo_in_progress());
+    }
+
+    #[test]
+    fn ring_saved_group_linked_f12_uses_main_lease_and_normal_terminal_cleanup() {
+        let mut app = phase_c_support::setup_app();
+        let ctx = egui::Context::default();
+        image_viewer(&mut app);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
+        app.begin_mounted_detached_session_for_test(173301, DetachedSource::Image);
+        let source = app
+            .smart_folder_source_lease()
+            .expect("linked F12 retains main source");
+        assert_eq!(app.projected_viewer_context_id(), app.viewer_context_main());
+        assert_eq!(
+            app.locate_window_context(173301).unwrap().0,
+            app.viewer_context_main()
+        );
+
+        open_book(&mut app, &ctx);
+
+        assert!(!app.projected_viewer_session_open());
+        assert!(app.saved_group_open_request_id_for_test().is_some());
+        assert_eq!(app.smart_folder_source_lease(), Some(source));
+        assert!(
+            app.saved_group_open_modal_visible(),
+            "wait belongs to the visible main grid"
+        );
+        app.finalize_closed_active_detached_viewport(
+            &ctx,
+            App::detached_image_window_viewport_id(173301),
+        );
+        assert!(app.active_detached_session.is_none());
+        assert_eq!(app.detached_viewer_window_id(), None);
+        assert!(app.locate_window_context(173301).is_none());
+        assert!(!app.fs_viewport_shown);
+        assert!(app.saved_group_open_modal_visible());
+    }
+
+    #[test]
+    fn ring_saved_group_independent_context_refusal_preserves_main_and_sibling() {
+        let mut app = phase_c_support::setup_app();
+        let ctx = egui::Context::default();
+        image_viewer(&mut app);
+        app.fullscreen_idx = None;
+        let main_source = app.smart_folder_source_lease();
+        let main_items = app.items.iter().map(GridItem::perf_key).collect::<Vec<_>>();
+        let main_generation = app.items_generation;
+        let independent = app.build_window_context_for_test(173302, |bundle| {
+            bundle.items = vec![GridItem::Image(PathBuf::from("C:/independent/a.jpg"))];
+            bundle.current_folder = Some(PathBuf::from("C:/independent"));
+            bundle.fullscreen_idx = Some(0);
+            bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        });
+        let sibling = app.build_window_context_for_test(173303, |bundle| {
+            bundle.items = vec![GridItem::Image(PathBuf::from("C:/sibling/b.jpg"))];
+            bundle.fullscreen_idx = Some(0);
+            bundle.viewer_presentation = ViewerPresentation::DetachedWindow;
+        });
+        let sibling_before = app
+            .with_owner_viewer_context(sibling, |app| {
+                (
+                    app.items_generation,
+                    app.fullscreen_idx,
+                    app.items[0].perf_key(),
+                    app.detached_viewer_window_id(),
+                )
+            })
+            .unwrap();
+
+        app.with_owner_viewer_context(independent, |app| {
+            assert!(app.smart_folder_source_lease().is_none());
+            let generation = app.items_generation;
+            let binding = app.detached_viewer_window_id();
+            open_book(app, &ctx);
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert_eq!(app.items_generation, generation);
+            assert_eq!(app.detached_viewer_window_id(), binding);
+            assert_eq!(
+                app.current_folder.as_deref(),
+                Some(Path::new("C:/independent"))
+            );
+            assert!(app.saved_group_open.is_none());
+        })
+        .unwrap();
+
+        assert_eq!(app.smart_folder_source_lease(), main_source);
+        assert_eq!(app.items_generation, main_generation);
+        assert_eq!(
+            app.items.iter().map(GridItem::perf_key).collect::<Vec<_>>(),
+            main_items
+        );
+        assert_eq!(app.fullscreen_idx, None);
+        assert!(app.saved_group_open.is_none());
+        assert_eq!(
+            app.with_owner_viewer_context(sibling, |app| {
+                (
+                    app.items_generation,
+                    app.fullscreen_idx,
+                    app.items[0].perf_key(),
+                    app.detached_viewer_window_id(),
+                )
+            })
+            .unwrap(),
+            sibling_before
+        );
+        assert!(app.locate_window_context(173302).is_some());
+        assert!(app.locate_window_context(173303).is_some());
+    }
+
+    #[test]
+    fn ring_saved_group_native_video_x_release_delivers_collection_to_main_dispatcher() {
+        use crate::gamepad::{PadButton, PadEvent};
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        let mut app = phase_c_support::setup_app();
+        let ctx = egui::Context::default();
+        let runtime = crate::collection_store::CollectionStoreRuntime::start_at(
+            app.tmp.path().join("ring-collections.db"),
+        )
+        .unwrap();
+        let client = runtime.client();
+        app.install_collection_runtime(runtime);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.collection_action_catalog().is_err() {
+            app.poll_collection_ui(&ctx);
+            assert!(std::time::Instant::now() < deadline, "initial catalog");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let collection = client
+            .create_collection("X ring target".into())
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        let target = collection.collection_id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !app
+            .collection_action_catalog()
+            .is_ok_and(|(ids, _)| ids == [target])
+        {
+            app.poll_collection_ui(&ctx);
+            assert!(std::time::Instant::now() < deadline, "created catalog");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let idx = install_native_deadline_player(
+            &mut app,
+            PathBuf::from("C:/clips/ring-native.mp4"),
+            10.0,
+            30.0,
+            false,
+        );
+        app.fullscreen_idx = Some(idx);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.settings.gamepad_enabled = true;
+        app.detached_window_manager
+            .note_input_surface(crate::app::ActionSurface::Viewer);
+        app.settings.ring_shortcuts.video.slots[RingDirection::Up.slot_index()] =
+            RingActionId::OpenCollection1;
+        assert!(app.native_video_fullscreen_active_for_main_backdrop());
+        for event in [
+            PadEvent::ButtonPressed(PadButton::West),
+            PadEvent::ButtonPressed(PadButton::DPadUp),
+        ] {
+            app.gamepad.push_for_test(event);
+        }
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
+            let batch = app.sample_gamepad_input_with_logic_for_test(ctx);
+            assert!(app.dispatch_gamepad_batch(ctx, batch).nav.is_none());
+        })
+        .drop_without_applying_deltas();
+        assert!(app.gamepad.state.west_ring_active());
+        assert_eq!(
+            app.gamepad.state.west_ring_direction(),
+            Some(RingDirection::Up)
+        );
+        app.gamepad
+            .push_for_test(PadEvent::ButtonReleased(PadButton::West));
+        ctx.run_pass(egui::RawInput::default(), |ctx| {
+            let batch = app.sample_gamepad_input_with_logic_for_test(ctx);
+            let outcome = app.dispatch_gamepad_batch(ctx, batch);
+            assert!(matches!(outcome.nav, Some(crate::ui_main::AddressBarNav::CollectionOpen(id)) if id == target));
+            assert!(!app.projected_viewer_session_open());
+            // App::update evaluates this gate after dispatch: CollectionOpen must reach
+            // the ordinary dispatcher instead of the native backdrop's early return.
+            assert!(!app.native_video_fullscreen_active_for_main_backdrop());
+            app.post_render_main_navigation(ctx, crate::app::update_phases::MainFrameNavigation {
+                fav_nav: None, toolbar_fav_nav: None, fullscreen_close_nav: None,
+                keyboard_nav: None, keyboard_nav_from_fullscreen_close: false,
+                gamepad_nav: outcome.nav, address_nav: None, open_folder_nav: None,
+                context_nav: None, folder_pane_nav: None, grid_nav: None,
+            });
+        }).drop_without_applying_deltas();
+
+        assert_eq!(
+            app.top_level_grid_view
+                .collection_session()
+                .unwrap()
+                .identity
+                .collection_id,
+            target
+        );
+        assert!(!app.gamepad.state.west_ring_active());
+        assert!(app.saved_group_open.is_none());
+        app.shutdown_collection_runtime_for_exit();
+    }
+}

@@ -208,6 +208,38 @@ mod overview_viewer_chrome_tests {
         (output, area)
     }
 
+    #[test]
+    fn saved_group_ring_actions_do_not_execute_in_page_overview() {
+        fixture(Mode::Fullscreen, |app, ctx| {
+            let original_idx = app.fullscreen_idx;
+            assert!(app.page_overview.session().is_some());
+            let actions: Vec<_> =
+                RingActionId::available_for_context(RingShortcutContext::ImageFullscreen)
+                    .into_iter()
+                    .filter(|action| action.saved_group_key_action().is_some())
+                    .collect();
+            assert_eq!(actions.len(), 44);
+            for action in actions {
+                assert!(
+                    app.apply_ring_action(
+                        ctx,
+                        RingShortcutContext::ImageFullscreen,
+                        action.clone(),
+                        "saved-group-overview-test"
+                    )
+                    .is_none(),
+                    "{action:?}"
+                );
+                assert_eq!(app.fullscreen_idx, original_idx, "{action:?}");
+                assert!(app.page_overview.session().is_some(), "{action:?}");
+                assert!(
+                    app.saved_group_open_request_id_for_test().is_none(),
+                    "{action:?}"
+                );
+            }
+        });
+    }
+
     fn gamepad_frame(app: &mut App, ctx: &egui::Context, events: &[PadEvent]) -> egui::FullOutput {
         for event in events {
             app.gamepad.push_for_test(*event);
@@ -1777,7 +1809,8 @@ const RING_STICK_HYSTERESIS_DEGREES: f32 = 8.0;
 // Keep commands that leave the view or control the window available during a
 // stale aggregate refresh. An unrecognized/new action is item-owned by default.
 fn grid_ring_action_allowed_during_refresh(action: &RingActionId) -> bool {
-    action.favorite_slot_number().is_some()
+    action.saved_group_key_action().is_some()
+        || action.favorite_slot_number().is_some()
         || action.drive_letter().is_some()
         || action.location_rating_stars().is_some()
         || matches!(
@@ -4115,7 +4148,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         batch: GamepadFrameBatch,
-        admission: impl FnOnce(&Self, &egui::Context) -> bool,
+        admission: impl Fn(&Self, &egui::Context) -> bool,
     ) -> GamepadDispatchOutcome {
         let operations = if self.page_turn_operation_tracking_needed() {
             batch.presentation_operations()
@@ -4175,7 +4208,10 @@ impl App {
                 self.page_overview.session().is_some() && self.gamepad_targets_viewer();
             let analog_ordinal = events.len() as u32;
             for event in events {
-                if self.gamepad_targets_viewer() {
+                // A preceding action can open a modal in this same batch. Keep
+                // delivering physical facts, but recheck ownership for every semantic action.
+                let event_allowed = admission(self, ctx);
+                if event_allowed && self.gamepad_targets_viewer() {
                     self.service_final_prepare_before_lookup(ctx);
                 }
                 match event {
@@ -4189,7 +4225,7 @@ impl App {
                         if action.kind == PadActionKind::Press {
                             self.gamepad.state.deliver_button_edge(action.button, true);
                         }
-                        if nav.is_none() {
+                        if event_allowed && nav.is_none() {
                             if let Some(next_nav) = self
                                 .dispatch_gamepad_batch_button_with_operation(
                                     ctx,
@@ -4209,6 +4245,16 @@ impl App {
                         }
                     }
                 }
+            }
+            if !admission(self, ctx) {
+                self.reset_gamepad_continuous_steps(now);
+                self.gamepad.state.suppress_pending_actions();
+                return GamepadDispatchOutcome {
+                    nav,
+                    dispatched,
+                    dispatch_allowed: false,
+                    saw_input_event,
+                };
             }
             // A neutral poll is not input. Preserve the sampled analog fact;
             // merely entering the analog handler must not cancel a page turn.
@@ -4386,7 +4432,12 @@ impl App {
     }
 
     fn gamepad_dispatch_allowed(&self, ctx: &egui::Context) -> bool {
-        if self.sidecar_restore_active() || self.remote_session_blocks_local_control() {
+        // Keyboard ownership is cached for the pass. A modal opened by an
+        // earlier action in this batch must be observed from current App state.
+        if self.sidecar_restore_active()
+            || self.common_modal_dialog_open()
+            || self.remote_session_blocks_local_control()
+        {
             return false;
         }
         // gilrs はグローバル入力 (ウィンドウフォーカス非依存) なので、mIV が前面に
@@ -8122,6 +8173,36 @@ impl App {
         {
             return None;
         }
+        if let Some(key_action) = action.saved_group_key_action() {
+            // Admission must precede close. The lease is only a check here;
+            // apply_saved_group_key_action reacquires the post-close grid source.
+            self.saved_group_open_source_if_allowed(key_action)?;
+            if self.projected_viewer_session_open() {
+                #[cfg(windows)]
+                let close_failed = match self.close_fullscreen_to_completion(ctx) {
+                    Ok(()) => false,
+                    Err(error) => {
+                        crate::logger::log(format!(
+                            "[saved-group] fullscreen close failed: {error:?}"
+                        ));
+                        true
+                    }
+                };
+                #[cfg(not(windows))]
+                let close_failed = {
+                    self.close_fullscreen();
+                    false
+                };
+                if close_failed || self.projected_viewer_session_open() {
+                    crate::logger::log("[saved-group] fullscreen remained open; request rejected");
+                    self.show_feedback_warning(
+                        "全画面を閉じられなかったため開けませんでした".into(),
+                    );
+                    return None;
+                }
+            }
+            return self.apply_saved_group_key_action(ctx, key_action);
+        }
         if let Some(slot) = action.favorite_slot_number() {
             return self.apply_ring_favorite_slot(ctx, slot, source);
         }
@@ -11108,6 +11189,119 @@ mod tests {
         GAMEPAD_LIST_VISIBLE_ROWS, GamepadListPickerHeading,
         draw_gamepad_list_picker_overlay_layout, draw_gamepad_ring_picker_overlay_layout,
     };
+
+    #[test]
+    fn saved_group_ring_book_request_is_allowed_during_grid_refresh() {
+        use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+        use std::sync::Arc;
+        let mut app = crate::app::setup_app_for_test();
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        app.book_op_pending = Some(crate::books::BookOpPending {
+            rx: receiver,
+            intent: crate::books::BookOpIntent::List { navigation: None },
+            shelf_scope: None,
+        });
+        let view = Arc::new(crate::filename_stack::StackView::build(
+            Default::default(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            app.settings.stack_separator,
+            app.settings.sort_order,
+        ));
+        app.stack_view = Some(Arc::clone(&view));
+        app.stack_return_state =
+            Some(crate::filename_stack_ui::StackReturnState::Refreshing { view });
+        assert!(!app.grid_item_input_allowed());
+        for action in RingActionId::available_for_context(RingShortcutContext::Grid)
+            .iter()
+            .filter(|action| action.saved_group_key_action().is_some())
+        {
+            assert!(
+                super::grid_ring_action_allowed_during_refresh(action),
+                "{action:?}"
+            );
+        }
+        let nav = app.apply_ring_action(
+            &egui::Context::default(),
+            RingShortcutContext::Grid,
+            RingActionId::OpenBook1,
+            "saved-group-ring-test",
+        );
+        assert!(nav.is_none());
+        assert!(app.saved_group_open_request_id_for_test().is_some());
+        assert!(app.saved_group_open_modal_visible());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn gamepad_batch_stops_semantics_after_any_modal_but_delivers_releases() {
+        use crate::gamepad::{PadButton, PadEvent};
+        use crate::ring_shortcut::{RingActionId, RingDirection, RingShortcutContext};
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        for action in [RingActionId::OpenBook1, RingActionId::OpenPreferences] {
+            let mut app = crate::app::setup_app_for_test();
+            let ctx = egui::Context::default();
+            let folder = app.tmp.path().join("parent").join("child");
+            std::fs::create_dir_all(&folder).unwrap();
+            app.current_folder = Some(folder.clone());
+            app.settings.gamepad_enabled = true;
+            app.settings
+                .ring_shortcuts
+                .profile_mut(RingShortcutContext::Grid)
+                .slots[RingDirection::Up.slot_index()] = action.clone();
+            let (_sender, receiver) = std::sync::mpsc::channel();
+            app.book_op_pending = Some(crate::books::BookOpPending {
+                rx: receiver,
+                intent: crate::books::BookOpIntent::List { navigation: None },
+                shelf_scope: None,
+            });
+            for event in [
+                PadEvent::ButtonPressed(PadButton::West),
+                PadEvent::ButtonPressed(PadButton::DPadUp),
+                PadEvent::ButtonReleased(PadButton::West),
+                PadEvent::ButtonReleased(PadButton::DPadUp),
+                PadEvent::ButtonPressed(PadButton::East),
+                PadEvent::ButtonReleased(PadButton::East),
+            ] {
+                app.gamepad.push_for_test(event);
+            }
+            let mut outcome = None;
+            ctx.run_pass(egui::RawInput::default(), |ctx| {
+                let owner = app.keyboard_owner_for_pass(ctx);
+                assert!(!owner.blocks_legacy_main_shortcuts());
+                let batch = app.sample_gamepad_input_with_logic_for_test(ctx);
+                outcome = Some(app.dispatch_gamepad_batch(ctx, batch));
+                // The owner remains cached even though the real modal opened.
+                assert_eq!(app.keyboard_owner_for_pass(ctx), owner);
+            })
+            .drop_without_applying_deltas();
+            let outcome = outcome.unwrap();
+            assert!(app.common_modal_dialog_open(), "{action:?}");
+            assert!(
+                outcome.nav.is_none(),
+                "B must not navigate after {action:?}"
+            );
+            assert!(!outcome.dispatch_allowed);
+            assert!(app.folder_nav_pending.is_none());
+            assert_eq!(app.current_folder.as_ref(), Some(&folder));
+            for button in [PadButton::West, PadButton::East, PadButton::DPadUp] {
+                assert!(
+                    !app.gamepad.state.delivered_button_down(button),
+                    "{button:?}"
+                );
+            }
+            if action == RingActionId::OpenBook1 {
+                assert!(app.saved_group_open_modal_visible());
+            }
+            app.cancel_saved_group_open_for_other_nav();
+            app.show_preferences = false;
+            assert!(
+                app.handle_gamepad_back(&ctx).is_some(),
+                "B is otherwise executable"
+            );
+        }
+    }
 
     fn list_order_gamepad_fixture() -> crate::app::tests::phase_c_support::AppTestEnv {
         use crate::app::top_level_grid_view::TopLevelGridSurface;

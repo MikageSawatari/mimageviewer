@@ -306,26 +306,12 @@ impl App {
         }
     }
 
-    pub(crate) fn apply_saved_group_key_action(
+    /// Admission only: fullscreen callers discard this lease and acquire the grid's
+    /// authoritative source again after terminal close.
+    pub(super) fn saved_group_open_source_if_allowed(
         &mut self,
-        ctx: &egui::Context,
         action: KeyAction,
-    ) -> Option<AddressBarNav> {
-        match action {
-            KeyAction::GridManageFavorites => {
-                self.show_favorites_editor = true;
-                return None;
-            }
-            KeyAction::GridManageBooks => {
-                self.open_book_manager_from_action();
-                return None;
-            }
-            KeyAction::GridManageCollections => {
-                self.open_collection_manager(None);
-                return None;
-            }
-            _ => {}
-        }
+    ) -> Option<SmartFolderSourceLease> {
         if self.is_snapshot_active() {
             self.show_feedback_warning("スナップショット中は他のフォルダに移動できません".into());
             return None;
@@ -347,6 +333,41 @@ impl App {
             );
             return None;
         };
+        if (action == KeyAction::GridOpenActiveBook
+            || action == KeyAction::GridBookPrev
+            || action == KeyAction::GridBookNext
+            || action.book_slot_number().is_some())
+            && self.book_op_pending.as_ref().is_some_and(|pending| {
+                !matches!(&pending.intent, crate::books::BookOpIntent::List { .. })
+            })
+        {
+            self.show_feedback_warning("本棚の更新処理が進行中です".into());
+            return None;
+        }
+        Some(source)
+    }
+
+    pub(crate) fn apply_saved_group_key_action(
+        &mut self,
+        ctx: &egui::Context,
+        action: KeyAction,
+    ) -> Option<AddressBarNav> {
+        match action {
+            KeyAction::GridManageFavorites => {
+                self.show_favorites_editor = true;
+                return None;
+            }
+            KeyAction::GridManageBooks => {
+                self.open_book_manager_from_action();
+                return None;
+            }
+            KeyAction::GridManageCollections => {
+                self.open_collection_manager(None);
+                return None;
+            }
+            _ => {}
+        }
+        let source = self.saved_group_open_source_if_allowed(action)?;
         let current_book = self.book_action_current_folder();
         let current_collection = self
             .top_level_grid_view
@@ -361,12 +382,6 @@ impl App {
             || action == KeyAction::GridBookNext
             || action.book_slot_number().is_some()
         {
-            if self.book_op_pending.as_ref().is_some_and(|pending| {
-                !matches!(&pending.intent, crate::books::BookOpIntent::List { .. })
-            }) {
-                self.show_feedback_warning("本棚の更新処理が進行中です".into());
-                return None;
-            }
             let id = self.next_saved_group_open_id();
             let lease = crate::collection_store::CollectionReadLease::new(
                 crate::collection_store::CollectionReadScope::viewer(
@@ -695,6 +710,55 @@ mod tests {
     };
     use crate::keymap::KeyAction;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn saved_group_ring_collection_from_grid_returns_the_shared_navigation() {
+        use crate::collection_store::CollectionStoreRuntime;
+        use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+        let mut app = crate::app::setup_app_for_test();
+        let runtime =
+            CollectionStoreRuntime::start_at(app.tmp.path().join("ring-collection.db")).unwrap();
+        let client = runtime.client();
+        app.install_collection_runtime(runtime);
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.collection_action_catalog().is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "initial catalog did not become ready"
+            );
+            app.poll_collection_ui(&ctx);
+            std::thread::yield_now();
+        }
+        let created = client
+            .create_collection("Ring collection".into())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        let id = created.collection_id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app
+            .collection_action_catalog()
+            .ok()
+            .is_none_or(|(ids, _)| !ids.contains(&id))
+        {
+            assert!(Instant::now() < deadline, "catalog did not become ready");
+            app.poll_collection_ui(&ctx);
+            std::thread::yield_now();
+        }
+        let nav = app.apply_ring_action(
+            &ctx,
+            RingShortcutContext::Grid,
+            RingActionId::OpenCollection1,
+            "saved-group-ring-test",
+        );
+        assert!(
+            matches!(nav, Some(crate::ui_main::AddressBarNav::CollectionOpen(found)) if found == id)
+        );
+        assert!(app.saved_group_open.is_none());
+        app.shutdown_collection_runtime_for_exit();
+    }
 
     #[test]
     fn cycle_wraps_and_unknown_current_uses_the_directional_edge() {
