@@ -24082,6 +24082,22 @@ impl App {
         ));
     }
 
+    pub(crate) fn history_input_focus_pending(
+        &self,
+        ctx: &egui::Context,
+        widget: egui::Id,
+    ) -> bool {
+        self.pending_text_input_focus.get().is_some_and(|claim| {
+            claim.viewport == ctx.viewport_id()
+                && claim.widget_id == widget
+                && claim.issued_pass.saturating_add(1) == ctx.cumulative_pass_nr()
+                && ctx
+                    .memory(|memory| memory.focused())
+                    .is_none_or(|focused| focused == widget)
+                && crate::ui_history_field::is_open_for(ctx, widget)
+        })
+    }
+
     pub(crate) fn clear_pending_text_input_focus(&self) {
         let transition = crate::keyboard_input::transition_pending_focus_claim(
             self.pending_text_input_focus.get(),
@@ -62948,6 +62964,7 @@ impl App {
     pub(crate) fn shortcuts_blocked_by_text_input(&self, ctx: &egui::Context) -> bool {
         self.keyboard_owner_for_pass(ctx)
             .blocks_legacy_main_shortcuts()
+            || crate::ui_history_field::owns_pending_focus(ctx)
     }
 
     pub(crate) fn collect_shell_clipboard_paths(
@@ -100925,8 +100942,19 @@ impl App {
         // release/中断の各境界で対象キーのみ無効化済み。
         self.update_thumb_adjust_drag_state();
 
-        let escape_input_owner = self.capture_search_escape_input(ctx);
         let mut search_escape_claim = pinned_search::EscapeClaim::for_frame(self);
+        let history_escape_taken = crate::ui_history_field::take_escape(
+            ctx,
+            self.any_dialog_open() || self.common_modal_dialog_open(),
+        );
+        if history_escape_taken {
+            search_escape_claim.claim(ctx);
+        }
+        let escape_input_owner = if history_escape_taken {
+            None
+        } else {
+            self.capture_search_escape_input(ctx)
+        };
 
         // ── メニューバー ─────────────────────────────────────────────
         let (fav_nav, _) = self.render_menubar(ui);
@@ -101044,6 +101072,7 @@ impl App {
 
         let (folder_pane_nav, folder_pane_rect) = self.render_main_bars(ui, &mut pre_grid_perf);
         self.route_search_escape(ctx, escape_input_owner, &mut search_escape_claim);
+        self.settle_search_input_departure(ctx, history_escape_taken);
         self.record_search_input_focus(ctx);
         // グローバルな一覧ホイール処理は、メニュー/ツールバー/アドレス/ファセット等の
         // popup を描いた後、グリッド描画の直前で行う。早すぎると popup 内 ScrollArea の

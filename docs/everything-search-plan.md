@@ -409,8 +409,12 @@ fullscreen/native/detachedからの検索起動を増やさず、Rの検出probe
 IME確定後Enter/検索ボタンで明示送信し、raw先頭10,000件の後で形式/表示条件を適用する。
 paging/追加取得、自動ext追記、Ctrl+Gの自動集約/hit-count sort/全文対象filterは追加しない。
 
-新しいSettings field/schema/DB/索引/検索履歴/Remote APIは追加せず、settings-transfer項目数を変更しない。
-query/result一覧はmIVの永続データや診断ログに残さない。Everything自身のquery history設定は変更しない。
+Everything 検索自体は専用schema/DB/索引/Remote APIを追加しない。
+後続 §1.756 では、共通の検索欄入力履歴として Settings に保存可否（既定オン）と種類別最近 20 件を追加する。
+確定時および実行済みの語での通常離脱で記録し、常設欄・一時バーで共有する。result一覧は引き続き永続化せず、
+query/result一覧を診断ログへ残さない。履歴本体は設定の持ち運び・Remote・MCPへ公開しない。
+設定オフで現行履歴も消去するが、設定世代バックアップにはしばらく残る。
+Everything自身のquery history設定は変更しない。[入力履歴の設計](search-input-history-plan.md)。
 結果からの通常open/tag/★/cacheは既存の保存契約に従う。
 keymap spec/default/実装計画、検索/shortcut manual、privacy、製品ページ、関連architecture/virtual/top-level/spec/READMEを同期する。
 
