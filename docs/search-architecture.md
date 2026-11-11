@@ -1248,6 +1248,14 @@ return origin の非 empty な保存 route を使う。保存が無い/empty の
 navigation の捕捉値を書き換えず、Plain/他 purpose の履歴規則を変えない。
 Collection の新しい検索終了分岐は Snapshot owner 中には入らず、既存の Snapshot 退役順と fallback を優先する。
 通常は Snapshot 開始時に live search が閉じるが、旧来の混在 state の残存フラグだけで Search 分岐を選ばない。
+§12.3 改訂1 では、検索中の `ExitTemporaryView` の成功採用を「読み取りだけの current 照合・source 履歴捕捉 →
+既存の出発 context 移譲 → main に残った context の検索退役・facet/rows/履歴採用」の順へそろえる。
+移譲済みの事実は採用内の局所の型で installer へ渡し、二重移譲と採用中要求の取消を避ける。
+Collection の採用直前 locked 検査で拒否された場合は移譲・検索退役・採用へ進まず、検索/rows/履歴を保持する。
+bundle 所有の Metadata / Everything 等は移譲先に保持する。Ctrl+S / Ctrl+T の `favsearch` / `tag_view` owner と pending が
+App 共有で bundle に無い点は既存の欠けとして今回未対応で、既存 Plain open との同等性を確認対象とする。
+App field・bundle field・registry 本体・detached 述語・viewport は変更せず、検索なし/他 purpose と
+Smart root の `Direct(Navigation)` の既存順序も維持する。実装・検証の証跡は設計書 §8.14、合意した範囲は §12.3 を参照。
 §1.682 の Everything 一覧順移動は検索を閉じず、結果への帰路だけを成功採用した移動先行へ揃える。
 両項目の詳細は [検索結果ナビゲーション設計](search-result-navigation-682-688-plan.md) を参照。
 

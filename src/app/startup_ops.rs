@@ -4669,7 +4669,10 @@ mod tests {
             assert!(app.should_promote_active_detached_video_for_main_context_change());
             let pdf = crate::pdf_loader::LeasedEpubPath::try_new(app.tmp.path().join("next.pdf"))
                 .unwrap();
-            app.prepare_pdf_visible_adoption(&pdf);
+            app.prepare_pdf_visible_adoption(
+                &pdf,
+                super::MainListInstallBoundary::UseInstallerBoundary,
+            );
             assert!(!app.direct_media_reader_active());
             assert!(
                 app.items.is_empty(),

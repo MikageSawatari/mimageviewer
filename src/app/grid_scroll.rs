@@ -639,11 +639,15 @@ mod tests {
             let adoption = app
                 .prepare_main_list_adoption(navigation, destination)
                 .unwrap();
-            assert!(app.adopt_main_list_navigation(adoption, |owner| {
-                owner.current_folder = Some(path);
-                owner.bump_items_generation();
-                None
-            }));
+            assert!(app.adopt_main_list_navigation(
+                adoption,
+                crate::app::MainListContextBoundaryPlan::None,
+                |owner, _boundary| {
+                    owner.current_folder = Some(path);
+                    owner.bump_items_generation();
+                    None
+                }
+            ));
             assert_eq!(app.grid_scroll.session() != before, changes);
         }
     }

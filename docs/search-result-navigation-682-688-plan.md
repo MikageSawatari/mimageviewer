@@ -1288,6 +1288,182 @@ $env:RUST_BACKTRACE = '1'
 cargo nextest run -p mimageviewer --lib -E 'test(collection_open_from_detached_transient_video_keeps_fallback_return_folder)' --test-threads 1 --no-fail-fast
 ```
 
+### 8.14 §12.3 改訂1の実装と §12 の完了検証 (2026-11-12、未コミット)
+
+§8.13 の停止・失敗は当時の記録として保持する。設計担当と独立設計 reviewer の構造合意と
+§12.3 改訂1、detached 計画 §11 の記録 (`b0ad9f8f8`) を受け、以下を実装した。
+ここでの検証は実装担当による headless 自動検証であり、実機の観測ではない。
+
+#### 変更と所有境界
+
+- `src/app.rs`: `MainListContextBoundaryPlan::{None, Physical, Collection}` と
+  `MainListInstallBoundary::{UseInstallerBoundary, AlreadyHandled(receipt)}` を導入。
+  receipt は共通 adopter だけが発行する局所値で、App に field / bool / Option を追加していない。
+- 読み取りの受付と current 照合後、元の `search_exit_history_source` を捕捉する。
+  検索 owner が active かつ `Direct(ExitTemporaryView)` の場合だけ、宣言された既存境界を先に1回通す。
+  Collection の最終 read-only locked 検査と移譲は同じ同期区間で行い、拒否は検索・一覧・履歴の変更前に返す。
+  `NotNeeded` も処理済みであり、installer 内の cursor capture を繰り返さない。
+- 位置保存・facet 採用・`select_after_load`・検索退役・installer は移譲後の main に適用する。
+  移譲後に元 context の proof を再検証／再捕捉しない。scroll session 等の main 側 bookkeeping は移譲後に読む。
+- `PreparedVisibleInstall` で receipt を物理 loading まで運び、PDF prepare と loading の両方で既存境界を省略する。
+  Collection child は Collection prepare と、その先の物理／PDF の入れ子全体へ同じ receipt を運ぶ。
+- `src/app/collection_grid.rs`、`collection_navigation.rs`、`smart_folder.rs`、`subfolder_expansion.rs`、
+  `image_folder_zip_operation.rs`、`src/global_search_ui.rs` は installer の宣言・受け渡しを更新。
+  `src/app/startup_ops.rs` の非共通 PDF 呼出は既存境界を使う引数を明示した。
+- `src/app/grid_scroll.rs`、`sidecar_restore.rs`、`tests/section1328_session.rs` の既存 fixture は新しい署名へ追従しただけで、
+  期待値は変更していない。既存 detached テストは削除・弱体化していない。
+- `src/app/search_nav_boundary_tests.rs` に下記の回帰を追加。
+  文書は `docs/architecture-overview.md`、`docs/search-architecture.md`、`docs/next-release-backlog.md`、
+  `htdocs/mimageviewer/manual/search.html` を更新した。
+
+境界関数の中身、detached の述語・viewport・registry・binding、bundle の field は変更していない。
+検索なし・他 purpose は `UseInstallerBoundary` で元の順序を保つ。既存 PDF の P → L はそのままである。
+
+#### 共通 adopter を使う21 installer の扱い
+
+L = loading の物理境界 false、P = PDF prepare の物理境界 false、D = drive install の物理境界 false、
+C = Collection prepare の true（同一 binding / fullscreen なしなら NotNeeded）。
+以下は installer が持つ既存境界と局所 plan の対応であり、早期実行は上記の検索終了条件に限定する。
+
+| # | 呼出元／installer | plan と receipt の扱い |
+| --- | --- | --- |
+| 1 | `dispatch_owned_folder_history_destination` Bookmarks | Physical Manual。synthetic の token → L |
+| 2 | 同 ReadingHistory | Physical Manual。prepared reading の token → L |
+| 3 | 同 synthetic Path | Physical Manual。Drive は D、Reading / Bookmarks は token → L |
+| 4 | `adopt_synthetic_surface` | Physical Manual。同じ synthetic 分岐へ渡す |
+| 5 | `load_folder_with_scan_claimed_with_search_origin` | prepared token の Physical。closure 全体の前で移譲し、folder → L |
+| 6 | `enter_reading_history_with_history` | Physical Manual。prepared token → L |
+| 7 | `commit_physical_history_transition` | prepared token の Physical。Folder / ZIP → L、PDF → P / L の両方 |
+| 8 | `commit_staged_rating_navigation` | Physical Manual。場所ジャンプの Rating も Exit。prepared token → L、legacy materialize も receipt を渡して L を省略 |
+| 9 | `zip_nav_show_current_level` | None。軽量 ZIP 階層再表示には該当境界なし |
+| 10 | `adopt_direct_pdf_rows` | prepared token の Physical。P / L の両方へ渡す |
+| 11 | `adopt_direct_collection_shell` | Collection(id)。C を省略可能にする |
+| 12 | `adopt_collection_history_root` | Collection(id)。C を省略可能にし、aggregate 行を設置 |
+| 13 | `adopt_collection_history_child_with_backing` | Collection(id)。C と Folder / ZIP の L、PDF の P / L 全体へ渡す |
+| 14 | `install_collection_outer_physical_adoption` | prepared token の Physical。root 設置後の物理 L / P へ渡す |
+| 15 | `adopt_smart_transition_root` | None。Direct(Navigation) の既存検索終了順序を維持 |
+| 16 | `adopt_smart_child_ready` | prepared token の Physical。child helper と P / L へ渡す |
+| 17 | `restore_smart_folder_for_synthetic_path_with_navigation` | None。Visible の直接 content close / 復元、Offscreen の既存 L を維持 |
+| 18 | `install_prepared_smart_folder` | None。他 purpose の既存 L を維持 |
+| 19 | `install_prepared_subfolder_expansion_owned` | prepared token の Physical。prepared memory → L |
+| 20 | `adopt_prepared_search_view` | None。軽量 Search projection に該当境界なし |
+| 21 | `adopt_image_zip_parent_scan` | prepared token の Physical。唯一の with_completion 直接呼出。parent folder → L |
+
+`PreparedCollectionNavigation::install` 等の root installer に渡す `false` は `preserve_active_media` であり、
+物理境界の `block_locked_media` とは別である。plan を行き先の path / enum だけから推測していない。
+
+#### 移譲前の変更の棚卸しと移動先
+
+| 既存の変更 | 所属 | 今回の扱い |
+| --- | --- | --- |
+| adopter の位置保存 | session 位置・departed generation は bundle、通常 folder_history は App 共有 | 早期境界後の main で実行 |
+| facet Navigation / Reproject / Ancestor | reducer / settings は App 共有、名前 cache / worker / failed generation は bundle | 同上。元 bundle の cache を行き先用に変えない |
+| select_after_load | App 共有の移動先予約 | 同上 |
+| transparent view の退役 | surface / return / snapshot / global_search は bundle。fav/tag owner は App 共有 | 同上。共有 owner の既存欠けは下記 |
+| physical surface install | ZIP / pane / rating / surface / return / stack / PDF epoch は主に bundle、Undo / favorite は共有 | closure 全体を早期境界後に置く |
+| physical history installer | 任意の fullscreen close、password、Collection rows / session、bookmark / reading / rating 効果、deferred open | 同上 |
+| direct PDF / PDF prepare | Smart 取消、surface / return / stack / PDF epoch、favorite の変更 | 同上。P 自体は receipt により省略 |
+| prepared folder install | auto fullscreen 予約、video override、stack rule / error は bundle | 同上 |
+| loading の既存 L より前 | Undo / media / color、ZIP / stack / rating / PDF pending、writeback、Smart / subfolder、picker、prefetch、sidecar。bundle と共有が混在 | 全て早期境界後に実行。L だけを receipt により省略 |
+| Collection 直入 | C 内の restore cursor 捕捉は既存関数の一部、destination session / rows は C の後 | 関数の中身を保ち、C 全体を早期実行。installer の C は省略 |
+| Collection outer physical | close、Collection root / session / aggregate rows、source-open 位置 | closure 全体を早期境界後に置く |
+
+二重境界を残さなかった理由: content close は collection sequence を pending 不在でも進め、book presentation permission を退役し、
+owner の rating picker を終了し、direct media reader の snapshot / return / surface を変え得る。冪等ではない。
+Collection の NotNeeded でも wrapper の cursor capture は実行されるため、wrapper 全体を省略する。
+
+範囲外の残り:
+
+- `favsearch` / `tag_view` 本体・pending、tag の fallback restore は App 共有という既存の欠けがある。
+  bundle が現在運ぶ Metadata / Everything、surface / rows / snapshot / return 等の保持を今回の保証対象とする。
+  context 所有化は行わない。Ctrl+S / Ctrl+T は既存 Plain open との対照で確認し、欠けを固定する assert は追加しない。
+- Smart root は `Direct(Navigation)` と `close_transient_views_before_smart_folder` による独立の検索終了経路で、
+  同型の順序は残る。制約4に従い今回変更しない。
+
+#### 新規テストと検証結果
+
+新規テスト（`src/app/search_nav_boundary_tests.rs`、11件）:
+
+- `search_nav_boundary_physical_location_preserves_departing_context_and_real_back`
+- `search_nav_boundary_saved_book_preserves_departing_context_and_real_back`
+- `search_nav_boundary_collection_preserves_departing_context_and_real_back`
+- `search_nav_boundary_rating_preserves_departing_context_and_real_back`
+- `search_nav_boundary_drive_list_preserves_departing_context_and_real_back`
+- `search_nav_boundary_shared_search_owners_match_existing_plain_collection_open`
+- `search_nav_boundary_collection_lock_after_prepare_keeps_source_and_history`
+- `search_nav_boundary_image_park_keeps_picture_reopen_identity_and_window`
+- `search_nav_boundary_receipt_prevents_pdf_and_loading_items_from_closing_again`
+- `search_nav_boundary_direct_pdf_preserves_search_before_destination_presentation`
+- `search_nav_boundary_collection_child_preserves_departure_through_nested_physical_install`
+
+最初の4件はそれぞれ4検索 × Root / 正規結果から入った実子 × detached 有無を検査する。
+Metadata / Everything は accepted owner（適用条件／dataset Arc identity・run）、surface、rows / generation、
+return origin / route、player identity、presentation demand を移譲前後で比較し、実際の Back consumer で検索前へ戻る。
+共有 facet reducer は bundle ではないため旧 window に保持される条件にはせず、bundle の canonical return route を検査する。
+Ctrl+S / Ctrl+T の owner は既存 Plain Collection open との同等性を別に検査する。
+
+独立ソースレビューは Rating の場所ジャンプも L 境界へ達することを指摘した。最初の None 指定を Physical Manual に訂正し、
+prepared / legacy 両方へ receipt を通したうえで ACCEPT。レビューは Cargo を実行せず、以下の実行証跡と区別する。
+
+実行記録（実装担当による自動検証、最終 GREEN）:
+
+| コマンド・確認 | 結果・証跡 |
+| --- | --- |
+| `cargo check -p mimageviewer --lib` | Cargo / run-heavy **exit 0**、1m16s。`target/search-nav-section12-3-check-lib.log` |
+| 初回 `cargo check -p mimageviewer --lib --tests` | **exit 101**。新規 module の `LocationJumpTarget` import 漏れ E0433 が4件。import を訂正。`target/search-nav-section12-3-check-tests.log` |
+| 訂正後の同 check | **exit 0**、2m07s。`target/search-nav-section12-3-check-tests-fixed.log` |
+| 初回 narrow（新規11件＋停止原因の既存1件） | **exit 100**、12件中11成功 / 1失敗、17,424 skip、8.174s、build 6m20s。`target/search-nav-section12-3-narrow-first.log`。既存 detached 回帰は成功。残る新規 Collection child の sequence 期待値を下記の理由で訂正 |
+| 訂正後の同 narrow | **exit 0、12/12 成功**、17,424 skip、13.530s、build 2m30s。`target/search-nav-section12-3-narrow.log`。停止原因の既存1件と新規11件を全て含む |
+| §8.13 と同じ関連 focused gate | **exit 0、4,685/4,685 成功**、12,751 skip、591.901s、build 1.24s。`target/search-nav-section12-3-focused.log`。新規11件、§12 の既存16件、停止原因の既存 detached 回帰を含む。負荷疑いの失敗や単独再実行はなし |
+| 最後の整形・静的検査 | `cargo fmt`（引数なし）、`cargo fmt --check`、`git diff --check` は全て成功。glyph は危険文字0、cards は53件 / 超過0。`target/search-nav-section12-3-final-checks.log`。runner 最終 **exit 0** |
+| 独立ソースレビュー | **ACCEPT**。21 installer、追加11件、選択・binding・再生状態の追加検査を確認。reviewer は Cargo を実行せず、実装担当の実行結果と区別 |
+| 境界・保護領域の静的比較 | 境界と関連14関数、registry 全文は HEAD と同一。整形後も主要11関数を再照合して同一。`ui_main.rs`、`ui_pinned_search.rs`、`app/pinned_search.rs`、`app/detached_window_manager.rs` も整形後に本文同一 |
+
+初回 narrow の1失敗は新規テストの固定値1の誤りだった。Collection の `begin_with_origin` → `begin` は sequence を進めるが、
+App 共有の fav/tag owner が promote 後も main に残る場合、その正規退役の `take_return_origin` → `take_return_to` でも先に進む。
+Metadata / Everything のケースは既に成功し、Ctrl+S のケースで実値2との不一致になった。
+製品側は変更せず、同じ検索種・detached 再生状態で既存 Plain Collection open（C → transient 退役 → begin、物理 L なし）を
+別 fixture で実行し、その sequence と入れ子 child 採用を比較する形に訂正した。
+余分な L close は依然として増分になるため失敗し、共有 owner の既存の欠けを固定値で要求しない。独立レビューも訂正を ACCEPT。
+既存テストの期待値変更は今回なく、署名追従だけである。
+
+Cargo の build / test はすべて、以下の共通 runner 経由で実行する。
+PC 共通 full-test lock 中は待機し、lock 領域への書込不可は指定どおり警告後に低優先度・6並列へ移行する。
+`CARGO_BUILD_JOBS` / `-j` は実装担当から指定していない。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE = '1'
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local\miv-locks\run-heavy.ps1 -Owner "682-codex" -WorkDir G:\home\mimageviewer-682 -Command "<下記の cargo コマンド>"
+```
+
+最初の2回の log 採取では外側 PowerShell が stderr を `NativeCommandError` として再表示し、shell status が1になった。
+表の exit は Cargo を運ぶ run-heavy の記録であり、warning の再表示と compile error を混同していない。
+訂正後からは外側も `exit $LASTEXITCODE` を明示して runner の終了値を保存する。
+
+nextest の exact command（環境変数・runner は上記）:
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(search_nav_boundary) | test(collection_open_from_detached_transient_video_keeps_fallback_return_folder)' --test-threads 6 --no-fail-fast
+cargo nextest run -p mimageviewer --lib -E 'test(list_order) | test(everything) | test(location) | test(gamepad) | test(jump) | test(section1328) | test(section1339) | test(favorite) | test(bookshelf) | test(books_root) | test(menubar) | test(pane) | test(address) | test(backdrop) | test(startup_restore) | test(saved_group) | test(book) | test(collection) | test(active_book) | test(ring) | test(section1733) | test(keymap) | test(pinned_search) | test(search_history) | test(history_field) | test(section207) | test(section1684) | test(section1732) | test(gps) | test(section1759) | test(section1756) | test(search_nav) | test(keyboard_input) | test(facet) | test(folder_history) | test(history_parent) | test(reading_history)' --test-threads 6 --no-fail-fast
+```
+
+後者は §8.13 と同じ全文 filter で、新規11件も `test(search_nav)` に含む。
+実行は `target/search-nav-section12-3-verify.ps1` から行い、前者の失敗時は後者へ進まない。
+後者の filter は `target/search-nav-section12-filter.txt` から読み込むが、上記全文と同じである。
+runner 自身の log は `target/search-nav-section12-3-verify-runner.log`、初回は末尾 `-first.log` に保持する。
+focused 成功後は同 script で次を順に行った（結果は上表）:
+
+```powershell
+cargo fmt
+cargo fmt --check
+git diff --check
+python scripts/check_ui_glyphs.py
+python scripts/check_site_cards.py
+```
+
+§12 は承認された §12.3 改訂1 の範囲で実装・自動検証を完了した（未コミット）。
+§8.13 の停止は履歴として残す。実機・full suite・build-dev・製品起動・commit は今回未実施で、設計担当へ引き継ぐ。
+
 ## 9. 追補: ツールバーのお気に入りもそろえる (2026-11-11 利用者決定)
 
 利用者の判断 (親セッション経由、2026-11-11): §2.1 範囲外で相談事項にした「ツールバーのお気に入りは移動前に検索を閉じる」不揃いは、

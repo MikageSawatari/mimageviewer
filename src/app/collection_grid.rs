@@ -2159,21 +2159,27 @@ impl App {
         let Some(adoption) = self.prepare_main_list_adoption(navigation, destination) else {
             return false;
         };
-        self.adopt_main_list_navigation(adoption, move |app| {
-            app.prepare_collection_main_context_change(collection_id);
-            if fullscreen_close_origin {
-                app.close_fullscreen();
-            }
-            app.open_collection_grid_after_context_change(
-                collection_id,
-                restore,
-                origin.as_ref().map(|origin| origin.restore.clone()),
-            );
-            if let Some(origin) = origin {
-                app.top_level_grid_view.install_return_origin(origin);
-            }
-            None
-        })
+        self.adopt_main_list_navigation(
+            adoption,
+            super::MainListContextBoundaryPlan::Collection(collection_id),
+            move |app, boundary| {
+                if boundary.uses_installer_boundary() {
+                    app.prepare_collection_main_context_change(collection_id);
+                }
+                if fullscreen_close_origin {
+                    app.close_fullscreen();
+                }
+                app.open_collection_grid_after_context_change(
+                    collection_id,
+                    restore,
+                    origin.as_ref().map(|origin| origin.restore.clone()),
+                );
+                if let Some(origin) = origin {
+                    app.top_level_grid_view.install_return_origin(origin);
+                }
+                None
+            },
+        )
     }
 
     pub(crate) fn start_collection_history_prepare(
@@ -2402,30 +2408,37 @@ impl App {
         let Some(adoption) = self.prepare_main_list_adoption(navigation, destination) else {
             return false;
         };
-        self.adopt_main_list_navigation(adoption, |app| {
-            // The read-only admission above makes this native transfer non-rejecting.
-            let _ = app.prepare_collection_main_context_change(identity.collection_id);
-            app.save_departing_session_grid_positions();
-            if !retaining_binding {
-                app.top_level_grid_view
-                    .begin_with_origin(TopLevelGridSurface::Collection(identity), return_to);
-            }
-            if let Some(session) = app.top_level_grid_view.collection_session_mut() {
-                if retaining_binding {
-                    session.cancel_pending();
+        self.adopt_main_list_navigation(
+            adoption,
+            super::MainListContextBoundaryPlan::Collection(identity.collection_id),
+            |app, boundary| {
+                // The read-only admission above makes this native transfer non-rejecting.
+                if boundary.uses_installer_boundary() {
+                    let _ = app.prepare_collection_main_context_change(identity.collection_id);
                 }
-                session.wanted_revision = restore.revision_at_open.max(session.accepted_revision);
-                session.restore_anchor = restore.viewport_anchor;
-                session.watch = watch;
-            }
-            if retaining_binding {
-                app.schedule_collection_grid_snapshot();
-            } else {
-                app.reset_details_sort_to_toolbar();
-                app.apply_collection_grid_prepared_install(prepared, None);
-            }
-            None
-        })
+                app.save_departing_session_grid_positions();
+                if !retaining_binding {
+                    app.top_level_grid_view
+                        .begin_with_origin(TopLevelGridSurface::Collection(identity), return_to);
+                }
+                if let Some(session) = app.top_level_grid_view.collection_session_mut() {
+                    if retaining_binding {
+                        session.cancel_pending();
+                    }
+                    session.wanted_revision =
+                        restore.revision_at_open.max(session.accepted_revision);
+                    session.restore_anchor = restore.viewport_anchor;
+                    session.watch = watch;
+                }
+                if retaining_binding {
+                    app.schedule_collection_grid_snapshot();
+                } else {
+                    app.reset_details_sort_to_toolbar();
+                    app.apply_collection_grid_prepared_install(prepared, None);
+                }
+                None
+            },
+        )
     }
 
     /// Keep the replay/restore lineage while refreshing only the native destination payload.
@@ -2695,64 +2708,71 @@ impl App {
         if let super::PreparedPhysicalListing::Zip { prepared, .. } = &listing {
             self.reconcile_zip_refresh_adoption(&mut adoption, prepared);
         }
-        self.adopt_main_list_navigation(adoption, |app| {
-            let _ = app.prepare_collection_main_context_change(session.identity.collection_id);
-            app.save_departing_session_grid_positions();
-            app.install_collection_history_child_session(session);
-            app.pending_auto_fs_open = false;
-            app.cancel_folder_pane_open(super::PaneOpenRestoreExit::Adopted);
-            app.reset_details_sort_to_toolbar();
-            app.reconcile_bookmark_return_target_for_folder_load(&path);
-            if app
-                .reading_history_return_from
-                .as_ref()
-                .is_some_and(|from| !crate::folder_tree::path_eq(&from.container, &path))
-            {
-                app.reading_history_return_from = None;
-            }
-            if folder_changes {
-                if !app.navigation_scope.is_detached_physical() {
-                    crate::thumb_loader::bump_catchup_epoch();
+        self.adopt_main_list_navigation(
+            adoption,
+            super::MainListContextBoundaryPlan::Collection(session.identity.collection_id),
+            |app, boundary| {
+                if boundary.uses_installer_boundary() {
+                    let _ =
+                        app.prepare_collection_main_context_change(session.identity.collection_id);
                 }
-                app.bump_render_epoch_only();
-            }
-            if folder {
-                app.transition_favorite_view_for_path(Some(&path));
-                app.clear_meta_undo();
-                crate::zip_loader::clear_nested_cache();
-                app.zip_nav = None;
-            }
-            let authority = if aliased {
-                super::VisibleInstallAuthority::StagedArchive {
-                    logical_source: &path,
+                app.save_departing_session_grid_positions();
+                app.install_collection_history_child_session(session);
+                app.pending_auto_fs_open = false;
+                app.cancel_folder_pane_open(super::PaneOpenRestoreExit::Adopted);
+                app.reset_details_sort_to_toolbar();
+                app.reconcile_bookmark_return_target_for_folder_load(&path);
+                if app
+                    .reading_history_return_from
+                    .as_ref()
+                    .is_some_and(|from| !crate::folder_tree::path_eq(&from.container, &path))
+                {
+                    app.reading_history_return_from = None;
                 }
-            } else {
-                super::VisibleInstallAuthority::Ordinary
-            };
-            let hydration = app.install_prepared_physical_listing(
-                listing,
-                authority,
-                super::StartupListIntent::ExplicitList,
-                token,
-            );
-            if aliased {
-                app.address = path.to_string_lossy().to_string();
-                if !(app.global_search.active || app.favsearch.active) {
-                    app.forget_recent_folder(&backing);
-                    app.remember_recent_folder(&path);
+                if folder_changes {
+                    if !app.navigation_scope.is_detached_physical() {
+                        crate::thumb_loader::bump_catchup_epoch();
+                    }
+                    app.bump_render_epoch_only();
                 }
-                app.update_active_quick_folder_target(&path);
-                app.archive_source_override = Some(path.clone());
-                app.transition_favorite_view_for_path(Some(&path));
-                if let Some(return_to) = restore_reading_history {
-                    app.reading_history_return_from = Some(return_to);
+                if folder {
+                    app.transition_favorite_view_for_path(Some(&path));
+                    app.clear_meta_undo();
+                    crate::zip_loader::clear_nested_cache();
+                    app.zip_nav = None;
                 }
-                if let Some(state) = restore_bookmark_view {
-                    app.bookmark_view_state = Some(state);
+                let authority = if aliased {
+                    super::VisibleInstallAuthority::StagedArchive {
+                        logical_source: &path,
+                    }
+                } else {
+                    super::VisibleInstallAuthority::Ordinary
+                };
+                let hydration = app.install_prepared_physical_listing(
+                    listing,
+                    authority,
+                    super::StartupListIntent::ExplicitList,
+                    token.with_install_boundary(boundary),
+                );
+                if aliased {
+                    app.address = path.to_string_lossy().to_string();
+                    if !(app.global_search.active || app.favsearch.active) {
+                        app.forget_recent_folder(&backing);
+                        app.remember_recent_folder(&path);
+                    }
+                    app.update_active_quick_folder_target(&path);
+                    app.archive_source_override = Some(path.clone());
+                    app.transition_favorite_view_for_path(Some(&path));
+                    if let Some(return_to) = restore_reading_history {
+                        app.reading_history_return_from = Some(return_to);
+                    }
+                    if let Some(state) = restore_bookmark_view {
+                        app.bookmark_view_state = Some(state);
+                    }
                 }
-            }
-            hydration
-        })
+                hydration
+            },
+        )
     }
 
     fn schedule_collection_grid_snapshot(&mut self) {

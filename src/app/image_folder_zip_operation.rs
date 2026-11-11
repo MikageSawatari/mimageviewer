@@ -958,14 +958,16 @@ impl App {
             Err(reason) => return op.failed(format!("親一覧の採用: {reason:?}")),
         };
         let (completed, receipt) = mpsc::channel();
+        let boundary_plan = self.physical_main_list_boundary_plan(&token);
         self.adopt_main_list_navigation_with_completion(
             adoption,
-            move |app| {
+            boundary_plan,
+            move |app, boundary| {
                 app.install_admitted_physical_surface(&path, &OpenRequestOwner::Navigation, None);
                 app.install_prepared_scanned_folder_listing(
                     prepared,
                     VisibleInstallAuthority::Ordinary,
-                    token,
+                    token.with_install_boundary(boundary),
                 )
             },
             Some(MainListAfterHydration::ImageFolderZip {

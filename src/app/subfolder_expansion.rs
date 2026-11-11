@@ -2642,7 +2642,8 @@ impl App {
             else {
                 return;
             };
-            self.adopt_main_list_navigation(adoption, |app| {
+            let boundary_plan = self.physical_main_list_boundary_plan(&token);
+            self.adopt_main_list_navigation(adoption, boundary_plan, |app, boundary| {
                 app.folder_nav_subfolder_restore = None;
                 app.subfolder_expansion_removed_paths = owned.removed_paths;
                 app.cancel_stack_script_pending();
@@ -2650,7 +2651,12 @@ impl App {
                 app.stack_view = None;
                 app.stack_return_state = None;
                 app.stack_showing_flat = false;
-                app.install_prepared_subfolder_expansion_memory(prepared, ctx, token, owned.purpose)
+                app.install_prepared_subfolder_expansion_memory(
+                    prepared,
+                    ctx,
+                    token.with_install_boundary(boundary),
+                    owned.purpose,
+                )
             });
         } else {
             let hydration = self.install_prepared_subfolder_expansion_memory(

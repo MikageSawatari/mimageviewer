@@ -1484,11 +1484,49 @@ enum MainFacetAdoption {
 
 pub(crate) type MainListHydration = Option<(sidecar_restore::SidecarLoadContinuation, bool)>;
 
+/// The installer declares its existing source-context boundary; destination paths alone
+/// cannot distinguish a native Collection handoff from a physical or in-place install.
+pub(crate) enum MainListContextBoundaryPlan {
+    None,
+    Physical {
+        metadata_boundary: FsMetadataBoundary,
+        close_destination: FullscreenCloseDestination,
+    },
+    Collection(crate::collection_store::CollectionId),
+}
+
+/// Issued only by the common adopter after the existing boundary has been handled.
+/// NotNeeded is handled too: the installer must not repeat its cursor capture.
+#[derive(Clone, Copy)]
+pub(crate) struct MainListBoundaryReceipt {
+    _private: (),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum MainListInstallBoundary {
+    UseInstallerBoundary,
+    AlreadyHandled(MainListBoundaryReceipt),
+}
+
+impl MainListInstallBoundary {
+    pub(crate) fn uses_installer_boundary(self) -> bool {
+        matches!(self, Self::UseInstallerBoundary)
+    }
+}
+
 /// A visible EPUB lease is acquired once before facet/history mutation and moved into the
 /// installer. Cache deletion cannot turn a prepared success into a late install refusal.
 pub(crate) struct PreparedVisibleInstall {
     display_epub_source: Option<crate::pdf_loader::LeasedEpubPath>,
     book_append_refresh: Option<book_append_refresh::BookAppendRefresh>,
+    install_boundary: MainListInstallBoundary,
+}
+
+impl PreparedVisibleInstall {
+    pub(crate) fn with_install_boundary(mut self, boundary: MainListInstallBoundary) -> Self {
+        self.install_boundary = boundary;
+        self
+    }
 }
 
 impl FolderNavHistoryTarget {
@@ -25965,15 +26003,17 @@ impl App {
     pub(crate) fn adopt_main_list_navigation(
         &mut self,
         adoption: MainListAdoption,
-        install: impl FnOnce(&mut Self) -> MainListHydration,
+        boundary_plan: MainListContextBoundaryPlan,
+        install: impl FnOnce(&mut Self, MainListInstallBoundary) -> MainListHydration,
     ) -> bool {
-        self.adopt_main_list_navigation_with_completion(adoption, install, None)
+        self.adopt_main_list_navigation_with_completion(adoption, boundary_plan, install, None)
     }
 
     fn adopt_main_list_navigation_with_completion(
         &mut self,
         adoption: MainListAdoption,
-        install: impl FnOnce(&mut Self) -> MainListHydration,
+        boundary_plan: MainListContextBoundaryPlan,
+        install: impl FnOnce(&mut Self, MainListInstallBoundary) -> MainListHydration,
         completion: Option<MainListAfterHydration>,
     ) -> bool {
         let MainListAdoption {
@@ -25981,33 +26021,69 @@ impl App {
             destination,
             facet_mode,
         } = adoption;
+        let exits_search =
+            matches!(
+                navigation.history,
+                MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView { .. })
+            ) && (self.global_search.active || self.favsearch.active || self.tag_view.active);
         // A search child has the visible child's facet route, while its transparent
         // history location is the pre-search origin. Keep the captured child route
         // for admission; only successful departure records the origin's saved route.
-        let search_exit_history_source =
-            if matches!(
-                navigation.history,
-                MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView { .. })
-            ) && (self.global_search.active || self.favsearch.active || self.tag_view.active)
-            {
-                navigation.source_location.as_ref().map(|source| {
-                    let route = self
-                        .top_level_grid_view
-                        .return_origin()
-                        .filter(|origin| {
-                            FolderNavHistoryTarget::from_restore(&origin.restore).is_some_and(
-                                |target| Self::folder_nav_targets_eq(&target, &source.location),
-                            ) && !origin.route.0.is_empty()
-                        })
-                        .map(|origin| origin.route.clone())
-                        .unwrap_or_else(|| {
-                            FacetRoute::root(Self::facet_scope_for_location(&source.location))
-                        });
-                    FolderNavHistoryEntry::new(source.location.clone(), route)
-                })
-            } else {
-                None
+        let search_exit_history_source = if exits_search {
+            navigation.source_location.as_ref().map(|source| {
+                let route = self
+                    .top_level_grid_view
+                    .return_origin()
+                    .filter(|origin| {
+                        FolderNavHistoryTarget::from_restore(&origin.restore).is_some_and(
+                            |target| Self::folder_nav_targets_eq(&target, &source.location),
+                        ) && !origin.route.0.is_empty()
+                    })
+                    .map(|origin| origin.route.clone())
+                    .unwrap_or_else(|| {
+                        FacetRoute::root(Self::facet_scope_for_location(&source.location))
+                    });
+                FolderNavHistoryEntry::new(source.location.clone(), route)
+            })
+        } else {
+            None
+        };
+        // Source proof and history belong to the outgoing context. Do not recapture or
+        // validate them after promote has installed a fresh main. All destination mutations,
+        // including the departing-position marker and facet caches, follow this boundary.
+        let install_boundary = if exits_search {
+            let result = match boundary_plan {
+                MainListContextBoundaryPlan::None => None,
+                MainListContextBoundaryPlan::Physical {
+                    metadata_boundary,
+                    close_destination,
+                } => Some(self.change_main_context_for_visible_grid_for_destination(
+                    false,
+                    metadata_boundary,
+                    close_destination,
+                )),
+                MainListContextBoundaryPlan::Collection(collection_id) => {
+                    // Keep the final admission and handoff in one synchronous interval.
+                    // The read-only check also precedes prepare's restore-cursor capture.
+                    if !self.collection_main_context_change_allowed(collection_id) {
+                        return false;
+                    }
+                    Some(self.prepare_collection_main_context_change(collection_id))
+                }
             };
+            match result {
+                Some(CollectionMainContextChange::Blocked(_)) => return false,
+                Some(
+                    CollectionMainContextChange::NotNeeded
+                    | CollectionMainContextChange::Transferred,
+                ) => MainListInstallBoundary::AlreadyHandled(MainListBoundaryReceipt {
+                    _private: (),
+                }),
+                None => MainListInstallBoundary::UseInstallerBoundary,
+            }
+        } else {
+            MainListInstallBoundary::UseInstallerBoundary
+        };
         let session_before = self.grid_scroll.session();
         let route_changes = self.facet_navigation.route() != &destination.route;
         let search_reprojection = navigation.source_location.is_none()
@@ -26054,7 +26130,7 @@ impl App {
         ) {
             self.dismiss_transparent_view_for_admitted_jump();
         }
-        let mut hydration = install(self);
+        let mut hydration = install(self, install_boundary);
         if !matches!(
             destination.location,
             FolderNavHistoryTarget::Rating(_) | FolderNavHistoryTarget::RatingPhysical(_)
@@ -26193,7 +26269,24 @@ impl App {
         Ok(PreparedVisibleInstall {
             display_epub_source,
             book_append_refresh: None,
+            install_boundary: MainListInstallBoundary::UseInstallerBoundary,
         })
+    }
+
+    pub(crate) fn physical_main_list_boundary_plan(
+        &self,
+        prepared: &PreparedVisibleInstall,
+    ) -> MainListContextBoundaryPlan {
+        MainListContextBoundaryPlan::Physical {
+            metadata_boundary: prepared
+                .book_append_refresh
+                .as_ref()
+                .filter(|refresh| self.book_append_refresh_is_current(refresh))
+                .map_or(FsMetadataBoundary::Manual, |refresh| {
+                    FsMetadataBoundary::BookAppend(refresh.operation)
+                }),
+            close_destination: self.fullscreen_close_destination(),
+        }
     }
 
     fn active_quick_folder_workspace(&self) -> Option<&QuickFolderWorkspace> {
@@ -27295,9 +27388,14 @@ impl App {
                     return false;
                 };
                 self.retire_replaced_main_list_requests(None);
-                self.adopt_main_list_navigation(adoption, |app| {
-                    app.install_prepared_synthetic_surface(prepared)
-                })
+                self.adopt_main_list_navigation(
+                    adoption,
+                    MainListContextBoundaryPlan::Physical {
+                        metadata_boundary: FsMetadataBoundary::Manual,
+                        close_destination: self.fullscreen_close_destination(),
+                    },
+                    |app, boundary| app.install_prepared_synthetic_surface(prepared, boundary),
+                )
             }
             FolderNavHistoryTarget::RatingPhysical(restore) => {
                 let Some(owner) =
@@ -27344,9 +27442,14 @@ impl App {
                     return false;
                 };
                 self.retire_replaced_main_list_requests(None);
-                self.adopt_main_list_navigation(adoption, |app| {
-                    app.install_prepared_synthetic_surface(prepared)
-                })
+                self.adopt_main_list_navigation(
+                    adoption,
+                    MainListContextBoundaryPlan::Physical {
+                        metadata_boundary: FsMetadataBoundary::Manual,
+                        close_destination: self.fullscreen_close_destination(),
+                    },
+                    |app, boundary| app.install_prepared_synthetic_surface(prepared, boundary),
+                )
             }
             FolderNavHistoryTarget::Path(path) if is_synthetic_view_path(&path) => {
                 let Some(prepared) = self.prepare_synthetic_surface(
@@ -27364,9 +27467,14 @@ impl App {
                 };
                 // History replay is a new destination request even when its list is synthetic.
                 self.retire_replaced_main_list_requests(None);
-                self.adopt_main_list_navigation(adoption, |app| {
-                    app.install_prepared_synthetic_surface(prepared)
-                })
+                self.adopt_main_list_navigation(
+                    adoption,
+                    MainListContextBoundaryPlan::Physical {
+                        metadata_boundary: FsMetadataBoundary::Manual,
+                        close_destination: self.fullscreen_close_destination(),
+                    },
+                    |app, boundary| app.install_prepared_synthetic_surface(prepared, boundary),
+                )
             }
             FolderNavHistoryTarget::Path(path) => self.start_physical_navigation_owned(
                 PhysicalHistoryIntent::Navigation {
@@ -27510,11 +27618,19 @@ impl App {
             let Some(adoption) = self.prepare_main_list_adoption(navigation, destination) else {
                 return;
             };
-            self.adopt_main_list_navigation(adoption, |app| {
-                app.install_prepared_synthetic_surface(prepared)
-            });
+            self.adopt_main_list_navigation(
+                adoption,
+                MainListContextBoundaryPlan::Physical {
+                    metadata_boundary: FsMetadataBoundary::Manual,
+                    close_destination: self.fullscreen_close_destination(),
+                },
+                |app, boundary| app.install_prepared_synthetic_surface(prepared, boundary),
+            );
         } else {
-            let hydration = self.install_prepared_synthetic_surface(prepared);
+            let hydration = self.install_prepared_synthetic_surface(
+                prepared,
+                MainListInstallBoundary::UseInstallerBoundary,
+            );
             self.hydrate_installed_main_list(hydration);
         }
     }
@@ -27573,18 +27689,22 @@ impl App {
     fn install_prepared_synthetic_surface(
         &mut self,
         prepared: PreparedSyntheticSurface,
+        boundary: MainListInstallBoundary,
     ) -> MainListHydration {
         match prepared {
             PreparedSyntheticSurface::Drive { origin } => {
-                self.install_drive_list(origin);
+                self.install_drive_list(origin, boundary);
                 None
             }
             PreparedSyntheticSurface::Reading {
                 entrance,
                 root,
-                prepared,
+                mut prepared,
                 entries,
-            } => self.install_reading_history_surface(prepared, entries, entrance, root),
+            } => {
+                prepared.token = prepared.token.with_install_boundary(boundary);
+                self.install_reading_history_surface(prepared, entries, entrance, root)
+            }
             PreparedSyntheticSurface::Bookmarks { token, entrance } => {
                 if matches!(entrance, BookmarkSurfaceEntrance::Menu) {
                     self.clear_bookmark_view_return_state();
@@ -27593,7 +27713,7 @@ impl App {
                 if !matches!(entrance, BookmarkSurfaceEntrance::Restore) {
                     self.reset_details_sort_to_toolbar();
                 }
-                self.install_bookmark_view_surface(token)
+                self.install_bookmark_view_surface(token.with_install_boundary(boundary))
             }
         }
     }
@@ -29687,7 +29807,7 @@ impl App {
         );
     }
 
-    fn install_drive_list(&mut self, origin: Option<PathBuf>) {
+    fn install_drive_list(&mut self, origin: Option<PathBuf>, boundary: MainListInstallBoundary) {
         self.capture_main_list_restore_cursor();
         self.retire_rating_navigation_owner();
         self.save_departing_session_grid_positions();
@@ -29700,7 +29820,9 @@ impl App {
         self.reading_history_return_from = None;
         self.clear_bookmark_view_return_state();
 
-        self.change_main_context_for_visible_grid(false);
+        if boundary.uses_installer_boundary() {
+            self.change_main_context_for_visible_grid(false);
+        }
         if let Some(pending) = self.folder_nav_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
@@ -32235,7 +32357,8 @@ impl App {
                 .effective_folder()
                 .as_ref()
                 .is_none_or(|current| !crate::folder_tree::path_eq(current, &path));
-        let install = move |app: &mut Self| {
+        let boundary_plan = self.physical_main_list_boundary_plan(&token);
+        let install = move |app: &mut Self, boundary| {
             if let OpenRequestOwner::QuickFolderSwitch(switch) = &owner {
                 app.active_quick_folder_slot = Some(switch.target_slot);
             }
@@ -32254,7 +32377,11 @@ impl App {
             if let Some(effects) = grid_effects {
                 app.commit_grid_virtual_open_effects(&path, effects);
             }
-            let hydration = app.install_prepared_scanned_folder_listing(prepared, authority, token);
+            let hydration = app.install_prepared_scanned_folder_listing(
+                prepared,
+                authority,
+                token.with_install_boundary(boundary),
+            );
             if !detached_physical {
                 app.commit_staged_search_navigation_effects(
                     &path,
@@ -32271,9 +32398,9 @@ impl App {
             let Some(adoption) = self.prepare_main_list_adoption(navigation, destination) else {
                 return FolderOpenOutcome::Ignored;
             };
-            self.adopt_main_list_navigation(adoption, install);
+            self.adopt_main_list_navigation(adoption, boundary_plan, install);
         } else {
-            let hydration = install(self);
+            let hydration = install(self, MainListInstallBoundary::UseInstallerBoundary);
             if detached_enters {
                 self.grid_scroll.renew_session();
             }
@@ -35666,11 +35793,19 @@ impl App {
             let Some(adoption) = self.prepare_main_list_adoption(navigation, destination) else {
                 return;
             };
-            self.adopt_main_list_navigation(adoption, |app| {
-                app.install_prepared_synthetic_surface(prepared)
-            });
+            self.adopt_main_list_navigation(
+                adoption,
+                MainListContextBoundaryPlan::Physical {
+                    metadata_boundary: FsMetadataBoundary::Manual,
+                    close_destination: self.fullscreen_close_destination(),
+                },
+                |app, boundary| app.install_prepared_synthetic_surface(prepared, boundary),
+            );
         } else {
-            let hydration = self.install_prepared_synthetic_surface(prepared);
+            let hydration = self.install_prepared_synthetic_surface(
+                prepared,
+                MainListInstallBoundary::UseInstallerBoundary,
+            );
             self.hydrate_installed_main_list(hydration);
         }
     }
@@ -38225,7 +38360,8 @@ impl App {
         };
         let path = request.path;
         let close_fullscreen = matches!(&after_hydration,Some(MainListAfterHydration::Dfs {continuation,..}) if continuation.fullscreen);
-        self.adopt_main_list_navigation(adoption, |app| {
+        let boundary_plan = self.physical_main_list_boundary_plan(&token);
+        self.adopt_main_list_navigation(adoption, boundary_plan, |app, boundary| {
             if close_fullscreen {
                 app.close_fullscreen_for_folder_nav_reopen();
             }
@@ -38265,7 +38401,7 @@ impl App {
                 prepared,
                 authority,
                 restore_intent.clone(),
-                token,
+                token.with_install_boundary(boundary),
             );
             if let Some((continuation, _)) = hydration.as_mut() {
                 continuation.navigation_after_hydration = collection_navigation
@@ -38390,7 +38526,7 @@ impl App {
                 pages,
                 password,
             } => {
-                self.prepare_pdf_visible_adoption(&source);
+                self.prepare_pdf_visible_adoption(&source, token.install_boundary);
                 let mut hydration = self.install_loading_items_inner(
                     path,
                     items,
@@ -38920,56 +39056,64 @@ impl App {
         else {
             return;
         };
-        self.adopt_main_list_navigation(adoption, |app| {
-            let _ = app.dismiss_snapshot_without_restore();
-            if app.global_search.active {
-                let _ = app.dismiss_global_search_without_restore();
-            }
-            if app.favsearch.active {
-                let _ = app.dismiss_favsearch_without_restore();
-            }
-            if app.tag_view.active {
-                let _ = app.dismiss_tag_view_without_restore();
-            }
-            if app.show_search_bar {
-                app.show_search_bar = false;
-                app.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
-                app.search_filter = None;
-                app.search_filter_origin_folder = None;
-                app.search_has_focus = false;
-                app.search_tag_bridge.clear();
-                app.cancel_search_pending();
-            }
-            app.gamepad_location_picker = None;
-            app.rating_view_stars = transition.target_stars;
-            app.rating_view_sort = transition.target_sort;
-            app.rating_view_return_to = transition.return_to;
-            app.rating_view_nav_stack.clear();
-            app.pending_rating_view_zipdir_open = None;
-            app.reset_details_sort_to_toolbar();
-            app.persist_pending_view_trim_state();
-            if let Some(notice) = result.visibility_notice {
-                app.show_feedback_warning(notice.message().into());
-            }
-            app.rating_view_rows = result.rows;
-            app.rating_view_skipped = result.skipped;
-            let hydration = match (result.prepared, token) {
-                (Some(prepared), Some(token)) => {
-                    app.install_prepared_rating_view_rows_inner(prepared, token)
+        self.adopt_main_list_navigation(
+            adoption,
+            MainListContextBoundaryPlan::Physical {
+                metadata_boundary: FsMetadataBoundary::Manual,
+                close_destination: self.fullscreen_close_destination(),
+            },
+            |app, boundary| {
+                let _ = app.dismiss_snapshot_without_restore();
+                if app.global_search.active {
+                    let _ = app.dismiss_global_search_without_restore();
                 }
-                (None, None) => {
-                    app.install_rating_view_rows();
-                    None
+                if app.favsearch.active {
+                    let _ = app.dismiss_favsearch_without_restore();
                 }
-                _ => unreachable!("prepared Rating token travels with prepared rows"),
-            };
-            app.overlay_rating_session_writes_since(read_generation);
-            app.rebuild_visible_indices_after_rating_publication();
-            if let Some(path) = transition.select_opened_path.as_deref() {
-                app.select_rating_view_row_for_opened_path(path);
-            }
-            hydration
-        });
+                if app.tag_view.active {
+                    let _ = app.dismiss_tag_view_without_restore();
+                }
+                if app.show_search_bar {
+                    app.show_search_bar = false;
+                    app.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Local);
+                    app.search_filter = None;
+                    app.search_filter_origin_folder = None;
+                    app.search_has_focus = false;
+                    app.search_tag_bridge.clear();
+                    app.cancel_search_pending();
+                }
+                app.gamepad_location_picker = None;
+                app.rating_view_stars = transition.target_stars;
+                app.rating_view_sort = transition.target_sort;
+                app.rating_view_return_to = transition.return_to;
+                app.rating_view_nav_stack.clear();
+                app.pending_rating_view_zipdir_open = None;
+                app.reset_details_sort_to_toolbar();
+                app.persist_pending_view_trim_state();
+                if let Some(notice) = result.visibility_notice {
+                    app.show_feedback_warning(notice.message().into());
+                }
+                app.rating_view_rows = result.rows;
+                app.rating_view_skipped = result.skipped;
+                let hydration = match (result.prepared, token) {
+                    (Some(prepared), Some(token)) => app.install_prepared_rating_view_rows_inner(
+                        prepared,
+                        token.with_install_boundary(boundary),
+                    ),
+                    (None, None) => {
+                        app.install_rating_view_rows_with_boundary(boundary);
+                        None
+                    }
+                    _ => unreachable!("prepared Rating token travels with prepared rows"),
+                };
+                app.overlay_rating_session_writes_since(read_generation);
+                app.rebuild_visible_indices_after_rating_publication();
+                if let Some(path) = transition.select_opened_path.as_deref() {
+                    app.select_rating_view_row_for_opened_path(path);
+                }
+                hydration
+            },
+        );
     }
 
     pub(crate) fn poll_rating_view(&mut self) {
@@ -39433,6 +39577,10 @@ impl App {
     }
 
     fn install_rating_view_rows(&mut self) {
+        self.install_rating_view_rows_with_boundary(MainListInstallBoundary::UseInstallerBoundary);
+    }
+
+    fn install_rating_view_rows_with_boundary(&mut self, boundary: MainListInstallBoundary) {
         let previous_selected_key = self.selected.and_then(|idx| self.rating_path_key(idx));
         let previous_selected = self.rating_view_rebuild_selected_index();
         let retained_details_rated_at_sort = (self.items_are_rating_view
@@ -39493,22 +39641,52 @@ impl App {
             })
             .collect();
 
-        self.start_loading_items_inner(
-            rating_view_synthetic_path(),
-            items,
-            image_metas,
-            existing_keys,
-            video_items,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            VisibleInstallAuthority::Rating {
-                stars: self.rating_view_stars,
-            },
-        );
+        if boundary.uses_installer_boundary() {
+            self.start_loading_items_inner(
+                rating_view_synthetic_path(),
+                items,
+                image_metas,
+                existing_keys,
+                video_items,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                VisibleInstallAuthority::Rating {
+                    stars: self.rating_view_stars,
+                },
+            );
+        } else {
+            let token =
+                match self.prepare_visible_install(&rating_view_synthetic_path(), &items, None) {
+                    Ok(token) => token.with_install_boundary(boundary),
+                    Err(reason) => {
+                        self.show_open_admission_refusal(reason);
+                        return;
+                    }
+                };
+            let hydration = self.install_loading_items_inner(
+                rating_view_synthetic_path(),
+                items,
+                image_metas,
+                existing_keys,
+                video_items,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                VisibleInstallAuthority::Rating {
+                    stars: self.rating_view_stars,
+                },
+                token,
+                None,
+            );
+            self.hydrate_installed_main_list(hydration);
+        }
         self.finish_rating_view_install(
             previous_selected,
             previous_selected_key,
@@ -40830,10 +41008,20 @@ impl App {
             let Some(adoption) = self.prepare_main_list_adoption(navigation, destination) else {
                 return;
             };
-            self.adopt_main_list_navigation(adoption, |app| {
-                app.install_zip_current_level(items, metas, zip_path, restore_intent, visibility);
-                None
-            });
+            self.adopt_main_list_navigation(
+                adoption,
+                MainListContextBoundaryPlan::None,
+                |app, _boundary| {
+                    app.install_zip_current_level(
+                        items,
+                        metas,
+                        zip_path,
+                        restore_intent,
+                        visibility,
+                    );
+                    None
+                },
+            );
         } else {
             self.install_zip_current_level(items, metas, zip_path, restore_intent, visibility);
         }
@@ -41566,11 +41754,14 @@ impl App {
     fn prepare_pdf_visible_adoption(
         &mut self,
         logical_location: &crate::pdf_loader::LeasedEpubPath,
+        boundary: MainListInstallBoundary,
     ) {
         if !self.smart_folder_session_owns_load(logical_location.as_path()) {
             self.transition_favorite_view_for_path(Some(logical_location.as_path()));
         }
-        self.change_main_context_for_visible_grid(false);
+        if boundary.uses_installer_boundary() {
+            self.change_main_context_for_visible_grid(false);
+        }
         crate::zip_loader::clear_nested_cache();
         self.zip_nav = None;
         self.cancel_token.store(true, Ordering::Relaxed);
@@ -41688,7 +41879,8 @@ impl App {
                 | StartupListIntent::PreservePresentation
                 | StartupListIntent::InternalInstall
         );
-        let install = move |app: &mut Self| {
+        let boundary_plan = self.physical_main_list_boundary_plan(&token);
+        let install = move |app: &mut Self, boundary| {
             if enters_pdf {
                 app.grid_scroll.renew_session();
             }
@@ -41705,7 +41897,7 @@ impl App {
             if let OpenRequestOwner::Bookmark(owner) = owner {
                 app.begin_bookmark_page_wait(owner);
             }
-            app.prepare_pdf_visible_adoption(source);
+            app.prepare_pdf_visible_adoption(source, boundary);
             let mut hydration = app.install_loading_items_inner(
                 path.to_path_buf(),
                 items,
@@ -41719,7 +41911,7 @@ impl App {
                 None,
                 None,
                 VisibleInstallAuthority::Ordinary,
-                token,
+                token.with_install_boundary(boundary),
                 None,
             );
             if let Some((continuation, _)) = hydration.as_mut() {
@@ -41737,14 +41929,14 @@ impl App {
             hydration
         };
         if let Some((admitted, effects)) = admitted {
-            self.adopt_main_list_navigation(admitted, move |app| {
+            self.adopt_main_list_navigation(admitted, boundary_plan, move |app, boundary| {
                 if let Some(effects) = effects {
                     app.commit_grid_virtual_open_effects(path, effects);
                 }
-                install(app)
+                install(app, boundary)
             })
         } else {
-            let hydration = install(self);
+            let hydration = install(self, MainListInstallBoundary::UseInstallerBoundary);
             self.hydrate_installed_main_list(hydration);
             true
         }
@@ -41871,7 +42063,10 @@ impl App {
             pdf_path.display()
         ));
         if prepared_pages.is_some() {
-            self.prepare_pdf_visible_adoption(&candidate_source);
+            self.prepare_pdf_visible_adoption(
+                &candidate_source,
+                MainListInstallBoundary::UseInstallerBoundary,
+            );
         }
 
         // 同じ PDF の再 open では、旧 handle を新しい waiter の登録まで保持する。
@@ -43940,6 +44135,7 @@ impl App {
         let PreparedVisibleInstall {
             display_epub_source,
             book_append_refresh,
+            install_boundary,
         } = prepared_visible;
         let book_append_refresh =
             book_append_refresh.filter(|refresh| self.book_append_refresh_is_current(refresh));
@@ -44143,12 +44339,14 @@ impl App {
                     &subfolder_expansion_synthetic_path(),
                 )))
         .then(|| crate::settings::FavoriteViewState::from_settings(&self.settings));
-        self.change_main_context_for_visible_grid_with_metadata_boundary(
-            false,
-            book_append_refresh
-                .map(|refresh| FsMetadataBoundary::BookAppend(refresh.operation))
-                .unwrap_or(FsMetadataBoundary::Manual),
-        );
+        if install_boundary.uses_installer_boundary() {
+            self.change_main_context_for_visible_grid_with_metadata_boundary(
+                false,
+                book_append_refresh
+                    .map(|refresh| FsMetadataBoundary::BookAppend(refresh.operation))
+                    .unwrap_or(FsMetadataBoundary::Manual),
+            );
+        }
         let previous_page_index = std::mem::take(&mut self.page_identity_index);
         self.retire_smart_folder_payloads([
             Box::new(previous_page_index) as smart_folder::RetiredSmartFolderPayload
@@ -104365,6 +104563,8 @@ pub(crate) mod paged_prefetch_tests;
 pub(crate) mod paint_record_test_support;
 #[cfg(test)]
 mod search_nav_book_tests;
+#[cfg(test)]
+mod search_nav_boundary_tests;
 #[cfg(test)]
 mod search_nav_entry_inventory_tests;
 #[cfg(test)]

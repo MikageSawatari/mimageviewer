@@ -59,6 +59,13 @@ Search の surface proof/switch sequence を poll・ready・adopt まで照合�
 既存 History prepare に同じ要求を渡し、既存の成功採用だけが検索を退役する。
 検索内の子から明示移動する要求は currentness 用の child route を保ち、成功採用時にだけ履歴記録用の検索前 route を導く。
 一致する return origin の保存 route を保ち、保存が空/無い場合だけ元 location の root へ正規化する。
+§12.3 改訂1 の所有境界修正では、検索中の `ExitTemporaryView` の成功採用で既存の出発 context 移譲を
+検索退役・facet/rows の採用より先に通す。移譲済みの事実は採用内の局所の型で installer へ渡し、
+非冪等な移譲を二重に呼ばない。source 履歴は移譲前に捕捉し、移譲後に旧 context の proof を再検証しない。
+Collection の採用直前 locked 検査と同じ binding の `NotNeeded`、検索なし/他 purpose の順序は維持する。
+App field・bundle field・registry 本体・detached 述語・viewport は変更しない。bundle 所有の Metadata / Everything 等は
+移譲先へ保持するが、App 共有の `favsearch` / `tag_view` owner が bundle に無い既存の欠けは今回未対応である。
+Smart root の `Direct(Navigation)` の既存順序は変更しない。実装・検証記録とこの範囲の詳細は設計書 §8.14・§12.3 を参照。
 
 ## 本のitems生成境界（§1.242 G1）
 
