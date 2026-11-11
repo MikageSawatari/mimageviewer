@@ -291,6 +291,119 @@ M3 の「検索のふだんのショートカットと同じ受付条件」を�
 
 ---
 
+### 第 2.3 版への対応と追加の設計確認事項
+
+利用者の続行指示を受け、`5e1e42553` の上で以下を変更した。
+
+- `src/app/search_request.rs`: Metadata 注入後に既存の `reset_global_search_for_query_change(ctx)` を呼び、
+  直後に debounce 解除・done=true・reject解除とする。
+- `src/global_search_ui/everything.rs`: 不要となった `retire_search_work` を削除し、`switch_search_source` の後始末を元の形へ戻した。
+- `src/search_request.rs`: 印の期間を発行 pass / 次 pass のみに縮め、境界テストを更新。
+  テスト内の `CharIndex` / 整数比較も修正した。
+- `src/ui_dialogs/context_menu.rs`: テストが private な `SubmittedEverything` を直接作る代わりに、
+  既存の fake dataset 採用 fixture を使う。trait import と `PhysicalChild` fixture も修正。
+- `src/app/tests/search_request.rs`: 旧結果を実際に採用した fixture から 3 時点の注入を検査し、
+  並べ替え（名前・評価昇順・評価降順）× ★ 変更を含める。既存の settle helper の可視性だけを
+  `src/global_search_ui.rs` の test module 内で広げて再利用した。
+- `docs/search-architecture.md` と `htdocs/mimageviewer/manual/search.html`: 第 2.3 版の説明へ更新。
+
+独立レビューと source inspection により、既存 reset を debounce 解除だけで未実行状態へ使う場合に
+以下の 2 経路の問題が指摘された。2 の Everything の旧語再公開は headless テストでも捕捉した。
+1 も既存の settle helper を使う headless 検査で 30 秒以内に待機へ収束せず失敗した。
+利用者指示に従って、この所有境界の追加実装を停止した。取り込み可能な完成状態ではない。
+
+1. **通常フォルダ → Metadata 注入**: reset により `last_executed` は空になる。
+   `poll_search_page_edit_prepare` の Ready 採用条件は、Metadata では
+   `items_are_global_search_view || !last_executed.is_empty()` を要求する。
+   通常一覧では両方 false のため採用できない。items generation が不変で worker が正常 Ready を返し続ける場合は、
+   desired が残って再送され、100ms 後の再描画要求が続く。世代変更・worker の Failed / 切断では待機へ抜ける。
+   最初の headless 検査では 3 秒内に 3 回の stale rejection は観測せず成功したが、
+   これは待機への収束自体を証明しないため、既存の settle helper を使う検査へ改めた。
+   再検査は `Metadata projection did not settle: query=new draft done=true rejected=None applied=` で失敗した。
+   既存検索結果からの 3 時点の検査では `items_are_global_search_view=true` なので、この入口を検査できない。
+2. **Everything 結果 Root → Metadata 注入**: source 切り替えと reset は accepted の Everything dataset を保持する。
+   `request_search_view_build` の先頭は `everything_dataset_for_reprojection` を見て旧 dataset を再投影する。
+   この判定は編集 source を見ておらず、Everything の Ready は accepted の submitted と一致すれば採用される。
+   そのため旧 Everything の結果・`last_executed` が再公開され、空の Metadata 未実行状態にならない。
+
+設計担当への確認事項: 後続の検索実行が無い場合について、通常一覧からの未送信入力と、
+別 source の採用済み結果を消して待機する処理をどの所有境界で成立させるか。
+Ready の採用条件を緩める guard や、accepted を呼び出し側で書き換える迂回は追加していない。
+
+この 2 経路の期待する不変条件を headless 回帰に追加した:
+
+- `search_name_new_metadata_draft_converges_without_repeated_projection_rejections`
+- `search_name_metadata_from_everything_does_not_republish_the_old_query`
+
+コンパイル・検証の途中記録:
+
+- 可視性・CharIndex の報告済みエラーを修正。最初のコンパイルで追加検出された test fixture の
+  borrow / `NodeT` import も修正した。
+- 最初の追加テスト: コンパイル成功 (16分02秒)、35 件中 31 成功・4 失敗。
+  Everything の旧語再公開以外の 3 件は fixture の問題で、未設定カーソルを許す検査、
+  child viewport の RawInput map、IndexerInit の terminal 状態を修正した。
+- 利用者の PC 負荷規則追加前に開始した関連テスト・ui_snapshot は中断され、完了結果として扱っていない。
+  以後の全 cargo は `CARGO_BUILD_JOBS=6`、nextest は `-j 6` を付け、重いコマンドは 1 本ずつ実行する。
+- 制限適用後の関連 nextest (修正前): コンパイル 8分53秒、実行 111.401 秒。
+  776 件中 773 成功・3 失敗。2 件は上記の Metadata 注入の不一致。
+  残る `context_menu_musicvideo_saved_order_and_hidden_preserve_existing_items` は、非表示を slot 配分より先に適用し、
+  他項目が外部ツール / Open With の固定枠を跨ぐ不具合だった。
+- `src/context_menu_model.rs` を、順序解決 → ID の表示設定・子 layout 解決 → 空 unit 除去 → 区切り線出力の順へ修正。
+  既存期待値は維持し、leaf / submenu の非表示と、空 submenu の Present / Absent 指定の漏れの回帰を追加した。
+  独立レビューでこの配置修正は ACCEPT。Metadata 注入の未解決 2 件は承認対象に含まない。
+- `docs/section221-context-menu-layout.md`、`docs/context-menu-unification-plan.md` へ同じ解決順を追記。
+- メニュー配置の最初の絞り込み検査は 144 件すべて成功 (追加 P2 対応前の source での結果)。
+  追加 P2 対応後の関連全体と ui_snapshot の結果は以下へ追記する。
+
+git 書き込み・製品バイナリ起動・`test-lib-full.ps1` は行っていない。
+
+#### 第 2.3 版対応時の最終検証結果
+
+以下の cargo コマンドはすべて `CARGO_BUILD_JOBS=6` と `MSBUILDDISABLENODEREUSE=1` を設定して 1 本ずつ実行した。
+nextest は `-j 6`、ui_snapshot は `RUST_TEST_THREADS=6` も設定した。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 成功、28.84 秒。既存の warning あり |
+| `cargo nextest run -p mimageviewer --lib -j 6 --no-fail-fast -E 'test(/context_menu_model\|ui_dialogs::context_menu\|keymap\|pinned_search\|global_search_ui\|everything\|search_request/)'` | 最終差分で 778 件中 776 成功・2 失敗、実行 84.460 秒（コンパイル 3分17秒） |
+| `cargo test --test ui_snapshot` | 249 件すべて成功、実行 61.50 秒（コンパイル 2分51秒）。PNG 更新なし |
+| `python scripts/check_ui_glyphs.py` | 成功、危険なグリフ 0 件 |
+| `python scripts/check_site_cards.py` | 成功、53 カード・違反 0 件 |
+| `cargo fmt`（引数なし）と `git diff --check` | ともに成功。Git の改行コード警告のみ |
+
+残る nextest の失敗は、上記の未送信 Metadata の不一致を検出する次の 2 件だけである。
+
+- `search_name_metadata_from_everything_does_not_republish_the_old_query`:
+  `last_executed` に `"old everything"` が再公開されることを検出した。
+- `search_name_new_metadata_draft_converges_without_repeated_projection_rejections`:
+  prepare が待機へ収束せず、既存 settle helper が 30 秒で失敗した。
+  `query=new draft done=true rejected=None applied=`。
+
+3 時点からの注入・旧検索取消・結果消去・並べ替え（評価順を含む）/ ★ 変更・Enter、
+入力欄の focus / 全選択と印の寿命、メニュー・キーの入口、keymap 往復、配置・preview の各回帰は
+上記 2 件を除いて関連検査で成功した。設定済みメニュー順の回帰も最終差分では成功した。
+
+最終ログは `target/search-from-item-verification/related-final-j6.log`、`ui-snapshot-j6.log`、`core-check-j6.log`。
+検証用バイナリは、未解決の設計不一致により関連テストが失敗しているため作成していない。
+第 2.3 版の実装は未完了であり、失敗する 2 件を無効化したり、製品へ迂回処理を入れたりしていない。
+
+今回の変更ファイル（`5e1e42553` 以降、12 件）:
+
+- `src/app/search_request.rs`
+- `src/app/tests/search_request.rs`
+- `src/context_menu_model.rs`
+- `src/global_search_ui.rs`
+- `src/global_search_ui/everything.rs`
+- `src/search_request.rs`
+- `src/ui_dialogs/context_menu.rs`
+- `docs/context-menu-unification-plan.md`
+- `docs/search-architecture.md`
+- `docs/search-from-item-plan.md`
+- `docs/section221-context-menu-layout.md`
+- `htdocs/mimageviewer/manual/search.html`
+
+---
+
 # 付録 A: 後の版の拡張案 (設計第 1 版、2026-11-11、未レビュー・利用者未提示)
 
 以下は最小版の前に書いた案。利用者決定で後の版へ回した。後の版で着手するときは、最小版の型 (M4) を土台に見直す。

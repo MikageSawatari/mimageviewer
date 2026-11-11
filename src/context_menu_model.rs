@@ -1182,7 +1182,7 @@ fn open_with_submenu(input: &ContextMenuInput) -> Option<MenuNode> {
     );
     Some(MenuNode::Submenu {
         label: "アプリケーションで開く…".to_string(),
-        children: apply_context_menu_layout(children, ContextMenuParentId::OpenWith, &input.layout),
+        children,
     })
 }
 
@@ -1209,11 +1209,7 @@ fn search_by_name_submenu(input: &ContextMenuInput) -> Option<MenuNode> {
     .collect();
     Some(MenuNode::Submenu {
         label: ContextMenuItemId::SearchByName.label().into(),
-        children: apply_context_menu_layout(
-            children,
-            ContextMenuParentId::SearchByName,
-            &input.layout,
-        ),
+        children,
     })
 }
 
@@ -1321,10 +1317,6 @@ fn apply_context_menu_layout(
         }
     }
 
-    units.retain(|unit| match unit.id {
-        LayoutUnitId::Configurable(item) => settings.is_visible(item),
-        LayoutUnitId::Fixed(_) => true,
-    });
     if settings.has_explicit_order(parent) {
         let order = settings.resolved_order(parent);
         let mut configurable: Vec<_> = units
@@ -1354,9 +1346,44 @@ fn apply_context_menu_layout(
         }
     }
 
+    // Resolve every admitted static slot before hiding its assigned item. Removing
+    // slots first would move unrelated items across the fixed dynamic groups.
+    units.retain(|unit| match unit.id {
+        LayoutUnitId::Configurable(item) => settings.is_visible(item),
+        LayoutUnitId::Fixed(_) => true,
+    });
+
     let mut resolved = Vec::new();
     let mut previous_section = None;
     for unit in units {
+        let child_parent = match unit.id {
+            LayoutUnitId::Configurable(ContextMenuItemId::SearchByName) => {
+                Some(ContextMenuParentId::SearchByName)
+            }
+            LayoutUnitId::Fixed(ContextMenuFixedSlotId::OpenWithSubmenu) => {
+                Some(ContextMenuParentId::OpenWith)
+            }
+            _ => None,
+        };
+        // Preserve parent slots through ordering, then remove empty submenus
+        // before they can publish a separator or become the previous section.
+        let nodes = normalize_menu(
+            unit.nodes
+                .into_iter()
+                .map(|node| match (node, child_parent) {
+                    (MenuNode::Submenu { label, children }, Some(child_parent)) => {
+                        MenuNode::Submenu {
+                            label,
+                            children: apply_context_menu_layout(children, child_parent, settings),
+                        }
+                    }
+                    (node, _) => node,
+                })
+                .collect(),
+        );
+        if nodes.is_empty() {
+            continue;
+        }
         let inherited_separator = previous_section.is_some_and(|previous| previous != unit.section);
         let separator_before = match unit.id {
             LayoutUnitId::Configurable(item) => match settings.separator_before(item) {
@@ -1370,7 +1397,7 @@ fn apply_context_menu_layout(
             resolved.push(MenuNode::Separator);
         }
         previous_section = Some(unit.section);
-        resolved.extend(unit.nodes);
+        resolved.extend(nodes);
     }
     normalize_menu(resolved)
 }
@@ -3247,6 +3274,113 @@ mod tests {
             ),
             raw
         );
+    }
+
+    #[test]
+    fn hiding_a_reordered_leaf_or_submenu_keeps_other_items_across_fixed_groups() {
+        for (id, node) in [
+            (
+                ContextMenuItemId::CreateMusicVideo,
+                item(MenuCommand::CreateMusicVideo, "musicvideo"),
+            ),
+            (
+                ContextMenuItemId::SearchByName,
+                MenuNode::Submenu {
+                    label: ContextMenuItemId::SearchByName.label().into(),
+                    children: vec![item(MenuCommand::SearchByNameEverything, "search")],
+                },
+            ),
+        ] {
+            let raw = vec![
+                item(MenuCommand::CutFiles, "cut"),
+                item(MenuCommand::CopyFiles, "copy"),
+                MenuNode::Separator,
+                item(MenuCommand::ExternalTool(ExternalToolId(1)), "tool"),
+                MenuNode::Separator,
+                MenuNode::Submenu {
+                    label: "アプリケーションで開く…".into(),
+                    children: vec![item(MenuCommand::OpenExternalToolSettings, "settings")],
+                },
+                MenuNode::Separator,
+                node,
+            ];
+            let mut layout = ContextMenuLayoutSettings::default();
+            let mut order = layout.resolved_order(ContextMenuParentId::Root);
+            order.retain(|candidate| *candidate != id);
+            order.insert(0, id);
+            layout.set_order(ContextMenuParentId::Root, &order);
+            let shown = apply_context_menu_layout(raw.clone(), ContextMenuParentId::Root, &layout);
+            let without_item = normalize_menu(
+                shown
+                    .into_iter()
+                    .filter(|node| {
+                        matches!(node, MenuNode::Separator)
+                            || menu_node_layout_id(node) != LayoutUnitId::Configurable(id)
+                    })
+                    .collect(),
+            );
+            layout.set_visible(id, false);
+            let hidden = apply_context_menu_layout(raw.clone(), ContextMenuParentId::Root, &layout);
+            assert_eq!(
+                hidden, without_item,
+                "hiding {id:?} must not move another item"
+            );
+            assert_eq!(
+                labels(&hidden),
+                ["cut", "tool", "アプリケーションで開く…", "settings", "copy"]
+            );
+
+            if id == ContextMenuItemId::SearchByName {
+                layout.set_visible(id, true);
+                layout.set_visible(ContextMenuItemId::SearchByNameEverything, false);
+                assert_eq!(
+                    apply_context_menu_layout(raw, ContextMenuParentId::Root, &layout),
+                    hidden,
+                    "hiding all children must preserve the same fixed-group anchors"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_submenus_do_not_publish_separator_overrides_or_section_state() {
+        for before in [
+            ContextMenuSeparatorBefore::Present,
+            ContextMenuSeparatorBefore::Absent,
+        ] {
+            let mut raw = vec![item(MenuCommand::CutFiles, "cut")];
+            if before == ContextMenuSeparatorBefore::Absent {
+                raw.push(MenuNode::Separator);
+            }
+            raw.extend([
+                MenuNode::Submenu {
+                    label: ContextMenuItemId::SearchByName.label().into(),
+                    children: vec![item(MenuCommand::SearchByNameEverything, "search")],
+                },
+                item(MenuCommand::CopyFiles, "copy"),
+            ]);
+            let mut layout = ContextMenuLayoutSettings::default();
+            layout.set_separator_before(ContextMenuItemId::SearchByName, before);
+            layout.set_visible(ContextMenuItemId::SearchByNameEverything, false);
+            let empty_submenu =
+                apply_context_menu_layout(raw.clone(), ContextMenuParentId::Root, &layout);
+            assert_eq!(
+                menu_shape(&empty_submenu),
+                if before == ContextMenuSeparatorBefore::Present {
+                    vec!["CutFiles", "CopyFiles"]
+                } else {
+                    vec!["CutFiles", "|", "CopyFiles"]
+                },
+                "{before:?} belongs to the removed submenu, not the next visible item"
+            );
+            layout.set_visible(ContextMenuItemId::SearchByName, false);
+            layout.set_visible(ContextMenuItemId::SearchByNameEverything, true);
+            assert_eq!(
+                empty_submenu,
+                apply_context_menu_layout(raw, ContextMenuParentId::Root, &layout),
+                "hiding all children and hiding their parent must resolve equally"
+            );
+        }
     }
 
     #[test]

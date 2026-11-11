@@ -168,11 +168,13 @@ Smart Folderの一覧退避は非固定のtemporary queryのみを所有し、�
 メニューの可否判定だけは呼び出し元の右クリックメニューをモーダル判定から除外し、
 名前を確定して自分のメニュー owner を閉じた後、通常の受付で実行する。
 メニューの可否判定へキーの入力所有・IME 判定は流用しない。
-Edited / Submit は呼ばず Enter まで検索しない。Metadata は進行中の検索・prepare・mtime lookup を
-source切替と同じ後始末で終え、runを更新し、デバウンス予約と拒否表示を解除して待機する。
-source・適用済み結果・`accepted`・`last_executed` は保持する。
+新しい検索は Enter まで始めない。Metadata は下書きの代入後、既存の
+`reset_global_search_for_query_change(ctx)` を通し、手で語を打ち替えたときと同じく
+進行中の検索を取り消して旧結果を消し、空の一覧用の新しい prepare を残す。
+直後に `last_change_at = None`・`done = true`・`reject_message = None` として待機する。
+source切替用の prepare 退役経路は使わない。Local / Everything は入力の代入だけを行う。
 Local / Metadata だけ、全選択の一時印を入力欄 id・文字列・発行passに結び付ける。
-対象欄の最初の描画で必ず印を取り出して消し、3 pass以内・フォーカス要求または取得済み・
+対象欄の最初の描画で必ず印を取り出して消し、発行passかその次のpass・フォーカス要求または取得済み・
 文字列一致・IME変換中でない場合だけ全選択する。Everything は既存の全選択を使い、印を作らない。
 Local は Metadata / Everything の結果中（PhysicalChild を含む）には受け付けない。
 新しい App 状態・worker・永続データは追加しない。詳細は [設計 M1〜M8](search-from-item-plan.md)。

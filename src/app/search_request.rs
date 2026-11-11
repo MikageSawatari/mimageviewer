@@ -117,9 +117,9 @@ impl App {
         self.ensure_search_session(kind);
         *self.search_draft_mut(kind) = request.query;
         if kind == Kind::Metadata {
-            // A query wish reads the draft. Retire the old producer/prepare
-            // before they can project results using this newly injected draft.
-            self.retire_search_work();
+            // Use the ordinary query-edit transaction, then disarm its debounce.
+            // This clears old results while retaining a valid prepare for sorting.
+            self.reset_global_search_for_query_change(ctx);
             self.global_search.last_change_at = None;
             self.global_search.done = true;
             self.global_search.reject_message = None;

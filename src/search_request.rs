@@ -89,7 +89,7 @@ pub(crate) fn select_all_pending_for_test(ctx: &egui::Context, input_id: egui::I
     })
 }
 
-/// Apply only on the initial draw, within three passes, without disturbing IME composition.
+/// Apply only on the first draw in the issuing or following pass, preserving IME composition.
 pub(crate) fn apply_select_all(
     ctx: &egui::Context,
     query: &str,
@@ -109,7 +109,7 @@ pub(crate) fn apply_select_all(
         return;
     };
     if requested.query != query
-        || pass - requested.issued_pass > 3
+        || pass - requested.issued_pass > 1
         || !(focus_requested || output.response.has_focus())
         || crate::ime_focus::ime_input_active(ctx)
     {
@@ -299,8 +299,8 @@ mod tests {
         let mut query = "作者 title".to_owned();
         request_select_all(&ctx, id, &query);
         let range = draw_field(&ctx, id, &mut query, true, vec![]).unwrap();
-        assert_eq!(range.sorted_cursors()[0].index, 0);
-        assert_eq!(range.sorted_cursors()[1].index, query.chars().count());
+        assert_eq!(range.sorted_cursors()[0].index.0, 0);
+        assert_eq!(range.sorted_cursors()[1].index.0, query.chars().count());
         assert!(!selection_pending(&ctx, id));
         let mut state = egui::TextEdit::load_state(&ctx, id).unwrap();
         assert_eq!(state.cursor.char_range(), Some(range));
@@ -355,8 +355,8 @@ mod tests {
     }
 
     #[test]
-    fn selection_request_expires_after_three_passes_without_its_field() {
-        for age in [3, 4] {
+    fn selection_request_selects_on_issuing_or_next_pass_and_expires_after_two() {
+        for age in [0, 1, 2] {
             let ctx = egui::Context::default();
             let id = egui::Id::unique("prefill");
             let mut query = "title".to_owned();
@@ -367,8 +367,18 @@ mod tests {
                     .drop_without_applying_deltas();
             }
             assert!(selection_pending(&ctx, id));
-            let range = draw_field(&ctx, id, &mut query, true, vec![]).unwrap();
-            assert_eq!(range.is_empty(), age > 3, "age={age}");
+            let range = draw_field(&ctx, id, &mut query, true, vec![]);
+            if age <= 1 {
+                let range = range.expect("current or next pass must select the entire query");
+                assert_eq!(range.sorted_cursors()[0].index.0, 0, "age={age}");
+                assert_eq!(
+                    range.sorted_cursors()[1].index.0,
+                    query.chars().count(),
+                    "age={age}"
+                );
+            } else {
+                assert!(range.is_none_or(|range| range.is_empty()), "age={age}");
+            }
             assert!(!selection_pending(&ctx, id));
         }
     }
@@ -381,8 +391,8 @@ mod tests {
         draw_field(&ctx, id, &mut query, true, vec![]);
         request_select_all(&ctx, id, &query);
         let range = draw_field(&ctx, id, &mut query, false, vec![]).unwrap();
-        assert_eq!(range.sorted_cursors()[0].index, 0);
-        assert_eq!(range.sorted_cursors()[1].index, query.chars().count());
+        assert_eq!(range.sorted_cursors()[0].index.0, 0);
+        assert_eq!(range.sorted_cursors()[1].index.0, query.chars().count());
         assert!(!selection_pending(&ctx, id));
     }
 
@@ -398,8 +408,8 @@ mod tests {
             assert!(!output.response.has_focus());
             apply_select_all(ui.ctx(), &query, true, &mut output);
             let range = output.state.cursor.char_range().unwrap();
-            assert_eq!(range.sorted_cursors()[0].index, 0);
-            assert_eq!(range.sorted_cursors()[1].index, query.chars().count());
+            assert_eq!(range.sorted_cursors()[0].index.0, 0);
+            assert_eq!(range.sorted_cursors()[1].index.0, query.chars().count());
             assert_eq!(output.cursor_range, Some(range));
             assert!(!selection_pending(ui.ctx(), id));
         })
@@ -418,8 +428,8 @@ mod tests {
         assert!(!selection_pending(&ctx, first));
         assert!(selection_pending(&ctx, second));
         let range = draw_field(&ctx, second, &mut query, true, vec![]).unwrap();
-        assert_eq!(range.sorted_cursors()[0].index, 0);
-        assert_eq!(range.sorted_cursors()[1].index, query.chars().count());
+        assert_eq!(range.sorted_cursors()[0].index.0, 0);
+        assert_eq!(range.sorted_cursors()[1].index.0, query.chars().count());
         assert!(!selection_pending(&ctx, second));
     }
 

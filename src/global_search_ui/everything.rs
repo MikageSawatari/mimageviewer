@@ -258,7 +258,10 @@ impl App {
             return;
         }
         self.finish_everything_edit_boundary();
-        self.retire_search_work();
+        self.global_search.pending = None;
+        self.retire_search_prepare();
+        self.global_search.mtime_lookup_pending = None;
+        self.global_search.run_sequence = self.global_search.run_sequence.wrapping_add(1);
         self.clear_search_draft_on_end(self.global_search.source.into());
         self.global_search.source = source;
         self.global_search.last_executed.clear();
@@ -267,13 +270,6 @@ impl App {
         self.global_search.reject_message = None;
         self.global_search.focus_request = true;
         // Accepted data and its source still explain the visible rows after a failed send.
-    }
-
-    pub(crate) fn retire_search_work(&mut self) {
-        self.global_search.pending = None;
-        self.retire_search_prepare();
-        self.global_search.mtime_lookup_pending = None;
-        self.global_search.run_sequence = self.global_search.run_sequence.wrapping_add(1);
     }
 
     pub(crate) fn everything_search_progress_visible(&self) -> bool {

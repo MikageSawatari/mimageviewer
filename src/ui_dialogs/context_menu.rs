@@ -7057,6 +7057,8 @@ mod search_by_name_menu_tests {
         assert!(app.global_search.last_change_at.is_none());
         if kind == Kind::Metadata {
             assert!(!app.global_search.is_searching());
+            assert!(app.global_search.containers.is_empty());
+            assert!(app.global_search.all_hits.is_empty());
         }
     }
 
@@ -7097,7 +7099,7 @@ mod search_by_name_menu_tests {
 
     #[test]
     fn search_name_egui_menu_click_closes_owner_and_opens_each_input() {
-        use egui_kittest::kittest::Queryable;
+        use egui_kittest::kittest::{NodeT, Queryable};
         for pinned in [false, true] {
             for (_, kind, label) in destinations() {
                 let mut harness = crate::test_ui::builder()
@@ -7304,7 +7306,7 @@ mod search_by_name_menu_tests {
 
     #[test]
     fn search_name_local_menu_refusal_preserves_metadata_and_everything_result_children() {
-        use crate::global_search_ui::{EverythingPosition, SearchAccepted, SubmittedEverything};
+        use crate::global_search_ui::{EverythingPosition, SearchAccepted};
         for source in [Kind::Metadata, Kind::Everything] {
             for child in [false, true] {
                 let mut app = fixture(false);
@@ -7314,21 +7316,30 @@ mod search_by_name_menu_tests {
                 app.ensure_search_session(source);
                 *app.search_draft_mut(source) = "previous results".into();
                 if source == Kind::Everything {
-                    app.global_search.accepted = SearchAccepted::Everything {
-                        submitted: SubmittedEverything {
-                            query: "previous results".into(),
-                            run: 1,
-                        },
-                        dataset: crate::global_search_ui::everything_dataset_for_test(Vec::new()),
-                        position: if child {
-                            EverythingPosition::PhysicalChild {
-                                logical_source: app.tmp.path().to_owned(),
-                                return_anchor: None,
-                            }
-                        } else {
-                            EverythingPosition::Root
-                        },
-                    };
+                    let dataset = crate::global_search_ui::everything_dataset_for_test(vec![
+                        app.items[0].clone(),
+                    ]);
+                    crate::global_search_ui::adopt_everything_for_test(
+                        &mut app,
+                        &ctx,
+                        "previous results",
+                        dataset,
+                    );
+                    if child {
+                        let root = app.tmp.path().to_owned();
+                        let SearchAccepted::Everything { position, .. } =
+                            &mut app.global_search.accepted
+                        else {
+                            unreachable!()
+                        };
+                        *position = EverythingPosition::PhysicalChild {
+                            logical_source: root.clone(),
+                            return_anchor: root.clone(),
+                            route: crate::app::FacetRoute::root(crate::app::FacetScope::path(
+                                &root,
+                            )),
+                        };
+                    }
                 } else if child {
                     app.global_search.drill = Some(crate::global_search_ui::DrillState {
                         container_root: app.tmp.path().to_owned(),

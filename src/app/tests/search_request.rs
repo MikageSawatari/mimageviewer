@@ -202,10 +202,14 @@ fn search_name_normal_local_and_metadata_open_preserve_collapsed_selection() {
 #[test]
 fn search_name_metadata_injection_disarms_completed_waiting_and_running_queries() {
     for phase in 0..3 {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = super::super::setup_app_for_test();
         let ctx = context();
-        app.ensure_search_session(Kind::Metadata);
-        app.begin_search_page_edit_prepare_for_test(&ctx);
+        app.indexer_init = super::super::IndexerInit::Unavailable;
+        let old_path = app.tmp.path().join("old.png");
+        image::RgbImage::new(2, 3).save(&old_path).unwrap();
+        crate::global_search_ui::tests::g1_publish_search_hits(&mut app, &ctx, &[old_path]);
+        assert_eq!(app.items.len(), 1);
         app.global_search.metadata_draft = "old executed".into();
         app.global_search.last_executed = "old executed".into();
         app.global_search.accepted = SearchAccepted::Metadata {
@@ -214,14 +218,7 @@ fn search_name_metadata_injection_disarms_completed_waiting_and_running_queries(
                 filters: app.global_search.filters.clone(),
             }),
         };
-        let SearchAccepted::Metadata {
-            applied: applied_before,
-        } = &app.global_search.accepted
-        else {
-            unreachable!()
-        };
-        let applied_before = applied_before.clone();
-        let items_before = app.items.clone();
+        app.global_search.pending = None;
         app.global_search.done = phase == 0;
         app.global_search.last_change_at =
             (phase != 0).then(|| Instant::now() - Duration::from_secs(2));
@@ -237,22 +234,14 @@ fn search_name_metadata_injection_disarms_completed_waiting_and_running_queries(
         }
         ctx.begin_pass(egui::RawInput::default());
         inject(&mut app, &ctx, Kind::Metadata, "new draft");
-        assert_eq!(app.global_search.last_executed, "old executed");
-        assert!(
-            matches!(&app.global_search.accepted, SearchAccepted::Metadata { applied: Some(applied) } if applied.query == "old executed")
-        );
+        assert!(app.global_search.last_executed.is_empty());
+        assert!(app.global_search.all_hits.is_empty());
+        assert!(app.global_search.containers.is_empty());
         assert!(app.global_search.last_change_at.is_none());
-        assert!(
-            matches!(&app.global_search.accepted, SearchAccepted::Metadata { applied } if applied == &applied_before)
-        );
-        assert_eq!(app.items, items_before);
         assert!(app.global_search.done);
+        assert!(!app.global_search.is_searching());
         assert!(app.global_search.pending.is_none());
-        assert!(app.global_search.page_edit_prepare.is_none());
-        for _ in 0..8 {
-            app.poll_global_search_debounce(&ctx);
-            app.poll_global_search_events(&ctx);
-        }
+        assert!(app.global_search.page_edit_prepare.is_some());
         assert_eq!(cancel.load(Ordering::Relaxed), phase == 2);
         if phase == 2 {
             assert!(
@@ -263,19 +252,48 @@ fn search_name_metadata_injection_disarms_completed_waiting_and_running_queries(
                 .is_err(),
                 "retired query no longer has a receiver"
             );
-            app.poll_global_search_events(&ctx);
-            assert!(app.global_search.done);
         }
+        crate::global_search_ui::tests::section1409_settle_metadata(&mut app, &ctx, |app| {
+            app.items.is_empty()
+        });
+        assert!(matches!(
+            app.global_search.accepted,
+            SearchAccepted::Metadata { applied: None }
+        ));
         let run = app.global_search.run_sequence;
         for _ in 0..8 {
             app.poll_global_search_debounce(&ctx);
+            app.poll_global_search_events(&ctx);
         }
         assert_eq!(app.global_search.run_sequence, run);
-        assert_eq!(app.global_search.last_executed, "old executed");
-        assert!(
-            matches!(&app.global_search.accepted, SearchAccepted::Metadata { applied } if applied == &applied_before)
-        );
-        assert!(app.global_search.page_edit_prepare.is_none());
+        assert!(app.global_search.last_executed.is_empty());
+        assert!(app.global_search.pending.is_none());
+        // Keep the ordinary projection worker usable after the draft-only edit.
+        for sort in [
+            crate::settings::SortOrder::FileName,
+            crate::settings::SortOrder::RatingAsc,
+            crate::settings::SortOrder::RatingDesc,
+        ] {
+            for rating_filter in [[true; 6], [false, false, false, false, false, true]] {
+                app.feedback_toasts_for_test.clear();
+                app.settings.sort_order = sort;
+                app.settings.rating_filter = rating_filter;
+                app.drop_rating_filter_suppression_on_user_edit();
+                app.apply_sort_change_reload();
+                crate::global_search_ui::tests::section1409_settle_metadata(
+                    &mut app,
+                    &ctx,
+                    |app| app.items.is_empty(),
+                );
+                assert!(
+                    app.feedback_toasts_for_test.is_empty(),
+                    "sort={sort:?}, phase={phase}: {:?}",
+                    app.feedback_toasts_for_test
+                );
+                assert!(app.global_search.pending.is_none());
+                assert_eq!(app.global_search.run_sequence, run);
+            }
+        }
         assert!(app.submit_search_input(&ctx, Kind::Metadata, Kind::Metadata.temporary_id()));
         assert!(app.global_search.last_change_at.is_some());
         assert_ne!(app.global_search.run_sequence, run);
@@ -284,6 +302,69 @@ fn search_name_metadata_injection_disarms_completed_waiting_and_running_queries(
         assert_eq!(app.global_search.last_executed, "new draft");
         end(&ctx);
     }
+}
+
+#[test]
+fn search_name_new_metadata_draft_converges_without_repeated_projection_rejections() {
+    let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+    let mut app = super::super::setup_app_for_test();
+    let ctx = context();
+    app.current_folder = Some(app.tmp.path().to_owned());
+    app.items = vec![GridItem::Image(app.tmp.path().join("folder-item.png"))];
+    assert!(!app.items_are_global_search_view);
+    ctx.begin_pass(egui::RawInput::default());
+    inject(&mut app, &ctx, Kind::Metadata, "new draft");
+    assert!(app.edit_owner(Kind::Metadata));
+    assert_eq!(app.global_search.metadata_draft, "new draft");
+    crate::global_search_ui::tests::section1409_settle_metadata(&mut app, &ctx, |app| {
+        app.global_search.pending.is_none()
+    });
+    let rejected = app.search_prepare_metrics_for_test().stale_rejections;
+    assert!(
+        rejected <= 1,
+        "draft-only entry must settle; repeatedly rejected {rejected} empty projections (search_view={}, last_executed={:?})",
+        app.items_are_global_search_view,
+        app.global_search.last_executed
+    );
+    assert!(app.global_search.pending.is_none());
+    end(&ctx);
+}
+
+#[test]
+fn search_name_metadata_from_everything_does_not_republish_the_old_query() {
+    let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+    let mut app = super::super::setup_app_for_test();
+    let ctx = context();
+    let old_path = app.tmp.path().join("old.png");
+    image::RgbImage::new(2, 3).save(&old_path).unwrap();
+    crate::global_search_ui::adopt_everything_for_test(
+        &mut app,
+        &ctx,
+        "old everything",
+        crate::global_search_ui::everything_dataset_for_test(vec![GridItem::Image(old_path)]),
+    );
+    ctx.begin_pass(egui::RawInput::default());
+    inject(&mut app, &ctx, Kind::Metadata, "new metadata");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while app.global_search.last_executed.is_empty() && Instant::now() < deadline {
+        app.poll_global_search_events(&ctx);
+        app.poll_global_search_debounce(&ctx);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        app.global_search.last_executed.is_empty(),
+        "old query must not be republished after injection: {:?}",
+        app.global_search.last_executed
+    );
+    assert!(
+        app.items.is_empty(),
+        "editing the Metadata query must clear the old results"
+    );
+    assert!(matches!(
+        app.global_search.accepted,
+        SearchAccepted::Metadata { applied: None }
+    ));
+    end(&ctx);
 }
 
 #[test]
@@ -300,7 +381,7 @@ fn search_name_abandoned_selection_never_revives_on_ordinary_reopen() {
                 // No field draw: the mark has not been consumed.
                 end(&ctx);
                 if abandoned == "undrawn" {
-                    for _ in 0..4 {
+                    for _ in 0..2 {
                         ctx.begin_pass(egui::RawInput::default());
                         end(&ctx);
                     }
@@ -335,9 +416,12 @@ fn search_name_abandoned_selection_never_revives_on_ordinary_reopen() {
                 *app.search_draft_mut(kind) = "same draft".into();
                 app.open_search_shortcut(&ctx, kind);
                 draw(&mut app, &ctx, kind, pinned);
-                let range = selection(&ctx, input_id(kind, pinned));
-                assert_eq!(
-                    range.start, range.end,
+                let range = egui::TextEdit::load_state(&ctx, input_id(kind, pinned))
+                    .unwrap()
+                    .cursor
+                    .char_range();
+                assert!(
+                    range.is_none_or(|range| range.is_empty()),
                     "{kind:?}, pinned={pinned}, {abandoned}"
                 );
                 end(&ctx);
@@ -397,17 +481,18 @@ fn search_name_local_refusal_keeps_both_search_result_sources_and_physical_child
                     crate::global_search_ui::everything_dataset_for_test(Vec::new()),
                 );
                 if child {
+                    let child_path = app.tmp.path().to_owned();
+                    let route =
+                        super::super::FacetRoute::root(super::super::FacetScope::path(&child_path));
                     let SearchAccepted::Everything { position, .. } =
                         &mut app.global_search.accepted
                     else {
                         unreachable!()
                     };
                     *position = crate::global_search_ui::EverythingPosition::PhysicalChild {
-                        logical_source: app.tmp.path().to_owned(),
-                        return_anchor: app.tmp.path().to_owned(),
-                        route: super::super::FacetRoute::root(super::super::FacetScope::path(
-                            app.tmp.path(),
-                        )),
+                        logical_source: child_path.clone(),
+                        return_anchor: child_path,
+                        route,
                     };
                 }
             } else if child {
@@ -488,10 +573,18 @@ fn search_name_item_entry_excludes_wrong_surfaces_views_and_checked_selection() 
     assert!(app.grid_item_search_name(&ctx, &item).is_none());
     app.fullscreen_idx = None;
     let viewport = egui::ViewportId::from_hash_of("detached-search-name-test");
-    ctx.begin_pass(egui::RawInput {
+    let mut input = egui::RawInput {
         viewport_id: viewport,
         ..Default::default()
-    });
+    };
+    input.viewports.insert(
+        viewport,
+        egui::ViewportInfo {
+            parent: Some(egui::ViewportId::ROOT),
+            ..Default::default()
+        },
+    );
+    ctx.begin_pass(input);
     assert!(app.grid_item_search_name(&ctx, &item).is_none());
     end(&ctx);
 }

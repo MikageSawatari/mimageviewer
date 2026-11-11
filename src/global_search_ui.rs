@@ -5635,7 +5635,7 @@ pub(crate) mod tests {
         tx
     }
 
-    fn section1409_settle_metadata(
+    pub(crate) fn section1409_settle_metadata(
         app: &mut App,
         ctx: &egui::Context,
         ready: impl Fn(&App) -> bool,
