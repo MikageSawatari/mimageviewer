@@ -1220,7 +1220,14 @@ Tantivy commit自体を強制中断はしない。そこで上位のIndexerManag
 同じ ExitTemporaryView の physical jump へ渡す。無効な行き先・scan 失敗・取消では検索結果と選択を保持する。
 検索外は従来の Direct を使い、Ctrl+F の先閉じと既存の入力優先順位は維持する。
 メニューバー・キー・リング・ゲームパッドのお気に入りは検索を残した擬似的な子への移動のまま。
-アドレス欄・フォルダペインも対象外。
+追補 §10: アドレス欄の Enter（空欄 → DriveList、「本棚」「本棚 > 名前」、解決したパス）は、
+dispatch 時に検索 3 owner のどれかが active なら成功時終了の場所ジャンプへ渡す。
+利用者によるフォルダペインのクリック・Enter・ゲームパッド操作は、受付時に検索が active なら
+`ExitTemporaryView` の scan を使い、受付後の検索開始では既存の surface-switch 退役処理で取り消す。
+検索外の Direct / DriveList / PaneNavigation と、内部の `start_folder_pane_open` の呼び出しは従来どおり。
+成功後は検索 owner を閉じるので Esc で結果へは戻れず、履歴 Back は検索前の場所へ戻る。
+失敗・取消・stale は結果と選択を保持する。メニューバーのお気に入り・本棚等、キー・リング・ゲームパッドの
+お気に入りは検索を残した擬似的な子への移動のまま。
 §1.682 の Everything 一覧順移動は検索を閉じず、結果への帰路だけを成功採用した移動先行へ揃える。
 両項目の詳細は [検索結果ナビゲーション設計](search-result-navigation-682-688-plan.md) を参照。
 

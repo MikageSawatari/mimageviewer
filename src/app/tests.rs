@@ -30075,18 +30075,11 @@ mod phase_c_folder_nav_history_tests {
                 app.update_ime_state(ctx);
                 app.note_main_chrome_pointer_block_transition(ctx);
                 if let Some(nav) = app.render_toolbar(root_ui).1 {
-                    let crate::ui_main::AddressBarNav::Direct(path, restore_intent) = nav else {
-                        panic!("address Enter must produce Direct navigation");
+                    let crate::ui_main::AddressBarNav::AddressInput(target) = nav else {
+                        panic!("address Enter must produce address-input navigation");
                     };
-                    // The exact consumer used by App::update after merging AddressBarNav::Direct.
-                    app.open_direct_navigation_target(
-                        path,
-                        None,
-                        crate::app::OpenRequestOwner::Navigation,
-                        None,
-                        None,
-                        restore_intent,
-                    );
+                    // The exact consumer used by App::update for address Enter.
+                    app.dispatch_address_input(target);
                 }
             });
         harness.run();

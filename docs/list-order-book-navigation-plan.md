@@ -117,6 +117,9 @@ Everything では `PhysicalChild.logical_source` と完全一致する行だけ�
   current origin・accepted run・採用 path と row の physical key・dataset membership が一致する成功採用でだけ、
   `logical_source` / `return_anchor` を移動先 row に置き換え、route は保つ。一覧順以外の `Descend` は従来どおり。
   Folder 行から中の書庫へ着く場合は、まず Folder 行の採用で基準を替え、その後の書庫 open は `Descend` とする。
+  親 Folder 行の配下で既に読んでいる本が次の結果行にもある場合、行の基準だけが進んで物理の本が変わらないことがある。
+  ListOrder の宛先と現在の本の physical key が両方存在して一致するときは「一覧の移動先は現在表示中の本です」と Info で伝え、
+  通常の行採用を継続する。端の Edge 表示設定は変更しない。
 
 ## 4. 移動
 
@@ -193,7 +196,8 @@ Everything では `PhysicalChild.logical_source` と完全一致する行だけ�
 | その open が取消・失敗した | 置き換えたまま (いま見ている一覧の写し) | 一覧に居るので操作の文脈 (FsCommon) に無い |
 | この操作で移動した (ZIP / PDF の後からの採用・hydration を含む) | 変えない | Folder は §3.4 の 5、Everything は成功採用で置き換えた logical_source の行。結果へ戻ると移動先行を選択する |
 | EPUB を「PDF として保存」して保存先を開いた | 変えない | 保存先が列に無ければ通知 |
-| DFS・兄弟移動・履歴・アドレスバー・ブックマーク・評価一覧から開いた物理の本 | 変えない | Folder は列に含まれれば使える。Everything の帰路基準は替えず、現在の場所が旧行の範囲外なら通知 |
+| DFS・兄弟移動・履歴・ブックマーク・評価一覧等から開いた物理の本 | 変えない | Folder は列に含まれれば使える。検索を残す入口の Everything の帰路基準は替えず、現在の場所が旧行の範囲外なら通知 |
+| 検索中にアドレス欄・利用者のフォルダペイン操作で移動した (§1.688 追補 §10) | 変えない | 成功採用で検索が終了し、旧 Everything scope の列は使えない。移動先一覧から本を開けば Folder scope の列へ置き換わる |
 | 親一覧へ戻った・他の surface へ移った | 変えない | 一覧に居る間は文脈に無い。次に本を開けば置き換わる |
 | ★固定を有効にした / 解除した | 変えない | 有効の間は 4 で使えない。解除で戻る |
 | F12 で同じ context を別窓へ出す / 戻す (linked) | 変えない | 別窓の間は 3 で使えない |

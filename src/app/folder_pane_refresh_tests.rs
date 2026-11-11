@@ -3,6 +3,143 @@ use super::*;
 use crate::folder_pane::{FolderPaneCursorScroll, FolderPaneState};
 use std::time::SystemTime;
 
+#[cfg(windows)]
+#[test]
+fn folder_pane_user_search_click_and_enter_adopt_then_history_back_to_pre_search() {
+    for kind in 0..4 {
+        for enter in [false, true] {
+            let mut app = App::navigation_search_fixture_for_test(kind);
+            let origin = app.tmp.path().join("pre-search");
+            let target = app.tmp.path().join("pane-user-target");
+            std::fs::create_dir_all(&origin).unwrap();
+            std::fs::create_dir(&target).unwrap();
+            let root = app.tmp.path().to_path_buf();
+            app.set_folder_tree_pane_visible(true);
+            if kind == 1 {
+                // adopt_everything_for_test reserves the temporary search editor's
+                // first focus. This isolated pane frame does not draw that bar to
+                // acknowledge the user's move to the tree. Retire only its editor
+                // reservation through the existing focus-loss/navigation API; the
+                // accepted dataset and producer/modal state are left intact.
+                assert!(app.global_search.pending.is_none());
+                assert!(app.global_search.focus_request || app.global_search.has_focus);
+                app.retire_search_input_focus(
+                    crate::ui_pinned_search::PinnedSearchKind::Everything,
+                );
+                assert!(!app.global_search.focus_request && !app.global_search.has_focus);
+            }
+            app.folder_pane =
+                FolderPaneState::test_tree(&root, vec![origin.clone(), target.clone()]);
+            app.folder_pane.test_seed_listing(&target, vec![], false);
+            app.folder_pane.set_cursor(origin.clone());
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            ctx.enable_accesskit();
+            ctx.options_mut(|options| options.max_passes = std::num::NonZeroUsize::new(1).unwrap());
+            let mut frame = 0;
+            navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+            assert!(app.global_search.active || app.favsearch.active || app.tag_view.active);
+            if enter {
+                app.folder_pane.set_focus_tree();
+                app.folder_pane.set_cursor(target.clone());
+                assert!(
+                    app.folder_pane_blocks_grid_keyboard(),
+                    "kind={kind}: tree owns Enter"
+                );
+                assert!(
+                    !app.everything_search_progress_visible(),
+                    "kind={kind}: Enter must not be a new search submission"
+                );
+                assert!(
+                    !app.main_chrome_pointer_blocked(),
+                    "kind={kind}: pane has no modal owner"
+                );
+                assert!(
+                    matches!(app.folder_pane.handle_tree_key(crate::folder_pane::FolderPaneTreeKey::Enter), Some(crate::folder_pane::FolderPaneCommand::Open(path)) if path == target),
+                    "kind={kind}: real cursor resolves the target"
+                );
+                navigation_tree_frame(
+                    &mut app,
+                    &ctx,
+                    &mut frame,
+                    vec![tree_key_event(egui::Key::Enter)],
+                );
+            } else {
+                let id: egui::Id = ctx
+                    .data(|data| {
+                        data.get_temp(egui::Id::unique((
+                            "folder_pane_test_label_id",
+                            target.as_path(),
+                        )))
+                    })
+                    .expect("real rendered destination row");
+                let rect = ctx.read_response(id).unwrap().rect;
+                let viewport: egui::Rect = ctx
+                    .data(|data| data.get_temp(egui::Id::unique("folder_pane_test_viewport")))
+                    .unwrap();
+                let clickable = rect.intersect(viewport);
+                assert!(
+                    clickable.is_positive(),
+                    "kind={kind}: rendered target must be visible"
+                );
+                assert_ne!(app.folder_pane.active_path(), Some(target.as_path()));
+                let pos = clickable.center();
+                for pressed in [true, false] {
+                    navigation_tree_frame(
+                        &mut app,
+                        &ctx,
+                        &mut frame,
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                    );
+                }
+            }
+            if let Some(pending) = app.folder_pane_open_pending.as_ref() {
+                assert_eq!(
+                    pending.path, target,
+                    "kind={kind} enter={enter}: actual handler requested path"
+                );
+                assert!(
+                    matches!(
+                        pending.purpose,
+                        FolderOpenScanPurpose::JumpToPhysicalFolder { .. }
+                    ),
+                    "kind={kind} enter={enter}: user scan must exit search"
+                );
+            } else {
+                assert_eq!(
+                    app.current_folder.as_ref(),
+                    Some(&target),
+                    "kind={kind} enter={enter}: actual handler must start or finish navigation; pane_focus={} blocked={} modal={:?} cursor={:?}",
+                    app.folder_pane.has_focus,
+                    app.shortcuts_blocked_by_text_input(&ctx),
+                    app.modal_dialog_block_reason(),
+                    app.folder_pane
+                        .visible_rows()
+                        .iter()
+                        .filter(|row| row.is_cursor)
+                        .map(|row| row.path.clone())
+                        .collect::<Vec<_>>()
+                );
+            }
+            app.verify_admitted_user_navigation_for_test(&target, &origin);
+            assert_eq!(
+                app.current_folder.as_ref(),
+                Some(&origin),
+                "kind={kind} enter={enter}"
+            );
+            assert!(!app.global_search.active && !app.favsearch.active && !app.tag_view.active);
+        }
+    }
+}
+
 fn tree_frame(app: &mut App, ctx: &egui::Context, frame: &mut u64, toggle: bool) {
     let events = if toggle {
         vec![egui::Event::Key {

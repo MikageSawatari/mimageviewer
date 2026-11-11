@@ -317,7 +317,8 @@
 ## 8. 実装記録 (2026-11-11、feat-682-search-nav)
 
 初回実装は `3621aefec` (設計担当がコミット)。§8.1〜8.4 はその実装・検証時の記録で、
-§8.5 は独立レビューへの追補修正 (`e85c702ef`)、§8.6 は設計担当の受入、§8.7 は §9 の追補実装 (未コミット)。
+§8.5 は独立レビューへの追補修正 (`e85c702ef`)、§8.6 は設計担当の受入、§8.7 は §9 の追補実装 (`4a87140f3`)、
+§8.8 は §10 の追補実装 (未コミット)。
 実装担当は製品バイナリの起動・実機観測・コミットを行っていない。
 設計の前提を source で照合し、既存の capture 入口、成功採用境界、Folder 行の採用後に内部書庫を開く順序を維持した。
 App の新しい pending / bool / 次回採用フラグ、detached 述語・viewport・registry 遷移の変更、新しい同期 I/O はない。
@@ -572,7 +573,7 @@ music-video companion。最終 build の後に 5 ファイルの存在・更新�
   (`CoverIdentity` 引数追加) に追従しておらずビルドできない。今回の変更とは無関係で、本ブランチでは直していない (`test-full.ps1` は止まる見込み)。
 - 製品は起動していない。実機の挙動は未確認。
 
-### 8.7 §9 ツールバーのお気に入り・ピン留め本の追補実装 (d66169d2f 後、未コミット)
+### 8.7 §9 ツールバーのお気に入り・ピン留め本の追補実装 (4a87140f3 でコミット)
 
 変更ファイル: 製品コードは `src/app.rs` / `src/app/update_phases.rs`、テストは
 `src/app/location_jump.rs` / `src/ui_main.rs`。文書は本書、`docs/everything-search-plan.md`、
@@ -615,6 +616,98 @@ music-video companion。最終 build の後に 5 ファイルの存在・更新�
 検索外 Direct と menubar、Ctrl+F の先閉じ、入力優先順位の維持と、6 件の追加テスト・公開文書の §9 との一致を検査した。
 レビュー担当は Cargo / 製品起動 / 編集を行っていない。
 製品ページのカードは変更せず、カードの上限検査は再実行していない。確認用 build は設計担当へ引き継ぐ。
+
+### 8.8 §10 アドレス欄・利用者のフォルダペイン操作の追補実装 (0833b63a7 後、未コミット)
+
+設計の 4 種のアドレス Enter と利用者 pane 操作の前提を source で照合し、実装前の別 context の
+Sol / xhigh 独立レビューでも routing・受付・ready restore 継承を確認した (合意、阻害する指摘なし)。
+App の pending / bool、detached 述語 / viewport / registry 遷移、内部 scan の契約は増やしていない。
+
+- アドレス Enter だけ `AddressBarNav::AddressInput(LocationJumpTarget)` として運ぶ。空欄は DriveList、
+  本棚 root / 本棚内の名前 / 解決パスは Physical で、UI の TextEdit / IME 処理は変更しない。
+  input/address・context・grid・immediate の全 4 dispatch から `dispatch_address_input` へ渡す。
+  dispatch 時に検索中なら既存 `dispatch_location_jump`、検索なしなら既存の Plain downstream match を共有する。
+  Plain の Direct / DriveList の引数・受付・history に共通 modal 等の新しい gate を足さない。
+- `start_folder_pane_open` は変更せず、新しい利用者専用入口 `start_user_folder_pane_open` から既存の
+  `replace_ready_folder_pane_open` へ合流する。利用者の受付時に検索中なら既存の JumpToPhysicalFolder purpose、
+  それ以外は PaneNavigation を選ぶ。検索中は場所ジャンプと同じ既存 admission を共有する。
+  ready の diagnostic と EPUB restore 継承を維持し、受付拒否時は継承 restore を既存 Abandoned 処理で終了する。
+  要求は既存の MainListNavigation に ExitTemporaryView を所有し、成功採用でだけ検索を閉じる。
+- 利用者入口の全一覧:
+  1. `render_folder_pane_tree` の行クリック → `render_main_bars` の `folder_pane_nav` → main frame arbiter → replace-ready。
+  2. `handle_folder_pane_keyboard` の Enter → start-user。
+  3. `handle_gamepad_grid_accept` の pane Open (ゲームパッド A) → start-user。close は従来の Hide だけで二重 open しない。
+  4. pane のカーソルを移して閉じる HideAndNavigate → `take_folder_tree_pane_close_navigation` →同じ frame arbiter。
+  優先順位・ready 回収・同じパスの重複回避を維持する。
+- 内部・別機能の `start_folder_pane_open` 呼出しは変更しない。クリップボード取り込み reveal の親一覧 open、
+  取り込み先の場所ボタン、画像フォルダ ZIP 化の親一覧再openを保持する。起動復元・保存済みグループ等の
+  内部 scan / 既存テストも利用者専用入口へ置き換えない。
+- 検索が成功採用で終了するため、アドレス欄・pane から移った後は Esc で検索結果へ戻る従来の使い方がなくなる。
+  履歴 Back は検索前の場所へ戻る。manual と現行仕様へ明記した。範囲外のお気に入り / メニューバー本棚等の挙動は維持する。
+
+無反応調査の初回テストは、grid_physical_navigation だけを直接呼び、画像フォルダの自動 page open 意図を設定する
+実際の accept_grid_container_open を飛ばしたため、キーへ届く前に本の open 待ちで失敗した。製品の原因特定の証拠ではない。
+再現テストは実共通受付・grid dispatch・通常完了 poll へ訂正し、Everything Root / PhysicalChild × ZIP / 画像フォルダ本 × ↑/↓を検査する。
+この 8 ケースは修正前の製品でも成功し、position=None では案内が出る。lock を報告原因とする根拠は得られていない。
+追加調査は、保持した親 Folder 行の配下で現在の本自身を次の結果行として選ぶ場合、一覧端と案内表示設定、
+同じ fixture の通常フォルダでの移動を、実 handler / worker / 採用で分けて検査する。
+追加の実 handler 再現で、親行 A とその配下の本 B が両方結果にあると、A の基準を保持したままお気に入り経由で
+B を読んでいる状態の次入力は、B 自身を再採用して基準 / index を A→B へ進める。画面の本は B のままで、
+従来はこの成立した採用にも案内がなかった。採用後の Info を要求するテストは修正前に None で失敗した。
+これは `list_order_position=None` の拒否や lock による取りこぼしではない。
+
+修正は `apply_folder_nav_result` の scan 失敗処理後。ListOrder の宛先 logical path と現在の effective_folder の
+physical key が **両方 Some で一致**するとき、既存の Info toast で「一覧の移動先は現在表示中の本です」と伝える。
+行採用・帰還基準の更新・既存の前後順は変更しない。選ばれた宛先が同じ本であるという現在の事実を伝えるもので、
+採用成功の先取りではない。新しい pending や通知輸送は作らず、通常 close / reopen 後も残る既存 toast を使う。
+この限定 Info の設計は別 context の Sol / xhigh レビューでも合意済み。
+
+別のケースとして、保持した列が親行 A だけなら worker は target=None を返して ListOrder Edge を出す。
+既存の「先頭 / 末尾の案内を表示」が OFF の場合は、その Edge が意図どおり非表示になる。ON/OFF の実 handler テストを残し、
+この設定は変更しない。サブ PC 担当のデータ配置と表示設定は記録がなく、どのケースが報告と一致するかは未確認。
+コードで再現した「同じ物理本へ別行として進む」説明不足と、報告環境の原因の断定は分ける。
+
+既存テストの変更は次の 6 件で、実アドレス Enter が返す marker を Direct / DriveList から AddressInput に追従する。
+宛先・入力文字列・IME 合成 / 確定・フォーカス・履歴等の既存 assert は削除・緩和していない。
+
+1. `section1684_address_enter_preserves_empty_and_bookshelf_routing`: 空欄と本棚 root / 名前 / 解決パスの候補型を変更するため。
+2. `section207_address_enter_focus_reorder_escape_and_hidden_lifecycle`: Enter の physical / drive 候補型を変更するため。Escape / 非表示 / focus の検査は維持。
+3. `address_ime_commit_and_immediate_enter_same_pass_navigates_and_releases_focus`: 同一 pass の IME 確定後 Enter の address marker を変更するため。
+4. `address_ime_commit_and_immediate_enter_next_pass_navigates_and_releases_focus`: 次 pass の IME 確定後 Enter の address marker を変更するため。
+5. `address_bar_focus_recovery_then_enter_navigates_and_releases_focus`: focus 回復後 Enter の address marker を変更するため。
+3〜5 は共有 helper の address branch だけを変更し、同じ helper の検索入力 branch は従来どおり。
+
+6. `section1339_address_bar_zip_enter_keeps_copied_path_across_row_refresh`: 実 Enter の旧 Direct marker と手動 Direct consumer を AddressInput と実 `dispatch_address_input` に追従するため。ZIP preflight / 行 refresh / 履歴の assert は維持する。初回の広い focused 実行で期待型の不一致を検出した。
+
+変更ファイルは 22 件。製品は `src/app.rs`、`src/app/location_jump.rs`、`src/app/update_phases.rs`、
+`src/app/gamepad_input.rs`、`src/ui_folder_pane.rs`、`src/ui_main.rs`。テストはそれらの test module に加え
+`src/app/folder_pane_refresh_tests.rs`、`src/app/list_order_everything_tests.rs`、`src/app/tests.rs`。
+文書は本書、architecture-overview / everything-search-plan / search-architecture / keymap-spec /
+key-customization-impl-plan / list-order-book-navigation-plan / next-release-backlog と manual の
+search / shortcuts / grid / gamepad / fullscreen。
+
+新規テストは 11 件。address / pane の失敗・取消・stale、Plain / 内部 scan 回帰、pane gamepad と ready replacement の app 5 件、
+4 検索 × 4 address 入力と vanished target の実描画 Enter 1 件、4 検索 × pane 行クリック / Enter と Back の実描画 1 件、
+無関係な検索行からの案内・親行だけの Edge 設定・同じ本の別行への採用・検索終了後の通常 Folder 移動の実 handler 4 件。
+最後のテストは Everything Root / PhysicalChild × ZIP / 画像フォルダ本について、実 AddressInput dispatch・scan 採用で検索を終了してから
+通常 Folder の実キー一覧順移動・worker / 採用を確認する。独立 Sol / xhigh は製品差分とこの最終拡張を ACCEPT (追加指摘なし)。
+
+製品起動・コミット・full suite は行わず、`build-dev.ps1` は利用者の指示で設計担当へ任せる。
+Cargo 実行は `MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=4`。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(list_order_everything_menubar_favorite_physical_book_reports_unavailable_from_real_key_handler)' --no-fail-fast` (初回) | exit 100、1 実行 / 0 成功 / 1 失敗、30.633s、compile 4m30s。上記 fixture の準備不足。`target/search-nav-address-pane-silent-red.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(list_order_everything_menubar_favorite_physical_book_reports_unavailable_from_real_key_handler) \| test(address_input) \| test(user_pane) \| test(internal_pane_scans_keep_transparent_search_navigation) \| test(folder_pane_user_search)' --no-fail-fast` | exit 100、8 実行 / 6 成功 / 2 失敗、38.103s、compile 8m31s。修正した無関係行の再現 8 ケースと app 5 テストは成功。headless 2 件は、既存 resolver が不存在 path を既存祖先へ解決する契約と、ペイン実入力 fixture の完了待ちを訂正した。`target/search-nav-address-pane-repro-tests.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(list_order_everything_menubar_favorite_physical_book_reports_unavailable_from_real_key_handler) \| test(list_order_everything_retained_parent_favorite) \| test(list_order_regular_folder_repro_fixture) \| test(address_input) \| test(user_pane) \| test(internal_pane_scans_keep_transparent_search_navigation) \| test(folder_pane_user_search)' --no-fail-fast` | exit 100、11 実行 / 9 成功 / 2 失敗、10.202s、compile 2m43s。同じ本への行採用で Info がない RED を取得。残る pane fixture は、単独描画では実検索欄の focus-loss pass がないため Everything の初回 focus 予約が残り Enter が再検索へ送られたもの。既存の focus retirement API でその既知予約だけを終了するよう訂正し、producer / 結果 / modal をテストから操作しない。`target/search-nav-address-pane-confirmed-red.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(list_order_everything_retained_parent_favorite_current_book_reports_its_nested_result_row) \| test(folder_pane_user_search)' --no-fail-fast` | exit 0、2 実行 / 2 成功、17,275 skip、5.910s、compile 5m41s。`target/search-nav-address-pane-corrections.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(list_order) \| test(everything) \| test(location) \| test(gamepad) \| test(jump) \| test(section1328) \| test(toolbar_favorite) \| test(address) \| test(folder_pane) \| test(user_pane) \| test(internal_pane) \| test(startup_restore) \| test(saved_group)' --no-fail-fast` (初回) | exit 100、957 実行 / 956 成功 (1 leaky) / 1 失敗、16,320 skip、101.886s、compile 4m34s。上記 section1339 の旧 marker / consumer を訂正。追加 11 件は成功。`target/search-nav-address-pane-focused.log` |
+| 上記 957 件と同一の nextest コマンド (最終、section1339 訂正・workspace fmt 後) | **exit 0、957 実行 / 957 成功 / 0 失敗、16,320 skip、102.720s、compile 3m02s**。`target/search-nav-address-pane-final.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険な文字 0 件。 |
+| `python scripts/check_site_cards.py` | exit 0、53 cards checked、0 over the limit。 |
+| `.\scripts\test-focused.ps1 -PlanOnly` | shared / unmapped paths を検出しテスト実行なし、runner exit 1。禁止された full suite へ進まず上記明示 filter を使う。 |
+| `cargo fmt` (workspace、引数なし、最後に再実行) / `cargo fmt --check` | ともに exit 0。検索入力部品と履歴▼の周辺に整形差分なし。 |
+| `git -c core.safecrlf=false diff --check` | exit 0。 |
 
 ## 9. 追補: ツールバーのお気に入りもそろえる (2026-11-11 利用者決定)
 

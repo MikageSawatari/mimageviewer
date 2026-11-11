@@ -41,32 +41,27 @@ impl App {
         Some(AddressBarNav::LocationJump(target))
     }
 
-    pub(crate) fn dispatch_location_jump(&mut self, target: LocationJumpTarget) {
-        if self.location_jump_snapshot_blocked()
+    pub(super) fn location_jump_admission_blocked(&mut self) -> bool {
+        self.location_jump_snapshot_blocked()
             || self.main_chrome_pointer_blocked()
             || self.document_open_modal_admission_blocked()
-        {
+    }
+
+    pub(crate) fn dispatch_address_input(&mut self, target: LocationJumpTarget) {
+        if self.global_search.active || self.favsearch.active || self.tag_view.active {
+            self.dispatch_location_jump(target);
+        } else {
+            // Address Enter keeps its released Direct / DriveList admission outside search.
+            self.dispatch_plain_location_jump(target);
+        }
+    }
+
+    pub(crate) fn dispatch_location_jump(&mut self, target: LocationJumpTarget) {
+        if self.location_jump_admission_blocked() {
             return;
         }
         if !(self.global_search.active || self.favsearch.active || self.tag_view.active) {
-            // Preserve each destination's released plain-navigation entry point.
-            match target {
-                LocationJumpTarget::Physical(path) => self.open_direct_navigation_target_at_stage(
-                    path,
-                    None,
-                    OpenRequestOwner::Navigation,
-                    None,
-                    None,
-                    StartupListIntent::ExplicitList,
-                    MainListRequestStage::Admission,
-                ),
-                LocationJumpTarget::DriveList => self.enter_drive_list_from_navigation(None),
-                LocationJumpTarget::ReadingHistory => {
-                    self.enter_reading_history_with_entrance(ReadingHistoryEntrance::Menu);
-                }
-                LocationJumpTarget::BooksRoot => self.open_books_root(),
-                LocationJumpTarget::Rating(stars) => self.enter_rating_view(stars),
-            }
+            self.dispatch_plain_location_jump(target);
             return;
         }
 
@@ -93,6 +88,26 @@ impl App {
             LocationJumpTarget::Rating(stars) => {
                 self.enter_rating_view_with_history(stars, history)
             }
+        }
+    }
+
+    fn dispatch_plain_location_jump(&mut self, target: LocationJumpTarget) {
+        match target {
+            LocationJumpTarget::Physical(path) => self.open_direct_navigation_target_at_stage(
+                path,
+                None,
+                OpenRequestOwner::Navigation,
+                None,
+                None,
+                StartupListIntent::ExplicitList,
+                MainListRequestStage::Admission,
+            ),
+            LocationJumpTarget::DriveList => self.enter_drive_list_from_navigation(None),
+            LocationJumpTarget::ReadingHistory => {
+                self.enter_reading_history_with_entrance(ReadingHistoryEntrance::Menu);
+            }
+            LocationJumpTarget::BooksRoot => self.open_books_root(),
+            LocationJumpTarget::Rating(stars) => self.enter_rating_view(stars),
         }
     }
 
@@ -883,6 +898,14 @@ mod tests {
         origin: &std::path::Path,
     ) {
         complete_physical_jump(app, target);
+        finish_admitted_user_jump_and_go_back(app, target, origin);
+    }
+
+    fn finish_admitted_user_jump_and_go_back(
+        app: &mut App,
+        target: &std::path::Path,
+        origin: &std::path::Path,
+    ) {
         settle_location_jump(app, |app| app.current_folder.as_deref() == Some(target));
         assert_search_dismissed_with_history(app, origin.to_path_buf());
         let ctx = egui::Context::default();
@@ -917,6 +940,89 @@ mod tests {
     // The UI test module cannot call an app-private frame phase. This bridge is
     // test-only and exercises the same toolbar lane, scan adoption and Back handler.
     impl App {
+        pub(crate) fn navigation_search_fixture_for_test(kind: usize) -> AppTestEnv {
+            search_fixture(kind)
+        }
+
+        pub(crate) fn verify_admitted_user_navigation_for_test(
+            &mut self,
+            target: &std::path::Path,
+            origin: &std::path::Path,
+        ) {
+            if self.folder_pane_open_pending.is_some() {
+                complete_physical_jump(self, target);
+            }
+            assert_eq!(
+                self.current_folder.as_deref(),
+                Some(target),
+                "user navigation must admit its actual requested path before Back; search=({},{},{}) pending={:?}",
+                self.global_search.active,
+                self.favsearch.active,
+                self.tag_view.active,
+                self.folder_pane_open_pending
+                    .as_ref()
+                    .map(|pending| &pending.path)
+            );
+            finish_admitted_user_jump_and_go_back(self, target, origin);
+        }
+
+        pub(crate) fn verify_failed_address_input_navigation_for_test(
+            &mut self,
+            candidate: AddressBarNav,
+            kind: usize,
+        ) {
+            let expected = user_navigation_source_state(self);
+            let mut frame = toolbar_favorite_frame(PathBuf::new());
+            frame.toolbar_fav_nav = None;
+            frame.address_nav = Some(candidate);
+            self.post_render_main_navigation(&egui::Context::default(), frame);
+            let pending = self
+                .folder_pane_open_pending
+                .take()
+                .expect("actual address candidate starts a scan");
+            let scan = pending
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("vanished address scan reply");
+            assert!(
+                scan.is_err(),
+                "the candidate's resolved directory vanished after Enter"
+            );
+            let ready = super::super::FolderPaneOpenReady {
+                navigation: pending.navigation,
+                epub_restore: pending.epub_restore,
+                path: pending.path,
+                purpose: pending.purpose,
+                scan,
+            };
+            assert!(
+                self.resolve_main_folder_open_ready(&egui::Context::default(), ready)
+                    .is_none()
+            );
+            assert_search_active(self, kind);
+            assert_eq!(user_navigation_source_state(self), expected);
+            assert!(self.fs_feedback_toast.is_some());
+        }
+
+        pub(crate) fn verify_address_input_navigation_for_test(
+            &mut self,
+            candidate: AddressBarNav,
+            origin: &std::path::Path,
+        ) {
+            let target = match &candidate {
+                AddressBarNav::AddressInput(LocationJumpTarget::Physical(path)) => path.clone(),
+                AddressBarNav::AddressInput(LocationJumpTarget::DriveList) => {
+                    super::super::drive_list_synthetic_path()
+                }
+                _ => panic!("expected an address Enter candidate"),
+            };
+            let mut frame = toolbar_favorite_frame(target.clone());
+            frame.toolbar_fav_nav = None;
+            frame.address_nav = Some(candidate);
+            self.post_render_main_navigation(&egui::Context::default(), frame);
+            self.verify_admitted_user_navigation_for_test(&target, origin);
+        }
+
         pub(crate) fn verify_toolbar_favorite_jump_for_test(
             &mut self,
             target: PathBuf,
@@ -1185,5 +1291,272 @@ mod tests {
             assert!(app.folder_pane_open_pending.is_none());
             assert!(app.fs_feedback_toast.is_some());
         }
+    }
+
+    fn user_navigation_source_state(
+        app: &App,
+    ) -> (
+        Option<PathBuf>,
+        String,
+        Option<usize>,
+        u64,
+        super::super::FolderNavHistorySnapshot,
+        [String; 4],
+    ) {
+        (
+            app.current_folder.clone(),
+            app.address.clone(),
+            app.selected,
+            app.items_generation,
+            app.folder_nav_history_snapshot(),
+            [
+                app.global_search.metadata_draft.clone(),
+                app.global_search.everything_draft.clone(),
+                app.favsearch.query.clone(),
+                app.tag_view.query.clone(),
+            ],
+        )
+    }
+
+    fn start_address_or_user_pane(app: &mut App, target: PathBuf, pane: bool) {
+        if pane {
+            app.start_user_folder_pane_open(target);
+        } else {
+            let mut frame = toolbar_favorite_frame(target.clone());
+            frame.toolbar_fav_nav = None;
+            frame.address_nav = Some(AddressBarNav::AddressInput(LocationJumpTarget::Physical(
+                target,
+            )));
+            app.post_render_main_navigation(&egui::Context::default(), frame);
+        }
+    }
+
+    #[test]
+    fn address_input_and_user_pane_fail_cancel_and_stale_keep_the_current_search() {
+        for kind in 0..4 {
+            for pane in [false, true] {
+                for outcome in 0..4 {
+                    let mut app = search_fixture(kind);
+                    let target = app.tmp.path().join("user-destination");
+                    std::fs::create_dir(&target).unwrap();
+                    // The destination existed when the address or cached tree row was chosen.
+                    if outcome == 0 {
+                        std::fs::remove_dir(&target).unwrap();
+                    }
+                    start_address_or_user_pane(&mut app, target.clone(), pane);
+                    let pending = app
+                        .folder_pane_open_pending
+                        .as_ref()
+                        .expect("user explicit scan");
+                    assert!(matches!(
+                        pending.purpose,
+                        super::super::FolderOpenScanPurpose::JumpToPhysicalFolder {
+                            selection: JumpToFolderSelection::None,
+                            origin: None
+                        }
+                    ));
+                    assert!(matches!(
+                        &pending.navigation.as_ref().unwrap().history,
+                        MainHistoryOperation::Direct(
+                            DirectNavigationPurpose::ExitTemporaryView { .. }
+                        )
+                    ));
+                    if outcome == 2 {
+                        let cancel = pending.cancel.clone();
+                        let expected = user_navigation_source_state(&app);
+                        app.cancel_folder_pane_open(super::super::PaneOpenRestoreExit::Abandoned);
+                        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+                        assert_eq!(user_navigation_source_state(&app), expected);
+                    } else {
+                        let pending = app.folder_pane_open_pending.take().unwrap();
+                        if outcome == 3 {
+                            app.retire_main_list_requests_for_surface_switch();
+                            match kind {
+                                0 => app.global_search.metadata_draft = "replacement".into(),
+                                1 => app.global_search.everything_draft = "replacement".into(),
+                                2 => app.favsearch.query = "replacement".into(),
+                                _ => app.tag_view.query = "replacement".into(),
+                            }
+                        }
+                        let expected = user_navigation_source_state(&app);
+                        let scan = match outcome {
+                            0 => {
+                                let result = pending
+                                    .rx
+                                    .recv_timeout(std::time::Duration::from_secs(30))
+                                    .expect("missing-directory scan reply");
+                                assert!(result.is_err());
+                                result
+                            }
+                            1 => Err(std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                "denied",
+                            )),
+                            _ => Ok(super::super::scan_directory(&target)),
+                        };
+                        pending
+                            .cancel
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        let ready = super::super::FolderPaneOpenReady {
+                            navigation: pending.navigation,
+                            epub_restore: pending.epub_restore,
+                            path: pending.path,
+                            purpose: pending.purpose,
+                            scan,
+                        };
+                        assert!(
+                            app.resolve_main_folder_open_ready(&egui::Context::default(), ready)
+                                .is_none()
+                        );
+                        assert_eq!(user_navigation_source_state(&app), expected);
+                        if outcome < 2 {
+                            assert!(app.fs_feedback_toast.is_some());
+                        }
+                    }
+                    assert_search_active(&app, kind);
+                    assert!(app.folder_pane_open_pending.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn user_pane_gamepad_search_entry_adopts_and_history_back_restores_pre_search() {
+        for kind in 0..4 {
+            let mut app = search_fixture(kind);
+            let origin = app.tmp.path().join("pre-search");
+            let target = app.tmp.path().join("gamepad-pane");
+            std::fs::create_dir_all(&origin).unwrap();
+            std::fs::create_dir(&target).unwrap();
+            app.settings.folder_tree_pane_visible = true;
+            let tree_root = app.tmp.path().to_path_buf();
+            app.folder_pane =
+                crate::folder_pane::FolderPaneState::test_tree(&tree_root, vec![target.clone()]);
+            app.folder_pane.set_cursor(target.clone());
+            assert!(
+                app.handle_gamepad_grid_accept(&egui::Context::default())
+                    .is_none()
+            );
+            assert!(app.context_folder_jump_pending());
+            finish_toolbar_jump_and_go_back(&mut app, &target, &origin);
+        }
+    }
+
+    #[test]
+    fn internal_pane_scans_keep_transparent_search_navigation() {
+        for kind in 0..4 {
+            let mut app = search_fixture(kind);
+            let target = app.tmp.path().join("internal-pane");
+            std::fs::create_dir(&target).unwrap();
+            let history = (
+                app.folder_history_back_entry().cloned(),
+                app.folder_history_forward_entry().cloned(),
+            );
+            app.start_folder_pane_open(target.clone());
+            assert!(matches!(
+                app.folder_pane_open_pending.as_ref().unwrap().purpose,
+                super::super::FolderOpenScanPurpose::PaneNavigation
+            ));
+            settle_location_jump(&mut app, |app| app.current_folder.as_ref() == Some(&target));
+            assert_search_active(&app, kind);
+            assert_eq!(
+                (
+                    app.folder_history_back_entry().cloned(),
+                    app.folder_history_forward_entry().cloned()
+                ),
+                history
+            );
+        }
+    }
+
+    #[test]
+    fn address_input_and_user_pane_plain_entries_keep_existing_direct_and_pane_routing() {
+        for entry in 0..5 {
+            let mut app = setup_app();
+            let origin = app.tmp.path().join("plain-user-origin");
+            let shelf = app.tmp.path().join("plain-user-shelf");
+            app.settings.book_root = Some(shelf.clone());
+            let target = match entry {
+                3 => shelf,
+                4 => crate::books::book_folder(&shelf, "named-book"),
+                _ => app.tmp.path().join("plain-user-target"),
+            };
+            std::fs::create_dir(&origin).unwrap();
+            std::fs::create_dir_all(&target).unwrap();
+            app.current_folder = Some(origin.clone());
+            app.top_level_grid_view
+                .replace_surface(TopLevelGridSurface::Folder);
+            if entry == 0 {
+                app.start_user_folder_pane_open(target.clone());
+                assert!(matches!(
+                    app.folder_pane_open_pending.as_ref().unwrap().purpose,
+                    super::super::FolderOpenScanPurpose::PaneNavigation
+                ));
+            } else {
+                app.dispatch_address_input(if entry == 1 {
+                    LocationJumpTarget::DriveList
+                } else {
+                    LocationJumpTarget::Physical(target.clone())
+                });
+            }
+            settle_location_jump(&mut app, |app| {
+                if entry == 1 {
+                    app.items_are_drive_list
+                } else {
+                    app.current_folder.as_ref() == Some(&target)
+                }
+            });
+            assert_search_dismissed_with_history(&app, origin);
+        }
+    }
+
+    #[test]
+    fn user_pane_ready_replacement_uses_search_exit_and_new_search_cancels_plain_scan() {
+        for kind in 0..4 {
+            let mut app = search_fixture(kind);
+            let old = app.tmp.path().join("old-pane-candidate");
+            let new = app.tmp.path().join("new-pane-candidate");
+            std::fs::create_dir(&old).unwrap();
+            std::fs::create_dir(&new).unwrap();
+            app.start_user_folder_pane_open(old.clone());
+            let pending = app.folder_pane_open_pending.take().unwrap();
+            pending
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let ready = super::super::FolderPaneOpenReady {
+                navigation: pending.navigation,
+                epub_restore: pending.epub_restore,
+                path: pending.path,
+                purpose: pending.purpose,
+                scan: Ok(super::super::scan_directory(&old)),
+            };
+            app.replace_ready_folder_pane_open(new.clone(), Some(ready));
+            assert_eq!(app.folder_pane_open_pending.as_ref().unwrap().path, new);
+            assert!(app.context_folder_jump_pending());
+            assert_search_active(&app, kind);
+            complete_physical_jump(&mut app, &new);
+            let origin = app.tmp.path().join("pre-search");
+            assert_search_dismissed_with_history(&app, origin);
+        }
+        let mut app = setup_app();
+        let origin = app.tmp.path().join("plain-source");
+        let target = app.tmp.path().join("replaced-pane");
+        std::fs::create_dir(&origin).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        app.current_folder = Some(origin.clone());
+        app.top_level_grid_view
+            .replace_surface(TopLevelGridSurface::Folder);
+        app.start_user_folder_pane_open(target);
+        let cancel = app
+            .folder_pane_open_pending
+            .as_ref()
+            .unwrap()
+            .cancel
+            .clone();
+        app.open_global_search();
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(app.folder_pane_open_pending.is_none());
+        assert!(app.global_search.active);
+        assert_eq!(app.current_folder.as_ref(), Some(&origin));
     }
 }

@@ -378,7 +378,7 @@ impl App {
                     // クリック経路と同じく worker scan 経由で開く (UI スレッドの
                     // read_dir ブロック回避)。Enter は consume 済みなので、この後
                     // grid keyboard へ抜けても二重発火しない。
-                    self.start_folder_pane_open(path);
+                    self.start_user_folder_pane_open(path);
                     return None;
                 }
             }

@@ -9529,7 +9529,7 @@ impl App {
             {
                 self.request_folder_tree_pane_close();
                 // worker scan 経由で開く (UI スレッドの read_dir ブロック回避)。
-                self.start_folder_pane_open(path);
+                self.start_user_folder_pane_open(path);
                 return None;
             }
             return None;

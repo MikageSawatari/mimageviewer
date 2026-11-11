@@ -860,6 +860,7 @@ pub(crate) enum LocationJumpTarget {
 #[derive(Debug)]
 pub(crate) enum AddressBarNav {
     LocationJump(LocationJumpTarget),
+    AddressInput(LocationJumpTarget),
     ZipListReturn(crate::app::ZipListReturnRequest),
     Direct(PathBuf, crate::app::StartupListIntent),
     GridVirtual(crate::app::GridVirtualOpenIntent),
@@ -15995,6 +15996,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         | AddressBarNav::ZipListReturn(_)
                                         | AddressBarNav::EverythingResults
                                         | AddressBarNav::LocationJump(_)
+                                        | AddressBarNav::AddressInput(_)
                                         | AddressBarNav::SavedGroupReady(_),
                                     )
                                     | None => "親フォルダへ [BS]".to_string(),
@@ -16505,28 +16507,31 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         if !is_snap_active && resp.lost_focus() && enter_pressed {
                                             let address_text = self.address.trim();
                                             if address_text.is_empty() {
-                                                result = Some(AddressBarNav::DriveList(None));
+                                                result = Some(AddressBarNav::AddressInput(
+                                                    LocationJumpTarget::DriveList,
+                                                ));
                                             } else if address_text == "本棚" {
-                                                result = Some(AddressBarNav::Direct(
-                                                    self.book_root_path(),
-                                                    crate::app::StartupListIntent::ExplicitList,
+                                                result = Some(AddressBarNav::AddressInput(
+                                                    LocationJumpTarget::Physical(
+                                                        self.book_root_path(),
+                                                    ),
                                                 ));
                                             } else if let Some(book_name) =
                                                 address_text.strip_prefix("本棚 > ")
                                             {
-                                                result = Some(AddressBarNav::Direct(
-                                                    crate::books::book_folder(
-                                                        &self.book_root_path(),
-                                                        book_name.trim(),
+                                                result = Some(AddressBarNav::AddressInput(
+                                                    LocationJumpTarget::Physical(
+                                                        crate::books::book_folder(
+                                                            &self.book_root_path(),
+                                                            book_name.trim(),
+                                                        ),
                                                     ),
-                                                    crate::app::StartupListIntent::ExplicitList,
                                                 ));
                                             } else if let Some(resolved) =
                                                 resolve_folder_bar_address_input(&self.address)
                                             {
-                                                result = Some(AddressBarNav::Direct(
-                                                    resolved,
-                                                    crate::app::StartupListIntent::ExplicitList,
+                                                result = Some(AddressBarNav::AddressInput(
+                                                    LocationJumpTarget::Physical(resolved),
                                                 ));
                                             }
                                         }
@@ -34927,6 +34932,108 @@ mod section207_tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn address_input_search_enter_forms_adopt_then_history_back_and_vanished_target_keeps_results()
+    {
+        for kind in 0..4 {
+            for form in 0..5 {
+                let mut env = App::navigation_search_fixture_for_test(kind);
+                only_folder_and_tree(&mut env);
+                let origin = env.tmp.path().join("pre-search");
+                std::fs::create_dir_all(&origin).unwrap();
+                let physical = env.tmp.path().join("address-destination");
+                let shelf = env.tmp.path().join("address-shelf");
+                let book = crate::books::book_folder(&shelf, "名前");
+                let fallback = env.tmp.path().join("address-fallback-parent");
+                std::fs::create_dir(&physical).unwrap();
+                std::fs::create_dir_all(&book).unwrap();
+                std::fs::create_dir(&fallback).unwrap();
+                env.settings.book_root = Some(shelf.clone());
+                let input = match form {
+                    0 => physical.to_string_lossy().to_string(),
+                    1 => String::new(),
+                    2 => "本棚".into(),
+                    3 => "本棚 > 名前".into(),
+                    _ => fallback.join("missing-child").to_string_lossy().to_string(),
+                };
+                env.address = input.clone();
+                let selected = env.selected;
+                let generation = env.items_generation;
+                let app = Rc::new(RefCell::new(env));
+                let render = Rc::clone(&app);
+                let candidates = Rc::new(RefCell::new(Vec::new()));
+                let captured = Rc::clone(&candidates);
+                let fonts = Cell::new(false);
+                let mut harness = crate::test_ui::builder()
+                    .with_size(egui::vec2(1200.0, 320.0))
+                    .build_ui(move |root_ui| {
+                        let ctx = root_ui.ctx().clone();
+                        crate::ime_focus::install_ime_input_policy(&ctx);
+                        if !fonts.replace(true) {
+                            crate::ui_fonts::configure_fonts(&ctx);
+                            ctx.request_repaint();
+                            return;
+                        }
+                        let mut app = render.borrow_mut();
+                        app.update_ime_state(&ctx);
+                        if let Some(candidate) = app.render_toolbar(root_ui).1 {
+                            captured.borrow_mut().push(candidate);
+                        }
+                    });
+                harness.run();
+                harness
+                    .get_by_role(egui::accesskit::Role::TextInput)
+                    .click();
+                harness.run();
+                harness.key_press(egui::Key::Enter);
+                harness.run();
+                if form == 4 {
+                    // The address resolver deliberately walks to the nearest existing
+                    // parent. Exercise that actual candidate, then remove only the
+                    // dedicated empty parent before its asynchronous scan starts.
+                    assert!(
+                        matches!(candidates.borrow().as_slice(), [AddressBarNav::AddressInput(LocationJumpTarget::Physical(path))] if path == &fallback),
+                        "kind={kind} candidates={:?}",
+                        candidates.borrow()
+                    );
+                    let candidate = candidates.borrow_mut().pop().unwrap();
+                    std::fs::remove_dir(&fallback).unwrap();
+                    let mut app = app.borrow_mut();
+                    app.verify_failed_address_input_navigation_for_test(candidate, kind);
+                    assert!(
+                        app.global_search.active || app.favsearch.active || app.tag_view.active
+                    );
+                    assert_eq!(app.address, input);
+                    assert_eq!(app.selected, selected);
+                    assert_eq!(app.items_generation, generation);
+                } else {
+                    let expected = match form {
+                        0 => Some(&physical),
+                        1 => None,
+                        2 => Some(&shelf),
+                        _ => Some(&book),
+                    };
+                    if let Some(expected) = expected {
+                        assert!(
+                            matches!(candidates.borrow().as_slice(), [AddressBarNav::AddressInput(LocationJumpTarget::Physical(path))] if path == expected),
+                            "kind={kind} form={form}"
+                        );
+                    } else {
+                        assert!(matches!(
+                            candidates.borrow().as_slice(),
+                            [AddressBarNav::AddressInput(LocationJumpTarget::DriveList)]
+                        ));
+                    }
+                    let candidate = candidates.borrow_mut().pop().unwrap();
+                    app.borrow_mut()
+                        .verify_address_input_navigation_for_test(candidate, &origin);
+                    assert_eq!(app.borrow().current_folder.as_ref(), Some(&origin));
+                }
+            }
+        }
+    }
+
     #[test]
     fn file_organize_destinations_many_location_entries_scroll_and_select_last() {
         let mut env = crate::app::setup_app_for_test();
@@ -35866,11 +35973,14 @@ mod section207_tests {
             match expected {
                 None => assert!(nav.borrow().is_empty(), "input: {input:?}"),
                 Some(None) => assert!(
-                    matches!(nav.borrow().as_slice(), [AddressBarNav::DriveList(None)]),
+                    matches!(
+                        nav.borrow().as_slice(),
+                        [AddressBarNav::AddressInput(LocationJumpTarget::DriveList)]
+                    ),
                     "input: {input:?}"
                 ),
                 Some(Some(expected)) => assert!(
-                    matches!(nav.borrow().as_slice(), [AddressBarNav::Direct(path, crate::app::StartupListIntent::ExplicitList)] if path == &expected),
+                    matches!(nav.borrow().as_slice(), [AddressBarNav::AddressInput(LocationJumpTarget::Physical(path))] if path == &expected),
                     "input: {input:?}"
                 ),
             }
@@ -35921,7 +36031,7 @@ mod section207_tests {
         harness.key_press(egui::Key::Enter);
         harness.run();
         assert!(
-            matches!(nav.borrow().as_slice(), [AddressBarNav::Direct(path, _)] if path == &target)
+            matches!(nav.borrow().as_slice(), [AddressBarNav::AddressInput(LocationJumpTarget::Physical(path))] if path == &target)
         );
         assert!(!app.borrow().address_has_focus);
         nav.borrow_mut().clear();
@@ -35934,7 +36044,7 @@ mod section207_tests {
         harness.run();
         assert!(matches!(
             nav.borrow().as_slice(),
-            [AddressBarNav::DriveList(None)]
+            [AddressBarNav::AddressInput(LocationJumpTarget::DriveList)]
         ));
         nav.borrow_mut().clear();
         harness
@@ -36126,7 +36236,7 @@ mod section207_tests {
         assert_ne!(harness.ctx.memory(|memory| memory.focused()), Some(edit_id));
         if address {
             assert!(
-                matches!(nav.borrow().as_slice(), [AddressBarNav::Direct(path, _)] if path == &target)
+                matches!(nav.borrow().as_slice(), [AddressBarNav::AddressInput(LocationJumpTarget::Physical(path))] if path == &target)
             );
             assert!(!app.borrow().address_has_focus);
         } else {

@@ -1246,6 +1246,10 @@ impl App {
                 }
             } else if let Some(nav) = input_nav.or(address_nav) {
                 match nav {
+                    crate::ui_main::AddressBarNav::AddressInput(target) => {
+                        self.dispatch_address_input(target);
+                        None
+                    }
                     crate::ui_main::AddressBarNav::LocationJump(target) => {
                         self.dispatch_location_jump(target);
                         None
@@ -1347,6 +1351,10 @@ impl App {
                     } => self
                         .open_grid_container_with_mode(ctx, idx, mode, "grid_context_menu")
                         .and_then(|nav| match nav {
+                            crate::ui_main::AddressBarNav::AddressInput(target) => {
+                                self.dispatch_address_input(target);
+                                None
+                            }
                             crate::ui_main::AddressBarNav::LocationJump(target) => {
                                 self.dispatch_location_jump(target);
                                 None
@@ -1515,6 +1523,10 @@ impl App {
                 }
             } else {
                 match grid_nav {
+                    Some(crate::ui_main::AddressBarNav::AddressInput(target)) => {
+                        self.dispatch_address_input(target);
+                        None
+                    }
                     Some(crate::ui_main::AddressBarNav::LocationJump(target)) => {
                         self.dispatch_location_jump(target);
                         None

@@ -236,7 +236,13 @@ Folder 行の中の書庫へ着く場合は Folder 行の採用が先で、そ�
 追補 §9 の利用者決定により、ツールバーのお気に入り（ボタン列・ドロップダウン）とピン留め本も同じ成功時終了の契約にそろえる。
 4 種の検索中は dispatch 時に ★固定・共通 modal・Everything 取得中を判定し、無効な行き先・scan 失敗・取消では結果と選択を保持する。
 検索外の Direct と優先順位、Ctrl+F の先閉じは従来どおり。メニューバー・キー・リング・ゲームパッドのお気に入りは
-検索を残した擬似的な子への移動のままとし、アドレス欄・フォルダペインも変更しない。
+検索を残した擬似的な子への移動のままとする。メニューバーの本棚等も従来どおり。
+追補 §10 により、アドレス欄の Enter（空欄のドライブ一覧・「本棚」「本棚 > 名前」・解決したパス）は、
+dispatch 時に検索が active なら同じ成功時終了の場所ジャンプへ渡す。
+利用者のフォルダペイン操作（クリック・Enter・ゲームパッド）も、受付時に検索が active なら
+`ExitTemporaryView` の scan を使う。受付後に始まった検索は既存の退役処理でその scan を取り消す。
+検索外の Direct / DriveList / PaneNavigation と、起動復元等の内部 `start_folder_pane_open` は変更しない。
+成功後は Esc で検索結果へ戻らず、履歴 Back は検索前の場所へ戻る。失敗・取消・stale は結果と選択を保持する。
 両項目の正本は [検索結果ナビゲーション設計](search-result-navigation-682-688-plan.md)。実機観測の記録ではない。
 
 §1.664（2026-10-31）: 通常 close の既存 Live continuation は、採用済み PhysicalChild が本で、現在の論理コンテナと採用済み本分類の root がその source に一致するとき `AddressBarNav::EverythingResults` を返し、通常／即時 dispatcher から `return_from_everything_child(Results)` を呼ぶ。本の種類は accepted dataset の行種別と `ProjectionRecipe` で確認する。Folder 行は追加設定 ON・画像のみを必須とし、拡張子付き実フォルダを旧拡張子判定だけで対象にしない（既存分類問題§1.418自体は範囲外）。この制限は通常 close に適用し、Results ボタンは従来どおり階層途中からも使える。新しい帰路 state・第二 cache は作らない。既存の取消可能な main modal と prepare/adoption を再利用する簡素化を採り、追加の割り込み・復元機構は不要とした。Ctrl+G／Ctrl+S／タグの検索除外は維持する（別々の drill／nav_stack owner が必要なため今回対象外）。まれな失敗は既定の割り切りとし、新しい回復処理を足さない。detached 述語・viewport・registry 移譲は変更しない。

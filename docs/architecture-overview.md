@@ -43,6 +43,9 @@ fork の子には渡さず、promote 後の旧 main は id の照合で使えな
 既存の Fullscreen フォルダナビゲーションと共有する。[仕様と検証](list-order-book-navigation-plan.md)。
 検索中の場所ジャンプ（§1.688）は対象入口を型付き要求へ揃え、dispatch 時の admission 後、既存の
 `ExitTemporaryView` の成功採用境界で検索を終了する。[検索結果ナビゲーション設計](search-result-navigation-682-688-plan.md)。
+追補 §9・§10 はツールバーのお気に入り・ピン留め本、アドレス欄の Enter、利用者のフォルダペイン操作も
+成功時終了へそろえる。アドレス欄は dispatch 時、ペインは受付時に検索 owner を判定し、内部の pane scan は変更しない。
+検索外の経路は維持し、検索中の移動成功後は結果を復元せず、履歴 Back は検索前の場所へ戻る。
 
 ## 本のitems生成境界（§1.242 G1）
 

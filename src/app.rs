@@ -25046,6 +25046,10 @@ impl App {
         nav: crate::ui_main::AddressBarNav,
     ) -> bool {
         match nav {
+            crate::ui_main::AddressBarNav::AddressInput(target) => {
+                self.dispatch_address_input(target);
+                true
+            }
             crate::ui_main::AddressBarNav::LocationJump(target) => {
                 self.dispatch_location_jump(target);
                 true
@@ -60830,13 +60834,16 @@ impl App {
         self.select_item_after_load(index);
     }
 
-    /// フォルダツリーペインのクリック/Enter ナビを worker scan 経由で開始する。
-    /// UI スレッドで `scan_directory` を直接走らせず、worker で read_dir + メタ取得を
-    /// 済ませる。完了結果は `poll_folder_pane_open` で回収し、通常 nav と同じ
-    /// 優先順位で裁定してから開く。対象は実ディレクトリ前提
-    /// (フォルダペインは実フォルダのみ表示する)。
+    /// Internal callers retain ordinary PaneNavigation regardless of search state.
+    /// Explicit user pane commands use start_user_folder_pane_open instead.
+    /// Both routes scan real directories on a worker and share the normal main arbiter.
     pub(crate) fn start_folder_pane_open(&mut self, path: PathBuf) {
         self.start_folder_open_scan(path, FolderOpenScanPurpose::PaneNavigation);
+    }
+
+    /// Only explicit user pane commands choose success-only search exit at admission.
+    pub(crate) fn start_user_folder_pane_open(&mut self, path: PathBuf) {
+        self.replace_ready_folder_pane_open(path, None);
     }
 
     #[cfg(windows)]
@@ -61091,11 +61098,20 @@ impl App {
                 PaneOpenRestoreExit::ReplacedByPaneScan,
             )
         });
-        self.start_folder_open_scan_with_restore(
-            path,
-            FolderOpenScanPurpose::PaneNavigation,
-            inherited,
-        );
+        let purpose = if self.global_search.active || self.favsearch.active || self.tag_view.active
+        {
+            if self.location_jump_admission_blocked() {
+                let _ = self.finish_pane_open_restore(inherited, PaneOpenRestoreExit::Abandoned);
+                return;
+            }
+            FolderOpenScanPurpose::JumpToPhysicalFolder {
+                selection: crate::ui_dialogs::context_menu::JumpToFolderSelection::None,
+                origin: None,
+            }
+        } else {
+            FolderOpenScanPurpose::PaneNavigation
+        };
+        self.start_folder_open_scan_with_restore(path, purpose, inherited);
     }
 
     pub(crate) fn context_folder_jump_pending(&self) -> bool {
@@ -62285,6 +62301,18 @@ impl App {
                 return;
             }
         };
+        if matches!(&result.mode, FolderNavMode::ListOrder { .. })
+            && let Some(current) = self.effective_folder()
+            && let (Some(current_key), Some(target_key)) = (
+                crate::path_key::physical_path_spelling(&current),
+                crate::path_key::physical_path_spelling(&path),
+            )
+            && current_key == target_key
+        {
+            // A parent result row and its nested book are distinct entries. The
+            // anchor still advances normally even when the chosen book is on screen.
+            self.show_feedback_toast("一覧の移動先は現在表示中の本です".into());
+        }
         if !self.navigation_scope.is_detached_physical()
             && self.main_folder_history_available()
             && matches!(

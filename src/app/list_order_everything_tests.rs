@@ -1256,3 +1256,495 @@ fn list_order_everything_pdf_password_wait_resumes_original_owner_or_cancels() {
         finish_modal_landing_and_return(&mut app, &ctx, &fixture);
     }
 }
+
+#[cfg(windows)]
+struct ClearListOrderInput;
+
+#[cfg(windows)]
+impl Drop for ClearListOrderInput {
+    fn drop(&mut self) {
+        crate::key_input::clear_test_frame();
+    }
+}
+
+fn open_book_from_grid_for_list_order_repro(app: &mut App, ctx: &egui::Context, path: &Path) {
+    let index = app
+        .items
+        .iter()
+        .position(|item| item.drag_source_path() == Some(path))
+        .unwrap();
+    // Enter/double-click first run shared container admission, which captures
+    // the image-folder auto-open intent before returning a navigation value.
+    app.selected = Some(index);
+    let navigation = app
+        .accept_grid_container_open(ctx, index)
+        .expect("grid container admission");
+    let mut frame = list_order_repro_navigation_frame();
+    frame.grid_nav = Some(navigation);
+    app.post_render_main_navigation(ctx, frame);
+    app.settle_open_path_classification_for_test();
+    app.finish_page_identity_preparation_for_test();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while app.fullscreen_idx.is_none() || app.sidecar_restore_active() {
+        app.post_render_main_navigation(ctx, list_order_repro_navigation_frame());
+        app.settle_open_path_classification_for_test();
+        app.poll_history_navigation_transition_for_test(ctx);
+        app.poll_zip_enumerate();
+        app.poll_pdf_enumerate();
+        app.poll_sidecar_restore(ctx);
+        app.poll_book_composition_service_for_test(ctx);
+        app.poll_book_presentation_permission(ctx);
+        assert!(
+            Instant::now() < deadline,
+            "grid book open did not finish: target={path:?}, current={:?}, fullscreen={:?}, auto_open={}, classification={}, history={}, scan={}, zip={}, pdf={}, sidecar={}, deferred_book={}, feedback={:?}",
+            app.current_folder,
+            app.fullscreen_idx,
+            app.pending_auto_fs_open,
+            app.top_level_grid_view.open_path_classification().is_some(),
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_some(),
+            app.folder_pane_open_pending.is_some(),
+            app.zip_enumerate_pending.is_some(),
+            app.pdf_enumerate_pending.is_some(),
+            app.sidecar_restore_active(),
+            app.book_deferred_open_wait_active(),
+            app.feedback_toasts_for_test
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(app.effective_folder().as_deref(), Some(path));
+}
+
+fn list_order_repro_navigation_frame() -> crate::app::update_phases::MainFrameNavigation {
+    crate::app::update_phases::MainFrameNavigation {
+        fav_nav: None,
+        toolbar_fav_nav: None,
+        fullscreen_close_nav: None,
+        keyboard_nav: None,
+        keyboard_nav_from_fullscreen_close: false,
+        gamepad_nav: None,
+        address_nav: None,
+        open_folder_nav: None,
+        context_nav: None,
+        folder_pane_nav: None,
+        grid_nav: None,
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn list_order_everything_menubar_favorite_physical_book_reports_unavailable_from_real_key_handler()
+{
+    let _serial = crate::key_input::lock_test_input();
+    let _clear = ClearListOrderInput;
+    for initial_child in [false, true] {
+        for zip_book in [true, false] {
+            for forward in [false, true] {
+                let mut app = setup_app();
+                let ctx = egui::Context::default();
+                app.active_quick_folder_slot = None;
+                app.settings.auto_fullscreen_zip_pdf = true;
+                app.settings.auto_fullscreen_image_folders = true;
+                app.settings.detached_viewer_enabled = false;
+                app.settings.detached_viewer_open_images_in_window = false;
+                let root = app.tmp.path().to_path_buf();
+                let result_book = root.join("result-book");
+                let favorite = root.join("menubar-favorite");
+                std::fs::create_dir_all(&favorite).unwrap();
+                std::fs::create_dir_all(&result_book).unwrap();
+                write_page(&result_book.join("001.png"));
+                let physical_book = favorite.join(if zip_book { "a-book.zip" } else { "a-book" });
+                let next_book = favorite.join(if zip_book { "b-book.zip" } else { "b-book" });
+                for book in [&physical_book, &next_book] {
+                    if zip_book {
+                        write_zip(book);
+                    } else {
+                        std::fs::create_dir_all(book).unwrap();
+                        write_page(&book.join("001.png"));
+                    }
+                }
+                app.current_folder = Some(root);
+                adopt_rows(&mut app, vec![GridItem::Folder(result_book.clone())]);
+                if initial_child {
+                    open_book_from_grid_for_list_order_repro(&mut app, &ctx, &result_book);
+                    app.close_fullscreen();
+                    assert_child(&app, &result_book);
+                }
+                // Use the actual menubar lane, which intentionally retains Search.
+                let mut frame = list_order_repro_navigation_frame();
+                frame.fav_nav = Some(favorite.clone());
+                app.post_render_main_navigation(&ctx, frame);
+                app.settle_open_path_classification_for_test();
+                app.finish_page_identity_preparation_for_test();
+                assert_eq!(app.current_folder.as_ref(), Some(&favorite));
+                assert!(app.global_search.active);
+                assert!(!app.items_are_global_search_view);
+                open_book_from_grid_for_list_order_repro(&mut app, &ctx, &physical_book);
+                assert!(app.global_search.active);
+                assert!(app.list_order_position().is_none());
+                let before = app.effective_folder();
+                let modal = app.viewer_mutation_modal_active();
+                let sequence_block = app.fs_navigation_sequence_blocks_new_target();
+                let locked = app.fs_nav_is_locked();
+                app.fs_feedback_toast = None;
+                app.feedback_toasts_for_test.clear();
+                crate::key_input::set_test_frame(vec![crate::key_input::KeyEdge {
+                    operation_id: crate::key_input::KeyOperationId::unassigned(),
+                    source_hwnd: 1,
+                    source_viewport: egui::ViewportId::ROOT,
+                    virtual_key: if forward { 0x28 } else { 0x26 },
+                    scan_code: 0,
+                    extended: false,
+                    pressed: true,
+                    repeat: false,
+                    ctrl: true,
+                    shift: true,
+                    alt: false,
+                }]);
+                ctx.begin_pass(egui::RawInput {
+                    focused: true,
+                    ..Default::default()
+                });
+                let fs_index = app.fullscreen_idx.unwrap();
+                let action = app.handle_fs_key_input(&ctx, fs_index, false);
+                assert_eq!(
+                    action.list_order_nav,
+                    Some(forward),
+                    "key handler dropped ListOrder: initial_child={initial_child}, zip_book={zip_book}, modal={modal}, sequence_block={sequence_block}, locked={locked}"
+                );
+                app.handle_fs_navigation_with_list_order_operation(
+                    &ctx,
+                    action.close,
+                    action.close_to_page_list,
+                    action.ctrl_nav,
+                    action.sibling_nav,
+                    action.mouse_nav,
+                    action.page_nav,
+                    action.jump_to,
+                    fs_index,
+                    action.list_order_nav,
+                    None,
+                );
+                ctx.end_pass().drop_without_applying_deltas();
+                assert_eq!(app.effective_folder(), before);
+                assert!(app.folder_nav_pending.is_none());
+                assert_eq!(
+                    app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+                    Some("一覧から開いた本で使えます"),
+                    "silent ListOrder: initial_child={initial_child}, zip_book={zip_book}, modal={modal}, sequence_block={sequence_block}, locked={locked}, position=None, feedback={:?}",
+                    app.feedback_toasts_for_test
+                );
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn dispatch_list_order_repro_key(app: &mut App, ctx: &egui::Context, forward: bool) {
+    let modal = app.viewer_mutation_modal_active();
+    let sequence_block = app.fs_navigation_sequence_blocks_new_target();
+    let locked = app.fs_nav_is_locked();
+    crate::key_input::set_test_frame(vec![crate::key_input::KeyEdge {
+        operation_id: crate::key_input::KeyOperationId::unassigned(),
+        source_hwnd: 1,
+        source_viewport: egui::ViewportId::ROOT,
+        virtual_key: if forward { 0x28 } else { 0x26 },
+        scan_code: 0,
+        extended: false,
+        pressed: true,
+        repeat: false,
+        ctrl: true,
+        shift: true,
+        alt: false,
+    }]);
+    ctx.begin_pass(egui::RawInput {
+        focused: true,
+        ..Default::default()
+    });
+    let fs_index = app.fullscreen_idx.unwrap();
+    let action = app.handle_fs_key_input(ctx, fs_index, false);
+    assert_eq!(
+        action.list_order_nav,
+        Some(forward),
+        "real ListOrder key was not routed: modal={modal}, sequence_block={sequence_block}, locked={locked}"
+    );
+    app.handle_fs_navigation_with_list_order_operation(
+        ctx,
+        action.close,
+        action.close_to_page_list,
+        action.ctrl_nav,
+        action.sibling_nav,
+        action.mouse_nav,
+        action.page_nav,
+        action.jump_to,
+        fs_index,
+        action.list_order_nav,
+        None,
+    );
+    ctx.end_pass().drop_without_applying_deltas();
+}
+
+#[cfg(windows)]
+fn retained_parent_favorite_repro(
+    app: &mut tests::phase_c_support::AppTestEnv,
+    ctx: &egui::Context,
+    zip_book: bool,
+    nested_result_rows: bool,
+) -> (PathBuf, PathBuf, PathBuf, Arc<ListOrderSnapshot>) {
+    app.active_quick_folder_slot = None;
+    app.settings.auto_fullscreen_zip_pdf = true;
+    app.settings.auto_fullscreen_image_folders = true;
+    app.settings.detached_viewer_enabled = false;
+    app.settings.detached_viewer_open_images_in_window = false;
+    app.settings.sort_order = crate::settings::SortOrder::FileName;
+    let root = app.tmp.path().to_path_buf();
+    let parent = root.join("a-parent-result");
+    let favorite = parent.join("favorite");
+    let book = favorite.join(if zip_book { "b-book.zip" } else { "b-book" });
+    let next = favorite.join(if zip_book { "c-book.zip" } else { "c-book" });
+    std::fs::create_dir_all(&favorite).unwrap();
+    write_page(&parent.join("001.png"));
+    for path in [&book, &next] {
+        if zip_book {
+            write_zip(path);
+        } else {
+            std::fs::create_dir(path).unwrap();
+            write_page(&path.join("001.png"));
+        }
+    }
+    app.current_folder = Some(root);
+    let mut rows = vec![GridItem::Folder(parent.clone())];
+    if nested_result_rows {
+        for path in [&book, &next] {
+            rows.push(if zip_book {
+                GridItem::ZipFile(path.clone())
+            } else {
+                GridItem::Folder(path.clone())
+            });
+        }
+    }
+    adopt_rows(app, rows);
+    let index = app
+        .items
+        .iter()
+        .position(|item| item.drag_source_path() == Some(parent.as_path()))
+        .unwrap();
+    let navigation = app.accept_grid_container_open(ctx, index).unwrap();
+    let mut frame = list_order_repro_navigation_frame();
+    frame.grid_nav = Some(navigation);
+    app.post_render_main_navigation(ctx, frame);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while app.current_folder.as_ref() != Some(&parent)
+        || app.folder_pane_open_pending.is_some()
+        || app.sidecar_restore_active()
+    {
+        app.post_render_main_navigation(ctx, list_order_repro_navigation_frame());
+        app.settle_open_path_classification_for_test();
+        app.poll_sidecar_restore(ctx);
+        assert!(
+            Instant::now() < deadline,
+            "parent result row did not open its mixed folder list"
+        );
+        std::thread::yield_now();
+    }
+    app.finish_page_identity_preparation_for_test();
+    assert_child(app, &parent);
+    assert!(
+        app.fullscreen_idx.is_none(),
+        "a mixed folder is not an image-folder book"
+    );
+    let snapshot = app.list_order.clone().unwrap();
+    assert_eq!(snapshot.entries[0].path, parent);
+    let mut frame = list_order_repro_navigation_frame();
+    frame.fav_nav = Some(favorite.clone());
+    app.post_render_main_navigation(ctx, frame);
+    app.settle_open_path_classification_for_test();
+    app.finish_page_identity_preparation_for_test();
+    assert_eq!(app.current_folder.as_ref(), Some(&favorite));
+    assert!(app.global_search.active);
+    open_book_from_grid_for_list_order_repro(app, ctx, &book);
+    assert_child(app, &parent);
+    assert!(Arc::ptr_eq(app.list_order.as_ref().unwrap(), &snapshot));
+    assert_eq!(app.list_order_position().unwrap().1, 0);
+    assert!(!app.viewer_mutation_modal_active());
+    assert!(
+        !app.fs_navigation_sequence_blocks_new_target(),
+        "initial book is ready, not an unpumped folder-navigation sequence"
+    );
+    assert!(
+        !app.fs_nav_is_locked(),
+        "initial book has no unresolved display-wait lock"
+    );
+    (parent, book, next, snapshot)
+}
+
+#[cfg(windows)]
+#[test]
+fn list_order_everything_retained_parent_favorite_book_reaches_boundary_notice_policy() {
+    let _serial = crate::key_input::lock_test_input();
+    let _clear = ClearListOrderInput;
+    for zip_book in [true, false] {
+        for notice_visible in [true, false] {
+            for forward in [false, true] {
+                let mut app = setup_app();
+                let ctx = egui::Context::default();
+                let (parent, book, _, snapshot) =
+                    retained_parent_favorite_repro(&mut app, &ctx, zip_book, false);
+                app.settings.fullscreen_boundary_notice_visible = notice_visible;
+                app.fs_feedback_toast = None;
+                app.feedback_toasts_for_test.clear();
+                dispatch_list_order_repro_key(&mut app, &ctx, forward);
+                assert!(
+                    app.folder_nav_pending.is_some(),
+                    "Some(parent row) must dispatch the existing frozen order"
+                );
+                let result = receive_folder_nav(&mut app, &ctx);
+                assert!(
+                    result.target.is_none(),
+                    "there is only one captured result row"
+                );
+                app.apply_folder_nav_result(&ctx, result);
+                assert_eq!(app.effective_folder().as_ref(), Some(&book));
+                assert_child(&app, &parent);
+                assert!(Arc::ptr_eq(app.list_order.as_ref().unwrap(), &snapshot));
+                assert!(!app.fs_nav_is_locked());
+                assert!(
+                    app.feedback_toasts_for_test.is_empty(),
+                    "the boundary uses its central hint rather than the unavailable warning"
+                );
+                let hint = app
+                    .fs_boundary_hint
+                    .expect("worker exhaustion must publish an edge hint");
+                assert!(matches!(hint, crate::ui_fullscreen::FsBoundaryHint::Edge {
+                    scope: crate::ui_fullscreen::FsBoundaryEdgeScope::ListOrder, at_end, ..
+                } if at_end == forward));
+                // This is the same visibility predicate used by draw_boundary_hint.
+                // OFF intentionally hides the edge; it is not an admission failure.
+                assert_eq!(
+                    crate::ui_fullscreen::fullscreen_boundary_hint_visible(
+                        app.settings.fullscreen_boundary_notice_visible,
+                        hint
+                    ),
+                    notice_visible
+                );
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn list_order_everything_retained_parent_favorite_current_book_reports_its_nested_result_row() {
+    let _serial = crate::key_input::lock_test_input();
+    let _clear = ClearListOrderInput;
+    for zip_book in [true, false] {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let (_, book, _, snapshot) = retained_parent_favorite_repro(&mut app, &ctx, zip_book, true);
+        app.feedback_toasts_for_test.clear();
+        dispatch_list_order_repro_key(&mut app, &ctx, true);
+        let result = receive_folder_nav(&mut app, &ctx);
+        assert_eq!(result.target.as_ref().unwrap().logical_source(), book);
+        app.apply_folder_nav_result(&ctx, result);
+        finish_landing(&mut app, &ctx);
+        // The row advances A -> B although B was already being read under A.
+        // The unchanged pixels/path therefore do not imply a dropped operation.
+        assert_eq!(app.effective_folder().as_ref(), Some(&book));
+        assert_child(&app, &book);
+        assert_eq!(app.list_order_position().unwrap().1, 1);
+        assert!(Arc::ptr_eq(app.list_order.as_ref().unwrap(), &snapshot));
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+            Some("一覧の移動先は現在表示中の本です"),
+            "adopting a different logical row for the already displayed book must explain the unchanged view"
+        );
+        assert!(
+            !app.feedback_toasts_for_test
+                .iter()
+                .any(|(text, _)| text == "一覧から開いた本で使えます")
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn list_order_regular_folder_repro_fixture_navigates_from_the_real_book_key_handler() {
+    let _serial = crate::key_input::lock_test_input();
+    let _clear = ClearListOrderInput;
+    for initial_child in [false, true] {
+        for zip_book in [true, false] {
+            let mut app = setup_app();
+            let ctx = egui::Context::default();
+            app.active_quick_folder_slot = None;
+            app.settings.auto_fullscreen_zip_pdf = true;
+            app.settings.auto_fullscreen_image_folders = true;
+            app.settings.detached_viewer_enabled = false;
+            app.settings.detached_viewer_open_images_in_window = false;
+            app.settings.sort_order = crate::settings::SortOrder::FileName;
+            let folder = app.tmp.path().join("ordinary-list");
+            std::fs::create_dir(&folder).unwrap();
+            let book = folder.join(if zip_book { "a-book.zip" } else { "a-book" });
+            let next = folder.join(if zip_book { "b-book.zip" } else { "b-book" });
+            for path in [&book, &next] {
+                if zip_book {
+                    write_zip(path);
+                } else {
+                    std::fs::create_dir(path).unwrap();
+                    write_page(&path.join("001.png"));
+                }
+            }
+            let origin = app.tmp.path().to_path_buf();
+            let result_book = origin.join("search-source-book");
+            std::fs::create_dir(&result_book).unwrap();
+            write_page(&result_book.join("001.png"));
+            app.current_folder = Some(origin);
+            adopt_rows(&mut app, vec![GridItem::Folder(result_book.clone())]);
+            if initial_child {
+                open_book_from_grid_for_list_order_repro(&mut app, &ctx, &result_book);
+                app.close_fullscreen();
+                assert_child(&app, &result_book);
+            }
+            let mut address = list_order_repro_navigation_frame();
+            address.address_nav = Some(crate::ui_main::AddressBarNav::AddressInput(
+                crate::ui_main::LocationJumpTarget::Physical(folder.clone()),
+            ));
+            app.post_render_main_navigation(&ctx, address);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while app.current_folder.as_ref() != Some(&folder)
+                || app.folder_pane_open_pending.is_some()
+                || app.sidecar_restore_active()
+            {
+                app.post_render_main_navigation(&ctx, list_order_repro_navigation_frame());
+                app.settle_open_path_classification_for_test();
+                app.poll_sidecar_restore(&ctx);
+                assert!(
+                    Instant::now() < deadline,
+                    "address search exit did not adopt its physical folder"
+                );
+                std::thread::yield_now();
+            }
+            assert!(!app.global_search.active && !app.favsearch.active && !app.tag_view.active);
+            assert_eq!(app.current_list_order_scope(), Some(ListOrderScope::Folder));
+            app.finish_page_identity_preparation_for_test();
+            open_book_from_grid_for_list_order_repro(&mut app, &ctx, &book);
+            assert_eq!(
+                app.list_order.as_ref().unwrap().scope,
+                ListOrderScope::Folder
+            );
+            assert_eq!(app.list_order_position().unwrap().1, 0);
+            assert!(!app.fs_navigation_sequence_blocks_new_target());
+            assert!(
+                !app.fs_nav_is_locked(),
+                "same ordinary fixture has no test-only display lock"
+            );
+            dispatch_list_order_repro_key(&mut app, &ctx, true);
+            let result = receive_folder_nav(&mut app, &ctx);
+            assert_eq!(result.target.as_ref().unwrap().logical_source(), next);
+            app.apply_folder_nav_result(&ctx, result);
+            finish_landing(&mut app, &ctx);
+            assert_eq!(app.effective_folder().as_ref(), Some(&next));
+            assert_eq!(app.list_order_position().unwrap().1, 1);
+        }
+    }
+}
