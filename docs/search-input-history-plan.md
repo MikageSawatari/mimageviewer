@@ -62,13 +62,21 @@
       owner: egui::Id,          // 一覧を開いた入力欄の id
       highlight: Option<usize>, // ↑↓ の選択位置
       drawn_pass: u64,          // owner の部品を最後に描いた cumulative_pass_nr
+      popup_rect: egui::Rect,   // 前 pass で描いた一覧の矩形 (一覧内の押下の判定に使う)
   }
   ```
 
   `None` = 閉じている。開閉・選択位置・持ち主はこの 1 つだけで表し、別の bool や egui の popup 状態と
-  二重に持たない。owner の部品が前の pass で描かれていなければ (バーを閉じた・検索終了・別の表示へ
-  切り替えた)、次に触った時点で `None` に戻す (退役)。owner の入力欄が無効 (disabled) で描かれた pass でも閉じる
-  (モーダル表示中は入力欄が無効で描かれる: `src/app/main_chrome.rs`)。
+  二重に持たない。部品の module に `close(ctx)` を 1 つ置き、次の**既存の遷移の境界**で明示的に閉じる
+  (同時表示を追跡せず、境界で閉じる):
+  - owner の部品が前の pass で描かれていない (バーを閉じた・検索終了・別の表示へ切り替えた)。次に触った時点で閉じる。
+  - owner の入力欄が無効 (disabled) で描かれた。
+  - 本物のモーダルが入力を取った: `App::note_main_chrome_pointer_block_transition` (`src/app/main_chrome.rs`) が
+    `egui::Popup::close_all` を呼ぶ箇所で同じく `close`。モーダルが入力欄の描画前に Esc で閉じる pass でも、
+    §4.2 の手順 2 で閉じる (Esc はモーダルのもの)。
+  - 別の egui の popup / menu が開いている (`egui::Popup::is_any_open(ctx)`。入力欄の右クリックの編集メニュー
+    `ui_helpers::singleline_text_edit_context_menu` を含む)。部品の描画時に見て閉じる。
+  - 持ち主の viewport が OS のフォーカスを失った (`ctx.input(|i| i.focused)` が false)。
 - 幅は呼び出し側指定の最小幅 (既定 = 入力欄の幅) 以上。配色は `os_theme` の popup helper
   (`dark_popup_style` 等、coding-conventions の配色の節) を使う。
 - 一覧は 1 行のボタンの並び。項目の表示文字列は呼び出し側が渡す (検索 = 検索語、フォルダ = フル
@@ -78,30 +86,27 @@
   wheel を消費する** (coding-conventions「Popup / menu wheel passthrough」、既存例
   `suppress_menu_button_wheel_passthrough`)。
 - 閉じる条件: 項目を選んだ / Esc (§4) / ▼をもう一度押した / 入力欄・一覧の外でポインタを押した /
-  入力欄を編集した (文字入力・削除・貼り付け) / 入力欄からフォーカスが離れた (§3.3 の「離脱」) /
-  退役 (上記)。**一覧の中のクリックでは、TextEdit がフォーカスを失っても選択の処理を先に行い**、
-  離脱として閉じない。▼のクリックも同じ (開閉したあと入力欄へフォーカスを戻す)。
+  入力欄を編集した (文字入力・削除・貼り付け) / 入力欄からフォーカスが離れた / 上の境界。
+- **一覧の中 (`popup_rect`) と▼でのポインタ押下**では、TextEdit が「外側の押下」としてフォーカスを
+  手放しても、部品が同じ pass で入力欄へフォーカスを戻し (`request_focus`)、閉じない。押下と離しの
+  pass が分かれても、項目のクリック (離し) で選べる。
 - 一覧の中身は開いている pass ごとに呼び出し側から受け取る (snapshot を持たない)。highlight が
   件数を超えたら末尾へ寄せる。
 
 ### 3.3 戻り値 (案)
 
 ```rust
-pub enum HistoryFieldEvent {
-    None,
-    Picked(usize),   // 一覧から選んだ (呼び出し側の entries の index)。通常の確定とは排他
-    Departed,        // 入力欄からフォーカスが離れた。部品自身の操作 (▼・一覧内クリック・Esc で一覧を閉じた) は含まない
-}
 pub struct HistoryFieldOutput {
     pub text: <ime_focus helper の既存の出力型>, // 呼び出し側は従来どおり response / changed / lost_focus を見る
-    pub event: HistoryFieldEvent,
+    pub picked: Option<usize>, // 一覧から選んだ (呼び出し側の entries の index)。通常の確定とは排他
 }
 ```
 
 API の細部 (entries を `&[String]` で渡すか表示用 closure にするか等) は実装担当が既存コードに合わせて
 決めてよい。条件は: (1) IME helper を経由する、(2) 呼び出し側は `Picked` に対して自分の確定経路を呼ぶ、
-(3) 部品は履歴の保存・記録を一切知らない、(4) `Picked` が出た pass では、その欄の従来の確定
-(Enter による `lost_focus && enter`) が起きない。
+(3) 部品は履歴の保存・記録を一切知らない、(4) `picked` が `Some` の pass では、呼び出し側は
+その欄の従来の確定判定 (`lost_focus && enter` など) を**実行しない** (排他の根拠はフォーカスではなくこの契約)。
+「入力欄から離れた」通知は部品から出さない (離脱の判定は §5.2 で App が 1 か所で行う)。
 
 ## 4. キー操作
 
@@ -118,34 +123,41 @@ API の細部 (entries を `&[String]` で渡すか表示用 closure にする�
 #### 4.1 egui のフォーカス移動と Enter
 
 - egui は `Memory::begin_pass` で、フォーカス中の widget の event filter に含まれない ↑↓ をフォーカス移動に、
-  Esc をフォーカス解除に使う (`vendor/egui/src/memory/mod.rs` の `begin_pass` の Key 処理)。部品は履歴付きの
-  入力欄の TextEdit に event filter を設定し、**↓ / ↑ は常に入力欄に残す** (一覧を開く・選ぶのに使うため)。
-  ↑ は一覧が閉じているとき、従来の ↑ と同じ結果 (実装時に今の ↑ の挙動を確かめ、それを保つ) にする。
-  **Esc は一覧が開いている間だけ** filter に含め、egui にフォーカスを外させない
-  (filter は前の pass の値で効くので、開閉の状態 = §3.2 の `HistoryPopupState` の前 pass の値で決める)。
+  Esc をフォーカス解除に使う (`vendor/egui/src/memory/mod.rs` の `begin_pass` の Key 処理)。IME helper
+  (`crates/egui-ime` の描画後処理) はフォーカス中の入力欄に `horizontal_arrows` / `vertical_arrows` を含む
+  filter を毎 pass 設定しているので、**↓ / ↑ はすでに入力欄に残る**。部品は filter を設定しない
+  (helper が描画後に上書きするので、部品が足しても維持できない)。
+  ↑ は一覧が閉じているとき、今の ↑ と同じ結果を保つ (部品は消費しない)。
 - ↓ / ↑ / (選択中の) Enter は TextEdit を描く**前に**部品が消費する (TextEdit が Enter でフォーカスを
   手放したり、カーソルを動かしたりしないように)。各欄は Enter を描画前に `bool` で先読みしている
-  (`ui_main.rs` の一時バー、`global_search_ui/everything.rs` 等) が、従来の確定は `lost_focus && enter` なので、
-  フォーカスを手放さない `Picked` の pass では従来の確定は起きない。
-- `Picked` の確定は、検索欄では既存の `App::submit_search_input` を通す (egui / native の押下をまとめて
-  claim する `finish_search_input_submit` を含む)。フォルダ欄も同じ `claim_text_input_submit(ctx, <アドレス欄の id>)`
-  で押下を claim してから移動する。同じ backend frame の再 pass (egui の discard による同じ入力の再実行) で
-  2 回選ばれないことを、この claim で保証し、テストで確かめる。
+  (`ui_main.rs` の一時バー、`global_search_ui/everything.rs` 等) ので、**排他は §3.3 の契約 (`picked` が
+  `Some` の pass では従来の確定判定を実行しない) で保証する**。
+- `picked` の確定は、検索欄では既存の `App::submit_search_input` を通す (egui / native の押下をまとめて
+  claim する `finish_search_input_submit` を含む。確定後は Enter と同じくフォーカスを手放す)。フォルダ欄も
+  同じ `claim_text_input_submit(ctx, <アドレス欄の id>)` で押下を claim してから移動する。同じ backend frame の
+  再 pass (egui の discard による同じ入力の再実行) で 2 回選ばれないことを、この claim で保証し、テストで確かめる。
 - 消費した ↓ / ↑ / Enter / Esc の押下が native 側の KeySlot から後段のショートカットへ漏れないことを確かめる
   (§1.723 と同型の二重消費を作らない)。
 
 #### 4.2 Esc
 
-- 一覧が開いている間は Esc が filter に含まれるので、egui はフォーカスを外さず、Esc の event も残る。
-  部品の module に前処理 `take_escape(ctx) -> bool` を 1 つ置き、**メイン viewport の
-  `capture_search_escape_input` の呼び出し (app.rs、update の描画前) より前**に呼ぶ。処理は次の順:
-  1. `HistoryPopupState` が無い、前の pass で owner が描かれていない (退役)、IME 変換中、修飾キー付き、
-     のいずれかなら何もしない (退役なら状態を消す)。
-  2. 共通モーダル・ダイアログが開いていれば何もしない (モーダルが Esc を持つ。owner の入力欄は無効で描かれ、
-     その pass で一覧も閉じる)。
-  3. それ以外: 状態を消して一覧を閉じ、Esc を egui から消費し、同じ viewport の native の Esc 押下を claim する。
-     戻り値 true のとき、その pass の `EscapeClaim` を claim 済みにして、検索の Esc 振り分け
-     (`route_search_escape`) とフォーカス回復による Esc の扱いに渡さない。
+- egui は Esc で `begin_pass` の時点でフォーカスを外すので (filter では止めない)、部品は Esc で一覧を閉じたあと
+  **持ち主の入力欄へフォーカスを戻す**。部品の module に前処理 `take_escape(ctx) -> bool` を 1 つ置き、
+  **メイン viewport の update で `EscapeClaim::for_frame` を初期化した直後、`capture_search_escape_input` より前**
+  (app.rs の描画前、現在 `capture_search_escape_input` を呼んでいる箇所) に呼ぶ。`EscapeClaim` は 1 回だけ
+  初期化し、`take_escape` が true ならそれを claim 済みにする (その後に初期化し直さない)。処理は次の順:
+  1. この pass の入力に**修飾キーなしの Esc の押下**が無い、または IME 変換中なら何もしない。
+  2. `HistoryPopupState` が無ければ何もしない。前の pass で owner が描かれていない (退役) なら状態を消して何もしない。
+  3. 共通モーダル・ダイアログが開いている (`EscapeClaim::for_frame` が claim 済みの理由と同じ判定) なら、状態を
+     消して一覧を閉じるが、Esc は消費しない (モーダルのもの)。
+  4. それ以外: 状態を消して一覧を閉じ、Esc を egui から消費し、同じ viewport の native の Esc 押下を claim し、
+     `memory.request_focus(owner)` で持ち主へフォーカスを戻す (owner は前の pass でフォーカスを持っていた
+     入力欄であることを確かめる。▼で開いた直後・↓で開いた直後でも、部品がフォーカスを戻しているので成り立つ)。
+     true を返し、`EscapeClaim` を claim 済みにする。検索の Esc 振り分け (`route_search_escape`) と
+     フォーカス回復 (`recovering_text_input`) による Esc の扱いに渡さない。
+- claim は「検索を終了させない」ためのもので、一覧を閉じる・フォーカスを戻すのは `take_escape` 自身が行う。
+- 確かめる操作: 一覧が閉じた状態での Esc (従来どおり)、▼で開いた直後の Esc、↓で開いた直後の Esc、
+  一覧を閉じた直後にもう一度 Esc (従来の Esc の動作になる)、アドレス欄での同じ 3 つ。
 - フォルダバーのアドレス欄の Esc もこの前処理で一覧だけが閉じることを、アドレス欄の Esc を扱う既存経路を
   列挙して確かめる。
 - これらは入力欄の中だけで効く固定の部品操作 (ComboBox と同じ扱い) なので `KeyAction` にはしない。
@@ -188,29 +200,38 @@ data_dir の解決に従う。
    (常設欄・一時バー・`route_pending_search_submit` の予約経路とも)。結果が 0 件・失敗でも記録する
    (仕様: 見つからなかった語も入る)。
 2. **入力欄から通常に離れたとき、その語で検索を実行済みなら**: 入力するだけで検索するコンテナ検索と
-   アイテム検索で、「入力して結果をクリックした」語を残すため。描画の途中では判定しない
-   (Esc による終了の振り分けは描画後、常設欄の × も入力欄より後に処理されるので、描画中には
-   「取消による離脱」と区別できない)。次の 2 段に分ける:
-   - **候補を残す**: 部品が `Departed` を返したら、欄 (常設・一時バー) は
-     `App::note_search_input_departure(kind)` を呼ぶ。App はその pass の候補 `(kind, 下書きの文字列)` を
-     1 つだけ持つ (後勝ち)。
-   - **1 か所で判定する**: メイン viewport の update で、検索の Esc 振り分け (`route_search_escape`) と
-     各欄の操作 (常設欄の ×・確定・編集、一時バーの閉じる) をすべて処理した**後の 1 か所**で
-     `App::settle_search_input_departure()` を呼び、候補を取り出して次をすべて満たすときだけ記録する:
-     - その kind の検索がまだ続いている (`edit_owner(kind)`。Esc・× で終了・解除した pass では false になる)
-     - 下書きが候補の文字列から変わっていない
-     - その語で**検索を実行済み** (結果の到着は問わない)。kind ごとの「最後に実行した要求の検索語」:
-       現在地 = 適用中の絞り込みの語、コンテナ = `favsearch.last_executed`、アイテム = 最後に送った
-       (実行中または完了した) 要求の語、Everything = 最後に送った要求の語。実装担当が各 owner の既存の
-       値から取り出す (新しい状態は足さない)。
-   入力途中の語 (デバウンスで一時的に実行された語) は、フォーカスが入力欄にある間は候補にならないので残らない。
-   結果の取得中 (Running) に結果をクリックしても、実行済みの語なので記録される。現在地の絞り込みと
-   Everything は確定しないと実行されないので、ここでは 1 の重複 (先頭へ移すだけ) にしかならない。
-   候補は pass をまたいで持ち越さない (判定で必ず捨てる)。
+   アイテム検索で、「入力して結果をクリックした」語を残すため。各欄の `lost_focus()` では判定しない
+   (描画の途中では、描画後に処理される Esc による終了や常設欄の × と区別できない。また egui の
+   `lost_focus()` は 2 pass にわたって true になり得て、描画順によって古い離脱が新しいものを上書きする)。
+   代わりに、**前の pass のフォーカス所有者と今のフォーカスを、pass の中の 1 か所で比べる**:
+   - 既存の `App::record_search_input_focus` は、毎 pass、フォーカス中の検索入力欄 (`SearchInputId`。
+     常設・一時バー) を viewport の temp data `search_input_owner` に記録している。
+   - 新しい `App::settle_search_input_departure(ctx)` を、メイン viewport の update で
+     **`route_search_escape` の直後、`record_search_input_focus` の直前** (app.rs の現在 101051〜101052 行の間。
+     `render_grid` より前) に呼ぶ。ここでは前の pass の記録 (`search_input_owner` の古い値) を読み、
+     それが `Some(input)` で、今フォーカスがその入力欄に無ければ、`input.kind()` の離脱として次をすべて
+     満たすときだけ記録する:
+     - その kind の検索がまだ続いている (`edit_owner(kind)`。この pass の Esc・× で終了・解除していれば false)
+     - 下書き (`search_draft(kind)`) が空でない
+     - その下書きで**検索を実行済み** (結果の到着は問わない)。kind ごとの「最後に実行した要求の検索語」:
+       - 現在地: `App::submitted_local_search()` (実行中の要求 → 適用済みの順。検索対象・OR の変更から
+         `submit_search_input` を通らず直接実行される要求も含む) の検索語
+       - コンテナ: `favsearch.last_executed`
+       - アイテム: `global_search.source == Metadata` のときの `global_search.last_executed`
+       - Everything: 実行中の要求、無ければ受け付けた結果 (`SearchAccepted::Everything`) の送った検索語
+       実装担当が各 owner の既存の値から取り出す (新しい状態は足さない)。
+   - 部品自身の操作 (▼・一覧内の押下・Esc で一覧を閉じた) は、その pass のうちに入力欄へフォーカスを戻すので
+     離脱にならない。`picked` の確定は 1 で記録済みで、ここで再び記録されても先頭へ移すだけ。
+   - 判定は pass ごとに 1 回で、候補を持ち越さない。ここは `render_grid` より前なので、グリッドの操作
+     (別ウィンドウの準備・閲覧の開始) で検索の状態が変わる前に判定できる。結果のクリックで入力欄が
+     フォーカスを手放すのはツールバーの描画中 (グリッドより前) なので、同じ pass の判定で捕まる。
+   入力途中の語 (デバウンス待ち) は、フォーカスが入力欄にある間は判定しないので残らない。
+   結果の取得中 (Running) に結果をクリックしても、実行済みの語なので記録される。
+   現在地の絞り込みと Everything でも、実行済みの語のまま離れれば記録される (多くは 1 の重複で、先頭へ移すだけ)。
 
 記録しないもの: mIV Remote・AI 連携 (MCP)・タグビュー・フォルダバー (フォルダは既存のフォルダ履歴)。
 Remote と MCP は `submit_search_input` と上の入力欄を通らない。実装時に `submit_search_input` と
-`note_search_input_departure` の呼び出し元を列挙し、UI の入力欄以外から呼ばれていないことを確かめる。
+`settle_search_input_departure` の呼び出し元を列挙し、UI の入力欄以外から呼ばれていないことを確かめる。
 test-script は通常の入力 (Enter・クリック) を配送するので、通常の操作と同じく記録される (遮断しない。
 試験は隔離したデータで行う)。
 
@@ -264,7 +285,8 @@ test-script は通常の入力 (Enter・クリック) を配送するので、�
 - 一覧の中身は開いている pass ごとに Settings から引く (snapshot を持たない)。開いている間に
   中身が変わるのは記録 (§5.2) だけで、記録は確定・離脱のときに起き、どちらでも一覧は閉じる。
 - **記録の時点を 2 つに絞る** (確定と、実行済みの語での通常の離脱)。検索の結果到着・デバウンス・ソース切り替え
-  などの非同期の完了では記録しない。離脱の判定は pass の中の 1 か所だけで、候補を持ち越さない。
+  などの非同期の完了では記録しない。離脱の判定は pass の中の 1 か所 (`route_search_escape` の直後) だけで、前の pass のフォーカス所有者との比較で
+  行い、候補を持ち越さない。
 - **オフ = 空** にして「オフだが中身がある」状態を作らない。
 - 環境設定を開いている間は検索欄が使えない (`pinned_search_availability` が Err) ので、消去と記録が
   競合しない。ダイアログが開いた瞬間のフォーカス喪失で記録されても、live 値を引き継ぐので消えない。
@@ -313,6 +335,9 @@ test-script は通常の入力 (Enter・クリック) を配送するので、�
     アイテム検索の取得中 (Running) に結果をクリックしても記録されること。
   - 入力途中 (フォーカスあり) の語、まだ実行していない語 (デバウンス待ち) は記録されないこと。
   - Esc で検索を終了した pass、× で解除した pass では記録されないこと。
+  - 現在地の絞り込みで検索対象・OR を変えて実行中のまま離れると、新しい要求の語で記録されること。
+  - 検索欄 A → B → 結果一覧と 2 pass で移ったとき、A と B がそれぞれ正しく判定されること (常設欄の並び順を
+    入れ替えても同じ)。
   - 設定オフでは記録されないこと。オフで OK すると消えること。消去ボタン。環境設定の OK で live の履歴が
     巻き戻らないこと。
   - 永続化: settings.db への保存と再読込で履歴が戻ること、キーの無い旧設定を読むと既定オン・空になること、
