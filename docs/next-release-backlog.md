@@ -251,7 +251,7 @@
 
 ### 1.718 本の一覧の表紙サムネが、表紙ページの回転に従わない (2026-11-05)
 
-- 状態: **実装済み・実機確認待ち (2026-11-11、ブランチ `fix-718-cover-rotation`、master 未 merge)**。
+- 状態: **対応済み・master 入り (2026-11-11、`cc85e8d3b`)・次の版で出荷**。サブ PC 担当の実機確認 (依頼 31、`C:\miv-subpc\results-31\`) で手順 1〜9 すべて期待どおり (修正前の版で作った旧キャッシュの作り直しを含む。mIV Remote と変換書庫は対象外)。取り込み後の master の lib 全件 17,127 件成功。サムネイルの catalog に列 `cover_key` を追加 (旧行は Legacy として読み、全削除しない)。以前の状態: 実装済み・実機確認待ち。
   設計は [cover-rotation-1718-plan.md](cover-rotation-1718-plan.md) (設計の独立レビュー Sol/xhigh 4 回)。
   実装は Codex Sol/high、実装の独立レビュー Sol/xhigh 3 回で P2 3 件を修正し、最後は P1/P2/P3 なし。
   本体 lib 全件 (`test-lib-full.ps1`) 17126 件成功。検証ビルド (`build-dev.ps1`) 作成済み。実機確認は未実施。
