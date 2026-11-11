@@ -56,6 +56,8 @@ pub(super) fn draw_everything_controls(
     ui: &mut egui::Ui,
     query: &mut String,
     focus_request: &mut bool,
+    history: Option<&[String]>,
+    availability: Result<(), &'static str>,
 ) -> EverythingControls {
     let mut controls = EverythingControls::default();
     ui.horizontal_wrapped(|ui| {
@@ -77,12 +79,24 @@ pub(super) fn draw_everything_controls(
         // The caller latch requests opening focus; recovery retries belong to
         // the helper. Explicit requests preserve an active preedit selection.
         let select_query = *focus_request && !crate::ime_focus::ime_input_active(ui.ctx());
-        let mut output =
-            crate::ime_focus::show_singleline(ui, query, Some(focus_request), |edit| {
+        let history_output = crate::ui_history_field::show_singleline(
+            ui,
+            query,
+            Some(focus_request),
+            crate::ui_pinned_search::PinnedSearchKind::Everything.temporary_id(),
+            history.unwrap_or_default(),
+            crate::ui_history_field::HistoryFieldOptions {
+                visible: history.is_some(),
+                availability,
+                ..Default::default()
+            },
+            |edit| {
                 edit.id(crate::ui_pinned_search::PinnedSearchKind::Everything.temporary_id())
                     .hint_text("ファイル名・Everything 構文 (ext:jpg;png など)")
                     .desired_width(width)
-            });
+            },
+        );
+        let mut output = history_output.text;
         if select_query {
             let range = egui::text::CCursorRange::two(
                 egui::text::CCursor::new(0),
@@ -95,8 +109,12 @@ pub(super) fn draw_everything_controls(
         }
         crate::ui_helpers::singleline_text_edit_context_menu(ui, &mut output, query);
         controls.has_focus = output.response.has_focus();
-        controls.lost_focus = output.response.lost_focus();
-        controls.send = ui.button("検索").clicked();
+        controls.lost_focus = history_output.picked.is_none() && output.response.lost_focus();
+        if let Some(query_from_history) = history_output.picked.and_then(|i| history?.get(i)) {
+            *query = query_from_history.clone();
+            controls.send = true;
+        }
+        controls.send |= ui.button("検索").clicked();
         controls.close = ui.small_button("×").on_hover_text("検索を閉じる").clicked();
     });
     draw_everything_hint(ui);
@@ -194,7 +212,7 @@ pub(super) fn draw_everything_progress(ctx: &egui::Context) -> bool {
 pub fn draw_everything_search_snapshot_fixture(ui: &mut egui::Ui) {
     let mut query = String::from("旅行 日本語 ext:jpg;png;pdf");
     let mut focus_request = false;
-    draw_everything_controls(ui, &mut query, &mut focus_request);
+    draw_everything_controls(ui, &mut query, &mut focus_request, Some(&[]), Ok(()));
     draw_everything_status(
         ui,
         EverythingStatus {
@@ -273,7 +291,7 @@ mod tests {
                     egui::CentralPanel::default().show(root_ui, |ui| {
                         let mut query = String::from("旅行 日本語 ext:jpg;png;pdf");
                         let mut focus = false;
-                        super::draw_everything_controls(ui, &mut query, &mut focus);
+                        super::draw_everything_controls(ui, &mut query, &mut focus, None, Ok(()));
                         // Production renders a failed search via the same error label.
                         ui.colored_label(
                             ui.visuals().error_fg_color,

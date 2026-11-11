@@ -148,6 +148,8 @@ mod tests {
                         ui,
                         &mut app.global_search.everything_draft,
                         &mut app.global_search.focus_request,
+                        None,
+                        Ok(()),
                     );
                 })
             });

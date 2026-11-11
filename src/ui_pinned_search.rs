@@ -65,6 +65,7 @@ pub enum PinnedSearchAction {
     Submit(PinnedSearchKind),
     Clear(PinnedSearchKind),
     Focused(PinnedSearchKind),
+    Picked(PinnedSearchKind, usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -123,6 +124,7 @@ pub fn draw_pinned_search(
     focus: bool,
     enter: bool,
     drag: bool,
+    history: Option<&[String]>,
 ) -> egui::InnerResponse<SearchFieldResponse> {
     let gap = ui.spacing().item_spacing.x;
     let text_width = |text: &str, style| {
@@ -153,11 +155,16 @@ pub fn draw_pinned_search(
         };
     const MARGIN: f32 = 2.0;
     const TEXT_MARGIN: f32 = 4.0;
+    let history_width = if history.is_some() {
+        crate::ui_history_field::reserved_width(ui)
+    } else {
+        0.0
+    };
     let width = search_section_width(
         ui.max_rect().width(),
         ui.available_rect_before_wrap().width(),
         controls,
-        (MARGIN + TEXT_MARGIN + 1.0) * 2.0,
+        (MARGIN + TEXT_MARGIN + 1.0) * 2.0 + history_width,
         gap,
     );
     let previous_bottom = ui.min_rect().bottom();
@@ -201,20 +208,30 @@ pub fn draw_pinned_search(
                             );
                             let output = ui
                                 .add_enabled_ui(enabled.is_ok(), |ui| {
-                                    let mut output = crate::ime_focus::show_singleline(
+                                    let history_output = crate::ui_history_field::show_singleline(
                                         ui,
                                         draft,
                                         Some(&mut request),
+                                        kind.input_id(),
+                                        history.unwrap_or_default(),
+                                        crate::ui_history_field::HistoryFieldOptions {
+                                            visible: history.is_some(),
+                                            availability: enabled,
+                                            ..Default::default()
+                                        },
                                         |edit| {
                                             edit.id(kind.input_id())
-                                                .desired_width(width.input + TEXT_MARGIN * 2.0)
+                                                .desired_width(
+                                                    width.input + TEXT_MARGIN * 2.0 + history_width,
+                                                )
                                                 .min_size(egui::vec2(
-                                                    width.input + TEXT_MARGIN * 2.0,
+                                                    width.input + TEXT_MARGIN * 2.0 + history_width,
                                                     20.0,
                                                 ))
                                                 .margin(egui::Margin::symmetric(4, 2))
                                         },
                                     );
+                                    let mut output = history_output.text;
                                     crate::ui_helpers::set_accessibility_label(
                                         &output.response,
                                         kind.label(),
@@ -243,7 +260,9 @@ pub fn draw_pinned_search(
                                     if output.response.has_focus() {
                                         actions.push(PinnedSearchAction::Focused(kind));
                                     }
-                                    if owns_submit && output.response.lost_focus() && enter {
+                                    if let Some(index) = history_output.picked {
+                                        actions.push(PinnedSearchAction::Picked(kind, index));
+                                    } else if owns_submit && output.response.lost_focus() && enter {
                                         actions.push(PinnedSearchAction::Submit(kind));
                                     }
                                     output.response.response
@@ -310,6 +329,26 @@ pub fn draw_pinned_search(
 }
 
 #[doc(hidden)]
+pub fn draw_pinned_search_history_snapshot_fixture(ui: &mut egui::Ui) {
+    ui.scope(|ui| {
+        crate::ui_main::apply_toolbar_style(ui);
+        ui.horizontal_wrapped(|ui| {
+            draw_pinned_search(
+                ui,
+                PinnedSearchKind::Container,
+                &mut "旅行".to_owned(),
+                PinnedSearchState::Applied,
+                Ok(()),
+                false,
+                false,
+                false,
+                Some(&["旅行".to_owned(), "写真集".to_owned()]),
+            );
+        });
+    });
+}
+
+#[doc(hidden)]
 pub fn draw_pinned_search_snapshot_fixture(ui: &mut egui::Ui) {
     ui.scope(|ui| {
         crate::ui_main::apply_toolbar_style(ui);
@@ -348,6 +387,7 @@ pub fn draw_pinned_search_snapshot_fixture(ui: &mut egui::Ui) {
                     false,
                     false,
                     false,
+                    Some(&[]),
                 );
             }
         });
@@ -390,6 +430,7 @@ mod tests {
                             false,
                             false,
                             drag,
+                            None,
                         )
                         .inner;
                         let mut seen = render.borrow_mut();
@@ -534,6 +575,7 @@ mod tests {
                                     false,
                                     false,
                                     false,
+                                    None,
                                 );
                                 render.borrow_mut().push((
                                     Some(kind),

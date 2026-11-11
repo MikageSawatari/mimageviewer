@@ -4713,6 +4713,8 @@ impl App {
 
         let combo_popup_height = (ctx.content_rect().height() - 96.0).clamp(240.0, 520.0);
         let mut drill_back = false;
+        let history_availability =
+            self.pinned_search_availability(crate::ui_pinned_search::PinnedSearchKind::Metadata);
         egui::Panel::top("global_search_bar").show(root_ui, |ui| {
             self.gate_main_chrome(ui);
             if running {
@@ -4752,10 +4754,17 @@ impl App {
                      「お気に入り」→「編集」で、対象の行の「アイテム索引 (Ctrl+G)」に\n\
                      チェックを入れてください。",
                 );
-                let mut output = crate::ime_focus::show_singleline(
+                let history_output = crate::ui_history_field::show_singleline(
                     ui,
                     &mut self.global_search.metadata_draft,
                     Some(&mut self.global_search.focus_request),
+                    crate::ui_pinned_search::PinnedSearchKind::Metadata.temporary_id(),
+                    self.settings.search_input_history.entries(crate::ui_pinned_search::PinnedSearchKind::Metadata),
+                    crate::ui_history_field::HistoryFieldOptions {
+                        visible: self.settings.save_search_input_history,
+                        availability: history_availability,
+                        ..Default::default()
+                    },
                     |edit| {
                         edit.id(crate::ui_pinned_search::PinnedSearchKind::Metadata.temporary_id()).hint_text(
                             r#"画像・PDF・動画をファイル名やメタ情報で検索 (AND / -除外 / "…")"#,
@@ -4764,17 +4773,24 @@ impl App {
                         .min_size(egui::vec2(320.0, 20.0))
                     },
                 );
+                let mut output = history_output.text;
                 let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
                     &mut output,
                     &mut self.global_search.metadata_draft,
                 );
+                let picked = history_output.picked;
+                if let Some(index) = picked {
+                    if let Some(query) = self.settings.search_input_history.entries(crate::ui_pinned_search::PinnedSearchKind::Metadata).get(index).cloned() {
+                        self.global_search.metadata_draft = query;
+                    }
+                }
                 let response = output.response;
                 self.global_search.has_focus |= response.has_focus();
                 if response.changed() || menu_changed {
                     query_changed = true;
                 }
-                if response.lost_focus() && enter_pressed {
+                if picked.is_some() || (response.lost_focus() && enter_pressed) {
                     submit_requested = true;
                 }
                 if ui.small_button("×").on_hover_text("検索を閉じる").clicked() {

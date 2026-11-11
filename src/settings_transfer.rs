@@ -343,6 +343,7 @@ preferences_policy! {
         pause_indexer_while_minimized: bool => ("最小化中は索引を停止", |_, _| true, plain, plain);
         write_rating_to_xmp: bool => ("評価をXMPに保存", |_, _| true, plain, plain);
         reading_history_enabled: bool => ("閲覧履歴を記録", |_, _| true, plain, plain);
+        save_search_input_history: bool => ("検索欄の入力履歴を保存する", |_, _| true, plain, plain);
         default_spread_mode: SpreadMode => ("標準の見開き設定", |v, _| SpreadMode::all().contains(v), plain, plain);
         apply_default_spread_to_plain_folders: bool => ("通常フォルダにも既定のページ構成を使う", |_, _| true, plain, plain);
         follow_document_reading_direction: bool => ("文書の綴じ方向に従う", |_, _| true, plain, plain);
@@ -503,6 +504,7 @@ preferences_policy! {
         last_cursor_rows_above => "利用データ・登録先・履歴・検索対象";
         recent_folders => "利用データ・登録先・履歴・検索対象";
         quick_folder_recent_folders => "利用データ・登録先・履歴・検索対象";
+        search_input_history => "利用データ・登録先・履歴・検索対象";
         quick_folder_slots => "利用データ・登録先・履歴・検索対象";
         quick_folder_drive_current_dirs => "利用データ・登録先・履歴・検索対象";
         window_pos => "runtime overlay / PC のウィンドウ配置";
@@ -1227,6 +1229,7 @@ mod tests {
         settings.pause_indexer_while_minimized = !settings.pause_indexer_while_minimized;
         settings.write_rating_to_xmp = !settings.write_rating_to_xmp;
         settings.reading_history_enabled = !settings.reading_history_enabled;
+        settings.save_search_input_history = !settings.save_search_input_history;
         settings.default_spread_mode = different_enum(
             &settings.default_spread_mode,
             &[
@@ -2103,20 +2106,20 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 492);
+        assert_eq!(entries.len(), 494);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            157
+            158
         );
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            335
+            336
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -2145,7 +2148,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 155);
+        assert_eq!(wire.len(), 156);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -2662,6 +2665,11 @@ mod tests {
     #[test]
     fn excluded_private_values_never_reach_export_or_diagnostics() {
         let mut settings = private_destination();
+        for kind in crate::ui_pinned_search::PinnedSearchKind::ALL {
+            settings
+                .search_input_history
+                .record(kind, "miv-history-sentinel-756");
+        }
         settings
             .image_ext_priority
             .push(r"C:\Users\private-alice\SECRET_PIN_184729".into());
@@ -2678,6 +2686,7 @@ mod tests {
             "private-lut",
             "private-smart-folder",
             "secret.example",
+            "miv-history-sentinel-756",
         ] {
             assert!(!exported.json.contains(needle));
             assert!(!diagnostic.contains(needle));

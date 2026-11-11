@@ -1,6 +1,6 @@
 # 検索欄の入力履歴 (§1.756) 設計
 
-状態: 設計 (2026-11-11、設計担当 ClaudeCode Opus 5.5)。実装は Codex GPT-6.1 Sol / high、レビューは別の Sol / xhigh。
+状態: 実装・対象自動検証済み、設計担当の受け入れ・実機確認待ち (2026-11-11、設計担当 ClaudeCode Opus 5.5)。実装は Codex GPT-6.1 Sol / high、レビューは別の Sol / xhigh。
 正本の仕様は [next-release-backlog.md §1.756](next-release-backlog.md)。本書はその実装設計。
 関連: §1.690 (一覧の項目から検索欄へ条件を渡す「検索要求」の型。同じ入力欄を触る)、保留側 §1.692。
 
@@ -402,3 +402,203 @@ test-script は通常の入力 (Enter・クリック) を配送するので、�
 - ↓ / ↑ / Enter / Esc、日本語の変換中の ↓ / Enter / Esc。
 - フォルダバーの▼の見た目・一覧の幅・選んだときの移動。小さいウィンドウ・UI 倍率での折り返し。
 - 環境設定の「履歴と復元」でオフ・消去。
+
+## 12. 実装・検証記録 (2026-11-11)
+
+作業場所は `G:\home\mimageviewer-756`、`feat-756-search-history`、開始時 HEAD は
+`1d5f5436682690fff6d097c8ee6e14291239b418`。未コミットで設計担当へ渡す。
+製品 exe は起動しない。本体 lib 全件・`test-full.ps1` は設計担当の検証枠へ残す。
+
+### 実装時の確認と調整
+
+仕様の変更はない。TextEdit suffix、IME helper の描画後の focus filter、検索確定・Esc・
+実行済み要求・live Settings の引継ぎを既存コードで確認した。独立レビューでも設計の実質的な矛盾は見つからなかった。
+
+- egui 0.37 では旧 `raw_scroll_delta` の代わりに、既存の
+  `wheel_input::consume_wheel_input` を使う。既存 menu の wheel 消費と同じ経路。
+- suffix atom は22ptで、本文との間には `icon_spacing` が加わる。
+  `ui_history_field::reserved_width(ui)` にまとめ、常設欄・フォルダバー・折り返し判定・fixtureで共有する。
+  フォルダ欄は従来の欄全幅168ptを基準に、suffix追加後も実 `text_clip_rect` 幅を維持する。
+  TextEditの内側余白はeguiのstyleが所有し、本文160ptという固定値は仮定しない。
+- 編集とEnterが同じ入力batchに来た場合は編集を優先して一覧を閉じ、従来のTextEdit確定へ渡す。
+  他のegui menu表示中の再openを抑え、補助の矩形・focus要求もviewportごとのkeyにした。
+- `search_input_owner` のkey/passはContextのdata lockを取る前に取得する。
+  最初の対象試験で見つかったlock再入をこの境界で修正した。
+
+### 記録元・非公開の監査
+
+`submit_search_input` の本番の呼出し元は常設欄のSubmit/Picked、現在地・コンテナ・アイテム・
+Everythingの一時バー、`route_pending_search_submit` の予約入力経路だけ。
+`settle_search_input_departure` の本番の呼出し元はmain updateの
+`route_search_escape` 直後・`record_search_input_focus` 直前の1箇所だけ。
+Remote・MCP・タグビューからの呼出しはない。
+
+Settings全体を読む次の8箇所を、応答・logの出力境界まで確認した。
+
+| 読み込み境界 | 出力で使う情報 |
+| --- | --- |
+| `remote_ipc/collections.rs` `CollectionSettingsSource::load` | Homeの登録先、SmartFolder・お気に入り検索・タグの固定DTO。表示/サムネイル設定と結果項目だけ |
+| `remote_ipc/persistent_collections.rs` のSettings読み込み | snapshot/navigationのprepared entries・view facts・表示設定。wire/cache keyとも列挙フィールドだけ |
+| `agent_ipc/library.rs` の2箇所 | 本棚の場所、一覧の表示順 |
+| `agent_ipc/folder.rs` | 表示/走査条件 |
+| `agent_ipc/thumbnail.rs` | サムネイル品質とI/O許可 |
+| `agent_ipc/metadata_write.rs` | 本棚の場所 |
+| `agent_ipc/mod.rs` のSearchItems | 可視性・EPUB・書庫のpolicy |
+
+いずれもSettings全体をserializeせず、履歴をDTOへ投影しない。Remote/agentのperf・request logは
+operation/tool/id/count/outcome/ms等で、応答本文や履歴を出さない。
+新しい履歴のDebugは件数だけ。設定書き出しは履歴を除外する。
+診断ZIPはlogの収集であり、設定DBを同梱しない。新しいlog/perf出力は追加していない。
+`miv-history-sentinel-756` を実際の履歴に入れた設定書き出し・Remote・agentの応答/log検査を追加した。
+
+### 対象検証
+
+以下のbuild/testにはすべて `$env:MSBUILDDISABLENODEREUSE='1'` を設定した。
+nativeの並列buildが失敗したため、以後はCargoの `-j 1` を使った。
+
+| 検証 | 結果・log |
+| --- | --- |
+| 初回 `cargo check -p mimageviewer --bin mimageviewer-core` | turbojpeg native build失敗。serial cmake build成功後に進めた。`target/history756-check.log` / `history756-native-build.log` |
+| 初回の絞ったnextest 589件 | focus記録のContext lock再入を検出して中断。修正後の検証へ。`target/history756-focused.log` |
+| 関連nextest 1,076件 | 1,071成功・5失敗。分類件数と整形依存のtest各1、意図した画像差分3。`target/history756-related.log` |
+| 幅補正後の影響nextest 157件 (`UPDATE_SNAPSHOTS=1`) | 142成功・15失敗。失敗は部品fixtureの▼フォント未登録。本体フォントへ統一。分類/index修正と画像3枚更新は成功。`target/history756-affected-update-final.log` |
+| 本体フォントでの部品16件 | 15成功・1失敗。新規testの本文160pt仮定だけを訂正し、従来の全幅168ptに対する実本文幅一致を検査。`target/history756-field-fonts.log` |
+
+最終の対象結果（すべてCargoの実exit codeを確認）:
+
+| 検証 | 結果・log |
+| --- | --- |
+| 部品16件（本体フォント、glyph/accessibility検査あり） | 16成功・0失敗。間隔0/4/9ptで従来本文幅を維持。`target/history756-field-green.log` |
+| フォルダバーの既存group、更新なしの通常比較 | 25成功・0失敗。幅・折り返し・移動・IME・3画像の通常比較を含む。`target/history756-folder-green.log` |
+| `UPDATE_SNAPSHOTS=1` のintegration UI全件 | 251成功・0失敗。`target/history756-ui-update-final.log` |
+| 更新指定なしのintegration UI全件 | 251成功・0失敗。`target/history756-ui-green.log` |
+| core check | exit 0、2分52秒。既存警告326箇所を差分の追加行/新規ファイルと照合し、変更由来は0。`target/history756-check-final.log` / `history756-warning-audit.json` |
+| workspace全体 `cargo fmt` / `cargo fmt --check` | 成功 |
+| UI glyph / site cards / `git diff --check` | glyph問題0、53 cards中超過0、diff check成功 |
+| 確認用 `build-dev.ps1 -PreserveRuntime` | exit 0。normal feature set、`CARGO_BUILD_JOBS=1`。core（30分37秒）とRemote・EPUB worker・MCP adapter・music-video editorを生成。依存検査 `runtime=4 pe=5` 成功。製品は起動していない |
+
+影響外の成功結果を再利用し、失敗した分類/index、部品、幅/フォルダバー、画像の経路を修正後に再検証した。
+1回の「1,076件全成功」や、本体lib全件の成功として合算しない。
+最初の部品fixtureの不足は本体フォント・明示的なアクセシビリティ名で訂正し、検査は無効にしていない。
+
+実行コマンド（上記表のlogと対応。全件lib/full gateではなく明示filterだけ）:
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+# 関連1,076件の調査・回帰
+cargo nextest run -j 1 -p mimageviewer --lib --no-fail-fast -E 'test(/search|section207|section1684|ui_toolbar_layout|settings_transfer|keymap|ime_focus|main_chrome|ui_dialogs::preferences::/)'
+# 幅補正後の157件と既存画像3枚の更新
+$env:UPDATE_SNAPSHOTS='1'
+cargo nextest run -j 1 -p mimageviewer --lib --no-fail-fast -E 'test(/ui_history_field|pinned_search|section207|section1684|ui_toolbar_layout|settings_transfer|search_input_history/)'
+# 部品の最終16件
+cargo test -j 1 -p mimageviewer --lib ui_history_field::tests -- --test-threads=1
+# フォルダバー通常比較25件
+Remove-Item Env:UPDATE_SNAPSHOTS -ErrorAction SilentlyContinue
+cargo test -j 1 -p mimageviewer --lib ui_main::section207_tests -- --test-threads=1
+# 全UI画像の更新と通常比較
+$env:UPDATE_SNAPSHOTS='1'
+cargo test -j 1 --test ui_snapshot
+Remove-Item Env:UPDATE_SNAPSHOTS -ErrorAction SilentlyContinue
+cargo test -j 1 --test ui_snapshot
+cargo check -j 1 -p mimageviewer --bin mimageviewer-core
+cargo fmt
+cargo fmt --check
+python scripts/check_ui_glyphs.py
+python scripts/check_site_cards.py
+git diff --check
+$env:CARGO_BUILD_JOBS='1'
+.\scripts\build-dev.ps1 -PreserveRuntime
+```
+
+PowerShellのstderr出力と終了状態を混同しないよう、記録用に出力をredirectしたCargoコマンドでは
+`$LASTEXITCODE` を明示的に保存して同じ値で終了した。確認用build scriptはredirectせずに呼び出した。
+
+### 画像
+
+追加3枚、更新18枚、計729,735 bytes。実装担当は21枚すべてを目視した。
+normal/middleのinline配置が独立したため、既存のフォルダバー36条件は23名・23種類の画素配置を厳密に検査する。
+一時的なalias診断モードは削除し、viewport内矩形・全操作のhit検査は維持した。
+画像一覧は下の変更ファイル一覧のPNG項目を参照。設計担当の目視確認は別に残す。
+
+### 変更ファイル
+
+変更はこのworktreeの59ファイル。新規Rustは共有部品とApp回帰、PNGは新規3枚・更新18枚。
+`CHANGELOG.md` と `src/version_highlights.rs` は変更していない。
+公開・設定・キー・フォルダバーの説明と、リリース担当向け文面の案も含む。
+
+- `docs/README.md`
+- `docs/architecture-overview.md`
+- `docs/everything-search-plan.md`
+- `docs/keymap-spec.md`
+- `docs/next-release-backlog.md`
+- `docs/search-input-history-plan.md`
+- `docs/spec.md`
+- `docs/ui-snapshot-policy.md`
+- `htdocs/mimageviewer/index.html`
+- `htdocs/mimageviewer/manual/grid.html`
+- `htdocs/mimageviewer/manual/search.html`
+- `htdocs/mimageviewer/manual/settings.html`
+- `htdocs/mimageviewer/manual/shortcuts.html`
+- `htdocs/mimageviewer/privacy.html`
+- `src/agent_ipc/logging_tests.rs`
+- `src/app.rs`
+- `src/app/main_chrome.rs`
+- `src/app/pinned_search.rs`
+- `src/app/pinned_search/history_tests.rs` (new)
+- `src/app/tests/search_submit.rs`
+- `src/global_search_ui.rs`
+- `src/global_search_ui/everything.rs`
+- `src/global_search_ui/everything/shortcut.rs`
+- `src/global_search_ui/everything/ui.rs`
+- `src/ime_focus.rs`
+- `src/lib.rs`
+- `src/remote_ipc/collections.rs`
+- `src/remote_ipc/persistent_collections.rs`
+- `src/settings.rs`
+- `src/settings_transfer.rs`
+- `src/ui_dialogs/preferences.rs`
+- `src/ui_dialogs/preferences/pages.rs`
+- `src/ui_dialogs/preferences/search_index.rs`
+- `src/ui_history_field.rs` (new)
+- `src/ui_main.rs`
+- `src/ui_pinned_search.rs`
+- `src/ui_toolbar_layout.rs`
+- `tests/snapshots/everything_search_bar_dark.png`
+- `tests/snapshots/everything_search_bar_light.png`
+- `tests/snapshots/everything_search_bar_narrow_dark.png`
+- `tests/snapshots/folder_address_history_light.png` (new)
+- `tests/snapshots/folder_bar_organize_destinations.png`
+- `tests/snapshots/folder_bar_organize_destinations_scrolled.png`
+- `tests/snapshots/folder_bar_organize_destinations_toggle.png`
+- `tests/snapshots/folder_toolbar_dpi150_first_row.png`
+- `tests/snapshots/folder_toolbar_dpi150_last_row.png`
+- `tests/snapshots/folder_toolbar_dpi150_middle_row.png`
+- `tests/snapshots/folder_toolbar_narrow_first_row.png`
+- `tests/snapshots/folder_toolbar_narrow_last_row.png`
+- `tests/snapshots/folder_toolbar_narrow_middle_row.png`
+- `tests/snapshots/folder_toolbar_normal_first_row.png`
+- `tests/snapshots/folder_toolbar_normal_last_row.png`
+- `tests/snapshots/folder_toolbar_normal_middle_inline.png`
+- `tests/snapshots/folder_toolbar_normal_middle_row.png`
+- `tests/snapshots/search_history_popup_dark.png` (new)
+- `tests/snapshots/toolbar_pinned_search_history_light.png` (new)
+- `tests/snapshots/toolbar_pinned_search_light.png`
+- `tests/snapshots/toolbar_pinned_search_narrow_dark.png`
+- `tests/ui_snapshot.rs`
+
+### 実機・全体gate
+
+本体lib全件・workspace/vendorのfull gate、実機の日本語IMEと操作・倍率・見た目の確認は未実施。
+製品の起動やforeground/inputの操作はしていない。強制終了・保存失敗の回復処理は追加していない。
+
+確認用一式は `target/dev-runtime/` に配置済み。通常版・トレイ常駐のmImageViewerを先に終了し、
+このworktreeから利用者が起動する（単一起動mutexを共有）。
+通常の `%APPDATA%\mimageviewer` を使うため、実際の設定・データを更新する可能性がある。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+確認する操作: 4種類それぞれの検索確定後、▼/↓で選び直してEnterで1回だけ実行されること、
+Escで一覧だけが閉じること、日本語IME変換中のキー、フォルダバー右端の▼、
+環境設定での全件消去・保存オフでOKした後の▼非表示。

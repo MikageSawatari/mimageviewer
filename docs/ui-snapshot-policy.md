@@ -581,3 +581,17 @@ UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --lib local_adjust_panel_snapshot
 integrationの `book_manager_window_close_and_mode_controls_in_small_viewport` は12条件で×と方式ボタンを検査し、
 geometryの全組合せへPNGを増やさない。
 更新モードを外した `ui_snapshot` 全224件の通常比較も成功した。
+
+検索欄の入力履歴（§1.756、2026-11-11）は、本体の共有部品を使う
+`toolbar_pinned_search_history_light`（560×100）、`search_history_popup_dark`（440×240）、
+`folder_address_history_light`（560×120）の3枚を追加した。計18,852 bytes。
+既存の常設欄2枚・Everythingバー3枚・フォルダバー設定/整理先3枚・フォルダバー配置10枚、
+計18枚を更新した。新規と更新の21枚は計729,735 bytesで、実装担当が全枚を目視し、
+明暗・狭幅・150%で▼と文字、枠、右側操作、一覧の末尾に欠けや重なりがないことを確認した。
+フォルダバーは全36条件のgeometry/hit検査を維持し、従来の23名を保持する。
+履歴ボタンの移設でnormal/middleのinlineがrowとは異なる配置になるため、
+現在は23名・23種類の画素配置を検査する（0.37採用時の22種類から1種類増加）。
+更新指定あり/なしのintegration `ui_snapshot` は各251件成功した。
+既存の整理先画像3枚はlibの該当25件でも通常比較を確認した。
+新しい部品のfixtureも本体フォントを使い、glyphとaccessibilityの検査を無効にしない。
+製品GUIの起動・実IMEの検収ではなく、設計担当の画像確認と実機確認は別に行う。

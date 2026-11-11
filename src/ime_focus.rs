@@ -1304,12 +1304,6 @@ mod tests {
             reason: "RRGGBB 専用の ASCII 制約入力で日本語自由入力ではない",
         },
         RawTextEditExemption {
-            path: "src/ui_main.rs",
-            line_anchor: "singleline(&mut self.address)",
-            expected_occurrences: 1,
-            reason: "snapshot 表示中だけ描く disabled 読み取り専用欄",
-        },
-        RawTextEditExemption {
             path: "src/ui_text.rs",
             line_anchor: "multiline(&mut t.text)",
             expected_occurrences: 1,
