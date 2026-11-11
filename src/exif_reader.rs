@@ -225,6 +225,98 @@ pub struct TagInfo {
 pub struct ExifInfo {
     /// セクションごとにまとめた (グループ, [(タグ名, 値)]) のリスト
     pub sections: Vec<(TagGroup, Vec<(String, String)>)>,
+    /// Raw numeric GPS tags, validated before display formatting loses precision.
+    pub(crate) gps: Option<GpsCoordinates>,
+}
+
+/// Validated shooting location. Only the EXIF reader constructs these values.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GpsCoordinates {
+    pub latitude: f64,
+    pub longitude: f64,
+}
+
+impl ExifInfo {
+    /// Respect the display filter without parsing localized/rounded display strings.
+    pub(crate) fn gps_coordinates(&self) -> Option<GpsCoordinates> {
+        let visible = |tag: &str| {
+            self.sections.iter().any(|(group, fields)| {
+                *group == TagGroup::Gps && fields.iter().any(|(name, _)| name == tag)
+            })
+        };
+        (visible("GPSLatitude") && visible("GPSLongitude"))
+            .then_some(self.gps)
+            .flatten()
+    }
+}
+
+fn gps_coordinates(entries: &[rexif::ExifEntry]) -> Option<GpsCoordinates> {
+    use rexif::{ExifTag, IfdKind, TagValue};
+    let lookup = |tag| {
+        entries
+            .iter()
+            .find(|entry| entry.kind == IfdKind::Gps && entry.tag == tag)
+            .map(|entry| &entry.value)
+    };
+    let axis = |tag, reference_tag, positive, negative, maximum| {
+        let TagValue::URational(values) = lookup(tag)? else {
+            return None;
+        };
+        let TagValue::Ascii(reference) = lookup(reference_tag)? else {
+            return None;
+        };
+        let [d, m, s] = values.as_slice() else {
+            return None;
+        };
+        gps_axis(
+            [d.value(), m.value(), s.value()],
+            reference,
+            positive,
+            negative,
+            maximum,
+        )
+    };
+    Some(GpsCoordinates {
+        latitude: axis(
+            ExifTag::GPSLatitude,
+            ExifTag::GPSLatitudeRef,
+            "N",
+            "S",
+            90.0,
+        )?,
+        longitude: axis(
+            ExifTag::GPSLongitude,
+            ExifTag::GPSLongitudeRef,
+            "E",
+            "W",
+            180.0,
+        )?,
+    })
+}
+
+fn gps_axis(
+    [degrees, minutes, seconds]: [f64; 3],
+    reference: &str,
+    positive: &str,
+    negative: &str,
+    maximum: f64,
+) -> Option<f64> {
+    if ![degrees, minutes, seconds].iter().all(|v| v.is_finite())
+        || degrees < 0.0
+        || !(0.0..60.0).contains(&minutes)
+        || !(0.0..60.0).contains(&seconds)
+    {
+        return None;
+    }
+    let value = degrees + minutes / 60.0 + seconds / 3600.0;
+    if value > maximum {
+        return None;
+    }
+    match reference {
+        r if r == positive => Some(value),
+        r if r == negative => Some(-value),
+        _ => None,
+    }
 }
 
 /// ファイルから EXIF 情報を読み取る。EXIF が無い場合は None。
@@ -332,7 +424,10 @@ fn build_exif_info(entries: &[rexif::ExifEntry], hidden_tags: &[String]) -> Opti
     if sections.is_empty() {
         None
     } else {
-        Some(ExifInfo { sections })
+        Some(ExifInfo {
+            sections,
+            gps: gps_coordinates(entries),
+        })
     }
 }
 
@@ -1366,8 +1461,137 @@ pub fn known_tags_in_group(group: TagGroup) -> impl Iterator<Item = &'static Tag
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    // Small TIFF with a real GPS IFD, parsed through the production reader.
+    pub(crate) fn gps_fixture_bytes(latitude: u32, longitude: u32) -> Vec<u8> {
+        let mut bytes = b"II*\0\x08\0\0\0".to_vec();
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&0x8825_u16.to_le_bytes());
+        bytes.extend_from_slice(&4_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&26_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&4_u16.to_le_bytes());
+        for (tag, format, count, data) in [
+            (1_u16, 2_u16, 2_u32, u32::from_le_bytes(*b"S\0\0\0")),
+            (2, 5, 3, 80),
+            (3, 2, 2, u32::from_le_bytes(*b"W\0\0\0")),
+            (4, 5, 3, 104),
+        ] {
+            bytes.extend_from_slice(&tag.to_le_bytes());
+            bytes.extend_from_slice(&format.to_le_bytes());
+            bytes.extend_from_slice(&count.to_le_bytes());
+            bytes.extend_from_slice(&data.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        for value in [latitude, 30, 0, longitude, 45, 0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+            bytes.extend_from_slice(&1_u32.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn gps_raw_tags_and_display_filter() {
+        let bytes = gps_fixture_bytes(35, 139);
+        let info = read_exif_from_bytes(&bytes, &[]).unwrap();
+        assert_eq!(
+            info.gps_coordinates(),
+            Some(GpsCoordinates {
+                latitude: -35.5,
+                longitude: -139.75
+            })
+        );
+        let fields = &info.sections[0].1;
+        assert!(
+            fields
+                .iter()
+                .any(|(key, value)| key == "GPSLatitude" && value == "35°30'0.00\" S")
+        );
+        for hidden in ["GPSLatitude", "GPSLongitude"] {
+            assert!(
+                read_exif_from_bytes(&bytes, &[hidden.into()])
+                    .unwrap()
+                    .gps_coordinates()
+                    .is_none()
+            );
+        }
+        // Hiding reference rows does not erase the source direction tags.
+        assert_eq!(
+            read_exif_from_bytes(&bytes, &["GPSLatitudeRef".into(), "GPSLongitudeRef".into()])
+                .unwrap()
+                .gps_coordinates(),
+            info.gps_coordinates()
+        );
+    }
+
+    #[test]
+    fn gps_rejects_missing_or_invalid_raw_tags() {
+        use rexif::{ExifTag, TagValue};
+        let parsed = rexif::parse_buffer(&gps_fixture_bytes(35, 139)).unwrap();
+        for tag in [
+            ExifTag::GPSLatitude,
+            ExifTag::GPSLongitude,
+            ExifTag::GPSLatitudeRef,
+            ExifTag::GPSLongitudeRef,
+        ] {
+            let mut entries = parsed.entries.clone();
+            entries.retain(|entry| entry.tag != tag);
+            assert!(gps_coordinates(&entries).is_none(), "{tag:?}");
+        }
+        for (tag, reference) in [
+            (ExifTag::GPSLatitudeRef, "E"),
+            (ExifTag::GPSLongitudeRef, "N"),
+            (ExifTag::GPSLatitudeRef, "South"),
+            (ExifTag::GPSLongitudeRef, ""),
+        ] {
+            let mut entries = parsed.entries.clone();
+            entries
+                .iter_mut()
+                .find(|entry| entry.tag == tag)
+                .unwrap()
+                .value = TagValue::Ascii(reference.into());
+            assert!(gps_coordinates(&entries).is_none());
+        }
+        for (latitude, longitude) in [(91, 139), (35, 181)] {
+            assert!(
+                read_exif_from_bytes(&gps_fixture_bytes(latitude, longitude), &[])
+                    .unwrap()
+                    .gps_coordinates()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn gps_axis_validates_components_before_combining_them() {
+        for maximum in [90.0, 180.0] {
+            for components in [
+                [maximum + 1.0, 0.0, 0.0],
+                [maximum, 0.0, 0.01],
+                [1.0, 60.0, 0.0],
+                [1.0, 0.0, 60.0],
+                [-1.0, 0.0, 0.0],
+                [1.0, -1.0, 0.0],
+                [1.0, 0.0, -1.0],
+            ] {
+                assert!(gps_axis(components, "N", "N", "S", maximum).is_none());
+            }
+            for nonfinite in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+                for index in 0..3 {
+                    let mut components = [1.0, 2.0, 3.0];
+                    components[index] = nonfinite;
+                    assert!(gps_axis(components, "N", "N", "S", maximum).is_none());
+                }
+            }
+            assert_eq!(
+                gps_axis([maximum, 0.0, 0.0], "S", "N", "S", maximum),
+                Some(-maximum)
+            );
+        }
+    }
 
     #[test]
     fn jpeg_prefix_cap_returns_no_exif_without_reading_the_body() {

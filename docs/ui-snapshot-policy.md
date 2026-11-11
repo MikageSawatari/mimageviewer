@@ -1,5 +1,12 @@
 # UI スナップショットテスト運用方針
 
+§1.759 は `tests/ui_snapshot.rs::exif_gps_maps_dark` で、製品と共通の EXIF renderer に
+固定の撮影位置を渡す。`exif_gps_maps_dark.png` は300×165、12,267 bytesの1枚。
+GPS の緯度・経度と「Google マップで開く」の文字欠け・重なりがないことを生成後に目視確認し、
+更新指定なしの通常比較も1件成功した。App・worker・製品起動は含めず、ブラウザーも開かない。
+写真切替・見開き左右・欠損／不正／非表示・固定の失敗通知は、lib の `gps_maps_panel_*` で
+記録用 opener を注入して別に検査する。
+
 3D写真 段C（2026-11-07）は `depth_export_settings_small_dark` /
 `depth_export_progress_small_dark` の2枚（1093×614、55,224 / 29,457 bytes）を追加した。
 設定の各選択・既定4ループ・固定操作行・タイトル×、進行数と取消の表示を実装担当と

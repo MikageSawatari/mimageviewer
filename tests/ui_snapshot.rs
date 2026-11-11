@@ -29,6 +29,17 @@ use egui_kittest::kittest::NodeT;
 use egui_kittest::{Harness, kittest::Queryable};
 
 #[test]
+fn exif_gps_maps_dark() {
+    snapshot_with_theme_at_size(
+        "exif_gps_maps_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(300.0, 165.0),
+        None,
+        mimageviewer::draw_exif_gps_snapshot_fixture,
+    );
+}
+
+#[test]
 fn preferences_book_cover_only_dark() {
     snapshot_with_theme_at_size(
         "preferences_book_cover_only_dark",

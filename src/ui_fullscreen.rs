@@ -94406,6 +94406,7 @@ mod specified_scale_consumer_tests {
                         .map(|i| (format!("fixture {i}"), format!("metadata value {i}")))
                         .collect(),
                 )],
+                ..Default::default()
             }),
         );
         let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);

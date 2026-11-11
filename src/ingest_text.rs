@@ -1008,6 +1008,7 @@ mod tests {
                     ("LensModel".to_string(), "safe lens".to_string()),
                 ],
             )],
+            ..Default::default()
         };
         let mut buf = String::new();
         append_exif(&mut buf, &info, true);

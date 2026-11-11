@@ -2941,7 +2941,14 @@ impl App {
                         ui.separator();
                         ui.add_space(8.0);
                     }
-                    draw_exif_panel(ui, exif, &mut self.exif_sections_open);
+                    if let Some(warning) = draw_exif_panel(
+                        ui,
+                        exif,
+                        &mut self.exif_sections_open,
+                        crate::external_links::open_url,
+                    ) {
+                        self.show_feedback_warning(warning.to_string());
+                    }
                 }
 
                 // 外部メタデータ (サイドカー) セクション (FS 画像のみ。docs §11)
@@ -6264,6 +6271,7 @@ mod metadata_info_target_tests {
                         exif_reader::TagGroup::Camera,
                         vec![("Make".into(), format!("camera-{idx}"))],
                     )],
+                    ..Default::default()
                 }),
             );
             app.xmp_cache.insert(
@@ -6308,6 +6316,146 @@ mod metadata_info_target_tests {
             .as_mut()
             .unwrap()
             .selected = side;
+    }
+
+    #[test]
+    fn gps_maps_panel_click_uses_current_photo_and_spread_side() {
+        for mode in [SpreadMode::Single, SpreadMode::Ltr, SpreadMode::Rtl] {
+            let mut app = spread_app(mode);
+            for idx in 0..3 {
+                let key = app.metadata_cache_key(idx).unwrap();
+                app.exif_cache.insert(
+                    key,
+                    exif_reader::read_exif_from_bytes(
+                        &exif_reader::tests::gps_fixture_bytes(30 + idx as u32, 130 + idx as u32),
+                        &[],
+                    ),
+                );
+            }
+            // Page 3 has no GPS. A delayed EXIF load must not reuse page 2's location.
+            let key = app.metadata_cache_key(3).unwrap();
+            app.exif_cache.remove(&key);
+            let mut fonts_ready = false;
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(360.0, 300.0))
+                .build_ui_state(
+                    move |ui, state: &mut (AppTestEnv, Vec<String>, Vec<&'static str>)| {
+                        if !fonts_ready {
+                            crate::ui_fonts::configure_fonts(ui.ctx());
+                            fonts_ready = true;
+                            ui.ctx().request_repaint();
+                            return;
+                        }
+                        let (app, opened, warnings) = state;
+                        let (anchor, pages, _) = app.resolve_metadata_info_target();
+                        if let Some(spread) = app
+                            .similar_panel
+                            .info_target
+                            .as_mut()
+                            .and_then(|target| target.spread.as_mut())
+                        {
+                            draw_metadata_info_target_selector(ui, &mut spread.selected);
+                        }
+                        let idx = anchor.map(|anchor| {
+                            app.similar_panel
+                                .info_target
+                                .as_ref()
+                                .unwrap()
+                                .idx(anchor, pages)
+                        });
+                        if let Some(exif) = app.get_exif_for_idx(idx)
+                            && let Some(warning) =
+                                draw_exif_panel(ui, &exif, &mut app.exif_sections_open, |url| {
+                                    opened.push(url.to_string());
+                                    // Simulate an opener error which leaks its URL if forwarded.
+                                    Err(format!("failed: {url}"))
+                                })
+                        {
+                            warnings.push(warning);
+                        }
+                    },
+                    (app, Vec::new(), Vec::new()),
+                );
+            harness.run();
+            assert!(
+                harness.state().1.is_empty(),
+                "drawing never opens a browser"
+            );
+            harness.get_by_label("Google マップで開く").click();
+            harness.run();
+            assert!(
+                harness
+                    .state()
+                    .1
+                    .last()
+                    .unwrap()
+                    .ends_with("-30.5000000%2C-130.7500000")
+            );
+            if mode == SpreadMode::Single {
+                harness.state_mut().0.fullscreen_idx = Some(1);
+            } else {
+                harness
+                    .get_by_label(if mode.is_rtl() {
+                        "左ページ"
+                    } else {
+                        "右ページ"
+                    })
+                    .click();
+            }
+            harness.run();
+            harness.get_by_label("Google マップで開く").click();
+            harness.run();
+            assert_eq!(harness.state().1.len(), 2);
+            assert!(harness.state().1[1].ends_with("-31.5000000%2C-131.7500000"));
+            harness.state_mut().0.fullscreen_idx = Some(2);
+            harness.run();
+            harness.get_by_label("Google マップで開く").click();
+            harness.run();
+            assert_eq!(harness.state().1.len(), 3);
+            assert!(harness.state().1[2].ends_with("-32.5000000%2C-132.7500000"));
+            assert!(
+                harness
+                    .state()
+                    .2
+                    .iter()
+                    .all(|warning| *warning == "Google マップを開けませんでした")
+            );
+            harness.state_mut().0.fullscreen_idx = Some(3);
+            harness.state_mut().0.spread_mode = SpreadMode::Single;
+            harness.run();
+            assert!(harness.query_by_label("Google マップで開く").is_none());
+            assert_eq!(harness.state().1.len(), 3);
+        }
+    }
+
+    #[test]
+    fn gps_maps_panel_hides_invalid_missing_and_filtered_locations() {
+        let valid = exif_reader::tests::gps_fixture_bytes(35, 139);
+        let invalid = exif_reader::tests::gps_fixture_bytes(91, 139);
+        for exif in [
+            ExifInfo::default(),
+            exif_reader::read_exif_from_bytes(&invalid, &[]).unwrap(),
+            exif_reader::read_exif_from_bytes(&valid, &["GPSLatitude".into()]).unwrap(),
+            exif_reader::read_exif_from_bytes(&valid, &["GPSLongitude".into()]).unwrap(),
+        ] {
+            let mut fonts_ready = false;
+            let mut harness = crate::test_ui::builder().build_ui(move |ui| {
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ui.ctx());
+                    fonts_ready = true;
+                    ui.ctx().request_repaint();
+                    return;
+                }
+                assert!(
+                    draw_exif_panel(ui, &exif, &mut Default::default(), |_| panic!(
+                        "no browser action expected"
+                    ))
+                    .is_none()
+                );
+            });
+            harness.run();
+            assert!(harness.query_by_label("Google マップで開く").is_none());
+        }
     }
 
     #[test]
@@ -7194,7 +7342,9 @@ fn draw_exif_panel(
     ui: &mut egui::Ui,
     exif: &ExifInfo,
     sections_open: &mut std::collections::HashMap<String, bool>,
-) {
+    mut open_url: impl FnMut(&str) -> Result<(), String>,
+) -> Option<&'static str> {
+    let mut warning = None;
     ui.label(
         egui::RichText::new("EXIF")
             .color(egui::Color32::WHITE)
@@ -7230,9 +7380,46 @@ fn draw_exif_panel(
                 let display_tag = exif_reader::tag_display_name(tag_name);
                 draw_key_value_wrapped(ui, display_tag, value);
             }
+            if *group == exif_reader::TagGroup::Gps
+                && let Some(gps) = exif.gps_coordinates()
+                && ui
+                    .button("Google マップで開く")
+                    .on_hover_text(
+                        "既定のブラウザーが開き、撮影位置（緯度・経度）が Google に送られます。",
+                    )
+                    .clicked()
+            {
+                // This pass's info_idx EXIF owns the action; never retain a pending location.
+                // The opener's error may contain the URL, so discard it without logging.
+                if open_url(&crate::external_links::google_maps_url(gps)).is_err() {
+                    warning = Some("Google マップを開けませんでした");
+                }
+            }
             ui.add_space(4.0);
         }
     }
+    warning
+}
+
+#[doc(hidden)]
+pub fn draw_exif_gps_snapshot_fixture(ui: &mut egui::Ui) {
+    apply_metadata_panel_dark_widget_style(ui);
+    let exif = ExifInfo {
+        sections: vec![(
+            exif_reader::TagGroup::Gps,
+            vec![
+                ("GPSLatitude".into(), "35°30'0.00\" N".into()),
+                ("GPSLongitude".into(), "139°45'0.00\" E".into()),
+            ],
+        )],
+        gps: Some(exif_reader::GpsCoordinates {
+            latitude: 35.5,
+            longitude: 139.75,
+        }),
+    };
+    let _ = draw_exif_panel(ui, &exif, &mut Default::default(), |_| {
+        panic!("snapshot must not open a browser")
+    });
 }
 
 /// キー: 値 を1つの LayoutJob で描画し、長い値も確実に折り返す。
