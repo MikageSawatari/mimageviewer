@@ -1,5 +1,15 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
+§1.733（2026-11-11）: 本・コレクションの番号1〜20と前/次の44操作をリング・ジェスチャ・
+ゲームパッド X リングへ追加し、マウス3ボタンは一覧だけに追加する。
+`OpenCollection1..20` / `CollectionPrev・Next` / `OpenBook1..20` / `BookPrev・Next` を
+既存の `GridOpenCollection1..20` / `GridCollectionPrev・Next` / `GridOpenBook1..20` /
+`GridBookPrev・Next` に対応させ、同じキー操作の行へ各文脈の割り当てを表示する。
+既存の `KeyAction`、既定キー、生成defaultは変更しない。管理画面と追加先を開く操作は対象外。
+リング・ジェスチャ・Xリングは一覧/画像FS/動画FS、編集ジェスチャもお気に入りと同じ受付で、
+ページ一覧では実行しない。全画面からは受付判定→終了完了→メイン一覧の共通入口の順とし、
+独立contextは拒否、連動F12は閉じてメイン一覧で開く。詳細は [§1.733設計](ring-saved-group-actions-plan.md)。
+
 §1.681: 編集履歴専用の `EditHistoryKeyPermit` を keyboard owner から発行する。
 まず owner によらず `Context::text_edit_focused()` が真なら発行しない。
 注釈本文 / DragValue の数値直接入力は常にフィールド自身が Undo を所有し、ROOT の modeless VST3 パネルによる
@@ -84,6 +94,13 @@ egui と native 動画の resolver / dispatcher、双方の動画ヘルプへ登
 ペインにフォーカスがある Enter は検索の有無によらずペインが消費し、一覧の「開く」へ渡さない。
 検索外の Direct / DriveList / PaneNavigation と内部の pane open、既存の入力優先順位は従来どおり。
 新しい Action や既定割当は足さない。
+追補 §12 では既存の本・コレクションを開く Action も、検索中は成功採用で検索を終了する。
+`GridOpenActiveBook` / `GridOpenCollectionTarget`、`GridOpenBook1..20` / `GridOpenCollection1..20`、
+`GridBookPrev/Next` / `GridCollectionPrev/Next` と同じメニュー・ツールバー・管理画面の入口を含む。
+§1.733 のリング・ジェスチャ・マウスボタン・ゲームパッド X リングも同じ共通入口へ渡す。
+失敗・取消・stale は結果と選択を保ち、検索なしの既存動作・割当・番号・管理順・待機/取消は変えない。
+成功後は Esc で結果へ戻れず、履歴 Back は検索前の場所へ戻る。検索結果の行を開く操作は検索を継続する。
+既存の `GlobalOpenFolder` / `MenuCommandId::FileOpenFolder` も検索中だけ成功時終了へそろえ、検索なしの Direct は維持する。
 詳細は [検索結果ナビゲーション設計](search-result-navigation-682-688-plan.md) を参照。
 
 2026-10-22: crop / SNS 分割の固定 Escape は、ドラッグ中なら開始前の状態へ戻してドラッグだけを取り消し、

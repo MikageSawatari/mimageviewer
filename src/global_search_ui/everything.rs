@@ -683,6 +683,16 @@ impl App {
         matches!(&self.global_search.accepted, SearchAccepted::Everything { submitted, .. } if submitted.query == self.global_search.everything_draft)
     }
 
+    pub(crate) fn submitted_everything_query(&self) -> Option<&str> {
+        match &self.global_search.pending {
+            Some(SearchProducer::Everything { submitted, .. }) => Some(&submitted.query),
+            _ => match &self.global_search.accepted {
+                SearchAccepted::Everything { submitted, .. } => Some(&submitted.query),
+                _ => None,
+            },
+        }
+    }
+
     pub(super) fn render_everything_search_bar(&mut self, root_ui: &mut egui::Ui) {
         let ctx = &root_ui.ctx().clone();
         let enter = self.dialog_enter_pressed(ctx)
@@ -694,11 +704,21 @@ impl App {
         let mut close = false;
         let mut back = false;
         let running = self.everything_search_progress_visible();
+        let history_availability =
+            self.pinned_search_availability(crate::ui_pinned_search::PinnedSearchKind::Everything);
+        let history_focus_pending = self.history_input_focus_pending(
+            ctx,
+            crate::ui_pinned_search::PinnedSearchKind::Everything.temporary_id(),
+        );
         egui::Panel::top("global_search_bar").show(root_ui,|ui| {
             self.gate_main_chrome(ui);
             ui.add_enabled_ui(!running,|ui| {
                 if !crate::ui_pinned_search::PinnedSearchKind::Everything.pinned(&self.settings) {
-                let controls = ui::draw_everything_controls(ui,&mut self.global_search.everything_draft,&mut self.global_search.focus_request);
+                let controls = ui::draw_everything_controls(ui,&mut self.global_search.everything_draft,&mut self.global_search.focus_request,
+                    self.settings.save_search_input_history.then(|| self.settings.search_input_history.entries(crate::ui_pinned_search::PinnedSearchKind::Everything)), history_availability, history_focus_pending);
+                if controls.focus_requested {
+                    self.claim_pending_text_input_focus(ctx.viewport_id(), crate::ui_pinned_search::PinnedSearchKind::Everything.temporary_id(), ctx.cumulative_pass_nr());
+                }
                 self.global_search.has_focus |= controls.has_focus;
                 send = controls.send || controls.lost_focus && enter;
                 close = controls.close;

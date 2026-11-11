@@ -1335,6 +1335,25 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["履歴件数", "最大", "記憶"]
     ),
     entry!(
+        "resume/search-input-history-enabled",
+        PlaybackResume,
+        "検索欄の入力履歴を保存する",
+        [
+            "検索",
+            "履歴",
+            "入力履歴",
+            "history",
+            "コンテナ",
+            "Everything"
+        ]
+    ),
+    entry!(
+        "resume/search-input-history-clear",
+        PlaybackResume,
+        "検索欄の入力履歴をすべて消去",
+        ["検索", "履歴", "入力履歴", "history", "削除", "クリア"]
+    ),
+    entry!(
         "susie/enabled",
         SusiePlugins,
         "Susie 画像プラグインを有効にする",
@@ -2313,6 +2332,25 @@ mod tests {
                         && entry.anchor == "thumbnail/details-name-colors"),
                 "missing name-color result: {query}"
             );
+        }
+    }
+
+    #[test]
+    fn search_input_history_search_finds_save_and_clear_controls() {
+        let placed = anchors_in_pages_source(PAGES_SOURCE);
+        for query in ["検索", "履歴", "入力履歴", "history"] {
+            let found = search_preferences(query, test_tree_position);
+            for anchor in [
+                "resume/search-input-history-enabled",
+                "resume/search-input-history-clear",
+            ] {
+                assert!(
+                    found.iter().any(|entry| entry.anchor == anchor
+                        && entry.page == PreferencesPage::PlaybackResume),
+                    "missing search history control for {query}: {anchor}"
+                );
+                assert!(placed.contains(&anchor));
+            }
         }
     }
 }

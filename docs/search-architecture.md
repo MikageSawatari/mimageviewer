@@ -1233,6 +1233,21 @@ dispatch 時に検索 3 owner のどれかが active なら成功時終了の場
 フォルダペインにフォーカスがある Enter は検索の有無によらずペインが消費し、一覧の結果を開かない。
 アドレス欄で移れる親もないパス（存在しないドライブ等）を確定した場合は移動せず通知する。
 存在しない子パスから既存の親へ移る従来の解決は維持し、その移動が成功したときだけ検索を終了する。
+追補 §12: 検索中に保存済みの本・コレクションを明示して開く操作も成功時終了へそろえる。
+本棚ルート、追加先の本/コレクション、管理順の番号・前後、ツールバーの固定項目、管理画面の「開く」を含み、
+キー・メニュー・リング・ジェスチャ・マウスボタン・ゲームパッドの同等入口で同じ契約を使う。
+成功後は検索を残した擬似子にせず通常の本/コレクション表示とし、履歴 Back は検索前の場所へ戻る。
+失敗・取消・stale は結果と選択を保持し、検索外の挙動は維持する。検索結果の行を開くことや検索内の帰路は対象外。
+`GlobalOpenFolder` / `FileOpenFolder` のダイアログからの移動も検索中だけ同じ明示 jump へ渡し、検索なしは旧 Direct を維持する。
+saved-group の source は Plain の既存 lease と Search の受付時 `MainListNavigation` を一つの enum で所有する。
+Search は `ExitTemporaryView`・source proof・switch sequence を本/collection の prepare と成功採用まで輸送し、
+poll/ready/adopt の照合で同じ表示の epoch-only stale も拒否する。Plain の cached collection open と loader は維持する。
+検索内の子の要求を検証する route と、検索終了後の Back に記録する route は目的が異なる。
+前者は捕捉した child route を維持し、後者は `Direct(ExitTemporaryView)` の成功採用時だけ元 location と一致する
+return origin の非 empty な保存 route を使う。保存が無い/empty のときだけ元 location の root route を導く。
+navigation の捕捉値を書き換えず、Plain/他 purpose の履歴規則を変えない。
+Collection の新しい検索終了分岐は Snapshot owner 中には入らず、既存の Snapshot 退役順と fallback を優先する。
+通常は Snapshot 開始時に live search が閉じるが、旧来の混在 state の残存フラグだけで Search 分岐を選ばない。
 §1.682 の Everything 一覧順移動は検索を閉じず、結果への帰路だけを成功採用した移動先行へ揃える。
 両項目の詳細は [検索結果ナビゲーション設計](search-result-navigation-682-688-plan.md) を参照。
 

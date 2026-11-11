@@ -19,7 +19,17 @@ pub struct FolderBarWidth(f32);
 
 impl FolderBarWidth {
     pub fn with_input() -> Self {
-        Self(ADDRESS_INPUT_MIN_WIDTH + 8.0) // TextEdit default horizontal margin: 4 + 4.
+        // Released whole-editor reservation; preserve it independently of the
+        // current egui TextEdit style's inner padding.
+        Self(ADDRESS_INPUT_MIN_WIDTH + 8.0)
+    }
+
+    pub fn with_history_input(ui: &egui::Ui, history: bool) -> Self {
+        let mut width = Self::with_input();
+        if history {
+            width.space(crate::ui_history_field::reserved_width(ui));
+        }
+        width
     }
 
     /// Start a measurement of controls without an input field.
@@ -320,13 +330,22 @@ fn address_label_needs_row(width: f32, label_with_gap: f32) -> bool {
 pub fn address_input<R>(
     ui: &mut egui::Ui,
     label: Option<egui::WidgetText>,
+    history: bool,
     draw: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<R> {
     let width = ui.available_rect_before_wrap().width();
     let label_above = label.as_ref().is_some_and(|text| {
         let mut measured = FolderBarWidth::controls();
         measured.label(ui, text.clone());
-        address_label_needs_row(width, measured.width())
+        address_label_needs_row(
+            width
+                - if history {
+                    crate::ui_history_field::reserved_width(ui)
+                } else {
+                    0.0
+                },
+            measured.width(),
+        )
     });
     let layout = if label_above {
         egui::Layout::top_down(egui::Align::Min)
@@ -347,6 +366,29 @@ pub fn address_input<R>(
             draw(ui)
         },
     )
+}
+
+#[doc(hidden)]
+pub fn draw_address_input_snapshot_fixture(
+    ui: &mut egui::Ui,
+    path: &mut String,
+    history: bool,
+) -> egui::Response {
+    let output = crate::ui_history_field::show_singleline(
+        ui,
+        path,
+        None,
+        egui::Id::unique("folder_address_snapshot"),
+        &[],
+        crate::ui_history_field::HistoryFieldOptions {
+            visible: history,
+            monospace: true,
+            ..Default::default()
+        },
+        |edit| edit.desired_width(f32::INFINITY),
+    );
+    crate::ui_helpers::set_accessibility_label(&output.text.response, "Folder address");
+    output.text.response.response
 }
 
 #[cfg(test)]

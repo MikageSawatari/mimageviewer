@@ -2060,6 +2060,17 @@ impl App {
     }
 
     pub(crate) fn open_collection_grid_from_navigation(&mut self, collection_id: CollectionId) {
+        // Snapshot is the owning surface and already closed the live searches.
+        // Preserve its existing retirement order even for legacy leftover search flags.
+        if !self.is_snapshot_active()
+            && (self.global_search.active || self.favsearch.active || self.tag_view.active)
+        {
+            if self.location_jump_admission_blocked() {
+                return;
+            }
+            self.start_search_collection_navigation(collection_id);
+            return;
+        }
         if self.document_open_modal_admission_blocked() {
             return;
         }
@@ -2070,6 +2081,58 @@ impl App {
             self.copied_destination_source_proof(),
         );
         self.adopt_direct_collection_shell(collection_id, None, origin, nav, false);
+    }
+
+    /// A manager button has already been admitted by its owning dialog. Its own modal
+    /// must not reject the navigation it initiated; document operations still exclude opens.
+    pub(crate) fn open_collection_grid_from_manager(&mut self, collection_id: CollectionId) {
+        if !self.is_snapshot_active()
+            && (self.global_search.active || self.favsearch.active || self.tag_view.active)
+        {
+            if self.location_jump_snapshot_blocked() || self.document_open_modal_admission_blocked()
+            {
+                return;
+            }
+            self.start_search_collection_navigation(collection_id);
+        } else {
+            self.open_collection_grid_from_navigation(collection_id);
+        }
+    }
+
+    fn start_search_collection_navigation(&mut self, collection_id: CollectionId) {
+        let navigation = self.capture_main_list_navigation(
+            super::MainHistoryOperation::Direct(
+                super::DirectNavigationPurpose::ExitTemporaryView {
+                    selection: crate::ui_dialogs::context_menu::JumpToFolderSelection::None,
+                },
+            ),
+            self.copied_destination_source_proof(),
+        );
+        self.open_collection_grid_with_search_navigation(collection_id, navigation);
+    }
+
+    pub(super) fn open_collection_grid_with_search_navigation(
+        &mut self,
+        collection_id: CollectionId,
+        navigation: super::MainListNavigation,
+    ) {
+        // Keep the search mounted while the existing history worker prepares a usable
+        // collection. Only its admitted install retires the temporary view and records Back.
+        let origin = self.collection_open_return_origin(collection_id, false);
+        let target = super::FolderNavHistoryTarget::Collection(CollectionGridRestore {
+            identity: CollectionGridIdentity { collection_id },
+            revision_at_open: self.collection_catalog_revision(collection_id).unwrap_or(0),
+            viewport_anchor: None,
+            return_to: origin.clone().map(Box::new),
+        });
+        if !self.start_collection_history_transition_owned(
+            target,
+            super::CollectionHistoryIntent::Restore,
+            origin,
+            navigation,
+        ) {
+            self.show_feedback_warning("コレクションを開けませんでした".into());
+        }
     }
 
     pub(crate) fn adopt_direct_collection_shell(
@@ -5489,6 +5552,10 @@ mod tests {
             std::fs::create_dir(&saved_folder).unwrap();
             let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
             let target = recv(client.create_collection("Target".into()).unwrap());
+            poll_until(&mut app, "target was not cataloged", |app| {
+                app.collection_catalog_revision(target.collection_id())
+                    .is_some()
+            });
             seed_search_or_snapshot_without_return_to(
                 &mut app,
                 source,
@@ -5496,8 +5563,25 @@ mod tests {
                 snapshot,
             );
 
+            let source_generation = app.items_generation;
+            let source_keys: Vec<_> = app.items.iter().map(GridItem::perf_key).collect();
             app.open_collection_grid_from_navigation(target.collection_id());
-            assert_collection_return_folder(&app, &saved_folder);
+            if snapshot {
+                assert_collection_return_folder(&app, &saved_folder);
+            } else {
+                assert!(app.global_search.active);
+                assert_eq!(app.items_generation, source_generation);
+                assert_eq!(
+                    app.items.iter().map(GridItem::perf_key).collect::<Vec<_>>(),
+                    source_keys
+                );
+                assert!(app.top_level_grid_view.return_to().is_none());
+                assert!(
+                    app.top_level_grid_view
+                        .history_navigation_transition()
+                        .is_some()
+                );
+            }
             wait_for_grid(&mut app, target.collection_id());
             assert_collection_return_folder(&app, &saved_folder);
             app.shutdown_collection_runtime_for_exit();
@@ -5516,6 +5600,10 @@ mod tests {
         std::fs::create_dir(&tag_folder).unwrap();
         let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
         let target = recv(client.create_collection("Target".into()).unwrap());
+        poll_until(&mut app, "target was not cataloged", |app| {
+            app.collection_catalog_revision(target.collection_id())
+                .is_some()
+        });
         seed_search_or_snapshot_without_return_to(&mut app, source, search_folder.clone(), true);
         app.top_level_grid_view
             .install_return_to(TopLevelGridRestore::Folder(search_folder));
@@ -5541,6 +5629,10 @@ mod tests {
             std::fs::create_dir(&saved_folder).unwrap();
             let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
             let target = recv(client.create_collection("Target".into()).unwrap());
+            poll_until(&mut app, "target was not cataloged", |app| {
+                app.collection_catalog_revision(target.collection_id())
+                    .is_some()
+            });
             seed_search_or_snapshot_without_return_to(
                 &mut app,
                 source.clone(),
@@ -5550,23 +5642,38 @@ mod tests {
             let generation = mount_detached_collection_media(&mut app, source, 1_314, false);
 
             app.open_collection_grid_from_navigation(target.collection_id());
-            assert_collection_return_folder(&app, &saved_folder);
-            app.with_window_viewer_context(1_314, |window| {
-                assert_eq!(window.fullscreen_idx, Some(0));
-                assert_eq!(window.items_generation, generation);
-                assert!(matches!(window.items.as_slice(), [GridItem::Video(_)]));
-                assert!(matches!(
-                    window.fs_cache.get(&0),
-                    Some(super::super::FsCacheEntry::Video { .. })
-                ));
-                assert!(matches!(
-                    window.top_level_grid_view.surface(),
-                    TopLevelGridSurface::Snapshot | TopLevelGridSurface::Search(_)
-                ));
-            })
-            .unwrap();
+            if snapshot {
+                assert_collection_return_folder(&app, &saved_folder);
+            } else {
+                assert!(app.global_search.active);
+                assert_eq!(app.items_generation, generation);
+                assert!(app.top_level_grid_view.return_to().is_none());
+                assert!(
+                    app.top_level_grid_view
+                        .history_navigation_transition()
+                        .is_some()
+                );
+            }
+            let assert_source_window = |app: &mut App| {
+                app.with_window_viewer_context(1_314, |window| {
+                    assert_eq!(window.fullscreen_idx, Some(0));
+                    assert_eq!(window.items_generation, generation);
+                    assert!(matches!(window.items.as_slice(), [GridItem::Video(_)]));
+                    assert!(matches!(
+                        window.fs_cache.get(&0),
+                        Some(super::super::FsCacheEntry::Video { .. })
+                    ));
+                    assert!(matches!(
+                        window.top_level_grid_view.surface(),
+                        TopLevelGridSurface::Snapshot | TopLevelGridSurface::Search(_)
+                    ));
+                })
+                .unwrap();
+            };
+            assert_source_window(&mut app);
             wait_for_grid(&mut app, target.collection_id());
             assert_collection_return_folder(&app, &saved_folder);
+            assert_source_window(&mut app);
             app.shutdown_collection_runtime_for_exit();
         }
     }

@@ -11800,6 +11800,14 @@ mod tests {
             "OpenLocationPictures".to_string(),
             "OpenLocationDownloads".to_string(),
         ]);
+        key_handled.extend([
+            "CollectionPrev".to_string(),
+            "CollectionNext".to_string(),
+            "BookPrev".to_string(),
+            "BookNext".to_string(),
+        ]);
+        add_numbered_names(&mut key_handled, "OpenCollection", 1..=20);
+        add_numbered_names(&mut key_handled, "OpenBook", 1..=20);
         add_numbered_names(&mut key_handled, "OpenFavorite", 1..=20);
         add_drive_names(&mut key_handled, "OpenDrive");
         add_numbered_names(&mut key_handled, "GridColumnCount", 1..=20);

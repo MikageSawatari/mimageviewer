@@ -9,6 +9,10 @@ use crate::ui_pinned_search::{
 #[path = "tests/search_submit.rs"]
 mod submit_tests;
 
+#[cfg(test)]
+#[path = "pinned_search/history_tests.rs"]
+mod history_tests;
+
 impl From<SearchSource> for Kind {
     fn from(source: SearchSource) -> Self {
         match source {
@@ -451,6 +455,8 @@ mod focus_tests {
                             focus,
                             false,
                             false,
+                            None,
+                            false,
                         );
                     });
                 });
@@ -552,6 +558,8 @@ mod focus_tests {
                                 true,
                                 false,
                                 false,
+                                None,
+                                false,
                             );
                             app.global_search.has_focus |= response.inner.input.has_focus();
                         } else {
@@ -636,7 +644,7 @@ impl EscapeClaim {
         Self(app.any_dialog_open() && !app.everything_search_progress_visible())
     }
 
-    fn claim(&mut self, ctx: &egui::Context) {
+    pub(crate) fn claim(&mut self, ctx: &egui::Context) {
         self.0 = true;
         ctx.input_mut(|input| {
             input.consume_key(input.modifiers, egui::Key::Escape);
@@ -784,7 +792,7 @@ impl App {
     }
 
     /// Finish the one accepted text-submit operation, including its focus reservation.
-    fn finish_search_input_submit(&mut self, ctx: &egui::Context, widget: egui::Id) {
+    pub(crate) fn finish_text_input_submit(&mut self, ctx: &egui::Context, widget: egui::Id) {
         crate::keyboard_input::claim_text_input_submit(ctx, widget);
         if self
             .pending_text_input_focus
@@ -805,7 +813,8 @@ impl App {
             return false;
         }
         self.ensure_search_session(kind);
-        self.finish_search_input_submit(ctx, widget);
+        self.record_search_input_history(kind);
+        self.finish_text_input_submit(ctx, widget);
         match kind {
             Kind::Local => {
                 self.search_focus_request = false;
@@ -850,7 +859,7 @@ impl App {
         {
             return false;
         }
-        self.finish_search_input_submit(ctx, widget);
+        self.finish_text_input_submit(ctx, widget);
         self.tag_view.focus_request = false;
         self.tag_view.has_focus = false;
         true
@@ -878,6 +887,10 @@ impl App {
     /// Called after Main's discrete-input and active-detached admission, before grid keys.
     /// A real widget or its recovery claim wins over a not-yet-drawn search reservation.
     pub(crate) fn route_pending_search_submit(&mut self, ctx: &egui::Context) -> bool {
+        self.keyboard_owner_for_pass(ctx);
+        if crate::ui_history_field::owns_pending_focus(ctx) {
+            return false;
+        }
         use crate::keyboard_input::{
             KeyboardOwner, ShortcutScope, ShortcutSurface, TextInputPhase,
         };
@@ -942,6 +955,51 @@ impl App {
             Kind::Container => &self.favsearch.query,
             Kind::Metadata => &self.global_search.metadata_draft,
             Kind::Everything => &self.global_search.everything_draft,
+        }
+    }
+    fn record_search_input_history(&mut self, kind: Kind) {
+        if self.settings.save_search_input_history {
+            let query = self.search_draft(kind).to_owned();
+            self.settings.search_input_history.record(kind, &query);
+        }
+    }
+
+    /// Compare only consecutive passes, after Escape/clear and before grid actions.
+    /// The previous field is a single viewport-owned value, never a pending departure.
+    pub(crate) fn settle_search_input_departure(
+        &mut self,
+        ctx: &egui::Context,
+        history_escape_taken: bool,
+    ) {
+        if history_escape_taken || !self.settings.save_search_input_history {
+            return;
+        }
+        let owner_id = ctx.viewport_id().0.with("search_input_owner");
+        let previous = ctx.data(|data| data.get_temp::<(SearchInputId, u64)>(owner_id));
+        let Some((input, pass)) = previous else {
+            return;
+        };
+        if pass.checked_add(1) != Some(ctx.cumulative_pass_nr())
+            || ctx.memory(|memory| memory.has_focus(input.id()))
+            || !self.edit_owner(input.kind())
+        {
+            return;
+        }
+        let kind = input.kind();
+        let draft = self.search_draft(kind);
+        let executed = match kind {
+            Kind::Local => self
+                .submitted_local_search()
+                .is_some_and(|sent| sent.query == draft),
+            Kind::Container => self.favsearch.last_executed == draft,
+            Kind::Metadata => {
+                self.global_search.source == crate::global_search_ui::SearchSource::Metadata
+                    && self.global_search.last_executed == draft
+            }
+            Kind::Everything => self.submitted_everything_query() == Some(draft),
+        };
+        if executed {
+            self.record_search_input_history(kind);
         }
     }
     pub(crate) fn search_draft_mut(&mut self, kind: Kind) -> &mut String {
@@ -1097,7 +1155,9 @@ impl App {
                 Action::Edited(kind)
                 | Action::Submit(kind)
                 | Action::Clear(kind)
-                | Action::Focused(kind) => kind,
+                | Action::Focused(kind)
+                | Action::RequestFocus(kind)
+                | Action::Picked(kind, _) => kind,
             };
             if matches!(action, Action::Focused(_)) {
                 continue;
@@ -1113,6 +1173,18 @@ impl App {
                 Action::Edited(_) if kind == Kind::Everything => {}
                 Action::Submit(_) => {
                     self.submit_search_input(ctx, kind, kind.input_id());
+                }
+                Action::Picked(_, index) => {
+                    if let Some(query) = self
+                        .settings
+                        .search_input_history
+                        .entries(kind)
+                        .get(index)
+                        .cloned()
+                    {
+                        *self.search_draft_mut(kind) = query;
+                        self.submit_search_input(ctx, kind, kind.input_id());
+                    }
                 }
                 Action::Edited(_) => {
                     self.ensure_search_session(kind);
@@ -1134,6 +1206,13 @@ impl App {
                     }
                 }
                 Action::Focused(_) => {}
+                Action::RequestFocus(_) => {
+                    self.claim_pending_text_input_focus(
+                        ctx.viewport_id(),
+                        kind.input_id(),
+                        ctx.cumulative_pass_nr(),
+                    );
+                }
             }
         }
     }
@@ -1270,8 +1349,10 @@ impl App {
             .or_else(|| crate::ime_focus::recovering_text_input(ctx))?;
         // Recovery supplies the viewport/pass validity and pointer/other-widget precedence.
         // The previous record only maps that valid widget ID to a search kind.
+        let owner_id = ctx.viewport_id().0.with("search_input_owner");
         ctx.data(|data| {
-            data.get_temp::<SearchInputId>(ctx.viewport_id().0.with("search_input_owner"))
+            data.get_temp::<(SearchInputId, u64)>(owner_id)
+                .map(|(owner, _)| owner)
         })
         .filter(|owner| owner.id() == widget)
     }
@@ -1287,11 +1368,12 @@ impl App {
             })
             .find(|owner| Some(owner.id()) == widget);
         let id = ctx.viewport_id().0.with("search_input_owner");
+        let pass = ctx.cumulative_pass_nr();
         ctx.data_mut(|data| {
             if let Some(owner) = owner {
-                data.insert_temp(id, owner);
+                data.insert_temp(id, (owner, pass));
             } else {
-                data.remove::<SearchInputId>(id);
+                data.remove::<(SearchInputId, u64)>(id);
             }
         });
     }
@@ -1388,15 +1470,26 @@ impl App {
         };
         let enter = self.dialog_enter_pressed(ui.ctx());
         let drag = self.settings.toolbar_section_drag_enabled;
+        let focus_pending = self.history_input_focus_pending(ui.ctx(), kind.input_id());
+        let draft = match kind {
+            Kind::Local => &mut self.search_query,
+            Kind::Container => &mut self.favsearch.query,
+            Kind::Metadata => &mut self.global_search.metadata_draft,
+            Kind::Everything => &mut self.global_search.everything_draft,
+        };
         let response = crate::ui_pinned_search::draw_pinned_search(
             ui,
             kind,
-            self.search_draft_mut(kind),
+            draft,
             state,
             enabled,
             focus,
             enter,
             drag,
+            self.settings
+                .save_search_input_history
+                .then(|| self.settings.search_input_history.entries(kind)),
+            focus_pending,
         );
         let focused = response.inner.input.has_focus();
         match kind {

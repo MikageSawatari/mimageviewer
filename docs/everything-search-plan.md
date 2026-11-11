@@ -248,6 +248,11 @@ dispatch 時に検索が active なら同じ成功時終了の場所ジャンプ
 ペインにフォーカスがある Enter はペインが消費し、検索結果の本を開かない。
 存在しないドライブ等、アドレス欄の入力から移れる親もない場合は移動せず通知する。
 存在しない子パスから既存の親へ移る従来の解決は維持し、その移動が成功したときだけ検索を終了する。
+追補 §12: 保存済みの本・コレクションを開く明示操作（追加先、管理順の番号/前後、固定ボタン、管理画面の「開く」）も、
+移動先の成功採用で検索を終了する。失敗・取消・stale は結果と選択を保持し、検索外の open は従来どおり。
+検索が終了した後は旧 Everything scope の列を使わず、履歴 Back は検索前へ戻る。結果行から本を開く通常の PhysicalChild と
+Everything の一覧順移動・結果への帰路は検索を継続するので、保存済み本への明示 open と混同しない。
+`GlobalOpenFolder` / `FileOpenFolder` の「フォルダを開く」も、検索中だけ成功時終了へ渡す。検索なしの Direct は維持する。
 両項目の正本は [検索結果ナビゲーション設計](search-result-navigation-682-688-plan.md)。実機観測の記録ではない。
 
 §1.664（2026-10-31）: 通常 close の既存 Live continuation は、採用済み PhysicalChild が本で、現在の論理コンテナと採用済み本分類の root がその source に一致するとき `AddressBarNav::EverythingResults` を返し、通常／即時 dispatcher から `return_from_everything_child(Results)` を呼ぶ。本の種類は accepted dataset の行種別と `ProjectionRecipe` で確認する。Folder 行は追加設定 ON・画像のみを必須とし、拡張子付き実フォルダを旧拡張子判定だけで対象にしない（既存分類問題§1.418自体は範囲外）。この制限は通常 close に適用し、Results ボタンは従来どおり階層途中からも使える。新しい帰路 state・第二 cache は作らない。既存の取消可能な main modal と prepare/adoption を再利用する簡素化を採り、追加の割り込み・復元機構は不要とした。Ctrl+G／Ctrl+S／タグの検索除外は維持する（別々の drill／nav_stack owner が必要なため今回対象外）。まれな失敗は既定の割り切りとし、新しい回復処理を足さない。detached 述語・viewport・registry 移譲は変更しない。
@@ -442,8 +447,12 @@ fullscreen/native/detachedからの検索起動を増やさず、Rの検出probe
 IME確定後Enter/検索ボタンで明示送信し、raw先頭10,000件の後で形式/表示条件を適用する。
 paging/追加取得、自動ext追記、Ctrl+Gの自動集約/hit-count sort/全文対象filterは追加しない。
 
-新しいSettings field/schema/DB/索引/検索履歴/Remote APIは追加せず、settings-transfer項目数を変更しない。
-query/result一覧はmIVの永続データや診断ログに残さない。Everything自身のquery history設定は変更しない。
+Everything 検索自体は専用schema/DB/索引/Remote APIを追加しない。
+後続 §1.756 では、共通の検索欄入力履歴として Settings に保存可否（既定オン）と種類別最近 20 件を追加する。
+確定時および実行済みの語での通常離脱で記録し、常設欄・一時バーで共有する。result一覧は引き続き永続化せず、
+query/result一覧を診断ログへ残さない。履歴本体は設定の持ち運び・Remote・MCPへ公開しない。
+設定オフで現行履歴も消去するが、設定世代バックアップにはしばらく残る。
+Everything自身のquery history設定は変更しない。[入力履歴の設計](search-input-history-plan.md)。
 結果からの通常open/tag/★/cacheは既存の保存契約に従う。
 keymap spec/default/実装計画、検索/shortcut manual、privacy、製品ページ、関連architecture/virtual/top-level/spec/READMEを同期する。
 

@@ -571,6 +571,50 @@ pub enum RingActionId {
     OpenFavorite18,
     OpenFavorite19,
     OpenFavorite20,
+    OpenCollection1,
+    OpenCollection2,
+    OpenCollection3,
+    OpenCollection4,
+    OpenCollection5,
+    OpenCollection6,
+    OpenCollection7,
+    OpenCollection8,
+    OpenCollection9,
+    OpenCollection10,
+    OpenCollection11,
+    OpenCollection12,
+    OpenCollection13,
+    OpenCollection14,
+    OpenCollection15,
+    OpenCollection16,
+    OpenCollection17,
+    OpenCollection18,
+    OpenCollection19,
+    OpenCollection20,
+    CollectionPrev,
+    CollectionNext,
+    OpenBook1,
+    OpenBook2,
+    OpenBook3,
+    OpenBook4,
+    OpenBook5,
+    OpenBook6,
+    OpenBook7,
+    OpenBook8,
+    OpenBook9,
+    OpenBook10,
+    OpenBook11,
+    OpenBook12,
+    OpenBook13,
+    OpenBook14,
+    OpenBook15,
+    OpenBook16,
+    OpenBook17,
+    OpenBook18,
+    OpenBook19,
+    OpenBook20,
+    BookPrev,
+    BookNext,
     OpenDriveC,
     OpenDriveD,
     OpenDriveE,
@@ -707,6 +751,253 @@ impl RingActionId {
             || self
                 .page_overview_key_action()
                 .is_some_and(|action| actions.contains(&action))
+    }
+
+    const COLLECTION_SLOTS: &'static [(Self, &'static str, crate::keymap::KeyAction); 20] = &[
+        (
+            Self::OpenCollection1,
+            "open_collection_1",
+            crate::keymap::KeyAction::GridOpenCollection1,
+        ),
+        (
+            Self::OpenCollection2,
+            "open_collection_2",
+            crate::keymap::KeyAction::GridOpenCollection2,
+        ),
+        (
+            Self::OpenCollection3,
+            "open_collection_3",
+            crate::keymap::KeyAction::GridOpenCollection3,
+        ),
+        (
+            Self::OpenCollection4,
+            "open_collection_4",
+            crate::keymap::KeyAction::GridOpenCollection4,
+        ),
+        (
+            Self::OpenCollection5,
+            "open_collection_5",
+            crate::keymap::KeyAction::GridOpenCollection5,
+        ),
+        (
+            Self::OpenCollection6,
+            "open_collection_6",
+            crate::keymap::KeyAction::GridOpenCollection6,
+        ),
+        (
+            Self::OpenCollection7,
+            "open_collection_7",
+            crate::keymap::KeyAction::GridOpenCollection7,
+        ),
+        (
+            Self::OpenCollection8,
+            "open_collection_8",
+            crate::keymap::KeyAction::GridOpenCollection8,
+        ),
+        (
+            Self::OpenCollection9,
+            "open_collection_9",
+            crate::keymap::KeyAction::GridOpenCollection9,
+        ),
+        (
+            Self::OpenCollection10,
+            "open_collection_10",
+            crate::keymap::KeyAction::GridOpenCollection10,
+        ),
+        (
+            Self::OpenCollection11,
+            "open_collection_11",
+            crate::keymap::KeyAction::GridOpenCollection11,
+        ),
+        (
+            Self::OpenCollection12,
+            "open_collection_12",
+            crate::keymap::KeyAction::GridOpenCollection12,
+        ),
+        (
+            Self::OpenCollection13,
+            "open_collection_13",
+            crate::keymap::KeyAction::GridOpenCollection13,
+        ),
+        (
+            Self::OpenCollection14,
+            "open_collection_14",
+            crate::keymap::KeyAction::GridOpenCollection14,
+        ),
+        (
+            Self::OpenCollection15,
+            "open_collection_15",
+            crate::keymap::KeyAction::GridOpenCollection15,
+        ),
+        (
+            Self::OpenCollection16,
+            "open_collection_16",
+            crate::keymap::KeyAction::GridOpenCollection16,
+        ),
+        (
+            Self::OpenCollection17,
+            "open_collection_17",
+            crate::keymap::KeyAction::GridOpenCollection17,
+        ),
+        (
+            Self::OpenCollection18,
+            "open_collection_18",
+            crate::keymap::KeyAction::GridOpenCollection18,
+        ),
+        (
+            Self::OpenCollection19,
+            "open_collection_19",
+            crate::keymap::KeyAction::GridOpenCollection19,
+        ),
+        (
+            Self::OpenCollection20,
+            "open_collection_20",
+            crate::keymap::KeyAction::GridOpenCollection20,
+        ),
+    ];
+
+    const BOOK_SLOTS: &'static [(Self, &'static str, crate::keymap::KeyAction); 20] = &[
+        (
+            Self::OpenBook1,
+            "open_book_1",
+            crate::keymap::KeyAction::GridOpenBook1,
+        ),
+        (
+            Self::OpenBook2,
+            "open_book_2",
+            crate::keymap::KeyAction::GridOpenBook2,
+        ),
+        (
+            Self::OpenBook3,
+            "open_book_3",
+            crate::keymap::KeyAction::GridOpenBook3,
+        ),
+        (
+            Self::OpenBook4,
+            "open_book_4",
+            crate::keymap::KeyAction::GridOpenBook4,
+        ),
+        (
+            Self::OpenBook5,
+            "open_book_5",
+            crate::keymap::KeyAction::GridOpenBook5,
+        ),
+        (
+            Self::OpenBook6,
+            "open_book_6",
+            crate::keymap::KeyAction::GridOpenBook6,
+        ),
+        (
+            Self::OpenBook7,
+            "open_book_7",
+            crate::keymap::KeyAction::GridOpenBook7,
+        ),
+        (
+            Self::OpenBook8,
+            "open_book_8",
+            crate::keymap::KeyAction::GridOpenBook8,
+        ),
+        (
+            Self::OpenBook9,
+            "open_book_9",
+            crate::keymap::KeyAction::GridOpenBook9,
+        ),
+        (
+            Self::OpenBook10,
+            "open_book_10",
+            crate::keymap::KeyAction::GridOpenBook10,
+        ),
+        (
+            Self::OpenBook11,
+            "open_book_11",
+            crate::keymap::KeyAction::GridOpenBook11,
+        ),
+        (
+            Self::OpenBook12,
+            "open_book_12",
+            crate::keymap::KeyAction::GridOpenBook12,
+        ),
+        (
+            Self::OpenBook13,
+            "open_book_13",
+            crate::keymap::KeyAction::GridOpenBook13,
+        ),
+        (
+            Self::OpenBook14,
+            "open_book_14",
+            crate::keymap::KeyAction::GridOpenBook14,
+        ),
+        (
+            Self::OpenBook15,
+            "open_book_15",
+            crate::keymap::KeyAction::GridOpenBook15,
+        ),
+        (
+            Self::OpenBook16,
+            "open_book_16",
+            crate::keymap::KeyAction::GridOpenBook16,
+        ),
+        (
+            Self::OpenBook17,
+            "open_book_17",
+            crate::keymap::KeyAction::GridOpenBook17,
+        ),
+        (
+            Self::OpenBook18,
+            "open_book_18",
+            crate::keymap::KeyAction::GridOpenBook18,
+        ),
+        (
+            Self::OpenBook19,
+            "open_book_19",
+            crate::keymap::KeyAction::GridOpenBook19,
+        ),
+        (
+            Self::OpenBook20,
+            "open_book_20",
+            crate::keymap::KeyAction::GridOpenBook20,
+        ),
+    ];
+
+    fn saved_group_slot_entry(&self) -> Option<(&'static str, crate::keymap::KeyAction)> {
+        Self::COLLECTION_SLOTS
+            .iter()
+            .chain(Self::BOOK_SLOTS.iter())
+            .find(|entry| &entry.0 == self)
+            .map(|entry| (entry.1, entry.2))
+    }
+
+    /// Reuse the existing keyboard entry point for opening a saved collection or book.
+    pub fn saved_group_key_action(&self) -> Option<crate::keymap::KeyAction> {
+        use crate::keymap::KeyAction;
+        if let Some(entry) = self.saved_group_slot_entry() {
+            return Some(entry.1);
+        }
+        match self {
+            Self::CollectionPrev => Some(KeyAction::GridCollectionPrev),
+            Self::CollectionNext => Some(KeyAction::GridCollectionNext),
+            Self::BookPrev => Some(KeyAction::GridBookPrev),
+            Self::BookNext => Some(KeyAction::GridBookNext),
+            _ => None,
+        }
+    }
+
+    pub fn for_saved_group_key_action(action: crate::keymap::KeyAction) -> Option<Self> {
+        use crate::keymap::KeyAction;
+        if let Some(entry) = Self::COLLECTION_SLOTS
+            .iter()
+            .chain(Self::BOOK_SLOTS.iter())
+            .find(|entry| entry.2 == action)
+        {
+            return Some(entry.0.clone());
+        }
+        match action {
+            KeyAction::GridCollectionPrev => Some(Self::CollectionPrev),
+            KeyAction::GridCollectionNext => Some(Self::CollectionNext),
+            KeyAction::GridBookPrev => Some(Self::BookPrev),
+            KeyAction::GridBookNext => Some(Self::BookNext),
+            _ => None,
+        }
     }
 
     const FAVORITE_SLOT_STRINGS: [&'static str; 20] = [
@@ -934,6 +1225,7 @@ impl RingActionId {
 
     fn is_location_navigation_action(&self) -> bool {
         self.favorite_slot_number().is_some()
+            || self.saved_group_key_action().is_some()
             || self.drive_letter().is_some()
             || self.location_rating_stars().is_some()
             || matches!(
@@ -948,8 +1240,12 @@ impl RingActionId {
     }
 
     fn location_navigation_actions() -> Vec<Self> {
-        let mut actions = Vec::with_capacity(20 + 24 + 11);
+        let mut actions = Vec::with_capacity(20 + 44 + 24 + 11);
         actions.extend((1..=20).filter_map(Self::favorite_slot_action));
+        actions.extend(Self::COLLECTION_SLOTS.iter().map(|entry| entry.0.clone()));
+        actions.extend([Self::CollectionPrev, Self::CollectionNext]);
+        actions.extend(Self::BOOK_SLOTS.iter().map(|entry| entry.0.clone()));
+        actions.extend([Self::BookPrev, Self::BookNext]);
         actions.extend(('C'..='Z').filter_map(Self::drive_action));
         actions.extend([
             Self::OpenLocationDriveList,
@@ -968,6 +1264,9 @@ impl RingActionId {
     }
 
     pub fn as_str(&self) -> &str {
+        if let Some(entry) = self.saved_group_slot_entry() {
+            return entry.0;
+        }
         if let Some(slot) = self.favorite_slot_number() {
             return Self::FAVORITE_SLOT_STRINGS[slot - 1];
         }
@@ -991,7 +1290,51 @@ impl RingActionId {
             Self::ClearRecentFolders => "clear_recent_folders",
             Self::ClearQuickFolderSlots => "clear_quick_folder_slots",
             Self::CycleFavorite => "cycle_favorite",
-            Self::OpenFavorite1
+            Self::CollectionPrev => "collection_prev",
+            Self::CollectionNext => "collection_next",
+            Self::BookPrev => "book_prev",
+            Self::BookNext => "book_next",
+            Self::OpenCollection1
+            | Self::OpenCollection2
+            | Self::OpenCollection3
+            | Self::OpenCollection4
+            | Self::OpenCollection5
+            | Self::OpenCollection6
+            | Self::OpenCollection7
+            | Self::OpenCollection8
+            | Self::OpenCollection9
+            | Self::OpenCollection10
+            | Self::OpenCollection11
+            | Self::OpenCollection12
+            | Self::OpenCollection13
+            | Self::OpenCollection14
+            | Self::OpenCollection15
+            | Self::OpenCollection16
+            | Self::OpenCollection17
+            | Self::OpenCollection18
+            | Self::OpenCollection19
+            | Self::OpenCollection20
+            | Self::OpenBook1
+            | Self::OpenBook2
+            | Self::OpenBook3
+            | Self::OpenBook4
+            | Self::OpenBook5
+            | Self::OpenBook6
+            | Self::OpenBook7
+            | Self::OpenBook8
+            | Self::OpenBook9
+            | Self::OpenBook10
+            | Self::OpenBook11
+            | Self::OpenBook12
+            | Self::OpenBook13
+            | Self::OpenBook14
+            | Self::OpenBook15
+            | Self::OpenBook16
+            | Self::OpenBook17
+            | Self::OpenBook18
+            | Self::OpenBook19
+            | Self::OpenBook20
+            | Self::OpenFavorite1
             | Self::OpenFavorite2
             | Self::OpenFavorite3
             | Self::OpenFavorite4
@@ -1128,6 +1471,13 @@ impl RingActionId {
 
     pub fn from_str(s: &str) -> Option<Self> {
         let key = s.trim().to_ascii_lowercase();
+        if let Some(entry) = Self::COLLECTION_SLOTS
+            .iter()
+            .chain(Self::BOOK_SLOTS.iter())
+            .find(|entry| entry.1 == key.as_str())
+        {
+            return Some(entry.0.clone());
+        }
         if let Some(index) = Self::FAVORITE_SLOT_STRINGS
             .iter()
             .position(|value| *value == key.as_str())
@@ -1157,6 +1507,10 @@ impl RingActionId {
             "clear_recent_folders" => Self::ClearRecentFolders,
             "clear_quick_folder_slots" => Self::ClearQuickFolderSlots,
             "cycle_favorite" => Self::CycleFavorite,
+            "collection_prev" => Self::CollectionPrev,
+            "collection_next" => Self::CollectionNext,
+            "book_prev" => Self::BookPrev,
+            "book_next" => Self::BookNext,
             "open_location_drive_list" => Self::OpenLocationDriveList,
             "open_location_reading_history" => Self::OpenLocationReadingHistory,
             "open_location_rating_1" => Self::OpenLocationRating1,
@@ -1249,6 +1603,9 @@ impl RingActionId {
     }
 
     pub fn label_for_context(&self, context: RingShortcutContext) -> &'static str {
+        if let Some(action) = self.saved_group_key_action() {
+            return action.description();
+        }
         if let Some(slot) = self.favorite_slot_number() {
             return Self::FAVORITE_SLOT_LABELS[slot - 1];
         }
@@ -1292,7 +1649,51 @@ impl RingActionId {
             Self::ClearRecentFolders => "最近開いたフォルダ履歴をクリア",
             Self::ClearQuickFolderSlots => "A/B の記憶した場所と一覧位置をクリア",
             Self::CycleFavorite => "お気に入り巡回",
-            Self::OpenFavorite1
+            Self::CollectionPrev
+            | Self::CollectionNext
+            | Self::BookPrev
+            | Self::BookNext
+            | Self::OpenCollection1
+            | Self::OpenCollection2
+            | Self::OpenCollection3
+            | Self::OpenCollection4
+            | Self::OpenCollection5
+            | Self::OpenCollection6
+            | Self::OpenCollection7
+            | Self::OpenCollection8
+            | Self::OpenCollection9
+            | Self::OpenCollection10
+            | Self::OpenCollection11
+            | Self::OpenCollection12
+            | Self::OpenCollection13
+            | Self::OpenCollection14
+            | Self::OpenCollection15
+            | Self::OpenCollection16
+            | Self::OpenCollection17
+            | Self::OpenCollection18
+            | Self::OpenCollection19
+            | Self::OpenCollection20
+            | Self::OpenBook1
+            | Self::OpenBook2
+            | Self::OpenBook3
+            | Self::OpenBook4
+            | Self::OpenBook5
+            | Self::OpenBook6
+            | Self::OpenBook7
+            | Self::OpenBook8
+            | Self::OpenBook9
+            | Self::OpenBook10
+            | Self::OpenBook11
+            | Self::OpenBook12
+            | Self::OpenBook13
+            | Self::OpenBook14
+            | Self::OpenBook15
+            | Self::OpenBook16
+            | Self::OpenBook17
+            | Self::OpenBook18
+            | Self::OpenBook19
+            | Self::OpenBook20
+            | Self::OpenFavorite1
             | Self::OpenFavorite2
             | Self::OpenFavorite3
             | Self::OpenFavorite4
@@ -4389,5 +4790,183 @@ mod next_input_tests {
             loaded, settings,
             "sanitize must preserve new and existing assignments"
         );
+    }
+}
+
+#[cfg(test)]
+mod saved_group_action_tests {
+    use super::*;
+    use crate::keymap::KeyAction;
+
+    fn saved_group_cases() -> Vec<(RingActionId, String, KeyAction)> {
+        let mut cases = Vec::new();
+        for (group, key_group) in [("collection", "Collection"), ("book", "Book")] {
+            for slot in 1..=20 {
+                let id = format!("open_{group}_{slot}");
+                let key_name = format!("GridOpen{key_group}{slot}");
+                cases.push((
+                    RingActionId::from_str(&id).unwrap(),
+                    id,
+                    KeyAction::from_ini_name(&key_name).unwrap(),
+                ));
+            }
+            for (direction, key_direction) in [("prev", "Prev"), ("next", "Next")] {
+                let id = format!("{group}_{direction}");
+                let key_name = format!("Grid{key_group}{key_direction}");
+                cases.push((
+                    RingActionId::from_str(&id).unwrap(),
+                    id,
+                    KeyAction::from_ini_name(&key_name).unwrap(),
+                ));
+            }
+        }
+        assert_eq!(cases.len(), 44);
+        cases
+    }
+
+    #[test]
+    fn saved_group_actions_round_trip_and_match_existing_key_actions() {
+        let cases = saved_group_cases();
+        let mut ids = std::collections::BTreeSet::new();
+        for (action, id, key_action) in &cases {
+            assert!(ids.insert(id));
+            assert_eq!(action.as_str(), id);
+            assert_eq!(RingActionId::from_str(id), Some(action.clone()));
+            assert_eq!(
+                RingActionId::from_str(&format!("  {}  ", id.to_ascii_uppercase())),
+                Some(action.clone())
+            );
+            assert_eq!(action.saved_group_key_action(), Some(*key_action));
+            assert_eq!(
+                RingActionId::for_saved_group_key_action(*key_action),
+                Some(action.clone())
+            );
+            for &context in RingShortcutContext::all() {
+                assert_eq!(action.label_for_context(context), key_action.description());
+            }
+            let encoded = serde_json::to_string(action).unwrap();
+            assert_eq!(encoded, format!("\"{id}\""));
+            assert_eq!(
+                serde_json::from_str::<RingActionId>(&encoded).unwrap(),
+                *action
+            );
+        }
+        for &key_action in KeyAction::all() {
+            let expected = cases
+                .iter()
+                .find(|entry| entry.2 == key_action)
+                .map(|entry| entry.0.clone());
+            assert_eq!(
+                RingActionId::for_saved_group_key_action(key_action),
+                expected,
+                "{key_action:?}"
+            );
+        }
+        for action in [
+            RingActionId::None,
+            RingActionId::OpenFavorite1,
+            RingActionId::AddToBook,
+        ] {
+            assert_eq!(action.saved_group_key_action(), None);
+        }
+        for id in [
+            "open_collection_0",
+            "open_collection_21",
+            "open_book_0",
+            "open_book_21",
+        ] {
+            assert_eq!(RingActionId::from_str(id), None);
+        }
+    }
+
+    #[test]
+    fn saved_group_candidates_follow_favorites_and_share_location_context_rules() {
+        let cases = saved_group_cases();
+        let expected: Vec<_> = cases.iter().map(|entry| entry.0.clone()).collect();
+        for &context in RingShortcutContext::all() {
+            let candidates = RingActionId::available_for_context(context);
+            let start = candidates
+                .iter()
+                .position(|action| *action == RingActionId::OpenFavorite20)
+                .unwrap()
+                + 1;
+            assert_eq!(
+                &candidates[start..start + expected.len()],
+                expected.as_slice()
+            );
+            assert_eq!(candidates[start + expected.len()], RingActionId::OpenDriveC);
+            for action in &expected {
+                assert!(action.is_valid_for_context(context));
+                let mouse_valid = context == RingShortcutContext::Grid;
+                assert_eq!(
+                    action.is_valid_for_mouse_button_context(context),
+                    mouse_valid
+                );
+                assert_eq!(
+                    RingActionId::available_for_mouse_button_context(context).contains(action),
+                    mouse_valid
+                );
+                assert_eq!(action.page_overview_key_action(), None);
+                assert!(!action.is_executable_in_page_overview(KeyAction::all()));
+                assert_eq!(
+                    candidates
+                        .iter()
+                        .filter(|candidate| *candidate == action)
+                        .count(),
+                    1
+                );
+            }
+        }
+        for &context in RightDragContext::all() {
+            let candidates = RingActionId::available_for_right_drag_context(context);
+            for action in &expected {
+                assert!(action.is_valid_for_right_drag_context(context));
+                assert!(candidates.contains(action));
+            }
+        }
+    }
+
+    #[test]
+    fn saved_group_assignments_survive_settings_serde_and_sanitize_without_new_defaults() {
+        let defaults = RingShortcutSettings::default();
+        for (action, id, _) in saved_group_cases() {
+            let mut settings = defaults.clone();
+            for &context in RingShortcutContext::all() {
+                assert!(!defaults.profile(context).slots.contains(&action));
+                for slot in [
+                    MouseButtonSlot::Back,
+                    MouseButtonSlot::Forward,
+                    MouseButtonSlot::Middle,
+                ] {
+                    assert_ne!(defaults.mouse_button_profile(context).action(slot), action);
+                }
+                settings.profile_mut(context).slots[0] = action.clone();
+            }
+            for &context in RightDragContext::all() {
+                assert!(
+                    !defaults
+                        .mouse_gesture_profile(context)
+                        .bindings
+                        .iter()
+                        .any(|binding| binding.action == action)
+                );
+                settings.mouse_gesture_profile_mut(context).bindings =
+                    vec![MouseGestureBinding::new(
+                        vec![MouseGestureDirection::Up],
+                        action.clone(),
+                    )];
+            }
+            let mouse = settings.mouse_button_profile_mut(RingShortcutContext::Grid);
+            mouse.back = action.clone();
+            mouse.forward = action.clone();
+            mouse.middle = action;
+            let mut loaded: RingShortcutSettings =
+                serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+            loaded.sanitize();
+            assert_eq!(
+                loaded, settings,
+                "{id}: every supported assignment must survive sanitize"
+            );
+        }
     }
 }

@@ -1334,7 +1334,7 @@ fn list_order_repro_navigation_frame() -> crate::app::update_phases::MainFrameNa
 
 #[cfg(windows)]
 #[test]
-fn list_order_everything_folder_dialog_physical_book_reports_unavailable_from_real_key_handler() {
+fn list_order_everything_internal_open_physical_book_reports_unavailable_from_real_key_handler() {
     let _serial = crate::key_input::lock_test_input();
     let _clear = ClearListOrderInput;
     for initial_child in [false, true] {
@@ -1370,11 +1370,9 @@ fn list_order_everything_folder_dialog_physical_book_reports_unavailable_from_re
                     app.close_fullscreen();
                     assert_child(&app, &result_book);
                 }
-                // The file-open dialog still retains Search; menu favorites now
-                // exit it under section 11 and cannot create this retained state.
-                let mut frame = list_order_repro_navigation_frame();
-                frame.open_folder_nav = Some(favorite.clone());
-                app.post_render_main_navigation(&ctx, frame);
+                // Explicit user destinations exit Search. Retain this internal-open
+                // fixture to cover the original list-order ownership defect.
+                app.load_folder(favorite.clone());
                 app.settle_open_path_classification_for_test();
                 app.finish_page_identity_preparation_for_test();
                 assert_eq!(app.current_folder.as_ref(), Some(&favorite));
@@ -1486,7 +1484,7 @@ fn dispatch_list_order_repro_key(app: &mut App, ctx: &egui::Context, forward: bo
 }
 
 #[cfg(windows)]
-fn retained_parent_folder_dialog_repro(
+fn retained_parent_internal_open_repro(
     app: &mut tests::phase_c_support::AppTestEnv,
     ctx: &egui::Context,
     zip_book: bool,
@@ -1556,9 +1554,8 @@ fn retained_parent_folder_dialog_repro(
     );
     let snapshot = app.list_order.clone().unwrap();
     assert_eq!(snapshot.entries[0].path, parent);
-    let mut frame = list_order_repro_navigation_frame();
-    frame.open_folder_nav = Some(favorite.clone());
-    app.post_render_main_navigation(ctx, frame);
+    // Internal opens still preserve Search; user destinations now exit it.
+    app.load_folder(favorite.clone());
     app.settle_open_path_classification_for_test();
     app.finish_page_identity_preparation_for_test();
     assert_eq!(app.current_folder.as_ref(), Some(&favorite));
@@ -1581,7 +1578,7 @@ fn retained_parent_folder_dialog_repro(
 
 #[cfg(windows)]
 #[test]
-fn list_order_everything_retained_parent_folder_dialog_book_reaches_boundary_notice_policy() {
+fn list_order_everything_retained_parent_internal_open_book_reaches_boundary_notice_policy() {
     let _serial = crate::key_input::lock_test_input();
     let _clear = ClearListOrderInput;
     for zip_book in [true, false] {
@@ -1590,7 +1587,7 @@ fn list_order_everything_retained_parent_folder_dialog_book_reaches_boundary_not
                 let mut app = setup_app();
                 let ctx = egui::Context::default();
                 let (parent, book, _, snapshot) =
-                    retained_parent_folder_dialog_repro(&mut app, &ctx, zip_book, false);
+                    retained_parent_internal_open_repro(&mut app, &ctx, zip_book, false);
                 app.settings.fullscreen_boundary_notice_visible = notice_visible;
                 app.fs_feedback_toast = None;
                 app.feedback_toasts_for_test.clear();
@@ -1635,7 +1632,7 @@ fn list_order_everything_retained_parent_folder_dialog_book_reaches_boundary_not
 
 #[cfg(windows)]
 #[test]
-fn list_order_everything_retained_parent_folder_dialog_current_book_reports_its_nested_result_row()
+fn list_order_everything_retained_parent_internal_open_current_book_reports_its_nested_result_row()
 {
     let _serial = crate::key_input::lock_test_input();
     let _clear = ClearListOrderInput;
@@ -1643,7 +1640,7 @@ fn list_order_everything_retained_parent_folder_dialog_current_book_reports_its_
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let (_, book, _, snapshot) =
-            retained_parent_folder_dialog_repro(&mut app, &ctx, zip_book, true);
+            retained_parent_internal_open_repro(&mut app, &ctx, zip_book, true);
         app.feedback_toasts_for_test.clear();
         dispatch_list_order_repro_key(&mut app, &ctx, true);
         let result = receive_folder_nav(&mut app, &ctx);

@@ -13,6 +13,96 @@ pub use mimageviewer_agent_ipc::{AgentLevel, PermissionSnapshot};
 
 pub const MAX_FAVORITES: usize = 100;
 
+/// PC 内だけに保存する、検索欄の種類ごとの最近の入力。
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SearchInputHistory {
+    container: Vec<String>,
+    local: Vec<String>,
+    metadata: Vec<String>,
+    everything: Vec<String>,
+}
+
+impl SearchInputHistory {
+    pub fn entries(&self, kind: crate::ui_pinned_search::PinnedSearchKind) -> &[String] {
+        use crate::ui_pinned_search::PinnedSearchKind::*;
+        match kind {
+            Container => &self.container,
+            Local => &self.local,
+            Metadata => &self.metadata,
+            Everything => &self.everything,
+        }
+    }
+
+    fn entries_mut(&mut self, kind: crate::ui_pinned_search::PinnedSearchKind) -> &mut Vec<String> {
+        use crate::ui_pinned_search::PinnedSearchKind::*;
+        match kind {
+            Container => &mut self.container,
+            Local => &mut self.local,
+            Metadata => &mut self.metadata,
+            Everything => &mut self.everything,
+        }
+    }
+
+    pub fn record(&mut self, kind: crate::ui_pinned_search::PinnedSearchKind, text: &str) {
+        let text = text.trim();
+        if text.is_empty() || text.chars().count() > 1_000 {
+            return;
+        }
+        let entries = self.entries_mut(kind);
+        entries.retain(|entry| entry != text);
+        entries.insert(0, text.to_owned());
+        entries.truncate(20);
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn len(&self) -> usize {
+        self.container.len() + self.local.len() + self.metadata.len() + self.everything.len()
+    }
+}
+
+// Diagnostics may print Settings; never include the query text in Debug output.
+impl std::fmt::Debug for SearchInputHistory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SearchInputHistory")
+            .field("entry_count", &self.len())
+            .finish()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SearchInputHistory {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use crate::ui_pinned_search::PinnedSearchKind;
+        let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+        let mut history = Self::default();
+        for (key, kind) in [
+            ("container", PinnedSearchKind::Container),
+            ("local", PinnedSearchKind::Local),
+            ("metadata", PinnedSearchKind::Metadata),
+            ("everything", PinnedSearchKind::Everything),
+        ] {
+            if let Some(entries) = value.get(key).and_then(serde_json::Value::as_array) {
+                // Stored order is newest first. Keep the first occurrence after trimming.
+                for value in entries {
+                    let Some(text) = value.as_str().map(str::trim) else {
+                        continue;
+                    };
+                    if text.is_empty() || text.chars().count() > 1_000 {
+                        continue;
+                    }
+                    let normalized = history.entries_mut(kind);
+                    if normalized.len() < 20 && !normalized.iter().any(|entry| entry == text) {
+                        normalized.push(text.to_owned());
+                    }
+                }
+            }
+        }
+        Ok(history)
+    }
+}
+
 /// お気に入りとは独立した、登録順で表示するファイル整理先。
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileOrganizeDestination {
@@ -4683,6 +4773,11 @@ pub struct Settings {
     /// A/B クイックフォルダごとの最近開いたフォルダ一覧 (v1.6.0+)。
     #[serde(default = "default_quick_folder_recent_folders")]
     pub quick_folder_recent_folders: [Vec<PathBuf>; 2],
+    /// 検索欄ごとに実行済みの検索語を PC 内へ保存する。オフは履歴が空の状態。
+    #[serde(default = "default_true")]
+    pub save_search_input_history: bool,
+    #[serde(default)]
+    pub search_input_history: SearchInputHistory,
     #[serde(default = "default_quick_folder_slots")]
     pub quick_folder_slots: [Option<PathBuf>; 2],
     /// Accepted A/B workspace. Missing in older settings means A; explicit None
@@ -5093,8 +5188,8 @@ pub struct Settings {
     /// 「Windows のメニュー」サブメニューへまとめる。
     #[serde(default)]
     pub show_windows_context_menu_inline: bool,
-    /// mIV の事前判定でごみ箱へ移せる対象は、種類に関係なく mIV 側の削除確認を省略する。
-    /// 完全削除候補は常に確認を残す。
+    /// mIV の事前判定でごみ箱へ移せる対象は、実フォルダを含まなければ削除確認を省略する。
+    /// 実フォルダを含む場合と完全削除候補は常に確認を残す。
     #[serde(default)]
     pub skip_recycle_bin_delete_confirmation: bool,
 
@@ -7822,6 +7917,8 @@ impl Default for Settings {
             startup_folder_path: None,
             recent_folders: Vec::new(),
             quick_folder_recent_folders: default_quick_folder_recent_folders(),
+            save_search_input_history: true,
+            search_input_history: SearchInputHistory::default(),
             quick_folder_slots: default_quick_folder_slots(),
             active_quick_folder_slot: default_active_quick_folder_slot(),
             quick_folder_drive_current_dirs: default_quick_folder_drive_current_dirs(),
@@ -10130,6 +10227,9 @@ impl Settings {
     /// 読み込んだ設定値を安全範囲に補正する (JSON 手編集で範囲外の値が入った場合の防衛)。
     /// お気に入りの UUID マイグレーションもここで行う。
     fn sanitize(&mut self) {
+        if !self.save_search_input_history {
+            self.search_input_history.clear();
+        }
         if FullscreenFitMode::all()
             .iter()
             .all(|mode| !mode.cycle_enabled(&self.fullscreen_fit_cycle_excluded))
@@ -10758,6 +10858,7 @@ impl Settings {
         self.last_cursor_rows_above = src.last_cursor_rows_above;
         self.recent_folders = std::mem::take(&mut src.recent_folders);
         self.quick_folder_recent_folders = std::mem::take(&mut src.quick_folder_recent_folders);
+        self.search_input_history = std::mem::take(&mut src.search_input_history);
         self.quick_folder_slots = std::mem::take(&mut src.quick_folder_slots);
         self.active_quick_folder_slot = src.active_quick_folder_slot;
         self.quick_folder_drive_current_dirs =
@@ -20746,7 +20847,118 @@ impl<'de> serde::Deserialize<'de> for Settings {
         if let Some(map) = value.as_object_mut() {
             crate::same_name_folder_book::canonicalize(map).map_err(serde::de::Error::custom)?;
         }
-        Settings::deserialize(value).map_err(serde::de::Error::custom)
+        let mut settings =
+            Settings::deserialize(value).map_err(<D::Error as serde::de::Error>::custom)?;
+        if !settings.save_search_input_history {
+            settings.search_input_history.clear();
+        }
+        Ok(settings)
+    }
+}
+
+#[cfg(test)]
+mod search_input_history_tests {
+    use super::*;
+    use crate::ui_pinned_search::PinnedSearchKind as Kind;
+
+    #[test]
+    fn search_input_history_records_normalized_recent_queries_per_kind() {
+        let mut history = SearchInputHistory::default();
+        for kind in Kind::ALL {
+            history.record(kind, "  猫  ");
+            history.record(kind, "Cat");
+            history.record(kind, "cat");
+            history.record(kind, " \t\n ");
+            history.record(kind, &"語".repeat(1_001));
+            history.record(kind, " 猫 ");
+            assert_eq!(history.entries(kind), ["猫", "cat", "Cat"]);
+        }
+        assert_eq!(history.len(), 12);
+        history.record(Kind::Local, &"語".repeat(1_000));
+        assert_eq!(history.entries(Kind::Local)[0].chars().count(), 1_000);
+        assert_eq!(history.entries(Kind::Container).len(), 3);
+        for i in 0..25 {
+            history.record(Kind::Local, &format!("query-{i}"));
+        }
+        assert_eq!(history.entries(Kind::Local).len(), 20);
+        assert_eq!(history.entries(Kind::Local)[0], "query-24");
+        assert_eq!(history.entries(Kind::Local)[19], "query-5");
+        history.clear();
+        assert_eq!(history.len(), 0);
+    }
+
+    #[test]
+    fn search_input_history_deserialize_drops_invalid_values_and_preserves_newest_order() {
+        let mut entries = vec![
+            serde_json::json!("  newest  "),
+            serde_json::json!("newest"),
+            serde_json::json!(null),
+            serde_json::json!(42),
+            serde_json::json!({}),
+            serde_json::json!(" \t "),
+            serde_json::json!("語".repeat(1_001)),
+            serde_json::json!("Newest"),
+        ];
+        entries.extend((0..25).map(|i| serde_json::json!(format!("older-{i}"))));
+        let history: SearchInputHistory = serde_json::from_value(serde_json::json!({
+            "container": entries, "local": false, "metadata": ["  item  "],
+            "everything": [" file: ", false], "unknown": ["ignored"]
+        }))
+        .unwrap();
+        assert_eq!(history.entries(Kind::Container).len(), 20);
+        assert_eq!(&history.entries(Kind::Container)[..2], ["newest", "Newest"]);
+        assert_eq!(history.entries(Kind::Container)[19], "older-17");
+        assert!(history.entries(Kind::Local).is_empty());
+        assert_eq!(history.entries(Kind::Metadata), ["item"]);
+        assert_eq!(history.entries(Kind::Everything), ["file:"]);
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!(42),
+            serde_json::json!([]),
+        ] {
+            let history: SearchInputHistory = serde_json::from_value(value).unwrap();
+            assert_eq!(history.len(), 0);
+        }
+        assert!(!format!("{history:?}").contains("newest"));
+    }
+
+    #[test]
+    fn search_input_history_sqlite_roundtrip_clear_and_old_missing_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(temp.path()).unwrap();
+        let mut settings = Settings::default();
+        for kind in Kind::ALL {
+            settings.search_input_history.record(kind, kind.label());
+        }
+        db.save_full(&settings).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert!(loaded.save_search_input_history);
+        assert_eq!(loaded.search_input_history, settings.search_input_history);
+        settings.search_input_history.clear();
+        db.save_full(&settings).unwrap();
+        assert_eq!(
+            db.load_into_settings().unwrap().search_input_history.len(),
+            0
+        );
+        settings.save_search_input_history = false;
+        settings
+            .search_input_history
+            .record(Kind::Local, "should-disappear");
+        db.save_full(&settings).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert!(!loaded.save_search_input_history);
+        assert_eq!(loaded.search_input_history.len(), 0);
+        drop(db);
+        let conn = rusqlite::Connection::open(temp.path().join("settings.db")).unwrap();
+        conn.execute("DELETE FROM settings_kv WHERE key IN ('save_search_input_history', 'search_input_history')", []).unwrap();
+        drop(conn);
+        let db = crate::settings_db::SettingsDb::open(temp.path()).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert!(loaded.save_search_input_history);
+        assert_eq!(loaded.search_input_history.len(), 0);
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert!(old.save_search_input_history);
+        assert_eq!(old.search_input_history.len(), 0);
     }
 }
 

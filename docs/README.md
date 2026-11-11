@@ -10,6 +10,7 @@
 | --- | --- |
 | [metadata-panel-spread-target-plan.md](metadata-panel-spread-target-plan.md) | §1.712 情報タブの左右ページ選択。編集／読書位置から独立したcontext所有、全ページ情報の対象、末尾補助表紙と初期化規則、検証 |
 | [list-order-book-navigation-plan.md](list-order-book-navigation-plan.md) | §1.444 一覧の表示順で前後の本へ移る操作。凍結列の context 所有・都度位置解決・既存 fullscreen 採用経路・検証記録 |
+| [search-result-navigation-682-688-plan.md](search-result-navigation-682-688-plan.md) | §1.682 Everything の一覧順移動と §1.688 検索中の明示移動。追補 §12 の本・コレクション・フォルダを開く全入口、成功時だけの検索終了・失敗/取消保持、入口監査と検証記録 |
 | [section445-stepped-slider-input.md](section445-stepped-slider-input.md) | §1.445、GPUメモリ上限などの手入力。eguiの編集状態とstep丸めの原因、共通修正、兄弟欄とheadless回帰・検証記録 |
 | [section443-font-color-fix.md](section443-font-color-fix.md) | §1.443、単色 EBDT 字形のカラー誤判定。epaint 0.37 の vendor 差分、実フォント・mesh 回帰と検証記録 |
 | [gpu-init-fallback-plan.md](gpu-init-fallback-plan.md) | §1.448 GPU 初期化と§12の§1.429 surface設定失敗。`--gpu-backend`、DX12 の FXC 固定、初回 device 作成だけの DX12 → Vulkan 有限選択、試行別診断と起動中だけの Error 保存。報告環境の原因や改善は未確認 |
@@ -116,13 +117,16 @@
 | [web-remote-left-panel-plan.md](web-remote-left-panel-plan.md) | リモートの左パネル (場所 / 検索 / タグ / お気に入り / 本棚) の範囲と、本体一覧との差 |
 | [web-remote-ai-plan.md](web-remote-ai-plan.md) | **段 3b-0〜3b-2 実装・実機確認済み。JPEG 転送 / 端末別画質 mode は実装済み・実機確認待ち**。remote AI アップスケール / デノイズの PC modal 排他、共有 canonical decoder、接続取得 / 切断 drain barrier、App 所有 singleton Runtime、stable remote key、HTTP job、Web UI、画面消灯復帰、VRAM、撤退条件 |
 | [local-vlm-caption-plan.md](local-vlm-caption-plan.md) | ローカル AI 説明文の正本。V1-3 の独立レビュー済み設計は §21.7。V1-3b の worker 内包・protocol 2・source identity・分割モデル取得・GPU 判定・初回案内・設定ページの実装と検証記録は §21.8。作成ジョブ (V1-3c) の受付・進捗・中止と検証記録は §21.9。実モデルの公開、表紙 (V1-4)、検索/MCP は別段階 |
+| [local-asr-transcript-plan.md](local-asr-transcript-plan.md) | ローカル文字起こし (whisper、動画) の計画。左パネルの「文字起こし」タブ・検索・MCP。AI 説明文の仕組みを型にする。初版、独立レビュー前 |
 | [local-vlm-v0-procedure.md](local-vlm-v0-procedure.md) | **手順の下書き (2026-11-02、未実行)**。ローカル AI 説明文の V0。Qwen3.5-4B/9B と Gemma 4 E4B の比較、VLM・AI 補正・表示用テクスチャの VRAM を同じ物差しで計測、利用者による目隠しの品質比較、4B 固定と U1 の判断基準 |
 | [mcp-integration-plan.md](mcp-integration-plan.md) | **段階 0 試験実装中 (2026-10-30)**。AI 連携 (MCP)。stdio の別 exe と本体の agent lane (Remote IPC とは別の pipe・版)、Remote 操作権との関係、安全性。実装・検証と未決事項は §14 |
 | [local-adjust-testing.md](local-adjust-testing.md) | 部分補正レイヤーの回帰テスト、合成順、キャッシュ無効化を検証するとき |
 | [search-architecture.md](search-architecture.md) | 検索 / インデクサ / タグを触るとき。**Ctrl+S/F/G/R の経路、Everythingの共通Search ownership、インデクサパイプライン + DB 責任分離** |
+| [search-input-history-plan.md](search-input-history-plan.md) | §1.756 検索欄の入力履歴。4 種類各 20 件、確定・実行済み語での離脱、設定の保存・オフと全件消去、フォルダバーと共有する▼・IME-safe な固定キー、ログ・Remote・MCP の非公開境界。実装中 |
 | [name-index-write-failure-plan.md](name-index-write-failure-plan.md) | §1.369 名前／コンテナ索引の書込失敗。レビュー反映・実装と検証記録。同じDBの起動中1回の通知／予約、通常UIへの配送、Full/watch/clearの共通出口、無害なno-opの維持 |
 | [page-adjustment-owner-plan.md](page-adjustment-owner-plan.md) | §1.372 検索再配置中の補正Undo／draftの保存先。設計R2反映・実装／自動検証／確認用build完了。安定target、context所有draft、共有Undo受理順と最新受付済み文書、終了配送と§1.371 cursor ownerとの関係 |
 | [item-kind-capability-matrix.md](item-kind-capability-matrix.md) | **★ / タグ / 削除 / コピー / 外部ツール / 検索が `GridItem` の種別ごとにどう振る舞うかの現状表**。セルは 対応 / 拒否 / コンテナへ寄せる / **無反応** の 4 値。仮想ページ (ZipImage / PdfPage) を扱う機能を足すときは先にここを見る |
+| [folder-check-selection-plan.md](folder-check-selection-plan.md) | **§1.732 (実装中)**。どの一覧でもフォルダをチェック選択・Ctrl+A の対象にする設計。選べる判定の一本化 (ドライブ一覧だけ除外)、削除の確認・本へ追加・合計サイズの変更点、選択を使う各操作のフォルダの扱いの一覧 |
 | [top-level-grid-view.md](top-level-grid-view.md) | 検索・★固定・サブ展開・スマートフォルダ等の最上位一覧 ownership / 復元 snapshot と、スマートフォルダ root / scoped drill の不変条件 |
 | [section257-smart-folder-navigation.md](section257-smart-folder-navigation.md) | スマートフォルダからの PDF 読み込み取消と親復帰位置の不具合。お気に入り表示設定の適用先、root/物理子の所有境界と回帰検証 |
 | [fullscreen-folder-sidecar-transition-investigation-20260913.md](fullscreen-folder-sidecar-transition-investigation-20260913.md) | §1.233 サイドカー復元の非同期待機と画像フォルダ移動の表示保持。v3.9.0退行のログ・所有境界・修正検証 |

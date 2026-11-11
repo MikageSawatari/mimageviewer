@@ -6934,9 +6934,9 @@ fn format_reading_history_media_time(value_ms: i64) -> String {
 }
 
 fn grid_selection_item_is_checkable(items: &[GridItem], allow_folders: bool, idx: usize) -> bool {
-    items.get(idx).is_some_and(|item| {
-        item.is_checkable() || (allow_folders && matches!(item, GridItem::Folder(_)))
-    })
+    items
+        .get(idx)
+        .is_some_and(|item| crate::grid_item::grid_item_checkable(item, allow_folders))
 }
 
 fn add_grid_selection_range(
@@ -8945,7 +8945,7 @@ impl App {
                                 }
                                 ui.separator();
                                 let has_selection = self.grid_item_input_allowed()
-                                    && (self.selected.is_some() || !self.checked.is_empty());
+                                    && self.grid_book_add_has_selection();
                                 for &command in books_menu_commands {
                                     match command {
                                         MenuCommandId::BooksAddSelectionToActiveBook => {
@@ -10034,11 +10034,7 @@ impl App {
             self.request_book_list_refresh();
         }
         if let Some(path) = actions.open {
-            if crate::folder_tree::path_eq(&path, &self.book_root_path()) {
-                self.open_books_root();
-            } else {
-                self.load_folder(path);
-            }
+            self.open_book_manager_target(path);
         }
         if let Some(name) = actions.active {
             self.select_book_append_target(name);
@@ -11130,8 +11126,8 @@ impl App {
             .map(|snapshot| snapshot.rows.clone());
         let toolbar_pinned_books = self.settings.pinned_books.clone();
         let toolbar_smart_folder_definitions = self.settings.smart_folders.clone();
-        let has_book_add_target = self.selected.is_some() || !self.checked.is_empty();
-        let has_rating_selection = has_book_add_target;
+        let has_book_add_target = self.grid_book_add_has_selection();
+        let has_rating_selection = self.selected.is_some() || !self.checked.is_empty();
         let toolbar_section_order =
             crate::settings::ToolbarSectionId::render_order(&self.settings.toolbar_section_order)
                 .into_iter()
@@ -13109,7 +13105,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         changed |= ui
             .checkbox(
                 &mut self.settings.show_address_bar_history_menu,
-                "最近開いたフォルダ履歴メニュー",
+                "履歴 (入力欄の▼)",
             )
             .changed();
         changed |= ui
@@ -15610,7 +15606,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let mut open_preferences = None;
         let mut open_omitted_list = false;
         // Measure the same visible controls in the folder bar's normal style.
-        let mut widths = crate::ui_toolbar_layout::FolderBarWidth::with_input();
+        let mut widths = crate::ui_toolbar_layout::FolderBarWidth::with_history_input(
+            ui,
+            self.settings.show_address_bar_history_menu,
+        );
         widths.label(ui, "フォルダ:");
         let show_history_nav = self.settings.show_address_bar_history_nav;
         let show_quick_folders = self.settings.show_address_bar_quick_folders;
@@ -15671,7 +15670,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             (stack_available, "スタック"),
             (subfolder_expansion_available, "サブ展開"),
             (pin_button_info.is_some(), "📌"),
-            (self.settings.show_address_bar_history_menu, "履歴▼"),
             (self.settings.show_address_bar_favorite_button, "♥"),
         ] {
             if visible {
@@ -15695,7 +15693,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 right_widths.space(4.0);
             }
         }
-        let mut input_widths = crate::ui_toolbar_layout::FolderBarWidth::with_input();
+        let mut input_widths = crate::ui_toolbar_layout::FolderBarWidth::with_history_input(
+            ui,
+            self.settings.show_address_bar_history_menu,
+        );
         if let Some(suffix) = self.snapshot_path_suffix() {
             widths.label(ui, suffix.clone());
             input_widths.label(ui, suffix);
@@ -16374,67 +16375,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         ui.add_space(4.0);
                                     }
 
-                                    if self.settings.show_address_bar_history_menu {
-                                        // 検索 (Ctrl+G / Ctrl+S) 中は履歴メニューを無効化する
-                                        // (検索は透明な一時オーバーレイで履歴の概念が適用されない)。
-                                        // Codex 3rd P3 fix: snapshot 中も同様に無効化。
-                                        crate::ui_toolbar_layout::folder_menu_button(
-                                            ui,
-                                            !search_active && !snapshot_active,
-                                            "履歴▼",
-                                            |ui| {
-                                                let menu_width = (ctx.content_rect().width()
-                                                    * 0.72)
-                                                    .clamp(560.0, 1100.0);
-                                                ui.set_min_width(menu_width);
-                                                let mut shown = 0usize;
-                                                for path in &recent_folders {
-                                                    if effective_folder.as_ref().is_some_and(
-                                                        |cur| {
-                                                            crate::folder_tree::path_eq(cur, path)
-                                                        },
-                                                    ) {
-                                                        continue;
-                                                    }
-                                                    let full = path.to_string_lossy().to_string();
-                                                    let button = egui::Button::new(
-                                                        egui::RichText::new(&full).monospace(),
-                                                    )
-                                                    .wrap_mode(egui::TextWrapMode::Extend);
-                                                    if ui.add(button).hover_tip(&full).clicked() {
-                                                        if let Some(resolved) =
-                                                            resolve_folder_bar_nav_path(path)
-                                                        {
-                                                            result = Some(AddressBarNav::Direct(
-                                                                resolved,
-                                                                crate::app::StartupListIntent::ExplicitList,
-                                                            ));
-                                                        }
-                                                        ui.close();
-                                                    }
-                                                    shown += 1;
-                                                    if shown >= 20 {
-                                                        break;
-                                                    }
-                                                }
-                                                if shown == 0 {
-                                                    ui.label(
-                                                        egui::RichText::new("履歴はありません")
-                                                            .weak(),
-                                                    );
-                                                }
-                                            },
-                                        )
-                                        .hover_tip(
-                                            if search_active {
-                                                "検索中は履歴メニューを使用できません"
-                                            } else {
-                                                "最近開いたフォルダ"
-                                            },
-                                        );
-                                        ui.add_space(4.0);
-                                    }
-
                                     if self.settings.show_address_bar_favorite_button {
                                         let (label, tooltip) = if current_is_favorite {
                                             (
@@ -16481,83 +16421,125 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                             .color(egui::Color32::from_rgb(58, 110, 165))
                                             .into()
                                     });
-                                    crate::ui_toolbar_layout::address_input(ui, label, |ui| {
-                                        // snapshot 中はフォルダパス入力を disabled にする (= §4.4)。
-                                        let resp = if is_snap_active {
-                                            ui.add_enabled(
-                                                false,
-                                                egui::TextEdit::singleline(&mut self.address)
-                                                    .id(egui::Id::unique("folder_address_input"))
-                                                    .desired_width(f32::INFINITY),
-                                            )
-                                        } else {
-                                            let mut output = crate::ime_focus::show_singleline(
-                                                ui,
-                                                &mut self.address,
-                                                None,
-                                                |edit| {
-                                                    edit.id(egui::Id::unique(
-                                                        "folder_address_input",
-                                                    ))
-                                                    .desired_width(f32::INFINITY)
+                                    crate::ui_toolbar_layout::address_input(
+                                        ui,
+                                        label,
+                                        self.settings.show_address_bar_history_menu,
+                                        |ui| {
+                                            let history_paths: Vec<_> = recent_folders
+                                                .iter()
+                                                .filter(|path| {
+                                                    effective_folder.as_ref().is_none_or(|cur| {
+                                                        !crate::folder_tree::path_eq(cur, path)
+                                                    })
+                                                })
+                                                .take(20)
+                                                .collect();
+                                            let history_entries: Vec<_> = history_paths
+                                                .iter()
+                                                .map(|path| path.to_string_lossy().into_owned())
+                                                .collect();
+                                            let focus_pending = self.history_input_focus_pending(
+                                                ctx,
+                                                egui::Id::unique("folder_address_input"),
+                                            );
+                                            let field = ui.add_enabled_ui(!is_snap_active, |ui| {
+                                            crate::ui_history_field::show_singleline(
+                                                ui, &mut self.address, None, egui::Id::unique("folder_address_input"),
+                                                &history_entries,
+                                                crate::ui_history_field::HistoryFieldOptions {
+                                                    visible: self.settings.show_address_bar_history_menu,
+                                                    availability: if search_active { Err("検索中は履歴メニューを使用できません") } else { Ok(()) },
+                                                    min_popup_width: Some((ctx.content_rect().width() * 0.72).clamp(560.0, 1100.0)),
+                                                    monospace: true,
+                                                    tooltip: "最近開いたフォルダ",
+                                                    focus_pending,
                                                 },
-                                            );
-                                            crate::ui_helpers::singleline_text_edit_context_menu(
-                                                ui,
-                                                &mut output,
-                                                &mut self.address,
-                                            );
-                                            output.response.response
-                                        };
-                                        crate::ui_helpers::set_accessibility_label(
-                                            &resp,
-                                            "フォルダ:",
-                                        );
-                                        self.address_has_focus = resp.has_focus();
-                                        if !is_snap_active && resp.lost_focus() && enter_pressed {
-                                            let address_text = self.address.trim();
-                                            if address_text.is_empty() {
-                                                result = Some(AddressBarNav::AddressInput(
-                                                    LocationJumpTarget::DriveList,
-                                                ));
-                                            } else if address_text == "本棚" {
-                                                result = Some(AddressBarNav::AddressInput(
-                                                    LocationJumpTarget::Physical(
-                                                        self.book_root_path(),
-                                                    ),
-                                                ));
-                                            } else if let Some(book_name) =
-                                                address_text.strip_prefix("本棚 > ")
-                                            {
-                                                result = Some(AddressBarNav::AddressInput(
-                                                    LocationJumpTarget::Physical(
-                                                        crate::books::book_folder(
-                                                            &self.book_root_path(),
-                                                            book_name.trim(),
-                                                        ),
-                                                    ),
-                                                ));
-                                            } else if let Some(resolved) =
-                                                resolve_folder_bar_address_input(&self.address)
-                                            {
-                                                result = Some(AddressBarNav::AddressInput(
-                                                    LocationJumpTarget::Physical(resolved),
-                                                ));
-                                            } else {
-                                                let path =
-                                                    normalize_folder_bar_input_path(&self.address);
-                                                if path
-                                                    .to_str()
-                                                    .is_none_or(|input| !input.trim().is_empty())
+                                                |edit| edit.id(egui::Id::unique("folder_address_input")).desired_width(f32::INFINITY),
+                                            )
+                                        }).inner;
+                                            if field.focus_requested {
+                                                self.claim_pending_text_input_focus(
+                                                    ctx.viewport_id(),
+                                                    egui::Id::unique("folder_address_input"),
+                                                    ctx.cumulative_pass_nr(),
+                                                );
+                                            }
+                                            let picked = field.picked;
+                                            let mut output = field.text;
+                                            if !is_snap_active {
+                                                crate::ui_helpers::singleline_text_edit_context_menu(ui, &mut output, &mut self.address);
+                                            }
+                                            let resp = output.response.response;
+                                            if let Some(index) = picked {
+                                                self.finish_text_input_submit(ctx, resp.id);
+                                                if let Some(path) =
+                                                    history_paths.get(index).and_then(|path| {
+                                                        resolve_folder_bar_nav_path(path)
+                                                    })
                                                 {
-                                                    self.show_feedback_warning(format!(
-                                                        "場所が見つかりません: {}",
-                                                        path.display()
+                                                    result = Some(AddressBarNav::Direct(
+                                                        path,
+                                                        crate::app::StartupListIntent::ExplicitList,
                                                     ));
                                                 }
                                             }
-                                        }
-                                    });
+                                            crate::ui_helpers::set_accessibility_label(
+                                                &resp,
+                                                "フォルダ:",
+                                            );
+                                            self.address_has_focus = resp.has_focus();
+                                            if picked.is_none()
+                                                && !is_snap_active
+                                                && (field.submit_requested
+                                                    || resp.lost_focus() && enter_pressed)
+                                            {
+                                                self.finish_text_input_submit(ctx, resp.id);
+                                                self.address_has_focus = false;
+                                                let address_text = self.address.trim();
+                                                if address_text.is_empty() {
+                                                    result = Some(AddressBarNav::AddressInput(
+                                                        LocationJumpTarget::DriveList,
+                                                    ));
+                                                } else if address_text == "本棚" {
+                                                    result = Some(AddressBarNav::AddressInput(
+                                                        LocationJumpTarget::Physical(
+                                                            self.book_root_path(),
+                                                        ),
+                                                    ));
+                                                } else if let Some(book_name) =
+                                                    address_text.strip_prefix("本棚 > ")
+                                                {
+                                                    result = Some(AddressBarNav::AddressInput(
+                                                        LocationJumpTarget::Physical(
+                                                            crate::books::book_folder(
+                                                                &self.book_root_path(),
+                                                                book_name.trim(),
+                                                            ),
+                                                        ),
+                                                    ));
+                                                } else if let Some(resolved) =
+                                                    resolve_folder_bar_address_input(&self.address)
+                                                {
+                                                    result = Some(AddressBarNav::AddressInput(
+                                                        LocationJumpTarget::Physical(resolved),
+                                                    ));
+                                                } else {
+                                                    let path = normalize_folder_bar_input_path(
+                                                        &self.address,
+                                                    );
+                                                    if path.to_str().is_none_or(|input| {
+                                                        !input.trim().is_empty()
+                                                    }) {
+                                                        self.show_feedback_warning(format!(
+                                                            "場所が見つかりません: {}",
+                                                            path.display()
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                        },
+                                    );
                                 }
                             }
                         },
@@ -16668,6 +16650,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let local_search_label = self
             .keymap
             .first_chord_action_label("現在地フィルタ", KeyAction::GlobalLocalSearch);
+        let history_availability =
+            self.pinned_search_availability(crate::ui_pinned_search::PinnedSearchKind::Local);
         egui::Panel::top("search_bar").show(root_ui, |ui| {
             self.gate_main_chrome(ui);
             ui.add_space(2.0);
@@ -16677,10 +16661,19 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     "{local_search_label}: 今開いているフォルダ / ZIP の表示中\n\
                      アイテムを名前やメタ情報で絞り込みます (索引不要・再帰なし)。"
                 ));
-                let mut output = crate::ime_focus::show_singleline(
+                let focus_pending = self.history_input_focus_pending(ctx, crate::ui_pinned_search::PinnedSearchKind::Local.temporary_id());
+                let history_output = crate::ui_history_field::show_singleline(
                     ui,
                     &mut self.search_query,
                     Some(&mut self.search_focus_request),
+                    crate::ui_pinned_search::PinnedSearchKind::Local.temporary_id(),
+                    self.settings.search_input_history.entries(crate::ui_pinned_search::PinnedSearchKind::Local),
+                    crate::ui_history_field::HistoryFieldOptions {
+                        visible: self.settings.save_search_input_history,
+                        availability: history_availability,
+                        focus_pending,
+                        ..Default::default()
+                    },
                     |edit| {
                         edit.id(crate::ui_pinned_search::PinnedSearchKind::Local.temporary_id()).hint_text(
                             r#"現在地のアイテムを名前やメタ情報で絞り込み (AND / -除外 / "…")"#,
@@ -16689,18 +16682,28 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         .min_size(egui::vec2(320.0, 20.0))
                     },
                 );
+                if history_output.focus_requested {
+                    self.claim_pending_text_input_focus(ctx.viewport_id(), crate::ui_pinned_search::PinnedSearchKind::Local.temporary_id(), ctx.cumulative_pass_nr());
+                }
+                let mut output = history_output.text;
                 let _menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
                     &mut output,
                     &mut self.search_query,
                 );
+                let picked = history_output.picked;
+                if let Some(index) = picked {
+                    if let Some(query) = self.settings.search_input_history.entries(crate::ui_pinned_search::PinnedSearchKind::Local).get(index).cloned() {
+                        self.search_query = query;
+                    }
+                }
                 let response = output.response;
 
                 // フォーカス状態を追跡
                 self.search_has_focus = response.has_focus();
 
                 // Enter で検索実行 (IME 変換確定の Enter は除外)
-                if response.lost_focus() && enter_pressed {
+                if picked.is_some() || history_output.submit_requested || (response.lost_focus() && enter_pressed) {
                     self.submit_search_input(ctx, crate::ui_pinned_search::PinnedSearchKind::Local, response.id);
                 }
 
@@ -16837,16 +16840,32 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let mut query_changed = false;
         let mut submit_requested = false;
 
+        let history_availability =
+            self.pinned_search_availability(crate::ui_pinned_search::PinnedSearchKind::Container);
         egui::Panel::top("favsearch_bar").show(root_ui, |ui| {
             self.gate_main_chrome(ui);
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 if !crate::ui_pinned_search::PinnedSearchKind::Container.pinned(&self.settings) {
                     ui.label("コンテナ検索:");
-                    let mut output = crate::ime_focus::show_singleline(
+                    let focus_pending = self.history_input_focus_pending(
+                        ctx,
+                        crate::ui_pinned_search::PinnedSearchKind::Container.temporary_id(),
+                    );
+                    let history_output = crate::ui_history_field::show_singleline(
                         ui,
                         &mut self.favsearch.query,
                         Some(&mut self.favsearch.focus_request),
+                        crate::ui_pinned_search::PinnedSearchKind::Container.temporary_id(),
+                        self.settings
+                            .search_input_history
+                            .entries(crate::ui_pinned_search::PinnedSearchKind::Container),
+                        crate::ui_history_field::HistoryFieldOptions {
+                            visible: self.settings.save_search_input_history,
+                            availability: history_availability,
+                            focus_pending,
+                            ..Default::default()
+                        },
                         |edit| {
                             edit.id(
                                 crate::ui_pinned_search::PinnedSearchKind::Container.temporary_id()
@@ -16858,11 +16877,31 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             .min_size(egui::vec2(320.0, 20.0))
                         },
                     );
+                    if history_output.focus_requested {
+                        self.claim_pending_text_input_focus(
+                            ctx.viewport_id(),
+                            crate::ui_pinned_search::PinnedSearchKind::Container.temporary_id(),
+                            ctx.cumulative_pass_nr(),
+                        );
+                    }
+                    let mut output = history_output.text;
                     let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                         ui,
                         &mut output,
                         &mut self.favsearch.query,
                     );
+                    let picked = history_output.picked;
+                    if let Some(index) = picked {
+                        if let Some(query) = self
+                            .settings
+                            .search_input_history
+                            .entries(crate::ui_pinned_search::PinnedSearchKind::Container)
+                            .get(index)
+                            .cloned()
+                        {
+                            self.favsearch.query = query;
+                        }
+                    }
                     let response = output.response;
 
                     self.favsearch.has_focus = response.has_focus();
@@ -16872,7 +16911,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         query_changed = true;
                     }
                     // Enter で確定的に再実行 (IME 変換確定の Enter は除外)
-                    if response.lost_focus() && enter_pressed {
+                    if picked.is_some()
+                        || history_output.submit_requested
+                        || (response.lost_focus() && enter_pressed)
+                    {
                         submit_requested = true;
                     }
 
@@ -17740,7 +17782,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             } else {
                 Vec::new()
             };
-            let allow_folders = self.subfolder_expansion_available();
+            let allow_folders = self.grid_folders_checkable();
             self.select_grid_cell(idx, ctrl, shift, &display_order, allow_folders);
             self.update_last_selected_image();
             activate = click.paired
@@ -21676,17 +21718,31 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         if checked_indices.len() > 1 {
             let mut lines = vec![format!("{} 個選択", checked_indices.len())];
             if self.settings.thumb_tooltip_show_file_size {
-                let total_size = checked_indices.iter().try_fold(0u64, |total, &idx| {
+                let includes_folder = checked_indices
+                    .iter()
+                    .any(|&idx| matches!(self.items.get(idx), Some(GridItem::Folder(_))));
+                let mut file_indices = checked_indices
+                    .iter()
+                    .copied()
+                    .filter(|&idx| !matches!(self.items.get(idx), Some(GridItem::Folder(_))))
+                    .peekable();
+                let has_files = file_indices.peek().is_some();
+                let total_size = file_indices.try_fold(0u64, |total, idx| {
                     let (_, size) = self.image_metas.get(idx).copied().flatten()?;
                     total.checked_add(u64::try_from(size).ok()?)
                 });
-                if let Some(total_size) = total_size {
+                if let Some(total_size) = total_size.filter(|_| has_files) {
                     lines.push(format!(
-                        "合計サイズ {}",
+                        "合計サイズ {}{}",
                         crate::ui_helpers::format_details_size(
                             total_size,
                             self.settings.details_size_display_mode,
-                        )
+                        ),
+                        if includes_folder {
+                            " (フォルダを除く)"
+                        } else {
+                            ""
+                        }
                     ));
                 }
             }
@@ -23865,6 +23921,44 @@ mod selection_info_tests {
         app.checked = [0usize, 1].into_iter().collect();
         app.settings.thumb_tooltip_show_file_size = true;
 
+        assert_eq!(
+            app.selection_info_content().unwrap().lines,
+            vec!["2 個選択"]
+        );
+    }
+
+    #[test]
+    fn section1732_selection_total_excludes_folders_with_or_without_metadata() {
+        for folder_meta in [None, Some((1, 0)), Some((1, 9999))] {
+            let mut app = setup_app_for_test();
+            app.items = vec![
+                GridItem::Folder(PathBuf::from(r"C:\pics\album")),
+                GridItem::Image(PathBuf::from(r"C:\pics\a.jpg")),
+                GridItem::Image(PathBuf::from(r"C:\pics\b.jpg")),
+            ];
+            app.image_metas = vec![folder_meta, Some((1, 1024)), Some((1, 2048))];
+            app.checked = HashSet::from([0, 1, 2]);
+            app.settings.thumb_tooltip_show_file_size = true;
+            assert_eq!(
+                app.selection_info_content().unwrap().lines,
+                vec!["3 個選択", "合計サイズ 3.0 KB (フォルダを除く)"]
+            );
+
+            app.image_metas[2] = None;
+            assert_eq!(
+                app.selection_info_content().unwrap().lines,
+                vec!["3 個選択"]
+            );
+        }
+    }
+
+    #[test]
+    fn section1732_folder_only_selection_has_no_total_size() {
+        let mut app = setup_app_for_test();
+        app.items = vec![GridItem::Folder("a".into()), GridItem::Folder("b".into())];
+        app.image_metas = vec![None, Some((1, 0))];
+        app.checked = HashSet::from([0, 1]);
+        app.settings.thumb_tooltip_show_file_size = true;
         assert_eq!(
             app.selection_info_content().unwrap().lines,
             vec!["2 個選択"]
@@ -32208,6 +32302,88 @@ mod grid_reclick_open_tests {
     }
 
     #[test]
+    fn section1732_folder_click_selection_preserves_checks_and_includes_shift_range() {
+        for mode in [
+            GridClickSelectionMode::Check,
+            GridClickSelectionMode::Explorer,
+        ] {
+            for drive_list in [false, true] {
+                let mut harness = handler_harness(mode, false, Some(0), false, false);
+                {
+                    let app = &mut harness.state_mut().app;
+                    app.items = vec![
+                        GridItem::Image("a.jpg".into()),
+                        GridItem::Folder("album".into()),
+                        GridItem::Image("b.jpg".into()),
+                    ];
+                    app.items_are_rating_view = !drive_list;
+                    app.items_are_drive_list = drive_list;
+                    app.checked = HashSet::from([0]);
+                    assert!(!app.subfolder_expansion_available());
+                }
+                click_cell(&mut harness, 1, egui::Modifiers::CTRL);
+                assert_eq!(harness.state().activations, 0);
+                if drive_list {
+                    assert!(!harness.state().app.checked.contains(&1));
+                } else {
+                    assert_eq!(harness.state().app.checked, HashSet::from([0, 1]));
+                }
+                // Reset the existing anchor through the real selection handler, then
+                // extend across the Folder row to the image at the other end.
+                click_cell(&mut harness, 0, egui::Modifiers::NONE);
+                click_cell(&mut harness, 2, egui::Modifiers::SHIFT);
+                assert_eq!(harness.state().app.checked.contains(&1), !drive_list);
+                assert_eq!(harness.state().activations, 0);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1732_collection_root_folder_clicks_are_checkable() {
+        for mode in [
+            GridClickSelectionMode::Check,
+            GridClickSelectionMode::Explorer,
+        ] {
+            for modifiers in [egui::Modifiers::CTRL, egui::Modifiers::SHIFT] {
+                // Each case is one selection click, independent of double-click pairing.
+                let mut harness = handler_harness(mode, false, None, false, false);
+                {
+                    let app = &mut harness.state_mut().app;
+                    let folder = app.tmp.path().join("collection-folder");
+                    std::fs::create_dir_all(&folder).unwrap();
+                    crate::app::tests::install_collection_item_for_detached_plan(
+                        app,
+                        &folder,
+                        crate::collection_store::CollectionResolvedKind::Folder,
+                    );
+                    app.collection_ui.set_read_phase_for_test(false);
+                    app.selected = modifiers.shift.then_some(0);
+                    assert!(!app.subfolder_expansion_available());
+                }
+                click_cell(&mut harness, 0, modifiers);
+                // Explorer keeps a lone Ctrl-selected item in `selected`;
+                // Check mode and Shift ranges explicitly check even one item.
+                assert_eq!(
+                    harness.state().app.selected,
+                    Some(0),
+                    "{mode:?} {modifiers:?}"
+                );
+                assert_eq!(
+                    harness.state().app.checked,
+                    if mode == GridClickSelectionMode::Check || modifiers.shift {
+                        HashSet::from([0])
+                    } else {
+                        HashSet::new()
+                    },
+                    "{mode:?} {modifiers:?}",
+                );
+                assert_eq!(harness.state().activations, 0, "{mode:?} {modifiers:?}");
+            }
+        }
+    }
+
+    #[test]
     fn shift_range_plain_click_on_cursor_collapses_without_opening() {
         let mut harness =
             handler_harness(GridClickSelectionMode::Explorer, true, None, false, false);
@@ -34530,7 +34706,7 @@ mod section207_tests {
                                                     );
                                                 }
                                                 layout::FolderTailPart::Input => {
-                                                    layout::address_input(ui, None, |ui| {
+                                                    layout::address_input(ui, None, false, |ui| {
                                                         crate::ime_focus::add_singleline(
                                                             ui,
                                                             &mut path,
@@ -34955,6 +35131,58 @@ mod section207_tests {
     }
 
     #[cfg(windows)]
+    #[test]
+    fn search_nav_book_manager_real_click_keeps_owner_and_exits_only_on_adoption() {
+        for kind in 0..4 {
+            for root_button in [false, true] {
+                let mut env = App::navigation_search_fixture_for_test(kind);
+                let origin = env.tmp.path().join("pre-search");
+                std::fs::create_dir_all(&origin).unwrap();
+                let target = if root_button {
+                    env.book_root_path()
+                } else {
+                    env.active_book_folder_path()
+                };
+                if !root_button {
+                    std::fs::create_dir_all(&target).unwrap();
+                }
+                env.show_book_manager = true;
+                let generation = env.items_generation;
+                let app = Rc::new(RefCell::new(env));
+                let render = Rc::clone(&app);
+                let fonts = Cell::new(false);
+                let mut harness = crate::test_ui::builder()
+                    .with_size(egui::vec2(1200.0, 800.0))
+                    .build_ui(move |root_ui| {
+                        let ctx = root_ui.ctx().clone();
+                        if !fonts.replace(true) {
+                            crate::ui_fonts::configure_fonts(&ctx);
+                            ctx.request_repaint();
+                            return;
+                        }
+                        render.borrow_mut().draw_book_manager(&ctx);
+                    });
+                harness.run();
+                if root_button {
+                    assert!(
+                        !target.exists(),
+                        "opening the shelf must prepare a missing root"
+                    );
+                    harness.get_by_label("本棚フォルダ").click();
+                } else {
+                    harness.get_all_by_label("開く").next().unwrap().click();
+                }
+                harness.run();
+                let mut app = app.borrow_mut();
+                assert!(app.show_book_manager, "the initiating manager stays open");
+                assert!(app.global_search.active || app.favsearch.active || app.tag_view.active);
+                assert_eq!(app.items_generation, generation);
+                app.verify_admitted_user_navigation_for_test(&target, &origin);
+                assert!(app.show_book_manager);
+            }
+        }
+    }
+
     #[test]
     fn address_missing_drive_enter_notifies_and_preserves_search_or_plain_state() {
         let missing_drive = std::iter::once(b'Q')
@@ -35426,7 +35654,7 @@ mod section207_tests {
                         let input = field.rect();
                         let label = harness.get_by_label(&suffix).rect();
                         let left = harness.get_by_label("場所▼").rect();
-                        let right = harness.get_by_label("履歴▼").rect();
+                        let history = harness.get_by_label("入力履歴").rect();
                         let panel = state.borrow().toolbar_content_rect.unwrap();
                         let viewport = harness.ctx.content_rect();
                         let case =
@@ -35459,8 +35687,8 @@ mod section207_tests {
                             "{case}: left/label: {left:?} {label:?}"
                         );
                         assert!(
-                            precedes(input, right),
-                            "{case}: input/right: {input:?} {right:?}"
+                            input.contains_rect(history),
+                            "{case}: suffix inside input: {input:?} {history:?}"
                         );
                         assert!(
                             label.bottom() <= input.top() + 0.5
@@ -35469,7 +35697,7 @@ mod section207_tests {
                                     && input.top() < label.bottom()),
                             "{case}: label/input order: {label:?} {input:?}"
                         );
-                        for rect in [left, label, input, right] {
+                        for rect in [left, label, input, history] {
                             assert!(
                                 panel.expand(0.5).contains_rect(rect),
                                 "{case}: {panel:?} {rect:?}"
@@ -35599,7 +35827,6 @@ mod section207_tests {
                 assert!(precedes(left, input), "left/input: {left:?} {input:?}");
                 for label in [
                     "♡",
-                    "履歴▼",
                     "📌",
                     "サブ展開",
                     "スタック",
@@ -35620,18 +35847,18 @@ mod section207_tests {
                         "width={width} zoom={zoom} row={new_row} input/right={label}: {input:?} {right:?}"
                     );
                 }
-                assert!(input.width() >= crate::ui_toolbar_layout::ADDRESS_INPUT_MIN_WIDTH);
+                let history = harness.get_by_label("入力履歴").rect();
+                assert!(input.contains_rect(history));
+                assert!(
+                    input.width()
+                        - crate::ui_history_field::SUFFIX_WIDTH
+                        - harness.ctx.global_style().spacing.icon_spacing
+                        >= crate::ui_toolbar_layout::FolderBarWidth::with_input().width()
+                );
                 // 矩形が存在するだけでなく、折り返した各行の固定操作に実際に
                 // pointer が届くことを確認する。popup を開かず hover hit test を使う。
-                for label in [
-                    "場所▼",
-                    "♡",
-                    "履歴▼",
-                    "📌",
-                    "サブ展開",
-                    "スタック",
-                    "非表示 321 件",
-                ] {
+                for label in ["場所▼", "♡", "📌", "サブ展開", "スタック", "非表示 321 件"]
+                {
                     let node = harness.get_by_label(label);
                     let id = unsafe {
                         egui::Id::from_high_entropy_bits(
@@ -35985,7 +36212,7 @@ mod section207_tests {
             for (slot, target) in QuickFolderSlotId::ALL.into_iter().zip(&targets) {
                 if history_menu {
                     nav.borrow_mut().clear();
-                    harness.get_by_label("履歴▼").click();
+                    harness.get_by_label("入力履歴").click();
                     harness.run();
                     harness.get_by_label(target.to_str().unwrap()).click();
                     harness.run();

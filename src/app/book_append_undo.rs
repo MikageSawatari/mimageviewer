@@ -515,6 +515,7 @@ mod tests {
                 source_context: receipt.source_context,
                 accepted_revision: receipt.accepted_revision,
                 target_folder: receipt.files.folder.clone(),
+                skipped_containers: 0,
                 observations,
             },
         });

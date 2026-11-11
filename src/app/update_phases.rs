@@ -956,7 +956,7 @@ impl App {
             let deselect = self.keymap.pressed_action(ctx, KeyAction::GridDeselect);
             if ctrl_a {
                 for &idx in &self.visible_indices {
-                    if self.items.get(idx).is_some_and(|it| it.is_checkable()) {
+                    if self.grid_item_can_be_checked(idx) {
                         self.checked.insert(idx);
                     }
                 }
@@ -1359,7 +1359,7 @@ impl App {
                     }
                 }
             } else if let Some(p) = open_folder_nav {
-                Some(p)
+                self.dispatch_favorite_navigation(p)
             } else if let Some(action) = context_nav {
                 // context_nav が実際に勝ったときだけ source surface の終了と typed
                 // destination/selection の dispatch を適用する。show_context_menu 内で

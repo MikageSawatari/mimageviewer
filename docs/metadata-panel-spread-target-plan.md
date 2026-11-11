@@ -1,5 +1,62 @@
 # §1.712 情報パネルの見開き対象
 
+## GPS 欄からの地図起動（§1.759）
+
+共通の `draw_exif_panel` は、同じ pass の `info_idx` から得た `exif_info` のみで
+GPS ボタンを描き、クリック時に直ちに `external_links::open_url` へ渡す。
+前フレームの座標や pending を保持しない単純化を採用し、対象照合の追加状態・modal・専用窓経路は作らない。
+取得済みキャッシュだけを読み、同期ファイル読取り・decode・GPU upload は追加しない。
+
+`exif_reader` は rexif の数値 URational 3 要素と参照 ASCII タグから座標を検証する。
+表示値は度分秒・度分・十進度に丸められるため、文字列から復元しない。
+N/S と E/W の軸、参照欠損、各要素の有限性、度の非負、分秒 [0,60)、緯度90／経度180の上限を検証し、
+検証済み座標を EXIF cache に保存する。表示フィルターで緯度・経度の両方が残る場合だけ利用する。
+参照タグの表示設定は座標の有効性を変えない。参照の元タグそのものが無ければ無効。
+参照値の前後のASCII空白は除去し、緯度N/S・経度E/Wの1文字と完全一致で判定する。
+小文字・方位の語・軸違い・ASCII以外の空白は受け付けない。
+MCP `project_exif` もこれを共用し、GPS 許可の gate と altitude の既存投影は維持する。
+
+URL の写真由来情報は座標のみ。十進度は小数7桁・指数なし・負のゼロなしで組み立てる。
+失敗は固定文言の既存 warning feedback とし、URLを含み得るエラー原文を捨てる。診断ログは足さない。
+ブラウザー起動の関数注入で headless 操作を観測し、テストからOS／ネットワークへ出さない。
+
+### §1.759 自動検証（2026-11-11）
+
+対象は `feat-759-gps-maps`、base `2d2f8fd72` の未コミット差分。
+初回の対象7件は6成功・1失敗で、非表示条件の純描画fixtureに本体フォントの登録がなく、
+既存見出しの `▼` が描けなかった。fixtureの初期化を揃えて修正後、EXIF・外部リンク・
+情報対象・MCP情報投影・EXIF検索本文の関連57件がすべて成功した（8.665秒）。
+途中の29件成功はMCP全件を含まないため、最終57件へ件数を加算しない。
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/exif_reader::tests::|external_links::tests::|metadata_info_target_tests::|agent_ipc::item_info::tests::|append_exif_can_skip/)'
+$env:UPDATE_SNAPSHOTS = '1'
+cargo test -p mimageviewer --test ui_snapshot exif_gps_maps_dark
+Remove-Item Env:UPDATE_SNAPSHOTS
+cargo test -p mimageviewer --test ui_snapshot exif_gps_maps_dark
+```
+
+PNGの生成と通常比較は各1/1成功。300×165、12,267 bytesの新規1枚を目視し、
+GPS欄の値とボタンの文字欠け・重なりがないことを確認した。
+`cargo check -p mimageviewer --bin mimageviewer-core` は exit 0（1分29秒、下記の sandbox 用 native 指定あり）。
+`cargo fmt`（引数なし）後の `cargo fmt --check` は成功、
+`python scripts/check_ui_glyphs.py` は0件、`python scripts/check_site_cards.py` は53カード・違反0件。
+
+実装担当の sandbox では turbojpeg の CMake/MSBuild が止まったため、同一版の既存成果物を指して検証した。
+設計担当が通常環境 (`MSBUILDDISABLENODEREUSE=1`) で同じ対象を再実行した結果は下の「検収」に記す。
+
+テスト実行体の横には指定のFFmpeg DLL 6本を実体コピーした。
+実行ログは `target/gps-maps-verification/target-gps-*.log`。最終結果は
+`tests-final`（57件）、`snapshot-update`／`snapshot-final`（各1件）、`check-final` にある。
+全体gate・build-dev・コミット・実機および実ブラウザー確認は今回の担当範囲外で、ClaudeCodeへ引き継ぐ。
+
+独立レビューP2/P3の追補は `efa3f62a4` 上の未コミット差分で検証した。
+前後のASCII空白を持つ実TIFF参照値とMCPのGPS許可あり／なしの回帰3件を追加し、
+起動失敗通知は各modeの3クリックに対する固定文言3件との完全一致へ変更した。
+上記と同じ関連filterで60/60成功（5.095秒）、`cargo fmt` → `cargo fmt --check` はexit 0。
+前回と同じ検証用native環境指定を使い、リポジトリのビルド設定は変更していない。
+ログは `target/gps-maps-verification/review-fixes-related.log`。製品起動・コミットは行っていない。
+
 ## 原因と不変条件
 
 右パネルの情報タブは、見開きでも各セクションが直接`fullscreen_idx`を読んでいた。

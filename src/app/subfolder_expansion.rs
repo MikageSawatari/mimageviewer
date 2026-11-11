@@ -1635,12 +1635,15 @@ fn spawn_subfolder_expansion_prepare(
 }
 
 impl App {
+    pub(crate) fn grid_folders_checkable(&self) -> bool {
+        !self.items_are_drive_list
+    }
+
     pub(crate) fn grid_item_can_be_checked(&self, idx: usize) -> bool {
         let Some(item) = self.items.get(idx) else {
             return false;
         };
-        item.is_checkable()
-            || (self.subfolder_expansion_available() && matches!(item, GridItem::Folder(_)))
+        crate::grid_item::grid_item_checkable(item, self.grid_folders_checkable())
     }
 
     pub(crate) fn selected_subfolder_expansion_roots(&self) -> Vec<PathBuf> {

@@ -17343,8 +17343,8 @@ pub struct App {
     pub(crate) edit_bundle_apply_pending: Option<crate::edit_bundle::EditBundleApplyPending>,
     /// 複数ページの貼り付け / リセット。確認・実行・キャンセルを1つの型で所有する。
     pub(crate) edit_bundle_bulk_pending: Option<crate::edit_bundle_bulk::BulkPageEditPending>,
-    /// 削除対象のファイル / フォルダパスリスト
-    pub(crate) delete_targets: Vec<(usize, PathBuf)>,
+    /// 対象決定時の実パスとフォルダ種別を保持する削除要求。
+    pub(crate) delete_targets: Vec<crate::ui_dialogs::context_menu::DeleteTarget>,
     /// 削除確認ダイアログの文言。ドライブ種別 / ゴミ箱設定 / 容量判定を毎フレーム
     /// 繰り返さないよう、ダイアログ単位でキャッシュする。
     pub(crate) delete_confirm_label: Option<String>,
@@ -24084,6 +24084,22 @@ impl App {
         ));
     }
 
+    pub(crate) fn history_input_focus_pending(
+        &self,
+        ctx: &egui::Context,
+        widget: egui::Id,
+    ) -> bool {
+        self.pending_text_input_focus.get().is_some_and(|claim| {
+            claim.viewport == ctx.viewport_id()
+                && claim.widget_id == widget
+                && claim.issued_pass.saturating_add(1) == ctx.cumulative_pass_nr()
+                && ctx
+                    .memory(|memory| memory.focused())
+                    .is_none_or(|focused| focused == widget)
+                && crate::ui_history_field::is_open_for(ctx, widget)
+        })
+    }
+
     pub(crate) fn clear_pending_text_input_focus(&self) {
         let transition = crate::keyboard_input::transition_pending_focus_claim(
             self.pending_text_input_focus.get(),
@@ -25965,6 +25981,33 @@ impl App {
             destination,
             facet_mode,
         } = adoption;
+        // A search child has the visible child's facet route, while its transparent
+        // history location is the pre-search origin. Keep the captured child route
+        // for admission; only successful departure records the origin's saved route.
+        let search_exit_history_source =
+            if matches!(
+                navigation.history,
+                MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView { .. })
+            ) && (self.global_search.active || self.favsearch.active || self.tag_view.active)
+            {
+                navigation.source_location.as_ref().map(|source| {
+                    let route = self
+                        .top_level_grid_view
+                        .return_origin()
+                        .filter(|origin| {
+                            FolderNavHistoryTarget::from_restore(&origin.restore).is_some_and(
+                                |target| Self::folder_nav_targets_eq(&target, &source.location),
+                            ) && !origin.route.0.is_empty()
+                        })
+                        .map(|origin| origin.route.clone())
+                        .unwrap_or_else(|| {
+                            FacetRoute::root(Self::facet_scope_for_location(&source.location))
+                        });
+                    FolderNavHistoryEntry::new(source.location.clone(), route)
+                })
+            } else {
+                None
+            };
         let session_before = self.grid_scroll.session();
         let route_changes = self.facet_navigation.route() != &destination.route;
         let search_reprojection = navigation.source_location.is_none()
@@ -26051,7 +26094,7 @@ impl App {
             MainHistoryOperation::Direct(purpose) => {
                 self.record_folder_nav_entry_transition(
                     destination,
-                    navigation.source_location,
+                    search_exit_history_source.or(navigation.source_location),
                     &purpose,
                 );
                 if let DirectNavigationPurpose::ExitTemporaryView { selection } = purpose {
@@ -51915,9 +51958,9 @@ impl App {
     pub(crate) fn start_delete_files(
         &mut self,
         ctx: &egui::Context,
-        paths: Vec<std::path::PathBuf>,
+        targets: Vec<crate::ui_dialogs::context_menu::DeleteTarget>,
     ) {
-        if paths.is_empty()
+        if targets.is_empty()
             || self.delete_pending.is_some()
             || self.metadata_cleanup_pending.is_some()
             || self.delete_purge_retry_pending.is_some()
@@ -51930,6 +51973,12 @@ impl App {
         if !self.admit_book_append_followup_mutation() {
             return;
         }
+        // 確認待ち・メニュー待ちの間に items が変わっても、対象決定時の範囲を維持する。
+        let source_scopes = targets.iter().map(|target| target.source_scope()).collect();
+        let paths = targets
+            .into_iter()
+            .map(|target| target.into_path())
+            .collect::<Vec<_>>();
         self.invalidate_xmp_rating_reads_for_removed_paths(&paths);
         self.release_viewer_surfaces_for_removed_paths(ctx, &paths, "delete_target_path");
         // 削除中に items を差し替える恐れのある in-flight pending を停止。poll_delete_pending
@@ -51942,19 +51991,6 @@ impl App {
             p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         self.global_search.pending = None;
-        let source_scopes = paths
-            .iter()
-            .map(|path| {
-                let is_tree = self.items.iter().any(|item| {
-                    matches!(item, GridItem::Folder(candidate) if crate::folder_tree::path_eq(candidate, path))
-                });
-                if is_tree {
-                    crate::delete_worker::DeleteSourceScope::Tree(path.clone())
-                } else {
-                    crate::delete_worker::DeleteSourceScope::Exact(path.clone())
-                }
-            })
-            .collect();
         let stack = self.capture_stack_deletion();
         self.delete_pending = Some(crate::delete_worker::spawn_with_stack(
             paths,
@@ -55053,7 +55089,7 @@ impl App {
         sources: Vec<crate::books::BookPageSource>,
     ) {
         let book_name = self.active_book_name();
-        self.start_book_append_to_named(ctx, book_name, sources);
+        self.start_book_append_to_named(ctx, book_name, sources, 0);
     }
 
     /// `start_book_append` の本名指定版 (ツールバーのピン留め本へ追加する用)。
@@ -55062,6 +55098,7 @@ impl App {
         ctx: &egui::Context,
         book_name: String,
         sources: Vec<crate::books::BookPageSource>,
+        skipped_containers: usize,
     ) {
         if sources.is_empty() {
             self.show_feedback_warning("追加するページがありません".to_string());
@@ -55082,6 +55119,7 @@ impl App {
             source_context: self.projected_viewer_context_id(),
             accepted_revision: self.book_append_undo_revision,
             target_folder: crate::books::book_folder(&root, &book_name),
+            skipped_containers,
             observations: Default::default(),
         };
         let data_dir = crate::data_dir::get();
@@ -63206,6 +63244,7 @@ impl App {
     pub(crate) fn shortcuts_blocked_by_text_input(&self, ctx: &egui::Context) -> bool {
         self.keyboard_owner_for_pass(ctx)
             .blocks_legacy_main_shortcuts()
+            || crate::ui_history_field::owns_pending_focus(ctx)
     }
 
     pub(crate) fn collect_shell_clipboard_paths(
@@ -101160,8 +101199,19 @@ impl App {
         // release/中断の各境界で対象キーのみ無効化済み。
         self.update_thumb_adjust_drag_state();
 
-        let escape_input_owner = self.capture_search_escape_input(ctx);
         let mut search_escape_claim = pinned_search::EscapeClaim::for_frame(self);
+        let history_escape_taken = crate::ui_history_field::take_escape(
+            ctx,
+            self.any_dialog_open() || self.common_modal_dialog_open(),
+        );
+        if history_escape_taken {
+            search_escape_claim.claim(ctx);
+        }
+        let escape_input_owner = if history_escape_taken {
+            None
+        } else {
+            self.capture_search_escape_input(ctx)
+        };
 
         // ── メニューバー ─────────────────────────────────────────────
         let (fav_nav, _) = self.render_menubar(ui);
@@ -101264,6 +101314,7 @@ impl App {
 
         let (folder_pane_nav, folder_pane_rect) = self.render_main_bars(ui, &mut pre_grid_perf);
         self.route_search_escape(ctx, escape_input_owner, &mut search_escape_claim);
+        self.settle_search_input_departure(ctx, history_escape_taken);
         self.record_search_input_focus(ctx);
         // グローバルな一覧ホイール処理は、メニュー/ツールバー/アドレス/ファセット等の
         // popup を描いた後、グリッド描画の直前で行う。早すぎると popup 内 ScrollArea の
@@ -104312,6 +104363,10 @@ mod original_material_tests;
 pub(crate) mod paged_prefetch_tests;
 #[cfg(test)]
 pub(crate) mod paint_record_test_support;
+#[cfg(test)]
+mod search_nav_book_tests;
+#[cfg(test)]
+mod search_nav_entry_inventory_tests;
 #[cfg(test)]
 mod search_nav_pane_frame_tests;
 #[cfg(test)]

@@ -1380,7 +1380,7 @@ pub(super) fn draw_recycle_bin_delete_confirmation_setting(
     );
     ui.label(
         egui::RichText::new(
-            "ON にすると、ごみ箱へ移せる項目は確認せずに移動を始めます。フォルダや ZIP / PDF /\
+            "ON にすると、ごみ箱へ移せる項目は確認せずに移動を始めます。ただしフォルダを含む場合は必ず確認します。ZIP / PDF /\
              対応アーカイブを削除すると、中にあるすべてのファイルをごみ箱へ移します。1 つの項目に、\
              一覧に表示されていない多数のファイルが含まれる場合があります。ごみ箱に残っている間は\
              元に戻せます。完全に削除される可能性がある場合は、この設定が ON でも確認します。",
@@ -2729,6 +2729,9 @@ fn key_action_detail_label(action: KeyAction) -> &'static str {
 }
 
 fn ring_action_detail_label(action: &RingActionId, context: RingShortcutContext) -> &'static str {
+    if let Some(key_action) = action.saved_group_key_action() {
+        return key_action_detail_label(key_action);
+    }
     match action {
         RingActionId::ImagePageOverview => key_action_detail_label(KeyAction::FsPageOverviewToggle),
         RingActionId::GridSelectAll => "表示中のチェック可能な項目をすべてチェックする",
@@ -2766,6 +2769,12 @@ fn ring_action_detail_label(action: &RingActionId, context: RingShortcutContext)
 
 fn ring_bindings_for_key_action(action: KeyAction) -> Vec<(RingShortcutContext, RingActionId)> {
     let mut out = Vec::new();
+    if let Some(ring_action) = RingActionId::for_saved_group_key_action(action) {
+        for &context in RingShortcutContext::all() {
+            push_ring_binding_if_available(&mut out, context, ring_action.clone());
+        }
+        return out;
+    }
     if action == KeyAction::FsPageOverviewToggle {
         push_ring_binding_if_available(
             &mut out,
@@ -11669,6 +11678,40 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
             );
         }
     });
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("検索欄の入力履歴").strong());
+    anchored(
+        ui,
+        state,
+        "resume/search-input-history-enabled",
+        |ui, state| {
+            ui.checkbox(
+                &mut state.settings.save_search_input_history,
+                "検索欄の入力履歴を保存する",
+            );
+            ui.label(egui::RichText::new(
+            "コンテナ検索・現在地の絞り込み・アイテム検索・Everything 検索で実行した検索語を、欄ごとに最近の 20 件まで PC 内に保存し、入力欄の▼か ↓ キーで選び直せます。オフにすると、今の入力履歴も消去します (設定の自動バックアップには、しばらく残ります)。",
+        ).weak());
+        },
+    );
+    anchored(
+        ui,
+        state,
+        "resume/search-input-history-clear",
+        |ui, state| {
+            let count = state.search_input_history_entry_count;
+            ui.label(format!("入力履歴: {count} 件を記憶。"));
+            if count > 0 && ui.button("検索欄の入力履歴をすべて消去").clicked() {
+                state.search_input_history_clear_requested = true;
+            }
+            if let Some(message) = &state.search_input_history_clear_result {
+                ui.label(egui::RichText::new(message).weak());
+            }
+        },
+    );
 }
 
 pub(super) fn page_susie_plugins(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -12426,6 +12469,65 @@ mod tests {
         assert!(command_key_labels_match_filter(&key_labels, "f11"));
         assert!(command_key_labels_match_filter(&key_labels, "numpad9"));
         assert!(!command_key_labels_match_filter(&key_labels, "F12"));
+    }
+
+    #[test]
+    fn saved_group_ring_assignments_share_key_rows_and_descriptions() {
+        let mut state = zoom_key_editor_state();
+        let keymap = crate::keymap::Keymap::default();
+        let actions: Vec<_> = RingActionId::available_for_context(RingShortcutContext::Grid)
+            .into_iter()
+            .filter(|action| action.saved_group_key_action().is_some())
+            .collect();
+        assert_eq!(actions.len(), 44);
+        for ring in actions {
+            let key = ring.saved_group_key_action().unwrap();
+            let bindings = ring_bindings_for_key_action(key);
+            assert_eq!(bindings.len(), 3);
+            for &context in RingShortcutContext::all() {
+                assert!(bindings.contains(&(context, ring.clone())));
+                assert!(super::ring_action_has_key_action(context, &ring));
+                assert_eq!(ring.label_for_context(context), key.description());
+                assert_eq!(
+                    super::ring_action_detail_label(&ring, context),
+                    super::key_action_detail_label(key),
+                );
+            }
+        }
+        let ring = RingActionId::OpenCollection1;
+        for &context in RingShortcutContext::all() {
+            state.settings.ring_shortcuts.profile_mut(context).slots[0] = ring.clone();
+            state.settings.ring_shortcuts.set_right_drag_mode(
+                super::right_drag_context_for_ring_context(context),
+                crate::ring_shortcut::RightDragMode::RingShortcut,
+            );
+        }
+        let rows = super::command_overview_rows(&state, &keymap, &Default::default());
+        let row = rows
+            .iter()
+            .find(|row| {
+                matches!(
+                    row.target,
+                    super::OperationOverviewTarget::Key(KeyAction::GridOpenCollection1)
+                )
+            })
+            .unwrap();
+        for category in ["リング", "パッド"] {
+            let labels = &row
+                .assignments
+                .iter()
+                .find(|(name, _)| *name == category)
+                .unwrap()
+                .1;
+            assert_eq!(labels.len(), 3, "{category}: {labels:?}");
+            for &context in RingShortcutContext::all() {
+                assert!(labels.iter().any(|label| label.contains(context.label())));
+            }
+        }
+        assert!(!rows.iter().any(|row| matches!(
+            &row.target,
+            super::OperationOverviewTarget::Ring { action, .. } if *action == ring
+        )));
     }
 
     #[test]

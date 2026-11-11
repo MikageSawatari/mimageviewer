@@ -11,6 +11,26 @@ use crate::ui_dialogs::context_menu::{
 use crate::ui_main::{AddressBarNav, LocationJumpTarget};
 
 impl App {
+    /// The manager owns this button's admission. Keep that dialog open while preparing
+    /// the destination; its own modal is not a competing navigation blocker.
+    pub(crate) fn open_book_manager_target(&mut self, path: std::path::PathBuf) {
+        if self.global_search.active || self.favsearch.active || self.tag_view.active {
+            if !self.location_jump_snapshot_blocked() {
+                if crate::folder_tree::path_eq(&path, &self.book_root_path()) {
+                    if let Some(root) = self.prepare_books_root_for_navigation() {
+                        self.begin_location_jump_to_physical(root);
+                    }
+                } else {
+                    self.begin_location_jump_to_physical(path);
+                }
+            }
+        } else if crate::folder_tree::path_eq(&path, &self.book_root_path()) {
+            self.open_books_root();
+        } else {
+            self.load_folder(path);
+        }
+    }
+
     pub(super) fn location_jump_snapshot_blocked(&mut self) -> bool {
         if self.is_snapshot_active() {
             self.show_feedback_warning(
@@ -566,15 +586,16 @@ mod tests {
         );
         let search_origin = app.capture_search_open_origin();
         let history = app.folder_nav_history_snapshot();
-        let selected_path = app.items[selected.unwrap()]
-            .drag_source_path()
-            .unwrap()
-            .to_path_buf();
+        let delete_targets = vec![
+            crate::ui_dialogs::context_menu::DeleteTarget::from_grid_item(
+                &app.items[selected.unwrap()],
+            )
+            .unwrap(),
+        ];
         let _owner = app.keyboard_owner_for_pass(&ctx);
         app.handle_delete_key(&ctx);
         assert!(app.show_delete_confirm);
         assert_eq!(app.modal_dialog_block_reason(), Some("delete_confirm"));
-        let delete_targets = vec![(selected.unwrap(), selected_path)];
         assert_eq!(app.delete_targets, delete_targets);
         for (lane, candidate) in candidates {
             if lane == 3 {

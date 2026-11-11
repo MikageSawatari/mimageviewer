@@ -399,6 +399,7 @@ fn book_shelf_root_change_keeps_captured_mutation_receiver() {
                 source_context: app.projected_viewer_context_id(),
                 accepted_revision: app.book_append_undo_revision,
                 target_folder: app.book_root_path().join("A"),
+                skipped_containers: 0,
                 observations: Default::default(),
             }
         } else {
@@ -493,6 +494,7 @@ fn book_shelf_first_order_edit_waits_for_pending_and_unadopted_book_results() {
                     source_context: app.projected_viewer_context_id(),
                     accepted_revision: app.book_append_undo_revision,
                     target_folder: app.book_root_path().join("A"),
+                    skipped_containers: 0,
                     observations: Default::default(),
                 }
             } else {
@@ -719,6 +721,7 @@ fn book_shelf_returned_book_append_then_order_conflict_reloads_and_next_save_suc
                 source_context: app.projected_viewer_context_id(),
                 accepted_revision: app.book_append_undo_revision,
                 target_folder: root.join("B"),
+                skipped_containers: 0,
                 observations: Default::default(),
             },
             shelf_scope: Some(app.shelf_scope()),

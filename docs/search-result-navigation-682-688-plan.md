@@ -1012,6 +1012,282 @@ Cargo は `MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=4`。
 - `.\scripts\build-dev.ps1`: 成功 (`target\dev-runtime\mimageviewer-core.exe`、2026-11-11 23:30)。
 - 実機確認の記録はまだ無い。
 
+### 8.13 §12 の入口再監査・実装と検証 (2026-11-12、未完了・設計判断待ち)
+
+§11 の記録・表は当時の判断として §8.11 に残す。以下は §12 の決定による再監査で、実行時の追加観測ではない。
+最終実装・独立レビュー・自動検証の証跡は担当から受領後に本節へ追記する。未記載の gate を成功と扱わない。
+
+**停止状態:** 関連 gate の既存 detached 所有回帰が採用後に失敗し、検索 owner の退役と元 context の移譲順序の問題を
+自動検証で確認した。§2.3 / detached 憲法 §2 の構造合意が必要な境界に達したため、機能コード作業を停止する。
+全体 GREEN・§12 完了・全体受入は未達。作業途中の差分と失敗を保持し、registry・述語・viewport は変更していない。
+
+#### 旧監査で漏れた理由と列挙基準の変更
+
+- §8.11 は「場所ジャンプ・お気に入り・本棚 root」を主に数え、保存済みの本を開く `saved_group_actions` と製本管理の
+  `load_folder` を root とは別の操作として残存扱いにした。表から存在が消えていたのではなく、
+  **本の open も利用者が別の場所へ移る入口であるという基準を適用しなかった**。§1.733 で追加した
+  リング等も同じ saved-group 入口へ来るため、同じ漏れを共有する。旧表の「残存」「今回の承認範囲外」は歴史的記録であり、
+  本・コレクションと「フォルダを開く」に関する現行の扱いは下表と §12 が上書きする。
+- source 上、旧 `adopt_saved_group_ready` の本は `load_folder_with_scan_owned(..., OpenRequestOwner::Navigation, ...)` を使う。
+  `capture_main_list_navigation` は検索中の通常 `Direct(Navigation)` を `Restore` にするので、検索を明示終了せず子へ進み、
+  検索前から移動先への通常履歴を作らない。加えて `history_nav_availability` は検索 owner が active の間は履歴入力を拒否する。
+  **履歴の記録が無いことと、残った検索 owner による履歴受付拒否の両方**が関係する。
+  これはサブ PC 担当の「本は開くが検索表示が残り、← が効かない」という観測と整合するコード経路で、
+  タイトルだけの描画不良として扱わない。修正後の採用/履歴の自動検証は下記へ別途記録する。
+- 今回は loader の種類や行き先の実体（実フォルダ/本/合成一覧）で数を減らさず、
+  **利用者が検索結果の外の場所・保存済み本・コレクションを明示して開く入口**を producer から consumer・成功採用まで数える。
+  登録済み `KeyAction` / `MenuCommandId`、動的メニュー/ツールバー、管理画面、リング等、固定ペイン操作を別々に照合する。
+  管理・追加・追加先の選択だけの操作と、検索結果の子/帰路、外部アプリ、内部復元は理由付きで区別する。
+
+#### 利用者入口の全列挙（§12 着手時の共有作業ツリーを source inspection）
+
+番号の範囲は登録済み全番号を含む。以下の「成功時終了」は 4 種の検索が active の場合だけで、
+失敗・取消・stale は検索結果と選択を保持し、検索なしの既存入口/順序は維持する。
+本棚フォルダの実メニュー名は「製本」→「本棚フォルダを開く」で、「本棚」というトップメニューではない。
+
+| 利用者入口・登録 | producer → consumer の照合先 | 現行の分類・§12 の扱い |
+| --- | --- | --- |
+| お気に入りの番号/前後キー、動的「お気に入り」メニュー、ツールバーのボタン/ドロップダウン、パッド Start 一覧 | `KeyAction::GridOpenFavorite1..20` / favorite 前後、`apply_ring_favorite_slot` / `apply_favorite_cycle_nav` / `confirm_gamepad_favorite_picker`、`render_menubar` / `render_toolbar` → `dispatch_favorite_navigation` | §11 の成功時終了を維持 |
+| お気に入りのリング・ジェスチャ・マウスボタン・パッド X リング | `RingActionId` の favorite slot / cycle → 同じ favorite helper、通常 frame / native MAIN の total consumer | §11 の成功時終了を維持 |
+| ドライブ文字/現在 drive root/drive 切替、場所▼の固定項目・整理先、場所リスト | `GridOpenDriveC..Z` / `GridOpenCurrentDriveRoot` / `GridSwitchDriveC..Z` / `GridOpenLocation*`、`apply_ring_location_action` / `confirm_gamepad_location_picker`、場所▼ → `LocationJump` | 成功時終了を維持。Bookmarks は既存 bookmark browser の入口で処理 |
+| 「製本」→本棚フォルダを開く、場所▼/場所キー/リング等の本棚 root | `MenuCommandId::BooksOpenRoot`、`GridOpenLocationBooksRoot` → `LocationJumpTarget::BooksRoot` | §11 の成功時終了を維持。検索なしのメニュー即時 open を維持 |
+| 「製本」→追加先の本を開く、ツールバーの追加先の本を開く、同キー | `MenuCommandId::BooksOpenActiveBook` / `KeyAction::GridOpenActiveBook` → `open_active_book_from_action` → `apply_saved_group_key_action` | **§12 追加**。本の成功採用で検索終了、通常の本表示と履歴へ |
+| 本1〜20、前/次の本（管理順） | `GridOpenBook1..20` / `GridBookPrev` / `GridBookNext`、対応する `RingActionId::OpenBook1..20` / `BookPrev` / `BookNext` → `saved_group_key_action` → 共通 saved-group 受付 | **§12 追加**。キー・リング・ジェスチャ・一覧のマウスボタン・パッド X リングを同じ採用へ |
+| ツールバーの固定した本 | `toolbar_book_pin_open` → `toolbar_fav_nav` → favorite helper | §9 の成功時終了を維持。追加先の本とは別 producer として照合 |
+| 「製本の管理」の追加先を開く・本棚フォルダ・各行の「開く」 | book manager の `actions.open` → root または指定した本の準備/採用 | **§12 追加**。管理画面自身の modal は受理済みボタンの入口として扱い、自己 modal を理由に拒否しない |
+| 「コレクション」→追加先を開く、ツールバーの「開く」/固定ボタン、管理画面の「開く」 | `MenuCommandId::CollectionsOpenTarget`、`CollectionToolbarIntent::Open`、`CollectionUiAction::Open` → navigation/manager の collection open | **§12 統一**。既存 History prepare の成功採用で検索終了、失敗・取消は元結果保持 |
+| コレクション1〜20・前/次・追加先キー | `GridOpenCollection1..20` / `GridCollectionPrev` / `GridCollectionNext` / `GridOpenCollectionTarget` → saved-group の `CollectionOpen` / `SavedGroupReady` → collection open | **§12 統一**。一覧準備待ちと ready 両経路を同じ検索終了契約へ |
+| コレクション番号/前後のリング・ジェスチャ・一覧のマウスボタン・パッド X リング | `RingActionId::OpenCollection1..20` / `CollectionPrev` / `CollectionNext` → `saved_group_key_action` → 同じ入口 | **§12 統一**。追加先/管理用の新 RingAction は増やさない |
+| 動的スマートフォルダのメニュー/固定ツールバー/管理画面/パッド Start のスマートフォルダタブ | `ui_main.rs` の menu/toolbar、`smart_folder_editor`、`confirm_gamepad_favorite_picker` の smart-folder 分岐 → `open_smart_folder_staged` → `RootReady` 採用 | 独立した合成一覧の既存成功採用入口。採用時に検索 owner を退役する。今回の製品変更なし。`SmartFoldersNew/AddCurrent/Manage` 自体は作成/管理で、保存済み定義の open と区別 |
+| ファイル→フォルダを開く、GlobalOpenFolder キー | `MenuCommandId::FileOpenFolder` / `KeyAction::GlobalOpenFolder` → open-folder dialog → `open_folder_nav` → favorite helper | **§12 追加**。検索中だけ成功時終了、検索なしの旧 Direct を維持 |
+| アドレス Enter（パス/空欄/本棚/本棚内の本） | `ui_main.rs` のアドレス入力確定 → `AddressInput` → `dispatch_address_input` | §10/§11 の成功時終了と無効 path 通知、既存 parent fallback を維持 |
+| ペインのクリック/Enter/ゲームパッド/カーソル移動後の閉じる | `start_user_folder_pane_open` → `ExitTemporaryView` scan | §10/§11 の成功時終了・入力所有を維持。内部 scan 呼出と区別 |
+| 実際の親へ、結果の「フォルダに移動」 | `GridPhysicalParentFolder` / `grid_parent`、context menu の jump request → 共通明示 jump | 既存成功時終了を維持 |
+| 閲覧履歴/評価一覧/ブックマークの一覧を開く | `FileReadingHistory`、場所操作、bookmark browser → 各一覧の採用 | 既存の一覧採用で検索を終了。履歴への積み方と戻り先は各既存契約を維持 |
+| 本/コレクション/お気に入りの管理画面を開く、追加先だけを選ぶ、追加/固定/並べ替え | `GridManage*` / `BooksManage` / `CollectionsManage` / `FavoritesEdit`、各管理 action | 表示先へ移らないため、管理を開いただけで検索を終了しない。上記の管理画面内「開く」は別扱い |
+| A/B、フォルダ履歴 Back/Forward、アドレス欄の最近の場所 ▼/↓ | workspace/history helper とアドレス履歴選択 | 検索 active 中は既存の無効化/拒否を維持。検索入力欄の検索履歴 ▼/↓とは別機能 |
+| 検索結果の本/フォルダ、Everything PhysicalChild、検索内の親/結果/前後・一覧順移動 | grid/archive open、各検索 owner の帰路と `FsListOrderPrev/Next` | **検索継続**。検索結果の外への明示 open とは区別する |
+| 場所▼のクリップボード取り込み先、取り込み通知「表示」 | intake の既存 pane open | §8.11 の残存記録を維持。今回の本/コレクション・登録済み KeyAction/MenuCommandId の修正とは別経路 |
+| 取り込み出力フォルダ/ごみ箱/ログ/手引き、Explorer で表示、外部ツール | `FileOpenCaptureFolder` / `FileOpenRecycleBin` など、外部 open | Explorer 等の外部表示であり、アプリ内の場所を移さない |
+| 起動復元、single-instance Activation、画像フォルダ ZIP 化等の内部 open | `startup_ops`、保存済みグループ復元/内部 pane scan | §10 で区別した内部呼出・外部 open の既存契約を維持。利用者の保存済み本を開く Action と混同しない |
+
+#### 実装と所有境界（実装担当の報告・source 照合、設計 conflict で検証未完了）
+
+- `SavedGroupOpenTransition.source` の旧 lease を、`SavedGroupOpenSource::{Plain(SmartFolderSourceLease), Search(MainListNavigation)}`
+  に置き換えた。検索中は**受付時**に `Direct(ExitTemporaryView)`・surface proof・switch sequence を既存 navigation owner へ捕捉し、
+  poll / ready / adopt で current を照合する。同じ rows/検索 owner を保ったまま switch epoch だけ進んだ場合も古い要求を採用しない。
+  別 pending field や実行時 bool は足さず、Plain は従来の lease・cached `CollectionOpen`・loader を使う。
+- Book は捕捉済み navigation を `open_user_book_with_scan` から既存の prepared scan loader へ運び、
+  Collection は `open_collection_grid_with_search_navigation` から既存 `CollectionHistoryTransition` prepare へ運ぶ。
+  検索の退役・通常タイトル/アドレスへの切替・検索前からの履歴は、同じ navigation の成功採用で行う。
+  入力受付、番号解決、scan/prepare の開始や ready だけでは検索を閉じない。失敗・取消・stale は結果/選択を残す。
+- 一般の collection open は検索中だけ共通 location admission + prepare へ通す。manager の「開く」は自身の modal 内で
+  受理済みのボタンなので、snapshot/document gate を通して同じ prepare へ進め、自分の modal に拒否させない。
+  Book manager の受理済みボタンも snapshot gate から共通 jump 準備へ進む。本棚 root は既存
+  `prepare_books_root_for_navigation` を使い、未作成 root の作成・本棚 structural operation 中の拒否を維持する。
+  Collection は Snapshot が owning surface の場合を新しい Search 分岐から除き、既存の退役順を優先する。
+  通常 Snapshot の開始は live search を閉じるが、旧 Snapshot + Tag の混在 fixture でも残存フラグだけで Search 分岐へ入らず、
+  従来の fallback を保つ。
+- `open_folder_nav` が優先順位に勝った場合は検索中だけ `dispatch_favorite_navigation` を使う。
+  `GlobalOpenFolder` / `FileOpenFolder` からの検索なしの移動は従来の Direct のまま。
+- 2回目 narrow の PhysicalParent で、Back の `location` は検索前なのに `route` が検索内の子になっている不整合を検出した。
+  `folder_nav_current_target` は canonical な return 先を返すが、`folder_nav_current_entry` は現在の facet child route を付ける。
+  **要求の currentness にはその child route が必要なので捕捉値は変更しない**。
+  `adopt_main_list_navigation_with_completion` の成功採用の冒頭で、`Direct(ExitTemporaryView)` かつ検索3 owner のいずれかが active の場合だけ、
+  記録専用の local history entry を導く。location が一致する `return_origin` の非 empty な保存 route はそのまま保ち、
+  empty/無しの場合だけ source location の root route へ正規化して履歴記録に使う。元の navigation は検証用の child route を維持する。
+  新しい App field・predicate・viewport/registry 変更は無く、Plain と他の purpose は変えない。source 差分は独立レビュー ACCEPT。
+- 状態の組み合わせを減らすため、既存の saved-group 待機/取消と collection History prepare を再利用した。
+  新しい並列 open owner・再試行・専用復元経路は作らない。まれな失敗は既定の割り切り（ログ + 通知）。
+
+#### §12 の変更ファイル（master 併合差分と区別）
+
+| ファイル | §12 での変更 |
+| --- | --- |
+| `src/app/saved_group_actions.rs` | Plain/Search の単一 source owner、受付時 navigation 捕捉、poll/ready/adopt の current 照合、本/collection 採用への輸送 |
+| `src/app/collection_grid.rs` | 検索時 navigation/manager open を既存 History prepare 成功採用へ接続。Plain/Snapshot の既存優先・退役順を維持。既存3回帰の採用時期と catalog 公開待ちを補強 |
+| `src/app/location_jump.rs` | book manager の受理済み open を共通 jump/root 準備へ接続。旧 delete-race fixture の型追従も同ファイル |
+| `src/app/update_phases.rs` | `open_folder_nav` の勝者を検索中だけ favorite helper へ接続 |
+| `src/ui_main.rs` | manager の open button を専用入口へ接続、実描画の manager click 回帰を追加。master の履歴 widget/入力は維持 |
+| `src/ui_dialogs/collections.rs` | manager 内の受理済み Open を `open_collection_grid_from_manager` へ接続し、自分の dialog による受付拒否を避ける |
+| `src/app.rs` | 新しい test module の登録。成功した検索終了だけに記録専用の元 route を導出。要求の child route・既存 history 受付/Navigation→Restore 書換は維持 |
+| `src/app/search_nav_book_tests.rs`（新規） | 本/collection の handler・成功採用/Back・Plain・失敗/取消/stale/epoch と保存 route の 9 テスト |
+| `src/app/search_nav_entry_inventory_tests.rs`（新規） | 全登録 action/menu の exhaustive 意味分類と実 handler の 6 テスト |
+| `src/app/list_order_everything_tests.rs` | dialog の仕様統一後も残すべき retained-search 状態を内部 loader で再現するよう 3 fixture/name を変更。assertion は維持 |
+| `src/app/gamepad_input.rs` | master 併合で双方の既存テストを保持。独立レビューで検出した master 側テストの `#[test]` 欠落を復旧。§12 の別 producer は増やさない |
+| `src/app/pinned_search/history_tests.rs` | master の履歴フォーカス回帰で、通常 Enter の typed `AddressInput` と履歴選択の旧 `Direct(..., ExplicitList)` を分けて厳密検査。製品側の widget/履歴は変更しない |
+| 設計・仕様・手引き 17 ファイルと製品ページ | `README`、architecture/search/Everything/keymap/key-customization/list-order/spec/ring-saved-group/backlog、本設計、manual の search/shortcuts/books/collections/grid/gamepad。成功時終了・失敗保持・Esc/履歴・入口再監査を反映。製品ページの検索カードは150字以内で置換し手引きへ誘導 |
+
+#### 新規回帰・既存テストの変更理由
+
+`search_nav_book_tests.rs` の 9 件:
+
+- `search_nav_book_retained_result_child_records_saved_origin_route_and_real_back_restores_it`
+- `search_nav_book_saved_actions_plain_preserve_book_display_and_back`
+- `search_nav_book_saved_scan_failure_cancel_and_stale_retain_each_search`
+- `search_nav_book_ring_actions_share_the_saved_group_success_boundary`
+- `search_nav_book_cold_collection_catalog_reenters_the_shared_prepared_open`
+- `search_nav_book_collection_catalog_cancel_and_stale_keep_each_search`
+- `search_nav_book_cached_collection_and_late_preparation_reject_same_source_epoch_change`
+- `search_nav_book_deleted_collection_preparation_preserves_each_search`
+- `search_nav_book_manager_owned_opens_adopt_with_dialog_open_and_keep_plain`
+
+`search_nav_entry_inventory_tests.rs` の 6 件:
+
+- `search_nav_inventory_key_and_menu_registries_have_explicit_policies`
+- `search_nav_inventory_metadata_all_independent_key_inputs`
+- `search_nav_inventory_everything_all_independent_key_inputs`
+- `search_nav_inventory_container_all_independent_key_inputs`
+- `search_nav_inventory_tag_all_independent_key_inputs`
+- `search_nav_inventory_all_navigation_menus_use_their_real_handlers`
+
+全登録 `KeyAction` 580 / `MenuCommandId` 56 を wildcard の無い match で分類し、独立移動 130 action と管理入口 2 action を
+実 handler へ流す。新 variant はコンパイル時に分類を要求し、登録一覧との parity は既存 keymap テストと照合する。
+prefix による候補の取りこぼしや、別途手書きした「対象一覧だけ」を入力にする構造を避ける。
+
+`ui_main.rs` の `search_nav_book_manager_real_click_keeps_owner_and_exits_only_on_adoption` は、
+4 検索 × 追加先/未作成本棚 root の実 manager button click を使い、manager owner を閉じずに採用と Back まで検査する。
+上記はテスト source の追加内容であり、実行成功件数は次表で別に記録する。
+保存 route の新規 1 件を含め、現在の新規 source は 9 + 6 + UI 1 = 16 テスト。
+同回帰は4検索の正規結果採用から実 gamepad grid accept で子へ入り、保存済み2段 route を持つ元の場所から
+追加先の本へ移る。要求の current proof は子のまま通ること、Back entry と実 Back 後が元の保存 route に一致することを検査する。
+
+既存テストの調整:
+
+- `location_jump` の delete-race fixture は master の削除対象型への追従として、同じ fixture の 2 assertion の期待値を
+  旧 tuple から `DeleteTarget::from_grid_item` へ変更した。製品の期待を弱めていない。
+- Everything の旧 folder-dialog 3 fixture は、利用者ダイアログが検索終了へ統一されたため、内部 `load_folder` で同じ
+  retained-search 状態を作る。`list_order_everything_internal_open_physical_book_reports_unavailable_from_real_key_handler`、
+  `list_order_everything_retained_parent_internal_open_book_reaches_boundary_notice_policy`、
+  `list_order_everything_retained_parent_internal_open_current_book_reports_its_nested_result_row` へ名称変更し、assertion は全て維持した。
+- 併合 4 conflict は検索入力/履歴について master の widget を正とし、既存検索移動仕様と併合した。
+  gamepad の両側の回帰を残し、上記 attribute を復旧した。今回の検索終了修正のために master の入力/履歴を作り替えていない。
+- 初回 narrow の 11 失敗: 10 件は新規 book fixture が `CollectionStoreRuntime` の Ready 前に
+  `create_collection(...).unwrap()` を呼び `Err(Starting)` になったもの。残る menu inventory の 1 件は、
+  `FileReadingHistory` に今回の新規 Back 契約を期待していたが、既存の `Restore` 契約では検索を終了しても履歴 snapshot を変えない。
+  fixture の Ready 待ちと、この入口の「検索終了 + history snapshot 不変」の検査へ訂正した。製品コードの変更ではない。
+- 2回目 narrow の 5 失敗: manager close 1 件は、実装に無い Esc close を draft fixture が期待していた。
+  実 headless Window のタイトルバー `Close window` をクリックして閉じ、`!collection_manager_open` と実 Back の期待を維持した。
+  他の4件は PhysicalParent の上記 route 不整合で、製品側の記録境界を修正した。
+  inventory fixture も人工的な `load_folder` の子から、4 owner の正規検索結果採用 + 実 gamepad grid accept で入る子へ強化した。
+  製品差分・テスト差分とも独立レビュー ACCEPT だが、修正後の実行成功は次表で別に記録する。
+- 3回目 narrow の残る2失敗は、新規の実子/metadata inventory が共有する metadata fixture の初期化不足だった。
+  新しい stream を設置したのに `done` が以前の状態のままで、`poll_global_search_events` が done による早期 return で未読になった。
+  fixture の `begin_search_page_edit_prepare_for_test` 直後に `done = false` を設定し、実際の spawn と同じ開始状態へそろえた。
+  期待値・製品コードは変更しない。まず該当2件を実行し、後続の broad gate には新規16件すべてを含める。
+- 上記2件の再検証では `done` の訂正だけでは不足し、metadata fixture の draft が `inventory child`、
+  test helper の固定 `last_executed` が `test` で一致せず、採用済み `Metadata.applied` が `Some` にならなかった。
+  source の `Wish.query = metadata_draft` と `last_executed == wish.query` の採用条件を照合して特定した。
+  fixture の draft を `test` へ同期し、`done = false` を prepare 前へ移し、timeout 診断を詳しくした。
+  厳密な採用/経路/Back の期待値は維持し、製品コードは変更しない。訂正後の該当2件は下表のとおり成功。
+- 初回 broad の旧 collection 3 件:
+  - `collection_open_from_transient_search_or_snapshot_keeps_fallback_return_folder`
+  - `collection_open_from_detached_transient_video_keeps_fallback_return_folder`
+  - `collection_open_uses_last_transient_fallback_after_snapshot_consumes_return_to`
+
+  Snapshot + Tag 混在ケースは、上記の Snapshot owner 優先を保つ分岐へ訂正した。
+  Search の2件は新しい成功時終了契約のため、準備待ちでは global active / generation / items / return を保持し pending があることを
+  追加検査し、元の return assertion は `wait_for_grid` 後に全て維持した。detached の `with_window` の全 assertion も前後両方で検査する。
+  その後の4件再検で混在ケースは成功したが、Search の2件は pending が無い段階で失敗した。
+  source を照合すると、create の Ack 後でも App 側の catalog に未公開だと preflight の contains が拒否する fixture timing だった。
+  3 collection fixture は create 後・seed/mount 前に、既存 `poll_until` で `collection_catalog_revision(id).is_some()` を待つよう補強した。
+- 初回 broad の master 追加回帰 `section1756_history_same_pass_arrow_click_reserves_next_pass_folder_keys_before_grid` は、
+  helper の通常 Enter が旧 Direct を期待していた。通常 Enter は `AddressInput(Physical(current))`、
+  履歴の ArrowDown + Enter は従来どおり `Direct(target, ExplicitList)` を厳密に検査するよう区別した。
+  その他の assertion は全て維持し、製品コードは変更していない。4件再検で同回帰は成功した。
+
+#### 採用後の cross-context 所有回帰と設計 conflict による停止
+
+独立レビューが source から指摘した「registry へ context を移す前に共通 Exit が検索 owner を消す」懸念は、
+catalog 公開待ちを補強した回帰と backtrace 再検で確認された。最初の catalog 公開前の拒否とは別の失敗である。
+
+- `collection_open_from_detached_transient_video_keeps_fallback_return_folder` の元 window の surface は、
+  `Search | Snapshot` を保持するべきところ、**採用後**の同じ assertion で失敗した。
+  受付直後の `assert_source_window` は成功している。backtrace は test の2回目の `assert_source_window`
+  （`wait_for_grid` と従来の return assertion の後、再検時 `collection_grid.rs:5657`）へ到達する。
+  既存 assertion を削らず、before/after 両方へ強化したことで回帰を可視化した。製品バイナリの実機観測ではなく headless 自動検証の結果。
+- source の順序は、`adopt_main_list_navigation_with_completion` が `dismiss_transparent_view_for_admitted_jump` で
+  Search owner/surface を消し、その後 `adopt_collection_history_root` の install closure から
+  `prepare_collection_main_context_change` → `change_main_context_for_visible_grid_for_destination` →
+  `promote_active_detached_video_for_main_context_change` → 既存の stash/bind/`DetachedWindowStateActive` へ元 bundle を移譲する。
+  この順では、移譲される元 context の検索が既に退役している。
+- 影響は共通 adopter を使う book/physical の `ExitTemporaryView` 系列にも及ぶため、collection だけを除外する guard で回避しない。
+  新規16テストは初回 broad ですべて成功したが、既存 cross-context の受入条件を満たしていない。
+- 本設計 §2.3 の「実装でこれらに触れる必要が出たら、実装者は止めて報告する」と
+  [detached リワーク憲法 §2](detached-rework-plan.md) の構造合意要件に従い、機能コード作業を停止した。
+  独立 source review もこの scope 分類を支持している。registry・detached 述語・viewport の変更は行っていない。
+  以前の source/テスト差分 ACCEPT は、この cross-context 回帰発見後の全体受入を意味しない。
+  独立レビューの最終状態は **未解決 P2・§12 未完了・registry 所有の構造合意が必要・停止支持**。
+
+設計担当と独立 reviewer の構造合意を要する検討案（未実施）:
+
+1. 移動先の準備成功を確定し、捕捉した source proof を検証する。
+2. 元の media context を既存の移譲境界へ先に渡し、元 bundle の検索と帰路を保持する。
+3. 新しい main にだけ検索退役・facet/rows/history の成功採用を適用する。
+
+共有 adopter と各 installer の順序をそろえる設計が必要で、今回の範囲内の小さな collection 症状修正として実施していない。
+実機・full suite・`build-dev.ps1`・commit は未実施。停止後は記録と fmt/glyph/cards/diffcheck の整理だけを行う。
+
+#### 停止時点の実行結果（実装担当からの報告）
+
+| コマンド・確認 | 結果・証跡 |
+| --- | --- |
+| 初回 `cargo check -p mimageviewer --lib --tests` | exit 101、`DeleteTarget` 型への旧 fixture 追従漏れ E0277 が 2 件。`target/search-nav-section12-check.log`。2 assertion を訂正 |
+| 2回目の同 check | exit 101、新規 headless fixture の private field 参照で E0616 が 1 件。`target/search-nav-section12-check-fixed.log`。field assertion を外し、既存 `verify_admitted_user_navigation_for_test` 橋で同じ target の採用と Back を検査する形へ訂正 |
+| 訂正後の同 check | **exit 0、成功、dev profile 3m00s**。`target/search-nav-section12-check-final.log` |
+| 初回 `cargo nextest run -p mimageviewer --lib -E 'test(search_nav_book) \| test(search_nav_inventory)' --test-threads 6 --no-fail-fast` | exit 100、15 件中 4 成功 / 11 失敗、17,409 skip、7.562s、build 11m53s。`target/search-nav-section12-narrow.log`。上記の fixture/既存契約に対する期待を訂正中。実 UI manager click の新規 1 件（4検索 × 追加先/未作成 root）は成功 |
+| 2回目の同 narrow | exit 100、15 件中 10 成功 / 5 失敗、17,409 skip、85.516s、build 2m53s。`target/search-nav-section12-narrow-fixed.log`。manager close fixture と4検索の PhysicalParent route 不整合を上記のとおり訂正 |
+| 3回目の同 narrow | exit 100、16 件中 14 成功 / 2 失敗、17,409 skip、87.071s、build 3m20s。`target/search-nav-section12-narrow-final.log`。残る2件は上記の metadata fixture 開始状態を訂正 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(search_nav_book_retained_result_child) \| test(search_nav_inventory_metadata)' --test-threads 6 --no-fail-fast`（done 訂正後） | exit 100、2 件中 0 成功 / 2 失敗、17,423 skip、67.065s、build 2m20s。`target/search-nav-section12-metadata-fixed.log`。上記の draft/helper query 不一致を特定し fixture を訂正。環境変数は他の narrow と同じ |
+| 同じ該当2件コマンド（query 同期後） | **exit 0、2/2 成功**、17,423 skip、34.440s、build 2m21s。`target/search-nav-section12-metadata-query-fixed.log`。製品/期待値の変更なし |
+| 関連を広げた focused gate（下記の全文コマンド） | exit 100、4,674 件中 4,670 成功 / 4 失敗、12,751 skip、682.681s、test profile compile 0.78s。`target/search-nav-section12-focused.log`。新規16件は全成功。失敗は上記の旧 collection 3件と master 履歴フォーカス回帰1件 |
+| 既存4回帰の filtered nextest（上記の3 collection名 + master履歴フォーカス名） | exit 100、4 件中 2 成功 / 2 失敗、17,421 skip、5.253s、compile 3m06s。`target/search-nav-section12-existing-regressions.log`。Snapshot + Tag 混在と pinned-search 回帰は成功、残るSearch2件は catalog 公開待ちを補強 |
+| catalog 公開待ちを加えた3 collection の filtered nextest | exit 100、3 件中 2 成功 / 1 失敗、17,422 skip、1.446s、build 3m07s。`target/search-nav-section12-collection-published.log`。非detached search と旧 Snapshot + Tag は成功。残る detached 1件は採用後の source-window surface 保持で失敗 |
+| 残る detached 1件の backtrace 再検（下記 exact command） | exit 100、1 件中 0 成功 / 1 失敗、17,424 skip、1.928s、build 0.81s。`target/search-nav-section12-detached-owner-backtrace.log`。採用後の2回目の `assert_source_window` の失敗を特定し、設計 conflict として機能コード作業を停止 |
+| `python scripts/check_ui_glyphs.py` | 停止後の最終再実行も成功、危険文字 0（実装担当の報告） |
+| `python scripts/check_site_cards.py` | 停止後の最終再実行も成功、53 cards / 上限超過 0（実装担当の報告） |
+| 最終 fmt / docs差分検査 | `cargo fmt`（workspace、引数なし）、`cargo fmt --check`、`git diff --check` は成功。4競合ファイルの conflict marker は 0。整形前後の UTF-8 本文比較で検索入力/履歴の保護7領域は全て同一（`ui_pinned_search`、`ui_history_field`、`app/pinned_search`、Everything UI/shortcut、toolbar layout、`ui_main` の履歴入力領域）。`git add` は行わず index の UU は残す |
+| 独立レビュー | 最終は **未解決 P2、§12 未完了、registry 所有の構造合意が必要、停止支持**。受付/輸送/route への以前の部分 ACCEPT と区別し、全体受入は未達 |
+| full suite / verification build / 製品起動 / commit | 未実施。設計 conflict で停止しており、全体 GREEN/完了として引き渡さない |
+| 実機確認 | 修正後は未確認。依頼36の旧ビルド観測は §12 冒頭に観測者付きで記録 |
+
+compile/check は `MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=4`、実装担当の
+`python target/search-nav-run.py` wrapper から上記 exact command を実行した記録である。
+初回 narrow も同じ環境変数を使い、`target/search-nav-section12-run.py` wrapper から実行した。
+同 wrapper は PASS 出力を省略するだけで、filter・失敗・summary・exit code は変えない。
+
+関連 focused gate の exact command（`target/search-nav-section12-filter.txt` の全文を展開）:
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE = '1'
+$env:CARGO_BUILD_JOBS = '4'
+cargo nextest run -p mimageviewer --lib -E 'test(list_order) | test(everything) | test(location) | test(gamepad) | test(jump) | test(section1328) | test(section1339) | test(favorite) | test(bookshelf) | test(books_root) | test(menubar) | test(pane) | test(address) | test(backdrop) | test(startup_restore) | test(saved_group) | test(book) | test(collection) | test(active_book) | test(ring) | test(section1733) | test(keymap) | test(pinned_search) | test(search_history) | test(history_field) | test(section207) | test(section1684) | test(section1732) | test(gps) | test(section1759) | test(section1756) | test(search_nav) | test(keyboard_input) | test(facet) | test(folder_history) | test(history_parent) | test(reading_history)' --test-threads 6 --no-fail-fast
+```
+
+実装担当は同じ filter を `$focus = Get-Content -Raw -Encoding UTF8 target/search-nav-section12-filter.txt` で読み、
+`target/search-nav-section12-run.py` wrapper から上記の `-E $focus` 相当を実行した。
+
+既存4回帰の再検コマンド（同じ環境変数・wrapper、`target/search-nav-section12-existing-regressions.log`）:
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(collection_open_from_transient_search_or_snapshot_keeps_fallback_return_folder) | test(collection_open_from_detached_transient_video_keeps_fallback_return_folder) | test(collection_open_uses_last_transient_fallback_after_snapshot_consumes_return_to) | test(section1756_history_same_pass_arrow_click_reserves_next_pass_folder_keys_before_grid)' --test-threads 6 --no-fail-fast
+```
+
+catalog 公開待ち補強後の collection 3件コマンド（同じ環境変数・wrapper、`target/search-nav-section12-collection-published.log`）:
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(collection_open_from_transient_search_or_snapshot_keeps_fallback_return_folder) | test(collection_open_from_detached_transient_video_keeps_fallback_return_folder) | test(collection_open_uses_last_transient_fallback_after_snapshot_consumes_return_to)' --test-threads 6 --no-fail-fast
+```
+
+wrapper の COMMAND 表示は console 側だけで、ログ本体は cargo 出力である。上記の exact command は実装担当の実行記録から補った。
+
+残る detached 所有回帰の backtrace 再検（上記2環境変数に `RUST_BACKTRACE=1` を追加）:
+
+```powershell
+$env:RUST_BACKTRACE = '1'
+cargo nextest run -p mimageviewer --lib -E 'test(collection_open_from_detached_transient_video_keeps_fallback_return_folder)' --test-threads 1 --no-fail-fast
+```
+
 ## 9. 追補: ツールバーのお気に入りもそろえる (2026-11-11 利用者決定)
 
 利用者の判断 (親セッション経由、2026-11-11): §2.1 範囲外で相談事項にした「ツールバーのお気に入りは移動前に検索を閉じる」不揃いは、
@@ -1072,9 +1348,12 @@ Esc では検索結果へ戻った、と報告された。設計担当が「そ�
 
 - 変わる挙動: 検索中にアドレス欄・フォルダペインで移ると、今までは検索を残したまま開き、Esc で検索結果へ戻れた。これからは
   移動先を開けた時点で検索を終える。検索結果へは戻れない (← は検索前の場所へ戻る)。
+  §11・§12 により、お気に入り、本棚・保存済み本/コレクションの追加先・番号/前後・管理画面からの open と、
+  「ファイル」→「フォルダを開く」も同じ境界へそろえる。失敗・取消・stale は結果と選択を残す。
 - 更新履歴の文案 (公開時に利用者が確認する): 「検索中に場所ジャンプ (デスクトップ・ドライブ・ドライブ一覧・閲覧履歴・本棚・
   レーティング一覧など)、アドレス欄、フォルダペイン、お気に入り (ツールバー・メニューバー・キー・リング・ゲームパッドなど)、
-  メニューバーの本棚から移ると、移動先を開けた時点で検索を終えるようにしました。
+  「製本」メニューの本棚フォルダ、追加先・番号指定・前後移動・管理画面などから本やコレクションを開く操作、
+  「ファイル」メニューの「フォルダを開く」から移ると、移動先を開けた時点で検索を終えるようにしました。
   移動先で ← を押すと検索前の場所へ戻ります。移動に失敗したときは検索結果が残ります。」
   - 親セッションの案にあった「検索結果へは ← で戻れます」は実際の動きと異なる (← は検索前の場所へ戻り、検索結果は履歴に残らない) ため採らない。
 
@@ -1128,3 +1407,31 @@ Esc では検索結果へ戻った、と報告された。設計担当が「そ�
   失敗では結果が残る。検索なしでは今と同じ。
 - 4 種の検索でペインにフォーカスがある状態の Enter が、ペインのフォルダへ移る (一覧の結果を開かない)。検索なしの回帰。
 - 検索あり / なしでアドレス欄に `Q:\` (存在しないドライブ) を入れると、移動せず通知が出る (検索ありなら結果と選択が残る)。
+
+## 12. 追補 4: 本を開く入口もそろえる (2026-11-12、サブ PC 確認 a7437b155 の差分)
+
+観測はサブ PC 担当 (統括セッション経由、依頼 36)。§11 の 3 点は期待どおり。違った点:
+
+- メニューバーに「本棚」という名前の項目は無く、「製本」メニューで試した。「本棚フォルダを開く」は検索が閉じた。
+- **「追加先の本を開く」(`GridOpenActiveBook` / `MenuCommandId::BooksOpenActiveBook`) は、Ctrl+R・Ctrl+S・Ctrl+T の 3 つとも
+  検索が閉じなかった**。一覧は本 b1 になるが、タイトル・アドレスが「検索結果: "book" > b1」「Everything: …」「タグビュー > b1」のまま
+  で、← も効かない。検索欄の × で閉じると検索前の場所へ戻る。検索なしでは「本棚 > b1」へ移り ← で戻れる。
+
+### 12.1 決定
+
+- **本を開く入口** (本棚・コレクション・追加先の本・本棚順の前後・§1.733 の「本1〜20を開く」「前/次の本を開く」、
+  キー・ツールバー・メニュー・リング・ジェスチャ・ゲームパッド) も、検索中は他の入口と同じく、移動先を開けた時点で検索を終える。
+  失敗・取消・stale では結果と選択を残す。検索なしは今と同じ。
+- §8.11 の洗い出しでこの入口が漏れた理由 (物理の場所への移動として数えなかった、別の open 経路を通る、等) を確かめて §8 に書く。
+  漏れの理由が「入口の数え方」にあるなら、数え方 (列挙の基準) を直してから全入口を列挙し直す。
+- 全登録入口の再監査に伴い、`GlobalOpenFolder` / `FileOpenFolder` のダイアログからの移動も、検索中だけ同じ成功時終了へ通す。
+  検索なしの Direct は維持し、取り込み出力フォルダを Explorer で開く操作や起動復元・ZIP 化等の内部呼出は混ぜない。
+- ← が効かない状態 (検索の表示のまま本の一覧) は、検索を残したまま本の一覧へ移ったことで生じた不整合と見られる。成功採用時に検索を
+  終える経路へ乗れば解消するはずだが、原因をコードで確かめる。
+
+### 12.2 テスト
+
+- 4 種の検索 × 本を開く入口 (追加先の本・本棚順の前後・本1〜20・前/次の本・コレクションの本・本棚フォルダ) で、採用後に検索が閉じ、
+  タイトル・アドレスが通常の本の表示になり、← で検索前の場所へ戻る。検索なしは今と同じ (「本棚 > 名前」、← で戻る)。
+- 入口の列挙をテストで押さえる: 物理の場所・本へ移る `KeyAction` / `MenuCommandId` を列挙し、それぞれが検索中に検索を残したまま
+  移らないことを検査する (新しい入口が足されたときに漏れが検出されるよう、列挙はキーマップ・メニューの一覧から取る)。

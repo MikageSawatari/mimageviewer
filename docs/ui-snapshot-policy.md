@@ -1,5 +1,20 @@
 # UI スナップショットテスト運用方針
 
+§1.732 はフォルダを含む削除の必須確認に合わせ、環境設定の説明文と既存の
+`preferences_recycle_bin_delete_confirmation`（560×230、61,954 bytes）だけを更新した。
+実装担当と独立 reviewer が全文・折り返し・余白を目視し、欠けや重なりがないことを確認した。
+`preferences_folder_edit_restore`（620×680）も再生成して比較し、従来 PNG と byte 単位で一致した。
+2件の更新指定なしの通常比較も成功した。純粋な設定描画 fixture で、製品アプリの起動は含まない。
+一覧セルのレイアウト・チェック印の描画は変えていない。検証記録は
+[フォルダ選択の設計 §7](folder-check-selection-plan.md#7-実装と検証の記録2026-11-10)を参照。
+
+§1.759 は `tests/ui_snapshot.rs::exif_gps_maps_dark` で、製品と共通の EXIF renderer に
+固定の撮影位置を渡す。`exif_gps_maps_dark.png` は300×165、12,267 bytesの1枚。
+GPS の緯度・経度と「Google マップで開く」の文字欠け・重なりがないことを生成後に目視確認し、
+更新指定なしの通常比較も1件成功した。App・worker・製品起動は含めず、ブラウザーも開かない。
+写真切替・見開き左右・欠損／不正／非表示・固定の失敗通知は、lib の `gps_maps_panel_*` で
+記録用 opener を注入して別に検査する。
+
 3D写真 段C（2026-11-07）は `depth_export_settings_small_dark` /
 `depth_export_progress_small_dark` の2枚（1093×614、55,224 / 29,457 bytes）を追加した。
 設定の各選択・既定4ループ・固定操作行・タイトル×、進行数と取消の表示を実装担当と
@@ -581,3 +596,24 @@ UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --lib local_adjust_panel_snapshot
 integrationの `book_manager_window_close_and_mode_controls_in_small_viewport` は12条件で×と方式ボタンを検査し、
 geometryの全組合せへPNGを増やさない。
 更新モードを外した `ui_snapshot` 全224件の通常比較も成功した。
+
+検索欄の入力履歴（§1.756、2026-11-11）は、本体の共有部品を使う
+`toolbar_pinned_search_history_light`（560×100）、`search_history_popup_dark`（440×240）、
+`folder_address_history_light`（560×120）の3枚を追加した。計18,852 bytes。
+既存の常設欄2枚・Everythingバー3枚・フォルダバー設定/整理先3枚・フォルダバー配置10枚、
+計18枚を更新した。新規と更新の21枚は計729,735 bytesで、実装担当が全枚を目視し、
+明暗・狭幅・150%で▼と文字、枠、右側操作、一覧の末尾に欠けや重なりがないことを確認した。
+フォルダバーは全36条件のgeometry/hit検査を維持し、従来の23名を保持する。
+履歴ボタンの移設でnormal/middleのinlineがrowとは異なる配置になるため、
+現在は23名・23種類の画素配置を検査する（0.37採用時の22種類から1種類増加）。
+更新指定あり/なしのintegration `ui_snapshot` は各251件成功した。
+既存の整理先画像3枚はlibの該当25件でも通常比較を確認した。
+新しい部品のfixtureも本体フォントを使い、glyphとaccessibilityの検査を無効にしない。
+製品GUIの起動・実IMEの検収ではなく、設計担当の画像確認と実機確認は別に行う。
+
+§1.756の設計担当の目視後、常設欄は履歴なしと同じ欄全体の幅へ戻し、履歴行は左揃え・
+通常行の塗りなしへ修正した。`toolbar_pinned_search_light` / `toolbar_pinned_search_narrow_dark` /
+`toolbar_pinned_search_history_light` / `search_history_popup_dark` の4枚だけを再更新（計61,794 bytes）。
+実装担当が4枚を目視し、通常幅の折り返し、狭幅、選択行と通常行の区別を確認した。
+一時バーとフォルダバーの既存PNGは変更していない。更新指定あり/なしで各251件成功。
+追補の検証記録は設計書§12。

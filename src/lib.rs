@@ -472,6 +472,7 @@ pub use ui_fullscreen::{
 };
 mod ui_details_icon;
 pub mod ui_helpers;
+pub mod ui_history_field;
 mod ui_main;
 pub mod ui_page_overview;
 pub mod ui_pinned_search;
@@ -489,8 +490,9 @@ pub use ui_main::draw_details_name_colors_snapshot_fixture;
 mod ui_metadata_panel;
 #[doc(hidden)]
 pub use ui_metadata_panel::{
-    draw_comfyui_provenance_snapshot_fixture, draw_paused_metadata_panel_snapshot_fixture,
-    draw_similar_panel_snapshot_fixture, draw_similar_states_snapshot_fixture,
+    draw_comfyui_provenance_snapshot_fixture, draw_exif_gps_snapshot_fixture,
+    draw_paused_metadata_panel_snapshot_fixture, draw_similar_panel_snapshot_fixture,
+    draw_similar_states_snapshot_fixture,
 };
 pub mod music_note_color;
 pub mod ui_music_panels;

@@ -1793,6 +1793,37 @@ fn jpeg_gps_is_permission_scoped_and_raw_user_comment_is_never_exported() {
 }
 
 #[test]
+fn padded_tiff_gps_references_preserve_projection_permission_gate() {
+    for (latitude_ref, longitude_ref, sign) in [
+        ("S ", "W ", -1.0),
+        (" S", " W", -1.0),
+        (" \tS\r\n ", " \tW\r\n ", -1.0),
+        (" N ", " E ", 1.0),
+    ] {
+        let bytes = crate::exif_reader::tests::gps_fixture_bytes_with_refs(
+            35,
+            139,
+            latitude_ref,
+            longitude_ref,
+        );
+        let source = crate::exif_reader::read_exif_from_bytes(&bytes, &[]).unwrap();
+        for gps in [false, true] {
+            let InfoField::Present(exif) = project_exif(Some(source.clone()), gps) else {
+                panic!("missing EXIF");
+            };
+            assert_eq!(
+                exif.gps,
+                gps.then_some(GpsInfo {
+                    latitude: sign * 35.5,
+                    longitude: sign * 139.75,
+                    altitude: None,
+                })
+            );
+        }
+    }
+}
+
+#[test]
 fn invalid_references_and_pre_cancel_are_rejected_without_heavy_io() {
     let directory = crate::settings_db::DataDirOverrideGuard::new();
     let path = directory.path().join("missing.zip");
