@@ -188,8 +188,9 @@ pub(crate) struct CoverCrop { x0: u32, y0: u32, x1: u32, y1: u32 }
 - 順序: デコード → EXIF 適用 → 元寸法の確定 → 類似画像索引への受け渡し (`offer_thumbnail_raster`、元画像のまま) →
   (自動なら判定) → 切り出し → 縮小 → WebP 保存 (r1 指摘 4)。同じ raster を使う他の consumer も切り出し前に済ませる。
 - **手動の範囲**: 範囲は先に分かるので、全体のデコード目標を `display_px × (全体の長辺 / 範囲の長辺)` に広げる (元寸法・既存の上限を
-  超えない)。JPEG の DCT 縮小 (`thumbnail_jpeg_decode_target`)、PDF の render 寸法 (`thumbnail_pdf_render_target`)、WIC の縮小
-  デコードが受け取る。
+  超えない)。JPEG の DCT 縮小 (`thumbnail_jpeg_decode_target`) と PDF の render 寸法 (`thumbnail_pdf_render_target`) が受け取る。
+  WIC・image crate・Susie の経路は今も全体の解像度でデコードしている (thumb_loader.rs:6151、wic_decoder.rs:80) ので、そのまま全体を
+  デコードしてから切る (目標寸法を足さない。実装担当の確認 2026-11-11)。
 - **自動** (r2 指摘 10): (1) 今と同じ目標でデコードする。(2) そこから**高さ 256 の解析用 raster** を作って判定する (デコード倍率に
   よらず判定の入力をそろえる)。(3) 切ると判定し、範囲の長辺が `display_px` に足りない場合だけ、**同じ bytes / 同じ PDF の lease から
   手動と同じ目標で 1 回だけデコードし直す**。デコードは最大 2 回。
