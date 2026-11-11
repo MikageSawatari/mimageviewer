@@ -23330,7 +23330,7 @@ impl App {
                 let Some((mtime, file_size)) = self.image_metas.get(idx).and_then(|m| *m) else {
                     continue;
                 };
-                let Some(req) = make_load_request_with_visibility(
+                let Some(req) = make_load_request_with_auto_crop(
                     item,
                     idx,
                     mtime,
@@ -23347,6 +23347,7 @@ impl App {
                     self.video_pin_db.as_ref(),
                     use_full_path_keys,
                     self.listing_file_type_visibility(),
+                    self.thumbnail_auto_crop_identity(),
                 ) else {
                     continue;
                 };
@@ -32377,7 +32378,7 @@ impl App {
             .iter()
             .zip(image_metas.iter())
             .flat_map(|(it, meta)| {
-                folder_thumb_existing_keys_for_with_visibility(
+                folder_thumb_existing_keys_for_with_auto_crop(
                     it,
                     *meta,
                     &pin_map_for_existing,
@@ -32386,6 +32387,7 @@ impl App {
                     self.settings.folder_thumb_depth,
                     use_full_path_cache_keys,
                     &self.settings.file_type_visibility,
+                    configured_thumbnail_auto_crop(&self.settings),
                 )
             })
             .collect();
@@ -34917,7 +34919,7 @@ impl App {
             .iter()
             .zip(image_metas.iter())
             .flat_map(|(it, meta)| {
-                folder_thumb_existing_keys_for_with_visibility(
+                folder_thumb_existing_keys_for_with_auto_crop(
                     it,
                     *meta,
                     &pin_map_for_existing,
@@ -34926,6 +34928,7 @@ impl App {
                     self.settings.folder_thumb_depth,
                     true,
                     &self.settings.file_type_visibility,
+                    configured_thumbnail_auto_crop(&self.settings),
                 )
             })
             .collect();
@@ -35373,7 +35376,7 @@ impl App {
             .iter()
             .zip(image_metas.iter())
             .flat_map(|(it, meta)| {
-                folder_thumb_existing_keys_for_with_visibility(
+                folder_thumb_existing_keys_for_with_auto_crop(
                     it,
                     *meta,
                     &pin_map_for_existing,
@@ -35384,6 +35387,7 @@ impl App {
                     // 同名コンテナが共存しうるので basename だと衝突する)
                     true,
                     &self.settings.file_type_visibility,
+                    configured_thumbnail_auto_crop(&self.settings),
                 )
             })
             .collect();
@@ -35781,7 +35785,7 @@ impl App {
             .iter()
             .zip(image_metas.iter())
             .flat_map(|(it, meta)| {
-                folder_thumb_existing_keys_for_with_visibility(
+                folder_thumb_existing_keys_for_with_auto_crop(
                     it,
                     *meta,
                     &pin_map_for_existing,
@@ -35790,6 +35794,7 @@ impl App {
                     self.settings.folder_thumb_depth,
                     true,
                     &self.settings.file_type_visibility,
+                    configured_thumbnail_auto_crop(&self.settings),
                 )
             })
             .collect();
@@ -39239,7 +39244,7 @@ impl App {
             .iter()
             .zip(image_metas.iter())
             .flat_map(|(it, meta)| {
-                folder_thumb_existing_keys_for_with_visibility(
+                folder_thumb_existing_keys_for_with_auto_crop(
                     it,
                     *meta,
                     &pin_map_for_existing,
@@ -39248,6 +39253,7 @@ impl App {
                     self.settings.folder_thumb_depth,
                     true,
                     &self.settings.file_type_visibility,
+                    configured_thumbnail_auto_crop(&self.settings),
                 )
             })
             .collect();
@@ -39916,8 +39922,16 @@ impl App {
         // existing_keys は **全階層** のキー (全 leaf entry_name + 全 dir の zipdir:) を
         // 集める。ルート階層しか materialize しないので、これがないと深い階層の
         // サムネが delete_missing で stale 削除されて再生成ループになる (Codex P2)。
-        let existing_keys: std::collections::HashSet<String> =
+        let mut existing_keys: std::collections::HashSet<String> =
             tree.all_cache_keys().into_iter().collect();
+        let auto = configured_thumbnail_auto_crop(&self.settings);
+        let auto_zipdir_keys: Vec<_> = existing_keys
+            .iter()
+            .filter(|key| key.starts_with("zipdir:"))
+            .flat_map(|key| {
+                representative_existing_keys(key, &self.settings.file_type_visibility, auto)
+            })
+            .collect();
         let mut pinned_keys = Vec::new();
         // 本ごとピン (Model B) の代表サムネは zipdir:{prefix}#pin:{entry} キーで保存される。
         // base の zipdir:{prefix} しか existing に無いと delete_missing が pinned 行を毎回
@@ -39994,16 +40008,36 @@ impl App {
                         )
                     };
                     resolved.map(|resolved| {
-                        resolved.pinned_cache_key(
-                            &crate::grid_item::zipdir_cache_key(prefix),
-                            crate::folder_thumb_pins::PinKeyMode::Exact,
+                        let item = GridItem::ZipFile(tree.zip_path.clone());
+                        let base = crate::grid_item::zipdir_cache_key(prefix);
+                        let plain = pinned_cache_key_with_auto_crop(
+                            &item,
+                            &resolved,
+                            &base,
                             special,
-                        )
+                            &self.settings.file_type_visibility,
+                            None,
+                        );
+                        let current = pinned_cache_key_with_auto_crop(
+                            &item,
+                            &resolved,
+                            &base,
+                            special,
+                            &self.settings.file_type_visibility,
+                            auto,
+                        );
+                        let mut keys = vec![plain.clone()];
+                        if current != plain {
+                            keys.push(current);
+                        }
+                        keys
                     })
                 })
+                .flatten()
                 .collect();
             pinned_keys = pinned;
         }
+        existing_keys.extend(auto_zipdir_keys);
         let mut prepared = if let Some(nav) = book_nav {
             let (items, image_metas) = book_materialization::materialize_archive_level(
                 &nav.tree,
@@ -57630,7 +57664,7 @@ impl App {
                 return PriorityThumbnailAdmission::MissingMetadata;
             };
             self.items.get(idx).and_then(|item| {
-                make_load_request_with_visibility(
+                make_load_request_with_auto_crop(
                     item,
                     idx,
                     mtime,
@@ -57647,6 +57681,7 @@ impl App {
                     self.video_pin_db.as_ref(),
                     use_full_path_keys,
                     self.listing_file_type_visibility(),
+                    self.thumbnail_auto_crop_identity(),
                 )
             })
         };
@@ -58041,7 +58076,7 @@ impl App {
                     continue;
                 };
                 self.items.get(i).and_then(|item| {
-                    make_load_request_with_visibility(
+                    make_load_request_with_auto_crop(
                         item,
                         i,
                         mtime,
@@ -58058,6 +58093,7 @@ impl App {
                         self.video_pin_db.as_ref(),
                         use_full_path_keys,
                         self.listing_file_type_visibility(),
+                        self.thumbnail_auto_crop_identity(),
                     )
                 })
             };
@@ -58690,7 +58726,7 @@ impl App {
             // T54: Ctrl+S 検索結果は full-path キーで衝突回避 (= idle upgrade も同じく)
             let use_full_path_keys = self.use_full_path_cache_keys();
             let Some(mut req) = self.items.get(i).and_then(|item| {
-                make_load_request_with_visibility(
+                make_load_request_with_auto_crop(
                     item,
                     i,
                     mtime,
@@ -58707,6 +58743,7 @@ impl App {
                     self.video_pin_db.as_ref(),
                     use_full_path_keys,
                     self.listing_file_type_visibility(),
+                    self.thumbnail_auto_crop_identity(),
                 )
             }) else {
                 continue;
@@ -102533,6 +102570,111 @@ fn parent_row_for_item(
     })
 }
 
+/// Settings alone are used while preparing a new list; its previous mounted
+/// context (possibly Drive) must not affect the incoming cache namespace.
+fn configured_thumbnail_auto_crop(
+    settings: &crate::settings::Settings,
+) -> Option<crate::cover_auto_crop::AutoCropIdentity> {
+    settings
+        .thumb_cover_auto_crop
+        .then(|| crate::cover_auto_crop::AutoCropIdentity::new(settings.default_reading_direction))
+}
+
+impl App {
+    fn thumbnail_auto_crop_identity(&self) -> Option<crate::cover_auto_crop::AutoCropIdentity> {
+        (!self.items_are_drive_list)
+            .then(|| configured_thumbnail_auto_crop(&self.settings))
+            .flatten()
+    }
+}
+
+fn auto_crop_leaf_allowed(request: &LoadRequest) -> bool {
+    if request.cover_crop.is_some()
+        || !matches!(
+            request.raw_source,
+            crate::thumb_loader::LoadRequestSource::Original
+        )
+    {
+        return false;
+    }
+    // A logical folder remains a folder even when its name ends in .cr3/.mp4.
+    // Its identity permits K2 reuse; the worker never detects a folder image.
+    if request.folder_thumb_provenance == Some(crate::catalog::FolderThumbProvenance::AutoSelected)
+    {
+        return true;
+    }
+    let path = request
+        .zip_entry
+        .as_deref()
+        .map_or(request.path.as_path(), Path::new);
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    !crate::raw_format::is_raw_path(path)
+        && !matches!(
+            crate::file_type_visibility::category_for_extension(&ext),
+            Some(
+                crate::file_type_visibility::FileTypeCategory::Video
+                    | crate::file_type_visibility::FileTypeCategory::Audio
+            )
+        )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_load_request_with_auto_crop(
+    item: &GridItem,
+    idx: usize,
+    mtime: i64,
+    file_size: i64,
+    bypass_cache: bool,
+    pdf_password: Option<&str>,
+    folder_thumb_sort: Option<crate::settings::SortOrder>,
+    folder_thumb_depth: u32,
+    pin_map: &HashMap<String, crate::folder_thumb_pins::FolderPin>,
+    converted_archive_cache_paths: &HashMap<String, ConvertedArchiveSourceState>,
+    archive_source_override: Option<&Path>,
+    current_folder: Option<&Path>,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    video_pin_db: Option<&crate::video_pins::VideoPinDb>,
+    use_full_path_keys: bool,
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+    auto: Option<crate::cover_auto_crop::AutoCropIdentity>,
+) -> Option<LoadRequest> {
+    let mut request = make_load_request_with_visibility(
+        item,
+        idx,
+        mtime,
+        file_size,
+        bypass_cache,
+        pdf_password,
+        folder_thumb_sort,
+        folder_thumb_depth,
+        pin_map,
+        converted_archive_cache_paths,
+        archive_source_override,
+        current_folder,
+        pin_db,
+        video_pin_db,
+        use_full_path_keys,
+        visibility,
+    )?;
+    let eligible = match item {
+        GridItem::ZipFile(_)
+        | GridItem::PdfFile(_)
+        | GridItem::ConvertibleArchive { .. }
+        | GridItem::ZipDir { .. } => true,
+        GridItem::Folder(_) => {
+            request.folder_thumb_provenance
+                == Some(crate::catalog::FolderThumbProvenance::AutoSelected)
+        }
+        _ => false,
+    };
+    request.set_auto_cover_crop(auto.filter(|_| eligible && auto_crop_leaf_allowed(&request)));
+    Some(request)
+}
+
 fn make_load_request_with_visibility(
     item: &GridItem,
     idx: usize,
@@ -102976,7 +103118,7 @@ pub(crate) fn folder_thumb_existing_keys_for_with_visibility(
     use_full_path_keys: bool,
     visibility: &crate::file_type_visibility::FileTypeVisibility,
 ) -> Vec<String> {
-    folder_thumb_existing_keys_for(
+    folder_thumb_existing_keys_for_with_auto_crop(
         item,
         item_meta,
         pin_map,
@@ -102984,10 +103126,9 @@ pub(crate) fn folder_thumb_existing_keys_for_with_visibility(
         folder_thumb_sort,
         folder_thumb_depth,
         use_full_path_keys,
+        visibility,
+        None,
     )
-    .into_iter()
-    .map(|key| crate::thumb_loader::representative_cache_key_for_policy(&key, visibility))
-    .collect()
 }
 
 pub(crate) fn folder_thumb_existing_keys_for(
@@ -103002,6 +103143,31 @@ pub(crate) fn folder_thumb_existing_keys_for(
     // `delete_missing` の存続キー集合と make_load_request の読み書きキーが乖離
     // しないように、必ず同じ helper (`container_cache_base_key`) を経由する。
     use_full_path_keys: bool,
+) -> Vec<String> {
+    folder_thumb_existing_keys_for_with_auto_crop(
+        item,
+        item_meta,
+        pin_map,
+        pin_db,
+        folder_thumb_sort,
+        folder_thumb_depth,
+        use_full_path_keys,
+        &Default::default(),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn folder_thumb_existing_keys_for_with_auto_crop(
+    item: &GridItem,
+    item_meta: Option<(i64, i64)>,
+    pin_map: &HashMap<String, crate::folder_thumb_pins::FolderPin>,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    folder_thumb_sort: Option<crate::settings::SortOrder>,
+    folder_thumb_depth: u32,
+    use_full_path_keys: bool,
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+    auto: Option<crate::cover_auto_crop::AutoCropIdentity>,
 ) -> Vec<String> {
     let (container_path, convertible_format) = match item {
         GridItem::Image(p) => {
@@ -103026,7 +103192,7 @@ pub(crate) fn folder_thumb_existing_keys_for(
         else {
             return Vec::new();
         };
-        let mut keys = vec![base_key.clone()];
+        let mut keys = representative_existing_keys(&base_key, visibility, auto);
         let container_key = crate::path_key::normalize_keep_drive(container_path);
         if let (Some(root_metadata), Some(source)) = (item_meta, pin_map.get(&container_key))
             && pin_source_compatible_with_container(ContainerKindForPin::ConvertibleArchive, source)
@@ -103057,11 +103223,26 @@ pub(crate) fn folder_thumb_existing_keys_for(
             } else {
                 base_key.clone()
             };
-            keys.push(resolved.pinned_cache_key(
+            let plain = pinned_cache_key_with_auto_crop(
+                item,
+                &resolved,
                 &pinned_base_key,
-                crate::folder_thumb_pins::PinKeyMode::Exact,
                 None,
-            ));
+                visibility,
+                None,
+            );
+            let current = pinned_cache_key_with_auto_crop(
+                item,
+                &resolved,
+                &pinned_base_key,
+                None,
+                visibility,
+                auto,
+            );
+            keys.push(plain.clone());
+            if current != plain {
+                keys.push(current);
+            }
         }
         return keys;
     }
@@ -103075,7 +103256,7 @@ pub(crate) fn folder_thumb_existing_keys_for(
         return Vec::new();
     };
 
-    let mut keys = vec![base_key.clone()];
+    let mut keys = representative_existing_keys(&base_key, visibility, auto);
     let container_key = crate::path_key::normalize_keep_drive(container_path);
     if let Some(source) = pin_map.get(&container_key) {
         // cascade 解決後の leaf source_id を使う (= `apply_folder_thumb_pin` が
@@ -103105,14 +103286,76 @@ pub(crate) fn folder_thumb_existing_keys_for(
             } else {
                 base_key.clone()
             };
-            keys.push(resolved.pinned_cache_key(
+            let plain = pinned_cache_key_with_auto_crop(
+                item,
+                &resolved,
                 &pinned_base_key,
-                crate::folder_thumb_pins::PinKeyMode::Exact,
                 None,
-            ));
+                visibility,
+                None,
+            );
+            let current = pinned_cache_key_with_auto_crop(
+                item,
+                &resolved,
+                &pinned_base_key,
+                None,
+                visibility,
+                auto,
+            );
+            keys.push(plain.clone());
+            if current != plain {
+                keys.push(current);
+            }
         }
     }
     keys
+}
+
+/// Keep the released namespace for page seed/writeback alongside the current
+/// automatic setting. Rows from a previous binding are not retained.
+fn representative_existing_keys(
+    base: &str,
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+    auto: Option<crate::cover_auto_crop::AutoCropIdentity>,
+) -> Vec<String> {
+    let plain = crate::thumb_loader::representative_cache_key_for_policy(base, visibility);
+    let current =
+        crate::thumb_loader::representative_cache_key_for_policy_with_auto(base, visibility, auto);
+    let mut keys = vec![plain.clone()];
+    if current != plain {
+        keys.push(current);
+    }
+    keys
+}
+
+/// Reuse the already-resolved leaf without another source lookup. Its private
+/// crop remains owned by the atomic request helper.
+fn pinned_cache_key_with_auto_crop(
+    item: &GridItem,
+    resolved: &crate::folder_thumb_pins::ResolvedPinTarget,
+    base: &str,
+    zipdir_prefix: Option<&str>,
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+    auto: Option<crate::cover_auto_crop::AutoCropIdentity>,
+) -> String {
+    let mut probe = LoadRequest {
+        path: resolved.abs_path.clone(),
+        zip_entry: resolved.zip_entry.clone(),
+        folder_thumb_provenance: (resolved.kind == crate::folder_thumb_pins::ResolvedKind::Folder)
+            .then_some(crate::catalog::FolderThumbProvenance::AutoSelected),
+        file_type_visibility: visibility.clone(),
+        ..Default::default()
+    };
+    resolved.assign_to_load_request(
+        &mut probe,
+        base,
+        crate::folder_thumb_pins::PinKeyMode::Exact,
+        zipdir_prefix,
+    );
+    let eligible = !matches!(item, GridItem::Folder(_))
+        || resolved.kind == crate::folder_thumb_pins::ResolvedKind::Folder;
+    probe.set_auto_cover_crop(auto.filter(|_| eligible && auto_crop_leaf_allowed(&probe)));
+    probe.cache_key_override.expect("resolved pinned cache key")
 }
 
 /// `apply_folder_thumb_pin` 用の container kind discriminator。
@@ -103423,6 +103666,7 @@ fn apply_folder_thumb_pin(
             mtime: resolved.mtime,
             file_size: resolved.file_size,
             cover_crop: None,
+            auto_cover_crop: None,
             edit_preview_key: None,
             edit_preview_validate_container: false,
             pinned_page_adjustment_key: None,
@@ -103602,6 +103846,7 @@ fn apply_folder_thumb_pin(
         force_cache: false,
         raw_source: crate::thumb_loader::LoadRequestSource::Original,
         cover_crop: None,
+        auto_cover_crop: None,
     };
     resolved.assign_to_load_request(
         &mut request,
@@ -104142,6 +104387,8 @@ fn finite_video_target_secs(target_secs: f64, duration_secs: f64) -> f64 {
 // `phase_c_support::setup_app` を使う (production 配線を通した回帰は App が要る)。
 #[cfg(test)]
 pub(crate) mod composite_pixels_revision_tests;
+#[cfg(test)]
+mod cover_auto_tests;
 #[cfg(test)]
 mod cover_crop_tests;
 #[cfg(test)]

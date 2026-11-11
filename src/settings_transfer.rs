@@ -326,6 +326,7 @@ preferences_policy! {
         file_type_visibility: crate::file_type_visibility::FileTypeVisibility => ("表示するファイル種類", |_, _| true, plain, plain);
         folder_thumb_sort: SortOrder => ("フォルダ代表画像の選定順", |v, _raw| matches!(v, SortOrder::FileName | SortOrder::Numeric | SortOrder::DateAsc | SortOrder::DateDesc), plain, plain);
         folder_thumb_depth: u32 => ("フォルダ代表画像の探索深さ", |v, _raw| (0..=10).contains(v), plain, plain);
+        thumb_cover_auto_crop: bool => ("つながった表紙の自動切り出し", |_, _| true, plain, plain);
         folder_skip_limit: usize => ("画像なしフォルダを飛ばす上限", |v, _raw| (1..=30).contains(v), plain, plain);
         edit_restore_prompt_enabled: bool => ("編集の復元確認", |_, _| true, plain, plain);
         sidecar_backup_enabled: bool => ("編集データのサイドカーバックアップ", |_, _| true, plain, plain);
@@ -1213,6 +1214,7 @@ mod tests {
         } else {
             30
         };
+        settings.thumb_cover_auto_crop = !settings.thumb_cover_auto_crop;
         settings.edit_restore_prompt_enabled = !settings.edit_restore_prompt_enabled;
         settings.sidecar_backup_enabled = !settings.sidecar_backup_enabled;
         settings.tag_sidecar_backup_enabled = !settings.tag_sidecar_backup_enabled;
@@ -2103,13 +2105,13 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 492);
+        assert_eq!(entries.len(), 493);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            157
+            158
         );
         assert_eq!(
             entries
@@ -2145,7 +2147,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 155);
+        assert_eq!(wire.len(), 156);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);

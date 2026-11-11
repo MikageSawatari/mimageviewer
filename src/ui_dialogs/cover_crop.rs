@@ -38,6 +38,8 @@ struct PreparedCover {
     source: FolderPinSource,
     rotation_key: Option<String>,
     crop: Option<CoverCrop>,
+    auto_crop: Option<CoverCrop>,
+    auto_enabled: bool,
     image: egui::ColorImage,
 }
 
@@ -47,6 +49,7 @@ struct CropDraft {
     rotation: Rotation,
     crop: CropRect,
     had_manual_crop: bool,
+    auto_enabled: bool,
     drag: Option<CropDrag>,
     error: Option<String>,
 }
@@ -307,8 +310,12 @@ impl App {
                                 egui::TextureOptions::LINEAR,
                             ),
                             rotation,
-                            crop: rotate_rect(crop_rect(prepared.crop), rotation),
+                            crop: rotate_rect(
+                                crop_rect(prepared.crop.or(prepared.auto_crop)),
+                                rotation,
+                            ),
                             had_manual_crop: prepared.crop.is_some(),
+                            auto_enabled: prepared.auto_enabled,
                             drag: None,
                             error: None,
                         })
@@ -491,6 +498,80 @@ fn prepare_cover_inner(
             .oriented(source)
         }
     };
+    let auto_enabled = env.thumb_cover_auto_crop && container.kind != BookKind::Folder;
+    let has_edit_preview = auto_enabled
+        && cover.cover_crop.is_none()
+        && cover
+            .edit_preview_key
+            .as_deref()
+            .zip(env.edit_preview_db.as_deref())
+            .is_some_and(|(key, db)| {
+                match &cover.location {
+                    ReadLocation::File(path) => std::fs::metadata(path).ok().and_then(|meta| {
+                        db.load(
+                            key,
+                            crate::ui_helpers::mtime_secs(&meta),
+                            meta.len() as i64,
+                            target_px,
+                        )
+                    }),
+                    ReadLocation::ArchiveEntry { archive, .. } => {
+                        std::fs::metadata(archive).ok().and_then(|meta| {
+                            db.load_for_container(
+                                key,
+                                crate::ui_helpers::mtime_secs(&meta),
+                                meta.len() as i64,
+                                target_px,
+                            )
+                        })
+                    }
+                    ReadLocation::PdfPage { .. } => db.load_for_container(
+                        key,
+                        cover.signature.mtime_ms.div_euclid(1000),
+                        cover.signature.size as i64,
+                        target_px,
+                    ),
+                    _ => None,
+                }
+                .is_some()
+            });
+    let auto_crop = if auto_enabled
+        && cover.cover_crop.is_none()
+        && !has_edit_preview
+        && u64::from(image.width()) * 100 >= u64::from(image.height()) * 85
+        && !cancel.load(Ordering::Relaxed)
+    {
+        let page_aspect = match &cover.location {
+            ReadLocation::ArchiveEntry { archive, entry } => {
+                crate::cover_auto_sample::sample_zip_page_aspect(
+                    archive,
+                    entry,
+                    container.zip_dir_prefix.as_deref(),
+                )
+            }
+            ReadLocation::PdfPage { pdf, page } => cover.epub_read.as_ref().and_then(|read| {
+                crate::pdf_loader::get_page_sizes_with_read_target(
+                    pdf,
+                    read,
+                    cover.pdf_password.as_deref(),
+                )
+                .ok()
+                .and_then(|sizes| {
+                    crate::cover_auto_sample::page_aspect_from_sizes(&sizes, *page as usize)
+                })
+            }),
+            _ => None,
+        };
+        crate::cover_auto_crop::cover_auto_crop(
+            &crate::cover_auto_crop::analysis_raster(&image),
+            (image.width(), image.height()),
+            page_aspect,
+            env.default_reading_direction,
+        )
+        .ok()
+    } else {
+        None
+    };
     let image = if image.width().max(image.height()) > target_px {
         image.resize(target_px, target_px, image::imageops::FilterType::Triangle)
     } else {
@@ -501,6 +582,8 @@ fn prepare_cover_inner(
         source: cover.persistent_source,
         rotation_key: cover.rotation_key,
         crop: cover.cover_crop,
+        auto_crop,
+        auto_enabled,
         image: egui::ColorImage::from_rgba_unmultiplied(
             [rgba.width() as usize, rgba.height() as usize],
             rgba.as_raw(),
@@ -573,6 +656,9 @@ fn draw_window(
             if let Phase::Ready(draft)=phase
                 && let Some(error)=&draft.error
             { ui.colored_label(ui.visuals().error_fg_color,error); }
+            if let Phase::Ready(draft)=phase
+                && draft.had_manual_crop && draft.auto_enabled
+            { ui.small("手動の範囲を解除すると、自動の判定に戻ります。"); }
             ui.separator();
             let body_height = ui.available_height().max(20.0);
             ui.spacing_mut().scroll = super::non_overlapping_dialog_scroll_style(ui.spacing().scroll);
@@ -748,6 +834,16 @@ fn hit_handle(rect: egui::Rect, point: egui::Pos2) -> Option<CropHandle> {
 /// Pure fixture: generated pixels, production window/canvas, no App or worker.
 #[doc(hidden)]
 pub fn draw_cover_crop_snapshot_fixture(ui: &mut egui::Ui) {
+    draw_cover_crop_snapshot(ui, false);
+}
+
+/// The automatic setting adds the explanation beside a manual range.
+#[doc(hidden)]
+pub fn draw_cover_auto_crop_snapshot_fixture(ui: &mut egui::Ui) {
+    draw_cover_crop_snapshot(ui, true);
+}
+
+fn draw_cover_crop_snapshot(ui: &mut egui::Ui, auto_enabled: bool) {
     let size = [720, 280];
     let mut pixels = vec![egui::Color32::from_rgb(220, 210, 187); size[0] * size[1]];
     for y in 12..268 {
@@ -778,6 +874,7 @@ pub fn draw_cover_crop_snapshot_fixture(ui: &mut egui::Ui) {
         rotation: Rotation::None,
         crop: crop_rect(CoverCrop::new([15_000, 45_000, 450_000, 955_000]).unwrap()),
         had_manual_crop: true,
+        auto_enabled,
         drag: None,
         error: None,
     });
@@ -800,6 +897,8 @@ mod tests {
             },
             rotation_key: None,
             crop,
+            auto_crop: None,
+            auto_enabled: false,
             image: egui::ColorImage::new(
                 [120, 80],
                 vec![egui::Color32::from_rgb(55, 125, 180); 120 * 80],
@@ -876,6 +975,78 @@ mod tests {
             .unwrap()
             .lookup(&root.join("child"))
             .unwrap()
+    }
+
+    #[test]
+    fn cover_crop_initial_range_prefers_manual_then_auto_then_full() {
+        let manual = CoverCrop::new([100_000, 0, 500_000, 1_000_000]).unwrap();
+        let automatic = CoverCrop::new([500_000, 0, 950_000, 1_000_000]).unwrap();
+        for (manual_crop, auto_crop, expected) in [
+            (manual, automatic, manual),
+            (None, automatic, automatic),
+            (None, None, None),
+        ] {
+            let (app, tx, _, _) = fake_loading_app();
+            let mut prepared = fake_prepared(manual_crop);
+            prepared.auto_crop = auto_crop;
+            prepared.auto_enabled = true;
+            tx.send((7, Ok(prepared))).ok().unwrap();
+            let mut h = app_harness(app);
+            h.run_steps(4);
+            let Phase::Ready(draft) = &h.state().cover_crop_dialog.as_ref().unwrap().phase else {
+                panic!("prepared crop draft");
+            };
+            let expected = crop_rect(expected);
+            assert_eq!(
+                [
+                    draft.crop.min_x,
+                    draft.crop.min_y,
+                    draft.crop.max_x,
+                    draft.crop.max_y
+                ],
+                [
+                    expected.min_x,
+                    expected.min_y,
+                    expected.max_x,
+                    expected.max_y
+                ]
+            );
+            assert_eq!(draft.had_manual_crop, manual_crop.is_some());
+            if manual_crop.is_none() {
+                h.get_by_label("手動の範囲を解除").click();
+                h.run_steps(2);
+                assert!(
+                    h.state().cover_crop_dialog_open(),
+                    "automatic draft cannot clear a manual range"
+                );
+            } else {
+                h.get_by_label("手動の範囲を解除すると、自動の判定に戻ります。");
+            }
+        }
+    }
+
+    #[test]
+    fn cover_crop_accept_auto_draft_saves_manual_range() {
+        let (app, tx, root, _) = fake_loading_app();
+        let crop = CoverCrop::new([500_000, 0, 1_000_000, 1_000_000]).unwrap();
+        let mut prepared = fake_prepared(None);
+        prepared.auto_crop = crop;
+        prepared.auto_enabled = true;
+        tx.send((7, Ok(prepared))).ok().unwrap();
+        let mut h = app_harness(app);
+        h.run_steps(4);
+        h.get_by_label("OK").click();
+        h.run_steps(2);
+        assert_eq!(
+            h.state()
+                .folder_thumb_pin_db
+                .as_ref()
+                .unwrap()
+                .lookup(&root)
+                .unwrap()
+                .cover_crop,
+            crop
+        );
     }
 
     #[test]
@@ -1221,7 +1392,7 @@ mod tests {
                             1=>{
                                 let prepared=fake_prepared(CoverCrop::new([0,0,500_000,1_000_000]).unwrap());
                                 Phase::Ready(CropDraft {source:prepared.source,texture:ctx.load_texture("pure-cover",prepared.image,egui::TextureOptions::LINEAR),rotation:Rotation::None,
-                                    crop:crop_rect(prepared.crop),had_manual_crop:true,drag:None,error:None})
+                                    crop:crop_rect(prepared.crop),had_manual_crop:true,auto_enabled:true,drag:None,error:None})
                             }
                             _=>Phase::Failed("代表画像を読み込めませんでした。別のページで指定してください。".into()),
                         });

@@ -732,14 +732,33 @@ impl App {
                 Some(self.settings.folder_thumb_sort),
                 self.settings.folder_thumb_depth,
             )?;
-            let storage_key = crate::thumb_loader::representative_cache_key_for_policy(
-                &storage_key,
-                self.listing_file_type_visibility(),
-            );
             let pin = item.container_path().and_then(|path| {
                 self.folder_pin_map
                     .get(&crate::path_key::normalize_keep_drive(path))
             });
+            let auto = self.thumbnail_auto_crop_identity().filter(|_| {
+                pin.is_none_or(|pin| {
+                    let mut probe = LoadRequest {
+                        cover_crop: pin.cover_crop,
+                        ..Default::default()
+                    };
+                    match &pin.source {
+                        crate::folder_thumb_pins::FolderPinSource::ZipEntry { entry, .. } => {
+                            probe.zip_entry = Some(entry.clone())
+                        }
+                        crate::folder_thumb_pins::FolderPinSource::File { rel, .. } => {
+                            probe.path = PathBuf::from(rel)
+                        }
+                        _ => {}
+                    }
+                    auto_crop_leaf_allowed(&probe)
+                })
+            });
+            let storage_key = crate::thumb_loader::representative_cache_key_for_policy_with_auto(
+                &storage_key,
+                self.listing_file_type_visibility(),
+                auto,
+            );
             color_representative_key(
                 item,
                 &storage_key,
@@ -771,7 +790,7 @@ impl App {
         }
         let (mtime, file_size) = self.image_metas.get(idx).copied().flatten()?;
         let empty_pins = std::collections::HashMap::new();
-        let mut req = make_load_request_with_visibility(
+        let mut req = make_load_request_with_auto_crop(
             item,
             idx,
             mtime,
@@ -792,6 +811,7 @@ impl App {
             self.video_pin_db.as_ref(),
             self.use_full_path_cache_keys(),
             self.listing_file_type_visibility(),
+            self.thumbnail_auto_crop_identity(),
         )?;
         req.relative_page_provenance = self.relative_page_provenance_for_idx(idx);
         self.attach_viewer_thumbnail_context(&mut req);
@@ -850,6 +870,7 @@ fn run_color_scan_worker(
         let mtime = item.req.mtime;
         let file_size = item.req.file_size;
         if let Some(source) = item.pin_source {
+            let auto = item.req.auto_cover_crop;
             let container = item.req.path.clone();
             let base_key = item
                 .req
@@ -878,6 +899,8 @@ fn run_color_scan_worker(
                 None,
                 password.as_deref(),
             );
+            item.req
+                .set_auto_cover_crop(auto.filter(|_| auto_crop_leaf_allowed(&item.req)));
         }
         let palette = load_palette_for_request(
             item.req,
@@ -1200,6 +1223,43 @@ mod tests {
         env.invalidate_color_representative(0);
         assert_eq!(env.color_filter.palettes.representative_revisions.len(), 1);
         assert!(env.color_filter_scope_refresh_pending);
+    }
+
+    #[test]
+    fn cover_auto_color_identity_follows_binding_and_manual_range_without_source_io() {
+        let mut app = representative_app();
+        let off = app.color_identity_for_idx(0).unwrap().0;
+        app.settings.default_reading_direction = crate::settings::ReadingDirection::Ltr;
+        assert_eq!(app.color_identity_for_idx(0).unwrap().0, off);
+        app.settings.thumb_cover_auto_crop = true;
+        let ltr = app.color_identity_for_idx(0).unwrap().0;
+        assert_ne!(ltr, off);
+        assert!(ltr.contains("|autocrop:v1:ltr"));
+        let (_, request) = app.color_work_identity_for_idx(0).unwrap();
+        assert_eq!(
+            request.auto_cover_crop,
+            Some(crate::cover_auto_crop::AutoCropIdentity::new(
+                crate::settings::ReadingDirection::Ltr
+            ))
+        );
+        app.settings.default_reading_direction = crate::settings::ReadingDirection::Rtl;
+        assert_ne!(app.color_identity_for_idx(0).unwrap().0, ltr);
+        let path = app.items[0].container_path().unwrap().to_owned();
+        app.folder_pin_map.insert(
+            crate::path_key::normalize_keep_drive(&path),
+            crate::folder_thumb_pins::FolderPin {
+                source: crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+                    zip_rel: String::new(),
+                    entry: "cover.jpg".into(),
+                },
+                cover_crop: crate::folder_thumb_pins::CoverCrop::new([0, 0, 500_000, 1_000_000])
+                    .unwrap(),
+            },
+        );
+        let manual = app.color_identity_for_idx(0).unwrap().0;
+        assert!(!manual.contains("|autocrop:"));
+        app.settings.default_reading_direction = crate::settings::ReadingDirection::Ltr;
+        assert_eq!(app.color_identity_for_idx(0).unwrap().0, manual);
     }
 
     #[test]

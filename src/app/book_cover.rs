@@ -71,6 +71,9 @@ pub(crate) struct BookCoverEnv {
     pub(crate) folder_thumb_sort: crate::settings::SortOrder,
     pub(crate) folder_thumb_depth: u32,
     pub(crate) visibility: crate::file_type_visibility::FileTypeVisibility,
+    pub(crate) thumb_cover_auto_crop: bool,
+    pub(crate) default_reading_direction: crate::settings::ReadingDirection,
+    pub(crate) edit_preview_db: Option<Arc<crate::edit_preview_cache::EditPreviewCacheDb>>,
     pub(crate) pin_db: Option<Arc<crate::folder_thumb_pins::FolderThumbPinDb>>,
     pub(crate) video_pins: Option<crate::video_pins::VideoPinReadSource>,
     pub(crate) archive_cache: Option<Arc<crate::archive_cache::ArchiveCacheDb>>,
@@ -86,6 +89,9 @@ impl Default for BookCoverEnv {
             folder_thumb_sort: crate::settings::SortOrder::Numeric,
             folder_thumb_depth: 3,
             visibility: Default::default(),
+            thumb_cover_auto_crop: false,
+            default_reading_direction: Default::default(),
+            edit_preview_db: None,
             pin_db: None,
             video_pins: None,
             archive_cache: None,
@@ -104,6 +110,9 @@ impl App {
             folder_thumb_sort: self.settings.folder_thumb_sort,
             folder_thumb_depth: self.settings.folder_thumb_depth,
             visibility: self.listing_file_type_visibility().clone(),
+            thumb_cover_auto_crop: self.settings.thumb_cover_auto_crop,
+            default_reading_direction: self.settings.default_reading_direction,
+            edit_preview_db: self.edit_preview_cache.as_ref().map(|service| service.db()),
             pin_db: self.folder_thumb_pin_db.clone(),
             video_pins: self.video_pin_db.as_ref().and_then(|db| db.read_source()),
             archive_cache: self.archive_cache_db.clone(),
@@ -134,6 +143,7 @@ pub(crate) struct ResolvedBookCover {
     pub(crate) persistent_source: FolderPinSource,
     pub(crate) rotation_key: Option<String>,
     pub(crate) cover_crop: Option<CoverCrop>,
+    pub(crate) edit_preview_key: Option<String>,
 }
 
 #[derive(Debug)]
@@ -348,6 +358,7 @@ impl CoverResolver<'_> {
                     self.env.books_root.as_deref(),
                 ),
                 cover_crop: None,
+                edit_preview_key: None,
             });
         }
         let pin_container = zip_prefix.map_or_else(
@@ -541,6 +552,7 @@ impl CoverResolver<'_> {
                 .ok()
                 .filter(|metadata| metadata.is_file())
                 .and_then(|metadata| FileSignature::from_metadata(&metadata));
+            let edit_preview_key = request.edit_preview_key.clone();
             let resolved = crate::thumb_loader::resolve_read_after_cache_miss(
                 request,
                 self.env.pin_db.as_deref(),
@@ -612,6 +624,7 @@ impl CoverResolver<'_> {
                     self.env.books_root.as_deref(),
                 ),
                 cover_crop: resolved.cover_crop,
+                edit_preview_key,
                 location: resolved.location,
                 signature_path: logical_path,
                 signature,

@@ -354,7 +354,7 @@ fn prepare_rating_view(
         .iter()
         .zip(image_metas.iter())
         .flat_map(|(item, meta)| {
-            crate::app::folder_thumb_existing_keys_for_with_visibility(
+            crate::app::folder_thumb_existing_keys_for_with_auto_crop(
                 item,
                 *meta,
                 &pin_map,
@@ -363,6 +363,11 @@ fn prepare_rating_view(
                 options.folder_thumb_depth,
                 true,
                 &options.visibility,
+                options.sidecar_settings.thumb_cover_auto_crop.then(|| {
+                    crate::cover_auto_crop::AutoCropIdentity::new(
+                        options.sidecar_settings.default_reading_direction,
+                    )
+                }),
             )
         })
         .collect();

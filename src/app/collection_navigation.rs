@@ -6699,6 +6699,7 @@ mod tests {
                 .map(|(key, source)| (key, source.into()))
                 .collect();
         let sources = prepared_thumbnail_sources(CollectionGridThumbnailSources {
+            auto_cover_crop: None,
             folder_pin_map: folder_pins.clone(),
             video_folder_pin_seeds: Arc::clone(&seeds),
             video_sidecars: std::collections::HashMap::from([(
@@ -6925,6 +6926,7 @@ mod tests {
             vec![7; MAX_RETAINED_COLLECTION_PIN_BLOB_BYTES + 1],
         )]));
         let delivery = prepared_thumbnail_sources(CollectionGridThumbnailSources {
+            auto_cover_crop: None,
             folder_pin_map: Default::default(),
             video_folder_pin_seeds: Default::default(),
             video_sidecars: std::collections::HashMap::new(),
@@ -7436,6 +7438,7 @@ mod tests {
             &app,
             &prepared,
             prepared_thumbnail_sources(CollectionGridThumbnailSources {
+                auto_cover_crop: None,
                 folder_pin_map: Default::default(),
                 video_folder_pin_seeds: Default::default(),
                 video_sidecars: std::collections::HashMap::from([(
@@ -7696,6 +7699,7 @@ mod tests {
         );
         let prepared = prepare_snapshot(&added.snapshot);
         let sources_a = CollectionGridThumbnailSources {
+            auto_cover_crop: None,
             folder_pin_map: Default::default(),
             video_folder_pin_seeds: Default::default(),
             video_sidecars: std::collections::HashMap::from([(
@@ -7777,6 +7781,7 @@ mod tests {
 
         std::fs::write(&sidecar_a, b"same-path-sidecar-updated").unwrap();
         let sidecar_changed = CollectionGridThumbnailSources {
+            auto_cover_crop: None,
             folder_pin_map: Default::default(),
             video_folder_pin_seeds: Default::default(),
             video_sidecars: std::collections::HashMap::from([(
@@ -7810,6 +7815,7 @@ mod tests {
         assert_eq!(app.video_thumb_overrides.get("video-key"), Some(&sidecar_a));
 
         let pin_changed = CollectionGridThumbnailSources {
+            auto_cover_crop: None,
             folder_pin_map: Default::default(),
             video_folder_pin_seeds: Default::default(),
             video_sidecars: std::collections::HashMap::from([(

@@ -47,6 +47,35 @@ fn cover_crop_small_200_dark() {
 }
 
 fn cover_crop_snapshot(name: &str, theme: mimageviewer::os_theme::ResolvedTheme, scale: f32) {
+    cover_crop_snapshot_with_auto(name, theme, scale, false);
+}
+
+#[test]
+fn cover_auto_crop_small_100_light() {
+    cover_crop_snapshot_with_auto(
+        "cover_auto_crop_small_100_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        1.0,
+        true,
+    );
+}
+
+#[test]
+fn cover_auto_crop_small_200_dark() {
+    cover_crop_snapshot_with_auto(
+        "cover_auto_crop_small_200_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        2.0,
+        true,
+    );
+}
+
+fn cover_crop_snapshot_with_auto(
+    name: &str,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+    scale: f32,
+    auto_enabled: bool,
+) {
     let mut fonts_ready = false;
     let mut harness = test_ui::builder()
         .with_size(egui::vec2(1093.0, 614.0))
@@ -59,7 +88,11 @@ fn cover_crop_snapshot(name: &str, theme: mimageviewer::os_theme::ResolvedTheme,
                 ui.ctx().request_repaint();
                 return;
             }
-            mimageviewer::draw_cover_crop_snapshot_fixture(ui);
+            if auto_enabled {
+                mimageviewer::draw_cover_auto_crop_snapshot_fixture(ui);
+            } else {
+                mimageviewer::draw_cover_crop_snapshot_fixture(ui);
+            }
         });
     harness.run_steps(8);
     let viewport = harness.ctx.content_rect();
@@ -67,6 +100,15 @@ fn cover_crop_snapshot(name: &str, theme: mimageviewer::os_theme::ResolvedTheme,
         assert!(
             viewport.contains_rect(harness.get_by_label(label).rect()),
             "{name}: {label} outside viewport"
+        );
+    }
+    if auto_enabled {
+        assert!(
+            viewport.contains_rect(
+                harness
+                    .get_by_label("手動の範囲を解除すると、自動の判定に戻ります。")
+                    .rect()
+            )
         );
     }
     harness.snapshot(name);

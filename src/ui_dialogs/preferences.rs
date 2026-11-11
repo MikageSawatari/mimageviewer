@@ -2843,6 +2843,11 @@ impl App {
             let old_show_hidden_files = self.settings.show_hidden_files;
             let file_type_visibility_changed =
                 self.settings.file_type_visibility != state.settings.file_type_visibility;
+            let cover_auto_crop_changed = self.settings.thumb_cover_auto_crop
+                != state.settings.thumb_cover_auto_crop
+                || (state.settings.thumb_cover_auto_crop
+                    && self.settings.default_reading_direction
+                        != state.settings.default_reading_direction);
             let old_exif = self.settings.exif_hidden_tags.clone();
 
             let old_susie = (
@@ -3193,7 +3198,7 @@ impl App {
             let rating_sort_position_changed = old_rating_sort_unrated_position
                 != self.settings.rating_sort_unrated_position
                 && self.settings.sort_order.is_rating();
-            if file_type_visibility_changed {
+            if file_type_visibility_changed || cover_auto_crop_changed {
                 self.apply_file_type_visibility_change(ctx);
             } else if duplicate_settings_changed || file_visibility_changed {
                 self.reload_current_folder_preserving_override();
@@ -5807,6 +5812,56 @@ mod tests {
             db.load_into_settings().unwrap().thumb_show_type_icon,
             !initial
         );
+    }
+
+    #[test]
+    fn thumb_cover_auto_crop_preferences_ok_cancel_save_and_reopen() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_view_harness(PreferencesPage::Thumbnail);
+        let label = "つながった表紙から表表紙を自動で切り出す (書庫・PDF の本)";
+        let db = crate::settings_db::SettingsDb::open(harness.state().tmp.path()).unwrap();
+        for (cancel, expected) in [(true, false), (false, true), (true, true), (false, false)] {
+            harness.get_by_label(label).click();
+            harness.run_steps(3);
+            let before = harness.state().settings.thumb_cover_auto_crop;
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .thumb_cover_auto_crop,
+                !before
+            );
+            harness
+                .get_by_label(if cancel { "キャンセル" } else { "  OK  " })
+                .click();
+            harness.run_steps(3);
+            if cancel {
+                harness.get_by_label("破棄して閉じる").click();
+                harness.run_steps(3);
+            }
+            assert_eq!(harness.state().settings.thumb_cover_auto_crop, expected);
+            assert_eq!(
+                db.load_into_settings().unwrap().thumb_cover_auto_crop,
+                expected
+            );
+            harness
+                .state_mut()
+                .open_preferences_page(PreferencesPage::Thumbnail);
+            harness.run_steps(3);
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .thumb_cover_auto_crop,
+                expected
+            );
+        }
     }
 
     #[test]

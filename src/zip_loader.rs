@@ -2967,6 +2967,67 @@ fn read_prefix_by_name<R: Read + Seek>(
     Ok(bytes)
 }
 
+/// Dimension-sampling input for auto covers. Inspect only this outer ZIP's
+/// central directory and read bounded prefixes through the same open handle.
+/// Nested ZIPs and direct RAR never enter a full-entry compatibility fallback.
+pub(crate) fn read_cover_auto_page_prefixes(
+    zip_path: &Path,
+    leaf_entry: &str,
+    prefix: Option<&str>,
+) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    if crate::rar_loader::is_rar_path(zip_path) || split_nested_zip_path(leaf_entry).len() > 1 {
+        return Ok(Vec::new());
+    }
+    let mut archive = ARCHIVE_DIRECTORY_CACHE.open_archive(zip_path, None)?;
+    let prefix = prefix.map(|p| {
+        let p = p.replace('\\', "/");
+        if p.is_empty() {
+            p
+        } else {
+            format!("{}/", p.trim_end_matches('/'))
+        }
+    });
+    let mut names = Vec::new();
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index_raw(index)
+            .map_err(|e| zip_error_to_io(e, None))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = normalized_zip_entry_name(&entry);
+        if should_ignore(&name)
+            || prefix
+                .as_ref()
+                .is_some_and(|prefix| !name.starts_with(prefix))
+            || split_nested_zip_path(&name).len() > 1
+            || !lowercase_ext(&name).is_some_and(|ext| is_image_ext(&ext))
+        {
+            continue;
+        }
+        names.push((crate::filename_sort::FileNameSortKey::new(&name), name));
+    }
+    names.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let leaf = leaf_entry.replace('\\', "/");
+    let Some(leaf_index) = names.iter().position(|(_, name)| name == &leaf) else {
+        return Ok(Vec::new());
+    };
+    let mut prefixes = Vec::new();
+    for index in crate::cover_auto_sample::sample_indices(names.len(), leaf_index) {
+        let name = &names[index].1;
+        if let Ok(bytes) = read_prefix_by_name(
+            &mut archive,
+            name,
+            None,
+            crate::cover_auto_sample::MAX_SAMPLE_PREFIX_BYTES,
+            None,
+        ) {
+            prefixes.push((name.clone(), bytes));
+        }
+    }
+    Ok(prefixes)
+}
+
 fn decoded_name_index<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     entry_name: &str,

@@ -1116,7 +1116,14 @@ metadata bundle は v13 に範囲を追加し、v7〜v12 の取り込みを維�
 cascade は leaf の範囲を route hash に含める。範囲なしの綴りは変更しない。
 キー生成と要求設定は `ResolvedPinTarget` の helper へ統一し、ドライブの近似では範囲を含めない。
 基本キーの正規化は `|types:`・`|autocrop:` を除去して設定を付け直し、pin と EPUB generation を保持する。
-第1段では自動 identity は出力しない。存続集合は手動範囲付きの完成キーも含める。
+自動切り出しは `thumb_cover_auto_crop`（既定 OFF）と既定の綴じ方向をキーに反映する。
+基本キーの `|types:` の後、`#pin:` より前に `|autocrop:v1:rtl` / `|autocrop:v1:ltr` を付ける。
+手動範囲・ページ一覧・仮想フォルダの seed/writeback・ドライブ・Remote には付けない。
+フォルダの自動代表にも設定 identity を付けるが、自身では判定せず子の完成行を子の実効キーで読む。
+存続集合は従来の基本・固定キー、手動範囲付きの完成キーと、現設定の自動 identity 付きのキーを含め、ピンなし ZipDir も明示して残す。
+ネストでない ZIP/変換 ZIP の近傍ページは最大8枚の先頭256KBずつで寸法だけを調べる。
+PDF/変換済み EPUB は代表描画と同じ password・`ReadTarget` lease の `PageSizes` を使い、追加の変換や問い合わせはしない。
+ネスト ZIP・直接読む RAR は先読みせず、フォルダの本も自動判定の対象外。
 
 ユーザーが「このフォルダ / ZIP / PDF / 変換済み RAR・7z・LZH の代表サムネは中の特定アイテム」を手動で指定
 できる機能。優先順位は **手動ピン > 自動代表選定 > フォルダ/ZIP/PDF/アーカイブアイコン**。

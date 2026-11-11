@@ -313,6 +313,21 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ]
     ),
     entry!(
+        "thumbnail/cover-auto-crop",
+        Thumbnail,
+        "つながった表紙から表表紙を自動で切り出す (書庫・PDF の本)",
+        [
+            "表紙",
+            "背",
+            "裏表紙",
+            "切り出し",
+            "範囲",
+            "綴じ方向",
+            "書庫",
+            "PDF"
+        ]
+    ),
+    entry!(
         "thumbnail/name-font-scale",
         Thumbnail,
         "名前の文字サイズ:",
@@ -2257,6 +2272,18 @@ mod tests {
             assert_eq!(entry.page, page);
             assert!(PAGES_SOURCE.contains(&format!("anchored(ui, state, \"{anchor}\"")));
         }
+    }
+
+    #[test]
+    fn thumb_cover_auto_crop_search_finds_its_anchor() {
+        for query in ["表表紙", "表紙 切り出し", "綴じ方向 書庫"] {
+            let entry = search_preferences(query, test_tree_position)
+                .into_iter()
+                .find(|entry| entry.anchor == "thumbnail/cover-auto-crop")
+                .unwrap_or_else(|| panic!("missing automatic cover crop setting for {query}"));
+            assert_eq!(entry.page, PreferencesPage::Thumbnail);
+        }
+        assert!(PAGES_SOURCE.contains("anchored(ui, state, \"thumbnail/cover-auto-crop\""));
     }
 
     #[test]

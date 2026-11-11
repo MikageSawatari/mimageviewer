@@ -608,3 +608,84 @@ PowerShell の構文検査は成功。権限のある端末で同スクリプト
   `CARGO_BUILD_JOBS=1` / `CMAKE_BUILD_PARALLEL_LEVEL=1`、通常profile、portableなし。
   5実行ファイルと依存DLLの配置、PE検査（runtime=4 / pe=5）も成功。実行ファイルは起動していない。
   `target/cover-crop-revise-build-dev.log`。
+
+## 16. 第2段（自動）の実装・引き継ぎ（2026-11-12）
+
+基点は第1段と再レビュー修正 `bd3ba8b30` / `6407c82a1`。実装担当はコミットせず、作業ツリーで引き継ぐ。
+評価資料・画像はリポジトリへコピーしない。検出は指定の `miv5_crop` とそのhelpersの挙動を独立したRustの純粋関数へ移し、
+ZipPlaのコードは参照しない。ディレクトリ評価・独立レビュー・確認用buildは設計担当が行う。
+
+### 16.1 接続と実装上の判断
+
+- `cover_auto_crop` は元寸法の入口、余白、境界、背／平らな面、綴じの並び、色の拒否を理由付きで判定する。
+  解析用rasterは高さ256・面積平均（横1解析画素幅、縦2解析画素幅）で統一する。試作の`downscale`は小画像を拡大しないが、workerの縮小済み入力を扱うため、
+  §6.2に従って小画像も256へ拡大する。cubicでは低解像度で約3列揺れたため、§12.7に従って正規化を修正した。
+  横の背境界を太らせずに縦方向の単発ノイズを平均し、判定しきい値を変えずに、倍率間の境界の安定性を合成・実JPEG DCTテストで確認する。
+  100:1を超える細片は、縦長1面が最小1%の幅を持てないため解析を辞退し、拡大による過大な作業領域を作らない。
+- ZIPの通常列挙は入れ子を展開し得るので、先読みは中央目次だけを調べる限定helperを使う。
+  既存と同じ名前解決とprefix読取で、同じハンドルから最大8回×256KiBを読む。全entry読取へのfallbackは持たない。
+  読む順の次、末尾だけ前を選び、portrait比率と中央値の合意を調べる。PDF/EPUBは同じpasswordとReadTargetでPageSizesを使う。
+- 自動identityを追加するのは正規化関数だけ。要求のsetterでidentityとkeyを同時に設定する。
+  手動範囲と既知のRAW／動画／音声を除外し、Drive・Remote・ページseed/writebackは範囲なしの名前空間を保つ。
+  フォルダのAutoSelectedにはK2のためのidentityだけを付け、フォルダ画像を自動判定しない。
+- K2は子のwriterと同じkeyで読む。子の手動範囲・対象外のleaf・FolderのSeeded pinも区別する。
+  leafの種類の判定には解決済みの実パスとentryを渡し、空のprobeでRAW／動画／音声を見落とさない。
+  手動範囲のない代替要求は自動の指示と元のpinned keyを保つ。
+  存続集合には従来の基本・固定keyと現在の自動keyを併せて入れ、前の綴じ方向の自動keyは残さない。
+  フォルダ名が`.cr3`や`.mp4`でもFolderの役割を保ち、K2用identityを落とさない。
+- 初回デコードの全体を類似索引へ渡してから判定する。切った長辺が表示寸法に足りないときだけ、
+  同じJPEG bytes／同じPDF leaseから最大1回再デコードする。CacheOnlyは判定・先読みをしない。
+- 設定は既定OFFの加法field。通常Settings DBは汎用serde保存で、RemoteListingSettingsへは追加しない。
+  設定転送の明示的な項目一覧へ登録する。ON/OFF、またはON中の既定綴じ方向の変更は、種類の表示設定と同じreloadを使う。
+  Collectionのsource digestと再利用判定もON時のidentityを含め、OFF時の旧digestを保つ。
+- 範囲画面は既存の1つの準備workerで先読み・判定する。手動範囲を優先し、無ければ自動、無ければ全体。
+  固定ページの有効な編集previewがある場合は自動判定しない。自動の初期枠だけでは手動解除を有効にせず、OKで手動の範囲にする。
+
+### 16.2 ディレクトリ評価の実行方法（設計担当）
+
+`cover_auto_crop_directory_evaluation` はignored test。ZIPでは実際のbounded先読み、PNGダミーではtruthのpage_aspectを使う。
+比較画像 `sheet.png` と2次元IoUによる集計 `summary.json` を出す。素材を変更せず、出力先は明示できる。
+
+```powershell
+$env:MIV_COVER_AUTO_EVAL_DIR = 'G:\home\mimageviewer-764-eval\dummies' # realisticも別実行
+$env:MIV_COVER_AUTO_EVAL_OUTPUT = '.\target\cover-auto-eval-dummies'
+cargo test -p mimageviewer --lib cover_auto_crop_directory_evaluation -- --ignored --nocapture
+```
+
+合成ダミー57/82・本物らしい合成59/90以上、誤り0、負例を一度も切らないという受入判定は、この設計担当の実行結果で行う。
+実装担当はこの外部評価を実行しない。
+
+### 16.3 実装担当の自動検証
+
+対象は上記基点に対する未コミットの第2段差分。通常のtest profile・既定features、
+`CARGO_BUILD_JOBS=1` / `CMAKE_BUILD_PARALLEL_LEVEL=1`で実行した。
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/cover_auto|auto_cover_crop|auto_crop_scale_tests|thumb_cover_auto_crop|cover_crop|representative_cache_key|folder_thumb_pin|book_cover|cover_rotation_tests|cover_scope_tests|color_representative|collection_container_pin|settings_transfer/)' --no-fail-fast
+```
+
+- 最終版は **243成功・失敗0（exit 0）、17127 skipped**。
+  `target/cover-auto-stage2-focused.log`。lib全件・test-fullは実行していない。
+- 自前生成のカバー16条件（左右綴じ・余白と埃・傾き・折り返しの有無）はすべて2次元IoU 0.85以上。
+  負例10条件（表紙だけ・横長・見開き・絵と白地の左右、左右綴じ）はすべて辞退した。
+  128/256/512/1024行の入力と、実TurboJPEGの3種類以上のDCT倍率で、左右端の揺れが解析用rasterの1.1列以内。
+- ZIPの実先読みとworker保存、CacheOnlyの再利用、種類除外の代替、編集preview優先、
+  PDF/EPUBのPageSizesと最大1回の拡大再描画で同じpassword・ReadTarget借用を確認した。
+  K2の手動／自動／RAW／動画／音声／Folder Seeded pinの子writer key一致を確認した。
+  Folder/ZIP/PDF/ZipDirの現設定キーと従来キーの存続、旧綴じ方向の自動キーの除去、
+  OFFのgolden・Collection digest・色フィルタ・設定の保存／転送も含む。
+- §1.742のEPUB完成generationキーと存続集合の既存境界は、手動に続き自動付きでも記録した。
+  generation付きの完成行が現行のpending集合では残らない点は§1.742の修正対象で、今回変更しない。
+- 反復中の3件の失敗は、設定転送の件数期待値、CacheOnly用fixtureの在メモリmap未水和、cubic rasterの倍率間の揺れだった。
+  件数を追加項目分更新し、fixtureは既存Fixed providerの契約どおりmapを水和し、rasterは§16.1の面積平均へ修正した。
+  続く1件は転送wireの件数期待値の更新漏れで修正済み。最終成功件数にはこれらの失敗を含めない。
+- `cargo test -p mimageviewer --test ui_snapshot`（更新指定なし）は **253成功・失敗0（exit 0）**。
+  `target/cover-auto-stage2-snapshots-compare.log`。自動ONの範囲画面2枚を追加し、設定欄の
+  `preferences_favorite_view_state_dark` 1枚だけを意図的に更新した。新規2枚と設定の更新は限定filterで実行し、
+  1093×614の100%/200%で説明・操作行・画像とhandle、設定欄の追加文と後続項目を目視した。
+  既存の手動用2枚を含む他のPNGは変更していない。
+  最初の全件比較は252成功・設定欄1件の意図した差分で、更新後の全件比較を上記の最終結果とする。
+- 引数なしの`cargo fmt`、`cargo fmt --check`、`git diff --check`は成功。
+  `python scripts/check_ui_glyphs.py`は0件、`python scripts/check_site_cards.py`は53枚・超過0。
+- 指示どおりコミット・確認用build・製品起動・外部ディレクトリ評価・追加の独立レビューは行っていない。
+  設計担当は§16.2の評価、別コンテキストの独立レビューと確認用buildを実行する。
