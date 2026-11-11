@@ -97,6 +97,29 @@ class ConverterTests(unittest.TestCase):
     def converter(self, page='plugins/eq.md'):
         return docs.Converter(page, {'plugins/eq.md', 'plugins/delay.md'}, {'plugins/eq.md', 'plugins/delay.md', 'README.md'}, {'bus_function.png'})
 
+    def test_empty_legacy_anchor_is_safe_and_preserved(self):
+        converter = self.converter()
+        self.assertEqual(converter.render('<a id="sfz-note-player"></a>'),
+                         '<p><a id="sfz-note-player"></a></p>')
+        for invalid in ['<a id="legacy" onclick="run()"></a>',
+                        '<a href="https://example.com"></a>',
+                        '<a id="legacy">text</a>', '<a id="legacy">']:
+            with self.subTest(invalid=invalid), self.assertRaises(docs.ConversionError):
+                converter.render(invalid)
+
+    def test_metadata_corrections_require_exact_existing_fields(self):
+        metadata = {'title': 'Tools', 'description': 'Audio and MIDI'}
+        rule = {'operation': 'replace_metadata', 'field': 'description',
+                'anchor': 'Audio and MIDI', 'replacement': 'Audio'}
+        self.assertEqual(docs.apply_metadata_overrides(metadata, [rule]),
+                         {'title': 'Tools', 'description': 'Audio'})
+        self.assertEqual(metadata['description'], 'Audio and MIDI')
+        for invalid in [{**rule, 'anchor': 'outdated'}, {**rule, 'field': 'lang'}]:
+            with self.subTest(rule=invalid), self.assertRaisesRegex(docs.ConversionError, 'metadata must match once'):
+                docs.apply_metadata_overrides(metadata, [invalid])
+        with self.assertRaisesRegex(docs.ConversionError, 'metadata must match once'):
+            docs.apply_metadata_overrides(metadata, [rule, rule])
+
     def test_front_matter_and_japanese_only(self):
         metadata, body = docs.front_matter('---\ntitle: "音響"\ndescription: "説明"\nlang: ja\n---\n# 本文')
         self.assertEqual(metadata, {'title': '音響', 'description': '説明', 'lang': 'ja'})
@@ -228,12 +251,12 @@ class ConverterTests(unittest.TestCase):
 class GenerationTests(unittest.TestCase):
     def test_fork_and_upstream_versions_are_verified_separately(self):
         with self.assertRaisesRegex(docs.ConversionError, 'associated with mIV Sound'):
-            docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.6')
+            docs.generate(docs.DEFAULT_SOURCE, 'v0.17.0-miv.0')
         with self.assertRaisesRegex(docs.ConversionError, 'DOCS_VERSION v0.14.0'):
-            docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.7', 'v0.14.0')
+            docs.generate(docs.DEFAULT_SOURCE, 'v0.17.0-miv.1', 'v0.14.0')
 
     def test_sound_branding_defaults_storage_and_upstream_credit(self):
-        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.7')
+        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.17.0-miv.1')
         for name, data in output.items():
             if not name.endswith('.html'):
                 continue
@@ -242,7 +265,7 @@ class GenerationTests(unittest.TestCase):
                 self.assertIn('manual/sound/' + name, page)
                 self.assertIn('EffeTune / EffeTune Mixwright (作者: Frieve、MIT License)', page)
                 self.assertIn('<a href="https://github.com/MikageSawatari/miv-sound">mIV Sound のソース</a>', page)
-                self.assertIn('https://github.com/Frieve-A/effetune/tree/c506bbab8a3dcd75bc5049ebb9b92572b526c557/docs/i18n/ja', page)
+                self.assertIn('https://github.com/Frieve-A/effetune/tree/5ffca1b31e8a74ada7140aefd0c9c9fe4b7740da/docs/i18n/ja', page)
                 self.assertNotIn('mIV Sound Web アプリ', page)
                 self.assertNotIn('%APPDATA%', page)
                 self.assertNotIn('CUE', page)
@@ -261,16 +284,18 @@ class GenerationTests(unittest.TestCase):
         self.assertIn('effetune/plugin/sfz-references.json', output['others-sfz-note-player.html'].decode())
 
     def test_snapshot_cannot_be_silently_relabelled_for_new_bundle(self):
-        with self.assertRaisesRegex(docs.ConversionError, 'associated with mIV Sound unspecified, not v0.15.0-miv.7'):
-            docs.generate(docs.ROOT / 'third_party/effetune-docs/03bffda3', 'v0.15.0-miv.7')
-        with self.assertRaisesRegex(docs.ConversionError, 'associated with mIV Sound unspecified, not v0.15.0-miv.7'):
-            docs.generate(docs.ROOT / 'third_party/effetune-docs/6791afdf', 'v0.15.0-miv.7')
-        with self.assertRaisesRegex(docs.ConversionError, 'associated with mIV Sound unspecified, not v0.15.0-miv.7'):
-            docs.generate(docs.ROOT / 'third_party/effetune-docs/01c96f00', 'v0.15.0-miv.7')
+        with self.assertRaisesRegex(docs.ConversionError, 'associated with mIV Sound 0.15.0-miv.7, not v0.17.0-miv.1'):
+            docs.generate(docs.ROOT / 'third_party/effetune-docs/c506bbab', 'v0.17.0-miv.1')
+        with self.assertRaisesRegex(docs.ConversionError, 'associated with mIV Sound unspecified, not v0.17.0-miv.1'):
+            docs.generate(docs.ROOT / 'third_party/effetune-docs/03bffda3', 'v0.17.0-miv.1')
+        with self.assertRaisesRegex(docs.ConversionError, 'associated with mIV Sound unspecified, not v0.17.0-miv.1'):
+            docs.generate(docs.ROOT / 'third_party/effetune-docs/6791afdf', 'v0.17.0-miv.1')
+        with self.assertRaisesRegex(docs.ConversionError, 'associated with mIV Sound unspecified, not v0.17.0-miv.1'):
+            docs.generate(docs.ROOT / 'third_party/effetune-docs/01c96f00', 'v0.17.0-miv.1')
 
     def test_snapshot_matches_output_and_preserves_license_images(self):
-        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.7')
-        self.assertEqual(len(output), 137)  # 20 category/guide/index/license + 113 plugin pages + 4 images
+        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.17.0-miv.1')
+        self.assertEqual(len(output), 138)  # 21 category/guide/index/license + 113 plugin pages + 4 images
         for name, data in output.items():
             with self.subTest(name=name):
                 self.assertEqual((docs.MANUAL / 'sound' / name).read_bytes(), data)
@@ -279,7 +304,7 @@ class GenerationTests(unittest.TestCase):
                     self.assertNotIn('sidebar-section', text)
                     self.assertIn('href="../style.css"', text)
                     self.assertIn('href="license.html"', text)
-                    self.assertIn('c506bbab8a3dcd75bc5049ebb9b92572b526c557', text)
+                    self.assertIn('5ffca1b31e8a74ada7140aefd0c9c9fe4b7740da', text)
                     self.assertNotIn('{%', text)
                     self.assertNotIn('<p></p>', text)
                     self.assertNotIn('<li></li>', text)
@@ -289,7 +314,7 @@ class GenerationTests(unittest.TestCase):
             self.assertEqual(output['images/' + path.name], path.read_bytes())
 
     def test_snapshot_split_navigation_index_and_override_survival(self):
-        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.7').items() if name.endswith('.html')}
+        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.17.0-miv.1').items() if name.endswith('.html')}
         eq = output['eq.html'].split('<main class="content">')[1]
         self.assertIn('id="スペクトラムオーバーレイ"', eq)
         self.assertIn('href="eq-15band-geq.html"', eq)
@@ -319,7 +344,7 @@ class GenerationTests(unittest.TestCase):
         self.assertIn('visualizer.html', output)
 
     def test_readme_basic_operations_keep_vst_features_and_exclude_other_platforms(self):
-        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.7').items() if name.endswith('.html')}
+        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.17.0-miv.1').items() if name.endswith('.html')}
         body = output['README.html'].split('<main class="content">')[1].split('</main>')[0]
         for heading in ['Visualizer', 'エフェクトチェーンの作成', 'プリセットの使用', 'エフェクトの共通操作', '保存データのバックアップと復元', 'セクション機能の使用方法', 'ABパイプライン機能の使用', 'エフェクト選択とキーボードショートカット', 'よく使われるエフェクトの組み合わせ']:
             self.assertIn(heading, body)
@@ -346,7 +371,7 @@ class GenerationTests(unittest.TestCase):
         self.assertIn('href="controller-mapping.html"', body)
 
     def test_new_effects_and_expanded_visualizer_keep_bundled_operations(self):
-        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.7').items() if name.endswith('.html')}
+        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.17.0-miv.1').items() if name.endswith('.html')}
         for page in ['analyzer-analog-meter.html', 'analyzer-rhythm-analyzer.html', 'eq-tonal-balance-eq.html', 'others-sfz-note-player.html', 'resonator-adaptive-prediction.html']:
             self.assertIn(page, output)
             self.assertIn('href="' + page + '"', output['index.html'])
@@ -367,16 +392,16 @@ class GenerationTests(unittest.TestCase):
                 self.assertNotIn('省電力', text)
                 self.assertNotIn('非表示時は表示専用DSPをスキップ', text)
         body = output['visualizer.html'].split('<main class="content">')[1].split('</main>')[0]
-        for retained in ['共通の10種類', 'このほかの8種類', 'mIV Original', 'Lyric Stage', 'Fretboard', 'Guitar', 'Analog Meter', 'Rhythm Analyzer', 'Phase Map', 'リンクを読み込む', 'Ctrl+V', 'Ctrl+D', 'Ctrl+クリック', '最前面へ', 'グラフスケール', 'Trail Feedback', 'Edge Fade', 'Cinema Strip', 'Meter Bridge']:
+        for retained in ['共通の11種類', 'このほかの10種類', 'mIV Original', 'Lyric Stage', 'Fretboard', 'Guitar', 'Analog Meter', 'Rhythm Analyzer', 'Phase Map', 'リンクを読み込む', 'Ctrl+V', 'Ctrl+D', 'Ctrl+クリック', '最前面へ', 'グラフスケール', 'Trail Feedback', 'Edge Fade', 'Cinema Strip', 'Meter Bridge']:
             self.assertIn(retained, body)
         for excluded in ['クリーンフィード', 'Macでは', 'WebAssembly 音声処理を使用する', 'ハードウェア アクセラレーションを使用', 'v0.12.0']:
             self.assertNotIn(excluded, body)
-        self.assertIn('c506bbab8a3dcd75bc5049ebb9b92572b526c557', body)
+        self.assertIn('5ffca1b31e8a74ada7140aefd0c9c9fe4b7740da', body)
         for information in ['代表画像をこの表示へ自動で渡します', '長辺1024ピクセル', '最初の一枚', '曲が終わっても情報を残し', '前回の表示 (デフォルト)']:
             self.assertIn(information, body)
         self.assertNotIn('この表示には渡されません', body)
         sfz = output['others-sfz-note-player.html']
-        for usable in ['SFZ Library', 'フォルダーを取り込む', 'ファイルを取り込む', '元の音源フォルダを保管', '音源への参照だけ', '256 MiB', 'Sample Shift', 'ARIA', 'sfz-references.json', '元のファイルは削除しません']:
+        for usable in ['SoundFont Library', 'フォルダーを取り込む', 'ファイルを取り込む', '元の音源ファイルやフォルダーを保管', '音源への参照だけ', '256 MiB', 'Sample Shift', 'ARIA', 'sfz-references.json', '元のファイルは削除しません']:
             self.assertIn(usable, sfz)
         for other_product in ['Electron 版', 'Web 版', 'Import Folder']:
             self.assertNotIn(other_product, sfz)
@@ -391,7 +416,7 @@ class GenerationTests(unittest.TestCase):
         self.assertNotIn('Safari', controller)
 
     def test_bundled_tour_and_visualizer_exclude_standalone_services(self):
-        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.7')
+        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.17.0-miv.1')
         readme = output['README.html'].decode().split('<main class="content">')[1].split('</main>')[0]
         self.assertIn('設定メニューの <strong>画面の案内を見る</strong>', readme)
         self.assertIn('音楽や動画は mImageViewer で再生してください', readme)
@@ -410,13 +435,13 @@ class GenerationTests(unittest.TestCase):
         self.assertIn('Needle Response', output['analyzer-analog-meter.html'].decode())
 
     def test_counter_video_hdr_and_new_standalone_pages_match_vst_host(self):
-        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.7')
+        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.17.0-miv.1')
         visualizer = output['visualizer.html'].decode()
         for expected in ['Video</strong> は追加メニューにありません', 'Visualizer HDR', 'Color Adjust', 'Color Map', 'Mid', 'Treble', 'Beat', 'Width']:
             self.assertIn(expected, visualizer)
         for absent in ['内蔵プレーヤーの現在の再生位置', 'その行へ再生位置が移動', 'クリーンフィード', '外部入力用の経過時間', '処理サンプル', 'project time', 'アートワーク、動画、曲情報と並べて表示できます']:
             self.assertNotIn(absent, visualizer)
-        for expected in ['id="miv-counter"', 'Counter Gallery', 'このほかの8種類', 'mImageViewer が送る再生位置', '歌詞と同じ時刻', '歌詞のない曲でも使えます', '一時停止中は止まり', 'シーク・再生速度の変更・曲の切り替え・繰り返し再生に追従', '再生位置を受け取れないときは0', 'クリックしても表示時刻はリセットされず、再生位置も変わりません', 'プレイリスト番号は00', '小数桁数', 'フレームレート', '7セグメント', 'クロスフェード', '最小桁数', '全点灯', '数字の窓', 'ニキシー管']:
+        for expected in ['id="miv-counter"', 'Counter Gallery', 'このほかの10種類', 'mImageViewer が送る再生位置', '歌詞と同じ時刻', '歌詞のない曲でも使えます', '一時停止中は止まり', 'シーク・再生速度の変更・曲の切り替え・繰り返し再生に追従', '再生位置を受け取れないときは0', 'クリックしても表示時刻はリセットされず、再生位置も変わりません', 'プレイリスト番号は00', '小数桁数', 'フレームレート', '7セグメント', 'クロスフェード', '最小桁数', '全点灯', '数字の窓', 'ニキシー管']:
             self.assertIn(expected, visualizer)
         add_items = re.search(r'<li><p><strong>Oscilloscope</strong>.*?</p>', visualizer)[0]
         self.assertIn('<strong>Counter</strong>', add_items)
@@ -431,7 +456,7 @@ class GenerationTests(unittest.TestCase):
             self.assertLess(body.index('id="' + heading + '"'), body.index('id="プラグイン一覧"'))
 
     def test_bundled_prediction_and_rhythm_exclude_standalone_requirements(self):
-        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.7').items() if name.endswith('.html')}
+        output = {name: data.decode() for name, data in docs.generate(docs.DEFAULT_SOURCE, 'v0.17.0-miv.1').items() if name.endswith('.html')}
         prediction = output['resonator-adaptive-prediction.html']
         self.assertIn('音響調整の音声処理を使います', prediction)
         self.assertIn('追加の音声設定は不要', prediction)
@@ -444,16 +469,75 @@ class GenerationTests(unittest.TestCase):
         self.assertNotIn('曲の頭から解析が自動でやり直されます', rhythm)
         self.assertNotIn('ほかのアプリで曲を切り替えたときなどに使います', rhythm)
 
+    def test_v017_mastering_keeps_playback_presets_without_offline_export(self):
+        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.17.0-miv.1')
+        guide = output['mastering-presets.html'].decode().split('<main class="content">')[1]
+        for expected in ['System Presets &gt; Mastering', 'J-Pop Dense', '再生音で調整する',
+                         'mImageViewer での再生中', 'Tonal Balance EQ', 'Brickwall Limiter',
+                         '特定のラウドネスやトゥルーピークの値を保証するものではありません']:
+            self.assertIn(expected, guide)
+        self.assertEqual(guide.count('<td style="text-align:left">'), 20)  # ten stereo presets
+        self.assertEqual(guide.count('<li><p>'), 3)
+        for absent in ['オフラインファイル出力', 'ファイル処理', '書き出', 'WAVまたはFLAC']:
+            self.assertNotIn(absent, guide)
+        self.assertNotIn('処理済みファイルの書き出しは', output['README.html'].decode())
+        self.assertIn('href="mastering-presets.html"', output['README.html'].decode())
+        self.assertIn('href="mastering-presets.html"', output['index.html'].decode())
+
+    def test_v017_visualizer_excludes_standalone_transports_network_and_file_midi(self):
+        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.17.0-miv.1')
+        visualizer = output['visualizer.html'].decode()
+        add_items = re.search(r'<li><p><strong>Oscilloscope</strong>.*?</p>', visualizer)[0]
+        for excluded in ['Video', 'Playback Control', 'Seek Bar', '曲情報']:
+            self.assertNotIn('<strong>' + excluded + '</strong>', add_items)
+        for retained in ['Lyrics', 'Counter', 'Drums', 'Key', 'Chord', 'MIDI', 'MIDI Event List']:
+            self.assertIn('<strong>' + retained + '</strong>', add_items)
+        for retained in ['Groove Lounge', 'Listening Room', 'MIDI Monitor', 'MIDI の音符やイベントを渡しません',
+                         '演奏情報は表示されません', '音声解析を使います', 'Track Information（曲情報）',
+                         'id="miv-counter"', 'id="miv-lyrics"', '数字の窓', '単語のハイライト', '円周を回る点']:
+            self.assertIn(retained, visualizer)
+        for absent in ['standalone-playback-controls', 'レイアウトにプレーヤーのボタンを配置',
+                       '再生位置バーを配置', 'プレーヤーが一時停止中や停止中でも',
+                       'AirPlay', 'ネットワークの曲', 'ネットワーク音楽のガイド',
+                       '.wrd', 'MusicXML', 'ファイル内の音符や拍の情報', 'MIDIの鍵盤のチャンネル表示',
+                       '再生中のMIDIファイルに含まれるすべてのイベント']:
+            self.assertNotIn(absent, visualizer)
+        for data in output.values():
+            for absent in [b'--settings-name', b'Mixwright Instrument', b'AirPlay', b'Subsonic', b'DLNA']:
+                self.assertNotIn(absent, data)
+        for expected in ['Chords &amp; Key', 'コードレーン']:
+            self.assertIn(expected, output['analyzer-note-spectrogram.html'].decode())
+        self.assertIn('Drums', output['analyzer-rhythm-analyzer.html'].decode())
+
+    def test_v017_soundfont_rename_preserves_url_and_excludes_midi_player(self):
+        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.17.0-miv.1')
+        sfz = output['others-sfz-note-player.html'].decode()
+        self.assertIn('<h1 id="sfz-note-player" class="page-title">SoundFont Note Player</h1>', sfz)
+        self.assertEqual(sfz.count('id="sfz-note-player"'), 1)
+        for expected in ['.sf2', '.sf3', 'SoundFont Library', 'Preset', 'Instrument Details',
+                         'SoundFont の容量上限', 'サンプルキャッシュ', 'sfz-references.json']:
+            self.assertIn(expected, sfz)
+        self.assertNotIn('フォルダーを取り込み直してください', sfz)
+        self.assertNotIn('代表的なサンプルを選んで自動的に読み込み', sfz)
+        self.assertIn('専用のオーディオツールとジェネレーター', output['others.html'].decode())
+        self.assertNotIn('others-soundfont-player.html', output)
+        self.assertNotIn('others-soundfont-note-player.html', output)
+        for name, data in output.items():
+            if name.endswith('.html'):
+                with self.subTest(page=name):
+                    self.assertNotIn('SoundFont Player', data.decode())
+                    self.assertNotIn('soundfont-player', data.decode())
+
     def test_index_is_self_canonical_contents_without_redirect(self):
-        text = docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.7')['index.html'].decode()
+        text = docs.generate(docs.DEFAULT_SOURCE, 'v0.17.0-miv.1')['index.html'].decode()
         self.assertNotIn('noindex', text)
         self.assertNotIn('refresh', text)
         self.assertIn('<link rel="canonical" href="https://mikage.to/mimageviewer/manual/sound/index.html">', text)
         self.assertIn('href="eq-15band-peq.html"', text)
-        self.assertEqual(text.count('mIV Sound v0.15.0-miv.7 の説明です。'), 1)
+        self.assertEqual(text.count('mIV Sound v0.17.0-miv.1 の説明です。'), 1)
 
     def test_version_changes_only_index_body_and_never_urls_or_redirects(self):
-        first_version, second_version = 'v0.15.0-miv.7', 'v1.2.3-beta.1'
+        first_version, second_version = 'v0.17.0-miv.1', 'v1.2.3-beta.1'
         first = docs.generate(docs.DEFAULT_SOURCE, first_version)
         with workspace_temporary_directory() as temporary:
             snapshot = Path(temporary) / 'snapshot'
@@ -482,7 +566,7 @@ class GenerationTests(unittest.TestCase):
                     self.assertEqual(data, second[name])
 
     def test_parent_links_resolve_at_fixed_depth_and_missing_links_fail(self):
-        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.7')
+        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.17.0-miv.1')
         for name, data in output.items():
             if not name.endswith('.html'):
                 continue
@@ -495,7 +579,7 @@ class GenerationTests(unittest.TestCase):
         def broken(*args, **kwargs):
             return original(*args, **kwargs).replace('../effetune.html', '../missing.html')
         with patch.object(docs, 'chrome', side_effect=broken), self.assertRaisesRegex(docs.ConversionError, 'Broken generated link'):
-            docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.7')
+            docs.generate(docs.DEFAULT_SOURCE, 'v0.17.0-miv.1')
 
     def test_check_exit_status_and_version_fallback_without_writes(self):
         with workspace_temporary_directory() as temporary:
@@ -528,11 +612,11 @@ class GenerationTests(unittest.TestCase):
                 extra.unlink()
                 vendor = root / 'config'
                 vendor.mkdir(parents=True)
-                (vendor / 'miv-sound.rs').write_text('pub const VERSION: &str = "0.15.0-miv.7";\npub const DOCS_VERSION: &str = "v0.15.0";\n', encoding='utf-8')
+                (vendor / 'miv-sound.rs').write_text('pub const VERSION: &str = "0.17.0-miv.1";\npub const DOCS_VERSION: &str = "v0.17.0";\n', encoding='utf-8')
                 self.assertEqual(run('--version', 'v0.12.0'), 0)
                 self.assertEqual(output.read_bytes(), b'current')
                 self.assertEqual(run('--check'), 0)
-                self.assertEqual(docs.generate.call_args.args[1:], ('v0.15.0-miv.7', 'v0.15.0'))
+                self.assertEqual(docs.generate.call_args.args[1:], ('v0.17.0-miv.1', 'v0.17.0'))
 
     def test_check_rejects_legacy_tree_without_removing_it(self):
         with workspace_temporary_directory() as temporary:
@@ -540,7 +624,7 @@ class GenerationTests(unittest.TestCase):
             (root / '.htaccess').write_bytes(b'<IfModule mod_rewrite.c>\n</IfModule>\n')
             with patch.object(docs, 'ROOT', root), patch.object(docs, 'MANUAL', root / 'manual'), patch.object(docs, 'generate', return_value={'index.html': b'current'}), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 def run(*args):
-                    with patch('sys.argv', ['gen-effetune-docs.py', '--version', 'v0.15.0-miv.7', *args]):
+                    with patch('sys.argv', ['gen-effetune-docs.py', '--version', 'v0.17.0-miv.1', *args]):
                         return docs.main()
                 self.assertEqual(run(), 0)
                 legacy = root / 'manual/effetune'
@@ -571,14 +655,14 @@ class GenerationTests(unittest.TestCase):
             htaccess.write_bytes(b'<IfModule mod_rewrite.c>\n</IfModule>\n')
             with patch.object(docs, 'ROOT', root), patch.object(docs, 'MANUAL', root / 'manual'), patch.object(docs, 'generate', return_value={'index.html': b'current'}), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 def run(*args):
-                    with patch('sys.argv', ['gen-effetune-docs.py', '--version', 'v0.15.0-miv.7', *args]):
+                    with patch('sys.argv', ['gen-effetune-docs.py', '--version', 'v0.17.0-miv.1', *args]):
                         return docs.main()
                 self.assertEqual(run(), 0)
                 base = root / 'manual/sound'
                 (base / 'notes').mkdir()
                 self.assertEqual(run('--check'), 0)
                 before = htaccess.read_bytes()
-                for name in ['v0.15.0-miv.7', 'v0.13.0', 'v0.12.0', 'v0.15.0-beta.1', 'v-archive']:
+                for name in ['v0.17.0-miv.1', 'v0.13.0', 'v0.12.0', 'v0.15.0-beta.1', 'v-archive']:
                     old = base / name
                     old.mkdir()
                     self.assertEqual(run('--check'), 1)
@@ -599,14 +683,14 @@ class RedirectTests(unittest.TestCase):
     HTACCESS = b'<IfModule mod_rewrite.c>\n  RewriteEngine On\n  RewriteCond %{HTTP_HOST} ^www\\.mikage\\.to$ [NC]\n  RewriteRule ^(.*)$ https://mikage.to/mimageviewer/$1 [R=301,L]\n</IfModule>\n# Other configuration\n'
 
     def test_redirects_cover_all_legacy_files_and_entries_without_loops(self):
-        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.15.0-miv.7')
+        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.17.0-miv.1')
         configurations = [docs.updated_htaccess(self.HTACCESS, output),
                           (docs.MANUAL.parent / '.htaccess').read_bytes()]
         current = 'https://mikage.to/mimageviewer/manual/sound/'
         cases = {}
-        self.assertEqual(len(output), 137)
+        self.assertEqual(len(output), 138)
         for base in ['manual/effetune/', 'manual/sound/']:
-            for version in ['v0.15.0-miv.7', 'v0.15.0-miv.6', 'v0.15.0', 'v0.14.0', 'v0.13.0', 'v0.12.0', 'v0.11.1', 'v1.2.3-beta.1']:
+            for version in ['v0.17.0-miv.1', 'v0.15.0-miv.6', 'v0.15.0', 'v0.14.0', 'v0.13.0', 'v0.12.0', 'v0.11.1', 'v1.2.3-beta.1']:
                 for name in output:
                     cases[base + version + '/' + name] = current + name
                 for removed in ['', '/', '//', '/removed.html', '/nested/removed.html', '/eq-15band-peq.html/extra', '/images/missing.png']:

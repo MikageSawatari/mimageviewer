@@ -20,6 +20,7 @@
 <a href="README.html">基本操作</a>
 <a href="bus-function.html">バス機能ガイド</a>
 <a href="controller-mapping.html">コントローラーマッピング - MIDI・ゲームパッド・キーボードで操作</a>
+<a href="mastering-presets.html">マスタリングプリセット</a>
 <a href="analyzer.html">アナライザープラグイン - スペクトラムアナライザー・スペクトログラム・VU／ラウドネスメーター</a>
 <a href="analyzer-analog-meter.html" class="sub">Analog Meter</a>
 <a href="analyzer-chroma-spiral.html" class="sub">Chroma Spiral</a>
@@ -38,7 +39,7 @@
 <a href="eq.html">イコライザープラグイン - パラメトリック・グラフィック・リニアフェーズEQとルーム補正</a>
 <a href="lofi.html">Lo-Fiプラグイン - カセット・MD・MP3・ラジオ・レコードの音を再現</a>
 <a href="modulation.html">モジュレーションプラグイン - コーラス・フェイザー・ピッチシフター</a>
-<a href="others.html">その他のプラグイン - テストトーン／ノイズジェネレーターとSFZ Note Player</a>
+<a href="others.html">その他のプラグイン - テストトーン／ノイズジェネレーターとSoundFont Note Player</a>
 <a href="resonator.html">レゾネータープラグイン</a>
 <a href="restoration.html">復元プラグイン - クリックノイズ・ハム除去とノイズリダクション</a>
 <a href="reverb.html">リバーブプラグイン - コンボリューション・ホール・プレート・ルームリバーブ</a>
@@ -48,11 +49,11 @@
 <a href="license.html">MIT License</a>
   </nav></aside>
   <main class="content">
-    <div class="box info"><div class="box-body">mIV Sound は EffeTune / EffeTune Mixwright (作者: Frieve、MIT License) を元にした mImageViewer 専用の派生版です。<a href="https://github.com/MikageSawatari/miv-sound">mIV Sound のソース</a>を公開しています。この説明は EffeTune の<a href="https://github.com/Frieve-A/effetune/tree/c506bbab8a3dcd75bc5049ebb9b92572b526c557/docs/i18n/ja">公式ドキュメント</a> (<a href="license.html">MIT License</a>) を音響調整に合わせて転載・一部修正したものです。</div></div>
+    <div class="box info"><div class="box-body">mIV Sound は EffeTune / EffeTune Mixwright (作者: Frieve、MIT License) を元にした mImageViewer 専用の派生版です。<a href="https://github.com/MikageSawatari/miv-sound">mIV Sound のソース</a>を公開しています。この説明は EffeTune の<a href="https://github.com/Frieve-A/effetune/tree/5ffca1b31e8a74ada7140aefd0c9c9fe4b7740da/docs/i18n/ja">公式ドキュメント</a> (<a href="license.html">MIT License</a>) を音響調整に合わせて転載・一部修正したものです。</div></div>
 <h1 id="note-spectrogram" class="page-title">Note Spectrogram</h1>
 <div class="box info"><div class="box-body">mImageViewer の音響調整は左右2チャンネルで処理します。以下の多チャンネルの例は、上流のデスクトップ版向けの説明です。</div></div>
 <p><a href="analyzer.html">カテゴリの説明とプラグイン一覧</a></p>
-<p>音声を変えずに、A0～C8 の範囲で推定した基本周波数（F0）を流れるピアノロールで表示します。和音の構成音、ボーカルやメロディーの動き、ベースライン、オクターブをまたいで重なる音を追うのに役立ち、音色別の色分けや強調表示も使えます。</p>
+<p>音声を変えずに、A0～C8 の範囲で推定した基本周波数（F0）を流れるピアノロールで表示します。和音の構成音、ボーカルやメロディーの動き、ベースライン、オクターブをまたいで重なる音を追うのに役立ち、音色別の色分けや強調表示も使えます。コード名やキー（調）も推定し、和声の変化を追う手掛かりになります。</p>
 <h2 id="活用ガイド-2">活用ガイド</h2>
 <ul>
 <li><p><strong>和音とメロディー</strong>：和音は同じ時刻に並ぶ複数の明るい行として、メロディーやベースラインは音の行をたどる軌跡として見えます。</p></li>
@@ -81,7 +82,7 @@
 <li><p><strong>Instrument (9)</strong>：上記の 9 つの音色グループごとに色分けします。</p></li></ul></li>
 <li><p><strong>Highlight</strong> - 指定したグループ（<strong>Vocal</strong>、<strong>Bass</strong>、<strong>Other (3)</strong>、<strong>Guitar</strong>、<strong>Piano</strong>、<strong>Strings</strong>、<strong>Wind</strong>、<strong>Synth</strong>、<strong>Organ</strong>、<strong>Other (9)</strong>）を強調します。そのグループに属する可能性が低い音ほど中立の灰色に近づけ、音量を示す太さは保ちます。<strong>None</strong>（初期値）では強調しません。</p>
 <ul>
-<li><p>音の始まりと音色の解析には追加の CPU を使います。CPU 負荷を最小にするには、<strong>Onsets</strong> をオフにし、<strong>Normal</strong> または <strong>Note Colors</strong> を選んで、<strong>Highlight</strong> を <strong>None</strong> にします。</p></li></ul></li>
+<li><p>音の始まりと音色の解析には追加の CPU を使います。CPU 負荷を最小にするには、<strong>Onsets</strong> と <strong>Chords &amp; Key</strong> をオフにし、<strong>Normal</strong> または <strong>Note Colors</strong> を選んで、<strong>Highlight</strong> を <strong>None</strong> にします。</p></li></ul></li>
 <li><p><strong>Pitch Resolution</strong> - 履歴を消さずに、縦方向の音高の細かさを選びます。</p>
 <ul>
 <li><p><strong>1/12 Octave</strong>（初期値）：半音ごとに 1 行。</p></li>
@@ -89,6 +90,7 @@
 <li><p><strong>Layout</strong> - <strong>Horizontal</strong>（初期値、下に鍵盤、履歴は上へ流れる）または <strong>Vertical</strong>（右に鍵盤、履歴は左へ流れる）。</p></li>
 <li><p><strong>Volume</strong> - バーの太さと鍵盤ぎわの半円メーターで相対音量を表します（初期値オン）。オフにするとバーの太さは一定になります。</p></li>
 <li><p><strong>Onsets</strong> - 推定した音の始まりを三角形（Horizontal では ▼、Vertical では ▶）で示します（初期値オフ）。三角形の底辺の中央が発音の時刻と音高を示すため、持続中の同じ音を弾き直した場合も別々の印になります。オフにしても、Instrument の <strong>Color</strong> や <strong>Highlight</strong> が必要とする間は音色の解析が続きます。</p></li>
+<li><p><strong>Chords &amp; Key</strong>（初期値オフ）- オンにするとコードレーンとキーの推定結果を表示します。CPU 負荷を抑えるにはオフのままにします。</p></li>
 <li><p><strong>Time Span</strong>（1～10 s、初期値 2 s）- ピアノロールに表示する履歴の長さです。</p></li>
 <li><p><strong>Lowest Note</strong> / <strong>Highest Note</strong> - 解析・表示する音域を設定します（初期値：E1～G6）。</p></li></ul>
 <h2 id="表示ガイド-3">表示ガイド</h2>
@@ -97,10 +99,17 @@
 <li><p><strong>グリッドと鍵盤</strong>：C ごとの線がオクターブの境界を示し、E と F の間の補助線はどのモードでも表示されます。黒鍵の行は背景が暗くなります。鍵盤は現在の音高推定の確信度に応じて光ります。</p></li>
 <li><p><strong>色の濃さ</strong>：色の濃さは常に音高推定の確信度を示します。入力が小さすぎて解析できないときは、ピアノロールは暗いままです。</p></li>
 <li><p><strong>音色の色と強調</strong>：音色の色は、推定確率に応じて各グループの色を混ぜたものです。音色の推定ができると、履歴の対応する位置に色が付きます。判定待ちの音は中立の灰色で表示されます。凡例には表示中のグループが並び、強調表示中はその後に <strong>Highlight:</strong> と選択したグループが続きます。凡例のグループにマウスを重ねると、一時的にそのグループを強調できます。</p></li>
-<li><p><strong>音量バー</strong>：<strong>Volume</strong> がオンのとき、バーの太さは 24 dB の相対範囲で変わります。鍵盤ぎわの柔らかな半円は、現在の音量に合わせてすぐに上がり、20 dB/s で下がります。</p></li></ul>
+<li><p><strong>音量バー</strong>：<strong>Volume</strong> がオンのとき、バーの太さは 24 dB の相対範囲で変わります。鍵盤ぎわの柔らかな半円は、現在の音量に合わせてすぐに上がり、20 dB/s で下がります。</p></li>
+<li><p><strong>コードレーン</strong>：<strong>Horizontal</strong> では右端、<strong>Vertical</strong> では上端の細い帯に、音符と同じ時間軸でコードを表示します。コード名は、音が鳴ってから約 0.22 秒後、推定が確定すると表示します。<strong>C</strong>、<strong>Cm7</strong>、<strong>C/E</strong> などがコードを表し、スラッシュの後は転回形のベース音を示します。コードがない区間は空白になります。短い区間では、名前を表示する幅が足りない場合もあります。コード名は大きな文字で表示します。<strong>Note Colors</strong> では、転回形も含め、コード名と長さを示すバーにルート音の色を使います。</p></li>
+<li><p><strong>Key</strong>：現在の区間から推定したキーを、左下に背景が透明な大きな文字で表示します。判定できないときは非表示になります。<strong>Note Colors</strong> では表示中のキーの主音の色を使います。</p></li></ul>
 <h2 id="ビジュアル表示-1">ビジュアル表示</h2>
 <ul>
-<li><p>履歴にマウスを重ねるか、タッチしてなぞると、音名、時刻、<strong>Salience</strong>（音高推定の確信度）、<strong>Level</strong>（dB）を読み取れます。音色の解析が動作しているときは、グループの推定確率も表示されます。<strong>Instrument (3)</strong> では <strong>Vocal</strong>、<strong>Bass</strong>、<strong>Other</strong>、それ以外では 9 グループで、<strong>Highlight</strong> のグループがその中にない場合はそれも加わります（推定のない音は <strong>Not classified</strong>）。</p></li></ul>
+<li><p>履歴にマウスを重ねるか、タッチしてなぞると、音名、時刻、<strong>Salience</strong>（音高推定の確信度）、<strong>Level</strong>（dB）を読み取れます。音色の解析が動作しているときは、グループの推定確率も表示されます。<strong>Instrument (3)</strong> では <strong>Vocal</strong>、<strong>Bass</strong>、<strong>Other</strong>、それ以外では 9 グループで、<strong>Highlight</strong> のグループがその中にない場合はそれも加わります（推定のない音は <strong>Not classified</strong>）。</p></li>
+<li><p><strong>Chords &amp; Key</strong> がオンのときは、その位置のコードも表示します。確定した推定結果がコードなしの場合は <strong>No chord</strong> と表示します。推定結果が得られるまではコードの読み取り値を表示しません。</p></li></ul>
+<h2 id="制限事項">制限事項</h2>
+<ul>
+<li><p>検出するコードは、メジャー、マイナー、ディミニッシュ、オーギュメント、メジャーセブンス、マイナーセブンス、ドミナントセブンス、ディミニッシュセブンス、ハーフディミニッシュセブンス、sus2、sus4 の 11 種とその転回形です。音名とコード名は、現在の瞬時キーに合わせて # と ♭ を使い分けます。その推定結果が得られるまではシャープを使います。</p></li>
+<li><p>ポップスやロックの実演奏での検証は限られているため、聴きながら確認する手掛かりとして使ってください。</p></li></ul>
 <nav aria-label="カテゴリ内の前後のエフェクト"><a rel="prev" href="analyzer-level-meter.html">前へ: Level Meter</a> / <a rel="next" href="analyzer-oscilloscope.html">次へ: Oscilloscope</a></nav>
   </main>
 </div>

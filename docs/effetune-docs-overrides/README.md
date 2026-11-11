@@ -8,6 +8,10 @@
 名称・クレジットは §2、保存と初回コピーは §4〜5、ポータブルの有効化は F4、統合文書と Counter 復帰は §19。
 原文 EffeTune / EffeTune Mixwright（Frieve、MIT）の名前は転載注記・license に残す。
 
+現行版は **0.17.0-miv.1**（上流説明書 **v0.17.0**）。既定 snapshot は
+`third_party/effetune-docs/5ffca1b3/`、公開出力は134 HTML＋4画像。
+更新記録は [派生版計画 §20](../effetune-fork-plan.md#20-0170-miv1-への更新-2026-11-11) を参照。
+
 2026-10-10 の v0.13.0 実装レビュー訂正（履歴）:
 
 - `resonator.json`: Adaptive Prediction は同梱 VST の native 処理を使うため、
@@ -32,6 +36,12 @@ python scripts/gen-sitemap-xml.py --check
 `DOCS_VERSION` は元の上流説明書の版。`SOURCE.md` の `mIV Sound` と `Docs version` の両方を照合し、
 同じ snapshot の無審査の付け替えを拒否する。本文・title・description の「EffeTune」は訂正後に「mIV Sound」へ置換する。
 上流サービスの案内は訂正で「上流の Web アプリ」などにしてから置換し、URL・拡張子・上流のクレジットを保つ。
+
+上流版を更新するときは、新しい commit の日本語原文・LICENSE・画像を別の snapshot として保存し、
+`SOURCE.md` に Mixwright release と submodule commit、派生版・説明書の版を記録する。
+`DEFAULT_SOURCE` と採否台帳を切り替え、変更ページの新機能・既存アンカーを確認してから再生成する。
+旧 snapshot は過去版のテストと由来の記録に使うため、そのまま残す。
+ページが増減したら sitemap も再生成・検査し、コミット後の日付確定は公開担当へ引き継ぐ。
 
 ## 出力とリンク
 
@@ -74,6 +84,11 @@ README の Web アプリ用 HTML は変換対象に入らない。
 `heading_id`、`scope_heading_id`、段落・インラインの完全一致アンカーは移行不要。
 各アンカーは一意でなければ失敗する。更新で見出しや本文が変わった場合に、
 訂正を黙って省略しない。訂正で削除された小見出しをリンクが参照しても失敗する。
+
+`replace_metadata` は front matter の `title` または `description` を完全一致で訂正する。
+本文だけを除外して検索用の説明に独立版の機能を残さないための規則で、欠落・不一致・同じ訂正の重複は失敗する。
+上流が追加した空の `<a id="..."></a>` も変換できるが、リンク・属性付きHTMLの許可範囲は広げない。
+SoundFont Note Player の旧アンカーは、重複しないよう h2 へ移し、旧 `others-sfz-note-player.html` を維持する。
 
 2026-10-01 の分割で追加・変更したルール:
 
@@ -119,10 +134,11 @@ README の Web アプリ用 HTML は変換対象に入らない。
 | トラブルシューティングとFAQ、技術情報（ブラウザ互換性、ブラウザサポートの詳細、推奨サンプルレート） | ブラウザ／独立アプリの要件・設定。mIV の利用条件は mIV ページで案内 |
 | 利用可能なエフェクト、開発ガイド | エフェクト一覧は生成目次に全111件掲載済み。開発ガイドは利用者向け操作の対象外 |
 
-## mIV Sound 向け訂正 (F3・F4 統合、2026-11-08 更新)
+## mIV Sound 向け訂正 (2026-11-11 更新)
 
-- 原文は `c506bbab` の日本語 snapshot（上流 v0.15.0）。`config/miv-sound.rs` と `SOURCE.md` の派生版を対応づけて
-  `manual/sound/` に133 HTML＋4画像を生成する。上流原文・LICENSE・画像は変更しない。
+- 原文は `5ffca1b3` の日本語 snapshot（上流 v0.17.0、Mixwright release `60c7629`）。
+  `config/miv-sound.rs` と `SOURCE.md` の派生版を対応づけて、`manual/sound/` に134 HTML＋4画像を生成する。
+  上流原文・LICENSE・画像は変更しない。
 - 転載注記に [mIV Sound のソース](https://github.com/MikageSawatari/miv-sound)を案内する。
   原作・作者・MIT のクレジットと、原文ドキュメントの参照先は維持する。
 - `selection.json` の完全なページ台帳と README の見出し選別で、内蔵プレーヤー・ライブラリ・LAN・MCP・
@@ -136,6 +152,18 @@ README の Web アプリ用 HTML は変換対象に入らない。
 - IR・SFZ 参照の保存先を mIV data_dir 内へ変更。プリセットの自動共有は行わず、バックアップで受け渡す。
   上流 Web アプリへ開く共有 URL は保持し、架空の mIV Sound Web アプリとは書かない。
 - 旧公開生成物は除去し、旧入口と全版の各ページを301転送する。ポータブルの保存先・機能は案内ページにまとめ、過去の更新履歴は変更しない。
+- `mastering-presets.md` は同梱エフェクトによる再生音の調整として採用する。10種類のチェーンと入力レベルの
+  説明を残し、独立版のオフライン出力設定・ファイル処理エリア・書き出し手順は訂正・除外する。
+  README の新しい案内も、選び方と入力レベルの説明に限定する。
+- Visualizer の Video / Playback Control / Seek Bar / Track Information は追加一覧から外す。
+  再生操作とその外観設定、ネットワーク・AirPlayの曲情報、MIDI/WRD/MusicXML歌詞の説明を除く。
+  Groove Lounge / Listening Room / MIDI Monitor は実際に選べるプリセットとして残し、利用できる表示を説明する。
+  MIDI の表示項目も追加候補には残るが、mIV は音符・イベントを渡さないことを明記し、独立版のファイル再生の説明は外す。
+  Drums / Key / Chord と音声解析、Lyrics / Counter は維持する。
+- SFZ Note Player は SoundFont Note Player に改名し、SF2/SF3 の取込と Preset を案内する。
+  登録・原本参照・バックアップ範囲の訂正は維持。上流から再取込の指示が消えたため、容量上限の旧補正は削除し、
+  新しいサンプルキャッシュの説明を採用する。mIV は MIDI 音符を渡さないため、SoundFont Player の節・一覧・
+  title / description と同機能への案内を除外する。DAW の別クラス Mixwright Instrument の利用は案内しない。
 
 ## 同梱版と訂正 (2026-10-28、履歴)
 

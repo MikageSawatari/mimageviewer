@@ -67,9 +67,9 @@
   },
   {
     "operation": "replace_inline",
-    "anchor": "**Oscilloscope**、**Spectrum**、**Spectrogram**、**Stereo**、**Level Meter**、**Analog Meter**、**Notes**、**Guitar**、**Chroma Spiral**、**Phase Map**、**Rhythm Analyzer**のグラフ、または**Lyrics**、**Artwork**、**Video**、**Title**、**Album**、**Artist**、**Counter**、**Text**、**Shape**を追加します。アイテムはドラッグで移動し、ハンドルをドラッグしてサイズを変えます（**Shift**で縦横比を保ち、**Ctrl**/**Cmd**で中心を基準にサイズを変えます）。位置を揃えるには**グリッドに吸着**を使い、吸着を無視するには**Alt**を押しながらドラッグします。重なり順は**上へ移動**、**下へ移動**、**最前面へ**、**最背面へ**で変えます（一覧で下にあるアイテムほど手前に表示されます）。選択中のアイテムを複製するには、**Ctrl+D**（Macでは**Cmd+D**）を押すか、**Altを押しながらドラッグ**します。",
-    "replacement": "**Oscilloscope**、**Spectrum**、**Spectrogram**、**Stereo**、**Level Meter**、**Analog Meter**、**Notes**、**Guitar**、**Chroma Spiral**、**Phase Map**、**Rhythm Analyzer**のグラフ、または**Lyrics**、**Artwork**、**Title**、**Album**、**Artist**、**Counter**、**Text**、**Shape**を追加します。アイテムはドラッグで移動し、ハンドルをドラッグしてサイズを変えます（**Shift**で縦横比を保ち、**Ctrl**で中心を基準にサイズを変えます）。位置を揃えるには**グリッドに吸着**を使い、吸着を無視するには**Alt**を押しながらドラッグします。重なり順は**上へ移動**、**下へ移動**、**最前面へ**、**最背面へ**で変えます（一覧で下にあるアイテムほど手前に表示されます）。選択中のアイテムを複製するには、**Ctrl+D**を押すか、**Altを押しながらドラッグ**します。",
-    "reason": "Windows VST modifiers; retain editing operations and omit unavailable Add items."
+    "anchor": "**Oscilloscope**、**Spectrum**、**Spectrogram**、**Stereo**、**Level Meter**、**Analog Meter**、**Notes**、**MIDI**、**MIDI Event List**、**Drums**、**Guitar**、**Chroma Spiral**、**Phase Map**、**Rhythm Analyzer**のグラフ、または**Lyrics**、**Artwork**、**Video**、**Title**、**Album**、**Artist**、**曲情報**、**Playback Control**、**Seek Bar**、**Counter**、**Key**、**Chord**、**Text**、**Shape**を追加します。アイテムはドラッグで移動し、ハンドルをドラッグしてサイズを変えます（**Shift**で縦横比を保ち、**Ctrl**/**Cmd**で中心を基準にサイズを変えます）。位置を揃えるには**グリッドに吸着**を使い、吸着を無視するには**Alt**を押しながらドラッグします。重なり順は**上へ移動**、**下へ移動**、**最前面へ**、**最背面へ**で変えます（一覧で下にあるアイテムほど手前に表示されます）。選択中のアイテムを複製するには、**Ctrl+D**（Macでは**Cmd+D**）を押すか、**Altを押しながらドラッグ**します。",
+    "replacement": "**Oscilloscope**、**Spectrum**、**Spectrogram**、**Stereo**、**Level Meter**、**Analog Meter**、**Notes**、**MIDI**、**MIDI Event List**、**Drums**、**Guitar**、**Chroma Spiral**、**Phase Map**、**Rhythm Analyzer**のグラフ、または**Lyrics**、**Artwork**、**Title**、**Album**、**Artist**、**Counter**、**Key**、**Chord**、**Text**、**Shape**を追加します。アイテムはドラッグで移動し、ハンドルをドラッグしてサイズを変えます（**Shift**で縦横比を保ち、**Ctrl**で中心を基準にサイズを変えます）。位置を揃えるには**グリッドに吸着**を使い、吸着を無視するには**Alt**を押しながらドラッグします。重なり順は**上へ移動**、**下へ移動**、**最前面へ**、**最背面へ**で変えます（一覧で下にあるアイテムほど手前に表示されます）。選択中のアイテムを複製するには、**Ctrl+D**を押すか、**Altを押しながらドラッグ**します。",
+    "reason": "v0.17.0 VST build excludes video, playback-control, seek-bar and track-info Add choices. Keep Lyrics, Counter, MIDI items and new Drums/Key/Chord; use Windows modifiers."
   },
   {
     "operation": "replace_inline",
@@ -97,8 +97,8 @@
   },
   {
     "operation": "replace_inline",
-    "anchor": "どの比率にも、共通の10種類のプリセットがあります。",
-    "replacement": "どの比率にも **mIV Original** と、共通の10種類のプリセットがあります。**mIV Original** は、代表画像、曲情報、歌詞と音声グラフをまとめた初期表示です。",
+    "anchor": "どの比率にも、共通の11種類のプリセットがあります。",
+    "replacement": "どの比率にも **mIV Original** と、共通の11種類のプリセットがあります。**mIV Original** は、代表画像、曲情報、歌詞と音声グラフをまとめた初期表示です。",
     "reason": "mIV Original is available for every bundled aspect ratio."
   },
   {
@@ -106,5 +106,77 @@
     "anchor": "番号はプレーヤーのプレイリストの1曲目を1とし、外部入力では00になります。",
     "replacement": "プレイリスト番号は00になります。",
     "reason": "mIV supplies no playlist ordinal; counter trackIndex is zero."
+  },
+  {
+    "operation": "remove_section",
+    "heading_id": "midiの表示",
+    "keep_heading": true,
+    "note": "mImageViewer は mIV Sound に MIDI の音符やイベントを渡しません。**MIDI** と **MIDI Event List** は追加できますが、演奏情報は表示されません。**Notes**、**Drums**、**Guitar**、**Rhythm Analyzer** は音声解析を使います。",
+    "reason": "mIV plugin_loader.cpp supplies an empty input EventList. Do not describe standalone MIDI files or DAW MIDI as available in mIV; retain the existing Add choices."
+  },
+  {
+    "operation": "replace_paragraph",
+    "anchor": "**曲情報** を追加すると、再生中のファイルやネットワークの曲から取得できたタグと音声形式を表示できます。AirPlayでは、送信端末の情報、受信コーデック、受信側PCMの形式、送信側の音量も、情報が届いていれば表示します。取得できない項目は表示しません。文字の見た目はTitleと同じ設定で調整できます。**Title**、**Artist**、**Album**、**Artwork**にも、AirPlayの送信側から届いた情報が表示されます。",
+    "replacement": "",
+    "reason": "track-info is excluded by the VST build. Network/AirPlay metadata is unavailable; Title/Album/Artist/Artwork remain."
+  },
+  {
+    "operation": "replace_paragraph",
+    "anchor": "AirPlayの受信中は、送信側から曲の再生位置が届くと、**Counter** と **Seek Bar** に表示されます。更新は送信側からの通知に従います。シークや未対応の再生操作は使えません。**停止** で現在の受信を終了できます。設定や音声形式については、[ネットワーク音楽のガイド](openhome.md)を参照してください。",
+    "replacement": "",
+    "reason": "Network receivers and their playback clock/transport are unavailable in bundled VST."
+  },
+  {
+    "operation": "replace_paragraph",
+    "anchor": "MIDIファイルでは、内蔵歌詞または同じ名前の`.wrd`ファイルを表示できます。読める歌詞がある場合は`.wrd`を優先します。デスクトップ版ではMIDIと同じフォルダーに置いてください。ブラウザーでは両方を一緒に選択・ドロップするか、アクセスを許可したMusic LibraryのフォルダーからMIDIを再生します。WRDの歌詞は曲に合わせてページ全体が切り替わり、**表示**、**スクロール**、**単語のハイライト**は適用されません。読めるWRDがない場合は、MIDI内蔵のLyricイベント、`.kar`または`@KMIDI`の印があるMIDIのカラオケ用テキスト、同じ名前の`.lrc`の順に使います。カラオケの見出しやコード記号は歌詞として表示しません。MusicXMLの歌詞には通常の行表示・単語表示の設定が使えます。表示する歌詞は**パート**と**番**で選び、指定しない場合はどちらも**自動**のままにします。",
+    "replacement": "",
+    "reason": "mIV supplies LRC/tag lyrics, not standalone MIDI/WRD/MusicXML lyrics or library loading."
+  },
+  {
+    "operation": "replace_inline",
+    "anchor": "**Groove Lounge**: アルバムアートと曲情報に、検出したコード名・キーと演奏に合わせて光るドラムセットを組み合わせます。落ち着いた青緑と金色で、控えめなスペクトラム、再生ボタン、シークバー、経過時間も表示します。",
+    "replacement": "**Groove Lounge**: アルバムアートと曲情報に、検出したコード名・キーと演奏に合わせて光るドラムセットを組み合わせます。落ち着いた青緑と金色で、控えめなスペクトラムと経過時間も表示します。",
+    "reason": "Keep the preset and its audio displays; omit unavailable playback buttons and seek bar."
+  },
+  {
+    "operation": "replace_inline",
+    "anchor": "**Listening Room**（16:9）：大きなアルバムアートと曲情報に、再生ボタン、シークバー、経過時間、控えめなスペクトラムの帯を添えたレイアウトです。グラファイト色の背景に温かみのある色を組み合わせています。",
+    "replacement": "**Listening Room**（16:9）：大きなアルバムアートと曲情報に、経過時間、控えめなスペクトラムの帯を添えたレイアウトです。グラファイト色の背景に温かみのある色を組み合わせています。",
+    "reason": "Keep the preset; standalone transport controls are unavailable."
+  },
+  {
+    "operation": "replace_inline",
+    "anchor": "**MIDI Monitor** (21:9, 9:16): 16チャンネルのMIDIミキサーとイベント一覧に、曲情報、再生ボタン、経過時間、シークバーを組み合わせた、普段のMIDI再生向けの画面。21:9では1行の歌詞も表示します。",
+    "replacement": "**MIDI Monitor** (21:9, 9:16): MIDI表示用の組み込みレイアウトです。mImageViewer は MIDI 情報を渡さないため、MIDIミキサーとイベント一覧に演奏情報は表示されません。曲情報と経過時間、21:9の歌詞はホストから受け取った内容を表示します。",
+    "reason": "The preset remains selectable, but mIV has no MIDI source or standalone transport. Keep host metadata, clock and lyrics."
+  },
+  {
+    "operation": "replace_paragraph",
+    "anchor": "**MIDI優先**がオンのとき、**Notes**と**Guitar**の**色の種類**では**チャンネルの色**も選べます。MIDIの鍵盤のチャンネル表示と共通の配色で、隣り合うチャンネルを見分けやすくしています。MIDIデータがないときやMIDI優先がオフのときは、**色**で設定した単色を使います。",
+    "replacement": "",
+    "reason": "mIV supplies no MIDI presentation; channel colors from MIDI are not an operative display mode here."
+  },
+  {
+    "operation": "replace_html",
+    "anchor": "<p><strong>Playback Control</strong>を追加すると、レイアウトにプレーヤーのボタンを配置できます。<strong>操作</strong>で<strong>再生 / 一時停止</strong>、<strong>停止</strong>、<strong>前の曲</strong>、<strong>次の曲</strong>、<strong>シャッフル</strong>、<strong>リピート</strong>を選び、必要なボタンの数だけアイテムを追加します。<strong>Edit</strong>の外でクリックまたはタップするか、<strong>Tab</strong>でフォーカスして<strong>Enter</strong>または<strong>Space</strong>を押すと操作できます。プレーヤーを開いているとき、使えない操作のボタンは薄く表示されます。1曲リピート中はシャッフルを使えません。</p>",
+    "replacement": "<h3 id=\"standalone-playback-controls\">Playback Control / Seek Bar</h3>\n<p><strong>Playback Control</strong>を追加すると、レイアウトにプレーヤーのボタンを配置できます。<strong>操作</strong>で<strong>再生 / 一時停止</strong>、<strong>停止</strong>、<strong>前の曲</strong>、<strong>次の曲</strong>、<strong>シャッフル</strong>、<strong>リピート</strong>を選び、必要なボタンの数だけアイテムを追加します。<strong>Edit</strong>の外でクリックまたはタップするか、<strong>Tab</strong>でフォーカスして<strong>Enter</strong>または<strong>Space</strong>を押すと操作できます。プレーヤーを開いているとき、使えない操作のボタンは薄く表示されます。1曲リピート中はシャッフルを使えません。</p>",
+    "reason": "Create an exact section boundary around standalone transport controls and their style lists."
+  },
+  {
+    "operation": "remove_section",
+    "heading_id": "standalone-playback-controls",
+    "reason": "VST build excludes Playback Control and Seek Bar. miv-counter is the following h3, so all Counter settings remain."
+  },
+  {
+    "operation": "insert_note",
+    "heading_id": "レイアウトを編集する",
+    "note": "**Video**、**Playback Control**、**Seek Bar**、**Track Information（曲情報）** は追加メニューにありません。曲名・アルバム名・アーティスト名は **Title**、**Album**、**Artist** を使ってください。",
+    "reason": "State the four excluded VST Add choices explicitly; Lyrics and Counter remain available."
+  },
+  {
+    "operation": "replace_inline",
+    "anchor": "音声解析でもMIDIでも、1拍ごとに円周を1周する点の表示を切り替えられます。",
+    "replacement": "音声解析による拍に合わせて、1拍ごとに円周を1周する点の表示を切り替えられます。",
+    "reason": "Do not promise MIDI beat input from mIV."
   }
 ]

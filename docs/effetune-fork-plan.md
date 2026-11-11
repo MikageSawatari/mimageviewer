@@ -1183,3 +1183,40 @@ portable zip実物の生成・内容確認、署名あり配布とVirusTotal (�
 - `python scripts/check_site_cards.py`: **52枚、超過0**。`git diff --check`: **成功**。
   cargo のビルド・テスト、製品起動、コミット・公開は行っていない。`target/` と実際の
   `config/miv-sound.rs` には触れず、候補のビルド・承認は設計担当へ引き継ぐ。
+
+## 20. 0.17.0-miv.1 への更新 (2026-11-11)
+
+対象は `feat-755-miv-sound`。説明書・生成器・生成回帰だけを更新した。
+設計担当が更新済みの `config/miv-sound.rs` はそのまま利用し、編集していない。
+
+- 新しい snapshot は `5ffca1b31e8a74ada7140aefd0c9c9fe4b7740da`。
+  Mixwright v0.17.0 release `60c7629f8bc6e848995bca4d9dd754f8600c069a` の
+  `external/effetune` に対応し、`SOURCE.md` に派生版 `0.17.0-miv.1` と説明書 `v0.17.0` を記録した。
+  日本語原文30ファイルは参照先の上流作業ツリーとバイト一致し、LICENSE・4画像は旧 snapshot と一致した。
+  上流原文と旧 snapshot は変更していない。
+- `mastering-presets.md` は、同梱の System Presets > Mastering を使う再生音の調整として採用。
+  10種類のチェーンと音量調整・制限事項は残し、オフライン出力の設定とファイル処理の手順・書き出し案内は外した。
+  README の新しいリンクも、選び方と入力レベルの説明に訂正した。
+- 一致しなくなった4規則のうち、SoundFont の取込、Visualizer の追加一覧、共通プリセット数を新原文へ移した。
+  容量上限を変えた後の再取込指示は上流から消えたため、その旧補正を削除し、新しいサンプルキャッシュの説明を採用した。
+  SoundFont の登録・原本参照・バックアップ範囲は維持し、SF2/SF3 にも表記を広げた。
+- SoundFont Note Player の改名後も `others-sfz-note-player.html` を維持する。
+  空の旧アンカーを安全に変換してから h2 へ移し、ID の重複を除いた。
+  mIV の `plugin_loader.cpp` は MIDI 音符イベントを渡さないため、SoundFont Player の節を見出し選別で除外し、
+  一覧と案内文、検索用 title / description も完全一致の規則で外した。選別で外れるカテゴリ導入は一覧前へ戻した。
+  `replace_metadata` を追加し、本文と同様に欠落・不一致・重複の訂正を拒否する。
+- Visualizer の追加一覧から Video / Playback Control / Seek Bar / Track Information を除き、
+  再生操作・外観設定のまとまりは、完全一致で節境界を作って `remove_section` で除外した。
+  AirPlay の時計・ネットワーク曲情報、MIDI/WRD/MusicXML歌詞、MIDI色と拍の説明も除外・訂正した。
+  MIDI の表示節は「ホストから音符・イベントを受け取らない」と明記した注記へ置き換えた。
+  Groove Lounge / Listening Room / MIDI Monitor は選べるレイアウトとして残し、再生操作やMIDI再生の説明を訂正した。
+  Lyrics / Counter、Drums / Key / Chord と音声解析の新機能は残した。
+  DAW の別クラス Mixwright Instrument を案内する原文は今回の snapshot にはなく、生成回帰で混入を検査する。
+- `manual/sound/` に134 HTML＋4画像を再生成。既存の固定 URL・旧版301を維持し、新ガイドだけを追加した。
+  sitemap は217 URLへ再生成した。指定の公開5ファイルと `native-dependencies.md` に更新対象の `0.15.0` 表記はなかった。
+- 検証: `test_gen_effetune_docs.py` **40件成功**、生成器 `--check` **138ファイル＋301一致**、
+  sitemap `--check` **217 URL一致**、`check_site_cards.py` **53枚・超過0**、
+  `check_ui_glyphs.py` **問題0**、`git diff --check` **成功**。
+  新しい除外・採用、旧 URL、メタ情報の一意一致、旧 snapshot の版付け替え拒否を回帰検査に含めた。
+  cargo のビルド・テスト、製品の起動、コミットは行っていない。`target/`・`vendor/` には触れていない。
+  本体の候補ビルド・承認と、コミット後の sitemap の日付確定は設計担当へ引き継ぐ。

@@ -11,7 +11,7 @@
   <style>.content img { max-width:100%; height:auto; } .content pre { overflow-x:auto; } .content pre.license { white-space:pre-wrap; overflow-wrap:anywhere; } .content li p { margin-bottom:0; } .content ul ul, .content ol ul { margin:0; }</style>
 </head>
 <body>
-<header class="site-header"><span class="logo">mImageViewer</span><nav class="breadcrumb"><a href="../../index.html">ホーム</a><span class="sep">›</span><a href="../index.html">マニュアル</a><span class="sep">›</span><a href="index.html">mIV Sound 説明書</a><span class="sep">›</span><a href="others.html">その他のプラグイン - テストトーン／ノイズジェネレーターとSFZ Note Player</a><span class="sep">›</span><span aria-current="page">Oscillator</span></nav></header>
+<header class="site-header"><span class="logo">mImageViewer</span><nav class="breadcrumb"><a href="../../index.html">ホーム</a><span class="sep">›</span><a href="../index.html">マニュアル</a><span class="sep">›</span><a href="index.html">mIV Sound 説明書</a><span class="sep">›</span><a href="others.html">その他のプラグイン - テストトーン／ノイズジェネレーターとSoundFont Note Player</a><span class="sep">›</span><span aria-current="page">Oscillator</span></nav></header>
 <div class="layout">
   <aside class="sidebar"><div class="sidebar-label">mIV Sound</div><nav>
     <a href="../effetune.html">音響調整</a>
@@ -20,6 +20,7 @@
 <a href="README.html">基本操作</a>
 <a href="bus-function.html">バス機能ガイド</a>
 <a href="controller-mapping.html">コントローラーマッピング - MIDI・ゲームパッド・キーボードで操作</a>
+<a href="mastering-presets.html">マスタリングプリセット</a>
 <a href="analyzer.html">アナライザープラグイン - スペクトラムアナライザー・スペクトログラム・VU／ラウドネスメーター</a>
 <a href="basics.html">基本プラグイン - ベースマネジメント・チャンネルルーティング・クロスオーバー</a>
 <a href="control.html">制御プラグイン</a>
@@ -28,9 +29,9 @@
 <a href="eq.html">イコライザープラグイン - パラメトリック・グラフィック・リニアフェーズEQとルーム補正</a>
 <a href="lofi.html">Lo-Fiプラグイン - カセット・MD・MP3・ラジオ・レコードの音を再現</a>
 <a href="modulation.html">モジュレーションプラグイン - コーラス・フェイザー・ピッチシフター</a>
-<a href="others.html">その他のプラグイン - テストトーン／ノイズジェネレーターとSFZ Note Player</a>
+<a href="others.html">その他のプラグイン - テストトーン／ノイズジェネレーターとSoundFont Note Player</a>
 <a href="others-oscillator.html" class="sub active" aria-current="page">Oscillator</a>
-<a href="others-sfz-note-player.html" class="sub">SFZ Note Player</a>
+<a href="others-sfz-note-player.html" class="sub">SoundFont Note Player</a>
 <a href="resonator.html">レゾネータープラグイン</a>
 <a href="restoration.html">復元プラグイン - クリックノイズ・ハム除去とノイズリダクション</a>
 <a href="reverb.html">リバーブプラグイン - コンボリューション・ホール・プレート・ルームリバーブ</a>
@@ -40,7 +41,7 @@
 <a href="license.html">MIT License</a>
   </nav></aside>
   <main class="content">
-    <div class="box info"><div class="box-body">mIV Sound は EffeTune / EffeTune Mixwright (作者: Frieve、MIT License) を元にした mImageViewer 専用の派生版です。<a href="https://github.com/MikageSawatari/miv-sound">mIV Sound のソース</a>を公開しています。この説明は EffeTune の<a href="https://github.com/Frieve-A/effetune/tree/c506bbab8a3dcd75bc5049ebb9b92572b526c557/docs/i18n/ja">公式ドキュメント</a> (<a href="license.html">MIT License</a>) を音響調整に合わせて転載・一部修正したものです。</div></div>
+    <div class="box info"><div class="box-body">mIV Sound は EffeTune / EffeTune Mixwright (作者: Frieve、MIT License) を元にした mImageViewer 専用の派生版です。<a href="https://github.com/MikageSawatari/miv-sound">mIV Sound のソース</a>を公開しています。この説明は EffeTune の<a href="https://github.com/Frieve-A/effetune/tree/5ffca1b31e8a74ada7140aefd0c9c9fe4b7740da/docs/i18n/ja">公式ドキュメント</a> (<a href="license.html">MIT License</a>) を音響調整に合わせて転載・一部修正したものです。</div></div>
 <h1 id="oscillator" class="page-title">Oscillator</h1>
 
 <p><a href="others.html">カテゴリの説明とプラグイン一覧</a></p>
@@ -162,7 +163,7 @@
 <li><p>システムやプラグインチェーンのインパルス応答を調べる場合は、出力を録音して解析します。</p></li>
 <li><p>インパルスはピークが鋭く広い周波数成分を含むため、低い Volume から始めてください。</p></li></ul></li></ul></li></ol>
 <p>注意: Oscillator はテスト信号ジェネレーターです。低い Volume から始めて徐々に上げ、機器の損傷や聴覚疲労につながる大音量や高周波トーンは避けてください。</p>
-<nav aria-label="カテゴリ内の前後のエフェクト"><a rel="next" href="others-sfz-note-player.html">次へ: SFZ Note Player</a></nav>
+<nav aria-label="カテゴリ内の前後のエフェクト"><a rel="next" href="others-sfz-note-player.html">次へ: SoundFont Note Player</a></nav>
   </main>
 </div>
 <footer><p>原文: Frieve-A (MIT License) / mImageViewer 向け編集: Mikage Sawatari</p></footer>

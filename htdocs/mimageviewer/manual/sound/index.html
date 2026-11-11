@@ -20,6 +20,7 @@
 <a href="README.html">基本操作</a>
 <a href="bus-function.html">バス機能ガイド</a>
 <a href="controller-mapping.html">コントローラーマッピング - MIDI・ゲームパッド・キーボードで操作</a>
+<a href="mastering-presets.html">マスタリングプリセット</a>
 <a href="analyzer.html">アナライザープラグイン - スペクトラムアナライザー・スペクトログラム・VU／ラウドネスメーター</a>
 <a href="basics.html">基本プラグイン - ベースマネジメント・チャンネルルーティング・クロスオーバー</a>
 <a href="control.html">制御プラグイン</a>
@@ -28,7 +29,7 @@
 <a href="eq.html">イコライザープラグイン - パラメトリック・グラフィック・リニアフェーズEQとルーム補正</a>
 <a href="lofi.html">Lo-Fiプラグイン - カセット・MD・MP3・ラジオ・レコードの音を再現</a>
 <a href="modulation.html">モジュレーションプラグイン - コーラス・フェイザー・ピッチシフター</a>
-<a href="others.html">その他のプラグイン - テストトーン／ノイズジェネレーターとSFZ Note Player</a>
+<a href="others.html">その他のプラグイン - テストトーン／ノイズジェネレーターとSoundFont Note Player</a>
 <a href="resonator.html">レゾネータープラグイン</a>
 <a href="restoration.html">復元プラグイン - クリックノイズ・ハム除去とノイズリダクション</a>
 <a href="reverb.html">リバーブプラグイン - コンボリューション・ホール・プレート・ルームリバーブ</a>
@@ -38,14 +39,15 @@
 <a href="license.html">MIT License</a>
   </nav></aside>
   <main class="content">
-    <div class="box info"><div class="box-body">mIV Sound は EffeTune / EffeTune Mixwright (作者: Frieve、MIT License) を元にした mImageViewer 専用の派生版です。<a href="https://github.com/MikageSawatari/miv-sound">mIV Sound のソース</a>を公開しています。この説明は EffeTune の<a href="https://github.com/Frieve-A/effetune/tree/c506bbab8a3dcd75bc5049ebb9b92572b526c557/docs/i18n/ja">公式ドキュメント</a> (<a href="license.html">MIT License</a>) を音響調整に合わせて転載・一部修正したものです。</div></div>
+    <div class="box info"><div class="box-body">mIV Sound は EffeTune / EffeTune Mixwright (作者: Frieve、MIT License) を元にした mImageViewer 専用の派生版です。<a href="https://github.com/MikageSawatari/miv-sound">mIV Sound のソース</a>を公開しています。この説明は EffeTune の<a href="https://github.com/Frieve-A/effetune/tree/5ffca1b31e8a74ada7140aefd0c9c9fe4b7740da/docs/i18n/ja">公式ドキュメント</a> (<a href="license.html">MIT License</a>) を音響調整に合わせて転載・一部修正したものです。</div></div>
 <h1 class="page-title">mIV Sound 説明書</h1>
-<p>mIV Sound v0.15.0-miv.7 の説明です。</p>
+<p>mIV Sound v0.17.0-miv.1 の説明です。</p>
 <p>mImageViewer での開き方、設定の保存先、リモート配信の注意点は<a href="../effetune.html">音響調整</a>をご覧ください。エフェクトごとの設定と画面内の操作を以下にまとめています。</p>
 <p>再生位置を表示する Counter と Counter Gallery は、<a href="visualizer.html#miv-counter">Visualizer の Counter</a>をご覧ください。</p>
 <ul><li><a href="README.html">基本操作</a></li>
 <li><a href="bus-function.html">バス機能ガイド</a></li>
 <li><a href="controller-mapping.html">コントローラーマッピング - MIDI・ゲームパッド・キーボードで操作</a></li>
+<li><a href="mastering-presets.html">マスタリングプリセット</a></li>
 <li><a href="analyzer.html">アナライザープラグイン - スペクトラムアナライザー・スペクトログラム・VU／ラウドネスメーター</a><ul><li><a href="analyzer-analog-meter.html">Analog Meter</a></li><li><a href="analyzer-chroma-spiral.html">Chroma Spiral</a></li><li><a href="analyzer-level-meter.html">Level Meter</a></li><li><a href="analyzer-note-spectrogram.html">Note Spectrogram</a></li><li><a href="analyzer-oscilloscope.html">Oscilloscope</a></li><li><a href="analyzer-pitch-meter.html">Pitch Meter</a></li><li><a href="analyzer-rhythm-analyzer.html">Rhythm Analyzer</a></li><li><a href="analyzer-spectrogram.html">Spectrogram</a></li><li><a href="analyzer-spectrum-analyzer.html">Spectrum Analyzer</a></li><li><a href="analyzer-stereo-meter.html">Stereo Meter</a></li></ul></li>
 <li><a href="basics.html">基本プラグイン - ベースマネジメント・チャンネルルーティング・クロスオーバー</a><ul><li><a href="basics-bass-management.html">Bass Management</a></li><li><a href="basics-channel-divider.html">Channel Divider</a></li><li><a href="basics-dc-offset.html">DC Offset</a></li><li><a href="basics-fir-crossover.html">FIR Crossover</a></li><li><a href="basics-matrix.html">Matrix</a></li><li><a href="basics-multichannel-panel.html">MultiChannel Panel</a></li><li><a href="basics-mute.html">Mute</a></li><li><a href="basics-polarity-inversion.html">Polarity Inversion</a></li><li><a href="basics-stereo-balance.html">Stereo Balance</a></li><li><a href="basics-volume.html">Volume</a></li></ul></li>
 <li><a href="control.html">制御プラグイン</a><ul><li><a href="control-section.html">Section</a></li></ul></li>
@@ -54,7 +56,7 @@
 <li><a href="eq.html">イコライザープラグイン - パラメトリック・グラフィック・リニアフェーズEQとルーム補正</a><ul><li><a href="eq-15band-geq.html">15Band GEQ</a></li><li><a href="eq-15band-peq.html">15Band PEQ</a></li><li><a href="eq-5band-dynamic-eq.html">5Band Dynamic EQ</a></li><li><a href="eq-5band-fir-peq.html">5Band FIR PEQ</a></li><li><a href="eq-5band-peq.html">5Band PEQ</a></li><li><a href="eq-band-pass-filter.html">Band Pass Filter</a></li><li><a href="eq-comb-filter.html">Comb Filter</a></li><li><a href="eq-earphone-cable-sim.html">Earphone Cable Sim</a></li><li><a href="eq-group-delay-eq.html">Group Delay EQ</a></li><li><a href="eq-group-delay-peq.html">Group Delay PEQ</a></li><li><a href="eq-hi-pass-filter.html">Hi Pass Filter</a></li><li><a href="eq-lo-pass-filter.html">Lo Pass Filter</a></li><li><a href="eq-loudness-equalizer.html">Loudness Equalizer</a></li><li><a href="eq-narrow-range.html">Narrow Range</a></li><li><a href="eq-room-eq.html">Room EQ</a></li><li><a href="eq-tilt-eq.html">Tilt EQ</a></li><li><a href="eq-tonal-balance-eq.html">Tonal Balance EQ</a></li><li><a href="eq-tone-control.html">Tone Control</a></li></ul></li>
 <li><a href="lofi.html">Lo-Fiプラグイン - カセット・MD・MP3・ラジオ・レコードの音を再現</a><ul><li><a href="lofi-am-radio-simulator.html">AM Radio Simulator</a></li><li><a href="lofi-bit-crusher.html">Bit Crusher</a></li><li><a href="lofi-cassette-artifacts.html">Cassette Artifacts</a></li><li><a href="lofi-digital-error-emulator.html">Digital Error Emulator</a></li><li><a href="lofi-dsd64-imd-simulator.html">DSD64 IMD Simulator</a></li><li><a href="lofi-fm-radio-simulator.html">FM Radio Simulator</a></li><li><a href="lofi-g726-simulator.html">G.726 Simulator</a></li><li><a href="lofi-gsm-fr-simulator.html">GSM-FR Simulator</a></li><li><a href="lofi-hum-generator.html">Hum Generator</a></li><li><a href="lofi-md-simulator.html">MD Simulator</a></li><li><a href="lofi-mp3-codec-simulator.html">MP3 Codec Simulator</a></li><li><a href="lofi-noise-blender.html">Noise Blender</a></li><li><a href="lofi-sbc-codec-simulator.html">SBC Codec Simulator</a></li><li><a href="lofi-simple-jitter.html">Simple Jitter</a></li><li><a href="lofi-sw-radio-simulator.html">SW Radio Simulator</a></li><li><a href="lofi-tape-artifacts.html">Tape Artifacts</a></li><li><a href="lofi-tv-audio-simulator.html">TV Audio Simulator</a></li><li><a href="lofi-vinyl-artifacts.html">Vinyl Artifacts</a></li><li><a href="lofi-vinyl-simulator.html">Vinyl Simulator</a></li></ul></li>
 <li><a href="modulation.html">モジュレーションプラグイン - コーラス・フェイザー・ピッチシフター</a><ul><li><a href="modulation-auto-filter.html">Auto Filter</a></li><li><a href="modulation-auto-pan.html">Auto Pan</a></li><li><a href="modulation-chorus.html">Chorus</a></li><li><a href="modulation-doppler-distortion.html">Doppler Distortion</a></li><li><a href="modulation-frequency-shifter.html">Frequency Shifter</a></li><li><a href="modulation-phaser.html">Phaser</a></li><li><a href="modulation-pitch-shifter.html">Pitch Shifter</a></li><li><a href="modulation-pitch-shifter-hq.html">Pitch Shifter HQ</a></li><li><a href="modulation-rotary-speaker.html">Rotary Speaker</a></li><li><a href="modulation-tremolo.html">Tremolo</a></li><li><a href="modulation-wow-flutter.html">Wow Flutter</a></li></ul></li>
-<li><a href="others.html">その他のプラグイン - テストトーン／ノイズジェネレーターとSFZ Note Player</a><ul><li><a href="others-oscillator.html">Oscillator</a></li><li><a href="others-sfz-note-player.html">SFZ Note Player</a></li></ul></li>
+<li><a href="others.html">その他のプラグイン - テストトーン／ノイズジェネレーターとSoundFont Note Player</a><ul><li><a href="others-oscillator.html">Oscillator</a></li><li><a href="others-sfz-note-player.html">SoundFont Note Player</a></li></ul></li>
 <li><a href="resonator.html">レゾネータープラグイン</a><ul><li><a href="resonator-adaptive-prediction.html">Adaptive Prediction</a></li><li><a href="resonator-horn-resonator.html">Horn Resonator</a></li><li><a href="resonator-horn-resonator-plus.html">Horn Resonator Plus</a></li><li><a href="resonator-modal-resonator.html">Modal Resonator</a></li></ul></li>
 <li><a href="restoration.html">復元プラグイン - クリックノイズ・ハム除去とノイズリダクション</a><ul><li><a href="restoration-click-remover.html">Click Remover</a></li><li><a href="restoration-clip-restorer.html">Clip Restorer</a></li><li><a href="restoration-hum-remover.html">Hum Remover</a></li><li><a href="restoration-noise-reduction.html">Noise Reduction</a></li></ul></li>
 <li><a href="reverb.html">リバーブプラグイン - コンボリューション・ホール・プレート・ルームリバーブ</a><ul><li><a href="reverb-dattorro-plate-reverb.html">Dattorro Plate Reverb</a></li><li><a href="reverb-fdn-reverb.html">FDN Reverb</a></li><li><a href="reverb-ir-reverb.html">IR Reverb</a></li><li><a href="reverb-rs-reverb.html">RS Reverb</a></li></ul></li>
