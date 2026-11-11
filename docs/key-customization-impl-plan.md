@@ -1,5 +1,15 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
+§1.733（2026-11-11）: 本・コレクションの番号1〜20と前/次の44操作をリング・ジェスチャ・
+ゲームパッド X リングへ追加し、マウス3ボタンは一覧だけに追加する。
+`OpenCollection1..20` / `CollectionPrev・Next` / `OpenBook1..20` / `BookPrev・Next` を
+既存の `GridOpenCollection1..20` / `GridCollectionPrev・Next` / `GridOpenBook1..20` /
+`GridBookPrev・Next` に対応させ、同じキー操作の行へ各文脈の割り当てを表示する。
+既存の `KeyAction`、既定キー、生成defaultは変更しない。管理画面と追加先を開く操作は対象外。
+リング・ジェスチャ・Xリングは一覧/画像FS/動画FS、編集ジェスチャもお気に入りと同じ受付で、
+ページ一覧では実行しない。全画面からは受付判定→終了完了→メイン一覧の共通入口の順とし、
+独立contextは拒否、連動F12は閉じてメイン一覧で開く。詳細は [§1.733設計](ring-saved-group-actions-plan.md)。
+
 §1.681: 編集履歴専用の `EditHistoryKeyPermit` を keyboard owner から発行する。
 まず owner によらず `Context::text_edit_focused()` が真なら発行しない。
 注釈本文 / DragValue の数値直接入力は常にフィールド自身が Undo を所有し、ROOT の modeless VST3 パネルによる
