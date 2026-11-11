@@ -519,3 +519,38 @@ P2-2の不変条件は「未確定時の代替位置と利用者が選んだ位�
 UI 文字列は変更していないため UI glyph 検査は対象外。全 lib gate は設計担当へ引き継ぎ、ここでは実行しない。製品バイナリ起動・実機操作・コミットは行わない。修正済み §12 からの設計変更はない。
 
 確認用 build の初回は依存 `inventory` の rustc 起動が `0xc0000142 (STATUS_DLL_INIT_FAILED)` で失敗し、wrapper は exit 101。製品ソースの compile error ではない。source / feature / profile は変えず、同じ native 環境に `CARGO_BUILD_JOBS=1` を指定して一度再実行し成功した。core の Cargo build は依存込み41分50秒、remote 3分20秒。成果物は `target/dev-runtime/mimageviewer-core.exe` と上記 companion 4本。通常 `%APPDATA%/mimageviewer` profile を既定とする非 portable build であり、エージェントによる起動・既存 process の停止は行っていない。
+
+### 独立レビュー r1 対応 (2026-11-12、`2f82b8b74` 上の未コミット差分)
+
+設計担当が受理した P2 2件と、同 commit で改訂された §12.2 に対応する。
+
+| 指摘 | 原因・修正 |
+| --- | --- |
+| P2-1：長い連打で同じフォルダの移動を再発行 | 記録時刻が最初のクリックのままで、0 / 0.25 / 0.50 / 0.75 秒の4回目を `Single` としていた。一致した count 2 / 3 のたびに既存の `record.time` を更新する。初回の `expanded` は保持する |
+| P2-2：A→Bダブルクリックの B が開閉しない | egui の count は 1(A)→2(B)→3(B)。B の最初の count 2 は path 不一致で単クリック扱いとなるため、次の count 3 が B の開閉を担当する必要がある。回数の `count == 2` 制限を除き、一致したクリックのうち `!record.toggled` の最初の1回だけ既存の目標状態判定を行う。目標どおりで開閉不要の場合も処理済みにする |
+
+変更は判定 owner の時刻更新と既存 `toggled` の利用だけ。UI renderer、共通の開閉 helper、path 同一性、開ける条件、単クリックの即時移動、scan / repaint / I/O / 永続化は変更しない。追加状態・新しい列挙経路はない。公開マニュアルの操作仕様はそのまま成立し、UI 文字列の変更もない。
+
+製品コードを直す前に、新規の純粋判定2件と実 pointer handler 2件、および既存テストの count 列の補正を先に用意し、新規4件だけを選択して実行した。**4件実行 / 0成功 / 4失敗、exit 100、1.488秒** (`target/769-r1-red.log`)。純粋判定は 0.75秒で `Single` が返ることと、B の count 3 が `Repeated(None)` になることで失敗。handler は egui の count 列を確認した後、長い連打の4回目で最初の cancel token が立つことと、B の count 3 後も枝が閉じていることで失敗した。compile / fixture の準備失敗を再現根拠にしていない。この結果を確認してから製品コードを修正した。
+
+| テスト | 検査内容 |
+| --- | --- |
+| `label_click_r1_long_sequence_keeps_navigation_suppressed` | 0 / 0.25 / 0.50 / 0.75 / 1.0秒、count 1→2→3→3→3。初回が開/閉の双方で、開閉は1回、以降は `Repeated(None)` を維持 |
+| `label_click_r1_boundary_count_three_performs_the_second_rows_toggle` | A の count 1、B の count 2（単クリック扱い）、B の count 3（初回状態の逆を目標に開閉）、以後 count 3 は抑止。現在表示が既に目標どおりの場合も検査 |
+| `folder_pane_label_r1_long_sequence_preserves_the_first_pending_open` | 実 PointerButton と RawInput.time で上記5連打と、最初からの経過が 2×delay を超えることを確認。各回で取消 token が立たず pending の `Arc::ptr_eq` が成立し、枝が1回だけ開く。元 receiver を戻して完了後の現在地・子行も検査 |
+| `folder_pane_label_r1_boundary_then_double_click_opens_the_second_row_once` | 行境界の6pt未満の点で A→B→B をクリックし、実 egui count 1→2→3 を確認。A から B への移動を採用し、B の2回目は pending を置換せず開閉する。完了後の現在地と子行も検査 |
+
+既存の `label_click_double_uses_first_display_and_toggles_only_once`、`label_click_triple_and_further_clicks_do_not_navigate_or_toggle`、`label_click_path_mismatch_or_timeout_starts_a_new_single`、`label_click_arrow_clear_breaks_the_label_sequence` の count 列も、先行クリックを踏まえた count 3 に合わせた。
+
+全 cargo 処理（fmt を含む）は利用者指定の `powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local\miv-locks\run-heavy.ps1 -Owner "769-impl" -WorkDir G:\home\mimageviewer-769 -Command "<コマンド>"` 経由で順に実行した。同時に複数の重い処理は起動していない。共有の全 lib gate 待ちの後、red / green ともロック領域への書き込み不可の警告が出たため、指示どおり BelowNormal / `CARGO_BUILD_JOBS=6` で継続した。前回の native 環境 `target/769-env.ps1` は継承し、親プロセスでも並列数を6に指定した。feature / profile は既定、既存 warning あり。
+
+| 検証コマンド・範囲 | 結果 | 証跡 (`target/`) |
+| --- | --- | --- |
+| 修正前：`cargo nextest run -p mimageviewer --lib -E 'test(/label_click_r1/) \| test(/folder_pane_label_r1/)' --no-fail-fast` | **0成功 / 4失敗、exit 100** | `769-r1-red.log` |
+| 修正後：同じ新規4件の filter | **4成功 / 失敗0、0.654秒、exit 0** | `769-r1-new-tests.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **exit 0、18.41秒** | `769-r1-check.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/label_click/) \| test(/folder_pane/)' --no-fail-fast` | **108成功 / 失敗0、10.949秒、exit 0** | `769-r1-regression.log` |
+| `scripts/test-focused.ps1 -Path @('src/folder_pane.rs','src/app/folder_pane_refresh_tests.rs')` | **52 / 52件成功、計104実行、exit 0** | `769-r1-focused.log`、`test-focused/runs/20261111T181625877Z-bb563bd8` / `20261111T181629881Z-4ce92ecb` |
+| 引数なし `cargo fmt` / `cargo fmt --check` / `git diff --check` | **各 exit 0** | `769-r1-fmt.log` / `769-r1-fmt-check.log`、最終diff検査 |
+
+今回の `build-dev.ps1` と本体 lib 全件は利用者指定により設計担当へ引き継ぎ、実行しない。製品起動・実機操作・コミットも行わない。改訂された §12.2 からの設計変更はない。

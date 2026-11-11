@@ -214,6 +214,141 @@ fn pointer_tree_click(app: &mut App, ctx: &egui::Context, frame: &mut u64, pos: 
     navigation_tree_frame(app, ctx, frame, vec![event(false)]);
 }
 
+fn assert_pointer_click_count(ctx: &egui::Context, expected: u8) {
+    let actual = ctx.input(|input| {
+        let pointer = &input.pointer;
+        let button = egui::PointerButton::Primary;
+        if pointer.button_triple_clicked(button) {
+            3
+        } else if pointer.button_double_clicked(button) {
+            2
+        } else if pointer.button_clicked(button) {
+            1
+        } else {
+            0
+        }
+    });
+    assert_eq!(actual, expected, "actual egui pointer click count");
+}
+
+#[test]
+fn folder_pane_label_r1_long_sequence_preserves_the_first_pending_open() {
+    let (mut app, ctx, mut frame, b, _) = navigation_tree_fixture();
+    let child = b.join("child");
+    std::fs::create_dir(&child).unwrap();
+    app.folder_pane
+        .test_seed_listing(&b, vec![child.clone()], false);
+    for _ in 0..3 {
+        navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+    }
+    let pos = label_click_rect(&ctx, &b).center();
+    pointer_tree_click(&mut app, &ctx, &mut frame, pos);
+    assert_pointer_click_count(&ctx, 1);
+    let first_frame = frame;
+    let pending = app.folder_pane_open_pending.as_mut().unwrap();
+    assert_eq!(pending.path, b);
+    let first = pending.cancel.clone();
+    let (_held_reply, rx) = mpsc::channel();
+    let original_rx = std::mem::replace(&mut pending.rx, rx);
+    for count in [2, 3, 3, 3] {
+        frame += 13; // press + release add 2 frames: releases are 0.25s apart.
+        pointer_tree_click(&mut app, &ctx, &mut frame, pos);
+        assert_pointer_click_count(&ctx, count);
+        assert!(
+            !first.load(Ordering::Relaxed),
+            "long repeat must not cancel the first scan at frame {frame}"
+        );
+        let pending = app.folder_pane_open_pending.as_ref().unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &pending.cancel),
+            "long repeat must not replace pending"
+        );
+        assert_eq!(pending.path, b);
+        assert!(
+            app.folder_pane
+                .visible_rows()
+                .iter()
+                .find(|row| row.path == b)
+                .unwrap()
+                .expanded,
+            "only the second click toggles the branch"
+        );
+    }
+    assert!(
+        (frame - first_frame) as f64 / 60.0
+            > ctx.options(|options| options.input_options.max_double_click_delay * 2.0)
+    );
+    app.folder_pane_open_pending.as_mut().unwrap().rx = original_rx;
+    finish_label_navigation(&mut app, &ctx, &b);
+    settle_tree_scans(&mut app, &ctx, &mut frame);
+    assert!(!first.load(Ordering::Relaxed));
+    let rows = app.folder_pane.visible_rows();
+    assert!(rows.iter().find(|row| row.path == b).unwrap().expanded);
+    assert!(rows.iter().any(|row| row.path == child));
+}
+
+#[test]
+fn folder_pane_label_r1_boundary_then_double_click_opens_the_second_row_once() {
+    let (mut app, ctx, mut frame, a, b) = navigation_tree_fixture();
+    let child = b.join("child");
+    std::fs::create_dir(&child).unwrap();
+    app.folder_pane
+        .test_seed_listing(&b, vec![child.clone()], false);
+    for _ in 0..3 {
+        navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+    }
+    let ra = label_click_rect(&ctx, &a);
+    let rb = label_click_rect(&ctx, &b);
+    let first_pos = egui::pos2(ra.center().x, ra.bottom() - 0.1);
+    let second_pos = egui::pos2(ra.center().x, rb.top() + 0.1);
+    assert!(first_pos.distance(second_pos) < 6.0);
+    pointer_tree_click(&mut app, &ctx, &mut frame, first_pos);
+    assert_pointer_click_count(&ctx, 1);
+    let pending = app.folder_pane_open_pending.as_mut().unwrap();
+    assert_eq!(pending.path, a);
+    let first_a = pending.cancel.clone();
+    let (_held_a, rx) = mpsc::channel();
+    pending.rx = rx;
+    pointer_tree_click(&mut app, &ctx, &mut frame, second_pos);
+    assert_pointer_click_count(&ctx, 2);
+    assert!(first_a.load(Ordering::Relaxed));
+    assert!(
+        !app.folder_pane
+            .visible_rows()
+            .iter()
+            .find(|row| row.path == b)
+            .unwrap()
+            .expanded
+    );
+    let pending = app.folder_pane_open_pending.as_mut().unwrap();
+    assert_eq!(pending.path, b);
+    let first_b = pending.cancel.clone();
+    let (_held_b, rx) = mpsc::channel();
+    let original_rx = std::mem::replace(&mut pending.rx, rx);
+    pointer_tree_click(&mut app, &ctx, &mut frame, second_pos);
+    assert_pointer_click_count(&ctx, 3);
+    assert!(!first_b.load(Ordering::Relaxed));
+    let pending = app.folder_pane_open_pending.as_mut().unwrap();
+    assert!(Arc::ptr_eq(&first_b, &pending.cancel));
+    assert_eq!(pending.path, b);
+    assert!(
+        app.folder_pane
+            .visible_rows()
+            .iter()
+            .find(|row| row.path == b)
+            .unwrap()
+            .expanded,
+        "B's count 3 is its second click and must toggle"
+    );
+    app.folder_pane_open_pending.as_mut().unwrap().rx = original_rx;
+    finish_label_navigation(&mut app, &ctx, &b);
+    settle_tree_scans(&mut app, &ctx, &mut frame);
+    assert!(!first_b.load(Ordering::Relaxed));
+    let rows = app.folder_pane.visible_rows();
+    assert!(rows.iter().find(|row| row.path == b).unwrap().expanded);
+    assert!(rows.iter().any(|row| row.path == child));
+}
+
 // Poll the real navigation/adoption path without advancing egui time. Real scan
 // duration must not decide whether the next synthetic click is a double click.
 fn finish_label_navigation(app: &mut App, ctx: &egui::Context, expected: &Path) {
