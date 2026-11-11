@@ -105,6 +105,9 @@
 - 閉じる条件: 項目を選んだ / Esc (§4) / ▼をもう一度押した / 入力欄・一覧の外でポインタを押した /
   入力欄を編集した (文字入力・削除・貼り付け) / 入力欄からフォーカスが離れた / 上の境界。
 - 一覧の中・▼の操作でフォーカスを失わない方法は §3.4。
+- 初回Areaのsizing passは、内容の計測とArea終端まで行った上で `request_discard` を要求する。
+  通常の複数pass内で既知サイズ・対話可能な一覧を保存し、次のbackend frameのヒットテストへ渡す。
+  sizing中のAreaを強制的に対話可能にしたり、入力を保存・再送したりしない。
 - 一覧の中身は開いている pass ごとに呼び出し側から受け取る (snapshot を持たない)。highlight が
   件数を超えたら末尾へ寄せる。
 
@@ -137,6 +140,8 @@ egui は既定 (`SurrenderFocusOn::Clicks`) で、フォーカス中の TextEdit
   (スクロールバー・空白部分のクリックを含む) のどの pass でも同じ判定なので、一覧の中の操作は
   離しまで内部の操作として扱われ、離脱にも閉鎖にもならない。
 - 一覧の layer は部品が描く `Area` の `LayerId` (id は owner から作る) で判定する (`ctx.layer_id_at`)。
+- helperより前の入力欄の矩形参照には `read_response` を使わない。これは内部で `get_response` を呼び、
+  同passの押下＋離しで保護前にfocusを手放し得る。viewportのWidgetRectから矩形だけを読む。
 
 ## 4. キー操作
 
@@ -778,3 +783,111 @@ $env:CARGO_BUILD_JOBS='1'
 確認用coreは `target/dev-runtime/mimageviewer-core.exe` に更新済み。起動コマンドと通常プロファイルへの
 注意は上の「実機・全体gate」と同じ。今回の実機確認対象は、未フォーカス欄の▼からすぐ↓/Enter、
 別欄への▼移動、日本語IME中のキー、フォルダ確定後のグリッドキー復帰。実機確認は行っていない。
+
+### 高速クリックの取りこぼし（3d5c221e8基点）
+
+2026-11-11。サブPCの画面操作ツールによる報告を調査した。人による操作・こちらでの製品起動は行っていない。
+実Appのrendererを使うheadless回帰とvendor/eguiのソースで、別々の2経路を確認した。
+
+1. `show_singleline` の `outside_pointer` がhelperの前で `ctx.read_response(id)` を呼んでいた。
+   `vendor/egui/src/context.rs` の `read_response` は矩形の参照だけではなく `get_response` を呼ぶ。
+   同passのPointerMoved＋押下＋離しでは `pointer.any_pressed()` と `pointer.any_click()` がともに成立し、
+   `SurrenderFocusOn::Clicks` が履歴ownerのfocusを保護前に外す。その後の `!has_focus` により一覧が閉じ、
+   行のクリックを読むところへ届かない。行のhoverが既に成立していても起きる。
+   押下・離しを分けると、押下時はany_clickがなく、離し時はoutside_pointerの参照がなく、この経路を通らない。
+   入力欄の矩形は公開viewportのWidgetRectから直接読み、currentの有効矩形→prevのfallbackを保つ形で修正した。
+2. 初回のAreaはサイズ未確定で、`area.rs` のsizing passは不可視・非対話として保存される。
+   次passの `Context::begin_pass` はprevのwidgetsとAreasのinteractableを使うため、このlayerをhit testから除外する。
+   描画中にAreaが対話可能になっても、そのpassの押下先は既に背面へ決まっている。
+   未focus欄から開いた直後に押すと `outside_pointer` が真になり、既存予約からのfocus取得を行わず閉じる。
+   150%小窓で、同frameの押下＋離しと、hoverなしの連続2frameの両方を再現した。
+   Areaの `ui.is_sizing_pass()` のときだけ `request_discard` を要求し、本文の計測とArea終端は最後まで通す。
+   通常の複数passで既知サイズ・対話可能な状態を保存し、次backend frameの入力を受けるようにした。
+
+レイヤーの確認: 実フォルダ欄の一覧と実facet「サイズ」の交差部分をクリックする配置を使用した。
+安定表示後の失敗では履歴のForeground layerがhit対象で、行もenabled/visibleだった。初回表示の失敗では
+同じ交差部分のhit対象がBackgroundになり、履歴行はenabled=false/visible=falseだった。
+実facetはContextのrootから継承するBackgroundなので、準備済みの履歴Foregroundより上に並ぶものではない。
+Areasの順序は非表示でも残るが、`layer_id_at` はcurrent/lastのvisibleとinteractableも要求する。
+2pass以上非表示のAreaが順序だけで入力を覆う経路はなかった。`move_to_top` はend-passまで順序を確定せず、
+同時要求では以前の相対順を維持するため、履歴が必ず最前面になることは保証しない。
+根拠のないtop要求の追加はしていない。
+`retire` は同ownerを毎pass描く今回の条件で閉じず、行の点は入力欄・一覧の外を押す `outside_press` にも該当しない。
+安定表示後の取りこぼしは1のfocus離脱、初回は2のhit testと予約受付の境界で説明できる。
+
+簡素化とレビュー: 実装前の独立ソースレビューで2経路と修正方針を確認した。
+この短い一覧をモーダル化する必要はなく、状態・入力の保存/再送・時間待ち・click先の後付け変更を増やさない。
+初回レイアウト計測を通常の複数passで完了させる。sizing中のinteractableを強制変更せず、
+max_passesの強制変更やdiscard予算超過時のretryも加えない。IME helper、既存focus予約、通常の行のクリックを使う。
+
+追加回帰は `src/app/pinned_search/history_tests.rs` の `section1756_history_pointer_*` 7件。
+常設4種・一時4種の実描画、フォルダtoolbarと実facet、同frameの移動＋押下＋離し、hoverなし2frame、
+hover済の行からの高速クリック、初回直後、100%/150%小窓を検査する。
+初回は待機frameを入れず、Contextの `run_ui` を使って本番と同じlayoutの再passを実行する。
+フォルダ一覧が入力欄より広く「サイズ」と重なること、hit対象、選んだ語/移動先、Sizeメニューが開かないことも確認する。
+App fixtureの隔離データを使い、Everythingは不正queryで実IPCを開始しない。desktop/GPUの操作は行わない。
+
+修正前後の切り分け:
+
+| 段階 | 結果・log |
+| --- | --- |
+| 製品コード未変更の新規7件 | 2成功・5失敗。安定表示後のフォルダ・一時欄・hover済一時欄の高速クリック不達を再現。初回2件は下記fixtureの読み取り誤り。`target/history-pointer-red.log` |
+| 矩形参照だけ修正、初回fixture修正後の7件 | 5成功・2失敗。初回フォルダの同frame/連続2frameで実際のpick不達、背景hit、非対話行を再現。`target/history-pointer-red-sizing.log` |
+| 両修正後の関連filter | 新規7件（28条件）を含む182件すべて成功、17093件は対象外。`target/history-pointer-related.log` |
+| `cargo test -j 1 --test ui_snapshot` | 251件すべて成功。既存PNGとの通常比較、PNG更新・追加なし。`target/history-pointer-ui.log` |
+| `cargo check -j 1 -p mimageviewer --bin mimageviewer-core` | exit 0。既存と同じ326警告、追加行の警告参照0。`target/history-pointer-check.log` / `target/history-pointer-warning-audit.json` |
+| workspace全体の `cargo fmt` / `cargo fmt --check` / `git diff --check` | すべて成功 |
+| `python scripts/check_ui_glyphs.py` / `python scripts/check_site_cards.py` | glyph問題0、53 cards中超過0 |
+| 通常構成の `build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | exit 0。coreを7分47秒で更新、付属exeも成功。`target/vcrt-pe-reports/dev-runtime.json` の依存検査runtime=4/pe=5成功。製品未起動 |
+
+初回fixtureはend_pass後のthis_passを読んで0行だったため、完了したprev_passを読むよう直した。
+これはテスト側の誤りであり製品不具合とは数えない。初回の製品不具合は2段階目のクリック不達で確認した。
+
+残る不明点: サブPCの実入力イベント列や各時点のArea idを採取していないため、報告された全クリックを
+この2経路のどちらかへ個別に断定はできない。長くhoverしても背面が強調され続けたか、人の通常操作でも
+同じ頻度かは未確認。今回の再現で、少なくとも初回表示時に背景がhit対象となる経路と、hover後でも
+同frameクリックが失われる経路は確認できた。
+
+最終差分の独立レビューでは重要な問題は見つからなかった。追加のlayout passで予約のissued+1・
+ownerのdrawn_pass+1の範囲を外れず、RawInputの再送も行われないことを確認した。
+検証実行は実装担当が所有し、reviewerはソースと同じ結果を確認して再実行しない。
+
+自動検証のコマンド（すべてこのworktree、全Cargoコマンドで `MSBUILDDISABLENODEREUSE=1`）:
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+# 上記redの切り分け2段階でそれぞれ実行
+cargo nextest run -j 1 -p mimageviewer --lib --no-fail-fast -E 'test(/section1756_history_pointer/)'
+# 両修正後。新規7件をこの182件に含め、重複実行していない
+cargo nextest run -j 1 -p mimageviewer --lib --no-fail-fast -E 'test(/ui_history_field::tests|pinned_search::|keyboard_input::tests|ime_focus::|section207|section1684|section1409|keymap::.*owner|folder_bar_|address_bar_focus|section292|main_chrome::tests/)'
+Remove-Item Env:UPDATE_SNAPSHOTS -ErrorAction SilentlyContinue
+cargo test -j 1 --test ui_snapshot
+cargo check -j 1 -p mimageviewer --bin mimageviewer-core
+cargo fmt
+cargo fmt --check
+python scripts/check_ui_glyphs.py
+python scripts/check_site_cards.py
+git diff --check
+```
+
+変更は `src/ui_history_field.rs`、`src/app/pinned_search/history_tests.rs`、本書の3ファイル。
+このworktreeに未コミットで残す。本体lib全件・full gateは指示どおり実行していない。
+
+確認用ビルドは通常構成で次を使用した（製品は起動しない）:
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+$env:CARGO_BUILD_JOBS='1'
+.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0
+```
+
+初回の既定指定は、MSBuildプロセス存在による待機に入ったところで自分のscriptだけ中断した。
+今回の差分はUI・test・文書だけで、前回の確認用ビルドからネイティブ依存は変更されていないため、
+既存の待機なしオプションで再開した。実際にネイティブ依存の再コンパイルはなく、coreの再コンパイルから進めた。
+他のMSBuildプロセスや稼働中アプリの停止・製品起動は行っていない。
+
+確認用coreは `target/dev-runtime/mimageviewer-core.exe`。手動確認は、フォルダ履歴のfacet「サイズ」と重なる行、
+常設・一時検索欄の行を素早くクリックし、150%の小窓でも選択できることを対象とする。
+起動コマンドは `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
+通常の `%APPDATA%\mimageviewer` を使い実設定・データを更新し得るので、インストール版・常駐tray版を先に終了する。
+本実装担当による実機・人手確認は行っていない。

@@ -787,6 +787,264 @@ fn history_keys(keys: &[egui::Key]) -> egui::RawInput {
     }
 }
 
+/// Use the production bars and backend-sized frames (including egui discard
+/// passes), without a desktop window or a GPU renderer.
+fn history_pointer_case(
+    search: Option<(Kind, bool)>,
+    split: bool,
+    settle: bool,
+    scale: f32,
+    hover: bool,
+) {
+    use egui_kittest::kittest::Queryable as _;
+    use std::{cell::RefCell, rc::Rc};
+
+    let _input = crate::key_input::lock_test_input();
+    let mut env = crate::app::setup_app_for_test();
+    let current = env.tmp.path().join("current");
+    std::fs::create_dir(&current).unwrap();
+    let targets: Vec<_> = (0..8)
+        .map(|index| {
+            let path = env.tmp.path().join(format!("target-{index}"));
+            std::fs::create_dir(&path).unwrap();
+            path
+        })
+        .collect();
+    env.current_folder = Some(current.clone());
+    env.address = current.to_string_lossy().into_owned();
+    env.active_quick_folder_slot = None;
+    env.recent_folders = targets.clone();
+    env.items = targets
+        .iter()
+        .cloned()
+        .map(crate::app::GridItem::Folder)
+        .collect();
+    env.visible_indices = (0..targets.len()).collect();
+    env.items_are_drive_list = false;
+    env.settings.toolbar_section_order = vec![crate::settings::ToolbarSectionId::Folder];
+    env.settings.show_address_bar_history_menu = true;
+    env.settings.show_toolbar_facet_filter = true;
+    let chosen = if search.is_some_and(|(kind, _)| kind == Kind::Everything) {
+        "chosen\0"
+    } else {
+        "chosen"
+    };
+    let field = if let Some((kind, pinned)) = search {
+        configure_surface(&mut env, pinned);
+        env.ensure_search_session(kind);
+        env.search_focus_request = false;
+        env.favsearch.focus_request = false;
+        env.global_search.focus_request = false;
+        *env.search_draft_mut(kind) = "draft".into();
+        env.favsearch.last_executed = chosen.into();
+        env.settings.search_input_history.record(kind, chosen);
+        input(kind, pinned).id()
+    } else {
+        egui::Id::unique("folder_address_input")
+    };
+    let env = Rc::new(RefCell::new(env));
+    let drawn = env.clone();
+    let navigation = Rc::new(RefCell::new(None));
+    let nav = navigation.clone();
+    let mut harness = crate::test_ui::builder()
+        .with_size(if scale == 1.5 {
+            egui::vec2(728.0, 409.0)
+        } else {
+            egui::vec2(800.0, 500.0)
+        })
+        .with_pixels_per_point(scale)
+        .with_context_setup(|ctx| {
+            crate::ime_focus::install_ime_input_policy(ctx);
+            crate::ui_fonts::configure_fonts(ctx);
+        })
+        .build_ui(move |root| {
+            let mut env = drawn.borrow_mut();
+            env.update_ime_state(root.ctx());
+            crate::test_ui::full_viewport_ui(root, |root| {
+                if let Some((kind, pinned)) = search {
+                    if pinned {
+                        egui::CentralPanel::default().show(root, |ui| {
+                            let output = env.draw_pinned_search_section(ui, kind);
+                            env.handle_pinned_search_actions(ui.ctx(), output.inner.actions);
+                        });
+                    } else {
+                        match kind {
+                            Kind::Local => env.render_search_bar(root),
+                            Kind::Container => env.render_favsearch_bar(root),
+                            Kind::Metadata | Kind::Everything => env.render_global_search_bar(root),
+                        }
+                    }
+                } else {
+                    if let Some(path) = env.render_toolbar(root).1 {
+                        *nav.borrow_mut() = Some(path);
+                    }
+                    env.render_facet_filter_bar(root);
+                }
+            });
+        });
+    harness.run_steps(3);
+    let pointer = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    let arrow = crate::ui_history_field::arrow_rect_for_test(&harness.ctx, field).center();
+    harness.input_mut().events.extend([
+        egui::Event::PointerMoved(arrow),
+        pointer(arrow, true),
+        pointer(arrow, false),
+    ]);
+    harness.step();
+    assert!(
+        crate::ui_history_field::is_open_for(&harness.ctx, field),
+        "arrow {search:?}/{scale}"
+    );
+    if settle {
+        harness.run_steps(3);
+    }
+    let layer = egui::LayerId::new(
+        egui::Order::Foreground,
+        field.with("history_field_popup_area"),
+    );
+    let rows: Vec<_> = harness.ctx.viewport(|viewport| {
+        viewport
+            .prev_pass
+            .widgets
+            .get_layer(layer)
+            .filter(|widget| {
+                widget.id != layer.id.with("move")
+                    && widget.sense.senses_click()
+                    && !widget.sense.senses_drag()
+            })
+            .copied()
+            .collect()
+    });
+    assert_eq!(rows.len(), if search.is_some() { 1 } else { targets.len() });
+    let (index, pos) = if search.is_none() {
+        let field_width = harness
+            .ctx
+            .viewport(|viewport| viewport.prev_pass.widgets.get(field).unwrap().rect.width());
+        assert!(
+            rows[0].rect.width() > field_width,
+            "popup must extend beyond the address input"
+        );
+        let size = harness.get_by_label("サイズ").rect();
+        rows.iter()
+            .enumerate()
+            .find_map(|(index, row)| {
+                let overlap = row.rect.intersect(size);
+                overlap.is_positive().then_some((index, overlap.center()))
+            })
+            .expect("folder history must overlap the actual facet Size button")
+    } else {
+        (0, rows[0].rect.center())
+    };
+    let before = harness.ctx.layer_id_at(pos);
+    if hover {
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::PointerMoved(pos));
+        harness.step();
+        assert!(harness.ctx.read_response(rows[index].id).unwrap().hovered());
+    }
+    harness
+        .input_mut()
+        .events
+        .extend([egui::Event::PointerMoved(pos), pointer(pos, true)]);
+    if split {
+        harness.step();
+    }
+    harness.input_mut().events.push(pointer(pos, false));
+    harness.step();
+    let diagnostic = format!(
+        "{search:?}/split={split}/settle={settle}/scale={scale}, hit={before:?}, row={:?}",
+        rows[index]
+    );
+    if let Some((kind, _)) = search {
+        assert_eq!(
+            env.borrow_mut().search_draft_mut(kind),
+            chosen,
+            "{diagnostic}"
+        );
+    } else {
+        assert!(
+            matches!(&*navigation.borrow(), Some(crate::ui_main::AddressBarNav::Direct(path, _)) if crate::folder_tree::path_eq(path, &targets[index])),
+            "{diagnostic}: {:?}",
+            navigation.borrow()
+        );
+        assert!(env.borrow().settings.facet_filter.size_preset.is_none());
+        assert!(
+            !egui::Popup::is_any_open(&harness.ctx),
+            "Size menu must stay closed"
+        );
+    }
+    assert!(
+        !crate::ui_history_field::is_open_for(&harness.ctx, field),
+        "{diagnostic}"
+    );
+    assert_eq!(
+        before,
+        Some(layer),
+        "{diagnostic}: history must own the hit test"
+    );
+    assert!(rows[index].enabled && rows[index].visible, "{diagnostic}");
+}
+
+#[test]
+fn section1756_history_pointer_search_same_frame() {
+    for pinned in [false, true] {
+        for kind in Kind::ALL {
+            history_pointer_case(Some((kind, pinned)), false, true, 1.0, false);
+        }
+    }
+}
+
+#[test]
+fn section1756_history_pointer_search_no_hover_two_frames() {
+    for pinned in [false, true] {
+        for kind in Kind::ALL {
+            history_pointer_case(Some((kind, pinned)), true, true, 1.0, false);
+        }
+    }
+}
+
+#[test]
+fn section1756_history_pointer_folder_over_facet() {
+    for scale in [1.0, 1.5] {
+        history_pointer_case(None, false, true, scale, false);
+    }
+}
+
+#[test]
+fn section1756_history_pointer_folder_over_facet_two_frames() {
+    for scale in [1.0, 1.5] {
+        history_pointer_case(None, true, true, scale, false);
+    }
+}
+
+#[test]
+fn section1756_history_pointer_immediately_after_open() {
+    for search in [None, Some((Kind::Local, false)), Some((Kind::Local, true))] {
+        history_pointer_case(search, false, false, 1.5, false);
+    }
+}
+
+#[test]
+fn section1756_history_pointer_immediately_after_open_two_frames() {
+    for search in [None, Some((Kind::Local, false)), Some((Kind::Local, true))] {
+        history_pointer_case(search, true, false, 1.5, false);
+    }
+}
+
+#[test]
+fn section1756_history_pointer_search_hover_then_fast_click() {
+    for pinned in [false, true] {
+        history_pointer_case(Some((Kind::Metadata, pinned)), false, true, 1.0, true);
+    }
+}
+
 fn history_pending_grid_case(
     search: Option<(Kind, bool)>,
     keys: &[egui::Key],

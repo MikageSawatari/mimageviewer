@@ -248,10 +248,18 @@ pub(crate) fn show_singleline<'text>(
     let pointer = ctx.pointer_interact_pos();
     let outside_pointer = ctx.input(|input| input.pointer.any_pressed())
         && pointer.is_some_and(|pos| {
-            !ctx.read_response(id)
-                .is_some_and(|response| response.rect.contains(pos))
-                && ctx.layer_id_at(pos)
-                    != Some(egui::LayerId::new(egui::Order::Foreground, popup_id(id)))
+            // read_response calls get_response, which can surrender focus on
+            // an aggregated press+release before the popup's focus guard runs.
+            !ctx.viewport(|viewport| {
+                viewport
+                    .this_pass
+                    .widgets
+                    .get(id)
+                    .filter(|widget| widget.rect.is_positive() && widget.rect.is_finite())
+                    .or_else(|| viewport.prev_pass.widgets.get(id))
+                    .is_some_and(|widget| widget.rect.contains(pos))
+            }) && ctx.layer_id_at(pos)
+                != Some(egui::LayerId::new(egui::Order::Foreground, popup_id(id)))
         });
     let requesting_focus = options.focus_pending
         && enabled
@@ -406,6 +414,11 @@ pub(crate) fn show_singleline<'text>(
             .fixed_pos(pos)
             .movable(false)
             .show(&ctx, |ui| {
+                if ui.is_sizing_pass() {
+                    // Finish measuring, then save an interactive Area in the
+                    // next layout pass before accepting the next input frame.
+                    ui.ctx().request_discard("measure input history popup");
+                }
                 crate::os_theme::apply_dark_ui(ui);
                 crate::os_theme::dark_popup_frame(&ctx).show(ui, |ui| {
                     ui.set_width((popup_width - ui.spacing().window_margin.sum().x).max(0.0));
