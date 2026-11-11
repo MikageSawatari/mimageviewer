@@ -4,7 +4,8 @@ use eframe::egui;
 
 use crate::app::App;
 use crate::folder_pane::{
-    self, FolderPaneCommand, FolderPaneCursorScroll, FolderPaneListingOptions, FolderPaneTreeKey,
+    self, FolderPaneCommand, FolderPaneCursorScroll, FolderPaneLabelClick,
+    FolderPaneListingOptions, FolderPaneTreeKey,
 };
 use crate::ui_main::AddressBarNav;
 
@@ -529,6 +530,12 @@ impl App {
         });
     }
 
+    fn apply_folder_pane_branch_click(&mut self, path: &std::path::Path, key: FolderPaneTreeKey) {
+        self.folder_pane.set_focus_tree();
+        self.folder_pane.set_cursor(path.to_path_buf());
+        let _ = self.folder_pane.handle_tree_key(key);
+    }
+
     fn render_folder_pane_tree(&mut self, ui: &mut egui::Ui) -> Option<std::path::PathBuf> {
         let rows = self.folder_pane.visible_rows();
         if rows.is_empty() {
@@ -608,22 +615,45 @@ impl App {
                     );
                 });
                 if (row.expanded || row.has_children_or_unknown) && arrow_resp.clicked() {
-                    self.folder_pane.set_focus_tree();
-                    self.folder_pane.set_cursor(row.path.clone());
+                    self.folder_pane.clear_label_click();
                     let key = if row.expanded {
                         FolderPaneTreeKey::Left
                     } else {
                         FolderPaneTreeKey::Right
                     };
-                    let _ = self.folder_pane.handle_tree_key(key);
+                    self.apply_folder_pane_branch_click(&row.path, key);
                 }
                 if resp.clicked() {
-                    self.folder_pane.set_focus_tree();
-                    self.folder_pane.set_cursor(row.path.clone());
-                    if self
-                        .folder_pane
-                        .active_path()
-                        .is_none_or(|active| !crate::folder_tree::path_eq(active, &row.path))
+                    let count = if resp.triple_clicked() {
+                        3
+                    } else if resp.double_clicked() {
+                        2
+                    } else {
+                        1
+                    };
+                    let time = ui.input(|input| input.time);
+                    let delay = ui
+                        .ctx()
+                        .options(|options| options.input_options.max_double_click_delay);
+                    let click = self.folder_pane.handle_label_click(
+                        &row.path,
+                        count,
+                        row.expanded,
+                        row.expanded || row.has_children_or_unknown,
+                        time,
+                        delay,
+                    );
+                    if let FolderPaneLabelClick::Repeated(Some(key)) = click {
+                        self.apply_folder_pane_branch_click(&row.path, key);
+                    } else {
+                        self.folder_pane.set_focus_tree();
+                        self.folder_pane.set_cursor(row.path.clone());
+                    }
+                    if click == FolderPaneLabelClick::Single
+                        && self
+                            .folder_pane
+                            .active_path()
+                            .is_none_or(|active| !crate::folder_tree::path_eq(active, &row.path))
                     {
                         nav = Some(row.path.clone());
                     }

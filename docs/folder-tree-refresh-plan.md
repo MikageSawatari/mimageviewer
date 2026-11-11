@@ -488,3 +488,34 @@ P2-2の不変条件は「未確定時の代替位置と利用者が選んだ位�
 - 単クリックの移動をダブルクリック判定まで遅らせる: 単クリックが毎回遅くなるリリース済み挙動の退行なので採らない。
 - 移動完了で現在地の展開状態を保つように既存の展開規則を変える: 範囲外で、他の移動 (Ctrl+↑↓ など) の見え方も変わるので採らない。
 - 上の 1 件の記録は、egui が count 2 以上と判定したときだけ参照し、利用者に見える状態や保存データにはならない。組み合わせは「単クリック扱い / 一致した count 2 / 一致した count 3」の 3 通りに限る。
+
+### 実装記録 (2026-11-12、`bdd537a48` 上の未コミット差分)
+
+| 項目 | 実装・確認方法 |
+| --- | --- |
+| §12.1 | label の `clicked()` 内で triple → double → single の優先順で回数を渡す。単クリックは従来の即時 navigation、一致した 2/3 回目は navigation を出さない |
+| §12.2 | `FolderPaneState::handle_label_click` が path・初回 expanded・egui time・処理済みの一時記録 1 件を所有する。path は `folder_tree::path_eq`、時刻は実際の `max_double_click_delay` の 2 倍以内で照合。初回表示の逆を目標とし、現在表示と異なる時だけ Left/Right を返す |
+| 開閉の共通化 | ▶ / ▼ と label の開閉を `apply_folder_pane_branch_click` へ合流。既存の focus/cursor と `handle_tree_key` を使う。矢印 click は label 記録を消す。空の枝にも同じ「開けるか」の条件を渡す |
+| §12.3 | 純粋判定 5 件と実 pointer handler 10 件を追加。祖先への移動の前後完了を別試験とし、pending receiver を一時保持して cancel token / `Arc::ptr_eq`、最終現在地・枝の状態・子行を検査する。移動完了待ちは egui time を進めずに既存 navigation 裁定・採用を poll する |
+| §12.4・範囲 | 記録は永続化しない。新しい列挙経路・scan 要求・repaint・delay・retry・UI 同期 I/O は追加しない。▶ / ▼・矢印キー・Enter の処理と disabled gate は維持 |
+| 文書 | `docs/spec.md` と `manual/tut-navigation.html` を更新。公開ページを検索した範囲では、同じフォルダツリーのマウス操作を記述した他ページは見つからず、追加変更なし。backlog §1.769 の状態行は変更しない |
+
+検証は Windows MSVC / default features。初回の TurboJPEG 自動 CMake build は exit 1 で停止し、Rust test build は exit 101 (試験開始前)。同じ crate 同梱ソースを本 worktree の `target/769-native/source` へ実コピーし、SIMD 有効・Release `/MT`・直列で静的 build した。`turbojpeg.lib` / `turbojpeg-static.lib` とヘッダを `target/769-native/` に配置し、検証プロセスだけ explicit library と通常形式の include path を使う (`target/769-env.ps1`)。製品の依存設定・build script は変更しない。準備途中の LibRaw library/header 配置不足による exit 101 は成功根拠に含めない。
+
+途中の test compile は `InputState::options` が非公開のため exit 101。間隔の取得を公開の `Context::options` へ補正し、その後の core check は成功した。最初に実行できた追加 filter は **15件中12成功/3失敗、exit 100** (`769-added-tests-pass.log`)。祖先 2 件は arbitration fixture が意図的に subtree を drive として選び自動 reveal を抑止していた setup 不備、行境界 1 件は距離が egui の strict `< 6pt` の上限ちょうどになった setup 不備。祖先は既存の synthetic-ancestor/real-subtree backend を実 drive root で使い、境界は行内 0.1pt の点で strict 上限内に補正した。製品コードによる対処や仕様変更は行っていない。
+
+次の追加 filter は **13成功/2失敗、exit 100** (`769-added-tests-final.log`)。実 drive の長い祖先経路を使ったことで、小さい setup viewport と pointer 用 viewport の間で cursor reveal の hit target が変わる fixture 不備が残った。クリック前に B の cursor reveal を pointer 用の 1600×600 viewport で消化させ、2 回目が B の実 response の `double_clicked()` に届いたことも検査するよう補正した。最終追加 filter は **15成功/失敗0、3.441秒、exit 0**。製品コードの追加変更はない。
+
+| 検証コマンド | 結果 | 証跡 (`target/`) |
+| --- | --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/label_click/) \| test(/folder_pane_label/)' --no-fail-fast` | **15成功/失敗0、3.441秒、exit 0** | `769-added-tests-stable.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/folder_pane/)' --no-fail-fast` | **104成功/失敗0、24.803秒、exit 0** | `769-folder-filter.log` |
+| `scripts/test-focused.ps1 -Path @('src/folder_pane.rs','src/ui_folder_pane.rs','src/app/folder_pane_refresh_tests.rs')` | **50 / 18 / 50 件すべて成功、計118実行 (重複あり)、exit 0** | `769-focused.log`、`test-focused/runs/20261111T155821843Z-9838ebb3` / `20261111T155831717Z-172044d5` / `20261111T155841206Z-15d1f67f` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **exit 0、4分07秒**。既存 warning あり | `769-check.log` |
+| `cargo test --test ui_snapshot folder_pane` | **4成功/失敗0、1.37秒、exit 0**。基準画像更新なし | `769-snapshot.log` |
+| 引数なし `cargo fmt` / `cargo fmt --check` / `git diff --check` | **各 exit 0** | `769-fmt.log` / `769-fmt-check.log` / `769-diff-check.log` |
+| `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | 初回 **exit 101**、並列数 1 の再実行は **exit 0**。通常 features / dev-runtime で core・remote・EPUB worker・MCP・music-video editor の5本を生成。runtime 4本 / PE 5本の検査成功。起動なし | `769-build-dev.log` / `769-build-dev-serial.log`、`vcrt-pe-reports/dev-runtime.json` |
+
+UI 文字列は変更していないため UI glyph 検査は対象外。全 lib gate は設計担当へ引き継ぎ、ここでは実行しない。製品バイナリ起動・実機操作・コミットは行わない。修正済み §12 からの設計変更はない。
+
+確認用 build の初回は依存 `inventory` の rustc 起動が `0xc0000142 (STATUS_DLL_INIT_FAILED)` で失敗し、wrapper は exit 101。製品ソースの compile error ではない。source / feature / profile は変えず、同じ native 環境に `CARGO_BUILD_JOBS=1` を指定して一度再実行し成功した。core の Cargo build は依存込み41分50秒、remote 3分20秒。成果物は `target/dev-runtime/mimageviewer-core.exe` と上記 companion 4本。通常 `%APPDATA%/mimageviewer` profile を既定とする非 portable build であり、エージェントによる起動・既存 process の停止は行っていない。

@@ -49,6 +49,19 @@ pub(crate) enum FolderPaneCommand {
     Open(PathBuf),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FolderPaneLabelClick {
+    Single,
+    Repeated(Option<FolderPaneTreeKey>),
+}
+
+struct FolderPaneLabelClickRecord {
+    path: PathBuf,
+    expanded: bool,
+    time: f64,
+    toggled: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FolderPaneRow {
     pub path: PathBuf,
@@ -213,6 +226,7 @@ pub(crate) struct FolderPaneState {
     participation: PaneParticipation,
     listing_options: FolderPaneListingOptions,
     last_drive_refresh: Option<std::time::Instant>,
+    label_click: Option<FolderPaneLabelClickRecord>,
     #[cfg(test)]
     scan_backend: Option<TestScanBackend>,
 }
@@ -238,6 +252,7 @@ impl Default for FolderPaneState {
             participation: PaneParticipation::Suspended,
             listing_options: FolderPaneListingOptions::default(),
             last_drive_refresh: None,
+            label_click: None,
             #[cfg(test)]
             scan_backend: None,
         }
@@ -245,6 +260,50 @@ impl Default for FolderPaneState {
 }
 
 impl FolderPaneState {
+    /// Resolve a label gesture without navigation, I/O, or changing tree state.
+    /// The first click's display owns the target even if active sync runs meanwhile.
+    pub(crate) fn handle_label_click(
+        &mut self,
+        path: &Path,
+        count: u8,
+        expanded: bool,
+        can_expand: bool,
+        time: f64,
+        max_double_click_delay: f64,
+    ) -> FolderPaneLabelClick {
+        if count >= 2
+            && let Some(record) = self.label_click.as_mut().filter(|record| {
+                crate::folder_tree::path_eq(&record.path, path)
+                    && (0.0..=max_double_click_delay * 2.0).contains(&(time - record.time))
+            })
+        {
+            let key = if count == 2 && !record.toggled {
+                record.toggled = true;
+                if record.expanded && expanded {
+                    Some(FolderPaneTreeKey::Left)
+                } else if !record.expanded && !expanded && can_expand {
+                    Some(FolderPaneTreeKey::Right)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            return FolderPaneLabelClick::Repeated(key);
+        }
+        self.label_click = Some(FolderPaneLabelClickRecord {
+            path: path.to_path_buf(),
+            expanded,
+            time,
+            toggled: false,
+        });
+        FolderPaneLabelClick::Single
+    }
+
+    pub(crate) fn clear_label_click(&mut self) {
+        self.label_click = None;
+    }
+
     pub(crate) fn selected_drive(&self) -> Option<&Path> {
         self.selection.position().drive.as_deref()
     }
@@ -1366,6 +1425,94 @@ impl FolderPaneState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn label_click_single_replaces_record_and_matches_normalized_path() {
+        let mut state = FolderPaneState::default();
+        let path = Path::new(r"C:\tree\branch");
+        assert_eq!(
+            state.handle_label_click(path, 1, false, true, 1.0, 0.3),
+            FolderPaneLabelClick::Single
+        );
+        assert_eq!(
+            state.handle_label_click(Path::new("c:/TREE/branch"), 2, false, true, 1.2, 0.3),
+            FolderPaneLabelClick::Repeated(Some(FolderPaneTreeKey::Right))
+        );
+        assert_eq!(
+            state.handle_label_click(path, 1, true, true, 1.3, 0.3),
+            FolderPaneLabelClick::Single
+        );
+        assert_eq!(
+            state.handle_label_click(path, 2, true, true, 1.4, 0.3),
+            FolderPaneLabelClick::Repeated(Some(FolderPaneTreeKey::Left))
+        );
+    }
+
+    #[test]
+    fn label_click_double_uses_first_display_and_toggles_only_once() {
+        for (first, current, can_expand, expected) in [
+            (false, false, true, Some(FolderPaneTreeKey::Right)),
+            (true, true, true, Some(FolderPaneTreeKey::Left)),
+            (true, false, true, None),
+            (false, true, true, None),
+            (false, false, false, None),
+        ] {
+            let mut state = FolderPaneState::default();
+            let path = Path::new("C:/branch");
+            state.handle_label_click(path, 1, first, can_expand, 1.0, 0.3);
+            assert_eq!(
+                state.handle_label_click(path, 2, current, can_expand, 1.2, 0.3),
+                FolderPaneLabelClick::Repeated(expected)
+            );
+            assert_eq!(
+                state.handle_label_click(path, 2, first, can_expand, 1.25, 0.3),
+                FolderPaneLabelClick::Repeated(None)
+            );
+        }
+    }
+
+    #[test]
+    fn label_click_triple_and_further_clicks_do_not_navigate_or_toggle() {
+        let mut state = FolderPaneState::default();
+        let path = Path::new("C:/branch");
+        state.handle_label_click(path, 1, false, true, 1.0, 0.3);
+        for time in [1.2, 1.3, 1.5] {
+            assert_eq!(
+                state.handle_label_click(path, 3, false, true, time, 0.3),
+                FolderPaneLabelClick::Repeated(None)
+            );
+        }
+    }
+
+    #[test]
+    fn label_click_path_mismatch_or_timeout_starts_a_new_single() {
+        for count in [2, 3] {
+            for (next, time) in [("C:/other", 1.2), ("C:/branch", 1.601)] {
+                let mut state = FolderPaneState::default();
+                state.handle_label_click(Path::new("C:/branch"), 1, false, true, 1.0, 0.3);
+                assert_eq!(
+                    state.handle_label_click(Path::new(next), count, true, true, time, 0.3),
+                    FolderPaneLabelClick::Single
+                );
+                assert_eq!(
+                    state.handle_label_click(Path::new(next), 2, true, true, time + 0.1, 0.3),
+                    FolderPaneLabelClick::Repeated(Some(FolderPaneTreeKey::Left))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn label_click_arrow_clear_breaks_the_label_sequence() {
+        let mut state = FolderPaneState::default();
+        let path = Path::new("C:/branch");
+        state.handle_label_click(path, 1, false, true, 1.0, 0.3);
+        state.clear_label_click();
+        assert_eq!(
+            state.handle_label_click(path, 2, true, true, 1.2, 0.3),
+            FolderPaneLabelClick::Single
+        );
+    }
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
