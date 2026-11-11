@@ -260,3 +260,21 @@ GPT-6.1 Sol / xhigh のコードレビューは修正後 ACCEPT (未解決 P1/P2
 実アプリ・ui-smoke は未実行。本体 lib 全件は依頼どおり実行せず、設計担当のロック取得後の gate に残す。
 コミットも行わない。製品機能を変更しない test-script 診断であり、通常 profile の build-dev 確認用 binary は
 今回の差し込みを使えないため作成しない。設計の主要な前提との相違は見つかっていない。
+
+### 7.3 独立レビューと設計担当の検証 (2026-11-11〜12)
+
+- 実装の独立レビュー (GPT-6.1 Sol / xhigh、実装者とは別、08b197240): **ACCEPT、P1〜P3 の指摘なし**。
+  製品ビルドの gilrs 起動・停止・Drop と cfg 境界に挙動変更なし、`pad_trigger` の閾値と順序は gilrs 0.11.2 と一致、
+  と報告された。
+- 実アプリ (利用者の了承済み、1 回): `.\scripts\ui-smoke.ps1 -Scenario GamepadBasic -InteractiveApproved -SkipBuild`
+  (使い捨ての `target\portable-smoke`、`portable,test-script`)、2026-11-12 00:06〜00:08、**exit 0**、再試行なし。
+  台本の最後の記録は `injected=11 drained=11 discarded=0 reader=script foreground=true`。
+  十字キー右で 2 枚目を選択 → A で全画面 (2 / 3) → B で一覧 → X+上のリングで親フォルダ (`library`、`sub` 1 件)、
+  をスクリーンショット (証跡 `target/ui-smoke-runs/20261111T150602352Z-54716-GamepadBasic-e4af6fdf/`) で確認。
+  fixture の画像は page-turn の配色を使うため、ファイル名の色 (red/green/blue) と実際の色は一致しない
+  (一覧と全画面の表示は互いに一致)。
+- 本体 lib 全件 (`test-lib-full.ps1`、共有ロック取得下、00:09〜00:45): 17,219 件中 **10 件が失敗**
+  (TIMEOUT 4: `history_parent_1473::section1473_*`、FAIL 6: `smart_folder_transition_tests` 1・
+  `still_window_mode_key_tests::remote_*`/`streaming_*` 3・`local_adjust_segmentation_tests` の時間計測 2)。
+  いずれも待ちの期限・経過時間の閾値で落ちるもので、ゲームパッド・台本とは無関係。所要が通常の約 7 分に対して
+  36 分で、実行時の負荷が高かった。10 件を単独で再実行し **10 件とも成功** (80.75s)。
