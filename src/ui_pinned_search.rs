@@ -215,6 +215,11 @@ pub fn draw_pinned_search(
                                                 .margin(egui::Margin::symmetric(4, 2))
                                         },
                                     );
+                                    crate::search_request::apply_select_all(
+                                        ui.ctx(),
+                                        draft,
+                                        &mut output,
+                                    );
                                     crate::ui_helpers::set_accessibility_label(
                                         &output.response,
                                         kind.label(),

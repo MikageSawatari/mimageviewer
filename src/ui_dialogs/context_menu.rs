@@ -1160,7 +1160,7 @@ impl crate::app::App {
             ContextMenuSurface::Grid,
             explorer_folder,
         );
-        let nodes = self.context_menu_nodes(&target, in_search);
+        let nodes = self.context_menu_nodes(ctx, &target, in_search);
         let mut selected_command = None;
         let mut open = true;
         egui::Window::new("context_menu")
@@ -1250,7 +1250,7 @@ impl crate::app::App {
             explorer_folder,
         );
         let shell_paths = target.shell_paths.clone().unwrap_or_default();
-        let miv_items = self.context_menu_nodes(&target, in_search);
+        let miv_items = self.context_menu_nodes(ctx, &target, in_search);
         let miv_count = menu_leaf_count(&miv_items);
         let target_kind = native_grid_context_menu_target_kind(&target);
         let prepare_ms = prepare_t0.elapsed().as_secs_f64() * 1000.0;
@@ -1461,6 +1461,7 @@ impl crate::app::App {
 
     fn context_menu_nodes(
         &mut self,
+        ctx: &egui::Context,
         target: &NativeGridContextMenuTarget,
         in_search: bool,
     ) -> Vec<MenuNode> {
@@ -1496,7 +1497,26 @@ impl crate::app::App {
             rating: self.items_are_rating_view,
             reading_history: self.items_are_reading_history_view,
         };
+        let search_by_name = (target.surface == ContextMenuSurface::Grid
+            && !target.is_folder_context)
+            .then(|| self.grid_item_search_name(ctx, &target.item))
+            .flatten()
+            .map(|query| {
+                let availability = |kind| {
+                    if query.is_empty() {
+                        Err("名前が空のため検索できません")
+                    } else {
+                        self.search_with_text_availability(ctx, kind)
+                    }
+                };
+                crate::context_menu_model::SearchByNameAvailability {
+                    everything: availability(crate::ui_pinned_search::PinnedSearchKind::Everything),
+                    metadata: availability(crate::ui_pinned_search::PinnedSearchKind::Metadata),
+                    local: availability(crate::ui_pinned_search::PinnedSearchKind::Local),
+                }
+            });
         let input = ContextMenuInput {
+            search_by_name,
             kind: ContextMenuItemKind::from_grid_item(&target.item),
             surface: target.surface,
             is_folder_context: target.is_folder_context,
@@ -1774,6 +1794,33 @@ impl crate::app::App {
             return None;
         }
         match command {
+            MenuCommand::SearchByNameEverything
+            | MenuCommand::SearchByNameMetadata
+            | MenuCommand::SearchByNameLocal => {
+                if target.surface == ContextMenuSurface::Grid
+                    && !target.is_folder_context
+                    && let Some(query) = self.grid_item_search_name(ctx, &target.item)
+                    && !query.is_empty()
+                {
+                    let target = match command {
+                        MenuCommand::SearchByNameEverything => {
+                            crate::ui_pinned_search::PinnedSearchKind::Everything
+                        }
+                        MenuCommand::SearchByNameMetadata => {
+                            crate::ui_pinned_search::PinnedSearchKind::Metadata
+                        }
+                        MenuCommand::SearchByNameLocal => {
+                            crate::ui_pinned_search::PinnedSearchKind::Local
+                        }
+                        _ => unreachable!(),
+                    };
+                    self.open_search_with_text(
+                        ctx,
+                        crate::search_request::SearchRequest { target, query },
+                    );
+                }
+                None
+            }
             MenuCommand::ConvertImageFolderToZip => {
                 if let GridItem::Folder(path) = &target.item {
                     self.start_image_folder_zip(ctx, path.clone(), false);
@@ -2297,7 +2344,7 @@ impl crate::app::App {
             ContextMenuSurface::Fullscreen,
             explorer_folder,
         );
-        let nodes = self.context_menu_nodes(&target, false);
+        let nodes = self.context_menu_nodes(ctx, &target, false);
         let mut selected_command = None;
         let mut open = true;
         egui::Window::new("fs_context_menu")
@@ -4021,7 +4068,7 @@ mod copy_action_tests {
                 ContextMenuSurface::Grid,
                 None,
             );
-            let nodes = app.context_menu_nodes(&target, false);
+            let nodes = app.context_menu_nodes(&egui::Context::default(), &target, false);
             assert!(nodes.iter().any(|node| matches!(
                 node,
                 MenuNode::Item {
@@ -4604,7 +4651,10 @@ mod delete_confirm_tests {
         }
         let target = target(app, item, surface);
         let mut commands = Vec::new();
-        visit(&app.context_menu_nodes(&target, false), &mut commands);
+        visit(
+            &app.context_menu_nodes(&egui::Context::default(), &target, false),
+            &mut commands,
+        );
         commands
     }
 
@@ -4649,19 +4699,19 @@ mod delete_confirm_tests {
             app.checked.clear();
             let mut target = target(&app, unsupported, ContextMenuSurface::Grid);
             assert_eq!(
-                caption_state(&app.context_menu_nodes(&target, false)),
+                caption_state(&app.context_menu_nodes(&egui::Context::default(), &target, false)),
                 Some((false, true))
             );
             app.checked = [0, 1].into_iter().collect();
             target.has_checked = true;
             target.checked_count = 2;
             assert_eq!(
-                caption_state(&app.context_menu_nodes(&target, false)),
+                caption_state(&app.context_menu_nodes(&egui::Context::default(), &target, false)),
                 Some((false, true))
             );
             app.checked = [0, 2].into_iter().collect();
             assert_eq!(
-                caption_state(&app.context_menu_nodes(&target, false)),
+                caption_state(&app.context_menu_nodes(&egui::Context::default(), &target, false)),
                 Some((true, false))
             );
         }
@@ -4725,7 +4775,7 @@ mod delete_confirm_tests {
         );
         background.is_folder_context = true;
         background.item_index = None;
-        let nodes = app.context_menu_nodes(&background, false);
+        let nodes = app.context_menu_nodes(&egui::Context::default(), &background, false);
         assert!(matches!(
             nodes.first(),
             Some(MenuNode::Item {
@@ -4737,7 +4787,7 @@ mod delete_confirm_tests {
         ));
         background.surface = ContextMenuSurface::Fullscreen;
         assert!(
-            !app.context_menu_nodes(&background, false)
+            !app.context_menu_nodes(&egui::Context::default(), &background, false)
                 .iter()
                 .any(|node| matches!(
                     node,
@@ -4808,7 +4858,7 @@ mod delete_confirm_tests {
                     entry_ids: vec![crate::collection_store::CollectionEntryId::new()],
                 },
             );
-        let nodes = app.context_menu_nodes(&root, false);
+        let nodes = app.context_menu_nodes(&egui::Context::default(), &root, false);
         let jump = state(&nodes, MenuCommand::JumpToFolder).expect("grid location jump");
         assert!(!jump.0);
         assert_eq!(jump.1.as_deref(), Some(COLLECTION_JUMP_STALE_MESSAGE));
@@ -4824,7 +4874,7 @@ mod delete_confirm_tests {
         );
 
         root.surface = ContextMenuSurface::Fullscreen;
-        let nodes = app.context_menu_nodes(&root, false);
+        let nodes = app.context_menu_nodes(&egui::Context::default(), &root, false);
         assert!(state(&nodes, MenuCommand::JumpToFolder).is_none());
     }
 
@@ -5019,7 +5069,10 @@ mod delete_confirm_tests {
             native_grid_context_menu_target_kind(&target),
             "virtual_item"
         );
-        assert!(!app.context_menu_nodes(&target, false).is_empty());
+        assert!(
+            !app.context_menu_nodes(&egui::Context::default(), &target, false)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -5056,7 +5109,7 @@ mod delete_confirm_tests {
             native_grid_context_menu_target_kind(&target),
             "checked_paths"
         );
-        let nodes = app.context_menu_nodes(&target, false);
+        let nodes = app.context_menu_nodes(&egui::Context::default(), &target, false);
         for command in [MenuCommand::CutFiles, MenuCommand::CopyFiles] {
             assert!(nodes.iter().any(|node| {
                 matches!(
@@ -5126,14 +5179,16 @@ mod delete_confirm_tests {
         app.keymap = crate::keymap::Keymap::from_ini_str(
             "[Grid]\nGridCutFiles = Alt+X\nGridCopyFiles = Alt+C\n",
         );
-        let labels = menu_labels(&app.context_menu_nodes(&target, false));
+        let labels =
+            menu_labels(&app.context_menu_nodes(&egui::Context::default(), &target, false));
         assert!(labels.contains(&"切り取り (Alt+X)".to_string()));
         assert!(labels.contains(&"コピー (Alt+C)".to_string()));
 
         app.keymap = crate::keymap::Keymap::from_ini_str(
             "[Grid]\nGridCutFiles = none\nGridCopyFiles = none\n",
         );
-        let labels = menu_labels(&app.context_menu_nodes(&target, false));
+        let labels =
+            menu_labels(&app.context_menu_nodes(&egui::Context::default(), &target, false));
         assert!(labels.contains(&"切り取り".to_string()));
         assert!(labels.contains(&"コピー".to_string()));
         assert!(!labels.iter().any(|label| label.starts_with("切り取り (")));
@@ -5273,15 +5328,21 @@ mod delete_confirm_tests {
             Some(PathBuf::from(r"C:\media")),
         );
 
-        assert!(app.context_menu_nodes(&target, false).iter().any(|node| {
-            matches!(
-                node,
-                MenuNode::Item {
-                    command: MenuCommand::ExternalTool(crate::external_tool::ExternalToolId(7)),
-                    ..
-                }
-            )
-        }));
+        assert!(
+            app.context_menu_nodes(&egui::Context::default(), &target, false)
+                .iter()
+                .any(|node| {
+                    matches!(
+                        node,
+                        MenuNode::Item {
+                            command: MenuCommand::ExternalTool(
+                                crate::external_tool::ExternalToolId(7)
+                            ),
+                            ..
+                        }
+                    )
+                })
+        );
         assert!(matches!(
             &target.external_tool_descriptor.targets_for_test(&app)[..],
             [
@@ -5332,7 +5393,7 @@ mod delete_confirm_tests {
                 crate::app::collection_grid::CollectionRootDeleteResolution::NotCollectionRoot,
         };
 
-        let items = app.context_menu_nodes(&target, false);
+        let items = app.context_menu_nodes(&egui::Context::default(), &target, false);
         let external: Vec<_> = items
             .iter()
             .filter_map(|item| match item {
@@ -5598,7 +5659,7 @@ mod delete_confirm_tests {
             crate::app::collection_grid::CollectionRootDeleteResolution::Unavailable(
                 "コレクションの参照を確認しています",
             );
-        let nodes = app.context_menu_nodes(&target, false);
+        let nodes = app.context_menu_nodes(&egui::Context::default(), &target, false);
         assert_eq!(
             state(&nodes, MenuCommand::RemoveFromCollection),
             Some((false, Some("コレクションの参照を確認しています")))

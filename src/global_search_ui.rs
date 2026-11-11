@@ -4764,6 +4764,7 @@ impl App {
                         .min_size(egui::vec2(320.0, 20.0))
                     },
                 );
+                crate::search_request::apply_select_all(ui.ctx(), &self.global_search.metadata_draft, &mut output);
                 let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
                     &mut output,

@@ -159,6 +159,18 @@ Smart Folderの一覧退避は非固定のtemporary queryのみを所有し、�
 消費する。初回未送信/取消後/PhysicalChildにもclosable ownerで終了先を持つ。
 詳細な幅・フォーカス・簡素化の判断は [ツールバー計画 §2.5](toolbar-customization-plan.md#25-検索欄の個別固定-1409)。
 
+### 1.6 一覧の項目の名前から検索欄を開く (§1.690)
+
+メイン窓の一覧の「名前で検索」サブメニューと3つの Grid KeyAction は、
+`SearchRequest { target, query }` を `App::open_search_with_text` へ渡す。
+項目の名前・入口の可否・渡し先の通常ショートカットの受付を共有し、
+`ensure_search_session` で既存の欄を開いて下書きを置き換え、フォーカスと全選択を要求する。
+Edited / Submit は呼ばず Enter まで検索しない。Metadata の既存デバウンス予約は解除し、
+進行中の検索・適用済み結果は保持する。全選択の一時印は入力欄 id と文字列に結び付けて
+フォーカスのある描画時に消費し、IME 変換中は選択を変えない。
+Local は Metadata / Everything の結果中（PhysicalChild を含む）には受け付けない。
+新しい App 状態・worker・永続データは追加しない。詳細は [設計 M1〜M8](search-from-item-plan.md)。
+
 ## 2. モジュールマップ
 
 ### 2.1 クエリ層 (UI スレッドが呼ぶ)
@@ -166,6 +178,8 @@ Smart Folderの一覧退避は非固定のtemporary queryのみを所有し、�
 | モジュール | 役割 |
 | --- | --- |
 | [search_query.rs](../src/search_query.rs) | トークナイザ + AST + `matches` / `matches_with_mode` / `decide_partial` / `MatchMode` |
+| [search_request.rs](../src/search_request.rs) | 検索欄の渡し先と文字列、項目種別ごとの名前生成、入力欄 id ごとの全選択の一時印 |
+| [app/search_request.rs](../src/app/search_request.rs) | 名前で検索の共通受付と `open_search_with_text`。既存の検索欄へ入力だけを渡す |
 | [search_norm.rs](../src/search_norm.rs) | `normalize_for_match(s) -> String` — Ctrl+S/F/Gのtoken検索で共有する唯一の正規化関数。Everythingのqueryは通さない |
 | [global_search.rs](../src/global_search.rs) | Ctrl+G のクエリワーカー (streaming、Searcher snapshot 固定) |
 | [global_search_ui.rs](../src/global_search_ui.rs) / [everything.rs](../src/global_search_ui/everything.rs) | Metadata/Everythingの単一Search owner、検索バー、共通prepare/adopt、物理childの帰路 |

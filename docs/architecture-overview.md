@@ -727,6 +727,8 @@ detachedは既存の共通パネルを使い、述語・viewport・bundleの交�
 | モジュール | 役割 |
 | --- | --- |
 | `search_query.rs` | 検索クエリのトークナイザ + マッチャ (AND / OR / NOT / `"..."` フレーズ、`MatchMode`)。Ctrl+S/F/G共通、Everythingは通さない |
+| `search_request.rs` | 既存検索欄の渡し先と文字列、項目の名前生成、入力欄 id に結び付いた全選択の一時印。新しい永続データは持たない |
+| `app/search_request.rs` | 一覧の「名前で検索」と3つの Grid KeyAction の共通受付・入力受け渡し。既存セッションを開き、Enterまで検索を実行しない |
 | `search_norm.rs` | `normalize_for_match` — ingest / クエリ / post-filter で共有する唯一の正規化関数 (lowercase) |
 | `search_index_db.rs` | Ctrl+S 用 `search_index.db` (お気に入り配下のフォルダ / ZIP / PDF / 動画名) |
 | `fts_index.rs` | Tantivy 0.26 ラッパ。`IndexDoc` / `Fields` / `QueryFilters` / `build_bigram_and_query` / `search_page`。bigram tokenizer + lower_caser |

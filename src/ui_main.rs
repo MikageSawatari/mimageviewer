@@ -16662,6 +16662,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         .min_size(egui::vec2(320.0, 20.0))
                     },
                 );
+                crate::search_request::apply_select_all(ui.ctx(), &self.search_query, &mut output);
                 let _menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
                     &mut output,

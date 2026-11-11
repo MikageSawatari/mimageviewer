@@ -693,6 +693,7 @@ mod context_state_tests;
 mod logic_service;
 mod pinned_search;
 pub(crate) mod root_lifecycle;
+mod search_request;
 mod startup_ops;
 mod subfolder_expansion;
 mod update_phases;
@@ -59081,6 +59082,10 @@ impl App {
                 browser_back_count,
                 browser_forward_count,
             );
+        }
+
+        if self.handle_grid_search_name_keys(ctx) {
+            return None;
         }
 
         if let Some(action) =

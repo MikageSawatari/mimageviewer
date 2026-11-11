@@ -375,6 +375,7 @@ pub mod save_with_metadata;
 pub mod search_index_db;
 pub mod search_norm;
 pub mod search_query;
+pub(crate) mod search_request;
 pub mod search_walker;
 pub mod search_watcher;
 mod seek_ruler;

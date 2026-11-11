@@ -240,6 +240,9 @@
 # GridCopyFileName = none ; ファイル名をコピー
 # GridCopyImage = none ; 画像をクリップボードにコピー
 # GridCopyEditedImage = none ; 編集を反映した画像をコピー
+# GridSearchNameEverything = none ; 名前で検索: Everything で探す
+# GridSearchNameMetadata = none ; 名前で検索: アイテム検索で探す
+# GridSearchNameLocal = none ; 名前で検索: この場所で絞り込む
 # GridOrganizeFiles = none ; 選択中またはチェック済みの実ファイル/実フォルダの整理先を選ぶ
 # GridToggleCheck = Space ; 選択中の項目のチェックを切り替える
 # GridDelete = Delete ; 通常一覧では実ファイル/実フォルダを削除し、コレクション直下では参照登録を外す

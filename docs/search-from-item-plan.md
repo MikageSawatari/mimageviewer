@@ -161,6 +161,59 @@ pub(crate) fn item_search_name(item: &GridItem) -> Option<String>; // M2 の規�
 
 ---
 
+## M9. 実装記録 (2026-11-12、設計前提の不一致により停止)
+
+### 設計担当への確認事項
+
+M3 の「検索のふだんのショートカットと同じ受付条件」を右クリックメニューの表示・実行にも
+そのまま適用すると、メニュー自身により全渡し先が拒否される。コード調査と独立レビューで一致した。
+ユーザー指示「設計の主要な前提がコードと合わなければ、実装で迂回せず止めて報告する」に従い、
+この境界を変更する前に実装を停止した。以下の差分は未完成・未検証であり、取り込み可能な完成状態ではない。
+
+- `src/app.rs` の `modal_dialog_block_reason_including_menus` は
+  `include_menus && self.context_menu_idx.is_some()` を `grid_context_menu` として扱う。
+  `any_dialog_open` / `common_modal_dialog_open` がこの判定を参照する。
+- `src/ui_dialogs/context_menu.rs` の `show_context_menu` は `context_menu_idx` を保持したまま
+  `context_menu_nodes` を生成し、選択コマンドを dispatch した後に消す。
+  `dispatch_native_context_menu_result` もメニュー owner を保持したまま dispatch する契約である。
+- このため Ctrl+F/G の既存 `any_dialog_open`、Everything の既存 entry availability、
+  さらに `pinned_search_availability` が、すべてメニュー表示中の要求を拒否する。
+  Everything には pass ごとにキャッシュした `keyboard_owner_for_pass` の `Modal` も関係するため、
+  `context_menu_idx` の一時解除だけでは解決しない。
+- 必要な設計判断: メニュー自身が入力を所有する間の可否評価と、メニューを閉じて検索欄へ渡す実行境界を
+  どこで区切り、通常ショートカットの受付を変更せず共通条件を共有するか。独自 guard・一時解除・
+  owner キャッシュの書換え等の迂回は追加していない。
+
+### 作成した差分
+
+- 新設: `src/search_request.rs` (要求型・名前生成・全選択の印)、
+  `src/app/search_request.rs` (受付の共通化・下書き注入・キー入口)、
+  `src/app/tests/search_request.rs` (headless 回帰テストの草稿)。
+- 接続: `src/lib.rs`、`src/app.rs`、`src/app/update_phases.rs`、
+  `src/context_menu_model.rs`、`src/ui_dialogs/context_menu.rs`、`src/keymap.rs`、
+  `src/ui_main.rs`、`src/ui_pinned_search.rs`、`src/global_search_ui.rs`、
+  `src/global_search_ui/everything/shortcut.rs`、`src/global_search_ui/everything/ui.rs`。
+- 文書: `docs/keymap.ini.default`、`docs/keymap-spec.md`、`docs/key-customization-impl-plan.md`、
+  `docs/search-architecture.md`、`docs/item-kind-capability-matrix.md`、`docs/README.md`、
+  `docs/architecture-overview.md`、本書、`htdocs/mimageviewer/index.html`、
+  `htdocs/mimageviewer/manual/search.html`・`grid.html`・`shortcuts.html`。
+- テスト追加: 名前・全選択 helper 6 件、keymap 1 件、メニューモデル 3 件、
+  App 9 件 (常設 ON/OFF・3渡し先・再注入・通常開き方・Ctrl+G 3時点・受付・切替・キー)。
+  いずれもコンパイル・実行前。M7 全体の充足は未確認。
+
+### 実行した検証と未実行項目
+
+- `python scripts/check_site_cards.py`: 53 カード、違反 0 件 (文書担当・実装担当)。
+- 公開 HTML 4 ページ内のローカル fragment 参照 65 件の検査: 問題 0 件 (文書担当)。
+- `git diff --check`: 成功。改行コードに関する Git の警告あり。
+- `cargo fmt` (引数なし、ワークスペース全体): 成功 (exit 0)。
+- `python scripts/check_ui_glyphs.py`: 危険なグリフ 0 件 (exit 0)。
+- `cargo check`、関連 `cargo nextest run`、`cargo test --test ui_snapshot`、
+  検証バイナリ作成: 設計判断待ちで未実行。
+  本体 lib 全件テスト・製品バイナリ起動・git 書き込み操作は行っていない。
+
+---
+
 # 付録 A: 後の版の拡張案 (設計第 1 版、2026-11-11、未レビュー・利用者未提示)
 
 以下は最小版の前に書いた案。利用者決定で後の版へ回した。後の版で着手するときは、最小版の型 (M4) を土台に見直す。
