@@ -2951,3 +2951,15 @@ backstop / interlude の数 frame の見え方、実モデルでの推論。head
   修正後の同 12 件は **12 成功 / 0 失敗、exit 0** (`target/depth-1767-focused-r6.log`)。
 - 独立レビュー P2 の linked ring 検査の省略を撤去し、全 phase の modal と dismiss 後の positive control を実行する。
   P3 の §11 の旧 detached 全拒否記述は linked 再入場と独立 session/context 拒否へ同期した。
+
+#### 独立実装レビューと全件 (2026-11-11、設計担当)
+
+- 独立実装レビュー (GPT-6.1 Sol / xhigh、read-only、対象 `08d2e0005`、実装者とは別のセッション): P1 / P2 / P3 なし、判定「受入可」。
+  構造的変更であることに合意 (はい)。§6.4.2 の A〜E への適合、独立フラグの書き込み全箇所の列挙、ダイアログの表示先が通常の各表示で 1 つで、
+  今回新しく恒久的に見えない modal を作っていないこと (holdover・native 動画で body を描かない性質は既存の main Fullscreen と同じ)、
+  テストの検査力 (旧来の全拒否では positive control が通らない)、観測が `cfg(test)` に閉じることを確認。
+- `test-lib-full.ps1` (共有ロック取得、`08d2e0005`): **17,232 成功 / 0 失敗、75 skipped、949 秒**、exit 0。receipt `target/test-lib-full/d293317d….json`。
+- `cargo test --test ui_snapshot` (更新指定なし): **250 成功 / 0 失敗**、exit 0。
+- `cargo test --workspace --exclude mimageviewer-launcher --features pack-build-tools --no-run`: exit 0。launcher を含めると、この worktree に
+  release の exe 5 本が無いため launcher の build.rs で止まる (CLAUDE.md の test-full の前提どおり。launcher は今回変更なし)。
+- `build-dev.ps1`: exit 0。確認用 `target/dev-runtime/mimageviewer-core.exe`。製品は起動していない (実機確認は統括経由でサブ PC へ依頼)。

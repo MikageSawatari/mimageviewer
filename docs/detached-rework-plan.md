@@ -1488,6 +1488,12 @@ F12 の ON / OFF では既存 owner を終了し、D の再入場を案内する
 コマンド・件数・exit code・検証の限界は [実装記録 §17.14](depth-parallax-plan.md#1714-実装記録-642-第-1-段) に集約する。
 製品起動・全件 gate・確認用 build はこの実装依頼の対象外で、設計担当へ引き継ぐ。
 
+独立実装レビュー (2026-11-11、GPT-6.1 Sol / xhigh、read-only、対象 `08d2e0005`): P1 / P2 / P3 なし、判定「受入可」。
+独立フラグの全書き込み (直接代入・初期化 18 箇所、`ViewerSession::default`、swap 2 経路) の列挙に漏れが無いこと、
+App の detached 用状態・時間窓・retry・追加 repaint が無く、viewport / HWND / placement / focus / swap / fork / park / backstop の機構を
+変えていないことを確認し、**症状パッチではなく構造的な変更であることに合意** (確定先 session と所有 context の境界で適格性・終了・描画先を決める変更)。
+設計担当 ClaudeCode もこの判断に合意する。本体 lib 全件 17,232 件成功 (共有ロック取得、`target/test-lib-full` の receipt `d293317d…`)。
+
 ### 2026-11-10: ページめくり提示資格を表示単位の binding へ移す (§1.750)
 
 遠方ページの横長寸法の到着で本全体の `Arc<Vec<SpreadDisplayUnit>>` が作り直されると、演出中の単位が同じでも
