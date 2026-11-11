@@ -1,5 +1,19 @@
 [
   {
+    "operation": "replace_html",
+    "scope_heading_id": "note-spectrogram",
+    "anchor": "<h3 id=\"制限事項\">制限事項</h3>",
+    "replacement": "<h3 id=\"note-spectrogram-limitations\">制限事項</h3>",
+    "reason": "Give the new Note Spectrogram limitations a distinct ID so the published Rhythm Analyzer limitations fragment keeps its owner."
+  },
+  {
+    "operation": "replace_html",
+    "scope_heading_id": "rhythm-analyzer",
+    "anchor": "<h3 id=\"制限事項-1\">制限事項</h3>",
+    "replacement": "<h3 id=\"制限事項\">制限事項</h3>",
+    "reason": "Preserve analyzer-rhythm-analyzer.html#制限事項 from the v0.15.0 manual after the new earlier heading changes the upstream duplicate suffix."
+  },
+  {
     "operation": "insert_note",
     "heading_id": "アナライザープラグイン",
     "repeat_on_plugins": true,

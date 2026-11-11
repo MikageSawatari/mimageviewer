@@ -492,7 +492,8 @@ class GenerationTests(unittest.TestCase):
             self.assertNotIn('<strong>' + excluded + '</strong>', add_items)
         for retained in ['Lyrics', 'Counter', 'Drums', 'Key', 'Chord', 'MIDI', 'MIDI Event List']:
             self.assertIn('<strong>' + retained + '</strong>', add_items)
-        for retained in ['Groove Lounge', 'Listening Room', 'MIDI Monitor', 'MIDI の音符やイベントを渡しません',
+        for retained in ['Groove Lounge', 'Listening Room', 'MIDI Monitor', 'mIV Sound では演奏情報は表示されません',
+                         'mImageViewer で再生中の曲の情報と再生位置を表示し、21:9では歌詞も表示します',
                          '演奏情報は表示されません', '音声解析を使います', 'Track Information（曲情報）',
                          'id="miv-counter"', 'id="miv-lyrics"', '数字の窓', '単語のハイライト', '円周を回る点']:
             self.assertIn(retained, visualizer)
@@ -500,7 +501,7 @@ class GenerationTests(unittest.TestCase):
                        '再生位置バーを配置', 'プレーヤーが一時停止中や停止中でも',
                        'AirPlay', 'ネットワークの曲', 'ネットワーク音楽のガイド',
                        '.wrd', 'MusicXML', 'ファイル内の音符や拍の情報', 'MIDIの鍵盤のチャンネル表示',
-                       '再生中のMIDIファイルに含まれるすべてのイベント']:
+                       '再生中のMIDIファイルに含まれるすべてのイベント', 'ホスト', 'イベントを渡しません']:
             self.assertNotIn(absent, visualizer)
         for data in output.values():
             for absent in [b'--settings-name', b'Mixwright Instrument', b'AirPlay', b'Subsonic', b'DLNA']:
@@ -508,6 +509,22 @@ class GenerationTests(unittest.TestCase):
         for expected in ['Chords &amp; Key', 'コードレーン']:
             self.assertIn(expected, output['analyzer-note-spectrogram.html'].decode())
         self.assertIn('Drums', output['analyzer-rhythm-analyzer.html'].decode())
+
+    def test_analyzer_limitations_keep_the_published_fragment_owner(self):
+        output = docs.generate(docs.DEFAULT_SOURCE, 'v0.17.0-miv.1')
+        rhythm = output['analyzer-rhythm-analyzer.html'].decode()
+        heading, end = docs.section_span(rhythm, '制限事項')
+        self.assertEqual(heading[0], '<h2 id="制限事項">制限事項</h2>')
+        limitations = rhythm[heading.end():end]
+        self.assertIn('テンポと拍の追跡が不確かになります', limitations)
+        self.assertIn('対応サンプルレート', limitations)
+        self.assertNotIn('検出するコードは', limitations)
+        self.assertNotIn('id="制限事項-1"', rhythm)
+        notes = output['analyzer-note-spectrogram.html'].decode()
+        heading, end = docs.section_span(notes, 'note-spectrogram-limitations')
+        self.assertEqual(heading[0], '<h2 id="note-spectrogram-limitations">制限事項</h2>')
+        self.assertIn('検出するコードは', notes[heading.end():end])
+        self.assertNotIn('id="制限事項"', notes)
 
     def test_v017_soundfont_rename_preserves_url_and_excludes_midi_player(self):
         output = docs.generate(docs.DEFAULT_SOURCE, 'v0.17.0-miv.1')

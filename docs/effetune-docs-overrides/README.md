@@ -62,6 +62,11 @@ python scripts/gen-sitemap-xml.py --check
 非掲載 Markdown へのリンクは従来どおりテキストにする。外部リンクは維持し、
 `/dsp/...` などは上流サイトを指す。
 
+上流更新時は、前回公開した全生成ページのフラグメントと対応する節も比較する。
+同名見出しの追加で既存節の ID がずれた場合は、`scope_heading_id` で対象を限定した完全一致の訂正で
+新しい節に別 ID を与え、既存節の公開 ID を保つ。Note Spectrogram の新しい「制限事項」は
+`note-spectrogram-limitations`、Rhythm Analyzer の既存節は `制限事項` とする。
+
 `--check` は `manual/sound/` 直下（images/ を含む）の欠落・古い内容・余分なファイルと転送規則を検査する。
 `manual/sound/v*/` は現行版を含め空でも拒否し、旧 `manual/effetune/` の残存も拒否する。
 通常生成はこれらの残存を警告して続行するが削除はしない。移行時に明示的に公開ツリーから除く。

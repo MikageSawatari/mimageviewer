@@ -1220,3 +1220,18 @@ portable zip実物の生成・内容確認、署名あり配布とVirusTotal (�
   新しい除外・採用、旧 URL、メタ情報の一意一致、旧 snapshot の版付け替え拒否を回帰検査に含めた。
   cargo のビルド・テスト、製品の起動、コミットは行っていない。`target/`・`vendor/` には触れていない。
   本体の候補ビルド・承認と、コミット後の sitemap の日付確定は設計担当へ引き継ぐ。
+
+### 20.1 独立レビューの P3 訂正 (2026-11-12)
+
+- `analyzer.json` の `scope_heading_id` と完全一致の HTML 訂正で、Note Spectrogram の新しい
+  「制限事項」を `note-spectrogram-limitations`、Rhythm Analyzer の既存節を従来の `制限事項` にした。
+  同名見出し追加による自動採番のずれを補正し、旧フラグメントがテンポ・拍の制限事項を指すことを回帰検査に追加した。
+- `7e38bde18` の旧生成 HTML 全133ページを `git show` で比較し、既存644 IDに欠落がないことを確認した。
+  ほかに変更された既存 ID はなかった。`sfz-note-player` は同じ音源機能の公開 ID として維持し、表示名だけが改名されている。
+  新規の `mastering-presets.html` は旧版に対応ページがない。
+- MIDI Monitor の「ホストから受け取った内容」を「mImageViewer で再生中の曲の情報と再生位置、21:9では歌詞」へ訂正した。
+  `now_playing_notify.cpp` の曲名・アルバム・アーティスト・歌詞と再生位置の通知を照合した。
+  新しい補正文も確認し、MIDI節の注記をデータ受け渡しの説明から、演奏情報を表示しないという利用者向けの説明へ揃えた。
+- 生成 HTML 3ページを再生成。`test_gen_effetune_docs.py` **41件成功**、生成器 `--check` **138ファイル＋301一致**、
+  `check_site_cards.py` **53枚・超過0**、`git diff --check` **成功**。
+  sitemap・上流 snapshot・`target/`・`vendor/` は変更せず、コミットは行っていない。

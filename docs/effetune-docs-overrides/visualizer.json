@@ -111,7 +111,7 @@
     "operation": "remove_section",
     "heading_id": "midiの表示",
     "keep_heading": true,
-    "note": "mImageViewer は mIV Sound に MIDI の音符やイベントを渡しません。**MIDI** と **MIDI Event List** は追加できますが、演奏情報は表示されません。**Notes**、**Drums**、**Guitar**、**Rhythm Analyzer** は音声解析を使います。",
+    "note": "**MIDI** と **MIDI Event List** は追加できますが、mIV Sound では演奏情報は表示されません。**Notes**、**Drums**、**Guitar**、**Rhythm Analyzer** は音声解析を使います。",
     "reason": "mIV plugin_loader.cpp supplies an empty input EventList. Do not describe standalone MIDI files or DAW MIDI as available in mIV; retain the existing Add choices."
   },
   {
@@ -147,7 +147,7 @@
   {
     "operation": "replace_inline",
     "anchor": "**MIDI Monitor** (21:9, 9:16): 16チャンネルのMIDIミキサーとイベント一覧に、曲情報、再生ボタン、経過時間、シークバーを組み合わせた、普段のMIDI再生向けの画面。21:9では1行の歌詞も表示します。",
-    "replacement": "**MIDI Monitor** (21:9, 9:16): MIDI表示用の組み込みレイアウトです。mImageViewer は MIDI 情報を渡さないため、MIDIミキサーとイベント一覧に演奏情報は表示されません。曲情報と経過時間、21:9の歌詞はホストから受け取った内容を表示します。",
+    "replacement": "**MIDI Monitor** (21:9, 9:16): MIDI表示用の組み込みレイアウトです。mIV Sound ではMIDIミキサーとイベント一覧に演奏情報は表示されません。mImageViewer で再生中の曲の情報と再生位置を表示し、21:9では歌詞も表示します。",
     "reason": "The preset remains selectable, but mIV has no MIDI source or standalone transport. Keep host metadata, clock and lyrics."
   },
   {
