@@ -527,6 +527,165 @@ pub enum DepthSourcePhase {
 `index.html` の3D紹介・対応表示説明。既存Creative 3D LUTの説明は別機能なので対象にしない。
 段Dで公開説明を更新する。案1の再操作・再推論は採択済みであり、wake所有の移管は対象外。
 
+#### 6.4.2 F12 の別ウィンドウ対応 (§1.767、2026-11-11)
+
+設計: ClaudeCode Opus 5.5。worktree `G:\home\mimageviewer-depth2`、ブランチ `feat-766-767-depth-ui`。
+利用者決定 (2026-11-11): 360° は別ウィンドウで使えるので、3D も F12 の別ウィンドウで使えるようにする。
+行番号は基点 `18d528908` の調査時点 (関数名を追跡の正本とする)。
+
+**範囲を 2 段に分ける (設計担当の判断)**
+
+- **第 1 段 (今回実装)**: フル機能ウィンドウモードで F12 を押し、**main context をそのまま別ウィンドウに出している表示**
+  (linked F12。`ViewerPresentation::DetachedWindow` かつ独立 session でない) とその枠なし全画面。バックログ §1.767 の
+  「まず F12 で開く閲覧ウィンドウの通常表示と枠なし全画面が対象」に当たる。
+- **第 2 段 (保留、統括・利用者の判断待ち)**: 複数ウィンドウモードの各窓、フル機能モードのメディアウィンドウなど、
+  **main 以外の独立 context** での 3D。下の「第 2 段で要るもの」のとおり、資源とダイアログの持ち主が main 以外になることで
+  設計が大きく増え、既存操作に新しい制限も入る。
+
+**調査で分かったこと (コード確認)**
+
+1. **描画経路は既に共通**。別ウィンドウ (main context の linked F12 も、独立 context も) は
+   `render_fullscreen_viewport_with_root_input` から `show_viewport_immediate(fs_id, …, render_fs_body)` (ui_fullscreen.rs:30305) を通り、
+   `render_fs_body` の中で `draw_depth_panel`・`advance_depth_source`・`try_paint_depth`・待機表示・`draw_viewer_shared_dialogs` を呼ぶ。
+   ctx は子 viewport の ctx。キー (D・I/Tab・F11・F12) は子 viewport の pass が処理し、D・I/Tab に detached 専用の抑止は無い。
+   上部の 3D ボタンも描かれる。カーソル自動非表示はその viewport id を対象にする。推論完了の wake は `ctx.viewport_id()` を要求に捕捉し
+   (depth_view.rs:511)、eframe は immediate 子 viewport の repaint を親へ回す。
+   **今 3D を止めているのは `depth_presentation_eligible` (depth_view.rs:168) だけ**。
+2. **統括の前提「動く閲覧 context は 1 つ」は main の linked F12 では成り立つ** (context は main 1 つ)。ただし、プロセス全体では
+   アクティブな独立 detached context の pass の後、同じ frame に main の埋め込み表示も描かれる
+   (`should_render_main_fullscreen_viewport_after_detached_context`、app.rs:4635)。組み合わせ (コード調査):
+   - 複数ウィンドウモード: 静止画は常に別ウィンドウで開き (`requested_viewer_presentation_for_open`、app.rs:70409)、main が静止画を
+     MainWindow / Fullscreen で表示することは無い。main の埋め込みはメディア (音楽表示など) だけ。
+   - フル機能モード + メディアウィンドウ: メディアウィンドウ (独立 context) から次へ進むと静止画を表示でき、main の埋め込み静止画と同時に
+     通常の body (`render_fs_body`) が 2 つ走り得る。
+   - linked F12 + メディアウィンドウ: アクティブな独立 context を描いた frame では main は埋め込みのときだけ描かれるので
+     (app.rs:4635、テスト `main_embedded_fullscreen_still_renders_while_detached_context_is_active`)、linked F12 と通常の body が
+     2 つ並ぶことは無い。ParkedLive のメディアウィンドウは専用の描画経路 (ui_fullscreen.rs:24763) で、通常の body ではない。
+   第 1 段では main 以外は 3D に入れないので、3D を持つ context は常に main 1 つ。深度 worker (最新 1 件の待ち、depth_estimation.rs:235) と
+   GPU の callback slot (1 つ、depth_parallax_wgpu.rs:737) の持ち主も main 1 つのまま。
+3. **3D のダイアログは live な viewer pass すべてで描かれる** (既存の穴)。書き出し画面 (`draw_viewer_shared_dialogs` → `draw_depth_export_dialog`)
+   と追加モデルの案内 (ui_fullscreen.rs:30222 の `show_depth_addon_dialog`) は context を見ないので、上の 2 live pass の frame では
+   main 以外の窓 (メディアウィンドウ) にも出る。さらに追加モデルの案内は ROOT (app.rs:100957、`!main_viewer_blocked`) でも描く。
+   linked F12 中は main が塞がっていない扱い (`viewer_session_blocks_main_window` は detached では偽、app.rs:63778) なので、
+   F12 の窓から D を押してモデル未導入だと、メインウィンドウと F12 の窓の両方に出る。書き出しの ROOT 側
+   (`main_window_should_draw_export_dialogs`) は detached 中は偽なので重ならない。
+4. **別ウィンドウ内の F11 は presentation を変えない**。`toggle_egui_viewer_window_mode_for_input` は detached では
+   `toggle_detached_viewer_borderless_fullscreen` (app.rs:70884) に分岐し、同じ viewport の枠なし全画面を切り替えるだけ
+   (`commit_viewer_presentation` を通らない)。viewport id は window_id から決まり世代に依らない (`detached_image_window_viewport_id`)。
+   egui が OS の窓を作り直しても同じ id、renderer はプロセス共通 (設計レビュー r1 で確認)。切替中の数 frame は
+   `paint_viewer_presentation_interlude` が描画前に返る (ui_fullscreen.rs:28593)。
+5. keep-alive の backstop (`render_active_detached_viewport_backstop`、ui_fullscreen.rs:27038) は、通常の描画が走らなかった frame ごとに
+   保持画像 (`FsPageLayoutSource::Captured`) で描き、3D は描かない。
+6. egui の `ctx.data()` の一時データ (`depth_panel_rect`、`depth_export_display_snapshot`) は viewport をまたいで共有だが、第 1 段では
+   書くのは main の 3D の pass だけで、読む側は mount 中の context が 3D のときだけ読む。
+
+**決定 (第 1 段)**
+
+A. **適格性を「main context の閲覧表示 (linked F12 を含む)」にする**。`depth_presentation_eligible` を
+   `projected == main` かつ (`MainWindow` | `Fullscreen` | (`DetachedWindow` かつ main の現在の session が独立でない)) に広げる。
+   独立かどうかは既存の事実 (`detached_viewer_independent_active`: 「現在の detached 静止画 session がメイン一覧と独立しているか」) で判定する。
+   複数ウィンドウモードで main 自身が独立の静止画窓になっている場合は、他の独立窓と同じく対象外 (窓によって使える・使えないが分かれないように)。
+   入口 (`depth_entry_allowed`) と確定点 (`commit_viewer_presentation_deferred_feedback`) は今までどおりこの 1 つを使う。
+   `detached_viewer_independent_active` は `ViewerSession.independent_active` の mounted projection で、presentation と一緒に swap される
+   (context ごとの事実。App 全体のフラグではない)。
+   - **確定点は「確定先の session」で判定する** (設計レビュー r4 P1)。今の確定点は presentation だけを受け取り、独立フラグは呼出し元が
+     確定の**後**に書く (`activate_mounted_as_independent_detached`、`prepare_viewer_presentation_open`)。linked な DetachedWindow から
+     独立な DetachedWindow へ移るとき、presentation は同じなので 3D が終わらず、独立 session に 3D が残る。
+     確定点の入力を (presentation, 独立か) の組にした `commit_viewer_session(target, independent)` を共通の確定点とし、
+     既存の `commit_viewer_presentation(target)` は「独立かどうかは今のまま」の薄い入口として残す。独立フラグを変える呼出し元は
+     新しい値を渡して確定し、その後でフラグを書く (書く順序と値の持ち主は変えない)。3D の継続は「同じ presentation かつ同じ独立かどうか
+     の再確定」だけ。独立フラグを書く箇所をすべて列挙し、確定点を通るか、3D と両立し得ない (main 以外・媒体だけ等) ことをコードで示す。
+     新しい field・待ちは作らない。
+   - 描画直前と pass 先頭の継続の照合 (§6.3) も同じ述語を読むので、仮に確定点を通らない書き換えがあっても、次の pass で 3D は終わる
+     (2 つは役割が違う: 確定点は状態の持ち主の後始末、照合は描画の安全)。
+   - switching (切替途中) の除外は A の述語の役目ではない。静止画の linked F12 の切替は同期で確定し、native の切替は既存の媒体条件で扱われる。
+   - 拒否の文言 (`DepthEntryBlock::Detached`) を「3D 写真は、メインの画像表示と F12 の別ウィンドウで使えます」に直す。
+     確定点の不適格な切替先の通知も同じ趣旨に直す。
+B. **表示先の移し替えは §6.4.1 の案 1 のまま**: F12 の ON / OFF は presentation の実切替なので `commit_viewer_presentation` で 3D を終え、
+   通知で D (実効キー) の再入場を案内する (MainWindow / Fullscreen ⇔ DetachedWindow のどちら向きも)。同じ presentation の再確定は継続。
+C. **F12 の窓の中の F11 (枠なし全画面の切替) では 3D を続ける**。viewport・ctx・context が変わらず、推論の wake 先・GPU 資源・パネルの持ち主が
+   移らないので、§6.4.1 のリサイズ・最大化と同じ扱い (毎 pass の content rect / fit transform から描き直す)。案 1 がメインの F11 で終えるのは
+   viewport が ROOT ⇔ 全画面の子で入れ替わるからで、その理由がここには無い。interlude の数 frame は深度の前進・3D の描画が止まるだけで、
+   状態は変わらない。メインの F11 (終了) と挙動が違うことはマニュアルに書く。モニタをまたぐ移動 (DPI の変化) も続ける。
+D. **3D のダイアログは main context の表示だけで描く**。3D の持ち主は常に main なので、ダイアログの持ち主も main と決める。
+   - viewer pass の 2 か所 (`draw_viewer_shared_dialogs` の `draw_depth_export_dialog`、ui_fullscreen の `show_depth_addon_dialog`) は、
+     mount 中の context が main のときだけ描く (メディアウィンドウ等の pass では描かない)。
+   - ROOT の `show_depth_addon_dialog` は、既存の `!main_viewer_blocked` に加えて **main に開いている閲覧表示が無い** (`fullscreen_idx` が None) ときだけ描く。
+     main の閲覧表示が開いていれば (MainWindow / Fullscreen / linked F12) その pass が描く。今の main の Fullscreen での見え方
+     (ROOT は描かず全画面の pass が描く) と同じ規則を linked F12 に広げるもの。ROOT の書き出し (`main_window_should_draw_export_dialogs`) は変えない。
+   - 所有の終わり方は今の main と同じ: F12 の窓を閉じる・一覧へ戻ると main の閲覧表示が閉じ、書き出しは既存の取消 (`cancel_depth_export_for_fullscreen_close`)
+     → ROOT、追加モデルの案内も ROOT に出る。新しい gate・ハンドオーバー・frame フラグは作らない。
+   - main の埋め込み表示と独立のメディアウィンドウが同時に動く既存の組み合わせでも、メディアウィンドウに 3D のダイアログが出なくなる (今の穴を閉じる)。
+E. **backstop の frame は 2D のまま**。描画経路を 2 つにしないため。通常の pass が走らない frame の間は平面に見え得ることを実機確認の項目に入れる。
+
+**採らなかった案**: F12 で別ウィンドウへ 3D を持ち越す (案 2。§6.4.1 と同じ理由)。独立 context も今回まとめて対象にする (下の第 2 段)。
+
+**状態を減らす検討**: 3D の持ち主を main 1 つに保つことで、資源の取り合い・ダイアログの持ち主・所有 viewer の終了後の表示先は、
+すべて今の main の挙動の範囲に収まる。新しい状態・gate・待ちは足さない。
+
+**第 2 段で要るもの (設計レビュー r1〜r3 で分かったこと。保留)**
+
+独立 context を対象にすると、3D とダイアログの持ち主が main 以外になる。r1〜r3 のレビューで次が必要と分かった:
+- プロセス全体で 3D は 1 context (main の埋め込みと独立 context が同じ frame に live pass を持つため。入口で他の bundle を読んで拒否)。
+- live でなくなる経路の終了漏れ (`park_active_detached_context_as_live_media` は 3D を終えない)。
+- ダイアログの表示先を、所有 viewer が生きていればそこ、終わればメインの表示、と事実から決める関数。ただし表示先が通常の body を描かない経路
+  (main の列挙待ち holdover・native 動画など) に当たると modal が見えなくなるため、modal の間は所有窓が終わらない保証が要る:
+  窓の切替・外部からの開く要求を追加モデルの確認中も拒否する (**今は受け付けている操作への新しい制限**)、所有窓の OS の閉じる操作を拒否する、
+  modal 中の自動送り (スライドショー・フォルダをまたぐ送り) と受付済みの遷移の扱い。
+- 独立 context から D を押したときの、モデル確認の完了後の入場の再開 (ROOT の poll から要求元 context へ配送)。
+これらは「既存操作に新しい制限を入れるか」(CLAUDE.md「通常の使い方が不便になる変更」) を含むので、統括・利用者の判断を待つ。
+
+**detached 述語・viewport 経路に触れる範囲 (第 1 段)** (CLAUDE.md「Detached viewer リワーク中のルール」)
+
+- 変える: 3D の適格性 (`depth_presentation_eligible`) の許可集合に「main context の linked な DetachedWindow」を加えること (既存の事実
+  `detached_viewer_independent_active` を読むだけ)、3D のダイアログの描く場所 (viewer pass 2 か所と ROOT の追加モデル案内 1 か所)、文言。
+- 変えない: viewport の生成・id・builder、HWND の同定、placement、focus、z-order、bundle の swap、fork / park の手順、
+  `reset_detached_pause_foreground_modes`、`render_fs_body` の root / child の振り分け、backstop、F11 / F12 の経路、
+  App の detached 用 bool / Option (新設しない)。時間窓・再試行・追加 repaint は足さない。
+- 設計担当と独立 Sol / xhigh が「症状パッチではなく構造的な変更」であることに合意したうえで実装し、detached-rework-plan §11 に記録する。
+
+**テスト** (状態遷移・handler・複数 viewport の headless 駆動。既存の `src/app/depth_view_tests.rs`、
+`src/app/depth_main_window_tests.rs`、`src/app/multiwindow_scenario_tests.rs` の fixture を使う)
+
+1. 入口の matrix: main × {MainWindow, Fullscreen, linked DetachedWindow} で許可、main × 独立 DetachedWindow (複数ウィンドウモード) と
+   独立 context × 全表示で拒否。上部の 3D ボタンの有効表示も同じ答え。拒否の文言。
+2. 確定点: linked DetachedWindow で 3D 中に独立化 (`activate_mounted_as_independent_detached`、`prepare_viewer_presentation_open` の独立 open) →
+   3D が確定点で終わる (次の pass を待たない)。独立フラグを書く全箇所の列挙を実装記録に残す。
+   F12 の ON / OFF (Fullscreen ⇔ linked DetachedWindow、MainWindow ⇔ linked DetachedWindow) の両方向で終了し、再入場の通知
+   (実効キー、割り当てなしは上部ボタン)。同じ presentation の再確定で継続。F12 の窓の中の F11 の両方向で、`FsExclusiveView::Depth`・
+   source の段階・LRU・GPU slot・実行中の要求が保たれ、次の pass は新しい content rect で描く。ReadingBack / Estimating 中の F11 でも
+   要求が生きて採用される。
+3. F12 の窓の実 pass (子 viewport の headless 駆動): D で入場、推論要求の viewport が子 viewport id、パネルの矩形がその pass で書かれ
+   入力除外 (マウス・タッチ・Ctrl+クリック) に使われる、I / Tab、書き出しの全 phase の modal と描画、待機表示、カーソル自動非表示の対象 viewport、
+   `pixels_per_point` を途中で変えた pass (DPI の異なる画面への移動) で transform とクリックの写像が新しい値に従う。§1.766 の折りたたみも F12 の窓で働く。
+4. ダイアログの描く場所: linked F12 で D (モデル未導入) → 追加モデルの案内が F12 の窓の pass だけに出て ROOT では描かれない。
+   main の Fullscreen / MainWindow / 一覧 (環境設定から) は今までどおり。main 埋め込み + アクティブな独立 context (静止画・動画) の
+   2 つの通常 body の frame で、独立側の pass は 3D の書き出し画面・追加モデルの案内を描かない。linked F12 + ParkedLive のメディアウィンドウの
+   併存でも 3D のダイアログは F12 の窓だけ。F12 の窓を閉じたときの書き出しの取消 → ROOT の Stopping / Finished、
+   追加モデルの案内 → ROOT。
+5. 寿命: F12 の窓を閉じる (推論中を含む) で 3D が終わり要求の取消・slot 除去。メディアウィンドウとの切替など既存の park / fork で終わる。
+6. 既存の depth・書き出し・表示切替・360° のテストが通る (`test(/depth|export|presentation|window_mode|panorama/)`)。
+
+**文書**: マニュアル `fullscreen.html` の 3D 写真「使える場面・使えない場面」: F12 の別ウィンドウでも使える、F12 で表示先を切り替えると
+終了 (D で再開)、F12 の窓の中の F11 では続く、複数ウィンドウモードの窓とメディアウィンドウでは使えない。`index.html` の 3D の説明と
+`faq.html` に対応範囲の記述があれば合わせる。`docs/keymap-spec.md` の 3D 写真の節 (今は「メインだけ・別ウィンドウ不可」) を直す。
+本書 §1・§6.1・§6.3・§6.4 の「メインだけ」の記述を本節に合わせて直す。まれな失敗は既定の割り切り (§13)。
+
+**設計レビュー (GPT-6.1 Sol / xhigh、read-only、master `62de527fb` = 製品コードは基点と同一)**
+
+- r1: 調査主張 1〜7 は正しい。P1 2 件 (独立 context の所有窓が閉じた後の書き出し・追加モデル案内の表示先が無い)、P2 1 件
+  (独立 context からのモデル確認後の入場再開が捨てられる)、P3 1 件 (keymap-spec)。構造的変更に合意。
+- r2: 表示先を事実から決める関数へ改訂 → P1 (表示先が通常の body を描かない経路で modal が見えない)・P3 (受入条件)。合意は維持。
+- r3: modal 中は所有窓を終わらせない形へ改訂 → P1 (自動送り・受付済み遷移)・P2 (close 拒否・開く要求の拒否は新しい制限で利用者確認が要る)・
+  P3 (modal 段階の分類)。合意は維持、判定は「指摘修正後に実装開始可」。
+- 設計担当の判断: r1〜r3 の P1 は「独立 context が 3D とダイアログの持ち主になる」ことから生じ、直すたびに別の組み合わせが出ていた
+  (CLAUDE.md「状態の組み合わせを減らす」の経緯と同じ形)。持ち主を main 1 つに保つ第 1 段に絞り、独立 context は第 2 段として判断を仰ぐ。
+  main の MainWindow / Fullscreen に既にある一般的な modal・自動送りの挙動は、第 1 段では変えない。
+- r4 (第 1 段): P1 1 件 (linked → 独立の確定点が確定前の独立フラグで判定する) → 決定 A に「確定先の session で判定」を追加。
+  P3 1 件 (linked F12 と独立 context の通常 body は 2 つ並ばない) → 調査 2・テスト 4 を訂正。独立フラグは context ごとの projection、
+  ROOT の地点では main が mount されていることを確認。判定「指摘修正後に実装開始可」、構造的変更に合意 (はい)。
+  P1 の修正は独立化の既存の所有境界で閉じるもので、追加の guard・待ち・再試行・repaint は不要との見解。
+
 ### 6.5 他の機能との関係 — 「表示を占有するモード」を 1 つの述語にする
 
 360° が他の機能を止めている箇所 (調査では 30 か所余り: キー・編集ツールの入口・補正パネル・
