@@ -44,6 +44,15 @@ impl RootDepthViewer {
     }
 
     pub(crate) fn ready(&self, app: &mut App) -> u64 {
+        self.ready_with_depth_values(app, [4, 6], vec![half::f16::from_f32(0.5); 24])
+    }
+
+    pub(crate) fn ready_with_depth_values(
+        &self,
+        app: &mut App,
+        size: [u32; 2],
+        values: Vec<half::f16>,
+    ) -> u64 {
         let source = app.ensure_final_composite_material(&self.ctx, 0).unwrap();
         let key = crate::depth_estimation::DepthSourceKey {
             texture_id: source.source_texture().id(),
@@ -72,9 +81,9 @@ impl RootDepthViewer {
         state.attach_renderer(&render);
         let map = crate::depth_estimation::DepthMap {
             key,
-            width: 4,
-            height: 6,
-            values: vec![half::f16::from_f32(0.5); 24],
+            width: size[0],
+            height: size[1],
+            values,
             median: 0.5,
         };
         state.lru.insert(
@@ -98,7 +107,7 @@ impl RootDepthViewer {
         self.frame_with_before(app, events, |_, _| {});
     }
 
-    pub(super) fn frame_with_before(
+    pub(crate) fn frame_with_before(
         &mut self,
         app: &mut App,
         events: Vec<egui::Event>,
@@ -383,7 +392,14 @@ fn depth_main_window_root_wait_and_mouse_use_current_panel_and_resized_fit_coord
             .unwrap()
             .transform
             .paint_rect;
-        let point = image.center() - image.size() * 0.25;
+        let media = app
+            .fullscreen_page_layout
+            .single_page()
+            .unwrap()
+            .transform
+            .viewport_rect;
+        let radius = media.width().min(media.height()) * 0.25;
+        let point = image.center() - egui::vec2(radius * 0.5, radius * 0.5);
         viewer.frame(&mut app, vec![egui::Event::PointerMoved(point)]);
         let FsExclusiveView::Depth(state) = &app.fs_exclusive_view else {
             unreachable!()

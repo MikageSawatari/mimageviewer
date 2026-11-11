@@ -466,17 +466,46 @@ fn depth_parallax_panel_dark() {
                 ui.ctx(),
                 &mut settings,
                 "奥行きを計算中",
+                Some("I / Tab: パネルを隠す・出す".into()),
             );
         },
     );
 }
 
 #[test]
-fn depth_parallax_panel_small_viewport_reaches_every_control_and_keeps_header_fixed() {
+fn depth_parallax_panel_small_dark() {
+    let mut settings = mimageviewer::depth_parallax::DepthParallaxSettings::default();
+    snapshot_with_theme_at_size(
+        "depth_parallax_panel_small_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(546.5, 307.0),
+        None,
+        move |ui| {
+            mimageviewer::ui_depth_parallax::draw_depth_parallax_panel(
+                ui.ctx(),
+                &mut settings,
+                "奥行きを計算中",
+                Some("I / Tab: パネルを隠す・出す".into()),
+            );
+        },
+    );
+}
+
+#[test]
+fn depth_parallax_panel_small_viewport_reaches_every_control_and_keeps_header_footer_fixed() {
     use test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+    #[derive(Clone, Copy)]
+    struct Layout {
+        scroll: ScrollLayout,
+        panel: egui::Rect,
+        header: egui::Rect,
+        footer: egui::Rect,
+        close: egui::Rect,
+        export: egui::Rect,
+    }
     struct State {
         settings: mimageviewer::depth_parallax::DepthParallaxSettings,
-        layout: Option<(ScrollLayout, egui::Rect, egui::Rect, egui::Rect, egui::Rect)>,
+        layout: Option<Layout>,
         closed: bool,
     }
     for (size, expected) in [
@@ -496,14 +525,16 @@ fn depth_parallax_panel_small_viewport_reaches_every_control_and_keeps_header_fi
                         ui.ctx(),
                         &mut state.settings,
                         "失敗しました (モデルを読み込めませんでした)",
+                        Some("I / Tab: パネルを隠す・出す".into()),
                     );
-                    state.layout = Some((
-                        ScrollLayout::from_output(&panel.scroll),
-                        panel.rect,
-                        panel.header_rect,
-                        panel.close_rect,
-                        panel.export_rect,
-                    ));
+                    state.layout = Some(Layout {
+                        scroll: ScrollLayout::from_output(&panel.scroll),
+                        panel: panel.rect,
+                        header: panel.header_rect,
+                        footer: panel.footer_rect,
+                        close: panel.close_rect,
+                        export: panel.export_rect,
+                    });
                     state.closed |= panel.close_requested;
                 },
                 State {
@@ -514,14 +545,33 @@ fn depth_parallax_panel_small_viewport_reaches_every_control_and_keeps_header_fi
             );
         harness.run();
         let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
-        let (before, panel, header, close, _) = harness.state().layout.unwrap();
-        assert!(bounds.contains_rect(panel));
-        assert!(panel.contains_rect(header));
-        assert!(header.contains_rect(close));
-        assert!(before.inner.top() > header.bottom());
-        before.assert_height(expected, panel, harness.ctx.pixels_per_point());
+        let before = harness.state().layout.unwrap();
+        let assert_fixed_regions = |harness: &Harness<'_, State>| {
+            let layout = harness.state().layout.unwrap();
+            assert!(bounds.contains_rect(layout.panel));
+            assert!(layout.panel.contains_rect(layout.header));
+            assert!(layout.panel.contains_rect(layout.footer));
+            assert!(layout.header.contains_rect(layout.close));
+            assert!(layout.scroll.inner.top() > layout.header.bottom());
+            assert!(layout.scroll.inner.bottom() < layout.footer.top());
+            assert_eq!(layout.header, before.header);
+            assert_eq!(layout.footer, before.footer);
+            assert_eq!(layout.close, before.close);
+            for label in [
+                "左 Ctrl+クリック: その場所の深さで止める",
+                "I / Tab: パネルを隠す・出す",
+            ] {
+                let hint = harness.get_by_label(label).rect();
+                assert!(layout.footer.contains_rect(hint), "clipped footer: {label}");
+                assert!(!layout.scroll.inner.intersects(hint));
+            }
+        };
+        assert_fixed_regions(&harness);
+        before
+            .scroll
+            .assert_height(expected, before.panel, harness.ctx.pixels_per_point());
         if matches!(expected, HeightExpectation::Scrolls) {
-            harness.event(egui::Event::PointerMoved(before.inner.center()));
+            harness.event(egui::Event::PointerMoved(before.scroll.inner.center()));
             harness.event(egui::Event::MouseWheel {
                 unit: egui::MouseWheelUnit::Point,
                 delta: egui::vec2(0.0, -100000.0),
@@ -530,14 +580,75 @@ fn depth_parallax_panel_small_viewport_reaches_every_control_and_keeps_header_fi
                 source: egui::MouseWheelSource::Unknown,
             });
             harness.run_steps(40);
-            let (after, _, after_header, after_close, export) = harness.state().layout.unwrap();
-            after.assert_scrolled_to_end(before, harness.ctx.pixels_per_point());
-            assert_eq!(after_header, header);
-            assert_eq!(after_close, close);
-            assert!(after.inner.expand(1.0).contains_rect(export));
+            let after = harness.state().layout.unwrap();
+            after
+                .scroll
+                .assert_scrolled_to_end(before.scroll, harness.ctx.pixels_per_point());
+            assert!(after.scroll.inner.expand(1.0).contains_rect(after.export));
+            assert_fixed_regions(&harness);
         }
         let export = harness.get_by_role_and_label(egui::accesskit::Role::Button, "書き出し…");
         assert!(export.accesskit_node().is_disabled());
+        // Reach the top again through actual input before checking each control.
+        if matches!(expected, HeightExpectation::Scrolls) {
+            harness.event(egui::Event::PointerMoved(before.scroll.inner.center()));
+            harness.event(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0., 100000.),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+            });
+            harness.run_steps(40);
+        }
+        // Every body control must fit in the measured viewport at some actual
+        // wheel position, including the middle reset button at 200% scale.
+        for (role, label) in [
+            (egui::accesskit::Role::ComboBox, "動き"),
+            (egui::accesskit::Role::Slider, "強さ"),
+            (egui::accesskit::Role::Slider, "周期"),
+            (egui::accesskit::Role::Slider, "止まる深さ"),
+            (egui::accesskit::Role::Button, "既定値"),
+            (egui::accesskit::Role::CheckBox, "奥行きを整える"),
+            (egui::accesskit::Role::Button, "書き出し…"),
+        ] {
+            for _ in 0..30 {
+                let control = harness.get_by_role_and_label(role, label).rect();
+                let inner = harness.state().layout.unwrap().scroll.inner;
+                if inner.contains_rect(control) {
+                    break;
+                }
+                harness.event(egui::Event::PointerMoved(inner.center()));
+                harness.event(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(
+                        0.,
+                        if control.top() < inner.top() {
+                            30.
+                        } else {
+                            -30.
+                        },
+                    ),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
+                });
+                harness.run_steps(20);
+            }
+            let control = harness.get_by_role_and_label(role, label).rect();
+            let inner = harness.state().layout.unwrap().scroll.inner;
+            assert!(
+                inner.contains_rect(control),
+                "unreachable body control: {label}"
+            );
+            assert_fixed_regions(&harness);
+            if label == "既定値" {
+                harness.state_mut().settings.focus = 0.2;
+                harness.get_by_role_and_label(role, label).click();
+                harness.run();
+                assert_eq!(harness.state().settings.focus, 0.5);
+            }
+        }
         harness
             .get_by_role_and_label(egui::accesskit::Role::Button, "×")
             .click();

@@ -281,7 +281,25 @@ impl App {
     pub(crate) fn toggle_depth_panel(&mut self) {
         if let FsExclusiveView::Depth(state) = &mut self.fs_exclusive_view {
             state.panel_visible = !state.panel_visible;
+            if !state.panel_visible {
+                let key = self
+                    .keymap
+                    .first_chord_label(crate::keymap::KeyAction::FsToggleMetadata);
+                self.show_feedback_toast(match key {
+                    Some(key) => {
+                        format!("3D 写真のパネルを隠しました。{key} でもう一度表示します")
+                    }
+                    None => "3D 写真のパネルを隠しました".to_owned(),
+                });
+            }
         }
+    }
+
+    fn depth_panel_toggle_keys(&self) -> Option<String> {
+        let labels = self
+            .keymap
+            .chord_labels(crate::keymap::KeyAction::FsToggleMetadata);
+        (!labels.is_empty()).then(|| labels.join(" / "))
     }
 
     pub(crate) fn try_paint_depth(
@@ -290,14 +308,21 @@ impl App {
         ctx: &egui::Context,
         payload: &crate::gpu_lanczos::FullscreenPaintPayload,
         transform: &crate::displayed_image_transform::DisplayedImageTransform,
+        canvas: egui::Rect,
         underlay: &crate::ui_fullscreen::FsBgStyle,
     ) -> bool {
         #[cfg(windows)]
         {
-            let Some(render) = self.wgpu_render_state.as_ref() else {
+            let FsExclusiveView::Depth(state) = &mut self.fs_exclusive_view else {
                 return false;
             };
-            let FsExclusiveView::Depth(state) = &mut self.fs_exclusive_view else {
+            // Consume even on an early return. A request belongs to this pass only.
+            let focus_click = state
+                .pending_focus_click
+                .take()
+                .filter(|(_, pass)| *pass == ctx.cumulative_pass_nr())
+                .map(|(pos, _)| pos);
+            let Some(render) = self.wgpu_render_state.as_ref() else {
                 return false;
             };
             let Some(resource) = state.ready() else {
@@ -329,6 +354,7 @@ impl App {
                 let moving = state.mouse.update(
                     pointer,
                     transform.paint_rect,
+                    canvas,
                     pointer.is_some_and(|point| panel.is_some_and(|rect| rect.contains(point))),
                     settings.strength,
                     dt,
@@ -344,10 +370,7 @@ impl App {
                     true,
                 )
             };
-            if moving && self.window_visible && visible && self.depth_export_operation.is_none() {
-                ctx.request_repaint();
-            }
-            let params = crate::depth_parallax_wgpu::DepthRenderParams::from_settings(
+            let mut params = crate::depth_parallax_wgpu::DepthRenderParams::from_settings(
                 settings,
                 resource.depth.median,
                 offset,
@@ -355,6 +378,33 @@ impl App {
                 transform.rotation.degrees() as u32 / 90,
                 transform.paint_rect.aspect_ratio(),
             );
+            let now = std::time::Instant::now();
+            if let Some(focus) = focus_click.and_then(|pos| {
+                crate::depth_parallax_wgpu::focus_depth_at(
+                    pos,
+                    transform.paint_rect,
+                    params,
+                    resource.depth.width,
+                    resource.depth.height,
+                    &resource.depth.values,
+                )
+            }) {
+                self.settings.depth_parallax.focus = focus;
+                self.settings.depth_parallax.normalize();
+                self.settings.save();
+                params.focus = self.settings.depth_parallax.focus;
+                state.focus_highlight = Some(now);
+            }
+            let intensity =
+                crate::depth_parallax::focus_highlight_intensity(state.focus_highlight, now);
+            params = params.with_focus_highlight(intensity);
+            if (moving || intensity > 0.0)
+                && self.window_visible
+                && visible
+                && self.depth_export_operation.is_none()
+            {
+                ctx.request_repaint();
+            }
             let callback = crate::depth_parallax_wgpu::DepthShaderCallback {
                 context: resource.context,
                 key: resource.key,
@@ -406,15 +456,26 @@ impl App {
         }
         let status = self.depth_panel_status();
         let export_enabled = self.depth_export_available(ctx);
+        let panel_toggle_hint = self
+            .depth_panel_toggle_keys()
+            .map(|keys| format!("{keys}: パネルを隠す・出す"));
         let response = crate::ui_depth_parallax::draw_depth_parallax_panel_with_export(
             ctx,
             &mut self.settings.depth_parallax,
             &status,
             export_enabled,
+            panel_toggle_hint,
         );
         ctx.data_mut(|data| data.insert_temp(egui::Id::unique("depth_panel_rect"), response.rect));
         if response.changed {
+            self.settings.depth_parallax.normalize();
             self.settings.save();
+        }
+        if response.focus_adjusting
+            && let FsExclusiveView::Depth(state) = &mut self.fs_exclusive_view
+        {
+            state.focus_highlight = Some(std::time::Instant::now());
+            ctx.request_repaint();
         }
         if response.close_requested {
             self.set_fs_exclusive_view(FsExclusiveView::None, "depth_panel_close");

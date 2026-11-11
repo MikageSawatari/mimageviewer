@@ -10,6 +10,7 @@ struct State {
     hidden: bool,
     close_requested: bool,
     batched_clicks: bool,
+    focus_adjustments: usize,
 }
 
 fn harness(size: egui::Vec2, batched_clicks: bool) -> Harness<'static, State> {
@@ -19,8 +20,14 @@ fn harness(size: egui::Vec2, batched_clicks: bool) -> Harness<'static, State> {
         .build_ui_state(
             |ui, state: &mut State| {
                 if !state.hidden {
-                    let panel = super::draw_depth_parallax_panel(ui.ctx(), &mut state.settings, "");
+                    let panel = super::draw_depth_parallax_panel(
+                        ui.ctx(),
+                        &mut state.settings,
+                        "",
+                        Some("I / Tab: パネルを隠す・出す".into()),
+                    );
                     state.close_requested |= panel.close_requested;
+                    state.focus_adjustments += usize::from(panel.focus_adjusting);
                 }
             },
             State {
@@ -28,6 +35,60 @@ fn harness(size: egui::Vec2, batched_clicks: bool) -> Harness<'static, State> {
                 ..State::default()
             },
         )
+}
+
+#[test]
+fn depth_focus_slider_and_default_trigger_highlight_but_hover_and_shaping_do_not() {
+    let mut harness = harness(egui::vec2(1093., 614.), false);
+    harness.run();
+    let slider = harness
+        .get_by_role_and_label(egui::accesskit::Role::Slider, "止まる深さ")
+        .rect();
+    harness.hover_at(slider.center());
+    harness.run();
+    assert_eq!(harness.state().focus_adjustments, 0);
+    pointer(&mut harness, slider.center(), true);
+    harness.event(egui::Event::PointerMoved(slider.right_center()));
+    harness.step();
+    assert!(harness.state().focus_adjustments > 0);
+    pointer(&mut harness, slider.right_center(), false);
+    harness.run();
+    let before = harness.state().focus_adjustments;
+    let reset = harness
+        .get_by_role_and_label(egui::accesskit::Role::Button, "既定値")
+        .rect();
+    click_at(&mut harness, reset.center());
+    assert_eq!(harness.state().settings.focus, 0.5);
+    assert!(harness.state().focus_adjustments > before);
+    let before = harness.state().focus_adjustments;
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::Slider, "止まる深さ")
+        .focus();
+    harness.event(egui::Event::Key {
+        key: egui::Key::ArrowRight,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness.step();
+    harness.event(egui::Event::Key {
+        key: egui::Key::ArrowRight,
+        physical_key: None,
+        pressed: false,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness.run();
+    assert!(harness.state().focus_adjustments > before);
+    let focus = harness.state().settings.focus;
+    let before = harness.state().focus_adjustments;
+    let shape = harness
+        .get_by_role_and_label(egui::accesskit::Role::CheckBox, "奥行きを整える")
+        .rect();
+    click_at(&mut harness, shape.center());
+    assert_eq!(harness.state().settings.focus, focus);
+    assert_eq!(harness.state().focus_adjustments, before);
 }
 
 fn pointer(harness: &mut Harness<'_, State>, pos: egui::Pos2, pressed: bool) {

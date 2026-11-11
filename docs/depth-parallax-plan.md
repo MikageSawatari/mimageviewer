@@ -262,7 +262,8 @@ CPU の画素 (`ColorImage`) を探さず、**表示中のテクスチャを GPU
 - 自動の動きは時刻だけで決まる関数 `motion_offset(kind, strength, phase)`。
   `phase = (経過時間 / 周期) mod 1`。左右 = (sin, 0)、円 = (cos, 0.6 sin)、8 の字 = (sin, 0.5 sin 2θ)、
   上下 = (0, 0.7 sin)。書き出しは同じ関数に `phase = i / N` を渡す (継ぎ目が出ない)。
-- **マウス追従**: 画像矩形の中心からのポインタ位置を −1〜1 に正規化し、`offset = −強さ × (nx, 0.6 ny)`
+- **マウス追従**: 画像矩形の中心からのポインタ位置を、呼出元の media rect の短辺 × 0.25 を半径として
+  縦横同じ分母で −1〜1 に正規化し、`offset = −強さ × (nx, 0.6 ny)`
   を目標にして時定数 0.15 秒で近づける。ポインタが 3D パネルの上にあるときは目標を動かさない
   (パネルを操作すると絵が揺れるのを防ぐ)。ポインタが窓の外なら中心へ戻す。
   基準の逆引き shader で手前がポインタから離れる向きとする (右 pointer → 手前は左)。
@@ -553,8 +554,10 @@ pub enum DepthSourcePhase {
   置き換えで 360° の挙動が変わらないことを、既存の 360° のテストで確かめる。
 - 3D 中のホイール: **通常どおりページ送り**。3D 中に固有の意味は持たせない (360° と違う点)。
   Ctrl+ホイールのズームだけ止める (§5.2)。
-- 3D 中のマウス左クリック／タップ: **通常どおりページ送り**。360°がcanvasを視線操作に使うための
-  クリック停止をDepthへ持ち込まない。判定は表示中のfit transformを使い、保存2D transformを変更しない。
+- 3D 中の修飾なしマウス左クリック／タップ: **通常どおりページ送り**。マウスの Ctrl+左クリックだけは
+  release イベントの修飾で判定し、同じ pass の描画資源・fit transform から止まる深さを決める (§17.2)。
+  計算中だけ通知し、失敗・元画像ホールド・画像外は何もせず、いずれもページは送らない。
+  表示中の3Dパネルをマウス・タッチとも除外する。保存2D transformは変更しない。
 - 3D 中の左右パネルの表示切替 (I / Tab): **3D パネルの表示・非表示を切り替える**。他のパネルは
   3D 中は出ない。
 - **透過部分の背景切替 (Shift+B / ImageBackgroundCycle)**: Depth中も許可する（利用者決定2026-11-08）。
@@ -635,6 +638,9 @@ pub enum DepthSourcePhase {
   - 強さ: 0.5〜5%、既定 2%
   - 周期: 1〜10 秒、既定 3 秒 (マウス追従のときは無効表示)
   - 止まる深さ: 奥 ↔ 手前 (0〜1)、既定 0.5 (整形 ON なら中央値の深さ)
+    - 下に「画像を左 Ctrl+クリックすると、その場所の深さになります」と小さな「既定値」ボタン。
+      スライダーのドラッグ・変更、既定値、Ctrl+クリックで1秒保持＋0.3秒フェードのハイライトを出す。
+      表示だけの状態で、書き出しには含めない (§17.4)。
   - 奥行きを整える: ON / OFF、既定 ON (説明: 手前の床などが奥行きを占めて平らに見えるのを防ぐ)
   - 「書き出し…」
   - 状態の1行: 「モデルを準備中」「奥行きを計算中」「失敗しました (理由)」。待機中は画像上にも
@@ -2079,3 +2085,397 @@ F12 の確定点で終える変更と、viewer の pass の中で持ち主を呼
 ### 第 4 回 (2026-11-06、同じセッションの継続、read-only)
 
 第 3 回の P1 は解消。新しい P1 / P2 は無し。段 B も着手可。
+
+## 17. 次の版の改善: クリックで止める点・マウス追従の範囲・止まる深さのハイライト (§1.751〜§1.753、2026-11-10)
+
+v5.1.0 の配布ビルドを利用者が試して出した要望 3 件 (`next-release-backlog.md` §1.751・§1.752・§1.753)。
+設計: ClaudeCode Opus 5.5。worktree `G:\home\mimageviewer-3d-751`、ブランチ `feat-3d-751`。
+
+### 17.1 方針 (状態を増やさない)
+
+- **止まる深さの持ち主は今までどおり `DepthParallaxSettings::focus` の 1 つだけ**。クリックで決めた点を
+  画像ごと・別の値 (「ピン」) として持たず、クリックは「その場所の深さを `focus` に入れる」操作にする。
+  パネルのスライダーがそのまま新しい値を示し、スライダーで戻せる。書き出しも同じ `focus` を使うので、
+  書き出しへの反映のための経路は要らない。
+  - 採らなかった案: 画像ごとのピン (位置または深さ) を `DepthViewState` に持ち、スライダーの値と別に
+    優先させる。持ち主が 2 つになり、ページ移動・書き出し・スライダー操作との優先順位と寿命を決める
+    必要が出る。深度は画像ごとに 0〜1 へ正規化され、整形 ON では中央値が 0.5 に揃うので、共通の値を
+    次の画像へ持ち越しても意味は保たれる。
+- **ハイライトは表示だけの一時状態**。設定にも書き出しの要求にも入れない。書き出しはモーダルで、
+  要求は `DepthRenderParams::from_settings` から作るので、そこでハイライトを常に 0 にすれば書き出しに
+  混ざる経路は無い。
+- 新しいモード・新しい非同期処理は足さない。クリック位置の深さは CPU に残した深度マップから同期で読む
+  (最大 1536² の f16 の 1 点の双線形補間。I/O なし)。
+
+### 17.2 §1.751 クリックした場所を止まる点にする
+
+**操作**: 3D 写真の表示中に、画像の上で **Ctrl+左クリック** (マウス)。案内は「**左 Ctrl**+クリック」とする。
+
+- 修飾なしの左クリックは今までどおりページ送り (§6.5、リリース済みの挙動) のまま残す。修飾なしクリックを
+  ピンに変えるとページ送りが失われるので、利用者に相談せずには採らない (CLAUDE.md「通常の使い方が
+  不便になる変更」)。Ctrl+クリックは基点ではページ送り (修飾を見ていない) なので、**3D 中だけ**意味を変える。
+  3D 以外の Ctrl+クリックは変えない。
+- **右 Ctrl は既定で元画像の一時表示 (`FsOriginalPreviewHold`) に割り当てられている** (keymap.rs:7147)。押している間は
+  素材が `NotYet(OriginalHold)` になり 3D の描画資源が外れる (ui_fullscreen.rs:13303)。この優先は変えない
+  (元画像ホールドの挙動を変えるとリリース済み機能の変更になる)。元画像ホールド中の Ctrl+クリックは
+  止まる深さを変えず、ページも送らない。そのため案内は「左 Ctrl」にする。
+- **Ctrl の判定は、受理した左ボタンの release イベントが持つ修飾** (`egui::Event::PointerButton { modifiers, .. }`、
+  egui-winit が押下時の状態を記録する) で行う。OS の現在値 (`ctrl_held_via_os`) は、release から処理の pass までに
+  Ctrl を離すと通常クリックへ落ちるので使わない。Shift / Alt が同時に押されていても Ctrl があればこの操作。
+- クリックの分類は既存の `plan_fs_canvas_click` に `FsCanvasClickAction::DepthFocusAt(pos)` を足して行う。
+  パネル・シークバー・ポップアップ・オーバーフロー・modal・Remote 等で `None` / `DismissOverflow` になる条件と、
+  Ctrl+Space の scrub など planner より前に primary を所有する操作は、既存の順のまま先に効く。`PageSide` を返す
+  直前で「3D 中かつ Ctrl」なら `DepthFocusAt` を返す。ドラッグ (3 px 超)・ダブルクリックの扱いは従来どおり。
+- `DepthFocusAt` の処理 (どの場合も**ページは送らない**):
+  - 深度が計算中 (`ReadingBack` / `Estimating` / `WaitingForStableTexture`) で、元画像ホールド中でない: 「奥行きの計算が終わると使えます」を短く通知。
+  - 失敗 (`Failed`): 何もしない (失敗はパネルと既存の通知で知らせ済み。同じ鍵では再試行しない §13)。
+  - 元画像ホールド中: 何もしない。
+  - 描画できる (`ready()` あり): 下の「描画時の解決」へ要求を渡す。画像の外だった場合は描画時に何もしない。
+    深さが決まったCtrl+クリックは既存パネルと同じ操作時の `settings.save()` を1クリックにつき1回だけ同期実行する。
+    [UI応答性 §2.5](ui-responsiveness.md#25-静止画シーク回転-reader-の所有境界)の明示的な例外に従い、再passやハイライト中の再描画では保存しない。
+- **保証の範囲はマウスのクリック**。タッチのタップは Ctrl の有無にかかわらず従来どおり (ページ送り) で、止まる深さは
+  スライダーで調整する。ただし 3D パネルの上のタップが背面のページ送りになる既存の穴は、パネルに新しい
+  ボタンを置くのでこの機会に塞ぐ: 表示中の 3D パネルの矩形をタッチの除外領域 (ui_fullscreen.rs:40477 の組立て) にも加える
+  (マウス側は ui_fullscreen.rs:40117 で既に除外している)。
+- **keymap**: 押した位置を使うポインター操作で、離散コマンドではないので `KeyAction` にしない。
+  `docs/keymap-spec.md` の 3D 写真の節に固定入力として理由とともに書く。
+
+**描画時の解決 (前の pass の記録を使わない)**: 入力の処理は描画より前にあり、前の pass で記録した幾何は
+ページ移動・回転・大きさの変更の直後に今の表示と食い違い得る (独立レビュー P2)。そこで、クリックは
+「同じ pass の要求」として `DepthViewState` に `pending_focus_click: Option<(egui::Pos2, u64 /* cumulative pass nr */)>` で置き、
+**同じ pass の `try_paint_depth` が、実際に描く資源 (`resource.key` が payload の source と一致した後) と transform で解決して消費する**。
+pass 番号が違う要求は解決せずに捨てる (その pass で 3D を描かなかった = 資源が無い・素材が変わった)。
+新しい記録や待ちの状態は増えない (1 pass だけ生きる要求)。
+
+**クリック位置 → 深さ**: シェーダと同じ写像を CPU の純粋関数で持つ。
+
+- 画面の点 `pos` → `in_uv = (pos − paint_rect.min) / paint_rect.size` (範囲外なら `None`)
+  → `base = (in_uv − 0.5) / zoom + 0.5` → `rotate_uv(base)` (WGSL の `rotate_uv` と同じ 4 通り)
+  → `source = mix(uv.min, uv.max, …)` を uv の範囲に clamp
+  → 深度マップを **clamp-to-edge の双線形** (texel 中心 `(i + 0.5) / w`) で読む
+  → `pow(clamp(d, 0, 1), gamma)`。`gamma = depth_gamma(shape_depth, median)`。シェーダは整形後の深さと
+  `focus` を比べるので、`focus` に入れるのは整形後の値。`zoom` は `DepthRenderParams` と同じ値を使う
+  (式を 2 か所に書かない。解決は `try_paint_depth` 内で作った `params` から読む)。
+- 式と順序はシェーダと同じだが、**幾何上の近似**である: GPU の callback viewport は物理画素へ丸められ、
+  シェーダは有限の探索 (40 段 + 二分 5 回) なので、端数の位置・非整数 DPI では数値が完全には一致しない。
+  検査は許容誤差つきで行う (§17.6)。
+- **今の動き (offset) は使わない** (offset 0 の写像)。`focus` を変えると全体が `offset × Δfocus` だけずれるので、
+  「クリックの瞬間に動いて見えていた被写体の点」を選んでもその点はポインタから離れる。offset 0 の写像なら、
+  `t = focus` で逆引き位置が常に `base` になるので、新しい `focus` で描いたときに**クリックした画面上の位置にある面が
+  そこで止まる** (遮るものが無い限り)。「クリックした場所が動かない」に合うのはこちら。左右方向の「回転の中心」は無い
+  (このシェーダは画面全体を同じ量ずらすので、止まるのは深さで決まる面全体)。
+- 保証はクリックした時点の強さ (zoom)・回転・整形に対するもの。後で「奥行きを整える」や強さを変えると、
+  `focus` は数値のまま保ち、以前の被写体点を固定し直さない (利用者がもう一度クリックすればよい)。
+- CPU の深度: `DepthTexture::upload` で深度マップの値 (`Vec<half::f16>` と寸法) を GPU へ上げた後も `DepthTexture` に残す。
+  LRU は同じ `Arc<DepthTexture>` を渡すので、LRU から戻った場合も使える。最大 1536² × 2 B ≈ 4.7 MB、
+  LRU 4 枚で最大約 19 MB の CPU メモリ。VRAM の会計 (`byte_size`) には入れない。
+- 決まった値は `settings.depth_parallax.focus` に入れて `normalize` 後に保存し (パネルの変更と同じ保存経路)、
+  §17.4 のハイライトを始める。
+
+### 17.3 §1.752 マウス追従を画面中央の狭い範囲で端まで動かす
+
+- `MouseFollow::update` の正規化を、画像の矩形の大きさではなく**表示領域 (キャンバス) の短辺の半分の正方形**に
+  する: `r = 0.25 × min(canvas.w, canvas.h)`、`n = (p − image.center()) / r` を各軸 ±1 で頭打ち。
+  中心は今までどおり画像の中心 (fit 表示ではキャンバスの中心とほぼ同じ)。縦の 0.6 倍と符号は変えない。
+  - 1920×1080 の全画面なら、中央の 540×540 px の正方形の縁で動きの端に届く。上下の HUD の帯
+    (上端・下端) まで寄る必要が無い。
+  - 縦横で同じ `r` を使う (横長の画像で左右だけ感度が鈍くならない)。
+  - 小さい画像でも感度が極端にならないよう、画像ではなくキャンバスを基準にする。
+- 範囲は**固定** (設定項目を足さない)。0.25 は利用者の実機確認で調整する前提の初期値で、定数 1 か所に置く。
+- HUD の帯・パネルの上にポインタがあるときの扱いは変えない (帯の中は頭打ちで端のまま、パネル上は目標を
+  固定)。帯へ寄せる必要がなくなるので、帯専用の分岐は足さない。
+- キャンバスの矩形は、`try_paint_depth` の呼出元が既に持つ画像の表示領域 (固定バー等を除いた media rect。
+  `resolved_fullscreen_media_rect` / 呼出元の `image_rect`、ui_fullscreen.rs:5065) を引数で渡して使う。
+  painter の clip 矩形は Page fit で親の clip をそのまま返すので使わない (独立レビュー P2)。画像の中心は
+  `transform.paint_rect.center()`。
+
+### 17.4 §1.753 止まる深さのハイライト
+
+- **出る時**: パネルの「止まる深さ」スライダーをドラッグ中・値を変えたフレーム (キーボードでの変更を含む)、
+  §17.5 の「既定値」ボタン、§17.2 の Ctrl+クリック。最後にこれらが起きてから **1.0 秒は強さ 1、その後 0.3 秒で 0 へ**
+  フェードして消える。ホバーだけでは出さない (パネルへポインタを動かすたびに色が付くのを避ける)。
+- **持ち主**: `DepthViewState` の `focus_highlight: Option<Instant>` (最後に起きた時刻) と、時刻から強さを返す純粋関数
+  `focus_highlight_intensity(last, now) -> f32` だけ。3D を抜ける・ページを移ると `DepthViewState` の寿命や
+  深度の作り直しに従う (特別な解除は足さない。ページを移ってもフェードが残るだけで害は無い)。
+- **再描画**: 強さが 0 でない間は毎フレーム `request_repaint` (最長 1.3 秒)。マウス追従で止まっているときも
+  フェードが進む。最小化・非表示・書き出しの modal 中は要求しない (既存の動きの再描画と同じ条件、depth_view.rs:347)。
+- **描き方 (シェーダ)**: uniform の空き (`view.w`、今は 0) にハイライトの強さを入れる。uniform の大きさは変えない。
+  レイマーチで決まった面の深さ `t_hit = (near + far) / 2` と `focus` の差で
+  `w = h × (1 − smoothstep(0.03, 0.05, |t_hit − focus|))`。色は
+  `rgb = mix(c.rgb × (1 − 0.2h), vec3(0.0, 0.85, 1.0) × c.a, 0.55w)` (premultiplied のまま。帯の外を 20% 暗くして
+  帯を見やすくする)。色・幅・暗さは初期値で、実機確認で調整する。
+- **書き出しには含めない**: `DepthRenderParams::from_settings` はハイライト 0 を返し、画面の paint だけが
+  `with_focus_highlight(h)` で上書きする。書き出し側は from_settings の値をそのまま使う (変更しない)。
+
+### 17.5 パネル
+
+- 「止まる深さ」スライダーの下 (奥 ↔ 手前の行の下) に、小さな説明 1 行:
+  「画像を左 Ctrl+クリックすると、その場所の深さになります」。
+- 同じ行の右か次の行に小さな「既定値」ボタン: `focus = 0.5` にしてハイライトを出す (クリックで変えた値を戻す入口)。
+- パネルの戻り値 `DepthPanelResponse` に `focus_adjusting: bool` (スライダーのドラッグ中・変更・既定値ボタン) を足し、
+  `draw_depth_panel` がハイライトの時刻を更新する。保存は今までどおり `changed` で行う。
+- 固定パネルの高さ検査 (`tests/support/scroll_layout.rs`) と UI スナップショットを更新する。
+
+### 17.6 テスト
+
+GPU を使う比較は許容誤差つき (補間とレイマーチの有限探索、§17.2 の近似)。
+
+- `MouseFollow::update`: 中心から `r` の位置で目標が端 (±強さ、縦は 0.6 倍)、`r` を越えると頭打ち、縦横で同じ `r`、
+  キャンバスが 0 の大きさなら中心、パネル上で固定・ポインタなしで中心へ (既存の検査を新しい分母で直す)。
+  キャンバスとして media rect が使われ、clip 矩形が大きくても感度が変わらないこと。
+- 位置 → 深さの純粋関数: 回転 0〜3、切り取り (uv 範囲)、zoom、gamma、双線形、画像外で `None`、端数の fit 矩形。
+- GPU (既存の 2 面の深度を使う検査に加え、模様付きの色と連続した深度の画像も使う): 求めた `focus` で、正負の offset・
+  切り取り・回転・gamma ありで描いても、クリックした位置の画素が offset 0 のときと許容誤差内で同じ。
+  ハイライト 0 の出力は今までと同じ、1 なら帯の中の面だけ色が付く。alpha 0 / 中間 / 1 で premultiplied が保たれる。
+- `plan_fs_canvas_click` と処理 (handler-level): 3D + Ctrl → `DepthFocusAt`、3D + Ctrl なし → `PageSide`、
+  3D でない + Ctrl → `PageSide` (変わらない)。Ctrl は release イベントの修飾で判定され、release 後に Ctrl を離しても
+  `DepthFocusAt` のまま。ダブルクリック・3 px 超のドラッグ・パネル / popup / overflow / modal / Remote で従来どおり。
+  画像外・計算中・失敗・元画像ホールド中の Ctrl+クリックでページが動かず、計算中だけ通知が出る。
+- 描画時の解決: 同じ pass の要求は今の資源と transform で解決され、pass が違う要求・資源の鍵が payload と合わない pass
+  (ページ移動・素材の変更直後) の要求は解決されずに捨てられる。LRU から戻った深度でも解決できる。
+- タッチ: 表示中の 3D パネル内のタップでページが送られない。パネル外のタップは従来どおりページ送り。
+- 書き出し: params のハイライトが 0。画面でハイライト中に作った書き出し要求にもハイライトが入らない。
+- ハイライトの強さの時刻関数 (1.0 秒保持・0.3 秒フェード・その後 0)。マウス追従で止まっているときもフェードが最後まで
+  進む (再描画が要求される)。hidden / minimized / 書き出しの modal 中は再描画を要求しない。
+- 整形を切り替えても `focus` の数値が保たれる。
+- パネル: スライダー操作と既定値ボタンで `focus_adjusting`、既定値ボタンで 0.5。
+
+### 17.7 文書
+
+- マニュアル `htdocs/mimageviewer/manual/fullscreen.html` の 3D 写真の節: 止まる深さの行に Ctrl+クリック・既定値・
+  ハイライトを、マウス追従の説明に「画面中央の狭い範囲で端まで動く」を足す。製品ページの 3D のカードは
+  機能の要約だけなので、文言が今も正しいかだけ確かめる。
+- `docs/keymap-spec.md` の 3D 写真の節に、3D 中の Ctrl+左クリックを固定入力として理由とともに書く。
+- 本書 §5.3 (マウス追従の正規化)、§6.5 (3D 中のクリック)、§8 (パネル) を本節に合わせて直す。
+- まれな失敗は既定の割り切り (§13)。この改善で新しい失敗の経路は増えない。
+
+### 17.8 独立レビュー (設計、2026-11-10、GPT-6.1 Sol / xhigh、read-only、基点 `c89cc2cbc`)
+
+P2 5 件・P3 2 件。判定「指摘修正後に実装開始可」。ClaudeCode が根拠のコード (keymap.rs の RightCtrl、
+タッチの除外領域の組立て、`single_clip_rect`) を確かめ、すべて採って §17 を直した。
+
+| 指摘 | 対応 |
+| --- | --- |
+| P2 前 pass の `DisplaySnapshot` は `resource_id` が一致しても今の表示と食い違い得る (入力は描画より前、回転・resize は id を変えない) | 記録を使わず、同じ pass の `try_paint_depth` が実際に描く資源と transform でクリックを解決する (§17.2) |
+| P2 OS の Ctrl の現在値では release 後に離すと通常クリックへ落ちる | release イベントの修飾で判定 (§17.2) |
+| P2 右 Ctrl は元画像ホールドの既定キーで、ホールド中は 3D 資源が外れる | ホールドを優先、その間は何もしない。案内は「左 Ctrl」(§17.2・§17.5) |
+| P2 painter の clip 矩形は media rect と一致しない | 呼出元の media rect を渡す (§17.3) |
+| P2 3D パネルがタッチの除外領域に無い | パネル矩形をタッチの除外にも加える。保証はマウスのクリックに限る (§17.2) |
+| P3 「完全一致」には精度の定義が要る | 幾何上の近似と明記し、GPU 検査は許容誤差つき (§17.2・§17.6) |
+| P3 失敗時に「計算が終わると使えます」は不正確 | 通知は計算中だけ。失敗は既存の表示に任せる (§17.2) |
+
+再確認 (同じセッションの継続、基点 `7f179a692`): 7 件とも解消、新しい P1 / P2 なし。判定「実装開始可」。
+実装上の注意として、`pending_focus_click` の登録は**入力計画の時点** (`render_fs_body` 内の入力計画、
+ui_fullscreen.rs:28487 付近) で行う。既存の action 適用には描画後へ遅らせる経路 (複数ホイール入力が混ざるとき、
+ui_fullscreen.rs:41011・30497) があり、そこへ置くと同じ pass の `try_paint_depth` (44869) に間に合わない。
+MainWindow (30278) と Fullscreen (30290) はどちらも `render_fs_body` を通り、入力計画 → 素材更新 (28871) → 描画 →
+`try_paint_depth` の順で、間に pass の終了は無い。両 presentation について、この遅延経路と egui の discard による
+再 pass を含めた呼出順の回帰検査を入れる。
+
+### 17.9 実装記録
+
+2026-11-10、`feat-3d-751`、基点 `6e2ed9049`。実装担当による未コミット差分。
+製品の起動・デスクトップ入力・push は行わず、全件 gate とコミットは coordinator が担当する。
+
+| 対象 | 変更 |
+| --- | --- |
+| `src/ui_fullscreen.rs` | release の位置・修飾と egui の click 判定を対応づけ、従来の除外後に `DepthFocusAt` を分類。`render_fs_body` から呼ばれる入力計画内で直ちに要求を登録し、遅延 action 適用では何もしない。表示パネルを touch の除外へ追加。media rect を Depth paint へ渡す |
+| `src/app/depth_view.rs` | 同じ pass の要求を消費し、resource key 確認後、実際の transform と params で解決。既存の設定保存経路とハイライトへ接続。既存の可視・最小化・書き出し条件の下だけ連続 repaint |
+| `src/depth_parallax.rs` | canvas 短辺の 0.25 を共通半径にした追従、pass 限りの要求、ハイライトの時刻と強さの純粋関数 |
+| `src/depth_parallax_wgpu.rs` | CPU 深度を `DepthTexture` に保持し、回転・crop・zoom・bilinear・gamma の純粋 lookup を追加。`view.w` の premultiplied ハイライト。from_settings は常に強さ0 |
+| `src/ui_depth_parallax.rs` | 弱い文字色の操作案内、既定値ボタン、`focus_adjusting`。固定 header／scroll body と本文上限380ptを維持（追加内容も収まることを高さ検査で確認） |
+| `src/depth_focus_sampling_tests.rs`、`src/ui_fullscreen/depth_focus_tests.rs` | CPU/GPU 比較、両 presentation の実入力→描画順序と discard、pass/key 不一致・画像外・LRU、タッチ・除外・repaint の回帰 |
+| `src/app/depth_export.rs` (test)、`src/app/depth_main_window_tests.rs`、`src/ui_depth_parallax_tests.rs`、`tests/ui_snapshot.rs`、パネル PNG | ハイライト中の実書き出し要求で強さ0、新しい追従半径の期待値、実パネルの操作、固定 header／本文高さ・末尾到達と外観 |
+| `htdocs/mimageviewer/manual/fullscreen.html`、`docs/keymap-spec.md`、本書 | 操作と表示仕様を同期。製品ページの3Dカードは説明が引き続き正確なため変更なし |
+
+§17からの仕様変更なし。新しい非同期処理、回復経路、設定項目は追加していない。
+Ctrl+クリックは深さが決まった操作時に、既存パネルと同じ `settings.save()` を1クリックにつき1回同期実行する。
+[UI応答性 §2.5](ui-responsiveness.md#25-静止画シーク回転-reader-の所有境界)の明示的な例外に従い、
+毎フレーム、同じクリックの再pass、ハイライト中の再描画では保存しない。writerの新設や部分的な非同期化は行わない。
+CPU深度はGPU資源と同じArc/LRUの寿命を使い、VRAM会計は従来の値を維持する。
+操作感（半径0.25）、ハイライトの色・幅、非整数DPIでの見え方は実機確認待ち。
+
+検証（Windows、通常 feature、未コミット差分。実アプリの操作感・画質は未確認）:
+
+| コマンド | 結果・証拠 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth/)'` | **174成功 / 0失敗**、exit 0。`target/depth-751-final.log`。CPU/GPU・入力計画・both presentation/discard・touch・LRU・modal/Remote・repaint・実書き出し要求を含む |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/fullscreen_click\|canvas_click\|touch/)'` | **261成功 / 0失敗**、exit 0。`target/depth-751-input-tests.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険グリフ0件 |
+| `python scripts/check_site_cards.py` | exit 0、53カード / 超過0件（製品ページの変更なし） |
+| `UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot depth_parallax` | **2成功 / 0失敗**、exit 0。`target/depth-751-snapshot-update.log`。PNG 1枚（46,134 bytes）を目視確認。案内は1行で収まり、既定値・状態行・×に欠けや重なりなし |
+| `cargo test --test ui_snapshot depth_parallax` | 更新モードなしの通常比較も **2成功 / 0失敗**、exit 0。`target/depth-751-snapshot-compare.log`。1093×614で不要scrollなし、546.5×307で実wheelによる末尾・既定値の到達と固定header/×を確認 |
+| `cargo fmt`、`cargo fmt --check`、`git diff --check` | exit 0。整形は引数なしで実行。`target/depth-751-fmt.log` |
+| `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | **exit 0**。通常feature・`dev-runtime`、portableなし。core / remote / EPUB worker / MCP adapter / music-video editor とDLLを配置。CRT検査 **runtime=4 / pe=5 成功**。`target/depth-751-build.log`、`target/vcrt-pe-reports/dev-runtime.json`。製品は起動していない |
+
+途中の depth 検査は158件中157成功・旧追従感度の期待値1件を修正。
+追加テストの最初のコンパイルでは新eguiのRawInput APIとtest fixtureの借用2箇所を修正し、
+172件中170成功の段階で、書き出しのsame-pass受付をpass外から呼んでいたfixture2件を
+既存のcapture/admit経路へ直した。製品側の受付条件は変更していない。
+同じ位置の複数クリックも最後の受理primary releaseの修飾で分類する回帰を追加した。
+さらにeguiのheadless probeで、release `[300,300]` の後に同じ入力束で `[500,300]` へ移動すると、
+`Response::interact_pointer_pos` は後者になることを確認した。位置をResponseに合わせてreleaseを探すと
+CtrlクリックをPageSideへ落としてしまうため、位置と修飾を同じ受理releaseから採る形へ修正。
+マウス移動・Ctrl解放がreleaseの後に入る入力を、plannerと両presentationの実描画テストに追加した。
+Ctrl+Shift+Altも確認する。これは§17の入力所有の実装上の修正で、仕様変更ではない。
+上表はそれらを含む最終ソースでの成功結果。
+
+パネル本文の上限は、途中に440ptも検査したが、追加内容が従来の380pt内に収まると確認できたため
+380ptを維持した。上表のdepth 174件、入力261件、snapshot更新・通常比較は380ptの最終ソースで成功。
+画像を覆う面積と入力除外の範囲を不必要に広げない。
+入力座標の最終修正でpanel painter・UI harness・PNG・依存条件は変わらないため、
+snapshotの成功結果は検証方針どおり再利用した。
+
+確認用 `build-dev.ps1 -PreserveRuntime` の初回はTurboJPEGのCMake/MSBuild段階でexit 101。
+同じworktreeの生成先に対して `cmake --build target/dev-runtime/build/turbojpeg-sys-ad9ab6b47bbc75e3/out/build --target install --config RelWithDebInfo --parallel 1`
+を実行するとexit 0で依存物を構築できた（`target/depth-751-native-build.log`）。
+製品コード・ビルドscript・個人設定は変えず、一時的な `CARGO_BUILD_JOBS=1` の依存準備も経て、
+最終の入力座標修正後は通常の並列数で上表の確認用buildを完了した。ネイティブ依存構築後の再実行には
+`-WaitForOtherBuildsMinutes 0` を使用。初回失敗の原因を製品の不具合とは判定していない。
+
+確認用coreは `target/dev-runtime/mimageviewer-core.exe`。normal profileなので、引数なしの起動は
+実利用中の `%APPDATA%/mimageviewer` を使い、設定やデータを更新し得る。
+利用者がインストール版／常駐tray版を終了してから
+`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe` で起動する。
+両presentationで左Ctrlクリックがページを送らずその深さを設定すること、右Ctrlホールド中は変更しないこと、
+既定値0.5・調整時のハイライトとフェード、中央の狭い範囲で追従の端に届くこと、書き出しにハイライトが入らないことが
+実機の確認項目。全件gate・実機確認・coordinatorによるcommitはこの実装作業では行っていない。
+
+#### Codex P2/P3 対応
+
+2026-11-10、`4299e510c` に対する独立レビュー後の対応。製品コードの変更はなく、
+`src/app/depth_main_window_tests.rs`、`src/ui_fullscreen/depth_focus_tests.rs`、本書だけを変更した。
+
+- P2: §17.2 と本節に、Ctrl+クリックが既存パネルと同じ操作時の同期 `settings.save()` を
+  1クリックにつき1回呼ぶことを明記した。UI応答性 §2.5 の明示的な例外を適用し、
+  writer の新設や非同期化は行わない。実入力から描画までのテストで、保存世代が press では進まず、
+  release に discard 再pass があっても1だけ進み、その後のハイライト付き8回の実描画では進まないことを検査する。
+- P3: 共通fixtureで深度値を指定できるようにし、x方向の0→1勾配と画像中央以外のクリックを使った
+  回転90°／resizeの2テストを追加した。release と同じ pass 内の回転変更、または同じ入力の新しい表示領域を
+  実描画経路に渡し、実際の Depth callback の矩形と描画後の transform の一致、同一 resource の維持を確認する。
+  現在と直前の transform それぞれから期待深度を計算し、差が0.1を超えること、許容誤差 `1e-4` の
+  同じ合否判定が旧 transform の値を拒否し、実際に設定された値を受理することを assert する。
+  旧テストは検査内容に合わせて pass／resource／画像外／LRU／media半径の名前へ変更した。
+
+§17からの仕様変更なし。テストと文書のみのため確認用バイナリの再buildは不要。
+全件suite、コミット、push、製品起動は行っていない。
+
+検証（同worktree、通常feature）:
+
+| コマンド | 結果・証拠 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth_focus_click_(saves_once\|uses_same_pass)/)'` | **3成功 / 0失敗**、exit 0。`target/depth-751-review-focused.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth/)'` | **177成功 / 0失敗**、exit 0。`target/depth-751-review-depth.log`。上の追加3件を含む |
+| `cargo fmt`（引数なし）、`git diff --check` | exit 0 |
+
+### 17.10 操作の案内: パネルを隠す・出す (§1.760、5ch >>755) と Ctrl+クリック (2026-11-11)
+
+利用者の判断 (2026-11-11): §1.751 は左 Ctrl+クリックのままとする。そのうえで、パネルを隠せることと
+Ctrl+クリックで止まる深さを決められることを、画面上から分かるようにする。
+
+現状 (コード確認): パネルの表示・非表示は `App::toggle_depth_panel` (`src/app/depth_view.rs`) の 1 か所で、
+呼び出しはキー `KeyAction::FsToggleMetadata` (既定 `I` / `Tab`、`src/ui_fullscreen.rs` の `key_i`) と
+ゲームパッドのリング `RingActionId::ImageToggleMetadata` (`src/app/gamepad_input.rs`) の 2 つ。
+Ctrl+クリックの案内は §17.5 でスライダー下 (ScrollArea の中) に置いたため、本文をスクロールすると見えない。
+
+**決定**
+
+1. **パネル下部に固定の案内欄** (フッター) を置く。ヘッダと同じく ScrollArea の**外**で、本文の高さは
+   フッターの実測高さを差し引いて確保する (固定パネルの規則、`tests/support/scroll_layout.rs`)。小さな弱い文字色で 2 行:
+   - `左 Ctrl+クリック: その場所の深さで止める` (マウス操作なので固定文言)
+   - `<キー>: パネルを隠す・出す`。`<キー>` は `keymap.chord_labels(KeyAction::FsToggleMetadata)` を ` / ` で
+     つないだもの (既定は `I / Tab`)。割り当てが空なら、この行は出さない (存在しない操作を案内しない)。
+   §17.5 のスライダー下の Ctrl+クリック説明は**消して**フッターへ移す (同じ意味を 2 か所に書かない)。
+   「既定値」ボタンはスライダーの近くに残す。
+2. **隠したときに通知を 1 回出す**。`toggle_depth_panel` が表示→非表示へ切り替えたとき、既存の
+   `show_feedback_toast` で `3D 写真のパネルを隠しました。<キー> でもう一度表示します` を出す
+   (`<キー>` は `keymap.first_chord_label(KeyAction::FsToggleMetadata)` による最初の割り当て1つ、既定は `I`。
+   割り当てが空なら `3D 写真のパネルを隠しました` だけ)。どの割り当てでも再表示できるので、通知には1つで足りる。
+   フッターには全chordを表示する。キーとリングの両方の入口が同じ関数を通るので、
+   通知もそこに 1 か所だけ置く。表示に戻すときは通知しない。
+   通知は毎回出す。初回だけにするには永続の「見た」状態が要り、状態を増やすため採らない。
+   1つのchord自体が極端に長い場合は通知が欠け得る。これは折り返さない共通トーストの既知の制約として残す。
+3. 文言は描画のたびに今の keymap から作る (キャッシュしない)。ui 関数 (`draw_depth_parallax_panel_with_export`) は
+   keymap を持たず、App が作った案内文字列 (`Option<String>`) を引数で受け取る (パネル側に I/O・設定参照を足さない)。
+
+**採らなかった案**: 隠したあと画像の隅に小さな「3D」ボタンを常に出す (隠した目的の「画像を広く見る」に反する)。
+右端ホバーで出す・鍵で固定する (backlog の未定案。状態と入力経路が増えるので今回は入れない)。
+
+**テスト**: フッター文言が keymap の今の割り当てに従う (既定・別キーへ変更・複数・空) handler/UI テスト。
+隠す切替で通知が 1 回、出す切替で通知なし (キーとリングの両方)。1093×614 と小さい画面でヘッダ・フッターが
+ScrollArea の外に見え、本文が末尾まで届く高さ検査。UI スナップショット更新。
+
+**文書**: マニュアル (3D 写真の節) に「パネル下部に操作の案内が出る」「隠したときの通知」を足す。
+`docs/keymap-spec.md` に、3D パネルの案内が `FsToggleMetadata` の割り当てから作られることを書く。
+
+### 17.11 実装記録 (§17.10)
+
+2026-11-11、`feat-3d-751`、基点 `da4485dcc`。§17.10からの仕様変更なし。
+
+前提のコード確認:
+
+- パネル表示の切替は `src/app/depth_view.rs:281` の `App::toggle_depth_panel` が所有する。
+  `src/ui_fullscreen.rs:36920` の `key_i` と `src/app/gamepad_input.rs:8099` の `ImageToggleMetadata` は
+  両方この関数を通る。入口の受付条件やkeymap自体は変更していない。
+- `App::draw_depth_panel` (`src/app/depth_view.rs:445`) が状態と書き出し可否を純描画関数へ渡し、返されたパネル矩形を
+  入力除外へ渡す既存の境界を維持する。
+- `src/ui_depth_parallax.rs:58,102` は固定headerと明示的に確保したScrollAreaの親領域を持つ。
+  描画するフッター文字の折り返し済みgalleyを実測し、行間と本文との間隔も含めて本文高から差し引く。
+  本文の上限380ptと既定値ボタンを維持し、旧スライダー下の説明は撤去した。
+
+| ファイル | 変更 |
+| --- | --- |
+| `src/app/depth_view.rs` | 毎回現在の `FsToggleMetadata` のchord表示を結合し、案内文字列を渡す。隠すときだけ共通の通知を1回発行。割り当てなしではキー案内を省略 |
+| `src/ui_depth_parallax.rs` | 小さい弱い文字色の固定フッター2行。純描画APIへ `Option<String>` を追加し、keymap参照・I/O・状態の追加なし |
+| `src/app/depth_view_tests.rs` | 実App描画で既定・変更・複数・空の割り当てに追従。キーとリングの両入口から2周ずつ、隠す通知1回／出す通知なしを検査 |
+| `src/ui_depth_parallax_tests.rs`、`src/ui_depth_export_tests.rs` | 共通描画APIへ案内文字列を渡し、既存のパネル操作・書き出し回帰を維持 |
+| `tests/ui_snapshot.rs`、パネルPNG | 1093×614と546.5×307でheader/footerの可視性とScrollArea外の固定配置、実wheelによる末尾と各controlへの到達を検査。小画面の代表snapshotを追加 |
+| `htdocs/mimageviewer/manual/fullscreen.html`、`docs/keymap-spec.md`、本書 | 固定案内・現在の割り当て・隠した通知の説明を同期。製品ページの3Dカードの主張は変わらないため変更なし |
+
+検証（Windows、通常feature、同worktreeの未コミット差分）。利用者の実機確認中のcoreを保護するため、
+`build-dev.ps1` は実行していない。確認用成果物の再作成と全件suiteはcoordinatorが担当する。
+本作業ではコミット・push・製品起動を行っていない。
+
+| コマンド | 結果・証拠 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth/)'` | **179成功 / 0失敗**、exit 0。`target/depth-panel-1760-tests.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/keymap/)'` | **210成功 / 0失敗**、exit 0。`target/depth-panel-1760-keymap.log` |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険グリフ0件 |
+| `UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot depth_parallax` | **3成功 / 0失敗**、exit 0。`target/depth-panel-1760-snapshot-update.log`。既存の通常サイズPNGを更新し、小画面PNGを追加 |
+| `cargo test --test ui_snapshot depth_parallax` | 更新指定なしの通常比較も **3成功 / 0失敗**、exit 0。`target/depth-panel-1760-snapshot-compare.log` |
+| `cargo fmt`（引数なし）、`git diff --check` | exit 0 |
+
+`tests/snapshots/depth_parallax_panel_dark.png`（1093×614、46,626 bytes）と
+`depth_parallax_panel_small_dark.png`（546×307、19,219 bytes）を目視確認した。
+小画面の入力は546.5×307 logical points。両方で見出し・×・固定案内2行が収まり、文字の欠けや重なりなし。
+小画面の本文にはscrollbarがあり、別の高さ検査で実wheelによる末尾と各controlへの到達を確認した。
+純描画snapshotとheadless handlerテストの結果であり、製品起動・実機操作の確認とは分ける。
+
+#### Codex P2 対応
+
+2026-11-11、`29b023df0` に対する独立レビュー後の対応。複数chordを連結した通知が
+546.5×307の画面からはみ出す指摘に対し、coordinatorの判断で§17.10の通知仕様を更新した。
+`src/app/depth_view.rs` の隠す通知だけを既存の `first_chord_label(FsToggleMetadata)` へ変更し、
+最初の割り当てキー1つを知らせる（既定 `I`、未割り当てなら隠した事実だけ）。
+共通トースト描画と、全chordを折り返して表示するフッターの実装は変更しない。
+1つのchord自体が極端に長い場合に欠け得る制約は§17.10に明記した。
+
+`src/app/depth_view_tests.rs` の既存handlerテストを更新し、既定・単一・複数・未割り当ての通知を検査する。
+`Ctrl+Shift+Alt+F13 / F14 / F15` の3割り当てでも、後ろのキーやリングで隠した通知が
+最初の `Ctrl+Shift+Alt+F13` だけを含むこと、表示時の通知なし・隠すたび1回を確認する。
+同じ3割り当てで、実App描画のフッターには全chordが残ることも確認する。
+`docs/keymap-spec.md` は通知のキーが最初の1つであると明記した。
+マニュアルの「もう一度表示するキーを短い通知で知らせます」は今回の動作と矛盾しないため変更なし。
+
+変更ファイルは上記の製品コード・テスト・キー仕様と本書の4ファイル。
+コミット・push・製品起動・`build-dev.ps1`・全件suiteは行っていない。
+
+検証（Windows、通常feature、同worktreeの未コミット差分）:
+
+| コマンド | 結果・証拠 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth/)'` | **179成功 / 0失敗**、exit 0。`target/depth-panel-1760-p2-tests.log`。上記の既存2テストの追加条件を含む |
+| `cargo fmt`（引数なし）、`git diff --check` | exit 0 |
+
+フッターの描画・レイアウト・既定表示とsnapshot fixtureは変更していないため、
+直前のsnapshot更新／通常比較3件成功・PNG2枚の目視結果は引き続き有効として再利用した。

@@ -109,6 +109,20 @@ pub struct MouseFollow {
     pub current: egui::Vec2,
     pub target: egui::Vec2,
 }
+/// Radius of the central, isotropic mouse-follow area, relative to the media short side.
+const MOUSE_FOLLOW_RADIUS: f32 = 0.25;
+
+pub(crate) fn focus_highlight_intensity(last: Option<Instant>, now: Instant) -> f32 {
+    last.map_or(0.0, |last| {
+        let elapsed = now.saturating_duration_since(last).as_secs_f32();
+        if elapsed <= 1.0 {
+            1.0
+        } else {
+            (1.0 - (elapsed - 1.0) / 0.3).max(0.0)
+        }
+    })
+}
+
 impl MouseFollow {
     /// Negate pointer displacement for the reference shader's inverse lookup
     /// (`source = pixel - offset * (depth - focus)`). Moving the pointer right/down
@@ -117,15 +131,17 @@ impl MouseFollow {
         &mut self,
         pointer: Option<egui::Pos2>,
         image: egui::Rect,
+        canvas: egui::Rect,
         over_panel: bool,
         strength: f32,
         dt: f32,
     ) -> bool {
         if !over_panel {
+            let radius = MOUSE_FOLLOW_RADIUS * canvas.width().min(canvas.height());
             self.target = pointer
-                .filter(|_| image.width() > 0.0 && image.height() > 0.0)
+                .filter(|_| radius > 0.0)
                 .map_or(egui::Vec2::ZERO, |p| {
-                    let n = (p - image.center()) / (image.size() * 0.5);
+                    let n = (p - image.center()) / radius;
                     -egui::vec2(n.x.clamp(-1.0, 1.0), 0.6 * n.y.clamp(-1.0, 1.0)) * strength
                 });
         }
@@ -278,6 +294,8 @@ pub(crate) struct DepthViewState {
     // Continuous pending presentation only; readiness/cancellation still belongs to source.
     pub wait_started_at: Instant,
     pub mouse: MouseFollow,
+    pub pending_focus_click: Option<(egui::Pos2, u64)>,
+    pub focus_highlight: Option<Instant>,
     pub source: DepthSourcePhase,
     pub lru: DepthLru,
     pub wait_reason: DepthSourceWait,
@@ -298,6 +316,8 @@ impl DepthViewState {
             started_at: now,
             wait_started_at: now,
             mouse: MouseFollow::default(),
+            pending_focus_click: None,
+            focus_highlight: None,
             source: DepthSourcePhase::WaitingForStableTexture,
             lru: DepthLru::default(),
             wait_reason: DepthSourceWait::TexturePending,
@@ -607,14 +627,45 @@ mod tests {
     fn mouse_panel_freeze_and_return_to_center() {
         let mut mouse = MouseFollow::default();
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100., 100.));
-        mouse.update(Some(egui::pos2(100., 100.)), rect, false, 0.02, 0.15);
+        mouse.update(Some(egui::pos2(100., 100.)), rect, rect, false, 0.02, 0.15);
         assert_eq!(mouse.target, egui::vec2(-0.02, -0.012));
         assert!(mouse.current.x < 0. && mouse.current.y < 0.);
         let target = mouse.target;
-        mouse.update(Some(rect.min), rect, true, 0.02, 0.15);
+        mouse.update(Some(rect.min), rect, rect, true, 0.02, 0.15);
         assert_eq!(mouse.target, target);
-        mouse.update(None, rect, false, 0.02, 0.15);
+        mouse.update(None, rect, rect, false, 0.02, 0.15);
         assert_eq!(mouse.target, egui::Vec2::ZERO);
+    }
+
+    #[test]
+    fn depth_mouse_uses_isotropic_media_radius_including_small_images_and_zero_canvas() {
+        let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920., 1080.));
+        let image = egui::Rect::from_center_size(egui::pos2(800., 500.), egui::vec2(80., 40.));
+        let mut mouse = MouseFollow::default();
+        for (delta, expected) in [
+            (egui::vec2(270., 0.), egui::vec2(-0.02, 0.)),
+            (egui::vec2(0., 270.), egui::vec2(0., -0.012)),
+            (egui::vec2(-540., -540.), egui::vec2(0.02, 0.012)),
+            (egui::vec2(135., 135.), egui::vec2(-0.01, -0.006)),
+        ] {
+            mouse.update(Some(image.center() + delta), image, canvas, false, 0.02, 1.);
+            assert!((mouse.target - expected).length() < 1e-6);
+        }
+        mouse.update(Some(image.max), image, egui::Rect::ZERO, false, 0.02, 1.);
+        assert_eq!(mouse.target, egui::Vec2::ZERO);
+    }
+
+    #[test]
+    fn depth_focus_highlight_holds_then_fades_without_wall_clock_waits() {
+        let start = Instant::now();
+        assert_eq!(focus_highlight_intensity(None, start), 0.);
+        for (seconds, expected) in [(0., 1.), (1., 1.), (1.15, 0.5), (1.3, 0.), (2., 0.)] {
+            let actual = focus_highlight_intensity(
+                Some(start),
+                start + std::time::Duration::from_secs_f32(seconds),
+            );
+            assert!((actual - expected).abs() < 1e-6, "{seconds}: {actual}");
+        }
     }
     #[test]
     fn settings_normalize_nonfinite_and_unknown() {

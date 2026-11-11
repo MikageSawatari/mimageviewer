@@ -25,6 +25,8 @@ pub(crate) use initial_placement::FsInitialPlacementRequest;
 #[cfg(test)]
 mod continuous_quality_tests;
 #[cfg(all(test, windows))]
+mod depth_focus_tests;
+#[cfg(all(test, windows))]
 mod depth_main_window_tests;
 #[cfg(test)]
 mod depth_tests;
@@ -19746,6 +19748,7 @@ enum FsCanvasClickAction {
     ToggleVideo(usize),
     DismissOverflow,
     PageSide(i32),
+    DepthFocusAt(egui::Pos2),
 }
 
 pub(crate) struct FullscreenRootFrameInput {
@@ -40490,6 +40493,9 @@ impl App {
         if top_bar_visible {
             touch_excluded.push(fullscreen_top_bar_rect(full_rect));
         }
+        if let Some(rect) = self.visible_depth_panel_rect(ctx) {
+            touch_excluded.push(rect);
+        }
         // Use the same frontmost surface captured for both pointer buttons. A popup
         // above overflow keeps its pre-existing touch handling instead of becoming overflow.
         touch_excluded.extend_from_slice(overflow_touch_excluded);
@@ -40976,6 +40982,11 @@ impl App {
             click_zoom,
             click_pan,
         );
+        // Input planning precedes source update and paint in both presentations.
+        // The proposal may be applied after paint when wheel navigation is mixed.
+        if let FsCanvasClickAction::DepthFocusAt(pos) = canvas_click {
+            self.plan_depth_focus_click(ctx, pos);
+        }
         let wheel_navigation_produced = accepted_wheel
             .iter()
             .any(|action| self.fs_wheel_action_requests_navigation(action));
@@ -41461,7 +41472,7 @@ impl App {
         // Click navigation is independent of transform ownership. Depth keeps
         // its saved 2D transform suspended while accepting ordinary page clicks.
         match canvas_click {
-            FsCanvasClickAction::None => {}
+            FsCanvasClickAction::None | FsCanvasClickAction::DepthFocusAt(_) => {}
             FsCanvasClickAction::ResetTransform => {
                 self.clear_fs_initial_placement_request();
                 self.fs_zoom = 1.0;
@@ -41640,7 +41651,37 @@ impl App {
         {
             return FsCanvasClickAction::None;
         }
-        let Some(pos) = response.interact_pointer_pos() else {
+        // Response position follows later pointer moves in the same batch. Keep
+        // both position and modifiers of the accepted release for a Depth focus.
+        let depth_focus_pos = if self.fs_exclusive_view.is_depth() {
+            _ctx.input(|input| {
+                input
+                    .events
+                    .iter()
+                    .filter_map(|event| match event {
+                        egui::Event::PointerButton {
+                            button,
+                            pressed: false,
+                            modifiers,
+                            ..
+                        } => Some((*button, *modifiers)),
+                        _ => None,
+                    })
+                    .zip(input.pointer.released_buttons_with_click_counts())
+                    .filter_map(|((button, modifiers), (_, click))| {
+                        (button == egui::PointerButton::Primary)
+                            .then_some(click)
+                            .flatten()
+                            .map(|(point, _)| (point, modifiers))
+                    })
+                    .last()
+                    .filter(|(_, modifiers)| modifiers.ctrl)
+                    .map(|(point, _)| point)
+            })
+        } else {
+            None
+        };
+        let Some(pos) = depth_focus_pos.or_else(|| response.interact_pointer_pos()) else {
             return FsCanvasClickAction::None;
         };
         let has_right_panel = self.metadata_panel_click_shown()
@@ -41658,14 +41699,56 @@ impl App {
         );
         if in_side_panel
             || (seek_panel_interactive && seek_geometry.panel_rect(full_rect).contains(pos))
+            || self
+                .visible_depth_panel_rect(_ctx)
+                .is_some_and(|rect| rect.contains(pos))
         {
             FsCanvasClickAction::None
+        } else if depth_focus_pos.is_some() {
+            FsCanvasClickAction::DepthFocusAt(pos)
         } else {
             FsCanvasClickAction::PageSide(fullscreen_click_nav_base_delta(
                 pos.x,
                 full_rect.center().x,
                 self.spread_mode.advances_right_to_left(),
             ))
+        }
+    }
+
+    fn visible_depth_panel_rect(&self, ctx: &egui::Context) -> Option<egui::Rect> {
+        match &self.fs_exclusive_view {
+            crate::fs_exclusive_view::FsExclusiveView::Depth(state) if state.panel_visible => {
+                ctx.data(|data| data.get_temp(egui::Id::unique("depth_panel_rect")))
+            }
+            _ => None,
+        }
+    }
+
+    fn plan_depth_focus_click(&mut self, ctx: &egui::Context, pos: egui::Pos2) {
+        use crate::depth_parallax::{DepthSourcePhase, DepthSourceWait};
+        if self
+            .fullscreen_idx
+            .is_some_and(|idx| self.original_preview_active(ctx, idx))
+        {
+            return;
+        }
+        let crate::fs_exclusive_view::FsExclusiveView::Depth(state) = &mut self.fs_exclusive_view
+        else {
+            return;
+        };
+        match state.source {
+            DepthSourcePhase::Failed { .. } => {}
+            DepthSourcePhase::WaitingForStableTexture
+                if state.wait_reason == DepthSourceWait::OriginalHold => {}
+            _ if state.ready().is_some() => {
+                state.pending_focus_click = Some((pos, ctx.cumulative_pass_nr()));
+            }
+            DepthSourcePhase::ReadingBack { .. }
+            | DepthSourcePhase::Estimating { .. }
+            | DepthSourcePhase::WaitingForStableTexture => {
+                self.show_feedback_toast("奥行きの計算が終わると使えます".into());
+            }
+            DepthSourcePhase::Ready { .. } => {}
         }
     }
 
@@ -44866,7 +44949,14 @@ impl App {
                 ));
             if matches!(layout_source, FsPageLayoutSource::CurrentItem)
                 && self.depth_view_may_continue(page_idx)
-                && self.try_paint_depth(&painter, ui.ctx(), resource, &transform, bg_style)
+                && self.try_paint_depth(
+                    &painter,
+                    ui.ctx(),
+                    resource,
+                    &transform,
+                    full_rect,
+                    bg_style,
+                )
             {
                 if let Some(submitted) = submitted {
                     submitted.pages.clear();
