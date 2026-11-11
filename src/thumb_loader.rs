@@ -19,6 +19,8 @@ mod auto_crop_scale_tests;
 mod catalog_provider;
 #[cfg(test)]
 mod cover_rotation_tests;
+#[cfg(test)]
+mod key_normalization_tests;
 pub(crate) use catalog_provider::{ParentObservedStamp, ParentRow, RequestCatalog};
 pub use catalog_provider::{ThumbnailCatalogProvider, ThumbnailSaveTarget};
 
@@ -381,32 +383,52 @@ pub(crate) fn representative_cache_key_for_policy_with_auto(
     if !is_representative_cache_key(key) {
         return key.to_owned();
     }
-    let split = key
-        .find(CACHE_KEY_PIN_SUFFIX)
-        .unwrap_or_else(|| key.find("|generation:").unwrap_or(key.len()));
-    let (base, tail) = key.split_at(split);
-    // Only a contiguous derived suffix belongs to the policy. A pipe inside a ZIP
-    // directory name may delimit the same text without being cache metadata.
-    let mut base = base;
-    while let Some((prefix, part)) = base.rsplit_once('|') {
-        let derived = part.strip_prefix("types:").is_some_and(|fingerprint| {
-            fingerprint.len() == 16 && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
-        }) || matches!(part, "autocrop:v1:rtl" | "autocrop:v1:ltr");
-        if !derived {
-            break;
-        }
-        base = prefix;
-    }
-    let mut normalized = base.to_owned();
-    if !policy.is_all_visible() {
-        normalized.push_str(&format!("|types:{:016x}", policy.fingerprint()));
-    }
+    // The builder emits exactly one auto token immediately before the first
+    // #pin:, or at the end of an unpinned key. In particular, |generation: is
+    // not a delimiter here: it can be literal ZIP name text, and the released
+    // policy function treats an unpinned generation as part of its base.
+    let split = key.find(CACHE_KEY_PIN_SUFFIX).unwrap_or(key.len());
+    let (base, pin) = key.split_at(split);
+    let without_auto = base
+        .strip_suffix("|autocrop:v1:rtl")
+        .or_else(|| base.strip_suffix("|autocrop:v1:ltr"))
+        .map(|base| format!("{base}{pin}"));
+    let mut normalized = released_representative_cache_key_for_policy(
+        without_auto.as_deref().unwrap_or(key),
+        policy,
+    );
     if let Some(auto) = auto {
-        normalized.push_str("|autocrop:");
-        normalized.push_str(auto.suffix());
+        let split = normalized
+            .find(CACHE_KEY_PIN_SUFFIX)
+            .unwrap_or(normalized.len());
+        normalized.insert_str(split, &format!("|autocrop:{}", auto.suffix()));
     }
-    normalized.push_str(tail);
     normalized
+}
+
+// Keep the released (c4e92e5df) policy algorithm intact. Auto normalization is
+// deliberately a separate step so arbitrary ZIP names retain its exact spelling.
+fn released_representative_cache_key_for_policy(
+    key: &str,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
+) -> String {
+    if !is_representative_cache_key(key) {
+        return key.to_owned();
+    }
+    let split = key.find(CACHE_KEY_PIN_SUFFIX).unwrap_or(key.len());
+    let (base, pin) = key.split_at(split);
+    let base = base
+        .rsplit_once("|types:")
+        .filter(|(_, fingerprint)| {
+            fingerprint.len() == 16 && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .map_or(base, |(base, _)| base);
+    if policy.is_all_visible() {
+        format!("{base}{pin}")
+    } else {
+        let suffix = format!("|types:{:016x}", policy.fingerprint());
+        format!("{base}{suffix}{pin}")
+    }
 }
 
 pub fn resolved_pin_allowed(
@@ -3407,7 +3429,7 @@ fn process_load_request_with_provider(
         if let Some(fallback) = req.epub_pin_fallback.as_deref() {
             let mut fallback = fallback.clone();
             fallback.inherit_request_identity_from(req);
-            if req.cover_crop.is_none() {
+            if req.cover_crop.is_none() && req.auto_cover_crop.is_some() {
                 fallback.cache_key_override = req.cache_key_override.clone();
                 fallback.auto_cover_crop = req.auto_cover_crop;
             }
@@ -7623,6 +7645,60 @@ mod tests {
     }
 
     #[test]
+    fn cover_auto_epub_fallback_off_keeps_stage_one_base_row() {
+        let data = crate::data_dir::TestDataDirGuard::new();
+        for enabled in [false, true] {
+            let root = data.path().join(if enabled { "on" } else { "off" });
+            std::fs::create_dir_all(&root).unwrap();
+            image::RgbImage::from_pixel(12, 8, image::Rgb([30_u8, 80, 170]))
+                .save(root.join("cover.png"))
+                .unwrap();
+            let epub = root.join("updated.epub");
+            std::fs::write(&epub, b"no converted generation").unwrap();
+            let base =
+                folder_thumb_auto_cache_key_for_path(&root, false, SortOrder::Numeric, 3).unwrap();
+            let fallback = LoadRequest {
+                path: root.clone(),
+                cache_key_override: Some(base.clone()),
+                folder_thumb_sort: Some(SortOrder::Numeric),
+                folder_thumb_depth: 3,
+                folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+                source_policy: LoadSourcePolicy::SourceOnly,
+                force_cache: true,
+                ..Default::default()
+            };
+            let mut request = LoadRequest {
+                path: epub,
+                pdf_page: Some(0),
+                pdf_stamp_policy: PdfStampPolicy::ResolveInWorker,
+                cache_key_override: Some("folderthumb:root#pin:pdf|updated.epub||0|1|2".into()),
+                source_policy: LoadSourcePolicy::SourceOnly,
+                force_cache: true,
+                epub_pin_fallback: Some(Box::new(fallback)),
+                ..Default::default()
+            };
+            request.set_auto_cover_crop(enabled.then(|| {
+                crate::cover_auto_crop::AutoCropIdentity::new(
+                    crate::settings::ReadingDirection::Rtl,
+                )
+            }));
+            let pinned = cache_key_for_request(&request).unwrap().into_owned();
+            let catalog = Arc::new(
+                crate::catalog::CatalogDb::open(&data.path().join("cache"), &root).unwrap(),
+            );
+            let messages = run_cover_crop_request(&mut request, &catalog, None);
+            assert!(messages.iter().any(|message| message.pixels().is_some()));
+            let saved = if enabled { &pinned } else { &base };
+            let absent = if enabled { &base } else { &pinned };
+            assert_eq!(
+                catalog.load_one(saved).unwrap().unwrap().source_dims,
+                Some((12, 8))
+            );
+            assert!(catalog.load_one(absent).unwrap().is_none());
+        }
+    }
+
+    #[test]
     fn epub_fallback_worker_uses_outer_request_correlation_and_completes_once() {
         let pdf_owner = crate::pdf_loader::PdfRenderEpochOwner::fresh();
         let tmp = TempDir::new().unwrap();
@@ -10240,9 +10316,7 @@ mod tests {
             assert_eq!(representative_cache_key_for_policy(key, &visible), key);
         }
         let tail = "#pin:image|cover.jpg|||crop:0,0,500000,1000000|7|9|generation:17:4096";
-        let dirty = format!(
-            "zipthumb:a.zip|types:0000000000000001|autocrop:v1:rtl|types:0000000000000002|autocrop:v1:ltr{tail}"
-        );
+        let dirty = format!("zipthumb:a.zip|types:0000000000000002|autocrop:v1:ltr{tail}");
         let expected = format!("zipthumb:a.zip|types:{:016x}{tail}", policy.fingerprint());
         assert_eq!(
             representative_cache_key_for_policy(&dirty, &policy),
@@ -10262,7 +10336,7 @@ mod tests {
                 &policy
             ),
             format!(
-                "pdfthumb:a.epub|types:{:016x}|generation:17:4096",
+                "pdfthumb:a.epub|autocrop:v1:rtl|generation:17:4096|types:{:016x}",
                 policy.fingerprint()
             )
         );

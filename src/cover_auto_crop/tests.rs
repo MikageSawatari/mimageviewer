@@ -2,7 +2,7 @@ use super::*;
 use image::Rgb;
 
 #[test]
-fn analysis_area_average_suppresses_row_noise_without_broadening_columns() {
+fn native_analysis_raster_preserves_pixels_without_smoothing_either_axis() {
     let image = RgbImage::from_fn(8, 256, |x, y| {
         Rgb([
             if x < 4 { 30 } else { 200 },
@@ -10,19 +10,135 @@ fn analysis_area_average_suppresses_row_noise_without_broadening_columns() {
             80,
         ])
     });
-    let raster = analysis_raster(&DynamicImage::ImageRgb8(image));
+    let raster = analysis_raster(&DynamicImage::ImageRgb8(image.clone()));
     assert_eq!(raster.dimensions(), (8, 256));
-    for (x, y, pixel) in raster.enumerate_pixels() {
-        assert_eq!(pixel[0], if x < 4 { 30 } else { 200 });
-        assert_eq!(
-            pixel[1],
-            match y {
-                127 | 129 => 64,
-                128 => 128,
-                _ => 0,
+    assert_eq!(raster, image);
+}
+
+#[test]
+fn analysis_area_average_integrates_only_the_output_pixel_area() {
+    let source = RgbImage::from_fn(16, 512, |x, y| {
+        Rgb([if x % 2 == 0 { 40 } else { 80 }, (y % 4) as u8 * 60, 90])
+    });
+    let raster = analysis_raster(&DynamicImage::ImageRgb8(source));
+    assert_eq!(raster.dimensions(), (8, 256));
+    for (_, y, pixel) in raster.enumerate_pixels() {
+        assert_eq!(*pixel, Rgb([60, if y % 2 == 0 { 30 } else { 150 }, 90]));
+    }
+}
+
+/// Three broad colored bands can look like flap/front/back geometry, but have
+/// no spine and no flat face. The nearly isoluminant hue changes every sixteen
+/// rows; the fine print texture supplies real luminance variance within them.
+fn textured_art(texture: usize, binding: ReadingDirection) -> RgbImage {
+    RgbImage::from_fn(300, 256, |x, y| {
+        let x = if binding == ReadingDirection::Ltr {
+            299 - x
+        } else {
+            x
+        };
+        let base = match x {
+            0..70 => [130i32, 90, 170],
+            70..249 => [75, 75, 200],
+            _ => [150, 130, 150],
+        };
+        let hue = if (y / 16) % 2 == 0 { -1 } else { 1 };
+        let (tone, jitter) = match texture {
+            // A native 256-row counterexample to the old [1/4,1/2,1/4]
+            // vertical filter: std ~30 becomes ~1.4, manufacturing a flat face.
+            0 => (if y % 2 == 0 { -30 } else { 30 }, 0),
+            // Fine halftone dots. Only alternate rows contain horizontal edges,
+            // so the texture itself is not a full-height panel boundary.
+            1 => (if y % 2 == 0 && x % 2 == 0 { 30 } else { -30 }, 0),
+            // Deterministic row noise with small independent pixel variation;
+            // adjacent noise pixels remain below the panel-edge threshold.
+            _ => {
+                let row = y.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let pixel = row ^ x.wrapping_mul(2_654_435_761);
+                (
+                    if row & 0x100 == 0 { -30 } else { 30 },
+                    (pixel % 9) as i32 - 4,
+                )
             }
+        };
+        let shift = [40 * hue, -20 * hue, 0];
+        Rgb(std::array::from_fn(|c| {
+            (base[c] + shift[c] + tone + jitter) as u8
+        }))
+    })
+}
+
+#[test]
+fn native_analysis_preserves_ink_variance_colorfulness_and_panel_strength() {
+    let image = textured_art(0, ReadingDirection::Rtl);
+    let raster = analysis_raster(&DynamicImage::ImageRgb8(image.clone()));
+    assert_eq!(raster, image);
+    let native = Raster::from_image(&image);
+    let analysis = Raster::from_image(&raster);
+    assert_eq!(panel_edges(&analysis), panel_edges(&native));
+    assert_eq!(panel_edges(&analysis), vec![0, 67, 73, 246, 252, 300]);
+    let native_features = Features::new(&native);
+    let analysis_features = Features::new(&analysis);
+    for (left, right) in [(0, 67), (67, 73), (73, 246), (246, 252), (252, 300)] {
+        assert_eq!(
+            analysis_features.ink(left, right),
+            native_features.ink(left, right)
         );
-        assert_eq!(pixel[2], 80);
+        assert_eq!(
+            analysis_features.score(left, right),
+            native_features.score(left, right)
+        );
+        assert!(!analysis_features.flat(left, right));
+        let columns = &analysis_features.columns[left..right];
+        let count = ((right - left) * analysis.height) as f64;
+        let mean = columns.iter().map(|c| c.lum).sum::<f64>() / count;
+        let std = (columns.iter().map(|c| c.lum2).sum::<f64>() / count - mean * mean).sqrt();
+        assert!(std >= 29.9, "panel {left}..{right}: std={std}");
+    }
+}
+
+#[test]
+fn smoothing_native_rows_would_manufacture_an_accepted_front_cover() {
+    let image = textured_art(0, ReadingDirection::Rtl);
+    let smoothed = RgbImage::from_fn(image.width(), image.height(), |x, y| {
+        Rgb(std::array::from_fn(|c| {
+            (0.25 * f64::from(image.get_pixel(x, y.saturating_sub(1))[c])
+                + 0.5 * f64::from(image.get_pixel(x, y)[c])
+                + 0.25 * f64::from(image.get_pixel(x, (y + 1).min(image.height() - 1))[c]))
+            .round() as u8
+        }))
+    });
+    assert_eq!(
+        cover_auto_crop(
+            &smoothed,
+            image.dimensions(),
+            Some(0.7),
+            ReadingDirection::Rtl
+        )
+        .expect("the old kernel manufactures flat panels and accepts this art")
+        .values(),
+        [223_333, 0, 820_000, 1_000_000]
+    );
+    let raster = analysis_raster(&DynamicImage::ImageRgb8(image));
+    assert_eq!(
+        cover_auto_crop(&raster, (300, 256), Some(0.7), ReadingDirection::Rtl),
+        Err(AutoCropDecline::NoJacketEvidence)
+    );
+}
+
+#[test]
+fn fine_stripes_halftone_and_noise_do_not_manufacture_jacket_evidence() {
+    for binding in [ReadingDirection::Rtl, ReadingDirection::Ltr] {
+        for texture in 0..3 {
+            let image = textured_art(texture, binding);
+            let dims = image.dimensions();
+            let raster = analysis_raster(&DynamicImage::ImageRgb8(image));
+            assert_eq!(
+                cover_auto_crop(&raster, dims, Some(0.7), binding),
+                Err(AutoCropDecline::NoJacketEvidence),
+                "{binding:?}, texture={texture}"
+            );
+        }
     }
 }
 
@@ -237,7 +353,8 @@ fn gates_and_identity_are_explicit() {
 #[test]
 fn content_margin_tolerates_sparse_dust_and_remains_asymmetric() {
     let (image, _) = jacket(ReadingDirection::Rtl, true, false, true);
-    let bounds = content_bounds(&Raster::from_image(&image));
+    let raster = Raster::from_image(&image);
+    let bounds = content_bounds(&raster, |x, y| raster.get(x, y));
     assert_eq!(
         bounds,
         [

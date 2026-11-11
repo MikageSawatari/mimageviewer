@@ -6257,25 +6257,40 @@ fn insert_folder_pin(
             Some("代表サムネの範囲を適用できない画像のため、範囲だけをスキップしました".to_owned()),
         ),
     };
-    tx.prepare_cached(
-        "INSERT INTO folder_pin.folder_thumb_pins
-                (container_key, source_kind, source_rel, source_entry, source_page,
-                 cover_crop_x0, cover_crop_y0, cover_crop_x1, cover_crop_y1, cover_crop_source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    let columns = [
+        "container_key",
+        "source_kind",
+        "source_rel",
+        "source_entry",
+        "source_page",
+        "cover_crop_x0",
+        "cover_crop_y0",
+        "cover_crop_x1",
+        "cover_crop_y1",
+        "cover_crop_source",
+    ]
+    .map(str::to_owned);
+    use rusqlite::types::Value;
+    let values = [
+        Value::Text(key.into()),
+        Value::Text(pin.source_kind.clone()),
+        Value::Text(pin.source_rel.clone()),
+        pin.source_entry.clone().map_or(Value::Null, Value::Text),
+        pin.source_page
+            .map_or(Value::Null, |page| Value::Integer(i64::from(page))),
+        crop.map_or(Value::Null, |c| Value::Integer(i64::from(c.values()[0]))),
+        crop.map_or(Value::Null, |c| Value::Integer(i64::from(c.values()[1]))),
+        crop.map_or(Value::Null, |c| Value::Integer(i64::from(c.values()[2]))),
+        crop.map_or(Value::Null, |c| Value::Integer(i64::from(c.values()[3]))),
+        crop.map_or(Value::Null, |_| Value::Text(source.cover_crop_binding())),
+    ];
+    crate::folder_thumb_pins::write_pin_values(
+        tx,
+        "folder_pin.folder_thumb_pins",
+        &columns,
+        &values,
+        crate::folder_thumb_pins::PinRowWrite::Insert,
     )
-    .map_err(db_error)?
-    .execute(params![
-        key,
-        pin.source_kind,
-        pin.source_rel,
-        pin.source_entry,
-        pin.source_page,
-        crop.map(|c| c.values()[0]),
-        crop.map(|c| c.values()[1]),
-        crop.map(|c| c.values()[2]),
-        crop.map(|c| c.values()[3]),
-        crop.map(|_| source.cover_crop_binding()),
-    ])
     .map_err(db_error)?;
     if let Some(reason) = &skipped {
         crate::logger::log(format!("metadata import: {key}: {reason}"));

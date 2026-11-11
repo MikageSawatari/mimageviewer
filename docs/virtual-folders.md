@@ -1108,14 +1108,16 @@ worker を再起動しない。archive 候補が desired scope から外れて s
 IMMEDIATE transaction 内で列を調べ、欠けた列だけを追加する。readonly は旧 schema を範囲なしで読む。
 単一 decoder で座標・leaf 資格・束縛を検査し、不正な範囲はログを出して無視するがピンは保持する。
 読み取りは `FolderPin { source, cover_crop }`。通常の `set` は範囲を消し、
-`set_with_cover_crop` は leaf と範囲を一度に UPSERT、`clear_cover_crop` は固定を残す。
+`set_with_cover_crop` は同一transaction内でsourceをUPSERTし、範囲と束縛を別UPDATEで書く。
+source変更triggerは常に範囲を消すため、この順序を改名・コピー・取り込みでも共用する。`clear_cover_crop` は固定を残す。
 同じ leaf の名前変更・ZIP キー移行・画像フォルダの ZIP 化は、変更前に有効だった範囲だけを再束縛する。
 metadata bundle は v13 に範囲を追加し、v7〜v12 の取り込みを維持する。書き出しも decoder を通す。
 直接 leaf の範囲あり identity は `kind|rel|entry|page|crop:x0,y0,x1,y1|mtime|size`。
 直接の ZipDir/ZipEntry は `zipdir:{prefix}#pin:{entry}|crop:x0,y0,x1,y1`。
 cascade は leaf の範囲を route hash に含める。範囲なしの綴りは変更しない。
 キー生成と要求設定は `ResolvedPinTarget` の helper へ統一し、ドライブの近似では範囲を含めない。
-基本キーの正規化は `|types:`・`|autocrop:` を除去して設定を付け直し、pin と EPUB generation を保持する。
+基本キーの種類設定はmasterの処理を保ち、最初の`#pin:`より前の末尾の16桁hex `|types:`を1つだけ付け直す。
+自動はその区切りの直前（固定なしならキー末尾）にある完全一致トークンだけを外して付け直す。`|generation:`は区切らない。
 自動切り出しは `thumb_cover_auto_crop`（既定 OFF）と既定の綴じ方向をキーに反映する。
 基本キーの `|types:` の後、`#pin:` より前に `|autocrop:v1:rtl` / `|autocrop:v1:ltr` を付ける。
 手動範囲・ページ一覧・仮想フォルダの seed/writeback・ドライブ・Remote には付けない。

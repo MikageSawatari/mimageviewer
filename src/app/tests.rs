@@ -49797,7 +49797,7 @@ mod favorite_adjustment_defaults_tests {
 
         assert_eq!(req.path, zip_path);
         assert_eq!(req.zip_entry.as_deref(), Some("bookA/ch02/page01.jpg"));
-        assert_eq!(req.zip_dir_prefix, None);
+        assert_eq!(req.zip_dir_prefix.as_deref(), Some("bookA/"));
         assert_eq!(req.resolve_override, None);
         assert_eq!(
             req.edit_preview_key.as_deref(),

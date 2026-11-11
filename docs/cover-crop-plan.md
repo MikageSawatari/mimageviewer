@@ -96,10 +96,12 @@ pub(crate) struct CoverCrop { x0: u32, y0: u32, x1: u32, y1: u32 }
   ピンは有効のまま (行は書き換えない)。
   - 旧版が `set` で別の画像へ固定し直しても、束縛が一致しないので古い範囲は当たらない (r1 指摘 6)。
   - 旧版の名前変更 (`source_rel` だけを書き換える) の後も束縛が外れて範囲なしになる (範囲は失われる側に倒れる)。
-- 同じ IMMEDIATE transaction 内に source 4 列の `AFTER UPDATE` trigger も冪等に追加する。source が実際に変わり、
-  束縛列が旧値のままなら範囲の 5 列を NULL にする。decoder の不一致検査だけでは旧版の a→b→a で範囲が復活するため、
-  旧版が参照先を変えた時点で消す。新版が source と新しい束縛・範囲を同時に書く場合、および container key だけの名前変更は保つ。
-  trigger 内の範囲消去でも既存の revision trigger が進むが、revision は変更の検出用なので増分が 2 になってもよい。
+- 同じ IMMEDIATE transaction 内に source 4 列の `AFTER UPDATE` trigger も冪等に追加する。
+  source が実際に変わったら、束縛列の値に関係なく範囲の5列をNULLにする。旧版のa→b→aで範囲を復活させず、
+  開発版の古い不一致行が新しい保存を誤って消すことも防ぐ。未リリースの旧trigger定義はDROP＋CREATEで置き換える。
+  新版のset・改名・ZIPキー移行・画像フォルダZIP化・metadata取り込みは、同一transaction内でsourceを先に書き、
+  decoderで検証済みの範囲と新しい束縛を別UPDATEで後から書く。後者はsource列を触らずtriggerを再発火しない。
+  container keyだけの名前変更では範囲を保つ。revision triggerの追加増分は変更検出用のtokenとして許容する。
 - 読み取り専用の open (`open_readonly`) は schema を作らない。列の無い DB では範囲なしとして読む (catalog の layout 列と同じ方式)。
 - 別プロセス (mIV Remote) の `open` も同じ `init_schema` を通る (同じ版の exe。列の追加が重なっても IMMEDIATE で直列化される)。
 
@@ -108,7 +110,7 @@ pub(crate) struct CoverCrop { x0: u32, y0: u32, x1: u32, y1: u32 }
 | 書き手 | 範囲の扱い |
 | --- | --- |
 | `FolderThumbPinDb::set(container, source)` (既存の「固定」) | 範囲と束縛を NULL にする (同じ画像の固定し直しでも消す) |
-| 新 `set_with_cover_crop(container, source, Option<CoverCrop>)` | ピン・範囲・束縛を 1 回の UPSERT で書く。source が leaf でない・RAW・動画なら拒否 |
+| 新 `set_with_cover_crop(container, source, Option<CoverCrop>)` | 同一transaction内でsourceをUPSERTし、範囲・束縛を別UPDATEで書く。source が leaf でない・RAW・動画なら拒否 |
 | 新 `clear_cover_crop(container)` | 範囲と束縛だけ NULL。ピンは残す |
 | `remove(container)` | 行ごと削除 |
 | `rename_key_migration` の `source_rel` 付け替え、`zip_key_migration` の `source_entry` 付け替え・行の移し替え、`image_folder_zip_metadata` の行の写し替え | 同じ leaf の名前変更。**付け替え前に `decode_cover_crop` で有効だった範囲だけ**、束縛列を新しい source に付け替えて保つ。無効だった範囲は NULL にする (r2 指摘 4) |
@@ -150,9 +152,15 @@ pub(crate) struct CoverCrop { x0: u32, y0: u32, x1: u32, y1: u32 }
   - 固定した本: `zipthumb:a.zip|types:…|autocrop:v1:rtl#pin:{source_id}` (EPUB は末尾に `|generation:m:s`)
   - フォルダの自動代表: `folderthumb:auto-v3:…|autocrop:v1:rtl` (K2 の流用で子の自動の結果を含み得るので、フォルダの key にも付ける)
   - 範囲付きのピン・ドライブ一覧・Remote の key には付けない。
-- 基本 key 側の正規化は 1 つの関数 (今の `representative_cache_key_for_policy` を広げる) が行い、既存の `|types:` と `|autocrop:` を
-  外してから付け直す (冪等。r2 指摘 8)。ページの key と、仮想フォルダの seed / writeback に使う基本 key には付けない。
-  除去するのは基本key末尾に連続する `types:` の16桁hexと `autocrop:v1:rtl` / `autocrop:v1:ltr` の完全一致だけで、ZIP内名の途中の同名断片や未知の版は保持する。
+- 正規化はmaster (`c4e92e5df`) の処理をそのまま基礎にする。区切りは最初の `#pin:` だけで、
+  その前（固定なしならキー全体）末尾の16桁hexの `|types:` を1つだけ外して、現在の種類設定を付け直す。
+  `|generation:` は区切りにしない。固定なしの `pdfthumb:a.epub|generation:m:s` の種類設定ありの綴りは、
+  masterと同じ `pdfthumb:a.epub|generation:m:s|types:…`。固定ありでは従来どおりgenerationはpin側の末尾にある。
+  自動はこの処理と分け、最初の `#pin:` の直前、固定なしではキー末尾に `|autocrop:v1:{rtl|ltr}` を1つだけ置く。
+  その正確な位置にある完全一致トークンだけを先に外してからmasterの処理を通すため、通常のbuilder出力では冪等で、
+  自動の追加・解除が往復する。ZIP内名の途中の `autocrop` / `generation`、未知の版、複数の `types:` はmasterの解釈を保つ。
+  例: 固定なしgeneration付きの自動キーは `pdfthumb:a.epub|generation:m:s|types:…|autocrop:v1:rtl`。
+  ページのkeyと仮想フォルダのseed/writebackには自動を付けない。
 - 存続集合 (`delete_missing`): 今の key に加えて、表示中の設定の自動 identity 付きの key を入れる。ZIP の一覧の存続集合
   (`tree.all_cache_keys()` 由来、app.rs:39914) には、**ピンなしの ZipDir の自動 identity 付きの key** も明示して足す。
 - 前方一致で行を探す経路 (ドライブ一覧の `drive_list_pinned_cache_key_prefix`、Folder 種の最新行) は、残りが `crop:` で始まる行と
@@ -184,9 +192,10 @@ pub(crate) struct CoverCrop { x0: u32, y0: u32, x1: u32, y1: u32 }
   - cache-only の読み手 (ドライブ向けの確定読取 thumb_loader.rs:2756 / :2778、子の代表の流用 :5082) は範囲付きの key を完全一致で読み、
     代替の行を探さない。その間、親の自動代表は子の流用をやめて通常の探索に戻り、ドライブ一覧は範囲を見ない (§5.1)。
     誤った画素は出さず、親の表示が子の代替表示と揃わないことだけを受け入れる (除外設定 + 範囲付きピンの組み合わせに限る)。
-  - **手動の範囲が無い要求 (自動の identity だけ付いた要求) の代替要求は、自動の指示を保ったまま、今と同じく元の pinned key で保存する**
+  - **`auto_cover_crop`がSomeで手動の範囲が無い要求の代替要求は、自動の指示を保ったまま元のpinned keyで保存する**
     (r3 指摘 2)。同じ設定で代替の表紙を判定するので K3 を満たし、子の本の行を pinned key で探す既存の読み手もそのまま見つけられる。
-    手動の範囲の key は代替要求に引き継がない (上の規則のまま)。
+    手動の範囲のkeyは代替要求に引き継がない。自動OFFのEPUB読めず代替は第1段どおり代替自身の基本keyへ保存し、
+    自動OFFの種類除外代替はリリース済みの元pinned keyへの保存を保つ。
 
 ### 6.2 切り出しの位置と解像度
 
@@ -199,6 +208,9 @@ pub(crate) struct CoverCrop { x0: u32, y0: u32, x1: u32, y1: u32 }
 - **自動** (r2 指摘 10): (1) 今と同じ目標でデコードする。(2) そこから**高さ 256 の解析用 raster** を作って判定する (デコード倍率に
   よらず判定の入力をそろえる)。(3) 切ると判定し、範囲の長辺が `display_px` に足りない場合だけ、**同じ bytes / 同じ PDF の lease から
   手動と同じ目標で 1 回だけデコードし直す**。デコードは最大 2 回。
+  判定の印刷密度・輝度分散・色の豊かさ・境界強度へ追加の平滑化を掛けない。高さ256のnative入力の細かなtextureを保ち、
+  縮小は出力1画素分の面積平均を使う。孤立した埃による余白位置の揺れだけを、行方向3タップの参照値で抑える。
+  その座標で切り出した元画素から境界の強さと全特徴量を計算し、判定用統計を平滑化した値で置き換えない。
 - 返す寸法: `source_dims` = `CoverCrop::pixel_bounds(元寸法)` の幅・高さ、`layout_dims` = `None`。catalog の行にも同じ値を保存する。
 - 表紙 identity (§1.718): `CoverIdentity::Page(leaf のページキー)` のまま。回転前に切った画素が描画時に回るので表示と一致する。
 - 見開きの寸法記録 (`record_*_dims_for_spread`) には、切った結果の寸法を渡さない (ページの寸法ではない)。
@@ -386,6 +398,8 @@ ZipPlaFork (commit 07955f52、**AGPL v3**) の公開コードを読んだ結果�
   - **ZIP・変換アーカイブの変換 ZIP (ネストでない entry)**: 既存の entry の先頭部分読み (zip_loader.rs:3087) で最大 256 KB を読み、
     `probe_image_dims_from_bytes` で寸法を得る (EXIF の向き 5〜8 はこの関数が既に入れ替える)。上限は 8 × 256 KB。
   - **ネスト ZIP の中のページ・直接読む RAR**: 部分読みが無い (途中の ZIP を展開する / entry 全体を返す) ので**先読みせず切らない**。
+  - **ZipDir**: 代表entryを直接読む要求も含め、共通App builderが`LoadRequest.zip_dir_prefix`を設定し、このscope内だけで前後を選ぶ。
+    範囲画面は解決後の同じ要求のprefixを受け取り、外側ZIP全体や独自のprefixへ置き換えない。
   - **PDF・EPUB (変換済み PDF)**: PDF ワーカーの `PageSizes` 要求 (ページを読み込まずに全ページの寸法を返す既存の要求、pdf_loader.rs:2718)。
     ページ数に比例するが render 1 枚より軽いと記録されている。代表の render と同じパスワード (`None` は通常の PDF の指定)・同じ EPUB の `ReadTarget` lease を渡し、
     変換・パスワードの問い合わせは起こさない。パスワードが必要なのに得られていない場合は切らない (r3 指摘 5)。
@@ -622,6 +636,8 @@ ZipPlaのコードは参照しない。ディレクトリ評価・独立レビ�
   §6.2に従って小画像も256へ拡大する。cubicでは低解像度で約3列揺れたため、§12.7に従って正規化を修正した。
   横の背境界を太らせずに縦方向の単発ノイズを平均し、判定しきい値を変えずに、倍率間の境界の安定性を合成・実JPEG DCTテストで確認する。
   100:1を超える細片は、縦長1面が最小1%の幅を持てないため解析を辞退し、拡大による過大な作業領域を作らない。
+  **追記**: 上記の縦2画素幅は初回実装の判断。細textureを平らな面へ変える独立レビュー指摘で撤回し、
+  判定統計を保持する方式へ修正した（§17）。
 - ZIPの通常列挙は入れ子を展開し得るので、先読みは中央目次だけを調べる限定helperを使う。
   既存と同じ名前解決とprefix読取で、同じハンドルから最大8回×256KiBを読む。全entry読取へのfallbackは持たない。
   読む順の次、末尾だけ前を選び、portrait比率と中央値の合意を調べる。PDF/EPUBは同じpasswordとReadTargetでPageSizesを使う。
@@ -689,3 +705,69 @@ cargo nextest run -p mimageviewer --lib -E 'test(/cover_auto|auto_cover_crop|aut
   `python scripts/check_ui_glyphs.py`は0件、`python scripts/check_site_cards.py`は53枚・超過0。
 - 指示どおりコミット・確認用build・製品起動・外部ディレクトリ評価・追加の独立レビューは行っていない。
   設計担当は§16.2の評価、別コンテキストの独立レビューと確認用buildを実行する。
+
+## 17. 第1段確認・第2段独立レビューの5件修正（基点 `995f75f63`）
+
+- keyの基礎処理はmasterの関数を保持し、自動トークンの除去・追加だけを正確なbuilder位置で分離した（§5.2）。
+  test moduleへmaster関数をoracleとしてコピーし、ZIP内名・複数types・generation・pinの有無を両policyで比較する。
+  実builderの固定／ZipDir／EPUB generation／フォルダ出力では、冪等性・自動の往復・policy切替も検査する。
+- crop消去triggerはsource値の変更だけを条件にする。新しい保存・コピー・改名・ZIP移行・取り込みは共通helperで
+  同一transactionのsource→crop＋束縛の2段に統一した。古い不一致行からの新規保存、旧版a→b→a、
+  改名・移行・container keyだけの変更、旧開発triggerの置換と再openの冪等性を検査する。
+- EPUB読めずの代替で元のpinned keyを継承するのは自動Some・手動なしだけ。OFFは第1段の代替基本行へ保存する。
+  workerから実保存し、OFF/ONそれぞれの行と、誤った別キーの行がないことを検査する。
+- 判定rasterの縦2画素幅平滑化を撤回した。300×256、幅70/179/51の3色帯、行ごとの輝度±30と16行ごとの色相変化では、
+  旧平滑化で広い面の輝度stdが約30.001から約1.361へ落ち、存在しない平らな面を作っていた。
+  反例のRGB値は未提示だったため、同じ寸法・textureと旧処理の解析範囲67..246を再現する生成fixtureを作った。
+  旧kernelの入力では切り出しを受理し、nativeの未平滑入力では`NoJacketEvidence`になることを同じ純粋関数で確認する。
+  native256の画素・印刷密度・分散・色の点数・境界強度を保持する回帰と、細縞／網点／ノイズの両綴じ方向の拒否を追加した。
+  面積平均だけでは低解像度間で約5列の揺れが残った。原因は256行の入力だけで埃が余白の除去を早く止め、
+  高さと境界のsupport順位を変えることだった。余白座標の参照だけに3タップを使い、元画素の特徴量を保った。
+  小型Rust検証13件は成功、128/256/512/1024行の最大差は約1.00037列。実DCT倍率と元の余白座標のテストも通し、
+  許容値1.1列は広げていない。外部評価は生成sheetを開かず、集計だけを確認する。
+- 通常ZipDirのdirect entry・直接pin・cascadeに共通の要求baseからsampling prefixを渡す。
+  範囲画面も解決済み要求の同じprefixを使う。Aの最後のページの後に比率の違うBがあるZIPで、
+  実App要求→samplerと画面用resolverの両方がAの比率を得ることを検査する。
+
+検証は指定の共有`run-heavy.ps1`、owner=`764-codex`を通し、Cargo build/test/checkを同時実行しない。
+追加のコミット・確認用build・製品起動・独立レビューは行わず、設計担当へ作業ツリーを渡す。
+
+### 17.1 検証記録
+
+対象は`995f75f63`からの未コミット差分。既定features・通常test profile、共有runnerのsandbox fallbackでは
+BelowNormal・`CARGO_BUILD_JOBS=6`、`CMAKE_BUILD_PARALLEL_LEVEL=1`。他セッションの全件ロック待ちも同じrunnerに従った。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local\miv-locks\run-heavy.ps1 -Owner '764-codex' -WorkDir G:\home\mimageviewer-764 -Command "cargo nextest run -p mimageviewer --lib -E 'test(/cover_auto|auto_cover_crop|auto_crop_scale_tests|thumb_cover_auto_crop|cover_crop|representative_cache_key|folder_thumb_pin|book_cover|caption_rotation|cover_rotation_tests|cover_scope_tests|drive_list_pin|color_representative|collection_container_pin|metadata_transfer|zip_key_migration|rename_key_migration|image_folder_zip_metadata|zipdir_thumb_request/)' --no-fail-fast"
+```
+
+- 最終焦点実行は **436成功・失敗0（exit0）、16945 skipped**。`target/cover-crop-five-fixes-focused.log`。
+  設定済みsource・旧版UPSERT・stale crop保存・migrationの再open・改名／ZIP化／取り込み・master oracle・scopeを含む。
+- 最初のcompileは新しいoracle testの`SortOrder` import漏れでテスト未実行、修正済み。
+  面積平均だけの反復は435件中433成功で、生成fixtureの境界期待値と約5列の揺れの2件が失敗した。
+  fixtureを旧処理の実際の受理まで再現するものへ直し、余白位置参照を分離してから上記最終版を検証した。
+  これらの失敗は最終成功件数に含めない。lib全件・test-fullは実行していない。
+- 外部評価の今回の基準は、設計担当が提示した現在の入力に対して、正例goodがdummies **35以上**・realistic **29以上**、
+  wrong **0**、負例のcrop **0**。§16.2の初回基準は、今回の利用者指示によるこの基準へ更新する。
+  出力は`target/cover-auto-eval-{dummies,realistic}-five-fixes/`。sheetを開かずsummaryの集計欄だけを読む。
+
+外部評価の結果（正しい綴じ方向、集計値のみ確認）:
+
+| 入力 | good正例 | wrong | declined合計 | 負例crop | 負例declined |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| dummies | 36 | 0 | 46 | 0 | 22 |
+| realistic | 31 | 0 | 59 | 0 | 30 |
+
+両方とも上記受入基準を満たした。ignored testは各1成功・失敗0（exit0）。
+実際のZIP先読みを使い、評価入力をコピーせず、生成sheetは開いていない。
+`target/cover-crop-five-fixes-final-checks.log` に集計と実行結果を残した。
+同じrunner内の `target/cover-crop-five-fixes-final-checks.ps1` が2評価→整形check→UI snapshotを直列に実行する。
+
+- 引数なしの`cargo fmt`を実施後、共有runner内の`cargo fmt --check`は成功。
+- 範囲画面のscope連携を変更したため、更新指定なしの`cargo test -p mimageviewer --test ui_snapshot`を実施し、
+  **253成功・失敗0（exit0）**。PNG更新なし。上記final-checks logを正本とする。
+- `python scripts/check_ui_glyphs.py`は0件、`git diff --check`は成功。
+- 補助の隔離probeの初回native準備はMSBuildで失敗したが、既存の検証用TurboJPEGライブラリを明示して解消した。
+  その準備失敗とprobe13件は、本体436件・外部評価2件・UI253件の成功件数へ合算しない。
+- 実装担当は追加のコミット、製品起動、確認用build、lib全件、test-full、独立レビューを行っていない。
+  設計担当が差分をレビューし、外部評価を再実行してコミットする。

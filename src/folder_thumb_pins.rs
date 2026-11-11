@@ -38,6 +38,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_FOLDER_PIN_DB_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
+const CLEAR_STALE_COVER_CROP_TRIGGER: &str =
+    "CREATE TRIGGER folder_thumb_pin_clear_stale_cover_crop
+    AFTER UPDATE OF source_kind, source_rel, source_entry, source_page ON folder_thumb_pins
+    WHEN NEW.source_kind IS NOT OLD.source_kind
+      OR NEW.source_rel IS NOT OLD.source_rel
+      OR NEW.source_entry IS NOT OLD.source_entry
+      OR NEW.source_page IS NOT OLD.source_page
+    BEGIN
+    UPDATE folder_thumb_pins SET cover_crop_x0 = NULL, cover_crop_y0 = NULL,
+        cover_crop_x1 = NULL, cover_crop_y1 = NULL, cover_crop_source = NULL
+        WHERE container_key = NEW.container_key;
+    END";
+
 /// EXIF-oriented leaf coordinates in millionths, before saved rotation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CoverCrop([u32; 4]);
@@ -277,7 +290,162 @@ pub(crate) fn rebind_cover_crop_values(
     }
 }
 
-/// Update a same-leaf source column and its validated crop in one statement.
+#[derive(Clone, Copy)]
+pub(crate) enum PinRowWrite {
+    Insert,
+    InsertOrIgnore,
+    Upsert,
+}
+
+/// Source writes always precede crop writes in the caller's transaction. A source
+/// UPDATE deliberately clears every old crop, including previously stale bindings.
+fn write_pin_record(
+    conn: &Connection,
+    key: &str,
+    source: &FolderPinSource,
+    crop: Option<CoverCrop>,
+) -> SqlResult<usize> {
+    use rusqlite::types::Value;
+    let (entry, page) = match source {
+        FolderPinSource::ZipEntry { entry, .. } => (Value::Text(entry.clone()), Value::Null),
+        FolderPinSource::ZipDir { dir_prefix, .. } => (
+            Value::Text(normalize_zip_dir_prefix(dir_prefix)),
+            Value::Null,
+        ),
+        FolderPinSource::PdfPage { page, .. } => (Value::Null, Value::Integer(i64::from(*page))),
+        FolderPinSource::File { .. } => (Value::Null, Value::Null),
+    };
+    let columns = [
+        "container_key",
+        "source_kind",
+        "source_rel",
+        "source_entry",
+        "source_page",
+        "cover_crop_x0",
+        "cover_crop_y0",
+        "cover_crop_x1",
+        "cover_crop_y1",
+        "cover_crop_source",
+    ]
+    .map(str::to_owned);
+    let values = [
+        Value::Text(key.into()),
+        Value::Text(source.db_kind().into()),
+        Value::Text(source.rel().replace('\\', "/")),
+        entry,
+        page,
+        crop.map_or(Value::Null, |c| Value::Integer(i64::from(c.values()[0]))),
+        crop.map_or(Value::Null, |c| Value::Integer(i64::from(c.values()[1]))),
+        crop.map_or(Value::Null, |c| Value::Integer(i64::from(c.values()[2]))),
+        crop.map_or(Value::Null, |c| Value::Integer(i64::from(c.values()[3]))),
+        crop.map_or(Value::Null, |_| Value::Text(source.cover_crop_binding())),
+    ];
+    write_pin_values(
+        conn,
+        "folder_thumb_pins",
+        &columns,
+        &values,
+        PinRowWrite::Upsert,
+    )
+}
+
+/// Generic copies pass rows whose crops were decoded before remapping and rebound
+/// afterward. Crop-less released schemas still use their original INSERT behavior.
+pub(crate) fn write_pin_values(
+    conn: &Connection,
+    table: &str,
+    columns: &[String],
+    values: &[rusqlite::types::Value],
+    mode: PinRowWrite,
+) -> SqlResult<usize> {
+    assert!(matches!(
+        table,
+        "folder_thumb_pins" | "folder_pin.folder_thumb_pins"
+    ));
+    if conn.is_autocommit() || columns.len() != values.len() {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    // Column names originate from PRAGMA table_info or the fixed typed record.
+    if columns.iter().any(|name| {
+        name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    }) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let key = columns
+        .iter()
+        .position(|name| name == "container_key")
+        .ok_or_else(|| rusqlite::Error::InvalidColumnName("container_key".into()))?;
+    let fields = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| !name.starts_with("cover_crop_"))
+        .collect::<Vec<_>>();
+    let names = fields
+        .iter()
+        .map(|(_, name)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let placeholders = vec!["?"; fields.len()].join(",");
+    let prefix = if matches!(mode, PinRowWrite::InsertOrIgnore) {
+        "INSERT OR IGNORE"
+    } else {
+        "INSERT"
+    };
+    let suffix = if matches!(mode, PinRowWrite::Upsert) {
+        let assignments = fields
+            .iter()
+            .filter(|(_, name)| name.as_str() != "container_key")
+            .map(|(_, name)| format!("{name}=excluded.{name}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(" ON CONFLICT(container_key) DO UPDATE SET {assignments}")
+    } else {
+        String::new()
+    };
+    let changed = conn.execute(
+        &format!("{prefix} INTO {table} ({names}) VALUES ({placeholders}){suffix}"),
+        rusqlite::params_from_iter(fields.iter().map(|(i, _)| &values[*i])),
+    )?;
+    // An ignored destination collision must leave its crop intact.
+    if changed != 0 {
+        write_pin_crop_values(conn, table, &values[key], columns, values)?;
+    }
+    Ok(changed)
+}
+
+fn write_pin_crop_values(
+    conn: &Connection,
+    table: &str,
+    key: &rusqlite::types::Value,
+    columns: &[String],
+    values: &[rusqlite::types::Value],
+) -> SqlResult<()> {
+    let fields = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| name.starts_with("cover_crop_"))
+        .collect::<Vec<_>>();
+    if fields.is_empty() {
+        return Ok(());
+    }
+    let assignments = fields
+        .iter()
+        .map(|(_, name)| format!("{name}=?"))
+        .collect::<Vec<_>>()
+        .join(",");
+    conn.execute(
+        &format!("UPDATE {table} SET {assignments} WHERE container_key=?"),
+        rusqlite::params_from_iter(
+            fields
+                .iter()
+                .map(|(i, _)| &values[*i])
+                .chain(std::iter::once(key)),
+        ),
+    )?;
+    Ok(())
+}
+
+/// Update a same-leaf source first, then restore only its previously validated crop.
 /// Legacy schemas without crop columns continue to work unchanged.
 pub(crate) fn rewrite_pin_source_column(
     conn: &Connection,
@@ -286,6 +454,9 @@ pub(crate) fn rewrite_pin_source_column(
     new_value: &str,
 ) -> SqlResult<usize> {
     assert!(matches!(column, "source_rel" | "source_entry"));
+    if conn.is_autocommit() {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
     let (columns, mut values) = {
         let mut stmt = conn.prepare("SELECT * FROM folder_thumb_pins WHERE container_key=?1")?;
         let columns = stmt
@@ -312,29 +483,18 @@ pub(crate) fn rewrite_pin_source_column(
         .ok_or_else(|| rusqlite::Error::InvalidColumnName(column.into()))?;
     values[index] = rusqlite::types::Value::Text(new_value.into());
     rebind_cover_crop_values(&columns, &mut values, crop);
-    let fields = columns
-        .iter()
-        .enumerate()
-        .filter(|(_, name)| name.as_str() == column || name.starts_with("cover_crop_"))
-        .collect::<Vec<_>>();
-    let assignments = fields
-        .iter()
-        .enumerate()
-        .map(|(i, (_, name))| format!("{name}=?{}", i + 1))
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut params = fields
-        .iter()
-        .map(|(i, _)| values[*i].clone())
-        .collect::<Vec<_>>();
-    params.push(rusqlite::types::Value::Text(key.into()));
-    conn.execute(
-        &format!(
-            "UPDATE folder_thumb_pins SET {assignments} WHERE container_key=?{}",
-            params.len()
-        ),
-        rusqlite::params_from_iter(params),
-    )
+    let changed = conn.execute(
+        &format!("UPDATE folder_thumb_pins SET {column}=?1 WHERE container_key=?2"),
+        params![new_value, key],
+    )?;
+    write_pin_crop_values(
+        conn,
+        "folder_thumb_pins",
+        &rusqlite::types::Value::Text(key.into()),
+        &columns,
+        &values,
+    )?;
+    Ok(changed)
 }
 
 /// UI-owned handle identity and successful writes, without reading SQLite on the UI thread.
@@ -727,11 +887,19 @@ impl FolderThumbPinDb {
             [],
             |row| row.get(0),
         )?;
+        let installed_crop_trigger: Option<String> = tx.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='folder_thumb_pin_clear_stale_cover_crop'",
+            [],
+            |row| row.get(0),
+        ).optional()?;
+        let crop_trigger_changed =
+            installed_crop_trigger.as_deref() != Some(CLEAR_STALE_COVER_CROP_TRIGGER);
         // Triggers own the revision, including cleanup/rename paths that mutate
         // the table without going through set/remove. SQLite advances it in the
         // same transaction as the changed pin row.
         // Old source-only writers must discard crops permanently, even if they later
-        // restore the original source. New writers change the binding with the source.
+        // restore the original source. New writers restore the crop in a second
+        // statement within the same transaction, after the source trigger has run.
         // The crop-only UPDATE cannot re-enter the source trigger, regardless of
         // recursive_triggers; its extra revision increment is harmless.
         tx.execute_batch(
@@ -746,22 +914,19 @@ impl FolderThumbPinDb {
              CREATE TRIGGER IF NOT EXISTS folder_thumb_pin_revision_delete
                  AFTER DELETE ON folder_thumb_pins BEGIN
                  UPDATE folder_thumb_pin_revision SET revision = revision + 1 WHERE singleton = 1;
-             END;
-             CREATE TRIGGER IF NOT EXISTS folder_thumb_pin_clear_stale_cover_crop
-                 AFTER UPDATE OF source_kind, source_rel, source_entry, source_page ON folder_thumb_pins
-                 WHEN (NEW.source_kind IS NOT OLD.source_kind
-                    OR NEW.source_rel IS NOT OLD.source_rel
-                    OR NEW.source_entry IS NOT OLD.source_entry
-                    OR NEW.source_page IS NOT OLD.source_page)
-                   AND NEW.cover_crop_source IS OLD.cover_crop_source
-                 BEGIN
-                 UPDATE folder_thumb_pins SET cover_crop_x0 = NULL, cover_crop_y0 = NULL,
-                     cover_crop_x1 = NULL, cover_crop_y1 = NULL, cover_crop_source = NULL
-                     WHERE container_key = NEW.container_key;
              END;",
         )?;
+        if crop_trigger_changed {
+            // The binding-dependent trigger existed only in unreleased crop builds.
+            // Replace that definition as part of the same IMMEDIATE migration.
+            tx.execute_batch("DROP TRIGGER IF EXISTS folder_thumb_pin_clear_stale_cover_crop")?;
+            tx.execute_batch(CLEAR_STALE_COVER_CROP_TRIGGER)?;
+        }
         tx.commit()?;
-        Ok(crop_columns_added || revision_row_added != 0 || installed_triggers != 4)
+        Ok(crop_columns_added
+            || revision_row_added != 0
+            || installed_triggers != 4
+            || crop_trigger_changed)
     }
 
     fn container_key(container: &Path) -> String {
@@ -926,35 +1091,13 @@ impl FolderThumbPinDb {
     ) -> Result<(), FolderPinError> {
         validate_source(source)?;
         let key = Self::container_key(container);
-        let rel_norm = source.rel().replace('\\', "/");
-        let (entry, page): (Option<String>, Option<i64>) = match source {
-            FolderPinSource::File { .. } => (None, None),
-            FolderPinSource::ZipEntry { entry, .. } => (Some(entry.clone()), None),
-            FolderPinSource::ZipDir { dir_prefix, .. } => {
-                (Some(normalize_zip_dir_prefix(dir_prefix)), None)
-            }
-            FolderPinSource::PdfPage { page, .. } => (None, Some(*page as i64)),
-        };
         let conn = self
             .conn
             .lock()
             .map_err(|_| FolderPinError::Sql(rusqlite::Error::InvalidQuery))?;
-        conn.execute(
-            "INSERT INTO folder_thumb_pins (container_key, source_kind, source_rel, source_entry, source_page, cover_crop_x0, cover_crop_y0, cover_crop_x1, cover_crop_y1, cover_crop_source) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
-             ON CONFLICT(container_key) DO UPDATE SET \
-                source_kind  = excluded.source_kind, \
-                source_rel   = excluded.source_rel, \
-                source_entry = excluded.source_entry, \
-                source_page  = excluded.source_page, \
-                cover_crop_x0 = excluded.cover_crop_x0, cover_crop_y0 = excluded.cover_crop_y0, \
-                cover_crop_x1 = excluded.cover_crop_x1, cover_crop_y1 = excluded.cover_crop_y1, \
-                cover_crop_source = excluded.cover_crop_source",
-            params![key, source.db_kind(), rel_norm, entry.as_deref(), page,
-                crop.map(|c| c.values()[0]), crop.map(|c| c.values()[1]),
-                crop.map(|c| c.values()[2]), crop.map(|c| c.values()[3]),
-                crop.map(|_| source.cover_crop_binding())],
-        )?;
+        let tx = conn.unchecked_transaction()?;
+        write_pin_record(&tx, &key, source, crop)?;
+        tx.commit()?;
         self.mutation_revision.fetch_add(1, Ordering::Release);
         Ok(())
     }
@@ -2698,7 +2841,7 @@ mod tests {
         db.set(&folder, &source).unwrap();
         let (looked_up, after_insert) = db.lookup_for_selection(&folder).unwrap();
         assert_eq!(looked_up.map(|pin| pin.source), Some(source.clone()));
-        assert_eq!(after_insert.revision, initial.revision + 1);
+        assert_eq!(after_insert.revision, initial.revision + 2);
         db.set(
             &folder,
             &FolderPinSource::File {
@@ -2709,11 +2852,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             db.selection_revision().unwrap().revision,
-            after_insert.revision + 2
+            after_insert.revision + 3
         );
         db.remove(&folder).unwrap();
         let after_delete = db.selection_revision().unwrap();
-        assert_eq!(after_delete.revision, after_insert.revision + 3);
+        assert_eq!(after_delete.revision, after_insert.revision + 4);
         assert_eq!(db.lookup_for_selection(&folder).unwrap().0, None);
         drop(db);
         std::fs::remove_file(&path).unwrap();
@@ -2908,7 +3051,7 @@ mod tests {
         db.set_with_cover_crop(container, &source, crop).unwrap();
         db.set(container, &source).unwrap();
         assert_eq!(db.lookup(container).unwrap().cover_crop, None);
-        assert_eq!(db.selection_revision().unwrap().revision, revision + 4);
+        assert_eq!(db.selection_revision().unwrap().revision, revision + 7);
         for unsupported in [
             FolderPinSource::File {
                 rel: "cover.cr3".into(),
@@ -3012,7 +3155,9 @@ mod tests {
         assert_eq!(db.lookup(container).unwrap().source.rel(), "new.jpg");
         assert_eq!(db.lookup(container).unwrap().cover_crop, None);
         let conn = db.conn.lock().unwrap();
-        rewrite_pin_source_column(&conn, "c:/album", "source_rel", "renamed.jpg").unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        rewrite_pin_source_column(&tx, "c:/album", "source_rel", "renamed.jpg").unwrap();
+        tx.commit().unwrap();
         assert_eq!(
             conn.query_row("SELECT cover_crop_source FROM folder_thumb_pins", [], |r| r
                 .get::<_, Option<String>>(0))
@@ -3021,14 +3166,100 @@ mod tests {
         );
         drop(conn);
         db.set_with_cover_crop(container, &source, crop).unwrap();
-        rewrite_pin_source_column(
-            &db.conn.lock().unwrap(),
-            "c:/album",
-            "source_rel",
-            "renamed.jpg",
-        )
-        .unwrap();
+        let conn = db.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        rewrite_pin_source_column(&tx, "c:/album", "source_rel", "renamed.jpg").unwrap();
+        tx.commit().unwrap();
+        drop(conn);
         assert_eq!(db.lookup(container).unwrap().cover_crop, crop);
+    }
+
+    #[test]
+    fn cover_crop_save_from_pretrigger_stale_row_retains_new_crop() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pins.db");
+        let container = Path::new("c:/album");
+        let source = FolderPinSource::File {
+            rel: "a.jpg".into(),
+            kind: FileKind::Image,
+        };
+        let old_crop = CoverCrop::new([0, 0, 400_000, 1_000_000]).unwrap();
+        let new_crop = CoverCrop::new([500_000, 0, 1_000_000, 1_000_000]).unwrap();
+        let db = FolderThumbPinDb::open_at(&path).unwrap();
+        db.set_with_cover_crop(container, &source, old_crop)
+            .unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "DROP TRIGGER folder_thumb_pin_clear_stale_cover_crop;
+             UPDATE folder_thumb_pins SET source_rel='b.jpg'",
+            )
+            .unwrap();
+        assert_eq!(db.lookup(container).unwrap().cover_crop, None);
+        drop(db);
+
+        // Opening the new schema preserves the stale row. Saving a fresh crop for
+        // a.jpg must work even though its new binding equals that stale old binding.
+        let db = FolderThumbPinDb::open_at(&path).unwrap();
+        for recursive in [false, true] {
+            db.conn
+                .lock()
+                .unwrap()
+                .pragma_update(None, "recursive_triggers", recursive)
+                .unwrap();
+            db.conn
+                .lock()
+                .unwrap()
+                .execute("UPDATE folder_thumb_pins SET source_rel='b.jpg'", [])
+                .unwrap();
+            // Recreate persisted pretrigger data after the source trigger runs.
+            db.conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE folder_thumb_pins SET cover_crop_x0=0,cover_crop_y0=0,
+                 cover_crop_x1=400000,cover_crop_y1=1000000,cover_crop_source='image|a.jpg|-|-'",
+                    [],
+                )
+                .unwrap();
+            db.set_with_cover_crop(container, &source, new_crop)
+                .unwrap();
+            assert_eq!(
+                db.lookup(container),
+                Some(FolderPin {
+                    source: source.clone(),
+                    cover_crop: new_crop
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn cover_crop_source_writers_require_transaction_before_mutating() {
+        let db = open_in_memory();
+        let container = Path::new("c:/album");
+        let source = FolderPinSource::File {
+            rel: "a.jpg".into(),
+            kind: FileKind::Image,
+        };
+        let crop = CoverCrop::new([0, 0, 400_000, 1_000_000]).unwrap();
+        db.set_with_cover_crop(container, &source, crop).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let replacement = FolderPinSource::File {
+            rel: "b.jpg".into(),
+            kind: FileKind::Image,
+        };
+        assert!(write_pin_record(&conn, "c:/album", &replacement, None).is_err());
+        assert!(rewrite_pin_source_column(&conn, "c:/album", "source_rel", "b.jpg").is_err());
+        drop(conn);
+        assert_eq!(
+            db.lookup(container),
+            Some(FolderPin {
+                source,
+                cover_crop: crop
+            })
+        );
     }
 
     #[test]
@@ -3225,6 +3456,76 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn cover_crop_trigger_replaces_binding_dependent_dev_definition_idempotently() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pins.db");
+        let container = Path::new("c:/album");
+        let source = FolderPinSource::File {
+            rel: "a.jpg".into(),
+            kind: FileKind::Image,
+        };
+        let crop = CoverCrop::new([0, 0, 400_000, 1_000_000]).unwrap();
+        let db = FolderThumbPinDb::open_at(&path).unwrap();
+        db.set_with_cover_crop(container, &source, crop).unwrap();
+        let revision = db.selection_revision().unwrap();
+        db.conn.lock().unwrap().execute_batch(
+            "DROP TRIGGER folder_thumb_pin_clear_stale_cover_crop;
+             CREATE TRIGGER folder_thumb_pin_clear_stale_cover_crop
+                 AFTER UPDATE OF source_kind, source_rel, source_entry, source_page ON folder_thumb_pins
+                 WHEN (NEW.source_kind IS NOT OLD.source_kind
+                    OR NEW.source_rel IS NOT OLD.source_rel
+                    OR NEW.source_entry IS NOT OLD.source_entry
+                    OR NEW.source_page IS NOT OLD.source_page)
+                   AND NEW.cover_crop_source IS OLD.cover_crop_source
+                 BEGIN
+                 UPDATE folder_thumb_pins SET cover_crop_x0=NULL,cover_crop_y0=NULL,
+                     cover_crop_x1=NULL,cover_crop_y1=NULL,cover_crop_source=NULL
+                     WHERE container_key=NEW.container_key;
+                 END;",
+        ).unwrap();
+        drop(db);
+
+        let (db, migrated) = FolderThumbPinDb::open_at_with_migration_info(&path).unwrap();
+        assert!(migrated);
+        assert_eq!(db.selection_revision().unwrap(), revision);
+        assert_eq!(db.lookup(container).unwrap().cover_crop, crop);
+        let schema_version: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        drop(db);
+        let (db, migrated) = FolderThumbPinDb::open_at_with_migration_info(&path).unwrap();
+        assert!(!migrated);
+        assert_eq!(
+            db.conn
+                .lock()
+                .unwrap()
+                .query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            schema_version
+        );
+        assert_eq!(db.selection_revision().unwrap(), revision);
+        db.conn.lock().unwrap().execute(
+            "UPDATE folder_thumb_pins SET source_rel='b.jpg', cover_crop_source='image|b.jpg|-|-'", [],
+        ).unwrap();
+        assert_eq!(db.lookup(container).unwrap().cover_crop, None);
+        let cleared: bool = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT cover_crop_x0 IS NULL AND cover_crop_y0 IS NULL AND cover_crop_x1 IS NULL
+                AND cover_crop_y1 IS NULL AND cover_crop_source IS NULL FROM folder_thumb_pins",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(cleared);
     }
 
     #[test]

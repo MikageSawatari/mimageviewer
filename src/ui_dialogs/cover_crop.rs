@@ -546,7 +546,7 @@ fn prepare_cover_inner(
                 crate::cover_auto_sample::sample_zip_page_aspect(
                     archive,
                     entry,
-                    container.zip_dir_prefix.as_deref(),
+                    cover.zip_dir_prefix.as_deref(),
                 )
             }
             ReadLocation::PdfPage { pdf, page } => cover.epub_read.as_ref().and_then(|read| {

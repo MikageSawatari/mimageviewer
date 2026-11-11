@@ -70,18 +70,17 @@ pub(crate) fn analysis_raster(image: &DynamicImage) -> RgbImage {
     analysis_area_average(&rgb, width)
 }
 
-/// Integrate source pixel areas instead of introducing cubic ringing. Each
-/// analysis column covers one output pixel; each row covers two. The vertical
-/// averaging suppresses isolated scan noise consistently even for an already
-/// 256-row decode. Horizontal edges stay sharp: averaging two columns would
-/// broaden a spine edge enough to create two separate detected boundaries.
+/// Integrate each output pixel's source area without an additional smoothing
+/// footprint. In particular, a native 256-row decode must retain its ink,
+/// luminance variance and colorfulness: smoothing alternating rows can turn
+/// printed art into false flat-panel evidence. Both axes use the same support.
 fn analysis_area_average(source: &RgbImage, width: u32) -> RgbImage {
-    let taps = |source_size: u32, output_size: u32, footprint: f64| {
+    let taps = |source_size: u32, output_size: u32| {
         let scale = f64::from(source_size) / f64::from(output_size);
         (0..output_size)
             .map(|position| {
                 let center = (f64::from(position) + 0.5) * scale;
-                let radius = scale * footprint * 0.5;
+                let radius = scale * 0.5;
                 let (left, right) = (center - radius, center + radius);
                 (left.floor() as i64..right.ceil() as i64)
                     .filter_map(|pixel| {
@@ -96,8 +95,8 @@ fn analysis_area_average(source: &RgbImage, width: u32) -> RgbImage {
             })
             .collect::<Vec<_>>()
     };
-    let columns = taps(source.width(), width, 1.0);
-    let rows = taps(source.height(), 256, 2.0);
+    let columns = taps(source.width(), width);
+    let rows = taps(source.height(), 256);
     let source_width = source.width() as usize;
     // Only one accumulated source row is retained; allocating an intermediate
     // source-height raster would multiply memory for a tall full-size decode.
@@ -142,6 +141,17 @@ struct Raster {
 impl Raster {
     fn get(&self, x: usize, y: usize) -> Pixel {
         self.pixels[y * self.width + x]
+    }
+
+    /// Only margin positioning uses this row reference. A dust row otherwise
+    /// survives one decode scale but not another, changing the content height
+    /// and therefore the support ranking of otherwise identical panel edges.
+    /// Panel evidence and visual statistics always read the unfiltered pixels.
+    fn margin_pixel(&self, x: usize, y: usize) -> Pixel {
+        let previous = self.get(x, y.saturating_sub(1));
+        let current = self.get(x, y);
+        let next = self.get(x, (y + 1).min(self.height - 1));
+        std::array::from_fn(|c| (0.25 * previous[c] + 0.5 * current[c] + 0.25 * next[c]).round())
     }
 
     fn from_image(image: &RgbImage) -> Self {
@@ -194,7 +204,7 @@ fn luminance(p: Pixel) -> f64 {
 
 /// Each edge has its own reference color and 20% cap; a few dust pixels do not
 /// terminate an otherwise blank margin.
-fn content_bounds(raster: &Raster) -> [usize; 4] {
+fn content_bounds(raster: &Raster, sample: impl Fn(usize, usize) -> Pixel) -> [usize; 4] {
     let walk = |vertical: bool, reverse: bool| {
         let (depth, length) = if vertical {
             (raster.height, raster.width)
@@ -203,11 +213,7 @@ fn content_bounds(raster: &Raster) -> [usize; 4] {
         };
         let pixel = |d, i| {
             let d = if reverse { depth - 1 - d } else { d };
-            if vertical {
-                raster.get(i, d)
-            } else {
-                raster.get(d, i)
-            }
+            if vertical { sample(i, d) } else { sample(d, i) }
         };
         let reference = color_median((0..length).map(|i| pixel(0, i)));
         (0..depth / 5)
@@ -368,7 +374,7 @@ pub(crate) fn cover_auto_crop(
         return Err(NoStructure);
     }
     let source = Raster::from_image(image);
-    let bounds = content_bounds(&source);
+    let bounds = content_bounds(&source, |x, y| source.margin_pixel(x, y));
     let sub = source.region(bounds, binding == ReadingDirection::Ltr);
     if sub.width as f64 / (sub.height as f64) < aspect * 1.25 {
         return Err(NotWide);

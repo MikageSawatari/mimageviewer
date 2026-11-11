@@ -3682,16 +3682,12 @@ fn copy_exact(
             .position(|c| c == col)
             .ok_or_else(|| rusqlite::Error::InvalidColumnName(col.into()))?;
         row[index] = rusqlite::types::Value::Text(new_key.into());
-        let placeholders = (0..columns.len())
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(",");
-        return tx.execute(
-            &format!(
-                "INSERT OR IGNORE INTO {table} ({}) VALUES ({placeholders})",
-                columns.join(",")
-            ),
-            rusqlite::params_from_iter(row),
+        return crate::folder_thumb_pins::write_pin_values(
+            tx,
+            table,
+            columns,
+            &row,
+            crate::folder_thumb_pins::PinRowWrite::InsertOrIgnore,
         );
     }
     let insert_columns = columns.join(", ");
@@ -8537,9 +8533,29 @@ mod tests {
         let renamed = db.lookup(root).unwrap();
         assert_eq!(renamed.source.rel(), "new.jpg");
         assert_eq!(renamed.cover_crop, crop);
+        let destination = Path::new("c:/books/existing");
+        let destination_source = FolderPinSource::File {
+            rel: "destination.jpg".into(),
+            kind: FileKind::Image,
+        };
+        let destination_crop = CoverCrop::new([500_000, 0, 1_000_000, 1_000_000]).unwrap();
+        db.set_with_cover_crop(destination, &destination_source, destination_crop)
+            .unwrap();
         let mut conn = rusqlite::Connection::open(&path).unwrap();
         let tx = conn.transaction().unwrap();
         let columns = table_columns(&tx, "folder_thumb_pins").unwrap();
+        assert_eq!(
+            copy_exact(
+                &tx,
+                "folder_thumb_pins",
+                "container_key",
+                &columns,
+                "c:/books/one",
+                "c:/books/existing",
+            )
+            .unwrap(),
+            0
+        );
         copy_exact(
             &tx,
             "folder_thumb_pins",
@@ -8559,6 +8575,8 @@ mod tests {
         )
         .unwrap();
         tx.commit().unwrap();
+        assert_eq!(db.lookup(destination).unwrap().source, destination_source);
+        assert_eq!(db.lookup(destination).unwrap().cover_crop, destination_crop);
         assert_eq!(
             db.lookup(Path::new("c:/books/valid-moved"))
                 .unwrap()

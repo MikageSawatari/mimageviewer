@@ -606,6 +606,19 @@ pub(crate) fn copy_rows_on(
         return Ok(0);
     }
     if phase == CopyPhase::Apply {
+        if table == "folder_thumb_pins" {
+            for row in &expected {
+                crate::folder_thumb_pins::write_pin_values(
+                    conn,
+                    table,
+                    &columns,
+                    row,
+                    crate::folder_thumb_pins::PinRowWrite::Insert,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            return Ok(expected.len());
+        }
         let names = columns.join(",");
         let placeholders = (0..columns.len())
             .map(|_| "?")

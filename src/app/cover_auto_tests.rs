@@ -39,6 +39,99 @@ fn saved_bytes() -> Vec<u8> {
 }
 
 #[test]
+fn cover_auto_zipdir_real_request_scopes_last_page_sampling_to_its_book_and_dialog() {
+    use std::io::{Cursor, Write};
+    let temp = tempfile::tempdir().unwrap();
+    let zip_path = temp.path().join("books.zip");
+    let png = |width, height| {
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(width, height)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    };
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+    let options = zip::write::SimpleFileOptions::default();
+    for book in ["A", "B"] {
+        for index in 0..8 {
+            zip.start_file(format!("{book}/{index:03}.png"), options)
+                .unwrap();
+            zip.write_all(&png(if book == "A" { 70 } else { 40 }, 100))
+                .unwrap();
+        }
+    }
+    let last = "A/999_cover.png";
+    zip.start_file(last, options).unwrap();
+    zip.write_all(&png(300, 256)).unwrap();
+    zip.finish().unwrap();
+    let item = GridItem::ZipDir {
+        zip_path: zip_path.clone(),
+        dir_prefix: "A/".into(),
+        representative: Some(last.into()),
+        is_archive: false,
+    };
+    let pin = FolderPin::from(FolderPinSource::ZipEntry {
+        zip_rel: String::new(),
+        entry: last.into(),
+    });
+    let owner = crate::path_key::normalize_keep_drive(&book_container_key(&zip_path, "A/"));
+    let auto = Some(AutoCropIdentity::new(ReadingDirection::Rtl));
+    for pinned in [false, true] {
+        let pins = if pinned {
+            HashMap::from([(owner.clone(), pin.clone())])
+        } else {
+            HashMap::new()
+        };
+        let req = request(&item, &pins, auto);
+        assert_eq!(req.auto_cover_crop, auto);
+        assert_eq!(req.zip_dir_prefix.as_deref(), Some("A/"));
+        assert_eq!(
+            crate::cover_auto_sample::sample_zip_page_aspect(
+                &req.path,
+                req.zip_entry.as_deref().unwrap(),
+                req.zip_dir_prefix.as_deref(),
+            ),
+            Some(0.7)
+        );
+        // This is the previous failure: the next book supplied all eight samples.
+        assert_eq!(
+            crate::cover_auto_sample::sample_zip_page_aspect(
+                &req.path,
+                req.zip_entry.as_deref().unwrap(),
+                None,
+            ),
+            Some(0.4)
+        );
+    }
+    let container = super::book_cover::BookCoverContainer {
+        path: zip_path.clone(),
+        kind: super::book_cover::BookKind::Zip,
+        zip_dir_prefix: Some("A/".into()),
+    };
+    let env = super::book_cover::BookCoverEnv {
+        books_root: Some(temp.path().to_owned()),
+        ..Default::default()
+    };
+    let super::book_cover::BookCover::Readable(cover) =
+        super::book_cover::resolve_logical_book_cover(&container, Some(pin), &env)
+    else {
+        panic!("same pinned leaf must resolve for the range dialog");
+    };
+    assert_eq!(cover.zip_dir_prefix.as_deref(), Some("A/"));
+    let crate::thumb_loader::ReadLocation::ArchiveEntry { archive, entry } = cover.location else {
+        panic!("resolved ZIP page");
+    };
+    assert_eq!(
+        crate::cover_auto_sample::sample_zip_page_aspect(
+            &archive,
+            &entry,
+            cover.zip_dir_prefix.as_deref(),
+        ),
+        Some(0.7)
+    );
+}
+
+#[test]
 fn cover_auto_request_roles_binding_and_off_keys() {
     let zip = PathBuf::from("book.zip");
     let items = [

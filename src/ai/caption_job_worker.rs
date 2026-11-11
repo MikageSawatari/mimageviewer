@@ -1358,6 +1358,7 @@ mod tests {
             rotation_key: None,
             cover_crop: None,
             edit_preview_key: None,
+            zip_dir_prefix: None,
         })
     }
 

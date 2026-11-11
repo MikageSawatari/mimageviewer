@@ -102786,6 +102786,12 @@ fn make_load_request_with_visibility(
             representative,
             ..
         } => {
+            // One scope for direct entries, pins, and representative resolution.
+            // The range-dialog resolver consumes this same request field.
+            let base = LoadRequest {
+                zip_dir_prefix: Some(dir_prefix.clone()),
+                ..base
+            };
             // ネスト ZIP ツリーの子コンテナ代表サムネ (v1.3.0)。代表画像のバイトを
             // zip_entry 経由で読み、カタログには zipdir:{dir_prefix} キーで保存する
             // (entry_name キーと非衝突, additive)。cache_key_override が zipdir: で

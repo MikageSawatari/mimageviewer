@@ -144,6 +144,8 @@ pub(crate) struct ResolvedBookCover {
     pub(crate) rotation_key: Option<String>,
     pub(crate) cover_crop: Option<CoverCrop>,
     pub(crate) edit_preview_key: Option<String>,
+    /// Sampling scope from the shared thumbnail request, never the outer ZIP.
+    pub(crate) zip_dir_prefix: Option<String>,
 }
 
 #[derive(Debug)]
@@ -359,6 +361,7 @@ impl CoverResolver<'_> {
                 ),
                 cover_crop: None,
                 edit_preview_key: None,
+                zip_dir_prefix: None,
             });
         }
         let pin_container = zip_prefix.map_or_else(
@@ -625,6 +628,7 @@ impl CoverResolver<'_> {
                 ),
                 cover_crop: resolved.cover_crop,
                 edit_preview_key,
+                zip_dir_prefix: request.zip_dir_prefix.clone(),
                 location: resolved.location,
                 signature_path: logical_path,
                 signature,

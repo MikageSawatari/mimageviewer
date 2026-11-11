@@ -507,7 +507,8 @@ sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを
 ピン解決・stat・書庫列挙・既定本棚パスの解決・画像 decode/縮小を一つの `cover-crop-prepare` worker で行う。
 準備全体を perf event で計測し、完了時に repaint、UI は非blocking poll と世代照合だけを行う。
 閉じた modal の結果は破棄し、UI で worker を待たない。回転はメモリのページ角度 owner だけを引く。
-保存は既存の単一行ピン UPSERT と同じ経路を使い、失敗はログとトーストで通知する。
+保存は既存のピン書込み経路を使い、同一transaction内でsourceを先にUPSERTし、範囲・束縛を別UPDATEで書く。
+失敗はログとトーストで通知する。
 自動切り出しも同じ準備 worker 内で行う。UI では ON/OFF・既定綴じ方向と編集 preview DB の handle だけを捕捉する。
 固定ページの有効な preview 照合、近傍ページの寸法先読み、高さ256の raster 解析は worker の仕事である。
 ZIP は最大8×256KBの先頭読み、PDF/EPUB は代表と同じ password・`ReadTarget` の `PageSizes` を使う。
