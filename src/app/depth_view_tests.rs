@@ -1573,6 +1573,10 @@ fn depth_panel_footer_uses_live_keymap_through_app_draw() {
             "[FsCommon]\nFsToggleMetadata = F13\nFsToggleMetadata.2 = F14\n",
             Some("F13 / F14: パネルを隠す・出す"),
         ),
+        (
+            "[FsCommon]\nFsToggleMetadata = Ctrl+Shift+Alt+F13\nFsToggleMetadata.2 = F14\nFsToggleMetadata.3 = F15\n",
+            Some("Ctrl+Shift+Alt+F13 / F14 / F15: パネルを隠す・出す"),
+        ),
         ("[FsCommon]\nFsToggleMetadata = none\n", None),
     ] {
         app.keymap = crate::keymap::Keymap::from_ini_str(ini);
@@ -1617,7 +1621,7 @@ fn depth_panel_footer_uses_live_keymap_through_app_draw() {
 
 #[cfg(windows)]
 #[test]
-fn depth_panel_hide_toast_is_once_per_hide_and_show_is_silent_through_key_and_ring() {
+fn depth_panel_hide_toast_uses_first_chord_once_and_show_is_silent_through_key_and_ring() {
     use crate::ring_shortcut::{RingActionId, RingShortcutContext};
     let _input_guard = crate::key_input::lock_test_input();
     let ctx = egui::Context::default();
@@ -1626,7 +1630,7 @@ fn depth_panel_hide_toast_is_once_per_hide_and_show_is_silent_through_key_and_ri
     depth(&mut app);
     let side_panel_mode = app.settings.fullscreen_side_panel_mode;
     for (ini, keys, hint) in [
-        ("", vec![egui::Key::I, egui::Key::Tab], "I / Tab"),
+        ("", vec![egui::Key::I, egui::Key::Tab], "I"),
         (
             "[FsCommon]\nFsToggleMetadata = F13\n",
             vec![egui::Key::F13],
@@ -1635,7 +1639,12 @@ fn depth_panel_hide_toast_is_once_per_hide_and_show_is_silent_through_key_and_ri
         (
             "[FsCommon]\nFsToggleMetadata = F13\nFsToggleMetadata.2 = F14\n",
             vec![egui::Key::F13, egui::Key::F14],
-            "F13 / F14",
+            "F13",
+        ),
+        (
+            "[FsCommon]\nFsToggleMetadata = Ctrl+Shift+Alt+F13\nFsToggleMetadata.2 = F14\nFsToggleMetadata.3 = F15\n",
+            vec![egui::Key::F14, egui::Key::F15],
+            "Ctrl+Shift+Alt+F13",
         ),
         ("[FsCommon]\nFsToggleMetadata = none\n", vec![], ""),
     ] {

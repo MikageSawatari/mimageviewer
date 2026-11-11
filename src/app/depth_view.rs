@@ -282,10 +282,12 @@ impl App {
         if let FsExclusiveView::Depth(state) = &mut self.fs_exclusive_view {
             state.panel_visible = !state.panel_visible;
             if !state.panel_visible {
-                let keys = self.depth_panel_toggle_keys();
-                self.show_feedback_toast(match keys {
-                    Some(keys) => {
-                        format!("3D 写真のパネルを隠しました。{keys} でもう一度表示します")
+                let key = self
+                    .keymap
+                    .first_chord_label(crate::keymap::KeyAction::FsToggleMetadata);
+                self.show_feedback_toast(match key {
+                    Some(key) => {
+                        format!("3D 写真のパネルを隠しました。{key} でもう一度表示します")
                     }
                     None => "3D 写真のパネルを隠しました".to_owned(),
                 });
