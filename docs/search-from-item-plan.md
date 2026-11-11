@@ -1,8 +1,8 @@
 # 名前で検索 (§1.690) — 設計
 
 作成: 2026-11-11。ブランチ `feat-690-search-from-item` (master `3287af3fc` から)。設計担当 ClaudeCode Opus。
-状態: **最小版の設計 (第 2.1 版)。仕様は利用者承認済み (2026-11-11、統括経由)。第 2 版の独立レビュー (Sol/xhigh) は REJECT
-(P1 1 件・P2 5 件・P3 1 件)。第 2.1 版で全件を反映 (各所に「P<N> 対応」)。製品コードは未実装。**
+状態: **最小版の設計 (第 2.2 版)。仕様は利用者承認済み (2026-11-11、統括経由)。第 2 版の独立レビュー (Sol/xhigh) は REJECT
+(P1 1 件・P2 5 件・P3 1 件)。第 2.1 版で全件を反映 (各所に「P<N> 対応」)。第 2.1 版の再レビューも REJECT (P1 2 件・P2 1 件・P3 1 件)。第 2.2 版で反映。実装中 (M9)。**
 第 1 版 (材料を組み立てる専用のモーダル) は利用者決定で後の版へ回した。付録 A に残す (未レビュー)。
 
 ## M1. 範囲 (利用者決定 2026-11-11)
@@ -50,17 +50,25 @@
 | アイテム検索で探す | `ensure_search_session(Metadata)` | `pinned_search_availability(Metadata)` が Err |
 | この場所で絞り込む | `ensure_search_session(Local)` | `pinned_search_availability(Local)` が Err (本のページ表示中など) |
 
-**受付の条件 (第 2.1 版、独立レビュー指摘 P2-5・P2-6 対応)**: 各渡し先は、**その検索のふだんのショートカット
-(Ctrl+R / Ctrl+G / Ctrl+F) が今受け付けられるときだけ**選べる。受付の判定はショートカットの dispatch が使っている
-条件を 1 つの述語に取り出して共有し、ショートカット側の挙動は変えない。したがって次のようになる:
+**受付の条件 (第 2.2 版。2.1 版のレビュー指摘 P2-5・P2-6、再レビュー指摘 P1-2 対応)**: 各渡し先は、**その検索のふだんのショートカット
+(Ctrl+R / Ctrl+G / Ctrl+F) が今受け付けられるときだけ**選べる。ただし「検索を開始できる状態か」(渡し先ごとの判定) と、
+「キー入力を誰が所有しているか」(入力所有・IME の判定) は分ける。ショートカット側の受付・入力ガードは変えない。
 
+- 渡し先の判定は、ショートカットの dispatch が使っている「検索を開始できる状態か」の条件を 1 つの述語に取り出して共有する。
+- **右クリックメニュー自身もモーダル扱い** (`common_modal_dialog_open` に含まれる) なので、メニューの灰色判定では
+  **呼び出し元の右クリックメニューだけを除外**した述語を使う (他のモーダル・閲覧中などはそのまま拒否)。
+  Everything の dispatcher の keyboard permit はメニューへ流用しない。
+- メニューで選んだ後は、対象の名前を文字列に確定し、**自分のメニューを閉じて (context_menu の owner を片付けて) から**
+  `open_search_with_text` を呼ぶ。`open_search_with_text` はメニューを除外しない通常の述語で受け付ける。
+  egui のメニューとネイティブメニューの両方の dispatch 経路で同じ順にする。
+- キーは既存 `handle_keyboard` の入力所有・IME・detached 前面・フォルダペイン判定の後で処理する (コピー系の `KeyAction` と同じ位置)。
+  その後 `open_search_with_text` の通常の述語。
 - 「この場所で絞り込む」は、アイテム検索・Everything の結果を表示している間 (結果から開いた実フォルダ
   `PhysicalChild` を含む) は灰色。ふだんの Ctrl+F がこの間は受け付けられないのと同じ (`update_phases.rs` の Ctrl+F 受付)。
   検索を終了して戻り先を復元する経路にはしない。
 - 入口そのもの (メニュー項目とキー) は、メイン窓 (main viewport、フルスクリーンでない) のサムネイル一覧で、
   `grid_item_input_allowed()` が真、ブックマーク一覧・閲覧履歴の一覧でない、チェックした項目が無い、
   M2 の対象種別の 1 項目、のときだけ有効。メニュー・キー・dispatch でこの判定を 1 つの関数にまとめて共有する。
-  キーは既存 `handle_keyboard` の入力所有・IME・detached 前面・フォルダペイン判定の後で処理する (コピー系の `KeyAction` と同じ位置)。
 
 共通の手順 (`App::open_search_with_text(ctx, request)`、新設):
 
@@ -69,33 +77,36 @@
 2. `ensure_search_session(kind)`。開いていなければ既存の開く関数 (別の検索セッションとの排他・戻り先の保持を含む) が走る。
    既に開いていれば何もしない。Ctrl+G の `toggle_global_search` (開いていれば閉じる) は使わない。
 3. その欄の下書き (`search_draft_mut(kind)`) を名前で置き換える。**検索を始める処理 (Edited / Submit) は呼ばない。**
-   Ctrl+G だけは、下書きが `last_executed` と違い `last_change_at` があるとデバウンス後に検索が始まる
-   (`poll_global_search_debounce`) ので、代入と同時に次をそろえる (P1 対応):
-   - `last_change_at = None` (デバウンスの予約を外す。代入は「編集」ではない)。
-   - 進行中の検索 (`pending`) が無ければ `done = true` (`open_global_search` の「保持された下書きは編集・確定まで待機」と同じ状態。
-     検索中の表示にしない)。進行中の検索があればそのまま続けさせ、`done` も触らない (前の語の検索として完了し、
-     表示中の結果と適用条件はその語のもの。新しい語は「未適用」の表示になる)。
-   - 表示中の結果・適用済みの条件 (`accepted`)・`last_executed` は変えない。
+   Ctrl+G だけは、下書きが `last_executed` と違い `last_change_at` があるとデバウンス後に検索が始まり
+   (`poll_global_search_debounce`)、また結果の組み立て (`SearchViewWish.query`) が今の下書きから作られるので、
+   進行中の検索を続けさせると旧い語の結果の採用が食い違う。そこで代入と同時に次をそろえる (第 2.2 版、再レビュー指摘 P1-1 対応):
+   - 進行中の検索を、`switch_search_source` が source 切り替え時にしているのと同じ後始末で終える
+     (`pending = None`、`retire_search_prepare()`、`mtime_lookup_pending = None`、`run_sequence` を進める)。source は変えない。
+     可能ならこの後始末を `switch_search_source` と共有する小さな helper に取り出す (`switch_search_source` の挙動は変えない)。
+   - `last_change_at = None` (デバウンスの予約を外す。代入は「編集」ではない)、`done = true`
+     (`open_global_search` の「保持された下書きは編集・確定まで待機」と同じ状態。検索中の表示にしない)、`reject_message = None`。
+   - 表示中の結果・適用済みの条件 (`accepted`)・`last_executed` は変えない。旧い検索の途中までの結果が表示されていれば、
+     それはそのまま残る (source 切り替えで旧い検索を止めたときと同じ見え方)。
    Ctrl+F と Everything は確定 (Enter / 検索ボタン) でしか検索しないので、代入だけでよい。
 4. フォーカスの要求を**毎回明示的に立てる** (P2-2 対応。既に開いている検索では開く関数が走らないため):
    常設欄なら `request_pinned_search_focus(ctx, kind)`、一時バーなら Local は `search_focus_request = true`、
    Metadata / Everything は `global_search.focus_request = true` (`temporary_search_focus_reservation` が拾う形)。
-5. 全選択 (P2-3 対応): egui はフォーカスの無い欄の選択を単一カーソルに畳むので、描画前に保存した選択は残らない。
-   そこで、対象の入力欄の id (常設欄なら `kind.input_id()`、一時バーなら `kind.temporary_id()`) について、
-   egui の一時データに「次にフォーカスがある状態で描かれたとき全選択する」印を、入れた文字列と一緒に置く
-   (`crate::search_request` の小さな helper で置く・消費する)。各欄の描画で、`show_singleline` の後に
-   helper を 1 行呼ぶ: 欄にフォーカスがあり、IME 変換中でなく、下書きが印の文字列と同じなら全選択して印を消す。
-   下書きが印の文字列と違えば印を消すだけ。Everything の欄が今している「フォーカス要求の pass で全選択」と同じ処理を、
-   この操作で入れたときだけに限る形。ふだんの Ctrl+F・Ctrl+G の開き方は変えない。
-   呼ぶ場所は、常設欄の描画 (`ui_pinned_search.rs`、Local・Metadata・Everything 共通の 1 か所) と、Ctrl+F・Ctrl+G の一時バーの描画。
-   印は App の状態ではなく、その入力欄の egui の状態として持つ (欄が描かれなければ効かないだけで、他の処理と組み合わさらない)。
+5. 全選択 (第 2.2 版、P2-3・再レビュー指摘 P2 対応): egui はフォーカスの無い欄の選択を単一カーソルに畳むので、
+   描画前に保存した選択は残らない。Everything の欄 (常設・一時バーとも) は既存の「フォーカス要求の pass で全選択」がそのまま効くので、
+   **印を作らない**。Local と Metadata だけ、対象の入力欄の id (常設欄なら `kind.input_id()`、一時バーなら `kind.temporary_id()`)
+   について、egui の一時データに印 (発行した pass 番号 `ctx.cumulative_pass_nr()` と入れた文字列) を置く
+   (`crate::search_request` の小さな helper で置く・消費する)。egui の一時データは明示的に消すまで残るので、
+   **対象の入力欄が描かれた最初の pass (発行 pass 以降) で必ず取り出して消す**。その pass がフォーカス要求の pass か欄にフォーカスがあり、
+   IME 変換中でなく、下書きが印の文字列と同じで、発行から 3 pass 以内なら、Everything の欄と同じ方法
+   (show の後で `state.cursor` に全範囲を入れて store し、`output.cursor_range` も更新) で全選択する。それ以外は消すだけ。
+   呼ぶ場所は、常設欄の描画 (`ui_pinned_search.rs` の 1 か所) と、Ctrl+F・Ctrl+G の一時バーの描画。ふだんの Ctrl+F・Ctrl+G の開き方は変えない。
 6. 何も実行しない。確定は利用者の Enter (既存の `submit_search_input`)、取りやめは既存の Esc。
 
 - 渡し先の他の選択 (Ctrl+F・Ctrl+G の OR、検索対象、Ctrl+G の絞り込み) は変えない。
 - §1.756 との関係: 履歴は `submit_search_input` の中で記録されるので、Enter したときにふだんどおり入る。
   名前を入れただけでは記録されない。§1.756 の「入力欄から離れたときの記録」は、今の語がその欄で実行済みの語と
   同じかどうかで決まる。したがって**実行済みの語と違う名前を入れて、Enter せずに離れた場合は記録されない**。
-  入れた名前が直前に実行済みの語と同じだった場合は、ふだんの離脱と同じく記録される (先頭へ移るだけ。仕様どおり) (P3-7 対応)。
+  入れた名前が直前に実行済みの語と同じだった場合は、既存の離脱処理どおり、記録・先頭への移動が起こる (履歴を消去した後なら再登録。仕様どおり) (P3-7・再レビュー指摘 P3 対応)。
   §1.756 の描画部品 (`ui_history_field`) は触らない。`ui_pinned_search.rs` へは手順 5 の 1 行だけ足す
   (§1.756 も同じファイルを変えているので、後から入る側が取り込んで合わせる)。
 - §1.682+§1.688 とはファイルが重ならない。
@@ -151,6 +162,11 @@ pub(crate) fn item_search_name(item: &GridItem) -> Option<String>; // M2 の規�
 - 受付: アイテム検索・Everything の結果表示中 (`PhysicalChild` を含む) は「この場所で絞り込む」が灰色で、キーでも何も起きないこと。
   ブックマーク一覧・閲覧履歴の一覧・フルスクリーン・detached viewer・チェックありでは入口が出ない / 効かないこと (P2-5・P2-6)。
 - §1.756 取り込み後: 入れただけ・違う語で離れた場合は記録されず、Enter で記録されること。
+- (第 2.2 版) Ctrl+G の 3 時点からの注入で、prepare が残らず、`accepted` が注入前と同じであること。
+- (第 2.2 版) 右クリックメニュー表示中に 3 項目が (条件を満たすとき) 有効で、選ぶとメニューが閉じて欄が開くこと
+  (egui メニューとネイティブメニューの dispatch の両方)。他のモーダルが開いているときは灰色。
+- (第 2.2 版) 全選択の印を置いた後、欄が描かれない pass が続く・Esc で閉じる・source を切り替える、のどれの後でも、
+  ふだんの Ctrl+F・Ctrl+G で開き直したときに全選択されないこと。Everything には印が作られないこと。
 - 右クリックメニュー: 対象種別だけに出る・複数選択や背景では出ない・無効の理由。キー操作: 既定未割り当て、割り当てれば動く。
 
 ## M8. 文書
