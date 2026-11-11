@@ -1,6 +1,7 @@
 #[cfg(windows)]
 use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, PresentationRequest};
 use super::*;
+use crate::ui_dialogs::context_menu::DeleteTarget;
 
 pub(crate) fn assert_cache_book_cover_only_worker_catalog_contract(
     app: &mut App,
@@ -45036,7 +45037,10 @@ mod favorite_adjustment_defaults_tests {
             true,
         );
         assert!(app.rename_pending.is_none());
-        app.start_delete_files(&ctx, vec![old.clone()]);
+        app.start_delete_files(
+            &ctx,
+            vec![DeleteTarget::from_grid_item(&GridItem::Image(old.clone())).unwrap()],
+        );
         assert!(app.delete_pending.is_none());
         app.start_book_rename(&ctx, "Before".into(), "After".into());
         app.start_book_delete(&ctx, "Before".into());
@@ -46183,18 +46187,18 @@ mod favorite_adjustment_defaults_tests {
     }
 
     #[test]
-    fn grid_book_add_rejects_mixed_invalid_items_without_partial_copy() {
+    fn grid_book_add_rejects_mixed_audio_without_partial_copy() {
         use crate::grid_item::{GridItem, ThumbnailState};
 
         let mut app = setup_app();
         let src = app.tmp.path().join("source.jpg");
-        let folder = app.tmp.path().join("folder");
+        let audio = app.tmp.path().join("audio.mp3");
         let root = app.tmp.path().join("books");
         std::fs::write(&src, b"image bytes").expect("write source bytes");
-        std::fs::create_dir(&folder).expect("create folder item");
+        std::fs::write(&audio, b"audio bytes").expect("write audio item");
         app.settings.book_root = Some(root.clone());
         app.settings.active_book_name = "target".to_string();
-        app.items = vec![GridItem::Image(src), GridItem::Folder(folder)];
+        app.items = vec![GridItem::Image(src), GridItem::Audio(audio)];
         app.thumbnails = vec![ThumbnailState::Pending, ThumbnailState::Pending];
         app.checked.insert(0);
         app.checked.insert(1);
@@ -55253,15 +55257,18 @@ mod favorite_adjustment_defaults_tests {
     fn request_delete_confirm_resets_cached_label_for_new_targets() {
         let mut app = setup_app();
         app.show_delete_confirm = true;
-        app.delete_targets = vec![(0, PathBuf::from("C:/pics/old.jpg"))];
+        app.delete_targets =
+            vec![DeleteTarget::from_grid_item(&GridItem::Image("C:/pics/old.jpg".into())).unwrap()];
         app.delete_confirm_label = Some("old label".to_owned());
 
-        app.request_delete_confirm(vec![(1, PathBuf::from("J:/pics/new.jpg"))]);
+        app.request_delete_confirm(vec![
+            DeleteTarget::from_grid_item(&GridItem::Image("J:/pics/new.jpg".into())).unwrap(),
+        ]);
 
         assert!(app.show_delete_confirm);
         assert_eq!(
             app.delete_targets,
-            vec![(1, PathBuf::from("J:/pics/new.jpg"))]
+            vec![DeleteTarget::from_grid_item(&GridItem::Image("J:/pics/new.jpg".into())).unwrap()]
         );
         assert!(
             app.delete_confirm_label.is_none(),
@@ -66596,7 +66603,8 @@ mod native_video_rating_key_tests {
                     app.start_book_delete(&ctx, "Book".into());
                     assert!(app.book_structural_op.is_some());
                 } else {
-                    app.start_delete_files(&ctx, vec![target.clone()]);
+                    let delete_target = DeleteTarget::from_grid_item(&app.items[0]).unwrap();
+                    app.start_delete_files(&ctx, vec![delete_target]);
                     assert!(app.delete_pending.is_some());
                 }
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -67085,7 +67093,7 @@ mod fullscreen_main_focus_guard_tests {
 }
 
 #[cfg(windows)]
-fn install_collection_item_for_detached_plan(
+pub(crate) fn install_collection_item_for_detached_plan(
     app: &mut App,
     path: &Path,
     kind: crate::collection_store::CollectionResolvedKind,
@@ -95439,7 +95447,10 @@ mod file_operation_selection_tests {
         ctx.end_pass().drop_without_applying_deltas();
 
         assert!(app.show_delete_confirm);
-        assert_eq!(app.delete_targets, vec![(folder, folder_path)]);
+        assert_eq!(
+            app.delete_targets,
+            vec![DeleteTarget::from_grid_item(&GridItem::Folder(folder_path)).unwrap()]
+        );
     }
 
     #[test]
@@ -114399,3 +114410,510 @@ fn front_popup_presentation_open_keeps_page_owner_until_the_display_target_chang
 
 mod collection_return;
 mod edit_history_1681;
+
+#[cfg(all(test, windows))]
+mod section1732_folder_selection_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+    use crate::app::top_level_grid_view::{SmartFolderViewState, TopLevelGridSurface};
+    use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+
+    fn install_items(app: &mut App, root: &Path) {
+        std::fs::create_dir_all(root.join("folder")).unwrap();
+        std::fs::write(root.join("first.jpg"), b"first").unwrap();
+        std::fs::write(root.join("last.jpg"), b"last").unwrap();
+        app.current_folder = Some(root.to_path_buf());
+        app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
+        app.items = vec![
+            GridItem::Image(root.join("first.jpg")),
+            GridItem::Folder(root.join("folder")),
+            GridItem::Image(root.join("last.jpg")),
+            GridItem::Folder(root.join("hidden-folder")),
+            GridItem::ZipDir {
+                zip_path: root.join("book.zip"),
+                dir_prefix: "chapter/".to_string(),
+                is_archive: false,
+                representative: None,
+            },
+        ];
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.image_metas = vec![None; app.items.len()];
+        app.visible_indices = vec![0, 1, 2, 4];
+        app.selected = Some(0);
+        app.checked.clear();
+    }
+
+    fn key(app: &mut App, modifiers: egui::Modifiers, key: egui::Key) {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+            ],
+            ..Default::default()
+        });
+        let _owner = app.keyboard_owner_for_pass(&ctx);
+        if modifiers == egui::Modifiers::CTRL && key == egui::Key::A {
+            app.input_main_grid_shortcuts(&ctx, false);
+        } else if key == egui::Key::Delete {
+            app.handle_delete_key(&ctx);
+        } else {
+            let _ = app.handle_keyboard(&ctx);
+        }
+        ctx.end_pass().drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn folders_are_checkable_across_list_kinds_except_drives() {
+        let mut app = setup_app();
+        let root = app.tmp.path().join("predicate");
+        for view in [
+            "normal",
+            "rating",
+            "tag",
+            "history",
+            "item-search",
+            "name-search",
+            "favorite-search",
+            "collection",
+            "smart",
+            "search-bar",
+            "snapshot",
+        ] {
+            install_items(&mut app, &root);
+            app.items_are_rating_view = view == "rating";
+            app.items_are_tag_view = view == "tag";
+            app.items_are_reading_history_view = view == "history";
+            app.items_are_global_search_view = view == "item-search";
+            app.global_search.active = view == "item-search";
+            app.show_search_bar = matches!(view, "name-search" | "search-bar");
+            app.search_filter = (view == "name-search").then(|| HashSet::from([0, 1]).into());
+            app.favsearch.active = view == "favorite-search";
+            app.top_level_grid_view
+                .replace_surface(TopLevelGridSurface::Folder);
+            match view {
+                "collection" => {
+                    super::install_collection_item_for_detached_plan(
+                        &mut app,
+                        &root.join("folder"),
+                        crate::collection_store::CollectionResolvedKind::Folder,
+                    );
+                }
+                "smart" => {
+                    app.top_level_grid_view
+                        .replace_surface(TopLevelGridSurface::SmartFolder(
+                            SmartFolderViewState::root(
+                                uuid::Uuid::nil(),
+                                vec![root.join("folder")],
+                            ),
+                        ));
+                }
+                "snapshot" => app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed),
+                _ => {}
+            }
+            let folder = app
+                .items
+                .iter()
+                .position(|item| matches!(item, GridItem::Folder(_)))
+                .unwrap();
+            assert!(app.grid_folders_checkable(), "{view}");
+            assert!(app.grid_item_can_be_checked(folder), "{view}");
+            assert!(
+                !app.grid_item_can_be_checked(app.items.len()),
+                "{view}: invalid index"
+            );
+            for (index, item) in app.items.iter().enumerate() {
+                if matches!(item, GridItem::ZipDir { .. }) {
+                    assert!(
+                        !app.grid_item_can_be_checked(index),
+                        "{view}: ZIP directory"
+                    );
+                }
+            }
+        }
+        app.items_are_drive_list = true;
+        assert!(!app.grid_folders_checkable());
+        let folder = app
+            .items
+            .iter()
+            .position(|item| matches!(item, GridItem::Folder(_)))
+            .unwrap();
+        assert!(!app.grid_item_can_be_checked(folder));
+    }
+
+    #[test]
+    fn ctrl_a_and_gamepad_select_all_include_visible_folders_in_rating_and_collection() {
+        let mut app = setup_app();
+        let root = app.tmp.path().join("select-all");
+        for view in ["rating", "collection", "drive"] {
+            install_items(&mut app, &root);
+            app.items_are_rating_view = view == "rating";
+            app.items_are_drive_list = view == "drive";
+            app.top_level_grid_view
+                .replace_surface(TopLevelGridSurface::Folder);
+            if view == "drive" {
+                app.items[0] = GridItem::Folder(root.join("first-drive"));
+                app.items[2] = GridItem::Folder(root.join("last-drive"));
+            }
+            if view == "collection" {
+                super::install_collection_item_for_detached_plan(
+                    &mut app,
+                    &root.join("folder"),
+                    crate::collection_store::CollectionResolvedKind::Folder,
+                );
+            }
+            key(&mut app, egui::Modifiers::CTRL, egui::Key::A);
+            let expected = match view {
+                "drive" => HashSet::new(),
+                "collection" => HashSet::from([0]),
+                _ => HashSet::from([0, 1, 2]),
+            };
+            assert_eq!(app.checked, expected, "{view}: Ctrl+A");
+            app.checked.clear();
+            let _ = app.apply_ring_action(
+                &egui::Context::default(),
+                RingShortcutContext::Grid,
+                RingActionId::GridSelectAll,
+                "section1732-test",
+            );
+            assert_eq!(app.checked, expected, "{view}: gamepad select all");
+        }
+    }
+
+    #[test]
+    fn shift_arrow_and_space_check_folders_in_rating_and_collection_but_not_drives() {
+        let mut app = setup_app();
+        let root = app.tmp.path().join("keyboard");
+        for view in ["rating", "collection", "drive"] {
+            install_items(&mut app, &root);
+            app.items_are_rating_view = view == "rating";
+            app.items_are_drive_list = view == "drive";
+            app.top_level_grid_view
+                .replace_surface(TopLevelGridSurface::Folder);
+            let folder = if view == "collection" {
+                super::install_collection_item_for_detached_plan(
+                    &mut app,
+                    &root.join("folder"),
+                    crate::collection_store::CollectionResolvedKind::Folder,
+                );
+                key(&mut app, egui::Modifiers::SHIFT, egui::Key::ArrowRight);
+                assert_eq!(app.checked, HashSet::from([0]), "collection: Shift+Right");
+                0
+            } else {
+                key(&mut app, egui::Modifiers::SHIFT, egui::Key::ArrowRight);
+                assert_eq!(app.selected, Some(1), "{view}: cursor reached folder");
+                assert_eq!(
+                    app.checked.contains(&1),
+                    view != "drive",
+                    "{view}: Shift+Right"
+                );
+                1
+            };
+            app.checked.clear();
+            app.selected = Some(folder);
+            key(&mut app, egui::Modifiers::NONE, egui::Key::Space);
+            assert_eq!(
+                app.checked.contains(&folder),
+                view != "drive",
+                "{view}: Space"
+            );
+            key(&mut app, egui::Modifiers::NONE, egui::Key::Space);
+            assert!(app.checked.is_empty(), "{view}: Space toggles off");
+        }
+    }
+
+    #[test]
+    fn ctrl_a_subfolder_expansion_roots_are_checked_folders_only() {
+        let mut app = setup_app();
+        let root = app.tmp.path().join("expansion");
+        std::fs::create_dir_all(root.join("folder")).unwrap();
+        install_items(&mut app, &root);
+        key(&mut app, egui::Modifiers::CTRL, egui::Key::A);
+        assert_eq!(app.checked, HashSet::from([0, 1, 2]));
+        assert_eq!(
+            app.selected_subfolder_expansion_roots(),
+            vec![root.join("folder")]
+        );
+        app.toggle_subfolder_expansion_view();
+        let pending = app
+            .subfolder_expansion_pending
+            .as_ref()
+            .expect("checked folder scan");
+        assert_eq!(pending.root, root);
+        assert_eq!(pending.roots, vec![root.join("folder")]);
+        pending.cancel();
+    }
+
+    #[test]
+    fn collection_root_ctrl_a_delete_requests_unregistration_and_preserves_folder() {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("registered-folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("keep.txt"), b"preserve").unwrap();
+        super::install_collection_item_for_detached_plan(
+            &mut app,
+            &folder,
+            crate::collection_store::CollectionResolvedKind::Folder,
+        );
+        app.collection_ui.set_read_phase_for_test(false);
+        key(&mut app, egui::Modifiers::CTRL, egui::Key::A);
+        assert_eq!(app.checked, HashSet::from([0]));
+        assert!(matches!(
+            app.collection_root_delete_resolution(app.selected, true),
+            crate::app::collection_grid::CollectionRootDeleteResolution::Ready(ref target)
+                if target.entry_ids.len() == 1
+        ));
+        assert!(!app.any_dialog_open());
+        key(&mut app, egui::Modifiers::NONE, egui::Key::Delete);
+        assert!(app.any_dialog_open(), "registration removal confirmation");
+        assert!(!app.show_delete_confirm);
+        assert!(app.delete_pending.is_none());
+        assert!(app.delete_targets.is_empty());
+        assert_eq!(std::fs::read(folder.join("keep.txt")).unwrap(), b"preserve");
+    }
+
+    #[test]
+    fn collection_physical_child_delete_keeps_folder_confirmation_with_skip_enabled() {
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("registered-folder");
+        std::fs::create_dir_all(folder.join("child")).unwrap();
+        super::install_collection_item_for_detached_plan(
+            &mut app,
+            &folder,
+            crate::collection_store::CollectionResolvedKind::Folder,
+        );
+        let owner = app.collection_grid_physical_load_owner(0, &folder).unwrap();
+        assert!(app.commit_collection_grid_physical_load(&owner, &folder));
+        app.items = vec![GridItem::Folder(folder.join("child"))];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        app.settings.skip_recycle_bin_delete_confirmation = true;
+        key(&mut app, egui::Modifiers::CTRL, egui::Key::A);
+        key(&mut app, egui::Modifiers::NONE, egui::Key::Delete);
+        assert!(app.show_delete_confirm);
+        assert_eq!(
+            app.delete_targets,
+            vec![DeleteTarget::from_grid_item(&GridItem::Folder(folder.join("child"))).unwrap()]
+        );
+        assert!(app.delete_pending.is_none());
+        assert!(folder.join("child").is_dir());
+    }
+
+    #[test]
+    fn ctrl_a_bookmark_delete_includes_missing_page_folder_proxy_without_deleting_files() {
+        use crate::book_bookmarks::{
+            BookBookmarkEvent, BookBookmarkService, BookContainerKind, NewBookBookmark,
+            PageIdentity,
+        };
+        use crate::bookmark_browser::{BookmarkBrowserRow, BookmarkRowSource};
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("book-folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        let page = folder.join("keep.jpg");
+        std::fs::write(&page, b"keep page").unwrap();
+        let service = BookBookmarkService::spawn().unwrap();
+        let mut rows = Vec::new();
+        for (request_id, name) in [(173201, "keep.jpg"), (173202, "missing.jpg")] {
+            service.add(
+                request_id,
+                NewBookBookmark {
+                    container_path: folder.clone(),
+                    container_kind: BookContainerKind::ImageFolder,
+                    page_identity: PageIdentity::RelativePath(name.into()),
+                    page_index_hint: 0,
+                },
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let bookmark = loop {
+                if let Ok(BookBookmarkEvent::Added {
+                    request_id: completed,
+                    result,
+                }) = service.try_recv()
+                {
+                    if completed == request_id {
+                        break result.unwrap().0;
+                    }
+                }
+                assert!(std::time::Instant::now() < deadline, "bookmark insert");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+            let missing = name == "missing.jpg";
+            rows.push(BookmarkBrowserRow {
+                source: BookmarkRowSource::Book(bookmark),
+                item: if missing {
+                    GridItem::Folder(folder.clone())
+                } else {
+                    GridItem::Image(page.clone())
+                },
+                relative_page_provenance: None,
+                image_meta: None,
+                marker_thumbnail: None,
+                created_at_ms: request_id as i64,
+                missing,
+            });
+        }
+        drop(service);
+        assert_eq!(
+            crate::book_bookmarks::load_all_from_disk().unwrap().len(),
+            2
+        );
+        app.items_are_bookmark_view = true;
+        app.items = rows.iter().map(|row| row.item.clone()).collect();
+        app.bookmark_browser_rows = rows;
+        app.thumbnails = vec![ThumbnailState::Pending; 2];
+        app.image_metas = vec![None; 2];
+        app.visible_indices = vec![0, 1];
+        app.selected = Some(0);
+        key(&mut app, egui::Modifiers::CTRL, egui::Key::A);
+        assert_eq!(app.checked, HashSet::from([0, 1]));
+        key(&mut app, egui::Modifiers::NONE, egui::Key::Delete);
+        let pending = app
+            .bookmark_delete_pending
+            .take()
+            .expect("bookmark-only delete worker");
+        assert_eq!(pending.keys.len(), 2);
+        pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert!(
+            crate::book_bookmarks::load_all_from_disk()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!app.show_delete_confirm);
+        assert!(app.delete_pending.is_none());
+        assert_eq!(std::fs::read(page).unwrap(), b"keep page");
+    }
+
+    #[test]
+    fn main_folder_checks_survive_detached_drive_context_creation_and_retirement() {
+        let mut app = setup_app();
+        let root = app.tmp.path().join("contexts");
+        install_items(&mut app, &root);
+        key(&mut app, egui::Modifiers::CTRL, egui::Key::A);
+        let expected_items = app.items.clone();
+        let expected_checks = app.checked.clone();
+        let id =
+            app.build_active_context_for_test(Some(173201), DetachedSource::Image, |detached| {
+                install_items(detached, &root.join("drive-context"));
+                detached.items_are_drive_list = true;
+            });
+        assert_eq!(app.items, expected_items);
+        assert_eq!(app.checked, expected_checks);
+        app.with_window_context_for_test(id, |detached| {
+            assert!(!detached.grid_folders_checkable());
+            assert!(!detached.grid_item_can_be_checked(1));
+            let _ = detached.apply_ring_action(
+                &egui::Context::default(),
+                RingShortcutContext::Grid,
+                RingActionId::GridSelectAll,
+                "section1732-context-test",
+            );
+            assert!(!detached.checked.contains(&1));
+        });
+        assert_eq!(app.items, expected_items);
+        assert_eq!(app.checked, expected_checks);
+        app.close_and_retire_context(id, "section1732-test-close", |_| {}, |_| ())
+            .unwrap();
+        assert_eq!(app.items, expected_items);
+        assert_eq!(app.checked, expected_checks);
+        assert!(app.grid_item_can_be_checked(1));
+    }
+
+    #[test]
+    fn ctrl_a_external_tool_excludes_mixed_folders_and_preserves_container_target() {
+        use crate::external_tool::{
+            ExternalOperation, ExternalTargetSource, ExternalTool, ExternalToolLaunch,
+            LaunchTarget, PayloadPolicy, SelectionPolicy, resolve_external_targets,
+        };
+        let mut app = setup_app();
+        let root = app.tmp.path().join("external");
+        install_items(&mut app, &root);
+        app.visible_indices = vec![0, 1];
+        key(&mut app, egui::Modifiers::CTRL, egui::Key::A);
+        assert_eq!(app.checked, HashSet::from([0, 1]));
+        assert_eq!(
+            resolve_external_targets(
+                &app.items,
+                &app.visible_indices,
+                &app.checked,
+                ExternalTargetSource::GridKey {
+                    selected: app.selected
+                },
+            ),
+            vec![LaunchTarget::ImagePage(root.join("first.jpg"))]
+        );
+        assert_eq!(
+            resolve_external_targets(
+                &app.items,
+                &app.visible_indices,
+                &app.checked,
+                ExternalTargetSource::Container {
+                    path: Some(root.join("folder"))
+                },
+            ),
+            vec![LaunchTarget::RealFile(root.join("folder"))]
+        );
+        for (selection, max_targets) in [
+            (SelectionPolicy::Single, 10),
+            (SelectionPolicy::Each, 10),
+            (SelectionPolicy::Batch, 10),
+            (SelectionPolicy::Each, 1),
+            (SelectionPolicy::Batch, 1),
+        ] {
+            let mut tool = ExternalTool::defaults_for_viewing();
+            tool.launch = ExternalToolLaunch::Executable(root.join("never-launched.exe"));
+            tool.payload = PayloadPolicy::OriginalFile;
+            tool.selection = selection;
+            tool.confirmation_threshold = 1;
+            tool.max_targets = max_targets;
+            app.settings.external_tools = vec![tool];
+            app.fs_feedback_toast = None;
+            let ctx = egui::Context::default();
+            app.launch_grid_external_tool_slot(&ctx, 1);
+            for _ in 0..12 {
+                if !matches!(app.external_tool_operation, ExternalOperation::Preparing(_)) {
+                    break;
+                }
+                app.frame_counter += 1;
+                ctx.run_pass(Default::default(), |ctx| app.show_external_tool_modals(ctx))
+                    .drop_without_applying_deltas();
+            }
+            assert!(
+                matches!(
+                    app.external_tool_operation,
+                    ExternalOperation::Materializing(_)
+                ),
+                "{selection:?}: one file must pass Single / threshold / limit"
+            );
+            assert!(app.fs_feedback_toast.is_none());
+            // Never authorize the worker's external-process launch boundary.
+            // The next request retires and cancels it through the normal owner.
+        }
+        app.settings.external_tools[0].selection = SelectionPolicy::Single;
+        app.request_grid_external_tool_picker();
+        for _ in 0..12 {
+            if !matches!(app.external_tool_operation, ExternalOperation::Preparing(_)) {
+                break;
+            }
+            app.frame_counter += 1;
+            let ctx = egui::Context::default();
+            ctx.run_pass(Default::default(), |ctx| app.show_external_tool_modals(ctx))
+                .drop_without_applying_deltas();
+        }
+        assert!(matches!(
+            app.external_tool_operation,
+            ExternalOperation::Picker(_)
+        ));
+    }
+}

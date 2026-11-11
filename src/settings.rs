@@ -5093,8 +5093,8 @@ pub struct Settings {
     /// 「Windows のメニュー」サブメニューへまとめる。
     #[serde(default)]
     pub show_windows_context_menu_inline: bool,
-    /// mIV の事前判定でごみ箱へ移せる対象は、種類に関係なく mIV 側の削除確認を省略する。
-    /// 完全削除候補は常に確認を残す。
+    /// mIV の事前判定でごみ箱へ移せる対象は、実フォルダを含まなければ削除確認を省略する。
+    /// 実フォルダを含む場合と完全削除候補は常に確認を残す。
     #[serde(default)]
     pub skip_recycle_bin_delete_confirmation: bool,
 

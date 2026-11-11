@@ -8276,7 +8276,7 @@ impl App {
             }
             RingActionId::GridSelectAll if context == RingShortcutContext::Grid => {
                 for &idx in &self.visible_indices {
-                    if self.items.get(idx).is_some_and(|it| it.is_checkable()) {
+                    if self.grid_item_can_be_checked(idx) {
                         self.checked.insert(idx);
                     }
                 }

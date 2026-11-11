@@ -125,6 +125,7 @@ fn section1373_composition_save_remove_admission_rejects_busy_without_mutation()
                         source_context: receipt.source_context,
                         accepted_revision: receipt.accepted_revision,
                         target_folder: receipt.files.folder.clone(),
+                        skipped_containers: 0,
                         observations: Default::default(),
                     }
                 };

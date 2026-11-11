@@ -1,5 +1,13 @@
 # UI スナップショットテスト運用方針
 
+§1.732 はフォルダを含む削除の必須確認に合わせ、環境設定の説明文と既存の
+`preferences_recycle_bin_delete_confirmation`（560×230、61,954 bytes）だけを更新した。
+実装担当と独立 reviewer が全文・折り返し・余白を目視し、欠けや重なりがないことを確認した。
+`preferences_folder_edit_restore`（620×680）も再生成して比較し、従来 PNG と byte 単位で一致した。
+2件の更新指定なしの通常比較も成功した。純粋な設定描画 fixture で、製品アプリの起動は含まない。
+一覧セルのレイアウト・チェック印の描画は変えていない。検証記録は
+[フォルダ選択の設計 §7](folder-check-selection-plan.md#7-実装と検証の記録2026-11-10)を参照。
+
 3D写真 段C（2026-11-07）は `depth_export_settings_small_dark` /
 `depth_export_progress_small_dark` の2枚（1093×614、55,224 / 29,457 bytes）を追加した。
 設定の各選択・既定4ループ・固定操作行・タイトル×、進行数と取消の表示を実装担当と

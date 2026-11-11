@@ -281,6 +281,8 @@ pub enum BookOpIntent {
         source_context: crate::app::ViewerContextId,
         accepted_revision: u64,
         target_folder: PathBuf,
+        /// Containers skipped when the grid selection was admitted; reported on success.
+        skipped_containers: usize,
         observations: crate::book_append_undo::AppendObservations,
     },
     UndoAppend {

@@ -101,7 +101,7 @@ Copy/Cut → Paste の表は、mIV が持つ OLE clipboard shortcut / paste verb
 | ファイル Copy/Cut — 右クリック・グリッド | **対応**。単一は先頭の「切り取り」「コピー」、checked は件数付きで表示し、解決済み `shell_paths` を渡す。 | **対応**。単一・Space でチェックした集合のどちらも実フォルダ path を渡す。 | **対応**。単一・checked とも ZIP/PDF 実 path を渡す。 | **拒否**。単一では項目を隠し、VirtualOnly / Mixed checked では理由付き disabled にする。 | **拒否**。`ZipImage` と同じ。 | **拒否**。単一では項目を隠し、仮想 checked なら理由付き disabled。 | **拒否**。単一では項目を隠し、仮想 checked なら理由付き disabled。 | enabled 時はキー入口と同じ OLE clipboard helper へ、右クリック時に確定した path 集合と Copy / Cut verb を渡す。 |
 | ファイル Copy/Cut — 右クリック・ビューア | **対応**。実ファイルページでは先頭の「切り取り」「コピー」から OLE clipboard へ渡す。 | **拒否**。Folder 自体は viewer leaf にならない。 | **拒否**。コンテナ自身でなく子 page が viewer target になる。 | **拒否**。実 filesystem path がないため項目を隠す。 | **拒否**。実 filesystem path がないため項目を隠す。 | **拒否**。Stack 自体は viewer 前に member Image へ展開される。 | **拒否**。ZipDir 自体は viewer leaf にならない。 | enabled 時はグリッドと同じ OLE clipboard helper へ単一の実 path と Copy / Cut verb を渡す。 |
 | 外向き file D&D — グリッド・単一 | **対応**。実 path を `SHDoDragDrop` に COPY effect で渡す (`src/ui_main.rs:1691-1744`, `src/file_drag.rs:160-199`)。 | **対応**。Folder の `drag_source_path` を渡す (`src/grid_item.rs:288-307`, `src/ui_main.rs:1736-1744`)。 | **対応**。ZIP/PDF 実 path を渡す (`src/grid_item.rs:288-307`, `src/ui_main.rs:1736-1744`)。 | **拒否**。種別ごとの理由をトーストで返す (2026-08-30 修正、`GridItem::file_operation_refusal`)。 | **拒否**。同上。 | **拒否**。同上 (スタック向けの文言)。 | **拒否**。同上 (書庫内フォルダ向けの文言)。 | destination Shell へ COPY だけを要求する。元 path / mIV DB は変更しない (`src/file_drag.rs:160-199`)。 |
-| 外向き file D&D — グリッド・checked（実項目だけ / 仮想 page だけ） (`src/ui_main.rs`) | **対応**。checked が実項目だけなら実 path 全件を drag する。 | **対応**。サブフォルダ展開可能な一覧で Space によりチェックした Folder も `drag_source_path` を渡す。 | **対応**。checked が実項目だけなら ZIP/PDF path 全件を drag する。 | **拒否**。仮想 page だけの checked は事前トーストを出して drag しない。 | **拒否**。仮想 page だけの checked は事前トーストを出して drag しない。 | **拒否**。checkbox 対象外。 | **拒否**。checkbox 対象外。 | 実項目だけなら destination Shell へ COPY。仮想 page だけなら file / DB とも変更なし。 |
+| 外向き file D&D — グリッド・checked（実項目だけ / 仮想 page だけ） (`src/ui_main.rs`) | **対応**。checked が実項目だけなら実 path 全件を drag する。 | **対応**。ドライブ一覧以外でチェックした Folder も `drag_source_path` を渡す。 | **対応**。checked が実項目だけなら ZIP/PDF path 全件を drag する。 | **拒否**。仮想 page だけの checked は事前トーストを出して drag しない。 | **拒否**。仮想 page だけの checked は事前トーストを出して drag しない。 | **拒否**。checkbox 対象外。 | **拒否**。checkbox 対象外。 | 実項目だけなら destination Shell へ COPY。仮想 page だけなら file / DB とも変更なし。 |
 | 外向き file D&D — グリッド・実 / 仮想 page 混在 checked (`src/ui_main.rs`) | **対応**。実 path は drag 対象に残り、部分実行される。 | **対応**。Space でチェックした Folder は実 path として部分実行側に残る。 | **対応**。ZIP/PDF の実 path は drag 対象に残り、部分実行される。 | **拒否**。この page は対象から除外されるが、実 path の COPY は部分実行し、完了後にトーストを出す。 | **拒否**。この page は対象から除外されるが、実 path の COPY は部分実行し、完了後にトーストを出す。 | **拒否**。checkbox 対象外。 | **拒否**。checkbox 対象外。 | 残った実 path だけ destination Shell へ COPY。除外 page と元 path / DB は変更しない。 |
 | 外向き file D&D — ビューア | **拒否**。drag start は grid cell response にだけ接続される (`src/ui_main.rs:13319-13335`)。 | **拒否**。grid cell drag 入口がなく viewer leaf でもない (`src/ui_main.rs:13319-13335`)。 | **拒否**。grid cell drag 入口がなく viewer leaf でもない (`src/ui_main.rs:13319-13335`)。 | **拒否**。grid cell drag 入口がない (`src/ui_main.rs:13319-13335`)。 | **拒否**。grid cell drag 入口がない (`src/ui_main.rs:13319-13335`)。 | **拒否**。grid cell drag 入口がない (`src/ui_main.rs:13319-13335`)。 | **拒否**。grid cell drag 入口がない (`src/ui_main.rs:13319-13335`)。 | D&D 処理が起動しないため変更なし (`src/ui_main.rs:13319-13335`)。 |
 | パス文字列コピー — グリッド・単一 (`src/context_menu_model.rs:328-368`) | **対応**。実 path を clipboard text にする (`src/ui_dialogs/context_menu.rs:475-501`, `src/ui_dialogs/context_menu.rs:1366-1389`)。 | **対応**。folder の実 path を text にする (`src/ui_dialogs/context_menu.rs:475-501`)。 | **対応**。コンテナの実 path を text にする (`src/ui_dialogs/context_menu.rs:475-501`)。 | **対応**。filesystem path ではなく `zip_path:entry` の合成表示文字列 (`src/ui_dialogs/context_menu.rs:489-497`)。 | **対応**。filesystem path ではなく `pdf_path:Page N` の合成表示文字列 (`src/ui_dialogs/context_menu.rs:498-500`)。 | **対応**。「代表画像のパス」をコピーする (`src/context_menu_model.rs:328-343`, `src/ui_dialogs/context_menu.rs:485-488`)。 | **対応**。filesystem path ではなく `zip_path:prefix` の合成表示文字列 (`src/ui_dialogs/context_menu.rs:489-497`)。 | OS clipboard の text のみ。file / DB は変更しない (`src/ui_dialogs/context_menu.rs:471-473`, `src/ui_dialogs/context_menu.rs:1388-1389`)。 |
@@ -118,7 +118,7 @@ Copy/Cut が出るかは mIV が固定しないため **要調査（実行環境
 
 | 機能・入口 | 実ファイル (`Image` / `Video` / `Audio`) | `Folder` | コンテナファイル (`ZipFile` / `PdfFile`) | `ZipImage` | `PdfPage` | `Stack` | `ZipDir` | 保存先・対象ファイルの変更 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| ExternalTool — グリッド | **対応**。右クリックは checked があれば checked 全件、無ければ右クリック項目、キーは checked 優先・無ければ selected を対象にする。全対象を `current_grid_order()` 順に保ち、`Single` / `Each` / `Batch` で渡す。画像は `TempEdited` なら常に PNG、`TempOriginal` なら常に元バイト列のコピー、`OriginalFile` なら実ファイルそのもの。動画は `VideoPolicy::CurrentFrame` のとき提示済みフレームを原寸 decode し、それ以外は動画本体を渡す (コピーしない)。 | **対応**。キー・固定スロット・ツール選択は選択した実フォルダー自身を `RealFile` として渡し、checked の表示順・件数制限を適用する。画像用一時出力は行わない。フォルダー項目の右クリックと物理フォルダー背景は従来どおりコンテナー 1 件を渡す。設定previewとメニューcapabilityも `LaunchTarget::from_grid_item` を共有する（§1.397）。 | **対応**。コンテナー項目の右クリックは checked を広げず、ZIP/PDF 自身 1 件を渡す。ページ入口で選んだ場合も実ファイルとして選択ポリシーを適用する。 | **対応**。`TempOriginal` は常に元バイト列を一時展開、`TempEdited` は常に PNG。`OriginalFile` は元ファイルが無いので同期判定で無効化し、native / egui menu の hover で理由を表示する (隠さない)。worker でも拒否する。実ファイルとの混在も全件を選択ポリシーへ渡す。 | **対応**。`TempOriginal` / `TempEdited` はツール指定長辺で PNG (PDF ページには元バイト列が無い)。`OriginalFile` の扱いは `ZipImage` と同じ。 | **対応**。束ねられた全 member を表示順の実項目へ展開してから `SelectionPolicy` と件数上限を適用する。 | **拒否**。書庫内ディレクトリ自体は実体化対象にしないため、混在時も部分実行せず全体を拒否する。 | tool 定義は `settings.db` の `external_tools` table。派生 temp は process 単位 directory に置くが元 file は変更しない。外部 process が元実ファイルを変更した後の監視・再読込は P5。 |
+| ExternalTool — グリッド | **対応**。右クリックは checked があればその対象、無ければ右クリック項目、キーは checked 優先・無ければ selected を対象にする。checked に Folder 以外があれば Folder を除き、件数・確認閾値・上限・capability も残りで判定する。ZIP/PDF 本体は除かない。全対象を `current_grid_order()` 順に保ち、`Single` / `Each` / `Batch` で渡す。画像は `TempEdited` なら常に PNG、`TempOriginal` なら常に元バイト列のコピー、`OriginalFile` なら実ファイルそのもの。動画は `VideoPolicy::CurrentFrame` のとき提示済みフレームを原寸 decode し、それ以外は動画本体を渡す (コピーしない)。 | **対応**。キー・固定スロット・ツール選択は、Folder だけの checked、またはチェックなしの単独選択で実フォルダー自身を `RealFile` として渡す。Folder 以外と一緒にチェックした場合は Folder を除き、除外件数は通知しない。残った対象に表示順・件数制限を適用する。画像用一時出力は行わない。フォルダー項目の右クリックと物理フォルダー背景は従来どおりコンテナー 1 件を渡す。設定previewとメニューcapabilityも `LaunchTarget::from_grid_item` を共有する（§1.397）。 | **対応**。コンテナー項目の右クリックは checked を広げず、ZIP/PDF 自身 1 件を渡す。ページ入口で選んだ場合も実ファイルとして選択ポリシーを適用する。 | **対応**。`TempOriginal` は常に元バイト列を一時展開、`TempEdited` は常に PNG。`OriginalFile` は元ファイルが無いので同期判定で無効化し、native / egui menu の hover で理由を表示する (隠さない)。worker でも拒否する。実ファイルとの混在も全件を選択ポリシーへ渡す。 | **対応**。`TempOriginal` / `TempEdited` はツール指定長辺で PNG (PDF ページには元バイト列が無い)。`OriginalFile` の扱いは `ZipImage` と同じ。 | **対応**。束ねられた全 member を表示順の実項目へ展開してから `SelectionPolicy` と件数上限を適用する。 | **拒否**。書庫内ディレクトリ自体は実体化対象にしないため、混在時も部分実行せず全体を拒否する。 | tool 定義は `settings.db` の `external_tools` table。派生 temp は process 単位 directory に置くが元 file は変更しない。外部 process が元実ファイルを変更した後の監視・再読込は P5。 |
 | ExternalTool — ビューア | **対応**。checked を無視して viewer の現在ページ 1 件を共通 resolver へ渡す。見開き中も P4 までは現在ページ 1 件で、`SpreadPolicy` 3 値は適用しない。ただし起動完了前でも viewer close を予約する。 | **拒否**。Folder variant 自体を viewer leaf / tool target にしない。 | **拒否**。コンテナ自身は viewer leaf にしない。現在の ZIP / PDF page で `Container` を選んだ場合は各 page セルのとおり親本体を渡す。 | **対応 (P3)**。現在の ZIP page をグリッドと同じ materializer へ渡す。`Container` は外側の元書庫を渡す。 | **対応 (P3)**。現在の PDF page をグリッドと同じ materializer へ渡す。`Container` は PDF 本体を渡す。 | **拒否**。Stack 自体は viewer 前に member Image へ展開される。 | **拒否**。ZipDir variant 自体を viewer leaf / tool target にしない。 | グリッドと同じ tool 定義・worker・一時ファイル寿命を使う。mIV は元 file を書き換えない。 |
 
 `SelectionPolicy::Single` は対象が 1 件のときだけ渡し、2 件以上なら全体を拒否する。既定の `Each` は
@@ -130,7 +130,7 @@ Copy/Cut が出るかは mIV が固定しないため **要調査（実行環境
 複数試行の結果は 1 利用者操作として成功 / 失敗件数を集約して通知する。
 
 P2b-1 の `ExternalToolPicker` / `ExternalTool1` .. `ExternalTool10` /
-`ExternalToolForContainer` は main-window の Grid 専用で、既定キーは設定しない。前二者は選択項目（実フォルダーを含む）対象、
+`ExternalToolForContainer` は main-window の Grid 専用で、既定キーは設定しない。前二者は選択項目対象（他の種類と一緒にチェックした実フォルダーは除き、フォルダーだけなら渡す）、
 最後は現在の `effective_folder()` からフォルダー / 本 1 件を解決する。変換アーカイブでは変換 cache ZIP
 でなく元アーカイブを渡し、検索・タグ・履歴・snapshot 等の集約ビュー背景では単一の現在地を決めず
 拒否する。右クリックは登録済みの全ツールを平坦に並べ、フォルダー背景と
@@ -163,6 +163,7 @@ adjustment 等の別 action になる (`src/keymap.rs:5438-5446`, `src/ui_fullsc
 
 > **2026-08-30 時点の進捗**: 5 / 8 / 11 / 12 は修正済み (本文の該当セルも更新済み)。
 > 残りは主に **1 / 2 / 3 / 4 / 9 / 10 = タグとページの関係**に集約される。
+> **2026-11-10 追記**: 6 のフォルダ選択と Ctrl+A の不一致は §1.732 で解消。
 > 14 (checked を無視する ExternalTool) と 15 (Windows 側削除) は現行仕様として意図的。
 
 1. **★ / タグ × `ZipImage` / `PdfPage`** — ★ はページ固有 key・kind で付き、タグは
@@ -186,10 +187,12 @@ adjustment 等の別 action になる (`src/keymap.rs:5438-5446`, `src/ui_fullsc
 6. **実ファイル操作 × checkable item** — `drag_source_path` は実ファイル / 実フォルダを返し、
    ZIP / PDF 内 page を除外する一方、`is_checkable` は page を含む。そのため checked 後の
    Copy/Cut、パスコピー、削除は仮想 page を含む全選択を拒否する。右クリックでは先頭の
-   「切り取り」「コピー」を理由付き disabled で残す。サブフォルダ展開可能な通常一覧では
-   Space が Folder もチェック可能にし、Shell menu / Copy/Cut / D&D / パスコピー / 削除の
-   全入口が同じ実 Folder path を扱う。ただし Ctrl+A は `is_checkable` だけを見るため Folder を
-   含めない (`src/app/subfolder_expansion.rs`, `src/app.rs`, `src/ui_dialogs/context_menu.rs`)。
+   「切り取り」「コピー」を理由付き disabled で残す。**フォルダ選択の入口差は解消済み (§1.732)**。
+   ドライブ一覧以外では Space / Ctrl・Shift+クリック / Shift+矢印 / Ctrl+A / ゲームパッドが
+   共通の `grid_item_can_be_checked` / `grid_item_checkable` 判定で Folder を含める。
+   Shell menu / Copy/Cut / D&D / パスコピー / 削除は同じ実 Folder path を扱う
+   (`src/app/subfolder_expansion.rs`, `src/grid_item.rs`, `src/app/update_phases.rs`,
+   `src/app/gamepad_input.rs`, `src/ui_dialogs/context_menu.rs`)。
 7. **仮想 item 混在選択 × file 操作** — キーと右クリックの Copy/Cut、パスコピー、削除は
    全体拒否する。右クリックの Copy/Cut は `Mixed` / `VirtualOnly` を分類して項目を disabled にし、
    Windows menu 用 `shell_paths` も作らない。一方 D&D は仮想 page だけ除外して実 path を

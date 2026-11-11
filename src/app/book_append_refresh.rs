@@ -263,6 +263,7 @@ impl App {
             source_context,
             accepted_revision,
             target_folder,
+            skipped_containers,
             ..
         }) = self.book_op_pending.as_ref().map(|pending| &pending.intent)
         else {
@@ -273,6 +274,7 @@ impl App {
             source_context: *source_context,
             accepted_revision: *accepted_revision,
         };
+        let skipped_containers = *skipped_containers;
         if !crate::folder_tree::path_eq(target_folder, &summary.folder) {
             summary.undo_files = None;
         }
@@ -412,6 +414,9 @@ impl App {
             "「{}」に {} ページ追加しました",
             summary.book_name, summary.added
         );
+        if skipped_containers > 0 {
+            message.push_str(&format!(" (フォルダ・本 {skipped_containers} 件は対象外)"));
+        }
         if summary.erase_fallback_pages > 0 {
             message.push_str(&format!(
                 "\n{} ページの消しゴム補完は簡易処理で再作成しました",
@@ -683,6 +688,7 @@ mod tests {
                 source_context: receipt.source_context,
                 accepted_revision: receipt.accepted_revision,
                 target_folder: receipt.files.folder.clone(),
+                skipped_containers: 0,
                 observations: AppendObservations::default(),
             },
         });
@@ -849,6 +855,134 @@ mod tests {
                 "Append preparation did not finish"
             );
             std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn grid_append_completion_fixture() -> AppTestEnvForTest {
+        let mut app = setup_app_for_test();
+        let source = app.tmp.path().join("source.jpg");
+        std::fs::write(&source, b"unchanged page bytes").unwrap();
+        app.settings.book_root = Some(app.tmp.path().join("books"));
+        app.settings.active_book_name = "target".into();
+        app.items = vec![GridItem::Image(source)];
+        app
+    }
+
+    #[test]
+    fn section1732_book_add_completion_reports_skipped_containers() {
+        let mut app = grid_append_completion_fixture();
+        let folder = app.tmp.path().join("folder");
+        let zip = app.tmp.path().join("book.zip");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(&zip, b"excluded container").unwrap();
+        app.items
+            .extend([GridItem::Folder(folder), GridItem::ZipFile(zip)]);
+        app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+        app.checked = (0..app.items.len()).collect();
+        app.rebuild_visible_indices();
+        let ctx = egui::Context::default();
+        app.add_grid_selection_to_active_book(&ctx);
+        assert!(matches!(
+            app.book_op_pending.as_ref().map(|pending| &pending.intent),
+            Some(BookOpIntent::Append {
+                skipped_containers: 2,
+                ..
+            })
+        ));
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().unwrap().0,
+            "「target」へ追加中: 1 ページ (フォルダ・本 2 件は対象外)"
+        );
+        drain_append(&mut app, &ctx);
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().unwrap().0,
+            "「target」に 1 ページ追加しました (フォルダ・本 2 件は対象外)"
+        );
+        let output = &app.book_append_undo_receipt.as_ref().unwrap().files.created[0].path;
+        assert_eq!(std::fs::read(output).unwrap(), b"unchanged page bytes");
+    }
+
+    #[test]
+    fn section1732_book_add_completion_without_skips_keeps_existing_message() {
+        let mut app = grid_append_completion_fixture();
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.checked.insert(0);
+        app.rebuild_visible_indices();
+        let ctx = egui::Context::default();
+        app.add_grid_selection_to_active_book(&ctx);
+        assert!(matches!(
+            app.book_op_pending.as_ref().map(|pending| &pending.intent),
+            Some(BookOpIntent::Append {
+                skipped_containers: 0,
+                ..
+            })
+        ));
+        drain_append(&mut app, &ctx);
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().unwrap().0,
+            "「target」に 1 ページ追加しました"
+        );
+    }
+
+    #[test]
+    fn section1732_book_append_refresh_retains_skipped_count_on_the_same_intent() {
+        let (mut app, receipt, summary) = fixture();
+        let tx = hold(&mut app, &receipt);
+        let BookOpIntent::Append {
+            skipped_containers, ..
+        } = &mut app.book_op_pending.as_mut().unwrap().intent
+        else {
+            unreachable!()
+        };
+        *skipped_containers = 2;
+        tx.send(Ok(BookOpResult::Append(summary))).unwrap();
+        let ctx = egui::Context::default();
+        app.poll_book_op_pending(&ctx);
+        // Viewing the target schedules a real readonly refresh under the same request.
+        assert!(matches!(
+            app.book_op_pending.as_ref().map(|pending| &pending.intent),
+            Some(BookOpIntent::Append {
+                operation_id: 42,
+                skipped_containers: 2,
+                ..
+            })
+        ));
+        drain_append(&mut app, &ctx);
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .unwrap()
+                .0
+                .starts_with("「book」に 1 ページ追加しました (フォルダ・本 2 件は対象外)")
+        );
+    }
+
+    #[test]
+    fn section1732_book_append_failure_and_disconnect_do_not_report_skipped_count() {
+        for disconnected in [false, true] {
+            let (mut app, receipt, _) = fixture();
+            let tx = hold(&mut app, &receipt);
+            let BookOpIntent::Append {
+                skipped_containers, ..
+            } = &mut app.book_op_pending.as_mut().unwrap().intent
+            else {
+                unreachable!()
+            };
+            *skipped_containers = 2;
+            if !disconnected {
+                tx.send(Err("copy failed".into())).unwrap();
+            }
+            drop(tx);
+            app.poll_book_op_pending(&egui::Context::default());
+            assert!(app.book_op_pending.is_none());
+            assert_eq!(
+                app.fs_feedback_toast.as_ref().unwrap().0,
+                if disconnected {
+                    "製本処理に失敗しました: 製本処理が中断されました"
+                } else {
+                    "製本処理に失敗しました: copy failed"
+                }
+            );
         }
     }
 
@@ -1308,9 +1442,23 @@ mod tests {
         receipt.source_context = other;
         receipt.accepted_revision = app.book_append_undo_revision;
         let tx = hold(&mut app, &receipt);
+        let BookOpIntent::Append {
+            skipped_containers, ..
+        } = &mut app.book_op_pending.as_mut().unwrap().intent
+        else {
+            unreachable!()
+        };
+        *skipped_containers = 3;
         let generation = app.items_generation;
         tx.send(Ok(BookOpResult::Append(summary))).unwrap();
         app.poll_book_op_pending(&egui::Context::default());
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("(フォルダ・本 3 件は対象外)")
+        );
         assert_eq!(app.projected_viewer_context_id(), main);
         assert_eq!(app.items_generation, generation);
         assert!(app.book_append_operation_matches_receipt(receipt.operation()));
@@ -1370,9 +1518,23 @@ mod tests {
         });
         app.erase_mask = Some(vec![true, false]);
         let tx = hold(&mut app, &receipt);
+        let BookOpIntent::Append {
+            skipped_containers, ..
+        } = &mut app.book_op_pending.as_mut().unwrap().intent
+        else {
+            unreachable!()
+        };
+        *skipped_containers = 4;
         let generation = app.items_generation;
         tx.send(Ok(BookOpResult::Append(summary))).unwrap();
         app.poll_book_op_pending(&egui::Context::default());
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("(フォルダ・本 4 件は対象外)")
+        );
         assert!(app.book_append_undo_receipt.is_none());
         assert!(app.book_op_pending.is_none());
         assert_eq!(app.erase_mask, Some(vec![true, false]));

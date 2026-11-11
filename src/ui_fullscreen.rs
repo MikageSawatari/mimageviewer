@@ -4816,6 +4816,18 @@ const BOOK_ADD_UNSUPPORTED_ITEM_HINT: &str =
 const BOOK_ADD_MIXED_UNSUPPORTED_HINT: &str = "画像・ページ以外が選ばれているため追加できません";
 const BOOK_ADD_SAME_TARGET_BOOK_PAGE_HINT: &str =
     "追加先に設定されている本のページは、同じ本に追加できません";
+const BOOK_ADD_CONTAINERS_ONLY_HINT: &str =
+    "フォルダや本はそのままでは本へ追加できません。中の画像を選んでください";
+
+fn grid_book_add_skips_container(item: &GridItem) -> bool {
+    matches!(
+        item,
+        GridItem::Folder(_)
+            | GridItem::ZipFile(_)
+            | GridItem::PdfFile(_)
+            | GridItem::ConvertibleArchive { .. }
+    )
+}
 
 fn friendly_book_add_error(err: String) -> String {
     if err.contains("最終合成の完了後")
@@ -56075,6 +56087,16 @@ impl App {
         indices
     }
 
+    /// 本だけの選択も受け付け、実行時に中のページを選ぶ案内を出す。
+    /// メニューとツールバーは実処理と同じチェック優先・smart folder の規則を使う。
+    pub(crate) fn grid_book_add_has_selection(&self) -> bool {
+        self.checked
+            .iter()
+            .copied()
+            .chain(self.selected.filter(|_| self.checked.is_empty()))
+            .any(|idx| self.items.get(idx).is_some() && self.smart_folder_rule_qualifies_index(idx))
+    }
+
     pub(crate) fn add_grid_selection_to_named_book(
         &mut self,
         ctx: &egui::Context,
@@ -56093,7 +56115,17 @@ impl App {
         let target_folder = crate::books::book_folder(&self.book_root_path(), &book_name);
         let mut sources = Vec::new();
         let mut errors = Vec::new();
+        let mut skipped_containers = 0;
         for idx in indices {
+            // 本体はページへ変換しない。エラー文ではなく種類で除外し、画像との混在を許す。
+            if self
+                .items
+                .get(idx)
+                .is_some_and(grid_book_add_skips_container)
+            {
+                skipped_containers += 1;
+                continue;
+            }
             // ファイル名スタックの集約セルは、そのメンバー画像を 1 枚ずつ通常の Grid 追加と同じ規則
             // (同一本ページ拒否 + 色補正/非破壊回転の焼き込み) で展開する。Stack セルは
             // book_page_source_for_idx の対象外 (1 idx = N メンバー) なので専用経路で個別変換する。
@@ -56126,8 +56158,20 @@ impl App {
             return;
         }
         let count = sources.len();
-        self.start_book_append_to_named(ctx, book_name.clone(), sources);
-        self.show_feedback_warning(format!("「{book_name}」へ追加中: {count} ページ"));
+        if count == 0 {
+            self.show_feedback_warning(if skipped_containers > 0 {
+                BOOK_ADD_CONTAINERS_ONLY_HINT.to_string()
+            } else {
+                "選択中に追加できるページがありません".to_string()
+            });
+            return;
+        }
+        self.start_book_append_to_named(ctx, book_name.clone(), sources, skipped_containers);
+        let mut message = format!("「{book_name}」へ追加中: {count} ページ");
+        if skipped_containers > 0 {
+            message.push_str(&format!(" (フォルダ・本 {skipped_containers} 件は対象外)"));
+        }
+        self.show_feedback_warning(message);
     }
 
     pub(crate) fn add_clipboard_image_to_active_book(&mut self, ctx: &egui::Context) {
@@ -56169,7 +56213,7 @@ impl App {
             }
         };
         let book_name = self.active_book_name();
-        self.start_book_append_to_named(ctx, book_name, vec![source]);
+        self.start_book_append_to_named(ctx, book_name, vec![source], 0);
         self.show_feedback_warning("追加先の本へ追加中".to_string());
     }
 
@@ -82464,6 +82508,156 @@ mod tests {
             true,
             Some((ZOOM_NEAR_ONE + 0.01, egui::Vec2::ZERO))
         ));
+    }
+
+    fn grid_book_add_container_items(root: &std::path::Path) -> Vec<GridItem> {
+        vec![
+            GridItem::Folder(root.join("folder")),
+            GridItem::ZipFile(root.join("book.zip")),
+            GridItem::PdfFile(root.join("book.pdf")),
+            GridItem::ConvertibleArchive {
+                path: root.join("book.7z"),
+                format: crate::archive_converter::ArchiveFormat::SevenZ,
+            },
+        ]
+    }
+
+    #[test]
+    fn grid_book_add_selection_admission_keeps_container_guidance_and_checked_priority() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = grid_book_add_container_items(app.tmp.path());
+        assert!(!app.grid_book_add_has_selection());
+        app.selected = Some(0);
+        assert!(
+            app.grid_book_add_has_selection(),
+            "本だけでも案内を表示できる"
+        );
+        app.checked.insert(99);
+        assert!(
+            !app.grid_book_add_has_selection(),
+            "チェック優先で無効な idx は除く"
+        );
+        app.checked.insert(1);
+        assert!(app.grid_book_add_has_selection());
+        app.checked.clear();
+        app.selected = Some(99);
+        assert!(!app.grid_book_add_has_selection());
+    }
+
+    #[test]
+    fn grid_book_add_skips_all_container_types_and_starts_remaining_page() {
+        let mut app = crate::app::setup_app_for_test();
+        let src = app.tmp.path().join("source.jpg");
+        let root = app.tmp.path().join("books");
+        std::fs::write(&src, b"unchanged page bytes").unwrap();
+        app.settings.book_root = Some(root.clone());
+        app.items = grid_book_add_container_items(app.tmp.path());
+        app.items.push(GridItem::Image(src));
+        app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending; app.items.len()];
+        app.checked = (0..app.items.len()).collect();
+        app.rebuild_visible_indices();
+        let ctx = egui::Context::default();
+
+        app.add_grid_selection_to_named_book(&ctx, "target".into());
+
+        let pending = app
+            .book_op_pending
+            .take()
+            .expect("remaining page starts append worker");
+        // Join the physical append before the disposable AppTestEnv/data-dir override is dropped.
+        let result = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("book append worker completes")
+            .expect("book append succeeds");
+        let crate::books::BookOpResult::Append(summary) = result else {
+            panic!("expected append result");
+        };
+        assert_eq!(summary.added, 1);
+        assert_eq!(
+            std::fs::read(summary.first_path.expect("appended page")).unwrap(),
+            b"unchanged page bytes"
+        );
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+            Some("「target」へ追加中: 1 ページ (フォルダ・本 4 件は対象外)")
+        );
+    }
+
+    #[test]
+    fn grid_book_add_container_only_selection_guides_without_starting_worker() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.book_root = Some(app.tmp.path().join("books"));
+        app.items = grid_book_add_container_items(app.tmp.path());
+        let ctx = egui::Context::default();
+        // カーソル単独の各種類と、チェック選択の両方を同じ受付で扱う。
+        for idx in 0..app.items.len() {
+            app.selected = Some(idx);
+            app.add_grid_selection_to_named_book(&ctx, "target".into());
+            assert!(app.book_op_pending.is_none());
+            assert_eq!(
+                app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+                Some(BOOK_ADD_CONTAINERS_ONLY_HINT)
+            );
+        }
+        app.checked = (0..app.items.len()).collect();
+        app.add_grid_selection_to_named_book(&ctx, "target".into());
+        assert!(app.book_op_pending.is_none());
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+            Some(BOOK_ADD_CONTAINERS_ONLY_HINT)
+        );
+        assert!(!app.book_root_path().exists());
+    }
+
+    #[test]
+    fn grid_book_add_container_skips_preserve_media_and_same_book_rejections() {
+        let mut app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().join("books");
+        app.settings.book_root = Some(root.clone());
+        let ctx = egui::Context::default();
+        let source_path = app.tmp.path().join("source.jpg");
+        let invalid_items = [
+            (
+                GridItem::Video(app.tmp.path().join("movie.mp4")),
+                BOOK_ADD_MIXED_UNSUPPORTED_HINT,
+            ),
+            (
+                GridItem::Audio(app.tmp.path().join("sound.mp3")),
+                BOOK_ADD_MIXED_UNSUPPORTED_HINT,
+            ),
+            (
+                GridItem::Image(root.join("target/0001_page.jpg")),
+                BOOK_ADD_SAME_TARGET_BOOK_PAGE_HINT,
+            ),
+        ];
+        for (invalid, message) in invalid_items {
+            app.items = grid_book_add_container_items(app.tmp.path());
+            app.items.push(GridItem::Image(source_path.clone()));
+            app.items.push(invalid);
+            app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending; app.items.len()];
+            app.checked = (0..app.items.len()).collect();
+            app.rebuild_visible_indices();
+            app.add_grid_selection_to_named_book(&ctx, "target".into());
+            assert!(
+                app.book_op_pending.is_none(),
+                "invalid page must reject the whole append"
+            );
+            assert_eq!(
+                app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+                Some(message)
+            );
+            assert!(!root.exists());
+        }
+        app.items = vec![GridItem::Video(app.tmp.path().join("movie.mp4"))];
+        app.checked.clear();
+        app.selected = Some(0);
+        app.add_grid_selection_to_named_book(&ctx, "target".into());
+        assert!(app.book_op_pending.is_none());
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+            Some(BOOK_GRID_VIDEO_HINT)
+        );
     }
 
     #[test]
