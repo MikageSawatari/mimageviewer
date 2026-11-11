@@ -22,7 +22,7 @@
 
 ### v1 に含める
 
-- メイン context のウィンドウ表示 / 全画面の **3D 表示モード** (以下「3D モード」)。ON/OFF はキーと閲覧上部の
+- メイン context のウィンドウ表示 / 全画面 / linked F12 別ウィンドウの **3D 表示モード** (以下「3D モード」、§6.4.2)。ON/OFF はキーと閲覧上部の
   ボタン。入ると右側に **3D パネル**が出る。
 - 動き: **マウス追従 / 左右 / 円 / 8 の字 / 上下**。強さ・周期・止まる深さ・奥行き整形をパネルで選ぶ。
   設定は画像ごとではなく全体の設定として保存する。
@@ -37,7 +37,7 @@
 | --- | --- |
 | 動画、アニメーション画像 (GIF / APNG / WebP) | フレームごとに深度が変わりちらつく。研究調査 §6 と同じ |
 | 見開き・連結読み | 2 ページを 1 つの奥行きとして扱えない。360° と同じく入口で弾く |
-| **別ウィンドウ (F12 の DetachedWindow)、独立 context** | §6.4。v1 はメイン context の MainWindow / Fullscreen だけ。F11 のウィンドウ表示は対象に含める |
+| **独立 session の別ウィンドウ、独立 context** | §6.4.2 第 2 段。複数ウィンドウモードの窓・メディアウィンドウは対象外。main の linked F12 は対象 |
 | 360° パノラマ表示との同時使用 | どちらも表示を占有するモード。3D に入ると 360° は終わり、3D 中は 360° に入れない (§6.2) |
 | 深度の手修正、左右並び (SBS)、2 層化と背景補完 | 研究調査 §6 の v1.x / v2 |
 | 先読み (次のページの深度を前もって計算) | dGPU では 30〜50 ms で不要。内蔵 GPU で 1 秒待つ点は試験実装で評価してから |
@@ -303,7 +303,7 @@ hidden / minimized は予約せず、Ready / Failed / OFFでは箱と箱由来�
 
 - 画像の閲覧中でない、動画、アニメーション画像
 - 見開きの 2 ページ表示中、連結読み
-- メイン context の MainWindow / Fullscreen でない (§6.4)。共通の `App::depth_presentation_eligible` で context と許可集合の両方を照合する
+- メイン context の MainWindow / Fullscreen / 独立でない DetachedWindow でない (§6.4.2)。共通の `App::depth_presentation_eligible` で context・presentation・session の独立性を照合する
 - wgpu の描画状態が無い
 - 編集系のモード (消しゴム・隠蔽加工・補正レイヤー・テキスト注釈・切り取り・SNS 分割) の最中
 
@@ -376,9 +376,10 @@ pub enum DepthSourcePhase {
 | D キー / 上部の 3D ボタン | 入口条件を通れば ON。ON なら OFF |
 | 上部バーの × | 3D を OFF (閲覧表示は閉じない。360° と同じ) |
 | Esc / 一覧へ戻る / フォルダ移動 | 既存の閲覧終了で 3D も終わる |
-| MainWindow ⇔ Fullscreen (F11) の実切替 | 共通の `commit_viewer_presentation` で 3D を終了し、D で再入場できるとトーストで知らせる。同じ presentation の再確定では継続 |
+| MainWindow ⇔ Fullscreen (F11)、MainWindow / Fullscreen ⇔ linked DetachedWindow (F12) の実切替 | 共通の `commit_viewer_session` で 3D を終了し、実効キー (未割当なら上部ボタン) で再入場できるとトーストで知らせる。同じ presentation かつ同じ独立性の再確定では継続 |
+| linked F12 窓内の F11 (枠なし全画面)、リサイズ・DPI 変更 | presentation・context・viewport は同じなので 3D と実行中要求を継続。現在の pass の矩形・倍率で描く |
 | 静止画の次 / 前ページへ移動 | ON のまま。新しいページの表示が安定したら深度を作る |
-| **続ける条件を満たさなくなった** (動画・アニメーション画像のページへ移った、同じページでアニメーションと後から分かった、見開き・連結読みに切り替わった、F12 で別ウィンドウ表示になった) | **3D を OFF にする** (§6.2 の持ち主を通る)。トーストで知らせる |
+| **続ける条件を満たさなくなった** (動画・アニメーション画像のページへ移った、同じページでアニメーションと後から分かった、見開き・連結読みに切り替わった、独立 session になった) | **3D を OFF にする** (§6.2 の持ち主を通る)。トーストで知らせる |
 | 3D パネルの「書き出し…」 | モーダルの書き出しダイアログ (§7) |
 
 - 「ON のまま続ける条件を満たさない」状態を作らない。360° は「state を保ったまま非アクティブ」
@@ -408,33 +409,34 @@ pub enum DepthSourcePhase {
 
 ### 6.4 別ウィンドウ (detached viewer) と 3D モード
 
-- **v1 はメイン context の MainWindow / Fullscreen だけ**で使える。理由: 3D モードは毎フレームの再描画・
+- **メイン context の MainWindow / Fullscreen / linked DetachedWindow** で使える (§6.4.2 第 1 段)。独立 session・独立 context は対象外。理由: 3D モードは毎フレームの再描画・
   GPU 資源・深度 worker を持つ。複数の viewer で同時に動かすと、`callback_resources` の slot、
   worker の要求の取り合い、park / fork 時の移動先、と組み合わせが増える。v1 では入口で弾いて
   組み合わせを作らない。
 - それでも状態は `ViewerContextBundle` に置く。メインの bundle が mount を外れる間 (active detached を
   mount している間) に App の field として見えてしまわないため。
 - **「メイン」の定義**: context の識別子 (メインの bundle か) と、**今の presentation** (メイン窓の
-  MainWindow / Fullscreen か、別ウィンドウか) の両方で決める。メインの context 自身も F12 で別ウィンドウ表示に
-  なる (viewer_context_registry.rs:4936、app.rs:63053) ので、識別子の比較だけでは足りない。
+  MainWindow / Fullscreen / linked DetachedWindow か) と session の独立性で決める。メインの context 自身も複数ウィンドウモードでは独立 session に
+  なるので、識別子の比較だけでは足りない。独立性は mounted の `ViewerSession.independent_active` を読む。
 - **presentation の切替を確定する所で 3D を終える**: 通常の F12 は
   `apply_egui_viewer_presentation_for_current_item` (app.rs:91819 → 91624) で presentation を変え、
   `reset_detached_pause_foreground_modes` は通らない。F12 のキー処理に OFF を足すのではなく、
-  **viewer の presentation を書き換える共通の確定点** (実装担当が特定する。F12 の ON / OFF・その他の
-  presentation の切替が共通に通る `commit_viewer_presentation`) で、実際の表示切替または切替先が共通適格性を満たさなければ §6.2 の持ち主で
+  **viewer の session を確定する共通の確定点** (`commit_viewer_session`。presentation だけの入口は `commit_viewer_presentation`) で、実際の表示・独立性の切替または切替先が共通適格性を満たさなければ §6.2 の持ち主で
   `Depth` を終える。360° は別ウィンドウでも使えるので、ここでは `Depth` だけを終える。
-  - 加えて §6.3 の描画直前の照合が、確定点を通らない経路があっても別ウィンドウの viewport で 3D を
+  - 加えて §6.3 の描画直前の照合が、確定点を通らない経路があっても不適格な session で 3D を
     描かないことを保証する (2 つは役割が違う: 確定点は状態の持ち主の後始末、照合は描画の安全)。
-  - 実装担当は、F12 の直後の frame に別ウィンドウで 3D を描かないことをテストで確かめる。
-- park / fork の経路で 3D の状態を相手側へ渡す処理は作らない。fork・park は常に `FsExclusiveView::Depth`
-  を OFF にしてから行う (`reset_detached_pause_foreground_modes` は 360° と同じく占有モードを終える)。
+  - F12 の表示先切替では終了し、切替先で新しく D を押せば入場する。窓内 F11 は確定点を通らず継続する。
+- park / fork の経路で main の 3D の状態を相手側へ渡す処理は作らない。main の Depth を搬送する前に
+  既存 fork の退役点・park の `reset_detached_pause_foreground_modes` を通して OFF にする。
+  main 以外の live-media park の終了漏れは §6.4.2 第 2 段の検討対象とする。
 - detached の述語に触れる箇所 (入口条件の「メインの viewer か」と park 時の OFF) は、
   CLAUDE.md「Detached viewer リワーク中のルール」に従い、**ClaudeCode と Codex の双方のレビューで
   症状パッチではない構造的な変更だと合意**し、detached-rework-plan.md §11 に記録する。
 
 #### 6.4.1 MainWindow 対応 (2026-11-08、案1を採択・実装済み)
 
-対象は **メイン context の `MainWindow` と `Fullscreen`**。`DetachedWindow` と独立 context は
+以下は MainWindow 対応時点の記録。現在の適用範囲は §6.4.2 を正本とする。
+当時の対象は **メイン context の `MainWindow` と `Fullscreen`**。`DetachedWindow` と独立 context は
 引き続き対象外で、§6.4 の複数 viewer・GPU slot・worker・park/fork の理由を変更しない。
 設計担当 ClaudeCode が案1を採択し、独立 Sol / xhigh と症状パッチではない構造変更であることに合意した。
 入口と確定点の適格性を共有し、実切替で既存 owner を終える。完了通知の宛先移管や追加 repaint は作らない。
@@ -2001,7 +2003,8 @@ stage／commit・製品起動・build-dev・filterなし全件は実施しない
 - **状態遷移**: OFF → ON → (ページ移動) → ON、× / D で OFF、フルスクリーン終了・フォルダ移動で取り消し。
 - **続ける条件の照合** (§6.3): open_fullscreen の各種、スライドショー再開、フォルダをまたぐ移動、
   動画タイル、ページ一覧からの移動、同じページでの見開き・連結読みの切替、アニメーションと後から
-  分かる場合、F12 での別ウィンドウ化、の各経路で 3D が OFF になり、別ウィンドウで 3D を描く frame が無い。
+  分かる場合の各経路で 3D が OFF になる。F12 の表示先切替でも終了し、linked の別ウィンドウでは
+  新しい D の再入場で 3D を描く。独立 session/context は入場・継続を拒否する (§6.4.2)。
 - **占有モードの持ち主** (§6.2): 360° ON から 3D に入ると `Depth` に切り替わり、360° の state と
   `intent.on` が消え、`intent.projection` は残る、3D 中に
   360° のページへ移っても 360° が復帰しない、3D 中の V キーは弾かれる、360° の非アクティブ state が
@@ -2013,7 +2016,7 @@ stage／commit・製品起動・build-dev・filterなし全件は実施しない
   別の context の状態が変わらない。
 - **起こす責任**: ポインタを動かさずに 3D を ON にして `Ready` まで進む。
 - **GPU 資源**: OFF・終了・terminal close で `callback_resources` の slot が消え、VRAM の会計から外れる。
-- **入口条件**: 動画・アニメーション・見開き・連結読み・detached・編集モード・紙めくりの最中で弾き、
+- **入口条件**: 動画・アニメーション・見開き・連結読み・独立 session/context・編集モード・紙めくりの最中で弾き、
   理由が正しい。360° ON では弾かずに切り替わる (上)。3D 中は紙めくりが起きない。
 - **占有モードの述語**: 3D 中に止めるキー・入口が 360° 中と同じであること (分類表の「止める」側)。
   360° 固有の挙動 (ホイール = 画角) が 3D 中に出ないこと。
@@ -2798,3 +2801,153 @@ PNGの目視確認:
 展開の2枚と折りたたみの見出し部分の拡大表示で、三角・見出し・×の欠け/重なりとデバッグ表示がないことを確認した。
 本文・固定フッターの配置と小画面のscrollbarも確認し、スクロール末尾への到達は既存のgeometry/実wheel検査で保証する。
 純描画・headless handlerの証拠であり、実製品起動・実機操作の確認とは区別する。
+
+#### 独立実装レビュー (2026-11-11、GPT-6.1 Sol / xhigh、read-only、対象 `96e4fb28a`)
+
+P1 / P2 / P3 の指摘なし。判定「受入可」。§17.12 の決定 1〜6 への適合、`depth_panel_rect` の全読み手が折りたたみ後の実矩形を使うこと、
+切替 pass の `request_discard` が同じ frame で Area の登録矩形を更新する egui の仕組みとして妥当で時間窓・追加 repaint の症状パッチに当たらないこと、
+保存が操作 1 回につき 1 回、両表示の共通経路、テストの検査力、文書の一致、`vendor/egui` が親コミットと同一 tree であることを確認した。
+`max_passes = 1` では次の入力 1 回が旧矩形に吸われ得るが、設計に明記済みで製品の 2 pass と整合する、との見解。
+
+### 17.14 実装記録 (§6.4.2 第 1 段)
+
+2026-11-11、`feat-766-767-depth-ui`、基点 `9280249bf`。§6.4.2 の決定 A〜E を実装。
+設計担当は ClaudeCode Opus。独立 GPT-6.1 Sol / xhigh の設計レビュー r1〜r4 による
+構造的変更への合意を前提とし、完成差分も独立した同設定の担当が確認して ACCEPT と判定した。
+
+前提のコード確認:
+
+- `ViewerSession.independent_active` は context の session に属し、presentation と同じ
+  `swap_with_mounted` で投影される。App 全体の detached 設定から独立性を推測していない。
+- linked の F12 は既存の presentation 確定点で表示先を切り替える。切替後に新しい D で入場し、
+  worker の wake はその pass の子 viewport id を捕捉する。旧要求の wake 先を移管しない。
+- 窓内 F11 は `toggle_detached_viewer_borderless_fullscreen` であり、presentation/context/viewport id を
+  変更せず確定点を通らない。既存の interlude と backstop の 2D 描画はそのまま。
+- `commit_viewer_session` は確定先の presentation と独立性で共通の適格性を判定する。
+  呼出し元が独立フラグを書く順序と所有者は維持し、書く前に旧 Depth の Drop を済ませる。
+  継続できるのは presentation・独立性がともに同じで、確定先が適格な再確定だけ。
+- 3D の共有ダイアログは main が所有する。private な registry API の公開範囲は広げず、
+  `mounted_viewer_owns_depth_dialogs` で projected == main を返して viewer pass の 2 か所から読む。
+  ROOT の追加モデル案内だけに `fullscreen_idx.is_none()` を加え、ROOT 書き出しの規則は変更していない。
+- `park_active_detached_context_as_live_media` の対象は main 以外の at-rest active context。
+  その bundle 内の終了漏れは第 2 段へ残す。関数末尾の main 側の既存確定点には確定先 false を渡すため、
+  main が linked の Depth を所有していればそこで終了する。park の手順は変えていない。
+- 新しい同期 I/O、decode、GPU upload、待ち、repaint、detached 用状態は追加していない。
+  まれな失敗は §13 の既定どおりログと通知で終える。
+
+独立フラグの書き込み全箇所 (製品コード。関数名を追跡の正本とする):
+
+| ファイル・関数 | 値 | 分類・3D の所有境界 |
+| --- | --- | --- |
+| `app.rs::new_from_settings_with_load_meta_book_query_repaint_and_similar_capability` | false | (b) App 構築時。Depth は未生成 |
+| `viewer_session.rs::ViewerSession::default` | false | (b) 新しい空の session。Depth は未生成 |
+| `app.rs::poll_detached_physical_folder_open` | true | (a) 現 presentation と true を確定してから書く |
+| `app.rs::close_all_detached_viewers_with_cause` | false | (b) projected session・全独立 context の既存 close/retire 後。`close_fullscreen_content` が Depth を終了 |
+| `app.rs::park_and_close_current_active_detached_viewer_inner` | false | (a) 非 detached presentation と false を既存確定点に渡す |
+| `app.rs::start_active_detached_loading_context` | true | (a) DetachedWindow と true を確定してから書く |
+| `app.rs::start_active_detached_collection_root_image` | true | (a) DetachedWindow と true を確定してから書く |
+| `app.rs::activate_detached_image_window_snapshot` | true | (a) 現 presentation と true を確定してから書く |
+| `app.rs::park_current_viewer_context_as_live_media_inner` | false | (a) main 側の非 detached presentation と false を既存確定点に渡す |
+| `app.rs::park_active_detached_context_as_live_media` | false | (a) 同上。at-rest の独立 context 内は既存 activation の true 確定点を通る |
+| `app.rs::preserve_active_detached_image_window_for_main_context_change_inner` | false | (b) 成功した park の後だけ。既存 `reset_detached_pause_foreground_modes` が Depth を終了済み |
+| `app.rs::promote_active_detached_video_for_main_context_change` | false | (a) main 側の非 detached presentation と false を既存確定点に渡す |
+| `app.rs::prepare_detached_image_windows_for_open` | false | (b) 独立 session は 3D 不可。linked なら元から false で変化せず、park 成功時は既存 owner が終了済み |
+| `app.rs::take_parked_fullfeature_linked_still_for_grid_open` | false | (b) 呼出し元 `prepare_viewer_presentation_open` が linked/false を確定済み。同値の再代入 |
+| `app.rs::prepare_viewer_presentation_open` (主代入) | independent_detached_still | (a) 計算した確定先の独立性で先に確定。linked → 独立も即座に終了 |
+| 同関数 (非 detached / 非 egui 媒体の末尾代入) | false | (b) 当該条件では independent_detached_still は false。上の確定と同値 |
+| `app.rs::prepare_viewer_presentation_close` | false | (a) 非 detached presentation と false を既存確定点に渡す |
+| `app.rs::close_fullscreen_for_folder_nav_reopen` | 保存した独立性 | (a) 保存した presentation と独立性を確定してから復元。既存 content close でも Depth は終了 |
+| `viewer_context_registry.rs::activate_mounted_as_independent_detached` | true | (a) DetachedWindow と true を確定してから書く |
+| `viewer_session.rs::swap_with_mounted` (`swap_viewer_context_bundle` から) | 相手の値 | (b) 同じ context の session と fs_exclusive_view を一括交換する所有搬送。session の意味の変更ではない |
+| 同関数 (`split_current_context_preserving_main_grid` から) | 新規/相手の値 | (b) 既存 fork の共通 primitive が Depth を終了してから搬送。新規 session は空 |
+
+`rg` で `detached_viewer_independent_active` の代入・初期化、`independent_active` の初期化・swap と
+可変参照の呼出し元を照合した。残る直接代入は `#[cfg(test)]` の fixture だけで、製品の状態遷移ではない。
+新しい session 判定のために bundle swap・fork・park の手順は変えていない。
+
+| ファイル | 変更 |
+| --- | --- |
+| `src/app/depth_view.rs` | linked 適格性、確定先 session の共通確定点、main の dialog 所有判定、再入場/拒否通知 |
+| `src/app.rs`、`src/app/viewer_context_registry.rs` | 独立性の変更を確定先の値で確定。ROOT の追加モデル案内の描画条件 |
+| `src/depth_parallax.rs` | 非対応場面の通知に F12 の対応を反映 |
+| `src/depth_estimation.rs` | `cfg(test)` の実 submit 観測だけを追加し、要求の context・viewport・key を検査可能にする。製品 worker の動作は不変更 |
+| `src/app/depth_export.rs` | `cfg(test)` の paint receipt 観測だけを追加。前 pass の snapshot を破壊せず、子 pass の実 Depth 描画を検査 |
+| `src/ui_fullscreen.rs`、`src/ui_fullscreen/viewer_chrome.rs` | 3D のダイアログ 2 か所だけを main 所有に限定 |
+| `src/app/depth_view_tests.rs`、`depth_main_window_tests.rs`、`depth_export_main_window_tests.rs`、`multiwindow_scenario_tests.rs` | 入口・確定・資源寿命、子 viewport・dialog 所有の headless 回帰 |
+| `src/ui_fullscreen/depth_focus_tests.rs` | linked fixture と実 pass の入力・パネル・DPI 回帰。既存 `depth_main_window_tests.rs` の描画直前検査は変更せず回帰実行 |
+| `htdocs/mimageviewer/manual/fullscreen.html`、`shortcuts.html`、`htdocs/mimageviewer/index.html`、`docs/keymap-spec.md` | 対応範囲・F12 終了と再開・窓内 F11 継続を同期。FAQ に該当記述なし |
+| 本書、`docs/detached-rework-plan.md` §11 | 現行仕様、構造上の理由、書き込み列挙、検証証拠 |
+
+検証は Windows、通常 feature、上記基点への未コミット差分で実施。全 Cargo に
+`MSBUILDDISABLENODEREUSE=1` を使用する。製品起動・コミット・push・`build-dev.ps1`・
+`test-lib-full.ps1`・`test-full.ps1` は依頼どおり実施せず、全件 gate・確認用 build を設計担当へ引き継ぐ。
+
+| コマンド | 結果・証拠 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth\|export\|presentation\|window_mode\|panorama\|detached/)'` | **1,311 成功 / 0 失敗、exit 0**。`target/depth-1767-regression.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/multiwindow_scenario/)'` | **48 成功 / 0 失敗、exit 0**。`target/depth-1767-multiwindow.log` |
+| `cargo test --test ui_snapshot` (更新指定なし) | **250 成功 / 0 失敗、exit 0**。`target/depth-1767-snapshot.log`。PNG 更新なし |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0。`target/depth-1767-check.log`。以後の Rust 意味変更はテストと `cfg(test)` 観測だけで、通常 graph の結果を再利用 |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険グリフ 0 件。`target/depth-1767-glyphs.log` |
+| `python scripts/check_site_cards.py` | exit 0、53 カード・上限超過 0 件。`target/depth-1767-site.log` |
+| `cargo fmt` (引数なし) | exit 0。`target/depth-1767-fmt.log`。最終の意味変更後に上記回帰を実行し、その後は整形と文書だけ |
+| `git diff --check` | exit 0。`target/depth-1767-diff-check.log`。`git diff --exit-code -- vendor/` も exit 0、snapshot に差分なし |
+
+§6.4.2 の受入条件と回帰の対応:
+
+1. `depth_presentation_entry_continuation_and_commit_share_context_eligibility` と
+   `depth_top_button_color_matches_the_context_and_session_entry_matrix` で入口・確定先の matrix と
+   上部ボタンの実色、拒否文言を検査する。
+2. 既存 independent activation / fork 所有テストを linked に広げ、独立 open の即時終了・F12 双方向の
+   終了と実効キー/未割当の通知・同 session 再確定を検査する。
+   `depth_linked_f11_keeps_readback_estimation_and_ready_owners_in_both_directions` は実子 pass の F11 入力で
+   ReadingBack / Estimating / Ready・LRU・slot・要求が残り、その結果を採用できることを確認する。
+3. linked の実子 pass で D・I/Tab、panel/canvas/mouse/Ctrl/touch、折りたたみ、待機表示、書き出し全 phase の
+   modal・wheel・key・ring と dismiss 後の positive control を検査する。
+   `depth_linked_actual_readback_submits_the_child_viewport_to_the_worker` は実 submit の宛先を観測し、
+   `depth_linked_child_entry_panel_keys_and_dpi_use_the_current_pass_geometry` は子の実効 ppp と cursor 宛先、
+   DPI/rect が変わる release 同 pass の gradient 深度を新 transform で照合する (旧 transform との差も確認)。
+4. `multiwindow_depth_addon_*` / `multiwindow_depth_export_*` の 12 条件で実 ROOT 更新を駆動する。
+   main の各表示・一覧・独立 still/video・ParkedLive を検査し、全非 grid host の viewer 寿命も確認する。
+   所有側の close 後の addon と export の Stopping / Finished の ROOT 描画も検査する。
+5. `depth_linked_close_retires_request_or_gpu_slot_immediately` と既存所有回帰で close・fork・独立化の
+   要求取消/slot 除去・兄弟の要求/slot 不変を検査する。
+
+設計との差分はない。実 submit と paint receipt の観測は `cfg(test)` のみで、製品の状態や処理は増やしていない。
+独立 GPT-6.1 Sol / xhigh の完成レビューは **ACCEPT、未解決 P1/P2/P3 なし**。
+レビュー担当は同じ成功ログを再利用し、テストを重複実行していない。
+
+未確認: F11 の実 HWND 切替、実モニタ間 DPI 移動、native 動画との併存、OS 保存先画面の owner/focus、
+backstop / interlude の数 frame の見え方、実モデルでの推論。headless/offscreen の成功とは区別する。
+確認用 build と全件 gate は依頼どおり設計担当に残す。製品起動・commit・push は実施していない。
+
+検証中に直した fixture の不備 (製品の不具合や期待値の緩和として扱わない):
+
+- 初回 core check は UI module から private な registry API を呼んだため exit 101。
+  main 所有判定を `depth_view.rs` の小さな accessor にまとめ、API の公開範囲を維持して再 check は exit 0。
+- 初回 depth compile は一時 path の取得先と借用競合の 2 件で exit 101、テスト実行 0 件。
+  path を fixture 構築側で捕捉して修正。
+- depth 初回実行は **194 実行 / 189 成功 / 5 失敗、exit 100** (`target/depth-1767-focused-r2.log`)。
+  子 fixture が各 frame で DisplaySnapshot を消し、前 pass の capture を使う書き出しボタンを無効にしていた。
+  削除を撤去し、実 paint receipt を子 pass 内で読み取る観測だけを使う。
+  F11 は ROOT 単独の入力 pass が子 viewport 登録を退役させていたため実子 pass で駆動し、
+  cursor command は egui の集約先である親 FullOutput からも採取する。
+  ScenarioDriver には既存の indexer 準備完了 fixture を与え、startup overlay を検査対象に混ぜない。
+- 上記 5 件の限定再実行は **3 成功 / 2 失敗、exit 100** (`target/depth-1767-focused-r3.log`)。
+  残りは ROOT の `ctx.memory` から子の modal layer を読んでいたことと、Fullscreen fixture の first pass で
+  閲覧が終了し案内が ROOT に出たこと。layer は子 pass 内で観測し、通常の Fullscreen child focus を
+  明示して各 ROOT pass 後の session 継続も検査する。時計や keep 設定で終了規則を回避していない。
+- 残り 2 件の限定再実行は **1 成功 / 1 失敗、exit 100** (`target/depth-1767-focused-r4.log`)。
+  linked を含む書き出し全 phase・リングの実検査は成功。Fullscreen の ROOT 更新 fixture は
+  first pass 後に閲覧が閉じることを再検出した。focus だけでは退役を説明できず、logic/UI の境界を
+  一時観測して切り分けた。
+- host を独立した 12 テストに分けた実行は **9 成功 / 3 失敗、exit 100** (`target/depth-1767-focused-r5.log`)。
+  addon の Fullscreen / linked / linked + ParkedLive が UI 段で終了することを確認。
+  `setup_app_for_test` は `initialized=false` のままで、初回 UI の `render_initial_open` が
+  開始フォルダを開き seed 済み閲覧を置換していた。export の open admission はそれを拒否するため
+  export だけ成功していた。所有の検査 fixture だけを起動済み (`initialized=true`) と明示し、
+  全非 grid host で各 ROOT pass 後の idx/presentation 継続を検査する。
+  共通 fixture と製品の初期 open 規則は変更せず、一時 trace は撤去済み。
+  修正後の同 12 件は **12 成功 / 0 失敗、exit 0** (`target/depth-1767-focused-r6.log`)。
+- 独立レビュー P2 の linked ring 検査の省略を撤去し、全 phase の modal と dismiss 後の positive control を実行する。
+  P3 の §11 の旧 detached 全拒否記述は linked 再入場と独立 session/context 拒否へ同期した。

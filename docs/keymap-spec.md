@@ -7,11 +7,17 @@
 
 ## 3D 写真
 
-`FsDepthParallax` は画像フルスクリーン (`FsImage`) の `Press` 操作、既定は
+`FsDepthParallax` は画像閲覧 (`FsImage`) の `Press` 操作、既定は
 <kbd>D</kbd>。再度押すか右パネルの×で終了する。操作カスタマイズで変更・解除できる。
-main viewer の単ページ静止画だけを対象とし、動画・アニメーション・見開き・連結読み・
-編集・紙めくり中・別ウィンドウでは受け付けない。360度表示からは3Dへ切り替える。
+main context の MainWindow / Fullscreen / 一覧と連動する F12 の DetachedWindow
+（枠なし全画面を含む）の単ページ静止画を対象とする。複数ウィンドウモードの窓と
+メディアウィンドウなどの独立 context、動画・アニメーション・見開き・連結読み・
+編集・紙めくり中では受け付けない。360度表示からは3Dへ切り替える。
 3D中の360度切替は受け付けない。
+F12 の ON / OFF による表示先切替と、main の F11 による MainWindow / Fullscreen 切替では
+3Dを終了し、`FsDepthParallax` の実効キー（既定D）での再開を通知する。
+linked F12 の窓内で F11 により通常表示 / 枠なし全画面を切り替えた場合は3Dを継続する。
+F11 / F12 も既存の `FsToggleWindowMode` / `ToggleDetachedViewerMode` の実効キーを使う。
 3D中も `FsBgCycle`（既定Shift+B）とリングの背景色サイクルを受け付ける。
 透過画像だけで黒→白→市松（AIアップスケール中は黒/白）を循環し、3Dは終了しない。
 書き出しダイアログを開いている間はモーダルのため受け付けない。

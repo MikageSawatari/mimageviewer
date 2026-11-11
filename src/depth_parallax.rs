@@ -190,7 +190,7 @@ impl DepthEntryBlock {
             Self::Animation => "アニメーション画像は 3D 写真に対応していません",
             Self::Spread => "3D 写真は 1 ページ表示で使えます",
             Self::ContinuousReading => "3D 写真はページ表示で使えます",
-            Self::Detached => "3D 写真はメインウィンドウの画像表示で使えます",
+            Self::Detached => "3D 写真は、メインの画像表示と F12 の別ウィンドウで使えます",
             Self::NoWgpu => "3D 写真には GPU 描画が必要です",
             Self::Editing => "編集モードを終了してから 3D 写真を使ってください",
             Self::PageTurning => "ページめくりの完了後に 3D 写真を使ってください",

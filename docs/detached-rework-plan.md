@@ -1455,6 +1455,39 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-11: 3D 写真の F12 の別ウィンドウ対応 (§1.767 第 1 段)
+
+基点 `9280249bf`、`feat-766-767-depth-ui`。設計の正本は
+[depth-parallax-plan.md §6.4.2](depth-parallax-plan.md#642-f12-の別ウィンドウ対応-17672026-11-11)。
+設計担当 ClaudeCode Opus と独立 GPT-6.1 Sol / xhigh の設計レビュー r1〜r4 で、
+「症状パッチではなく構造的な変更」であることに合意済み。
+
+変えた範囲:
+
+- 3D の適格性を main context の MainWindow / Fullscreen / linked DetachedWindow にする。
+  既存の mounted `ViewerSession.independent_active` を使い、独立 session・独立 context は拒否する。
+- session の確定点 `commit_viewer_session` が確定先の presentation と独立性を照合する。
+  独立化の書き込みより前に既存 Depth owner を終了する。presentation だけの入口も同じ確定点に通す。
+- 3D の書き出し・追加モデル案内は main context の viewer pass だけで描き、ROOT の案内は
+  main の `fullscreen_idx` が None のときに描く。一般の共有ダイアログと ROOT 書き出しは維持する。
+
+変えない範囲: viewport の生成・id・builder、HWND の同定、placement、focus、z-order、bundle の swap、
+fork / park の手順、`reset_detached_pause_foreground_modes`、`render_fs_body` の root / child 分岐、
+backstop、F11 / F12 のキー経路。App の detached 用状態・時間窓・再試行・追加 repaint は足していない。
+既存の確定点への入力を確定先の独立性へ置き換えた park / 復帰経路は、処理順・搬送先を変えていない。
+
+判断理由: 3D の持ち主を main 1 つに保ち、既存の描画経路と資源所有を共有する変更である。
+F12 の ON / OFF では既存 owner を終了し、D の再入場を案内する。窓内 F11 は context・viewport が
+変わらず、既存のリサイズと同じ扱いで継続する。ダイアログの表示先もその所有 context から決まり、
+追加の保留状態や移管を必要としない。独立 context の park と dialog 寿命は第 2 段へ残す。
+`park_active_detached_context_as_live_media` は他の at-rest context を park する経路であり、その bundle の
+3D 終了処理は今回変更しない。main 側の既存確定点には false を渡し、linked main の Depth があればそこで終了する。
+
+検証の要点: 入口と上部ボタン、linked → 独立化、F12 の両方向、窓内 F11 の要求・GPU 資源の継続、
+子 viewport の実 pass と入力・DPI・ダイアログ所有・終了取消を headless で検査する。
+コマンド・件数・exit code・検証の限界は [実装記録 §17.14](depth-parallax-plan.md#1714-実装記録-642-第-1-段) に集約する。
+製品起動・全件 gate・確認用 build はこの実装依頼の対象外で、設計担当へ引き継ぐ。
+
 ### 2026-11-10: ページめくり提示資格を表示単位の binding へ移す (§1.750)
 
 遠方ページの横長寸法の到着で本全体の `Arc<Vec<SpreadDisplayUnit>>` が作り直されると、演出中の単位が同じでも

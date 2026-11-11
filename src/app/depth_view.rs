@@ -74,6 +74,11 @@ pub(crate) fn depth_wait_status(
 }
 
 impl App {
+    /// Depth and its process-wide dialogs are owned only by the main viewer context.
+    pub(crate) fn mounted_viewer_owns_depth_dialogs(&self) -> bool {
+        self.projected_viewer_context_id() == self.viewer_context_main()
+    }
+
     pub(crate) fn panorama_state(&self) -> Option<&crate::panorama::PanoramaState> {
         self.fs_exclusive_view.panorama_state()
     }
@@ -166,11 +171,16 @@ impl App {
     /// Entry and presentation commits share the same context/presentation boundary.
     #[cfg(windows)]
     pub(crate) fn depth_presentation_eligible(&self, presentation: ViewerPresentation) -> bool {
+        self.depth_session_eligible(presentation, self.detached_viewer_independent_active)
+    }
+
+    #[cfg(windows)]
+    fn depth_session_eligible(&self, presentation: ViewerPresentation, independent: bool) -> bool {
         self.projected_viewer_context_id() == self.viewer_context_main()
-            && matches!(
+            && (matches!(
                 presentation,
                 ViewerPresentation::MainWindow | ViewerPresentation::Fullscreen
-            )
+            ) || (presentation == ViewerPresentation::DetachedWindow && !independent))
     }
 
     /// Retire before changing hosts, even between eligible presentations. This keeps
@@ -181,7 +191,20 @@ impl App {
         target: ViewerPresentation,
         cause: &'static str,
     ) {
-        if let Some(message) = self.commit_viewer_presentation_deferred_feedback(target, cause) {
+        self.commit_viewer_session(target, self.detached_viewer_independent_active, cause);
+    }
+
+    /// Judge the destination session before the caller publishes its independence flag.
+    #[cfg(windows)]
+    pub(crate) fn commit_viewer_session(
+        &mut self,
+        target: ViewerPresentation,
+        target_independent: bool,
+        cause: &'static str,
+    ) {
+        if let Some(message) =
+            self.commit_viewer_session_deferred_feedback(target, target_independent, cause)
+        {
             self.show_feedback_toast(message);
         }
     }
@@ -194,9 +217,25 @@ impl App {
         target: ViewerPresentation,
         cause: &'static str,
     ) -> Option<String> {
-        let eligible = self.depth_presentation_eligible(target);
+        self.commit_viewer_session_deferred_feedback(
+            target,
+            self.detached_viewer_independent_active,
+            cause,
+        )
+    }
+
+    #[cfg(windows)]
+    fn commit_viewer_session_deferred_feedback(
+        &mut self,
+        target: ViewerPresentation,
+        target_independent: bool,
+        cause: &'static str,
+    ) -> Option<String> {
+        let eligible = self.depth_session_eligible(target, target_independent);
         let feedback = if self.fs_exclusive_view.is_depth()
-            && (target != self.viewer_presentation || !eligible)
+            && (target != self.viewer_presentation
+                || target_independent != self.detached_viewer_independent_active
+                || !eligible)
         {
             self.set_fs_exclusive_view(FsExclusiveView::None, cause);
             let message = if eligible {
@@ -207,7 +246,7 @@ impl App {
                     None => "3D 写真を終了しました: 表示を切り替えました。上部の 3D ボタンでもう一度使えます".into(),
                 }
             } else {
-                "3D 写真を終了しました: メインウィンドウの画像表示で使えます".into()
+                "3D 写真を終了しました: メインの画像表示と F12 の別ウィンドウで使えます".into()
             };
             Some(message)
         } else {

@@ -22,7 +22,9 @@ fn depth_collapsed_panel_next_pass_routes_mouse_ctrl_hover_and_touch_in_both_pre
     // The child renderer is thread-local; neither presentation creates a native window.
     std::thread::spawn(|| {
         let _input = crate::key_input::lock_test_input();
-        for fullscreen in [false, true] {
+        for presentation in [crate::app::ViewerPresentation::MainWindow,
+            crate::app::ViewerPresentation::Fullscreen, crate::app::ViewerPresentation::DetachedWindow] {
+            let fullscreen = presentation != crate::app::ViewerPresentation::MainWindow;
             for case in [
                 "mouse",
                 "ctrl",
@@ -36,7 +38,9 @@ fn depth_collapsed_panel_next_pass_routes_mouse_ctrl_hover_and_touch_in_both_pre
                 "expanded_hover",
             ] {
                 let mut app = crate::app::setup_app_for_test();
-                let viewer = RootDepthViewer::new(&mut app);
+                let viewer = if presentation == crate::app::ViewerPresentation::DetachedWindow {
+                    RootDepthViewer::linked(&mut app)
+                } else { RootDepthViewer::new(&mut app) };
                 viewer.ready(&mut app);
                 let ctx = viewer.ctx;
                 assert_eq!(ctx.options(|options| options.max_passes.get()), 2);
@@ -49,7 +53,7 @@ fn depth_collapsed_panel_next_pass_routes_mouse_ctrl_hover_and_touch_in_both_pre
                 app.window_visible = false;
                 app.settings.depth_parallax.focus = 0.2;
                 if fullscreen {
-                    app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+                    app.viewer_presentation = presentation;
                     app.native_video_in_window_active = false;
                     app.settings.video_in_window_mode = false;
                 }
