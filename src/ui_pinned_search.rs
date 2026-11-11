@@ -66,6 +66,7 @@ pub enum PinnedSearchAction {
     Clear(PinnedSearchKind),
     Focused(PinnedSearchKind),
     Picked(PinnedSearchKind, usize),
+    RequestFocus(PinnedSearchKind),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -125,6 +126,7 @@ pub fn draw_pinned_search(
     enter: bool,
     drag: bool,
     history: Option<&[String]>,
+    focus_pending: bool,
 ) -> egui::InnerResponse<SearchFieldResponse> {
     let gap = ui.spacing().item_spacing.x;
     let text_width = |text: &str, style| {
@@ -212,6 +214,7 @@ pub fn draw_pinned_search(
                                         crate::ui_history_field::HistoryFieldOptions {
                                             visible: history.is_some(),
                                             availability: enabled,
+                                            focus_pending,
                                             ..Default::default()
                                         },
                                         |edit| {
@@ -225,6 +228,9 @@ pub fn draw_pinned_search(
                                         },
                                     );
                                     let mut output = history_output.text;
+                                    if history_output.focus_requested {
+                                        actions.push(PinnedSearchAction::RequestFocus(kind));
+                                    }
                                     crate::ui_helpers::set_accessibility_label(
                                         &output.response,
                                         kind.label(),
@@ -255,7 +261,9 @@ pub fn draw_pinned_search(
                                     }
                                     if let Some(index) = history_output.picked {
                                         actions.push(PinnedSearchAction::Picked(kind, index));
-                                    } else if owns_submit && output.response.lost_focus() && enter {
+                                    } else if history_output.submit_requested
+                                        || owns_submit && output.response.lost_focus() && enter
+                                    {
                                         actions.push(PinnedSearchAction::Submit(kind));
                                     }
                                     output.response.response
@@ -336,6 +344,7 @@ pub fn draw_pinned_search_history_snapshot_fixture(ui: &mut egui::Ui) {
                 false,
                 false,
                 Some(&["旅行".to_owned(), "写真集".to_owned()]),
+                false,
             );
         });
     });
@@ -381,6 +390,7 @@ pub fn draw_pinned_search_snapshot_fixture(ui: &mut egui::Ui) {
                     false,
                     false,
                     Some(&[]),
+                    false,
                 );
             }
         });
@@ -424,6 +434,7 @@ mod tests {
                             false,
                             drag,
                             None,
+                            false,
                         )
                         .inner;
                         let mut seen = render.borrow_mut();
@@ -549,6 +560,7 @@ mod tests {
                                     false,
                                     false,
                                     history.then_some(&[][..]),
+                                    false,
                                 );
                                 rects.push((
                                     response.response.rect,
@@ -617,6 +629,7 @@ mod tests {
                                     false,
                                     false,
                                     None,
+                                    false,
                                 );
                                 render.borrow_mut().push((
                                     Some(kind),

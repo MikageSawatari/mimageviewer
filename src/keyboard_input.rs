@@ -305,7 +305,7 @@ pub(crate) fn claim_text_input_submit(ctx: &egui::Context, widget_id: egui::Id) 
             )
         });
     });
-    ctx.memory_mut(|memory| memory.surrender_focus(widget_id));
+    crate::ime_focus::end_text_input(ctx, widget_id);
 }
 
 /// Capture the submit owner before drawing a field. `lost_focus` alone includes
@@ -318,7 +318,12 @@ pub(crate) fn text_input_owns_submit(ctx: &egui::Context, widget_id: egui::Id) -
     }
     match ctx.memory(|memory| memory.focused()) {
         Some(focused) => focused == widget_id,
-        None => crate::ime_focus::recovering_text_input(ctx) == Some(widget_id),
+        None => {
+            crate::ime_focus::recovering_text_input(ctx) == Some(widget_id)
+                || matches!(cached_keyboard_owner(ctx), Some(KeyboardOwner::TextInput {
+                viewport, widget_id: owner, phase: TextInputPhase::PendingFocus,
+            }) if viewport == ctx.viewport_id() && owner == widget_id && crate::ui_history_field::is_open_for(ctx, widget_id))
+        }
     }
 }
 
@@ -645,6 +650,9 @@ pub(crate) fn cache_keyboard_owner(ctx: &egui::Context, owner: KeyboardOwner) {
 }
 
 pub(crate) fn keymap_owner_blocks_shortcuts(ctx: &egui::Context) -> bool {
+    if crate::ui_history_field::owns_pending_focus(ctx) {
+        return true;
+    }
     cached_keyboard_owner(ctx)
         .map(KeyboardOwner::blocks_legacy_keymap_shortcuts)
         // A keymap path without the App pass gate is an invalid route. Keep it

@@ -16431,6 +16431,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                                 .iter()
                                                 .map(|path| path.to_string_lossy().into_owned())
                                                 .collect();
+                                            let focus_pending = self.history_input_focus_pending(
+                                                ctx,
+                                                egui::Id::unique("folder_address_input"),
+                                            );
                                             let field = ui.add_enabled_ui(!is_snap_active, |ui| {
                                             crate::ui_history_field::show_singleline(
                                                 ui, &mut self.address, None, egui::Id::unique("folder_address_input"),
@@ -16441,10 +16445,18 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                                     min_popup_width: Some((ctx.content_rect().width() * 0.72).clamp(560.0, 1100.0)),
                                                     monospace: true,
                                                     tooltip: "最近開いたフォルダ",
+                                                    focus_pending,
                                                 },
                                                 |edit| edit.id(egui::Id::unique("folder_address_input")).desired_width(f32::INFINITY),
                                             )
                                         }).inner;
+                                            if field.focus_requested {
+                                                self.claim_pending_text_input_focus(
+                                                    ctx.viewport_id(),
+                                                    egui::Id::unique("folder_address_input"),
+                                                    ctx.cumulative_pass_nr(),
+                                                );
+                                            }
                                             let picked = field.picked;
                                             let mut output = field.text;
                                             if !is_snap_active {
@@ -16452,9 +16464,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                             }
                                             let resp = output.response.response;
                                             if let Some(index) = picked {
-                                                crate::keyboard_input::claim_text_input_submit(
-                                                    ctx, resp.id,
-                                                );
+                                                self.finish_text_input_submit(ctx, resp.id);
                                                 if let Some(path) =
                                                     history_paths.get(index).and_then(|path| {
                                                         resolve_folder_bar_nav_path(path)
@@ -16473,9 +16483,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                             self.address_has_focus = resp.has_focus();
                                             if picked.is_none()
                                                 && !is_snap_active
-                                                && resp.lost_focus()
-                                                && enter_pressed
+                                                && (field.submit_requested
+                                                    || resp.lost_focus() && enter_pressed)
                                             {
+                                                self.finish_text_input_submit(ctx, resp.id);
+                                                self.address_has_focus = false;
                                                 let address_text = self.address.trim();
                                                 if address_text.is_empty() {
                                                     result = Some(AddressBarNav::DriveList(None));
@@ -16626,6 +16638,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     "{local_search_label}: 今開いているフォルダ / ZIP の表示中\n\
                      アイテムを名前やメタ情報で絞り込みます (索引不要・再帰なし)。"
                 ));
+                let focus_pending = self.history_input_focus_pending(ctx, crate::ui_pinned_search::PinnedSearchKind::Local.temporary_id());
                 let history_output = crate::ui_history_field::show_singleline(
                     ui,
                     &mut self.search_query,
@@ -16635,6 +16648,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     crate::ui_history_field::HistoryFieldOptions {
                         visible: self.settings.save_search_input_history,
                         availability: history_availability,
+                        focus_pending,
                         ..Default::default()
                     },
                     |edit| {
@@ -16645,6 +16659,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         .min_size(egui::vec2(320.0, 20.0))
                     },
                 );
+                if history_output.focus_requested {
+                    self.claim_pending_text_input_focus(ctx.viewport_id(), crate::ui_pinned_search::PinnedSearchKind::Local.temporary_id(), ctx.cumulative_pass_nr());
+                }
                 let mut output = history_output.text;
                 let _menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
@@ -16663,7 +16680,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 self.search_has_focus = response.has_focus();
 
                 // Enter で検索実行 (IME 変換確定の Enter は除外)
-                if picked.is_some() || (response.lost_focus() && enter_pressed) {
+                if picked.is_some() || history_output.submit_requested || (response.lost_focus() && enter_pressed) {
                     self.submit_search_input(ctx, crate::ui_pinned_search::PinnedSearchKind::Local, response.id);
                 }
 
@@ -16808,6 +16825,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             ui.horizontal(|ui| {
                 if !crate::ui_pinned_search::PinnedSearchKind::Container.pinned(&self.settings) {
                     ui.label("コンテナ検索:");
+                    let focus_pending = self.history_input_focus_pending(
+                        ctx,
+                        crate::ui_pinned_search::PinnedSearchKind::Container.temporary_id(),
+                    );
                     let history_output = crate::ui_history_field::show_singleline(
                         ui,
                         &mut self.favsearch.query,
@@ -16819,6 +16840,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         crate::ui_history_field::HistoryFieldOptions {
                             visible: self.settings.save_search_input_history,
                             availability: history_availability,
+                            focus_pending,
                             ..Default::default()
                         },
                         |edit| {
@@ -16832,6 +16854,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             .min_size(egui::vec2(320.0, 20.0))
                         },
                     );
+                    if history_output.focus_requested {
+                        self.claim_pending_text_input_focus(
+                            ctx.viewport_id(),
+                            crate::ui_pinned_search::PinnedSearchKind::Container.temporary_id(),
+                            ctx.cumulative_pass_nr(),
+                        );
+                    }
                     let mut output = history_output.text;
                     let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                         ui,
@@ -16859,7 +16888,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         query_changed = true;
                     }
                     // Enter で確定的に再実行 (IME 変換確定の Enter は除外)
-                    if picked.is_some() || (response.lost_focus() && enter_pressed) {
+                    if picked.is_some()
+                        || history_output.submit_requested
+                        || (response.lost_focus() && enter_pressed)
+                    {
                         submit_requested = true;
                     }
 

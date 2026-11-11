@@ -747,3 +747,375 @@ fn section1756_search_input_history_rejected_or_disabled_submissions_do_not_reco
         }
     }
 }
+
+fn history_keys(keys: &[egui::Key]) -> egui::RawInput {
+    #[cfg(windows)]
+    crate::key_input::set_test_frame(
+        keys.iter()
+            .map(|key| crate::key_input::KeyEdge {
+                operation_id: crate::key_input::KeyOperationId::unassigned(),
+                source_hwnd: 0,
+                source_viewport: egui::ViewportId::ROOT,
+                virtual_key: match key {
+                    egui::Key::ArrowDown => 0x28,
+                    egui::Key::ArrowUp => 0x26,
+                    egui::Key::Enter => 0x0D,
+                    _ => unreachable!(),
+                },
+                scan_code: 0,
+                extended: false,
+                pressed: true,
+                repeat: false,
+                ctrl: false,
+                shift: false,
+                alt: false,
+            })
+            .collect(),
+    );
+    egui::RawInput {
+        events: keys
+            .iter()
+            .map(|&key| egui::Event::Key {
+                key,
+                physical_key: Some(key),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+fn history_pending_grid_case(
+    search: Option<(Kind, bool)>,
+    keys: &[egui::Key],
+    edit: Option<egui::Event>,
+) {
+    let _input = crate::key_input::lock_test_input();
+    let mut app = crate::app::setup_app_for_test();
+    let ctx = context();
+    crate::ui_fonts::configure_fonts(&ctx);
+    let current = app.tmp.path().join("current");
+    let target = app.tmp.path().join("target");
+    std::fs::create_dir(&current).unwrap();
+    std::fs::create_dir(&target).unwrap();
+    let draft = if search.is_some_and(|(kind, _)| kind == Kind::Everything) {
+        "draft\0"
+    } else {
+        "draft"
+    };
+    let chosen = if search.is_some_and(|(kind, _)| kind == Kind::Everything) {
+        "chosen\0"
+    } else {
+        "chosen"
+    };
+    let field = if let Some((kind, pinned)) = search {
+        configure_surface(&mut app, pinned);
+        app.ensure_search_session(kind);
+        app.search_focus_request = false;
+        app.favsearch.focus_request = false;
+        app.global_search.focus_request = false;
+        *app.search_draft_mut(kind) = draft.into();
+        app.favsearch.last_executed = draft.into();
+        app.settings.search_input_history.record(kind, chosen);
+        input(kind, pinned).id()
+    } else {
+        app.current_folder = Some(current.clone());
+        app.address = current.to_string_lossy().into_owned();
+        app.active_quick_folder_slot = None;
+        app.recent_folders = vec![target.clone()];
+        assert_eq!(app.recent_folder_entries(), &[target.clone()]);
+        app.settings.toolbar_section_order = vec![crate::settings::ToolbarSectionId::Folder];
+        app.settings.show_address_bar_history_menu = true;
+        egui::Id::unique("folder_address_input")
+    };
+    app.items = vec![
+        crate::app::GridItem::Folder(target.clone()),
+        crate::app::GridItem::Folder(current.clone()),
+    ];
+    app.visible_indices = vec![0, 1];
+    app.selected = Some(1);
+    let draw = |app: &mut App| {
+        if let Some((kind, pinned)) = search {
+            render_search(app, &ctx, kind, pinned);
+            None
+        } else {
+            ctx.root_ui(|ui| app.render_toolbar(ui).1)
+        }
+    };
+    let mut initial = history_keys(&[]);
+    initial.screen_rect = Some(egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(1600.0, 500.0),
+    ));
+    begin(&mut app, &ctx, initial);
+    assert!(draw(&mut app).is_none());
+    end(&ctx);
+    assert!(!ctx.memory(|m| m.has_focus(field)));
+    let pos = crate::ui_history_field::arrow_rect_for_test(&ctx, field).center();
+    let click = egui::RawInput {
+        events: vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+        ..Default::default()
+    };
+    begin(&mut app, &ctx, click);
+    assert!(draw(&mut app).is_none());
+    assert!(
+        !ctx.memory(|m| m.has_focus(field)),
+        "test must observe the reservation before helper focus"
+    );
+    assert_eq!(app.pending_text_input_focus.get().unwrap().widget_id, field);
+    assert!(crate::ui_history_field::is_open_for(&ctx, field));
+    end(&ctx);
+    let mut raw = history_keys(keys);
+    if let Some(event) = edit.clone() {
+        raw.events.insert(0, event);
+    }
+    begin(&mut app, &ctx, raw);
+    assert!(
+        matches!(app.keyboard_owner_for_pass(&ctx), crate::keyboard_input::KeyboardOwner::TextInput { widget_id, phase: crate::keyboard_input::TextInputPhase::PendingFocus, .. } if widget_id == field)
+    );
+    assert!(
+        app.handle_keyboard(&ctx).is_none(),
+        "{search:?}/{keys:?}: grid must not open a result"
+    );
+    assert_eq!(
+        app.selected,
+        Some(1),
+        "{search:?}/{keys:?}: grid must not move selection"
+    );
+    let nav = draw(&mut app);
+    assert!(
+        matches!(crate::keyboard_input::cached_keyboard_owner(&ctx), Some(crate::keyboard_input::KeyboardOwner::TextInput {
+        widget_id, phase: crate::keyboard_input::TextInputPhase::Focused, ..
+    }) if widget_id == field),
+        "the same owner must receive actual focus for the rest of this pass"
+    );
+    assert!(
+        app.handle_keyboard(&ctx).is_none(),
+        "post-render grid handler must remain blocked"
+    );
+
+    for key in keys {
+        assert!(
+            !ctx.input(|i| i.key_pressed(*key)),
+            "history must consume {key:?}"
+        );
+    }
+    #[cfg(windows)]
+    assert!(!crate::key_input::pressed_key_down(
+        ctx.viewport_id(),
+        |edge| matches!(edge.virtual_key, 0x0D | 0x26 | 0x28)
+    ));
+    if keys.contains(&egui::Key::Enter) {
+        assert!(app.pending_text_input_focus.get().is_none());
+        assert!(!crate::ui_history_field::is_open_for(&ctx, field));
+        if let Some((kind, _)) = search {
+            let expected = if keys.contains(&egui::Key::ArrowDown) {
+                chosen
+            } else {
+                draft
+            };
+            if edit.is_some() {
+                assert!(
+                    app.search_draft(kind).contains("edit-marker"),
+                    "pending input must reach TextEdit before submit"
+                );
+                assert_eq!(
+                    app.settings.search_input_history.entries(kind)[0],
+                    app.search_draft(kind)
+                );
+            } else {
+                assert_eq!(app.search_draft(kind), expected);
+                assert_eq!(app.settings.search_input_history.entries(kind)[0], expected);
+            }
+        } else {
+            let expected = if keys.contains(&egui::Key::ArrowDown) {
+                &target
+            } else {
+                &current
+            };
+            assert!(
+                matches!(nav,Some(crate::ui_main::AddressBarNav::Direct(ref path,_)) if crate::folder_tree::path_eq(path, expected)),
+                "{keys:?}: normal address/history navigation: {nav:?} expected {expected:?}"
+            );
+        }
+    } else {
+        assert!(nav.is_none());
+        assert!(ctx.memory(|m| m.has_focus(field)));
+        assert!(crate::ui_history_field::is_open_for(&ctx, field));
+    }
+    end(&ctx);
+    if !keys.contains(&egui::Key::Enter) {
+        begin(&mut app, &ctx, history_keys(&[]));
+        assert!(
+            ctx.memory(|m| m.has_focus(field)),
+            "reserved arrows must not transfer focus at end_pass"
+        );
+        assert!(crate::ui_history_field::is_open_for(&ctx, field));
+        assert!(draw(&mut app).is_none());
+        end(&ctx);
+    } else if search.is_none() {
+        begin(&mut app, &ctx, history_keys(&[egui::Key::ArrowUp]));
+        assert!(!app.address_has_focus);
+        assert!(
+            !app.shortcuts_blocked_by_text_input(&ctx),
+            "address submit must release the next pass"
+        );
+        assert!(app.handle_keyboard(&ctx).is_none());
+        assert_eq!(
+            app.selected,
+            Some(0),
+            "grid keys must resume after address submission"
+        );
+        end(&ctx);
+    }
+}
+
+#[test]
+fn section1756_history_same_pass_arrow_click_reserves_next_pass_search_keys_before_grid() {
+    for pinned in [false, true] {
+        for kind in Kind::ALL {
+            for keys in [
+                vec![egui::Key::ArrowDown],
+                vec![egui::Key::ArrowUp],
+                vec![egui::Key::Enter],
+                vec![egui::Key::ArrowDown, egui::Key::Enter],
+            ] {
+                history_pending_grid_case(Some((kind, pinned)), &keys, None);
+            }
+        }
+    }
+}
+
+#[test]
+fn section1756_history_same_pass_arrow_click_reserves_next_pass_folder_keys_before_grid() {
+    for keys in [
+        vec![egui::Key::ArrowDown],
+        vec![egui::Key::ArrowUp],
+        vec![egui::Key::Enter],
+        vec![egui::Key::ArrowDown, egui::Key::Enter],
+    ] {
+        history_pending_grid_case(None, &keys, None);
+    }
+}
+
+#[test]
+fn section1756_pending_history_text_and_paste_enter_reach_the_editor_before_submit() {
+    for pinned in [false, true] {
+        for kind in Kind::ALL {
+            for edit in [
+                egui::Event::Text("edit-marker".into()),
+                egui::Event::Paste("edit-marker".into()),
+            ] {
+                history_pending_grid_case(Some((kind, pinned)), &[egui::Key::Enter], Some(edit));
+            }
+        }
+    }
+}
+
+#[test]
+fn section1756_history_focus_reservation_yields_to_another_fields_arrow_in_both_draw_orders() {
+    for reversed in [false, true] {
+        for (first, second) in [
+            (Kind::Metadata, Kind::Everything),
+            (Kind::Everything, Kind::Metadata),
+        ] {
+            let _input = crate::key_input::lock_test_input();
+            let mut app = crate::app::setup_app_for_test();
+            configure_surface(&mut app, true);
+            let ctx = context();
+            crate::ui_fonts::configure_fonts(&ctx);
+            app.ensure_search_session(Kind::Everything);
+            app.global_search.focus_request = false;
+            for kind in [first, second] {
+                app.settings.search_input_history.record(kind, "history");
+            }
+            let order = if reversed {
+                [second, first]
+            } else {
+                [first, second]
+            };
+            let draw = |app: &mut App| {
+                ctx.root_ui(|root| {
+                    egui::CentralPanel::default().show(root, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            for kind in order {
+                                let response = app.draw_pinned_search_section(ui, kind);
+                                app.handle_pinned_search_actions(&ctx, response.inner.actions);
+                            }
+                        });
+                    });
+                })
+            };
+            let mut raw = history_keys(&[]);
+            raw.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 400.0),
+            ));
+            begin(&mut app, &ctx, raw);
+            draw(&mut app);
+            end(&ctx);
+            for kind in [first, second] {
+                let pos =
+                    crate::ui_history_field::arrow_rect_for_test(&ctx, kind.input_id()).center();
+                begin(
+                    &mut app,
+                    &ctx,
+                    egui::RawInput {
+                        events: vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed: true,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed: false,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                );
+                app.keyboard_owner_for_pass(&ctx);
+                draw(&mut app);
+                assert_eq!(
+                    app.pending_text_input_focus.get().unwrap().widget_id,
+                    kind.input_id()
+                );
+                assert!(!ctx.memory(|m| m.has_focus(first.input_id()) || m.has_focus(second.input_id())), "outside pointer must supersede pending focus");
+                end(&ctx);
+            }
+            begin(&mut app, &ctx, history_keys(&[egui::Key::ArrowDown]));
+            assert!(app.handle_keyboard(&ctx).is_none());
+            draw(&mut app);
+            assert!(ctx.memory(|m| m.has_focus(second.input_id())));
+            assert!(crate::ui_history_field::is_open_for(
+                &ctx,
+                second.input_id()
+            ));
+            end(&ctx);
+            begin(&mut app, &ctx, history_keys(&[]));
+            assert!(ctx.memory(|m| m.has_focus(second.input_id())));
+            end(&ctx);
+        }
+    }
+}

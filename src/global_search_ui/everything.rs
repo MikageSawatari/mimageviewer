@@ -670,12 +670,19 @@ impl App {
         let running = self.everything_search_progress_visible();
         let history_availability =
             self.pinned_search_availability(crate::ui_pinned_search::PinnedSearchKind::Everything);
+        let history_focus_pending = self.history_input_focus_pending(
+            ctx,
+            crate::ui_pinned_search::PinnedSearchKind::Everything.temporary_id(),
+        );
         egui::Panel::top("global_search_bar").show(root_ui,|ui| {
             self.gate_main_chrome(ui);
             ui.add_enabled_ui(!running,|ui| {
                 if !crate::ui_pinned_search::PinnedSearchKind::Everything.pinned(&self.settings) {
                 let controls = ui::draw_everything_controls(ui,&mut self.global_search.everything_draft,&mut self.global_search.focus_request,
-                    self.settings.save_search_input_history.then(|| self.settings.search_input_history.entries(crate::ui_pinned_search::PinnedSearchKind::Everything)), history_availability);
+                    self.settings.save_search_input_history.then(|| self.settings.search_input_history.entries(crate::ui_pinned_search::PinnedSearchKind::Everything)), history_availability, history_focus_pending);
+                if controls.focus_requested {
+                    self.claim_pending_text_input_focus(ctx.viewport_id(), crate::ui_pinned_search::PinnedSearchKind::Everything.temporary_id(), ctx.cumulative_pass_nr());
+                }
                 self.global_search.has_focus |= controls.has_focus;
                 send = controls.send || controls.lost_focus && enter;
                 close = controls.close;

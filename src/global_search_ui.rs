@@ -4754,6 +4754,7 @@ impl App {
                      「お気に入り」→「編集」で、対象の行の「アイテム索引 (Ctrl+G)」に\n\
                      チェックを入れてください。",
                 );
+                let focus_pending = self.history_input_focus_pending(ctx, crate::ui_pinned_search::PinnedSearchKind::Metadata.temporary_id());
                 let history_output = crate::ui_history_field::show_singleline(
                     ui,
                     &mut self.global_search.metadata_draft,
@@ -4763,6 +4764,7 @@ impl App {
                     crate::ui_history_field::HistoryFieldOptions {
                         visible: self.settings.save_search_input_history,
                         availability: history_availability,
+                        focus_pending,
                         ..Default::default()
                     },
                     |edit| {
@@ -4773,6 +4775,9 @@ impl App {
                         .min_size(egui::vec2(320.0, 20.0))
                     },
                 );
+                if history_output.focus_requested {
+                    self.claim_pending_text_input_focus(ctx.viewport_id(), crate::ui_pinned_search::PinnedSearchKind::Metadata.temporary_id(), ctx.cumulative_pass_nr());
+                }
                 let mut output = history_output.text;
                 let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
@@ -4790,7 +4795,7 @@ impl App {
                 if response.changed() || menu_changed {
                     query_changed = true;
                 }
-                if picked.is_some() || (response.lost_focus() && enter_pressed) {
+                if picked.is_some() || history_output.submit_requested || (response.lost_focus() && enter_pressed) {
                     submit_requested = true;
                 }
                 if ui.small_button("×").on_hover_text("検索を閉じる").clicked() {

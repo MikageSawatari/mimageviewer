@@ -24082,6 +24082,22 @@ impl App {
         ));
     }
 
+    pub(crate) fn history_input_focus_pending(
+        &self,
+        ctx: &egui::Context,
+        widget: egui::Id,
+    ) -> bool {
+        self.pending_text_input_focus.get().is_some_and(|claim| {
+            claim.viewport == ctx.viewport_id()
+                && claim.widget_id == widget
+                && claim.issued_pass.saturating_add(1) == ctx.cumulative_pass_nr()
+                && ctx
+                    .memory(|memory| memory.focused())
+                    .is_none_or(|focused| focused == widget)
+                && crate::ui_history_field::is_open_for(ctx, widget)
+        })
+    }
+
     pub(crate) fn clear_pending_text_input_focus(&self) {
         let transition = crate::keyboard_input::transition_pending_focus_claim(
             self.pending_text_input_focus.get(),
@@ -62953,6 +62969,7 @@ impl App {
     pub(crate) fn shortcuts_blocked_by_text_input(&self, ctx: &egui::Context) -> bool {
         self.keyboard_owner_for_pass(ctx)
             .blocks_legacy_main_shortcuts()
+            || crate::ui_history_field::owns_pending_focus(ctx)
     }
 
     pub(crate) fn collect_shell_clipboard_paths(

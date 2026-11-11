@@ -44,8 +44,17 @@
 - 描画後に `output.response.rect(<atom id>)` で▼の位置を取り、その矩形へ枠なしの▼ボタン
   (`ui.put` / `ui.interact` で TextEdit より後に追加 = ヒットテストで手前) を置く。
   ▼を押したら一覧を開閉する。入力欄にフォーカスがあれば保ち (§3.4)、無ければ次の pass で IME helper の
-  `focus_request` 引数を通して入力欄へフォーカスを渡す (helper の契約を保つため、helper の外で
+  予約受付用のIME helperを通して入力欄へフォーカスを渡す (helper の契約を保つため、helper の外で
   `request_focus` を呼ばない)。
+- 未フォーカス欄の▼はpass限りの `focus_requested` を返し、呼び出し側が既存の
+  `App::pending_text_input_focus` にviewport・widget・passを登録する。部品内に別の予約を持たない。
+  次passの `focus_pending` はこのclaimと有効な一覧ownerから導出する。IME helper内でTextEdit描画前に
+  実フォーカスへ渡し、begin-passの矢印フォーカス移動も終端する。同じownerのphaseだけPendingからFocusedへ渡す。
+  別widgetの実フォーカスや欄/一覧の外のpointer pressは優先し、予約で奪わない。
+  main/keymapの描画前判定では当該PendingFocusを保護し、通常の予約検索Enter振り分けにも渡さない。
+  フォルダ欄も同じclaimを使う。未選択Enterはpass限りの `submit_requested` で通常の確定/claimへ送る。
+  これはeguiの `lost_focus` が過去2passの履歴だけを見るため、取得と確定が同じpassに起きる場合の通知であり、
+  入力の編集はTextEditが行う。描画前に満たした要求を描画後に再度要求しない。
 - 入力欄が無効 (disabled) のときは▼も無効。▼だけを無効にする理由 (検索中は使えない等) は
   呼び出し側が tooltip 文字列で渡す。
 - 履歴の機能自体を出さないとき (検索: 設定オフ、フォルダ: `show_address_bar_history_menu` オフ) は suffix を
@@ -124,7 +133,7 @@ egui は既定 (`SurrenderFocusOn::Clicks`) で、フォーカス中の TextEdit
 
 - 部品は TextEdit (= IME helper の呼び出し) を描く直前に、ポインタが「履歴の一覧の layer の上」または
   「この欄の▼の矩形 (前 pass の値を temp data に置く)」にあれば、`ctx.options_mut` で
-  `input_options.surrender_focus_on` を `Never` にし、描画直後に元へ戻す。押下・離し・ドラッグ
+  `input_options.surrender_focus_on` を `Never` にし、短いDrop guardで描画直後（panic時も）元へ戻す。押下・離し・ドラッグ
   (スクロールバー・空白部分のクリックを含む) のどの pass でも同じ判定なので、一覧の中の操作は
   離しまで内部の操作として扱われ、離脱にも閉鎖にもならない。
 - 一覧の layer は部品が描く `Area` の `LayerId` (id は owner から作る) で判定する (`ctx.layer_id_at`)。
@@ -154,7 +163,7 @@ egui は既定 (`SurrenderFocusOn::Clicks`) で、フォーカス中の TextEdit
   (`ui_main.rs` の一時バー、`global_search_ui/everything.rs` 等) ので、**排他は §3.3 の契約 (`picked` が
   `Some` の pass では従来の確定判定を実行しない) で保証する**。
 - `picked` の確定は、検索欄では既存の `App::submit_search_input` を通す (egui / native の押下をまとめて
-  claim する `finish_search_input_submit` を含む。確定後は Enter と同じくフォーカスを手放す)。フォルダ欄も
+  claim する `finish_text_input_submit` を含む。確定後は Enter と同じくフォーカスを手放す)。フォルダ欄も
   同じ `claim_text_input_submit(ctx, <アドレス欄の id>)` で押下を claim してから移動する。同じ backend frame の
   再 pass (egui の discard による同じ入力の再実行) で 2 回選ばれないことを、この claim で保証し、テストで確かめる。
 - 消費した ↓ / ↑ / Enter / Esc の押下が native 側の KeySlot から後段のショートカットへ漏れないことを確かめる
@@ -672,3 +681,100 @@ PNG以外の変更は `src/ui_pinned_search.rs`、`src/ui_history_field.rs`、�
 更新済みの確認用coreの起動コマンドと実設定への注意は上の「実機・全体gate」と同じ。
 今回の実機確認対象は通常幅の常設欄の折り返しと、検索語/フォルダパスの履歴行の左揃え・
 通常/選択/hoverの見た目。実機確認自体は未実施。
+
+### 独立実装レビュー後の修正（9eedaabd9基点）
+
+設計担当からのP2 1件・P3 2件への対応。作業はこのworktreeだけ、未コミットで引き渡す。
+P2はコードから確認した未フォーカス欄の▼の同passクリック→次passキーの所有権漏れで、
+実機での発生を確認したという意味ではない。
+
+- 部品のprivate tempフォーカス予約を廃止し、pass通知を経由して既存のAppの単一claimへ統合した。
+  常設4種類・一時バー4種類・フォルダ欄が同じviewport/widget/passを使う。
+- 描画前のmain/keymapと通常予約Enter経路は、同ownerの履歴PendingFocusを保護する。
+  既存のほかのPendingFocusの挙動を一律には変えない。
+- IME helperの従来要求は描画後にfocusを付けるため、予約直後の編集とEnterを保持するには
+  IME所有者内で描画前に実体化する入口が必要だった。短い `activate_reserved_focus` を追加し、
+  begin-passが残した矢印のfocus directionを終端する。同じownerのphaseを更新し、入力編集器・待機・
+  retry/discard・新しい保持状態を追加せずTextEditに編集を任せる。
+  plain Enterの同pass取得/確定は `lost_focus` の過去pass制約をpass通知で補い、通常の確定・claimへ流す。
+- 予約の新規経路で既存の共有focus flagを立てない。別欄へのpointer pressや実フォーカスを優先し、
+  無効化/非表示/利用不可の退役後には予約からfocusを付けない。
+- `surrender_focus_on` の変更は短いDrop guardで通常終了とpanicの両方を復元する。復旧処理は足さない。
+- フォルダの通常確定でもfocus claimと `address_has_focus` を終了し、次passのグリッド入力へ戻す。
+  履歴pick後にhelperの復帰契約が残ることを次pass回帰で検出したため、明示確定はIME側の短い
+  `end_text_input` で実フォーカスと同viewport/widgetの契約を一緒に終了する。
+  現在passのcached ownerとキーclaimは保持し、別欄・別viewportの契約は消さない。
+- `search-thumb-parent-catalog-plan.md` §15は、キャッシュ自体に検索語/結果の並びを保存しないことと、
+  別途有効なら入力履歴を保存することを分け、§1.756への参照を付けた。
+
+簡素化の検討: 短い入力欄のfocus引渡しなのでモーダル化は不要。既存の1pass claimを使い、
+別のpending、入力イベントの保存/再送、独自のテキスト編集を持たない方法を採った。
+構造は実装前に独立reviewerと合意し、実装中の退役・通常Enter・pointer優先・pass終端も指摘に合わせて確認した。
+実装と関連文書の独立レビューでは、残る重要指摘はない。検証は実装担当が所有し、reviewerは再実行していない。
+
+すべて `MSBUILDDISABLENODEREUSE=1`、Cargoのコンパイルは `-j 1`。
+
+| 今回の検証 | 結果・log |
+| --- | --- |
+| 初回追加3件 | 2成功・1失敗。folder fixtureが既定quick slotの別履歴を読んでいた。`target/history756-reviewfix-new.log` |
+| 描画前IME受付と編集batchを追加した5件 | 4成功・1失敗。同じfixture前提を修正し、active slotなし・target履歴を明示した。`target/history756-reviewfix-new2.log` |
+| 関連filter 134件 | 133成功・1失敗。履歴pick後の次pass復帰契約残留を検出し、上記IME終了境界で修正した。`target/history756-reviewfix-related.log` |
+| `cargo test -j 1 -p egui-ime --lib` | 31成功・0失敗。別widget/viewportの契約を保持する追加1件を含む。`target/history756-reviewfix-ime.log` |
+| 本体の最終関連filter | 146成功・0失敗、340.546秒。`target/history756-reviewfix-related-final.log` |
+| UIスナップショット通常比較 | 251成功・0失敗、42.96秒。`target/history756-reviewfix-ui.log`。更新モードなし |
+| 最終core check | exit 0、33.54秒。警告326件は既存と同じ。追加行上の警告参照0。`target/history756-reviewfix-check-final.log` / `history756-reviewfix-warning-audit.json` |
+| workspace全体fmt / fmt check / glyph / site cards / diff check | 成功。glyph問題0、53 cards中超過0 |
+| 確認用 `build-dev.ps1 -PreserveRuntime` | exit 0。通常構成のcore（16分）と付属exeを更新。依存検査 `runtime=4 pe=5` 成功。製品は未起動 |
+
+追加App handler回帰は、実際の▼の押下・離しを同じpassに入れ、待機passを挟まず次passに
+↓/↑/Enter/↓＋Enterを入れる。常設4種・一時4種・フォルダの36条件、Text/Paste＋Enterの16条件、
+Metadata/Everythingの▼の移動順×描画順の4条件を検査する。
+描画前と描画後の実handler、egui/nativeのキーclaim、end-pass後のfocus維持、フォルダ確定後の
+次passグリッド復帰も対象。部品の退役3条件とconfigure panic時の設定復元も追加した。
+
+本体lib全件・full gateと実機確認は今回も未実施。PNGは更新も追加もなく、既存251件との通常比較が成功した。
+`CHANGELOG.md` と `src/version_highlights.rs` は変更しない。
+
+最終検証のコマンド（すべてこのworktreeで実行。確認用buildはstderrをredirectせず呼び出した）:
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+cargo test -j 1 -p egui-ime --lib
+cargo nextest run -j 1 -p mimageviewer --lib --no-fail-fast -E 'test(/ui_history_field::tests|pinned_search::|keyboard_input::tests|ime_focus::|section207|section1684|section1409|keymap::.*owner/)'
+Remove-Item Env:UPDATE_SNAPSHOTS -ErrorAction SilentlyContinue
+cargo test -j 1 --test ui_snapshot
+cargo check -j 1 -p mimageviewer --bin mimageviewer-core
+cargo fmt
+cargo fmt --check
+python scripts/check_ui_glyphs.py
+python scripts/check_site_cards.py
+git diff --check
+$env:CARGO_BUILD_JOBS='1'
+.\scripts\build-dev.ps1 -PreserveRuntime
+```
+
+今回の変更は次の19ファイル。保持stateやSettings/公開文言の変更は増やしていない。
+
+- `crates/egui-ime/src/lib.rs`
+- `docs/architecture-overview.md`
+- `docs/coding-conventions.md`
+- `docs/keymap-spec.md`
+- `docs/search-input-history-plan.md`
+- `docs/search-thumb-parent-catalog-plan.md`
+- `src/app.rs`
+- `src/app/pinned_search.rs`
+- `src/app/pinned_search/history_tests.rs`
+- `src/app/tests/search_submit.rs`
+- `src/global_search_ui.rs`
+- `src/global_search_ui/everything.rs`
+- `src/global_search_ui/everything/shortcut.rs`
+- `src/global_search_ui/everything/ui.rs`
+- `src/ime_focus.rs`
+- `src/keyboard_input.rs`
+- `src/ui_history_field.rs`
+- `src/ui_main.rs`
+- `src/ui_pinned_search.rs`
+
+確認用coreは `target/dev-runtime/mimageviewer-core.exe` に更新済み。起動コマンドと通常プロファイルへの
+注意は上の「実機・全体gate」と同じ。今回の実機確認対象は、未フォーカス欄の▼からすぐ↓/Enter、
+別欄への▼移動、日本語IME中のキー、フォルダ確定後のグリッドキー復帰。実機確認は行っていない。

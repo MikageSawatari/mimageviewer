@@ -150,6 +150,7 @@ mod tests {
                         &mut app.global_search.focus_request,
                         None,
                         Ok(()),
+                        false,
                     );
                 })
             });

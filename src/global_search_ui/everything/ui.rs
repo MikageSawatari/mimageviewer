@@ -50,6 +50,7 @@ pub(super) struct EverythingControls {
     pub(super) close: bool,
     pub(super) has_focus: bool,
     pub(super) lost_focus: bool,
+    pub(super) focus_requested: bool,
 }
 
 pub(super) fn draw_everything_controls(
@@ -58,6 +59,7 @@ pub(super) fn draw_everything_controls(
     focus_request: &mut bool,
     history: Option<&[String]>,
     availability: Result<(), &'static str>,
+    focus_pending: bool,
 ) -> EverythingControls {
     let mut controls = EverythingControls::default();
     ui.horizontal_wrapped(|ui| {
@@ -88,6 +90,7 @@ pub(super) fn draw_everything_controls(
             crate::ui_history_field::HistoryFieldOptions {
                 visible: history.is_some(),
                 availability,
+                focus_pending,
                 ..Default::default()
             },
             |edit| {
@@ -97,6 +100,8 @@ pub(super) fn draw_everything_controls(
             },
         );
         let mut output = history_output.text;
+        controls.focus_requested = history_output.focus_requested;
+        controls.send = history_output.submit_requested;
         if select_query {
             let range = egui::text::CCursorRange::two(
                 egui::text::CCursor::new(0),
@@ -212,7 +217,7 @@ pub(super) fn draw_everything_progress(ctx: &egui::Context) -> bool {
 pub fn draw_everything_search_snapshot_fixture(ui: &mut egui::Ui) {
     let mut query = String::from("旅行 日本語 ext:jpg;png;pdf");
     let mut focus_request = false;
-    draw_everything_controls(ui, &mut query, &mut focus_request, Some(&[]), Ok(()));
+    draw_everything_controls(ui, &mut query, &mut focus_request, Some(&[]), Ok(()), false);
     draw_everything_status(
         ui,
         EverythingStatus {
@@ -291,7 +296,14 @@ mod tests {
                     egui::CentralPanel::default().show(root_ui, |ui| {
                         let mut query = String::from("旅行 日本語 ext:jpg;png;pdf");
                         let mut focus = false;
-                        super::draw_everything_controls(ui, &mut query, &mut focus, None, Ok(()));
+                        super::draw_everything_controls(
+                            ui,
+                            &mut query,
+                            &mut focus,
+                            None,
+                            Ok(()),
+                            false,
+                        );
                         // Production renders a failed search via the same error label.
                         ui.colored_label(
                             ui.visuals().error_fg_color,

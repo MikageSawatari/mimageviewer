@@ -456,6 +456,7 @@ mod focus_tests {
                             false,
                             false,
                             None,
+                            false,
                         );
                     });
                 });
@@ -558,6 +559,7 @@ mod focus_tests {
                                 false,
                                 false,
                                 None,
+                                false,
                             );
                             app.global_search.has_focus |= response.inner.input.has_focus();
                         } else {
@@ -790,7 +792,7 @@ impl App {
     }
 
     /// Finish the one accepted text-submit operation, including its focus reservation.
-    fn finish_search_input_submit(&mut self, ctx: &egui::Context, widget: egui::Id) {
+    pub(crate) fn finish_text_input_submit(&mut self, ctx: &egui::Context, widget: egui::Id) {
         crate::keyboard_input::claim_text_input_submit(ctx, widget);
         if self
             .pending_text_input_focus
@@ -812,7 +814,7 @@ impl App {
         }
         self.ensure_search_session(kind);
         self.record_search_input_history(kind);
-        self.finish_search_input_submit(ctx, widget);
+        self.finish_text_input_submit(ctx, widget);
         match kind {
             Kind::Local => {
                 self.search_focus_request = false;
@@ -857,7 +859,7 @@ impl App {
         {
             return false;
         }
-        self.finish_search_input_submit(ctx, widget);
+        self.finish_text_input_submit(ctx, widget);
         self.tag_view.focus_request = false;
         self.tag_view.has_focus = false;
         true
@@ -885,6 +887,10 @@ impl App {
     /// Called after Main's discrete-input and active-detached admission, before grid keys.
     /// A real widget or its recovery claim wins over a not-yet-drawn search reservation.
     pub(crate) fn route_pending_search_submit(&mut self, ctx: &egui::Context) -> bool {
+        self.keyboard_owner_for_pass(ctx);
+        if crate::ui_history_field::owns_pending_focus(ctx) {
+            return false;
+        }
         use crate::keyboard_input::{
             KeyboardOwner, ShortcutScope, ShortcutSurface, TextInputPhase,
         };
@@ -1150,6 +1156,7 @@ impl App {
                 | Action::Submit(kind)
                 | Action::Clear(kind)
                 | Action::Focused(kind)
+                | Action::RequestFocus(kind)
                 | Action::Picked(kind, _) => kind,
             };
             if matches!(action, Action::Focused(_)) {
@@ -1199,6 +1206,13 @@ impl App {
                     }
                 }
                 Action::Focused(_) => {}
+                Action::RequestFocus(_) => {
+                    self.claim_pending_text_input_focus(
+                        ctx.viewport_id(),
+                        kind.input_id(),
+                        ctx.cumulative_pass_nr(),
+                    );
+                }
             }
         }
     }
@@ -1456,6 +1470,7 @@ impl App {
         };
         let enter = self.dialog_enter_pressed(ui.ctx());
         let drag = self.settings.toolbar_section_drag_enabled;
+        let focus_pending = self.history_input_focus_pending(ui.ctx(), kind.input_id());
         let draft = match kind {
             Kind::Local => &mut self.search_query,
             Kind::Container => &mut self.favsearch.query,
@@ -1474,6 +1489,7 @@ impl App {
             self.settings
                 .save_search_input_history
                 .then(|| self.settings.search_input_history.entries(kind)),
+            focus_pending,
         );
         let focused = response.inner.input.has_focus();
         match kind {

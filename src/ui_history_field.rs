@@ -22,6 +22,8 @@ pub(crate) struct HistoryFieldOptions {
     pub tooltip: &'static str,
     pub min_popup_width: Option<f32>,
     pub monospace: bool,
+    /// Derived from the caller's existing viewport/widget focus reservation.
+    pub focus_pending: bool,
 }
 
 impl Default for HistoryFieldOptions {
@@ -32,6 +34,7 @@ impl Default for HistoryFieldOptions {
             tooltip: "入力履歴",
             min_popup_width: None,
             monospace: false,
+            focus_pending: false,
         }
     }
 }
@@ -39,6 +42,8 @@ impl Default for HistoryFieldOptions {
 pub(crate) struct HistoryFieldOutput {
     pub text: TextEditOutput,
     pub picked: Option<usize>,
+    pub focus_requested: bool,
+    pub submit_requested: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -60,8 +65,10 @@ fn arrow_rect_key(viewport: egui::ViewportId, owner: Id) -> Id {
     owner.with(("history_field_arrow_rect", viewport))
 }
 
-fn focus_request_key(viewport: egui::ViewportId, owner: Id) -> Id {
-    owner.with(("history_field_focus_request", viewport))
+#[cfg(test)]
+pub(crate) fn arrow_rect_for_test(ctx: &Context, owner: Id) -> egui::Rect {
+    let key = arrow_rect_key(ctx.viewport_id(), owner);
+    ctx.data(|data| data.get_temp(key)).unwrap()
 }
 
 fn state(ctx: &Context) -> Option<HistoryPopupState> {
@@ -71,27 +78,44 @@ fn state(ctx: &Context) -> Option<HistoryPopupState> {
 
 fn store(ctx: &Context, state: HistoryPopupState) {
     let id = state_id(ctx);
-    let viewport = ctx.viewport_id();
     ctx.data_mut(|data| {
-        if let Some(previous) = data
-            .get_temp::<HistoryPopupState>(id)
-            .filter(|previous| previous.owner != state.owner)
-        {
-            data.remove::<u64>(focus_request_key(viewport, previous.owner));
-        }
         data.insert_temp(id, state);
     });
 }
 
 pub(crate) fn close(ctx: &Context) {
     let id = state_id(ctx);
-    let viewport = ctx.viewport_id();
     ctx.data_mut(|data| {
-        if let Some(previous) = data.get_temp::<HistoryPopupState>(id) {
-            data.remove::<u64>(focus_request_key(viewport, previous.owner));
-        }
         data.remove::<HistoryPopupState>(id);
     });
+}
+
+pub(crate) fn is_open_for(ctx: &Context, owner: Id) -> bool {
+    state(ctx).is_some_and(|state| {
+        state.owner == owner && state.drawn_pass.saturating_add(1) >= ctx.cumulative_pass_nr()
+    }) && ctx.input(|input| input.focused)
+        && !egui::Popup::is_any_open(ctx)
+}
+
+/// The existing App claim protects this history while the helper lands focus.
+pub(crate) fn owns_pending_focus(ctx: &Context) -> bool {
+    matches!(crate::keyboard_input::cached_keyboard_owner(ctx),
+        Some(crate::keyboard_input::KeyboardOwner::TextInput {
+            viewport, widget_id, phase: crate::keyboard_input::TextInputPhase::PendingFocus,
+        }) if viewport == ctx.viewport_id() && is_open_for(ctx, widget_id))
+}
+
+struct SurrenderFocusGuard {
+    ctx: Context,
+    previous: egui::SurrenderFocusOn,
+}
+
+impl Drop for SurrenderFocusGuard {
+    fn drop(&mut self) {
+        self.ctx.options_mut(|options| {
+            options.input_options.surrender_focus_on = self.previous;
+        });
+    }
 }
 
 fn retire(ctx: &Context) {
@@ -191,7 +215,7 @@ fn consume_wheel(ctx: &Context) {
 pub(crate) fn show_singleline<'text>(
     ui: &mut egui::Ui,
     text: &'text mut String,
-    mut focus_request: Option<&mut bool>,
+    focus_request: Option<&mut bool>,
     id: Id,
     entries: &[String],
     options: HistoryFieldOptions,
@@ -221,6 +245,19 @@ pub(crate) fn show_singleline<'text>(
     }
     let was_open = current.is_some();
     let ime_active = crate::ime_focus::ime_input_active(&ctx);
+    let pointer = ctx.pointer_interact_pos();
+    let outside_pointer = ctx.input(|input| input.pointer.any_pressed())
+        && pointer.is_some_and(|pos| {
+            !ctx.read_response(id)
+                .is_some_and(|response| response.rect.contains(pos))
+                && ctx.layer_id_at(pos)
+                    != Some(egui::LayerId::new(egui::Order::Foreground, popup_id(id)))
+        });
+    let requesting_focus = options.focus_pending
+        && enabled
+        && !outside_pointer
+        && crate::ime_focus::activate_reserved_focus(ui, id);
+    let pending_enter = requesting_focus && !ime_active && plain_key(&ctx, Key::Enter);
     let editing = !ime_active && has_edit_intent(&ctx, id);
     if editing && current.is_some() {
         close(&ctx);
@@ -228,7 +265,9 @@ pub(crate) fn show_singleline<'text>(
     }
     let mut picked = None;
     let mut moved_highlight = false;
-    if may_open && ctx.memory(|memory| memory.has_focus(id)) && !ime_active && !editing {
+    let has_focus = ctx.memory(|memory| memory.has_focus(id));
+    let mut request = focus_request.is_some_and(std::mem::take) && !requesting_focus;
+    if may_open && has_focus && !ime_active && !editing {
         if plain_key(&ctx, Key::ArrowDown) {
             consume_key(&ctx, Key::ArrowDown);
             moved_highlight = true;
@@ -272,7 +311,6 @@ pub(crate) fn show_singleline<'text>(
     }
 
     let arrow_rect_id = arrow_rect_key(ctx.viewport_id(), id);
-    let pointer = ctx.pointer_interact_pos();
     let pointer_on_arrow = options.visible
         && pointer.is_some_and(|pos| {
             ctx.data(|data| data.get_temp::<egui::Rect>(arrow_rect_id))
@@ -281,42 +319,32 @@ pub(crate) fn show_singleline<'text>(
     let pointer_on_popup = current.is_some()
         && pointer.and_then(|pos| ctx.layer_id_at(pos))
             == Some(egui::LayerId::new(egui::Order::Foreground, popup_id(id)));
-    let surrender = ctx.options(|options| options.input_options.surrender_focus_on);
-    if pointer_on_arrow || pointer_on_popup {
+    let surrender = (pointer_on_arrow || pointer_on_popup).then(|| {
+        let previous = ctx.options(|options| options.input_options.surrender_focus_on);
         ctx.options_mut(|options| {
             options.input_options.surrender_focus_on = egui::SurrenderFocusOn::Never
         });
-    }
-    // A suffix click on an unfocused field requests focus through the helper on
-    // the next pass, rather than issuing a competing request after the helper.
-    let request_id = focus_request_key(ctx.viewport_id(), id);
-    let mut internal_request = ctx
-        .data_mut(|data| data.remove_temp::<u64>(request_id))
-        .is_some_and(|requested| requested.saturating_add(1) == pass)
-        && enabled;
-    if internal_request {
-        if let Some(request) = focus_request.as_deref_mut() {
-            *request = true;
+        SurrenderFocusGuard {
+            ctx: ctx.clone(),
+            previous,
         }
-    }
+    });
     let atom_id = egui::IdSalt::new("history_field_arrow");
     let arrow_size = egui::vec2(SUFFIX_WIDTH, ui.text_style_height(&egui::TextStyle::Body));
-    let output = crate::ime_focus::show_singleline(
-        ui,
-        text,
-        focus_request.or(Some(&mut internal_request)),
-        |edit| {
-            let edit = configure(edit).id(id);
-            if options.visible {
-                edit.suffix(egui::Atom::custom(atom_id, arrow_size))
-            } else {
-                edit
-            }
-        },
-    );
-    ctx.options_mut(|options| options.input_options.surrender_focus_on = surrender);
+    let output = crate::ime_focus::show_singleline(ui, text, Some(&mut request), |edit| {
+        let edit = configure(edit).id(id);
+        if options.visible {
+            edit.suffix(egui::Atom::custom(atom_id, arrow_size))
+        } else {
+            edit
+        }
+    });
+    drop(surrender);
+    // lost_focus only covers prior passes, not acquisition and submit in one pass.
+    let submit_requested = pending_enter && picked.is_none() && !output.response.has_focus();
 
     let mut arrow_clicked = false;
+    let mut focus_requested = false;
     if let Some(rect) = output.response.rect(atom_id).filter(|_| options.visible) {
         ctx.data_mut(|data| data.insert_temp(arrow_rect_id, rect));
         let response = ui
@@ -351,13 +379,13 @@ pub(crate) fn show_singleline<'text>(
             current = Some(open);
             store(&ctx, open);
             if !output.response.has_focus() {
-                ctx.data_mut(|data| data.insert_temp(request_id, pass));
+                focus_requested = true;
                 ctx.request_repaint();
             }
         }
     }
     if (output.response.changed() && !ime_active)
-        || (!output.response.has_focus() && !arrow_clicked && !internal_request)
+        || (!output.response.has_focus() && !arrow_clicked && !requesting_focus)
     {
         current = None;
         if state(&ctx).is_some_and(|state| state.owner == id) {
@@ -442,6 +470,8 @@ pub(crate) fn show_singleline<'text>(
     HistoryFieldOutput {
         text: output,
         picked,
+        focus_requested,
+        submit_requested,
     }
 }
 
@@ -532,13 +562,16 @@ mod tests {
                                 |edit| edit.desired_width(280.0).hint_text("Search"),
                             );
                             state.rect = output.text.response.rect;
+                            state.request_focus |= output.focus_requested;
                             if let Some(index) = output.picked {
                                 state.picked.push(index);
                                 crate::keyboard_input::claim_text_input_submit(&ctx, field_id());
                                 if state.discard_pick {
                                     ctx.request_discard("exercise same input re-pass");
                                 }
-                            } else if owned && enter && output.text.response.lost_focus() {
+                            } else if output.submit_requested
+                                || owned && enter && output.text.response.lost_focus()
+                            {
                                 state.submitted += 1;
                                 crate::keyboard_input::claim_text_input_submit(&ctx, field_id());
                             }
@@ -938,6 +971,111 @@ mod tests {
     }
 
     #[test]
+    fn history_field_surrender_focus_is_restored_when_configure_panics() {
+        let ctx = Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let draw = |ui: &mut egui::Ui| {
+            let mut text = String::new();
+            show_singleline(
+                ui,
+                &mut text,
+                None,
+                field_id(),
+                &[],
+                Default::default(),
+                |edit| edit.desired_width(280.0).hint_text("Search"),
+            );
+        };
+        ctx.run_ui(Default::default(), draw)
+            .drop_without_applying_deltas();
+        let rect = arrow_rect_for_test(&ctx, field_id());
+        for previous in [
+            egui::SurrenderFocusOn::Clicks,
+            egui::SurrenderFocusOn::Never,
+        ] {
+            ctx.options_mut(|options| options.input_options.surrender_focus_on = previous);
+            ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::PointerMoved(rect.center())],
+                    ..Default::default()
+                },
+                |ui| {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut text = String::new();
+                        show_singleline(
+                            ui,
+                            &mut text,
+                            None,
+                            field_id(),
+                            &[],
+                            Default::default(),
+                            |_| {
+                                assert_eq!(
+                                    ctx.options(|options| options.input_options.surrender_focus_on),
+                                    egui::SurrenderFocusOn::Never
+                                );
+                                panic!("exercise configure unwinding");
+                            },
+                        );
+                    }));
+                    assert!(result.is_err());
+                    assert_eq!(
+                        ctx.options(|options| options.input_options.surrender_focus_on),
+                        previous
+                    );
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn history_field_pending_focus_is_not_granted_after_retirement() {
+        for cause in ["disabled", "hidden", "unavailable"] {
+            let ctx = Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            ctx.run_ui(Default::default(), |ui| {
+                store(
+                    &ctx,
+                    HistoryPopupState {
+                        owner: field_id(),
+                        highlight: None,
+                        drawn_pass: ctx.cumulative_pass_nr(),
+                    },
+                );
+                if cause == "disabled" {
+                    ui.disable();
+                }
+                let mut text = String::new();
+                show_singleline(
+                    ui,
+                    &mut text,
+                    None,
+                    field_id(),
+                    &[],
+                    HistoryFieldOptions {
+                        visible: cause != "hidden",
+                        availability: if cause == "unavailable" {
+                            Err("unavailable")
+                        } else {
+                            Ok(())
+                        },
+                        focus_pending: true,
+                        ..Default::default()
+                    },
+                    |edit| edit.hint_text("Search"),
+                );
+                assert!(state(&ctx).is_none());
+                assert!(
+                    !ctx.memory(|m| m.has_focus(field_id())),
+                    "retired reservation: {cause}"
+                );
+            })
+            .drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
     fn history_field_text_or_paste_with_enter_submits_edit_instead_of_history() {
         #[cfg(windows)]
         let _input = crate::key_input::lock_test_input();
@@ -1015,17 +1153,6 @@ mod tests {
                     },
                 );
                 assert!(state(&ctx).is_some());
-                let request_key = focus_request_key(viewport, field_id());
-                ctx.data_mut(|data| {
-                    data.insert_temp(
-                        request_key,
-                        if viewport == egui::ViewportId::ROOT {
-                            50u64
-                        } else {
-                            60u64
-                        },
-                    )
-                });
                 let rect_key = arrow_rect_key(viewport, field_id());
                 let rect = ctx
                     .data(|data| data.get_temp::<egui::Rect>(rect_key))
@@ -1039,11 +1166,6 @@ mod tests {
                         ctx.data(|data| data.get_temp::<egui::Rect>(root_key)),
                         root_arrow_rect
                     );
-                    let root_request = focus_request_key(egui::ViewportId::ROOT, field_id());
-                    assert_eq!(
-                        ctx.data(|data| data.get_temp::<u64>(root_request)),
-                        Some(50)
-                    );
                 }
             })
             .drop_without_applying_deltas();
@@ -1051,14 +1173,11 @@ mod tests {
         ctx.run_ui(input(sibling), |_ui| {
             close(&ctx);
             assert!(state(&ctx).is_none());
-            let request_key = focus_request_key(sibling, field_id());
-            assert_eq!(ctx.data(|data| data.get_temp::<u64>(request_key)), None);
         })
         .drop_without_applying_deltas();
         ctx.run_ui(input(egui::ViewportId::ROOT), |_ui| {
             assert_eq!(state(&ctx).unwrap().owner, field_id());
-            let request_key = focus_request_key(egui::ViewportId::ROOT, field_id());
-            assert_eq!(ctx.data(|data| data.get_temp::<u64>(request_key)), Some(50));
+
             let rect_key = arrow_rect_key(egui::ViewportId::ROOT, field_id());
             assert_eq!(
                 ctx.data(|data| data.get_temp::<egui::Rect>(rect_key)),

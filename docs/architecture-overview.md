@@ -141,6 +141,9 @@ PDF共有poolの失効は先行改修 `4510346f5` / master `c1e66f589` のviewer
 `ui_history_field` は IME helper を通す TextEdit に▼を内蔵する共有部品で、検索欄とフォルダアドレス欄が使う。
 viewport ごとの単一 `HistoryPopupState` が owner・選択位置・描画 pass を所有し、egui Popup と状態を二重化しない。
 部品は一覧の表示と選択だけを扱い、保存・検索実行・フォルダ移動は各呼び出し側が所有する。
+未フォーカス欄の▼はAppの既存pending focus claimに接続し、部品内に別の予約は持たない。
+IME helperが予約を描画前の実フォーカスへ渡し、本体facadeが同じ入力ownerのphaseを更新する。
+明示的な確定では実フォーカスと同viewport/widgetの復帰契約をIME側で一緒に終了する。
 検索履歴の記録は共通 submit の受付と、App update の一箇所で直前 pass の検索入力フォーカスから判定する通常離脱だけ。
 非同期結果の到着や個々の欄の lost_focus では記録しない。ログ・Remote・MCPの出力境界には履歴を公開しない。
 詳細は [入力履歴の設計](search-input-history-plan.md)。
