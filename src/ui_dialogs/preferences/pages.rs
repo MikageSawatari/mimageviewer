@@ -2728,67 +2728,9 @@ fn key_action_detail_label(action: KeyAction) -> &'static str {
     }
 }
 
-const SAVED_COLLECTION_DETAILS: [&str; 20] = [
-    "コレクションの管理順で 1 番目を開く",
-    "コレクションの管理順で 2 番目を開く",
-    "コレクションの管理順で 3 番目を開く",
-    "コレクションの管理順で 4 番目を開く",
-    "コレクションの管理順で 5 番目を開く",
-    "コレクションの管理順で 6 番目を開く",
-    "コレクションの管理順で 7 番目を開く",
-    "コレクションの管理順で 8 番目を開く",
-    "コレクションの管理順で 9 番目を開く",
-    "コレクションの管理順で 10 番目を開く",
-    "コレクションの管理順で 11 番目を開く",
-    "コレクションの管理順で 12 番目を開く",
-    "コレクションの管理順で 13 番目を開く",
-    "コレクションの管理順で 14 番目を開く",
-    "コレクションの管理順で 15 番目を開く",
-    "コレクションの管理順で 16 番目を開く",
-    "コレクションの管理順で 17 番目を開く",
-    "コレクションの管理順で 18 番目を開く",
-    "コレクションの管理順で 19 番目を開く",
-    "コレクションの管理順で 20 番目を開く",
-];
-
-const SAVED_BOOK_DETAILS: [&str; 20] = [
-    "本棚の管理順で 1 番目の本を開く",
-    "本棚の管理順で 2 番目の本を開く",
-    "本棚の管理順で 3 番目の本を開く",
-    "本棚の管理順で 4 番目の本を開く",
-    "本棚の管理順で 5 番目の本を開く",
-    "本棚の管理順で 6 番目の本を開く",
-    "本棚の管理順で 7 番目の本を開く",
-    "本棚の管理順で 8 番目の本を開く",
-    "本棚の管理順で 9 番目の本を開く",
-    "本棚の管理順で 10 番目の本を開く",
-    "本棚の管理順で 11 番目の本を開く",
-    "本棚の管理順で 12 番目の本を開く",
-    "本棚の管理順で 13 番目の本を開く",
-    "本棚の管理順で 14 番目の本を開く",
-    "本棚の管理順で 15 番目の本を開く",
-    "本棚の管理順で 16 番目の本を開く",
-    "本棚の管理順で 17 番目の本を開く",
-    "本棚の管理順で 18 番目の本を開く",
-    "本棚の管理順で 19 番目の本を開く",
-    "本棚の管理順で 20 番目の本を開く",
-];
-
 fn ring_action_detail_label(action: &RingActionId, context: RingShortcutContext) -> &'static str {
     if let Some(key_action) = action.saved_group_key_action() {
-        if let Some(slot) = key_action.collection_slot_number() {
-            return SAVED_COLLECTION_DETAILS[slot - 1];
-        }
-        if let Some(slot) = key_action.book_slot_number() {
-            return SAVED_BOOK_DETAILS[slot - 1];
-        }
-        return match key_action {
-            KeyAction::GridCollectionPrev => "前のコレクションを開く。端で循環します",
-            KeyAction::GridCollectionNext => "次のコレクションを開く。端で循環します",
-            KeyAction::GridBookPrev => "本棚の管理順で前の本を開く。端で循環します",
-            KeyAction::GridBookNext => "本棚の管理順で次の本を開く。端で循環します",
-            _ => unreachable!("saved-group ring mapping must be a navigation action"),
-        };
+        return key_action_detail_label(key_action);
     }
     match action {
         RingActionId::ImagePageOverview => key_action_detail_label(KeyAction::FsPageOverviewToggle),
@@ -12496,7 +12438,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_group_ring_assignments_share_key_rows_and_describe_management_order() {
+    fn saved_group_ring_assignments_share_key_rows_and_descriptions() {
         let mut state = zoom_key_editor_state();
         let keymap = crate::keymap::Keymap::default();
         let actions: Vec<_> = RingActionId::available_for_context(RingShortcutContext::Grid)
@@ -12511,13 +12453,11 @@ mod tests {
             for &context in RingShortcutContext::all() {
                 assert!(bindings.contains(&(context, ring.clone())));
                 assert!(super::ring_action_has_key_action(context, &ring));
-                let detail = super::ring_action_detail_label(&ring, context);
-                if let Some(slot) = key.collection_slot_number().or(key.book_slot_number()) {
-                    assert!(detail.contains(&format!(" {slot} 番目")), "{detail}");
-                    assert!(detail.contains("管理順"), "{detail}");
-                } else {
-                    assert!(detail.contains("端で循環"), "{detail}");
-                }
+                assert_eq!(ring.label_for_context(context), key.description());
+                assert_eq!(
+                    super::ring_action_detail_label(&ring, context),
+                    super::key_action_detail_label(key),
+                );
             }
         }
         let ring = RingActionId::OpenCollection1;

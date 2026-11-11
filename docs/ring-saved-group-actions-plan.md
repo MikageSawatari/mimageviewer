@@ -27,13 +27,14 @@
 
 | `RingActionId` | 保存名 | 表示名 | 対応する `KeyAction` |
 | --- | --- | --- | --- |
-| `OpenCollection1..20` | `open_collection_1`..`open_collection_20` | コレクション 1 … 20 | `GridOpenCollection1..20` |
-| `CollectionPrev` / `CollectionNext` | `collection_prev` / `collection_next` | 前のコレクション / 次のコレクション | `GridCollectionPrev` / `GridCollectionNext` |
-| `OpenBook1..20` | `open_book_1`..`open_book_20` | 本棚の本 1 … 20 | `GridOpenBook1..20` |
-| `BookPrev` / `BookNext` | `book_prev` / `book_next` | 本棚順で前の本 / 本棚順で次の本 | `GridBookPrev` / `GridBookNext` |
+| `OpenCollection1..20` | `open_collection_1`..`open_collection_20` | コレクション1を開く … コレクション20を開く | `GridOpenCollection1..20` |
+| `CollectionPrev` / `CollectionNext` | `collection_prev` / `collection_next` | 前のコレクションを開く / 次のコレクションを開く | `GridCollectionPrev` / `GridCollectionNext` |
+| `OpenBook1..20` | `open_book_1`..`open_book_20` | 本1を開く … 本20を開く | `GridOpenBook1..20` |
+| `BookPrev` / `BookNext` | `book_prev` / `book_next` | 前の本を開く / 次の本を開く | `GridBookPrev` / `GridBookNext` |
 
-- 詳細説明 (操作カスタマイズのホバー) は「コレクションの管理順で N 番目を開く」「本棚の管理順で N 番目の本を開く」
-  「前/次のコレクション (本) を開く。端で循環します」程度。番号の意味はキーと同じ (管理一覧の全件、§keymap-spec)。
+- 表示名は対応する既存の `KeyAction::description()` を参照し、リング側に文言を重複定義しない。
+  詳細説明 (操作カスタマイズのホバー) もキー行と同じ説明を使う。
+  番号の意味はキーと同じ (管理一覧の全件、§keymap-spec)。
 - 前/次の本は backlog の方針 (コレクション 1〜20・本 1〜20・前/次のコレクション) に無いが、同じ実行入口に乗るだけで
   費用がほぼ無く、片方だけ無いと不自然なので一緒に足す。
 - 足さないもの: `GridOpenActiveBook` (追加先の本を開く)・`GridOpenCollectionTarget` (追加先のコレクションを開く)・
@@ -174,7 +175,8 @@
   - P2 更新中のホイールクリック → 既存の制限として範囲外にした (お気に入りも同じ)。
   - P2 全列挙テスト・ホバー説明の場所 → §8 に足した。
   - P3 旧版での保持 → §6 を直した。
-  - 候補名: 本は「本棚の本 N」「本棚順で前/次の本」にした (全画面の一覧順の前/次と区別する)。
+  - 候補名 (実機確認後に改訂): 既存の `KeyAction::description()` に統一する。
+    「前/次の本を開く」は全画面の「一覧の表示順で前/次の本を開く」と区別できるため、「本棚順で」は付けない。
 - 設計レビュー 2 回目 (同じセッション): ACCEPT WITH CHANGES。連動型を受け付ける判断は了承 (待機ダイアログが隠れる・
   状態が壊れる欠陥は無い。後片付けは既存の通常 cleanup が行う)。P2 §8 の動画遷移中の期待値の矛盾、P3 別ウィンドウの
   検証項目 → §8 を直した。
@@ -312,3 +314,21 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 
 引数なしでは通常の `%APPDATA%\mimageviewer` を使い、実際の設定・データを更新し得る。
 single-instance mutexも共有するので、先にインストール版・常駐tray版のmImageViewerを終了する。
+
+### 追加修正: キーとリングの表示名を統一
+
+- サブPC担当の実機確認で、操作一覧とリング候補の本の名前が一致しないことが見つかった。
+  設計担当の決定に従い、全44操作の `label_for_context` を既存の `KeyAction::description()` 参照へ統一した。
+  番号表の表示名列・前後移動の個別ラベルを削除し、保存IDと `ini_name()` は変更していない。
+- ホバーも `key_action_detail_label` を共有する。全44件・3文脈で表示名と説明の一致を検査し、
+  テスト内にも表示名を転記しない。操作行の回帰名は `saved_group_ring_assignments_share_key_rows_and_descriptions` とした。
+- キー仕様・本／コレクションのマニュアル4ページと本書§2・§10の候補名を更新した。
+- 該当44操作の表示名を写した既存UIスナップショットは無い。リング案内のfixtureは別操作、
+  操作一覧の `command_chords_catalog_dark` はコピー操作だけを表示するため、PNG更新は無い。
+- この追加修正では全件テスト・`build-dev`・製品の起動・コミットは実施しない。
+- 検証: `python scripts/check_ui_glyphs.py` は危険グリフ0件、
+  `cargo check -p mimageviewer --bin mimageviewer-core` 成功 (24.95秒、既存警告あり)。
+  `cargo nextest run -p mimageviewer --lib -E 'test(/ring|saved_group|keymap|operation|preferences/)' --no-fail-fast` は
+  **1,083件実行・1,083件成功** (61.008秒、16,157件 skipped)。ログは
+  `target/section733-label-check.log` と `target/section733-label-related.log`。
+- 検証後に `cargo fmt` (引数なし) と `cargo fmt --check` を実行し、成功した。
