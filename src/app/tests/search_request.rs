@@ -353,6 +353,263 @@ fn search_name_new_metadata_draft_converges_without_repeated_projection_rejectio
     }
 }
 
+fn completed_search_for_snapshot(
+    ctx: &egui::Context,
+    source: Kind,
+    pinned: bool,
+) -> super::super::AppTestEnvForTest {
+    let mut app = super::super::setup_app_for_test();
+    pin(&mut app, pinned);
+    app.indexer_init = super::super::IndexerInit::Unavailable;
+    let origin = app.tmp.path().join("snapshot-search-origin");
+    std::fs::create_dir(&origin).unwrap();
+    let hits = app.tmp.path().join("snapshot-search-hits");
+    std::fs::create_dir(&hits).unwrap();
+    let paths = [hits.join("fresh name.png"), hits.join("a-old-only.png")];
+    for path in &paths {
+        image::RgbImage::new(2, 3).save(path).unwrap();
+    }
+    app.current_folder = Some(origin);
+    match source {
+        Kind::Metadata => {
+            app.open_global_search();
+            app.global_search.metadata_draft = "test".into();
+            app.global_search.reset_for_new_query();
+            crate::global_search_ui::tests::g1_publish_search_hits(&mut app, ctx, &paths);
+        }
+        Kind::Everything => crate::global_search_ui::adopt_everything_for_test(
+            &mut app,
+            ctx,
+            "old everything",
+            crate::global_search_ui::everything_dataset_for_test(
+                paths.into_iter().map(GridItem::Image).collect(),
+            ),
+        ),
+        _ => unreachable!(),
+    }
+    assert!(app.global_search.active);
+    assert!(!app.global_search.last_executed.is_empty());
+    assert!(app.global_search.page_edit_prepare.is_some());
+    assert_eq!(app.items.len(), 2);
+    // Fix a strict subset, so re-adopting the previous dataset cannot look like
+    // preserving the fixed list just because it contains the same paths.
+    app.visible_indices = vec![
+        app.items
+            .iter()
+            .position(|item| {
+                item.drag_source_path()
+                    .is_some_and(|path| path.ends_with("fresh name.png"))
+            })
+            .unwrap(),
+    ];
+    app
+}
+
+fn assert_snapshot_search_retired(app: &App) {
+    assert!(!app.global_search.active);
+    assert_eq!(
+        app.global_search.source,
+        crate::global_search_ui::SearchSource::Metadata
+    );
+    assert!(matches!(
+        app.global_search.accepted,
+        SearchAccepted::Metadata { applied: None }
+    ));
+    assert!(app.global_search.page_edit_prepare.is_none());
+    assert!(app.global_search.pending.is_none());
+    assert!(app.global_search.mtime_lookup_pending.is_none());
+    assert!(app.search_video_thread_cancel.is_none());
+    assert!(app.global_search.saved_folder.is_none());
+    assert!(app.global_search.last_executed.is_empty());
+    assert!(!app.items_are_global_search_view);
+    assert!(!app.global_search.aggregate);
+    assert!(app.global_search.aggregate_auto);
+    assert!(app.search_drilled_folder_counts.is_empty());
+}
+
+#[test]
+fn search_name_snapshot_retires_completed_search_before_prefill_sort_and_enter() {
+    let _input = crate::key_input::lock_test_input();
+    for source in [Kind::Everything, Kind::Metadata] {
+        for pinned in [false, true] {
+            let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let ctx = context();
+            let mut app = completed_search_for_snapshot(&ctx, source, pinned);
+            let prepare_cancel = app.search_prepare_cancel_for_test();
+            let video_cancel = Arc::new(AtomicBool::new(false));
+            app.search_video_thread_cancel = Some(video_cancel.clone());
+            let mtime_cancel = Arc::new(AtomicBool::new(false));
+            let (_mtime_tx, mtime_rx) = std::sync::mpsc::channel();
+            app.global_search.mtime_lookup_pending =
+                Some(crate::global_search_ui::MtimeLookupPending {
+                    cancel: mtime_cancel.clone(),
+                    rx: mtime_rx,
+                });
+            app.search_drilled_folder_counts
+                .insert("old container".into(), [1; 6]);
+            let fixed = vec![app.items[app.visible_indices[0]].clone()];
+            let label = crate::snapshot::SnapshotSourceLabel::GlobalSearch {
+                query: app.global_search.last_executed.clone(),
+            };
+            app.activate_snapshot(label);
+            app.finish_page_identity_preparation_for_test();
+            assert!(app.is_snapshot_active());
+            assert_eq!(app.items, fixed);
+            assert_snapshot_search_retired(&app);
+            assert!(prepare_cancel.load(Ordering::Relaxed));
+            assert!(video_cancel.load(Ordering::Relaxed));
+            assert!(mtime_cancel.load(Ordering::Relaxed));
+            assert!(
+                app.feedback_toasts_for_test
+                    .iter()
+                    .any(|(text, _)| text == "検索結果をスナップショットに固定しました (1 件)")
+            );
+
+            ctx.begin_pass(egui::RawInput::default());
+            let query = app.grid_item_search_name(&ctx, &app.items[0]).unwrap();
+            assert_eq!(query, "fresh name");
+            assert!(
+                app.search_with_text_availability(&ctx, Kind::Metadata)
+                    .is_ok()
+            );
+            inject(&mut app, &ctx, Kind::Metadata, &query);
+            assert_eq!(app.global_search.metadata_draft, query);
+            assert_eq!(app.items, fixed);
+            draw(&mut app, &ctx, Kind::Metadata, pinned);
+            for sort in [
+                crate::settings::SortOrder::FileName,
+                crate::settings::SortOrder::RatingDesc,
+            ] {
+                app.settings.sort_order = sort;
+                app.apply_sort_change_reload_without_ui_io();
+                for _ in 0..8 {
+                    app.poll_global_search_events(&ctx);
+                    app.poll_global_search_debounce(&ctx);
+                    app.poll_container_mtime_pending(&ctx);
+                }
+                assert!(matches!(
+                    app.global_search.accepted,
+                    SearchAccepted::Metadata { applied: None }
+                ));
+                assert!(app.global_search.page_edit_prepare.is_none());
+                assert!(app.global_search.pending.is_none());
+                assert!(app.global_search.last_executed.is_empty());
+                assert!(app.global_search.last_change_at.is_none());
+                assert!(!app.global_search.is_searching());
+                assert!(app.items.iter().all(|item| fixed.contains(item)));
+            }
+            end(&ctx);
+            ctx.begin_pass(egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: Some(egui::Key::Enter),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            });
+            app.update_ime_state(&ctx);
+            draw(&mut app, &ctx, Kind::Metadata, pinned);
+            assert!(app.global_search.last_change_at.is_some());
+            app.global_search.last_change_at = Some(Instant::now() - Duration::from_secs(2));
+            app.poll_global_search_debounce(&ctx);
+            assert_eq!(
+                app.global_search.source,
+                crate::global_search_ui::SearchSource::Metadata
+            );
+            assert_eq!(app.global_search.last_executed, "fresh name");
+            assert!(!matches!(
+                app.global_search.accepted,
+                SearchAccepted::Everything { .. }
+            ));
+            end(&ctx);
+        }
+    }
+}
+
+#[test]
+fn search_name_snapshot_ordinary_ctrl_g_does_not_retain_old_search_resources() {
+    for source in [Kind::Everything, Kind::Metadata] {
+        for pinned in [false, true] {
+            let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let ctx = context();
+            let mut app = completed_search_for_snapshot(&ctx, source, pinned);
+            let label = crate::snapshot::SnapshotSourceLabel::GlobalSearch {
+                query: app.global_search.last_executed.clone(),
+            };
+            app.activate_snapshot(label);
+            app.finish_page_identity_preparation_for_test();
+            assert_snapshot_search_retired(&app);
+            ctx.begin_pass(egui::RawInput::default());
+            app.open_search_shortcut(&ctx, Kind::Metadata);
+            assert!(app.edit_owner(Kind::Metadata));
+            for _ in 0..8 {
+                app.poll_global_search_events(&ctx);
+                app.poll_global_search_debounce(&ctx);
+            }
+            assert!(matches!(
+                app.global_search.accepted,
+                SearchAccepted::Metadata { applied: None }
+            ));
+            assert!(app.global_search.page_edit_prepare.is_none());
+            assert!(app.global_search.pending.is_none());
+            assert!(app.global_search.last_executed.is_empty());
+            end(&ctx);
+        }
+    }
+}
+
+#[test]
+fn search_name_snapshot_preserves_captured_return_origin_and_cancels_old_navigation() {
+    for source in [Kind::Everything, Kind::Metadata] {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let ctx = context();
+        let mut app = completed_search_for_snapshot(&ctx, source, false);
+        let origin = app.top_level_grid_view.return_origin().unwrap().clone();
+        let fixed = vec![app.items[app.visible_indices[0]].clone()];
+        let selected = app.visible_indices[0];
+        app.selected = Some(selected);
+        let nav_cancel = Arc::new(AtomicBool::new(false));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.folder_nav_pending = Some(super::super::FolderNavPending {
+            cancel: nav_cancel.clone(),
+            rx,
+            forward: true,
+            mode: super::super::FolderNavMode::Grid,
+        });
+        app.pending_folder_nav_steps = 3;
+        let pane_cancel = Arc::new(AtomicBool::new(false));
+        let (_pane_tx, pane_rx) = std::sync::mpsc::channel();
+        app.folder_pane_open_pending = Some(super::super::FolderPaneOpenPending {
+            navigation: None,
+            epub_restore: None,
+            path: app.tmp.path().join("not-adopted"),
+            cancel: pane_cancel.clone(),
+            rx: pane_rx,
+            purpose: super::super::FolderOpenScanPurpose::PaneNavigation,
+        });
+        let label = crate::snapshot::SnapshotSourceLabel::GlobalSearch {
+            query: app.global_search.last_executed.clone(),
+        };
+        app.activate_snapshot(label);
+        app.finish_page_identity_preparation_for_test();
+        assert_eq!(app.items, fixed);
+        assert_eq!(app.selected, Some(0));
+        assert!(nav_cancel.load(Ordering::Relaxed));
+        assert!(pane_cancel.load(Ordering::Relaxed));
+        assert!(app.folder_nav_pending.is_none());
+        assert!(app.folder_pane_open_pending.is_none());
+        assert_eq!(app.pending_folder_nav_steps, 0);
+        assert_eq!(app.top_level_grid_view.return_origin(), Some(&origin));
+        assert_eq!(
+            app.snapshot.as_ref().unwrap().pre_snapshot_search_origin,
+            origin.restore.legacy_path()
+        );
+        assert_eq!(app.dismiss_snapshot_with_origin(), Some(origin));
+    }
+}
+
 #[test]
 fn search_name_metadata_from_everything_rejects_without_changing_the_old_query() {
     let _input = crate::key_input::lock_test_input();

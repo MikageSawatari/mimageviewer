@@ -4,7 +4,7 @@
 状態: **最小版の設計 (第 2.4 版)。仕様は利用者承認済み (2026-11-11、統括経由)。第 2 版の独立レビュー (Sol/xhigh) は REJECT
 (P1 1 件・P2 5 件・P3 1 件)。第 2.1 版で全件を反映 (各所に「P<N> 対応」)。第 2.1 版の再レビューも REJECT (P1 2 件・P2 1 件・P3 1 件)。第 2.2 版で反映。第 2.2 版の再レビューは ACCEPT WITH CHANGES (P2 1 件: 全選択の印の期間)。第 2.3 版で印の期間を縮め、
 実装で判明した Ctrl+G の再投影の退行に対して手順 3 を「ふだんの編集と同じ後始末」に改めた。第 2.3 版も実装で成立しなかったため、
-第 2.4 版で「Ctrl+G・Everything の検索セッションが開いている間はアイテム検索へ渡さない」に絞った (M3 手順 3)。実装・指定の自動検証済み。確認用ビルドの native 依存失敗は M9 に記録。**
+第 2.4 版で「Ctrl+G・Everything の検索セッションが開いている間はアイテム検索へ渡さない」に絞った (M3 手順 3)。実装・指定の自動検証済み。master 取り込み後の★固定終了境界の修正・検証は M9。本体 lib 全件・確認用ビルドは設計担当。**
 第 1 版 (材料を組み立てる専用のモーダル) は利用者決定で後の版へ回した。付録 A に残す (未レビュー)。
 
 ## M1. 範囲 (利用者決定 2026-11-11)
@@ -179,6 +179,10 @@ pub(crate) fn item_search_name(item: &GridItem) -> Option<String>; // M2 の規�
 - (第 2.2 版) 全選択の印を置いた後、欄が描かれない pass が続く・Esc で閉じる・source を切り替える、のどれの後でも、
   ふだんの Ctrl+F・Ctrl+G で開き直したときに全選択されないこと。Everything には印が作られないこと。
 - 右クリックメニュー: 対象種別だけに出る・複数選択や背景では出ない・無効の理由。キー操作: 既定未割り当て、割り当てれば動く。
+- ★固定は実際の `activate_snapshot` 経由で検査する。Everything / Metadata の完了済み検索から固定し、
+  項目名を Metadata へ入れた後に並べ替え・poll を行っても旧 accepted / prepare / 語 / dataset が戻らず、
+  Enter で初めて新しい語の Metadata 検索になること（常設 ON/OFF）。ふだんの Ctrl+G で開く場合も旧資源を残さないこと。
+  固定一覧の内容・選択・トースト・終了時のキャンセル、および固定解除／fork 後の canonical な戻り先を維持すること。
 
 ## M8. 文書
 
@@ -474,6 +478,47 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local
 第 2.4 版からの実装の逸脱、独立レビューの未解決指摘はない。
 変更は上記の 11 ファイル。整形は引数なしの `cargo fmt` でワークスペース全体へ適用した。
 git 書き込み・製品バイナリ起動・本体 lib 全件テストは行っていない。実機 UI / IME の確認も未実施。
+
+---
+
+### master 取り込み後の P1 修正: ★固定の検索終了境界
+
+`25c6626e7` の master 取り込み後の独立レビューで、★固定の手書き Ctrl+G 終了が旧 accepted / prepare を残す P1 が指摘された。
+`close_searches_for_snapshot` を `dismiss_global_search_without_restore` に統一し、受付への除外条件は追加していない。
+戻り先・route は `activate_snapshot` の終了前 capture → `begin_with_origin` で保持される。
+`cancel_pending_folder_nav` は直前の Snapshot 用 `prepare_viewer_index_swap` がすでに呼ぶため、正規終了からの追加呼び出しは二度目の取消である。
+
+- `src/app/snapshot_ops.rs`: Ctrl+G の部分コピーを削除し、accepted / prepare / mtime / 動画取消・集約状態等も正規終了で退役。
+  `had_active` とトースト文言、固定する項目の capture は維持。
+- `src/app/tests/search_request.rs`: 実際の検索採用 → `activate_snapshot` からの回帰を 3 件追加。
+  Everything / Metadata × 常設 ON/OFF、旧資源の取消・退役、項目名の注入、sort リクエスト後の検索系 poll と Enter、
+  通常の Ctrl+G 再開、固定一覧・選択・トースト・完全な帰路・旧 nav の取消を検査。
+  sort リクエスト後の検査対象は旧検索資源の再利用であり、pane scan 完了後の表示順検査ではない。
+- `src/app/tests.rs`: 旧検索の legacy 復元用 slot の残存に依存していた 2 件を更新。
+  canonical な帰路を持つ各 fork からの実復帰と main 不変、別途 seed した未使用 fallback の保持を検査する。
+- `docs/top-level-grid-view.md`: 検索終了後は固定一覧が捕捉した canonical origin を所有・fork することを明記。本書 M7 に回帰条件を追加。
+
+対象外の同型差分: Ctrl+F の手書き終了は `retire_local_search_for_list_adoption` にある filter / origin / focus / tag bridge の終了を省略し、
+Ctrl+S は `dismiss_favsearch_with_origin` にある `results_paths` / `nav_stack` / focus / saved restore の終了を省略している。
+`FavSearchPending` の破棄は receiver を閉じるが、正規終了で行う cancel flag の store はこのブロックにない。
+今回はこれらを変更せず、実害の判定も別扱いとする。
+
+独立レビューは ACCEPT。検証結果を以下に記録する。本体 lib 全件・`build-dev` は利用者指示により設計担当へ委ねる。
+
+ビルド・テストは前節と同じ共通 `run-heavy.ps1`（Owner=`codex-690`、WorkDir=`G:\home\mimageviewer-690`）で逐次実行した。
+nextest の filter は既存の関連7モジュールと `snapshot`、`activate_snapshot` 呼出し周辺のテスト名を含む。
+実際の filter は `target/search-from-item-verification/snapshot-close.filter` に保存。
+
+| コマンド | 結果（共通ロック待機を除く） |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -j 6 --no-fail-fast -E (Get-Content -Raw target/search-from-item-verification/snapshot-close.filter)` | 1,352 件すべて成功、実行 145.355 秒、コンパイル 3分27秒。16,060 件は範囲外 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 成功、52.68 秒。既存 warning あり |
+| `cargo test --test ui_snapshot` | 253 件すべて成功、実行 56.29 秒、コンパイル 2分13秒。PNG 更新なし |
+| `python scripts/check_ui_glyphs.py` | 成功、危険なグリフ 0 件 |
+| `cargo fmt`（引数なし）・`git diff --check` | ともに成功 |
+
+ログは同ディレクトリの `snapshot-close-nextest.log`・`snapshot-close-check.log`・`snapshot-close-ui.log`。
+git 書き込み・製品起動・本体 lib 全件・`build-dev` は行っていない。設計指定からの逸脱はない。
 
 ---
 

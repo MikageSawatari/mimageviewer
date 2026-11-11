@@ -83,7 +83,9 @@ surface を共有する。現在の最上位 surface と一時ビューからの
 `restore_view_return_context()` が実フォルダと synthetic view を同じ型から振り分ける。
 
 検索由来の ★固定を別 viewer context へ fork する場合、`TopLevelGridView` / snapshot と、
-Ctrl+S / Ctrl+G の synthetic subfolder restore payload は同じ `ViewerContextBundle` に複製する。
+Ctrl+S の synthetic subfolder restore payload は同じ `ViewerContextBundle` に複製する。
+Ctrl+G は固定開始時に完全な canonical origin を捕捉し、通常の検索終了処理で legacy restore を
+退役させる。fork は捕捉済みの canonical origin を同じ bundle に複製する。
 rating filter の一時解除 anchor も context 所有であり、一方の snapshot 解除が sibling の
 anchor や fallback を `take()` してはならない。canonical `return_to` が存在する遷移では、
 未使用の legacy fallback slot は consume しない。

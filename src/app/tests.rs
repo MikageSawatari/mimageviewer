@@ -9894,7 +9894,7 @@ fn rating_filter_suppression_is_owned_by_the_context_that_established_it() {
 
 #[test]
 #[cfg(windows)]
-fn forked_search_snapshots_each_restore_their_own_synthetic_subfolder_fallback() {
+fn forked_search_snapshots_each_restore_their_own_canonical_subfolder_origin() {
     let mut app = phase_c_support::setup_app();
     let root = app.tmp.path().join("forked-search-restore");
     std::fs::create_dir_all(&root).unwrap();
@@ -9907,10 +9907,16 @@ fn forked_search_snapshots_each_restore_their_own_synthetic_subfolder_fallback()
     );
     app.global_search.active = true;
     app.global_search.saved_folder = Some(subfolder_expansion_synthetic_path());
+    let expected_restore = crate::app::top_level_grid_view::TopLevelGridRestore::SubfolderExpansion(
+        snapshot_subfolder_restore(root.clone()),
+    );
     app.global_search_subfolder_restore = Some(snapshot_subfolder_restore(root.clone()));
     app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::GlobalSearch {
         query: "hit".into(),
     });
+    assert!(app.global_search_subfolder_restore.is_none());
+    assert_eq!(app.top_level_grid_view.return_to(), Some(&expected_restore));
+    let canonical_origin = app.top_level_grid_view.return_origin().cloned();
 
     app.bind_mounted_context_for_test(906);
     let first = app.fork_mounted_live_media_context(906);
@@ -9918,14 +9924,19 @@ fn forked_search_snapshots_each_restore_their_own_synthetic_subfolder_fallback()
     let second = app.fork_mounted_live_media_context(907);
     let main_facet = app.facet_navigation.clone();
     let main_history = app.folder_nav_history_snapshot();
+    let main_items = app.items.clone();
+    let main_folder = app.current_folder.clone();
     for (position, context_id) in [first, second].into_iter().enumerate() {
         if position != 0 {
             // Eliminate the first restore's legacy App-global runtime as an accidental fallback.
             app.clear_subfolder_expansion_view_state();
         }
         let mounted = app.with_viewer_context(context_id, |ctx| {
-            assert!(ctx.global_search_subfolder_restore.is_some());
-            assert!(ctx.top_level_grid_view.take_return_to().is_some());
+            assert!(ctx.global_search_subfolder_restore.is_none());
+            assert_eq!(
+                ctx.top_level_grid_view.return_origin(),
+                canonical_origin.as_ref()
+            );
             let source_items = ctx.items.clone();
             ctx.deactivate_snapshot();
             assert_eq!(ctx.items, source_items);
@@ -9951,6 +9962,14 @@ fn forked_search_snapshots_each_restore_their_own_synthetic_subfolder_fallback()
             ));
         });
         assert!(mounted.is_ok());
+        assert!(app.is_snapshot_active());
+        assert!(app.global_search_subfolder_restore.is_none());
+        assert_eq!(
+            app.top_level_grid_view.return_origin(),
+            canonical_origin.as_ref()
+        );
+        assert_eq!(app.items, main_items);
+        assert_eq!(app.current_folder, main_folder);
         assert_eq!(app.facet_navigation, main_facet);
         assert_eq!(
             app.folder_nav_history_snapshot().back_stack,
@@ -9967,7 +9986,7 @@ fn forked_search_snapshots_each_restore_their_own_synthetic_subfolder_fallback()
 #[cfg(windows)]
 fn dismissing_snapshot_with_owned_return_preserves_unused_search_restore_fallback() {
     let mut app = phase_c_support::setup_app();
-    let root = app.tmp.path().join("unused-search-restore");
+    let root = app.tmp.path().join("owned-search-restore");
     std::fs::create_dir_all(&root).unwrap();
     let search_path = crate::app::search_results_synthetic_path();
     seed_snapshot_context(
@@ -9977,17 +9996,32 @@ fn dismissing_snapshot_with_owned_return_preserves_unused_search_restore_fallbac
     );
     app.global_search.active = true;
     app.global_search.saved_folder = Some(subfolder_expansion_synthetic_path());
+    let expected_restore = crate::app::top_level_grid_view::TopLevelGridRestore::SubfolderExpansion(
+        snapshot_subfolder_restore(root.clone()),
+    );
     app.global_search_subfolder_restore = Some(snapshot_subfolder_restore(root));
     app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::GlobalSearch {
         query: "hit".into(),
     });
+    assert!(app.global_search_subfolder_restore.is_none());
+    assert_eq!(app.top_level_grid_view.return_to(), Some(&expected_restore));
+
+    // A separate unused legacy slot must survive dismissal of the canonical snapshot owner.
+    let unused_restore = snapshot_subfolder_restore(app.tmp.path().join("unused-search-restore"));
+    app.global_search_subfolder_restore = Some(unused_restore.clone());
 
     let returned = app.dismiss_snapshot_without_restore();
-    assert!(matches!(
-        returned,
-        Some(crate::app::top_level_grid_view::TopLevelGridRestore::SubfolderExpansion(_))
-    ));
-    assert!(app.global_search_subfolder_restore.is_some());
+    assert_eq!(returned, Some(expected_restore));
+    assert_eq!(
+        app.global_search_subfolder_restore
+            .clone()
+            .map(crate::app::top_level_grid_view::TopLevelGridRestore::SubfolderExpansion),
+        Some(
+            crate::app::top_level_grid_view::TopLevelGridRestore::SubfolderExpansion(
+                unused_restore
+            )
+        )
+    );
 }
 
 #[test]
