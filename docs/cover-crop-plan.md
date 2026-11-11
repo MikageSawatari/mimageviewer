@@ -96,6 +96,10 @@ pub(crate) struct CoverCrop { x0: u32, y0: u32, x1: u32, y1: u32 }
   ピンは有効のまま (行は書き換えない)。
   - 旧版が `set` で別の画像へ固定し直しても、束縛が一致しないので古い範囲は当たらない (r1 指摘 6)。
   - 旧版の名前変更 (`source_rel` だけを書き換える) の後も束縛が外れて範囲なしになる (範囲は失われる側に倒れる)。
+- 同じ IMMEDIATE transaction 内に source 4 列の `AFTER UPDATE` trigger も冪等に追加する。source が実際に変わり、
+  束縛列が旧値のままなら範囲の 5 列を NULL にする。decoder の不一致検査だけでは旧版の a→b→a で範囲が復活するため、
+  旧版が参照先を変えた時点で消す。新版が source と新しい束縛・範囲を同時に書く場合、および container key だけの名前変更は保つ。
+  trigger 内の範囲消去でも既存の revision trigger が進むが、revision は変更の検出用なので増分が 2 になってもよい。
 - 読み取り専用の open (`open_readonly`) は schema を作らない。列の無い DB では範囲なしとして読む (catalog の layout 列と同じ方式)。
 - 別プロセス (mIV Remote) の `open` も同じ `init_schema` を通る (同じ版の exe。列の追加が重なっても IMMEDIATE で直列化される)。
 
@@ -148,6 +152,7 @@ pub(crate) struct CoverCrop { x0: u32, y0: u32, x1: u32, y1: u32 }
   - 範囲付きのピン・ドライブ一覧・Remote の key には付けない。
 - 基本 key 側の正規化は 1 つの関数 (今の `representative_cache_key_for_policy` を広げる) が行い、既存の `|types:` と `|autocrop:` を
   外してから付け直す (冪等。r2 指摘 8)。ページの key と、仮想フォルダの seed / writeback に使う基本 key には付けない。
+  除去するのは基本key末尾に連続する `types:` の16桁hexと `autocrop:v1:rtl` / `autocrop:v1:ltr` の完全一致だけで、ZIP内名の途中の同名断片や未知の版は保持する。
 - 存続集合 (`delete_missing`): 今の key に加えて、表示中の設定の自動 identity 付きの key を入れる。ZIP の一覧の存続集合
   (`tree.all_cache_keys()` 由来、app.rs:39914) には、**ピンなしの ZipDir の自動 identity 付きの key** も明示して足す。
 - 前方一致で行を探す経路 (ドライブ一覧の `drive_list_pinned_cache_key_prefix`、Folder 種の最新行) は、残りが `crop:` で始まる行と
@@ -564,3 +569,42 @@ lib 全件・test-full と実機確認は設計担当へ引き継ぐ。独立実
 変更は作業ツリーに保持し、今回の55パスだけを対象にする `target/cover-crop-commit.ps1` を用意した。
 PowerShell の構文検査は成功。権限のある端末で同スクリプトを実行すると、引数なしの `cargo fmt`、
 新規4ファイルの明示 add、pathspec commit を行う。merge・push・branch 切り替えは行わない。
+
+### 15.4 第1段の再レビュー修正（基点 `bd3ba8b30`）
+
+初回差分は設計担当が `bd3ba8b30` としてコミットした。以下は独立レビュー指摘を設計担当が確認した後の修正で、
+実装担当は追加のコミットを行わず、作業ツリーで引き継ぐ。
+
+- key正規化は既知の派生接尾辞の完全一致を末尾から除く。ZIP内名の `|autocrop:one/` / `two/`、
+  内名の途中の `autocrop:v1:rtl` / `ltr`、未知版を保持するgoldenを追加した。
+- §4のsource変更トリガーで、旧版のsource-only UPSERTによる a→b→a 後も範囲を復活させない。
+  source＋束縛の同時更新、container_keyだけの改名、既存schemaへの一度だけの追加、recursive_triggers OFF/ONを検査する。
+  revisionの追加増分を使う箇所は失効用で、正確な増分を検査していた2件の期待値を更新した。
+- Ctrl+Gとmain以外のownerを共有の範囲指定受付で除外する。drive/share root、合成タイル、変換前／変換済み書庫、
+  別窓mountとmainへの復帰のテストを追加した。別窓側の記録は `detached-rework-plan.md` §11。
+- AI説明文の転送テストは現在の `FORMAT_VERSION` を期待する。テスト内のほかの12固定値は旧形式の受け入れを検査するfixtureで維持する。
+- 色フィルタの範囲なしidentityは旧 `Option<FolderPinSource>` のDebug綴りを保ち、範囲がある場合だけ追加する。
+  固定あり／なしのliteral goldenと、同じページの範囲変更のidentityを検査する。
+- PDFのfixtureを描画目標の計算後の境界へ移し、実worker関数から64→128pxの拡張と、PageSizes／Renderで同じ
+  password・ReadTarget借用（lease）を検査する。Folder／ZIP／PDFと実ZipDir一覧の準備で、変更前の範囲キーは
+  存続集合から消え、変更後のキーと保存行だけが残ることを検査する。
+- 初回焦点実行は212件中211成功、失敗1件は新トリガーで旧束縛が消える変換fixtureだった。
+  decoder検証を維持するため、変換／改名／ZIP内名移行／exportのstale fixtureはトリガー導入前のDB状態を明示する。
+  独立追レビューで見つかったZIP内名の途中の派生tokenと、このfixtureの2件を修正し、静的追レビューはACCEPT。
+
+最終差分の検証（2026-11-12）:
+
+- `cargo test -p mimageviewer --lib metadata_transfer` — **122成功 / 失敗0**。
+  `target/cover-crop-revise-metadata.log`。
+- `cargo nextest run -p mimageviewer --lib -E 'test(/cover_crop|folder_thumb_pin|representative_cache_key|app::color_filter|rename_key_migration|zip_key_migration|image_folder_zip_metadata|pdf_worker_save_skip_and_harvested_reply_keep_request_correlation|pdf_interrupted_worker_sends_one_correlated_cancellation|book_cover_only_pdf_cancel_harvest_saves_dimensions_and_layout/)' --no-fail-fast`
+  — **212件中211成功 / 失敗1**。`target/cover-crop-revise-focused.log`。
+  失敗は変更していない `pdf_and_image_store_copy_does_not_wait_for_nonoverlapping_epub_range` の500ms受信待ち。
+  `cargo nextest run -p mimageviewer --lib -E 'test(/pdf_and_image_store_copy_does_not_wait_for_nonoverlapping_epub_range/)' --test-threads 1`
+  の単独再検証は **1成功 / 失敗0**。テストの待ち時間・内容は変更していない。
+  `target/cover-crop-revise-epub-lock.log`。対象212件はこの2実行を合わせて成功を確認し、一括全成功とは区別する。
+- `cargo fmt`（引数なし）・`cargo fmt --check`・`git diff --check` 成功。
+  `python scripts/check_ui_glyphs.py` は0件。lib全件・test-full・製品起動は実施していない。
+- 確認用 `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` は **成功（exit 0）**。
+  `CARGO_BUILD_JOBS=1` / `CMAKE_BUILD_PARALLEL_LEVEL=1`、通常profile、portableなし。
+  5実行ファイルと依存DLLの配置、PE検査（runtime=4 / pe=5）も成功。実行ファイルは起動していない。
+  `target/cover-crop-revise-build-dev.log`。

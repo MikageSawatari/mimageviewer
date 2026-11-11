@@ -36,11 +36,19 @@ fn color_representative_key(
 ) -> String {
     // The root selection plus DB revision identifies cascade selections without UI-thread
     // stat/DB lookups. The worker resolves the canonical #pin: storage suffix as usual.
-    format!(
-        "{}|representative:{storage_key:?}#pin:{pin:?}|cascade:{:?}:{depth}|thumb:{revision}",
+    // Keep the released Option<FolderPinSource> spelling exactly when no crop
+    // exists; wrapping it in FolderPin would invalidate existing pinned palettes.
+    let source = pin.map(|pin| &pin.source);
+    let mut key = format!(
+        "{}|representative:{storage_key:?}#pin:{source:?}|cascade:{:?}:{depth}|thumb:{revision}",
         item.perf_key(),
         pin.and(pin_stamp)
-    )
+    );
+    if let Some(crop) = pin.and_then(|pin| pin.cover_crop) {
+        let [x0, y0, x1, y1] = crop.values();
+        key.push_str(&format!("|crop:{x0},{y0},{x1},{y1}"));
+    }
+    key
 }
 
 fn color_scan_cache_decision(req: &LoadRequest, cache_decision: CacheDecision) -> CacheDecision {
@@ -2160,6 +2168,26 @@ mod tests {
 mod cover_crop_identity_tests {
     use super::*;
     use crate::folder_thumb_pins::{CoverCrop, FolderPin, FolderPinSource};
+
+    #[test]
+    fn color_representative_no_crop_keys_preserve_released_literal_spelling() {
+        // Literal output of color_representative_key at c4e92e5df, before FolderPin.
+        // A relative filename keeps the production perf_key identical on every OS.
+        let item = GridItem::PdfFile(PathBuf::from("book.pdf"));
+        let pin = FolderPin::from(FolderPinSource::PdfPage {
+            pdf_rel: String::new(),
+            page: 1,
+        });
+        assert_eq!(
+            color_representative_key(&item, "pdfthumb:book.pdf", Some(&pin), None, 3, 0),
+            r##"pdffile::book.pdf|representative:"pdfthumb:book.pdf"#pin:Some(PdfPage { pdf_rel: "", page: 1 })|cascade:None:3|thumb:0"##
+        );
+        assert_eq!(
+            color_representative_key(&item, "pdfthumb:book.pdf", None, None, 3, 0),
+            r##"pdffile::book.pdf|representative:"pdfthumb:book.pdf"#pin:None|cascade:None:3|thumb:0"##
+        );
+    }
+
     #[test]
     fn cover_crop_color_filter_identity_tracks_range_changes_on_the_same_page() {
         let item = GridItem::PdfFile(PathBuf::from("C:/books/book.pdf"));

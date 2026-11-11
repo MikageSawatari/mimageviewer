@@ -96,6 +96,11 @@ impl App {
         &self,
         idx: usize,
     ) -> Option<(BookCoverContainer, Option<FolderPinSource>)> {
+        // The shared menu/start boundary owns these exclusions, so neither menu
+        // backend nor direct command dispatch can enter an unsupported context.
+        if self.items_are_global_search_view || !self.main_folder_history_available() {
+            return None;
+        }
         let item = self.items.get(idx)?;
         let target = match item {
             GridItem::Folder(path)
@@ -1357,10 +1362,10 @@ mod tests {
     fn cover_crop_menu_admission_uses_logical_owners_without_source_io() {
         let mut app = crate::app::setup_app_for_test();
         app.current_folder = Some(crate::app::search_results_synthetic_path());
-        app.items_are_global_search_view = true;
         app.items = vec![
             GridItem::ZipFile(PathBuf::from("C:/missing/book.zip")),
             GridItem::Image(PathBuf::from("C:/missing/page.png")),
+            GridItem::Folder(crate::app::search_results_synthetic_path()),
         ];
         assert!(
             app.cover_crop_menu_state(0)
@@ -1371,6 +1376,16 @@ mod tests {
             app.cover_crop_menu_state(1).is_none(),
             "a synthetic list is not a page's pin owner"
         );
+        assert!(app.cover_crop_menu_state(2).is_none());
+        assert!(app.cover_crop_menu_state(3).is_none());
+
+        app.items_are_global_search_view = true;
+        for idx in 0..app.items.len() {
+            assert!(app.cover_crop_target(idx).is_none());
+            assert!(app.cover_crop_menu_state(idx).is_none());
+        }
+
+        app.items_are_global_search_view = false;
         app.current_folder = Some(PathBuf::from("C:/missing"));
         app.items = vec![
             GridItem::Folder(PathBuf::from("C:/")),
@@ -1386,5 +1401,46 @@ mod tests {
             app.cover_crop_menu_state(2)
                 .is_some_and(|state| !state.enabled)
         );
+        let archive_path = PathBuf::from("C:/missing/book.7z");
+        app.converted_archive_cache_paths.insert(
+            crate::path_key::normalize_keep_drive(&archive_path),
+            crate::app::ConvertedArchiveSourceState::CachedZip {
+                logical_source: archive_path,
+                path: PathBuf::from("C:/missing/cache/book.zip"),
+            },
+        );
+        assert!(
+            app.cover_crop_menu_state(2)
+                .is_some_and(|state| state.enabled),
+            "worker-confirmed conversion availability needs no source I/O"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cover_crop_menu_excludes_drive_and_share_roots() {
+        let mut app = crate::app::setup_app_for_test();
+        for root in ["C:/", "//server/share/"] {
+            app.items = vec![GridItem::Folder(PathBuf::from(root))];
+            assert!(app.cover_crop_target(0).is_none(), "{root}");
+            assert!(app.cover_crop_menu_state(0).is_none(), "{root}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cover_crop_menu_excludes_detached_owner_and_preserves_main_admission() {
+        let mut app = crate::app::setup_app_for_test();
+        let item = GridItem::ZipFile(PathBuf::from("C:/missing/book.zip"));
+        app.items = vec![item.clone()];
+        assert!(app.cover_crop_menu_state(0).is_some());
+        let detached = app.build_window_context_for_test(764_081, |owner| {
+            owner.items = vec![item];
+        });
+        app.with_window_context_for_test(detached, |owner| {
+            assert!(owner.cover_crop_target(0).is_none());
+            assert!(owner.cover_crop_menu_state(0).is_none());
+        });
+        assert!(app.cover_crop_menu_state(0).is_some());
     }
 }

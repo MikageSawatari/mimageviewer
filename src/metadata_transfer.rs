@@ -8077,7 +8077,7 @@ mod tests {
         let exported = export_at(&source_data, &root, false, &cancel, no_progress).unwrap();
         assert_eq!(exported.ai_captions, 1);
         let manifest = read_bundle_manifest(&root, &cancel).unwrap();
-        assert_eq!(manifest.version, 12);
+        assert_eq!(manifest.version, FORMAT_VERSION);
         assert!(manifest.sections.ai_captions);
         visit_bundle_entries(&root, &manifest, &cancel, |entry, _, _| {
             if entry.path == "image.jpg" {
@@ -13828,9 +13828,13 @@ mod tests {
             )
             .unwrap();
             if stale {
+                // Export must validate stale bindings left by a DB predating the trigger.
                 Connection::open(source_data.join("folder_thumb_pins.db"))
                     .unwrap()
-                    .execute("UPDATE folder_thumb_pins SET source_rel='b.jpg'", [])
+                    .execute_batch(
+                        "DROP TRIGGER folder_thumb_pin_clear_stale_cover_crop;
+                        UPDATE folder_thumb_pins SET source_rel='b.jpg'",
+                    )
                     .unwrap();
             }
             let cancel = AtomicBool::new(false);

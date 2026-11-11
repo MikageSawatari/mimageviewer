@@ -327,9 +327,13 @@ mod tests {
         db.set_with_cover_crop(zip, &source, crop).unwrap();
         migrate_thumb_pin(&path, zip, &[("old.jpg".into(), "new.jpg".into())]).unwrap();
         assert_eq!(db.lookup(zip).unwrap().cover_crop, crop);
+        // Preserve coverage of stale data written before the source-change trigger existed.
         rusqlite::Connection::open(&path)
             .unwrap()
-            .execute("UPDATE folder_thumb_pins SET source_entry='other.jpg'", [])
+            .execute_batch(
+                "DROP TRIGGER folder_thumb_pin_clear_stale_cover_crop;
+                UPDATE folder_thumb_pins SET source_entry='other.jpg'",
+            )
             .unwrap();
         migrate_thumb_pin(&path, zip, &[("other.jpg".into(), "final.jpg".into())]).unwrap();
         let pin = db.lookup(zip).unwrap();

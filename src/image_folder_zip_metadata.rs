@@ -1268,9 +1268,13 @@ mod tests {
             db.set_with_cover_crop(&manifest.source, &source, crop)
                 .unwrap();
             if stale {
+                // A DB written before the source-change trigger can retain a stale binding.
                 Connection::open(&path)
                     .unwrap()
-                    .execute("UPDATE folder_thumb_pins SET source_rel='b.jpg'", [])
+                    .execute_batch(
+                        "DROP TRIGGER folder_thumb_pin_clear_stale_cover_crop;
+                        UPDATE folder_thumb_pins SET source_rel='b.jpg'",
+                    )
                     .unwrap();
             }
             copy_store_rows(

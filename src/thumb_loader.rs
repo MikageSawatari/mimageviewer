@@ -338,17 +338,19 @@ pub fn representative_cache_key_for_policy(
         .find(CACHE_KEY_PIN_SUFFIX)
         .unwrap_or_else(|| key.find("|generation:").unwrap_or(key.len()));
     let (base, tail) = key.split_at(split);
-    let mut parts = base.split('|');
-    let mut normalized = parts.next().unwrap_or_default().to_owned();
-    for part in parts {
+    // Only a contiguous derived suffix belongs to the policy. A pipe inside a ZIP
+    // directory name may delimit the same text without being cache metadata.
+    let mut base = base;
+    while let Some((prefix, part)) = base.rsplit_once('|') {
         let derived = part.strip_prefix("types:").is_some_and(|fingerprint| {
             fingerprint.len() == 16 && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
-        }) || part.starts_with("autocrop:");
+        }) || matches!(part, "autocrop:v1:rtl" | "autocrop:v1:ltr");
         if !derived {
-            normalized.push('|');
-            normalized.push_str(part);
+            break;
         }
+        base = prefix;
     }
+    let mut normalized = base.to_owned();
     if !policy.is_all_visible() {
         normalized.push_str(&format!("|types:{:016x}", policy.fingerprint()));
     }
@@ -6073,17 +6075,19 @@ pub(crate) fn load_one_cached(
             crate::pdf_loader::JobPriority::Normal
         };
         let render_started = std::time::Instant::now();
-        #[cfg(test)]
-        let fixture_result = tests::take_pdf_render_result(cancel_policy, &pdf_render_validity);
-        #[cfg(not(test))]
-        let fixture_result: Option<std::io::Result<crate::pdf_loader::RenderResult>> = None;
-        let render_result = fixture_result.unwrap_or_else(|| {
+        let render_result = (|| {
             let render_target = if let Some(crop) = cover_crop {
-                let sizes = if let Some(read) = epub_read {
-                    crate::pdf_loader::get_page_sizes_with_read_target(path, read, pdf_password)
-                } else {
-                    crate::pdf_loader::get_page_sizes(path, pdf_password)
-                }?;
+                #[cfg(test)]
+                let fixture_sizes = tests::pdf_page_sizes_fixture(path, epub_read, pdf_password);
+                #[cfg(not(test))]
+                let fixture_sizes: Option<std::io::Result<Vec<(f32, f32)>>> = None;
+                let sizes = fixture_sizes.unwrap_or_else(|| {
+                    if let Some(read) = epub_read {
+                        crate::pdf_loader::get_page_sizes_with_read_target(path, read, pdf_password)
+                    } else {
+                        crate::pdf_loader::get_page_sizes(path, pdf_password)
+                    }
+                })?;
                 let (width, height) = sizes.get(page_num as usize).copied().ok_or_else(|| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -6105,6 +6109,20 @@ pub(crate) fn load_one_cached(
             } else {
                 thumbnail_pdf_render_target(display_px)
             };
+            // Intercept only the render boundary in tests, after production target selection.
+            #[cfg(test)]
+            if let Some(result) = tests::take_pdf_render_result(
+                cancel_policy,
+                &pdf_render_validity,
+                tests::PdfBoundaryRequest::new(
+                    path,
+                    epub_read,
+                    pdf_password,
+                    Some((page_num, render_target)),
+                ),
+            ) {
+                return result;
+            }
             if let Some(read) = epub_read {
                 crate::pdf_loader::render_page_with_read_target(
                     path,
@@ -6129,7 +6147,7 @@ pub(crate) fn load_one_cached(
                     cancel_policy,
                 )
             }
-        });
+        })();
         render_ms = Some(render_started.elapsed().as_secs_f64() * 1000.0);
         render_result
             .map(|res| {
@@ -6906,6 +6924,34 @@ mod tests {
         cancel_on_reply: Option<Arc<AtomicBool>>,
         observed_policy: Arc<Mutex<Option<crate::pdf_loader::CancelWaitPolicy>>>,
         observed_validity: Option<Arc<Mutex<Option<crate::pdf_loader::PdfRenderValidity>>>>,
+        observed_requests: Option<Arc<Mutex<Vec<PdfBoundaryRequest>>>>,
+    }
+
+    #[derive(Debug)]
+    pub(super) struct PdfBoundaryRequest {
+        path: PathBuf,
+        read: Option<crate::pdf_loader::ReadTarget>,
+        read_address: Option<usize>,
+        password: Option<String>,
+        // None identifies PageSizes; Some identifies Render(page, target).
+        render: Option<(u32, u32)>,
+    }
+
+    impl PdfBoundaryRequest {
+        pub(super) fn new(
+            path: &Path,
+            read: Option<&crate::pdf_loader::ReadTarget>,
+            password: Option<&str>,
+            render: Option<(u32, u32)>,
+        ) -> Self {
+            Self {
+                path: path.to_owned(),
+                read: read.cloned(),
+                read_address: read.map(|read| read as *const _ as usize),
+                password: password.map(str::to_owned),
+                render,
+            }
+        }
     }
 
     struct PdfRenderFixtureScope(Option<PdfRenderFixture>);
@@ -6919,6 +6965,7 @@ mod tests {
             cancel_on_reply: None,
             observed_policy: Arc::new(Mutex::new(None)),
             observed_validity: None,
+            observed_requests: None,
         });
         run()
     }
@@ -6937,9 +6984,38 @@ mod tests {
         }
     }
 
+    pub(super) fn pdf_page_sizes_fixture(
+        path: &Path,
+        read: Option<&crate::pdf_loader::ReadTarget>,
+        password: Option<&str>,
+    ) -> Option<std::io::Result<Vec<(f32, f32)>>> {
+        PDF_RENDER_FIXTURE.with(|current| {
+            let current = current.borrow();
+            let fixture = current.as_ref()?;
+            if let Some(observed) = &fixture.observed_requests {
+                observed
+                    .lock()
+                    .unwrap()
+                    .push(PdfBoundaryRequest::new(path, read, password, None));
+            }
+            let result = fixture
+                .result
+                .as_ref()
+                .expect("page sizes require a PDF result");
+            Some(Ok(vec![
+                (
+                    result.page_size_points.width,
+                    result.page_size_points.height
+                );
+                result.page_count as usize
+            ]))
+        })
+    }
+
     pub(super) fn take_pdf_render_result(
         policy: crate::pdf_loader::CancelWaitPolicy,
         validity: &crate::pdf_loader::PdfRenderValidity,
+        request: PdfBoundaryRequest,
     ) -> Option<std::io::Result<crate::pdf_loader::RenderResult>> {
         PDF_RENDER_FIXTURE
             .with(|current| current.borrow_mut().take())
@@ -6947,6 +7023,9 @@ mod tests {
                 *fixture.observed_policy.lock().unwrap() = Some(policy);
                 if let Some(observed) = fixture.observed_validity {
                     *observed.lock().unwrap() = Some(validity.clone());
+                }
+                if let Some(observed) = fixture.observed_requests {
+                    observed.lock().unwrap().push(request);
                 }
                 if let Some(cancel) = fixture.cancel_on_reply {
                     cancel.store(true, Ordering::Relaxed);
@@ -6982,6 +7061,7 @@ mod tests {
                 cancel_on_reply: harvested.then(|| Arc::clone(&cancel)),
                 observed_policy: Arc::clone(&observed_policy),
                 observed_validity: Some(Arc::clone(&observed_validity)),
+                observed_requests: None,
             });
             let mut request = LoadRequest {
                 path: tmp.path().join("injected.pdf"),
@@ -7161,6 +7241,7 @@ mod tests {
                     cancel_on_reply: None,
                     observed_policy: Arc::new(Mutex::new(None)),
                     observed_validity: None,
+                    observed_requests: None,
                 })
             });
             let mut request = LoadRequest {
@@ -9028,6 +9109,7 @@ mod tests {
             cancel_on_reply: Some(Arc::clone(&cancel)),
             observed_policy: Arc::clone(&observed_policy),
             observed_validity: None,
+            observed_requests: None,
         });
         let mut req = LoadRequest {
             path: tmp.path().join("book.pdf"),
@@ -9743,7 +9825,7 @@ mod tests {
         }
         let tail = "#pin:image|cover.jpg|||crop:0,0,500000,1000000|7|9|generation:17:4096";
         let dirty = format!(
-            "zipthumb:a.zip|types:0000000000000001|autocrop:v1:rtl|types:0000000000000002|autocrop:v2:ltr{tail}"
+            "zipthumb:a.zip|types:0000000000000001|autocrop:v1:rtl|types:0000000000000002|autocrop:v1:ltr{tail}"
         );
         let expected = format!("zipthumb:a.zip|types:{:016x}{tail}", policy.fingerprint());
         assert_eq!(
@@ -9777,6 +9859,38 @@ mod tests {
         ));
         assert!(!drive_list_cache_key_allowed(&dirty));
         assert!(!drive_list_cache_key_allowed(&expected));
+    }
+
+    #[test]
+    fn cover_crop_key_normalization_preserves_literal_zip_names_and_unknown_identities() {
+        let visible = crate::file_type_visibility::FileTypeVisibility::default();
+        let policy = crate::file_type_visibility::FileTypeVisibility {
+            excluded_extensions: ["gif".into()].into_iter().collect(),
+            ..Default::default()
+        };
+        // These are released ZipDir keys, whose inner names may contain literal pipes.
+        let one = "zipdir:book|autocrop:one/";
+        let two = "zipdir:book|autocrop:two/";
+        for key in [
+            one,
+            two,
+            "zipdir:chapter/|autocrop:v1:rtl/",
+            "zipdir:chapter/|autocrop:v1:ltr/",
+            "zipdir:chapter/|autocrop:v1:rtl|suffix/",
+            "zipdir:chapter/|autocrop:v1:ltr|suffix/",
+            "zipdir:chapter/|types:0000000000000001|suffix/",
+            "zipthumb:a.zip|autocrop:v2:ltr",
+            "zipdir:chapter/|types:not-a-fingerprint/",
+        ] {
+            assert_eq!(representative_cache_key_for_policy(key, &visible), key);
+            let scoped = format!("{key}|types:{:016x}", policy.fingerprint());
+            assert_eq!(representative_cache_key_for_policy(key, &policy), scoped);
+            assert_eq!(representative_cache_key_for_policy(&scoped, &visible), key);
+        }
+        assert_ne!(
+            representative_cache_key_for_policy(one, &visible),
+            representative_cache_key_for_policy(two, &visible)
+        );
     }
 
     #[test]
@@ -9965,6 +10079,96 @@ mod tests {
             assert_eq!(row.source_dims, Some((6, 8)));
             assert_eq!(row.layout_dims, None);
             assert_eq!(row.cover, pixels.cover);
+        }
+    }
+
+    #[test]
+    fn cover_crop_pdf_render_boundary_widens_target_with_same_lease_and_password() {
+        for leased in [false, true] {
+            for cropped in [false, true] {
+                let tmp = TempDir::new().unwrap();
+                let path = tmp
+                    .path()
+                    .join(if leased { "book.epub" } else { "book.pdf" });
+                let read =
+                    leased.then(|| crate::pdf_loader::generation_target_for_test(&path, 17, 4096));
+                let observed = Arc::new(Mutex::new(Vec::new()));
+                let mut result = cover_only_pdf_result();
+                result.page_count = 2;
+                result.page_size_points = crate::pdf_loader::PdfPageSizePoints {
+                    width: 2000.0,
+                    height: 1000.0,
+                };
+                let _scope = PdfRenderFixtureScope::install(PdfRenderFixture {
+                    result: Ok(result),
+                    cancel_on_reply: None,
+                    observed_policy: Arc::new(Mutex::new(None)),
+                    observed_validity: None,
+                    observed_requests: Some(Arc::clone(&observed)),
+                });
+                let (tx, rx) = mpsc::channel();
+                let done = Arc::new(AtomicUsize::new(0));
+                load_one_cached(
+                    &path,
+                    None,
+                    None,
+                    None,
+                    Some(1),
+                    read.as_ref(),
+                    Some("session password"),
+                    None,
+                    0,
+                    &tx,
+                    None.into(),
+                    None,
+                    7,
+                    9,
+                    &done,
+                    64,
+                    75,
+                    64,
+                    make_decision(CachePolicy::Off, 0, 0),
+                    &Arc::new(Mutex::new(crate::stats::ThumbStats::default())),
+                    None,
+                    true,
+                    1,
+                    1,
+                    ThumbnailRequestId::Registered(109),
+                    crate::pdf_loader::PdfRenderValidity::Unscoped,
+                    crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                    LoadRequestSource::Original,
+                    None,
+                    None,
+                    CoverIdentity::Page(crate::adjustment_db::normalize_path(&path)),
+                    None,
+                    cropped.then(|| manual_cover_crop([750_000, 0, 1_000_000, 1_000_000])),
+                );
+                assert_eq!(done.load(Ordering::Relaxed), 1);
+                assert!(rx.try_iter().any(|message| message.pixels().is_some()));
+                let observed = observed.lock().unwrap();
+                assert_eq!(observed.len(), if cropped { 2 } else { 1 });
+                for request in observed.iter() {
+                    assert_eq!(request.path, path);
+                    assert_eq!(request.read.as_ref(), read.as_ref());
+                    assert_eq!(request.password.as_deref(), Some("session password"));
+                }
+                if cropped {
+                    assert_eq!(observed[0].render, None);
+                    // Both boundaries borrow the exact same ReadTarget instance (and lease).
+                    assert_eq!(observed[0].read_address, observed[1].read_address);
+                    assert_eq!(observed[0].read_address.is_some(), leased);
+                }
+                // A 2000x1000 page's right quarter is 500x1000: target doubles.
+                assert_eq!(
+                    observed.last().unwrap().render,
+                    Some((1, if cropped { 128 } else { 64 }))
+                );
+            }
         }
     }
 

@@ -8565,7 +8565,10 @@ mod tests {
                 .cover_crop,
             crop
         );
-        // A legacy re-pin invalidates the old binding before a new-code rename/copy.
+        // Simulate a DB written before the source-change trigger: the legacy re-pin
+        // leaves a stale binding for the new-code rename/copy decoder to reject.
+        conn.execute_batch("DROP TRIGGER folder_thumb_pin_clear_stale_cover_crop")
+            .unwrap();
         conn.execute("UPDATE folder_thumb_pins SET source_rel='other.jpg' WHERE container_key='c:/books/one'", []).unwrap();
         let tx = conn.transaction().unwrap();
         let columns = table_columns(&tx, "folder_thumb_pins").unwrap();

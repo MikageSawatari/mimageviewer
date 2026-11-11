@@ -721,7 +721,8 @@ impl FolderThumbPinDb {
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN (
                 'folder_thumb_pin_revision_insert',
                 'folder_thumb_pin_revision_update',
-                'folder_thumb_pin_revision_delete'
+                'folder_thumb_pin_revision_delete',
+                'folder_thumb_pin_clear_stale_cover_crop'
             )",
             [],
             |row| row.get(0),
@@ -729,6 +730,10 @@ impl FolderThumbPinDb {
         // Triggers own the revision, including cleanup/rename paths that mutate
         // the table without going through set/remove. SQLite advances it in the
         // same transaction as the changed pin row.
+        // Old source-only writers must discard crops permanently, even if they later
+        // restore the original source. New writers change the binding with the source.
+        // The crop-only UPDATE cannot re-enter the source trigger, regardless of
+        // recursive_triggers; its extra revision increment is harmless.
         tx.execute_batch(
             "CREATE TRIGGER IF NOT EXISTS folder_thumb_pin_revision_insert
                  AFTER INSERT ON folder_thumb_pins BEGIN
@@ -741,10 +746,22 @@ impl FolderThumbPinDb {
              CREATE TRIGGER IF NOT EXISTS folder_thumb_pin_revision_delete
                  AFTER DELETE ON folder_thumb_pins BEGIN
                  UPDATE folder_thumb_pin_revision SET revision = revision + 1 WHERE singleton = 1;
+             END;
+             CREATE TRIGGER IF NOT EXISTS folder_thumb_pin_clear_stale_cover_crop
+                 AFTER UPDATE OF source_kind, source_rel, source_entry, source_page ON folder_thumb_pins
+                 WHEN (NEW.source_kind IS NOT OLD.source_kind
+                    OR NEW.source_rel IS NOT OLD.source_rel
+                    OR NEW.source_entry IS NOT OLD.source_entry
+                    OR NEW.source_page IS NOT OLD.source_page)
+                   AND NEW.cover_crop_source IS OLD.cover_crop_source
+                 BEGIN
+                 UPDATE folder_thumb_pins SET cover_crop_x0 = NULL, cover_crop_y0 = NULL,
+                     cover_crop_x1 = NULL, cover_crop_y1 = NULL, cover_crop_source = NULL
+                     WHERE container_key = NEW.container_key;
              END;",
         )?;
         tx.commit()?;
-        Ok(crop_columns_added || revision_row_added != 0 || installed_triggers != 3)
+        Ok(crop_columns_added || revision_row_added != 0 || installed_triggers != 4)
     }
 
     fn container_key(container: &Path) -> String {
@@ -2692,11 +2709,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             db.selection_revision().unwrap().revision,
-            after_insert.revision + 1
+            after_insert.revision + 2
         );
         db.remove(&folder).unwrap();
         let after_delete = db.selection_revision().unwrap();
-        assert_eq!(after_delete.revision, after_insert.revision + 2);
+        assert_eq!(after_delete.revision, after_insert.revision + 3);
         assert_eq!(db.lookup_for_selection(&folder).unwrap().0, None);
         drop(db);
         std::fs::remove_file(&path).unwrap();
@@ -2834,7 +2851,7 @@ mod tests {
         }
         assert_eq!(
             db.selection_revision().unwrap().revision,
-            initial.revision + 2
+            initial.revision + 3
         );
     }
 
@@ -3012,6 +3029,202 @@ mod tests {
         )
         .unwrap();
         assert_eq!(db.lookup(container).unwrap().cover_crop, crop);
+    }
+
+    #[test]
+    fn cover_crop_released_upsert_cannot_revive_crop_after_source_roundtrip() {
+        fn released_upsert(conn: &Connection, source: &FolderPinSource) {
+            let (entry, page): (Option<&str>, Option<i64>) = match source {
+                FolderPinSource::ZipEntry { entry, .. } => (Some(entry), None),
+                FolderPinSource::PdfPage { page, .. } => (None, Some(*page as i64)),
+                _ => (None, None),
+            };
+            // The released set() statement from c4e92e5df, including all four
+            // source columns but none of the later crop columns.
+            conn.execute(
+                "INSERT INTO folder_thumb_pins (container_key, source_kind, source_rel, source_entry, source_page) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(container_key) DO UPDATE SET \
+                    source_kind  = excluded.source_kind, \
+                    source_rel   = excluded.source_rel, \
+                    source_entry = excluded.source_entry, \
+                    source_page  = excluded.source_page",
+                params!["c:/album", source.db_kind(), source.rel(), entry, page],
+            )
+            .unwrap();
+        }
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE folder_thumb_pins (
+                container_key TEXT PRIMARY KEY, source_kind TEXT NOT NULL,
+                source_rel TEXT NOT NULL, source_entry TEXT, source_page INTEGER
+            );",
+        )
+        .unwrap();
+        assert!(FolderThumbPinDb::init_schema(&conn).unwrap());
+        assert_eq!(
+            conn.query_row("PRAGMA recursive_triggers", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let db = FolderThumbPinDb::from_connection(conn);
+        let container = Path::new("c:/album");
+        let crop = CoverCrop::new([0, 0, 400_000, 1_000_000]).unwrap();
+        let image = FolderPinSource::File {
+            rel: "a.jpg".into(),
+            kind: FileKind::Image,
+        };
+        let cases = [
+            (
+                image.clone(),
+                FolderPinSource::File {
+                    rel: "a.jpg".into(),
+                    kind: FileKind::Folder,
+                },
+            ),
+            (
+                image,
+                FolderPinSource::File {
+                    rel: "b.jpg".into(),
+                    kind: FileKind::Image,
+                },
+            ),
+            (
+                FolderPinSource::ZipEntry {
+                    zip_rel: String::new(),
+                    entry: "a.jpg".into(),
+                },
+                FolderPinSource::ZipEntry {
+                    zip_rel: String::new(),
+                    entry: "b.jpg".into(),
+                },
+            ),
+            (
+                FolderPinSource::PdfPage {
+                    pdf_rel: String::new(),
+                    page: 0,
+                },
+                FolderPinSource::PdfPage {
+                    pdf_rel: String::new(),
+                    page: 1,
+                },
+            ),
+        ];
+        // Recursion is off by default, but safety does not depend on that setting.
+        for recursive in [false, true] {
+            db.conn
+                .lock()
+                .unwrap()
+                .pragma_update(None, "recursive_triggers", recursive)
+                .unwrap();
+            for (original, other) in &cases {
+                db.set_with_cover_crop(container, original, crop).unwrap();
+                released_upsert(&db.conn.lock().unwrap(), original);
+                assert_eq!(db.lookup(container).unwrap().cover_crop, crop);
+                for source in [other, original] {
+                    released_upsert(&db.conn.lock().unwrap(), source);
+                    let pin = db.lookup(container).unwrap();
+                    assert_eq!(&pin.source, source);
+                    assert_eq!(pin.cover_crop, None);
+                    let cleared: bool = db
+                        .conn
+                        .lock()
+                        .unwrap()
+                        .query_row(
+                            "SELECT cover_crop_x0 IS NULL AND cover_crop_y0 IS NULL
+                                AND cover_crop_x1 IS NULL AND cover_crop_y1 IS NULL
+                                AND cover_crop_source IS NULL FROM folder_thumb_pins",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert!(cleared);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cover_crop_source_and_binding_write_and_container_only_rename_preserve_crop() {
+        let db = open_in_memory();
+        let container = Path::new("c:/album");
+        let first = FolderPinSource::File {
+            rel: "a.jpg".into(),
+            kind: FileKind::Image,
+        };
+        let second = FolderPinSource::File {
+            rel: "b.jpg".into(),
+            kind: FileKind::Image,
+        };
+        let old_crop = CoverCrop::new([0, 0, 400_000, 1_000_000]).unwrap();
+        let new_crop = CoverCrop::new([500_000, 0, 1_000_000, 1_000_000]).unwrap();
+        db.set_with_cover_crop(container, &first, old_crop).unwrap();
+        db.set_with_cover_crop(container, &second, new_crop)
+            .unwrap();
+        assert_eq!(db.lookup(container).unwrap().cover_crop, new_crop);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE folder_thumb_pins SET container_key='c:/renamed' WHERE container_key='c:/album'",
+                [],
+            )
+            .unwrap();
+        let renamed = Path::new("c:/renamed");
+        assert!(db.lookup(container).is_none());
+        assert_eq!(
+            db.lookup(renamed),
+            Some(FolderPin {
+                source: second,
+                cover_crop: new_crop,
+            })
+        );
+        db.set(renamed, &first).unwrap();
+        assert_eq!(db.lookup(renamed).unwrap().cover_crop, None);
+    }
+
+    #[test]
+    fn cover_crop_trigger_installs_on_existing_crop_schema_only_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pins.db");
+        let container = Path::new("c:/album");
+        let source = FolderPinSource::File {
+            rel: "a.jpg".into(),
+            kind: FileKind::Image,
+        };
+        let crop = CoverCrop::new([0, 0, 400_000, 1_000_000]).unwrap();
+        let db = FolderThumbPinDb::open_at(&path).unwrap();
+        db.set_with_cover_crop(container, &source, crop).unwrap();
+        let revision = db.selection_revision().unwrap();
+        // Recreate the schema from before this trigger was added, retaining the
+        // existing crop columns, crop data and all revision triggers.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER folder_thumb_pin_clear_stale_cover_crop")
+            .unwrap();
+        drop(db);
+
+        for expected_migration in [true, false] {
+            let (db, migrated) = FolderThumbPinDb::open_at_with_migration_info(&path).unwrap();
+            assert_eq!(migrated, expected_migration);
+            assert_eq!(db.selection_revision().unwrap(), revision);
+            assert_eq!(db.lookup(container).unwrap().cover_crop, crop);
+            assert_eq!(
+                db.conn
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT count(*) FROM sqlite_master WHERE type='trigger'
+                            AND name='folder_thumb_pin_clear_stale_cover_crop'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                1
+            );
+        }
     }
 
     #[test]

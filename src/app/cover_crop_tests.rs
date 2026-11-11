@@ -148,7 +148,7 @@ fn cover_crop_drive_catalog_prefix_skips_newer_cropped_and_auto_rows() {
 }
 
 #[test]
-fn cover_crop_completed_rows_survive_existing_key_cleanup_for_folder_zip_pdf() {
+fn cover_crop_completed_rows_survive_cleanup_and_replaced_crops_do_not_for_folder_zip_pdf() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
     let folder = root.join("folder");
@@ -185,15 +185,140 @@ fn cover_crop_completed_rows_survive_existing_key_cleanup_for_folder_zip_pdf() {
             },
         ),
     ] {
-        let pins = HashMap::from([(
+        let mut pins = HashMap::from([(
             crate::path_key::normalize_keep_drive(&container),
             FolderPin {
                 source,
                 cover_crop: crop,
             },
         )]);
+        let mut previous_key = None;
+        for crop in [
+            crop,
+            CoverCrop::new([500_000, 0, 1_000_000, 1_000_000]).unwrap(),
+        ] {
+            pins.get_mut(&crate::path_key::normalize_keep_drive(&container))
+                .unwrap()
+                .cover_crop = crop;
+            let request = make_load_request_with_visibility(
+                &item,
+                0,
+                17,
+                23,
+                false,
+                None,
+                Some(crate::settings::SortOrder::Numeric),
+                3,
+                &pins,
+                &HashMap::new(),
+                None,
+                None,
+                None,
+                None,
+                false,
+                &Default::default(),
+            )
+            .unwrap();
+            let key = crate::thumb_loader::cache_key_for_request(&request)
+                .unwrap()
+                .into_owned();
+            let existing: HashSet<String> = folder_thumb_existing_keys_for_with_visibility(
+                &item,
+                Some((17, 23)),
+                &pins,
+                None,
+                Some(crate::settings::SortOrder::Numeric),
+                3,
+                false,
+                &Default::default(),
+            )
+            .into_iter()
+            .collect();
+            assert!(existing.contains(&key), "current crop absent: {key}");
+            if let Some(previous) = previous_key.as_ref() {
+                assert_ne!(previous, &key);
+                assert!(
+                    !existing.contains(previous),
+                    "old crop retained: {previous}"
+                );
+            }
+            let catalog = crate::catalog::CatalogDb::open(&root.join("cache"), root).unwrap();
+            catalog
+                .save_thumb_bytes(
+                    &key,
+                    request.mtime,
+                    request.file_size,
+                    Some((4, 10)),
+                    &thumbnail_bytes(),
+                    &crate::cover_identity::CoverIdentity::Unknown,
+                )
+                .unwrap();
+            catalog.delete_missing(&existing).unwrap();
+            assert!(
+                catalog.load_one(&key).unwrap().is_some(),
+                "completed crop key lost: {key}"
+            );
+            if let Some(previous) = previous_key.replace(key) {
+                assert!(catalog.load_one(&previous).unwrap().is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn cover_crop_zipdir_changed_crop_replaces_existing_key_and_prunes_old_row() {
+    let app = super::tests::phase_c_support::setup_app();
+    let zip = app.tmp.path().join("books.zip");
+    std::fs::write(&zip, b"zip identity").unwrap();
+    let container = book_container_key(&zip, "book/");
+    let source = FolderPinSource::ZipEntry {
+        zip_rel: String::new(),
+        entry: "book/cover.jpg".into(),
+    };
+    let catalog =
+        crate::catalog::CatalogDb::open(&app.tmp.path().join("cache"), app.tmp.path()).unwrap();
+    let mut previous_key = None;
+    for crop in [
+        CoverCrop::new([0, 0, 400_000, 1_000_000]).unwrap(),
+        CoverCrop::new([500_000, 0, 1_000_000, 1_000_000]).unwrap(),
+    ] {
+        let pin_db = app.folder_thumb_pin_db.as_ref().unwrap();
+        pin_db
+            .set_with_cover_crop(&container, &source, crop)
+            .unwrap();
+        let enumeration = crate::zip_loader::PreparedZipEnumeration::prepare(
+            zip.clone(),
+            crate::zip_loader::ZipEnumeration {
+                entries: ["book/cover.jpg", "other/page.jpg"]
+                    .into_iter()
+                    .map(|entry| crate::zip_loader::ZipImageEntry {
+                        entry_name: entry.into(),
+                        uncompressed_size: 23,
+                        mtime: 17,
+                        container_ancestry: Vec::new(),
+                    })
+                    .collect(),
+                has_foreign_archives: false,
+                legacy_renames: Vec::new(),
+            },
+            Default::default(),
+        );
+        let prepared = app.prepare_zip_grid(
+            zip.clone(),
+            enumeration,
+            None,
+            StartupListIntent::ExplicitList,
+        );
+        let item = prepared
+            .items
+            .iter()
+            .find(
+                |item| matches!(item, GridItem::ZipDir { dir_prefix, .. } if dir_prefix == "book/"),
+            )
+            .unwrap();
+        let pins = pin_db.lookup_many([container.clone()]);
         let request = make_load_request_with_visibility(
-            &item,
+            item,
             0,
             17,
             23,
@@ -205,28 +330,27 @@ fn cover_crop_completed_rows_survive_existing_key_cleanup_for_folder_zip_pdf() {
             &HashMap::new(),
             None,
             None,
-            None,
+            Some(pin_db.as_ref()),
             None,
             false,
             &Default::default(),
         )
         .unwrap();
+        assert_eq!(request.cover_crop, crop);
         let key = crate::thumb_loader::cache_key_for_request(&request)
             .unwrap()
             .into_owned();
-        let existing = folder_thumb_existing_keys_for_with_visibility(
-            &item,
-            Some((17, 23)),
-            &pins,
-            None,
-            Some(crate::settings::SortOrder::Numeric),
-            3,
-            false,
-            &Default::default(),
-        )
-        .into_iter()
-        .collect();
-        let catalog = crate::catalog::CatalogDb::open(&root.join("cache"), root).unwrap();
+        assert!(
+            prepared.existing_keys.contains(&key),
+            "current crop absent: {key}"
+        );
+        if let Some(previous) = previous_key.as_ref() {
+            assert_ne!(previous, &key);
+            assert!(
+                !prepared.existing_keys.contains(previous),
+                "old crop retained: {previous}"
+            );
+        }
         catalog
             .save_thumb_bytes(
                 &key,
@@ -237,11 +361,11 @@ fn cover_crop_completed_rows_survive_existing_key_cleanup_for_folder_zip_pdf() {
                 &crate::cover_identity::CoverIdentity::Unknown,
             )
             .unwrap();
-        catalog.delete_missing(&existing).unwrap();
-        assert!(
-            catalog.load_one(&key).unwrap().is_some(),
-            "completed crop key lost: {key}"
-        );
+        catalog.delete_missing(&prepared.existing_keys).unwrap();
+        assert!(catalog.load_one(&key).unwrap().is_some());
+        if let Some(previous) = previous_key.replace(key) {
+            assert!(catalog.load_one(&previous).unwrap().is_none());
+        }
     }
 }
 
