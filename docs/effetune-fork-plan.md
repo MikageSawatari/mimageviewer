@@ -1235,3 +1235,22 @@ portable zip実物の生成・内容確認、署名あり配布とVirusTotal (�
 - 生成 HTML 3ページを再生成。`test_gen_effetune_docs.py` **41件成功**、生成器 `--check` **138ファイル＋301一致**、
   `check_site_cards.py` **53枚・超過0**、`git diff --check` **成功**。
   sitemap・上流 snapshot・`target/`・`vendor/` は変更せず、コミットは行っていない。
+
+### 20.2 派生版の取り込みと候補 (2026-11-12、設計担当)
+
+- 派生版 `G:\home\miv-sound` のブランチ `miv-0.17`: 上流 v0.17.0 (`60c7629`) の merge `992f200`、
+  独立レビュー (GPT-6.1 Sol / xhigh) の P2 修正 `459a5dc`。再レビューは ACCEPT。
+  衝突は 11 ファイル 20 箇所。派生版の名称・クラス ID・保存先・歌詞と再生時計・Last view・mIV Original は維持した。
+- 上流 v0.17.0 で増えた **Instrument クラス (`kInstrumentId`) は登録しない**。mIV はエフェクトだけを使い、
+  派生版は上流のクラス ID・製品名を出さない (§3)。内部の音源処理はコンパイルしたまま残す。
+- mIV の host は MIDI を渡さない (イベントバスを有効にせず、空のイベント一覧を渡す)。そのため
+  Visualizer の MIDI 表示は、実際に MIDI が届いた後にだけ使う (上流は SoundFont Player がパイプラインにあるだけで
+  MIDI 表示に切り替え、mIV Original の Notes が空になっていた。レビュー P2)。MIDI で鳴らす SoundFont Player は
+  追加一覧と検索から外し、保存済みのパイプラインからは読み込める。SoundFont Note Player (旧 SFZ Note Player) は使える。
+- 上流の Space キーの転送 (`vst_forwardHostSpace`) は残す。mIV の host の子窓は既定の処理に渡すだけで、
+  再生は切り替わらない (0.15.0-miv.7 でもプラグインの窓の Space は何もしなかった)。mIV の再生へつなぐのは別の機能追加。
+- 候補 `93c07e961a200f901ad4f8df6335c20bf99b1c3a1da4f5a8f403a5fccc4c55ca`: ctest 138/138 成功。
+  1 回目の ctest では `effetune_plugin_processing_lifecycle_tests` が高負荷で 300 秒のタイムアウトになった。
+  原因は、高負荷のときテスト終了時に WebView2 のブラウザプロセス (6 本) が残り、テストがその終了を待ち続けること。
+  0.15.0-miv.7 の同じテストでも同じ負荷 (6 本同時) で 6 本中 4 本が止まる既存の問題で、今回の退行ではない。
+  製品で窓を閉じた後にブラウザプロセスが残るかは未調査 (別項目の候補)。
