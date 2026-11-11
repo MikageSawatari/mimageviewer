@@ -89,23 +89,32 @@ impl App {
         if ctx.viewport_id() != egui::ViewportId::ROOT {
             return Err("メインウィンドウの一覧から検索してください");
         }
-        self.search_shortcut_availability(
-            kind,
-            self.viewer_session_blocks_main_window() || self.viewer_mutation_modal_active(),
-        )?;
-        self.pinned_search_availability(kind)
+        self.search_prefill_availability(kind, true)
     }
 
     pub(crate) fn search_with_text_menu_availability(
         &self,
         kind: Kind,
     ) -> Result<(), &'static str> {
+        self.search_prefill_availability(kind, false)
+    }
+
+    /// Prefill has the ordinary shortcut's state admission plus the item-search
+    /// restriction. Keep the shortcut itself free to focus/toggle its open session.
+    fn search_prefill_availability(
+        &self,
+        kind: Kind,
+        include_context_menu: bool,
+    ) -> Result<(), &'static str> {
+        if kind == Kind::Metadata && self.global_search.active {
+            return Err("検索を閉じてから使えます");
+        }
         self.search_entry_availability(
             kind,
             self.viewer_session_blocks_main_window() || self.viewer_mutation_modal_active(),
-            false,
+            include_context_menu,
         )?;
-        self.pinned_search_availability_including_context_menu(kind, false)
+        self.pinned_search_availability_including_context_menu(kind, include_context_menu)
     }
 
     pub(crate) fn open_search_with_text(&mut self, ctx: &egui::Context, request: SearchRequest) {
@@ -114,15 +123,14 @@ impl App {
             return;
         }
         let kind = request.target;
-        self.ensure_search_session(kind);
-        *self.search_draft_mut(kind) = request.query;
         if kind == Kind::Metadata {
-            // Use the ordinary query-edit transaction, then disarm its debounce.
-            // This clears old results while retaining a valid prepare for sorting.
-            self.reset_global_search_for_query_change(ctx);
-            self.global_search.last_change_at = None;
-            self.global_search.done = true;
-            self.global_search.reject_message = None;
+            // Open the existing retained-draft idle state. No edit transaction,
+            // producer, or projection is needed before the user submits it.
+            *self.search_draft_mut(kind) = request.query;
+            self.ensure_search_session(kind);
+        } else {
+            self.ensure_search_session(kind);
+            *self.search_draft_mut(kind) = request.query;
         }
         let input_id = if kind.pinned(&self.settings) {
             self.request_pinned_search_focus(ctx, kind);

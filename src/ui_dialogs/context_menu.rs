@@ -7057,8 +7057,6 @@ mod search_by_name_menu_tests {
         assert!(app.global_search.last_change_at.is_none());
         if kind == Kind::Metadata {
             assert!(!app.global_search.is_searching());
-            assert!(app.global_search.containers.is_empty());
-            assert!(app.global_search.all_hits.is_empty());
         }
     }
 
@@ -7076,6 +7074,7 @@ mod search_by_name_menu_tests {
                         .is_none()
                 );
                 let target = target(&app, false, ContextMenuSurface::Grid);
+                let previous_items = app.items.clone();
                 let nodes = app.context_menu_nodes(&ctx, &target, false);
                 for (destination, _, _) in destinations() {
                     assert_eq!(command_state(&nodes, &destination), Some((true, None)));
@@ -7092,6 +7091,10 @@ mod search_by_name_menu_tests {
                     }
                 ));
                 assert_draft_only(&app, kind);
+                assert_eq!(
+                    app.items, previous_items,
+                    "prefill retains the ordinary grid"
+                );
                 ctx.end_pass().drop_without_applying_deltas();
             }
         }
@@ -7129,6 +7132,7 @@ mod search_by_name_menu_tests {
                     );
                 harness.run_steps(4);
                 assert!(harness.state().context_menu_idx.is_some());
+                let previous_items = harness.state().items.clone();
                 harness.get_by_label("名前で検索").click();
                 harness.run_steps(3);
                 for (_, _, destination_label) in destinations() {
@@ -7142,6 +7146,7 @@ mod search_by_name_menu_tests {
                 harness.get_by_label(label).click();
                 harness.run_steps(3);
                 assert_draft_only(harness.state(), kind);
+                assert_eq!(harness.state().items, previous_items);
                 if kind == Kind::Local {
                     assert!(harness.state().search_has_focus);
                 } else {
@@ -7367,6 +7372,355 @@ mod search_by_name_menu_tests {
                 assert!(!app.show_search_bar);
                 assert!(app.search_pending.is_none());
                 ctx.end_pass().drop_without_applying_deltas();
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ExistingSearchPhase {
+        Input,
+        Results,
+        PhysicalChild,
+        Running,
+    }
+
+    fn existing_search_fixture(
+        ctx: &egui::Context,
+        source: Kind,
+        phase: ExistingSearchPhase,
+        pinned: bool,
+    ) -> AppTestEnvForTest {
+        use crate::global_search_ui::{EverythingPosition, SearchAccepted, SearchProducer};
+        let mut app = fixture(pinned);
+        app.context_menu_idx = None;
+        app.indexer_init = crate::app::IndexerInit::Unavailable;
+        *app.search_draft_mut(source) = "previous draft".into();
+        app.ensure_search_session(source);
+        if phase != ExistingSearchPhase::Input {
+            let path = app.items[0].drag_source_path().unwrap().to_owned();
+            image::RgbImage::new(2, 3).save(&path).unwrap();
+            if source == Kind::Everything {
+                let dataset =
+                    crate::global_search_ui::everything_dataset_for_test(vec![GridItem::Image(
+                        path,
+                    )]);
+                crate::global_search_ui::adopt_everything_for_test(
+                    &mut app,
+                    ctx,
+                    "previous draft",
+                    dataset,
+                );
+                if phase == ExistingSearchPhase::PhysicalChild {
+                    let root = app.tmp.path().to_owned();
+                    let SearchAccepted::Everything { position, .. } =
+                        &mut app.global_search.accepted
+                    else {
+                        unreachable!()
+                    };
+                    *position = EverythingPosition::PhysicalChild {
+                        logical_source: root.clone(),
+                        return_anchor: root.clone(),
+                        route: crate::app::FacetRoute::root(crate::app::FacetScope::path(&root)),
+                    };
+                }
+            } else {
+                // A retained draft opens idle (done=true). Entering a real producer
+                // uses this reset; otherwise poll returns before reading its stream.
+                // The existing G1 fixture publishes the executed query "test".
+                app.global_search.metadata_draft = "test".into();
+                app.global_search.reset_for_new_query();
+                crate::global_search_ui::tests::g1_publish_search_hits(&mut app, ctx, &[path]);
+                assert_eq!(
+                    app.global_search.metadata_draft,
+                    app.global_search.last_executed
+                );
+                assert!(matches!(
+                    &app.global_search.accepted,
+                    SearchAccepted::Metadata { applied: Some(applied) } if applied.query == "test"
+                ));
+                if phase == ExistingSearchPhase::PhysicalChild {
+                    app.global_search.drill = Some(crate::global_search_ui::DrillState {
+                        container_root: app.tmp.path().to_owned(),
+                        current_path: app.tmp.path().to_owned(),
+                        is_zip: false,
+                    });
+                }
+            }
+            app.items_are_global_search_view = phase != ExistingSearchPhase::PhysicalChild;
+        }
+        if phase == ExistingSearchPhase::Running {
+            if source == Kind::Everything {
+                let _cancel = crate::global_search_ui::start_everything_for_test(
+                    &mut app,
+                    ctx,
+                    "previous draft",
+                );
+            } else {
+                let (_tx, rx) = crossbeam_channel::unbounded();
+                app.global_search.pending = Some(SearchProducer::Metadata(
+                    crate::indexer_manager::SearchHandle {
+                        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        rx,
+                    },
+                ));
+            }
+            app.global_search.done = false;
+        }
+        app.global_search.has_focus = false;
+        app.global_search.focus_request = false;
+        app.context_menu_idx = Some(app.capture_grid_context_menu_owner(0));
+        app
+    }
+
+    // Capture ownership tokens rather than addresses inside Option storage, so replacing
+    // a worker at the same memory address cannot look like an unchanged operation.
+    fn existing_search_assertion(app: &App) -> Box<dyn Fn(&App)> {
+        use crate::global_search_ui::{EverythingPosition, SearchAccepted, SearchProducer};
+        use std::sync::{Arc, atomic::Ordering};
+        let run = app.global_search.run_sequence;
+        let state = (
+            app.global_search.source,
+            app.global_search.metadata_draft.clone(),
+            app.global_search.everything_draft.clone(),
+            app.global_search.last_executed.clone(),
+            app.global_search.last_change_at,
+            app.global_search.done,
+            app.global_search.drill.clone(),
+            app.items_are_global_search_view,
+            app.global_search.has_focus,
+            app.global_search.focus_request,
+        );
+        let items = app.items.clone();
+        let metadata_accepted = match &app.global_search.accepted {
+            SearchAccepted::Metadata { applied } => Some(applied.clone()),
+            _ => None,
+        };
+        let everything_accepted = match &app.global_search.accepted {
+            SearchAccepted::Everything {
+                submitted,
+                dataset,
+                position,
+            } => Some((submitted.clone(), Arc::clone(dataset), position.clone())),
+            _ => None,
+        };
+        let metadata_pending = match &app.global_search.pending {
+            Some(SearchProducer::Metadata(handle)) => Some(Arc::clone(&handle.cancel)),
+            _ => None,
+        };
+        let everything_pending = match &app.global_search.pending {
+            Some(SearchProducer::Everything {
+                cancel,
+                request_run,
+                submitted,
+                context,
+                generation,
+                ..
+            }) => Some((
+                cancel.clone(),
+                *request_run,
+                submitted.clone(),
+                *context,
+                *generation,
+            )),
+            _ => None,
+        };
+        let prepare = app
+            .global_search
+            .page_edit_prepare
+            .as_ref()
+            .map(|_| app.search_prepare_cancel_for_test());
+        Box::new(move |app| {
+            assert!(app.global_search.active);
+            assert_eq!(app.global_search.run_sequence, run);
+            assert_eq!(
+                (
+                    app.global_search.source,
+                    app.global_search.metadata_draft.clone(),
+                    app.global_search.everything_draft.clone(),
+                    app.global_search.last_executed.clone(),
+                    app.global_search.last_change_at,
+                    app.global_search.done,
+                    app.global_search.drill.clone(),
+                    app.items_are_global_search_view,
+                    app.global_search.has_focus,
+                    app.global_search.focus_request,
+                ),
+                state,
+            );
+            assert_eq!(app.items, items);
+            match (
+                &metadata_accepted,
+                &everything_accepted,
+                &app.global_search.accepted,
+            ) {
+                (Some(before), None, SearchAccepted::Metadata { applied }) => {
+                    assert_eq!(applied, before)
+                }
+                (
+                    None,
+                    Some((before, dataset_before, position_before)),
+                    SearchAccepted::Everything {
+                        submitted,
+                        dataset,
+                        position,
+                    },
+                ) => {
+                    assert_eq!(submitted, before);
+                    assert!(Arc::ptr_eq(dataset, dataset_before));
+                    match (position_before, position) {
+                        (EverythingPosition::Root, EverythingPosition::Root) => {}
+                        (
+                            EverythingPosition::PhysicalChild {
+                                logical_source: old_source,
+                                return_anchor: old_anchor,
+                                route: old_route,
+                            },
+                            EverythingPosition::PhysicalChild {
+                                logical_source,
+                                return_anchor,
+                                route,
+                            },
+                        ) => {
+                            assert_eq!(
+                                (logical_source, return_anchor, route),
+                                (old_source, old_anchor, old_route)
+                            );
+                        }
+                        _ => panic!("accepted result position changed"),
+                    }
+                }
+                _ => panic!("accepted search source changed"),
+            }
+            match (
+                &metadata_pending,
+                &everything_pending,
+                &app.global_search.pending,
+            ) {
+                (None, None, None) => {}
+                (Some(before), None, Some(SearchProducer::Metadata(handle))) => {
+                    assert!(Arc::ptr_eq(before, &handle.cancel));
+                    assert!(!before.load(Ordering::Relaxed));
+                }
+                (
+                    None,
+                    Some((before, old_run, old_submitted, old_context, old_generation)),
+                    Some(SearchProducer::Everything {
+                        cancel,
+                        request_run,
+                        submitted,
+                        context,
+                        generation,
+                        ..
+                    }),
+                ) => {
+                    assert!(std::ptr::eq(before.cancel_flag(), cancel.cancel_flag()));
+                    assert!(!before.is_cancelled());
+                    assert_eq!(
+                        (request_run, submitted, context, generation),
+                        (old_run, old_submitted, old_context, old_generation)
+                    );
+                }
+                _ => panic!("pending search owner changed"),
+            }
+            assert_eq!(
+                app.global_search.page_edit_prepare.is_some(),
+                prepare.is_some()
+            );
+            if let Some(before) = &prepare {
+                assert!(Arc::ptr_eq(before, &app.search_prepare_cancel_for_test()));
+                assert!(!before.load(Ordering::Relaxed));
+            }
+        })
+    }
+
+    #[test]
+    fn search_name_metadata_menu_refuses_active_search_without_mutating_its_owners() {
+        for pinned in [false, true] {
+            for source in [Kind::Metadata, Kind::Everything] {
+                for phase in [
+                    ExistingSearchPhase::Input,
+                    ExistingSearchPhase::Results,
+                    ExistingSearchPhase::PhysicalChild,
+                    ExistingSearchPhase::Running,
+                ] {
+                    let ctx = egui::Context::default();
+                    ctx.begin_pass(egui::RawInput::default());
+                    let mut app = existing_search_fixture(&ctx, source, phase, pinned);
+                    let unchanged = existing_search_assertion(&app);
+                    let target = target(&app, false, ContextMenuSurface::Grid);
+                    let nodes = app.context_menu_nodes(&ctx, &target, true);
+                    assert_eq!(
+                        command_state(&nodes, &MenuCommand::SearchByNameMetadata),
+                        Some((false, Some("検索を閉じてから使えます"))),
+                        "{source:?}/{phase:?}/pinned={pinned}",
+                    );
+                    unchanged(&app);
+                    // Both the native result and the egui selected-command path must
+                    // recheck admission, even if a stale command reaches dispatch.
+                    app.dispatch_native_context_menu_result(
+                        &ctx,
+                        NativeContextMenuResult::MivCommand(MenuCommand::SearchByNameMetadata),
+                        &target,
+                    );
+                    unchanged(&app);
+                    app.context_menu_idx = Some(app.capture_grid_context_menu_owner(0));
+                    app.dispatch_native_grid_context_command(
+                        &ctx,
+                        MenuCommand::SearchByNameMetadata,
+                        &target,
+                    );
+                    unchanged(&app);
+                    ctx.end_pass().drop_without_applying_deltas();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn search_name_metadata_egui_button_stays_disabled_for_active_search_sessions() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        for pinned in [false, true] {
+            for source in [Kind::Metadata, Kind::Everything] {
+                for phase in [
+                    ExistingSearchPhase::Input,
+                    ExistingSearchPhase::Results,
+                    ExistingSearchPhase::PhysicalChild,
+                    ExistingSearchPhase::Running,
+                ] {
+                    let ctx = egui::Context::default();
+                    ctx.begin_pass(egui::RawInput::default());
+                    let app = existing_search_fixture(&ctx, source, phase, pinned);
+                    let unchanged = existing_search_assertion(&app);
+                    ctx.end_pass().drop_without_applying_deltas();
+                    let mut harness = crate::test_ui::builder()
+                        .with_context_setup(crate::ui_fonts::configure_fonts)
+                        .with_size(egui::vec2(1100.0, 1100.0))
+                        .build_ui_state(
+                            |ui, app: &mut AppTestEnvForTest| {
+                                let _ = app.show_context_menu(ui.ctx());
+                            },
+                            app,
+                        );
+                    harness.run_steps(4);
+                    harness.get_by_label("名前で検索").click();
+                    harness.run_steps(3);
+                    let button = harness.get_by_label("アイテム検索で探す");
+                    assert!(button.accesskit_node().is_disabled());
+                    let position = button.rect().center();
+                    harness.event(egui::Event::PointerMoved(position));
+                    for pressed in [true, false] {
+                        harness.event(egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        });
+                        harness.run_steps(1);
+                    }
+                    harness.run_steps(2);
+                    unchanged(harness.state());
+                    assert!(harness.state().context_menu_idx.is_some());
+                }
             }
         }
     }

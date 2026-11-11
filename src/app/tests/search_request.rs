@@ -1,5 +1,5 @@
 use super::*;
-use crate::global_search_ui::{MetadataAppliedSpec, SearchAccepted, SearchProducer};
+use crate::global_search_ui::{SearchAccepted, SearchProducer};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -129,7 +129,7 @@ fn search_name_three_targets_pinned_and_temporary_focus_select_and_wait_for_ente
 #[test]
 fn search_name_reinjects_into_open_unfocused_fields_and_selects_each_time() {
     for pinned in [false, true] {
-        for kind in [Kind::Local, Kind::Metadata, Kind::Everything] {
+        for kind in [Kind::Local, Kind::Everything] {
             let mut app = super::super::setup_app_for_test();
             pin(&mut app, pinned);
             let ctx = context();
@@ -199,102 +199,151 @@ fn search_name_normal_local_and_metadata_open_preserve_collapsed_selection() {
     }
 }
 
+fn bind_metadata_prefill(app: &mut App) {
+    let mut settings = crate::keymap::KeymapSettings::default();
+    settings.set_override_chords(
+        KeyAction::GridSearchNameMetadata,
+        vec![crate::keymap::Chord::ctrl_shift(crate::keymap::KeyName::F)],
+    );
+    app.keymap = crate::keymap::Keymap::from_settings(&settings);
+    app.selected = Some(0);
+}
+
+fn metadata_prefill_key_input() -> egui::RawInput {
+    egui::RawInput {
+        events: vec![egui::Event::Key {
+            key: egui::Key::F,
+            physical_key: Some(egui::Key::F),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+        }],
+        ..Default::default()
+    }
+}
+
 #[test]
-fn search_name_metadata_injection_disarms_completed_waiting_and_running_queries() {
-    for phase in 0..3 {
+fn search_name_metadata_active_completed_waiting_and_running_queries_reject_prefill() {
+    let _input = crate::key_input::lock_test_input();
+    for pinned in [false, true] {
+        for phase in 0..3 {
+            let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+            let mut app = super::super::setup_app_for_test();
+            pin(&mut app, pinned);
+            let ctx = context();
+            let old_path = app.tmp.path().join("old.png");
+            image::RgbImage::new(2, 3).save(&old_path).unwrap();
+            app.open_global_search();
+            app.global_search.metadata_draft = "test".into();
+            app.global_search.reset_for_new_query();
+            crate::global_search_ui::tests::g1_publish_search_hits(&mut app, &ctx, &[old_path]);
+            let SearchAccepted::Metadata {
+                applied: Some(applied),
+            } = &app.global_search.accepted
+            else {
+                panic!("completed Metadata result fixture");
+            };
+            let applied = applied.clone();
+            assert_eq!(applied.query, "test");
+            app.global_search.pending = None;
+            app.global_search.done = phase == 0;
+            let last_change = (phase != 0).then(|| Instant::now() - Duration::from_secs(2));
+            app.global_search.last_change_at = last_change;
+            let (_tx, rx) = crossbeam_channel::unbounded();
+            let cancel = Arc::new(AtomicBool::new(false));
+            if phase == 2 {
+                app.global_search.pending = Some(SearchProducer::Metadata(
+                    crate::indexer_manager::SearchHandle {
+                        cancel: cancel.clone(),
+                        rx,
+                    },
+                ));
+            }
+            bind_metadata_prefill(&mut app);
+            let run = app.global_search.run_sequence;
+            let prepare_cancel = app.search_prepare_cancel_for_test();
+            let items = app.items.clone();
+            let hits = app.global_search.all_hits.len();
+            let searching = app.global_search.is_searching();
+            let focus = app.global_search.focus_request;
+            ctx.begin_pass(metadata_prefill_key_input());
+            assert_eq!(
+                app.search_with_text_availability(&ctx, Kind::Metadata),
+                Err("検索を閉じてから使えます")
+            );
+            inject(&mut app, &ctx, Kind::Metadata, "new draft");
+            app.handle_keyboard(&ctx);
+            assert_eq!(app.global_search.metadata_draft, "test");
+            assert_eq!(app.global_search.last_executed, "test");
+            assert_eq!(app.global_search.last_change_at, last_change);
+            assert_eq!(app.global_search.run_sequence, run);
+            assert_eq!(app.global_search.done, phase == 0);
+            assert_eq!(app.global_search.is_searching(), searching);
+            assert_eq!(app.global_search.focus_request, focus);
+            assert_eq!(app.global_search.pending.is_some(), phase == 2);
+            assert!(!cancel.load(Ordering::Relaxed));
+            assert!(Arc::ptr_eq(
+                &prepare_cancel,
+                &app.search_prepare_cancel_for_test()
+            ));
+            assert!(!prepare_cancel.load(Ordering::Relaxed));
+            assert_eq!(app.items, items);
+            assert_eq!(app.global_search.all_hits.len(), hits);
+            assert!(matches!(&app.global_search.accepted,
+                SearchAccepted::Metadata { applied: Some(value) } if value == &applied));
+            assert!(!crate::search_request::select_all_pending_for_test(
+                &ctx,
+                input_id(Kind::Metadata, pinned)
+            ));
+            end(&ctx);
+        }
+    }
+}
+
+#[test]
+fn search_name_new_metadata_draft_converges_without_repeated_projection_rejections() {
+    let _input = crate::key_input::lock_test_input();
+    for pinned in [false, true] {
         let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = super::super::setup_app_for_test();
+        pin(&mut app, pinned);
         let ctx = context();
         app.indexer_init = super::super::IndexerInit::Unavailable;
-        let old_path = app.tmp.path().join("old.png");
-        image::RgbImage::new(2, 3).save(&old_path).unwrap();
-        crate::global_search_ui::tests::g1_publish_search_hits(&mut app, &ctx, &[old_path]);
-        assert_eq!(app.items.len(), 1);
-        app.global_search.metadata_draft = "old executed".into();
-        app.global_search.last_executed = "old executed".into();
-        app.global_search.accepted = SearchAccepted::Metadata {
-            applied: Some(MetadataAppliedSpec {
-                query: "old executed".into(),
-                filters: app.global_search.filters.clone(),
-            }),
-        };
-        app.global_search.pending = None;
-        app.global_search.done = phase == 0;
-        app.global_search.last_change_at =
-            (phase != 0).then(|| Instant::now() - Duration::from_secs(2));
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let cancel = Arc::new(AtomicBool::new(false));
-        if phase == 2 {
-            app.global_search.pending = Some(SearchProducer::Metadata(
-                crate::indexer_manager::SearchHandle {
-                    cancel: cancel.clone(),
-                    rx,
-                },
-            ));
-        }
+        app.current_folder = Some(app.tmp.path().to_owned());
+        app.items = vec![GridItem::Image(app.tmp.path().join("folder-item.png"))];
+        let items = app.items.clone();
         ctx.begin_pass(egui::RawInput::default());
         inject(&mut app, &ctx, Kind::Metadata, "new draft");
-        assert!(app.global_search.last_executed.is_empty());
-        assert!(app.global_search.all_hits.is_empty());
-        assert!(app.global_search.containers.is_empty());
-        assert!(app.global_search.last_change_at.is_none());
-        assert!(app.global_search.done);
-        assert!(!app.global_search.is_searching());
-        assert!(app.global_search.pending.is_none());
-        assert!(app.global_search.page_edit_prepare.is_some());
-        assert_eq!(cancel.load(Ordering::Relaxed), phase == 2);
-        if phase == 2 {
-            assert!(
-                tx.send(crate::global_search::SearchStreamEvent::Done {
-                    truncated: false,
-                    reason: crate::global_search::DoneReason::Complete,
-                })
-                .is_err(),
-                "retired query no longer has a receiver"
-            );
-        }
-        crate::global_search_ui::tests::section1409_settle_metadata(&mut app, &ctx, |app| {
-            app.items.is_empty()
-        });
-        assert!(matches!(
-            app.global_search.accepted,
-            SearchAccepted::Metadata { applied: None }
-        ));
+        assert!(app.edit_owner(Kind::Metadata));
+        assert_eq!(app.global_search.metadata_draft, "new draft");
         let run = app.global_search.run_sequence;
         for _ in 0..8 {
-            app.poll_global_search_debounce(&ctx);
             app.poll_global_search_events(&ctx);
+            app.poll_global_search_debounce(&ctx);
+            assert!(app.global_search.page_edit_prepare.is_none());
+            assert!(app.global_search.pending.is_none());
+            assert!(app.global_search.last_change_at.is_none());
+            assert!(app.global_search.last_executed.is_empty());
+            assert!(!app.global_search.is_searching());
+            assert!(app.global_search.done);
+            assert_eq!(app.global_search.run_sequence, run);
+            assert_eq!(app.items, items);
         }
-        assert_eq!(app.global_search.run_sequence, run);
-        assert!(app.global_search.last_executed.is_empty());
-        assert!(app.global_search.pending.is_none());
-        // Keep the ordinary projection worker usable after the draft-only edit.
-        for sort in [
-            crate::settings::SortOrder::FileName,
-            crate::settings::SortOrder::RatingAsc,
-            crate::settings::SortOrder::RatingDesc,
-        ] {
-            for rating_filter in [[true; 6], [false, false, false, false, false, true]] {
-                app.feedback_toasts_for_test.clear();
-                app.settings.sort_order = sort;
-                app.settings.rating_filter = rating_filter;
-                app.drop_rating_filter_suppression_on_user_edit();
-                app.apply_sort_change_reload();
-                crate::global_search_ui::tests::section1409_settle_metadata(
-                    &mut app,
-                    &ctx,
-                    |app| app.items.is_empty(),
-                );
-                assert!(
-                    app.feedback_toasts_for_test.is_empty(),
-                    "sort={sort:?}, phase={phase}: {:?}",
-                    app.feedback_toasts_for_test
-                );
-                assert!(app.global_search.pending.is_none());
-                assert_eq!(app.global_search.run_sequence, run);
-            }
-        }
-        assert!(app.submit_search_input(&ctx, Kind::Metadata, Kind::Metadata.temporary_id()));
+        draw(&mut app, &ctx, Kind::Metadata, pinned);
+        assert!(ctx.memory(|memory| memory.has_focus(input_id(Kind::Metadata, pinned))));
+        end(&ctx);
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: Some(egui::Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        });
+        app.update_ime_state(&ctx);
+        draw(&mut app, &ctx, Kind::Metadata, pinned);
         assert!(app.global_search.last_change_at.is_some());
         assert_ne!(app.global_search.run_sequence, run);
         app.global_search.last_change_at = Some(Instant::now() - Duration::from_secs(2));
@@ -305,66 +354,72 @@ fn search_name_metadata_injection_disarms_completed_waiting_and_running_queries(
 }
 
 #[test]
-fn search_name_new_metadata_draft_converges_without_repeated_projection_rejections() {
-    let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
-    let mut app = super::super::setup_app_for_test();
-    let ctx = context();
-    app.current_folder = Some(app.tmp.path().to_owned());
-    app.items = vec![GridItem::Image(app.tmp.path().join("folder-item.png"))];
-    assert!(!app.items_are_global_search_view);
-    ctx.begin_pass(egui::RawInput::default());
-    inject(&mut app, &ctx, Kind::Metadata, "new draft");
-    assert!(app.edit_owner(Kind::Metadata));
-    assert_eq!(app.global_search.metadata_draft, "new draft");
-    crate::global_search_ui::tests::section1409_settle_metadata(&mut app, &ctx, |app| {
-        app.global_search.pending.is_none()
-    });
-    let rejected = app.search_prepare_metrics_for_test().stale_rejections;
-    assert!(
-        rejected <= 1,
-        "draft-only entry must settle; repeatedly rejected {rejected} empty projections (search_view={}, last_executed={:?})",
-        app.items_are_global_search_view,
-        app.global_search.last_executed
-    );
-    assert!(app.global_search.pending.is_none());
-    end(&ctx);
-}
-
-#[test]
-fn search_name_metadata_from_everything_does_not_republish_the_old_query() {
-    let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
-    let mut app = super::super::setup_app_for_test();
-    let ctx = context();
-    let old_path = app.tmp.path().join("old.png");
-    image::RgbImage::new(2, 3).save(&old_path).unwrap();
-    crate::global_search_ui::adopt_everything_for_test(
-        &mut app,
-        &ctx,
-        "old everything",
-        crate::global_search_ui::everything_dataset_for_test(vec![GridItem::Image(old_path)]),
-    );
-    ctx.begin_pass(egui::RawInput::default());
-    inject(&mut app, &ctx, Kind::Metadata, "new metadata");
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while app.global_search.last_executed.is_empty() && Instant::now() < deadline {
-        app.poll_global_search_events(&ctx);
-        app.poll_global_search_debounce(&ctx);
-        std::thread::sleep(Duration::from_millis(2));
+fn search_name_metadata_from_everything_rejects_without_changing_the_old_query() {
+    let _input = crate::key_input::lock_test_input();
+    for pinned in [false, true] {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = super::super::setup_app_for_test();
+        pin(&mut app, pinned);
+        let ctx = context();
+        let old_path = app.tmp.path().join("old.png");
+        image::RgbImage::new(2, 3).save(&old_path).unwrap();
+        crate::global_search_ui::adopt_everything_for_test(
+            &mut app,
+            &ctx,
+            "old everything",
+            crate::global_search_ui::everything_dataset_for_test(vec![GridItem::Image(old_path)]),
+        );
+        app.global_search.metadata_draft = "retained metadata".into();
+        bind_metadata_prefill(&mut app);
+        let SearchAccepted::Everything {
+            dataset, submitted, ..
+        } = &app.global_search.accepted
+        else {
+            panic!("Everything result fixture");
+        };
+        let dataset = dataset.clone();
+        let submitted = submitted.clone();
+        let prepare = app
+            .global_search
+            .page_edit_prepare
+            .as_ref()
+            .map(|_| app.search_prepare_cancel_for_test());
+        let run = app.global_search.run_sequence;
+        let items = app.items.clone();
+        let focus = app.global_search.focus_request;
+        ctx.begin_pass(metadata_prefill_key_input());
+        assert_eq!(
+            app.search_with_text_availability(&ctx, Kind::Metadata),
+            Err("検索を閉じてから使えます")
+        );
+        inject(&mut app, &ctx, Kind::Metadata, "new metadata");
+        app.handle_keyboard(&ctx);
+        assert!(app.edit_owner(Kind::Everything));
+        assert_eq!(app.global_search.metadata_draft, "retained metadata");
+        assert_eq!(app.global_search.last_executed, "old everything");
+        assert_eq!(app.global_search.run_sequence, run);
+        assert_eq!(app.global_search.focus_request, focus);
+        assert!(matches!(&app.global_search.accepted,
+            SearchAccepted::Everything { dataset: current, submitted: current_submission,
+                position: crate::global_search_ui::EverythingPosition::Root }
+            if Arc::ptr_eq(current, &dataset) && current_submission == &submitted));
+        for _ in 0..8 {
+            app.poll_global_search_events(&ctx);
+            app.poll_global_search_debounce(&ctx);
+        }
+        assert_eq!(app.global_search.last_executed, "old everything");
+        assert_eq!(app.items, items);
+        assert!(app.global_search.pending.is_none());
+        assert_eq!(
+            app.global_search.page_edit_prepare.is_some(),
+            prepare.is_some()
+        );
+        if let Some(before) = prepare {
+            assert!(Arc::ptr_eq(&before, &app.search_prepare_cancel_for_test()));
+            assert!(!before.load(Ordering::Relaxed));
+        }
+        end(&ctx);
     }
-    assert!(
-        app.global_search.last_executed.is_empty(),
-        "old query must not be republished after injection: {:?}",
-        app.global_search.last_executed
-    );
-    assert!(
-        app.items.is_empty(),
-        "editing the Metadata query must clear the old results"
-    );
-    assert!(matches!(
-        app.global_search.accepted,
-        SearchAccepted::Metadata { applied: None }
-    ));
-    end(&ctx);
 }
 
 #[test]
@@ -524,7 +579,6 @@ fn search_name_switches_existing_sessions_through_ensure_without_submitting() {
         (Kind::Container, Kind::Metadata),
         (Kind::Container, Kind::Everything),
         (Kind::Metadata, Kind::Everything),
-        (Kind::Everything, Kind::Metadata),
     ] {
         let mut app = super::super::setup_app_for_test();
         let ctx = context();

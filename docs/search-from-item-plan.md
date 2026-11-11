@@ -4,7 +4,7 @@
 状態: **最小版の設計 (第 2.4 版)。仕様は利用者承認済み (2026-11-11、統括経由)。第 2 版の独立レビュー (Sol/xhigh) は REJECT
 (P1 1 件・P2 5 件・P3 1 件)。第 2.1 版で全件を反映 (各所に「P<N> 対応」)。第 2.1 版の再レビューも REJECT (P1 2 件・P2 1 件・P3 1 件)。第 2.2 版で反映。第 2.2 版の再レビューは ACCEPT WITH CHANGES (P2 1 件: 全選択の印の期間)。第 2.3 版で印の期間を縮め、
 実装で判明した Ctrl+G の再投影の退行に対して手順 3 を「ふだんの編集と同じ後始末」に改めた。第 2.3 版も実装で成立しなかったため、
-第 2.4 版で「Ctrl+G・Everything の検索セッションが開いている間はアイテム検索へ渡さない」に絞った (M3 手順 3)。実装中 (M9)。**
+第 2.4 版で「Ctrl+G・Everything の検索セッションが開いている間はアイテム検索へ渡さない」に絞った (M3 手順 3)。実装・指定の自動検証済み。確認用ビルドの native 依存失敗は M9 に記録。**
 第 1 版 (材料を組み立てる専用のモーダル) は利用者決定で後の版へ回した。付録 A に残す (未レビュー)。
 
 ## M1. 範囲 (利用者決定 2026-11-11)
@@ -158,10 +158,12 @@ pub(crate) fn item_search_name(item: &GridItem) -> Option<String>; // M2 の規�
 - headless App: 3 つの渡し先 × (常設欄 ON / OFF) で、セッションが開き、下書きが名前に置き換わり、フォーカスと全選択がそろい、
   検索が始まっていないこと (Ctrl+F は `search_pending`・`search_filter` 不変、Ctrl+G は pending なし・検索中の表示なし、
   Everything は producer なし)。その後の Enter で既存どおり検索が始まること。
-  別の検索セッション (Ctrl+S、Ctrl+G ↔ Everything) が開いているときの切り替え。利用できない渡し先で何も変わらないこと。
-- Ctrl+G へ入れる時点が「検索完了後」「デバウンス待ち (`last_change_at` あり)」「検索の実行中」のそれぞれで、
-  その後の poll を何回回しても (実行中の検索が完了した後も) 新しい検索が始まらず、Enter で初めて始まること (P1)。
-- 既に開いていて入力欄からフォーカスが外れている検索 (常設・一時バーとも) に入れても、フォーカスが入り全選択されること (P2-2)。
+  別の検索セッション (Ctrl+S から各渡し先、Ctrl+G から Everything) が開いているときの切り替え。
+  Everything から Ctrl+G を含め、利用できない渡し先では何も変わらないこと。
+- Ctrl+G が「検索完了後」「デバウンス待ち (`last_change_at` あり)」「検索の実行中」のそれぞれで、
+  名前の注入を拒否し、下書き・結果・検索の所有状態が変わらないこと (第 2.4 版、P1)。
+- 既に開いていて入力欄からフォーカスが外れている Local / Everything (常設・一時バーとも) に入れても、
+  フォーカスが入り全選択されること。開設済み Metadata は第 2.4 版の受付で拒否する (P2-2)。
 - 全選択の印: Local・Metadata の常設欄と一時バーで、フォーカスが入った描画で全選択になること。ふだんの Ctrl+F・Ctrl+G で
   開いたときは今までどおり全選択しないこと。IME 変換中は選択を変えないこと (P2-3)。
 - 受付: アイテム検索・Everything の結果表示中 (`PhysicalChild` を含む) は「この場所で絞り込む」が灰色で、キーでも何も起きないこと。
@@ -401,6 +403,77 @@ nextest は `-j 6`、ui_snapshot は `RUST_TEST_THREADS=6` も設定した。
 - `docs/search-from-item-plan.md`
 - `docs/section221-context-menu-layout.md`
 - `htdocs/mimageviewer/manual/search.html`
+
+---
+
+### 第 2.4 版への対応
+
+設計 `023e18461` と途中実装 `bcfc446b9` の上で、開設済み Metadata / Everything から Metadata への
+注入を拒否する仕様へ変更した。第 2.3 版の失敗を迂回する処理は追加していない。
+
+- `src/app/search_request.rs`: 注入専用の共通受付で `global_search.active` 中の Metadata を
+  「検索を閉じてから使えます」で拒否する。通常ショートカットの受付は変えない。
+  許可時は Metadata の下書き代入 → `ensure_search_session(Metadata)` とし、既存の保持された下書きの待機分岐を使う。
+  第 2.3 版の reset 呼び出し・debounce / done / reject の直接変更を削除した。
+- `src/app/tests/search_request.rs`: Metadata の完了後・デバウンス待ち・実行中、および Everything からの注入は
+  拒否・状態不変・割り当てたキーでも不変の検査へ置換。常設 ON/OFF で、未開設時の注入後に poll しても
+  prepare / producer を作らず、元の一覧を保持して待機し、実際の Enter で初めて検索を始めることを検査する。
+  開設済み欄への再注入の成功検査は Local / Everything に限定した。
+- `src/global_search_ui.rs`: 不要になったテスト用 settle helper の公開範囲を元に戻した。検索処理の挙動は変更していない。
+- `src/ui_dialogs/context_menu.rs`: 成功時の通常一覧保持と、両 source × 入力中 / 結果 / 子フォルダ / 実行中 × 常設 ON/OFF の
+  灰色理由・既存 owner 不変を検査。ネイティブ dispatch と実際の headless egui ボタンの無効状態・クリックの両方を含む。
+- `docs/keymap-spec.md`、`docs/search-architecture.md`、`docs/item-kind-capability-matrix.md` と本書:
+  第 2.4 版の受付・待機処理に更新。M7 の旧い再注入条件も新しい拒否条件と区別した。
+- `htdocs/mimageviewer/manual/search.html`・`shortcuts.html`: 開設中の制限を記載し、検索説明を短縮。
+  `htdocs/mimageviewer/index.html` の検索カードは `3287af3fc` の文へ完全に戻した。
+
+独立レビューでは production と追加回帰に実装 finding なし。文書指摘の M7 の旧条件は上記のとおり整理した。
+第 2.4 版の検証結果は以下に記録する。
+
+初回の関連 nextest はコンパイル成功（7分35秒）、780 件中 777 成功・3 失敗（実行 100.293 秒）。
+失敗はテストの前提設定・期待値だったため、製品コードを変えずに修正した。
+
+- Everything の拒否テストは、結果用 prepare が元から存在するため、`None` ではなく拒否前後の有無・同じ cancel Arc・非取消を比較する。
+- 2 件のメニューテストは、保持下書きで開いた `done=true` のまま擬似ストリームを送っていたため、poll が受信前に戻っていた。
+  結果の前提状態を通常の検索開始と同じ `reset_for_new_query` で初期化し、既存 helper の実行語 `test` に下書きも合わせた。
+  App の 3 時点の拒否テストも、実際に採用された spec を比較し、後から適用条件を上書きしない前提設定へそろえた。
+  これらの修正にも独立レビューの追加指摘なし。
+
+#### 第 2.4 版の最終検証
+
+本体のコンパイルを伴うコマンドはすべて次の共通スクリプトを経由し、1 本ずつ実行した。
+ロックへの書き込み不可の警告が出たため、利用者指示どおり低優先度・6 並列のフォールバックで継続した。
+`CARGO_BUILD_JOBS=6`、`MSBUILDDISABLENODEREUSE=1`、nextest は `-j 6`、ui_snapshot は `RUST_TEST_THREADS=6` も設定した。
+各時間は Cargo / nextest の表示値で、共通ロックの待機時間を含まない。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local\miv-locks\run-heavy.ps1 -Owner "codex-690" -WorkDir G:\home\mimageviewer-690 -Command "<コマンド>"
+```
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 成功、43.08 秒。既存の warning あり |
+| `cargo nextest run -p mimageviewer --lib -j 6 --no-fail-fast -E 'test(/context_menu_model\|ui_dialogs::context_menu\|keymap\|pinned_search\|global_search_ui\|everything\|search_request/)'` | 修正後は 780 件すべて成功、実行 62.373 秒（コンパイル 3分03秒）、16540 件は範囲外 |
+| `cargo test --test ui_snapshot` | 249 件すべて成功、実行 60.64 秒（コンパイル 1分07秒）。PNG 更新なし |
+| `python scripts/check_ui_glyphs.py` | 成功、危険なグリフ 0 件 |
+| `python scripts/check_site_cards.py` | 成功、53 カード・違反 0 件 |
+| `cargo fmt`（引数なし）・`cargo fmt --check` | 成功 |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | 失敗、exit 101。`turbojpeg-sys v1.2.0` の CMake / MSBuild install が exit 1。core 未生成 |
+
+ログ: `target/search-from-item-verification/core-check-24.log`、`related-24-final.log`、`ui-snapshot-24.log`。
+初回の失敗記録は `related-24.log` に残している。
+
+確認用ビルドは、共通ロック待機と既存の native ビルド待機を経て実行した。
+`[vcrt-pe] passed: runtime=4 pe=0` の後、未準備だった dev-runtime 用依存のコンパイルに入り、
+`target/dev-runtime/build/turbojpeg-sys-ad9ab6b47bbc75e3/out/build` の CMake install で失敗した。
+`MSBUILDDISABLENODEREUSE=1` は最初から適用済み。`mimageviewer-core.exe` は生成されず、後続 companion のビルドにも進んでいない。
+既存の debug / test 用 native 依存を使う指定の自動検証はすべて成功しているが、
+利用者向けの確認用バイナリは native 依存の install 失敗を解消した環境で再作成する必要がある。
+製品コードや依存ソースを迂回する変更・ビルドキャッシュの手動差し替えは行っていない。
+
+第 2.4 版からの実装の逸脱、独立レビューの未解決指摘はない。
+変更は上記の 11 ファイル。整形は引数なしの `cargo fmt` でワークスペース全体へ適用した。
+git 書き込み・製品バイナリ起動・本体 lib 全件テストは行っていない。実機 UI / IME の確認も未実施。
 
 ---
 

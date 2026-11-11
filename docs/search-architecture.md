@@ -164,19 +164,19 @@ Smart Folderの一覧退避は非固定のtemporary queryのみを所有し、�
 メイン窓の一覧の「名前で検索」サブメニューと3つの Grid KeyAction は、
 `SearchRequest { target, query }` を `App::open_search_with_text` へ渡す。
 項目の名前・入口の可否・渡し先の通常ショートカットの開始可否を共有し、
-`ensure_search_session` で既存の欄を開いて下書きを置き換え、フォーカスと全選択を要求する。
+既存の欄に名前を入れ、フォーカスと全選択を要求する。
 メニューの可否判定だけは呼び出し元の右クリックメニューをモーダル判定から除外し、
 名前を確定して自分のメニュー owner を閉じた後、通常の受付で実行する。
 メニューの可否判定へキーの入力所有・IME 判定は流用しない。
-新しい検索は Enter まで始めない。Metadata は下書きの代入後、既存の
-`reset_global_search_for_query_change(ctx)` を通し、手で語を打ち替えたときと同じく
-進行中の検索を取り消して旧結果を消し、空の一覧用の新しい prepare を残す。
-直後に `last_change_at = None`・`done = true`・`reject_message = None` として待機する。
-source切替用の prepare 退役経路は使わない。Local / Everything は入力の代入だけを行う。
+新しい検索は Enter まで始めない。Metadata は `global_search.active` 中には受け付けず、
+「検索を閉じてから使えます」と通知する。Metadata / Everything のどちらの検索セッションも
+開いていないときだけ、下書きを先に名前で置き換えてから `ensure_search_session(Metadata)` を呼ぶ。
+既存の `open_global_search` の保持された下書きで待機する分岐を使い、reset・デバウンスは呼ばない。
+Local / Everything は `ensure_search_session` で欄を開いてから入力を代入する。
 Local / Metadata だけ、全選択の一時印を入力欄 id・文字列・発行passに結び付ける。
 対象欄の最初の描画で必ず印を取り出して消し、発行passかその次のpass・フォーカス要求または取得済み・
 文字列一致・IME変換中でない場合だけ全選択する。Everything は既存の全選択を使い、印を作らない。
-Local は Metadata / Everything の結果中（PhysicalChild を含む）には受け付けない。
+Metadata / Local は Metadata / Everything の検索セッション中（入力中・PhysicalChild を含む）には受け付けない。
 新しい App 状態・worker・永続データは追加しない。詳細は [設計 M1〜M8](search-from-item-plan.md)。
 
 ## 2. モジュールマップ
