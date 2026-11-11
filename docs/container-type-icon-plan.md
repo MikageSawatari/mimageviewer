@@ -549,6 +549,12 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
   `page_turn_mainwindow_submits_visible_vacant_leaf_both_directions` で、本件の変更箇所と関係がなく、
   3 件とも単独の再実行で成功した (全件実行の負荷による失敗、[§1.765](next-release-backlog.md) と同じ型)。
 
+- 設計担当の追加確認 (2026-11-12、60dc118b6 の前と同じコード): `cargo test --test ui_snapshot` 249 件成功、
+  `cargo test --workspace --features pack-build-tools --no-run` 成功、`build-dev.ps1` 成功
+  (`target/dev-runtime/`、PE 検査通過)。製品の起動による確認は未実施。
+- §1.764 (`feat-764-cover-crop`) との試し merge: `docs/display-pipeline.md` §1.3.2 の同じ段落で文書の競合が 1 か所
+  (両方の文を残せば解決)。コードは自動 merge でき、§1.764 側に旧設定名の新しい使用箇所はない。
+
 ### 8.11 設計レビューの記録
 
 - r1 (GPT-6.1 Sol / xhigh、2026-11-11): REVISE、P1 なし。P2 `--settings-override` はマージ前に未知キーを拒否するので
