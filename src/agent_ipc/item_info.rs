@@ -772,16 +772,7 @@ fn project_exif(source: Option<crate::exif_reader::ExifInfo>, gps: bool) -> Info
     };
     if gps {
         info.gps = (|| {
-            let latitude = coordinate(
-                &lookup("GPSLatitude")?,
-                lookup("GPSLatitudeRef").as_deref(),
-                90.0,
-            )?;
-            let longitude = coordinate(
-                &lookup("GPSLongitude")?,
-                lookup("GPSLongitudeRef").as_deref(),
-                180.0,
-            )?;
+            let coordinates = source.gps_coordinates()?;
             let altitude = lookup("GPSAltitude").and_then(|value| {
                 let altitude = value.split_whitespace().next()?.parse::<f64>().ok()?;
                 if !altitude.is_finite() {
@@ -798,39 +789,13 @@ fn project_exif(source: Option<crate::exif_reader::ExifInfo>, gps: bool) -> Info
                 )
             });
             Some(GpsInfo {
-                latitude,
-                longitude,
+                latitude: coordinates.latitude,
+                longitude: coordinates.longitude,
                 altitude,
             })
         })();
     }
     InfoField::Present(info)
-}
-
-fn coordinate(value: &str, reference: Option<&str>, maximum: f64) -> Option<f64> {
-    let components = value
-        .split(|c: char| !c.is_ascii_digit() && c != '.')
-        .filter(|p| !p.is_empty())
-        .map(str::parse::<f64>)
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?;
-    let degrees = match components.as_slice() {
-        [d] => *d,
-        [d, m] if *m < 60.0 => d + m / 60.0,
-        [d, m, s] if *m < 60.0 && *s < 60.0 => d + m / 60.0 + s / 3600.0,
-        _ => return None,
-    };
-    if !degrees.is_finite() || degrees > maximum {
-        return None;
-    }
-    let direction = reference
-        .and_then(|r| r.chars().next())
-        .or_else(|| value.chars().last())?;
-    match direction {
-        'N' | 'E' => Some(degrees),
-        'S' | 'W' => Some(-degrees),
-        _ => None,
-    }
 }
 
 fn text(value: impl Into<String>) -> TextValue {
