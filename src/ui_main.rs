@@ -861,6 +861,7 @@ pub(crate) enum LocationJumpTarget {
 pub(crate) enum AddressBarNav {
     LocationJump(LocationJumpTarget),
     AddressInput(LocationJumpTarget),
+    Favorite(PathBuf),
     ZipListReturn(crate::app::ZipListReturnRequest),
     Direct(PathBuf, crate::app::StartupListIntent),
     GridVirtual(crate::app::GridVirtualOpenIntent),
@@ -8464,9 +8465,12 @@ impl App {
     }
 
     /// メニューバーを描画し、ナビゲーション先とソート変更の有無を返す。
-    pub(crate) fn render_menubar(&mut self, root_ui: &mut egui::Ui) -> (Option<PathBuf>, bool) {
+    pub(crate) fn render_menubar(
+        &mut self,
+        root_ui: &mut egui::Ui,
+    ) -> (Option<LocationJumpTarget>, bool) {
         let ctx = &root_ui.ctx().clone();
-        let mut fav_nav: Option<PathBuf> = None;
+        let mut fav_nav: Option<LocationJumpTarget> = None;
         let mut smart_folder_open: Option<uuid::Uuid> = None;
         let mut settings_changed = false;
         let mut sort_changed = false;
@@ -8833,7 +8837,7 @@ impl App {
                                     let favorites = self.settings.favorites.clone();
                                     for fav in &favorites {
                                         if ui.button(&fav.name).clicked() {
-                                            fav_nav = Some(fav.path.clone());
+                                            fav_nav = Some(LocationJumpTarget::Physical(fav.path.clone()));
                                             ui.close();
                                         }
                                     }
@@ -8968,7 +8972,12 @@ impl App {
                                         }
                                         MenuCommandId::BooksOpenRoot => {
                                             if ui.button(&book_open_root_menu_label).clicked() {
-                                                self.open_books_root();
+                                                if self.global_search.active || self.favsearch.active || self.tag_view.active {
+                                                    fav_nav = Some(LocationJumpTarget::BooksRoot);
+                                                } else {
+                                                    // Preserve the released Plain menu timing.
+                                                    self.open_books_root();
+                                                }
                                                 ui.close();
                                             }
                                         }
@@ -15997,6 +16006,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         | AddressBarNav::EverythingResults
                                         | AddressBarNav::LocationJump(_)
                                         | AddressBarNav::AddressInput(_)
+                                        | AddressBarNav::Favorite(_)
                                         | AddressBarNav::SavedGroupReady(_),
                                     )
                                     | None => "親フォルダへ [BS]".to_string(),
@@ -16533,6 +16543,18 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                                 result = Some(AddressBarNav::AddressInput(
                                                     LocationJumpTarget::Physical(resolved),
                                                 ));
+                                            } else {
+                                                let path =
+                                                    normalize_folder_bar_input_path(&self.address);
+                                                if path
+                                                    .to_str()
+                                                    .is_none_or(|input| !input.trim().is_empty())
+                                                {
+                                                    self.show_feedback_warning(format!(
+                                                        "場所が見つかりません: {}",
+                                                        path.display()
+                                                    ));
+                                                }
                                             }
                                         }
                                     });
@@ -34929,6 +34951,101 @@ mod section207_tests {
                     "actual HistoryBack adoption kind={kind} control={control}"
                 );
             }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn address_missing_drive_enter_notifies_and_preserves_search_or_plain_state() {
+        let missing_drive = std::iter::once(b'Q')
+            .chain((b'A'..=b'Z').rev())
+            .map(|letter| PathBuf::from(format!("{}:\\", letter as char)))
+            .find(|path| !path.exists())
+            .expect("this regression needs one unmounted drive letter");
+        assert_eq!(resolve_folder_bar_nav_path(&missing_drive), None);
+        for kind in [None, Some(0), Some(1), Some(2), Some(3)] {
+            let mut env = match kind {
+                Some(kind) => App::navigation_search_fixture_for_test(kind),
+                None => crate::app::setup_app_for_test(),
+            };
+            only_folder_and_tree(&mut env);
+            env.address = missing_drive.to_string_lossy().into_owned();
+            let current = env.current_folder.clone();
+            let selected = env.selected;
+            let generation = env.items_generation;
+            let history = (
+                env.folder_nav_back_stack.clone(),
+                env.folder_nav_forward_stack.clone(),
+            );
+            let drafts = (
+                env.global_search.metadata_draft.clone(),
+                env.global_search.everything_draft.clone(),
+                env.favsearch.query.clone(),
+                env.tag_view.query.clone(),
+            );
+            let active = (
+                env.global_search.active,
+                env.favsearch.active,
+                env.tag_view.active,
+            );
+            let app = Rc::new(RefCell::new(env));
+            let render = Rc::clone(&app);
+            let candidates = Rc::new(RefCell::new(Vec::new()));
+            let captured = Rc::clone(&candidates);
+            let fonts = Cell::new(false);
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(1200.0, 320.0))
+                .build_ui(move |root_ui| {
+                    let ctx = root_ui.ctx().clone();
+                    crate::ime_focus::install_ime_input_policy(&ctx);
+                    if !fonts.replace(true) {
+                        crate::ui_fonts::configure_fonts(&ctx);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    let mut app = render.borrow_mut();
+                    app.update_ime_state(&ctx);
+                    if let Some(candidate) = app.render_toolbar(root_ui).1 {
+                        captured.borrow_mut().push(candidate);
+                    }
+                });
+            harness.run();
+            harness
+                .get_by_role(egui::accesskit::Role::TextInput)
+                .click();
+            harness.run();
+            harness.key_press(egui::Key::Enter);
+            harness.run();
+            let app = app.borrow();
+            assert!(candidates.borrow().is_empty());
+            assert_eq!(app.current_folder, current);
+            assert_eq!(app.selected, selected);
+            assert_eq!(app.items_generation, generation);
+            assert_eq!(app.folder_nav_back_stack, history.0);
+            assert_eq!(app.folder_nav_forward_stack, history.1);
+            assert_eq!(
+                (
+                    app.global_search.active,
+                    app.favsearch.active,
+                    app.tag_view.active
+                ),
+                active
+            );
+            assert_eq!(
+                (
+                    app.global_search.metadata_draft.clone(),
+                    app.global_search.everything_draft.clone(),
+                    app.favsearch.query.clone(),
+                    app.tag_view.query.clone()
+                ),
+                drafts
+            );
+            assert_eq!(app.address, missing_drive.to_string_lossy());
+            assert_eq!(
+                app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+                Some(format!("場所が見つかりません: {}", missing_drive.display()).as_str()),
+                "kind={kind:?}: an unresolved drive must report failure"
+            );
         }
     }
 

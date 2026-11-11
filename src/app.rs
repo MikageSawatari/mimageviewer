@@ -25045,18 +25045,45 @@ impl App {
         &mut self,
         nav: crate::ui_main::AddressBarNav,
     ) -> bool {
+        if matches!(
+            nav,
+            crate::ui_main::AddressBarNav::HistoryBack
+                | crate::ui_main::AddressBarNav::HistoryForward
+                | crate::ui_main::AddressBarNav::SavedGroupReady(_)
+        ) {
+            return false;
+        }
+        self.dispatch_main_input_nav_immediate(nav, true);
+        true
+    }
+
+    /// Total dispatch for main-input early tails. The close-origin flag preserves
+    /// collection return semantics and each old consumer's cleanup contract.
+    pub(super) fn dispatch_main_input_nav_immediate(
+        &mut self,
+        nav: crate::ui_main::AddressBarNav,
+        fullscreen_close_origin: bool,
+    ) {
         match nav {
+            crate::ui_main::AddressBarNav::Favorite(path) => {
+                if let Some(path) = self.dispatch_favorite_navigation(path) {
+                    self.dispatch_main_input_nav_immediate(
+                        crate::ui_main::AddressBarNav::Direct(
+                            path,
+                            StartupListIntent::ExplicitList,
+                        ),
+                        fullscreen_close_origin,
+                    );
+                }
+            }
             crate::ui_main::AddressBarNav::AddressInput(target) => {
                 self.dispatch_address_input(target);
-                true
             }
             crate::ui_main::AddressBarNav::LocationJump(target) => {
                 self.dispatch_location_jump(target);
-                true
             }
             crate::ui_main::AddressBarNav::ZipListReturn(plan) => {
                 self.apply_zip_list_return(plan);
-                true
             }
             crate::ui_main::AddressBarNav::Direct(path, restore_intent) => {
                 let outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
@@ -25076,12 +25103,10 @@ impl App {
                         "fullscreen close navigation rejected: {outcome:?}"
                     ));
                 }
-                true
             }
             crate::ui_main::AddressBarNav::GridVirtual(intent) => {
                 self.start_grid_virtual_open(intent);
                 self.clear_pending_folder_nav_steps();
-                true
             }
             crate::ui_main::AddressBarNav::CollectionSource {
                 path,
@@ -25104,7 +25129,6 @@ impl App {
                         "fullscreen collection navigation rejected: {outcome:?}"
                     ));
                 }
-                true
             }
             crate::ui_main::AddressBarNav::RatingSource {
                 owner,
@@ -25112,49 +25136,66 @@ impl App {
                 ..
             } => {
                 self.start_rating_physical_open(owner, restore_intent);
-                true
+                if !fullscreen_close_origin {
+                    self.clear_pending_folder_nav_steps();
+                }
             }
             crate::ui_main::AddressBarNav::DriveList(origin) => {
                 self.enter_drive_list_from_navigation(origin);
-                true
             }
             crate::ui_main::AddressBarNav::ReadingHistoryRootExit => {
                 self.exit_reading_history_root();
-                true
             }
             crate::ui_main::AddressBarNav::ReadingHistory(entrance) => {
                 self.enter_reading_history_with_entrance(entrance);
-                true
             }
             crate::ui_main::AddressBarNav::Bookmarks => {
                 self.enter_bookmark_view();
-                true
             }
             crate::ui_main::AddressBarNav::RatingViewBack => {
                 self.rating_view_parent_nav();
-                true
             }
             crate::ui_main::AddressBarNav::EverythingResults => {
                 self.return_from_everything_child(
                     crate::global_search_ui::EverythingReturn::Results,
                 );
-                true
             }
             crate::ui_main::AddressBarNav::BooksRoot => {
                 self.open_books_root();
-                true
             }
             crate::ui_main::AddressBarNav::Collection(restore) => {
-                self.apply_collection_input_nav(restore, true);
-                true
+                self.apply_collection_input_nav(restore, fullscreen_close_origin);
             }
             crate::ui_main::AddressBarNav::CollectionOpen(id) => {
                 self.open_collection_grid_from_navigation(id);
-                true
             }
-            crate::ui_main::AddressBarNav::SavedGroupReady(_) => false,
-            crate::ui_main::AddressBarNav::HistoryBack
-            | crate::ui_main::AddressBarNav::HistoryForward => false,
+            crate::ui_main::AddressBarNav::SavedGroupReady(id) => self.adopt_saved_group_ready(id),
+            crate::ui_main::AddressBarNav::HistoryBack => {
+                if let Some(path) =
+                    self.dispatch_main_folder_history_input(FolderHistoryDirection::Back)
+                {
+                    self.dispatch_main_input_nav_immediate(
+                        crate::ui_main::AddressBarNav::Direct(
+                            path,
+                            StartupListIntent::ExplicitList,
+                        ),
+                        fullscreen_close_origin,
+                    );
+                }
+            }
+            crate::ui_main::AddressBarNav::HistoryForward => {
+                if let Some(path) =
+                    self.dispatch_main_folder_history_input(FolderHistoryDirection::Forward)
+                {
+                    self.dispatch_main_input_nav_immediate(
+                        crate::ui_main::AddressBarNav::Direct(
+                            path,
+                            StartupListIntent::ExplicitList,
+                        ),
+                        fullscreen_close_origin,
+                    );
+                }
+            }
         }
     }
 
@@ -101002,35 +101043,12 @@ impl App {
                 // この経路では menubar / toolbar を描画していないので必ず None で OK
                 // (= 競合なし、folder_nav が常に勝つ)。`keyboard_nav` / `gamepad_nav` は
                 // 早期 return より前で確定済みなので使える。
-                if let Some(crate::ui_main::AddressBarNav::RatingSource {
-                    owner,
-                    restore_intent,
-                    ..
-                }) = gamepad_nav.as_ref()
-                {
-                    self.start_rating_physical_open(owner.clone(), restore_intent.clone());
-                    self.clear_pending_folder_nav_steps();
-                } else if let Some(crate::ui_main::AddressBarNav::GridVirtual(intent)) = gamepad_nav
-                {
-                    self.start_grid_virtual_open(intent);
-                    self.clear_pending_folder_nav_steps();
-                } else if let Some(crate::ui_main::AddressBarNav::Direct(path, restore_intent)) =
-                    gamepad_nav
-                {
-                    let _ = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
-                        path,
-                        false,
-                        OpenRequestOwner::Navigation,
-                        restore_intent,
-                    );
-
-                    self.clear_pending_folder_nav_steps();
-                } else if let Some(result) = self.poll_folder_nav() {
-                    let folder_nav_wins = keyboard_nav.is_none();
-                    if folder_nav_wins {
-                        self.apply_folder_nav_result(ctx, result);
-                    }
-                }
+                self.dispatch_native_backdrop_navigation(
+                    ctx,
+                    keyboard_nav,
+                    keyboard_nav_from_fullscreen_close,
+                    gamepad_nav,
+                );
                 // Do not paint the main viewport black while the native video
                 // backdrop is taking over. If the main HWND transiently leaks
                 // above the fullscreen backdrop, a black client area makes the
@@ -104282,14 +104300,20 @@ mod folder_pane_refresh_tests;
 mod grid_cursor_tests;
 #[cfg(test)]
 mod material_demand_revision_tests;
+#[cfg(test)]
+mod menubar_search_jump_tests;
 #[cfg(all(test, windows))]
 pub(crate) mod multiwindow_scenario_tests;
+#[cfg(test)]
+mod native_backdrop_navigation_tests;
 #[cfg(test)]
 mod original_material_tests;
 #[cfg(test)]
 pub(crate) mod paged_prefetch_tests;
 #[cfg(test)]
 pub(crate) mod paint_record_test_support;
+#[cfg(test)]
+mod search_nav_pane_frame_tests;
 #[cfg(test)]
 mod section375_c1_tests;
 #[cfg(test)]

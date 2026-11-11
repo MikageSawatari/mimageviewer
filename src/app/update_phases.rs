@@ -9,7 +9,7 @@ use super::*;
 
 /// Navigation values captured during this root UI pass; never retained by App.
 pub(super) struct MainFrameNavigation {
-    pub(super) fav_nav: Option<PathBuf>,
+    pub(super) fav_nav: Option<crate::ui_main::LocationJumpTarget>,
     pub(super) toolbar_fav_nav: Option<PathBuf>,
     pub(super) fullscreen_close_nav: Option<crate::ui_main::AddressBarNav>,
     pub(super) keyboard_nav: Option<crate::ui_main::AddressBarNav>,
@@ -23,6 +23,25 @@ pub(super) struct MainFrameNavigation {
 }
 
 impl App {
+    /// Native video skips chrome/grid drawing, not main navigation dispatch.
+    /// Keep its existing gamepad precedence and immediate Direct loader, while
+    /// dispatching every payload rather than dropping unfamiliar variants.
+    pub(super) fn dispatch_native_backdrop_navigation(
+        &mut self,
+        ctx: &egui::Context,
+        keyboard_nav: Option<crate::ui_main::AddressBarNav>,
+        keyboard_nav_from_fullscreen_close: bool,
+        gamepad_nav: Option<crate::ui_main::AddressBarNav>,
+    ) {
+        if let Some(nav) = gamepad_nav {
+            self.dispatch_main_input_nav_immediate(nav, false);
+        } else if let Some(nav) = keyboard_nav {
+            self.dispatch_main_input_nav_immediate(nav, keyboard_nav_from_fullscreen_close);
+        } else if let Some(result) = self.poll_folder_nav() {
+            self.apply_folder_nav_result(ctx, result);
+        }
+    }
+
     // Worker adoption can enter a UI-bound presentation continuation; see the ledger.
     pub(super) fn render_update_begin(&mut self, _ctx: &egui::Context) {
         self.speculative_gpu_frame
@@ -1233,19 +1252,23 @@ impl App {
             let mut navigate_owner = OpenRequestOwner::Navigation;
             let mut navigate_restore_intent = StartupListIntent::ExplicitList;
             let mut navigate_stage = MainListRequestStage::Admission;
-            let navigate = if let Some(path) = fav_nav {
-                Some(path)
-            } else if let Some(path) = toolbar_fav_nav {
-                // Keep menubar favorites and plain toolbar navigation on their
-                // existing Direct path; only the winning toolbar search jump exits.
-                if self.global_search.active || self.favsearch.active || self.tag_view.active {
-                    self.dispatch_location_jump(crate::ui_main::LocationJumpTarget::Physical(path));
-                    None
-                } else {
-                    Some(path)
+            let navigate = if let Some(target) = fav_nav {
+                match target {
+                    crate::ui_main::LocationJumpTarget::Physical(path) => {
+                        self.dispatch_favorite_navigation(path)
+                    }
+                    target => {
+                        self.dispatch_address_input(target);
+                        None
+                    }
                 }
+            } else if let Some(path) = toolbar_fav_nav {
+                self.dispatch_favorite_navigation(path)
             } else if let Some(nav) = input_nav.or(address_nav) {
                 match nav {
+                    crate::ui_main::AddressBarNav::Favorite(path) => {
+                        self.dispatch_favorite_navigation(path)
+                    }
                     crate::ui_main::AddressBarNav::AddressInput(target) => {
                         self.dispatch_address_input(target);
                         None
@@ -1351,6 +1374,9 @@ impl App {
                     } => self
                         .open_grid_container_with_mode(ctx, idx, mode, "grid_context_menu")
                         .and_then(|nav| match nav {
+                            crate::ui_main::AddressBarNav::Favorite(path) => {
+                                self.dispatch_favorite_navigation(path)
+                            }
                             crate::ui_main::AddressBarNav::AddressInput(target) => {
                                 self.dispatch_address_input(target);
                                 None
@@ -1523,6 +1549,9 @@ impl App {
                 }
             } else {
                 match grid_nav {
+                    Some(crate::ui_main::AddressBarNav::Favorite(path)) => {
+                        self.dispatch_favorite_navigation(path)
+                    }
                     Some(crate::ui_main::AddressBarNav::AddressInput(target)) => {
                         self.dispatch_address_input(target);
                         None

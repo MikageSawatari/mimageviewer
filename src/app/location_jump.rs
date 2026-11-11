@@ -56,6 +56,20 @@ impl App {
         }
     }
 
+    /// Search favorites are consumed here; Plain paths continue through the caller's
+    /// existing Direct consumer (including the native/immediate loader and cleanup).
+    pub(crate) fn dispatch_favorite_navigation(
+        &mut self,
+        path: std::path::PathBuf,
+    ) -> Option<std::path::PathBuf> {
+        if self.global_search.active || self.favsearch.active || self.tag_view.active {
+            self.dispatch_location_jump(LocationJumpTarget::Physical(path));
+            None
+        } else {
+            Some(path)
+        }
+    }
+
     pub(crate) fn dispatch_location_jump(&mut self, target: LocationJumpTarget) {
         if self.location_jump_admission_blocked() {
             return;
@@ -1123,6 +1137,120 @@ mod tests {
         }
     }
 
+    fn favorite_handler_candidate(
+        app: &mut App,
+        ctx: &egui::Context,
+        entrance: usize,
+    ) -> AddressBarNav {
+        use crate::keymap::KeyAction;
+        use crate::ring_shortcut::{
+            GamepadFavoritePickerState, GamepadFavoritePickerTab, GamepadListCursor, RingActionId,
+            RingShortcutContext,
+        };
+        match entrance {
+            0..=2 => app.apply_location_navigation_key_action(
+                ctx,
+                [
+                    KeyAction::GridOpenFavorite1,
+                    KeyAction::GridFavoritePrev,
+                    KeyAction::GridFavoriteNext,
+                ][entrance],
+                "favorite-test",
+            ),
+            3 => app.apply_ring_action(
+                ctx,
+                RingShortcutContext::Grid,
+                RingActionId::OpenFavorite1,
+                "favorite-test",
+            ),
+            _ => {
+                app.gamepad_favorite_picker = Some(GamepadFavoritePickerState {
+                    tab: GamepadFavoritePickerTab::Favorites,
+                    favorites: GamepadListCursor::new(0),
+                    smart_folders: GamepadListCursor::new(0),
+                });
+                app.confirm_gamepad_favorite_picker(ctx)
+            }
+        }
+        .expect("registered favorite handler must produce a candidate")
+    }
+
+    #[test]
+    fn favorite_key_ring_and_gamepad_handlers_exit_each_search_only_after_success() {
+        for kind in 0..4 {
+            for entrance in 0..5 {
+                for fail in [false, true] {
+                    let mut app = search_fixture(kind);
+                    let origin = app.tmp.path().join("pre-search");
+                    std::fs::create_dir_all(&origin).unwrap();
+                    let target = app.tmp.path().join("handler-favorite");
+                    if !fail {
+                        std::fs::create_dir(&target).unwrap();
+                    }
+                    app.settings.favorites = vec![crate::settings::FavoriteEntry::new(
+                        "test".into(),
+                        target.clone(),
+                    )];
+                    let source = user_navigation_source_state(&app);
+                    let ctx = egui::Context::default();
+                    let candidate = favorite_handler_candidate(&mut app, &ctx, entrance);
+                    assert!(matches!(&candidate, AddressBarNav::Favorite(path) if path == &target));
+                    assert_search_active(&app, kind);
+                    let mut frame = toolbar_favorite_frame(PathBuf::new());
+                    frame.toolbar_fav_nav = None;
+                    frame.gamepad_nav = Some(candidate);
+                    app.post_render_main_navigation(&ctx, frame);
+                    if fail {
+                        settle_location_jump(&mut app, |app| {
+                            app.folder_pane_open_pending.is_none()
+                        });
+                        assert_eq!(
+                            user_navigation_source_state(&app),
+                            source,
+                            "kind={kind} entrance={entrance}"
+                        );
+                        assert_search_active(&app, kind);
+                        assert!(app.fs_feedback_toast.is_some());
+                    } else {
+                        finish_toolbar_jump_and_go_back(&mut app, &target, &origin);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn favorite_typed_dispatch_rechecks_modal_snapshot_and_plain_immediate() {
+        for kind in 0..4 {
+            for block in 0..3 {
+                let mut app = search_fixture(kind);
+                let target = app.tmp.path().join("blocked-favorite");
+                std::fs::create_dir(&target).unwrap();
+                let candidate = AddressBarNav::Favorite(target);
+                match block {
+                    0 => app.show_delete_confirm = true,
+                    1 => app.show_preferences = true,
+                    _ => app.toggle_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed),
+                }
+                let source = user_navigation_source_state(&app);
+                assert!(app.apply_fullscreen_close_nav_immediate(candidate));
+                assert_eq!(user_navigation_source_state(&app), source);
+                assert!(app.folder_pane_open_pending.is_none());
+            }
+        }
+        let mut app = setup_app();
+        let origin = app.tmp.path().join("plain-origin");
+        let target = app.tmp.path().join("plain-favorite");
+        std::fs::create_dir(&origin).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        app.current_folder = Some(origin);
+        app.top_level_grid_view
+            .replace_surface(TopLevelGridSurface::Folder);
+        assert!(app.apply_fullscreen_close_nav_immediate(AddressBarNav::Favorite(target.clone())));
+        settle_location_jump(&mut app, |app| app.current_folder.as_ref() == Some(&target));
+        assert!(app.folder_pane_open_pending.is_none());
+    }
+
     #[test]
     fn toolbar_favorite_plain_path_keeps_the_existing_direct_navigation() {
         for toolbar in [false, true] {
@@ -1161,10 +1289,6 @@ mod tests {
                 for path in [&menu, &toolbar, &folder] {
                     std::fs::create_dir(path).unwrap();
                 }
-                let main_history_heads = (
-                    app.folder_history_back_entry().cloned(),
-                    app.folder_history_forward_entry().cloned(),
-                );
                 let (tx, rx) = std::sync::mpsc::channel();
                 tx.send(super::super::FolderNavThreadResult {
                     target: Some(super::super::FolderNavTarget {
@@ -1187,7 +1311,7 @@ mod tests {
                 frame.keyboard_nav =
                     Some(AddressBarNav::LocationJump(LocationJumpTarget::DriveList));
                 if winner == 0 {
-                    frame.fav_nav = Some(menu.clone());
+                    frame.fav_nav = Some(LocationJumpTarget::Physical(menu.clone()));
                 }
                 if winner == 2 {
                     frame.toolbar_fav_nav = None;
@@ -1195,18 +1319,9 @@ mod tests {
                 app.post_render_main_navigation(&egui::Context::default(), frame);
                 match winner {
                     0 => {
-                        settle_location_jump(&mut app, |app| {
-                            app.current_folder.as_ref() == Some(&menu)
-                        });
-                        assert_search_active(&app, kind);
-                        assert_eq!(
-                            (
-                                app.folder_history_back_entry().cloned(),
-                                app.folder_history_forward_entry().cloned()
-                            ),
-                            main_history_heads,
-                            "menubar favorites keep transparent-search history"
-                        );
+                        complete_physical_jump(&mut app, &menu);
+                        let origin = app.tmp.path().join("pre-search");
+                        assert_search_dismissed_with_history(&app, origin);
                     }
                     1 => {
                         assert_eq!(app.folder_pane_open_pending.as_ref().unwrap().path, toolbar);

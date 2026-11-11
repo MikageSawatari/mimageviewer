@@ -341,6 +341,43 @@ impl App {
             && !self.folder_pane_disabled()
     }
 
+    fn consume_folder_pane_fixed_key(
+        &self,
+        ctx: &egui::Context,
+        key: crate::keymap::KeyName,
+    ) -> bool {
+        use crate::keymap::{Chord, KeyName};
+
+        let mut consumed = false;
+        // The old consume_key(NONE, key) accepts extra Shift/Alt and coalesces
+        // every matching press into one tree action. Claim both native and egui
+        // queues here before an Enter can transfer focus back to the grid.
+        for physical_key in [
+            Some(key),
+            (key == KeyName::Enter).then_some(KeyName::NumpadEnter),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for shift in [false, true] {
+                for alt in [false, true] {
+                    while self
+                        .keymap
+                        .consume_fixed_chord(ctx, Chord::new(false, shift, alt, physical_key))
+                    {
+                        consumed = true;
+                    }
+                }
+            }
+        }
+        if consumed && let Some(logical_key) = key.to_egui() {
+            // egui folds NumpadEnter into Enter. Its physical native slot was
+            // claimed above; retire that logical twin at the same boundary.
+            ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, logical_key));
+        }
+        consumed
+    }
+
     pub(crate) fn handle_folder_pane_keyboard(
         &mut self,
         ctx: &egui::Context,
@@ -357,20 +394,18 @@ impl App {
         }
 
         if self.folder_pane.has_focus {
-            let key = ctx.input_mut(|i| {
-                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
-                    Some(FolderPaneTreeKey::Up)
-                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
-                    Some(FolderPaneTreeKey::Down)
-                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
-                    Some(FolderPaneTreeKey::Left)
-                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
-                    Some(FolderPaneTreeKey::Right)
-                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
-                    Some(FolderPaneTreeKey::Enter)
-                } else {
-                    None
-                }
+            use crate::keymap::KeyName;
+            let key = [
+                (KeyName::Up, FolderPaneTreeKey::Up),
+                (KeyName::Down, FolderPaneTreeKey::Down),
+                (KeyName::Left, FolderPaneTreeKey::Left),
+                (KeyName::Right, FolderPaneTreeKey::Right),
+                (KeyName::Enter, FolderPaneTreeKey::Enter),
+            ]
+            .into_iter()
+            .find_map(|(key, action)| {
+                self.consume_folder_pane_fixed_key(ctx, key)
+                    .then_some(action)
             });
             if let Some(key) = key {
                 if let Some(FolderPaneCommand::Open(path)) = self.folder_pane.handle_tree_key(key) {
@@ -395,7 +430,7 @@ impl App {
             && !self.favsearch.has_focus
             && !self.global_search.has_focus;
         if esc_to_tree_allowed
-            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            && self.consume_folder_pane_fixed_key(ctx, crate::keymap::KeyName::Esc)
         {
             self.folder_pane.set_focus_tree_at_active();
             return None;

@@ -5480,7 +5480,10 @@ impl App {
         self.sync_native_video_favorite_picker_overlay(ctx);
     }
 
-    fn confirm_gamepad_favorite_picker(&mut self, ctx: &egui::Context) -> Option<AddressBarNav> {
+    pub(super) fn confirm_gamepad_favorite_picker(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Option<AddressBarNav> {
         let picker = self.gamepad_favorite_picker.as_ref()?;
         let tab = picker.tab;
         let selected = picker.active_cursor().selected;
@@ -5515,10 +5518,7 @@ impl App {
                 Some(&format!("path={}", target.display())),
             );
             ctx.request_repaint();
-            return Some(AddressBarNav::Direct(
-                target,
-                crate::app::StartupListIntent::ExplicitList,
-            ));
+            return Some(AddressBarNav::Favorite(target));
         }
         if let Some(definition_id) = smart_folder_target {
             self.bump_input_seq(
@@ -5596,7 +5596,10 @@ impl App {
         ctx.request_repaint();
     }
 
-    fn confirm_gamepad_location_picker(&mut self, ctx: &egui::Context) -> Option<AddressBarNav> {
+    pub(super) fn confirm_gamepad_location_picker(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Option<AddressBarNav> {
         let selected = self
             .gamepad_location_picker
             .as_ref()
@@ -7675,10 +7678,7 @@ impl App {
         }
         self.bump_input_seq(source, Some(&format!("favorite_slot={slot}")));
         ctx.request_repaint();
-        Some(AddressBarNav::Direct(
-            target,
-            crate::app::StartupListIntent::ExplicitList,
-        ))
+        Some(AddressBarNav::Favorite(target))
     }
 
     fn apply_ring_drive_letter(
@@ -11149,7 +11149,7 @@ mod tests {
     }
 
     #[test]
-    fn location_jump_plain_inputs_use_same_transport_and_favorites_keep_direct_navigation() {
+    fn location_jump_plain_inputs_use_same_transport_and_favorites_defer_search_decision() {
         use crate::ui_main::{AddressBarNav, LocationJumpTarget};
         let ctx = egui::Context::default();
         let mut app = crate::app::tests::phase_c_support::setup_app();
@@ -11172,9 +11172,7 @@ mod tests {
             ));
         app.global_search.active = true;
         let nav = app.apply_ring_favorite_slot(&ctx, 1, "test");
-        assert!(
-            matches!(nav, Some(AddressBarNav::Direct(path, crate::app::StartupListIntent::ExplicitList)) if path == target)
-        );
+        assert!(matches!(nav, Some(AddressBarNav::Favorite(path)) if path == target));
         assert!(app.global_search.active);
     }
 
@@ -11833,11 +11831,11 @@ mod tests {
                             },
                         )
                         .unwrap();
-                    let crate::ui_main::AddressBarNav::Direct(path, intent) = nav else {
-                        panic!("favorite confirmation must produce a direct navigation");
+                    let crate::ui_main::AddressBarNav::Favorite(path) = nav else {
+                        panic!("favorite confirmation must produce a favorite navigation");
                     };
                     assert!(app.gamepad_favorite_picker.is_none());
-                    (path, intent)
+                    (path, crate::app::StartupListIntent::ExplicitList)
                 },
             );
         }

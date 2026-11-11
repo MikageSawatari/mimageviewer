@@ -1036,10 +1036,11 @@ fn mixed_path_favorite_direct_navigation_standardizes_input_without_rewriting_sa
         for source in ["menu-toolbar", "gamepad-ring"] {
             assert_mixed_path_favorite_direct_navigation(folder_name, source, |app, ctx| {
                 if source == "menu-toolbar" {
-                    // render_menubar / render_toolbar return this saved copy. App::update
-                    // sends it directly to open_direct_navigation_target, bypassing _owned.
+                    // Plain favorites preserve this saved copy through the shared dispatcher
+                    // before the frame sends it to its existing Direct acceptance call.
                     (
-                        app.settings.favorites[0].path.clone(),
+                        app.dispatch_favorite_navigation(app.settings.favorites[0].path.clone())
+                            .expect("Plain favorites continue through Direct"),
                         StartupListIntent::ExplicitList,
                     )
                 } else {
@@ -1051,10 +1052,14 @@ fn mixed_path_favorite_direct_navigation_standardizes_input_without_rewriting_sa
                             "mixed_favorite_regression",
                         )
                         .unwrap();
-                    let crate::ui_main::AddressBarNav::Direct(path, intent) = nav else {
-                        panic!("favorite input must produce a direct navigation");
+                    let crate::ui_main::AddressBarNav::Favorite(path) = nav else {
+                        panic!("favorite input must produce a favorite navigation");
                     };
-                    (path, intent)
+                    (
+                        app.dispatch_favorite_navigation(path)
+                            .expect("Plain favorites continue through Direct"),
+                        StartupListIntent::ExplicitList,
+                    )
                 }
             });
         }
@@ -29736,7 +29741,8 @@ mod phase_c_folder_nav_history_tests {
         app.sync_folder_pane_state(&ctx);
         app.folder_pane.set_cursor(directory.clone());
         app.folder_pane.set_focus_tree();
-        // Real pane keyboard gate consumes Enter and starts the real directory scan.
+        // The real root pass decides keyboard ownership before the fixed pane
+        // consumer claims Enter and starts the directory scan.
         ctx.run_pass(
             egui::RawInput {
                 events: vec![egui::Event::Key {
@@ -29749,7 +29755,7 @@ mod phase_c_folder_nav_history_tests {
                 ..Default::default()
             },
             |ctx| {
-                assert!(app.handle_folder_pane_keyboard(ctx).is_none());
+                assert!(app.input_root_keyboard(ctx).0.is_none());
             },
         )
         .drop_without_applying_deltas();

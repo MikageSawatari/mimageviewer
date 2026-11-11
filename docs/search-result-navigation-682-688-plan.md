@@ -777,6 +777,222 @@ Cargo は `MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=4`。
 - `.\scripts\build-dev.ps1`: 成功 (`target\dev-runtime\mimageviewer-core.exe`、2026-11-11 20:32)。
 - 実機確認の記録はまだ無い。
 
+### 8.11 §11 の実装・検証記録 (未コミット)
+
+着手前 source 調査で、typed お気に入りには通常の 4 consumer に加えて native backdrop 内の consumer も必要と判明し、
+一度設計担当へ報告した。**設計担当・利用者の判断で、この経路は detached ではなく main frame の navigation consumer であり、
+凍結対象外、§11 に含めて実装する**と確定して再開した。LocationJump 等の既存の取りこぼしも含めて全 variant を棚卸しした。
+以下は source / headless test の記録であり、サブ PC 担当以外の実機観測を主張しない。
+
+#### 着手前調査と main consumer の修正
+
+- `app.rs:100365` の `poll_video_presentation_transition` は gamepad dispatch (`100747`) より前。
+  お気に入り確定は `gamepad_input.rs:5509` で `close_fullscreen()` を呼ぶが、表示切替中は
+  `app.rs:82313` が `TerminalClose` を積んで戻り、その場で `fullscreen_idx` を消さない。
+- 実 teardown は `native_video.rs:3111` の `TerminalSessionClose` effect。
+  その後の fullscreen native render (`ui_fullscreen.rs:27516`) はこの effect を処理しない。
+  Fullscreen → MainWindow 切替中なら、Video / fullscreen index が残り
+  `native_video.rs:4826` の backdrop 判定は true になり得る。
+- この先の `app.rs:101017` は Direct の partial consumer。新しい `AddressBarNav::Favorite` を通常 4 箇所だけに足すと、
+  ここで要求が消える。したがって「producer が close するので native consumer には到達しない」という前提は成立しない。
+  これは source による反証であり、サブ PC の新しい観測や本セッションの native 実行結果ではない。
+- 最小案は、この既存 consumer に Favorite の arm を足し、同じ favorite dispatcher を呼ぶだけ。
+  dispatcher は検索中なら既存 LocationJump、検索外なら path を旧 Direct consumer に返す。
+  immediate / native の Plain は従来の `_owned` loader と `clear_pending_folder_nav_steps()` を保つ。
+  viewport 述語・lifecycle・registry・表示切替 reducer / effects の変更や、新しい App 状態は不要。
+  この native 経路の consumer 完備は上記判断で承認済み。実装は variant ごとの if-let を廃し、
+  `dispatch_native_backdrop_navigation` → exhaustive な `dispatch_main_input_nav_immediate` に集約した。
+  通常の fullscreen-close の即時 dispatcher も同じ本体へ委譲する。native の旧 gamepad 優先順位は保ち、
+  gamepad が無い場合の keyboard、どちらも無い場合の folder worker 結果も処理する。
+  native player を作らない Video metadata fixture で、切替中の real picker 確定・backdrop 判定・実 consumer を検査する。
+
+通常のメニュー・toolbar・key/ring/gamepad お気に入りは共通 `dispatch_favorite_navigation` を通る。
+検索中だけ既存 `dispatch_location_jump(Physical)` の受付・成功時終了を使い、Plain は path を各旧 Direct consumer へ返す。
+メニューの返り値は `Option<LocationJumpTarget>`、キー等は `AddressBarNav::Favorite(PathBuf)`。
+本棚 root は描画時 Plain なら旧即時 open、検索中なら BooksRoot の候補を返し、dispatch 時に再判定する。
+これにより検索なしの同一 frame のメニュー順序も変更しない。新しい App pending / bool / 次回採用フラグはない。
+
+#### native main consumer の全 variant 棚卸し
+
+新しい `Favorite` を含めて `AddressBarNav` は 20 variant。native の consumer は wildcard / 未知型の破棄ではなく、
+全 variant を処理する `dispatch_main_input_nav_immediate` を呼ぶ。既存の gamepad 優先順位を保ち、keyboard 勝利時は
+既存 `keyboard_nav_from_fullscreen_close` も保持する。下記 source 行は c76356bac 基準、Favorite は今回の新型。
+GridOnly の入口も同じ frame / batch の viewer 変更があり得るため、ここでは型を理由に破棄しない。
+
+| Variant | gamepad_nav への producer / 文脈 | 共通 dispatcher での処理 |
+| --- | --- | --- |
+| Favorite | favorite picker South (`gamepad_input.rs:5370,5483,5518`)、West ring → slot (`4927,7464,8069,7652`)。番号 / 前後キーも同 helper | `dispatch_favorite_navigation`。検索中は LocationJump、Plain は旧 Direct `_owned` + steps 消去 |
+| LocationJump | location picker South (`5535,5599,5634`)、drive / place ring (`7698,7720,7756,7791,8085`)。全 ring 文脈 | `dispatch_location_jump`。§2.1 で型付き化した既存場所入力の native 取りこぼしも解消 |
+| Direct | grid South → `collection_grid.rs:1435,1480`、grid East / parent → `grid_parent.rs:585`、smart/subfolder parent | 旧 Navigation `_owned` loader + steps 消去 |
+| GridVirtual | grid South、GridOpenSelectedAsPage/List ring → `app.rs:61733` / `collection_grid.rs:1456` | `start_grid_virtual_open` + steps 消去 |
+| CollectionSource | grid South (`collection_grid.rs:1469`)、grid East parent (`1244`) | 旧 CollectionGridPhysical `_owned` loader + steps 消去 |
+| RatingSource | grid South (`collection_grid.rs:1475`) | `start_rating_physical_open`。native の旧 steps 消去も維持 |
+| DriveList | grid East / GridParent ring (`grid_parent.rs:593`) | `enter_drive_list_from_navigation` |
+| ReadingHistory | grid East (`grid_parent.rs:540` → `app.rs:24636,24646`) | `enter_reading_history_with_entrance` |
+| Bookmarks | grid East (`grid_parent.rs:534` → `app.rs:24655,24660`) | `enter_bookmark_view` |
+| ReadingHistoryRootExit | grid East (`grid_parent.rs:568` → `reading_history_origin.rs:237`) | `exit_reading_history_root` |
+| Collection | grid East (`grid_parent.rs:518` → `collection_grid.rs:1256`) | `apply_collection_input_nav`。gamepad は false、keyboard は既存の close-origin を渡す |
+| HistoryBack | 全 ring 文脈 (`ring_shortcut.rs:1481,1507,1549`、`gamepad_input.rs:8335,7624,7643`)、grid East bookmark root (`grid_parent.rs:548`) | `dispatch_main_folder_history_input(Back)`。返り値に物理 path があれば旧 Direct へ渡す |
+| HistoryForward | 全 ring 文脈 (`gamepad_input.rs:8336,7624,7641`) | 同じ共通履歴受付 (Forward) |
+| ZipListReturn | gamepad_nav の直接 producer はない。viewer East / CloseFullscreen は pending close → fullscreen_close_nav (`close_return.rs:361,416`) | 受けた場合も `apply_zip_list_return` で処理 |
+| EverythingResults | 直接 producer なし、viewer close の帰路 (`close_return.rs:370`) | `return_from_everything_child(Results)` |
+| RatingViewBack | 直接 producer なし、grid East はその場で parent 処理し None、viewer close の帰路 (`close_return.rs:382`) | `rating_view_parent_nav` |
+| BooksRoot | raw variant の gamepad producer なし。location picker / ring は LocationJump(BooksRoot) | `open_books_root` |
+| AddressInput | gamepad producer なし、address Enter (`ui_main.rs:16505`) | `dispatch_address_input` |
+| CollectionOpen | gamepad / ring producer なし、keyboard saved-group (`app.rs:59245` → `saved_group_actions.rs:456`) | `open_collection_grid_from_navigation` |
+| SavedGroupReady | gamepad_nav の直接 producer なし、非同期 saved-group ready の別 lane (`saved_group_actions.rs:605,620` → `update_phases.rs:1185`) | `adopt_saved_group_ready` |
+
+Select / Start / analog / marker / ring-settings picker 自身は nav を返さず overlay 等を操作する。
+location picker の Bookmarks はその場で `open_bookmark_browser` を呼び None を返す。
+既存 `apply_fullscreen_close_nav_immediate` の history / saved-group を false で通常 lane へ返す契約は保持するが、
+native はその部分 dispatcher を使わず上表の total 本体を直接呼ぶため、未処理型が無言で落ちる経路はない。
+viewport 述語・lifecycle・registry・reducer / effects は変更していない。
+
+#### 入口の全列挙 (c76356bac の source。今回の変更と残存を区別)
+
+| 利用者入口 | 経路・検索の扱い | §11 の扱い |
+| --- | --- | --- |
+| メニューバーのお気に入り | `ui_main.rs:8836` → fav_nav → Direct、検索を保持していた | 共通 favorite helper、成功時終了 |
+| ツールバーのお気に入り（ボタン・ドロップダウン）・ピン留め本 | `ui_main.rs:12078,12098,12378` → toolbar_fav_nav、検索中は成功時終了 | 同じ favorite helper へ統一 |
+| キーのお気に入り番号・前後 | `gamepad_input.rs:7796,7811,7812,7886` → slot helper (`7652`) → Direct だった | typed Favorite、成功時終了 |
+| リング・マウスボタン・ジェスチャのお気に入り | `gamepad_input.rs:3521,3549,7620,8069` → 同じ slot helper | 同上 |
+| ゲームパッドのお気に入り一覧 | `gamepad_input.rs:5483,5518` → Direct だった | 同上。native consumer も全 variant 対応 |
+| メニューバーの本棚 root | `ui_main.rs:8972` → `app.rs:54910` → load、検索を保持していた | 検索中は typed BooksRoot。Plain は描画中の即 open を維持 |
+| アドレス Enter | `ui_main.rs:16505` → AddressInput | §10 対応済み。未解決時の通知を両モードへ追加 |
+| ペインのクリック・Enter・gamepad・カーソルを動かして閉じる | `app.rs:60845,61089`、`ui_folder_pane.rs:381`、`gamepad_input.rs:9532` | §10 対応済み。固定キーの native / egui 所有を共通化 |
+| 場所▼の通常項目・整理先、場所キー・リング・マウス・gamepad場所一覧 | `ui_main.rs:16123–16228`、`gamepad_input.rs:5618,7698,7720,7756,7791` | 既存 LocationJump、成功時終了 |
+| 実際の親へ・コンテキストの場所へ移動 | `grid_parent.rs:430`、`app.rs:60623` | 既存 ExitTemporaryView、成功時終了 |
+| ファイル → フォルダを開く | `ui_main.rs:8640` → `ui_dialogs/open_folder.rs:102` → `update_phases.rs:1338` の Direct | **検索を保持する残存入口。今回の承認範囲外として変更しない** |
+| 追加先の本を開く・本の番号・本の前後 | `saved_group_actions.rs:132,309,642` → owned scan/load。検索 source lease も受理 | **残存**。本棚 root とは別の操作 |
+| 製本管理の「開く」 | `ui_main.rs:10027–10031` → open_books_root / load_folder | **残存** |
+| 場所▼の「クリップボード取り込み」 | `ui_main.rs:13007,13017` → internal start_folder_pane_open | **残存**。通常場所項目とは別の経路 |
+| 取り込み通知の「表示」 | `app.rs:20398,20417` → internal PaneNavigation | **残存** |
+| アドレス欄の履歴▼ | `ui_main.rs:16368–16403`、検索中 disabled、Direct 候補 | 通常操作では対象外。同じ frame の後発検索との関係は未変更。並行作業領域のため触れない |
+| 作業場所 A/B | `ui_main.rs:15848–15911`、検索中 disabled、workspace switch | 通常操作では対象外。同じ frame の後発検索との関係は未変更 |
+| 履歴 Back / Forward | `app.rs:25301` で active search を拒否 | 検索を残す物理移動には該当しない |
+| ブックマーク一覧とその行 | `app.rs:53762,53779` の一覧採用で検索を終了、その後 `54143` で行を開く | 残存入口には該当しない |
+| 現在の本のブックマーク | `app.rs:53456` | 同じ本のページ移動、場所ジャンプ対象外 |
+| 貼り付け・外部 D&D | `app.rs:63480,52161`、`update_phases.rs:405` | ファイル操作。検索結果の一覧では拒否 |
+| Explorer で表示 | `context_menu.rs:1017` 等 | 外部アプリの操作、内部場所移動なし |
+| Explorer / single-instance Activation からの open | `startup_ops.rs:290,376,1748` → physical loader | 外部 open の別仕様、今回変更しない |
+| 検索結果の本・フォルダ、Everything PhysicalChild、検索内の戻る・親・前後 | `app.rs:35178,35197,38505` 等 | 設計で明示除外。検索の一部として保持 |
+
+残存入口が検索を保持する source 根拠は、通常 physical load の成功尾部
+`app.rs:38505` の `commit_staged_search_navigation_effects()` が active owner を検索の子へ進める点。
+§11.1 の「他にも残っていないか列挙する」はこれらを一括変更する承認とは解釈せず、上表に明記する。
+
+#### ペイン・アドレスの根因と修正
+
+- ペイン: `ui_folder_pane.rs:359–383` は egui の raw consume 後に grid focus へ戻し、
+  `app.rs:59441` の GridOpenSelected が残る native KeySlot twin を読む経路がある。
+  固定キーを既存 `Keymap::consume_fixed_chord` に寄せ、両方の入力を同じ所有境界で消費するよう修正した。
+  旧 egui NONE が許す Shift / Alt、Enter に折り畳まれる NumpadEnter、重複 press の 1 操作化を維持する。
+  main frame の root keyboard → toolbar → grid shortcuts → 実検索バー / pane → grid → nav の順で流す 6 テストを追加した。
+  最初の 5 失敗は root 行を描く fixture の準備段階であり、二重配送の再現の証拠ではない。
+  cursor 初期化と他の一時ディレクトリを含まない pane 専用 root へ fixture を訂正した。
+- アドレス: `ui_main.rs:16531` の resolver が None の場合に else がない。
+  `git show master:src/ui_main.rs` の対応する Direct producer も同じ無通知分岐だった。
+  新規 headless Enter テストの Plain ケースで、候補なし・一覧/選択/履歴を保持・toast=None を確認し、
+  通知を要求する assert は失敗した。検索なしの既存無通知を再現した RED。
+  未解決の非空入力には既存 warning で「場所が見つかりません: …」を出す。引用符付き空白の no-op と、
+  存在しない子から既存の親へ移る resolver の動きは変えない。UI TextEdit / IME と履歴▼は変更しない。
+- `menubar_search_jump_tests.rs` は実メニュークリックから 4 検索の成功 / 失敗、実 Back、Plain の即時 BooksRoot と Direct を検査する 6 件。
+- `native_backdrop_navigation_tests.rs` は real picker 確定で TerminalClose が pending かつ backdrop=true の状態を作り、
+  Favorite / LocationJump の採用・失敗・4 検索、Plain loader cleanup、History Back / Forward を検査する 6 件。
+- `location_jump.rs` に、番号 / 前 / 次キー・ring・gamepad picker の成功 / 失敗を各検索で通す検査と、modal / snapshot / Plain immediate の 2 件を追加。
+- 変更ファイルは製品コード `app.rs` / `ui_main.rs` / `ui_folder_pane.rs` / `app/{gamepad_input,location_jump,update_phases}.rs`、
+  既存 `app/{tests,list_order_everything_tests}.rs`、新規 pane / menubar / native-backdrop の 3 test module、本書、関連仕様 8 件、manual 4 件 (計 24 ファイル)。
+
+#### 変更ファイル 24 件
+
+- `src/app.rs`
+- `src/ui_main.rs`
+- `src/ui_folder_pane.rs`
+- `src/app/gamepad_input.rs`
+- `src/app/location_jump.rs`
+- `src/app/update_phases.rs`
+- `src/app/tests.rs`
+- `src/app/list_order_everything_tests.rs`
+- `src/app/search_nav_pane_frame_tests.rs`
+- `src/app/menubar_search_jump_tests.rs`
+- `src/app/native_backdrop_navigation_tests.rs`
+- `docs/architecture-overview.md`
+- `docs/everything-search-plan.md`
+- `docs/key-customization-impl-plan.md`
+- `docs/keymap-spec.md`
+- `docs/list-order-book-navigation-plan.md`
+- `docs/next-release-backlog.md`
+- `docs/search-architecture.md`
+- `docs/search-result-navigation-682-688-plan.md`
+- `docs/spec.md`
+- `htdocs/mimageviewer/manual/search.html`
+- `htdocs/mimageviewer/manual/shortcuts.html`
+- `htdocs/mimageviewer/manual/grid.html`
+- `htdocs/mimageviewer/manual/gamepad.html`
+
+
+#### 新規テスト 21 件の一覧
+
+| File | Test |
+| --- | --- |
+| `src/app/search_nav_pane_frame_tests.rs` | `search_nav_pane_frame_metadata_enter_opens_tree_target` |
+| `src/app/search_nav_pane_frame_tests.rs` | `search_nav_pane_frame_everything_enter_opens_tree_target` |
+| `src/app/search_nav_pane_frame_tests.rs` | `search_nav_pane_frame_favorite_search_enter_opens_tree_target` |
+| `src/app/search_nav_pane_frame_tests.rs` | `search_nav_pane_frame_tag_enter_opens_tree_target` |
+| `src/app/search_nav_pane_frame_tests.rs` | `search_nav_pane_frame_plain_enter_opens_tree_target` |
+| `src/app/search_nav_pane_frame_tests.rs` | `search_nav_pane_frame_enter_preserves_modifiers_keypad_and_coalescing` |
+| `src/app/menubar_search_jump_tests.rs` | `menubar_favorite_each_search_adopts_then_real_back_returns_before_search` |
+| `src/app/menubar_search_jump_tests.rs` | `menubar_books_root_each_search_adopts_then_real_back_returns_before_search` |
+| `src/app/menubar_search_jump_tests.rs` | `menubar_missing_favorite_each_search_keeps_results_selection_and_origin` |
+| `src/app/menubar_search_jump_tests.rs` | `menubar_failed_books_root_each_search_keeps_results_selection_and_origin` |
+| `src/app/menubar_search_jump_tests.rs` | `menubar_plain_books_root_opens_during_render_without_deferred_candidate` |
+| `src/app/menubar_search_jump_tests.rs` | `menubar_plain_favorite_uses_existing_direct_navigation_and_history` |
+| `src/app/native_backdrop_navigation_tests.rs` | `native_backdrop_gamepad_favorite_each_search_adopts_and_returns_before_search` |
+| `src/app/native_backdrop_navigation_tests.rs` | `native_backdrop_gamepad_missing_favorite_each_search_preserves_source` |
+| `src/app/native_backdrop_navigation_tests.rs` | `native_backdrop_gamepad_location_drive_list_and_physical_exit_each_search` |
+| `src/app/native_backdrop_navigation_tests.rs` | `native_backdrop_gamepad_vanished_location_each_search_preserves_source` |
+| `src/app/native_backdrop_navigation_tests.rs` | `native_backdrop_plain_favorite_and_direct_keep_immediate_loader_cleanup` |
+| `src/app/native_backdrop_navigation_tests.rs` | `native_backdrop_history_back_and_forward_are_consumed` |
+| `src/app/location_jump.rs` | `favorite_key_ring_and_gamepad_handlers_exit_each_search_only_after_success` |
+| `src/app/location_jump.rs` | `favorite_typed_dispatch_rechecks_modal_snapshot_and_plain_immediate` |
+| `src/ui_main.rs` | `address_missing_drive_enter_notifies_and_preserves_search_or_plain_state` |
+
+
+#### 既存テストを変更した理由 (削除・弱化なし)
+
+1. `toolbar_favorite_priority_keeps_menubar_then_toolbar_then_keyboard_ahead_of_folder_navigation`: menubar が勝つ優先順位は保持し、§11 で承認された検索終了を期待する。旧「検索を残す」assert だけを成功採用後の終了 / 検索前 history に変更した。
+2. `location_jump_plain_inputs_use_same_transport_and_favorites_keep_direct_navigation` → `...favorites_defer_search_decision`: favorite producer の型を Favorite に変更したため。dispatch 前に検索を閉じない assert は維持。
+3. `mixed_path_favorite_picker_direct_navigation_preserves_saved_record`: 新しい Favorite から path を取り出し、既存の ExplicitList intent と旧 Plain path 検査を維持。混在表記や拡張子付き実フォルダの assert は変更しない。
+4. `list_order_everything_menubar_favorite_physical_book_reports_unavailable_from_real_key_handler` → `...folder_dialog_physical_book...`: menubar は検索を終えるため、検索を保持する同じ source 状態を作る範囲外の FileOpenFolder の実 frame consumer へ fixture を移した。Root / Child・ZIP / 画像フォルダ・上下の全 assert を維持。
+5. `list_order_everything_retained_parent_favorite_book_reaches_boundary_notice_policy` → `...retained_parent_folder_dialog_book...`: 同じ共通 fixture の入口変更。Edge と表示 ON/OFF の検査は維持。
+6. `list_order_everything_retained_parent_favorite_current_book_reports_its_nested_result_row` → `...retained_parent_folder_dialog_current_book...`: 同じ入口変更。基準 A→B・index・同じ本の Info・採用後の全 assert は維持。
+7. `mixed_path_favorite_direct_navigation_standardizes_input_without_rewriting_saved_record`: 広い focused で旧 Direct marker の期待が残っていたことを検出。ring の候補を Favorite として受け、Plain は共通 helper の返す path を旧 Direct 検査へ渡す。menu / toolbar の保存 path も共通 helper を通す。保存表記・正規化・拡張子付き実フォルダ・分類・設定を書き換えない全検査を維持。
+8. `section1339_pane_enter_scan_crosses_real_search_refresh`: 固定キーが共通 keymap owner を使うため、裸の pane handler 呼出しでは App pass の owner cache がなく fail-closed になる (keyboard_input.rs の既存契約)。本番の `input_root_keyboard` から Enter を流すよう fixture を訂正した。再公開前後の同一 navigation / current / cancel=false、実 frame 採用・favsearch 終了・本の行・Back / Forward の全検査は維持。新しい検索の取消や製品の採用不良ではない。
+
+独立 Sol / xhigh の source review は ACCEPT。close-origin 引継ぎと native テストでの次 frame の transition poll を指摘され、
+既存 flag の輸送と実順序の poll / terminal-effect 検査を補い、再確認で未解決 P1〜P3 はなかった。実行結果は下記で区別する。
+
+Cargo は `MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=4`。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(search_nav_pane_frame) \| test(address_missing_drive_enter)' --test-threads 2 --no-fail-fast` (初回) | exit 101、テスト未実行。fixture の不存在 zip_context と UI test の private snapshot field 参照を訂正。`target/search-nav-section11-red.log` |
+| 同じコマンド (compile 訂正後) | exit 100、6 実行 / 0 成功 / 6 失敗、17,277 skip、1.730s、compile 3m27s。pane 5 件は fixture、address 1 件は Plain の無通知 RED。`target/search-nav-section11-red-corrected.log` |
+| `cargo fmt` (workspace、引数なし、停止 checkpoint の最後) / `cargo fmt --check` | ともに exit 0。未登録の menubar test draft は compile / test 対象にしていない。 |
+| `git -c core.safecrlf=false diff --check` | exit 0。tracked 15 件 + 新規 draft test 2 件、製品ロジックの変更なし。 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(search_nav_pane_frame) \| test(address_missing_drive_enter) \| test(menubar_) \| test(favorite_key_ring_and_gamepad_handlers) \| test(favorite_typed_dispatch) \| test(native_backdrop_) \| test(toolbar_favorite_priority)' --test-threads 4 --no-fail-fast` (再開後初回) | exit 101、テスト未実行。KeyName::Escape と payload のない FolderNavMode::ListOrder を訂正。`target/search-nav-section11-implemented.log` |
+| 同じ再開後コマンド (型名訂正・close-origin / transition poll 補強後) | **exit 0、25/25 成功、17,273 skip、18.125s、compile 14m42s**。新規 21 件を含む。`target/search-nav-section11-narrow.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(list_order) \| test(everything) \| test(location) \| test(gamepad) \| test(jump) \| test(section1328) \| test(section1339) \| test(favorite) \| test(bookshelf) \| test(books_root) \| test(menubar) \| test(pane) \| test(address) \| test(backdrop) \| test(startup_restore) \| test(saved_group)' --test-threads 6 --no-fail-fast` (初回) | exit 100、1,992 実行 / 1,990 成功 / 2 失敗、15,306 skip、327.569s、compile 1.69s。上記 7・8 の旧 marker / pass fixture を訂正。`target/search-nav-section11-focused.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(mixed_path_favorite_direct_navigation_standardizes_input_without_rewriting_saved_record) \| test(section1339_pane_enter_scan_crosses_real_search_refresh)' --test-threads 2 --no-fail-fast` | exit 0、2/2 成功、17,296 skip、3.665s、compile 3m02s。`target/search-nav-section11-existing-fixtures.log` |
+| 上記の 1,992 件と同じ合併 filter / threads の nextest コマンド (最終) | **exit 0、1,992/1,992 成功、15,306 skip、297.311s、compile 1.32s**。`target/search-nav-section11-final.log` |
+| `python scripts/check_ui_glyphs.py` (再開後) | exit 0、危険文字 0 件。 |
+| `python scripts/check_site_cards.py` (再開後) | exit 0、53 cards checked、0 over the limit。 |
+| `cargo fmt` (workspace、引数なし、最終テスト終了後) / `cargo fmt --check` | ともに exit 0。検索入力欄・履歴▼への整形差分なし。 |
+| `git -c core.safecrlf=false diff --check` (最終) | exit 0。tracked 21 件 + 新規 test module 3 件、計 24 ファイル。 |
+
+再開後の実行結果は上表と後続追記で区別する。製品起動・full suite・コミットは行わない。
+`build-dev.ps1` は利用者の既存指示どおり設計担当が実行する。
+
 ## 9. 追補: ツールバーのお気に入りもそろえる (2026-11-11 利用者決定)
 
 利用者の判断 (親セッション経由、2026-11-11): §2.1 範囲外で相談事項にした「ツールバーのお気に入りは移動前に検索を閉じる」不揃いは、
@@ -838,7 +1054,8 @@ Esc では検索結果へ戻った、と報告された。設計担当が「そ�
 - 変わる挙動: 検索中にアドレス欄・フォルダペインで移ると、今までは検索を残したまま開き、Esc で検索結果へ戻れた。これからは
   移動先を開けた時点で検索を終える。検索結果へは戻れない (← は検索前の場所へ戻る)。
 - 更新履歴の文案 (公開時に利用者が確認する): 「検索中に場所ジャンプ (デスクトップ・ドライブ・ドライブ一覧・閲覧履歴・本棚・
-  レーティング一覧など)、アドレス欄、フォルダペイン、ツールバーのお気に入りから移ると、移動先を開けた時点で検索を終えるようにしました。
+  レーティング一覧など)、アドレス欄、フォルダペイン、お気に入り (ツールバー・メニューバー・キー・リング・ゲームパッドなど)、
+  メニューバーの本棚から移ると、移動先を開けた時点で検索を終えるようにしました。
   移動先で ← を押すと検索前の場所へ戻ります。移動に失敗したときは検索結果が残ります。」
   - 親セッションの案にあった「検索結果へは ← で戻れます」は実際の動きと異なる (← は検索前の場所へ戻り、検索結果は履歴に残らない) ため採らない。
 
@@ -864,6 +1081,10 @@ Esc では検索結果へ戻った、と報告された。設計担当が「そ�
   `LocationJumpTarget::BooksRoot` と同じ値で運ぶ。
 - 実装時に、**利用者の操作で物理の場所へ移るのに検索を残したまま (擬似子) で開く入口が他に残っていないか**をコードで全列挙し、
   表に残す。検索結果の中を開く (結果の本・フォルダへ降りる、Everything の PhysicalChild、検索内の ← / 親へ) は検索の一部なので対象外。
+- 追加判断 (設計担当・利用者): native backdrop の早期 return は detached 述語・viewport lifecycle・registry transition ではなく
+  main frame の navigation consumer なので凍結対象外。§11 に含める。Favorite だけの arm 追加で済ませず、gamepad_nav の全 variant を
+  棚卸しし、LocationJump の既存取りこぼしを含め共通 dispatcher で処理する。検索なしの旧 loader と steps 後処理は維持する。
+  各 variant の処理と、直接 producer がないものの根拠は §8.11 に記録し、無言の型破棄を残さない。
 
 ### 11.2 検索中のフォルダペインの Enter が一覧へ渡る
 
