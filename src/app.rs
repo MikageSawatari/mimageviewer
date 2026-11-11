@@ -54806,7 +54806,7 @@ impl App {
         sources: Vec<crate::books::BookPageSource>,
     ) {
         let book_name = self.active_book_name();
-        self.start_book_append_to_named(ctx, book_name, sources);
+        self.start_book_append_to_named(ctx, book_name, sources, 0);
     }
 
     /// `start_book_append` の本名指定版 (ツールバーのピン留め本へ追加する用)。
@@ -54815,6 +54815,7 @@ impl App {
         ctx: &egui::Context,
         book_name: String,
         sources: Vec<crate::books::BookPageSource>,
+        skipped_containers: usize,
     ) {
         if sources.is_empty() {
             self.show_feedback_warning("追加するページがありません".to_string());
@@ -54835,6 +54836,7 @@ impl App {
             source_context: self.projected_viewer_context_id(),
             accepted_revision: self.book_append_undo_revision,
             target_folder: crate::books::book_folder(&root, &book_name),
+            skipped_containers,
             observations: Default::default(),
         };
         let data_dir = crate::data_dir::get();

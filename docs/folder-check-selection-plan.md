@@ -468,3 +468,82 @@ cargo nextest run --build-jobs 1 -p mimageviewer --lib -E 'test(external_tool) |
 部分集合である（130件とは数えない）。製品UI文字列は変更していない。製品バイナリ起動・
 外部プロセスの実起動・git commit/add/stash/reset/ブランチ切替は行っていない。
 全lib gateとbuild-devは前回と同じく設計担当への引き継ぎとし、本追補では実行していない。
+
+### 実機確認追補: 本への追加完了にも対象外件数を残す（2026-11-11、依頼32）
+
+サブPC担当の観測は、画像・Folder・ZIP本体を混ぜた追加で画像は追加されたが、開始時の
+「フォルダ・本 N 件は対象外」が見えず、完了通知だけが見えたというもの（2回確認）。
+設計担当から提示されたログは開始1081.401s／完了1081.449s。この経過時間はサブPCの記録であり、
+本追補の実機実測ではない。
+
+修正前のコードで原因を確認した。`add_grid_selection_to_named_book` は対象外件数をローカルに数え、
+`start_book_append_to_named` 呼び出し後の開始通知だけに付けていた。`finish_book_append_terminal` は
+件数を受け取らず「に N ページ追加しました」を発行する。両方の `show_feedback_warning*` は
+`publish_feedback_toast` を通り、同じ `fs_feedback_toast` へ代入するため、完了時に件数のある開始文を
+上書きする。トーストの時間延長や遅延で回避せず、完了の事実と一緒に件数を通知する。
+
+実装:
+
+- `BookOpIntent::Append` に `skipped_containers: usize` を追加し、その追加依頼だけが件数を保持する。
+  Appの別フィールド、完了summaryの重複状態、設定・永続化の追加はない。
+- グリッドからの受付は既に数えた件数を `start_book_append_to_named` へ渡し、intentに保存する。
+  開始文は変更しない。成功終端でintentから件数を読み、0件なら従来の文のまま、1件以上なら
+  `「target」に 1 ページ追加しました (フォルダ・本 2 件は対象外)` の形で付ける。
+  消しゴム補完・非表示ページ・Undo不可の既存の補足はそのまま後ろに続ける。
+- 直接の呼び出し元を全検索し、グリッド以外の `start_book_append` ラッパーと画像fullscreen入口は
+  0を渡す形にした。クリップボード・動画フレームもラッパー経由で0になる。ツールバーのピン留め本へ
+  グリッド選択を追加する操作は同じグリッドhandlerなので、同じ選別と件数を使う。
+- 失敗・receiver切断・Undoの通知経路は変更しない。件数の付加はAppend成功終端だけで行う。
+  UI同期I/O、再試行・回復処理、既存機能の制限は追加していない。
+
+所有と別contextの確認:
+
+- 本操作はApp共通の単一 `BookOpPending` へ受理され、処理中の新しい追加は既存gateが拒否する。
+  workerはその依頼専用のchannelに返し、`poll_book_op_pending` はそのintentを保持したまま処理する。
+- metadata presence準備やtarget一覧refreshでreceiverが交代しても同じpending／intentを使うため、
+  件数は失われない。件数を別の完了へ引き継ぐApp側の退避欄は作らない。
+- 結果は既存 `source_context` の所有contextを一時mountして処理し、閉じたcontextの場合も従来の
+  追加成功／失敗通知を処理する。`operation_id`／`source_context`／`accepted_revision` の照合と
+  refreshの採用条件は変更不要。Undo資格の失効後も、実際に成功した自分の追加の件数は通知する。
+  detachedの述語・viewport・context寿命の処理自体は変更していない。
+
+追加したhandler-level回帰（`src/app/book_append_refresh.rs`）:
+
+- `section1732_book_add_completion_reports_skipped_containers`: 画像1件＋Folder1件＋ZIP本体1件を
+  チェックし、Ctrl+Bが呼ぶ `add_grid_selection_to_active_book` から実際のAppend workerと完了pollまで
+  通す。開始文だけでなく最後の完了文が対象外2件を含むことと、追加した画像のbytesも検査する。
+- `section1732_book_add_completion_without_skips_keeps_existing_message`: 画像1件を同じhandlerで追加し、
+  intentの対象外数0件と、従来と完全一致する完了文を検査する。
+- `section1732_book_append_refresh_retains_skipped_count_on_the_same_intent`: 同じ追加intentのまま
+  readonly refreshへreceiverを交代し、完了通知まで対象外件数を維持することを検査する。
+- `section1732_book_append_failure_and_disconnect_do_not_report_skipped_count`: 失敗とreceiver切断の
+  両方で、対象外件数のない従来のエラー文を保つことを検査する。
+
+既存の `section1373_detached_source_terminal_and_main_refresh_keep_separate_owners` と
+`section1373_closed_source_preserves_success_and_newer_sibling_draft` にも、その追加依頼の対象外数を
+完了通知へ載せるassertionを追加した。兄弟の一覧・draft・refreshの所有について既存の検査を維持する。
+他のAppend intent fixtureには0を明示した。設計からの逸脱なし。
+
+最終差分の自動検証（HEAD `58a53fa3d` 上の未コミット差分、通常feature、dev/test profile、
+nextest 0.9.148／default、retryなし、`MSBUILDDISABLENODEREUSE=1`）:
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0、27.50秒。既存警告あり。`check.log` |
+| 下記の焦点nextest | exit 0、追加4件＋既存context回帰2件の計6件すべて成功（2.257秒）。初回再コンパイル11分13秒。`focused.log`／`focused-junit.xml` |
+| `cargo nextest run --build-jobs 1 -p mimageviewer --lib -E 'test(section1732) \| test(book_add) \| test(book_append)' --no-tests fail` | exit 0、98件すべて成功（121.888秒）。既存のDB cold/warmベンチ1件が121.849秒でSLOW、失敗ではない。`related.log`／`related-junit.xml` |
+| 最後の `cargo fmt`（引数なし、workspace全体） | exit 0、検証したRust8ファイルのhashは不変。`format.log` |
+| `cargo fmt --check` | exit 0 |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険な文字0件 |
+| `git diff --check` | exit 0 |
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE = '1'
+cargo nextest run --build-jobs 1 -p mimageviewer --lib -E 'test(section1732_book_add_completion_) | test(section1732_book_append_refresh_retains_) | test(section1732_book_append_failure_) | test(section1373_detached_source_terminal_and_main_refresh_keep_separate_owners) | test(section1373_closed_source_preserves_success_and_newer_sibling_draft)' --no-tests fail
+cargo nextest run --build-jobs 1 -p mimageviewer --lib -E 'test(section1732) | test(book_add) | test(book_append)' --no-tests fail
+```
+
+ログ・JUnitは `target/section1732-append-toast/`。JUnitの実行済み集合を照合し、焦点6件は
+関連98件にすべて含まれることを確認した（104件とは数えない）。製品バイナリ起動・実機での
+再確認・git commit/add/stash/reset/ブランチ切替は行っていない。全lib gateとbuild-devは前回同様、
+設計担当への引き継ぎとし、本追補では実行していない。

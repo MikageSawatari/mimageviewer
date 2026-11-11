@@ -55,6 +55,7 @@ pub(crate) fn followup_fixture(
             source_context: append.source_context,
             accepted_revision: append.accepted_revision,
             target_folder: append.files.folder.clone(),
+            skipped_containers: 0,
             observations: Default::default(),
         }),
         "undo" => Some(BookOpIntent::UndoAppend {

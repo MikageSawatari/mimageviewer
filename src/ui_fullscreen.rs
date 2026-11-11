@@ -56076,7 +56076,7 @@ impl App {
             });
             return;
         }
-        self.start_book_append_to_named(ctx, book_name.clone(), sources);
+        self.start_book_append_to_named(ctx, book_name.clone(), sources, skipped_containers);
         let mut message = format!("「{book_name}」へ追加中: {count} ページ");
         if skipped_containers > 0 {
             message.push_str(&format!(" (フォルダ・本 {skipped_containers} 件は対象外)"));
@@ -56123,7 +56123,7 @@ impl App {
             }
         };
         let book_name = self.active_book_name();
-        self.start_book_append_to_named(ctx, book_name, vec![source]);
+        self.start_book_append_to_named(ctx, book_name, vec![source], 0);
         self.show_feedback_warning("追加先の本へ追加中".to_string());
     }
 
