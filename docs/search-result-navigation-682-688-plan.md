@@ -1288,7 +1288,7 @@ $env:RUST_BACKTRACE = '1'
 cargo nextest run -p mimageviewer --lib -E 'test(collection_open_from_detached_transient_video_keeps_fallback_return_folder)' --test-threads 1 --no-fail-fast
 ```
 
-### 8.14 §12.3 改訂1の実装と §12 の完了検証 (2026-11-12、未コミット)
+### 8.14 §12.3 改訂1の実装と §12 の完了検証 (2026-11-12、835a5261b でコミット)
 
 §8.13 の停止・失敗は当時の記録として保持する。設計担当と独立設計 reviewer の構造合意と
 §12.3 改訂1、detached 計画 §11 の記録 (`b0ad9f8f8`) を受け、以下を実装した。
@@ -1463,6 +1463,16 @@ python scripts/check_site_cards.py
 
 §12 は承認された §12.3 改訂1 の範囲で実装・自動検証を完了した（未コミット）。
 §8.13 の停止は履歴として残す。実機・full suite・build-dev・製品起動・commit は今回未実施で、設計担当へ引き継ぐ。
+
+### 8.15 受入 (設計担当 ClaudeCode、2026-11-12、§12)
+
+- 実装コミット `835a5261b` (branch `feat-682-search-nav`、master 未統合)。前段: master `16dbdf0f7` の取り込みと §12 途中 `c7d210072`、設計 §12.3 `895620a2c`・改訂1 `6698e2ffe`、detached 計画 §11 の記録 `b0ad9f8f8`。
+- 設計担当の確認: 早期境界は検索中の `ExitTemporaryView` だけで動き、境界関数本体・viewer_context_registry・detached 述語・viewport・bundle field・App field は差分に無い。
+- 独立レビュー (GPT-6.1 Sol / xhigh、範囲 `b0ad9f8f8..835a5261b`): **ACCEPT**、P1〜P3 なし。検索なし・他 purpose の順序を直接比べる専用テストと同一 binding の `NotNeeded` 専用ケースは無いが、差分で不変を確認したとの所見。
+- `test-lib-full` (run-heavy.ps1 `-FullTest` のロック下、`835a5261b`): **17,361 成功・75 skip・失敗 0** (839 秒)。
+- `.\scripts\build-dev.ps1` (run-heavy.ps1 経由): 成功 (`target\dev-runtime\mimageviewer-core.exe`、2026-11-12 05:29)。
+- 範囲外として残す: Ctrl+S / Ctrl+T の owner が App 共有で bundle に無い既存の欠け、Smart root の既存順序。
+- 実機確認の記録はまだ無い。
 
 ## 9. 追補: ツールバーのお気に入りもそろえる (2026-11-11 利用者決定)
 
