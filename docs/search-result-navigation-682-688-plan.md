@@ -318,7 +318,7 @@
 
 初回実装は `3621aefec` (設計担当がコミット)。§8.1〜8.4 はその実装・検証時の記録で、
 §8.5 は独立レビューへの追補修正 (`e85c702ef`)、§8.6 は設計担当の受入、§8.7 は §9 の追補実装 (`4a87140f3`)、
-§8.8 は §10 の追補実装 (`ed6429060`)、§8.9 はその全件テスト失敗への追補修正 (未コミット)。
+§8.8 は §10 の追補実装 (`ed6429060`)、§8.9 はその全件テスト失敗への追補修正 (`9373116d1` でコミット)。
 実装担当は製品バイナリの起動・実機観測・コミットを行っていない。
 設計の前提を source で照合し、既存の capture 入口、成功採用境界、Folder 行の採用後に内部書庫を開く順序を維持した。
 App の新しい pending / bool / 次回採用フラグ、detached 述語・viewport・registry 遷移の変更、新しい同期 I/O はない。
@@ -777,7 +777,7 @@ Cargo は `MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=4`。
 - `.\scripts\build-dev.ps1`: 成功 (`target\dev-runtime\mimageviewer-core.exe`、2026-11-11 20:32)。
 - 実機確認の記録はまだ無い。
 
-### 8.11 §11 の実装・検証記録 (未コミット)
+### 8.11 §11 の実装・検証記録 (6036ffcaa でコミット)
 
 着手前 source 調査で、typed お気に入りには通常の 4 consumer に加えて native backdrop 内の consumer も必要と判明し、
 一度設計担当へ報告した。**設計担当・利用者の判断で、この経路は detached ではなく main frame の navigation consumer であり、
@@ -992,6 +992,25 @@ Cargo は `MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=4`。
 
 再開後の実行結果は上表と後続追記で区別する。製品起動・full suite・コミットは行わない。
 `build-dev.ps1` は利用者の既存指示どおり設計担当が実行する。
+
+### 8.12 受入 (設計担当 ClaudeCode、2026-11-11〜12、§11)
+
+- 実装担当が一度止まった点: native 動画 backdrop の早期 return 経路の navigation consumer は、detached の述語・viewport lifecycle・
+  registry ではなく main frame の consumer なので、凍結対象外と判断して §11 に含めた。この consumer は gamepad 要求のうち
+  Direct 等しか扱わず、このブランチで `LocationJump` にしたゲームパッドの場所ジャンプを黙って捨て得た (ブランチ内の退行、ソース上で成立)。
+  共通の exhaustive dispatcher へ接続して解消し、テストを追加した。
+- 独立レビュー (GPT-6.1 Sol / xhigh、範囲 `a1ebaa2ae..6036ffcaa`): **ACCEPT**、P1〜P3 なし。
+- `test-lib-full` (PC 全体ロック下、`6036ffcaa`):
+  - 1 回目: 17,221 成功・2 失敗 (`section1674_paged_continuous_round_trip_refreshes_pdf_geometry_and_visible_quality`、
+    `page_turn_mainwindow_submits_visible_vacant_leaf_both_directions`)。
+  - 2 回目: 17,220 成功・2 失敗・1 タイムアウト (`overflow_real_metadata_hold_preview_requires_an_unowned_new_press`、
+    `page_turn_mainwindow_submits_visible_vacant_leaf_both_directions`、section1375 の 100k scan 性能テスト)。
+  - いずれも本ブランチが触らない `src/ui_fullscreen` / folder_scan 性能テストで、壁時計に依存する。失敗 3 件は単独で 3 回とも成功。
+    `ui_fullscreen` 全 1,354 件は、既定の並列数では page_turn の 1 件だけ失敗し、`--test-threads 6` では全件成功。
+    実行時は他セッションの cargo / rustc / codex が約 20 プロセス動き、CPU 使用率は約 61% だった。負荷依存の既存の不安定さと判断し、
+    クリーンな全件記録は残っていない (次に負荷の低いときに再実行する)。
+- `.\scripts\build-dev.ps1`: 成功 (`target\dev-runtime\mimageviewer-core.exe`、2026-11-11 23:30)。
+- 実機確認の記録はまだ無い。
 
 ## 9. 追補: ツールバーのお気に入りもそろえる (2026-11-11 利用者決定)
 
