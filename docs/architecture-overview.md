@@ -31,13 +31,18 @@ channel/queue/cancelとpool catalogの型は同じviewer contextで移譲・退�
 
 `previous_run_diagnostics` は main 所有の終了状態と専用 writer を持ち、通常 GUI の first admission 後だけ開始する。`GuiRunSession` は single-instance guard を最終保存まで保持する。前回資料の読取り・活動中のAI/GPU checkpoint・置換保存・保持整理はworker、UIは不変な許可項目本文を非blockingで受け取る。panicの小sinkは今回参照の保存後に公開し、nativeはrun相関、device-lostは専用atomic latchからworkerで記録する。`ui_previous_run_notice`は本文の表示と明示コピーを担当する。現役DisplayのORT Failedは既存の結果採用/失敗key寿命で一度だけ所有contextへError feedbackを出し、固定分類と数値だけの詳細をhover・明示コピーへ渡す。通常/startupログと終了状態の保存後に、必要な制御エラーのnative通知を行う。設定DBへの項目追加・回復処理はない。採取・保存範囲と制約は [設計](ai-crash-655-investigation.md#確定設計-2026-10-30) を参照。
 
-## 通常フォルダ一覧の表示順ナビゲーション (§1.444)
+## 通常フォルダ・Everything 結果一覧の表示順ナビゲーション (§1.444、§1.682)
 
-`app/list_order_navigation` は、main の通常フォルダ一覧から本を開く受付時の本の行だけを
-`ListOrderSnapshot` として凍結する。`ViewerContextBundle` が列と取得元 context id を持ち、
-現在位置は表示中の論理 source から導く。fork の子には渡さず、promote 後の旧 main は id の照合で使えない。
+`app/list_order_navigation` は、main の通常フォルダ一覧、または Everything Root の結果そのものから本を開く受付時の本の行だけを
+`ListOrderSnapshot` として凍結する。`ViewerContextBundle` が 1 つの列・取得元 context id・
+`Folder` / `Everything { run }` scope を持つ。Everything の run は accepted dataset のもの。
+現在位置は通常フォルダなら表示中の論理 source、Everything なら `PhysicalChild.logical_source` の完全一致と
+現在の場所の所属確認で導く。一覧順の要求だけが移動先行を search origin に載せ、成功採用で検索側の帰路基準を揃える。
+fork の子には渡さず、promote 後の旧 main は id の照合で使えない。
 `FolderNavMode::ListOrder` の行き先選択だけを worker に足し、停止判定・事前走査・採用・本の再表示は
 既存の Fullscreen フォルダナビゲーションと共有する。[仕様と検証](list-order-book-navigation-plan.md)。
+検索中の場所ジャンプ（§1.688）は対象入口を型付き要求へ揃え、dispatch 時の admission 後、既存の
+`ExitTemporaryView` の成功採用境界で検索を終了する。[検索結果ナビゲーション設計](search-result-navigation-682-688-plan.md)。
 
 ## 本のitems生成境界（§1.242 G1）
 

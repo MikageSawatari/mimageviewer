@@ -244,7 +244,7 @@ impl PreparedSearchThumbnails {
         }
     }
 }
-pub(crate) use everything::SearchOpenOrigin;
+pub(crate) use everything::{EverythingChildAdmission, SearchOpenOrigin};
 pub(crate) use everything::{
     EverythingPosition, EverythingReturn, MetadataAppliedSpec, SearchAccepted, SearchProducer,
     SearchProjection, SearchSource,
@@ -4322,10 +4322,18 @@ impl App {
     ///
     /// `global_search.active` が false、または `view == Aggregated` のときは no-op。
     pub(crate) fn advance_drilled_current_path(&mut self, p: &Path) {
+        self.advance_drilled_current_path_with_admission(p, &EverythingChildAdmission::Descend);
+    }
+
+    pub(crate) fn advance_drilled_current_path_with_admission(
+        &mut self,
+        p: &Path,
+        child: &EverythingChildAdmission,
+    ) {
         if !self.global_search.active {
             return;
         }
-        if self.accept_everything_physical_child(p) {
+        if self.accept_everything_physical_child(p, child) {
             return;
         }
         self.cancel_pending_folder_nav();

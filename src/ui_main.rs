@@ -848,8 +848,18 @@ enum PinButtonClick {
     Remove,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LocationJumpTarget {
+    Physical(PathBuf),
+    DriveList,
+    ReadingHistory,
+    BooksRoot,
+    Rating(u8),
+}
+
 #[derive(Debug)]
 pub(crate) enum AddressBarNav {
+    LocationJump(LocationJumpTarget),
     ZipListReturn(crate::app::ZipListReturnRequest),
     Direct(PathBuf, crate::app::StartupListIntent),
     GridVirtual(crate::app::GridVirtualOpenIntent),
@@ -15984,6 +15994,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         | AddressBarNav::HistoryForward
                                         | AddressBarNav::ZipListReturn(_)
                                         | AddressBarNav::EverythingResults
+                                        | AddressBarNav::LocationJump(_)
                                         | AddressBarNav::SavedGroupReady(_),
                                     )
                                     | None => "親フォルダへ [BS]".to_string(),
@@ -16071,7 +16082,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         ui.separator();
                     }
 
-                    let place_nav_enabled = !search_active && !snapshot_active;
+                    let place_nav_enabled = !snapshot_active;
                     let place_response = crate::ui_toolbar_layout::folder_menu_button_with_snapshot(
                         ui,
                         place_nav_enabled,
@@ -16107,13 +16118,13 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 match entry {
                                     crate::known_folders::LocationMenuEntry::DriveList => {
                                         if ui.button("ドライブ一覧").clicked() {
-                                            result = Some(AddressBarNav::DriveList(None));
+                                            result = app.location_jump_nav(ui.ctx(), LocationJumpTarget::DriveList, "place_menu");
                                             ui.close();
                                         }
                                     }
                                     crate::known_folders::LocationMenuEntry::ReadingHistory => {
                                         if ui.button("閲覧履歴").clicked() {
-                                            result = Some(AddressBarNav::ReadingHistory(crate::app::ReadingHistoryEntrance::Menu));
+                                            result = app.location_jump_nav(ui.ctx(), LocationJumpTarget::ReadingHistory, "place_menu");
                                             ui.close();
                                         }
                                     }
@@ -16135,7 +16146,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                                     crate::test_script::register_clickable_widget("rating-three", &rating_response);
                                                 }
                                                 if rating_response.clicked() {
-                                                    app.enter_rating_view_from_menu(stars);
+                                                    result = app.location_jump_nav(ui.ctx(), LocationJumpTarget::Rating(stars), "place_menu");
                                                     ui.close();
                                                 }
                                             }
@@ -16151,7 +16162,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                             )
                                             .clicked()
                                         {
-                                            result = Some(AddressBarNav::BooksRoot);
+                                            result = app.location_jump_nav(ui.ctx(), LocationJumpTarget::BooksRoot, "place_menu");
                                             ui.close();
                                         }
                                     }
@@ -16174,10 +16185,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                                             if let Some(resolved) =
                                                                 resolve_folder_bar_nav_path(&destination.path)
                                                             {
-                                                                result = Some(AddressBarNav::Direct(
-    resolved,
-    crate::app::StartupListIntent::ExplicitList,
-));
+                                                                result = app.location_jump_nav(ui.ctx(), LocationJumpTarget::Physical(resolved), "place_menu");
                                                             }
                                                             ui.close();
                                                         }
@@ -16200,10 +16208,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                             if let Some(resolved) =
                                                 resolve_folder_bar_nav_path(&location.path)
                                             {
-                                                result = Some(AddressBarNav::Direct(
-                                                    resolved,
-                                                    crate::app::StartupListIntent::ExplicitList,
-                                                ));
+                                                result = app.location_jump_nav(ui.ctx(), LocationJumpTarget::Physical(resolved), "place_menu");
                                             }
                                             ui.close();
                                         }
@@ -16218,10 +16223,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                             if let Some(resolved) =
                                                 resolve_folder_bar_nav_path(&drive)
                                             {
-                                                result = Some(AddressBarNav::Direct(
-                                                    resolved,
-                                                    crate::app::StartupListIntent::ExplicitList,
-                                                ));
+                                                result = app.location_jump_nav(ui.ctx(), LocationJumpTarget::Physical(resolved), "place_menu");
                                             }
                                             ui.close();
                                         }
@@ -16237,8 +16239,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     )
                     .hover_tip(if snapshot_active {
                         "★固定中は場所ジャンプを使用できません"
-                    } else if search_active {
-                        "検索中は場所ジャンプを使用できません"
                     } else {
                         "デスクトップ / 主要フォルダ / ドライブへ移動"
                     });
@@ -34688,7 +34688,7 @@ mod section207_tests {
         click_location_menu(&mut harness, "保管");
         harness.run();
         assert!(
-            matches!(nav.borrow().as_slice(), [AddressBarNav::Direct(path, crate::app::StartupListIntent::ExplicitList)] if path == &target)
+            matches!(nav.borrow().as_slice(), [AddressBarNav::LocationJump(LocationJumpTarget::Physical(path))] if path == &target)
         );
         assert!(
             harness.query_by_label("保管").is_none(),
@@ -34714,6 +34714,98 @@ mod section207_tests {
                 modifiers: egui::Modifiers::NONE,
             });
             harness.step();
+        }
+    }
+
+    #[test]
+    fn location_jump_places_organize_menu_accepts_each_search_owner() {
+        use crate::app::top_level_grid_view::{TopLevelGridRestore, TopLevelGridSurface};
+        use crate::settings::FileOrganizeDestination;
+        for kind in 0..4 {
+            let mut env = crate::app::setup_app_for_test();
+            only_folder_and_tree(&mut env);
+            let origin = env.tmp.path().join("pre-search");
+            let target = env.tmp.path().join("organize-target");
+            std::fs::create_dir(&origin).unwrap();
+            std::fs::create_dir(&target).unwrap();
+            env.current_folder = Some(origin.clone());
+            env.top_level_grid_view
+                .replace_surface(TopLevelGridSurface::Folder);
+            match kind {
+                0 => env.open_global_search(),
+                1 => {
+                    let row = env.tmp.path().join("result.zip");
+                    crate::global_search_ui::adopt_everything_for_test(
+                        &mut env,
+                        &egui::Context::default(),
+                        "places-menu",
+                        crate::global_search_ui::everything_dataset_for_test(vec![
+                            GridItem::ZipFile(row),
+                        ]),
+                    );
+                    assert!(matches!(
+                        env.global_search.accepted,
+                        crate::global_search_ui::SearchAccepted::Everything { .. }
+                    ));
+                }
+                2 => env.open_favsearch(),
+                _ => env.open_tag_view(),
+            }
+            assert!(
+                matches!(env.top_level_grid_view.return_to(), Some(TopLevelGridRestore::Folder(path)) if path == &origin)
+            );
+            env.settings.show_location_desktop = false;
+            env.settings.show_location_pictures = false;
+            env.settings.show_location_downloads = false;
+            env.settings.show_location_videos = false;
+            env.settings.show_location_music = false;
+            env.settings.show_location_drive_roots = false;
+            env.settings.file_organize_destinations = vec![FileOrganizeDestination {
+                name: "整理先の検証".into(),
+                path: target.clone(),
+            }];
+            let app = Rc::new(RefCell::new(env));
+            let render = Rc::clone(&app);
+            let nav = Rc::new(RefCell::new(Vec::new()));
+            let nav_render = Rc::clone(&nav);
+            let fonts = Cell::new(false);
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(1100.0, 480.0))
+                .build_ui(move |root_ui| {
+                    crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                        let ctx = root_ui.ctx().clone();
+                        if !fonts.replace(true) {
+                            crate::ui_fonts::configure_fonts(&ctx);
+                            ctx.request_repaint();
+                            return;
+                        }
+                        if let Some(candidate) = render.borrow_mut().render_toolbar(root_ui).1 {
+                            nav_render.borrow_mut().push(candidate);
+                        }
+                    });
+                });
+            harness.run();
+            let places = harness.get_by_label("場所▼");
+            assert!(!places.accesskit_node().is_disabled(), "kind={kind}");
+            click_location_menu(&mut harness, "場所▼");
+            harness.run();
+            click_location_menu(&mut harness, "整理先");
+            harness.run();
+            click_location_menu(&mut harness, "整理先の検証");
+            harness.run();
+            assert!(
+                matches!(nav.borrow().as_slice(), [AddressBarNav::LocationJump(LocationJumpTarget::Physical(path))] if path == &target),
+                "kind={kind}"
+            );
+            assert!(harness.query_by_label("整理先の検証").is_none());
+            let candidate = nav.borrow_mut().pop().unwrap();
+            let mut app = app.borrow_mut();
+            assert!(app.apply_fullscreen_close_nav_immediate(candidate));
+            assert!(app.folder_open_preparation_pending());
+            assert!(
+                app.global_search.active || app.favsearch.active || app.tag_view.active,
+                "the actual menu's explicit jump must retain search until its scan succeeds"
+            );
         }
     }
 
@@ -34814,7 +34906,7 @@ mod section207_tests {
         click_location_menu(&mut harness, "整理先 099");
         harness.run();
         assert!(
-            matches!(nav.borrow().as_slice(), [AddressBarNav::Direct(path, crate::app::StartupListIntent::ExplicitList)] if path == &target)
+            matches!(nav.borrow().as_slice(), [AddressBarNav::LocationJump(LocationJumpTarget::Physical(path))] if path == &target)
         );
         assert!(harness.query_by_label("整理先 099").is_none());
     }

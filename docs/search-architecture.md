@@ -100,6 +100,13 @@ pin変更stampが古ければ同じprepareで再準備する。Ctrl+Gの既存�
 EverythingのP2修正とは別件として残す（[対応範囲](everything-search-plan.md#16-p2-動画pinのworker準備2026-10-12)）。
 
 採用済みEverythingの位置は `EverythingPosition::Root` / `PhysicalChild`。
+§1.682 の一覧順移動では、Root の結果一覧から開いた時点の列を accepted run 付き scope で凍結する。
+現在位置は `PhysicalChild.logical_source` の完全一致と現在の論理の場所の所属確認で求め、祖先の結果行から推定しない。
+一覧順要求にだけ `EverythingChildAdmission::ListOrderRow { dataset_run, row }` を載せ、current origin・accepted run・
+採用 path と row の physical key・dataset membership が一致する成功採用で logical_source/return_anchor を替え、route は保持する。
+通常の `Descend` は従来どおり。Folder 行の採用後に中の書庫を開く場合も、その書庫 open は Descend とする。
+列は 1 つで通常フォルダとは scope で分離し、再検索は新しい結果の採用で旧列が使えなくなる。
+再送信・取消・失敗・source 切替だけでは accepted の旧列を維持する。比較は `physical_path_spelling` の key (I/O なし)。
 実フォルダ・画像フォルダ本・ZIP/PDF/EPUB/変換書庫の main 物理表示が受理された境界だけでlogical source/return anchor/routeを保持し、
 取消や失敗で未採用のchildへ進めない。結果へ戻ると保持datasetを共通prepareで再投影し、IPCを再送しない。
 Parent（BS／grid 親／gamepad Back）は ZIP 内部を一段、それ以外は effective_folder が logical_source の厳密な物理子孫なら通常の物理親へ移動し、起点なら Root へ戻す。Results ボタンは階層を飛ばして Root へ戻す。
@@ -1203,6 +1210,15 @@ Tantivy commit自体を強制中断はしない。そこで上位のIndexerManag
 - `std::fs::read_dir` → walker スレッドのみ。UI からは呼ばない
 
 ### 7.4 検索ビュー切替時の戻り先所有権
+
+§1.688: 場所ジャンプ（キー・リング・ジェスチャ・マウスボタン・ゲームパッド、場所リスト、場所▼の整理先を含む）は、
+検索の有無によらず `AddressBarNav::LocationJump(LocationJumpTarget)` で運び、dispatch 時に ★固定・取得中 modal・
+検索 3 owner の active を判定する。検索中なら `Direct(ExitTemporaryView)` の既存採用境界で成功時だけ
+3 owner を `_without_restore` で閉じる。実フォルダ・本棚・ドライブ・ドライブ一覧・閲覧履歴・評価一覧で同じ契約を使う。
+失敗・取消・stale は結果・選択・入力を保持する。終了時の pending 破棄で遅着完了の上書きを防ぎ、履歴には検索前の場所を残す。
+お気に入り・アドレス欄・フォルダペイン・メニューバーの既存入口は対象外。
+§1.682 の Everything 一覧順移動は検索を閉じず、結果への帰路だけを成功採用した移動先行へ揃える。
+両項目の詳細は [検索結果ナビゲーション設計](search-result-navigation-682-688-plan.md) を参照。
 
 Ctrl+F / S / G / T、検索由来Snapshot、スマートフォルダは同じ最上位一覧を所有する。
 これらを直接切り替える入口では、既存ビューを通常closeして元一覧を再構築してはならない。

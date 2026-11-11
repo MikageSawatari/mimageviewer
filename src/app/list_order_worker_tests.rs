@@ -4,6 +4,7 @@ use tests::phase_c_support::setup_app;
 fn snapshot(owner: ViewerContextId, paths: &[PathBuf]) -> Arc<ListOrderSnapshot> {
     Arc::new(ListOrderSnapshot {
         owner,
+        scope: ListOrderScope::Folder,
         entries: paths
             .iter()
             .map(|path| ListOrderEntry {

@@ -734,13 +734,14 @@ mod list_order_tests;
 mod list_order_virtual_tests;
 #[cfg(test)]
 mod list_order_worker_tests;
+mod location_jump;
 mod rating_membership_ops;
 #[cfg(test)]
 pub(crate) mod rating_membership_tests;
 mod viewer_context_registry;
-pub(crate) use list_order_navigation::ListOrderSnapshot;
 #[cfg(test)]
 pub(crate) use list_order_navigation::{ListOrderEntry, ListOrderEntryKind};
+pub(crate) use list_order_navigation::{ListOrderScope, ListOrderSnapshot};
 #[cfg(windows)]
 pub(crate) use viewer_context_registry::ContextResidence;
 pub(crate) use viewer_context_registry::ViewerContextId;
@@ -1217,6 +1218,7 @@ enum ClassifiedOpenContinuation {
         intent: PhysicalHistoryIntent,
         dfs_continuation: Option<PhysicalHistoryDfsContinuation>,
         restore_intent: StartupListIntent,
+        search_origin: Option<crate::global_search_ui::SearchOpenOrigin>,
     },
     Collection {
         target: FolderNavHistoryTarget,
@@ -25044,6 +25046,10 @@ impl App {
         nav: crate::ui_main::AddressBarNav,
     ) -> bool {
         match nav {
+            crate::ui_main::AddressBarNav::LocationJump(target) => {
+                self.dispatch_location_jump(target);
+                true
+            }
             crate::ui_main::AddressBarNav::ZipListReturn(plan) => {
                 self.apply_zip_list_return(plan);
                 true
@@ -27301,7 +27307,8 @@ impl App {
                     ClassifiedOpenContinuation::Physical {
                         intent,
                         dfs_continuation: None,
-                        restore_intent
+                        restore_intent,
+                        search_origin: self.capture_search_open_origin(),
                     },
                     navigation,
                     MainListRequestStage::Admission,
@@ -30296,12 +30303,12 @@ impl App {
             ClassifiedOpenContinuation::Physical {
                 intent,
                 dfs_continuation,
-
                 restore_intent,
+                search_origin,
             } => {
                 // A stale history head is intentionally discarded; lease refusal is reported
                 // by the classified transition before it returns false.
-                if !self.start_physical_history_transition_classified_at_stage(
+                if !self.start_physical_history_transition_classified_with_search_origin(
                     intent,
                     path,
                     dfs_continuation,
@@ -30313,6 +30320,7 @@ impl App {
                         .expect("physical classification owns its navigation"),
                     folder_scan.take(),
                     MainListRequestStage::Continuation,
+                    search_origin,
                 ) {
                     crate::logger::log("classified physical history: request not adopted");
                 }
@@ -30595,6 +30603,22 @@ impl App {
 
         restore_intent: crate::app::StartupListIntent,
     ) -> FolderOpenOutcome {
+        let search_origin = self.capture_search_open_origin();
+        self.load_folder_nav_target_with_search_origin(
+            route,
+            pre_scan,
+            restore_intent,
+            search_origin,
+        )
+    }
+
+    fn load_folder_nav_target_with_search_origin(
+        &mut self,
+        route: FolderNavRoute,
+        pre_scan: Option<ScannedDir>,
+        restore_intent: StartupListIntent,
+        search_origin: Option<crate::global_search_ui::SearchOpenOrigin>,
+    ) -> FolderOpenOutcome {
         use crate::folder_tree::FolderNavLandingKind;
         let path = match route {
             FolderNavRoute::Detached(landing) => {
@@ -30641,13 +30665,16 @@ impl App {
                 MainListRequestStage::Continuation,
             )
         } else {
-            self.load_folder_with_scan_owned_outcome_and_effects_at_stage(
+            self.load_folder_with_scan_owned_with_search_origin(
                 path,
                 pre_scan,
                 OpenRequestOwner::Navigation,
                 None,
+                None,
                 restore_intent.clone(),
+                None,
                 MainListRequestStage::Continuation,
+                search_origin,
             )
         }
     }
@@ -31309,6 +31336,32 @@ impl App {
         navigation: Option<MainListNavigation>,
         stage: MainListRequestStage,
     ) -> FolderOpenOutcome {
+        let search_origin = self.capture_search_open_origin();
+        self.load_folder_with_scan_owned_with_search_origin(
+            path,
+            pre_scan,
+            owner,
+            grid_effects,
+            classified_kind,
+            restore_intent,
+            navigation,
+            stage,
+            search_origin,
+        )
+    }
+
+    fn load_folder_with_scan_owned_with_search_origin(
+        &mut self,
+        path: PathBuf,
+        pre_scan: Option<ScannedDir>,
+        owner: OpenRequestOwner,
+        grid_effects: Option<GridVirtualOpenEffects>,
+        classified_kind: Option<OpenPathKind>,
+        restore_intent: StartupListIntent,
+        navigation: Option<MainListNavigation>,
+        stage: MainListRequestStage,
+        search_origin: Option<crate::global_search_ui::SearchOpenOrigin>,
+    ) -> FolderOpenOutcome {
         if !self.snapshot_scope_allows_open(&path, &owner) {
             self.reject_snapshot_out_of_scope_open();
             self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
@@ -31357,7 +31410,7 @@ impl App {
         ) {
             return FolderOpenOutcome::Ignored;
         }
-        self.load_folder_with_scan_claimed(
+        self.load_folder_with_scan_claimed_with_search_origin(
             path,
             pre_scan,
             owner,
@@ -31367,6 +31420,7 @@ impl App {
             restore_intent.clone(),
             navigation,
             stage,
+            search_origin,
         )
     }
 
@@ -31928,6 +31982,34 @@ impl App {
         navigation: Option<MainListNavigation>,
         stage: MainListRequestStage,
     ) -> FolderOpenOutcome {
+        let search_origin = self.capture_search_open_origin();
+        self.load_folder_with_scan_claimed_with_search_origin(
+            path,
+            pre_scan,
+            owner,
+            authority,
+            grid_effects,
+            classified_kind,
+            restore_intent,
+            navigation,
+            stage,
+            search_origin,
+        )
+    }
+
+    fn load_folder_with_scan_claimed_with_search_origin(
+        &mut self,
+        path: PathBuf,
+        pre_scan: Option<ScannedDir>,
+        owner: OpenRequestOwner,
+        authority: VisibleInstallAuthority<'_>,
+        grid_effects: Option<GridVirtualOpenEffects>,
+        classified_kind: Option<OpenPathKind>,
+        restore_intent: StartupListIntent,
+        navigation: Option<MainListNavigation>,
+        stage: MainListRequestStage,
+        search_origin: Option<crate::global_search_ui::SearchOpenOrigin>,
+    ) -> FolderOpenOutcome {
         let detached_physical = self.navigation_scope.is_detached_physical();
         if classified_kind != Some(OpenPathKind::Directory)
             && let Some(reason) = self.pdf_open_refusal(&path)
@@ -31948,7 +32030,7 @@ impl App {
             && let Some(intent) = Self::physical_open_intent(&owner, self.pending_auto_fs_open)
         {
             self.pending_auto_fs_open = false;
-            return if self.start_physical_history_transition_classified_at_stage(
+            return if self.start_physical_history_transition_classified_with_search_origin(
                 intent,
                 path,
                 None,
@@ -31957,6 +32039,7 @@ impl App {
                 navigation,
                 None,
                 stage,
+                search_origin,
             ) {
                 FolderOpenOutcome::Loaded
             } else {
@@ -32054,11 +32137,7 @@ impl App {
             _ => None,
         };
         let location = self.physical_destination_for_owner(&path, &owner, rating.as_ref());
-        let search_origin = (
-            self.favsearch.active,
-            self.tag_view.active,
-            self.capture_search_open_origin(),
-        );
+        let search_origin = (self.favsearch.active, self.tag_view.active, search_origin);
         let book_prefix = grid_effects
             .as_ref()
             .is_some_and(|effects| effects.suppress_facet_filter)
@@ -35440,17 +35519,6 @@ impl App {
 
     /// The producer owns menu/return intent; dispatchers must not infer it from the input lane.
     fn enter_reading_history_with_entrance(&mut self, entrance: ReadingHistoryEntrance) {
-        let root = match &entrance {
-            ReadingHistoryEntrance::Menu => self.capture_reading_history_root(),
-            ReadingHistoryEntrance::Return(origin) => {
-                let top_level_grid_view::TopLevelGridRestore::ReadingHistory(root) =
-                    &origin.restore
-                else {
-                    return;
-                };
-                root.clone()
-            }
-        };
         let history = match &entrance {
             ReadingHistoryEntrance::Menu
                 if !(self.global_search.active
@@ -35464,6 +35532,25 @@ impl App {
                 route: Some(origin.route.clone()),
             },
             _ => MainHistoryOperation::Restore { route: None },
+        };
+        self.enter_reading_history_with_history(entrance, history);
+    }
+
+    fn enter_reading_history_with_history(
+        &mut self,
+        entrance: ReadingHistoryEntrance,
+        history: MainHistoryOperation,
+    ) {
+        let root = match &entrance {
+            ReadingHistoryEntrance::Menu => self.capture_reading_history_root(),
+            ReadingHistoryEntrance::Return(origin) => {
+                let top_level_grid_view::TopLevelGridRestore::ReadingHistory(root) =
+                    &origin.restore
+                else {
+                    return;
+                };
+                root.clone()
+            }
         };
         let navigation =
             self.capture_main_list_navigation(history, self.copied_destination_source_proof());
@@ -35867,6 +35954,13 @@ impl App {
 
     /// ★N が付いたアイテム / コンテナをフラットに並べるレーティング一覧ビューを開く。
     pub(crate) fn enter_rating_view(&mut self, stars: u8) {
+        self.enter_rating_view_with_history(
+            stars,
+            MainHistoryOperation::Direct(DirectNavigationPurpose::Navigation),
+        );
+    }
+
+    fn enter_rating_view_with_history(&mut self, stars: u8, history: MainHistoryOperation) {
         self.capture_main_list_restore_cursor();
         let stars = stars.clamp(1, 5);
         crate::logger::log(format!("=== enter_rating_view stars={stars} ==="));
@@ -35877,7 +35971,14 @@ impl App {
         } else {
             origin.map(Box::new)
         };
-        self.start_rating_navigation(stars, RatingNavigationIntent::Direct { from }, return_to);
+        let navigation =
+            self.capture_main_list_navigation(history, self.copied_destination_source_proof());
+        self.start_rating_navigation_owned(
+            stars,
+            RatingNavigationIntent::Direct { from },
+            return_to,
+            navigation,
+        );
     }
 
     fn start_rating_history_replay(
@@ -36294,6 +36395,26 @@ impl App {
         restore_intent: crate::app::StartupListIntent,
         stage: MainListRequestStage,
     ) -> bool {
+        let search_origin = self.capture_search_open_origin();
+        self.start_physical_history_transition_with_dfs_and_search_origin(
+            intent,
+            path,
+            dfs_continuation,
+            restore_intent,
+            stage,
+            search_origin,
+        )
+    }
+
+    fn start_physical_history_transition_with_dfs_and_search_origin(
+        &mut self,
+        intent: PhysicalHistoryIntent,
+        path: PathBuf,
+        dfs_continuation: Option<PhysicalHistoryDfsContinuation>,
+        restore_intent: StartupListIntent,
+        stage: MainListRequestStage,
+        search_origin: Option<crate::global_search_ui::SearchOpenOrigin>,
+    ) -> bool {
         let path = crate::path_key::normalize_input_path(&path);
         let restore_intent = if matches!(intent, PhysicalHistoryIntent::RequiredFullscreen { .. })
             || dfs_continuation
@@ -36326,8 +36447,8 @@ impl App {
                 ClassifiedOpenContinuation::Physical {
                     intent,
                     dfs_continuation,
-
                     restore_intent: restore_intent.clone(),
+                    search_origin,
                 },
                 navigation,
                 stage,
@@ -36342,7 +36463,7 @@ impl App {
                 }
             };
         }
-        self.start_physical_history_transition_classified_at_stage(
+        self.start_physical_history_transition_classified_with_search_origin(
             intent,
             path,
             dfs_continuation,
@@ -36351,6 +36472,7 @@ impl App {
             navigation,
             None,
             stage,
+            search_origin,
         )
     }
 
@@ -36386,6 +36508,32 @@ impl App {
         navigation: MainListNavigation,
         folder_scan: Option<ScannedDir>,
         stage: MainListRequestStage,
+    ) -> bool {
+        let search_origin = self.capture_search_open_origin();
+        self.start_physical_history_transition_classified_with_search_origin(
+            intent,
+            path,
+            dfs_continuation,
+            classified_kind,
+            restore_intent,
+            navigation,
+            folder_scan,
+            stage,
+            search_origin,
+        )
+    }
+
+    fn start_physical_history_transition_classified_with_search_origin(
+        &mut self,
+        intent: PhysicalHistoryIntent,
+        path: PathBuf,
+        dfs_continuation: Option<PhysicalHistoryDfsContinuation>,
+        classified_kind: Option<OpenPathKind>,
+        restore_intent: StartupListIntent,
+        navigation: MainListNavigation,
+        folder_scan: Option<ScannedDir>,
+        stage: MainListRequestStage,
+        search_origin: Option<crate::global_search_ui::SearchOpenOrigin>,
     ) -> bool {
         if !self.main_list_navigation_is_current(&navigation) {
             return false;
@@ -36430,6 +36578,7 @@ impl App {
             dfs_continuation,
             restore_intent,
             stage,
+            search_origin,
         )
     }
 
@@ -36485,6 +36634,7 @@ impl App {
             dfs_continuation,
             restore_intent,
             MainListRequestStage::Continuation,
+            self.capture_search_open_origin(),
         )
     }
 
@@ -36499,6 +36649,7 @@ impl App {
         dfs_continuation: Option<PhysicalHistoryDfsContinuation>,
         restore_intent: StartupListIntent,
         stage: MainListRequestStage,
+        search_origin: Option<crate::global_search_ui::SearchOpenOrigin>,
     ) -> bool {
         if path
             .extension()
@@ -36540,7 +36691,7 @@ impl App {
             dfs_continuation,
             favsearch_origin: self.favsearch.active,
             tag_view_origin: self.tag_view.active,
-            global_search_origin: self.capture_search_open_origin(),
+            global_search_origin: search_origin,
             grid_open_effects: None,
 
             restore_intent: restore_intent.clone(),
@@ -36834,6 +36985,7 @@ impl App {
     fn physical_history_source_is_current(&self, request: &PhysicalHistoryTransition) -> bool {
         if request
             .global_search_origin
+            .as_ref()
             .is_some_and(|origin| !self.search_open_origin_is_current(origin))
         {
             return false;
@@ -38364,10 +38516,16 @@ impl App {
             self.update_tag_view_address();
         }
         if let Some(origin) =
-            global_search_origin.filter(|origin| self.search_open_origin_is_current(*origin))
+            global_search_origin.filter(|origin| self.search_open_origin_is_current(origin))
         {
-            self.retire_search_open_input_focus(origin);
-            self.advance_drilled_current_path(path);
+            self.retire_search_open_input_focus(origin.clone());
+            let child = match &origin {
+                crate::global_search_ui::SearchOpenOrigin::Everything { child, .. } => child,
+                crate::global_search_ui::SearchOpenOrigin::Metadata => {
+                    &crate::global_search_ui::EverythingChildAdmission::Descend
+                }
+            };
+            self.advance_drilled_current_path_with_admission(path, child);
         }
     }
 
@@ -54746,8 +54904,14 @@ impl App {
     }
 
     pub(crate) fn open_books_root(&mut self) {
+        if let Some(root) = self.prepare_books_root_for_navigation() {
+            self.load_folder(root);
+        }
+    }
+
+    fn prepare_books_root_for_navigation(&mut self) -> Option<PathBuf> {
         if self.book_structural_op.is_some() {
-            return;
+            return None;
         }
         let root = self.book_root_path();
         if let Err(err) = std::fs::create_dir_all(&root) {
@@ -54755,9 +54919,9 @@ impl App {
                 "本棚フォルダを作成できません: {}: {err}",
                 root.display()
             ));
-            return;
+            return None;
         }
-        self.load_folder(root);
+        Some(root)
     }
 
     pub(crate) fn request_book_list_refresh(&mut self) {
@@ -62091,6 +62255,19 @@ impl App {
         }
         // DFS スレッドで事前スキャン済みなら UI スレッドの read_dir を省ける。
         let path = target.logical_source().to_path_buf();
+        // Only this admitted list-order result can replace Everything's result-row anchor.
+        // Request freshness uses the current run_sequence; dataset identity uses the frozen run.
+        let mut search_origin = self.capture_search_open_origin();
+        if let FolderNavMode::ListOrder { snapshot, .. } = &result.mode
+            && let ListOrderScope::Everything { run } = snapshot.scope
+            && let Some(crate::global_search_ui::SearchOpenOrigin::Everything { child, .. }) =
+                &mut search_origin
+        {
+            *child = crate::global_search_ui::EverythingChildAdmission::ListOrderRow {
+                dataset_run: run,
+                row: path.clone(),
+            };
+        }
         let smart_kind = target.smart_kind;
         let route = target.route;
         let scanned = match target.scanned {
@@ -62150,7 +62327,7 @@ impl App {
                     true,
                     MainListRequestStage::Continuation,
                 )
-                && self.start_physical_history_transition_with_dfs_at_stage(
+                && self.start_physical_history_transition_with_dfs_and_search_origin(
                     PhysicalHistoryIntent::Navigation {
                         replay: None,
                         auto_fullscreen: false,
@@ -62159,6 +62336,7 @@ impl App {
                     Some(continuation),
                     restore_intent.clone(),
                     MainListRequestStage::Continuation,
+                    search_origin,
                 );
             if !staged {
                 self.clear_pending_folder_nav_steps();
@@ -62230,8 +62408,12 @@ impl App {
                 // 注: close_fullscreen は slideshow_playing=false にするが、SlideshowNext は
                 // resume_slideshow フラグ (= reopen 側で再開) で復帰するので問題ない。
                 self.close_fullscreen_for_folder_nav_reopen();
-                let open_outcome =
-                    self.load_folder_nav_target(route, scanned, restore_intent.clone());
+                let open_outcome = self.load_folder_nav_target_with_search_origin(
+                    route,
+                    scanned,
+                    restore_intent.clone(),
+                    search_origin,
+                );
                 if !matches!(open_outcome, FolderOpenOutcome::Loaded) {
                     let deferred_conversion =
                         matches!(open_outcome, FolderOpenOutcome::ConversionDialogOpened)
@@ -62453,6 +62635,7 @@ impl App {
             request.dfs_continuation = Some(continuation);
             return true;
         }
+        let search_origin = self.capture_search_open_origin();
         let Some(candidate) = self.top_level_grid_view.open_path_classification_mut() else {
             return false;
         };
@@ -62482,6 +62665,7 @@ impl App {
             },
             dfs_continuation: Some(continuation),
             restore_intent: StartupListIntent::PageContinuation,
+            search_origin,
         }));
         true
     }

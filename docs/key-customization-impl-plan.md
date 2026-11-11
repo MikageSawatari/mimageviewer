@@ -66,8 +66,15 @@ INI・設定復元・GUI 入力／capture が共有する action 検証へ通す
 `EachPhysicalPress` で物理押下を数えるが、移動の準備中は既存 gate で拒否し累積しない。
 egui の repeat-only フレームは既存 Ctrl+↑↓ と同じく最大 1 回へまとめ、native は既存 Ctrl+↑↓ と同じく repeat を無視する。
 egui と native 動画の resolver / dispatcher、双方の動画ヘルプへ登録する。
-通常フォルダ一覧から最後に本を開く操作を受け付けた時点の列を使い、DFS / 兄弟移動は維持する。
+通常フォルダ一覧、または Everything の結果一覧から最後に本を開く操作を受け付けた時点の列を使い、DFS / 兄弟移動は維持する。
+§1.682 では accepted run 付き scope と logical_source の照合で Everything の列を分離し、既存の入力 handler・gate は変更しない。
 詳細は [一覧順ナビゲーション設計](list-order-book-navigation-plan.md) を参照。
+
+2026-11-11 §1.688: 既存の場所操作（ドライブ、現在ドライブの root、ドライブ切替、場所▼の固定項目・整理先）を
+検索中も使用可能にする。キー・リング・ジェスチャ・マウスボタン・ゲームパッドの同等入口と場所リストは
+共通の型付き場所ジャンプを使い、成功採用でだけ検索を終了する。★固定・Everything 取得中の制限は維持する。
+お気に入り・アドレス欄・フォルダペイン・メニューバーの入口は変更しない。新しい Action や既定割当は足さない。
+詳細は [検索結果ナビゲーション設計](search-result-navigation-682-688-plan.md) を参照。
 
 2026-10-22: crop / SNS 分割の固定 Escape は、ドラッグ中なら開始前の状態へ戻してドラッグだけを取り消し、
 ドラッグが無ければ従来どおりモードを終了する。消しゴム / 補正レイヤーと同じモード内の取消優先であり、
@@ -666,7 +673,7 @@ ini 出力のみ `;` / `#` を含む表記を KeySlot の別名に置換し、`S
 - FsClose `Enter` (画像のみ P) / FsBackToList `Backspace` (P) / `Esc` (固定)
 - FsJumpFirst/Last `Home/End` (P)
 - FsCtrlNavPrev/Next `Ctrl+↑/↓` (P) / FsSiblingPrev/Next `Ctrl+PageUp/Down` (P)
-- FsListOrderPrev/Next `Ctrl+Shift+↑/↓` (P): 最後に通常フォルダ一覧から本を開いたときの一覧順。準備中は受付拒否、累積なし
+- FsListOrderPrev/Next `Ctrl+Shift+↑/↓` (P): 最後に通常フォルダ / Everything 結果一覧から本を開いたときの一覧順。同じ scope の本だけで使用。準備中は受付拒否、累積なし
 - FsToggleWindowMode `F11` (P)。native 動画経路では App 側 keymap の effective chord を
   presenter へ転送する global snapshot に載せる。
 - レーティングは専用 `[Rating]` グループの `RatingItem*` / `RatingContainer*` / `RatingBookPreferred*` を共有する。

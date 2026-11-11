@@ -3826,6 +3826,7 @@ mod tests {
                     },
                     dfs_continuation: None,
                     restore_intent: StartupListIntent::ExplicitList,
+                    search_origin: None,
                 },
                 _ => unreachable!(),
             };

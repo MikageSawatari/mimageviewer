@@ -313,3 +313,191 @@
 - P3 (比較規則): physical key (`physical_path_spelling`) に揃えた (§2.2-3)。
 - 輸送経路の確認結果 (実フォルダ・staged・`ClassifiedOpenContinuation::Physical`・変換書庫/EPUB cache・direct PDF) を §2.2-5 に記録した。
 - 範囲外の整理、detached 述語・viewport・registry を変更しない点は妥当と確認された。
+
+## 8. 実装記録 (2026-11-11、feat-682-search-nav、未コミット)
+
+実装は本 worktree の差分。製品バイナリの起動・実機観測・コミットは行っていない。
+設計の前提を source で照合し、既存の capture 入口、成功採用境界、Folder 行の採用後に内部書庫を開く順序を維持した。
+App の新しい pending / bool / 次回採用フラグ、detached 述語・viewport・registry 遷移の変更、新しい同期 I/O はない。
+
+### 8.1 変更ファイルと実装
+
+- `src/app/list_order_navigation.rs`: `ListOrderScope`、snapshot の scope、capture / position 共通の
+  `current_list_order_scope`。Everything は accepted run、Root と結果 items のときだけ capture し、
+  position は logical_source の physical key 完全一致と現在の論理場所の所属を照合する。
+- `src/global_search_ui/everything.rs` / `src/global_search_ui.rs`: `EverythingChildAdmission` を
+  `SearchOpenOrigin::Everything` に追加。既定は `Descend`。current origin / accepted dataset run /
+  採用 path と行の physical key / dataset membership が揃った成功採用だけ `ListOrderRow` の基準を採用する。
+  route は保持し、通常の Descend は既存どおり Root からだけ進む。
+- `src/app.rs`: `apply_folder_nav_result` の Everything scope の ListOrder だけが `ListOrderRow` を作る。
+  reading history / rating の既存入口は従来の history を選ぶ wrapper を残し、場所ジャンプだけ
+  `ExitTemporaryView` を渡せる共通 tail にした。本棚作成も既存処理を共通 helper に抽出した。
+- `src/app/location_jump.rs` / `src/app/gamepad_input.rs` / `src/app/update_phases.rs` / `src/ui_main.rs`:
+  `LocationJumpTarget` と `AddressBarNav::LocationJump`、共通入力 helper / dispatch。
+  キー・リング・ジェスチャ・マウスボタン・ゲームパッドのリング・場所リスト・場所▼ (整理先を含む) を通す。
+  場所リストと場所▼は検索中も利用可能。お気に入り・アドレス欄・フォルダペイン・メニューバーは変更しない。
+- `src/app/list_order_tests.rs` / `src/app/list_order_everything_tests.rs` /
+  `src/global_search_ui/everything/tests.rs` / `src/app/location_jump.rs` / `src/app/gamepad_input.rs`: 回帰テスト。
+  `src/tag_view.rs` は遅着完了の破棄を検査する `cfg(test)` 限定の pending constructor だけを追加。
+  `src/app/tests/section1328_session.rs` は場所入力の既存テストの候補型を追従しただけ。
+- `src/app/list_order_worker_tests.rs` / `src/app/native_video.rs` / `src/app/viewer_context_registry.rs` /
+  `src/ui_fullscreen.rs`: 既存の Folder snapshot fixture に scope を明示するだけ。
+  `src/app/startup_ops.rs`: 既存の分類待ち fixture に通常 origin (`None`) を明示するだけ。
+- §6 の設計文書・キー仕様・構造概観、manual 4 ページ、製品紹介カード、backlog §1.682 / §1.688 を更新。
+
+### 8.2 ListOrderRow の全輸送経路
+
+起点はすべて `apply_folder_nav_result`。現在の `capture_search_open_origin()` の child に、
+snapshot の accepted run と宛先の行を付ける。外側 run_sequence を snapshot run で置き換えない。
+
+1. 実フォルダ・画像フォルダ本:
+   `load_folder_nav_target_with_search_origin` → `load_folder_with_scan_owned_with_search_origin` →
+   `load_folder_with_scan_claimed_with_search_origin` → install closure →
+   `commit_staged_search_navigation_effects`。hydration 開始前に検索側も commit する。
+2. ZIP / CBZ・PDF (cold / warm):
+   `start_physical_history_transition_with_dfs_and_search_origin` →
+   `start_physical_history_transition_classified_with_search_origin` → `admit_physical_history_phase` →
+   `PhysicalHistoryTransition.global_search_origin` → `commit_physical_history_transition` →同じ commit。
+   一覧順の PDF は staged へ入り、既存の direct PDF 即時採用経路は変更しない。
+3. EPUB・変換書庫の非同期分類:
+   上記の start → `ClassifiedOpenContinuation::Physical.search_origin` → 分類完了後の
+   `start_physical_history_transition_classified_with_search_origin` → 上記 staged request。
+   分類完了時に origin を再捕捉しない。
+4. 変換確認・パスワード・変換完了・EPUB cache:
+   既存 request 自体が継続を所有し、`commit_converted_physical_history_transition` 等から
+   `commit_physical_history_transition` に戻る。検索へ渡すのは元の `request.path`。
+   backing ZIP/PDF は検索行の identity に使わない。
+5. Folder 行から内部書庫:
+   1 の Folder 行採用で基準を更新 → 既存 fullscreen reopen →
+   `find_fullscreen_nav_target_filtered` →通常の `load_folder_nav_target` (新規捕捉は `Descend`)。
+   内部書庫自身が結果行にあっても、Folder 行の基準を維持する。
+
+成功採用は `commit_staged_search_navigation_effects` →
+`advance_drilled_current_path_with_admission` → `accept_everything_physical_child` の一つの経路。
+通常呼出しの `advance_drilled_current_path` と通常 load の wrapper は `Descend` を維持する。
+App に要求外の輸送 field は増やしていない。
+
+### 8.3 LocationJump の dispatch 箇所
+
+- `src/app/update_phases.rs::post_render_main_navigation`: input / address、context menu の open 結果、grid の 3 match。
+- `src/app.rs::apply_fullscreen_close_nav_immediate`: 即時 dispatcher。
+
+上の 4 か所すべてが `dispatch_location_jump` を呼ぶ。入力側では宛先のみを運び、
+dispatch 時に ★固定・対象 context の Everything 取得中・既存 document modal を照合して、
+現在の検索 owner から Plain / ExitTemporaryView を選ぶ。
+Physical は既存 jump scan、DriveList は synthetic adoption、ReadingHistory / Rating は既存の install / commit へ渡し、
+いずれも成功前に検索を dismiss しない。検索外は従来の各下流入口を使う。
+
+### 8.4 検証
+
+追加テストは 32 件 (ループ内で複数の検索 owner・着地を検査):
+
+- `app/list_order_everything_tests.rs` 12 件: Root/items capture、名前・日付・詳細の昇降順、
+  ★/タグ/facet/Ctrl+F、複数ドライブと media 除外、logical_source と現在場所の physical key、
+  accepted run / 再送信 / 取消 / source 切替、origin と dataset の 2 run、
+  8 着地経路の origin 輸送と Results の選択、通常 close、Parent、Folder→内部書庫と次の押下、取消・失敗・stale。
+- `global_search_ui/everything/tests.rs` 2 件:
+  `list_order_failed_query_preserves_the_accepted_run_snapshot_and_physical_child` と
+  `list_order_row_admission_uses_physical_identity_and_preserves_the_original_route`。
+- `app/location_jump.rs` 15 件: 4 検索 owner の実フォルダ scan 成功/失敗、DriveList / ReadingHistory / BooksRoot /
+  Rating の採用と検索前履歴、Everything Root / PhysicalChild、Plain 候補後の Everything 取得開始・Metadata/favsearch 開始、
+  producer 破棄と遅着送信、同一検索の行更新と新しい検索への切替の採用判定、★固定の再照合、CBZ、input / address / grid の dispatcher、
+  5 宛先の Plain 回帰。Everything fixture は実際に dataset を採用し、accepted 型と元の origin を照合する。
+- `app/gamepad_input.rs` 2 件: キー・リング・マウスボタン・ゲームパッドリング・場所リストの typed transport と、
+  Plain transport / 範囲外のお気に入り Direct の回帰。
+- `ui_main.rs` 1 件: 4 検索 owner で実際の headless toolbar を描画し、場所▼ → 整理先 → 宛先のクリックから
+  typed candidate と非同期受付までを検査する。検索を受付時に閉じないことも照合する。
+
+既存テストの変更理由:
+
+- `list_order_capture_excluded_surfaces_preserve_the_previous_snapshot` は
+  `list_order_capture_excluded_surfaces_and_metadata_preserve_the_previous_snapshot` に改名し、active Metadata を明示。
+  Everything の意図した例外を新しい capture テストへ分けた。従来の除外 surface と保持の assert は残す。
+- 既存 Everything テストの `accept_everything_physical_child` 呼出しは `Descend` を明示し、origin freshness は借用へ追従しただけ。
+  期待する状態や assert は変えていない。
+- 既存 snapshot / 分類待ち fixture の `scope: Folder` / `search_origin: None` は、新しい型の必須 field の指定。
+  native / detached / registry を含め、既存の期待値を緩めたテストはない。
+- `file_organize_destinations_location_menu_navigation_and_snapshot` と
+  `file_organize_destinations_many_location_entries_scroll_and_select_last` は整理先の候補型だけを
+  `Direct` から `LocationJump(Physical)` へ変更。Plain も dispatch で mode を決める意図した仕様変更への追従で、
+  宛先 path・snapshot・menu close・スクロールの assert は残した。履歴・お気に入り・アドレス欄の期待値は変えない。
+- `section1328_session` の場所キー入力の候補だけを `ReadingHistory(Menu)` から
+  `LocationJump(ReadingHistory)` へ変更。4 つの入力 lane の採用・選択・履歴の検査と、親へ戻る場合の旧候補型は維持する。
+
+独立 read-only 実装レビュー (Sol / xhigh) は製品の構造を ACCEPT。
+レビューで見つかったテスト fixture の Everything 未採用と Plain→非modal検索の未収録は補完し、focused 再レビューで解消済み。
+検証対象は本節の未コミット差分、Windows / MSVC / 通常 feature set。
+Cargo 実行では `MSBUILDDISABLENODEREUSE=1` を使用。最初の直接 nextest は `CARGO_BUILD_JOBS=1`、
+関連一式・最後の単独再検証・確認用 build は `CARGO_BUILD_JOBS=4`。
+full suite は設計担当の PC 全体 lock 下で行うため、この実装セッションでは実行しない。
+
+初回の場所ジャンプ 15 件は 3 成功 / 12 失敗。新規 fixture の履歴参照が旧 flat field を見ていたため、
+A/B の正規 owner を読む `folder_history_back_entry()` へ修正した。★固定は元から検索を閉じるので固定直後を拒否前の基準にした。
+同一 query の行更新は path を所有する明示ジャンプを継続できる既存契約であり、items generation の変更だけで拒否されるという
+新規テストの前提を訂正した。新しい検索への切替は既存の退役入口と保存した遅着 scan で検査する。
+Everything の producer 破棄は、別 query に替えてジャンプを無効化せず、同じ採用 query のまま pending を開始して検査する。
+これらはテストだけの修正で、製品の adoption / history / Snapshot 規則は変更していない。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --lib --tests` | 本体 lib / lib tests の型検査は通過。対象外の既存 `tests/catalog_integration.rs` の `CatalogDb::save` 4 呼出しが `CoverIdentity` 引数未指定で E0061。`src/catalog.rs` と当該テストは HEAD と同じで、今回変更していない。コマンド全体は失敗 (shell exit 1)。初回の新 variant の match / fixture 必須 field の指定漏れは修正済み |
+| `cargo check -p mimageviewer --lib` | 成功、3m46s。`target/search-nav-lib-check.log` |
+| `.\scripts\test-focused.ps1 -PlanOnly` | broad/shared 入力を検知して exit 2、テスト未実行。案内された full gate は実行していない |
+| `.\scripts\test-focused.ps1 -Path src/app/location_jump.rs` | 2 回ともテスト開始前に `turbojpeg-sys` CMake/MSBuild で失敗 (0 件実行)。native の原因は未確定。ログは `target/test-focused/runs/20261111T053346910Z-51e8f29b/` と `20261111T054149346Z-de596bd3/` |
+| `cmake --build target/debug/build/turbojpeg-sys-f4a0b3122eba9190/out/build --target install --config Debug --parallel 1 -- /verbosity:normal` | 同じ workspace の native 生成物の準備は成功 (exit 0、0 エラー、4m07s)。ただし成功時の ZERO_CHECK は up-to-date で、並列数を原因とは確定していない。`target/search-nav-turbojpeg-build.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(app::location_jump::)' --no-fail-fast` | native 段階を通過、初回 test compile 23m15s。15 実行 / 3 成功 / 12 失敗 (上記新規 fixture の誤り)。`target/search-nav-location-nextest.log`、nextest exit 100 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(list_order) \| test(everything) \| test(location) \| test(gamepad) \| test(jump) \| test(section1328)' --no-fail-fast` | 717 実行 / 716 成功 (slow 3) / 1 失敗、180.044s、compile 4m34s。残る失敗は新規テストが Everything Root の `current_folder` を合成パスと決め付けたもの。`target/search-nav-focused-nextest.log`、nextest exit 100 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(location_jump_same_query_refresh_adopts_but_new_query_rejects_old_scan)' --no-fail-fast` | 実際の受付前の folder を保存し、拒否後の不変を検査するようそのテスト内だけを修正。1 実行 / 1 成功、2.281s、compile 2m31s、exit 0。`target/search-nav-fixture-nextest.log` |
+| `cargo fmt` (workspace、引数なし) / `cargo fmt --check` | 実行済み、成功。最後のソース変更後にも workspace 全体へ適用 |
+| `python scripts/check_ui_glyphs.py` | 成功、危険 glyph 0 件 |
+| `python scripts/check_site_cards.py` | 成功、53 cards / 上限超過 0 件 |
+| `git diff --check` | 成功 |
+| `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | 最終実行は exit 0 / DONE。本体 10m06s、付属 4 executable も生成し、FFmpeg / VCRT / EffeTune 配置と最終 PE gate `runtime=4 pe=5` が成功。通常 profile / 通常 feature set、portable 無効。実行条件は下記。取得した出力は `target/search-nav-build-dev-final.log` (大量の警告には tool 側の省略を含む)、PE report は `target/vcrt-pe-reports/dev-runtime.json`。製品は起動していない |
+
+最終の関連検証は **717 個の異なるテストで成功** (有効な 716 件 + 修正後の単独 1 件を再利用)。
+最後の変更は当該 1 テスト内の受付前 folder 保存と不変 assert だけで、製品・共通 fixture・他の 716 件は不変のため、
+build/test policy に従い一式を重複実行していない。直接 nextest 等のログは `.\target\search-nav-run.py` で保存し、
+それ以外の結果は当セッションのコマンド出力にも残した。これらは非対話検査で、
+製品バイナリの起動やユーザーの実設定による実機検証の代替ではない。
+native 調査は生成物 / 実行条件だけに限定し、依存ソース・build logic・個人設定は変更せず、他セッションの process も停止していない。
+
+確認用 build の初回も、新しい `dev-runtime` 用 `turbojpeg-sys` の CMake/MSBuild Checking Build System で失敗した。
+`C1041` / `MSB3191` の具体的診断はなく、原因は未確定。
+Cargo が生成した同じ native build directory に対して
+`cmake --build target/dev-runtime/build/turbojpeg-sys-ad9ab6b47bbc75e3/out/build --target install --config RelWithDebInfo --parallel 1 -- /verbosity:normal`
+を実行し、成功 (exit 0、0 エラー、5m00.75s、`target/search-nav-turbojpeg-runtime.log`) を確認した。
+これは同じ `turbojpeg-sys 1.2.0` の RelWithDebInfo / MT 生成物であり、先の Debug / MTd 生成物は流用していない。
+
+その後の確認用 build では、同依存が提供する explicit / static 指定をプロセス環境変数で使用した。
+`out/lib/turbojpeg-static.lib` を本 worktree 内の `target/turbojpeg-runtime-explicit/lib/turbojpeg.lib` にコピーし、
+SHA256 が一致することを照合した。指定は次のとおり (すべて今回の PowerShell process 内だけ):
+
+```powershell
+$env:X86_64_PC_WINDOWS_MSVC_TURBOJPEG_SOURCE = 'explicit'
+$env:X86_64_PC_WINDOWS_MSVC_TURBOJPEG_STATIC = '1'
+$env:X86_64_PC_WINDOWS_MSVC_TURBOJPEG_LIB_DIR = 'G:\home\mimageviewer-682\target\turbojpeg-runtime-explicit\lib'
+$env:X86_64_PC_WINDOWS_MSVC_TURBOJPEG_INCLUDE_DIR = 'G:\home\mimageviewer-682\target\dev-runtime\build\turbojpeg-sys-ad9ab6b47bbc75e3\out\include'
+$env:CXXFLAGS_x86_64_pc_windows_msvc = '/IG:\home\mimageviewer-682\target\dev-runtime\build\turbojpeg-sys-ad9ab6b47bbc75e3\out\include'
+$env:MSBUILDDISABLENODEREUSE = '1'
+$env:CARGO_BUILD_JOBS = '4'
+.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0
+```
+
+依存の build script 出力で `cargo:rustc-link-lib=static=turbojpeg` と上記の library / include directory を確認した。
+最初の explicit 指定では libraw の `jpeglib.h` 探索が C1083 で失敗した
+(`target/search-nav-build-dev-explicit-header-failure.log`)。
+ヘッダーは存在し、依存の `fs::canonicalize` が `\\?\G:\...` 表記を下流へ渡していた。
+同じ MSVC `cl.exe /nologo /EP` と `__has_include(<jpeglib.h>)` だけの非実行 probe で、
+通常表記の `/IG:\...\include` は exit 0、`/I\\?\G:\...\include` は exit 2 になる差を確認した。
+そこで上記の target 固有 `CXXFLAGS` に通常表記の include を追加した。製品・依存・build script のソース修正はない。
+`-PreserveRuntime` は稼働中の開発用 runtime を停止しないため、待機時間 0 は所有者を確認できない他セッションの
+MSBuild process を止めずに進めるための既存オプションである。通常 feature set / portable 無効は変えていない。
+
+確認用成果物は `target/dev-runtime/mimageviewer-core.exe` と同 directory の remote / EPUB PDF / MCP /
+music-video companion。最終 build の後に 5 ファイルの存在・更新日時を照合した。
+利用者の手動確認は、インストール版・トレイ常駐版を閉じてから
+`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
+既定では通常の `%APPDATA%\mimageviewer` を使用し、実設定・データを更新し得る。single-instance mutex も共用する。
+確認対象は Everything の一覧順移動と移動先行への Results 復帰、Folder 行から内部書庫へ進む場合の基準、
+各検索中の場所ジャンプの成功時終了 / 失敗時保持と、検索外の同等操作。
+実機結果・full suite・コミットは設計担当へ引き継ぐ。

@@ -360,7 +360,9 @@ fn session1328_reading_zip_main_return(input: Session1328ReadingReturn) {
                 .expect("explicit reading-history command");
             assert!(matches!(
                 nav,
-                crate::ui_main::AddressBarNav::ReadingHistory(ReadingHistoryEntrance::Menu)
+                crate::ui_main::AddressBarNav::LocationJump(
+                    crate::ui_main::LocationJumpTarget::ReadingHistory
+                )
             ));
             let mut navigation = session1328_main_navigation();
             match lane {
