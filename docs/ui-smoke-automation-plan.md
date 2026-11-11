@@ -592,6 +592,18 @@ mainを除外しない。同じcontextでもROOTとDetachedの表示ownerは別�
 一覧ROOTはread-onlyなtarget一覧の提供に限定し、一覧描画の完了証跡は追加しない。
 一覧自身は新しいviewport/paint証跡を発行しない。値は初回の未観測（false/0）または
 同ownerの過去fullscreen callbackの履歴であり、一覧の描画失敗・完了を示す値ではない。
+§1.483（2026-11-11）では、main が mounted、専用全画面 host が表示済みで、active detached
+および detached 切替がない場合に限り `MainFullscreen` の typed input owner を追加する。
+main context serial・専用 viewport ID・実 HWND・backend token を固定し、role は `fullscreen`、
+window ID／host incarnation は absent とする。Root の意味と Detached の判定／activation は変えない。
+既存の Focus 取得、actual backend witness と pass owner の照合、consume／peek、stale 拒否を
+共有する。全画面が閉じた／再生成された後に新しい host へ自動で付け替えない。
+selected capture も専用 viewport を使い、all capture は既存の `host_styles` の fullscreen を使う。
+この追加は入力宛先だけで、専用全画面の paint 証跡はまだ発行しない（false／0 は未観測）。
+Root を現在の入力先へ読み替える案、LegacyImplicit への退避、Focus 抑止 bool は採らない。
+first-ai は保存した同じ owner へ AI／close を送り、各 ACK 後は Root を選んで既存の
+Observe／evidence／quit 契約を維持する。選択自体は Focus を送らない。実アプリ確認は未実行。
+
 一覧の開始条件は既存のtarget登録・focus・items状態で確認する。ROOTの画像paint証拠は
 実際にROOT内でfullscreen画像を描く経路に限る。
 
@@ -658,7 +670,7 @@ pass の更新に先行し得る。順序が必要な scenario は `snapshot_fra
 これは描画完了の証拠ではなく grid 入力の状態 barrier であり、固定 sleep は使わない。
 未選択の`LegacyImplicit`は、従来の最初の該当consumerへの配送・ROOT frame基準のexpiryを
 維持する。窓固定の保証は持たず、新しいforeground/host登録条件を加えない。
-明示`Targeted`はS1aのRoot/Detached exact identityを保持し、受付時にも再検証する。
+明示`Targeted`はRoot/Detached/MainFullscreen exact identityを保持し、受付時にも再検証する。
 Targetedがstale・未登録・不適合の場合にLegacyへfallbackしてはならない。
 
 - 暗黙操作のownerをpresentationやKeyAction scopeだけで固定する初期案は撤回した。

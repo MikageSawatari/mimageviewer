@@ -279,6 +279,12 @@ pub(crate) enum TestScriptWindowIdentity {
         hwnd: u64,
         backend_token: u64,
     },
+    MainFullscreen {
+        context_serial: u64,
+        viewport_id: egui::ViewportId,
+        hwnd: u64,
+        backend_token: u64,
+    },
     Detached {
         window_id: u64,
         context_serial: u64,
@@ -293,35 +299,38 @@ impl TestScriptWindowIdentity {
     pub(crate) fn role(&self) -> &'static str {
         match self {
             Self::Root { .. } => "root",
+            Self::MainFullscreen { .. } => "fullscreen",
             Self::Detached { .. } => "detached",
         }
     }
 
     pub(crate) fn window_id(&self) -> Option<u64> {
         match self {
-            Self::Root { .. } => None,
+            Self::Root { .. } | Self::MainFullscreen { .. } => None,
             Self::Detached { window_id, .. } => Some(*window_id),
         }
     }
 
     pub(crate) fn context_serial(&self) -> u64 {
         match self {
-            Self::Root { context_serial, .. } | Self::Detached { context_serial, .. } => {
-                *context_serial
-            }
+            Self::Root { context_serial, .. }
+            | Self::MainFullscreen { context_serial, .. }
+            | Self::Detached { context_serial, .. } => *context_serial,
         }
     }
 
     pub(crate) fn viewport_id(&self) -> egui::ViewportId {
         match self {
             Self::Root { .. } => egui::ViewportId::ROOT,
-            Self::Detached { viewport_id, .. } => *viewport_id,
+            Self::MainFullscreen { viewport_id, .. } | Self::Detached { viewport_id, .. } => {
+                *viewport_id
+            }
         }
     }
 
     pub(crate) fn host_incarnation(&self) -> Option<u64> {
         match self {
-            Self::Root { .. } => None,
+            Self::Root { .. } | Self::MainFullscreen { .. } => None,
             Self::Detached {
                 host_incarnation, ..
             } => Some(*host_incarnation),
@@ -330,15 +339,17 @@ impl TestScriptWindowIdentity {
 
     pub(crate) fn hwnd(&self) -> u64 {
         match self {
-            Self::Root { hwnd, .. } | Self::Detached { hwnd, .. } => *hwnd,
+            Self::Root { hwnd, .. }
+            | Self::MainFullscreen { hwnd, .. }
+            | Self::Detached { hwnd, .. } => *hwnd,
         }
     }
 
     pub(crate) fn backend_token(&self) -> u64 {
         match self {
-            Self::Root { backend_token, .. } | Self::Detached { backend_token, .. } => {
-                *backend_token
-            }
+            Self::Root { backend_token, .. }
+            | Self::MainFullscreen { backend_token, .. }
+            | Self::Detached { backend_token, .. } => *backend_token,
         }
     }
 
@@ -358,6 +369,14 @@ impl TestScriptWindowIdentity {
                 hwnd,
                 backend_token,
             } => format!("root/context={context_serial}/hwnd=0x{hwnd:x}/backend={backend_token}"),
+            Self::MainFullscreen {
+                context_serial,
+                viewport_id,
+                hwnd,
+                backend_token,
+            } => format!(
+                "fullscreen/context={context_serial}/viewport={viewport_id:?}/hwnd=0x{hwnd:x}/backend={backend_token}"
+            ),
             Self::Detached {
                 window_id,
                 context_serial,
@@ -4011,6 +4030,15 @@ impl UiRuntime {
                         })?;
                     match identity {
                         TestScriptWindowIdentity::Root { .. } => Ok(vec![root]),
+                        TestScriptWindowIdentity::MainFullscreen { viewport_id, .. } => {
+                            Ok(vec![capture::Target {
+                                viewport_id: *viewport_id,
+                                role: "fullscreen".into(),
+                                hwnd: Some(identity.hwnd()),
+                                availability: availability(*viewport_id),
+                                presentation: target_window.presentation,
+                            }])
+                        }
                         TestScriptWindowIdentity::Detached {
                             window_id,
                             context_serial,
@@ -4348,7 +4376,11 @@ impl UiRuntime {
                     return None;
                 };
                 let phase = match (&owner, window.residence.as_str()) {
-                    (TestScriptWindowIdentity::Root { .. }, "mounted" | "at_rest") => {
+                    (
+                        TestScriptWindowIdentity::Root { .. }
+                        | TestScriptWindowIdentity::MainFullscreen { .. },
+                        "mounted" | "at_rest",
+                    ) => {
                         if target_focused {
                             TargetedActionPhase::AwaitingPass
                         } else {
@@ -8556,6 +8588,15 @@ mod tests {
         }
     }
 
+    fn main_fullscreen_identity(context_serial: u64, generation: u64) -> TestScriptWindowIdentity {
+        TestScriptWindowIdentity::MainFullscreen {
+            context_serial,
+            viewport_id: egui::ViewportId::from_hash_of(("fullscreen_viewer", generation)),
+            hwnd: 0x5000 + generation,
+            backend_token: 0x6000 + generation,
+        }
+    }
+
     fn detached_identity_from_witness(
         witness: eframe::miv_test_script_window_witness::WindowWitness,
         context_serial: u64,
@@ -9286,6 +9327,267 @@ mod tests {
     }
 
     #[test]
+    fn main_fullscreen_target_focus_and_consumers_are_separate_from_root_and_detached() {
+        let root = root_identity(11, 0x503);
+        let fullscreen = main_fullscreen_identity(11, 1);
+        let detached = window_identity(7, 12, 14);
+        let mut runtime = local_runtime();
+        runtime
+            .publish_windows(vec![
+                window_snapshot(root.clone(), 17, 0, "still"),
+                window_snapshot(fullscreen.clone(), 17, 0, "still"),
+                window_snapshot(detached.clone(), 18, 0, "sibling"),
+            ])
+            .unwrap();
+        for target in [&fullscreen, &root] {
+            for action in [KeyAction::FsAiModelRealEsrGeneralV3, KeyAction::FsClose] {
+                let (applied, ack) = mpsc::sync_channel(1);
+                assert_eq!(
+                    runtime.queue_action(
+                        action,
+                        TestScriptActionSelection::Targeted(target.clone()),
+                        action_request_for_test(applied),
+                        false,
+                    ),
+                    Some(target.viewport_id())
+                );
+                assert!(runtime.pending_targeted_detached_action().is_none());
+                let mut requested = None;
+                assert!(request_action_target_focus_with(
+                    target,
+                    Some(target),
+                    |_| true,
+                    0,
+                    |_| panic!("another HWND is foreground"),
+                    |id| requested = Some(id),
+                ));
+                assert_eq!(requested, Some(target.viewport_id()));
+                assert!(!runtime.consume_action(Some(target), action));
+                assert_eq!(
+                    runtime.promote_focused_action_targets(|owner| owner == target),
+                    vec![target.viewport_id()]
+                );
+                for other in [&root, &fullscreen, &detached]
+                    .into_iter()
+                    .filter(|owner| *owner != target)
+                {
+                    assert!(!runtime.peek_action(Some(other), action));
+                    assert!(!runtime.consume_action(Some(other), action));
+                    assert!(
+                        runtime
+                            .probe_targeted_action(
+                                other,
+                                &[CommandScope::FsImage, CommandScope::FsCommon]
+                            )
+                            .is_none()
+                    );
+                    runtime.finish_target_pass(other, true, 1);
+                }
+                assert!(matches!(ack.try_recv(), Err(mpsc::TryRecvError::Empty)));
+                assert!(runtime.consume_action(Some(target), action));
+                assert_eq!(ack.try_recv(), Ok(Ok(())));
+                assert!(!runtime.consume_action(Some(target), action));
+            }
+        }
+    }
+
+    #[test]
+    fn main_fullscreen_target_is_stale_after_close_or_any_identity_change() {
+        let original = main_fullscreen_identity(11, 1);
+        let TestScriptWindowIdentity::MainFullscreen {
+            context_serial,
+            viewport_id,
+            hwnd,
+            backend_token,
+        } = original.clone()
+        else {
+            unreachable!()
+        };
+        let replacements = [
+            None,
+            Some(TestScriptWindowIdentity::MainFullscreen {
+                context_serial: context_serial + 1,
+                viewport_id,
+                hwnd,
+                backend_token,
+            }),
+            Some(TestScriptWindowIdentity::MainFullscreen {
+                context_serial,
+                viewport_id: egui::ViewportId::from_hash_of("recreated"),
+                hwnd,
+                backend_token,
+            }),
+            Some(TestScriptWindowIdentity::MainFullscreen {
+                context_serial,
+                viewport_id,
+                hwnd: hwnd + 1,
+                backend_token,
+            }),
+            Some(TestScriptWindowIdentity::MainFullscreen {
+                context_serial,
+                viewport_id,
+                hwnd,
+                backend_token: backend_token + 1,
+            }),
+        ];
+        for replacement in replacements {
+            let mut runtime = local_runtime();
+            runtime
+                .publish_windows(vec![window_snapshot(original.clone(), 17, 0, "still")])
+                .unwrap();
+            let (applied, ack) = mpsc::sync_channel(1);
+            runtime.queue_action(
+                KeyAction::FsClose,
+                TestScriptActionSelection::Targeted(original.clone()),
+                action_request_for_test(applied),
+                true,
+            );
+            let windows = replacement
+                .as_ref()
+                .map(|owner| window_snapshot(owner.clone(), 17, 0, "still"))
+                .into_iter()
+                .collect();
+            runtime.publish_windows(windows).unwrap();
+            assert!(
+                ack.try_recv()
+                    .unwrap()
+                    .unwrap_err()
+                    .contains("no longer current")
+            );
+            assert!(runtime.pending_actions.is_empty());
+            let (applied, ack) = mpsc::sync_channel(1);
+            assert_eq!(
+                runtime.queue_action(
+                    KeyAction::FsClose,
+                    TestScriptActionSelection::Targeted(original.clone()),
+                    action_request_for_test(applied),
+                    true
+                ),
+                None
+            );
+            assert!(
+                ack.try_recv()
+                    .unwrap()
+                    .unwrap_err()
+                    .contains("no longer current")
+            );
+            assert!(!request_action_target_focus_with(
+                &original,
+                replacement.as_ref(),
+                |_| panic!("stale logical owner"),
+                0,
+                |_| panic!("stale focus"),
+                |_| panic!("stale focus")
+            ));
+            assert!(!runtime.consume_action(None, KeyAction::FsClose));
+        }
+    }
+
+    #[test]
+    fn main_fullscreen_selected_capture_uses_the_dedicated_viewport_once() {
+        let root = root_identity(11, 0x503);
+        let fullscreen = main_fullscreen_identity(11, 1);
+        let mut runtime = local_runtime();
+        runtime
+            .publish_windows(vec![
+                window_snapshot(root, 17, 0, "still"),
+                window_snapshot(fullscreen.clone(), 17, 0, "still"),
+            ])
+            .unwrap();
+        let style = TestScriptHostStyle {
+            role: "fullscreen".into(),
+            window_id: None,
+            presentation: TestScriptWindowPresentation::ActiveImmediate,
+            viewport: format!("{:?}", fullscreen.viewport_id()),
+            viewport_id: Some(fullscreen.viewport_id()),
+            hwnd: fullscreen.hwnd(),
+            backend_token: Some(fullscreen.backend_token()),
+            topmost: false,
+            noactivate: false,
+            minimized: false,
+            visible: true,
+            owner_hwnd: 0,
+            foreground_hwnd: 0,
+        };
+        runtime.snapshot.write().unwrap().host_styles = vec![style];
+        let registered =
+            std::collections::HashSet::from([egui::ViewportId::ROOT, fullscreen.viewport_id()]);
+        let selection = TestScriptActionSelection::Targeted(fullscreen.clone());
+        let selected = runtime
+            .capture_targets(CaptureScope::Selected, &selection, &registered)
+            .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].viewport_id, fullscreen.viewport_id());
+        assert_eq!(selected[0].hwnd, Some(fullscreen.hwnd()));
+        let all = runtime
+            .capture_targets(CaptureScope::All, &selection, &registered)
+            .unwrap();
+        assert_eq!(
+            all.iter()
+                .filter(|target| target.viewport_id == fullscreen.viewport_id())
+                .count(),
+            1
+        );
+        runtime.publish_windows(vec![]).unwrap();
+        assert!(
+            runtime
+                .capture_targets(CaptureScope::Selected, &selection, &registered)
+                .is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn first_ai_actions_select_the_same_fullscreen_and_restore_root_after_ack() {
+        let root = root_identity(11, 0x503);
+        let fullscreen = main_fullscreen_identity(11, 1);
+        let fullscreen_window = window_snapshot(fullscreen.clone(), 17, 0, "still");
+        let mut snapshot = ready_snapshot();
+        snapshot.windows = vec![
+            window_snapshot(root.clone(), 17, 0, "still"),
+            fullscreen_window.clone(),
+        ];
+        let (bridge, rx, _) = runner_bridge(snapshot);
+        let runner = bridge.clone();
+        let worker = std::thread::spawn(move || {
+            for action in [KeyAction::FsAiModelRealEsrGeneralV3, KeyAction::FsClose] {
+                release_checks::run_first_ai_viewer_action(&runner, &fullscreen_window, action)
+                    .unwrap();
+                assert_eq!(
+                    runner.action_selection().unwrap(),
+                    TestScriptActionSelection::Targeted(root.clone())
+                );
+            }
+        });
+        for expected in [KeyAction::FsAiModelRealEsrGeneralV3, KeyAction::FsClose] {
+            loop {
+                match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+                    UiCommand::Log(_) => {}
+                    UiCommand::RunAction {
+                        action,
+                        selection,
+                        request,
+                    } => {
+                        assert_eq!(action, expected);
+                        assert_eq!(
+                            selection,
+                            TestScriptActionSelection::Targeted(fullscreen.clone())
+                        );
+                        assert!(request.try_deliver());
+                        break;
+                    }
+                    command => panic!("selection must not request focus: {command:?}"),
+                }
+            }
+        }
+        worker.join().unwrap();
+        assert!(
+            rx.try_iter()
+                .all(|command| matches!(command, UiCommand::Log(_)))
+        );
+    }
+
+    #[test]
     fn fullscreen_open_action_never_queues_source_focus_in_its_dispatch_pass() {
         let owner = root_identity(11, 0x503);
         let action = KeyAction::GridOpenSelected;
@@ -9672,7 +9974,7 @@ mod tests {
             hwnd: Some(identity.hwnd()),
             backend_token: Some(identity.backend_token()),
             residence: "at_rest".to_string(),
-            presentation: if identity.window_id().is_some() {
+            presentation: if !matches!(identity, TestScriptWindowIdentity::Root { .. }) {
                 TestScriptWindowPresentation::ActiveImmediate
             } else {
                 TestScriptWindowPresentation::Root
