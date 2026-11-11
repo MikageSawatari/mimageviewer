@@ -180,9 +180,16 @@ egui は既定 (`SurrenderFocusOn::Clicks`) で、フォーカス中の TextEdit
   フォーカスの無い欄の▼で開いた直後の 1〜2 pass) は、egui がフォーカスを外すことがある。その場合も
   手順 4 で一覧は閉じ、検索は終了しない。フォーカスが外れるだけなので、回復処理は足さない。
 - claim は「検索を終了させない」ためのもので、一覧を閉じるのは `take_escape` 自身が行う。
+- `take_escape` が true を返した pass は、§5.2 の離脱の判定 (`settle_search_input_departure`) から除外する
+  (戻り値を同じ pass の update の中で settle へ渡すだけで、状態は持たない)。filter が効く前の Esc で
+  フォーカスが外れても、一覧を閉じただけの操作として記録しない。
+- 既存の挙動 (今回は変えない): 入力欄の右クリックの編集メニュー (egui の Popup) は Esc を見て閉じるが消費しないので、
+  今の版でも、編集メニューを開いた検索欄で Esc を押すと、メニューが閉じたうえで検索の Esc 振り分けも動く。
+  履歴の一覧はこの場合に Esc を取らない (手順 3) ので、この挙動を変えも悪化させもしない。直すなら別の項目にする。
 - 確かめる操作: 一覧が閉じた状態での Esc (従来どおり)、▼で開いてから Esc、↓で開いてから Esc、
   一覧を閉じた直後にもう一度 Esc (従来の Esc の動作になる)、履歴を開いたまま入力欄を右クリック→Esc
-  (編集メニューが閉じる)、アドレス欄での同じ操作。
+  (履歴の一覧は閉じ、その Esc は従来どおり編集メニューと検索に渡る)、アドレス欄での同じ操作。
+  フォーカスの無い欄の▼で開き、フォーカスが入った直後の Esc で、一覧が閉じ、検索は続き、記録されないこと。
 - これらは入力欄の中だけで効く固定の部品操作 (ComboBox と同じ扱い) なので `KeyAction` にはしない。
   固定にする理由を [keymap-spec.md](keymap-spec.md) の固定入力の節に書く。
 
@@ -235,7 +242,7 @@ data_dir の解決に従う。
    - 新しい `App::settle_search_input_departure(ctx)` を、メイン viewport の update で
      **`route_search_escape` の直後、`record_search_input_focus` の直前** (app.rs の現在 101051〜101052 行の間。
      `render_grid` より前) に呼ぶ。ここでは記録 (`search_input_owner` の古い値) を読み、それが
-     **直前の pass (`記録した pass + 1 == 今の pass`) の記録**で、`Some(input)` で、今フォーカスがその入力欄に
+     **直前の pass (`記録した pass + 1 == 今の pass`) の記録**で、この pass で `take_escape` が Esc を取っておらず、`Some(input)` で、今フォーカスがその入力欄に
      無ければ、`input.kind()` の離脱として次をすべて満たすときだけ記録する (途中 return を挟んだ古い記録は
      使わず、過去の離脱を後から補わない):
      - その kind の検索がまだ続いている (`edit_owner(kind)`。この pass の Esc・× で終了・解除していれば false)
