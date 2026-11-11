@@ -1435,3 +1435,43 @@ Esc では検索結果へ戻った、と報告された。設計担当が「そ�
   タイトル・アドレスが通常の本の表示になり、← で検索前の場所へ戻る。検索なしは今と同じ (「本棚 > 名前」、← で戻る)。
 - 入口の列挙をテストで押さえる: 物理の場所・本へ移る `KeyAction` / `MenuCommandId` を列挙し、それぞれが検索中に検索を残したまま
   移らないことを検査する (新しい入口が足されたときに漏れが検出されるよう、列挙はキーマップ・メニューの一覧から取る)。
+
+### 12.3 決定: 出発 context の移譲を、検索の退役より先に行う (2026-11-12、設計担当)
+
+§8.13 の停止 (採用後に F12 側へ移した元 context の検索が消える) への設計判断。観測は headless の既存回帰
+`collection_open_from_detached_transient_video_keeps_fallback_return_folder` の失敗で、実機の観測ではない。
+
+**守る不変条件**: 検索の owner (`global_search` / `favsearch` / `tag_view`、Search surface と return origin) は、それを表示している
+context のもの。採用で出発 context が detached window へ移る (再生中の detached メディアの promote 等) とき、移る context は検索を
+**そのまま**持って行く。「検索を終える」は、採用後も main に残って移動先を表示する context にだけ適用する。
+
+**違反している経路**: 共通 adopter (`adopt_main_list_navigation_with_completion`) が `dismiss_transparent_view_for_admitted_jump` で
+検索を退役させてから `install` を呼び、installer の中 (`prepare_collection_main_context_change` / `install_loading_items_inner` の
+`change_main_context_for_visible_grid_*`) で出発 context が移譲される。§12 で collection が共通 adopter に乗ったことで回帰が見えたが、
+同じ順序は既に共通 adopter を使う `ExitTemporaryView` 系列 (§1.688 の場所ジャンプ、既存の「フォルダに移動」) にもある。
+
+**決定**: 出発 context を main から外す既存の境界 (promote / park / close) を、`ExitTemporaryView` の検索退役より**先に**通す。
+順序は「読み取りだけの受付・current 照合 → 出発 context の移譲 (既存境界) → main に残った context へ検索退役・facet・rows・履歴の
+成功採用」。既存の Plain のコレクション open (`open_collection_grid` が `prepare_collection_main_context_change` →
+`retire_transient_views_for_collection` の順) と同じ順序にそろえるもので、新しい順序を作るのではない。
+
+制約 (実装):
+
+1. 移譲境界の関数 (`change_main_context_for_visible_grid_for_destination`、promote / park / bind / registry、detached 述語・viewport)
+   の中身は変えない。変えるのは呼ぶ位置だけ。
+2. 1 回の採用で移譲境界を通るのは 1 回。installer 側の既存呼び出しは、共通 adopter 以外の経路でも使うので消せない場合、
+   2 回目が副作用 (`cancel_collection_navigation_intent` 等) で採用中の要求を壊さないことを確かめる。確かめられない場合は、
+   installer が「既に移譲済み」を受け取る形 (引数・要求の型) にし、App に新しい bool / Option を足さない。
+3. `block_locked_media` は installer ごとの今の値 (collection は true で受付時に検査済み、物理は false) をそのまま使う。
+4. 検索なし・`ExitTemporaryView` 以外の purpose の順序と結果は変えない。変えるなら理由を記録してレビューへ回す。
+5. 出発 context の移譲より前に、出発 context を変える処理 (`save_leaving_folder_grid_position`、facet route の採用など) が
+   adopter に無いかを列挙し、あれば同じ規則 (移譲の後、main に残った context へ) で扱う。列挙結果は §8 に書く。
+6. 既存の detached 回帰は削らない・弱めない。追加する回帰: 4 種の検索 × (物理の場所ジャンプ・本・コレクション) で、
+   detached メディアが再生中に main で移動したとき、移った側の context が検索 (surface・owner・rows・return) を保ち、
+   main は移動先を検索なしで表示し ← で検索前へ戻る。移譲が起きない場合 (detached なし) の既存結果も対照に置く。
+
+単純化の検討 (CLAUDE.md): 「detached メディア再生中は検索中の移動を断る」は今できる操作を減らす退行なので採らない。
+「F12 側を閉じる」も再生中のメディアを止める退行なので採らない。既存経路と同じ順序へそろえる案が、状態を増やさずに済む。
+
+detached の凍結ルールにより、本決定は設計担当と独立レビューの双方が「症状パッチではなく構造修正」と合意してから実装し、
+[detached リワーク計画 §11](detached-rework-plan.md) に記録する。
