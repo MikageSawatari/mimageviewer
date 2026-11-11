@@ -300,3 +300,95 @@ cargo nextest run --build-jobs 1 -p mimageviewer --lib -E 'test(delete_confirm_t
 ```
 
 関連85件には追加3件を含むため、88件の異なるテストとは数えない。確認文・状態遷移・コレクション／ブックマーク境界・Shell共有対象・worker開始の拒否・XMP削除後の遅着・worker本体の回帰を含む。全件gateと確認用buildは従来の設計担当への引き継ぎのまま、本追補では実行していない。製品起動・git変更操作も行っていない。
+
+### 追補: 外部ツールの混在チェックからフォルダだけを除く（2026-11-11）
+
+§3.5 の利用者決定を実装。`checked_external_target_index` を対象 index 選別の共通関数とし、
+`resolve_external_targets` と `external_tool_context_menu_descriptor` の `ordered_checked_indices`、
+および起動前のフレーム分割準備を同じ関数へ通した。フォルダ以外があれば Folder だけを除き、
+フォルダだけのチェックはそのまま渡す。Single・Each・Batch の件数、確認閾値、上限、
+メニュー／ピッカーの capability は選別後の対象で一致する。ZIP／PDF 本体や仮想ページは除かない。
+チェックなしの単独項目、Container・Viewer・Playback、除外数を通知しない方針も設計どおり。
+
+コードで確認した前提と実装上の扱い:
+
+- 対象を作る第三の経路は `advance_external_preparation_mounted` の Source 列挙だった。
+  起動／ピッカー開始時に対象全件を同期 collect すると既存の応答性契約を壊すため、共通関数は
+  既存 Enumerating の cursor 内で分類・列挙を進める形にした。各呼び出しは表示 entry 最大1件、
+  既存の128 entry／2ms予算内で進む。新しい要求owner・非同期job・回復処理は追加しない。
+- `rebuild_visible_indices` は非表示になった項目を checked から外す（WYSIWYG契約）。
+  選別には現在の表示順を使い、index順や現在項目優先へ並べ替えない。全チェック項目に到達したら
+  走査を終え、唯一のチェック項目が現在項目の場合の直接参照も維持する。
+- 準備中の変更・終了・取消は既存の owner／items_generation／modal 契約のまま。
+  確認・実体化workerには選別済み対象だけを渡す。UI同期I/Oや製品UI文字列の追加なし。
+
+追加5件（`src/external_tool.rs`）:
+
+- `external_tool_mixed_folder_picker_and_slot_single_deliver_only_the_file`
+- `external_tool_mixed_folder_capability_matches_resolver_picker_and_preparation`
+- `external_tool_mixed_folder_each_batch_threshold_and_limit_use_filtered_count`
+- `external_tool_folder_only_checks_keep_order_single_folder_and_other_sources`
+- `external_tool_folder_filter_preparation_keeps_large_classification_frame_budget`
+
+変更2件:
+
+- `src/app/tests.rs` の旧 `ctrl_a_external_tool_count_includes_folder_and_preserves_container_target` を
+  `ctrl_a_external_tool_excludes_mixed_folders_and_preserves_container_target` に更新。
+  実際のCtrl+A handlerで画像1件＋Folderをチェックし、Single／Each／Batchのslot受付、
+  閾値・上限1件での受付、picker表示、Container維持を検査する。
+- `folder_target_checked_order_limits_and_virtual_refusal_are_preserved` を
+  `folder_target_mixed_checks_exclude_folders_and_preserve_virtual_refusal` に更新。
+  Folder除外後のSingle受付とEach／Batchの実引数、ZipDir拒否を固定する。
+
+追加のSingle試験はheadlessの実pickerボタンとslotの両入口を通し、準備要求からfake launcherへ
+渡ったパスが画像1件だけであることを検査する。Each／Batch試験は実handlerの確認・上限判定まで
+進める。capability試験は画像、ZIP／PDF本体、ZIP内画像、PDFページ、画像＋PDFページを含む。
+大量試験は全フォルダ／末尾だけファイルの1024件と、4096件中先頭2件だけのチェックを含む。
+
+対象経路のgrep監査:
+
+```powershell
+rg -n 'checked|ordered_checked_indices|resolve_external_targets|external_tool_context_menu_descriptor' src/external_tool.rs
+rg -n 'external_tool.*checked|checked.*external_tool|ExternalTargetSource|resolve_external_targets' src --glob '*.rs'
+rg -n 'external_tool' src --glob '*.rs' --glob '!external_tool.rs' --glob '!tests.rs'
+```
+
+製品のチェック由来の独立走査はresolver・menu descriptor・Source列挙の3経路で、すべて共通関数へ
+集約した。右クリック側はdescriptorを作成・消費するだけ。pickerはSource列挙の結果を捕捉して
+そのまま再利用する。設定previewは `LaunchTarget::from_grid_item` で現在項目1件を取り、checkedは
+見ない。関連付けアプリの拡張子収集も一覧全体の走査で、チェック由来の外部ツール対象ではない。
+それ以外に別の対象・件数・capability生成経路は見つからなかった。
+監査出力は `target/section1732-external/target-path-audit.txt`。
+
+マニュアルの詳細ページと一覧の右クリック説明、製品ページ、spec、capability表、keymap仕様、
+外部ツール設計、backlog §1.732 のリリースノート用メモを更新した。過去の更新履歴は変更しない。
+設計方針からの逸脱なし。全lib gateとbuild-devは今回も設計担当へ引き継ぐ。
+
+最終差分の自動検証（HEAD `0c9f20d47` 上の未コミット差分、通常feature、dev/test profile、
+nextest 0.9.148／default、retryなし、`MSBUILDDISABLENODEREUSE=1`、build-jobs 1）:
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0、19.49秒。既存警告あり。`target/section1732-external/check-final.log` |
+| 下記の焦点filterによるnextest | exit 0、7件すべて成功（0.562秒）。再コンパイル4分56秒。`focused-final.log`／`focused-final-junit.xml` |
+| `cargo nextest run --build-jobs 1 -p mimageviewer --lib -E 'test(external_tool) \| test(section1732)' --no-tests fail` | exit 0、126件すべて成功（11.757秒）。`related-final.log`／`related-final-junit.xml` |
+| `cargo fmt`（引数なし、workspace全体）／`cargo fmt --check` | exit 0 |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険な文字0件 |
+| `python scripts/check_site_cards.py` | exit 0、53件中違反0件 |
+| `git diff --check` | exit 0 |
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE = '1'
+cargo nextest run --build-jobs 1 -p mimageviewer --lib -E 'test(external_tool_mixed_folder) | test(external_tool_folder_only) | test(external_tool_folder_filter) | test(ctrl_a_external_tool_excludes_) | test(folder_target_mixed_checks)' --no-tests fail
+cargo nextest run --build-jobs 1 -p mimageviewer --lib -E 'test(external_tool) | test(section1732)' --no-tests fail
+```
+
+ログ・JUnitはすべて `target/section1732-external/` 内。JUnitの実行済み集合を照合し、焦点7件が
+関連126件にすべて含まれることを確認した（133件とは数えない）。初回の関連実行は126件中123件が
+成功し、旧件数の期待値が残っていた2件と、追加試験でworker専用のfile-list APIを直接使った1件が
+失敗した。試験を新仕様と実際のpicker handler経路へ修正し、選別走査の早期終了も回帰で固定した後、
+上記の焦点・関連を再実行して全件成功した。初回記録は `related.log`。
+
+製品バイナリ起動・外部プロセスの実起動・実機確認・git commit/add/stash/reset/ブランチ切替は
+行っていない。headless UIとfake launcherだけを使い、実workerを通す試験もlaunch authorizationを
+与えない。依頼どおり `test-lib-full.ps1`／`build-dev.ps1` は実行していない。

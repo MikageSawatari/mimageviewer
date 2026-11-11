@@ -361,10 +361,20 @@ enum ExternalPreparationInput {
 }
 
 enum ExternalPreparationStage {
-    Enumerating { cursor: usize },
-    LegacyIndex { cursor: usize },
-    StackIndex { cursor: usize },
-    Snapshot { cursor: usize, member_cursor: usize },
+    Enumerating {
+        cursor: usize,
+        checked_cursor: ExternalCheckedTargetCursor,
+    },
+    LegacyIndex {
+        cursor: usize,
+    },
+    StackIndex {
+        cursor: usize,
+    },
+    Snapshot {
+        cursor: usize,
+        member_cursor: usize,
+    },
     Complete,
 }
 
@@ -512,12 +522,113 @@ impl ExternalPreparationBudget {
     }
 }
 
-fn ordered_checked_indices(checked: &HashSet<usize>, display_order: &[usize]) -> Vec<usize> {
-    display_order
-        .iter()
-        .copied()
-        .filter(|index| checked.contains(index))
-        .collect()
+enum ExternalCheckedTargetCursor {
+    Classifying {
+        cursor: usize,
+        checked_seen: usize,
+    },
+    Targets {
+        cursor: usize,
+        checked_seen: usize,
+        folders_only: bool,
+    },
+    Complete,
+}
+
+enum ExternalCheckedTargetStep {
+    Pending,
+    Target(usize),
+    Complete,
+}
+
+/// Shared checked-target selection for the resolver, menu and frame-split preparation.
+/// Classification and enumeration each visit at most one display entry per call, so
+/// preparation keeps its entry/time budget even for a large folder-only selection.
+fn checked_external_target_index(
+    items: &[crate::grid_item::GridItem],
+    checked: &HashSet<usize>,
+    display_order: &[usize],
+    selection: &mut ExternalCheckedTargetCursor,
+) -> ExternalCheckedTargetStep {
+    use crate::grid_item::GridItem;
+    match selection {
+        ExternalCheckedTargetCursor::Classifying {
+            cursor,
+            checked_seen,
+        } => {
+            if let Some(&index) = display_order
+                .get(*cursor)
+                .filter(|_| *checked_seen < checked.len())
+            {
+                *cursor += 1;
+                if checked.contains(&index) {
+                    *checked_seen += 1;
+                    if items
+                        .get(index)
+                        .is_some_and(|item| !matches!(item, GridItem::Folder(_)))
+                    {
+                        *selection = ExternalCheckedTargetCursor::Targets {
+                            cursor: 0,
+                            checked_seen: 0,
+                            folders_only: false,
+                        };
+                    }
+                }
+            } else {
+                *selection = ExternalCheckedTargetCursor::Targets {
+                    cursor: 0,
+                    checked_seen: 0,
+                    folders_only: true,
+                };
+            }
+            ExternalCheckedTargetStep::Pending
+        }
+        ExternalCheckedTargetCursor::Targets {
+            cursor,
+            checked_seen,
+            folders_only,
+        } => {
+            if let Some(&index) = display_order
+                .get(*cursor)
+                .filter(|_| *checked_seen < checked.len())
+            {
+                *cursor += 1;
+                if checked.contains(&index) {
+                    *checked_seen += 1;
+                    if items
+                        .get(index)
+                        .is_some_and(|item| *folders_only || !matches!(item, GridItem::Folder(_)))
+                    {
+                        return ExternalCheckedTargetStep::Target(index);
+                    }
+                }
+                ExternalCheckedTargetStep::Pending
+            } else {
+                *selection = ExternalCheckedTargetCursor::Complete;
+                ExternalCheckedTargetStep::Complete
+            }
+        }
+        ExternalCheckedTargetCursor::Complete => ExternalCheckedTargetStep::Complete,
+    }
+}
+
+fn ordered_checked_indices(
+    items: &[crate::grid_item::GridItem],
+    checked: &HashSet<usize>,
+    display_order: &[usize],
+) -> Vec<usize> {
+    let mut selection = ExternalCheckedTargetCursor::Classifying {
+        cursor: 0,
+        checked_seen: 0,
+    };
+    let mut indices = Vec::new();
+    loop {
+        match checked_external_target_index(items, checked, display_order, &mut selection) {
+            ExternalCheckedTargetStep::Target(index) => indices.push(index),
+            ExternalCheckedTargetStep::Pending => {}
+            ExternalCheckedTargetStep::Complete => return indices,
+        }
+    }
 }
 
 /// 発火面、checked、実際の表示順から対象集合を一度だけ解決する純関数。
@@ -535,14 +646,14 @@ pub fn resolve_external_targets(
             if checked.is_empty() {
                 clicked.into_iter().collect()
             } else {
-                ordered_checked_indices(checked, display_order)
+                ordered_checked_indices(items, checked, display_order)
             }
         }
         ExternalTargetSource::GridKey { selected } => {
             if checked.is_empty() {
                 selected.into_iter().collect()
             } else {
-                ordered_checked_indices(checked, display_order)
+                ordered_checked_indices(items, checked, display_order)
             }
         }
         ExternalTargetSource::Viewer { current } | ExternalTargetSource::Playback { current } => {
@@ -2549,8 +2660,10 @@ impl crate::app::App {
                 ExternalTargetSource::GridContext { .. } | ExternalTargetSource::GridKey { .. }
             ) && !self.checked.is_empty()
             {
-                for index in &self.checked {
-                    if let Some(item) = self.items.get(*index) {
+                for index in
+                    ordered_checked_indices(&self.items, &self.checked, self.current_grid_order())
+                {
+                    if let Some(item) = self.items.get(index) {
                         capability.add_grid_item(item);
                     }
                 }
@@ -2665,7 +2778,13 @@ impl crate::app::App {
             items_generation: descriptor.items_generation,
             purpose,
             input: ExternalPreparationInput::Source(descriptor.source),
-            stage: ExternalPreparationStage::Enumerating { cursor: 0 },
+            stage: ExternalPreparationStage::Enumerating {
+                cursor: 0,
+                checked_cursor: ExternalCheckedTargetCursor::Classifying {
+                    cursor: 0,
+                    checked_seen: 0,
+                },
+            },
             snapshots,
             locators: Vec::new(),
             requests: Vec::new(),
@@ -2766,7 +2885,13 @@ impl crate::app::App {
             stage: if needs_lookup {
                 ExternalPreparationStage::LegacyIndex { cursor: 0 }
             } else {
-                ExternalPreparationStage::Enumerating { cursor: 0 }
+                ExternalPreparationStage::Enumerating {
+                    cursor: 0,
+                    checked_cursor: ExternalCheckedTargetCursor::Classifying {
+                        cursor: 0,
+                        checked_seen: 0,
+                    },
+                }
             },
             locators: Vec::new(),
             requests: Vec::new(),
@@ -2802,10 +2927,19 @@ impl crate::app::App {
                         }
                         *cursor += 1;
                     } else {
-                        preparing.stage = ExternalPreparationStage::Enumerating { cursor: 0 };
+                        preparing.stage = ExternalPreparationStage::Enumerating {
+                            cursor: 0,
+                            checked_cursor: ExternalCheckedTargetCursor::Classifying {
+                                cursor: 0,
+                                checked_seen: 0,
+                            },
+                        };
                     }
                 }
-                ExternalPreparationStage::Enumerating { cursor } => {
+                ExternalPreparationStage::Enumerating {
+                    cursor,
+                    checked_cursor,
+                } => {
                     let locator = match &preparing.input {
                         ExternalPreparationInput::Legacy(targets) => {
                             if let Some(target) = targets.get(*cursor) {
@@ -2853,34 +2987,35 @@ impl crate::app::App {
                                 | ExternalTargetSource::Playback { current } => (*current, false),
                                 ExternalTargetSource::Container { .. } => unreachable!(),
                             };
-                            // One target has no ordering choice. Keep its direct lookup;
-                            // multiple checked targets always follow the display cursor.
-                            let single_current = !use_checked
-                                || (self.checked.len() == 1
-                                    && primary.is_some_and(|index| self.checked.contains(&index)));
-                            let index = if single_current {
-                                if *cursor == 0 {
-                                    *cursor = 1;
-                                    primary
+                            let index = if use_checked {
+                                // A sole checked current item has no ordering choice. Keep
+                                // its direct lookup without scanning the remaining grid.
+                                let single = primary.filter(|index| {
+                                    self.checked.len() == 1 && self.checked.contains(index)
+                                });
+                                let order = single.as_slice();
+                                let order = if single.is_some() {
+                                    order
                                 } else {
-                                    None
+                                    self.current_grid_order()
+                                };
+                                match checked_external_target_index(
+                                    &self.items,
+                                    &self.checked,
+                                    order,
+                                    checked_cursor,
+                                ) {
+                                    ExternalCheckedTargetStep::Target(index) => Some(index),
+                                    ExternalCheckedTargetStep::Pending => continue,
+                                    ExternalCheckedTargetStep::Complete => None,
                                 }
-                            } else if preparing.locators.len() < self.checked.len() {
-                                if let Some(index) = self.current_grid_order().get(*cursor).copied()
-                                {
-                                    *cursor += 1;
-                                    if self.checked.contains(&index) {
-                                        Some(index)
-                                    } else {
-                                        continue;
-                                    }
-                                } else {
-                                    None
-                                }
+                            } else if *cursor == 0 {
+                                *cursor = 1;
+                                primary
                             } else {
                                 None
                             };
-                            if let Some(index) = index {
+                            index.and_then(|index| {
                                 self.items
                                     .get(index)
                                     .map(|item| ExternalTargetLocator::Listed {
@@ -2889,14 +3024,7 @@ impl crate::app::App {
                                         index,
                                         target: LaunchTarget::from_grid_item(Some(item)),
                                     })
-                            } else if use_checked
-                                && preparing.locators.len() < self.checked.len()
-                                && *cursor < self.current_grid_order().len()
-                            {
-                                continue;
-                            } else {
-                                None
-                            }
+                            })
                         }
                         ExternalPreparationInput::Captured => None,
                     };
@@ -5441,7 +5569,7 @@ mod tests {
     }
 
     #[test]
-    fn folder_target_checked_order_limits_and_virtual_refusal_are_preserved() {
+    fn folder_target_mixed_checks_exclude_folders_and_preserve_virtual_refusal() {
         use crate::grid_item::GridItem;
         let items = vec![
             GridItem::Folder("first".into()),
@@ -5455,20 +5583,14 @@ mod tests {
             &checked,
             ExternalTargetSource::GridKey { selected: Some(0) },
         );
-        assert_eq!(
-            targets,
-            vec![
-                LaunchTarget::RealFile("last".into()),
-                LaunchTarget::ImagePage("page.jpg".into()),
-                LaunchTarget::RealFile("first".into())
-            ]
-        );
+        assert_eq!(targets, vec![LaunchTarget::ImagePage("page.jpg".into())]);
         let mut tool = file_list_test_tool(SelectionPolicy::Single);
         tool.arguments = "{files}".to_string();
-        assert!(
+        assert_eq!(
             build_launch_operation(&tool, &targets)
-                .unwrap_err()
-                .contains("3 件")
+                .unwrap()
+                .target_count,
+            1
         );
         for selection in [SelectionPolicy::Each, SelectionPolicy::Batch] {
             tool.selection = selection;
@@ -5478,17 +5600,10 @@ mod tests {
                 .into_iter()
                 .flat_map(|request| request.files)
                 .collect();
-            assert_eq!(
-                files,
-                vec![
-                    PathBuf::from("last"),
-                    PathBuf::from("page.jpg"),
-                    PathBuf::from("first")
-                ]
-            );
+            assert_eq!(files, vec![PathBuf::from("page.jpg")]);
         }
-        tool.max_targets = 2;
-        assert!(build_launch_operation(&tool, &targets).is_err());
+        tool.max_targets = 1;
+        assert!(build_launch_operation(&tool, &targets).is_ok());
         // Context-menu container routing still ignores checked items and sends exactly one path.
         assert_eq!(
             resolve_external_targets(
@@ -5565,6 +5680,384 @@ mod tests {
                 menu,
                 ExternalToolMenuTarget::from_launch_targets(&[target]),
                 "{item:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_tool_mixed_folder_picker_and_slot_single_deliver_only_the_file() {
+        use crate::grid_item::GridItem;
+        use egui_kittest::kittest::Queryable;
+        let mut app = crate::app::setup_app_for_test();
+        let file = app.tmp.path().join("page.jpg");
+        std::fs::write(&file, b"original").unwrap();
+        app.items = vec![
+            GridItem::Folder(app.tmp.path().join("folder")),
+            GridItem::Image(file.clone()),
+        ];
+        app.visible_indices = vec![0, 1];
+        app.checked = HashSet::from([0, 1]);
+        app.selected = Some(0);
+        let mut tool = file_list_test_tool(SelectionPolicy::Single);
+        tool.payload = PayloadPolicy::OriginalFile;
+        tool.arguments = "{files}".to_string();
+        app.settings.external_tools = vec![tool.clone()];
+        app.request_grid_external_tool_picker();
+        finish_picker_preparation(&mut app);
+        let ExternalOperation::Picker(picker) = &app.external_tool_operation else {
+            panic!("expected picker")
+        };
+        let targets: Vec<_> = picker
+            .locators
+            .iter()
+            .map(|locator| locator.target().clone())
+            .collect();
+        assert_eq!(targets, vec![LaunchTarget::ImagePage(file.clone())]);
+        assert_eq!(
+            external_tool_capability(&tool, picker.capability),
+            Some((true, None))
+        );
+        assert_eq!(
+            build_launch_operation(&tool, &targets)
+                .unwrap()
+                .target_count,
+            1
+        );
+
+        // Exercise the real picker button, including its captured-target continuation.
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(800.0, 600.0))
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .build_ui_state(
+                |ui, app: &mut crate::app::AppTestEnvForTest| {
+                    app.show_external_tool_picker(ui.ctx());
+                },
+                app,
+            );
+        harness.run();
+        harness
+            .get_by_label(&format!("1. {}", tool.display_name()))
+            .click();
+        harness.run();
+        let app = harness.state_mut();
+        let mut picker_preparing = take_preparing(app);
+        finish_snapshot_for_test(app, &mut picker_preparing);
+        assert_eq!(picker_preparing.requests.len(), 1);
+        assert!(
+            matches!(&picker_preparing.purpose, ExternalPreparationPurpose::ForTool(tool)
+            if tool.selection == SelectionPolicy::Single)
+        );
+
+        app.launch_grid_external_tool_slot(&egui::Context::default(), 1);
+        let mut slot_preparing = take_preparing(app);
+        finish_snapshot_for_test(app, &mut slot_preparing);
+        assert_eq!(slot_preparing.requests.len(), 1);
+        let manager = crate::materializer::Materializer::new_at_for_test(
+            app.tmp.path().join("artifacts"),
+            1732,
+        );
+        for preparing in [picker_preparing, slot_preparing] {
+            let ExternalPreparationPurpose::ForTool(prepared_tool) = preparing.purpose else {
+                panic!("expected tool")
+            };
+            assert_eq!(
+                evaluate_target_count(
+                    prepared_tool.selection,
+                    preparing.requests.len(),
+                    prepared_tool.confirmation_threshold,
+                    prepared_tool.max_targets
+                )
+                .unwrap(),
+                TargetCountDecision::Proceed
+            );
+            let mut delivered = Vec::new();
+            let completion = run_file_list_fake_worker(
+                &manager,
+                prepared_tool,
+                preparing.requests,
+                Arc::new(AtomicBool::new(false)),
+                |request, _| {
+                    delivered.extend(request.files);
+                    Ok(ExternalLaunchOutcome::all_launched(None))
+                },
+            );
+            assert!(completion.failures.is_empty());
+            assert_eq!(completion.succeeded_target_count, 1);
+            assert_eq!(delivered, vec![file.clone()]);
+        }
+    }
+
+    #[test]
+    fn external_tool_mixed_folder_capability_matches_resolver_picker_and_preparation() {
+        use crate::grid_item::GridItem;
+        let mut app = crate::app::setup_app_for_test();
+        for remaining in [
+            vec![GridItem::Image("page.jpg".into())],
+            vec![
+                GridItem::ZipFile("book.zip".into()),
+                GridItem::PdfFile("book.pdf".into()),
+            ],
+            vec![GridItem::ZipImage {
+                zip_path: "book.zip".into(),
+                entry_name: "page.jpg".into(),
+            }],
+            vec![GridItem::PdfPage {
+                pdf_path: "book.pdf".into(),
+                page_num: 2,
+                content_type: None,
+            }],
+            vec![
+                GridItem::Image("page.jpg".into()),
+                GridItem::PdfPage {
+                    pdf_path: "book.pdf".into(),
+                    page_num: 2,
+                    content_type: None,
+                },
+            ],
+        ] {
+            app.items = vec![GridItem::Folder("first".into())];
+            app.items.extend(remaining);
+            app.items.push(GridItem::Folder("last".into()));
+            app.visible_indices = (0..app.items.len()).rev().collect();
+            app.checked = (0..app.items.len()).collect();
+            app.selected = Some(0);
+            app.settings.external_tools = vec![file_list_test_tool(SelectionPolicy::Batch)];
+            for source in [
+                ExternalTargetSource::GridContext { clicked: Some(0) },
+                ExternalTargetSource::GridKey { selected: Some(0) },
+            ] {
+                let targets = resolve_external_targets(
+                    &app.items,
+                    &app.visible_indices,
+                    &app.checked,
+                    source.clone(),
+                );
+                assert_eq!(targets.len(), app.items.len() - 2);
+                let expected: Vec<_> = app.items[1..app.items.len() - 1]
+                    .iter()
+                    .rev()
+                    .map(|item| LaunchTarget::from_grid_item(Some(item)))
+                    .collect();
+                assert_eq!(targets, expected);
+                let capability = ExternalToolMenuTarget::from_launch_targets(&targets);
+                let descriptor = app.external_tool_context_menu_descriptor(source);
+                assert_eq!(descriptor.capability, capability);
+                app.begin_external_preparation(
+                    egui::ViewportId::ROOT,
+                    descriptor,
+                    ExternalPreparationPurpose::ForPicker(ExternalToolPickerTargetKind::GridItems),
+                );
+                finish_picker_preparation(&mut app);
+                let ExternalOperation::Picker(picker) = &app.external_tool_operation else {
+                    panic!("expected picker")
+                };
+                assert_eq!(picker.capability, capability);
+                assert_eq!(
+                    picker
+                        .locators
+                        .iter()
+                        .map(|locator| locator.target().clone())
+                        .collect::<Vec<_>>(),
+                    targets
+                );
+                for payload in [PayloadPolicy::OriginalFile, PayloadPolicy::TempOriginal] {
+                    let mut tool = app.settings.external_tools[0].clone();
+                    tool.payload = payload;
+                    assert_eq!(
+                        external_tool_capability(&tool, capability),
+                        external_tool_capability(&tool, picker.capability)
+                    );
+                    assert_eq!(
+                        external_tool_capability(&tool, capability).unwrap().0,
+                        payload != PayloadPolicy::OriginalFile || !capability.has_virtual_page
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn external_tool_mixed_folder_each_batch_threshold_and_limit_use_filtered_count() {
+        use crate::grid_item::GridItem;
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Folder("first".into()),
+            GridItem::Video("one.mp4".into()),
+            GridItem::Folder("middle".into()),
+            GridItem::Video("two.mp4".into()),
+        ];
+        app.visible_indices = vec![3, 2, 1, 0];
+        app.checked = (0..4).collect();
+        app.selected = Some(0);
+        for selection in [SelectionPolicy::Each, SelectionPolicy::Batch] {
+            for (threshold, limit) in [(2, 2), (1, 2), (1, 1)] {
+                let mut tool = file_list_test_tool(selection);
+                tool.payload = PayloadPolicy::OriginalFile;
+                tool.confirmation_threshold = threshold;
+                tool.max_targets = limit;
+                app.settings.external_tools = vec![tool.clone()];
+                app.launch_grid_external_tool_slot(&egui::Context::default(), 1);
+                let mut preparing = take_preparing(&mut app);
+                finish_snapshot_for_test(&mut app, &mut preparing);
+                assert_eq!(preparing.requests.len(), 2);
+                assert_eq!(
+                    preparing
+                        .locators
+                        .iter()
+                        .map(|locator| locator.target().clone())
+                        .collect::<Vec<_>>(),
+                    vec![
+                        LaunchTarget::RealFile("two.mp4".into()),
+                        LaunchTarget::RealFile("one.mp4".into())
+                    ]
+                );
+                // Resume the real handler's admission branch; never authorize a launch.
+                app.fs_feedback_toast = None;
+                app.external_tool_operation = ExternalOperation::Preparing(preparing);
+                finish_picker_preparation(&mut app);
+                match &app.external_tool_operation {
+                    ExternalOperation::Materializing(pending) if threshold == 2 && limit == 2 => {
+                        assert_eq!(pending.progress.total, 2);
+                        assert!(app.fs_feedback_toast.is_none());
+                    }
+                    ExternalOperation::Confirmation(confirmation)
+                        if threshold == 1 && limit == 2 =>
+                    {
+                        assert_eq!(confirmation.operation.target_count(), 2);
+                    }
+                    ExternalOperation::Idle if limit == 1 => {
+                        assert!(
+                            app.fs_feedback_toast
+                                .as_ref()
+                                .unwrap()
+                                .0
+                                .contains("対象は 2 件")
+                        );
+                    }
+                    _ => panic!(
+                        "unexpected admission for {selection:?}, threshold={threshold}, limit={limit}"
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn external_tool_folder_only_checks_keep_order_single_folder_and_other_sources() {
+        use crate::grid_item::GridItem;
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Folder("first".into()),
+            GridItem::Image("page.jpg".into()),
+            GridItem::Folder("last".into()),
+        ];
+        app.visible_indices = vec![2, 1, 0];
+        app.checked = HashSet::from([0, 2]);
+        app.settings.external_tools = vec![file_list_test_tool(SelectionPolicy::Batch)];
+        for source in [
+            ExternalTargetSource::GridKey { selected: Some(1) },
+            ExternalTargetSource::GridContext { clicked: Some(1) },
+        ] {
+            let targets = resolve_external_targets(
+                &app.items,
+                &app.visible_indices,
+                &app.checked,
+                source.clone(),
+            );
+            assert_eq!(
+                targets,
+                vec![
+                    LaunchTarget::RealFile("last".into()),
+                    LaunchTarget::RealFile("first".into())
+                ]
+            );
+            let descriptor = app.external_tool_context_menu_descriptor(source);
+            assert_eq!(
+                descriptor.capability,
+                ExternalToolMenuTarget::from_launch_targets(&targets)
+            );
+            let tool = app.settings.external_tools[0].clone();
+            app.queue_external_tool_launch_from_context_menu(
+                &egui::Context::default(),
+                &tool,
+                &descriptor,
+            );
+            let mut preparing = take_preparing(&mut app);
+            finish_snapshot_for_test(&mut app, &mut preparing);
+            assert_eq!(
+                preparing
+                    .locators
+                    .iter()
+                    .map(|locator| locator.target().clone())
+                    .collect::<Vec<_>>(),
+                targets
+            );
+        }
+        app.checked.insert(1);
+        for source in [
+            ExternalTargetSource::Viewer { current: Some(0) },
+            ExternalTargetSource::Playback { current: Some(0) },
+            ExternalTargetSource::Container {
+                path: Some("first".into()),
+            },
+        ] {
+            assert_eq!(
+                resolve_external_targets(&app.items, &app.visible_indices, &app.checked, source),
+                vec![LaunchTarget::RealFile("first".into())]
+            );
+        }
+        app.checked.clear();
+        for source in [
+            ExternalTargetSource::GridKey { selected: Some(0) },
+            ExternalTargetSource::GridContext { clicked: Some(0) },
+        ] {
+            assert_eq!(
+                resolve_external_targets(&app.items, &app.visible_indices, &app.checked, source),
+                vec![LaunchTarget::RealFile("first".into())]
+            );
+        }
+    }
+
+    #[test]
+    fn external_tool_folder_filter_preparation_keeps_large_classification_frame_budget() {
+        use crate::grid_item::GridItem;
+        let mut app = crate::app::setup_app_for_test();
+        for mixed in [false, true] {
+            let count = 1024;
+            app.items = (0..count)
+                .map(|index| GridItem::Folder(format!("folder-{index}").into()))
+                .collect();
+            if mixed {
+                app.items[count - 1] = GridItem::Video("last.mp4".into());
+            }
+            app.visible_indices = (0..count).collect();
+            app.checked = (0..count).collect();
+            app.settings.external_tools = vec![file_list_test_tool(SelectionPolicy::Batch)];
+            app.launch_grid_external_tool_slot(&egui::Context::default(), 1);
+            let mut preparing = take_preparing(&mut app);
+            assert!(preparing.locators.is_empty());
+            let frames = finish_snapshot_for_test(&mut app, &mut preparing);
+            assert!(frames.len() > 1);
+            assert!(frames.iter().all(|entries| *entries <= 128));
+            assert_eq!(preparing.requests.len(), if mixed { 1 } else { count });
+            assert!(preparing.scanned_entries <= count * 3 + 8);
+        }
+        for mixed in [false, true] {
+            app.items = (0..4096)
+                .map(|index| GridItem::Folder(format!("folder-{index}").into()))
+                .collect();
+            if mixed {
+                app.items[1] = GridItem::Video("second.mp4".into());
+            }
+            app.visible_indices = (0..4096).collect();
+            app.checked = HashSet::from([0, 1]);
+            app.launch_grid_external_tool_slot(&egui::Context::default(), 1);
+            let mut preparing = take_preparing(&mut app);
+            finish_snapshot_for_test(&mut app, &mut preparing);
+            assert_eq!(preparing.requests.len(), if mixed { 1 } else { 2 });
+            assert!(
+                preparing.scanned_entries < 16,
+                "do not scan beyond the last checked item"
             );
         }
     }

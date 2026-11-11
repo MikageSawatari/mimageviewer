@@ -114479,7 +114479,7 @@ mod section1732_folder_selection_tests {
     }
 
     #[test]
-    fn ctrl_a_external_tool_count_includes_folder_and_preserves_container_target() {
+    fn ctrl_a_external_tool_excludes_mixed_folders_and_preserves_container_target() {
         use crate::external_tool::{
             ExternalOperation, ExternalTargetSource, ExternalTool, ExternalToolLaunch,
             LaunchTarget, PayloadPolicy, SelectionPolicy, resolve_external_targets,
@@ -114499,10 +114499,7 @@ mod section1732_folder_selection_tests {
                     selected: app.selected
                 },
             ),
-            vec![
-                LaunchTarget::ImagePage(root.join("first.jpg")),
-                LaunchTarget::RealFile(root.join("folder"))
-            ]
+            vec![LaunchTarget::ImagePage(root.join("first.jpg"))]
         );
         assert_eq!(
             resolve_external_targets(
@@ -114515,12 +114512,12 @@ mod section1732_folder_selection_tests {
             ),
             vec![LaunchTarget::RealFile(root.join("folder"))]
         );
-        for (selection, max_targets, confirmation) in [
-            (SelectionPolicy::Single, 10, false),
-            (SelectionPolicy::Each, 10, true),
-            (SelectionPolicy::Batch, 10, true),
-            (SelectionPolicy::Each, 1, false),
-            (SelectionPolicy::Batch, 1, false),
+        for (selection, max_targets) in [
+            (SelectionPolicy::Single, 10),
+            (SelectionPolicy::Each, 10),
+            (SelectionPolicy::Batch, 10),
+            (SelectionPolicy::Each, 1),
+            (SelectionPolicy::Batch, 1),
         ] {
             let mut tool = ExternalTool::defaults_for_viewing();
             tool.launch = ExternalToolLaunch::Executable(root.join("never-launched.exe"));
@@ -114540,23 +114537,31 @@ mod section1732_folder_selection_tests {
                 ctx.run_pass(Default::default(), |ctx| app.show_external_tool_modals(ctx))
                     .drop_without_applying_deltas();
             }
-            if confirmation {
-                assert!(
-                    matches!(
-                        app.external_tool_operation,
-                        ExternalOperation::Confirmation(_)
-                    ),
-                    "{selection:?}: both targets require confirmation"
-                );
-            } else {
-                assert!(matches!(
+            assert!(
+                matches!(
                     app.external_tool_operation,
-                    ExternalOperation::Idle
-                ));
-                let message = &app.fs_feedback_toast.as_ref().expect("count refusal").0;
-                assert!(message.contains("2 件"), "{selection:?}: {message}");
-            }
-            app.external_tool_operation = ExternalOperation::Idle;
+                    ExternalOperation::Materializing(_)
+                ),
+                "{selection:?}: one file must pass Single / threshold / limit"
+            );
+            assert!(app.fs_feedback_toast.is_none());
+            // Never authorize the worker's external-process launch boundary.
+            // The next request retires and cancels it through the normal owner.
         }
+        app.settings.external_tools[0].selection = SelectionPolicy::Single;
+        app.request_grid_external_tool_picker();
+        for _ in 0..12 {
+            if !matches!(app.external_tool_operation, ExternalOperation::Preparing(_)) {
+                break;
+            }
+            app.frame_counter += 1;
+            let ctx = egui::Context::default();
+            ctx.run_pass(Default::default(), |ctx| app.show_external_tool_modals(ctx))
+                .drop_without_applying_deltas();
+        }
+        assert!(matches!(
+            app.external_tool_operation,
+            ExternalOperation::Picker(_)
+        ));
     }
 }
