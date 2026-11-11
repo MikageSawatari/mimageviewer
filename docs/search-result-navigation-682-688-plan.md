@@ -1475,3 +1475,30 @@ context のもの。採用で出発 context が detached window へ移る (再�
 
 detached の凍結ルールにより、本決定は設計担当と独立レビューの双方が「症状パッチではなく構造修正」と合意してから実装し、
 [detached リワーク計画 §11](detached-rework-plan.md) に記録する。
+
+#### 12.3 改訂 1 (設計レビュー REVISE への対応、2026-11-12)
+
+設計レビュー (Sol / xhigh) は、順序の是正が**症状パッチではなく構造修正である**ことに合意した (出発 context に移動先の退役・採用を
+先に適用している所有境界の誤りを直すもので、detached 憲法 §2 と整合)。指摘への対応:
+
+- **P2 (Ctrl+S / Ctrl+T の owner は bundle に無い)**: 指摘どおり。bundle が運ぶ検索状態は `global_search` (Metadata / Everything)・
+  snapshot・`items_are_*`・subfolder restore までで、`favsearch` / `tag_view` 本体と pending は App 共有
+  (`viewer_context_registry.rs` の bundle 定義)。ただしこれは**リリース済みの既存の欠け**で、今回の変更で生じるものではない:
+  リリース済みの Plain のコレクション open (`open_collection_grid`) も promote → `retire_transient_views_for_collection` の順で、
+  Ctrl+S / Ctrl+T の共有 owner を退役させる。§12.3 は既存と同じ順序にそろえるので、この 2 種は既存の Plain open と同じ結果になり、
+  悪化しない。**`favsearch` / `tag_view` を context 所有へ移す bundle 境界の変更は今回の範囲に入れない**
+  (bundle の所有変更は detached リワークの領域で、木曜の期限内に設計・レビュー・検証を終えられない)。別項目として統括へ報告し、
+  本書と detached 計画 §11 に「既存の欠け・未対応」と記録する。よって不変条件の「移る context が検索をそのまま持って行く」は、
+  **bundle が今運んでいる状態について**と読む。制約 1 (移譲境界の中身・bundle の field を変えない) は維持する。
+- **二重呼出は冪等でない** (`cancel_collection_navigation_intent` が sequence を進める): 制約 2 の後段を必須にする。共通 adopter で
+  移譲した事実を局所の型・引数で installer へ渡し、installer 内の既存境界を明示的に省略する。App の field は足さない。
+- **Collection の locked 検査**: 採用直前の `collection_main_context_change_allowed` 検査 (`collection_grid.rs` の
+  `adopt_collection_history_root`) を残し、検査と移譲を同じ同期区間で行う。`Blocked` の後は検索退役・採用へ進まず、
+  検索・rows・履歴を変えない。同じ Collection binding の `NotNeeded` も維持する。
+- **移譲前の変更の棚卸し**は共通 adopter に加え installer まで含める (物理 surface の採用、PDF の表示設定、`install_loading_items_inner`
+  の境界より前の処理)。source の履歴情報 (`search_exit_history_source` 等) は移譲前に捕捉し、移譲後に旧 context の proof を
+  再検証しない。検索なし・他 purpose の順序は変えない。
+- **P3 回帰の追加**: (a) 画像の detached 窓が park される場合も、元画像・再オープン先・窓が保持され、main だけ検索を終える。
+  (b) Collection で、準備後・採用前に locked になった場合は、検索・rows・履歴を変えず移譲もしない。
+  制約 6 の「検索を保つ」の検査対象は Metadata / Everything (bundle 所有) とし、Ctrl+S / Ctrl+T は既存の Plain open と同じ結果
+  であることを対照で確かめる (欠けを固定する assert にはしない)。
