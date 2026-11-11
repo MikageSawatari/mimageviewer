@@ -1,6 +1,6 @@
 # 検索結果からの一覧順移動 (§1.682) と、検索中の場所ジャンプ (§1.688)
 
-2026-11-11 第 1 版 (設計 = ClaudeCode Opus 5.5)。設計の独立レビュー = Codex GPT-6.1 Sol / xhigh、
+2026-11-11 第 3 版 (設計 = ClaudeCode Opus 5.5)。第 1 版は REJECT、第 2 版は ACCEPT WITH CHANGES で、指摘は反映済み (§7)。設計の独立レビュー = Codex GPT-6.1 Sol / xhigh、
 実装 = Codex GPT-6.1 Sol / high、実装の独立レビュー = 別の Sol / xhigh。
 コードの事実は 2026-11-11 の master (`2d2f8fd72`) を読んだもの。実行時の観測は無い (エージェントは製品を起動しない)。
 
@@ -81,27 +81,31 @@
 
 ### 2.1 §1.688: 検索中の場所ジャンプは「検索を終える明示ジャンプ」にする
 
-1. **受付を 1 つの helper にまとめる**。`location_navigation_blocked() -> bool` を
-   `location_jump_admission() -> Option<LocationJumpMode>` に置き換える。
-   - ★固定中: 従来どおり通知して `None`。
-   - 検索 3 owner のどれかが active: `Some(LocationJumpMode::ExitTemporaryView)`。
-   - それ以外: `Some(LocationJumpMode::Plain)`。
-   - Everything 取得中の main modal など既存の受付制限は、今の入口が持つ判定のまま。
-   - **dispatch の時点でも取得中 modal を確かめる** (§7 P2)。キーの navigation 値はフレームの前半で作られ、
-     同じフレームの検索バー描画で Everything の送信が始まった後、フレーム末尾で dispatch される
-     (`src/app.rs` 約 100515・101050・101130)。下流の `document_open_modal_admission_blocked` は Everything を含まず、
-     `adopt_synthetic_surface` にも判定が無い。そこで `begin_exit_temporary_view_jump` の先頭で、主一覧の open / navigation が
-     共有する Everything 取得中の target-context admission を再判定し、取得中なら何もしない (案内は既存の取得中表示に任せる)。
-2. **行き先を型で表す**。`enum LocationJumpTarget { Physical(PathBuf), DriveList, ReadingHistory, BooksRoot, Rating(u8) }`。
+1. **入力の時点では行き先だけを決め、受付の判定は dispatch の時点で 1 回行う** (第 3 版、§7 第 2 版 P2)。
+   - 入力側: `location_navigation_blocked()` を外す。★固定中の拒否だけは今の位置にも残す (fullscreen を閉じる前に通知するため)。
+     それ以外は検索中でも行き先の解決へ進む。
+   - キーの navigation 値はフレームの前半で作られ、同じフレームの検索バー描画 (一時バー・常設欄、`src/app/pinned_search.rs` 798) で
+     Everything / Metadata / favsearch の送信・session 開始が起きた後、フレーム末尾で dispatch される
+     (`src/app.rs` 約 100515・101050・101130、`src/app/update_phases.rs` 1239)。下流の `document_open_modal_admission_blocked` は
+     Everything を含まず、`adopt_synthetic_surface` にも判定が無い。したがって検索中かどうか・取得中 modal かどうかは
+     **dispatch の時点で** 決める。入力の時点の検索状態で mode を決めない。
+2. **行き先を型で表し、対象の場所ジャンプは常に同じ navigation 値で運ぶ**。
+   `enum LocationJumpTarget { Physical(PathBuf), DriveList, ReadingHistory, BooksRoot, Rating(u8) }`、
+   `AddressBarNav::LocationJump(LocationJumpTarget)`。
    既存の各 helper (`apply_ring_drive_letter` 等、`quick_location_nav`) は行き先の解決 (存在確認・通知) までを今のまま行い、
-   最後に共通の `fn location_jump_nav(&mut self, target, mode, source) -> Option<AddressBarNav>` へ渡す。
+   最後に共通の `fn location_jump_nav(&mut self, target, source) -> Option<AddressBarNav>` へ渡す。
    fullscreen を閉じる・`bump_input_seq`・repaint もこの helper に集める (今は各 helper に重複している)。
-   - `Plain`: 今と同じ値を返す (`Direct(path, ExplicitList)` / `DriveList(None)` / `ReadingHistory(Menu)` / `BooksRoot`、
-     評価一覧は今と同じ `enter_rating_view`)。**検索外の挙動は変えない**。
-   - `ExitTemporaryView`: 新しい `AddressBarNav::ExitTemporaryViewJump(LocationJumpTarget)` を返す。
-3. **dispatch も 1 か所**。`AddressBarNav::ExitTemporaryViewJump(target)` を受ける全 match
+   評価一覧も同期の `enter_rating_view` 呼び出しをやめ、`Rating(n)` としてこの値で運ぶ。
+3. **dispatch は 1 か所**。`AddressBarNav::LocationJump(target)` を受ける全 match
    (`update_phases.rs` の input/address・context・grid の 3 か所、`apply_fullscreen_close_nav_immediate` 等の即時 dispatcher)
-   は同じ `fn begin_exit_temporary_view_jump(&mut self, target)` を呼ぶ。中身は既存の前例に乗せる:
+   は同じ `fn dispatch_location_jump(&mut self, target)` を呼ぶ。中身:
+   1. ★固定中 → 今と同じ通知で終わる。
+   2. 主一覧の open / navigation が共有する Everything 取得中の target-context admission が拒否 → 何もしない
+      (案内は既存の取得中表示に任せる)。
+   3. 検索 3 owner のどれも active でない (`Plain`) → **今と同じ下流** (`Direct(path, ExplicitList)` を
+      `open_direct_navigation_target_at_stage` へ / `enter_drive_list_from_navigation(None)` /
+      `enter_reading_history_with_entrance(Menu)` / `open_books_root` / `enter_rating_view(n)`)。検索外の挙動は変えない。
+   4. 検索のどれかが active (`ExitTemporaryView`) → 既存の前例に乗せる:
    - `Physical(path)`: `begin_context_jump_to_folder(JumpToFolderRequest { destination, selection: None, origin: None })`。
      `destination` はディレクトリなら `PhysicalDirectory`、ZIP/PDF/EPUB/変換書庫なら `ArchiveContainer`
      (分類は既存 helper の解決結果か拡張子分類で行い、UI スレッドに新しい同期 I/O を足さない)。
@@ -146,8 +150,9 @@
    Collection / Rating owner の除外はそのまま。列の中身は今と同じ (`current_grid_order()` 順の Folder / Zip / Pdf /
    ConvertibleArchive 行、path 重複なし)。
    - `Folder` scope: 今と同じ。
-   - `Everything` scope: **Root (結果一覧そのもの) のときだけ** 取る。並べ替え・★/タグ/ファセット/Ctrl+F 絞り込み後の表示順。
-     PhysicalChild の中 (実フォルダ行の物理一覧) から本を開いたときは取らず、前の列を残す (第 1 版から変更、§7 P1)。
+   - `Everything` scope: **Root で、かつ表示中の行が検索結果そのもの (`items_are_global_search_view`) のときだけ** 取る。
+     並べ替え・★/タグ/ファセット/Ctrl+F 絞り込み後の表示順。PhysicalChild の中 (実フォルダ行の物理一覧) や、Root のまま
+     アドレス欄等で dataset 外の物理一覧へ移った状態から本を開いたときは取らず、前の列を残す (§7 第 1 版 P1、第 2 版 P2)。
 3. **位置 (position)**: `snapshot.scope == current_list_order_scope()` を足す。表示先 (MainWindow / Fullscreen)・
    detached でないことの条件は今のまま。今の本の求め方は scope で分ける:
    - `Folder`: 今と同じ (`effective_folder()` の完全一致 → Folder 行の配下)。
@@ -155,6 +160,11 @@
      検索 session が「どの結果行を開いているか」を既に持っているので、物理パスの祖先推定をしない。Everything が
      `A` と `A\B` の両方を返した場合や、内側の書庫も結果行である場合でも、位置は開いた行に一意に決まる。
      Folder 行を開いてその中の本を開いた状態から押すと、その Folder 行の前後の結果行へ移る。
+   - ただし位置を返す前に、**今表示している論理の場所がその行に属すること**を確かめる: `effective_folder()` がその行と同じ
+     physical key、または行が Folder でその配下 (成分境界)。範囲外の入口 (アドレス欄等) で別の場所へ移った後は `logical_source`
+     が旧行のまま残るので、この確認が無いと別の本を見ているのに旧行の次へ移ってしまう (§7 第 2 版 P2)。
+   - 比較規則: Everything の entry・`logical_source`・採用された path の照合は、既存の dataset membership と同じ
+     `crate::path_key::physical_path_spelling` の key で行う (`path_eq` ではない。I/O なし、§7 第 2 版 P3)。
    - 帰結: 検索を閉じた後・別の結果を採用した後 (run が変わる)・Ctrl+G の本・通常フォルダでは Everything の列は使えない。
      Everything の本の中では、通常フォルダで取った列は使えない。どちらも「一覧から開いた本で使えます」の通知。
    - 列は 1 つだけ持つ (scope ごとに持たない)。Everything から本を開くと、それまでの通常フォルダの列は置き換わる。
@@ -169,17 +179,23 @@
    - 一覧順の移動先が決まった時点 (`apply_folder_nav_result` の `FolderNavMode::ListOrder` で、snapshot の scope が
      `Everything { run }`) に、その要求へ **移動先の結果行** を持たせる:
      `SearchOpenOrigin::Everything { run, context, child: EverythingChildAdmission }`、
-     `enum EverythingChildAdmission { Descend, ListOrderRow { run: u64, row: PathBuf } }`。
+     `enum EverythingChildAdmission { Descend, ListOrderRow { dataset_run: u64, row: PathBuf } }`。
      既定は `Descend` (今の動き)。`ListOrderRow` を作るのはこの 1 か所だけ。
+     **2 つの run は別物**: 外側の `run` は今と同じ `capture_search_open_origin()` の値 (現在の `run_sequence`)、
+     内側の `dataset_run` は snapshot の scope の値 (accepted `SubmittedEverything.run`)。取消後は両者が異なる。
+     「現在の `capture_search_open_origin()` に `ListOrderRow { dataset_run, row }` を付ける」形にする。
    - 載せ方: 要求ごとに既に運ばれている search origin (`load_folder_with_scan_claimed` の install closure、
      `PhysicalHistoryTransition.global_search_origin`、direct PDF の採用、変換書庫の継続) に、一覧順の移動の要求だけが
      `ListOrderRow` を渡せるよう、引数または要求の field で通す。App の新しい pending・bool・「次の採用で使う」field は作らない。
-     どの関数に引数を足すかは実装者がコードで決め、全経路を列挙して報告する。変換ダイアログの直接呼び出し
-     (`src/ui_dialogs/archive_convert.rs` 1148) が一覧順の着地に関わるかも確かめる。
+     どの関数に引数を足すかは実装者がコードで決め、全経路を列挙して報告する。設計レビューの確認では、実フォルダは
+     install closure (hydration 開始前に検索側 commit)、ZIP/PDF/EPUB/変換書庫は staged 経路で、分類完了後に
+     `PhysicalHistoryTransition` を作る **`ClassifiedOpenContinuation::Physical`** (`src/app.rs` 約 36323・30296) にも
+     origin を再捕捉せず渡す必要がある。変換書庫・EPUB cache は元の `request.path` を検索側 commit へ渡す。
+     direct PDF の採用と変換ダイアログの直接呼び出し (`src/ui_dialogs/archive_convert.rs` 1148) は一覧順の着地では通らないので `Descend` のまま。
    - 採用 (`commit_staged_search_navigation_effects` → `advance_drilled_current_path` → `accept_everything_physical_child`) で:
      - `Descend`: 今と同じ (Root なら行へ、PhysicalChild なら変えない)。**一覧順以外の移動の挙動は変えない**。
-     - `ListOrderRow { run, row }`: origin が current (既存の run・context・active 照合)、accepted の run が一致、
-       採用された path が `row` と一致 (`path_eq`)、`row` が dataset の行、のすべてを満たすときだけ
+     - `ListOrderRow { dataset_run, row }`: origin が current (既存の run・context・active 照合)、accepted の run が `dataset_run`、
+       採用された path が `row` と同じ physical key、`row` が dataset の行、のすべてを満たすときだけ
        `PhysicalChild { logical_source: row, return_anchor: row, route }` にする (`route` は今の値を保持)。
        満たさなければ何もしない (取消・失敗・stale では採用が起きないか、基準が変わらない)。
    - Folder 行から中の書庫へ着地する場合 (§1.444 §3.4 の 5-2): 一覧順の要求は Folder 行の list 採用 (path = 行) で基準を置き換え、
@@ -239,7 +255,7 @@
   移動先が表示され、← で検索前の場所へ戻れる (履歴が記録される)。入口が違っても同じ結果になる。
 - 存在しない / scan 失敗の行き先: 検索 active・結果の行・選択が残り、通知が出る。
 - ジャンプの scan 中に検索の完了が届く場合と、採用後に届く場合。採用後は一覧を上書きしない。
-- 場所キーの navigation 値を作った同じフレームで Everything の送信が始まると、ジャンプは実行されない (dispatch 時の再判定)。
+- 場所キーの navigation 値を作った同じフレームで Everything の送信が始まると、ジャンプは実行されない (dispatch 時の判定)。検索なしの状態から常設欄で Everything / Metadata / favsearch を開始した同じフレームでは、ExitTemporaryView 側の規則になる (または取得中なら実行されない)。
 - 場所▼ の「整理先」も同じ規則。範囲外の入口 (お気に入り・アドレス欄・フォルダペイン・メニューバー) は今の挙動のまま (回帰)。
 - ★固定中は今の拒否のまま。検索外では今と同じ `AddressBarNav` (回帰)。
 - fullscreen (検索結果から開いた画像・本) からの場所ジャンプ: fullscreen を閉じて同じ規則。
@@ -286,3 +302,14 @@
 - P3 (文書): keymap-spec・key-customization-impl-plan・architecture-overview を追加した (§6)。
 - レビューで確認された事項: ListOrder の開始・採用に検索 active の拒否は無い。検索終了時の pending 破棄は既存処理で成立する。
   detached 述語・viewport・registry の変更は不要。新しい同期 I/O は不要。
+
+### 第 2 版 (同じレビュー担当の再レビュー、ACCEPT WITH CHANGES、2026-11-11)
+
+- P2 (Root だけでは表示中の一覧が検索結果と限らない): capture に `items_are_global_search_view` を足し、position の前に
+  今の論理の場所が行に属することを確かめる (§2.2-2・3)。
+- P2 (Plain の場所ジャンプが dispatch 時の判定を通らない): 対象の場所ジャンプは検索の有無によらず `AddressBarNav::LocationJump`
+  で運び、mode・modal・★固定を dispatch 時に判定する (§2.1-1〜3)。
+- P3 (2 つの run): `run` (現在の run_sequence) と `dataset_run` (accepted の run) を分けて書いた (§2.2-5)。
+- P3 (比較規則): physical key (`physical_path_spelling`) に揃えた (§2.2-3)。
+- 輸送経路の確認結果 (実フォルダ・staged・`ClassifiedOpenContinuation::Physical`・変換書庫/EPUB cache・direct PDF) を §2.2-5 に記録した。
+- 範囲外の整理、detached 述語・viewport・registry を変更しない点は妥当と確認された。
