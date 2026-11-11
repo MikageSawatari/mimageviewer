@@ -709,7 +709,7 @@ Cargo 実行は `MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=4`。
 | `cargo fmt` (workspace、引数なし、最後に再実行) / `cargo fmt --check` | ともに exit 0。検索入力部品と履歴▼の周辺に整形差分なし。 |
 | `git -c core.safecrlf=false diff --check` | exit 0。 |
 
-### 8.9 ed6429060 の全件テスト失敗 2 件の調査と修正 (未コミット)
+### 8.9 ed6429060 の全件テスト失敗 2 件の調査と修正 (9373116d1 でコミット)
 
 入力証拠は利用者提供の、ロック下で実行された全件 nextest の
 `target/test-lib-full/runs/20261111T101847481Z-ec099034/stderr.log`。
@@ -761,6 +761,21 @@ Cargo は `MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=4`。
 | `git -c core.safecrlf=false diff --check` | exit 0。差分は上記 2 ファイルのみ。 |
 
 製品起動・コミット・`test-lib-full` / `test-full` は行わない。全件 gate の再確認は設計担当へ引き継ぐ。
+
+### 8.10 受入 (設計担当 ClaudeCode、2026-11-11、§9・§10)
+
+- 独立レビュー (GPT-6.1 Sol / xhigh、範囲 `4a87140f3^..ed6429060`): **ACCEPT**、P1〜P3 なし。一覧順キーの押下から移動までの
+  早期終了を全列挙し、`position` の `None` は共通 handler の案内に届くこと、scope / capture の除外による別の無通知経路は無いことを確認。
+  同じ本への移動の案内は症状パッチではないと判断。サブ PC の観測の原因と一致した証拠は無い (入力所有・準備中 lock の可能性は実機資料なしでは確定できない)。
+  メニューバーの閲覧履歴・評価一覧は既存の採用処理で検索を閉じるため、範囲外で擬似子のまま残るのはお気に入り (ツールバー以外)・メニューバーの本棚。
+- `test-lib-full` (PC 全体ロック下):
+  - 1 回目 (`ed6429060`): 17,200 成功・1 失敗・1 タイムアウト。失敗は §8.9 の 1 (テストの手動 consumer、`9373116d1` で修正)。
+    タイムアウトは section1375 の 100k scan 性能テスト (単独 84 秒で成功、今回の差分を通らない)。
+  - 2 回目 (`9373116d1`): 17,201 成功・1 失敗。失敗は `caption_rotation_rename_move_display_then_reset_preserves_reused_path_and_sibling` の
+    ディレクトリ rename の `PermissionDenied` (OS error 5)。今回の差分を通らず、単独では成功。
+  - 3 回目 (`9373116d1`): **17,202 件すべて成功**、75 skipped、849.7 秒、exit 0。
+- `.\scripts\build-dev.ps1`: 成功 (`target\dev-runtime\mimageviewer-core.exe`、2026-11-11 20:32)。
+- 実機確認の記録はまだ無い。
 
 ## 9. 追補: ツールバーのお気に入りもそろえる (2026-11-11 利用者決定)
 
