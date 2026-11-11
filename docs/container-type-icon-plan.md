@@ -335,7 +335,7 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 
 ## 8. 種類ごとの選択 (§1.770)
 
-作成: 2026-11-11。状態: **設計レビュー r2 / 独立コードレビュー ACCEPT、実装・focused 574件 / UI snapshot 249件検証済み（2026-11-12）。全lib・build-dev は設計担当へ引き継ぎ、実機未確認、未コミット**。要望: 5ch >>764 (実フォルダだけをアイコンにし、書庫・PDF の表紙はそのまま見たい)。
+作成: 2026-11-11。状態: **設計レビュー r2 ACCEPT、実装 (9e7c3a97b) の独立実装レビュー ACCEPT (2026-11-12)。実機未確認**。要望: 5ch >>764 (実フォルダだけをアイコンにし、書庫・PDF の表紙はそのまま見たい)。
 バックログ: [next-release-backlog.md §1.770](next-release-backlog.md)。
 
 ### 8.1 要件
@@ -501,6 +501,8 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 - ドライブ・検索結果の集約行に専用の選択肢を作る: 要望の範囲外で、選択肢が増えるだけ。
 - 種類を外したとき一覧を読み直す: §3 の理由で採らない (コレクションのルート・Everything)。
 
+まれな失敗 (設定 DB の書き込み失敗など) は既定の割り切り方針に従い、追加の回復処理を設けない。
+
 ### 8.10 実装記録
 
 - 2026-11-12: `ContainerIconKind` / `ContainerIconKinds` と唯一の対応表 `container_icon_kind` を
@@ -540,6 +542,13 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
   記録: `target/icon-kinds-snapshot-full.log`。
 - 設計からの挙動変更はない。実装記録を指定の §8.10 とするため、既存の設計レビュー履歴は §8.11 へ移した。
 
+- 全件 (設計担当、2026-11-12、9e7c3a97b、`test-lib-full.ps1` run `20261111T154724649Z-a032f613`):
+  17,218 件中 17,215 成功・3 失敗・75 skipped (995 秒)。失敗は
+  `close_return_remote_acquire_and_return_never_resurrects_main_terminal_request`、
+  `section1375_large_physical_scan_10k_100k` (全件中 368 秒)、
+  `page_turn_mainwindow_submits_visible_vacant_leaf_both_directions` で、本件の変更箇所と関係がなく、
+  3 件とも単独の再実行で成功した (全件実行の負荷による失敗、[§1.765](next-release-backlog.md) と同じ型)。
+
 ### 8.11 設計レビューの記録
 
 - r1 (GPT-6.1 Sol / xhigh、2026-11-11): REVISE、P1 なし。P2 `--settings-override` はマージ前に未知キーを拒否するので
@@ -549,5 +558,7 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
   検査 → §8.6 に追記。対応表・引数置換で判定の一致が保たれること・`old - new` の差集合・Remote に変更が
   要らないことは妥当と確認された。
 
-まれな失敗 (設定 DB の書き込み失敗など) は既定の割り切り方針に従い、追加の回復処理を設けない。
 - r2 (同、resume): ACCEPT。r1 の指摘の反映を確認、追加指摘なし。
+- 実装レビュー (同じ独立担当、実装担当とは別、2026-11-12、`54a701ef0..9e7c3a97b`): ACCEPT、P1/P2/P3 なし。
+  置換漏れ・`ALL` 固定なし、差集合・3 入口の変換・serde 形と DB/取り込みの整合、旧テストの OK/Cancel/保存/再表示の
+  検査の保持、UI・マニュアル・PNG の変化が意図どおりであることを確認。
