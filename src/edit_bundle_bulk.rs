@@ -672,7 +672,7 @@ impl App {
                 export_crop: self.export_crop_page_keys.contains(&target.page_key),
                 // get_rotation は cache miss 時に同期SELECTする。起動時に全件ロードされ、
                 // set_image_rotation でも同期される key set だけを見る。
-                rotation: self.rotation_page_keys.contains(&target.page_key),
+                rotation: self.rotation_page_keys.contains_key(&target.page_key),
             })
             .collect::<Vec<_>>();
         let counts = count_reset_kinds(&presences);
@@ -1019,7 +1019,7 @@ impl App {
         target: &BulkPageEditTarget,
         current_idx: Option<usize>,
     ) -> Result<(), String> {
-        if !self.rotation_page_keys.contains(&target.page_key) {
+        if !self.rotation_page_keys.contains_key(&target.page_key) {
             return Ok(());
         }
         let idx = current_idx.ok_or_else(|| {

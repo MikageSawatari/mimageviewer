@@ -165,6 +165,9 @@ pub(crate) fn prepare(
                 entries.push((
                     cache_key,
                     crate::catalog::CacheEntry {
+                        cover: crate::cover_identity::CoverIdentity::Page(
+                            crate::adjustment_db::normalize_path(&seed.video_path),
+                        ),
                         mtime: seed.mtime,
                         file_size: seed.file_size,
                         jpeg_data: webp,

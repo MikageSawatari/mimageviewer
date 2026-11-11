@@ -532,6 +532,16 @@ fn decode_remote_source(
     if let Some(bytes) = preloaded_zip_bytes {
         // The request already verified this representative's payload after its
         // RAW admission decision. Reuse those bytes in the ordinary loader.
+        let cover = crate::thumb_loader::cover_identity_for_location(
+            &crate::thumb_loader::ReadLocation::ArchiveEntry {
+                archive: request.path.clone(),
+                entry: request
+                    .zip_entry
+                    .clone()
+                    .expect("preloaded ZIP entry was selected"),
+            },
+            request.books_root.as_deref(),
+        );
         crate::thumb_loader::load_one_cached(
             &request.path,
             request.zip_entry.as_deref(),
@@ -568,6 +578,8 @@ fn decode_remote_source(
             request.raw_source.clone(),
             Some(&raw_handoff),
             None,
+            cover,
+            None,
         );
     } else {
         crate::thumb_loader::process_load_request(
@@ -599,7 +611,7 @@ fn decode_remote_source(
         crate::thumb_loader::ThumbMsgPayload::Pixels(pixels)
         | crate::thumb_loader::ThumbMsgPayload::SourcePixels(pixels)
         | crate::thumb_loader::ThumbMsgPayload::ProvisionalPixels(pixels) => {
-            Some((pixels.image, pixels.source_dims))
+            Some((pixels.image, pixels.source_dims, pixels.cover))
         }
         crate::thumb_loader::ThumbMsgPayload::Canceled => {
             saw_canceled = true;
@@ -608,7 +620,7 @@ fn decode_remote_source(
         _ => None,
     });
     let drain_ms = drain_started.elapsed().as_secs_f64() * 1000.0;
-    let (color_image, decoded_source_dims) = loaded.ok_or_else(|| {
+    let (color_image, decoded_source_dims, cover) = loaded.ok_or_else(|| {
         remote_source_decode_error(
             saw_canceled || shared_cancel.load(Ordering::Acquire),
             zip_directory,
@@ -618,6 +630,7 @@ fn decode_remote_source(
         raster: RemoteSourceRaster {
             pixels: Arc::new(color_image),
             decoded_source_dims,
+            cover,
         },
         load_request_ms,
         drain_ms,
@@ -1254,6 +1267,7 @@ impl RemoteSourceDecodeIdentity {
 struct RemoteSourceRaster {
     pixels: Arc<egui::ColorImage>,
     decoded_source_dims: Option<(u32, u32)>,
+    cover: crate::cover_identity::CoverIdentity,
 }
 
 #[derive(Clone)]
@@ -1553,11 +1567,10 @@ impl RemoteSourceSingleFlight {
     fn acquire(&self, identity: &RemoteSourceDecodeIdentity) -> RemoteSourceAcquire {
         Self::debug_assert_can_wait(identity);
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if state
-            .handoff
-            .as_ref()
-            .is_some_and(|handoff| handoff.identity == *identity)
-        {
+        if state.handoff.as_ref().is_some_and(|handoff| {
+            handoff.identity == *identity
+                && handoff.raster.cover != crate::cover_identity::CoverIdentity::Legacy
+        }) {
             return RemoteSourceAcquire::Handoff(state.handoff.as_ref().unwrap().raster.clone());
         }
         // This is a one-slot hand-off, not a cache. Any different identity releases it now.
@@ -4621,8 +4634,11 @@ impl ContainerEngine {
             Ok(resolved) => resolved,
             Err(error) => return thumbnail_error_from_media(error),
         };
-        let rotation =
-            context.rotation_for_remote_page(&resolved.logical, &request.address.subresource);
+        let rotation = if is_remote_book_thumbnail(&request.address, &resolved) {
+            crate::rotation_db::Rotation::None
+        } else {
+            context.rotation_for_remote_page(&resolved.logical, &request.address.subresource)
+        };
         let raw_thumbnail = std::fs::metadata(&resolved.canonical)
             .ok()
             .and_then(|metadata| {
@@ -7995,6 +8011,7 @@ impl ContainerEngine {
             file_size = size;
         }
         let mut request = crate::thumb_loader::LoadRequest {
+            books_root: self.settings.book_root.clone(),
             file_type_visibility: self
                 .current_file_type_visibility()
                 .map_err(|error| media_error(MediaErrorCode::RenderFailed, error.to_string()))?,
@@ -8340,6 +8357,20 @@ impl ContainerEngine {
                                 developed.image.width(),
                                 developed.image.height(),
                             )),
+                            cover: crate::thumb_loader::cover_identity_for_location(
+                                &request.zip_entry.as_ref().map_or_else(
+                                    || {
+                                        crate::thumb_loader::ReadLocation::File(
+                                            request.path.clone(),
+                                        )
+                                    },
+                                    |entry| crate::thumb_loader::ReadLocation::ArchiveEntry {
+                                        archive: request.path.clone(),
+                                        entry: entry.clone(),
+                                    },
+                                ),
+                                request.books_root.as_deref(),
+                            ),
                         },
                         load_request_ms: started.elapsed().as_secs_f64() * 1000.0,
                         drain_ms: 0.0,
@@ -8376,7 +8407,13 @@ impl ContainerEngine {
         let RemoteSourceRaster {
             pixels: color_image,
             decoded_source_dims,
+            cover,
         } = source_load.raster;
+        let rotation = if !full_page && is_remote_book_thumbnail(address, resolved) {
+            context.rotation_for_remote_cover(&cover)
+        } else {
+            rotation
+        };
         if let Some(stage) = source_stage.as_mut() {
             stage.finish_with_outcome(
                 RemotePageStageMetrics::buffer(color_image.size[0], color_image.size[1], 4),
@@ -9651,6 +9688,13 @@ fn is_zip_path(path: &Path) -> bool {
         .is_some_and(|extension| {
             crate::folder_tree::is_zip_extension(&extension.to_ascii_lowercase())
         })
+}
+
+fn is_remote_book_thumbnail(address: &RemoteAddress, resolved: &ResolvedPath) -> bool {
+    matches!(address.subresource, RemoteSubresource::ZipDirectory { .. })
+        || (matches!(address.subresource, RemoteSubresource::File)
+            && (is_archive_container(resolved)
+                || crate::folder_tree::is_paged_document_path(&resolved.logical)))
 }
 
 fn is_archive_container(resolved: &ResolvedPath) -> bool {
@@ -11607,6 +11651,7 @@ pub(super) mod tests {
                 8,
                 Some((8, 8)),
                 &webp,
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
         }
@@ -11970,6 +12015,7 @@ pub(super) mod tests {
                     8,
                     Some((8, 8)),
                     &webp,
+                    &crate::cover_identity::CoverIdentity::Legacy,
                 )
                 .unwrap();
             let response = engine.thumbnail(
@@ -13402,6 +13448,7 @@ pub(super) mod tests {
                 60,
                 Some((120, 60)),
                 b"old",
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
         let _pin = crate::pdf_loader::pin_epub_for_test(&epub, 802, pdf.len() as u64);
@@ -13429,7 +13476,16 @@ pub(super) mod tests {
         let (old_webp, _, _) = crate::catalog::encode_thumb_webp(&portrait, 96, 75.0).unwrap();
         let (new_webp, _, _) = crate::catalog::encode_thumb_webp(&landscape, 96, 75.0).unwrap();
         catalog
-            .save("page_0000", 901, pdf.len() as i64, 48, 96, None, &old_webp)
+            .save(
+                "page_0000",
+                901,
+                pdf.len() as i64,
+                48,
+                96,
+                None,
+                &old_webp,
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
         let _pin = crate::pdf_loader::pin_epub_for_test(&epub, 901, pdf.len() as u64);
         let resolves = crate::pdf_loader::RemoteResolveTestCounter::for_path(&epub);
@@ -13439,7 +13495,16 @@ pub(super) mod tests {
             Box::new(move || {
                 crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &path)
                     .unwrap()
-                    .save("page_0000", 902, pdf.len() as i64, 96, 48, None, &new_webp)
+                    .save(
+                        "page_0000",
+                        902,
+                        pdf.len() as i64,
+                        96,
+                        48,
+                        None,
+                        &new_webp,
+                        &crate::cover_identity::CoverIdentity::Legacy,
+                    )
                     .unwrap();
             }),
         );
@@ -13493,7 +13558,16 @@ pub(super) mod tests {
         let (old_webp, _, _) = crate::catalog::encode_thumb_webp(&landscape, 96, 75.0).unwrap();
         let (new_webp, _, _) = crate::catalog::encode_thumb_webp(&portrait, 96, 75.0).unwrap();
         catalog
-            .save("page_0000", 903, pdf.len() as i64, 96, 48, None, &old_webp)
+            .save(
+                "page_0000",
+                903,
+                pdf.len() as i64,
+                96,
+                48,
+                None,
+                &old_webp,
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
         open_parent_catalog(&epub)
             .unwrap()
@@ -13507,7 +13581,16 @@ pub(super) mod tests {
             Box::new(move || {
                 crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &path)
                     .unwrap()
-                    .save("page_0000", 904, pdf.len() as i64, 48, 96, None, &new_webp)
+                    .save(
+                        "page_0000",
+                        904,
+                        pdf.len() as i64,
+                        48,
+                        96,
+                        None,
+                        &new_webp,
+                        &crate::cover_identity::CoverIdentity::Legacy,
+                    )
                     .unwrap();
             }),
         );
@@ -13772,6 +13855,7 @@ pub(super) mod tests {
                 96,
                 Some((48, 96)),
                 &webp,
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
         let engine = ContainerEngine::new(crate::settings::Settings {
@@ -13861,6 +13945,7 @@ pub(super) mod tests {
             raster: RemoteSourceRaster {
                 pixels: Arc::new(egui::ColorImage::new([2, 1], vec![color; 2])),
                 decoded_source_dims: Some((2, 1)),
+                cover: crate::cover_identity::CoverIdentity::Page("test-page.png".into()),
             },
             load_request_ms: 1.0,
             drain_ms: 0.5,
@@ -14415,6 +14500,36 @@ pub(super) mod tests {
         assert_eq!(decodes.load(Ordering::Acquire), 1);
         assert_eq!(second.outcome, RemoteSourceLoadOutcome::Handoff);
         assert!(Arc::ptr_eq(&first.raster.pixels, &second.raster.pixels));
+        assert_eq!(first.raster.cover, second.raster.cover);
+    }
+
+    #[test]
+    fn remote_source_handoff_rereads_legacy_pixels_with_their_replacement_identity() {
+        let flight = Arc::new(RemoteSourceSingleFlight::default());
+        let identity = source_test_identity("book.zip", 64, false);
+        let first = flight
+            .load(identity.clone(), Arc::new(AtomicBool::new(false)), |_| {
+                let mut decoded = source_test_decoded(egui::Color32::RED);
+                decoded.raster.cover = crate::cover_identity::CoverIdentity::Legacy;
+                Ok(decoded)
+            })
+            .unwrap();
+        let second = flight
+            .load(identity, Arc::new(AtomicBool::new(false)), |_| {
+                Ok(source_test_decoded(egui::Color32::BLUE))
+            })
+            .unwrap();
+        assert_eq!(second.outcome, RemoteSourceLoadOutcome::Decoded);
+        assert!(!Arc::ptr_eq(&first.raster.pixels, &second.raster.pixels));
+        assert_eq!(
+            first.raster.cover,
+            crate::cover_identity::CoverIdentity::Legacy
+        );
+        assert_eq!(second.raster.pixels.pixels[0], egui::Color32::BLUE);
+        assert_eq!(
+            second.raster.cover,
+            crate::cover_identity::CoverIdentity::Page("test-page.png".into())
+        );
     }
 
     #[test]
@@ -15033,6 +15148,7 @@ pub(super) mod tests {
                     144,
                     Some((503, 727)),
                     b"thumb",
+                    &crate::cover_identity::CoverIdentity::Legacy,
                 )
                 .unwrap();
         }
@@ -15148,6 +15264,110 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn remote_book_thumbnail_rereads_upgraded_legacy_cover_and_rotates_its_page() {
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let folder = data.path().join("remote-cover-identity");
+        std::fs::create_dir_all(&folder).unwrap();
+        let zip_path = folder.join("book.zip");
+        write_remote_ai_test_zip(
+            &zip_path,
+            &[("chapter/page.png", &remote_ai_test_png(96, 48))],
+        );
+        let pdf_path = folder.join("book.pdf");
+        std::fs::write(&pdf_path, minimal_remote_pdf_with_direction(72, 144)).unwrap();
+        let _pdf = crate::pdf_loader::RemotePdfTestBackend::for_path(&pdf_path);
+        let rotation_db = crate::rotation_db::RotationDb::open().unwrap();
+        let context = WorkerContext::open();
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            cache_policy: crate::settings::CachePolicy::Always,
+            ..Default::default()
+        });
+        let webp =
+            crate::catalog::encode_thumb_webp(&image::DynamicImage::new_rgb8(96, 48), 96, 80.0)
+                .unwrap()
+                .0;
+        for (path, subresource, catalog_folder, cache_key, page_key) in [
+            (
+                &zip_path,
+                RemoteSubresource::File,
+                &folder,
+                container_thumb_key(crate::thumb_loader::CACHE_KEY_ZIP, &zip_path).unwrap(),
+                crate::adjustment_db::zip_entry_key(&zip_path, "chapter/page.png"),
+            ),
+            (
+                &zip_path,
+                RemoteSubresource::ZipDirectory {
+                    prefix: "chapter/".into(),
+                },
+                &zip_path,
+                crate::grid_item::zipdir_cache_key("chapter/"),
+                crate::adjustment_db::zip_entry_key(&zip_path, "chapter/page.png"),
+            ),
+            (
+                &pdf_path,
+                RemoteSubresource::File,
+                &folder,
+                container_thumb_key(crate::thumb_loader::CACHE_KEY_PDF, &pdf_path).unwrap(),
+                crate::edit_source::page_key_for_pdf(&pdf_path, 0),
+            ),
+        ] {
+            let metadata = std::fs::metadata(path).unwrap();
+            let catalog = crate::catalog::CatalogDb::open(
+                &crate::catalog::default_cache_dir(),
+                catalog_folder,
+            )
+            .unwrap();
+            rotation_db
+                .set_key(
+                    &crate::adjustment_db::normalize_path(path),
+                    crate::rotation_db::Rotation::Cw90,
+                )
+                .unwrap();
+            rotation_db
+                .set_key(&page_key, crate::rotation_db::Rotation::Cw90)
+                .unwrap();
+            let request = mimageviewer_ipc::ThumbnailRequest {
+                address: RemoteAddress {
+                    path: path.to_string_lossy().into_owned(),
+                    subresource,
+                },
+                source_address: None,
+                target_px: 64,
+            };
+            for (cover, expected_dims) in [
+                (crate::cover_identity::CoverIdentity::Legacy, (64, 32)),
+                (
+                    crate::cover_identity::CoverIdentity::Page(page_key.clone()),
+                    (32, 64),
+                ),
+            ] {
+                // Same source stamp and decode identity: only the desktop-written row changes.
+                catalog
+                    .save_thumb_bytes(
+                        &cache_key,
+                        crate::ui_helpers::mtime_secs(&metadata),
+                        metadata.len() as i64,
+                        Some((96, 48)),
+                        &webp,
+                        &cover,
+                    )
+                    .unwrap();
+                let response = engine.thumbnail(&request, &context);
+                let ThumbnailResponse::Success { webp_bytes } = response else {
+                    panic!("{request:?}: {response:?}");
+                };
+                let actual = image::load_from_memory(&webp_bytes).unwrap();
+                assert_eq!(
+                    (actual.width(), actual.height()),
+                    expected_dims,
+                    "{request:?}"
+                );
+                assert_eq!(catalog.load_one(&cache_key).unwrap().unwrap().cover, cover);
+            }
+        }
+    }
+
+    #[test]
     fn remote_cover_only_zip_pdf_requests_save_covers_and_page_dimensions() {
         let data = crate::data_dir::TestDataDirGuard::new();
         let cache_dir = crate::catalog::default_cache_dir();
@@ -15209,7 +15429,15 @@ pub(super) mod tests {
                 let (width, height) = dims[&page_key].expect("viewed pages retain dimensions");
                 assert_eq!(width > height, path == &zip_path);
                 let covers = crate::catalog::CatalogDb::open(&cache_dir, &folder).unwrap();
-                assert!(covers.load_one(&cover_key).unwrap().is_some());
+                let cover = covers.load_one(&cover_key).unwrap().unwrap();
+                let page_identity = match page_key.as_str() {
+                    "page.png" => crate::adjustment_db::zip_entry_key(path, "page.png"),
+                    _ => crate::edit_source::page_key_for_pdf(path, 0),
+                };
+                assert_eq!(
+                    cover.cover,
+                    crate::cover_identity::CoverIdentity::Page(page_identity)
+                );
             }
         }
     }
@@ -15255,6 +15483,12 @@ pub(super) mod tests {
                 )
                 .unwrap();
                 assert_eq!(decoded.raster.decoded_source_dims, Some((96, 48)));
+                assert_eq!(
+                    decoded.raster.cover,
+                    crate::cover_identity::CoverIdentity::Page(
+                        crate::adjustment_db::zip_entry_key(&path, "page.png")
+                    )
+                );
                 let key = override_key.as_deref().unwrap_or("page.png");
                 let saves_webp = !cover_only || override_key.is_some();
                 assert_eq!(catalog.load_one(key).unwrap().is_some(), saves_webp);
@@ -15538,6 +15772,7 @@ pub(super) mod tests {
                 8,
                 Some((8, 8)),
                 &webp,
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
         drop(catalog);

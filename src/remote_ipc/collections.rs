@@ -2196,18 +2196,54 @@ mod tests {
         let cache_dir = crate::catalog::default_cache_dir();
         let first_catalog = crate::catalog::CatalogDb::open(&cache_dir, &first_parent).unwrap();
         first_catalog
-            .save("portrait-a.jpg", 1, 10, 8, 8, Some((1200, 1800)), b"a")
+            .save(
+                "portrait-a.jpg",
+                1,
+                10,
+                8,
+                8,
+                Some((1200, 1800)),
+                b"a",
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
         first_catalog
-            .save("portrait-b.jpg", 1, 10, 8, 8, Some((1200, 1800)), b"b")
+            .save(
+                "portrait-b.jpg",
+                1,
+                10,
+                8,
+                8,
+                Some((1200, 1800)),
+                b"b",
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
         drop(first_catalog);
         let second_catalog = crate::catalog::CatalogDb::open(&cache_dir, &second_parent).unwrap();
         second_catalog
-            .save("wide.jpg", 1, 10, 8, 8, Some((1800, 1200)), b"wide")
+            .save(
+                "wide.jpg",
+                1,
+                10,
+                8,
+                8,
+                Some((1800, 1200)),
+                b"wide",
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
         second_catalog
-            .save("portrait-c.jpg", 1, 10, 8, 8, Some((1200, 1800)), b"c")
+            .save(
+                "portrait-c.jpg",
+                1,
+                10,
+                8,
+                8,
+                Some((1200, 1800)),
+                b"c",
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
         drop(second_catalog);
 
@@ -2301,7 +2337,16 @@ mod tests {
         let catalog =
             crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &parent).unwrap();
         catalog
-            .save("legacy-wide.jpg", 1, 10, 8, 6, None, &jpeg)
+            .save(
+                "legacy-wide.jpg",
+                1,
+                10,
+                8,
+                6,
+                None,
+                &jpeg,
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
         catalog
             .save(
@@ -2312,6 +2357,7 @@ mod tests {
                 8,
                 Some((600, 800)),
                 b"thumb",
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
         drop(catalog);

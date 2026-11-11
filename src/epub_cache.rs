@@ -2091,6 +2091,7 @@ mod tests {
                 None,
                 None,
                 b"old",
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
 

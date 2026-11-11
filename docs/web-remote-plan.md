@@ -764,6 +764,20 @@ remote-web は pending 要求を id で解決し、接続断では全 pending �
 共有して重複生成しない。remote-web の `/api/thumb` はこの要求・応答を中継するだけで、IPC 往復
 時間を `ipc_ms` として診断ログへ記録する。
 
+本のタイル (ZIP / PDF / EPUB の表紙、ZipDir、フォルダ代表) は、読み込み結果の画素と一緒に
+`CoverIdentity` を受け取り、`Page(k)` なら読み込み後に worker の read-only `RotationDb` から
+k の角度を引いて回転する。容器自身のパスの回転は使わない。ページのタイルは従来の
+`rotation_for_remote_page` を使う。Remote が作る新しい catalog 行にも identity を保存する。
+旧行 (`Legacy`) は回転せず、その場での作り直しもしない。デスクトップ側で作り直された次の行を
+読めるよう、`RemoteSourceSingleFlight` は `Legacy` の完了済み raster を使い回さない。
+それ以外の完了済み受け渡しでは、source identity が同じなら画素と保存済みの cover identity を
+一緒に再利用し、後から読んだ identity だけを古い画素へ付け替えない。
+
+一覧サムネイルの `/api/thumb` に ETag は無く、`private, max-age=60` と一覧 URL の session epoch を使う。
+回転 DB の変更は Remote の state generation を進めるが、表示中の一覧タイルは貼り替えない。
+本のタイルもページのタイルと同じく、一覧を開き直す等、ブラウザ cache の期限が過ぎた後の
+次の取得で回転が反映される。期限が過ぎただけでは表示中の画像は更新されない。
+
 本体未起動・pipe 未接続時も HTTP サーバ自体は起動する。`/api/thumb` は 503 と機械可読な
 `miv_not_running` を返し、フロントは「mIV 本体が起動していません」と画面内に表示する。
 仮想グリッドの tile は binding 世代と絶対 path + subresource の address identity を応答時に照合し、破棄時は fetch を abort する。

@@ -365,6 +365,9 @@ pub(in crate::app) fn prepare_collection_grid_live_thumbnail_sources(
         folder_pin_cache.insert(
             seed.cache_key.clone(),
             crate::catalog::CacheEntry {
+                cover: crate::cover_identity::CoverIdentity::Page(
+                    crate::adjustment_db::normalize_path(&seed.video_path),
+                ),
                 mtime: seed.mtime,
                 file_size: seed.file_size,
                 jpeg_data: webp.clone(),
@@ -6198,6 +6201,7 @@ mod tests {
                     .unwrap()
                     .into_owned(),
                 crate::catalog::CacheEntry {
+                    cover: crate::cover_identity::CoverIdentity::Legacy,
                     mtime: 1,
                     file_size: 5,
                     jpeg_data: Vec::new(),
@@ -11249,10 +11253,30 @@ mod tests {
         assert!(before.0.is_subset(&before.1));
         let catalog = app.get_or_open_catalog(&folder).unwrap();
         for key in &before.0 {
-            catalog.save(key, 1, 1, 1, 1, None, b"thumb").unwrap();
+            catalog
+                .save(
+                    key,
+                    1,
+                    1,
+                    1,
+                    1,
+                    None,
+                    b"thumb",
+                    &crate::cover_identity::CoverIdentity::Legacy,
+                )
+                .unwrap();
         }
         catalog
-            .save("removed.png", 1, 1, 1, 1, None, b"removed")
+            .save(
+                "removed.png",
+                1,
+                1,
+                1,
+                1,
+                None,
+                b"removed",
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
         open(&mut app, normal_first);
         let after = physical_folder_thumbnail_keys(&mut app, &folder);
@@ -11336,11 +11360,31 @@ mod tests {
         let expected = thumbnail_request_keys(&app);
         let catalog = app.get_or_open_catalog(&folder).unwrap();
         for key in &expected {
-            catalog.save(key, 1, 1, 1, 1, None, b"thumb").unwrap();
+            catalog
+                .save(
+                    key,
+                    1,
+                    1,
+                    1,
+                    1,
+                    None,
+                    b"thumb",
+                    &crate::cover_identity::CoverIdentity::Legacy,
+                )
+                .unwrap();
         }
         let legacy_key = super::super::image_full_path_cache_key(&folder.join("page.png"));
         catalog
-            .save(&legacy_key, 1, 1, 1, 1, None, b"legacy")
+            .save(
+                &legacy_key,
+                1,
+                1,
+                1,
+                1,
+                None,
+                b"legacy",
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
         let snapshot =
             collection_with_sources(&client, &[(folder.clone(), CollectionResolvedKind::Folder)]);

@@ -36,7 +36,7 @@ impl WorkerContext {
         Self {
             folder_pin_db: crate::folder_thumb_pins::FolderThumbPinDb::open().ok(),
             video_pin_db: crate::video_pins::VideoPinDb::open().ok(),
-            rotation_db: crate::rotation_db::RotationDb::open().ok(),
+            rotation_db: crate::rotation_db::RotationDb::open_readonly().ok(),
             adjustment_db: crate::adjustment_db::AdjustmentDb::open().ok(),
             mask_db: crate::mask_db::MaskDb::open_readonly().ok(),
             local_adjust_db: crate::local_adjust_db::LocalAdjustDb::open_readonly(
@@ -91,6 +91,25 @@ impl WorkerContext {
                     .and_then(|database| database.get_key(&key))
             })
             .unwrap_or(crate::rotation_db::Rotation::None)
+    }
+
+    pub(super) fn rotation_for_remote_cover(
+        &self,
+        cover: &crate::cover_identity::CoverIdentity,
+    ) -> crate::rotation_db::Rotation {
+        match cover {
+            crate::cover_identity::CoverIdentity::Page(key) => {
+                match self.rotation_db.as_ref().map(|db| db.get_key_checked(key)) {
+                    Some(Ok(rotation)) => rotation.unwrap_or_default(),
+                    Some(Err(error)) => {
+                        crate::logger::log(format!("remote cover rotation read failed: {error}"));
+                        crate::rotation_db::Rotation::None
+                    }
+                    None => crate::rotation_db::Rotation::None,
+                }
+            }
+            _ => crate::rotation_db::Rotation::None,
+        }
     }
 }
 
@@ -426,6 +445,7 @@ impl ThumbnailEngine {
         })?;
 
         let mut load_request = crate::thumb_loader::LoadRequest {
+            books_root: self.settings.book_root.clone(),
             request_id: crate::thumb_loader::ThumbnailRequestId::Standalone,
             // decode は検証済みの logical path を使う。catalog key、pin DB、回転 DB が
             // 本体 UI と同じ spelling になり、canonical path は境界判定専用に保つ。
@@ -557,9 +577,9 @@ impl ThumbnailEngine {
             ));
         }
         drop(tx);
-        let color_image = rx
+        let pixels = rx
             .into_iter()
-            .find_map(|message| message.into_pixels().map(|pixels| pixels.image))
+            .find_map(|message| message.into_pixels())
             .ok_or_else(|| {
                 if matches!(
                     raw_requirement,
@@ -586,24 +606,24 @@ impl ThumbnailEngine {
                 }
             })?;
 
-        let mut image = color_image_to_dynamic(&color_image).ok_or_else(|| {
+        let mut image = color_image_to_dynamic(&pixels.image).ok_or_else(|| {
             error_response(
                 ThumbnailErrorCode::GenerationFailed,
                 "サムネイル画像を WebP へ変換できませんでした",
             )
         })?;
-        // 本体 UI と同様、通常画像だけに手動回転 DB を適用する。フォルダ代表は
-        // GridItem::Folder なので回転対象外。
-        if !is_folder {
-            let rotation =
-                context.rotation_for_remote_page(&resolved.logical, &RemoteSubresource::File);
-            image = match rotation {
-                crate::rotation_db::Rotation::None => image,
-                crate::rotation_db::Rotation::Cw90 => image.rotate90(),
-                crate::rotation_db::Rotation::Cw180 => image.rotate180(),
-                crate::rotation_db::Rotation::Cw270 => image.rotate270(),
-            };
-        }
+        // A folder rotates by the page that actually supplied its pixels, not its own path.
+        let rotation = if is_folder {
+            context.rotation_for_remote_cover(&pixels.cover)
+        } else {
+            context.rotation_for_remote_page(&resolved.logical, &RemoteSubresource::File)
+        };
+        image = match rotation {
+            crate::rotation_db::Rotation::None => image,
+            crate::rotation_db::Rotation::Cw90 => image.rotate90(),
+            crate::rotation_db::Rotation::Cw180 => image.rotate180(),
+            crate::rotation_db::Rotation::Cw270 => image.rotate270(),
+        };
         crate::catalog::encode_thumb_webp(
             &image,
             effective_target,
@@ -1139,6 +1159,7 @@ mod tests {
                 8,
                 Some((8, 8)),
                 &webp,
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
         let bytes = engine
@@ -1187,6 +1208,7 @@ mod tests {
                 8,
                 Some((8, 8)),
                 &webp,
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
         let bytes = engine
@@ -1341,6 +1363,7 @@ mod tests {
                 None,
                 &webp,
                 Some(&proof),
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
         assert!(catalog.load_one(&key).unwrap().is_some());
@@ -1420,6 +1443,125 @@ mod tests {
     }
 
     #[test]
+    fn remote_custom_book_root_keeps_folder_and_page_cache_rows_unrotatable() {
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let books = data.path().join("custom-books");
+        let book = books.join("bound-book");
+        std::fs::create_dir_all(&book).unwrap();
+        let page = book.join("cover.png");
+        image::DynamicImage::new_rgb8(96, 48).save(&page).unwrap();
+        let rotations = crate::rotation_db::RotationDb::open().unwrap();
+        rotations
+            .set(&page, crate::rotation_db::Rotation::Cw90)
+            .unwrap();
+        let settings = crate::settings::Settings {
+            book_root: Some(books.clone()),
+            cache_policy: crate::settings::CachePolicy::Always,
+            ..Default::default()
+        };
+        let context = WorkerContext::open();
+        let folders = ThumbnailEngine::new(settings.clone());
+        let resolved = resolve_existing(book.to_string_lossy().as_ref()).unwrap();
+        let bytes = folders
+            .generate_catalog_resolved(&resolved, 64, &context)
+            .unwrap();
+        let image = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((image.width(), image.height()), (64, 32));
+        let key = crate::thumb_loader::folder_thumb_auto_cache_key_for_path(
+            &book,
+            false,
+            settings.folder_thumb_sort,
+            settings.folder_thumb_depth,
+        )
+        .unwrap();
+        let catalog =
+            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &books).unwrap();
+        assert_eq!(
+            catalog.load_one(&key).unwrap().unwrap().cover,
+            crate::cover_identity::CoverIdentity::Unrotatable
+        );
+
+        let containers = ContainerEngine::new(settings);
+        let response = containers.thumbnail(
+            &ThumbnailRequest {
+                address: RemoteAddress::file(page.to_string_lossy().into_owned()),
+                source_address: None,
+                target_px: 64,
+            },
+            &context,
+        );
+        assert!(
+            matches!(response, ThumbnailResponse::Success { .. }),
+            "{response:?}"
+        );
+        let catalog =
+            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &book).unwrap();
+        assert_eq!(
+            catalog.load_one("cover.png").unwrap().unwrap().cover,
+            crate::cover_identity::CoverIdentity::Unrotatable
+        );
+    }
+
+    #[test]
+    fn remote_folder_thumbnail_uses_the_loaded_cover_page_rotation() {
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let folder = data.path().join("remote-rotated-folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        let page = folder.join("cover.png");
+        image::DynamicImage::new_rgb8(96, 48).save(&page).unwrap();
+        let rotation_db = crate::rotation_db::RotationDb::open().unwrap();
+        rotation_db
+            .set(&folder, crate::rotation_db::Rotation::Cw90)
+            .unwrap();
+        rotation_db
+            .set(&page, crate::rotation_db::Rotation::Cw90)
+            .unwrap();
+        let context = WorkerContext::open();
+        let engine = ThumbnailEngine::new(crate::settings::Settings {
+            cache_policy: crate::settings::CachePolicy::Always,
+            ..Default::default()
+        });
+        let resolved = resolve_existing(folder.to_string_lossy().as_ref()).unwrap();
+        for (page_rotation, expected_dims) in [
+            (crate::rotation_db::Rotation::Cw90, (32, 64)),
+            (crate::rotation_db::Rotation::None, (64, 32)),
+        ] {
+            rotation_db.set(&page, page_rotation).unwrap();
+            let bytes = engine
+                .generate_catalog_resolved(&resolved, 64, &context)
+                .unwrap();
+            let image = image::load_from_memory(&bytes).unwrap();
+            assert_eq!((image.width(), image.height()), expected_dims);
+        }
+        let key = crate::thumb_loader::folder_thumb_auto_cache_key_for_path(
+            &folder,
+            false,
+            engine.settings.folder_thumb_sort,
+            engine.settings.folder_thumb_depth,
+        )
+        .unwrap();
+        let catalog = crate::catalog::CatalogDb::open(
+            &crate::catalog::default_cache_dir(),
+            folder.parent().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            catalog.load_one(&key).unwrap().unwrap().cover,
+            crate::cover_identity::CoverIdentity::Page(crate::adjustment_db::normalize_path(&page)),
+        );
+        for cover in [
+            crate::cover_identity::CoverIdentity::Legacy,
+            crate::cover_identity::CoverIdentity::Unknown,
+            crate::cover_identity::CoverIdentity::Unrotatable,
+        ] {
+            assert_eq!(
+                context.rotation_for_remote_cover(&cover),
+                crate::rotation_db::Rotation::None
+            );
+        }
+    }
+
+    #[test]
     fn remote_folder_round_trip_reselects_after_archive_tile_write() {
         let data_dir = crate::data_dir::TestDataDirGuard::new();
         let root = data_dir.path().join("library");
@@ -1465,6 +1607,7 @@ mod tests {
                 meta.len() as i64,
                 Some((8, 8)),
                 &webp,
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
         let second = engine

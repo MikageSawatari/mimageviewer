@@ -923,7 +923,16 @@ mod tests {
         let synthetic =
             crate::catalog::CatalogDb::open(temp.path(), Path::new("__search_results__")).unwrap();
         synthetic
-            .save(&request_key, 1, 2, 1, 1, None, &[1, 2, 3])
+            .save(
+                &request_key,
+                1,
+                2,
+                1,
+                1,
+                None,
+                &[1, 2, 3],
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
         observation.catalog = Some(Arc::new(synthetic));
         let before = cache_probe(&observation).unwrap();
@@ -934,7 +943,16 @@ mod tests {
         let parent =
             crate::catalog::CatalogDb::open(temp.path(), source.parent().unwrap()).unwrap();
         parent
-            .save("cover.png", 3, 4, 1, 1, None, &[4, 5, 6])
+            .save(
+                "cover.png",
+                3,
+                4,
+                1,
+                1,
+                None,
+                &[4, 5, 6],
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
         let entry = parent.load_one("cover.png").unwrap().unwrap();
         let cache = observation.cache.as_ref().unwrap();

@@ -1029,7 +1029,14 @@ mod tests {
         let catalog =
             crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &root).unwrap();
         catalog
-            .save_thumb_bytes(&key, target.mtime, target.file_size, Some((8, 8)), &webp())
+            .save_thumb_bytes(
+                &key,
+                target.mtime,
+                target.file_size,
+                Some((8, 8)),
+                &webp(),
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
         with_pdf(
             PdfFixture {
@@ -1065,7 +1072,14 @@ mod tests {
         let catalog =
             crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &root).unwrap();
         catalog
-            .save_thumb_bytes(&key, target.mtime, target.file_size, Some((8, 8)), &webp())
+            .save_thumb_bytes(
+                &key,
+                target.mtime,
+                target.file_size,
+                Some((8, 8)),
+                &webp(),
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
         let cover = readable(resolve_book_cover(&root, BookKind::Folder, &env));
         assert_eq!(cover.cover_ref, "child.zip#entry=fixed.jpg");
@@ -1112,7 +1126,14 @@ mod tests {
         let catalog =
             crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &root).unwrap();
         catalog
-            .save_thumb_bytes(&key, target.mtime, target.file_size, Some((8, 8)), &webp())
+            .save_thumb_bytes(
+                &key,
+                target.mtime,
+                target.file_size,
+                Some((8, 8)),
+                &webp(),
+                &crate::cover_identity::CoverIdentity::Legacy,
+            )
             .unwrap();
         with_pdf(
             PdfFixture {
@@ -1208,6 +1229,7 @@ mod tests {
                 pdf_target.file_size,
                 Some((8, 8)),
                 &webp,
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
         let automatic = LoadRequest {
@@ -1262,6 +1284,7 @@ mod tests {
                 &webp,
                 Some(P::AutoSelected),
                 Some(&fallback_proof),
+                &crate::cover_identity::CoverIdentity::Legacy,
             )
             .unwrap();
         let before = parent_catalog.load_one(&child_key).unwrap().unwrap();

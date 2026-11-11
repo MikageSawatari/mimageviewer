@@ -37,6 +37,8 @@ enum Phase {
     },
 }
 struct Request {
+    cover_scope: Option<crate::cover_source_scope::CoverSourceScope>,
+    refresh_legacy_cover: bool,
     id: ThumbnailRequestId,
     items_gen: u64,
     kind: ThumbnailRequestKind,
@@ -102,6 +104,26 @@ pub(crate) struct ThumbnailRequestProjection {
     pub(crate) worker_pending: bool,
 }
 impl ThumbnailRequests {
+    pub(crate) fn begin_for_request(
+        &mut self,
+        req: &crate::thumb_loader::LoadRequest,
+        kind: ThumbnailRequestKind,
+        edit_preview_epoch: Option<u64>,
+    ) -> Option<ThumbnailRequestId> {
+        let id = self.begin(req.idx, req.items_gen, kind, edit_preview_epoch)?;
+        let r = self.entries.get_mut(&req.idx)?.request_mut()?;
+        r.cover_scope = req.cover_scope.clone();
+        r.refresh_legacy_cover = req.refresh_legacy_cover;
+        Some(id)
+    }
+    pub(crate) fn cover_facts(
+        &self,
+        idx: usize,
+        id: ThumbnailRequestId,
+    ) -> Option<(Option<crate::cover_source_scope::CoverSourceScope>, bool)> {
+        let r = self.entries.get(&idx)?.request()?;
+        (r.id == id).then(|| (r.cover_scope.clone(), r.refresh_legacy_cover))
+    }
     /// Normal and Upgrade share admission: changing the producer alone never releases a wait.
     pub(crate) fn admission(
         &mut self,
@@ -141,6 +163,8 @@ impl ThumbnailRequests {
         self.entries.insert(
             idx,
             Slot::Request(Request {
+                cover_scope: None,
+                refresh_legacy_cover: false,
                 id,
                 items_gen,
                 kind,
@@ -705,6 +729,7 @@ mod diagnostic_projection_tests {
             items_gen,
             input_seq: 0,
             payload: ThumbMsgPayload::SourcePixels(ThumbPixels {
+                cover: crate::cover_identity::CoverIdentity::Legacy,
                 image: egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
                 origin: ThumbLoadOrigin::SourceGenerated {
                     evaluated_display_px: 128,

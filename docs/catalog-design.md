@@ -311,7 +311,8 @@ CREATE TABLE thumbnails (
     source_width  INTEGER,                     -- 元画像 / PDF raster の幅（ピクセル）
     source_height INTEGER,                     -- 元画像 / PDF raster の高さ（ピクセル）
     layout_width  INTEGER,                     -- PDF page box 幅（1/1000 point、他はNULL）
-    layout_height INTEGER                      -- PDF page box 高さ（1/1000 point、他はNULL）
+    layout_height INTEGER,                     -- PDF page box 高さ（1/1000 point、他はNULL）
+    cover_key     TEXT                         -- 表紙の画素の由来（下記）
 );
 
 -- 本のページで WebP 保存を抑えた場合の寸法 (§1.452)
@@ -332,6 +333,33 @@ PDF の raster 丸めに依存しないページ矩形比だけを `layout_*` �
 v1 は PDF の `source_*` へ page-box 単位を書いていた。どちらも WebP から正確には補えないため、
 `pdf_layout_dims_version=2` への移行時に PDF catalog の全 page 行と通常 catalog の `pdfthumb:` 行を
 一度だけ削除・再生成し、無関係な画像 / ZIP 行は保持する。
+
+`cover_key` は `add_thumbnail_column_if_missing` で追加し、`CATALOG_VERSION=2` は変えない。
+NULL / 列なしは `Legacy`、`u` は `Unknown`、`n` は `Unrotatable`。
+メモリ上の `Page` は常に rotation store と同じ絶対キーを持つ。SQL 保存時だけ、先頭のドライブ文字
+(`d:` 等) が catalog の immutable な元フォルダのドライブ文字と大文字小文字を無視して一致するキーは、
+その2文字を除いた `q:<key>` とする。別ドライブ・UNC・元フォルダにドライブ文字が無い場合を含め、
+それ以外の `Page` は絶対キーをそのまま `p:<key>` として保存する。
+通常 catalog はドライブ文字の変更前後で共有されるため、`q:` の読取時は DB を開いた元フォルダの
+小文字のドライブ文字を付け直す。DB の過去の `folder_path` や、DB ファイルを置いたドライブは使わない。
+元フォルダにドライブ文字が無い `q:` は `Unknown` とし、旧行の再生成には回さない。
+通常・folder selection・Collection・音声アート・Remote を含め、全件・単件・prefix の読み手が同じ規則を使う。
+Collection は synthetic な DB identity と実ソース親フォルダを要求に別々に保持し、開いた handle に元ドライブを
+渡す。maintenance 後の CacheOnly 読み直しもその immutable な元ドライブを保持する。
+`cover_key` は未リリースなので旧 `p:` のドライブ付き行を移行する処理は設けない。
+変換書庫の表紙は、元書庫でなく実際に読んだ変換 ZIP のページキーを持つ。たとえば D: の本棚の
+catalog に C: の変換 ZIP の表紙を保存した場合は `p:c:/...` のまま読み戻し、D: に付け替えない。
+同じドライブの変換 ZIP は `q:` で保存する。この簡単なドライブ比較だけでは、同じ書庫を別ドライブに
+置いて catalog を共有した場合やドライブ文字変更後に、保存元の変換 cache または別ドライブ上の同名
+cache を指す場合が残る。mtime / size が同一の書庫の複製、またはドライブ文字の変更と変換書庫が重なる
+条件で、writer が使った変換ファイルの回転または回転なしで描く場合がある。これを既知の制限として
+受け入れ、所有関係の追加情報や特別な失効処理は足さない。
+画素は未回転のまま保持し、メモリ・seed・writebackでも由来を同じ素材としてコピーする。
+read-only の全件・単件・prefix読取は列の有無を検出して旧DBも読み、Collectionの必須列には加えない。
+`Legacy` は回転済みの出どころを持つ通常要求だけが元ソースから作り直し、既存行は保存方針にかかわらず置換する。
+元ソースを読めなければ旧画素を保持し、CacheOnlyでは作り直さない。syntheticメモリ由来だけの旧行は親DBを新設しない。
+旧行の子を表紙に流用した結果は `Unknown` とし、具体的な固定ページが判明している場合だけその `Page` とする。
+詳細と既知の制限は [§1.718 の設計](cover-rotation-1718-plan.md) §5を参照。
 
 `page_dims` は既存 schema version を変えない追加表で、通常の writable open だけで作る。
 `save_page_dims` は元の WebP と同じキー・stamp・source/layout 寸法を記録し、既存 `thumbnails` 行の

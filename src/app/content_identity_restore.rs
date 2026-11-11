@@ -503,7 +503,7 @@ impl App {
         let rotation_indices = (0..self.items.len())
             .filter(|&idx| {
                 self.rotation_key_for_idx(idx)
-                    .is_some_and(|key| presence.rotations.contains(&key))
+                    .is_some_and(|key| presence.rotations.contains_key(&key))
             })
             .collect::<Vec<_>>();
         for idx in rotation_indices {
@@ -539,7 +539,7 @@ impl App {
         self.local_adjust_page_keys
             .extend(presence.local_adjustments);
         self.comic_page_keys.extend(presence.comics);
-        self.rotation_page_keys.extend(presence.rotations);
+        self.update_rotation_page_owner(presence.rotations);
         self.export_crop_page_keys.extend(presence.crops);
     }
 

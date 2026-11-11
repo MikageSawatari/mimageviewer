@@ -50,6 +50,35 @@ fn caption_rotation_single_noop_and_reset_only_invalidate_changed_dependencies()
 }
 
 #[test]
+fn rotation_owner_snapshot_preserves_unchanged_caption_and_memory_lookup_never_reads_db() {
+    use crate::rotation_db::Rotation;
+    let mut app = setup_app_for_test();
+    app.update_rotation_page_owner([
+        ("cover".into(), Rotation::Cw90),
+        ("other".into(), Rotation::Cw180),
+    ]);
+    app.caption_display
+        .seed_rotation_for_test("cover-caption", "cover");
+    app.caption_display
+        .seed_rotation_for_test("other-caption", "other");
+    let reads = crate::rotation_db::read_operations_for_test();
+    assert_eq!(app.rotation_for_page_key("cover"), Rotation::Cw90);
+    assert_eq!(app.rotation_for_page_key("missing"), Rotation::None);
+    assert_eq!(crate::rotation_db::read_operations_for_test(), reads);
+    app.replace_rotation_page_owner(std::collections::BTreeMap::from([
+        ("cover".into(), Rotation::Cw90),
+        ("other".into(), Rotation::Cw270),
+    ]));
+    assert!(app.caption_display.contains_for_test("cover-caption"));
+    assert!(!app.caption_display.contains_for_test("other-caption"));
+    app.caption_display
+        .seed_rotation_for_test("other-caption", "other");
+    let unchanged = app.rotation_page_keys.clone();
+    app.replace_rotation_page_owner(unchanged);
+    assert!(app.caption_display.contains_for_test("other-caption"));
+}
+
+#[test]
 fn caption_rotation_rename_move_rewrites_every_presence_set_in_three_faces() {
     use std::collections::BTreeSet;
     use std::path::Path;
@@ -77,11 +106,15 @@ fn caption_rotation_rename_move_rewrites_every_presence_set_in_three_faces() {
             &mut app.mask_page_keys,
             &mut app.conceal_page_keys,
             &mut app.comic_page_keys,
-            &mut app.rotation_page_keys,
             &mut app.export_crop_page_keys,
         ] {
             keys.clone_from(&before);
         }
+        app.rotation_page_keys = before
+            .iter()
+            .cloned()
+            .map(|key| (key, crate::rotation_db::Rotation::Cw90))
+            .collect();
         app.rewrite_page_edit_presence_for_rename(Path::new(old), Path::new(new));
         // Shell success and the later migration completion both use this helper.
         app.rewrite_page_edit_presence_for_rename(Path::new(old), Path::new(new));
@@ -97,11 +130,17 @@ fn caption_rotation_rename_move_rewrites_every_presence_set_in_three_faces() {
             &app.mask_page_keys,
             &app.conceal_page_keys,
             &app.comic_page_keys,
-            &app.rotation_page_keys,
             &app.export_crop_page_keys,
         ] {
             assert_eq!(keys, &expected, "presence must follow {old} -> {new}");
         }
+        assert_eq!(
+            app.rotation_page_keys,
+            expected
+                .into_iter()
+                .map(|key| (key, crate::rotation_db::Rotation::Cw90))
+                .collect()
+        );
     }
 }
 

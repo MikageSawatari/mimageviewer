@@ -273,6 +273,7 @@ pub(crate) fn generate_with_options(
                 ));
             }
             let entry = CacheEntry {
+                cover: crate::cover_identity::CoverIdentity::Unrotatable,
                 mtime: original.mtime_secs,
                 file_size: original.file_size,
                 jpeg_data: bytes,
