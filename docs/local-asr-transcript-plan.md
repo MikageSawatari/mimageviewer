@@ -1,6 +1,6 @@
 # ローカル文字起こし (ASR) 計画書
 
-Status: 設計中 (2026-11-11、設計担当 ClaudeCode)。独立レビュー 2 回目までの指摘を反映 (§17)。T0 は着手可、製品の実装は T0 の合格後。
+Status: 設計中 (2026-11-11、設計担当 ClaudeCode)。独立レビュー済み (3 回で閉じた、§17)。T0 は着手可、製品の実装は T0 の合格後。
 関連: [local-vlm-caption-plan.md](local-vlm-caption-plan.md) (AI 説明文。本計画はその仕組みを型として使う)、
 [video-architecture.md](video-architecture.md) (左パネル・native presenter)、[search-architecture.md](search-architecture.md) (§4.8・§4.11)、
 [mcp-integration-plan.md](mcp-integration-plan.md) (§5.6・§15.2)、[async-architecture.md](async-architecture.md)。
@@ -408,3 +408,7 @@ P1 なし、P2 6 件、P3 3 件。すべて該当コードを読んで指摘ど�
 | --- | --- | --- |
 | P2-1 | 中止の後に届くものをすべて捨てると、保存済みの知らせと終了の知らせが漏れる | §6.5 を、捨てるのは未保存の結果と進捗だけ、終了を受けるまで `Stopping` で残す形に改めた |
 | P2-2 | 表示 snapshot を作り直す時点に、ジョブの状態と再生中の音声トラックの変化が無い | §8.2 に 2 つの時点を足し、別トラックの判定を `applied` から導く形にした |
+
+### 17.3 3 回目 (2026-11-11、同じ担当の続き、基準 `9cc674257`)
+
+2 回目の 2 件は解消と判定。新しい指摘なし。結論は「T0 は可。製品の実装は T0 の合格後」。
