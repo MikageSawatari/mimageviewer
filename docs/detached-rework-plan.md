@@ -1488,6 +1488,10 @@ App に detached 用 bool / Option を足さず、時間窓・待ち・再試行
 非所有窓・main・環境設定由来の非退行、受付済み folder / PDF / ZIP 遷移の正常完了、ROOT poll の再開配送、一時 id の分離。
 完成レビューとコマンド・件数・exit code は [実装記録 §17.15](depth-parallax-plan.md#1715-実装記録-643-第-2-段) に集約する。
 
+完成差分の正式な独立実装レビュー (GPT-6.1 Sol / xhigh、read-only、実装者とは別のセッション、対象 `08cc9da88`): P1 / P2 / P3 なし、
+判定「受入可」。「症状パッチではなく構造的な変更」であることに設計担当 ClaudeCode Opus と合意。触れないとした範囲 (viewport 生成・HWND・placement・
+focus・bundle swap・fork / park の搬送・backstop) への変更なしも確認された。
+
 ### 2026-11-11: 3D 写真の F12 の別ウィンドウ対応 (§1.767 第 1 段)
 
 基点 `9280249bf`、`feat-766-767-depth-ui`。設計の正本は

@@ -3168,7 +3168,7 @@ backstop / interlude の数 frame の見え方、実モデルでの推論。head
    id の context による分離自体で拒否されることを検査する。
 8. depth・export・presentation・window_mode・panorama・detached・multiwindow_scenario・slideshow・admission を指定 filter で回帰実行する。
 
-完成差分の独立レビュー (GPT-6.1 Sol / xhigh、read-only) では、削除 API / variant の既存テスト追従漏れ 3 か所を P2 1 件、
+実装担当のセッション内のレビュー (GPT-6.1 Sol / xhigh) では、削除 API / variant の既存テスト追従漏れ 3 か所を P2 1 件、
 非 modal の Running 案内にまで遷移拒否を広げていた点を P3 1 件として修正した。
 後者は phase 選択と同じ `entry_check_opens_modal()` を入口でも読み、Installing / Cancelling / Removing の Running を拒否しない。
 `depth_setup_running_operations_remain_modeless_during_accepted_independent_transition` がその対照を持つ。
@@ -3188,16 +3188,16 @@ backstop / interlude の数 frame の見え方、実モデルでの推論。head
   通常の非同期所有者が行う `poll_book_composition_read` も補い、projection / permission 待ちから reopen まで進める。
   15 秒の待機上限は変えず、失敗時に残る待機状態を表示する。旧 items の復元や製品 guard は加えていない。
 
-修正差分も独立レビューで検査条件の弱体化なしと確認した。修正後の実行結果は下表で確認する。
+修正差分も同じセッション内のレビューで検査条件の弱体化なしと確認した。修正後の実行結果は下表で確認する。
 この修正後の 5 件再実行は **2 成功・3 失敗、exit 100** (`target/depth-1767-phase2-focused-r2.log`)。
 park と PDF は成功し、残った dialog 3 件は新 Window の最初の不可視 sizing pass でタイトルを要求していた。
 既存の成功 fixture と同じ 4 pass の準備後に検査するよう観測点を修正し、全 7 pass の両 viewer の寿命確認と、
 後続 3 pass の唯一 surface の検査を維持した。egui の通常の初回計測に合わせる修理であり、
-製品への待ち・repaint・frame フラグや vendor の変更はない。独立レビューでも owner / mount / live の矛盾なしと確認した。
+製品への待ち・repaint・frame フラグや vendor の変更はない。同じセッション内のレビューでも owner / mount / live の矛盾なしと確認した。
 続く 3 件再実行は **2 成功・1 失敗、exit 100** (`target/depth-1767-phase2-focused-r3.log`)。
 唯一 surface の検査は 3 条件とも通ったが、export 条件の末尾で addon 用 helper を誤って検査していた。
 addon が無いときの `Main` fallback は正しいため、存在する dialog に合わせて export / addon の helper を選ぶよう修正した。
-この修正も独立レビューで妥当と確認し、個別の重複実行はせず、以下の指定回帰 filter 内で全 depth 条件を再確認する。
+この修正も同じセッション内のレビューで妥当と確認し、個別の重複実行はせず、以下の指定回帰 filter 内で全 depth 条件を再確認する。
 
 | コマンド | 結果・証拠 |
 | --- | --- |
@@ -3211,9 +3211,12 @@ addon が無いときの `Main` fallback は正しいため、存在する dialo
 
 最後の意味変更はテストの export / addon helper 選択だけで、その後に上記の指定回帰を実行した。
 製品コードに追加の guard・待ち・repaint は加えず、失敗した fixture の観測条件を修理した。
-設計との差分はない。完成差分の独立 GPT-6.1 Sol / xhigh レビューは **受入可、未解決 P1/P2/P3 なし**。
-所有境界に沿う構造的変更であり、fixture の修理も検査条件の弱体化なしと確認した。
-レビュー担当は上記 1,523 件と snapshot 250 件の成功ログを再利用し、Cargo を重複実行していない。
+設計との差分はない。上の「同じセッション内のレビュー」は実装担当のセッションの中で行われたもので、正式な独立レビューには数えない。
+**正式な独立実装レビュー (GPT-6.1 Sol / xhigh、read-only、実装者とは別のセッション、対象 `08cc9da88`、差分 `cc0264f3a..08cc9da88`)**:
+P1 / P2 / P3 なし、判定「受入可」。単一所有と寿命、dialog 表示先の集約、独立所有者に限った modal 保護、r5 P1 の遷移中拒否と正常 reopen、
+ROOT からの再開配送の照合、context 付き一時 id、テストの強さ (旧実装で通るだけの検査なし、fixture 修理で条件の弱体化なし)、文書の整合を確認。
+「症状パッチではなく構造的な変更」であることに**合意** (既存の所有者と遷移状態から受付・表示先・退役を導き、追加の detached 状態・時間窓・待ち・
+再試行・追加 repaint を作らない)。レビュー担当は上記 1,523 件と snapshot 250 件の成功ログを参照し、Cargo を重複実行していない。
 
 未確認: 実 OS 窓での close / activation / focus、native の保存先画面、実モニタ間の DPI 移動、実モデルでの推論、
 backstop / interlude の数 frame の見え方。headless の成功とは区別する。
