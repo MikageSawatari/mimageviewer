@@ -101173,24 +101173,9 @@ impl App {
 
         // ── ツールバー ───────────────────────────────────────────────
         let (toolbar_fav_nav, address_nav) = self.render_toolbar(ui);
-        // ツールバーお気に入りクリックは「指定フォルダへ飛ぶ」操作なので、検索系
-        // (Ctrl+F フォルダ内ファイル名フィルタ / Ctrl+S お気に入り横断検索 /
-        //  Ctrl+G 全文検索) が立っていれば全部抜けてからナビゲートする。
-        // close_*() の saved_folder 復帰で旧フォルダへ無駄にロードが走らないよう、
-        // 先に saved_folder を捨てておく。
+        // Ctrl+F の現在地フィルタだけは従来どおり先に閉じる。
+        // 検索 owner は dispatch 時の受付と成功採用まで保持する。
         if toolbar_fav_nav.is_some() {
-            if self.global_search.active {
-                self.global_search.saved_folder = None;
-                self.close_global_search();
-            }
-            if self.favsearch.active {
-                self.favsearch.saved_folder = None;
-                self.close_favsearch();
-            }
-            if self.tag_view.active {
-                self.tag_view.saved_folder = None;
-                self.close_tag_view();
-            }
             if self.show_search_bar {
                 self.cancel_pending_folder_nav();
                 self.show_search_bar = false;

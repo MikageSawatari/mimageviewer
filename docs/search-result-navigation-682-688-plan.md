@@ -126,7 +126,7 @@
 5. 検索中のジャンプ後の「戻る (←)」は、右クリック「フォルダに移動」と同じく検索前の場所へ戻る (ExitTemporaryView の既存契約)。
    検索結果は履歴に積まない (§1.689 は保留のまま)。
 
-**範囲外 (今回変えない)**: お気に入り (キー・リング・メニューバー・ツールバー・ゲームパッドのお気に入りリスト)、
+**初回実装の範囲外 (§9 でツールバーのお気に入り・ピン留め本を追加)**: お気に入り (キー・リング・メニューバー・ツールバー・ゲームパッドのお気に入りリスト)、
 アドレス欄、フォルダペイン、メニューバーの「閲覧履歴」「評価一覧」「本棚」(`ui_main.rs` 約 8641・8740・8958。
 今は検索中も有効で、閲覧履歴・評価一覧は検索を閉じて履歴に残さず、本棚は検索を閉じずに擬似的な子として開く)。これらは今も検索中に動く (拒否されていない) ので >>717 の不便には当たらず、
 挙動を揃えると「検索中に擬似的な子として開く」リリース済みの挙動が変わる (CLAUDE.md「通常の使い方が不便になる変更は相談」)。
@@ -317,7 +317,8 @@
 ## 8. 実装記録 (2026-11-11、feat-682-search-nav)
 
 初回実装は `3621aefec` (設計担当がコミット)。§8.1〜8.4 はその実装・検証時の記録で、
-§8.5 は独立レビューへの追補修正 (未コミット)。実装担当は製品バイナリの起動・実機観測・コミットを行っていない。
+§8.5 は独立レビューへの追補修正 (`e85c702ef`)、§8.6 は設計担当の受入、§8.7 は §9 の追補実装 (未コミット)。
+実装担当は製品バイナリの起動・実機観測・コミットを行っていない。
 設計の前提を source で照合し、既存の capture 入口、成功採用境界、Folder 行の採用後に内部書庫を開く順序を維持した。
 App の新しい pending / bool / 次回採用フラグ、detached 述語・viewport・registry 遷移の変更、新しい同期 I/O はない。
 
@@ -570,6 +571,50 @@ music-video companion。最終 build の後に 5 ファイルの存在・更新�
 - 既存の別問題: `cargo check -p mimageviewer --lib --tests` の統合テスト `tests/catalog_integration.rs` が master の §1.718
   (`CoverIdentity` 引数追加) に追従しておらずビルドできない。今回の変更とは無関係で、本ブランチでは直していない (`test-full.ps1` は止まる見込み)。
 - 製品は起動していない。実機の挙動は未確認。
+
+### 8.7 §9 ツールバーのお気に入り・ピン留め本の追補実装 (d66169d2f 後、未コミット)
+
+変更ファイル: 製品コードは `src/app.rs` / `src/app/update_phases.rs`、テストは
+`src/app/location_jump.rs` / `src/ui_main.rs`。文書は本書、`docs/everything-search-plan.md`、
+`docs/search-architecture.md`、`docs/keymap-spec.md`、`docs/key-customization-impl-plan.md`、
+`docs/next-release-backlog.md`、`htdocs/mimageviewer/manual/search.html` / `shortcuts.html` の計 12 ファイル。
+
+- 設計の前提を source で照合した。ツールバーのお気に入りのボタン / ドロップダウンとピン留め本の open は
+  同じ `toolbar_fav_nav` を返し、メニューバーは別の `fav_nav`。dispatch 前の先閉じだけが 3 検索 owner の
+  saved_folder を捨てて close していた。前提の相違・新しい pending / bool / detached 遷移の変更はない。
+- `src/app.rs` の toolbar 描画後から、global_search / favsearch / tag_view の saved_folder 消去と close を撤去した。
+  `show_search_bar` (Ctrl+F) の先閉じ・local filter の取消 / 再投影は従来のまま残した。検索入力部品は変更していない。
+- `src/app/update_phases.rs` の `fav_nav.or(toolbar_fav_nav)` を、優先順位を保った明示の分岐に分けた。
+  `fav_nav` があれば既存 Direct、次に `toolbar_fav_nav` があれば dispatch 時の 3 owner の active を判定する。
+  検索中だけ既存 `dispatch_location_jump(Physical(path))` を呼び、★固定・メニュー除外共通 modal・
+  Everything 取得中・document-open admission と、成功時だけの `ExitTemporaryView` 採用を共有する。
+  検索なしは既存 `Some(path)` の Direct tail のまま。拒否時も低優先候補へ流さず、そのフレームの勝者を維持する。
+- ピン留め本の producer は変更しない。同じ `toolbar_fav_nav` なので追加の入口や状態を作らず、この規則が適用される。
+  メニューバー・キー・リング・ゲームパッドのお気に入り、アドレス欄・フォルダペインは従来のまま。
+- manual `search.html` / `shortcuts.html` と関連する現行仕様を、ツールバーのお気に入り・ピン留め本も成功時終了に含める記述へ更新した。
+- テスト追加は 6 件。`src/app/location_jump.rs` に検索 4 種の成功 / 不存在 / scan 失敗、Plain Direct 比較、
+  menubar > toolbar > keyboard > ready-folder の優先順位と menubar の旧検索履歴、一般 modal / Everything 取得中、
+  検索後に★固定へ切り替えた候補の拒否を追加した。成功時は実際の HistoryBack の受付・非同期採用まで通す。
+  `src/ui_main.rs` は headless な実 toolbar の描画・クリックを 4 検索 × ボタン / ドロップダウン / 実ピン留め本で行い、
+  返る tuple の第 1 要素から同じ toolbar dispatch / scan 採用 / HistoryBack へ接続する。
+  UI test から App 内の非公開 frame phase を呼ぶ bridge だけを `cfg(test)` 内に設け、製品側の入口や field は増やさない。
+
+検証対象はこの追補差分、Windows / MSVC / 通常 feature set。製品起動・コミット・full suite は行わず、
+`build-dev.ps1` は利用者の指示で設計担当へ任せる。Cargo 実行は `MSBUILDDISABLENODEREUSE=1`、
+`CARGO_BUILD_JOBS=4` を使用する。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(toolbar_favorite)' --no-fail-fast` | exit 0、7 実行 / 7 成功 (新規 6 件 + 既存 folder-pane/toolbar 優先順位 1 件)、4.435s、compile 2m44s、17,259 skipped。`target/search-nav-toolbar-new-tests.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(list_order) \| test(everything) \| test(location) \| test(gamepad) \| test(jump) \| test(section1328) \| test(toolbar_favorite)' --no-fail-fast` | exit 0、729 実行 / 729 成功、72.656s、compile 1.01s、16,537 skipped。`target/search-nav-toolbar-focused.log` |
+| `python scripts/check_ui_glyphs.py` | 成功、危険 glyph 0 件 |
+| `cargo fmt` (workspace 全体、引数なし) / `cargo fmt --check` | 最終実行も成功、exit 0 |
+| `git -c core.safecrlf=false diff --check` | 最終整形後も成功、exit 0。`ui_main.rs` の差分は既存の test module 内 1 hunk だけで、検索入力 / 履歴▼ の差分はない |
+
+別 context の read-only 独立実装レビュー (Sol / xhigh) は **ACCEPT、追加指摘なし**。
+検索外 Direct と menubar、Ctrl+F の先閉じ、入力優先順位の維持と、6 件の追加テスト・公開文書の §9 との一致を検査した。
+レビュー担当は Cargo / 製品起動 / 編集を行っていない。
+製品ページのカードは変更せず、カードの上限検査は再実行していない。確認用 build は設計担当へ引き継ぐ。
 
 ## 9. 追補: ツールバーのお気に入りもそろえる (2026-11-11 利用者決定)
 

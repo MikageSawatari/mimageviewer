@@ -860,4 +860,330 @@ mod tests {
             assert_search_dismissed_with_history(&app, origin);
         }
     }
+
+    fn toolbar_favorite_frame(path: PathBuf) -> super::super::update_phases::MainFrameNavigation {
+        super::super::update_phases::MainFrameNavigation {
+            fav_nav: None,
+            toolbar_fav_nav: Some(path),
+            fullscreen_close_nav: None,
+            keyboard_nav: None,
+            keyboard_nav_from_fullscreen_close: false,
+            gamepad_nav: None,
+            address_nav: None,
+            open_folder_nav: None,
+            context_nav: None,
+            folder_pane_nav: None,
+            grid_nav: None,
+        }
+    }
+
+    fn finish_toolbar_jump_and_go_back(
+        app: &mut App,
+        target: &std::path::Path,
+        origin: &std::path::Path,
+    ) {
+        complete_physical_jump(app, target);
+        settle_location_jump(app, |app| app.current_folder.as_deref() == Some(target));
+        assert_search_dismissed_with_history(app, origin.to_path_buf());
+        let ctx = egui::Context::default();
+        let mut back = toolbar_favorite_frame(target.to_path_buf());
+        back.toolbar_fav_nav = None;
+        back.keyboard_nav = Some(AddressBarNav::HistoryBack);
+        app.post_render_main_navigation(&ctx, back);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while app.current_folder.as_deref() != Some(origin)
+            || app
+                .top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+            || app.sidecar_restore_active()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "toolbar favorite history Back did not adopt"
+            );
+            app.settle_open_path_classification_for_test();
+            app.poll_history_navigation_transition_for_test(&ctx);
+            app.poll_sidecar_restore(&ctx);
+            std::thread::yield_now();
+        }
+        assert!(!app.global_search.active && !app.favsearch.active && !app.tag_view.active);
+        assert_eq!(
+            app.folder_history_forward_target(),
+            Some(&FolderNavHistoryTarget::Path(target.to_path_buf()))
+        );
+    }
+
+    // The UI test module cannot call an app-private frame phase. This bridge is
+    // test-only and exercises the same toolbar lane, scan adoption and Back handler.
+    impl App {
+        pub(crate) fn verify_toolbar_favorite_jump_for_test(
+            &mut self,
+            target: PathBuf,
+            origin: &std::path::Path,
+        ) {
+            self.post_render_main_navigation(
+                &egui::Context::default(),
+                toolbar_favorite_frame(target.clone()),
+            );
+            assert!(self.folder_pane_open_pending.is_some());
+            assert!(self.global_search.active || self.favsearch.active || self.tag_view.active);
+            finish_toolbar_jump_and_go_back(self, &target, origin);
+        }
+    }
+
+    #[test]
+    fn toolbar_favorite_search_success_and_failures_preserve_the_owned_state_until_adoption() {
+        for kind in 0..4 {
+            for outcome in 0..3 {
+                let mut app = search_fixture(kind);
+                let origin = app.tmp.path().join("pre-search");
+                std::fs::create_dir_all(&origin).unwrap();
+                let target = app.tmp.path().join("toolbar-favorite");
+                if outcome != 1 {
+                    std::fs::create_dir(&target).unwrap();
+                }
+                let source_folder = app.current_folder.clone();
+                let source_address = app.address.clone();
+                let selected = app.selected;
+                let generation = app.items_generation;
+                let history = app.folder_nav_history_snapshot();
+                let drafts = (
+                    app.global_search.metadata_draft.clone(),
+                    app.global_search.everything_draft.clone(),
+                    app.favsearch.query.clone(),
+                    app.tag_view.query.clone(),
+                );
+                app.post_render_main_navigation(
+                    &egui::Context::default(),
+                    toolbar_favorite_frame(target.clone()),
+                );
+                assert_search_active(&app, kind);
+                assert_eq!(app.current_folder, source_folder);
+                assert_eq!(app.selected, selected);
+                assert_eq!(app.folder_nav_history_snapshot(), history);
+                if outcome == 0 {
+                    finish_toolbar_jump_and_go_back(&mut app, &target, &origin);
+                } else {
+                    let pending = app
+                        .folder_pane_open_pending
+                        .take()
+                        .expect("toolbar explicit jump scan");
+                    let scan = if outcome == 1 {
+                        let result = pending
+                            .rx
+                            .recv_timeout(std::time::Duration::from_secs(30))
+                            .expect("missing path scan reply");
+                        assert!(result.is_err());
+                        result
+                    } else {
+                        pending
+                            .cancel
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "denied",
+                        ))
+                    };
+                    let ready = super::super::FolderPaneOpenReady {
+                        navigation: pending.navigation,
+                        epub_restore: pending.epub_restore,
+                        path: pending.path,
+                        purpose: pending.purpose,
+                        scan,
+                    };
+                    assert!(
+                        app.resolve_main_folder_open_ready(&egui::Context::default(), ready)
+                            .is_none()
+                    );
+                    assert_search_active(&app, kind);
+                    assert_eq!(app.current_folder, source_folder);
+                    assert_eq!(app.address, source_address);
+                    assert_eq!(app.selected, selected);
+                    assert_eq!(app.items_generation, generation);
+                    assert_eq!(app.folder_nav_history_snapshot(), history);
+                    assert_eq!(
+                        (
+                            app.global_search.metadata_draft.clone(),
+                            app.global_search.everything_draft.clone(),
+                            app.favsearch.query.clone(),
+                            app.tag_view.query.clone()
+                        ),
+                        drafts
+                    );
+                    assert!(app.fs_feedback_toast.is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn toolbar_favorite_plain_path_keeps_the_existing_direct_navigation() {
+        for toolbar in [false, true] {
+            let mut app = setup_app();
+            let origin = app.tmp.path().join("plain-origin");
+            let target = app.tmp.path().join("plain-favorite");
+            std::fs::create_dir(&origin).unwrap();
+            std::fs::create_dir(&target).unwrap();
+            app.current_folder = Some(origin.clone());
+            app.top_level_grid_view
+                .replace_surface(TopLevelGridSurface::Folder);
+            let mut frame = toolbar_favorite_frame(target.clone());
+            if !toolbar {
+                frame.toolbar_fav_nav = None;
+                frame.address_nav = Some(AddressBarNav::Direct(
+                    target.clone(),
+                    StartupListIntent::ExplicitList,
+                ));
+            }
+            app.post_render_main_navigation(&egui::Context::default(), frame);
+            settle_location_jump(&mut app, |app| app.current_folder.as_ref() == Some(&target));
+            assert_search_dismissed_with_history(&app, origin);
+            assert!(app.folder_pane_open_pending.is_none());
+        }
+    }
+
+    #[test]
+    fn toolbar_favorite_priority_keeps_menubar_then_toolbar_then_keyboard_ahead_of_folder_navigation()
+     {
+        for kind in 0..4 {
+            for winner in 0..3 {
+                let mut app = search_fixture(kind);
+                let menu = app.tmp.path().join("menu-favorite");
+                let toolbar = app.tmp.path().join("toolbar-favorite");
+                let folder = app.tmp.path().join("folder-nav-loser");
+                for path in [&menu, &toolbar, &folder] {
+                    std::fs::create_dir(path).unwrap();
+                }
+                let main_history_heads = (
+                    app.folder_history_back_entry().cloned(),
+                    app.folder_history_forward_entry().cloned(),
+                );
+                let (tx, rx) = std::sync::mpsc::channel();
+                tx.send(super::super::FolderNavThreadResult {
+                    target: Some(super::super::FolderNavTarget {
+                        route: super::super::FolderNavRoute::FullFeature(folder.clone()),
+                        smart_kind: None,
+                        scanned: super::super::FolderNavScanResult::Ready(
+                            super::super::scan_directory(&folder),
+                        ),
+                    }),
+                    hit_image_folder: false,
+                })
+                .unwrap();
+                app.folder_nav_pending = Some(super::super::FolderNavPending {
+                    cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    rx,
+                    forward: true,
+                    mode: super::super::FolderNavMode::Grid,
+                });
+                let mut frame = toolbar_favorite_frame(toolbar.clone());
+                frame.keyboard_nav =
+                    Some(AddressBarNav::LocationJump(LocationJumpTarget::DriveList));
+                if winner == 0 {
+                    frame.fav_nav = Some(menu.clone());
+                }
+                if winner == 2 {
+                    frame.toolbar_fav_nav = None;
+                }
+                app.post_render_main_navigation(&egui::Context::default(), frame);
+                match winner {
+                    0 => {
+                        settle_location_jump(&mut app, |app| {
+                            app.current_folder.as_ref() == Some(&menu)
+                        });
+                        assert_search_active(&app, kind);
+                        assert_eq!(
+                            (
+                                app.folder_history_back_entry().cloned(),
+                                app.folder_history_forward_entry().cloned()
+                            ),
+                            main_history_heads,
+                            "menubar favorites keep transparent-search history"
+                        );
+                    }
+                    1 => {
+                        assert_eq!(app.folder_pane_open_pending.as_ref().unwrap().path, toolbar);
+                        complete_physical_jump(&mut app, &toolbar);
+                        let origin = app.tmp.path().join("pre-search");
+                        assert_search_dismissed_with_history(&app, origin);
+                    }
+                    _ => {
+                        assert!(app.items_are_drive_list);
+                        let origin = app.tmp.path().join("pre-search");
+                        assert_search_dismissed_with_history(&app, origin);
+                    }
+                }
+                assert_ne!(app.current_folder.as_ref(), Some(&folder));
+            }
+        }
+    }
+
+    #[test]
+    fn toolbar_favorite_search_dispatch_rechecks_modal_and_everything_fetching() {
+        for kind in 0..4 {
+            let mut app = search_fixture(kind);
+            let target = app.tmp.path().join("blocked-favorite");
+            std::fs::create_dir(&target).unwrap();
+            let current = app.current_folder.clone();
+            let history = app.folder_nav_history_snapshot();
+            app.show_delete_confirm = true;
+            app.post_render_main_navigation(
+                &egui::Context::default(),
+                toolbar_favorite_frame(target),
+            );
+            assert_search_active(&app, kind);
+            assert_eq!(app.current_folder, current);
+            assert_eq!(app.selected, Some(0));
+            assert_eq!(app.folder_nav_history_snapshot(), history);
+            assert!(app.folder_pane_open_pending.is_none());
+        }
+        let mut app = search_fixture(1);
+        let target = app.tmp.path().join("fetch-blocked-favorite");
+        let cancel = crate::global_search_ui::start_everything_for_test(
+            &mut app,
+            &egui::Context::default(),
+            "location-jump",
+        );
+        let current = app.current_folder.clone();
+        let history = app.folder_nav_history_snapshot();
+        app.post_render_main_navigation(&egui::Context::default(), toolbar_favorite_frame(target));
+        assert!(app.everything_search_progress_visible());
+        assert!(!cancel.is_cancelled());
+        assert_eq!(app.current_folder, current);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.folder_nav_history_snapshot(), history);
+        assert!(app.folder_pane_open_pending.is_none());
+    }
+
+    #[test]
+    fn toolbar_favorite_pending_candidate_keeps_the_snapshot_that_replaced_search() {
+        for kind in 0..4 {
+            let mut app = search_fixture(kind);
+            let target = app.tmp.path().join("outside-pin");
+            std::fs::create_dir(&target).unwrap();
+            // A toolbar path was already captured when pinning ends the search.
+            let frame = toolbar_favorite_frame(target);
+            app.toggle_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+            assert!(app.is_snapshot_active());
+            assert!(!app.global_search.active && !app.favsearch.active && !app.tag_view.active);
+            let current = app.current_folder.clone();
+            let selected = app.selected;
+            let generation = app.items_generation;
+            let history = app.folder_nav_history_snapshot();
+            let snapshot_generation = app.snapshot.as_ref().unwrap().generation_id;
+            app.post_render_main_navigation(&egui::Context::default(), frame);
+            assert!(app.is_snapshot_active());
+            assert_eq!(
+                app.snapshot.as_ref().unwrap().generation_id,
+                snapshot_generation
+            );
+            assert_eq!(app.current_folder, current);
+            assert_eq!(app.selected, selected);
+            assert_eq!(app.items_generation, generation);
+            assert_eq!(app.folder_nav_history_snapshot(), history);
+            assert!(app.folder_pane_open_pending.is_none());
+            assert!(app.fs_feedback_toast.is_some());
+        }
+    }
 }

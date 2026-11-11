@@ -1227,15 +1227,23 @@ impl App {
             }
         } else {
             // folder_nav が未完了 or 他の高優先 nav 源が勝ったケース
-            let higher_priority_direct_nav = fav_nav.or(toolbar_fav_nav);
             let mut navigation = None;
             let mut navigate_pre_scan: Option<ScannedDir> = None;
             let mut pane_epub_restore = None;
             let mut navigate_owner = OpenRequestOwner::Navigation;
             let mut navigate_restore_intent = StartupListIntent::ExplicitList;
             let mut navigate_stage = MainListRequestStage::Admission;
-            let navigate = if higher_priority_direct_nav.is_some() {
-                higher_priority_direct_nav
+            let navigate = if let Some(path) = fav_nav {
+                Some(path)
+            } else if let Some(path) = toolbar_fav_nav {
+                // Keep menubar favorites and plain toolbar navigation on their
+                // existing Direct path; only the winning toolbar search jump exits.
+                if self.global_search.active || self.favsearch.active || self.tag_view.active {
+                    self.dispatch_location_jump(crate::ui_main::LocationJumpTarget::Physical(path));
+                    None
+                } else {
+                    Some(path)
+                }
             } else if let Some(nav) = input_nav.or(address_nav) {
                 match nav {
                     crate::ui_main::AddressBarNav::LocationJump(target) => {

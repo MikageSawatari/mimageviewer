@@ -34809,6 +34809,124 @@ mod section207_tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn toolbar_favorite_search_buttons_dropdown_and_pinned_book_use_the_toolbar_lane() {
+        use crate::app::top_level_grid_view::{TopLevelGridRestore, TopLevelGridSurface};
+        use crate::settings::{FavoriteEntry, ToolbarSectionDisplay};
+        for kind in 0..4 {
+            for control in 0..3 {
+                let mut env = crate::app::setup_app_for_test();
+                for &section in TS::default_order() {
+                    set_toolbar_section_visible(&mut env.settings, section, false);
+                }
+                let origin = env.tmp.path().join("toolbar-pre-search");
+                std::fs::create_dir(&origin).unwrap();
+                env.current_folder = Some(origin.clone());
+                env.top_level_grid_view
+                    .replace_surface(TopLevelGridSurface::Folder);
+                let target = if control == 2 {
+                    let root = env.tmp.path().join("toolbar-books");
+                    env.settings.book_root = Some(root.clone());
+                    crate::books::create_book(&root, "検証ピン本").unwrap();
+                    env.book_shelf.snapshot =
+                        Some(crate::book_order::read_snapshot(&root).unwrap());
+                    env.settings.pinned_books = vec!["検証ピン本".into()];
+                    env.settings.show_toolbar_bookshelf = true;
+                    env.settings.toolbar_bookshelf_display = ToolbarSectionDisplay::Buttons;
+                    env.settings.toolbar_bookshelf_collapsed = false;
+                    crate::books::book_folder(&root, "検証ピン本")
+                } else {
+                    let target = env.tmp.path().join("toolbar-favorite");
+                    std::fs::create_dir(&target).unwrap();
+                    env.settings.favorites =
+                        vec![FavoriteEntry::new("検証お気に入り".into(), target.clone())];
+                    env.settings.show_toolbar_favorites = true;
+                    env.settings.toolbar_favorites_display = if control == 0 {
+                        ToolbarSectionDisplay::Buttons
+                    } else {
+                        ToolbarSectionDisplay::Dropdown
+                    };
+                    env.settings.toolbar_favorites_collapsed = false;
+                    target
+                };
+                match kind {
+                    0 => env.open_global_search(),
+                    1 => {
+                        let row = env.tmp.path().join("result.zip");
+                        crate::global_search_ui::adopt_everything_for_test(
+                            &mut env,
+                            &egui::Context::default(),
+                            "toolbar-search",
+                            crate::global_search_ui::everything_dataset_for_test(vec![
+                                GridItem::ZipFile(row),
+                            ]),
+                        );
+                        assert!(matches!(
+                            env.global_search.accepted,
+                            crate::global_search_ui::SearchAccepted::Everything { .. }
+                        ));
+                    }
+                    2 => env.open_favsearch(),
+                    _ => env.open_tag_view(),
+                }
+                assert!(
+                    matches!(env.top_level_grid_view.return_to(), Some(TopLevelGridRestore::Folder(path)) if path == &origin)
+                );
+                let app = Rc::new(RefCell::new(env));
+                let render = Rc::clone(&app);
+                let candidates = Rc::new(RefCell::new(Vec::new()));
+                let captured = Rc::clone(&candidates);
+                let fonts = Cell::new(false);
+                let mut harness = crate::test_ui::builder()
+                    .with_size(egui::vec2(1100.0, 480.0))
+                    .build_ui(move |root_ui| {
+                        crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                            let ctx = root_ui.ctx().clone();
+                            if !fonts.replace(true) {
+                                crate::ui_fonts::configure_fonts(&ctx);
+                                ctx.request_repaint();
+                                return;
+                            }
+                            // Favorites and pinned books are the first toolbar result.
+                            // The address/location result is deliberately not used here.
+                            if let Some(path) = render.borrow_mut().render_toolbar(root_ui).0 {
+                                captured.borrow_mut().push(path);
+                            }
+                        });
+                    });
+                harness.run();
+                if control == 1 {
+                    harness.get_by_role(egui::accesskit::Role::ComboBox).click();
+                    harness.run();
+                }
+                click_location_menu(
+                    &mut harness,
+                    if control == 2 {
+                        "検証ピン本"
+                    } else {
+                        "検証お気に入り"
+                    },
+                );
+                harness.run();
+                assert_eq!(
+                    candidates.borrow().as_slice(),
+                    [target.clone()],
+                    "kind={kind} control={control}"
+                );
+                let candidate = candidates.borrow_mut().pop().unwrap();
+                let mut app = app.borrow_mut();
+                assert!(app.global_search.active || app.favsearch.active || app.tag_view.active);
+                app.verify_toolbar_favorite_jump_for_test(candidate, &origin);
+                assert_eq!(
+                    app.current_folder.as_ref(),
+                    Some(&origin),
+                    "actual HistoryBack adoption kind={kind} control={control}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn file_organize_destinations_many_location_entries_scroll_and_select_last() {
         let mut env = crate::app::setup_app_for_test();
