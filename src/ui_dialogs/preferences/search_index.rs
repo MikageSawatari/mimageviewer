@@ -300,8 +300,13 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     entry!(
         "thumbnail/container-type-icon",
         Thumbnail,
-        "フォルダ・書庫・PDF を種類のアイコンで表示する",
+        "代表画像の代わりに種類のアイコンで表示する",
         [
+            "実フォルダ",
+            "フォルダ",
+            "書庫",
+            "PDF",
+            "EPUB",
             "サムネイル",
             "コンテナ",
             "代表画像",
@@ -2260,18 +2265,21 @@ mod tests {
     }
 
     #[test]
-    fn thumb_container_type_icon_only_search_finds_its_anchor() {
-        for query in ["代表画像 アイコン", "コンテナ", "フォルダ 種類", "書庫 PDF"]
-        {
+    fn thumb_container_icon_kinds_search_finds_its_anchor() {
+        for query in [
+            "代表画像 アイコン",
+            "コンテナ",
+            "実フォルダ",
+            "フォルダ 種類",
+            "書庫 PDF",
+            "EPUB",
+        ] {
             let entry = search_preferences(query, test_tree_position)
                 .into_iter()
                 .find(|entry| entry.anchor == "thumbnail/container-type-icon")
                 .unwrap_or_else(|| panic!("missing container icon setting for {query}"));
             assert_eq!(entry.page, PreferencesPage::Thumbnail);
-            assert_eq!(
-                entry.title,
-                "フォルダ・書庫・PDF を種類のアイコンで表示する"
-            );
+            assert_eq!(entry.title, "代表画像の代わりに種類のアイコンで表示する");
         }
         assert!(PAGES_SOURCE.contains("anchored(ui, state, \"thumbnail/container-type-icon\""));
     }

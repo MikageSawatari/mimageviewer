@@ -6395,7 +6395,7 @@ mod tests {
     }
 
     #[test]
-    fn thumb_container_type_icon_only_preferences_preserve_collection_root_and_denominator() {
+    fn thumb_container_icon_kinds_preferences_preserve_collection_root_and_denominator() {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let folder = temp.path().join("folder");
@@ -6413,7 +6413,7 @@ mod tests {
                 (image, CollectionResolvedKind::Image),
             ],
         );
-        app.settings.thumb_container_type_icon_only = true;
+        app.settings.thumb_container_icon_kinds = crate::grid_item::ContainerIconKinds::ALL;
         app.settings.thumb_aspect_auto = true;
         app.open_collection_grid(created.collection_id(), None);
         wait_for_grid(&mut app, created.collection_id());
@@ -6427,7 +6427,10 @@ mod tests {
         assert_eq!(presentation.prepared.auto_aspect_eligible_total, 3);
         assert_eq!(app.auto_aspect_eligible_total(), 1);
         for idx in 0..app.items.len() {
-            if crate::grid_item::container_icon_only(&app.items[idx], true) {
+            if crate::grid_item::container_icon_only(
+                &app.items[idx],
+                crate::grid_item::ContainerIconKinds::ALL,
+            ) {
                 app.thumbnails[idx] = ThumbnailState::NoArt;
             }
         }
@@ -6444,9 +6447,12 @@ mod tests {
             .as_mut()
             .unwrap()
             .settings
-            .thumb_container_type_icon_only = false;
+            .thumb_container_icon_kinds = crate::grid_item::ContainerIconKinds::NONE;
         app.apply_preferences_dialog(&egui::Context::default());
-        assert!(!app.settings.thumb_container_type_icon_only);
+        assert_eq!(
+            app.settings.thumb_container_icon_kinds,
+            crate::grid_item::ContainerIconKinds::NONE
+        );
         assert_eq!(app.auto_aspect_eligible_total(), 3);
         assert_eq!(app.items, items);
         assert_eq!(app.current_folder, folder);
@@ -6463,7 +6469,10 @@ mod tests {
             &presentation,
         ));
         for (item, thumb) in app.items.iter().zip(&app.thumbnails) {
-            if crate::grid_item::container_icon_only(item, true) {
+            if crate::grid_item::container_icon_only(
+                item,
+                crate::grid_item::ContainerIconKinds::ALL,
+            ) {
                 assert!(matches!(thumb, ThumbnailState::Pending));
             }
         }

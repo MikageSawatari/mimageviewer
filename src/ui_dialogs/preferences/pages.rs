@@ -1416,12 +1416,15 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
         );
     });
     anchored(ui, state, "thumbnail/container-type-icon", |ui, state| {
-        ui.checkbox(
-            &mut state.settings.thumb_container_type_icon_only,
-            "フォルダ・書庫・PDF を種類のアイコンで表示する",
-        );
+        ui.label("代表画像の代わりに種類のアイコンで表示する:");
+        ui.horizontal_wrapped(|ui| {
+            let kinds = &mut state.settings.thumb_container_icon_kinds;
+            ui.checkbox(&mut kinds.folder, "実フォルダ");
+            ui.checkbox(&mut kinds.archive, "書庫 (ZIP・RAR など)");
+            ui.checkbox(&mut kinds.pdf_epub, "PDF・EPUB");
+        });
         ui.small(
-            "代表画像の代わりにアイコンを表示します。画像・動画・音声と、本を開いた後のページはそのままです。固定した代表画像やキャッシュは残り、オフに戻すと再び表示されます。",
+            "選んだ種類は代表画像を使わずアイコンで表示します。書庫の中のフォルダは「書庫」に従います。画像・動画・音声と、本を開いた後のページはそのままです。固定した代表画像やキャッシュは残り、外すと再び表示されます。",
         );
     });
     anchored(ui, state, "thumbnail/name-font-scale", |ui, state| {

@@ -17577,7 +17577,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     crate::grid_item::effective_thumbnail_state(
                         &self.items[idx],
                         &self.thumbnails[idx],
-                        self.settings.thumb_container_type_icon_only,
+                        self.settings.thumb_container_icon_kinds,
                     ),
                     &tags,
                     bookmark_time.as_deref(),
@@ -17598,7 +17598,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 let adjusted = if self.adjustment_dragging
                     || crate::grid_item::container_icon_only(
                         &self.items[idx],
-                        self.settings.thumb_container_type_icon_only,
+                        self.settings.thumb_container_icon_kinds,
                     ) {
                     None
                 } else {
@@ -17615,7 +17615,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     crate::grid_item::effective_thumbnail_state(
                         &self.items[idx],
                         &self.thumbnails[idx],
-                        self.settings.thumb_container_type_icon_only,
+                        self.settings.thumb_container_icon_kinds,
                     ),
                     rotation,
                     adjusted,
@@ -18924,7 +18924,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.items.get(*idx).is_some_and(|item| {
                 !crate::grid_item::container_icon_only(
                     item,
-                    self.settings.thumb_container_type_icon_only,
+                    self.settings.thumb_container_icon_kinds,
                 )
             })
         });
@@ -21283,7 +21283,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     crate::grid_item::effective_thumbnail_state(
                                         &self.items[idx],
                                         &self.thumbnails[idx],
-                                        self.settings.thumb_container_type_icon_only,
+                                        self.settings.thumb_container_icon_kinds,
                                     ),
                                     &tags,
                                     bookmark_time.as_deref(),
@@ -21311,7 +21311,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     let adjusted = if self.adjustment_dragging
                                         || crate::grid_item::container_icon_only(
                                             &self.items[idx],
-                                            self.settings.thumb_container_type_icon_only,
+                                            self.settings.thumb_container_icon_kinds,
                                         ) {
                                         None
                                     } else {
@@ -21331,7 +21331,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         crate::grid_item::effective_thumbnail_state(
                                             &self.items[idx],
                                             &self.thumbnails[idx],
-                                            self.settings.thumb_container_type_icon_only,
+                                            self.settings.thumb_container_icon_kinds,
                                         ),
                                         rot,
                                         adjusted,
@@ -21412,7 +21412,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         crate::grid_item::effective_thumbnail_state(
                                             &self.items[idx],
                                             &self.thumbnails[idx],
-                                            self.settings.thumb_container_type_icon_only,
+                                            self.settings.thumb_container_icon_kinds,
                                         ),
                                         &tags,
                                         bookmark_time.as_deref(),
@@ -21449,7 +21449,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     let adjusted_tex = if self.adjustment_dragging
                                         || crate::grid_item::container_icon_only(
                                             &self.items[idx],
-                                            self.settings.thumb_container_type_icon_only,
+                                            self.settings.thumb_container_icon_kinds,
                                         ) {
                                         None
                                     } else {
@@ -21477,7 +21477,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         crate::grid_item::effective_thumbnail_state(
                                             &self.items[idx],
                                             &self.thumbnails[idx],
-                                            self.settings.thumb_container_type_icon_only,
+                                            self.settings.thumb_container_icon_kinds,
                                         ),
                                         rot,
                                         adjusted_tex,
@@ -36784,7 +36784,7 @@ mod container_type_icon_hover_tests {
         let app = &mut env.app;
         let ctx = egui::Context::default();
         app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
-        app.settings.thumb_container_type_icon_only = true;
+        app.settings.thumb_container_icon_kinds = crate::grid_item::ContainerIconKinds::ALL;
         app.items = vec![GridItem::Folder("c:/shelf/book".into())];
         app.thumbnails = vec![ThumbnailState::Pending];
         let anchor = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(32.0, 32.0));

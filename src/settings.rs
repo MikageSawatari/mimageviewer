@@ -4900,7 +4900,7 @@ pub struct Settings {
     pub thumb_show_type_icon: bool,
     /// 一覧のコンテナを代表画像の代わりに種類アイコンで表示する。
     #[serde(default)]
-    pub thumb_container_type_icon_only: bool,
+    pub thumb_container_icon_kinds: crate::grid_item::ContainerIconKinds,
     /// サムネイル右下に動画・音声の長さを表示する。
     #[serde(default = "default_true")]
     pub thumb_show_media_duration: bool,
@@ -7880,7 +7880,7 @@ impl Default for Settings {
             thumb_name_max_lines: default_thumb_name_max_lines(),
             thumb_name_prioritize_width: false,
             thumb_show_type_icon: default_thumb_show_type_icon(),
-            thumb_container_type_icon_only: false,
+            thumb_container_icon_kinds: crate::grid_item::ContainerIconKinds::NONE,
             selection_info_display_mode: SelectionInfoDisplayMode::Tooltip,
             thumb_show_media_duration: true,
             thumb_show_resume_meter: true,
@@ -11260,39 +11260,71 @@ mod tests {
     }
 
     #[test]
-    fn thumb_container_type_icon_only_default_missing_and_db_roundtrip() {
-        assert!(!Settings::default().thumb_container_type_icon_only);
-        assert!(
-            !serde_json::from_str::<Settings>("{}")
+    fn thumb_container_icon_kinds_default_missing_and_db_roundtrip() {
+        use crate::grid_item::ContainerIconKinds as Kinds;
+        assert_eq!(Settings::default().thumb_container_icon_kinds, Kinds::NONE);
+        assert_eq!(
+            serde_json::from_str::<Settings>("{}")
                 .unwrap()
-                .thumb_container_type_icon_only
+                .thumb_container_icon_kinds,
+            Kinds::NONE
         );
         let temp = tempfile::tempdir().unwrap();
         let db = crate::settings_db::SettingsDb::create_new(temp.path()).unwrap();
-        for enabled in [false, true] {
+        for mask in 0..8 {
+            let kinds = Kinds {
+                folder: mask & 1 != 0,
+                archive: mask & 2 != 0,
+                pdf_epub: mask & 4 != 0,
+            };
             let settings = Settings {
-                thumb_container_type_icon_only: enabled,
+                thumb_container_icon_kinds: kinds,
                 ..Settings::default()
             };
             db.save_full(&settings).unwrap();
             assert_eq!(
-                db.load_into_settings()
-                    .unwrap()
-                    .thumb_container_type_icon_only,
-                enabled
+                db.load_into_settings().unwrap().thumb_container_icon_kinds,
+                kinds
             );
         }
         let conn = rusqlite::Connection::open(temp.path().join("settings.db")).unwrap();
         conn.execute(
-            "DELETE FROM settings_kv WHERE key = 'thumb_container_type_icon_only'",
+            "DELETE FROM settings_kv WHERE key = 'thumb_container_icon_kinds'",
             [],
         )
         .unwrap();
-        assert!(
-            !db.load_into_settings()
-                .unwrap()
-                .thumb_container_type_icon_only
+        assert_eq!(
+            db.load_into_settings().unwrap().thumb_container_icon_kinds,
+            Kinds::NONE
         );
+    }
+
+    #[test]
+    fn container_icon_kinds_legacy_json_migration_preserves_unrelated_values() {
+        use crate::grid_item::ContainerIconKinds as Kinds;
+        for (legacy, expected) in [
+            (serde_json::json!(true), Kinds::ALL),
+            (serde_json::json!(false), Kinds::NONE),
+            (serde_json::json!("bad"), Kinds::NONE),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("settings.json");
+            std::fs::write(&path, serde_json::json!({"thumb_container_type_icon_only": legacy, "grid_cols": 9, "favorites": [FavoriteEntry::new("kept".into(), "C:/kept".into())]}).to_string()).unwrap();
+            let MigrationReadResult::Loaded(mut loaded) = read_settings_json_for_migration(&path)
+            else {
+                panic!("legacy JSON must load");
+            };
+            apply_load_time_migrations(&mut loaded);
+            assert_eq!(loaded.thumb_container_icon_kinds, expected);
+            assert_eq!(loaded.grid_cols, 9);
+            assert_eq!(loaded.favorites.len(), 1);
+            assert!(
+                serde_json::to_value(loaded)
+                    .unwrap()
+                    .get("thumb_container_type_icon_only")
+                    .is_none()
+            );
+        }
     }
 
     #[test]
@@ -20745,9 +20777,37 @@ impl<'de> serde::Deserialize<'de> for Settings {
         let mut value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
         if let Some(map) = value.as_object_mut() {
             crate::same_name_folder_book::canonicalize(map).map_err(serde::de::Error::custom)?;
+            if let Err(error) = canonicalize_container_icon_kinds(map) {
+                log::warn!("{error}; using default container icon selection");
+            }
         }
         Settings::deserialize(value).map_err(serde::de::Error::custom)
     }
+}
+
+/// Convert the released all-or-nothing preference before defaults or partial merges apply.
+/// A present new key wins even when malformed; each entry point validates it normally.
+pub(crate) fn canonicalize_container_icon_kinds(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    let legacy = map.remove("thumb_container_type_icon_only");
+    if !map.contains_key("thumb_container_icon_kinds") {
+        if let Some(value) = legacy {
+            let old = value
+                .as_bool()
+                .ok_or_else(|| "invalid bool for thumb_container_type_icon_only".to_string())?;
+            let kinds = if old {
+                crate::grid_item::ContainerIconKinds::ALL
+            } else {
+                crate::grid_item::ContainerIconKinds::NONE
+            };
+            map.insert(
+                "thumb_container_icon_kinds".into(),
+                serde_json::to_value(kinds).expect("icon kinds are serializable"),
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

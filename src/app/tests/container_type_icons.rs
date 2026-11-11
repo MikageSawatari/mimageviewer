@@ -1,7 +1,10 @@
 //! §1.697: grid demand owns no-art transitions; request owners keep their normal lifetime.
 use super::phase_c_support::{AppTestEnv, setup_app};
 use super::*;
-use crate::grid_item::{container_icon_only, effective_thumbnail_state};
+use crate::grid_item::{
+    ContainerIconKind, ContainerIconKinds, container_icon_kind, container_icon_only,
+    effective_thumbnail_state,
+};
 use crate::thumb_loader::{ThumbLoadOrigin, ThumbMsg};
 
 fn kinds() -> Vec<(GridItem, bool)> {
@@ -116,13 +119,56 @@ fn loaded(ctx: &egui::Context, ratio: f32) -> ThumbnailState {
 #[test]
 fn container_type_icons_kind_table_and_state_projection() {
     let ctx = egui::Context::default();
-    for (item, target) in kinds() {
-        for enabled in [false, true] {
-            assert_eq!(
-                container_icon_only(&item, enabled),
-                enabled && target,
-                "{item:?}"
-            );
+    let mut rows = kinds()
+        .into_iter()
+        .map(|(item, _)| item)
+        .collect::<Vec<_>>();
+    rows.extend([
+        GridItem::Folder("Q:/".into()),
+        GridItem::ZipDir {
+            zip_path: "book.zip".into(),
+            dir_prefix: "inner.zip/".into(),
+            is_archive: true,
+            representative: None,
+        },
+        GridItem::SearchContainer {
+            path: "book.zip".into(),
+            kind: crate::grid_item::SearchContainerKind::Zip,
+            hit_count: 1,
+            representative: None,
+        },
+        GridItem::PdfFile("book.epub".into()),
+    ]);
+    use ContainerIconKind::{Archive, Folder, PdfEpub};
+    let expected = [
+        Some(Folder),
+        Some(Archive),
+        Some(PdfEpub),
+        Some(Archive),
+        Some(Archive),
+        Some(Folder),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Folder),
+        Some(Archive),
+        Some(Archive),
+        Some(PdfEpub),
+    ];
+    for (item, kind) in rows.into_iter().zip(expected) {
+        assert_eq!(container_icon_kind(&item), kind, "{item:?}");
+        for mask in 0..8 {
+            let selected = ContainerIconKinds {
+                folder: mask & 1 != 0,
+                archive: mask & 2 != 0,
+                pdf_epub: mask & 4 != 0,
+            };
+            let target = kind.is_some_and(|kind| selected.contains(kind));
+            assert_eq!(container_icon_only(&item, selected), target, "{item:?}");
             for state in [
                 ThumbnailState::Pending,
                 ThumbnailState::Evicted,
@@ -130,8 +176,8 @@ fn container_type_icons_kind_table_and_state_projection() {
                 ThumbnailState::Failed,
                 loaded(&ctx, 1.5),
             ] {
-                let effective = effective_thumbnail_state(&item, &state, enabled);
-                if enabled && target {
+                let effective = effective_thumbnail_state(&item, &state, selected);
+                if target {
                     assert!(matches!(effective, ThumbnailState::NoArt));
                 } else {
                     assert!(std::ptr::eq(effective, &state));
@@ -142,13 +188,225 @@ fn container_type_icons_kind_table_and_state_projection() {
 }
 
 #[test]
+fn container_icon_kinds_partial_selection_gates_only_selected_demand() {
+    let ctx = egui::Context::default();
+    for selected in [
+        ContainerIconKinds {
+            folder: true,
+            ..ContainerIconKinds::NONE
+        },
+        ContainerIconKinds {
+            archive: true,
+            ..ContainerIconKinds::NONE
+        },
+        ContainerIconKinds {
+            pdf_epub: true,
+            ..ContainerIconKinds::NONE
+        },
+    ] {
+        let mut items = kinds()
+            .into_iter()
+            .take(7)
+            .map(|(item, _)| item)
+            .collect::<Vec<_>>();
+        items.extend([
+            GridItem::SearchContainer {
+                path: "c:/shelf/book.zip".into(),
+                kind: crate::grid_item::SearchContainerKind::Zip,
+                hit_count: 1,
+                representative: Some(crate::grid_item::ContainerRepresentative {
+                    path: "c:/shelf/book.zip".into(),
+                    zip_entry: Some("1.png".into()),
+                    pdf_page: None,
+                }),
+            },
+            GridItem::ZipDir {
+                zip_path: "c:/shelf/book.zip".into(),
+                dir_prefix: "inner.zip/".into(),
+                is_archive: true,
+                representative: Some("inner.zip/1.png".into()),
+            },
+            GridItem::ZipImage {
+                zip_path: "c:/shelf/book.zip".into(),
+                entry_name: "1.png".into(),
+            },
+        ]);
+        let mut env = fixture(items);
+        let app = &mut env.app;
+        app.settings.thumb_container_icon_kinds = selected;
+        app.converted_archive_cache_paths.insert(
+            crate::path_key::normalize_keep_drive(Path::new("c:/shelf/book.7z")),
+            ConvertedArchiveSourceState::Pending,
+        );
+        let suppressed = [
+            selected.folder,
+            selected.archive,
+            selected.pdf_epub,
+            selected.archive,
+            selected.archive,
+            selected.folder,
+            false,
+            selected.archive,
+            selected.archive,
+            false,
+        ];
+        for (idx, suppressed) in suppressed.into_iter().enumerate() {
+            if suppressed {
+                assert_eq!(
+                    app.enqueue_priority_thumbnail(idx),
+                    PriorityThumbnailAdmission::NoArt
+                );
+            }
+        }
+        app.update_keep_range_and_requests(&ctx, Instant::now());
+        for (idx, suppressed) in suppressed.into_iter().enumerate() {
+            assert_eq!(
+                app.requested.contains_key(&idx),
+                !suppressed,
+                "{selected:?}, idx={idx}"
+            );
+            assert_eq!(
+                matches!(app.thumbnails[idx], ThumbnailState::NoArt),
+                suppressed
+            );
+            let image = loaded(&ctx, 1.5);
+            assert_eq!(
+                matches!(
+                    effective_thumbnail_state(&app.items[idx], &image, selected),
+                    ThumbnailState::NoArt
+                ),
+                suppressed
+            );
+        }
+    }
+}
+
+#[test]
+fn container_icon_kinds_partial_selection_auto_aspect_counts_archive() {
+    let ctx = egui::Context::default();
+    let mut env = fixture(vec![
+        GridItem::Folder("folder".into()),
+        GridItem::ZipFile("book.zip".into()),
+    ]);
+    let app = &mut env.app;
+    app.settings.thumb_container_icon_kinds = ContainerIconKinds {
+        folder: true,
+        ..ContainerIconKinds::NONE
+    };
+    app.settings.thumb_aspect_auto = true;
+    app.thumbnails = vec![ThumbnailState::NoArt, ThumbnailState::Pending];
+    assert_eq!(app.auto_aspect_eligible_total(), 1);
+    app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+    assert_eq!(
+        app.auto_aspect.current, None,
+        "pending archive still prevents completion"
+    );
+    app.thumbnails[1] = loaded(&ctx, 1.5);
+    app.rebuild_auto_aspect_samples_from_loaded();
+    assert_eq!(app.auto_aspect.samples, HashMap::from([(1, 1.5)]));
+    app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+    let (candidate, _, count) = app.auto_aspect.streak.unwrap();
+    assert_eq!(candidate, crate::settings::ThumbAspect::Portrait2x3);
+    assert_eq!(count, 1);
+    app.auto_aspect.streak = Some((candidate, Instant::now() - Duration::from_secs(1), count));
+    app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
+    assert_eq!(
+        app.auto_aspect.current,
+        Some(crate::settings::ThumbAspect::Portrait2x3)
+    );
+}
+
+#[test]
+fn container_icon_kinds_preferences_swap_preserves_requests_and_parked_viewer() {
+    let ctx = egui::Context::default();
+    for old in [
+        ContainerIconKinds::ALL,
+        ContainerIconKinds {
+            folder: true,
+            archive: false,
+            pdf_epub: true,
+        },
+    ] {
+        let mut env = fixture(vec![
+            GridItem::Folder("folder".into()),
+            GridItem::ZipFile("book.zip".into()),
+            GridItem::PdfFile("book.pdf".into()),
+            GridItem::Image("image.png".into()),
+        ]);
+        let app = &mut env.app;
+        app.settings.thumb_container_icon_kinds = old;
+        app.thumbnails = vec![
+            ThumbnailState::NoArt,
+            if old.archive {
+                ThumbnailState::NoArt
+            } else {
+                ThumbnailState::Pending
+            },
+            ThumbnailState::NoArt,
+            ThumbnailState::Pending,
+        ];
+        let id = app
+            .requested
+            .begin(3, app.items_generation, ThumbnailRequestKind::Normal, None)
+            .unwrap();
+        let sibling = app.build_window_context_for_test(1770, |mounted| {
+            mounted.items = vec![GridItem::Folder("sibling".into())];
+            mounted.thumbnails = vec![ThumbnailState::NoArt];
+            mounted.items_generation = 1770;
+        });
+        let items = app.items.clone();
+        let generation = app.items_generation;
+        app.selected = Some(2);
+        app.grid_scroll.set_position(120.0);
+        let scroll = app.grid_scroll.clone();
+        app.set_visibility_preferences_for_test(app.settings.file_type_visibility.clone());
+        app.pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .thumb_container_icon_kinds = ContainerIconKinds {
+            folder: false,
+            archive: true,
+            pdf_epub: true,
+        };
+        app.apply_preferences_dialog(&ctx);
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Pending));
+        assert_eq!(
+            matches!(app.thumbnails[1], ThumbnailState::NoArt),
+            old.archive
+        );
+        assert!(matches!(app.thumbnails[2], ThumbnailState::NoArt));
+        assert_eq!(app.items, items);
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(app.selected, Some(2));
+        assert_eq!(app.grid_scroll, scroll);
+        assert_eq!(app.requested.len(), 1);
+        assert_eq!(app.requested.id(3), Some(id));
+        app.update_keep_range_and_requests(&ctx, Instant::now());
+        assert!(matches!(app.thumbnails[1], ThumbnailState::NoArt));
+        assert!(!app.requested.contains_key(&1));
+        assert_eq!(app.requested.id(3), Some(id));
+        app.with_viewer_context(sibling, |mounted| {
+            assert!(matches!(mounted.thumbnails[0], ThumbnailState::NoArt));
+            assert_eq!(mounted.items_generation, 1770);
+            assert!(mounted.requested.is_empty());
+        })
+        .unwrap();
+    }
+}
+
+#[test]
 fn container_type_icons_keep_and_priority_demand_gate() {
     let ctx = egui::Context::default();
     for enabled in [false, true] {
         // Video's dedicated batch producer is unchanged; its generic admission has no request.
         let mut env = fixture(kinds().into_iter().take(12).map(|(item, _)| item).collect());
         let app = &mut env.app;
-        app.settings.thumb_container_type_icon_only = enabled;
+        app.settings.thumb_container_icon_kinds = if enabled {
+            crate::grid_item::ContainerIconKinds::ALL
+        } else {
+            crate::grid_item::ContainerIconKinds::NONE
+        };
         app.converted_archive_cache_paths.insert(
             crate::path_key::normalize_keep_drive(Path::new("c:/shelf/book.7z")),
             ConvertedArchiveSourceState::Pending,
@@ -196,7 +454,11 @@ fn container_type_icons_drive_pin_demand_gate() {
         let mut env = fixture(vec![GridItem::Folder("Q:/".into())]);
         let app = &mut env.app;
         app.items_are_drive_list = true;
-        app.settings.thumb_container_type_icon_only = enabled;
+        app.settings.thumb_container_icon_kinds = if enabled {
+            crate::grid_item::ContainerIconKinds::ALL
+        } else {
+            crate::grid_item::ContainerIconKinds::NONE
+        };
         app.folder_pin_map.insert(
             crate::path_key::normalize_keep_drive(Path::new("Q:/")),
             FolderPinSource::File {
@@ -233,7 +495,7 @@ fn container_type_icons_finished_deferred_slot_is_no_art_without_removing_admiss
         app.requested.contains_key(&0),
         "completed miss retains its archive-judgement admission slot"
     );
-    app.settings.thumb_container_type_icon_only = true;
+    app.settings.thumb_container_icon_kinds = crate::grid_item::ContainerIconKinds::ALL;
     app.update_keep_range_and_requests(&ctx, Instant::now());
     assert!(matches!(app.thumbnails[0], ThumbnailState::NoArt));
     assert!(
@@ -258,7 +520,7 @@ fn container_type_icons_toggle_keeps_request_until_both_source_terminals() {
             .unwrap()
             .clear();
         app.reload_queue.as_ref().unwrap().0.lock().unwrap().clear();
-        app.settings.thumb_container_type_icon_only = true;
+        app.settings.thumb_container_icon_kinds = crate::grid_item::ContainerIconKinds::ALL;
         app.settings.thumb_aspect_auto = true;
         app.update_keep_range_and_requests(&ctx, Instant::now());
         assert_eq!(app.requested.id(0), Some(id));
@@ -304,7 +566,11 @@ fn container_type_icons_toggle_keeps_request_until_both_source_terminals() {
         );
         assert!(matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
         assert!(matches!(
-            effective_thumbnail_state(&app.items[0], &app.thumbnails[0], true),
+            effective_thumbnail_state(
+                &app.items[0],
+                &app.thumbnails[0],
+                crate::grid_item::ContainerIconKinds::ALL
+            ),
             ThumbnailState::NoArt
         ));
         app.enqueue_idle_upgrades();
@@ -320,7 +586,7 @@ fn container_type_icons_loaded_containers_skip_idle_upgrade_but_images_do_not() 
         GridItem::Image("c:/shelf/page.png".into()),
     ]);
     let app = &mut env.app;
-    app.settings.thumb_container_type_icon_only = true;
+    app.settings.thumb_container_icon_kinds = crate::grid_item::ContainerIconKinds::ALL;
     app.settings.thumb_idle_upgrade = true;
     app.thumbnails.fill(loaded(&ctx, 1.5));
     app.enqueue_idle_upgrades();
@@ -338,7 +604,7 @@ fn container_type_icons_auto_aspect_all_containers_finish_beyond_keep() {
     );
     let app = &mut env.app;
     app.settings.thumb_aspect_auto = true;
-    app.settings.thumb_container_type_icon_only = true;
+    app.settings.thumb_container_icon_kinds = crate::grid_item::ContainerIconKinds::ALL;
     app.last_viewport_h = 120.0;
     app.settings.thumb_next_pages = 0;
     app.update_keep_range_and_requests(&ctx, Instant::now());
@@ -386,7 +652,7 @@ fn container_type_icons_auto_aspect_ignores_retained_samples_on_poll() {
         Instant::now() - Duration::from_secs(3),
         8,
     ));
-    app.settings.thumb_container_type_icon_only = true;
+    app.settings.thumb_container_icon_kinds = crate::grid_item::ContainerIconKinds::ALL;
     app.poll_thumbnails(&ctx, ThumbnailConsumptionPolicy::Grid);
     assert_eq!(
         app.auto_aspect.current,
@@ -432,7 +698,7 @@ fn container_type_icons_auto_aspect_loaded_rebuild_and_cache_seed_exclude_contai
     ]);
     let app = &mut env.app;
     app.settings.thumb_aspect_auto = true;
-    app.settings.thumb_container_type_icon_only = true;
+    app.settings.thumb_container_icon_kinds = crate::grid_item::ContainerIconKinds::ALL;
     app.thumbnails = vec![loaded(&ctx, 2.0), loaded(&ctx, 1.0)];
     app.rebuild_auto_aspect_samples_from_loaded();
     assert_eq!(app.auto_aspect.samples, HashMap::from([(1, 1.0)]));
@@ -492,7 +758,7 @@ fn container_type_icons_auto_aspect_loaded_rebuild_and_cache_seed_exclude_contai
 fn container_type_icons_preferences_leave_parked_viewer_untouched() {
     let mut env = fixture(vec![GridItem::Folder("c:/shelf/book".into())]);
     let app = &mut env.app;
-    app.settings.thumb_container_type_icon_only = true;
+    app.settings.thumb_container_icon_kinds = crate::grid_item::ContainerIconKinds::ALL;
     app.thumbnails[0] = ThumbnailState::NoArt;
     let sibling = app.build_window_context_for_test(1697, |mounted| {
         mounted.items = vec![GridItem::Folder("c:/sibling/book".into())];
@@ -504,7 +770,7 @@ fn container_type_icons_preferences_leave_parked_viewer_untouched() {
         .as_mut()
         .unwrap()
         .settings
-        .thumb_container_type_icon_only = false;
+        .thumb_container_icon_kinds = crate::grid_item::ContainerIconKinds::NONE;
     app.apply_preferences_dialog(&egui::Context::default());
     assert!(matches!(app.thumbnails[0], ThumbnailState::Pending));
     app.with_viewer_context(sibling, |mounted| {
@@ -595,12 +861,22 @@ fn container_type_icons_preferences_restore_pinned_and_plain_cache_without_delet
             .unwrap();
         // The first demand is canceled before execution; the next keep pass owns NoArt.
         app.requested.cancel_queued(0, request.request_id);
+        if pinned {
+            app.items.extend([
+                GridItem::ZipFile("other.zip".into()),
+                GridItem::PdfFile("other.pdf".into()),
+            ]);
+            app.thumbnails
+                .extend([ThumbnailState::NoArt, ThumbnailState::NoArt]);
+            app.image_metas.extend([Some((10, 20)); 2]);
+            app.visible_indices.extend([1, 2]);
+        }
         app.set_visibility_preferences_for_test(app.settings.file_type_visibility.clone());
         app.pref_state
             .as_mut()
             .unwrap()
             .settings
-            .thumb_container_type_icon_only = true;
+            .thumb_container_icon_kinds = crate::grid_item::ContainerIconKinds::ALL;
         app.apply_preferences_dialog(&ctx);
         assert!(
             matches!(app.thumbnails[0], ThumbnailState::Pending),
@@ -614,9 +890,21 @@ fn container_type_icons_preferences_restore_pinned_and_plain_cache_without_delet
             .as_mut()
             .unwrap()
             .settings
-            .thumb_container_type_icon_only = false;
+            .thumb_container_icon_kinds = if pinned {
+            ContainerIconKinds {
+                folder: false,
+                archive: true,
+                pdf_epub: true,
+            }
+        } else {
+            ContainerIconKinds::NONE
+        };
         app.apply_preferences_dialog(&ctx);
         assert!(matches!(app.thumbnails[0], ThumbnailState::Pending));
+        if pinned {
+            assert!(matches!(app.thumbnails[1], ThumbnailState::NoArt));
+            assert!(matches!(app.thumbnails[2], ThumbnailState::NoArt));
+        }
         app.update_keep_range_and_requests(&ctx, Instant::now());
         request = app
             .heavy_io_queue

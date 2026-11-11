@@ -335,7 +335,7 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 
 ## 8. 種類ごとの選択 (§1.770)
 
-作成: 2026-11-11。状態: **設計レビュー r2 ACCEPT、実装中**。要望: 5ch >>764 (実フォルダだけをアイコンにし、書庫・PDF の表紙はそのまま見たい)。
+作成: 2026-11-11。状態: **設計レビュー r2 / 独立コードレビュー ACCEPT、実装・focused 574件 / UI snapshot 249件検証済み（2026-11-12）。全lib・build-dev は設計担当へ引き継ぎ、実機未確認、未コミット**。要望: 5ch >>764 (実フォルダだけをアイコンにし、書庫・PDF の表紙はそのまま見たい)。
 バックログ: [next-release-backlog.md §1.770](next-release-backlog.md)。
 
 ### 8.1 要件
@@ -501,7 +501,46 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 - ドライブ・検索結果の集約行に専用の選択肢を作る: 要望の範囲外で、選択肢が増えるだけ。
 - 種類を外したとき一覧を読み直す: §3 の理由で採らない (コレクションのルート・Everything)。
 
-### 8.10 設計レビューの記録
+### 8.10 実装記録
+
+- 2026-11-12: `ContainerIconKind` / `ContainerIconKinds` と唯一の対応表 `container_icon_kind` を
+  `grid_item.rs` に追加。要求・描画・自動比率・スクロール・hover の既存判定は引数だけ置換し、
+  要求の作成・owner・終端処理は変更しない。
+- 旧 bool は共通の `canonicalize_container_icon_kinds` で map の段階から除去し、DB / 旧 JSON、
+  設定取り込み、override のマージ前に変換。壊れた旧値は DB / JSON では既定＋ログ、
+  取り込みでは指摘1件で宛先維持、override では拒否。新値があれば壊れていても旧値へ倒さない。
+- OK で外した種類の `NoArt` だけを `Pending` に戻す。既存の一覧位置・要求 owner・
+  キャッシュ・固定と退避 context は保持。3つの checkbox、検索索引、書き出しラベルと
+  マニュアル・表示パイプライン文書を更新した。
+- 回帰: 全 variant と8通りの選択、3種類別の混在一覧要求、書庫内の folder / page、
+  部分選択時の自動比率・スクロール待ち、種類の解除／入替と sibling owner 保持、
+  固定・cache からの復帰、出荷済み DB とコピーした portable DB、旧 JSON、
+  取り込み／書き出し、override、1093×614 の実ダイアログと狭幅の折り返しを検査する。
+- 検証結果は以下のとおり。全lib・build-dev は設計担当へ引き継ぐ（実装担当には実行しない指示）。
+  製品バイナリ起動とコミットは行わない。
+- 独立コードレビュー（GPT-6.1 Sol / xhigh、2026-11-12）: ACCEPT、P1/P2/P3 なし。
+  種類表・3入口の移行・新値優先・解除範囲・owner / 退避 context 保持・回帰テスト範囲を確認。
+  下記のテスト修正も限定再確認 ACCEPT。検査の弱体化なし。
+- 初回 focused は574件中570成功・4失敗。追加した自動比率テストが既存750ms streakを
+  待たない期待になっていたため、実 poll の候補と標本数を検証してから時計だけ進めた。
+  環境設定の3件は同名「実フォルダ」の Label と Checkbox が曖昧だったため、
+  role を Checkbox に限定。製品コードの修正・期待値の緩和はない。
+- `cargo fmt`（引数なし）、`cargo fmt --check`、`git diff --check` 成功。
+  `python scripts/check_ui_glyphs.py` は危険グリフ0件、exit 0。
+  記録: `target/icon-kinds-{fmt-check-final,diff-check-final,glyphs}.log`。
+- `UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot preferences_favorite_view_state_dark`:
+  1 passed、exit 0。更新 PNG は620×260、77,567 bytes。
+  実装担当と独立 reviewer が実 PNG を開き、見出し・3 checkbox・説明文に欠け／重なりがないことを確認。
+  記録: `target/icon-kinds-snapshot-update.log`。製品アプリの起動は含まない。
+- 修正後 focused（既定 feature / test profile、未コミット差分）:
+  `cargo nextest run -p mimageviewer --lib -E 'test(/container_type_icon|container_icon|container_icon_scroll|auto_aspect|thumbnail_request_lifecycle|settings_transfer::tests|settings_db|same_name_folder_book|thumbnail_type_icon|preferences/)'`
+  は574 passed / 0 failed（1 slow）、exit 0。記録: `target/icon-kinds-focused-final.log`。
+- 更新指定なしの `cargo test --test ui_snapshot`: 249 passed / 0 failed / 0 ignored、exit 0。
+  PNG 差分は `tests/snapshots/preferences_favorite_view_state_dark.png` だけ。
+  記録: `target/icon-kinds-snapshot-full.log`。
+- 設計からの挙動変更はない。実装記録を指定の §8.10 とするため、既存の設計レビュー履歴は §8.11 へ移した。
+
+### 8.11 設計レビューの記録
 
 - r1 (GPT-6.1 Sol / xhigh、2026-11-11): REVISE、P1 なし。P2 `--settings-override` はマージ前に未知キーを拒否するので
   旧キーが変換に届かない → マージ前に overlay を変換 (§8.3)。P2 取り込みで不正な旧値を黙って捨てると既存の
