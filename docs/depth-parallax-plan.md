@@ -688,6 +688,120 @@ E. **backstop の frame は 2D のまま**。描画経路を 2 つにしない�
   ROOT の地点では main が mount されていることを確認。判定「指摘修正後に実装開始可」、構造的変更に合意 (はい)。
   P1 の修正は独立化の既存の所有境界で閉じるもので、追加の guard・待ち・再試行・repaint は不要との見解。
 
+#### 6.4.3 独立した窓での 3D (§1.767 第 2 段、2026-11-11、設計)
+
+設計: ClaudeCode Opus 5.5。基点 `1ff4082a8` (第 1 段は実装・レビュー・全件済み)。
+利用者決定 (2026-11-11): 第 2 段も進める (第 1 段の報告で、独立した窓を持ち主にすると窓をまたぐ新しい制限が要ることを示したうえでの判断)。
+
+**対象**: main 以外の独立 context (複数ウィンドウモードの各窓、フル機能モードでメディアウィンドウから静止画へ進んだ窓、
+PDF / ZIP の連動静止画を再開した独立窓など) と、複数ウィンドウモードで main 自身が独立の静止画窓になっている場合。
+どの presentation でも、その context の live pass (`render_fs_body`) があれば 3D を使える。
+
+**第 1 段からの変更点だけを書く** (第 1 段の決定 B・C・E はそのまま。D は下の 3 で一般化する)。
+
+1. **3D を持てるのはプロセス全体で 1 context** (§6.4.2 調査 2 の「main 埋め込み + アクティブな独立 context の 2 つの通常 body」のため)。
+   - 適格性 (`depth_session_eligible`) から「main context」と「独立でない」を外す。presentation の許可集合は 3 種すべてになるので持たない
+     (常に真の述語は残さない)。代わりに入口条件へ「**ほかの context が 3D を持っていない**」を足す: `other_viewer_context_ids()` の各 context を
+     `with_viewer_context_ref` で読み、`fs_exclusive_view` が Depth なら拒否 (読み取りだけ。兄弟の状態を変えない。mount 中の自分は含まれない)。
+   - 拒否は `DepthEntryBlock::OtherWindow` (`Detached` を置き換え):「3D 写真は別のウィンドウで表示中です。そちらを終了してから使ってください」。
+     上部の 3D ボタンの有効表示も同じ答え。継続の照合 (`depth_view_may_continue`) も同じ関数だが、自分が持つ間に他が持つことは入口で起きない。
+   - 確定点 `commit_viewer_session` は残す: presentation か独立かどうかが実際に変わったら 3D を終える (第 1 段の案 1 と B)。
+     確定点の「不適格な切替先」の分岐は到達しなくなるので消す。
+   - 採らなかった案: 後から入った側を優先して他 context の 3D を終える (兄弟の状態を書き換える)、2 つ同時に動かす (worker の待ちは最新 1 件、
+     GPU slot は 1 つ)、2 つの通常 body がある間だけ禁止 (frame ごとに答えが揺れる)。
+2. **live pass を失う遷移はすべて 3D を終える**。欠けている `park_active_detached_context_as_live_media` (アクティブな独立 context を
+   ParkedLive へ移す) に、fork と同じ「Depth だけを `set_fs_exclusive_view(None)` で終える」を、snapshot 作成の前 (その context を mount した closure の中)
+   に入れる。`reset_detached_pause_foreground_modes` は呼ばない (360° 動画の意図の扱いを変えないため。fork の前例と同じ)。
+   ほかの経路 (pause・静止画の park・fork・close / retire・確定点・Remote の取得) は既に終える (設計レビュー r1〜r3 で確認)。scoped mount では終えない。
+3. **3D のダイアログを描く場所を 1 つの関数で決める** (第 1 段の D の一般化)。
+   ```text
+   depth_dialog_owner_surface(owner: Option<ViewerContextId>) -> DepthDialogSurface
+     owner が Some(c)、c ≠ main、viewer_context_live(c)  → Viewer(c)
+     それ以外                                              → Main   (第 1 段の規則: main の viewer pass、main に閲覧が無ければ ROOT)
+   viewer_context_live(c) (c ≠ main) = active_viewer_context_id() == Some(c) かつ detached_active_window_alive_wanted()
+   ```
+   - owner: 書き出しは `Operation.resource.context`。追加モデルの案内は、`DepthSetup` がダイアログの寿命の間持つ入口
+     (`ModeEntry(request)` → `Some(request.context)`、`Preferences` → `None`)。今は Checking の間しか入口を持たないので、ダイアログと一緒に持たせる。
+   - 描く側: viewer pass の 2 か所は `Viewer(mount 中の context)` のとき、または `Main` かつ mount 中が main のとき。ROOT は `Main` のときだけ
+     (ROOT の 3D 書き出しは既存条件 `main_window_should_draw_export_dialogs` に、追加モデルの案内は第 1 段の条件に、`Main` を加える。
+     独立 context が持ち主の間は main が一覧でも ROOT で描かない)。
+   - **main が持ち主のときは第 1 段と同じ** (main の今の見え方を変えない)。
+4. **modal の間、独立した持ち主の窓は終わらない**。持ち主が独立 context のとき、3 の答えが `Main` に落ちると、main の閲覧が
+   body を描かない状態 (列挙待ちの holdover・native 動画など) では modal が見えなくなる (設計レビュー r2 P1)。そこで、
+   **持ち主が main 以外の独立 context で、3D の modal (書き出しの全段階、または 3D の入口から開いた追加モデルの案内の Checking / Confirm。
+   RemoveConfirm は環境設定からしか開かず持ち主を持たない) が開いている間**だけ、その持ち主を終わらせる操作を受け付けない:
+   - キー・ポインタ (Esc・F12・F11・ページ移動・×・D): 既存の共通 modal が止める (変更なし)。
+   - 窓の切替 (他の窓の activation) と外部からの開く要求 (関連付け・D&D・単一起動・Everything 等): `document_open_modal_admission_blocked`
+     は書き出しを既に含む。**追加モデルの案内を「持ち主が独立 context の modal 段階」の間だけ**この述語に加える
+     (`Preferences` 由来や main が持ち主の案内では今までどおり受け付ける)。
+   - 持ち主の窓の OS の閉じる操作: `accept_active_detached_window_close` に、**閉じようとする窓の context が独立した 3D modal の持ち主**なら
+     拒否を加える (既存の `viewer_mutation_modal_active` と同じ扱い)。持ち主でない窓は今までどおり閉じられる。
+   - 自動送り (スライドショー・フォルダをまたぐ送り): 書き出し中は `handle_fs_navigation_with_render_perf` が既に止める。追加モデルの modal 中も、
+     持ち主が独立 context なら同じ条件で止める (持ち主でなければ今までどおり)。
+   - Remote の取得: 書き出しは既存の lease が止める。追加モデルの modal 中の取得は全 viewer を閉じ、main は一覧になるので答えは `Main` で ROOT が描ける。
+   - **受付済みの遷移がある間は modal を始めない** (設計レビュー r5 P1)。独立 context でフォルダ移動などを受け付けた後、旧画像の表示中に
+     modal を始めると、移動の完了 (`apply_folder_nav_result`) が旧 viewer を閉じた後の reopen を、上で広げた開く要求の拒否が自分で拒み、
+     持ち主の窓が終わり得る (通常の操作の競合)。そこで、持ち主になる context が独立 context のとき、modal を始める 2 か所
+     (3D の入口でモデル確認のダイアログを開く `toggle_depth_parallax`、書き出しの受付 `admit_depth_export`) で、その context が
+     **`active_detached_transition_outstanding()`** (アクティブな別ウィンドウの内部遷移が残っているかの唯一の判定。フォルダ移動・
+     PDF / ZIP の列挙待ち・遅延 reopen・Preparing などを含む) なら、modal を開かずに「読み込みが終わってから使ってください」と通知して拒否する。
+     判断は viewer を閉じる前の、modal を開く時点で行う。main・環境設定由来には広げない。
+     modal を開いた後は、新しい遷移は開く要求の拒否・共通 modal・自動送りの停止で受け付けないので、modal 中に持ち主が終わる通常の経路は残らない。
+   - これらはすべて、独立した窓で 3D を使うときだけ現れる新しい制限で、main の MainWindow / Fullscreen / linked F12 の挙動は変えない。
+   - 非 modal の段階 (追加モデルの Running / Done / Cancelled / Error) は止めない。持ち主が終われば `Main` に移り、main の閲覧が body を描かない間は
+     見えなくても入力は止めず、通常の body に戻れば描かれる (今の環境設定由来の案内と同じ性質)。
+   - 受入条件: 固定した状態では描く場所が 1 つ。持ち主の退場後は生存する表示先だけが描く。frame 全体での呼出し回数を 1 にそろえる frame フラグは作らない。
+5. **入場の再開を要求元 context へ配送する** (設計レビュー r1 P2)。モデル確認は ROOT の `poll_depth_setup` のまま。`ModeEntry(request)` の再開は、
+   `request.context` が main 以外なら `with_viewer_context(request.context, …)` で mount してその context の `resume_depth_entry_after_check` を呼ぶ。
+   照合は今の items 世代・fs_idx・item_id に加えて `viewer_context_live`。満たさなければ再開しない (既存の「古い要求は捨てる」)。
+   mount の中で 1 の「ほかの context が 3D を持っていない」も同じ関数で判定される。`DepthViewState::new(edit_request_owner_context())` は要求元を所有者にし、
+   推論の wake 先は後続の子 pass の `advance_depth_source` が子 viewport で捕捉する (r2 で確認済み)。
+6. **一時データの id を持ち主の context で分ける**: `depth_panel_rect` と `depth_export_display_snapshot` の id に 3D の持ち主の context を混ぜる
+   (1 により同時に 1 つしか書かないが、「context 固有の値は所有 context だけが読み書きする」を形で保証する)。
+
+**まれな失敗の割り切り**: modal 中に所有窓の viewer が失敗で閉じる (読み込み失敗でフォルダ移動が窓を閉じる等) 場合、答えは `Main` に移り、
+main の閲覧が body を描かない状態と重なると modal がしばらく見えない。通常の操作では起きない組み合わせなので、仕組みは足さない (ログ + 既存の通知)。
+
+**状態を減らす検討**: 持ち主を常に 1 つに保ち (1)、持ち主が終われば 3D も終わり (2)、modal の間は独立した持ち主を終わらせない (4)。
+これにより「持ち主の無い modal」「2 つの 3D」「at rest の 3D」の組み合わせを作らない。新しい保留状態・ハンドオーバー・待ち・再試行は足さない。
+入口 (`CheckingOrigin`) をダイアログの寿命の間持つのは、既存の値の寿命を延ばすだけで状態の種類は増えない。
+
+**detached 述語・viewport 経路に触れる範囲** (第 1 段に加えて)
+
+- 変える: 適格性 (presentation・独立の許可集合を外し、プロセス全体で 1 つの条件へ)、`park_active_detached_context_as_live_media` の 3D 終了、
+  ダイアログの描く場所の関数、`document_open_modal_admission_blocked` / `accept_active_detached_window_close` / 自動送りの停止条件に
+  「独立した 3D modal の持ち主」を加えること、入場の再開の配送、一時データの id。
+- 変えない: viewport の生成・id・builder、HWND の同定、placement、focus、z-order、bundle の swap、fork / park の手順、`reset_detached_pause_foreground_modes`、
+  `render_fs_body` の root / child の振り分け、backstop、F11 / F12 のキー経路。App に detached 用の bool / Option を新設しない
+  (持ち主は既存の operation と `DepthSetup` から読む)。時間窓・再試行・追加 repaint は足さない。
+
+**テスト** (第 1 段のテストに加えて)
+
+1. 入口の matrix: 独立 context × DetachedWindow、main の独立窓で許可。ほかの context (at rest) が 3D を持つときは両方向
+   (main 埋め込みが持つ → 独立 context で D、独立 context が持つ → main で D) で `OtherWindow` を返し、どちらの状態も変えない。上部ボタンも同じ。
+2. 寿命: アクティブ独立 context の 3D → 他の窓の activation (pause / park) で終わる、`park_active_detached_context_as_live_media` で終わる
+   (要求の取消・slot 除去)、閉じる (推論中を含む) で終わる。終えた後に別の context で入場でき、`OtherWindow` にならない。scoped mount では終わらない。
+3. ダイアログ: 独立 context で D (モデル未導入) → 案内がその窓の pass だけに出て、main の埋め込み・ROOT では描かれない。独立 context の書き出し →
+   その窓だけ。持ち主が main のとき・環境設定由来は第 1 段と同じ。
+4. modal 中の保護 (独立した持ち主): 書き出しの各段階と追加モデルの Checking / Confirm で、その窓の OS の閉じる操作・他の窓の activation・外部からの開く要求・
+   スライドショーの送り (フォルダをまたぐ送りを含む) が拒否 / 停止され、状態が変わらない。持ち主でない窓は閉じられる。main が持ち主の案内・環境設定由来の
+   案内では、開く要求・activation・スライドショーが今までどおり受け付けられる (退行なし)。
+4b. 受付済み遷移との排他: 独立 context でフォルダ移動を受け付け → 結果が届く前に D (モデル未導入) / 書き出し → modal は開かず通知で拒否 →
+   正常な結果が届き、同じ窓・同じ context で新しいフォルダが開く。通常フォルダと PDF / ZIP (列挙待ち) の両方。遷移が無ければ modal は開く。
+5. 非 modal: 独立 context の追加モデル Running 中にその窓を閉じる → 案内は main の表示 (一覧なら ROOT) に移り、操作できる。
+6. 入場の再開: 独立 context で D → ROOT の poll で「導入済み」の確認完了 → その独立 context だけが入場 (1 回の D で始まる)。確認中にページが変わった・
+   窓がアクティブでない場合は再開しない。
+7. 一時データの id: 3D を終えて別の context で始めた最初の pass に、前の context のパネル矩形・書き出し snapshot を読まない。
+8. 既存回帰: `test(/depth|export|presentation|window_mode|panorama|detached|multiwindow_scenario|slideshow/)`。
+
+**設計レビュー r5 (GPT-6.1 Sol / xhigh、read-only、基点 `1ff4082a8`)**: P1 1 件 (受付済みのフォルダ移動の完了が、広げた開く要求の拒否で
+reopen を拒まれ、modal 中に持ち主の窓が終わる通常の競合) → 4 の「受付済みの遷移がある間は modal を始めない」とテスト 4b を追加。
+ほかの点 (1 context 制約、ParkedLive の終了、入場の再開の配送、live 判定と描く場所、modal の分類、close の範囲、main・環境設定由来の非退行、
+Remote・トレイ・終了、まれな失敗の割り切り) は妥当との確認。P2・P3 なし。判定「指摘修正後に実装開始可」、構造的変更に合意 (はい)。
+
+**文書**: マニュアル (3D 写真の「使える場面」: 別ウィンドウでも使える、一度に 1 つの窓だけ、独立した窓でモデル確認・書き出し中はその窓を閉じたり
+他の窓へ切り替えたりできない)、keymap-spec の 3D の節、本書 §1・§6.1・§6.4・§6.4.2 の「第 2 段は保留」の記述、detached-rework-plan §11 (第 2 段の記録)。
+
 ### 6.5 他の機能との関係 — 「表示を占有するモード」を 1 つの述語にする
 
 360° が他の機能を止めている箇所 (調査では 30 か所余り: キー・編集ツールの入口・補正パネル・
