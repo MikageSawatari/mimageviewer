@@ -10,7 +10,9 @@ navigation / supersession / rollback の組合せを追加しない。
 パネルのクリックはframe内の意図とし、描画後の素材・ページ・一覧世代を照合して受付する。
 保存時は最新のReady素材と描画snapshotを一組で捕捉し、設定画面中のresizeや背景の素材更新を
 旧snapshotと混ぜない。ナビゲーションの共通受付はmanual／slideshowとも停止し、
-OS closeだけは所有contextの取消へ通す。
+main が所有するときの OS close は従来どおり取消へ通す。main 以外の独立 context が所有するときは、
+modal の間だけ所有窓の OS close を拒否し、通常の body を描く表示先を保持する
+([3D 写真設計](depth-parallax-plan.md) §6.4.3)。
 
 worker は凍結した色・深度 Arc だけを読み、画面と同じ WGSL を専用 pipeline / uniform /
 bind group で不透明な `Rgba8Unorm` へ描く。GPU submit / map / `poll(Wait)`、GIF/APNG の

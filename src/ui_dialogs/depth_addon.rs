@@ -97,6 +97,11 @@ impl DepthSetup {
         self.addon.set_status_for_test(status);
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_operation_for_test(&mut self, operation: AddonOperation) {
+        self.addon.set_operation_for_test(operation);
+    }
+
     pub(crate) fn modal_open(&self) -> bool {
         matches!(
             self.dialog.as_ref().map(|dialog| &dialog.phase),
@@ -118,6 +123,11 @@ impl DepthSetup {
         } else {
             None
         }
+    }
+
+    /// An in-progress addon operation opens modeless progress instead of checking.
+    pub(crate) fn entry_check_opens_modal(&self) -> bool {
+        self.addon.operation() == AddonOperation::None
     }
 
     fn set_dialog_phase(&mut self, phase: Dialog) {
@@ -181,15 +191,15 @@ impl App {
     }
 
     fn request_depth_addon_check(&mut self, ctx: &egui::Context, origin: CheckingOrigin) {
-        let phase = if self.depth_setup.addon.operation() != AddonOperation::None {
-            Dialog::Running
-        } else {
+        let phase = if self.depth_setup.entry_check_opens_modal() {
             self.depth_setup.addon.request_scan();
             if self.depth_setup.addon.is_scanning() {
                 Dialog::Checking
             } else {
                 Dialog::Confirm
             }
+        } else {
+            Dialog::Running
         };
         self.depth_setup.dialog = Some(OwnedDialog { origin, phase });
         ctx.request_repaint();

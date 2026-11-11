@@ -70189,8 +70189,8 @@ impl App {
             false
         };
         if should_park_active {
-            // Independent sessions cannot own Depth. A linked session keeps false here;
-            // on successful park its exclusive view was already retired by the park owner.
+            // A linked session keeps false here; on successful park its exclusive
+            // view was already retired by the park owner.
             self.detached_viewer_independent_active = false;
         }
         let mut should_recreate_active_viewport = false;

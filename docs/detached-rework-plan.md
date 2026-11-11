@@ -1455,6 +1455,39 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-11: 3D 写真の独立した窓への対応 (§1.767 第 2 段)
+
+基点 `cc0264f3a`、正本は [3D 写真設計 §6.4.3](depth-parallax-plan.md#643-独立した窓での-3d-1767-第-2-段2026-11-11設計)。
+第 2 段を進める利用者決定の後、設計担当 ClaudeCode Opus と独立 GPT-6.1 Sol / xhigh の設計レビュー r5 で
+「症状パッチではなく構造的な変更」であることに合意済み。r5 P1 の受付済み遷移と modal の排他を含む。
+作業は `feat-767-stage2`、`G:\home\mimageviewer-767s2` で継続し、中断時の実装差分は WIP `196dec7fc` から引き継いだ。
+
+変える範囲:
+
+- main / presentation / session 独立性による入場制限を、既存 registry の読み取りだけによる「ほかの context が Depth を持たない」条件に置き換える。
+  後から入った窓のために兄弟の Depth を終えない。実 session 切替での終了は既存確定点に残す。
+- `park_active_detached_context_as_live_media` は所有 context を mount した既存 closure 内で、snapshot 作成前に Depth だけを終了する。
+  360° の意図や park の搬送手順は変更しない。
+- `depth_dialog_owner_surface` / `viewer_context_live` が既存 operation と追加モデル案内の入口から表示先を導く。
+  生きている独立所有者は自窓、main 所有・環境設定由来・退場後の案内は既存 main の表示経路で描く。
+- 独立した所有者の modal の間だけ、追加モデル Checking / Confirm の document admission、所有窓 OS close、自動送りを止める。
+  modal の 2 入口では既存 `active_detached_transition_outstanding()` で先に拒否し、受付済みの reopen を modal が拒む組合せを作らない。
+  main 所有と環境設定由来には新しい制限を広げず、非所有窓の close も維持する。
+- ROOT poll の確認完了を独立した要求 context へ scoped mount で配送し、live / items / page identity を照合する。
+  パネル矩形と書き出し snapshot の一時 id は context で分ける。
+
+変えない範囲: viewport 生成・id・builder、HWND 同定、placement、focus、z-order、bundle swap、fork / park の搬送手順、
+`reset_detached_pause_foreground_modes`、`render_fs_body` の root / child 分岐、backstop、F11 / F12 のキー経路。
+App に detached 用 bool / Option を足さず、時間窓・待ち・再試行・追加 repaint を作らない。
+
+判断理由: 1 context だけの所有と独立所有窓の modal 受付を既存所有境界で揃え、複数の 3D・at-rest の 3D・通常操作で所有窓を失う modal の
+組合せを減らす変更である。表示先は既存の事実から導き、frame フラグや完了移管は作らない。
+まれな失敗は既定のログと通知で割り切る。
+
+検証の要点: OtherWindow の双方向 readonly 拒否、park / close の取消と slot 除去、所有表示先、modal 各段階の保護と
+非所有窓・main・環境設定由来の非退行、受付済み folder / PDF / ZIP 遷移の正常完了、ROOT poll の再開配送、一時 id の分離。
+完成レビューとコマンド・件数・exit code は [実装記録 §17.15](depth-parallax-plan.md#1715-実装記録-643-第-2-段) に集約する。
+
 ### 2026-11-11: 3D 写真の F12 の別ウィンドウ対応 (§1.767 第 1 段)
 
 基点 `9280249bf`、`feat-766-767-depth-ui`。設計の正本は

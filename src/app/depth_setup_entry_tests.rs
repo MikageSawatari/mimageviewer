@@ -291,3 +291,219 @@ fn depth_setup_independent_installed_scan_discards_changed_page() {
 fn depth_setup_independent_installed_scan_discards_inactive_window() {
     independent_scan_case("inactive");
 }
+
+/// Exercise the actual shared admission owners, including an expired timer at
+/// the last image where NextFolder would otherwise start a traversal.
+pub(crate) fn assert_independent_modal_protection(
+    app: &mut App,
+    ctx: &egui::Context,
+    owner: ViewerContextId,
+    window: u64,
+    sibling_window: u64,
+) {
+    let main_generation = app.items_generation;
+    let main_index = app.fullscreen_idx;
+    assert!(app.document_open_modal_admission_blocked());
+    assert!(!app.activate_detached_image_window_snapshot(ctx, sibling_window));
+    assert_eq!(app.active_viewer_context_id(), Some(owner));
+    assert_eq!(
+        app.accept_active_detached_window_close(ctx, window, "depth_modal_test"),
+        Some(false)
+    );
+    let requested = PathBuf::from("depth-modal-forwarded.jpg");
+    app.activation_open_path_tx
+        .send(crate::single_instance::ActivationOpenPath::received(
+            requested.clone(),
+            None,
+        ))
+        .unwrap();
+    app.poll_activation_open_paths(ctx);
+    assert!(app.startup_open_path_resolve_pending.is_none());
+    // Existing admission defers forwarded requests; it must not consume or open one.
+    assert_eq!(
+        app.activation_open_path_rx.try_recv().unwrap().path,
+        requested
+    );
+    app.with_viewer_context(owner, |mounted| {
+        let generation = mounted.items_generation;
+        let presentation = mounted.viewer_presentation;
+        let initial = mounted.fullscreen_idx;
+        mounted.settings.page_turn_animation_enabled = false;
+        mounted.settings.slideshow_end_action = crate::settings::SlideshowEndAction::NextFolder;
+        for idx in [0, mounted.items.len() - 1] {
+            mounted.fullscreen_idx = Some(idx);
+            mounted.slideshow_playing = true;
+            mounted.slideshow_anchor_idx = Some(idx);
+            mounted.slideshow_next_at = Instant::now() - Duration::from_secs(1);
+            let deadline = mounted.slideshow_next_at;
+            for nav in [
+                crate::ui_fullscreen::FsPageNav::Target(2),
+                crate::ui_fullscreen::FsPageNav::None,
+            ] {
+                mounted.handle_fs_navigation(ctx, false, false, None, None, None, nav, None, idx);
+                assert_eq!(mounted.fullscreen_idx, Some(idx));
+                assert_eq!(mounted.slideshow_next_at, deadline);
+                assert!(mounted.slideshow_playing);
+                assert!(mounted.folder_nav_pending.is_none());
+                assert_eq!(mounted.items_generation, generation);
+                assert_eq!(mounted.viewer_presentation, presentation);
+            }
+        }
+        mounted.fullscreen_idx = initial;
+        mounted.slideshow_playing = false;
+    })
+    .unwrap();
+    assert!(app.request_detached_image_window_close_by_ids(
+        ctx,
+        &[sibling_window],
+        "depth_modal_sibling_close",
+        None
+    ));
+    assert_eq!(app.active_viewer_context_id(), Some(owner));
+    assert_eq!(app.items_generation, main_generation);
+    assert_eq!(app.fullscreen_idx, main_index);
+}
+
+#[test]
+fn depth_setup_independent_checking_and_confirm_protect_owner_but_allow_sibling_close() {
+    for checking in [true, false] {
+        let ctx = egui::Context::default();
+        let mut app = setup_app_for_test();
+        install_pages(&mut app, &ctx);
+        app.push_window_context_for_test(&ctx, 80_470, |owner| install_pages(owner, &ctx));
+        app.depth_setup = DepthSetup::for_test(app.tmp.path().join("missing-independent-modal"));
+        if !checking {
+            app.depth_setup.set_status_for_test(AddonStatus::Missing);
+        }
+        let owner =
+            app.build_active_context_for_test(Some(80_471), DetachedSource::Image, |owner| {
+                install_pages(owner, &ctx);
+                owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+                owner.detached_viewer_independent_active = true;
+            });
+        app.with_viewer_context(owner, |owner| {
+            owner.mark_active_detached_viewport_rendered(&ctx);
+            owner.toggle_depth_parallax(&ctx, 0);
+        })
+        .unwrap();
+        assert_eq!(app.depth_setup.checking_for_test(), checking);
+        assert_eq!(app.depth_setup.confirming_for_test(), !checking);
+        assert_independent_modal_protection(&mut app, &ctx, owner, 80_471, 80_470);
+    }
+}
+
+#[test]
+fn depth_setup_main_and_preferences_keep_external_open_activation_and_slideshow_admission() {
+    for preferences in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = setup_app_for_test();
+        install_pages(&mut app, &ctx);
+        app.depth_setup.set_status_for_test(AddonStatus::Missing);
+        if preferences {
+            app.request_depth_addon_setup(&ctx);
+        } else {
+            app.toggle_depth_parallax(&ctx, 0);
+        }
+        assert!(app.depth_setup.modal_open());
+        assert!(!app.document_open_modal_admission_blocked());
+        app.settings.page_turn_animation_enabled = false;
+        app.handle_fs_navigation(
+            &ctx,
+            false,
+            false,
+            None,
+            None,
+            None,
+            crate::ui_fullscreen::FsPageNav::Target(3),
+            None,
+            0,
+        );
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(3),
+            "main/preferences navigation remains admitted"
+        );
+        app.slideshow_playing = true;
+        app.slideshow_anchor_idx = Some(3);
+        app.slideshow_next_at = Instant::now() - Duration::from_secs(1);
+        app.settings.slideshow_end_action = crate::settings::SlideshowEndAction::Stop;
+        app.handle_fs_navigation(
+            &ctx,
+            false,
+            false,
+            None,
+            None,
+            None,
+            crate::ui_fullscreen::FsPageNav::None,
+            None,
+            3,
+        );
+        assert!(
+            !app.slideshow_playing,
+            "main/preferences timer reaches its normal end"
+        );
+        app.push_window_context_for_test(&ctx, 80_472, |owner| {
+            install_pages(owner, &ctx);
+            owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+            owner.detached_viewer_independent_active = true;
+        });
+        assert!(app.activate_detached_image_window_snapshot(&ctx, 80_472));
+        app.activation_open_path_tx
+            .send(crate::single_instance::ActivationOpenPath::received(
+                app.tmp.path().join("external-main-addon.jpg"),
+                None,
+            ))
+            .unwrap();
+        app.poll_activation_open_paths(&ctx);
+        assert!(
+            app.startup_open_path_resolve_pending.is_some(),
+            "main/preferences forwarded path starts resolving"
+        );
+    }
+}
+
+#[test]
+fn depth_setup_running_operations_remain_modeless_during_accepted_independent_transition() {
+    for operation in [
+        crate::addon::AddonOperation::Installing,
+        crate::addon::AddonOperation::Cancelling,
+        crate::addon::AddonOperation::Removing,
+    ] {
+        let ctx = egui::Context::default();
+        let mut app = setup_app_for_test();
+        install_pages(&mut app, &ctx);
+        app.depth_setup.set_status_for_test(AddonStatus::Missing);
+        app.depth_setup.set_operation_for_test(operation);
+        let current = app.tmp.path().join("modeless-transition");
+        std::fs::create_dir(&current).unwrap();
+        let owner =
+            app.build_active_context_for_test(Some(80_473), DetachedSource::Image, |owner| {
+                install_pages(owner, &ctx);
+                owner.current_folder = Some(current.clone());
+                owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+                owner.detached_viewer_independent_active = true;
+            });
+        app.with_viewer_context(owner, |owner| {
+            owner.mark_active_detached_viewport_rendered(&ctx);
+            owner.start_folder_nav(current.clone(), true, FolderNavMode::Fullscreen);
+            assert!(owner.active_detached_transition_outstanding());
+            owner.toggle_depth_parallax(&ctx, 0);
+            assert!(owner.depth_setup.dialog_open_for_test(), "{operation:?}");
+            assert_eq!(
+                owner.depth_setup.dialog_owner_context(),
+                Some(owner.edit_request_owner_context())
+            );
+            assert!(!owner.depth_setup.modal_open());
+            assert!(!owner.document_open_modal_admission_blocked());
+            assert!(
+                owner.fs_feedback_toast.is_none(),
+                "modeless progress is not refused"
+            );
+            assert_eq!(
+                owner.accept_active_detached_window_close(&ctx, 80_473, "modeless_operation_close"),
+                Some(true)
+            );
+        })
+        .unwrap();
+    }
+}

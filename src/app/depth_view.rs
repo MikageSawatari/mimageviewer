@@ -247,7 +247,9 @@ impl App {
         }
         // Setup owns its lazy scan. Unknown installation is Checking, never Missing.
         if self.depth_setup.installed_model_path().is_none() {
-            if self.depth_modal_entry_waiting_for_transition() {
+            if self.depth_setup.entry_check_opens_modal()
+                && self.depth_modal_entry_waiting_for_transition()
+            {
                 self.show_feedback_toast("読み込みが終わってから使ってください".into());
                 return;
             }

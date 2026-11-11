@@ -357,6 +357,42 @@ pub(super) fn install_ready_depth_for_export(app: &mut App) {
 }
 
 #[cfg(windows)]
+pub(crate) fn record_ready_display(app: &App, ctx: &egui::Context) {
+    use crate::displayed_image_transform::{
+        DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
+        RectPixelFit, ResolvedDisplayPlacement,
+    };
+    let FsExclusiveView::Depth(state) = &app.fs_exclusive_view else {
+        panic!("ready depth")
+    };
+    let transform = DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+        page_idx: app.fullscreen_idx.unwrap(),
+        viewport_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800., 600.)),
+        source_size: egui::vec2(200., 300.),
+        texture_size: egui::vec2(200., 300.),
+        rotation: crate::rotation_db::Rotation::None,
+        free_rotation_rad: 0.,
+        content_bbox: None,
+        fit_mode: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+            crate::settings::FullscreenFitMode::Page,
+        ),
+        fit_scale_limits: FullscreenFitScaleLimits::default(),
+        pixels_per_point: 1.,
+        placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+        pixel_fit: RectPixelFit::Texels,
+    })
+    .unwrap();
+    super::depth_export::record_display(
+        ctx,
+        app.edit_request_owner_context(),
+        state.ready().unwrap().resource_id,
+        app.items_generation,
+        &transform,
+        &crate::ui_fullscreen::FsBgStyle::Solid(egui::Color32::BLACK),
+    );
+}
+
+#[cfg(windows)]
 fn assert_depth_owner_live(app: &App, evidence: &DepthOwnerEvidence) {
     let FsExclusiveView::Depth(state) = &app.fs_exclusive_view else {
         panic!("sibling must retain its Depth owner");
@@ -780,14 +816,12 @@ fn depth_presentation_entry_continuation_and_commit_share_context_eligibility() 
                 ViewerPresentation::DetachedWindow,
             ] {
                 for independent in [false, true] {
-                    let eligible = true;
                     owner.viewer_presentation = source;
                     owner.detached_viewer_independent_active = independent;
-                    assert_eq!(owner.depth_entry_allowed(0), if eligible { Ok(()) } else {
-                        Err(DepthEntryBlock::OtherWindow)
-                    }, "context={context:?}, source={source:?}, independent={independent}");
+                    assert_eq!(owner.depth_entry_allowed(0), Ok(()),
+                        "context={context:?}, source={source:?}, independent={independent}");
                     depth(owner);
-                    assert_eq!(owner.depth_view_may_continue(0), eligible);
+                    assert!(owner.depth_view_may_continue(0));
                     for target in [ViewerPresentation::MainWindow, ViewerPresentation::Fullscreen,
                         ViewerPresentation::DetachedWindow] {
                         for target_independent in [false, true] {
@@ -797,14 +831,13 @@ fn depth_presentation_entry_continuation_and_commit_share_context_eligibility() 
                             owner.feedback_toasts_for_test.clear();
                             owner.commit_viewer_session(target, target_independent, "depth_session_matrix");
                             assert_eq!(owner.viewer_presentation, target);
-                            let target_eligible = true;
-                            let continues = eligible && target_eligible && source == target
+                            let continues = source == target
                                 && independent == target_independent;
                             assert_eq!(owner.fs_exclusive_view.is_depth(), continues,
                                 "context={context:?} ({source:?},{independent}) -> ({target:?},{target_independent})");
                             assert_eq!(owner.feedback_toasts_for_test.len(), usize::from(!continues));
                             if !continues {
-                                assert_eq!(owner.feedback_toasts_for_test[0].0.contains("D キー"), target_eligible);
+                                assert!(owner.feedback_toasts_for_test[0].0.contains("D キー"));
                             }
                         }
                     }
@@ -3061,6 +3094,11 @@ fn depth_independent_live_media_park_retires_request_and_slot_and_releases_entry
         );
         app.with_viewer_context(child, |owner| assert!(!owner.fs_exclusive_view.is_depth()))
             .unwrap();
+        // The existing live-media park returns main to its grid. Open another
+        // viewer before asking whether the retired context still blocks 3D.
+        assert!(app.fullscreen_idx.is_none());
+        app.open_fullscreen(0, HistoryTrigger::UserChosen);
+        assert_eq!(app.fullscreen_idx, Some(0));
         assert_eq!(app.depth_entry_allowed(0), Ok(()));
     }
 }

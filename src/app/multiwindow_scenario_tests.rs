@@ -3559,7 +3559,9 @@ fn independent_depth_dialog_scenario(export: bool, running_close: bool) {
         let mut app = setup_app_for_test();
         app.initialized = true;
         app.indexer_init.mark_unavailable_if_not_ready();
-        let mut viewer = super::depth_main_window_tests::RootDepthViewer::linked(&mut app);
+        // Main is the embedded viewer beside an independent child, not a linked
+        // F12 viewer competing for the active session's child viewport identity.
+        let viewer = super::depth_main_window_tests::RootDepthViewer::new(&mut app);
         let ctx = viewer.ctx.clone();
         app.set_fs_exclusive_view(
             crate::fs_exclusive_view::FsExclusiveView::None,
@@ -3576,11 +3578,10 @@ fn independent_depth_dialog_scenario(export: bool, running_close: bool) {
         app.with_viewer_context(child, |owner| {
             owner.mark_active_detached_viewport_rendered(&ctx);
             if export {
+                super::depth_view_tests::install_ready_depth_for_export(owner);
                 viewer.ready(owner);
-                viewer.frame(owner, vec![]);
-                viewer.frame(owner, vec![]);
-                let button = viewer.label("?????").center();
-                viewer.click(owner, button, false);
+                super::depth_view_tests::record_ready_display(owner, &ctx);
+                owner.open_depth_export(&ctx, 0);
                 assert!(owner.depth_export_dialog_open());
             } else {
                 owner
@@ -3594,11 +3595,20 @@ fn independent_depth_dialog_scenario(export: bool, running_close: bool) {
         let viewport = App::detached_image_window_viewport_id(88_980);
         let mut driver = ScenarioDriver::with_ctx(ctx.clone());
         driver.focus(viewport);
-        let title = if export { "3D ???????" } else { "3D ????????" };
-        for _ in 0..4 {
+        let title = if export {
+            "3D 写真の書き出し"
+        } else {
+            "3D 写真の追加モデル"
+        };
+        // Match run_depth_dialog_owner_case: egui's first Area/Window pass only
+        // sizes the newly shown window and intentionally emits no visible title.
+        // Check lifetime on those setup passes too, then require unique placement
+        // on several settled passes rather than treating sizing as missing UI.
+        for pass in 0..7 {
             let frame = driver.root(&mut app);
             assert_eq!(app.fullscreen_idx, Some(0));
-            assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+            assert_eq!(app.viewer_presentation, ViewerPresentation::MainWindow);
+            assert!(app.fullscreen_embedded_still_active());
             app.with_viewer_context(child, |owner| {
                 assert_eq!(owner.fullscreen_idx, Some(0));
                 assert_eq!(
@@ -3607,6 +3617,9 @@ fn independent_depth_dialog_scenario(export: bool, running_close: bool) {
                 );
             })
             .unwrap();
+            if pass < 4 {
+                continue;
+            }
             let surfaces: Vec<_> = frame
                 .labels
                 .iter()
@@ -3620,7 +3633,12 @@ fn independent_depth_dialog_scenario(export: bool, running_close: bool) {
                 frame.labels
             );
         }
-        assert!(!app.depth_addon_dialog_in_mounted_viewer());
+        let draws_in_main = if export {
+            app.depth_export_dialog_in_mounted_viewer()
+        } else {
+            app.depth_addon_dialog_in_mounted_viewer()
+        };
+        assert!(!draws_in_main);
         if running_close {
             app.depth_setup.set_dialog_running_for_test();
             assert!(!app.depth_setup.modal_open());
@@ -3660,4 +3678,235 @@ fn multiwindow_depth_independent_export_dialog_is_drawn_only_in_owner_live_pass(
 #[test]
 fn multiwindow_depth_independent_running_addon_returns_to_actual_root_after_os_close() {
     independent_depth_dialog_scenario(false, true);
+}
+
+fn depth_transition_pdf(path: &Path) {
+    // Same tiny two-page, valid-xref fixture used by collection-return tests.
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [4 0 R 6 0 R] /Count 2 >>",
+        "<< /Length 0 >>\nstream\nendstream",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 3 0 R >>",
+        "<< /Length 0 >>\nstream\nendstream",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 5 0 R >>",
+    ];
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![];
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", index + 1, object).as_bytes());
+    }
+    let xref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+    std::fs::write(path, bytes).unwrap();
+}
+
+fn depth_accepted_transition_case(kind: &str, export: bool) {
+    // Keep the path-scoped in-process PDF worker registered until App and every
+    // outstanding PDF request have dropped, as in collection-return fixtures.
+    let mut _pdf_backend = None;
+    let mut app = setup_app_for_test();
+    app.initialized = true;
+    app.indexer_init.mark_unavailable_if_not_ready();
+    app.settings.sidecar_backup_enabled = false;
+    app.settings.tag_sidecar_backup_enabled = false;
+    app.settings.auto_fullscreen_image_folders = true;
+    app.settings.auto_fullscreen_zip_pdf = true;
+    app.settings.book_nav_resume = crate::settings::ResumeMode::FromStart;
+    let ctx = egui::Context::default();
+    crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
+    let nav_root = app.tmp.path().join("depth-accepted-transition");
+    let current = nav_root.join("a");
+    std::fs::create_dir_all(&current).unwrap();
+    save_portrait(&current.join("old.png"), [90, 100, 110]);
+    let target = match kind {
+        "folder" => {
+            let target = nav_root.join("b");
+            std::fs::create_dir(&target).unwrap();
+            save_portrait(&target.join("new.png"), [110, 120, 130]);
+            target
+        }
+        "zip" => {
+            let target = nav_root.join("b.zip");
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&target).unwrap());
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            zip.start_file("new.png", options).unwrap();
+            std::io::copy(
+                &mut std::fs::File::open(current.join("old.png")).unwrap(),
+                &mut zip,
+            )
+            .unwrap();
+            zip.finish().unwrap();
+            target
+        }
+        "pdf" => {
+            let target = nav_root.join("b.pdf");
+            depth_transition_pdf(&target);
+            target
+        }
+        _ => unreachable!(),
+    };
+    if kind == "pdf" {
+        _pdf_backend = Some(crate::pdf_loader::RemotePdfTestBackend::for_path(&target));
+    }
+    super::depth_view_tests::install_pages(&mut app, &ctx);
+    let main_generation = app.items_generation;
+    let owner = app.build_active_context_for_test(Some(88_995), DetachedSource::Book, |owner| {
+        super::depth_view_tests::install_pages(owner, &ctx);
+        owner.current_folder = Some(current.clone());
+        owner.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+        owner.detached_viewer_independent_active = true;
+        if export {
+            super::depth_view_tests::install_ready_depth_for_export(owner);
+        }
+    });
+    app.depth_setup
+        .set_status_for_test(crate::addon::AddonStatus::Missing);
+    app.with_viewer_context(owner, |mounted| {
+        mounted.mark_active_detached_viewport_rendered(&ctx);
+        assert!(!mounted.active_detached_transition_outstanding());
+        if export {
+            super::depth_view_tests::record_ready_display(mounted, &ctx);
+            assert!(mounted.capture_depth_export(&ctx, true).is_some());
+        }
+        let enumeration_export_capture =
+            export.then(|| mounted.capture_depth_export(&ctx, true).unwrap());
+        mounted.start_folder_nav(current.clone(), true, FolderNavMode::Fullscreen);
+        assert!(mounted.active_detached_transition_outstanding());
+        if export {
+            mounted.open_depth_export(&ctx, 0);
+        } else {
+            mounted.toggle_depth_parallax(&ctx, 0);
+        }
+        assert!(!mounted.depth_export_dialog_open());
+        assert!(!mounted.depth_setup.dialog_open_for_test());
+        assert_eq!(
+            mounted.fs_feedback_toast.as_ref().unwrap().0,
+            "読み込みが終わってから使ってください"
+        );
+        let mut result = None;
+        wait_until(
+            "accepted depth folder-nav result",
+            std::time::Duration::from_secs(10),
+            || {
+                result = mounted.poll_folder_nav();
+                result.is_some()
+            },
+        );
+        let result = result.unwrap();
+        assert_eq!(result.target.as_ref().unwrap().logical_source(), target);
+        mounted.apply_folder_nav_result(&ctx, result);
+        // Enumeration is a continuation of the accepted request, not a new modal.
+        if kind == "zip" {
+            assert!(mounted.zip_enumerate_pending.is_some());
+        }
+        if kind == "pdf" {
+            assert!(mounted.pdf_enumerate_pending.is_some());
+        }
+        if kind != "folder" {
+            assert!(mounted.active_detached_transition_outstanding());
+            // The normal reopen path has retired the old viewer; D cannot acquire
+            // a model modal from that no-image interval. Do not restore stale items.
+            assert!(mounted.fullscreen_idx.is_none());
+            mounted.toggle_depth_parallax(&ctx, 0);
+            assert!(!mounted.depth_setup.dialog_open_for_test());
+            assert!(!mounted.depth_export_dialog_open());
+            if let Some(capture) = enumeration_export_capture {
+                // A capture accepted from the last image can outlive its paint.
+                // Exercise its actual admission owner during enumeration too.
+                mounted.admit_depth_export(&ctx, capture);
+                assert_eq!(
+                    mounted.fs_feedback_toast.as_ref().unwrap().0,
+                    "読み込みが終わってから使ってください"
+                );
+                assert!(!mounted.depth_export_dialog_open());
+            }
+            assert!(
+                !mounted.document_open_modal_admission_blocked(),
+                "accepted enumeration must be free to finish"
+            );
+        }
+        let reopen_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+                mounted.poll_zip_enumerate();
+                mounted.poll_pdf_enumerate();
+                mounted.poll_sidecar_restore(&ctx);
+                mounted.finish_page_identity_preparation_for_test();
+                // PDF's deferred reopen can transfer to the ordinary document
+                // composition/read owner after enumeration. Poll that owner as
+                // update_active_viewer_context does; sidecar polling alone cannot
+                // adopt its projection or consume the retained fullscreen open.
+                mounted.poll_book_composition_read(&ctx);
+                if mounted.fullscreen_idx.is_some()
+                    && mounted.zip_enumerate_pending.is_none()
+                    && mounted.pdf_enumerate_pending.is_none()
+                    && !mounted.sidecar_restore_active()
+                {
+                    mounted.mark_active_detached_viewport_rendered(&ctx);
+                }
+                if mounted.fullscreen_idx.is_some()
+                    && mounted.current_folder.as_deref() == Some(target.as_path())
+                    && !mounted.active_detached_transition_outstanding()
+                    && !mounted.sidecar_restore_active()
+                {
+                    break;
+                }
+                assert!(std::time::Instant::now() < reopen_deadline,
+                    "{kind}: accepted transition did not reopen: folder={:?}, idx={:?}, rows={}, pdf_pending={}, zip_pending={}, hydration={}, composition_pending={}, deferred_reopen={}, outstanding={}, feedback={:?}",
+                    mounted.current_folder, mounted.fullscreen_idx, mounted.items.len(),
+                    mounted.pdf_enumerate_pending.is_some(), mounted.zip_enumerate_pending.is_some(),
+                    mounted.sidecar_restore_active(), mounted.book_composition.is_pending(),
+                    mounted.fs_nav_after_pdf_enumerate.is_some(), mounted.active_detached_transition_outstanding(),
+                    mounted.fs_feedback_toast);
+                std::thread::yield_now();
+        }
+        assert_eq!(mounted.edit_request_owner_context(), owner);
+        assert_eq!(mounted.active_detached_window_id(), Some(88_995));
+        assert_eq!(
+            mounted.viewer_presentation,
+            ViewerPresentation::DetachedWindow
+        );
+        assert_eq!(mounted.fullscreen_idx, Some(0));
+        assert!(!mounted.active_detached_window_is_closing());
+        assert!(!mounted.depth_setup.dialog_open_for_test());
+        assert!(!mounted.depth_export_dialog_open());
+        // Positive control: with the continuation gone the same window can start a modal.
+        mounted
+            .depth_setup
+            .set_status_for_test(crate::addon::AddonStatus::Missing);
+        mounted.toggle_depth_parallax(&ctx, 0);
+        assert!(mounted.depth_setup.confirming_for_test());
+        assert_eq!(mounted.depth_setup.dialog_owner_context(), Some(owner));
+    })
+    .unwrap();
+    assert_eq!(app.items_generation, main_generation);
+    assert_eq!(app.fullscreen_idx, Some(0));
+    assert_eq!(app.active_viewer_context_id(), Some(owner));
+}
+
+#[test]
+fn multiwindow_depth_accepted_folder_transition_rejects_entry_and_export_then_reopens_same_context()
+{
+    for export in [false, true] {
+        depth_accepted_transition_case("folder", export);
+    }
+}
+#[test]
+fn multiwindow_depth_accepted_zip_transition_rejects_entry_and_export_then_reopens_same_context() {
+    for export in [false, true] {
+        depth_accepted_transition_case("zip", export);
+    }
+}
+#[test]
+fn multiwindow_depth_accepted_pdf_transition_rejects_entry_and_export_then_reopens_same_context() {
+    for export in [false, true] {
+        depth_accepted_transition_case("pdf", export);
+    }
 }

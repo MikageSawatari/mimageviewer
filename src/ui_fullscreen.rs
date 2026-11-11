@@ -43590,7 +43590,8 @@ impl App {
         fs_render_perf: &mut Option<FsRenderPerfRecorder>,
     ) {
         // Own manual navigation and slideshow timers at their common boundary.
-        // OS close still reaches teardown and cancels only the owning export.
+        // Accepted OS close reaches teardown; the independent modal owner is
+        // protected earlier by accept_active_detached_window_close.
         if (self.depth_export_dialog_open()
             || self.depth_independent_addon_modal_owner()
                 == Some(self.edit_request_owner_context()))

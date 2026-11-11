@@ -23,6 +23,7 @@ struct ChildDepthPass {
     commands: std::rc::Rc<std::cell::RefCell<Vec<(egui::ViewportId, bool)>>>,
     actual_ppp: std::rc::Rc<std::cell::Cell<f32>>,
     depth_painted: std::rc::Rc<std::cell::Cell<bool>>,
+    receipt_context: std::rc::Rc<std::cell::Cell<ViewerContextId>>,
     modal_layers: std::rc::Rc<std::cell::RefCell<DepthModalLayers>>,
 }
 
@@ -103,6 +104,9 @@ impl RootDepthViewer {
             commands: Default::default(),
             actual_ppp: Default::default(),
             depth_painted: Default::default(),
+            receipt_context: std::rc::Rc::new(std::cell::Cell::new(
+                app.edit_request_owner_context(),
+            )),
             modal_layers: Default::default(),
         };
         let events = child.events.clone();
@@ -114,7 +118,7 @@ impl RootDepthViewer {
         let commands = child.commands.clone();
         let actual_ppp = child.actual_ppp.clone();
         let depth_painted = child.depth_painted.clone();
-        let receipt_context = app.edit_request_owner_context();
+        let receipt_context = child.receipt_context.clone();
         let modal_layers = child.modal_layers.clone();
         egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
             passes.set(passes.get() + 1);
@@ -154,7 +158,7 @@ impl RootDepthViewer {
                     depth_painted.set(
                         crate::app::depth_export::display_painted_this_pass_for_test(
                             ui.ctx(),
-                            receipt_context,
+                            receipt_context.get(),
                         ),
                     );
                     *modal_layers.borrow_mut() = depth_modal_layers(ui.ctx());
@@ -264,7 +268,9 @@ impl RootDepthViewer {
         mut before: impl FnMut(&mut App, &egui::Context),
     ) {
         app.frame_counter += 1;
+        self.context = app.edit_request_owner_context();
         let events = if let Some(child) = &self.child {
+            child.receipt_context.set(self.context);
             child.size.set(self.size);
             child.shapes.borrow_mut().clear();
             child.depth_painted.set(false);
@@ -950,8 +956,8 @@ fn depth_top_button_color_matches_the_context_and_session_entry_matrix() {
                 }).unwrap();
             }
         }
-        assert_eq!(crate::depth_parallax::DepthEntryBlock::Detached.message(),
-            "3D 写真は、メインの画像表示と F12 の別ウィンドウで使えます");
+        assert_eq!(crate::depth_parallax::DepthEntryBlock::OtherWindow.message(),
+            "3D 写真は別のウィンドウで表示中です。そちらを終了してから使ってください");
         crate::key_input::clear_test_frame();
     }).join().unwrap();
 }

@@ -442,7 +442,11 @@ fn depth_linked_dialogs_draw_only_in_main_context_and_return_to_root_after_close
             viewer.frame(&mut app, vec![]);
             viewer.label(heading);
             app.with_viewer_context(sibling, |owner| {
-                assert!(!owner.mounted_viewer_owns_depth_dialogs());
+                assert!(!if addon {
+                    owner.depth_addon_dialog_in_mounted_viewer()
+                } else {
+                    owner.depth_export_dialog_in_mounted_viewer()
+                });
                 let before = viewer.child_passes();
                 viewer.frame(owner, vec![]);
                 viewer.frame(owner, vec![]);
@@ -456,7 +460,11 @@ fn depth_linked_dialogs_draw_only_in_main_context_and_return_to_root_after_close
                 );
             })
             .unwrap();
-            assert!(app.mounted_viewer_owns_depth_dialogs());
+            assert!(if addon {
+                app.depth_addon_dialog_in_mounted_viewer()
+            } else {
+                app.depth_export_dialog_in_mounted_viewer()
+            });
             viewer.frame(&mut app, vec![]);
             viewer.label(heading);
             app.close_fullscreen();
@@ -519,4 +527,144 @@ fn depth_linked_dialogs_draw_only_in_main_context_and_return_to_root_after_close
     })
     .join()
     .unwrap();
+}
+
+#[test]
+fn depth_independent_export_all_phases_protect_owner_and_allow_sibling_close() {
+    for phase in 0..4 {
+        let mut app = setup_app_for_test();
+        let ctx = egui::Context::default();
+        crate::app::depth_view_tests::install_pages(&mut app, &ctx);
+        app.push_window_context_for_test(&ctx, 88_990, |owner| {
+            crate::app::depth_view_tests::install_pages(owner, &ctx);
+        });
+        let child =
+            app.build_active_context_for_test(Some(88_991), DetachedSource::Image, |owner| {
+                crate::app::depth_view_tests::install_pages(owner, &ctx);
+                owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+                owner.detached_viewer_independent_active = true;
+                crate::app::depth_view_tests::install_ready_depth_for_export(owner);
+            });
+        app.with_viewer_context(child, |owner| {
+            owner.mark_active_detached_viewport_rendered(&ctx);
+            let FsExclusiveView::Depth(state) = &owner.fs_exclusive_view else {
+                unreachable!()
+            };
+            let paint_pass = ctx.cumulative_pass_nr();
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    snapshot_id(child),
+                    DisplaySnapshot {
+                        resource_id: state.ready().unwrap().resource_id,
+                        paint_pass,
+                        page_idx: 0,
+                        items_generation: owner.items_generation,
+                        uv: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1., 1.)),
+                        quarter_turns: 0,
+                        paint_size: egui::vec2(200., 300.),
+                        underlay: crate::ui_fullscreen::FsBgStyle::Solid(egui::Color32::BLACK),
+                    },
+                )
+            });
+            owner.open_depth_export(&ctx, 0);
+        })
+        .unwrap();
+        assert_eq!(app.depth_export_owner_context(), Some(child));
+        let mut _events = None;
+        if phase == 1 || phase == 2 {
+            let (job, events, _) = DepthExportJob::controlled_for_test();
+            _events = Some(events);
+            app.depth_export_operation.as_mut().unwrap().phase = Phase::Running {
+                job,
+                completed: 0,
+                total: 4,
+                status: if phase == 1 {
+                    RunStatus::Active
+                } else {
+                    RunStatus::Stopping
+                },
+            };
+        } else if phase == 3 {
+            app.depth_export_operation.as_mut().unwrap().phase = Phase::Finished {
+                message: "完了".into(),
+                failed: false,
+            };
+        }
+        crate::app::depth_setup_entry_tests::assert_independent_modal_protection(
+            &mut app, &ctx, child, 88_991, 88_990,
+        );
+    }
+}
+
+#[test]
+fn depth_first_pass_in_new_context_cannot_read_previous_panel_or_export_snapshot() {
+    let ctx = egui::Context::default();
+    let mut app = setup_app_for_test();
+    crate::app::depth_view_tests::install_pages(&mut app, &ctx);
+    crate::app::depth_view_tests::install_ready_depth_for_export(&mut app);
+    let main = app.viewer_context_main();
+    let resource = match &app.fs_exclusive_view {
+        FsExclusiveView::Depth(state) => state.ready().unwrap().resource_id,
+        _ => unreachable!(),
+    };
+    let panel = egui::Rect::from_min_size(egui::pos2(100., 100.), egui::vec2(300., 400.));
+    let paint_pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|data| {
+        data.insert_temp(app.depth_panel_rect_id(), panel);
+        data.insert_temp(
+            snapshot_id(main),
+            DisplaySnapshot {
+                resource_id: resource,
+                paint_pass,
+                page_idx: 0,
+                items_generation: app.items_generation,
+                uv: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1., 1.)),
+                quarter_turns: 0,
+                paint_size: panel.size(),
+                underlay: crate::ui_fullscreen::FsBgStyle::Solid(egui::Color32::BLACK),
+            },
+        );
+    });
+    assert!(app.capture_depth_export(&ctx, true).is_some());
+    app.set_fs_exclusive_view(FsExclusiveView::None, "previous_context_finished");
+    let child = app.build_active_context_for_test(Some(88_992), DetachedSource::Image, |owner| {
+        crate::app::depth_view_tests::install_pages(owner, &ctx);
+        owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+        owner.detached_viewer_independent_active = true;
+        crate::app::depth_view_tests::install_ready_depth_for_export(owner);
+    });
+    app.with_viewer_context(child, |owner| {
+        assert_ne!(
+            owner.depth_panel_rect_id(),
+            egui::Id::unique(("depth_panel_rect", main))
+        );
+        assert!(
+            ctx.data(|data| data.get_temp::<egui::Rect>(owner.depth_panel_rect_id()))
+                .is_none()
+        );
+        assert!(
+            ctx.data(|data| data.get_temp::<DisplaySnapshot>(snapshot_id(child)))
+                .is_none()
+        );
+        // Match the resource identity too: isolation is the id's context component,
+        // not accidental rejection of a stale GPU resource id or generation.
+        let child_resource = match &owner.fs_exclusive_view {
+            FsExclusiveView::Depth(state) => state.ready().unwrap().resource_id,
+            _ => unreachable!(),
+        };
+        ctx.data_mut(|data| {
+            let mut previous: DisplaySnapshot = data.get_temp(snapshot_id(main)).unwrap();
+            previous.resource_id = child_resource;
+            previous.items_generation = owner.items_generation;
+            data.insert_temp(snapshot_id(main), previous);
+        });
+        assert!(owner.capture_depth_export(&ctx, true).is_none());
+        owner.open_depth_export(&ctx, 0);
+        assert!(!owner.depth_export_dialog_open());
+    })
+    .unwrap();
+    assert_eq!(
+        ctx.data(|data| data.get_temp::<egui::Rect>(app.depth_panel_rect_id())),
+        Some(panel)
+    );
 }
