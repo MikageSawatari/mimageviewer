@@ -13,7 +13,6 @@ use gilrs::{Axis, Button, EventType, Gilrs};
 /// 入力イベントキューの上限。UI が長時間 drain しない (最小化 / 長 stall) と無制限に
 /// 溜まってメモリスパイク / 復帰時ヒッチになるため上限を設ける。溢れたときは **最古** を
 /// 捨てて最新を残す (= release / disconnect / 中立軸 などの重要イベントを失わない)。
-#[cfg(not(test))]
 const GAMEPAD_EVENT_CAP: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -90,6 +89,106 @@ pub(crate) struct PadEventReceipt {
     pub(crate) accepted: bool,
 }
 
+/// Both producers observe foreground once, validate that observation, then make
+/// receipts under the same queue/capacity contract.
+fn enqueue_pad_events(
+    queue: &Mutex<VecDeque<PadEventReceipt>>,
+    events: &[PadEvent],
+    validate: impl FnOnce(Option<u64>) -> Result<(), String>,
+) -> Result<(), String> {
+    let foreground = foreground_app_hwnd();
+    validate(foreground)?;
+    let mut queue = queue.lock().unwrap_or_else(|e| e.into_inner());
+    for &event in events {
+        if queue.len() >= GAMEPAD_EVENT_CAP {
+            queue.pop_front();
+        }
+        queue.push_back(PadEventReceipt::new(event, foreground));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum GamepadReader {
+    Physical,
+    #[cfg(any(test, feature = "test-script"))]
+    Script,
+    #[default]
+    Stopped,
+}
+
+fn desired_reader(enabled: bool, script_active: bool) -> GamepadReader {
+    if !enabled {
+        return GamepadReader::Stopped;
+    }
+    #[cfg(any(test, feature = "test-script"))]
+    if script_active {
+        return GamepadReader::Script;
+    }
+    let _ = script_active;
+    GamepadReader::Physical
+}
+
+#[cfg(any(test, feature = "test-script"))]
+#[derive(Debug, Default)]
+pub(crate) struct ScriptPadCounters {
+    injected: std::sync::atomic::AtomicU64,
+    drained: std::sync::atomic::AtomicU64,
+    discarded: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(any(test, feature = "test-script"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ScriptPadCounts {
+    pub(crate) injected: u64,
+    pub(crate) drained: u64,
+    pub(crate) discarded: u64,
+}
+
+#[cfg(any(test, feature = "test-script"))]
+impl ScriptPadCounters {
+    pub(crate) fn snapshot(&self) -> ScriptPadCounts {
+        ScriptPadCounts {
+            injected: self.injected.load(Ordering::Acquire),
+            drained: self.drained.load(Ordering::Acquire),
+            discarded: self.discarded.load(Ordering::Acquire),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-script"))]
+#[derive(Clone, Debug)]
+pub(crate) struct ScriptPadAck {
+    pub(crate) counters: Arc<ScriptPadCounters>,
+    pub(crate) injected: u64,
+    pub(crate) discarded: u64,
+}
+
+#[cfg(any(test, feature = "test-script"))]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ScriptPadSnapshot {
+    pub(crate) enabled: bool,
+    pub(crate) foreground: bool,
+    pub(crate) reader: &'static str,
+    pub(crate) injected: u64,
+    pub(crate) drained: u64,
+    pub(crate) discarded: u64,
+}
+
+#[cfg(any(test, feature = "test-script"))]
+impl Default for ScriptPadSnapshot {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            foreground: false,
+            reader: "stopped",
+            injected: 0,
+            drained: 0,
+            discarded: 0,
+        }
+    }
+}
+
 impl PadEventReceipt {
     pub(crate) fn new(event: PadEvent, foreground: Option<u64>) -> Self {
         Self {
@@ -108,7 +207,9 @@ pub struct GamepadRuntime {
     shutdown: Arc<AtomicBool>,
     #[cfg(not(test))]
     handle: Option<std::thread::JoinHandle<()>>,
-    started: bool,
+    reader: GamepadReader,
+    #[cfg(any(test, feature = "test-script"))]
+    script_counters: Arc<ScriptPadCounters>,
 }
 
 impl Default for GamepadRuntime {
@@ -124,7 +225,9 @@ impl GamepadRuntime {
             shutdown: Arc::new(AtomicBool::new(false)),
             #[cfg(not(test))]
             handle: None,
-            started: false,
+            reader: GamepadReader::Stopped,
+            #[cfg(any(test, feature = "test-script"))]
+            script_counters: Arc::default(),
         }
     }
 
@@ -142,7 +245,77 @@ impl GamepadRuntime {
         }
         self.ensure_started(ctx);
         let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
-        q.drain(..).collect()
+        let events: Vec<_> = q.drain(..).collect();
+        #[cfg(any(test, feature = "test-script"))]
+        if self.reader == GamepadReader::Script {
+            self.script_counters
+                .drained
+                .fetch_add(events.len() as u64, Ordering::Release);
+        }
+        events
+    }
+
+    #[cfg(any(test, feature = "test-script"))]
+    pub(crate) fn inject_script_events(
+        &mut self,
+        ctx: &egui::Context,
+        enabled: bool,
+        events: &[PadEvent],
+    ) -> Result<ScriptPadAck, String> {
+        if enabled {
+            self.ensure_started_with(ctx, true);
+        }
+        enqueue_pad_events(&self.queue, events, |foreground| {
+            if !enabled
+                || (foreground.is_none()
+                    && events
+                        .iter()
+                        .any(|event| matches!(event, PadEvent::ButtonPressed(_))))
+            {
+                return Err(format!(
+                    "environment: gamepad requires enabled and presses require foreground; enabled={enabled} foreground={} reader={} injected={} drained={} discarded={}; wait_until(|s| s.gamepad.foreground, ms)",
+                    foreground.is_some(),
+                    self.reader_name(),
+                    self.script_counters.snapshot().injected,
+                    self.script_counters.snapshot().drained,
+                    self.script_counters.snapshot().discarded
+                ));
+            }
+            Ok(())
+        })?;
+        let injected = self
+            .script_counters
+            .injected
+            .fetch_add(events.len() as u64, Ordering::Release)
+            + events.len() as u64;
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+        Ok(ScriptPadAck {
+            counters: Arc::clone(&self.script_counters),
+            injected,
+            discarded: self.script_counters.discarded.load(Ordering::Acquire),
+        })
+    }
+
+    #[cfg(any(test, feature = "test-script"))]
+    fn reader_name(&self) -> &'static str {
+        match self.reader {
+            GamepadReader::Physical => "physical",
+            GamepadReader::Script => "script",
+            GamepadReader::Stopped => "stopped",
+        }
+    }
+
+    #[cfg(any(test, feature = "test-script"))]
+    pub(crate) fn script_snapshot(&self, enabled: bool) -> ScriptPadSnapshot {
+        let counts = self.script_counters.snapshot();
+        ScriptPadSnapshot {
+            enabled,
+            foreground: foreground_app_hwnd().is_some(),
+            reader: self.reader_name(),
+            injected: counts.injected,
+            drained: counts.drained,
+            discarded: counts.discarded,
+        }
     }
 
     /// 設定から drain までの配線を見るテスト用。デバイス無しで 1 件流し込む。
@@ -169,31 +342,60 @@ impl GamepadRuntime {
     }
 
     fn stop(&mut self) {
-        if !self.started {
-            return;
-        }
-        self.started = false;
-        self.shutdown.store(true, Ordering::Relaxed);
-        self.shutdown = Arc::new(AtomicBool::new(false));
-        #[cfg(not(test))]
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+        let was_running = self.reader != GamepadReader::Stopped;
+        self.reader = desired_reader(false, false);
+        if was_running {
+            self.shutdown.store(true, Ordering::Relaxed);
+            self.shutdown = Arc::new(AtomicBool::new(false));
+            #[cfg(not(test))]
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
         }
         let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(any(test, feature = "test-script"))]
+        self.script_counters
+            .discarded
+            .fetch_add(q.len() as u64, Ordering::Release);
         q.clear();
     }
 
     #[cfg(test)]
-    fn ensure_started(&mut self, _ctx: &egui::Context) {
-        self.started = true;
+    fn ensure_started(&mut self, ctx: &egui::Context) {
+        self.ensure_started_with(ctx, self.reader == GamepadReader::Script);
     }
 
     #[cfg(not(test))]
     fn ensure_started(&mut self, ctx: &egui::Context) {
-        if self.started {
+        #[cfg(all(windows, feature = "test-script"))]
+        let script_active = crate::test_script::is_active();
+        #[cfg(not(all(windows, feature = "test-script")))]
+        let script_active = false;
+        self.ensure_started_with(ctx, script_active);
+    }
+
+    fn ensure_started_with(&mut self, ctx: &egui::Context, script_active: bool) {
+        let desired = desired_reader(true, script_active);
+        if self.reader == desired {
             return;
         }
-        self.started = true;
+        if self.reader != GamepadReader::Stopped {
+            self.stop();
+        }
+        self.reader = desired;
+        #[cfg(any(test, feature = "test-script"))]
+        if desired == GamepadReader::Script {
+            crate::logger::log("[gamepad] script reader: gilrs thread disabled");
+            return;
+        }
+        #[cfg(test)]
+        let _ = ctx;
+        #[cfg(not(test))]
+        self.start_physical(ctx);
+    }
+
+    #[cfg(not(test))]
+    fn start_physical(&mut self, ctx: &egui::Context) {
         let queue = Arc::clone(&self.queue);
         let shutdown = Arc::clone(&self.shutdown);
         let repaint_ctx = ctx.clone();
@@ -212,13 +414,7 @@ impl GamepadRuntime {
                     let mut sent_any = false;
                     while let Some(event) = gilrs.next_event() {
                         if let Some(mapped) = map_gilrs_event(event.event) {
-                            let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
-                            // 満杯時は最古を捨てて最新を残す (release/disconnect/中立軸を守る)。
-                            if q.len() >= GAMEPAD_EVENT_CAP {
-                                q.pop_front();
-                            }
-                            q.push_back(PadEventReceipt::new(mapped, foreground_app_hwnd()));
-                            drop(q);
+                            let _ = enqueue_pad_events(&queue, &[mapped], |_| Ok(()));
                             sent_any = true;
                         }
                     }
@@ -773,6 +969,146 @@ mod tests {
     };
     use std::sync::atomic::Ordering;
 
+    #[test]
+    fn pad_producer_observes_foreground_and_preserves_latest_256_receipts() {
+        let foreground = crate::test_native_focus::scoped(1, 2, false);
+        let queue = std::sync::Mutex::new(std::collections::VecDeque::new());
+        super::enqueue_pad_events(
+            &queue,
+            &[PadEvent::ButtonPressed(PadButton::South)],
+            |observed| {
+                assert!(observed.is_none());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!queue.lock().unwrap()[0].accepted);
+        drop(foreground);
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        let mut changed_foreground = None;
+        let mut events = vec![PadEvent::Connected; 255];
+        events.push(PadEvent::Disconnected);
+        super::enqueue_pad_events(&queue, &events, |observed| {
+            assert!(observed.is_some());
+            // Changing focus after validation cannot change these receipts.
+            changed_foreground = Some(crate::test_native_focus::scoped(2, 2, false));
+            Ok(())
+        })
+        .unwrap();
+        let queue = queue.lock().unwrap();
+        assert_eq!(queue.len(), 256);
+        assert!(queue.iter().all(|receipt| receipt.accepted));
+        assert_eq!(queue.back().unwrap().event, PadEvent::Disconnected);
+        assert!(super::foreground_app_hwnd().is_none());
+    }
+
+    #[test]
+    fn pad_script_reader_decision_is_shared_and_stop_discards_without_ack() {
+        assert_eq!(
+            super::desired_reader(true, true),
+            super::GamepadReader::Script
+        );
+        assert_eq!(
+            super::desired_reader(true, false),
+            super::GamepadReader::Physical
+        );
+        assert_eq!(
+            super::desired_reader(false, true),
+            super::GamepadReader::Stopped
+        );
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        let ctx = egui::Context::default();
+        let mut runtime = GamepadRuntime::new();
+        runtime.ensure_started_with(&ctx, true);
+        assert_eq!(runtime.reader, super::GamepadReader::Script);
+        let ack = runtime
+            .inject_script_events(&ctx, true, &[PadEvent::Connected, PadEvent::Disconnected])
+            .unwrap();
+        assert_eq!(ack.injected, 2);
+        assert_eq!(ack.counters.snapshot().drained, 0);
+        assert!(runtime.drain(&ctx, false).is_empty());
+        assert_eq!(runtime.reader, super::GamepadReader::Stopped);
+        assert_eq!(
+            ack.counters.snapshot(),
+            super::ScriptPadCounts {
+                injected: 2,
+                drained: 0,
+                discarded: 2
+            }
+        );
+        runtime.stop();
+        assert_eq!(ack.counters.snapshot().discarded, 2);
+    }
+
+    #[test]
+    fn pad_script_counters_count_receipts_once_and_are_per_runtime() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        let ctx = egui::Context::default();
+        let mut first = GamepadRuntime::new();
+        let second = GamepadRuntime::new();
+        let ack = first
+            .inject_script_events(
+                &ctx,
+                true,
+                &[
+                    PadEvent::Connected,
+                    PadEvent::AxisChanged(PadAxis::LeftX, 0.4),
+                ],
+            )
+            .unwrap();
+        assert_eq!(first.drain(&ctx, true).len(), 2);
+        assert!(first.drain(&ctx, true).is_empty());
+        assert_eq!(
+            ack.counters.snapshot(),
+            super::ScriptPadCounts {
+                injected: 2,
+                drained: 2,
+                discarded: 0
+            }
+        );
+        assert_eq!(
+            second.script_counters.snapshot(),
+            super::ScriptPadCounts::default()
+        );
+    }
+
+    #[test]
+    fn pad_script_preconditions_reject_disabled_and_background_presses_only() {
+        let _foreground = crate::test_native_focus::scoped(1, 2, false);
+        let ctx = egui::Context::default();
+        let mut runtime = GamepadRuntime::new();
+        assert!(
+            runtime
+                .inject_script_events(&ctx, false, &[PadEvent::Connected])
+                .unwrap_err()
+                .contains("enabled=false")
+        );
+        assert_eq!(runtime.reader, super::GamepadReader::Stopped);
+        assert!(
+            runtime
+                .inject_script_events(&ctx, true, &[PadEvent::ButtonPressed(PadButton::South)])
+                .unwrap_err()
+                .contains("foreground=false")
+        );
+        assert!(runtime.queue.lock().unwrap().is_empty());
+        let ack = runtime
+            .inject_script_events(
+                &ctx,
+                true,
+                &[
+                    PadEvent::ButtonReleased(PadButton::South),
+                    PadEvent::AxisChanged(PadAxis::LeftX, 0.0),
+                    PadEvent::Connected,
+                    PadEvent::Disconnected,
+                ],
+            )
+            .unwrap();
+        let receipts = runtime.drain(&ctx, true);
+        assert_eq!(receipts.len(), 4);
+        assert!(receipts.iter().all(|receipt| !receipt.accepted));
+        assert_eq!(ack.counters.snapshot().drained, 4);
+    }
+
     /// 無効にしたら、読むのをやめる。
     ///
     /// 読んだ結果を捨てるだけでは足りない: gilrs スレッドは入力のたびに repaint を
@@ -783,7 +1119,11 @@ mod tests {
         let mut runtime = GamepadRuntime::new();
 
         assert!(runtime.drain(&ctx, true).is_empty());
-        assert!(runtime.started, "有効なら読み取りを始める");
+        assert_eq!(
+            runtime.reader,
+            super::GamepadReader::Physical,
+            "有効なら読み取りを始める"
+        );
 
         // 停止前に届いていた分は配らない。無効にした後で古い入力が 1 回流れると、
         // 「切ったのに動いた」になる。
@@ -796,7 +1136,11 @@ mod tests {
                 Some(1),
             ));
         assert!(runtime.drain(&ctx, false).is_empty());
-        assert!(!runtime.started, "無効なら読み取りを止める");
+        assert_eq!(
+            runtime.reader,
+            super::GamepadReader::Stopped,
+            "無効なら読み取りを止める"
+        );
         assert!(
             runtime.queue.lock().unwrap().is_empty(),
             "溜まっていた入力は捨てる"
@@ -807,7 +1151,11 @@ mod tests {
         );
 
         assert!(runtime.drain(&ctx, true).is_empty());
-        assert!(runtime.started, "有効に戻したら読み取りを再開する");
+        assert_eq!(
+            runtime.reader,
+            super::GamepadReader::Physical,
+            "有効に戻したら読み取りを再開する"
+        );
     }
 
     use crate::ring_shortcut::RingDirection;

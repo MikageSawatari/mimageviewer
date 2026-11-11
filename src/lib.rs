@@ -473,6 +473,7 @@ pub use ui_fullscreen::{
 };
 mod ui_details_icon;
 pub mod ui_helpers;
+pub mod ui_history_field;
 mod ui_main;
 pub mod ui_page_overview;
 pub mod ui_pinned_search;

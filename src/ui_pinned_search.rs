@@ -65,6 +65,8 @@ pub enum PinnedSearchAction {
     Submit(PinnedSearchKind),
     Clear(PinnedSearchKind),
     Focused(PinnedSearchKind),
+    Picked(PinnedSearchKind, usize),
+    RequestFocus(PinnedSearchKind),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -123,6 +125,8 @@ pub fn draw_pinned_search(
     focus: bool,
     enter: bool,
     drag: bool,
+    history: Option<&[String]>,
+    focus_pending: bool,
 ) -> egui::InnerResponse<SearchFieldResponse> {
     let gap = ui.spacing().item_spacing.x;
     let text_width = |text: &str, style| {
@@ -201,10 +205,18 @@ pub fn draw_pinned_search(
                             );
                             let output = ui
                                 .add_enabled_ui(enabled.is_ok(), |ui| {
-                                    let mut output = crate::ime_focus::show_singleline(
+                                    let history_output = crate::ui_history_field::show_singleline(
                                         ui,
                                         draft,
                                         Some(&mut request),
+                                        kind.input_id(),
+                                        history.unwrap_or_default(),
+                                        crate::ui_history_field::HistoryFieldOptions {
+                                            visible: history.is_some(),
+                                            availability: enabled,
+                                            focus_pending,
+                                            ..Default::default()
+                                        },
                                         |edit| {
                                             edit.id(kind.input_id())
                                                 .desired_width(width.input + TEXT_MARGIN * 2.0)
@@ -215,6 +227,10 @@ pub fn draw_pinned_search(
                                                 .margin(egui::Margin::symmetric(4, 2))
                                         },
                                     );
+                                    let mut output = history_output.text;
+                                    if history_output.focus_requested {
+                                        actions.push(PinnedSearchAction::RequestFocus(kind));
+                                    }
                                     crate::search_request::apply_select_all(
                                         ui.ctx(),
                                         draft,
@@ -249,7 +265,11 @@ pub fn draw_pinned_search(
                                     if output.response.has_focus() {
                                         actions.push(PinnedSearchAction::Focused(kind));
                                     }
-                                    if owns_submit && output.response.lost_focus() && enter {
+                                    if let Some(index) = history_output.picked {
+                                        actions.push(PinnedSearchAction::Picked(kind, index));
+                                    } else if history_output.submit_requested
+                                        || owns_submit && output.response.lost_focus() && enter
+                                    {
                                         actions.push(PinnedSearchAction::Submit(kind));
                                     }
                                     output.response.response
@@ -316,6 +336,27 @@ pub fn draw_pinned_search(
 }
 
 #[doc(hidden)]
+pub fn draw_pinned_search_history_snapshot_fixture(ui: &mut egui::Ui) {
+    ui.scope(|ui| {
+        crate::ui_main::apply_toolbar_style(ui);
+        ui.horizontal_wrapped(|ui| {
+            draw_pinned_search(
+                ui,
+                PinnedSearchKind::Container,
+                &mut "旅行".to_owned(),
+                PinnedSearchState::Applied,
+                Ok(()),
+                false,
+                false,
+                false,
+                Some(&["旅行".to_owned(), "写真集".to_owned()]),
+                false,
+            );
+        });
+    });
+}
+
+#[doc(hidden)]
 pub fn draw_pinned_search_snapshot_fixture(ui: &mut egui::Ui) {
     ui.scope(|ui| {
         crate::ui_main::apply_toolbar_style(ui);
@@ -353,6 +394,8 @@ pub fn draw_pinned_search_snapshot_fixture(ui: &mut egui::Ui) {
                     Ok(()),
                     false,
                     false,
+                    false,
+                    Some(&[]),
                     false,
                 );
             }
@@ -396,6 +439,8 @@ mod tests {
                             false,
                             false,
                             drag,
+                            None,
+                            false,
                         )
                         .inner;
                         let mut seen = render.borrow_mut();
@@ -497,6 +542,55 @@ mod tests {
         assert_eq!(shrink.input, 158.0);
         assert_eq!(shrink.width, 300.0);
     }
+
+    #[test]
+    fn section1409_history_preserves_whole_field_width_and_toolbar_wrapping() {
+        type Geometry = (egui::Rect, egui::Rect, egui::Rect, Option<egui::Rect>);
+        for width in [1120.0, 720.0, 360.0, 240.0] {
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(width, 500.0))
+                .build_ui_state(
+                    |ui, (history, rects): &mut (bool, Vec<Geometry>)| {
+                        crate::ui_main::apply_toolbar_style(ui);
+                        rects.clear();
+                        ui.horizontal_wrapped(|ui| {
+                            for kind in PinnedSearchKind::ALL {
+                                let response = draw_pinned_search(
+                                    ui,
+                                    kind,
+                                    &mut "下書き".to_owned(),
+                                    PinnedSearchState::Edited,
+                                    Ok(()),
+                                    false,
+                                    false,
+                                    false,
+                                    history.then_some(&[][..]),
+                                    false,
+                                );
+                                rects.push((
+                                    response.response.rect,
+                                    response.inner.input.rect,
+                                    response.inner.clear.rect,
+                                    response.inner.submit.map(|r| r.rect),
+                                ));
+                            }
+                        });
+                    },
+                    (false, Vec::new()),
+                );
+            harness.run();
+            let baseline = harness.state().1.clone();
+            harness.state_mut().0 = true;
+            harness.run();
+            assert_eq!(
+                harness.state().1,
+                baseline,
+                "history must fit inside the released field and section at {width}pt",
+            );
+        }
+    }
+
     #[test]
     fn section1409_real_render_fields_buttons_and_folder_fit_1120_720_360_240() {
         use std::{cell::RefCell, rc::Rc};
@@ -539,6 +633,8 @@ mod tests {
                                     Ok(()),
                                     false,
                                     false,
+                                    false,
+                                    None,
                                     false,
                                 );
                                 render.borrow_mut().push((

@@ -125,10 +125,28 @@ IPCのHWND/send/pump/packetは検索ごとの`everything-ipc` runが一括所有
 完了event/取消eventで待つ。native sendが遅くても取消は先に返し、旧runは有限deadlineで自然退役する。
 [遅いsendと取消の契約](everything-search-plan.md#17-wm_copydataの遅い送信と取消2026-10-12)。
 raw10,000件・明示送信・完了後一括採用・mainの取消可能modalを使う。
-新設定field/DB/schema/検索履歴/Remote APIは追加せず、query/result一覧は永続化・診断ログへ保存しない。
+Everything 専用DB/schema/Remote APIは追加せず、result一覧は永続化しない。query/result一覧は診断ログへ保存しない。
+検索語の永続化は §1.756 の共通入力履歴に従う（下記）。
 PDF共有poolの失効は先行改修 `4510346f5` / master `c1e66f589` のviewer-context ownerを使う。
 最新実装の独立レビューと自動/実機検証の受入は未完了。
 [仕様・履歴・検証台帳](everything-search-plan.md#14-実装記録2026-10-12検証待ち)。
+
+## 検索入力履歴と履歴欄の所有（§1.756）
+
+`Settings.search_input_history` が `PinnedSearchKind` ごとに最近 20 件を持ち、常設欄と一時バーで共有する。
+保存可否は `save_search_input_history`（既定 true）。通常の settings.db 保存へ載せ、新しいファイル・I/O・workerは足さない。
+環境設定の OK は live の履歴を引き継ぎ、オフなら現行履歴を空にする。設定の持ち運びでは履歴本体を除外する。
+世代バックアップは復旧用途として維持し、消去前の語が残ることを公開文書へ明記する。
+
+`ui_history_field` は IME helper を通す TextEdit に▼を内蔵する共有部品で、検索欄とフォルダアドレス欄が使う。
+viewport ごとの単一 `HistoryPopupState` が owner・選択位置・描画 pass を所有し、egui Popup と状態を二重化しない。
+部品は一覧の表示と選択だけを扱い、保存・検索実行・フォルダ移動は各呼び出し側が所有する。
+未フォーカス欄の▼はAppの既存pending focus claimに接続し、部品内に別の予約は持たない。
+IME helperが予約を描画前の実フォーカスへ渡し、本体facadeが同じ入力ownerのphaseを更新する。
+明示的な確定では実フォーカスと同viewport/widgetの復帰契約をIME側で一緒に終了する。
+検索履歴の記録は共通 submit の受付と、App update の一箇所で直前 pass の検索入力フォーカスから判定する通常離脱だけ。
+非同期結果の到着や個々の欄の lost_focus では記録しない。ログ・Remote・MCPの出力境界には履歴を公開しない。
+詳細は [入力履歴の設計](search-input-history-plan.md)。
 
 ## PDF render epochのviewer-context所有（§1.377）
 

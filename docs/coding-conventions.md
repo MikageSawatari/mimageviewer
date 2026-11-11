@@ -140,6 +140,12 @@ focus 復帰は `lost_focus()`、pointer 無しの key press、他 widget の fo
 helper の retry は viewport / widget ごとに次 pass 限りで、`lost_focus()` 以外の同条件を満たし
 欄が focus を持たない場合だけ使う。初回要求用の呼び出し側 latch には書き込まない。
 pointer 入力や他 widget への正当な focus 移動を優先する。
+
+履歴の▼からの予約はAppの既存 `pending_text_input_focus` だけに保持する。IME helperの
+`activate_reserved_focus` が受理済みの予約を描画前に実フォーカスへ渡し、begin-passの矢印移動を終端する。
+本体facadeは同じkeyboard ownerのphaseだけをFocusedへ進め、同じ要求を描画後に再投入しない。
+明示的な確定は `claim_text_input_submit` からIME helperの `end_text_input` を通し、
+同viewport・widgetのフォーカスと復帰契約を一緒に終了する。他欄・他viewportの契約は残す。
 raw TextEdit は理由付き allowlist を検査する unit test で禁止している。TSF を採用しない理由、
 IMM32 の 2 経路と未対応範囲の正本は [src/ime_focus.rs](../src/ime_focus.rs) の helper doc comment を参照。
 

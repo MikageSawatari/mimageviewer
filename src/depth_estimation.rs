@@ -181,9 +181,23 @@ pub(crate) struct DepthWorker {
     queue: Arc<Queue>,
 }
 
+#[cfg(test)]
+thread_local! {
+    // Observe the real UI-thread submission, including its repaint destination.
+    static LAST_TEST_SUBMISSION: std::cell::Cell<Option<(ViewerContextId, egui::ViewportId, DepthSourceKey)>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
 type Estimate = dyn Fn(&DepthRequest) -> Result<DepthMap, String> + Send + 'static;
 
 impl DepthWorker {
+    #[cfg(test)]
+    pub(crate) fn take_submission_for_test()
+    -> Option<(ViewerContextId, egui::ViewportId, DepthSourceKey)> {
+        LAST_TEST_SUBMISSION.with(|submission| submission.take())
+    }
+
     pub(crate) fn shared() -> Result<&'static Self, String> {
         static WORKER: OnceLock<Result<DepthWorker, String>> = OnceLock::new();
         WORKER
@@ -251,6 +265,8 @@ impl DepthWorker {
             _activity: activity,
             input_seq,
         });
+        #[cfg(test)]
+        LAST_TEST_SUBMISSION.with(|submission| submission.set(Some((context, viewport, key))));
         if let Some(old) = &old {
             old.cancel.store(true, Ordering::Release);
         }
