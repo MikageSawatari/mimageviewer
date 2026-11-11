@@ -2527,6 +2527,16 @@ ScrollArea の外に見え、本文が末尾まで届く高さ検査。UI スナ
      マウス追従が凍結しない、タッチがページ送り」を確かめる。持ち越すと分かった場合は、Area の id を
      折りたたみ状態ごとに分けるなど、**描く矩形自体を正しくする**側で直す (読む側で矩形を削る補正はしない)。
    - 切り替えたその pass は、クリックがパネル内なので背面に渡らない (従来どおり)。
+   - **実装で分かったこと (2026-11-11)**: Area の返す矩形と保存する大きさはその pass の中身から決まるが、egui の当たり判定は
+     **前の pass に登録された widget 矩形**を使い、Area の move widget は `begin` で前 pass の大きさのまま登録される。そのため
+     折りたたんだ pass の次に再描画が無いまま来た最初の入力 1 回は、旧本文の位置でも Area に吸われる (実装担当が handler テストで再現)。
+   - **決定: egui 本体 (`vendor/egui`) は改変しない**。Area の共通処理を変えると mIV のすべての Area に影響し、egui の更新のたびに
+     持ち越しが要る。代わりに、パネルの開閉を切り替えた pass で `ctx.request_discard("depth panel collapsed/expanded")` を出す。
+     egui が「この pass の配置は古いので同じ frame の中でもう一度組み直す」ために用意している仕組み (egui 自身の Grid が同種の
+     大きさのずれに使う。`Options::max_passes` 既定 2、mIV の既存の利用例 detached_placement.rs:1302) で、組み直しの pass の `begin` は
+     新しい大きさで widget を登録する。時間窓・次 frame の再描画待ちではなく、同じ frame の中で配置を確定させるもの。
+     組み直しの pass には入力が無いので、開閉の切替と保存は 1 回だけ (§17.6 の discard 再 pass の扱いと同じ)。
+     max_passes が 1 の環境 (テストの一部) では組み直されず、上の 1 回の吸い込みが残り得る (製品は既定の 2)。
 5. **I / Tab・D・×との関係**
    - I / Tab: 今までどおり完全に隠す・出す。折りたたみの値は変えない (出したとき、折りたたんでいれば 1 行で出る)。
      隠したときの通知 (§17.10) もそのまま。
@@ -2563,3 +2573,69 @@ I / Tab を「展開 → 1 行 → 非表示」の 3 段の循環にする (リ�
 `docs/keymap-spec.md` の 3D 写真の節に固定のマウス操作として 1 行。本書 §8 に折りたたみの 1 行。
 
 まれな失敗は既定の割り切り (§13)。この変更で新しい失敗の経路は増えない。
+
+### 17.13 実装記録 (§17.12)
+
+2026-11-11、`feat-766-767-depth-ui`、基点 `18d528908`。§17.12の仕様を実装。
+
+前提のコード確認:
+
+- `DepthParallaxSettings` は構造体の `#[serde(default)]` で旧JSONを受け入れる。
+  `DepthRenderParams::from_settings` は描画用の項目だけを取り、パネルの折りたたみを参照しない。
+- `App::draw_depth_panel` は現在の描画矩形を `depth_panel_rect` に公開し、`changed` のときだけ
+  normalizeとsaveを1回ずつ行う。保存経路と矩形を読む側は変更していない。
+- MainWindowとFullscreenは同じパネル描画・canvas入力分類・タッチ・マウス追従を通る。
+  detachedの述語・viewport経路と§1.767は変更していない。
+- `vendor/egui/src/containers/area.rs::Prepared::end` はそのpassの `content_ui.min_size()` を
+  `AreaState.size` と返却する矩形へ反映していたが、`begin` が前passの大きさで登録したmove widgetは
+  更新していなかった。次passのhit-testは前passのwidgetを使うため、実handler回帰で旧本文へのクリック遮断を再現した。
+  設計担当の§17.12決定4追記に従い、egui本体の変更と追加単体テストを撤回した。
+  パネルの見出しをクリックして設定を反転したpassだけ `ctx.request_discard("depth panel collapsed/expanded")` を出し、
+  同じframe内の組み直しでAreaの登録矩形を確定する。読む側の補正、Area IDの分割、追加状態は使わない。
+- 対象の純描画Harnessと `RootDepthViewer` 由来の両presentationのContextは `max_passes` を変更せず、
+  製品と同じ既定2であることをassertする。`Context::run_pass` も `run_ui` と同じ複数pass経路を通る。
+  共通fixtureや他のテストのpass数設定は変更していない。
+
+| ファイル | 変更 |
+| --- | --- |
+| `src/depth_parallax.rs` | 既定falseの `panel_collapsed` と旧JSON・保存往復のテスト |
+| `src/ui_depth_parallax.rs` | 三角と見出しを1つのクリック部品にし、ホバー強調・手形カーソル・開閉ヒントを追加。折りたたみ中は見出しと×だけを描き、scroll応答をOptionに変更。開閉を切り替えたpassだけrequest_discard |
+| `src/ui_depth_parallax_tests.rs` | 2サイズ・同時/別frameの実pointerで開閉、changed回数、固定見出し/×、本文/フッター不在、旧本文の層解放と×を検査。初めから折りたたむ場合も見出し/×の矩形・文字描画・×のクリックを検査 |
+| `src/ui_fullscreen/depth_focus_tests.rs` | egui既定2 passで、両presentationの旧本文へのmouse/Ctrl/touch/hover、見出しの入力所有、再展開後の除外を検査。開閉frameが2 pass、再passが入力なし、保存はクリック1回につき1回、通常再描画では保存しないことを検査 |
+| `src/app/depth_view_tests.rs` | I/Tab・リングで折りたたみを維持し、既存の隠す通知を検査。D終了・再入場の保持を検査 |
+| `src/app/depth_main_window_tests.rs` | 待機表示が折りたたんだ見出しだけを避け、旧本文位置を使えることを検査 |
+| `tests/ui_snapshot.rs`、パネルPNG | 展開の既存2枚を更新し、546.5×307の折りたたみ代表を追加。既存のスクロール到達性検査を維持 |
+| `htdocs/mimageviewer/manual/fullscreen.html`、`docs/keymap-spec.md`、本書 | 折りたたみ・完全非表示との違い・次回保持と固定入力の理由を同期 |
+
+検証はWindows、通常feature、同worktreeの未コミット差分で実施する。
+製品起動・コミット・push・`build-dev.ps1`・`test-lib-full.ps1`・`test-full.ps1` は依頼どおり実施しない。
+検証用成果物と全件gateは設計担当へ引き継ぐ。
+
+| コマンド | 結果・証拠 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth/)'` | **186成功 / 0失敗**、exit 0。`target/depth-panel-1766-discard-depth.log`。追加6件とdiscard再passの検査を含む |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/fullscreen_click\|canvas_click\|touch/)'` | **262成功 / 0失敗**、exit 0。`target/depth-panel-1766-discard-input.log` |
+| `cargo test --test ui_snapshot depth_parallax`（更新指定なし） | **4成功 / 0失敗**、exit 0。`target/depth-panel-1766-discard-snapshot.log`。PNG3枚は今回の修正前後のSHA-256が一致、更新なし |
+| `python scripts/check_ui_glyphs.py`（前回実装の結果を再利用） | exit 0、危険グリフ0件。UI文言の追加変更なし。`target/depth-panel-1766-glyphs.log` |
+| `python scripts/check_site_cards.py`（前回実装の結果を再利用） | exit 0、53カード・上限超過0件。サイト変更なし。`target/depth-panel-1766-site.log` |
+| `cargo fmt`（引数なし）、`git diff --check` | exit 0。最後の整形以外のRust変更後に上記の最終回帰を実行 |
+
+全cargo/testに `MSBUILDDISABLENODEREUSE=1` を使用した。初回のTurboJPEG CMake/MSBuildは並列ビルドでexit 1となり、
+`CARGO_BUILD_JOBS=1` で依存物を構築した後、通常の並列設定へ戻して最終検証した。並列失敗の原因自体は未確定。
+修正前のhandler回帰は旧本文へのクリックが遮断されて5件中1件失敗 (`target/depth-panel-1766-focused-fixed.log`)。
+今回の再検証はeguiを基点どおりに戻したツリーで行う。`git status --short -- vendor/egui` の出力は空で、
+`git diff --exit-code -- vendor/egui` もexit 0。設計との差分はない。
+比較許容値は変更していない。実機・独立完成レビュー・全件gateは未実施。
+
+PNGの目視確認:
+
+| PNG (`tests/snapshots/`) | 実寸 | バイト数 |
+| --- | --- | --- |
+| `depth_parallax_panel_dark.png` | 1093×614 | 46,845 |
+| `depth_parallax_panel_small_dark.png` | 547×307 | 19,438 |
+| `depth_parallax_panel_collapsed_small_dark.png`（追加） | 547×307 | 7,535 |
+
+小画面の入力は546.5×307 logical points。計3枚、73,818 bytes。
+展開の2枚と折りたたみの見出し部分の拡大表示で、三角・見出し・×の欠け/重なりとデバッグ表示がないことを確認した。
+本文・固定フッターの配置と小画面のscrollbarも確認し、スクロール末尾への到達は既存のgeometry/実wheel検査で保証する。
+純描画・headless handlerの証拠であり、実製品起動・実機操作の確認とは区別する。

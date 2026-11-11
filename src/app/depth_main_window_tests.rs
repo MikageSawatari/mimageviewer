@@ -242,6 +242,46 @@ pub(super) fn wheel(pos: egui::Pos2) -> Vec<egui::Event> {
 }
 
 #[test]
+fn depth_collapsed_wait_indicator_can_use_the_old_panel_body() {
+    let _input = crate::key_input::lock_test_input();
+    let mut app = setup_app_for_test();
+    let mut viewer = RootDepthViewer::new(&mut app);
+    viewer.frame(&mut app, vec![]);
+    let old = viewer.panel();
+    let full = egui::Rect::from_min_max(
+        egui::pos2(old.left() + 8., 0.),
+        egui::pos2(old.right(), 614.),
+    );
+    for collapsed in [false, true] {
+        app.settings.depth_parallax.panel_collapsed = collapsed;
+        let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+            unreachable!()
+        };
+        state.wait_started_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let output = viewer.ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewer.size)),
+                ..Default::default()
+            },
+            |ui| {
+                app.draw_depth_panel(ui.ctx(), 0);
+                app.draw_depth_wait_indicator(ui, full, ui.ctx(), ActionSurface::Viewer);
+            },
+        );
+        viewer.shapes = output.shapes.clone();
+        output.drop_without_applying_deltas();
+        if collapsed {
+            let caption = viewer.label("D で取り消し");
+            assert!(old.intersects(caption));
+            assert!(!viewer.panel().intersects(caption));
+        } else {
+            assert!(viewer.text_rects("D で取り消し").is_empty());
+        }
+    }
+    crate::key_input::clear_test_frame();
+}
+
+#[test]
 fn depth_main_window_root_paints_fit_rotation_resize_underlay_without_mutating_2d_transform() {
     let _input = crate::key_input::lock_test_input();
     let mut app = setup_app_for_test();

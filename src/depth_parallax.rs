@@ -57,6 +57,8 @@ pub struct DepthParallaxSettings {
     pub period_secs: f32,
     pub focus: f32,
     pub shape_depth: bool,
+    /// Panel presentation preference, independent of rendering and export.
+    pub panel_collapsed: bool,
 }
 impl Default for DepthParallaxSettings {
     fn default() -> Self {
@@ -66,6 +68,7 @@ impl Default for DepthParallaxSettings {
             period_secs: 3.0,
             focus: 0.5,
             shape_depth: true,
+            panel_collapsed: false,
         }
     }
 }
@@ -668,6 +671,20 @@ mod tests {
         }
     }
     #[test]
+    fn depth_panel_collapsed_defaults_for_old_json_and_roundtrips() {
+        let old = r#"{"motion":"horizontal","strength":0.02,"period_secs":3.0,"focus":0.5,"shape_depth":true}"#;
+        let mut settings: DepthParallaxSettings = serde_json::from_str(old).unwrap();
+        assert!(!settings.panel_collapsed);
+        settings.panel_collapsed = true;
+        settings.normalize();
+        let json = serde_json::to_string(&settings).unwrap();
+        assert_eq!(
+            serde_json::from_str::<DepthParallaxSettings>(&json).unwrap(),
+            settings
+        );
+    }
+
+    #[test]
     fn settings_normalize_nonfinite_and_unknown() {
         let mut settings = DepthParallaxSettings {
             motion: MotionKind::Unknown,
@@ -675,6 +692,7 @@ mod tests {
             period_secs: f32::INFINITY,
             focus: -1.,
             shape_depth: true,
+            panel_collapsed: false,
         };
         settings.normalize();
         assert_eq!(settings.strength, 0.02);

@@ -1518,6 +1518,7 @@ fn depth_i_and_tab_toggle_only_the_depth_panel_through_the_shared_key_handler() 
     let mut app = setup_app_for_test();
     install_pages(&mut app, &ctx);
     depth(&mut app);
+    app.settings.depth_parallax.panel_collapsed = true;
     let side_panel_mode = app.settings.fullscreen_side_panel_mode;
     for (key, visible) in [(egui::Key::I, false), (egui::Key::Tab, true)] {
         ctx.begin_pass(egui::RawInput {
@@ -1536,8 +1537,40 @@ fn depth_i_and_tab_toggle_only_the_depth_panel_through_the_shared_key_handler() 
             panic!("metadata key must keep the depth owner");
         };
         assert_eq!(state.panel_visible, visible, "{key:?}");
+        assert!(app.settings.depth_parallax.panel_collapsed);
         assert_eq!(app.settings.fullscreen_side_panel_mode, side_panel_mode);
         assert!(!app.show_metadata_panel);
+    }
+    crate::key_input::clear_test_frame();
+}
+
+#[cfg(windows)]
+#[test]
+fn depth_collapsed_preference_survives_d_exit_and_reentry() {
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let mut app = setup_app_for_test();
+    install_pages(&mut app, &ctx);
+    let model_path = app.tmp.path().join("unused-depth.onnx");
+    app.depth_setup
+        .set_status_for_test(crate::addon::AddonStatus::Valid {
+            model_id: "collapsed-fixture".into(),
+            bytes: 1,
+            model_path,
+            mmproj_path: None,
+        });
+    app.settings.depth_parallax.panel_collapsed = true;
+    for active in [true, false, true] {
+        depth_key_frame(
+            &mut app,
+            &ctx,
+            &[(egui::Key::D, true), (egui::Key::D, false)],
+        );
+        assert_eq!(app.fs_exclusive_view.is_depth(), active);
+        assert!(app.settings.depth_parallax.panel_collapsed);
+        if let FsExclusiveView::Depth(state) = &app.fs_exclusive_view {
+            assert!(state.panel_visible);
+        }
     }
     crate::key_input::clear_test_frame();
 }
@@ -1628,6 +1661,7 @@ fn depth_panel_hide_toast_uses_first_chord_once_and_show_is_silent_through_key_a
     let mut app = setup_app_for_test();
     install_pages(&mut app, &ctx);
     depth(&mut app);
+    app.settings.depth_parallax.panel_collapsed = true;
     let side_panel_mode = app.settings.fullscreen_side_panel_mode;
     for (ini, keys, hint) in [
         ("", vec![egui::Key::I, egui::Key::Tab], "I"),
@@ -1688,6 +1722,7 @@ fn depth_panel_hide_toast_uses_first_chord_once_and_show_is_silent_through_key_a
                         panic!("panel toggle must preserve the Depth owner");
                     };
                     assert_eq!(state.panel_visible, visible, "{ini}, {key:?}");
+                    assert!(app.settings.depth_parallax.panel_collapsed);
                     assert_eq!(
                         app.feedback_toasts_for_test.len(),
                         cycle,

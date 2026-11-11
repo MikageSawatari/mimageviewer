@@ -18,6 +18,262 @@ fn pointer(pos: egui::Pos2, pressed: bool, ctrl: bool) -> egui::Event {
 }
 
 #[test]
+fn depth_collapsed_panel_next_pass_routes_mouse_ctrl_hover_and_touch_in_both_presentations() {
+    // The child renderer is thread-local; neither presentation creates a native window.
+    std::thread::spawn(|| {
+        let _input = crate::key_input::lock_test_input();
+        for fullscreen in [false, true] {
+            for case in [
+                "mouse",
+                "ctrl",
+                "hover",
+                "touch",
+                "header_mouse",
+                "header_touch",
+                "expanded_mouse",
+                "expanded_ctrl",
+                "expanded_touch",
+                "expanded_hover",
+            ] {
+                let mut app = crate::app::setup_app_for_test();
+                let viewer = RootDepthViewer::new(&mut app);
+                viewer.ready(&mut app);
+                let ctx = viewer.ctx;
+                assert_eq!(ctx.options(|options| options.max_passes.get()), 2);
+                let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, viewer.size);
+                app.rotation_cache
+                    .insert(0, crate::rotation_db::Rotation::Cw90);
+                app.items[1] = GridItem::Image("collapsed-next.jpg".into());
+                crate::app::source_texture_test_support::seed(&mut app, &ctx, 1);
+                app.settings.touch_still_chrome_learned = true;
+                app.window_visible = false;
+                app.settings.depth_parallax.focus = 0.2;
+                if fullscreen {
+                    app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+                    app.native_video_in_window_active = false;
+                    app.settings.video_in_window_mode = false;
+                }
+                let child_events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+                let queue = child_events.clone();
+                let panel = std::rc::Rc::new(std::cell::Cell::new(egui::Rect::NOTHING));
+                let child_panel = panel.clone();
+                let observed_pass = std::rc::Rc::new(std::cell::Cell::new(0_u64));
+                let child_pass = observed_pass.clone();
+                let completed_passes = std::rc::Rc::new(std::cell::Cell::new(0));
+                let child_completed = completed_passes.clone();
+                ctx.set_embed_viewports(false);
+                egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
+                    let pass = child_pass.get() + 1;
+                    child_pass.set(pass);
+                    assert_eq!(ctx.options(|options| options.max_passes.get()), 2);
+                    let output = ctx.run_pass(
+                        egui::RawInput {
+                            viewport_id: viewport.ids.this,
+                            screen_rect: Some(rect),
+                            time: Some(pass as f64 / 60.),
+                            events: std::mem::take(&mut *queue.borrow_mut()),
+                            viewports: [(
+                                viewport.ids.this,
+                                egui::ViewportInfo {
+                                    parent: Some(viewport.ids.parent),
+                                    focused: Some(true),
+                                    ..Default::default()
+                                },
+                            )]
+                            .into_iter()
+                            .collect(),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            if ctx.current_pass_index() > 0 {
+                                assert!(ctx.input(|input| input.raw.events.is_empty()));
+                            }
+                            ctx.root_ui(|ui| (viewport.viewport_ui_cb)(ui));
+                            child_panel.set(
+                                ctx.data(|d| d.get_temp(egui::Id::unique("depth_panel_rect")))
+                                    .unwrap(),
+                            );
+                        },
+                    );
+                    child_completed.set(output.platform_output.num_completed_passes);
+                    output.drop_without_applying_deltas();
+                });
+                let frame = |app: &mut crate::app::App, events: Vec<egui::Event>| {
+                    app.frame_counter += 1;
+                    let events = if fullscreen {
+                        *child_events.borrow_mut() = events;
+                        vec![]
+                    } else {
+                        events
+                    };
+                    let output = ctx.run_pass(
+                        egui::RawInput {
+                            screen_rect: Some(rect),
+                            events,
+                            time: Some(app.frame_counter as f64 / 60.),
+                            viewports: [(
+                                egui::ViewportId::ROOT,
+                                egui::ViewportInfo {
+                                    focused: Some(true),
+                                    ..Default::default()
+                                },
+                            )]
+                            .into_iter()
+                            .collect(),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            if !fullscreen && ctx.current_pass_index() > 0 {
+                                assert!(ctx.input(|input| input.raw.events.is_empty()));
+                            }
+                            ctx.root_ui(|ui| app.render_fullscreen_viewport(ui));
+                            if !fullscreen {
+                                panel.set(
+                                    ctx.data(|d| d.get_temp(egui::Id::unique("depth_panel_rect")))
+                                        .unwrap(),
+                                );
+                            }
+                        },
+                    );
+                    if !fullscreen {
+                        completed_passes.set(output.platform_output.num_completed_passes);
+                    }
+                    output.drop_without_applying_deltas();
+                };
+                for _ in 0..3 {
+                    frame(&mut app, vec![]);
+                }
+                app.fs_focus_regained_at = None;
+                let expanded = panel.get();
+                let header = expanded.min + egui::vec2(60., 18.);
+                let body = expanded.min + egui::vec2(25., 125.);
+                assert!(
+                    app.fullscreen_page_layout
+                        .single_page()
+                        .unwrap()
+                        .transform
+                        .paint_rect
+                        .contains(body),
+                    "focus fixture must sample the image"
+                );
+                let click = |app: &mut crate::app::App, pos| {
+                    frame(
+                        app,
+                        vec![egui::Event::PointerMoved(pos), pointer(pos, true, false)],
+                    );
+                    frame(app, vec![pointer(pos, false, false)]);
+                };
+                let save_before = crate::settings::save_generation();
+                click(&mut app, header);
+                assert!(
+                    app.settings.depth_parallax.panel_collapsed,
+                    "{fullscreen}, {case}"
+                );
+                assert_eq!(
+                    app.fullscreen_idx,
+                    Some(0),
+                    "collapse click must not navigate"
+                );
+                assert_eq!(crate::settings::save_generation(), save_before + 1);
+                assert_eq!(completed_passes.get(), 2, "collapse must rebuild in the same frame");
+                assert!(panel.get().height() < 45.);
+                if case.starts_with("expanded_") {
+                    click(&mut app, header);
+                    assert!(!app.settings.depth_parallax.panel_collapsed);
+                    assert_eq!(completed_passes.get(), 2, "expand must rebuild in the same frame");
+                    assert_eq!(crate::settings::save_generation(), save_before + 2);
+                    assert!(panel.get().contains(body));
+                }
+                let before = crate::settings::save_generation();
+                if let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view {
+                    state.mouse.target = egui::Vec2::ZERO;
+                    state.mouse.current = egui::Vec2::ZERO;
+                }
+                let pos = if case.starts_with("header_") {
+                    header
+                } else {
+                    body
+                };
+                let ctrl = case.ends_with("ctrl");
+                let touch = case.ends_with("touch");
+                if case.ends_with("hover") {
+                    // This is the very next pass after the collapsing release.
+                    frame(&mut app, vec![egui::Event::PointerMoved(pos)]);
+                    let FsExclusiveView::Depth(state) = &app.fs_exclusive_view else {
+                        unreachable!()
+                    };
+                    assert_eq!(
+                        state.mouse.target == egui::Vec2::ZERO,
+                        case.starts_with("expanded_"),
+                        "{fullscreen}, {case}"
+                    );
+                } else {
+                    for pressed in [true, false] {
+                        let mut events = vec![];
+                        if touch {
+                            events.push(egui::Event::Touch {
+                                device_id: egui::TouchDeviceId(766),
+                                id: egui::TouchId(1),
+                                phase: if pressed {
+                                    egui::TouchPhase::Start
+                                } else {
+                                    egui::TouchPhase::End
+                                },
+                                pos,
+                                force: None,
+                            });
+                        }
+                        if pressed {
+                            events.push(egui::Event::PointerMoved(pos));
+                        }
+                        events.push(pointer(pos, pressed, ctrl));
+                        if touch && !pressed {
+                            events.push(egui::Event::PointerGone);
+                        }
+                        frame(&mut app, events);
+                    }
+                    let turns_page = matches!(case, "mouse" | "touch");
+                    assert_eq!(
+                        app.fullscreen_idx,
+                        Some(usize::from(turns_page)),
+                        "{fullscreen}, {case}"
+                    );
+                    assert_eq!(
+                        app.settings.depth_parallax.focus,
+                        if case == "ctrl" { 0.5 } else { 0.2 },
+                        "{fullscreen}, {case}"
+                    );
+                }
+                if case == "hover" {
+                    frame(&mut app, vec![]);
+                    assert_eq!(
+                        crate::settings::save_generation(),
+                        before,
+                        "repaint must not save"
+                    );
+                    app.feedback_toasts_for_test.clear();
+                    for (key, visible) in [(egui::Key::I, false), (egui::Key::Tab, true)] {
+                        for pressed in [true, false] {
+                            frame(&mut app, vec![egui::Event::Key {
+                                key, physical_key: Some(key), pressed, repeat: false,
+                                modifiers: egui::Modifiers::NONE,
+                            }]);
+                        }
+                        assert!(matches!(&app.fs_exclusive_view, FsExclusiveView::Depth(state) if state.panel_visible == visible));
+                        assert!(app.settings.depth_parallax.panel_collapsed);
+                        assert_eq!(app.feedback_toasts_for_test.len(), 1, "hide once; show silently");
+                    }
+                    assert!(panel.get().height() < 45.);
+                }
+            }
+        }
+        crate::key_input::clear_test_frame();
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
 fn depth_focus_canvas_click_uses_release_modifiers_and_preserves_prior_exclusions() {
     let _input = crate::key_input::lock_test_input();
     let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800., 600.));
