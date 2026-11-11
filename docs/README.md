@@ -116,6 +116,7 @@
 | [web-remote-left-panel-plan.md](web-remote-left-panel-plan.md) | リモートの左パネル (場所 / 検索 / タグ / お気に入り / 本棚) の範囲と、本体一覧との差 |
 | [web-remote-ai-plan.md](web-remote-ai-plan.md) | **段 3b-0〜3b-2 実装・実機確認済み。JPEG 転送 / 端末別画質 mode は実装済み・実機確認待ち**。remote AI アップスケール / デノイズの PC modal 排他、共有 canonical decoder、接続取得 / 切断 drain barrier、App 所有 singleton Runtime、stable remote key、HTTP job、Web UI、画面消灯復帰、VRAM、撤退条件 |
 | [local-vlm-caption-plan.md](local-vlm-caption-plan.md) | ローカル AI 説明文の正本。V1-3 の独立レビュー済み設計は §21.7。V1-3b の worker 内包・protocol 2・source identity・分割モデル取得・GPU 判定・初回案内・設定ページの実装と検証記録は §21.8。作成ジョブ (V1-3c) の受付・進捗・中止と検証記録は §21.9。実モデルの公開、表紙 (V1-4)、検索/MCP は別段階 |
+| [local-asr-transcript-plan.md](local-asr-transcript-plan.md) | ローカル文字起こし (whisper、動画) の計画。左パネルの「文字起こし」タブ・検索・MCP。AI 説明文の仕組みを型にする。初版、独立レビュー前 |
 | [local-vlm-v0-procedure.md](local-vlm-v0-procedure.md) | **手順の下書き (2026-11-02、未実行)**。ローカル AI 説明文の V0。Qwen3.5-4B/9B と Gemma 4 E4B の比較、VLM・AI 補正・表示用テクスチャの VRAM を同じ物差しで計測、利用者による目隠しの品質比較、4B 固定と U1 の判断基準 |
 | [mcp-integration-plan.md](mcp-integration-plan.md) | **段階 0 試験実装中 (2026-10-30)**。AI 連携 (MCP)。stdio の別 exe と本体の agent lane (Remote IPC とは別の pipe・版)、Remote 操作権との関係、安全性。実装・検証と未決事項は §14 |
 | [local-adjust-testing.md](local-adjust-testing.md) | 部分補正レイヤーの回帰テスト、合成順、キャッシュ無効化を検証するとき |
