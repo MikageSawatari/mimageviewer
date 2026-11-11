@@ -3218,6 +3218,15 @@ ROOT からの再開配送の照合、context 付き一時 id、テストの強�
 「症状パッチではなく構造的な変更」であることに**合意** (既存の所有者と遷移状態から受付・表示先・退役を導き、追加の detached 状態・時間窓・待ち・
 再試行・追加 repaint を作らない)。レビュー担当は上記 1,523 件と snapshot 250 件の成功ログを参照し、Cargo を重複実行していない。
 
+設計担当による最終確認 (2026-11-12、対象 `47a93b304` = 製品コードは `08cc9da88` と同一、いずれも共有の `run-heavy.ps1` 経由):
+
+| コマンド | 結果 |
+| --- | --- |
+| `.\scripts\test-lib-full.ps1` (`-FullTest`、共有ロック test-lib-full 下) | **17,249 成功 / 0 失敗 / 75 skipped、795.6 秒、exit 0** |
+| `cargo test --workspace --exclude mimageviewer-launcher --features pack-build-tools --no-run` | exit 0 (launcher はこの worktree に release exe 5 本が無く build.rs で止まるため除外。コード起因ではない) |
+| `.\scripts\build-dev.ps1` | exit 0、`target\dev-runtime\mimageviewer-core.exe` |
+| `cargo test --test ui_snapshot` | 実装担当の 250 成功を再利用 (その後の変更はテスト fixture・整形・文書だけ) |
+
 未確認: 実 OS 窓での close / activation / focus、native の保存先画面、実モニタ間の DPI 移動、実モデルでの推論、
 backstop / interlude の数 frame の見え方。headless の成功とは区別する。
 製品起動・`build-dev.ps1`・`test-lib-full.ps1`・`test-full.ps1`・コミット・push は依頼どおり実施しない。
