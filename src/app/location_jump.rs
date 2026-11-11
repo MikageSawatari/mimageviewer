@@ -43,7 +43,7 @@ impl App {
 
     pub(crate) fn dispatch_location_jump(&mut self, target: LocationJumpTarget) {
         if self.location_jump_snapshot_blocked()
-            || self.everything_search_progress_visible()
+            || self.main_chrome_pointer_blocked()
             || self.document_open_modal_admission_blocked()
         {
             return;
@@ -467,6 +467,167 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn location_jump_dispatch_rechecks_delete_confirmation_for_each_search() {
+        for kind in 0..4 {
+            assert_location_jump_delete_race_is_blocked(search_fixture(kind));
+        }
+    }
+
+    #[test]
+    fn location_jump_plain_dispatch_rechecks_delete_confirmation() {
+        let mut app = setup_app();
+        let origin = app.tmp.path().join("plain-origin");
+        let row = origin.join("selected.zip");
+        std::fs::create_dir(&origin).unwrap();
+        app.current_folder = Some(origin);
+        app.top_level_grid_view
+            .replace_surface(TopLevelGridSurface::Folder);
+        app.install_new_items(vec![GridItem::ZipFile(row)], vec![None]);
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        assert_location_jump_delete_race_is_blocked(app);
+    }
+
+    fn assert_location_jump_delete_race_is_blocked(mut app: AppTestEnv) {
+        use super::super::update_phases::MainFrameNavigation;
+        let ctx = egui::Context::default();
+        let physical = app.tmp.path().join("blocked-destination");
+        std::fs::create_dir(&physical).unwrap();
+        let shelf = app.tmp.path().join("blocked-shelf");
+        app.settings.book_root = Some(shelf.clone());
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Delete,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        });
+        assert!(!app.main_chrome_pointer_blocked());
+        let mut candidates = Vec::new();
+        for target in [
+            LocationJumpTarget::DriveList,
+            LocationJumpTarget::ReadingHistory,
+            LocationJumpTarget::BooksRoot,
+            LocationJumpTarget::Physical(physical),
+            LocationJumpTarget::Rating(3),
+        ] {
+            for lane in 0..4 {
+                let candidate = app
+                    .location_jump_nav(&ctx, target.clone(), "delete-race")
+                    .expect("candidate is generated before the delete dialog opens");
+                candidates.push((lane, candidate));
+            }
+        }
+        let current_folder = app.current_folder.clone();
+        let surface = app.top_level_grid_view.surface().clone();
+        let return_to = format!("{:?}", app.top_level_grid_view.return_to());
+        let selected = app.selected;
+        let checked = app.checked.clone();
+        let generation = app.items_generation;
+        let search_state = (
+            app.global_search.active,
+            app.favsearch.active,
+            app.tag_view.active,
+        );
+        let search_origin = app.capture_search_open_origin();
+        let history = app.folder_nav_history_snapshot();
+        let selected_path = app.items[selected.unwrap()]
+            .drag_source_path()
+            .unwrap()
+            .to_path_buf();
+        let _owner = app.keyboard_owner_for_pass(&ctx);
+        app.handle_delete_key(&ctx);
+        assert!(app.show_delete_confirm);
+        assert_eq!(app.modal_dialog_block_reason(), Some("delete_confirm"));
+        let delete_targets = vec![(selected.unwrap(), selected_path)];
+        assert_eq!(app.delete_targets, delete_targets);
+        for (lane, candidate) in candidates {
+            if lane == 3 {
+                assert!(app.apply_fullscreen_close_nav_immediate(candidate));
+            } else {
+                let mut frame = MainFrameNavigation {
+                    fav_nav: None,
+                    toolbar_fav_nav: None,
+                    fullscreen_close_nav: None,
+                    keyboard_nav: None,
+                    keyboard_nav_from_fullscreen_close: false,
+                    gamepad_nav: None,
+                    address_nav: None,
+                    open_folder_nav: None,
+                    context_nav: None,
+                    folder_pane_nav: None,
+                    grid_nav: None,
+                };
+                match lane {
+                    0 => frame.keyboard_nav = Some(candidate),
+                    1 => frame.address_nav = Some(candidate),
+                    _ => frame.grid_nav = Some(candidate),
+                }
+                app.post_render_main_navigation(&ctx, frame);
+            }
+            assert_eq!(app.current_folder, current_folder);
+            assert_eq!(app.top_level_grid_view.surface(), &surface);
+            assert_eq!(
+                format!("{:?}", app.top_level_grid_view.return_to()),
+                return_to
+            );
+            assert_eq!(app.items_generation, generation);
+            assert_eq!(app.selected, selected);
+            assert_eq!(app.checked, checked);
+            assert_eq!(app.folder_nav_history_snapshot(), history);
+            assert_eq!(
+                (
+                    app.global_search.active,
+                    app.favsearch.active,
+                    app.tag_view.active
+                ),
+                search_state
+            );
+            if let Some(origin) = &search_origin {
+                assert!(app.search_open_origin_is_current(origin));
+            } else {
+                assert!(app.capture_search_open_origin().is_none());
+            }
+            assert!(app.show_delete_confirm);
+            assert_eq!(app.delete_targets, delete_targets);
+            assert!(app.folder_pane_open_pending.is_none());
+            assert!(
+                app.top_level_grid_view
+                    .history_navigation_transition()
+                    .is_none()
+            );
+            assert!(app.rating_view_pending.is_none());
+        }
+        assert!(
+            !shelf.exists(),
+            "blocked BooksRoot must not create its directory"
+        );
+        ctx.end_pass().drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn location_jump_dispatch_excludes_menus_from_the_modal_gate() {
+        let mut app = search_fixture(0);
+        let nav = app
+            .location_jump_nav(
+                &egui::Context::default(),
+                LocationJumpTarget::DriveList,
+                "test",
+            )
+            .unwrap();
+        app.context_menu_idx = Some(app.capture_grid_context_menu_owner(0));
+        assert!(app.common_modal_dialog_open());
+        assert!(!app.main_chrome_pointer_blocked());
+        assert!(app.apply_fullscreen_close_nav_immediate(nav));
+        assert!(app.items_are_drive_list);
+        let origin = app.tmp.path().join("pre-search");
+        assert_search_dismissed_with_history(&app, origin);
     }
 
     #[test]

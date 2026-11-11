@@ -314,9 +314,10 @@
 - 輸送経路の確認結果 (実フォルダ・staged・`ClassifiedOpenContinuation::Physical`・変換書庫/EPUB cache・direct PDF) を §2.2-5 に記録した。
 - 範囲外の整理、detached 述語・viewport・registry を変更しない点は妥当と確認された。
 
-## 8. 実装記録 (2026-11-11、feat-682-search-nav、未コミット)
+## 8. 実装記録 (2026-11-11、feat-682-search-nav)
 
-実装は本 worktree の差分。製品バイナリの起動・実機観測・コミットは行っていない。
+初回実装は `3621aefec` (設計担当がコミット)。§8.1〜8.4 はその実装・検証時の記録で、
+§8.5 は独立レビューへの追補修正 (未コミット)。実装担当は製品バイナリの起動・実機観測・コミットを行っていない。
 設計の前提を source で照合し、既存の capture 入口、成功採用境界、Folder 行の採用後に内部書庫を開く順序を維持した。
 App の新しい pending / bool / 次回採用フラグ、detached 述語・viewport・registry 遷移の変更、新しい同期 I/O はない。
 
@@ -501,3 +502,60 @@ music-video companion。最終 build の後に 5 ファイルの存在・更新�
 確認対象は Everything の一覧順移動と移動先行への Results 復帰、Folder 行から内部書庫へ進む場合の基準、
 各検索中の場所ジャンプの成功時終了 / 失敗時保持と、検索外の同等操作。
 実機結果・full suite・コミットは設計担当へ引き継ぐ。
+
+### 8.5 独立レビュー ACCEPT WITH CHANGES への追補 (3621aefec 後、未コミット)
+
+利用者が伝えた別の Sol / xhigh 独立レビューの P2 / P3 に対応した。
+変更ファイルは `src/app/location_jump.rs`、`src/app/list_order_everything_tests.rs`、本書だけ。
+
+**P2: 候補生成後に開いた一般 modal の再照合**
+
+- root のフレーム順序は場所キー等の候補生成 → `handle_delete_key` → `post_render_main_navigation`。
+  削除確認は後者の handler が `show_delete_confirm` と削除対象を設定して開くが、従来の場所 dispatch は
+  Everything 取得中と document-open modal しか拒否せず、旧 items を対象にした確認を残して別一覧を採用できた。
+- `dispatch_location_jump` の Everything 専用判定を既存 `main_chrome_pointer_blocked()` に置き換えた。
+  共通の `modal_dialog_block_reason_including_menus(false)` から導く既存判定を使い、メニューを除外する。
+  Everything 取得中もこの共通判定に含まれる。★固定と document-open admission は維持し、
+  Plain / ExitTemporaryView の分岐前に全 4 dispatcher で同じ判定を適用する。新しい modal 分類は作らない。
+- Plain の旧下流も source で照合した。例えば `enter_drive_list_from_navigation` は document-open modal だけを見て
+  `adopt_synthetic_surface` へ進み、一般の削除確認を再検査しなかった。場所▼等の通常入力は共通 chrome gate で止まる一方、
+  生成済み候補と同じフレームで削除確認が開く競合は通過し得た。今回の Plain の変更は、この競合も拒否する修正である。
+  Plain の通常操作・メニュー操作は維持し、同 frame の Delete 確認後の未 dispatch 候補を新たに拒否する。
+- 新規 3 テスト: `location_jump_dispatch_rechecks_delete_confirmation_for_each_search`、
+  `location_jump_plain_dispatch_rechecks_delete_confirmation`、`location_jump_dispatch_excludes_menus_from_the_modal_gate`。
+  最初の 2 件は実際の Delete キー event と `handle_delete_key` を使う。4 検索 owner / Plain、5 宛先、
+  input / address / grid / immediate の 4 dispatch lane について、検索 owner・surface・復元先・items generation・
+  選択/チェック・履歴・削除確認対象の不変と、後続 open の未開始を照合する。
+  メニューだけの場合は拒否しないことを別途検査する。
+
+**P3: 変換確認・パスワード待ちでの ListOrderRow 輸送**
+
+- 新規 2 テスト: `list_order_everything_conversion_confirmation_resumes_original_owner_or_cancels` と
+  `list_order_everything_pdf_password_wait_resumes_original_owner_or_cancels`。各々が再開 / 取消を検査する。
+- 変換確認は未キャッシュの実 7z と Ask 設定から実際の確認 phase へ進む。既存 Confirm handler で実変換 worker を開始し、
+  headless `show_archive_convert_dialog` の `StagedHistory(request_id)` 完了 routing と ZIP preflight を通して採用する。
+- PDF は既存 `TestPdfEnumeratePool` で外部 process の応答だけを模擬する。実 enqueue に `PasswordRequired` を返して
+  既存 preflight からパスワード待ちを生成し、実際の retry / cancel handler を使う。再試行の enqueue へ成功応答を返す。
+  dialog / PhysicalHistoryPhase / commit をテストから直接設定しない。
+- 待機・再開中は同じ request id、現在の origin run と旧 accepted dataset run、ListOrderRow、元 source、凍結列を保持する。
+  成功時は移動先の logical_source / return_anchor を採用し、Results 帰還でその行を選択する。
+  取消時は旧基準・表示 items・fullscreen・凍結列を保持する。既存の cache 着地 / preflight テストも残した。
+
+検証コマンドと結果はこの追補差分に対するもの。製品起動・full suite・コミットは行わず、
+確認用 build は通常 feature set / portable 無効とする。Cargo の環境は `MSBUILDDISABLENODEREUSE=1`、
+`CARGO_BUILD_JOBS=4`。確認用 build の native 指定は §8.4 の同じプロセス環境変数を使う。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(location_jump_dispatch_rechecks_delete_confirmation_for_each_search) \| test(location_jump_plain_dispatch_rechecks_delete_confirmation) \| test(location_jump_dispatch_excludes_menus_from_the_modal_gate) \| test(list_order_everything_conversion_confirmation_resumes_original_owner_or_cancels) \| test(list_order_everything_pdf_password_wait_resumes_original_owner_or_cancels)' --no-fail-fast` | exit 0、5 実行 / 5 成功、1.198s (compile 2m24s)、17,255 skipped。`target/search-nav-review-new-tests.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(list_order) \| test(everything) \| test(location) \| test(gamepad) \| test(jump) \| test(section1328)' --no-fail-fast` | exit 0、722 実行 / 722 成功、72.996s (compile 1.10s)、16,538 skipped。`target/search-nav-review-focused.log` |
+| `cargo fmt` (workspace 全体、引数なし) / `cargo fmt --check` | 成功、exit 0 |
+| `git -c core.safecrlf=false diff --check` | 成功、exit 0 |
+| `.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | exit 0 / DONE。本体 1m44s、remote 0.47s、EPUB worker 0.50s、MCP 0.36s、music-video editor 3.94s。5 executable の存在を照合し、最終 PE gate `runtime=4 pe=5` が成功。§8.4 の native 環境変数を同じ値で指定。進捗抜粋は `target/search-nav-review-build.log`、PE report は `target/vcrt-pe-reports/dev-runtime.json` |
+
+追補差分の別 context の read-only 独立レビュー (Sol / xhigh) は **ACCEPT、追加指摘なし**。
+製品修正は共通 modal 判定の置換 1 行だけで、ListOrderRow の輸送コードには修正がなかった。
+今回追加した 5 件を含む関連 722 件の成功を記録する。full suite・実機観測・コミットは指定どおり未実施。
+確認用本体は `target/dev-runtime/mimageviewer-core.exe` を更新済み。利用者が起動する場合の
+`Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`、通常 `%APPDATA%\mimageviewer` の
+実設定・データ更新の可能性、インストール版・トレイ常駐版を先に閉じる注意は §8.4 と同じ。

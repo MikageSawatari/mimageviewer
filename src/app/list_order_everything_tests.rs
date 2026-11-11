@@ -471,6 +471,7 @@ enum Landing {
     WarmPdf,
     Epub,
     Converted,
+    UncachedArchive,
     Folder,
     ImageFolder,
     FolderInnerZip,
@@ -530,7 +531,7 @@ fn landing_fixture(
         Landing::Zip => "b-target.zip",
         Landing::ColdPdf | Landing::WarmPdf => "b-target.pdf",
         Landing::Epub => "b-target.epub",
-        Landing::Converted => "b-target.7z",
+        Landing::Converted | Landing::UncachedArchive => "b-target.7z",
         _ => "b-target",
     });
     let mut epub_pin = None;
@@ -612,6 +613,26 @@ fn landing_fixture(
                 .unwrap();
             app.settings
                 .set_archive_file_handling(crate::settings::ArchiveFileHandling::Convert);
+            GridItem::ConvertibleArchive {
+                path: row.clone(),
+                format: crate::archive_converter::ArchiveFormat::SevenZ,
+            }
+        }
+        Landing::UncachedArchive => {
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::RgbImage::new(2, 2)
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            let mut archive = sevenz_rust2::ArchiveWriter::create(&row).unwrap();
+            archive
+                .push_archive_entry(
+                    sevenz_rust2::ArchiveEntry::new_file("001.png"),
+                    Some(std::io::Cursor::new(bytes.into_inner())),
+                )
+                .unwrap();
+            archive.finish().unwrap();
+            app.settings
+                .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
             GridItem::ConvertibleArchive {
                 path: row.clone(),
                 format: crate::archive_converter::ArchiveFormat::SevenZ,
@@ -991,5 +1012,247 @@ fn list_order_everything_cancel_scan_failure_and_stale_preflight_keep_the_origin
             app.list_order.as_ref().unwrap(),
             &fixture.snapshot
         ));
+    }
+}
+
+/// Inspect the request transported by production; never reconstruct its origin at a modal seam.
+fn assert_modal_list_order_owner(app: &App, fixture: &LandingFixture) -> u64 {
+    let Some(HistoryNavigationTransition::Physical(request)) =
+        app.top_level_grid_view.history_navigation_transition()
+    else {
+        panic!("modal list-order landing must retain its physical request");
+    };
+    let Some(SearchOpenOrigin::Everything {
+        run,
+        context,
+        child: EverythingChildAdmission::ListOrderRow { dataset_run, row },
+    }) = &request.global_search_origin
+    else {
+        panic!("modal continuation lost the transported list-order row");
+    };
+    assert_eq!(*run, app.global_search.run_sequence);
+    assert_eq!(*context, app.viewer_context_main());
+    assert_eq!(*dataset_run, accepted_run(app));
+    assert_ne!(
+        run, dataset_run,
+        "cancelled query separates request and dataset runs"
+    );
+    assert_eq!(row, &fixture.row);
+    assert_eq!(&request.path, &fixture.row);
+    assert_child(app, &fixture.source);
+    assert_eq!(app.effective_folder().as_ref(), Some(&fixture.source));
+    assert!(Arc::ptr_eq(
+        app.list_order.as_ref().unwrap(),
+        &fixture.snapshot
+    ));
+    request.request_id
+}
+
+fn assert_modal_cancel_preserves_source(
+    app: &App,
+    fixture: &LandingFixture,
+    source_rows: &[GridItem],
+) {
+    assert_child(app, &fixture.source);
+    assert!(app.global_search.active);
+    assert_eq!(app.effective_folder().as_ref(), Some(&fixture.source));
+    assert_eq!(app.items.as_slice(), source_rows);
+    assert_eq!(app.fullscreen_idx, Some(0));
+    assert_eq!(app.list_order_position().unwrap().1, 0);
+    assert!(Arc::ptr_eq(
+        app.list_order.as_ref().unwrap(),
+        &fixture.snapshot
+    ));
+    assert!(
+        app.top_level_grid_view
+            .history_navigation_transition()
+            .is_none()
+    );
+}
+
+fn finish_modal_landing_and_return(app: &mut App, ctx: &egui::Context, fixture: &LandingFixture) {
+    finish_landing(app, ctx);
+    assert_child(app, &fixture.row);
+    assert_eq!(app.effective_folder().as_ref(), Some(&fixture.row));
+    assert_eq!(app.list_order_position().unwrap().1, 1);
+    assert!(Arc::ptr_eq(
+        app.list_order.as_ref().unwrap(),
+        &fixture.snapshot
+    ));
+    app.release_fs_nav_lock();
+    assert!(app.return_from_everything_child(EverythingReturn::Results));
+    finish_results_return(app, ctx, &fixture.row);
+}
+
+fn tick_archive_conversion_dialog(app: &mut App, ctx: &egui::Context) {
+    // Headless egui rendering consumes the same completion routing as App::update.
+    // No native window is opened and no desktop input is sent.
+    ctx.run_pass(egui::RawInput::default(), |ctx| {
+        app.show_archive_convert_dialog(ctx);
+    })
+    .drop_without_applying_deltas();
+    if let Some(state) = &app.archive_convert {
+        if let crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Error { message } =
+            &state.phase
+        {
+            panic!("list-order archive conversion failed: {message}");
+        }
+    }
+}
+
+#[test]
+fn list_order_everything_conversion_confirmation_resumes_original_owner_or_cancels() {
+    use crate::ui_dialogs::archive_convert::{ArchiveConvertCompletionPolicy, ArchiveConvertPhase};
+    for cancel in [true, false] {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        // A real 7z with no cache record must scan, ask, and run the converter.
+        let fixture = landing_fixture(&mut app, Landing::UncachedArchive);
+        let source_rows = app.items.clone();
+        start_everything_for_test(&mut app, &ctx, "cancelled query before confirmation");
+        app.cancel_everything_search();
+        start_landing(&mut app, &ctx, &fixture);
+        let request_id = assert_modal_list_order_owner(&app, &fixture);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            app.poll_history_navigation_transition_for_test(&ctx);
+            tick_archive_conversion_dialog(&mut app, &ctx);
+            assert_eq!(assert_modal_list_order_owner(&app, &fixture), request_id);
+            if app
+                .archive_convert
+                .as_ref()
+                .is_some_and(|state| matches!(state.phase, ArchiveConvertPhase::Confirm { .. }))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "uncached archive did not reach confirmation"
+            );
+            std::thread::yield_now();
+        }
+        let state = app.archive_convert.as_ref().unwrap();
+        assert_eq!(state.src_path, fixture.row);
+        assert_eq!(
+            state.completion,
+            ArchiveConvertCompletionPolicy::StagedHistory(request_id)
+        );
+        assert!(!state.suppress_confirm);
+        assert!(
+            matches!(app.top_level_grid_view.history_navigation_transition(),
+            Some(HistoryNavigationTransition::Physical(request))
+                if matches!(request.phase, PhysicalHistoryPhase::ArchiveConverting))
+        );
+        if cancel {
+            assert!(
+                app.cancel_archive_convert_for_navigation("list_order_confirmation_cancel_test")
+            );
+            app.poll_history_navigation_transition_for_test(&ctx);
+            assert!(app.archive_convert.is_none());
+            assert_modal_cancel_preserves_source(&app, &fixture, &source_rows);
+            continue;
+        }
+        // This existing test entry invokes the Confirm button's production handler.
+        app.confirm_archive_convert_for_test();
+        assert!(matches!(
+            app.archive_convert.as_ref().map(|state| &state.phase),
+            Some(ArchiveConvertPhase::Converting { .. })
+        ));
+        assert_eq!(assert_modal_list_order_owner(&app, &fixture), request_id);
+        let mut saw_backing_preflight = false;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.archive_convert.is_some()
+            || app
+                .top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+        {
+            app.poll_history_navigation_transition_for_test(&ctx);
+            tick_archive_conversion_dialog(&mut app, &ctx);
+            if let Some(HistoryNavigationTransition::Physical(request)) =
+                app.top_level_grid_view.history_navigation_transition()
+            {
+                saw_backing_preflight |= matches!(
+                    request.phase,
+                    PhysicalHistoryPhase::ArchivePreflighting { .. }
+                );
+                assert_eq!(assert_modal_list_order_owner(&app, &fixture), request_id);
+            }
+            app.poll_sidecar_restore(&ctx);
+            assert!(
+                Instant::now() < deadline,
+                "confirmed archive did not adopt its backing"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            saw_backing_preflight,
+            "dialog completion must resume the same staged owner"
+        );
+        assert_ne!(app.current_folder.as_ref(), Some(&fixture.row));
+        assert_eq!(app.archive_source_override.as_ref(), Some(&fixture.row));
+        finish_modal_landing_and_return(&mut app, &ctx, &fixture);
+    }
+}
+
+#[test]
+fn list_order_everything_pdf_password_wait_resumes_original_owner_or_cancels() {
+    for cancel in [true, false] {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let fixture = landing_fixture(&mut app, Landing::ColdPdf);
+        let source_rows = app.items.clone();
+        // Replace only the external PDF process response. Enqueue, preflight,
+        // password-wait creation, Retry/Cancel, and final adoption remain real.
+        let pool = crate::pdf_loader::TestPdfEnumeratePool::new(&fixture.row);
+        start_everything_for_test(&mut app, &ctx, "cancelled query before password");
+        app.cancel_everything_search();
+        start_landing(&mut app, &ctx, &fixture);
+        let request_id = assert_modal_list_order_owner(&app, &fixture);
+        let job = pool.take();
+        assert_eq!(job.priority(), crate::pdf_loader::JobPriority::Critical);
+        job.fail(crate::pdf_loader::PdfReadError::PasswordRequired);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.pdf_password_dialog_path().as_ref() != Some(&fixture.row) {
+            app.poll_history_navigation_transition_for_test(&ctx);
+            app.poll_sidecar_restore(&ctx);
+            assert_eq!(assert_modal_list_order_owner(&app, &fixture), request_id);
+            assert!(
+                Instant::now() < deadline,
+                "PDF did not reach password input"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            matches!(app.top_level_grid_view.history_navigation_transition(),
+            Some(HistoryNavigationTransition::Physical(request))
+                if matches!(request.phase, PhysicalHistoryPhase::PdfPassword))
+        );
+        assert!(
+            matches!(app.pdf_password_request.as_ref().map(|request| &request.owner),
+            Some(PdfPasswordRequestOwner::StagedHistory(owner)) if *owner == request_id)
+        );
+        if cancel {
+            assert!(app.cancel_pdf_password_dialog_request());
+            assert!(app.pdf_password_dialog_path().is_none());
+            assert_modal_cancel_preserves_source(&app, &fixture, &source_rows);
+            continue;
+        }
+        assert!(app.retry_pdf_password_dialog_request("secret".into(), false));
+        assert!(app.pdf_password_dialog_path().is_none());
+        assert_eq!(assert_modal_list_order_owner(&app, &fixture), request_id);
+        assert!(
+            matches!(app.top_level_grid_view.history_navigation_transition(),
+            Some(HistoryNavigationTransition::Physical(request))
+                if matches!(&request.phase, PhysicalHistoryPhase::Preflighting {
+                    pdf_password_submission: Some((password, false)), ..
+                } if password == "secret"))
+        );
+        let resumed = pool.take();
+        assert_eq!(resumed.priority(), crate::pdf_loader::JobPriority::Critical);
+        resumed.complete(1);
+        finish_landing(&mut app, &ctx);
+        assert_eq!(app.pdf_current_password.as_deref(), Some("secret"));
+        finish_modal_landing_and_return(&mut app, &ctx, &fixture);
     }
 }
