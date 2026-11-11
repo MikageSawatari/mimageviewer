@@ -184,4 +184,79 @@ ACCEPT WITH CHANGES、P1 なし。P2 4 件をすべて反映した。
 
 ## 7. 実装記録
 
-(実装後に追記)
+### 7.1 実装と §4 の照合 (2026-11-11、feat-pad-inject)
+
+対象は base `4739dc589` 上の未コミット差分。実装・検証をこの worktree 内で行い、独立した
+GPT-6.1 Sol / xhigh のコードレビューは修正後 ACCEPT (未解決 P1/P2 なし)。
+
+- `gamepad.rs` の producer を `enqueue_pad_events` に集約した。OS 前面を一度だけ観測し、
+  UI 側の前提確認と受領票へ同じ値を渡す。上限 256・最古捨ては実入力と共通。
+  reader は Physical / Script / Stopped。Script の無効化でもキューを捨て、discarded に数える。
+  台本用の件数・共有ハンドルは runtime インスタンスの所有で、並列テスト間で共有しない。
+- **トリガー (§4):** 使用中の gilrs 0.11.2 と gilrs-core 0.6.8 のローカル依存ソースで確認。
+  Cargo の既定 Windows backend は WGI。`windows_wgi/gamepad.rs` は LeftTrigger / RightTrigger の
+  値変化を AxisValueChanged として送り、gilrs `gamepad.rs` のボタン軸変換は、未押下で
+  `value >= 0.75` なら ButtonPressed、押下中で `value <= 0.65` なら ButtonReleased を返し、
+  その後に ButtonChanged を返す。それ以外は ButtonChanged だけ。
+  `map_gilrs_event` 後は「押下／解放 (閾値を跨ぐ場合) → AxisChanged」。`pad_trigger` はこの順と
+  ヒステリシスを使用する。gilrs の OS 読み取り自体の検証には読み替えない。
+- **台本の稼働状態 (§4):** 既存の `test_script::runtime()` が持つ Option<UiRuntime> の有無を
+  `is_active()` で読み取る。起動時は `lib.rs` の App creator で `test_script::start` が完了してから
+  App の logic が始まる。Script の選択はテストと通常の ensure_started が同じ純関数を通る。
+  UI command 処理中の runtime lock を再取得しないよう、差し込み口は Script を明示して開始する。
+- **snapshot (§4):** 既存の App adapter は `ui_fullscreen.rs` の `test_script_snapshot`。
+  App 所有の `GamepadPhysicalInput` → runtime から診断を読み、`TestScriptSnapshot.gamepad` として
+  Rhai map に投影する。UI command は既存の `ui_update` に App の差し込み callback を渡す。
+  ack は snapshot 公開を待たず、UI 応答で受け取った Arc の件数を直接読む。
+- **X リング (§4):** `gamepad_input.rs` の方向押下は West 保持中に方向を記録し、West の解放で
+  `finish_gamepad_west_release` → Ring(direction) → 通常の割り当て実行へ進む。
+  `ring_shortcut.rs` の既定 grid profile の先頭 (Up) は GridParentFolder。
+  台本は X 押下 → 上押下 → X 解放 → 上解放の順を維持する。
+- 全 pad 命令、名前／数値検査、保持状態、5 秒の UI 応答＋drain 待ち、unchecked の後始末を追加。
+  通常入力は runtime.finish 後に積まない。終了時の Disconnected はキーの Cancel と同じ終端処理として、
+  既に finish が立っていても一度だけ積む。未差し込みの台本では切断を積まない。
+- GamepadBasic、使い捨て PNG fixture、runner の登録・証跡保存と台本 API 文書を追加。
+  専用 fullscreen viewport は既存 root paint owner の対象外なので、自動検査は全画面状態・ページ番号・
+  画像 identity・page_ready を使い、実表示は全 viewport の screenshot を証跡にする。
+  root の paint フラグを全画面の描画成功判定には流用しない。
+
+### 7.2 検証
+
+- feature なしの core `cargo check`: 成功 (3m09s)。
+- `portable,test-script` の core `cargo check`: 成功 (2m52s)。
+  ログ: `target/padinject-check-script.log`。既存の警告あり。
+- fixture の Python テスト: 4 件成功。PowerShell の構文検査はエラー 0 件、runner は ASCII のみ。
+- 引数なし `scripts/test-focused.ps1`: 文書・runner・fixture の未対応パスを検出して非ゼロ終了。
+  この実行ではテストを選択していない。Rust の対象パスを明示した実行を別途行う。
+- 初回の Rust 焦点テストは TurboJPEG の依存ビルド (MSBuild) が非ゼロで止まり、テスト未実行。
+  `-j 1` は nextest の実行並列数でありビルド並列数ではないため、その再試行でも同じ段階で停止した。
+  ワークツリー内の同一 CMake build directory の単独・直列 build は成功。
+  正しいビルド並列指定 `--build-jobs 1` では依存ビルドを通過した。
+  ログ: `target/padinject-tests-narrow.log`、`target/padinject-tests-narrow-retry.log`、
+  `target/padinject-turbojpeg-rebuild.log`、`target/padinject-tests-narrow-j1.log`。
+- その後の本体テストコンパイルは、新設した pointer test の WorkerState 参照パスが一段浅く
+  E0433 (1 件) になった。`super::super::gamepad_input` へ修正して再実行する。この段階もテスト未実行。
+- 修正後の本体 test build は成功 (10m21s) したが、一覧取得時に依存 DLL 不足
+  (`0xc0000135`) で停止し、テスト未実行。`development-build-and-test.md` の手順どおり、
+  この worktree の `vendor/ffmpeg/bin` の 6 DLL を `target/debug/deps` へ実ファイルとしてコピーし、
+  コピー元・先の SHA256 一致を確認した。既存の異なる DLL は上書きしない手順を使った。
+  ログ: `target/padinject-tests-narrow-final.log`。
+- `cargo nextest run -p mimageviewer --lib --features portable,test-script --build-jobs 1
+  -E 'test(/test_script::gamepad_input/)'`: **8 passed / 0 failed** (0.380s)。
+  ログ: `target/padinject-tests-narrow-run.log`。実 API を登録した Engine で GamepadBasic を
+  コンパイルする 1 件を含む (台本・アプリは実行しない)。
+- 同 command の `-E 'test(/gamepad|test_script|pad_/)'`: **344 passed / 0 failed** (19.880s)。
+  ログ: `target/padinject-tests-related.log`。producer の観測・容量・状態・件数、背景押下の抑止、
+  台本 API と既存 gamepad／test_script の回帰を含む。新規回帰は計 12 件。
+- `.\scripts\test-focused.ps1 -Path src/gamepad.rs,src/test_script.rs,src/app/gamepad_input/physical.rs
+  -Features portable,test-script`: **13 + 154 + 8 = 175 passed / 0 failed**。
+  ログ: `target/padinject-test-focused.log` と `target/test-focused/runs/` の各 run の JUnit。
+  上記 filter と重複するため、件数を合算して unique な検証件数とはしない。
+- `cargo fmt` (引数なし) を実行済み。最終 `cargo fmt --check` と `git diff --check`: exit 0。
+- 終了処理の修正を含む最終ソースの `portable,test-script` core check: exit 0 (23.71s)。
+  ログ: `target/padinject-check-script-final.log`。
+  製品ビルド対象の共有処理は最初の feature なし check 以後、整形以外の意味変更なし。
+
+実アプリ・ui-smoke は未実行。本体 lib 全件は依頼どおり実行せず、設計担当のロック取得後の gate に残す。
+コミットも行わない。製品機能を変更しない test-script 診断であり、通常 profile の build-dev 確認用 binary は
+今回の差し込みを使えないため作成しない。設計の主要な前提との相違は見つかっていない。
