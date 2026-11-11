@@ -318,7 +318,7 @@
 
 初回実装は `3621aefec` (設計担当がコミット)。§8.1〜8.4 はその実装・検証時の記録で、
 §8.5 は独立レビューへの追補修正 (`e85c702ef`)、§8.6 は設計担当の受入、§8.7 は §9 の追補実装 (`4a87140f3`)、
-§8.8 は §10 の追補実装 (未コミット)。
+§8.8 は §10 の追補実装 (`ed6429060`)、§8.9 はその全件テスト失敗への追補修正 (未コミット)。
 実装担当は製品バイナリの起動・実機観測・コミットを行っていない。
 設計の前提を source で照合し、既存の capture 入口、成功採用境界、Folder 行の採用後に内部書庫を開く順序を維持した。
 App の新しい pending / bool / 次回採用フラグ、detached 述語・viewport・registry 遷移の変更、新しい同期 I/O はない。
@@ -617,7 +617,7 @@ music-video companion。最終 build の後に 5 ファイルの存在・更新�
 レビュー担当は Cargo / 製品起動 / 編集を行っていない。
 製品ページのカードは変更せず、カードの上限検査は再実行していない。確認用 build は設計担当へ引き継ぐ。
 
-### 8.8 §10 アドレス欄・利用者のフォルダペイン操作の追補実装 (0833b63a7 後、未コミット)
+### 8.8 §10 アドレス欄・利用者のフォルダペイン操作の追補実装 (ed6429060 でコミット)
 
 設計の 4 種のアドレス Enter と利用者 pane 操作の前提を source で照合し、実装前の別 context の
 Sol / xhigh 独立レビューでも routing・受付・ready restore 継承を確認した (合意、阻害する指摘なし)。
@@ -708,6 +708,59 @@ Cargo 実行は `MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=4`。
 | `.\scripts\test-focused.ps1 -PlanOnly` | shared / unmapped paths を検出しテスト実行なし、runner exit 1。禁止された full suite へ進まず上記明示 filter を使う。 |
 | `cargo fmt` (workspace、引数なし、最後に再実行) / `cargo fmt --check` | ともに exit 0。検索入力部品と履歴▼の周辺に整形差分なし。 |
 | `git -c core.safecrlf=false diff --check` | exit 0。 |
+
+### 8.9 ed6429060 の全件テスト失敗 2 件の調査と修正 (未コミット)
+
+入力証拠は利用者提供の、ロック下で実行された全件 nextest の
+`target/test-lib-full/runs/20261111T101847481Z-ec099034/stderr.log`。
+その実行は 17,202 件中 17,200 成功・1 失敗・1 timeout、974.069s、75 skip であり、全件成功とは扱わない。
+本セッションでは全件を再実行せず、指定された単独・focused のみを実行する。
+変更ファイルは `src/app/tests.rs` と本書のみ。製品動作と性能テストは変更しない。
+
+1. `section1339_pane_enter_scan_crosses_real_search_refresh`:
+   - `handle_folder_pane_keyboard` → `start_user_folder_pane_open` → replace-ready が、検索中の要求を
+     `JumpToPhysicalFolder` として開始する。`resolve_main_folder_open_ready` の同 purpose 分岐は
+     `apply_jump_to_physical_folder_ready_with_navigation` で採用を処理してから **None を返す**。
+     普通の `PaneNavigation` が返す `ResolvedMainFolderOpen` を unwrap して再度手動 load する旧テストの consumer が不一致だった。
+     同じクエリの結果再公開による取消ではない。
+   - 同じクエリ・空の nav_stack の `execute_favsearch` は surface-switch 退役を行わない。
+     修正テストは実 refresh helper の再公開を挟み、元の `MainListNavigation` が current のまま、cancel が false、
+     pending が同一の navigation を保持することを明示的に検査する。
+   - ready の手動 poll / unwrap / load をやめ、実 `post_render_main_navigation` の通常 frame consumer で完了まで処理する。
+     成功後の `current_folder = directory`、本の行の存在を維持し、旧 `favsearch.nav_stack.last() = directory` は
+     利用者承認の §10 の仕様に従い `favsearch.active = false` へ変更する。
+     実履歴 Back で検索前の origin へ戻り、検索は閉じたまま、Forward が移動先を指すことも追加した。
+     Back 用の origin はテスト専用の実ディレクトリを作る。
+   - `rg` で section1339 / pane / search-refresh と resolver の同形 consumer を棚卸しした。
+     `section1339_search_refresh_crossing_pending_folder_scan_keeps_copied_destination` は既に消費型 jump として処理している。
+     required-fullscreen の再公開テストは消費型 None、ZIP preflight / classification の再公開テストは別の継続経路である。
+     `independent_folder_pane_intent_retires_offscreen_smart_request_before_poll` の unwrap は検索からの利用者操作ではなく
+     明示 `PaneNavigation` の内部 scan を対象にしており変更しない。これらを含む指定の合併 filter で検証する。
+2. `section1375_large_physical_scan_10k_100k`:
+   - 変更前の HEAD `ed6429060` で単独 filter を実行し、**1/1 成功、84.240s、exit 0**。
+     10k は scan 68.421ms / projection 52.030ms、100k は 650.156ms / 528.737ms。
+   - `git diff e85c702ef..HEAD -- src/app/folder_scan.rs src/app/book_materialization.rs Cargo.toml Cargo.lock .config/nextest.toml`
+     は差分なし。テストは App を生成せず、ローカルファイル作成 → scan → pure projection → drop だけを行い、
+     §9 / §10 の toolbar / address / pane dispatch を呼ばない。今回の製品差分が timeout の原因である根拠はない。
+   - 100k の eprintln 後には listing の破棄、worker が所有する `TempDir` の drop、worker join が残る。
+     Cargo.lock の tempfile 3.27.0 の `TempDir::drop` は `std::fs::remove_dir_all` で全ファイルを削除するため、
+     出力は一時ファイル削除の完了を意味しない。ファイル作成・削除は表示した scan / projection の計測外。
+     nextest の既存設定にもこのテストの過去最大 430s と 600s timeout が記録されている。
+   - 単独では timeout を再現しなかったため、元の 600s の OS 内待機箇所・負荷要因までは断定しない。
+     今回のナビゲーション差分とは無関係な時間超過として性能側を変更しない。timeout 延長・retry・計測の緩和も行わない。
+
+Cargo は `MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=4`。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(section1375_large_physical_scan_10k_100k)' --success-output immediate --no-fail-fast` | exit 0、1/1 成功、17,276 skip、84.240s、compile 1.46s。`target/search-nav-full-followup-scan.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(section1339_pane_enter_scan_crosses_real_search_refresh)' --no-fail-fast` (初回) | exit 101、テスト未実行。追加 enum 参照の修飾不足による E0433 を検出し、既存と同じ `super::FolderOpenScanPurpose` に訂正した。`target/search-nav-full-followup-pane.log` |
+| 上記ペイン単独コマンド (訂正後) | exit 0、1/1 成功、17,276 skip、3.523s、compile 3m52s。元要求の保持・実採用・favsearch 終了・Back / Forward を確認。`target/search-nav-full-followup-pane-final.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(section1339) \| test(pane) \| test(folder_pane)' --test-threads 6 --no-fail-fast` | **exit 0、593/593 成功、16,684 skip、102.267s、compile 2.40s**。`target/search-nav-full-followup-focused.log` |
+| `cargo fmt` (workspace、引数なし、テスト終了後) / `cargo fmt --check` | ともに exit 0。 |
+| `git -c core.safecrlf=false diff --check` | exit 0。差分は上記 2 ファイルのみ。 |
+
+製品起動・コミット・`test-lib-full` / `test-full` は行わない。全件 gate の再確認は設計担当へ引き継ぐ。
 
 ## 9. 追補: ツールバーのお気に入りもそろえる (2026-11-11 利用者決定)
 

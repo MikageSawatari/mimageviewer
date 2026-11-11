@@ -29719,13 +29719,14 @@ mod phase_c_folder_nav_history_tests {
         app.settings.sidecar_backup_enabled = false;
         let origin = app.tmp.path().join("pane-search-origin");
         let directory = app.tmp.path().join("pane-search-destination");
+        std::fs::create_dir_all(&origin).unwrap();
         std::fs::create_dir_all(&directory).unwrap();
         let book = directory.join("z-book.zip");
         write_1328_zip(&book);
         arm_context_jump_source(
             &mut app,
             TopLevelSearchView::Favorite,
-            origin,
+            origin.clone(),
             GridItem::ZipFile(book.clone()),
         );
         app.favsearch.query = "book".into();
@@ -29752,39 +29753,74 @@ mod phase_c_folder_nav_history_tests {
             },
         )
         .drop_without_applying_deltas();
-        assert!(app.folder_pane_open_pending.is_some());
+        let pending = app.folder_pane_open_pending.as_ref().unwrap();
+        assert!(matches!(
+            pending.purpose,
+            super::FolderOpenScanPurpose::JumpToPhysicalFolder { .. }
+        ));
+        let navigation = pending.navigation.clone().unwrap();
+        let cancel = pending.cancel.clone();
+        assert!(app.main_list_navigation_is_current(&navigation));
         refresh_favorite_zip_search_for_test(&mut app, &directory, &book);
+        assert!(app.main_list_navigation_is_current(&navigation));
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            app.folder_pane_open_pending
+                .as_ref()
+                .unwrap()
+                .navigation
+                .as_ref(),
+            Some(&navigation),
+            "same-query publication must retain the original pane request"
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let ready = loop {
-            if let Some(ready) = app.poll_folder_pane_open(&ctx) {
-                break ready;
-            }
-            assert!(
-                app.folder_pane_open_pending.is_some(),
-                "same-query result publication cannot cancel pane navigation"
+        while app.current_folder.as_ref() != Some(&directory)
+            || app.folder_pane_open_pending.is_some()
+            || app.sidecar_restore_active()
+        {
+            // Use the real frame consumer: JumpToPhysicalFolder is adopted inside
+            // resolve_main_folder_open_ready and returns None rather than a Direct load.
+            app.post_render_main_navigation(
+                &ctx,
+                crate::app::update_phases::MainFrameNavigation {
+                    fav_nav: None,
+                    toolbar_fav_nav: None,
+                    fullscreen_close_nav: None,
+                    keyboard_nav: None,
+                    keyboard_nav_from_fullscreen_close: false,
+                    gamepad_nav: None,
+                    address_nav: None,
+                    open_folder_nav: None,
+                    context_nav: None,
+                    folder_pane_nav: None,
+                    grid_nav: None,
+                },
             );
+            app.poll_sidecar_restore(&ctx);
             assert!(
                 std::time::Instant::now() < deadline,
-                "pane scan must complete"
+                "pane scan must adopt through the main frame after the same-query refresh"
             );
             std::thread::yield_now();
-        };
-        let ready = app.resolve_main_folder_open_ready(&ctx, ready).unwrap();
-        app.load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation(
-            ready.path,
-            Some(ready.scan),
-            super::OpenRequestOwner::Navigation,
-            None,
-            None,
-            ready.restore_intent,
-            ready.navigation,
-        );
+        }
         assert_eq!(app.current_folder.as_ref(), Some(&directory));
-        assert_eq!(app.favsearch.nav_stack.last(), Some(&directory));
+        assert!(!app.favsearch.active);
+        assert_eq!(
+            app.folder_history_back_target(),
+            Some(&FolderNavHistoryTarget::Path(origin.clone()))
+        );
         assert!(
             app.items
                 .iter()
                 .any(|item| item.drag_source_path() == Some(book.as_path()))
+        );
+        app.dispatch_folder_history_input_for_test(FolderHistoryDirection::Back);
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&origin));
+        assert!(!app.favsearch.active);
+        assert_eq!(
+            app.folder_history_forward_target(),
+            Some(&FolderNavHistoryTarget::Path(directory))
         );
     }
 
