@@ -456,7 +456,7 @@ fn run_depth_dialog_owner_case(host: &'static str, export: bool) {
         if let Some(sibling) = sibling {
             assert!(
                 !app.with_viewer_context(sibling, |owner| owner
-                    .mounted_viewer_owns_depth_dialogs())
+                    .depth_addon_dialog_in_mounted_viewer())
                     .unwrap()
             );
             assert!(
@@ -3551,4 +3551,113 @@ fn multiwindow_scenario_collection_root_stale_grid_open_is_terminal() {
     })
     .join()
     .expect("scenario thread");
+}
+
+fn independent_depth_dialog_scenario(export: bool, running_close: bool) {
+    std::thread::spawn(move || {
+        let _input = crate::key_input::lock_test_input();
+        let mut app = setup_app_for_test();
+        app.initialized = true;
+        app.indexer_init.mark_unavailable_if_not_ready();
+        let mut viewer = super::depth_main_window_tests::RootDepthViewer::linked(&mut app);
+        let ctx = viewer.ctx.clone();
+        app.set_fs_exclusive_view(
+            crate::fs_exclusive_view::FsExclusiveView::None,
+            "independent_owner_fixture",
+        );
+        let child =
+            app.build_active_context_for_test(Some(88_980), DetachedSource::Image, |owner| {
+                super::depth_view_tests::install_pages(owner, &ctx);
+                crate::app::source_texture_test_support::seed(owner, &ctx, 0);
+                owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+                owner.detached_viewer_independent_active = true;
+                owner.native_video_in_window_active = false;
+            });
+        app.with_viewer_context(child, |owner| {
+            owner.mark_active_detached_viewport_rendered(&ctx);
+            if export {
+                viewer.ready(owner);
+                viewer.frame(owner, vec![]);
+                viewer.frame(owner, vec![]);
+                let button = viewer.label("?????").center();
+                viewer.click(owner, button, false);
+                assert!(owner.depth_export_dialog_open());
+            } else {
+                owner
+                    .depth_setup
+                    .set_status_for_test(crate::addon::AddonStatus::Missing);
+                owner.toggle_depth_parallax(&ctx, 0);
+                assert!(owner.depth_setup.dialog_open_for_test());
+            }
+        })
+        .unwrap();
+        let viewport = App::detached_image_window_viewport_id(88_980);
+        let mut driver = ScenarioDriver::with_ctx(ctx.clone());
+        driver.focus(viewport);
+        let title = if export { "3D ???????" } else { "3D ????????" };
+        for _ in 0..4 {
+            let frame = driver.root(&mut app);
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+            app.with_viewer_context(child, |owner| {
+                assert_eq!(owner.fullscreen_idx, Some(0));
+                assert_eq!(
+                    owner.viewer_presentation,
+                    ViewerPresentation::DetachedWindow
+                );
+            })
+            .unwrap();
+            let surfaces: Vec<_> = frame
+                .labels
+                .iter()
+                .filter(|(_, labels)| labels.iter().any(|s| s == title))
+                .map(|(id, _)| *id)
+                .collect();
+            assert_eq!(
+                surfaces,
+                vec![viewport],
+                "independent owner only: {:?}",
+                frame.labels
+            );
+        }
+        assert!(!app.depth_addon_dialog_in_mounted_viewer());
+        if running_close {
+            app.depth_setup.set_dialog_running_for_test();
+            assert!(!app.depth_setup.modal_open());
+            assert!(!app.document_open_modal_admission_blocked());
+            app.close_fullscreen(); // Main is now a grid; independent owner remains live.
+            assert_eq!(
+                app.accept_active_detached_window_close(&ctx, 88_980, "addon_running_close"),
+                Some(true)
+            );
+            for _ in 0..2 {
+                driver.root(&mut app);
+            }
+            let frame = driver.root(&mut app);
+            let surfaces: Vec<_> = frame
+                .labels
+                .iter()
+                .filter(|(_, labels)| labels.iter().any(|s| s == title))
+                .map(|(id, _)| *id)
+                .collect();
+            assert_eq!(surfaces, vec![egui::ViewportId::ROOT]);
+            assert!(!app.common_modal_dialog_open());
+        }
+        crate::key_input::clear_test_frame();
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
+fn multiwindow_depth_independent_addon_dialog_is_drawn_only_in_owner_live_pass() {
+    independent_depth_dialog_scenario(false, false);
+}
+#[test]
+fn multiwindow_depth_independent_export_dialog_is_drawn_only_in_owner_live_pass() {
+    independent_depth_dialog_scenario(true, false);
+}
+#[test]
+fn multiwindow_depth_independent_running_addon_returns_to_actual_root_after_os_close() {
+    independent_depth_dialog_scenario(false, true);
 }

@@ -755,8 +755,10 @@ use final_prepare::{FinalEffectOrigin, FinalEffectReady, FinalEffectReceiver, Fi
 pub(crate) use prepared_edit::{
     FinalPipelineInvalidation, PreparedEditCancel, PreparedEditDisposition, PreparedEditReject,
 };
+mod depth_dialog;
 mod depth_export;
 mod depth_view;
+pub(crate) use depth_dialog::DepthDialogSurface;
 pub(crate) use depth_view::DepthEntryRequest;
 #[cfg(all(test, windows))]
 pub(crate) mod depth_main_window_tests;
@@ -42757,6 +42759,7 @@ impl App {
     pub(crate) fn document_open_modal_admission_blocked(&self) -> bool {
         self.book_structural_op.is_some()
             || self.depth_export_dialog_open()
+            || self.depth_independent_addon_modal_owner().is_some()
             || self.book_append_undo_in_progress()
             || self.image_folder_zip_operation.is_some()
             || self.composition_editor_modal_active()
@@ -69765,6 +69768,12 @@ impl App {
         }
         let snapshot = self
             .with_viewer_context(active_id, |app| {
+                if app.fs_exclusive_view.is_depth() {
+                    app.set_fs_exclusive_view(
+                        crate::fs_exclusive_view::FsExclusiveView::None,
+                        "park_active_live_media",
+                    );
+                }
                 let snapshot = app.build_parked_live_media_window_snapshot(ctx)?;
                 let window_id = snapshot.id;
                 app.activate_mounted_as_independent_detached(window_id);
@@ -100981,7 +100990,10 @@ impl App {
         // TRT pack オンラインインストールダイアログ (環境設定から起動)。
         self.show_trt_install_dialog(ctx);
         self.show_vlm_addon_dialog(ctx);
-        if !main_viewer_blocked && self.fullscreen_idx.is_none() {
+        if !main_viewer_blocked
+            && self.fullscreen_idx.is_none()
+            && self.depth_addon_dialog_on_main()
+        {
             self.show_depth_addon_dialog(ctx);
         }
         // 編集用追加パック (フォント + 被写体分離モデル) のオンライン取得ダイアログ。

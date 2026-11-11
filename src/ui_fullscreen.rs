@@ -30219,7 +30219,7 @@ impl App {
                 // 「DL ボタンを押しても何も起きない」状態になる (実機 FB 2026-06-06)。
                 // メイン update 側は fullscreen 中スキップするので二重描画にはならない。
                 self.show_editing_addon_dialog(ctx);
-                if self.mounted_viewer_owns_depth_dialogs() {
+                if self.depth_addon_dialog_in_mounted_viewer() {
                     self.show_depth_addon_dialog(ctx);
                 }
 
@@ -40136,10 +40136,8 @@ impl App {
             && ctx
                 .input(|input| input.pointer.hover_pos())
                 .is_some_and(|point| {
-                    ctx.data(|data| {
-                        data.get_temp::<egui::Rect>(egui::Id::unique("depth_panel_rect"))
-                    })
-                    .is_some_and(|rect| rect.contains(point))
+                    ctx.data(|data| data.get_temp::<egui::Rect>(self.depth_panel_rect_id()))
+                        .is_some_and(|rect| rect.contains(point))
                 });
         let cursor_in_panel = cursor_in_depth_panel
             || passive_hover_enabled
@@ -41732,7 +41730,7 @@ impl App {
     fn visible_depth_panel_rect(&self, ctx: &egui::Context) -> Option<egui::Rect> {
         match &self.fs_exclusive_view {
             crate::fs_exclusive_view::FsExclusiveView::Depth(state) if state.panel_visible => {
-                ctx.data(|data| data.get_temp(egui::Id::unique("depth_panel_rect")))
+                ctx.data(|data| data.get_temp(self.depth_panel_rect_id()))
             }
             _ => None,
         }
@@ -43593,7 +43591,11 @@ impl App {
     ) {
         // Own manual navigation and slideshow timers at their common boundary.
         // OS close still reaches teardown and cancels only the owning export.
-        if self.depth_export_dialog_open() && !close_fs {
+        if (self.depth_export_dialog_open()
+            || self.depth_independent_addon_modal_owner()
+                == Some(self.edit_request_owner_context()))
+            && !close_fs
+        {
             return;
         }
         if self.viewer_mutation_modal_active() {
@@ -54736,7 +54738,7 @@ impl App {
         available.max.y = available.max.y.min(full_rect.bottom() - 48.0);
         if state.panel_visible
             && let Some(panel) =
-                ctx.data(|data| data.get_temp::<egui::Rect>(egui::Id::unique("depth_panel_rect")))
+                ctx.data(|data| data.get_temp::<egui::Rect>(self.depth_panel_rect_id()))
             && panel.intersects(available)
         {
             available.max.x = available.max.x.min(panel.left() - 12.0);

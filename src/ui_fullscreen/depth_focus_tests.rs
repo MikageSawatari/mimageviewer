@@ -61,6 +61,7 @@ fn depth_collapsed_panel_next_pass_routes_mouse_ctrl_hover_and_touch_in_both_pre
                 let queue = child_events.clone();
                 let panel = std::rc::Rc::new(std::cell::Cell::new(egui::Rect::NOTHING));
                 let child_panel = panel.clone();
+                let panel_id = app.depth_panel_rect_id();
                 let observed_pass = std::rc::Rc::new(std::cell::Cell::new(0_u64));
                 let child_pass = observed_pass.clone();
                 let completed_passes = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -94,7 +95,7 @@ fn depth_collapsed_panel_next_pass_routes_mouse_ctrl_hover_and_touch_in_both_pre
                             }
                             ctx.root_ui(|ui| (viewport.viewport_ui_cb)(ui));
                             child_panel.set(
-                                ctx.data(|d| d.get_temp(egui::Id::unique("depth_panel_rect")))
+                                ctx.data(|d| d.get_temp(panel_id))
                                     .unwrap(),
                             );
                         },
@@ -133,7 +134,7 @@ fn depth_collapsed_panel_next_pass_routes_mouse_ctrl_hover_and_touch_in_both_pre
                             ctx.root_ui(|ui| app.render_fullscreen_viewport(ui));
                             if !fullscreen {
                                 panel.set(
-                                    ctx.data(|d| d.get_temp(egui::Id::unique("depth_panel_rect")))
+                                    ctx.data(|d| d.get_temp(panel_id))
                                         .unwrap(),
                                 );
                             }
@@ -299,7 +300,7 @@ fn depth_focus_canvas_click_uses_release_modifiers_and_preserves_prior_exclusion
                     app.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
                 }
                 if exclusion == "panel" && depth {
-                    ctx.data_mut(|d| d.insert_temp(egui::Id::unique("depth_panel_rect"), rect));
+                    ctx.data_mut(|d| d.insert_temp(app.depth_panel_rect_id(), rect));
                 }
                 let mut clicked = false;
                 for frame in 0..if exclusion == "double" { 5 } else { 3 } {
@@ -422,7 +423,7 @@ fn depth_focus_touch_panel_is_excluded_and_ctrl_taps_outside_still_turn_pages() 
         app.fs_focus_regained_at = None;
         let panel = viewer
             .ctx
-            .data(|d| d.get_temp::<egui::Rect>(egui::Id::unique("depth_panel_rect")))
+            .data(|d| d.get_temp::<egui::Rect>(app.depth_panel_rect_id()))
             .unwrap();
         let pos = if in_panel {
             panel.center_bottom() - egui::vec2(0., 10.)

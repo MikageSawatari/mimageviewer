@@ -228,3 +228,66 @@ fn depth_setup_confirmed_missing_does_not_resume_after_model_becomes_installed()
     assert!(!app.fs_exclusive_view.is_depth());
     crate::key_input::clear_test_frame();
 }
+
+fn independent_scan_case(change: &str) {
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let mut app = setup_app_for_test();
+    install_pages(&mut app, &ctx);
+    installed_pack(&mut app);
+    let main_generation = app.items_generation;
+    let context = app.build_active_context_for_test(Some(80_460), DetachedSource::Image, |owner| {
+        install_pages(owner, &ctx);
+        owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+        owner.detached_viewer_independent_active = true;
+    });
+    app.with_viewer_context(context, |owner| {
+        owner.mark_active_detached_viewport_rendered(&ctx);
+        assert!(owner.viewer_context_live(context));
+        press_d(owner, &ctx);
+        assert_eq!(owner.depth_setup.dialog_owner_context(), Some(context));
+        if change == "page" {
+            owner.fullscreen_idx = Some(3);
+        }
+    })
+    .unwrap();
+    if change == "inactive" {
+        app.build_active_context_for_test(Some(80_461), DetachedSource::Image, |owner| {
+            install_pages(owner, &ctx);
+            owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+            owner.detached_viewer_independent_active = true;
+        });
+    }
+    // This is ROOT's poll, with main mounted rather than the requesting context.
+    finish_scan(&mut app, &ctx);
+    assert!(!app.fs_exclusive_view.is_depth());
+    assert_eq!(app.items_generation, main_generation);
+    assert_eq!(app.fullscreen_idx, Some(0));
+    app.with_viewer_context(context, |owner| {
+        assert_eq!(owner.fs_exclusive_view.is_depth(), change == "unchanged");
+        if let FsExclusiveView::Depth(state) = &owner.fs_exclusive_view {
+            assert_eq!(state.context, context);
+        }
+    })
+    .unwrap();
+    assert!(!app.depth_setup.dialog_open_for_test());
+    app.poll_depth_setup(&ctx);
+    assert!(
+        !app.fs_exclusive_view.is_depth(),
+        "completion cannot enter ROOT later"
+    );
+    crate::key_input::clear_test_frame();
+}
+
+#[test]
+fn depth_setup_independent_installed_scan_resumes_only_the_requesting_context_from_root() {
+    independent_scan_case("unchanged");
+}
+#[test]
+fn depth_setup_independent_installed_scan_discards_changed_page() {
+    independent_scan_case("page");
+}
+#[test]
+fn depth_setup_independent_installed_scan_discards_inactive_window() {
+    independent_scan_case("inactive");
+}

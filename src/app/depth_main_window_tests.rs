@@ -5,6 +5,7 @@ use crate::fs_exclusive_view::FsExclusiveView;
 
 pub(crate) struct RootDepthViewer {
     pub(crate) ctx: egui::Context,
+    context: ViewerContextId,
     pub(crate) size: egui::Vec2,
     pub(crate) shapes: Vec<egui::epaint::ClippedShape>,
     minimized: bool,
@@ -72,6 +73,7 @@ impl RootDepthViewer {
         assert!(app.depth_entry_allowed(0).is_ok());
         assert!(app.fullscreen_embedded_still_active());
         Self {
+            context: app.edit_request_owner_context(),
             ctx,
             size: egui::vec2(1093.0, 614.0),
             shapes: vec![],
@@ -112,6 +114,7 @@ impl RootDepthViewer {
         let commands = child.commands.clone();
         let actual_ppp = child.actual_ppp.clone();
         let depth_painted = child.depth_painted.clone();
+        let receipt_context = app.edit_request_owner_context();
         let modal_layers = child.modal_layers.clone();
         egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
             passes.set(passes.get() + 1);
@@ -149,7 +152,10 @@ impl RootDepthViewer {
                     (viewport.viewport_ui_cb)(ui);
                     actual_ppp.set(ui.ctx().pixels_per_point());
                     depth_painted.set(
-                        crate::app::depth_export::display_painted_this_pass_for_test(ui.ctx()),
+                        crate::app::depth_export::display_painted_this_pass_for_test(
+                            ui.ctx(),
+                            receipt_context,
+                        ),
                     );
                     *modal_layers.borrow_mut() = depth_modal_layers(ui.ctx());
                 },
@@ -367,7 +373,7 @@ impl RootDepthViewer {
 
     pub(super) fn panel(&self) -> egui::Rect {
         self.ctx
-            .data(|d| d.get_temp(egui::Id::unique("depth_panel_rect")))
+            .data(|d| d.get_temp(egui::Id::unique(("depth_panel_rect", self.context))))
             .unwrap()
     }
 
@@ -897,7 +903,7 @@ fn depth_top_button_color_matches_the_context_and_session_entry_matrix() {
         let _input = crate::key_input::lock_test_input();
         for presentation in [ViewerPresentation::MainWindow, ViewerPresentation::Fullscreen,
             ViewerPresentation::DetachedWindow] {
-            for (other_context, independent) in [(false, false), (false, true), (true, false)] {
+            for (other_context, independent, occupied) in [(false, false, false), (false, true, false), (true, false, false), (true, true, false), (false, false, true), (true, true, true)] {
                 let mut app = setup_app_for_test();
                 let mut viewer = if presentation == ViewerPresentation::MainWindow {
                     RootDepthViewer::new(&mut app)
@@ -908,6 +914,14 @@ fn depth_top_button_color_matches_the_context_and_session_entry_matrix() {
                         crate::app::source_texture_test_support::seed(owner, &viewer.ctx, 0);
                     })
                 } else { app.viewer_context_main() };
+                let blocker = if context == app.viewer_context_main() {
+                    app.build_window_context_for_test(88_971, |_| {})
+                } else { app.viewer_context_main() };
+                app.with_viewer_context(blocker, |owner| {
+                    owner.set_fs_exclusive_view(if occupied {
+                        FsExclusiveView::Depth(DepthViewState::new(owner.edit_request_owner_context()))
+                    } else { FsExclusiveView::None }, "button_other_owner");
+                }).unwrap();
                 app.with_viewer_context(context, |owner| {
                     owner.viewer_presentation = presentation;
                     owner.detached_viewer_independent_active = independent;
@@ -915,7 +929,7 @@ fn depth_top_button_color_matches_the_context_and_session_entry_matrix() {
                     owner.settings.video_in_window_mode = presentation == ViewerPresentation::MainWindow;
                     owner.settings.detached_viewer_enabled = presentation == ViewerPresentation::DetachedWindow;
                     owner.set_fs_exclusive_view(FsExclusiveView::None, "button_entry_matrix");
-                    let allowed = !other_context && (presentation != ViewerPresentation::DetachedWindow || !independent);
+                    let allowed = !occupied;
                     assert_eq!(owner.depth_entry_allowed(0).is_ok(), allowed);
                     for _ in 0..3 {
                         viewer.frame(owner, vec![egui::Event::PointerMoved(egui::pos2(300., 12.))]);

@@ -399,7 +399,7 @@ impl App {
         self.draw_favorite_default_clear_confirm_dialog(ctx);
         self.draw_export_dialog(ctx);
         self.draw_export_progress_dialog(ctx);
-        if self.mounted_viewer_owns_depth_dialogs() {
+        if self.depth_export_dialog_in_mounted_viewer() {
             self.draw_depth_export_dialog(ctx);
         }
     }

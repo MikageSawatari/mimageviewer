@@ -780,12 +780,11 @@ fn depth_presentation_entry_continuation_and_commit_share_context_eligibility() 
                 ViewerPresentation::DetachedWindow,
             ] {
                 for independent in [false, true] {
-                    let eligible = context == owner.viewer_context_main()
-                        && (source != ViewerPresentation::DetachedWindow || !independent);
+                    let eligible = true;
                     owner.viewer_presentation = source;
                     owner.detached_viewer_independent_active = independent;
                     assert_eq!(owner.depth_entry_allowed(0), if eligible { Ok(()) } else {
-                        Err(DepthEntryBlock::Detached)
+                        Err(DepthEntryBlock::OtherWindow)
                     }, "context={context:?}, source={source:?}, independent={independent}");
                     depth(owner);
                     assert_eq!(owner.depth_view_may_continue(0), eligible);
@@ -798,8 +797,7 @@ fn depth_presentation_entry_continuation_and_commit_share_context_eligibility() 
                             owner.feedback_toasts_for_test.clear();
                             owner.commit_viewer_session(target, target_independent, "depth_session_matrix");
                             assert_eq!(owner.viewer_presentation, target);
-                            let target_eligible = context == owner.viewer_context_main()
-                                && (target != ViewerPresentation::DetachedWindow || !target_independent);
+                            let target_eligible = true;
                             let continues = eligible && target_eligible && source == target
                                 && independent == target_independent;
                             assert_eq!(owner.fs_exclusive_view.is_depth(), continues,
@@ -2650,7 +2648,7 @@ fn depth_wait_actual_viewer_box_obeys_delay_and_panel_visibility() {
             if panel_visible {
                 let panel = viewer
                     .ctx
-                    .data(|data| data.get_temp::<egui::Rect>(egui::Id::unique("depth_panel_rect")))
+                    .data(|data| data.get_temp::<egui::Rect>(app.depth_panel_rect_id()))
                     .unwrap();
                 assert!(
                     !rect.intersects(panel),
@@ -2964,4 +2962,140 @@ fn depth_actual_mouse_page_navigation_ignores_suspended_2d_transforms() {
     })
     .join()
     .unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn depth_other_window_entry_is_readonly_in_both_directions_and_scoped_mount_keeps_owner() {
+    for main_owns in [true, false] {
+        let ctx = egui::Context::default();
+        let mut app = setup_app_for_test();
+        install_pages(&mut app, &ctx);
+        let main = app.viewer_context_main();
+        let child =
+            app.build_active_context_for_test(Some(70_340), DetachedSource::Image, |owner| {
+                install_pages(owner, &ctx);
+                owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+                owner.detached_viewer_independent_active = true;
+            });
+        let (owner_id, rejected) = if main_owns {
+            (main, child)
+        } else {
+            (child, main)
+        };
+        let evidence = app
+            .with_viewer_context(owner_id, |owner| tracked_depth(owner, false))
+            .unwrap();
+        app.with_viewer_context(rejected, |owner| {
+            let generation = owner.items_generation;
+            let presentation = owner.viewer_presentation;
+            assert_eq!(
+                owner.depth_entry_allowed(0),
+                Err(DepthEntryBlock::OtherWindow)
+            );
+            owner.toggle_depth_parallax(&ctx, 0);
+            assert!(!owner.fs_exclusive_view.is_depth());
+            assert!(!owner.depth_setup.dialog_open_for_test());
+            assert_eq!(owner.items_generation, generation);
+            assert_eq!(owner.viewer_presentation, presentation);
+            assert_eq!(owner.fullscreen_idx, Some(0));
+            assert_eq!(
+                owner.fs_feedback_toast.as_ref().unwrap().0,
+                DepthEntryBlock::OtherWindow.message()
+            );
+        })
+        .unwrap();
+        app.with_viewer_context(owner_id, |owner| {
+            assert_depth_owner_live(owner, &evidence);
+            assert!(owner.depth_view_may_continue(0));
+            owner.set_fs_exclusive_view(FsExclusiveView::None, "owner_finish");
+        })
+        .unwrap();
+        assert!(evidence.cancel.unwrap().load(Ordering::Acquire));
+        app.with_viewer_context(rejected, |owner| {
+            assert_eq!(owner.depth_entry_allowed(0), Ok(()))
+        })
+        .unwrap();
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn depth_independent_live_media_park_retires_request_and_slot_and_releases_entry() {
+    for ready in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = setup_app_for_test();
+        install_pages(&mut app, &ctx);
+        let render = isolate_depth_renderer(&mut app);
+        let mut evidence = None;
+        let child =
+            app.build_active_context_for_test(Some(70_341), DetachedSource::Video, |owner| {
+                install_pages(owner, &ctx);
+                owner.wgpu_render_state = Some(render.clone());
+                owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+                owner.detached_viewer_independent_active = true;
+                let path = PathBuf::from("depth-park-live.mp4");
+                owner.fs_cache.insert(
+                    1,
+                    FsCacheEntry::Video {
+                        player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                            path, 3.0,
+                        )),
+                        load_seq: 0,
+                    },
+                );
+                evidence = Some(tracked_depth(owner, ready));
+            });
+        assert!(app.park_active_detached_context_as_live_media(&ctx, "depth_test_live_park"));
+        let evidence = evidence.unwrap();
+        if let Some(cancel) = evidence.cancel {
+            assert!(cancel.load(Ordering::Acquire));
+        }
+        assert!(
+            render
+                .renderer
+                .read()
+                .callback_resources
+                .get::<crate::depth_parallax_wgpu::DepthRenderResourcesRef>()
+                .is_none()
+        );
+        app.with_viewer_context(child, |owner| assert!(!owner.fs_exclusive_view.is_depth()))
+            .unwrap();
+        assert_eq!(app.depth_entry_allowed(0), Ok(()));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn depth_independent_os_close_retires_request_and_slot_and_releases_entry() {
+    for ready in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = setup_app_for_test();
+        install_pages(&mut app, &ctx);
+        let render = isolate_depth_renderer(&mut app);
+        let mut evidence = None;
+        app.build_active_context_for_test(Some(70_342), DetachedSource::Image, |owner| {
+            install_pages(owner, &ctx);
+            owner.wgpu_render_state = Some(render.clone());
+            owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+            owner.detached_viewer_independent_active = true;
+            evidence = Some(tracked_depth(owner, ready));
+        });
+        assert_eq!(
+            app.accept_active_detached_window_close(&ctx, 70_342, "depth_test_close"),
+            Some(true)
+        );
+        if let Some(cancel) = evidence.unwrap().cancel {
+            assert!(cancel.load(Ordering::Acquire));
+        }
+        assert!(
+            render
+                .renderer
+                .read()
+                .callback_resources
+                .get::<crate::depth_parallax_wgpu::DepthRenderResourcesRef>()
+                .is_none()
+        );
+        assert_eq!(app.depth_entry_allowed(0), Ok(()));
+    }
 }

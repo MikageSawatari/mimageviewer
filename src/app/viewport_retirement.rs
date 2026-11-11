@@ -43,9 +43,10 @@ impl App {
         if self.sidecar_restore_target_window_id() == Some(window_id) {
             return Some(false);
         }
-        let allowed = match self
-            .with_window_viewer_context_state(window_id, |app| !app.viewer_mutation_modal_active())
-        {
+        let allowed = match self.with_window_viewer_context_state(window_id, |app| {
+            !app.viewer_mutation_modal_active()
+                && !app.depth_independent_modal_owned_by(app.edit_request_owner_context())
+        }) {
             Ok(allowed) => allowed,
             Err(error) => {
                 crate::logger::log(format!(

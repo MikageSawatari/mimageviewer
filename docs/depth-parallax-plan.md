@@ -22,7 +22,7 @@
 
 ### v1 に含める
 
-- メイン context のウィンドウ表示 / 全画面 / linked F12 別ウィンドウの **3D 表示モード** (以下「3D モード」、§6.4.2)。ON/OFF はキーと閲覧上部の
+- ウィンドウ表示 / 全画面 / 別ウィンドウの **3D 表示モード** (以下「3D モード」、§6.4.3)。main と独立 context のどちらでも使え、同時に持てるのは 1 context。ON/OFF はキーと閲覧上部の
   ボタン。入ると右側に **3D パネル**が出る。
 - 動き: **マウス追従 / 左右 / 円 / 8 の字 / 上下**。強さ・周期・止まる深さ・奥行き整形をパネルで選ぶ。
   設定は画像ごとではなく全体の設定として保存する。
@@ -37,7 +37,7 @@
 | --- | --- |
 | 動画、アニメーション画像 (GIF / APNG / WebP) | フレームごとに深度が変わりちらつく。研究調査 §6 と同じ |
 | 見開き・連結読み | 2 ページを 1 つの奥行きとして扱えない。360° と同じく入口で弾く |
-| **独立 session の別ウィンドウ、独立 context** | §6.4.2 第 2 段。複数ウィンドウモードの窓・メディアウィンドウは対象外。main の linked F12 は対象 |
+| **複数 context での同時 3D** | §6.4.3。複数ウィンドウモード・メディアウィンドウも対象だが、一度に 1 context だけが持つ |
 | 360° パノラマ表示との同時使用 | どちらも表示を占有するモード。3D に入ると 360° は終わり、3D 中は 360° に入れない (§6.2) |
 | 深度の手修正、左右並び (SBS)、2 層化と背景補完 | 研究調査 §6 の v1.x / v2 |
 | 先読み (次のページの深度を前もって計算) | dGPU では 30〜50 ms で不要。内蔵 GPU で 1 秒待つ点は試験実装で評価してから |
@@ -303,7 +303,7 @@ hidden / minimized は予約せず、Ready / Failed / OFFでは箱と箱由来�
 
 - 画像の閲覧中でない、動画、アニメーション画像
 - 見開きの 2 ページ表示中、連結読み
-- メイン context の MainWindow / Fullscreen / 独立でない DetachedWindow でない (§6.4.2)。共通の `App::depth_presentation_eligible` で context・presentation・session の独立性を照合する
+- ほかの context が 3D を持っている (§6.4.3)。`other_viewer_context_ids` と `with_viewer_context_ref` で読み取り、`OtherWindow` で拒否する。presentation と独立性の許可集合は持たない
 - wgpu の描画状態が無い
 - 編集系のモード (消しゴム・隠蔽加工・補正レイヤー・テキスト注釈・切り取り・SNS 分割) の最中
 
@@ -312,7 +312,7 @@ hidden / minimized は予約せず、Ready / Failed / OFFでは箱と箱由来�
 360° が ON のときに 3D へ入るのは弾かず、§6.2 の 1 つの持ち主が 360° を終わらせてから 3D にする。
 
 **同じ条件を「続けてよいか」にも使う**: 入口条件のうちページと表示の状態に関わるもの
-(静止画・1 ページ・連結読みでない・メインの表示) は、3D 中も毎フレーム同じ関数で照合する (§6.3)。
+(静止画・1 ページ・連結読みでない・ほかが 3D を持っていない) は、3D 中も毎フレーム同じ関数で照合する (§6.3)。
 
 ### 6.2 状態 — 表示を占有するモードの持ち主を 1 つにする
 
@@ -409,33 +409,29 @@ pub enum DepthSourcePhase {
 
 ### 6.4 別ウィンドウ (detached viewer) と 3D モード
 
-- **メイン context の MainWindow / Fullscreen / linked DetachedWindow** で使える (§6.4.2 第 1 段)。独立 session・独立 context は対象外。理由: 3D モードは毎フレームの再描画・
-  GPU 資源・深度 worker を持つ。複数の viewer で同時に動かすと、`callback_resources` の slot、
-  worker の要求の取り合い、park / fork 時の移動先、と組み合わせが増える。v1 では入口で弾いて
-  組み合わせを作らない。
-- それでも状態は `ViewerContextBundle` に置く。メインの bundle が mount を外れる間 (active detached を
-  mount している間) に App の field として見えてしまわないため。
-- **「メイン」の定義**: context の識別子 (メインの bundle か) と、**今の presentation** (メイン窓の
-  MainWindow / Fullscreen / linked DetachedWindow か) と session の独立性で決める。メインの context 自身も複数ウィンドウモードでは独立 session に
-  なるので、識別子の比較だけでは足りない。独立性は mounted の `ViewerSession.independent_active` を読む。
+- **main・独立 context のどの画像閲覧表示でも使える** (§6.4.3)。複数ウィンドウモードで main 自身が独立 session になっている窓も含む。
+  GPU slot・worker・ダイアログの組合せは、入口で「プロセス全体で 1 context」に制限して減らす。
+- 状態は `ViewerContextBundle` に置き、scoped mount では維持する。ほかの context の 3D は読み取りだけで照合し、
+  新しい入場のために兄弟の状態を終えたり資源を消したりしない。
+- **「メイン」の定義**は context の識別子。main 所有と環境設定由来のダイアログの見え方・受付規則は維持する。
+  presentation・session の独立性は入場の許可条件ではなく、実 session 切替の終了判定にだけ使う。
 - **presentation の切替を確定する所で 3D を終える**: 通常の F12 は
   `apply_egui_viewer_presentation_for_current_item` (app.rs:91819 → 91624) で presentation を変え、
   `reset_detached_pause_foreground_modes` は通らない。F12 のキー処理に OFF を足すのではなく、
-  **viewer の session を確定する共通の確定点** (`commit_viewer_session`。presentation だけの入口は `commit_viewer_presentation`) で、実際の表示・独立性の切替または切替先が共通適格性を満たさなければ §6.2 の持ち主で
+  **viewer の session を確定する共通の確定点** (`commit_viewer_session`。presentation だけの入口は `commit_viewer_presentation`) で、実際の表示・独立性の切替があれば §6.2 の持ち主で
   `Depth` を終える。360° は別ウィンドウでも使えるので、ここでは `Depth` だけを終える。
-  - 加えて §6.3 の描画直前の照合が、確定点を通らない経路があっても不適格な session で 3D を
+  - 加えて §6.3 の描画直前の照合が、媒体・ページ・排他条件を満たさない状態で 3D を
     描かないことを保証する (2 つは役割が違う: 確定点は状態の持ち主の後始末、照合は描画の安全)。
   - F12 の表示先切替では終了し、切替先で新しく D を押せば入場する。窓内 F11 は確定点を通らず継続する。
-- park / fork の経路で main の 3D の状態を相手側へ渡す処理は作らない。main の Depth を搬送する前に
-  既存 fork の退役点・park の `reset_detached_pause_foreground_modes` を通して OFF にする。
-  main 以外の live-media park の終了漏れは §6.4.2 第 2 段の検討対象とする。
-- detached の述語に触れる箇所 (入口条件の「メインの viewer か」と park 時の OFF) は、
+- live pass を失う park / fork / close では Depth を終了する。独立した live-media park も snapshot 作成前に
+  その context の Depth だけを退役し、360° の意図を変えない。ダイアログの寿命・表示先・独立所有窓の modal 保護は §6.4.3 の規則に従う。
+- detached の述語に触れる箇所 (live・dialog 所有・modal の受付・park 時の OFF) は、
   CLAUDE.md「Detached viewer リワーク中のルール」に従い、**ClaudeCode と Codex の双方のレビューで
   症状パッチではない構造的な変更だと合意**し、detached-rework-plan.md §11 に記録する。
 
 #### 6.4.1 MainWindow 対応 (2026-11-08、案1を採択・実装済み)
 
-以下は MainWindow 対応時点の記録。現在の適用範囲は §6.4.2 を正本とする。
+以下は MainWindow 対応時点の記録。現在の適用範囲は §6.4.3 を正本とする。
 当時の対象は **メイン context の `MainWindow` と `Fullscreen`**。`DetachedWindow` と独立 context は
 引き続き対象外で、§6.4 の複数 viewer・GPU slot・worker・park/fork の理由を変更しない。
 設計担当 ClaudeCode が案1を採択し、独立 Sol / xhigh と症状パッチではない構造変更であることに合意した。
@@ -531,18 +527,20 @@ pub enum DepthSourcePhase {
 
 #### 6.4.2 F12 の別ウィンドウ対応 (§1.767、2026-11-11)
 
+以下は第 1 段の設計・実装の記録。現在は §6.4.3 で独立した窓も対象にしている。
+本節の決定 B・C・E は維持し、main 限定の適格性と決定 D は §6.4.3 の所有・表示先の規則へ一般化した。
+
 設計: ClaudeCode Opus 5.5。worktree `G:\home\mimageviewer-depth2`、ブランチ `feat-766-767-depth-ui`。
 利用者決定 (2026-11-11): 360° は別ウィンドウで使えるので、3D も F12 の別ウィンドウで使えるようにする。
 行番号は基点 `18d528908` の調査時点 (関数名を追跡の正本とする)。
 
 **範囲を 2 段に分ける (設計担当の判断)**
 
-- **第 1 段 (今回実装)**: フル機能ウィンドウモードで F12 を押し、**main context をそのまま別ウィンドウに出している表示**
+- **第 1 段 (実装済み)**: フル機能ウィンドウモードで F12 を押し、**main context をそのまま別ウィンドウに出している表示**
   (linked F12。`ViewerPresentation::DetachedWindow` かつ独立 session でない) とその枠なし全画面。バックログ §1.767 の
   「まず F12 で開く閲覧ウィンドウの通常表示と枠なし全画面が対象」に当たる。
-- **第 2 段 (保留、統括・利用者の判断待ち)**: 複数ウィンドウモードの各窓、フル機能モードのメディアウィンドウなど、
-  **main 以外の独立 context** での 3D。下の「第 2 段で要るもの」のとおり、資源とダイアログの持ち主が main 以外になることで
-  設計が大きく増え、既存操作に新しい制限も入る。
+- **第 2 段 (§6.4.3 で利用者採択)**: 複数ウィンドウモードの各窓、フル機能モードのメディアウィンドウなど、
+  **main 以外の独立 context** での 3D。下の課題を単一所有と独立所有窓だけの modal 保護へ整理した。
 
 **調査で分かったこと (コード確認)**
 
@@ -625,7 +623,7 @@ E. **backstop の frame は 2D のまま**。描画経路を 2 つにしない�
 **状態を減らす検討**: 3D の持ち主を main 1 つに保つことで、資源の取り合い・ダイアログの持ち主・所有 viewer の終了後の表示先は、
 すべて今の main の挙動の範囲に収まる。新しい状態・gate・待ちは足さない。
 
-**第 2 段で要るもの (設計レビュー r1〜r3 で分かったこと。保留)**
+**第 2 段へ整理した課題 (設計レビュー r1〜r3 の調査記録。採択仕様は §6.4.3)**
 
 独立 context を対象にすると、3D とダイアログの持ち主が main 以外になる。r1〜r3 のレビューで次が必要と分かった:
 - プロセス全体で 3D は 1 context (main の埋め込みと独立 context が同じ frame に live pass を持つため。入口で他の bundle を読んで拒否)。
@@ -635,7 +633,7 @@ E. **backstop の frame は 2D のまま**。描画経路を 2 つにしない�
   窓の切替・外部からの開く要求を追加モデルの確認中も拒否する (**今は受け付けている操作への新しい制限**)、所有窓の OS の閉じる操作を拒否する、
   modal 中の自動送り (スライドショー・フォルダをまたぐ送り) と受付済みの遷移の扱い。
 - 独立 context から D を押したときの、モデル確認の完了後の入場の再開 (ROOT の poll から要求元 context へ配送)。
-これらは「既存操作に新しい制限を入れるか」(CLAUDE.md「通常の使い方が不便になる変更」) を含むので、統括・利用者の判断を待つ。
+これらの新しい制限は、利用者が第 2 段を進めると決めた後、§6.4.3 の範囲で採択した。
 
 **detached 述語・viewport 経路に触れる範囲 (第 1 段)** (CLAUDE.md「Detached viewer リワーク中のルール」)
 

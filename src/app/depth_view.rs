@@ -8,7 +8,7 @@ use crate::fs_exclusive_view::{ExclusiveViewKind, FsExclusiveView};
 /// Textures can refine during the check, so content/list identity owns this intent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DepthEntryRequest {
-    context: ViewerContextId,
+    pub(crate) context: ViewerContextId,
     items_generation: u64,
     fs_idx: usize,
     item_id: crate::item_identity::ItemId,
@@ -74,11 +74,6 @@ pub(crate) fn depth_wait_status(
 }
 
 impl App {
-    /// Depth and its process-wide dialogs are owned only by the main viewer context.
-    pub(crate) fn mounted_viewer_owns_depth_dialogs(&self) -> bool {
-        self.projected_viewer_context_id() == self.viewer_context_main()
-    }
-
     pub(crate) fn panorama_state(&self) -> Option<&crate::panorama::PanoramaState> {
         self.fs_exclusive_view.panorama_state()
     }
@@ -130,12 +125,17 @@ impl App {
             return Err(DepthEntryBlock::NotImageViewer);
         }
         #[cfg(windows)]
-        let (main_viewer_presentation, wgpu_available) = (
-            self.depth_presentation_eligible(self.viewer_presentation),
+        let (other_window_depth, wgpu_available) = (
+            self.other_viewer_context_ids().into_iter().any(|context| {
+                self.with_viewer_context_ref(context, |owner| {
+                    owner.texture_caches().fs_exclusive_view.is_depth()
+                })
+                .unwrap_or(false)
+            }),
             self.wgpu_render_state.is_some(),
         );
         #[cfg(not(windows))]
-        let (main_viewer_presentation, wgpu_available) = (true, false);
+        let (other_window_depth, wgpu_available) = (false, false);
         crate::depth_parallax::entry_allowed(DepthEntryInput {
             image_viewer: self.fullscreen_idx == Some(fs_idx)
                 && self.items.get(fs_idx).is_some_and(GridItem::has_page_data),
@@ -149,7 +149,7 @@ impl App {
                 crate::ui_fullscreen::SpreadPair::Double { .. }
             ),
             continuous_reading: !self.reading_flow.is_paged(),
-            main_viewer_presentation,
+            other_window_depth,
             wgpu_available,
             editing: self.is_overlay_edit_mode_active(),
             page_turning: self.page_turn_barrier_active() || self.page_turn_completion_active(),
@@ -168,21 +168,6 @@ impl App {
         true
     }
 
-    /// Entry and presentation commits share the same context/presentation boundary.
-    #[cfg(windows)]
-    pub(crate) fn depth_presentation_eligible(&self, presentation: ViewerPresentation) -> bool {
-        self.depth_session_eligible(presentation, self.detached_viewer_independent_active)
-    }
-
-    #[cfg(windows)]
-    fn depth_session_eligible(&self, presentation: ViewerPresentation, independent: bool) -> bool {
-        self.projected_viewer_context_id() == self.viewer_context_main()
-            && (matches!(
-                presentation,
-                ViewerPresentation::MainWindow | ViewerPresentation::Fullscreen
-            ) || (presentation == ViewerPresentation::DetachedWindow && !independent))
-    }
-
     /// Retire before changing hosts, even between eligible presentations. This keeps
     /// pending requests, their viewport wake target and GPU resources in one lifetime.
     #[cfg(windows)]
@@ -194,7 +179,7 @@ impl App {
         self.commit_viewer_session(target, self.detached_viewer_independent_active, cause);
     }
 
-    /// Judge the destination session before the caller publishes its independence flag.
+    /// Retire on a real session change before publishing its independence flag.
     #[cfg(windows)]
     pub(crate) fn commit_viewer_session(
         &mut self,
@@ -231,22 +216,16 @@ impl App {
         target_independent: bool,
         cause: &'static str,
     ) -> Option<String> {
-        let eligible = self.depth_session_eligible(target, target_independent);
         let feedback = if self.fs_exclusive_view.is_depth()
             && (target != self.viewer_presentation
-                || target_independent != self.detached_viewer_independent_active
-                || !eligible)
+                || target_independent != self.detached_viewer_independent_active)
         {
             self.set_fs_exclusive_view(FsExclusiveView::None, cause);
-            let message = if eligible {
-                match self.keymap.first_chord_label(KeyAction::FsDepthParallax) {
+            let message = match self.keymap.first_chord_label(KeyAction::FsDepthParallax) {
                     Some(key) => format!(
                         "3D 写真を終了しました: 表示を切り替えました。{key} キーでもう一度使えます"
                     ),
                     None => "3D 写真を終了しました: 表示を切り替えました。上部の 3D ボタンでもう一度使えます".into(),
-                }
-            } else {
-                "3D 写真を終了しました: メインの画像表示と F12 の別ウィンドウで使えます".into()
             };
             Some(message)
         } else {
@@ -268,6 +247,10 @@ impl App {
         }
         // Setup owns its lazy scan. Unknown installation is Checking, never Missing.
         if self.depth_setup.installed_model_path().is_none() {
+            if self.depth_modal_entry_waiting_for_transition() {
+                self.show_feedback_toast("読み込みが終わってから使ってください".into());
+                return;
+            }
             self.request_depth_addon_for_entry(
                 ctx,
                 DepthEntryRequest {
@@ -282,6 +265,22 @@ impl App {
         self.enter_depth_parallax(ctx);
     }
 
+    /// ROOT owns polling; only an independent request needs a scoped owner mount.
+    pub(crate) fn resume_depth_entry_in_request_context(
+        &mut self,
+        ctx: &egui::Context,
+        request: DepthEntryRequest,
+    ) {
+        if request.context == self.viewer_context_main() {
+            self.resume_depth_entry_after_check(ctx, request);
+        } else {
+            #[cfg(windows)]
+            let _ = self.with_viewer_context(request.context, |owner| {
+                owner.resume_depth_entry_after_check(ctx, request);
+            });
+        }
+    }
+
     pub(crate) fn resume_depth_entry_after_check(
         &mut self,
         ctx: &egui::Context,
@@ -293,6 +292,9 @@ impl App {
             || self.fullscreen_idx != Some(request.fs_idx)
             || self.item_id(request.fs_idx) != request.item_id
         {
+            return;
+        }
+        if !self.viewer_context_live(request.context) {
             return;
         }
         if self.remote_session_blocks_local_control() {
@@ -352,6 +354,7 @@ impl App {
     ) -> bool {
         #[cfg(windows)]
         {
+            let panel_rect_id = self.depth_panel_rect_id();
             let FsExclusiveView::Depth(state) = &mut self.fs_exclusive_view else {
                 return false;
             };
@@ -375,11 +378,7 @@ impl App {
             }
             let panel = state
                 .panel_visible
-                .then(|| {
-                    ctx.data(|data| {
-                        data.get_temp::<egui::Rect>(egui::Id::unique("depth_panel_rect"))
-                    })
-                })
+                .then(|| ctx.data(|data| data.get_temp::<egui::Rect>(panel_rect_id)))
                 .flatten();
             let (pointer, dt, visible) = ctx.input(|input| {
                 (
@@ -455,6 +454,7 @@ impl App {
             crate::ui_fullscreen::paint_image_underlay(painter, transform.paint_quad(), underlay);
             super::depth_export::record_display(
                 ctx,
+                resource.context,
                 resource.resource_id,
                 self.items_generation,
                 transform,
@@ -505,7 +505,7 @@ impl App {
             export_enabled,
             panel_toggle_hint,
         );
-        ctx.data_mut(|data| data.insert_temp(egui::Id::unique("depth_panel_rect"), response.rect));
+        ctx.data_mut(|data| data.insert_temp(self.depth_panel_rect_id(), response.rect));
         if response.changed {
             self.settings.depth_parallax.normalize();
             self.settings.save();
