@@ -61,26 +61,58 @@ fn select_all_id(input_id: egui::Id) -> egui::Id {
     input_id.with("search_request_select_all")
 }
 
-/// Select after the field actually receives focus: egui collapses unfocused selections.
-pub(crate) fn request_select_all(ctx: &egui::Context, input_id: egui::Id, query: &str) {
-    ctx.data_mut(|data| data.insert_temp(select_all_id(input_id), query.to_owned()));
+#[derive(Clone)]
+struct SelectAllRequest {
+    issued_pass: u64,
+    query: String,
 }
 
-/// Apply once, preserving IME composition and discarding requests after intervening edits.
+/// The field's first draw consumes this request, even if selection is no longer appropriate.
+pub(crate) fn request_select_all(ctx: &egui::Context, input_id: egui::Id, query: &str) {
+    let request = SelectAllRequest {
+        issued_pass: ctx.cumulative_pass_nr(),
+        query: query.to_owned(),
+    };
+    ctx.data_mut(|data| data.insert_temp(select_all_id(input_id), request));
+}
+
+/// Ordinary search openings discard any prefill request left by a previous session.
+pub(crate) fn clear_select_all(ctx: &egui::Context, input_id: egui::Id) {
+    ctx.data_mut(|data| data.remove::<SelectAllRequest>(select_all_id(input_id)));
+}
+
+#[cfg(test)]
+pub(crate) fn select_all_pending_for_test(ctx: &egui::Context, input_id: egui::Id) -> bool {
+    ctx.data(|data| {
+        data.get_temp::<SelectAllRequest>(select_all_id(input_id))
+            .is_some()
+    })
+}
+
+/// Apply only on the initial draw, within three passes, without disturbing IME composition.
 pub(crate) fn apply_select_all(
     ctx: &egui::Context,
     query: &str,
+    focus_requested: bool,
     output: &mut egui::widgets::text_edit::TextEditOutput,
 ) {
     let id = select_all_id(output.response.id);
-    let Some(requested) = ctx.data(|data| data.get_temp::<String>(id)) else {
+    let pass = ctx.cumulative_pass_nr();
+    let Some(requested) = ctx.data_mut(|data| {
+        let requested = data.get_temp::<SelectAllRequest>(id)?;
+        if pass < requested.issued_pass {
+            return None;
+        }
+        data.remove::<SelectAllRequest>(id);
+        Some(requested)
+    }) else {
         return;
     };
-    if requested != query {
-        ctx.data_mut(|data| data.remove::<String>(id));
-        return;
-    }
-    if !output.response.has_focus() || crate::ime_focus::ime_input_active(ctx) {
+    if requested.query != query
+        || pass - requested.issued_pass > 3
+        || !(focus_requested || output.response.has_focus())
+        || crate::ime_focus::ime_input_active(ctx)
+    {
         return;
     }
     let range = egui::text::CCursorRange::two(
@@ -90,7 +122,6 @@ pub(crate) fn apply_select_all(
     output.state.cursor.set_char_range(Some(range));
     output.state.clone().store(ctx, output.response.id);
     output.cursor_range = Some(range);
-    ctx.data_mut(|data| data.remove::<String>(id));
 }
 
 #[cfg(test)]
@@ -232,7 +263,7 @@ mod tests {
     }
 
     fn selection_pending(ctx: &egui::Context, id: egui::Id) -> bool {
-        ctx.data(|data| data.get_temp::<String>(select_all_id(id)).is_some())
+        select_all_pending_for_test(ctx, id)
     }
 
     fn draw_field(
@@ -254,7 +285,7 @@ mod tests {
                     crate::ime_focus::show_singleline(ui, query, Some(&mut request), |edit| {
                         edit.id(id)
                     });
-                apply_select_all(ui.ctx(), query, &mut output);
+                apply_select_all(ui.ctx(), query, focus, &mut output);
                 range = output.state.cursor.char_range();
             },
         ));
@@ -262,13 +293,11 @@ mod tests {
     }
 
     #[test]
-    fn selection_waits_for_focus_then_selects_unicode_once_and_stores_state() {
+    fn selection_selects_unicode_once_and_stores_state_on_focus_request() {
         let ctx = egui::Context::default();
         let id = egui::Id::unique("prefill");
         let mut query = "作者 title".to_owned();
         request_select_all(&ctx, id, &query);
-        draw_field(&ctx, id, &mut query, false, vec![]);
-        assert!(selection_pending(&ctx, id));
         let range = draw_field(&ctx, id, &mut query, true, vec![]).unwrap();
         assert_eq!(range.sorted_cursors()[0].index, 0);
         assert_eq!(range.sorted_cursors()[1].index, query.chars().count());
@@ -291,39 +320,144 @@ mod tests {
     }
 
     #[test]
+    fn selection_request_is_discarded_on_first_draw_without_focus() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::unique("prefill");
+        let mut query = "title".to_owned();
+        request_select_all(&ctx, id, &query);
+        draw_field(&ctx, id, &mut query, false, vec![]);
+        assert!(!selection_pending(&ctx, id));
+        let mut state = egui::TextEdit::load_state(&ctx, id).unwrap();
+        let caret = egui::text::CCursorRange::one(egui::text::CCursor::new(2));
+        state.cursor.set_char_range(Some(caret));
+        state.store(&ctx, id);
+        assert_eq!(draw_field(&ctx, id, &mut query, true, vec![]), Some(caret));
+    }
+
+    #[test]
+    fn cleared_selection_does_not_apply_on_a_later_focus_request() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::unique("prefill");
+        let sibling = egui::Id::unique("sibling");
+        let mut query = "title".to_owned();
+        draw_field(&ctx, id, &mut query, false, vec![]);
+        request_select_all(&ctx, id, &query);
+        request_select_all(&ctx, sibling, &query);
+        clear_select_all(&ctx, id);
+        assert!(!selection_pending(&ctx, id));
+        assert!(selection_pending(&ctx, sibling));
+        let mut state = egui::TextEdit::load_state(&ctx, id).unwrap();
+        let caret = egui::text::CCursorRange::one(egui::text::CCursor::new(2));
+        state.cursor.set_char_range(Some(caret));
+        state.store(&ctx, id);
+        assert_eq!(draw_field(&ctx, id, &mut query, true, vec![]), Some(caret));
+        assert!(selection_pending(&ctx, sibling));
+    }
+
+    #[test]
+    fn selection_request_expires_after_three_passes_without_its_field() {
+        for age in [3, 4] {
+            let ctx = egui::Context::default();
+            let id = egui::Id::unique("prefill");
+            let mut query = "title".to_owned();
+            request_select_all(&ctx, id, &query);
+            let issued_pass = ctx.cumulative_pass_nr();
+            while ctx.cumulative_pass_nr() < issued_pass + age {
+                ctx.run_ui(Default::default(), |_| {})
+                    .drop_without_applying_deltas();
+            }
+            assert!(selection_pending(&ctx, id));
+            let range = draw_field(&ctx, id, &mut query, true, vec![]).unwrap();
+            assert_eq!(range.is_empty(), age > 3, "age={age}");
+            assert!(!selection_pending(&ctx, id));
+        }
+    }
+
+    #[test]
+    fn selection_request_uses_existing_focus_without_a_new_focus_request() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::unique("prefill");
+        let mut query = "title".to_owned();
+        draw_field(&ctx, id, &mut query, true, vec![]);
+        request_select_all(&ctx, id, &query);
+        let range = draw_field(&ctx, id, &mut query, false, vec![]).unwrap();
+        assert_eq!(range.sorted_cursors()[0].index, 0);
+        assert_eq!(range.sorted_cursors()[1].index, query.chars().count());
+        assert!(!selection_pending(&ctx, id));
+    }
+
+    #[test]
+    fn selection_accepts_the_focus_request_pass_before_response_has_focus() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::unique("prefill");
+        let mut query = "作者 title".to_owned();
+        request_select_all(&ctx, id, &query);
+        ctx.run_ui(Default::default(), |ui| {
+            let mut output =
+                crate::ime_focus::show_singleline(ui, &mut query, None, |edit| edit.id(id));
+            assert!(!output.response.has_focus());
+            apply_select_all(ui.ctx(), &query, true, &mut output);
+            let range = output.state.cursor.char_range().unwrap();
+            assert_eq!(range.sorted_cursors()[0].index, 0);
+            assert_eq!(range.sorted_cursors()[1].index, query.chars().count());
+            assert_eq!(output.cursor_range, Some(range));
+            assert!(!selection_pending(ui.ctx(), id));
+        })
+        .drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn selection_requests_are_independent_between_fields() {
+        let ctx = egui::Context::default();
+        let first = egui::Id::unique("first");
+        let second = egui::Id::unique("second");
+        let mut query = "title".to_owned();
+        request_select_all(&ctx, first, &query);
+        request_select_all(&ctx, second, &query);
+        draw_field(&ctx, first, &mut query, true, vec![]);
+        assert!(!selection_pending(&ctx, first));
+        assert!(selection_pending(&ctx, second));
+        let range = draw_field(&ctx, second, &mut query, true, vec![]).unwrap();
+        assert_eq!(range.sorted_cursors()[0].index, 0);
+        assert_eq!(range.sorted_cursors()[1].index, query.chars().count());
+        assert!(!selection_pending(&ctx, second));
+    }
+
+    #[test]
     #[expect(
         deprecated,
         reason = "Exercise compatibility IME notifications without changing the draft"
     )]
-    fn selection_waits_for_ime_and_does_not_affect_sibling_fields() {
+    fn selection_is_discarded_during_ime_and_does_not_select_after_composition() {
         let ctx = egui::Context::default();
         crate::ime_focus::install_ime_input_policy(&ctx);
         let id = egui::Id::unique("prefill");
-        let sibling = egui::Id::unique("sibling");
         let mut query = "作者".to_owned();
         draw_field(&ctx, id, &mut query, true, vec![]);
         request_select_all(&ctx, id, &query);
         // Enabled starts composition without inserting text into the draft.
-        draw_field(
+        let range = draw_field(
             &ctx,
             id,
             &mut query,
             false,
             vec![egui::Event::Ime(egui::ImeEvent::Enabled)],
         );
-        assert!(selection_pending(&ctx, id));
+        assert!(!selection_pending(&ctx, id));
         assert!(crate::ime_focus::ime_input_active(&ctx));
-        assert!(!selection_pending(&ctx, sibling));
+        assert!(range.unwrap().is_empty());
+        let mut state = egui::TextEdit::load_state(&ctx, id).unwrap();
+        let caret = egui::text::CCursorRange::one(egui::text::CCursor::new(1));
+        state.cursor.set_char_range(Some(caret));
+        state.store(&ctx, id);
         let range = draw_field(
             &ctx,
             id,
             &mut query,
             false,
             vec![egui::Event::Ime(egui::ImeEvent::Disabled)],
-        )
-        .unwrap();
-        assert_eq!(range.sorted_cursors()[0].index, 0);
-        assert_eq!(range.sorted_cursors()[1].index, query.chars().count());
+        );
+        assert!(range.unwrap().is_empty());
         assert!(!selection_pending(&ctx, id));
     }
 }

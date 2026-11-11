@@ -24180,6 +24180,13 @@ impl App {
     pub(crate) fn everything_search_entry_availability(
         &self,
     ) -> crate::global_search_ui::EverythingSearchEntryAvailability {
+        self.everything_search_entry_availability_with_modal(self.common_modal_dialog_open())
+    }
+
+    pub(crate) fn everything_search_entry_availability_with_modal(
+        &self,
+        modal_open: bool,
+    ) -> crate::global_search_ui::EverythingSearchEntryAvailability {
         use crate::global_search_ui::EverythingSearchEntryAvailability as Entry;
         // Preserve the former main-grid/modal/Remote conjunction exactly.
         if !self.main_folder_history_available() {
@@ -24200,7 +24207,7 @@ impl App {
         if self.remote_session_blocks_local_control() {
             return Entry::RemoteControl;
         }
-        if self.common_modal_dialog_open() {
+        if modal_open {
             return Entry::OtherOperation;
         }
         Entry::Available

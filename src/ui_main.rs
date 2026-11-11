@@ -16650,6 +16650,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     "{local_search_label}: 今開いているフォルダ / ZIP の表示中\n\
                      アイテムを名前やメタ情報で絞り込みます (索引不要・再帰なし)。"
                 ));
+                let focus_requested = self.search_focus_request;
                 let mut output = crate::ime_focus::show_singleline(
                     ui,
                     &mut self.search_query,
@@ -16662,7 +16663,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         .min_size(egui::vec2(320.0, 20.0))
                     },
                 );
-                crate::search_request::apply_select_all(ui.ctx(), &self.search_query, &mut output);
+                crate::search_request::apply_select_all(ui.ctx(), &self.search_query, focus_requested, &mut output);
                 let _menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
                     &mut output,

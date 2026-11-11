@@ -4752,6 +4752,7 @@ impl App {
                      「お気に入り」→「編集」で、対象の行の「アイテム索引 (Ctrl+G)」に\n\
                      チェックを入れてください。",
                 );
+                let focus_requested = self.global_search.focus_request;
                 let mut output = crate::ime_focus::show_singleline(
                     ui,
                     &mut self.global_search.metadata_draft,
@@ -4764,7 +4765,7 @@ impl App {
                         .min_size(egui::vec2(320.0, 20.0))
                     },
                 );
-                crate::search_request::apply_select_all(ui.ctx(), &self.global_search.metadata_draft, &mut output);
+                crate::search_request::apply_select_all(ui.ctx(), &self.global_search.metadata_draft, focus_requested, &mut output);
                 let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
                     &mut output,

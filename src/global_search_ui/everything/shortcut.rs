@@ -44,13 +44,21 @@ impl App {
     }
 
     pub(crate) fn dispatch_everything_search_shortcut(&mut self, ctx: &egui::Context) -> bool {
-        if self
-            .search_shortcut_availability(
-                ctx,
-                crate::ui_pinned_search::PinnedSearchKind::Everything,
-                false,
-            )
-            .is_err()
+        if ctx.viewport_id() != egui::ViewportId::ROOT
+            || self
+                .search_shortcut_availability(
+                    crate::ui_pinned_search::PinnedSearchKind::Everything,
+                    false,
+                )
+                .is_err()
+        {
+            return false;
+        }
+        let Some(permit) = self.keyboard_owner_for_pass(ctx).shortcut_permit() else {
+            return false;
+        };
+        if permit.scope().viewport != ctx.viewport_id()
+            || permit.scope().surface != ShortcutSurface::Main
         {
             return false;
         }

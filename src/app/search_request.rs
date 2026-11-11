@@ -10,30 +10,31 @@ impl App {
     /// `main_viewer_blocked` is the main UI checkpoint's existing viewer/modal snapshot.
     pub(crate) fn search_shortcut_availability(
         &self,
-        ctx: &egui::Context,
         kind: Kind,
         main_viewer_blocked: bool,
     ) -> Result<(), &'static str> {
+        self.search_entry_availability(kind, main_viewer_blocked, true)
+    }
+
+    /// Evaluate state only. Keyboard ownership stays in the shortcut dispatcher;
+    /// a menu's own input ownership is not a reason to disable its commands.
+    fn search_entry_availability(
+        &self,
+        kind: Kind,
+        main_viewer_blocked: bool,
+        include_context_menu: bool,
+    ) -> Result<(), &'static str> {
         if kind == Kind::Everything {
-            if ctx.viewport_id() != egui::ViewportId::ROOT {
-                return Err("メインウィンドウの一覧から検索してください");
-            }
-            if let Some(reason) = self.everything_search_entry_availability().reason_text() {
-                return Err(reason);
-            }
-            let permit = self.keyboard_owner_for_pass(ctx).shortcut_permit();
-            return if permit.is_some_and(|permit| {
-                permit.scope().viewport == ctx.viewport_id()
-                    && permit.scope().surface == crate::keyboard_input::ShortcutSurface::Main
-            }) {
-                Ok(())
-            } else {
-                Err("文字入力などの操作を終えてから検索してください")
-            };
+            return self
+                .everything_search_entry_availability_with_modal(
+                    self.search_common_modal_open(include_context_menu),
+                )
+                .reason_text()
+                .map_or(Ok(()), Err);
         }
         let allowed = !self.address_has_focus
             && !main_viewer_blocked
-            && !self.any_dialog_open()
+            && !self.search_dialog_open(include_context_menu)
             && !self.favsearch.has_focus
             && !self.tag_view.has_focus
             && match kind {
@@ -49,6 +50,15 @@ impl App {
         } else {
             Err("ほかの操作が完了してから検索してください")
         }
+    }
+
+    pub(crate) fn search_common_modal_open(&self, include_context_menu: bool) -> bool {
+        self.modal_dialog_block_reason_including_menus(include_context_menu)
+            .is_some()
+    }
+
+    pub(crate) fn search_dialog_open(&self, include_context_menu: bool) -> bool {
+        self.search_common_modal_open(include_context_menu) || self.show_vst3_manager
     }
 
     /// One item-entry predicate for menus, keys and menu dispatch. Empty names
@@ -76,12 +86,26 @@ impl App {
         ctx: &egui::Context,
         kind: Kind,
     ) -> Result<(), &'static str> {
+        if ctx.viewport_id() != egui::ViewportId::ROOT {
+            return Err("メインウィンドウの一覧から検索してください");
+        }
         self.search_shortcut_availability(
-            ctx,
             kind,
             self.viewer_session_blocks_main_window() || self.viewer_mutation_modal_active(),
         )?;
         self.pinned_search_availability(kind)
+    }
+
+    pub(crate) fn search_with_text_menu_availability(
+        &self,
+        kind: Kind,
+    ) -> Result<(), &'static str> {
+        self.search_entry_availability(
+            kind,
+            self.viewer_session_blocks_main_window() || self.viewer_mutation_modal_active(),
+            false,
+        )?;
+        self.pinned_search_availability_including_context_menu(kind, false)
     }
 
     pub(crate) fn open_search_with_text(&mut self, ctx: &egui::Context, request: SearchRequest) {
@@ -93,11 +117,12 @@ impl App {
         self.ensure_search_session(kind);
         *self.search_draft_mut(kind) = request.query;
         if kind == Kind::Metadata {
-            // Injection is not Edited/Submit: never arm (or retain) a debounce.
+            // A query wish reads the draft. Retire the old producer/prepare
+            // before they can project results using this newly injected draft.
+            self.retire_search_work();
             self.global_search.last_change_at = None;
-            if self.global_search.pending.is_none() {
-                self.global_search.done = true;
-            }
+            self.global_search.done = true;
+            self.global_search.reject_message = None;
         }
         let input_id = if kind.pinned(&self.settings) {
             self.request_pinned_search_focus(ctx, kind);
@@ -110,7 +135,9 @@ impl App {
             }
             kind.temporary_id()
         };
-        crate::search_request::request_select_all(ctx, input_id, self.search_draft(kind));
+        if matches!(kind, Kind::Local | Kind::Metadata) {
+            crate::search_request::request_select_all(ctx, input_id, self.search_draft(kind));
+        }
     }
 
     /// Called after handle_keyboard's existing ownership/IME/pane gates.

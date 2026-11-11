@@ -1506,7 +1506,7 @@ impl crate::app::App {
                     if query.is_empty() {
                         Err("名前が空のため検索できません")
                     } else {
-                        self.search_with_text_availability(ctx, kind)
+                        self.search_with_text_menu_availability(kind)
                     }
                 };
                 crate::context_menu_model::SearchByNameAvailability {
@@ -1814,6 +1814,9 @@ impl crate::app::App {
                         }
                         _ => unreachable!(),
                     };
+                    // Capture the name first, then end the calling menu owner.
+                    // Shared search admission sees the ordinary post-menu state.
+                    self.context_menu_idx = None;
                     self.open_search_with_text(
                         ctx,
                         crate::search_request::SearchRequest { target, query },
@@ -6951,5 +6954,409 @@ mod clipboard_image_writer_tests {
         );
         assert_eq!(api.events.last(), Some(&"close"));
         assert!(!api.opened);
+    }
+}
+
+#[cfg(test)]
+mod search_by_name_menu_tests {
+    use super::*;
+    use crate::app::{App, AppTestEnvForTest};
+    use crate::ui_pinned_search::PinnedSearchKind as Kind;
+
+    fn destinations() -> [(MenuCommand, Kind, &'static str); 3] {
+        [
+            (
+                MenuCommand::SearchByNameEverything,
+                Kind::Everything,
+                "Everything で探す",
+            ),
+            (
+                MenuCommand::SearchByNameMetadata,
+                Kind::Metadata,
+                "アイテム検索で探す",
+            ),
+            (
+                MenuCommand::SearchByNameLocal,
+                Kind::Local,
+                "この場所で絞り込む",
+            ),
+        ]
+    }
+
+    fn fixture(pinned: bool) -> AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
+        app.current_folder = Some(app.tmp.path().to_owned());
+        app.items = vec![
+            GridItem::Image(app.tmp.path().join("日本語 name.png")),
+            GridItem::Image(app.tmp.path().join("different cursor.png")),
+        ];
+        // The right-click target is independent of the keyboard cursor.
+        app.selected = Some(1);
+        app.settings.show_toolbar_search_local = pinned;
+        app.settings.show_toolbar_search_metadata = pinned;
+        app.settings.show_toolbar_search_everything = pinned;
+        #[cfg(windows)]
+        {
+            app.main_hwnd = None;
+        }
+        app.context_menu_pos = egui::pos2(24.0, 24.0);
+        app.context_menu_idx = Some(app.capture_grid_context_menu_owner(0));
+        app
+    }
+
+    fn target(
+        app: &App,
+        background: bool,
+        surface: ContextMenuSurface,
+    ) -> NativeGridContextMenuTarget {
+        let (index, item) = if background {
+            (
+                usize::MAX,
+                GridItem::Folder(app.current_folder.clone().unwrap()),
+            )
+        } else {
+            (0, app.items[0].clone())
+        };
+        app.context_menu_target(
+            index,
+            item,
+            background,
+            !app.checked.is_empty(),
+            app.current_folder.clone(),
+            surface,
+            None,
+        )
+    }
+
+    fn command_state<'a>(
+        nodes: &'a [MenuNode],
+        expected: &MenuCommand,
+    ) -> Option<(bool, Option<&'a str>)> {
+        nodes.iter().find_map(|node| match node {
+            MenuNode::Item {
+                command,
+                enabled,
+                disabled_reason,
+                ..
+            } if command == expected => Some((*enabled, disabled_reason.as_deref())),
+            MenuNode::Submenu { children, .. } => command_state(children, expected),
+            _ => None,
+        })
+    }
+
+    fn assert_draft_only(app: &App, kind: Kind) {
+        assert!(
+            app.context_menu_idx.is_none(),
+            "the caller's menu owner must retire first"
+        );
+        assert!(app.edit_owner(kind), "{kind:?} input must open");
+        assert_eq!(app.search_draft(kind), "日本語 name");
+        assert!(app.search_pending.is_none());
+        assert!(app.search_filter.is_none());
+        assert!(app.global_search.pending.is_none());
+        assert!(app.global_search.last_change_at.is_none());
+        if kind == Kind::Metadata {
+            assert!(!app.global_search.is_searching());
+        }
+    }
+
+    #[test]
+    fn search_name_native_menu_enables_three_targets_and_retires_its_owner_before_opening() {
+        for pinned in [false, true] {
+            for (command, kind, _) in destinations() {
+                let mut app = fixture(pinned);
+                let ctx = egui::Context::default();
+                ctx.begin_pass(egui::RawInput::default());
+                assert!(app.common_modal_dialog_open());
+                assert!(
+                    app.keyboard_owner_for_pass(&ctx)
+                        .shortcut_permit()
+                        .is_none()
+                );
+                let target = target(&app, false, ContextMenuSurface::Grid);
+                let nodes = app.context_menu_nodes(&ctx, &target, false);
+                for (destination, _, _) in destinations() {
+                    assert_eq!(command_state(&nodes, &destination), Some((true, None)));
+                }
+                assert!(matches!(
+                    app.dispatch_native_context_menu_result(
+                        &ctx,
+                        NativeContextMenuResult::MivCommand(command),
+                        &target,
+                    ),
+                    NativeGridContextMenuOutcome::Consumed {
+                        nav: None,
+                        close_fullscreen: false
+                    }
+                ));
+                assert_draft_only(&app, kind);
+                ctx.end_pass().drop_without_applying_deltas();
+            }
+        }
+    }
+
+    #[test]
+    fn search_name_egui_menu_click_closes_owner_and_opens_each_input() {
+        use egui_kittest::kittest::Queryable;
+        for pinned in [false, true] {
+            for (_, kind, label) in destinations() {
+                let mut harness = crate::test_ui::builder()
+                    .with_context_setup(crate::ui_fonts::configure_fonts)
+                    .with_size(egui::vec2(1100.0, 1100.0))
+                    .build_ui_state(
+                        move |ui, app: &mut AppTestEnvForTest| {
+                            if app.context_menu_idx.is_some() {
+                                // Capture the real input owner while the menu is present.
+                                let _owner = app.keyboard_owner_for_pass(ui.ctx());
+                                let _ = app.show_context_menu(ui.ctx());
+                            } else if app.edit_owner(kind) {
+                                if pinned {
+                                    let response = app.draw_pinned_search_section(ui, kind);
+                                    app.handle_pinned_search_actions(
+                                        ui.ctx(),
+                                        response.inner.actions,
+                                    );
+                                } else if kind == Kind::Local {
+                                    app.render_search_bar(ui);
+                                } else {
+                                    app.render_global_search_bar(ui);
+                                }
+                            }
+                        },
+                        fixture(pinned),
+                    );
+                harness.run_steps(4);
+                assert!(harness.state().context_menu_idx.is_some());
+                harness.get_by_label("名前で検索").click();
+                harness.run_steps(3);
+                for (_, _, destination_label) in destinations() {
+                    assert!(
+                        !harness
+                            .get_by_label(destination_label)
+                            .accesskit_node()
+                            .is_disabled()
+                    );
+                }
+                harness.get_by_label(label).click();
+                harness.run_steps(3);
+                assert_draft_only(harness.state(), kind);
+                if kind == Kind::Local {
+                    assert!(harness.state().search_has_focus);
+                } else {
+                    assert!(harness.state().global_search.has_focus);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn search_name_menu_excludes_only_its_own_modal_and_rechecks_other_modals_at_dispatch() {
+        for (command, kind, _) in destinations() {
+            let mut app = fixture(false);
+            let ctx = egui::Context::default();
+            ctx.begin_pass(egui::RawInput::default());
+            let target = target(&app, false, ContextMenuSurface::Grid);
+            let admitted_nodes = app.context_menu_nodes(&ctx, &target, false);
+            assert_eq!(command_state(&admitted_nodes, &command), Some((true, None)));
+            app.show_about_dialog = true;
+            let blocked_nodes = app.context_menu_nodes(&ctx, &target, false);
+            for (destination, _, _) in destinations() {
+                let (enabled, reason) = command_state(&blocked_nodes, &destination).unwrap();
+                assert!(!enabled);
+                assert!(reason.is_some_and(|reason| !reason.is_empty()));
+            }
+            let previous = app.search_draft(kind).to_owned();
+            app.dispatch_native_context_menu_result(
+                &ctx,
+                NativeContextMenuResult::MivCommand(command),
+                &target,
+            );
+            assert!(app.show_about_dialog);
+            assert_eq!(app.search_draft(kind), previous);
+            assert!(!app.edit_owner(kind));
+            assert!(app.search_pending.is_none());
+            assert!(app.global_search.pending.is_none());
+            ctx.end_pass().drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn search_name_app_menu_filters_item_kinds_and_rejects_excluded_entry_contexts() {
+        use crate::grid_item::{CollectionPlaceholderReason, SearchContainerKind};
+        let mut app = fixture(false);
+        let root = app.tmp.path().to_owned();
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput::default());
+        for (item, included) in [
+            (GridItem::Folder(root.join("folder.with.dot")), true),
+            (GridItem::Image(root.join("image.png")), true),
+            (GridItem::Video(root.join("video.mp4")), true),
+            (GridItem::Audio(root.join("audio.mp3")), true),
+            (GridItem::ZipFile(root.join("book.zip")), true),
+            (GridItem::PdfFile(root.join("book.pdf")), true),
+            (GridItem::PdfFile(root.join("book.epub")), true),
+            (
+                GridItem::ConvertibleArchive {
+                    path: root.join("book.7z"),
+                    format: crate::archive_converter::ArchiveFormat::SevenZ,
+                },
+                true,
+            ),
+            (
+                GridItem::ZipImage {
+                    zip_path: root.join("book.zip"),
+                    entry_name: "nested/image.png".into(),
+                },
+                true,
+            ),
+            (
+                GridItem::ZipDir {
+                    zip_path: root.join("book.zip"),
+                    dir_prefix: "nested/folder/".into(),
+                    is_archive: false,
+                    representative: None,
+                },
+                true,
+            ),
+            (
+                GridItem::SearchContainer {
+                    path: root.join("folder.with.dot"),
+                    kind: SearchContainerKind::Folder,
+                    hit_count: 1,
+                    representative: None,
+                },
+                true,
+            ),
+            (
+                GridItem::PdfPage {
+                    pdf_path: root.join("book.pdf"),
+                    page_num: 0,
+                    content_type: None,
+                },
+                false,
+            ),
+            (
+                GridItem::Stack {
+                    key: "series".into(),
+                    representative: root.join("image.png"),
+                    count: 2,
+                },
+                false,
+            ),
+            (
+                GridItem::CollectionPlaceholder {
+                    path: root.join("missing.png"),
+                    last_known_kind: crate::collection_store::CollectionResolvedKind::Image,
+                    reason: CollectionPlaceholderReason::Missing,
+                },
+                false,
+            ),
+        ] {
+            app.items[0] = item;
+            app.context_menu_idx = Some(app.capture_grid_context_menu_owner(0));
+            let target = target(&app, false, ContextMenuSurface::Grid);
+            let nodes = app.context_menu_nodes(&ctx, &target, false);
+            for (command, _, _) in destinations() {
+                assert_eq!(
+                    command_state(&nodes, &command).is_some(),
+                    included,
+                    "{:?}",
+                    target.item
+                );
+                if !included {
+                    app.dispatch_native_grid_context_command(&ctx, command, &target);
+                    assert!(!app.show_search_bar);
+                    assert!(!app.global_search.active);
+                }
+            }
+        }
+        app.items[0] = GridItem::Image(root.join("日本語 name.png"));
+        for exclusion in 0..5 {
+            app.checked.clear();
+            app.items_are_bookmark_view = exclusion == 2;
+            app.items_are_reading_history_view = exclusion == 3;
+            app.fullscreen_idx = (exclusion == 4).then_some(0);
+            if exclusion == 0 {
+                app.checked.insert(0);
+            }
+            let target = target(
+                &app,
+                exclusion == 1,
+                if exclusion == 4 {
+                    ContextMenuSurface::Fullscreen
+                } else {
+                    ContextMenuSurface::Grid
+                },
+            );
+            let nodes = app.context_menu_nodes(&ctx, &target, false);
+            for (command, _, _) in destinations() {
+                assert!(
+                    command_state(&nodes, &command).is_none(),
+                    "exclusion={exclusion}"
+                );
+                app.dispatch_native_grid_context_command(&ctx, command, &target);
+                assert!(!app.show_search_bar);
+                assert!(!app.global_search.active);
+            }
+        }
+        ctx.end_pass().drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn search_name_local_menu_refusal_preserves_metadata_and_everything_result_children() {
+        use crate::global_search_ui::{EverythingPosition, SearchAccepted, SubmittedEverything};
+        for source in [Kind::Metadata, Kind::Everything] {
+            for child in [false, true] {
+                let mut app = fixture(false);
+                let ctx = egui::Context::default();
+                ctx.begin_pass(egui::RawInput::default());
+                app.context_menu_idx = None;
+                app.ensure_search_session(source);
+                *app.search_draft_mut(source) = "previous results".into();
+                if source == Kind::Everything {
+                    app.global_search.accepted = SearchAccepted::Everything {
+                        submitted: SubmittedEverything {
+                            query: "previous results".into(),
+                            run: 1,
+                        },
+                        dataset: crate::global_search_ui::everything_dataset_for_test(Vec::new()),
+                        position: if child {
+                            EverythingPosition::PhysicalChild {
+                                logical_source: app.tmp.path().to_owned(),
+                                return_anchor: None,
+                            }
+                        } else {
+                            EverythingPosition::Root
+                        },
+                    };
+                } else if child {
+                    app.global_search.drill = Some(crate::global_search_ui::DrillState {
+                        container_root: app.tmp.path().to_owned(),
+                        current_path: app.tmp.path().to_owned(),
+                        is_zip: false,
+                    });
+                }
+                app.items_are_global_search_view = !child;
+                app.search_query = "keep local draft".into();
+                app.context_menu_idx = Some(app.capture_grid_context_menu_owner(0));
+                let target = target(&app, false, ContextMenuSurface::Grid);
+                let nodes = app.context_menu_nodes(&ctx, &target, true);
+                let (enabled, reason) =
+                    command_state(&nodes, &MenuCommand::SearchByNameLocal).unwrap();
+                assert!(!enabled);
+                assert!(reason.is_some_and(|reason| !reason.is_empty()));
+                app.dispatch_native_context_menu_result(
+                    &ctx,
+                    NativeContextMenuResult::MivCommand(MenuCommand::SearchByNameLocal),
+                    &target,
+                );
+                assert!(app.edit_owner(source));
+                assert_eq!(app.search_draft(source), "previous results");
+                assert_eq!(app.search_query, "keep local draft");
+                assert!(!app.show_search_bar);
+                assert!(app.search_pending.is_none());
+                ctx.end_pass().drop_without_applying_deltas();
+            }
+        }
     }
 }

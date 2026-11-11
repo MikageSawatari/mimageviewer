@@ -905,7 +905,6 @@ impl App {
         // with the same reason as the disabled menu/pinned input.
         if self
             .search_shortcut_availability(
-                ctx,
                 crate::ui_pinned_search::PinnedSearchKind::Local,
                 main_viewer_blocked,
             )
@@ -1012,7 +1011,6 @@ impl App {
 
         if self
             .search_shortcut_availability(
-                ctx,
                 crate::ui_pinned_search::PinnedSearchKind::Metadata,
                 main_viewer_blocked,
             )

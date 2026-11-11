@@ -1,8 +1,9 @@
 # 名前で検索 (§1.690) — 設計
 
 作成: 2026-11-11。ブランチ `feat-690-search-from-item` (master `3287af3fc` から)。設計担当 ClaudeCode Opus。
-状態: **最小版の設計 (第 2.2 版)。仕様は利用者承認済み (2026-11-11、統括経由)。第 2 版の独立レビュー (Sol/xhigh) は REJECT
-(P1 1 件・P2 5 件・P3 1 件)。第 2.1 版で全件を反映 (各所に「P<N> 対応」)。第 2.1 版の再レビューも REJECT (P1 2 件・P2 1 件・P3 1 件)。第 2.2 版で反映。実装中 (M9)。**
+状態: **最小版の設計 (第 2.3 版)。仕様は利用者承認済み (2026-11-11、統括経由)。第 2 版の独立レビュー (Sol/xhigh) は REJECT
+(P1 1 件・P2 5 件・P3 1 件)。第 2.1 版で全件を反映 (各所に「P<N> 対応」)。第 2.1 版の再レビューも REJECT (P1 2 件・P2 1 件・P3 1 件)。第 2.2 版で反映。第 2.2 版の再レビューは ACCEPT WITH CHANGES (P2 1 件: 全選択の印の期間)。第 2.3 版で印の期間を縮め、
+実装で判明した Ctrl+G の再投影の退行に対して手順 3 を「ふだんの編集と同じ後始末」に改めた。実装中 (M9)。**
 第 1 版 (材料を組み立てる専用のモーダル) は利用者決定で後の版へ回した。付録 A に残す (未レビュー)。
 
 ## M1. 範囲 (利用者決定 2026-11-11)
@@ -77,16 +78,21 @@
 2. `ensure_search_session(kind)`。開いていなければ既存の開く関数 (別の検索セッションとの排他・戻り先の保持を含む) が走る。
    既に開いていれば何もしない。Ctrl+G の `toggle_global_search` (開いていれば閉じる) は使わない。
 3. その欄の下書き (`search_draft_mut(kind)`) を名前で置き換える。**検索を始める処理 (Edited / Submit) は呼ばない。**
-   Ctrl+G だけは、下書きが `last_executed` と違い `last_change_at` があるとデバウンス後に検索が始まり
-   (`poll_global_search_debounce`)、また結果の組み立て (`SearchViewWish.query`) が今の下書きから作られるので、
-   進行中の検索を続けさせると旧い語の結果の採用が食い違う。そこで代入と同時に次をそろえる (第 2.2 版、再レビュー指摘 P1-1 対応):
-   - 進行中の検索を、`switch_search_source` が source 切り替え時にしているのと同じ後始末で終える
-     (`pending = None`、`retire_search_prepare()`、`mtime_lookup_pending = None`、`run_sequence` を進める)。source は変えない。
-     可能ならこの後始末を `switch_search_source` と共有する小さな helper に取り出す (`switch_search_source` の挙動は変えない)。
-   - `last_change_at = None` (デバウンスの予約を外す。代入は「編集」ではない)、`done = true`
-     (`open_global_search` の「保持された下書きは編集・確定まで待機」と同じ状態。検索中の表示にしない)、`reject_message = None`。
-   - 表示中の結果・適用済みの条件 (`accepted`)・`last_executed` は変えない。旧い検索の途中までの結果が表示されていれば、
-     それはそのまま残る (source 切り替えで旧い検索を止めたときと同じ見え方)。
+   Ctrl+G だけは扱いが要る。今の Ctrl+G は、検索語を編集した瞬間に表示中の結果を消して取り直す
+   (`reset_global_search_for_query_change`: 進行中の検索の取り消し、結果の破棄、`run_sequence` の更新、空の一覧への作り直し) ので、
+   「表示中の結果は旧い語、入力欄は新しい語」という状態は、デバウンス待ちの一瞬しか存在しない。結果の組み立て
+   (`SearchViewWish.query`) も今の下書きから作られ、この前提に立っている。名前を入れる操作でこの状態を長く残すと、
+   旧い検索の結果の採用、並べ替え・★の再投影、適用条件の表示が食い違う (第 2 版・第 2.1 版のレビュー指摘 P1、第 2.2 版の実装で判明した
+   prepare 退役後の並べ替えの退行)。そこで第 2.3 版では、**Ctrl+G へ入れるのは「ふだんの入力欄の編集」と同じ後始末を通し、
+   デバウンスの予約だけ外す**:
+   - 代入の後に、既存の `reset_global_search_for_query_change(ctx)` を呼ぶ (利用者が手で語を打ち替えたときと同じ。
+     表示中の Ctrl+G の結果は消え、進行中の検索は取り消される)。
+   - その直後に `last_change_at = None` (デバウンスで検索を始めない)、`done = true`、`reject_message = None`。
+     これは `open_global_search` の「保持された下書きは編集・確定まで待機」と同じ状態 (結果なし・検索中の表示なし) で、
+     既存の画面の状態を増やさない。
+   - `switch_search_source` 相当の後始末 (prepare の退役) は使わない (第 2.2 版の手順を取り消す)。
+   - 利用者から見ると、Ctrl+G の結果を表示中に「アイテム検索で探す」を選ぶと、手で語を打ち替えたときと同じく結果が消え、
+     Enter で新しい語の検索が始まる。Esc はふだんどおり検索を閉じる。
    Ctrl+F と Everything は確定 (Enter / 検索ボタン) でしか検索しないので、代入だけでよい。
 4. フォーカスの要求を**毎回明示的に立てる** (P2-2 対応。既に開いている検索では開く関数が走らないため):
    常設欄なら `request_pinned_search_focus(ctx, kind)`、一時バーなら Local は `search_focus_request = true`、
@@ -97,7 +103,7 @@
    について、egui の一時データに印 (発行した pass 番号 `ctx.cumulative_pass_nr()` と入れた文字列) を置く
    (`crate::search_request` の小さな helper で置く・消費する)。egui の一時データは明示的に消すまで残るので、
    **対象の入力欄が描かれた最初の pass (発行 pass 以降) で必ず取り出して消す**。その pass がフォーカス要求の pass か欄にフォーカスがあり、
-   IME 変換中でなく、下書きが印の文字列と同じで、発行から 3 pass 以内なら、Everything の欄と同じ方法
+   IME 変換中でなく、下書きが印の文字列と同じで、発行した pass かその次の pass (第 2.3 版。3 pass から縮めた) なら、Everything の欄と同じ方法
    (show の後で `state.cursor` に全範囲を入れて store し、`output.cursor_range` も更新) で全選択する。それ以外は消すだけ。
    呼ぶ場所は、常設欄の描画 (`ui_pinned_search.rs` の 1 か所) と、Ctrl+F・Ctrl+G の一時バーの描画。ふだんの Ctrl+F・Ctrl+G の開き方は変えない。
 6. 何も実行しない。確定は利用者の Enter (既存の `submit_search_input`)、取りやめは既存の Esc。
@@ -142,7 +148,7 @@ pub(crate) fn item_search_name(item: &GridItem) -> Option<String>; // M2 の規�
 ## M6. 状態と寿命
 
 - App に新しい状態は持たない。持つのは M3 手順 5 の全選択の印だけで、これは入力欄 id に結び付いた egui の一時データ
-  (入れた文字列と同じ間だけ効き、フォーカスのある描画で 1 回消費される)。
+  (Local・Metadata だけ。発行 pass と文字列を持ち、対象欄の最初の描画で必ず消費する。全選択の条件は M3 手順 5)。
 - 名前はメニュー・キーの時点で文字列にする。以後の一覧の入れ替えとは無関係。
 - 検索欄を開いた後の操作 (編集・Enter・Esc・×・別の検索への切り替え) はすべて既存の検索欄の処理。
 - 検索欄が使えない状況 (閲覧中・モーダル表示中) は `pinned_search_availability` が既存どおり判定する。
@@ -162,7 +168,10 @@ pub(crate) fn item_search_name(item: &GridItem) -> Option<String>; // M2 の規�
 - 受付: アイテム検索・Everything の結果表示中 (`PhysicalChild` を含む) は「この場所で絞り込む」が灰色で、キーでも何も起きないこと。
   ブックマーク一覧・閲覧履歴の一覧・フルスクリーン・detached viewer・チェックありでは入口が出ない / 効かないこと (P2-5・P2-6)。
 - §1.756 取り込み後: 入れただけ・違う語で離れた場合は記録されず、Enter で記録されること。
-- (第 2.2 版) Ctrl+G の 3 時点からの注入で、prepare が残らず、`accepted` が注入前と同じであること。
+- (第 2.3 版) Ctrl+G の 3 時点 (完了後・デバウンス待ち・実行中) からの注入で、手で語を打ち替えたときと同じく結果が消えて進行中の検索が取り消され、
+  検索中の表示にならず、poll を回しても新しい検索が始まらず、Enter で初めて始まること。注入後の並べ替え・★の変更で落ちないこと。
+- (第 2.3 版) 全選択の印を置いた直後に欄が描かれないまま終了し、2 pass 以上後にふだんの Ctrl+F/G で開き直しても全選択されないこと。
+  印を置いた pass か次の pass で描かれた場合は全選択されること。
 - (第 2.2 版) 右クリックメニュー表示中に 3 項目が (条件を満たすとき) 有効で、選ぶとメニューが閉じて欄が開くこと
   (egui メニューとネイティブメニューの dispatch の両方)。他のモーダルが開いているときは灰色。
 - (第 2.2 版) 全選択の印を置いた後、欄が描かれない pass が続く・Esc で閉じる・source を切り替える、のどれの後でも、
@@ -177,7 +186,9 @@ pub(crate) fn item_search_name(item: &GridItem) -> Option<String>; // M2 の規�
 
 ---
 
-## M9. 実装記録 (2026-11-12、設計前提の不一致により停止)
+## M9. 実装記録 (2026-11-12)
+
+### 第 2.1 版での停止記録
 
 ### 設計担当への確認事項
 
@@ -227,6 +238,56 @@ M3 の「検索のふだんのショートカットと同じ受付条件」を�
 - `cargo check`、関連 `cargo nextest run`、`cargo test --test ui_snapshot`、
   検証バイナリ作成: 設計判断待ちで未実行。
   本体 lib 全件テスト・製品バイナリ起動・git 書き込み操作は行っていない。
+
+### 第 2.2 版への対応と追加の設計確認事項
+
+利用者の続行指示を受け、設計コミット `b04a445b1` と途中実装コミット `d440d8827` の上で作業を再開した。
+第 2.1 版のメニュー受付問題は、以下の変更で対応した。git の書き込み操作と製品バイナリ起動は行っていない。
+
+- `src/app/search_request.rs` と `src/app/update_phases.rs`: 検索開始可能な状態の判定を共通化し、
+  Everything の keyboard permit は `src/global_search_ui/everything/shortcut.rs` の dispatcher へ戻した。
+- `src/app.rs`、`src/app/pinned_search.rs`: 通常の受付を維持したまま、メニュー自身だけを除いた可否判定を用意。
+  `src/ui_dialogs/context_menu.rs` は名前確定 → 自分の owner を閉じる → 通常の `open_search_with_text` の順とした。
+- `src/global_search_ui/everything.rs`: `retire_search_work` を source 切り替えと Metadata 注入で共有。
+  Metadata 注入は旧 pending / prepare / mtime lookup を退役し、run を更新、done=true・reject解除・debounce解除とする。
+  accepted と last_executed、表示中の items は注入時には変更しない。
+- `src/search_request.rs` と `src/ui_pinned_search.rs`・`src/ui_main.rs`・`src/global_search_ui.rs`:
+  Local/Metadata の印を発行 pass + 文字列とし、最初の描画で消費する。全選択は同語・非IME・focus要求またはfocusあり・3pass以内。
+  `src/global_search_ui/everything/ui.rs` の印消費を削除し、Everything は既存の全選択だけを使う。
+  通常の `open_search_shortcut` では Local/Metadata の両入力IDの印を明示破棄する。
+  これにより、3pass以内の Esc / source切り替え後にも通常の開き直しで注入の印が復活しない。
+- `src/app/tests/search_request.rs`・`src/ui_dialogs/context_menu.rs` の headless 回帰を更新・追加。
+  `docs/search-architecture.md` の内部説明、`docs/keymap.ini.default` の生成順、本書 M6 の古い寿命説明も合わせた。
+
+独立レビューで、**第 2.2 版の prepare 退役により保持結果の評価順ソートが退行する**ことが判明した。
+コード経路でも一致したため、利用者の「設計の前提がまたコードと合わなければその時点で報告」に従い、
+この境界の追加実装を停止した。現在の差分は取り込み可能な完成状態ではない。
+
+1. Metadata 注入は、検索完了後を含め `retire_search_work` で `page_edit_prepare` を消す。
+2. 検索結果を表示したまま評価順へ切り替えると、`App::apply_sort_change_reload_with_physical_mode`
+   (`src/app.rs`) は `rebuild_items_from_global_search` を呼ぶ。
+3. `request_search_view_build` (`src/global_search_ui.rs`) は prepare の有無で分岐する。
+   prepare が無い Metadata の経路では、`ListingOrderRequest::Rating` を `standard_fallback()` に変え、
+   「評価順を準備できなかったため名前順で表示しました」と通知する。評価順のまま ★ フィルタを変えた場合も同じ再構築へ進む。
+4. Metadata の保持結果の並べ替えには prepare を作り直す入口が無い。
+   Everything の dataset 再投影経路とは異なる。第 2.2 版の指定どおり旧 prepare を消すだけでは、
+   名前注入前に使えていた並べ替えを保持できない。
+
+設計担当への判断事項: 旧検索・旧 query の prepare を退役させた後、保持結果をどの immutable 条件・結果から再投影するか。
+旧 prepare をそのまま残す、評価順を無効化する、名前順への fallback を容認する、等の迂回・機能制限は追加していない。
+
+第 2.2 版対応時の検証:
+
+- `cargo check -p mimageviewer --bin mimageviewer-core`: 成功 (8分07秒)。既存コードの warning あり。
+- `python scripts/check_ui_glyphs.py`: 危険なグリフ 0 件。
+- `python scripts/check_site_cards.py`: 53 カード、違反 0 件。
+- `cargo nextest run -p mimageviewer --lib -E 'test(/search_request|search_name|search_by_name/)'`:
+  依存 `turbojpeg-sys v1.2.0` の native build で失敗 (CMake の MSBuild install が exit 1、Cargo exit 101)。
+  テスト実行 0 件。追加テストのコンパイル完了も未確認。タイムアウトによる打ち切りではない。
+- `cargo fmt` (引数なし): 成功 (exit 0)。
+- `git diff --check`: 成功。改行コードについての Git の警告のみ。
+- 関連モジュールの nextest、`cargo test --test ui_snapshot`、検証バイナリ作成: 追加の設計判断待ちで未実行。
+  `test-lib-full.ps1` は利用者指定により実行しない。
 
 ---
 

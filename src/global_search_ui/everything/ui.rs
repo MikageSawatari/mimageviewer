@@ -83,7 +83,6 @@ pub(super) fn draw_everything_controls(
                     .hint_text("ファイル名・Everything 構文 (ext:jpg;png など)")
                     .desired_width(width)
             });
-        crate::search_request::apply_select_all(ui.ctx(), query, &mut output);
         if select_query {
             let range = egui::text::CCursorRange::two(
                 egui::text::CCursor::new(0),

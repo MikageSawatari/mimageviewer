@@ -1,5 +1,5 @@
 use super::*;
-use crate::global_search_ui::{MetadataAppliedSpec, SearchAccepted, SearchProducer, SearchSource};
+use crate::global_search_ui::{MetadataAppliedSpec, SearchAccepted, SearchProducer};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -79,6 +79,10 @@ fn search_name_three_targets_pinned_and_temporary_focus_select_and_wait_for_ente
             inject(&mut app, &ctx, kind, "日本語 name");
             assert!(app.edit_owner(kind), "{kind:?}, pinned={pinned}");
             assert_eq!(app.search_draft(kind), "日本語 name");
+            assert_eq!(
+                crate::search_request::select_all_pending_for_test(&ctx, input_id(kind, pinned)),
+                kind != Kind::Everything
+            );
             for _ in 0..5 {
                 app.poll_global_search_debounce(&ctx);
             }
@@ -201,6 +205,7 @@ fn search_name_metadata_injection_disarms_completed_waiting_and_running_queries(
         let mut app = super::super::setup_app_for_test();
         let ctx = context();
         app.ensure_search_session(Kind::Metadata);
+        app.begin_search_page_edit_prepare_for_test(&ctx);
         app.global_search.metadata_draft = "old executed".into();
         app.global_search.last_executed = "old executed".into();
         app.global_search.accepted = SearchAccepted::Metadata {
@@ -209,6 +214,14 @@ fn search_name_metadata_injection_disarms_completed_waiting_and_running_queries(
                 filters: app.global_search.filters.clone(),
             }),
         };
+        let SearchAccepted::Metadata {
+            applied: applied_before,
+        } = &app.global_search.accepted
+        else {
+            unreachable!()
+        };
+        let applied_before = applied_before.clone();
+        let items_before = app.items.clone();
         app.global_search.done = phase == 0;
         app.global_search.last_change_at =
             (phase != 0).then(|| Instant::now() - Duration::from_secs(2));
@@ -229,18 +242,27 @@ fn search_name_metadata_injection_disarms_completed_waiting_and_running_queries(
             matches!(&app.global_search.accepted, SearchAccepted::Metadata { applied: Some(applied) } if applied.query == "old executed")
         );
         assert!(app.global_search.last_change_at.is_none());
-        assert_eq!(app.global_search.done, phase != 2);
+        assert!(
+            matches!(&app.global_search.accepted, SearchAccepted::Metadata { applied } if applied == &applied_before)
+        );
+        assert_eq!(app.items, items_before);
+        assert!(app.global_search.done);
+        assert!(app.global_search.pending.is_none());
+        assert!(app.global_search.page_edit_prepare.is_none());
         for _ in 0..8 {
             app.poll_global_search_debounce(&ctx);
             app.poll_global_search_events(&ctx);
         }
-        assert!(!cancel.load(Ordering::Relaxed));
+        assert_eq!(cancel.load(Ordering::Relaxed), phase == 2);
         if phase == 2 {
-            tx.send(crate::global_search::SearchStreamEvent::Done {
-                truncated: false,
-                reason: crate::global_search::DoneReason::Complete,
-            })
-            .unwrap();
+            assert!(
+                tx.send(crate::global_search::SearchStreamEvent::Done {
+                    truncated: false,
+                    reason: crate::global_search::DoneReason::Complete,
+                })
+                .is_err(),
+                "retired query no longer has a receiver"
+            );
             app.poll_global_search_events(&ctx);
             assert!(app.global_search.done);
         }
@@ -250,6 +272,10 @@ fn search_name_metadata_injection_disarms_completed_waiting_and_running_queries(
         }
         assert_eq!(app.global_search.run_sequence, run);
         assert_eq!(app.global_search.last_executed, "old executed");
+        assert!(
+            matches!(&app.global_search.accepted, SearchAccepted::Metadata { applied } if applied == &applied_before)
+        );
+        assert!(app.global_search.page_edit_prepare.is_none());
         assert!(app.submit_search_input(&ctx, Kind::Metadata, Kind::Metadata.temporary_id()));
         assert!(app.global_search.last_change_at.is_some());
         assert_ne!(app.global_search.run_sequence, run);
@@ -261,10 +287,69 @@ fn search_name_metadata_injection_disarms_completed_waiting_and_running_queries(
 }
 
 #[test]
+fn search_name_abandoned_selection_never_revives_on_ordinary_reopen() {
+    let _input = crate::key_input::lock_test_input();
+    for pinned in [false, true] {
+        for kind in [Kind::Local, Kind::Metadata] {
+            for abandoned in ["undrawn", "escape", "switch"] {
+                let mut app = super::super::setup_app_for_test();
+                pin(&mut app, pinned);
+                let ctx = context();
+                ctx.begin_pass(egui::RawInput::default());
+                inject(&mut app, &ctx, kind, "same draft");
+                // No field draw: the mark has not been consumed.
+                end(&ctx);
+                if abandoned == "undrawn" {
+                    for _ in 0..4 {
+                        ctx.begin_pass(egui::RawInput::default());
+                        end(&ctx);
+                    }
+                }
+                if abandoned == "escape" {
+                    ctx.begin_pass(egui::RawInput {
+                        events: vec![egui::Event::Key {
+                            key: egui::Key::Escape,
+                            physical_key: Some(egui::Key::Escape),
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        }],
+                        ..Default::default()
+                    });
+                    let owner = app.capture_search_escape_input(&ctx);
+                    app.route_search_escape(
+                        &ctx,
+                        owner,
+                        &mut super::super::pinned_search::EscapeClaim::default(),
+                    );
+                    assert!(!app.edit_owner(kind));
+                    end(&ctx);
+                } else {
+                    // Switching to Container exercises the ordinary session
+                    // teardown, including a temporary draft's clearing.
+                    app.ensure_search_session(Kind::Container);
+                }
+                ctx.begin_pass(egui::RawInput::default());
+                // Keep the spelling identical even for temporary inputs so the
+                // test cannot pass only because closing cleared their draft.
+                *app.search_draft_mut(kind) = "same draft".into();
+                app.open_search_shortcut(&ctx, kind);
+                draw(&mut app, &ctx, kind, pinned);
+                let range = selection(&ctx, input_id(kind, pinned));
+                assert_eq!(
+                    range.start, range.end,
+                    "{kind:?}, pinned={pinned}, {abandoned}"
+                );
+                end(&ctx);
+            }
+        }
+    }
+}
+
+#[test]
 fn search_name_shortcut_conjunctions_preserve_local_and_metadata_admission() {
-    let ctx = context();
+    let mut app = super::super::setup_app_for_test();
     for bits in 0..256 {
-        let mut app = super::super::setup_app_for_test();
         app.address_has_focus = bits & 1 != 0;
         app.search_has_focus = bits & 2 != 0;
         app.favsearch.has_focus = bits & 4 != 0;
@@ -279,12 +364,12 @@ fn search_name_shortcut_conjunctions_preserve_local_and_metadata_admission() {
             && !app.favsearch.has_focus
             && !app.tag_view.has_focus;
         assert_eq!(
-            app.search_shortcut_availability(&ctx, Kind::Local, blocked)
+            app.search_shortcut_availability(Kind::Local, blocked)
                 .is_ok(),
             base && !app.global_search.has_focus && !app.global_search.active
         );
         assert_eq!(
-            app.search_shortcut_availability(&ctx, Kind::Metadata, blocked)
+            app.search_shortcut_availability(Kind::Metadata, blocked)
                 .is_ok(),
             base && !app.search_has_focus
         );
@@ -305,21 +390,26 @@ fn search_name_local_refusal_keeps_both_search_result_sources_and_physical_child
             };
             app.ensure_search_session(kind);
             if everything {
-                app.global_search.accepted = SearchAccepted::Everything {
-                    submitted: crate::global_search_ui::SubmittedEverything {
-                        query: "old".into(),
-                        run: 1,
-                    },
-                    dataset: crate::global_search_ui::everything_dataset_for_test(Vec::new()),
-                    position: if child {
-                        crate::global_search_ui::EverythingPosition::PhysicalChild {
-                            logical_source: app.tmp.path().to_owned(),
-                            return_anchor: None,
-                        }
-                    } else {
-                        crate::global_search_ui::EverythingPosition::Root
-                    },
-                };
+                crate::global_search_ui::adopt_everything_for_test(
+                    &mut app,
+                    &ctx,
+                    "old",
+                    crate::global_search_ui::everything_dataset_for_test(Vec::new()),
+                );
+                if child {
+                    let SearchAccepted::Everything { position, .. } =
+                        &mut app.global_search.accepted
+                    else {
+                        unreachable!()
+                    };
+                    *position = crate::global_search_ui::EverythingPosition::PhysicalChild {
+                        logical_source: app.tmp.path().to_owned(),
+                        return_anchor: app.tmp.path().to_owned(),
+                        route: super::super::FacetRoute::root(super::super::FacetScope::path(
+                            app.tmp.path(),
+                        )),
+                    };
+                }
             } else if child {
                 app.global_search.drill = Some(crate::global_search_ui::DrillState {
                     container_root: app.tmp.path().to_owned(),
@@ -437,6 +527,77 @@ fn search_name_rebound_grid_action_routes_after_existing_keyboard_ownership() {
         assert!(app.handle_keyboard(&ctx).is_none());
         assert!(app.edit_owner(target));
         assert_eq!(app.search_draft(target), "selected name");
+        end(&ctx);
+    }
+}
+
+#[test]
+fn search_name_key_respects_text_ime_modal_pane_and_entry_ownership() {
+    let _input = crate::key_input::lock_test_input();
+    for blocked in [
+        "text",
+        "ime",
+        "modal",
+        "checked",
+        "bookmark",
+        "history",
+        "fullscreen",
+        "pane",
+    ] {
+        let mut app = super::super::setup_app_for_test();
+        let mut settings = crate::keymap::KeymapSettings::default();
+        settings.set_override_chords(
+            KeyAction::GridSearchNameMetadata,
+            vec![crate::keymap::Chord::ctrl_shift(crate::keymap::KeyName::F)],
+        );
+        app.keymap = crate::keymap::Keymap::from_settings(&settings);
+        app.items = vec![GridItem::Image(app.tmp.path().join("selected.jpg"))];
+        app.selected = Some(0);
+        let ctx = context();
+        match blocked {
+            "checked" => {
+                app.checked.insert(0);
+            }
+            "bookmark" => app.items_are_bookmark_view = true,
+            "history" => app.items_are_reading_history_view = true,
+            "fullscreen" => app.fullscreen_idx = Some(0),
+            "modal" => app.show_stats_dialog = true,
+            "pane" => {
+                app.settings.folder_tree_pane_visible = true;
+            }
+            _ => {}
+        }
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::F,
+                physical_key: Some(egui::Key::F),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            }],
+            ..Default::default()
+        });
+        if matches!(blocked, "text" | "ime") {
+            crate::keyboard_input::cache_keyboard_owner(
+                &ctx,
+                crate::keyboard_input::KeyboardOwner::TextInput {
+                    viewport: egui::ViewportId::ROOT,
+                    widget_id: egui::Id::unique("search-name-text-owner"),
+                    phase: if blocked == "ime" {
+                        crate::keyboard_input::TextInputPhase::ImeComposing
+                    } else {
+                        crate::keyboard_input::TextInputPhase::Focused
+                    },
+                },
+            );
+        }
+        if blocked == "pane" {
+            // The pane's existing focus owner is independent of text input.
+            app.folder_pane.has_focus = true;
+        }
+        app.handle_keyboard(&ctx);
+        assert!(!app.global_search.active, "{blocked}");
+        assert!(app.global_search.metadata_draft.is_empty(), "{blocked}");
         end(&ctx);
     }
 }
