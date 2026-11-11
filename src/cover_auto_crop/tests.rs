@@ -142,6 +142,78 @@ fn fine_stripes_halftone_and_noise_do_not_manufacture_jacket_evidence() {
     }
 }
 
+/// Print only in the top/bottom bands must contribute to panel variance.
+/// A filtered margin reference erases those bands before Features can see them.
+fn patterned_margin_art(band: i32, amplitude: i32, center_hue: bool) -> RgbImage {
+    RgbImage::from_fn(300, 256, |x, y| {
+        let z = y.min(255 - y) as i32;
+        let tone = amplitude * z.min(band - z).min(8).max(0) * if y % 2 == 0 { -1 } else { 1 };
+        let shade = if x < 100 {
+            -20
+        } else if x < 208 {
+            0
+        } else {
+            20
+        };
+        let hue = if center_hue && band < y as i32 && (y as i32) < 255 - band {
+            if (y / 16) % 2 == 0 {
+                [30, -15, 0]
+            } else {
+                [-30, 15, 0]
+            }
+        } else {
+            [0; 3]
+        };
+        Rgb(std::array::from_fn(|channel| {
+            u8::try_from([150, 60, 120][channel] + shade + tone + hue[channel])
+                .expect("generated print stays in RGB range")
+        }))
+    })
+}
+
+#[test]
+fn patterned_margin_rows_remain_content_and_decline_without_jacket_evidence() {
+    // Exact confirmation-review counterexample, including the central hue bands.
+    let image = patterned_margin_art(50, 4, true);
+    let raster = analysis_raster(&DynamicImage::ImageRgb8(image.clone()));
+    assert_eq!(raster, image);
+    let source = Raster::from_image(&raster);
+    assert_eq!(
+        content_bounds(&source, |x, y| source.get(x, y)),
+        [0, 1, 300, 255]
+    );
+    assert_eq!(
+        cover_auto_crop(
+            &raster,
+            image.dimensions(),
+            Some(0.7),
+            ReadingDirection::Rtl
+        ),
+        Err(AutoCropDecline::NoJacketEvidence)
+    );
+}
+
+#[test]
+fn patterned_top_bottom_bands_with_flat_center_must_decline() {
+    // These widths/amplitudes also decline in the evaluation prototype.
+    for (band, amplitude) in [(40, 3), (50, 4), (64, 5)] {
+        for binding in [ReadingDirection::Rtl, ReadingDirection::Ltr] {
+            let image = patterned_margin_art(band, amplitude, false);
+            let image = if binding == ReadingDirection::Ltr {
+                image::imageops::flip_horizontal(&image)
+            } else {
+                image
+            };
+            let dims = image.dimensions();
+            let raster = analysis_raster(&DynamicImage::ImageRgb8(image));
+            assert!(
+                cover_auto_crop(&raster, dims, Some(0.7), binding).is_err(),
+                "band={band}, amplitude={amplitude}, binding={binding:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn impossible_scan_sliver_declines_without_unbounded_upscale() {
     for dims in [(2048, 1), (25_601, 256)] {
@@ -157,7 +229,13 @@ fn impossible_scan_sliver_declines_without_unbounded_upscale() {
 
 /// Distinct printed faces with no internal full-height seams. The left flap
 /// contains sparse text, the spine is dense, and the back is almost blank.
-fn jacket(binding: ReadingDirection, scan: bool, skew: bool, flap: bool) -> (RgbImage, [u32; 4]) {
+fn jacket(
+    binding: ReadingDirection,
+    scan: bool,
+    dust: bool,
+    skew: bool,
+    flap: bool,
+) -> (RgbImage, [u32; 4]) {
     let (height, front_width, flap_width, spine_width, back_width) =
         (512, 358, if flap { 140 } else { 0 }, 36, 358);
     let margin = if scan { [23, 13, 7, 19] } else { [0; 4] };
@@ -201,7 +279,7 @@ fn jacket(binding: ReadingDirection, scan: bool, skew: bool, flap: bool) -> (Rgb
             image.put_pixel(margin[0] + x, margin[1] + y, Rgb(p));
         }
     }
-    if scan {
+    if dust {
         // Dust is below the 3% margin tolerance, on all four margins.
         for x in (3..image.width()).step_by(71) {
             image.put_pixel(x, 3, Rgb([20, 20, 20]));
@@ -239,7 +317,7 @@ fn synthetic_jackets_both_bindings_margins_dust_skew_and_spine() {
         for scan in [false, true] {
             for skew in [false, true] {
                 for flap in [false, true] {
-                    let (image, truth) = jacket(binding, scan, skew, flap);
+                    let (image, truth) = jacket(binding, scan, scan, skew, flap);
                     let dims = image.dimensions();
                     let raster = analysis_raster(&DynamicImage::ImageRgb8(image));
                     let crop = cover_auto_crop(&raster, dims, Some(0.7), binding).unwrap_or_else(
@@ -259,9 +337,11 @@ fn synthetic_jackets_both_bindings_margins_dust_skew_and_spine() {
 }
 
 #[test]
-fn decoded_resolution_keeps_boundaries_within_one_analysis_column() {
+fn decoded_resolution_without_dust_keeps_boundaries_within_one_analysis_column() {
     for binding in [ReadingDirection::Rtl, ReadingDirection::Ltr] {
-        let (image, _) = jacket(binding, true, true, true);
+        // Isolated dust may disappear at a smaller decode scale. The prototype
+        // does not promise identical content bounds in that case.
+        let (image, _) = jacket(binding, true, false, true, true);
         let dims = image.dimensions();
         let mut previous: Option<[u32; 4]> = None;
         for height in [128, 256, 512, 1024] {
@@ -352,7 +432,7 @@ fn gates_and_identity_are_explicit() {
 
 #[test]
 fn content_margin_tolerates_sparse_dust_and_remains_asymmetric() {
-    let (image, _) = jacket(ReadingDirection::Rtl, true, false, true);
+    let (image, _) = jacket(ReadingDirection::Rtl, true, true, false, true);
     let raster = Raster::from_image(&image);
     let bounds = content_bounds(&raster, |x, y| raster.get(x, y));
     assert_eq!(
@@ -369,7 +449,7 @@ fn content_margin_tolerates_sparse_dust_and_remains_asymmetric() {
 #[test]
 fn color_is_a_veto_and_does_not_relocate_to_the_back() {
     for binding in [ReadingDirection::Rtl, ReadingDirection::Ltr] {
-        let (mut image, front) = jacket(binding, false, false, false);
+        let (mut image, front) = jacket(binding, false, false, false, false);
         for y in 0..image.height() {
             for x in front[0]..front[2] {
                 // A grayscale front cannot win against the vivid back by

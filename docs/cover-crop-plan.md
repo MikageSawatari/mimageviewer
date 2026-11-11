@@ -209,8 +209,8 @@ pub(crate) struct CoverCrop { x0: u32, y0: u32, x1: u32, y1: u32 }
   よらず判定の入力をそろえる)。(3) 切ると判定し、範囲の長辺が `display_px` に足りない場合だけ、**同じ bytes / 同じ PDF の lease から
   手動と同じ目標で 1 回だけデコードし直す**。デコードは最大 2 回。
   判定の印刷密度・輝度分散・色の豊かさ・境界強度へ追加の平滑化を掛けない。高さ256のnative入力の細かなtextureを保ち、
-  縮小は出力1画素分の面積平均を使う。孤立した埃による余白位置の揺れだけを、行方向3タップの参照値で抑える。
-  その座標で切り出した元画素から境界の強さと全特徴量を計算し、判定用統計を平滑化した値で置き換えない。
+  縮小は出力1画素分の面積平均を使う。余白も未平滑の解析画素で判定し、元画素では余白でない模様帯を除去しない。
+  埃が縮小率によって残ったり消えたりする場合の結果の一致は保証せず、そのための平滑化を追加しない。
 - 返す寸法: `source_dims` = `CoverCrop::pixel_bounds(元寸法)` の幅・高さ、`layout_dims` = `None`。catalog の行にも同じ値を保存する。
 - 表紙 identity (§1.718): `CoverIdentity::Page(leaf のページキー)` のまま。回転前に切った画素が描画時に回るので表示と一致する。
 - 見開きの寸法記録 (`record_*_dims_for_spread`) には、切った結果の寸法を渡さない (ページの寸法ではない)。
@@ -725,6 +725,8 @@ cargo nextest run -p mimageviewer --lib -E 'test(/cover_auto|auto_cover_crop|aut
   高さと境界のsupport順位を変えることだった。余白座標の参照だけに3タップを使い、元画素の特徴量を保った。
   小型Rust検証13件は成功、128/256/512/1024行の最大差は約1.00037列。実DCT倍率と元の余白座標のテストも通し、
   許容値1.1列は広げていない。外部評価は生成sheetを開かず、集計だけを確認する。
+  **fix4追記**: 3タップの余白参照も模様帯を切除して分散を失わせるため撤去し、余白は`source.get`で判定する。
+  埃入りfixtureの倍率間一致は試作の保証ではないため、安定性検査は余白・傾きを残した埃なし入力に変更し、1.1列は維持する。
 - 通常ZipDirのdirect entry・直接pin・cascadeに共通の要求baseからsampling prefixを渡す。
   範囲画面も解決済み要求の同じprefixを使う。Aの最後のページの後に比率の違うBがあるZIPで、
   実App要求→samplerと画面用resolverの両方がAの比率を得ることを検査する。
@@ -771,3 +773,31 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local
   その準備失敗とprobe13件は、本体436件・外部評価2件・UI253件の成功件数へ合算しない。
 - 実装担当は追加のコミット、製品起動、確認用build、lib全件、test-full、独立レビューを行っていない。
   設計担当が差分をレビューし、外部評価を再実行してコミットする。
+
+### 17.2 fix4: 模様を余白にしない（基点 `6d4658154`）
+
+`margin_pixel`を撤去し、余白判定へ未平滑の`source.get`を渡す。提示された300×256の生成式をそのままテストへ移し、
+余白が`[0,1,300,255]`で、余白処理を通した判定が`NoJacketEvidence`になることを検査する。
+中央が平らで上下だけに模様がある帯幅40/50/64、最大振幅24/32/40の3変種（試作も辞退）も、左右綴じで必ず辞退させる。
+既存の細縞・網点・ノイズの辞退と、埃なしの合成入力・実JPEG DCTの1.1列の境界検査を維持する。
+
+検証は共有runnerのowner=`764 fix4`で直列実行し、外部評価は集計値だけを確認する。
+出力先は`target/cover-auto-eval-{dummies,realistic}-fix4/`。入力画像をコピーせず、sheetを開かない。
+
+- 焦点nextestは`cover_auto|auto_cover_crop|auto_crop_scale_tests|key_normalization_tests|representative_cache_key|cover_crop_key_normalization|thumb_loader::tests::.*cache_key`のfilterで、
+  **47成功・失敗0（exit0）、17336 skipped**。`target/cover-crop-fix4-focused.log`。
+  初回は追加変種の帯幅50・最大振幅40も辞退すると誤って期待して1失敗だったが、試作も同じ入力をcropすることを確認した。
+  上記の試作も辞退する3条件へ直して再実行した。本体の閾値は変更していない。
+
+外部評価は各1成功・失敗0（exit0）で、受入基準を満たした。集計値のみ確認:
+
+| 入力 | good正例 | wrong | declined合計 | 負例crop | 負例declined |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| dummies | 36 | 0 | 46 | 0 | 22 |
+| realistic | 32 | 0 | 58 | 0 | 30 |
+
+実行ログは`target/cover-crop-fix4-final-checks.log`。評価入力をコピーせず、生成sheetは開いていない。
+
+- 引数なしの`cargo fmt`と、同じrunner内の`cargo fmt --check`は成功。
+- 更新指定なしの`cargo test -p mimageviewer --test ui_snapshot`は**253成功・失敗0（exit0）**。snapshot更新なし。
+- `git diff --check`は成功。製品起動・build-dev・lib全件・コミットは行っていない。

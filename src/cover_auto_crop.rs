@@ -143,17 +143,6 @@ impl Raster {
         self.pixels[y * self.width + x]
     }
 
-    /// Only margin positioning uses this row reference. A dust row otherwise
-    /// survives one decode scale but not another, changing the content height
-    /// and therefore the support ranking of otherwise identical panel edges.
-    /// Panel evidence and visual statistics always read the unfiltered pixels.
-    fn margin_pixel(&self, x: usize, y: usize) -> Pixel {
-        let previous = self.get(x, y.saturating_sub(1));
-        let current = self.get(x, y);
-        let next = self.get(x, (y + 1).min(self.height - 1));
-        std::array::from_fn(|c| (0.25 * previous[c] + 0.5 * current[c] + 0.25 * next[c]).round())
-    }
-
     fn from_image(image: &RgbImage) -> Self {
         Self {
             width: image.width() as usize,
@@ -374,7 +363,7 @@ pub(crate) fn cover_auto_crop(
         return Err(NoStructure);
     }
     let source = Raster::from_image(image);
-    let bounds = content_bounds(&source, |x, y| source.margin_pixel(x, y));
+    let bounds = content_bounds(&source, |x, y| source.get(x, y));
     let sub = source.region(bounds, binding == ReadingDirection::Ltr);
     if sub.width as f64 / (sub.height as f64) < aspect * 1.25 {
         return Err(NotWide);
