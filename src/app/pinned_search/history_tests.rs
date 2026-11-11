@@ -798,8 +798,10 @@ fn history_pending_grid_case(
     crate::ui_fonts::configure_fonts(&ctx);
     let current = app.tmp.path().join("current");
     let target = app.tmp.path().join("target");
+    let after = app.tmp.path().join("after");
     std::fs::create_dir(&current).unwrap();
     std::fs::create_dir(&target).unwrap();
+    std::fs::create_dir(&after).unwrap();
     let draft = if search.is_some_and(|(kind, _)| kind == Kind::Everything) {
         "draft\0"
     } else {
@@ -833,8 +835,11 @@ fn history_pending_grid_case(
     app.items = vec![
         crate::app::GridItem::Folder(target.clone()),
         crate::app::GridItem::Folder(current.clone()),
+        crate::app::GridItem::Folder(after),
     ];
-    app.visible_indices = vec![0, 1];
+    // A middle cursor in one column must move for either leaked vertical arrow.
+    app.visible_indices = vec![0, 1, 2];
+    app.settings.grid_cols = 1;
     app.selected = Some(1);
     let draw = |app: &mut App| {
         if let Some((kind, pinned)) = search {
