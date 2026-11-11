@@ -1455,6 +1455,26 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-12: 検索中の移動で、出発 context の移譲を検索の退役より先に行う (§1.682 / §1.688 §12.3)
+
+検索中に本・コレクション・場所へ移る共通 adopter (`adopt_main_list_navigation_with_completion`) が、`ExitTemporaryView` の検索退役を
+先に行い、その後の installer 内で出発 context を detached 窓へ移譲していた。移譲された context は bundle の検索状態 (Metadata /
+Everything の `global_search`、Search surface・return origin・rows) を失っていた。headless の既存回帰
+`collection_open_from_detached_transient_video_keeps_fallback_return_folder` で判明 (実機の観測ではない)。
+
+変更は呼び出し順だけ: 受付・current 照合 → 既存の移譲境界 (promote / park / close) → main に残った context へ検索退役と成功採用。
+リリース済みの Plain のコレクション open (`open_collection_grid`) と同じ順序。移譲境界の関数の中身、detached 述語・viewport・
+registry・binding、bundle の field は変えない。移譲済みの事実は局所の型・引数で installer へ渡して二重の境界を省略し、App に
+bool / Option を足さない。Collection の採用直前 locked 検査は移譲と同じ同期区間に置き、`Blocked` では何も変えない。
+
+**未対応 (既存の欠け)**: Ctrl+S (`favsearch`) と Ctrl+T (`tag_view`) の検索 owner と pending は App 共有で bundle に無いため、
+移譲後も main の退役で消える。リリース済みの Plain のコレクション open も同じで、今回の変更で悪化しない。context 所有への移動は
+bundle 境界の変更なので、リワーク側の別項目とする。
+
+設計担当 ClaudeCode と独立 Sol / xhigh 設計レビュー (r1 REVISE P2/P3 → r2 ACCEPT) は、移動先の変更を移譲境界より前に適用していた
+順序の誤りを正す構造修正であり、症状パッチではないと合意した。正本は
+[検索結果からの移動 §12.3](search-result-navigation-682-688-plan.md)。
+
 ### 2026-11-10: ページめくり提示資格を表示単位の binding へ移す (§1.750)
 
 遠方ページの横長寸法の到着で本全体の `Arc<Vec<SpreadDisplayUnit>>` が作り直されると、演出中の単位が同じでも
