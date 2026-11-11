@@ -595,3 +595,10 @@ geometryの全組合せへPNGを増やさない。
 既存の整理先画像3枚はlibの該当25件でも通常比較を確認した。
 新しい部品のfixtureも本体フォントを使い、glyphとaccessibilityの検査を無効にしない。
 製品GUIの起動・実IMEの検収ではなく、設計担当の画像確認と実機確認は別に行う。
+
+§1.756の設計担当の目視後、常設欄は履歴なしと同じ欄全体の幅へ戻し、履歴行は左揃え・
+通常行の塗りなしへ修正した。`toolbar_pinned_search_light` / `toolbar_pinned_search_narrow_dark` /
+`toolbar_pinned_search_history_light` / `search_history_popup_dark` の4枚だけを再更新（計61,794 bytes）。
+実装担当が4枚を目視し、通常幅の折り返し、狭幅、選択行と通常行の区別を確認した。
+一時バーとフォルダバーの既存PNGは変更していない。更新指定あり/なしで各251件成功。
+追補の検証記録は設計書§12。

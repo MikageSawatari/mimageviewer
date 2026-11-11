@@ -155,16 +155,11 @@ pub fn draw_pinned_search(
         };
     const MARGIN: f32 = 2.0;
     const TEXT_MARGIN: f32 = 4.0;
-    let history_width = if history.is_some() {
-        crate::ui_history_field::reserved_width(ui)
-    } else {
-        0.0
-    };
     let width = search_section_width(
         ui.max_rect().width(),
         ui.available_rect_before_wrap().width(),
         controls,
-        (MARGIN + TEXT_MARGIN + 1.0) * 2.0 + history_width,
+        (MARGIN + TEXT_MARGIN + 1.0) * 2.0,
         gap,
     );
     let previous_bottom = ui.min_rect().bottom();
@@ -221,11 +216,9 @@ pub fn draw_pinned_search(
                                         },
                                         |edit| {
                                             edit.id(kind.input_id())
-                                                .desired_width(
-                                                    width.input + TEXT_MARGIN * 2.0 + history_width,
-                                                )
+                                                .desired_width(width.input + TEXT_MARGIN * 2.0)
                                                 .min_size(egui::vec2(
-                                                    width.input + TEXT_MARGIN * 2.0 + history_width,
+                                                    width.input + TEXT_MARGIN * 2.0,
                                                     20.0,
                                                 ))
                                                 .margin(egui::Margin::symmetric(4, 2))
@@ -532,6 +525,54 @@ mod tests {
         assert_eq!(shrink.input, 158.0);
         assert_eq!(shrink.width, 300.0);
     }
+
+    #[test]
+    fn section1409_history_preserves_whole_field_width_and_toolbar_wrapping() {
+        type Geometry = (egui::Rect, egui::Rect, egui::Rect, Option<egui::Rect>);
+        for width in [1120.0, 720.0, 360.0, 240.0] {
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(width, 500.0))
+                .build_ui_state(
+                    |ui, (history, rects): &mut (bool, Vec<Geometry>)| {
+                        crate::ui_main::apply_toolbar_style(ui);
+                        rects.clear();
+                        ui.horizontal_wrapped(|ui| {
+                            for kind in PinnedSearchKind::ALL {
+                                let response = draw_pinned_search(
+                                    ui,
+                                    kind,
+                                    &mut "下書き".to_owned(),
+                                    PinnedSearchState::Edited,
+                                    Ok(()),
+                                    false,
+                                    false,
+                                    false,
+                                    history.then_some(&[][..]),
+                                );
+                                rects.push((
+                                    response.response.rect,
+                                    response.inner.input.rect,
+                                    response.inner.clear.rect,
+                                    response.inner.submit.map(|r| r.rect),
+                                ));
+                            }
+                        });
+                    },
+                    (false, Vec::new()),
+                );
+            harness.run();
+            let baseline = harness.state().1.clone();
+            harness.state_mut().0 = true;
+            harness.run();
+            assert_eq!(
+                harness.state().1,
+                baseline,
+                "history must fit inside the released field and section at {width}pt",
+            );
+        }
+    }
+
     #[test]
     fn section1409_real_render_fields_buttons_and_folder_fit_1120_720_360_240() {
         use std::{cell::RefCell, rc::Rc};

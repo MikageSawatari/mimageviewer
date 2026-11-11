@@ -397,9 +397,11 @@ pub(crate) fn show_singleline<'text>(
                                 let response = ui
                                     .add_sized(
                                         [ui.available_width(), ui.spacing().interact_size.y],
-                                        egui::Button::new(text)
-                                            .selected(open.highlight == Some(index))
-                                            .truncate(),
+                                        egui::Button::selectable(
+                                            open.highlight == Some(index),
+                                            (text, egui::Atom::grow()),
+                                        )
+                                        .truncate(),
                                     )
                                     .on_hover_text(entry);
                                 if response.clicked() {

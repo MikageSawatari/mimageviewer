@@ -50,6 +50,9 @@
   呼び出し側が tooltip 文字列で渡す。
 - 履歴の機能自体を出さないとき (検索: 設定オフ、フォルダ: `show_address_bar_history_menu` オフ) は suffix を
   付けず、従来と同じ TextEdit にする (空白も予約しない)。
+- 常設欄・一時バーは従来の欄全体の幅を保ち、▼の分だけ本文領域を狭める。常設欄の
+  `search_section_width` の140〜220ptのclamp・折り返し判定にsuffix幅を足さない。
+  フォルダバーのアドレス欄は別の幅方針で、本文幅を維持する予約を保つ。
 
 ### 3.2 一覧 (popup) と、その状態の所有者
 
@@ -85,6 +88,8 @@
 - 一覧は 1 行のボタンの並び。項目の表示文字列は呼び出し側が渡す (検索 = 検索語、フォルダ = フル
   パスの monospace)。入りきらない文字列は省略し、hover で全文を出す。0 件なら弱い文字で
   「履歴はありません」。
+- 行は `Button::selectable` を使い文字を左寄せにする。選択中とhover中の行だけ強調し、
+  それ以外の行は塗りなし。検索語とmonospaceのフルパスで同じ描画を使う。
 - 高さが画面に入らないときに備えて `ScrollArea` に入れる。**popup が開いている frame では
   wheel を消費する** (coding-conventions「Popup / menu wheel passthrough」、既存例
   `suppress_menu_button_wheel_passthrough`)。
@@ -417,7 +422,8 @@ test-script は通常の入力 (Enter・クリック) を配送するので、�
 - egui 0.37 では旧 `raw_scroll_delta` の代わりに、既存の
   `wheel_input::consume_wheel_input` を使う。既存 menu の wheel 消費と同じ経路。
 - suffix atom は22ptで、本文との間には `icon_spacing` が加わる。
-  `ui_history_field::reserved_width(ui)` にまとめ、常設欄・フォルダバー・折り返し判定・fixtureで共有する。
+  `ui_history_field::reserved_width(ui)` にまとめ、フォルダバー・その折り返し判定・fixtureで共有する。
+  当初は常設欄にも加算したが、下記の設計担当の目視後の修正で取り除いた。
   フォルダ欄は従来の欄全幅168ptを基準に、suffix追加後も実 `text_clip_rect` 幅を維持する。
   TextEditの内側余白はeguiのstyleが所有し、本文160ptという固定値は仮定しない。
 - 編集とEnterが同じ入力batchに来た場合は編集を優先して一覧を閉じ、従来のTextEdit確定へ渡す。
@@ -602,3 +608,67 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 確認する操作: 4種類それぞれの検索確定後、▼/↓で選び直してEnterで1回だけ実行されること、
 Escで一覧だけが閉じること、日本語IME変換中のキー、フォルダバー右端の▼、
 環境設定での全件消去・保存オフでOKした後の▼非表示。
+
+### 設計担当の目視後の修正
+
+初回実装は設計担当が `ff5e51641` にコミット済み。この追補は同commitを基点とする
+未コミット差分で、作業場所・全件テスト禁止・製品起動禁止は上記と同じ。
+
+- 常設欄だけでsuffix幅をsectionのframe予約とTextEdit幅へ加算していたため、
+  `toolbar_pinned_search_light` の折り返しが1段増えていた。加算を両方から外し、
+  140〜220ptのclampを含む従来の幅計算に戻した。▼はその内側に入り、本文領域が譲る。
+  一時バーとフォルダバーの幅計算は変更しない。
+- 共有の履歴行を通常の `Button::new(...).selected(...)` から `Button::selectable` へ変更。
+  文字の右にgrow atomを置き、行幅いっぱいのクリック領域と省略・tooltipを保ったまま左寄せにする。
+  通常行の塗りを消し、選択・hoverの強調はeguiの標準styleに任せる。monospaceのフルパスも同じ経路。
+- `section1409_*` の既存期待値を変更せず、1120/720/360/240pt・4種類の実rendererで、
+  履歴オン/オフのsection・入力欄・解除/検索ボタンの矩形が完全一致する回帰を追加した。
+
+独立レビューでは重要な問題・不足なし。レビュー担当は編集・build/test・製品起動を行わず、
+検証は実装担当が所有した。
+
+追補のbuild/testもすべて `MSBUILDDISABLENODEREUSE=1`、Cargoは `-j 1`（build scriptは
+`CARGO_BUILD_JOBS=1`）。本体lib全件/full gateは実行していない。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+$env:UPDATE_SNAPSHOTS='1'
+cargo nextest run -j 1 -p mimageviewer --lib --no-fail-fast -E 'test(/ui_history_field::tests|ui_pinned_search::tests/)'
+cargo test -j 1 --test ui_snapshot
+Remove-Item Env:UPDATE_SNAPSHOTS -ErrorAction SilentlyContinue
+cargo test -j 1 --test ui_snapshot
+cargo check -j 1 -p mimageviewer --bin mimageviewer-core
+cargo fmt
+cargo fmt --check
+python scripts/check_ui_glyphs.py
+python scripts/check_site_cards.py
+$env:CARGO_BUILD_JOBS='1'
+.\scripts\build-dev.ps1 -PreserveRuntime
+git diff --check
+```
+
+| 追補の検証 | 結果・log |
+| --- | --- |
+| 部品16件・常設欄4件 | 20成功・0失敗。`target/history756-followup-focused.log` |
+| integration UI更新 | 251成功・0失敗、40.97秒。`target/history756-followup-ui-update.log` |
+| integration UI通常比較 | 251成功・0失敗、37.49秒。`target/history756-followup-ui-green.log` |
+| core check | exit 0、16.37秒。警告326件で初回と同じ。`target/history756-followup-check.log` |
+| workspace全体fmt / fmt check / glyph / site cards | 成功。glyph問題0、53 cards中超過0 |
+| 確認用 `build-dev.ps1 -PreserveRuntime` | exit 0。coreは4分18秒、付属exeも成功。依存検査 `runtime=4 pe=5` 成功。通常構成、製品は未起動 |
+| `git diff --check` | 成功 |
+
+更新PNGは次の4枚だけ（新規なし、計61,794 bytes）。全4枚を実装担当が目視し、
+常設欄のアイテム検索が他の常設欄と同じ行に収まること、暗色一覧の左揃えと選択行だけの塗り、
+狭幅時の欄・ボタンの配置、▼と文字の非重複を確認した。
+一時バー・フォルダバーのPNGは変更なし。
+
+- `tests/snapshots/toolbar_pinned_search_light.png`
+- `tests/snapshots/toolbar_pinned_search_narrow_dark.png`
+- `tests/snapshots/toolbar_pinned_search_history_light.png`
+- `tests/snapshots/search_history_popup_dark.png`
+
+PNG以外の変更は `src/ui_pinned_search.rs`、`src/ui_history_field.rs`、本書、
+`docs/ui-snapshot-policy.md`。計8ファイルを未コミットで引き渡し、製品exeは未起動。
+更新済みの確認用coreの起動コマンドと実設定への注意は上の「実機・全体gate」と同じ。
+今回の実機確認対象は通常幅の常設欄の折り返しと、検索語/フォルダパスの履歴行の左揃え・
+通常/選択/hoverの見た目。実機確認自体は未実施。
