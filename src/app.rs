@@ -61420,6 +61420,11 @@ impl App {
 
                 // parked still の再開と同じく、既に割り当てた detached window_id を
                 // 保ったまま物理一覧上の対象 index を開く。
+                self.commit_viewer_session(
+                    self.viewer_presentation,
+                    true,
+                    "detached_physical_folder_open",
+                );
                 self.detached_viewer_independent_active = true;
                 self.detached_viewer_open_next_still_detached_once = true;
                 self.fs_open_intent_from_grid = true;
@@ -65193,6 +65198,7 @@ impl App {
             .sync_stable(self.viewer_presentation);
         self.pending_detached_video_host_resync = false;
         self.last_active_detached_window_id = None;
+        // Every projected session was closed above; close_fullscreen_content retires Depth.
         self.detached_viewer_independent_active = false;
         self.detached_viewer_open_next_still_detached_once = false;
         self.detached_viewer_folder_nav_reuse_window_once = false;
@@ -67183,8 +67189,9 @@ impl App {
                 self.fullscreen_idx = None;
                 #[cfg(windows)]
                 self.publish_effetune_auto_fullscreen();
-                self.commit_viewer_presentation(
+                self.commit_viewer_session(
                     self.non_detached_viewer_presentation(),
+                    false,
                     "presentation_commit",
                 );
                 #[cfg(windows)]
@@ -67267,8 +67274,9 @@ impl App {
                     DetachedWindowState::Opening,
                     "start_active_detached_loading_context",
                 );
-                app.commit_viewer_presentation(
+                app.commit_viewer_session(
                     ViewerPresentation::DetachedWindow,
+                    true,
                     "detached_commit",
                 );
                 app.detached_viewer_independent_active = true;
@@ -67407,11 +67415,12 @@ impl App {
                     },
                     "start_active_detached_collection_root_image",
                 );
-                app.detached_viewer_independent_active = true;
-                app.commit_viewer_presentation(
+                app.commit_viewer_session(
                     ViewerPresentation::DetachedWindow,
+                    true,
                     "detached_commit",
                 );
+                app.detached_viewer_independent_active = true;
                 app.fs_open_intent_from_grid = false;
                 app.top_level_grid_view.begin(
                     top_level_grid_view::TopLevelGridSurface::Collection(plan.identity),
@@ -68758,6 +68767,7 @@ impl App {
                 return false;
             }
             self.ensure_mounted_detached_session_binding(activate_window_id);
+            self.commit_viewer_session(self.viewer_presentation, true, "resume_still_snapshot");
             self.detached_viewer_independent_active = true;
             self.detached_viewer_open_next_still_detached_once = true;
             self.fs_open_intent_from_grid = false;
@@ -69638,8 +69648,9 @@ impl App {
         self.fullscreen_idx = None;
         #[cfg(windows)]
         self.publish_effetune_auto_fullscreen();
-        self.commit_viewer_presentation(
+        self.commit_viewer_session(
             self.non_detached_viewer_presentation(),
+            false,
             "presentation_commit",
         );
         #[cfg(windows)]
@@ -69791,8 +69802,9 @@ impl App {
         self.fullscreen_idx = None;
         #[cfg(windows)]
         self.publish_effetune_auto_fullscreen();
-        self.commit_viewer_presentation(
+        self.commit_viewer_session(
             self.non_detached_viewer_presentation(),
+            false,
             "presentation_commit",
         );
         #[cfg(windows)]
@@ -69960,6 +69972,7 @@ impl App {
                     "main_context_change_handoff",
                 );
             }
+            // Successful park already retired Depth in reset_detached_pause_foreground_modes.
             self.detached_viewer_independent_active = false;
         }
         self.detached_viewer_open_next_still_detached_once = false;
@@ -70140,8 +70153,9 @@ impl App {
         self.fullscreen_idx = None;
         #[cfg(windows)]
         self.publish_effetune_auto_fullscreen();
-        self.commit_viewer_presentation(
+        self.commit_viewer_session(
             self.non_detached_viewer_presentation(),
+            false,
             "presentation_commit",
         );
         #[cfg(windows)]
@@ -70183,6 +70197,8 @@ impl App {
             false
         };
         if should_park_active {
+            // Independent sessions cannot own Depth. A linked session keeps false here;
+            // on successful park its exclusive view was already retired by the park owner.
             self.detached_viewer_independent_active = false;
         }
         let mut should_recreate_active_viewport = false;
@@ -71553,6 +71569,7 @@ impl App {
         self.deferred_detached_image_window_views.remove(&window_id);
         self.ensure_mounted_detached_session_binding(window_id);
         self.last_active_detached_window_id = Some(window_id);
+        // prepare_viewer_presentation_open committed the linked destination before this reuse.
         self.detached_viewer_independent_active = false;
         self.detached_viewer_open_next_still_detached_once = false;
         self.transition_detached_window_state(
@@ -71608,7 +71625,11 @@ impl App {
         if self.viewer_presentation != presentation {
             self.fs_front_pointer = Default::default();
         }
-        self.commit_viewer_presentation(presentation, "presentation_commit");
+        self.commit_viewer_session(
+            presentation,
+            independent_detached_still,
+            "presentation_commit",
+        );
         #[cfg(windows)]
         self.publish_effetune_auto_fullscreen();
         if detached_still && !independent_detached_still {
@@ -71672,6 +71693,7 @@ impl App {
         if !matches!(presentation, ViewerPresentation::DetachedWindow)
             || !self.viewer_item_supports_egui_detached_viewport(idx)
         {
+            // Non-detached/media opens committed independent_detached_still=false above.
             self.detached_viewer_independent_active = false;
             self.detached_viewer_focus_requested = false;
         }
@@ -81941,8 +81963,9 @@ impl App {
         // intent (including borderless state) through intermediate folder-nav closes.
         let preserve_detached_for_folder_nav = self.detached_active_window_alive_wanted();
         if !preserve_detached_for_folder_nav {
-            self.commit_viewer_presentation(
+            self.commit_viewer_session(
                 self.non_detached_viewer_presentation(),
+                false,
                 "presentation_commit",
             );
             #[cfg(windows)]
@@ -82036,7 +82059,11 @@ impl App {
                 // viewport instead of reusing the existing detached host.
                 self.fs_open_intent_from_grid = false;
                 self.fs_viewport_shown = true;
-                self.commit_viewer_presentation(viewer_presentation, "presentation_commit");
+                self.commit_viewer_session(
+                    viewer_presentation,
+                    detached_viewer_independent_active,
+                    "presentation_commit",
+                );
                 #[cfg(windows)]
                 self.publish_effetune_auto_fullscreen();
                 self.fs_viewport_presentation = fs_viewport_presentation;
@@ -100982,7 +101009,7 @@ impl App {
         // TRT pack オンラインインストールダイアログ (環境設定から起動)。
         self.show_trt_install_dialog(ctx);
         self.show_vlm_addon_dialog(ctx);
-        if !main_viewer_blocked {
+        if !main_viewer_blocked && self.fullscreen_idx.is_none() {
             self.show_depth_addon_dialog(ctx);
         }
         // 編集用追加パック (フォント + 被写体分離モデル) のオンライン取得ダイアログ。

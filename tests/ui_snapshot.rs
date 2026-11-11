@@ -545,6 +545,28 @@ fn depth_parallax_panel_small_dark() {
 }
 
 #[test]
+fn depth_parallax_panel_collapsed_small_dark() {
+    let mut settings = mimageviewer::depth_parallax::DepthParallaxSettings {
+        panel_collapsed: true,
+        ..Default::default()
+    };
+    snapshot_with_theme_at_size(
+        "depth_parallax_panel_collapsed_small_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(546.5, 307.0),
+        None,
+        move |ui| {
+            mimageviewer::ui_depth_parallax::draw_depth_parallax_panel(
+                ui.ctx(),
+                &mut settings,
+                "奥行きを計算中",
+                Some("I / Tab: パネルを隠す・出す".into()),
+            );
+        },
+    );
+}
+
+#[test]
 fn depth_parallax_panel_small_viewport_reaches_every_control_and_keeps_header_footer_fixed() {
     use test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
     #[derive(Clone, Copy)]
@@ -581,7 +603,7 @@ fn depth_parallax_panel_small_viewport_reaches_every_control_and_keeps_header_fo
                         Some("I / Tab: パネルを隠す・出す".into()),
                     );
                     state.layout = Some(Layout {
-                        scroll: ScrollLayout::from_output(&panel.scroll),
+                        scroll: ScrollLayout::from_output(panel.scroll.as_ref().unwrap()),
                         panel: panel.rect,
                         header: panel.header_rect,
                         footer: panel.footer_rect,
