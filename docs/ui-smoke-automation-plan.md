@@ -21,6 +21,68 @@
 | S3 | 動画canvasのzoomとstrip/panel/modalとの入力優先順位 | 実OSマウス入力、exact native target/矩形、実配送と処理の観測 |
 | AudioTracks | 再生中・一時停止中の音声切り替え、保存・F12・音声モード HUD | native Response の有効性と入力前の同一性、desired/applied と pump 周波数 |
 | ClipboardCapture | 実クリップボードの手動貼り付け、監視の除外、Excel 2 段書き込み、S1 PNG 保存 | 実 OS Ctrl+V、loopback HTTP、取り込み reader 開封・通知処理完了・小窓表示の診断、worker のファイル検査 |
+| GamepadBasic | 一覧の右移動、A/B の全画面開閉、X リングで親フォルダへ移動 | gilrs と同じキューへの PadEvent 差し込み、App drain の ack、OS 前面の観測、通常のパッド consumer と描画結果 |
+
+### GamepadBasic (2026-11-11)
+
+`scripts/ui-smoke/gamepad-basic.rhai` は `portable,test-script` で、実機からの読み取り以降の
+ゲームパッド経路を確認する。設計の正本は [操作台本からのゲームパッド入力](gamepad-script-injection-plan.md)。
+gilrs の OS 読み取りや実機・ドライバーの動作は検証範囲外。台本実行中は gilrs を起動せず、
+本物のパッド入力を混ぜない。製品ビルドと台本なしの診断ビルドは従来どおり。
+
+generator が `target/portable-smoke/data/gamepad-basic/library/sub/` に内容の異なる 96×144 PNG を
+3 枚用意し、`sub` を開く。gamepad 有効・OS 前面が自プロセス・一覧の起動処理とサムネイル待ちの完了を待つ。
+十字キー右で `selected_index` が 1 増え、A で全画面状態になり、B で一覧に戻ることを検査する。
+A 後の選択画像の一致と読込完了は root の content snapshot の page index・item identity・`page_ready` で
+自動検査する。実際の表示は全画面を含む全 viewport の screenshot を保存して確認する証跡とし、
+描画内容の自動判定は行わない。通常の専用 fullscreen viewport は root の paint owner
+ではないため、既存 snapshot の root paint フラグを描画成功の assertion に流用しない。
+続けて **X 押下 → 上押下 → X 解放 → 上解放** の順を変えずに送り、既定 X リング上の
+「親フォルダへ」で `current_folder_path` が `library` へ移ることを検査する。
+最後に `pad_neutral()`、`pad_disconnect()` と drain 済み／破棄なしを確認する。
+各 checkpoint の screenshot と app log を保存し、失敗時は gamepad 件数と content snapshot もログに残す。
+
+所要時間は準備済み診断ビルドで約 1〜2 分、初回 build は別途見込む。runner は前面ウィンドウを使用する。
+台本は PadEvent を内部キューに送るため OS のマウス・キー入力や実パッドを使わないが、実アプリを起動して
+前面を使用する検証なので、[実行確認](interactive-release-verification.md) に従い、この内容・時間・
+使い捨てデータへの明示了承後だけ実行する。通常の実装作業では起動・操作せず、live 結果は未検証として残す。
+
+```powershell
+.\scripts\ui-smoke.ps1 -Scenario GamepadBasic -InteractiveApproved
+# 同一 source の診断ビルドを準備済みの場合のみ -SkipBuild を追加
+```
+
+runner は既存の了承 guard、固定 exe/data、marker・manifest・入力 desktop の事前検査を使う。
+非空の出力先を拒否する generator と、その依存 PNG generator、台本、settings override、起動先 `sub` と
+親を含む `library` の fixture、screenshot、app log は既存 run directory の SHA256 証跡へ保存する。
+通常 profile や利用者の画像・設定を fixture に取り込まない。`test-full.ps1` や build gate に live 実行を追加しない。
+
+台本 API は [設計 §3.6](gamepad-script-injection-plan.md#36-台本の命令-rhai) を正とする。
+各命令はキューに積むだけでなく App の drain まで待つが、操作の成功は snapshot で別に検査する。
+押下は送信時点の gamepad 有効と OS 前面を要求し、解放・軸・接続・切断は有効だけを要求する。
+拒否や 5 秒の ack timeout は環境不成立として失敗にし、再試行しない。
+
+| 命令 | 入力と動作 |
+| --- | --- |
+| `pad_press(button)` / `pad_release(button)` | ボタンの押下／解放を 1 件 |
+| `pad_tap(button)` | 押下・取り込み待ち・解放・取り込み待ち |
+| `pad_hold(button, ms)` | 押下の取り込み後から指定時間保持して解放。中断時も解放を送る |
+| `pad_axis(axis, value)` | 軸を 1 件。スティックは −1.0〜1.0、トリガーは 0.0〜1.0 |
+| `pad_stick(side, x, y)` | `left` / `right` の X、Y を順に送る。Y の正は上 |
+| `pad_trigger(side, value)` | `left` / `right` のトリガーを実 gilrs と同じ PadEvent 順で送る |
+| `pad_neutral()` | 台本が保持しているボタンを解放し、非中立の軸を 0 へ戻す |
+| `pad_connect()` / `pad_disconnect()` | 接続／切断。切断は保持状態を終端にする |
+
+ボタン名は大文字小文字を区別せず `a`/`south`、`b`/`east`、`x`/`west`、`y`/`north`、
+`up`/`down`/`left`/`right`（`dpad_up` 等も可）、`lb`/`rb`/`lt`/`rt`、`back`/`select`、`start`。
+軸名は `left_x`/`left_y`/`right_x`/`right_y`/`lt`/`rt`。整数も受け付け、範囲外はエラーにする。
+`snapshot().gamepad` は `enabled`、`foreground`、`reader`（`script`/`physical`/`stopped`）、
+`injected`、`drained`、`discarded` を公開する。例外・中断・timeout 時の最終 cleanup は切断を送り、保持状態を残さない。
+
+非対話の fixture 検証は `python -B scripts/ui-smoke/test_gamepad_basic_fixture.py`。
+正確なフォルダ構成、PNG の CRC・寸法・展開した画素列・画像間の差異・再現性、非空先の拒否と保全、
+空白を含む出力先の CLI を検査する。登録済み Rhai Engine での台本 compile と Rust の queue／ack テストは
+アプリや OS 入力を実行せずに行い、実アプリでの成功証拠とは分けて記録する。
 
 ### ClipboardCapture (§14、2026-10-06)
 

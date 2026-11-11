@@ -34258,6 +34258,7 @@ impl App {
 
         let pdf_warm_adoption = crate::test_script::pdf_warm_adoption_checkpoint();
         crate::test_script::TestScriptSnapshot {
+            gamepad: self.gamepad.script_snapshot(self.settings.gamepad_enabled),
             clipboard_capture: {
                 let diagnostics = crate::clipboard_capture::diagnostics::snapshot();
                 let selection = self.clipboard_capture_smoke_selection();

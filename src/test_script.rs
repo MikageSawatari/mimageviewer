@@ -27,6 +27,7 @@ mod capture;
 #[cfg(feature = "test-script")]
 mod clipboard_capture;
 mod evidence_path;
+mod gamepad_input;
 #[cfg(feature = "test-script")]
 pub(crate) mod grid_observation;
 #[cfg(feature = "test-script")]
@@ -1086,6 +1087,7 @@ impl ClipboardCaptureSmokeSnapshot {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TestScriptSnapshot {
+    pub(crate) gamepad: crate::gamepad::ScriptPadSnapshot,
     pub(crate) clipboard_capture: ClipboardCaptureSmokeSnapshot,
     pub(crate) is_fullscreen: bool,
     pub(crate) always_on_top: bool,
@@ -1223,6 +1225,7 @@ impl TestScriptHostStyle {
 impl Default for TestScriptSnapshot {
     fn default() -> Self {
         Self {
+            gamepad: crate::gamepad::ScriptPadSnapshot::default(),
             clipboard_capture: ClipboardCaptureSmokeSnapshot::default(),
             is_fullscreen: false,
             always_on_top: false,
@@ -1296,6 +1299,10 @@ impl Default for TestScriptSnapshot {
 impl TestScriptSnapshot {
     fn to_rhai_map(&self) -> Map {
         let mut map = Map::new();
+        map.insert(
+            "gamepad".into(),
+            gamepad_input::snapshot_map(&self.gamepad).into(),
+        );
         map.insert(
             "clipboard_capture".into(),
             self.clipboard_capture.to_rhai_map().into(),
@@ -1482,6 +1489,8 @@ struct PreconditionTrace {
 
 #[derive(Debug)]
 enum UiCommand {
+    Gamepad(gamepad_input::Request),
+    GamepadFinish(Arc<AtomicBool>),
     #[cfg(all(windows, any(test, feature = "test-script")))]
     ReleaseCheck(release_checks::Request),
     Key(SyntheticKeyCommand),
@@ -2037,6 +2046,7 @@ impl InterruptState {
 
 #[derive(Clone)]
 struct RunnerBridge {
+    gamepad: gamepad_input::WorkerState,
     tx: mpsc::Sender<UiCommand>,
     snapshot: Arc<RwLock<TestScriptSnapshot>>,
     interrupt: Arc<InterruptState>,
@@ -3039,6 +3049,7 @@ fn wait_interruptibly(
 }
 
 fn register_runner_api(engine: &mut Engine, bridge: RunnerBridge) {
+    gamepad_input::register(engine, bridge.clone());
     #[cfg(feature = "test-script")]
     history_input::register(engine, bridge.clone());
     #[cfg(all(windows, any(test, feature = "test-script")))]
@@ -3612,6 +3623,7 @@ fn load_script(path: &Path) -> Result<String, String> {
 }
 
 fn finish_worker(bridge: &RunnerBridge, outcome: ScriptOutcome) {
+    let _ = bridge.send_unchecked(UiCommand::GamepadFinish(bridge.gamepad.injected_flag()));
     let _ = bridge.send_unchecked(UiCommand::Cancel(Instant::now()));
     let _ = bridge.send_unchecked(UiCommand::Finished(outcome));
 }
@@ -4609,6 +4621,13 @@ fn runtime() -> &'static Mutex<Option<UiRuntime>> {
     RUNTIME.get_or_init(|| Mutex::new(None))
 }
 
+pub(crate) fn is_active() -> bool {
+    runtime()
+        .lock()
+        .map(|runtime| runtime.is_some())
+        .unwrap_or(false)
+}
+
 static PROCESS_EXIT_CODE: AtomicI32 = AtomicI32::new(EXIT_NOT_SET);
 static SHUTDOWN_WATCHDOG_ARMED: AtomicBool = AtomicBool::new(false);
 
@@ -4694,6 +4713,7 @@ fn start_inner(path: PathBuf, run_dir: PathBuf, ctx: &egui::Context) -> Result<(
     let pointer_regions = Arc::new(RwLock::new(pointer_input::RegionCatalog::default()));
     let wake_ctx = ctx.clone();
     let bridge = RunnerBridge {
+        gamepad: gamepad_input::WorkerState::default(),
         tx,
         snapshot: Arc::clone(&snapshot),
         interrupt: Arc::clone(&interrupt),
@@ -5064,7 +5084,13 @@ pub(crate) fn capture_pending_for(viewport_id: egui::ViewportId) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn ui_update(ctx: &egui::Context, mut snapshot: TestScriptSnapshot) -> bool {
+pub(crate) fn ui_update(
+    ctx: &egui::Context,
+    mut snapshot: TestScriptSnapshot,
+    mut inject_gamepad: impl FnMut(
+        &[crate::gamepad::PadEvent],
+    ) -> Result<crate::gamepad::ScriptPadAck, String>,
+) -> bool {
     let frame = frame_key(ctx);
     let issues = crate::key_input::take_synthetic_input_issues(ctx);
     let Ok(mut guard) = runtime().lock() else {
@@ -5140,6 +5166,24 @@ pub(crate) fn ui_update(ctx: &egui::Context, mut snapshot: TestScriptSnapshot) -
 
     while let Ok(command) = runtime.rx.try_recv() {
         match command {
+            UiCommand::Gamepad(request) => {
+                gamepad_input::handle_request(
+                    request,
+                    runtime.finish.is_some(),
+                    &mut inject_gamepad,
+                );
+            }
+            UiCommand::GamepadFinish(injected) => {
+                // Like key Cancel, terminal cleanup must survive an interrupt that
+                // already began finishing before this command queue was drained.
+                if injected.load(Ordering::Acquire) {
+                    if let Err(error) = inject_gamepad(&[crate::gamepad::PadEvent::Disconnected]) {
+                        crate::logger::log(format!(
+                            "[test-script] gamepad terminal cleanup: {error}"
+                        ));
+                    }
+                }
+            }
             #[cfg(all(windows, any(test, feature = "test-script")))]
             UiCommand::ReleaseCheck(request) => {
                 if let Err(error) = runtime.validate_selected_owner(&request.owner) {
@@ -6877,6 +6921,7 @@ mod tests {
         let wake_count = Arc::clone(&wakes);
         (
             RunnerBridge {
+                gamepad: gamepad_input::WorkerState::default(),
                 tx,
                 snapshot: Arc::new(RwLock::new(snapshot)),
                 interrupt: Arc::new(InterruptState::default()),

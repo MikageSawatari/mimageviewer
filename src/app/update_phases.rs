@@ -64,7 +64,13 @@ impl App {
         #[cfg(all(windows, feature = "test-script"))]
         {
             let snapshot = self.test_script_snapshot(ctx);
-            if crate::test_script::ui_update(ctx, snapshot) {
+            if crate::test_script::ui_update(ctx, snapshot, |events| {
+                self.gamepad.script_runtime().inject_script_events(
+                    ctx,
+                    self.settings.gamepad_enabled,
+                    events,
+                )
+            }) {
                 if crate::test_script::release_checks::take_quit_after_finish() {
                     if let Some(tray) = self.tray_controller.as_ref() {
                         if let Err(error) = tray.quit_for_smoke() {

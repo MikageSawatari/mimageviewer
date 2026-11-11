@@ -37,6 +37,16 @@ pub(crate) struct GamepadPhysicalInput {
 }
 
 impl GamepadPhysicalInput {
+    #[cfg(any(test, feature = "test-script"))]
+    pub(crate) fn script_runtime(&mut self) -> &mut GamepadRuntime {
+        &mut self.runtime
+    }
+
+    #[cfg(any(test, feature = "test-script"))]
+    pub(crate) fn script_snapshot(&self, enabled: bool) -> crate::gamepad::ScriptPadSnapshot {
+        self.runtime.script_snapshot(enabled)
+    }
+
     fn end_pending_session(&mut self) {
         // Repeated disabled/inputless logic polls describe the same terminal.
         // Only adjacent terminals coalesce; intervening edges keep their order.
