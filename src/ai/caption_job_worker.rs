@@ -162,6 +162,10 @@ pub fn spawn_caption_worker(
     std::thread::Builder::new()
         .name("caption-job".into())
         .spawn(move || {
+            // UI capture keeps only the setting. Resolve the default on this worker,
+            // once, before any image/book rotation consumer uses the environment.
+            let mut config = config;
+            resolve_caption_books_root(&mut config, crate::books::default_books_root);
             let result = run_worker(
                 &config,
                 &worker_cancel,
@@ -181,6 +185,12 @@ pub fn spawn_caption_worker(
         lifetime,
         cancel,
     })
+}
+
+fn resolve_caption_books_root(config: &mut CaptionWorkerConfig, default: impl FnOnce() -> PathBuf) {
+    if config.book_cover_env.books_root.is_none() {
+        config.book_cover_env.books_root = Some(default());
+    }
 }
 
 fn send_event(
@@ -1107,7 +1117,10 @@ mod tests {
         let book = root.join("book");
         std::fs::create_dir_all(&book).unwrap();
         let path = image(&book);
-        config.book_cover_env.books_root = Some(root);
+        assert!(config.book_cover_env.books_root.is_none());
+        // Exercise the worker's default-root boundary without writing to the real bookshelf.
+        resolve_caption_books_root(&mut config, || root);
+        resolve_caption_books_root(&mut config, || panic!("resolved root must be reused"));
         let rotations = RotationDb::open_at(&config.rotation_db_path).unwrap();
         rotations.set(&path, Rotation::Cw90).unwrap();
         let db = CaptionDb::open_at(&config.caption_db_path).unwrap();
@@ -1338,6 +1351,12 @@ mod tests {
             epub_read: None,
             pdf_password: None,
             preloaded_bytes: None,
+            persistent_source: crate::folder_thumb_pins::FolderPinSource::File {
+                rel: source.file_name().unwrap().to_string_lossy().into_owned(),
+                kind: crate::folder_thumb_pins::FileKind::Image,
+            },
+            rotation_key: None,
+            cover_crop: None,
         })
     }
 

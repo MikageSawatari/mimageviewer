@@ -78,8 +78,7 @@ pub(crate) struct RatingViewPreparedItems {
     pub(crate) items: Vec<GridItem>,
     pub(crate) image_metas: Vec<Option<(i64, i64)>>,
     pub(crate) existing_keys: std::collections::HashSet<String>,
-    pub(crate) pin_map:
-        std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    pub(crate) pin_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin>,
     pub(crate) video_items: Vec<(usize, PathBuf, u64)>,
     pub(crate) video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
     pub(crate) page_edits: crate::app::page_edit_snapshot::StablePageEditProjection,

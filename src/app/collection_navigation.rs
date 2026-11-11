@@ -6693,6 +6693,11 @@ mod tests {
                 page: 3,
             },
         )]);
+        let folder_pins: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin> =
+            folder_pins
+                .into_iter()
+                .map(|(key, source)| (key, source.into()))
+                .collect();
         let sources = prepared_thumbnail_sources(CollectionGridThumbnailSources {
             folder_pin_map: folder_pins.clone(),
             video_folder_pin_seeds: Arc::clone(&seeds),

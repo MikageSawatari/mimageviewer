@@ -988,7 +988,8 @@ mod tests {
             zip_rel: String::new(),
             entry: "cover.jpg".to_string(),
         };
-        app.folder_pin_map.insert(pin_key.clone(), pin.clone());
+        app.folder_pin_map
+            .insert(pin_key.clone(), pin.clone().into());
         let ctx = egui::Context::default();
         let epoch = app.collection_thumbnail_source_epoch;
         for (changes, expected_epoch) in [(0, epoch), (2, epoch.wrapping_add(1))] {
@@ -1006,7 +1007,11 @@ mod tests {
             app.content_identity_restore_pending = Some(ContentIdentityRestorePending { rx });
             app.poll_content_identity_restore(&ctx);
             assert_eq!(app.collection_thumbnail_source_epoch, expected_epoch);
-            assert_eq!(app.folder_pin_map.get(&pin_key), Some(&pin));
+            assert_eq!(
+                app.folder_pin_map.get(&pin_key).map(|pin| &pin.source),
+                Some(&pin)
+            );
+            assert_eq!(app.folder_pin_map[&pin_key].cover_crop, None);
         }
     }
 

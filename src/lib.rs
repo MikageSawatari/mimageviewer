@@ -2698,3 +2698,6 @@ pub use ui_image_folder_zip::draw_snapshot as draw_image_folder_zip_snapshot;
 
 pub mod avif_decoder;
 pub mod image_decode;
+
+#[doc(hidden)]
+pub use ui_dialogs::cover_crop::draw_cover_crop_snapshot_fixture;

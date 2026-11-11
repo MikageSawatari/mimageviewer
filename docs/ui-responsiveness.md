@@ -503,6 +503,12 @@ sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを
 
 ## 4. 新機能追加時のチェックリスト
 
+表紙の手動範囲（§1.764）の準備は、論理コンテナ・明示ページ・設定値と既存 handle だけを UI で捕捉する。
+ピン解決・stat・書庫列挙・既定本棚パスの解決・画像 decode/縮小を一つの `cover-crop-prepare` worker で行う。
+準備全体を perf event で計測し、完了時に repaint、UI は非blocking poll と世代照合だけを行う。
+閉じた modal の結果は破棄し、UI で worker を待たない。回転はメモリのページ角度 owner だけを引く。
+保存は既存の単一行ピン UPSERT と同じ経路を使い、失敗はログとトーストで通知する。
+
 AI 説明文の削除（§1.730）は UI で既存一覧の対象を捕捉するだけとし、説明文 DB の open、
 存在・status の集計、単一 transaction の DELETE を worker 上に置く。root は完了 channel を
 非blocking poll し、worker 完了時だけ repaint を要求する。全 phase を同じ可視 modal にし、

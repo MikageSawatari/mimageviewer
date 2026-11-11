@@ -76,7 +76,7 @@ impl Request {
     pub(crate) fn prepare(
         self,
         mut reset_indices: Vec<usize>,
-        pins: &HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+        pins: &HashMap<String, crate::folder_thumb_pins::FolderPin>,
         pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
         video_db: Option<&crate::video_pins::VideoPinDb>,
         cancel: &AtomicBool,
@@ -200,11 +200,8 @@ impl Request {
             ) else {
                 continue;
             };
-            let key = format!(
-                "{base}{}{}",
-                crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
-                resolved.source_id
-            );
+            let key =
+                resolved.pinned_cache_key(&base, crate::folder_thumb_pins::PinKeyMode::Exact, None);
             let webp = video_db
                 .lookup(&resolved.abs_path)
                 .map(|pin| pin.thumb_webp);

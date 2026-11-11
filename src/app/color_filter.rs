@@ -3,7 +3,7 @@ use super::*;
 struct ColorScanWorkItem {
     key: crate::color_search::ColorPaletteKey,
     req: LoadRequest,
-    pin_source: Option<crate::folder_thumb_pins::FolderPinSource>,
+    pin_source: Option<crate::folder_thumb_pins::FolderPin>,
 }
 
 const COLOR_SCAN_CONFIRM_MISSING_THRESHOLD: usize = 2_000;
@@ -29,7 +29,7 @@ pub(super) fn color_filter_representative_supported(item: &GridItem) -> bool {
 fn color_representative_key(
     item: &GridItem,
     storage_key: &str,
-    pin: Option<&crate::folder_thumb_pins::FolderPinSource>,
+    pin: Option<&crate::folder_thumb_pins::FolderPin>,
     pin_stamp: Option<crate::folder_thumb_pins::FolderPinMutationStamp>,
     depth: u32,
     revision: u64,
@@ -1137,7 +1137,8 @@ mod tests {
             crate::folder_thumb_pins::FolderPinSource::PdfPage {
                 pdf_rel: String::new(),
                 page: 3,
-            },
+            }
+            .into(),
         );
         assert_eq!(env.color_missing_work_items().len(), 2);
         // UI construction must not stat/open this nonexistent PDF, even when pinned.
@@ -1203,8 +1204,11 @@ mod tests {
             zip_rel: String::new(),
             dir_prefix: "chapter/".into(),
         };
-        let key = |pin, stamp| {
-            color_representative_key(&item, "zipthumb:book.zip", pin, Some(stamp), 3, 0)
+        let key = |pin: Option<&crate::folder_thumb_pins::FolderPinSource>, stamp| {
+            let pin = pin.map(|source: &crate::folder_thumb_pins::FolderPinSource| {
+                crate::folder_thumb_pins::FolderPin::from(source.clone())
+            });
+            color_representative_key(&item, "zipthumb:book.zip", pin.as_ref(), Some(stamp), 3, 0)
         };
         let before = db.mutation_stamp();
         let pinned = key(Some(&source), before);
@@ -1269,7 +1273,7 @@ mod tests {
             vec![ColorScanWorkItem {
                 key: "test".into(),
                 req,
-                pin_source,
+                pin_source: pin_source.map(Into::into),
             }],
             cache_map,
             catalog,
@@ -1596,7 +1600,7 @@ mod tests {
         };
         let pins = std::collections::HashMap::from([(
             crate::path_key::normalize_keep_drive(&path),
-            source.clone(),
+            crate::folder_thumb_pins::FolderPin::from(source.clone()),
         )]);
         let pinned = apply_folder_thumb_pin(
             req.clone(),
@@ -2018,8 +2022,10 @@ mod tests {
                     entry: "pinned.png".into(),
                 }
             };
-            app.folder_pin_map
-                .insert(crate::path_key::normalize_keep_drive(&path), pin.clone());
+            app.folder_pin_map.insert(
+                crate::path_key::normalize_keep_drive(&path),
+                pin.clone().into(),
+            );
             assert_eq!(app.thumb_storage_scope(), ThumbStorageScope::MultiParent);
             let (_, req) = app.color_work_identity_for_idx(0).unwrap();
             let RequestCatalog::Parent { row, work } = &req.catalog_target else {
@@ -2147,5 +2153,30 @@ mod tests {
         assert_eq!(request.items_gen, app.items_generation);
         app.bump_render_epoch_only();
         assert!(request.pdf_render_validity.is_stale());
+    }
+}
+
+#[cfg(test)]
+mod cover_crop_identity_tests {
+    use super::*;
+    use crate::folder_thumb_pins::{CoverCrop, FolderPin, FolderPinSource};
+    #[test]
+    fn cover_crop_color_filter_identity_tracks_range_changes_on_the_same_page() {
+        let item = GridItem::PdfFile(PathBuf::from("C:/books/book.pdf"));
+        let mut pin = FolderPin::from(FolderPinSource::PdfPage {
+            pdf_rel: String::new(),
+            page: 1,
+        });
+        let key = |pin: &FolderPin| {
+            color_representative_key(&item, "pdfthumb:book.pdf", Some(pin), None, 3, 0)
+        };
+        let original = key(&pin);
+        pin.cover_crop = CoverCrop::new([0, 0, 500_000, 1_000_000]).unwrap();
+        let first = key(&pin);
+        assert_ne!(first, original);
+        pin.cover_crop = CoverCrop::new([500_000, 0, 1_000_000, 1_000_000]).unwrap();
+        assert_ne!(key(&pin), first);
+        pin.cover_crop = None;
+        assert_eq!(key(&pin), original);
     }
 }

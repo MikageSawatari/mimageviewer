@@ -15,7 +15,10 @@
 //!     source_kind   TEXT NOT NULL,     -- "image"/"video"/"folder"/"zipfile"/"pdffile"/"archive"/"zipentry"/"zipdir"/"pdfpage"
 //!     source_rel    TEXT NOT NULL,     -- container 相対パス (zipentry/pdfpage で container 自身を指すときは空)
 //!     source_entry  TEXT,              -- source_kind = "zipentry" のときの ZIP エントリ名 / "zipdir" のときの prefix
-//!     source_page   INTEGER            -- source_kind = "pdfpage" のときのページ番号 (0-indexed)
+//!     source_page   INTEGER,           -- source_kind = "pdfpage" のときのページ番号 (0-indexed)
+//!     cover_crop_x0 INTEGER, cover_crop_y0 INTEGER,
+//!     cover_crop_x1 INTEGER, cover_crop_y1 INTEGER,
+//!     cover_crop_source TEXT           -- 範囲を書いた時点の kind|rel|entry|page
 //! );
 //! ```
 //!
@@ -34,6 +37,305 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_FOLDER_PIN_DB_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+/// EXIF-oriented leaf coordinates in millionths, before saved rotation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct CoverCrop([u32; 4]);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CoverCropError;
+impl std::fmt::Display for CoverCropError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cover crop requires coordinates within 0..=1000000 and edges at least 10000")
+    }
+}
+impl std::error::Error for CoverCropError {}
+impl CoverCrop {
+    pub(crate) fn new(values: [u32; 4]) -> Result<Option<Self>, CoverCropError> {
+        let [x0, y0, x1, y1] = values;
+        if x1 > 1_000_000
+            || y1 > 1_000_000
+            || x1.checked_sub(x0).is_none_or(|n| n < 10_000)
+            || y1.checked_sub(y0).is_none_or(|n| n < 10_000)
+        {
+            return Err(CoverCropError);
+        }
+        Ok((values != [0, 0, 1_000_000, 1_000_000]).then_some(Self(values)))
+    }
+    pub(crate) fn values(self) -> [u32; 4] {
+        self.0
+    }
+    pub(crate) fn pixel_bounds(self, width: u32, height: u32) -> (u32, u32, u32, u32) {
+        let [x0, y0, x1, y1] = self.0;
+        let floor = |v: u32, n: u32| (u64::from(v) * u64::from(n) / 1_000_000) as u32;
+        let ceil = |v: u32, n: u32| (u64::from(v) * u64::from(n)).div_ceil(1_000_000) as u32;
+        let (x, y) = (floor(x0, width), floor(y0, height));
+        (x, y, ceil(x1, width) - x, ceil(y1, height) - y)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FolderPin {
+    pub source: FolderPinSource,
+    pub cover_crop: Option<CoverCrop>,
+}
+impl From<FolderPinSource> for FolderPin {
+    fn from(source: FolderPinSource) -> Self {
+        Self {
+            source,
+            cover_crop: None,
+        }
+    }
+}
+impl std::ops::Deref for FolderPin {
+    type Target = FolderPinSource;
+    fn deref(&self) -> &Self::Target {
+        &self.source
+    }
+}
+
+/// Existing source-only resolution callers deliberately carry no crop.
+pub(crate) trait PinSpec {
+    fn pin_source(&self) -> &FolderPinSource;
+    fn pin_crop(&self) -> Option<CoverCrop>;
+}
+impl PinSpec for FolderPin {
+    fn pin_source(&self) -> &FolderPinSource {
+        &self.source
+    }
+    fn pin_crop(&self) -> Option<CoverCrop> {
+        self.cover_crop
+    }
+}
+impl PinSpec for FolderPinSource {
+    fn pin_source(&self) -> &FolderPinSource {
+        self
+    }
+    fn pin_crop(&self) -> Option<CoverCrop> {
+        None
+    }
+}
+
+impl FolderPinSource {
+    pub(crate) fn supports_cover_crop(&self) -> bool {
+        let name = match self {
+            Self::File {
+                rel,
+                kind: FileKind::Image,
+            } => rel,
+            Self::ZipEntry { entry, .. } => entry,
+            Self::PdfPage { .. } => return true,
+            _ => return false,
+        };
+        let path = Path::new(name);
+        let extension = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        // The persisted Image / ZipEntry kind proves the image role. Do not make
+        // crop validity depend on this process having loaded a Susie plugin yet.
+        !crate::raw_format::is_raw_path(path)
+            && !crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&extension.as_str())
+            && !crate::folder_tree::is_audio_ext(&extension)
+    }
+    pub(crate) fn cover_crop_binding(&self) -> String {
+        let entry = match self {
+            Self::ZipEntry { entry, .. } => entry.clone(),
+            Self::ZipDir { dir_prefix, .. } => normalize_zip_dir_prefix(dir_prefix),
+            _ => "-".into(),
+        };
+        let page = match self {
+            Self::PdfPage { page, .. } => page.to_string(),
+            _ => "-".into(),
+        };
+        format!(
+            "{}|{}|{entry}|{page}",
+            self.db_kind(),
+            self.rel().replace('\\', "/")
+        )
+    }
+}
+
+pub(crate) fn decode_cover_crop(row: &rusqlite::Row<'_>) -> Option<CoverCrop> {
+    decode_cover_crop_with(|name| row.get::<_, rusqlite::types::Value>(name).ok())
+}
+
+/// One validity decoder for SQLite reads and generic row-copy migrations.
+fn decode_cover_crop_with(
+    mut get: impl FnMut(&str) -> Option<rusqlite::types::Value>,
+) -> Option<CoverCrop> {
+    use rusqlite::types::Value;
+    let raw = [
+        "cover_crop_x0",
+        "cover_crop_y0",
+        "cover_crop_x1",
+        "cover_crop_y1",
+    ]
+    .map(&mut get);
+    let binding = get("cover_crop_source");
+    if raw.iter().all(|v| matches!(v, None | Some(Value::Null)))
+        && matches!(binding, None | Some(Value::Null))
+    {
+        return None;
+    }
+    let decode = || -> Option<CoverCrop> {
+        let text = |v: Option<Value>| match v {
+            Some(Value::Text(s)) => Some(s),
+            _ => None,
+        };
+        let kind = text(get("source_kind"))?;
+        let rel = text(get("source_rel"))?;
+        let entry = text(get("source_entry"));
+        let page = match get("source_page") {
+            Some(Value::Integer(n)) => Some(n),
+            _ => None,
+        };
+        let source = decode_row(&kind, &rel, entry.as_deref(), page)?;
+        if !source.supports_cover_crop() || text(binding)? != source.cover_crop_binding() {
+            return None;
+        }
+        let mut values = [0; 4];
+        for (out, value) in values.iter_mut().zip(raw) {
+            let Some(Value::Integer(n)) = value else {
+                return None;
+            };
+            *out = u32::try_from(n).ok()?;
+        }
+        CoverCrop::new(values).ok().flatten()
+    };
+    let result = decode();
+    if result.is_none() {
+        crate::logger::log("folder_thumb_pins: ignoring invalid or unbound cover crop".to_owned());
+    }
+    result
+}
+
+pub(crate) fn cover_crop_from_values(
+    columns: &[String],
+    values: &[rusqlite::types::Value],
+) -> Option<CoverCrop> {
+    decode_cover_crop_with(|name| {
+        columns
+            .iter()
+            .position(|c| c == name)
+            .map(|i| values[i].clone())
+    })
+}
+
+/// Called after a same-leaf source rename, using the crop validated before the change.
+pub(crate) fn rebind_cover_crop_values(
+    columns: &[String],
+    values: &mut [rusqlite::types::Value],
+    crop: Option<CoverCrop>,
+) {
+    use rusqlite::types::Value;
+    let text = |name: &str| {
+        columns
+            .iter()
+            .position(|c| c == name)
+            .and_then(|i| match &values[i] {
+                Value::Text(s) => Some(s.clone()),
+                _ => None,
+            })
+    };
+    let source = text("source_kind")
+        .zip(text("source_rel"))
+        .and_then(|(kind, rel)| {
+            let entry = text("source_entry");
+            let page = columns
+                .iter()
+                .position(|c| c == "source_page")
+                .and_then(|i| match values[i] {
+                    Value::Integer(n) => Some(n),
+                    _ => None,
+                });
+            decode_row(&kind, &rel, entry.as_deref(), page)
+        });
+    let crop = crop.filter(|_| {
+        source
+            .as_ref()
+            .is_some_and(FolderPinSource::supports_cover_crop)
+    });
+    for (n, name) in [
+        "cover_crop_x0",
+        "cover_crop_y0",
+        "cover_crop_x1",
+        "cover_crop_y1",
+    ]
+    .iter()
+    .enumerate()
+    {
+        if let Some(i) = columns.iter().position(|c| c == name) {
+            values[i] = crop.map_or(Value::Null, |c| Value::Integer(i64::from(c.values()[n])));
+        }
+    }
+    if let Some(i) = columns.iter().position(|c| c == "cover_crop_source") {
+        values[i] = crop
+            .and_then(|_| source)
+            .map_or(Value::Null, |s| Value::Text(s.cover_crop_binding()));
+    }
+}
+
+/// Update a same-leaf source column and its validated crop in one statement.
+/// Legacy schemas without crop columns continue to work unchanged.
+pub(crate) fn rewrite_pin_source_column(
+    conn: &Connection,
+    key: &str,
+    column: &str,
+    new_value: &str,
+) -> SqlResult<usize> {
+    assert!(matches!(column, "source_rel" | "source_entry"));
+    let (columns, mut values) = {
+        let mut stmt = conn.prepare("SELECT * FROM folder_thumb_pins WHERE container_key=?1")?;
+        let columns = stmt
+            .column_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let values = stmt
+            .query_row([key], |row| {
+                (0..columns.len())
+                    .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                    .collect::<SqlResult<Vec<_>>>()
+            })
+            .optional()?;
+        let Some(values) = values else {
+            return Ok(0);
+        };
+        (columns, values)
+    };
+    let crop = cover_crop_from_values(&columns, &values);
+    let index = columns
+        .iter()
+        .position(|c| c == column)
+        .ok_or_else(|| rusqlite::Error::InvalidColumnName(column.into()))?;
+    values[index] = rusqlite::types::Value::Text(new_value.into());
+    rebind_cover_crop_values(&columns, &mut values, crop);
+    let fields = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| name.as_str() == column || name.starts_with("cover_crop_"))
+        .collect::<Vec<_>>();
+    let assignments = fields
+        .iter()
+        .enumerate()
+        .map(|(i, (_, name))| format!("{name}=?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut params = fields
+        .iter()
+        .map(|(i, _)| values[*i].clone())
+        .collect::<Vec<_>>();
+    params.push(rusqlite::types::Value::Text(key.into()));
+    conn.execute(
+        &format!(
+            "UPDATE folder_thumb_pins SET {assignments} WHERE container_key=?{}",
+            params.len()
+        ),
+        rusqlite::params_from_iter(params),
+    )
+}
 
 /// UI-owned handle identity and successful writes, without reading SQLite on the UI thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -238,7 +540,9 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
 #[derive(Debug)]
 pub enum FolderPinError {
     /// `rel` が空 (File variant のみ。ZipEntry/PdfPage の zip_rel/pdf_rel は空可)。
-    EmptyRelPath { kind: &'static str },
+    EmptyRelPath {
+        kind: &'static str,
+    },
     /// 絶対パス (`/foo` や `\foo`)。
     AbsolutePath(String),
     /// `..` セグメントを含む。
@@ -251,6 +555,7 @@ pub enum FolderPinError {
     EmptyZipDirPrefix,
     /// SQLite エラー。
     Sql(rusqlite::Error),
+    UnsupportedCoverCrop,
 }
 
 impl std::fmt::Display for FolderPinError {
@@ -268,6 +573,9 @@ impl std::fmt::Display for FolderPinError {
             FolderPinError::EmptyZipEntry => write!(f, "zip entry name is empty"),
             FolderPinError::EmptyZipDirPrefix => write!(f, "zip dir prefix is empty"),
             FolderPinError::Sql(e) => write!(f, "sql error: {e}"),
+            FolderPinError::UnsupportedCoverCrop => {
+                f.write_str("cover crop requires a non-RAW image leaf")
+            }
         }
     }
 }
@@ -306,7 +614,7 @@ impl FolderThumbPinDb {
         Self::open_with_migration_info().map(|(db, _)| db)
     }
 
-    /// Open the pin store and report whether its additive revision schema was installed.
+    /// Open the pin store and report additive revision/crop schema installation.
     pub fn open_with_migration_info() -> SqlResult<(Self, bool)> {
         crate::startup_result(
             miv_startup::Stage::AppDbMigrate,
@@ -385,6 +693,26 @@ impl FolderThumbPinDb {
                 revision INTEGER NOT NULL
             );",
         )?;
+        let mut crop_columns_added = false;
+        let columns = {
+            let mut stmt = tx.prepare("PRAGMA table_info(folder_thumb_pins)")?;
+            stmt.query_map([], |r| r.get::<_, String>(1))?
+                .collect::<SqlResult<Vec<_>>>()?
+        };
+        for (name, kind) in [
+            ("cover_crop_x0", "INTEGER"),
+            ("cover_crop_y0", "INTEGER"),
+            ("cover_crop_x1", "INTEGER"),
+            ("cover_crop_y1", "INTEGER"),
+            ("cover_crop_source", "TEXT"),
+        ] {
+            if !columns.iter().any(|c| c == name) {
+                tx.execute_batch(&format!(
+                    "ALTER TABLE folder_thumb_pins ADD COLUMN {name} {kind}"
+                ))?;
+                crop_columns_added = true;
+            }
+        }
         let revision_row_added = tx.execute(
             "INSERT OR IGNORE INTO folder_thumb_pin_revision (singleton, instance_id, revision) VALUES (1, ?1, 0)",
             [uuid::Uuid::new_v4().to_string()],
@@ -416,7 +744,7 @@ impl FolderThumbPinDb {
              END;",
         )?;
         tx.commit()?;
-        Ok(revision_row_added != 0 || installed_triggers != 3)
+        Ok(crop_columns_added || revision_row_added != 0 || installed_triggers != 3)
     }
 
     fn container_key(container: &Path) -> String {
@@ -424,55 +752,37 @@ impl FolderThumbPinDb {
     }
 
     /// 単一 container 用ピンを取得 (なければ `None`)。
-    pub fn lookup(&self, container: &Path) -> Option<FolderPinSource> {
+    pub(crate) fn lookup(&self, container: &Path) -> Option<FolderPin> {
         let key = Self::container_key(container);
         let conn = self.conn.lock().ok()?;
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT source_kind, source_rel, source_entry, source_page \
-                 FROM folder_thumb_pins WHERE container_key = ?1",
-            )
-            .ok()?;
-        let row = stmt
-            .query_row([&key], |row| {
-                let kind: String = row.get(0)?;
-                let rel: String = row.get(1)?;
-                let entry: Option<String> = row.get(2)?;
-                let page: Option<i64> = row.get(3)?;
-                Ok((kind, rel, entry, page))
-            })
-            .ok()?;
-        decode_row(&row.0, &row.1, row.2.as_deref(), row.3)
+        conn.query_row(
+            "SELECT * FROM folder_thumb_pins WHERE container_key = ?1",
+            [&key],
+            decode_pin_row,
+        )
+        .ok()
+        .flatten()
     }
 
-    /// Worker-only lookup and store revision from one SQLite read snapshot.
-    /// Unlike `lookup`, errors remain visible so a representative proof fails
-    /// closed when the pin store cannot be read.
-    pub fn lookup_for_selection(
+    /// Read pin and revision in the same snapshot, failing closed for selection proofs.
+    pub(crate) fn lookup_for_selection(
         &self,
         container: &Path,
-    ) -> SqlResult<(Option<FolderPinSource>, crate::catalog::CatalogRevision)> {
+    ) -> SqlResult<(Option<FolderPin>, crate::catalog::CatalogRevision)> {
         let key = Self::container_key(container);
         let conn = self
             .conn
             .lock()
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
         let tx = conn.unchecked_transaction()?;
-        let row = tx
+        let pin = tx
             .query_row(
-                "SELECT source_kind, source_rel, source_entry, source_page \
-                 FROM folder_thumb_pins WHERE container_key = ?1",
+                "SELECT * FROM folder_thumb_pins WHERE container_key = ?1",
                 [&key],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<i64>>(3)?,
-                    ))
-                },
+                decode_pin_row,
             )
-            .optional()?;
+            .optional()?
+            .flatten();
         let revision = tx.query_row(
             "SELECT instance_id, revision FROM folder_thumb_pin_revision WHERE singleton = 1",
             [],
@@ -484,12 +794,7 @@ impl FolderThumbPinDb {
             },
         )?;
         tx.commit()?;
-        Ok((
-            row.and_then(|(kind, rel, entry, page)| {
-                decode_row(&kind, &rel, entry.as_deref(), page)
-            }),
-            revision,
-        ))
+        Ok((pin, revision))
     }
 
     pub fn selection_revision(&self) -> SqlResult<crate::catalog::CatalogRevision> {
@@ -518,7 +823,7 @@ impl FolderThumbPinDb {
     /// 入力は重複除去してから 500 件ずつ chunked に IN クエリへ流す
     /// (SQLite の式ツリー上限・準備済みステートメントのバインド数上限の両方を
     /// 安全側で避けるため。`rating_db::get_many` と同じ規模感)。
-    pub fn lookup_many<I, P>(&self, containers: I) -> HashMap<String, FolderPinSource>
+    pub(crate) fn lookup_many<I, P>(&self, containers: I) -> HashMap<String, FolderPin>
     where
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
@@ -544,7 +849,7 @@ impl FolderThumbPinDb {
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
-                "SELECT container_key, source_kind, source_rel, source_entry, source_page \
+                "SELECT * \
                  FROM folder_thumb_pins WHERE container_key IN ({placeholders})"
             );
             let mut stmt = match conn.prepare(&sql) {
@@ -559,17 +864,12 @@ impl FolderThumbPinDb {
             let params: Vec<&dyn rusqlite::ToSql> =
                 chunk.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
             let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                let key: String = row.get(0)?;
-                let kind: String = row.get(1)?;
-                let rel: String = row.get(2)?;
-                let entry: Option<String> = row.get(3)?;
-                let page: Option<i64> = row.get(4)?;
-                Ok((key, kind, rel, entry, page))
+                Ok((row.get::<_, String>("container_key")?, decode_pin_row(row)?))
             });
             match rows {
                 Ok(iter) => {
                     for r in iter.flatten() {
-                        if let Some(src) = decode_row(&r.1, &r.2, r.3.as_deref(), r.4) {
+                        if let Some(src) = r.1 {
                             out.insert(r.0, src);
                         }
                     }
@@ -586,6 +886,27 @@ impl FolderThumbPinDb {
 
     /// ピンを書き込む / 上書きする。
     pub fn set(&self, container: &Path, source: &FolderPinSource) -> Result<(), FolderPinError> {
+        self.write_pin(container, source, None)
+    }
+
+    pub(crate) fn set_with_cover_crop(
+        &self,
+        container: &Path,
+        source: &FolderPinSource,
+        crop: Option<CoverCrop>,
+    ) -> Result<(), FolderPinError> {
+        if !source.supports_cover_crop() {
+            return Err(FolderPinError::UnsupportedCoverCrop);
+        }
+        self.write_pin(container, source, crop)
+    }
+
+    fn write_pin(
+        &self,
+        container: &Path,
+        source: &FolderPinSource,
+        crop: Option<CoverCrop>,
+    ) -> Result<(), FolderPinError> {
         validate_source(source)?;
         let key = Self::container_key(container);
         let rel_norm = source.rel().replace('\\', "/");
@@ -602,15 +923,32 @@ impl FolderThumbPinDb {
             .lock()
             .map_err(|_| FolderPinError::Sql(rusqlite::Error::InvalidQuery))?;
         conn.execute(
-            "INSERT INTO folder_thumb_pins (container_key, source_kind, source_rel, source_entry, source_page) \
-             VALUES (?1, ?2, ?3, ?4, ?5) \
+            "INSERT INTO folder_thumb_pins (container_key, source_kind, source_rel, source_entry, source_page, cover_crop_x0, cover_crop_y0, cover_crop_x1, cover_crop_y1, cover_crop_source) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
              ON CONFLICT(container_key) DO UPDATE SET \
                 source_kind  = excluded.source_kind, \
                 source_rel   = excluded.source_rel, \
                 source_entry = excluded.source_entry, \
-                source_page  = excluded.source_page",
-            params![key, source.db_kind(), rel_norm, entry.as_deref(), page],
+                source_page  = excluded.source_page, \
+                cover_crop_x0 = excluded.cover_crop_x0, cover_crop_y0 = excluded.cover_crop_y0, \
+                cover_crop_x1 = excluded.cover_crop_x1, cover_crop_y1 = excluded.cover_crop_y1, \
+                cover_crop_source = excluded.cover_crop_source",
+            params![key, source.db_kind(), rel_norm, entry.as_deref(), page,
+                crop.map(|c| c.values()[0]), crop.map(|c| c.values()[1]),
+                crop.map(|c| c.values()[2]), crop.map(|c| c.values()[3]),
+                crop.map(|_| source.cover_crop_binding())],
         )?;
+        self.mutation_revision.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    /// Clear only the crop and its binding, retaining the selected representative.
+    pub(crate) fn clear_cover_crop(&self, container: &Path) -> SqlResult<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        conn.execute("UPDATE folder_thumb_pins SET cover_crop_x0=NULL, cover_crop_y0=NULL, cover_crop_x1=NULL, cover_crop_y1=NULL, cover_crop_source=NULL WHERE container_key=?1", [Self::container_key(container)])?;
         self.mutation_revision.fetch_add(1, Ordering::Release);
         Ok(())
     }
@@ -650,10 +988,65 @@ pub struct ResolvedPinTarget {
     /// 親キー (`folderthumb:{dirname}` 等) の後ろに `#pin:` で連結する。
     /// pin の付け替え / target ファイル変更で自動的に変わるので、古い
     /// pin の WebP を catch しない。
-    pub source_id: String,
+    source_id: String,
+    source_id_without_crop: String,
+    cover_crop: Option<CoverCrop>,
 }
 
 /// pin target の dispatch 種別。`LoadRequest::resolve_override` と 1 対 1 に対応。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PinKeyMode {
+    Exact,
+    WithoutCrop,
+}
+
+impl ResolvedPinTarget {
+    pub(crate) fn pinned_cache_key(
+        &self,
+        base: &str,
+        mode: PinKeyMode,
+        zipdir_prefix: Option<&str>,
+    ) -> String {
+        if let Some(prefix) = zipdir_prefix
+            && self.kind == ResolvedKind::ZipEntry
+            && let Some(entry) = self.zip_entry.as_deref()
+        {
+            let mut key = format!("zipdir:{prefix}#pin:{entry}");
+            if mode == PinKeyMode::Exact
+                && let Some(crop) = self.cover_crop
+            {
+                let [x0, y0, x1, y1] = crop.values();
+                key.push_str(&format!("|crop:{x0},{y0},{x1},{y1}"));
+            }
+            return key;
+        }
+        let id = if mode == PinKeyMode::Exact {
+            &self.source_id
+        } else {
+            &self.source_id_without_crop
+        };
+        format!("{base}#pin:{id}")
+    }
+
+    pub(crate) fn assign_to_load_request(
+        &self,
+        request: &mut crate::thumb_loader::LoadRequest,
+        base: &str,
+        mode: PinKeyMode,
+        zipdir_prefix: Option<&str>,
+    ) {
+        request.cache_key_override = Some(self.pinned_cache_key(base, mode, zipdir_prefix));
+        request.cover_crop = if mode == PinKeyMode::Exact {
+            self.cover_crop
+        } else {
+            None
+        };
+        if request.cover_crop.is_some() {
+            request.edit_preview_key = None;
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResolvedKind {
     /// 画像ファイル直接 decode
@@ -686,8 +1079,11 @@ pub enum ResolvedKind {
 ///
 /// この関数は `std::fs::metadata` を 1 回呼ぶ (= cheap stat syscall)。
 /// UI スレッドからの呼び出しを想定。
-pub fn resolve_pin_target(container: &Path, source: &FolderPinSource) -> Option<ResolvedPinTarget> {
-    resolve_pin_target_via(container, source, &|path| {
+pub(crate) fn resolve_pin_target(
+    container: &Path,
+    pin: &impl PinSpec,
+) -> Option<ResolvedPinTarget> {
+    resolve_pin_target_via(container, pin, &|path| {
         let meta = std::fs::metadata(path).ok()?;
         Some((crate::ui_helpers::mtime_secs(&meta), meta.len() as i64))
     })
@@ -695,12 +1091,14 @@ pub fn resolve_pin_target(container: &Path, source: &FolderPinSource) -> Option<
 
 fn resolve_pin_target_via<M>(
     container: &Path,
-    source: &FolderPinSource,
+    pin: &impl PinSpec,
     metadata: &M,
 ) -> Option<ResolvedPinTarget>
 where
     M: Fn(&Path) -> Option<(i64, i64)>,
 {
+    let source = pin.pin_source();
+    let cover_crop = pin.pin_crop().filter(|_| source.supports_cover_crop());
     let (abs_path, zip_entry, zip_dir_prefix, pdf_page, kind) = match source {
         FolderPinSource::File { rel, kind } => {
             let abs = container.join(rel);
@@ -813,6 +1211,16 @@ where
         size = identity_size,
     );
 
+    let source_id_without_crop = source_id.clone();
+    let source_id = if let Some(crop) = cover_crop {
+        let [x0, y0, x1, y1] = crop.values();
+        format!(
+            "{}|crop:{x0},{y0},{x1},{y1}|{identity_mtime}|{identity_size}",
+            source.cover_crop_binding()
+        )
+    } else {
+        source_id
+    };
     Some(ResolvedPinTarget {
         kind,
         abs_path,
@@ -822,6 +1230,8 @@ where
         mtime,
         file_size,
         source_id,
+        source_id_without_crop,
+        cover_crop,
     })
 }
 
@@ -837,14 +1247,14 @@ where
 ///
 /// `max_depth` は **追加 cascade 段数** (= immediate を 0 段目とする)。例えば `max_depth=3`
 /// で A→B→C→D の 3 段 cascade まで追跡可能。`Settings.folder_thumb_depth` と揃える。
-pub fn resolve_pin_target_cascaded_via<F>(
+pub(crate) fn resolve_pin_target_cascaded_via<F>(
     container: &Path,
-    immediate_source: &FolderPinSource,
+    immediate_source: &impl PinSpec,
     lookup: F,
     max_depth: usize,
 ) -> Option<ResolvedPinTarget>
 where
-    F: FnMut(&Path) -> Option<FolderPinSource>,
+    F: FnMut(&Path) -> Option<FolderPin>,
 {
     resolve_pin_target_cascaded_via_with_metadata(
         container,
@@ -863,25 +1273,30 @@ where
 /// 組み立てを同じ所有者に保つために使う。
 pub(crate) fn resolve_pin_target_cascaded_via_with_metadata<F, M>(
     container: &Path,
-    immediate_source: &FolderPinSource,
+    immediate_source: &impl PinSpec,
     mut lookup: F,
     metadata: M,
     max_depth: usize,
 ) -> Option<ResolvedPinTarget>
 where
-    F: FnMut(&Path) -> Option<FolderPinSource>,
+    F: FnMut(&Path) -> Option<FolderPin>,
     M: Fn(&Path) -> Option<(i64, i64)>,
 {
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     visited.insert(crate::path_key::normalize_keep_drive(container));
     let mut current_container: PathBuf = container.to_path_buf();
-    let mut current_source: FolderPinSource = immediate_source.clone();
+    let mut current_source = FolderPin {
+        source: immediate_source.pin_source().clone(),
+        cover_crop: immediate_source.pin_crop(),
+    };
     let mut cascades_remaining = max_depth;
     let mut route_source_ids: Vec<String> = Vec::new();
+    let mut route_ids_without_crop: Vec<String> = Vec::new();
     let mut followed_child_pin = false;
     loop {
         let resolved = resolve_pin_target_via(&current_container, &current_source, &metadata)?;
         route_source_ids.push(resolved.source_id.clone());
+        route_ids_without_crop.push(resolved.source_id_without_crop.clone());
         if !matches!(
             resolved.kind,
             ResolvedKind::Folder
@@ -893,6 +1308,7 @@ where
             return Some(finalize_cascaded_source_id(
                 resolved,
                 &route_source_ids,
+                &route_ids_without_crop,
                 followed_child_pin,
             ));
         }
@@ -900,6 +1316,7 @@ where
             return Some(finalize_cascaded_source_id(
                 resolved,
                 &route_source_ids,
+                &route_ids_without_crop,
                 followed_child_pin,
             ));
         }
@@ -922,6 +1339,7 @@ where
             return Some(finalize_cascaded_source_id(
                 resolved,
                 &route_source_ids,
+                &route_ids_without_crop,
                 followed_child_pin,
             ));
         }
@@ -929,11 +1347,12 @@ where
             return Some(finalize_cascaded_source_id(
                 resolved,
                 &route_source_ids,
+                &route_ids_without_crop,
                 followed_child_pin,
             ));
         };
         // 次の container 種別ごとの compat 規則を inline で適用。
-        let compatible = match (resolved.kind, &next_source) {
+        let compatible = match (resolved.kind, &next_source.source) {
             // Folder container: 任意の source kind を受け入れるが、内側参照は非空 rel 必須。
             (ResolvedKind::Folder, FolderPinSource::File { .. }) => true,
             (ResolvedKind::Folder, FolderPinSource::ZipEntry { zip_rel, .. }) => {
@@ -981,6 +1400,7 @@ where
             return Some(finalize_cascaded_source_id(
                 resolved,
                 &route_source_ids,
+                &route_ids_without_crop,
                 followed_child_pin,
             ));
         }
@@ -1000,6 +1420,7 @@ where
 fn finalize_cascaded_source_id(
     mut resolved: ResolvedPinTarget,
     route_source_ids: &[String],
+    route_ids_without_crop: &[String],
     followed_child_pin: bool,
 ) -> ResolvedPinTarget {
     if followed_child_pin {
@@ -1010,6 +1431,16 @@ fn finalize_cascaded_source_id(
         }
         let route_hash = format!("{:x}", hasher.finalize());
         resolved.source_id = format!("cascade:{route_hash}:{}", resolved.source_id);
+        let mut hasher = Sha256::new();
+        for id in route_ids_without_crop {
+            hasher.update((id.len() as u64).to_le_bytes());
+            hasher.update(id.as_bytes());
+        }
+        resolved.source_id_without_crop = format!(
+            "cascade:{:x}:{}",
+            hasher.finalize(),
+            resolved.source_id_without_crop
+        );
     }
     resolved
 }
@@ -1017,6 +1448,19 @@ fn finalize_cascaded_source_id(
 /// DB 行から `FolderPinSource` を組み立てる。検査に通らない行は `None` を返し、
 /// **どの行をなぜ skip したか**を `logger` 経由でログに出す (= ユーザーが DB を
 /// 手書きで触ったり、将来のスキーマ拡張で互換性が崩れた際に診断できるように)。
+fn decode_pin_row(row: &rusqlite::Row<'_>) -> SqlResult<Option<FolderPin>> {
+    let kind: String = row.get("source_kind")?;
+    let rel: String = row.get("source_rel")?;
+    let entry: Option<String> = row.get("source_entry")?;
+    let page: Option<i64> = row.get("source_page")?;
+    Ok(
+        decode_row(&kind, &rel, entry.as_deref(), page).map(|source| FolderPin {
+            source,
+            cover_crop: decode_cover_crop(row),
+        }),
+    )
+}
+
 fn decode_row(
     kind: &str,
     rel: &str,
@@ -1208,6 +1652,23 @@ fn zip_dir_container_key(zip_root: &Path, dir_prefix: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    fn resolve_pin_target_cascaded_via<F>(
+        container: &Path,
+        source: &FolderPinSource,
+        mut lookup: F,
+        depth: usize,
+    ) -> Option<ResolvedPinTarget>
+    where
+        F: FnMut(&Path) -> Option<FolderPinSource>,
+    {
+        super::resolve_pin_target_cascaded_via(
+            container,
+            source,
+            |path| lookup(path).map(Into::into),
+            depth,
+        )
+    }
+
     fn open_in_memory() -> FolderThumbPinDb {
         let conn = Connection::open_in_memory().expect("memory db");
         FolderThumbPinDb::init_schema(&conn).expect("schema");
@@ -1238,7 +1699,7 @@ mod tests {
         db.set(folder, &source).unwrap();
         let written = db.mutation_stamp();
         assert_ne!(written, initial);
-        assert_eq!(readonly.lookup(folder), Some(source));
+        assert_eq!(readonly.lookup(folder).map(|pin| pin.source), Some(source));
         db.remove(folder).unwrap();
         assert_ne!(db.mutation_stamp(), written);
         let missing = temp.path().join("missing.db");
@@ -1249,7 +1710,11 @@ mod tests {
     #[test]
     fn lookup_missing_returns_none() {
         let db = open_in_memory();
-        assert!(db.lookup(Path::new("C:/no/such/folder")).is_none());
+        assert!(
+            db.lookup(Path::new("C:/no/such/folder"))
+                .map(|pin| pin.source)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1261,7 +1726,7 @@ mod tests {
             kind: FileKind::Image,
         };
         db.set(container, &src).unwrap();
-        assert_eq!(db.lookup(container), Some(src));
+        assert_eq!(db.lookup(container).map(|pin| pin.source), Some(src));
     }
 
     #[test]
@@ -1273,7 +1738,7 @@ mod tests {
             entry: "page-01.png".to_string(),
         };
         db.set(container, &src).unwrap();
-        assert_eq!(db.lookup(container), Some(src));
+        assert_eq!(db.lookup(container).map(|pin| pin.source), Some(src));
     }
 
     #[test]
@@ -1286,7 +1751,7 @@ mod tests {
             entry: "page-05.png".to_string(),
         };
         db.set(container, &src).unwrap();
-        assert_eq!(db.lookup(container), Some(src));
+        assert_eq!(db.lookup(container).map(|pin| pin.source), Some(src));
     }
 
     #[test]
@@ -1299,7 +1764,7 @@ mod tests {
         };
         db.set(container, &src).unwrap();
         assert_eq!(
-            db.lookup(container),
+            db.lookup(container).map(|pin| pin.source),
             Some(FolderPinSource::ZipDir {
                 zip_rel: String::new(),
                 dir_prefix: "bookA/chapter01/".to_string(),
@@ -1316,7 +1781,7 @@ mod tests {
             page: 7,
         };
         db.set(container, &src).unwrap();
-        assert_eq!(db.lookup(container), Some(src));
+        assert_eq!(db.lookup(container).map(|pin| pin.source), Some(src));
     }
 
     #[test]
@@ -1328,7 +1793,7 @@ mod tests {
             page: 3,
         };
         db.set(container, &src).unwrap();
-        assert_eq!(db.lookup(container), Some(src));
+        assert_eq!(db.lookup(container).map(|pin| pin.source), Some(src));
     }
 
     #[test]
@@ -1340,7 +1805,7 @@ mod tests {
             kind: FileKind::Folder,
         };
         db.set(container, &src).unwrap();
-        assert_eq!(db.lookup(container), Some(src));
+        assert_eq!(db.lookup(container).map(|pin| pin.source), Some(src));
     }
 
     #[test]
@@ -1360,7 +1825,7 @@ mod tests {
             kind: FileKind::Image,
         };
         db.set(container, &new).unwrap();
-        assert_eq!(db.lookup(container), Some(new));
+        assert_eq!(db.lookup(container).map(|pin| pin.source), Some(new));
     }
 
     #[test]
@@ -1375,9 +1840,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(db.lookup(container).is_some());
+        assert!(db.lookup(container).map(|pin| pin.source).is_some());
         db.remove(container).unwrap();
-        assert!(db.lookup(container).is_none());
+        assert!(db.lookup(container).map(|pin| pin.source).is_none());
     }
 
     #[test]
@@ -1395,8 +1860,16 @@ mod tests {
         };
         db.set(Path::new(r"C:\Albums\Trip"), &src).unwrap();
         // 大文字小文字違い + フォワードスラッシュ違いでもヒットする
-        assert!(db.lookup(Path::new("c:/albums/trip")).is_some());
-        assert!(db.lookup(Path::new(r"c:\Albums/TRIP")).is_some());
+        assert!(
+            db.lookup(Path::new("c:/albums/trip"))
+                .map(|pin| pin.source)
+                .is_some()
+        );
+        assert!(
+            db.lookup(Path::new(r"c:\Albums/TRIP"))
+                .map(|pin| pin.source)
+                .is_some()
+        );
     }
 
     #[test]
@@ -1534,7 +2007,10 @@ mod tests {
             },
         )
         .unwrap();
-        let got = db.lookup(Path::new("C:/Albums/Trip")).unwrap();
+        let got = db
+            .lookup(Path::new("C:/Albums/Trip"))
+            .map(|pin| pin.source)
+            .unwrap();
         // forward-slash に正規化されている
         assert_eq!(
             got,
@@ -1559,7 +2035,11 @@ mod tests {
                 params!["c:/albums/trip", "image", "../up.jpg"],
             )
             .unwrap();
-        assert!(db.lookup(Path::new("C:/Albums/Trip")).is_none());
+        assert!(
+            db.lookup(Path::new("C:/Albums/Trip"))
+                .map(|pin| pin.source)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1705,7 +2185,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(db.lookup(Path::new("C:/Albums/Trip")).is_some());
+        assert!(
+            db.lookup(Path::new("C:/Albums/Trip"))
+                .map(|pin| pin.source)
+                .is_some()
+        );
     }
 
     #[test]
@@ -1720,7 +2204,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(db.lookup(Path::new("C:/Albums/Trip")).is_some());
+        assert!(
+            db.lookup(Path::new("C:/Albums/Trip"))
+                .map(|pin| pin.source)
+                .is_some()
+        );
     }
 
     /// 一時ディレクトリに実ファイルを作って resolve_pin_target が
@@ -2192,7 +2680,7 @@ mod tests {
         };
         db.set(&folder, &source).unwrap();
         let (looked_up, after_insert) = db.lookup_for_selection(&folder).unwrap();
-        assert_eq!(looked_up, Some(source.clone()));
+        assert_eq!(looked_up.map(|pin| pin.source), Some(source.clone()));
         assert_eq!(after_insert.revision, initial.revision + 1);
         db.set(
             &folder,
@@ -2243,7 +2731,10 @@ mod tests {
                                     .expect("concurrent refresh must acquire the schema writer");
                             let revision = db.selection_revision().unwrap();
                             if !fresh {
-                                assert_eq!(db.lookup(Path::new("C:/album")), Some(pin.clone()));
+                                assert_eq!(
+                                    db.lookup(Path::new("C:/album")).map(|pin| pin.source),
+                                    Some(pin.clone())
+                                );
                             }
                             (revision, migrated)
                         })
@@ -2297,7 +2788,12 @@ mod tests {
         let (migrated_db, migrated) =
             FolderThumbPinDb::open_at_with_migration_info(&legacy_path).unwrap();
         assert!(migrated);
-        assert!(migrated_db.lookup(Path::new("C:/album")).is_some());
+        assert!(
+            migrated_db
+                .lookup(Path::new("C:/album"))
+                .map(|pin| pin.source)
+                .is_some()
+        );
         drop(migrated_db);
         assert!(
             !FolderThumbPinDb::open_at_with_migration_info(&legacy_path)
@@ -2321,7 +2817,11 @@ mod tests {
         .unwrap();
         drop(conn);
         let db = FolderThumbPinDb::open_at(&path).unwrap();
-        assert!(db.lookup(Path::new("C:/album")).is_some());
+        assert!(
+            db.lookup(Path::new("C:/album"))
+                .map(|pin| pin.source)
+                .is_some()
+        );
         let initial = db.selection_revision().unwrap();
         {
             let conn = db.conn.lock().unwrap();
@@ -2335,6 +2835,265 @@ mod tests {
         assert_eq!(
             db.selection_revision().unwrap().revision,
             initial.revision + 2
+        );
+    }
+
+    #[test]
+    fn cover_crop_validates_ppm_and_rounds_outward_without_overflow() {
+        assert_eq!(CoverCrop::new([0, 0, 1_000_000, 1_000_000]).unwrap(), None);
+        for bad in [
+            [0, 0, 9_999, 1_000_000],
+            [0, 0, 1_000_001, 1_000_000],
+            [500_000, 0, 400_000, 1_000_000],
+            [0, 20_000, 1_000_000, 20_000],
+        ] {
+            assert!(CoverCrop::new(bad).is_err());
+        }
+        let crop = CoverCrop::new([333_333, 100_000, 666_667, 900_000])
+            .unwrap()
+            .unwrap();
+        assert_eq!(crop.pixel_bounds(10, 7), (3, 0, 4, 7));
+        let bounds = crop.pixel_bounds(u32::MAX, u32::MAX);
+        assert!(bounds.0 <= u32::MAX - bounds.2);
+        assert!(bounds.1 <= u32::MAX - bounds.3);
+        assert_eq!(crop.pixel_bounds(0, 0), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn cover_crop_writers_preserve_pin_and_revision_contracts() {
+        let db = open_in_memory();
+        let container = Path::new("c:/album");
+        let source = FolderPinSource::File {
+            rel: "cover.jpg".into(),
+            kind: FileKind::Image,
+        };
+        let crop = CoverCrop::new([0, 0, 400_000, 1_000_000]).unwrap();
+        let revision = db.selection_revision().unwrap().revision;
+        db.set_with_cover_crop(container, &source, crop).unwrap();
+        assert_eq!(db.lookup(container).unwrap().cover_crop, crop);
+        assert_eq!(db.lookup_many([container])["c:/album"].cover_crop, crop);
+        assert_eq!(
+            db.lookup_for_selection(container)
+                .unwrap()
+                .0
+                .unwrap()
+                .cover_crop,
+            crop
+        );
+        db.clear_cover_crop(container).unwrap();
+        assert_eq!(
+            db.lookup(container),
+            Some(FolderPin {
+                source: source.clone(),
+                cover_crop: None
+            })
+        );
+        db.set_with_cover_crop(container, &source, crop).unwrap();
+        db.set(container, &source).unwrap();
+        assert_eq!(db.lookup(container).unwrap().cover_crop, None);
+        assert_eq!(db.selection_revision().unwrap().revision, revision + 4);
+        for unsupported in [
+            FolderPinSource::File {
+                rel: "cover.cr3".into(),
+                kind: FileKind::Image,
+            },
+            FolderPinSource::File {
+                rel: "clip.mp4".into(),
+                kind: FileKind::Video,
+            },
+            FolderPinSource::File {
+                rel: "sub".into(),
+                kind: FileKind::Folder,
+            },
+            FolderPinSource::ZipEntry {
+                zip_rel: "".into(),
+                entry: "clip.mp4".into(),
+            },
+        ] {
+            assert!(
+                db.set_with_cover_crop(container, &unsupported, crop)
+                    .is_err()
+            );
+        }
+        let plugin = FolderPinSource::File {
+            rel: "cover.plugin-image".into(),
+            kind: FileKind::Image,
+        };
+        db.set_with_cover_crop(container, &plugin, crop).unwrap();
+        assert_eq!(db.lookup(container).unwrap().cover_crop, crop);
+        let plugin_zip = FolderPinSource::ZipEntry {
+            zip_rel: String::new(),
+            entry: "cover.plugin-image".into(),
+        };
+        db.set_with_cover_crop(container, &plugin_zip, crop)
+            .unwrap();
+        assert_eq!(db.lookup(container).unwrap().cover_crop, crop);
+        db.remove(container).unwrap();
+        assert!(db.lookup(container).is_none());
+    }
+
+    #[test]
+    fn cover_crop_legacy_readonly_and_additive_schema_preserve_source_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pins.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE folder_thumb_pins(container_key TEXT PRIMARY KEY,source_kind TEXT NOT NULL,source_rel TEXT NOT NULL,source_entry TEXT,source_page INTEGER);
+            INSERT INTO folder_thumb_pins VALUES ('c:/album','image','old.jpg',NULL,NULL)").unwrap();
+        drop(conn);
+        let readonly = FolderThumbPinDb::open_readonly(&path).unwrap();
+        assert_eq!(
+            readonly.lookup(Path::new("c:/album")).unwrap().cover_crop,
+            None
+        );
+        drop(readonly);
+        let db = FolderThumbPinDb::open_at(&path).unwrap();
+        assert_eq!(
+            db.lookup(Path::new("c:/album")).unwrap().source.rel(),
+            "old.jpg"
+        );
+        let conn = Connection::open(path).unwrap();
+        assert_eq!(conn.query_row("SELECT count(*) FROM pragma_table_info('folder_thumb_pins') WHERE name LIKE 'cover_crop_%'", [], |r| r.get::<_,u32>(0)).unwrap(), 5);
+        conn.execute("INSERT INTO folder_thumb_pins(container_key,source_kind,source_rel,source_entry,source_page) VALUES ('c:/other','image','new.jpg',NULL,NULL)", []).unwrap();
+        assert!(db.lookup(Path::new("c:/other")).is_some());
+    }
+
+    #[test]
+    fn cover_crop_decoder_rejects_stale_partial_noninteger_and_nonleaf_values() {
+        let db = open_in_memory();
+        let container = Path::new("c:/album");
+        let source = FolderPinSource::File {
+            rel: "cover.jpg".into(),
+            kind: FileKind::Image,
+        };
+        let crop = CoverCrop::new([0, 0, 400_000, 1_000_000]).unwrap();
+        for sql in [
+            "UPDATE folder_thumb_pins SET source_rel='other.jpg'",
+            "UPDATE folder_thumb_pins SET cover_crop_y0=NULL",
+            "UPDATE folder_thumb_pins SET cover_crop_x0='bad'",
+            "UPDATE folder_thumb_pins SET cover_crop_x1=9999",
+            "UPDATE folder_thumb_pins SET cover_crop_x0=-1",
+            "UPDATE folder_thumb_pins SET source_kind='folder', cover_crop_source='folder|cover.jpg|-|-'",
+            "UPDATE folder_thumb_pins SET source_rel='cover.cr3', cover_crop_source='image|cover.cr3|-|-'",
+        ] {
+            db.set_with_cover_crop(container, &source, crop).unwrap();
+            db.conn.lock().unwrap().execute(sql, []).unwrap();
+            assert_eq!(db.lookup(container).unwrap().cover_crop, None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn cover_crop_old_upsert_and_old_rename_cannot_rebind_to_another_leaf() {
+        let db = open_in_memory();
+        let container = Path::new("c:/album");
+        let source = FolderPinSource::File {
+            rel: "cover.jpg".into(),
+            kind: FileKind::Image,
+        };
+        let crop = CoverCrop::new([0, 0, 400_000, 1_000_000]).unwrap();
+        db.set_with_cover_crop(container, &source, crop).unwrap();
+        db.conn.lock().unwrap().execute("INSERT INTO folder_thumb_pins(container_key,source_kind,source_rel) VALUES ('c:/album','image','new.jpg') ON CONFLICT(container_key) DO UPDATE SET source_kind=excluded.source_kind,source_rel=excluded.source_rel", []).unwrap();
+        assert_eq!(db.lookup(container).unwrap().source.rel(), "new.jpg");
+        assert_eq!(db.lookup(container).unwrap().cover_crop, None);
+        let conn = db.conn.lock().unwrap();
+        rewrite_pin_source_column(&conn, "c:/album", "source_rel", "renamed.jpg").unwrap();
+        assert_eq!(
+            conn.query_row("SELECT cover_crop_source FROM folder_thumb_pins", [], |r| r
+                .get::<_, Option<String>>(0))
+                .unwrap(),
+            None
+        );
+        drop(conn);
+        db.set_with_cover_crop(container, &source, crop).unwrap();
+        rewrite_pin_source_column(
+            &db.conn.lock().unwrap(),
+            "c:/album",
+            "source_rel",
+            "renamed.jpg",
+        )
+        .unwrap();
+        assert_eq!(db.lookup(container).unwrap().cover_crop, crop);
+    }
+
+    #[test]
+    fn cover_crop_cache_keys_keep_legacy_spelling_and_isolate_cascaded_crop() {
+        let folder = Path::new("c:/album");
+        let source = FolderPinSource::File {
+            rel: "cover.jpg".into(),
+            kind: FileKind::Image,
+        };
+        let crop = CoverCrop::new([0, 0, 400_000, 1_000_000]).unwrap();
+        let plain = resolve_pin_target_via(folder, &source, &|_| Some((10, 20))).unwrap();
+        let cropped = resolve_pin_target_via(
+            folder,
+            &FolderPin {
+                source: source.clone(),
+                cover_crop: crop,
+            },
+            &|_| Some((10, 20)),
+        )
+        .unwrap();
+        assert_eq!(
+            plain.pinned_cache_key("folderthumb:album|types:7", PinKeyMode::Exact, None),
+            "folderthumb:album|types:7#pin:image|cover.jpg|-|-|10|20"
+        );
+        assert_eq!(
+            cropped.pinned_cache_key("base", PinKeyMode::Exact, None),
+            "base#pin:image|cover.jpg|-|-|crop:0,0,400000,1000000|10|20"
+        );
+        assert_eq!(
+            cropped.pinned_cache_key("base", PinKeyMode::WithoutCrop, None),
+            plain.pinned_cache_key("base", PinKeyMode::Exact, None)
+        );
+        let immediate = FolderPinSource::File {
+            rel: "child".into(),
+            kind: FileKind::Folder,
+        };
+        let resolve = |crop| {
+            super::resolve_pin_target_cascaded_via_with_metadata(
+                folder,
+                &immediate,
+                |_| {
+                    Some(FolderPin {
+                        source: source.clone(),
+                        cover_crop: crop,
+                    })
+                },
+                |_| Some((10, 20)),
+                1,
+            )
+            .unwrap()
+        };
+        let a = resolve(None);
+        let b = resolve(crop);
+        assert_eq!(
+            a.pinned_cache_key("base", PinKeyMode::Exact, None),
+            "base#pin:cascade:da282e92daca6f7022da56954d9671be18e6fc2c533226400950c0ef140b49cd:image|cover.jpg|-|-|10|20"
+        );
+        assert_ne!(
+            a.pinned_cache_key("base", PinKeyMode::Exact, None),
+            b.pinned_cache_key("base", PinKeyMode::Exact, None)
+        );
+        assert_eq!(
+            a.pinned_cache_key("base", PinKeyMode::WithoutCrop, None),
+            b.pinned_cache_key("base", PinKeyMode::WithoutCrop, None)
+        );
+        let zip = FolderPin {
+            source: FolderPinSource::ZipEntry {
+                zip_rel: String::new(),
+                entry: "dir/page.jpg".into(),
+            },
+            cover_crop: crop,
+        };
+        let target =
+            resolve_pin_target_via(Path::new("c:/book.zip/dir"), &zip, &|_| Some((10, 20)))
+                .unwrap();
+        assert_eq!(
+            target.pinned_cache_key("unused", PinKeyMode::Exact, Some("dir/")),
+            "zipdir:dir/#pin:dir/page.jpg|crop:0,0,400000,1000000"
+        );
+        assert_eq!(
+            target.pinned_cache_key("unused", PinKeyMode::WithoutCrop, Some("dir/")),
+            "zipdir:dir/#pin:dir/page.jpg"
         );
     }
 }

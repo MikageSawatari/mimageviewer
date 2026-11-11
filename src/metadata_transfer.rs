@@ -51,7 +51,8 @@ pub(crate) fn folder_zip_page_backup(
 }
 const FORMAT_NAME: &str = "mimageviewer-portable-metadata";
 const SHARD_FORMAT_NAME: &str = "mimageviewer-portable-metadata-shard";
-const FORMAT_VERSION: u32 = 12;
+const FORMAT_VERSION: u32 = 13;
+const COVER_CROP_FORMAT_VERSION: u32 = 13;
 const COMPOSITION_FORMAT_VERSION: u32 = 11;
 const AI_CAPTION_FORMAT_VERSION: u32 = 12;
 const SPREAD_SHIFT_FORMAT_VERSION: u32 = 10;
@@ -641,6 +642,23 @@ struct PortableFolderThumbPin {
     source_rel: String,
     source_entry: Option<String>,
     source_page: Option<u32>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_pin_cover_crop"
+    )]
+    cover_crop: Option<[u32; 4]>,
+}
+
+// Preserve a malformed crop as an invalid value so import can report it while retaining the pin.
+fn deserialize_pin_cover_crop<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<[u32; 4]>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_value(value).unwrap_or([u32::MAX; 4])))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3764,7 +3782,7 @@ where
         prepare_container_scope(&mut conn, entries, physical_index, cancel)?;
         let mut stmt = conn
             .prepare(
-                "SELECT p.container_key, p.source_kind, p.source_rel, p.source_entry, p.source_page
+                "SELECT p.*
                    FROM metadata_transfer_container_scope AS s
                   CROSS JOIN folder_thumb_pins AS p
                   WHERE p.container_key = s.item_key
@@ -3793,6 +3811,8 @@ where
                         source_rel: row.get(2)?,
                         source_entry: row.get(3)?,
                         source_page,
+                        cover_crop: crate::folder_thumb_pins::decode_cover_crop(row)
+                            .map(|c| c.values()),
                     },
                 ))
             })
@@ -4061,7 +4081,17 @@ where
         let mut line_number = 1_usize;
         while read_bounded_line(&mut reader, &mut line, MAX_RECORD_BYTES, cancel, &path)? {
             line_number += 1;
-            let entry: PortableEntry = parse_json_record(&line, &path, line_number)?;
+            let mut entry: PortableEntry = parse_json_record(&line, &path, line_number)?;
+            if manifest.version < COVER_CROP_FORMAT_VERSION {
+                if let Some(pin) = &mut entry.container_state.folder_thumb_pin {
+                    pin.cover_crop = None;
+                }
+                for nested in &mut entry.nested_containers {
+                    if let Some(pin) = &mut nested.state.folder_thumb_pin {
+                        pin.cover_crop = None;
+                    }
+                }
+            }
             validate_portable_entry(&entry)?;
             validate_shard_entry_path(&header.folder, &entry.path)?;
             let identity = entry.path.to_lowercase();
@@ -4207,18 +4237,20 @@ fn validate_bundle_manifest(manifest: &BundleManifest) -> Result<(), TransferErr
         LEGACY_FORMAT_VERSION,
         SPREAD_SHIFT_FORMAT_VERSION,
         COMPOSITION_FORMAT_VERSION,
+        AI_CAPTION_FORMAT_VERSION,
         FORMAT_VERSION,
     ]
     .contains(&manifest.version)
     {
         return Err(TransferError::Invalid(format!(
-            "未対応のバージョンです: {}（v{} / v{} / v{} / v{} / v{} / v{}を受け入れます）",
+            "未対応のバージョンです: {}（v{} / v{} / v{} / v{} / v{} / v{} / v{}を受け入れます）",
             manifest.version,
             RELEASED_FORMAT_VERSION,
             PREVIOUS_FORMAT_VERSION,
             LEGACY_FORMAT_VERSION,
             SPREAD_SHIFT_FORMAT_VERSION,
             COMPOSITION_FORMAT_VERSION,
+            AI_CAPTION_FORMAT_VERSION,
             FORMAT_VERSION
         )));
     }
@@ -4294,18 +4326,20 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), TransferError> {
         LEGACY_FORMAT_VERSION,
         SPREAD_SHIFT_FORMAT_VERSION,
         COMPOSITION_FORMAT_VERSION,
+        AI_CAPTION_FORMAT_VERSION,
         FORMAT_VERSION,
     ]
     .contains(&manifest.version)
     {
         return Err(TransferError::Invalid(format!(
-            "未対応のバージョンです: {}（v{} / v{} / v{} / v{} / v{} / v{}を受け入れます）",
+            "未対応のバージョンです: {}（v{} / v{} / v{} / v{} / v{} / v{} / v{}を受け入れます）",
             manifest.version,
             RELEASED_FORMAT_VERSION,
             PREVIOUS_FORMAT_VERSION,
             LEGACY_FORMAT_VERSION,
             SPREAD_SHIFT_FORMAT_VERSION,
             COMPOSITION_FORMAT_VERSION,
+            AI_CAPTION_FORMAT_VERSION,
             FORMAT_VERSION
         )));
     }
@@ -6205,12 +6239,29 @@ fn insert_folder_pin(
         ));
         return Ok(Some(reason));
     }
-    portable_folder_pin_source(pin)
+    let source = portable_folder_pin_source(pin)
         .ok_or_else(|| TransferError::Invalid("代表サムネ設定が不正です".into()))?;
+    let (crop, skipped) = match pin.cover_crop {
+        None => (None, None),
+        Some(values) if source.supports_cover_crop() => {
+            match crate::folder_thumb_pins::CoverCrop::new(values) {
+                Ok(crop) => (crop, None),
+                Err(_) => (
+                    None,
+                    Some("代表サムネの範囲が不正なため、範囲だけをスキップしました".to_owned()),
+                ),
+            }
+        }
+        Some(_) => (
+            None,
+            Some("代表サムネの範囲を適用できない画像のため、範囲だけをスキップしました".to_owned()),
+        ),
+    };
     tx.prepare_cached(
         "INSERT INTO folder_pin.folder_thumb_pins
-                (container_key, source_kind, source_rel, source_entry, source_page)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+                (container_key, source_kind, source_rel, source_entry, source_page,
+                 cover_crop_x0, cover_crop_y0, cover_crop_x1, cover_crop_y1, cover_crop_source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
     )
     .map_err(db_error)?
     .execute(params![
@@ -6219,9 +6270,17 @@ fn insert_folder_pin(
         pin.source_rel,
         pin.source_entry,
         pin.source_page,
+        crop.map(|c| c.values()[0]),
+        crop.map(|c| c.values()[1]),
+        crop.map(|c| c.values()[2]),
+        crop.map(|c| c.values()[3]),
+        crop.map(|_| source.cover_crop_binding()),
     ])
     .map_err(db_error)?;
-    Ok(None)
+    if let Some(reason) = &skipped {
+        crate::logger::log(format!("metadata import: {key}: {reason}"));
+    }
+    Ok(skipped)
 }
 
 fn delete_container_family(
@@ -12111,7 +12170,7 @@ mod tests {
                 Err(TransferError::Invalid(message))
                     if message.contains("未対応のバージョン")
                         && message.contains(&version.to_string())
-                        && message.contains("v7 / v8 / v9 / v10 / v11 / v12を受け入れます")
+                    && message.contains("v7 / v8 / v9 / v10 / v11 / v12 / v13を受け入れます")
             ));
         }
     }
@@ -13520,6 +13579,7 @@ mod tests {
             source_rel: "../outside.jpg".to_string(),
             source_entry: None,
             source_page: None,
+            cover_crop: None,
         });
         assert!(matches!(
             validate_manifest(&invalid_pin),
@@ -13532,6 +13592,7 @@ mod tests {
             source_rel: "book.future".to_string(),
             source_entry: None,
             source_page: None,
+            cover_crop: None,
         });
         assert!(validate_manifest(&unknown_pin).is_ok());
 
@@ -13740,5 +13801,122 @@ mod tests {
             crate::book_bookmarks::resolve_relative_page_path(&album, "chapter/future.jpg"),
             crate::book_bookmarks::RelativePagePathResolution::Missing(_)
         ));
+    }
+
+    #[test]
+    fn cover_crop_metadata_roundtrip_ignores_stale_binding_and_v12_unknown_field() {
+        use crate::folder_thumb_pins::{CoverCrop, FileKind, FolderPinSource, FolderThumbPinDb};
+        for (version, stale) in [(13, false), (13, true), (12, false)] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("a.jpg"), b"image").unwrap();
+            fs::write(root.join("b.jpg"), b"image").unwrap();
+            let source_data = temp.path().join("source-data");
+            let destination_data = temp.path().join("destination-data");
+            init_data_dir(&source_data);
+            init_data_dir(&destination_data);
+            let db = FolderThumbPinDb::open_at(&source_data.join("folder_thumb_pins.db")).unwrap();
+            let crop = CoverCrop::new([0, 0, 400_000, 1_000_000]).unwrap();
+            db.set_with_cover_crop(
+                &root,
+                &FolderPinSource::File {
+                    rel: "a.jpg".into(),
+                    kind: FileKind::Image,
+                },
+                crop,
+            )
+            .unwrap();
+            if stale {
+                Connection::open(source_data.join("folder_thumb_pins.db"))
+                    .unwrap()
+                    .execute("UPDATE folder_thumb_pins SET source_rel='b.jpg'", [])
+                    .unwrap();
+            }
+            let cancel = AtomicBool::new(false);
+            export_at(&source_data, &root, false, &cancel, no_progress).unwrap();
+            let exported = read_manifest(&root, &cancel).unwrap();
+            assert_eq!(exported.version, 13);
+            let pin = exported
+                .entries
+                .iter()
+                .find(|e| e.path == ".")
+                .unwrap()
+                .container_state
+                .folder_thumb_pin
+                .as_ref()
+                .unwrap();
+            assert_eq!(
+                pin.cover_crop,
+                if stale {
+                    None
+                } else {
+                    crop.map(|c| c.values())
+                }
+            );
+            if version == 12 {
+                rewrite_transfer_version(&root, version);
+            }
+            let summary = import_at(&destination_data, &root, &cancel, no_progress).unwrap();
+            assert_eq!(summary.failed_entries, 0);
+            let imported =
+                FolderThumbPinDb::open_at(&destination_data.join("folder_thumb_pins.db"))
+                    .unwrap()
+                    .lookup(&root)
+                    .unwrap();
+            assert_eq!(imported.source.rel(), if stale { "b.jpg" } else { "a.jpg" });
+            assert_eq!(
+                imported.cover_crop,
+                if stale || version == 12 { None } else { crop }
+            );
+        }
+    }
+
+    #[test]
+    fn cover_crop_metadata_invalid_range_reports_skip_and_still_imports_pin() {
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource, FolderThumbPinDb};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.jpg"), b"image").unwrap();
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        FolderThumbPinDb::open_at(&source_data.join("folder_thumb_pins.db"))
+            .unwrap()
+            .set(
+                &root,
+                &FolderPinSource::File {
+                    rel: "a.jpg".into(),
+                    kind: FileKind::Image,
+                },
+            )
+            .unwrap();
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &root, false, &cancel, no_progress).unwrap();
+        rewrite_root_shard_entries(&root, &cancel, |entry| {
+            if let Some(pin) = &mut entry.container_state.folder_thumb_pin {
+                pin.cover_crop = Some([0, 0, 9_999, 1_000_000]);
+            }
+        });
+        let summary = import_at(&destination_data, &root, &cancel, no_progress).unwrap();
+        assert_eq!(summary.failed_entries, 1);
+        assert_eq!(summary.failed_items.len(), 1);
+        assert!(!summary.failed_items[0].reason.is_empty());
+        let imported = FolderThumbPinDb::open_at(&destination_data.join("folder_thumb_pins.db"))
+            .unwrap()
+            .lookup(&root)
+            .unwrap();
+        assert_eq!(imported.source.rel(), "a.jpg");
+        assert_eq!(imported.cover_crop, None);
+        for malformed in [
+            serde_json::json!([-1, 0, 500_000, 1_000_000]),
+            serde_json::json!([0, 0, 10]),
+            serde_json::json!("bad"),
+        ] {
+            let parsed: PortableFolderThumbPin = serde_json::from_value(serde_json::json!({"source_kind":"image", "source_rel":"a.jpg", "source_entry":null,"source_page":null,"cover_crop":malformed})).unwrap();
+            assert!(crate::folder_thumb_pins::CoverCrop::new(parsed.cover_crop.unwrap()).is_err());
+        }
     }
 }

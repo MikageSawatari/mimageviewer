@@ -202,7 +202,8 @@ fn container_type_icons_drive_pin_demand_gate() {
             FolderPinSource::File {
                 rel: "cover.png".into(),
                 kind: FileKind::Image,
-            },
+            }
+            .into(),
         );
         app.update_keep_range_and_requests(&ctx, Instant::now());
         assert_eq!(app.requested.contains_key(&0), !enabled);
@@ -553,8 +554,10 @@ fn container_type_icons_preferences_restore_pinned_and_plain_cache_without_delet
                 .unwrap()
                 .set(&folder, &pin)
                 .unwrap();
-            app.folder_pin_map
-                .insert(crate::path_key::normalize_keep_drive(&folder), pin.clone());
+            app.folder_pin_map.insert(
+                crate::path_key::normalize_keep_drive(&folder),
+                pin.clone().into(),
+            );
         }
         assert_eq!(
             app.enqueue_priority_thumbnail(0),
@@ -667,7 +670,7 @@ fn container_type_icons_preferences_restore_pinned_and_plain_cache_without_delet
         );
         assert_eq!(
             app.folder_thumb_pin_db.as_ref().unwrap().lookup(&folder),
-            pinned.then_some(pin)
+            pinned.then_some(pin.into())
         );
     }
 }

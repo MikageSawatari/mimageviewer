@@ -143,13 +143,17 @@ fn migrate_thumb_pin(
     let container_key = crate::path_key::normalize_keep_drive(zip_path);
     let tx = conn.transaction()?;
     let mut changed = 0usize;
-    {
-        let mut update = tx.prepare(
-            "UPDATE folder_thumb_pins SET source_entry = ?1
-             WHERE container_key = ?2 AND source_entry = ?3",
-        )?;
-        for (old_entry, new_entry) in renames {
-            changed += update.execute(rusqlite::params![new_entry, container_key, old_entry])?;
+    for (old_entry, new_entry) in renames {
+        let matches: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM folder_thumb_pins WHERE container_key=?1 AND source_entry=?2)",
+            rusqlite::params![container_key, old_entry], |r| r.get(0))?;
+        if matches {
+            changed += crate::folder_thumb_pins::rewrite_pin_source_column(
+                &tx,
+                &container_key,
+                "source_entry",
+                new_entry,
+            )?;
         }
     }
     tx.commit()?;
@@ -306,5 +310,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(entry, "新しい名前/p1.jpg");
+    }
+
+    #[test]
+    fn cover_crop_zip_entry_rename_rebinds_valid_crop_and_discards_stale_crop() {
+        use crate::folder_thumb_pins::{CoverCrop, FolderPinSource, FolderThumbPinDb};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("folder_thumb_pins.db");
+        let zip = Path::new("c:/books/one.zip");
+        let db = FolderThumbPinDb::open_at(&path).unwrap();
+        let crop = CoverCrop::new([0, 0, 400_000, 1_000_000]).unwrap();
+        let source = FolderPinSource::ZipEntry {
+            zip_rel: String::new(),
+            entry: "old.jpg".into(),
+        };
+        db.set_with_cover_crop(zip, &source, crop).unwrap();
+        migrate_thumb_pin(&path, zip, &[("old.jpg".into(), "new.jpg".into())]).unwrap();
+        assert_eq!(db.lookup(zip).unwrap().cover_crop, crop);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute("UPDATE folder_thumb_pins SET source_entry='other.jpg'", [])
+            .unwrap();
+        migrate_thumb_pin(&path, zip, &[("other.jpg".into(), "final.jpg".into())]).unwrap();
+        let pin = db.lookup(zip).unwrap();
+        assert_eq!(pin.cover_crop, None);
+        assert!(
+            matches!(pin.source, FolderPinSource::ZipEntry { entry, .. } if entry == "final.jpg")
+        );
+        assert_eq!(
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .query_row("SELECT cover_crop_source FROM folder_thumb_pins", [], |r| r
+                    .get::<_, Option<String>>(0))
+                .unwrap(),
+            None
+        );
     }
 }

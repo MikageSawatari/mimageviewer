@@ -29,6 +29,50 @@ use egui_kittest::kittest::NodeT;
 use egui_kittest::{Harness, kittest::Queryable};
 
 #[test]
+fn cover_crop_small_100_light() {
+    cover_crop_snapshot(
+        "cover_crop_small_100_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        1.0,
+    );
+}
+
+#[test]
+fn cover_crop_small_200_dark() {
+    cover_crop_snapshot(
+        "cover_crop_small_200_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        2.0,
+    );
+}
+
+fn cover_crop_snapshot(name: &str, theme: mimageviewer::os_theme::ResolvedTheme, scale: f32) {
+    let mut fonts_ready = false;
+    let mut harness = test_ui::builder()
+        .with_size(egui::vec2(1093.0, 614.0))
+        .build_ui(move |ui| {
+            mimageviewer::os_theme::apply_resolved(ui.ctx(), theme);
+            if !fonts_ready {
+                install_app_fonts(ui.ctx());
+                mimageviewer::settings::apply_ui_scale_factor(ui.ctx(), scale);
+                fonts_ready = true;
+                ui.ctx().request_repaint();
+                return;
+            }
+            mimageviewer::draw_cover_crop_snapshot_fixture(ui);
+        });
+    harness.run_steps(8);
+    let viewport = harness.ctx.content_rect();
+    for label in ["OK", "手動の範囲を解除", "キャンセル", "Close window"] {
+        assert!(
+            viewport.contains_rect(harness.get_by_label(label).rect()),
+            "{name}: {label} outside viewport"
+        );
+    }
+    harness.snapshot(name);
+}
+
+#[test]
 fn exif_gps_maps_dark() {
     snapshot_with_theme_at_size(
         "exif_gps_maps_dark",

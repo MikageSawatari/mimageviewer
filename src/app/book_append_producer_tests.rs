@@ -145,7 +145,7 @@ fn section1373_zip_representative_pin_set_and_remove_admit_before_dirty_is_consu
                     .set(&zip, &source)
                     .unwrap();
                 let key = crate::path_key::normalize_keep_drive(&zip);
-                app.folder_pin_map.insert(key, source.clone());
+                app.folder_pin_map.insert(key, source.clone().into());
             }
             let generation = app.items_generation;
             app.toggle_folder_pin_for_idx(0);

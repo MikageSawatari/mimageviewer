@@ -248,6 +248,7 @@ impl ContextMenuItemId {
             MenuCommand::Deselect => Self::Deselect,
             MenuCommand::RemoveReadingHistory => Self::RemoveReadingHistory,
             MenuCommand::EditBookComposition
+            | MenuCommand::SpecifyCoverCrop
             | MenuCommand::ConvertEpubToPdf
             | MenuCommand::ExternalTool(_)
             | MenuCommand::OpenWithAssociation { .. } => return None,
@@ -752,6 +753,8 @@ pub enum MenuNode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuCommand {
+    /// Context-menu-only representative operation; deliberately has no key binding.
+    SpecifyCoverCrop,
     /// Dynamic current-book operation; it has no application key binding.
     EditBookComposition,
     ConvertEpubToPdf,

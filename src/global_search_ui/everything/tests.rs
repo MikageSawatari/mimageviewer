@@ -411,7 +411,8 @@ fn stale_prepared_pins_and_tags_retry_before_any_metadata_is_published() {
         let SearchMetadataInstall::Prepared(metadata) = &prepared.metadata else {
             panic!("Everything metadata must be worker prepared");
         };
-        assert_eq!(metadata.pins[&zip_key], old_pin);
+        assert_eq!(metadata.pins[&zip_key].source, old_pin);
+        assert_eq!(metadata.pins[&zip_key].cover_crop, None);
         assert_eq!(metadata.tags[&image_key], vec!["#before"]);
     }
     // These ordinary edits occur after the worker has finished its immutable payload.
@@ -454,7 +455,8 @@ fn stale_prepared_pins_and_tags_retry_before_any_metadata_is_published() {
         |app| app.global_search.pending.is_none(),
     );
     assert!(Arc::ptr_eq(accepted_dataset(&app), &result));
-    assert_eq!(app.folder_pin_map[&zip_key], fresh_pin);
+    assert_eq!(app.folder_pin_map[&zip_key].source, fresh_pin);
+    assert_eq!(app.folder_pin_map[&zip_key].cover_crop, None);
     assert_eq!(app.tags_cache[&image_key], vec!["#after"]);
     assert_eq!(
         app.converted_archive_cache_paths[&rar_key],

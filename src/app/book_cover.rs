@@ -4,7 +4,9 @@
 use super::*;
 use crate::ai_caption_db::FileSignature;
 use crate::archive_converter::ArchiveFormat;
-use crate::folder_thumb_pins::{FileKind, FolderPinSource, ResolvedKind, ResolvedPinTarget};
+use crate::folder_thumb_pins::{
+    CoverCrop, FileKind, FolderPin, FolderPinSource, PinKeyMode, ResolvedKind, ResolvedPinTarget,
+};
 use crate::thumb_loader::{ReadLocation, ResolveStrategy};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13,6 +15,24 @@ pub(crate) enum BookKind {
     Pdf,
     Archive(ArchiveFormat),
     Folder,
+}
+
+/// Logical owner; a ZIP directory remains attached to the original archive,
+/// including when its bytes are read from a converted cache ZIP.
+#[derive(Clone, Debug)]
+pub(crate) struct BookCoverContainer {
+    pub(crate) path: PathBuf,
+    pub(crate) kind: BookKind,
+    pub(crate) zip_dir_prefix: Option<String>,
+}
+
+impl BookCoverContainer {
+    pub(crate) fn pin_container(&self) -> PathBuf {
+        self.zip_dir_prefix.as_deref().map_or_else(
+            || self.path.clone(),
+            |prefix| book_container_key(&self.path, prefix),
+        )
+    }
 }
 
 impl BookKind {
@@ -80,7 +100,7 @@ impl App {
     /// Capture handles and settings only; opening stores and source I/O happen on the worker.
     pub(crate) fn book_cover_env(&self) -> BookCoverEnv {
         BookCoverEnv {
-            books_root: Some(self.book_root_path()),
+            books_root: self.settings.book_root.clone(),
             folder_thumb_sort: self.settings.folder_thumb_sort,
             folder_thumb_depth: self.settings.folder_thumb_depth,
             visibility: self.listing_file_type_visibility().clone(),
@@ -111,6 +131,9 @@ pub(crate) struct ResolvedBookCover {
     pub(crate) epub_read: Option<crate::pdf_loader::ReadTarget>,
     pub(crate) pdf_password: Option<String>,
     pub(crate) preloaded_bytes: Option<Vec<u8>>,
+    pub(crate) persistent_source: FolderPinSource,
+    pub(crate) rotation_key: Option<String>,
+    pub(crate) cover_crop: Option<CoverCrop>,
 }
 
 #[derive(Debug)]
@@ -135,6 +158,56 @@ pub(crate) fn resolve_book_cover(
     kind: BookKind,
     env: &BookCoverEnv,
 ) -> BookCover {
+    resolve_logical_book_cover(
+        &BookCoverContainer {
+            path: book_path.to_owned(),
+            kind,
+            zip_dir_prefix: None,
+        },
+        None,
+        env,
+    )
+}
+
+pub(crate) fn resolve_logical_book_cover(
+    container: &BookCoverContainer,
+    mut selected_source: Option<FolderPin>,
+    env: &BookCoverEnv,
+) -> BookCover {
+    // Resolve the Shell-backed default once, on this worker, for every route
+    // (including cached direct-image fallbacks).
+    let worker_env = BookCoverEnv {
+        books_root: Some(
+            env.books_root
+                .clone()
+                .unwrap_or_else(crate::books::default_books_root),
+        ),
+        ..env.clone()
+    };
+    let env = &worker_env;
+    let book_path = container.path.as_path();
+    let kind = container.kind;
+    // Entry B can name the same leaf as a cascaded pin. Inherit that leaf's
+    // effective crop without asking the UI to resolve or inspect the pin DB.
+    if let Some(selected) = selected_source
+        .as_mut()
+        .filter(|pin| pin.cover_crop.is_none())
+        && let Some(existing) = env
+            .pin_db
+            .as_ref()
+            .and_then(|db| db.lookup(&container.pin_container()))
+        && let Some(target) = resolve_pin_target_cascaded(
+            &container.pin_container(),
+            &existing,
+            env.pin_db.as_deref(),
+            env.folder_thumb_depth as usize,
+        )
+        && source_for_selected_pin(book_path, &target).as_ref() == Some(&selected.source)
+    {
+        let mut request = LoadRequest::default();
+        target.assign_to_load_request(&mut request, "cover-resolution", PinKeyMode::Exact, None);
+        selected.cover_crop = request.cover_crop;
+    }
     // The UI supplies an I/O-free kind hint. An accepted recipe can classify
     // a real directory named album.pdf/album.zip as a document/archive.
     // Establish the actual owner here, before choosing its signature policy.
@@ -164,8 +237,16 @@ pub(crate) fn resolve_book_cover(
         video_db,
         visited: HashSet::new(),
     };
-    match resolver.resolve(book_path, kind, None) {
+    match resolver.resolve_container(
+        book_path,
+        kind,
+        None,
+        container.zip_dir_prefix.as_deref(),
+        selected_source,
+    ) {
         Ok(mut cover) => {
+            cover.persistent_source =
+                source_for_location(book_path, &cover.signature_path, &cover.location);
             // File books are signed by the original file, never the converted ZIP.
             if kind != BookKind::Folder {
                 cover.signature_path = book_path.to_owned();
@@ -219,6 +300,17 @@ impl CoverResolver<'_> {
         kind: BookKind,
         selected: Option<&crate::thumb_loader::SelectedChildPin>,
     ) -> Result<ResolvedBookCover, CoverError> {
+        self.resolve_container(path, kind, selected, None, None)
+    }
+
+    fn resolve_container(
+        &mut self,
+        path: &Path,
+        kind: BookKind,
+        selected: Option<&crate::thumb_loader::SelectedChildPin>,
+        zip_prefix: Option<&str>,
+        source_override: Option<FolderPin>,
+    ) -> Result<ResolvedBookCover, CoverError> {
         // Reconstructing a cached child is not another folder-search level.
         // Each child repeats its own released selection at folder_thumb_depth;
         // only a repeated owner terminates the cached reconstruction chain.
@@ -246,24 +338,65 @@ impl CoverResolver<'_> {
                 epub_read: None,
                 pdf_password: None,
                 preloaded_bytes: None,
+                persistent_source: source_for_location(
+                    path,
+                    path,
+                    &ReadLocation::File(path.to_owned()),
+                ),
+                rotation_key: crate::edit_source::caption_rotation_key(
+                    &ReadLocation::File(path.to_owned()),
+                    self.env.books_root.as_deref(),
+                ),
+                cover_crop: None,
             });
         }
-        let item = kind.grid_item(path);
-        let source = if let Some(selected) = selected {
-            Some(
-                source_for_selected_pin(&selected.container, &selected.target)
-                    .ok_or(BookCoverFailure::ReadFailed)?,
-            )
+        let pin_container = zip_prefix.map_or_else(
+            || path.to_owned(),
+            |prefix| book_container_key(path, prefix),
+        );
+        let item = if let Some(prefix) = zip_prefix {
+            GridItem::ZipDir {
+                zip_path: path.to_owned(),
+                dir_prefix: prefix.to_owned(),
+                is_archive: false,
+                representative: None,
+            }
         } else {
-            self.env.pin_db.as_ref().and_then(|db| db.lookup(path))
+            kind.grid_item(path)
+        };
+        let source = if source_override.is_some() {
+            source_override
+        } else if let Some(selected) = selected {
+            Some(FolderPin {
+                source: source_for_selected_pin(&selected.container, &selected.target)
+                    .ok_or(BookCoverFailure::ReadFailed)?,
+                cover_crop: {
+                    let mut request = LoadRequest::default();
+                    selected.target.assign_to_load_request(
+                        &mut request,
+                        "cover-resolution",
+                        PinKeyMode::Exact,
+                        None,
+                    );
+                    request.cover_crop
+                },
+            })
+        } else {
+            self.env
+                .pin_db
+                .as_ref()
+                .and_then(|db| db.lookup(&pin_container))
         };
         let mut pins = HashMap::new();
         if let Some(source) = source.as_ref() {
-            pins.insert(crate::path_key::normalize_keep_drive(path), source.clone());
+            pins.insert(
+                crate::path_key::normalize_keep_drive(&pin_container),
+                source.clone(),
+            );
         }
         let target = source.as_ref().and_then(|source| {
             resolve_pin_target_cascaded(
-                path,
+                &pin_container,
                 source,
                 self.env.pin_db.as_deref(),
                 self.env.folder_thumb_depth as usize,
@@ -334,6 +467,21 @@ impl CoverResolver<'_> {
             true,
             &self.env.visibility,
         )
+        .or_else(|| {
+            zip_prefix.map(|prefix| LoadRequest {
+                path: converted
+                    .get(&crate::path_key::normalize_keep_drive(path))
+                    .and_then(ConvertedArchiveSourceState::load_path)
+                    .unwrap_or(path)
+                    .to_owned(),
+                zip_dir_prefix: Some(prefix.to_owned()),
+                resolve_override: Some(ResolveStrategy::ZipDirRepresentative),
+                folder_thumb_sort: Some(self.env.folder_thumb_sort),
+                folder_thumb_depth: self.env.folder_thumb_depth,
+                file_type_visibility: self.env.visibility.clone(),
+                ..Default::default()
+            })
+        })
         .ok_or(BookCoverFailure::ReadFailed)?;
         // The selected cached row owns its exact fixed page/entry. The synthetic
         // source above feeds that position back through the released App planner.
@@ -406,7 +554,11 @@ impl CoverResolver<'_> {
                     .pin
                     .as_ref()
                     .map_or(selected.container.as_path(), |pin| pin.container.as_path());
-                return self.resolve(child, BookKind::for_path(child), selected.pin.as_ref());
+                let mut cover =
+                    self.resolve(child, BookKind::for_path(child), selected.pin.as_ref())?;
+                cover.persistent_source =
+                    source_for_location(path, &cover.signature_path, &cover.location);
+                return Ok(cover);
             }
             let physical_path = match &resolved.location {
                 ReadLocation::File(path) => path,
@@ -454,6 +606,12 @@ impl CoverResolver<'_> {
                 read = Some(target);
             }
             return Ok(ResolvedBookCover {
+                persistent_source: source_for_location(path, &logical_path, &resolved.location),
+                rotation_key: crate::edit_source::caption_rotation_key(
+                    &resolved.location,
+                    self.env.books_root.as_deref(),
+                ),
+                cover_crop: resolved.cover_crop,
                 location: resolved.location,
                 signature_path: logical_path,
                 signature,
@@ -538,6 +696,30 @@ fn source_for_selected_pin(
     })
 }
 
+/// Build persistence from structured leaf data. `cover_ref` is presentation text
+/// and deliberately never participates in reconstructing a pin.
+fn source_for_location(
+    container: &Path,
+    logical: &Path,
+    location: &ReadLocation,
+) -> FolderPinSource {
+    let rel = relative_ref(container, logical);
+    match location {
+        ReadLocation::ArchiveEntry { entry, .. } => FolderPinSource::ZipEntry {
+            zip_rel: rel,
+            entry: entry.clone(),
+        },
+        ReadLocation::PdfPage { page, .. } => FolderPinSource::PdfPage {
+            pdf_rel: rel,
+            page: *page,
+        },
+        _ => FolderPinSource::File {
+            rel,
+            kind: FileKind::Image,
+        },
+    }
+}
+
 fn file_signature(path: &Path) -> Result<FileSignature, BookCoverFailure> {
     let metadata = std::fs::metadata(path).map_err(|_| BookCoverFailure::Missing)?;
     FileSignature::from_metadata(&metadata).ok_or(BookCoverFailure::ReadFailed)
@@ -579,6 +761,121 @@ mod tests {
     use std::cell::RefCell;
     use std::io::Write;
     use tempfile::TempDir;
+
+    #[test]
+    fn book_cover_logical_zipdir_returns_persistent_leaf_and_effective_crop() {
+        let tmp = TempDir::new().unwrap();
+        let zip = tmp.path().join("book.zip");
+        write_zip(&zip, &["chapter/001.jpg", "chapter/cover.jpg", "other.jpg"]);
+        let env = pin_env(&tmp);
+        let container = BookCoverContainer {
+            path: zip.clone(),
+            kind: BookKind::Zip,
+            zip_dir_prefix: Some("chapter/".into()),
+        };
+        let crop = CoverCrop::new([0, 0, 450_000, 1_000_000]).unwrap();
+        let source = FolderPinSource::ZipEntry {
+            zip_rel: String::new(),
+            entry: "chapter/cover.jpg".into(),
+        };
+        env.pin_db
+            .as_ref()
+            .unwrap()
+            .set_with_cover_crop(&container.pin_container(), &source, crop)
+            .unwrap();
+        let cover = readable(resolve_logical_book_cover(&container, None, &env));
+        assert_eq!(cover.persistent_source, source);
+        assert_eq!(cover.cover_crop, crop);
+        assert_eq!(
+            cover.rotation_key,
+            Some(crate::adjustment_db::zip_entry_key(
+                &zip,
+                "chapter/cover.jpg"
+            ))
+        );
+        assert!(
+            matches!(cover.location, ReadLocation::ArchiveEntry { archive, entry } if archive == zip && entry == "chapter/cover.jpg")
+        );
+    }
+
+    #[test]
+    fn book_cover_logical_zipdir_automatic_selection_uses_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let zip = tmp.path().join("book.zip");
+        write_zip(
+            &zip,
+            &["000.jpg", "chapter/first.jpg", "chapter/second.jpg"],
+        );
+        let container = BookCoverContainer {
+            path: zip,
+            kind: BookKind::Zip,
+            zip_dir_prefix: Some("chapter/".into()),
+        };
+        let cover = readable(resolve_logical_book_cover(&container, None, &pin_env(&tmp)));
+        assert_eq!(
+            cover.persistent_source,
+            FolderPinSource::ZipEntry {
+                zip_rel: String::new(),
+                entry: "chapter/first.jpg".into()
+            }
+        );
+        assert_eq!(cover.cover_crop, None);
+    }
+
+    #[test]
+    fn book_cover_cascade_rebases_leaf_and_keeps_child_crop() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("book");
+        std::fs::create_dir_all(root.join("child")).unwrap();
+        std::fs::write(root.join("child/cover.jpg"), b"fixture").unwrap();
+        let env = pin_env(&tmp);
+        let db = env.pin_db.as_ref().unwrap();
+        let crop = CoverCrop::new([50_000, 0, 600_000, 1_000_000]).unwrap();
+        db.set_with_cover_crop(
+            &root.join("child"),
+            &FolderPinSource::File {
+                rel: "cover.jpg".into(),
+                kind: FileKind::Image,
+            },
+            crop,
+        )
+        .unwrap();
+        db.set(
+            &root,
+            &FolderPinSource::File {
+                rel: "child".into(),
+                kind: FileKind::Folder,
+            },
+        )
+        .unwrap();
+        let cover = readable(resolve_book_cover(&root, BookKind::Folder, &env));
+        assert_eq!(
+            cover.persistent_source,
+            FolderPinSource::File {
+                rel: "child/cover.jpg".into(),
+                kind: FileKind::Image
+            }
+        );
+        assert_eq!(cover.cover_crop, crop);
+        let selected = readable(resolve_logical_book_cover(
+            &BookCoverContainer {
+                path: root.clone(),
+                kind: BookKind::Folder,
+                zip_dir_prefix: None,
+            },
+            Some(cover.persistent_source.clone().into()),
+            &env,
+        ));
+        assert_eq!(
+            selected.cover_crop, crop,
+            "explicit same-page entry inherits the cascade's effective crop"
+        );
+        // Clearing at the parent makes a direct leaf pin; it must not edit the child row.
+        db.set_with_cover_crop(&root, &cover.persistent_source, None)
+            .unwrap();
+        assert_eq!(db.lookup(&root).unwrap().cover_crop, None);
+        assert_eq!(db.lookup(&root.join("child")).unwrap().cover_crop, crop);
+    }
 
     struct PdfFixture {
         path: PathBuf,
@@ -901,6 +1198,58 @@ mod tests {
     }
 
     #[test]
+    fn book_cover_converted_zipdir_keeps_logical_pin_source_and_physical_bytes() {
+        let _data = crate::data_dir::TestDataDirGuard::new();
+        let tmp = TempDir::new().unwrap();
+        let original = tmp.path().join("book.7z");
+        let converted = tmp.path().join("converted.zip");
+        std::fs::write(&original, b"original sevenz").unwrap();
+        write_zip(&converted, &["chapter/first.jpg", "chapter/fixed.jpg"]);
+        let metadata = std::fs::metadata(&original).unwrap();
+        let cache = Arc::new(crate::archive_cache::ArchiveCacheDb::open().unwrap());
+        cache
+            .record(
+                &original,
+                crate::ui_helpers::mtime_secs(&metadata),
+                metadata.len() as i64,
+                ArchiveFormat::SevenZ,
+                &converted,
+                std::fs::metadata(&converted).unwrap().len() as i64,
+                2,
+                false,
+            )
+            .unwrap();
+        let mut env = pin_env(&tmp);
+        env.archive_cache = Some(cache);
+        let container = BookCoverContainer {
+            path: original.clone(),
+            kind: BookKind::Archive(ArchiveFormat::SevenZ),
+            zip_dir_prefix: Some("chapter/".into()),
+        };
+        let crop = CoverCrop::new([0, 0, 400_000, 1_000_000]).unwrap();
+        let source = FolderPinSource::ZipEntry {
+            zip_rel: String::new(),
+            entry: "chapter/fixed.jpg".into(),
+        };
+        env.pin_db
+            .as_ref()
+            .unwrap()
+            .set_with_cover_crop(&container.pin_container(), &source, crop)
+            .unwrap();
+        let cover = readable(resolve_logical_book_cover(&container, None, &env));
+        assert_eq!(cover.signature_path, original);
+        assert_eq!(cover.persistent_source, source);
+        assert_eq!(cover.cover_crop, crop);
+        assert_eq!(
+            cover.preloaded_bytes.as_deref(),
+            Some(b"chapter/fixed.jpg".as_slice())
+        );
+        assert!(
+            matches!(cover.location,ReadLocation::ArchiveEntry {archive,..} if archive==converted)
+        );
+    }
+
+    #[test]
     fn book_cover_direct_rar_uses_original_book_identity() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("testdata/archives/rar-multipart-filename-regression/○×△□ Vol.2.rar");
@@ -995,6 +1344,17 @@ mod tests {
                 assert_eq!(cover.cover_ref, "#page=0");
                 assert_eq!(cover.signature, source_signature(source).unwrap());
                 assert_ne!(cover.signature, file_signature(&path).unwrap());
+                assert_eq!(
+                    cover.persistent_source,
+                    FolderPinSource::PdfPage {
+                        pdf_rel: String::new(),
+                        page: 0
+                    }
+                );
+                assert_eq!(
+                    cover.rotation_key,
+                    Some(crate::edit_source::page_key_for_pdf(&path, 0))
+                );
                 assert_eq!(cover.epub_read.unwrap().display_source_state, Some(source));
             },
         );
@@ -1025,7 +1385,7 @@ mod tests {
             crate::catalog::FolderThumbProvenance::Seeded,
         )
         .unwrap();
-        let key = crate::thumb_loader::pinned_folder_row_key(&base, &target.source_id, None);
+        let key = target.pinned_cache_key(&base, PinKeyMode::Exact, None);
         let catalog =
             crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &root).unwrap();
         catalog
@@ -1068,7 +1428,7 @@ mod tests {
         };
         env.pin_db.as_ref().unwrap().set(&zip, &source).unwrap();
         let target = resolve_pin_target_cascaded(&zip, &source, env.pin_db.as_deref(), 3).unwrap();
-        let key = format!("zipthumb:child.zip#pin:{}", target.source_id);
+        let key = target.pinned_cache_key("zipthumb:child.zip", PinKeyMode::Exact, None);
         let catalog =
             crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &root).unwrap();
         catalog
@@ -1122,7 +1482,7 @@ mod tests {
             crate::catalog::FolderThumbProvenance::Seeded,
         )
         .unwrap();
-        let key = crate::thumb_loader::pinned_folder_row_key(&base, &target.source_id, None);
+        let key = target.pinned_cache_key(&base, PinKeyMode::Exact, None);
         let catalog =
             crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &root).unwrap();
         catalog
@@ -1213,11 +1573,7 @@ mod tests {
         )
         .unwrap();
         let grandchild_key = crate::thumb_loader::representative_cache_key_for_policy(
-            &crate::thumb_loader::pinned_folder_row_key(
-                &grandchild_base,
-                &pdf_target.source_id,
-                None,
-            ),
+            &pdf_target.pinned_cache_key(&grandchild_base, PinKeyMode::Exact, None),
             &env.visibility,
         );
         let child_catalog = crate::catalog::CatalogDb::open(&cache_dir, &child).unwrap();
@@ -1264,11 +1620,7 @@ mod tests {
         )
         .unwrap();
         let child_key = crate::thumb_loader::representative_cache_key_for_policy(
-            &crate::thumb_loader::pinned_folder_row_key(
-                &child_base,
-                &hidden_target.source_id,
-                None,
-            ),
+            &hidden_target.pinned_cache_key(&child_base, PinKeyMode::Exact, None),
             &env.visibility,
         );
         let parent_catalog = crate::catalog::CatalogDb::open(&cache_dir, &root).unwrap();

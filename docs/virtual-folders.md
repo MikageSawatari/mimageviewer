@@ -1103,11 +1103,27 @@ worker を再起動しない。archive 候補が desired scope から外れて s
 
 #### 3.1.1 親コンテナの代表サムネピン (folder thumb pin、v0.9.x)
 
+§1.764 の手動表紙範囲は `cover_crop_x0/y0/x1/y1`（ppm 整数）と
+`cover_crop_source`（`kind|rel|entry|page` の束縛）を既存表へ加法 migration で追加する。
+IMMEDIATE transaction 内で列を調べ、欠けた列だけを追加する。readonly は旧 schema を範囲なしで読む。
+単一 decoder で座標・leaf 資格・束縛を検査し、不正な範囲はログを出して無視するがピンは保持する。
+読み取りは `FolderPin { source, cover_crop }`。通常の `set` は範囲を消し、
+`set_with_cover_crop` は leaf と範囲を一度に UPSERT、`clear_cover_crop` は固定を残す。
+同じ leaf の名前変更・ZIP キー移行・画像フォルダの ZIP 化は、変更前に有効だった範囲だけを再束縛する。
+metadata bundle は v13 に範囲を追加し、v7〜v12 の取り込みを維持する。書き出しも decoder を通す。
+直接 leaf の範囲あり identity は `kind|rel|entry|page|crop:x0,y0,x1,y1|mtime|size`。
+直接の ZipDir/ZipEntry は `zipdir:{prefix}#pin:{entry}|crop:x0,y0,x1,y1`。
+cascade は leaf の範囲を route hash に含める。範囲なしの綴りは変更しない。
+キー生成と要求設定は `ResolvedPinTarget` の helper へ統一し、ドライブの近似では範囲を含めない。
+基本キーの正規化は `|types:`・`|autocrop:` を除去して設定を付け直し、pin と EPUB generation を保持する。
+第1段では自動 identity は出力しない。存続集合は手動範囲付きの完成キーも含める。
+
 ユーザーが「このフォルダ / ZIP / PDF / 変換済み RAR・7z・LZH の代表サムネは中の特定アイテム」を手動で指定
 できる機能。優先順位は **手動ピン > 自動代表選定 > フォルダ/ZIP/PDF/アーカイブアイコン**。
 
 - **DB**: `%APPDATA%/mimageviewer/folder_thumb_pins.db` (`folder_thumb_pins.rs`)。
-  schema は `(container_key, source_kind, source_rel, source_entry, source_page)`。
+  基本列は `(container_key, source_kind, source_rel, source_entry, source_page)`、
+  表紙範囲の追加列は上記 §1.764 のとおり。
   container_key は `path_key::normalize_keep_drive` で正規化。`source_kind` は
   `image` / `video` / `folder` / `zipfile` / `pdffile` / `archive` / `zipentry` / `zipdir` /
   `pdfpage` で、`zipdir` は `source_entry` に ZIP 内 prefix を保存する。
@@ -1155,7 +1171,7 @@ worker を再起動しない。archive 候補が desired scope から外れて s
   → A の親グリッドでの A のタイルは C を表示する。同様に、親フォルダが book.zip /
   book.pdf や変換済み archive を pin し、その ZIP/PDF/archive が page 2 を pin していれば、
   親も page 2 とその編集
-  preview を表示する。子側に pin がなければ従来どおり ZIP / 変換済み archive の先頭画像、
+  preview を表示する（代表専用の範囲がある場合は元画像の切り出しと個別色調補正）。子側に pin がなければ従来どおり ZIP / 変換済み archive の先頭画像、
   PDF のページ 0 へフォールバックする。ZIP 内でも、外側 root + ZipDir prefix を合成した仮想 container
   key で lookup し、子の `ZipEntry` / `ZipDir` pin を同じ規則で辿る。
   cascade の段数上限は `Settings.folder_thumb_depth` (規定 3、範囲 0〜10) に揃える

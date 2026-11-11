@@ -69,7 +69,7 @@ pub(crate) struct ContextResult {
     pub(crate) tags_cache: Option<HashMap<String, Vec<String>>>,
     pub(crate) current_rating: Option<u8>,
     pub(crate) page_state: Option<PageStateResult>,
-    pub(crate) folder_pin_map: Option<HashMap<String, crate::folder_thumb_pins::FolderPinSource>>,
+    pub(crate) folder_pin_map: Option<HashMap<String, crate::folder_thumb_pins::FolderPin>>,
     pub(crate) folder_pin_materializations: Option<super::pin_materialization::Prepared>,
     pub(crate) video_pin_blobs: Option<HashMap<PathBuf, Vec<u8>>>,
     pub(crate) video_items: Option<Vec<(usize, PathBuf, u64)>>,
@@ -1312,7 +1312,8 @@ mod tests {
             context
                 .folder_pin_map
                 .as_ref()
-                .and_then(|pins| pins.get(&literal_key)),
+                .and_then(|pins| pins.get(&literal_key))
+                .map(|pin| &pin.source),
             Some(&source)
         );
         assert!(context.video_pin_blobs.as_ref().unwrap().is_empty());

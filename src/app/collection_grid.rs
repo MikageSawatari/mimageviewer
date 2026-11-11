@@ -295,7 +295,13 @@ pub(in crate::app) fn prepare_collection_grid_thumbnail_sources(
         hash_collection_thumbnail_identity_part(&mut digest, source.db_kind().as_bytes());
         hash_collection_thumbnail_identity_part(&mut digest, source.rel().as_bytes());
         use crate::folder_thumb_pins::FolderPinSource;
-        match source {
+        if let Some(crop) = source.cover_crop {
+            digest.update(b"cover-crop\0");
+            for value in crop.values() {
+                digest.update(value.to_le_bytes());
+            }
+        }
+        match &source.source {
             FolderPinSource::ZipEntry { entry, .. } => {
                 hash_collection_thumbnail_identity_part(&mut digest, entry.as_bytes())
             }
@@ -3695,10 +3701,7 @@ impl App {
         selected: Option<usize>,
         video_sidecars: std::collections::HashMap<String, std::path::PathBuf>,
         video_pin_blobs: Arc<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>,
-        folder_pin_map: std::collections::HashMap<
-            String,
-            crate::folder_thumb_pins::FolderPinSource,
-        >,
+        folder_pin_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin>,
         folder_pin_cache: std::collections::HashMap<String, crate::catalog::CacheEntry>,
         collection_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
         auto_aspect_eligible_total: usize,
@@ -5663,6 +5666,11 @@ mod tests {
                 },
             ),
         ]);
+        let expected: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin> =
+            expected
+                .into_iter()
+                .map(|(key, source)| (key, source.into()))
+                .collect();
         for path in [&folder, &zip, &pdf, &archive, &epub] {
             app.folder_thumb_pin_db
                 .as_ref()
@@ -5794,6 +5802,11 @@ mod tests {
                 page: 7,
             },
         )]);
+        let sibling_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin> =
+            sibling_map
+                .into_iter()
+                .map(|(key, source)| (key, source.into()))
+                .collect();
         let expected_sibling = sibling_map.clone();
         let sibling = app.build_window_context_for_test(1307, move |context| {
             context.folder_pin_map = sibling_map;
@@ -5969,7 +5982,8 @@ mod tests {
             FolderPinSource::PdfPage {
                 pdf_rel: String::new(),
                 page: 1,
-            },
+            }
+            .into(),
         );
         let pinned = prepare(sources.clone()).presentation.identity();
         assert_ne!(pinned, empty);
@@ -5978,9 +5992,35 @@ mod tests {
             FolderPinSource::PdfPage {
                 pdf_rel: String::new(),
                 page: 2,
-            },
+            }
+            .into(),
         );
         assert_ne!(prepare(sources.clone()).presentation.identity(), pinned);
+        let uncropped = prepare(sources.clone()).presentation.identity();
+        sources
+            .folder_pin_map
+            .get_mut("container")
+            .unwrap()
+            .cover_crop =
+            crate::folder_thumb_pins::CoverCrop::new([0, 0, 500_000, 1_000_000]).unwrap();
+        let cropped = prepare(sources.clone()).presentation.identity();
+        assert_ne!(
+            cropped, uncropped,
+            "crop changes must retire the accepted source identity"
+        );
+        sources
+            .folder_pin_map
+            .get_mut("container")
+            .unwrap()
+            .cover_crop =
+            crate::folder_thumb_pins::CoverCrop::new([500_000, 0, 1_000_000, 1_000_000]).unwrap();
+        assert_ne!(prepare(sources.clone()).presentation.identity(), cropped);
+        sources
+            .folder_pin_map
+            .get_mut("container")
+            .unwrap()
+            .cover_crop = None;
+        assert_eq!(prepare(sources.clone()).presentation.identity(), uncropped);
         let seed = super::super::smart_folder::PreparedVideoFolderPinSeed {
             cache_key: "seed#pin:key".into(),
             video_path: PathBuf::from("clip.mp4"),
@@ -8763,7 +8803,14 @@ mod tests {
         assert_eq!(app.current_folder.as_deref(), Some(cached.as_path()));
         assert_eq!(app.address, zip_path.to_string_lossy());
         assert_eq!(app.pin_container_key().as_deref(), Some(zip_path.as_path()));
-        assert_eq!(app.folder_thumb_pin_for(&zip_path), Some(&logical_pin));
+        assert_eq!(
+            app.folder_thumb_pin_for(&zip_path).map(|pin| &pin.source),
+            Some(&logical_pin)
+        );
+        assert_eq!(
+            app.folder_thumb_pin_for(&zip_path).unwrap().cover_crop,
+            None
+        );
         assert!(matches!(
             app.folder_history_back_target(),
             Some(super::super::FolderNavHistoryTarget::Collection(restore))

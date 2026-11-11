@@ -580,6 +580,7 @@ fn decode_remote_source(
             None,
             cover,
             None,
+            None,
         );
     } else {
         crate::thumb_loader::process_load_request(

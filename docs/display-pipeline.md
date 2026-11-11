@@ -503,7 +503,7 @@ load 時に失効する。削除／全消去通知を受けた UI も、メモ�
 必要があるため、従来どおり必ず失効を通知する。この二つの削除契約は service command で区別する。
 
 親コンテナの代表サムネイルを手動 pin した場合も、cascade 解決後の leaf が固定の
-Image / ZipEntry / PdfPage なら同じ preview を通常 catalog より優先する。直接ページは
+Image / ZipEntry / PdfPage で代表専用の範囲が無ければ同じ preview を通常 catalog より優先する。直接ページは
 page mtime + size、ZIP/PDF の親代表は保存 worker が記録した container size と thumbnail
 worker が読んだ現在の container mtime + size で stale 判定する。変換アーカイブでは元
 アーカイブではなく、実際にページを読んだ cache ZIP の key / identity を使う。編集 preview
@@ -522,6 +522,16 @@ SQLite 更新、LRU prune はすべて専用 worker 上で行い、UI スレッ�
 
 ### 1.3.2 親コンテナの代表サムネ — 優先順位
 
+手動の表紙範囲（§1.764）は leaf の EXIF 適用後・保存回転前の ppm 座標をピンに保持する。
+`ResolvedPinTarget` の helper がキーと `LoadRequest.cover_crop` を同時に設定する。
+範囲付きは編集 preview を使わず、元寸法確定と類似画像索引への raster offer の後、縮小前に切る。
+JPEG DCT と PDF render の目標を範囲に応じて広げ、WIC・image crate・Susie は既存の全体デコードを維持する。
+`source_dims` は元寸法に範囲を写像した幅・高さ、`layout_dims` は None。ページの見開き寸法へは登録しない。
+個別色調補正と `CoverIdentity::Page` の描画時回転は維持する。閲覧・ページ一覧には範囲を適用しない。
+子の Image ピンは範囲もフォルダの自動代表へ渡す。子の完成済み行を流用する場合は子の writer と同じキーで読む。
+種類除外等の代替要求は範囲付きキーを引き継がず、自身のキーへ保存する。
+ドライブ一覧は範囲・自動 identity のない近似行だけを参照し、Remote の本タイルは既存のピン省略を維持する。
+
 §1.697 の `thumb_container_type_icon_only`（既定 OFF）が ON の間、一覧の対象コンテナは
 共通判定で表示・レイアウトを既存の `NoArt` に置き換え、一覧由来の代表要求と idle 高画質化を省く。
 要求中の owner、固定・キャッシュは保持し、自動比率とスクロールの画像待ち集計からは除く。
@@ -537,8 +547,8 @@ OFF への復帰は現在の App 一覧の対象 `NoArt` を `Pending` に戻す
    kind/rel/entry/page/mtime/size の compact 表現、子のフォルダ / ZIP / PDF / ZipDir に
    さらに代表 pin があれば、最終ページまでの経路 hash + leaf identity になる。pin の
    付け替え、途中コンテナ、target ファイルの変更で source_id が自動的に変わるので
-   古い WebP を catch しない。固定 leaf が Image / ZipEntry / PdfPage なら、そのページの
-   編集 preview と個別色調補正も親コンテナまで引き継ぐ。詳細:
+   古い WebP を catch しない。固定 leaf が Image / ZipEntry / PdfPage なら個別色調補正を親コンテナまで引き継ぎ、
+   代表専用の範囲が無い場合はそのページの編集 preview も引き継ぐ。詳細:
    [virtual-folders.md §3.1.1](virtual-folders.md#311-親コンテナの代表サムネピン-folder-thumb-pinv09x)。
 2. **自動代表選定 (`resolve_folder_thumb_image`)** — Settings の `folder_thumb_sort`
    (Numeric / Modified / etc.) + `folder_thumb_depth` (再帰深さ) で先頭画像を選び、

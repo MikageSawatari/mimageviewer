@@ -1052,11 +1052,12 @@ fn apply_supported_folder_pin(
     ) else {
         return;
     };
-    request.cache_key_override = Some(format!(
-        "{base_key}{}{}",
-        crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
-        resolved.source_id
-    ));
+    resolved.assign_to_load_request(
+        request,
+        &base_key,
+        crate::folder_thumb_pins::PinKeyMode::Exact,
+        None,
+    );
     request.path = resolved.abs_path;
     request.mtime = resolved.mtime;
     request.file_size = resolved.file_size;
@@ -1372,6 +1373,81 @@ mod tests {
             .unwrap();
         let decoded = image::load_from_memory(&bytes).unwrap();
         assert_eq!((decoded.width(), decoded.height()), (8, 8));
+    }
+
+    #[test]
+    fn remote_image_folder_pin_uses_manual_crop_key_and_pixels_without_changing_page() {
+        use crate::folder_thumb_pins::{CoverCrop, FileKind, FolderPinSource};
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let root = data.path().join("remote-cover-crop");
+        std::fs::create_dir_all(&root).unwrap();
+        let page = root.join("cover.png");
+        image::RgbImage::from_fn(12, 8, |x, _| {
+            image::Rgb(if x < 6 { [220, 20, 20] } else { [20, 20, 220] })
+        })
+        .save(&page)
+        .unwrap();
+        let db = crate::folder_thumb_pins::FolderThumbPinDb::open_at(&data.path().join("pins.db"))
+            .unwrap();
+        let source = FolderPinSource::File {
+            rel: "cover.png".into(),
+            kind: FileKind::Image,
+        };
+        let crop = CoverCrop::new([500_000, 0, 1_000_000, 1_000_000])
+            .unwrap()
+            .unwrap();
+        db.set_with_cover_crop(&root, &source, Some(crop)).unwrap();
+        let mut request = crate::thumb_loader::LoadRequest {
+            path: root.clone(),
+            folder_thumb_sort: Some(crate::settings::SortOrder::Numeric),
+            folder_thumb_depth: 3,
+            ..Default::default()
+        };
+        apply_supported_folder_pin(&mut request, &root, Some(&db));
+        assert_eq!(request.cover_crop, Some(crop));
+        let crop_key = crate::thumb_loader::cache_key_for_request(&request)
+            .unwrap()
+            .into_owned();
+        assert!(crop_key.contains("|crop:500000,0,1000000,1000000"));
+        assert!(!crop_key.contains("|autocrop:"));
+        let settings = crate::settings::Settings {
+            cache_policy: crate::settings::CachePolicy::Always,
+            ..Default::default()
+        };
+        let engine = ThumbnailEngine::new(settings);
+        let mut context = WorkerContext::without_databases();
+        context.folder_pin_db = Some(db);
+        let folder = resolve_existing(root.to_string_lossy().as_ref()).unwrap();
+        let bytes = engine
+            .generate_catalog_resolved(&folder, 64, &context)
+            .unwrap();
+        let image = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((image.width(), image.height()), (6, 8));
+        let color = image.to_rgb8().get_pixel(0, 0).0;
+        assert!(color[2] > color[0]);
+        let physical_page = resolve_existing(page.to_string_lossy().as_ref()).unwrap();
+        let bytes = engine
+            .generate_catalog_resolved(&physical_page, 64, &context)
+            .unwrap();
+        let image = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((image.width(), image.height()), (12, 8));
+        context
+            .folder_pin_db
+            .as_ref()
+            .unwrap()
+            .clear_cover_crop(&root)
+            .unwrap();
+        let mut uncropped = crate::thumb_loader::LoadRequest {
+            folder_thumb_sort: Some(crate::settings::SortOrder::Numeric),
+            folder_thumb_depth: 3,
+            ..Default::default()
+        };
+        apply_supported_folder_pin(&mut uncropped, &root, context.folder_pin_db.as_ref());
+        assert_eq!(uncropped.cover_crop, None);
+        assert_ne!(
+            crate::thumb_loader::cache_key_for_request(&uncropped).unwrap(),
+            crop_key
+        );
     }
 
     #[test]

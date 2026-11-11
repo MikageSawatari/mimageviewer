@@ -752,7 +752,7 @@ pub(crate) struct CollectionGridThumbnailSources {
     pub(crate) video_sidecars: std::collections::HashMap<String, PathBuf>,
     pub(crate) video_pin_blobs: std::sync::Arc<std::collections::HashMap<PathBuf, Vec<u8>>>,
     pub(crate) folder_pin_map:
-        std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+        std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin>,
     pub(crate) video_folder_pin_seeds: std::sync::Arc<
         Vec<(
             super::smart_folder::PreparedVideoFolderPinSeed,

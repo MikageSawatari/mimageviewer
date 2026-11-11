@@ -1767,7 +1767,7 @@ pub(in crate::app) struct ViewerContextBundle {
     current_folder_watch_failed: Option<PathBuf>,
     external_rescan_pending: Option<ExternalRescanPending>,
     folder_refresh_pending: Option<book_append_refresh::FolderRefreshRequest>,
-    folder_pin_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    folder_pin_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin>,
     converted_archive_cache_paths: std::collections::HashMap<String, ConvertedArchiveSourceState>,
     converted_archive_pin_root_states:
         std::collections::HashMap<String, ConvertedArchivePinRootState>,

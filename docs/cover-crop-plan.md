@@ -508,3 +508,59 @@ ZipPlaFork (commit 07955f52、**AGPL v3**) の公開コードを読んだ結果�
 - r3 の 6 項目はすべて解消。新しい設計上の問題なし。
 - 実装担当への注記: 子の手動 / 自動 / 対象外ごとの key 一致、代替要求の指示の保持、`|types:`・`|autocrop:`・`|generation:` の
   正規化と存続集合を回帰テストで確かめる。解析倍率の安定性と §1.742 は §12.7 のとおり。
+
+## 15. 第1段（手動）の実装と検証（2026-11-11）
+
+- 対象は §4〜§11 の手動範囲。§12 の自動判定・設定・自動 identity の出力は未実装。
+- ピンの加法 schema 移行、束縛の decoder、同じ leaf の改名／ZIP 移行／画像フォルダ ZIP 化、
+  bundle v13 と v7〜v12 の受け入れ、leaf／cascade／ZipDir の helper、worker 切り出し、両方のメニュー入口と modal を接続した。
+- 元画像、ページ一覧、閲覧・編集・書き出しの要求には範囲を付けない。ドライブは範囲のない近似キーを使い、
+  最新行を選ぶ SQL の LIMIT より前に範囲・自動 identity のある行を除く。
+- 本体の source map、コレクション digest、色フィルタ、インポート後の pin refresh も `FolderPin` に追従。
+  detached 関連は bundle の map 型変更だけで、述語・viewport routing を変更しない。
+
+### 15.1 前提の食い違いと判断
+
+- §6.2 の WIC 縮小デコードという旧記述は、利用者承認の `1710930a0` で訂正した。
+  WIC・image crate・Susie は従来の全体デコードの後に切り、JPEG DCT と PDF render の目標だけを広げる。
+- source-only の既存 resolver 呼び出しとの互換性は `PinSpec` で保つ。実際の DB 読み取りと pin map は範囲を持つ `FolderPin` に統一する。
+  有効な Image／ZipEntry かどうかの decoder は、起動時点の Susie 登録状況を参照せず、RAW・既知の動画／音声を除外する。
+- ZipDir の直接 ZipEntry 要求は既存の取得済み stamp から解決し、新しい UI stat を足さない。
+  直接ピンの特殊綴りと、子 ZipDir へ cascade した場合の経路 identity の綴りを維持する。
+- 在メモリ回転と同じ本棚判定を保つため、既定本棚パスの解決は worker に移す。
+  独立レビューで見つかった AI 説明文生成・表示側の兄弟 consumer も追従した。
+- Remote の Image／Folder ピンには手動範囲を渡す。Remote の個別色調補正キー未設定は既存の動作として維持する。
+- §1.742 は今回の範囲外。EPUB の worker 完成キーには generation が付く一方、現行の存続集合には pending キーだけが入り、
+  `delete_missing` で行が消える既存の境界を、範囲なし／手動範囲ありの両方で記録するテストを置いた。
+  Folder／ZIP／PDF の手動範囲の完成行は別の存続テストで検査する。
+
+### 15.2 検証の担当
+
+焦点テスト、UI snapshot、fmt・グリフ検査、通常 profile の確認用 build は実装担当が行う。
+lib 全件・test-full と実機確認は設計担当へ引き継ぐ。独立実装レビューは Sol / xhigh の別コンテキストで行い、
+既定本棚回転、200% の画像表示、入力エラーの可視性の指摘を修正後、静的レビュー・PNG の目視とも ACCEPT。
+
+- `cargo nextest run -p mimageviewer --lib -E 'test(/cover_crop|folder_thumb_pin|book_cover|representative_cache_key|remote_image_folder_pin|caption_rotation|cover_rotation_tests|cover_scope_tests|drive_list_pin|color_representative|collection_container_pin|metadata_transfer::tests::.*(version|pin)|zip_key_migration/)' --no-fail-fast`
+  — **193 成功 / 失敗 0**。`target/cover-crop-verified-focused.log`。
+- `cargo test -p mimageviewer --test ui_snapshot cover_crop`（新規2枚だけ更新）— **2 成功**。
+  `target/cover-crop-snapshots-revised.log`。100%/200%とも画像全体・handle・固定ボタンを目視。
+- 更新指定を外した `cargo test -p mimageviewer --test ui_snapshot` — **251 成功 / 失敗 0**。
+  `target/cover-crop-snapshots-compare.log`。既存 PNG の差分 0。
+- `cargo fmt`（引数なし）・`cargo fmt --check` 成功。`python scripts/check_ui_glyphs.py` は 0 件。
+  `python scripts/check_site_cards.py` は 53 枚検査・超過 0。
+- 初回の native 依存ビルドは MSBuild の並列実行で失敗し、`CARGO_BUILD_JOBS=1` で再実行して解消した。
+  反復中のテスト fixture の DirectImage 指定漏れと、v13 追加後のメッセージ期待値更新漏れも修正済み。
+  これらの失敗・compile-only 実行は成功件数に含めない。
+- `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` は同じ並列数で **成功（exit 0）**。
+  core・Remote・EPUB PDF・MCP・音楽ビデオ編集の5実行ファイルと依存 DLL を `target/dev-runtime/` に配置し、
+  PE 検査も成功（runtime=4 / pe=5）。`target/cover-crop-build-dev.log`。
+  `portable` は有効にせず、実行ファイルは起動していない。
+
+### 15.3 コミットの引き継ぎ
+
+実装担当が新規4ファイルを明示して `git add -- <paths>` を試したが、共通 Git 管理ディレクトリ
+`C:/home/mimageviewer/.git/worktrees/mimageviewer-764/index.lock` の作成をセッションの書き込み権限で拒否された。
+コミットは未作成で、ブランチは `feat-764-cover-crop`、HEAD は設計訂正 `1710930a0` のまま。
+変更は作業ツリーに保持し、今回の55パスだけを対象にする `target/cover-crop-commit.ps1` を用意した。
+PowerShell の構文検査は成功。権限のある端末で同スクリプトを実行すると、引数なしの `cargo fmt`、
+新規4ファイルの明示 add、pathspec commit を行う。merge・push・branch 切り替えは行わない。

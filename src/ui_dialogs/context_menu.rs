@@ -1580,6 +1580,20 @@ impl crate::app::App {
             layout: self.settings.context_menu_layout.clone(),
         };
         let mut nodes = crate::context_menu_model::build_context_menu(&input);
+        if target.surface == ContextMenuSurface::Grid
+            && !target.is_folder_context
+            && !target.has_checked
+            && let Some(idx) = target.item_index
+            && let Some(state) = self.cover_crop_menu_state(idx)
+        {
+            nodes.push(MenuNode::Separator);
+            nodes.push(MenuNode::Item {
+                command: MenuCommand::SpecifyCoverCrop,
+                label: state.label,
+                enabled: state.enabled,
+                disabled_reason: state.disabled_reason,
+            });
+        }
         // Native and fallback menus share this current-book operation. Checked
         // rows and page count do not determine whether an empty book can edit.
         if target.surface == ContextMenuSurface::Grid
@@ -1685,7 +1699,10 @@ impl crate::app::App {
                 crate::folder_thumb_pins::source_from_grid_item(container, &target.item)?,
             )
         };
-        let label = if self.folder_thumb_pin_for(&pin_container) == Some(&source) {
+        let label = if self
+            .folder_thumb_pin_for(&pin_container)
+            .is_some_and(|pin| pin.source == source)
+        {
             "📌 代表サムネ固定を解除"
         } else {
             "📌 代表サムネに固定"
@@ -2010,6 +2027,15 @@ impl crate::app::App {
             MenuCommand::ToggleRepresentativeThumb => {
                 if let Some(idx) = target.item_index {
                     self.toggle_folder_pin_for_idx(idx);
+                }
+                None
+            }
+            MenuCommand::SpecifyCoverCrop => {
+                if target.surface == ContextMenuSurface::Grid
+                    && !target.has_checked
+                    && let Some(idx) = target.item_index
+                {
+                    self.start_cover_crop_for_item(ctx, idx);
                 }
                 None
             }
@@ -3510,6 +3536,81 @@ mod caption_menu_tests {
                     .iter()
                     .map(|target| target.path().to_path_buf())
                     .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn cover_crop_native_and_egui_routes_start_before_menu_owner_is_cleared() {
+        use egui_kittest::kittest::Queryable;
+        let mut app = fixture(false);
+        let target = app.context_menu_target(
+            0,
+            app.items[0].clone(),
+            false,
+            false,
+            None,
+            ContextMenuSurface::Grid,
+            None,
+        );
+        assert!(matches!(
+            app.dispatch_native_context_menu_result(
+                &egui::Context::default(),
+                NativeContextMenuResult::MivCommand(MenuCommand::SpecifyCoverCrop),
+                &target
+            ),
+            NativeGridContextMenuOutcome::Consumed { .. }
+        ));
+        app.cover_crop_dialog
+            .as_ref()
+            .expect("native menu starts editor")
+            .finish_worker_for_test();
+        drop(app);
+        let app = fixture(false);
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1000.0, 1400.0))
+            .build_ui_state(
+                |ui, app: &mut crate::app::AppTestEnvForTest| {
+                    if app.context_menu_idx.is_some() {
+                        let _ = app.show_context_menu(ui.ctx());
+                    }
+                },
+                app,
+            );
+        harness.run_steps(4);
+        harness
+            .get_by_label("このページを代表にして範囲を指定…")
+            .click();
+        harness.run_steps(2);
+        assert!(harness.state().context_menu_idx.is_none());
+        harness
+            .state()
+            .cover_crop_dialog
+            .as_ref()
+            .expect("egui menu starts editor")
+            .finish_worker_for_test();
+    }
+
+    #[test]
+    fn cover_crop_menu_is_grid_only_including_detached_viewer_surface() {
+        let mut app = fixture(false);
+        for (surface, expected) in [
+            (ContextMenuSurface::Grid, true),
+            (ContextMenuSurface::Fullscreen, false),
+        ] {
+            let target =
+                app.context_menu_target(0, app.items[0].clone(), false, false, None, surface, None);
+            let nodes = app.context_menu_nodes(&target, false);
+            assert_eq!(
+                nodes.iter().any(|node| matches!(
+                    node,
+                    MenuNode::Item {
+                        command: MenuCommand::SpecifyCoverCrop,
+                        ..
+                    }
+                )),
                 expected
             );
         }
