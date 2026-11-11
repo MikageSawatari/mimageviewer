@@ -335,7 +335,7 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 
 ## 8. 種類ごとの選択 (§1.770)
 
-作成: 2026-11-11。状態: **設計中**。要望: 5ch >>764 (実フォルダだけをアイコンにし、書庫・PDF の表紙はそのまま見たい)。
+作成: 2026-11-11。状態: **設計レビュー r2 ACCEPT、実装中**。要望: 5ch >>764 (実フォルダだけをアイコンにし、書庫・PDF の表紙はそのまま見たい)。
 バックログ: [next-release-backlog.md §1.770](next-release-backlog.md)。
 
 ### 8.1 要件
@@ -511,3 +511,4 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
   要らないことは妥当と確認された。
 
 まれな失敗 (設定 DB の書き込み失敗など) は既定の割り切り方針に従い、追加の回復処理を設けない。
+- r2 (同、resume): ACCEPT。r1 の指摘の反映を確認、追加指摘なし。
