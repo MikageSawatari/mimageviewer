@@ -1,6 +1,8 @@
 # 一覧のコンテナを種類アイコンで表示する (§1.697)
 
 作成: 2026-11-08。状態: **実装・自動検証済み (設計レビュー r3 / 独立実装レビュー ACCEPT)、サブ PC の実機確認で NG なし (2026-11-09)、master 取り込み済み (2026-11-09、v5.1.0)**。対象版: v5.1.0 候補。
+
+**§1.770 (2026-11-11) で種類ごとの選択へ広げた。設定・判定・移行は §8 が正本。§1〜§7 の「ON」は §8 では「その項目の種類が選ばれている」と読み替える。**
 要望: 5ch >>728・730。バックログ: [next-release-backlog.md §1.697](next-release-backlog.md)。
 
 ## 1. 要件
@@ -330,3 +332,239 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
   詳細表示の hover プレビューは本で出ない、閲覧履歴・ドライブ一覧・Everything (OFF で同じ 5 件のまま表紙が戻る)、
   自動比率 (本だけのフォルダは 1:1 のまま待ちなし、混在フォルダは画像に合わせて 3:2)。ログに ERROR / WARN / panic なし。
   未確認: 本棚・コレクション・複数ウィンドウ・Remote (自動テストのみ)。結果は `C:\miv-subpc\results-24\`。
+
+## 8. 種類ごとの選択 (§1.770)
+
+作成: 2026-11-11。状態: **設計レビュー r2 ACCEPT、実装 (9e7c3a97b) の独立実装レビュー ACCEPT (2026-11-12)。実機未確認**。要望: 5ch >>764 (実フォルダだけをアイコンにし、書庫・PDF の表紙はそのまま見たい)。
+バックログ: [next-release-backlog.md §1.770](next-release-backlog.md)。
+
+### 8.1 要件
+
+- §1.697 の一括の切り替えを、**実フォルダ・書庫・PDF/EPUB の 3 種類**ごとに選べる形へ広げる。
+  拡張子ごとの設定、単体の画像・動画・音声への拡張はしない。
+- 新規の利用者と、旧設定 OFF の利用者は従来どおり代表画像 (3 種類とも未選択)。
+- 旧設定 ON の利用者は、更新後も旧設定の対象すべてがアイコンのまま (3 種類とも選択)。
+- 実フォルダだけを選んだとき、書庫・PDF/EPUB と書庫の中のフォルダ・書庫 (`ZipDir`) を巻き込まない。
+- 選択を外した種類だけ通常の取得に戻し、代表の固定・キャッシュ・一覧の場所・選択・スクロールを保つ。
+- §1〜§7 の構造 (1 つの判定、`NoArt` への射影、要求を作らない、画像待ちの集計から除く、
+  idle 高画質化から除く、hover を開かない、切り替えで一覧を読み直さない) はそのまま使う。
+
+### 8.2 種類の対応表
+
+判定は項目の種類 (`GridItem` の variant) だけで決める。開いている一覧の種類 (通常フォルダ・本棚・
+コレクション・検索結果など) やパスの中身は見ない。表は `grid_item::container_icon_kind` だけが持つ。
+
+| 項目 | 種類 | 理由 |
+| --- | --- | --- |
+| `Folder` (通常一覧・本棚・コレクションのフォルダ行・スマートフォルダ・閲覧履歴など) | 実フォルダ | ディスク上のフォルダ。画像フォルダを本として扱っている場合も同じ (下記) |
+| `Folder` (ドライブ一覧のドライブ) | 実フォルダ | ドライブはディスク上のフォルダの根。別の種類を設けるほどの差がない |
+| `SearchContainer { kind: Folder }` (検索結果の集約行) | 実フォルダ | ヒットを含む親フォルダのまとまり |
+| `ZipFile` | 書庫 | ZIP / CBZ |
+| `ConvertibleArchive` | 書庫 | RAR / 7z / LZH、入れ子書庫を含む ZIP |
+| `ZipDir` (`is_archive` が真 = 書庫の中の書庫、偽 = 書庫の中のフォルダ) | 書庫 | 書庫の一部。実フォルダだけを選んだときに巻き込まない (§8.1) |
+| `SearchContainer { kind: Zip }` | 書庫 | ヒットを含む ZIP のまとまり |
+| `PdfFile` (EPUB を含む) | PDF/EPUB | |
+
+対象外は §2.1 のまま (`Image` / `Video` / `Audio` / `ZipImage` / `PdfPage` / `Stack` / `CollectionPlaceholder`)。
+
+決めたこと:
+
+- **画像フォルダを本として扱う設定のフォルダも「実フォルダ」**: 項目は `Folder` のままで、本として扱うかは
+  開くときの扱いの違いにとどまる。種類の判定に本扱いの判定 (フォルダの中身の走査や本の設定の参照) を
+  持ち込むと、判定が項目の種類だけで決まらなくなり、描画・要求・集計の各所で同じ答えを出す保証が崩れる。
+  画像フォルダの表紙を見たい利用者は「実フォルダ」を選ばなければよい。
+- **書庫の中のフォルダは「書庫」**: 書庫の中を見ている間のフォルダ行は書庫の一部で、ディスク上の
+  フォルダではない。要望の「実フォルダだけ」をそのまま満たす。
+- **ドライブは「実フォルダ」**: 一覧に出るのはフォルダと同じ `Folder` 項目で、要求経路も §4.2 のとおり
+  共通の判定を通る。ドライブ専用の選択肢は作らない。
+
+### 8.3 設定と移行
+
+設定はリリース済み (v5.1.0 の `thumb_container_type_icon_only: bool`) なので移行が必要。
+
+- 新しい値: `Settings::thumb_container_icon_kinds: ContainerIconKinds`、`#[serde(default)]`。
+  `ContainerIconKinds { folder: bool, archive: bool, pdf_epub: bool }` (Copy、既定は全部 false)。
+  `settings_kv` には 1 つのキー `thumb_container_icon_kinds` (JSON の object) で保存する。
+  3 種類を 1 つの値にまとめるのは、旧キーからの変換を「1 つのキーを作る」1 回で済ませ、
+  部分的な読み込み (設定ファイルの一部だけの取り込み) で 3 つがばらばらに混ざらないようにするため。
+- 旧キー `thumb_container_type_icon_only` は `Settings` から外す。読み込み時に map の段階で新キーへ変換する。
+  既存の前例 `same_name_folder_book::canonicalize` (旧 bool キー `skip_zip_if_folder_exists` → 新キー) と
+  同じ形にする:
+  - 新キーがあれば新キーを使う (旧キーは無視する)。
+  - 新キーが無く旧キーが bool なら、`true` → 3 種類とも選択、`false` → 3 種類とも未選択の新キーを作る。
+  - 新キーがあれば、新キーの値が壊れていても旧キーへは倒さない (壊れた新キーは各入口の通常の扱い)。
+  - 旧キーが bool でない (壊れた値) なら、旧キーを取り除いて「旧値が不正」を返す (新キーは作らない)。
+    扱いは入口ごとに決める (下記)。同名フォルダの前例は DB 読み込みで `Incompatible` を返すが、それは
+    「将来の版の値を古い版が上書きしない」ための保護で、この旧キーは今後の版で書かれることがない。
+  - 旧キーは map から常に取り除く。
+- 変換関数は 1 つ (`canonicalize_container_icon_kinds(map) -> Result<(), ...>`)。通す入口は 3 つ:
+  1. `impl Deserialize for Settings` (settings.rs、`same_name_folder_book::canonicalize` を呼んでいる所)。
+     `settings_kv` からの読み込みと旧 JSON からの移行はここを通る。旧値が不正なら既定 (未選択) に倒し、
+     ログに残す (起動を止めるほどの値ではない)。`save_full` は `settings_kv` を全部書き直すので、
+     次の保存で旧キーの行が消える。
+  2. 設定の取り込み (`settings_transfer::parse_items`)。v5.1.0 で書き出した設定ファイルに
+     `thumb_container_type_icon_only` があれば同じ規則で新キーとして受け付ける (件数は 1 件、
+     不明な項目には数えない)。旧値が不正なら、既存の契約どおり指摘 1 件 (`TransferIssue`) にして
+     取り込み先の値を変えない。書き出しは新キーだけを出す。
+  3. `--settings-override` (`settings_override.rs`)。overlay は現在の設定へマージしてから Deserialize するが、
+     マージは Settings に無いキーを `UnknownSetting` で拒否するので、旧キーは Deserialize まで届かない
+     (設計レビュー r1 P2)。**マージの前に overlay の map を同じ関数で変換する**。overlay 内で新キーが勝ち、
+     旧キーだけなら現在の選択を ALL / NONE で上書きする。旧値が不正なら override を拒否する
+     (試験の構成を黙って変えない、という override の既存方針どおり)。
+- Remote の一覧設定 (`REMOTE_LISTING_SETTINGS_SQL`) はこの設定を読まない (§2.2 のとおり Remote は対象外)。
+  変更なし。Remote の設定転送の方針 (環境設定にある項目だけを転送する) にも、新しい項目は追加しない。
+- 旧版へ戻した場合: 新しい版で保存した設定 DB は、v5.1.0 の既存の version gate が新しい版の DB として扱い、
+  設定全体を既定値で起動して保存を抑止する (`settings_db.rs` の version gate)。本件で互換のための保存は足さない。
+
+### 8.4 判定の形
+
+- `grid_item::ContainerIconKind { Folder, Archive, PdfEpub }` と
+  `grid_item::container_icon_kind(item) -> Option<ContainerIconKind>` が §8.2 の表を持つ唯一の場所。
+- `ContainerIconKinds::contains(kind)`、`ContainerIconKinds::NONE` / `ALL`。
+- `container_icon_only(item, kinds: ContainerIconKinds) -> bool` と
+  `effective_thumbnail_state(item, thumb, kinds)` は、今の `enabled: bool` を `kinds` に置き換えるだけ。
+  呼び出し元 (要求ループ、ドライブ一覧の要求、優先要求、idle 高画質化、描画・レイアウトの全箇所、
+  補正済みテクスチャ、自動比率、スクロール計測、hover) は、`self.settings.thumb_container_type_icon_only` を
+  `self.settings.thumb_container_icon_kinds` に置き換える。新しい分岐は足さない。
+- テスト用の `true` は `ContainerIconKinds::ALL` に置き換える。
+
+### 8.5 切り替え (環境設定の OK)
+
+§4.5 を種類ごとにする。旧値 `old` と新値 `new` から「外した種類」`turned_off = old - new` を求める。
+
+- 種類を足したとき: 何もしない (次のフレームから描画の置き換えと要求の停止が効く)。
+- 種類を外したとき: 現在の一覧で `container_icon_only(item, turned_off)` が真かつ `NoArt` の idx だけを
+  `Pending` に戻し、再描画を要求する。残っている種類 (例: 書庫は選んだまま実フォルダだけ外した) の
+  `NoArt` は戻さない。戻した項目は通常の要求経路で、キャッシュ・固定から読み込まれる。
+- 一覧の読み直し・現在地・選択・スクロール・要求 owner・キャッシュ・固定・退避中の viewer context の扱いは
+  §4.5 と同じ。
+
+### 8.6 環境設定の画面
+
+`thumbnail/container-type-icon` の anchor を残し、チェックボックス 1 つを「見出し + 横並びの 3 つ」にする。
+
+- 見出し: 「代表画像の代わりに種類のアイコンで表示する:」
+- 横並び (`horizontal_wrapped`): 「実フォルダ」「書庫 (ZIP・RAR など)」「PDF・EPUB」
+- 説明 (small): 「選んだ種類は代表画像を使わずアイコンで表示します。書庫の中のフォルダは「書庫」に従います。
+  画像・動画・音声と、本を開いた後のページはそのままです。固定した代表画像やキャッシュは残り、
+  外すと再び表示されます。」
+- 高さは今の項目から 1 行増える程度。環境設定はページ内が ScrollArea なので 1093×614 でも操作できる。
+  既存の環境設定のスナップショット (`preferences_favorite_view_state_dark`、620×260 の本文 fixture) を更新する。
+  これはダイアログ全体の操作性までは見ないので、1093×614 の環境設定ダイアログ全体を描く既存の headless
+  検査の形で、サムネイルページを開いて 3 つのチェックボックスへ到達でき (スクロール後に見える)、OK / キャンセルが
+  見えることと、狭い幅で横並びが折り返すことを確かめるテストを足す (設計レビュー r1 P3)。
+- 設定検索の索引の見出しを「代表画像の代わりに種類のアイコンで表示する」にし、キーワードに
+  「実フォルダ」「フォルダ」「書庫」「PDF」「EPUB」を足す。
+- 設定の書き出しのラベルは「種類のアイコンで表示する項目」。
+
+### 8.7 テスト
+
+- 判定の表: 全 `GridItem` の種類 × 8 通りの `ContainerIconKinds`。`ZipDir` (`is_archive` 真偽とも) と
+  `SearchContainer { Zip }` は書庫だけで真、`SearchContainer { Folder }` とドライブの `Folder` は実フォルダだけで真。
+- 要求経路: 実フォルダだけを選んだ混在一覧で、`Folder` / `SearchContainer{Folder}` は要求なし・`NoArt`、
+  `ZipFile` / `PdfFile` / `ConvertibleArchive` / `ZipDir` / `SearchContainer{Zip}` / 画像は従来どおり要求される。
+  書庫だけ・PDF/EPUB だけも同様に 1 本ずつ。
+- 書庫の中: 実フォルダだけを選んで書庫を開くと、書庫内フォルダ (`ZipDir`) とページは代表・画像のまま。
+- 切り替え: 全部選択 → 実フォルダだけ外す OK で、`Folder` の `NoArt` だけが `Pending` に戻り、書庫・PDF の
+  `NoArt` は残る。キャッシュ行・固定行が残り、戻した `Folder` が `Loaded` になる。Cancel は何も変えない。
+- 自動比率・スクロール計測: 実フォルダだけを選んだ一覧で、書庫の代表は母数・標本・完了条件に入る。
+- 移行 (設定 DB): 旧キーだけの DB で `true` → `ALL`、`false` → `NONE`、どちらも無い → `NONE`、
+  旧キーが bool でない → `NONE`、新旧両方 → 新キーが勝つ。保存後に旧キーの行が無いこと、
+  他の設定 (列数・お気に入り) が残ること。ポータブルへコピーした DB でも同じ。
+- 移行 (設定の取り込み): v5.1.0 形式の `{"thumb_container_type_icon_only": true}` で `ALL` (受付 1 件・
+  不明 0 件・指摘なし)、`false` で `NONE`、新旧両方で新キーが勝つ、どちらも無ければ取り込み先を変えない。
+  書き出しに旧キーが出ない。新キーの壊れた値は他の項目と同じ「正しくありません」の指摘になる。
+- 部分選択の切り替え: `{実フォルダ, PDF/EPUB}` → `{書庫, PDF/EPUB}` を 1 回の OK で行うと、`Folder` だけが
+  `Pending` に戻り、書庫は新たに抑止 (要求なし)、PDF は `NoArt` のまま。要求 owner と退避中の viewer context は
+  変わらない (設計レビュー r1 P2)。
+- 部分選択の保存: `{実フォルダ, PDF/EPUB}` などを DB へ保存・再読み込み、書き出し・取り込みで往復して同じ値。
+- 新キーが壊れていて旧キーが正しい場合に、旧値へ倒さないこと (DB 読み込み・取り込み・override)。
+- 旧 JSON (`settings.json` からの移行経路 `read_settings_json_for_migration` → `apply_load_time_migrations`) に
+  旧キーだけがある場合の移行。
+- `--settings-override`: 旧キーだけの overlay で現在の選択が ALL / NONE になる、新旧両方なら新キーが勝つ、
+  旧値が不正なら拒否される。
+- 既存の §1.697 のテストは `true` → `ALL` の置き換えで全部通ること。
+
+### 8.8 §1.764 との関係
+
+§1.764 (表紙範囲の切り出し、別ブランチ) は代表サムネイルの要求経路 (固定の解決・source_id・worker の
+切り出し) を触る。本件は要求経路の中身を変えず、既存の判定呼び出しの引数を置き換えるだけにする。
+後から入る側の merge で、`self.settings.thumb_container_type_icon_only` の行が近くにある場合の
+単純な衝突が起こり得る。
+
+### 8.9 検討して採らなかった案
+
+- 3 つの bool を別々のキーにする: 移行で 3 キーを作る必要があり、部分的な取り込みで混在し得る。
+- 旧キーを残して「旧キーが ON なら 3 種類とも ON」と毎回読む: 種類を外しても旧キーの ON が残り、
+  次の読み込みで戻ってしまう (旧キーを書き換える処理が別に要る)。読み込み時に 1 回変換して旧キーを消す。
+- 種類ごとの判定に「本として扱うフォルダか」を含める: §8.2 のとおり、判定が項目の種類だけで決まらなくなる。
+- ドライブ・検索結果の集約行に専用の選択肢を作る: 要望の範囲外で、選択肢が増えるだけ。
+- 種類を外したとき一覧を読み直す: §3 の理由で採らない (コレクションのルート・Everything)。
+
+まれな失敗 (設定 DB の書き込み失敗など) は既定の割り切り方針に従い、追加の回復処理を設けない。
+
+### 8.10 実装記録
+
+- 2026-11-12: `ContainerIconKind` / `ContainerIconKinds` と唯一の対応表 `container_icon_kind` を
+  `grid_item.rs` に追加。要求・描画・自動比率・スクロール・hover の既存判定は引数だけ置換し、
+  要求の作成・owner・終端処理は変更しない。
+- 旧 bool は共通の `canonicalize_container_icon_kinds` で map の段階から除去し、DB / 旧 JSON、
+  設定取り込み、override のマージ前に変換。壊れた旧値は DB / JSON では既定＋ログ、
+  取り込みでは指摘1件で宛先維持、override では拒否。新値があれば壊れていても旧値へ倒さない。
+- OK で外した種類の `NoArt` だけを `Pending` に戻す。既存の一覧位置・要求 owner・
+  キャッシュ・固定と退避 context は保持。3つの checkbox、検索索引、書き出しラベルと
+  マニュアル・表示パイプライン文書を更新した。
+- 回帰: 全 variant と8通りの選択、3種類別の混在一覧要求、書庫内の folder / page、
+  部分選択時の自動比率・スクロール待ち、種類の解除／入替と sibling owner 保持、
+  固定・cache からの復帰、出荷済み DB とコピーした portable DB、旧 JSON、
+  取り込み／書き出し、override、1093×614 の実ダイアログと狭幅の折り返しを検査する。
+- 検証結果は以下のとおり。全lib・build-dev は設計担当へ引き継ぐ（実装担当には実行しない指示）。
+  製品バイナリ起動とコミットは行わない。
+- 独立コードレビュー（GPT-6.1 Sol / xhigh、2026-11-12）: ACCEPT、P1/P2/P3 なし。
+  種類表・3入口の移行・新値優先・解除範囲・owner / 退避 context 保持・回帰テスト範囲を確認。
+  下記のテスト修正も限定再確認 ACCEPT。検査の弱体化なし。
+- 初回 focused は574件中570成功・4失敗。追加した自動比率テストが既存750ms streakを
+  待たない期待になっていたため、実 poll の候補と標本数を検証してから時計だけ進めた。
+  環境設定の3件は同名「実フォルダ」の Label と Checkbox が曖昧だったため、
+  role を Checkbox に限定。製品コードの修正・期待値の緩和はない。
+- `cargo fmt`（引数なし）、`cargo fmt --check`、`git diff --check` 成功。
+  `python scripts/check_ui_glyphs.py` は危険グリフ0件、exit 0。
+  記録: `target/icon-kinds-{fmt-check-final,diff-check-final,glyphs}.log`。
+- `UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot preferences_favorite_view_state_dark`:
+  1 passed、exit 0。更新 PNG は620×260、77,567 bytes。
+  実装担当と独立 reviewer が実 PNG を開き、見出し・3 checkbox・説明文に欠け／重なりがないことを確認。
+  記録: `target/icon-kinds-snapshot-update.log`。製品アプリの起動は含まない。
+- 修正後 focused（既定 feature / test profile、未コミット差分）:
+  `cargo nextest run -p mimageviewer --lib -E 'test(/container_type_icon|container_icon|container_icon_scroll|auto_aspect|thumbnail_request_lifecycle|settings_transfer::tests|settings_db|same_name_folder_book|thumbnail_type_icon|preferences/)'`
+  は574 passed / 0 failed（1 slow）、exit 0。記録: `target/icon-kinds-focused-final.log`。
+- 更新指定なしの `cargo test --test ui_snapshot`: 249 passed / 0 failed / 0 ignored、exit 0。
+  PNG 差分は `tests/snapshots/preferences_favorite_view_state_dark.png` だけ。
+  記録: `target/icon-kinds-snapshot-full.log`。
+- 設計からの挙動変更はない。実装記録を指定の §8.10 とするため、既存の設計レビュー履歴は §8.11 へ移した。
+
+- 全件 (設計担当、2026-11-12、9e7c3a97b、`test-lib-full.ps1` run `20261111T154724649Z-a032f613`):
+  17,218 件中 17,215 成功・3 失敗・75 skipped (995 秒)。失敗は
+  `close_return_remote_acquire_and_return_never_resurrects_main_terminal_request`、
+  `section1375_large_physical_scan_10k_100k` (全件中 368 秒)、
+  `page_turn_mainwindow_submits_visible_vacant_leaf_both_directions` で、本件の変更箇所と関係がなく、
+  3 件とも単独の再実行で成功した (全件実行の負荷による失敗、[§1.765](next-release-backlog.md) と同じ型)。
+
+- 設計担当の追加確認 (2026-11-12、60dc118b6 の前と同じコード): `cargo test --test ui_snapshot` 249 件成功、
+  `cargo test --workspace --features pack-build-tools --no-run` 成功、`build-dev.ps1` 成功
+  (`target/dev-runtime/`、PE 検査通過)。製品の起動による確認は未実施。
+- §1.764 (`feat-764-cover-crop`) との試し merge: `docs/display-pipeline.md` §1.3.2 の同じ段落で文書の競合が 1 か所
+  (両方の文を残せば解決)。コードは自動 merge でき、§1.764 側に旧設定名の新しい使用箇所はない。
+
+### 8.11 設計レビューの記録
+
+- r1 (GPT-6.1 Sol / xhigh、2026-11-11): REVISE、P1 なし。P2 `--settings-override` はマージ前に未知キーを拒否するので
+  旧キーが変換に届かない → マージ前に overlay を変換 (§8.3)。P2 取り込みで不正な旧値を黙って捨てると既存の
+  「指摘 1 件・取り込み先を維持」の契約に反する → 入口ごとの扱いを決めた (§8.3)。P2 部分選択の受け入れテスト不足 →
+  §8.7 に追記。P3 旧版へ戻した場合の説明が version gate と違う → 訂正 (§8.3)。P3 1093×614 のダイアログ全体の
+  検査 → §8.6 に追記。対応表・引数置換で判定の一致が保たれること・`old - new` の差集合・Remote に変更が
+  要らないことは妥当と確認された。
+
+- r2 (同、resume): ACCEPT。r1 の指摘の反映を確認、追加指摘なし。
+- 実装レビュー (同じ独立担当、実装担当とは別、2026-11-12、`54a701ef0..9e7c3a97b`): ACCEPT、P1/P2/P3 なし。
+  置換漏れ・`ALL` 固定なし、差集合・3 入口の変換・serde 形と DB/取り込みの整合、旧テストの OK/Cancel/保存/再表示の
+  検査の保持、UI・マニュアル・PNG の変化が意図どおりであることを確認。

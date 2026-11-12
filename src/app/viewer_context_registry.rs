@@ -3334,8 +3334,9 @@ impl App {
             // already owns its independent list loses passive observation here.
             self.retire_passive_folder_observation();
         }
-        self.commit_viewer_presentation(
+        self.commit_viewer_session(
             ViewerPresentation::DetachedWindow,
+            true,
             "activate_independent_detached",
         );
         self.ensure_mounted_detached_session_binding(window_id);

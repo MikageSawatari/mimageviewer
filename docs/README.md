@@ -116,10 +116,12 @@
 | [web-remote-left-panel-plan.md](web-remote-left-panel-plan.md) | リモートの左パネル (場所 / 検索 / タグ / お気に入り / 本棚) の範囲と、本体一覧との差 |
 | [web-remote-ai-plan.md](web-remote-ai-plan.md) | **段 3b-0〜3b-2 実装・実機確認済み。JPEG 転送 / 端末別画質 mode は実装済み・実機確認待ち**。remote AI アップスケール / デノイズの PC modal 排他、共有 canonical decoder、接続取得 / 切断 drain barrier、App 所有 singleton Runtime、stable remote key、HTTP job、Web UI、画面消灯復帰、VRAM、撤退条件 |
 | [local-vlm-caption-plan.md](local-vlm-caption-plan.md) | ローカル AI 説明文の正本。V1-3 の独立レビュー済み設計は §21.7。V1-3b の worker 内包・protocol 2・source identity・分割モデル取得・GPU 判定・初回案内・設定ページの実装と検証記録は §21.8。作成ジョブ (V1-3c) の受付・進捗・中止と検証記録は §21.9。実モデルの公開、表紙 (V1-4)、検索/MCP は別段階 |
+| [local-asr-transcript-plan.md](local-asr-transcript-plan.md) | ローカル文字起こし (whisper、動画) の計画。左パネルの「文字起こし」タブ・検索・MCP。AI 説明文の仕組みを型にする。初版、独立レビュー前 |
 | [local-vlm-v0-procedure.md](local-vlm-v0-procedure.md) | **手順の下書き (2026-11-02、未実行)**。ローカル AI 説明文の V0。Qwen3.5-4B/9B と Gemma 4 E4B の比較、VLM・AI 補正・表示用テクスチャの VRAM を同じ物差しで計測、利用者による目隠しの品質比較、4B 固定と U1 の判断基準 |
 | [mcp-integration-plan.md](mcp-integration-plan.md) | **段階 0 試験実装中 (2026-10-30)**。AI 連携 (MCP)。stdio の別 exe と本体の agent lane (Remote IPC とは別の pipe・版)、Remote 操作権との関係、安全性。実装・検証と未決事項は §14 |
 | [local-adjust-testing.md](local-adjust-testing.md) | 部分補正レイヤーの回帰テスト、合成順、キャッシュ無効化を検証するとき |
 | [search-architecture.md](search-architecture.md) | 検索 / インデクサ / タグを触るとき。**Ctrl+S/F/G/R の経路、Everythingの共通Search ownership、インデクサパイプライン + DB 責任分離** |
+| [search-input-history-plan.md](search-input-history-plan.md) | §1.756 検索欄の入力履歴。4 種類各 20 件、確定・実行済み語での離脱、設定の保存・オフと全件消去、フォルダバーと共有する▼・IME-safe な固定キー、ログ・Remote・MCP の非公開境界。実装中 |
 | [name-index-write-failure-plan.md](name-index-write-failure-plan.md) | §1.369 名前／コンテナ索引の書込失敗。レビュー反映・実装と検証記録。同じDBの起動中1回の通知／予約、通常UIへの配送、Full/watch/clearの共通出口、無害なno-opの維持 |
 | [page-adjustment-owner-plan.md](page-adjustment-owner-plan.md) | §1.372 検索再配置中の補正Undo／draftの保存先。設計R2反映・実装／自動検証／確認用build完了。安定target、context所有draft、共有Undo受理順と最新受付済み文書、終了配送と§1.371 cursor ownerとの関係 |
 | [item-kind-capability-matrix.md](item-kind-capability-matrix.md) | **★ / タグ / 削除 / コピー / 外部ツール / 検索が `GridItem` の種別ごとにどう振る舞うかの現状表**。セルは 対応 / 拒否 / コンテナへ寄せる / **無反応** の 4 値。仮想ページ (ZipImage / PdfPage) を扱う機能を足すときは先にここを見る |

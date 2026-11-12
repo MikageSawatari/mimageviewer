@@ -1416,12 +1416,15 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
         );
     });
     anchored(ui, state, "thumbnail/container-type-icon", |ui, state| {
-        ui.checkbox(
-            &mut state.settings.thumb_container_type_icon_only,
-            "フォルダ・書庫・PDF を種類のアイコンで表示する",
-        );
+        ui.label("代表画像の代わりに種類のアイコンで表示する:");
+        ui.horizontal_wrapped(|ui| {
+            let kinds = &mut state.settings.thumb_container_icon_kinds;
+            ui.checkbox(&mut kinds.folder, "実フォルダ");
+            ui.checkbox(&mut kinds.archive, "書庫 (ZIP・RAR など)");
+            ui.checkbox(&mut kinds.pdf_epub, "PDF・EPUB");
+        });
         ui.small(
-            "代表画像の代わりにアイコンを表示します。画像・動画・音声と、本を開いた後のページはそのままです。固定した代表画像やキャッシュは残り、オフに戻すと再び表示されます。",
+            "選んだ種類は代表画像を使わずアイコンで表示します。書庫の中のフォルダは「書庫」に従います。画像・動画・音声と、本を開いた後のページはそのままです。固定した代表画像やキャッシュは残り、外すと再び表示されます。",
         );
     });
     anchored(ui, state, "thumbnail/cover-auto-crop", |ui, state| {
@@ -11685,6 +11688,40 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
             );
         }
     });
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("検索欄の入力履歴").strong());
+    anchored(
+        ui,
+        state,
+        "resume/search-input-history-enabled",
+        |ui, state| {
+            ui.checkbox(
+                &mut state.settings.save_search_input_history,
+                "検索欄の入力履歴を保存する",
+            );
+            ui.label(egui::RichText::new(
+            "コンテナ検索・現在地の絞り込み・アイテム検索・Everything 検索で実行した検索語を、欄ごとに最近の 20 件まで PC 内に保存し、入力欄の▼か ↓ キーで選び直せます。オフにすると、今の入力履歴も消去します (設定の自動バックアップには、しばらく残ります)。",
+        ).weak());
+        },
+    );
+    anchored(
+        ui,
+        state,
+        "resume/search-input-history-clear",
+        |ui, state| {
+            let count = state.search_input_history_entry_count;
+            ui.label(format!("入力履歴: {count} 件を記憶。"));
+            if count > 0 && ui.button("検索欄の入力履歴をすべて消去").clicked() {
+                state.search_input_history_clear_requested = true;
+            }
+            if let Some(message) = &state.search_input_history_clear_result {
+                ui.label(egui::RichText::new(message).weak());
+            }
+        },
+    );
 }
 
 pub(super) fn page_susie_plugins(ui: &mut egui::Ui, state: &mut PreferencesState) {

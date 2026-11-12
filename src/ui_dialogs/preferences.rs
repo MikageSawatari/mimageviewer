@@ -1298,6 +1298,10 @@ pub(crate) struct PreferencesState {
     pub reading_history_clear_requested: bool,
     /// 直近の閲覧履歴削除結果。
     pub reading_history_clear_result: Option<String>,
+    /// 検索欄の入力履歴を App 側で即時消去する one-shot。
+    pub search_input_history_clear_requested: bool,
+    pub search_input_history_clear_result: Option<String>,
+    pub search_input_history_entry_count: usize,
 
     // ── サムネイルページ: お気に入り別表示状態 ──────────────────
     pub favorite_view_state_entry_count: usize,
@@ -1855,6 +1859,9 @@ impl PreferencesState {
             reading_history_entry_count,
             reading_history_clear_requested: false,
             reading_history_clear_result: None,
+            search_input_history_clear_requested: false,
+            search_input_history_clear_result: None,
+            search_input_history_entry_count: s.search_input_history.len(),
             favorite_view_state_entry_count: 0,
             favorite_view_state_active: s.active_favorite_view_id().is_some(),
             favorite_view_state_clear_confirm_open: false,
@@ -2445,6 +2452,9 @@ pub(crate) fn prepare_preferences_settings_for_commit(
     let new_details_selection_bar_mode = edited.details_selection_bar_mode.normalized();
 
     edited.overwrite_non_preferences_from(live);
+    if !edited.save_search_input_history {
+        edited.search_input_history.clear();
+    }
     // Immediate settings windows own these values. An older Preferences draft
     // must never restore their opening-time values, including on close checks.
     edited.agent_level = live.agent_level;
@@ -2525,6 +2535,24 @@ fn merge_video_media_memory_for_preferences(
 }
 
 impl App {
+    fn apply_search_input_history_clear_request(&mut self) {
+        let requested = self
+            .pref_state
+            .as_mut()
+            .is_some_and(|state| std::mem::take(&mut state.search_input_history_clear_requested));
+        if !requested {
+            return;
+        }
+        let count = self.settings.search_input_history.len();
+        self.settings.search_input_history.clear();
+        if let Some(state) = self.pref_state.as_mut() {
+            state.settings.search_input_history.clear();
+            state.search_input_history_entry_count = 0;
+            state.search_input_history_clear_result =
+                Some(format!("検索欄の入力履歴を {count} 件消去しました。"));
+        }
+    }
+
     pub(crate) fn install_preferences_settings(&mut self, mut settings: Settings) {
         // This is the accepted boundary, before executor reconfiguration,
         // reader-policy changes, settings replacement, or index submission.
@@ -2838,7 +2866,7 @@ impl App {
                 self.settings.epub_file_handling,
             );
             let old_grid_display_order = self.settings.grid_display_order.clone();
-            let old_thumb_container_type_icon_only = self.settings.thumb_container_type_icon_only;
+            let old_thumb_container_icon_kinds = self.settings.thumb_container_icon_kinds;
             let old_rating_sort_unrated_position = self.settings.rating_sort_unrated_position;
             let old_show_hidden_files = self.settings.show_hidden_files;
             let file_type_visibility_changed =
@@ -2945,12 +2973,18 @@ impl App {
             }
             prepare_preferences_state_settings_for_commit(&mut state, &mut self.settings);
             self.install_preferences_settings(state.settings);
-            if old_thumb_container_type_icon_only != self.settings.thumb_container_type_icon_only {
-                if !self.settings.thumb_container_type_icon_only {
+            if old_thumb_container_icon_kinds != self.settings.thumb_container_icon_kinds {
+                let new = self.settings.thumb_container_icon_kinds;
+                let turned_off = crate::grid_item::ContainerIconKinds {
+                    folder: old_thumb_container_icon_kinds.folder && !new.folder,
+                    archive: old_thumb_container_icon_kinds.archive && !new.archive,
+                    pdf_epub: old_thumb_container_icon_kinds.pdf_epub && !new.pdf_epub,
+                };
+                if turned_off != crate::grid_item::ContainerIconKinds::NONE {
                     // Restore only the mounted list's suppressed display states.
                     // Requests, caches, pins and parked viewer contexts keep their owners.
                     for (item, thumb) in self.items.iter().zip(self.thumbnails.iter_mut()) {
-                        if crate::grid_item::container_icon_only(item, true)
+                        if crate::grid_item::container_icon_only(item, turned_off)
                             && matches!(thumb, crate::grid_item::ThumbnailState::NoArt)
                         {
                             *thumb = crate::grid_item::ThumbnailState::Pending;
@@ -3260,6 +3294,9 @@ impl App {
 
         // 初回: 一時コピーを作成
         self.ensure_preferences_state();
+        if let Some(state) = self.pref_state.as_mut() {
+            state.search_input_history_entry_count = self.settings.search_input_history.len();
+        }
         self.refresh_vlm_preferences(ctx);
         self.refresh_depth_preferences();
         // A fresh draft gets a fresh ScrollArea id, with one explicit restore.
@@ -3683,6 +3720,9 @@ impl App {
         if clear_book_resume_requested {
             self.clear_book_resume_async();
         }
+
+        // 履歴と復元ページ: 検索欄の入力履歴消去 (one-shot)。
+        self.apply_search_input_history_clear_request();
 
         // 履歴と復元ページ: 閲覧履歴クリア (one-shot)。
         let mut clear_reading_history_requested = false;
@@ -4442,6 +4482,69 @@ pub fn draw_file_type_visibility_snapshot_fixture(ui: &mut egui::Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_input_history_preferences_commit_keeps_live_and_clears_when_disabled() {
+        use crate::ui_pinned_search::PinnedSearchKind as Kind;
+        for save in [true, false] {
+            let mut live = Settings::default();
+            live.search_input_history.record(Kind::Local, "old draft");
+            let mut draft = live.preferences_snapshot();
+            draft.save_search_input_history = save;
+            live.search_input_history.record(Kind::Local, "latest live");
+            prepare_preferences_settings_for_commit(&mut draft, &mut live);
+            assert_eq!(draft.save_search_input_history, save);
+            if save {
+                assert_eq!(
+                    draft.search_input_history.entries(Kind::Local),
+                    ["latest live", "old draft"]
+                );
+            } else {
+                assert_eq!(draft.search_input_history.len(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn search_input_history_clear_is_immediate_one_shot_and_cannot_be_restored_by_ok() {
+        use crate::ui_pinned_search::PinnedSearchKind as Kind;
+        let mut app = crate::app::setup_app_for_test();
+        for kind in Kind::ALL {
+            app.settings
+                .search_input_history
+                .record(kind, "miv-history-sentinel-756");
+        }
+        app.open_preferences_page(PreferencesPage::PlaybackResume);
+        app.ensure_preferences_state();
+        app.pref_state
+            .as_mut()
+            .unwrap()
+            .search_input_history_clear_requested = true;
+        app.apply_search_input_history_clear_request();
+        assert_eq!(app.settings.search_input_history.len(), 0);
+        let state = app.pref_state.as_ref().unwrap();
+        assert!(!state.search_input_history_clear_requested);
+        assert_eq!(state.search_input_history_entry_count, 0);
+        assert_eq!(state.settings.search_input_history.len(), 0);
+        assert_eq!(
+            state.search_input_history_clear_result.as_deref(),
+            Some("検索欄の入力履歴を 4 件消去しました。")
+        );
+        app.settings
+            .search_input_history
+            .record(Kind::Local, "later record");
+        app.apply_search_input_history_clear_request();
+        assert_eq!(
+            app.settings.search_input_history.entries(Kind::Local),
+            ["later record"]
+        );
+        let mut draft = app.pref_state.take().unwrap().settings;
+        prepare_preferences_settings_for_commit(&mut draft, &mut app.settings);
+        assert_eq!(
+            draft.search_input_history.entries(Kind::Local),
+            ["later record"]
+        );
+    }
 
     #[test]
     fn cache_book_cover_only_preferences_ok_persists_and_drives_worker_catalog() {
@@ -5865,10 +5968,94 @@ mod tests {
     }
 
     #[test]
-    fn thumb_container_type_icon_only_preferences_ok_cancel_save_and_reopen() {
+    fn container_icon_kinds_preferences_small_dialog_controls_reachable() {
         use egui_kittest::kittest::Queryable;
         let mut harness = preferences_view_harness(PreferencesPage::Thumbnail);
-        let label = "フォルダ・書庫・PDF を種類のアイコンで表示する";
+        let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1093.0, 614.0));
+        // Reach the controls through the actual dialog's scroll area after visiting its end.
+        harness.get_by_label("名前の文字サイズ:").scroll_to_me();
+        harness.run_steps(3);
+        for label in ["実フォルダ", "書庫 (ZIP・RAR など)", "PDF・EPUB"] {
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+                .scroll_to_me();
+            harness.run_steps(3);
+            assert!(
+                bounds.contains_rect(
+                    harness
+                        .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+                        .rect()
+                )
+            );
+            assert!(bounds.contains_rect(harness.get_by_label("  OK  ").rect()));
+            assert!(bounds.contains_rect(harness.get_by_label("キャンセル").rect()));
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+                .click();
+            harness.run_steps(3);
+        }
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .thumb_container_icon_kinds,
+            crate::grid_item::ContainerIconKinds::ALL
+        );
+        assert_eq!(
+            harness.state().settings.thumb_container_icon_kinds,
+            crate::grid_item::ContainerIconKinds::NONE
+        );
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        assert_eq!(
+            harness.state().settings.thumb_container_icon_kinds,
+            crate::grid_item::ContainerIconKinds::ALL
+        );
+    }
+
+    #[test]
+    fn container_icon_kinds_preferences_narrow_row_wraps() {
+        use egui_kittest::kittest::Queryable;
+        let state = preferences_state_for_test(&Settings::default());
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(285.0, 600.0))
+            .build_ui_state(
+                |root_ui, state| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .show(ui, |ui| pages::page_thumbnail(ui, state));
+                    });
+                },
+                state,
+            );
+        harness.run_steps(3);
+        let folder = harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, "実フォルダ")
+            .rect();
+        let archive = harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, "書庫 (ZIP・RAR など)")
+            .rect();
+        let pdf = harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, "PDF・EPUB")
+            .rect();
+        assert!(
+            pdf.top() > folder.top(),
+            "checkboxes must wrap at narrow widths"
+        );
+        for rect in [folder, archive, pdf] {
+            assert!(rect.left() >= 0.0 && rect.right() <= 285.0, "{rect:?}");
+        }
+    }
+
+    #[test]
+    fn thumb_container_icon_kinds_preferences_ok_cancel_save_and_reopen() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_view_harness(PreferencesPage::Thumbnail);
+        let label = "実フォルダ";
         let db = crate::settings_db::SettingsDb::open(harness.state().tmp.path()).unwrap();
         for (cancel, expected) in [(true, false), (false, true), (true, true), (false, false)] {
             if !harness.state().show_preferences {
@@ -5877,12 +6064,14 @@ mod tests {
                     .open_preferences_page(PreferencesPage::Thumbnail);
                 harness.run_steps(3);
             }
-            let before = harness.state().settings.thumb_container_type_icon_only;
+            let before = harness.state().settings.thumb_container_icon_kinds.folder;
             assert!(!harness.state().preferences_dialog_has_unsaved_changes());
-            harness.get_by_label(label).click();
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+                .click();
             harness.run_steps(3);
             assert_eq!(
-                harness.state().settings.thumb_container_type_icon_only,
+                harness.state().settings.thumb_container_icon_kinds.folder,
                 before
             );
             assert_eq!(
@@ -5892,7 +6081,8 @@ mod tests {
                     .as_ref()
                     .unwrap()
                     .settings
-                    .thumb_container_type_icon_only,
+                    .thumb_container_icon_kinds
+                    .folder,
                 !before
             );
             harness
@@ -5905,13 +6095,14 @@ mod tests {
             }
             assert!(!harness.state().show_preferences);
             assert_eq!(
-                harness.state().settings.thumb_container_type_icon_only,
+                harness.state().settings.thumb_container_icon_kinds.folder,
                 expected
             );
             assert_eq!(
                 db.load_into_settings()
                     .unwrap()
-                    .thumb_container_type_icon_only,
+                    .thumb_container_icon_kinds
+                    .folder,
                 expected
             );
             harness
@@ -5925,14 +6116,15 @@ mod tests {
                     .as_ref()
                     .unwrap()
                     .settings
-                    .thumb_container_type_icon_only,
+                    .thumb_container_icon_kinds
+                    .folder,
                 expected
             );
         }
     }
 
     #[test]
-    fn thumb_container_type_icon_only_preferences_restore_only_current_container_no_art() {
+    fn thumb_container_icon_kinds_preferences_restore_only_current_container_no_art() {
         use crate::grid_item::{GridItem, ThumbnailState};
         let mut app = crate::app::setup_app_for_test();
         let ctx = egui::Context::default();
@@ -5962,23 +6154,36 @@ mod tests {
         let generation = app.items_generation;
         let state = |settings: &Settings, enabled| {
             let mut state = preferences_state_for_test(settings);
-            state.settings.thumb_container_type_icon_only = enabled;
+            state.settings.thumb_container_icon_kinds = if enabled {
+                crate::grid_item::ContainerIconKinds::ALL
+            } else {
+                crate::grid_item::ContainerIconKinds::NONE
+            };
             Box::new(state)
         };
         app.pref_state = Some(state(&app.settings, true));
         app.apply_preferences_dialog(&ctx);
-        assert!(app.settings.thumb_container_type_icon_only);
+        assert_eq!(
+            app.settings.thumb_container_icon_kinds,
+            crate::grid_item::ContainerIconKinds::ALL
+        );
         assert!(matches!(app.thumbnails[0], ThumbnailState::NoArt));
         assert!(matches!(app.thumbnails[2], ThumbnailState::Evicted));
 
         // Cancel preserves both the live option and the suppressed display state.
         app.pref_state = Some(state(&app.settings, false));
         app.discard_preferences_dialog();
-        assert!(app.settings.thumb_container_type_icon_only);
+        assert_eq!(
+            app.settings.thumb_container_icon_kinds,
+            crate::grid_item::ContainerIconKinds::ALL
+        );
         assert!(matches!(app.thumbnails[0], ThumbnailState::NoArt));
         app.pref_state = Some(state(&app.settings, false));
         app.apply_preferences_dialog(&ctx);
-        assert!(!app.settings.thumb_container_type_icon_only);
+        assert_eq!(
+            app.settings.thumb_container_icon_kinds,
+            crate::grid_item::ContainerIconKinds::NONE
+        );
         assert!(matches!(app.thumbnails[0], ThumbnailState::Pending));
         assert!(matches!(app.thumbnails[1], ThumbnailState::Pending));
         assert!(matches!(app.thumbnails[2], ThumbnailState::Evicted));

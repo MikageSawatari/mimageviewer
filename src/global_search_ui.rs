@@ -4713,6 +4713,8 @@ impl App {
 
         let combo_popup_height = (ctx.content_rect().height() - 96.0).clamp(240.0, 520.0);
         let mut drill_back = false;
+        let history_availability =
+            self.pinned_search_availability(crate::ui_pinned_search::PinnedSearchKind::Metadata);
         egui::Panel::top("global_search_bar").show(root_ui, |ui| {
             self.gate_main_chrome(ui);
             if running {
@@ -4752,10 +4754,19 @@ impl App {
                      「お気に入り」→「編集」で、対象の行の「アイテム索引 (Ctrl+G)」に\n\
                      チェックを入れてください。",
                 );
-                let mut output = crate::ime_focus::show_singleline(
+                let focus_pending = self.history_input_focus_pending(ctx, crate::ui_pinned_search::PinnedSearchKind::Metadata.temporary_id());
+                let history_output = crate::ui_history_field::show_singleline(
                     ui,
                     &mut self.global_search.metadata_draft,
                     Some(&mut self.global_search.focus_request),
+                    crate::ui_pinned_search::PinnedSearchKind::Metadata.temporary_id(),
+                    self.settings.search_input_history.entries(crate::ui_pinned_search::PinnedSearchKind::Metadata),
+                    crate::ui_history_field::HistoryFieldOptions {
+                        visible: self.settings.save_search_input_history,
+                        availability: history_availability,
+                        focus_pending,
+                        ..Default::default()
+                    },
                     |edit| {
                         edit.id(crate::ui_pinned_search::PinnedSearchKind::Metadata.temporary_id()).hint_text(
                             r#"画像・PDF・動画をファイル名やメタ情報で検索 (AND / -除外 / "…")"#,
@@ -4764,17 +4775,27 @@ impl App {
                         .min_size(egui::vec2(320.0, 20.0))
                     },
                 );
+                if history_output.focus_requested {
+                    self.claim_pending_text_input_focus(ctx.viewport_id(), crate::ui_pinned_search::PinnedSearchKind::Metadata.temporary_id(), ctx.cumulative_pass_nr());
+                }
+                let mut output = history_output.text;
                 let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
                     &mut output,
                     &mut self.global_search.metadata_draft,
                 );
+                let picked = history_output.picked;
+                if let Some(index) = picked {
+                    if let Some(query) = self.settings.search_input_history.entries(crate::ui_pinned_search::PinnedSearchKind::Metadata).get(index).cloned() {
+                        self.global_search.metadata_draft = query;
+                    }
+                }
                 let response = output.response;
                 self.global_search.has_focus |= response.has_focus();
                 if response.changed() || menu_changed {
                     query_changed = true;
                 }
-                if response.lost_focus() && enter_pressed {
+                if picked.is_some() || history_output.submit_requested || (response.lost_focus() && enter_pressed) {
                     submit_requested = true;
                 }
                 if ui.small_button("×").on_hover_text("検索を閉じる").clicked() {
@@ -5096,7 +5117,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn thumb_container_type_icon_only_preferences_preserve_everything_results() {
+    fn thumb_container_icon_kinds_preferences_preserve_everything_results() {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let mut app = crate::app::setup_app_for_test();
         let ctx = egui::Context::default();
@@ -5106,10 +5127,13 @@ pub(crate) mod tests {
         image::RgbImage::new(2, 3).save(&image).unwrap();
         let dataset =
             everything_dataset_for_test(vec![GridItem::Folder(folder), GridItem::Image(image)]);
-        app.settings.thumb_container_type_icon_only = true;
+        app.settings.thumb_container_icon_kinds = crate::grid_item::ContainerIconKinds::ALL;
         adopt_everything_for_test(&mut app, &ctx, "picture OR folder", Arc::clone(&dataset));
         for idx in 0..app.items.len() {
-            if crate::grid_item::container_icon_only(&app.items[idx], true) {
+            if crate::grid_item::container_icon_only(
+                &app.items[idx],
+                crate::grid_item::ContainerIconKinds::ALL,
+            ) {
                 app.thumbnails[idx] = ThumbnailState::NoArt;
             }
         }
@@ -5126,9 +5150,12 @@ pub(crate) mod tests {
             .as_mut()
             .unwrap()
             .settings
-            .thumb_container_type_icon_only = false;
+            .thumb_container_icon_kinds = crate::grid_item::ContainerIconKinds::NONE;
         app.apply_preferences_dialog(&ctx);
-        assert!(!app.settings.thumb_container_type_icon_only);
+        assert_eq!(
+            app.settings.thumb_container_icon_kinds,
+            crate::grid_item::ContainerIconKinds::NONE
+        );
         assert_eq!(app.items, items);
         assert_eq!(app.current_folder, folder);
         assert_eq!(app.items_generation, generation);
@@ -5144,7 +5171,10 @@ pub(crate) mod tests {
             SearchAccepted::Everything { dataset: accepted, position: EverythingPosition::Root, .. }
                 if Arc::ptr_eq(accepted, &dataset)));
         for (item, thumb) in app.items.iter().zip(&app.thumbnails) {
-            if crate::grid_item::container_icon_only(item, true) {
+            if crate::grid_item::container_icon_only(
+                item,
+                crate::grid_item::ContainerIconKinds::ALL,
+            ) {
                 assert!(matches!(thumb, ThumbnailState::Pending));
             }
         }

@@ -272,6 +272,34 @@ Down/Up/Cancel のいずれでも。就寝中の App は command を drain で�
 ([app.rs:61895](../src/app.rs:61895) 付近)。`begin_frame` の位置は動かさない (入力処理しない
 フレームで edge を消費してしまう)。early return 側が repaint を保証する。
 
+### 7.1 ゲームパッド API (2026-11-11)
+
+`test-script` でのパッド入力は、キーの synthetic timeline ではなく、gilrs と共通の
+`GamepadRuntime` キューへ `PadEvent` を積み、通常の physical consumer・操作割り当てを通す。
+命令と引数、取り込み待ち、前面の前提、終了時の解放の正本は
+[ゲームパッド差し込み設計 §3](gamepad-script-injection-plan.md#3-設計)。
+
+| API | 意味 |
+| --- | --- |
+| `pad_press(button)` / `pad_release(button)` | ボタンの押下／解放 |
+| `pad_tap(button)` | 押下と解放を、それぞれ App の取り込みを待って送る |
+| `pad_hold(button, ms)` | 押下の取り込み後から保持時間を計り、解放する |
+| `pad_axis(axis, value)` | 軸の値を送る |
+| `pad_stick(side, x, y)` | `left` / `right` のスティック X、Y を順に送る |
+| `pad_trigger(side, value)` | `left` / `right` のトリガーを gilrs と同じ PadEvent 順で送る |
+| `pad_neutral()` | 台本が保持中のボタンを解放し、非中立の軸を 0 に戻す |
+| `pad_connect()` / `pad_disconnect()` | 接続／切断。切断で保持状態を終端にする |
+
+ボタンの別名、軸名、数値範囲は [§3.6](gamepad-script-injection-plan.md#36-台本の命令-rhai) を参照。
+`snapshot().gamepad` は `enabled`、`foreground`、`reader`、`injected`、`drained`、`discarded` を公開する。
+App の drain の ack は操作実行の証明ではないため、結果は選択番号やフォルダ等の snapshot で検査する。
+押下は送信時点の gamepad 有効と OS 前面が自プロセスであることを要求し、egui の focus は要求しない。
+解放・軸・接続・切断は有効だけを要求する。台本実行中は gilrs を起動せず、OS 読み取り自体は検証しない。
+例外・中断・timeout 時は終了処理で切断を送り、保持状態を残さない。
+
+使用例は [GamepadBasic](ui-smoke-automation-plan.md#gamepadbasic-2026-11-11)。
+実アプリの起動と前面使用を伴うため、[実行確認](interactive-release-verification.md) の明示了承後だけ実行する。
+
 ## 8. 有効化ゲート
 
 - cargo feature **`test-script`** (既定 off) — Rhai engine / plugin / CLI 解析

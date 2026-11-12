@@ -148,28 +148,79 @@ pub enum SearchContainerKind {
     Zip,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContainerIconKind {
+    Folder,
+    Archive,
+    PdfEpub,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ContainerIconKinds {
+    pub folder: bool,
+    pub archive: bool,
+    pub pdf_epub: bool,
+}
+
+impl ContainerIconKinds {
+    pub const NONE: Self = Self {
+        folder: false,
+        archive: false,
+        pdf_epub: false,
+    };
+    pub const ALL: Self = Self {
+        folder: true,
+        archive: true,
+        pdf_epub: true,
+    };
+
+    pub fn contains(self, kind: ContainerIconKind) -> bool {
+        match kind {
+            ContainerIconKind::Folder => self.folder,
+            ContainerIconKind::Archive => self.archive,
+            ContainerIconKind::PdfEpub => self.pdf_epub,
+        }
+    }
+}
+
+/// The sole kind table, shared by demand, presentation and image-wait aggregates.
+pub fn container_icon_kind(item: &GridItem) -> Option<ContainerIconKind> {
+    match item {
+        GridItem::Folder(_)
+        | GridItem::SearchContainer {
+            kind: SearchContainerKind::Folder,
+            ..
+        } => Some(ContainerIconKind::Folder),
+        GridItem::ZipFile(_)
+        | GridItem::ConvertibleArchive { .. }
+        | GridItem::ZipDir { .. }
+        | GridItem::SearchContainer {
+            kind: SearchContainerKind::Zip,
+            ..
+        } => Some(ContainerIconKind::Archive),
+        GridItem::PdfFile(_) => Some(ContainerIconKind::PdfEpub),
+        GridItem::Image(_)
+        | GridItem::Video(_)
+        | GridItem::Audio(_)
+        | GridItem::ZipImage { .. }
+        | GridItem::PdfPage { .. }
+        | GridItem::Stack { .. }
+        | GridItem::CollectionPlaceholder { .. } => None,
+    }
+}
+
 /// Whether the main grid substitutes the existing no-art container presentation.
-/// Keep the kind list here so demand, layout and image-wait aggregates agree.
-pub fn container_icon_only(item: &GridItem, enabled: bool) -> bool {
-    enabled
-        && matches!(
-            item,
-            GridItem::Folder(_)
-                | GridItem::ZipFile(_)
-                | GridItem::PdfFile(_)
-                | GridItem::ConvertibleArchive { .. }
-                | GridItem::ZipDir { .. }
-                | GridItem::SearchContainer { .. }
-        )
+pub fn container_icon_only(item: &GridItem, kinds: ContainerIconKinds) -> bool {
+    container_icon_kind(item).is_some_and(|kind| kinds.contains(kind))
 }
 
 /// A presentation projection only: never completes an outstanding thumbnail request.
 pub fn effective_thumbnail_state<'a>(
     item: &GridItem,
     thumbnail: &'a ThumbnailState,
-    enabled: bool,
+    kinds: ContainerIconKinds,
 ) -> &'a ThumbnailState {
-    if container_icon_only(item, enabled) {
+    if container_icon_only(item, kinds) {
         &ThumbnailState::NoArt
     } else {
         thumbnail

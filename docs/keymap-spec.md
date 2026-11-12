@@ -7,16 +7,23 @@
 
 ## 3D 写真
 
-`FsDepthParallax` は画像フルスクリーン (`FsImage`) の `Press` 操作、既定は
+`FsDepthParallax` は画像閲覧 (`FsImage`) の `Press` 操作、既定は
 <kbd>D</kbd>。再度押すか右パネルの×で終了する。操作カスタマイズで変更・解除できる。
-main viewer の単ページ静止画だけを対象とし、動画・アニメーション・見開き・連結読み・
-編集・紙めくり中・別ウィンドウでは受け付けない。360度表示からは3Dへ切り替える。
+main context の MainWindow / Fullscreen / 一覧と連動する F12 の DetachedWindow
+（枠なし全画面を含む）の単ページ静止画を対象とする。複数ウィンドウモードの窓と
+メディアウィンドウなどの独立 context、動画・アニメーション・見開き・連結読み・
+編集・紙めくり中では受け付けない。360度表示からは3Dへ切り替える。
 3D中の360度切替は受け付けない。
+F12 の ON / OFF による表示先切替と、main の F11 による MainWindow / Fullscreen 切替では
+3Dを終了し、`FsDepthParallax` の実効キー（既定D）での再開を通知する。
+linked F12 の窓内で F11 により通常表示 / 枠なし全画面を切り替えた場合は3Dを継続する。
+F11 / F12 も既存の `FsToggleWindowMode` / `ToggleDetachedViewerMode` の実効キーを使う。
 3D中も `FsBgCycle`（既定Shift+B）とリングの背景色サイクルを受け付ける。
 透過画像だけで黒→白→市松（AIアップスケール中は黒/白）を循環し、3Dは終了しない。
 書き出しダイアログを開いている間はモーダルのため受け付けない。
 消しゴム・隠蔽加工・補正レイヤーの修飾なしDは、それぞれの編集文脈だけで使う。
 3Dのパネル操作とマウス追従は連続操作のためkeymapの対象外とする。
+見出しの折りたたみ・展開はパネル上の部品へのマウス・タッチ操作なので `KeyAction` を持たない。
 3D中のマウスのCtrl+左クリックは、その画面位置の深さを「止まる深さ」に入れる固定入力。
 ポインター位置を必要とし、離散コマンドではないため `KeyAction` の対象外とする。
 案内は「左Ctrl+クリック」とし、右Ctrlの既定 `FsOriginalPreviewHold` は元画像の一時表示を優先する。
@@ -781,6 +788,7 @@ dispatch 可否とは別の状態遷移であり、取消後の unfocused pass �
 | OS 予約 | <kbd>Alt</kbd>+<kbd>F4</kbd>、<kbd>Alt</kbd>+<kbd>Tab</kbd>、<kbd>Win</kbd> キー系など | Windows 側が先に処理する。mIV の keymap では上書きしない |
 | keyboard focus 移動 | <kbd>Tab</kbd> traversal | 非テキスト widget へ focus が移って `wants_keyboard_input()` が true のまま残り、全 shortcut が停止した履歴と、TextEdit から 1 hop だけ移動する不統一を避けるため、アプリ全体で常に無効。Tab chord 自体は `KeyAction` へ割り当て可能 |
 | フォーカスローカル UI | テキスト入力、IME 変換、コンボボックス、リスト、フォルダツリー、製本並べ替えダイアログ内の矢印 / Enter / Esc / PageUp / PageDown / Home / End など | その UI 部品の中だけで意味を持ち、グローバルショートカットとして外へ漏らさない |
+| 検索欄・フォルダアドレス欄の履歴（§1.756） | 入力フォーカス中の修飾なし <kbd>↓</kbd> = 履歴を開き先頭を選択、開いている間の <kbd>↑</kbd>/<kbd>↓</kbd> = 端で止まる選択移動、<kbd>Enter</kbd>（NumpadEnter 含む）= 選択項目を確定、<kbd>Esc</kbd> = 一覧だけを閉じる | コンボボックスと同じ部品内操作なので `KeyAction` 対象外。IME 変換中は扱わず、入力欄を開いただけでは一覧を出さない。選択なしの Enter は一覧を閉じて通常の確定へ渡す。閉鎖中の ↑ / Esc も従来経路へ残す。未フォーカス欄の▼直後も、viewport/widget単位の既存フォーカス予約が↓・↑・Enterを所有する。消費した押下は egui/native で共有 claim し、背面の検索終了やショートカットへ漏らさない。履歴選択は検索の共通 submit（アドレス欄は既存の移動）へ排他的に渡す。詳細は [入力履歴の設計](search-input-history-plan.md) |
 | 本の構成editor (G4、next-book) | 実ページのクリック、左のページ順ドラッグ・非表示、右のページ指定、各編集button、IME-safe な Enter = 保存 / Escape = キャンセル | 本HUD・本一覧右クリック・「本」menuから開く局所UI。新しい KeyAction は設けない。Enter はフォーカスwidgetがなく確認中でないときだけ保存し、Escape は確認を先に閉じる。保存 / 再読込中は取消を受け付けず、IME変換中は Enter / Escape の保存・取消を行わない。modal owner が背面の閲覧 / メタ情報 / ナビゲータ入力を止める。解除確認は明示buttonで行う。組の変更確認はなく、結果を直接表示し元に戻す/やり直すで修正する |
 | 画像folder→ZIP変換 (G) | 「ZIP に変換」「取消」「閉じる」、IME-safe な Escape = 取消 / 閉じる | folder右クリックと構成対象外案内から開く局所UI。新しい KeyAction / global shortcut は設けない。変換は明示buttonで確定し、取消可能なphaseだけEscapeを受け付ける。保存確定以降は取消しない。process modal ownerがmain / fullscreen / detachedの背面操作と新しいopenを止める |
 | 環境設定の持ち運び | 設定の復元の「環境設定を書き出し…」「環境設定を取り込み…」、説明 Modal の「書き出す」「ファイルを選ぶ」、取り込み後の環境設定の Enter / Escape | ダイアログ内だけのファイル操作で、新しい KeyAction は設けない。Enter / Escape は IME-safe な dialog helper を通す。環境設定表示中は新しい転送入口二つだけを無効化し、既存の復元操作は変更しない。取り込み完了時にも環境設定が開いていれば draft を変更せず通知する。転送 Modal の表示中は背後の環境設定へ Enter / Escape を渡さず、操作カスタマイズの「押して入力」も捕捉を停止する。待機状態と入力欄は保持し、Modal を閉じれば捕捉を再開する。通常の設定復元の表示だけでは捕捉を停止しない。転送 job 中は説明 Modal と設定復元の実行 / キャンセル / × / Enter / Escape を無効にし、メインの背面設定メニュー・ツールバーは既存の設定復元/common modal と説明 Modal で止める。別窓・fullscreen・native 動画への転送専用入力遮断は加えない。検証成功後の環境設定は既存 OK / キャンセルを使う。操作カスタマイズ自体は転送対象外で既存共有を使う |

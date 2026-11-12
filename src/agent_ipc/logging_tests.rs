@@ -25,6 +25,88 @@ fn lines(fixture: &Fixture) -> Vec<String> {
 }
 
 #[test]
+fn search_input_history_is_private_in_agent_responses_and_logs() {
+    let fixture = Fixture::new();
+    fixture.seed_index();
+    let books = fixture._dir.path().join("books");
+    std::fs::create_dir(&books).unwrap();
+    let sentinel = "miv-history-sentinel-756";
+    crate::settings_db::with_db_result(|db| {
+        let mut settings = db.load_into_settings()?;
+        settings.book_root = Some(books.clone());
+        settings
+            .search_input_history
+            .record(crate::ui_pinned_search::PinnedSearchKind::Local, sentinel);
+        db.save_full(&settings)
+    })
+    .unwrap();
+    assert_eq!(
+        crate::settings_db::with_db_result(|db| db.load_into_settings())
+            .unwrap()
+            .search_input_history
+            .len(),
+        1
+    );
+    let collection = fixture
+        .runtime
+        .as_ref()
+        .unwrap()
+        .client()
+        .create_collection("public collection".into())
+        .unwrap()
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    let connection = fixture.connection();
+    for (id, command) in [
+        Command::Status,
+        Command::ListLibrary {
+            kind: LibraryKind::Bookshelf,
+            stars: None,
+            max_stars: None,
+            limit: None,
+            cursor: None,
+        },
+        Command::GetCollection {
+            id: Some(collection.collection_id().to_string()),
+            name: None,
+            limit: None,
+            cursor: None,
+        },
+        Command::SearchItems {
+            query: "cat".into(),
+            kind: Some(ItemKind::Image),
+            limit: Some(2),
+            cursor: None,
+        },
+        Command::ListFolder {
+            path: books.to_string_lossy().into_owned(),
+            subresource: None,
+            min_stars: None,
+            max_stars: None,
+            kinds: None,
+            limit: None,
+            cursor: None,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = fixture.call(&connection, id as u64 + 1, command);
+        assert!(response.result.is_ok(), "{response:?}");
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains(sentinel));
+        assert!(!json.contains("search_input_history"));
+    }
+    assert!(lines(&fixture).iter().all(|line| !line.contains(sentinel)));
+    assert!(
+        lines(&fixture)
+            .iter()
+            .all(|line| !line.contains("search_input_history"))
+    );
+}
+
+#[test]
 fn periodic_hello_and_status_stay_quiet_across_fresh_connections() {
     let fixture = Fixture::new();
     poll(&fixture, AGENT_PROTOCOL_VERSION);

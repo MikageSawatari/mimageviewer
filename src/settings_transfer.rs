@@ -214,6 +214,9 @@ macro_rules! preferences_policy {
         fn parse_items(items: &Map<String, Value>) -> ParsedPreferences {
             let mut result = ParsedPreferences { accepted: Vec::new(), issues: Vec::new(), unknown_count: 0 };
             let mut items = items.clone();
+            if canonicalize_container_icon_kinds(&mut items).is_err() {
+                result.issues.push(issue("種類のアイコンで表示する項目"));
+            }
             if crate::same_name_folder_book::canonicalize(&mut items).is_err() {
                 items.remove(crate::same_name_folder_book::KEY);
                 items.remove(crate::same_name_folder_book::LEGACY_KEY);
@@ -289,7 +292,7 @@ preferences_policy! {
         thumb_name_font_scale_percent: u32 => ("サムネイル一覧の名前の文字サイズ", |v, _raw| (THUMB_NAME_FONT_SCALE_PERCENT_MIN..=THUMB_NAME_FONT_SCALE_PERCENT_MAX).contains(v), plain, plain);
         thumb_name_max_lines: u32 => ("サムネイル一覧の名前の最大行数", |v, _raw| (THUMB_NAME_MAX_LINES_MIN..=THUMB_NAME_MAX_LINES_MAX).contains(v), plain, plain);
         thumb_show_type_icon: bool => ("サムネイルに種類アイコンを表示する", |_, _raw| true, plain, plain);
-        thumb_container_type_icon_only: bool => ("フォルダ・書庫・PDF を種類のアイコンで表示する", |_, _raw| true, plain, plain);
+        thumb_container_icon_kinds: crate::grid_item::ContainerIconKinds => ("種類のアイコンで表示する項目", |_, _raw| true, plain, plain);
         thumb_name_prioritize_width: bool => ("ファイル名の表示幅を優先する", |_, _raw| true, plain, plain);
         selection_info_display_mode: SelectionInfoDisplayMode => ("選択項目の情報表示", |v, _raw| !matches!(v, SelectionInfoDisplayMode::Unknown), plain, plain);
         thumb_tooltip_show_filename: bool => ("サムネイルツールチップ：ファイル名", |_, _| true, plain, plain);
@@ -344,6 +347,7 @@ preferences_policy! {
         pause_indexer_while_minimized: bool => ("最小化中は索引を停止", |_, _| true, plain, plain);
         write_rating_to_xmp: bool => ("評価をXMPに保存", |_, _| true, plain, plain);
         reading_history_enabled: bool => ("閲覧履歴を記録", |_, _| true, plain, plain);
+        save_search_input_history: bool => ("検索欄の入力履歴を保存する", |_, _| true, plain, plain);
         default_spread_mode: SpreadMode => ("標準の見開き設定", |v, _| SpreadMode::all().contains(v), plain, plain);
         apply_default_spread_to_plain_folders: bool => ("通常フォルダにも既定のページ構成を使う", |_, _| true, plain, plain);
         follow_document_reading_direction: bool => ("文書の綴じ方向に従う", |_, _| true, plain, plain);
@@ -504,6 +508,7 @@ preferences_policy! {
         last_cursor_rows_above => "利用データ・登録先・履歴・検索対象";
         recent_folders => "利用データ・登録先・履歴・検索対象";
         quick_folder_recent_folders => "利用データ・登録先・履歴・検索対象";
+        search_input_history => "利用データ・登録先・履歴・検索対象";
         quick_folder_slots => "利用データ・登録先・履歴・検索対象";
         quick_folder_drive_current_dirs => "利用データ・登録先・履歴・検索対象";
         window_pos => "runtime overlay / PC のウィンドウ配置";
@@ -904,6 +909,76 @@ pub fn write_preferences(path: &Path, json: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn container_icon_kinds_legacy_transfer_partial_and_new_precedence() {
+        use crate::grid_item::ContainerIconKinds as Kinds;
+        let partial = Kinds {
+            folder: true,
+            archive: false,
+            pdf_epub: true,
+        };
+        for (items, expected, accepted, issues) in [
+            (
+                json!({"thumb_container_type_icon_only": true}),
+                Kinds::ALL,
+                1,
+                0,
+            ),
+            (
+                json!({"thumb_container_type_icon_only": false}),
+                Kinds::NONE,
+                1,
+                0,
+            ),
+            (json!({}), partial, 0, 0),
+            (
+                json!({"thumb_container_type_icon_only": "bad"}),
+                partial,
+                0,
+                1,
+            ),
+            (
+                json!({"thumb_container_icon_kinds": partial, "thumb_container_type_icon_only": true}),
+                partial,
+                1,
+                0,
+            ),
+            (
+                json!({"thumb_container_icon_kinds": partial, "thumb_container_type_icon_only": "bad"}),
+                partial,
+                1,
+                0,
+            ),
+            (
+                json!({"thumb_container_icon_kinds": "bad", "thumb_container_type_icon_only": true}),
+                partial,
+                0,
+                1,
+            ),
+        ] {
+            let mut destination = Settings {
+                thumb_container_icon_kinds: partial,
+                ..Settings::default()
+            };
+            let report = parse_preferences(&document(items))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(report.accepted_count, accepted);
+            assert_eq!(report.unknown_count, 0);
+            assert_eq!(report.issues.len(), issues);
+            if issues != 0 {
+                assert_eq!(report.issues[0], issue("種類のアイコンで表示する項目"));
+            }
+            assert_eq!(destination.thumb_container_icon_kinds, expected);
+            let (map, _) = project(capture_export(&destination));
+            assert_eq!(
+                map["thumb_container_icon_kinds"],
+                serde_json::to_value(expected).unwrap()
+            );
+            assert!(!map.contains_key("thumb_container_type_icon_only"));
+        }
+    }
+
+    #[test]
     fn same_name_folder_book_legacy_transfer_partial_and_new_precedence() {
         use crate::same_name_folder_book::{KEY, LEGACY_KEY, SameNameFolderBookPolicy as Policy};
         for (old, expected) in [(true, Policy::PreferBook), (false, Policy::ShowBoth)] {
@@ -1229,6 +1304,7 @@ mod tests {
         settings.pause_indexer_while_minimized = !settings.pause_indexer_while_minimized;
         settings.write_rating_to_xmp = !settings.write_rating_to_xmp;
         settings.reading_history_enabled = !settings.reading_history_enabled;
+        settings.save_search_input_history = !settings.save_search_input_history;
         settings.default_spread_mode = different_enum(
             &settings.default_spread_mode,
             &[
@@ -2067,14 +2143,23 @@ mod tests {
     }
 
     #[test]
-    fn thumb_container_type_icon_only_transfer_roundtrip_missing_invalid() {
-        for enabled in [false, true] {
+    fn thumb_container_icon_kinds_transfer_roundtrip_missing_invalid() {
+        for mask in 0..8 {
+            let selected = crate::grid_item::ContainerIconKinds {
+                folder: mask & 1 != 0,
+                archive: mask & 2 != 0,
+                pdf_epub: mask & 4 != 0,
+            };
             let source = Settings {
-                thumb_container_type_icon_only: enabled,
+                thumb_container_icon_kinds: selected,
                 ..Settings::default()
             };
             let mut destination = Settings {
-                thumb_container_type_icon_only: !enabled,
+                thumb_container_icon_kinds: crate::grid_item::ContainerIconKinds {
+                    folder: !selected.folder,
+                    archive: !selected.archive,
+                    pdf_epub: !selected.pdf_epub,
+                },
                 ..Settings::default()
             };
             let exported = export_preferences(&source).unwrap();
@@ -2082,22 +2167,31 @@ mod tests {
                 .unwrap()
                 .apply_to(&mut destination);
             assert!(report.issues.is_empty());
-            assert!(report.changed_fields.iter().any(|label| {
-                label == "フォルダ・書庫・PDF を種類のアイコンで表示する"
-            }));
-            assert_eq!(destination.thumb_container_type_icon_only, enabled);
+            assert!(
+                report
+                    .changed_fields
+                    .iter()
+                    .any(|label| { label == "種類のアイコンで表示する項目" })
+            );
+            assert_eq!(destination.thumb_container_icon_kinds, selected);
             parse_preferences(&document(json!({})))
                 .unwrap()
                 .apply_to(&mut destination);
-            assert_eq!(destination.thumb_container_type_icon_only, enabled);
-            for invalid in [json!("true"), json!(1), Value::Null] {
-                let report = parse_preferences(&document(
-                    json!({"thumb_container_type_icon_only": invalid}),
-                ))
-                .unwrap()
-                .apply_to(&mut destination);
+            assert_eq!(destination.thumb_container_icon_kinds, selected);
+            for invalid in [
+                json!("true"),
+                json!(1),
+                Value::Null,
+                json!({}),
+                json!({"folder": true, "archive": false}),
+                json!({"folder": true, "archive": false, "pdf_epub": 1}),
+            ] {
+                let report =
+                    parse_preferences(&document(json!({"thumb_container_icon_kinds": invalid})))
+                        .unwrap()
+                        .apply_to(&mut destination);
                 assert_eq!(report.issues.len(), 1);
-                assert_eq!(destination.thumb_container_type_icon_only, enabled);
+                assert_eq!(destination.thumb_container_icon_kinds, selected);
             }
         }
     }
@@ -2105,7 +2199,7 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 493);
+        assert_eq!(entries.len(), 495);
         assert_eq!(
             entries
                 .iter()
@@ -2118,7 +2212,7 @@ mod tests {
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            335
+            336
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -2664,6 +2758,11 @@ mod tests {
     #[test]
     fn excluded_private_values_never_reach_export_or_diagnostics() {
         let mut settings = private_destination();
+        for kind in crate::ui_pinned_search::PinnedSearchKind::ALL {
+            settings
+                .search_input_history
+                .record(kind, "miv-history-sentinel-756");
+        }
         settings
             .image_ext_priority
             .push(r"C:\Users\private-alice\SECRET_PIN_184729".into());
@@ -2680,6 +2779,7 @@ mod tests {
             "private-lut",
             "private-smart-folder",
             "secret.example",
+            "miv-history-sentinel-756",
         ] {
             assert!(!exported.json.contains(needle));
             assert!(!diagnostic.contains(needle));

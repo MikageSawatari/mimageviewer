@@ -963,7 +963,11 @@ fn container_type_icon_loaded_projection_matches_no_art_paint_layout_and_hits() 
             for (item, drive) in cases {
                 for show_type_icon in [false, true] {
                     for prioritize_width in [false, true] {
-                        let projected = effective_thumbnail_state(&item, &loaded, true);
+                        let projected = effective_thumbnail_state(
+                            &item,
+                            &loaded,
+                            crate::grid_item::ContainerIconKinds::ALL,
+                        );
                         assert!(matches!(projected, ThumbnailState::NoArt));
                         let expected = container_projection_paint(
                             &ctx,
@@ -1016,7 +1020,8 @@ fn container_type_icon_preserves_loaded_image_and_book_page_paint() {
             content_type: None,
         },
     ] {
-        let projected = effective_thumbnail_state(&item, &loaded, true);
+        let projected =
+            effective_thumbnail_state(&item, &loaded, crate::grid_item::ContainerIconKinds::ALL);
         assert!(std::ptr::eq(projected, &loaded));
         let off = container_projection_paint(&ctx, &item, &loaded, false, true, false);
         let on = container_projection_paint(&ctx, &item, projected, false, true, false);
