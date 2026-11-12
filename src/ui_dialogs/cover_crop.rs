@@ -352,12 +352,22 @@ impl App {
                                     crop,
                                 ) {
                                     self.show_feedback_toast(
-                                        "代表サムネの範囲を設定しました".into(),
+                                        if action == Action::Clear {
+                                            "代表サムネの範囲を解除しました"
+                                        } else {
+                                            "代表サムネの範囲を設定しました"
+                                        }
+                                        .into(),
                                     );
                                     true
                                 } else {
                                     self.show_feedback_warning(
-                                        "代表サムネの範囲を保存できませんでした".into(),
+                                        if action == Action::Clear {
+                                            "代表サムネの範囲を解除できませんでした"
+                                        } else {
+                                            "代表サムネの範囲を保存できませんでした"
+                                        }
+                                        .into(),
                                     );
                                     true
                                 }
@@ -1047,6 +1057,67 @@ mod tests {
                 .cover_crop,
             crop
         );
+    }
+
+    #[test]
+    fn cover_crop_modal_accept_and_clear_report_their_own_success_and_failure() {
+        use crate::feedback::FeedbackKind;
+        for (button, success, failure) in [
+            (
+                "OK",
+                "代表サムネの範囲を設定しました",
+                "代表サムネの範囲を保存できませんでした",
+            ),
+            (
+                "手動の範囲を解除",
+                "代表サムネの範囲を解除しました",
+                "代表サムネの範囲を解除できませんでした",
+            ),
+        ] {
+            for writable in [true, false] {
+                let (app, tx, root, crop) = fake_loading_app();
+                let mut h = app_harness(app);
+                tx.send((7, Ok(fake_prepared(Some(crop))))).unwrap();
+                h.run_steps(4);
+                if !writable {
+                    // Force the real writer to fail without touching external data.
+                    h.state_mut().folder_thumb_pin_db = Some(Arc::new(
+                        crate::folder_thumb_pins::FolderThumbPinDb::open_readonly(
+                            &h.state().tmp.path().join("crop-pins.db"),
+                        )
+                        .unwrap(),
+                    ));
+                }
+                h.state_mut().feedback_toasts_for_test.clear();
+                h.get_by_label(button).click();
+                h.run_steps(2);
+                assert!(!h.state().cover_crop_dialog_open());
+                let expected = if writable {
+                    (success.to_owned(), FeedbackKind::Info)
+                } else {
+                    (failure.to_owned(), FeedbackKind::Warning)
+                };
+                assert_eq!(h.state().feedback_toasts_for_test, vec![expected]);
+                let saved = h
+                    .state()
+                    .folder_thumb_pin_db
+                    .as_ref()
+                    .unwrap()
+                    .lookup(&root)
+                    .unwrap();
+                if writable {
+                    assert_eq!(saved.cover_crop, (button == "OK").then_some(crop));
+                } else {
+                    assert!(matches!(
+                        saved.source,
+                        FolderPinSource::File {
+                            kind: crate::folder_thumb_pins::FileKind::Folder,
+                            ..
+                        }
+                    ));
+                }
+            }
+        }
     }
 
     #[test]

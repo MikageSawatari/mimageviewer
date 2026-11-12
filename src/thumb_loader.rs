@@ -6736,6 +6736,8 @@ pub(crate) fn load_one_cached(
         source_dims.unwrap_or_else(|| (img.width(), img.height())),
     );
     let offer_raster = offer_started.map(|at| at.finish()).unwrap_or_default();
+    #[cfg(test)]
+    cover_auto_eval_decode::capture(&img, source_dims, dct_stats, orientation);
     let mut img = img;
     let mut source_dims = source_dims;
     let mut effective_crop = cover_crop;
@@ -7230,6 +7232,10 @@ pub(crate) fn with_test_pdf_render_result<T>(
 ) -> T {
     tests::with_pdf_render_result(result, run)
 }
+
+#[cfg(test)]
+#[path = "thumb_loader/cover_auto_eval_decode.rs"]
+pub(crate) mod cover_auto_eval_decode;
 
 #[cfg(test)]
 mod tests {

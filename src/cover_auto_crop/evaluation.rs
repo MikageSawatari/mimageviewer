@@ -1,5 +1,10 @@
 //! Opt-in evaluation: input books and all generated artifacts stay outside the
 //! source tree when MIV_COVER_AUTO_EVAL_OUTPUT names an external directory.
+//!
+//! MIV_COVER_AUTO_EVAL_DECODE=worker selects the real thumbnail worker's source
+//! decode (default: full). MIV_COVER_AUTO_EVAL_DISPLAY_PX overrides its display
+//! target, 256..=2048; the default is the App startup geometry's 256 pixels.
+//! thumb_px comes from Settings::default() (512). No saved user settings are read.
 use super::*;
 use image::Rgb;
 use serde::Deserialize;
@@ -17,11 +22,54 @@ struct Truth {
     page_aspect: Option<f64>,
 }
 
+struct DecodeMode {
+    worker: bool,
+    display_px: u32,
+    thumb_px: u32,
+}
+
+impl DecodeMode {
+    fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
+        let worker = match std::env::var("MIV_COVER_AUTO_EVAL_DECODE").as_deref() {
+            Err(std::env::VarError::NotPresent) | Ok("full") => false,
+            Ok("worker") => true,
+            _ => return Err("MIV_COVER_AUTO_EVAL_DECODE must be full or worker".into()),
+        };
+        // App initialization: last_cell_size/h=200, pixels_per_point=1.
+        // Runtime cell geometry/DPI can change display_px; it is not a setting.
+        let display_px = std::env::var("MIV_COVER_AUTO_EVAL_DISPLAY_PX")
+            .ok()
+            .map(|value| value.parse::<u32>())
+            .transpose()?
+            .unwrap_or_else(|| crate::thumb_loader::compute_display_px(200.0, 200.0, 1.0));
+        if !(256..=2048).contains(&display_px) {
+            return Err("MIV_COVER_AUTO_EVAL_DISPLAY_PX must be in 256..=2048".into());
+        }
+        Ok(Self {
+            worker,
+            display_px,
+            thumb_px: crate::settings::Settings::default().thumb_px,
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        if self.worker { "worker" } else { "full" }
+    }
+}
+
+struct LoadedCase {
+    image: DynamicImage,
+    aspect: Option<f64>,
+    zip_leaf: Option<String>,
+    worker: Option<crate::thumb_loader::cover_auto_eval_decode::DecodedCover>,
+}
+
 fn load_case(
     directory: &Path,
     name: &str,
     truth: &Truth,
-) -> Result<(DynamicImage, Option<f64>, Option<String>), Box<dyn std::error::Error>> {
+    mode: &DecodeMode,
+) -> Result<LoadedCase, Box<dyn std::error::Error>> {
     let zip_path = directory.join(format!("{name}.zip"));
     if zip_path.is_file() {
         let mut archive = zip::ZipArchive::new(std::fs::File::open(&zip_path)?)?;
@@ -48,13 +96,42 @@ fn load_case(
         // aspect is allowed only for PNG dummies, never to rescue a ZIP sample.
         let aspect =
             crate::cover_auto_sample::sample_zip_page_aspect(&zip_path, &leaf, prefix.as_deref());
-        Ok((image::load_from_memory(&bytes)?, aspect, Some(leaf)))
+        let worker = mode
+            .worker
+            .then(|| {
+                crate::thumb_loader::cover_auto_eval_decode::decode(
+                    &zip_path,
+                    Some(&leaf),
+                    mode.display_px,
+                    mode.thumb_px,
+                )
+            })
+            .transpose()?;
+        Ok(LoadedCase {
+            image: image::load_from_memory(&bytes)?,
+            aspect,
+            zip_leaf: Some(leaf),
+            worker,
+        })
     } else {
-        Ok((
-            image::open(directory.join(format!("{name}.png")))?,
-            truth.page_aspect,
-            None,
-        ))
+        let path = directory.join(format!("{name}.png"));
+        let worker = mode
+            .worker
+            .then(|| {
+                crate::thumb_loader::cover_auto_eval_decode::decode(
+                    &path,
+                    None,
+                    mode.display_px,
+                    mode.thumb_px,
+                )
+            })
+            .transpose()?;
+        Ok(LoadedCase {
+            image: image::open(path)?,
+            aspect: truth.page_aspect,
+            zip_leaf: None,
+            worker,
+        })
     }
 }
 
@@ -102,6 +179,8 @@ fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Erro
     let output = std::env::var_os("MIV_COVER_AUTO_EVAL_OUTPUT")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target/cover-auto-eval"));
+    let mode = DecodeMode::from_env()?;
+    let _worker_data = mode.worker.then(crate::data_dir::TestDataDirGuard::new);
     std::fs::create_dir_all(&output)?;
     let truth: BTreeMap<String, Truth> =
         serde_json::from_slice(&std::fs::read(directory.join("truth.json"))?)?;
@@ -121,15 +200,33 @@ fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Erro
     let mut reasons = BTreeMap::<String, u32>::new();
     let mut rows = Vec::new();
     for (index, (name, truth)) in truth.iter().enumerate() {
-        let (image, aspect, zip_leaf) = load_case(&directory, name, truth)?;
+        let LoadedCase {
+            mut image,
+            aspect,
+            zip_leaf,
+            worker,
+        } = load_case(&directory, name, truth, &mode)?;
+        if let Some(decoded) = &worker {
+            // Worker-mode truth coordinates are EXIF-upright, like CoverCrop.
+            // This reference raster is used only for the comparison sheet.
+            image = crate::thumb_loader::apply_orientation(image, decoded.orientation);
+        }
         let dims = (image.width(), image.height());
-        let raster = analysis_raster(&image);
+        let decoded_image = worker.as_ref().map_or(&image, |decoded| &decoded.image);
+        let native_dims = worker.as_ref().map_or(dims, |decoded| decoded.native_dims);
+        if native_dims != dims {
+            return Err(format!(
+                "{name}: native/reference dimensions differ: {native_dims:?} vs {dims:?}"
+            )
+            .into());
+        }
+        let raster = analysis_raster(decoded_image);
         let binding = if truth.ltr {
             ReadingDirection::Ltr
         } else {
             ReadingDirection::Rtl
         };
-        let detected = cover_auto_crop(&raster, dims, aspect, binding);
+        let detected = cover_auto_crop(&raster, native_dims, aspect, binding);
         let expected = truth.front.map(|x| {
             let y = truth.front_y.unwrap_or([0.0, dims.1 as f64]);
             [x[0], y[0], x[1], y[1]]
@@ -169,7 +266,9 @@ fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Erro
             .err()
             .map(AutoCropDecline::as_str)
             .unwrap_or("cropped");
-        rows.push(json!({"index":index,"name":name,"status":status,"reason":reason,"iou":iou,"truth":expected,"prediction":predicted,"page_aspect":aspect,"zip_leaf":zip_leaf,"ltr":truth.ltr}));
+        rows.push(json!({"index":index,"name":name,"status":status,"reason":reason,"iou":iou,"truth":expected,"prediction":predicted,"page_aspect":aspect,"zip_leaf":zip_leaf,"ltr":truth.ltr,
+            "decoded_dims":[decoded_image.width(),decoded_image.height()],"native_dims":native_dims,
+            "dct_scale_num":worker.as_ref().and_then(|decoded|decoded.dct_scale_num),"orientation":worker.as_ref().map(|decoded|decoded.orientation)}));
         let mut tile = image.thumbnail(cell_width - 12, cell_height - 14).to_rgb8();
         let project = |r: [f64; 4]| {
             [
@@ -202,7 +301,8 @@ fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Erro
         }
     }
     sheet.save(output.join("sheet.png"))?;
-    let summary = json!({"algorithm":"autocrop:v1","iou_threshold":0.85,"good":good,"wrong":wrong,"declined":declined,
+    let summary = json!({"algorithm":"autocrop:v1","decode_mode":mode.name(),"display_px":mode.display_px,"thumb_px":mode.thumb_px,
+        "jpeg_decode_target":mode.display_px.max(mode.thumb_px),"iou_threshold":0.85,"good":good,"wrong":wrong,"declined":declined,
         "negative_cropped":negative_cropped,"negative_declined":negative_declined,"decline_reasons":reasons,"sheet_columns":columns,"rows":rows});
     std::fs::write(
         output.join("summary.json"),
