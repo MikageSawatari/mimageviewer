@@ -4588,6 +4588,8 @@ impl App {
                 self.global_search.accepted,
                 SearchAccepted::Metadata { applied: None }
             )
+            && !self.items_are_global_search_view
+            && self.global_search.drill.is_none()
         {
             return Some("Everything 検索".to_string());
         }
@@ -5654,6 +5656,167 @@ pub(crate) mod tests {
             root,
             "root and child have distinct input lifetimes"
         );
+    }
+
+    /// Keep applied conditions unaccepted while exercising a real RatedBatch and
+    /// the existing synchronous projection boundary for the retained partial rows.
+    fn section690_streamed_rows_without_applied_conditions(
+        app: &mut App,
+        ctx: &egui::Context,
+        path: &Path,
+    ) -> crossbeam_channel::Sender<SearchStreamEvent> {
+        let stream = section1409_metadata_stream(app, ctx, "test");
+        section1409_settle_metadata(app, ctx, |app| {
+            app.items_are_global_search_view && app.items.is_empty()
+        });
+        app.hold_next_search_ready_for_test();
+        stream
+            .send(SearchStreamEvent::Batch {
+                hits: vec![GlobalHit {
+                    kind: IndexKind::Image,
+                    path: path.to_string_lossy().into_owned(),
+                    score: 1.0,
+                    mtime: 0,
+                    file_size: Some(0),
+                    stars: 0,
+                }],
+                scanned_candidates: 1,
+                valid_hits: 1,
+                visibility_notice: None,
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while app.search_prepare_metrics_for_test().rated_batches != 1 {
+            app.poll_global_search_events(ctx);
+            assert!(
+                Instant::now() < deadline,
+                "streamed label RatedBatch missing"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // The label must explain rows published without an applied spec too.
+        // Pause the prepared owner and use the production fallback projection,
+        // which installs rows without publishing MetadataAppliedSpec.
+        let prepare = app.global_search.page_edit_prepare.take();
+        app.rebuild_items_from_global_search();
+        app.global_search.page_edit_prepare = prepare;
+        app.finish_page_identity_preparation_for_test();
+        assert!(!app.global_search.done);
+        assert!(app.items_are_global_search_view);
+        assert_eq!(app.items, vec![GridItem::Image(path.to_owned())]);
+        assert!(matches!(
+            app.global_search.accepted,
+            SearchAccepted::Metadata { applied: None }
+        ));
+        stream
+    }
+
+    #[test]
+    fn global_search_label_streamed_unapplied_rows_survive_everything_switch_without_draft() {
+        use crate::ui_pinned_search::PinnedSearchKind as Kind;
+        for pinned in [false, true] {
+            for aggregate in [false, true] {
+                let mut app = crate::app::setup_app_for_test();
+                app.settings.show_toolbar_search_metadata = pinned;
+                app.settings.show_toolbar_search_everything = pinned;
+                let ctx = egui::Context::default();
+                ctx.begin_pass(egui::RawInput::default());
+                let path = app.tmp.path().join("hit.png");
+                image::RgbImage::new(2, 3).save(&path).unwrap();
+                let _stream =
+                    section690_streamed_rows_without_applied_conditions(&mut app, &ctx, &path);
+                if aggregate {
+                    let prepare = app.global_search.page_edit_prepare.take();
+                    app.global_search.aggregate = true;
+                    app.rebuild_items_from_global_search();
+                    app.global_search.page_edit_prepare = prepare;
+                    app.finish_page_identity_preparation_for_test();
+                }
+                let items = app.items.clone();
+                assert_eq!(
+                    app.search_with_text_availability(&ctx, Kind::Everything),
+                    Ok(())
+                );
+                app.open_search_with_text(
+                    &ctx,
+                    crate::search_request::SearchRequest {
+                        target: Kind::Everything,
+                        query: "everything draft".into(),
+                    },
+                );
+                assert_eq!(app.global_search.source, SearchSource::Everything);
+                assert!(matches!(
+                    app.global_search.accepted,
+                    SearchAccepted::Metadata { applied: None }
+                ));
+                assert!(app.items_are_global_search_view);
+                assert_eq!(app.items, items);
+                assert!(app.global_search.last_executed.is_empty());
+                if pinned {
+                    assert_eq!(app.global_search.metadata_draft, "test");
+                }
+                assert_eq!(
+                    app.global_search_location_label().as_deref(),
+                    Some("🌐 アイテム検索")
+                );
+                app.update_global_search_address();
+                assert_eq!(app.address, "🌐 アイテム検索");
+                let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
+            }
+        }
+    }
+
+    #[test]
+    fn global_search_label_unapplied_physical_child_keeps_metadata_breadcrumb_on_everything_switch()
+    {
+        use crate::ui_pinned_search::PinnedSearchKind as Kind;
+        for pinned in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            app.settings.show_toolbar_search_metadata = pinned;
+            app.settings.show_toolbar_search_everything = pinned;
+            let ctx = egui::Context::default();
+            ctx.begin_pass(egui::RawInput::default());
+            let folder = app.tmp.path().join("fx690");
+            std::fs::create_dir(&folder).unwrap();
+            let path = folder.join("hit.png");
+            image::RgbImage::new(2, 3).save(&path).unwrap();
+            let _stream =
+                section690_streamed_rows_without_applied_conditions(&mut app, &ctx, &path);
+            app.drill_into_container(folder.clone(), false);
+            app.advance_drilled_current_path(&folder);
+            app.load_folder(folder);
+            app.settle_open_path_classification_for_test();
+            app.finish_page_identity_preparation_for_test();
+            assert!(!app.items_are_global_search_view);
+            assert!(app.global_search.drill.is_some());
+            assert!(matches!(
+                app.global_search.accepted,
+                SearchAccepted::Metadata { applied: None }
+            ));
+            let items = app.items.clone();
+            app.open_search_with_text(
+                &ctx,
+                crate::search_request::SearchRequest {
+                    target: Kind::Everything,
+                    query: "everything draft".into(),
+                },
+            );
+            assert_eq!(app.global_search.source, SearchSource::Everything);
+            assert!(!app.items_are_global_search_view);
+            assert!(app.global_search.drill.is_some());
+            assert_eq!(app.items, items);
+            assert!(app.global_search.last_executed.is_empty());
+            if pinned {
+                assert_eq!(app.global_search.metadata_draft, "test");
+            }
+            assert_eq!(
+                app.global_search_location_label().as_deref(),
+                Some("🌐 アイテム検索 > fx690")
+            );
+            app.update_global_search_address();
+            assert_eq!(app.address, "🌐 アイテム検索 > fx690");
+            let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
+        }
     }
 
     fn section1409_metadata_stream(

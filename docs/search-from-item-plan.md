@@ -738,7 +738,8 @@ Everything の採用前にも Metadata のラベルへ進んでいたこと。�
 実行中には語と既存の「検索中」を表示できる（`src/global_search_ui.rs:3189`、`:3227`）。
 語のない一覧・集約は `🌐 アイテム検索`、ドリルインは `🌐 アイテム検索 > fx690` の形とする。
 Everything の欄を選んでも、Metadata の `applied: Some` があれば表示中の Metadata の語・件数・ドリルインを維持する。
-`source == Everything` かつ `accepted == Metadata { applied: None }` のときだけ `Everything 検索` とし、
+`source == Everything` に加え、`accepted == Metadata { applied: None }`、`!items_are_global_search_view`、
+`drill.is_none()` の 3 条件が揃うときだけ `Everything 検索` とし、
 採用済み Everything の語・件数・ドリルインは従来どおり優先する。
 実行中の進捗は既存の「Everything ファイル名検索」ダイアログにあり、この簡潔なラベルと矛盾しない。
 `update_global_search_address` の呼出し時期・検索状態・入力動作は変更していない。
@@ -768,9 +769,9 @@ Everything の採用は既存の合成 lifecycle fixture を使い、Enter の�
 初回差分は `source` だけで `Everything 検索` を返していたため、上記の `applied: None` 条件を追加した。
 `switch_search_source` は producer / prepare を退役し `last_executed` を消す一方、accepted と表示中の項目は保持する
 （`src/global_search_ui/everything.rs:256`、`:261`、`:267`、`:272`）。そのため採用済み Metadata は `applied.query` で説明する。
-初回 Ctrl+G の実行中で `applied: None` の場合は、Metadata 結果の採用前であり、切替時にその未採用の検索も取消されるため
-`Everything 検索` を選ぶ。実行済み条件の採用資格は Done または受信済み Batch を必要とし、項目の採用と同じ処理内で
-accepted へ反映される（`src/global_search_ui.rs:3594`、`:3670`）。
+この追補では `applied: None` を結果未表示と判断したが、独立レビュー P2（対象 `072d66476`）で誤りを確認した。
+実行済み条件を accepted に反映する処理（`src/global_search_ui.rs:3594`、`:3670`）と、行の設置・途中結果の再投影は同一ではない。
+worker の取消は既に表示された途中の行を取り除かない。現在の判定は次の P2 追補で訂正する。
 
 回帰をさらに 2 件追加（本節の追加は計 6 件）。完了済み Metadata 4 件 → Everything への名前注入 → Metadata の語・件数・
 集約・ドリルインとアドレスの保持 → Enter → 合成 Everything 結果の採用と表示切替を常設 ON/OFF で検査する。
@@ -784,4 +785,39 @@ prepare の退役・実行語の消去・一覧不変・`Everything 検索` を�
 （追加 6 件を含む、実行 32.834 秒、ビルド再利用 1.22 秒、範囲外 17,116 件）。
 ログは `target/search-title-verification/metadata-retained-label-tests.log` と
 `metadata-retained-related-tests-final.log`。初回の失敗ログは `metadata-retained-related-tests.log`。
+最後に `cargo fmt`（引数なし）を適用し、`git diff --check` で差分を確認。git 書き込み・アプリ起動は行わない。
+
+### 独立レビュー P2: 未 applied の途中行・結果の続きも維持
+
+`Everything 検索` は、Everything 欄の選択に加えて Metadata の applied なし・検索結果行の表示でない・drill なしをすべて要求する。
+`items_are_global_search_view` は通常の項目設置で false（`src/app.rs:45308`）となり、検索の行を設置する共通処理が true に
+上書きする（`src/global_search_ui.rs:2669`）。そのため途中結果・一覧・集約も true で表せる。
+ドリルインは `drill_into_container`（`:4284`）が drill を設定し、結果から実フォルダ・ZIP・PDF を開く処理は
+`advance_drilled_current_path`（`:4324`、`:4334`、`:4358`）で drill を設定・更新してから通常の項目設置へ進む
+（`src/app.rs:38392`）。この場合は flag が false でも drill が残る。検索終了は flag と drill の両方を解除する
+（`src/global_search_ui.rs:3073`、`:3085`）。検索を開いただけでは以前の物理行を保持し、flag を立てない（`:2972`、`:4092`）。
+確認した範囲で追加条件が必要な状態はなく、検索結果またはその続きはアイテム検索の文言とする。
+
+切替で `last_executed` が消え、applied もない場合は `🌐 アイテム検索`（語・件数なし）、drill 中は
+`🌐 アイテム検索 > fx690` の形にする。常設 Metadata 欄 ON で下書きが残っていても語の代用に使わない。
+
+別件の既存不具合として、Everything 欄へ切替後のソートが `src/app.rs:29065` → `rebuild_items_from_global_search` を経て、
+保持された `all_hits` から Metadata の行を再投影する経路を記録する（prepare がない場合の同期投影は
+`src/global_search_ui.rs:4180` 以降）。今回は修正せず、ラベルから `all_hits` を見て表示を取り繕う処理も追加しない。
+変更前は常設欄 ON のこの経路で残存下書きと件数を表示していたが、今回の受入仕様では語・件数なしになる。
+
+回帰を `src/global_search_ui.rs` に 2 件追加（本節の追加は計 8 件）。実 RatedBatch を受信後、Ready を保持し、
+通常の同期投影境界で未 applied の途中行を作ってから Everything へ切替える（常設 ON/OFF、一覧/集約）。
+もう 1 件は同じ途中結果から実フォルダを開き、flag=false・drill ありで切替えて breadcrumb と一覧不変を検査する。
+いずれも常設欄の保持下書きがラベルに混入しないことを検査する。以前の名前注入・採用済み Metadata・Enter 後の採用の
+回帰も同じ関連 filter で再実行した。以前の初回検索切替テストは poll 前で行をまだ設置していない
+（flag=false・drill なし）ケースとして維持し、途中行を表示済みのケースを今回補う。
+
+最初のラベル回帰は既存 6 件成功・新規 2 件失敗。同期投影後のページ識別情報準備を待たずに入力・実フォルダ移動を試みていた
+fixture の不備で、準備中の既存 gate（`src/app.rs:24292`、`:31744`）に拒否された。
+`finish_page_identity_preparation_for_test` で実際の準備完了を待つようテストを修正し、製品側の gate・判定条件は変更していない。
+
+修正後は同じ共通ランナー（Owner=`codex-690t`）でラベル回帰 8 件すべて成功（実行 2.047 秒、コンパイル 2分37秒）、
+前回と同じ関連 filter の 315 件すべて成功（追加 8 件を含む、実行 34.971 秒、ビルド再利用 1.58 秒、範囲外 17,116 件）。
+ログは `target/search-title-verification/p2-label-tests-final.log` と `p2-related-tests.log`、初回の fixture 不備は `p2-label-tests.log`。
 最後に `cargo fmt`（引数なし）を適用し、`git diff --check` で差分を確認。git 書き込み・アプリ起動は行わない。
