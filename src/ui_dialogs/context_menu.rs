@@ -3652,7 +3652,7 @@ mod caption_menu_tests {
         ] {
             let target =
                 app.context_menu_target(0, app.items[0].clone(), false, false, None, surface, None);
-            let nodes = app.context_menu_nodes(&target, false);
+            let nodes = app.context_menu_nodes(&egui::Context::default(), &target, false);
             assert_eq!(
                 nodes.iter().any(|node| matches!(
                     node,
