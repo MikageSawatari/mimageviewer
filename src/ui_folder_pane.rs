@@ -663,6 +663,14 @@ impl App {
                         nav = Some(row.path.clone());
                     }
                 }
+                if resp.clicked_by(egui::PointerButton::Primary)
+                    || ((row.expanded || row.has_children_or_unknown)
+                        && arrow_resp.clicked_by(egui::PointerButton::Primary))
+                {
+                    // Pointer clicks target an already visible row. Retire only
+                    // their new reveal; keyboard/accessibility requests still scroll.
+                    self.folder_pane.cursor_scroll = FolderPaneCursorScroll::Idle;
+                }
                 if cursor_scroll != FolderPaneCursorScroll::Idle && row.is_cursor {
                     cursor_drawn = true;
                     if cursor_scroll == FolderPaneCursorScroll::Requested
