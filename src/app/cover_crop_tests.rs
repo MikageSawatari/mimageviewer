@@ -1,6 +1,37 @@
 use super::*;
 use crate::folder_thumb_pins::{CoverCrop, FileKind, FolderPin, FolderPinSource, PinKeyMode};
 
+impl App {
+    /// Exercise the ordinary tile builder from the crop-dialog integration tests.
+    pub(crate) fn cover_crop_tile_request_for_test(&self, idx: usize) -> LoadRequest {
+        let item = &self.items[idx];
+        let path = match item {
+            GridItem::ZipFile(path) | GridItem::PdfFile(path) => path,
+            _ => panic!("rotation fixture expects a ZIP/PDF book tile"),
+        };
+        let metadata = std::fs::metadata(path).unwrap();
+        make_load_request_with_visibility(
+            item,
+            idx,
+            crate::ui_helpers::mtime_secs(&metadata),
+            metadata.len() as i64,
+            false,
+            None,
+            Some(crate::settings::SortOrder::Numeric),
+            3,
+            &self.folder_pin_map,
+            &HashMap::new(),
+            None,
+            self.current_folder.as_deref(),
+            self.folder_thumb_pin_db.as_deref(),
+            None,
+            false,
+            &Default::default(),
+        )
+        .unwrap()
+    }
+}
+
 fn thumbnail_bytes() -> Vec<u8> {
     let mut bytes = std::io::Cursor::new(Vec::new());
     image::DynamicImage::new_rgb8(2, 2)

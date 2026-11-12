@@ -954,7 +954,7 @@ mod tests {
         (app, tx, root, crop)
     }
 
-    fn app_harness(
+    pub(super) fn app_harness(
         app: crate::app::AppTestEnvForTest,
     ) -> Harness<'static, crate::app::AppTestEnvForTest> {
         crate::test_ui::builder()
@@ -1615,3 +1615,7 @@ mod tests {
         assert!(app.cover_crop_menu_state(0).is_some());
     }
 }
+
+#[cfg(test)]
+#[path = "cover_crop_rotation_tests.rs"]
+mod rotation_tests;
