@@ -191,7 +191,12 @@ fn key_entry(action: KeyAction) -> Entry {
         | GlobalFavSearch
         | GlobalMetadataSearch
         | GlobalEverythingSearch
-        | GridTagView => Entry::SearchSurface,
+        | GridTagView
+        // §1.690: put the selected item's name into a search box without
+        // running it; the location changes only after the user presses Enter.
+        | GridSearchNameEverything
+        | GridSearchNameMetadata
+        | GridSearchNameLocal => Entry::SearchSurface,
         GridOpenExternalPlayer
         | VideoExternalPlayer
         | ExternalToolPicker
