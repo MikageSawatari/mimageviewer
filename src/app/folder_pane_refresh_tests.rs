@@ -92,13 +92,23 @@ fn navigation_tree_frame(
     frame: &mut u64,
     events: Vec<egui::Event>,
 ) -> Option<Arc<AtomicBool>> {
+    navigation_tree_frame_height(app, ctx, frame, events, 600.0)
+}
+
+fn navigation_tree_frame_height(
+    app: &mut App,
+    ctx: &egui::Context,
+    frame: &mut u64,
+    events: Vec<egui::Event>,
+    height: f32,
+) -> Option<Arc<AtomicBool>> {
     *frame += 1;
     let mut started = None;
     ctx.run_ui(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(1600.0, 600.0),
+                egui::vec2(1600.0, height),
             )),
             time: Some(*frame as f64 / 60.0),
             events,
@@ -229,6 +239,263 @@ fn assert_pointer_click_count(ctx: &egui::Context, expected: u8) {
         }
     });
     assert_eq!(actual, expected, "actual egui pointer click count");
+}
+
+fn full_label_rect(ctx: &egui::Context, path: &Path) -> egui::Rect {
+    let id = ctx
+        .data(|data| {
+            data.get_temp::<egui::Id>(egui::Id::unique(("folder_pane_test_label_id", path)))
+        })
+        .unwrap();
+    ctx.read_response(id).unwrap().rect
+}
+
+fn tree_label_at(app: &App, ctx: &egui::Context, pos: egui::Pos2) -> PathBuf {
+    let viewport = ctx
+        .data(|data| data.get_temp::<egui::Rect>(egui::Id::unique("folder_pane_test_viewport")))
+        .unwrap();
+    app.folder_pane
+        .visible_rows()
+        .into_iter()
+        .find(|row| {
+            full_label_rect(ctx, &row.path)
+                .intersect(viewport)
+                .contains(pos)
+        })
+        .expect("pointer must hit a visible label")
+        .path
+}
+
+fn req40_scrolling_click_scenario(expanded: bool, clicks: u8) {
+    let (mut app, ctx, mut frame, b, _) = navigation_tree_fixture();
+    let root = b.parent().unwrap().to_path_buf();
+    let mut children = vec![root.join("a"), root.join("b"), root.join("c")];
+    let items: Vec<_> = (0..60).map(|i| root.join(format!("item-{i:03}"))).collect();
+    for path in &items {
+        std::fs::create_dir(path).unwrap();
+        std::fs::create_dir(path.join("child")).unwrap();
+        children.push(path.clone());
+    }
+    app.folder_pane = FolderPaneState::test_tree(&root, children);
+    app.folder_pane.test_scan_subtree(root.clone());
+    for path in &items {
+        app.folder_pane
+            .test_seed_listing(path, vec![path.join("child")], expanded);
+    }
+    app.folder_pane.set_cursor(root.clone());
+    for _ in 0..3 {
+        navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+    }
+    let viewport = ctx
+        .data(|data| data.get_temp::<egui::Rect>(egui::Id::unique("folder_pane_test_viewport")))
+        .unwrap();
+    let x = items
+        .iter()
+        .filter(|path| {
+            let rect = full_label_rect(&ctx, path);
+            rect.top() > viewport.top()
+                && rect.bottom() < viewport.bottom() - 10.0
+                && rect.center().y > viewport.center().y + 60.0
+        })
+        .next_back()
+        .expect("off-center X must be visible in a scrolling tree")
+        .clone();
+    let before = full_label_rect(&ctx, &x);
+    let pos = before.center();
+    pointer_tree_click(&mut app, &ctx, &mut frame, pos);
+    assert_pointer_click_count(&ctx, 1);
+    let pending = app
+        .folder_pane_open_pending
+        .as_mut()
+        .expect("first click immediately opens X");
+    assert_eq!(pending.path, x);
+    let first = pending.cancel.clone();
+    let (_held, rx) = mpsc::channel();
+    let original_rx = std::mem::replace(&mut pending.rx, rx);
+    // Consume the existing cursor reveal, with no extra click and no navigation completion.
+    for _ in 0..2 {
+        navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+    }
+    let moved = full_label_rect(&ctx, &x);
+    assert!(
+        (before.center().y - moved.center().y).abs() > 30.0,
+        "X must actually move: {before:?} -> {moved:?}"
+    );
+    assert!(
+        (moved.center().y - viewport.center().y).abs() < 3.0,
+        "the existing reveal must center X"
+    );
+    for count in 2..=clicks {
+        let hit = tree_label_at(&app, &ctx, pos);
+        assert_ne!(hit, x, "the same screen position must now hit another row");
+        let hit_expanded = app
+            .folder_pane
+            .visible_rows()
+            .iter()
+            .find(|row| row.path == hit)
+            .unwrap()
+            .expanded;
+        pointer_tree_click(&mut app, &ctx, &mut frame, pos);
+        assert_pointer_click_count(&ctx, count);
+        assert!(
+            !first.load(Ordering::Relaxed),
+            "repeat must not cancel X's scan (hit {hit:?})"
+        );
+        let pending = app.folder_pane_open_pending.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&first, &pending.cancel));
+        assert_eq!(pending.path, x);
+        let rows = app.folder_pane.visible_rows();
+        assert_eq!(
+            rows.iter().find(|row| row.path == x).unwrap().expanded,
+            !expanded
+        );
+        assert!(rows.iter().any(|row| row.path == x && row.is_cursor));
+        assert_eq!(
+            rows.iter().find(|row| row.path == hit).unwrap().expanded,
+            hit_expanded
+        );
+        // Opening/closing X may move the following rows before the third click.
+        navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+    }
+    app.folder_pane_open_pending.as_mut().unwrap().rx = original_rx;
+    finish_label_navigation(&mut app, &ctx, &x);
+    assert!(!first.load(Ordering::Relaxed));
+    assert_eq!(
+        app.folder_pane
+            .visible_rows()
+            .iter()
+            .find(|row| row.path == x)
+            .unwrap()
+            .expanded,
+        !expanded
+    );
+}
+
+#[test]
+fn folder_pane_label_req40_scrolled_closed_double() {
+    req40_scrolling_click_scenario(false, 2);
+}
+#[test]
+fn folder_pane_label_req40_scrolled_closed_triple() {
+    req40_scrolling_click_scenario(false, 3);
+}
+#[test]
+fn folder_pane_label_req40_scrolled_open_double() {
+    req40_scrolling_click_scenario(true, 2);
+}
+#[test]
+fn folder_pane_label_req40_scrolled_open_triple() {
+    req40_scrolling_click_scenario(true, 3);
+}
+
+#[test]
+fn folder_pane_label_req40_completed_navigation_collapses_prior_ancestors() {
+    let (mut app, ctx, mut frame, b, _) = navigation_tree_fixture();
+    let root = b.parent().unwrap().to_path_buf();
+    let prior = root.join("m-prior");
+    for name in ["leaf-0", "leaf-1"] {
+        std::fs::create_dir_all(prior.join(name)).unwrap();
+    }
+    let x = root.join("x-target");
+    std::fs::create_dir_all(x.join("child")).unwrap();
+    for i in 0..8 {
+        std::fs::create_dir(root.join(format!("zz-tail-{i:02}"))).unwrap();
+    }
+    app.folder_pane = FolderPaneState::default();
+    app.folder_pane.test_scan_subtree(root);
+    app.load_folder(prior.join("leaf-1"));
+    settle(&mut app, &ctx);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        app.sync_folder_pane_state(&ctx);
+        if !app.folder_pane.has_pending() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    const HEIGHT: f32 = 1400.0; // All rows fit; ancestor removal must move X, not restore an offset.
+    app.folder_pane.set_cursor(x.clone());
+    for _ in 0..3 {
+        navigation_tree_frame_height(&mut app, &ctx, &mut frame, vec![], HEIGHT);
+    }
+    assert!(
+        app.folder_pane
+            .visible_rows()
+            .iter()
+            .find(|row| row.path == prior)
+            .unwrap()
+            .expanded
+    );
+    let before = full_label_rect(&ctx, &x);
+    let pos = before.center();
+    let click = |app: &mut App, frame: &mut u64| {
+        let event = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        navigation_tree_frame_height(
+            app,
+            &ctx,
+            frame,
+            vec![egui::Event::PointerMoved(pos), event(true)],
+            HEIGHT,
+        );
+        navigation_tree_frame_height(app, &ctx, frame, vec![event(false)], HEIGHT);
+    };
+    click(&mut app, &mut frame);
+    assert_pointer_click_count(&ctx, 1);
+    let first = app
+        .folder_pane_open_pending
+        .as_ref()
+        .unwrap()
+        .cancel
+        .clone();
+    finish_label_navigation(&mut app, &ctx, &x);
+    for _ in 0..2 {
+        navigation_tree_frame_height(&mut app, &ctx, &mut frame, vec![], HEIGHT);
+    }
+    assert!(
+        !app.folder_pane
+            .visible_rows()
+            .iter()
+            .find(|row| row.path == prior)
+            .unwrap()
+            .expanded
+    );
+    let after = full_label_rect(&ctx, &x);
+    assert!(
+        after.top() < before.top() - 30.0,
+        "ancestor removal must shift X upward: {before:?} -> {after:?}"
+    );
+    let hit = tree_label_at(&app, &ctx, pos);
+    assert_ne!(hit, x);
+    let hit_expanded = app
+        .folder_pane
+        .visible_rows()
+        .iter()
+        .find(|row| row.path == hit)
+        .unwrap()
+        .expanded;
+    click(&mut app, &mut frame);
+    assert_pointer_click_count(&ctx, 2);
+    assert!(!first.load(Ordering::Relaxed));
+    assert!(
+        app.folder_pane_open_pending.is_none(),
+        "must not start navigation to {hit:?}"
+    );
+    assert_eq!(app.current_folder.as_ref(), Some(&x));
+    let rows = app.folder_pane.visible_rows();
+    assert!(
+        rows.iter()
+            .any(|row| row.path == x && row.expanded && row.is_cursor)
+    );
+    assert_eq!(
+        rows.iter().find(|row| row.path == hit).unwrap().expanded,
+        hit_expanded
+    );
 }
 
 #[test]
