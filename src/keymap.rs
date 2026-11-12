@@ -1628,6 +1628,9 @@ pub enum KeyAction {
     GridCopyFiles,
     GridCopyPath,
     GridCopyFileName,
+    GridSearchNameEverything,
+    GridSearchNameMetadata,
+    GridSearchNameLocal,
     GridCopyImage,
     GridCopyEditedImage,
     GridOrganizeFiles,
@@ -2239,6 +2242,9 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridCopyFiles,
     KeyAction::GridCopyPath,
     KeyAction::GridCopyFileName,
+    KeyAction::GridSearchNameEverything,
+    KeyAction::GridSearchNameMetadata,
+    KeyAction::GridSearchNameLocal,
     KeyAction::GridCopyImage,
     KeyAction::GridCopyEditedImage,
     KeyAction::GridOrganizeFiles,
@@ -4475,6 +4481,9 @@ impl KeyAction {
             GridCopyFiles => "GridCopyFiles",
             GridCopyPath => "GridCopyPath",
             GridCopyFileName => "GridCopyFileName",
+            GridSearchNameEverything => "GridSearchNameEverything",
+            GridSearchNameMetadata => "GridSearchNameMetadata",
+            GridSearchNameLocal => "GridSearchNameLocal",
             GridCopyImage => "GridCopyImage",
             GridCopyEditedImage => "GridCopyEditedImage",
             GridOrganizeFiles => "GridOrganizeFiles",
@@ -5243,6 +5252,9 @@ impl KeyAction {
             GridCopyFiles => "選択中またはチェック済みの実ファイル/実フォルダをコピーする",
             GridCopyPath => "パスをコピー",
             GridCopyFileName => "ファイル名をコピー",
+            GridSearchNameEverything => "名前で検索: Everything で探す",
+            GridSearchNameMetadata => "名前で検索: アイテム検索で探す",
+            GridSearchNameLocal => "名前で検索: この場所で絞り込む",
             GridCopyImage => "画像をクリップボードにコピー",
             GridCopyEditedImage => "編集を反映した画像をコピー",
             GridOrganizeFiles => "選択中またはチェック済みの実ファイル/実フォルダの整理先を選ぶ",
@@ -5851,6 +5863,9 @@ impl KeyAction {
             | GridCopyFiles
             | GridCopyPath
             | GridCopyFileName
+            | GridSearchNameEverything
+            | GridSearchNameMetadata
+            | GridSearchNameLocal
             | GridCopyImage
             | GridCopyEditedImage
             | GridOrganizeFiles
@@ -6404,6 +6419,9 @@ impl KeyAction {
             | GridCopyFiles
             | GridCopyPath
             | GridCopyFileName
+            | GridSearchNameEverything
+            | GridSearchNameMetadata
+            | GridSearchNameLocal
             | GridCopyImage
             | GridCopyEditedImage
             | GridOrganizeFiles
@@ -6988,6 +7006,9 @@ impl KeyAction {
             GridCopyFiles => ChordList::one(Chord::ctrl(C)),
             GridCopyPath => ChordList::EMPTY,
             GridCopyFileName => ChordList::EMPTY,
+            GridSearchNameEverything => ChordList::EMPTY,
+            GridSearchNameMetadata => ChordList::EMPTY,
+            GridSearchNameLocal => ChordList::EMPTY,
             GridCopyImage => ChordList::EMPTY,
             GridCopyEditedImage => ChordList::EMPTY,
             GridToggleCheck => ChordList::one(Chord::key(Space)),
@@ -11968,6 +11989,69 @@ mod tests {
                     sibling.default_chords().iter().collect::<Vec<_>>()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn search_name_actions_are_unassigned_grid_press_and_roundtrip_ini_and_settings() {
+        let actions = [
+            KeyAction::GridSearchNameEverything,
+            KeyAction::GridSearchNameMetadata,
+            KeyAction::GridSearchNameLocal,
+        ];
+        let keymap = Keymap::from_ini_str(
+            "[Grid]\nGridSearchNameEverything = F16\nGridSearchNameMetadata = F17\nGridSearchNameLocal = F18\n",
+        );
+        assert!(keymap.warnings().is_empty(), "{:?}", keymap.warnings());
+        let settings = KeymapSettings::from_keymap(&keymap);
+        let settings: KeymapSettings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        let restored = Keymap::from_settings(&settings);
+        for (action, key) in actions
+            .into_iter()
+            .zip([KeyName::F16, KeyName::F17, KeyName::F18])
+        {
+            assert_eq!(
+                KeyAction::all()
+                    .iter()
+                    .filter(|&&candidate| candidate == action)
+                    .count(),
+                1
+            );
+            assert_eq!(KeyAction::from_ini_name(action.ini_name()), Some(action));
+            assert_eq!(action.context(), KeyContext::Grid);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert!(action.is_user_facing());
+            assert!(action.default_chords().is_empty());
+            assert!(Keymap::empty().effective_chords(action).is_empty());
+            assert_eq!(keymap.effective_chords(action), vec![Chord::key(key)]);
+            assert_eq!(restored.effective_chords(action), vec![Chord::key(key)]);
+            assert_eq!(
+                restored.resolve_first_action_for_chord(
+                    Chord::key(key),
+                    GRID_ACTIVE_SCOPES,
+                    &actions
+                ),
+                Some(action),
+            );
+            for scopes in [FS_IMAGE_ACTIVE_SCOPES, FS_VIDEO_ACTIVE_SCOPES] {
+                assert_eq!(
+                    restored.resolve_first_action_for_chord(Chord::key(key), scopes, &actions),
+                    None
+                );
+            }
+            assert!(Keymap::default_reference_ini().contains(&format!(
+                "# {} = none ; {}\n",
+                action.ini_name(),
+                action.description(),
+            )));
+        }
+        let disabled = Keymap::from_ini_str(
+            "[Grid]\nGridSearchNameEverything = none\nGridSearchNameMetadata = none\nGridSearchNameLocal = none\n",
+        );
+        assert!(disabled.warnings().is_empty());
+        for action in actions {
+            assert!(disabled.effective_chords(action).is_empty());
         }
     }
 

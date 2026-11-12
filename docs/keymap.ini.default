@@ -238,6 +238,9 @@
 # GridCopyFiles = Ctrl+C ; 選択中またはチェック済みの実ファイル/実フォルダをコピーする
 # GridCopyPath = none ; パスをコピー
 # GridCopyFileName = none ; ファイル名をコピー
+# GridSearchNameEverything = none ; 名前で検索: Everything で探す
+# GridSearchNameMetadata = none ; 名前で検索: アイテム検索で探す
+# GridSearchNameLocal = none ; 名前で検索: この場所で絞り込む
 # GridCopyImage = none ; 画像をクリップボードにコピー
 # GridCopyEditedImage = none ; 編集を反映した画像をコピー
 # GridOrganizeFiles = none ; 選択中またはチェック済みの実ファイル/実フォルダの整理先を選ぶ

@@ -231,6 +231,12 @@ pub fn draw_pinned_search(
                                     if history_output.focus_requested {
                                         actions.push(PinnedSearchAction::RequestFocus(kind));
                                     }
+                                    crate::search_request::apply_select_all(
+                                        ui.ctx(),
+                                        draft,
+                                        focus,
+                                        &mut output,
+                                    );
                                     crate::ui_helpers::set_accessibility_label(
                                         &output.response,
                                         kind.label(),

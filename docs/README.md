@@ -122,6 +122,7 @@
 | [local-adjust-testing.md](local-adjust-testing.md) | 部分補正レイヤーの回帰テスト、合成順、キャッシュ無効化を検証するとき |
 | [search-architecture.md](search-architecture.md) | 検索 / インデクサ / タグを触るとき。**Ctrl+S/F/G/R の経路、Everythingの共通Search ownership、インデクサパイプライン + DB 責任分離** |
 | [search-input-history-plan.md](search-input-history-plan.md) | §1.756 検索欄の入力履歴。4 種類各 20 件、確定・実行済み語での離脱、設定の保存・オフと全件消去、フォルダバーと共有する▼・IME-safe な固定キー、ログ・Remote・MCP の非公開境界。実装中 |
+| [search-from-item-plan.md](search-from-item-plan.md) | §1.690「名前で検索」。M1〜M8 が一覧1項目から既存3検索欄へ名前を入れる仕様・名前規則・受付・Enterまで待機する所有設計。付録Aは後の拡張案 |
 | [name-index-write-failure-plan.md](name-index-write-failure-plan.md) | §1.369 名前／コンテナ索引の書込失敗。レビュー反映・実装と検証記録。同じDBの起動中1回の通知／予約、通常UIへの配送、Full/watch/clearの共通出口、無害なno-opの維持 |
 | [page-adjustment-owner-plan.md](page-adjustment-owner-plan.md) | §1.372 検索再配置中の補正Undo／draftの保存先。設計R2反映・実装／自動検証／確認用build完了。安定target、context所有draft、共有Undo受理順と最新受付済み文書、終了配送と§1.371 cursor ownerとの関係 |
 | [item-kind-capability-matrix.md](item-kind-capability-matrix.md) | **★ / タグ / 削除 / コピー / 外部ツール / 検索が `GridItem` の種別ごとにどう振る舞うかの現状表**。セルは 対応 / 拒否 / コンテナへ寄せる / **無反応** の 4 値。仮想ページ (ZipImage / PdfPage) を扱う機能を足すときは先にここを見る |

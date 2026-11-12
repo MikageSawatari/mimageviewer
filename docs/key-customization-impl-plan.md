@@ -1,5 +1,13 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
+§1.690: `GridSearchNameEverything` / `GridSearchNameMetadata` / `GridSearchNameLocal` は
+Grid / Press、既定キーなし。メイン窓の一覧のカーソル位置の名前を既存の検索欄へ入れ、
+フォーカス・全選択だけを要求する。検索は実行せず Enter で確定する。
+右クリックの「名前で検索」と共通の受付・`open_search_with_text` を使い、通常ショートカットの
+受付条件・入力所有を維持する。対象種別・対象外の一覧は
+[キー仕様](keymap-spec.md#一覧の項目の名前で検索1690)、所有と待機の規則は
+[設計 M1〜M6](search-from-item-plan.md#m1-範囲-利用者決定-2026-11-11) を参照。
+
 §1.733（2026-11-11）: 本・コレクションの番号1〜20と前/次の44操作をリング・ジェスチャ・
 ゲームパッド X リングへ追加し、マウス3ボタンは一覧だけに追加する。
 `OpenCollection1..20` / `CollectionPrev・Next` / `OpenBook1..20` / `BookPrev・Next` を
@@ -653,6 +661,8 @@ ini 出力のみ `;` / `#` を含む表記を KeySlot の別名に置換し、`S
 - GridColumnCount1..10 `Alt+1`..`Alt+0`、GridColumnCount11..20 は既定キーなし、GridToggleDetailsView `Alt+-` (P)
 
 ### Grid (Ph4)
+- GridSearchNameEverything / GridSearchNameMetadata / GridSearchNameLocal は既定なしのPress（§1.690）。
+  既存の検索欄へ名前を入れるだけで、検索を始めない。
 - GridCursorRight/Left/Up/Down `矢印` (P)(予約候補) / GridOpenSelected `Enter` (P) / GridOpenExternalPlayer `Shift+Enter` (P) /
   GridParentFolder `Backspace` (P) / GridToggleCheck `Space` (P)
 - GridTreeFolderPrev/Next `Ctrl+↑/↓` (P) / GridSiblingFolderPrev/Next `Ctrl+PageUp/Down` (P)

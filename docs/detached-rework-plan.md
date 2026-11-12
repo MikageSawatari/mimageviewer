@@ -7389,3 +7389,15 @@ keepaliveの症状条件を足す修正ではなく、対象と寿命を既存ow
 実装レビュー・自動検証の結果は [内部本計画 §9](archive-inner-book-open-return-plan.md) に記録する。
 独立source追レビューはACCEPT（追加P1/P2なし）。Ready close／parkの2件、S1〜S3の110件、
 既存detached／close／archiveの1,085件が全成功。core check・fmt・glyph・検証用buildも成功し、製品は起動していない。
+
+#### §1.690: 検索由来の★固定で Ctrl+G を正規の終了処理へ (2026-11-12、独立再レビュー ACCEPT)
+
+`close_searches_for_snapshot` の Ctrl+G 部分は `dismiss_global_search_with_origin` の手書きの部分コピーで、
+旧 `accepted`・prepare・`source`・mtime worker などを退役させていなかった。§1.690 の受付が前提とする
+「`global_search.active == false` なら旧い検索資源は終了済み」が★固定の後に成り立たないため、タグビューと同じく
+`dismiss_global_search_without_restore()` を呼ぶ形に置き換えた。戻り先とrouteは `activate_snapshot` が終了前に
+canonical origin として捕捉済みで、fork する `ViewerContextBundle` もその origin を複製する。変わるのは、★固定中に
+未使用の legacy `global_search_subfolder_restore` を持ち越さなくなる点だけで、戻り先は変わらない。
+viewport・detached 述語・新しい状態は加えていない。症状を消す guard ではなく、終了境界を 1 つの所有者に揃える構造修正である
+(設計担当 ClaudeCode と独立 Sol/xhigh 再レビューの双方が、症状パッチでなく構造的修正であることに同意)。記録は [search-from-item-plan.md](search-from-item-plan.md) M9。
+

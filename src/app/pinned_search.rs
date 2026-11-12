@@ -1056,15 +1056,24 @@ impl App {
             .or_else(|| Kind::ALL.into_iter().find(|kind| self.edit_owner(*kind)))
     }
     pub(crate) fn pinned_search_availability(&self, kind: Kind) -> Result<(), &'static str> {
+        self.pinned_search_availability_including_context_menu(kind, true)
+    }
+    pub(crate) fn pinned_search_availability_including_context_menu(
+        &self,
+        kind: Kind,
+        include_context_menu: bool,
+    ) -> Result<(), &'static str> {
         if kind == Kind::Everything {
-            self.everything_search_entry_availability()
-                .reason_text()
-                .map_or(Ok(()), Err)?;
+            self.everything_search_entry_availability_with_modal(
+                self.search_common_modal_open(include_context_menu),
+            )
+            .reason_text()
+            .map_or(Ok(()), Err)?;
         }
         if self.viewer_session_blocks_main_window() {
             return Err("閲覧中は検索できません");
         }
-        if self.common_modal_dialog_open() || self.any_dialog_open() {
+        if self.search_dialog_open(include_context_menu) {
             return Err("ほかの操作が完了してから検索してください");
         }
         if kind == Kind::Local && self.grid_is_pdf_pages() {
@@ -1097,6 +1106,12 @@ impl App {
         ctx.request_repaint();
     }
     pub(crate) fn open_search_shortcut(&mut self, ctx: &egui::Context, kind: Kind) {
+        // An ordinary reopen must not revive a prefill selection from a field
+        // that was closed or switched away before its first draw.
+        if matches!(kind, Kind::Local | Kind::Metadata) {
+            crate::search_request::clear_select_all(ctx, kind.input_id());
+            crate::search_request::clear_select_all(ctx, kind.temporary_id());
+        }
         if kind == Kind::Local
             && let Err(reason) = self.pinned_search_availability(kind)
         {

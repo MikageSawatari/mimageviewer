@@ -909,13 +909,12 @@ impl App {
         //     落ちた状態で Ctrl+F が通ってしまう → `active` も条件に入れる
         // Paged documents reject local filtering at the shared shortcut admission,
         // with the same reason as the disabled menu/pinned input.
-        if !self.address_has_focus
-            && !main_viewer_blocked
-            && !self.any_dialog_open()
-            && !self.favsearch.has_focus
-            && !self.global_search.has_focus
-            && !self.tag_view.has_focus
-            && !self.global_search.active
+        if self
+            .search_shortcut_availability(
+                crate::ui_pinned_search::PinnedSearchKind::Local,
+                main_viewer_blocked,
+            )
+            .is_ok()
         {
             let ctrl_f = self
                 .keymap
@@ -1016,12 +1015,12 @@ impl App {
         // ── Ctrl+G: グローバルメタ検索バー表示 (docs §10.3) ──────────
         self.dispatch_everything_search_shortcut(ctx);
 
-        if !self.address_has_focus
-            && !main_viewer_blocked
-            && !self.any_dialog_open()
-            && !self.search_has_focus
-            && !self.favsearch.has_focus
-            && !self.tag_view.has_focus
+        if self
+            .search_shortcut_availability(
+                crate::ui_pinned_search::PinnedSearchKind::Metadata,
+                main_viewer_blocked,
+            )
+            .is_ok()
         {
             let ctrl_g = self
                 .keymap

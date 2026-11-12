@@ -159,6 +159,26 @@ Smart Folderの一覧退避は非固定のtemporary queryのみを所有し、�
 消費する。初回未送信/取消後/PhysicalChildにもclosable ownerで終了先を持つ。
 詳細な幅・フォーカス・簡素化の判断は [ツールバー計画 §2.5](toolbar-customization-plan.md#25-検索欄の個別固定-1409)。
 
+### 1.6 一覧の項目の名前から検索欄を開く (§1.690)
+
+メイン窓の一覧の「名前で検索」サブメニューと3つの Grid KeyAction は、
+`SearchRequest { target, query }` を `App::open_search_with_text` へ渡す。
+項目の名前・入口の可否・渡し先の通常ショートカットの開始可否を共有し、
+既存の欄に名前を入れ、フォーカスと全選択を要求する。
+メニューの可否判定だけは呼び出し元の右クリックメニューをモーダル判定から除外し、
+名前を確定して自分のメニュー owner を閉じた後、通常の受付で実行する。
+メニューの可否判定へキーの入力所有・IME 判定は流用しない。
+新しい検索は Enter まで始めない。Metadata は `global_search.active` 中には受け付けず、
+「検索を閉じてから使えます」と通知する。Metadata / Everything のどちらの検索セッションも
+開いていないときだけ、下書きを先に名前で置き換えてから `ensure_search_session(Metadata)` を呼ぶ。
+既存の `open_global_search` の保持された下書きで待機する分岐を使い、reset・デバウンスは呼ばない。
+Local / Everything は `ensure_search_session` で欄を開いてから入力を代入する。
+Local / Metadata だけ、全選択の一時印を入力欄 id・文字列・発行passに結び付ける。
+対象欄の最初の描画で必ず印を取り出して消し、発行passかその次のpass・フォーカス要求または取得済み・
+文字列一致・IME変換中でない場合だけ全選択する。Everything は既存の全選択を使い、印を作らない。
+Metadata / Local は Metadata / Everything の検索セッション中（入力中・PhysicalChild を含む）には受け付けない。
+新しい App 状態・worker・永続データは追加しない。詳細は [設計 M1〜M8](search-from-item-plan.md)。
+
 ## 2. モジュールマップ
 
 ### 2.1 クエリ層 (UI スレッドが呼ぶ)
@@ -166,6 +186,8 @@ Smart Folderの一覧退避は非固定のtemporary queryのみを所有し、�
 | モジュール | 役割 |
 | --- | --- |
 | [search_query.rs](../src/search_query.rs) | トークナイザ + AST + `matches` / `matches_with_mode` / `decide_partial` / `MatchMode` |
+| [search_request.rs](../src/search_request.rs) | 検索欄の渡し先と文字列、項目種別ごとの名前生成、入力欄 id ごとの全選択の一時印 |
+| [app/search_request.rs](../src/app/search_request.rs) | 名前で検索の共通受付と `open_search_with_text`。既存の検索欄へ入力だけを渡す |
 | [search_norm.rs](../src/search_norm.rs) | `normalize_for_match(s) -> String` — Ctrl+S/F/Gのtoken検索で共有する唯一の正規化関数。Everythingのqueryは通さない |
 | [global_search.rs](../src/global_search.rs) | Ctrl+G のクエリワーカー (streaming、Searcher snapshot 固定) |
 | [global_search_ui.rs](../src/global_search_ui.rs) / [everything.rs](../src/global_search_ui/everything.rs) | Metadata/Everythingの単一Search owner、検索バー、共通prepare/adopt、物理childの帰路 |

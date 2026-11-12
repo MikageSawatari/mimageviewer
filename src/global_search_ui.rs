@@ -4754,6 +4754,7 @@ impl App {
                      「お気に入り」→「編集」で、対象の行の「アイテム索引 (Ctrl+G)」に\n\
                      チェックを入れてください。",
                 );
+                let focus_requested = self.global_search.focus_request;
                 let focus_pending = self.history_input_focus_pending(ctx, crate::ui_pinned_search::PinnedSearchKind::Metadata.temporary_id());
                 let history_output = crate::ui_history_field::show_singleline(
                     ui,
@@ -4779,6 +4780,7 @@ impl App {
                     self.claim_pending_text_input_focus(ctx.viewport_id(), crate::ui_pinned_search::PinnedSearchKind::Metadata.temporary_id(), ctx.cumulative_pass_nr());
                 }
                 let mut output = history_output.text;
+                crate::search_request::apply_select_all(ui.ctx(), &self.global_search.metadata_draft, focus_requested, &mut output);
                 let menu_changed = crate::ui_helpers::singleline_text_edit_context_menu(
                     ui,
                     &mut output,

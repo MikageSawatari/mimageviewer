@@ -12,15 +12,17 @@ use serde::{Deserialize, Serialize};
 pub enum ContextMenuParentId {
     Root,
     OpenWith,
+    SearchByName,
 }
 
 impl ContextMenuParentId {
-    pub const ALL: &'static [Self] = &[Self::Root, Self::OpenWith];
+    pub const ALL: &'static [Self] = &[Self::Root, Self::OpenWith, Self::SearchByName];
 
     pub const fn stable_name(self) -> &'static str {
         match self {
             Self::Root => "Root",
             Self::OpenWith => "OpenWith",
+            Self::SearchByName => "SearchByName",
         }
     }
 
@@ -35,6 +37,7 @@ impl ContextMenuParentId {
         match self {
             Self::Root => "最上位の項目",
             Self::OpenWith => "「アプリケーションで開く…」内の項目",
+            Self::SearchByName => "「名前で検索」内の項目",
         }
     }
 }
@@ -79,6 +82,10 @@ pub enum ContextMenuItemId {
     RemoveReadingHistory,
     Deselect,
     CreateMusicVideo,
+    SearchByName,
+    SearchByNameEverything,
+    SearchByNameMetadata,
+    SearchByNameLocal,
 }
 
 impl ContextMenuItemId {
@@ -117,6 +124,10 @@ impl ContextMenuItemId {
         Self::RemoveReadingHistory,
         Self::Deselect,
         Self::CreateMusicVideo,
+        Self::SearchByName,
+        Self::SearchByNameEverything,
+        Self::SearchByNameMetadata,
+        Self::SearchByNameLocal,
     ];
 
     pub const fn stable_name(self) -> &'static str {
@@ -155,6 +166,10 @@ impl ContextMenuItemId {
             Self::RemoveFromCollection => "RemoveFromCollection",
             Self::RemoveReadingHistory => "RemoveReadingHistory",
             Self::Deselect => "Deselect",
+            Self::SearchByName => "SearchByName",
+            Self::SearchByNameEverything => "SearchByNameEverything",
+            Self::SearchByNameMetadata => "SearchByNameMetadata",
+            Self::SearchByNameLocal => "SearchByNameLocal",
         }
     }
 
@@ -168,6 +183,9 @@ impl ContextMenuItemId {
     pub const fn parent(self) -> ContextMenuParentId {
         match self {
             Self::OpenExternalToolSettings => ContextMenuParentId::OpenWith,
+            Self::SearchByNameEverything | Self::SearchByNameMetadata | Self::SearchByNameLocal => {
+                ContextMenuParentId::SearchByName
+            }
             _ => ContextMenuParentId::Root,
         }
     }
@@ -208,6 +226,10 @@ impl ContextMenuItemId {
             Self::RemoveFromCollection => "コレクションから外す",
             Self::RemoveReadingHistory => "履歴から削除",
             Self::Deselect => "選択解除",
+            Self::SearchByName => "名前で検索",
+            Self::SearchByNameEverything => "Everything で探す",
+            Self::SearchByNameMetadata => "アイテム検索で探す",
+            Self::SearchByNameLocal => "この場所で絞り込む",
         }
     }
 
@@ -247,6 +269,9 @@ impl ContextMenuItemId {
             MenuCommand::RemoveFromCollection => Self::RemoveFromCollection,
             MenuCommand::Deselect => Self::Deselect,
             MenuCommand::RemoveReadingHistory => Self::RemoveReadingHistory,
+            MenuCommand::SearchByNameEverything => Self::SearchByNameEverything,
+            MenuCommand::SearchByNameMetadata => Self::SearchByNameMetadata,
+            MenuCommand::SearchByNameLocal => Self::SearchByNameLocal,
             MenuCommand::EditBookComposition
             | MenuCommand::ConvertEpubToPdf
             | MenuCommand::ExternalTool(_)
@@ -540,6 +565,23 @@ impl ContextMenuPreviewScenario {
             has_explorer_folder: true,
             collection_reference,
             collection_jump: None,
+            search_by_name: (surface == ContextMenuSurface::Grid
+                && !is_folder_context
+                && !has_checked
+                && !reading_history
+                && !matches!(
+                    kind,
+                    ContextMenuItemKind::PdfPage | ContextMenuItemKind::Stack
+                ))
+            .then_some(SearchByNameAvailability {
+                everything: Ok(()),
+                metadata: Ok(()),
+                local: if in_search {
+                    Err("検索結果ではこの場所の絞り込みを使えません")
+                } else {
+                    Ok(())
+                },
+            }),
             view: ContextMenuViewFlags {
                 in_search,
                 search: in_search,
@@ -645,8 +687,25 @@ fn collect_rendered_preview_items(
                 separator_before = false;
             }
             MenuNode::Submenu { children, .. } => {
-                if parent == ContextMenuParentId::Root {
-                    collect_rendered_preview_items(children, ContextMenuParentId::OpenWith, out);
+                let child_parent = match menu_node_layout_id(node) {
+                    LayoutUnitId::Configurable(item) => {
+                        debug_assert_eq!(item.parent(), parent);
+                        out.push((
+                            item,
+                            RenderedPreviewItem {
+                                first: !saw_content,
+                                separator_before,
+                            },
+                        ));
+                        Some(ContextMenuParentId::SearchByName)
+                    }
+                    LayoutUnitId::Fixed(ContextMenuFixedSlotId::OpenWithSubmenu) => {
+                        Some(ContextMenuParentId::OpenWith)
+                    }
+                    _ => None,
+                };
+                if let Some(child_parent) = child_parent {
+                    collect_rendered_preview_items(children, child_parent, out);
                 }
                 saw_content = true;
                 separator_before = false;
@@ -694,7 +753,16 @@ pub(crate) fn context_menu_layout_preview(
         .map(|item| {
             let state = if !capability.iter().any(|(candidate, _)| *candidate == item) {
                 ContextMenuPreviewItemState::Unavailable
-            } else if !layout.is_visible(item) {
+            } else if !layout.is_visible(item)
+                || (item.parent() == ContextMenuParentId::SearchByName
+                    && !layout.is_visible(ContextMenuItemId::SearchByName))
+                || (item == ContextMenuItemId::SearchByName
+                    && !ContextMenuLayoutSettings::canonical_order(
+                        ContextMenuParentId::SearchByName,
+                    )
+                    .iter()
+                    .any(|child| layout.is_visible(*child)))
+            {
                 ContextMenuPreviewItemState::Hidden
             } else if let Some((_, rendered)) =
                 rendered.iter().find(|(candidate, _)| *candidate == item)
@@ -795,6 +863,9 @@ pub enum MenuCommand {
     RemoveFromCollection,
     Deselect,
     RemoveReadingHistory,
+    SearchByNameEverything,
+    SearchByNameMetadata,
+    SearchByNameLocal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -948,12 +1019,21 @@ pub struct ContextMenuInput {
     pub collection_reference: CollectionReferenceAvailability,
     /// Collection root の元の場所への移動。参照解除とは別の可否を持つ。
     pub collection_jump: Option<ContextMenuActionState>,
+    /// Shared App entry predicate admits the item; each destination keeps its own reason.
+    pub search_by_name: Option<SearchByNameAvailability>,
     pub view: ContextMenuViewFlags,
     pub pin: Option<ContextMenuActionState>,
     pub external_tools: Vec<ExternalToolMenuEntry>,
     pub associated_apps: Vec<AssociatedAppMenuEntry>,
     pub shortcuts: ContextMenuShortcutLabels,
     pub layout: ContextMenuLayoutSettings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchByNameAvailability {
+    pub everything: Result<(), &'static str>,
+    pub metadata: Result<(), &'static str>,
+    pub local: Result<(), &'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1102,7 +1182,34 @@ fn open_with_submenu(input: &ContextMenuInput) -> Option<MenuNode> {
     );
     Some(MenuNode::Submenu {
         label: "アプリケーションで開く…".to_string(),
-        children: apply_context_menu_layout(children, ContextMenuParentId::OpenWith, &input.layout),
+        children,
+    })
+}
+
+fn search_by_name_submenu(input: &ContextMenuInput) -> Option<MenuNode> {
+    if input.surface != ContextMenuSurface::Grid || input.is_folder_context {
+        return None;
+    }
+    let availability = input.search_by_name?;
+    let children = [
+        (MenuCommand::SearchByNameEverything, availability.everything),
+        (MenuCommand::SearchByNameMetadata, availability.metadata),
+        (MenuCommand::SearchByNameLocal, availability.local),
+    ]
+    .into_iter()
+    .map(|(command, available)| MenuNode::Item {
+        label: ContextMenuItemId::from_command(&command)
+            .expect("search destination has a static ID")
+            .label()
+            .into(),
+        command,
+        enabled: available.is_ok(),
+        disabled_reason: available.err().map(str::to_owned),
+    })
+    .collect();
+    Some(MenuNode::Submenu {
+        label: ContextMenuItemId::SearchByName.label().into(),
+        children,
     })
 }
 
@@ -1141,6 +1248,21 @@ fn menu_node_layout_id(node: &MenuNode) -> LayoutUnitId {
         MenuNode::Item { command, .. } => LayoutUnitId::Configurable(
             ContextMenuItemId::from_command(command).expect("static context-menu command"),
         ),
+        MenuNode::Submenu { children, .. }
+            if children.iter().any(|child| {
+                matches!(
+                    child,
+                    MenuNode::Item {
+                        command: MenuCommand::SearchByNameEverything
+                            | MenuCommand::SearchByNameMetadata
+                            | MenuCommand::SearchByNameLocal,
+                        ..
+                    }
+                )
+            }) =>
+        {
+            LayoutUnitId::Configurable(ContextMenuItemId::SearchByName)
+        }
         MenuNode::Submenu { children, .. }
             if children.iter().any(|child| {
                 matches!(
@@ -1195,10 +1317,6 @@ fn apply_context_menu_layout(
         }
     }
 
-    units.retain(|unit| match unit.id {
-        LayoutUnitId::Configurable(item) => settings.is_visible(item),
-        LayoutUnitId::Fixed(_) => true,
-    });
     if settings.has_explicit_order(parent) {
         let order = settings.resolved_order(parent);
         let mut configurable: Vec<_> = units
@@ -1228,9 +1346,44 @@ fn apply_context_menu_layout(
         }
     }
 
+    // Resolve every admitted static slot before hiding its assigned item. Removing
+    // slots first would move unrelated items across the fixed dynamic groups.
+    units.retain(|unit| match unit.id {
+        LayoutUnitId::Configurable(item) => settings.is_visible(item),
+        LayoutUnitId::Fixed(_) => true,
+    });
+
     let mut resolved = Vec::new();
     let mut previous_section = None;
     for unit in units {
+        let child_parent = match unit.id {
+            LayoutUnitId::Configurable(ContextMenuItemId::SearchByName) => {
+                Some(ContextMenuParentId::SearchByName)
+            }
+            LayoutUnitId::Fixed(ContextMenuFixedSlotId::OpenWithSubmenu) => {
+                Some(ContextMenuParentId::OpenWith)
+            }
+            _ => None,
+        };
+        // Preserve parent slots through ordering, then remove empty submenus
+        // before they can publish a separator or become the previous section.
+        let nodes = normalize_menu(
+            unit.nodes
+                .into_iter()
+                .map(|node| match (node, child_parent) {
+                    (MenuNode::Submenu { label, children }, Some(child_parent)) => {
+                        MenuNode::Submenu {
+                            label,
+                            children: apply_context_menu_layout(children, child_parent, settings),
+                        }
+                    }
+                    (node, _) => node,
+                })
+                .collect(),
+        );
+        if nodes.is_empty() {
+            continue;
+        }
         let inherited_separator = previous_section.is_some_and(|previous| previous != unit.section);
         let separator_before = match unit.id {
             LayoutUnitId::Configurable(item) => match settings.separator_before(item) {
@@ -1244,7 +1397,7 @@ fn apply_context_menu_layout(
             resolved.push(MenuNode::Separator);
         }
         previous_section = Some(unit.section);
-        resolved.extend(unit.nodes);
+        resolved.extend(nodes);
     }
     normalize_menu(resolved)
 }
@@ -1536,6 +1689,9 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
         });
     }
     push_group(&mut nodes, copy_group);
+    if let Some(search_by_name) = search_by_name_submenu(input) {
+        push_group(&mut nodes, [search_by_name]);
+    }
 
     if input.kind.supports_page_edits() {
         // コピー系とは別グループにして、消す操作を並びで見分けられるようにする。
@@ -1970,6 +2126,7 @@ mod tests {
             has_explorer_folder: false,
             collection_reference: CollectionReferenceAvailability::NotCollectionRoot,
             collection_jump: None,
+            search_by_name: None,
             view: ContextMenuViewFlags::default(),
             pin: None,
             external_tools: Vec::new(),
@@ -2128,7 +2285,7 @@ mod tests {
     }
 
     #[test]
-    fn preview_scenarios_cover_every_configurable_leaf_through_the_production_builder() {
+    fn preview_scenarios_cover_every_configurable_item_through_the_production_builder() {
         let layout = ContextMenuLayoutSettings::default();
         let uncovered: Vec<_> = ContextMenuItemId::ALL
             .iter()
@@ -2147,7 +2304,232 @@ mod tests {
             .collect();
         assert!(
             uncovered.is_empty(),
-            "uncovered stable leaves: {uncovered:?}"
+            "uncovered stable items: {uncovered:?}"
+        );
+    }
+
+    fn ready_search_by_name() -> SearchByNameAvailability {
+        SearchByNameAvailability {
+            everything: Ok(()),
+            metadata: Ok(()),
+            local: Ok(()),
+        }
+    }
+
+    #[test]
+    fn search_by_name_uses_the_admitted_snapshot_only_for_single_grid_items() {
+        let commands = [
+            MenuCommand::SearchByNameEverything,
+            MenuCommand::SearchByNameMetadata,
+            MenuCommand::SearchByNameLocal,
+        ];
+        for kind in [
+            ContextMenuItemKind::Folder,
+            ContextMenuItemKind::Image,
+            ContextMenuItemKind::Video,
+            ContextMenuItemKind::Audio,
+            ContextMenuItemKind::ZipFile,
+            ContextMenuItemKind::PdfFile,
+            ContextMenuItemKind::ConvertibleArchive,
+            ContextMenuItemKind::ZipImage,
+            ContextMenuItemKind::ZipDir,
+            ContextMenuItemKind::SearchContainer,
+        ] {
+            let mut case = input(kind, ContextMenuSurface::Grid);
+            case.search_by_name = Some(ready_search_by_name());
+            let nodes = build_context_menu(&case);
+            for command in &commands {
+                assert!(
+                    command_state(&nodes, command.clone()).unwrap().1,
+                    "{kind:?}"
+                );
+            }
+            assert!(root_layout_ids(&nodes).contains(&ContextMenuItemId::SearchByName));
+        }
+
+        // App owns kind/context admission. Rejected kinds arrive without a snapshot.
+        for kind in [
+            ContextMenuItemKind::PdfPage,
+            ContextMenuItemKind::Stack,
+            ContextMenuItemKind::CollectionPlaceholder,
+        ] {
+            let nodes = build_context_menu(&input(kind, ContextMenuSurface::Grid));
+            assert!(command_state(&nodes, commands[0].clone()).is_none());
+        }
+        let mut case = input(ContextMenuItemKind::Image, ContextMenuSurface::Grid);
+        for excluded in 0..4 {
+            case.search_by_name = Some(ready_search_by_name());
+            case.has_checked = excluded == 0;
+            case.is_folder_context = excluded == 1;
+            case.surface = if excluded == 2 {
+                ContextMenuSurface::Fullscreen
+            } else {
+                ContextMenuSurface::Grid
+            };
+            if excluded == 3 {
+                case.search_by_name = None;
+            }
+            let nodes = build_context_menu(&case);
+            for command in &commands {
+                assert!(command_state(&nodes, command.clone()).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn search_by_name_preserves_each_destination_disabled_reason() {
+        let mut case = input(ContextMenuItemKind::Image, ContextMenuSurface::Grid);
+        case.search_by_name = Some(SearchByNameAvailability {
+            everything: Err("Everything を利用できません"),
+            metadata: Ok(()),
+            local: Err("検索結果では使えません"),
+        });
+        let nodes = build_context_menu(&case);
+        assert_eq!(
+            command_state(&nodes, MenuCommand::SearchByNameEverything),
+            Some((
+                "Everything で探す".into(),
+                false,
+                Some("Everything を利用できません".into())
+            ))
+        );
+        assert_eq!(
+            command_state(&nodes, MenuCommand::SearchByNameMetadata),
+            Some(("アイテム検索で探す".into(), true, None))
+        );
+        assert_eq!(
+            command_state(&nodes, MenuCommand::SearchByNameLocal),
+            Some((
+                "この場所で絞り込む".into(),
+                false,
+                Some("検索結果では使えません".into())
+            ))
+        );
+        case.search_by_name = Some(SearchByNameAvailability {
+            everything: Err("検索に使える名前がありません"),
+            metadata: Err("検索に使える名前がありません"),
+            local: Err("検索に使える名前がありません"),
+        });
+        let nodes = build_context_menu(&case);
+        for command in [
+            MenuCommand::SearchByNameEverything,
+            MenuCommand::SearchByNameMetadata,
+            MenuCommand::SearchByNameLocal,
+        ] {
+            let (_, enabled, reason) = command_state(&nodes, command).unwrap();
+            assert!(!enabled);
+            assert_eq!(reason.as_deref(), Some("検索に使える名前がありません"));
+        }
+    }
+
+    #[test]
+    fn search_by_name_parent_and_children_have_independent_layout_and_preview() {
+        use ContextMenuItemId::{
+            SearchByName, SearchByNameEverything, SearchByNameLocal, SearchByNameMetadata,
+        };
+        let mut case =
+            ContextMenuPreviewScenario::GridImage.input(ContextMenuLayoutSettings::default());
+        assert_eq!(SearchByName.parent(), ContextMenuParentId::Root);
+        for id in [
+            SearchByNameEverything,
+            SearchByNameMetadata,
+            SearchByNameLocal,
+        ] {
+            assert_eq!(id.parent(), ContextMenuParentId::SearchByName);
+            assert_eq!(
+                ContextMenuItemId::parse_stable_name(id.stable_name()),
+                Some(id)
+            );
+        }
+        assert_eq!(
+            ContextMenuParentId::parse_stable_name("SearchByName"),
+            Some(ContextMenuParentId::SearchByName)
+        );
+        let root_ids = root_layout_ids(&build_context_menu(&case));
+        assert_eq!(
+            root_ids.iter().position(|id| *id == SearchByName),
+            root_ids
+                .iter()
+                .position(|id| *id == ContextMenuItemId::PasteEditBundle)
+                .map(|position| position + 1)
+        );
+        case.layout.set_order(
+            ContextMenuParentId::SearchByName,
+            &[
+                SearchByNameLocal,
+                SearchByNameEverything,
+                SearchByNameMetadata,
+            ],
+        );
+        case.layout
+            .set_separator_before(SearchByNameEverything, ContextMenuSeparatorBefore::Present);
+        let mut root_order = case.layout.resolved_order(ContextMenuParentId::Root);
+        root_order.retain(|id| *id != SearchByName);
+        root_order.insert(0, SearchByName);
+        case.layout
+            .set_order(ContextMenuParentId::Root, &root_order);
+        let nodes = build_context_menu(&case);
+        assert_eq!(root_layout_ids(&nodes)[0], SearchByName);
+        let MenuNode::Submenu { children, .. } = &nodes[0] else {
+            panic!("search submenu moves as its own configurable root item");
+        };
+        assert_eq!(
+            menu_shape(children),
+            [
+                "SearchByNameLocal",
+                "|",
+                "SearchByNameEverything",
+                "SearchByNameMetadata"
+            ]
+        );
+        let preview =
+            context_menu_layout_preview(ContextMenuPreviewScenario::GridImage, &case.layout);
+        assert_eq!(
+            preview.state(SearchByName),
+            ContextMenuPreviewItemState::First
+        );
+        assert_eq!(
+            preview.state(SearchByNameLocal),
+            ContextMenuPreviewItemState::First
+        );
+        assert_eq!(
+            preview.state(SearchByNameEverything),
+            ContextMenuPreviewItemState::Available {
+                separator_before: true
+            }
+        );
+        case.layout.set_visible(SearchByName, false);
+        let preview =
+            context_menu_layout_preview(ContextMenuPreviewScenario::GridImage, &case.layout);
+        for id in [
+            SearchByName,
+            SearchByNameEverything,
+            SearchByNameMetadata,
+            SearchByNameLocal,
+        ] {
+            assert_eq!(preview.state(id), ContextMenuPreviewItemState::Hidden);
+        }
+        assert!(
+            command_state(&build_context_menu(&case), MenuCommand::SearchByNameLocal).is_none()
+        );
+        case.layout.set_visible(SearchByName, true);
+        for id in [
+            SearchByNameEverything,
+            SearchByNameMetadata,
+            SearchByNameLocal,
+        ] {
+            case.layout.set_visible(id, false);
+        }
+        let preview =
+            context_menu_layout_preview(ContextMenuPreviewScenario::GridImage, &case.layout);
+        assert_eq!(
+            preview.state(SearchByName),
+            ContextMenuPreviewItemState::Hidden
+        );
+        assert!(!root_layout_ids(&build_context_menu(&case)).contains(&SearchByName));
+        case.layout.set_visible(SearchByNameLocal, true);
+        assert!(
+            command_state(&build_context_menu(&case), MenuCommand::SearchByNameLocal).is_some()
         );
     }
 
@@ -2892,6 +3274,113 @@ mod tests {
             ),
             raw
         );
+    }
+
+    #[test]
+    fn hiding_a_reordered_leaf_or_submenu_keeps_other_items_across_fixed_groups() {
+        for (id, node) in [
+            (
+                ContextMenuItemId::CreateMusicVideo,
+                item(MenuCommand::CreateMusicVideo, "musicvideo"),
+            ),
+            (
+                ContextMenuItemId::SearchByName,
+                MenuNode::Submenu {
+                    label: ContextMenuItemId::SearchByName.label().into(),
+                    children: vec![item(MenuCommand::SearchByNameEverything, "search")],
+                },
+            ),
+        ] {
+            let raw = vec![
+                item(MenuCommand::CutFiles, "cut"),
+                item(MenuCommand::CopyFiles, "copy"),
+                MenuNode::Separator,
+                item(MenuCommand::ExternalTool(ExternalToolId(1)), "tool"),
+                MenuNode::Separator,
+                MenuNode::Submenu {
+                    label: "アプリケーションで開く…".into(),
+                    children: vec![item(MenuCommand::OpenExternalToolSettings, "settings")],
+                },
+                MenuNode::Separator,
+                node,
+            ];
+            let mut layout = ContextMenuLayoutSettings::default();
+            let mut order = layout.resolved_order(ContextMenuParentId::Root);
+            order.retain(|candidate| *candidate != id);
+            order.insert(0, id);
+            layout.set_order(ContextMenuParentId::Root, &order);
+            let shown = apply_context_menu_layout(raw.clone(), ContextMenuParentId::Root, &layout);
+            let without_item = normalize_menu(
+                shown
+                    .into_iter()
+                    .filter(|node| {
+                        matches!(node, MenuNode::Separator)
+                            || menu_node_layout_id(node) != LayoutUnitId::Configurable(id)
+                    })
+                    .collect(),
+            );
+            layout.set_visible(id, false);
+            let hidden = apply_context_menu_layout(raw.clone(), ContextMenuParentId::Root, &layout);
+            assert_eq!(
+                hidden, without_item,
+                "hiding {id:?} must not move another item"
+            );
+            assert_eq!(
+                labels(&hidden),
+                ["cut", "tool", "アプリケーションで開く…", "settings", "copy"]
+            );
+
+            if id == ContextMenuItemId::SearchByName {
+                layout.set_visible(id, true);
+                layout.set_visible(ContextMenuItemId::SearchByNameEverything, false);
+                assert_eq!(
+                    apply_context_menu_layout(raw, ContextMenuParentId::Root, &layout),
+                    hidden,
+                    "hiding all children must preserve the same fixed-group anchors"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_submenus_do_not_publish_separator_overrides_or_section_state() {
+        for before in [
+            ContextMenuSeparatorBefore::Present,
+            ContextMenuSeparatorBefore::Absent,
+        ] {
+            let mut raw = vec![item(MenuCommand::CutFiles, "cut")];
+            if before == ContextMenuSeparatorBefore::Absent {
+                raw.push(MenuNode::Separator);
+            }
+            raw.extend([
+                MenuNode::Submenu {
+                    label: ContextMenuItemId::SearchByName.label().into(),
+                    children: vec![item(MenuCommand::SearchByNameEverything, "search")],
+                },
+                item(MenuCommand::CopyFiles, "copy"),
+            ]);
+            let mut layout = ContextMenuLayoutSettings::default();
+            layout.set_separator_before(ContextMenuItemId::SearchByName, before);
+            layout.set_visible(ContextMenuItemId::SearchByNameEverything, false);
+            let empty_submenu =
+                apply_context_menu_layout(raw.clone(), ContextMenuParentId::Root, &layout);
+            assert_eq!(
+                menu_shape(&empty_submenu),
+                if before == ContextMenuSeparatorBefore::Present {
+                    vec!["CutFiles", "CopyFiles"]
+                } else {
+                    vec!["CutFiles", "|", "CopyFiles"]
+                },
+                "{before:?} belongs to the removed submenu, not the next visible item"
+            );
+            layout.set_visible(ContextMenuItemId::SearchByName, false);
+            layout.set_visible(ContextMenuItemId::SearchByNameEverything, true);
+            assert_eq!(
+                empty_submenu,
+                apply_context_menu_layout(raw, ContextMenuParentId::Root, &layout),
+                "hiding all children and hiding their parent must resolve equally"
+            );
+        }
     }
 
     #[test]

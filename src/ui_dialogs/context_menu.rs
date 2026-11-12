@@ -1160,7 +1160,7 @@ impl crate::app::App {
             ContextMenuSurface::Grid,
             explorer_folder,
         );
-        let nodes = self.context_menu_nodes(&target, in_search);
+        let nodes = self.context_menu_nodes(ctx, &target, in_search);
         let mut selected_command = None;
         let mut open = true;
         egui::Window::new("context_menu")
@@ -1250,7 +1250,7 @@ impl crate::app::App {
             explorer_folder,
         );
         let shell_paths = target.shell_paths.clone().unwrap_or_default();
-        let miv_items = self.context_menu_nodes(&target, in_search);
+        let miv_items = self.context_menu_nodes(ctx, &target, in_search);
         let miv_count = menu_leaf_count(&miv_items);
         let target_kind = native_grid_context_menu_target_kind(&target);
         let prepare_ms = prepare_t0.elapsed().as_secs_f64() * 1000.0;
@@ -1461,6 +1461,7 @@ impl crate::app::App {
 
     fn context_menu_nodes(
         &mut self,
+        ctx: &egui::Context,
         target: &NativeGridContextMenuTarget,
         in_search: bool,
     ) -> Vec<MenuNode> {
@@ -1496,7 +1497,26 @@ impl crate::app::App {
             rating: self.items_are_rating_view,
             reading_history: self.items_are_reading_history_view,
         };
+        let search_by_name = (target.surface == ContextMenuSurface::Grid
+            && !target.is_folder_context)
+            .then(|| self.grid_item_search_name(ctx, &target.item))
+            .flatten()
+            .map(|query| {
+                let availability = |kind| {
+                    if query.is_empty() {
+                        Err("名前が空のため検索できません")
+                    } else {
+                        self.search_with_text_menu_availability(kind)
+                    }
+                };
+                crate::context_menu_model::SearchByNameAvailability {
+                    everything: availability(crate::ui_pinned_search::PinnedSearchKind::Everything),
+                    metadata: availability(crate::ui_pinned_search::PinnedSearchKind::Metadata),
+                    local: availability(crate::ui_pinned_search::PinnedSearchKind::Local),
+                }
+            });
         let input = ContextMenuInput {
+            search_by_name,
             kind: ContextMenuItemKind::from_grid_item(&target.item),
             surface: target.surface,
             is_folder_context: target.is_folder_context,
@@ -1774,6 +1794,36 @@ impl crate::app::App {
             return None;
         }
         match command {
+            MenuCommand::SearchByNameEverything
+            | MenuCommand::SearchByNameMetadata
+            | MenuCommand::SearchByNameLocal => {
+                if target.surface == ContextMenuSurface::Grid
+                    && !target.is_folder_context
+                    && let Some(query) = self.grid_item_search_name(ctx, &target.item)
+                    && !query.is_empty()
+                {
+                    let target = match command {
+                        MenuCommand::SearchByNameEverything => {
+                            crate::ui_pinned_search::PinnedSearchKind::Everything
+                        }
+                        MenuCommand::SearchByNameMetadata => {
+                            crate::ui_pinned_search::PinnedSearchKind::Metadata
+                        }
+                        MenuCommand::SearchByNameLocal => {
+                            crate::ui_pinned_search::PinnedSearchKind::Local
+                        }
+                        _ => unreachable!(),
+                    };
+                    // Capture the name first, then end the calling menu owner.
+                    // Shared search admission sees the ordinary post-menu state.
+                    self.context_menu_idx = None;
+                    self.open_search_with_text(
+                        ctx,
+                        crate::search_request::SearchRequest { target, query },
+                    );
+                }
+                None
+            }
             MenuCommand::ConvertImageFolderToZip => {
                 if let GridItem::Folder(path) = &target.item {
                     self.start_image_folder_zip(ctx, path.clone(), false);
@@ -2297,7 +2347,7 @@ impl crate::app::App {
             ContextMenuSurface::Fullscreen,
             explorer_folder,
         );
-        let nodes = self.context_menu_nodes(&target, false);
+        let nodes = self.context_menu_nodes(ctx, &target, false);
         let mut selected_command = None;
         let mut open = true;
         egui::Window::new("fs_context_menu")
@@ -4021,7 +4071,7 @@ mod copy_action_tests {
                 ContextMenuSurface::Grid,
                 None,
             );
-            let nodes = app.context_menu_nodes(&target, false);
+            let nodes = app.context_menu_nodes(&egui::Context::default(), &target, false);
             assert!(nodes.iter().any(|node| matches!(
                 node,
                 MenuNode::Item {
@@ -4604,7 +4654,10 @@ mod delete_confirm_tests {
         }
         let target = target(app, item, surface);
         let mut commands = Vec::new();
-        visit(&app.context_menu_nodes(&target, false), &mut commands);
+        visit(
+            &app.context_menu_nodes(&egui::Context::default(), &target, false),
+            &mut commands,
+        );
         commands
     }
 
@@ -4649,19 +4702,19 @@ mod delete_confirm_tests {
             app.checked.clear();
             let mut target = target(&app, unsupported, ContextMenuSurface::Grid);
             assert_eq!(
-                caption_state(&app.context_menu_nodes(&target, false)),
+                caption_state(&app.context_menu_nodes(&egui::Context::default(), &target, false)),
                 Some((false, true))
             );
             app.checked = [0, 1].into_iter().collect();
             target.has_checked = true;
             target.checked_count = 2;
             assert_eq!(
-                caption_state(&app.context_menu_nodes(&target, false)),
+                caption_state(&app.context_menu_nodes(&egui::Context::default(), &target, false)),
                 Some((false, true))
             );
             app.checked = [0, 2].into_iter().collect();
             assert_eq!(
-                caption_state(&app.context_menu_nodes(&target, false)),
+                caption_state(&app.context_menu_nodes(&egui::Context::default(), &target, false)),
                 Some((true, false))
             );
         }
@@ -4725,7 +4778,7 @@ mod delete_confirm_tests {
         );
         background.is_folder_context = true;
         background.item_index = None;
-        let nodes = app.context_menu_nodes(&background, false);
+        let nodes = app.context_menu_nodes(&egui::Context::default(), &background, false);
         assert!(matches!(
             nodes.first(),
             Some(MenuNode::Item {
@@ -4737,7 +4790,7 @@ mod delete_confirm_tests {
         ));
         background.surface = ContextMenuSurface::Fullscreen;
         assert!(
-            !app.context_menu_nodes(&background, false)
+            !app.context_menu_nodes(&egui::Context::default(), &background, false)
                 .iter()
                 .any(|node| matches!(
                     node,
@@ -4808,7 +4861,7 @@ mod delete_confirm_tests {
                     entry_ids: vec![crate::collection_store::CollectionEntryId::new()],
                 },
             );
-        let nodes = app.context_menu_nodes(&root, false);
+        let nodes = app.context_menu_nodes(&egui::Context::default(), &root, false);
         let jump = state(&nodes, MenuCommand::JumpToFolder).expect("grid location jump");
         assert!(!jump.0);
         assert_eq!(jump.1.as_deref(), Some(COLLECTION_JUMP_STALE_MESSAGE));
@@ -4824,7 +4877,7 @@ mod delete_confirm_tests {
         );
 
         root.surface = ContextMenuSurface::Fullscreen;
-        let nodes = app.context_menu_nodes(&root, false);
+        let nodes = app.context_menu_nodes(&egui::Context::default(), &root, false);
         assert!(state(&nodes, MenuCommand::JumpToFolder).is_none());
     }
 
@@ -5019,7 +5072,10 @@ mod delete_confirm_tests {
             native_grid_context_menu_target_kind(&target),
             "virtual_item"
         );
-        assert!(!app.context_menu_nodes(&target, false).is_empty());
+        assert!(
+            !app.context_menu_nodes(&egui::Context::default(), &target, false)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -5056,7 +5112,7 @@ mod delete_confirm_tests {
             native_grid_context_menu_target_kind(&target),
             "checked_paths"
         );
-        let nodes = app.context_menu_nodes(&target, false);
+        let nodes = app.context_menu_nodes(&egui::Context::default(), &target, false);
         for command in [MenuCommand::CutFiles, MenuCommand::CopyFiles] {
             assert!(nodes.iter().any(|node| {
                 matches!(
@@ -5126,14 +5182,16 @@ mod delete_confirm_tests {
         app.keymap = crate::keymap::Keymap::from_ini_str(
             "[Grid]\nGridCutFiles = Alt+X\nGridCopyFiles = Alt+C\n",
         );
-        let labels = menu_labels(&app.context_menu_nodes(&target, false));
+        let labels =
+            menu_labels(&app.context_menu_nodes(&egui::Context::default(), &target, false));
         assert!(labels.contains(&"切り取り (Alt+X)".to_string()));
         assert!(labels.contains(&"コピー (Alt+C)".to_string()));
 
         app.keymap = crate::keymap::Keymap::from_ini_str(
             "[Grid]\nGridCutFiles = none\nGridCopyFiles = none\n",
         );
-        let labels = menu_labels(&app.context_menu_nodes(&target, false));
+        let labels =
+            menu_labels(&app.context_menu_nodes(&egui::Context::default(), &target, false));
         assert!(labels.contains(&"切り取り".to_string()));
         assert!(labels.contains(&"コピー".to_string()));
         assert!(!labels.iter().any(|label| label.starts_with("切り取り (")));
@@ -5273,15 +5331,21 @@ mod delete_confirm_tests {
             Some(PathBuf::from(r"C:\media")),
         );
 
-        assert!(app.context_menu_nodes(&target, false).iter().any(|node| {
-            matches!(
-                node,
-                MenuNode::Item {
-                    command: MenuCommand::ExternalTool(crate::external_tool::ExternalToolId(7)),
-                    ..
-                }
-            )
-        }));
+        assert!(
+            app.context_menu_nodes(&egui::Context::default(), &target, false)
+                .iter()
+                .any(|node| {
+                    matches!(
+                        node,
+                        MenuNode::Item {
+                            command: MenuCommand::ExternalTool(
+                                crate::external_tool::ExternalToolId(7)
+                            ),
+                            ..
+                        }
+                    )
+                })
+        );
         assert!(matches!(
             &target.external_tool_descriptor.targets_for_test(&app)[..],
             [
@@ -5332,7 +5396,7 @@ mod delete_confirm_tests {
                 crate::app::collection_grid::CollectionRootDeleteResolution::NotCollectionRoot,
         };
 
-        let items = app.context_menu_nodes(&target, false);
+        let items = app.context_menu_nodes(&egui::Context::default(), &target, false);
         let external: Vec<_> = items
             .iter()
             .filter_map(|item| match item {
@@ -5598,7 +5662,7 @@ mod delete_confirm_tests {
             crate::app::collection_grid::CollectionRootDeleteResolution::Unavailable(
                 "コレクションの参照を確認しています",
             );
-        let nodes = app.context_menu_nodes(&target, false);
+        let nodes = app.context_menu_nodes(&egui::Context::default(), &target, false);
         assert_eq!(
             state(&nodes, MenuCommand::RemoveFromCollection),
             Some((false, Some("コレクションの参照を確認しています")))
@@ -6890,5 +6954,774 @@ mod clipboard_image_writer_tests {
         );
         assert_eq!(api.events.last(), Some(&"close"));
         assert!(!api.opened);
+    }
+}
+
+#[cfg(test)]
+mod search_by_name_menu_tests {
+    use super::*;
+    use crate::app::{App, AppTestEnvForTest};
+    use crate::ui_pinned_search::PinnedSearchKind as Kind;
+
+    fn destinations() -> [(MenuCommand, Kind, &'static str); 3] {
+        [
+            (
+                MenuCommand::SearchByNameEverything,
+                Kind::Everything,
+                "Everything で探す",
+            ),
+            (
+                MenuCommand::SearchByNameMetadata,
+                Kind::Metadata,
+                "アイテム検索で探す",
+            ),
+            (
+                MenuCommand::SearchByNameLocal,
+                Kind::Local,
+                "この場所で絞り込む",
+            ),
+        ]
+    }
+
+    fn fixture(pinned: bool) -> AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
+        app.current_folder = Some(app.tmp.path().to_owned());
+        app.items = vec![
+            GridItem::Image(app.tmp.path().join("日本語 name.png")),
+            GridItem::Image(app.tmp.path().join("different cursor.png")),
+        ];
+        // The right-click target is independent of the keyboard cursor.
+        app.selected = Some(1);
+        app.settings.show_toolbar_search_local = pinned;
+        app.settings.show_toolbar_search_metadata = pinned;
+        app.settings.show_toolbar_search_everything = pinned;
+        #[cfg(windows)]
+        {
+            app.main_hwnd = None;
+        }
+        app.context_menu_pos = egui::pos2(24.0, 24.0);
+        app.context_menu_idx = Some(app.capture_grid_context_menu_owner(0));
+        app
+    }
+
+    fn target(
+        app: &App,
+        background: bool,
+        surface: ContextMenuSurface,
+    ) -> NativeGridContextMenuTarget {
+        let (index, item) = if background {
+            (
+                usize::MAX,
+                GridItem::Folder(app.current_folder.clone().unwrap()),
+            )
+        } else {
+            (0, app.items[0].clone())
+        };
+        app.context_menu_target(
+            index,
+            item,
+            background,
+            !app.checked.is_empty(),
+            app.current_folder.clone(),
+            surface,
+            None,
+        )
+    }
+
+    fn command_state<'a>(
+        nodes: &'a [MenuNode],
+        expected: &MenuCommand,
+    ) -> Option<(bool, Option<&'a str>)> {
+        nodes.iter().find_map(|node| match node {
+            MenuNode::Item {
+                command,
+                enabled,
+                disabled_reason,
+                ..
+            } if command == expected => Some((*enabled, disabled_reason.as_deref())),
+            MenuNode::Submenu { children, .. } => command_state(children, expected),
+            _ => None,
+        })
+    }
+
+    fn assert_draft_only(app: &App, kind: Kind) {
+        assert!(
+            app.context_menu_idx.is_none(),
+            "the caller's menu owner must retire first"
+        );
+        assert!(app.edit_owner(kind), "{kind:?} input must open");
+        assert_eq!(app.search_draft(kind), "日本語 name");
+        assert!(app.search_pending.is_none());
+        assert!(app.search_filter.is_none());
+        assert!(app.global_search.pending.is_none());
+        assert!(app.global_search.last_change_at.is_none());
+        if kind == Kind::Metadata {
+            assert!(!app.global_search.is_searching());
+        }
+    }
+
+    #[test]
+    fn search_name_native_menu_enables_three_targets_and_retires_its_owner_before_opening() {
+        for pinned in [false, true] {
+            for (command, kind, _) in destinations() {
+                let mut app = fixture(pinned);
+                let ctx = egui::Context::default();
+                ctx.begin_pass(egui::RawInput::default());
+                assert!(app.common_modal_dialog_open());
+                assert!(
+                    app.keyboard_owner_for_pass(&ctx)
+                        .shortcut_permit()
+                        .is_none()
+                );
+                let target = target(&app, false, ContextMenuSurface::Grid);
+                let previous_items = app.items.clone();
+                let nodes = app.context_menu_nodes(&ctx, &target, false);
+                for (destination, _, _) in destinations() {
+                    assert_eq!(command_state(&nodes, &destination), Some((true, None)));
+                }
+                assert!(matches!(
+                    app.dispatch_native_context_menu_result(
+                        &ctx,
+                        NativeContextMenuResult::MivCommand(command),
+                        &target,
+                    ),
+                    NativeGridContextMenuOutcome::Consumed {
+                        nav: None,
+                        close_fullscreen: false
+                    }
+                ));
+                assert_draft_only(&app, kind);
+                assert_eq!(
+                    app.items, previous_items,
+                    "prefill retains the ordinary grid"
+                );
+                ctx.end_pass().drop_without_applying_deltas();
+            }
+        }
+    }
+
+    #[test]
+    fn search_name_egui_menu_click_closes_owner_and_opens_each_input() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        for pinned in [false, true] {
+            for (_, kind, label) in destinations() {
+                let mut harness = crate::test_ui::builder()
+                    .with_context_setup(crate::ui_fonts::configure_fonts)
+                    .with_size(egui::vec2(1100.0, 1100.0))
+                    .build_ui_state(
+                        move |ui, app: &mut AppTestEnvForTest| {
+                            if app.context_menu_idx.is_some() {
+                                // Capture the real input owner while the menu is present.
+                                let _owner = app.keyboard_owner_for_pass(ui.ctx());
+                                let _ = app.show_context_menu(ui.ctx());
+                            } else if app.edit_owner(kind) {
+                                if pinned {
+                                    let response = app.draw_pinned_search_section(ui, kind);
+                                    app.handle_pinned_search_actions(
+                                        ui.ctx(),
+                                        response.inner.actions,
+                                    );
+                                } else if kind == Kind::Local {
+                                    app.render_search_bar(ui);
+                                } else {
+                                    app.render_global_search_bar(ui);
+                                }
+                            }
+                        },
+                        fixture(pinned),
+                    );
+                harness.run_steps(4);
+                assert!(harness.state().context_menu_idx.is_some());
+                let previous_items = harness.state().items.clone();
+                harness.get_by_label("名前で検索").click();
+                harness.run_steps(3);
+                for (_, _, destination_label) in destinations() {
+                    assert!(
+                        !harness
+                            .get_by_label(destination_label)
+                            .accesskit_node()
+                            .is_disabled()
+                    );
+                }
+                harness.get_by_label(label).click();
+                harness.run_steps(3);
+                assert_draft_only(harness.state(), kind);
+                assert_eq!(harness.state().items, previous_items);
+                if kind == Kind::Local {
+                    assert!(harness.state().search_has_focus);
+                } else {
+                    assert!(harness.state().global_search.has_focus);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn search_name_menu_excludes_only_its_own_modal_and_rechecks_other_modals_at_dispatch() {
+        for (command, kind, _) in destinations() {
+            let mut app = fixture(false);
+            let ctx = egui::Context::default();
+            ctx.begin_pass(egui::RawInput::default());
+            let target = target(&app, false, ContextMenuSurface::Grid);
+            let admitted_nodes = app.context_menu_nodes(&ctx, &target, false);
+            assert_eq!(command_state(&admitted_nodes, &command), Some((true, None)));
+            app.show_about_dialog = true;
+            let blocked_nodes = app.context_menu_nodes(&ctx, &target, false);
+            for (destination, _, _) in destinations() {
+                let (enabled, reason) = command_state(&blocked_nodes, &destination).unwrap();
+                assert!(!enabled);
+                assert!(reason.is_some_and(|reason| !reason.is_empty()));
+            }
+            let previous = app.search_draft(kind).to_owned();
+            app.dispatch_native_context_menu_result(
+                &ctx,
+                NativeContextMenuResult::MivCommand(command),
+                &target,
+            );
+            assert!(app.show_about_dialog);
+            assert_eq!(app.search_draft(kind), previous);
+            assert!(!app.edit_owner(kind));
+            assert!(app.search_pending.is_none());
+            assert!(app.global_search.pending.is_none());
+            ctx.end_pass().drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn search_name_app_menu_filters_item_kinds_and_rejects_excluded_entry_contexts() {
+        use crate::grid_item::{CollectionPlaceholderReason, SearchContainerKind};
+        let mut app = fixture(false);
+        let root = app.tmp.path().to_owned();
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput::default());
+        for (item, included) in [
+            (GridItem::Folder(root.join("folder.with.dot")), true),
+            (GridItem::Image(root.join("image.png")), true),
+            (GridItem::Video(root.join("video.mp4")), true),
+            (GridItem::Audio(root.join("audio.mp3")), true),
+            (GridItem::ZipFile(root.join("book.zip")), true),
+            (GridItem::PdfFile(root.join("book.pdf")), true),
+            (GridItem::PdfFile(root.join("book.epub")), true),
+            (
+                GridItem::ConvertibleArchive {
+                    path: root.join("book.7z"),
+                    format: crate::archive_converter::ArchiveFormat::SevenZ,
+                },
+                true,
+            ),
+            (
+                GridItem::ZipImage {
+                    zip_path: root.join("book.zip"),
+                    entry_name: "nested/image.png".into(),
+                },
+                true,
+            ),
+            (
+                GridItem::ZipDir {
+                    zip_path: root.join("book.zip"),
+                    dir_prefix: "nested/folder/".into(),
+                    is_archive: false,
+                    representative: None,
+                },
+                true,
+            ),
+            (
+                GridItem::SearchContainer {
+                    path: root.join("folder.with.dot"),
+                    kind: SearchContainerKind::Folder,
+                    hit_count: 1,
+                    representative: None,
+                },
+                true,
+            ),
+            (
+                GridItem::PdfPage {
+                    pdf_path: root.join("book.pdf"),
+                    page_num: 0,
+                    content_type: None,
+                },
+                false,
+            ),
+            (
+                GridItem::Stack {
+                    key: "series".into(),
+                    representative: root.join("image.png"),
+                    count: 2,
+                },
+                false,
+            ),
+            (
+                GridItem::CollectionPlaceholder {
+                    path: root.join("missing.png"),
+                    last_known_kind: crate::collection_store::CollectionResolvedKind::Image,
+                    reason: CollectionPlaceholderReason::Missing,
+                },
+                false,
+            ),
+        ] {
+            app.items[0] = item;
+            app.context_menu_idx = Some(app.capture_grid_context_menu_owner(0));
+            let target = target(&app, false, ContextMenuSurface::Grid);
+            let nodes = app.context_menu_nodes(&ctx, &target, false);
+            for (command, _, _) in destinations() {
+                assert_eq!(
+                    command_state(&nodes, &command).is_some(),
+                    included,
+                    "{:?}",
+                    target.item
+                );
+                if !included {
+                    app.dispatch_native_grid_context_command(&ctx, command, &target);
+                    assert!(!app.show_search_bar);
+                    assert!(!app.global_search.active);
+                }
+            }
+        }
+        app.items[0] = GridItem::Image(root.join("日本語 name.png"));
+        for exclusion in 0..5 {
+            app.checked.clear();
+            app.items_are_bookmark_view = exclusion == 2;
+            app.items_are_reading_history_view = exclusion == 3;
+            app.fullscreen_idx = (exclusion == 4).then_some(0);
+            if exclusion == 0 {
+                app.checked.insert(0);
+            }
+            let target = target(
+                &app,
+                exclusion == 1,
+                if exclusion == 4 {
+                    ContextMenuSurface::Fullscreen
+                } else {
+                    ContextMenuSurface::Grid
+                },
+            );
+            let nodes = app.context_menu_nodes(&ctx, &target, false);
+            for (command, _, _) in destinations() {
+                assert!(
+                    command_state(&nodes, &command).is_none(),
+                    "exclusion={exclusion}"
+                );
+                app.dispatch_native_grid_context_command(&ctx, command, &target);
+                assert!(!app.show_search_bar);
+                assert!(!app.global_search.active);
+            }
+        }
+        ctx.end_pass().drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn search_name_local_menu_refusal_preserves_metadata_and_everything_result_children() {
+        use crate::global_search_ui::{EverythingPosition, SearchAccepted};
+        for source in [Kind::Metadata, Kind::Everything] {
+            for child in [false, true] {
+                let mut app = fixture(false);
+                let ctx = egui::Context::default();
+                ctx.begin_pass(egui::RawInput::default());
+                app.context_menu_idx = None;
+                app.ensure_search_session(source);
+                *app.search_draft_mut(source) = "previous results".into();
+                if source == Kind::Everything {
+                    let dataset = crate::global_search_ui::everything_dataset_for_test(vec![
+                        app.items[0].clone(),
+                    ]);
+                    crate::global_search_ui::adopt_everything_for_test(
+                        &mut app,
+                        &ctx,
+                        "previous results",
+                        dataset,
+                    );
+                    if child {
+                        let root = app.tmp.path().to_owned();
+                        let SearchAccepted::Everything { position, .. } =
+                            &mut app.global_search.accepted
+                        else {
+                            unreachable!()
+                        };
+                        *position = EverythingPosition::PhysicalChild {
+                            logical_source: root.clone(),
+                            return_anchor: root.clone(),
+                            route: crate::app::FacetRoute::root(crate::app::FacetScope::path(
+                                &root,
+                            )),
+                        };
+                    }
+                } else if child {
+                    app.global_search.drill = Some(crate::global_search_ui::DrillState {
+                        container_root: app.tmp.path().to_owned(),
+                        current_path: app.tmp.path().to_owned(),
+                        is_zip: false,
+                    });
+                }
+                app.items_are_global_search_view = !child;
+                app.search_query = "keep local draft".into();
+                app.context_menu_idx = Some(app.capture_grid_context_menu_owner(0));
+                let target = target(&app, false, ContextMenuSurface::Grid);
+                let nodes = app.context_menu_nodes(&ctx, &target, true);
+                let (enabled, reason) =
+                    command_state(&nodes, &MenuCommand::SearchByNameLocal).unwrap();
+                assert!(!enabled);
+                assert!(reason.is_some_and(|reason| !reason.is_empty()));
+                app.dispatch_native_context_menu_result(
+                    &ctx,
+                    NativeContextMenuResult::MivCommand(MenuCommand::SearchByNameLocal),
+                    &target,
+                );
+                assert!(app.edit_owner(source));
+                assert_eq!(app.search_draft(source), "previous results");
+                assert_eq!(app.search_query, "keep local draft");
+                assert!(!app.show_search_bar);
+                assert!(app.search_pending.is_none());
+                ctx.end_pass().drop_without_applying_deltas();
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ExistingSearchPhase {
+        Input,
+        Results,
+        PhysicalChild,
+        Running,
+    }
+
+    fn existing_search_fixture(
+        ctx: &egui::Context,
+        source: Kind,
+        phase: ExistingSearchPhase,
+        pinned: bool,
+    ) -> AppTestEnvForTest {
+        use crate::global_search_ui::{EverythingPosition, SearchAccepted, SearchProducer};
+        let mut app = fixture(pinned);
+        app.context_menu_idx = None;
+        app.indexer_init = crate::app::IndexerInit::Unavailable;
+        *app.search_draft_mut(source) = "previous draft".into();
+        app.ensure_search_session(source);
+        if phase != ExistingSearchPhase::Input {
+            let path = app.items[0].drag_source_path().unwrap().to_owned();
+            image::RgbImage::new(2, 3).save(&path).unwrap();
+            if source == Kind::Everything {
+                let dataset =
+                    crate::global_search_ui::everything_dataset_for_test(vec![GridItem::Image(
+                        path,
+                    )]);
+                crate::global_search_ui::adopt_everything_for_test(
+                    &mut app,
+                    ctx,
+                    "previous draft",
+                    dataset,
+                );
+                if phase == ExistingSearchPhase::PhysicalChild {
+                    let root = app.tmp.path().to_owned();
+                    let SearchAccepted::Everything { position, .. } =
+                        &mut app.global_search.accepted
+                    else {
+                        unreachable!()
+                    };
+                    *position = EverythingPosition::PhysicalChild {
+                        logical_source: root.clone(),
+                        return_anchor: root.clone(),
+                        route: crate::app::FacetRoute::root(crate::app::FacetScope::path(&root)),
+                    };
+                }
+            } else {
+                // A retained draft opens idle (done=true). Entering a real producer
+                // uses this reset; otherwise poll returns before reading its stream.
+                // The existing G1 fixture publishes the executed query "test".
+                app.global_search.metadata_draft = "test".into();
+                app.global_search.reset_for_new_query();
+                crate::global_search_ui::tests::g1_publish_search_hits(&mut app, ctx, &[path]);
+                assert_eq!(
+                    app.global_search.metadata_draft,
+                    app.global_search.last_executed
+                );
+                assert!(matches!(
+                    &app.global_search.accepted,
+                    SearchAccepted::Metadata { applied: Some(applied) } if applied.query == "test"
+                ));
+                if phase == ExistingSearchPhase::PhysicalChild {
+                    app.global_search.drill = Some(crate::global_search_ui::DrillState {
+                        container_root: app.tmp.path().to_owned(),
+                        current_path: app.tmp.path().to_owned(),
+                        is_zip: false,
+                    });
+                }
+            }
+            app.items_are_global_search_view = phase != ExistingSearchPhase::PhysicalChild;
+        }
+        if phase == ExistingSearchPhase::Running {
+            if source == Kind::Everything {
+                let _cancel = crate::global_search_ui::start_everything_for_test(
+                    &mut app,
+                    ctx,
+                    "previous draft",
+                );
+            } else {
+                let (_tx, rx) = crossbeam_channel::unbounded();
+                app.global_search.pending = Some(SearchProducer::Metadata(
+                    crate::indexer_manager::SearchHandle {
+                        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        rx,
+                    },
+                ));
+            }
+            app.global_search.done = false;
+        }
+        app.global_search.has_focus = false;
+        app.global_search.focus_request = false;
+        app.context_menu_idx = Some(app.capture_grid_context_menu_owner(0));
+        app
+    }
+
+    // Capture ownership tokens rather than addresses inside Option storage, so replacing
+    // a worker at the same memory address cannot look like an unchanged operation.
+    fn existing_search_assertion(app: &App) -> Box<dyn Fn(&App)> {
+        use crate::global_search_ui::{EverythingPosition, SearchAccepted, SearchProducer};
+        use std::sync::{Arc, atomic::Ordering};
+        let run = app.global_search.run_sequence;
+        let state = (
+            app.global_search.source,
+            app.global_search.metadata_draft.clone(),
+            app.global_search.everything_draft.clone(),
+            app.global_search.last_executed.clone(),
+            app.global_search.last_change_at,
+            app.global_search.done,
+            app.global_search.drill.clone(),
+            app.items_are_global_search_view,
+            app.global_search.has_focus,
+            app.global_search.focus_request,
+        );
+        let items = app.items.clone();
+        let metadata_accepted = match &app.global_search.accepted {
+            SearchAccepted::Metadata { applied } => Some(applied.clone()),
+            _ => None,
+        };
+        let everything_accepted = match &app.global_search.accepted {
+            SearchAccepted::Everything {
+                submitted,
+                dataset,
+                position,
+            } => Some((submitted.clone(), Arc::clone(dataset), position.clone())),
+            _ => None,
+        };
+        let metadata_pending = match &app.global_search.pending {
+            Some(SearchProducer::Metadata(handle)) => Some(Arc::clone(&handle.cancel)),
+            _ => None,
+        };
+        let everything_pending = match &app.global_search.pending {
+            Some(SearchProducer::Everything {
+                cancel,
+                request_run,
+                submitted,
+                context,
+                generation,
+                ..
+            }) => Some((
+                cancel.clone(),
+                *request_run,
+                submitted.clone(),
+                *context,
+                *generation,
+            )),
+            _ => None,
+        };
+        let prepare = app
+            .global_search
+            .page_edit_prepare
+            .as_ref()
+            .map(|_| app.search_prepare_cancel_for_test());
+        Box::new(move |app| {
+            assert!(app.global_search.active);
+            assert_eq!(app.global_search.run_sequence, run);
+            assert_eq!(
+                (
+                    app.global_search.source,
+                    app.global_search.metadata_draft.clone(),
+                    app.global_search.everything_draft.clone(),
+                    app.global_search.last_executed.clone(),
+                    app.global_search.last_change_at,
+                    app.global_search.done,
+                    app.global_search.drill.clone(),
+                    app.items_are_global_search_view,
+                    app.global_search.has_focus,
+                    app.global_search.focus_request,
+                ),
+                state,
+            );
+            assert_eq!(app.items, items);
+            match (
+                &metadata_accepted,
+                &everything_accepted,
+                &app.global_search.accepted,
+            ) {
+                (Some(before), None, SearchAccepted::Metadata { applied }) => {
+                    assert_eq!(applied, before)
+                }
+                (
+                    None,
+                    Some((before, dataset_before, position_before)),
+                    SearchAccepted::Everything {
+                        submitted,
+                        dataset,
+                        position,
+                    },
+                ) => {
+                    assert_eq!(submitted, before);
+                    assert!(Arc::ptr_eq(dataset, dataset_before));
+                    match (position_before, position) {
+                        (EverythingPosition::Root, EverythingPosition::Root) => {}
+                        (
+                            EverythingPosition::PhysicalChild {
+                                logical_source: old_source,
+                                return_anchor: old_anchor,
+                                route: old_route,
+                            },
+                            EverythingPosition::PhysicalChild {
+                                logical_source,
+                                return_anchor,
+                                route,
+                            },
+                        ) => {
+                            assert_eq!(
+                                (logical_source, return_anchor, route),
+                                (old_source, old_anchor, old_route)
+                            );
+                        }
+                        _ => panic!("accepted result position changed"),
+                    }
+                }
+                _ => panic!("accepted search source changed"),
+            }
+            match (
+                &metadata_pending,
+                &everything_pending,
+                &app.global_search.pending,
+            ) {
+                (None, None, None) => {}
+                (Some(before), None, Some(SearchProducer::Metadata(handle))) => {
+                    assert!(Arc::ptr_eq(before, &handle.cancel));
+                    assert!(!before.load(Ordering::Relaxed));
+                }
+                (
+                    None,
+                    Some((before, old_run, old_submitted, old_context, old_generation)),
+                    Some(SearchProducer::Everything {
+                        cancel,
+                        request_run,
+                        submitted,
+                        context,
+                        generation,
+                        ..
+                    }),
+                ) => {
+                    assert!(std::ptr::eq(before.cancel_flag(), cancel.cancel_flag()));
+                    assert!(!before.is_cancelled());
+                    assert_eq!(
+                        (request_run, submitted, context, generation),
+                        (old_run, old_submitted, old_context, old_generation)
+                    );
+                }
+                _ => panic!("pending search owner changed"),
+            }
+            assert_eq!(
+                app.global_search.page_edit_prepare.is_some(),
+                prepare.is_some()
+            );
+            if let Some(before) = &prepare {
+                assert!(Arc::ptr_eq(before, &app.search_prepare_cancel_for_test()));
+                assert!(!before.load(Ordering::Relaxed));
+            }
+        })
+    }
+
+    #[test]
+    fn search_name_metadata_menu_refuses_active_search_without_mutating_its_owners() {
+        for pinned in [false, true] {
+            for source in [Kind::Metadata, Kind::Everything] {
+                for phase in [
+                    ExistingSearchPhase::Input,
+                    ExistingSearchPhase::Results,
+                    ExistingSearchPhase::PhysicalChild,
+                    ExistingSearchPhase::Running,
+                ] {
+                    let ctx = egui::Context::default();
+                    ctx.begin_pass(egui::RawInput::default());
+                    let mut app = existing_search_fixture(&ctx, source, phase, pinned);
+                    let unchanged = existing_search_assertion(&app);
+                    let target = target(&app, false, ContextMenuSurface::Grid);
+                    let nodes = app.context_menu_nodes(&ctx, &target, true);
+                    assert_eq!(
+                        command_state(&nodes, &MenuCommand::SearchByNameMetadata),
+                        Some((false, Some("検索を閉じてから使えます"))),
+                        "{source:?}/{phase:?}/pinned={pinned}",
+                    );
+                    unchanged(&app);
+                    // Both the native result and the egui selected-command path must
+                    // recheck admission, even if a stale command reaches dispatch.
+                    app.dispatch_native_context_menu_result(
+                        &ctx,
+                        NativeContextMenuResult::MivCommand(MenuCommand::SearchByNameMetadata),
+                        &target,
+                    );
+                    unchanged(&app);
+                    app.context_menu_idx = Some(app.capture_grid_context_menu_owner(0));
+                    app.dispatch_native_grid_context_command(
+                        &ctx,
+                        MenuCommand::SearchByNameMetadata,
+                        &target,
+                    );
+                    unchanged(&app);
+                    ctx.end_pass().drop_without_applying_deltas();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn search_name_metadata_egui_button_stays_disabled_for_active_search_sessions() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        for pinned in [false, true] {
+            for source in [Kind::Metadata, Kind::Everything] {
+                for phase in [
+                    ExistingSearchPhase::Input,
+                    ExistingSearchPhase::Results,
+                    ExistingSearchPhase::PhysicalChild,
+                    ExistingSearchPhase::Running,
+                ] {
+                    let ctx = egui::Context::default();
+                    ctx.begin_pass(egui::RawInput::default());
+                    let app = existing_search_fixture(&ctx, source, phase, pinned);
+                    let unchanged = existing_search_assertion(&app);
+                    ctx.end_pass().drop_without_applying_deltas();
+                    let mut harness = crate::test_ui::builder()
+                        .with_context_setup(crate::ui_fonts::configure_fonts)
+                        .with_size(egui::vec2(1100.0, 1100.0))
+                        .build_ui_state(
+                            |ui, app: &mut AppTestEnvForTest| {
+                                let _ = app.show_context_menu(ui.ctx());
+                            },
+                            app,
+                        );
+                    harness.run_steps(4);
+                    harness.get_by_label("名前で検索").click();
+                    harness.run_steps(3);
+                    let button = harness.get_by_label("アイテム検索で探す");
+                    assert!(button.accesskit_node().is_disabled());
+                    let position = button.rect().center();
+                    harness.event(egui::Event::PointerMoved(position));
+                    for pressed in [true, false] {
+                        harness.event(egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        });
+                        harness.run_steps(1);
+                    }
+                    harness.run_steps(2);
+                    unchanged(harness.state());
+                    assert!(harness.state().context_menu_idx.is_some());
+                }
+            }
+        }
     }
 }
