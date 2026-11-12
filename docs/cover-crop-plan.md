@@ -818,9 +818,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local
 - **採らない: 回転を変えたら該当タイルのキャッシュ行を消す。** §1.718 §2.1 のとおり、単一キーの削除には書き込み途中の worker を止める
   epoch が無く、古い結果が書き戻される。
 - **採らない: 全体の回転 revision をキーに入れる。** 普通の画像を 1 枚回すだけで、全ての本の自動のタイルのキーが変わり作り直しになる。
-- **採らない: 追い出し対象を「回した表紙の本だけ」に絞る。** `Loaded` は scope もキーも持たない (`Page` 化で scope が落ちる)。絞るために
-  `Loaded` へ状態を足すより、自動 ON のときは自動の対象の本のタイルを全部追い出して通常の要求に戻すほうが状態が少ない。
-  キーが変わらない本はキャッシュの即時ヒットで戻るので、回転というまれな操作 1 回の費用としては小さい。
+- **採らない: 回転を変えたら自動の対象の本のタイルを全部追い出す (rev2 の案)。** キャッシュを保存しない設定 (`CachePolicy::Off`) や
+  未生成の本では、無関係な画像を R/L で回すだけで全 context の本を再デコードすることになり、通常の操作の費用になる。
+- **採らない: `Loaded` に scope やキーを足して、回した表紙の本だけを特定する。** タイルの状態が増える。
 - **採る: 回転は「不変スナップショット」として 1 つだけ運び、キーの印はそこから 1 つの純粋関数で作る。**
   - 純粋関数 `auto_crop_identity(binding, scope, snapshot) -> AutoCropIdentity { binding, rotation: Option<u64> }`。
     `rotation` は `scope` に入る snapshot の非 0 行 (キー, 角度) の安定ハッシュで、行が無ければ `None` (今と同じ綴り
@@ -832,12 +832,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local
     子の writer と同じ scope・同じスナップショットから子の identity を作る。
   - 同じ関数を、要求の組み立て (`CacheOnly` で scope を外す前に確定する)、子の K2 キー、残す行の集合 (`delete_missing` の存続キー:
     通常一覧・ZipDir・ピン付き)、範囲画面の自動の枠、採用時の確認、のすべてで使う。
-- 作り直しの起動と遅着の扱いは、既存の 2 つの境界を広げるだけにする:
-  1. **追い出し**: 回転 owner が変わったときの既存のフック (`rotation_page_owner_changed` → `evict_legacy_cover_thumbnails`、全 viewer
-     context を回る §1.718 の経路) で、自動 ON なら、自動の対象の本のタイル (`Loaded` / 読み込み中とも) を追い出す。自動 OFF なら今までどおり。
-  2. **採用時の確認**: 要求の不変の事実 (`requested.cover_facts`) に、その要求の scope と自動の identity を入れる。結果を採用するとき
-     (`app.rs` の Legacy の回転確認と同じ場所)、今のスナップショットで `auto_crop_identity` を作り直して要求の identity と比べ、違えば
-     既存の `evict_thumbnail_for_reload` で捨てて要求し直す。回転を変えた時点で読み込み中だった要求の遅着は、ここで捨てられる。
+- **対象の絞り込みは「同じ純粋関数を前後のスナップショットで比べる」1 つの述語にする。**
+  述語 `auto_cover_stale(item, before, after)`: 自動 ON で自動の対象の本 (`GridItem` が ZipFile / PdfFile / ConvertibleArchive / ZipDir、
+  または AutoSelected のフォルダ) について、**item から作る保守的な論理 scope** (アーカイブ・PDF は本体、ZipDir は外側 ZIP＋prefix と変換先、
+  フォルダはそのフォルダ以下) で `auto_crop_identity` を before と after それぞれから作り、違えば対象。`Loaded` に状態は足さない。
+  保守的 scope は writer の scope を必ず含む (含まない経路は組み立ての誤りとしてテストで落とす) ので、取りこぼしは起きず、
+  scope 外の回転 (同じフォルダの普通の画像など) では対象にならない。
+- 作り直しの起動と遅着の扱いは、既存の境界を広げるだけにする:
+  1. **回転の変更**: 既存のフック (`rotation_page_owner_changed` → `evict_legacy_cover_thumbnails`、全 viewer context を回る §1.718 の経路) で、
+     変更前と変更後のスナップショットを述語に渡し、対象のタイル (`Loaded` / 読み込み中とも) を追い出す。自動 OFF なら今までどおり。
+  2. **保存した一覧の復元**: サムネイルごと退避する一覧 (`snapshot_ops` の退避・復元) は、退避したときのスナップショットの Arc を一緒に持ち、
+     復元するときに今のスナップショットと同じ述語で比べて対象のタイルを追い出す (Arc が同一なら比較を省く)。既存の Legacy の復元検査と同じ場所。
+  3. **採用時の確認**: 要求の不変の事実 (`requested.cover_facts`) に、**要求を組み立てた時点の scope と自動の identity の組**を入れる
+     (`CacheOnly` で `prepare_cover_refresh` が要求の scope を外す前に捕捉する。要求の scope の扱いそのものは変えない)。結果を採用するとき
+     (Legacy の回転確認と同じ場所)、捕捉した scope と今のスナップショットで identity を作り直して要求の identity と比べ、違えば既存の
+     `evict_thumbnail_for_reload` で捨てて要求し直す。回転が変わっていなければ (`CacheOnly` のヒットを含めて) そのまま採用する。
   専用の待機状態・再要求ループ・行の状態は持たない。
 - 判定の入力: 要求にスナップショットの Arc を載せ、worker は解決した leaf の `CoverIdentity::Page(key)` で角度を引く。キーの印と判定材料は
   同じスナップショット由来なので食い違わない。
@@ -866,7 +875,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local
 - identity とキー: scope に回転が無ければ今の綴りと同一 (master の関数の oracle 比較を維持)。scope 内の行が変わると印が変わり、scope 外の
   回転では変わらない。親のスナップショットから作った子の K2 キーが、子の writer のキーと同一。残す行の集合が writer のキーと同一で、
   `delete_missing` で回転付きの行が消えない。正規化は `:r{16 hex}` 付きの印も、ビルダーの位置にあるときだけ扱う。
-- 追い出しと採用: 自動 ON で表紙ページの回転を変えると、自動の対象の本のタイルが全 context で追い出され、自動の対象でないタイルは残る。
-  自動 OFF では追い出さない。回転の変更前に出した要求の結果が変更後に届くと捨てられ、要求し直した結果が採用される。
+- 追い出しと採用: 自動 ON で表紙ページの回転を変えると、その本のタイルが全 context で追い出される。同じフォルダの普通の画像や別の本の
+  ページの回転では追い出さない。自動 OFF では追い出さない。回転の変更前に出した要求 (`CacheOnly` を含む) の結果が変更後に届くと捨てられ、
+  回転が変わっていない `CacheOnly` のヒットは採用される。
+- 復元: 一覧を退避 → 別の context で表紙を回転 → 復元すると、その本のタイルだけ追い出される。回転の変更が無い復元では追い出さない。
 - scope: ピンなし ZipDir の範囲画面の要求に scope が入る。自動の対象の要求すべてで、leaf のページキーが scope に入る。
 - 手動の範囲＋回転を描画まで通すテスト (別途追加) と合わせて、手動は回転を変えてもキー・範囲が変わらないこと。
