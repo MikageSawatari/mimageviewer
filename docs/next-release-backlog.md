@@ -111,6 +111,7 @@
 
 ### 1.765 本体 lib の全件実行時だけ落ちるテストが 2 件ある (負荷で時間切れ) — 設計担当の観測 (2026-11-11)
 
+- 追記 (2026-11-13、統括): 負荷のかかった全件で落ち、単独で流し直すと通ったもの: `app::collection_navigation::tests::now_playing_collection_eof_terminal_errors_and_cancellations_respect_request_owner` (11-12〜13 に 2 回、master 33fa08c5f と §1.769 のブランチ)、`app::folder_scan::section1375_scan_perf_tests::section1375_large_physical_scan_10k_100k` (600 秒で時間切れ、単独では 110 秒、master e56838b81)。`ui_fullscreen::tests::real_book_strip_press_previews_one_page_over_wide_an…` (fix-690-search-title)。
 - 状態: **未着手**。収録版は未定。製品の不具合ではなく、テストの安定性の問題。
 - 観測 (`test-lib-full.ps1` の結果、どちらも 2026-11-11 の master):
   - 1 回目 (run `20261111T093054768Z-2c076dc3`、§1.732・§1.759 取り込み後): `ui_fullscreen::overflow_input_tests::overflow_closed_state_does_not_reclaim_buttons_or_touch_from_a_stale_area` が `src/ui_fullscreen/overflow_input_tests.rs:2513` で失敗 (閉じたメニューの後の新しいドラッグで `fs_pan` が動かない、`touch=false`)。単独では 9 回とも成功。2 回目の全件では成功。
