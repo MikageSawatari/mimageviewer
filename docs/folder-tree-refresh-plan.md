@@ -444,3 +444,15 @@ P2-2の不変条件は「未確定時の代替位置と利用者が選んだ位�
 | 引数なし`cargo fmt`、`cargo fmt --check`、`git diff --check` | **各exit0** | `tree-pending-fmt-check.log`、終了時diff検査 |
 
 新規warningなし（既存lib test warning153件）。指定により全lib・全snapshot・build-dev・製品起動・コミットは行わない。
+
+## 13. マウスでクリックした行を中央へ寄せない (2026-11-12 設計、ClaudeCode)
+
+利用者決定 (2026-11-12 夜、§1.769 の実機確認 依頼 40 から派生)。ツリーで行の名前、または ▶ / ▼ をマウスでクリックしたときは、その行を中央へ寄せない。押した行は既に見えているので、Windows のエクスプローラのナビゲーション ウィンドウと同じく、スクロール位置をそのままにする。
+
+- 今の作り (v5.1.0 から): 行のクリックは `set_cursor` を呼び、`set_cursor` は `cursor_scroll = Requested` を立てる。▶ / ▼ の `handle_tree_key(Left/Right)` (`collapse_cursor` / `expand_cursor`) も `Requested` を立てる。次のフレームの `render_folder_pane_tree` が cursor 行で `scroll_to_me(Align::Center)` を呼び、行を中央へ寄せる (`animated(false)` なので一瞬)。
+- 変えること: マウスの行クリック (名前・▶ / ▼) を処理したフレームでは、そのクリックで立った reveal 要求を取り下げる。新しい状態・フィールドは足さない。cursor・focus・開閉・移動の要求は今までどおり。
+- 変えないこと: キー操作 (↑ ↓ ← → Enter、ゲームパッド)、ツリーを開いたときの現在地表示 (§11)、右側の一覧や Ctrl+↑↓・履歴など「クリック以外で現在地が変わる」ときの中央寄せ、ドライブ選択・↻ の再読み込み。これらは今の中央寄せのまま (「見える範囲に入れるだけ」にするのは次の版以降に検討)。
+- クリック後の移動の完了: クリックで cursor は `Explicit` になり、`sync_to_active` は reveal を要求しない。移動の完了で前の現在地の祖先の自動展開が閉じて行が増減しても、既存の path anchor 復元 (`FolderPaneScrollMemory`) のままとし、追加の reveal はしない。
+- まれな失敗は既定の割り切り方針による (書き込み・永続化なし)。
+
+テスト (handler-level、実 pointer event): ツリーがスクロールする高さで、中央にない行の名前をクリックしても、次のフレーム以降でスクロール位置が変わらない (移動の完了後も、行の増減が無い場合は同じ)。▶ / ▼ のクリックでも同じ。キー操作 (↓ など) では今までどおり cursor 行が中央へ寄る。既存の cursor reveal のテスト (§10・§11) が通ること。
