@@ -3834,7 +3834,8 @@ impl App {
             }
             _ => unreachable!("native outer adoption has a prepared Collection destination"),
         };
-        self.adopt_main_list_navigation(prepared.adoption, |app| {
+        let boundary_plan = self.physical_main_list_boundary_plan(&prepared.token);
+        self.adopt_main_list_navigation(prepared.adoption, boundary_plan, |app, boundary| {
             if !matches!(request.action, CollectionNavigationAction::OuterGrid { .. }) {
                 app.close_fullscreen_for_folder_nav_reopen();
             }
@@ -3854,7 +3855,7 @@ impl App {
                 prepared.listing,
                 super::VisibleInstallAuthority::Ordinary,
                 restore_intent,
-                prepared.token,
+                prepared.token.with_install_boundary(boundary),
             )
         });
     }

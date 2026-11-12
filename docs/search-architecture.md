@@ -100,6 +100,13 @@ pin変更stampが古ければ同じprepareで再準備する。Ctrl+Gの既存�
 EverythingのP2修正とは別件として残す（[対応範囲](everything-search-plan.md#16-p2-動画pinのworker準備2026-10-12)）。
 
 採用済みEverythingの位置は `EverythingPosition::Root` / `PhysicalChild`。
+§1.682 の一覧順移動では、Root の結果一覧から開いた時点の列を accepted run 付き scope で凍結する。
+現在位置は `PhysicalChild.logical_source` の完全一致と現在の論理の場所の所属確認で求め、祖先の結果行から推定しない。
+一覧順要求にだけ `EverythingChildAdmission::ListOrderRow { dataset_run, row }` を載せ、current origin・accepted run・
+採用 path と row の physical key・dataset membership が一致する成功採用で logical_source/return_anchor を替え、route は保持する。
+通常の `Descend` は従来どおり。Folder 行の採用後に中の書庫を開く場合も、その書庫 open は Descend とする。
+列は 1 つで通常フォルダとは scope で分離し、再検索は新しい結果の採用で旧列が使えなくなる。
+再送信・取消・失敗・source 切替だけでは accepted の旧列を維持する。比較は `physical_path_spelling` の key (I/O なし)。
 実フォルダ・画像フォルダ本・ZIP/PDF/EPUB/変換書庫の main 物理表示が受理された境界だけでlogical source/return anchor/routeを保持し、
 取消や失敗で未採用のchildへ進めない。結果へ戻ると保持datasetを共通prepareで再投影し、IPCを再送しない。
 Parent（BS／grid 親／gamepad Back）は ZIP 内部を一段、それ以外は effective_folder が logical_source の厳密な物理子孫なら通常の物理親へ移動し、起点なら Root へ戻す。Results ボタンは階層を飛ばして Root へ戻す。
@@ -1225,6 +1232,54 @@ Tantivy commit自体を強制中断はしない。そこで上位のIndexerManag
 - `std::fs::read_dir` → walker スレッドのみ。UI からは呼ばない
 
 ### 7.4 検索ビュー切替時の戻り先所有権
+
+§1.688: 場所ジャンプ（キー・リング・ジェスチャ・マウスボタン・ゲームパッド、場所リスト、場所▼の整理先を含む）は、
+検索の有無によらず `AddressBarNav::LocationJump(LocationJumpTarget)` で運び、dispatch 時に ★固定・取得中 modal・
+検索 3 owner の active を判定する。検索中なら `Direct(ExitTemporaryView)` の既存採用境界で成功時だけ
+3 owner を `_without_restore` で閉じる。実フォルダ・本棚・ドライブ・ドライブ一覧・閲覧履歴・評価一覧で同じ契約を使う。
+失敗・取消・stale は結果・選択・入力を保持する。終了時の pending 破棄で遅着完了の上書きを防ぎ、履歴には検索前の場所を残す。
+追補 §9: ツールバーのお気に入り（ボタン列・ドロップダウン）とピン留め本も、検索 3 owner のどれかが active なら
+同じ ExitTemporaryView の physical jump へ渡す。無効な行き先・scan 失敗・取消では検索結果と選択を保持する。
+検索外は従来の Direct を使い、Ctrl+F の先閉じと既存の入力優先順位は維持する。
+追補 §10: アドレス欄の Enter（空欄 → DriveList、「本棚」「本棚 > 名前」、解決したパス）は、
+dispatch 時に検索 3 owner のどれかが active なら成功時終了の場所ジャンプへ渡す。
+利用者によるフォルダペインのクリック・Enter・ゲームパッド操作は、受付時に検索が active なら
+`ExitTemporaryView` の scan を使い、受付後の検索開始では既存の surface-switch 退役処理で取り消す。
+検索外の Direct / DriveList / PaneNavigation と、内部の `start_folder_pane_open` の呼び出しは従来どおり。
+成功後は検索 owner を閉じるので Esc で結果へは戻れず、履歴 Back は検索前の場所へ戻る。
+失敗・取消・stale は結果と選択を保持する。
+追補 §11 は §9・§10 で残した例外を改訂し、メニューバー・キー・リング・ジェスチャ・マウスボタン・
+ゲームパッドのお気に入り（番号・前後移動・一覧）もツールバーと同じ受付・成功時終了へそろえる。
+メニューバーの本棚は `LocationJumpTarget::BooksRoot` を使う。いずれも失敗・取消・stale では結果と選択を保ち、
+検索外の挙動と入力優先順位は変えない。成功後の Esc は結果を復元せず、履歴 Back は検索前の場所へ戻る。
+フォルダペインにフォーカスがある Enter は検索の有無によらずペインが消費し、一覧の結果を開かない。
+アドレス欄で移れる親もないパス（存在しないドライブ等）を確定した場合は移動せず通知する。
+存在しない子パスから既存の親へ移る従来の解決は維持し、その移動が成功したときだけ検索を終了する。
+追補 §12: 検索中に保存済みの本・コレクションを明示して開く操作も成功時終了へそろえる。
+本棚ルート、追加先の本/コレクション、管理順の番号・前後、ツールバーの固定項目、管理画面の「開く」を含み、
+キー・メニュー・リング・ジェスチャ・マウスボタン・ゲームパッドの同等入口で同じ契約を使う。
+成功後は検索を残した擬似子にせず通常の本/コレクション表示とし、履歴 Back は検索前の場所へ戻る。
+失敗・取消・stale は結果と選択を保持し、検索外の挙動は維持する。検索結果の行を開くことや検索内の帰路は対象外。
+`GlobalOpenFolder` / `FileOpenFolder` のダイアログからの移動も検索中だけ同じ明示 jump へ渡し、検索なしは旧 Direct を維持する。
+saved-group の source は Plain の既存 lease と Search の受付時 `MainListNavigation` を一つの enum で所有する。
+Search は `ExitTemporaryView`・source proof・switch sequence を本/collection の prepare と成功採用まで輸送し、
+poll/ready/adopt の照合で同じ表示の epoch-only stale も拒否する。Plain の cached collection open と loader は維持する。
+検索内の子の要求を検証する route と、検索終了後の Back に記録する route は目的が異なる。
+前者は捕捉した child route を維持し、後者は `Direct(ExitTemporaryView)` の成功採用時だけ元 location と一致する
+return origin の非 empty な保存 route を使う。保存が無い/empty のときだけ元 location の root route を導く。
+navigation の捕捉値を書き換えず、Plain/他 purpose の履歴規則を変えない。
+Collection の新しい検索終了分岐は Snapshot owner 中には入らず、既存の Snapshot 退役順と fallback を優先する。
+通常は Snapshot 開始時に live search が閉じるが、旧来の混在 state の残存フラグだけで Search 分岐を選ばない。
+§12.3 改訂1 では、検索中の `ExitTemporaryView` の成功採用を「読み取りだけの current 照合・source 履歴捕捉 →
+既存の出発 context 移譲 → main に残った context の検索退役・facet/rows/履歴採用」の順へそろえる。
+移譲済みの事実は採用内の局所の型で installer へ渡し、二重移譲と採用中要求の取消を避ける。
+Collection の採用直前 locked 検査で拒否された場合は移譲・検索退役・採用へ進まず、検索/rows/履歴を保持する。
+bundle 所有の Metadata / Everything 等は移譲先に保持する。Ctrl+S / Ctrl+T の `favsearch` / `tag_view` owner と pending が
+App 共有で bundle に無い点は既存の欠けとして今回未対応で、既存 Plain open との同等性を確認対象とする。
+App field・bundle field・registry 本体・detached 述語・viewport は変更せず、検索なし/他 purpose と
+Smart root の `Direct(Navigation)` の既存順序も維持する。実装・検証の証跡は設計書 §8.14、合意した範囲は §12.3 を参照。
+§1.682 の Everything 一覧順移動は検索を閉じず、結果への帰路だけを成功採用した移動先行へ揃える。
+両項目の詳細は [検索結果ナビゲーション設計](search-result-navigation-682-688-plan.md) を参照。
 
 Ctrl+F / S / G / T、検索由来Snapshot、スマートフォルダは同じ最上位一覧を所有する。
 これらを直接切り替える入口では、既存ビューを通常closeして元一覧を再構築してはならない。

@@ -1207,13 +1207,30 @@ fn history_pending_grid_case(
                 assert_eq!(app.settings.search_input_history.entries(kind)[0], expected);
             }
         } else {
-            let expected = if keys.contains(&egui::Key::ArrowDown) {
-                &target
+            let history_selected = keys.contains(&egui::Key::ArrowDown);
+            let expected = if history_selected { &target } else { &current };
+            let expected_transport = if history_selected {
+                // Selecting a saved history row keeps its released Direct
+                // transport and explicit-list intent.
+                matches!(
+                    &nav,
+                    Some(crate::ui_main::AddressBarNav::Direct(
+                        path,
+                        crate::app::StartupListIntent::ExplicitList,
+                    )) if crate::folder_tree::path_eq(path, expected)
+                )
             } else {
-                &current
+                // Enter without a selected history row submits the address
+                // through the typed input dispatcher (which decides search at dispatch).
+                matches!(
+                    &nav,
+                    Some(crate::ui_main::AddressBarNav::AddressInput(
+                        crate::ui_main::LocationJumpTarget::Physical(path),
+                    )) if crate::folder_tree::path_eq(path, expected)
+                )
             };
             assert!(
-                matches!(nav,Some(crate::ui_main::AddressBarNav::Direct(ref path,_)) if crate::folder_tree::path_eq(path, expected)),
+                expected_transport,
                 "{keys:?}: normal address/history navigation: {nav:?} expected {expected:?}"
             );
         }

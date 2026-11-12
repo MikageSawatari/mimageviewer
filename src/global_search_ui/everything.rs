@@ -49,12 +49,19 @@ pub(crate) enum SearchSource {
     Everything,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug)]
+pub(crate) enum EverythingChildAdmission {
+    Descend,
+    ListOrderRow { dataset_run: u64, row: PathBuf },
+}
+
+#[derive(Clone)]
 pub(crate) enum SearchOpenOrigin {
     Metadata,
     Everything {
         run: u64,
         context: crate::app::ViewerContextId,
+        child: EverythingChildAdmission,
     },
 }
 
@@ -104,7 +111,7 @@ impl Drop for SearchProducer {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SubmittedEverything {
     query: String,
-    run: u64,
+    pub(crate) run: u64,
 }
 
 #[derive(Clone)]
@@ -218,19 +225,20 @@ impl App {
                 SearchAccepted::Everything { .. } => SearchOpenOrigin::Everything {
                     run: self.global_search.run_sequence,
                     context: self.virtual_list_context_id(),
+                    child: EverythingChildAdmission::Descend,
                 },
             })
     }
 
-    pub(crate) fn search_open_origin_is_current(&self, origin: SearchOpenOrigin) -> bool {
+    pub(crate) fn search_open_origin_is_current(&self, origin: &SearchOpenOrigin) -> bool {
         self.global_search.active
             && match origin {
                 SearchOpenOrigin::Metadata => {
                     matches!(self.global_search.accepted, SearchAccepted::Metadata { .. })
                 }
-                SearchOpenOrigin::Everything { run, context } => {
-                    run == self.global_search.run_sequence
-                        && context == self.virtual_list_context_id()
+                SearchOpenOrigin::Everything { run, context, .. } => {
+                    *run == self.global_search.run_sequence
+                        && *context == self.virtual_list_context_id()
                         && matches!(
                             self.global_search.accepted,
                             SearchAccepted::Everything { .. }
@@ -516,29 +524,57 @@ impl App {
         )
     }
 
-    pub(super) fn accept_everything_physical_child(&mut self, path: &Path) -> bool {
+    pub(super) fn accept_everything_physical_child(
+        &mut self,
+        path: &Path,
+        child: &EverythingChildAdmission,
+    ) -> bool {
         let SearchAccepted::Everything {
-            dataset, position, ..
+            submitted,
+            dataset,
+            position,
         } = &mut self.global_search.accepted
         else {
             return false;
         };
-        if matches!(position, EverythingPosition::Root) {
+        let source = match child {
+            EverythingChildAdmission::Descend if matches!(position, EverythingPosition::Root) => {
+                path
+            }
+            EverythingChildAdmission::Descend => {
+                self.update_global_search_address();
+                return true;
+            }
+            EverythingChildAdmission::ListOrderRow { dataset_run, row } => {
+                if submitted.run != *dataset_run
+                    || crate::path_key::physical_path_spelling(path).is_none_or(|key| {
+                        crate::path_key::physical_path_spelling(row).as_ref() != Some(&key)
+                    })
+                {
+                    return true;
+                }
+                row.as_path()
+            }
+        };
+        {
             // The accepted dataset owns physical identity for both files and folders.
             // file_operation_path intentionally excludes Folder (checkable file policy).
-            if !crate::path_key::physical_path_spelling(path)
+            if !crate::path_key::physical_path_spelling(source)
                 .is_some_and(|key| dataset.rows.iter().any(|row| row.physical_key == key))
             {
                 return true;
             }
-            let route = self
-                .top_level_grid_view
-                .return_origin()
-                .map(|origin| origin.route.clone())
-                .unwrap_or_default();
+            let route = match position {
+                EverythingPosition::PhysicalChild { route, .. } => route.clone(),
+                EverythingPosition::Root => self
+                    .top_level_grid_view
+                    .return_origin()
+                    .map(|origin| origin.route.clone())
+                    .unwrap_or_default(),
+            };
             *position = EverythingPosition::PhysicalChild {
-                logical_source: path.into(),
-                return_anchor: path.into(),
+                logical_source: source.into(),
+                return_anchor: source.into(),
                 route,
             };
         }

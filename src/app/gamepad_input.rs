@@ -12,7 +12,7 @@ use eframe::egui;
 use super::ViewerPresentation;
 use super::{
     App, ContainerRatingTarget, FolderNavMode, GridContainerOpenMode, GridCursorDirection,
-    GridCursorMove, GridScrollIntent, ReadingHistoryEntrance, grid_cursor_nav_target_pos,
+    GridCursorMove, GridScrollIntent, grid_cursor_nav_target_pos,
 };
 use crate::adjustment::{POST_FILTER_GROUPS, PostFilter};
 use crate::folder_pane::{FolderPaneCommand, FolderPaneTreeKey};
@@ -34,6 +34,7 @@ use crate::ring_shortcut::{
     RingPickerState, RingShortcutContext, format_mouse_gesture_pattern, mouse_flick_guide_delay,
     mouse_flick_menu_delay, mouse_gesture_direction_from_delta,
 };
+use crate::ui_main::LocationJumpTarget;
 
 #[cfg(test)]
 mod overview_guide_snapshots;
@@ -5530,7 +5531,10 @@ impl App {
         self.sync_native_video_favorite_picker_overlay(ctx);
     }
 
-    fn confirm_gamepad_favorite_picker(&mut self, ctx: &egui::Context) -> Option<AddressBarNav> {
+    pub(super) fn confirm_gamepad_favorite_picker(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Option<AddressBarNav> {
         let picker = self.gamepad_favorite_picker.as_ref()?;
         let tab = picker.tab;
         let selected = picker.active_cursor().selected;
@@ -5565,10 +5569,7 @@ impl App {
                 Some(&format!("path={}", target.display())),
             );
             ctx.request_repaint();
-            return Some(AddressBarNav::Direct(
-                target,
-                crate::app::StartupListIntent::ExplicitList,
-            ));
+            return Some(AddressBarNav::Favorite(target));
         }
         if let Some(definition_id) = smart_folder_target {
             self.bump_input_seq(
@@ -5646,7 +5647,10 @@ impl App {
         ctx.request_repaint();
     }
 
-    fn confirm_gamepad_location_picker(&mut self, ctx: &egui::Context) -> Option<AddressBarNav> {
+    pub(super) fn confirm_gamepad_location_picker(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Option<AddressBarNav> {
         let selected = self
             .gamepad_location_picker
             .as_ref()
@@ -5665,30 +5669,23 @@ impl App {
             return None;
         };
         let nav = match nav {
-            GamepadLocationNav::DriveList => AddressBarNav::DriveList(None),
-            GamepadLocationNav::ReadingHistory => {
-                AddressBarNav::ReadingHistory(ReadingHistoryEntrance::Menu)
-            }
+            GamepadLocationNav::DriveList => LocationJumpTarget::DriveList,
+            GamepadLocationNav::ReadingHistory => LocationJumpTarget::ReadingHistory,
             GamepadLocationNav::Bookmarks => {
                 self.open_bookmark_browser();
                 return None;
             }
-            GamepadLocationNav::RatingView(stars) => {
-                self.bump_input_seq("gamepad_rating_view", Some(&stars.to_string()));
-                self.enter_rating_view(stars);
-                return None;
-            }
-            GamepadLocationNav::BooksRoot => AddressBarNav::BooksRoot,
+            GamepadLocationNav::RatingView(stars) => LocationJumpTarget::Rating(stars),
+            GamepadLocationNav::BooksRoot => LocationJumpTarget::BooksRoot,
             GamepadLocationNav::Direct(path) => {
                 let Some(resolved) = crate::folder_tree::resolve_openable_path(&path) else {
                     self.show_feedback_warning(format!("場所が見つかりません: {}", path.display()));
                     return None;
                 };
-                AddressBarNav::Direct(resolved, crate::app::StartupListIntent::ExplicitList)
+                LocationJumpTarget::Physical(resolved)
             }
         };
-        self.bump_input_seq("gamepad_location_nav", Some(&format!("{nav:?}")));
-        Some(nav)
+        self.location_jump_nav(ctx, nav, "gamepad_location_nav")
     }
 
     fn ring_picker_is_stale(&self) -> bool {
@@ -7706,20 +7703,6 @@ impl App {
         Some(nav)
     }
 
-    fn location_navigation_blocked(&mut self) -> bool {
-        if self.is_snapshot_active() {
-            self.show_feedback_warning(
-                "スナップショット中は他のフォルダに移動できません".to_string(),
-            );
-            return true;
-        }
-        if self.global_search.active || self.favsearch.active || self.tag_view.active {
-            self.show_feedback_warning("検索中は場所ジャンプを使用できません".to_string());
-            return true;
-        }
-        false
-    }
-
     fn apply_ring_favorite_slot(
         &mut self,
         ctx: &egui::Context,
@@ -7746,18 +7729,16 @@ impl App {
         }
         self.bump_input_seq(source, Some(&format!("favorite_slot={slot}")));
         ctx.request_repaint();
-        Some(AddressBarNav::Direct(
-            target,
-            crate::app::StartupListIntent::ExplicitList,
-        ))
+        Some(AddressBarNav::Favorite(target))
     }
 
     fn apply_ring_drive_letter(
         &mut self,
+        ctx: &egui::Context,
         letter: char,
         source: &'static str,
     ) -> Option<AddressBarNav> {
-        if self.location_navigation_blocked() {
+        if self.location_jump_snapshot_blocked() {
             return None;
         }
         let path = super::drive_root_path_for_letter(letter)?;
@@ -7765,18 +7746,15 @@ impl App {
             self.show_feedback_warning(format!("ドライブが見つかりません: {}", path.display()));
             return None;
         };
-        if self.projected_viewer_session_open() {
-            self.close_fullscreen();
-        }
-        self.bump_input_seq(source, Some(&format!("drive={}", path.display())));
-        Some(AddressBarNav::Direct(
-            resolved,
-            crate::app::StartupListIntent::ExplicitList,
-        ))
+        self.location_jump_nav(ctx, LocationJumpTarget::Physical(resolved), source)
     }
 
-    fn apply_current_drive_root(&mut self, source: &'static str) -> Option<AddressBarNav> {
-        if self.location_navigation_blocked() {
+    fn apply_current_drive_root(
+        &mut self,
+        ctx: &egui::Context,
+        source: &'static str,
+    ) -> Option<AddressBarNav> {
+        if self.location_jump_snapshot_blocked() {
             return None;
         }
         let Some(path) = self.current_location_root() else {
@@ -7790,25 +7768,16 @@ impl App {
             ));
             return None;
         };
-        if self.projected_viewer_session_open() {
-            self.close_fullscreen();
-        }
-        self.bump_input_seq(
-            source,
-            Some(&format!("current_drive_root={}", path.display())),
-        );
-        Some(AddressBarNav::Direct(
-            resolved,
-            crate::app::StartupListIntent::ExplicitList,
-        ))
+        self.location_jump_nav(ctx, LocationJumpTarget::Physical(resolved), source)
     }
 
     fn apply_switch_drive_letter(
         &mut self,
+        ctx: &egui::Context,
         letter: char,
         source: &'static str,
     ) -> Option<AddressBarNav> {
-        if self.location_navigation_blocked() {
+        if self.location_jump_snapshot_blocked() {
             return None;
         }
         let root = super::drive_root_path_for_letter(letter)?;
@@ -7835,21 +7804,7 @@ impl App {
             };
             resolved_root
         };
-        if self.projected_viewer_session_open() {
-            self.close_fullscreen();
-        }
-        self.bump_input_seq(
-            source,
-            Some(&format!(
-                "switch_drive={} target={}",
-                drive_key,
-                target.display()
-            )),
-        );
-        Some(AddressBarNav::Direct(
-            target,
-            crate::app::StartupListIntent::ExplicitList,
-        ))
+        self.location_jump_nav(ctx, LocationJumpTarget::Physical(target), source)
     }
 
     fn apply_ring_location_action(
@@ -7858,37 +7813,28 @@ impl App {
         action: &RingActionId,
         source: &'static str,
     ) -> Option<AddressBarNav> {
-        if self.location_navigation_blocked() {
+        if self.location_jump_snapshot_blocked() {
             return None;
         }
-        if let Some(stars) = action.location_rating_stars() {
-            self.bump_input_seq(source, Some(&format!("rating_view={stars}")));
-            self.enter_rating_view(stars);
-            return None;
-        }
-        let nav = match action {
-            RingActionId::OpenLocationDriveList => AddressBarNav::DriveList(None),
-            RingActionId::OpenLocationReadingHistory => {
-                AddressBarNav::ReadingHistory(ReadingHistoryEntrance::Menu)
+        let target = if let Some(stars) = action.location_rating_stars() {
+            LocationJumpTarget::Rating(stars)
+        } else {
+            match action {
+                RingActionId::OpenLocationDriveList => LocationJumpTarget::DriveList,
+                RingActionId::OpenLocationReadingHistory => LocationJumpTarget::ReadingHistory,
+                RingActionId::OpenLocationBooksRoot => LocationJumpTarget::BooksRoot,
+                RingActionId::OpenLocationDesktop => {
+                    self.quick_location_target(crate::known_folders::desktop_dir(), "デスクトップ")?
+                }
+                RingActionId::OpenLocationPictures => {
+                    self.quick_location_target(crate::known_folders::pictures_dir(), "ピクチャ")?
+                }
+                RingActionId::OpenLocationDownloads => self
+                    .quick_location_target(crate::known_folders::downloads_dir(), "ダウンロード")?,
+                _ => return None,
             }
-            RingActionId::OpenLocationBooksRoot => AddressBarNav::BooksRoot,
-            RingActionId::OpenLocationDesktop => {
-                self.quick_location_nav(crate::known_folders::desktop_dir(), "デスクトップ")?
-            }
-            RingActionId::OpenLocationPictures => {
-                self.quick_location_nav(crate::known_folders::pictures_dir(), "ピクチャ")?
-            }
-            RingActionId::OpenLocationDownloads => {
-                self.quick_location_nav(crate::known_folders::downloads_dir(), "ダウンロード")?
-            }
-            _ => return None,
         };
-        if self.projected_viewer_session_open() {
-            self.close_fullscreen();
-        }
-        self.bump_input_seq(source, Some(&format!("{nav:?}")));
-        ctx.request_repaint();
-        Some(nav)
+        self.location_jump_nav(ctx, target, source)
     }
 
     pub(crate) fn apply_location_navigation_key_action(
@@ -7901,13 +7847,13 @@ impl App {
             return self.apply_ring_favorite_slot(ctx, slot, source);
         }
         if let Some(letter) = action.drive_letter() {
-            return self.apply_ring_drive_letter(letter, source);
+            return self.apply_ring_drive_letter(ctx, letter, source);
         }
         if action == KeyAction::GridOpenCurrentDriveRoot {
-            return self.apply_current_drive_root(source);
+            return self.apply_current_drive_root(ctx, source);
         }
         if let Some(letter) = action.switch_drive_letter() {
-            return self.apply_switch_drive_letter(letter, source);
+            return self.apply_switch_drive_letter(ctx, letter, source);
         }
         if let Some(ring_action) = ring_location_action_for_key_action(action) {
             return self.apply_ring_location_action(ctx, &ring_action, source);
@@ -7991,11 +7937,11 @@ impl App {
         self.apply_ring_favorite_slot(ctx, next + 1, source)
     }
 
-    fn quick_location_nav(
+    fn quick_location_target(
         &mut self,
         path: Option<std::path::PathBuf>,
         label: &'static str,
-    ) -> Option<AddressBarNav> {
+    ) -> Option<LocationJumpTarget> {
         let Some(path) = path else {
             self.show_feedback_warning(format!("{label} が見つかりません"));
             return None;
@@ -8004,10 +7950,7 @@ impl App {
             self.show_feedback_warning(format!("場所が見つかりません: {}", path.display()));
             return None;
         };
-        Some(AddressBarNav::Direct(
-            resolved,
-            crate::app::StartupListIntent::ExplicitList,
-        ))
+        Some(LocationJumpTarget::Physical(resolved))
     }
 
     fn apply_tree_folder_nav(&mut self, ctx: &egui::Context, forward: bool, source: &'static str) {
@@ -8207,7 +8150,7 @@ impl App {
             return self.apply_ring_favorite_slot(ctx, slot, source);
         }
         if let Some(letter) = action.drive_letter() {
-            return self.apply_ring_drive_letter(letter, source);
+            return self.apply_ring_drive_letter(ctx, letter, source);
         }
         if action.location_rating_stars().is_some()
             || matches!(
@@ -9483,10 +9426,6 @@ impl App {
             );
             return;
         }
-        if self.global_search.active || self.favsearch.active || self.tag_view.active {
-            self.show_feedback_warning("検索中は場所リストを開けません".to_string());
-            return;
-        }
         let rating_counts = self.rating_counts();
         let entries = self.build_gamepad_location_entries(rating_counts);
         if entries.is_empty() {
@@ -9671,7 +9610,7 @@ impl App {
             {
                 self.request_folder_tree_pane_close();
                 // worker scan 経由で開く (UI スレッドの read_dir ブロック回避)。
-                self.start_folder_pane_open(path);
+                self.start_user_folder_pane_open(path);
                 return None;
             }
             return None;
@@ -11191,6 +11130,134 @@ mod tests {
     };
 
     #[test]
+    fn location_jump_key_ring_and_gamepad_picker_transport_targets_during_search() {
+        use crate::keymap::KeyAction;
+        use crate::ring_shortcut::{
+            GamepadLocationEntry, GamepadLocationNav, GamepadLocationPickerState, MouseButtonSlot,
+            RingActionId, RingDirection, RingShortcutContext,
+        };
+        use crate::ui_main::{AddressBarNav, LocationJumpTarget};
+        let ctx = egui::Context::default();
+        for kind in 0..4 {
+            let mut app = crate::app::tests::phase_c_support::setup_app();
+            match kind {
+                0 => {
+                    app.global_search.active = true;
+                }
+                1 => {
+                    app.current_folder = Some(app.tmp.path().join("pre-search"));
+                    let row = app.tmp.path().join("result.zip");
+                    crate::global_search_ui::adopt_everything_for_test(
+                        &mut app,
+                        &ctx,
+                        "location-transport",
+                        crate::global_search_ui::everything_dataset_for_test(vec![
+                            crate::grid_item::GridItem::ZipFile(row),
+                        ]),
+                    );
+                    assert!(matches!(
+                        app.global_search.accepted,
+                        crate::global_search_ui::SearchAccepted::Everything { .. }
+                    ));
+                }
+                2 => app.favsearch.active = true,
+                _ => app.tag_view.active = true,
+            }
+            let nav = app.apply_location_navigation_key_action(
+                &ctx,
+                KeyAction::GridOpenLocationDriveList,
+                "test",
+            );
+            assert!(matches!(
+                nav,
+                Some(AddressBarNav::LocationJump(LocationJumpTarget::DriveList))
+            ));
+            let nav = app.apply_ring_action(
+                &ctx,
+                RingShortcutContext::Grid,
+                RingActionId::OpenLocationRating3,
+                "test",
+            );
+            assert!(matches!(
+                nav,
+                Some(AddressBarNav::LocationJump(LocationJumpTarget::Rating(3)))
+            ));
+            assert!(
+                app.rating_view_pending.is_none(),
+                "input must not start rating before dispatch"
+            );
+            app.settings.ring_shortcuts.mouse_buttons_grid.back =
+                RingActionId::OpenLocationDriveList;
+            let mouse = app.dispatch_mouse_button(
+                &ctx,
+                MouseButtonSlot::Back,
+                crate::app::ActionSurface::MainWindow,
+                "test-mouse",
+            );
+            assert!(matches!(
+                mouse.navigation,
+                Some(AddressBarNav::LocationJump(LocationJumpTarget::DriveList))
+            ));
+            app.settings
+                .ring_shortcuts
+                .profile_mut(RingShortcutContext::Grid)
+                .slots[RingDirection::Up.slot_index()] = RingActionId::OpenLocationBooksRoot;
+            let ring = app.trigger_gamepad_ring_action(&ctx, RingDirection::Up);
+            assert!(matches!(
+                ring,
+                Some(AddressBarNav::LocationJump(LocationJumpTarget::BooksRoot))
+            ));
+            app.open_gamepad_location_picker(&ctx);
+            assert!(app.gamepad_location_picker.is_some());
+            app.gamepad_location_picker = Some(GamepadLocationPickerState {
+                selected: 0,
+                scroll_top: 0,
+                entries: vec![GamepadLocationEntry {
+                    label: "test".into(),
+                    value: String::new(),
+                    nav: GamepadLocationNav::ReadingHistory,
+                }],
+            });
+            let nav = app.confirm_gamepad_location_picker(&ctx);
+            assert!(matches!(
+                nav,
+                Some(AddressBarNav::LocationJump(
+                    LocationJumpTarget::ReadingHistory
+                ))
+            ));
+            assert!(!app.items_are_reading_history_view);
+        }
+    }
+
+    #[test]
+    fn location_jump_plain_inputs_use_same_transport_and_favorites_defer_search_decision() {
+        use crate::ui_main::{AddressBarNav, LocationJumpTarget};
+        let ctx = egui::Context::default();
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let nav = app.apply_location_navigation_key_action(
+            &ctx,
+            crate::keymap::KeyAction::GridOpenLocationDriveList,
+            "test",
+        );
+        assert!(matches!(
+            nav,
+            Some(AddressBarNav::LocationJump(LocationJumpTarget::DriveList))
+        ));
+        let target = app.tmp.path().join("favorite");
+        std::fs::create_dir(&target).unwrap();
+        app.settings
+            .favorites
+            .push(crate::settings::FavoriteEntry::new(
+                "test".into(),
+                target.clone(),
+            ));
+        app.global_search.active = true;
+        let nav = app.apply_ring_favorite_slot(&ctx, 1, "test");
+        assert!(matches!(nav, Some(AddressBarNav::Favorite(path)) if path == target));
+        assert!(app.global_search.active);
+    }
+
+    #[test]
     fn saved_group_ring_book_request_is_allowed_during_grid_refresh() {
         use crate::ring_shortcut::{RingActionId, RingShortcutContext};
         use std::sync::Arc;
@@ -11958,11 +12025,11 @@ mod tests {
                             },
                         )
                         .unwrap();
-                    let crate::ui_main::AddressBarNav::Direct(path, intent) = nav else {
-                        panic!("favorite confirmation must produce a direct navigation");
+                    let crate::ui_main::AddressBarNav::Favorite(path) = nav else {
+                        panic!("favorite confirmation must produce a favorite navigation");
                     };
                     assert!(app.gamepad_favorite_picker.is_none());
-                    (path, intent)
+                    (path, crate::app::StartupListIntent::ExplicitList)
                 },
             );
         }

@@ -73819,6 +73819,7 @@ mod tests {
             .replace_surface(crate::app::top_level_grid_view::TopLevelGridSurface::Folder);
         app.list_order = Some(Arc::new(crate::app::ListOrderSnapshot {
             owner: app.virtual_list_context_id(),
+            scope: crate::app::ListOrderScope::Folder,
             entries: vec![crate::app::ListOrderEntry {
                 path: folder,
                 kind: crate::app::ListOrderEntryKind::Folder,

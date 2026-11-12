@@ -1037,10 +1037,11 @@ fn mixed_path_favorite_direct_navigation_standardizes_input_without_rewriting_sa
         for source in ["menu-toolbar", "gamepad-ring"] {
             assert_mixed_path_favorite_direct_navigation(folder_name, source, |app, ctx| {
                 if source == "menu-toolbar" {
-                    // render_menubar / render_toolbar return this saved copy. App::update
-                    // sends it directly to open_direct_navigation_target, bypassing _owned.
+                    // Plain favorites preserve this saved copy through the shared dispatcher
+                    // before the frame sends it to its existing Direct acceptance call.
                     (
-                        app.settings.favorites[0].path.clone(),
+                        app.dispatch_favorite_navigation(app.settings.favorites[0].path.clone())
+                            .expect("Plain favorites continue through Direct"),
                         StartupListIntent::ExplicitList,
                     )
                 } else {
@@ -1052,10 +1053,14 @@ fn mixed_path_favorite_direct_navigation_standardizes_input_without_rewriting_sa
                             "mixed_favorite_regression",
                         )
                         .unwrap();
-                    let crate::ui_main::AddressBarNav::Direct(path, intent) = nav else {
-                        panic!("favorite input must produce a direct navigation");
+                    let crate::ui_main::AddressBarNav::Favorite(path) = nav else {
+                        panic!("favorite input must produce a favorite navigation");
                     };
-                    (path, intent)
+                    (
+                        app.dispatch_favorite_navigation(path)
+                            .expect("Plain favorites continue through Direct"),
+                        StartupListIntent::ExplicitList,
+                    )
                 }
             });
         }
@@ -29754,13 +29759,14 @@ mod phase_c_folder_nav_history_tests {
         app.settings.sidecar_backup_enabled = false;
         let origin = app.tmp.path().join("pane-search-origin");
         let directory = app.tmp.path().join("pane-search-destination");
+        std::fs::create_dir_all(&origin).unwrap();
         std::fs::create_dir_all(&directory).unwrap();
         let book = directory.join("z-book.zip");
         write_1328_zip(&book);
         arm_context_jump_source(
             &mut app,
             TopLevelSearchView::Favorite,
-            origin,
+            origin.clone(),
             GridItem::ZipFile(book.clone()),
         );
         app.favsearch.query = "book".into();
@@ -29770,7 +29776,8 @@ mod phase_c_folder_nav_history_tests {
         app.sync_folder_pane_state(&ctx);
         app.folder_pane.set_cursor(directory.clone());
         app.folder_pane.set_focus_tree();
-        // Real pane keyboard gate consumes Enter and starts the real directory scan.
+        // The real root pass decides keyboard ownership before the fixed pane
+        // consumer claims Enter and starts the directory scan.
         ctx.run_pass(
             egui::RawInput {
                 events: vec![egui::Event::Key {
@@ -29783,43 +29790,78 @@ mod phase_c_folder_nav_history_tests {
                 ..Default::default()
             },
             |ctx| {
-                assert!(app.handle_folder_pane_keyboard(ctx).is_none());
+                assert!(app.input_root_keyboard(ctx).0.is_none());
             },
         )
         .drop_without_applying_deltas();
-        assert!(app.folder_pane_open_pending.is_some());
+        let pending = app.folder_pane_open_pending.as_ref().unwrap();
+        assert!(matches!(
+            pending.purpose,
+            super::FolderOpenScanPurpose::JumpToPhysicalFolder { .. }
+        ));
+        let navigation = pending.navigation.clone().unwrap();
+        let cancel = pending.cancel.clone();
+        assert!(app.main_list_navigation_is_current(&navigation));
         refresh_favorite_zip_search_for_test(&mut app, &directory, &book);
+        assert!(app.main_list_navigation_is_current(&navigation));
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            app.folder_pane_open_pending
+                .as_ref()
+                .unwrap()
+                .navigation
+                .as_ref(),
+            Some(&navigation),
+            "same-query publication must retain the original pane request"
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let ready = loop {
-            if let Some(ready) = app.poll_folder_pane_open(&ctx) {
-                break ready;
-            }
-            assert!(
-                app.folder_pane_open_pending.is_some(),
-                "same-query result publication cannot cancel pane navigation"
+        while app.current_folder.as_ref() != Some(&directory)
+            || app.folder_pane_open_pending.is_some()
+            || app.sidecar_restore_active()
+        {
+            // Use the real frame consumer: JumpToPhysicalFolder is adopted inside
+            // resolve_main_folder_open_ready and returns None rather than a Direct load.
+            app.post_render_main_navigation(
+                &ctx,
+                crate::app::update_phases::MainFrameNavigation {
+                    fav_nav: None,
+                    toolbar_fav_nav: None,
+                    fullscreen_close_nav: None,
+                    keyboard_nav: None,
+                    keyboard_nav_from_fullscreen_close: false,
+                    gamepad_nav: None,
+                    address_nav: None,
+                    open_folder_nav: None,
+                    context_nav: None,
+                    folder_pane_nav: None,
+                    grid_nav: None,
+                },
             );
+            app.poll_sidecar_restore(&ctx);
             assert!(
                 std::time::Instant::now() < deadline,
-                "pane scan must complete"
+                "pane scan must adopt through the main frame after the same-query refresh"
             );
             std::thread::yield_now();
-        };
-        let ready = app.resolve_main_folder_open_ready(&ctx, ready).unwrap();
-        app.load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation(
-            ready.path,
-            Some(ready.scan),
-            super::OpenRequestOwner::Navigation,
-            None,
-            None,
-            ready.restore_intent,
-            ready.navigation,
-        );
+        }
         assert_eq!(app.current_folder.as_ref(), Some(&directory));
-        assert_eq!(app.favsearch.nav_stack.last(), Some(&directory));
+        assert!(!app.favsearch.active);
+        assert_eq!(
+            app.folder_history_back_target(),
+            Some(&FolderNavHistoryTarget::Path(origin.clone()))
+        );
         assert!(
             app.items
                 .iter()
                 .any(|item| item.drag_source_path() == Some(book.as_path()))
+        );
+        app.dispatch_folder_history_input_for_test(FolderHistoryDirection::Back);
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&origin));
+        assert!(!app.favsearch.active);
+        assert_eq!(
+            app.folder_history_forward_target(),
+            Some(&FolderNavHistoryTarget::Path(directory))
         );
     }
 
@@ -30110,18 +30152,11 @@ mod phase_c_folder_nav_history_tests {
                 app.update_ime_state(ctx);
                 app.note_main_chrome_pointer_block_transition(ctx);
                 if let Some(nav) = app.render_toolbar(root_ui).1 {
-                    let crate::ui_main::AddressBarNav::Direct(path, restore_intent) = nav else {
-                        panic!("address Enter must produce Direct navigation");
+                    let crate::ui_main::AddressBarNav::AddressInput(target) = nav else {
+                        panic!("address Enter must produce address-input navigation");
                     };
-                    // The exact consumer used by App::update after merging AddressBarNav::Direct.
-                    app.open_direct_navigation_target(
-                        path,
-                        None,
-                        crate::app::OpenRequestOwner::Navigation,
-                        None,
-                        None,
-                        restore_intent,
-                    );
+                    // The exact consumer used by App::update for address Enter.
+                    app.dispatch_address_input(target);
                 }
             });
         harness.run();

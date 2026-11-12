@@ -244,7 +244,7 @@ impl PreparedSearchThumbnails {
         }
     }
 }
-pub(crate) use everything::SearchOpenOrigin;
+pub(crate) use everything::{EverythingChildAdmission, SearchOpenOrigin};
 pub(crate) use everything::{
     EverythingPosition, EverythingReturn, MetadataAppliedSpec, SearchAccepted, SearchProducer,
     SearchProjection, SearchSource,
@@ -4109,13 +4109,17 @@ impl App {
                 else {
                     return false;
                 };
-                self.adopt_main_list_navigation(adoption, |app| {
-                    install(app);
-                    if let Some(origin) = input_owner {
-                        app.retire_search_open_input_focus(origin);
-                    }
-                    None
-                })
+                self.adopt_main_list_navigation(
+                    adoption,
+                    crate::app::MainListContextBoundaryPlan::None,
+                    |app, _boundary| {
+                        install(app);
+                        if let Some(origin) = input_owner {
+                            app.retire_search_open_input_focus(origin);
+                        }
+                        None
+                    },
+                )
             }
             SearchViewAdoption::Reprojection => {
                 install(self);
@@ -4322,10 +4326,18 @@ impl App {
     ///
     /// `global_search.active` が false、または `view == Aggregated` のときは no-op。
     pub(crate) fn advance_drilled_current_path(&mut self, p: &Path) {
+        self.advance_drilled_current_path_with_admission(p, &EverythingChildAdmission::Descend);
+    }
+
+    pub(crate) fn advance_drilled_current_path_with_admission(
+        &mut self,
+        p: &Path,
+        child: &EverythingChildAdmission,
+    ) {
         if !self.global_search.active {
             return;
         }
-        if self.accept_everything_physical_child(p) {
+        if self.accept_everything_physical_child(p, child) {
             return;
         }
         self.cancel_pending_folder_nav();

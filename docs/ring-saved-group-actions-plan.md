@@ -59,6 +59,11 @@
 
 ## 4. 実行
 
+2026-11-12 の検索との境界は [検索結果ナビゲーション設計 §12](search-result-navigation-682-688-plan.md#12-追補-4-本を開く入口もそろえる-2026-11-12サブ-pc-確認-a7437b155-の差分)
+を正とする。番号・前/次・追加先を含む保存済み本/コレクションの明示 open は、4 種の検索中は成功採用時だけ検索を終了し、
+失敗・取消・stale は検索結果と選択を保持する。検索外の順序・番号解決・待機/取消・割当は変えない。
+検索結果の行から本を開く操作は検索を継続する。以下の全画面を閉じる順序は、検索を終了する採用境界とは別である。
+
 1 つの入口に寄せる。`RingActionId` から対応する `KeyAction` を引く関数 (例: `saved_group_key_action()`) を置き、
 `apply_ring_action` で `App::apply_saved_group_key_action` に渡す。本・コレクションの解決、待機ダイアログ、
 中止、一覧更新中の扱いはキーと完全に同じ経路になる。
@@ -96,9 +101,10 @@
 - パッドの同じバッチ: 本・コレクションの待機ダイアログが開いた後は、同じバッチの残りの意味操作 (B の親移動など) を
   実行しない (物理ボタンの release の状態更新は続ける)。バッチ冒頭で一度だけ受付を判定しているため、
   1 件ごとに受付を判定し直す形にする。待機ダイアログ専用の分岐ではなく、バッチ内でモーダルが開いたら止まる一般の規則にする。
-- 動画の native presenter 経路: native 動画の全画面中は `src/app.rs` の早期 return 経路が `gamepad_nav` のうち
-  `RatingSource`・`GridVirtual`・`Direct` しか処理しない。全画面を閉じた後のフレームでこの経路を通らないことを確かめ、
-  通る場合は `CollectionOpen` も通常の navigation dispatcher と同じ処理へ渡す (落とさない)。
+- 動画の native presenter 経路: 当初は native 動画の全画面中の早期 return が `gamepad_nav` のうち
+  `RatingSource`・`GridVirtual`・`Direct` しか処理していなかった。検索結果ナビゲーション追補 §11 で共通の exhaustive
+  dispatcher へ統合したので、現在は `CollectionOpen` を含む全 variant を受ける。全画面を閉じた後のフレームの
+  到達先も照合し、通常の navigation dispatcher と同じ処理へ渡す (落とさない)。
 
 前提 (レビューで確認済み): メインウィンドウの全画面中は投影 context がメインで、一覧の source が変わらなければ
 `smart_folder_source_lease()` は全画面表示に依存しない。通常の終了経路は新しく `folder_nav_pending` /
@@ -107,7 +113,8 @@
 ### 4.2 一覧から使ったとき
 
 `apply_saved_group_key_action` をそのまま呼ぶ。返り値 (コレクションの一覧が読み込み済みなら
-`AddressBarNav::CollectionOpen`) は、お気に入りの `AddressBarNav::Direct` と同じように `apply_ring_action` の返り値として返す。
+`AddressBarNav::CollectionOpen`) は、お気に入りと同じ navigation 候補として `apply_ring_action` の返り値へ返す。
+お気に入りの旧 `Direct` は検索結果ナビゲーション追補 §11 で `Favorite` に改めており、検索時の受付は共通 helper が所有する。
 呼び出し側 (リング・ジェスチャー・マウスボタン・パッド) がその nav を適用することを確認する。
 
 ## 5. 表示
@@ -154,6 +161,8 @@
   メインの一覧をそのまま残す。ほかの viewer が開いている場合も、その状態を変えない。
 - パッド: X の release で本の待機を始めた同じバッチの B press が親移動を実行しない (handler-level)。
 - native 動画の全画面から X リングでコレクションを開いたとき、`CollectionOpen` が落ちない。
+- 検索との境界（追補 §12）: 4 種の検索 × 本/コレクションの番号・前後で、成功後の通常表示と検索前への履歴 Back、
+  失敗・取消・stale 時の結果/選択保持、検索なしの既存動作を回帰する。入力登録の全列挙から対応漏れを検出する。
 
 ## 9. 文書
 

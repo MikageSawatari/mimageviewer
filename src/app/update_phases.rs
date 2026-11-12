@@ -9,7 +9,7 @@ use super::*;
 
 /// Navigation values captured during this root UI pass; never retained by App.
 pub(super) struct MainFrameNavigation {
-    pub(super) fav_nav: Option<PathBuf>,
+    pub(super) fav_nav: Option<crate::ui_main::LocationJumpTarget>,
     pub(super) toolbar_fav_nav: Option<PathBuf>,
     pub(super) fullscreen_close_nav: Option<crate::ui_main::AddressBarNav>,
     pub(super) keyboard_nav: Option<crate::ui_main::AddressBarNav>,
@@ -23,6 +23,25 @@ pub(super) struct MainFrameNavigation {
 }
 
 impl App {
+    /// Native video skips chrome/grid drawing, not main navigation dispatch.
+    /// Keep its existing gamepad precedence and immediate Direct loader, while
+    /// dispatching every payload rather than dropping unfamiliar variants.
+    pub(super) fn dispatch_native_backdrop_navigation(
+        &mut self,
+        ctx: &egui::Context,
+        keyboard_nav: Option<crate::ui_main::AddressBarNav>,
+        keyboard_nav_from_fullscreen_close: bool,
+        gamepad_nav: Option<crate::ui_main::AddressBarNav>,
+    ) {
+        if let Some(nav) = gamepad_nav {
+            self.dispatch_main_input_nav_immediate(nav, false);
+        } else if let Some(nav) = keyboard_nav {
+            self.dispatch_main_input_nav_immediate(nav, keyboard_nav_from_fullscreen_close);
+        } else if let Some(result) = self.poll_folder_nav() {
+            self.apply_folder_nav_result(ctx, result);
+        }
+    }
+
     // Worker adoption can enter a UI-bound presentation continuation; see the ledger.
     pub(super) fn render_update_begin(&mut self, _ctx: &egui::Context) {
         self.speculative_gpu_frame
@@ -1232,17 +1251,37 @@ impl App {
             }
         } else {
             // folder_nav が未完了 or 他の高優先 nav 源が勝ったケース
-            let higher_priority_direct_nav = fav_nav.or(toolbar_fav_nav);
             let mut navigation = None;
             let mut navigate_pre_scan: Option<ScannedDir> = None;
             let mut pane_epub_restore = None;
             let mut navigate_owner = OpenRequestOwner::Navigation;
             let mut navigate_restore_intent = StartupListIntent::ExplicitList;
             let mut navigate_stage = MainListRequestStage::Admission;
-            let navigate = if higher_priority_direct_nav.is_some() {
-                higher_priority_direct_nav
+            let navigate = if let Some(target) = fav_nav {
+                match target {
+                    crate::ui_main::LocationJumpTarget::Physical(path) => {
+                        self.dispatch_favorite_navigation(path)
+                    }
+                    target => {
+                        self.dispatch_address_input(target);
+                        None
+                    }
+                }
+            } else if let Some(path) = toolbar_fav_nav {
+                self.dispatch_favorite_navigation(path)
             } else if let Some(nav) = input_nav.or(address_nav) {
                 match nav {
+                    crate::ui_main::AddressBarNav::Favorite(path) => {
+                        self.dispatch_favorite_navigation(path)
+                    }
+                    crate::ui_main::AddressBarNav::AddressInput(target) => {
+                        self.dispatch_address_input(target);
+                        None
+                    }
+                    crate::ui_main::AddressBarNav::LocationJump(target) => {
+                        self.dispatch_location_jump(target);
+                        None
+                    }
                     crate::ui_main::AddressBarNav::ZipListReturn(plan) => {
                         self.apply_fullscreen_close_nav_immediate(
                             crate::ui_main::AddressBarNav::ZipListReturn(plan),
@@ -1325,7 +1364,7 @@ impl App {
                     }
                 }
             } else if let Some(p) = open_folder_nav {
-                Some(p)
+                self.dispatch_favorite_navigation(p)
             } else if let Some(action) = context_nav {
                 // context_nav が実際に勝ったときだけ source surface の終了と typed
                 // destination/selection の dispatch を適用する。show_context_menu 内で
@@ -1340,6 +1379,17 @@ impl App {
                     } => self
                         .open_grid_container_with_mode(ctx, idx, mode, "grid_context_menu")
                         .and_then(|nav| match nav {
+                            crate::ui_main::AddressBarNav::Favorite(path) => {
+                                self.dispatch_favorite_navigation(path)
+                            }
+                            crate::ui_main::AddressBarNav::AddressInput(target) => {
+                                self.dispatch_address_input(target);
+                                None
+                            }
+                            crate::ui_main::AddressBarNav::LocationJump(target) => {
+                                self.dispatch_location_jump(target);
+                                None
+                            }
                             crate::ui_main::AddressBarNav::ZipListReturn(plan) => {
                                 self.apply_fullscreen_close_nav_immediate(
                                     crate::ui_main::AddressBarNav::ZipListReturn(plan),
@@ -1504,6 +1554,17 @@ impl App {
                 }
             } else {
                 match grid_nav {
+                    Some(crate::ui_main::AddressBarNav::Favorite(path)) => {
+                        self.dispatch_favorite_navigation(path)
+                    }
+                    Some(crate::ui_main::AddressBarNav::AddressInput(target)) => {
+                        self.dispatch_address_input(target);
+                        None
+                    }
+                    Some(crate::ui_main::AddressBarNav::LocationJump(target)) => {
+                        self.dispatch_location_jump(target);
+                        None
+                    }
                     Some(crate::ui_main::AddressBarNav::ZipListReturn(plan)) => {
                         self.apply_fullscreen_close_nav_immediate(
                             crate::ui_main::AddressBarNav::ZipListReturn(plan),

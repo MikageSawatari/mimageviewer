@@ -526,6 +526,125 @@ fn failed_new_query_keeps_the_old_accepted_source_and_dataset() {
 }
 
 #[test]
+fn list_order_failed_query_preserves_the_accepted_run_snapshot_and_physical_child() {
+    let mut app = crate::app::setup_app_for_test();
+    let ctx = egui::Context::default();
+    app.current_folder = Some(app.tmp.path().to_path_buf());
+    let book = app.tmp.path().join("book.zip");
+    adopt(
+        &mut app,
+        &ctx,
+        "old",
+        dataset(vec![GridItem::ZipFile(book.clone())]),
+    );
+    app.capture_main_folder_list_order(0);
+    let snapshot = app.list_order.clone().unwrap();
+    let run = match &app.global_search.accepted {
+        SearchAccepted::Everything { submitted, .. } => submitted.run,
+        _ => unreachable!(),
+    };
+    app.advance_drilled_current_path(&book);
+    app.current_folder = Some(book.clone());
+    assert_eq!(app.list_order_position().unwrap().1, 0);
+    start_fake_run(&mut app, &ctx, "failed replacement");
+    assert_ne!(app.global_search.run_sequence, run);
+    let (prepare, _command_rx, output_tx) = stalled_prepare();
+    app.global_search.page_edit_prepare = Some(prepare);
+    output_tx
+        .send(SearchPrepareOutput::EverythingFailed(
+            "fake query failure".into(),
+        ))
+        .unwrap();
+    app.poll_search_page_edit_prepare(&ctx);
+    assert!(matches!(&app.global_search.accepted,
+        SearchAccepted::Everything { submitted, position: EverythingPosition::PhysicalChild { logical_source, return_anchor, .. }, .. }
+            if submitted.run == run && logical_source == &book && return_anchor == &book));
+    assert!(Arc::ptr_eq(app.list_order.as_ref().unwrap(), &snapshot));
+    assert_eq!(app.list_order_position().unwrap().1, 0);
+    assert!(app.global_search.pending.is_none());
+}
+
+#[test]
+fn list_order_row_admission_uses_physical_identity_and_preserves_the_original_route() {
+    let mut app = crate::app::setup_app_for_test();
+    let ctx = egui::Context::default();
+    let root = app.tmp.path().to_path_buf();
+    app.current_folder = Some(root.clone());
+    let a = root.join("A");
+    let b = a.join("B");
+    let inner = b.join("book.zip");
+    let outsider = root.join("outside.zip");
+    adopt(
+        &mut app,
+        &ctx,
+        "parents and child rows",
+        dataset(vec![
+            GridItem::Folder(a.clone()),
+            GridItem::Folder(b.clone()),
+            GridItem::ZipFile(inner.clone()),
+        ]),
+    );
+    let run = match &app.global_search.accepted {
+        SearchAccepted::Everything { submitted, .. } => submitted.run,
+        _ => unreachable!(),
+    };
+    assert!(app.accept_everything_physical_child(&a, &EverythingChildAdmission::Descend));
+    let route = match &app.global_search.accepted {
+        SearchAccepted::Everything {
+            position: EverythingPosition::PhysicalChild { route, .. },
+            ..
+        } => route.clone(),
+        _ => unreachable!(),
+    };
+    assert!(
+        !route.0.is_empty(),
+        "the return route must be a real captured origin"
+    );
+    assert!(app.accept_everything_physical_child(&b, &EverythingChildAdmission::Descend));
+    assert!(matches!(&app.global_search.accepted,
+        SearchAccepted::Everything { position: EverythingPosition::PhysicalChild { logical_source, return_anchor, .. }, .. }
+            if logical_source == &a && return_anchor == &a));
+    for (adopted, dataset_run, row) in [
+        (b.clone(), run.wrapping_add(1), b.clone()),
+        (inner.clone(), run, b.clone()),
+        (outsider.clone(), run, outsider),
+    ] {
+        assert!(app.accept_everything_physical_child(
+            &adopted,
+            &EverythingChildAdmission::ListOrderRow { dataset_run, row }
+        ));
+        assert!(matches!(&app.global_search.accepted,
+            SearchAccepted::Everything { position: EverythingPosition::PhysicalChild { logical_source, return_anchor, route: current_route }, .. }
+                if logical_source == &a && return_anchor == &a && current_route == &route));
+    }
+    let alternate_spelling = PathBuf::from(b.to_string_lossy().replace('\\', "/").to_uppercase());
+    assert!(app.accept_everything_physical_child(
+        &alternate_spelling,
+        &EverythingChildAdmission::ListOrderRow {
+            dataset_run: run,
+            row: b.clone()
+        }
+    ));
+    assert!(matches!(&app.global_search.accepted,
+        SearchAccepted::Everything { position: EverythingPosition::PhysicalChild { logical_source, return_anchor, route: current_route }, .. }
+            if logical_source == &b && return_anchor == &b && current_route == &route));
+    assert!(app.accept_everything_physical_child(&inner, &EverythingChildAdmission::Descend));
+    assert!(matches!(&app.global_search.accepted,
+        SearchAccepted::Everything { position: EverythingPosition::PhysicalChild { logical_source, return_anchor, route: current_route }, .. }
+            if logical_source == &b && return_anchor == &b && current_route == &route));
+    assert!(app.accept_everything_physical_child(
+        &inner,
+        &EverythingChildAdmission::ListOrderRow {
+            dataset_run: run,
+            row: inner.clone()
+        }
+    ));
+    assert!(matches!(&app.global_search.accepted,
+        SearchAccepted::Everything { position: EverythingPosition::PhysicalChild { logical_source, return_anchor, route: current_route }, .. }
+            if logical_source == &inner && return_anchor == &inner && current_route == &route));
+}
+
+#[test]
 fn source_a_b_a_keeps_one_original_return_owner_and_old_accepted_result() {
     use crate::app::top_level_grid_view::TopLevelGridRestore;
     let mut app = crate::app::setup_app_for_test();
@@ -749,7 +868,7 @@ fn physical_open_acceptance_keeps_logical_archive_identity_and_returns_exact_sel
             ..
         }
     ));
-    assert!(app.accept_everything_physical_child(&logical));
+    assert!(app.accept_everything_physical_child(&logical, &EverythingChildAdmission::Descend));
     assert!(
         matches!(&app.global_search.accepted, SearchAccepted::Everything {
         position: EverythingPosition::PhysicalChild { logical_source, return_anchor, .. }, ..
@@ -812,7 +931,7 @@ fn zip_prefix_parent_stays_in_the_physical_child_before_returning_to_results() {
     let zip = app.tmp.path().join("book.zip");
     let result = dataset(vec![GridItem::ZipFile(zip.clone())]);
     adopt(&mut app, &ctx, "book", Arc::clone(&result));
-    assert!(app.accept_everything_physical_child(&zip));
+    assert!(app.accept_everything_physical_child(&zip, &EverythingChildAdmission::Descend));
     let tree = Arc::new(crate::zip_tree::ZipTree::build(
         zip.clone(),
         ["root.jpg", "chapter/page.jpg"]
@@ -974,7 +1093,7 @@ fn results_return_skips_deep_zip_and_physical_parents_of_folder_child() {
     let zip = folder.join("sub/book.zip");
     let result = dataset(vec![GridItem::Folder(folder.clone())]);
     adopt(&mut app, &ctx, "folder", Arc::clone(&result));
-    assert!(app.accept_everything_physical_child(&folder));
+    assert!(app.accept_everything_physical_child(&folder, &EverythingChildAdmission::Descend));
     let tree = Arc::new(crate::zip_tree::ZipTree::build(
         zip.clone(),
         ["root.jpg", "chapter/deep/page.jpg"]
@@ -1156,7 +1275,7 @@ fn cold_folder_video_pin_seed_cascades_and_retargets_thumbnail_owner_on_return()
         0,
         "UI must not read pin BLOBs from its connection"
     );
-    assert!(app.accept_everything_physical_child(&folder));
+    assert!(app.accept_everything_physical_child(&folder, &EverythingChildAdmission::Descend));
     // A physical child owns a different pool. Returning must prepare a fresh search
     // owner and seed it, without publishing search keys into the child's resources.
     app.load_folder(folder.clone());
@@ -1515,7 +1634,9 @@ fn ten_thousand_completed_rows_keep_ui_adoption_bounded_and_sibling_unchanged() 
         .file_operation_path()
         .unwrap()
         .to_path_buf();
-    assert!(app.accept_everything_physical_child(&logical_book));
+    assert!(
+        app.accept_everything_physical_child(&logical_book, &EverythingChildAdmission::Descend)
+    );
     let child = GridItem::ZipImage {
         zip_path: logical_book.clone(),
         entry_name: "page.jpg".into(),
@@ -1659,15 +1780,15 @@ fn captured_open_origin_cannot_apply_after_same_query_new_run_or_source_aba() {
     }]);
     adopt(&mut app, &ctx, "same", Arc::clone(&result));
     let old_open = app.capture_search_open_origin().unwrap();
-    assert!(app.search_open_origin_is_current(old_open));
+    assert!(app.search_open_origin_is_current(&old_open));
     start_fake_run(&mut app, &ctx, "same");
-    assert!(!app.search_open_origin_is_current(old_open));
+    assert!(!app.search_open_origin_is_current(&old_open));
     app.cancel_everything_search();
-    assert!(!app.search_open_origin_is_current(old_open));
+    assert!(!app.search_open_origin_is_current(&old_open));
     let canceled_open = app.capture_search_open_origin().unwrap();
     app.switch_search_source(SearchSource::Metadata);
     app.switch_search_source(SearchSource::Everything);
-    assert!(!app.search_open_origin_is_current(canceled_open));
+    assert!(!app.search_open_origin_is_current(&canceled_open));
     assert!(Arc::ptr_eq(accepted_dataset(&app), &result));
     assert!(!app.everything_has_physical_child());
 }
@@ -1679,7 +1800,7 @@ fn canceled_return_preserves_child_and_can_prepare_again_without_querying_everyt
     let logical = app.tmp.path().join("book.zip");
     let result = dataset(vec![GridItem::ZipFile(logical.clone())]);
     adopt(&mut app, &ctx, "book", Arc::clone(&result));
-    assert!(app.accept_everything_physical_child(&logical));
+    assert!(app.accept_everything_physical_child(&logical, &EverythingChildAdmission::Descend));
     let page = GridItem::ZipImage {
         zip_path: logical,
         entry_name: "page.jpg".into(),
@@ -1727,7 +1848,7 @@ fn failed_return_preserves_the_accepted_physical_child_rows() {
     let logical = app.tmp.path().join("book.zip");
     let result = dataset(vec![GridItem::ZipFile(logical.clone())]);
     adopt(&mut app, &ctx, "book", Arc::clone(&result));
-    assert!(app.accept_everything_physical_child(&logical));
+    assert!(app.accept_everything_physical_child(&logical, &EverythingChildAdmission::Descend));
     let page = GridItem::ZipImage {
         zip_path: logical,
         entry_name: "page.jpg".into(),

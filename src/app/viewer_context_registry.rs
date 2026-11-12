@@ -6721,6 +6721,7 @@ mod tests {
     ) -> Arc<super::super::ListOrderSnapshot> {
         Arc::new(super::super::ListOrderSnapshot {
             owner,
+            scope: super::super::ListOrderScope::Folder,
             entries: Arc::from([super::super::ListOrderEntry {
                 path: folder.to_path_buf(),
                 kind: super::super::ListOrderEntryKind::Folder,

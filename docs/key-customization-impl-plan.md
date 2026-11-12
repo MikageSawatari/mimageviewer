@@ -84,8 +84,32 @@ INI・設定復元・GUI 入力／capture が共有する action 検証へ通す
 `EachPhysicalPress` で物理押下を数えるが、移動の準備中は既存 gate で拒否し累積しない。
 egui の repeat-only フレームは既存 Ctrl+↑↓ と同じく最大 1 回へまとめ、native は既存 Ctrl+↑↓ と同じく repeat を無視する。
 egui と native 動画の resolver / dispatcher、双方の動画ヘルプへ登録する。
-通常フォルダ一覧から最後に本を開く操作を受け付けた時点の列を使い、DFS / 兄弟移動は維持する。
+通常フォルダ一覧、または Everything の結果一覧から最後に本を開く操作を受け付けた時点の列を使い、DFS / 兄弟移動は維持する。
+§1.682 では accepted run 付き scope と logical_source の照合で Everything の列を分離し、既存の入力 handler・gate は変更しない。
 詳細は [一覧順ナビゲーション設計](list-order-book-navigation-plan.md) を参照。
+
+2026-11-11 §1.688: 既存の場所操作（ドライブ、現在ドライブの root、ドライブ切替、場所▼の固定項目・整理先）を
+検索中も使用可能にする。キー・リング・ジェスチャ・マウスボタン・ゲームパッドの同等入口と場所リストは
+共通の型付き場所ジャンプを使い、成功採用でだけ検索を終了する。★固定・Everything 取得中の制限は維持する。
+追補 §9 によりツールバーのお気に入り（ボタン列・ドロップダウン）とピン留め本も、4 種の検索中は成功時終了へそろえる。
+無効な行き先・scan 失敗・取消では結果と選択を保持する。検索外の Direct、Ctrl+F の先閉じと既存の優先順位は維持する。
+追補 §10 によりアドレス欄の Enter（空欄・本棚・本棚内の名前・解決したパス）と、
+利用者のフォルダペイン操作（クリック・Enter・ゲームパッド）も検索中は成功採用でだけ検索を終了する。
+失敗・取消・stale は結果と選択を保持する。成功後の Esc は結果を復元せず、履歴 Back は検索前の場所へ戻る。
+追補 §11 で §9・§10 の例外を改訂し、メニューバー・キー・リング・ジェスチャ・マウスボタン・ゲームパッドの
+お気に入り（番号・前後移動・一覧）もツールバーと同じ受付・成功時終了へそろえる。
+メニューバーの本棚は `LocationJumpTarget::BooksRoot` を使い、失敗・取消・stale は結果と選択を保持する。
+ペインにフォーカスがある Enter は検索の有無によらずペインが消費し、一覧の「開く」へ渡さない。
+検索外の Direct / DriveList / PaneNavigation と内部の pane open、既存の入力優先順位は従来どおり。
+新しい Action や既定割当は足さない。
+追補 §12 では既存の本・コレクションを開く Action も、検索中は成功採用で検索を終了する。
+`GridOpenActiveBook` / `GridOpenCollectionTarget`、`GridOpenBook1..20` / `GridOpenCollection1..20`、
+`GridBookPrev/Next` / `GridCollectionPrev/Next` と同じメニュー・ツールバー・管理画面の入口を含む。
+§1.733 のリング・ジェスチャ・マウスボタン・ゲームパッド X リングも同じ共通入口へ渡す。
+失敗・取消・stale は結果と選択を保ち、検索なしの既存動作・割当・番号・管理順・待機/取消は変えない。
+成功後は Esc で結果へ戻れず、履歴 Back は検索前の場所へ戻る。検索結果の行を開く操作は検索を継続する。
+既存の `GlobalOpenFolder` / `MenuCommandId::FileOpenFolder` も検索中だけ成功時終了へそろえ、検索なしの Direct は維持する。
+詳細は [検索結果ナビゲーション設計](search-result-navigation-682-688-plan.md) を参照。
 
 2026-10-22: crop / SNS 分割の固定 Escape は、ドラッグ中なら開始前の状態へ戻してドラッグだけを取り消し、
 ドラッグが無ければ従来どおりモードを終了する。消しゴム / 補正レイヤーと同じモード内の取消優先であり、
@@ -686,7 +710,7 @@ ini 出力のみ `;` / `#` を含む表記を KeySlot の別名に置換し、`S
 - FsClose `Enter` (画像のみ P) / FsBackToList `Backspace` (P) / `Esc` (固定)
 - FsJumpFirst/Last `Home/End` (P)
 - FsCtrlNavPrev/Next `Ctrl+↑/↓` (P) / FsSiblingPrev/Next `Ctrl+PageUp/Down` (P)
-- FsListOrderPrev/Next `Ctrl+Shift+↑/↓` (P): 最後に通常フォルダ一覧から本を開いたときの一覧順。準備中は受付拒否、累積なし
+- FsListOrderPrev/Next `Ctrl+Shift+↑/↓` (P): 最後に通常フォルダ / Everything 結果一覧から本を開いたときの一覧順。同じ scope の本だけで使用。準備中は受付拒否、累積なし
 - FsToggleWindowMode `F11` (P)。native 動画経路では App 側 keymap の effective chord を
   presenter へ転送する global snapshot に載せる。
 - レーティングは専用 `[Rating]` グループの `RatingItem*` / `RatingContainer*` / `RatingBookPreferred*` を共有する。

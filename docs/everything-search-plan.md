@@ -217,6 +217,44 @@ media は一覧の exact physical identity から通常の fullscreen／native p
 
 `commit_staged_search_navigation_effects`、`advance_drilled_current_path`、grid／fullscreen の parent・Ctrl+上下、converted alias、F12 direct-media／container open を source-aware routing の対象として列挙する。Everything Root では filesystem の sibling navigation をしない。PhysicalChild 内では本の通常 navigation を使い、外側 container を越える操作は検索結果集合の契約へ戻す。Metadata の hit-only drill はそのまま維持し、Everything 用に container hit count や偽の DrillState を作らない。
 
+§1.682（2026-11-11）: main の Everything Root で、表示中の行が結果そのものの場合だけ、
+本を開く受付時の表示順を `ListOrderScope::Everything { run }` として凍結する。run は accepted の
+`SubmittedEverything.run`。PhysicalChild や dataset 外の一覧では取り直さない。位置は
+`logical_source` と行の完全一致で求め、現在の論理の場所が同じ行または Folder 行の配下であることも照合する。
+一覧順の移動要求だけが search origin に `EverythingChildAdmission::ListOrderRow { dataset_run, row }` を載せ、
+current origin・accepted run・採用 path と row の physical key・dataset membership が一致した成功採用でだけ
+`logical_source` / `return_anchor` を移動先行へ置き換える。route は保持し、通常の `Descend` は変更しない。
+Folder 行の中の書庫へ着く場合は Folder 行の採用が先で、その後の書庫 open は `Descend`。
+結果への復帰・親・通常 close は置き換え後の基準を使い、通常 close の §1.664 の条件は維持する。
+結果の並べ替え・絞り込みには追従せず、次に結果から本を開くまで元の順。新しい結果の採用でだけ run が変わり旧列が使えなくなる。
+再送信・取消・失敗・source 切替だけでは accepted の旧列を使える。列は通常フォルダ用と共通の 1 つで、scope 間で流用しない。
+比較は既存 dataset membership と同じ `physical_path_spelling` の key を使う。
+
+§1.688（2026-11-11）: キー・リング・ジェスチャ・マウスボタン・ゲームパッドの場所操作、場所リスト、
+ツールバー場所▼（整理先を含む）は検索中も使える。移動先の成功採用で検索を `_without_restore` で終了し、
+履歴からは検索前の場所へ戻る。失敗・取消・stale は結果を保持する。Everything 取得中 modal・★固定の制限は維持する。
+追補 §9 の利用者決定により、ツールバーのお気に入り（ボタン列・ドロップダウン）とピン留め本も同じ成功時終了の契約にそろえる。
+4 種の検索中は dispatch 時に ★固定・共通 modal・Everything 取得中を判定し、無効な行き先・scan 失敗・取消では結果と選択を保持する。
+検索外の Direct と優先順位、Ctrl+F の先閉じは従来どおり。
+追補 §10 により、アドレス欄の Enter（空欄のドライブ一覧・「本棚」「本棚 > 名前」・解決したパス）は、
+dispatch 時に検索が active なら同じ成功時終了の場所ジャンプへ渡す。
+利用者のフォルダペイン操作（クリック・Enter・ゲームパッド）も、受付時に検索が active なら
+`ExitTemporaryView` の scan を使う。受付後に始まった検索は既存の退役処理でその scan を取り消す。
+検索外の Direct / DriveList / PaneNavigation と、起動復元等の内部 `start_folder_pane_open` は変更しない。
+成功後は Esc で検索結果へ戻らず、履歴 Back は検索前の場所へ戻る。失敗・取消・stale は結果と選択を保持する。
+追補 §11 で §9・§10 の例外を改訂し、メニューバー・キー・リング・ジェスチャ・マウスボタン・ゲームパッドの
+お気に入り（番号・前後移動・一覧）もツールバーと同じ受付・成功時終了へそろえる。
+メニューバーの本棚は `LocationJumpTarget::BooksRoot` を使う。検索外は従来どおりで、失敗・取消・stale は結果と選択を保持する。
+ペインにフォーカスがある Enter はペインが消費し、検索結果の本を開かない。
+存在しないドライブ等、アドレス欄の入力から移れる親もない場合は移動せず通知する。
+存在しない子パスから既存の親へ移る従来の解決は維持し、その移動が成功したときだけ検索を終了する。
+追補 §12: 保存済みの本・コレクションを開く明示操作（追加先、管理順の番号/前後、固定ボタン、管理画面の「開く」）も、
+移動先の成功採用で検索を終了する。失敗・取消・stale は結果と選択を保持し、検索外の open は従来どおり。
+検索が終了した後は旧 Everything scope の列を使わず、履歴 Back は検索前へ戻る。結果行から本を開く通常の PhysicalChild と
+Everything の一覧順移動・結果への帰路は検索を継続するので、保存済み本への明示 open と混同しない。
+`GlobalOpenFolder` / `FileOpenFolder` の「フォルダを開く」も、検索中だけ成功時終了へ渡す。検索なしの Direct は維持する。
+両項目の正本は [検索結果ナビゲーション設計](search-result-navigation-682-688-plan.md)。実機観測の記録ではない。
+
 §1.664（2026-10-31）: 通常 close の既存 Live continuation は、採用済み PhysicalChild が本で、現在の論理コンテナと採用済み本分類の root がその source に一致するとき `AddressBarNav::EverythingResults` を返し、通常／即時 dispatcher から `return_from_everything_child(Results)` を呼ぶ。本の種類は accepted dataset の行種別と `ProjectionRecipe` で確認する。Folder 行は追加設定 ON・画像のみを必須とし、拡張子付き実フォルダを旧拡張子判定だけで対象にしない（既存分類問題§1.418自体は範囲外）。この制限は通常 close に適用し、Results ボタンは従来どおり階層途中からも使える。新しい帰路 state・第二 cache は作らない。既存の取消可能な main modal と prepare/adoption を再利用する簡素化を採り、追加の割り込み・復元機構は不要とした。Ctrl+G／Ctrl+S／タグの検索除外は維持する（別々の drill／nav_stack owner が必要なため今回対象外）。まれな失敗は既定の割り切りとし、新しい回復処理を足さない。detached 述語・viewport・registry 移譲は変更しない。
 
 §1.670（2026-11-01、利用者採択A）: §1.664で分離した独立viewerの既存帰路を改訂する。
