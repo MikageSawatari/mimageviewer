@@ -36992,21 +36992,16 @@ mod phase_c_drill_address_tests {
         );
     }
 
-    /// 入力変更後の debounce 待ち / worker 実行中相当では、0 件確定に見えないよう
-    /// address の件数表示にも検索中を出す。
+    /// 最初の検索を実行する前は、下書きも件数も address に出さない。
     #[test]
-    fn aggregated_address_marks_unsettled_results_as_searching() {
+    fn aggregated_address_omits_unsubmitted_query_and_count() {
         let mut app = setup_app();
         app.global_search.active = true;
         app.global_search.metadata_draft = "グルグル".to_string();
         app.global_search.last_executed.clear();
         app.update_global_search_address();
 
-        assert!(
-            app.address.contains("検索中"),
-            "未確定の Ctrl+G 検索は address に検索中を出す: {}",
-            app.address
-        );
+        assert_eq!(app.address, "🌐 アイテム検索");
     }
 
     #[test]

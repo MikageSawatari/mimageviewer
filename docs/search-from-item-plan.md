@@ -724,3 +724,64 @@ pub(crate) struct SearchRequest {
 ## 11. まれな失敗
 
 まれな失敗は割り切り (ログ + 通知)。AI 情報の読み込み失敗は行を出さないだけ。再試行の仕組みは作らない。
+
+## master 取り込み後の修正: 検索ラベル
+
+2026-11-12、master `46735399f` 後のサブ PC 実機確認（観測者: サブ PC 担当）で、名前を入れただけで
+未実行の語と 0 件がタイトルに出ること、Everything の確定前にも常設のアイテム検索欄の残存語が出ることを確認。
+未実行のまま実フォルダが再読込された際のドリルイン表示にも下書きが混入した。
+
+原因は `global_search_location_label` が採用済み・実行済みの語のない場合に `metadata_draft` を使い、
+Everything の採用前にも Metadata のラベルへ進んでいたこと。状態を変えず、この関数だけを修正した。
+表示語は採用済みの `applied.query`、それがなければ `last_executed` とし、下書きは表示しない。
+最初の検索も `spawn_global_search_with_refresh` で `last_executed` を設定してから worker を登録するため、
+実行中には語と既存の「検索中」を表示できる（`src/global_search_ui.rs:3189`、`:3227`）。
+語のない一覧・集約は `🌐 アイテム検索`、ドリルインは `🌐 アイテム検索 > fx690` の形とする。
+Everything の欄を選んでも、Metadata の `applied: Some` があれば表示中の Metadata の語・件数・ドリルインを維持する。
+`source == Everything` かつ `accepted == Metadata { applied: None }` のときだけ `Everything 検索` とし、
+採用済み Everything の語・件数・ドリルインは従来どおり優先する。
+実行中の進捗は既存の「Everything ファイル名検索」ダイアログにあり、この簡潔なラベルと矛盾しない。
+`update_global_search_address` の呼出し時期・検索状態・入力動作は変更していない。
+
+回帰は `src/app/tests/search_request.rs` に 4 件追加。Metadata の注入（常設 ON/OFF・一覧/集約）→ Enter →
+最初の worker 実行中 → 完了、Everything の注入（残存語あり/なし）→実行中相当→採用→再検索中の旧表示保持、
+未実行のドリルイン（root/子階層）、通常 Ctrl+G の編集→debounce→実行開始を検査する。
+Everything の採用は既存の合成 lifecycle fixture を使い、Enter の受付は既存テストで採用前ラベルも検査する。
+`src/app/tests.rs` の下書きを「検索中」と表示する旧テスト 1 件は新仕様へ更新した。
+
+初回検証は共通 `run-heavy.ps1`（Owner=`codex-690t`、WorkDir=`G:\home\mimageviewer-690`）経由。
+`cargo check -p mimageviewer --bin mimageviewer-core` は成功（1分13秒、既存 warning あり）。
+`cargo nextest run -p mimageviewer --lib -j 6 --no-fail-fast --no-tests fail -E 'test(global_search_label_)'` は
+追加 4 件すべて成功（実行 5.257 秒、コンパイル 12分50秒）。同じコマンドの filter を広げた関連 nextest は
+311 件すべて成功（追加 4 件を含む、実行 42.779 秒、ビルド再利用 1.73 秒、範囲外 17,116 件）。
+関連 filter は `label` / `global_search` / `search_request` / `update_global_search_address` と
+`phase_c_drill_address_tests` の OR。filter とログは `target/search-title-verification/`。
+共通ランナーはロック待機後、ロック領域への書込権限不足を警告し、既定の `no slot`・BelowNormal・
+`CARGO_BUILD_JOBS=6` で実行した。独自の迂回起動はしていない。
+`python scripts/check_ui_glyphs.py` は危険なグリフ 0 件。最後の `cargo fmt`（引数なし）と `git diff --check` も成功。
+本体 lib 全件と `build-dev` は利用者指示どおり設計担当が行い、git 書き込み・アプリ起動は行わない。
+実装範囲・検証範囲について設計指示からの逸脱はない。
+
+### 追補: 表示中の Metadata 結果を優先
+
+サブ PC 担当の手順 13 では、Ctrl+G の結果から Everything の欄へ切り替えた後も一覧は Metadata のまま。
+初回差分は `source` だけで `Everything 検索` を返していたため、上記の `applied: None` 条件を追加した。
+`switch_search_source` は producer / prepare を退役し `last_executed` を消す一方、accepted と表示中の項目は保持する
+（`src/global_search_ui/everything.rs:256`、`:261`、`:267`、`:272`）。そのため採用済み Metadata は `applied.query` で説明する。
+初回 Ctrl+G の実行中で `applied: None` の場合は、Metadata 結果の採用前であり、切替時にその未採用の検索も取消されるため
+`Everything 検索` を選ぶ。実行済み条件の採用資格は Done または受信済み Batch を必要とし、項目の採用と同じ処理内で
+accepted へ反映される（`src/global_search_ui.rs:3594`、`:3670`）。
+
+回帰をさらに 2 件追加（本節の追加は計 6 件）。完了済み Metadata 4 件 → Everything への名前注入 → Metadata の語・件数・
+集約・ドリルインとアドレスの保持 → Enter → 合成 Everything 結果の採用と表示切替を常設 ON/OFF で検査する。
+もう 1 件は初回 Metadata 検索の採用前から名前注入／通常の Everything ショートカットで切り替え、producer の取消・
+prepare の退役・実行語の消去・一覧不変・`Everything 検索` を検査する。
+初回の関連 nextest は 313 件中 312 件成功・追加 1 件失敗。テストの合成 Metadata 結果を準備する際、下書きを先に入れて
+`open_global_search` を呼び、既存の「保持した下書きは待機」（done=true）へ入っていたため、stream の受信が始まらなかった。
+既存 fixture の利用箇所と同じ open → 下書き設定 → `reset_for_new_query` → 合成結果の順へテストを修正した。
+製品側へ初期化や reset は追加していない。修正後は同じ共通ランナー条件で、ラベル回帰 6 件すべて成功
+（実行 1.495 秒、コンパイル 2分32秒）、前回と同じ関連 filter の 313 件すべて成功
+（追加 6 件を含む、実行 32.834 秒、ビルド再利用 1.22 秒、範囲外 17,116 件）。
+ログは `target/search-title-verification/metadata-retained-label-tests.log` と
+`metadata-retained-related-tests-final.log`。初回の失敗ログは `metadata-retained-related-tests.log`。
+最後に `cargo fmt`（引数なし）を適用し、`git diff --check` で差分を確認。git 書き込み・アプリ起動は行わない。

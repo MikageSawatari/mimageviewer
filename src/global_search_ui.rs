@@ -4583,14 +4583,19 @@ impl App {
         if !self.global_search.active {
             return None;
         }
+        if self.global_search.source == SearchSource::Everything
+            && matches!(
+                self.global_search.accepted,
+                SearchAccepted::Metadata { applied: None }
+            )
+        {
+            return Some("Everything 検索".to_string());
+        }
         let query = match &self.global_search.accepted {
             SearchAccepted::Metadata {
                 applied: Some(applied),
             } => applied.query.clone(),
-            SearchAccepted::Metadata { .. } if !self.global_search.last_executed.is_empty() => {
-                self.global_search.last_executed.clone()
-            }
-            SearchAccepted::Metadata { .. } => self.global_search.metadata_draft.clone(),
+            SearchAccepted::Metadata { .. } => self.global_search.last_executed.clone(),
             SearchAccepted::Everything { .. } => unreachable!(),
         };
         Some(match self.global_search.view() {
@@ -4653,7 +4658,7 @@ impl App {
                     };
                 let mut segs = vec![root_name];
                 segs.extend(rel);
-                let suffix = if self.global_search.is_searching() {
+                let suffix = if !query.is_empty() && self.global_search.is_searching() {
                     let hits =
                         crate::ui_helpers::format_count(self.global_search.total_valid as u64);
                     let scanned =
@@ -4662,10 +4667,14 @@ impl App {
                 } else {
                     String::new()
                 };
-                format!(
-                    "🌐 アイテム検索: \"{query}\" > {}{suffix}",
-                    segs.join(" > ")
-                )
+                if query.is_empty() {
+                    format!("🌐 アイテム検索 > {}", segs.join(" > "))
+                } else {
+                    format!(
+                        "🌐 アイテム検索: \"{query}\" > {}{suffix}",
+                        segs.join(" > ")
+                    )
+                }
             }
         })
     }

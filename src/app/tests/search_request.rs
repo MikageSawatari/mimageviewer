@@ -67,6 +67,331 @@ fn selection(ctx: &egui::Context, id: egui::Id) -> std::ops::Range<egui::text::C
         .as_sorted_char_range()
 }
 
+fn ready_label_search_indexer(app: &mut App, data: &std::path::Path) {
+    app.indexer_init = super::super::IndexerInit::Ready(
+        crate::indexer_manager::IndexerManager::new_at(
+            data,
+            &[],
+            crate::settings::IndexerSpeedProfile::default(),
+            Arc::clone(&app.activity_gate),
+            Vec::new(),
+        )
+        .unwrap(),
+    );
+}
+
+#[test]
+fn global_search_label_name_prefill_waits_for_enter_then_shows_running_and_completed_query() {
+    let _input = crate::key_input::lock_test_input();
+    for pinned in [false, true] {
+        let mut app = super::super::setup_app_for_test();
+        pin(&mut app, pinned);
+        let index = app.tmp.path().join("label-index");
+        ready_label_search_indexer(&mut app, &index);
+        let ctx = context();
+        ctx.begin_pass(egui::RawInput::default());
+        inject(&mut app, &ctx, Kind::Metadata, "name.with.dots");
+        for aggregate in [false, true] {
+            app.global_search.aggregate = aggregate;
+            assert_eq!(
+                app.global_search_location_label().as_deref(),
+                Some("🌐 アイテム検索")
+            );
+        }
+        app.global_search.aggregate = false;
+        draw(&mut app, &ctx, Kind::Metadata, pinned);
+        end(&ctx);
+
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: Some(egui::Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        });
+        app.update_ime_state(&ctx);
+        draw(&mut app, &ctx, Kind::Metadata, pinned);
+        assert!(app.global_search.last_change_at.is_some());
+        app.global_search.last_change_at = Some(Instant::now() - Duration::from_secs(2));
+        app.poll_global_search_debounce(&ctx);
+        assert!(matches!(
+            app.global_search.pending,
+            Some(SearchProducer::Metadata(_))
+        ));
+        assert!(matches!(
+            app.global_search.accepted,
+            SearchAccepted::Metadata { applied: None }
+        ));
+        assert_eq!(app.global_search.last_executed, "name.with.dots");
+        assert_eq!(
+            app.global_search_location_label().as_deref(),
+            Some("🌐 アイテム検索: \"name.with.dots\"  (0 件 / 検索中 · 0 件を確認)")
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !app.global_search.done {
+            app.poll_global_search_events(&ctx);
+            assert!(Instant::now() < deadline, "label search did not complete");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.global_search.reject_message.is_none());
+        assert_eq!(
+            app.global_search_location_label().as_deref(),
+            Some("🌐 アイテム検索: \"name.with.dots\"  (0 件)")
+        );
+        end(&ctx);
+    }
+}
+
+#[test]
+fn global_search_label_everything_prefill_and_pending_ignore_retained_metadata_draft() {
+    for pinned in [false, true] {
+        for retained in ["", "umi-01"] {
+            let mut app = super::super::setup_app_for_test();
+            pin(&mut app, pinned);
+            app.global_search.metadata_draft = retained.into();
+            let ctx = context();
+            ctx.begin_pass(egui::RawInput::default());
+            inject(&mut app, &ctx, Kind::Everything, "name.with.dots");
+            assert_eq!(
+                app.global_search_location_label().as_deref(),
+                Some("Everything 検索")
+            );
+            // Use the submitted lifecycle fixture without contacting a real Everything process.
+            crate::global_search_ui::start_everything_for_test(&mut app, &ctx, "name.with.dots");
+            assert!(app.global_search.is_searching());
+            assert_eq!(
+                app.global_search_location_label().as_deref(),
+                Some("Everything 検索")
+            );
+            crate::global_search_ui::adopt_everything_for_test(
+                &mut app,
+                &ctx,
+                "name.with.dots",
+                crate::global_search_ui::everything_dataset_for_test(Vec::new()),
+            );
+            let accepted = "Everything: \"name.with.dots\" / 0 件中 0 件取得 / 表示対象 0 件";
+            assert_eq!(
+                app.global_search_location_label().as_deref(),
+                Some(accepted)
+            );
+            crate::global_search_ui::start_everything_for_test(&mut app, &ctx, "next query");
+            assert_eq!(
+                app.global_search_location_label().as_deref(),
+                Some(accepted)
+            );
+            end(&ctx);
+        }
+    }
+}
+
+#[test]
+fn global_search_label_everything_prefill_preserves_accepted_metadata_until_enter_and_adoption() {
+    let _input = crate::key_input::lock_test_input();
+    for pinned in [false, true] {
+        let mut app = super::super::setup_app_for_test();
+        pin(&mut app, pinned);
+        let ctx = context();
+        ctx.begin_pass(egui::RawInput::default());
+        let paths: Vec<_> = (0..4)
+            .map(|index| app.tmp.path().join(format!("metadata-{index}.png")))
+            .collect();
+        for path in &paths {
+            image::RgbImage::new(2, 3).save(path).unwrap();
+        }
+        app.open_global_search();
+        app.global_search.metadata_draft = "test".into();
+        app.global_search.reset_for_new_query();
+        crate::global_search_ui::tests::g1_publish_search_hits(&mut app, &ctx, &paths);
+        assert!(matches!(&app.global_search.accepted,
+            SearchAccepted::Metadata { applied: Some(applied) } if applied.query == "test"));
+        let items = app.items.clone();
+        let metadata_label = "🌐 アイテム検索: \"test\"  (4 件)";
+        assert_eq!(
+            app.global_search_location_label().as_deref(),
+            Some(metadata_label)
+        );
+
+        inject(&mut app, &ctx, Kind::Everything, "new name");
+        assert!(app.edit_owner(Kind::Everything));
+        assert_eq!(app.global_search.everything_draft, "new name");
+        assert!(app.global_search.last_executed.is_empty());
+        assert_eq!(app.items, items);
+        assert_eq!(
+            app.global_search_location_label().as_deref(),
+            Some(metadata_label)
+        );
+        app.update_global_search_address();
+        assert_eq!(app.address, metadata_label);
+        // The applied query also owns the retained aggregate and drill labels.
+        app.global_search.aggregate = true;
+        assert_eq!(
+            app.global_search_location_label().as_deref(),
+            Some("🌐 アイテム検索: \"test\"  (1 件)")
+        );
+        app.global_search.drill = Some(crate::global_search_ui::DrillState {
+            container_root: app.tmp.path().join("fx690"),
+            current_path: app.tmp.path().join("fx690").join("child"),
+            is_zip: false,
+        });
+        assert_eq!(
+            app.global_search_location_label().as_deref(),
+            Some("🌐 アイテム検索: \"test\" > fx690 > child")
+        );
+        app.global_search.drill = None;
+        app.global_search.aggregate = false;
+        draw(&mut app, &ctx, Kind::Everything, pinned);
+        end(&ctx);
+
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: Some(egui::Key::Enter),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        });
+        app.update_ime_state(&ctx);
+        draw(&mut app, &ctx, Kind::Everything, pinned);
+        assert!(matches!(
+            app.global_search.pending,
+            Some(SearchProducer::Everything { .. })
+        ));
+        assert!(matches!(
+            app.global_search.accepted,
+            SearchAccepted::Metadata { applied: Some(_) }
+        ));
+        // Supply a completed dataset through the existing fixture; no live result is polled.
+        crate::global_search_ui::adopt_everything_for_test(
+            &mut app,
+            &ctx,
+            "new name",
+            crate::global_search_ui::everything_dataset_for_test(vec![GridItem::Image(
+                paths[0].clone(),
+            )]),
+        );
+        let everything_label = "Everything: \"new name\" / 1 件中 1 件取得 / 表示対象 1 件";
+        assert_eq!(
+            app.global_search_location_label().as_deref(),
+            Some(everything_label)
+        );
+        app.update_global_search_address();
+        assert_eq!(app.address, everything_label);
+        end(&ctx);
+    }
+}
+
+#[test]
+fn global_search_label_switch_before_first_metadata_adoption_cancels_unaccepted_query() {
+    for prefill in [false, true] {
+        let mut app = super::super::setup_app_for_test();
+        let index = app.tmp.path().join("label-index");
+        ready_label_search_indexer(&mut app, &index);
+        let ctx = context();
+        ctx.begin_pass(egui::RawInput::default());
+        app.open_global_search();
+        app.global_search.metadata_draft = "first query".into();
+        app.spawn_global_search(&ctx);
+        assert_eq!(app.global_search.last_executed, "first query");
+        assert!(matches!(
+            app.global_search.accepted,
+            SearchAccepted::Metadata { applied: None }
+        ));
+        let Some(SearchProducer::Metadata(handle)) = &app.global_search.pending else {
+            panic!("first Metadata search must have a producer");
+        };
+        let cancel = handle.cancel.clone();
+        let items = app.items.clone();
+        if prefill {
+            inject(&mut app, &ctx, Kind::Everything, "new name");
+        } else {
+            app.open_search_shortcut(&ctx, Kind::Everything);
+        }
+        assert!(app.edit_owner(Kind::Everything));
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.global_search.pending.is_none());
+        assert!(app.global_search.page_edit_prepare.is_none());
+        assert!(app.global_search.last_executed.is_empty());
+        assert!(matches!(
+            app.global_search.accepted,
+            SearchAccepted::Metadata { applied: None }
+        ));
+        assert_eq!(app.items, items);
+        assert_eq!(
+            app.global_search_location_label().as_deref(),
+            Some("Everything 検索")
+        );
+        end(&ctx);
+    }
+}
+
+#[test]
+fn global_search_label_unsubmitted_drill_has_no_query_or_quotes() {
+    let mut app = super::super::setup_app_for_test();
+    let ctx = context();
+    ctx.begin_pass(egui::RawInput::default());
+    inject(&mut app, &ctx, Kind::Metadata, "kumo-02");
+    let root = app.tmp.path().join("fx690");
+    for child in [false, true] {
+        app.global_search.drill = Some(crate::global_search_ui::DrillState {
+            container_root: root.clone(),
+            current_path: if child {
+                root.join("a").join("b")
+            } else {
+                root.clone()
+            },
+            is_zip: false,
+        });
+        assert_eq!(
+            app.global_search_location_label().as_deref(),
+            Some(if child {
+                "🌐 アイテム検索 > fx690 > a > b"
+            } else {
+                "🌐 アイテム検索 > fx690"
+            })
+        );
+    }
+    end(&ctx);
+}
+
+#[test]
+fn global_search_label_ordinary_ctrl_g_edit_waits_for_debounce_before_showing_query() {
+    let mut app = super::super::setup_app_for_test();
+    let index = app.tmp.path().join("label-index");
+    ready_label_search_indexer(&mut app, &index);
+    let ctx = context();
+    ctx.begin_pass(egui::RawInput::default());
+    app.open_search_shortcut(&ctx, Kind::Metadata);
+    app.global_search.metadata_draft = "ordinary query".into();
+    app.handle_pinned_search_actions(
+        &ctx,
+        vec![crate::ui_pinned_search::PinnedSearchAction::Edited(
+            Kind::Metadata,
+        )],
+    );
+    assert!(app.global_search.last_change_at.is_some());
+    assert!(app.global_search.pending.is_none());
+    assert_eq!(
+        app.global_search_location_label().as_deref(),
+        Some("🌐 アイテム検索")
+    );
+    app.global_search.last_change_at = Some(Instant::now() - Duration::from_secs(2));
+    app.poll_global_search_debounce(&ctx);
+    assert!(matches!(
+        app.global_search.pending,
+        Some(SearchProducer::Metadata(_))
+    ));
+    assert_eq!(
+        app.global_search_location_label().as_deref(),
+        Some("🌐 アイテム検索: \"ordinary query\"  (0 件 / 検索中 · 0 件を確認)")
+    );
+    end(&ctx);
+}
+
 #[test]
 fn search_name_three_targets_pinned_and_temporary_focus_select_and_wait_for_enter() {
     let _input = crate::key_input::lock_test_input();
@@ -120,6 +445,12 @@ fn search_name_three_targets_pinned_and_temporary_focus_select_and_wait_for_ente
                     Some(SearchProducer::Everything { .. })
                 )),
                 _ => unreachable!(),
+            }
+            if kind == Kind::Everything {
+                assert_eq!(
+                    app.global_search_location_label().as_deref(),
+                    Some("Everything 検索")
+                );
             }
             end(&ctx);
         }
