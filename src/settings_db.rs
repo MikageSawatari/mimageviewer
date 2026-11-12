@@ -6414,6 +6414,103 @@ mod tests {
     }
 
     #[test]
+    fn container_icon_kinds_released_db_and_copied_portable_db_migrate_once() {
+        use crate::grid_item::ContainerIconKinds as Kinds;
+        let partial = Kinds {
+            folder: true,
+            archive: false,
+            pdf_epub: true,
+        };
+        for (legacy, new, expected) in [
+            (Some(serde_json::json!(true)), None, Kinds::ALL),
+            (Some(serde_json::json!(false)), None, Kinds::NONE),
+            (None, None, Kinds::NONE),
+            (Some(serde_json::json!("bad")), None, Kinds::NONE),
+            (Some(serde_json::json!(true)), Some(partial), partial),
+            (Some(serde_json::json!("bad")), Some(partial), partial),
+        ] {
+            let source = TempDir::new().unwrap();
+            let portable = TempDir::new().unwrap();
+            {
+                let db = SettingsDb::create_new(source.path()).unwrap();
+                let mut original = Settings::default();
+                original.grid_cols = 9;
+                original
+                    .favorites
+                    .push(FavoriteEntry::new("kept".into(), PathBuf::from("C:/kept")));
+                db.save_full(&original).unwrap();
+                let inner = db.inner.lock().unwrap();
+                inner
+                    .conn
+                    .execute(
+                        "DELETE FROM settings_kv WHERE key='thumb_container_icon_kinds'",
+                        [],
+                    )
+                    .unwrap();
+                if let Some(new) = new {
+                    inner.conn.execute("INSERT INTO settings_kv(key,value) VALUES('thumb_container_icon_kinds',?1)", [serde_json::to_string(&new).unwrap()]).unwrap();
+                }
+                if let Some(legacy) = legacy {
+                    inner.conn.execute("INSERT INTO settings_kv(key,value) VALUES('thumb_container_type_icon_only',?1)", [legacy.to_string()]).unwrap();
+                }
+                inner
+                    .conn
+                    .execute(
+                        "UPDATE schema_meta SET value='5.1.0' WHERE key='app_version'",
+                        [],
+                    )
+                    .unwrap();
+            }
+            std::fs::copy(
+                source.path().join("settings.db"),
+                portable.path().join("settings.db"),
+            )
+            .unwrap();
+            for dir in [source.path(), portable.path()] {
+                let db = SettingsDb::open(dir).unwrap();
+                let loaded = db.load_into_settings().unwrap();
+                assert_eq!(loaded.thumb_container_icon_kinds, expected);
+                assert_eq!(loaded.grid_cols, 9);
+                assert_eq!(loaded.favorites.len(), 1);
+                assert_eq!(loaded.favorites[0].name, "kept");
+                db.save_full(&loaded).unwrap();
+                let count: i64 = db.inner.lock().unwrap().conn.query_row("SELECT count(*) FROM settings_kv WHERE key='thumb_container_type_icon_only'", [], |row| row.get(0)).unwrap();
+                assert_eq!(count, 0);
+                let mut changed = loaded;
+                changed.thumb_container_icon_kinds = partial;
+                db.save_full(&changed).unwrap();
+                drop(db);
+                assert_eq!(
+                    SettingsDb::open(dir)
+                        .unwrap()
+                        .load_into_settings()
+                        .unwrap()
+                        .thumb_container_icon_kinds,
+                    partial
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn container_icon_kinds_malformed_new_db_value_never_uses_legacy() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        {
+            let inner = db.inner.lock().unwrap();
+            inner
+                .conn
+                .execute(
+                    "UPDATE settings_kv SET value='\"bad\"' WHERE key='thumb_container_icon_kinds'",
+                    [],
+                )
+                .unwrap();
+            inner.conn.execute("INSERT INTO settings_kv(key,value) VALUES('thumb_container_type_icon_only','true')", []).unwrap();
+        }
+        assert!(db.load_into_settings().is_err());
+    }
+
+    #[test]
     fn same_name_folder_book_released_db_and_copied_portable_db_migrate_once() {
         use crate::same_name_folder_book::{KEY, LEGACY_KEY, SameNameFolderBookPolicy as Policy};
         for (old, expected) in [(true, Policy::PreferBook), (false, Policy::ShowBoth)] {

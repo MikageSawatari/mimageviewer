@@ -23137,7 +23137,7 @@ impl App {
             if self.items.get(idx).is_some_and(|item| {
                 crate::grid_item::container_icon_only(
                     item,
-                    self.settings.thumb_container_type_icon_only,
+                    self.settings.thumb_container_icon_kinds,
                 )
             }) {
                 continue;
@@ -23186,7 +23186,7 @@ impl App {
             .filter(|item| {
                 crate::grid_item::container_icon_only(
                     item,
-                    self.settings.thumb_container_type_icon_only,
+                    self.settings.thumb_container_icon_kinds,
                 )
             })
             .count()
@@ -23194,13 +23194,11 @@ impl App {
 
     fn auto_aspect_thumbnails_terminal(&self) -> bool {
         self.items.iter().enumerate().all(|(idx, item)| {
-            crate::grid_item::container_icon_only(
-                item,
-                self.settings.thumb_container_type_icon_only,
-            ) || self
-                .thumbnails
-                .get(idx)
-                .is_some_and(ThumbnailState::is_terminal)
+            crate::grid_item::container_icon_only(item, self.settings.thumb_container_icon_kinds)
+                || self
+                    .thumbnails
+                    .get(idx)
+                    .is_some_and(ThumbnailState::is_terminal)
         })
     }
 
@@ -23316,7 +23314,7 @@ impl App {
             for (idx, item) in self.items.iter().enumerate() {
                 if crate::grid_item::container_icon_only(
                     item,
-                    self.settings.thumb_container_type_icon_only,
+                    self.settings.thumb_container_icon_kinds,
                 ) {
                     continue;
                 }
@@ -23468,7 +23466,7 @@ impl App {
                 self.items.get(**idx).is_some_and(|item| {
                     !crate::grid_item::container_icon_only(
                         item,
-                        self.settings.thumb_container_type_icon_only,
+                        self.settings.thumb_container_icon_kinds,
                     )
                 })
             })
@@ -56853,7 +56851,7 @@ impl App {
                     && self.settings.thumb_aspect_auto
                     && !crate::grid_item::container_icon_only(
                         &self.items[i],
-                        self.settings.thumb_container_type_icon_only,
+                        self.settings.thumb_container_icon_kinds,
                     )
                 {
                     let listing_dims = if from_edit_preview {
@@ -57544,10 +57542,7 @@ impl App {
             return PriorityThumbnailAdmission::SidecarRestore;
         }
         if self.items.get(idx).is_some_and(|item| {
-            crate::grid_item::container_icon_only(
-                item,
-                self.settings.thumb_container_type_icon_only,
-            )
+            crate::grid_item::container_icon_only(item, self.settings.thumb_container_icon_kinds)
         }) {
             return PriorityThumbnailAdmission::NoArt;
         }
@@ -57951,7 +57946,7 @@ impl App {
         for i in self.keep_set_sorted() {
             if crate::grid_item::container_icon_only(
                 &self.items[i],
-                self.settings.thumb_container_type_icon_only,
+                self.settings.thumb_container_icon_kinds,
             ) {
                 // Display state is not a request terminal. Leave in-flight owners and
                 // their pixels/finalization untouched, including across a preference toggle.
@@ -58588,7 +58583,7 @@ impl App {
         for i in self.keep_set_sorted() {
             if crate::grid_item::container_icon_only(
                 &self.items[i],
-                self.settings.thumb_container_type_icon_only,
+                self.settings.thumb_container_icon_kinds,
             ) {
                 continue;
             }
