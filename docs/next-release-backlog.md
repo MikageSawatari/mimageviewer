@@ -39,6 +39,19 @@
 
 ## 1. 優先候補
 
+### 1.474 通常のページ表示でページ内スクロールと N 字スクロールを使う — 5ch >>642・767 (2026-10-29 起票、2026-11-12 採用)
+
+- 状態: **未着手・対応方針決定**。収録版は未定。[>>642](https://egg.5ch.io/test/read.cgi/software/1782419551/642) の、画像の端を基準にキーで表示範囲を動かしたい要望を保留側に記録していた。[>>767](https://egg.5ch.io/test/read.cgi/software/1782419551/767) で、縦連結のように次のページを見せず、今のページ内を矢印キーやホイールで動かしたいことと、NeeView のような N 字スクロールの要望が追加された。2026-11-12 の利用者決定で通常バックログへ移す。
+- mIV の現状 (コード確認、実画面試験なし): 通常のページ単位表示では矢印キーとホイールはページ送り。マウスやゲームパッドでパンはできるが、上下左右のキーによるページ内スクロールや端への位置合わせのコマンドはない。`FsContinuousScrollForward` / `Back` は連結用であり、§1.470 のキーによる拡大 / 縮小や §1.726 のページ切替直後の表示位置とも別。
+- 方針: ページ単位表示の修飾なし `↑` / `↓` と通常のホイールを、**それぞれ独立に「ページ送り (既定) / ページ内スクロール」から選択**できるようにする。ページ内スクロールは表示中のページまたは見開きの範囲内で動かし、端で止めてページは送らない。左右キーのページ送り、既存の連結表示、編集やズームなどの入力は変更しない。
+- N 字: 通常スクロールとは別に、前方向・次方向の操作を `KeyAction` として割り当て可能にする。縦の端に着いたら綴じ方向に沿って横へ移り、次の列の反対側の縦端から読む。前方向は逆順。表示中のページ内で完結し、最後の列の端から自動でページは送らない。
+- 他アプリの調査 (コード・公式資料。実画面試験なし):
+  - NeeView: [公式コマンド一覧](https://neelabo.github.io/NeeView/ja-jp/command-list.html) の Type A では左右がページ送り、上下が本の切り替え。4 方向スクロールは割り当て可能だが既定キーなし。[方向スクロールの実装](https://github.com/neelabo/NeeView/blob/686a43362dc4b3c9f2ea014240dbba2d0e9fbcaa/NeeView/MainView/ViewTransformControl.cs#L153-L230) は表示領域の指定割合 (既定 25%) で動かし、移動不能時に別軸へ動かす設定もある。端 / 中央への位置合わせは別コマンド。
+  - NeeView の [N 字計算](https://github.com/neelabo/NeeView/blob/686a43362dc4b3c9f2ea014240dbba2d0e9fbcaa/NeeView/PageFrames/NScroll.cs#L84-L104) は縦を優先し、縦端で綴じ方向に横へ進み、反対側の縦端に戻す。Z 字なども選べる。[N 字単体とスクロール＋ページ移動](https://github.com/neelabo/NeeView/blob/686a43362dc4b3c9f2ea014240dbba2d0e9fbcaa/NeeView/PageFrames/PageFrameBox.cs#L1140-L1163) は別経路で、後者 (Type A のホイール) だけが終端でページを送る。
+  - Leeyes: [作者配布の 2.6.1 ZIP](http://www3.tokai.or.jp/boxes/leeyes/leeyes261.zip) の `help/keycustom.html` / `muscustom.html` / `setting.html` では、キー・マウスに大小のスクロールを割り当て、移動量や重なり幅を設定できる。端では隣の列 / 行へ折り返すか次のファイルへ進むかを選べ、両方有効なら折り返し優先。
+  - ZipPla: [公開フォークの既定キー](https://github.com/himamon/ZipPlaFork/blob/07955f5267e2fb92d6fc6e40fde2507d8fb07b3b/source/ZipPla/ViewerForm.cs#L15850-L15882) は上下がページ送り。左右は拡大鏡モードで [画像内のスクロールを試し](https://github.com/himamon/ZipPlaFork/blob/07955f5267e2fb92d6fc6e40fde2507d8fb07b3b/source/ZipPla/ViewerForm.cs#L8383-L8400)、動けない場合はページを送る。SumatraPDF は [公式マニュアル](https://www.sumatrapdfreader.org/docs/Scrolling-and-zooming#scroll-with-the-keyboard) 上、上下がスクロール、左右は横にはみ出す場合にスクロール、収まる場合にページ送り。
+- 設計・検証: 既存のパン・表示範囲の制限と入力処理に接続し、設定で選んだ文脈以外の固定矢印を変更しない。移動量・長押し・折り返し量、4 方向の個別コマンドや端への位置合わせを含めるかは着手時に決める。通常表示・見開き・回転・画面内に収まる画像、左右の綴じ方向、別ウィンドウ、設定の組み合わせを確認し、入力欄・IME・ダイアログ・編集・連結表示を退行させない。[キー仕様](keymap-spec.md) と [操作カスタマイズ計画](key-customization-impl-plan.md) は実装時に更新する。規模は設計時に見積もる / P3。
+
 ### 1.772 ページめくりの演出を「めくり」と「スライド」から選べるようにする — 利用者要望 (2026-11-12)
 
 - 状態: **未着手・次の次の版以降 (利用者決定 2026-11-12)**。
