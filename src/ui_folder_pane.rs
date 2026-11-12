@@ -594,6 +594,7 @@ impl App {
             cursor_scroll = FolderPaneCursorScroll::Idle;
         }
         let mut cursor_drawn = false;
+        let mut pointer_row_clicked = false;
         // Preserve a path and its in-row offset across automatic cache replacement.
         // Button/text minimum sizes can exceed the requested 24pt label height.
         // Reuse the pitch measured from the actual row allocation on the last draw.
@@ -667,9 +668,10 @@ impl App {
                     || ((row.expanded || row.has_children_or_unknown)
                         && arrow_resp.clicked_by(egui::PointerButton::Primary))
                 {
-                    // Pointer clicks target an already visible row. Retire only
-                    // their new reveal; keyboard/accessibility requests still scroll.
-                    self.folder_pane.cursor_scroll = FolderPaneCursorScroll::Idle;
+                    // Pointer input replaces the cursor without revealing it.
+                    // Retire the captured request before later rows can apply it.
+                    cursor_scroll = FolderPaneCursorScroll::Idle;
+                    pointer_row_clicked = true;
                 }
                 if cursor_scroll != FolderPaneCursorScroll::Idle && row.is_cursor {
                     cursor_drawn = true;
@@ -717,7 +719,10 @@ impl App {
                 },
             )
         });
-        if self.folder_pane.cursor_scroll == FolderPaneCursorScroll::Idle {
+        if pointer_row_clicked {
+            // Neither the old request nor refresh-following belongs to this cursor.
+            self.folder_pane.cursor_scroll = FolderPaneCursorScroll::Idle;
+        } else if self.folder_pane.cursor_scroll == FolderPaneCursorScroll::Idle {
             self.folder_pane.cursor_scroll = if cursor_drawn {
                 if self.folder_pane.has_pending() {
                     FolderPaneCursorScroll::FollowingRefresh

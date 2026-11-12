@@ -450,7 +450,7 @@ P2-2の不変条件は「未確定時の代替位置と利用者が選んだ位�
 利用者決定 (2026-11-12 夜、§1.769 の実機確認 依頼 40 から派生)。ツリーで行の名前、または ▶ / ▼ をマウスでクリックしたときは、その行を中央へ寄せない。押した行は既に見えているので、Windows のエクスプローラのナビゲーション ウィンドウと同じく、スクロール位置をそのままにする。
 
 - 今の作り (v5.1.0 から): 行のクリックは `set_cursor` を呼び、`set_cursor` は `cursor_scroll = Requested` を立てる。▶ / ▼ の `handle_tree_key(Left/Right)` (`collapse_cursor` / `expand_cursor`) も `Requested` を立てる。次のフレームの `render_folder_pane_tree` が cursor 行で `scroll_to_me(Align::Center)` を呼び、行を中央へ寄せる (`animated(false)` なので一瞬)。
-- 変えること: マウスの行クリック (名前・▶ / ▼) を処理したフレームでは、そのクリックで立った reveal 要求を取り下げる。新しい状態・フィールドは足さない。cursor・focus・開閉・移動の要求は今までどおり。
+- 変えること: マウスの行クリック (名前・▶ / ▼ の Primary) を処理したフレームでは、そのクリックで立った reveal 要求と、クリックで置き換わる前のカーソルに対する未消化の要求を取り下げる。クリック以後の行では旧要求による reveal を行わず、描画末尾でも旧要求の復元・`FollowingRefresh` の決定を行わず `Idle` を保つ。同じフレームでクリックより前に既に適用された reveal は戻さない。フレーム内のローカル変数で扱い、新しい状態・フィールドは足さない。cursor・focus・開閉・移動の要求は今までどおり。
 - 変えないこと: キー操作 (↑ ↓ ← → Enter、ゲームパッド)、ツリーを開いたときの現在地表示 (§11)、右側の一覧や Ctrl+↑↓・履歴など「クリック以外で現在地が変わる」ときの中央寄せ、ドライブ選択・↻ の再読み込み。これらは今の中央寄せのまま (「見える範囲に入れるだけ」にするのは次の版以降に検討)。
 - クリック後の移動の完了: クリックで cursor は `Explicit` になり、`sync_to_active` は reveal を要求しない。移動の完了で前の現在地の祖先の自動展開が閉じて行が増減しても、既存の path anchor 復元 (`FolderPaneScrollMemory`) のままとし、追加の reveal はしない。
 - まれな失敗は既定の割り切り方針による (書き込み・永続化なし)。
@@ -479,3 +479,24 @@ P2-2の不変条件は「未確定時の代替位置と利用者が選んだ位�
 対象は `15646a9d3` 上の未コミット差分。検証済み Rust 2ファイルの SHA-256 は `target/tree-click-source-hashes.json` に保存した。新規4件のうちマウス3件は修正前失敗→修正後成功、↓ の継続確認は両方成功。移動完了後の追加 reveal は実 App handler / worker 完了の回帰でも発生しなかった。
 
 指定により、本体lib全件・`build-dev.ps1`・`ui_snapshot`・製品起動・コミットは実施しない。全lib・確認用build・snapshot と最終受入は設計担当へ引き継ぐ。`docs/next-release-backlog.md` は変更していない。
+
+### 独立レビュー P2: 未消化の旧要求の復活 (2026-11-12)
+
+独立レビュー (`xhigh`) が `0bba3577f` を REVISE とし、設計担当が P2 を採用した。初回実装はフィールドだけを `Idle` にするため、描画前に `mem::take` したローカルの `Requested` が残っていた。旧カーソル行が列挙待ちで未表示なら `cursor_drawn == false` のまま末尾が旧要求を復元し、次フレームでクリック先が中央へ移動する。初回記録の「描画前に取り出した既存要求の処理は従来どおり」では、この失効済み要求を新カーソルへ持ち越す経路を残していた。
+
+このため§13の「変えること」を補足し、クリック以前に実行済みの reveal は維持しつつ、クリック以後の旧要求の適用と末尾の要求復元・`FollowingRefresh` 化を止める。ペインの永続状態は追加せず、当該描画のローカル変数だけで扱う。
+
+- `render_folder_pane_tree` のローカル `pointer_row_clicked` に実 Primary の行クリックを記録し、その場でローカル `cursor_scroll` も `Idle` にする。後続行は旧要求を適用せず、末尾はクリック済みならフィールドを `Idle` に確定し、旧要求の復元・`FollowingRefresh` の決定を通さない。クリック前に既に発行した reveal、非ポインター操作・AccessKit の要求所有は維持する。
+- 実 pointer press/release の回帰を名前・▶・▼の3件追加。旧カーソルの親を展開し、その初回実走査を既存 backend の gate で保留する。旧カーソル行が未表示、走査 pending、`Requested` が2フレーム持ち越されることを確認してクリックし、後続フレームと保留走査の完了後も offset・行Y座標・reveal回数を保持することを検査する。
+- **製品コード変更前**の `cargo nextest run -p mimageviewer --lib -E 'test(/retires_waiting_cursor_request/)' --no-fail-fast --retries 0 --no-tests fail` は **0成功 / 3失敗、exit100**。3件とも後続フレームの offset 検査で失敗した（名前/展開 `974.6875 → 800.6875`、折畳 `1003.6875 → 800.6875`）。証跡は `target/tree-click-p2-red.log`。前提確認の失敗やコンパイルエラーではない。
+
+検証対象は `0bba3577f` 上の未コミット差分、Windows MSVC / default features / test・dev profile。`target/769-env.ps1` を使用し、全 Cargo コマンドを `run-heavy.ps1 -Owner tree-click-impl` 経由で実行した。修正前・修正後とも先行する全件テストのロックを待ち、書き込み不可の警告後は指定の低優先度・6並列で続行した。
+
+| コマンド・範囲 | 結果 | 証跡 (`target/`) |
+| --- | --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/folder_pane/)' --no-fail-fast --retries 0 --no-tests fail` | **97成功 / 失敗0、13.194秒、exit0**。新規3件と既存 cursor reveal / AccessKit 回帰を含む | `tree-click-p2-related.log` |
+| `scripts/test-focused.ps1 -Path src/ui_folder_pane.rs,src/app/folder_pane_refresh_tests.rs` | **18件 / 48件の2群すべて成功、各exit0**。1.621秒 / 13.389秒、計66実行は上との重複を含む | `tree-click-p2-focused.log`、`test-focused/runs/20261112T144047347Z-4262ba62` / `20261112T144052760Z-ca06d733` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **exit0、20.91秒** | `tree-click-p2-check.log` |
+| 引数なし `cargo fmt`、`cargo fmt --check`、`git diff --check` | **各exit0** | `tree-click-p2-fmt.log` / `tree-click-p2-fmt-check.log`、終了時diff検査 |
+
+検証済み Rust 2ファイルの SHA-256 は `target/tree-click-p2-source-hashes.json` に保存し、検証後に同一であることを確認した。新規3件はすべて修正前失敗→修正後成功。本体lib全件・`build-dev.ps1`・`ui_snapshot`・製品起動・コミットは指定により実施せず、backlog は変更していない。独立再レビュー・全体検証と最終受入は設計担当へ引き継ぐ。

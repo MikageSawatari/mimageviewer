@@ -514,6 +514,111 @@ fn folder_pane_pointer_collapse_click_keeps_scroll() {
     folder_pane_pointer_arrow_keeps_scroll(true);
 }
 
+fn pointer_click_retires_waiting_cursor_request(arrow: bool, expanded: bool) {
+    let (mut app, ctx, mut frame, clicked) = scrollable_tree_click_fixture(expanded);
+    let waiting_parent = clicked.parent().unwrap().join("row-050");
+    let waiting_cursor = waiting_parent.join("waiting-child");
+    std::fs::create_dir(&waiting_cursor).unwrap();
+    let release = app.folder_pane.test_hold_next_scan(waiting_parent.clone());
+    app.folder_pane.set_cursor(waiting_parent);
+    let _ = app
+        .folder_pane
+        .handle_tree_key(crate::folder_pane::FolderPaneTreeKey::Right);
+    app.folder_pane.set_cursor(waiting_cursor.clone());
+    let rect = label_click_rect(&ctx, &clicked);
+    let offset = pane_scroll_state(&ctx).unclamped_offset().y;
+    let scrolls = tree_scrolls(&ctx);
+    // The expanded parent is still awaiting its first listing. Its child cursor
+    // cannot be drawn, so Requested must survive multiple real pane frames.
+    for _ in 0..2 {
+        navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+        assert!(app.folder_pane.has_pending());
+        assert!(
+            !app.folder_pane
+                .visible_rows()
+                .iter()
+                .any(|row| row.path == waiting_cursor)
+        );
+        assert_eq!(
+            app.folder_pane.cursor_scroll,
+            FolderPaneCursorScroll::Requested
+        );
+        assert_tree_click_position(&ctx, &clicked, offset, rect);
+    }
+    let pos = if arrow {
+        egui::pos2(
+            rect.left() - ctx.global_style().spacing.item_spacing.x - 12.0,
+            rect.center().y,
+        )
+    } else {
+        rect.center()
+    };
+    pointer_tree_click(&mut app, &ctx, &mut frame, pos);
+    let row = app
+        .folder_pane
+        .visible_rows()
+        .into_iter()
+        .find(|row| row.path == clicked)
+        .unwrap();
+    assert!(
+        row.is_cursor,
+        "the actual pointer handler must replace the missing cursor"
+    );
+    if arrow {
+        assert_eq!(row.expanded, !expanded);
+        assert!(app.folder_pane_open_pending.is_none());
+    } else {
+        assert_eq!(app.folder_pane_open_pending.as_ref().unwrap().path, clicked);
+    }
+    for _ in 0..4 {
+        navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+        assert_tree_click_position(&ctx, &clicked, offset, rect);
+        assert_eq!(app.folder_pane.cursor_scroll, FolderPaneCursorScroll::Idle);
+    }
+    release.send(()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+        settle(&mut app, &ctx);
+        assert_tree_click_position(&ctx, &clicked, offset, rect);
+        if !app.folder_pane.has_pending() && app.folder_pane_open_pending.is_none() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    for _ in 0..4 {
+        navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+        assert_tree_click_position(&ctx, &clicked, offset, rect);
+    }
+    assert!(
+        app.folder_pane
+            .visible_rows()
+            .iter()
+            .any(|row| row.path == waiting_cursor)
+    );
+    assert_eq!(
+        tree_scrolls(&ctx),
+        scrolls,
+        "the obsolete reveal must stay retired after the listing arrives"
+    );
+}
+
+#[test]
+fn folder_pane_pointer_label_click_retires_waiting_cursor_request() {
+    pointer_click_retires_waiting_cursor_request(false, false);
+}
+
+#[test]
+fn folder_pane_pointer_expand_click_retires_waiting_cursor_request() {
+    pointer_click_retires_waiting_cursor_request(true, false);
+}
+
+#[test]
+fn folder_pane_pointer_collapse_click_retires_waiting_cursor_request() {
+    pointer_click_retires_waiting_cursor_request(true, true);
+}
+
 #[test]
 fn folder_pane_pointer_click_then_keyboard_down_still_centers_cursor() {
     let (mut app, ctx, mut frame, clicked) = scrollable_tree_click_fixture(false);
