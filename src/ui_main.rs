@@ -18170,7 +18170,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.folder_pin_selected_source(idx),
         ) {
             let key = crate::path_key::normalize_keep_drive(&pin_container);
-            self.folder_pin_map.get(&key) == Some(&src)
+            self.folder_pin_map
+                .get(&key)
+                .is_some_and(|pin| pin.source == src)
         } else {
             false
         }
@@ -20595,7 +20597,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.folder_pin_selected_source(idx),
         ) {
             let key = crate::path_key::normalize_keep_drive(&pin_container);
-            if self.folder_pin_map.get(&key) == Some(&src) {
+            if self
+                .folder_pin_map
+                .get(&key)
+                .is_some_and(|pin| pin.source == src)
+            {
                 flags.push("ピ");
             }
         }

@@ -7421,3 +7421,12 @@ canonical origin として捕捉済みで、fork する `ViewerContextBundle` �
 viewport・detached 述語・新しい状態は加えていない。症状を消す guard ではなく、終了境界を 1 つの所有者に揃える構造修正である
 (設計担当 ClaudeCode と独立 Sol/xhigh 再レビューの双方が、症状パッチでなく構造的修正であることに同意)。記録は [search-from-item-plan.md](search-from-item-plan.md) M9。
 
+### 代表サムネイルの手動範囲指定の受付（2026-11-11、§1.764）
+
+設計担当が確認済みの再レビュー指摘に従い、`ui_dialogs/cover_crop.rs` の共有受付で既存の
+`main_folder_history_available()` を参照し、main以外の投影中には範囲指定を受け付けない。
+メニュー表示だけに頼らず、機能の対象ownerを開始受付でも一貫させる構造修正で、設計§8.1の別窓非対応を満たす。
+既存のowner比較と一時投影の抑止を再利用し、detachedの述語本体・registry・viewport・保存・timerは変更しない。
+別窓を実際にmountするheadlessテストで拒否を確認し、mainへ戻ると同じ本を再び受け付けることも検査する。
+独立追レビューはこの受付を対象ownerの構造的一致としてACCEPT。
+焦点検証・確認用buildの結果は `cover-crop-plan.md` §15.4に記録した。

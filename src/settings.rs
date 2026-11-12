@@ -4996,6 +4996,9 @@ pub struct Settings {
     /// 一覧のコンテナを代表画像の代わりに種類アイコンで表示する。
     #[serde(default)]
     pub thumb_container_icon_kinds: crate::grid_item::ContainerIconKinds,
+    /// 書庫・PDF のつながった表紙から表表紙を自動で切り出す。
+    #[serde(default)]
+    pub thumb_cover_auto_crop: bool,
     /// サムネイル右下に動画・音声の長さを表示する。
     #[serde(default = "default_true")]
     pub thumb_show_media_duration: bool,
@@ -7978,6 +7981,7 @@ impl Default for Settings {
             thumb_name_prioritize_width: false,
             thumb_show_type_icon: default_thumb_show_type_icon(),
             thumb_container_icon_kinds: crate::grid_item::ContainerIconKinds::NONE,
+            thumb_cover_auto_crop: false,
             selection_info_display_mode: SelectionInfoDisplayMode::Tooltip,
             thumb_show_media_duration: true,
             thumb_show_resume_meter: true,
@@ -11358,6 +11362,39 @@ mod tests {
                 enabled
             );
         }
+    }
+
+    #[test]
+    fn thumb_cover_auto_crop_default_missing_and_db_roundtrip() {
+        assert!(!Settings::default().thumb_cover_auto_crop);
+        assert!(
+            !serde_json::from_str::<Settings>("{}")
+                .unwrap()
+                .thumb_cover_auto_crop
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(temp.path()).unwrap();
+        for enabled in [false, true] {
+            let settings = Settings {
+                thumb_cover_auto_crop: enabled,
+                ..Settings::default()
+            };
+            let restored: Settings =
+                serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(restored.thumb_cover_auto_crop, enabled);
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings().unwrap().thumb_cover_auto_crop,
+                enabled
+            );
+        }
+        let conn = rusqlite::Connection::open(temp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'thumb_cover_auto_crop'",
+            [],
+        )
+        .unwrap();
+        assert!(!db.load_into_settings().unwrap().thumb_cover_auto_crop);
     }
 
     #[test]

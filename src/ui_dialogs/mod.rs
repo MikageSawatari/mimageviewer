@@ -24,6 +24,7 @@ pub(crate) mod collections;
 pub mod content_restore;
 pub(crate) mod context_menu;
 mod context_shortcuts;
+pub(crate) mod cover_crop;
 pub(crate) mod editing_addon;
 pub(crate) mod epub_batch_convert;
 pub(crate) mod epub_convert;

@@ -221,10 +221,8 @@ fn read_value_for_source(
         DisplaySource::Book { kind, env } if row.is_some() => {
             match resolve_book_cover(path, *kind, env) {
                 BookCover::Readable(cover) => {
-                    rotation_key = crate::edit_source::caption_rotation_key(
-                        &cover.location,
-                        env.books_root.as_deref(),
-                    );
+                    // Resolution already used the worker's effective bookshelf root.
+                    rotation_key = cover.rotation_key;
                     Some(CurrentCaptionSource::Book {
                         signature: cover.signature,
                         cover_ref: cover.cover_ref,

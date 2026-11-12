@@ -1427,6 +1427,13 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
             "選んだ種類は代表画像を使わずアイコンで表示します。書庫の中のフォルダは「書庫」に従います。画像・動画・音声と、本を開いた後のページはそのままです。固定した代表画像やキャッシュは残り、外すと再び表示されます。",
         );
     });
+    anchored(ui, state, "thumbnail/cover-auto-crop", |ui, state| {
+        ui.checkbox(
+            &mut state.settings.thumb_cover_auto_crop,
+            "つながった表紙から表表紙を自動で切り出す (書庫・PDF の本)",
+        );
+        ui.small("既定の綴じ方向で判定します。手動で指定した範囲を優先し、判定できない表紙は全体を表示します。");
+    });
     anchored(ui, state, "thumbnail/name-font-scale", |ui, state| {
         ui.horizontal_wrapped(|ui| {
             let label = ui.label("名前の文字サイズ:");

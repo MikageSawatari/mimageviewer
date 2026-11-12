@@ -242,7 +242,7 @@ pub(crate) struct ReusedSmartFolderMetadata {
     mask_paths: HashSet<String>,
     conceal_paths: HashSet<String>,
     comic_paths: HashSet<String>,
-    folder_pin_map: HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    folder_pin_map: HashMap<String, crate::folder_thumb_pins::FolderPin>,
     converted_archive_cache_paths: HashMap<String, ConvertedArchiveSourceState>,
 }
 
@@ -321,7 +321,7 @@ pub(crate) struct SmartFolderPreparedGrid {
     mask_pages: HashSet<usize>,
     conceal_pages: HashSet<usize>,
     comic_pages: HashSet<usize>,
-    folder_pin_map: HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    folder_pin_map: HashMap<String, crate::folder_thumb_pins::FolderPin>,
     converted_archive_cache_paths: HashMap<String, ConvertedArchiveSourceState>,
     color_cache_map: Option<Arc<std::sync::RwLock<HashMap<String, crate::catalog::CacheEntry>>>>,
     color_catalog: Option<Arc<crate::catalog::CatalogDb>>,
@@ -6203,7 +6203,7 @@ pub(crate) struct PreparedVideoFolderPinSeed {
 
 pub(crate) fn prepare_video_folder_pin_seeds(
     items: &[GridItem],
-    folder_pin_map: &HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    folder_pin_map: &HashMap<String, crate::folder_thumb_pins::FolderPin>,
     folder_pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
     folder_thumb_sort: crate::settings::SortOrder,
     folder_thumb_depth: u32,
@@ -6246,11 +6246,10 @@ pub(crate) fn prepare_video_folder_pin_seeds(
             continue;
         };
         resolved_seeds.push(PreparedVideoFolderPinSeed {
-            cache_key: format!(
-                "{}{}{}",
-                base_key,
-                crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
-                resolved.source_id
+            cache_key: resolved.pinned_cache_key(
+                &base_key,
+                crate::folder_thumb_pins::PinKeyMode::Exact,
+                None,
             ),
             video_path: resolved.abs_path,
             mtime: resolved.mtime,
@@ -13716,7 +13715,8 @@ mod tests {
             crate::catalog::FolderThumbProvenance::Seeded,
         )
         .unwrap();
-        let key = crate::thumb_loader::pinned_folder_row_key(&base, &resolved.source_id, None);
+        let key =
+            resolved.pinned_cache_key(&base, crate::folder_thumb_pins::PinKeyMode::Exact, None);
         let catalog = crate::catalog::CatalogDb::open(
             &cache,
             &smart_folder_synthetic_path(snapshot.definition.id),

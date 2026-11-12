@@ -503,6 +503,18 @@ sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを
 
 ## 4. 新機能追加時のチェックリスト
 
+表紙の手動範囲（§1.764）の準備は、論理コンテナ・明示ページ・設定値と既存 handle だけを UI で捕捉する。
+ピン解決・stat・書庫列挙・既定本棚パスの解決・画像 decode/縮小を一つの `cover-crop-prepare` worker で行う。
+準備全体を perf event で計測し、完了時に repaint、UI は非blocking poll と世代照合だけを行う。
+閉じた modal の結果は破棄し、UI で worker を待たない。回転はメモリのページ角度 owner だけを引く。
+保存は既存のピン書込み経路を使い、同一transaction内でsourceを先にUPSERTし、範囲・束縛を別UPDATEで書く。
+失敗はログとトーストで通知する。
+自動切り出しも同じ準備 worker 内で行う。UI では ON/OFF・既定綴じ方向と編集 preview DB の handle だけを捕捉する。
+固定ページの有効な preview 照合、近傍ページの寸法先読み、高さ256の raster 解析は worker の仕事である。
+ZIP は最大8×256KBの先頭読み、PDF/EPUB は代表と同じ password・`ReadTarget` の `PageSizes` を使う。
+通常のサムネイル生成では cache miss の時だけ判定し、`CacheOnly` や idle の周期起床に解析を足さない。
+設定変更の反映には既存の種類表示変更と同じ一覧読み直しを使い、専用の live rebuild 状態を追加しない。
+
 AI 説明文の削除（§1.730）は UI で既存一覧の対象を捕捉するだけとし、説明文 DB の open、
 存在・status の集計、単一 transaction の DELETE を worker 上に置く。root は完了 channel を
 非blocking poll し、worker 完了時だけ repaint を要求する。全 phase を同じ可視 modal にし、

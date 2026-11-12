@@ -17918,8 +17918,10 @@ pub struct App {
     /// 現在ロード済み items の親コンテナごとのピン source キャッシュ。
     /// `load_folder` 完了時に `lookup_many` で一括取得し、`make_load_request` から
     /// 同期参照する (per-frame DB アクセス回避)。キーは `normalize_keep_drive(container)`。
+    pub(crate) cover_crop_dialog: Option<crate::ui_dialogs::cover_crop::CoverCropDialog>,
+    pub(crate) cover_crop_generation: u64,
     pub(crate) folder_pin_map:
-        std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+        std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin>,
     /// Current drive-list seed's provenance, keyed by the pinned tile prefix.
     /// It comes from the already-read parent catalog row, without source stat.
     drive_list_seed_proofs:
@@ -21634,6 +21636,8 @@ impl App {
             book_bookmark_service,
             video_chapter_thumb_db,
             folder_thumb_pin_db,
+            cover_crop_dialog: None,
+            cover_crop_generation: 0,
             folder_pin_map: std::collections::HashMap::new(),
             drive_list_seed_proofs: std::collections::HashMap::new(),
             converted_archive_cache_paths: std::collections::HashMap::new(),
@@ -23365,7 +23369,7 @@ impl App {
                 let Some((mtime, file_size)) = self.image_metas.get(idx).and_then(|m| *m) else {
                     continue;
                 };
-                let Some(req) = make_load_request_with_visibility(
+                let Some(req) = make_load_request_with_auto_crop(
                     item,
                     idx,
                     mtime,
@@ -23382,6 +23386,7 @@ impl App {
                     self.video_pin_db.as_ref(),
                     use_full_path_keys,
                     self.listing_file_type_visibility(),
+                    self.thumbnail_auto_crop_identity(),
                 ) else {
                     continue;
                 };
@@ -24329,6 +24334,7 @@ impl App {
             self.composition_editor_modal_active() => "book_composition_editor",
             self.everything_search_progress_visible() => "everything_search",
             self.capture_selection_open() => "clipboard_capture_selection",
+            self.cover_crop_dialog_open() => "cover_crop",
             self.sidecar_restore_active() => "sidecar_restore",
             self.remote_session_blocks_local_control() => "remote_session",
             self.remote_connection_dialog_open() => "remote_connection",
@@ -32648,7 +32654,7 @@ impl App {
         // (Codex Phase B P2 指摘)。pin DB lookup は load_folder 1 回あたり 1 度だけ実行。
         let pin_map_for_existing: std::collections::HashMap<
             String,
-            crate::folder_thumb_pins::FolderPinSource,
+            crate::folder_thumb_pins::FolderPin,
         > = if let Some(db) = self.folder_thumb_pin_db.as_ref() {
             let containers: Vec<&std::path::Path> = items
                 .iter()
@@ -32672,7 +32678,7 @@ impl App {
             .iter()
             .zip(image_metas.iter())
             .flat_map(|(it, meta)| {
-                folder_thumb_existing_keys_for_with_visibility(
+                folder_thumb_existing_keys_for_with_auto_crop(
                     it,
                     *meta,
                     &pin_map_for_existing,
@@ -32681,6 +32687,7 @@ impl App {
                     self.settings.folder_thumb_depth,
                     use_full_path_cache_keys,
                     &self.settings.file_type_visibility,
+                    configured_thumbnail_auto_crop(&self.settings),
                 )
             })
             .collect();
@@ -35188,7 +35195,7 @@ impl App {
 
         let pin_map_for_existing: std::collections::HashMap<
             String,
-            crate::folder_thumb_pins::FolderPinSource,
+            crate::folder_thumb_pins::FolderPin,
         > = if let Some(db) = self.folder_thumb_pin_db.as_ref() {
             let containers: Vec<&std::path::Path> = items
                 .iter()
@@ -35212,7 +35219,7 @@ impl App {
             .iter()
             .zip(image_metas.iter())
             .flat_map(|(it, meta)| {
-                folder_thumb_existing_keys_for_with_visibility(
+                folder_thumb_existing_keys_for_with_auto_crop(
                     it,
                     *meta,
                     &pin_map_for_existing,
@@ -35221,6 +35228,7 @@ impl App {
                     self.settings.folder_thumb_depth,
                     true,
                     &self.settings.file_type_visibility,
+                    configured_thumbnail_auto_crop(&self.settings),
                 )
             })
             .collect();
@@ -35645,7 +35653,7 @@ impl App {
         // pinned 形式の cache 行も保護対象に入れる (Codex Phase B P2 指摘、load_folder と同様)。
         let pin_map_for_existing: std::collections::HashMap<
             String,
-            crate::folder_thumb_pins::FolderPinSource,
+            crate::folder_thumb_pins::FolderPin,
         > = if let Some(db) = self.folder_thumb_pin_db.as_ref() {
             let containers: Vec<&std::path::Path> = items
                 .iter()
@@ -35668,7 +35676,7 @@ impl App {
             .iter()
             .zip(image_metas.iter())
             .flat_map(|(it, meta)| {
-                folder_thumb_existing_keys_for_with_visibility(
+                folder_thumb_existing_keys_for_with_auto_crop(
                     it,
                     *meta,
                     &pin_map_for_existing,
@@ -35679,6 +35687,7 @@ impl App {
                     // 同名コンテナが共存しうるので basename だと衝突する)
                     true,
                     &self.settings.file_type_visibility,
+                    configured_thumbnail_auto_crop(&self.settings),
                 )
             })
             .collect();
@@ -36076,7 +36085,7 @@ impl App {
 
         let pin_map_for_existing: std::collections::HashMap<
             String,
-            crate::folder_thumb_pins::FolderPinSource,
+            crate::folder_thumb_pins::FolderPin,
         > = if let Some(db) = self.folder_thumb_pin_db.as_ref() {
             let containers: Vec<&std::path::Path> =
                 items.iter().filter_map(GridItem::container_path).collect();
@@ -36092,7 +36101,7 @@ impl App {
             .iter()
             .zip(image_metas.iter())
             .flat_map(|(it, meta)| {
-                folder_thumb_existing_keys_for_with_visibility(
+                folder_thumb_existing_keys_for_with_auto_crop(
                     it,
                     *meta,
                     &pin_map_for_existing,
@@ -36101,6 +36110,7 @@ impl App {
                     self.settings.folder_thumb_depth,
                     true,
                     &self.settings.file_type_visibility,
+                    configured_thumbnail_auto_crop(&self.settings),
                 )
             })
             .collect();
@@ -39618,7 +39628,7 @@ impl App {
             .collect();
         let pin_map_for_existing: std::collections::HashMap<
             String,
-            crate::folder_thumb_pins::FolderPinSource,
+            crate::folder_thumb_pins::FolderPin,
         > = if let Some(db) = self.folder_thumb_pin_db.as_ref() {
             let containers: Vec<&std::path::Path> =
                 items.iter().filter_map(GridItem::container_path).collect();
@@ -39634,7 +39644,7 @@ impl App {
             .iter()
             .zip(image_metas.iter())
             .flat_map(|(it, meta)| {
-                folder_thumb_existing_keys_for_with_visibility(
+                folder_thumb_existing_keys_for_with_auto_crop(
                     it,
                     *meta,
                     &pin_map_for_existing,
@@ -39643,6 +39653,7 @@ impl App {
                     self.settings.folder_thumb_depth,
                     true,
                     &self.settings.file_type_visibility,
+                    configured_thumbnail_auto_crop(&self.settings),
                 )
             })
             .collect();
@@ -40341,8 +40352,16 @@ impl App {
         // existing_keys は **全階層** のキー (全 leaf entry_name + 全 dir の zipdir:) を
         // 集める。ルート階層しか materialize しないので、これがないと深い階層の
         // サムネが delete_missing で stale 削除されて再生成ループになる (Codex P2)。
-        let existing_keys: std::collections::HashSet<String> =
+        let mut existing_keys: std::collections::HashSet<String> =
             tree.all_cache_keys().into_iter().collect();
+        let auto = configured_thumbnail_auto_crop(&self.settings);
+        let auto_zipdir_keys: Vec<_> = existing_keys
+            .iter()
+            .filter(|key| key.starts_with("zipdir:"))
+            .flat_map(|key| {
+                representative_existing_keys(key, &self.settings.file_type_visibility, auto)
+            })
+            .collect();
         let mut pinned_keys = Vec::new();
         // 本ごとピン (Model B) の代表サムネは zipdir:{prefix}#pin:{entry} キーで保存される。
         // base の zipdir:{prefix} しか existing に無いと delete_missing が pinned 行を毎回
@@ -40390,41 +40409,65 @@ impl App {
                 .iter()
                 .filter_map(|(prefix, book_key)| {
                     let norm = crate::path_key::normalize_keep_drive(book_key);
-                    match pin_map.get(&norm) {
-                        Some(crate::folder_thumb_pins::FolderPinSource::ZipEntry {
-                            zip_rel,
-                            entry,
-                        }) if zip_rel.is_empty() => Some(format!(
-                            "{}{}{}",
-                            crate::grid_item::zipdir_cache_key(prefix),
-                            crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
-                            entry
-                        )),
-                        Some(
-                            source @ crate::folder_thumb_pins::FolderPinSource::ZipDir {
-                                zip_rel,
-                                ..
-                            },
-                        ) if zip_rel.is_empty() => resolve_pin_target_cascaded(
+                    let pin = pin_map.get(&norm)?;
+                    let special =
+                        match &pin.source {
+                            crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+                                zip_rel, ..
+                            } if zip_rel.is_empty() => Some(prefix.as_str()),
+                            crate::folder_thumb_pins::FolderPinSource::ZipDir {
+                                zip_rel, ..
+                            } if zip_rel.is_empty() => None,
+                            _ => return None,
+                        };
+                    let resolved = if special.is_some() {
+                        // This spelling has no stamp. Reuse the known logical source without a new UI stat.
+                        crate::folder_thumb_pins::resolve_pin_target_cascaded_via_with_metadata(
                             book_key,
-                            source,
+                            pin,
+                            |_| None,
+                            |_| Some((0, 0)),
+                            0,
+                        )
+                    } else {
+                        resolve_pin_target_cascaded(
+                            book_key,
+                            pin,
                             Some(pin_db.as_ref()),
                             self.settings.folder_thumb_depth as usize,
                         )
-                        .map(|resolved| {
-                            format!(
-                                "{}{}{}",
-                                crate::grid_item::zipdir_cache_key(prefix),
-                                crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
-                                resolved.source_id,
-                            )
-                        }),
-                        _ => None,
-                    }
+                    };
+                    resolved.map(|resolved| {
+                        let item = GridItem::ZipFile(tree.zip_path.clone());
+                        let base = crate::grid_item::zipdir_cache_key(prefix);
+                        let plain = pinned_cache_key_with_auto_crop(
+                            &item,
+                            &resolved,
+                            &base,
+                            special,
+                            &self.settings.file_type_visibility,
+                            None,
+                        );
+                        let current = pinned_cache_key_with_auto_crop(
+                            &item,
+                            &resolved,
+                            &base,
+                            special,
+                            &self.settings.file_type_visibility,
+                            auto,
+                        );
+                        let mut keys = vec![plain.clone()];
+                        if current != plain {
+                            keys.push(current);
+                        }
+                        keys
+                    })
                 })
+                .flatten()
                 .collect();
             pinned_keys = pinned;
         }
+        existing_keys.extend(auto_zipdir_keys);
         let mut prepared = if let Some(nav) = book_nav {
             let (items, image_metas) = book_materialization::materialize_archive_level(
                 &nav.tree,
@@ -43764,7 +43807,7 @@ impl App {
         prepared: crate::filename_stack_ui::StackPreparedItems,
         existing_keys: std::collections::HashSet<String>,
         folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
-        pin_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+        pin_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin>,
         select: Option<usize>,
         hydration_intent: StartupListIntent,
     ) {
@@ -44037,7 +44080,7 @@ impl App {
             page_edit_snapshot::PageEditProjection,
         )>,
         prepared_pin_map: Option<
-            std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+            std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin>,
         >,
         prepared_rating_tags: Option<(
             std::collections::HashMap<usize, u8>,
@@ -44107,7 +44150,7 @@ impl App {
             page_edit_snapshot::PageEditProjection,
         )>,
         prepared_pin_map: Option<
-            std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+            std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin>,
         >,
         mut prepared_rating_tags: Option<(
             std::collections::HashMap<usize, u8>,
@@ -46498,11 +46541,10 @@ impl App {
                 &base_key,
                 self.listing_file_type_visibility(),
             );
-            let pinned_key = format!(
-                "{}{}{}",
-                base_key,
-                crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
-                resolved.source_id,
+            let pinned_key = resolved.pinned_cache_key(
+                &base_key,
+                crate::folder_thumb_pins::PinKeyMode::Exact,
+                None,
             );
 
             // video_pins.db の WebP (= フルスクリーン HUD でユーザーがピン留めした
@@ -46744,7 +46786,7 @@ impl App {
                         let pinned_prefix =
                             format!("{}{}", key, crate::thumb_loader::CACHE_KEY_PIN_SUFFIX);
                         let pinned_entry = cat
-                            .load_latest_with_prefix(&pinned_prefix)
+                            .load_latest_uncropped_with_prefix_matching(&pinned_prefix, None)
                             .ok()
                             .flatten()
                             .map(|(_, entry)| entry);
@@ -46794,7 +46836,7 @@ impl App {
                 );
                 let pinned_prefix = format!("{}{}", key, crate::thumb_loader::CACHE_KEY_PIN_SUFFIX);
                 let pinned_entry = cat
-                    .load_latest_with_prefix(&pinned_prefix)
+                    .load_latest_uncropped_with_prefix_matching(&pinned_prefix, None)
                     .ok()
                     .flatten()
                     .map(|(_, entry)| entry);
@@ -46998,7 +47040,7 @@ impl App {
     }
 
     fn apply_folder_pin_aliases(
-        pins: &mut HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+        pins: &mut HashMap<String, crate::folder_thumb_pins::FolderPin>,
         aliases: &[(String, String)],
     ) {
         for (literal_key, effective_key) in aliases {
@@ -47061,7 +47103,7 @@ impl App {
         let container_key = crate::path_key::normalize_keep_drive(container);
         self.folder_pin_map
             .get(&container_key)
-            .is_some_and(|pinned| pinned == &source)
+            .is_some_and(|pinned| pinned.source == source)
     }
 
     /// 指定 container の代表サムネピンを `source` に設定 (上書き) し、再ロード予約を立てる。
@@ -47083,29 +47125,61 @@ impl App {
         };
         match db.set(container, &source) {
             Ok(()) => {
-                self.caption_display.clear();
-                self.invalidate_converted_archive_pin_root_states();
-                let key = crate::path_key::normalize_keep_drive(container);
-                self.folder_pin_map.insert(key, source);
-                self.invalidate_smart_folder_resort_metadata();
-                self.folder_thumb_pin_dirty.insert(container.to_path_buf());
-                crate::logger::log(format!("folder_thumb_pin set: {}", container.display()));
-                if self.zip_nav.is_some() {
-                    self.record_current_container_content_identity(
-                        crate::content_identity::ContentIdentityTrigger::Edit,
-                    );
-                } else {
-                    self.record_content_identity_for_path(
-                        container,
-                        crate::content_identity::ContentIdentityTrigger::Edit,
-                    );
-                }
+                self.folder_thumb_pin_saved(container, source.into());
                 true
             }
             Err(e) => {
                 crate::logger::log(format!("folder_thumb_pin set failed: {e}"));
                 false
             }
+        }
+    }
+
+    pub(crate) fn set_folder_thumb_pin_with_cover_crop(
+        &mut self,
+        container: &Path,
+        source: crate::folder_thumb_pins::FolderPinSource,
+        cover_crop: Option<crate::folder_thumb_pins::CoverCrop>,
+    ) -> bool {
+        let Some(db) = self.user_folder_thumb_pin_db() else {
+            return false;
+        };
+        match db.set_with_cover_crop(container, &source, cover_crop) {
+            Ok(()) => {
+                self.folder_thumb_pin_saved(
+                    container,
+                    crate::folder_thumb_pins::FolderPin { source, cover_crop },
+                );
+                true
+            }
+            Err(error) => {
+                crate::logger::log(format!("folder_thumb_pin crop set failed: {error}"));
+                false
+            }
+        }
+    }
+
+    fn folder_thumb_pin_saved(
+        &mut self,
+        container: &Path,
+        pin: crate::folder_thumb_pins::FolderPin,
+    ) {
+        self.caption_display.clear();
+        self.invalidate_converted_archive_pin_root_states();
+        let key = crate::path_key::normalize_keep_drive(container);
+        self.folder_pin_map.insert(key, pin);
+        self.invalidate_smart_folder_resort_metadata();
+        self.folder_thumb_pin_dirty.insert(container.to_path_buf());
+        crate::logger::log(format!("folder_thumb_pin set: {}", container.display()));
+        if self.zip_nav.is_some() {
+            self.record_current_container_content_identity(
+                crate::content_identity::ContentIdentityTrigger::Edit,
+            );
+        } else {
+            self.record_content_identity_for_path(
+                container,
+                crate::content_identity::ContentIdentityTrigger::Edit,
+            );
         }
     }
 
@@ -47147,7 +47221,7 @@ impl App {
     pub(crate) fn folder_thumb_pin_for(
         &self,
         container: &std::path::Path,
-    ) -> Option<&crate::folder_thumb_pins::FolderPinSource> {
+    ) -> Option<&crate::folder_thumb_pins::FolderPin> {
         let key = crate::path_key::normalize_keep_drive(container);
         self.folder_pin_map.get(&key)
     }
@@ -47248,7 +47322,7 @@ impl App {
         );
 
         let matches_current_pin = match (&existing_pin, &selected_source) {
-            (Some(a), Some(b)) => a == b,
+            (Some(a), Some(b)) => &a.source == b,
             _ => false,
         };
 
@@ -47333,7 +47407,10 @@ impl App {
             let Some(source) = self.folder_pin_selected_source(idx) else {
                 return;
             };
-            if self.folder_thumb_pin_for(&book_key) == Some(&source) {
+            if self
+                .folder_thumb_pin_for(&book_key)
+                .is_some_and(|pin| pin.source == source)
+            {
                 if !self.remove_folder_thumb_pin(&book_key) {
                     return;
                 }
@@ -47368,7 +47445,7 @@ impl App {
             return;
         };
         let existing = self.folder_thumb_pin_for(&container).cloned();
-        if existing.as_ref() == Some(&source) {
+        if existing.as_ref().is_some_and(|pin| pin.source == source) {
             // 解除は無条件で許可 (DB 上の dead pin を掃除できるように)
             self.remove_folder_thumb_pin(&container);
             return;
@@ -57270,21 +57347,26 @@ impl App {
                 textures_created += 1;
                 // 見開きの縦横判定はテクスチャ寿命に依存させない。元寸法が無い
                 // 旧 cache 等では、従来の判定と同じくロード済み画像寸法を使う。
-                match self.resolve_preview_coverage_for_display(i, source_coverage) {
-                    Ok(crate::source_coverage::SourceCoverage::Known(geometry)) => {
-                        self.record_page_dims_for_spread(i, geometry.coordinate_dims.as_tuple());
-                    }
-                    Ok(crate::source_coverage::SourceCoverage::FullSource) => {
-                        if let Some(dims) = source_dims
-                            .or_else(|| Some((u32::try_from(w).ok()?, u32::try_from(h).ok()?)))
-                        {
-                            self.record_thumbnail_page_dims_for_spread(i, dims);
+                if self.items[i].has_page_data() || matches!(self.items[i], GridItem::Video(_)) {
+                    match self.resolve_preview_coverage_for_display(i, source_coverage) {
+                        Ok(crate::source_coverage::SourceCoverage::Known(geometry)) => {
+                            self.record_page_dims_for_spread(
+                                i,
+                                geometry.coordinate_dims.as_tuple(),
+                            );
                         }
+                        Ok(crate::source_coverage::SourceCoverage::FullSource) => {
+                            if let Some(dims) = source_dims
+                                .or_else(|| Some((u32::try_from(w).ok()?, u32::try_from(h).ok()?)))
+                            {
+                                self.record_thumbnail_page_dims_for_spread(i, dims);
+                            }
+                        }
+                        Ok(crate::source_coverage::SourceCoverage::Unknown) | Err(_) => {}
                     }
-                    Ok(crate::source_coverage::SourceCoverage::Unknown) | Err(_) => {}
-                }
-                if let Some(dims) = layout_dims {
-                    self.record_page_layout_dims_for_spread(i, dims);
+                    if let Some(dims) = layout_dims {
+                        self.record_page_layout_dims_for_spread(i, dims);
+                    }
                 }
                 // auto_aspect: グリッド消費者だけが新規 Loaded の比率を記録。
                 // source_dims が None なら ColorImage の (w, h) を fallback として使う
@@ -58035,7 +58117,7 @@ impl App {
                 return PriorityThumbnailAdmission::MissingMetadata;
             };
             self.items.get(idx).and_then(|item| {
-                make_load_request_with_visibility(
+                make_load_request_with_auto_crop(
                     item,
                     idx,
                     mtime,
@@ -58052,6 +58134,7 @@ impl App {
                     self.video_pin_db.as_ref(),
                     use_full_path_keys,
                     self.listing_file_type_visibility(),
+                    self.thumbnail_auto_crop_identity(),
                 )
             })
         };
@@ -58446,7 +58529,7 @@ impl App {
                     continue;
                 };
                 self.items.get(i).and_then(|item| {
-                    make_load_request_with_visibility(
+                    make_load_request_with_auto_crop(
                         item,
                         i,
                         mtime,
@@ -58463,6 +58546,7 @@ impl App {
                         self.video_pin_db.as_ref(),
                         use_full_path_keys,
                         self.listing_file_type_visibility(),
+                        self.thumbnail_auto_crop_identity(),
                     )
                 })
             };
@@ -59095,7 +59179,7 @@ impl App {
             // T54: Ctrl+S 検索結果は full-path キーで衝突回避 (= idle upgrade も同じく)
             let use_full_path_keys = self.use_full_path_cache_keys();
             let Some(mut req) = self.items.get(i).and_then(|item| {
-                make_load_request_with_visibility(
+                make_load_request_with_auto_crop(
                     item,
                     i,
                     mtime,
@@ -59112,6 +59196,7 @@ impl App {
                     self.video_pin_db.as_ref(),
                     use_full_path_keys,
                     self.listing_file_type_visibility(),
+                    self.thumbnail_auto_crop_identity(),
                 )
             }) else {
                 continue;
@@ -101486,6 +101571,7 @@ impl App {
         self.show_stats_dialog_window(ctx);
         self.show_omitted_entries_dialog(ctx);
         self.show_rotation_reset_confirm_dialog(ctx);
+        self.show_cover_crop_dialog(ctx);
         let context_nav = self.show_context_menu(ctx);
         self.render_main_dialogs_after_context(ctx, main_viewer_blocked);
         self.poll_pdf_enumerate();
@@ -102664,7 +102750,7 @@ fn make_drive_list_pin_load_request(
     idx: usize,
     folder_thumb_sort: crate::settings::SortOrder,
     folder_thumb_depth: u32,
-    pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin>,
     drive_list_seed_proofs: &std::collections::HashMap<
         String,
         crate::thumb_loader::DriveListSeedProof,
@@ -102688,7 +102774,7 @@ fn make_drive_list_pin_load_request_with_visibility(
     idx: usize,
     folder_thumb_sort: crate::settings::SortOrder,
     folder_thumb_depth: u32,
-    pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin>,
     drive_list_seed_proofs: &std::collections::HashMap<
         String,
         crate::thumb_loader::DriveListSeedProof,
@@ -102725,7 +102811,7 @@ fn make_drive_list_pin_load_request_with_visibility(
         .get(&cache_key_prefix)
         .cloned()
         .or_else(|| {
-            match source {
+            match &source.source {
                 crate::folder_thumb_pins::FolderPinSource::File {
                     rel,
                     kind: crate::folder_thumb_pins::FileKind::PdfFile,
@@ -102752,7 +102838,7 @@ fn make_drive_list_pin_load_request_with_visibility(
         pinned_only: Some(crate::thumb_loader::PinnedOnlyRequest {
             cache_key_prefix,
             seed_proof,
-            source: source.clone(),
+            source: source.source.clone(),
         }),
         ..Default::default()
     })
@@ -102920,7 +103006,7 @@ fn make_load_request(
     pdf_password: Option<&str>,
     folder_thumb_sort: Option<crate::settings::SortOrder>,
     folder_thumb_depth: u32,
-    pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin>,
     converted_archive_cache_paths: &std::collections::HashMap<String, ConvertedArchiveSourceState>,
     archive_source_override: Option<&std::path::Path>,
     current_folder: Option<&std::path::Path>,
@@ -102987,6 +103073,111 @@ fn parent_row_for_item(
     })
 }
 
+/// Settings alone are used while preparing a new list; its previous mounted
+/// context (possibly Drive) must not affect the incoming cache namespace.
+fn configured_thumbnail_auto_crop(
+    settings: &crate::settings::Settings,
+) -> Option<crate::cover_auto_crop::AutoCropIdentity> {
+    settings
+        .thumb_cover_auto_crop
+        .then(|| crate::cover_auto_crop::AutoCropIdentity::new(settings.default_reading_direction))
+}
+
+impl App {
+    fn thumbnail_auto_crop_identity(&self) -> Option<crate::cover_auto_crop::AutoCropIdentity> {
+        (!self.items_are_drive_list)
+            .then(|| configured_thumbnail_auto_crop(&self.settings))
+            .flatten()
+    }
+}
+
+fn auto_crop_leaf_allowed(request: &LoadRequest) -> bool {
+    if request.cover_crop.is_some()
+        || !matches!(
+            request.raw_source,
+            crate::thumb_loader::LoadRequestSource::Original
+        )
+    {
+        return false;
+    }
+    // A logical folder remains a folder even when its name ends in .cr3/.mp4.
+    // Its identity permits K2 reuse; the worker never detects a folder image.
+    if request.folder_thumb_provenance == Some(crate::catalog::FolderThumbProvenance::AutoSelected)
+    {
+        return true;
+    }
+    let path = request
+        .zip_entry
+        .as_deref()
+        .map_or(request.path.as_path(), Path::new);
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    !crate::raw_format::is_raw_path(path)
+        && !matches!(
+            crate::file_type_visibility::category_for_extension(&ext),
+            Some(
+                crate::file_type_visibility::FileTypeCategory::Video
+                    | crate::file_type_visibility::FileTypeCategory::Audio
+            )
+        )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_load_request_with_auto_crop(
+    item: &GridItem,
+    idx: usize,
+    mtime: i64,
+    file_size: i64,
+    bypass_cache: bool,
+    pdf_password: Option<&str>,
+    folder_thumb_sort: Option<crate::settings::SortOrder>,
+    folder_thumb_depth: u32,
+    pin_map: &HashMap<String, crate::folder_thumb_pins::FolderPin>,
+    converted_archive_cache_paths: &HashMap<String, ConvertedArchiveSourceState>,
+    archive_source_override: Option<&Path>,
+    current_folder: Option<&Path>,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    video_pin_db: Option<&crate::video_pins::VideoPinDb>,
+    use_full_path_keys: bool,
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+    auto: Option<crate::cover_auto_crop::AutoCropIdentity>,
+) -> Option<LoadRequest> {
+    let mut request = make_load_request_with_visibility(
+        item,
+        idx,
+        mtime,
+        file_size,
+        bypass_cache,
+        pdf_password,
+        folder_thumb_sort,
+        folder_thumb_depth,
+        pin_map,
+        converted_archive_cache_paths,
+        archive_source_override,
+        current_folder,
+        pin_db,
+        video_pin_db,
+        use_full_path_keys,
+        visibility,
+    )?;
+    let eligible = match item {
+        GridItem::ZipFile(_)
+        | GridItem::PdfFile(_)
+        | GridItem::ConvertibleArchive { .. }
+        | GridItem::ZipDir { .. } => true,
+        GridItem::Folder(_) => {
+            request.folder_thumb_provenance
+                == Some(crate::catalog::FolderThumbProvenance::AutoSelected)
+        }
+        _ => false,
+    };
+    request.set_auto_cover_crop(auto.filter(|_| eligible && auto_crop_leaf_allowed(&request)));
+    Some(request)
+}
+
 fn make_load_request_with_visibility(
     item: &GridItem,
     idx: usize,
@@ -102996,7 +103187,7 @@ fn make_load_request_with_visibility(
     pdf_password: Option<&str>,
     folder_thumb_sort: Option<crate::settings::SortOrder>,
     folder_thumb_depth: u32,
-    pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin>,
     converted_archive_cache_paths: &std::collections::HashMap<String, ConvertedArchiveSourceState>,
     archive_source_override: Option<&std::path::Path>,
     current_folder: Option<&std::path::Path>,
@@ -103098,6 +103289,12 @@ fn make_load_request_with_visibility(
             representative,
             ..
         } => {
+            // One scope for direct entries, pins, and representative resolution.
+            // The range-dialog resolver consumes this same request field.
+            let base = LoadRequest {
+                zip_dir_prefix: Some(dir_prefix.clone()),
+                ..base
+            };
             // ネスト ZIP ツリーの子コンテナ代表サムネ (v1.3.0)。代表画像のバイトを
             // zip_entry 経由で読み、カタログには zipdir:{dir_prefix} キーで保存する
             // (entry_name キーと非衝突, additive)。cache_key_override が zipdir: で
@@ -103115,11 +103312,15 @@ fn make_load_request_with_visibility(
             let book_container = book_container_key(book_root, dir_prefix);
             let book_key = crate::path_key::normalize_keep_drive(&book_container);
             if let Some(source) = pin_map.get(&book_key) {
-                match source {
+                match &source.source {
                     crate::folder_thumb_pins::FolderPinSource::ZipEntry { zip_rel, entry }
                         if zip_rel.is_empty() && !entry.is_empty() =>
                     {
-                        return Some(LoadRequest {
+                        let resolved = crate::folder_thumb_pins::resolve_pin_target_cascaded_via_with_metadata(
+                            &book_container, source, |_| None,
+                            |_| Some((base.mtime, base.file_size)), 0,
+                        )?;
+                        let mut request = LoadRequest {
                             cover_scope: Some(
                                 crate::cover_source_scope::CoverSourceScope::page(
                                     crate::adjustment_db::zip_entry_key(load_zip_path, entry),
@@ -103141,14 +103342,15 @@ fn make_load_request_with_visibility(
                                 load_zip_path,
                                 entry,
                             )),
-                            cache_key_override: Some(format!(
-                                "{}{}{}",
-                                crate::grid_item::zipdir_cache_key(dir_prefix),
-                                crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
-                                entry
-                            )),
                             ..base
-                        });
+                        };
+                        resolved.assign_to_load_request(
+                            &mut request,
+                            &crate::grid_item::zipdir_cache_key(dir_prefix),
+                            crate::folder_thumb_pins::PinKeyMode::Exact,
+                            Some(dir_prefix),
+                        );
+                        return Some(request);
                     }
                     crate::folder_thumb_pins::FolderPinSource::ZipDir { zip_rel, .. }
                         if zip_rel.is_empty() =>
@@ -103159,12 +103361,6 @@ fn make_load_request_with_visibility(
                             pin_db,
                             folder_thumb_depth as usize,
                         ) {
-                            let cache_key = format!(
-                                "{}{}{}",
-                                crate::grid_item::zipdir_cache_key(dir_prefix),
-                                crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
-                                resolved.source_id,
-                            );
                             match resolved.kind {
                                 crate::folder_thumb_pins::ResolvedKind::ZipEntry => {
                                     let (edit_preview_key, edit_preview_validate_container) =
@@ -103174,7 +103370,7 @@ fn make_load_request_with_visibility(
                                             resolved.zip_entry.as_deref(),
                                             resolved.pdf_page,
                                         );
-                                    return Some(LoadRequest {
+                                    let mut request = LoadRequest {
                                         cover_scope: resolved.zip_entry.as_ref().map(|entry| {
                                             crate::cover_source_scope::CoverSourceScope::page(
                                                 crate::adjustment_db::zip_entry_key(
@@ -103191,23 +103387,28 @@ fn make_load_request_with_visibility(
                                             )
                                         }),
                                         path: load_zip_path.to_path_buf(),
-                                        zip_entry: resolved.zip_entry,
+                                        zip_entry: resolved.zip_entry.clone(),
                                         pinned_page_adjustment_key: edit_preview_key.clone(),
                                         edit_preview_key,
                                         edit_preview_validate_container,
-                                        cache_key_override: Some(cache_key),
                                         mtime: resolved.mtime,
                                         file_size: resolved.file_size,
                                         ..base
-                                    });
+                                    };
+                                    resolved.assign_to_load_request(
+                                        &mut request,
+                                        &crate::grid_item::zipdir_cache_key(dir_prefix),
+                                        crate::folder_thumb_pins::PinKeyMode::Exact,
+                                        None,
+                                    );
+                                    return Some(request);
                                 }
                                 crate::folder_thumb_pins::ResolvedKind::ZipDirRepresentative => {
-                                    return Some(LoadRequest {
+                                    let mut request = LoadRequest {
                                         cover_scope: resolved.zip_dir_prefix.as_ref().map(|prefix| crate::cover_source_scope::CoverSourceScope::zip_dir(load_zip_path, prefix)
                                             .union(crate::cover_source_scope::CoverSourceScope::zip_dir(zip_path, prefix))),
                                         path: load_zip_path.to_path_buf(),
-                                        zip_dir_prefix: resolved.zip_dir_prefix,
-                                        cache_key_override: Some(cache_key),
+                                        zip_dir_prefix: resolved.zip_dir_prefix.clone(),
                                         resolve_override: Some(
                                             crate::thumb_loader::ResolveStrategy::ZipDirRepresentative,
                                         ),
@@ -103216,7 +103417,14 @@ fn make_load_request_with_visibility(
                                         mtime: resolved.mtime,
                                         file_size: resolved.file_size,
                                         ..base
-                                    });
+                                    };
+                                    resolved.assign_to_load_request(
+                                        &mut request,
+                                        &crate::grid_item::zipdir_cache_key(dir_prefix),
+                                        crate::folder_thumb_pins::PinKeyMode::Exact,
+                                        None,
+                                    );
+                                    return Some(request);
                                 }
                                 _ => {}
                             }
@@ -103412,14 +103620,14 @@ fn make_load_request_with_visibility(
 pub(crate) fn folder_thumb_existing_keys_for_with_visibility(
     item: &GridItem,
     item_meta: Option<(i64, i64)>,
-    pin_map: &HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    pin_map: &HashMap<String, crate::folder_thumb_pins::FolderPin>,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
     folder_thumb_sort: Option<crate::settings::SortOrder>,
     folder_thumb_depth: u32,
     use_full_path_keys: bool,
     visibility: &crate::file_type_visibility::FileTypeVisibility,
 ) -> Vec<String> {
-    folder_thumb_existing_keys_for(
+    folder_thumb_existing_keys_for_with_auto_crop(
         item,
         item_meta,
         pin_map,
@@ -103427,16 +103635,15 @@ pub(crate) fn folder_thumb_existing_keys_for_with_visibility(
         folder_thumb_sort,
         folder_thumb_depth,
         use_full_path_keys,
+        visibility,
+        None,
     )
-    .into_iter()
-    .map(|key| crate::thumb_loader::representative_cache_key_for_policy(&key, visibility))
-    .collect()
 }
 
 pub(crate) fn folder_thumb_existing_keys_for(
     item: &GridItem,
     item_meta: Option<(i64, i64)>,
-    pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin>,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
     folder_thumb_sort: Option<crate::settings::SortOrder>,
     folder_thumb_depth: u32,
@@ -103445,6 +103652,31 @@ pub(crate) fn folder_thumb_existing_keys_for(
     // `delete_missing` の存続キー集合と make_load_request の読み書きキーが乖離
     // しないように、必ず同じ helper (`container_cache_base_key`) を経由する。
     use_full_path_keys: bool,
+) -> Vec<String> {
+    folder_thumb_existing_keys_for_with_auto_crop(
+        item,
+        item_meta,
+        pin_map,
+        pin_db,
+        folder_thumb_sort,
+        folder_thumb_depth,
+        use_full_path_keys,
+        &Default::default(),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn folder_thumb_existing_keys_for_with_auto_crop(
+    item: &GridItem,
+    item_meta: Option<(i64, i64)>,
+    pin_map: &HashMap<String, crate::folder_thumb_pins::FolderPin>,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    folder_thumb_sort: Option<crate::settings::SortOrder>,
+    folder_thumb_depth: u32,
+    use_full_path_keys: bool,
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+    auto: Option<crate::cover_auto_crop::AutoCropIdentity>,
 ) -> Vec<String> {
     let (container_path, convertible_format) = match item {
         GridItem::Image(p) => {
@@ -103469,7 +103701,7 @@ pub(crate) fn folder_thumb_existing_keys_for(
         else {
             return Vec::new();
         };
-        let mut keys = vec![base_key.clone()];
+        let mut keys = representative_existing_keys(&base_key, visibility, auto);
         let container_key = crate::path_key::normalize_keep_drive(container_path);
         if let (Some(root_metadata), Some(source)) = (item_meta, pin_map.get(&container_key))
             && pin_source_compatible_with_container(ContainerKindForPin::ConvertibleArchive, source)
@@ -103500,12 +103732,26 @@ pub(crate) fn folder_thumb_existing_keys_for(
             } else {
                 base_key.clone()
             };
-            keys.push(format!(
-                "{}{}{}",
-                pinned_base_key,
-                crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
-                resolved.source_id,
-            ));
+            let plain = pinned_cache_key_with_auto_crop(
+                item,
+                &resolved,
+                &pinned_base_key,
+                None,
+                visibility,
+                None,
+            );
+            let current = pinned_cache_key_with_auto_crop(
+                item,
+                &resolved,
+                &pinned_base_key,
+                None,
+                visibility,
+                auto,
+            );
+            keys.push(plain.clone());
+            if current != plain {
+                keys.push(current);
+            }
         }
         return keys;
     }
@@ -103519,7 +103765,7 @@ pub(crate) fn folder_thumb_existing_keys_for(
         return Vec::new();
     };
 
-    let mut keys = vec![base_key.clone()];
+    let mut keys = representative_existing_keys(&base_key, visibility, auto);
     let container_key = crate::path_key::normalize_keep_drive(container_path);
     if let Some(source) = pin_map.get(&container_key) {
         // cascade 解決後の leaf source_id を使う (= `apply_folder_thumb_pin` が
@@ -103549,15 +103795,76 @@ pub(crate) fn folder_thumb_existing_keys_for(
             } else {
                 base_key.clone()
             };
-            keys.push(format!(
-                "{}{}{}",
-                pinned_base_key,
-                crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
-                resolved.source_id,
-            ));
+            let plain = pinned_cache_key_with_auto_crop(
+                item,
+                &resolved,
+                &pinned_base_key,
+                None,
+                visibility,
+                None,
+            );
+            let current = pinned_cache_key_with_auto_crop(
+                item,
+                &resolved,
+                &pinned_base_key,
+                None,
+                visibility,
+                auto,
+            );
+            keys.push(plain.clone());
+            if current != plain {
+                keys.push(current);
+            }
         }
     }
     keys
+}
+
+/// Keep the released namespace for page seed/writeback alongside the current
+/// automatic setting. Rows from a previous binding are not retained.
+fn representative_existing_keys(
+    base: &str,
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+    auto: Option<crate::cover_auto_crop::AutoCropIdentity>,
+) -> Vec<String> {
+    let plain = crate::thumb_loader::representative_cache_key_for_policy(base, visibility);
+    let current =
+        crate::thumb_loader::representative_cache_key_for_policy_with_auto(base, visibility, auto);
+    let mut keys = vec![plain.clone()];
+    if current != plain {
+        keys.push(current);
+    }
+    keys
+}
+
+/// Reuse the already-resolved leaf without another source lookup. Its private
+/// crop remains owned by the atomic request helper.
+fn pinned_cache_key_with_auto_crop(
+    item: &GridItem,
+    resolved: &crate::folder_thumb_pins::ResolvedPinTarget,
+    base: &str,
+    zipdir_prefix: Option<&str>,
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+    auto: Option<crate::cover_auto_crop::AutoCropIdentity>,
+) -> String {
+    let mut probe = LoadRequest {
+        path: resolved.abs_path.clone(),
+        zip_entry: resolved.zip_entry.clone(),
+        folder_thumb_provenance: (resolved.kind == crate::folder_thumb_pins::ResolvedKind::Folder)
+            .then_some(crate::catalog::FolderThumbProvenance::AutoSelected),
+        file_type_visibility: visibility.clone(),
+        ..Default::default()
+    };
+    resolved.assign_to_load_request(
+        &mut probe,
+        base,
+        crate::folder_thumb_pins::PinKeyMode::Exact,
+        zipdir_prefix,
+    );
+    let eligible = !matches!(item, GridItem::Folder(_))
+        || resolved.kind == crate::folder_thumb_pins::ResolvedKind::Folder;
+    probe.set_auto_cover_crop(auto.filter(|_| eligible && auto_crop_leaf_allowed(&probe)));
+    probe.cache_key_override.expect("resolved pinned cache key")
 }
 
 /// `apply_folder_thumb_pin` 用の container kind discriminator。
@@ -103629,13 +103936,13 @@ fn pin_source_compatible_with_container(
 /// - pin 無しコンテナ leaf: Folder / ZIP / PDF / ZipDir ごとの strategy で auto-pick する
 fn resolve_pin_target_cascaded(
     container: &std::path::Path,
-    immediate_source: &crate::folder_thumb_pins::FolderPinSource,
+    immediate_source: &impl crate::folder_thumb_pins::PinSpec,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
     max_depth: usize,
 ) -> Option<crate::folder_thumb_pins::ResolvedPinTarget> {
     // closure 版に委譲。worker 側 (`resolve_folder_thumb_image`) でも同じヘルパーを
     // 異なる lookup closure で再利用する。
-    let lookup = |p: &std::path::Path| -> Option<crate::folder_thumb_pins::FolderPinSource> {
+    let lookup = |p: &std::path::Path| -> Option<crate::folder_thumb_pins::FolderPin> {
         pin_db.and_then(|db| db.lookup(p))
     };
     crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
@@ -103652,7 +103959,7 @@ fn resolve_pin_target_cascaded(
 /// cache identity を構築する。
 fn resolve_pin_target_cascaded_with_root_metadata(
     container: &std::path::Path,
-    immediate_source: &crate::folder_thumb_pins::FolderPinSource,
+    immediate_source: &impl crate::folder_thumb_pins::PinSpec,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
     max_depth: usize,
     root_metadata: (i64, i64),
@@ -103702,7 +104009,7 @@ fn apply_folder_thumb_pin(
     base_key: &str,
     use_full_path_keys: bool,
     container_kind: ContainerKindForPin,
-    pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin>,
     converted_archive_cache_paths: &std::collections::HashMap<String, ConvertedArchiveSourceState>,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
     // cascade resolve が Video kind に到達したとき、`video_pins.db` に有効な WebP が
@@ -103791,8 +104098,11 @@ fn apply_folder_thumb_pin(
     } else {
         base_key.to_owned()
     };
-    let pinned_key =
-        crate::thumb_loader::pinned_folder_row_key(&effective_base_key, &resolved.source_id, None);
+    let pinned_key = resolved.pinned_cache_key(
+        &effective_base_key,
+        crate::folder_thumb_pins::PinKeyMode::Exact,
+        None,
+    );
     // ネスト時の解決経路を確認するための診断ログ。Folder/ZipFile/PdfFile pin の挙動を
     // 切り分けやすくする。`mimageviewer.log` の grep `folder_thumb_pin: apply` で
     // すべての pin 適用箇所を一覧できる。
@@ -103864,6 +104174,8 @@ fn apply_folder_thumb_pin(
             // 値で catalog 行を書いているので、worker の cache_hit 比較が成立する。
             mtime: resolved.mtime,
             file_size: resolved.file_size,
+            cover_crop: None,
+            auto_cover_crop: None,
             edit_preview_key: None,
             edit_preview_validate_container: false,
             pinned_page_adjustment_key: None,
@@ -103999,7 +104311,7 @@ fn apply_folder_thumb_pin(
         };
         Some(scope)
     };
-    LoadRequest {
+    let mut request = LoadRequest {
         file_type_visibility: base_req.file_type_visibility.clone(),
         cover_scope,
         refresh_legacy_cover: base_req.refresh_legacy_cover,
@@ -104042,7 +104354,16 @@ fn apply_folder_thumb_pin(
         epub_pin_fallback,
         force_cache: false,
         raw_source: crate::thumb_loader::LoadRequestSource::Original,
-    }
+        cover_crop: None,
+        auto_cover_crop: None,
+    };
+    resolved.assign_to_load_request(
+        &mut request,
+        &effective_base_key,
+        crate::folder_thumb_pins::PinKeyMode::Exact,
+        None,
+    );
+    request
 }
 
 /// 保存する最大化 flag を決める。
@@ -104575,6 +104896,10 @@ fn finite_video_target_secs(target_secs: f64, duration_secs: f64) -> f64 {
 // `phase_c_support::setup_app` を使う (production 配線を通した回帰は App が要る)。
 #[cfg(test)]
 pub(crate) mod composite_pixels_revision_tests;
+#[cfg(test)]
+mod cover_auto_tests;
+#[cfg(test)]
+mod cover_crop_tests;
 #[cfg(test)]
 mod cover_scope_tests;
 #[cfg(test)]

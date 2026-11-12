@@ -64,6 +64,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2619,9 +2620,11 @@ fn rewrite_book_store_values(
             let new_container =
                 rewrite_book_key(&container, &mappings).unwrap_or_else(|| container.clone());
             if let Some(relative) = destination.strip_prefix(&format!("{new_container}/")) {
-                changed += tx.execute(
-                    "UPDATE folder_thumb_pins SET source_rel = ?1 WHERE container_key = ?2",
-                    rusqlite::params![relative, container],
+                changed += crate::folder_thumb_pins::rewrite_pin_source_column(
+                    tx,
+                    &container,
+                    "source_rel",
+                    relative,
                 )?;
             } else {
                 changed += tx.execute(
@@ -3303,6 +3306,9 @@ fn move_exact_with_collision(
     if old_key == new_key {
         return Ok(0);
     }
+    if table == "folder_thumb_pins" {
+        sanitize_moving_pin_crop(tx, old_key)?;
+    }
     if collision == PathMigrationCollision::SourceWins {
         let removed = tx.execute(&format!("DELETE FROM {table} WHERE {col} = ?1"), [new_key])?;
         return tx
@@ -3607,6 +3613,42 @@ fn table_columns(
 
 /// exact キーの複製。全列を `PRAGMA table_info` 由来の順序で選び、キー列だけ
 /// destination へ差し替える。destination conflict は `INSERT OR IGNORE` で温存する。
+fn sanitize_moving_pin_crop(tx: &rusqlite::Transaction<'_>, key: &str) -> rusqlite::Result<()> {
+    let columns = table_columns(tx, "folder_thumb_pins")?;
+    let crops = columns
+        .iter()
+        .filter(|c| c.starts_with("cover_crop_"))
+        .collect::<Vec<_>>();
+    if crops.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = tx.prepare("SELECT * FROM folder_thumb_pins WHERE container_key=?1")?;
+    let invalid = stmt
+        .query_row([key], |row| {
+            let present = crops.iter().any(|name| {
+                !matches!(
+                    row.get::<_, rusqlite::types::Value>(name.as_str()),
+                    Ok(rusqlite::types::Value::Null)
+                )
+            });
+            Ok(present && crate::folder_thumb_pins::decode_cover_crop(row).is_none())
+        })
+        .optional()?
+        .unwrap_or(false);
+    if invalid {
+        let assignments = crops
+            .iter()
+            .map(|name| format!("{name}=NULL"))
+            .collect::<Vec<_>>()
+            .join(",");
+        tx.execute(
+            &format!("UPDATE folder_thumb_pins SET {assignments} WHERE container_key=?1"),
+            [key],
+        )?;
+    }
+    Ok(())
+}
+
 fn copy_exact(
     tx: &rusqlite::Transaction<'_>,
     table: &str,
@@ -3620,6 +3662,33 @@ fn copy_exact(
     }
     if watched_destination_has_resume(tx, table, col, new_key)? {
         return Ok(0);
+    }
+    if table == "folder_thumb_pins" {
+        let mut stmt = tx.prepare("SELECT * FROM folder_thumb_pins WHERE container_key=?1")?;
+        let row = stmt
+            .query_row([old_key], |row| {
+                (0..columns.len())
+                    .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .optional()?;
+        let Some(mut row) = row else {
+            return Ok(0);
+        };
+        let crop = crate::folder_thumb_pins::cover_crop_from_values(columns, &row);
+        crate::folder_thumb_pins::rebind_cover_crop_values(columns, &mut row, crop);
+        let index = columns
+            .iter()
+            .position(|c| c == col)
+            .ok_or_else(|| rusqlite::Error::InvalidColumnName(col.into()))?;
+        row[index] = rusqlite::types::Value::Text(new_key.into());
+        return crate::folder_thumb_pins::write_pin_values(
+            tx,
+            table,
+            columns,
+            &row,
+            crate::folder_thumb_pins::PinRowWrite::InsertOrIgnore,
+        );
     }
     let insert_columns = columns.join(", ");
     let select_columns = columns
@@ -8435,5 +8504,128 @@ mod tests {
             )
             .unwrap();
         assert_eq!(raw, (key, "not-json".into()));
+    }
+
+    #[test]
+    fn cover_crop_book_rename_and_container_copy_preserve_only_valid_binding() {
+        use crate::folder_thumb_pins::{CoverCrop, FileKind, FolderPinSource, FolderThumbPinDb};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("folder_thumb_pins.db");
+        let db = FolderThumbPinDb::open_at(&path).unwrap();
+        let root = Path::new("c:/books/one");
+        let before = root.join("old.jpg");
+        let after = root.join("new.jpg");
+        let source = FolderPinSource::File {
+            rel: "old.jpg".into(),
+            kind: FileKind::Image,
+        };
+        let crop = CoverCrop::new([0, 0, 400_000, 1_000_000]).unwrap();
+        db.set_with_cover_crop(root, &source, crop).unwrap();
+        let descriptor = STORES
+            .iter()
+            .find(|s| s.table == "folder_thumb_pins")
+            .unwrap();
+        let mappings = [(
+            crate::adjustment_db::normalize_path(&before),
+            crate::adjustment_db::normalize_path(&after),
+        )];
+        migrate_book_store(&path, descriptor, &mappings, &[], &[(before, after)]).unwrap();
+        let renamed = db.lookup(root).unwrap();
+        assert_eq!(renamed.source.rel(), "new.jpg");
+        assert_eq!(renamed.cover_crop, crop);
+        let destination = Path::new("c:/books/existing");
+        let destination_source = FolderPinSource::File {
+            rel: "destination.jpg".into(),
+            kind: FileKind::Image,
+        };
+        let destination_crop = CoverCrop::new([500_000, 0, 1_000_000, 1_000_000]).unwrap();
+        db.set_with_cover_crop(destination, &destination_source, destination_crop)
+            .unwrap();
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        let tx = conn.transaction().unwrap();
+        let columns = table_columns(&tx, "folder_thumb_pins").unwrap();
+        assert_eq!(
+            copy_exact(
+                &tx,
+                "folder_thumb_pins",
+                "container_key",
+                &columns,
+                "c:/books/one",
+                "c:/books/existing",
+            )
+            .unwrap(),
+            0
+        );
+        copy_exact(
+            &tx,
+            "folder_thumb_pins",
+            "container_key",
+            &columns,
+            "c:/books/one",
+            "c:/books/valid-copy",
+        )
+        .unwrap();
+        move_exact(
+            &tx,
+            "folder_thumb_pins",
+            "container_key",
+            true,
+            "c:/books/valid-copy",
+            "c:/books/valid-moved",
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(db.lookup(destination).unwrap().source, destination_source);
+        assert_eq!(db.lookup(destination).unwrap().cover_crop, destination_crop);
+        assert_eq!(
+            db.lookup(Path::new("c:/books/valid-moved"))
+                .unwrap()
+                .cover_crop,
+            crop
+        );
+        // Simulate a DB written before the source-change trigger: the legacy re-pin
+        // leaves a stale binding for the new-code rename/copy decoder to reject.
+        conn.execute_batch("DROP TRIGGER folder_thumb_pin_clear_stale_cover_crop")
+            .unwrap();
+        conn.execute("UPDATE folder_thumb_pins SET source_rel='other.jpg' WHERE container_key='c:/books/one'", []).unwrap();
+        let tx = conn.transaction().unwrap();
+        let columns = table_columns(&tx, "folder_thumb_pins").unwrap();
+        copy_exact(
+            &tx,
+            "folder_thumb_pins",
+            "container_key",
+            &columns,
+            "c:/books/one",
+            "c:/books/copy",
+        )
+        .unwrap();
+        move_exact(
+            &tx,
+            "folder_thumb_pins",
+            "container_key",
+            true,
+            "c:/books/one",
+            "c:/books/moved",
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            db.lookup(Path::new("c:/books/valid-moved"))
+                .unwrap()
+                .cover_crop,
+            crop
+        );
+        for root in ["c:/books/copy", "c:/books/moved"] {
+            assert_eq!(db.lookup(Path::new(root)).unwrap().cover_crop, None);
+            assert_eq!(
+                conn.query_row(
+                    "SELECT cover_crop_source FROM folder_thumb_pins WHERE container_key=?1",
+                    [root],
+                    |r| r.get::<_, Option<String>>(0)
+                )
+                .unwrap(),
+                None
+            );
+        }
     }
 }

@@ -381,7 +381,8 @@ mod section1452_book_cover_cache {
                         entry_name: entry.into(),
                     },
                 )
-                .unwrap(),
+                .unwrap()
+                .into(),
             );
             let mut req = request(&app, &cover, (9, 10));
             let key = crate::thumb_loader::cache_key_for_request(&req)
@@ -2223,7 +2224,7 @@ fn ordinary_video_folder_seed_upgrades_identity_only_and_then_preserves_the_row(
         .unwrap();
     app.folder_pin_map.insert(
         crate::path_key::normalize_keep_drive(&folder),
-        source.clone(),
+        source.clone().into(),
     );
     app.current_folder = Some(parent.clone());
     app.items = vec![GridItem::Folder(folder.clone())];
@@ -2236,7 +2237,7 @@ fn ordinary_video_folder_seed_upgrades_identity_only_and_then_preserves_the_row(
         crate::catalog::FolderThumbProvenance::Seeded,
     )
     .unwrap();
-    let key = crate::thumb_loader::pinned_folder_row_key(&base, &resolved.source_id, None);
+    let key = resolved.pinned_cache_key(&base, crate::folder_thumb_pins::PinKeyMode::Exact, None);
     let catalog = Arc::new(
         crate::catalog::CatalogDb::open(&app.tmp.path().join("seed-cache"), &parent).unwrap(),
     );
@@ -19972,8 +19973,10 @@ mod phase_c_key_tests {
         let other = GridItem::Folder(PathBuf::from(r"C:\OtherFolder"));
         let source = crate::folder_thumb_pins::source_from_grid_item(&drive_root, &pinned).unwrap();
         app.current_folder = Some(drive_root.clone());
-        app.folder_pin_map
-            .insert(crate::path_key::normalize_keep_drive(&drive_root), source);
+        app.folder_pin_map.insert(
+            crate::path_key::normalize_keep_drive(&drive_root),
+            source.into(),
+        );
 
         assert!(
             app.should_force_cache_for_drive_list_pin(&pinned),
@@ -20039,8 +20042,11 @@ mod phase_c_key_tests {
             app.settings.folder_thumb_depth as usize,
         )
         .unwrap();
-        let pinned_parent_key =
-            crate::thumb_loader::pinned_folder_row_key(&parent_key, &resolved.source_id, None);
+        let pinned_parent_key = resolved.pinned_cache_key(
+            &parent_key,
+            crate::folder_thumb_pins::PinKeyMode::Exact,
+            None,
+        );
         parent_db
             .save(
                 &pinned_parent_key,
@@ -20075,8 +20081,10 @@ mod phase_c_key_tests {
 
         app.items = vec![GridItem::Folder(drive_root.clone())];
         app.image_metas = vec![None];
-        app.folder_pin_map
-            .insert(crate::path_key::normalize_keep_drive(&drive_root), source);
+        app.folder_pin_map.insert(
+            crate::path_key::normalize_keep_drive(&drive_root),
+            source.into(),
+        );
 
         let drive_list_db = std::sync::Arc::new(
             crate::catalog::CatalogDb::open(&cache_dir, &drive_list_catalog_path()).unwrap(),
@@ -20255,7 +20263,7 @@ mod phase_c_key_tests {
             ContainerKindForPin::Folder,
             &std::collections::HashMap::from([(
                 crate::path_key::normalize_keep_drive(&child),
-                page_pin,
+                page_pin.into(),
             )]),
             &std::collections::HashMap::new(),
             Some(pins.as_ref()),
@@ -20312,7 +20320,8 @@ mod phase_c_key_tests {
             crate::folder_thumb_pins::FolderPinSource::File {
                 rel: "child".into(),
                 kind: crate::folder_thumb_pins::FileKind::Folder,
-            },
+            }
+            .into(),
         );
         let drive_catalog = std::sync::Arc::new(
             crate::catalog::CatalogDb::open(&cache_dir, &drive_list_catalog_path()).unwrap(),
@@ -20437,8 +20446,10 @@ mod phase_c_key_tests {
             kind: crate::folder_thumb_pins::FileKind::Folder,
         };
         app.items = vec![GridItem::Folder(drive.clone())];
-        app.folder_pin_map
-            .insert(crate::path_key::normalize_keep_drive(&drive), root_pin);
+        app.folder_pin_map.insert(
+            crate::path_key::normalize_keep_drive(&drive),
+            root_pin.into(),
+        );
         let req = make_drive_list_pin_load_request(
             &app.items[0],
             0,
@@ -20649,7 +20660,7 @@ mod phase_c_key_tests {
         app.image_metas = vec![None];
         app.folder_pin_map.insert(
             crate::path_key::normalize_keep_drive(&drive),
-            source.clone(),
+            source.clone().into(),
         );
         let target = std::sync::Arc::new(
             crate::catalog::CatalogDb::open(&cache_dir, &drive_list_catalog_path()).unwrap(),
@@ -20798,7 +20809,7 @@ mod phase_c_key_tests {
         };
         let writer_pins = std::collections::HashMap::from([(
             crate::path_key::normalize_keep_drive(&child),
-            page_zero.clone(),
+            page_zero.clone().into(),
         )]);
         let writer_req = apply_folder_thumb_pin(
             writer_base,
@@ -20866,7 +20877,7 @@ mod phase_c_key_tests {
         };
         let page_one_pins = std::collections::HashMap::from([(
             crate::path_key::normalize_keep_drive(&child),
-            page_one.clone(),
+            page_one.clone().into(),
         )]);
         let page_one_writer = apply_folder_thumb_pin(
             LoadRequest {
@@ -21102,7 +21113,7 @@ mod phase_c_key_tests {
             pins.set(&grandchild, page).unwrap();
             let pin_map = std::collections::HashMap::from([(
                 crate::path_key::normalize_keep_drive(&child),
-                child_source.clone(),
+                child_source.clone().into(),
             )]);
             let request = apply_folder_thumb_pin(
                 LoadRequest {
@@ -21177,7 +21188,8 @@ mod phase_c_key_tests {
             crate::folder_thumb_pins::FolderPinSource::File {
                 rel: "child".into(),
                 kind: crate::folder_thumb_pins::FileKind::Folder,
-            },
+            }
+            .into(),
         );
         let drive_list_db = std::sync::Arc::new(
             crate::catalog::CatalogDb::open(&cache_dir, &drive_list_catalog_path()).unwrap(),
@@ -21250,7 +21262,8 @@ mod phase_c_key_tests {
             crate::folder_thumb_pins::FolderPinSource::PdfPage {
                 pdf_rel: "moved.epub".into(),
                 page: 0,
-            },
+            }
+            .into(),
         )]);
         let req = apply_folder_thumb_pin(
             base,
@@ -21354,8 +21367,10 @@ mod phase_c_key_tests {
 
         app.items = vec![GridItem::Folder(drive_root.clone())];
         app.image_metas = vec![None];
-        app.folder_pin_map
-            .insert(crate::path_key::normalize_keep_drive(&drive_root), source);
+        app.folder_pin_map.insert(
+            crate::path_key::normalize_keep_drive(&drive_root),
+            source.into(),
+        );
 
         let drive_list_db = std::sync::Arc::new(
             crate::catalog::CatalogDb::open(&cache_dir, &drive_list_catalog_path()).unwrap(),
@@ -21449,8 +21464,10 @@ mod phase_c_key_tests {
 
         app.items = vec![GridItem::Folder(drive_root.clone())];
         app.image_metas = vec![None];
-        app.folder_pin_map
-            .insert(crate::path_key::normalize_keep_drive(&drive_root), source);
+        app.folder_pin_map.insert(
+            crate::path_key::normalize_keep_drive(&drive_root),
+            source.into(),
+        );
 
         let drive_list_db = std::sync::Arc::new(
             crate::catalog::CatalogDb::open(&cache_dir, &drive_list_catalog_path()).unwrap(),
@@ -36330,7 +36347,8 @@ fn begin_detached_bookmark_media_test(
         crate::folder_thumb_pins::FolderPinSource::File {
             rel: "cover.jpg".to_string(),
             kind: crate::folder_thumb_pins::FileKind::Image,
-        },
+        }
+        .into(),
     );
     app.converted_archive_cache_paths.insert(
         "main-grid-archive".to_string(),
@@ -40445,7 +40463,8 @@ mod favorite_adjustment_defaults_tests {
             crate::folder_thumb_pins::FolderPinSource::File {
                 rel: "clip.mp4".to_string(),
                 kind: crate::folder_thumb_pins::FileKind::Video,
-            },
+            }
+            .into(),
         );
         app.items.push(GridItem::Folder(folder));
         app.image_metas.push(Some((10, 20)));
@@ -47174,7 +47193,7 @@ mod favorite_adjustment_defaults_tests {
                 path: cache.clone(),
             },
         );
-        let pins: std::collections::HashMap<String, FolderPinSource> =
+        let pins: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin> =
             std::collections::HashMap::new();
 
         let req = make_load_request(
@@ -48880,7 +48899,10 @@ mod favorite_adjustment_defaults_tests {
             },
         );
         let mut pins = std::collections::HashMap::new();
-        pins.insert(crate::path_key::normalize_keep_drive(&src), source.clone());
+        pins.insert(
+            crate::path_key::normalize_keep_drive(&src),
+            source.clone().into(),
+        );
 
         let req = make_load_request(
             &item,
@@ -48936,7 +48958,8 @@ mod favorite_adjustment_defaults_tests {
             FolderPinSource::ZipEntry {
                 zip_rel: String::new(),
                 entry: "inner/pinned.png".to_string(),
-            },
+            }
+            .into(),
         );
         let sources = std::collections::HashMap::from([(
             crate::path_key::normalize_keep_drive(&source_path),
@@ -49032,7 +49055,10 @@ mod favorite_adjustment_defaults_tests {
             entry: "chapter/page01.jpg".to_string(),
         };
         let mut pins = std::collections::HashMap::new();
-        pins.insert(crate::path_key::normalize_keep_drive(&folder), source);
+        pins.insert(
+            crate::path_key::normalize_keep_drive(&folder),
+            source.into(),
+        );
 
         let req = make_load_request(
             &item,
@@ -49079,7 +49105,8 @@ mod favorite_adjustment_defaults_tests {
             crate::folder_thumb_pins::FolderPinSource::File {
                 rel: "book.7z".to_string(),
                 kind: crate::folder_thumb_pins::FileKind::ConvertibleArchive,
-            },
+            }
+            .into(),
         );
         let mut converted = std::collections::HashMap::new();
         converted.insert(
@@ -49165,7 +49192,8 @@ mod favorite_adjustment_defaults_tests {
             crate::folder_thumb_pins::FolderPinSource::File {
                 rel: "book.7z".to_string(),
                 kind: crate::folder_thumb_pins::FileKind::ConvertibleArchive,
-            },
+            }
+            .into(),
         );
         app.folder_thumb_pin_db
             .as_ref()
@@ -49256,7 +49284,7 @@ mod favorite_adjustment_defaults_tests {
         ] {
             let pins = std::collections::HashMap::from([(
                 crate::path_key::normalize_keep_drive(&folder),
-                source,
+                source.into(),
             )]);
             let req = make_load_request(
                 &item,
@@ -49306,7 +49334,8 @@ mod favorite_adjustment_defaults_tests {
             crate::folder_thumb_pins::FolderPinSource::File {
                 rel: "book.zip".to_string(),
                 kind: crate::folder_thumb_pins::FileKind::ZipFile,
-            },
+            }
+            .into(),
         );
         let zip_page = crate::folder_thumb_pins::FolderPinSource::ZipEntry {
             zip_rel: String::new(),
@@ -49412,7 +49441,8 @@ mod favorite_adjustment_defaults_tests {
             crate::folder_thumb_pins::FolderPinSource::File {
                 rel: "book.pdf".to_string(),
                 kind: crate::folder_thumb_pins::FileKind::PdfFile,
-            },
+            }
+            .into(),
         );
         app.folder_thumb_pin_db
             .as_ref()
@@ -49659,10 +49689,12 @@ mod favorite_adjustment_defaults_tests {
         let book_key = source.join("bookA");
         assert_eq!(
             app.folder_thumb_pin_for(&book_key),
-            Some(&crate::folder_thumb_pins::FolderPinSource::ZipEntry {
-                zip_rel: String::new(),
-                entry: "bookA/p1.jpg".to_string(),
-            })
+            Some(&crate::folder_thumb_pins::FolderPin::from(
+                crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+                    zip_rel: String::new(),
+                    entry: "bookA/p1.jpg".to_string(),
+                }
+            ))
         );
 
         app.settings.show_address_bar_folder_pin = true;
@@ -49728,10 +49760,12 @@ mod favorite_adjustment_defaults_tests {
         app.toggle_folder_pin_for_idx(0);
         assert_eq!(
             app.folder_thumb_pin_for(&folder),
-            Some(&crate::folder_thumb_pins::FolderPinSource::File {
-                rel: "book.7z".to_string(),
-                kind: crate::folder_thumb_pins::FileKind::ConvertibleArchive,
-            })
+            Some(&crate::folder_thumb_pins::FolderPin::from(
+                crate::folder_thumb_pins::FolderPinSource::File {
+                    rel: "book.7z".to_string(),
+                    kind: crate::folder_thumb_pins::FileKind::ConvertibleArchive,
+                }
+            ))
         );
     }
 
@@ -49760,10 +49794,12 @@ mod favorite_adjustment_defaults_tests {
 
         assert_eq!(
             app.folder_thumb_pin_for(&zip_path),
-            Some(&FolderPinSource::ZipDir {
-                zip_rel: String::new(),
-                dir_prefix: "bookB/only/".to_string(),
-            })
+            Some(&crate::folder_thumb_pins::FolderPin::from(
+                FolderPinSource::ZipDir {
+                    zip_rel: String::new(),
+                    dir_prefix: "bookB/only/".to_string(),
+                }
+            ))
         );
     }
 
@@ -49804,7 +49840,10 @@ mod favorite_adjustment_defaults_tests {
             .set(&child_key, &child_source)
             .unwrap();
         let mut pins = std::collections::HashMap::new();
-        pins.insert(crate::path_key::normalize_keep_drive(&book_key), source);
+        pins.insert(
+            crate::path_key::normalize_keep_drive(&book_key),
+            source.into(),
+        );
 
         let req = make_load_request(
             &item,
@@ -49827,7 +49866,7 @@ mod favorite_adjustment_defaults_tests {
 
         assert_eq!(req.path, zip_path);
         assert_eq!(req.zip_entry.as_deref(), Some("bookA/ch02/page01.jpg"));
-        assert_eq!(req.zip_dir_prefix, None);
+        assert_eq!(req.zip_dir_prefix.as_deref(), Some("bookA/"));
         assert_eq!(req.resolve_override, None);
         assert_eq!(
             req.edit_preview_key.as_deref(),
@@ -81124,7 +81163,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             crate::folder_thumb_pins::FolderPinSource::File {
                 rel: "clip.mp4".to_string(),
                 kind: crate::folder_thumb_pins::FileKind::Video,
-            },
+            }
+            .into(),
         );
         let dirty: std::collections::HashSet<std::path::PathBuf> =
             [video.clone()].into_iter().collect();
@@ -112661,7 +112701,8 @@ fn file_type_visibility_thumbnail_request_routes_policy_before_pin_resolution() 
         crate::folder_thumb_pins::FolderPinSource::File {
             rel: "hidden.png".into(),
             kind: crate::folder_thumb_pins::FileKind::Image,
-        },
+        }
+        .into(),
     );
     let mut policy = crate::file_type_visibility::FileTypeVisibility::default();
     policy.excluded_extensions.insert("png".into());

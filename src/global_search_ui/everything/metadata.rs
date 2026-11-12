@@ -2,7 +2,7 @@
 //! freshness checks only clone initialized resources or read publication stamps.
 
 use crate::app::ConvertedArchiveSourceState;
-use crate::folder_thumb_pins::{FolderPinMutationStamp, FolderPinSource, FolderThumbPinDb};
+use crate::folder_thumb_pins::{FolderPin, FolderPinMutationStamp, FolderThumbPinDb};
 use crate::grid_item::GridItem;
 use crate::page_edit_write_epoch::{EditWriteEpoch, WriteStamp};
 use crate::tags_db::{TAG_WRITES, TagsDb};
@@ -59,7 +59,7 @@ pub(crate) enum SearchMetadataInstall {
 }
 
 pub(crate) struct EverythingMetadata {
-    pub(crate) pins: HashMap<String, FolderPinSource>,
+    pub(crate) pins: HashMap<String, FolderPin>,
     pub(crate) converted: HashMap<String, ConvertedArchiveSourceState>,
     pub(crate) tags: HashMap<String, Vec<String>>,
     pub(crate) video_pin_blobs: Arc<HashMap<PathBuf, Vec<u8>>>,
@@ -287,6 +287,7 @@ pub(crate) fn prepare(
 mod tests {
     use super::*;
     use crate::archive_converter::ArchiveFormat;
+    use crate::folder_thumb_pins::FolderPinSource;
     use crate::page_edit_write_epoch::TestEpochScope;
 
     fn prepare(
@@ -416,8 +417,12 @@ mod tests {
         assert!(payload.is_current(&resources));
         assert_eq!(payload.pins.len(), 1);
         assert_eq!(
-            payload.pins[&crate::path_key::normalize_keep_drive(&zip)],
+            payload.pins[&crate::path_key::normalize_keep_drive(&zip)].source,
             pin
+        );
+        assert_eq!(
+            payload.pins[&crate::path_key::normalize_keep_drive(&zip)].cover_crop,
+            None
         );
         assert_eq!(payload.tags[&key], vec!["#日本語"]);
         assert_eq!(payload.tags.len(), 2);
