@@ -29,7 +29,7 @@
   - `mimageviewer-vst3-host.exe` (1,239,128 bytes) sha256 `958840b3e0fc5d8e883036c2e08416869730af98f9f22705a9f1c0ce215ba431` — 0/71、Google・Microsoft とも Undetected。https://www.virustotal.com/gui/file/958840b3e0fc5d8e883036c2e08416869730af98f9f22705a9f1c0ce215ba431
   - `effetune/mIV Sound.vst3/Contents/x86_64-win/mIV Sound.vst3` (5,894,232 bytes) sha256 `caaa4591b37c7f572381e3b6b28e9f4eff78afac22dfb947af590d0d34e73a35` — 0/71、Google・Microsoft とも Undetected。https://www.virustotal.com/gui/file/caaa4591b37c7f572381e3b6b28e9f4eff78afac22dfb947af590d0d34e73a35
   - 次回からは中身が変わったときだけ検査する (利用者決定、チェックリスト 12.6 を更新)。
-- **公開後 (2026-11-13 夜)**: GitHub Release v5.2.0 (タグ・main = `81777f69d`)、資産 4 点の sha256 が手元と一致・latest・CI 緑。mikage.to 反映 19 ファイル + sitemap.xml、verify-site 403/404 (`.htaccess` の 403 のみ)、DL 3 点 200・サイズ一致。sitemap.xml はサイト直下のフォルダが別アカウントの持ち物で tar の削除→作成が失敗したため、`deploy-site.ps1` の展開を `--overwrite` (既存ファイルへ上書き) に直して上げた (これまでの手作業の scp 上書きが不要になる)。
+- **公開後 (2026-11-13 夜)**: GitHub Release v5.2.0 (タグ・main = `81777f69d`)、資産 4 点の sha256 が手元と一致・latest・CI 緑。mikage.to 反映 19 ファイル + sitemap.xml、verify-site 403/404 (`.htaccess` の 403 のみ)、DL 3 点 200・サイズ一致。sitemap.xml はサイト直下のフォルダが別アカウントの持ち物で tar の削除→作成が失敗したため、`deploy-site.ps1` の展開を `--overwrite` (既存ファイルへ上書き) に直して上げた (これまでの手作業の scp 上書きが不要になる)。プライバシーポリシーの英語版に「撮影地点を地図で開く」が抜けていたので追記して反映 (`36d899b28`)。Vector 申請は利用者が実施。Store 用 setup.exe を R2 `https://dl.mikage.jp/mimageviewer/v5.2.0/mImageViewer_setup.exe` に配置 (HTTP 200・サイズと配信 sha256 一致)。認定の注意事項は審査手順に関わる変更がないため前のまま。
 
 ## v5.1.0 (2026-11-10)
 
