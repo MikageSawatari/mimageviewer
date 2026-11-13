@@ -1,5 +1,6 @@
 #include "asr_protocol.h"
 #include "asr_window.h"
+#include "device_selection.h"
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -26,9 +27,65 @@ void utf8() {
     require(carry.append("b\xf0\x9f") == "b", "partial final");
     carry.finish();
     require(carry.append("next") == "next", "discard final partial");
-    for (const auto & bytes : {std::string("\x80"),std::string("\xc0\x80"),std::string("\xed\xa0\x80"),
-        std::string("\xf4\x90\x80\x80"),std::string("\xe6x")})
-        rejects([&] { asr::Utf8Carry invalid; invalid.append(bytes); });
+    require(carry.discarded_bytes()==2 && carry.discarded_fragments()==1,"final pending counted once");
+    carry.finish();
+    require(carry.discarded_bytes()==2 && carry.discarded_fragments()==1,"empty finish adds nothing");
+    struct Case { std::string input, expected; uint64_t bytes, fragments; };
+    for (const auto & item : std::vector<Case>{
+        {"\x80","",1,1},{"\xc0\x80","",2,2},{"\xe0\x80\x80","",3,3},
+        {"\xed\xa0\x80","",3,3},{"\xf4\x90\x80\x80","",4,4},
+        {"\xe6x","x",1,1},{"\xe3\x83" "A","A",2,1},{"\xc2\xc3\xa9","é",1,1},
+        {"a\xff\xfe" "b","ab",2,2},{"\xf0\x9f\x98\x80","😀",0,0}}) {
+        asr::Utf8Carry repaired;
+        require(repaired.append(item.input)==item.expected,"repair preserves valid bytes and ASCII");
+        repaired.finish();
+        require(repaired.discarded_bytes()==item.bytes && repaired.discarded_fragments()==item.fragments,"repair fragment definition");
+    }
+    asr::Utf8Carry observed;
+    require(observed.append("\xe3\x83")=="","G fragment initially held");
+    require(observed.append("\xe3\x81\x86")=="う","G next valid character reprocessed");
+    observed.finish();
+    require(observed.discarded_bytes()==2 && observed.discarded_fragments()==1,"G two-byte prefix one fragment");
+}
+std::string encode(uint32_t cp) {
+    if(cp<0x80)return std::string(1,static_cast<char>(cp));
+    if(cp<0x800)return {char(0xc0|(cp>>6)),char(0x80|(cp&0x3f))};
+    if(cp<0x10000)return {char(0xe0|(cp>>12)),char(0x80|((cp>>6)&0x3f)),char(0x80|(cp&0x3f))};
+    return {char(0xf0|(cp>>18)),char(0x80|((cp>>12)&0x3f)),char(0x80|((cp>>6)&0x3f)),char(0x80|(cp&0x3f))};
+}
+void whitespace() {
+    const std::vector<uint32_t> spaces{9,10,11,12,13,0x1c,0x1d,0x1e,0x1f,0x20,0x85,0xa0,0x1680,
+        0x2000,0x2001,0x2002,0x2003,0x2004,0x2005,0x2006,0x2007,0x2008,0x2009,0x200a,0x2028,0x2029,0x202f,0x205f,0x3000};
+    for(const auto cp:spaces) {
+        auto s=encode(cp);
+        require(asr::trim(s+"😀"+s)=="😀","Python whitespace removed at both ends");
+        require(asr::trim("a"+s+"b")=="a"+s+"b","interior whitespace preserved");
+        require(asr::trim(s+s).empty(),"all-whitespace text removed");
+    }
+    for(const auto cp:{0x200b,0xfeff,0x180e,0x200c,0x200d}) {
+        const auto s=encode(cp);require(asr::trim(s+"a"+s)==s+"a"+s,"non-space codepoints preserved");
+    }
+    size_t matched=0;
+    for(uint32_t cp=0;cp<=0x10ffff;++cp)if(asr::python_space(cp))++matched;
+    require(matched==29,"exact Python whitespace set");
+}
+void devices() {
+    using json=nlohmann::json;
+    const std::string a="00000000:0000000A", b="00000000:0000000B";
+    auto row=[](const std::string & luid,const std::string & name,uint32_t index,uint64_t memory,bool software=false) {
+        return json{{"luid",luid},{"name",name},{"physical_index",index},{"pci_id",name},
+            {"dxgi",{{"software",software},{"dedicated_bytes",memory}}}};
+    };
+    const auto initial=json::array({row(a,"A",0,8u),row(b,"B",1,0u)});
+    const auto reordered=json::array({row(b,"B",0,0u),row(a,"A",1,8u)});
+    require(worker_devices::select_inventory_device(initial,a)["physical_index"]==0u,"initial LUID lookup");
+    require(worker_devices::select_inventory_device(reordered,"00000000:0000000a")["physical_index"]==1u,"stable LUID survives inventory reorder");
+    require(worker_devices::select_inventory_device(reordered,b)["name"]=="B","explicit integrated GPU accepted");
+    require(worker_devices::select_inventory_device(reordered,"")["name"]=="A","VLM maximum dedicated memory unchanged");
+    rejects([&]{worker_devices::select_inventory_device(json::array({row(b,"B",0,0u)}),"");});
+    rejects([&]{worker_devices::select_inventory_device(json::array({row(a,"A",0,8u,true)}),a);});
+    rejects([&]{worker_devices::select_inventory_device(reordered,"00000000:0000000C");});
+    rejects([&]{worker_devices::select_inventory_device(json::array({row(a,"A",0,8u),row(a,"B",1,8u)}),a);});
 }
 void protocol() {
     using namespace asr_protocol;
@@ -43,7 +100,11 @@ void protocol() {
     accept({{"type","hello"}});
     rejects([&] { accept({{"type","hello"}}); });
     rejects([&] { accept({{"type","load"},{"model_path","m"},{"device_index",-1}}); });
-    accept({{"type","load"},{"model_path","m"},{"device_index",0u}});
+    for(const auto luid:{"", "00000000-0000000A", "00000000:0000000G", "00000000:0000000"})
+        rejects([&] { accept({{"type","load"},{"model_path","m"},{"device_luid",luid}}); });
+    rejects([&] { accept({{"type","load"},{"model_path","m"}}); });
+    rejects([&] { accept({{"type","load"},{"model_path","m"},{"device_luid","00000000:0000000A"},{"device_index",0u}}); });
+    accept({{"type","load"},{"model_path","m"},{"device_luid","00000000:0000000A"}});
     for (uint64_t request : {1u,2u}) {
         accept({{"type","begin"},{"request_id",request}});
         rejects([&] { accept({{"type","pcm"},{"request_id",request+1}}, {0,0}); });
@@ -63,6 +124,12 @@ void protocol() {
     std::istringstream in(bytes,std::ios::binary);
     require(framing::read(in,frame) && frame.header["type"]=="hello","framed response");
     require(!framing::read(in,frame),"clean frame EOF");
+    // token本文の修復をtransportには適用しない。不正なUTF-8 headerは常に拒否する。
+    std::string invalid="{\"type\":\"";invalid.push_back(char(0x80));invalid+="\"}";
+    std::ostringstream bad(std::ios::binary);
+    framing::write_u32(bad,static_cast<uint32_t>(invalid.size()+4));
+    framing::write_u32(bad,static_cast<uint32_t>(invalid.size()));bad<<invalid;
+    rejects([&]{std::istringstream input(bad.str(),std::ios::binary);Frame f;framing::read(input,f);});
 }
 void feed(asr::Stream & stream, size_t samples, bool speech) {
     std::vector<unsigned char> chunk(1024*1024);
@@ -143,75 +210,85 @@ void eof() {
     },[](asr::Window w) { require(w.final&&w.join_ms==0,"empty final"); });
     empty.end();require(empty.duration_ms()==0,"empty duration");
 }
-void failed_item(bool during_append) {
+void retained_counts(bool lookahead_only) {
+    size_t recognitions=0;
+    std::vector<asr::Window> windows;
+    asr::Stream stream([&](const float *,size_t,uint64_t) {
+        ++recognitions;
+        if(recognitions>1)return std::vector<asr::Segment>{{0,100,"　次　"}};
+        if(lookahead_only)return std::vector<asr::Segment>{{0,100," 有効 "},{1791000,1791100,"\xff\x80"}};
+        // retained部分でGの断片2byte、invalid lead1byte、窓末尾pending2byte。
+        // 継ぎ目以降のlookaheadの不正2byteは計数しない。
+        return std::vector<asr::Segment>{{0,100," \xe3\x83"},{100,200,"\xe3\x81\x86\xc0\xf0\x9f"},
+            {1791000,1791100,"\xff\x80"}};
+    },[&](asr::Window w){windows.push_back(std::move(w));});
+    feed(stream,1820*asr::kRate+16,false);
+    stream.end();
+    require(windows.size()==2 && !windows[0].final && windows[1].final,"two counting windows");
+    require(windows[0].utf8_discarded_bytes==(lookahead_only?0u:5u) &&
+        windows[0].utf8_discarded_fragments==(lookahead_only?0u:3u),"only retained fragments counted");
+    require(windows[0].segments.size()==1 && windows[0].segments[0].text==(lookahead_only?"有効":"う"),"retained text repaired then Unicode trimmed");
+    require(windows[1].utf8_discarded_bytes==0 && windows[1].utf8_discarded_fragments==0 &&
+        windows[1].segments[0].text=="次","window counters independent");
+    // 最後の区間がpendingだけで消えても、finishの破棄数は窓に残る。
+    asr::Stream pending([](const float *,size_t,uint64_t){return std::vector<asr::Segment>{{0,100,"\xe3\x83"}};},
+        [](asr::Window w){require(w.final&&w.segments.empty()&&w.utf8_discarded_bytes==2&&w.utf8_discarded_fragments==1,"pruned final segment still counted");});
+    feed(pending,asr::kRate,false);pending.end();
+}
+void request_lifecycle(bool early_end) {
     using namespace asr_protocol;
     Session session;
-    auto accept = [&](json header, std::vector<unsigned char> bytes = {}) {
-        Frame frame{std::move(header),std::move(bytes)};
-        session.accept(validate(frame),frame.header,frame.bytes.size());
-        return frame;
+    auto accept=[&](json header,const std::vector<unsigned char> & bytes=std::vector<unsigned char>{}) {
+        Frame frame{std::move(header),bytes};session.accept(validate(frame),frame.header,frame.bytes.size());
     };
     accept({{"type","hello"}});
-    accept({{"type","load"},{"model_path","m"},{"device_index",0u}});
+    accept({{"type","load"},{"model_path","m"},{"device_luid","00000000:0000000A"}});
     accept({{"type","begin"},{"request_id",10u}});
-    size_t recognitions = 0, published = 0;
-    auto recognize = [&](const float *, size_t, uint64_t) {
+    size_t recognitions=0;
+    std::vector<asr::Window> tentative;
+    auto recognize=[&](const float *,size_t,uint64_t) {
         ++recognitions;
-        // Gで観測した形。保留中のe3 83へ新しい文字e3 81 86が続くので、
-        // 連結後もUTF-8にならない。置換や黙った削除では直さない。
-        if (recognitions == 1) return std::vector<asr::Segment>{{0,100,"a\xe3\x83"},{100,200,"\xe3\x81\x86"}};
-        return std::vector<asr::Segment>{{0,500,"次の入力"}};
+        if(recognitions==1)return std::vector<asr::Segment>{{0,100,"a\xe3\x83"},{100,200,"\xe3\x81\x86"}};
+        return std::vector<asr::Segment>{{0,100,"次の入力"}};
     };
-    auto stream = std::make_unique<asr::Stream>(recognize, [&](asr::Window) { ++published; });
-    std::vector<unsigned char> chunk(during_append ? kMaxPcmBytes : 32000, 0);
-    uint64_t received_bytes = 0;
+    auto publish=[&](asr::Window w) {
+        session.record_window(w.utf8_discarded_bytes,w.utf8_discarded_fragments);
+        tentative.push_back(std::move(w));
+    };
+    auto stream=std::make_unique<asr::Stream>(recognize,publish);
+    const std::vector<unsigned char> chunk(early_end?kMaxPcmBytes:32000,0);
+    uint64_t received_bytes=0;
     do {
-        auto frame = accept({{"type","pcm"},{"request_id",10u}},chunk);
-        received_bytes += frame.bytes.size();
-        session.run_item([&] { stream->append(frame.bytes.data(),frame.bytes.size()); });
-    } while (during_append && !session.draining());
-    if (during_append) {
-        require(session.draining(),"append UTF-8 failure enters Draining");
-        // 失敗した枠の残りも長さへ入り、次のPCMは推論へ渡らない。
-        require(received_bytes / 32 > 1820000,"whole failing PCM frame counted");
-        stream.reset();
-        auto drained = accept({{"type","pcm"},{"request_id",10u}},std::vector<unsigned char>(32000,0));
-        received_bytes += drained.bytes.size();
-        session.run_item([&] { throw std::runtime_error("Draining decoded more PCM"); });
-        rejects([&] { accept({{"type","begin"},{"request_id",11u}}); });
-        rejects([&] { accept({{"type","pcm"},{"request_id",11u}},{0,0}); });
-        rejects([&] { session.accept_eof(); });
-    }
-    accept({{"type","end"},{"request_id",10u}});
-    session.run_item([&] { stream->end(); });
-    const auto failed = session.end_response();
-    require(failed["status"]=="item_failure" && failed["code"]=="invalid_utf8", "typed per-input UTF-8 failure");
-    require(failed["duration_ms"]==received_bytes/32 && failed["request_id"]==10u,"failed input full duration and ID");
-    require(recognitions==1 && published==0,"failed input publishes no invalid window");
-    stream.reset();
-    session.complete_end();
-    require(!session.streaming(),"one terminal end completes failed input");
-    rejects([&] { accept({{"type","end"},{"request_id",10u}}); });
-    // 同じLoaded sessionと認識器で次の入力を処理する。再load・再試行なし。
+        accept({{"type","pcm"},{"request_id",10u}},chunk);received_bytes+=chunk.size();
+        stream->append(chunk.data(),chunk.size());
+    }while(early_end&&tentative.empty());
+    rejects([&]{accept({{"type","begin"},{"request_id",11u}});});
+    rejects([&]{accept({{"type","pcm"},{"request_id",11u}},{0,0});});
+    rejects([&]{session.accept_eof();});
+    accept({{"type","end"},{"request_id",10u}});stream->end();
+    const auto end=session.end_response();
+    require(end["status"]=="ok"&&end["duration_ms"]==received_bytes/32&&end["request_id"]==10u,"early or normal end counts all received PCM");
+    uint64_t bytes=0,fragments=0;
+    for(const auto & w:tentative){bytes+=w.utf8_discarded_bytes;fragments+=w.utf8_discarded_fragments;}
+    require(end["utf8_discarded_bytes"]==bytes&&end["utf8_discarded_fragments"]==fragments&&bytes==2&&fragments==1,"end sums published window counts");
+    require(tentative.back().final,"end completes current input without draining state");
+    // 抽出失敗は本体が途中endを送り、この入力の暫定窓を捨てる。同じモデルを次へ使う。
+    tentative.clear();stream.reset();session.complete_end();
+    rejects([&]{accept({{"type","end"},{"request_id",10u}});});
     accept({{"type","begin"},{"request_id",11u}});
-    stream = std::make_unique<asr::Stream>(recognize, [&](asr::Window w) {
-        ++published;require(w.segments.size()==1 && w.segments[0].text=="次の入力","next input text");
-    });
-    auto good = accept({{"type","pcm"},{"request_id",11u}},std::vector<unsigned char>(32000,0));
-    session.run_item([&] { stream->append(good.bytes.data(),good.bytes.size()); });
-    accept({{"type","end"},{"request_id",11u}});
-    session.run_item([&] { stream->end(); });
-    require(session.end_response()["status"]=="ok" && session.end_response()["duration_ms"]==1000u,"next input succeeds");
-    session.complete_end();
-    session.accept_eof();
-    require(recognitions==2 && published==1,"model owner reused after failed input");
-    accept({{"type","begin"},{"request_id",12u}});
-    rejects([&] { session.run_item([] { throw std::runtime_error("GPU failure must remain fatal"); }); });
-    require(!session.draining(),"non-UTF8 failures are not converted to item failures");
+    require(session.end_response()["utf8_discarded_bytes"]==0u&&session.end_response()["utf8_discarded_fragments"]==0u,"begin resets request counters");
+    stream=std::make_unique<asr::Stream>(recognize,publish);
+    const std::vector<unsigned char> good(32000,0);
+    accept({{"type","pcm"},{"request_id",11u}},good);stream->append(good.data(),good.size());
+    accept({{"type","end"},{"request_id",11u}});stream->end();
+    require(session.end_response()["status"]=="ok"&&session.end_response()["duration_ms"]==1000u,"next input succeeds after early end");
+    require(session.end_response()["utf8_discarded_bytes"]==0u&&session.end_response()["utf8_discarded_fragments"]==0u,"next input does not inherit repair counts");
+    require(tentative.size()==1&&tentative[0].segments[0].text=="次の入力","no tentative result leaks into next input");
+    session.complete_end();session.accept_eof();
 }
 }
 int main() {
-    try { seams();utf8();protocol();loop(false);loop(true);eof();failed_item(true);failed_item(false);
-        std::cout<<"ASR framing, UTF-8, seams, quiet/forced fake recognizer, EOF and per-input failure continuation passed\n"; }
+    try { seams();utf8();whitespace();devices();protocol();loop(false);loop(true);eof();retained_counts(false);retained_counts(true);request_lifecycle(true);request_lifecycle(false);
+        std::cout<<"ASR strict framing, UTF-8 repair/counts, Unicode trim, stable LUID, windows and early-end lifecycle passed\n"; }
     catch(const std::exception & e) { std::cerr<<e.what()<<'\n';return 1; }
 }

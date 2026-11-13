@@ -1,9 +1,175 @@
 # ローカル文字起こし T1 区切り1 実装・検証記録
 
-2026-11-14。設計・検収は ClaudeCode Opus、実装・テストは Codex、独立レビューは別の
-gpt-6.1-sol / xhigh。作業ツリーは `G:\home\mimageviewer-asr-t1`、コミットしていない。
-本体製品exeは起動せず、通常プロファイルとバックアップへは手を加えていない。
-指定のworker exeだけを再ビルド・単体起動して確認した。
+## 検収後の修正（2026-11-14、現在の結果）
+
+検収済み `280f0301c` に対するP2/P3と、設計担当が決定したUTF-8修復の変更を実装した。
+今回の変更はコミットしていない。作業ツリーは `G:\home\mimageviewer-asr-t1` だけを編集し、
+本体製品exe、通常プロファイル、バックアップには触れていない。指定のworkerだけを単体実行した。
+別の `gpt-6.1-sol / xhigh` による完了レビューで、新規P1/P2/P3の指摘はない。
+以下の現行結果が、後半に残した初回実装の履歴を更新する。
+
+### 修正内容と契約
+
+- GPU選択からloadまで選択したLUIDを保持する。`LoadRequest.device_luid` を送信し、
+  workerは最新の一覧でLUIDから解決する。番号の `device_index` は受け付けない。
+  Rustは応答のLUIDを要求、およびDXGIのLUIDと照合する。物理番号が変わった同じGPUは受理し、
+  番号が同じ別GPUは拒否する。既存VLMの選択部分を純粋な共通関数へ移し、VLMの条件は維持した。
+- 端の空白はPython `str.isspace()` と同じ29文字に固定した。U+3000を含み、U+200B/U+FEFFは含めない。
+  有効なUTF-8へ復元した後に `str.strip()` 相当を適用する。内部の空白は保つ。
+- 採用するtoken本文でだけ復元不能なUTF-8断片を捨てる。不一致まで一致したprefixを捨て、
+  不一致を起こしたbyteは先頭として再評価する。`e3 83 e3 81 86` は `e3 83` だけを捨て「う」を保つ。
+  正常な区間またぎ、ASCII、4byte文字は維持する。窓末尾の未完prefixは従来どおり捨てる。
+  共有framingは変更せず、Rustの不正wire拒否も維持した。
+- `Window` / `End` の必須u64フィールドは `utf8_discarded_bytes` / `utf8_discarded_fragments`。
+  不一致で捨てるprefixを1断片、不正な先頭・単独の継続byteを各1byte・1断片と数える。
+  overlong・surrogate・範囲外の2byte目で失敗した場合も先頭だけを捨て、残りを再評価する。
+  窓末尾の未完prefixは全体で1断片。採用する区間だけをtrim前に数え、捨てるlookaheadと端の空白は数えない。
+  区間が空になって除去されても破棄数は残す。Endは公開したWindowの合計、beginで0へ戻す。
+  clientは値の整合、加算overflow、終端合計も検査する。定義はコードとworker READMEにも記載した。
+- `Draining`、`InvalidUtf8` 専用の `FileFailure`、Rustの `AsrFileFailure` / `AsrEvent::FileFailure` を削除した。
+  抽出途中でendを送り、呼出し元が暫定窓を捨て、次のbeginへ進む使い方をC++の実StreamとRustの偽workerで検査した。
+  モデルの再load、再試行、回復処理は追加していない。
+
+窓の切り方・継ぎ目・CLI paramsは検収済み実装から変えていない。設計担当が更新した
+`docs/local-asr-transcript-plan.md` は今回の開始時から変更済みであり、実装側からは編集していない。
+計画との意図した相違はない。破棄数のperf・ログへの接続、抽出失敗を扱う作成ジョブは依頼どおり次の区切り。
+
+### 最終workerでの実モデル回帰
+
+最終worker（下記SHA）でモデルを1回loadし、m1→m2→m3→m4→m5→m6→Gを同じprocessで実行した。
+GPUはRTX 4090、要求と応答のLUIDはともに `00000000:00016A26`。
+モデルは評価正本の `ggml-large-v3-turbo-q5_0.bin`。m1〜m5は
+`work/runs/turbo-q5_0-vulkan-mc0/<素材>/audio16k.wav`、m6は指定の
+`work/runs/t0/m6/audio16k.wav`、Gは `work/user-videos/audio/G.wav` を読んだ。
+
+| 素材 | 窓数 | 区間数（worker / 評価） | 全区間の本文・開始・終了 |
+| --- | --- | --- | --- |
+| m1 | 1 | 22 / 22 | 完全一致 |
+| m2 | 1 | 28 / 28 | 完全一致 |
+| m3 | 1 | 31 / 31 | 完全一致 |
+| m4 | 1 | 28 / 28 | 完全一致 |
+| m5 | 1 | 10 / 10 | 完全一致 |
+| m6 | 3 | 477 / 477 | 完全一致 |
+| G | 9 | 3488 / 3488 | 旧replace本文との差は2区間。生byteから独立修復した参照とは全件一致 |
+
+m1〜m6の破棄数はすべて0。m6の継ぎ目は1805020 / 3608180msでT0と一致した。
+Gは507,010,868bytesのPCMをすべて送信し、全9窓と `end status=ok, duration_ms=15844089` を受信した。
+Gの開始・読み終わり・継ぎ目・区間数・破棄数も全窓でT0参照と一致した。
+T0は最終長を秒の小数点以下2桁へ丸めて15844090msとするため、その1msだけは実WAVのsample数から
+求めたfloor値15844089msを期待値とした。差は比較JSONの `t0_rounding_delta_ms:1` に残した。
+区間時刻を補正する変更はない。
+
+Gの差は以下の2か所だけ。旧評価は不正byteを `errors="replace"` で読んでおり、そこにあった
+置換文字が今回なくなる。後続の正常な文字は維持され、区間数と全区間時刻は変わらない。
+本文は記録へ転載せず、元CLI区間番号・byte位置はともに0始まりで示す。
+
+| 窓 | 元CLI区間 | 区間の絶対開始 / 終了 (ms) | 区間本文のbyte位置 | 捨てたhex | 次区間の先頭（維持） |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 162 | 760740 / 790740 | 511〜512 | `e3 83` | `e3 81 86` |
+| 3 | 88 | 3935720 / 3935720 | 279〜280 | `e3 81` | `e3 81 b2` |
+
+どちらも前区間の末尾の未完prefixを持ち越した後、次区間の新しい先頭で不一致となったもの。
+合計4byte・2断片。参照解析は元CLI JSONを `surrogateescape` で読んでbyteを復元し、
+workerとは別のPython実装で採用区間の修復・stripを行った。
+証跡は `target/asr-t1-fixes/{asr-final.json,asr-final.stderr.log,asr-command.json,asr-comparison.json}`。
+
+VLMも同じ最終workerでQwen3.5-4B Q4_K_M + mmproj-F16を再確認した。
+統合前exe（SHA `d342f3564c87362b160d296967ed70b823e1d82dfb3254f379ed53a19ba298b9`）との比較で、
+READMEの26枚はvalidation 26/26、caption/text/keywords/content/status/finish_reason/generated_tokens/
+usage/prompt_chunks/validationの10項目とGPUがすべて26/26完全一致。
+`--serve` protocol 2の実モデル1枚も10項目・GPUが一致し、shutdown終了0。
+記録は `target/asr-t1-fixes/vlm-comparison/{summary.json,commands.txt}`。
+
+### G通しのメモリと所要時間（§13）
+
+100msを指定して現在の作業セットとcommit（GetProcessMemoryInfoのPagefileUsage）を採取した。
+窓応答を読み終えたreader threadで窓末尾も採取し、窓内ピークをリセットする。
+表のpeakは100ms採取値の窓ごとの最大、末尾は窓応答受信時の値であり、OSの累積peakと区別する。
+Gの範囲は5,006採取（周期4,997 + begin以降の窓snapshot等）。周期の間隔の中央値100.36ms、最大147.74ms。
+全7入力の生timelineは `asr-final.json.memory_samples` に6,071件保存した。
+MiBは1,048,576bytes。Gの各窓は次のとおり。
+
+| 窓 | 開始 / 読み終わり / 継ぎ目 (ms) | 区間数 | 破棄 byte / 断片 | WS peak / 末尾 (MiB) | commit peak / 末尾 (MiB) |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 0 / 1829800 / 1803260 | 412 | 2 / 1 | 623.11 / 401.99 | 2071.63 / 1349.83 |
+| 2 | 1803260 / 3634680 / 3604960 | 447 | 0 / 0 | 628.98 / 409.11 | 2078.16 / 1379.62 |
+| 3 | 3604960 / 5428790 / 5399220 | 377 | 2 / 1 | 635.29 / 420.70 | 2107.04 / 1393.82 |
+| 4 | 5399220 / 7219220 / 7193860 | 382 | 0 / 0 | 646.66 / 423.64 | 2122.36 / 1398.38 |
+| 5 | 7193860 / 9027210 / 8999200 | 304 | 0 / 0 | 652.11 / 439.51 | 2128.45 / 1382.18 |
+| 6 | 8999200 / 10829460 / 10814500 | 313 | 0 / 0 | 666.34 / 435.50 | 2111.36 / 1410.41 |
+| 7 | 10814500 / 12640050 / 12610200 | 420 | 0 / 0 | 663.27 / 442.36 | 2138.12 / 1380.95 |
+| 8 | 12610200 / 14440670 / 14410700 | 462 | 0 / 0 | 670.12 / 457.09 | 2112.20 / 1387.21 |
+| 9 | 14410700 / 15844089 / 15844089 | 371 | 0 / 0 | 642.47 / 449.52 | 2111.07 / 1384.10 |
+
+窓末commitは1349.83〜1410.41MiBに収まり、後半も上下している。窓末WSは401.99から449.52MiBへ
+47.53MiBの緩い増加があり、最大457.09MiBから最終窓では低下した。「増加が全くない」とは扱わない。
+9窓の観測では窓ごとのPCM・復号用一時メモリが累積する規模の増加は見られないが、
+これより長い入力での挙動まではこの1回の測定では断定しない。
+全processのOS累積peakはWS735.53MiB / commit2138.12MiBで、表の周期採取peakとは一致しない。
+
+同じ最終workerのm6も、窓末WS/commitは365.86/1336.87 → 373.30/1350.03 → 370.20/1341.24MiB、
+窓内peakは588.10/2020.76 → 595.03/2065.30 → 441.02/1981.34MiBだった。
+Gの処理は501.870秒 / 音声15844.089秒、実時間比0.03168（約31.57倍速）。m6は73.414秒。
+これはbeginからEnd受信までの参考値で、モデルloadを含まない。他セッションの負荷は排除できていない。
+
+### 検証コマンドと最終成果物
+
+以下のビルド・テスト・実モデル計測はすべて指定の入口経由で実行した。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local\miv-locks\run-heavy.ps1 -Owner asr-t1-codex -WorkDir G:\home\mimageviewer-asr-t1 -Command '<下表のコマンド>'
+```
+
+ロック領域へ書けずrunnerが警告してBelowNormalで続行した。Rustでは `CARGO_BUILD_JOBS=1`、
+`MSBUILDDISABLENODEREUSE=1`、`CMAKE_BUILD_PARALLEL_LEVEL=1` を設定した。
+Rustテスト時のPATHに `vendor/ffmpeg/bin` / `vendor/vcrt` を加えた。
+
+| コマンド（wrapper内） | 結果 |
+| --- | --- |
+| `cmake -S crates/vlm-worker -B crates/vlm-worker/build -G 'Visual Studio 18 2026' -A x64 -DVLM_REFERENCE_TOOLS=OFF` | 成功 |
+| `cmake --build crates/vlm-worker/build --config Release --target mimageviewer-vlm vlm-contract-tests vlm-greedy-tests vlm-image-attempt-tests vlm-output-tests vlm-image-input-tests vlm-protocol-tests asr-contract-tests -- /m:1 /nr:false` | 成功 |
+| `ctest --test-dir crates/vlm-worker/build -C Release --output-on-failure` | 最終8/8成功。UTF-8持越し・破棄/計数・4byte/overlong/surrogate/範囲外・Unicode空白・列挙順の入替・途中end→次beginを含む |
+| `cargo nextest run -j 1 -p mimageviewer --lib -E 'test(ai::asr_worker::) \| test(ai::vlm_worker::)' --no-fail-fast` | 45/45成功、7.974秒（compile 6分56秒）。strictな不正wire拒否・kill解除も維持 |
+| `python -B -I crates/vlm-worker/tools/test_asr_transcribe.py` | 5/5成功 |
+| `cargo check -j 1 -p mimageviewer --bin mimageviewer-core` | 成功、54.50秒 |
+| `powershell -NoProfile -File scripts/vlm-worker-identity.ps1 -ValidateRepo .` | 成功、最終exeと現sourceのidentity一致 |
+| `python -I crates/vlm-worker/tools/audit_imports.py --bin vendor/vlm-worker --dumpbin <VS dumpbin.exe> --out target/asr-t1-evidence/imports-repair-luid` | ADVAPI32/KERNEL32/dxgi/vulkan-1のみ。ws2_32/winhttp/wininetなし |
+| `python -B -I scripts/asr-model/regression_vlm.py run ...` / `compare ...` | 最終workerの26枚＋serve1枚すべて一致。実引数は上記 `commands.txt` |
+| `python -B -I crates/vlm-worker/tools/asr_transcribe.py --worker vendor/vlm-worker/mimageviewer-vlm.exe --model <評価model> --device-luid 00000000:00016A26 --out target/asr-t1-fixes/asr-final.json <m1..m6,GのWAV>` | 7入力すべてok、shutdown終了0。省略しない実引数は `asr-command.json` |
+| `python -B -I scripts/asr-model/analyze_repaired_asr.py --run target/asr-t1-fixes/asr-final.json --evaluation-work G:\home\mimageviewer-asr-eval\scripts\asr-eval\work --out target/asr-t1-fixes/asr-comparison.json` | 全件比較成功、exit0 |
+| `python -B -I target/asr-t1-fixes/final-source-checks.py`（内部で `cargo fmt`、`cargo fmt --check`、`git diff --check`、identity再検査） | すべて成功。独立参照decoderの5つの境界ケースと持越しbyteの出所、Python3ファイルの構文、最終exeのSHAも再検査 |
+
+ログは `target/asr-t1-fixes/{rust-focused,rust-check,python-tool-tests,vlm-run,vlm-compare}.log`、
+最終検査は `target/asr-t1-fixes/final-source-checks.log`、
+nativeは `target/asr-t1-evidence/worker-repair-luid-{build-ctest,identity,import-audit}.log`。
+初回のnamed pipe2件は検収側がsandbox外で再実行して成功済み。この環境の制約として扱う。
+全件libとworkspace gateは今回の修正で再実行しておらず、初回の有効な検証結果を再利用し、影響範囲を再検査した。
+前回のworkspace gateが要求したrelease内包用5exeは今回も追加buildしていない。
+UI未接続のAPI/worker修正なので本体の `build-dev.ps1` は実行せず、検証用成果物は下記Release workerとした。
+
+`vendor/vlm-worker/mimageviewer-vlm.exe` は48,491,520bytes。
+
+- SHA-256: `d7e38aee6e90cc96ce8125b684d9e875c37a06d6f17582043d8762cc7979811c`
+- source identity: `572c3ed51f59f4318f94b2ece56f9c6a0537cb8d9648b638ca73b19af17eb31e`
+
+### 今回の変更ファイル
+
+| ファイル（brace内は同じディレクトリ） | 要点 |
+| --- | --- |
+| `crates/vlm-worker/src/{devices.cpp,devices.h,device_selection.h}` | LUIDでの最新一覧の解決と、既存VLM選択部分の共有。新規 `device_selection.h` |
+| `crates/vlm-worker/src/{asr.cpp,asr_protocol.h,asr_window.h}` | LUID load、Unicode trim、断片修復・破棄数、状態の削減 |
+| `crates/vlm-worker/src/asr_errors.h` | `InvalidUtf8` 専用型を削除（ファイル削除） |
+| `crates/vlm-worker/tests/asr.cpp` | GPU identity・空白・UTF-8修復と数え方・early endの回帰 |
+| `src/ai/{asr_worker.rs,asr_worker_tests.rs}` | 要求/応答LUID、Window/End破棄数と検査、FileFailure削除と回帰 |
+| `tests/support/vlm_fake_worker.rs` | ASR load入替・破棄数・不正応答のfixture |
+| `crates/vlm-worker/tools/{asr_transcribe.py,test_asr_transcribe.py}` | LUID送信、破棄数検査、100ms生timeline、窓区間数と受信位置 |
+| `scripts/asr-model/analyze_repaired_asr.py` | 生byte由来の独立参照・破棄位置・全素材比較（新規） |
+| `crates/vlm-worker/README.md`, `docs/{async-architecture.md,local-asr-t1-chunk1-report.md}` | 現行契約と検証記録 |
+
+## 初回実装の履歴（検収済み280f0301c、以下は修正前）
+
+以下は初回検収時の記録で、`device_index` / `FileFailure` / Gの失敗と未測定の記述は上の修正で置き換わった。
+設計・検収はClaudeCode Opus、実装・テストはCodex、独立レビューは別のgpt-6.1-sol / xhigh。
 
 ## 範囲と API
 

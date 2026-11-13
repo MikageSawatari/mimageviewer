@@ -53,9 +53,9 @@ class Engine {
     double load_s_;
     int threads_;
 public:
-    Engine(const std::string & model, uint32_t device) {
+    Engine(const std::string & model, const std::string & device_luid) {
         auto begin = std::chrono::steady_clock::now();
-        device_ = select_asr_device(device).description;
+        device_ = select_asr_device(device_luid).description;
         threads_ = static_cast<int>(std::min(8u, std::max(1u, std::thread::hardware_concurrency())));
         whisper_log_set(whisper_log, &logs_);
         auto params = whisper_context_default_params();
@@ -164,7 +164,7 @@ int asr_serve() {
         try {
             if (kind == asr_protocol::Kind::Load) {
                 engine = std::make_unique<Engine>(framing::string_field(frame.header, "model_path"),
-                    static_cast<uint32_t>(framing::uint_field(frame.header, "device_index")));
+                    framing::string_field(frame.header, "device_luid"));
                 framing::write(std::cout, engine->loaded());
                 continue;
             }
@@ -172,20 +172,21 @@ int asr_serve() {
             if (kind == asr_protocol::Kind::Begin) {
                 stream = std::make_unique<asr::Stream>([&engine, request](const float * pcm, size_t size, uint64_t offset) {
                     return engine->recognize(pcm, size, offset, request);
-                }, [request](asr::Window window) {
+                }, [request, &session](asr::Window window) {
                     json segments = json::array();
                     for (const auto & s : window.segments)
                         segments.push_back({{"start_ms", s.start_ms}, {"end_ms", s.end_ms}, {"text", s.text}});
+                    session.record_window(window.utf8_discarded_bytes, window.utf8_discarded_fragments);
                     framing::write(std::cout, {{"type", "window"}, {"request_id", request}, {"start_ms", window.start_ms},
                         {"read_end_ms", window.read_end_ms}, {"join_ms", window.join_ms}, {"final", window.final},
-                        {"segments", std::move(segments)}});
+                        {"segments", std::move(segments)}, {"utf8_discarded_bytes", window.utf8_discarded_bytes},
+                        {"utf8_discarded_fragments", window.utf8_discarded_fragments}});
                 });
                 framing::write(std::cout, {{"type", "begin"}, {"request_id", request}, {"status", "ok"}});
             } else if (kind == asr_protocol::Kind::Pcm) {
-                session.run_item([&] { stream->append(frame.bytes.data(), frame.bytes.size()); });
-                if (session.draining()) stream.reset();
+                stream->append(frame.bytes.data(), frame.bytes.size());
             } else if (kind == asr_protocol::Kind::End) {
-                session.run_item([&] { stream->end(); });
+                stream->end();
                 framing::write(std::cout, session.end_response());
                 stream.reset();
                 session.complete_end();

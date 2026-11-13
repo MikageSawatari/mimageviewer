@@ -1,7 +1,7 @@
 """ASR protocol 1 の実モデル検証。WAV を逐次送信し、結果とメモリのピークを新規保存する。
 
 python -I crates/vlm-worker/tools/asr_transcribe.py --worker vendor/vlm-worker/mimageviewer-vlm.exe \
-    --model MODEL --device 0 --out target/asr-evidence/run.json WAV16K [WAV16K ...]
+    --model MODEL --device-luid HIGH:LOW --out target/asr-evidence/run.json WAV16K [WAV16K ...]
 
 同じプロセス・モデルで複数入力を処理する。製品アプリや設定には触れない。
 """
@@ -20,6 +20,15 @@ import time
 import wave
 
 MAX_FRAME = 16 * 1024 * 1024
+
+
+def discard_counts(event):
+    values = tuple(event[key] for key in ("utf8_discarded_bytes", "utf8_discarded_fragments"))
+    if any(type(value) is not int or not 0 <= value <= 2**64 - 1 for value in values):
+        raise ValueError("Invalid UTF-8 discard counters")
+    if (values[0] == 0) != (values[1] == 0) or values[1] > values[0]:
+        raise ValueError("Inconsistent UTF-8 discard counters")
+    return values
 
 
 def exact(pipe, count):
@@ -129,17 +138,17 @@ def transcribe_file(pipe, events, request, path, record, writers, timeout=1800):
         if event.get("request_id") != request:
             raise ValueError("Response request mismatch")
         if event["type"] == "end":
-            if event.get("status") not in ("ok", "item_failure"):
+            if event.get("status") != "ok":
                 raise ValueError("Unknown ASR end status")
-            if event["status"] == "item_failure":
-                if event.get("code") != "invalid_utf8" or not isinstance(event.get("error"), str):
-                    raise ValueError("Invalid per-input failure response")
-                record["item_failure"] = event
-                record["error"] = event["error"]
+            totals = discard_counts(event)
+            summed = tuple(sum(discard_counts(window)[i] for window in record["windows"]) for i in range(2))
+            if totals != summed:
+                raise ValueError("End UTF-8 discard counters differ from window totals")
             record["audio_seconds"] = event["duration_ms"] / 1000
             record["end"] = event
             record["status"] = event["status"]
-            record["segments_complete"] = event["status"] == "ok"
+            record["segments_complete"] = True
+            record["utf8_discarded_bytes"], record["utf8_discarded_fragments"] = totals
             writer.join()
             if record.get("writer_error"):
                 raise RuntimeError(f"PCM writer failed: {record['writer_error']}")
@@ -149,7 +158,11 @@ def transcribe_file(pipe, events, request, path, record, writers, timeout=1800):
         if event["type"] == "progress":
             record["progress_ms"].append(event["processed_ms"])
         elif event["type"] == "window":
-            record["windows"].append({key: value for key, value in event.items() if key != "segments"})
+            discard_counts(event)
+            window = {key: value for key, value in event.items() if key != "segments"}
+            window["segment_count"] = len(event["segments"])
+            window["segment_range_start"] = len(record["segments"])
+            record["windows"].append(window)
             record["segments"].extend({"start": s["start_ms"] / 1000, "end": s["end_ms"] / 1000,
                                       "text": s["text"]} for s in event["segments"])
         else:
@@ -160,7 +173,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worker", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
-    parser.add_argument("--device", type=int, required=True, help="Vulkan physical_index")
+    parser.add_argument("--device-luid", required=True, help="Selected DXGI LUID (HIGH:LOW)")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("wav", type=Path, nargs="+")
     args = parser.parse_args()
@@ -176,11 +189,12 @@ def main():
         peaks = {"working_set_bytes": 0, "commit_bytes": 0, "private_bytes": 0}
         interval = {"working_set_bytes": 0, "commit_bytes": 0, "private_bytes": 0}
         memory_lock = threading.Lock()
+        memory_samples = []
         get_memory = ctypes.WinDLL("psapi").GetProcessMemoryInfo
         get_memory.argtypes = [wintypes.HANDLE, ctypes.POINTER(Memory), wintypes.DWORD]
         get_memory.restype = wintypes.BOOL
 
-        def memory_snapshot(reset=False):
+        def memory_snapshot(reset=False, reason="sample"):
             counters = Memory()
             counters.cb = ctypes.sizeof(counters)
             if not get_memory(wintypes.HANDLE(int(process._handle)), ctypes.byref(counters), counters.cb):
@@ -188,6 +202,7 @@ def main():
             current = {"working_set_bytes": counters.WorkingSetSize, "commit_bytes": counters.PagefileUsage,
                        "private_bytes": counters.PrivateUsage}
             with memory_lock:
+                memory_samples.append({"wall_s":time.perf_counter()-started,"reason":reason,**current})
                 for key, value in current.items():
                     interval[key] = max(interval[key], value)
                 # OS が保持する累積ピークと、窓ごとにリセットする現在量のピークを分ける。
@@ -208,9 +223,9 @@ def main():
             try:
                 while True:
                     event = read_frame(process.stdout)
-                    if event["type"] in ("window", "begin", "load", "error") or event.get("status") in ("fatal", "item_failure"):
+                    if event["type"] in ("window", "begin", "load", "error") or event.get("status") == "fatal":
                         # 書込み側の背圧と無関係に、到着した窓の時点で採取する。
-                        event["memory"] = memory_snapshot(reset=True)
+                        event["memory"] = memory_snapshot(reset=True, reason=event["type"])
                         event["received_wall_s"] = time.perf_counter() - started
                     events.put(event)
             except BaseException as error:
@@ -232,7 +247,7 @@ def main():
             return event
 
         report = {"worker": str(args.worker.resolve()), "model": str(args.model.resolve()),
-                  "device_index": args.device, "stderr_log": str(log.resolve()), "files": []}
+                  "device_luid": args.device_luid, "stderr_log": str(log.resolve()), "files": []}
         writers = []
         current = None
         file_start = None
@@ -241,8 +256,10 @@ def main():
             report["hello"] = receive("hello")
             if report["hello"].get("role") != "asr" or report["hello"]["protocol_version"] != 1:
                 raise ValueError("Worker role/protocol mismatch")
-            send(process.stdin, {"type": "load", "model_path": str(args.model.resolve()), "device_index": args.device})
+            send(process.stdin, {"type": "load", "model_path": str(args.model.resolve()), "device_luid": args.device_luid})
             report["load"] = receive("load")
+            if report["load"]["device"]["luid"].upper() != args.device_luid.upper():
+                raise ValueError("Worker loaded a different GPU LUID")
             for request, path in enumerate(args.wav, 1):
                 file_start = time.perf_counter()
                 current = {"input": str(path.resolve()), "request_id": request, "status": "running",
@@ -279,6 +296,7 @@ def main():
             monitor.join()
             receiver.join(timeout=5)
             report["process_peaks"] = peaks
+            report["memory_samples"] = memory_samples
             report["wall_s"] = time.perf_counter() - started
             json.dump(report, output, ensure_ascii=False, indent=1)
             output.write("\n")

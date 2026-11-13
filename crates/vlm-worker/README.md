@@ -86,27 +86,25 @@ u32 の JSON byte 長、UTF-8 JSON object、任意の binary。body 上限は16M
 JSON の不正 UTF-8・raw NUL・途中 EOF は拒否する。stdout は枠だけ、診断は stderr。
 
 1. `hello` → `hello {role:"asr", protocol_version:1, settings_version:1, source_identity}`。
-2. `load {model_path, device_index}` → `load {status:"ok", model_load_s, cpu_threads, device}`。
-   `device_index` は `--list-devices` の Vulkan `physical_index`。DXGI のソフトウェア adapter を除外し、
-   LUID と PCI ID (無ければ一意の名前) を照合して、選んだ物理番号だけを Vulkan0 に公開する。
+2. `load {model_path, device_luid}` → `load {status:"ok", model_load_s, cpu_threads, device}`。
+   `device_luid` は選択したDXGI adapterの空でない `HIGH:LOW` 形式のLUID。
+   workerが最新の一覧へそのLUIDを直接照合するので、列挙順が変わっても別のGPUを選ばない。
+   `device_index` は受理しない。DXGI のソフトウェア adapter を除外し、
+   PCI ID (無ければ一意の名前) も照合して、その時点の物理番号だけを Vulkan0 に公開する。
    whisper に渡す番号はその0。内蔵 GPU を含め VRAM 下限なし。GPU 初期化失敗を CPU 実行へ落とさない。
 3. `begin {request_id}` → 同じ ID の `begin {status:"ok"}`。
 4. `pcm {request_id}` と binary の16kHz mono s16le PCM (1枠1MiB以下、空・奇数byte不可)。PCMごとの応答は無い。
-5. `end {request_id}` → 最後の窓を返して `end {status:"ok", duration_ms}`。
-   不正なUTF-8が出た入力は残りのPCMを保持せず読み捨て、同じendへ
-   `end {status:"item_failure", code:"invalid_utf8", error, duration_ms}` を1回返す。
-   最後の窓で不正が分かった場合も、そのendで失敗を返して終える。
-   長さは失敗した枠の残りと読み捨てた枠を含む全受信sample数から求める。
-   失敗後もロードした同じモデルで次の begin/pcm/end を処理できる。
+5. `end {request_id}` → 最後の窓を返して `end {status:"ok", duration_ms, utf8_discarded_bytes, utf8_discarded_fragments}`。
+   長さは全受信sample数から求める。ロードした同じモデルで次の begin/pcm/end を処理できる。
+   本体の抽出が途中で失敗した場合も、その時点でendを送り、本体がその入力の暫定窓を捨てる。
 6. `shutdown` はどの段階でも終了。中止は親がプロセスを終了させる。
 
 推論中は callback から `progress {request_id, processed_ms}`、窓の終了時は
-`window {request_id, start_ms, read_end_ms, join_ms, final, segments:[{start_ms,end_ms,text}]}` を返す。
+`window {request_id, start_ms, read_end_ms, join_ms, final, segments:[{start_ms,end_ms,text}], utf8_discarded_bytes, utf8_discarded_fragments}` を返す。
 時刻はすべて入力先頭からの絶対ms。非最終窓の `join_ms` が次の窓の開始、最終窓は音声の長さ。
 親は PCM 書込みと応答読取りを並行させる。load の失敗は `load {status:"fatal",code:"model_load",error}`、
 処理の失敗は `error {request_id,status:"fatal",code:"inference",error}` の後に非0終了。壊れた要求・順序違反は非0終了する。
-UTF-8の不正だけは上記の入力単位の失敗とする。親はその入力の途中の窓も捨てて次の入力へ進む。
-読み捨て中も枠の形とIDを検証し、end前のbeginや途中EOFは受理しない。
+end前のbegin・違う入力ID・途中EOFは受理しない。workerに入力単位の失敗応答や読み捨て状態は持たない。
 
 設定は CLI `-l ja -bs 5 -bo 5 -mc 0` と一致させ、VAD・DTW・前文参照を無効にする。
 CPU スレッドは論理コア数を上限に8。beam、温度 fallback、flash attention は v1.9.5 CLI と同じ。
@@ -117,6 +115,18 @@ CPU スレッドは論理コア数を上限に8。beam、温度 fallback、flash
 PCM は最大1840秒分の float buffer と受信中の1枠だけを保持し、音声全体を保存しない。
 トークンの byte 列から文字を復元し、区間末尾の途中の UTF-8 は次区間へ持ち越す。
 独立に復号する次の窓へは断片を持ち込まず、窓末尾で未完成の文字は捨てる。
+復元できない断片は、その直前まで一致したprefixだけを捨て、不一致byteを先頭として改めて評価する。
+例えば `e3 83` の次に `e3 81 86` が来たら、先の2byteだけを捨てて「う」を保つ。
+修復は採用するトークン本文だけに適用し、framingやJSONの不正なUTF-8は引き続き拒否する。
+本文の端はPython `str.strip()` と同じ29種の空白codepointで除去し、内部の空白は保つ。
+U+200B・U+FEFFは空白扱いしない。
+
+破棄数は各windowではその窓の数、endでは全windowの合計をu64で返し、beginで0へ戻す。
+数えるのは採用する区間と窓末尾の未完成断片だけで、捨てたlookahead区間や端の空白は含めない。
+断片数は次の規則で固定する。不一致まで一致したprefixをまとめて1断片とし、不一致byteは再評価する。
+不正な先頭・単独の継続byteは各1byte・1断片。2byte目がoverlong・surrogate・範囲外のときも、
+先頭を捨てて継続byteを1つずつ再評価する。窓末尾の未完成prefixは全体を1断片とする。
+区間が空になって除去されても、その本文や未完成prefixの破棄数は残す。
 `asr-contract-tests` は T0 の偽認識器・継ぎ目・EOF・有界buffer・UTF-8・framing・複数入力を検査する。
 
 `tools/asr_transcribe.py` は16kHz mono s16 WAVを小枠で送り、結果とプロセスメモリのピークを記録する
@@ -128,8 +138,6 @@ PCM送信を専用threadに置き、応答は送信中も採用する。失敗�
 `current_input` の途中の窓・進捗・メモリ・送信量・typedな `worker_failure` を保存する。
 書込みのBrokenPipeだけで先に送られたfatalを隠さない。toolのduplex回帰は
 `python -I crates/vlm-worker/tools/test_asr_transcribe.py` (実worker・モデルなし)。
-入力単位の失敗は `files` に `status:"item_failure"`・`segments_complete:false` として診断を残し、
-同じプロセスで次の入力を処理する。失敗入力の途中の区間は診断用の不完全な結果である。
 
 `whisper-source-manifest.json` は固定版の `CMakeLists.txt`・LICENSE・src/include/cmake全38ファイルの
 改行正規化済みSHA-256を保持する。source identityにmanifestも入れ、ソースがある場合は各ファイルと

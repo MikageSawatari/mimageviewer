@@ -1,4 +1,5 @@
 #include "devices.h"
+#include "device_selection.h"
 #include "llama.h"
 #include <windows.h>
 #include <dxgi1_2.h>
@@ -131,24 +132,7 @@ json list_devices() {
 
 DeviceSelection select_device(const std::string & requested) {
     Inventory inventory;
-    json selected;
-    size_t largest = 0;
-    std::string normalized = requested;
-    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c) { return char(std::toupper(c)); });
-    for (auto & v : inventory.vulkan) {
-        if (!v.contains("dxgi") || v["dxgi"]["software"].get<bool>()) continue;
-        auto bytes = v["dxgi"]["dedicated_bytes"].get<size_t>();
-        if ((!normalized.empty() && v["luid"] == normalized) || (normalized.empty() && bytes > largest)) {
-            if (!normalized.empty() && !selected.is_null()) throw std::runtime_error("Multiple Vulkan devices have the requested LUID");
-            selected = v;
-            largest = bytes;
-        }
-    }
-    if (selected.is_null()) throw std::runtime_error("No matching DXGI/Vulkan adapter with valid LUID");
-    size_t same_name = 0;
-    for (const auto & v : inventory.vulkan) if (v["name"] == selected["name"]) ++same_name;
-    if (!selected.contains("pci_id") && same_name != 1)
-        throw std::runtime_error("Cannot verify same-name GPUs without PCI identity; ggml exposes no LUID/UUID API");
+    json selected = worker_devices::select_inventory_device(inventory.vulkan, requested);
     std::string index = std::to_string(selected["physical_index"].get<uint32_t>());
     if (!SetEnvironmentVariableA("GGML_VK_VISIBLE_DEVICES", index.c_str())) throw std::runtime_error("Cannot pin Vulkan physical device");
     // ggml uses the CRT getenv(), so update its environment as well.
@@ -169,15 +153,7 @@ DeviceSelection select_device(const std::string & requested) {
     return {dev, selected};
 }
 
-DeviceSelection select_asr_device(uint32_t physical_index) {
-    Inventory inventory;
-    for (const auto & v : inventory.vulkan) {
-        if (v["physical_index"] != physical_index) continue;
-        if (!v.contains("dxgi") || v["dxgi"]["software"].get<bool>())
-            throw std::runtime_error("ASR requires a hardware DXGI/Vulkan adapter");
-        auto selected = select_device(v["luid"].get<std::string>());
-        selected.description["device_index"] = physical_index;
-        return selected;
-    }
-    throw std::runtime_error("ASR Vulkan device index is unavailable");
+DeviceSelection select_asr_device(const std::string & luid) {
+    if (luid.empty()) throw std::runtime_error("ASR requires a selected device LUID");
+    return select_device(luid);
 }

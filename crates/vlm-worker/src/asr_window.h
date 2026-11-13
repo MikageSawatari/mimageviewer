@@ -1,5 +1,4 @@
 #pragma once
-#include "asr_errors.h"
 #include <algorithm>
 #include <cstdint>
 #include <functional>
@@ -26,37 +25,69 @@ struct Window {
     uint64_t start_ms, read_end_ms, join_ms;
     bool final;
     std::vector<Segment> segments;
+    uint64_t utf8_discarded_bytes = 0, utf8_discarded_fragments = 0;
 };
 
 // 途中のbyte列はここが持ち、JSONの置換モードには渡さない。
 class Utf8Carry {
     std::string pending_;
+    uint64_t discarded_bytes_ = 0, discarded_fragments_ = 0;
+    void discard(size_t bytes) { discarded_bytes_ += bytes; ++discarded_fragments_; }
 public:
     std::string append(const std::string & bytes) {
         auto text = pending_ + bytes;
         pending_.clear();
+        std::string output;
+        output.reserve(text.size());
         size_t i = 0;
         while (i < text.size()) {
             auto lead = static_cast<unsigned char>(text[i]);
             size_t n = lead < 0x80 ? 1 : lead >= 0xc2 && lead <= 0xdf ? 2 :
                 lead >= 0xe0 && lead <= 0xef ? 3 : lead >= 0xf0 && lead <= 0xf4 ? 4 : 0;
-            if (!n) throw InvalidUtf8("Invalid ASR token UTF-8 lead byte");
-            for (size_t j = 1; j < n && i + j < text.size(); ++j) {
+            if (!n) { discard(1); ++i; continue; }
+            size_t j = 1;
+            for (; j < n && i + j < text.size(); ++j) {
                 auto b = static_cast<unsigned char>(text[i + j]);
                 if ((b & 0xc0) != 0x80 || (j == 1 && ((lead == 0xe0 && b < 0xa0) ||
                     (lead == 0xed && b >= 0xa0) || (lead == 0xf0 && b < 0x90) || (lead == 0xf4 && b >= 0x90))))
-                    throw InvalidUtf8("Invalid ASR token UTF-8 continuation");
+                    break;
             }
-            if (i + n > text.size()) { pending_ = text.substr(i); text.resize(i); break; }
+            if (j < n) {
+                if (i + j == text.size()) { pending_ = text.substr(i); break; }
+                // 不一致byteは捨てず、既に一致したprefixだけを1断片と数える。
+                // 次の周回でそのbyteを先頭として再評価し、ASCIIや次の正しい文字を保つ。
+                discard(j); i += j; continue;
+            }
+            output.append(text, i, n);
             i += n;
         }
-        return text;
+        return output;
     }
-    void finish() { pending_.clear(); } // 最後まで完結しなかった文字は捨てる。
+    void finish() {
+        if (!pending_.empty()) discard(pending_.size());
+        pending_.clear();
+    }
+    uint64_t discarded_bytes() const { return discarded_bytes_; }
+    uint64_t discarded_fragments() const { return discarded_fragments_; }
 };
+// Python str.isspace()の29文字に固定する。U+200B/U+FEFFなどは含めない。
+inline bool python_space(uint32_t cp) {
+    return (cp >= 9 && cp <= 13) || (cp >= 0x1c && cp <= 0x20) || cp == 0x85 || cp == 0xa0 ||
+        cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200a) || cp == 0x2028 || cp == 0x2029 ||
+        cp == 0x202f || cp == 0x205f || cp == 0x3000;
+}
+// 入力はUtf8Carryを通った正当なUTF-8だけ。内部空白を変えず、端の文字だけを除く。
 inline std::string trim(std::string text) {
-    const auto first = text.find_first_not_of(" \t\n\r\f\v");
-    return first == std::string::npos ? "" : text.substr(first, text.find_last_not_of(" \t\n\r\f\v") - first + 1);
+    size_t first = text.size(), last = 0, position = 0;
+    while (position < text.size()) {
+        const size_t begin = position;
+        auto lead = static_cast<unsigned char>(text[position++]);
+        const size_t count = lead < 0x80 ? 1 : lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4;
+        uint32_t cp = count == 1 ? lead : lead & (0x7f >> count);
+        for (size_t i = 1; i < count; ++i) cp = (cp << 6) | (static_cast<unsigned char>(text[position++]) & 0x3f);
+        if (!python_space(cp)) { if (first == text.size()) first = begin; last = position; }
+    }
+    return first == text.size() ? "" : text.substr(first, last - first);
 }
 inline uint64_t sample_ms(uint64_t sample) { return sample / (kRate / 1000); }
 
@@ -128,7 +159,7 @@ private:
         segments.erase(std::remove_if(segments.begin(), segments.end(), [](const Segment & s) {
             return s.text.empty();
         }), segments.end());
-        publish_({sample_ms(start_), read_end, seam, final, std::move(segments)});
+        publish_({sample_ms(start_), read_end, seam, final, std::move(segments), utf8.discarded_bytes(), utf8.discarded_fragments()});
         if (final) { pcm_.clear(); finished_ = true; return; }
         const size_t consumed = static_cast<size_t>(seam * (kRate / 1000) - start_);
         pcm_.erase(pcm_.begin(), pcm_.begin() + consumed);

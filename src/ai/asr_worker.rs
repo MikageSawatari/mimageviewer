@@ -54,12 +54,11 @@ pub enum GpuDetection {
 #[derive(Clone, Debug)]
 pub struct GpuDecision {
     pub device: Option<Adapter>,
-    /// --list-devices の Vulkan physical_index。worker が ggml へ対応付ける。
-    pub device_index: Option<u32>,
+    pub vulkan_available: bool,
 }
 impl GpuDecision {
     pub fn is_eligible(&self) -> bool {
-        self.device_index.is_some()
+        self.device.is_some() && self.vulkan_available
     }
 }
 
@@ -88,30 +87,25 @@ fn select_gpu(inventory: &Value) -> Result<GpuDecision, AsrError> {
                 best
             }
         });
-    let device_index = device.as_ref().and_then(|adapter| {
+    let vulkan_available = device.as_ref().is_some_and(|adapter| {
         let mut matches = vulkan.iter().filter(|v| {
             v["luid_valid"] == true
                 && v["luid"].as_str() == Some(adapter.luid.as_str())
                 && matches!(v["mapping"].as_str(), Some("pci-id" | "unique-description"))
         });
-        let first = matches.next()?;
-        if matches.next().is_some() {
-            return None;
-        }
-        first["physical_index"]
-            .as_u64()
-            .and_then(|n| u32::try_from(n).ok())
+        matches.next().is_some() && matches.next().is_none()
     });
     Ok(GpuDecision {
         device,
-        device_index,
+        vulkan_available,
     })
 }
 
 #[derive(Debug)]
 pub struct LoadRequest {
     pub model_path: PathBuf,
-    pub device_index: u32,
+    /// 列挙時に選んだidentityを保持する。変わり得るVulkanの番号は送らない。
+    pub device_luid: String,
 }
 #[derive(Debug, Deserialize)]
 pub struct LoadResult {
@@ -245,9 +239,24 @@ impl AsrWorkerClient {
         if !matches!(self.state, ClientState::Unloaded) {
             return Err(AsrError::Unavailable);
         }
+        if request.device_luid.len() != 17
+            || !request.device_luid.bytes().enumerate().all(|(i, b)| {
+                if i == 8 {
+                    b == b':'
+                } else {
+                    b.is_ascii_hexdigit()
+                }
+            })
+        {
+            return self
+                .owner
+                .as_ref()
+                .unwrap()
+                .fail(AsrError::Protocol("invalid GPU LUID".into()));
+        }
         let header = self.exchange(
             json!({"type":"load", "model_path":request.model_path,
-            "device_index":request.device_index}),
+            "device_luid":request.device_luid}),
             "load",
             Duration::from_secs(120),
         )?;
@@ -264,8 +273,14 @@ impl AsrWorkerClient {
         if !result.model_load_s.is_finite()
             || result.model_load_s < 0.0
             || !(1..=8).contains(&result.cpu_threads)
-            || result.device.physical_index != request.device_index
-            || result.device.luid != result.device.dxgi.luid
+            || !result
+                .device
+                .luid
+                .eq_ignore_ascii_case(&request.device_luid)
+            || !result
+                .device
+                .luid
+                .eq_ignore_ascii_case(&result.device.dxgi.luid)
             || result.device.dxgi.software
         {
             return self
@@ -329,7 +344,7 @@ fn checked_header(frame: Frame, expected: &str) -> Result<Value, AsrError> {
     }
     if header["type"].as_str() != Some(expected)
         || (matches!(expected, "load" | "begin") && header["status"] != "ok")
-        || (expected == "end" && !matches!(header["status"].as_str(), Some("ok" | "item_failure")))
+        || (expected == "end" && header["status"] != "ok")
     {
         return Err(AsrError::Protocol(
             "unexpected response type or status".into(),
@@ -452,10 +467,12 @@ pub struct Window {
     #[serde(rename = "final")]
     pub final_window: bool,
     pub segments: Vec<Segment>,
-}
-#[derive(Debug, PartialEq, Eq)]
-pub enum AsrFileFailure {
-    InvalidUtf8 { message: String },
+    /// 採用するtoken本文だけをtrim前に修復した破棄数。lookaheadと端の空白は数えない。
+    /// 不一致まで一致したprefixは1断片で、不一致byteを再評価する。不正な先頭・単独の
+    /// 継続byteは各1byte/1断片。overlong等の不正な2byte目も同じ再評価規則を使う。
+    /// 窓末尾の未完prefixは全体で1断片。空になって消えた区間の破棄数も残す。
+    pub utf8_discarded_bytes: u64,
+    pub utf8_discarded_fragments: u64,
 }
 #[derive(Debug, PartialEq, Eq)]
 pub enum AsrEvent {
@@ -470,12 +487,9 @@ pub enum AsrEvent {
     End {
         request_id: u64,
         duration_ms: u64,
-    },
-    /// この1本だけ失敗。すでに返した窓も保存せず、同じモデルで次のbeginへ進める。
-    FileFailure {
-        request_id: u64,
-        duration_ms: u64,
-        failure: AsrFileFailure,
+        /// この入力で公開した全Windowの合計。次のbeginでは0へ戻す。
+        utf8_discarded_bytes: u64,
+        utf8_discarded_fragments: u64,
     },
 }
 struct StreamState {
@@ -483,6 +497,31 @@ struct StreamState {
     next_start: u64,
     last_segment: Option<(u64, u64)>,
     final_end: Option<u64>,
+    utf8_discarded: DiscardCount,
+}
+#[derive(Default, PartialEq, Eq)]
+struct DiscardCount {
+    bytes: u64,
+    fragments: u64,
+}
+impl DiscardCount {
+    fn checked(bytes: u64, fragments: u64) -> Result<Self, AsrError> {
+        if (bytes == 0) != (fragments == 0) || fragments > bytes {
+            return Err(AsrError::Protocol("invalid UTF-8 discard counters".into()));
+        }
+        Ok(Self { bytes, fragments })
+    }
+    fn add(&mut self, count: Self) -> Result<(), AsrError> {
+        self.bytes = self
+            .bytes
+            .checked_add(count.bytes)
+            .ok_or_else(|| AsrError::Protocol("UTF-8 discard byte count overflow".into()))?;
+        self.fragments = self
+            .fragments
+            .checked_add(count.fragments)
+            .ok_or_else(|| AsrError::Protocol("UTF-8 discard fragment count overflow".into()))?;
+        Ok(())
+    }
 }
 pub struct AsrOutput {
     owner: Arc<ProcessOwner>,
@@ -531,6 +570,7 @@ impl AsrOutput {
                 next_start: 0,
                 last_segment: None,
                 final_end: None,
+                utf8_discarded: DiscardCount::default(),
             });
             return Ok(AsrEvent::Begin { request_id: id });
         }
@@ -567,6 +607,10 @@ impl AsrOutput {
                     }
                     stream.last_segment = Some((segment.start_ms, segment.end_ms));
                 }
+                stream.utf8_discarded.add(DiscardCount::checked(
+                    window.utf8_discarded_bytes,
+                    window.utf8_discarded_fragments,
+                )?)?;
                 stream.next_start = window.join_ms;
                 if window.final_window {
                     stream.final_end = Some(window.read_end_ms);
@@ -580,33 +624,20 @@ impl AsrOutput {
                 {
                     return Err(bad());
                 }
-                if h["status"] == "item_failure" {
-                    if stream.final_end.is_some()
-                        || duration_ms < stream.next_start
-                        || h["code"] != "invalid_utf8"
-                    {
-                        return Err(bad());
-                    }
-                    let message = h["error"]
-                        .as_str()
-                        .filter(|s| !s.is_empty())
-                        .ok_or_else(bad)?
-                        .to_owned();
-                    crate::logger::log(format!("asr_worker: invalid_utf8 request={id}: {message}"));
-                    self.stream = None;
-                    return Ok(AsrEvent::FileFailure {
-                        request_id: id,
-                        duration_ms,
-                        failure: AsrFileFailure::InvalidUtf8 { message },
-                    });
-                }
-                if stream.final_end != Some(duration_ms) {
+                let utf8_discarded_bytes = number("utf8_discarded_bytes")?;
+                let utf8_discarded_fragments = number("utf8_discarded_fragments")?;
+                if stream.final_end != Some(duration_ms)
+                    || stream.utf8_discarded
+                        != DiscardCount::checked(utf8_discarded_bytes, utf8_discarded_fragments)?
+                {
                     return Err(bad());
                 }
                 self.stream = None;
                 Ok(AsrEvent::End {
                     request_id: id,
                     duration_ms,
+                    utf8_discarded_bytes,
+                    utf8_discarded_fragments,
                 })
             }
             _ => Err(bad()),

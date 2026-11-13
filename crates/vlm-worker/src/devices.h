@@ -9,6 +9,5 @@ struct DeviceSelection {
 };
 nlohmann::json list_devices();
 DeviceSelection select_device(const std::string & luid);
-// ASRは共通一覧の物理Vulkan番号を受け取り、内蔵GPUも候補にする。
-// ggmlの最初の初期化より前に、そのデバイスだけを公開する。
-DeviceSelection select_asr_device(uint32_t physical_index);
+// ASRは選択済みLUIDを最新の共通一覧へ直接照合し、内蔵GPUも候補にする。
+DeviceSelection select_asr_device(const std::string & luid);
