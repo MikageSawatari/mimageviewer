@@ -52,6 +52,14 @@
   - ZipPla: [公開フォークの既定キー](https://github.com/himamon/ZipPlaFork/blob/07955f5267e2fb92d6fc6e40fde2507d8fb07b3b/source/ZipPla/ViewerForm.cs#L15850-L15882) は上下がページ送り。左右は拡大鏡モードで [画像内のスクロールを試し](https://github.com/himamon/ZipPlaFork/blob/07955f5267e2fb92d6fc6e40fde2507d8fb07b3b/source/ZipPla/ViewerForm.cs#L8383-L8400)、動けない場合はページを送る。SumatraPDF は [公式マニュアル](https://www.sumatrapdfreader.org/docs/Scrolling-and-zooming#scroll-with-the-keyboard) 上、上下がスクロール、左右は横にはみ出す場合にスクロール、収まる場合にページ送り。
 - 設計・検証: 既存のパン・表示範囲の制限と入力処理に接続し、設定で選んだ文脈以外の固定矢印を変更しない。移動量・長押し・折り返し量、4 方向の個別コマンドや端への位置合わせを含めるかは着手時に決める。通常表示・見開き・回転・画面内に収まる画像、左右の綴じ方向、別ウィンドウ、設定の組み合わせを確認し、入力欄・IME・ダイアログ・編集・連結表示を退行させない。[キー仕様](keymap-spec.md) と [操作カスタマイズ計画](key-customization-impl-plan.md) は実装時に更新する。規模は設計時に見積もる / P3。
 
+### 1.776 最初に全画面を開いたとき、全画面の 2 コマ目で約 0.5 秒止まる — ReleaseChecks の first-ai から (2026-11-13)
+
+- 状態: **未着手・次の版以降。v5.2.0 は既知として出荷 (利用者決定 2026-11-13)**。
+- 観測 (ReleaseChecks の記録、隔離した診断ポータブル版): v5.2.0 の run `release-checks-20261113-050011-2e1435fd` の first-ai で、`open_fullscreen` 直後の全画面 viewport の 2 コマ目が `immediate_viewport total=489.9ms run=487.1` (段別 `fullscreen_viewport_ms` 490ms)、`ui-frame-gap 492.7ms`。AI の action を送る前の段階。10-29 の run `release-checks-20261029-161208-c3ed5627` でも同じ場所で `total=543.6ms`。今回の版の変更によるものではない。
+- これまで見つからなかった理由: first-ai は §1.483 の台本の不具合で全画面を開いた直後に落ちており、v5.2.0 で台本を直して初めて最後まで走った。ほかの ReleaseChecks のケースは全画面を開かない。
+- 次にすること: `run=487ms` の中身 (全画面 viewport の初回の描画・surface の作成・`[fullscreen] virtual desktop synced` 前後の処理) を計装で特定する。原因が分かるまで、ReleaseChecks の分類 (known-*) に足して黙らせない。
+- 関連: §1.483、[ReleaseChecks 自動化計画](release-check-automation-plan.md)。規模 / 優先度: 調査から / P2。
+
 ### 1.775 SNS 分割書き出しの枚数の上限を 4 から 20 へ — X の仕様変更への追従 (2026-11-13)
 
 - 状態: **未着手・次の版に入れる (利用者決定 2026-11-13)**。着手前に、X で 5 枚以上の分割を実際に投稿して表示を確かめる (利用者は 20 枚の細切りのカルーセル投稿を見かけているが、継ぎ目の幅と表示の形は未確認)。
