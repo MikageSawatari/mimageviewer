@@ -1,4 +1,4 @@
-# ローカル AI 説明文 V1 worker
+# ローカル AI 説明文・文字起こし worker
 
 Windows x64 の worker と Rust client。GPU 判定・モデル導入の設定画面へ接続済み。
 画像から説明文を作成して DB へ保存するジョブは後続段階で接続する。
@@ -28,6 +28,10 @@ SHA-256 照合・安全に staging へ展開し、欠落している `vendor/lla
 GitHub ZIP の SHA-256 はソースに固定してある (2026-11-03 に中身を照合)。一致しなければ展開しない。
 引数・環境変数で hash / URL を差し替える入口は無い。
 既存 source tree を消さず、archive の traversal・絶対パス・リンク・重複・Windows の不正名を拒否する。
+同じ exe の文字起こし役割には `vendor/whisper.cpp` の固定 v1.9.5 ソースも必要。
+`scripts/setup-whisper-cpp.ps1` は同じ保護と no-overwrite 公開を使い、GitHub tag ZIP の
+SHA-256 `7a7a73071939f16bc028ad2f713f16f26e37afb6cc155d0f19e3d65705d2b1d9` を照合する。
+既存の両 vendor ソースは変更しない。現 identity の exe を再利用するだけならソースは不要。
 
 ### C++ の再ビルドが必要なとき
 
@@ -45,7 +49,7 @@ GitHub ZIP の SHA-256 はソースに固定してある (2026-11-03 に中身�
 $env:MSBUILDDISABLENODEREUSE = '1'
 $env:CMAKE_BUILD_PARALLEL_LEVEL = '1'
 cmake -S crates/vlm-worker -B crates/vlm-worker/build -G 'Visual Studio 18 2026' -A x64 -DVLM_REFERENCE_TOOLS=OFF
-cmake --build crates/vlm-worker/build --config Release --target mimageviewer-vlm vlm-contract-tests vlm-greedy-tests vlm-image-attempt-tests vlm-output-tests vlm-image-input-tests vlm-protocol-tests -- /m:1 /nr:false
+cmake --build crates/vlm-worker/build --config Release --target mimageviewer-vlm vlm-contract-tests vlm-greedy-tests vlm-image-attempt-tests vlm-output-tests vlm-image-input-tests vlm-protocol-tests asr-contract-tests -- /m:1 /nr:false
 ctest --test-dir crates/vlm-worker/build -C Release --output-on-failure
 ```
 
@@ -64,13 +68,73 @@ Copy-Item -LiteralPath .\vendor\vlm-worker\mimageviewer-vlm.exe -Destination C:\
 `GGML_VULKAN=ON`, `GGML_NATIVE=OFF`, `GGML_RPC=OFF`, `BUILD_SHARED_LIBS=OFF`, `GGML_BACKEND_DL=OFF`。
 `LLAMA_OPENSSL`, `LLAMA_BUILD_SERVER/TOOLS/EXAMPLES/TESTS/APP/COMMON`, `LLAMA_SUBPROCESS`, `MTMD_VIDEO` は OFF。
 b12032 の `LLAMA_BUILD_MTMD=ON` が `tools/mtmd` のライブラリだけを追加するので、tools 一式を有効にする必要はない。
-worker の推論ライブラリは `ggml`, `llama`, `mtmd`。別途 Windows の `dxgi` と Vulkan loader を使う。
+worker の推論ライブラリは `ggml`, `llama`, `mtmd`, `whisper`。whisper は既存 ggml を共有し、
+自前 ggml を追加しない。`WHISPER_BUILD_EXAMPLES/TESTS/SERVER/CURL/SDL2` は OFF。
+別途 Windows の `dxgi` と Vulkan loader を使う。
 `nlohmann/json.hpp` は同じ vendor のヘッダだけを使う。
 
 llama/ggml/mtmd と MSVC CRT は静的リンクする。OpenMP も無効化して runtime DLL 依存を避ける。
 CPU backend は SSE4.2/BMI2/AVX/AVX2/FMA/F16C などの追加命令を無効にし、x64 の基準に揃える。
 Vulkan loader と GPU driver は OS/driver 側の前提で、worker の配布物にはコピーしない。
 開発用 reference exe は worker の配布ディレクトリへ出さない。
+
+## ASR protocol 1
+
+`--asr-serve` は文字起こし専用。既存 `--serve` の VLM protocol 2 は変更しない。
+両役割の transport は `src/framing.h` を共有する。枠は little-endian u32 の全 body 長、
+u32 の JSON byte 長、UTF-8 JSON object、任意の binary。body 上限は16MiB。
+JSON の不正 UTF-8・raw NUL・途中 EOF は拒否する。stdout は枠だけ、診断は stderr。
+
+1. `hello` → `hello {role:"asr", protocol_version:1, settings_version:1, source_identity}`。
+2. `load {model_path, device_index}` → `load {status:"ok", model_load_s, cpu_threads, device}`。
+   `device_index` は `--list-devices` の Vulkan `physical_index`。DXGI のソフトウェア adapter を除外し、
+   LUID と PCI ID (無ければ一意の名前) を照合して、選んだ物理番号だけを Vulkan0 に公開する。
+   whisper に渡す番号はその0。内蔵 GPU を含め VRAM 下限なし。GPU 初期化失敗を CPU 実行へ落とさない。
+3. `begin {request_id}` → 同じ ID の `begin {status:"ok"}`。
+4. `pcm {request_id}` と binary の16kHz mono s16le PCM (1枠1MiB以下、空・奇数byte不可)。PCMごとの応答は無い。
+5. `end {request_id}` → 最後の窓を返して `end {status:"ok", duration_ms}`。
+   不正なUTF-8が出た入力は残りのPCMを保持せず読み捨て、同じendへ
+   `end {status:"item_failure", code:"invalid_utf8", error, duration_ms}` を1回返す。
+   最後の窓で不正が分かった場合も、そのendで失敗を返して終える。
+   長さは失敗した枠の残りと読み捨てた枠を含む全受信sample数から求める。
+   失敗後もロードした同じモデルで次の begin/pcm/end を処理できる。
+6. `shutdown` はどの段階でも終了。中止は親がプロセスを終了させる。
+
+推論中は callback から `progress {request_id, processed_ms}`、窓の終了時は
+`window {request_id, start_ms, read_end_ms, join_ms, final, segments:[{start_ms,end_ms,text}]}` を返す。
+時刻はすべて入力先頭からの絶対ms。非最終窓の `join_ms` が次の窓の開始、最終窓は音声の長さ。
+親は PCM 書込みと応答読取りを並行させる。load の失敗は `load {status:"fatal",code:"model_load",error}`、
+処理の失敗は `error {request_id,status:"fatal",code:"inference",error}` の後に非0終了。壊れた要求・順序違反は非0終了する。
+UTF-8の不正だけは上記の入力単位の失敗とする。親はその入力の途中の窓も捨てて次の入力へ進む。
+読み捨て中も枠の形とIDを検証し、end前のbeginや途中EOFは受理しない。
+
+設定は CLI `-l ja -bs 5 -bo 5 -mc 0` と一致させ、VAD・DTW・前文参照を無効にする。
+CPU スレッドは論理コア数を上限に8。beam、温度 fallback、flash attention は v1.9.5 CLI と同じ。
+30分の境界の前後10秒で最も静かな0.5秒の中央を選び (10ms刻み、同点は最初)、30秒先まで読む。
+その窓の区間だけで継ぎ目を決め、継ぎ目より前に始まる区間を丸ごと使い、次を継ぎ目から読む。
+読み足しが EOF に届いた窓は全区間を使う。次の sample または end で EOF を判定してから推論するので、
+1800.2秒や read-ahead ちょうどで終わる音声で空の窓を作らない。
+PCM は最大1840秒分の float buffer と受信中の1枠だけを保持し、音声全体を保存しない。
+トークンの byte 列から文字を復元し、区間末尾の途中の UTF-8 は次区間へ持ち越す。
+独立に復号する次の窓へは断片を持ち込まず、窓末尾で未完成の文字は捨てる。
+`asr-contract-tests` は T0 の偽認識器・継ぎ目・EOF・有界buffer・UTF-8・framing・複数入力を検査する。
+
+`tools/asr_transcribe.py` は16kHz mono s16 WAVを小枠で送り、結果とプロセスメモリのピークを記録する
+開発用入口。製品アプリや通常profileには触れない。依存更新と初回統合では ASR の評価素材と
+VLM の既存 protocol 2・実モデル比較・CTest・source identity・通信系 import なしを両方確認する。
+窓ごとのmemoryは受信threadで到着時に採取する。現在量、前の窓からの100ms採取の最大値、
+OSが持つプロセスの累積ピークを区別する。PCMを全量送った後の値を各窓へ使い回さない。
+PCM送信を専用threadに置き、応答は送信中も採用する。失敗時は完了済みの `files` と、
+`current_input` の途中の窓・進捗・メモリ・送信量・typedな `worker_failure` を保存する。
+書込みのBrokenPipeだけで先に送られたfatalを隠さない。toolのduplex回帰は
+`python -I crates/vlm-worker/tools/test_asr_transcribe.py` (実worker・モデルなし)。
+入力単位の失敗は `files` に `status:"item_failure"`・`segments_complete:false` として診断を残し、
+同じプロセスで次の入力を処理する。失敗入力の途中の区間は診断用の不完全な結果である。
+
+`whisper-source-manifest.json` は固定版の `CMakeLists.txt`・LICENSE・src/include/cmake全38ファイルの
+改行正規化済みSHA-256を保持する。source identityにmanifestも入れ、ソースがある場合は各ファイルと
+一覧の増減を照合する。CMakeはソース必須で照合し、どれかの変更時に再configureする。
+ソースが無い場合はmanifestから同じidentityを求め、検証済みexeを再利用できる。
 
 ## 確認用モード
 

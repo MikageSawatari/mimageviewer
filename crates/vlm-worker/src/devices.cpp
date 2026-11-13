@@ -168,3 +168,16 @@ DeviceSelection select_device(const std::string & requested) {
     selected["identity_check"] = selected.contains("pci_id") ? "pci-id" : "unique-description";
     return {dev, selected};
 }
+
+DeviceSelection select_asr_device(uint32_t physical_index) {
+    Inventory inventory;
+    for (const auto & v : inventory.vulkan) {
+        if (v["physical_index"] != physical_index) continue;
+        if (!v.contains("dxgi") || v["dxgi"]["software"].get<bool>())
+            throw std::runtime_error("ASR requires a hardware DXGI/Vulkan adapter");
+        auto selected = select_device(v["luid"].get<std::string>());
+        selected.description["device_index"] = physical_index;
+        return selected;
+    }
+    throw std::runtime_error("ASR Vulkan device index is unavailable");
+}

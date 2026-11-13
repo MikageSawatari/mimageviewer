@@ -23,7 +23,7 @@ function Get-MivVlmWorkerSourceHash {
 function Assert-MivVlmWorkerIdentity {
     param([Parameter(Mandatory = $true)] [string] $RepoRoot, [string] $WorkerPath)
     $worker = if ($WorkerPath) { $WorkerPath } else { Join-Path $RepoRoot 'vendor\vlm-worker\mimageviewer-vlm.exe' }
-    $recover = 'Restore the current-source worker from C:\home\mimageviewer_vendor_backup\vlm-worker first (bootstrap-vendor.sh validates before publication). Otherwise use scripts/setup-llama-cpp.ps1 for the pinned source, install the Vulkan SDK, and run scripts/build-vlm-worker.ps1. See crates/vlm-worker/README.md.'
+    $recover = 'Restore the current-source worker from C:\home\mimageviewer_vendor_backup\vlm-worker first (bootstrap-vendor.sh validates before publication). Otherwise use scripts/setup-llama-cpp.ps1 and scripts/setup-whisper-cpp.ps1 for the pinned sources, install the Vulkan SDK, and run scripts/build-vlm-worker.ps1. See crates/vlm-worker/README.md.'
     if (-not (Test-Path -LiteralPath $worker -PathType Leaf)) {
         throw "[vlm-identity] Vendor worker is missing: $worker. $recover"
     }
@@ -47,7 +47,7 @@ function Restore-MivVlmWorkerBackup {
         return
     }
     if (-not (Test-Path -LiteralPath $BackupPath -PathType Leaf)) {
-        throw '[vlm-restore] Backup missing. Use scripts/setup-llama-cpp.ps1 (requires a verified archive checksum), Vulkan SDK and scripts/build-vlm-worker.ps1; see crates/vlm-worker/README.md.'
+        throw '[vlm-restore] Backup missing. Use scripts/setup-llama-cpp.ps1 and scripts/setup-whisper-cpp.ps1 (verified archive checksums), Vulkan SDK and scripts/build-vlm-worker.ps1; see crates/vlm-worker/README.md.'
     }
     Assert-MivVlmIdentityAncestors $BackupPath
     $directory = Split-Path -Parent $destination

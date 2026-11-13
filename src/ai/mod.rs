@@ -9,6 +9,8 @@
 //! (タグ `v0.6.0-with-spread-inpaint` 参照)。
 
 #[cfg(windows)]
+pub mod asr_worker;
+#[cfg(windows)]
 pub(crate) mod caption_job_worker;
 pub mod classify;
 pub mod denoise;
@@ -29,6 +31,10 @@ pub mod trt_worker_shm;
 pub mod upscale;
 #[cfg(windows)]
 pub mod vlm_worker;
+#[cfg(windows)]
+mod worker_gpu;
+#[cfg(windows)]
+mod worker_transport;
 
 use std::fmt;
 

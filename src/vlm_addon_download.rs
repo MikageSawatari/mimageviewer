@@ -315,7 +315,11 @@ pub(crate) mod tests {
     fn transport_diagnostics_choose_kind_without_rewriting_lower_errors() {
         let dir = tempfile::tempdir().unwrap();
         let cancel = AtomicBool::new(false);
-        for (kind, label) in [(AddonKind::Vlm, "VLM"), (AddonKind::Depth, "Depth")] {
+        for (kind, label) in [
+            (AddonKind::Vlm, "VLM"),
+            (AddonKind::Depth, "Depth"),
+            (AddonKind::Asr, "ASR"),
+        ] {
             assert_eq!(
                 download_for_kind(kind, "unused", dir.path(), 0, "unused", &cancel, |_| {})
                     .unwrap_err(),

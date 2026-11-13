@@ -1,5 +1,24 @@
 # 非同期・並列アーキテクチャ
 
+## ローカル文字起こしの transport（T1 区切り1）
+
+`ai::asr_worker` は `mimageviewer-vlm.exe --asr-serve` を Job Object 内で起動する。
+VLM と共有するのは executable の取り出し、framing、子の起動と GPU 列挙だけで、
+モデル・pipe・状態・停止権は各プロセスに所属する。GPU の使用可否は役割ごとに判定する。
+ASR は software adapter を除いた最大専用メモリの GPU を選び、専用メモリ0も残す。
+
+`AsrWorkerClient::start` 後に kill handle を公開し、worker thread で hello/load を行う。
+`split` 後の `AsrInput` は抽出 thread が begin/PCM/end を書き、`AsrOutput` は別 thread が
+begin/progress/window/end を読む。PCM は1枠1MiBまで、結果の読み取り queue は容量1。
+一方の endpoint の Drop または KillHandle でプロセスを止め、相手の pipe 待ちも解く。
+モデルは複数の begin/end で保持する。中止命令、再起動、再試行、UI thread の待ちは追加しない。
+復元不能なUTF-8はその1本だけの失敗にし、workerは型付きDrainingで既存endまで受信する。
+`AsrEvent::FileFailure` が終端となり、途中の窓は保存しない。同じモデルで次の入力へ進める。
+入力側の全sample数と終端durationも照合する。壊れたwireやGPU・モデル失敗は致命的なまま。
+作成ジョブ・FFmpeg抽出・保存・表示への接続は次の区切りで行う。
+仕様は [ASR計画 §4〜6](local-asr-transcript-plan.md)、検証記録は
+[区切り1の記録](local-asr-t1-chunk1-report.md) を参照。
+
 ## 3D 写真の書き出し worker（2026-11-07、段 C）
 
 `depth_export.rs` はモーダル操作ごとに `depth-export` thread を1本作る。App の単一

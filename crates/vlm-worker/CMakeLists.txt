@@ -34,14 +34,27 @@ set(LLAMA_BUILD_NUMBER 12032)
 set(LLAMA_BUILD_COMMIT "dde879bc4f954b809892fd0d660515f42536394a")
 get_filename_component(LLAMA_ROOT "../../vendor/llama.cpp" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 add_subdirectory("${LLAMA_ROOT}" llama)
+get_filename_component(WHISPER_ROOT "../../vendor/whisper.cpp" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+foreach(flag BUILD_EXAMPLES BUILD_TESTS BUILD_SERVER CURL SDL2 COREML OPENVINO VITISAI)
+    set(WHISPER_${flag} OFF CACHE BOOL "" FORCE)
+endforeach()
+set(WHISPER_BUILD_IS_DEV OFF CACHE BOOL "" FORCE)
+# whisper.cpp reuses the already-defined llama.cpp ggml target. Do not add its
+# second ggml tree: that would duplicate the Vulkan backend and its shaders.
+add_subdirectory("${WHISPER_ROOT}" whisper)
 find_package(Vulkan REQUIRED)
 file(GLOB VLM_IDENTITY_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp")
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.ps1")
 list(APPEND VLM_IDENTITY_FILES "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt"
-    "${CMAKE_CURRENT_SOURCE_DIR}/tools/source-identity.ps1")
+    "${CMAKE_CURRENT_SOURCE_DIR}/tools/source-identity.ps1"
+    "${CMAKE_CURRENT_SOURCE_DIR}/whisper-source-manifest.json")
+file(GLOB_RECURSE WHISPER_IDENTITY_FILES CONFIGURE_DEPENDS
+    "${WHISPER_ROOT}/src/*" "${WHISPER_ROOT}/include/*" "${WHISPER_ROOT}/cmake/*")
+list(APPEND VLM_IDENTITY_FILES ${WHISPER_IDENTITY_FILES} "${WHISPER_ROOT}/CMakeLists.txt" "${WHISPER_ROOT}/LICENSE")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${VLM_IDENTITY_FILES})
 execute_process(COMMAND powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass
-    -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/source-identity.ps1" -SourceRoot "${CMAKE_CURRENT_SOURCE_DIR}"
+    -File "${CMAKE_CURRENT_SOURCE_DIR}/tools/source-identity.ps1" -SourceRoot "${CMAKE_CURRENT_SOURCE_DIR}" -VerifyVendor
     RESULT_VARIABLE VLM_IDENTITY_RESULT OUTPUT_VARIABLE VLM_SOURCE_SHA256
     ERROR_VARIABLE VLM_IDENTITY_ERROR OUTPUT_STRIP_TRAILING_WHITESPACE)
 string(LENGTH "${VLM_SOURCE_SHA256}" VLM_IDENTITY_LENGTH)
@@ -51,9 +64,9 @@ endif()
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/build_identity.h"
     CONTENT "#pragma once\n#define MIV_VLM_SOURCE_SHA256 \"@VLM_SOURCE_SHA256@\"\n#define MIV_VLM_SOURCE_MARKER \"MIV_VLM_SOURCE_SHA256:@VLM_SOURCE_SHA256@\"\n" @ONLY)
-add_executable(mimageviewer-vlm src/main.cpp src/devices.cpp src/inference.cpp src/serve.cpp)
+add_executable(mimageviewer-vlm src/main.cpp src/devices.cpp src/inference.cpp src/serve.cpp src/asr.cpp)
 target_include_directories(mimageviewer-vlm PRIVATE "${LLAMA_ROOT}/vendor" "${CMAKE_CURRENT_BINARY_DIR}/generated")
-target_link_libraries(mimageviewer-vlm PRIVATE ggml llama mtmd Vulkan::Vulkan dxgi)
+target_link_libraries(mimageviewer-vlm PRIVATE ggml llama mtmd whisper Vulkan::Vulkan dxgi)
 target_compile_definitions(mimageviewer-vlm PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(mimageviewer-vlm PRIVATE /utf-8 /W4 /permissive-)
 get_filename_component(OUTPUT_DIR "../../vendor/vlm-worker" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -94,3 +107,9 @@ add_executable(vlm-protocol-tests tests/protocol.cpp)
 target_include_directories(vlm-protocol-tests PRIVATE src "${LLAMA_ROOT}/vendor")
 target_compile_options(vlm-protocol-tests PRIVATE /utf-8)
 add_test(NAME vlm-protocol COMMAND vlm-protocol-tests)
+add_executable(asr-contract-tests tests/asr.cpp)
+target_include_directories(asr-contract-tests PRIVATE src "${LLAMA_ROOT}/vendor")
+target_compile_options(asr-contract-tests PRIVATE /utf-8)
+add_test(NAME asr-stream-protocol-and-windows COMMAND asr-contract-tests)
+add_test(NAME asr-pinned-source-identity COMMAND powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass
+    -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/source-identity.ps1")

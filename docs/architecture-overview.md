@@ -1,5 +1,14 @@
 # アーキテクチャ概観
 
+## ローカル文字起こしの基盤（T1 区切り1）
+
+VLM worker と同じ exe の ASR 役割が、whisper.cpp v1.9.5 を llama.cpp の ggml 上で使う。
+`ai::worker_transport` / `ai::worker_gpu` が実行ファイル・framing・起動・列挙を共有し、
+`ai::asr_worker` と既存の VLM client は独立したプロセスと状態を所有する。
+`asr_addon` は共通の `addon::ModelAddon` に ASR の index 契約と保存先を与える。
+この区切りではジョブ・DB・UI・MCP・検索を接続しない。
+[計画](local-asr-transcript-plan.md) と [実装・検証記録](local-asr-t1-chunk1-report.md) を参照。
+
 ## 製本した本の管理順（§1.683）
 
 `book_order`が本棚直下の`mimageviewer.book-order.json`を読み、名前順または手動順を解決する。既存の本・設定の保存形式は維持する。`app/book_shelf`はApp共通のroot/選択epoch/表示revision付きsnapshotと型付き読込・保存・未保存phaseを所有し、番号・固定集合・追加先候補を同じrowsから導く。Remoteは共通reader/resolverで保存済み順を読む。順序読取異常は名前順＋書込停止で原本を保持する。閲覧contextのitems・cache・generation・channelは変更しない。[設計と検証](book-order-plan.md)。
