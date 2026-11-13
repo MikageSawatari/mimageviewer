@@ -249,7 +249,7 @@ fn check_screen_crop(rotation: Rotation, displayed: [u32; 4], pdf: bool, jpeg: b
         })
         .unwrap();
     assert!(body.contains_rect(canvas));
-    let image_rect = canvas.shrink(4.0);
+    let image_rect = canvas.shrink2(CANVAS_PADDING);
     let point = |x, y| {
         egui::pos2(
             image_rect.left() + image_rect.width() * x as f32 / UNIT as f32,
@@ -276,7 +276,7 @@ fn check_screen_crop(rotation: Rotation, displayed: [u32; 4], pdf: bool, jpeg: b
         modifiers: egui::Modifiers::NONE,
     });
     h.run_steps(1);
-    h.get_by_label("OK").click();
+    h.get_by_label(OK_LABEL).click();
     h.run_steps(2);
     assert!(!h.state().cover_crop_dialog_open());
     let pins = h.state().folder_thumb_pin_db.as_ref().unwrap().clone();

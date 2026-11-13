@@ -515,6 +515,42 @@ fn menu_leaf_count(nodes: &[MenuNode]) -> usize {
         .sum()
 }
 
+fn insert_cover_crop_menu_item(nodes: &mut Vec<MenuNode>, state: ContextMenuActionState) {
+    fn insert_after_pin(nodes: &mut Vec<MenuNode>, crop_item: &MenuNode) -> bool {
+        for index in 0..nodes.len() {
+            match &mut nodes[index] {
+                MenuNode::Item {
+                    command: MenuCommand::ToggleRepresentativeThumb,
+                    ..
+                } => {
+                    nodes.insert(index + 1, crop_item.clone());
+                    return true;
+                }
+                MenuNode::Submenu { children, .. } => {
+                    if insert_after_pin(children, crop_item) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    let crop_item = MenuNode::Item {
+        command: MenuCommand::SpecifyCoverCrop,
+        label: state.label,
+        enabled: state.enabled,
+        disabled_reason: state.disabled_reason,
+    };
+    // Resolve the configurable layout first, then keep the related operation
+    // beside the visible pin even when its owning menu level changes.
+    if !insert_after_pin(nodes, &crop_item) {
+        nodes.push(MenuNode::Separator);
+        nodes.push(crop_item);
+    }
+}
+
 fn render_egui_menu_nodes(ui: &mut egui::Ui, nodes: &[MenuNode]) -> Option<MenuCommand> {
     let mut selected = None;
     for node in nodes {
@@ -1606,13 +1642,7 @@ impl crate::app::App {
             && let Some(idx) = target.item_index
             && let Some(state) = self.cover_crop_menu_state(idx)
         {
-            nodes.push(MenuNode::Separator);
-            nodes.push(MenuNode::Item {
-                command: MenuCommand::SpecifyCoverCrop,
-                label: state.label,
-                enabled: state.enabled,
-                disabled_reason: state.disabled_reason,
-            });
+            insert_cover_crop_menu_item(&mut nodes, state);
         }
         // Native and fallback menus share this current-book operation. Checked
         // rows and page count do not determine whether an empty book can edit.
@@ -3540,6 +3570,146 @@ fn open_folder_in_explorer(path: &std::path::Path) {
     #[cfg(not(windows))]
     {
         let _ = path;
+    }
+}
+
+#[cfg(test)]
+mod cover_crop_menu_tests {
+    use super::*;
+    use crate::context_menu_model::{ContextMenuItemId, ContextMenuParentId};
+
+    fn fixture(zip_page: bool) -> crate::app::AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
+        let shelf = app.tmp.path().join("shelf");
+        let book = shelf.join("book.zip");
+        app.current_folder = Some(if zip_page { book.clone() } else { shelf });
+        app.items = vec![if zip_page {
+            app.zip_nav = Some(crate::zip_tree::ZipNavState::new(std::sync::Arc::new(
+                crate::zip_tree::ZipTree::build(book.clone(), Vec::new()),
+            )));
+            GridItem::ZipImage {
+                zip_path: book,
+                entry_name: "page.png".to_owned(),
+            }
+        } else {
+            GridItem::ZipFile(book)
+        }];
+        app.selected = Some(0);
+        app.cached_handlers.insert(".zip".to_owned(), Vec::new());
+        app
+    }
+
+    fn menu_nodes(app: &mut crate::app::App) -> Vec<MenuNode> {
+        let target = app.context_menu_target(
+            0,
+            app.items[0].clone(),
+            false,
+            false,
+            None,
+            ContextMenuSurface::Grid,
+            None,
+        );
+        app.context_menu_nodes(&egui::Context::default(), &target, false)
+    }
+
+    fn command_index(nodes: &[MenuNode], expected: MenuCommand) -> usize {
+        nodes
+            .iter()
+            .position(|node| matches!(node, MenuNode::Item { command, .. } if *command == expected))
+            .unwrap_or_else(|| panic!("missing {expected:?}"))
+    }
+
+    fn assert_adjacent(nodes: &[MenuNode]) {
+        assert_eq!(
+            command_index(nodes, MenuCommand::SpecifyCoverCrop),
+            command_index(nodes, MenuCommand::ToggleRepresentativeThumb) + 1,
+            "the crop item must immediately follow the pin without a separator"
+        );
+    }
+
+    #[test]
+    fn cover_crop_menu_book_tile_is_adjacent_to_pin() {
+        assert_adjacent(&menu_nodes(&mut fixture(false)));
+    }
+
+    #[test]
+    fn cover_crop_menu_zip_page_is_adjacent_to_pin() {
+        assert_adjacent(&menu_nodes(&mut fixture(true)));
+    }
+
+    #[test]
+    fn cover_crop_menu_follows_reordered_pin() {
+        let mut app = fixture(false);
+        let mut order = app
+            .settings
+            .context_menu_layout
+            .resolved_order(ContextMenuParentId::Root);
+        let pin = order
+            .iter()
+            .position(|id| *id == ContextMenuItemId::ToggleRepresentativeThumb)
+            .unwrap();
+        let pin = order.remove(pin);
+        order.insert(0, pin);
+        app.settings
+            .context_menu_layout
+            .set_order(ContextMenuParentId::Root, &order);
+        let nodes = menu_nodes(&mut app);
+        assert_eq!(
+            command_index(&nodes, MenuCommand::ToggleRepresentativeThumb),
+            0
+        );
+        assert_adjacent(&nodes);
+    }
+
+    #[test]
+    fn cover_crop_menu_follows_pin_into_nested_submenu() {
+        let mut app = fixture(false);
+        let mut nodes = menu_nodes(&mut app);
+        let crop_index = command_index(&nodes, MenuCommand::SpecifyCoverCrop);
+        let crop = nodes.remove(crop_index);
+        let pin_index = command_index(&nodes, MenuCommand::ToggleRepresentativeThumb);
+        let pin = nodes.remove(pin_index);
+        nodes.insert(
+            pin_index,
+            MenuNode::Submenu {
+                label: "outer".to_owned(),
+                children: vec![MenuNode::Submenu {
+                    label: "inner".to_owned(),
+                    children: vec![pin.clone()],
+                }],
+            },
+        );
+        let mut expected = nodes.clone();
+        let MenuNode::Submenu { children, .. } = &mut expected[pin_index] else {
+            panic!("outer submenu");
+        };
+        let MenuNode::Submenu { children, .. } = &mut children[0] else {
+            panic!("inner submenu");
+        };
+        *children = vec![pin, crop];
+
+        insert_cover_crop_menu_item(&mut nodes, app.cover_crop_menu_state(0).unwrap());
+
+        assert_eq!(nodes, expected, "only the pin's own menu level changes");
+    }
+
+    #[test]
+    fn cover_crop_menu_hidden_pin_uses_separated_tail() {
+        let mut app = fixture(false);
+        app.settings
+            .context_menu_layout
+            .set_visible(ContextMenuItemId::ToggleRepresentativeThumb, false);
+        let nodes = menu_nodes(&mut app);
+        assert!(!nodes.iter().any(|node| matches!(
+            node,
+            MenuNode::Item {
+                command: MenuCommand::ToggleRepresentativeThumb,
+                ..
+            }
+        )));
+        let crop = command_index(&nodes, MenuCommand::SpecifyCoverCrop);
+        assert_eq!(crop, nodes.len() - 1);
+        assert!(matches!(nodes[crop - 1], MenuNode::Separator));
     }
 }
 
