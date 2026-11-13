@@ -911,6 +911,129 @@ App に detached 用の bool / Option を足さない。viewport の生成・HWN
 
 **実装の範囲 (r1 の後)**: 課題 2・課題 3 (P2-2 を含む)・課題 4 の文言を先に実装する。課題 1 は利用者の判断の後に別に設計・実装する。
 
+#### 6.4.5 課題 1 — 独立したメディアウィンドウから静止画の窓への交換 (§1.767、2026-11-14、設計)
+
+**利用者の決定 (2026-11-14)**: (a) フル機能モード + 「動画・音声は別ウィンドウで再生」で、**独立した**メディアウィンドウ (メインで別のものを開いて ParkedLive になり、
+再び有効にした窓) から同じ閲覧の送りで画像へ進んだら、メディアウィンドウを閉じ、**同じ独立した閲覧 (同じ context・同じ一覧) のまま静止画の窓を開き直す**。
+メインは変えない。連動したメディアウィンドウ (一覧から動画を開いた直後) からの画像は今どおりメインへ (F12 ON なら F12 の窓)。(b) 一覧から開くときの今の動きは変えない。
+(c)(d) 静止画から動画・音声へ送ったときの今の動きは変えない (独立した静止画の窓は今どおり断る)。(e) 開き直した窓は元の窓の位置と大きさを引き継ぐ。
+独立性を設定から決め直している根本もあわせて直す。本節は §6.4.4 の課題 1 (と r1 の案 A〜C) を置き換える。下書きは GPT-6.1 Sol / high (read-only) が master
+`403725b81` のコードで作り、設計担当が範囲を絞った (下の「由来の扱い」)。
+
+**適用範囲**: フル機能モード (複数ウィンドウモードでない) かつ `effective_media_in_media_window()`。複数ウィンドウモードのメディア窓 → 画像は今どおり同じ窓・独立のまま
+(利用者の決定の範囲外)。分類は `GridItem` で行う: メディア = `Video`・`Audio` (音声モード・音楽表示を含む)、静止画 = `Image`・`ZipImage`・`PdfPage`。
+
+**不変条件**:
+1. フル機能モードのメディアウィンドウ (専用の表示先としての役割) は Video / Audio だけを表示する。F12 ON の連動ホストを静止画表示へ再利用するのは既存の F12 の静止画表示であり、
+   この役割ではない (「一度でも動画を出した OS 窓には画像を出さない」という定義にはしない)。
+2. **独立性は閲覧 (context と窓の結び付き) の性質であり、確定点で設定から決め直さない**。独立性が決まるのは、新しく窓を結び付けるとき (一覧などからの新規 open は
+   設定・一度きりの指定で決める)、fork / promote / 再開の既存の所有移動、F12 (明示的な表示先の変更) だけ。
+3. 独立した閲覧のメディア → 静止画は、窓の役割の明示的な交換として 1 か所で確定する。
+
+**由来の扱い (設計担当の決定、下書きからの簡素化)**: 下書きは、送り・遅延 reopen・descriptor 再構築など全ての入口に「新規 / 継続 / 表示先変更」の由来の型を付け、
+遅延する要求 (`DeferredFsReopen`・book composition の `OpenIntent`・`MediaNavigationPending`・source-swap pending・descriptor 継続) まで運ぶ案だった
+(実装 3〜5 人日)。由来を運ぶ代わりに、**確定点で「この context に、今この窓が結び付いた独立の session があるか」という既存の事実から決める**:
+- `prepare_viewer_presentation_open` で、開く context に detached の window binding があり、その session を続ける (同じ window id のまま確定する) なら、
+  独立性は今の値 (`detached_viewer_independent_active`、その context の bundle に属する) を引き継ぐ。設定 (`detached_still_open_is_independent`) は見ない。
+- binding が無い (新しく窓を結び付ける) ときだけ、今どおり設定と一度きりの指定で決める。一覧からの新規 open は、既存の `prepare_detached_context_for_grid_open` が
+  先に park / 再開を済ませるので、ここに来る時点で binding が無い (下書きの分類と同じ結果になる)。
+- F12 は既存の `toggle_detached_viewer_mode` / `always_new_media_f12_target_presentation` が表示先と独立性を明示的に決める。その経路では「今が独立」という理由で
+  DetachedWindow を優先しない (`requested_viewer_presentation_for_open` の第 1 条件を通常の送りの解決だけに使う)。presentation が同じで独立性だけ変わる場合も確定を通す。
+- 遅延 reopen (フォルダ / 本 / PDF / ZIP、`close_fullscreen_for_folder_nav_reopen` は window id を保つ) と descriptor による既存窓の再構築は、binding が残るので引き継ぐ。
+  `fs_open_intent_from_grid` は独立性の判定に使わない。
+- これで、メディアへの送り (動画 A → 動画 B) でも独立性を false に戻さない (今はメディアへの open でも false に書き戻している)。
+この簡素化が成り立たない経路 (binding が残っているのに新しい閲覧として独立性を決め直すべき入口、または binding が一時的に外れている継続) がコードにあれば、
+その入口だけに既存の要求の型で由来を足す。App に bool / Option を足さない。
+
+**解決規則** (送り・自動送り・遅延 reopen の確定点。表示先と独立性を 1 回で決め、`commit_viewer_session` はその値だけを書く):
+
+| 今の閲覧と送り先 | 結果 | 窓 |
+| --- | --- | --- |
+| フル機能・独立メディア → 静止画 | DetachedWindow・独立 | A を退役し、新しい B を同じ context に結ぶ (下) |
+| フル機能・連動メディア → 静止画、F12 OFF | メイン (`non_detached_viewer_presentation`)・連動 | 既存の `open_non_detached` |
+| 同、F12 ON | DetachedWindow・連動 | 既存ホストを F12 の静止画表示に再利用 |
+| 独立静止画 → 静止画 | DetachedWindow・独立 | 同じ窓 |
+| 独立静止画 → Video / Audio | 既存どおり断る | 変えない |
+| メイン / F12 の静止画 → Video / Audio | 今の presentation のまま | 変えない |
+| メディア → メディア | 今の presentation と独立性のまま | 同じ窓 (既存の source-swap) |
+| 複数ウィンドウモードのメディア → 静止画 | DetachedWindow・独立 | 今どおり同じ窓 |
+
+**窓の交換 (独立メディア A → 独立静止画 B、同じ context C)**: 閲覧の終了ではなく C の表示ホストの交換。park・別 context の作成・フォルダの読み直しをしない。
+`close_fullscreen()` → `open_fullscreen()` は使わない (スライドショー停止・pending 取消・キャッシュ破棄が起きる。`close_fullscreen_now_for_destination`)。1 つの helper で:
+1. 送り先が採用できる (候補・提示許可が決まった) 境界で行う。決まる前に A を閉じない。交換を起こした要求は局所値に取り出してから進める。
+2. A の placement を Closing の前に捕捉する (`capture_detached_window_placement_at_decision` → `ensure_detached_window_runtime_placement`)。最大化も含む。
+3. C の旧メディア資源だけを既存の項目離脱の規則で退役する (player、native presenter、音声モード / VST、音楽表示)。**メディアの再生は止まる** (同じ閲覧で別の項目へ進むため)。
+   C 全体の `fs_cache.clear()` はしない。join・sleep・終了待ちを足さない。
+4. A の session と出力を `close_active_detached_session_exact` / `finish_active_detached_session_close` の部品で退役し、A–C の binding を明示的に外す
+   (独立 C では自動の unbind が効かない)。`remove_detached_window_runtime_inner` が A 所有の pending を取り消すので、手順 1 の後に呼ぶ。
+5. `allocate_detached_viewer_window_id` で B を作って C に結ぶ。B の runtime を `Opening`・連動でない・placement P (A のもの、offset なし) で、最初の builder より前に確定する
+   (`set_detached_window_runtime_placement`)。`last_active_detached_window_id` なども B にし、A を指す passive snapshot・deferred view・入力要求を残さない。
+6. (DetachedWindow, 独立) で B の静止画 session を始め、以後は通常の画像ロード・描画経路。前景の送りからの交換では B を前に出す (既存の表示・focus の確定に渡す)。
+   メインの reclaim は起動しない。新しい foreground 奪取・繰り返しの raise・時間窓を足さない。
+7. A が F11 の枠なし全画面だった場合: B も枠なし全画面で開く (既存の F11 の状態を B の最初の確定で適用する)。既存の部品で確定前に適用できない場合は、通常窓で開いて
+   設計担当へ戻す (新しい待ちや再試行で合わせない)。
+同じ window id のまま役割だけ替える案は、利用者の決定 (閉じて開き直す) を表さず、旧メディアと新しい静止画の寿命が同じ lease に残るので採らない。BA-4 (同種の送りでは
+窓 id を保つ) とは、種類変更だけを明示的な新しい窓にする点で整合する。B は静止画の runtime で旧 player を持たないので、一覧から新しいメディアを開いても
+`close_parked_live_media_windows_for_new_media` (ParkedLive でメディア資源を持つ窓を置き換える) の対象にならないことをテストで確かめる (除外用のフラグは足さない)。
+
+**3D**: メディアウィンドウに静止画を出さないので、メディアウィンドウでの 3D の入口は無くなる。A は動画を表示していたので交換時に引き継ぐ 3D は無い。B では第 2 段の規則で
+3D が使え、同じ一覧の静止画の送りでは C・B・presentation・独立性が変わらないので 3D は続く。
+
+**テスト** (旧実装で落ちること。resolver の期待値だけでなく実 handler と所有移動の結果まで):
+- 独立メディア A → 画像 1 → 画像 2 (実 navigation handler): 画像 1 で B≠A、同じ C・一覧・順序、B は独立。画像 2 も同じ B。メインの一覧・選択・閲覧は変わらない (multiwindow scenario)。
+- 独立メディア → 同種メディア → 画像: 途中も独立のまま、画像で 1 回だけ交換。音声・動画の音声モードでも同じ。
+- A の完全退役: session・binding・runtime・passive / deferred の描画要求が消え、後続の ROOT pass で A を再登録しない。B を 1 回の × で閉じられる。
+- 配置: A の P が B の runtime と最初の builder seed に一致。F11 の枠なし全画面から交換しても枠なしで開く。
+- 遅延 reopen (フォルダ / PDF / ZIP) と descriptor 再構築: 独立した窓で独立性を保つ。`fs_open_intent_from_grid=true` でも既存の閲覧を新規扱いしない。
+- F12: 実 F12 handler で、独立した窓から設定に従って表示先・独立性が変わる。遅延の完了が F12 を取り消さない。
+- 対照 (変えない): 連動メディア → 画像 (F12 OFF はメイン、ON は同じ連動ホスト)、一覧からの画像 → メディア → 画像 (静止画の窓の再利用・ParkedLive の再生継続・
+  同じメディアの再開)、静止画 → Video / Audio (メイン / F12 は今の表示先、独立静止画は断る)、複数ウィンドウモード、B を残して一覧から新しいメディアを開いても B が閉じない、
+  B の 3D → 同じ一覧の次の画像で 3D が続く。候補なし・取消のときは A を閉じない。
+- 既存テストの対照: `independent_detached_still_blocks_navigation_to_video`、`independent_still_video_navigation_uses_detached_hint_not_global_toast`、
+  `fullfeature_linked_still_is_preserved_before_different_media_open`、`fullfeature_image_media_image_reuses_parked_linked_still_window`、
+  `fullfeature_image_media_media_image_reuses_same_still_window`、`same_media_grid_open_activates_parked_live_without_close`、
+  `parked_live_audio_window_is_identified_for_minimal_live_display`、`parked_live_video_audio_mode_uses_music_display_and_preserves_mode`。
+
+**触る範囲**: `src/app.rs` (表示先と独立性の解決、`prepare_viewer_presentation_open`、F12 の確定、窓交換の helper)、`src/app/viewer_context_registry.rs`
+(同じ C の A → B の binding 交換を既存の単一 binding の規則の中で行う helper)、`src/app/native_video.rs` (旧メディア資源の退役の接続)、テスト、本書・
+detached-rework-plan §11・関連文書・マニュアル。**触らない範囲**: 課題 2・3 の修正そのもの、decoder・presenter・音声処理・VST bridge、HWND の同定、
+placement の計算・保存形式、focus / z-order の基盤、メインへの C の移管、複数ウィンドウモードの種類変更、静止画 → メディアの仕様。App に detached 用の
+bool / Option / pending を足さない。guard / delay / retry / 追加 repaint / silent fallback を足さない。まれな失敗は既定の割り切り (ログ + 通知)。
+
+**BA 分類**: BA-7 主 (表示先と独立性の二重決定、種類変更の窓交換の分散を 1 つの確定に直す)、BA-4 関連 (同種の送りは安定した id、明示交換だけ新しい id)、
+BA-6 関連 (runtime の placement を次の窓の seed に渡す。新しい保存先・同期経路を作らない)、BA-5 関連 (旧窓の描画要求を残さない)。
+
+**規模**: 由来を状態から決める簡素化で、実装は課題 2・3 の確定後に 1 人の実装担当が 1.5〜2.5 人日、独立レビューと修正で 0.5〜1 人日の見込み
+(利用者が了承した 1〜1.5 日を超える。統括に報告済み)。
+
+**設計レビュー r1 (GPT-6.1 Sol / xhigh、read-only、対象はこの節の案)**: P1 1 件・P2 2 件・P3 1 件、判定「指摘修正後に実装開始可」、構造的変更であることに**合意**
+(BA-7 主、BA-4・BA-6 関連、BA-5 を退役の回帰対象とする分類も妥当)。由来を状態から決める簡素化は、下の補正つきで採用できるとされた。反映:
+
+- **P1**: descriptor による再構築 (`activate_detached_image_window_snapshot` → `resume_active_detached_book_context_from_descriptor` →
+  `start_active_detached_book_context_with_start`) は、同じ window id でも**新しい context** を作り、`ViewerSession::default` の独立性は false。
+  「binding が残るので引き継ぐ」は誤りだった。**binding を予約・公開する時点で、解決済みの (presentation, 独立性) を bundle へ初期確定する**:
+  既存の `resume_window_id` / `DetachedBookContextStart` の開始・再開の区別を使い、再開なら再開元の独立性、新規 detached book open なら新規 open の規則で決める
+  (コレクション root の `start_active_detached_collection_root_image` は既に独立性を初期設定している)。以後のページ open は現在値を引き継ぐ。
+  由来を `DeferredFsReopen` や media pending へ広げる必要はない。回帰: 設定から独立性を得られない状態で、実 activation → descriptor 再構築 → 列挙完了 → 最初・次のページ。
+- **P2**: 複数ウィンドウモードの新規 Video / Audio は今 `independent_detached_still=false` で確定し、次の画像で設定から true になっている。継承の規則では false を引き継いで
+  「同じ窓・独立」にならない。**新しく binding するときの規則で、複数ウィンドウモードのメディアは (DetachedWindow, 独立) を初期確定**し、以後は引き継ぐ。
+  一覧の選択追従・F12 は今の動きを保つ (対照)。回帰は独立フラグを手で立てた fixture ではなく、通常の一覧から新規 Video / Audio → 画像 1 → 画像 2 で、
+  窓 id・独立性・メインの選択・静止画からメディアへの拒否を検査する。
+- **P2 (F11)**: F11 は即座に bool を切り替えず `DetachedViewerBorderlessTransition::target_borderless` に要求を持つ。F11 直後の送りは通常の操作で起こる
+  (`fs_nav_is_locked` は遷移をロックしない)。**交換の前に、遷移中ならその target、無ければ確定した状態を捕捉し、通常時の restore placement と一緒に B の最初の
+  生成 (`build_detached_viewer_viewport_builder`、初回から枠なしを指定できる) へ渡す**。`reset_active_detached_viewport_runtime_for_new_window` が borderless /
+  restore / transition を消すので、その後に B へ設定する。上の手順 7 の「確定前に適用できない場合は通常窓で開いて戻す」は削除する (通常の操作の表示の変更であり、
+  まれな失敗の割り切りではない)。回帰: F11 確定後・入り途中・戻り途中の交換と、B で F11 を戻したときの通常の配置・最大化の復元
+  (枠なしのときは runtime の通常配置 P と builder の全画面矩形が違うので、単純な一致を期待しない)。
+- **P3**: session の確定 (`commit_viewer_session_deferred_feedback`、`src/app/depth_view.rs`) は `target_independent` を 3D の終了判定に使うだけで独立性を書かない。
+  **`src/app/depth_view.rs` を変更範囲に入れ、確定点が (presentation, 独立性) を一緒に書く**。F12 の egui 経路 (`apply_egui_viewer_presentation_for_current_item`) と
+  native の確定経路 (`apply_video_presentation_switched`) も解決済みの独立性を確定する (presentation だけの helper を呼び続けると古い独立性が残る)。
+- 訂正: 一覧などからの新規 open は「全て binding が無い」わけではない (連動の静止画の窓は再利用されて binding が残る)。その場合の現在値 (連動 = false) の継承は結果を変えない。
+  外部・single instance・MCP・検索・タグ・履歴・sidecar / パスワード待ち・source-swap・EOF・スライドショーで、誤って独立性を引き継ぐ追加の経路は見つからなかった。
+- 通常の使い方への影響に追記: 画像へ移った後は、その窓から動画・音声へ送り戻せない (独立した静止画の窓は動画・音声への送りを断る、利用者の決定 (c)(d) に含まれる)。
+  窓の作り直しによる表示の間隔・フォーカスの変化は未測定。
+- 規模: 実装 2〜3 人日、レビューと修正 0.5〜1 人日 (全件テストと実機確認は別)。
+
 ### 6.5 他の機能との関係 — 「表示を占有するモード」を 1 つの述語にする
 
 360° が他の機能を止めている箇所 (調査では 30 か所余り: キー・編集ツールの入口・補正パネル・
