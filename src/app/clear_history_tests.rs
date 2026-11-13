@@ -302,3 +302,163 @@ fn reading_history_clear_confirm_count_failure_warns_without_deleting() {
     lock.execute_batch("ROLLBACK").unwrap();
     assert_eq!(reading_count(&app), 2);
 }
+
+fn history_clear_grid_harness() -> egui_kittest::Harness<'static, AppTestEnvForTest> {
+    let mut app = setup_app_for_test();
+    seed_reading(&app, 2);
+    let folder = app.tmp.path().join("modal-grid");
+    app.current_folder = Some(folder.clone());
+    app.items = (0..80)
+        .map(|index| crate::grid_item::GridItem::ZipFile(folder.join(format!("book-{index}.zip"))))
+        .collect();
+    app.visible_indices = (0..80).collect();
+    app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending; 80];
+    app.image_metas = vec![None; 80];
+    app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+    app.settings.grid_cols = 4;
+    app.settings.grid_click_selection_mode = crate::settings::GridClickSelectionMode::Explorer;
+    app.settings.grid_open_selected_item_on_click = false;
+    let mut fonts_ready = false;
+    crate::test_ui::builder()
+        .with_size(egui::vec2(1200.0, 480.0))
+        .with_step_dt(0.01)
+        .build_ui_state(
+            move |root_ui, app| {
+                let ctx = &root_ui.ctx().clone();
+                if !fonts_ready {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                // Match App::update: dialogs precede the main grid's input and drawing.
+                app.show_reading_history_clear_confirm_dialog(ctx);
+                assert!(app.handle_keyboard(ctx).is_none());
+                app.process_scroll(ctx);
+                assert!(app.render_grid(root_ui).is_none());
+            },
+            app,
+        )
+}
+
+fn click_history_grid_at(
+    harness: &mut egui_kittest::Harness<'_, AppTestEnvForTest>,
+    pos: egui::Pos2,
+) {
+    harness.hover_at(pos);
+    for pressed in [true, false] {
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    harness.step();
+}
+
+fn wheel_history_grid(harness: &mut egui_kittest::Harness<'_, AppTestEnvForTest>) {
+    harness.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, -180.0),
+        modifiers: egui::Modifiers::NONE,
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Unknown,
+    });
+    harness.run_steps(8);
+}
+
+fn key_history_grid(harness: &mut egui_kittest::Harness<'_, AppTestEnvForTest>, key: egui::Key) {
+    for pressed in [true, false] {
+        harness.event(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+    }
+    harness.run_steps(4);
+}
+
+#[test]
+fn reading_history_clear_modal_blocks_grid_click_wheel_and_keys() {
+    use egui_kittest::kittest::Queryable;
+    let mut harness = history_clear_grid_harness();
+    harness.run_steps(6);
+    let tile = harness
+        .ctx
+        .data(|data| {
+            data.get_temp::<egui::Response>(egui::Id::unique((
+                "grid_cell_input_response",
+                harness.state().grid_scroll_context_id(),
+                0usize,
+            )))
+        })
+        .expect("real grid tile")
+        .rect
+        .center();
+    // Positive controls: this point and these input handlers operate the actual grid.
+    harness.state_mut().selected = Some(1);
+    click_history_grid_at(&mut harness, tile);
+    assert_eq!(harness.state().selected, Some(0));
+    key_history_grid(&mut harness, egui::Key::ArrowRight);
+    assert_eq!(harness.state().selected, Some(1));
+    wheel_history_grid(&mut harness);
+    assert!(harness.state().grid_scroll.offset() > 0.0);
+    harness.state_mut().grid_scroll.set_position(0.0);
+    harness.run_steps(6);
+
+    harness.state_mut().request_clear_reading_history();
+    harness.run_steps(6);
+    let selected = harness.state().selected;
+    let offset = harness.state().grid_scroll.offset();
+    click_history_grid_at(&mut harness, tile);
+    assert_eq!(
+        harness.state().selected,
+        selected,
+        "backdrop must block tile selection"
+    );
+    assert!(
+        harness.state().reading_history_clear_dialog_visible(),
+        "backdrop click must not dismiss"
+    );
+    wheel_history_grid(&mut harness);
+    assert_eq!(
+        harness.state().grid_scroll.offset(),
+        offset,
+        "backdrop must block wheel scrolling"
+    );
+    for key in [egui::Key::ArrowDown, egui::Key::PageDown] {
+        key_history_grid(&mut harness, key);
+        assert_eq!(harness.state().selected, selected);
+        assert_eq!(harness.state().grid_scroll.offset(), offset);
+        assert!(harness.state().common_modal_dialog_open());
+    }
+    assert_eq!(reading_count(harness.state()), 2);
+    harness.get_by_label("キャンセル").click();
+    harness.run_steps(6);
+    assert!(!harness.state().common_modal_dialog_open());
+    assert_eq!(harness.state().selected, selected);
+    assert_eq!(harness.state().grid_scroll.offset(), offset);
+}
+
+#[test]
+fn reading_history_clear_modal_cancel_and_clear_buttons_work() {
+    use egui_kittest::kittest::Queryable;
+    let mut harness = history_clear_grid_harness();
+    harness.state_mut().request_clear_reading_history();
+    harness.run_steps(6);
+    harness.get_by_label("キャンセル").click();
+    harness.run_steps(6);
+    assert!(!harness.state().common_modal_dialog_open());
+    assert_eq!(reading_count(harness.state()), 2);
+    harness.state_mut().request_clear_reading_history();
+    harness.run_steps(6);
+    harness.get_by_label("クリア").click();
+    harness.run_steps(6);
+    assert!(!harness.state().common_modal_dialog_open());
+    assert_eq!(reading_count(harness.state()), 0);
+    assert_eq!(toast(harness.state()), Some("閲覧履歴を 2 件削除しました"));
+}

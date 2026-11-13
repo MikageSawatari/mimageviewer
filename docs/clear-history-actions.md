@@ -18,7 +18,7 @@
   状態は `show_reading_history_clear_confirm` だけ。
   `reading_history_clear_dialog_visible` を描画と共通モーダル判定で共有し、
   Enter / Escape は IME 対応 helper を通す。Enter のリピートでは確定せず、新しい押下を要する。
-  ×／キャンセルでは削除せず、確定時に件数を数え直す。
+  キャンセル／Escape では削除せず、確定時に件数を数え直す。
   確認前と確定時は `ReadingHistoryDb::try_count` で取得失敗を区別し、0 件のときだけ
   「閲覧履歴はありません」と通知する。取得失敗はログ＋警告で終了し、確認も削除も行わない。
   DB 不在時は従来どおり確認後の共有削除処理でエラーを通知する。既存の `count()` の
@@ -39,6 +39,8 @@
   本体 lib 全件と build-dev は利用者側の担当。対話起動は行わない。
 
 ## 実装・検証記録
+
+- サブ PC 担当の実機観測（確認画面の背後のタイルが選択された）を受け、確認を削除確認と同じ `egui::Modal` に変更。共通モーダル登録を保ち、背景クリックは閉じずに吸収する。実際の一覧へのクリック・ホイール・キー入力の遮断とボタン操作を新規 2 件の egui 入力テストで確認済み。run-heavy 経由で履歴操作 15 件、関連 1410 件（run ID `20d5f67b-490b-4464-a228-6252bf3f61a6`）、ui_snapshot 257 件が成功、PNG 更新なし。
 
 - 共通処理は `src/ui_dialogs/clear_history.rs`、環境設定の one-shot 要求は
   `apply_search_input_history_clear_request` / `apply_reading_history_clear_request`。

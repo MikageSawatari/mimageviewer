@@ -124,26 +124,25 @@ impl App {
                 })
             });
         let escape_pressed = self.dialog_escape_pressed(ctx);
-        let mut open = true;
         let mut clear = false;
         let mut cancel = escape_pressed;
-        // Normal Window uses the resolved OS theme, including its warning text color.
-        egui::Window::new("閲覧履歴のクリア")
-            .id(egui::Id::unique("reading_history_clear_confirm"))
-            .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.label("閲覧履歴をすべてクリアしますか？");
-                ui.colored_label(ui.visuals().warn_fg_color, "元に戻せません。");
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    clear = ui.button("クリア").clicked() || enter_pressed;
-                    cancel |= ui.button("キャンセル").clicked();
-                });
+        let dialog_width = (ctx.content_rect().width() - 32.0).clamp(240.0, 520.0);
+        // Match delete confirmation: absorb backdrop clicks without dismissing the modal.
+        // The ordinary context inherits the resolved OS theme and its warning text color.
+        egui::Modal::new(egui::Id::unique("reading_history_clear_confirm")).show(ctx, |ui| {
+            ui.set_min_width(dialog_width.min(320.0));
+            ui.set_max_width(dialog_width);
+            ui.heading("閲覧履歴のクリア");
+            ui.add_space(8.0);
+            ui.label("閲覧履歴をすべてクリアしますか？");
+            ui.colored_label(ui.visuals().warn_fg_color, "元に戻せません。");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                clear = ui.button("クリア").clicked() || enter_pressed;
+                cancel |= ui.button("キャンセル").clicked();
             });
-        if cancel || !open {
+        });
+        if cancel {
             self.resolve_reading_history_clear_confirmation(false);
         } else if clear {
             self.resolve_reading_history_clear_confirmation(true);
