@@ -24331,10 +24331,10 @@ impl App {
         visible
     }
 
-    /// Query the same blocker table, allowing only an existing tree gesture
+    /// Query the pointer blocker table (without menus), allowing a tree gesture
     /// to continue through sidecar hydration. Other simultaneous blockers count.
-    pub(crate) fn modal_input_blocked_except_sidecar_restore(&self) -> bool {
-        self.modal_dialog_block_reason_filtered(true, false)
+    pub(crate) fn main_chrome_pointer_blocked_except_sidecar_restore(&self) -> bool {
+        self.modal_dialog_block_reason_filtered(false, false)
             .is_some()
             || self.omitted_entries_dialog_visible()
     }

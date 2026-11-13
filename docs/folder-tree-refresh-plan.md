@@ -796,6 +796,42 @@ focused の `src/app.rs` は前回同様 broad path（全lib指定になる）�
 - 停止表そのもの (項目と順序) は変えない。読み方の引数を揃えるだけなので、新しい状態や時間窓は増えない。メニューの有無で状態の組み合わせを足さず、従来のツリーと同じ判定にまとめる。
 - 確かめること: グリッドのメニュー (egui メニュー、ブックマーク表示の専用 Window、読書履歴表示) が開いた状態で、メニュー外のツリーの名前・矢印をクリックすると従来どおり移動・開閉する。メニューに重なる位置の押下はツリーへ届かない。サイドカー復元中にメニューが開いている場合は、復元中の新しいクリックを受け付けない既定のまま。`main_chrome_folder_tree_clicks_follow_common_modal_ownership` の GridMenu ケースを本番の入力開始を通して通す。
 
+#### r6 の実装と全libで見つかった8件への対応（`762936a9c` 上の未コミット差分）
+
+**Enter の原因の確定。** `6f5791d1e` と `b01467f52` 以降で異なる Rust 4ファイル（`app.rs`、`ui_fullscreen.rs`、`ui_folder_pane.rs`、`app/folder_pane_refresh_tests.rs`）を一時的にすべて `6f5791d1e` の内容へ戻し、他の Rust source は両commitで同一であることを照合して、対象の arrow / keyboard 試験1件だけを実行した。**0成功 / 1失敗、0.702秒、exit100**。この環境では `6f5791d1e` でも Enter 後 pending の unwrap が None で失敗した（旧2493行、現在の2607行に対応）。ログは `target/769-r6-enter-6f.log`。HEAD・branchは動かさず、比較後は保存した現行4ファイルを復元した。
+
+現行へ戻して一時診断を加えた実測（`target/769-r6-red-and-enter-diagnostic-2.log`）では、Enter pass は次の順だった。
+
+1. 入力前: tree focusあり、cursor=B、pendingなし。
+2. キー処理後: Enter消費済み、tree focus解放済み、実 pending=B。
+3. 描画した全ラベル: `clicked=false`、`clicked_by(Primary)=false`、Enter=false、AccessKit Click要求=false。描画の移動候補は None。
+4. 移動裁定前: pending=B。裁定後: 開始tokenあり・cancel=false、pendingなし・現在地=B。
+
+従って実scanの成功応答が同じpassの裁定で採用される競走であり、P2 の候補None代入や `FAKE_PRIMARY_CLICKED` の重複ではない。vendor の fake flag は `get_response` がその時点のキー・focus・AccessKit要求から都度生成し、begin-passに保存されないことも照合した。**製品の Enter・非pointer活性化・P2 の候補更新は変更しない。** 試験frame本体を共有したまま裁定直前の hook を追加し、対象 Enter frame だけ、実handlerが作った目的=PaneNavigation・path=B・focus解放を検査して受信を一時保留する。裁定後も同じpath/token・非取消を検査し、実receiverへ戻して既存の実完了を通す。pending先Bという元の期待は維持し、scan速度に左右されない観測境界にした。
+
+最初の診断試行は、診断用の `data_mut` 内で同じ Context を読むロック入れ子を実行前に発見し、コンパイル中に Ctrl+C で取り下げた（`target/769-r6-red-and-enter-diagnostic.log`）。pass番号をロック外で読む形へ直した **`-2.log` だけを有効な診断・失敗証拠とする**。一時診断は製品・テストからすべて撤去済み。
+
+**r6 の実装。** 新規入力の開始、Single / Arrow の適用時確認は既存 `main_chrome_pointer_blocked()` を使う。継続と Toggle の適用時確認は、`main_chrome_pointer_blocked_except_sidecar_restore()` が同じ表を `(include_menus=false, include_sidecar_restore=false)` で読む。計5箇所を揃え、ツリー入力から `modal_dialog_block_reason()` を使わない。停止表の項目・順序、keyboard側の診断と停止、witness / layer によるメニュー重なりの拒否は変更しない。
+
+**7件のハーネス。** main_chrome の既存試験と search_nav の共通 `main_frame` は、fixture開始時の NotStarted だけを終端し、ROOT入力開始をキー・ツールバー・main barsより先に通す。main_chrome に表示完了も加え、search は既存の表示完了を維持する。search の矢印座標は cfg(test) で記録する実描画矩形に揃えた。実search editorのfocus・クリックでのblur・native twin / 修飾 / keypad / coalescing、gridの選択本が開かないこと、PaneNavigationの採用先の期待は書き換えていない。通過していた入力なしの3系統の描画ハーネスは変更しない。
+
+**修正前のr6回帰。** 実 `show_context_menu` を ROOT入力・キーの後、ツールバー・main barsの前に通すfixtureを追加。Grid / Bookmark専用Window / ReadingHistory × 名前・矢印の外側クリック6件、メニュー外の続きのpress、メニューに重なるcaptureの拒否、認識後にmenu ownerが始まるSingle / Arrow / Toggleの適用を検査する。さらに実CheckingRelayで復元の受信を保留した既存fixtureで、実メニュー併存時の新規クリック拒否と初回行への継続Toggle許可を別々に検査する。メニューのlive ownerと実Window、領域・capture・クリック成立を前提として確認し、メニューのcommandを実行しないよう overlapのrelease前にcaptureが実背景move widgetまたは非CLICK部品であることを検査する。全fixtureのデータはTempDir、nativeメニューはmain_hwnd無しで既存Fallbackへ送る。
+
+ハーネス修正と新11件を加えたが、製品のr6停止条件を変える前に上記の診断と合わせて19件を実行した。**8成功 / 11失敗、4.974秒、exit100、コンパイル5分39秒**（`target/769-r6-red-and-enter-diagnostic-2.log`、当時のsourceは `target/769-r6-red-source/`）。searchの6件、メニュー重なり拒否、新クリックの復元中拒否は成功。失敗は、旧main_chromeが最初のNoneを通ってGridMenuで失敗、Enterの上記競走、および新r6回帰のうち正の9件すべてが実メニュー等の前提を通過後の移動・展開の製品assertで失敗した。fixture成立の失敗は含まない。
+
+**最終検証:** Windows MSVC / default features / test・dev profile。すべて指定の `run-heavy.ps1 -Owner "codex-769"` 経由。比較用の実行は先行全件テストのlockを待ち、その後はlock領域への書込み不可の警告に従い BelowNormal / `CARGO_BUILD_JOBS=6` で実行した。core checkのみ既存native検証に合わせ `-j 1` を明示した。
+
+| コマンド・範囲 | 結果 | 証跡 (`target/`) |
+| --- | --- | --- |
+| 元の8件 + 新r6回帰11件の明示filter | **19成功 / 失敗0、18.007秒、exit0**。コンパイル9分24秒。上の修正前失敗11件を含む | `769-r6-green.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/folder_pane/) \| test(/main_chrome/) \| test(/search_nav/) \| test(/sidecar_restore/)' --no-fail-fast --retries 0 --no-tests fail` | **306成功 / 失敗0、169.094秒、exit0**（既存search_nav入力経路列挙等のslow 6件も成功）。P2のpointer B→現在地A / pointer→AccessKit現在地A回帰を含む | `769-r6-related.log` |
+| `scripts/test-focused.ps1 -Path ...`（変更したテスト保有Rust 4ファイルを配列指定） | **18 / 114 / 17 / 6件の4群すべて成功、計155実行、exit0**。2.133 / 28.554 / 15.612 / 12.342秒。上のfilterとの重複を含む | `769-r6-focused.log`、`769-r6-focused.ps1`、ログ内の `test-focused/runs/*` の各結果 |
+| `cargo check -p mimageviewer --bin mimageviewer-core -j 1` | **exit0、1分09秒** | `769-r6-check.log` |
+| 引数なし `cargo fmt` / `cargo fmt --check` | **各exit0** | `769-r6-fmt.log` / `769-r6-fmt-check.log` |
+| `git diff --check` / 検証前後のRust SHA-256照合 | **各成功** | `769-r6-diff-check.log` / `769-r6-source-hashes.json` |
+
+focused の指定順は `src/ui_folder_pane.rs`、`src/app/folder_pane_refresh_tests.rs`、`src/app/main_chrome.rs`、`src/app/search_nav_pane_frame_tests.rs`。`src/app.rs` はscriptのbroad判定で全lib指定になるため、従来と同じ分担で除外した。共有表helperの引数修正は上記の実入力回帰・停止理由の既存回帰・core checkで確認した。独立 Sol / xhigh のr6実装静的レビューは **ACCEPT**、追加findingなし。HEADは `762936a9c` のまま未コミット。全lib・ui_snapshot・build-dev・製品起動は行わず、backlogにも触れていない。
+
 ## 13. マウスでクリックした行を中央へ寄せない (2026-11-12 設計、ClaudeCode)
 
 利用者決定 (2026-11-12 夜、§1.769 の実機確認 依頼 40 から派生)。ツリーで行の名前、または ▶ / ▼ をマウスでクリックしたときは、その行を中央へ寄せない。押した行は既に見えているので、Windows のエクスプローラのナビゲーション ウィンドウと同じく、スクロール位置をそのままにする。

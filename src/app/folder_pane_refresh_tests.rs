@@ -248,6 +248,17 @@ fn navigation_tree_frame_height(
     events: Vec<egui::Event>,
     height: f32,
 ) -> Option<Arc<AtomicBool>> {
+    navigation_tree_frame_height_before_navigation(app, ctx, frame, events, height, |_| {})
+}
+
+fn navigation_tree_frame_height_before_navigation(
+    app: &mut App,
+    ctx: &egui::Context,
+    frame: &mut u64,
+    events: Vec<egui::Event>,
+    height: f32,
+    mut before_navigation: impl FnMut(&mut App),
+) -> Option<Arc<AtomicBool>> {
     *frame += 1;
     let mut started = None;
     ctx.run_ui(
@@ -266,6 +277,7 @@ fn navigation_tree_frame_height(
             let (toolbar_fav_nav, address_nav) = app.render_toolbar(ui);
             let folder_pane_nav = app.render_folder_pane(ui).0;
             let grid_nav = app.render_grid(ui);
+            before_navigation(app);
             started = app
                 .folder_pane_open_pending
                 .as_ref()
@@ -720,6 +732,7 @@ fn sidecar_tree_frame(
             app.render_other_worker_results(ctx);
             let keyboard_nav = app.handle_keyboard(ctx);
             app.render_menu_worker_results(ctx);
+            let context_nav = app.show_context_menu(ctx);
             let (toolbar_fav_nav, address_nav) = app.render_toolbar(ui);
             let folder_pane_nav = app.render_folder_pane(ui).0;
             let grid_nav = app.render_grid(ui);
@@ -729,6 +742,7 @@ fn sidecar_tree_frame(
                     keyboard_nav,
                     toolbar_fav_nav,
                     address_nav,
+                    context_nav,
                     folder_pane_nav,
                     grid_nav,
                     ..empty_main_navigation()
@@ -2598,13 +2612,51 @@ fn folder_pane_label_arrow_and_keyboard_keep_existing_behavior() {
         &mut frame,
         vec![tree_key_event(egui::Key::ArrowUp)],
     );
-    navigation_tree_frame(
+    // The real Enter handler starts its worker before this pass draws. Hold
+    // receipt at the existing arbitration boundary so scan speed cannot remove
+    // the pending owner before this test inspects the exact Enter request.
+    ctx.options_mut(|options| options.max_passes = std::num::NonZeroUsize::new(1).unwrap());
+    let (held_reply, waiting_reply) = mpsc::channel();
+    let mut waiting_reply = Some(waiting_reply);
+    let mut actual_reply = None;
+    let started = navigation_tree_frame_height_before_navigation(
         &mut app,
         &ctx,
         &mut frame,
         vec![tree_key_event(egui::Key::Enter)],
-    );
-    assert_eq!(app.folder_pane_open_pending.as_ref().unwrap().path, b);
+        600.0,
+        |app| {
+            assert!(
+                !app.folder_pane.has_focus,
+                "Enter releases tree keyboard focus"
+            );
+            let pending = app
+                .folder_pane_open_pending
+                .as_mut()
+                .expect("the real Enter handler starts a folder scan before arbitration");
+            assert_eq!(pending.path, b);
+            assert!(matches!(
+                pending.purpose,
+                FolderOpenScanPurpose::PaneNavigation
+            ));
+            actual_reply = Some(std::mem::replace(
+                &mut pending.rx,
+                waiting_reply
+                    .take()
+                    .expect("the hook runs once in this single-pass frame"),
+            ));
+        },
+    )
+    .expect("Enter creates the pending owner in the normal frame");
+    let pending = app
+        .folder_pane_open_pending
+        .as_mut()
+        .expect("normal arbitration preserves the Enter request while receipt is held");
+    assert_eq!(pending.path, b);
+    assert!(Arc::ptr_eq(&started, &pending.cancel));
+    assert!(!started.load(Ordering::Relaxed));
+    pending.rx = actual_reply.expect("the hook retained the actual worker receiver");
+    drop(held_reply);
     finish_label_navigation(&mut app, &ctx, &b);
 }
 
@@ -4846,4 +4898,136 @@ fn folder_pane_label_hover_only_upper_area_cancels_continuation() {
 #[test]
 fn folder_pane_label_drag_only_upper_window_body_cancels_continuation() {
     hover_only_tree_layer_scenario("window");
+}
+
+fn folder_pane_sidecar_with_grid_menu_scenario(continuation: bool) {
+    let SidecarTreeFixture {
+        mut app,
+        ctx,
+        b,
+        c,
+        pos,
+        first,
+        relay,
+    } = sidecar_tree_fixture(SidecarTreeFixtureMode::Name);
+    assert!(relay.captured(), "the real Checking receiver is held");
+    app.sidecar_restore
+        .as_mut()
+        .unwrap()
+        .reset_modal_grace_for_test();
+
+    // Capture a real owner from the already installed B dataset. Never replace
+    // the dataset or hydrate a synthetic item while its restoration is active.
+    assert!(!app.items.is_empty());
+    let menu_owner = app.capture_grid_context_menu_owner(0);
+    app.context_menu_idx = Some(menu_owner);
+    app.context_menu_pos = egui::pos2(1100.0, 80.0);
+    #[cfg(windows)]
+    {
+        app.main_hwnd = None; // The actual menu uses egui, never the desktop.
+    }
+    for time in [10.04, 10.05] {
+        sidecar_tree_frame(&mut app, &ctx, time, vec![], None);
+        assert_eq!(app.context_menu_idx, Some(menu_owner));
+    }
+    let menu = egui::AreaState::load(&ctx, egui::Id::unique("grid_ctx_menu"))
+        .expect("the real grid context menu was drawn before the input pass");
+    assert!(menu.rect().is_positive());
+    assert!(menu.interactable);
+    assert!(
+        ctx.memory(|memory| memory.top_modal_layer().is_none()),
+        "the restore stays in its pre-overlay grace period"
+    );
+    let other_pos = visible_label_click_rect(&ctx, &c).center();
+    let target = if continuation { pos } else { other_pos };
+    assert!(!menu.rect().contains(pos));
+    assert!(!menu.rect().contains(other_pos));
+    assert!(pos.distance(other_pos) > 6.0);
+    assert_label_expanded(&app, &b, false);
+    assert_label_expanded(&app, &c, false);
+
+    let request = app
+        .sidecar_restore
+        .as_ref()
+        .unwrap()
+        .connection_request_ids_for_test();
+    let restore_cancel = app.sidecar_restore.as_ref().unwrap().cancel_for_test();
+    let generation = app.items_generation;
+    let reveals = tree_scrolls(&ctx);
+    let focus = app.folder_pane.has_focus;
+    let cursor = app
+        .folder_pane
+        .visible_rows()
+        .into_iter()
+        .find(|row| row.is_cursor)
+        .map(|row| row.path);
+    let reveal = app.folder_pane.cursor_scroll;
+    let keyboard_owner = app.keyboard_owner_for_pass(&ctx);
+    assert_eq!(app.current_folder.as_ref(), Some(&b));
+    assert!(app.folder_pane_open_pending.is_none());
+
+    for (time, events) in [
+        (
+            10.08,
+            vec![
+                egui::Event::PointerMoved(target),
+                primary_event(target, true),
+            ],
+        ),
+        (10.10, vec![primary_event(target, false)]),
+    ] {
+        sidecar_tree_frame(&mut app, &ctx, time, events, None);
+        assert_label_expanded(&app, &b, continuation);
+        assert_label_expanded(&app, &c, false);
+        assert_eq!(app.current_folder.as_ref(), Some(&b));
+        assert_eq!(app.items_generation, generation);
+        assert!(app.folder_pane_open_pending.is_none());
+        assert!(!first.load(Ordering::Relaxed));
+        assert_eq!(app.folder_pane.has_focus, focus);
+        assert_eq!(
+            app.folder_pane
+                .visible_rows()
+                .into_iter()
+                .find(|row| row.is_cursor)
+                .map(|row| row.path),
+            cursor
+        );
+        assert_eq!(app.folder_pane.cursor_scroll, reveal);
+        assert_eq!(tree_scrolls(&ctx), reveals);
+        assert_eq!(app.keyboard_owner_for_pass(&ctx), keyboard_owner);
+        assert_eq!(app.context_menu_idx, Some(menu_owner));
+        let state = app
+            .sidecar_restore
+            .as_ref()
+            .expect("the real relay still holds restoration");
+        assert_eq!(state.connection_request_ids_for_test(), request);
+        assert!(Arc::ptr_eq(&restore_cancel, &state.cancel_for_test()));
+        assert!(!restore_cancel.load(Ordering::Relaxed));
+        assert!(
+            ctx.memory(|memory| memory.top_modal_layer().is_none()),
+            "the menu must be tested without a sidecar overlay layer"
+        );
+    }
+
+    // Close only the disposable menu, then release the real checking response
+    // and run the existing hydration/adoption path to completion.
+    app.context_menu_idx = None;
+    finish_sidecar_tree(&mut app, &ctx, &relay, 10.11);
+    assert!(app.sidecar_restore.is_none());
+    assert_eq!(app.current_folder.as_ref(), Some(&b));
+    assert!(app.folder_pane_open_pending.is_none());
+    assert!(!first.load(Ordering::Relaxed));
+    assert!(!restore_cancel.load(Ordering::Relaxed));
+    assert_label_expanded(&app, &b, continuation);
+    assert_label_expanded(&app, &c, false);
+}
+
+#[test]
+fn folder_pane_label_sidecar_with_grid_menu_rejects_new_click() {
+    folder_pane_sidecar_with_grid_menu_scenario(false);
+}
+
+#[test]
+fn folder_pane_label_sidecar_with_grid_menu_allows_anchor_continuation() {
+    folder_pane_sidecar_with_grid_menu_scenario(true);
 }

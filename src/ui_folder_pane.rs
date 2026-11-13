@@ -298,8 +298,8 @@ impl App {
         {
             self.folder_pane.clear_label_click();
         }
-        let start_allowed = self.modal_dialog_block_reason().is_none();
-        let continue_allowed = !self.modal_input_blocked_except_sidecar_restore();
+        let start_allowed = !self.main_chrome_pointer_blocked();
+        let continue_allowed = !self.main_chrome_pointer_blocked_except_sidecar_restore();
         if !continue_allowed {
             self.folder_pane.clear_label_click();
         }
@@ -812,7 +812,7 @@ impl App {
         {
             match result {
                 FolderPaneLabelResult::Single(path) => {
-                    if self.modal_dialog_block_reason().is_some() {
+                    if self.main_chrome_pointer_blocked() {
                         self.folder_pane.clear_label_click();
                         continue;
                     }
@@ -829,7 +829,7 @@ impl App {
                     self.folder_pane.cursor_scroll = FolderPaneCursorScroll::Idle;
                 }
                 FolderPaneLabelResult::Arrow(path) => {
-                    if self.modal_dialog_block_reason().is_some() {
+                    if self.main_chrome_pointer_blocked() {
                         self.folder_pane.clear_label_click();
                         continue;
                     }
@@ -846,7 +846,7 @@ impl App {
                     }
                 }
                 FolderPaneLabelResult::Toggle { path, expanded } => {
-                    if self.modal_input_blocked_except_sidecar_restore() {
+                    if self.main_chrome_pointer_blocked_except_sidecar_restore() {
                         self.folder_pane.clear_label_click();
                         continue;
                     }
