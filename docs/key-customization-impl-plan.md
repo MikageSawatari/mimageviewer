@@ -674,6 +674,9 @@ ini 出力のみ `;` / `#` を含む表記を KeySlot の別名に置換し、`S
     GridOpenLocation*、GridTogglePinnedTag1..20 は既定未割り当て。設定名も `Grid...` に揃え、
     サムネイル一覧 (`Grid`) の一発操作として扱う。操作カスタマイズでキーを
     割り当てると、グリッド表示中に場所移動またはピン留めタグの付与/解除を実行する。
+  - GridClearSearchInputHistory / GridClearReadingHistory は既定未割り当ての Grid / Press 操作。
+    環境設定と同じ全件消去処理をキーとリングで共有する。検索入力履歴は即時保存、閲覧履歴は確認後に削除。
+    空なら通知のみ。詳細は [履歴消去操作](clear-history-actions.md)。
   - GridClearRecentFolders / GridClearQuickFolderSlots も既定未割り当ての Grid 操作。
     フォルダバー設定メニューと同じ共有入口で、状態クリア・設定保存・完了トーストまでを実行する。
     後者は A/B の場所に加えてセッション中の一覧位置を全件消し、現在の一覧も先頭へ戻す。

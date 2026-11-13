@@ -9,6 +9,7 @@
 
 mod about;
 pub(crate) mod agent_integration;
+mod clear_history;
 pub(crate) mod depth_addon;
 mod model_addon;
 #[doc(hidden)]

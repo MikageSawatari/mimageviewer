@@ -8,6 +8,7 @@
 
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
+| [clear-history-actions.md](clear-history-actions.md) | 検索欄の入力履歴・閲覧履歴の全件消去をキー／リングへ割り当てる操作。共有処理・保存・確認・検証 |
 | [metadata-panel-spread-target-plan.md](metadata-panel-spread-target-plan.md) | §1.712 情報タブの左右ページ選択。編集／読書位置から独立したcontext所有、全ページ情報の対象、末尾補助表紙と初期化規則、検証 |
 | [list-order-book-navigation-plan.md](list-order-book-navigation-plan.md) | §1.444 一覧の表示順で前後の本へ移る操作。凍結列の context 所有・都度位置解決・既存 fullscreen 採用経路・検証記録 |
 | [search-result-navigation-682-688-plan.md](search-result-navigation-682-688-plan.md) | §1.682 Everything の一覧順移動と §1.688 検索中の明示移動。追補 §12 の本・コレクション・フォルダを開く全入口、成功時だけの検索終了・失敗/取消保持、入口監査と検証記録 |

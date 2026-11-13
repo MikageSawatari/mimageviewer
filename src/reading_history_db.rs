@@ -292,9 +292,13 @@ impl ReadingHistoryDb {
     }
 
     pub fn count(&self) -> usize {
+        self.try_count().unwrap_or(0)
+    }
+
+    /// 件数取得の失敗と空の履歴を区別する操作向け。
+    pub fn try_count(&self) -> Result<usize, rusqlite::Error> {
         self.conn
             .query_row("SELECT COUNT(*) FROM reading_history", [], |row| row.get(0))
-            .unwrap_or(0)
     }
 
     pub fn prune(&self, limit: usize) -> Result<usize, rusqlite::Error> {
@@ -716,6 +720,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = ReadingHistoryDb::open_at(dir.path().join("reading_history.db")).unwrap();
         (dir, db)
+    }
+
+    #[test]
+    fn try_count_reports_errors_and_preserves_legacy_count_fallback() {
+        let (_dir, db) = temp_db();
+        assert_eq!(db.try_count().unwrap(), 0);
+        db.upsert(entry("C:/Books/count.zip", 1), 1000).unwrap();
+        assert_eq!(db.try_count().unwrap(), 1);
+        db.conn.execute_batch("DROP TABLE reading_history").unwrap();
+        assert!(db.try_count().is_err());
+        assert_eq!(db.count(), 0);
     }
 
     #[test]

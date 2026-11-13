@@ -17467,6 +17467,7 @@ pub struct App {
 
     // ── 回転リセット確認ダイアログ ─────────────────────────────
     pub(crate) show_rotation_reset_confirm: bool,
+    pub(crate) show_reading_history_clear_confirm: bool,
 
     // ── キャッシュ管理ポップアップ ───────────────────────────────
     pub(crate) show_cache_manager: bool,
@@ -21472,6 +21473,7 @@ impl App {
             select_after_load: None,
             video_thumb_overrides: std::collections::HashMap::new(),
             show_rotation_reset_confirm: false,
+            show_reading_history_clear_confirm: false,
             show_cache_manager: false,
             show_metadata_cleanup: false,
             metadata_cleanup_pending: None,
@@ -24405,6 +24407,7 @@ impl App {
             self.edit_bundle_apply_pending.is_some() => "edit_bundle_apply_pending",
             self.edit_bundle_bulk_pending.is_some() => "edit_bundle_bulk_pending",
             self.show_rotation_reset_confirm => "rotation_reset_confirm",
+            self.reading_history_clear_dialog_visible() => "reading_history_clear_confirm",
             self.pdf_password_dialog_path().is_some() => "pdf_password",
             self.show_about_dialog => "about",
             self.show_update_dialog => "update",
@@ -59415,6 +59418,8 @@ impl App {
         }
         for action in [
             KeyAction::GridClearRecentFolders,
+            KeyAction::GridClearSearchInputHistory,
+            KeyAction::GridClearReadingHistory,
             KeyAction::GridClearQuickFolderSlots,
         ] {
             if self.keymap.consume_action(ctx, action) {
@@ -59680,27 +59685,16 @@ impl App {
             self.show_operation_customize = true;
             return None;
         }
-        if self
-            .keymap
-            .consume_action(ctx, KeyAction::GridClearRecentFolders)
-        {
-            self.apply_history_clear_key_action(
-                ctx,
-                KeyAction::GridClearRecentFolders,
-                "grid-history-clear-key",
-            );
-            return None;
-        }
-        if self
-            .keymap
-            .consume_action(ctx, KeyAction::GridClearQuickFolderSlots)
-        {
-            self.apply_history_clear_key_action(
-                ctx,
-                KeyAction::GridClearQuickFolderSlots,
-                "grid-history-clear-key",
-            );
-            return None;
+        for action in [
+            KeyAction::GridClearRecentFolders,
+            KeyAction::GridClearSearchInputHistory,
+            KeyAction::GridClearReadingHistory,
+            KeyAction::GridClearQuickFolderSlots,
+        ] {
+            if self.keymap.consume_action(ctx, action) {
+                self.apply_history_clear_key_action(ctx, action, "grid-history-clear-key");
+                return None;
+            }
         }
 
         if self
@@ -101571,6 +101565,7 @@ impl App {
         self.show_stats_dialog_window(ctx);
         self.show_omitted_entries_dialog(ctx);
         self.show_rotation_reset_confirm_dialog(ctx);
+        self.show_reading_history_clear_confirm_dialog(ctx);
         self.show_cover_crop_dialog(ctx);
         let context_nav = self.show_context_menu(ctx);
         self.render_main_dialogs_after_context(ctx, main_viewer_blocked);
@@ -104949,6 +104944,10 @@ mod composition_detach_tests;
 #[cfg(test)]
 #[path = "app/tests/still_seek_thumbnail_ownership.rs"]
 mod still_seek_thumbnail_ownership;
+
+#[cfg(test)]
+#[path = "app/clear_history_tests.rs"]
+mod clear_history_tests;
 
 /// Crate-wide `App` test fixture.
 ///
