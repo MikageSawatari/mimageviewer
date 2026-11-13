@@ -252,6 +252,7 @@ fn navigation_tree_frame_height(
             ..Default::default()
         },
         |ui| {
+            app.input_update_begin(ctx);
             let keyboard_nav = app.handle_keyboard(ctx);
             let (toolbar_fav_nav, address_nav) = app.render_toolbar(ui);
             let folder_pane_nav = app.render_folder_pane(ui).0;
@@ -2691,4 +2692,71 @@ fn folder_pane_main_return_rechecks_other_branch_even_when_list_a_is_equal() {
         );
         assert_eq!(app.items_generation, generation);
     }
+}
+
+#[test]
+fn folder_pane_label_ordered_arrow_then_nearby_label_is_single() {
+    let (mut app, ctx, mut frame, b, _) = navigation_tree_fixture();
+    navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+    let primary_event = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    ctx.options_mut(|options| options.max_passes = std::num::NonZeroUsize::new(1).unwrap());
+    let label = visible_label_click_rect(&ctx, &b);
+    let arrow = egui::pos2(label.left() - 3.9, label.center().y);
+    let pos = egui::pos2(label.left() + 0.1, label.center().y);
+    assert!(arrow.distance(pos) < 6.0);
+    navigation_tree_frame(
+        &mut app,
+        &ctx,
+        &mut frame,
+        vec![
+            egui::Event::PointerMoved(arrow),
+            primary_event(arrow, true),
+            primary_event(arrow, false),
+            egui::Event::PointerMoved(pos),
+            primary_event(pos, true),
+            primary_event(pos, false),
+        ],
+    );
+    let label_id = ctx
+        .data(|data| data.get_temp::<egui::Id>(egui::Id::unique(("folder_pane_test_label_id", &b))))
+        .unwrap();
+    let witnesses = ctx.pointer_button_targets();
+    assert_eq!(
+        witnesses.len(),
+        4,
+        "each button edge has its own hit witness"
+    );
+    let arrow_id = witnesses[0].3.expect("arrow press must hit a widget");
+    assert_ne!(arrow_id, label_id, "arrow and label are distinct widgets");
+    assert!(ctx.read_response(arrow_id).unwrap().rect.contains(arrow));
+    for (index, expected) in [arrow_id, arrow_id, label_id, label_id]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(
+            witnesses[index].3,
+            Some(expected),
+            "edge {index} has its own correct capture"
+        );
+        assert!(witnesses[index].4, "edge {index} is eligible");
+    }
+    assert!(
+        app.folder_pane
+            .visible_rows()
+            .iter()
+            .any(|row| row.path == b && row.expanded),
+        "arrow click must expand its row even before a nearby label click in the same pass"
+    );
+    assert_eq!(
+        app.folder_pane_open_pending
+            .as_ref()
+            .expect("label remains a single click")
+            .path,
+        b
+    );
 }
