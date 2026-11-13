@@ -12,6 +12,24 @@
 
 ---
 
+## v5.2.0 (2026-11-13)
+
+- **対象**: master `43f174e3f` (配布ビルドの入力)。v5.1.0 以降の §1.718・§1.732・§1.733・§1.751〜§1.753・§1.754 (PDFium)・§1.756・§1.759・§1.764 (手動・自動の表紙範囲、回転は §1.773 で次の版)・§1.766・§1.767 第 1 段・§1.770・§1.682/§1.688・§1.690 (名前で検索とタイトル表示の修正)・ツリーのクリックで中央へ寄せない・履歴の消去 2 種の割り当て・§1.483 (ReleaseChecks の台本)。更新履歴は利用者承認済み (8,121 バイト、短縮版なし)。公開前に `bd417429d` (監査の許可一覧と記録のみ、製品コードの変更なし) を追加。
+- **サブ PC の実機確認 (サブ PC 担当の観測)**: 依頼 37 (§1.755、次の次の版へ)・38 (§1.770)・39 (§1.767 第 2 段、次の版へ)・40 (§1.769、次の版へ)・41 (§1.764)・42/42b (§1.682)・43/44 (§1.690)・45 (ツリーのクリック)・46/47 (履歴の消去)。取り込んだ項目はすべて期待どおり、または既存の作り・手順書の想定違いと判断。
+- **CI 相当**: `cargo fmt --all --check` 成功。`viewer_context_audit` は §1.718 の `evict_legacy_cover_thumbnails` が A4 違反 → 許可一覧に登録 (`bd417429d`、独立 Sol / xhigh が構造的な変更に同意)、テスト 69 件・実行とも成功。
+- **自動テスト**: 配布ビルド内の全体テスト 19,664 件成功 (再試行なし)。test-script feature の lib 全件 17,747 件成功。master の lib 全件は負荷時に `section1375_large_physical_scan_10k_100k` が 600 秒で時間切れになることがあり (単独では約 110 秒、§1.765 に記録)、配布ビルド内では成功。UI スナップショット 257 件成功 (v5.2.0 の「重要な変更点」で 2 枚を更新、1093×614 で閉じる操作が見えることを目視)。
+- **ReleaseChecks (ClaudeCode が実行、利用者了承 2026-11-13、`-IncludeFirstAi` 付き)**: 1 回目 `release-checks-20261113-042713-611ed898` は static-background の開始時に前面の窓の不一致 (環境) で停止、自動再試行なし。利用者が窓を最小化・通知を止めて 2 回目 `release-checks-20261113-050011-2e1435fd` (`-SkipBuild`、同じ診断 artifact)。
+  - seed・idle 5・perf 2 は PASS。idle の CPU 1 コア比 0.001〜0.004、測定中の描画 0 フレーム。perf-cached は drawn 16ms 未満 302/303 (99.67%)・p95 10ms・max 27ms、perf-uncached は 303/304・p95 10ms・max 26ms。pre_grid raw p95 0.084 / 0.090ms。100ms 超 0。
+  - **first-ai は FAIL (既知として出荷、利用者決定)**: §1.483 の台本修正で初めて最後まで走り、最初に全画面を開いた直後の全画面 viewport の 2 コマ目で 490ms (`immediate_viewport run=487ms`、AI の action の前)。10-29 の run でも同じ場所で 544ms あり、今回の版の変更ではない。§1.776 に記録。
+- **bench**: 検索の採点・索引のコード、toolchain、tantivy に変更がないため実施していない。
+- **依存**: PDFium (chromium/8152 が出ているが今回 8138 へ上げたばかり)・Rust 1.100・mIV Sound 上流 v0.17.0 は次の版以降 (利用者了承)。ほかは最新か通常の crate の小更新のみ。
+- **panic.log**: 54 件 17 種すべて disposition あり (`check-panic-log.ps1` exit 0)。
+- **署名・成果物**: `build-dist.ps1 -SkipVst3Bridge` (署名あり)。単体exe・setup.exe を `signtool verify /pa /v` で確認 (Open Source Developer Taku Sano、タイムスタンプあり)。sha256: 単体exe `a2cb0f59ca4c806c7b5f898e0c86148e0205b17373e6e09ca032e17323bae999`、setup.exe `8c8fb958d499b3f89ea02060ee65bee26cefa99a599f36d42997a2714f7e5923`、portable zip `dcae0d1838c3218b565990a607b5d69886dbd9c720c86d001942bcee3008197f`、Vector zip `4ffbbca7121d745f45983d4ff2ef4f29a001faf4e996d4755316fcd1cbb79429`。
+- **VirusTotal (2026-11-13、送信は利用者の了承のうえ利用者が実行、結果は ClaudeCode が結果ページで確認)**:
+  - `mimageviewer-vst3-host.exe` (1,239,128 bytes) sha256 `958840b3e0fc5d8e883036c2e08416869730af98f9f22705a9f1c0ce215ba431` — 0/71、Google・Microsoft とも Undetected。https://www.virustotal.com/gui/file/958840b3e0fc5d8e883036c2e08416869730af98f9f22705a9f1c0ce215ba431
+  - `effetune/mIV Sound.vst3/Contents/x86_64-win/mIV Sound.vst3` (5,894,232 bytes) sha256 `caaa4591b37c7f572381e3b6b28e9f4eff78afac22dfb947af590d0d34e73a35` — 0/71、Google・Microsoft とも Undetected。https://www.virustotal.com/gui/file/caaa4591b37c7f572381e3b6b28e9f4eff78afac22dfb947af590d0d34e73a35
+  - 次回からは中身が変わったときだけ検査する (利用者決定、チェックリスト 12.6 を更新)。
+
 ## v5.1.0 (2026-11-10)
 
 - **対象**: master `abdce7690` (配布ビルドの入力)。v5.0.0 以降の 3D 写真 (depth-parallax)、§1.452・§1.675/§1.676・§1.691・§1.697・§1.726・§1.731・§1.735・§1.741・§1.750 と、一覧の行が窓より高いときの表示位置の修正。更新履歴 (4,782 バイト、8 KB 以内なので短縮版なし) と「重要な変更点」の must_read (書庫内フォルダの直接表示) は利用者承認済み。
