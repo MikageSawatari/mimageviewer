@@ -495,6 +495,70 @@ macro_rules! depth_dialog_owner_scenario {
     };
 }
 depth_dialog_owner_scenario!(multiwindow_depth_addon_grid, "grid", false);
+
+#[test]
+fn multiwindow_depth_paused_last_active_resume_close_does_not_register_passive_again() {
+    std::thread::spawn(|| {
+        for main_fullscreen in [false, true] {
+            for depth in [false, true] {
+                let mut app = setup_app_for_test();
+                app.initialized = true;
+                app.indexer_init.mark_unavailable_if_not_ready();
+                let mut driver = ScenarioDriver::new();
+                crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
+                let ctx = driver.ctx.clone();
+                super::depth_view_tests::install_pages(&mut app, &ctx);
+                app.viewer_presentation = ViewerPresentation::Fullscreen;
+                app.native_video_in_window_active = false;
+                app.settings.fullscreen_keep_on_app_switch = true;
+                if !main_fullscreen {
+                    app.fullscreen_idx = None;
+                }
+                let path = app.tmp.path().join("paused-resume.png");
+                save_portrait(&path, [60, 90, 120]);
+                let window = 89_100;
+                let owner = app.build_active_context_for_test(Some(window), DetachedSource::Image, |app| {
+                    configure_active_still(app, &ctx, path, window, egui::Color32::LIGHT_BLUE);
+                    if depth {
+                        app.set_fs_exclusive_view(
+                            crate::fs_exclusive_view::FsExclusiveView::Depth(
+                                crate::depth_parallax::DepthViewState::new(app.edit_request_owner_context())),
+                            "paused_resume_fixture",
+                        );
+                    }
+                });
+                app.last_active_detached_window_id = Some(window);
+                assert!(app.pause_current_active_viewer_context(&ctx));
+                assert_eq!(app.last_active_detached_window_id, Some(window));
+                assert_eq!(app.active_viewer_context_id(), None);
+                assert_eq!(app.detached_image_windows.iter().filter(|s| s.id == window).count(), 1);
+                assert!(app.activate_detached_image_window_snapshot(&ctx, window));
+                assert_eq!(app.active_viewer_context_id(), Some(owner));
+                assert_eq!(app.detached_image_windows.iter().filter(|s| s.id == window).count(), 0,
+                    "main_fullscreen={main_fullscreen} depth={depth}: active owns no passive snapshot");
+                let viewport = App::detached_image_window_viewport_id(window);
+                driver.focus(viewport);
+                driver.root(&mut app);
+                assert_eq!(app.accept_active_detached_window_close(&ctx, window, "paused_resume_close"), Some(true));
+                assert!(app.locate_window_context(window).is_none());
+                assert_eq!(app.viewer_context_residence(owner), ContextResidence::Retired);
+                assert!(app.detached_window_state(window).is_none());
+                assert!(!app.detached_image_windows.iter().any(|s| s.id == window));
+                driver.focus(egui::ViewportId::ROOT);
+                // First pass retires the old child; subsequent passes must never
+                // seed it again from an orphan passive snapshot.
+                for _ in 0..3 {
+                    driver.root(&mut app);
+                }
+                assert!(!driver.known.borrow().contains(&viewport));
+                assert!(!driver.callbacks.contains_key(&viewport));
+                assert!(!app.deferred_detached_image_window_views.contains_key(&window));
+                assert!(app.locate_window_context(window).is_none());
+                assert!(app.detached_window_state(window).is_none());
+            }
+        }
+    }).join().unwrap();
+}
 depth_dialog_owner_scenario!(multiwindow_depth_addon_embedded, "embedded", false);
 depth_dialog_owner_scenario!(multiwindow_depth_export_embedded, "embedded", true);
 depth_dialog_owner_scenario!(multiwindow_depth_addon_fullscreen, "fullscreen", false);

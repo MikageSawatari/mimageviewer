@@ -125,6 +125,14 @@ impl DepthSetup {
         }
     }
 
+    /// Forget only the pending admission. The addon scan and management UI have
+    /// their own lifetime and must continue after the requesting display is lost.
+    pub(crate) fn invalidate_mode_entry(&mut self, context: ViewerContextId) {
+        if self.entry_modal_owner_context() == Some(context) {
+            self.dialog = None;
+        }
+    }
+
     /// An in-progress addon operation opens modeless progress instead of checking.
     pub(crate) fn entry_check_opens_modal(&self) -> bool {
         self.addon.operation() == AddonOperation::None

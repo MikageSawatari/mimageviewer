@@ -65295,6 +65295,15 @@ impl App {
         let Some(id) = self.active_viewer_context_id() else {
             return false;
         };
+        self.pause_viewer_context_for_handoff(ctx, id)
+    }
+
+    #[cfg(windows)]
+    fn pause_viewer_context_for_handoff(
+        &mut self,
+        ctx: &egui::Context,
+        id: ViewerContextId,
+    ) -> bool {
         if self.viewer_context_residence(id) != ContextResidence::AtRest {
             return false;
         }
@@ -65513,6 +65522,18 @@ impl App {
         cause: ViewerCloseCause,
     ) -> Option<ClosedBookmarkSummary> {
         let id = self.active_viewer_context_id()?;
+        self.take_and_close_context_with_cause(ctx, id, reason, boundary, cause)
+    }
+
+    #[cfg(windows)]
+    fn take_and_close_context_with_cause(
+        &mut self,
+        ctx: &egui::Context,
+        id: ViewerContextId,
+        reason: &'static str,
+        boundary: FsMetadataBoundary,
+        cause: ViewerCloseCause,
+    ) -> Option<ClosedBookmarkSummary> {
         let summary_before = self.with_viewer_context_ref(id, ClosedBookmarkSummary::read)?;
         self.transfer_terminal_close_return(id, cause);
 
@@ -67430,24 +67451,15 @@ impl App {
         ));
         self.clear_fullscreen_feedback_for_viewer_switch();
 
-        if !self.park_and_close_current_active_detached_viewer_for_media_handoff(ctx) {
+        let source = self.active_viewer_context_id();
+        let Some((pos, snapshot)) =
+            self.take_detached_snapshot_for_activation(ctx, source, id, true)
+        else {
             self.log_detached_image_window_debug(format!(
                 "parked_live_activate_aborted id={id} reason=park_current_failed"
             ));
             return false;
-        }
-
-        let Some(pos) = self
-            .detached_image_windows
-            .iter()
-            .position(|window| window.id == id)
-        else {
-            self.log_detached_image_window_debug(format!(
-                "parked_live_activate_aborted id={id} reason=snapshot_missing_after_park"
-            ));
-            return false;
         };
-        let snapshot = self.detached_image_windows.remove(pos);
         let Some((context_id, residence)) = self.locate_window_context(id) else {
             self.log_detached_image_window_debug(format!(
                 "parked_live_activate_aborted id={id} reason=context_missing_after_remove"
@@ -67496,6 +67508,7 @@ impl App {
         );
         self.last_active_detached_window_id = Some(id);
         self.begin_active_detached_session(id, source);
+        self.retire_main_depth_for_independent_activation(context_id);
         self.log_detached_image_window_debug(format!(
             "parked_live_activate_committed id={id} passive_remaining={} active_context=true \
              session={:?}",
@@ -67689,12 +67702,27 @@ impl App {
         ctx: &egui::Context,
         preserve_fullfeature_linked_still: bool,
     ) -> bool {
+        let source = self.active_viewer_context_id();
+        self.park_detached_viewer_for_handoff(ctx, source, preserve_fullfeature_linked_still)
+    }
+
+    #[cfg(windows)]
+    fn park_detached_viewer_for_handoff(
+        &mut self,
+        ctx: &egui::Context,
+        source: Option<ViewerContextId>,
+        preserve_fullfeature_linked_still: bool,
+    ) -> bool {
         if self.document_open_modal_admission_blocked() {
             return false;
         }
-        if self.other_active_viewer_context_contains_video()
+        let source_at_rest =
+            source.filter(|id| self.viewer_context_residence(*id) == ContextResidence::AtRest);
+        if let Some(id) = source.filter(|id| *id != self.projected_viewer_context_id())
             && self
-                .park_active_detached_context_as_live_media(ctx, "park_active_context_live_media")
+                .with_viewer_context_ref(id, Self::viewer_context_contains_video)
+                .unwrap_or(false)
+            && self.park_detached_context_as_live_media(ctx, id, "park_active_context_live_media")
         {
             self.log_detached_image_window_debug(format!(
                 "park_current_active_detached result=parked_live_active_context passive_windows={} \
@@ -67718,7 +67746,7 @@ impl App {
             ));
             return true;
         }
-        if self.pause_current_active_viewer_context(ctx) {
+        if source.is_some_and(|id| self.pause_viewer_context_for_handoff(ctx, id)) {
             self.log_detached_image_window_debug(format!(
                 "park_current_active_detached result=paused passive_windows={} \
                  active_context={} session={:?}",
@@ -67727,13 +67755,14 @@ impl App {
                 self.active_detached_session
             ));
             return true;
-        } else if self.active_detached_context_is_at_rest() {
+        } else if let Some(id) = source_at_rest {
             self.log_detached_image_window_debug(
                 "park_current_active_detached result=close_active_context".to_string(),
             );
             return self
-                .take_and_close_active_context_with_cause(
+                .take_and_close_context_with_cause(
                     ctx,
+                    id,
                     "park_without_snapshot",
                     FsMetadataBoundary::Manual,
                     ViewerCloseCause::Replaced,
@@ -67799,7 +67828,30 @@ impl App {
             self.close_fullscreen();
             return true;
         }
-        !self.active_detached_context_is_at_rest()
+        source_at_rest.is_none()
+    }
+
+    /// Resolve the source before removing the destination: a parked last-active
+    /// window must never become its own outgoing owner merely by losing its snapshot.
+    #[cfg(windows)]
+    fn take_detached_snapshot_for_activation(
+        &mut self,
+        ctx: &egui::Context,
+        source: Option<ViewerContextId>,
+        destination: u64,
+        preserve_fullfeature_linked_still: bool,
+    ) -> Option<(usize, DetachedImageWindowSnapshot)> {
+        if !self.park_detached_viewer_for_handoff(ctx, source, preserve_fullfeature_linked_still) {
+            return None;
+        }
+        let pos = self
+            .detached_image_windows
+            .iter()
+            .position(|window| window.id == destination)?;
+        self.log_detached_image_window_debug(format!(
+            "snapshot_activation_handoff source={source:?} destination={destination} pos={pos} preserve_linked_still={preserve_fullfeature_linked_still}"
+        ));
+        Some((pos, self.detached_image_windows.remove(pos)))
     }
 
     /// Publish an empty, renderable detached context before a slow producer knows its contents.
@@ -67876,6 +67928,7 @@ impl App {
             .viewer_context_window(built)
             .expect("committed detached loading context publishes its window identity");
         self.begin_active_detached_session(window_id, source);
+        self.retire_main_depth_for_independent_activation(built);
         ctx.request_repaint();
         Some(window_id)
     }
@@ -68077,6 +68130,7 @@ impl App {
             .viewer_context_window(built)
             .expect("committed collection root must publish its window binding");
         self.begin_active_detached_session(window_id, DetachedSource::Image);
+        self.retire_main_depth_for_independent_activation(built);
         self.with_window_viewer_context(window_id, |app| {
             app.detached_viewer_open_next_still_detached_once = true;
             app.open_fullscreen(
@@ -68424,6 +68478,7 @@ impl App {
                 _ => DetachedSource::Book,
             };
             self.begin_active_detached_session(window_id, session_source);
+            self.retire_main_depth_for_independent_activation(built);
             ctx.request_repaint();
             true
         } else {
@@ -69168,268 +69223,168 @@ impl App {
             );
             return false;
         }
-        // The active EPUB/password continuation must finish in its owner before another
-        // context can be mounted. This is the same gate used by direct-open admission.
         if self.document_open_modal_admission_blocked() {
             return false;
         }
         if self.detached_window_state_is_parked_live(id) {
             return self.activate_parked_live_media_window_snapshot(ctx, id);
         }
-        let Some(pos) = self
+        let Some(snapshot) = self
             .detached_image_windows
             .iter()
-            .position(|window| window.id == id)
+            .find(|window| window.id == id)
         else {
             return false;
+        };
+        // Resolve and admit the destination while both owners are still intact.
+        enum Resume {
+            Context(ViewerContextId),
+            Collection(DetachedCollectionRootImageOpenPlan),
+            Still(usize),
+            Descriptor(ViewerContextDescriptor),
+        }
+        let resume = if let Some((owner, ContextResidence::AtRest)) = self.locate_window_context(id)
+        {
+            Resume::Context(owner)
+        } else if let Some(plan) = snapshot.reopen_collection_root.clone() {
+            Resume::Collection(plan)
+        } else {
+            let stamp_idx = matches!(
+                snapshot.reopen_descriptor,
+                None | Some(ViewerContextDescriptor::Image { .. })
+            )
+            .then(|| {
+                snapshot
+                    .reopen_sync_stamp
+                    .as_ref()
+                    .and_then(|stamp| self.resolve_viewer_sync_stamp_idx(stamp))
+            })
+            .flatten();
+            if let Some(idx) = stamp_idx {
+                Resume::Still(idx)
+            } else {
+                let Some(descriptor) = snapshot.reopen_descriptor.clone() else {
+                    self.log_detached_image_window_debug(format!(
+                        "passive_activate_aborted id={id} reason=no_reopen_route"
+                    ));
+                    return false;
+                };
+                if let ViewerContextDescriptor::Pdf { path, .. } = &descriptor
+                    && let Some(reason) = self.pdf_open_refusal(path)
+                {
+                    self.show_pdf_open_refusal(reason);
+                    return false;
+                }
+                // Preserve the existing descriptor preflight before handing off the source.
+                if let ViewerContextDescriptor::Image { path } = &descriptor
+                    && !path.parent().is_some_and(|parent| parent.is_dir())
+                {
+                    self.log_detached_image_window_debug(format!(
+                        "passive_activate_aborted id={id} reason=image_parent_missing"
+                    ));
+                    return false;
+                }
+                Resume::Descriptor(descriptor)
+            }
         };
         if !self.admit_book_append_followup_mutation() {
             return false;
         }
-        let snapshot = self.detached_image_windows.remove(pos);
-        self.update_detached_window_runtime_flags(snapshot.id, false, "passive_activate_begin");
+        let source = self.active_viewer_context_id();
+        let Some((pos, snapshot)) =
+            self.take_detached_snapshot_for_activation(ctx, source, id, false)
+        else {
+            return false;
+        };
+        self.update_detached_window_runtime_flags(id, false, "passive_activate_begin");
         self.transition_detached_window_state(
-            snapshot.id,
+            id,
             DetachedWindowState::Resuming,
             "passive_activate_begin",
         );
         self.log_detached_image_window_debug(format!(
-            "passive_activate_begin id={id} pos={pos} has_context={} \
-             descriptor={} stamp={} passive_remaining={} active_context={} session={:?}",
-            self.detached_window_context_is_at_rest(id),
-            Self::detached_viewer_descriptor_debug_kind(&snapshot.reopen_descriptor),
-            snapshot.reopen_sync_stamp.is_some(),
-            self.detached_image_windows.len(),
-            self.active_detached_context_debug_state(),
-            self.active_detached_session
+            "passive_activate_begin id={id} source={source:?} pos={pos} passive_remaining={}",
+            self.detached_image_windows.len()
         ));
         self.clear_fullscreen_feedback_for_viewer_switch();
-
-        if let Some((context_id, ContextResidence::AtRest)) = self.locate_window_context(id) {
-            self.ensure_detached_window_runtime_placement(snapshot.id, "resume_viewer_context");
-            if !self.park_and_close_current_active_detached_viewer(ctx) {
-                self.log_detached_image_window_debug(format!(
-                    "passive_activate_resume_context_aborted id={} reason=park_current_failed",
-                    snapshot.id
-                ));
-                self.transition_detached_window_state(
-                    snapshot.id,
-                    DetachedWindowState::Parked,
-                    "passive_activate_resume_context_aborted",
-                );
-                self.detached_image_windows.insert(pos, snapshot);
-                return false;
-            }
-            let activation = self.with_viewer_context(context_id, |app| {
-                app.activate_mounted_as_independent_detached(snapshot.id);
-                app.adopt_active_detached_viewport_runtime_from_passive("resume_viewer_context");
-                app.begin_retained_shift_readoption(ctx);
-                app.rearm_final_ai_prefetch_after_detached_resume();
-                app.service_final_prepare_before_lookup(ctx);
-                Self::viewer_context_bundle_detached_source(ContextRef::mounted(app))
-            });
-            let Ok(source) = activation else {
-                self.detached_image_windows.insert(pos, snapshot);
-                return false;
-            };
-            // keep-alive: passive→active 再開 = セッション再開 (§3.7 set)。open_fullscreen を
-            // 通らない経路なのでここで明示的に session を立てる。
-            self.last_active_detached_window_id = Some(snapshot.id);
-            self.begin_active_detached_session(snapshot.id, source);
-            self.log_detached_image_window_debug(format!(
-                "passive_activate_resume_context_committed id={} active_context=true \
-                 session={:?}",
-                snapshot.id, self.active_detached_session
-            ));
-            ctx.request_repaint();
-            return true;
-        }
-
-        if let Some(plan) = snapshot.reopen_collection_root.clone() {
-            self.ensure_detached_window_runtime_placement(
-                snapshot.id,
-                "resume_collection_root_image",
-            );
-            if !self.park_and_close_current_active_detached_viewer(ctx)
-                || !self.start_active_detached_collection_root_image(
-                    plan,
-                    ctx,
-                    None,
-                    Some(snapshot.id),
-                )
-            {
-                self.transition_detached_window_state(
-                    snapshot.id,
-                    DetachedWindowState::Parked,
-                    "resume_collection_root_image_aborted",
-                );
-                self.detached_image_windows.insert(pos, snapshot);
-                return false;
-            }
-            let zoom_pan = snapshot.zoom_pan;
-            let free_rotation = snapshot.free_rotation;
-            self.with_window_viewer_context(snapshot.id, |app| {
-                if let Some((zoom, pan)) = zoom_pan {
-                    app.fs_zoom = zoom;
-                    app.fs_pan = pan;
-                    app.clear_fs_initial_placement_request();
-                }
-                app.fs_free_rotation = free_rotation;
-            })
-            .expect("resumed collection root context must remain bound");
-            return true;
-        }
-
-        // 通常画像の parked still はまず同期スタンプ (main の現行 items) で解決する。
-        // `Image` descriptor はスタンプが解決できないときのフォールバック専用
-        // (親フォルダを窓内コンテキストとして開き直す)。Pdf/Zip descriptor は
-        // 従来どおり descriptor 優先 (この if を素通りして下の descriptor 経路へ)。
-        let stamp_first = matches!(
-            snapshot.reopen_descriptor,
-            None | Some(ViewerContextDescriptor::Image { .. })
-        );
-        if stamp_first
-            && let Some(stamp) = snapshot.reopen_sync_stamp.clone()
-            && let Some(idx) = self.resolve_viewer_sync_stamp_idx(&stamp).or_else(|| {
-                if snapshot.reopen_descriptor.is_none() {
-                    self.log_detached_image_window_debug(format!(
-                        "passive_activate_still_aborted id={} reason=stamp_not_resolved",
-                        snapshot.id
-                    ));
+        let activated = match resume {
+            Resume::Context(context_id) => {
+                self.ensure_detached_window_runtime_placement(id, "resume_viewer_context");
+                let activation = self.with_viewer_context(context_id, |app| {
+                    app.activate_mounted_as_independent_detached(id);
+                    app.adopt_active_detached_viewport_runtime_from_passive(
+                        "resume_viewer_context",
+                    );
+                    app.begin_retained_shift_readoption(ctx);
+                    app.rearm_final_ai_prefetch_after_detached_resume();
+                    app.service_final_prepare_before_lookup(ctx);
+                    Self::viewer_context_bundle_detached_source(ContextRef::mounted(app))
+                });
+                if let Ok(source) = activation {
+                    self.last_active_detached_window_id = Some(id);
+                    self.begin_active_detached_session(id, source);
+                    self.retire_main_depth_for_independent_activation(context_id);
+                    ctx.request_repaint();
+                    true
                 } else {
-                    self.log_detached_image_window_debug(format!(
-                        "passive_activate_stamp_fallback_to_descriptor id={}",
-                        snapshot.id
-                    ));
+                    false
                 }
-                None
-            })
-        {
-            self.log_detached_image_window_debug(format!(
-                "passive_activate_still_snapshot id={} idx={idx} independent=true \
-                 descriptor={} zoom_pan={} free_rotation={:.3}",
-                snapshot.id,
-                Self::detached_viewer_descriptor_debug_kind(&snapshot.reopen_descriptor),
-                snapshot.zoom_pan.is_some(),
-                snapshot.free_rotation
-            ));
-            let activate_window_id = snapshot.id;
-            self.ensure_detached_window_runtime_placement(
-                activate_window_id,
-                "resume_still_snapshot",
-            );
-            let activate_zoom_pan = snapshot.zoom_pan;
-            let activate_free_rotation = snapshot.free_rotation;
-            if !self.park_and_close_current_active_detached_viewer(ctx) {
-                self.log_detached_image_window_debug(format!(
-                    "passive_activate_still_aborted id={} reason=park_current_failed",
-                    activate_window_id
-                ));
-                self.transition_detached_window_state(
-                    activate_window_id,
-                    DetachedWindowState::Parked,
-                    "passive_activate_still_aborted",
-                );
-                self.detached_image_windows.insert(pos, snapshot);
-                return false;
             }
-            self.ensure_mounted_detached_session_binding(activate_window_id);
-            self.commit_viewer_session(self.viewer_presentation, true, "resume_still_snapshot");
-            self.detached_viewer_independent_active = true;
-            self.detached_viewer_open_next_still_detached_once = true;
-            self.fs_open_intent_from_grid = false;
-            self.adopt_active_detached_viewport_runtime_from_passive("resume_still_snapshot");
-            self.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
-            if let Some((zoom, pan)) = activate_zoom_pan {
-                self.fs_zoom = zoom;
-                self.fs_pan = pan;
-                self.clear_fs_initial_placement_request();
+            Resume::Collection(plan) => {
+                self.ensure_detached_window_runtime_placement(id, "resume_collection_root_image");
+                if self.start_active_detached_collection_root_image(plan, ctx, None, Some(id)) {
+                    self.with_window_viewer_context(id, |app| {
+                        if let Some((zoom, pan)) = snapshot.zoom_pan {
+                            app.fs_zoom = zoom;
+                            app.fs_pan = pan;
+                            app.clear_fs_initial_placement_request();
+                        }
+                        app.fs_free_rotation = snapshot.free_rotation;
+                    })
+                    .expect("resumed collection root context must remain bound");
+                    true
+                } else {
+                    false
+                }
             }
-            self.fs_free_rotation = activate_free_rotation;
-            self.log_detached_image_window_debug(format!(
-                "passive_activate_still_committed id={} active_context={} fs_idx={:?} \
-                 independent={} session={:?}",
-                activate_window_id,
-                self.active_detached_context_debug_state(),
-                self.fullscreen_idx,
-                self.detached_viewer_independent_active,
-                self.active_detached_session
-            ));
-            ctx.request_repaint();
-            return true;
-        }
-
-        let Some(descriptor) = snapshot.reopen_descriptor.clone() else {
-            self.log_detached_image_window_debug(format!(
-                "passive_activate_aborted id={} reason=no_reopen_route",
-                snapshot.id
-            ));
+            Resume::Still(idx) => {
+                self.ensure_detached_window_runtime_placement(id, "resume_still_snapshot");
+                self.ensure_mounted_detached_session_binding(id);
+                self.commit_viewer_session(self.viewer_presentation, true, "resume_still_snapshot");
+                self.detached_viewer_independent_active = true;
+                self.detached_viewer_open_next_still_detached_once = true;
+                self.fs_open_intent_from_grid = false;
+                self.adopt_active_detached_viewport_runtime_from_passive("resume_still_snapshot");
+                self.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
+                if let Some((zoom, pan)) = snapshot.zoom_pan {
+                    self.fs_zoom = zoom;
+                    self.fs_pan = pan;
+                    self.clear_fs_initial_placement_request();
+                }
+                self.fs_free_rotation = snapshot.free_rotation;
+                ctx.request_repaint();
+                true
+            }
+            Resume::Descriptor(descriptor) => {
+                self.ensure_detached_window_runtime_placement(id, "passive_activate_descriptor");
+                self.resume_active_detached_book_context_from_descriptor(id, descriptor, ctx)
+            }
+        };
+        if !activated {
             self.transition_detached_window_state(
-                snapshot.id,
+                id,
                 DetachedWindowState::Parked,
                 "passive_activate_aborted",
             );
             self.detached_image_windows.insert(pos, snapshot);
-            return false;
-        };
-        if let ViewerContextDescriptor::Pdf { path, .. } = &descriptor
-            && let Some(reason) = self.pdf_open_refusal(path)
-        {
-            self.show_pdf_open_refusal(reason);
-            self.transition_detached_window_state(
-                snapshot.id,
-                DetachedWindowState::Parked,
-                "passive_activate_pdf_refused",
-            );
-            self.detached_image_windows.insert(pos, snapshot);
-            return false;
-        }
-        // Image フォールバックは親フォルダが読めることを先に確認する。handoff を始めた
-        // 後で load に失敗すると表示文脈を失うため、無理なら parked のまま残す。
-        // (ユーザーのクリック 1 回につき is_dir 1 回の同期 I/O。恒常経路ではない。)
-        if let ViewerContextDescriptor::Image { path } = &descriptor {
-            if !path.parent().is_some_and(|p| p.is_dir()) {
-                self.log_detached_image_window_debug(format!(
-                    "passive_activate_reopen_descriptor_aborted id={} reason=image_parent_missing",
-                    snapshot.id
-                ));
-                self.transition_detached_window_state(
-                    snapshot.id,
-                    DetachedWindowState::Parked,
-                    "passive_activate_reopen_descriptor_aborted",
-                );
-                self.detached_image_windows.insert(pos, snapshot);
-                return false;
-            }
-            // Descriptor fallback creates a DetachedPhysical bundle below.
-            // App-global snapshot lock belongs to the main grid and therefore
-            // must not prevent this independent viewer from restoring its file.
-        }
-        self.log_detached_image_window_debug(format!(
-            "passive_activate_reopen_descriptor id={} descriptor={} title={:?}",
-            snapshot.id,
-            Self::detached_viewer_descriptor_debug_kind(&Some(descriptor.clone())),
-            snapshot.title
-        ));
-
-        self.ensure_detached_window_runtime_placement(snapshot.id, "passive_activate_descriptor");
-        if !self.park_and_close_current_active_detached_viewer(ctx) {
+        } else {
             self.log_detached_image_window_debug(format!(
-                "passive_activate_reopen_descriptor_aborted id={} reason=park_current_failed",
-                snapshot.id
+                "passive_activate_committed id={id} active_context={} session={:?}",
+                self.active_detached_context_debug_state(),
+                self.active_detached_session
             ));
-            self.transition_detached_window_state(
-                snapshot.id,
-                DetachedWindowState::Parked,
-                "passive_activate_reopen_descriptor_aborted",
-            );
-            self.detached_image_windows.insert(pos, snapshot);
-            return false;
         }
-        // Descriptor reopen is a pre-terminal renderer handoff. Keep the same runtime lease,
-        // ViewportId, placement, HWND observation, and activation intent while the new context
-        // becomes the active producer for this window.
-        self.resume_active_detached_book_context_from_descriptor(snapshot.id, descriptor, ctx)
+        activated
     }
 
     #[cfg(windows)]
@@ -70319,6 +70274,7 @@ impl App {
             .unwrap_or_else(|error| {
                 panic!("materialized still binding failed for {detached_id:?}: {error:?}")
             });
+        self.retire_main_depth_for_independent_activation(detached_id);
         true
     }
 
@@ -70331,6 +70287,16 @@ impl App {
         let Some(active_id) = self.active_viewer_context_id() else {
             return false;
         };
+        self.park_detached_context_as_live_media(ctx, active_id, reason)
+    }
+
+    #[cfg(windows)]
+    fn park_detached_context_as_live_media(
+        &mut self,
+        ctx: &egui::Context,
+        active_id: ViewerContextId,
+        reason: &'static str,
+    ) -> bool {
         if !self
             .video_presentation_transition
             .z_order_recovery_permitted()

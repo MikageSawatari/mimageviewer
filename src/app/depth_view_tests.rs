@@ -3137,3 +3137,199 @@ fn depth_independent_os_close_retires_request_and_slot_and_releases_entry() {
         assert_eq!(app.depth_entry_allowed(0), Ok(()));
     }
 }
+
+#[cfg(windows)]
+#[test]
+fn depth_main_live_pass_handoff_retires_only_fullscreen_on_actual_still_and_media_activation() {
+    for embedded in [false, true] {
+        for ready in [false, true] {
+            for media in [false, true] {
+                let ctx = egui::Context::default();
+                let mut app = setup_app_for_test();
+                install_pages(&mut app, &ctx);
+                app.viewer_presentation = if embedded {
+                    ViewerPresentation::MainWindow
+                } else {
+                    ViewerPresentation::Fullscreen
+                };
+                app.native_video_in_window_active = embedded;
+                let render = isolate_depth_renderer(&mut app);
+                let child = app.push_window_context_for_test(&ctx, 70_350, |owner| {
+                    install_pages(owner, &ctx);
+                    owner.wgpu_render_state = Some(render.clone());
+                    owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+                    owner.detached_viewer_independent_active = true;
+                    owner.native_video_in_window_active = false;
+                    if media {
+                        owner.fs_cache.insert(
+                            1,
+                            FsCacheEntry::Video {
+                                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                                    "activation.mp4".into(),
+                                    3.0,
+                                )),
+                                load_seq: 0,
+                            },
+                        );
+                    }
+                });
+                app.transition_detached_window_state(
+                    70_350,
+                    if media {
+                        DetachedWindowState::ParkedLive
+                    } else {
+                        DetachedWindowState::Parked
+                    },
+                    "main_live_pass_fixture",
+                );
+                let evidence = tracked_depth(&mut app, ready);
+                // A scoped inspection does not transfer display ownership.
+                app.with_viewer_context(child, |_| {}).unwrap();
+                assert_depth_owner_live(&app, &evidence);
+                assert!(app.activate_detached_image_window_snapshot(&ctx, 70_350));
+                assert_eq!(
+                    app.fs_exclusive_view.is_depth(),
+                    embedded,
+                    "embedded={embedded} ready={ready} media={media}"
+                );
+                if embedded {
+                    assert_depth_owner_live(&app, &evidence);
+                } else {
+                    if let Some(cancel) = &evidence.cancel {
+                        assert!(cancel.load(Ordering::Acquire));
+                    }
+                    assert!(
+                        render
+                            .renderer
+                            .read()
+                            .callback_resources
+                            .get::<crate::depth_parallax_wgpu::DepthRenderResourcesRef>()
+                            .is_none()
+                    );
+                }
+                app.depth_setup
+                    .set_status_for_test(crate::addon::AddonStatus::Valid {
+                        model_id: "activation-model".into(),
+                        bytes: 1,
+                        model_path: "activation.onnx".into(),
+                        mmproj_path: None,
+                    });
+                app.with_viewer_context(child, |owner| {
+                    assert_eq!(
+                        owner.depth_entry_allowed(0),
+                        if embedded {
+                            Err(DepthEntryBlock::OtherWindow)
+                        } else {
+                            Ok(())
+                        }
+                    );
+                    owner.toggle_depth_parallax(&ctx, 0);
+                    assert_eq!(owner.fs_exclusive_view.is_depth(), !embedded);
+                })
+                .unwrap();
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn depth_main_live_pass_handoff_new_loading_owner_commits_but_aborted_build_keeps_depth() {
+    for abort in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = setup_app_for_test();
+        install_pages(&mut app, &ctx);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        app.native_video_in_window_active = false;
+        let render = isolate_depth_renderer(&mut app);
+        let evidence = tracked_depth(&mut app, false);
+        let started = app.start_active_detached_loading_context(
+            &ctx,
+            None,
+            DetachedSource::Book,
+            "loading-book".into(),
+            |_, _| {
+                if abort {
+                    DetachedLoadingContextInit::Abort("test_abort")
+                } else {
+                    DetachedLoadingContextInit::Continue
+                }
+            },
+        );
+        assert_eq!(started.is_none(), abort);
+        assert_eq!(app.fs_exclusive_view.is_depth(), abort);
+        assert_eq!(evidence.cancel.unwrap().load(Ordering::Acquire), !abort);
+        assert!(
+            render
+                .renderer
+                .read()
+                .callback_resources
+                .get::<crate::depth_parallax_wgpu::DepthRenderResourcesRef>()
+                .is_none()
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn detached_snapshot_activation_handoff_switches_a_b_and_keeps_rejected_destination() {
+    let ctx = egui::Context::default();
+    let mut app = setup_app_for_test();
+    install_pages(&mut app, &ctx);
+    app.fullscreen_idx = None;
+    let configure = |owner: &mut App| {
+        install_pages(owner, &ctx);
+        owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+        owner.detached_viewer_independent_active = true;
+    };
+    let a = app.build_active_context_for_test(Some(70_360), DetachedSource::Image, configure);
+    app.last_active_detached_window_id = Some(70_360);
+    let b = app.push_window_context_for_test(&ctx, 70_361, configure);
+    assert!(app.activate_detached_image_window_snapshot(&ctx, 70_361));
+    assert_eq!(app.active_viewer_context_id(), Some(b));
+    assert_eq!(
+        app.detached_image_windows
+            .iter()
+            .map(|s| s.id)
+            .collect::<Vec<_>>(),
+        [70_360]
+    );
+    assert!(app.activate_detached_image_window_snapshot(&ctx, 70_360));
+    assert_eq!(app.active_viewer_context_id(), Some(a));
+    assert_eq!(
+        app.detached_image_windows
+            .iter()
+            .map(|s| s.id)
+            .collect::<Vec<_>>(),
+        [70_361]
+    );
+    assert_eq!(
+        app.detached_window_state(70_361),
+        Some(DetachedWindowState::Parked)
+    );
+    let rejected = app.push_window_context_for_test(&ctx, 70_362, configure);
+    app.retire_context(rejected, "test_snapshot_without_reopen_identity", |_| ())
+        .unwrap();
+    app.transition_detached_window_state(
+        70_362,
+        DetachedWindowState::Parked,
+        "test_rejected_snapshot",
+    );
+    assert!(!app.activate_detached_image_window_snapshot(&ctx, 70_362));
+    assert_eq!(app.active_viewer_context_id(), Some(a));
+    assert_eq!(
+        app.detached_image_windows
+            .iter()
+            .map(|s| s.id)
+            .collect::<Vec<_>>(),
+        [70_361, 70_362]
+    );
+    assert_eq!(
+        app.detached_window_state(70_362),
+        Some(DetachedWindowState::Parked)
+    );
+    assert_eq!(
+        app.locate_window_context(70_360),
+        Some((a, ContextResidence::AtRest))
+    );
+}

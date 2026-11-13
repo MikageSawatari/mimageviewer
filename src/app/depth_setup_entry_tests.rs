@@ -68,6 +68,79 @@ fn depth_setup_first_d_enters_after_installed_scan_without_completion_dialog() {
 }
 
 #[test]
+fn depth_main_live_pass_handoff_invalidates_checking_and_confirm_entry_but_keeps_preferences() {
+    let _input = crate::key_input::lock_test_input();
+    for embedded in [false, true] {
+        for origin in ["checking", "confirm", "preferences"] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app_for_test();
+            install_pages(&mut app, &ctx);
+            app.viewer_presentation = if embedded {
+                ViewerPresentation::MainWindow
+            } else {
+                ViewerPresentation::Fullscreen
+            };
+            app.native_video_in_window_active = embedded;
+            let model = installed_pack(&mut app);
+            let child = app.push_window_context_for_test(&ctx, 80_480, |owner| {
+                install_pages(owner, &ctx);
+                owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+                owner.detached_viewer_independent_active = true;
+                owner.native_video_in_window_active = false;
+            });
+            if origin == "preferences" {
+                app.request_depth_addon_setup(&ctx);
+            } else if origin == "confirm" {
+                app.depth_setup.set_status_for_test(AddonStatus::Missing);
+                app.toggle_depth_parallax(&ctx, 0);
+                assert!(app.depth_setup.confirming_for_test());
+            } else {
+                press_d(&mut app, &ctx);
+            }
+            let keep = embedded || origin == "preferences";
+            // Merely mounting a sibling must not consume main's entry intent.
+            app.with_viewer_context(child, |_| {}).unwrap();
+            assert!(app.depth_setup.modal_open());
+            assert!(app.activate_detached_image_window_snapshot(&ctx, 80_480));
+            assert_eq!(
+                app.depth_setup.modal_open(),
+                keep,
+                "{origin} embedded={embedded}"
+            );
+            if origin != "confirm" {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                // Observe the real scan completion even when the entry dialog
+                // has expired. This proves the addon scan itself was retained.
+                while app.depth_setup.installed_model_path().is_none() {
+                    app.poll_depth_setup(&ctx);
+                    assert!(Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                app.poll_depth_setup(&ctx);
+                assert_eq!(
+                    app.depth_setup.installed_model_path(),
+                    Some(model.as_path())
+                );
+                assert_eq!(
+                    app.fs_exclusive_view.is_depth(),
+                    embedded && origin == "checking"
+                );
+                assert_eq!(
+                    app.depth_setup.dialog_open_for_test(),
+                    origin == "preferences"
+                );
+            } else {
+                assert_eq!(app.depth_setup.confirming_for_test(), embedded);
+                assert!(!app.fs_exclusive_view.is_depth());
+            }
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert_eq!(app.active_viewer_context_id(), Some(child));
+            crate::key_input::clear_test_frame();
+        }
+    }
+}
+
+#[test]
 fn depth_setup_first_d_missing_or_corrupt_scan_keeps_download_confirmation() {
     let _input_guard = crate::key_input::lock_test_input();
     for corrupt in [false, true] {

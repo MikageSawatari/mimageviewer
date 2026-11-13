@@ -41,6 +41,10 @@ map する。`map_async` の完了 channel と `PollType::Poll` を使い、UI �
 
 要求は context / request ID / TextureId / cancel に相関し、結果も同じ所有者で照合する。
 source 切替・OFF・presentation変更・Dropは receiver/cancel と自分の GPU slot を退役する。
+独立 context への表示所有の移動が成功して main の全画面が live pass を失うときも、main を mount して
+同じ終了経路を通す。main 由来の Checking / Confirm の ModeEntry はその境界で失効させるが、
+モデル確認 worker 自体と Preferences 由来の案内は維持する。埋め込み main と通常更新・scoped mount は終了しない
+([3D 設計 §6.4.4](depth-parallax-plan.md))。
 兄弟 context の状態・cache・要求を変更しない。現在色と4件の深度 LRU を所有し、
 色・深度・readback buffer は既存 VRAM 会計へ渡す。推論は共有 AI runtime の直列契約を維持する。
 状態・入口・実装レビューと検証結果の正本は [3D 設計 §10](depth-parallax-plan.md#10-実装の段階-codex-への委任単位)。

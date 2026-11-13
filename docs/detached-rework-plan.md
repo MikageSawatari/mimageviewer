@@ -7480,3 +7480,31 @@ mount・swap・兄弟 context の表示状態の変更はしない。作り直�
 別窓を実際にmountするheadlessテストで拒否を確認し、mainへ戻ると同じ本を再び受け付けることも検査する。
 独立追レビューはこの受付を対象ownerの構造的一致としてACCEPT。
 焦点検証・確認用buildの結果は `cover-crop-plan.md` §15.4に記録した。
+
+### 2026-11-13: 3D 写真第 2 段の実機課題の修正 (再開の所有の移動、メインが表示を失う確定点での 3D 終了)
+
+対象は [depth-parallax-plan §6.4.4](depth-parallax-plan.md) の課題 2・3（P2-2 を含む）・4。
+設計レビュー r1 の構造合意を前提に、実装担当が主要な前提をコードで確認して実装した。
+BA 分類は **BA-7 主、BA-5 関連**。実装後の独立レビューの合意は設計担当が後で追記する。
+
+変える範囲:
+
+- passive / ParkedLive の再開を、取り出す前に確定した移動元と移動先 id を渡す共通 helper にそろえる。
+  移動元を park してから移動先を id で取り直して消費する。park の pause / live-media / close は明示された context を使い、
+  移動先の remove を根拠に移動元を推定し直さない。ParkedLive の linked still 保持と方式固有の再開処理は維持する。
+- 独立 context の activation / 新規 build 成功 / materialized fork 後の open 成功の確定点から、
+  共通 helper で main の全画面の Depth と Checking / Confirm の ModeEntry を終える。
+  main を mount して既存の Depth 終了（要求取消・slot 除去）を使い、モデル確認の処理と Preferences の案内は残す。
+- マニュアルに表示切替での 3D 終了と、外部 open の最後の 1 件を画面を閉じた後に開く既存動作を書く。
+
+変えない範囲:
+
+- 課題 1 の行き先・独立性の規則、360°、メインの閲覧位置・全画面の保持、埋め込み main の Depth / ModeEntry。
+- viewport の生成・id・builder、HWND、placement、focus、z-order、bundle swap、backstop、通常更新・scoped mount。
+- App の detached 用状態、D の入場判定（兄弟は読むだけ）、毎フレームの描画振り分け。
+  guard / delay / retry / 追加 repaint / 一括 reset / silent fallback は加えない。
+
+判断理由: remove で移動元の見え方が変わる前に所有者を固定し、live pass を失う確定でその表示に属する 3D の寿命を閉じる。
+描画側の孤児除外や兄弟の 3D を無視する条件を加える症状パッチではない。
+全画面の閲覧そのものを閉じる案は既存の閲覧保持を変えるので採らず、Depth と未完了入場の寿命だけを終端する。
+検証結果と未確認は [depth-parallax-plan §17.17](depth-parallax-plan.md) に集約する。

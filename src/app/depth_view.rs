@@ -74,6 +74,31 @@ pub(crate) fn depth_wait_status(
 }
 
 impl App {
+    /// A successful independent activation takes the live pass away from main's
+    /// fullscreen viewport. Ordinary mounts/updates and embedded main do not.
+    #[cfg(windows)]
+    pub(super) fn retire_main_depth_for_independent_activation(
+        &mut self,
+        destination: ViewerContextId,
+    ) {
+        let main = self.viewer_context_main();
+        if destination == main {
+            return;
+        }
+        self.with_viewer_context(main, |app| {
+            if app.fullscreen_idx.is_some()
+                && app.viewer_presentation == ViewerPresentation::Fullscreen
+                && !app.fullscreen_embedded_still_active()
+            {
+                app.depth_setup.invalidate_mode_entry(main);
+                if app.fs_exclusive_view.is_depth() {
+                    app.set_fs_exclusive_view(FsExclusiveView::None, "main_live_pass_handoff");
+                }
+            }
+        })
+        .expect("independent activation keeps the main context available");
+    }
+
     pub(crate) fn panorama_state(&self) -> Option<&crate::panorama::PanoramaState> {
         self.fs_exclusive_view.panorama_state()
     }

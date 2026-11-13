@@ -3356,3 +3356,109 @@ ROOT からの再開配送の照合、context 付き一時 id、テストの強�
 backstop / interlude の数 frame の見え方。headless の成功とは区別する。
 製品起動・`build-dev.ps1`・`test-lib-full.ps1`・`test-full.ps1`・コミット・push は依頼どおり実施しない。
 確認用 build・全件 gate・実機確認は設計担当へ引き継ぐ。vendor は変更していない。
+
+### 17.17 実装記録 (§6.4.4 実機課題 2・3・4)
+
+2026-11-14、`G:\home\mimageviewer-767s2` / `feat-767-stage2`、基点 `bbad4507d`。
+§6.4.4 の設計レビュー r1 後の範囲に従い、課題 2・3（P2-2 を含む）・4 を実装した。
+課題 1 は利用者判断待ちのままとし、行き先・独立性の解決規則は変更しない。
+
+着手前の主要前提の確認:
+
+- `active_viewer_context_id` は active session が無いとき、window binding と
+  `detached_viewer_window_id().or(last_active_detached_window_id)` を使い、同 id の passive snapshot があれば active としない。
+  旧 passive activation は先に snapshot を remove してから park を呼ぶため、実際に pause した直前の A が自分自身の移動元になり、
+  pause が同 id の snapshot を再度 push する。active close はその孤児を消さず、後の passive renderer が同 id を再登録する。
+  ParkedLive は既に park → id で取り直し → remove の順であり、linked still 保持を true で呼ぶことを確認した。
+- `should_render_main_fullscreen_viewport_after_detached_context` は独立 context の更新中、main の embedded active / pending だけを描く。
+  main の通常 Fullscreen の閲覧状態は残る。Depth の Drop は要求取消と自分の GPU slot 除去を持ち、
+  `set_fs_exclusive_view(None)` が既存の終了経路であることを確認した。
+- `DepthSetup::OwnedDialog` は Checking / Confirm の間も `ModeEntry(DepthEntryRequest)` を保持し、ROOT の poll で確認後に入場を再開する。
+  main は `viewer_context_live` が常に true のため、表示所有の移動時にその入場要求も失効させる必要がある。
+  ModeEntry の dialog だけを閉じれば確認処理は継続し、Preferences と Running 以降には影響しない。
+- 以上は設計の主要前提と一致した。毎フレームの描画検査、D からの兄弟の変更、孤児描画 guard は追加していない。
+
+変更ファイル:
+
+| ファイル | 変更 |
+| --- | --- |
+| `src/app.rs` | 明示した移動元を使う park / pause / live-media / close の共用、passive / ParkedLive の共通 snapshot 消費、成功した独立 activation / build / fork-open の確定点への接続 |
+| `src/app/depth_view.rs` | main context 内で、表示を失う Fullscreen の Depth と未完了の入場だけを終える helper |
+| `src/ui_dialogs/depth_addon.rs` | 指定 context の Checking / Confirm の ModeEntry 失効。確認処理と管理由来の案内を維持 |
+| `src/app/depth_view_tests.rs`、`src/app/depth_setup_entry_tests.rs`、`src/app/multiwindow_scenario_tests.rs` | 実 activation、要求取消・GPU slot、Checking / Confirm / Preferences、pause→再開→実 close→ROOT の回帰 |
+| `htdocs/mimageviewer/manual/fullscreen.html` | 切替時の 3D 終了と、外から開く要求の最後の 1 件を画面を閉じた後に開く説明 |
+| 本書、`docs/detached-rework-plan.md` §11、`docs/async-architecture.md` | 変更境界、BA 分類、入場の寿命、検証記録 |
+
+課題 3 の入口監査:
+
+| 入口 | 表示所有の移動の確定点 |
+| --- | --- |
+| `activate_detached_image_window_snapshot` の既存 context 再開 | mount で独立化が成功し、active session を設定した後 |
+| `activate_parked_live_media_window_snapshot` | 固有の pending owner 引継ぎ・runtime / session の再開を確定した後 |
+| `start_active_detached_loading_context` | Building を Commit し binding と active session を公開した後。Abort では終了しない |
+| `start_active_detached_collection_root_image` | anchor を解決して build を Commit し session を公開した後、画像を open する前 |
+| `start_active_detached_book_context_with_start` | descriptor / scanned-folder の受理で build を Commit し session を公開した後 |
+| materialized fork 後の open | fork context の open と binding が成功した後。この入口は main の fullscreen_idx が無い場合に限り、通常は終了対象を持たない |
+| stamp による旧 still snapshot の再開 | 既存の main / linked の open。別 context を有効にしないので新しい終了境界を足さない |
+| descriptor の継続、通常の更新・scoped mount | 既存 owner の処理。helper を呼ばない |
+
+全画面の閲覧自体を閉じる簡素化は既存の閲覧保持を変えるため採用しない（§6.4.4）。
+既存の owner と成功確定点だけを共用し、新しい App 状態、待ち、回復の仕組みは追加しない。
+
+検証環境: Windows、通常 feature、test / dev profile。Cargo のビルド・テストはすべて
+`powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local\miv-locks\run-heavy.ps1 -Owner "codex/767-p2b" -WorkDir G:\home\mimageviewer-767s2 -Command "<下記コマンド>"`
+を使った。ロック領域へ書けない警告が出たため、そのまま BelowNormal で継続した。
+Command 内で `CARGO_BUILD_JOBS=1`、`CARGO_INCREMENTAL=0`、`MSBUILDDISABLENODEREUSE=1` を設定した
+（この worktree の第 2 段の既存メモリ不足時と同じ条件）。重いコマンドは同時に 1 本だけ実行した。
+
+| コマンド / 対象 | 件数・exit code・証拠 |
+| --- | --- |
+| 旧製品コード `bbad4507d` + 新テスト: `cargo nextest run -p mimageviewer --lib -E 'test(/paused_last_active_resume\|main_live_pass_handoff/)' --no-fail-fast` | **4 実行 / 0 成功 / 4 失敗、exit 100**。`target/767-p2b-red.log`。A の passive が 1 件残る、main の Depth が残る（通常再開と loading build）、Checking が残る、の各不変条件で失敗。コンパイル成功、製品の不変条件違反を検出した |
+| 修正後の焦点: `cargo nextest run -p mimageviewer --lib -E 'test(/paused_last_active_resume\|main_live_pass_handoff\|snapshot_activation_handoff/)' --no-fail-fast` | **5 実行 / 4 成功 / 1 失敗、exit 100**。`target/767-p2b-focused-r1.log`。失敗と補修の理由は下記 |
+| 最終回帰: `cargo nextest run -p mimageviewer --lib -E 'test(/depth\|export\|presentation\|window_mode\|panorama\|detached\|multiwindow_scenario\|slideshow\|admission/)' --no-fail-fast` | **1,537 成功 / 0 失敗、exit 0**（16,161 skipped、117.004 秒）。`target/767-p2b-regression.log`。新規 5 件と既存の第 1 段・第 2 段・detached・multiwindow の指定回帰を含む |
+| `python scripts/check_ui_glyphs.py` | 危険グリフ **0 件、exit 0**。`target/767-p2b-glyphs.log` |
+| `python scripts/check_site_cards.py` | **53 カード、超過 0 件、exit 0**。`target/767-p2b-site.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **exit 0**（テスト実行なし、4 分 22 秒）。`target/767-p2b-check.log` |
+| `cargo fmt`（最後に引数なし、同じ run-heavy 経由） | **exit 0**。`target/767-p2b-fmt.log`。最終回帰・core check 後の Rust 変更は整形だけ |
+| `git diff --check` | **exit 0**。`target/767-p2b-diff-check.log`。変更は上記 10 ファイル、vendor 差分なし |
+
+旧コード比較の間だけ製品 3 ファイルを HEAD と同一にし、終了時に実装を戻した。
+旧コード比較後には、資源検査の renderer を main / child で同じ専用 renderer に固定し、
+A→B→A と再開拒否時の保持の対照 1 件も加えた。旧コードの 4 件の失敗点と根拠は変わらない。
+
+焦点検証の multiwindow 1 件は、修正で再開直後の snapshot 0 件の assertion を通過し、その先の ROOT pass で
+`fullscreen navigator input tracking must run at begin-pass` により停止した。
+新しい fixture で `install_fs_navigator_input_tracking` の登録を省いていたため、既存 scenario と同じ登録を追加した。
+assertion の削除・緩和や製品コードの変更はせず、上記の最終回帰で新規 5 件を含めてすべて成功した。
+最終回帰の製品コードは焦点検証と同じで、追加変更は fixture 初期化 1 行だけである。
+
+新規回帰と根拠:
+
+- `multiwindow_depth_paused_last_active_resume_close_does_not_register_passive_again`:
+  実際の pause と `last_active_detached_window_id=A` を使い、再開直後は A の passive が 0 件。
+  実 close handler を 1 回通し、context の Retired、binding / runtime / passive 要求の消滅、
+  後続 3 回の実 ROOT pass で callback / viewport / deferred view の再登録が無いことを検査した。
+  main 一覧 / 全画面 × Depth なし / ありの 4 条件を完走した。
+- `depth_main_live_pass_handoff_retires_only_fullscreen_on_actual_still_and_media_activation`:
+  passive / ParkedLive × 推論待ち / Ready × main 全画面 / 埋め込みの 8 条件で、main 全画面だけの終了、
+  cancel token / GPU slot の退役、子の実 D の成功を検査した。埋め込み main は保持し、子の D は OtherWindow。
+  事前の scoped mount は main の資源を維持する。
+- `depth_main_live_pass_handoff_invalidates_checking_and_confirm_entry_but_keeps_preferences`:
+  初回 D の実 Checking とローカル pack の実確認完了を使い、表示を失った main は後から入場しない。
+  main 由来の Confirm も失効する。確認処理は完了してモデルの状態を採用し、Preferences の案内は残る。
+  埋め込み main の Checking / Confirm は保持し、Checking の完了で main だけに入場する。
+- `depth_main_live_pass_handoff_new_loading_owner_commits_but_aborted_build_keeps_depth`:
+  build Commit で終了し、Abort では main の Depth と要求を保持する。
+- `detached_snapshot_activation_handoff_switches_a_b_and_keeps_rejected_destination`:
+  A→B→A で active と passive の二重所有を作らず、再開を断った対象と現在の active owner を保持する。
+
+見た目・レイアウト・アプリ内 UI 文字列は変更していないため、`cargo test --test ui_snapshot` は実施していない。
+unit 側の既存 depth snapshot は上記の指定回帰に含まれる。
+
+未確認 / 引継ぎ:
+
+- 実 OS 窓の activation / close / HWND / focus / z-order、backstop の見え方、実モデルでの推論、実モニタ間 DPI は未確認。
+  headless の実 handler / ROOT pass と、利用者の実機結果は区別する。課題 5 の一覧へのマウス入力は原因不明のまま。
+- `test-lib-full.ps1`・`test-full.ps1`・`build-dev.ps1`、製品起動、コミット・push は依頼どおり実施しない。
+  全件 gate・確認用 build・実機確認と独立実装レビューは設計担当へ引き継ぐ。
+  vendor は変更していない。独立レビュー後の構造合意は detached-rework-plan §11 に設計担当が追記する。
