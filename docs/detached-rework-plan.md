@@ -7421,6 +7421,19 @@ canonical origin として捕捉済みで、fork する `ViewerContextBundle` �
 viewport・detached 述語・新しい状態は加えていない。症状を消す guard ではなく、終了境界を 1 つの所有者に揃える構造修正である
 (設計担当 ClaudeCode と独立 Sol/xhigh 再レビューの双方が、症状パッチでなく構造的修正であることに同意)。記録は [search-from-item-plan.md](search-from-item-plan.md) M9。
 
+#### §1.718: 表紙の回転に合わせて退避中の一覧の古い本のタイルを読み直す (2026-11-13、viewer_context_audit A4)
+
+`evict_legacy_cover_thumbnails` (`app/viewer_context_registry.rs`、§1.718 のマージ cc85e8d3b) が `viewer_context_audit` の
+A4 (公開 API の fingerprint) に未登録で、CI の監査が落ちた。関数は回転ページ owner の値が実際に変わったとき
+(`rotation_page_owner_changed`。回転操作・全回転のリセット・改名や移動・削除やメタデータ整理・取り込みや復元など、
+回転 owner の値に差分が出たときだけで、差分が無ければ何もしない。読み取り専用の開閉からは呼ばれない) だけ動く。
+live の一覧は `reconcile_restored_cover_thumbnails`、at-rest / retiring の各 context は自分の bundle の項目・要求・画素・
+読み込み待ちの列だけを、同じ述語 (`legacy_book_cover_needs_reload`: 旧形式の本の表紙で、範囲内に回転があるもの) で作り直しの対象にする。
+mount・swap・兄弟 context の表示状態の変更はしない。作り直した結果は新しい identity を持つので、2 回目の呼び出しは何もしない (既存テスト)。
+色フィルタの代表 revision は main の既存の権限のまま。detached の述語・viewport・timer は変更しない。
+許可一覧への fingerprint の追加だけで、症状を消す guard ではなく、§1.718 の設計どおりの owner ごとの作り直しを監査に登録する変更である。
+設計担当 (ClaudeCode) と独立レビュー (Sol/xhigh、2026-11-13) の双方が、症状パッチではなく構造的な変更であることに同意した。
+
 ### 代表サムネイルの手動範囲指定の受付（2026-11-11、§1.764）
 
 設計担当が確認済みの再レビュー指摘に従い、`ui_dialogs/cover_crop.rs` の共有受付で既存の
