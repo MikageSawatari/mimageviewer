@@ -61572,6 +61572,90 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn independent_media_exchange_first_builder_inherits_placement_and_f11_intent() {
+        use crate::app::detached_media_exchange_tests as fixture;
+        for maximized in [false, true] {
+            // 0 normal, 1 settled borderless, 2 entering, 3 leaving, 4 return Settle.
+            for phase in 0..5 {
+                let mut app = crate::app::setup_app_for_test();
+                let ctx = egui::Context::default();
+                let root = app.tmp.path().to_path_buf();
+                fixture::install_items(&mut app, &ctx, &root, false);
+                let (a, _) = fixture::activate_independent_media(&mut app, &ctx);
+                app.with_active_viewer_context(|owner| {
+                    let p = fixture::placement(maximized);
+                    fixture::prepare_f11_exchange(owner, &ctx, a, p, phase);
+                    owner.open_fullscreen_from_fs_navigation(
+                        &ctx,
+                        2,
+                        crate::app::HistoryTrigger::UserChosen,
+                    );
+                    let b = owner.detached_viewer_window_id().unwrap();
+                    assert_ne!(a, b);
+                    assert_eq!(owner.detached_window_runtime_placement(b), Some(p));
+                    let borderless = phase == 1 || phase == 2;
+                    assert_eq!(owner.detached_viewer_borderless_fullscreen, borderless);
+                    assert!(owner.detached_viewer_borderless_transition.is_none());
+                    assert_eq!(
+                        owner.detached_viewer_restore_placement,
+                        borderless.then_some(p)
+                    );
+                    let builder = owner.build_detached_viewer_viewport_builder(
+                        2,
+                        Some(true),
+                        DetachedViewportBuilderVisibility::Preserve,
+                        true,
+                        None,
+                        "exchange_first_builder",
+                    );
+                    assert_eq!(builder.decorations, Some(!borderless));
+                    let target = if borderless {
+                        crate::detached_window_geometry::PhysicalWindowPlacement {
+                            outer: owner.detached_viewer_borderless_target_rect(),
+                            maximized: false,
+                        }
+                    } else {
+                        p
+                    };
+                    let (position, size) =
+                        crate::detached_window_geometry::provisional_builder_geometry(
+                            target,
+                            !borderless,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        builder.position,
+                        Some(window_geometry_pos_to_viewport(
+                            position,
+                            owner.settings.ui_scale_factor
+                        ))
+                    );
+                    assert_eq!(
+                        builder.inner_size,
+                        Some(window_geometry_size_to_viewport(
+                            size,
+                            owner.settings.ui_scale_factor
+                        ))
+                    );
+                    assert_eq!(
+                        owner.active_detached_viewport_maximized_on_visible_commit(),
+                        !borderless && maximized
+                    );
+                    if borderless {
+                        owner.toggle_detached_viewer_borderless_fullscreen(&ctx);
+                        let leaving = owner.detached_viewer_borderless_transition.unwrap();
+                        assert!(!leaving.target_borderless);
+                        assert_eq!(leaving.target_outer, p.outer);
+                        assert_eq!(owner.detached_viewer_restore_placement, Some(p));
+                    }
+                })
+                .unwrap();
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn active_and_inactive_viewer_builders_follow_saved_window_level() {
         let mut app = crate::app::setup_app_for_test();
         for enabled in [false, true] {

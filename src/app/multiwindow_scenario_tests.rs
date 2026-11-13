@@ -633,6 +633,90 @@ struct ScenarioDriver {
     number: usize,
 }
 
+#[test]
+fn multiwindow_independent_media_exchange_does_not_register_a_and_closes_b_once() {
+    std::thread::spawn(|| {
+        use super::detached_media_exchange_tests as fixture;
+        let mut app = setup_app_for_test();
+        app.initialized = true;
+        app.indexer_init.mark_unavailable_if_not_ready();
+        let mut driver = ScenarioDriver::new();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
+        let root = app.tmp.path().to_path_buf();
+        fixture::install_items(&mut app, &driver.ctx, &root, false);
+        let (a, c) = fixture::activate_independent_media(&mut app, &driver.ctx);
+        let main = (
+            app.items.clone(),
+            app.selected,
+            app.fullscreen_idx,
+            app.items_generation,
+        );
+        let va = App::detached_image_window_viewport_id(a);
+        driver.focus(va);
+        driver.root(&mut app);
+        assert!(
+            driver.known.borrow().contains(&va),
+            "A registered its real child output before replacement"
+        );
+        app.with_active_viewer_context(|owner| {
+            fixture::resolve_navigation(owner, &driver.ctx, Some(2), true);
+        })
+        .unwrap();
+        let b = app.active_detached_window_id().unwrap();
+        assert_ne!(a, b);
+        let vb = App::detached_image_window_viewport_id(b);
+        driver.focus(vb);
+        for _ in 0..3 {
+            driver.root(&mut app);
+        }
+        assert!(!driver.known.borrow().contains(&va));
+        assert!(!driver.callbacks.contains_key(&va));
+        assert!(driver.known.borrow().contains(&vb));
+        assert_eq!(app.viewer_context_window(c), Some(b));
+        assert_eq!(
+            (
+                app.items.clone(),
+                app.selected,
+                app.fullscreen_idx,
+                app.items_generation
+            ),
+            main
+        );
+        app.with_active_viewer_context(|owner| {
+            assert!(owner.detached_viewer_independent_active);
+            owner.open_fullscreen_from_fs_navigation(&driver.ctx, 3, HistoryTrigger::UserChosen);
+        })
+        .unwrap();
+        assert_eq!(app.active_detached_window_id(), Some(b));
+        fixture::install_media(&mut app, 1);
+        fixture::open_grid(&mut app, &driver.ctx, 1);
+        assert!(
+            app.locate_window_context(b).is_some(),
+            "new list media preserves the independent still B"
+        );
+        assert!(app.detached_window_state(b).is_some());
+        assert!(app.activate_detached_image_window_snapshot(&driver.ctx, b));
+        assert_eq!(
+            app.accept_active_detached_window_close(&driver.ctx, b, "exchange_close"),
+            Some(true)
+        );
+        assert_eq!(app.viewer_context_residence(c), ContextResidence::Retired);
+        driver.focus(egui::ViewportId::ROOT);
+        for _ in 0..3 {
+            driver.root(&mut app);
+        }
+        for (id, viewport) in [(a, va), (b, vb)] {
+            assert!(app.locate_window_context(id).is_none());
+            assert!(app.detached_window_state(id).is_none());
+            assert!(!driver.known.borrow().contains(&viewport));
+            assert!(!driver.callbacks.contains_key(&viewport));
+            assert!(!app.deferred_detached_image_window_views.contains_key(&id));
+        }
+    })
+    .join()
+    .unwrap();
+}
+
 impl ScenarioDriver {
     fn new() -> Self {
         Self::with_ctx(egui::Context::default())

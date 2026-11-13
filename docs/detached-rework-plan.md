@@ -1477,6 +1477,16 @@ App に detached 用の bool / Option / pending を足さない。guard / delay 
 設計担当 ClaudeCode Opus と独立 GPT-6.1 Sol / xhigh の設計レビュー r1 (指摘修正後に実装開始可、P1 1・P2 2・P3 1 を設計に反映) で、
 「症状パッチではなく構造的な変更」であることに合意した。
 
+実装追補: `src/app/depth_view.rs` の session commit を同時書込みにし、native の遅延確定は既存
+`PresentationRequest.target_independent` へ解決済みの値を保持する。F12 の同表示先への反転要求は
+採用後に独立性を確定する。旧 media output の drop とともにその transition request/effects を終端し、
+request id の単調増加は維持する。新しい App の状態・待ち・viewport の救済処理は追加しない。
+F11 の戻り Settle は restore を既に消費しているので runtime の通常 placement を引き継ぐ。
+遅延した DetachedImage scan は初期 session を上書きしない。実装・検証記録は正本 §17.18。
+
+設計担当の追加決定 (2026-11-14): 交換を要する Manual の遅着結果は owner が inactive なら採用前にログ付きで捨て、同種メディアの背景採用は維持する。
+通常 resolver と Collection の採用境界から共通判定を呼び、背景media採用は旧EOF部品と共有、same-host native確定は所有contextに閉じる。新pending・背景B・描画guardは追加しない。決定と検証は正本 §6.4.5 / §17.18。
+
 ### 2026-11-13: 3D 写真第 2 段の実機課題の修正 (再開の所有の移動、メインが表示を失う確定点での 3D 終了)
 
 対象は [depth-parallax-plan §6.4.4](depth-parallax-plan.md) の課題 2・3（P2-2 を含む）・4。

@@ -768,6 +768,8 @@ pub(crate) mod depth_main_window_tests;
 mod depth_setup_entry_tests;
 #[cfg(all(test, windows))]
 mod depth_view_tests;
+#[cfg(all(test, windows))]
+pub(crate) mod detached_media_exchange_tests;
 #[cfg(test)]
 pub(crate) mod final_prepare_tests;
 #[cfg(windows)]
@@ -33435,7 +33437,14 @@ impl App {
             crate::logger::log(format!(
                 "[VST3 startup] deferred media open resumes idx={idx}"
             ));
-            app.start_fs_load(idx);
+            if app.native_video_parked_live_input_window_id.is_some() {
+                app.load_parked_live_media_target(
+                    idx,
+                    crate::video::PlaybackStartOrigin::NewSource,
+                );
+            } else {
+                app.start_fs_load(idx);
+            }
             ctx.request_repaint();
         });
     }
@@ -61955,13 +61964,8 @@ impl App {
 
                 // parked still の再開と同じく、既に割り当てた detached window_id を
                 // 保ったまま物理一覧上の対象 index を開く。
-                self.commit_viewer_session(
-                    self.viewer_presentation,
-                    true,
-                    "detached_physical_folder_open",
-                );
-                self.detached_viewer_independent_active = true;
-                self.detached_viewer_open_next_still_detached_once = true;
+                // Binding initialization (or a later explicit F12) already owns this
+                // session. The delayed scan must not decide its presentation again.
                 self.fs_open_intent_from_grid = true;
                 self.open_fullscreen(image_idx, crate::app::HistoryTrigger::UserChosen);
                 self.move_grid_cursor(Some(image_idx), crate::app::GridCursorIntent::Automatic);
@@ -68350,6 +68354,21 @@ impl App {
             return false;
         }
         let target = Self::detached_book_context_target(&descriptor);
+        // Descriptor activation rebuilds a fresh bundle. Capture the resumed session's
+        // independence before the build replaces the mounted projection with defaults.
+        let independent = resume_window_id.map_or_else(
+            || {
+                self.settings.detached_viewer_open_images_in_window
+                    || self.detached_viewer_open_next_still_detached_once
+            },
+            |id| {
+                !self
+                    .detached_window_manager
+                    .runtime(id)
+                    .expect("resumed descriptor must retain its window runtime")
+                    .linked
+            },
+        );
         let built =
             self.build_viewer_context("start_active_detached_book_context", |app, reserved| {
                 // From this point until the bundle is captured, all loads belong to the
@@ -68376,6 +68395,16 @@ impl App {
                     );
                 }
                 app.reserve_window_binding_for_build(window_id);
+                app.commit_viewer_session(
+                    ViewerPresentation::DetachedWindow,
+                    independent,
+                    "detached_book_binding",
+                );
+                app.update_detached_window_runtime_flags(
+                    window_id,
+                    !independent,
+                    "detached_book_binding",
+                );
                 app.log_detached_image_window_debug(format!(
                     "allocate_window_id reason=start_active_detached_book_context id={window_id} \
              resumed={} context_serial={context_serial} folder_nav_reuse_once={}",
@@ -69626,6 +69655,19 @@ impl App {
                 || self.detached_viewer_open_next_still_detached_once)
     }
 
+    /// Only a new binding uses the open preferences. A bound reader keeps its session.
+    #[cfg(windows)]
+    fn new_detached_open_is_independent(&self, idx: usize) -> bool {
+        self.settings.detached_viewer_open_images_in_window
+            || self.detached_still_open_is_independent(idx)
+    }
+
+    #[cfg(windows)]
+    fn explicit_presentation_is_independent(&self, target: ViewerPresentation) -> bool {
+        target == ViewerPresentation::DetachedWindow
+            && self.settings.detached_viewer_open_images_in_window
+    }
+
     #[cfg(windows)]
     fn detached_image_snapshot_title_for_idx(&self, idx: usize) -> String {
         let name = self
@@ -70771,6 +70813,11 @@ impl App {
                 .unwrap_or_else(|error| {
                     panic!("always-new detached still binding failed: {error:?}")
                 });
+            self.commit_viewer_session(
+                ViewerPresentation::DetachedWindow,
+                true,
+                "always_new_window_binding",
+            );
             self.log_detached_image_window_debug(format!(
                 "allocate_window_id reason=prepare_detached_image_windows_for_open id={window_id} \
                  idx={idx} current_idx={current_idx:?} always_new={always_new} \
@@ -70979,10 +71026,20 @@ impl App {
 
     #[cfg(windows)]
     fn requested_viewer_presentation_for_open(&self, idx: usize) -> ViewerPresentation {
-        if (self.viewer_session_is_detached()
+        if self.viewer_session_is_detached()
             && self.detached_viewer_independent_active
-            && self.viewer_item_supports_detached_still(idx))
-            || (self.settings.effective_media_in_media_window() && self.viewer_item_is_media(idx))
+            && self.viewer_item_supports_detached_still(idx)
+        {
+            ViewerPresentation::DetachedWindow
+        } else {
+            self.requested_viewer_presentation_from_preferences(idx)
+        }
+    }
+
+    /// Explicit F12 changes do not inherit the current independent presentation.
+    #[cfg(windows)]
+    fn requested_viewer_presentation_from_preferences(&self, idx: usize) -> ViewerPresentation {
+        if (self.settings.effective_media_in_media_window() && self.viewer_item_is_media(idx))
             || (self.settings.detached_viewer_enabled && self.viewer_item_supports_session(idx))
             || self.detached_viewer_open_still_requested(idx)
         {
@@ -72137,8 +72194,12 @@ impl App {
         let presentation = self.resolve_viewer_presentation_for_open(idx, entering_media);
         let detached_still = matches!(presentation, ViewerPresentation::DetachedWindow)
             && self.viewer_item_supports_detached_still(idx);
-        let independent_detached_still =
-            detached_still && self.detached_still_open_is_independent(idx);
+        let independent_detached_still = presentation == ViewerPresentation::DetachedWindow
+            && if self.detached_viewer_window_id().is_some() {
+                self.detached_viewer_independent_active
+            } else {
+                self.new_detached_open_is_independent(idx)
+            };
         let focus_detached_from_grid = matches!(presentation, ViewerPresentation::DetachedWindow)
             && self.fs_open_intent_from_grid;
         self.log_detached_image_window_debug(format!(
@@ -72213,7 +72274,6 @@ impl App {
                 self.finish_active_detached_session_close("open_non_detached");
             }
         }
-        self.detached_viewer_independent_active = independent_detached_still;
         if matches!(presentation, ViewerPresentation::DetachedWindow)
             && let Some(window_id) = self.detached_viewer_window_id()
         {
@@ -72232,8 +72292,6 @@ impl App {
         if !matches!(presentation, ViewerPresentation::DetachedWindow)
             || !self.viewer_item_supports_egui_detached_viewport(idx)
         {
-            // Non-detached/media opens committed independent_detached_still=false above.
-            self.detached_viewer_independent_active = false;
             self.detached_viewer_focus_requested = false;
         }
         self.last_viewer_sync_stamp = if matches!(presentation, ViewerPresentation::DetachedWindow)
@@ -72295,6 +72353,109 @@ impl App {
         // 経由しないので奪還候補がそのまま残る。継続ナビなら新しい fullscreen が
         // 引き続き表示されているため reclaim 不要 → ここでクリアする。
         self.clear_pending_main_foreground_reclaim();
+    }
+
+    /// Window-role changes are distinct from same-host media/still navigation.
+    #[cfg(windows)]
+    fn independent_media_window_requires_still_exchange(&self, target: &GridItem) -> bool {
+        !self.settings.detached_viewer_open_images_in_window
+            && self.settings.effective_media_in_media_window()
+            && self.detached_viewer_independent_session()
+            && matches!(
+                target,
+                GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. }
+            )
+            && self
+                .fullscreen_idx
+                .is_some_and(|old| self.viewer_item_is_media(old))
+    }
+
+    /// Both async Manual owners call this after currentness/target resolution and
+    /// before adoption. An inactive media reader cannot change window roles.
+    #[cfg(windows)]
+    fn admit_manual_media_navigation_target(
+        &self,
+        target: &GridItem,
+        source: &'static str,
+    ) -> bool {
+        let owner = self.detached_viewer_window_id();
+        let active = self.active_detached_window_id();
+        if self.independent_media_window_requires_still_exchange(target)
+            && !owner.is_some_and(|id| active == Some(id))
+        {
+            crate::logger::log(format!(
+                "[media-nav] discard Manual result reason=inactive_media_still_exchange \
+                 source={source} owner={owner:?} active={active:?} context={:?}",
+                self.projected_viewer_context_id(),
+            ));
+            return false;
+        }
+        true
+    }
+
+    /// An admitted item change replaces the media host, not the reader or its list.
+    /// Called before fullscreen_idx and the item-scoped audio state are overwritten.
+    #[cfg(windows)]
+    fn exchange_independent_media_window_for_still(&mut self, idx: usize) {
+        if !self
+            .items
+            .get(idx)
+            .is_some_and(|target| self.independent_media_window_requires_still_exchange(target))
+        {
+            return;
+        }
+        let reason = "independent_media_to_still";
+        let old = self
+            .active_detached_session
+            .expect("independent media session");
+        let previous_idx = self.fullscreen_idx.expect("admitted media item");
+        // The navigation resolver has already taken the accepted request into a local
+        // value before entering open_fullscreen. Runtime removal may cancel old inputs.
+        let _ = self.capture_detached_window_placement_at_decision(old.window_id, reason);
+        let placement = self.ensure_detached_window_runtime_placement(old.window_id, reason);
+        let borderless = self
+            .detached_viewer_borderless_transition
+            .map_or(self.detached_viewer_borderless_fullscreen, |transition| {
+                transition.target_borderless
+            });
+        let restore = self.detached_viewer_restore_placement;
+        // During return Settle, F11 has already restored runtime placement and
+        // consumed restore_placement. Before that point it still owns the normal P.
+        let placement = restore.unwrap_or(placement);
+        self.retire_media_item_for_detached_host_exchange(previous_idx);
+        assert!(self.close_active_detached_session_exact(
+            DetachedSessionLease {
+                window_id: old.window_id
+            },
+            reason,
+        ));
+        self.detached_image_windows
+            .retain(|window| window.id != old.window_id);
+        self.deferred_detached_image_window_views
+            .remove(&old.window_id);
+        self.native_video_parked_live_activation_requests
+            .retain(|id| *id != old.window_id);
+        if self.native_video_parked_live_left_down_window_id == Some(old.window_id) {
+            self.native_video_parked_live_left_down_window_id = None;
+        }
+        if self.native_video_parked_live_input_window_id == Some(old.window_id) {
+            self.native_video_parked_live_input_window_id = None;
+        }
+        let window_id = self.replace_mounted_detached_window_binding(old.window_id);
+        self.reset_active_detached_viewport_runtime_for_new_window(window_id, reason);
+        self.last_active_detached_window_id = Some(window_id);
+        self.commit_viewer_session(ViewerPresentation::DetachedWindow, true, reason);
+        self.transition_detached_window_state(window_id, DetachedWindowState::Opening, reason);
+        self.update_detached_window_runtime_flags(window_id, false, reason);
+        self.set_detached_window_runtime_placement(window_id, placement, reason);
+        self.write_detached_viewer_borderless_state(
+            borderless,
+            borderless.then_some(placement),
+            "App::exchange_independent_media_window_for_still",
+            reason,
+        );
+        self.detached_viewer_focus_requested = true;
+        self.begin_active_detached_session(window_id, self.detached_source_for_idx(idx));
     }
 
     #[cfg(windows)]
@@ -72531,6 +72692,9 @@ impl App {
                 return;
             }
         }
+
+        #[cfg(windows)]
+        self.exchange_independent_media_window_for_still(idx);
 
         // This is the first common boundary after any cross-viewer routing. Cancel an older
         // exact-folder request only when this context is about to open a different valid item;
@@ -93244,7 +93408,7 @@ impl App {
     #[cfg(windows)]
     fn apply_egui_viewer_presentation_for_current_item(
         &mut self,
-        idx: usize,
+        idx: Option<usize>,
         target_presentation: ViewerPresentation,
         reason: &'static str,
     ) -> Option<String> {
@@ -93259,8 +93423,9 @@ impl App {
         if self.viewer_presentation != target_presentation {
             self.fs_front_pointer = Default::default();
         }
-        let depth_feedback = self.commit_viewer_presentation_deferred_feedback(
+        let depth_feedback = self.commit_viewer_session_deferred_feedback(
             target_presentation,
+            self.explicit_presentation_is_independent(target_presentation),
             "presentation_commit",
         );
         #[cfg(windows)]
@@ -93269,7 +93434,7 @@ impl App {
             matches!(target_presentation, ViewerPresentation::MainWindow);
         self.last_viewer_sync_stamp =
             if matches!(target_presentation, ViewerPresentation::DetachedWindow) {
-                self.viewer_sync_stamp_for_idx(idx)
+                idx.and_then(|idx| self.viewer_sync_stamp_for_idx(idx))
             } else {
                 None
             };
@@ -93279,7 +93444,14 @@ impl App {
         if matches!(target_presentation, ViewerPresentation::DetachedWindow) {
             let id = self.ensure_detached_viewer_window_id();
             self.ensure_mounted_detached_session_binding(id);
-            self.begin_active_detached_session(id, self.detached_source_for_idx(idx));
+            let source = idx.map_or_else(
+                || {
+                    self.active_detached_session
+                        .map_or(DetachedSource::Book, |s| s.source)
+                },
+                |idx| self.detached_source_for_idx(idx),
+            );
+            self.begin_active_detached_session(id, source);
             self.update_detached_window_runtime_flags(
                 id,
                 !self.detached_viewer_independent_active,
@@ -93290,7 +93462,7 @@ impl App {
             self.finish_active_detached_session_close(reason);
         }
         self.log_detached_image_window_debug(format!(
-            "apply_egui_viewer_presentation idx={idx} target={target_presentation:?} \
+            "apply_egui_viewer_presentation idx={idx:?} target={target_presentation:?} \
              reason={reason} fs_idx={:?} presentation={:?} session={:?} \
              window_id={:?} independent={} passive_windows={}",
             self.fullscreen_idx,
@@ -93387,6 +93559,8 @@ impl App {
             }
             if let Some(target_presentation) = self.always_new_media_f12_target_presentation() {
                 if target_presentation != self.viewer_presentation
+                    || self.explicit_presentation_is_independent(target_presentation)
+                        != self.detached_viewer_independent_active
                     || self.video_presentation_transition.is_transitioning()
                 {
                     // メイン側へ切り替えた場合だけ案内を出す: 「この表示先はビューア内の
@@ -93408,7 +93582,7 @@ impl App {
                         // 出す — presenter 無応答で切り替わらなかったのに「切り替えました」を
                         // 表示しない (Sol P2)。pending にフラグを焼き、確定側が発火する。
                         if let Some(request_id) =
-                            self.request_native_video_viewer_presentation(target_presentation, true)
+                            self.request_native_video_f12_presentation(target_presentation)
                             && announce_main_hint
                         {
                             self.video_presentation_transition
@@ -93418,7 +93592,7 @@ impl App {
                         && self.viewer_item_supports_egui_detached_viewport(idx)
                     {
                         let depth_feedback = self.apply_egui_viewer_presentation_for_current_item(
-                            idx,
+                            Some(idx),
                             target_presentation,
                             "always_new_media_f12",
                         );
@@ -93455,15 +93629,17 @@ impl App {
                 self.detached_image_windows.len()
             ));
             if let Some(idx) = self.fullscreen_idx {
-                let target_presentation = self.effective_viewer_presentation_for_open(idx);
+                let target_presentation = self.requested_viewer_presentation_from_preferences(idx);
                 if target_presentation != self.viewer_presentation
+                    || self.explicit_presentation_is_independent(target_presentation)
+                        != self.detached_viewer_independent_active
                     || self.video_presentation_transition.is_transitioning()
                 {
                     if matches!(self.items.get(idx), Some(GridItem::Video(_))) {
-                        self.switch_native_video_viewer_presentation(target_presentation, true);
+                        self.request_native_video_f12_presentation(target_presentation);
                     } else if self.viewer_item_supports_egui_detached_viewport(idx) {
                         depth_feedback = self.apply_egui_viewer_presentation_for_current_item(
-                            idx,
+                            Some(idx),
                             target_presentation,
                             if matches!(target_presentation, ViewerPresentation::DetachedWindow) {
                                 "f12_on"
@@ -93473,6 +93649,19 @@ impl App {
                         );
                     }
                 }
+            } else if self.detached_viewer_window_id().is_some() {
+                // Internal folder/book reopen temporarily has no item, but retains
+                // its binding. F12 still changes that session before completion.
+                let target = if self.settings.detached_viewer_enabled {
+                    ViewerPresentation::DetachedWindow
+                } else {
+                    self.non_detached_viewer_presentation()
+                };
+                depth_feedback = self.apply_egui_viewer_presentation_for_current_item(
+                    None,
+                    target,
+                    "f12_during_reopen",
+                );
             }
         }
         let message = if self.settings.detached_viewer_enabled {
@@ -99503,6 +99692,17 @@ impl App {
                     path.display()
                 ));
             }
+            #[cfg(windows)]
+            if matches!(pending.action, MediaNavigationAction::Manual { .. })
+                && result
+                    .target_idx
+                    .and_then(|idx| self.items.get(idx))
+                    .is_some_and(|target| {
+                        !self.admit_manual_media_navigation_target(target, pending.source)
+                    })
+            {
+                return;
+            }
             if crate::perf::is_enabled() {
                 crate::perf::event(
                     "media_nav",
@@ -99591,19 +99791,12 @@ impl App {
                     return;
                 }
                 if let Some(new_idx) = target_idx {
-                    match landing {
-                        ManualMediaNavigationLanding::Fullscreen => {
-                            self.open_fullscreen_from_fs_navigation(ctx, new_idx, history_trigger);
-                        }
-                        #[cfg(windows)]
-                        ManualMediaNavigationLanding::NativeVideo => {
-                            self.open_native_video_fullscreen_from_navigation(
-                                ctx,
-                                new_idx,
-                                history_trigger,
-                            );
-                        }
-                    }
+                    self.open_manual_media_navigation_target(
+                        ctx,
+                        new_idx,
+                        landing,
+                        history_trigger,
+                    );
                 } else {
                     #[cfg(windows)]
                     if matches!(landing, ManualMediaNavigationLanding::NativeVideo) {
@@ -99616,6 +99809,37 @@ impl App {
                         at: std::time::Instant::now(),
                     });
                 }
+            }
+        }
+    }
+
+    fn open_manual_media_navigation_target(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        landing: ManualMediaNavigationLanding,
+        history_trigger: HistoryTrigger,
+    ) {
+        match landing {
+            ManualMediaNavigationLanding::Fullscreen => {
+                #[cfg(windows)]
+                if self.native_video_parked_live_input_window_id.is_some()
+                    && self.viewer_item_is_media(idx)
+                {
+                    self.open_parked_live_media_from_navigation(
+                        ctx,
+                        idx,
+                        history_trigger,
+                        None,
+                        false,
+                    );
+                    return;
+                }
+                self.open_fullscreen_from_fs_navigation(ctx, idx, history_trigger);
+            }
+            #[cfg(windows)]
+            ManualMediaNavigationLanding::NativeVideo => {
+                self.open_native_video_fullscreen_from_navigation(ctx, idx, history_trigger);
             }
         }
     }
@@ -100228,30 +100452,101 @@ impl App {
     /// presentation を解決してしまうため、bundle 内の idx/cache だけを進める。
     #[cfg(windows)]
     fn open_parked_live_audio_from_continuous_eof(&mut self, ctx: &egui::Context, next_idx: usize) {
-        if !self.prepare_parked_live_audio_continuous_target(next_idx) {
-            return;
-        }
-
-        if self.fs_cache.contains_key(&next_idx) {
-            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&next_idx) {
-                player.set_playing_with_origin(
-                    true,
-                    crate::video::PlaybackStartOrigin::ContinuousAdvance,
-                );
-            }
-            self.apply_music_loop_mode(next_idx);
-            self.init_normalize_state_for_opened_video(next_idx);
-            self.maybe_start_normalize_scan_for_play_intent(next_idx);
-        } else {
-            self.start_fs_load(next_idx);
-        }
-        self.register_media_playback_origin(
+        self.open_parked_live_media_target(
+            ctx,
             next_idx,
             crate::video::PlaybackStartOrigin::ContinuousAdvance,
+            None,
+            false,
         );
+    }
+
+    #[cfg(windows)]
+    fn open_parked_live_media_from_navigation(
+        &mut self,
+        ctx: &egui::Context,
+        next_idx: usize,
+        history_trigger: HistoryTrigger,
+        autoplay_override: Option<bool>,
+        ignore_resume: bool,
+    ) {
+        let origin = match history_trigger {
+            HistoryTrigger::UserChosen => crate::video::PlaybackStartOrigin::NewSource,
+            HistoryTrigger::AutoAdvance => crate::video::PlaybackStartOrigin::ContinuousAdvance,
+        };
+        self.record_reading_history(next_idx, history_trigger);
+        self.open_parked_live_media_target(ctx, next_idx, origin, autoplay_override, ignore_resume);
+    }
+
+    /// Background adoption changes only the mounted reader. Session/presentation and
+    /// foreground viewport state belong to the active sibling, not this parked reader.
+    #[cfg(windows)]
+    fn open_parked_live_media_target(
+        &mut self,
+        ctx: &egui::Context,
+        next_idx: usize,
+        origin: crate::video::PlaybackStartOrigin,
+        autoplay_override: Option<bool>,
+        ignore_resume: bool,
+    ) {
+        if !self.prepare_parked_live_media_target(next_idx) {
+            return;
+        }
+        let target_is_video = matches!(self.items.get(next_idx), Some(GridItem::Video(_)));
+        if target_is_video
+            && self
+                .music_analysis_source
+                .as_ref()
+                .is_some_and(|source| source.owner_context_id == self.projected_viewer_context_id())
+        {
+            self.clear_music_view_state();
+        }
+        let cached = self.fs_cache.contains_key(&next_idx);
+        if !cached && self.media_startup_load_pending() {
+            crate::logger::log(format!(
+                "[VST3 startup] defer parked media open idx={next_idx} until background load completes"
+            ));
+            self.vst3_deferred_media_open = Some(next_idx);
+            return;
+        }
+        self.vst3_deferred_media_open = None;
+        if target_is_video && !cached {
+            self.fs_video_open_autoplay_override = autoplay_override;
+            self.fs_video_open_ignore_resume_once = ignore_resume;
+        }
+        // This load boundary already retires other players in the mounted context,
+        // saves resume positions and carries the context owner through a deferred open.
+        self.load_parked_live_media_target(next_idx, origin);
+        self.fs_video_open_autoplay_override = None;
+        self.fs_video_open_ignore_resume_once = false;
+        if cached {
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&next_idx) {
+                if target_is_video && ignore_resume {
+                    player.seek(
+                        0.0,
+                        crate::video::SeekOrigin::Internal(
+                            crate::video::InternalContinuation::Transport,
+                        ),
+                    );
+                }
+                player.set_playing_with_origin(
+                    !target_is_video || autoplay_override.unwrap_or(true),
+                    origin,
+                );
+            }
+            if matches!(self.items.get(next_idx), Some(GridItem::Audio(_))) {
+                self.apply_music_loop_mode(next_idx);
+            } else {
+                self.apply_loop_mode_to_player(next_idx);
+            }
+            self.init_normalize_state_for_opened_video(next_idx);
+            self.maybe_start_normalize_scan_for_play_intent(next_idx);
+        }
+        self.register_media_playback_origin(next_idx, origin);
+        self.refresh_fullscreen_video_marker_cache(next_idx);
 
         crate::logger::log(format!(
-            "[native-video] parked audio EOF advanced without open_fullscreen: target_idx={next_idx} \
+            "[native-video] parked media advanced without open_fullscreen: target_idx={next_idx} origin={origin:?} \
              window_id={:?}",
             self.native_video_parked_live_input_window_id
         ));
@@ -100259,8 +100554,25 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn prepare_parked_live_audio_continuous_target(&mut self, next_idx: usize) -> bool {
-        if !matches!(self.items.get(next_idx), Some(GridItem::Audio(_))) {
+    fn load_parked_live_media_target(
+        &mut self,
+        next_idx: usize,
+        origin: crate::video::PlaybackStartOrigin,
+    ) {
+        let drops_output = self
+            .fs_cache
+            .iter()
+            .any(|(idx, entry)| *idx != next_idx && matches!(entry, FsCacheEntry::Video { .. }));
+        self.start_media_load_with_origin(next_idx, origin);
+        if drops_output {
+            self.video_presentation_transition
+                .retire_media_output(self.viewer_presentation);
+        }
+    }
+
+    #[cfg(windows)]
+    fn prepare_parked_live_media_target(&mut self, next_idx: usize) -> bool {
+        if !self.viewer_item_is_media(next_idx) {
             return false;
         }
         self.sync_main_selection_from_viewer_idx(next_idx);

@@ -235,7 +235,7 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn commit_viewer_session_deferred_feedback(
+    pub(crate) fn commit_viewer_session_deferred_feedback(
         &mut self,
         target: ViewerPresentation,
         target_independent: bool,
@@ -257,6 +257,7 @@ impl App {
             None
         };
         self.viewer_presentation = target;
+        self.detached_viewer_independent_active = target_independent;
         feedback
     }
 

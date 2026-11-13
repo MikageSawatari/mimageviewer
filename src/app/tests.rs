@@ -6544,6 +6544,7 @@ fn recreated_detached_host_preserves_maximized_placement_until_visible_commit() 
                 id: 41,
                 current: ViewerPresentation::Fullscreen,
                 target: ViewerPresentation::DetachedWindow,
+                target_independent: false,
                 activate: true,
                 announce_main_hint: false,
                 outgoing_presenter_hwnd: 0xA117,
@@ -83982,6 +83983,14 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.thumbnails = vec![ThumbnailState::Pending];
             app.image_metas = vec![None];
             app.visible_indices = vec![0];
+            // This raw build fixture bypasses descriptor admission. Initialize the
+            // reserved binding as a new book open does, before deferred page open.
+            let independent = app.new_detached_open_is_independent(0);
+            app.commit_viewer_session(
+                ViewerPresentation::DetachedWindow,
+                independent,
+                "test_new_book_binding",
+            );
             app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
                 history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
@@ -92080,7 +92089,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.begin_active_detached_session(5, DetachedSource::Book);
         app.transition_detached_window_state(82, DetachedWindowState::ParkedLive, "test_setup");
 
-        assert!(app.prepare_parked_live_audio_continuous_target(audio_b));
+        assert!(app.prepare_parked_live_media_target(audio_b));
 
         let session = app
             .active_detached_session

@@ -69,6 +69,7 @@ pub(crate) struct PresentationRequest {
     pub(crate) id: u64,
     pub(crate) current: ViewerPresentation,
     pub(crate) target: ViewerPresentation,
+    pub(crate) target_independent: bool,
     pub(crate) activate: bool,
     pub(crate) announce_main_hint: bool,
     pub(crate) outgoing_presenter_hwnd: u64,
@@ -367,10 +368,32 @@ impl PresentationTransitionOwner {
         }
     }
 
+    /// Resolve the whole viewer session on the existing asynchronous request owner.
+    pub(crate) fn set_target_independent(&mut self, request_id: u64, independent: bool) {
+        match &mut self.state {
+            PresentationTransitionState::Preparing { request, .. }
+            | PresentationTransitionState::Ready { request, .. }
+            | PresentationTransitionState::Committing { request, .. }
+                if request.id == request_id =>
+            {
+                request.target_independent = independent;
+            }
+            _ => {}
+        }
+    }
+
     pub(crate) fn sync_stable(&mut self, current: ViewerPresentation) {
         if matches!(self.state, PresentationTransitionState::Stable { .. }) {
             self.state = PresentationTransitionState::Stable { current };
         }
+    }
+
+    /// The media output (including any native candidate) has been dropped. Its
+    /// request/effects cannot outlive that owner or wait for its now-closed channel.
+    /// Keep the monotonic request counter so late events can never name a successor.
+    pub(crate) fn retire_media_output(&mut self, current: ViewerPresentation) {
+        self.state = PresentationTransitionState::Stable { current };
+        self.effects.clear();
     }
 
     #[cfg(test)]
@@ -413,6 +436,7 @@ impl PresentationTransitionOwner {
                 id,
                 current,
                 target,
+                target_independent: false,
                 activate,
                 announce_main_hint,
                 outgoing_presenter_hwnd,

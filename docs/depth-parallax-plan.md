@@ -1034,6 +1034,23 @@ BA-6 関連 (runtime の placement を次の窓の seed に渡す。新しい保
   窓の作り直しによる表示の間隔・フォーカスの変化は未測定。
 - 規模: 実装 2〜3 人日、レビューと修正 0.5〜1 人日 (全件テストと実機確認は別)。
 
+**実装中の追加決定 (2026-11-14、設計担当)**:
+種類の変更（独立メディア A → 静止画 B の窓交換）は、所有する閲覧が active のときだけ確定する。
+受理済み Manual の結果が A の ParkedLive 後に届き、送り先が交換を要する静止画なら、理由をログに残して
+結果を採用せず捨てる。A は現在の動画・音声を再生する ParkedLive のまま、active な別窓 D の session・binding・
+window は変更しない。同種メディアの結果は従来どおり背景で採用する。再 activation 待ちの pending と背景 B の生成は追加しない。
+
+判定は `admit_manual_media_navigation_target` の1か所へ集約する。通常の `MediaNavigationPending` と
+Collection 専用 Manual の各 request owner が currentness と対象を照合した後、一覧・表示・資源の採用前に呼ぶ。
+交換の要否は送り先の `GridItem` と現在の閲覧から、active かどうかは owner の window binding と
+`active_detached_session.window_id` の一致から決める。native の Manual landing / AwaitingNative 中の結果も
+同じ採用規則を通す。描画側の guard、新しい App の bool / Option、待機や再試行は加えない。
+
+理由: フル機能モードのメディアウィンドウが背景で静止画を表示する旧動作は、不変条件1に反する課題1の一部である。
+背景交換には B の準備・非同期採用・F11 / focus の追加設計が要り、再 activation までの保留は状態を増やすため採らない
+（CLAUDE.md「設計の簡素化」）。画像が出ないのは要求の受理から結果までの間に別窓へ切り替えた場合だけで、
+元の窓を選んで送り直せる。設計担当の決定として採用し、利用者への追加照会は行わない。
+
 ### 6.5 他の機能との関係 — 「表示を占有するモード」を 1 つの述語にする
 
 360° が他の機能を止めている箇所 (調査では 30 か所余り: キー・編集ツールの入口・補正パネル・
@@ -3585,3 +3602,187 @@ unit 側の既存 depth snapshot は上記の指定回帰に含まれる。
 - `test-lib-full.ps1`・`test-full.ps1`・`build-dev.ps1`、製品起動、コミット・push は依頼どおり実施しない。
   全件 gate・確認用 build・実機確認と独立実装レビューは設計担当へ引き継ぐ。
   vendor は変更していない。独立レビュー後の構造合意は detached-rework-plan §11 に設計担当が追記する。
+
+### 17.18 実装記録 (§6.4.5 課題 1)
+
+2026-11-14、`G:\home\mimageviewer-767s2` / `feat-767-stage2`、基点 `01f5e898f`。
+§6.4.5 の r1 補正を優先して実装した。課題 2・3 の所有移動 helper と main Depth 退役の確定点は変更しない。
+
+変更ファイル:
+
+- `src/app.rs`: 新規 binding の初期解決と既存 session の継承、descriptor build 初期化、
+  採用後・旧項目更新前の窓交換 helper、F12 の明示解決（遅延 reopen 中を含む）、
+  遅着 Manual の窓交換を active に限定する共通採用判定。
+- `src/app/collection_navigation.rs`: 同じ採用判定を exact target 確認後・root の install 前に適用。
+- `src/app/depth_view.rs`: presentation と独立性の同時 commit。
+- `src/app/viewer_context_registry.rs`: session 退役後の同じ mounted context の A→B binding 交換。
+- `src/app/native_video.rs`: 旧 media 項目だけの退役、native F12 と通常の同 host 同期の区別。
+- `src/app/presentation_transition.rs`: 既存 request に解決済み独立性を保持し、旧 media output の
+  drop とともに旧 request/effects を終端する（次の request id は巻き戻さない）。
+- `src/app/detached_media_exchange_tests.rs`、`src/app/multiwindow_scenario_tests.rs`、
+  `src/ui_fullscreen.rs`、`src/app/tests.rs`: handler・所有移動・初回 builder の回帰。
+- 本書、`docs/detached-rework-plan.md` §11、`docs/video-architecture.md`、`docs/keymap-spec.md`、
+  `htdocs/mimageviewer/manual/fullscreen.html`: 仕様・所有境界と公開説明。
+
+着手前の前提確認（実装者と独立 GPT-6.1 Sol / xhigh のコード照合）:
+
+| 前提 | コードで確認した結果 |
+| --- | --- |
+| 独立性の二重決定 | prepare が静止画設定から再計算し、media で false を書き戻していた |
+| binding の予約・公開 | Building は私有予約、Commit 後に公開して session を開始する。継続は同じ binding を読む |
+| descriptor 再構築 | resume_window_id を保持しても新しい context / default session になる。予約直後に解決済み pair を初期化した |
+| 複数ウィンドウの新規 media | 旧コードは最初 false。新規 open の binding 初期解決で独立とし、その後は引き継ぐ |
+| F11 | transition が target を保持。return Settle では restore は消費済みで runtime に通常配置が戻っている |
+| session commit | target_independent を Depth 終了判定にだけ使用していた。同じ確定点で独立性も書く |
+
+r1 補正を優先すれば実装を妨げる矛盾はなかった。追加の入口監査で DetachedImage の scan 完了が
+独立性と one-shot を再設定する箇所も確認し、binding 初期確定に一本化した。
+F12 の native 同 host request は rect 同期 / VST 退出にも使われるため、通常要求は継承し、F12 の明示要求だけ
+解決し直す。現在の表示先へ戻す反転は reducer が Apply を省略できるので、採用後に独立性を同期確定する。
+
+交換は admission / 候補採用後だけ実行する。旧 C の media 資源を項目離脱の部品で終端し、
+C 全体の close、cache clear、park、再走査は行わない。既存の窓を閉じて開く簡素化を窓の役割交換に採用し、
+閲覧全体の close→open は slideshow / pending / cache を失うため使わない。
+App の新しい状態、待ち、リトライ、救済用 repaint、focus / z-order の仕組みは加えていない。
+
+検証はこの worktree だけで、Cargo のビルド・テストをすべて次で直列実行する:
+
+`powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local\miv-locks\run-heavy.ps1 -Owner "codex/767-issue1" -WorkDir G:\home\mimageviewer-767s2 -Command "<コマンド>"`
+
+ロック領域へ書けない警告は指定どおり継続。nextest は既存のこの worktree の検証条件と揃え、
+`CARGO_BUILD_JOBS=1` / `CARGO_INCREMENTAL=0` / `MSBUILDDISABLENODEREUSE=1` を使う。
+
+追加決定前の検証履歴（当時の未解決 P1 による非ゼロを含む。追加決定後の最終結果は後掲）:
+
+| コマンド | 件数 / exit code / 証拠 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core`（初回） | exit 0、4分09秒。最終検証前の中間状態 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/independent_media_exchange/)' --no-fail-fast`（r1） | **10成功 / 0失敗、exit 0**。compile 8分54秒、実行2.858秒。`target/767-issue1-focused-r1.log`。遅着Manualの追加回帰前 |
+| 同じ焦点コマンド（r2、遅着 Manual / native request 回帰と F12 OFF 完了を追加） | **12実行 / 11成功 / 1失敗、exit 100**。compile 8分57秒、実行2.941秒。`target/767-issue1-focused-r2.log`。失敗は下記の設計境界だけ |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth\|export\|presentation\|window_mode\|panorama\|detached\|multiwindow_scenario\|slideshow\|admission/)' --no-fail-fast`（回帰 r1） | **1,548実行 / 1,546成功 / 2失敗、exit 100**。109.438秒。`target/767-issue1-regression.log`。設計境界の P1 と下記 fixture |
+| 同じ回帰コマンド（r2、fixture 初期化だけ補正） | **1,548実行 / 1,547成功 / 1失敗、exit 100**。compile 8分38秒、実行121.461秒。`target/767-issue1-regression-r2.log`。未解決の遅着 Manual P1 だけが失敗。指定の既存対照・課題2/3回帰を含む |
+| `cargo check -p mimageviewer --bin mimageviewer-core`（最終） | **exit 0**、1分21秒（テスト実行なし）。`target/767-issue1-check.log` |
+| `cargo fmt`（最後に引数なし、run-heavy 経由） | **exit 0**。`target/767-issue1-fmt.log`。最終回帰後の Rust 変更は整形のみ |
+| `git diff --check` | **exit 0**。`target/767-issue1-diff-check.log`。LF→CRLF の既存設定による警告のみ。HEAD は `01f5e898f` のまま、vendor 差分なし |
+| `python scripts/check_ui_glyphs.py` | 危険グリフ 0、exit 0 |
+| `python scripts/check_site_cards.py` | 53カード、超過0、exit 0 |
+
+初回 nextest 呼出は PowerShell の filter 引数が未引用で解釈され、Cargo 起動前に exit 1。
+ASCII の target 内実行スクリプトに filter を引用して直した（テスト失敗件数には含めない）。
+
+回帰 r1 のもう1件は `detached_book_active_context_mount_restores_main_after_fullscreen_open`。
+生の `build_active_context_for_test` が default session のまま binding を作り、列挙完了後に設定から
+独立性を決める旧 prepare の副作用を前提にしていた。fixture 内の items 準備直後に
+`new_detached_open_is_independent` で新規規則を解決し、session を初期 commit するよう修正した。
+main の復元・ページ open・独立性の assertion はすべて維持し、共通 fixture や製品側の例外は追加しない。
+独立レビューもこの fixture 補正を妥当と確認した。製品の新規 descriptor 初期化は別の実 activation 回帰で検査している。
+
+未確認 / 引継ぎ:
+
+- 実 OS 窓の表示間隔、focus / z-order、実 player の停止音・VST GUI、F11 の実画面・最大化復元、
+  マルチモニター / DPI、実モデルでの3Dは未確認。headless handler / ROOT / builder の検証と区別する。
+  「active」は owner と active session の window 一致を指す。結果待ち中に他アプリへ前景を移した場合の
+  B の表示・focus は実機未確認で、OS 前景判定や最初の builder の既定動作は今回変更していない。
+- 旧製品コードへ差し戻して新規回帰を実行する比較は未実施。描画部品・レイアウト・UI文字列は変更していない。
+  `cargo test --test ui_snapshot` は未実施で、窓の初回条件は headless builder と ROOT scenario で検査した。
+- 依頼どおり `test-lib-full.ps1`・`test-full.ps1`・`build-dev.ps1`、製品起動、commit / push は実施しない。
+  vendor は変更しない。全件 gate、検証用 build、実機確認は設計担当へ引き継ぐ。
+
+#### 追加監査と設計担当の追加決定: 遅延 Manual の採用境界
+
+独立レビューで、独立 A の Manual 要求 → 別窓 D の実 activation → ParkedLive A への結果到着、という経路を確認した。
+park は input_seq を進めず、通常要求は `rebind_native_video_pending_owners` で `None` → `Some(A)` へ移る。
+従来の交換 helper は global active session を A とみなして D を閉じ、binding の所有 assert が失敗した。
+焦点 r2 と回帰 r2 の遅着テストで、D の `ViewerContextId(2) / AtRest` と C の `ViewerContextId(1) / Mounted` の
+不一致を再現した。これは timeout / harness の失敗ではない。追加決定前の独立レビューは P1 1件で未受入だった。
+
+設計担当が §6.4.5 末尾の追加決定を行った。交換の必要な遅着 Manual は inactive なら採用せずログ付きで破棄し、
+A の再生と ParkedLive、D の session / binding / window を保持する。同種メディアは背景で採用を続ける。
+利用者への照会は不要となり、保留状態や背景 B の寿命は作らない。
+
+追加の入口監査では、通常 resolver と別に Collection の request owner があり、その passive poll でも
+Manual が採用されることを確認した。共通 `admit_manual_media_navigation_target` へ判定を1か所に集約し、
+通常 resolver は result の currentness 照合後、Collection は exact target の照合後・root install 前に通す。
+Collection の対象は最新 prepared entry の `GridItem` を使い、旧一覧の index から分類しない。
+これは2つの request owner に同じ規則を適用する所有境界の修正であり、描画側の症状 guard ではない。
+
+追加回帰:
+
+- 遅着静止画: 通常の一覧から実 open / park / activation で独立 A を作り、実 Manual 要求後に D を実 activation。
+  A で結果を採用せず、元の media identity・再生意図・items / generation・binding・ParkedLive を保持する。
+  D の session・binding・runtime、共有 F11 / focus / viewport 状態、main の一覧と選択も不変。
+  Video / Audio と Image / ZipImage / PdfPage の組合せを検査する。
+- 遅着同種メディア: Video / Audio とも、A は同じ窓で次の media に進み、D と main は維持する。
+- native request: A の実同 host request を AwaitingNative まで進めてから Manual → D activation。
+  静止画結果を同じ採用規則で捨て、A の request / player と D を保持する。
+- Collection: 実 actor・最新 prepared root・実 Manual → D activation → passive poll を通し、
+  Video / Audio の静止画結果は捨て、同種メディアは背景で採用する。
+
+追加決定後の焦点 r3 は **15実行 / 13成功 / 2失敗、exit 100**（compile 9分11秒、実行11.308秒、
+`target/767-issue1-focused-r3.log`）。通常の遅着静止画と AwaitingNative 中の破棄は通過した。
+同種メディア対照で、旧 Manual の Fullscreen landing と native swap 不成立時の通常 open が
+`prepare_viewer_presentation_open` の active session publish へ入る旧経路を確認した。
+Collection の検査は native continuation の完了待ちで失敗した。コード上でも同じ通常 open を通り、
+A が Resuming に変わると ParkedLive poll の対象から外れる経路を確認した。
+これはテスト runner の timeout ではなく、回帰内の完了条件の未達である。
+
+同種メディアの背景採用を保つため、旧 Audio EOF の bundle 内採用部品を Video / Audio の共通部品にした。
+通常 resolver / Collection の Manual landing は共通入口を通し、native の成功した output swap は維持する。
+swap 不成立時と egui landing の背景メディアは、通常の全体 open に入らず、所有 C の idx / cache / marker と
+既存の media load だけを更新する。Video↔Audio も同じ窓で扱う。
+新旧 player の退役・resume 保存・normalize は既存の load に委ね、旧 output を drop したときだけ
+同じ C の presentation request/effects を終端する。成功 swap の output は終端しない。
+Manual の history / NewSource と EOF の ContinuousAdvance を保持し、cached / Audio へ動画の one-shot を残さない。
+Audio→Video の解析資源は `music_analysis_source.owner_context_id` が C に一致するものだけ退役する。
+起動時の音響処理待ちは既存 `vst3_deferred_media_open` へ送り、既存の所有 context ごとの完了処理から再開する。
+native の背景 swap の履歴も、候補の受付時ではなく確定点で記録する。
+
+さらに、破棄後に残した旧 same-host request の NativeReady / NativeCommitted は背景でも正当な完了である。
+その ApplyPresentation が A を active に戻す旧経路も確認し、ParkedLive の同 host Detached→Detached の確定を
+C の pair / native flag / sync stamp / A の runtime linked flag の更新に閉じた。
+active session / front 同期 / DSP owner の公開は前景側に属するため、この背景確定では行わない。
+別 host への明示切替の背景化・取消の仕様は追加していない。HWND 同定や focus / z-order の基盤は変更しない。
+
+回帰は Video↔Audio の両方向（通常 / Collection）、旧 AwaitingNative がある背景 media 採用での
+output 退役と遅着無効、既存の起動待ち gate と owner ごとの再開も追加した。
+同種メディアの対照でも D の共有 F11 / focus / viewport と one-shot 不変を検査する。
+静止画を捨てた native ケースは、その後の NativeReady / NativeCommitted と実 ApplyPresentation effect を通し、
+A の ParkedLive と D の session / 共有状態をもう一度検査する。
+native の host readiness / decoder と native 完了の事実だけに既存の headless seam を用い、
+request owner / current item / pending 完了 / continuation / App 側の確定 handler は実経路を使う。
+
+焦点 r4 は **18実行 / 16成功 / 2失敗、exit 100**（compile 9分34秒、実行4.156秒、
+`target/767-issue1-focused-r4.log`）。通常の背景採用、破棄後の同 host native 完了、旧 output の退役、
+起動待ち gate は通過した。2失敗は accepted Collection media の世代を旧値に固定した新規テストの期待だった。
+この fixture では既存の root replacement を1回通るため、
+`apply_collection_grid_prepared_install` → `install_new_items_inner` が世代を1回進める。
+accepted Collection media だけ `old_generation.wrapping_add(1)` とし、rows / 順序・C / A・D の所有不変と
+旧 player の退役を引き続き検査する。破棄する静止画は root install 前なので旧世代の完全不変を維持する。
+独立レビューでこの期待の補正を確認し、製品側の root reuse / replacement は変更しない。
+Collection 一般を常に世代更新する仕様にはしていない（既存の同一 root 再利用は世代不変）。
+
+追加決定後の最終検証（Cargo はすべて上記 runner 経由、重い処理は直列）:
+
+| コマンド | 件数 / exit code / 証拠 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/independent_media_exchange/)' --no-fail-fast`（r5） | **18成功 / 0失敗、exit 0**。compile 17分23秒、実行11.213秒。`target/767-issue1-focused-r5.log`。r4 以後の変更は上記の新規 Collection テストの世代期待だけ |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth\|export\|presentation\|window_mode\|panorama\|detached\|multiwindow_scenario\|slideshow\|admission/)' --no-fail-fast`（回帰 r3） | **1,554成功 / 0失敗、exit 0**。build確認1.16秒、実行117.535秒。`target/767-issue1-regression-r3.log`。指定の既存対照・課題2/3回帰を含む |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/healthy_.*swap.*same_output_identity\|parked_audio_continuous_target_stays_inside_bundle\|effetune_and_vst_startup_gate\|parked_video_deferred_swap_completion\|parked_source_swap_pending_/)' --no-fail-fast` | **7成功 / 0失敗、exit 0**。build確認1.20秒、実行0.952秒。`target/767-issue1-background-controls.log`。既存の音声EOF、起動gate、成功したnative output再利用、背景swapとowner照合 |
+| `cargo check -p mimageviewer --bin mimageviewer-core`（追加決定後） | **exit 0**、1分19秒（テスト実行なし）。`target/767-issue1-check-r2.log` |
+| `cargo fmt`（最後の Cargo 操作、引数なし） | **exit 0**。`target/767-issue1-fmt-r2.log`。以後の Rust 変更なし |
+| `git diff --check` | **exit 0**。`target/767-issue1-diff-check-r2.log`。既存 LF→CRLF 設定の警告のみ |
+| `python scripts/check_site_cards.py` | **53カード / 超過0、exit 0** |
+| `python scripts/check_ui_glyphs.py` | **危険グリフ0、exit 0** |
+
+r4 は共有 runner が別セッションの全件テストのロック解放を待ってから開始した。
+待機中はこちらの Cargo は起動せず、ロックを変更しない。再ビルド中も中断せず完了まで待った。
+こちらから全件テストは起動していない。
+
+追加決定に沿った実装と指定の自動検証を完了した。独立 GPT-6.1 Sol / xhigh の再監査では
+追加 P1 / P2 はなく、同じソースの焦点18件・指定回帰1,554件・背景対照7件の成功ログを照合した。
+core check / fmt と整形後の差分を含む最終証跡も独立レビューが照合し、今回の指定スコープを受入可と判定した。
+未解決 P1 / P2 はない。実機確認・全件 gate・検証用 build は上記の引継ぎ事項として残す。
+HEAD は `01f5e898f`、ブランチは `feat-767-stage2` のまま。変更は上記15ファイルだけで vendor 差分なし。
+製品起動・検証用 build・全件 gate・commit / push は依頼どおり実施しない。
+描画 / レイアウトは変更しておらず ui_snapshot は実施しない。実 OS / 再生音 / focus・F11・DPI / 実3Dなど、
+上記の未確認点は引き続き実機確認へ引き継ぐ。

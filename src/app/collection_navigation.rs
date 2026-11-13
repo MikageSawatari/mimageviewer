@@ -3909,6 +3909,18 @@ impl App {
             self.finish_collection_navigation_request_without_target(ctx, &request);
             return;
         }
+        #[cfg(windows)]
+        if matches!(request.action, CollectionNavigationAction::Manual { .. })
+            && prepared
+                .entries
+                .iter()
+                .find(|entry| entry.entry_id == ready.target.entry_id)
+                .is_some_and(|entry| {
+                    !self.admit_manual_media_navigation_target(&entry.item, "collection_manual")
+                })
+        {
+            return;
+        }
         let loops_current_media = request
             .origin
             .anchor
@@ -4508,18 +4520,7 @@ impl App {
                 wrap,
                 ..
             } => {
-                match landing {
-                    ManualMediaNavigationLanding::Fullscreen => {
-                        self.open_fullscreen_from_fs_navigation(ctx, target_idx, history_trigger)
-                    }
-                    #[cfg(windows)]
-                    ManualMediaNavigationLanding::NativeVideo => self
-                        .open_native_video_fullscreen_from_navigation(
-                            ctx,
-                            target_idx,
-                            history_trigger,
-                        ),
-                }
+                self.open_manual_media_navigation_target(ctx, target_idx, landing, history_trigger);
                 #[cfg(windows)]
                 let native_landing = matches!(landing, ManualMediaNavigationLanding::NativeVideo);
                 #[cfg(not(windows))]

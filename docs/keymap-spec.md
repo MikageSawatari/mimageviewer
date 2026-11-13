@@ -10,7 +10,7 @@
 `FsDepthParallax` は画像閲覧 (`FsImage`) の `Press` 操作、既定は
 <kbd>D</kbd>。再度押すか右パネルの×で終了する。操作カスタマイズで変更・解除できる。
 MainWindow / Fullscreen / DetachedWindow（枠なし全画面を含む）の単ページ静止画を対象とする。
-複数ウィンドウモードの窓やメディアウィンドウなどの独立 context でも使えるが、
+複数ウィンドウモードの窓や独立した静止画 context でも使えるが、
 プロセス全体で 1 context だけが 3D を所有できる。ほかの context が所有中なら入口で拒否し、
 その context の状態は変更しない。動画・アニメーション・見開き・連結読み・
 編集・紙めくり中では受け付けない。360度表示からは3Dへ切り替える。
@@ -19,6 +19,10 @@ F12 の ON / OFF による表示先切替と、main の F11 による MainWindow
 3Dを終了し、`FsDepthParallax` の実効キー（既定D）での再開を通知する。
 別ウィンドウの窓内で F11 により通常表示 / 枠なし全画面を切り替えた場合は3Dを継続する。
 F11 / F12 も既存の `FsToggleWindowMode` / `ToggleDetachedViewerMode` の実効キーを使う。
+フル機能 + メディア別窓の独立 Video / Audio から静止画へ進むと、同じ context のまま
+メディア窓 A を退役して静止画窓 B に交換する。B の画像送りでは3Dを継続する。
+F12 は現在の独立性を継承せず、設定に従う表示先・独立性を一緒に確定する。
+遅延 reopen 中に現在項目が無い場合も、残る binding の session に適用する。
 独立 context が pause / park / fork / close などで live pass を失うときは3Dを終了し、
 一時的な context mount では終了しない。
 main 以外の独立 context から開いたモデル確認の Checking / Confirm と、書き出しの全 phase は、

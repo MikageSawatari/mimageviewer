@@ -5554,6 +5554,22 @@ impl App {
         result
     }
 
+    /// The outgoing session/output must be retired before replacing this reader's host.
+    pub(in crate::app) fn replace_mounted_detached_window_binding(&mut self, old: u64) -> u64 {
+        let mounted = self
+            .mounted_viewer_context_id()
+            .expect("host exchange is mounted");
+        if let Some((owner, residence)) = self.locate_window_context(old) {
+            assert_eq!((owner, residence), (mounted, ContextResidence::Mounted));
+            assert_eq!(self.unbind_window(old), Some(mounted));
+        }
+        assert!(self.viewer_context_window(mounted).is_none());
+        let new = self.allocate_detached_viewer_window_id();
+        self.bind_window(mounted, new)
+            .expect("replacement host has one binding");
+        new
+    }
+
     #[track_caller]
     pub(in crate::app) fn reserve_window_binding_for_build(&mut self, window_id: u64) {
         self.viewer_contexts
