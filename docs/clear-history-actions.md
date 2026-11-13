@@ -19,10 +19,18 @@
   `reading_history_clear_dialog_visible` を描画と共通モーダル判定で共有し、
   Enter / Escape は IME 対応 helper を通す。Enter のリピートでは確定せず、新しい押下を要する。
   ×／キャンセルでは削除せず、確定時に件数を数え直す。
+  確認前と確定時は `ReadingHistoryDb::try_count` で取得失敗を区別し、0 件のときだけ
+  「閲覧履歴はありません」と通知する。取得失敗はログ＋警告で終了し、確認も削除も行わない。
+  DB 不在時は従来どおり確認後の共有削除処理でエラーを通知する。既存の `count()` の
+  呼び出し元とエラー時 0 件の互換動作は維持する。
   成功通知は実際の削除件数、失敗はログ＋通知とする。
-- UI スレッドの I/O: 利用者が提示した設計担当の判断に従い、出荷済みの環境設定と同じ
-  同期 SQLite DELETE / count を共有する。最大 1000 件。既存区間に perf event はない。
-  worker 化は今回行わず別件の検討対象。新しい DB 問合せ方式や同期 I/O 経路は作らない。
+- UI スレッドの DELETE: 利用者が提示した設計担当の判断に従い、出荷済みの環境設定と同じ
+  同期 SQLite DELETE と削除後の count を共有する。既存区間に perf event はない。
+- UI スレッドの件数確認: キー／リングの確認前と確定時に `SELECT COUNT(*)` を同期実行する。
+  接続の busy timeout は 3 秒。ローカル DB の行数は保持件数の上限（最大 1000 件）までで、
+  利用者の明示操作時だけ実行するため、今回は既存の DELETE と同じ扱いで許容する。
+  応答時間は未測定。件数確認の worker 化は DELETE とあわせて別件の検討対象とする。
+- 設定保存:
   検索入力履歴の即時設定保存は最近開いたフォルダ履歴の既存コマンドと同じ保存境界を使う。
 - 簡素化: 短い既存処理を共有し、確認中をモーダルにする。新しい worker、保留、再開、
   rollback や世代は追加しない。まれな失敗は割り切り（ログ＋通知、再試行なし）。
@@ -38,7 +46,7 @@
   未解消の指摘なし。通常 Window が OS テーマを継承する配色も規約適合と確認。
 - 指定の nextest 関連群: 1404 件成功、失敗 0（run ID `2f53dbcf-e49d-4d6e-85b2-ea2acad9642a`）。
   `target/clear-history-related-junit.xml` に結果を保存。
-- 最終ソースの追加確認: 14 件成功、失敗 0（run ID `bad41f2c-2dd1-4282-87bd-bf4e8ca63e7f`）。
+- 初回実装の最終ソースの追加確認: 14 件成功、失敗 0（run ID `bad41f2c-2dd1-4282-87bd-bf4e8ca63e7f`）。
   新規 12 テストと keymap / ring 網羅性の確認を含む。
   `target/clear-history-final-junit.xml` に結果を保存。
 - `cargo check -p mimageviewer --bin mimageviewer-core` 成功。
@@ -49,10 +57,26 @@
 - `cargo fmt`（引数なし）、`git diff --check`、UI グリフ検査も成功。
   lib 全件、build-dev、対話起動、Git への書込は指示どおり未実施。
 
-変更ファイル（19 件）:
+### e1d67ebf7 の独立レビュー指摘への対応
+
+- P2: 確認前・確定時の件数取得を `try_count()` へ変更し、取得失敗はログと警告で終了する。
+  既存の `count()` と DB 不在時の扱いは維持。再試行は追加しない。
+- 新規回帰 3 件成功（run ID `cfff9842-c5ac-4a41-80b1-ee42c988d233`）。
+  別の SQLite 接続の `BEGIN EXCLUSIVE` により実際の読み取り失敗を発生させ、確認前・確定時の
+  警告、ダイアログの終了、履歴保持、一覧の非更新を検査。DB 単体では `try_count()` の失敗と
+  既存 `count()` の 0 件へのフォールバックを検査。使い捨て DB だけを使用する。
+  結果は `target/clear-history-review-focused-junit.xml`。
+- P3: 同期 COUNT の実行箇所、busy timeout、今回の許容理由、未測定の応答時間と
+  DELETE とあわせた worker 化の別件扱いを上記へ明記した。
+- 前回と同じ nextest フィルタで関連 1408 件成功、失敗 0
+  （run ID `e524d94a-c8e8-40fb-bf76-250bf6db8214`、上記の新規 3 件を含む）。
+  結果は `target/clear-history-review-related-junit.xml`。
+  重処理は指定の run-heavy 経由。UI グリフ検査も成功。
+
+変更ファイル（初回実装とレビュー修正の合計 20 件）:
 
 - `src/app.rs`、`src/app/gamepad_input.rs`、`src/app/search_nav_entry_inventory_tests.rs`、
-  `src/app/clear_history_tests.rs`、`src/keymap.rs`、`src/ring_shortcut.rs`
+  `src/app/clear_history_tests.rs`、`src/keymap.rs`、`src/ring_shortcut.rs`、`src/reading_history_db.rs`
 - `src/ui_dialogs/mod.rs`、`src/ui_dialogs/clear_history.rs`、`src/ui_dialogs/preferences.rs`、
   `src/ui_dialogs/preferences/pages.rs`
 - `docs/README.md`、`docs/clear-history-actions.md`、`docs/keymap.ini.default`、

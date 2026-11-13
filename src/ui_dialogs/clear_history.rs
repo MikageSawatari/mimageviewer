@@ -56,16 +56,26 @@ impl App {
         Some(result)
     }
 
-    fn reading_history_is_empty(&self) -> bool {
-        // A missing DB is an error, not an empty history. Let the shared command report it.
-        self.reading_history_db
-            .as_ref()
-            .is_some_and(|db| db.count() == 0)
+    fn check_reading_history_clear_count(&mut self) -> bool {
+        match self.reading_history_db.as_ref().map(|db| db.try_count()) {
+            Some(Ok(0)) => {
+                self.show_feedback_toast("閲覧履歴はありません".into());
+                false
+            }
+            Some(Err(error)) => {
+                crate::logger::log(format!(
+                    "[reading_history] count before clear failed: {error}"
+                ));
+                self.show_feedback_warning("閲覧履歴の件数を確認できませんでした".into());
+                false
+            }
+            // Keep the missing-DB behavior: the shared DELETE reports its own error.
+            Some(Ok(_)) | None => true,
+        }
     }
 
     pub(crate) fn request_clear_reading_history(&mut self) {
-        if self.reading_history_is_empty() {
-            self.show_feedback_toast("閲覧履歴はありません".into());
+        if !self.check_reading_history_clear_count() {
             return;
         }
         self.show_reading_history_clear_confirm = true;
@@ -80,8 +90,7 @@ impl App {
             return;
         }
         // Recount at confirmation, rather than retaining an opening-time count.
-        if self.reading_history_is_empty() {
-            self.show_feedback_toast("閲覧履歴はありません".into());
+        if !self.check_reading_history_clear_count() {
             return;
         }
         match self.clear_reading_history() {

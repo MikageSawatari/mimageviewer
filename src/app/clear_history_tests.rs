@@ -261,3 +261,44 @@ fn reading_history_clear_failure_reports_error() {
     assert!(!app.common_modal_dialog_open());
     assert_eq!(toast(&app), Some("閲覧履歴の削除に失敗しました"));
 }
+
+fn hold_reading_history_exclusive_lock() -> rusqlite::Connection {
+    let lock =
+        rusqlite::Connection::open(crate::reading_history_db::ReadingHistoryDb::db_path()).unwrap();
+    lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    lock
+}
+
+#[test]
+fn reading_history_clear_key_count_failure_warns_without_opening_dialog() {
+    let mut app = setup_app_for_test();
+    seed_reading(&app, 2);
+    let generation = app.items_generation;
+    let lock = hold_reading_history_exclusive_lock();
+    app.apply_history_clear_key_action(
+        &egui::Context::default(),
+        KeyAction::GridClearReadingHistory,
+        "test",
+    );
+    assert!(!app.common_modal_dialog_open());
+    assert_eq!(app.items_generation, generation);
+    assert_eq!(toast(&app), Some("閲覧履歴の件数を確認できませんでした"));
+    lock.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(reading_count(&app), 2);
+}
+
+#[test]
+fn reading_history_clear_confirm_count_failure_warns_without_deleting() {
+    let mut app = setup_app_for_test();
+    seed_reading(&app, 2);
+    app.request_clear_reading_history();
+    assert!(app.common_modal_dialog_open());
+    let generation = app.items_generation;
+    let lock = hold_reading_history_exclusive_lock();
+    app.resolve_reading_history_clear_confirmation(true);
+    assert!(!app.common_modal_dialog_open());
+    assert_eq!(app.items_generation, generation);
+    assert_eq!(toast(&app), Some("閲覧履歴の件数を確認できませんでした"));
+    lock.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(reading_count(&app), 2);
+}
