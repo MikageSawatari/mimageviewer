@@ -3971,3 +3971,10 @@ Building の保持条件で用いた `viewer_session_is_detached()` は `fullscr
 全件 gate・検証用 build・製品起動・commit / push は今回の指示どおり実行していない。
 変更は上記5ファイルで vendor 差分なし、ブランチ `feat-767-stage2` / HEAD `600b0a99d` のまま。
 独立 GPT-6.1 Sol / xhigh が整形後の5ファイル差分と全証跡を照合し、今回の修正は **受入可、未解決 P1 / P2 なし** と判定した。
+
+#### 独立実装レビュー r3 (2026-11-14、設計担当が依頼した別セッションの GPT-6.1 Sol / xhigh、read-only、対象 `178a3ece2`)
+
+**受入可、P1 / P2 / P3 なし**。原因 (同期 install の内容 close が `prepare_viewer_presentation_close` で公開前の Building の session pair を非 detached / false に解除) の説明は正しく、
+`preserve_detached_for_folder_nav` の条件は registry 所有の私的予約と同じ窓の runtime から生存を判定するもので、Mounted には影響せず、Closing / runtime 不在は保持しない。
+取消と build abort で保持した pair が残る経路は無い。同型の経路 (loading shell / collection root / descriptor / ScannedFolder) に取りこぼしは無い。テストは弱めていない。
+**症状パッチではなく構造的な変更であることに合意** (内容の close と予約済み表示 session の寿命を区別し、公開前後で同じ所有者の確定値を保つ)。設計担当 (ClaudeCode) も同じ判断で検収した。
