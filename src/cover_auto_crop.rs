@@ -1,6 +1,8 @@
 //! Conservative jacket detection. Position comes from binding order and panel
 //! structure; visual richness can reject a position, never choose another one.
+use crate::cover_auto_material::AutoCropResults;
 use crate::folder_thumb_pins::CoverCrop;
+use crate::rotation_db::Rotation;
 use crate::settings::ReadingDirection;
 use image::{DynamicImage, RgbImage};
 
@@ -16,8 +18,8 @@ impl AutoCropIdentity {
 
     pub(crate) fn suffix(self) -> &'static str {
         match self.binding {
-            ReadingDirection::Rtl => "v1:rtl",
-            ReadingDirection::Ltr => "v1:ltr",
+            ReadingDirection::Rtl => "v2:rtl",
+            ReadingDirection::Ltr => "v2:ltr",
         }
     }
 }
@@ -49,6 +51,89 @@ impl AutoCropDecline {
             Self::RicherElsewhere => "richer-elsewhere",
         }
     }
+}
+
+/// Analyze all saved rotations once. Each result belongs to the unrotated,
+/// EXIF-upright source, so changing the saved angle never invalidates material.
+/// The caller supplies the shared fixed-size analysis decode, not a display
+/// thumbnail. In particular, rotate before reducing to the 256-row raster.
+pub(crate) fn detect_cover_crops(
+    image: &DynamicImage,
+    original_dims: (u32, u32),
+    page_aspect: Option<f64>,
+    binding: ReadingDirection,
+) -> AutoCropResults {
+    detect_cover_crops_with_report(image, original_dims, page_aspect, binding, |_, _| {})
+}
+
+pub(crate) fn detect_cover_crops_with_report(
+    image: &DynamicImage,
+    original_dims: (u32, u32),
+    page_aspect: Option<f64>,
+    binding: ReadingDirection,
+    mut report: impl FnMut(Rotation, Result<CoverCrop, AutoCropDecline>),
+) -> AutoCropResults {
+    AutoCropResults::new(
+        [
+            Rotation::None,
+            Rotation::Cw90,
+            Rotation::Cw180,
+            Rotation::Cw270,
+        ]
+        .map(|rotation| {
+            let result =
+                detect_cover_crop_at_rotation(image, original_dims, page_aspect, binding, rotation);
+            report(rotation, result);
+            result.ok()
+        }),
+    )
+}
+
+fn detect_cover_crop_at_rotation(
+    image: &DynamicImage,
+    original_dims: (u32, u32),
+    page_aspect: Option<f64>,
+    binding: ReadingDirection,
+    rotation: Rotation,
+) -> Result<CoverCrop, AutoCropDecline> {
+    let rotated;
+    let image = match rotation {
+        Rotation::None => image,
+        Rotation::Cw90 => {
+            rotated = image.rotate90();
+            &rotated
+        }
+        Rotation::Cw180 => {
+            rotated = image.rotate180();
+            &rotated
+        }
+        Rotation::Cw270 => {
+            rotated = image.rotate270();
+            &rotated
+        }
+    };
+    let dimensions = match rotation {
+        Rotation::Cw90 | Rotation::Cw270 => (original_dims.1, original_dims.0),
+        Rotation::None | Rotation::Cw180 => original_dims,
+    };
+    let crop = cover_auto_crop(&analysis_raster(image), dimensions, page_aspect, binding)?;
+    let [x0, y0, x1, y1] = crop.values();
+    let inverse = match rotation {
+        Rotation::None => [x0, y0, x1, y1],
+        Rotation::Cw90 => [y0, 1_000_000 - x1, y1, 1_000_000 - x0],
+        Rotation::Cw180 => [
+            1_000_000 - x1,
+            1_000_000 - y1,
+            1_000_000 - x0,
+            1_000_000 - y0,
+        ],
+        Rotation::Cw270 => [1_000_000 - y1, x0, 1_000_000 - y0, x1],
+    };
+    // Quarter turns preserve CoverCrop's bounds, minimum edges and non-full
+    // invariant. Failure here is a programming error, never a detector decline.
+    Ok(CoverCrop::new(inverse)
+        .expect("inverse rotation preserves valid crop bounds")
+        .expect("inverse rotation preserves a non-full crop"))
 }
 
 /// Use one deterministic analysis height, including when the decoder supplied

@@ -1119,9 +1119,13 @@ cascade は leaf の範囲を route hash に含める。範囲なしの綴りは
 基本キーの種類設定はmasterの処理を保ち、最初の`#pin:`より前の末尾の16桁hex `|types:`を1つだけ付け直す。
 自動はその区切りの直前（固定なしならキー末尾）にある完全一致トークンだけを外して付け直す。`|generation:`は区切らない。
 自動切り出しは `thumb_cover_auto_crop`（既定 OFF）と既定の綴じ方向をキーに反映する。
-基本キーの `|types:` の後、`#pin:` より前に `|autocrop:v1:rtl` / `|autocrop:v1:ltr` を付ける。
+基本キーの `|types:` の後、`#pin:` より前に `|autocrop:v2:rtl` / `|autocrop:v2:ltr` を付ける。
 手動範囲・ページ一覧・仮想フォルダの seed/writeback・ドライブ・Remote には付けない。
 フォルダの自動代表にも設定 identity を付けるが、自身では判定せず子の完成行を子の実効キーで読む。
+自動の素材は全体画素と4方向の範囲を持つ `AutoMaterial` ごとコピーする。K2ではv2の子の行が存在しない場合だけ同じ子のv1行を読み、
+切り済み画素の `LegacyV1` として運ぶ。古いキーは存続集合へ足さず、v2の行が壊れている／古い場合にv1へ戻らない。
+catalogの追加列 `auto_crops` は単一codecで素材の種類を保存し、v2キーでNULL／不正値は読み損ねとする。
+移行前から開いていた読み取り専用handleも、プロセス内schema世代の変化で列の有無を再検出する。
 存続集合は従来の基本・固定キー、手動範囲付きの完成キーと、現設定の自動 identity 付きのキーを含め、ピンなし ZipDir も明示して残す。
 ネストでない ZIP/変換 ZIP の近傍ページは最大8枚の先頭256KBずつで寸法だけを調べる。
 PDF/変換済み EPUB は代表描画と同じ password・`ReadTarget` lease の `PageSizes` を使い、追加の変換や問い合わせはしない。

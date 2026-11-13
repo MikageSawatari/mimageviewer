@@ -422,11 +422,121 @@ fn gates_and_identity_are_explicit() {
     }
     assert_eq!(
         AutoCropIdentity::new(ReadingDirection::Rtl).suffix(),
-        "v1:rtl"
+        "v2:rtl"
     );
     assert_eq!(
         AutoCropIdentity::new(ReadingDirection::Ltr).suffix(),
-        "v1:ltr"
+        "v2:ltr"
+    );
+}
+
+fn rotate_image(image: &DynamicImage, rotation: Rotation) -> DynamicImage {
+    match rotation {
+        Rotation::None => image.clone(),
+        Rotation::Cw90 => image.rotate90(),
+        Rotation::Cw180 => image.rotate180(),
+        Rotation::Cw270 => image.rotate270(),
+    }
+}
+
+fn rotate_crop(crop: CoverCrop, rotation: Rotation) -> CoverCrop {
+    let [x0, y0, x1, y1] = crop.values();
+    let values = match rotation {
+        Rotation::None => [x0, y0, x1, y1],
+        Rotation::Cw90 => [1_000_000 - y1, x0, 1_000_000 - y0, x1],
+        Rotation::Cw180 => [
+            1_000_000 - x1,
+            1_000_000 - y1,
+            1_000_000 - x0,
+            1_000_000 - y0,
+        ],
+        Rotation::Cw270 => [y0, 1_000_000 - x1, y1, 1_000_000 - x0],
+    };
+    CoverCrop::new(values).unwrap().unwrap()
+}
+
+#[test]
+fn saved_rotation_detection_matches_upright_jacket_in_source_coordinates() {
+    for binding in [ReadingDirection::Rtl, ReadingDirection::Ltr] {
+        for scan in [false, true] {
+            let (image, _) = jacket(binding, scan, scan, true, true);
+            let image = DynamicImage::ImageRgb8(image);
+            let upright =
+                detect_cover_crops(&image, (image.width(), image.height()), Some(0.7), binding)
+                    .crop_for(Rotation::None)
+                    .unwrap();
+            for physical in [
+                Rotation::None,
+                Rotation::Cw90,
+                Rotation::Cw180,
+                Rotation::Cw270,
+            ] {
+                let rotated = rotate_image(&image, physical);
+                let saved = Rotation::from_degrees(-physical.degrees());
+                let results = detect_cover_crops(
+                    &rotated,
+                    (rotated.width(), rotated.height()),
+                    Some(0.7),
+                    binding,
+                );
+                assert_eq!(
+                    results.crop_for(saved),
+                    Some(rotate_crop(upright, physical)),
+                    "binding={binding:?} scan={scan} physical={physical:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn portrait_gate_uses_saved_rotation_and_the_unrotated_results_stay_declined() {
+    let (image, _) = jacket(ReadingDirection::Rtl, true, false, false, true);
+    let portrait = DynamicImage::ImageRgb8(image).rotate90();
+    let dims = (portrait.width(), portrait.height());
+    let results = detect_cover_crops(&portrait, dims, Some(0.7), ReadingDirection::Rtl);
+    assert_eq!(results.crop_for(Rotation::None), None);
+    assert_eq!(results.crop_for(Rotation::Cw180), None);
+    assert_eq!(
+        detect_cover_crop_at_rotation(
+            &portrait,
+            dims,
+            Some(0.7),
+            ReadingDirection::Rtl,
+            Rotation::None
+        ),
+        Err(AutoCropDecline::RawAspectGate)
+    );
+    assert!(results.crop_for(Rotation::Cw270).is_some());
+}
+
+#[test]
+fn saved_quarter_turn_reduces_only_after_restoring_the_upright_analysis_height() {
+    let (image, _) = jacket(ReadingDirection::Rtl, true, true, true, true);
+    let upright = DynamicImage::ImageRgb8(image);
+    let portrait = upright.rotate90();
+    let correct = analysis_raster(&portrait.rotate270());
+    assert_eq!(correct, analysis_raster(&upright));
+    // Reducing a portrait first irreversibly loses horizontal detail and leaves
+    // a different analysis height after rotating; it cannot be reused here.
+    let wrong_order = image::imageops::rotate270(&analysis_raster(&portrait));
+    assert_ne!(correct.dimensions(), wrong_order.dimensions());
+    let expected = cover_auto_crop(
+        &correct,
+        (upright.width(), upright.height()),
+        Some(0.7),
+        ReadingDirection::Rtl,
+    )
+    .unwrap();
+    let result = detect_cover_crops(
+        &portrait,
+        (portrait.width(), portrait.height()),
+        Some(0.7),
+        ReadingDirection::Rtl,
+    );
+    assert_eq!(
+        result.crop_for(Rotation::Cw270),
+        Some(rotate_crop(expected, Rotation::Cw90))
     );
 }
 

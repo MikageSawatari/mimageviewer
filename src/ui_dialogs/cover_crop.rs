@@ -64,7 +64,7 @@ struct PreparedCover {
     source: FolderPinSource,
     rotation_key: Option<String>,
     crop: Option<CoverCrop>,
-    auto_crop: Option<CoverCrop>,
+    auto_crops: Option<crate::cover_auto_material::AutoCropResults>,
     auto_enabled: bool,
     image: egui::ColorImage,
 }
@@ -338,7 +338,11 @@ impl App {
                             ),
                             rotation,
                             crop: rotate_rect(
-                                crop_rect(prepared.crop.or(prepared.auto_crop)),
+                                crop_rect(prepared.crop.or_else(|| {
+                                    prepared
+                                        .auto_crops
+                                        .and_then(|crops| crops.crop_for(rotation))
+                                })),
                                 rotation,
                             ),
                             had_manual_crop: prepared.crop.is_some(),
@@ -579,10 +583,9 @@ fn prepare_cover_inner(
                 }
                 .is_some()
             });
-    let auto_crop = if auto_enabled
+    let auto_crops = if auto_enabled
         && cover.cover_crop.is_none()
         && !has_edit_preview
-        && u64::from(image.width()) * 100 >= u64::from(image.height()) * 85
         && !cancel.load(Ordering::Relaxed)
     {
         let page_aspect = match &cover.location {
@@ -606,13 +609,52 @@ fn prepare_cover_inner(
             }),
             _ => None,
         };
-        crate::cover_auto_crop::cover_auto_crop(
-            &crate::cover_auto_crop::analysis_raster(&image),
-            (image.width(), image.height()),
-            page_aspect,
-            env.default_reading_direction,
-        )
-        .ok()
+        let analysis = match &cover.location {
+            ReadLocation::PdfPage { pdf, page } => {
+                use crate::pdf_loader::{CancelWaitPolicy, JobPriority, PdfRenderValidity};
+                crate::thumb_loader::decode_cover_auto_analysis_pdf(
+                    pdf,
+                    cover.epub_read.as_ref(),
+                    *page,
+                    cover.pdf_password.as_deref(),
+                    Some(cancel),
+                    JobPriority::Normal,
+                    PdfRenderValidity::Unscoped,
+                    CancelWaitPolicy::AbortOnCancel,
+                )
+            }
+            ReadLocation::File(path) => crate::thumb_loader::decode_cover_auto_analysis_image(
+                crate::image_decode::Source::Path(path),
+                Some(&image),
+                Some(cancel),
+            ),
+            ReadLocation::ArchiveEntry { entry, .. } => {
+                crate::thumb_loader::decode_cover_auto_analysis_image(
+                    crate::image_decode::Source::Bytes {
+                        bytes: cover
+                            .preloaded_bytes
+                            .as_deref()
+                            .ok_or("書庫の画像を読み込めませんでした")?,
+                        hint: entry,
+                    },
+                    Some(&image),
+                    Some(cancel),
+                )
+            }
+            _ => unreachable!(),
+        };
+        match analysis {
+            Ok(analysis) => Some(crate::cover_auto_crop::detect_cover_crops(
+                &analysis.image,
+                analysis.native_dims,
+                page_aspect,
+                env.default_reading_direction,
+            )),
+            Err(error) => {
+                crate::logger::log(format!("cover crop dialog analysis failed: {error}"));
+                None
+            }
+        }
     } else {
         None
     };
@@ -626,7 +668,7 @@ fn prepare_cover_inner(
         source: cover.persistent_source,
         rotation_key: cover.rotation_key,
         crop: cover.cover_crop,
-        auto_crop,
+        auto_crops,
         auto_enabled,
         image: egui::ColorImage::from_rgba_unmultiplied(
             [rgba.width() as usize, rgba.height() as usize],
@@ -1017,7 +1059,7 @@ mod tests {
             },
             rotation_key: None,
             crop,
-            auto_crop: None,
+            auto_crops: None,
             auto_enabled: false,
             image: egui::ColorImage::new(
                 [120, 80],
@@ -1099,6 +1141,55 @@ mod tests {
     }
 
     #[test]
+    fn cover_crop_late_prepare_selects_current_angle_and_saves_source_coordinates() {
+        let automatic = CoverCrop::new([0, 0, 500_000, 1_000_000]).unwrap();
+        let manual = CoverCrop::new([100_000, 200_000, 600_000, 900_000]).unwrap();
+        for (saved, expected_screen) in
+            [(None, [0.0, 0.0, 1.0, 0.5]), (manual, [0.1, 0.1, 0.8, 0.6])]
+        {
+            let (mut app, tx, root, _) = fake_loading_app();
+            let mut prepared = fake_prepared(saved);
+            prepared.rotation_key = Some("delayed-cover-page".into());
+            prepared.auto_crops = Some(crate::cover_auto_material::AutoCropResults::new([
+                None, automatic, None, None,
+            ]));
+            prepared.auto_enabled = true;
+            // The worker material has no captured angle. A later owner update wins.
+            app.update_rotation_page_owner([("delayed-cover-page".into(), Rotation::Cw90)]);
+            tx.send((7, Ok(prepared))).ok().unwrap();
+            let mut h = app_harness(app);
+            h.run_steps(4);
+            let Phase::Ready(draft) = &h.state().cover_crop_dialog.as_ref().unwrap().phase else {
+                panic!("prepared rotated crop");
+            };
+            assert_eq!(draft.rotation, Rotation::Cw90);
+            for (actual, expected) in [
+                draft.crop.min_x,
+                draft.crop.min_y,
+                draft.crop.max_x,
+                draft.crop.max_y,
+            ]
+            .into_iter()
+            .zip(expected_screen)
+            {
+                assert!((actual / UNIT as f32 - expected).abs() < 0.000_001);
+            }
+            h.get_by_label(OK_LABEL).click();
+            h.run_steps(2);
+            assert_eq!(
+                h.state()
+                    .folder_thumb_pin_db
+                    .as_ref()
+                    .unwrap()
+                    .lookup(&root)
+                    .unwrap()
+                    .cover_crop,
+                saved.or(automatic)
+            );
+        }
+    }
+
+    #[test]
     fn cover_crop_initial_range_prefers_manual_then_auto_then_full() {
         let manual = CoverCrop::new([100_000, 0, 500_000, 1_000_000]).unwrap();
         let automatic = CoverCrop::new([500_000, 0, 950_000, 1_000_000]).unwrap();
@@ -1109,7 +1200,9 @@ mod tests {
         ] {
             let (app, tx, _, _) = fake_loading_app();
             let mut prepared = fake_prepared(manual_crop);
-            prepared.auto_crop = auto_crop;
+            prepared.auto_crops = Some(crate::cover_auto_material::AutoCropResults::new(
+                [auto_crop; 4],
+            ));
             prepared.auto_enabled = true;
             tx.send((7, Ok(prepared))).ok().unwrap();
             let mut h = app_harness(app);
@@ -1151,7 +1244,7 @@ mod tests {
         let (app, tx, root, _) = fake_loading_app();
         let crop = CoverCrop::new([500_000, 0, 1_000_000, 1_000_000]).unwrap();
         let mut prepared = fake_prepared(None);
-        prepared.auto_crop = crop;
+        prepared.auto_crops = Some(crate::cover_auto_material::AutoCropResults::new([crop; 4]));
         prepared.auto_enabled = true;
         tx.send((7, Ok(prepared))).ok().unwrap();
         let mut h = app_harness(app);

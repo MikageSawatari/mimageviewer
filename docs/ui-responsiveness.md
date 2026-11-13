@@ -511,6 +511,9 @@ sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを
 失敗はログとトーストで通知する。
 自動切り出しも同じ準備 worker 内で行う。UI では ON/OFF・既定綴じ方向と編集 preview DB の handle だけを捕捉する。
 固定ページの有効な preview 照合、近傍ページの寸法先読み、高さ256の raster 解析は worker の仕事である。
+判定用decode（JPEGは高さ1024以上の最小DCT倍率、PDFは高さ1024、その他は全体）はworker・範囲画面・評価器で共有する。
+workerは4方向の範囲と全体画素を一度作って運び、UIは在メモリの保存回転を引いて純粋な `auto_crop_view` で範囲を選ぶ。
+回転変更・遅着・退避一覧の復元に伴う再判定、キャッシュ追い出し、同期I/Oは追加しない。
 ZIP は最大8×256KBの先頭読み、PDF/EPUB は代表と同じ password・`ReadTarget` の `PageSizes` を使う。
 通常のサムネイル生成では cache miss の時だけ判定し、`CacheOnly` や idle の周期起床に解析を足さない。
 設定変更の反映には既存の種類表示変更と同じ一覧読み直しを使い、専用の live rebuild 状態を追加しない。

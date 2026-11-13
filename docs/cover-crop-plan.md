@@ -1078,3 +1078,48 @@ r2 = REVISE (P2 1 件、ほかは r1 の指摘を閉じた)。v2 キーで `auto
 自動フォルダの保存) は、3 つのどれかを必ず書く (省略可能な引数や既定値で NULL にしない)。
 テスト: `Automatic`・`NotAutomatic` (通常画像の自動フォルダ)・`LegacyV1` (K2 の v1 互換で作った親) のそれぞれで、保存 → catalog を開き直す → K2 で再流用 →
 送信 まで素材の種類と画素が保たれる。NULL の v2 行は読み損ねになる。
+
+### 21.11 実装記録 (2026-11-14)
+
+- `cover_auto_material.rs` に `AutoMaterial`・4方向の結果・単一codec・純粋な `auto_crop_view` を置いた。
+  catalogの追加列、既存ROのschema世代、workerの送信、UIのLoaded、子の行のコピー、退避一覧の復元を同じ素材でつないだ。
+- 自動の基本キーをv2に変更し、K2だけはv2の子の行が存在しない場合に同じ子のv1行を `LegacyV1` として読む。
+  v1は存続キーへ足さず、壊れた／古いv2からv1へ戻らない。自動OFF・手動のキーの綴りは変えない。
+- `thumb_loader/cover_auto_analysis.rs` の固定デコードをworker・範囲画面・評価器が共用する。判定前に各方向へ回し、結果を回転前座標へ戻す。
+  判定そのものは変えていない。近傍ページの比率は0°のままとした。
+- 全体画素の解像度を表示用・保存用に別々に決め、全方向の範囲の有効長辺と4096の上限を確認する。
+  既存の縦横比を正確にする整数寸法の選択は要求長辺より小さくなる場合があるため、実際のfit寸法で必要量を補正する。
+  この補正は自動素材だけに適用し、通常／手動の縮小処理は変えない。
+- グリッドのUV・寸法・当たり判定・再描画、詳細ホバー、コレクション並べ替え、品質判定が現在の角度の範囲を使う。
+  一覧の比率サンプルはLoaded／catalogのどちらも0°の結果を使う。回転の変更に追い出し・再判定・新しい同期I/Oを加えていない。
+- 範囲画面は準備の遅着後もメモリ上の現在の回転から自動範囲を選び、手動範囲を優先する。
+  補足文は実際に置かれている環境設定のサムネイル頁で「閲覧表示の横連結の方向」に合わせた。
+- 回帰テスト: `saved_rotation_detection_matches_upright_jacket_in_source_coordinates`、
+  `portrait_gate_uses_saved_rotation_and_the_unrotated_results_stay_declined`、
+  `saved_quarter_turn_reduces_only_after_restoring_the_upright_analysis_height`、`cover_auto_analysis_*`、
+  `auto_material_*`、`auto_cover_crop_pdf_fixed_analysis_keeps_password_and_read_lease`、
+  `auto_cover_late_pixels_keep_four_way_material_and_use_live_angle`、
+  `auto_cover_paint_and_hit_geometry_follow_current_angle_without_reupload`、
+  `cover_crop_late_prepare_selects_current_angle_and_saves_source_coordinates`。
+  既存の `cover_rotation_snapshot_return_reconciles_retained_legacy_and_preserves_current_material` も4方向素材の復元を検査する。
+- 焦点nextest: `cover_auto / cover_crop / representative_cache_key / folder_thumb / catalog / cover_rotation /
+  color_filter / grid_paint / snapshot_ops` と素材のテスト、計592件成功。評価器の対照条件追加後に `cover_auto` 47件も成功。
+- 共通の判定用decodeによるdirectory evaluation（画像の回転0/90/180/270°に対し、保存回転0/270/180/90°）:
+
+  | 入力 | 画像の回転 | 陽性good | wrong | 負例の切り出し | 負例の見送り |
+  |---|---|---:|---:|---:|---:|
+  | dummies | 0/90/180/270°すべて | 36 | 0 | 0 | 22 |
+  | realistic | 0/90/270° | 31 | 0 | 0 | 30 |
+  | realistic | 180° | 32 | 0 | 0 | 30 |
+  | realistic（0°、再符号化だけの対照） | 0° | 32 | 0 | 0 | 30 |
+
+  wrong・負例・陽性goodの下限は全方向で基準を満たしたが、**realisticの4方向の件数完全一致は未達**。
+  回転したZIPのJPEG表紙は評価器で品質95へ再符号化する。`MIV_COVER_AUTO_EVAL_REENCODE_INPUT=1` の対照を加え、
+  回転なしでも同じ再符号化経路で31→32になることを確認した。元の0°との寸法・DCT倍率の差はなく、成否の変化は1冊。
+  再符号化対照と180°は冊別の成否が2冊で異なり、差を再圧縮だけで説明できたとは断定しない。
+  同一画素を回す純粋な回帰テストは4方向で一致している。件数をそろえるための判定変更は行わず、この評価差は設計担当の確認事項として残す。
+  出力は `target/cover-auto-eval-{dummies,realistic}-773/rot{0,90,180,270}`、対照はrealistic側の `reencode0-control`。
+  評価入力・sheetの内容は閲覧せず、§22の利用者データは使っていない。
+- UI snapshotは257件成功。補足文の変更だけを含む `tests/snapshots/preferences_favorite_view_state_dark.png` を更新し、
+  差分を目視確認した。既存の小画面・最小幅・画像高さ・再オープンのテストも成功。
+  `cargo fmt`、`git diff --check`、`python scripts/check_ui_glyphs.py` も成功（危険glyphなし）。

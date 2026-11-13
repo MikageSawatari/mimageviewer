@@ -19037,9 +19037,18 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 )
             });
         let rotation = self.grid_tile_rotation_memory(idx);
-        let image_size = texture
+        let view = texture
             .as_ref()
-            .map(|tex| details_thumbnail_preview_size(tex.size_vec2(), rotation))
+            .zip(self.thumbnails.get(idx))
+            .map(|(tex, thumb)| thumb.tile_view_for_texture(tex, rotation));
+        let image_size = view
+            .as_ref()
+            .map(|view| {
+                details_thumbnail_preview_size(
+                    view.displayed_size,
+                    crate::rotation_db::Rotation::None,
+                )
+            })
             .unwrap_or_else(|| egui::vec2(180.0, 120.0));
         let padding = 8.0;
         let viewport_size = image_size + egui::vec2(padding * 2.0, padding * 2.0);
@@ -19083,7 +19092,15 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     let rect = ui.max_rect().shrink(padding);
                     if let Some(tex) = texture.as_ref() {
                         let img_rect = egui::Rect::from_center_size(rect.center(), image_size);
-                        crate::app::draw_rotated_image(ui.painter(), tex.id(), img_rect, rotation);
+                        crate::app::draw_rotated_image_uv_ex(
+                            ui.painter(),
+                            tex.id(),
+                            img_rect,
+                            view.expect("loaded tooltip has a material view").uv,
+                            rotation,
+                            0.0,
+                            img_rect.center(),
+                        );
                         if is_audio && let Some(parts) = audio_parts {
                             let marker_rect = if parts.music_icon {
                                 egui::Rect::from_center_size(

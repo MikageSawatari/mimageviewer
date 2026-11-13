@@ -1413,6 +1413,7 @@ mod tests {
                 Some((8, 8)),
                 &webp(),
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         with_pdf(
@@ -1456,6 +1457,7 @@ mod tests {
                 Some((8, 8)),
                 &webp(),
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let cover = readable(resolve_book_cover(&root, BookKind::Folder, &env));
@@ -1510,6 +1512,7 @@ mod tests {
                 Some((8, 8)),
                 &webp(),
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         with_pdf(
@@ -1603,6 +1606,7 @@ mod tests {
                 Some((8, 8)),
                 &webp,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let automatic = LoadRequest {
@@ -1654,6 +1658,7 @@ mod tests {
                 Some(P::AutoSelected),
                 Some(&fallback_proof),
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let before = parent_catalog.load_one(&child_key).unwrap().unwrap();

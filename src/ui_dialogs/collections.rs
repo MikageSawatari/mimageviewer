@@ -446,16 +446,37 @@ struct CollectionGridSnapshotRequest {
 }
 
 #[derive(Clone)]
+struct CollectionReorderTexture {
+    texture: egui::TextureHandle,
+    view: crate::cover_auto_material::AutoCropView,
+    rotation: crate::rotation_db::Rotation,
+}
+
+impl CollectionReorderTexture {
+    fn paint(&self, painter: &egui::Painter, rect: egui::Rect) {
+        crate::app::draw_rotated_image_uv_ex(
+            painter,
+            self.texture.id(),
+            rect,
+            self.view.uv,
+            self.rotation,
+            0.0,
+            rect.center(),
+        );
+    }
+}
+
+#[derive(Clone)]
 struct CollectionReorderEntry {
     entry: CollectionEntry,
-    texture: Option<egui::TextureHandle>,
+    texture: Option<CollectionReorderTexture>,
 }
 
 struct CollectionReorderProjection {
     receiver: std::sync::mpsc::Receiver<Result<Vec<CollectionEntryId>, CollectionPrepareError>>,
     selected_entry_id: Option<CollectionEntryId>,
     cancel: Arc<AtomicBool>,
-    textures: HashMap<CollectionEntryId, egui::TextureHandle>,
+    textures: HashMap<CollectionEntryId, CollectionReorderTexture>,
 }
 
 impl Drop for CollectionReorderProjection {
@@ -513,7 +534,7 @@ fn prepare_collection_reorder_projection(
     display_order: crate::settings::GridDisplayOrder,
     visibility: crate::file_type_visibility::FileTypeVisibility,
     selected_entry_id: Option<CollectionEntryId>,
-    textures: HashMap<CollectionEntryId, egui::TextureHandle>,
+    textures: HashMap<CollectionEntryId, CollectionReorderTexture>,
 ) -> CollectionReorderPhase {
     let (tx, receiver) = std::sync::mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1497,7 +1518,7 @@ impl App {
         &self,
         collection_id: CollectionId,
         revision: u64,
-    ) -> HashMap<CollectionEntryId, egui::TextureHandle> {
+    ) -> HashMap<CollectionEntryId, CollectionReorderTexture> {
         let Some(session) = self.top_level_grid_view.collection_session() else {
             return HashMap::new();
         };
@@ -1531,7 +1552,19 @@ impl App {
                             _ => None,
                         }
                     })?;
-                Some((entry.entry_id, texture))
+                let rotation = self.grid_tile_rotation_memory(index);
+                let view = self
+                    .thumbnails
+                    .get(index)?
+                    .tile_view_for_texture(&texture, rotation);
+                Some((
+                    entry.entry_id,
+                    CollectionReorderTexture {
+                        texture,
+                        view,
+                        rotation,
+                    },
+                ))
             })
             .collect()
     }
@@ -4931,7 +4964,7 @@ impl App {
                                                 let image_rect =
                                                     rect.shrink2(egui::vec2(6.0, 18.0));
                                                 if let Some(texture) = texture.as_ref() {
-                                                    let size = texture.size_vec2();
+                                                    let size = texture.view.displayed_size;
                                                     let scale = (image_rect.width() / size.x)
                                                         .min(image_rect.height() / size.y)
                                                         .min(1.0);
@@ -4939,15 +4972,7 @@ impl App {
                                                         image_rect.center(),
                                                         size * scale,
                                                     );
-                                                    ui.painter().image(
-                                                        texture.id(),
-                                                        paint_rect,
-                                                        egui::Rect::from_min_max(
-                                                            egui::Pos2::ZERO,
-                                                            egui::pos2(1.0, 1.0),
-                                                        ),
-                                                        egui::Color32::WHITE,
-                                                    );
+                                                    texture.paint(ui.painter(), paint_rect);
                                                 } else {
                                                     ui.painter().text(
                                                         image_rect.center(),
@@ -4966,7 +4991,7 @@ impl App {
                                                 );
                                                 let response = response.on_hover_ui(|ui| {
                                                     if let Some(texture) = texture.as_ref() {
-                                                        let size = texture.size_vec2();
+                                                        let size = texture.view.displayed_size;
                                                         let scale = (360.0 / size.x)
                                                             .min(360.0 / size.y)
                                                             .min(2.5);
@@ -4975,15 +5000,7 @@ impl App {
                                                                 size * scale,
                                                                 egui::Sense::hover(),
                                                             );
-                                                        ui.painter().image(
-                                                            texture.id(),
-                                                            preview_rect,
-                                                            egui::Rect::from_min_max(
-                                                                egui::Pos2::ZERO,
-                                                                egui::pos2(1.0, 1.0),
-                                                            ),
-                                                            egui::Color32::WHITE,
-                                                        );
+                                                        texture.paint(ui.painter(), preview_rect);
                                                     } else {
                                                         ui.label("サムネイルを準備中");
                                                     }

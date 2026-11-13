@@ -203,7 +203,7 @@ fn check_screen_crop(rotation: Rotation, displayed: [u32; 4], pdf: bool, jpeg: b
             source: cover.persistent_source,
             rotation_key: cover.rotation_key,
             crop: None,
-            auto_crop: None,
+            auto_crops: None,
             auto_enabled: false,
             image: egui::ColorImage::from_rgb([48, 32], pattern().to_rgb8().as_raw()),
         }

@@ -273,6 +273,7 @@ pub(crate) fn generate_with_options(
                 ));
             }
             let entry = CacheEntry {
+                auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 cover: crate::cover_identity::CoverIdentity::Unrotatable,
                 mtime: original.mtime_secs,
                 file_size: original.file_size,

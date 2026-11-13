@@ -1432,7 +1432,7 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
             &mut state.settings.thumb_cover_auto_crop,
             "つながった表紙から表表紙を自動で切り出す (書庫・PDF の本)",
         );
-        ui.small("既定の綴じ方向で判定します。手動で指定した範囲を優先し、判定できない表紙は全体を表示します。");
+        ui.small("閲覧表示の横連結の方向で判定します。手動で指定した範囲を優先し、判定できない表紙は全体を表示します。");
     });
     anchored(ui, state, "thumbnail/name-font-scale", |ui, state| {
         ui.horizontal_wrapped(|ui| {

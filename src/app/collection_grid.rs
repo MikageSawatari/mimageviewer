@@ -376,6 +376,7 @@ pub(in crate::app) fn prepare_collection_grid_live_thumbnail_sources(
         folder_pin_cache.insert(
             seed.cache_key.clone(),
             crate::catalog::CacheEntry {
+                auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 cover: crate::cover_identity::CoverIdentity::Page(
                     crate::adjustment_db::normalize_path(&seed.video_path),
                 ),
@@ -6374,6 +6375,7 @@ mod tests {
                     .unwrap()
                     .into_owned(),
                 crate::catalog::CacheEntry {
+                    auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                     cover: crate::cover_identity::CoverIdentity::Legacy,
                     mtime: 1,
                     file_size: 5,
@@ -11452,6 +11454,7 @@ mod tests {
                     None,
                     b"thumb",
                     &crate::cover_identity::CoverIdentity::Legacy,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 )
                 .unwrap();
         }
@@ -11465,6 +11468,7 @@ mod tests {
                 None,
                 b"removed",
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         open(&mut app, normal_first);
@@ -11559,6 +11563,7 @@ mod tests {
                     None,
                     b"thumb",
                     &crate::cover_identity::CoverIdentity::Legacy,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 )
                 .unwrap();
         }
@@ -11573,6 +11578,7 @@ mod tests {
                 None,
                 b"legacy",
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let snapshot =

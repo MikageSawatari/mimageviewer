@@ -245,6 +245,7 @@ mod tests {
                 Some((12, 8)),
                 &bytes,
                 &CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let memory = RwLock::new(catalog.load_all().unwrap());
@@ -550,6 +551,7 @@ mod tests {
                 None,
                 b"same unrotated pixels",
                 &crate::cover_identity::CoverIdentity::Page(original_key.clone()),
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let reader = crate::catalog::CatalogDb::open_existing_read_only(
@@ -623,7 +625,17 @@ mod tests {
             );
             let writer = crate::catalog::CatalogDb::open(cache.path(), &library).unwrap();
             writer
-                .save("archivethumb:book.rar", 1, 2, 2, 1, None, b"pixels", &cover)
+                .save(
+                    "archivethumb:book.rar",
+                    1,
+                    2,
+                    2,
+                    1,
+                    None,
+                    b"pixels",
+                    &cover,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
+                )
                 .unwrap();
             drop(writer);
             let reader = crate::catalog::CatalogDb::open_existing_read_only(cache.path(), &library)

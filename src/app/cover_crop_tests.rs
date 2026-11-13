@@ -155,6 +155,7 @@ fn cover_crop_drive_catalog_prefix_skips_newer_cropped_and_auto_rows() {
         ("17|23", 17),
         ("crop:0,0,500000,1000000|30|23", 30),
         ("40|23|autocrop:v1:rtl", 40),
+        ("50|23|autocrop:v2:rtl", 50),
     ] {
         db.save_thumb_bytes(
             &format!("{prefix}{suffix}"),
@@ -163,6 +164,7 @@ fn cover_crop_drive_catalog_prefix_skips_newer_cropped_and_auto_rows() {
             Some((1, 1)),
             &thumbnail_bytes(),
             &crate::cover_identity::CoverIdentity::Unknown,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic,
         )
         .unwrap();
     }
@@ -282,6 +284,7 @@ fn cover_crop_completed_rows_survive_cleanup_and_replaced_crops_do_not_for_folde
                     Some((4, 10)),
                     &thumbnail_bytes(),
                     &crate::cover_identity::CoverIdentity::Unknown,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 )
                 .unwrap();
             catalog.delete_missing(&existing).unwrap();
@@ -390,6 +393,7 @@ fn cover_crop_zipdir_changed_crop_replaces_existing_key_and_prunes_old_row() {
                 Some((4, 10)),
                 &thumbnail_bytes(),
                 &crate::cover_identity::CoverIdentity::Unknown,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         catalog.delete_missing(&prepared.existing_keys).unwrap();
@@ -466,6 +470,7 @@ fn cover_crop_epub_completed_key_retention_matches_existing_1742_limit() {
                 Some((4, 10)),
                 &thumbnail_bytes(),
                 &crate::cover_identity::CoverIdentity::Unknown,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         assert!(catalog.load_one(&key).unwrap().is_some());

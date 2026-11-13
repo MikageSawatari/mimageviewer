@@ -11655,6 +11655,7 @@ pub(super) mod tests {
                 Some((8, 8)),
                 &webp,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         }
@@ -12019,6 +12020,7 @@ pub(super) mod tests {
                     Some((8, 8)),
                     &webp,
                     &crate::cover_identity::CoverIdentity::Legacy,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 )
                 .unwrap();
             let response = engine.thumbnail(
@@ -13452,6 +13454,7 @@ pub(super) mod tests {
                 Some((120, 60)),
                 b"old",
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let _pin = crate::pdf_loader::pin_epub_for_test(&epub, 802, pdf.len() as u64);
@@ -13488,6 +13491,7 @@ pub(super) mod tests {
                 None,
                 &old_webp,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let _pin = crate::pdf_loader::pin_epub_for_test(&epub, 901, pdf.len() as u64);
@@ -13507,6 +13511,7 @@ pub(super) mod tests {
                         None,
                         &new_webp,
                         &crate::cover_identity::CoverIdentity::Legacy,
+                        crate::cover_auto_material::AutoMaterial::NotAutomatic,
                     )
                     .unwrap();
             }),
@@ -13570,6 +13575,7 @@ pub(super) mod tests {
                 None,
                 &old_webp,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         open_parent_catalog(&epub)
@@ -13593,6 +13599,7 @@ pub(super) mod tests {
                         None,
                         &new_webp,
                         &crate::cover_identity::CoverIdentity::Legacy,
+                        crate::cover_auto_material::AutoMaterial::NotAutomatic,
                     )
                     .unwrap();
             }),
@@ -13859,6 +13866,7 @@ pub(super) mod tests {
                 Some((48, 96)),
                 &webp,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let engine = ContainerEngine::new(crate::settings::Settings {
@@ -15152,6 +15160,7 @@ pub(super) mod tests {
                     Some((503, 727)),
                     b"thumb",
                     &crate::cover_identity::CoverIdentity::Legacy,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 )
                 .unwrap();
         }
@@ -15353,6 +15362,7 @@ pub(super) mod tests {
                         Some((96, 48)),
                         &webp,
                         &cover,
+                        crate::cover_auto_material::AutoMaterial::NotAutomatic,
                     )
                     .unwrap();
                 let response = engine.thumbnail(&request, &context);
@@ -15776,6 +15786,7 @@ pub(super) mod tests {
                 Some((8, 8)),
                 &webp,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         drop(catalog);

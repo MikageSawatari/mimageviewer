@@ -448,6 +448,7 @@ fn cover_auto_existing_file_keys_match_writer_and_retire_previous_binding() {
                         Some((4, 10)),
                         &saved_bytes(),
                         &crate::cover_identity::CoverIdentity::Unknown,
+                        crate::cover_auto_material::AutoMaterial::NotAutomatic,
                     )
                     .unwrap();
                 }
@@ -532,6 +533,7 @@ fn cover_auto_zipdir_pinned_and_unpinned_rows_survive_current_binding_only() {
                     Some((4, 10)),
                     &saved_bytes(),
                     &crate::cover_identity::CoverIdentity::Unknown,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 )
                 .unwrap();
                 db.delete_missing(&prepared.existing_keys).unwrap();
@@ -598,6 +600,7 @@ fn cover_auto_epub_completed_generation_retains_documented_1742_boundary() {
             Some((4, 10)),
             &saved_bytes(),
             &crate::cover_identity::CoverIdentity::Unknown,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic,
         )
         .unwrap();
         db.delete_missing(&keep).unwrap();
