@@ -3,7 +3,7 @@ use super::*;
 struct ColorScanWorkItem {
     key: crate::color_search::ColorPaletteKey,
     req: LoadRequest,
-    pin_source: Option<crate::folder_thumb_pins::FolderPinSource>,
+    pin_source: Option<crate::folder_thumb_pins::FolderPin>,
 }
 
 const COLOR_SCAN_CONFIRM_MISSING_THRESHOLD: usize = 2_000;
@@ -29,18 +29,26 @@ pub(super) fn color_filter_representative_supported(item: &GridItem) -> bool {
 fn color_representative_key(
     item: &GridItem,
     storage_key: &str,
-    pin: Option<&crate::folder_thumb_pins::FolderPinSource>,
+    pin: Option<&crate::folder_thumb_pins::FolderPin>,
     pin_stamp: Option<crate::folder_thumb_pins::FolderPinMutationStamp>,
     depth: u32,
     revision: u64,
 ) -> String {
     // The root selection plus DB revision identifies cascade selections without UI-thread
     // stat/DB lookups. The worker resolves the canonical #pin: storage suffix as usual.
-    format!(
-        "{}|representative:{storage_key:?}#pin:{pin:?}|cascade:{:?}:{depth}|thumb:{revision}",
+    // Keep the released Option<FolderPinSource> spelling exactly when no crop
+    // exists; wrapping it in FolderPin would invalidate existing pinned palettes.
+    let source = pin.map(|pin| &pin.source);
+    let mut key = format!(
+        "{}|representative:{storage_key:?}#pin:{source:?}|cascade:{:?}:{depth}|thumb:{revision}",
         item.perf_key(),
         pin.and(pin_stamp)
-    )
+    );
+    if let Some(crop) = pin.and_then(|pin| pin.cover_crop) {
+        let [x0, y0, x1, y1] = crop.values();
+        key.push_str(&format!("|crop:{x0},{y0},{x1},{y1}"));
+    }
+    key
 }
 
 fn color_scan_cache_decision(req: &LoadRequest, cache_decision: CacheDecision) -> CacheDecision {
@@ -724,14 +732,33 @@ impl App {
                 Some(self.settings.folder_thumb_sort),
                 self.settings.folder_thumb_depth,
             )?;
-            let storage_key = crate::thumb_loader::representative_cache_key_for_policy(
-                &storage_key,
-                self.listing_file_type_visibility(),
-            );
             let pin = item.container_path().and_then(|path| {
                 self.folder_pin_map
                     .get(&crate::path_key::normalize_keep_drive(path))
             });
+            let auto = self.thumbnail_auto_crop_identity().filter(|_| {
+                pin.is_none_or(|pin| {
+                    let mut probe = LoadRequest {
+                        cover_crop: pin.cover_crop,
+                        ..Default::default()
+                    };
+                    match &pin.source {
+                        crate::folder_thumb_pins::FolderPinSource::ZipEntry { entry, .. } => {
+                            probe.zip_entry = Some(entry.clone())
+                        }
+                        crate::folder_thumb_pins::FolderPinSource::File { rel, .. } => {
+                            probe.path = PathBuf::from(rel)
+                        }
+                        _ => {}
+                    }
+                    auto_crop_leaf_allowed(&probe)
+                })
+            });
+            let storage_key = crate::thumb_loader::representative_cache_key_for_policy_with_auto(
+                &storage_key,
+                self.listing_file_type_visibility(),
+                auto,
+            );
             color_representative_key(
                 item,
                 &storage_key,
@@ -763,7 +790,7 @@ impl App {
         }
         let (mtime, file_size) = self.image_metas.get(idx).copied().flatten()?;
         let empty_pins = std::collections::HashMap::new();
-        let mut req = make_load_request_with_visibility(
+        let mut req = make_load_request_with_auto_crop(
             item,
             idx,
             mtime,
@@ -784,6 +811,7 @@ impl App {
             self.video_pin_db.as_ref(),
             self.use_full_path_cache_keys(),
             self.listing_file_type_visibility(),
+            self.thumbnail_auto_crop_identity(),
         )?;
         req.relative_page_provenance = self.relative_page_provenance_for_idx(idx);
         self.attach_viewer_thumbnail_context(&mut req);
@@ -842,6 +870,7 @@ fn run_color_scan_worker(
         let mtime = item.req.mtime;
         let file_size = item.req.file_size;
         if let Some(source) = item.pin_source {
+            let auto = item.req.auto_cover_crop;
             let container = item.req.path.clone();
             let base_key = item
                 .req
@@ -870,6 +899,8 @@ fn run_color_scan_worker(
                 None,
                 password.as_deref(),
             );
+            item.req
+                .set_auto_cover_crop(auto.filter(|_| auto_crop_leaf_allowed(&item.req)));
         }
         let palette = load_palette_for_request(
             item.req,
@@ -1137,7 +1168,8 @@ mod tests {
             crate::folder_thumb_pins::FolderPinSource::PdfPage {
                 pdf_rel: String::new(),
                 page: 3,
-            },
+            }
+            .into(),
         );
         assert_eq!(env.color_missing_work_items().len(), 2);
         // UI construction must not stat/open this nonexistent PDF, even when pinned.
@@ -1194,6 +1226,43 @@ mod tests {
     }
 
     #[test]
+    fn cover_auto_color_identity_follows_binding_and_manual_range_without_source_io() {
+        let mut app = representative_app();
+        let off = app.color_identity_for_idx(0).unwrap().0;
+        app.settings.default_reading_direction = crate::settings::ReadingDirection::Ltr;
+        assert_eq!(app.color_identity_for_idx(0).unwrap().0, off);
+        app.settings.thumb_cover_auto_crop = true;
+        let ltr = app.color_identity_for_idx(0).unwrap().0;
+        assert_ne!(ltr, off);
+        assert!(ltr.contains("|autocrop:v1:ltr"));
+        let (_, request) = app.color_work_identity_for_idx(0).unwrap();
+        assert_eq!(
+            request.auto_cover_crop,
+            Some(crate::cover_auto_crop::AutoCropIdentity::new(
+                crate::settings::ReadingDirection::Ltr
+            ))
+        );
+        app.settings.default_reading_direction = crate::settings::ReadingDirection::Rtl;
+        assert_ne!(app.color_identity_for_idx(0).unwrap().0, ltr);
+        let path = app.items[0].container_path().unwrap().to_owned();
+        app.folder_pin_map.insert(
+            crate::path_key::normalize_keep_drive(&path),
+            crate::folder_thumb_pins::FolderPin {
+                source: crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+                    zip_rel: String::new(),
+                    entry: "cover.jpg".into(),
+                },
+                cover_crop: crate::folder_thumb_pins::CoverCrop::new([0, 0, 500_000, 1_000_000])
+                    .unwrap(),
+            },
+        );
+        let manual = app.color_identity_for_idx(0).unwrap().0;
+        assert!(!manual.contains("|autocrop:"));
+        app.settings.default_reading_direction = crate::settings::ReadingDirection::Ltr;
+        assert_eq!(app.color_identity_for_idx(0).unwrap().0, manual);
+    }
+
+    #[test]
     fn color_representative_cascade_pin_stamp_changes_identity_without_io() {
         let tmp = tempfile::tempdir().unwrap();
         let db = crate::folder_thumb_pins::FolderThumbPinDb::open_at(&tmp.path().join("pins.db"))
@@ -1203,8 +1272,11 @@ mod tests {
             zip_rel: String::new(),
             dir_prefix: "chapter/".into(),
         };
-        let key = |pin, stamp| {
-            color_representative_key(&item, "zipthumb:book.zip", pin, Some(stamp), 3, 0)
+        let key = |pin: Option<&crate::folder_thumb_pins::FolderPinSource>, stamp| {
+            let pin = pin.map(|source: &crate::folder_thumb_pins::FolderPinSource| {
+                crate::folder_thumb_pins::FolderPin::from(source.clone())
+            });
+            color_representative_key(&item, "zipthumb:book.zip", pin.as_ref(), Some(stamp), 3, 0)
         };
         let before = db.mutation_stamp();
         let pinned = key(Some(&source), before);
@@ -1269,7 +1341,7 @@ mod tests {
             vec![ColorScanWorkItem {
                 key: "test".into(),
                 req,
-                pin_source,
+                pin_source: pin_source.map(Into::into),
             }],
             cache_map,
             catalog,
@@ -1596,7 +1668,7 @@ mod tests {
         };
         let pins = std::collections::HashMap::from([(
             crate::path_key::normalize_keep_drive(&path),
-            source.clone(),
+            crate::folder_thumb_pins::FolderPin::from(source.clone()),
         )]);
         let pinned = apply_folder_thumb_pin(
             req.clone(),
@@ -2018,8 +2090,10 @@ mod tests {
                     entry: "pinned.png".into(),
                 }
             };
-            app.folder_pin_map
-                .insert(crate::path_key::normalize_keep_drive(&path), pin.clone());
+            app.folder_pin_map.insert(
+                crate::path_key::normalize_keep_drive(&path),
+                pin.clone().into(),
+            );
             assert_eq!(app.thumb_storage_scope(), ThumbStorageScope::MultiParent);
             let (_, req) = app.color_work_identity_for_idx(0).unwrap();
             let RequestCatalog::Parent { row, work } = &req.catalog_target else {
@@ -2147,5 +2221,50 @@ mod tests {
         assert_eq!(request.items_gen, app.items_generation);
         app.bump_render_epoch_only();
         assert!(request.pdf_render_validity.is_stale());
+    }
+}
+
+#[cfg(test)]
+mod cover_crop_identity_tests {
+    use super::*;
+    use crate::folder_thumb_pins::{CoverCrop, FolderPin, FolderPinSource};
+
+    #[test]
+    fn color_representative_no_crop_keys_preserve_released_literal_spelling() {
+        // Literal output of color_representative_key at c4e92e5df, before FolderPin.
+        // A relative filename keeps the production perf_key identical on every OS.
+        let item = GridItem::PdfFile(PathBuf::from("book.pdf"));
+        let pin = FolderPin::from(FolderPinSource::PdfPage {
+            pdf_rel: String::new(),
+            page: 1,
+        });
+        assert_eq!(
+            color_representative_key(&item, "pdfthumb:book.pdf", Some(&pin), None, 3, 0),
+            r##"pdffile::book.pdf|representative:"pdfthumb:book.pdf"#pin:Some(PdfPage { pdf_rel: "", page: 1 })|cascade:None:3|thumb:0"##
+        );
+        assert_eq!(
+            color_representative_key(&item, "pdfthumb:book.pdf", None, None, 3, 0),
+            r##"pdffile::book.pdf|representative:"pdfthumb:book.pdf"#pin:None|cascade:None:3|thumb:0"##
+        );
+    }
+
+    #[test]
+    fn cover_crop_color_filter_identity_tracks_range_changes_on_the_same_page() {
+        let item = GridItem::PdfFile(PathBuf::from("C:/books/book.pdf"));
+        let mut pin = FolderPin::from(FolderPinSource::PdfPage {
+            pdf_rel: String::new(),
+            page: 1,
+        });
+        let key = |pin: &FolderPin| {
+            color_representative_key(&item, "pdfthumb:book.pdf", Some(pin), None, 3, 0)
+        };
+        let original = key(&pin);
+        pin.cover_crop = CoverCrop::new([0, 0, 500_000, 1_000_000]).unwrap();
+        let first = key(&pin);
+        assert_ne!(first, original);
+        pin.cover_crop = CoverCrop::new([500_000, 0, 1_000_000, 1_000_000]).unwrap();
+        assert_ne!(key(&pin), first);
+        pin.cover_crop = None;
+        assert_eq!(key(&pin), original);
     }
 }

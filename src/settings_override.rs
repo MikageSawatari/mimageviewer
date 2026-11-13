@@ -110,10 +110,13 @@ pub(crate) fn apply(
     // 5.1's UTF8 encoding writes it, and so does Notepad. Rejecting a file over three invisible
     // bytes would be an error nobody could act on.
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-    let overlay: serde_json::Value = serde_json::from_str(text).map_err(OverrideError::NotJson)?;
+    let mut overlay: serde_json::Value =
+        serde_json::from_str(text).map_err(OverrideError::NotJson)?;
     if !overlay.is_object() {
         return Err(OverrideError::NotAnObject);
     }
+    crate::settings::canonicalize_container_icon_kinds(overlay.as_object_mut().unwrap())
+        .map_err(|error| OverrideError::Rejected(serde::de::Error::custom(error)))?;
 
     let mut current = serde_json::to_value(&*settings).map_err(OverrideError::Rejected)?;
     let mut changed = Vec::new();
@@ -163,6 +166,56 @@ fn merge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_icon_kinds_legacy_override_precedence_and_rejection() {
+        use crate::grid_item::ContainerIconKinds as Kinds;
+        let partial = Kinds {
+            folder: true,
+            archive: false,
+            pdf_epub: true,
+        };
+        for (json, expected) in [
+            (
+                serde_json::json!({"thumb_container_type_icon_only": true}),
+                Kinds::ALL,
+            ),
+            (
+                serde_json::json!({"thumb_container_type_icon_only": false}),
+                Kinds::NONE,
+            ),
+            (
+                serde_json::json!({"thumb_container_icon_kinds": partial, "thumb_container_type_icon_only": false}),
+                partial,
+            ),
+            (
+                serde_json::json!({"thumb_container_icon_kinds": partial, "thumb_container_type_icon_only": "bad"}),
+                partial,
+            ),
+        ] {
+            let mut settings = Settings {
+                thumb_container_icon_kinds: partial,
+                ..Settings::default()
+            };
+            apply(&mut settings, &overlay(&json.to_string()), true).unwrap();
+            assert_eq!(settings.thumb_container_icon_kinds, expected);
+        }
+        for json in [
+            serde_json::json!({"thumb_container_type_icon_only": "bad"}),
+            serde_json::json!({"thumb_container_icon_kinds": "bad", "thumb_container_type_icon_only": true}),
+            serde_json::json!({"thumb_container_icon_kinds": {"folder": "bad"}, "thumb_container_type_icon_only": true}),
+        ] {
+            let mut settings = Settings {
+                thumb_container_icon_kinds: partial,
+                ..Settings::default()
+            };
+            assert!(matches!(
+                apply(&mut settings, &overlay(&json.to_string()), true),
+                Err(OverrideError::Rejected(_))
+            ));
+            assert_eq!(settings.thumb_container_icon_kinds, partial);
+        }
+    }
 
     fn overlay(json: &str) -> OsString {
         OsString::from(json)

@@ -242,7 +242,7 @@ pub(crate) struct ReusedSmartFolderMetadata {
     mask_paths: HashSet<String>,
     conceal_paths: HashSet<String>,
     comic_paths: HashSet<String>,
-    folder_pin_map: HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    folder_pin_map: HashMap<String, crate::folder_thumb_pins::FolderPin>,
     converted_archive_cache_paths: HashMap<String, ConvertedArchiveSourceState>,
 }
 
@@ -321,7 +321,7 @@ pub(crate) struct SmartFolderPreparedGrid {
     mask_pages: HashSet<usize>,
     conceal_pages: HashSet<usize>,
     comic_pages: HashSet<usize>,
-    folder_pin_map: HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    folder_pin_map: HashMap<String, crate::folder_thumb_pins::FolderPin>,
     converted_archive_cache_paths: HashMap<String, ConvertedArchiveSourceState>,
     color_cache_map: Option<Arc<std::sync::RwLock<HashMap<String, crate::catalog::CacheEntry>>>>,
     color_catalog: Option<Arc<crate::catalog::CatalogDb>>,
@@ -3504,17 +3504,21 @@ impl App {
         let local_search = retains_local_search
             .then(|| self.capture_local_search_replay())
             .flatten();
-        self.adopt_main_list_navigation(adoption, |app| {
-            app.install_adopted_smart_transition_root(
-                request_id,
-                prepared,
-                record_history,
-                anchor,
-                prior_origin,
-                local_search,
-            );
-            None
-        })
+        self.adopt_main_list_navigation(
+            adoption,
+            super::MainListContextBoundaryPlan::None,
+            |app, _boundary| {
+                app.install_adopted_smart_transition_root(
+                    request_id,
+                    prepared,
+                    record_history,
+                    anchor,
+                    prior_origin,
+                    local_search,
+                );
+                None
+            },
+        )
     }
 
     fn install_adopted_smart_transition_root(
@@ -3868,7 +3872,8 @@ impl App {
         if let SmartPhysicalReady::ZipPrepared(prepared) = &child {
             self.reconcile_zip_refresh_adoption(&mut adoption, prepared);
         }
-        self.adopt_main_list_navigation(adoption, |app| {
+        let boundary_plan = self.physical_main_list_boundary_plan(&prepared_visible);
+        self.adopt_main_list_navigation(adoption, boundary_plan, |app, boundary| {
             app.adopt_smart_child_session(request_id, root, target, &source);
             let hydration = app.install_adopted_smart_child_ready(
                 request_id,
@@ -3879,7 +3884,8 @@ impl App {
                 effects,
                 restore_intent,
                 rows,
-                prepared_visible,
+                prepared_visible.with_install_boundary(boundary),
+                boundary,
             );
             if let Some(commit) = archive_commit {
                 app.commit_smart_folder_archive_source(commit);
@@ -3899,6 +3905,7 @@ impl App {
         restore_intent: super::StartupListIntent,
         rows: Option<(Vec<GridItem>, Vec<Option<(i64, i64)>>, HashSet<String>)>,
         prepared_visible: super::PreparedVisibleInstall,
+        install_boundary: super::MainListInstallBoundary,
     ) -> super::MainListHydration {
         let path = source.load_path.clone();
         // The old visible PDF/ZIP receivers still belong to the prior view until this exact
@@ -3930,7 +3937,7 @@ impl App {
             &child,
             SmartPhysicalReady::PdfPages { .. } | SmartPhysicalReady::PdfWarm { .. }
         ) {
-            self.prepare_pdf_visible_adoption(&source.logical_source);
+            self.prepare_pdf_visible_adoption(&source.logical_source, install_boundary);
         }
         if auto_fullscreen {
             if matches!(&child, SmartPhysicalReady::FolderPrepared(_)) {
@@ -6196,7 +6203,7 @@ pub(crate) struct PreparedVideoFolderPinSeed {
 
 pub(crate) fn prepare_video_folder_pin_seeds(
     items: &[GridItem],
-    folder_pin_map: &HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    folder_pin_map: &HashMap<String, crate::folder_thumb_pins::FolderPin>,
     folder_pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
     folder_thumb_sort: crate::settings::SortOrder,
     folder_thumb_depth: u32,
@@ -6239,11 +6246,10 @@ pub(crate) fn prepare_video_folder_pin_seeds(
             continue;
         };
         resolved_seeds.push(PreparedVideoFolderPinSeed {
-            cache_key: format!(
-                "{}{}{}",
-                base_key,
-                crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
-                resolved.source_id
+            cache_key: resolved.pinned_cache_key(
+                &base_key,
+                crate::folder_thumb_pins::PinKeyMode::Exact,
+                None,
             ),
             video_path: resolved.abs_path,
             mtime: resolved.mtime,
@@ -8912,17 +8918,24 @@ impl App {
         let Some(adoption) = self.prepare_main_list_adoption(navigation, destination) else {
             return false;
         };
-        self.adopt_main_list_navigation(adoption, |app| {
-            // Exact resident proof includes the parked root, definition, presentation and
-            // metadata. No event can interleave proof with this non-fallible moved install.
-            let synthetic = smart_folder_synthetic_path(definition_id);
-            app.transition_favorite_view_for_path(Some(&synthetic));
-            app.top_level_grid_view.replace_surface(
-                super::top_level_grid_view::TopLevelGridSurface::SmartFolder(root_state),
-            );
-            app.restore_adopted_smart_folder_session(definition_id, returned_root_entry.as_deref());
-            None
-        })
+        self.adopt_main_list_navigation(
+            adoption,
+            super::MainListContextBoundaryPlan::None,
+            |app, _boundary| {
+                // Exact resident proof includes the parked root, definition, presentation and
+                // metadata. No event can interleave proof with this non-fallible moved install.
+                let synthetic = smart_folder_synthetic_path(definition_id);
+                app.transition_favorite_view_for_path(Some(&synthetic));
+                app.top_level_grid_view.replace_surface(
+                    super::top_level_grid_view::TopLevelGridSurface::SmartFolder(root_state),
+                );
+                app.restore_adopted_smart_folder_session(
+                    definition_id,
+                    returned_root_entry.as_deref(),
+                );
+                None
+            },
+        )
     }
 
     pub(crate) fn poll_smart_folder(&mut self, ctx: &egui::Context) {
@@ -9385,10 +9398,14 @@ impl App {
             self.retire_smart_folder_payloads([Box::new(prepared) as RetiredSmartFolderPayload]);
             return false;
         };
-        self.adopt_main_list_navigation(adoption, |app| {
-            app.install_current_prepared_smart_folder(prepared);
-            None
-        })
+        self.adopt_main_list_navigation(
+            adoption,
+            super::MainListContextBoundaryPlan::None,
+            |app, _boundary| {
+                app.install_current_prepared_smart_folder(prepared);
+                None
+            },
+        )
     }
 
     /// Freshness was checked by the prepare owner before adoption. No worker or
@@ -13698,7 +13715,8 @@ mod tests {
             crate::catalog::FolderThumbProvenance::Seeded,
         )
         .unwrap();
-        let key = crate::thumb_loader::pinned_folder_row_key(&base, &resolved.source_id, None);
+        let key =
+            resolved.pinned_cache_key(&base, crate::folder_thumb_pins::PinKeyMode::Exact, None);
         let catalog = crate::catalog::CatalogDb::open(
             &cache,
             &smart_folder_synthetic_path(snapshot.definition.id),

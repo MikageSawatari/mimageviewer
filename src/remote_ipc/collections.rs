@@ -1810,6 +1810,52 @@ mod tests {
     use crate::settings::FavoriteEntry;
 
     #[test]
+    fn search_input_history_is_private_in_collection_responses() {
+        let data = crate::settings_db::DataDirOverrideGuard::new();
+        let definition = crate::settings::SmartFolderDefinition::new("empty");
+        let mut settings = Settings {
+            smart_folders: vec![definition.clone()],
+            ..Default::default()
+        };
+        let sentinel = "miv-history-sentinel-756";
+        settings
+            .search_input_history
+            .record(crate::ui_pinned_search::PinnedSearchKind::Local, sentinel);
+        assert_eq!(settings.search_input_history.len(), 1);
+        let db = crate::settings_db::SettingsDb::create_new(data.path()).unwrap();
+        db.save_full(&settings).unwrap();
+        drop(db);
+        let favorites =
+            super::super::live_favorites::LiveFavorites::snapshot(settings.favorites.clone());
+        let engine = CollectionEngine::new_with_live_favorites(settings, favorites);
+        assert_eq!(
+            engine.load_settings().unwrap().search_input_history.len(),
+            1
+        );
+        let home = engine.home();
+        assert!(matches!(&home, HomeResponse::Success(_)));
+        let listing = engine.collection(CollectionRequest {
+            kind: CollectionKind::SmartFolder {
+                definition_id: definition.id.to_string(),
+            },
+            spread_mode: None,
+            reading_direction: None,
+            force_single_page: false,
+        });
+        assert!(matches!(&listing, CollectionResponse::Success(_)));
+        let tags = engine.tag_browse(TagBrowseRequest);
+        assert!(matches!(&tags, TagBrowseResponse::Success(_)));
+        for response in [
+            serde_json::to_string(&home).unwrap(),
+            serde_json::to_string(&listing).unwrap(),
+            serde_json::to_string(&tags).unwrap(),
+        ] {
+            assert!(!response.contains(sentinel));
+            assert!(!response.contains("search_input_history"));
+        }
+    }
+
+    #[test]
     fn remote_rating_fetch_after_accepted_agent_write_reads_committed_value() {
         use crate::agent_ipc::metadata_write::{PreparedItem, PreparedRatings, PreparedWrite};
         use crate::agent_ipc::open::{OpenController, UiOpenOutcome};

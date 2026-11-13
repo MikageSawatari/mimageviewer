@@ -34258,6 +34258,7 @@ impl App {
 
         let pdf_warm_adoption = crate::test_script::pdf_warm_adoption_checkpoint();
         crate::test_script::TestScriptSnapshot {
+            gamepad: self.gamepad.script_snapshot(self.settings.gamepad_enabled),
             clipboard_capture: {
                 let diagnostics = crate::clipboard_capture::diagnostics::snapshot();
                 let selection = self.clipboard_capture_smoke_selection();
@@ -73821,6 +73822,7 @@ mod tests {
             .replace_surface(crate::app::top_level_grid_view::TopLevelGridSurface::Folder);
         app.list_order = Some(Arc::new(crate::app::ListOrderSnapshot {
             owner: app.virtual_list_context_id(),
+            scope: crate::app::ListOrderScope::Folder,
             entries: vec![crate::app::ListOrderEntry {
                 path: folder,
                 kind: crate::app::ListOrderEntryKind::Folder,

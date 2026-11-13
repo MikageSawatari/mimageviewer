@@ -32,16 +32,20 @@ v4.9.0 の候補。コードの事実は 2026-10-26 時点の master を読ん�
 - `press_multiplicity` は Ctrl+↑↓ と同じ `EachPhysicalPress`。新しいゲームパッド割り当ては足さない。
 - 既存の Ctrl+↑↓・Ctrl+PageUp/Down の挙動は変えない。
 
-## 3. 状態: 最後に通常フォルダ一覧から本を開く操作を受け付けた時点の、凍結した列
+## 3. 状態: 最後に対象の一覧から本を開く操作を受け付けた時点の、凍結した列
+
+2026-11-11 §1.682: Everything 結果も対象に拡張する。詳細な採用契約は [検索結果ナビゲーション設計](search-result-navigation-682-688-plan.md) §2.2 を正本とする。
 
 ### 3.1 型と持ち主
 
 ```rust
 struct ListOrderSnapshot {
     owner: ViewerContextId,               // 取得した時点の main context
+    scope: ListOrderScope,               // Folder / Everything { run: accepted run }
     entries: Arc<[ListOrderEntry]>,       // 一覧の表示順。凍結。path は重複しない
 }
 struct ListOrderEntry { path: PathBuf, kind: ListOrderEntryKind } // Folder / Zip / Pdf / ConvertibleArchive
+enum ListOrderScope { Folder, Everything { run: u64 } } // accepted SubmittedEverything.run
 ```
 
 - `Option<ListOrderSnapshot>` を **`ViewerContextBundle` の 1 field** にする。context が持つ状態なので、park / mount の
@@ -58,8 +62,8 @@ struct ListOrderEntry { path: PathBuf, kind: ListOrderEntryKind } // Folder / Zi
 
 ### 3.3 取得する時点 (置き換えるだけ)
 
-- **main の通常フォルダの一覧から、本の行を開く操作を受け付けた時点**で、その context の列を新しい列に置き換える。
-  開く要求には何も載せない。要求の採用・取消・失敗を待たない。
+- **main の通常フォルダ一覧、または採用済み Everything 結果一覧から、本の行を開く操作を受け付けた時点**で、その context の列を新しい列に置き換える。
+  capture は要求の採用・取消・失敗を待たない。列は scope ごとに増やさず 1 つを置き換える。
 - 取得は 1 つの helper `capture_main_folder_list_order(idx)` に集め、本の行を開く要求を作る 3 か所から、**load を始める前に**呼ぶ:
   - 通常フォルダ・ZIP / PDF (`grid_physical_navigation` `src/app/collection_grid.rs` 約 1355 を呼ぶ入口)
   - 変換対象の書庫 (`MainGridArchive`。`grid_physical_navigation` を通らない: `src/app.rs` 約 57428、`src/ui_main.rs` 約 16782、
@@ -67,9 +71,11 @@ struct ListOrderEntry { path: PathBuf, kind: ListOrderEntryKind } // Folder / Zi
 - Enter・ダブルクリック・明示の「ページ表示で開く / ページ一覧で開く」・既存のゲームパッドの決定は、上の入口を通るので同じ規則になる。
   実装時に入口を列挙して確かめる。
 - helper は次の条件をすべて満たすときだけ取る。満たさなければ何もしない (既存の列も消さない):
-  main context である / 一覧の surface が `TopLevelGridSurface::Folder` で ★固定が無効 (`is_snapshot_active()` が偽) /
+  main context である / ★固定が無効 (`is_snapshot_active()` が偽) / 通常フォルダ (`Folder` scope)、または
+  採用済み Everything が `Root` で `items_are_global_search_view` を満たす検索結果そのもの (`Everything { run }` scope) /
   要求の source が `Collection` / `Rating` owner でない / スマートフォルダの入口 (`begin_smart_grid_container_navigation`) に入らない。
-  評価一覧・スマートフォルダ・検索結果・閲覧履歴・コレクション・ブックマーク・サブフォルダ展開・ドライブ一覧からは取らない。
+  Everything の `PhysicalChild` の物理一覧や dataset 外の物理一覧からは取らない。Metadata・favsearch・タグ検索、
+  評価一覧・スマートフォルダ・閲覧履歴・コレクション・ブックマーク・サブフォルダ展開・ドライブ一覧からも取らない。
 - 下位の汎用 load 関数では取らない (DFS・起動時 open・アドレスバー入力が混ざるため)。
 - 開く操作が取消・失敗しても、列は「いま見ている一覧」の写しなので害は無い。元の列へ戻す処理は作らない。次に本を開けば、また置き換わる。
 
@@ -82,8 +88,9 @@ struct ListOrderEntry { path: PathBuf, kind: ListOrderEntryKind } // Folder / Zi
    (promote で main id は新しく発行され、旧 id が main に戻ることは無いので、旧 main に残った列は二度と使えない)
 3. 表示先が `ViewerPresentation::MainWindow` か `Fullscreen` (通常の専用フルスクリーン。App の初期値) で、
    `DetachedWindow` でも独立 owner でもない
-4. 一覧の surface が `TopLevelGridSurface::Folder` で、★固定が無効
-5. 表示中の本 (`effective_folder()`) のパスから位置を求められる。求め方は 2 段だけ:
+4. ★固定が無効で `snapshot.scope == current_list_order_scope()`。`Folder` は通常フォルダ、
+   `Everything { run }` は採用済み `SubmittedEverything.run` と一致する検索 session だけで使える
+5. scope に応じて現在位置を求められる。`Folder` は表示中の本 (`effective_folder()`) のパスから従来の 2 段で求める:
    1. `entries` のどれかの `path` と完全に一致すれば、その位置 (比較は `folder_tree::path_eq`)。
    2. 一致しなければ、**`Folder` の行だけ**を対象に、表示中のパスをその行の配下に含む行の位置 (パス成分の境界を守る既存の
       `path_in_subtree_ci` `src/app/metadata_ops.rs` 約 243 と同じ比較)。Folder 行から中の書庫へ着地した場合
@@ -94,15 +101,25 @@ struct ListOrderEntry { path: PathBuf, kind: ListOrderEntryKind } // Folder / Zi
    - EPUB の「PDF として保存」の後は、保存先の PDF を開く別のパスへの移動として扱う (`src/ui_dialogs/epub_convert.rs` 約 664、
      `src/app.rs` 約 39585)。保存先が列に無ければ位置は求まらず、通知になる。元の EPUB への別名や位置の保持は足さない。
 
+Everything では `PhysicalChild.logical_source` と完全一致する行だけを使い、祖先の行から推定しない。
+その前に `effective_folder()` がその行と同じ physical key、または Folder 行の配下 (成分境界) であることを確かめる。
+照合は dataset membership と同じ `physical_path_spelling` の key (I/O なし)。Root・一致なし・範囲外なら位置は無い。
+
 満たさないときは「一覧から開いた本で使えます」と短く知らせて何もしない。DFS へ黙って切り替えない。
 
-- 5 の帰結: 一覧から開いた本・この操作で移った本はもちろん、DFS・履歴・評価一覧から開いた物理の本などで**同じ列に含まれる本**へ
+- `Folder` scope の 5 の帰結: 一覧から開いた本・この操作で移った本はもちろん、DFS・履歴・評価一覧から開いた物理の本などで**同じ列に含まれる本**へ
   来たときも使える (評価一覧から開いた物理の本も surface は `Folder` になる: `src/app.rs` 約 36810)。
   このとき使うのは、**最後に通常フォルダ一覧から本を開く操作を受け付けた時点の順**で、いま見ている評価一覧などの順ではない。
   そこに含まれる本なら前後が決まる。列に無い場所へ移ると自然に使えなくなり、
   破棄の処理は要らない。★固定に入ると 4 で使えなくなり、解除すると戻る。
-- 列の位置を index として持たないので、移動の採用・取消・ZIP / PDF の後からの採用・hydration・内側の書庫の open のどれに対しても、
-  受け渡しや更新の処理が無い。
+- 列の位置は index として持たず、列自体も着地では更新しない。Everything では一覧順の要求だけが
+  `EverythingChildAdmission::ListOrderRow { dataset_run, row }` を既存 search origin に載せる。
+  current origin・accepted run・採用 path と row の physical key・dataset membership が一致する成功採用でだけ、
+  `logical_source` / `return_anchor` を移動先 row に置き換え、route は保つ。一覧順以外の `Descend` は従来どおり。
+  Folder 行から中の書庫へ着く場合は、まず Folder 行の採用で基準を替え、その後の書庫 open は `Descend` とする。
+  親 Folder 行の配下で既に読んでいる本が次の結果行にもある場合、行の基準だけが進んで物理の本が変わらないことがある。
+  ListOrder の宛先と現在の本の physical key が両方存在して一致するときは「一覧の移動先は現在表示中の本です」と Info で伝え、
+  通常の行採用を継続する。端の Edge 表示設定は変更しない。
 
 ## 4. 移動
 
@@ -155,10 +172,13 @@ struct ListOrderEntry { path: PathBuf, kind: ListOrderEntryKind } // Folder / Zi
   `ListOrder` が `Fullscreen` と同じに扱われる必要のある分岐 (`StartupListIntent::folder_navigation`・`history_trigger`・`perf_tag` など) は、
   実装時に `FolderNavMode` の match を全部たどって揃える。ただし `inflight_fullscreen_folder_nav_mode` の継続許可は除く (§4.2)。
 - 着いた本の位置は §3.4 で求め直すので、着地後に列へ書き込む処理は無い。
+  Everything の一覧順移動だけは、列ではなく検索側の帰路基準を §3.4 の成功採用契約で更新する。
 - 端 (先頭の前・末尾の次、または残りの行がすべて停止条件を満たさない): 既存の `FsBoundaryHint::Edge` の形で
   「一覧の先頭です / 一覧の末尾です」と知らせて止まる。ループしない。
 - フルスクリーンは保つ。閉じる・戻る (Esc / BS) は**既存の規則と設定のまま** (Backspace はページ一覧へ、Esc は条件により親一覧へ)。
   親へ戻ったときの選択は、既存の `effective_folder()` の名前による選択要求に任せる。
+  Everything では移動後の基準で Results・親・§1.664 の通常 close を処理し、結果への復帰で移動先行を選択する。
+  Folder 行から中の書庫へ着いた場合の通常 close は、結果から同じ Folder 行を開いた場合と同じ条件のまま。
 - 採用前の失敗 (worker の cancel・走査失敗) は既存の準備経路で止まる。採用後のまれな失敗は既存のログ + 通知で割り切り、
   専用の巻き戻しは作らない。
 
@@ -168,11 +188,16 @@ struct ListOrderEntry { path: PathBuf, kind: ListOrderEntryKind } // Folder / Zi
 
 | 出来事 | 列 | 操作が使えるか (§3.4) |
 | --- | --- | --- |
-| main の通常フォルダの一覧から本を開く操作を受け付けた | 新しい列に置き換え | 開いた本が表示されれば使える |
+| main の通常フォルダ一覧 / Everything Root の結果一覧から本を開く操作を受け付けた | scope を付けた新しい列に置き換え | 同じ scope の本が表示されれば使える |
+| Everything PhysicalChild / dataset 外の物理一覧から本を開いた | 変えない | logical_source と現在の場所の照合で決まる |
+| Everything 結果へ戻り、並べ替え・絞り込みを変えた | 凍結したまま | 次に結果から本を開くまでは元の順 |
+| 再検索・source 切替・取消・失敗 | accepted が変わるまでは変えない | 新しい結果の採用で run が変わると旧列は使えない |
+| 検索を閉じた / 別 scope へ移った | 変えない | scope 不一致で使えない |
 | その open が取消・失敗した | 置き換えたまま (いま見ている一覧の写し) | 一覧に居るので操作の文脈 (FsCommon) に無い |
-| この操作で移動した (ZIP / PDF の後からの採用・hydration を含む) | 変えない | 着いた本が列にあるので使える。Folder 行から中の書庫に着いたときは §3.4 の 5-2 で行の位置になる |
+| この操作で移動した (ZIP / PDF の後からの採用・hydration を含む) | 変えない | Folder は §3.4 の 5、Everything は成功採用で置き換えた logical_source の行。結果へ戻ると移動先行を選択する |
 | EPUB を「PDF として保存」して保存先を開いた | 変えない | 保存先が列に無ければ通知 |
-| DFS・兄弟移動・履歴・アドレスバー・ブックマーク・評価一覧から開いた物理の本 | 変えない | 着いた本が列にあれば使える (評価一覧の順ではなく保持した列の順)。無ければ通知 |
+| DFS・兄弟移動・履歴・ブックマーク・評価一覧等から開いた物理の本 | 変えない | Folder は列に含まれれば使える。検索を残す入口の Everything の帰路基準は替えず、現在の場所が旧行の範囲外なら通知 |
+| 検索中に場所ジャンプ・アドレス欄・利用者のフォルダペイン・全お気に入り入口・保存済みの本/コレクションを明示して開いた (§1.688 追補 §9〜§12) | 変えない | 成功採用で検索が終了し、旧 Everything scope の列は使えない。失敗・取消・stale は結果と選択を保持する。移動先の通常フォルダ一覧から本を開けば Folder scope の列へ置き換わる |
 | 親一覧へ戻った・他の surface へ移った | 変えない | 一覧に居る間は文脈に無い。次に本を開けば置き換わる |
 | ★固定を有効にした / 解除した | 変えない | 有効の間は 4 で使えない。解除で戻る |
 | F12 で同じ context を別窓へ出す / 戻す (linked) | 変えない | 別窓の間は 3 で使えない |
@@ -185,7 +210,7 @@ struct ListOrderEntry { path: PathBuf, kind: ListOrderEntryKind } // Folder / Zi
 - **一覧側 (Grid) の同等操作**: 一覧に居るときは見えている順に選んで開けばよい。
 - **detached・複数ウィンドウ・F12 linked の別窓での使用**: §3.4 で通知だけにする。列を別 context に渡す設計は、
   F12 往復・promote・park の組み合わせが増えるので v1 では作らない。
-- **評価一覧・スマートフォルダ・コレクション・検索結果・閲覧履歴・サブフォルダ展開からの取得**: それぞれ既存の表示順ナビゲーションや検索の範囲がある。
+- **評価一覧・スマートフォルダ・コレクション・Metadata / favsearch / タグ検索・閲覧履歴・サブフォルダ展開からの取得**: それぞれ既存の表示順ナビゲーションや検索の範囲がある。Everything 結果は §1.682 で対象に加えた。
 - **新しいゲームパッド・リング操作**: キーボード操作の要望のため。
 
 ## 7. 検討した単純化 (CLAUDE.md「設計の簡素化」)

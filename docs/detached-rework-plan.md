@@ -1455,6 +1455,26 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-12: 検索中の移動で、出発 context の移譲を検索の退役より先に行う (§1.682 / §1.688 §12.3)
+
+検索中に本・コレクション・場所へ移る共通 adopter (`adopt_main_list_navigation_with_completion`) が、`ExitTemporaryView` の検索退役を
+先に行い、その後の installer 内で出発 context を detached 窓へ移譲していた。移譲された context は bundle の検索状態 (Metadata /
+Everything の `global_search`、Search surface・return origin・rows) を失っていた。headless の既存回帰
+`collection_open_from_detached_transient_video_keeps_fallback_return_folder` で判明 (実機の観測ではない)。
+
+変更は呼び出し順だけ: 受付・current 照合 → 既存の移譲境界 (promote / park / close) → main に残った context へ検索退役と成功採用。
+リリース済みの Plain のコレクション open (`open_collection_grid`) と同じ順序。移譲境界の関数の中身、detached 述語・viewport・
+registry・binding、bundle の field は変えない。移譲済みの事実は局所の型・引数で installer へ渡して二重の境界を省略し、App に
+bool / Option を足さない。Collection の採用直前 locked 検査は移譲と同じ同期区間に置き、`Blocked` では何も変えない。
+
+**未対応 (既存の欠け)**: Ctrl+S (`favsearch`) と Ctrl+T (`tag_view`) の検索 owner と pending は App 共有で bundle に無いため、
+移譲後も main の退役で消える。リリース済みの Plain のコレクション open も同じで、今回の変更で悪化しない。context 所有への移動は
+bundle 境界の変更なので、リワーク側の別項目とする。
+
+設計担当 ClaudeCode と独立 Sol / xhigh 設計レビュー (r1 REVISE P2/P3 → r2 ACCEPT) は、移動先の変更を移譲境界より前に適用していた
+順序の誤りを正す構造修正であり、症状パッチではないと合意した。正本は
+[検索結果からの移動 §12.3](search-result-navigation-682-688-plan.md)。
+
 ### 2026-11-11: 3D 写真の独立した窓への対応 (§1.767 第 2 段)
 
 基点 `cc0264f3a`、正本は [3D 写真設計 §6.4.3](depth-parallax-plan.md#643-独立した窓での-3d-1767-第-2-段2026-11-11設計)。
@@ -7426,3 +7446,37 @@ keepaliveの症状条件を足す修正ではなく、対象と寿命を既存ow
 実装レビュー・自動検証の結果は [内部本計画 §9](archive-inner-book-open-return-plan.md) に記録する。
 独立source追レビューはACCEPT（追加P1/P2なし）。Ready close／parkの2件、S1〜S3の110件、
 既存detached／close／archiveの1,085件が全成功。core check・fmt・glyph・検証用buildも成功し、製品は起動していない。
+
+#### §1.690: 検索由来の★固定で Ctrl+G を正規の終了処理へ (2026-11-12、独立再レビュー ACCEPT)
+
+`close_searches_for_snapshot` の Ctrl+G 部分は `dismiss_global_search_with_origin` の手書きの部分コピーで、
+旧 `accepted`・prepare・`source`・mtime worker などを退役させていなかった。§1.690 の受付が前提とする
+「`global_search.active == false` なら旧い検索資源は終了済み」が★固定の後に成り立たないため、タグビューと同じく
+`dismiss_global_search_without_restore()` を呼ぶ形に置き換えた。戻り先とrouteは `activate_snapshot` が終了前に
+canonical origin として捕捉済みで、fork する `ViewerContextBundle` もその origin を複製する。変わるのは、★固定中に
+未使用の legacy `global_search_subfolder_restore` を持ち越さなくなる点だけで、戻り先は変わらない。
+viewport・detached 述語・新しい状態は加えていない。症状を消す guard ではなく、終了境界を 1 つの所有者に揃える構造修正である
+(設計担当 ClaudeCode と独立 Sol/xhigh 再レビューの双方が、症状パッチでなく構造的修正であることに同意)。記録は [search-from-item-plan.md](search-from-item-plan.md) M9。
+
+#### §1.718: 表紙の回転に合わせて退避中の一覧の古い本のタイルを読み直す (2026-11-13、viewer_context_audit A4)
+
+`evict_legacy_cover_thumbnails` (`app/viewer_context_registry.rs`、§1.718 のマージ cc85e8d3b) が `viewer_context_audit` の
+A4 (公開 API の fingerprint) に未登録で、CI の監査が落ちた。関数は回転ページ owner の値が実際に変わったとき
+(`rotation_page_owner_changed`。回転操作・全回転のリセット・改名や移動・削除やメタデータ整理・取り込みや復元など、
+回転 owner の値に差分が出たときだけで、差分が無ければ何もしない。読み取り専用の開閉からは呼ばれない) だけ動く。
+live の一覧は `reconcile_restored_cover_thumbnails`、at-rest / retiring の各 context は自分の bundle の項目・要求・画素・
+読み込み待ちの列だけを、同じ述語 (`legacy_book_cover_needs_reload`: 旧形式の本の表紙で、範囲内に回転があるもの) で作り直しの対象にする。
+mount・swap・兄弟 context の表示状態の変更はしない。作り直した結果は新しい identity を持つので、2 回目の呼び出しは何もしない (既存テスト)。
+色フィルタの代表 revision は main の既存の権限のまま。detached の述語・viewport・timer は変更しない。
+許可一覧への fingerprint の追加だけで、症状を消す guard ではなく、§1.718 の設計どおりの owner ごとの作り直しを監査に登録する変更である。
+設計担当 (ClaudeCode) と独立レビュー (Sol/xhigh、2026-11-13) の双方が、症状パッチではなく構造的な変更であることに同意した。
+
+### 代表サムネイルの手動範囲指定の受付（2026-11-11、§1.764）
+
+設計担当が確認済みの再レビュー指摘に従い、`ui_dialogs/cover_crop.rs` の共有受付で既存の
+`main_folder_history_available()` を参照し、main以外の投影中には範囲指定を受け付けない。
+メニュー表示だけに頼らず、機能の対象ownerを開始受付でも一貫させる構造修正で、設計§8.1の別窓非対応を満たす。
+既存のowner比較と一時投影の抑止を再利用し、detachedの述語本体・registry・viewport・保存・timerは変更しない。
+別窓を実際にmountするheadlessテストで拒否を確認し、mainへ戻ると同じ本を再び受け付けることも検査する。
+独立追レビューはこの受付を対象ownerの構造的一致としてACCEPT。
+焦点検証・確認用buildの結果は `cover-crop-plan.md` §15.4に記録した。

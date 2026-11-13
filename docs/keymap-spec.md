@@ -218,6 +218,29 @@ Remote は本体の同じ live media 記録と BookResumeWriter を読み書き�
 本の再開読取は writer の受付済み操作後を読む。操作権によるローカル入力の既存遮断と
 旧 session の write 拒否を維持し、Remote 専用クリア・IPC・キャッシュ無効化は追加しない。
 
+## 一覧の項目の名前で検索（§1.690）
+
+| Action | Context | Trigger | 既定 |
+| --- | --- | --- | --- |
+| `GridSearchNameEverything` | Grid | Press | なし |
+| `GridSearchNameMetadata` | Grid | Press | なし |
+| `GridSearchNameLocal` | Grid | Press | なし |
+
+操作カスタマイズで割り当てると、一覧のカーソル位置の1項目の名前を、それぞれ
+Everything・アイテム検索・現在地の絞り込みの既存欄へ入れる。欄を開いて下書きを置き換え、
+フォーカスを移して全選択する。入れただけでは検索せず、確定は既存の Enter、取消は既存の Esc。
+各検索の OR・検索対象・絞り込みは保持する。名前は実体から作り、引用などの加工をしない。
+ファイルは最後の拡張子を除き、フォルダ・ZipDir は名前をそのまま使う。
+
+メイン窓の一覧だけで受け付け、ブックマーク一覧・閲覧履歴・チェックあり・背景・
+フルスクリーン・別ウィンドウと、PdfPage・Stack・コレクションの欠落行は対象外。
+既存の入力所有・IME・detached 前面・フォルダペイン判定を通した後に処理する。
+渡し先はその検索の通常ショートカットと開始可否の判定を共有する。
+Metadata / Local は Metadata / Everything の検索セッション中（入力中・結果表示中・PhysicalChild を含む）には
+受け付けない。Metadata は「検索を閉じてから使えます」と通知し、未開設時だけ下書きを先に名前で
+置き換えて既存の待機状態で開く。右クリックの「名前で検索」と同じ実行口を通す。
+詳細は [名前で検索の設計 M1〜M6](search-from-item-plan.md#m1-範囲-利用者決定-2026-11-11)。
+
 ## コピー操作の割り当て（§1.477）
 
 **状態: 実装済み・実機未確認 (2026-10-29)。** 一覧と画像フルスクリーンに、次の5操作を別々に持つ。
@@ -540,6 +563,28 @@ ZIP/PDF内ページは実ファイルに置き換えず拒否し、入力時に�
 `GridFavorite...` / `GridOpenFavorite...` / `GridOpenCurrentDriveRoot` / `GridOpenDrive...` /
 `GridSwitchDrive...` /
 `GridOpenLocation...` / `GridTogglePinnedTag...` とし、競合判定とヘルプ表示でも `Grid` 文脈として扱う。
+§1.688: ドライブ・現在ドライブ root・ドライブ切替・場所▼の固定項目と整理先の場所ジャンプは、
+検索中も使える。キー・リング・ジェスチャ・マウスボタン・ゲームパッドの同等操作、ゲームパッドの場所リスト、
+場所▼は `AddressBarNav::LocationJump` に揃え、dispatch 時に ★固定・Everything 取得中 modal・検索状態を判定する。
+検索中は移動先の成功採用でだけ検索を終了し、失敗・取消では結果・選択・入力を保つ。履歴は検索前の場所へ戻る。
+追補 §9 ではツールバーのお気に入り（ボタン列・ドロップダウン）とピン留め本も検索中の成功時終了へそろえる。
+無効な行き先・scan 失敗・取消では結果と選択を保持し、検索外の Direct・Ctrl+F の先閉じ・優先順位は維持する。
+追補 §10 によりアドレス欄の Enter（空欄・本棚・本棚内の名前・解決したパス）は dispatch 時、
+利用者のフォルダペイン操作（クリック・Enter・ゲームパッド）は受付時に検索 active を判定し、成功時だけ検索を終了する。
+失敗・取消・stale は結果と選択を保持する。成功後は Esc で結果へ戻らず、履歴 Back は検索前の場所へ戻る。
+追補 §11 は §9・§10 の例外を改訂し、メニューバー・キー・リング・ジェスチャ・マウスボタン・ゲームパッドの
+お気に入り（番号・前後移動・一覧）もツールバーと同じ受付・成功時終了へそろえる。
+メニューバーの本棚は `LocationJumpTarget::BooksRoot` を使い、失敗・取消・stale では結果と選択を保持する。
+ペインにフォーカスがある Enter は検索の有無によらずペインが消費し、一覧の「開く」へ渡さない。
+検索外と内部の pane open、既存の入力優先順位は変更しない。新しいキー割当は追加しない。
+追補 §12: 本・コレクションを明示して開く既存 Action（追加先・番号・管理順の前/次）と、メニュー・ツールバー・
+固定ボタン・管理画面の同等入口も、検索中は成功採用でだけ検索を終了する。§1.733 のリング・ジェスチャ・
+マウスボタン・ゲームパッド X リングも共通の saved-group 入口を使う。
+失敗・取消・stale は結果と選択を保ち、検索なしの open・番号解決・待機/取消・割当は変えない。
+成功後は通常の本/コレクション表示となり、Esc で検索結果へ戻れず、履歴 Back は検索前の場所へ戻る。
+検索結果の行から本を開く操作は従来どおり検索を継続する。
+`GlobalOpenFolder` / `MenuCommandId::FileOpenFolder` のダイアログからの移動も、検索中だけ同じ成功時終了へ渡す。
+検索なしの旧 Direct、既定キー、ダイアログの入力確定/取消は変えない。
 本とコレクションにも、1〜20 番を開く、前/次へ移動する、追加先を開く、管理画面を開く
 `GridOpenBook1..20` / `GridBookPrev・Next` / `GridOpenActiveBook` / `GridManageBooks`、
 `GridOpenCollection1..20` / `GridCollectionPrev・Next` / `GridOpenCollectionTarget` /
@@ -562,8 +607,9 @@ ZIP/PDF内ページは実ファイルに置き換えず拒否し、入力時に�
 実行順・保存ID・既存設定との互換性は [§1.733 設計](ring-saved-group-actions-plan.md) を参照。
 本棚一覧またはコレクション一覧が未読込・更新中なら、1 回の入力で専用の待機ダイアログを開き、
 一覧確定後に同じ要求を実行する。待機中は背面操作を止め、「中止」で要求だけを取り消す。
-本は対象フォルダの事前走査が済んでから移動し、コレクションは新しい一覧の読み込み画面を
-採用した時点で待機を終える。番号と前/次は読み込み後の管理順で決めるが、追加先を開く操作は
+本は対象フォルダの事前走査が済んでから移動する。コレクションは、検索なしでは従来どおり新しい一覧の読み込み画面を
+採用した時点で待機を終え、検索中は既存 History prepare の成功採用まで結果を保持する。
+番号と前/次は読み込み後の管理順で決めるが、追加先を開く操作は
 押下時点の追加先を維持し、待機中に設定が変わっても別の追加先へ飛ばない。
 本棚の順の保存がない場合や順序を読めない場合は名前順を使う。本の番号・前/次・追加先候補・固定ボタンは同じ表示管理順から導く。「製本の管理」の各行 ↑ / ↓、今の順を固定、名前順に戻すは局所的なボタン操作で、専用の `KeyAction` や固定の矢印キー処理を追加しない。通常のwidgetフォーカス操作と名前欄のIME入力を維持する。
 フォルダバーの「最近開いたフォルダ履歴をクリア」と
@@ -784,6 +830,10 @@ dispatch 可否とは別の状態遷移であり、取消後の unfocused pass �
 
 ## 固定入力 / KeyAction 対象外の整理
 
+代表サムネの手動範囲（§1.764）は利用者決定により、本のタイルと本の中のページ一覧の
+右クリックメニューだけを入口とし、キー割り当てを追加しない。範囲のドラッグ・handle 操作は
+専用 modal 内の連続入力。確定・取消の Enter/Escape は既存の IME-safe dialog helper を使う。
+
 操作カスタマイズの一覧に出すものは、原則として `KeyAction` 化された離散ショートカットだけにする。
 次の入力は OS / フォーカス中 UI / モード内ドラッグ状態に強く依存するため、現時点では固定入力として扱う。
 固定入力へ同じキーを割り当てた場合は競合警告やヘルプで補助表示することはあるが、固定入力そのものは
@@ -794,6 +844,7 @@ dispatch 可否とは別の状態遷移であり、取消後の unfocused pass �
 | OS 予約 | <kbd>Alt</kbd>+<kbd>F4</kbd>、<kbd>Alt</kbd>+<kbd>Tab</kbd>、<kbd>Win</kbd> キー系など | Windows 側が先に処理する。mIV の keymap では上書きしない |
 | keyboard focus 移動 | <kbd>Tab</kbd> traversal | 非テキスト widget へ focus が移って `wants_keyboard_input()` が true のまま残り、全 shortcut が停止した履歴と、TextEdit から 1 hop だけ移動する不統一を避けるため、アプリ全体で常に無効。Tab chord 自体は `KeyAction` へ割り当て可能 |
 | フォーカスローカル UI | テキスト入力、IME 変換、コンボボックス、リスト、フォルダツリー、製本並べ替えダイアログ内の矢印 / Enter / Esc / PageUp / PageDown / Home / End など | その UI 部品の中だけで意味を持ち、グローバルショートカットとして外へ漏らさない |
+| 検索欄・フォルダアドレス欄の履歴（§1.756） | 入力フォーカス中の修飾なし <kbd>↓</kbd> = 履歴を開き先頭を選択、開いている間の <kbd>↑</kbd>/<kbd>↓</kbd> = 端で止まる選択移動、<kbd>Enter</kbd>（NumpadEnter 含む）= 選択項目を確定、<kbd>Esc</kbd> = 一覧だけを閉じる | コンボボックスと同じ部品内操作なので `KeyAction` 対象外。IME 変換中は扱わず、入力欄を開いただけでは一覧を出さない。選択なしの Enter は一覧を閉じて通常の確定へ渡す。閉鎖中の ↑ / Esc も従来経路へ残す。未フォーカス欄の▼直後も、viewport/widget単位の既存フォーカス予約が↓・↑・Enterを所有する。消費した押下は egui/native で共有 claim し、背面の検索終了やショートカットへ漏らさない。履歴選択は検索の共通 submit（アドレス欄は既存の移動）へ排他的に渡す。詳細は [入力履歴の設計](search-input-history-plan.md) |
 | 本の構成editor (G4、next-book) | 実ページのクリック、左のページ順ドラッグ・非表示、右のページ指定、各編集button、IME-safe な Enter = 保存 / Escape = キャンセル | 本HUD・本一覧右クリック・「本」menuから開く局所UI。新しい KeyAction は設けない。Enter はフォーカスwidgetがなく確認中でないときだけ保存し、Escape は確認を先に閉じる。保存 / 再読込中は取消を受け付けず、IME変換中は Enter / Escape の保存・取消を行わない。modal owner が背面の閲覧 / メタ情報 / ナビゲータ入力を止める。解除確認は明示buttonで行う。組の変更確認はなく、結果を直接表示し元に戻す/やり直すで修正する |
 | 画像folder→ZIP変換 (G) | 「ZIP に変換」「取消」「閉じる」、IME-safe な Escape = 取消 / 閉じる | folder右クリックと構成対象外案内から開く局所UI。新しい KeyAction / global shortcut は設けない。変換は明示buttonで確定し、取消可能なphaseだけEscapeを受け付ける。保存確定以降は取消しない。process modal ownerがmain / fullscreen / detachedの背面操作と新しいopenを止める |
 | 環境設定の持ち運び | 設定の復元の「環境設定を書き出し…」「環境設定を取り込み…」、説明 Modal の「書き出す」「ファイルを選ぶ」、取り込み後の環境設定の Enter / Escape | ダイアログ内だけのファイル操作で、新しい KeyAction は設けない。Enter / Escape は IME-safe な dialog helper を通す。環境設定表示中は新しい転送入口二つだけを無効化し、既存の復元操作は変更しない。取り込み完了時にも環境設定が開いていれば draft を変更せず通知する。転送 Modal の表示中は背後の環境設定へ Enter / Escape を渡さず、操作カスタマイズの「押して入力」も捕捉を停止する。待機状態と入力欄は保持し、Modal を閉じれば捕捉を再開する。通常の設定復元の表示だけでは捕捉を停止しない。転送 job 中は説明 Modal と設定復元の実行 / キャンセル / × / Enter / Escape を無効にし、メインの背面設定メニュー・ツールバーは既存の設定復元/common modal と説明 Modal で止める。別窓・fullscreen・native 動画への転送専用入力遮断は加えない。検証成功後の環境設定は既存 OK / キャンセルを使う。操作カスタマイズ自体は転送対象外で既存共有を使う |
@@ -870,11 +921,12 @@ fullscreen/native側からROOTへの新しい転送は加えない。
 | 既定キーなし (`GridOpenSelectedAsPage` / `GridOpenSelectedAsList`) | 選択中の ZIP/PDF/対応アーカイブを、全体設定に関係なく「ページを開く」または「一覧を開く」で明示的に開く。右クリックメニュー、リングショートカット、マウスジェスチャ候補にも同じ操作を出す。メイン一覧をページ一覧へ切り替えるフル機能ウィンドウ用コマンドのため、複数ウィンドウモードでは共通実行入口でトーストを表示し、履歴・変換・一覧・viewer の状態を一切変更しない。現在コンテキストのショートカット一覧にも使用可能なときだけ表示する |
 | 既定キーなし (`GridOpenPreferences` / `GridOpenOperationCustomize`) | 「環境設定」または「操作カスタマイズ」を開く。Grid 文脈だけで、キーボード、リング、マウスジェスチャ、マウスボタン、ゲームパッド X+方向へ割り当てられる。メインウィンドウ側のダイアログが見えない画像 / 動画フルスクリーンでは候補に出さず、発火もしない |
 | 既定キーなし (`GridClearRecentFolders` / `GridClearQuickFolderSlots`) | フォルダバー設定メニューと同じく、最近開いたフォルダ履歴、または A/B の記憶した場所と起動中に記憶した全フォルダの一覧位置を確認なしでクリアし、設定へ保存して完了をトースト表示する。後者は現在の一覧も先頭へ戻す。Grid 文脈だけで、キーボード、リング、マウスジェスチャ、マウスボタン、ゲームパッド X+方向へ割り当てられる |
+| 既定キーなし (`GridClearSearchInputHistory` / `GridClearReadingHistory`) | 検索欄の入力履歴、または閲覧履歴を環境設定と同じ処理で全件消去する Grid / Press 操作。検索入力履歴は確認なしで消してその場で設定を保存する。閲覧履歴は確認ダイアログの「クリア」または Enter で確定し、キャンセル・Escape では消さない。空なら確認や保存をせず通知だけ。リング、マウスジェスチャ、マウスボタン、ゲームパッド X+方向にも割り当てられる。文字入力・IME・モーダルの既存入力所有を維持する。[設計](clear-history-actions.md) |
 | 右ドラッグ（設定時） | 操作カスタマイズで選んだリングショートカットまたはマウスジェスチャを実行する。「ファイル上で右ドラッグを始めたとき、そのファイルを選択」が ON の場合は、押下時点で開始セルを選択してから操作を開始する。チェック済みの複数選択は解除せず、空き位置から開始した場合は選択を変えない。短い右クリックは従来どおり release 時に対象セルを選び、メニューを開く |
 | <kbd>Shift</kbd>+<kbd>Enter</kbd> | 選択中の動画を外部プレイヤーで開く。Action: `GridOpenExternalPlayer` |
 | <kbd>Alt</kbd>+<kbd>↑</kbd> | 親フォルダへ。Action: `GridParentFolder` の別既定割り当て (<kbd>Backspace</kbd> と同じ。Explorer 慣習に合わせた代替ショートカット。ドライブルートではドライブ一覧へ戻る。Ctrl+F フィルタ元フォルダでは no-op) |
 | <kbd>Alt</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | フォルダ履歴を戻る / 進む。Action: `GridHistoryBack` / `GridHistoryForward` (フォルダバーの ←/→ と同じ。Ctrl+F の現在地フィルタ中・空のバーでも移動し（一時/常設Local欄に入力中もAlt・Ctrlなしの実効割当だけ許可、IMEと文字編集用割当は入力欄優先）、行き先の一覧採用時に絞り込みを終える。Ctrl+G/S/T・Everything の検索結果と★固定中は無効で、キーには理由をInfo通知、ボタンには無効表示と理由を示す。ドライブ一覧でも履歴 target があれば有効) |
-| 既定キーなし (`GridOpenCurrentDriveRoot`) | 現在位置のルートディレクトリへ移動する。通常フォルダ、ZIP/PDF/変換アーカイブ内では `effective_folder()` のドライブ root / UNC share root を対象にする。検索中・★固定中は無効 |
+| 既定キーなし (`GridOpenCurrentDriveRoot`) | 現在位置のルートディレクトリへ移動する。通常フォルダ、ZIP/PDF/変換アーカイブ内では `effective_folder()` のドライブ root / UNC share root を対象にする。検索中は成功採用で検索を終了する。★固定中・Everything 取得中は無効 |
 | 既定キーなし (`GridOpenDriveC..Z`) | 対応する `C:\`〜`Z:\` のドライブルートを直接開く |
 | 既定キーなし (`GridSwitchDriveC..Z`) | アクティブな A/B クイックフォルダスロットごとに覚えている、そのドライブの最後の場所へ切り替える。未訪問または最後の場所が存在しない場合は対象ドライブ root へフォールバックする |
 | <kbd>Ctrl</kbd>+<kbd>↑</kbd> | ツリー順で前のフォルダへ (DFS pre-order、画像なしフォルダは skip_limit までスキップ)。Action: `GridTreeFolderPrev`。検索中は前のヒットフォルダへ移動 (`global_search_ctrl_nav` / `favsearch_ctrl_nav`)。★固定 中は snapshot 内の前 entry へ。スマートフォルダでは Folder 内の DFS を維持し、端または root 直下の PDF/ZIP/変換書庫からは一覧表示順の前の Folder/本 entry へ（単体画像・動画は除外） |
@@ -938,6 +990,8 @@ Shift を伴う一覧カーソル移動と Shift+クリックは起点を保持�
 
 フォルダツリーペインはツールバーの `ツリー` ボタン、またはグリッド側の <kbd>F</kbd> で表示する左ペイン。ここで扱うツリーは実ファイルシステムのディレクトリのみで、ZIP / PDF / 変換アーカイブなどの仮想フォルダは表示しない。ZIP / PDF 表示中は、その親実フォルダを現在位置として同期する。
 
+マウスで行の名前や ▶ / ▼ をクリックしたときは、その行を中央へ寄せない。キー操作では従来どおりカーソル行を中央へ寄せる。
+
 ツリー内の矢印 / Enter / Esc は、テキスト入力やリストボックス操作と同じフォーカスローカルな固定入力として扱う。グローバルショートカットではないため `KeyAction` には追加しない。ツリー側にフォーカスがある間は、同じキーがグリッド選択移動やレーティング操作へ漏れないようグリッド側のキー処理を止める。
 
 | キー | 動作 |
@@ -949,6 +1003,9 @@ Shift を伴う一覧カーソル移動と Shift+クリックは起点を保持�
 | グリッド側の <kbd>Esc</kbd> | フォルダツリー表示中、かつ検索バー・ダイアログ・フルスクリーンなどの優先処理がない場合、ツリー側へフォーカスを移す |
 
 ★固定 (Snapshot Lock) 中はフォルダ間移動を禁止するため、フォルダツリーペイン全体を disabled とし、クリック / キー操作を受け付けない。
+検索中の利用者によるペイン移動（クリック・Enter・ゲームパッド、カーソル移動後にペインを閉じる操作も含む）は、
+成功採用時に検索を終了する。失敗・取消では検索結果と選択を残し、移動成功後の Esc は結果を復元しない。
+履歴 Back は検索前の場所へ戻る。検索外の PaneNavigation と起動復元等の内部 scan は従来どおり。
 
 ## 製本 並べ替えダイアログ
 
@@ -1110,7 +1167,7 @@ keyzoom-1470 の dev-runtime ビルド、JIS 配列): 1200×900 の PNG を画�
 | <kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 縦/横連結モードでは画面単位で連結方向へスクロール。通常のページ単位表示では、環境設定の「ページジャンプ量」ぶん前 / 次へジャンプする。Action: `FsFixedJumpPrevNoRtl` / `FsFixedJumpNextNoRtl`。こちらは PageUp/PageDown へ割り当てる用途のため RTL でも前 / 次の意味を反転しない。修飾なし矢印ナビゲーションは文脈依存の固定入力として残す一方、メタデータパネル・ページジャンプ・Home/End 先頭末尾移動など副作用が明確な操作は KeyAction 化して競合検出対象にする |
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 見開きの「1 ページずらし」(現在の表示ユニット先頭を軸に見開きを 1 ページぶんずらす。空白/欠落ページでの綴じずれ補正。端の no-op は保存しない)。適格な本では既定ONの全体記憶設定に従い、実際の内部アンカーのPageRefを`spread_shift.db`へ保存する。通常一覧と記憶OFFではセッション調整。`spread_db`のmodeは保存し直さない。Single / Split モードでは従来の前 / 次ページ移動。ページ表示が RTL なら左右の意味を反転し、「カーソルキー左右の方向」の影響は受けない。リング / マウス / パッド用の操作候補には、この左右版に加えて PageUp/PageDown と同じく RTL でも前 / 次を反転しない「前 / 次」版を用意する |
 | <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | ツリー順で前 / 次のフォルダへ移動する。Action: `FsCtrlNavPrev` / `FsCtrlNavNext`。スマートフォルダでは Folder 内 DFS の端と root 直下の本から、一覧表示順の Folder/PDF/ZIP/変換書庫へ移る。独立 detached 静止画窓では main の検索・絞り込みを継承せず、窓自身の物理順で通常画像フォルダ / ZIP / CBZ / PDF へ移動する |
-| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 一覧の表示順で前 / 次の本を開く。Action: `FsListOrderPrev` / `FsListOrderNext` (`FsCommon` / Press / `EachPhysicalPress`)。最後に通常フォルダ一覧から本を開く操作を受け付けた時点の絞り込み・並べ替え順を使い、その一覧の中だけを移動する。Ctrl+↑↓ の DFS と異なりサブフォルダへは降りない。使える範囲・停止条件は [一覧順ナビゲーション設計](list-order-book-navigation-plan.md) 参照 |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 一覧の表示順で前 / 次の本を開く。Action: `FsListOrderPrev` / `FsListOrderNext` (`FsCommon` / Press / `EachPhysicalPress`)。最後に通常フォルダ / Everything 結果一覧から本を開く操作を受け付けた時点の絞り込み・並べ替え順を使い、その一覧の中だけを移動する。Everything は同じ accepted run の本で使用でき、成功採用で検索の帰路基準を移動先行へ揃える。Ctrl+↑↓ の DFS と異なりサブフォルダへは降りない。使える範囲・停止条件は [一覧順ナビゲーション設計](list-order-book-navigation-plan.md) 参照 |
 | <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 同じ親直下の前 / 次の兄弟フォルダへ移動する。Action: `FsSiblingPrev` / `FsSiblingNext`。独立 detached 静止画窓でも窓自身の物理兄弟順を使う |
 | <kbd>0</kbd> 〜 <kbd>7</kbd> | <kbd>1</kbd>〜<kbd>5</kbd>: ページ構成切替 (<kbd>1</kbd>: 単ページ / <kbd>2</kbd>: 見開き 左開き / <kbd>3</kbd>: 見開き 左開き+表紙単独 / <kbd>4</kbd>: 見開き 右開き / <kbd>5</kbd>: 見開き 右開き+表紙単独)。<kbd>6</kbd>: 連結方式をページ単位 → 縦連結 → 横連結で循環。<kbd>7</kbd>: 横方向 左→右 / 右→左を切替。<kbd>0</kbd>: ズーム/フィットをページ全体 → 横幅フィット → 縦幅フィット → 100%原寸 → 指定サイズで循環。余白カットは左パネルの表示トリムで設定する。見開き中は表紙あり/なしを保ったまま左開き / 右開きも連動して切り替える。ZIP の作品区切り表示上でも有効。ホバーバーの表示モード/フィットボタンからも切替可 |
 | 既定キーなし (`FsTogglePageAfterCoverAlone` / `FsToggleLastPageAlone`) | 表紙あり見開きで、表紙の次 / 最終ページを白い相方付きで単独表示する本別設定を切り替える。全体設定に従う状態からは現在の実効値の反対を明示保存する。表紙なし見開き・単ページ・横長分割では値だけ変更し、表示には適用しない |
@@ -1389,7 +1446,7 @@ SNS 中の通常 `FsExport` は案内だけを表示し、枠の確定・取消�
 | 修飾なしマウスホイール | 前 / 次のファイル（既定）、または音量調整 | `Settings.ring_shortcuts.video_normal_wheel_action`。動画・音声共通で、操作カスタマイズ「マウスボタン」から選択。パネル・モーダル・ストリップ、360度・拡大表示など既存の入力所有を優先し、KeyAction にはしない |
 | <kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 音量を dB フェーダー目盛りの 1/4 幅で上下 | |
 | <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 現在コンテキストの前 / 次フォルダまたは検索結果へ移動 | native presenter 経路でも有効。切り離した detached 窓 / always-new 窓ではメイン一覧を動かさず、案内だけ出す |
-| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 最後に通常フォルダ一覧から本を開く操作を受け付けた時点の、その一覧の表示順で前 / 次の本を開く | `FsListOrderPrev` / `FsListOrderNext`。native presenter でも同じ handler を使う。別窓・★固定中・保持した一覧に現在の本が無いときは案内だけ出し、準備中の追加入力は受け付けない。native の repeat 受付は既存 Ctrl+↑↓ と同じく無視 |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 最後に通常フォルダ / Everything 結果一覧から本を開く操作を受け付けた時点の、その一覧の表示順で前 / 次の本を開く | `FsListOrderPrev` / `FsListOrderNext`。native presenter でも同じ handler を使う。別窓・★固定中・保持した一覧に現在の本が無いときや scope 不一致なら案内だけ出し、準備中の追加入力は受け付けない。Everything の帰路は成功採用した行へ揃える。native の repeat 受付は既存 Ctrl+↑↓ と同じく無視 |
 | <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 前 / 次の兄弟フォルダへ | 同じ親の直下だけを対象にし、空フォルダも skip しない。検索中は無効。切り離した detached 窓 / always-new 窓では無効 |
 | <kbd>M</kbd> | ミュート トグル | |
 | 既定キーなし | 次の再生可能な音声トラックへ循環 | Action: `VideoNextAudioTrack`。`[FsVideo]` で割り当て可能。動画 HUD と動画→音声モード HUD の「音声 N」からも直接選べる。1 本以下では何もしない |

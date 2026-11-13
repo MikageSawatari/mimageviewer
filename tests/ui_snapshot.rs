@@ -29,6 +29,92 @@ use egui_kittest::kittest::NodeT;
 use egui_kittest::{Harness, kittest::Queryable};
 
 #[test]
+fn cover_crop_small_100_light() {
+    cover_crop_snapshot(
+        "cover_crop_small_100_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        1.0,
+    );
+}
+
+#[test]
+fn cover_crop_small_200_dark() {
+    cover_crop_snapshot(
+        "cover_crop_small_200_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        2.0,
+    );
+}
+
+fn cover_crop_snapshot(name: &str, theme: mimageviewer::os_theme::ResolvedTheme, scale: f32) {
+    cover_crop_snapshot_with_auto(name, theme, scale, false);
+}
+
+#[test]
+fn cover_auto_crop_small_100_light() {
+    cover_crop_snapshot_with_auto(
+        "cover_auto_crop_small_100_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        1.0,
+        true,
+    );
+}
+
+#[test]
+fn cover_auto_crop_small_200_dark() {
+    cover_crop_snapshot_with_auto(
+        "cover_auto_crop_small_200_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        2.0,
+        true,
+    );
+}
+
+fn cover_crop_snapshot_with_auto(
+    name: &str,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+    scale: f32,
+    auto_enabled: bool,
+) {
+    let mut fonts_ready = false;
+    let mut harness = test_ui::builder()
+        .with_size(egui::vec2(1093.0, 614.0))
+        .build_ui(move |ui| {
+            mimageviewer::os_theme::apply_resolved(ui.ctx(), theme);
+            if !fonts_ready {
+                install_app_fonts(ui.ctx());
+                mimageviewer::settings::apply_ui_scale_factor(ui.ctx(), scale);
+                fonts_ready = true;
+                ui.ctx().request_repaint();
+                return;
+            }
+            if auto_enabled {
+                mimageviewer::draw_cover_auto_crop_snapshot_fixture(ui);
+            } else {
+                mimageviewer::draw_cover_crop_snapshot_fixture(ui);
+            }
+        });
+    harness.run_steps(8);
+    let viewport = harness.ctx.content_rect();
+    for label in ["  OK  ", "手動の範囲を解除", "キャンセル", "Close window"] {
+        assert!(
+            viewport.contains_rect(harness.get_by_label(label).rect()),
+            "{name}: {label} outside viewport"
+        );
+    }
+    if auto_enabled {
+        assert!(
+            viewport.contains_rect(
+                harness
+                    .get_by_label("手動の範囲を解除すると、自動の判定に戻ります。")
+                    .rect()
+            )
+        );
+    }
+    harness.snapshot(name);
+}
+
+#[test]
 fn exif_gps_maps_dark() {
     snapshot_with_theme_at_size(
         "exif_gps_maps_dark",
@@ -376,6 +462,48 @@ fn toolbar_pinned_search_narrow_dark() {
         egui::vec2(360.0, 300.0),
         None,
         mimageviewer::ui_pinned_search::draw_pinned_search_snapshot_fixture,
+    );
+}
+
+#[test]
+fn toolbar_pinned_search_history_light() {
+    snapshot_with_theme_at_size(
+        "toolbar_pinned_search_history_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(560.0, 100.0),
+        None,
+        mimageviewer::ui_pinned_search::draw_pinned_search_history_snapshot_fixture,
+    );
+}
+
+#[test]
+fn search_history_popup_dark() {
+    snapshot_with_theme_at_size(
+        "search_history_popup_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(440.0, 240.0),
+        None,
+        |ui| mimageviewer::ui_history_field::draw_history_field_snapshot_fixture(ui, true),
+    );
+}
+
+#[test]
+fn folder_address_history_light() {
+    snapshot_with_theme_at_size(
+        "folder_address_history_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(560.0, 120.0),
+        None,
+        |ui| {
+            ui.horizontal(|ui| {
+                ui.label("フォルダ:");
+                mimageviewer::ui_toolbar_layout::draw_address_input_snapshot_fixture(
+                    ui,
+                    &mut r"C:\Pictures\旅行".to_owned(),
+                    true,
+                );
+            });
+        },
     );
 }
 
@@ -1661,6 +1789,7 @@ fn folder_toolbar_snapshot_status_label() {
                                             .color(egui::Color32::from_rgb(58, 110, 165))
                                             .into(),
                                     ),
+                                    false,
                                     |ui| {
                                         ui.add_enabled(
                                             false,
@@ -1738,8 +1867,8 @@ fn folder_toolbar_snapshot_status_label_rejects_high_dpi_overflow() {
 }
 
 /// Actual control styles, including the reported count and omitted-entry badge.
-/// All positions/row settings get geometry checks. Keep the 23 named baselines
-/// while separately asserting the 22 distinct layouts adopted for egui 0.37.
+/// All positions/row settings get geometry checks. The integrated history
+/// affordance makes normal/middle inline distinct: 23 names and 23 layouts.
 #[test]
 fn folder_toolbar_flexible_snapshots() {
     use egui_kittest::kittest::NodeT;
@@ -1782,18 +1911,17 @@ fn folder_toolbar_flexible_snapshots() {
                     harness.run();
                     // Verify the alias policy with pixels too, so a regression
                     // cannot silently turn a required baseline into a duplicate.
-                    // 0.37 WidgetAtom also wraps the full controls at normal/middle.
-                    // Keep the previous named image even though it now aliases
-                    // its row counterpart, so every baseline is regenerated.
+                    // Moving history into the address field lets normal/middle
+                    // inline keep its own placement. The remaining aliases retain
+                    // the established names and representative coverage.
                     let named_duplicate = !new_row
                         && (before == 0
                             || size == "narrow"
                             || (buttons && (size == "dpi150" || before == 2)));
-                    let pixel_duplicate = !new_row && (before == 0 || size == "narrow" || buttons);
                     let pixels = harness.render().unwrap();
+                    let first = unique.insert((pixels.width(), pixels.height(), pixels.into_raw()));
                     assert_eq!(
-                        unique.insert((pixels.width(), pixels.height(), pixels.into_raw())),
-                        !pixel_duplicate,
+                        first, !named_duplicate,
                         "unexpected snapshot alias: {size} {position} row={new_row} buttons={buttons}"
                     );
                     if !named_duplicate {
@@ -1822,7 +1950,7 @@ fn folder_toolbar_flexible_snapshots() {
                             "スタック",
                             "サブ展開",
                             "📌",
-                            "履歴▼",
+                            "入力履歴",
                             "♡",
                         ]
                     } else {
@@ -1850,7 +1978,7 @@ fn folder_toolbar_flexible_snapshots() {
         named, 23,
         "all existing folder baselines must be regenerated"
     );
-    assert_eq!(unique.len(), 22, "adopted 0.37 layout aliases changed");
+    assert_eq!(unique.len(), 23, "history-field layout aliases changed");
 }
 
 /// Generate decision material without adopting the old matrix's alias policy.
@@ -1891,7 +2019,7 @@ fn egui037_stage4_folder_toolbar_comparison_materials() {
         let input = harness.get_by_role(egui::accesskit::Role::TextInput).rect();
         assert!(viewport.contains_rect(input));
         assert!(input.width() >= mimageviewer::ui_toolbar_layout::ADDRESS_INPUT_MIN_WIDTH);
-        for label in ["場所▼", "♡", "履歴▼", "📌", "サブ展開", "スタック"] {
+        for label in ["場所▼", "♡", "入力履歴", "📌", "サブ展開", "スタック"] {
             let node = harness.get_by_label(label);
             let rect = node.rect();
             let id = egui_id_from_accesskit(node.accesskit_node().id());
@@ -1928,7 +2056,7 @@ fn draw_folder_toolbar_fixture(
             let _ = ui.button(*text);
         }
         let count = if buttons { "(674/674)" } else { "(25/120)" };
-        let mut measured = layout::FolderBarWidth::with_input();
+        let mut measured = layout::FolderBarWidth::with_history_input(ui, buttons);
         measured.label(ui, "フォルダ:");
         if buttons {
             for text in ["←", "→"] {
@@ -1957,7 +2085,7 @@ fn draw_folder_toolbar_fixture(
         right_width.label(ui, egui::RichText::new(count).size(11.0).monospace());
         right_width.space(4.0);
         if buttons {
-            for text in ["スタック", "サブ展開", "📌", "履歴▼", "♡"] {
+            for text in ["スタック", "サブ展開", "📌", "♡"] {
                 right_width.button_with_frame(ui, text, 0.0, !matches!(text, "📌" | "♡"));
                 right_width.space(4.0);
             }
@@ -1990,9 +2118,10 @@ fn draw_folder_toolbar_fixture(
                 ui.separator();
                 let mut right = Vec::new();
                 let mut input = None;
+                let input_minimum = layout::FolderBarWidth::with_history_input(ui, buttons).width();
                 layout::folder_tail(
                     ui,
-                    layout::FolderBarWidth::with_input().width(),
+                    input_minimum,
                     right_width.width(),
                     |ui, part| match part {
                         layout::FolderTailPart::RightControls => {
@@ -2025,23 +2154,16 @@ fn draw_folder_toolbar_fixture(
                                 ui.add_space(4.0);
                                 right.push(ui.add(egui::Button::new("📌").frame(false)).rect);
                                 ui.add_space(4.0);
-                                right.push(
-                                    layout::folder_menu_button(ui, true, "履歴▼", |_| {}).rect,
-                                );
-                                ui.add_space(4.0);
                                 right.push(ui.add(egui::Button::new("♡").frame(false)).rect);
                                 ui.add_space(4.0);
                             }
                         }
                         layout::FolderTailPart::Input => {
-                            layout::address_input(ui, None, |ui| {
+                            layout::address_input(ui, None, buttons, |ui| {
                                 input = Some(
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut *path)
-                                            .desired_width(f32::INFINITY),
-                                    )
-                                    .accessible_name("Folder address")
-                                    .rect,
+                                    layout::draw_address_input_snapshot_fixture(ui, path, buttons)
+                                        .accessible_name("Folder address")
+                                        .rect,
                                 );
                             });
                         }

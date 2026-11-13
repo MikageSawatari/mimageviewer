@@ -16689,6 +16689,7 @@ mod configurable_video_seek_dispatch_tests {
             .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
         app.list_order = Some(Arc::new(ListOrderSnapshot {
             owner: app.viewer_context_main(),
+            scope: ListOrderScope::Folder,
             entries: [first, next.clone()]
                 .into_iter()
                 .map(|path| ListOrderEntry {

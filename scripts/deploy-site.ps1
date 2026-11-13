@@ -126,7 +126,11 @@ if ($LASTEXITCODE -ne 0) { throw "tar failed (exit $LASTEXITCODE)" }
 $remoteTar = "/tmp/miv-site-$stamp.tar"
 & scp @sshOpts -q $tarFile "${Target}:$remoteTar"
 if ($LASTEXITCODE -ne 0) { throw "scp failed (exit $LASTEXITCODE)" }
-Invoke-Remote "tar -xf '$remoteTar' -C '$RemoteRoot' --no-same-owner --no-overwrite-dir; rc=`$?; rm -f '$remoteTar'; exit `$rc" | Out-Null
+# --overwrite writes into existing files instead of unlinking them first: the site root
+# directory belongs to another account, so the unlink of a root file (sitemap.xml) fails.
+# GNU tar refuses --overwrite together with --no-overwrite-dir. The archive holds only the
+# changed files (no directory members), so existing directories' metadata is not touched.
+Invoke-Remote "tar -xf '$remoteTar' -C '$RemoteRoot' --no-same-owner --overwrite; rc=`$?; rm -f '$remoteTar'; exit `$rc" | Out-Null
 Remove-Item -Recurse -Force $tmpDir
 
 $after = Get-RemoteHashes

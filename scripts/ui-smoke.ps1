@@ -10,6 +10,7 @@ Automation must not pass this switch until that approval has been obtained.
 MultiWindowRarNav checks Ctrl+Up/Down across direct RAR, ZIP, and CBR in one detached window.
 FolderHistory checks Rating and Collection folder history with real shortcut input.
 RatingFolderBack records scrolled Rating folder/ZIP returns for every default history input.
+GamepadBasic injects PadEvents for grid movement, A/B fullscreen, and X-ring parent navigation.
 #>
 # Run an isolated, diagnostic portable UI smoke scenario.
 #
@@ -28,7 +29,7 @@ RatingFolderBack records scrolled Rating folder/ZIP returns for every default hi
 [CmdletBinding()]
 param(
     [Alias('Suite')]
-    [ValidateSet('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AudioTracks', 'FolderHistory', 'RatingFolderBack', 'AlwaysOnTop', 'ClipboardCapture', 'ReleaseChecks')]
+    [ValidateSet('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AudioTracks', 'FolderHistory', 'RatingFolderBack', 'AlwaysOnTop', 'ClipboardCapture', 'GamepadBasic', 'ReleaseChecks')]
     [string] $Scenario = 'MultiWindowPdf',
     [switch] $SkipBuild,
     [int] $TimeoutSeconds = 120,
@@ -601,6 +602,9 @@ function Save-UiSmokeEvidence {
         if ($script:fixtureDir) {
             Try-AddUiSmokeEvidenceDirectory $script:fixtureDir 'inputs/fixture' 'fixture'
         }
+        if ($Scenario -eq 'GamepadBasic' -and $script:fixtureDir) {
+            Try-AddUiSmokeEvidenceDirectory (Split-Path -Parent $script:fixtureDir) 'inputs/gamepad-library' 'gamepad-library'
+        }
         if ($Scenario -eq 'ClipboardCapture' -and $script:fixtureDir) {
             $clipboardRoot = Split-Path -Parent $script:fixtureDir
             Try-AddUiSmokeEvidenceDirectory (Join-Path $clipboardRoot 'source') 'inputs/clipboard-source' 'clipboard-source'
@@ -807,7 +811,7 @@ try {
         throw '[ui-smoke] TimeoutSeconds must be greater than zero'
     }
 
-    $implementedScenarios = @('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AudioTracks', 'FolderHistory', 'RatingFolderBack', 'AlwaysOnTop', 'ClipboardCapture')
+    $implementedScenarios = @('MultiWindowPdf', 'MultiWindowStills', 'MultiWindowRarNav', 'NativeMouseMove', 'NativeTopPanoramaHover', 'NativeTopPanoramaClick', 'NativeSeekStripWholeLifecycle', 'StillStripDrag', 'Idle198Convergence', 'RatingSort', 'RatingSortCollection', 'AudioTracks', 'FolderHistory', 'RatingFolderBack', 'AlwaysOnTop', 'ClipboardCapture', 'GamepadBasic')
     if ($implementedScenarios -notcontains $Scenario) {
         throw "[ui-smoke] scenario $Scenario is not implemented"
     }
@@ -893,6 +897,59 @@ if ($script:archiveErrors.Count -gt 0) {
     $candidateFixtureGeneratorPdfDependencyPath = $null
 
     switch ($Scenario) {
+    'GamepadBasic' {
+        $scenarioRoot = Join-Path $dataDir 'gamepad-basic'
+        $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\gamepad-basic.rhai'
+        $libraryDir = Join-Path $scenarioRoot 'library'
+        $candidateFixtureDir = Join-Path $libraryDir 'sub'
+        $candidateSettingsPath = Join-Path $dataDir 'settings-override.json'
+        $candidateFixtureGeneratorPath = Join-Path $PSScriptRoot 'ui-smoke\generate_gamepad_basic_fixture.py'
+        $candidateFixtureGeneratorDependencyPath = Join-Path $PSScriptRoot 'page-turn\generate_fixture.py'
+        $scenarioRoot = Assert-ExactPath $scenarioRoot (Join-Path $repoRoot 'target\portable-smoke\data\gamepad-basic') 'gamepad-basic-fixture'
+        Assert-NoReparsePath $scenarioRoot $dataDir 'gamepad-basic-fixture'
+        if (Test-Path -LiteralPath $scenarioRoot) {
+            Assert-NoReparseTree $scenarioRoot 'gamepad-basic-fixture'
+            Remove-Item -LiteralPath $scenarioRoot -Recurse -Force
+        }
+        foreach ($path in @($candidateScriptPath, $candidateFixtureGeneratorPath, $candidateFixtureGeneratorDependencyPath)) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+                throw "[ui-smoke] gamepad fixture input missing: $path"
+            }
+        }
+        & python $candidateFixtureGeneratorPath $scenarioRoot
+        if ($LASTEXITCODE -ne 0) { throw '[ui-smoke] gamepad fixture generator failed' }
+        Assert-NoReparseTree $scenarioRoot 'gamepad-basic-fixture'
+        if (@(Get-ChildItem -LiteralPath $scenarioRoot -Force).Count -ne 1 -or
+            @(Get-ChildItem -LiteralPath $libraryDir -Force).Count -ne 1) {
+            throw '[ui-smoke] gamepad fixture must contain only library/sub'
+        }
+        $pngFiles = @(Get-ChildItem -LiteralPath $candidateFixtureDir -File | Sort-Object Name)
+        if (($pngFiles.Name -join ',') -ne '01-red.png,02-green.png,03-blue.png' -or
+            @(Get-ChildItem -LiteralPath $candidateFixtureDir -Force).Count -ne 3) {
+            throw '[ui-smoke] gamepad fixture must contain exactly three expected PNGs'
+        }
+        $fixtureHashes = @()
+        foreach ($png in $pngFiles) {
+            $dimensions = Get-PngDimensions $png.FullName
+            if ($dimensions.width -ne 96 -or $dimensions.height -ne 144) {
+                throw '[ui-smoke] gamepad fixture images must be 96x144'
+            }
+            $fixtureHashes += (Get-FileHash -LiteralPath $png.FullName -Algorithm SHA256).Hash
+        }
+        if (@($fixtureHashes | Sort-Object -Unique).Count -ne 3) {
+            throw '[ui-smoke] gamepad fixture images must be byte-distinct'
+        }
+        Write-UiSmokeJson $candidateSettingsPath ([ordered]@{
+            gamepad_enabled = $true
+            auto_fullscreen_image_folders = $false
+            detached_viewer_open_images_in_window = $false
+            grid_view_mode = 'Thumbnail'
+            grid_cols = 3
+            sort_order = 'FileName'
+            default_spread_mode = 'Single'
+            default_reading_flow = 'Paged'
+        })
+    }
     'ClipboardCapture' {
         $scenarioRoot = Join-Path $dataDir 'clipboard-capture'
         $candidateScriptPath = Join-Path $PSScriptRoot 'ui-smoke\clipboard-capture.rhai'
@@ -1747,6 +1804,9 @@ $arguments = @(
     Try-AddUiSmokeEvidenceFile $scriptPath 'inputs/scenario.rhai' 'scenario-script'
     Try-AddUiSmokeEvidenceFile $settingsPath 'inputs/settings-override.json' 'settings-override'
     Try-AddUiSmokeEvidenceDirectory $fixtureDir 'inputs/fixture' 'fixture'
+    if ($Scenario -eq 'GamepadBasic') {
+        Try-AddUiSmokeEvidenceDirectory (Split-Path -Parent $fixtureDir) 'inputs/gamepad-library' 'gamepad-library'
+    }
     if ($script:fixtureGeneratorPath) {
         Try-AddUiSmokeEvidenceFile $script:fixtureGeneratorPath 'inputs/fixture-generator.py' 'fixture-generator'
     }

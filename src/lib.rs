@@ -66,6 +66,8 @@ pub mod ai;
 pub mod ai_caption_db;
 mod app;
 pub(crate) mod caption_display_cache;
+pub(crate) mod cover_auto_crop;
+pub(crate) mod cover_auto_sample;
 pub mod cover_identity;
 pub mod cover_source_scope;
 pub mod depth_addon;
@@ -375,6 +377,7 @@ pub mod save_with_metadata;
 pub mod search_index_db;
 pub mod search_norm;
 pub mod search_query;
+pub(crate) mod search_request;
 pub mod search_walker;
 pub mod search_watcher;
 mod seek_ruler;
@@ -472,6 +475,7 @@ pub use ui_fullscreen::{
 };
 mod ui_details_icon;
 pub mod ui_helpers;
+pub mod ui_history_field;
 mod ui_main;
 pub mod ui_page_overview;
 pub mod ui_pinned_search;
@@ -2698,3 +2702,8 @@ pub use ui_image_folder_zip::draw_snapshot as draw_image_folder_zip_snapshot;
 
 pub mod avif_decoder;
 pub mod image_decode;
+
+#[doc(hidden)]
+pub use ui_dialogs::cover_crop::{
+    draw_cover_auto_crop_snapshot_fixture, draw_cover_crop_snapshot_fixture,
+};

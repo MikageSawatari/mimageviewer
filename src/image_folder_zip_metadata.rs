@@ -199,6 +199,7 @@ fn copy_store_rows(
                         );
                     }
                     if descriptor.table == "folder_thumb_pins" {
+                        let crop = crate::folder_thumb_pins::cover_crop_from_values(columns, row);
                         let get = |name: &str| {
                             columns
                                 .iter()
@@ -229,6 +230,7 @@ fn copy_store_rows(
                         )?;
                         replace_column(columns, row, "source_rel", Value::Text(String::new()))?;
                         replace_column(columns, row, "source_entry", Value::Text(entry))?;
+                        crate::folder_thumb_pins::rebind_cover_crop_values(columns, row, crop);
                     }
                     Ok(())
                 },
@@ -604,6 +606,19 @@ pub(crate) fn copy_rows_on(
         return Ok(0);
     }
     if phase == CopyPhase::Apply {
+        if table == "folder_thumb_pins" {
+            for row in &expected {
+                crate::folder_thumb_pins::write_pin_values(
+                    conn,
+                    table,
+                    &columns,
+                    row,
+                    crate::folder_thumb_pins::PinRowWrite::Insert,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            return Ok(expected.len());
+        }
         let names = columns.join(",");
         let placeholders = (0..columns.len())
             .map(|_| "?")
@@ -1249,5 +1264,57 @@ mod tests {
                 .unwrap(),
             "edit"
         );
+    }
+
+    #[test]
+    fn cover_crop_image_folder_zip_conversion_rebinds_only_valid_source_crop() {
+        use crate::folder_thumb_pins::{CoverCrop, FileKind, FolderPinSource, FolderThumbPinDb};
+        for stale in [false, true] {
+            let (data, _files, manifest) = fixture();
+            let path = data.path().join("folder_thumb_pins.db");
+            let db = FolderThumbPinDb::open_at(&path).unwrap();
+            let crop = CoverCrop::new([0, 0, 400_000, 1_000_000]).unwrap();
+            let source = FolderPinSource::File {
+                rel: "a.jpg".into(),
+                kind: FileKind::Image,
+            };
+            db.set_with_cover_crop(&manifest.source, &source, crop)
+                .unwrap();
+            if stale {
+                // A DB written before the source-change trigger can retain a stale binding.
+                Connection::open(&path)
+                    .unwrap()
+                    .execute_batch(
+                        "DROP TRIGGER folder_thumb_pin_clear_stale_cover_crop;
+                        UPDATE folder_thumb_pins SET source_rel='b.jpg'",
+                    )
+                    .unwrap();
+            }
+            copy_store_rows(
+                data.path(),
+                &manifest,
+                CopyPhase::Apply,
+                &HashMap::new(),
+                &mut || Ok(()),
+            )
+            .unwrap();
+            let pin = db.lookup(&manifest.destination).unwrap();
+            assert_eq!(pin.cover_crop, if stale { None } else { crop });
+            assert!(
+                matches!(pin.source, FolderPinSource::ZipEntry { zip_rel, entry } if zip_rel.is_empty() && entry == if stale { "b.jpg" } else { "a.jpg" })
+            );
+            // Conversion is a copy: even an invalid old row must remain untouched.
+            assert_eq!(
+                Connection::open(&path)
+                    .unwrap()
+                    .query_row(
+                        "SELECT cover_crop_source FROM folder_thumb_pins WHERE container_key=?1",
+                        [crate::path_key::normalize_keep_drive(&manifest.source)],
+                        |r| r.get::<_, Option<String>>(0)
+                    )
+                    .unwrap(),
+                Some("image|a.jpg|-|-".into())
+            );
+        }
     }
 }

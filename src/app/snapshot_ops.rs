@@ -1020,7 +1020,7 @@ impl App {
                 ))
             });
         }
-        // Tagの終了処理はreturn originも消費するので、戻り先とrouteを終了前に対で確定する。
+        // 検索の終了処理はreturn originも消費するので、戻り先とrouteを終了前に対で確定する。
         let top_level_return = top_level_return.map(|restore| {
             let route = self
                 .top_level_grid_view
@@ -1684,21 +1684,10 @@ impl App {
             self.favsearch_pending = None;
         }
 
-        // Ctrl+G (= global search): active false + query/results クリア
+        // 戻り先は保存済み。通常の終了境界でaccepted・prepareも含めて退役する。
         if self.global_search.active {
             had_active = true;
-            self.global_search.active = false;
-            self.global_search.clear_projection_branches();
-            self.global_search.last_change_at = None;
-            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Metadata);
-            self.clear_search_draft_on_end(crate::ui_pinned_search::PinnedSearchKind::Everything);
-            self.global_search.last_executed.clear();
-            self.global_search.containers.clear();
-            self.global_search.all_hits.clear();
-            self.global_search.drill = None;
-            self.global_search.done = false;
-            // SearchHandle は Drop impl で cancel.store する (= take で OK)
-            self.global_search.pending = None;
+            let _ = self.dismiss_global_search_without_restore();
         }
 
         had_active

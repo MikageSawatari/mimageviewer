@@ -13,8 +13,8 @@
 
 ## 永続 ID と固定枠
 
-- `ContextMenuItemId` は表示名や実行時 payload に依存しない静的 leaf の stable ID だけを持つ。
-  Root と Open With の親 ID を別に保存し、submenu を平坦化しない。
+- `ContextMenuItemId` は表示名や実行時 payload に依存しない静的項目の stable ID を持つ。
+  「名前で検索」は親自身も静的項目とし、その子、Root、Open With の親 ID を別に保存して submenu を平坦化しない。
 - 登録済み外部ツール群、Open With submenu、関連付けアプリ群は、元の capability-filtered tree
   にある位置と内部順を保つ固定枠である。設定 catalog、非表示一覧、共有 JSON へは出さない。
 - Windows Shell 群も従来どおり native renderer が末尾に置く固定枠で、サブメニュー / 同階層
@@ -25,8 +25,11 @@
 `context_menu_model` は従来どおり可否判定済みの tree を先に構築する。その後、同一階層の元の
 unit 列を static configurable slot と fixed slot に分類する。保存済み static ID は configurable
 slot の間だけで並べ替え、fixed slot の位置と内容は動かさない。非表示も static item にだけ適用する。
+まず可否判定済みの全 slot に保存順を割り当て、その後で表示設定と子階層の layout を解決する。
+空になった submenu を除いてから区切り線を出す。非表示の leaf・親・全非表示の子によって slot を先に詰め直したり、
+消えた親の区切り線指定を次の可視項目へ残したりしない。
 
-区切り線は stable leaf ごとに `Inherit / Present / Absent` を保存する。並べ替え時は actual item ID と
+区切り線は静的項目の stable ID ごとに `Inherit / Present / Absent` を保存する。並べ替え時は actual item ID と
 `MenuNode` payload を一緒に移し、slot 側の section は既定境界としてその位置に残す。`Inherit` は
 移動先 slot の既定境界、`Present / Absent` は item と一緒に移る明示指定になる。fixed slot の直前、
 動的group内部、Windows Shellとの境界は設定対象にしない。最後の `normalize_menu` が空・先頭・末尾・
@@ -45,7 +48,7 @@ JSON にも同フィールドを含める。旧 JSON で欠落した場合は標
 右クリック設定も標準へ置き換える。
 
 環境設定は「通常メニュー」と「右クリックメニュー」を別ページにする。右クリック側では Root /
-Open With を別々に編集し、1項目だけの Open With 階層には意味のない上下ボタンを出さない。
+Open With / 名前で検索を別々に編集し、1項目だけの Open With 階層には意味のない上下ボタンを出さない。
 確認用の表示場面を選ぶと、`context_menu_model` が固定fixtureをproductionの
 `build_context_menu`へ通し、各stable leafがその場面で対象になるか、実際に直前の区切り線が
 表示されるかを返す。UI側にitem-kind/capability表を複製しない。
@@ -62,7 +65,7 @@ Open With を別々に編集し、1項目だけの Open With 階層には意味�
 Stack、複数実ファイル選択、フルスクリーン画像・動画を持つ。さらに外部ツール1件・関連付けアプリ
 1件を含む画像sceneを別に置く。通常sceneには両動的groupを含めず、各sceneのラベルと説明にfixture
 条件を明記する。これは実行中のフォルダやOS関連付けの列挙ではなく、場面差を確認する固定例である。
-全stable leafが少なくとも1sceneで対象になることを回帰で固定する。
+親自身を含む全stable IDが少なくとも1sceneで対象になることを回帰で固定する。
 
 ## 受入条件
 

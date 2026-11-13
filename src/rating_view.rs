@@ -78,8 +78,7 @@ pub(crate) struct RatingViewPreparedItems {
     pub(crate) items: Vec<GridItem>,
     pub(crate) image_metas: Vec<Option<(i64, i64)>>,
     pub(crate) existing_keys: std::collections::HashSet<String>,
-    pub(crate) pin_map:
-        std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    pub(crate) pin_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin>,
     pub(crate) video_items: Vec<(usize, PathBuf, u64)>,
     pub(crate) video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
     pub(crate) page_edits: crate::app::page_edit_snapshot::StablePageEditProjection,
@@ -355,7 +354,7 @@ fn prepare_rating_view(
         .iter()
         .zip(image_metas.iter())
         .flat_map(|(item, meta)| {
-            crate::app::folder_thumb_existing_keys_for_with_visibility(
+            crate::app::folder_thumb_existing_keys_for_with_auto_crop(
                 item,
                 *meta,
                 &pin_map,
@@ -364,6 +363,11 @@ fn prepare_rating_view(
                 options.folder_thumb_depth,
                 true,
                 &options.visibility,
+                options.sidecar_settings.thumb_cover_auto_crop.then(|| {
+                    crate::cover_auto_crop::AutoCropIdentity::new(
+                        options.sidecar_settings.default_reading_direction,
+                    )
+                }),
             )
         })
         .collect();

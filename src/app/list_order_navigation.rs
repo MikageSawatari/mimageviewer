@@ -1,5 +1,4 @@
-//! Frozen main-folder book order. Position is derived from the mounted logical source;
-//! open requests and their asynchronous adoption never carry or update a cursor.
+//! Frozen book order. Position is derived from the mounted logical source, never a cursor.
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,7 +18,14 @@ pub(crate) struct ListOrderEntry {
 #[derive(Clone, Debug)]
 pub(crate) struct ListOrderSnapshot {
     pub(crate) owner: ViewerContextId,
+    pub(crate) scope: ListOrderScope,
     pub(crate) entries: Arc<[ListOrderEntry]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ListOrderScope {
+    Folder,
+    Everything { run: u64 },
 }
 
 impl ListOrderEntry {
@@ -41,6 +47,26 @@ impl ListOrderEntry {
 }
 
 impl App {
+    pub(crate) fn current_list_order_scope(&self) -> Option<ListOrderScope> {
+        use crate::global_search_ui::SearchAccepted;
+        if self.projected_viewer_context_id() != self.viewer_context_main()
+            || self.is_snapshot_active()
+        {
+            return None;
+        }
+        match self.top_level_grid_view.surface() {
+            top_level_grid_view::TopLevelGridSurface::Folder => Some(ListOrderScope::Folder),
+            top_level_grid_view::TopLevelGridSurface::Search(
+                top_level_grid_view::TopLevelSearchView::Global,
+            ) if self.global_search.active => match &self.global_search.accepted {
+                SearchAccepted::Everything { submitted, .. } => {
+                    Some(ListOrderScope::Everything { run: submitted.run })
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
     #[cfg(test)]
     pub(crate) fn list_order_pending_owners_for_test(&self) -> (bool, bool) {
         (
@@ -50,12 +76,18 @@ impl App {
     }
 
     pub(crate) fn capture_main_folder_list_order(&mut self, idx: usize) {
-        if self.projected_viewer_context_id() != self.viewer_context_main()
-            || !matches!(
-                self.top_level_grid_view.surface(),
-                top_level_grid_view::TopLevelGridSurface::Folder
-            )
-            || self.is_snapshot_active()
+        let Some(scope) = self.current_list_order_scope() else {
+            return;
+        };
+        if matches!(scope, ListOrderScope::Everything { .. })
+            && (!self.items_are_global_search_view
+                || !matches!(
+                    self.global_search.accepted,
+                    crate::global_search_ui::SearchAccepted::Everything {
+                        position: crate::global_search_ui::EverythingPosition::Root,
+                        ..
+                    }
+                ))
         {
             return;
         }
@@ -74,10 +106,19 @@ impl App {
             .current_grid_order()
             .iter()
             .filter_map(|&index| self.items.get(index).and_then(ListOrderEntry::from_item))
-            .filter(|entry| seen.insert(crate::path_key::normalize_keep_drive(&entry.path)))
+            .filter(|entry| match scope {
+                ListOrderScope::Folder => {
+                    seen.insert(crate::path_key::normalize_keep_drive(&entry.path))
+                }
+                ListOrderScope::Everything { .. } => {
+                    crate::path_key::physical_path_spelling(&entry.path)
+                        .is_some_and(|key| seen.insert(key))
+                }
+            })
             .collect::<Vec<_>>();
         self.list_order = Some(Arc::new(ListOrderSnapshot {
             owner: self.viewer_context_main(),
+            scope,
             entries: entries.into(),
         }));
     }
@@ -91,25 +132,44 @@ impl App {
                 ViewerPresentation::MainWindow | ViewerPresentation::Fullscreen
             )
             || self.navigation_scope.is_detached_physical()
-            || !matches!(
-                self.top_level_grid_view.surface(),
-                top_level_grid_view::TopLevelGridSurface::Folder
-            )
-            || self.is_snapshot_active()
+            || Some(snapshot.scope) != self.current_list_order_scope()
         {
             return None;
         }
         let current = self.effective_folder()?;
-        let position = snapshot
-            .entries
-            .iter()
-            .position(|entry| crate::folder_tree::path_eq(&entry.path, &current))
-            .or_else(|| {
+        let position = match snapshot.scope {
+            ListOrderScope::Folder => snapshot
+                .entries
+                .iter()
+                .position(|entry| crate::folder_tree::path_eq(&entry.path, &current))
+                .or_else(|| {
+                    snapshot.entries.iter().position(|entry| {
+                        entry.kind == ListOrderEntryKind::Folder
+                            && metadata_ops::path_in_subtree_ci(&current, &entry.path)
+                    })
+                })?,
+            ListOrderScope::Everything { .. } => {
+                use crate::global_search_ui::{EverythingPosition, SearchAccepted};
+                let SearchAccepted::Everything {
+                    position: EverythingPosition::PhysicalChild { logical_source, .. },
+                    ..
+                } = &self.global_search.accepted
+                else {
+                    return None;
+                };
+                let key = crate::path_key::physical_path_spelling(logical_source)?;
                 snapshot.entries.iter().position(|entry| {
-                    entry.kind == ListOrderEntryKind::Folder
-                        && metadata_ops::path_in_subtree_ci(&current, &entry.path)
-                })
-            })?;
+                    crate::path_key::physical_path_spelling(&entry.path).as_ref() == Some(&key)
+                        && (crate::path_key::physical_path_spelling(&current).as_ref()
+                            == Some(&key)
+                            || (entry.kind == ListOrderEntryKind::Folder
+                                && crate::path_key::physical_path_is_strict_descendant(
+                                    &current,
+                                    &entry.path,
+                                )))
+                })?
+            }
+        };
         Some((Arc::clone(snapshot), position))
     }
 }
