@@ -694,23 +694,41 @@ fn draw_window(
             if let Phase::Ready(draft)=phase
                 && let Some(error)=&draft.error
             { reserved.colored_label(reserved.visuals().error_fg_color,error); }
-            let row_height = [OK_LABEL, "キャンセル", "手動の範囲を解除"]
-                .into_iter()
-                .map(|label| egui::WidgetText::from(label)
-                    .into_galley(&reserved, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Button)
-                    .size().y + 2.0 * reserved.spacing().button_padding.y)
-                .fold(reserved.spacing().interact_size.y, f32::max);
+            // Measure real buttons with this style, rather than assuming a
+            // label width or padding. The child does not allocate into the
+            // footer and its sizing widgets cannot receive input.
+            let button_sizes = {
+                let mut measure = reserved.new_child(egui::UiBuilder::new()
+                    .id_salt("cover-crop-button-sizing").invisible().sizing_pass()
+                    .layout(egui::Layout::top_down(egui::Align::Min)));
+                [OK_LABEL, "キャンセル", "手動の範囲を解除"].map(|label| {
+                    measure.add(egui::Button::new(label).wrap_mode(egui::TextWrapMode::Extend)).rect.size()
+                })
+            };
+            let row_height = button_sizes.iter().map(|size| size.y).fold(0.0, f32::max);
+            let row_width = button_sizes.iter().map(|size| size.x).sum::<f32>()
+                + 2.0 * reserved.spacing().item_spacing.x + reserved.visuals().resize_corner_size;
+            let wrap_clear = reserved.available_width() < row_width;
+            let can_clear = matches!(phase, Phase::Ready(draft) if draft.had_manual_crop);
+            if wrap_clear {
+                // The footer grows bottom-up, so allocate its lower row first.
+                // Its actual height and inter-row spacing reduce the body below.
+                reserved.allocate_ui_with_layout(
+                    egui::vec2(reserved.available_width(), button_sizes[2].y),
+                    egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    if ui.add_enabled(can_clear, egui::Button::new("手動の範囲を解除")).clicked() { action = Action::Clear; }
+                });
+            }
             reserved.allocate_ui_with_layout(
                 egui::vec2(reserved.available_width(), row_height),
                 egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 let ready = matches!(phase, Phase::Ready(_));
                 if ui.add_enabled(ready, egui::Button::new(OK_LABEL)).clicked() || enter && ready { action = Action::Accept; }
                 if ui.button("キャンセル").clicked() { action = Action::Cancel; }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if !wrap_clear { ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(ui.visuals().resize_corner_size);
-                    let can_clear = matches!(phase, Phase::Ready(draft) if draft.had_manual_crop);
                     if ui.add_enabled(can_clear, egui::Button::new("手動の範囲を解除")).clicked() { action = Action::Clear; }
-                });
+                }); }
             });
             // In top-down reading order: 8 pt, separator, 4 pt, action row.
             reserved.add_space(4.0);
@@ -1601,6 +1619,146 @@ mod tests {
                             _ => !h.state().open,
                         },
                         "{kind} {scale}: {label} click not handled"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cover_crop_minimum_width_wraps_clear_and_keeps_buttons_clickable_at_100_and_200_percent() {
+        for scale in [1.0, 2.0] {
+            for auto_enabled in [false, true] {
+                for label in [OK_LABEL, "キャンセル", "手動の範囲を解除"] {
+                    let mut fonts_ready = false;
+                    let mut h = crate::test_ui::builder()
+                        .with_size(egui::vec2(1093.0, 614.0))
+                        .build_ui_state(
+                            move |ui, state: &mut PureWindowState| {
+                                let ctx = ui.ctx();
+                                if !fonts_ready {
+                                    crate::ui_fonts::configure_fonts(ctx);
+                                    crate::settings::apply_ui_scale_factor(ctx, scale);
+                                    fonts_ready = true;
+                                    ctx.request_repaint();
+                                    return;
+                                }
+                                let phase = state.phase.get_or_insert_with(|| {
+                                    let prepared = fake_prepared(Some(
+                                        CoverCrop::new([0, 0, 500_000, 1_000_000])
+                                            .unwrap()
+                                            .unwrap(),
+                                    ));
+                                    Phase::Ready(CropDraft {
+                                        source: prepared.source,
+                                        texture: ctx.load_texture(
+                                            "narrow-cover",
+                                            prepared.image,
+                                            egui::TextureOptions::LINEAR,
+                                        ),
+                                        rotation: Rotation::None,
+                                        crop: crop_rect(prepared.crop),
+                                        had_manual_crop: true,
+                                        auto_enabled,
+                                        drag: None,
+                                        error: None,
+                                    })
+                                });
+                                let action = draw_window(ctx, &mut state.open, phase, false, false);
+                                if action != Action::None {
+                                    state.action = action;
+                                }
+                                state.responses = state
+                                    .watched
+                                    .iter()
+                                    .filter_map(|id| ctx.read_response(*id))
+                                    .collect();
+                                state.canvas = ctx.data(|data| {
+                                    data.get_temp(egui::Id::new("cover-crop-canvas-geometry"))
+                                });
+                            },
+                            PureWindowState {
+                                phase: None,
+                                kind: 1,
+                                open: true,
+                                action: Action::None,
+                                watched: vec![],
+                                responses: vec![],
+                                canvas: None,
+                            },
+                        );
+                    h.run_steps(8);
+                    let window_id = egui::Id::new("cover-crop-window");
+                    let before = h.ctx.memory(|memory| memory.area_rect(window_id)).unwrap();
+                    // Exercise the actual resize edge, dragging past the 240 pt
+                    // minimum so Window's own constraint decides the final width.
+                    let start = before.right_center();
+                    h.hover_at(start);
+                    h.run_steps(2);
+                    h.event(egui::Event::PointerButton {
+                        pos: start,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                    h.run_steps(1);
+                    let end = egui::pos2(before.left() + 100.0, start.y);
+                    h.event(egui::Event::PointerMoved(end));
+                    h.run_steps(3);
+                    h.event(egui::Event::PointerButton {
+                        pos: end,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                    h.run_steps(8);
+                    let window = h.ctx.memory(|memory| memory.area_rect(window_id)).unwrap();
+                    assert!(
+                        (window.width() - 240.0).abs() <= 1.0,
+                        "{scale}/{auto_enabled}: resize did not reach minimum: {before:?} -> {window:?}"
+                    );
+                    let buttons = [OK_LABEL, "キャンセル", "手動の範囲を解除"]
+                        .map(|label| h.get_by_label(label).rect());
+                    let [ok, cancel, clear] = buttons;
+                    assert!(ok.right() < cancel.left());
+                    assert!((ok.center().y - cancel.center().y).abs() <= 1.0);
+                    assert!(clear.top() > ok.bottom().max(cancel.bottom()));
+                    assert!((clear.left() - ok.left()).abs() <= 1.0);
+                    for (i, rect) in buttons.iter().enumerate() {
+                        assert!(
+                            window.contains_rect(*rect),
+                            "{scale}/{auto_enabled}: button outside window: {rect:?} in {window:?}"
+                        );
+                        for other in buttons.iter().skip(i + 1) {
+                            assert!(!rect.intersects(*other));
+                        }
+                    }
+                    let (canvas, body) = h.state().canvas.unwrap();
+                    assert!(body.contains_rect(canvas));
+                    assert!(body.bottom() < ok.top());
+                    let node = h.get_by_label(label);
+                    let id = unsafe {
+                        egui::Id::from_high_entropy_bits(
+                            (u128::from(node.accesskit_node().id()) >> 64) as u64,
+                        )
+                    };
+                    h.state_mut().watched = vec![id];
+                    h.run_steps(2);
+                    let response = &h.state().responses[0];
+                    assert!(response.interact_rect.contains_rect(response.rect));
+                    let center = response.rect.center();
+                    h.hover_at(center);
+                    h.run_steps(2);
+                    assert!(h.state().responses[0].hovered());
+                    h.get_by_label(label).click();
+                    h.run_steps(2);
+                    assert!(
+                        h.state().action
+                            == match label {
+                                OK_LABEL => Action::Accept,
+                                "キャンセル" => Action::Cancel,
+                                _ => Action::Clear,
+                            }
                     );
                 }
             }

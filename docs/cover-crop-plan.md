@@ -912,6 +912,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local
 - 操作行を下端のスクロール外へ移し、左に「  OK  」「キャンセル」、右に「手動の範囲を解除」を置く。
   footerを先に下から配置し、ボタン・検証エラー・補足文の実高さと間隔を除いた残りだけを本文へ渡す。
   見出し、Enter/Escape、各操作の有効条件と保存経路は維持し、検証エラーは操作行の直下に固定する。
+  最小幅への縮小時は、非表示の計測用UIで得たボタンの実寸・間隔・右端余白から必要幅を判定し、
+  収まらないときだけ解除をOK／キャンセルの下の行へ左寄せする。2行の実高さも本文の残り高さへ反映する。
+  100%／200%で実際の窓の右辺を最小幅までドラッグし、手動範囲あり・自動ON/OFFの3ボタンの
+  非重複・窓内への収容・クリック到達性を検査する。
 - 画像の左右は24ptとし、角の判定9pt＋ウィンドウの標準リサイズ判定10ptに5ptの間隔を取る。
   上下は説明・操作領域に接するため、角の判定が収まる12ptにする。説明文は画像の下にまとめる。
   窓の外側には40ptを目安に余白を取り、小画面では従来の16ptまで縮めて画像の高さを優先する。
@@ -942,3 +946,7 @@ snapshotは指定4件を更新して目視し、更新指定なしの`ui_snapsho
 `ui_snapshot`257件が成功。4枚を目視し、残り548枚は元のSHA-256と一致した。
 追加修正のログは`target/764ui-baseline-measure.log`、`target/764ui-followup-geometry-final.log`、
 `target/764ui-followup-snapshot-update.log`、`target/764ui-followup-final.log`。
+
+最小幅での折り返しの追補検証は、実リサイズ・クリックを含む焦点5件と
+`cover_crop|context_menu`269件、更新指定なしの`ui_snapshot`257件が成功。
+広い画面の画像高は上記の値を維持。ログは`target/764ui-wrap-focused.log`、`target/764ui-wrap-final.log`。
