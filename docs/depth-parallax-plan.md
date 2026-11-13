@@ -800,6 +800,90 @@ Remote・トレイ・終了、まれな失敗の割り切り) は妥当との確
 **文書**: マニュアル (3D 写真の「使える場面」: 別ウィンドウでも使える、一度に 1 つの窓だけ、独立した窓でモデル確認・書き出し中はその窓を閉じたり
 他の窓へ切り替えたりできない)、keymap-spec の 3D の節、本書 §1・§6.1・§6.4・§6.4.2 の「第 2 段は保留」の記述、detached-rework-plan §11 (第 2 段の記録)。
 
+#### 6.4.4 第 2 段の実機課題の修正 (§1.767、2026-11-13、設計)
+
+**対象**: §17.16 の課題 1〜4。サブ PC 確認 依頼 39 (観測はサブ PC 担当) で見つかった。原因の調査は実装担当とは別の GPT-6.1 Sol / high (read-only) が
+コードと `C:\miv-subpc\results-39\` のログで行い、設計担当がコードで照合した。課題 1〜3 はどれも v5.1.0 から既存の detached の所有の不整合で、
+第 2 段の「同時に 1 context だけが 3D を持つ」規則で利用者に見えるようになった (課題 3 の「断られる」組合せだけが第 2 段で生じた)。
+凍結ルールにより、どれも症状パッチではなく所有の移動・確定点を正す構造的修正とし、独立 Sol / xhigh と合意して detached-rework-plan §11 に記録する。
+
+**課題 1 — 独立した窓の中の送りで独立性を失う (BA-7)**
+
+- 原因: 送りの行き先は `requested_viewer_presentation_for_open` が「今の session が独立 detached で、次が静止画」を根拠に DetachedWindow を選ぶ
+  (第 1 条件)。ところが確定の `prepare_viewer_presentation_open` は独立性を `detached_still_open_is_independent` (「画像を別ウィンドウで開く」設定か
+  一度きりの指定) で決め直し、今の session の独立性を見ない。フル機能モードで独立になったメディアウィンドウ (メインで別のものを開いて
+  ParkedLive になり、再び有効にした窓) では、動画→最初の画像で独立性が false になり、次の送りは F12 設定 OFF なら `open_non_detached` でメインへ移る。
+  同じ事実 (この session は独立か) を 2 か所で別々に決めているのが根本。
+- 修正: 表示先と独立性を 1 回の解決で決め、確定時に設定から決め直さない。**既存の session の中の移動 (送り・ページ移動・フォルダ移動後の reopen など、
+  新しい閲覧を始めない遷移) は、今の session の独立性を引き継ぐ**。一覧・外部・コレクションなどから新しく開く場合は、今どおり設定と一度きりの指定で決める。
+  解決結果 (presentation, independent) を 1 つの値として `prepare_viewer_presentation_open` の確定点へ渡し、`commit_viewer_session` はその値だけを書く。
+  「既存 session の中の移動か」は呼び出し元の既存の区別 (fs navigation と grid open の入口) から型で渡し、App に新しい bool / Option を足さない。
+- 通常の使い方への影響 (3D を使わなくても変わる): **独立したメディアウィンドウで画像を送り続けられるようになる** (今は 2 枚目からメインへ移り、
+  メディアウィンドウは閉じる)。一覧から動画を開いただけの連動したメディアウィンドウ (メインの閲覧の一部) は変えない (画像へ進むとメインで開く)。
+  F12 の連動ウィンドウ・複数ウィンドウモードの窓は、もともと独立性が設定と一致しているので変わらない。1 枚目は今も窓に留まるので、
+  「1 枚目は窓、2 枚目はメイン」という食い違いをなくす変更であり、手間が増える・できなくなる操作は無い。
+- 3D は、表示先が変わらない送りでは続く (§6.4.1 の継続条件のまま)。
+
+**課題 2 — 再開した窓が、閉じた後に待機中の窓として作り直される (BA-7、BA-5 関連)**
+
+- 原因: `activate_detached_image_window_snapshot` は、再開する窓の snapshot を `detached_image_windows` から先に remove し、その後で
+  `park_and_close_current_active_detached_viewer` を呼ぶ。そこで使う `active_viewer_context_id` は、session が無いとき window binding /
+  `last_active_detached_window_id` から移動元を探し、「snapshot が無い窓 = active」と判定する。再開する窓が直前の active 窓だった場合
+  (pause → 再開)、snapshot を先に消したためにその窓自身が移動元と判定され、`pause_current_active_viewer_context` が同じ context の snapshot を
+  もう一度 push する。再開後は active と snapshot の両方に同じ窓番号が残る。active の間は passive 描画から現在の active id が除外されるので見えず、
+  × の active close が snapshot を消さないため、閉じた後に `render_detached_image_windows` が残った snapshot を `deferred_passive_seed` で描き直す。
+  メインの全画面の close (`main focus guard`) は前提ではない。3D も成立条件ではない (v5.1.0 から既存)。
+- 修正: 再開を **移動元と移動先を明示した 1 つの所有の移動**にする。移動元 (今の active owner) を、対象の snapshot を消す前に確定し、
+  対象の取り出しで移動元を推定し直さない。snapshot の消費・active の選択・runtime の遷移を同じ処理が確定する。ParkedLive の再開
+  (`activate_parked_live_media_window_snapshot`、移動元を park してから対象を remove する) と同じ順序の規則にそろえ、両方が同じ helper を通る形を優先する。
+  描画側に「registry に無い snapshot は描かない」guard を足すことはしない (孤児の snapshot と所有の不整合が残るため)。
+- 通常の使い方への影響: なし (二重登録の除去のみ)。
+
+**課題 3 — 描かれないメインの全画面が 3D を持ち続ける (BA-7、BA-5 関連)**
+
+- 原因: 独立した窓の context を更新したフレームでは、メインの閲覧は埋め込み表示のときだけ描かれ、通常の全画面は描かれない
+  (`should_render_main_fullscreen_viewport_after_detached_context`、既存テスト `main_embedded_fullscreen_still_renders_while_detached_context_is_active`
+  が意図として検査)。全画面の child viewport は呼ばれないので egui が退役させ、root は一覧を描く (利用者には「全画面が閉じて一覧に戻った」と見える)。
+  一方でメインの `fullscreen_idx`・presentation・Depth はそのまま残る。detached の pause は Depth を終えるが、この「メインが表示を失う」遷移は
+  その終了の境界を通らない。第 2 段の入場条件は兄弟の Depth の有無だけを読むので、見えないメインが持ち主として残り、別の窓の D が断られる。
+- 修正: **メインが表示を失う遷移 (独立した context を有効にして、メインの全画面が描かれなくなる確定点) で、メイン context の中で既存の
+  `set_fs_exclusive_view(None)` を行い 3D を終える**。要求の取消と GPU slot の除去は既存の Depth 終了と同じ経路で済む。埋め込み表示のメインは
+  実際に描かれるので終えない (その場合の「別のウィンドウで表示中」の拒否は維持)。確定点は、独立 context を active にする既存の入口
+  (ParkedLive の再開、passive 窓の再開、新しい独立窓を開く入口) を列挙し、1 つの helper にまとめる。D の判定から兄弟を書き換えたり、
+  毎フレームの描画結果を見て終えたりはしない。
+- 採らない案: メインの見えない全画面の閲覧そのものを閉じる (状態は最も減るが、3D を使わない通常の閲覧で閲覧位置・`fullscreen_keep_on_app_switch` の
+  保持を変える。リリース済みの挙動の変更なので利用者の判断が要り、今回の範囲を超える)。入場判定で見えないメインの Depth を無視する
+  (単一 owner の規則を破り、要求と GPU slot が 2 つになる)。
+- 通常の使い方への影響: メインの全画面で 3D 中に独立した窓を有効にすると、メインの 3D が終わる (戻ったときは D で再開)。これは detached の
+  pause と同じ規則で、3D 以外の閲覧は変えない。
+
+**課題 4 — 文言**
+
+- マニュアル `fullscreen.html` の「その窓を閉じる操作、ほかの閲覧ウィンドウへの切り替え、外部からファイルを開く操作、自動のページ送りが止められる場合があります」
+  を、外部からの要求は画面を閉じた後に開くこと (`src/app/startup_ops.rs` の既存の保留、最後の 1 件) が分かる文言に直す。
+- 「一度に 1 つのウィンドウだけ」の説明に、ほかの窓へ切り替えると前の窓の 3D は終わることを加える (断られるのは前の窓が表示されたまま 3D を
+  持っているときだけ)。
+
+**記録のみ (課題 5)**: 一覧にマウスが届かなかった件は原因不明のまま (§17.16 の 5)。課題 3 の「一覧が描かれていても、見えないメインの閲覧が
+残っている」状態との関係は未確認 (依頼 39 の 1 回目の経路ではメインの全画面は Esc で閉じていた)。
+
+**テスト** (旧実装で落ちること):
+
+1. 状態遷移 / handler: 設定 OFF で独立したメディア session → 画像 A → 画像 B。両方の移動後も同じ context・window_id・DetachedWindow・独立性。
+   Depth あり / なし。ありでは表示先変更による Depth 終了が起きない。対照: 連動のメディアウィンドウ (一覧から動画を開いた直後) の画像はメインへ、
+   明示的な F12 の切替、動画への往復、一覧から新しく開く場合は今どおり設定で決まる。
+2. 状態遷移: 最後の active 窓 A を pause → A を再開した直後に、A の passive snapshot が 0 件。実 close handler を 1 回通すと、context・binding・
+   runtime・passive の描画要求がすべて消え、後続の root pass で同じ id を再登録しない (multiwindow scenario で、メインが一覧 / 全画面、Depth あり / なし)。
+   通常の A→B 切替、ParkedLive の再開、再開を断る場合の対象の保持も回帰に含める。
+3. 状態遷移 / multiwindow scenario: メインの全画面 + Depth → 独立した窓を実際の activation で有効にする → メインの Depth が終わり、要求の取消・slot の除去が
+   済み、独立した窓の D が成功する。メインの埋め込み表示 + Depth では終わらず、独立した窓の D は OtherWindow で断られる (対照)。
+4. 既存の第 1 段・第 2 段のテストはそのまま通る。
+
+**凍結ルール**: 3 件とも、所有の移動・確定点を 1 か所にそろえる変更で、guard / delay / retry / 追加 repaint / silent fallback を足さない。
+App に detached 用の bool / Option を足さない。viewport の生成・HWND・placement・focus・z-order・bundle swap・backstop は変えない
+(課題 2 の snapshot の push / remove の順序と、課題 1 の確定点に渡す値は変える)。detached-rework-plan §11 に範囲と理由を記録する。
+まれな失敗は既定の割り切り (ログ + 通知)。
+
 ### 6.5 他の機能との関係 — 「表示を占有するモード」を 1 つの述語にする
 
 360° が他の機能を止めている箇所 (調査では 30 か所余り: キー・編集ツールの入口・補正パネル・
