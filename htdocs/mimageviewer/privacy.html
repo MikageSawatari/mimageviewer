@@ -524,6 +524,7 @@
     <ul class="pink-list">
       <li><strong>Update check</strong>: to see whether a newer version exists, the App retrieves the public release information from the distribution source (GitHub). This is an ordinary HTTP request and includes no personally identifying information.</li>
       <li><strong>Optional component download</strong>: only when you choose to, the App downloads optional components (such as AI acceleration packs) from the distribution source. AI caption models and depth models for 3D photos are downloaded from mImageViewer's GitHub Releases only after you confirm the download. Images and text within images are not sent for caption generation or depth calculation.</li>
+      <li><strong>Opening a shooting location on a map</strong>: only when you press "Google マップで開く" (Open in Google Maps) in the GPS field of the information panel, your default browser opens and the latitude and longitude of the shooting location are passed to Google. The photo itself and its file name are not passed. <a href="manual/fullscreen.html#exif">Read the manual</a></li>
       <li><strong>User VST plug-ins you add</strong>: independent network activity follows each plug-in’s behavior. Check the provider’s documentation before use.</li>
       <li><strong>Audio adjustment display</strong>: while audio adjustment is open, the Windows feature used to display it (WebView2) may contact Microsoft to check for its own updates. It does not send song titles or artwork.</li>
       <li><strong>AI app integration (off by default)</strong>: when enabled, mImageViewer passes information locally to an AI app registered on the same PC.
@@ -555,7 +556,7 @@
     <p>The music video editor does not initiate network communication. Audio analysis, previews, and video creation are processed on your PC.</p>
     <p>The App converts EPUB to PDF on your PC and blocks requests to external sites included in the book. If an administrator or user has configured Windows or Edge WebView2 policies, conversion follows those settings.</p>
     <p>
-      These endpoints (GitHub / mikage.to, Microsoft, Tailscale when you use remote viewing, the sites that serve images fetched by clipboard capture, AI app providers, etc.) may record standard access logs (such as IP
+      These endpoints (GitHub / mikage.to, Microsoft, Google when you open a shooting location on a map, Tailscale when you use remote viewing, the sites that serve images fetched by clipboard capture, AI app providers, etc.) may record standard access logs (such as IP
       addresses) under their own privacy policies, but <strong>the developer does not obtain or
       use that information.</strong>
     </p>
