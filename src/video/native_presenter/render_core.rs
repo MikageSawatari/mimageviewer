@@ -2950,6 +2950,8 @@ struct NativeEguiOverlayState {
     hover_texture_key: Option<(u32, u32, u64)>,
     timeline_markers: Vec<NativeOverlayTimelineMarker>,
     jump_entries: Vec<NativeOverlayJumpEntry>,
+    transcript_snapshot: crate::transcript_display::TranscriptSnapshot,
+    transcript_panel_state: crate::transcript_panel::TranscriptPanelState,
     video_adjustments: crate::creative_lut::VideoAdjustments,
     video_scale_filter: VideoScaleFilter,
     video_downscale_smoothing_percent: u32,
@@ -8433,6 +8435,21 @@ impl NativeRenderCore {
         }
     }
 
+    pub(crate) fn set_overlay_transcript_snapshot(
+        &mut self,
+        snapshot: crate::transcript_display::TranscriptSnapshot,
+    ) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            if !overlay.transcript_snapshot.same_presentation(&snapshot) {
+                if overlay.transcript_snapshot.key != snapshot.key {
+                    overlay.transcript_panel_state.reset();
+                }
+                overlay.transcript_snapshot = snapshot;
+                overlay.dirty = true;
+            }
+        }
+    }
+
     pub fn set_video_canvas_color(&mut self, color: [u8; 3]) -> Result<bool, String> {
         self.canvas_background.set_color(&self.d3d_context, color)
     }
@@ -9615,6 +9632,8 @@ impl NativeEguiOverlayState {
             hover_texture_key: None,
             timeline_markers: Vec::new(),
             jump_entries: Vec::new(),
+            transcript_snapshot: Default::default(),
+            transcript_panel_state: Default::default(),
             video_adjustments: crate::creative_lut::VideoAdjustments::default(),
             video_scale_filter: VideoScaleFilter::OsDefault,
             video_downscale_smoothing_percent: 0,
@@ -11147,6 +11166,7 @@ impl NativeEguiOverlayState {
     }
 
     fn reset_side_panel_session(&mut self) {
+        self.transcript_panel_state.reset();
         // A fast source swap reuses the presenter, but this menu belongs to the old video.
         self.dirty |= self.more_popup_open;
         self.more_popup_open = false;
@@ -12924,6 +12944,8 @@ impl NativeEguiOverlayState {
         let hover_preview_pinned = self.hover_preview_pinned;
         let timeline_markers = self.timeline_markers.clone();
         let jump_entries = self.jump_entries.clone();
+        let transcript_snapshot = self.transcript_snapshot.clone();
+        let mut transcript_panel_state = std::mem::take(&mut self.transcript_panel_state);
         let creative_lut_choices = self.creative_lut_choices.clone();
         let mut video_adjustments = self.video_adjustments.clone();
         let mut video_scale_filter = self.video_scale_filter;
@@ -13498,6 +13520,7 @@ impl NativeEguiOverlayState {
                     overlay_height_points,
                     bottom_bar_height,
                     metadata,
+                    &transcript_snapshot,
                     &mut self.tag_picker_open,
                     &mut self.tag_picker_input,
                     &mut self.tag_picker_focus_request,
@@ -13525,6 +13548,8 @@ impl NativeEguiOverlayState {
                     &mut bookmark_title_edit,
                     &mut bulk_bookmark_dialog,
                     &mut video_left_panel_tab,
+                    &transcript_snapshot,
+                    &mut transcript_panel_state,
                     &mut video_adjustment_tab,
                     &mut video_adjustments,
                     &mut video_scale_filter,
@@ -14413,6 +14438,10 @@ impl NativeEguiOverlayState {
         self.seek_strip_drag = seek_strip_drag;
         self.bookmark_title_edit = bookmark_title_edit;
         self.bulk_bookmark_dialog = bulk_bookmark_dialog;
+        if !jump_panel_visible || video_left_panel_tab != NativeVideoLeftPanelTab::Transcript {
+            transcript_panel_state.reset();
+        }
+        self.transcript_panel_state = transcript_panel_state;
         self.video_left_panel_tab = video_left_panel_tab;
         self.video_adjustment_tab = video_adjustment_tab;
         self.video_adjustments = video_adjustments;

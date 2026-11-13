@@ -43,18 +43,56 @@ struct Progress {
 
 pub(crate) struct TranscriptJob {
     state: JobState,
-    queue: VecDeque<TranscriptTarget>,
+    queue: TranscriptQueue,
     current: Option<TranscriptTarget>,
     progress: Progress,
     worker: TranscriptWorker,
     cancel: Arc<AtomicBool>,
 }
 
+/// queue と検索用キーは同じ owner で更新する。表示の毎frameで全パスを正規化しない。
+#[derive(Default)]
+struct TranscriptQueue {
+    items: VecDeque<TranscriptTarget>,
+    keys: HashSet<String>,
+}
+
+impl TranscriptQueue {
+    fn push_back(&mut self, target: TranscriptTarget) -> bool {
+        if !self
+            .keys
+            .insert(crate::path_key::normalize_keep_drive(&target.path))
+        {
+            return false;
+        }
+        self.items.push_back(target);
+        true
+    }
+    fn pop_front(&mut self) -> Option<TranscriptTarget> {
+        let target = self.items.pop_front()?;
+        self.keys
+            .remove(&crate::path_key::normalize_keep_drive(&target.path));
+        Some(target)
+    }
+    fn clear(&mut self) {
+        self.items.clear();
+        self.keys.clear();
+    }
+    #[cfg(test)]
+    fn front(&self) -> Option<&TranscriptTarget> {
+        self.items.front()
+    }
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
 impl TranscriptJob {
     fn new(worker: TranscriptWorker, cancel: Arc<AtomicBool>) -> Self {
         Self {
             state: JobState::Running,
-            queue: VecDeque::new(),
+            queue: TranscriptQueue::default(),
             current: None,
             progress: Progress::default(),
             worker,
@@ -65,15 +103,9 @@ impl TranscriptJob {
         if self.state != JobState::Running {
             return 0;
         }
-        let mut seen: HashSet<_> = self
-            .queue
-            .iter()
-            .map(|p| crate::path_key::normalize_keep_drive(&p.path))
-            .collect();
         let mut added = 0;
         for path in targets.paths {
-            if seen.insert(crate::path_key::normalize_keep_drive(&path.path)) {
-                self.queue.push_back(path);
+            if self.queue.push_back(path) {
                 added += 1;
             }
         }
@@ -136,6 +168,24 @@ impl TranscriptJob {
             self.progress.failed,
             self.progress.discarded
         )
+    }
+
+    pub(crate) fn display_activity(
+        &self,
+        key: &str,
+    ) -> crate::transcript_display::TranscriptActivity {
+        use crate::transcript_display::TranscriptActivity;
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|target| crate::path_key::normalize_keep_drive(&target.path) == key)
+        {
+            TranscriptActivity::Running
+        } else if self.queue.keys.contains(key) {
+            TranscriptActivity::Queued
+        } else {
+            TranscriptActivity::None
+        }
     }
 }
 
@@ -322,7 +372,8 @@ impl App {
                     duration_ms,
                 }) => {
                     if job.state == JobState::Running {
-                        job.progress.processed_ms = processed_ms;
+                        // 先読み窓から次の継ぎ目へ戻る通知でも、同じ入力の表示は戻さない。
+                        job.progress.processed_ms = job.progress.processed_ms.max(processed_ms);
                         job.progress.duration_ms = duration_ms;
                     }
                     None
@@ -788,6 +839,72 @@ mod tests {
         assert_eq!(app.transcript_job.as_ref().unwrap().progress.created, 3);
         app.show_transcript_progress = true;
         assert!(!app.common_modal_dialog_open());
+    }
+
+    #[test]
+    fn transcript_window_progress_is_monotone_and_next_input_resets_to_zero() {
+        use crate::transcript_display::TranscriptActivity;
+        let mut app = crate::app::setup_app_for_test();
+        let (mut job, commands, events) = job();
+        job.append(TranscriptTargets {
+            paths: vec!["a.mp4".into(), "b.mp4".into()],
+            unsupported: 0,
+        });
+        job.advance().unwrap();
+        let _first = commands.try_recv().unwrap();
+        let a = crate::path_key::normalize_keep_drive(Path::new("a.mp4"));
+        let b = crate::path_key::normalize_keep_drive(Path::new("b.mp4"));
+        assert_eq!(job.display_activity(&a), TranscriptActivity::Running);
+        assert_eq!(job.display_activity(&b), TranscriptActivity::Queued);
+        app.transcript_job = Some(Box::new(job));
+        let ctx = egui::Context::default();
+        for processed_ms in [1_830_000, 1_801_000, 1_829_999] {
+            events
+                .send(TranscriptWorkerEvent::Progress {
+                    processed_ms,
+                    duration_ms: 4_000_000,
+                })
+                .unwrap();
+            app.poll_transcript_job(&ctx);
+            let job = app.transcript_job.as_ref().unwrap();
+            assert_eq!(job.progress.processed_ms, 1_830_000);
+            assert_eq!(
+                job.progress.processed_ms as f64 / job.progress.duration_ms as f64,
+                0.4575
+            );
+        }
+        events
+            .send(TranscriptWorkerEvent::ItemDone(
+                TranscriptItemOutcome::AlreadyCreated,
+            ))
+            .unwrap();
+        app.poll_transcript_job(&ctx);
+        let job = app.transcript_job.as_ref().unwrap();
+        assert_eq!(job.progress.processed_ms, 0);
+        assert_eq!(job.progress.duration_ms, 0);
+        assert_eq!(job.display_activity(&a), TranscriptActivity::None);
+        assert_eq!(job.display_activity(&b), TranscriptActivity::Running);
+        events
+            .send(TranscriptWorkerEvent::Progress {
+                processed_ms: 10,
+                duration_ms: 100,
+            })
+            .unwrap();
+        app.poll_transcript_job(&ctx);
+        assert_eq!(
+            app.transcript_job.as_ref().unwrap().progress.processed_ms,
+            10
+        );
+        app.transcript_job.as_mut().unwrap().stop();
+        assert_eq!(
+            app.transcript_job.as_ref().unwrap().display_activity(&b),
+            TranscriptActivity::Running
+        );
+        events
+            .send(TranscriptWorkerEvent::Finished(Ok(())))
+            .unwrap();
+        app.poll_transcript_job(&ctx);
+        assert!(app.transcript_job.is_none());
     }
 
     #[test]

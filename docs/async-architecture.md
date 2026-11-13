@@ -1,6 +1,6 @@
 # 非同期・並列アーキテクチャ
 
-## ローカル文字起こしの transport と作成（T1 区切り2）
+## ローカル文字起こしの transport・作成・表示（T1 区切り3）
 
 `ai::asr_worker` は `mimageviewer-vlm.exe --asr-serve` を Job Object 内で起動する。
 VLM と共有するのは executable の取り出し、framing、子の起動と GPU 列挙だけで、
@@ -35,9 +35,15 @@ FFmpegは既存のdecoder-open・音声一覧と選択関数を共用し、コ�
 
 `transcript.db` のtriggerがrev・indexed・削除印を管理する。STORESの表示cache記述から
 説明文/文字起こしの失効印を作り、metadata転送も同じ完了採用点へ渡す。
-文字起こし表示cacheの受け手は区切り3、索引への反映はT2で接続する。
+App共通の `TranscriptDisplayCache` がこの印で失効する。遅延起動する単一readerが短いread-only SELECTとstatを行い、
+rootはtry_recvとepoch/要求世代の照合だけを行う。clear/invalidate後は旧Arcを外してLoadingを配信する。
+読み取り表示の再入場refreshだけでは既存値を消さず、兄弟panelの本文を維持する。cacheは32entry上限、joinはしない。
+共通snapshotは保存本文、job所属、applied track、作成日、時刻mappingをまとめる。
+nativeのlatest-value commandはmarker同期から独立し、同じ値なら再送しない。
+source swapで空にし、F12のrender core再生成ではsource側のsnapshotを復元する。
+musicは同じbuilderとrendererを使い、panelの一時状態をnativeと共有しない。索引への反映はT2で接続する。
 仕様は [ASR計画 §4〜6](local-asr-transcript-plan.md)、検証記録は
-[区切り1](local-asr-t1-chunk1-report.md)・[区切り2](local-asr-t1-chunk2-report.md) を参照。
+[区切り1](local-asr-t1-chunk1-report.md)・[区切り2](local-asr-t1-chunk2-report.md)・[区切り3](local-asr-t1-chunk3-report.md) を参照。
 
 ## 3D 写真の書き出し worker（2026-11-07、段 C）
 

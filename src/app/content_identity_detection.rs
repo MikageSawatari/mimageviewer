@@ -61,6 +61,9 @@ impl App {
         if effects.caption_display_stale() {
             self.caption_display.clear();
         }
+        if effects.transcript_display_stale() {
+            self.transcript_display.clear();
+        }
         if !effects.content_identity_index_stale() || !self.settings.edit_restore_prompt_enabled {
             return;
         }

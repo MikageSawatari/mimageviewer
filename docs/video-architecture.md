@@ -467,7 +467,12 @@ Windows の owner rule (= owned は owner より常に手前) で、presenter HW
 入力 owner を同じ派生判定で一時抑止する。保存済みの open / lock / tag picker state は変更せず、mode 終了後に
 同じ状態へ戻す。上部・下部 HUD はこの抑止に含めない。
 右メタデータパネルは App の per-file `fs_click_info_open` を正本として presenter へ同期し、
-左パネルは上段の「ジャンプ / 画像補正」タブと、画像補正内の「色調 / フィルタ」タブで構成する。
+左パネルは上段の「ジャンプ / 文字起こし / 画像補正」タブと、画像補正内の「色調 / フィルタ」タブで構成する。
+文字起こしは常時タブを出し、Appの共通snapshotだけを受け取る。render threadでDB/ファイルは読まない。
+古い/別trackの本文は警告とともに保持する。全文折返し一覧はmusicと同じrendererで、可視行だけをlayoutし、
+Fenwick高さ索引を使う。再生中の行へ自動送りし、手動scrollで停止、再生位置へ戻る操作で再開する。
+このfollow/scrollはtab・panelの閉鎖/source変更で破棄する一時状態で、設定へは保存しない。
+右metadataにも同snapshotから文字起こしの状態1行を表示する。
 ジャンプの開閉と選択中タブは presenter-local な session 状態、色調と Creative LUT の値は
 viewer-wide な `Settings::video_adjustments` を正本とする。画像補正パネル末尾には動画専用の
 10 個の保存スロットを読込行 / 保存行で表示する。スロット内容は App 側の
@@ -2987,6 +2992,14 @@ viewport へ切り替わる間に新 viewport がフォーカスを取るまで�
 ⊞ ボタン (× の左)。
 
 ### 動画→音声モード (音楽ビュー)
+
+音楽ビューの左は「ジャンプ / 文字起こし」の2タブ。Appがnative動画と同じsnapshotを作り、
+共通一覧rendererへ渡す。tab/follow/scrollはviewer contextとsourceに属する現在のmusic panel sessionが持ち、
+閉鎖・動画とのmode遷移で破棄する。右情報にも同snapshotの状態1行を出す。
+文字起こしの時刻はコンテナ開始を0とし、`video::transcript_time` だけでraw再生秒への `T + container_start` と逆を行う。
+原点はdecoderが既に開くInputからVideoInfoへ渡し、UI再probeはしない。未知の間は行のseekを禁止する。
+既存seekの `[0, duration_secs - 0.1]` 制限は、原点が非0のTS等で末尾へ移れない既存の再生側の問題として維持する。
+文字起こし専用のclampや迂回は設けない（[ASR計画 §8.3](local-asr-transcript-plan.md#83-時刻の精度)）。
 
 音声ファイル (`GridItem::Audio`) の再生と、動画再生中に映像をカットして音声だけ聴く
 「動画→音声モード」は、どちらも同じ再生エンジンを使い、映像面を egui の音楽ビュー overlay

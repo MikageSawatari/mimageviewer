@@ -503,6 +503,13 @@ sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを
 
 ## 4. 新機能追加時のチェックリスト
 
+文字起こし表示（T1区切り3）のDB SELECTと署名取得は単一readerで行い、UI/presenterは不変のsnapshotとArc本文だけを使う。
+再生原点は既存decoderから取得し、描画で再probeしない。nativeとmusicは可変高一覧rendererを共有する。
+Fenwick索引で可視行を探し、その行だけ全文をlayoutする。高さの変更はpass末尾にまとめて採用し、
+幅/fontの変更でもmanual anchorとpauseを維持する。source/tab/panel閉鎖では一時状態を破棄する。
+job状態・appliedの変化だけでDBを再読込せず、本文Arcも保持する。nativeの同値snapshotは再送しない。
+`transcript/display_render` のms・全行数・layout行数と、明示実行用の5,000行perf testで描画を計測できる。
+
 文字起こし（T1区切り2）の受付は保持済み一覧からパスを捕捉するだけ。GPU列挙、モデル検査/取得、
 FFmpeg probe/変換、文字起こしDB参照・署名再確認・保存、
 削除件数の集計とtransactionは背景workerで行う。取得/削除/作成のroot pollはtry_recvだけを使い、

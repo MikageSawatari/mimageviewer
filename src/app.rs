@@ -10,6 +10,7 @@ mod reading_history_origin;
 use reading_history_origin::MainListRestoreDestination;
 mod grid_parent;
 mod music_bass;
+mod transcript_display;
 
 #[cfg(test)]
 use crate::test_native_focus as foreground_observer;
@@ -17599,6 +17600,9 @@ pub struct App {
         std::collections::HashMap<String, Option<crate::external_metadata::SidecarDisplay>>,
     /// All viewer contexts read this one cache; never move it into ViewerContextBundle.
     pub(crate) caption_display: crate::caption_display_cache::CaptionDisplayCache,
+    /// 表示値だけを共有し、panel session の scroll/follow はここへ入れない。
+    pub(crate) transcript_display: Box<crate::transcript_display_cache::TranscriptDisplayCache>,
+    pub(crate) music_transcript_panel: Box<crate::ui_music_panels::MusicTranscriptPanelSession>,
     /// 360 度パノラマビュー: インタラクティブステート (フルスクリーン内のみ Some)。
     /// 360 モード ON → Some、OFF → None。equirect でない画像へナビした場合は
     /// **保持しつつ非アクティブ化** する設計 (`is_panorama_mode_active(fs_idx)` で判定)。
@@ -21548,6 +21552,8 @@ impl App {
             xmp_panorama_info: std::collections::HashMap::new(),
             sidecar_display_cache: std::collections::HashMap::new(),
             caption_display: crate::caption_display_cache::CaptionDisplayCache::default(),
+            transcript_display: Box::default(),
+            music_transcript_panel: Box::default(),
             fs_exclusive_view: crate::fs_exclusive_view::FsExclusiveView::None,
             video_zoom_state: None,
             #[cfg(windows)]
@@ -93175,6 +93181,7 @@ impl App {
     }
 
     fn close_fs_side_panel_runtime(&mut self) {
+        self.music_transcript_panel.reset();
         // 右情報パネルはロック中だけ維持する。表示対象が変わっても内容を更新するだけで
         // 閉じない、というのがロックの意味 (backlog §1.158)。ロックを解くのは
         // フルスクリーンを本当に出たときだけで、その判断は `close_fullscreen` が持つ。
@@ -100789,6 +100796,7 @@ impl App {
             self.maybe_apply_deferred_native_video_nav(ctx);
             self.poll_audio_track_notice_toast(fs_idx);
             self.sync_native_video_metadata(fs_idx);
+            self.sync_native_transcript_snapshot(ctx, fs_idx);
             self.sync_native_video_timeline_markers(fs_idx);
             self.sync_native_video_tile_overlay(ctx, fs_idx);
             self.sync_native_video_seek_strip(ctx, fs_idx);
@@ -102246,6 +102254,7 @@ impl eframe::App for App {
         #[cfg(windows)]
         self.poll_caption_delete();
         self.caption_display.poll();
+        self.transcript_display.poll();
         self.poll_capture_selection(ctx);
         self.render_update_before_frame(ctx);
         #[cfg(not(windows))]

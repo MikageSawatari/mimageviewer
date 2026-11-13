@@ -1,6 +1,6 @@
 # アーキテクチャ概観
 
-## ローカル文字起こし（T1 区切り2）
+## ローカル文字起こし（T1 区切り3）
 
 VLM worker と同じ exe の ASR 役割が、whisper.cpp v1.9.5 を llama.cpp の ggml 上で使う。
 `ai::worker_transport` / `ai::worker_gpu` が実行ファイル・framing・起動・列挙を共有し、
@@ -9,10 +9,14 @@ VLM worker と同じ exe の ASR 役割が、whisper.cpp v1.9.5 を llama.cpp �
 Appの単一 `TranscriptJob` が受付とRunning/Stoppingを所有し、`transcript_job_worker` が
 FFmpegの逐次抽出・ASR pipeの並列送受信・後処理・署名再確認を伴う保存を実行する。
 `transcript.db` は1本1行の独立storeで、STORES経由の改名・削除・復元とmetadata転送に参加する。
-表示cacheの種類はstore descriptorで宣言し、文字起こし表示への接続は区切り3で行う。
-モデル案内・作成進捗・削除の入口は接続済み。表示・MCP・検索は後続。
+表示cacheの種類はstore descriptorで宣言し、確定した変更でApp共通の `TranscriptDisplayCache` を消す。
+単一readerがDB/署名を読み、世代照合後のArc区間を共通snapshotにまとめる。
+native動画の左3タブ、音楽ビューの左2タブは `transcript_panel` の全文折返し一覧を共有し、右には状態1行だけを出す。
+本文とjob案内は別に保持し、実再生のapplied trackから別trackを導く。panelのscroll/followは各sessionが所有する。
+`video::transcript_time` がコンテナ相対秒とraw PTS秒を双方向に変換する。既存seekの範囲制限は維持する。
+MCP・検索は後続。
 [計画](local-asr-transcript-plan.md)、[区切り1](local-asr-t1-chunk1-report.md)、
-[区切り2](local-asr-t1-chunk2-report.md) を参照。
+[区切り2](local-asr-t1-chunk2-report.md)、[区切り3](local-asr-t1-chunk3-report.md) を参照。
 
 ## 製本した本の管理順（§1.683）
 

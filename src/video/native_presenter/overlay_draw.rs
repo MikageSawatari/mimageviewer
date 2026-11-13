@@ -429,6 +429,7 @@ const VIDEO_JUMP_PANEL_OPTIONS: NativeJumpPanelOptions<'static> = NativeJumpPane
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum NativeVideoLeftPanelTab {
     Jump,
+    Transcript,
     Adjustment,
 }
 
@@ -436,6 +437,63 @@ pub(super) enum NativeVideoLeftPanelTab {
 pub(super) enum NativeVideoAdjustmentTab {
     ColorTone,
     Filter,
+}
+
+#[cfg(test)]
+mod transcript_tab_tests {
+    use super::*;
+    use egui_kittest::kittest::{NodeT, Queryable};
+    #[test]
+    fn native_transcript_tab_is_always_visible_and_routes_selection() {
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(640.0, 650.0))
+            .build_ui_state(
+                |ui, tab| {
+                    draw_native_video_left_panel(
+                        ui.ctx(),
+                        650.0,
+                        64.0,
+                        0.0,
+                        &[],
+                        &HashMap::new(),
+                        None,
+                        &mut None,
+                        &mut None,
+                        tab,
+                        &crate::transcript_display::TranscriptSnapshot::default(),
+                        &mut crate::transcript_panel::TranscriptPanelState::default(),
+                        &mut NativeVideoAdjustmentTab::ColorTone,
+                        &mut crate::creative_lut::VideoAdjustments::default(),
+                        &mut crate::settings::VideoScaleFilter::OsDefault,
+                        &mut 0,
+                        None,
+                        &mut crate::video::anime4k_policy::VideoAnime4kBudgetPreset::default(),
+                        &super::super::NativeVideoAnime4kStatus::Waiting,
+                        &[],
+                        &[],
+                        &mut Vec::new(),
+                        true,
+                        None,
+                    );
+                },
+                NativeVideoLeftPanelTab::Jump,
+            );
+        harness.run_steps(4);
+        for label in ["ジャンプ", "文字起こし", "画像補正"] {
+            let rect = harness.get_by_label(label).rect();
+            assert!(
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(320.0, 650.0))
+                    .contains_rect(rect)
+            );
+        }
+        harness.get_by_label("文字起こし").click();
+        harness.run_steps(2);
+        assert_eq!(*harness.state(), NativeVideoLeftPanelTab::Transcript);
+        harness.get_by_label("ジャンプ").click();
+        harness.run_steps(2);
+        assert_eq!(*harness.state(), NativeVideoLeftPanelTab::Jump);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -450,6 +508,8 @@ pub(super) fn draw_native_video_left_panel(
     bookmark_title_edit: &mut Option<NativeBookmarkTitleEdit>,
     bulk_bookmark_dialog: &mut Option<NativeBulkBookmarkDialog>,
     panel_tab: &mut NativeVideoLeftPanelTab,
+    transcript: &crate::transcript_display::TranscriptSnapshot,
+    transcript_state: &mut crate::transcript_panel::TranscriptPanelState,
     adjustment_tab: &mut NativeVideoAdjustmentTab,
     adjustments: &mut crate::creative_lut::VideoAdjustments,
     scale_filter: &mut crate::settings::VideoScaleFilter,
@@ -491,9 +551,10 @@ pub(super) fn draw_native_video_left_panel(
             let close_reserved = if click_to_show { 32.0 } else { 0.0 };
             let tab_gap = 4.0;
             let tab_width =
-                ((panel_rect.width() - 20.0 - close_reserved - tab_gap) * 0.5).max(70.0);
+                ((panel_rect.width() - 20.0 - close_reserved - tab_gap * 2.0) / 3.0).max(70.0);
             for (index, (tab, label)) in [
                 (NativeVideoLeftPanelTab::Jump, "ジャンプ"),
+                (NativeVideoLeftPanelTab::Transcript, "文字起こし"),
                 (NativeVideoLeftPanelTab::Adjustment, "画像補正"),
             ]
             .into_iter()
@@ -512,6 +573,9 @@ pub(super) fn draw_native_video_left_panel(
                     egui::Sense::click(),
                 );
                 draw_overlay_button_bg(&painter, rect, response.hovered(), *panel_tab == tab);
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label)
+                });
                 painter.text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -524,6 +588,9 @@ pub(super) fn draw_native_video_left_panel(
                     },
                 );
                 if response.clicked() {
+                    if *panel_tab != tab {
+                        transcript_state.reset();
+                    }
                     *panel_tab = tab;
                 }
             }
@@ -531,6 +598,19 @@ pub(super) fn draw_native_video_left_panel(
             let content_rect =
                 egui::Rect::from_min_max(panel_rect.min + egui::vec2(0.0, 36.0), panel_rect.max);
             match *panel_tab {
+                NativeVideoLeftPanelTab::Transcript => {
+                    let inner = content_rect.shrink2(egui::vec2(8.0, 6.0));
+                    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner));
+                    child.set_clip_rect(inner);
+                    if let Some(target_secs) = crate::transcript_panel::draw_transcript_panel_body(
+                        &mut child,
+                        transcript,
+                        position_secs,
+                        transcript_state,
+                    ) {
+                        commands.push(NativeOverlayCommand::Seek { target_secs });
+                    }
+                }
                 NativeVideoLeftPanelTab::Jump => draw_native_jump_panel_body(
                     ui,
                     content_rect,
@@ -574,6 +654,9 @@ pub(super) fn draw_native_video_left_panel(
                 close_clicked = response.on_hover_text("左パネルを閉じる").clicked();
             }
         });
+    if close_clicked {
+        transcript_state.reset();
+    }
     close_clicked
 }
 
@@ -6314,6 +6397,7 @@ pub(super) fn draw_native_metadata_panel(
     overlay_height_points: f32,
     bottom_bar_height: f32,
     metadata: &NativeOverlayMetadata,
+    transcript: &crate::transcript_display::TranscriptSnapshot,
     tag_picker_open: &mut bool,
     tag_picker_input: &mut String,
     tag_picker_focus_request: &mut bool,
@@ -6488,6 +6572,10 @@ pub(super) fn draw_native_metadata_panel(
                     },
                 );
             let mut rows = vec![
+                (
+                    "文字起こし",
+                    crate::transcript_panel::summary_value(transcript),
+                ),
                 ("ファイル", metadata.file_name.clone()),
                 ("タイトル", title.to_string()),
                 ("アーティスト", metadata.artist.clone().unwrap_or_default()),
@@ -8174,6 +8262,7 @@ pub(crate) mod tests {
                     720.0,
                     0.0,
                     &metadata,
+                    &crate::transcript_display::TranscriptSnapshot::default(),
                     &mut picker_open,
                     &mut String::new(),
                     &mut false,
@@ -8367,6 +8456,97 @@ pub(crate) mod tests {
         });
         crate::egui_output::discard_headless_output(output);
         layout.expect("the native top bar must publish its drawn layout")
+    }
+
+    fn native_transcript_composite_harness(
+        dark: bool,
+        missing: bool,
+    ) -> egui_kittest::Harness<'static, crate::transcript_panel::TranscriptPanelState> {
+        use crate::transcript_display::{TranscriptDataState, TranscriptSnapshot};
+        let snapshot = if missing {
+            TranscriptSnapshot {
+                key: "test-video".into(),
+                ..Default::default()
+            }
+        } else {
+            TranscriptSnapshot {
+                key:"test-video".into(),state:TranscriptDataState::Available,
+                segments:Arc::new(vec![
+                    (1000,4000,"今日の予定について、日本語で順番に説明します。長い文章もパネルの幅に合わせて折り返して表示します。".into()),
+                    (5000,9000,"次は、動画の文字起こしから聞きたい場所へ移動します。".into()),
+                    (10000,14000,"行の時刻を押すと、その言葉の少し前から再生します。".into()),
+                ]),
+                used_audio_stream:Some(1),applied_audio_stream:Some(2),
+                time_mapping:crate::video::transcript_time::TranscriptTimeMapping::raw_pts(10.0),
+                ..Default::default()
+            }
+        };
+        let metadata = test_overlay_metadata(
+            "文字起こしの表示例".into(),
+            Ok(crate::video::spherical_metadata::VideoPanoramaTrigger::Auto),
+        );
+        crate::test_ui::builder().with_context_setup(crate::ui_fonts::configure_fonts).with_size(egui::vec2(640.0,650.0)).build_ui_state(move |root_ui,state| {
+            crate::test_ui::full_viewport_ui(root_ui,|root_ui| {
+                let ctx = root_ui.ctx().clone();
+                crate::os_theme::apply_resolved(&ctx,if dark {crate::os_theme::ResolvedTheme::Dark} else {crate::os_theme::ResolvedTheme::Light});
+                root_ui.painter().rect_filled(ctx.content_rect(),0.0,ctx.global_style().visuals.panel_fill);
+                let main_text_color = ctx.global_style().visuals.text_color();
+                // native の独立した暗色 Context を、実 window を作らず同じ描画関数で再現する。
+                crate::os_theme::with_dark_context_style(&ctx,|| {
+                    draw_native_video_left_panel(&ctx,650.0,64.0,11.5,&[],&HashMap::new(),None,&mut None,&mut None,
+                        &mut NativeVideoLeftPanelTab::Transcript,&snapshot,state,&mut NativeVideoAdjustmentTab::ColorTone,
+                        &mut crate::creative_lut::VideoAdjustments::default(),&mut crate::settings::VideoScaleFilter::OsDefault,
+                        &mut 0,None,&mut crate::video::anime4k_policy::VideoAnime4kBudgetPreset::default(),
+                        &super::super::NativeVideoAnime4kStatus::Waiting,&[],&[],&mut Vec::new(),true,None);
+                    draw_native_metadata_panel(&ctx,640.0,650.0,64.0,&metadata,&snapshot,&mut false,&mut String::new(),
+                        &mut false,&mut None,&mut Vec::new(),&mut false,false,false,&mut Vec::new(),true,false,false,None);
+                });
+                assert_eq!(ctx.global_style().visuals.dark_mode,dark,"native の暗色設定を main へ漏らさない");
+                assert_eq!(ctx.global_style().visuals.text_color(),main_text_color);
+            });
+        },crate::transcript_panel::TranscriptPanelState::default())
+    }
+
+    #[test]
+    fn native_transcript_panels_dark_snapshot() {
+        let mut harness = native_transcript_composite_harness(true, false);
+        harness.run_steps(8);
+        harness.snapshot("native_transcript_panels_dark");
+    }
+
+    #[test]
+    fn native_transcript_panels_light_snapshot() {
+        let mut harness = native_transcript_composite_harness(false, false);
+        harness.run_steps(8);
+        harness.snapshot("native_transcript_panels_light");
+    }
+
+    #[test]
+    fn native_transcript_missing_composite_keeps_tab_notice_and_right_summary_visible() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        for dark in [true, false] {
+            let mut harness = native_transcript_composite_harness(dark, true);
+            harness.run_steps(6);
+            let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 650.0));
+            assert!(
+                bounds.contains_rect(
+                    harness
+                        .get_by_role_and_label(egui::accesskit::Role::Button, "文字起こし")
+                        .rect()
+                )
+            );
+            let notice = harness
+                .get_by_label("文字起こしはまだありません。一覧の右クリックで作れます")
+                .rect();
+            assert!(bounds.contains_rect(notice));
+            assert!(notice.right() <= 320.0);
+            let right_summary = harness
+                .get_all_by_label("なし")
+                .map(|node| node.rect())
+                .find(|rect| rect.left() >= 320.0)
+                .expect("右パネルに文字起こしの状態を出す");
+            assert!(bounds.contains_rect(right_summary));
+        }
     }
 
     fn test_overlay_metadata(
@@ -9124,6 +9304,8 @@ pub(crate) mod tests {
                         &mut bookmark_title_edit,
                         &mut bulk_bookmark_dialog,
                         &mut panel_tab,
+                        &crate::transcript_display::TranscriptSnapshot::default(),
+                        &mut crate::transcript_panel::TranscriptPanelState::default(),
                         &mut adjustment_tab,
                         &mut adjustments,
                         &mut scale_filter,
