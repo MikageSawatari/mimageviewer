@@ -331,6 +331,7 @@ impl CatalogWork {
             return Ok(None);
         }
         let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let schema_generation = THUMBNAIL_SCHEMA_GENERATION.load(Ordering::Acquire);
         // One statement/snapshot decides the immutable reader capabilities.
         // An incomplete valid SQLite file is a miss, not a cached legacy reader.
         let columns = {
@@ -359,9 +360,8 @@ impl CatalogWork {
             conn,
             access.clone(),
             self.admission,
-            true,
-            true,
-            columns.contains("cover_key"),
+            schema_generation,
+            ThumbnailColumns::from_names(&columns),
             cover_drive_for(identity),
         )))
     }
@@ -954,17 +954,43 @@ struct ThumbnailColumns {
     auto_material: bool,
 }
 
+impl ThumbnailColumns {
+    const CURRENT: Self = Self {
+        layout: true,
+        proof: true,
+        cover: true,
+        auto_material: true,
+    };
+
+    fn from_names(columns: &HashSet<String>) -> Self {
+        Self {
+            layout: columns.contains("layout_width") && columns.contains("layout_height"),
+            proof: columns.contains("folder_provenance") && columns.contains("selection_proof"),
+            cover: columns.contains("cover_key"),
+            auto_material: columns.contains("auto_crops"),
+        }
+    }
+
+    fn detect(conn: &Connection) -> rusqlite::Result<Self> {
+        let mut statement = conn.prepare("SELECT name FROM pragma_table_info('thumbnails')")?;
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+        Ok(Self::from_names(&names))
+    }
+
+    fn is_current(self) -> bool {
+        self.layout && self.proof && self.cover && self.auto_material
+    }
+}
+
 /// NULL is legacy absence only; a v2 identity requires an explicitly stored kind.
 fn decode_auto_material(filename: &str, value: Option<&str>) -> Option<AutoMaterial> {
     match value {
         Some(value) => AutoMaterial::decode(value),
-        None => {
-            let base = filename
-                .split_once("#pin:")
-                .map_or(filename, |(base, _)| base);
-            (!base.ends_with("|autocrop:v2:rtl") && !base.ends_with("|autocrop:v2:ltr"))
-                .then_some(AutoMaterial::NotAutomatic)
-        }
+        None => (!crate::thumb_loader::representative_auto_crop_key_parts(filename)
+            .is_some_and(|(_, token, _)| token.starts_with("|autocrop:v2:")))
+        .then_some(AutoMaterial::NotAutomatic),
     }
 }
 
@@ -1080,9 +1106,8 @@ impl CatalogDb {
         connection: Connection,
         access: std::sync::Arc<CatalogAccess>,
         admission: CatalogAdmission,
-        has_layout_dims_columns: bool,
-        has_folder_proof_columns: bool,
-        has_cover_key_column: bool,
+        schema_generation: u64,
+        columns: ThumbnailColumns,
         cover_drive: Option<char>,
     ) -> Self {
         let read_only = connection
@@ -1099,15 +1124,7 @@ impl CatalogDb {
             access,
             admission,
             database_path,
-            thumbnail_columns: Mutex::new((
-                0,
-                ThumbnailColumns {
-                    layout: has_layout_dims_columns,
-                    proof: has_folder_proof_columns,
-                    cover: has_cover_key_column,
-                    auto_material: false,
-                },
-            )),
+            thumbnail_columns: Mutex::new((schema_generation, columns)),
             cover_drive,
             read_only,
         }
@@ -1117,14 +1134,14 @@ impl CatalogDb {
         let generation = THUMBNAIL_SCHEMA_GENERATION.load(Ordering::Acquire);
         let mut cached = self.thumbnail_columns.lock().unwrap();
         if cached.0 != generation {
-            cached.1 = ThumbnailColumns {
-                layout: thumbnail_column_exists(conn, "layout_width")?
-                    && thumbnail_column_exists(conn, "layout_height")?,
-                proof: thumbnail_column_exists(conn, "folder_provenance")?
-                    && thumbnail_column_exists(conn, "selection_proof")?,
-                cover: thumbnail_column_exists(conn, "cover_key")?,
-                auto_material: thumbnail_column_exists(conn, "auto_crops")?,
-            };
+            // A migrated writer (including every App catalog-cache producer)
+            // already knows all supported columns. Other catalogs' migrations
+            // must not introduce schema SQL into its UI-side warm reads.
+            // Only a legacy RO capability snapshot can gain missing columns;
+            // those handles are opened/read by the thumbnail I/O workers.
+            if !cached.1.is_current() {
+                cached.1 = ThumbnailColumns::detect(conn)?;
+            }
             cached.0 = generation;
         }
         Ok(cached.1)
@@ -1319,9 +1336,8 @@ impl CatalogDb {
             conn,
             access.clone(),
             admission,
-            true,
-            true,
-            true,
+            THUMBNAIL_SCHEMA_GENERATION.load(Ordering::Acquire),
+            ThumbnailColumns::CURRENT,
             cover_drive_for(folder_path),
         ))
     }
@@ -1364,18 +1380,16 @@ impl CatalogDb {
     ) -> rusqlite::Result<Self> {
         let _lease = access.lease(admission)?;
         let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        let has_layout_dims_columns = thumbnail_column_exists(&conn, "layout_width")?
-            && thumbnail_column_exists(&conn, "layout_height")?;
-        let has_folder_proof_columns = thumbnail_column_exists(&conn, "folder_provenance")?
-            && thumbnail_column_exists(&conn, "selection_proof")?;
-        let has_cover_key_column = thumbnail_column_exists(&conn, "cover_key")?;
+        // Capture the epoch before detection: a migration racing the query
+        // leaves an older epoch and is therefore rechecked on the worker read.
+        let schema_generation = THUMBNAIL_SCHEMA_GENERATION.load(Ordering::Acquire);
+        let columns = ThumbnailColumns::detect(&conn)?;
         Ok(Self::from_connection(
             conn,
             access.clone(),
             admission,
-            has_layout_dims_columns,
-            has_folder_proof_columns,
-            has_cover_key_column,
+            schema_generation,
+            columns,
             cover_drive,
         ))
     }
@@ -3109,11 +3123,114 @@ mod tests {
             conn,
             std::sync::Arc::new(CatalogAccess::new()),
             CatalogAdmission::Admitted(0),
-            true,
-            true,
-            true,
+            THUMBNAIL_SCHEMA_GENERATION.load(Ordering::Acquire),
+            ThumbnailColumns::CURRENT,
             Some('c'),
         )
+    }
+
+    #[test]
+    fn auto_material_literal_zip_page_null_row_is_a_hit_with_auto_off() {
+        let db = open_in_memory();
+        let pixels = encode_thumb_webp(&image::DynamicImage::new_rgb8(2, 3), 3, 80.0)
+            .unwrap()
+            .0;
+        for key in ["cover|autocrop:v2:rtl#pin:001.jpg", "cover|autocrop:v2:ltr"] {
+            let request = crate::thumb_loader::LoadRequest {
+                path: PathBuf::from("book.zip"),
+                zip_entry: Some(key.into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                crate::thumb_loader::cache_key_for_request(&request).unwrap(),
+                key
+            );
+            assert!(crate::thumb_loader::representative_auto_crop_key_parts(key).is_none());
+            db.save(
+                key,
+                1,
+                2,
+                2,
+                3,
+                None,
+                &pixels,
+                &CoverIdentity::Unknown,
+                AutoMaterial::NotAutomatic,
+            )
+            .unwrap();
+            db.phase()
+                .unwrap()
+                .execute(
+                    "UPDATE thumbnails SET auto_crops=NULL WHERE filename=?1",
+                    [key],
+                )
+                .unwrap();
+            assert_eq!(
+                db.load_one(key).unwrap().unwrap().auto_material,
+                AutoMaterial::NotAutomatic
+            );
+            assert_eq!(db.load_all().unwrap()[key].jpeg_data, pixels);
+            assert_eq!(
+                db.load_latest_with_prefix(key)
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .auto_material,
+                AutoMaterial::NotAutomatic
+            );
+        }
+    }
+
+    #[test]
+    fn auto_material_complete_catalog_reads_do_not_redetect_columns() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("drive-list");
+        let writer = CatalogDb::open(temp.path(), &folder).unwrap();
+        writer
+            .save(
+                "thumb",
+                1,
+                2,
+                2,
+                3,
+                None,
+                b"pixels",
+                &CoverIdentity::Unknown,
+                AutoMaterial::NotAutomatic,
+            )
+            .unwrap();
+        let reader = CatalogDb::open_existing_read_only(temp.path(), &folder)
+            .unwrap()
+            .unwrap();
+        for db in [&writer, &reader] {
+            assert_ne!(db.thumbnail_columns.lock().unwrap().0, 0);
+            let conn = db.phase().unwrap();
+            conn.authorizer(Some(|context: AuthContext<'_>| match context.action {
+                AuthAction::Pragma { .. }
+                | AuthAction::Read {
+                    table_name: "pragma_table_info",
+                    ..
+                } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }));
+            assert!(
+                ThumbnailColumns::detect(&conn).is_err(),
+                "the test must forbid schema detection"
+            );
+        }
+        for migrated_elsewhere in [false, true] {
+            if migrated_elsewhere {
+                // Simulate an unrelated worker migration while UI keeps its
+                // complete writer / warm reader. It must not add schema SQL.
+                let _other = CatalogDb::open(temp.path(), &temp.path().join("other")).unwrap();
+            }
+            for db in [&writer, &reader] {
+                assert!(db.load_one("thumb").unwrap().is_some());
+                assert!(db.load_all().unwrap().contains_key("thumb"));
+                assert!(db.load_latest_with_prefix("thumb").unwrap().is_some());
+            }
+        }
     }
 
     #[test]

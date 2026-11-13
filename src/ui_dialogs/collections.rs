@@ -453,6 +453,11 @@ struct CollectionReorderTexture {
 }
 
 impl CollectionReorderTexture {
+    fn fit_size(&self, bounds: egui::Vec2, max_upscale: f32) -> egui::Vec2 {
+        self.view
+            .fit_texture(self.texture.size(), self.rotation, bounds, max_upscale)
+    }
+
     fn paint(&self, painter: &egui::Painter, rect: egui::Rect) {
         crate::app::draw_rotated_image_uv_ex(
             painter,
@@ -4964,13 +4969,11 @@ impl App {
                                                 let image_rect =
                                                     rect.shrink2(egui::vec2(6.0, 18.0));
                                                 if let Some(texture) = texture.as_ref() {
-                                                    let size = texture.view.displayed_size;
-                                                    let scale = (image_rect.width() / size.x)
-                                                        .min(image_rect.height() / size.y)
-                                                        .min(1.0);
+                                                    let size =
+                                                        texture.fit_size(image_rect.size(), 1.0);
                                                     let paint_rect = egui::Rect::from_center_size(
                                                         image_rect.center(),
-                                                        size * scale,
+                                                        size,
                                                     );
                                                     texture.paint(ui.painter(), paint_rect);
                                                 } else {
@@ -4991,13 +4994,13 @@ impl App {
                                                 );
                                                 let response = response.on_hover_ui(|ui| {
                                                     if let Some(texture) = texture.as_ref() {
-                                                        let size = texture.view.displayed_size;
-                                                        let scale = (360.0 / size.x)
-                                                            .min(360.0 / size.y)
-                                                            .min(2.5);
+                                                        let size = texture.fit_size(
+                                                            egui::vec2(360.0, 360.0),
+                                                            2.5,
+                                                        );
                                                         let (preview_rect, _) = ui
                                                             .allocate_exact_size(
-                                                                size * scale,
+                                                                size,
                                                                 egui::Sense::hover(),
                                                             );
                                                         texture.paint(ui.painter(), preview_rect);
@@ -9124,5 +9127,67 @@ mod tests {
     #[test]
     fn collection_reorder_dark_snapshot() {
         snapshot_collection_reorder("collection_reorder_dark");
+    }
+}
+
+#[cfg(test)]
+mod auto_cover_reorder_pixel_limit_tests {
+    use super::*;
+    use crate::cover_auto_material::{AutoCropResults, AutoMaterial};
+    use crate::rotation_db::Rotation;
+
+    #[test]
+    fn auto_cover_reorder_tile_and_hover_limit_actual_cropped_or_declined_pixels() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "small reorder cache",
+            egui::ColorImage::filled([128, 64], egui::Color32::WHITE),
+            Default::default(),
+        );
+        let crop =
+            crate::folder_thumb_pins::CoverCrop::new([250_000, 0, 750_000, 1_000_000]).unwrap();
+        for selected in [None, crop] {
+            let mut thumb = crate::grid_item::ThumbnailState::loaded_raster(
+                texture.clone(),
+                crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+                false,
+                128,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((8000, 4000)),
+                Some((800_000, 400_000)),
+            );
+            if let crate::grid_item::ThumbnailState::Loaded { auto_material, .. } = &mut thumb {
+                *auto_material = AutoMaterial::Automatic(AutoCropResults::new([selected; 4]));
+            }
+            for rotation in [
+                Rotation::None,
+                Rotation::Cw90,
+                Rotation::Cw180,
+                Rotation::Cw270,
+            ] {
+                let view = thumb.tile_view_for_texture(&texture, rotation);
+                let entry = CollectionReorderTexture {
+                    texture: texture.clone(),
+                    view,
+                    rotation,
+                };
+                let natural = if selected.is_some() {
+                    egui::vec2(64.0, 64.0)
+                } else if matches!(rotation, Rotation::Cw90 | Rotation::Cw270) {
+                    egui::vec2(64.0, 128.0)
+                } else {
+                    egui::vec2(128.0, 64.0)
+                };
+                assert_eq!(entry.fit_size(egui::vec2(1000.0, 1000.0), 1.0), natural);
+                assert_eq!(entry.fit_size(egui::vec2(360.0, 360.0), 2.5), natural * 2.5);
+                let bounded = entry.fit_size(egui::vec2(30.0, 20.0), 1.0);
+                // Source layout units can round the fitted edge one f32 ULP
+                // beyond the mathematical bound (e.g. 30.000002 points).
+                assert!(
+                    bounded.x <= 30.0 + 0.0001 && bounded.y <= 20.0 + 0.0001,
+                    "{bounded:?}"
+                );
+            }
+        }
     }
 }

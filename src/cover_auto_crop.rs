@@ -96,6 +96,12 @@ fn detect_cover_crop_at_rotation(
     binding: ReadingDirection,
     rotation: Rotation,
 ) -> Result<CoverCrop, AutoCropDecline> {
+    let dimensions = match rotation {
+        Rotation::Cw90 | Rotation::Cw270 => (original_dims.1, original_dims.0),
+        Rotation::None | Rotation::Cw180 => original_dims,
+    };
+    // Reject from dimensions before allocating a rotated copy or analysis raster.
+    raw_aspect_gate(dimensions)?;
     let rotated;
     let image = match rotation {
         Rotation::None => image,
@@ -111,10 +117,6 @@ fn detect_cover_crop_at_rotation(
             rotated = image.rotate270();
             &rotated
         }
-    };
-    let dimensions = match rotation {
-        Rotation::Cw90 | Rotation::Cw270 => (original_dims.1, original_dims.0),
-        Rotation::None | Rotation::Cw180 => original_dims,
     };
     let crop = cover_auto_crop(&analysis_raster(image), dimensions, page_aspect, binding)?;
     let [x0, y0, x1, y1] = crop.values();
@@ -431,6 +433,14 @@ fn panel_edges(raster: &Raster) -> Vec<usize> {
     picked
 }
 
+fn raw_aspect_gate(original_dims: (u32, u32)) -> Result<(), AutoCropDecline> {
+    if original_dims.1 == 0 || f64::from(original_dims.0) / f64::from(original_dims.1) < 0.85 {
+        Err(AutoCropDecline::RawAspectGate)
+    } else {
+        Ok(())
+    }
+}
+
 pub(crate) fn cover_auto_crop(
     image: &RgbImage,
     original_dims: (u32, u32),
@@ -438,9 +448,7 @@ pub(crate) fn cover_auto_crop(
     binding: ReadingDirection,
 ) -> Result<CoverCrop, AutoCropDecline> {
     use AutoCropDecline::*;
-    if original_dims.1 == 0 || f64::from(original_dims.0) / f64::from(original_dims.1) < 0.85 {
-        return Err(RawAspectGate);
-    }
+    raw_aspect_gate(original_dims)?;
     let aspect = page_aspect
         .filter(|r| r.is_finite() && *r > 0.0)
         .ok_or(PageAspectMissing)?;

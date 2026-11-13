@@ -87,6 +87,36 @@ pub(crate) struct AutoCropView {
     pub layout_dims: Option<(u32, u32)>,
 }
 
+impl AutoCropView {
+    /// Preserve source/page-box aspect, but bound enlargement by the selected
+    /// texture pixels, not by source dimensions (which can be PDF layout units).
+    pub(crate) fn fit_texture(
+        self,
+        texture_size: [usize; 2],
+        angle: Rotation,
+        bounds: egui::Vec2,
+        max_upscale: f32,
+    ) -> egui::Vec2 {
+        let pixels = egui::vec2(
+            texture_size[0] as f32 * self.uv.width(),
+            texture_size[1] as f32 * self.uv.height(),
+        );
+        let pixels = match angle {
+            Rotation::Cw90 | Rotation::Cw270 => egui::vec2(pixels.y, pixels.x),
+            Rotation::None | Rotation::Cw180 => pixels,
+        };
+        let size = self.displayed_size;
+        if size.x <= 0.0 || size.y <= 0.0 || !size.is_finite() {
+            return egui::Vec2::ZERO;
+        }
+        let scale = (bounds.x / size.x)
+            .min(bounds.y / size.y)
+            .min(max_upscale * pixels.x / size.x)
+            .min(max_upscale * pixels.y / size.y);
+        size * scale
+    }
+}
+
 pub(crate) fn auto_crop_view(
     source_dims: (u32, u32),
     layout_dims: Option<(u32, u32)>,
@@ -128,6 +158,35 @@ pub(crate) fn auto_crop_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_crop_texture_fit_preserves_source_aspect_with_rounded_raster() {
+        let material = AutoMaterial::Automatic(AutoCropResults::new([None; 4]));
+        for rotation in [
+            Rotation::None,
+            Rotation::Cw90,
+            Rotation::Cw180,
+            Rotation::Cw270,
+        ] {
+            let view = auto_crop_view((9000, 4000), Some((900_000, 400_000)), material, rotation);
+            for max_upscale in [1.0, 2.5] {
+                let size =
+                    view.fit_texture([128, 64], rotation, egui::vec2(1000.0, 1000.0), max_upscale);
+                let (wide, short) = (size.max_elem(), size.min_elem());
+                assert!((wide - 128.0 * max_upscale).abs() < 0.0001);
+                assert!((wide / short - 2.25).abs() < 0.0001);
+                assert!(short <= 64.0 * max_upscale);
+            }
+            // A vertical half-range has only 28 actual rows. Keeping all 56
+            // rows as the pixel budget would wrongly enlarge it to 32 points.
+            let crop = CoverCrop::new([0, 250_000, 1_000_000, 750_000]).unwrap();
+            let material = AutoMaterial::Automatic(AutoCropResults::new([crop; 4]));
+            let view = auto_crop_view((8000, 4000), None, material, rotation);
+            let size = view.fit_texture([128, 56], rotation, egui::vec2(1000.0, 1000.0), 1.0);
+            assert!((size.max_elem() - 112.0).abs() < 0.0001);
+            assert!((size.min_elem() - 28.0).abs() < 0.0001);
+        }
+    }
 
     #[test]
     fn auto_material_codec_roundtrip_and_validation() {

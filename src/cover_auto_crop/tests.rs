@@ -490,6 +490,58 @@ fn saved_rotation_detection_matches_upright_jacket_in_source_coordinates() {
 }
 
 #[test]
+fn raw_aspect_gate_before_pixel_work_preserves_decline_reason_for_each_rotation() {
+    let (pixels, _) = jacket(ReadingDirection::Rtl, true, false, false, true);
+    let image = DynamicImage::ImageRgb8(pixels);
+    for original_dims in [
+        (700, 1000),
+        (1000, 700),
+        (0, 1000),
+        (1000, 0),
+        (0, 0),
+        (849, 1000),
+        (850, 1000),
+    ] {
+        for rotation in [
+            Rotation::None,
+            Rotation::Cw90,
+            Rotation::Cw180,
+            Rotation::Cw270,
+        ] {
+            let rotated = rotate_image(&image, rotation);
+            let dimensions = match rotation {
+                Rotation::Cw90 | Rotation::Cw270 => (original_dims.1, original_dims.0),
+                _ => original_dims,
+            };
+            for aspect in [None, Some(f64::NAN), Some(0.7)] {
+                // The old order is the oracle: rotation/raster, then raw gate.
+                let expected = cover_auto_crop(
+                    &analysis_raster(&rotated),
+                    dimensions,
+                    aspect,
+                    ReadingDirection::Rtl,
+                );
+                let actual = detect_cover_crop_at_rotation(
+                    &image,
+                    original_dims,
+                    aspect,
+                    ReadingDirection::Rtl,
+                    rotation,
+                );
+                assert_eq!(
+                    actual.as_ref().err(),
+                    expected.as_ref().err(),
+                    "{original_dims:?} {rotation:?} {aspect:?}"
+                );
+                if raw_aspect_gate(dimensions).is_err() {
+                    assert_eq!(actual, Err(AutoCropDecline::RawAspectGate));
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn portrait_gate_uses_saved_rotation_and_the_unrotated_results_stay_declined() {
     let (image, _) = jacket(ReadingDirection::Rtl, true, false, false, true);
     let portrait = DynamicImage::ImageRgb8(image).rotate90();

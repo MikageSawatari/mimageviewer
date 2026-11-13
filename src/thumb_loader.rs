@@ -387,14 +387,8 @@ pub(crate) fn representative_cache_key_for_policy_with_auto(
     // #pin:, or at the end of an unpinned key. In particular, |generation: is
     // not a delimiter here: it can be literal ZIP name text, and the released
     // policy function treats an unpinned generation as part of its base.
-    let split = key.find(CACHE_KEY_PIN_SUFFIX).unwrap_or(key.len());
-    let (base, pin) = key.split_at(split);
-    let without_auto = base
-        .strip_suffix("|autocrop:v2:rtl")
-        .or_else(|| base.strip_suffix("|autocrop:v2:ltr"))
-        .or_else(|| base.strip_suffix("|autocrop:v1:rtl"))
-        .or_else(|| base.strip_suffix("|autocrop:v1:ltr"))
-        .map(|base| format!("{base}{pin}"));
+    let without_auto =
+        representative_auto_crop_key_parts(key).map(|(base, _, pin)| format!("{base}{pin}"));
     let mut normalized = released_representative_cache_key_for_policy(
         without_auto.as_deref().unwrap_or(key),
         policy,
@@ -408,20 +402,34 @@ pub(crate) fn representative_cache_key_for_policy_with_auto(
     normalized
 }
 
-/// Only K2 may reuse the old, already-cropped child pixels. Keep the same
-/// unambiguous suffix position as the builder, including pinned EPUB tails.
-fn legacy_auto_child_key(key: &str) -> Option<String> {
+/// Recognize only a representative's derived suffix at the builder's position.
+/// Returns the base, exact token, and pinned tail. Ordinary ZIP page names may
+/// contain every delimiter here and must never be interpreted as derived keys.
+pub(crate) fn representative_auto_crop_key_parts(key: &str) -> Option<(&str, &str, &str)> {
     if !is_representative_cache_key(key) {
         return None;
     }
     let split = key.find(CACHE_KEY_PIN_SUFFIX).unwrap_or(key.len());
-    let (base, tail) = key.split_at(split);
-    for binding in ["rtl", "ltr"] {
-        if let Some(base) = base.strip_suffix(&format!("|autocrop:v2:{binding}")) {
-            return Some(format!("{base}|autocrop:v1:{binding}{tail}"));
+    let (base, pin) = key.split_at(split);
+    for token in [
+        "|autocrop:v2:rtl",
+        "|autocrop:v2:ltr",
+        "|autocrop:v1:rtl",
+        "|autocrop:v1:ltr",
+    ] {
+        if let Some(base) = base.strip_suffix(token) {
+            return Some((base, token, pin));
         }
     }
     None
+}
+
+/// Only K2 may reuse the old, already-cropped child pixels. Keep the same
+/// unambiguous suffix position as the builder, including pinned EPUB tails.
+fn legacy_auto_child_key(key: &str) -> Option<String> {
+    let (base, token, tail) = representative_auto_crop_key_parts(key)?;
+    let binding = token.strip_prefix("|autocrop:v2:")?;
+    Some(format!("{base}|autocrop:v1:{binding}{tail}"))
 }
 
 // Keep the released (c4e92e5df) policy algorithm intact. Auto normalization is
