@@ -1,13 +1,18 @@
 # アーキテクチャ概観
 
-## ローカル文字起こしの基盤（T1 区切り1）
+## ローカル文字起こし（T1 区切り2）
 
 VLM worker と同じ exe の ASR 役割が、whisper.cpp v1.9.5 を llama.cpp の ggml 上で使う。
 `ai::worker_transport` / `ai::worker_gpu` が実行ファイル・framing・起動・列挙を共有し、
 `ai::asr_worker` と既存の VLM client は独立したプロセスと状態を所有する。
 `asr_addon` は共通の `addon::ModelAddon` に ASR の index 契約と保存先を与える。
-この区切りではジョブ・DB・UI・MCP・検索を接続しない。
-[計画](local-asr-transcript-plan.md) と [実装・検証記録](local-asr-t1-chunk1-report.md) を参照。
+Appの単一 `TranscriptJob` が受付とRunning/Stoppingを所有し、`transcript_job_worker` が
+FFmpegの逐次抽出・ASR pipeの並列送受信・後処理・署名再確認を伴う保存を実行する。
+`transcript.db` は1本1行の独立storeで、STORES経由の改名・削除・復元とmetadata転送に参加する。
+表示cacheの種類はstore descriptorで宣言し、文字起こし表示への接続は区切り3で行う。
+モデル案内・作成進捗・削除の入口は接続済み。表示・MCP・検索は後続。
+[計画](local-asr-transcript-plan.md)、[区切り1](local-asr-t1-chunk1-report.md)、
+[区切り2](local-asr-t1-chunk2-report.md) を参照。
 
 ## 製本した本の管理順（§1.683）
 

@@ -22,6 +22,11 @@ pub mod runtime;
 pub mod tensorrt_builder;
 pub mod tensorrt_installer;
 pub mod tensorrt_pack;
+#[cfg(windows)]
+pub mod transcript_audio;
+#[cfg(windows)]
+pub(crate) mod transcript_job_worker;
+pub mod transcript_postprocess;
 pub mod trt_worker_lifecycle;
 pub mod trt_worker_pool;
 pub mod trt_worker_proto;

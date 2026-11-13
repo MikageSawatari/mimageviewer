@@ -19339,6 +19339,15 @@ pub struct App {
     /// 編集用追加パックの確認ダイアログを「今はしない」で閉じたか (このセッション中)。
     /// true の間は編集系入口での再 prompt を抑制する (spec §4.1 `declined_this_session`)。
     pub(crate) editing_addon_declined_session: bool,
+    #[cfg(windows)]
+    pub(crate) asr_setup: crate::ui_dialogs::asr_addon::AsrSetup,
+    #[cfg(windows)]
+    pub(crate) transcript_job: Option<Box<crate::ui_dialogs::transcript_job::TranscriptJob>>,
+    #[cfg(windows)]
+    pub(crate) transcript_delete:
+        Option<crate::ui_dialogs::transcript_delete::TranscriptDeleteState>,
+    #[cfg(windows)]
+    pub(crate) show_transcript_progress: bool,
     pub(crate) vlm_setup: crate::ui_dialogs::vlm_addon::VlmSetup,
     pub(crate) depth_setup: crate::ui_dialogs::depth_addon::DepthSetup,
     pub(crate) depth_export_operation: Option<Box<depth_export::Operation>>,
@@ -20201,6 +20210,8 @@ impl Drop for App {
         self.retire_depth_export_for_exit();
         #[cfg(windows)]
         self.stop_caption_job_for_exit();
+        #[cfg(windows)]
+        self.stop_transcript_job_for_exit();
         self.close_local_composition_editor(CompositionEditorCloseReason::Shutdown);
         self.pdf_render_epoch.retire();
         self.transfer_spread_shift_exit_ownership();
@@ -22148,6 +22159,14 @@ impl App {
             trt_install_state: None,
             editing_addon_install_state: None,
             editing_addon_declined_session: false,
+            #[cfg(windows)]
+            asr_setup: Default::default(),
+            #[cfg(windows)]
+            transcript_job: None,
+            #[cfg(windows)]
+            transcript_delete: None,
+            #[cfg(windows)]
+            show_transcript_progress: false,
             vlm_setup: Default::default(),
             depth_setup: Default::default(),
             depth_export_operation: None,
@@ -24323,6 +24342,10 @@ impl App {
             ($( $cond:expr => $name:literal ),+ $(,)?) => {
                 $( if $cond { return Some($name); } )+
             };
+        }
+        #[cfg(windows)]
+        if self.transcript_delete_dialog_visible() || self.asr_setup.modal_open() {
+            return Some("transcript_modal");
         }
         #[cfg(windows)]
         if self.caption_delete_dialog_visible() {
@@ -50397,12 +50420,7 @@ impl App {
         changed: crate::metadata_transfer::ImportChangedSections,
     ) -> (Vec<String>, bool) {
         // DB writes have committed even if a context needs another terminal refresh.
-        if changed.ai_captions {
-            self.notify_caption_changed();
-        }
-        if changed.ai_captions || changed.thumbnail_pins {
-            self.caption_display.clear();
-        }
+        self.apply_content_identity_store_mutations(changed.store_mutations());
         #[cfg(windows)]
         let stale_before_apply = result.contexts.iter().any(|context| {
             match self.viewer_context_residence(context.context_id) {
@@ -79781,7 +79799,7 @@ impl App {
     }
 
     /// Both video and music builders read the same in-memory, normalized-path choice.
-    fn saved_audio_track_choice_for_path(
+    pub(crate) fn saved_audio_track_choice_for_path(
         &self,
         path: &std::path::Path,
     ) -> Option<crate::video::SavedAudioTrackChoice> {
@@ -101550,6 +101568,8 @@ impl App {
         // TRT pack オンラインインストールダイアログ (環境設定から起動)。
         self.show_trt_install_dialog(ctx);
         self.show_vlm_addon_dialog(ctx);
+        #[cfg(windows)]
+        self.show_asr_addon_dialog(ctx);
         if !main_viewer_blocked && self.fullscreen_idx.is_none() {
             self.show_depth_addon_dialog(ctx);
         }
@@ -102218,6 +102238,12 @@ impl eframe::App for App {
         #[cfg(windows)]
         self.poll_caption_job();
         #[cfg(windows)]
+        self.poll_asr_setup(ctx);
+        #[cfg(windows)]
+        self.poll_transcript_job(ctx);
+        #[cfg(windows)]
+        self.poll_transcript_delete();
+        #[cfg(windows)]
         self.poll_caption_delete();
         self.caption_display.poll();
         self.poll_capture_selection(ctx);
@@ -102282,6 +102308,8 @@ impl eframe::App for App {
         self.retire_depth_export_for_exit();
         #[cfg(windows)]
         self.stop_caption_job_for_exit();
+        #[cfg(windows)]
+        self.stop_transcript_job_for_exit();
         self.retire_close_return_owners(ViewerCloseCause::AppExit);
         self.close_local_composition_editor(CompositionEditorCloseReason::Shutdown);
         self.diagnostics_export.retire();

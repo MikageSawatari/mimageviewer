@@ -51,7 +51,8 @@ pub(crate) fn folder_zip_page_backup(
 }
 const FORMAT_NAME: &str = "mimageviewer-portable-metadata";
 const SHARD_FORMAT_NAME: &str = "mimageviewer-portable-metadata-shard";
-const FORMAT_VERSION: u32 = 13;
+const FORMAT_VERSION: u32 = 14;
+const TRANSCRIPT_FORMAT_VERSION: u32 = 14;
 const COVER_CROP_FORMAT_VERSION: u32 = 13;
 const COMPOSITION_FORMAT_VERSION: u32 = 11;
 const AI_CAPTION_FORMAT_VERSION: u32 = 12;
@@ -115,6 +116,7 @@ pub struct ExportSummary {
     pub spread_shifts: usize,
     pub compositions: usize,
     pub ai_captions: usize,
+    pub transcripts: usize,
     pub thumbnail_pins: usize,
     /// セキュリティ上再帰しなかったjunction / symlink directoryの数。
     pub skipped_reparse_directories: usize,
@@ -165,9 +167,11 @@ pub struct ImportSummary {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ImportCommittedChanges {
+    pub store_mutations: crate::rename_key_migration::StoreMutationEffects,
     pub rotation_keys: BTreeSet<String>,
     /// Physical items whose caption was changed or removed, published after commit.
     pub ai_captions: usize,
+    pub transcripts: usize,
     pub video_pins: usize,
     pub folder_pins: usize,
     pub spread_shift_additions: usize,
@@ -201,7 +205,30 @@ pub struct ImportChangedSections {
     pub spread_shift: bool,
     pub composition: bool,
     pub ai_captions: bool,
+    pub transcripts: bool,
     pub thumbnail_pins: bool,
+}
+
+impl ImportChangedSections {
+    /// 表示の失効は STORES の宣言に従い、説明文の索引通知は従来どおり維持する。
+    pub(crate) fn store_mutations(self) -> crate::rename_key_migration::StoreMutationEffects {
+        use crate::rename_key_migration::{STORES, StoreDisplayCache, StoreMutationEffects};
+        let mut effects = StoreMutationEffects::default();
+        for descriptor in STORES {
+            let changed = match descriptor.display_cache {
+                Some(StoreDisplayCache::Caption) => self.ai_captions,
+                Some(StoreDisplayCache::Transcript) => self.transcripts,
+                None => false,
+            };
+            if changed {
+                effects.record_rows_changed(descriptor, 1);
+            }
+            if self.thumbnail_pins && descriptor.display_cache == Some(StoreDisplayCache::Caption) {
+                effects.record_display_cache_stale(descriptor);
+            }
+        }
+        effects
+    }
 }
 
 impl ManifestSections {
@@ -216,6 +243,7 @@ impl ManifestSections {
             spread_shift: self.spread_shift,
             composition: self.composition,
             ai_captions: self.ai_captions,
+            transcripts: self.transcripts,
             thumbnail_pins: self.thumbnail_pins,
         }
     }
@@ -396,6 +424,8 @@ struct ManifestSections {
     #[serde(default)]
     ai_captions: bool,
     #[serde(default)]
+    transcripts: bool,
+    #[serde(default)]
     thumbnail_pins: bool,
 }
 
@@ -411,6 +441,7 @@ impl Default for ManifestSections {
             spread_shift: true,
             composition: true,
             ai_captions: true,
+            transcripts: true,
             thumbnail_pins: true,
         }
     }
@@ -481,12 +512,28 @@ struct PortableEntry {
     composition_family: Option<PortableCompositionFamily>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ai_caption: Option<PortableAiCaption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transcript: Option<PortableTranscript>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     nested_containers: Vec<PortableNestedContainer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     video_pin: Option<PortableVideoPin>,
     #[serde(default)]
     virtual_items: Vec<PortableVirtualItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PortableTranscript {
+    audio_stream: usize,
+    model_id: String,
+    config_version: i64,
+    lang: String,
+    duration_ms: u64,
+    segments: Vec<crate::transcript_db::TranscriptSegment>,
+    removed_counts: crate::transcript_db::RemovedCounts,
+    mtime: i64,
+    size: u64,
+    created_at: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1012,6 +1059,8 @@ where
     let mut batch_video_pin_changes = 0usize;
     let mut batch_folder_pin_changes = 0usize;
     let mut batch_ai_caption_changes = 0usize;
+    let mut batch_transcript_changes = 0usize;
+    let mut batch_store_mutations = crate::rename_key_migration::StoreMutationEffects::default();
     let mut batch_rotation_keys = BTreeSet::new();
     let mut batch_spread_shift_changes = SpreadShiftFamilyChanges::default();
     let mut batch_composition_changes = CompositionFamilyChanges::default();
@@ -1141,6 +1190,8 @@ where
                             batch_spread_shift_changes.merge(outcome.spread_shift);
                             batch_composition_changes.merge(outcome.composition);
                             batch_ai_caption_changes += usize::from(outcome.ai_caption_changed);
+                            batch_transcript_changes += usize::from(outcome.transcript_changed);
+                            batch_store_mutations.merge(outcome.store_mutations);
                             batch_rotation_keys.extend(outcome.rotation_keys);
                         }
                         Err(error) => {
@@ -1200,6 +1251,11 @@ where
                 }
                 summary.applied_entries = summary.applied_entries.saturating_add(batch_applied);
                 summary.committed.ai_captions += std::mem::take(&mut batch_ai_caption_changes);
+                summary.committed.transcripts += std::mem::take(&mut batch_transcript_changes);
+                summary
+                    .committed
+                    .store_mutations
+                    .merge(std::mem::take(&mut batch_store_mutations));
                 summary
                     .committed
                     .rotation_keys
@@ -1276,6 +1332,11 @@ where
     };
     if commit_result.is_ok() {
         summary.committed.ai_captions += batch_ai_caption_changes;
+        summary.committed.transcripts += batch_transcript_changes;
+        summary
+            .committed
+            .store_mutations
+            .merge(batch_store_mutations);
         summary
             .committed
             .rotation_keys
@@ -1655,6 +1716,7 @@ fn make_enumerated(
             spread_shift_family: None,
             composition_family: None,
             ai_caption: None,
+            transcript: None,
             nested_containers: Vec::new(),
             video_pin: None,
             virtual_items: Vec::new(),
@@ -2224,6 +2286,14 @@ where
         &mut metadata_rows,
         progress,
     )?;
+    attach_transcript_metadata(
+        data_dir,
+        entries,
+        &index,
+        cancel,
+        &mut metadata_rows,
+        progress,
+    )?;
     for entry in entries {
         entry
             .portable
@@ -2259,6 +2329,9 @@ where
         return Ok(());
     }
     let mut conn = open_readonly(&path)?;
+    if !crate::ai_caption_db::schema_is_published(&conn).map_err(db_error)? {
+        return Ok(());
+    }
     prepare_metadata_scope(&mut conn, index, &HashMap::new(), cancel)?;
     // Captions belong only to physical items, never virtual page families.
     let rotation_column =
@@ -2311,6 +2384,85 @@ where
         report_metadata_progress(metadata_rows, &key, progress);
         if let Some(&entry_index) = index.get(&key) {
             entries[entry_index].portable.ai_caption = Some(caption);
+        }
+    }
+    Ok(())
+}
+
+fn attach_transcript_metadata<F>(
+    data_dir: &Path,
+    entries: &mut [EnumeratedEntry],
+    index: &HashMap<String, usize>,
+    cancel: &AtomicBool,
+    metadata_rows: &mut usize,
+    progress: &mut F,
+) -> Result<(), TransferError>
+where
+    F: FnMut(TransferProgress),
+{
+    let path = data_dir.join("transcript.db");
+    if !path.is_file() {
+        return Ok(());
+    }
+    let mut conn = open_readonly(&path)?;
+    if !crate::ai_caption_db::schema_is_published(&conn).map_err(db_error)? {
+        return Ok(());
+    }
+    prepare_metadata_scope(&mut conn, index, &HashMap::new(), cancel)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT t.item_key,t.audio_stream,t.model_id,t.config_version,t.lang,
+        t.duration_ms,t.segments,t.removed_counts,t.mtime,t.size,t.created_at
+        FROM metadata_transfer_physical_scope AS s CROSS JOIN transcripts AS t
+        WHERE t.item_key=s.item_key AND t.status='ok'",
+        )
+        .map_err(db_error)?;
+    let rows = stmt
+        .query_map([], |row| {
+            let segments: String = row.get(6)?;
+            let removed_counts: String = row.get(7)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                PortableTranscript {
+                    audio_stream: usize::try_from(row.get::<_, i64>(1)?).map_err(|_| {
+                        invalid_db_value(
+                            1,
+                            rusqlite::types::Type::Integer,
+                            "transcript.db: audio_stream".into(),
+                        )
+                    })?,
+                    model_id: row.get(2)?,
+                    config_version: row.get(3)?,
+                    lang: row.get(4)?,
+                    duration_ms: row.get(5)?,
+                    segments: serde_json::from_str(&segments).map_err(|error| {
+                        invalid_db_value(
+                            6,
+                            rusqlite::types::Type::Text,
+                            format!("transcript.db: segments: {error}"),
+                        )
+                    })?,
+                    removed_counts: serde_json::from_str(&removed_counts).map_err(|error| {
+                        invalid_db_value(
+                            7,
+                            rusqlite::types::Type::Text,
+                            format!("transcript.db: removed_counts: {error}"),
+                        )
+                    })?,
+                    mtime: row.get(8)?,
+                    size: row.get(9)?,
+                    created_at: row.get(10)?,
+                },
+            ))
+        })
+        .map_err(db_error)?;
+    for row in rows {
+        check_cancel(cancel)?;
+        let (key, transcript) = row.map_err(db_error)?;
+        validate_portable_transcript(&transcript)?;
+        report_metadata_progress(metadata_rows, &key, progress);
+        if let Some(&entry_index) = index.get(&key) {
+            entries[entry_index].portable.transcript = Some(transcript);
         }
     }
     Ok(())
@@ -3955,6 +4107,7 @@ fn summarize_entry(summary: &mut ExportSummary, entry: &PortableEntry) {
         .as_ref()
         .map_or(0, |family| family.scopes.len());
     summary.ai_captions += usize::from(entry.ai_caption.is_some());
+    summary.transcripts += usize::from(entry.transcript.is_some());
     summary.compositions += entry
         .composition_family
         .as_ref()
@@ -4011,6 +4164,9 @@ fn read_bundle_manifest(root: &Path, cancel: &AtomicBool) -> Result<BundleManife
     // producer retained an unknown field while rewriting an older bundle.
     if manifest.version < COMPOSITION_FORMAT_VERSION {
         manifest.sections.composition = false;
+    }
+    if manifest.version < TRANSCRIPT_FORMAT_VERSION {
+        manifest.sections.transcripts = false;
     }
     if manifest.version < AI_CAPTION_FORMAT_VERSION {
         manifest.sections.ai_captions = false;
@@ -4238,12 +4394,13 @@ fn validate_bundle_manifest(manifest: &BundleManifest) -> Result<(), TransferErr
         SPREAD_SHIFT_FORMAT_VERSION,
         COMPOSITION_FORMAT_VERSION,
         AI_CAPTION_FORMAT_VERSION,
+        COVER_CROP_FORMAT_VERSION,
         FORMAT_VERSION,
     ]
     .contains(&manifest.version)
     {
         return Err(TransferError::Invalid(format!(
-            "未対応のバージョンです: {}（v{} / v{} / v{} / v{} / v{} / v{} / v{}を受け入れます）",
+            "未対応のバージョンです: {}（v{} / v{} / v{} / v{} / v{} / v{} / v{} / v{}を受け入れます）",
             manifest.version,
             RELEASED_FORMAT_VERSION,
             PREVIOUS_FORMAT_VERSION,
@@ -4251,6 +4408,7 @@ fn validate_bundle_manifest(manifest: &BundleManifest) -> Result<(), TransferErr
             SPREAD_SHIFT_FORMAT_VERSION,
             COMPOSITION_FORMAT_VERSION,
             AI_CAPTION_FORMAT_VERSION,
+            COVER_CROP_FORMAT_VERSION,
             FORMAT_VERSION
         )));
     }
@@ -4495,6 +4653,9 @@ fn validate_portable_entry(entry: &PortableEntry) -> Result<(), TransferError> {
         )));
     }
     validate_tags(&entry.tags)?;
+    if let Some(transcript) = &entry.transcript {
+        validate_portable_transcript(transcript)?;
+    }
     if let Some(caption) = &entry.ai_caption {
         validate_ai_caption(caption)?;
     }
@@ -5240,6 +5401,10 @@ fn ensure_database_schemas(data_dir: &Path) -> Result<(), TransferError> {
         crate::ai_caption_db::CaptionDb::open_at(&data_dir.join("ai_caption.db"))
             .map_err(|error| schema_open_error("ai_caption.db", error))?,
     );
+    drop(
+        crate::transcript_db::TranscriptDb::open_at(data_dir.join("transcript.db"))
+            .map_err(|error| schema_open_error("transcript.db", error))?,
+    );
     crate::book_composition::store::initialize_database_at(&data_dir.join("book_composition.db"))
         .map_err(TransferError::Database)?;
     drop(
@@ -5409,6 +5574,7 @@ fn open_import_connection(data_dir: &Path) -> Result<Connection, TransferError> 
         ("spread_shift", "spread_shift.db"),
         ("book_composition", "book_composition.db"),
         ("ai_caption", "ai_caption.db"),
+        ("transcript", "transcript.db"),
         ("folder_pin", "folder_thumb_pins.db"),
         ("video_pin", "video_pins.db"),
     ] {
@@ -5446,6 +5612,7 @@ fn open_import_connection(data_dir: &Path) -> Result<Connection, TransferError> 
         "spread_shift",
         "book_composition",
         "ai_caption",
+        "transcript",
         "folder_pin",
         "video_pin",
     ] {
@@ -5474,6 +5641,8 @@ struct ApplyEntryOutcome {
     spread_shift: SpreadShiftFamilyChanges,
     composition: CompositionFamilyChanges,
     ai_caption_changed: bool,
+    transcript_changed: bool,
+    store_mutations: crate::rename_key_migration::StoreMutationEffects,
     rotation_keys: BTreeSet<String>,
 }
 
@@ -5533,6 +5702,52 @@ fn apply_ai_caption(
         key, caption.mtime_ms, caption.size, caption.model_id, caption.prompt_version, caption.lang,
         caption.caption, caption.visible_text, keywords, caption.cover_ref, caption.created_at, caption.rotation,
     ]).map(|count| count > 0).map_err(db_error)
+}
+
+fn validate_portable_transcript(transcript: &PortableTranscript) -> Result<(), TransferError> {
+    crate::transcript_db::validate_transcript(&transcript.segments, transcript.duration_ms)
+        .map_err(|error| TransferError::Invalid(format!("文字起こし: {error}")))?;
+    if transcript.size > i64::MAX as u64 || transcript.audio_stream > i64::MAX as usize {
+        return Err(TransferError::Invalid(
+            "文字起こしの署名またはトラック番号が不正です".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn apply_transcript(
+    tx: &Connection,
+    key: &str,
+    transcript: Option<&PortableTranscript>,
+) -> Result<bool, TransferError> {
+    let Some(transcript) = transcript else {
+        return tx
+            .prepare_cached("DELETE FROM transcript.transcripts WHERE item_key=?1")
+            .map_err(db_error)?
+            .execute([key])
+            .map(|count| count > 0)
+            .map_err(db_error);
+    };
+    let segments = serde_json::to_string(&transcript.segments)
+        .map_err(|error| TransferError::Invalid(error.to_string()))?;
+    let removed_counts = serde_json::to_string(&transcript.removed_counts)
+        .map_err(|error| TransferError::Invalid(error.to_string()))?;
+    // 同じ取り込みでは版番号も索引反映待ちも進めない。
+    tx.prepare_cached("INSERT INTO transcript.transcripts
+        (item_key,mtime,size,audio_stream,model_id,config_version,lang,duration_ms,segments,removed_counts,status,created_at)
+        VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'ok',?11)
+        ON CONFLICT(item_key) DO UPDATE SET mtime=excluded.mtime,size=excluded.size,audio_stream=excluded.audio_stream,
+            model_id=excluded.model_id,config_version=excluded.config_version,lang=excluded.lang,duration_ms=excluded.duration_ms,
+            segments=excluded.segments,removed_counts=excluded.removed_counts,status='ok',created_at=excluded.created_at
+        WHERE transcripts.mtime IS NOT excluded.mtime OR transcripts.size IS NOT excluded.size
+            OR transcripts.audio_stream IS NOT excluded.audio_stream OR transcripts.model_id IS NOT excluded.model_id
+            OR transcripts.config_version IS NOT excluded.config_version OR transcripts.lang IS NOT excluded.lang
+            OR transcripts.duration_ms IS NOT excluded.duration_ms OR transcripts.segments IS NOT excluded.segments
+            OR transcripts.removed_counts IS NOT excluded.removed_counts OR transcripts.status IS NOT 'ok'
+            OR transcripts.created_at IS NOT excluded.created_at").map_err(db_error)?
+        .execute(params![key,transcript.mtime,transcript.size,transcript.audio_stream as i64,transcript.model_id,
+            transcript.config_version,transcript.lang,transcript.duration_ms,segments,removed_counts,transcript.created_at])
+        .map(|count| count > 0).map_err(db_error)
 }
 
 fn apply_entry(
@@ -5595,6 +5810,23 @@ fn apply_entry(
         );
     if sections.ai_captions {
         outcome.ai_caption_changed = apply_ai_caption(tx, &base_key, entry.ai_caption.as_ref())?;
+    }
+    if sections.transcripts {
+        outcome.transcript_changed = apply_transcript(tx, &base_key, entry.transcript.as_ref())?;
+    }
+    for descriptor in crate::rename_key_migration::STORES {
+        let changed = match descriptor.display_cache {
+            Some(crate::rename_key_migration::StoreDisplayCache::Caption) => {
+                outcome.ai_caption_changed
+            }
+            Some(crate::rename_key_migration::StoreDisplayCache::Transcript) => {
+                outcome.transcript_changed
+            }
+            None => false,
+        };
+        if changed {
+            outcome.store_mutations.record_rows_changed(descriptor, 1);
+        }
     }
     if sections.ratings {
         delete_page_key_family(
@@ -8060,6 +8292,206 @@ mod tests {
     }
 
     #[test]
+    fn derived_text_export_skips_unpublished_schema_and_reads_published_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let data = temp.path().join("data");
+        fs::create_dir_all(&root).unwrap();
+        init_data_dir(&data);
+        let path = root.join("voice.mp4");
+        fs::write(&path, b"audio").unwrap();
+        for filename in ["ai_caption.db", "transcript.db"] {
+            fs::remove_file(data.join(filename)).unwrap();
+            // 初回 open 後、DDL と user_version の公開 commit より前の状態。
+            Connection::open(data.join(filename)).unwrap();
+        }
+        let cancel = AtomicBool::new(false);
+        let before = export_at(&data, &root, false, &cancel, no_progress).unwrap();
+        assert_eq!((before.ai_captions, before.transcripts), (0, 0));
+        crate::ai_caption_db::CaptionDb::open_at(data.join("ai_caption.db")).unwrap();
+        let key = crate::transcript_db::TranscriptDb::normalize_path(&path);
+        set_transfer_caption(&data, &key, "ok", &transfer_caption());
+        let db = crate::transcript_db::TranscriptDb::open_at(data.join("transcript.db")).unwrap();
+        db.save(&crate::transcript_db::SaveRequest {
+            item_path: path.clone(),
+            signature: crate::transcript_db::FileSignature::from_metadata(
+                &fs::metadata(&path).unwrap(),
+            )
+            .unwrap(),
+            model_id: "test".into(),
+            config_version: 1,
+            lang: "ja".into(),
+            result: crate::transcript_db::TranscriptResult::Ok {
+                segments: vec![(0, 0, "言葉".into())],
+                removed_counts: Default::default(),
+                duration_ms: 0,
+                audio_stream: 0,
+            },
+        })
+        .unwrap();
+        drop(db);
+        let published = export_at(&data, &root, false, &cancel, no_progress).unwrap();
+        assert_eq!((published.ai_captions, published.transcripts), (1, 1));
+    }
+
+    #[test]
+    fn derived_text_export_rejects_unknown_version_and_published_missing_table() {
+        for filename in ["ai_caption.db", "transcript.db"] {
+            for version in [1, 2] {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path().join("root");
+                let data = temp.path().join("data");
+                fs::create_dir_all(&root).unwrap();
+                fs::write(root.join("voice.mp4"), b"audio").unwrap();
+                init_data_dir(&data);
+                fs::remove_file(data.join(filename)).unwrap();
+                let conn = Connection::open(data.join(filename)).unwrap();
+                conn.pragma_update(None, "user_version", version).unwrap();
+                drop(conn);
+                assert!(
+                    export_at(&data, &root, false, &AtomicBool::new(false), no_progress).is_err(),
+                    "{filename}: version {version}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn transcript_transfer_roundtrip_counts_noop_and_explicit_empty_removal() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir_all(&root).unwrap();
+        init_data_dir(&source);
+        init_data_dir(&destination);
+        let path = root.join("voice.mp4");
+        fs::write(&path, b"audio").unwrap();
+        let req = crate::transcript_db::SaveRequest {
+            item_path: path.clone(),
+            signature: crate::transcript_db::FileSignature::from_metadata(
+                &fs::metadata(&path).unwrap(),
+            )
+            .unwrap(),
+            model_id: "whisper@abc".into(),
+            config_version: 1,
+            lang: "ja".into(),
+            result: crate::transcript_db::TranscriptResult::Ok {
+                segments: vec![(0, 1234, "保存する言葉".into())],
+                removed_counts: crate::transcript_db::RemovedCounts {
+                    stock: 2,
+                    repeat: 3,
+                },
+                audio_stream: 1,
+                duration_ms: 1234,
+            },
+        };
+        let db = crate::transcript_db::TranscriptDb::open_at(source.join("transcript.db")).unwrap();
+        db.save(&req).unwrap();
+        let key = crate::transcript_db::TranscriptDb::normalize_path(&path);
+        let expected = db.get(&key).unwrap().unwrap();
+        drop(db);
+        let cancel = AtomicBool::new(false);
+        assert_eq!(
+            export_at(&source, &root, false, &cancel, no_progress)
+                .unwrap()
+                .transcripts,
+            1
+        );
+        let manifest = read_bundle_manifest(&root, &cancel).unwrap();
+        assert!(manifest.sections.transcripts);
+        assert_eq!(manifest.version, TRANSCRIPT_FORMAT_VERSION);
+        let imported = import_at(&destination, &root, &cancel, no_progress).unwrap();
+        assert_eq!(imported.failed_entries, 0);
+        assert_eq!(imported.committed.transcripts, 1);
+        assert!(
+            imported
+                .committed
+                .store_mutations
+                .transcript_display_stale()
+        );
+        assert!(!imported.committed.store_mutations.ai_captions_changed());
+        let destination_db =
+            crate::transcript_db::TranscriptDb::open_read_only(destination.join("transcript.db"))
+                .unwrap()
+                .unwrap();
+        let actual = destination_db.get(&key).unwrap().unwrap();
+        assert_eq!(actual.signature, expected.signature);
+        assert_eq!(actual.segments, expected.segments);
+        assert_eq!(actual.removed_counts, expected.removed_counts);
+        assert_eq!(actual.audio_stream, expected.audio_stream);
+        assert_eq!(actual.created_at, expected.created_at);
+        assert!(!actual.indexed);
+        drop(destination_db);
+        let noop = import_at(&destination, &root, &cancel, no_progress).unwrap();
+        assert_eq!(noop.committed.transcripts, 0);
+        assert!(!noop.committed.store_mutations.transcript_display_stale());
+        let mut disabled = manifest.clone();
+        disabled.sections.transcripts = false;
+        fs::write(
+            root.join(SIDECAR_FILENAME).join(BUNDLE_MANIFEST_FILENAME),
+            serde_json::to_vec(&disabled).unwrap(),
+        )
+        .unwrap();
+        rewrite_root_shard_entries(&root, &cancel, |entry| entry.transcript = None);
+        let ignored = import_at(&destination, &root, &cancel, no_progress).unwrap();
+        assert!(!ignored.changed.transcripts);
+        assert_eq!(ignored.committed.transcripts, 0);
+        fs::write(
+            root.join(SIDECAR_FILENAME).join(BUNDLE_MANIFEST_FILENAME),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let removed = import_at(&destination, &root, &cancel, no_progress).unwrap();
+        assert_eq!(removed.committed.transcripts, 1);
+        assert!(removed.committed.store_mutations.transcript_display_stale());
+        let conn = Connection::open(destination.join("transcript.db")).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM transcripts", [], |row| row
+                .get::<_, usize>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM transcript_removed WHERE item_key=?1",
+                [&key],
+                |row| row.get::<_, usize>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn transcript_and_caption_import_effects_follow_store_descriptors() {
+        let transcript = ImportChangedSections {
+            transcripts: true,
+            ..Default::default()
+        }
+        .store_mutations();
+        assert!(transcript.transcript_display_stale());
+        assert!(!transcript.ai_captions_changed());
+        assert!(!transcript.caption_display_stale());
+        let caption = ImportChangedSections {
+            ai_captions: true,
+            ..Default::default()
+        }
+        .store_mutations();
+        assert!(caption.ai_captions_changed());
+        assert!(caption.caption_display_stale());
+        assert!(!caption.transcript_display_stale());
+        let pins = ImportChangedSections {
+            thumbnail_pins: true,
+            ..Default::default()
+        }
+        .store_mutations();
+        assert!(pins.caption_display_stale());
+        assert!(!pins.ai_captions_changed());
+        assert!(!pins.transcript_display_stale());
+    }
+
+    #[test]
     fn ai_caption_transfer_roundtrip_counts_noop_and_explicit_empty_removal() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = temp.path().join("root");
@@ -9341,6 +9773,7 @@ mod tests {
             spread_shift_family: None,
             composition_family: None,
             ai_caption: None,
+            transcript: None,
             nested_containers: Vec::new(),
             video_pin: None,
             virtual_items: Vec::new(),
@@ -9521,6 +9954,7 @@ mod tests {
                 spread_shift_family: None,
                 composition_family: None,
                 ai_caption: None,
+                transcript: None,
                 nested_containers: Vec::new(),
                 video_pin: None,
                 virtual_items: Vec::new(),
@@ -11147,6 +11581,7 @@ mod tests {
                 spread_shift_family: None,
                 composition_family: None,
                 ai_caption: None,
+                transcript: None,
                 nested_containers: vec![PortableNestedContainer {
                     member_key: mixed_container.to_string(),
                     state: PortableContainerState {
@@ -11304,6 +11739,7 @@ mod tests {
                 spread_shift_family: None,
                 composition_family: None,
                 ai_caption: None,
+                transcript: None,
                 nested_containers: Vec::new(),
                 video_pin: None,
                 virtual_items: vec![virtual_item("A/B"), virtual_item(r"A\B")],
@@ -12185,7 +12621,7 @@ mod tests {
                 Err(TransferError::Invalid(message))
                     if message.contains("未対応のバージョン")
                         && message.contains(&version.to_string())
-                    && message.contains("v7 / v8 / v9 / v10 / v11 / v12 / v13を受け入れます")
+                    && message.contains("v7 / v8 / v9 / v10 / v11 / v12 / v13 / v14を受け入れます")
             ));
         }
     }
@@ -13482,6 +13918,7 @@ mod tests {
                 spread_shift_family: None,
                 composition_family: None,
                 ai_caption: None,
+                transcript: None,
                 nested_containers: Vec::new(),
                 video_pin: None,
                 virtual_items: Vec::new(),
@@ -13714,6 +14151,7 @@ mod tests {
                 spread_shift_family: None,
                 composition_family: None,
                 ai_caption: None,
+                transcript: None,
                 nested_containers: Vec::new(),
                 video_pin: None,
                 virtual_items: Vec::new(),
@@ -13821,7 +14259,12 @@ mod tests {
     #[test]
     fn cover_crop_metadata_roundtrip_ignores_stale_binding_and_v12_unknown_field() {
         use crate::folder_thumb_pins::{CoverCrop, FileKind, FolderPinSource, FolderThumbPinDb};
-        for (version, stale) in [(13, false), (13, true), (12, false)] {
+        for (version, stale) in [
+            (FORMAT_VERSION, false),
+            (FORMAT_VERSION, true),
+            (COVER_CROP_FORMAT_VERSION, false),
+            (AI_CAPTION_FORMAT_VERSION, false),
+        ] {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("root");
             fs::create_dir_all(&root).unwrap();
@@ -13855,7 +14298,7 @@ mod tests {
             let cancel = AtomicBool::new(false);
             export_at(&source_data, &root, false, &cancel, no_progress).unwrap();
             let exported = read_manifest(&root, &cancel).unwrap();
-            assert_eq!(exported.version, 13);
+            assert_eq!(exported.version, FORMAT_VERSION);
             let pin = exported
                 .entries
                 .iter()
@@ -13873,7 +14316,7 @@ mod tests {
                     crop.map(|c| c.values())
                 }
             );
-            if version == 12 {
+            if version < FORMAT_VERSION {
                 rewrite_transfer_version(&root, version);
             }
             let summary = import_at(&destination_data, &root, &cancel, no_progress).unwrap();
@@ -13886,7 +14329,11 @@ mod tests {
             assert_eq!(imported.source.rel(), if stale { "b.jpg" } else { "a.jpg" });
             assert_eq!(
                 imported.cover_crop,
-                if stale || version == 12 { None } else { crop }
+                if stale || version < COVER_CROP_FORMAT_VERSION {
+                    None
+                } else {
+                    crop
+                }
             );
         }
     }

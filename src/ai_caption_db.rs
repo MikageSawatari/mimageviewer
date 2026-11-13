@@ -17,6 +17,16 @@ mod normalize;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const REPETITION_CLEANUP: &str = "scalar_repetition_cleanup_v1";
 
+/// 説明文・文字起こしのschema 1はDDLとuser_versionを同時にcommitして公開する。
+/// 初期作成中のversion 0だけを未公開とし、未知版や公開後の破損はエラーにする。
+pub(crate) fn schema_is_published(conn: &Connection) -> rusqlite::Result<bool> {
+    match conn.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
 struct CommitWait {
     cancel: Arc<AtomicBool>,
     deadline: Instant,
@@ -95,7 +105,7 @@ impl Drop for CommitBusyGuard<'_> {
     }
 }
 
-fn commit_unless_cancelled(
+pub(crate) fn commit_unless_cancelled(
     conn: &Connection,
     tx: Transaction<'_>,
     cancel: &Arc<AtomicBool>,
@@ -272,14 +282,11 @@ impl CaptionDb {
         conn.busy_timeout(BUSY_TIMEOUT)?;
         // Schema and this version are published by the same initialization commit.
         // Opening the file can race that commit, so version zero is still absent.
-        match conn.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))? {
-            0 => Ok(None),
-            1 => {
-                let has_rotation = Self::has_rotation_column(&conn)?;
-                Ok(Some(Self { conn, has_rotation }))
-            }
-            _ => Err(rusqlite::Error::InvalidQuery),
+        if !schema_is_published(&conn)? {
+            return Ok(None);
         }
+        let has_rotation = Self::has_rotation_column(&conn)?;
+        Ok(Some(Self { conn, has_rotation }))
     }
 
     /// Existing, already-initialized database; never creates a missing store.
@@ -786,7 +793,7 @@ pub(crate) fn validate_caption(
     Ok(())
 }
 
-fn system_time_ms(value: SystemTime) -> Option<i64> {
+pub(crate) fn system_time_ms(value: SystemTime) -> Option<i64> {
     value
         .duration_since(UNIX_EPOCH)
         .ok()

@@ -1,6 +1,6 @@
 # 非同期・並列アーキテクチャ
 
-## ローカル文字起こしの transport（T1 区切り1）
+## ローカル文字起こしの transport と作成（T1 区切り2）
 
 `ai::asr_worker` は `mimageviewer-vlm.exe --asr-serve` を Job Object 内で起動する。
 VLM と共有するのは executable の取り出し、framing、子の起動と GPU 列挙だけで、
@@ -16,13 +16,28 @@ begin/progress/window/end を読む。PCM は1枠1MiBまで、結果の読み取
 モデルは複数の begin/end で保持する。中止命令、再起動、再試行、UI thread の待ちは追加しない。
 採用するtoken本文の復元不能なUTF-8はworkerがその断片だけ捨て、不一致byteを再評価する。
 正常な区間またぎの持越しは維持し、窓末尾の未完断片は捨てる。WindowとEndは捨てたbyte数・
-断片数を持ち、clientは窓の合計と終端を照合する。perfとログへの接続は次の区切りで行う。
+断片数を持ち、clientは窓の合計と終端を照合する。作成workerが入力ごとにperfとログへ出し、DBには保存しない。
 入力単位の失敗応答や読み捨て状態は持たない。抽出失敗時は本体が途中でendを送り、
 返った窓を捨てれば同じモデルで次のbeginへ進める。
 入力側の全sample数と終端durationも照合する。壊れたwireやGPU・モデル失敗は致命的なまま。
-作成ジョブ・FFmpeg抽出・保存・表示への接続は次の区切りで行う。
+Appの単一 `TranscriptJob` が待ち行列とRunning/Stoppingを所有し、実行役には1件ずつ渡す。
+中止は受付を閉じ、取消の印とkillを即時に伝える。保存commit済みのItemDoneとFinishedは
+中止後も採用し、Finishedまではownerを解放しない。説明文ジョブとは別process・別状態で動く。
+UIのイベント採用は1pass最大64件。上限まで処理してownerが残る場合だけ次passを予約し、
+大量のProgressの後ろにある保存・終了通知も処理する。空queueと終端では追加予約しない。
+モデル案内と削除の全phaseだけをmodalにし、長い作成と取得の進捗はmodelessで閲覧を止めない。
+
+`transcript_job_worker` はprobe・署名・DB参照と保存を所有する。同じ入力のPCM抽出・pipe書込みは
+scoped thread、窓の受信・後処理は実行役で並行する。joinするのは背景の実行役だけで、UIでは待たない。
+FFmpegは既存のdecoder-open・音声一覧と選択関数を共用し、コンテナ原点を引いた後に
+`aresample=async=1:first_pts=0` で先頭遅延を無音で埋める。tempfileは作らない。
+保存は `BEGIN IMMEDIATE` 内で署名を取り直してから行う。失敗で既存okを上書きしない。
+
+`transcript.db` のtriggerがrev・indexed・削除印を管理する。STORESの表示cache記述から
+説明文/文字起こしの失効印を作り、metadata転送も同じ完了採用点へ渡す。
+文字起こし表示cacheの受け手は区切り3、索引への反映はT2で接続する。
 仕様は [ASR計画 §4〜6](local-asr-transcript-plan.md)、検証記録は
-[区切り1の記録](local-asr-t1-chunk1-report.md) を参照。
+[区切り1](local-asr-t1-chunk1-report.md)・[区切り2](local-asr-t1-chunk2-report.md) を参照。
 
 ## 3D 写真の書き出し worker（2026-11-07、段 C）
 

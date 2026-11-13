@@ -9,6 +9,8 @@ pub(crate) struct ToolsMenuState<'a> {
     pub convert_enabled: bool,
     pub caption_disabled_reason: Option<&'a str>,
     pub caption_progress_available: bool,
+    pub transcript_disabled_reason: Option<&'a str>,
+    pub transcript_progress_available: bool,
     pub video_selected: bool,
 }
 
@@ -16,7 +18,10 @@ fn group(command: MenuCommandId) -> Option<u8> {
     use MenuCommandId::*;
     match command {
         ConvertToZip => Some(0),
-        ToolsCreateAiCaptions | ToolsShowCaptionProgress => Some(1),
+        ToolsCreateAiCaptions
+        | ToolsShowCaptionProgress
+        | ToolsCreateTranscripts
+        | ToolsShowTranscriptProgress => Some(1),
         VideoRegisterUpscale | VideoDeleteUpscale | VideoShowUpscaleTasks => Some(2),
         _ => None,
     }
@@ -45,6 +50,10 @@ pub(crate) fn draw(
             MenuCommandId::ToolsCreateAiCaptions => state.caption_disabled_reason,
             MenuCommandId::ToolsShowCaptionProgress => {
                 (!state.caption_progress_available).then_some("作成中の AI 説明文はありません")
+            }
+            MenuCommandId::ToolsCreateTranscripts => state.transcript_disabled_reason,
+            MenuCommandId::ToolsShowTranscriptProgress => {
+                (!state.transcript_progress_available).then_some("作成中の文字起こしはありません")
             }
             MenuCommandId::VideoRegisterUpscale | MenuCommandId::VideoDeleteUpscale => {
                 (!state.video_selected).then_some("一覧で動画ファイルを選択してください")
@@ -85,6 +94,8 @@ mod tests {
                 ConvertToZip,
                 ToolsCreateAiCaptions,
                 ToolsShowCaptionProgress,
+                ToolsCreateTranscripts,
+                ToolsShowTranscriptProgress,
                 VideoRegisterUpscale,
                 VideoDeleteUpscale,
                 VideoShowUpscaleTasks
@@ -92,7 +103,16 @@ mod tests {
         );
         assert_eq!(
             commands.iter().copied().map(group).collect::<Vec<_>>(),
-            [Some(0), Some(1), Some(1), Some(2), Some(2), Some(2)]
+            [
+                Some(0),
+                Some(1),
+                Some(1),
+                Some(1),
+                Some(1),
+                Some(2),
+                Some(2),
+                Some(2)
+            ]
         );
         assert_eq!(
             commands
@@ -110,7 +130,7 @@ mod tests {
         let keymap = Keymap::from_settings(&KeymapSettings::default());
         let fonts_ready = Cell::new(false);
         crate::test_ui::builder()
-            .with_size(egui::vec2(370.0, 240.0))
+            .with_size(egui::vec2(370.0, 300.0))
             .build_ui(move |ui| {
                 let ctx = &ui.ctx().clone();
                 crate::os_theme::apply_resolved(
@@ -147,6 +167,9 @@ mod tests {
                     caption_disabled_reason: (!caption)
                         .then_some(crate::context_menu_model::CAPTION_NO_TARGET_REASON),
                     caption_progress_available: progress,
+                    transcript_disabled_reason: (!caption)
+                        .then_some(crate::context_menu_model::TRANSCRIPT_NO_TARGET_REASON),
+                    transcript_progress_available: progress,
                     video_selected: video,
                 },
                 true,
@@ -158,8 +181,10 @@ mod tests {
                 let row = harness.get_by_label(&label);
                 let enabled = match command {
                     MenuCommandId::ConvertToZip => convert,
-                    MenuCommandId::ToolsCreateAiCaptions => caption,
-                    MenuCommandId::ToolsShowCaptionProgress => progress,
+                    MenuCommandId::ToolsCreateAiCaptions
+                    | MenuCommandId::ToolsCreateTranscripts => caption,
+                    MenuCommandId::ToolsShowCaptionProgress
+                    | MenuCommandId::ToolsShowTranscriptProgress => progress,
                     MenuCommandId::VideoRegisterUpscale | MenuCommandId::VideoDeleteUpscale => {
                         video
                     }
@@ -190,6 +215,8 @@ mod tests {
                     convert_enabled: false,
                     caption_disabled_reason: None,
                     caption_progress_available: true,
+                    transcript_disabled_reason: None,
+                    transcript_progress_available: true,
                     video_selected: false,
                 },
                 dark,
@@ -203,5 +230,38 @@ mod tests {
             snapshots.extend(harness.take_snapshot_results());
         }
         snapshots.unwrap();
+    }
+
+    #[test]
+    fn tools_menu_transcript_and_caption_availability_are_independent() {
+        for transcript in [false, true] {
+            let mut harness = harness(
+                ToolsMenuState {
+                    convert_enabled: false,
+                    caption_disabled_reason: transcript.then_some("説明文の対象なし"),
+                    caption_progress_available: !transcript,
+                    transcript_disabled_reason: (!transcript).then_some("文字起こしの対象なし"),
+                    transcript_progress_available: transcript,
+                    video_selected: false,
+                },
+                true,
+            );
+            harness.run_steps(4);
+            let keymap = Keymap::from_settings(&KeymapSettings::default());
+            for (command, enabled) in [
+                (MenuCommandId::ToolsCreateAiCaptions, !transcript),
+                (MenuCommandId::ToolsShowCaptionProgress, !transcript),
+                (MenuCommandId::ToolsCreateTranscripts, transcript),
+                (MenuCommandId::ToolsShowTranscriptProgress, transcript),
+            ] {
+                assert_eq!(
+                    harness
+                        .get_by_label(&keymap.menu_command_label(command))
+                        .accesskit_node()
+                        .is_disabled(),
+                    !enabled
+                );
+            }
+        }
     }
 }

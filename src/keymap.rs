@@ -2794,6 +2794,8 @@ pub enum MenuCommandId {
     ConvertToZip,
     ToolsCreateAiCaptions,
     ToolsShowCaptionProgress,
+    ToolsCreateTranscripts,
+    ToolsShowTranscriptProgress,
     VideoRegisterUpscale,
     VideoDeleteUpscale,
     VideoShowUpscaleTasks,
@@ -2854,6 +2856,8 @@ impl MenuCommandId {
         Self::ConvertToZip,
         Self::ToolsCreateAiCaptions,
         Self::ToolsShowCaptionProgress,
+        Self::ToolsCreateTranscripts,
+        Self::ToolsShowTranscriptProgress,
         Self::VideoRegisterUpscale,
         Self::VideoDeleteUpscale,
         Self::VideoShowUpscaleTasks,
@@ -2912,6 +2916,8 @@ impl MenuCommandId {
             MenuCommandId::ConvertToZip => "ConvertToZip",
             MenuCommandId::ToolsCreateAiCaptions => "ToolsCreateAiCaptions",
             MenuCommandId::ToolsShowCaptionProgress => "ToolsShowCaptionProgress",
+            MenuCommandId::ToolsCreateTranscripts => "ToolsCreateTranscripts",
+            MenuCommandId::ToolsShowTranscriptProgress => "ToolsShowTranscriptProgress",
             MenuCommandId::VideoRegisterUpscale => "VideoRegisterUpscale",
             MenuCommandId::VideoDeleteUpscale => "VideoDeleteUpscale",
             MenuCommandId::VideoShowUpscaleTasks => "VideoShowUpscaleTasks",
@@ -3181,6 +3187,18 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         id: MenuCommandId::ToolsShowCaptionProgress,
         parent: TopMenuId::Tools,
         label: "AI 説明文の作成状況",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::ToolsCreateTranscripts,
+        parent: TopMenuId::Tools,
+        label: "文字起こしを作る",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::ToolsShowTranscriptProgress,
+        parent: TopMenuId::Tools,
+        label: "文字起こしの作成状況",
         action: None,
     },
     MenuCommandSpec {
@@ -12580,6 +12598,8 @@ mod tests {
                 MenuCommandId::ConvertToZip,
                 MenuCommandId::ToolsCreateAiCaptions,
                 MenuCommandId::ToolsShowCaptionProgress,
+                MenuCommandId::ToolsCreateTranscripts,
+                MenuCommandId::ToolsShowTranscriptProgress,
                 MenuCommandId::VideoRegisterUpscale,
                 MenuCommandId::VideoDeleteUpscale,
                 MenuCommandId::VideoShowUpscaleTasks,
@@ -12588,6 +12608,8 @@ mod tests {
         for id in [
             MenuCommandId::ToolsCreateAiCaptions,
             MenuCommandId::ToolsShowCaptionProgress,
+            MenuCommandId::ToolsCreateTranscripts,
+            MenuCommandId::ToolsShowTranscriptProgress,
         ] {
             assert_eq!(menu_command_spec(id).unwrap().action, None);
             assert_eq!(MenuCommandId::parse_stable_name(id.stable_name()), Some(id));

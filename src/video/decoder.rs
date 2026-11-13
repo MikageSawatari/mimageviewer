@@ -2115,7 +2115,9 @@ fn send_video_info(
 }
 
 /// Input の stream metadata だけを読む。音声 setup / 出力 device には触れない。
-fn enumerate_audio_tracks(input: &ffmpeg_the_third::format::context::Input) -> Vec<AudioTrackInfo> {
+pub(crate) fn enumerate_audio_tracks(
+    input: &ffmpeg_the_third::format::context::Input,
+) -> Vec<AudioTrackInfo> {
     use ffmpeg_the_third::codec::decoder;
     enumerate_audio_tracks_with_decoder(input, |codec_id| decoder::find(codec_id).is_some())
 }

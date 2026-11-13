@@ -76,6 +76,7 @@ pub(crate) mod depth_estimation;
 pub(crate) mod depth_preprocess;
 pub mod detached_window_geometry;
 pub(crate) mod feedback;
+pub mod transcript_db;
 #[doc(hidden)]
 pub use feedback::draw_ai_failure_feedback_snapshot_fixture;
 #[cfg(windows)]

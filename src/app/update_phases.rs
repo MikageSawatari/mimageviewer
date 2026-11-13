@@ -799,6 +799,10 @@ impl App {
         self.show_caption_job_progress(ctx);
         #[cfg(windows)]
         self.show_caption_delete_dialog(ctx);
+        #[cfg(windows)]
+        self.show_transcript_job_progress(ctx);
+        #[cfg(windows)]
+        self.show_transcript_delete_dialog(ctx);
     }
 
     pub(super) fn service_thumb_quality_results(&mut self, ctx: &egui::Context) {
