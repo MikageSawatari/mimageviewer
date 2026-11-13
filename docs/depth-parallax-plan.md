@@ -3866,3 +3866,11 @@ request の abort / retire 中の後継は外側 `Preparing.request` が所有�
 こちらから全件 gate・検証用 build・製品起動・commit / push は実施していない。vendor 差分なし、
 ブランチ `feat-767-stage2` / HEAD `bc5c3415a` のまま。独立 Sol / xhigh が整形後の差分と全証跡を照合し、
 r1 P2 の指定スコープを **受入可、未解決 P1 / P2 なし** と判定した。
+
+#### 独立実装レビュー r2 (2026-11-14、設計担当が依頼した別セッションの GPT-6.1 Sol / xhigh、read-only、対象 `01c9b2195`)
+
+**受入可、P1 / P2 / P3 なし**。r1 の P2 は解消。保守要求の完了は `None` を所有 context の確定値へ解決し、追加テストは実 linked open → D の activation / fork →
+A の再 activation 後の完了と、D が active のままの完了を検査している。F12 以外で表示先が変わる実呼出は `toggle_video_window_mode` の MainWindow ↔ Fullscreen だけで、
+非 detached の独立性 false を継承するので正しい。新規 open とメディアウィンドウ設定による移動は `prepare_viewer_presentation_open` が同期で確定する。
+F12 の経路 (native・egui・`toggle_detached_viewer_mode`) は明示値を保つ。**症状パッチではなく構造的な変更であることに合意** (保守完了が参照する独立性の正本を
+所有 context に一本化した)。r1 (`9044445e6`) の判定「指摘修正後に受入可・構造的変更に合意」と合わせ、課題 1 の実装を設計担当 (ClaudeCode) が検収した。
