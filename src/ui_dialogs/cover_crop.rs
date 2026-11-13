@@ -46,6 +46,12 @@ pub(crate) struct CoverCropDialog {
     container: PathBuf,
     cancel: Arc<AtomicBool>,
     phase: Phase,
+    placement: WindowPlacement,
+}
+
+enum WindowPlacement {
+    Initial,
+    UserManaged,
 }
 
 enum Phase {
@@ -298,6 +304,7 @@ impl App {
             container: owner,
             cancel,
             phase,
+            placement: WindowPlacement::Initial,
         });
     }
 
@@ -347,7 +354,14 @@ impl App {
         let enter = self.dialog_enter_pressed(ctx);
         let escape = self.dialog_escape_pressed(ctx);
         let mut open = true;
-        let action = draw_window(ctx, &mut open, &mut dialog.phase, enter, escape);
+        let action = draw_window(
+            ctx,
+            &mut open,
+            &mut dialog.phase,
+            enter,
+            escape,
+            &mut dialog.placement,
+        );
         let close = !open
             || match action {
                 Action::Cancel => true,
@@ -664,6 +678,7 @@ fn draw_window(
     phase: &mut Phase,
     enter: bool,
     escape: bool,
+    placement: &mut WindowPlacement,
 ) -> Action {
     let bounds = ctx.content_rect();
     let safe = bounds.shrink2(window_margin(bounds));
@@ -675,11 +690,29 @@ fn draw_window(
             .allocated_width();
     let size = egui::vec2(safe.width().min(900.0 + scroll_width), safe.height());
     let mut action = if escape { Action::Cancel } else { Action::None };
-    egui::Window::new("代表サムネの範囲").id(egui::Id::new("cover-crop-window"))
-        .open(open).default_pos(safe.min)
-        .default_size(size).min_size(egui::vec2(240.0,120.0).min(size))
-        .max_size(size).constrain_to(safe).collapsible(false).resizable(true)
-        .show(ctx, |parent| {
+    let mut window = egui::Window::new("代表サムネの範囲")
+        .id(egui::Id::new("cover-crop-window"))
+        .open(open)
+        .default_pos(safe.min)
+        .default_size(size)
+        .min_size(egui::vec2(240.0, 120.0).min(size))
+        .max_size(size)
+        .constrain_to(safe)
+        .collapsible(false)
+        .resizable(true);
+    if matches!(
+        std::mem::replace(placement, WindowPlacement::UserManaged),
+        WindowPlacement::Initial
+    ) {
+        // Apply this opening's geometry once, including when egui still holds
+        // an earlier opening's size. Later frames leave user resizing/moving
+        // to egui. Reuse the id to keep area, scroll and animation state bounded.
+        window = window
+            .current_pos(safe.min)
+            .fixed_size(size)
+            .resizable(true);
+    }
+    window.show(ctx, |parent| {
             let content_rect = parent.available_rect_before_wrap();
             let mut reserved = parent.new_child(
                 egui::UiBuilder::new().max_rect(content_rect)
@@ -958,7 +991,14 @@ fn draw_cover_crop_snapshot(ui: &mut egui::Ui, auto_enabled: bool) {
         drag: None,
         error: None,
     });
-    let _ = draw_window(ui.ctx(), &mut true, &mut phase, false, false);
+    let _ = draw_window(
+        ui.ctx(),
+        &mut true,
+        &mut phase,
+        false,
+        false,
+        &mut WindowPlacement::UserManaged,
+    );
 }
 
 #[cfg(test)]
@@ -1030,6 +1070,7 @@ mod tests {
             container: root.clone(),
             cancel: Arc::new(AtomicBool::new(false)),
             phase: Phase::Loading(rx),
+            placement: WindowPlacement::Initial,
         });
         (app, tx, root, crop)
     }
@@ -1537,7 +1578,7 @@ mod tests {
                             }
                             _=>Phase::Failed("代表画像を読み込めませんでした。別のページで指定してください。".into()),
                         });
-                        let action=draw_window(ctx,&mut state.open,phase,false,false);
+                        let action=draw_window(ctx,&mut state.open,phase,false,false,&mut WindowPlacement::UserManaged);
                         if action!=Action::None {state.action=action;}
                         state.responses=state.watched.iter().filter_map(|id|ctx.read_response(*id)).collect();
                         state.canvas=ctx.data(|data|data.get_temp(egui::Id::new("cover-crop-canvas-geometry")));
@@ -1664,7 +1705,14 @@ mod tests {
                                         error: None,
                                     })
                                 });
-                                let action = draw_window(ctx, &mut state.open, phase, false, false);
+                                let action = draw_window(
+                                    ctx,
+                                    &mut state.open,
+                                    phase,
+                                    false,
+                                    false,
+                                    &mut WindowPlacement::UserManaged,
+                                );
                                 if action != Action::None {
                                     state.action = action;
                                 }
@@ -1763,6 +1811,212 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn cover_crop_repeated_openings_keep_egui_memory_bounded_and_siblings_unchanged() {
+        for scale in [1.0, 2.0] {
+            let (mut app, tx, _root, crop) = fake_loading_app();
+            let dialog = app.cover_crop_dialog.take();
+            let mut h = app_harness(app);
+            crate::settings::apply_ui_scale_factor(&h.ctx, scale);
+            h.run_steps(2);
+            h.set_size(egui::vec2(1920.0, 1080.0) / scale);
+            h.run_steps(2);
+            h.state_mut().cover_crop_dialog = dialog;
+            tx.send((7, Ok(fake_prepared(Some(crop))))).unwrap();
+            h.run_steps(8);
+            let sibling_id = egui::Id::new("cover-crop-unrelated-window-test");
+            let sibling_rect =
+                egui::Rect::from_min_size(egui::pos2(500.0, 100.0), egui::vec2(200.0, 150.0));
+            h.ctx.memory_mut(|memory| {
+                memory.areas_mut().set_state(
+                    egui::LayerId::new(egui::Order::Middle, sibling_id),
+                    egui::AreaState {
+                        pivot_pos: Some(sibling_rect.min),
+                        size: Some(sibling_rect.size()),
+                        ..Default::default()
+                    },
+                );
+                memory.data.insert_temp(sibling_id, 0x773_u64);
+            });
+            let mut warm_size = None;
+            for generation in 8..20 {
+                h.get_by_label("キャンセル").click();
+                h.run_steps(3);
+                assert!(h.state().cover_crop_dialog.is_none());
+                let (tx, rx) = mpsc::channel();
+                let app = h.state_mut();
+                app.cover_crop_generation = generation;
+                app.cover_crop_dialog = Some(CoverCropDialog {
+                    generation,
+                    container: app.current_folder.clone().unwrap(),
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    phase: Phase::Loading(rx),
+                    placement: WindowPlacement::Initial,
+                });
+                tx.send((generation, Ok(fake_prepared(Some(crop)))))
+                    .unwrap();
+                h.run_steps(8);
+                assert_eq!(
+                    h.ctx.memory(|memory| memory.area_rect(sibling_id)),
+                    Some(sibling_rect)
+                );
+                assert_eq!(
+                    h.ctx.data(|data| data.get_temp::<u64>(sibling_id)),
+                    Some(0x773)
+                );
+                let count = h.ctx.data(|data| data.len());
+                if generation == 10 {
+                    warm_size = Some(count);
+                }
+                if let Some(limit) = warm_size {
+                    assert!(
+                        count <= limit,
+                        "{scale}: egui memory grew with opening {generation}: {count} > {limit}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cover_crop_user_geometry_survives_loading_and_ready_frames_at_100_and_200_percent() {
+        fn drag(
+            h: &mut Harness<'static, crate::app::AppTestEnvForTest>,
+            from: egui::Pos2,
+            to: egui::Pos2,
+        ) {
+            h.hover_at(from);
+            h.run_steps(2);
+            h.event(egui::Event::PointerButton {
+                pos: from,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            });
+            h.run_steps(1);
+            h.event(egui::Event::PointerMoved(to));
+            h.run_steps(3);
+            h.event(egui::Event::PointerButton {
+                pos: to,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            h.run_steps(8);
+        }
+        let id = egui::Id::new("cover-crop-window");
+        for scale in [1.0, 2.0] {
+            let (mut app, tx, _root, crop) = fake_loading_app();
+            let dialog = app.cover_crop_dialog.take();
+            let mut h = app_harness(app);
+            crate::settings::apply_ui_scale_factor(&h.ctx, scale);
+            h.run_steps(2);
+            h.set_size(egui::vec2(1920.0, 1080.0) / scale);
+            h.run_steps(2);
+            h.state_mut().cover_crop_dialog = dialog;
+            h.run_steps(8);
+            let initial = h.ctx.memory(|m| m.area_rect(id)).unwrap();
+            drag(
+                &mut h,
+                initial.right_bottom(),
+                initial.min + egui::vec2(420.0, 260.0),
+            );
+            let resized = h.ctx.memory(|m| m.area_rect(id)).unwrap();
+            assert!(resized.width() + 40.0 < initial.width());
+            assert!(resized.height() + 40.0 < initial.height());
+            let title = resized.center_top() + egui::vec2(0.0, 16.0);
+            drag(&mut h, title, title + egui::vec2(30.0, 20.0));
+            let moved = h.ctx.memory(|m| m.area_rect(id)).unwrap();
+            assert!((moved.size() - resized.size()).length() <= 1.0);
+            assert!((moved.min - resized.min - egui::vec2(30.0, 20.0)).length() <= 1.0);
+            h.set_size(egui::vec2(2200.0, 1400.0) / scale);
+            h.run_steps(3);
+            assert_eq!(h.ctx.memory(|m| m.area_rect(id)).unwrap(), moved);
+            tx.send((7, Ok(fake_prepared(Some(crop))))).unwrap();
+            h.run_steps(10);
+            assert!(matches!(
+                h.state().cover_crop_dialog.as_ref().unwrap().phase,
+                Phase::Ready(_)
+            ));
+            let ready = h.ctx.memory(|m| m.area_rect(id)).unwrap();
+            assert!(
+                (ready.min - moved.min).length() <= 1.0
+                    && (ready.size() - moved.size()).length() <= 1.0,
+                "{scale}: worker completion overwrote user geometry: {moved:?} -> {ready:?}"
+            );
+            h.run_steps(10);
+            assert_eq!(h.ctx.memory(|m| m.area_rect(id)).unwrap(), ready);
+        }
+    }
+
+    #[test]
+    fn cover_crop_reopen_uses_current_viewport_at_100_and_200_percent() {
+        fn ready_harness(
+            scale: f32,
+            physical: egui::Vec2,
+        ) -> Harness<'static, crate::app::AppTestEnvForTest> {
+            let (mut app, tx, _root, crop) = fake_loading_app();
+            let dialog = app.cover_crop_dialog.take();
+            let mut h = app_harness(app);
+            crate::settings::apply_ui_scale_factor(&h.ctx, scale);
+            h.run_steps(2);
+            h.set_size(physical / scale);
+            // Harness builds an initial frame; do not open the dialog until
+            // the requested viewport/zoom has been applied to that context.
+            h.run_steps(2);
+            assert!((h.ctx.content_rect().size() * scale - physical).length() <= 1.0);
+            h.state_mut().cover_crop_dialog = dialog;
+            tx.send((7, Ok(fake_prepared(Some(crop))))).unwrap();
+            h.run_steps(8);
+            h
+        }
+        let window_id = egui::Id::new("cover-crop-window");
+        let mut failures = Vec::new();
+        for scale in [1.0, 2.0] {
+            let large_size = egui::vec2(1920.0, 1080.0);
+            let expected = {
+                let reference = ready_harness(scale, large_size);
+                reference
+                    .ctx
+                    .memory(|memory| memory.area_rect(window_id))
+                    .unwrap()
+            };
+            let mut h = ready_harness(scale, egui::vec2(1100.0, 620.0));
+            let small = h.ctx.memory(|memory| memory.area_rect(window_id)).unwrap();
+            h.get_by_label("キャンセル").click();
+            h.run_steps(3);
+            assert!(h.state().cover_crop_dialog.is_none());
+            h.set_size(large_size / scale);
+            h.run_steps(2);
+            let (tx, rx) = mpsc::channel();
+            let app = h.state_mut();
+            app.cover_crop_generation = 8;
+            app.cover_crop_dialog = Some(CoverCropDialog {
+                generation: 8,
+                container: app.current_folder.clone().unwrap(),
+                cancel: Arc::new(AtomicBool::new(false)),
+                phase: Phase::Loading(rx),
+                placement: WindowPlacement::Initial,
+            });
+            let crop = CoverCrop::new([0, 0, 500_000, 1_000_000]).unwrap().unwrap();
+            tx.send((8, Ok(fake_prepared(Some(crop))))).unwrap();
+            h.run_steps(8);
+            let reopened = h.ctx.memory(|memory| memory.area_rect(window_id)).unwrap();
+            println!(
+                "scale={scale}: small={small:?}, reopened={reopened:?}, fresh large={expected:?}"
+            );
+            if (reopened.size() - expected.size()).length() > 1.0
+                || (reopened.min - expected.min).length() > 1.0
+            {
+                failures.push(format!("{scale}: {reopened:?} != {expected:?}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "reopening retained old geometry: {failures:?}"
+        );
     }
 
     #[test]
@@ -1992,6 +2246,7 @@ mod tests {
             container: PathBuf::from("book.zip"),
             cancel: cancel.clone(),
             phase: Phase::Loading(rx),
+            placement: WindowPlacement::Initial,
         };
         drop(dialog);
         assert!(cancel.load(Ordering::Relaxed));

@@ -232,6 +232,7 @@ fn check_screen_crop(rotation: Rotation, displayed: [u32; 4], pdf: bool, jpeg: b
         container: path.clone(),
         cancel: Arc::new(AtomicBool::new(false)),
         phase: Phase::Loading(rx),
+        placement: WindowPlacement::Initial,
     });
     let mut h = super::tests::app_harness(app);
     tx.send((1, Ok(prepared))).unwrap();

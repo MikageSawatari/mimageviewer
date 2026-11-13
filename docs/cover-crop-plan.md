@@ -950,3 +950,25 @@ snapshotは指定4件を更新して目視し、更新指定なしの`ui_snapsho
 最小幅での折り返しの追補検証は、実リサイズ・クリックを含む焦点5件と
 `cover_crop|context_menu`269件、更新指定なしの`ui_snapshot`257件が成功。
 広い画面の画像高は上記の値を維持。ログは`target/764ui-wrap-focused.log`、`target/764ui-wrap-final.log`。
+
+## 20. 開く回ごとの窓の初期配置（§1.777、2026-11-14）
+
+修正前の実描画テストで、固定idのegui状態が残り、再表示の`default_size`を使わないことを確認した。
+1100×620から1920×1080へ変えて開き直しても、100%では914×540pt（初回なら914×1000pt）、
+200%では518×278pt（初回なら880×460pt）のままだった。
+
+バックログに併記された「開いた初回だけ位置・サイズを指定し直す」方式を採用する。
+現在のeguiには窓単位の状態削除APIがなく、新idを増やすとArea・Resize・scroll・animationの状態が残るため、
+固定idを維持する。`CoverCropDialog`が`Initial / UserManaged`の配置状態を所有し、最初の描画でだけ
+現在の表示領域に基づく位置とサイズを`current_pos`・`fixed_size`で適用する。その後は利用者の操作を保持する。
+初期化をworkerのphaseに結び付けず、読み込み完了・検証エラーでは窓を配置し直さない。
+
+窓idの他の参照は幾何テストだけで、モーダル登録・浮遊層guardはidに依存しない。
+固定idと`cover-crop-canvas-geometry`は維持し、他の窓を一括resetしない。
+100%/200%で再表示、読み込み中の移動・リサイズと完了後の保持、表示中のhost拡大、反復表示時の
+egui data数の上限・他の窓の状態の不変を検査する。§1.773の回転対応はこの変更に含めない。
+
+検証は共有runner（owner=`773`）で新規3件・`cover_crop`73件・通常の`ui_snapshot`257件が成功。
+修正前の再現ログは`target/773-premise-final-before.log`、修正後は`target/773-final.log`。
+初回のTurboJPEG/MSBuild停止は同版・同条件の静的libと一致するheaderを`target/773-native/`へ実体コピーし、
+検証コマンドだけで`target/773-native-env.ps1`を使って解消した。製品の依存設定は変更していない。
