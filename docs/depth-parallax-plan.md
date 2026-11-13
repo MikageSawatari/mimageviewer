@@ -3978,3 +3978,13 @@ Building の保持条件で用いた `viewer_session_is_detached()` は `fullscr
 `preserve_detached_for_folder_nav` の条件は registry 所有の私的予約と同じ窓の runtime から生存を判定するもので、Mounted には影響せず、Closing / runtime 不在は保持しない。
 取消と build abort で保持した pair が残る経路は無い。同型の経路 (loading shell / collection root / descriptor / ScannedFolder) に取りこぼしは無い。テストは弱めていない。
 **症状パッチではなく構造的な変更であることに合意** (内容の close と予約済み表示 session の寿命を区別し、公開前後で同じ所有者の確定値を保つ)。設計担当 (ClaudeCode) も同じ判断で検収した。
+
+#### 全件 gate と確認用 build (2026-11-14、設計担当、すべて run-heavy.ps1 経由)
+
+| コマンド | 結果 |
+|---|---|
+| `.\scripts\test-lib-full.ps1` (`-FullTest`、コード `178a3ece2`) | 1 回目 (`01c9b2195`) は 17,643 件中 2 件失敗 (上記で修正)。2 回目 **17,644 件成功 / 0 件失敗、exit 0** (901.6 秒)。実行中に文書だけのコミットを入れたため、再利用の記録は残っていない |
+| `cargo test --workspace --exclude mimageviewer-launcher --features pack-build-tools --no-run` | 1 回目はページング ファイル不足 (os error 1455、並行ビルドによる) で失敗、`-j 4` で再実行して **exit 0** |
+| `.\scripts\build-dev.ps1` | **exit 0**。`target\dev-runtime\mimageviewer-core.exe` (2026-11-14 06:51) |
+
+描画・レイアウトの変更が無いので ui_snapshot は回していない。実機確認 (サブ PC、手順 `C:\miv-subpc\steps-767-stage2.md`) は未実施。
