@@ -96,7 +96,7 @@ fn cover_crop_snapshot_with_auto(
         });
     harness.run_steps(8);
     let viewport = harness.ctx.content_rect();
-    for label in ["OK", "手動の範囲を解除", "キャンセル", "Close window"] {
+    for label in ["  OK  ", "手動の範囲を解除", "キャンセル", "Close window"] {
         assert!(
             viewport.contains_rect(harness.get_by_label(label).rect()),
             "{name}: {label} outside viewport"

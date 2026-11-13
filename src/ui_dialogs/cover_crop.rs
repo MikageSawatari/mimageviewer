@@ -20,6 +20,26 @@ use crate::rotation_db::Rotation;
 use eframe::egui;
 
 const UNIT: usize = 1_000_000;
+const OK_LABEL: &str = "  OK  ";
+const CORNER_HIT_RADIUS: f32 = 9.0;
+const EDGE_HIT_RADIUS: f32 = 6.0;
+// The sides face the window resize edge: 9 pt handle hit radius + egui's
+// 10 pt resize radius + 5 pt separation. Above/below are the title and footer,
+// so 12 pt only needs to contain the 9 pt handles, preserving image height.
+const CANVAS_PADDING: egui::Vec2 = egui::vec2(24.0, 12.0);
+const WINDOW_MARGIN: f32 = 40.0;
+
+fn window_margin(bounds: egui::Rect) -> egui::Vec2 {
+    // Give compact viewports the former 16 pt inset, rather than spending
+    // their editing height on the outer gap. Restore 40 pt gradually as the
+    // viewport grows from 360 to 480 pt; still clamp for very tiny viewports.
+    let roomy = ((bounds.height() - 360.0) / 120.0).clamp(0.0, 1.0);
+    let margin = egui::lerp(16.0..=WINDOW_MARGIN, roomy);
+    egui::vec2(
+        margin.min(bounds.width().max(0.0) * 0.1),
+        margin.min(bounds.height().max(0.0) * 0.1),
+    )
+}
 
 pub(crate) struct CoverCropDialog {
     generation: u64,
@@ -646,37 +666,83 @@ fn draw_window(
     escape: bool,
 ) -> Action {
     let bounds = ctx.content_rect();
-    let width = (bounds.width() - 32.0).clamp(240.0, 860.0);
+    let safe = bounds.shrink2(window_margin(bounds));
+    // Compensate for the padding increase (4 -> 24 pt per side) and the
+    // scrollbar now needed for the explanations below the image. Retain the
+    // former maximum image width using the actual scrollbar reservation.
+    let scroll_width =
+        super::non_overlapping_dialog_scroll_style(ctx.global_style().spacing.scroll)
+            .allocated_width();
+    let size = egui::vec2(safe.width().min(900.0 + scroll_width), safe.height());
     let mut action = if escape { Action::Cancel } else { Action::None };
     egui::Window::new("代表サムネの範囲").id(egui::Id::new("cover-crop-window"))
-        .open(open).default_pos(bounds.min+egui::vec2(16.0,16.0))
-        .default_width(width).default_height((bounds.height()-64.0).max(120.0))
-        .max_width(width).max_height((bounds.height()-32.0).max(100.0)).collapsible(false).resizable(true)
-        .show(ctx, |ui| {
-            // Fixed action row and title stay outside the scrollable body.
-            ui.horizontal_wrapped(|ui| {
-                let ready = matches!(phase, Phase::Ready(_));
-                if ui.add_enabled(ready, egui::Button::new("OK")).clicked() || enter && ready { action = Action::Accept; }
-                let can_clear = matches!(phase, Phase::Ready(draft) if draft.had_manual_crop);
-                if ui.add_enabled(can_clear, egui::Button::new("手動の範囲を解除")).clicked() { action = Action::Clear; }
-                if ui.button("キャンセル").clicked() { action = Action::Cancel; }
-            });
-            // Validation belongs to the fixed controls, so a failed save is
-            // visible without scrolling even for portrait images and large UI text.
-            if let Phase::Ready(draft)=phase
-                && let Some(error)=&draft.error
-            { ui.colored_label(ui.visuals().error_fg_color,error); }
+        .open(open).default_pos(safe.min)
+        .default_size(size).min_size(egui::vec2(240.0,120.0).min(size))
+        .max_size(size).constrain_to(safe).collapsible(false).resizable(true)
+        .show(ctx, |parent| {
+            let content_rect = parent.available_rect_before_wrap();
+            let mut reserved = parent.new_child(
+                egui::UiBuilder::new().max_rect(content_rect)
+                    .layout(egui::Layout::bottom_up(egui::Align::Min)),
+            );
+            // Render the fixed footer first, bottom-up. Its actual widget
+            // rectangles (including wrapped validation/auto text) consume the
+            // height before the scroll body receives the remainder.
             if let Phase::Ready(draft)=phase
                 && draft.had_manual_crop && draft.auto_enabled
-            { ui.small("手動の範囲を解除すると、自動の判定に戻ります。"); }
-            ui.separator();
-            let body_height = ui.available_height().max(20.0);
+            { reserved.small("手動の範囲を解除すると、自動の判定に戻ります。"); }
+            if let Phase::Ready(draft)=phase
+                && let Some(error)=&draft.error
+            { reserved.colored_label(reserved.visuals().error_fg_color,error); }
+            // Measure real buttons with this style, rather than assuming a
+            // label width or padding. The child does not allocate into the
+            // footer and its sizing widgets cannot receive input.
+            let button_sizes = {
+                let mut measure = reserved.new_child(egui::UiBuilder::new()
+                    .id_salt("cover-crop-button-sizing").invisible().sizing_pass()
+                    .layout(egui::Layout::top_down(egui::Align::Min)));
+                [OK_LABEL, "キャンセル", "手動の範囲を解除"].map(|label| {
+                    measure.add(egui::Button::new(label).wrap_mode(egui::TextWrapMode::Extend)).rect.size()
+                })
+            };
+            let row_height = button_sizes.iter().map(|size| size.y).fold(0.0, f32::max);
+            let row_width = button_sizes.iter().map(|size| size.x).sum::<f32>()
+                + 2.0 * reserved.spacing().item_spacing.x + reserved.visuals().resize_corner_size;
+            let wrap_clear = reserved.available_width() < row_width;
+            let can_clear = matches!(phase, Phase::Ready(draft) if draft.had_manual_crop);
+            if wrap_clear {
+                // The footer grows bottom-up, so allocate its lower row first.
+                // Its actual height and inter-row spacing reduce the body below.
+                reserved.allocate_ui_with_layout(
+                    egui::vec2(reserved.available_width(), button_sizes[2].y),
+                    egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    if ui.add_enabled(can_clear, egui::Button::new("手動の範囲を解除")).clicked() { action = Action::Clear; }
+                });
+            }
+            reserved.allocate_ui_with_layout(
+                egui::vec2(reserved.available_width(), row_height),
+                egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                let ready = matches!(phase, Phase::Ready(_));
+                if ui.add_enabled(ready, egui::Button::new(OK_LABEL)).clicked() || enter && ready { action = Action::Accept; }
+                if ui.button("キャンセル").clicked() { action = Action::Cancel; }
+                if !wrap_clear { ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(ui.visuals().resize_corner_size);
+                    if ui.add_enabled(can_clear, egui::Button::new("手動の範囲を解除")).clicked() { action = Action::Clear; }
+                }); }
+            });
+            // In top-down reading order: 8 pt, separator, 4 pt, action row.
+            reserved.add_space(4.0);
+            reserved.separator();
+            reserved.add_space(8.0);
+            let body_rect = reserved.available_rect_before_wrap();
+            let mut body = reserved.new_child(egui::UiBuilder::new().max_rect(body_rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)));
+            let ui = &mut body;
+            let body_height = body_rect.height().max(1.0);
             ui.spacing_mut().scroll = super::non_overlapping_dialog_scroll_style(ui.spacing().scroll);
             #[cfg(test)]
             let mut canvas_rect = None;
             let _body = egui::ScrollArea::vertical().auto_shrink([false,false]).max_height(body_height).show(ui, |ui| {
-                let body_top = ui.cursor().top();
-                ui.label("範囲は一覧の代表サムネだけに使います。画像そのものや閲覧時の表示は変わりません。");
                 match phase {
                     Phase::Loading(_) => { ui.spinner(); ui.label("代表画像を読み込んでいます…"); }
                     Phase::Failed(message) => {
@@ -684,13 +750,14 @@ fn draw_window(
                         ui.label("本の中を開いて表紙のページで指定してください。");
                     }
                     Phase::Ready(draft) => {
-                        let height = (body_height-(ui.cursor().top()-body_top)-4.0).max(48.0);
+                        let height = (body_height-4.0).max(48.0);
                         let _canvas = draw_canvas(ui,draft,height);
                         #[cfg(test)]
                         { canvas_rect = Some(_canvas); }
                         ui.weak("ドラッグで範囲を作成・移動できます。枠の辺と角で大きさを変更できます。");
                     }
                 }
+                ui.label("範囲は一覧の代表サムネだけに使います。画像そのものや閲覧時の表示は変わりません。");
                 ui.label("範囲を指定すると、この画像が代表に固定されます。");
                 ui.weak("このページの消しゴム・注釈・切り取りは代表サムネには反映されません (色調補正は反映されます)。");
             });
@@ -700,6 +767,11 @@ fn draw_window(
                 if let Some(rect)=canvas_rect { data.insert_temp(id,(rect,_body.inner_rect)); }
                 else { data.remove::<(egui::Rect,egui::Rect)>(id); }
             });
+            // The finite Window allocation owns the whole footer/body layout;
+            // do not feed scroll-content height into the next frame's size.
+            // Advance the original parent, not the scroll body's child.
+            drop(body);
+            parent.advance_cursor_after_rect(content_rect);
         });
     action
 }
@@ -709,14 +781,12 @@ fn draw_canvas(ui: &mut egui::Ui, draft: &mut CropDraft, height: f32) -> egui::R
     if matches!(draft.rotation, Rotation::Cw90 | Rotation::Cw270) {
         size = egui::vec2(size.y, size.x);
     }
-    // Reserve four points around the image so even full-image crop handles
-    // remain inside the canvas and its scroll viewport.
-    let scale = ((ui.available_width() - 8.0).max(1.0) / size.x)
-        .min((height - 8.0).max(1.0) / size.y)
+    let padding = 2.0 * CANVAS_PADDING;
+    let scale = ((ui.available_width() - padding.x).max(1.0) / size.x)
+        .min((height - padding.y).max(1.0) / size.y)
         .max(0.0001);
-    let (canvas, response) =
-        ui.allocate_exact_size(size * scale + egui::Vec2::splat(8.0), egui::Sense::drag());
-    let rect = canvas.shrink(4.0);
+    let (canvas, response) = ui.allocate_exact_size(size * scale + padding, egui::Sense::drag());
+    let rect = canvas.shrink2(CANVAS_PADDING);
     let mut mesh = egui::Mesh::with_texture(draft.texture.id());
     for (pos, uv) in [
         (rect.left_top(), egui::pos2(0., 0.)),
@@ -816,22 +886,22 @@ fn handles(rect: egui::Rect) -> [(egui::Pos2, CropHandle); 8] {
 fn hit_handle(rect: egui::Rect, point: egui::Pos2) -> Option<CropHandle> {
     handles(rect)
         .into_iter()
-        .find(|(p, _)| p.distance(point) <= 9.0)
+        .find(|(p, _)| p.distance(point) <= CORNER_HIT_RADIUS)
         .map(|(_, h)| h)
         .or_else(|| {
-            if (point.x - rect.left()).abs() <= 6.0
+            if (point.x - rect.left()).abs() <= EDGE_HIT_RADIUS
                 && (rect.top()..=rect.bottom()).contains(&point.y)
             {
                 Some(CropHandle::West)
-            } else if (point.x - rect.right()).abs() <= 6.0
+            } else if (point.x - rect.right()).abs() <= EDGE_HIT_RADIUS
                 && (rect.top()..=rect.bottom()).contains(&point.y)
             {
                 Some(CropHandle::East)
-            } else if (point.y - rect.top()).abs() <= 6.0
+            } else if (point.y - rect.top()).abs() <= EDGE_HIT_RADIUS
                 && (rect.left()..=rect.right()).contains(&point.x)
             {
                 Some(CropHandle::North)
-            } else if (point.y - rect.bottom()).abs() <= 6.0
+            } else if (point.y - rect.bottom()).abs() <= EDGE_HIT_RADIUS
                 && (rect.left()..=rect.right()).contains(&point.x)
             {
                 Some(CropHandle::South)
@@ -1045,7 +1115,7 @@ mod tests {
         tx.send((7, Ok(prepared))).ok().unwrap();
         let mut h = app_harness(app);
         h.run_steps(4);
-        h.get_by_label("OK").click();
+        h.get_by_label(OK_LABEL).click();
         h.run_steps(2);
         assert_eq!(
             h.state()
@@ -1064,7 +1134,7 @@ mod tests {
         use crate::feedback::FeedbackKind;
         for (button, success, failure) in [
             (
-                "OK",
+                OK_LABEL,
                 "代表サムネの範囲を設定しました",
                 "代表サムネの範囲を保存できませんでした",
             ),
@@ -1106,7 +1176,7 @@ mod tests {
                     .lookup(&root)
                     .unwrap();
                 if writable {
-                    assert_eq!(saved.cover_crop, (button == "OK").then_some(crop));
+                    assert_eq!(saved.cover_crop, (button == OK_LABEL).then_some(crop));
                 } else {
                     assert!(matches!(
                         saved.source,
@@ -1141,7 +1211,7 @@ mod tests {
         if let Phase::Ready(draft) = &mut h.state_mut().cover_crop_dialog.as_mut().unwrap().phase {
             draft.crop = crop_rect(changed);
         }
-        h.get_by_label("OK").click();
+        h.get_by_label(OK_LABEL).click();
         h.run_steps(2);
         assert!(!h.state().cover_crop_dialog_open());
         let expected = FolderPin {
@@ -1223,7 +1293,7 @@ mod tests {
                     max_y: UNIT as f32,
                 };
             }
-            h.get_by_label("OK").click();
+            h.get_by_label(OK_LABEL).click();
             h.run_steps(6);
             assert!(h.state().cover_crop_dialog_open());
             let error = "幅・高さが画像の 1% 以上になるよう指定してください";
@@ -1257,7 +1327,7 @@ mod tests {
                 "{scale}: portrait image/frame clipped after failed accept: {canvas:?} in {body:?}"
             );
             assert!(viewport.contains_rect(canvas));
-            for label in ["OK", "手動の範囲を解除", "キャンセル", "Close window"] {
+            for label in [OK_LABEL, "手動の範囲を解除", "キャンセル", "Close window"] {
                 assert!(
                     viewport.contains_rect(h.get_by_label(label).rect()),
                     "{scale}: {label} outside viewport"
@@ -1443,7 +1513,7 @@ mod tests {
         for scale in [1., 2.] {
             for kind in [0, 1, 2] {
                 let labels: &[&str] = if kind == 1 {
-                    &["OK", "手動の範囲を解除", "キャンセル", "Close window"]
+                    &[OK_LABEL, "手動の範囲を解除", "キャンセル", "Close window"]
                 } else {
                     &["キャンセル", "Close window"]
                 };
@@ -1477,6 +1547,16 @@ mod tests {
                     assert!((viewport.size() * scale - egui::vec2(1093., 614.)).length() < 1.);
                     if kind == 1 {
                         let (canvas, body) = h.state().canvas.expect("ready canvas geometry");
+                        let ok = h.get_by_label(OK_LABEL).rect();
+                        let cancel = h.get_by_label("キャンセル").rect();
+                        let clear = h.get_by_label("手動の範囲を解除").rect();
+                        assert!(ok.right() < cancel.left());
+                        assert!(cancel.right() + 16.0 < clear.left());
+                        assert!((ok.center().y - clear.center().y).abs() <= 1.0);
+                        assert!(
+                            body.bottom() < ok.top(),
+                            "body must stop above fixed footer"
+                        );
                         assert!(
                             body.contains_rect(canvas),
                             "{scale}: initial full image and crop handles {canvas:?} clipped by body {body:?}"
@@ -1501,7 +1581,7 @@ mod tests {
                             "{scale}: supplementary edit note is unreachable at scroll end: {note:?} in {body:?}"
                         );
                     }
-                    for control in ["OK", "手動の範囲を解除", "キャンセル", "Close window"]
+                    for control in [OK_LABEL, "手動の範囲を解除", "キャンセル", "Close window"]
                     {
                         let node = h.get_by_label(control);
                         assert!(
@@ -1533,13 +1613,344 @@ mod tests {
                     h.run_steps(2);
                     assert!(
                         match *label {
-                            "OK" => h.state().action == Action::Accept,
+                            OK_LABEL => h.state().action == Action::Accept,
                             "手動の範囲を解除" => h.state().action == Action::Clear,
                             "キャンセル" => h.state().action == Action::Cancel,
                             _ => !h.state().open,
                         },
                         "{kind} {scale}: {label} click not handled"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cover_crop_minimum_width_wraps_clear_and_keeps_buttons_clickable_at_100_and_200_percent() {
+        for scale in [1.0, 2.0] {
+            for auto_enabled in [false, true] {
+                for label in [OK_LABEL, "キャンセル", "手動の範囲を解除"] {
+                    let mut fonts_ready = false;
+                    let mut h = crate::test_ui::builder()
+                        .with_size(egui::vec2(1093.0, 614.0))
+                        .build_ui_state(
+                            move |ui, state: &mut PureWindowState| {
+                                let ctx = ui.ctx();
+                                if !fonts_ready {
+                                    crate::ui_fonts::configure_fonts(ctx);
+                                    crate::settings::apply_ui_scale_factor(ctx, scale);
+                                    fonts_ready = true;
+                                    ctx.request_repaint();
+                                    return;
+                                }
+                                let phase = state.phase.get_or_insert_with(|| {
+                                    let prepared = fake_prepared(Some(
+                                        CoverCrop::new([0, 0, 500_000, 1_000_000])
+                                            .unwrap()
+                                            .unwrap(),
+                                    ));
+                                    Phase::Ready(CropDraft {
+                                        source: prepared.source,
+                                        texture: ctx.load_texture(
+                                            "narrow-cover",
+                                            prepared.image,
+                                            egui::TextureOptions::LINEAR,
+                                        ),
+                                        rotation: Rotation::None,
+                                        crop: crop_rect(prepared.crop),
+                                        had_manual_crop: true,
+                                        auto_enabled,
+                                        drag: None,
+                                        error: None,
+                                    })
+                                });
+                                let action = draw_window(ctx, &mut state.open, phase, false, false);
+                                if action != Action::None {
+                                    state.action = action;
+                                }
+                                state.responses = state
+                                    .watched
+                                    .iter()
+                                    .filter_map(|id| ctx.read_response(*id))
+                                    .collect();
+                                state.canvas = ctx.data(|data| {
+                                    data.get_temp(egui::Id::new("cover-crop-canvas-geometry"))
+                                });
+                            },
+                            PureWindowState {
+                                phase: None,
+                                kind: 1,
+                                open: true,
+                                action: Action::None,
+                                watched: vec![],
+                                responses: vec![],
+                                canvas: None,
+                            },
+                        );
+                    h.run_steps(8);
+                    let window_id = egui::Id::new("cover-crop-window");
+                    let before = h.ctx.memory(|memory| memory.area_rect(window_id)).unwrap();
+                    // Exercise the actual resize edge, dragging past the 240 pt
+                    // minimum so Window's own constraint decides the final width.
+                    let start = before.right_center();
+                    h.hover_at(start);
+                    h.run_steps(2);
+                    h.event(egui::Event::PointerButton {
+                        pos: start,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                    h.run_steps(1);
+                    let end = egui::pos2(before.left() + 100.0, start.y);
+                    h.event(egui::Event::PointerMoved(end));
+                    h.run_steps(3);
+                    h.event(egui::Event::PointerButton {
+                        pos: end,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                    h.run_steps(8);
+                    let window = h.ctx.memory(|memory| memory.area_rect(window_id)).unwrap();
+                    assert!(
+                        (window.width() - 240.0).abs() <= 1.0,
+                        "{scale}/{auto_enabled}: resize did not reach minimum: {before:?} -> {window:?}"
+                    );
+                    let buttons = [OK_LABEL, "キャンセル", "手動の範囲を解除"]
+                        .map(|label| h.get_by_label(label).rect());
+                    let [ok, cancel, clear] = buttons;
+                    assert!(ok.right() < cancel.left());
+                    assert!((ok.center().y - cancel.center().y).abs() <= 1.0);
+                    assert!(clear.top() > ok.bottom().max(cancel.bottom()));
+                    assert!((clear.left() - ok.left()).abs() <= 1.0);
+                    for (i, rect) in buttons.iter().enumerate() {
+                        assert!(
+                            window.contains_rect(*rect),
+                            "{scale}/{auto_enabled}: button outside window: {rect:?} in {window:?}"
+                        );
+                        for other in buttons.iter().skip(i + 1) {
+                            assert!(!rect.intersects(*other));
+                        }
+                    }
+                    let (canvas, body) = h.state().canvas.unwrap();
+                    assert!(body.contains_rect(canvas));
+                    assert!(body.bottom() < ok.top());
+                    let node = h.get_by_label(label);
+                    let id = unsafe {
+                        egui::Id::from_high_entropy_bits(
+                            (u128::from(node.accesskit_node().id()) >> 64) as u64,
+                        )
+                    };
+                    h.state_mut().watched = vec![id];
+                    h.run_steps(2);
+                    let response = &h.state().responses[0];
+                    assert!(response.interact_rect.contains_rect(response.rect));
+                    let center = response.rect.center();
+                    h.hover_at(center);
+                    h.run_steps(2);
+                    assert!(h.state().responses[0].hovered());
+                    h.get_by_label(label).click();
+                    h.run_steps(2);
+                    assert!(
+                        h.state().action
+                            == match label {
+                                OK_LABEL => Action::Accept,
+                                "キャンセル" => Action::Cancel,
+                                _ => Action::Clear,
+                            }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cover_crop_image_height_preserves_1822cd0ef_at_100_and_200_percent() {
+        // Measured 1822cd0ef's draw_window/draw_canvas and 720x280 snapshot
+        // fixture in an isolated test module, using the same app fonts, themes,
+        // 1093x614 viewport, zoom and eight frames as tests/ui_snapshot.rs.
+        // Read cover-crop-canvas-geometry; image = canvas.shrink(4.0), the
+        // padding at that commit. Values are logical pt, including auto's note.
+        let baselines = [
+            (1.0, false, 333.875, 325.875),
+            (1.0, true, 333.875, 325.875),
+            (2.0, false, 101.0, 93.0),
+            (2.0, true, 83.5, 75.5),
+        ];
+        for (scale, auto, old_canvas_height, old_image_height) in baselines {
+            let mut fonts_ready = false;
+            let mut h = crate::test_ui::builder()
+                .with_size(egui::vec2(1093.0, 614.0))
+                .build_ui(move |ui| {
+                    crate::os_theme::apply_resolved(
+                        ui.ctx(),
+                        if scale == 1.0 {
+                            crate::os_theme::ResolvedTheme::Light
+                        } else {
+                            crate::os_theme::ResolvedTheme::Dark
+                        },
+                    );
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ui.ctx());
+                        crate::settings::apply_ui_scale_factor(ui.ctx(), scale);
+                        fonts_ready = true;
+                        ui.ctx().request_repaint();
+                        return;
+                    }
+                    draw_cover_crop_snapshot(ui, auto);
+                });
+            h.run_steps(8);
+            let (canvas, body) = h
+                .ctx
+                .data(|data| {
+                    data.get_temp::<(egui::Rect, egui::Rect)>(egui::Id::new(
+                        "cover-crop-canvas-geometry",
+                    ))
+                })
+                .unwrap();
+            let image = canvas.shrink2(CANVAS_PADDING);
+            println!(
+                "scale={scale} auto={auto}: canvas height={}, image height={}, width={}",
+                canvas.height(),
+                image.height(),
+                image.width()
+            );
+            assert!(
+                canvas.height() >= old_canvas_height,
+                "{scale}/{auto}: canvas {canvas:?} shorter than {old_canvas_height}"
+            );
+            assert!(
+                image.height() >= old_image_height,
+                "{scale}/{auto}: image {image:?} shorter than {old_image_height}"
+            );
+            assert!(body.contains_rect(canvas));
+            let viewport = h.ctx.content_rect();
+            for label in [OK_LABEL, "キャンセル", "手動の範囲を解除", "Close window"] {
+                assert!(viewport.contains_rect(h.get_by_label(label).rect()));
+            }
+            // The full-image hit regions must also fit, regardless of the
+            // partial selection painted by this snapshot fixture.
+            let window = h
+                .ctx
+                .memory(|memory| memory.area_rect(egui::Id::new("cover-crop-window")))
+                .unwrap();
+            let resize = h
+                .ctx
+                .global_style()
+                .interaction
+                .resize_grab_radius_corner
+                .max(h.ctx.global_style().interaction.resize_grab_radius_side);
+            for (point, _) in handles(image) {
+                let hit =
+                    egui::Rect::from_center_size(point, egui::Vec2::splat(2.0 * CORNER_HIT_RADIUS));
+                assert!(canvas.contains_rect(hit));
+                assert!(
+                    hit.left() > window.left() + resize && hit.right() < window.right() - resize
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cover_crop_full_image_handles_clear_window_edges_and_drag_without_resizing() {
+        for scale in [1.0, 2.0] {
+            for corner in [false, true] {
+                let (app, tx, _root, crop) = fake_loading_app();
+                let mut h = app_harness(app);
+                crate::settings::apply_ui_scale_factor(&h.ctx, scale);
+                h.set_size(egui::vec2(1093.0, 614.0) / scale);
+                tx.send((7, Ok(fake_prepared(Some(crop))))).unwrap();
+                h.run_steps(6);
+                if let Phase::Ready(draft) =
+                    &mut h.state_mut().cover_crop_dialog.as_mut().unwrap().phase
+                {
+                    draft.crop = crop_rect(None);
+                }
+                h.run_steps(3);
+                let (canvas, body) = h
+                    .ctx
+                    .data(|data| {
+                        data.get_temp::<(egui::Rect, egui::Rect)>(egui::Id::new(
+                            "cover-crop-canvas-geometry",
+                        ))
+                    })
+                    .unwrap();
+                let frame = canvas.shrink2(CANVAS_PADDING);
+                let window = h
+                    .ctx
+                    .memory(|memory| memory.area_rect(egui::Id::new("cover-crop-window")))
+                    .unwrap();
+                let viewport = h.ctx.content_rect();
+                let margin = window_margin(viewport);
+                assert!(viewport.shrink2(margin).expand(1.0).contains_rect(window));
+                let resize = h
+                    .ctx
+                    .global_style()
+                    .interaction
+                    .resize_grab_radius_corner
+                    .max(h.ctx.global_style().interaction.resize_grab_radius_side);
+                assert!(CANVAS_PADDING.x > CORNER_HIT_RADIUS + resize);
+                assert!(CANVAS_PADDING.y > CORNER_HIT_RADIUS);
+                assert!(body.contains_rect(canvas));
+                for (point, _) in handles(frame) {
+                    let hit = egui::Rect::from_center_size(
+                        point,
+                        egui::Vec2::splat(2.0 * CORNER_HIT_RADIUS),
+                    );
+                    assert!(
+                        canvas.contains_rect(hit),
+                        "{scale}: handle hit outside canvas"
+                    );
+                    assert!(
+                        hit.left() > window.left() + resize
+                            && hit.right() < window.right() - resize,
+                        "{scale}: handle overlaps lateral window resize edge"
+                    );
+                }
+                let (start, end, expected_handle) = if corner {
+                    let start = frame.left_top() - egui::vec2(CORNER_HIT_RADIUS - 1.0, 0.0);
+                    (start, start + egui::vec2(16.0, 16.0), CropHandle::NorthWest)
+                } else {
+                    let start = frame.right_center() + egui::vec2(EDGE_HIT_RADIUS - 1.0, 0.0);
+                    (start, start - egui::vec2(20.0, 0.0), CropHandle::East)
+                };
+                assert_eq!(hit_handle(frame, start), Some(expected_handle));
+                h.event(egui::Event::PointerMoved(start));
+                h.run_steps(1);
+                h.event(egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                h.run_steps(1);
+                h.event(egui::Event::PointerMoved(end));
+                h.run_steps(1);
+                h.event(egui::Event::PointerButton {
+                    pos: end,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                h.run_steps(2);
+                let after = h
+                    .ctx
+                    .memory(|memory| memory.area_rect(egui::Id::new("cover-crop-window")))
+                    .unwrap();
+                assert!(
+                    (after.min - window.min).length() <= 1.0
+                        && (after.size() - window.size()).length() <= 1.0,
+                    "{scale}: crop drag moved/resized window {window:?} -> {after:?}"
+                );
+                let Phase::Ready(draft) = &h.state().cover_crop_dialog.as_ref().unwrap().phase
+                else {
+                    panic!("ready crop");
+                };
+                if corner {
+                    assert!(draft.crop.min_x > 0.0 && draft.crop.min_y > 0.0);
+                } else {
+                    assert!(draft.crop.max_x < UNIT as f32);
                 }
             }
         }
