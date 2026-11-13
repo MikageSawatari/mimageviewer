@@ -741,6 +741,61 @@ P3 は読み取り条件の共通化に限定する。detached の述語・状�
 
 focused の `src/app.rs` は前回同様 broad path（全lib指定になる）のため除外し、共有判定は上のコード対応・独立静的レビューと変更した呼び出し元モジュールの回帰・core checkで確認した。独立 Sol / xhigh の P2・P3 フォローアップ静的レビューは **ACCEPT**、追加findingなし。HEADは `6f5791d1e` のまま未コミット。本体全lib・ui_snapshot・build-dev・製品起動は指定どおり実施せず、backlogにも触れていない。
 
+#### 全libで見つかった8件の調査と設計境界での停止（`b01467f52`）
+
+利用者の8件を、製品・テストが HEAD のまま指定の `run-heavy.ps1 -Owner "codex-769"` 経由で再実行した。**8件実行 / 0成功 / 8失敗、1.004秒、exit100**。失敗箇所は提供ログと一致する。証跡は `target/769-harness-red.log`。実行は次の nextest filter に限定し、全libは実行していない。
+
+`cargo nextest run -p mimageviewer --lib -E 'test(=app::folder_pane_refresh_tests::folder_pane_label_arrow_and_keyboard_keep_existing_behavior) | test(=app::main_chrome::tests::main_chrome_folder_tree_clicks_follow_common_modal_ownership) | test(/search_nav_pane_frame_/)' --no-fail-fast --retries 0 --no-tests fail`
+
+本番の描画入口は `App::ui → update_frame → input_update_begin → render_main_bars → render_folder_pane → render_folder_pane_tree`。`input_update_begin`（`src/app.rs:100977`）は起動overlay・native backdrop・fullscreen等の早期 return より前にあり、`App::ui` の `finish_folder_pane_presentation`（同102268）は早期 return の後も通る。child viewport は eframe が個別callbackへ送り `App::ui` を呼ばず、tree 自体にも ROOT guard がある。**入力開始を通らずツリーを描く本番入口は見つからなかった。**
+
+ただし、**本番でメニュー外のツリークリックを取りこぼす別の不一致を source 上で確認したため、依頼の停止条件に従って修正を停止する。** 独立 Sol / xhigh の読み取り専用監査も同じ結論だった。
+
+- `main_chrome_pointer_blocked()` は既存の共有停止表を `include_menus=false` で読み、グリッドメニュー外のポインター操作を許す。`main_chrome_modal_classification_keeps_menu_tools_and_hidden_scans_distinct` も GridMenu を common-modal ではあるが pointer chrome の blocker ではないと明示している。
+- 一方、ツリーの入力開始（`src/ui_folder_pane.rs:300`）と Single / Arrow の適用時判定は `modal_dialog_block_reason()`（`include_menus=true`）、継続判定も同じ true 側を使う。共有表でこの引数が変えるのは `grid_context_menu` の1項目である。
+- 本番の順序は入力開始（`src/app.rs:100977`）→キー（101151）→メニュー描画・退役（`show_context_menu`、101600）→ツールバー（101614）→main bars / tree（101658）。メニュー外の press / release は、入力開始ではまだ menu owner があるため FirstPress / ArrowPress を作らず、その後 `show_context_menu` の外側クリック処理が `context_menu_idx=None` にする（`src/ui_dialogs/context_menu.rs:1216–1227`）。描画時に chrome が許可状態へ戻っても適用結果がなく、Primary の旧 `clicked()` は意図的に除外されているので、従来は届いたクリックが失われる。
+- 稀な native メニュー失敗だけの問題ではない。ブックマークのグリッドメニューは専用の egui Window を使い、読書履歴ビューも通常から native メニューを飛ばして egui メニューを使う（同ファイルの `items_are_bookmark_view` / `!items_are_reading_history_view` の分岐）。どちらもメニュー外クリックで退役する通常経路がある。実機起動・操作はしておらず、これは本番コードの順序と条件による確認である。
+
+設計担当へ戻す論点は、§12.5 の新規開始・継続・適用時の停止理由を、既存の pointer chrome と同じ「メニュー外は操作可」にどう揃えるか。メニューが重なる位置の witness / layer による拒否と、メニューが存在するだけで全ツリーを拒否する判定を区別する必要がある。これはハーネスだけの修正では解消しないため、今回その場で製品条件を変更しない。
+
+8件について確認できた範囲は次のとおり。クリックの期待は書き換えていない。
+
+| テスト（`app::` 以下） | 確認できた失敗・前提 |
+| --- | --- |
+| `main_chrome::tests::main_chrome_folder_tree_clicks_follow_common_modal_ownership` | callback に入力開始・表示完了がない。最初の Blocker::None で要求0件のまま失敗し、GridMenu ケースには未到達。入力開始を補っても上記の本番不一致が残る |
+| `search_nav_pane_frame_tests::search_nav_pane_frame_metadata_enter_opens_tree_target` | 共通 `main_frame` に入力開始がなく、実矢印クリックによる tree focus 取得（168行）で失敗 |
+| `search_nav_pane_frame_tests::search_nav_pane_frame_everything_enter_opens_tree_target` | 同じ共通frame・同じ失敗箇所 |
+| `search_nav_pane_frame_tests::search_nav_pane_frame_favorite_search_enter_opens_tree_target` | 同じ共通frame・同じ失敗箇所 |
+| `search_nav_pane_frame_tests::search_nav_pane_frame_tag_enter_opens_tree_target` | 同じ共通frame・同じ失敗箇所 |
+| `search_nav_pane_frame_tests::search_nav_pane_frame_plain_enter_opens_tree_target` | 同じ共通frame・同じ失敗箇所 |
+| `search_nav_pane_frame_tests::search_nav_pane_frame_enter_preserves_modifiers_keypad_and_coalescing` | 同じ共通frame・同じ失敗箇所。native Enter を投入する前なので native-key 経路の失敗を示さない |
+| `folder_pane_refresh_tests::folder_pane_label_arrow_and_keyboard_keep_existing_behavior` | 共通frameは既に入力開始を通る。2607行の Enter 後 pending unwrap が None。別原因として、Enter が開始した実scanが描画中に完了して同じ pass の後段裁定で採用される競走があるが、今回はその実測確定まで進めていない。入力開始不足と断定しない |
+
+前の7件の fixture は、描画だけを直接呼ぶ一方 `IndexerInit::NotStarted` を終端していない点も新しい表示受付と合わない。search の矢印座標も古い `read_response(id).rect` を読むため、再開時は既存 cfg(test) の実描画矩形との照合が必要（この6件の直接原因が幾何かどうかは未観測）。検索 editor の実描画・focus・クリックによる blur、pane の Enter が grid/native twin に漏れないという元の検査意図は維持する。投入済み native test frame を消す `input_begin_key_frame` の単純追加はしない。
+
+リポジトリ全体で実tree / main bars の全呼び出しを列挙し、入力 owner を通らないテスト用描画を次の5系統として確認した。今回は通っているものは変更しない。
+
+| ハーネス | 入力開始なしの描画と現在の用途 |
+| --- | --- |
+| `src/app/main_chrome.rs:337` 上記のmodal ownership試験callback | 生の名前クリック・resizeを送る。入力開始と表示完了がない（失敗対象） |
+| `src/app/search_nav_pane_frame_tests.rs:240` `main_frame` | 生の矢印クリック・キー・native twinを送る。root keyboardはあるが入力開始がない（6失敗の共通frame） |
+| `src/ui_folder_pane.rs:1290` `actual_folder_pane_deep_scroll_anchor_keeps_real_coordinate_and_cursor_scroll_wins` | 実treeを描くが生イベントなし。scroll / cursor / listingを直接設定する描画試験 |
+| `src/app/tests.rs:27377` `rating_1328_large_folder_return` 内 `draw` | 実paneを描くが `RawInput.events` なし。履歴・お気に入り復元の4テストが共用 |
+| `src/app/folder_pane_refresh_tests.rs:3830` `folder_pane_main_return_rechecks_other_branch_even_when_list_a_is_equal` 末尾の再表示closure | 実paneを描くが生イベントなし。復帰時のscan再開だけを検査 |
+
+`ui_folder_pane` の empty-branch 実UI試験は完全な `input_update_begin` ではないが、専用 `begin_folder_pane_label_input → tree → finish` を既に通るため owner 欠落ではない。`folder_pane_refresh_tests` の他9描画siteもすべて `input_update_begin` が先行する。header-only / WidthTest / loading-width / snapshot fixture は header・splitter・純粋行描画だけで、名前・矢印の状態ownerを使うframeとは別に扱った。
+
+停止により製品・テストの修正はしていない。変更はこの調査記録のみ。8件は上記のとおり失敗したままで、関連群全体・focused・core check・fmt の成功を今回の結果として主張しない。全lib・ui_snapshot・build-dev・製品起動・コミット・backlog変更は行っていない。
+
+### 設計の改訂 r6: 停止理由はメインの枠のポインター判定に揃える (2026-11-14、ClaudeCode)
+
+上の停止記録の指摘を受けて、§12.5 と r4・r5 の「停止理由」を次のとおり改める。r6 はそれより前の記述に優先する。
+
+- 従来のツリーは `gate_main_chrome` で `main_chrome_pointer_blocked()` (共有の停止表を `include_menus=false` で読む) によってだけ止まり、グリッドのメニューが開いていてもメニュー外のクリックは届いていた。新しい入力の持ち主もこれと同じ判定を使う。新しいクリックの条件・継続の条件・適用時の確認はすべて、メニューを含まない停止表で評価する。継続の条件は「サイドカー復元の項目とメニューを除いた停止理由が無い」(`include_menus=false`、`include_sidecar_restore=false`) にする。`modal_dialog_block_reason()` (`include_menus=true`) はツリーの入力判定に使わない。
+- メニューがツリーに重なる位置の押下は、停止表ではなく押下の witness で区別する。capture がメニューの部品なら、ツリーの名前・矢印の押下ではないので `FirstPress` / `ArrowPress` を作らず、継続中なら打ち切る (capture の条件は r4・r5 のまま)。メニュー外の押下は、そのあと `show_context_menu` がメニューを閉じても、従来どおり 1 回のクリックとして描画側の適用点で適用する。
+- 停止表そのもの (項目と順序) は変えない。読み方の引数を揃えるだけなので、新しい状態や時間窓は増えない。メニューの有無で状態の組み合わせを足さず、従来のツリーと同じ判定にまとめる。
+- 確かめること: グリッドのメニュー (egui メニュー、ブックマーク表示の専用 Window、読書履歴表示) が開いた状態で、メニュー外のツリーの名前・矢印をクリックすると従来どおり移動・開閉する。メニューに重なる位置の押下はツリーへ届かない。サイドカー復元中にメニューが開いている場合は、復元中の新しいクリックを受け付けない既定のまま。`main_chrome_folder_tree_clicks_follow_common_modal_ownership` の GridMenu ケースを本番の入力開始を通して通す。
+
 ## 13. マウスでクリックした行を中央へ寄せない (2026-11-12 設計、ClaudeCode)
 
 利用者決定 (2026-11-12 夜、§1.769 の実機確認 依頼 40 から派生)。ツリーで行の名前、または ▶ / ▼ をマウスでクリックしたときは、その行を中央へ寄せない。押した行は既に見えているので、Windows のエクスプローラのナビゲーション ウィンドウと同じく、スクロール位置をそのままにする。
