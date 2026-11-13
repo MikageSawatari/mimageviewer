@@ -1203,3 +1203,45 @@ r2 = REVISE (P2 1 件、ほかは r1 の指摘を閉じた)。v2 キーで `auto
 - r1の最終検証: 共有runner（`773 D r1`）経由で焦点nextest599件成功、UI snapshot257件成功。
   `cargo fmt`・`git diff --check`も成功。snapshotの更新はなく、既存552枚のPNGは不変。
   §22.1〜22.3を含む既存本文は保持した。製品起動・build-dev・lib全件・コミットは行っていない。
+
+### 22.4 実装記録 (2026-11-14)
+
+- §22.2のV3'をRustへ移した。平滑化しない解析画素による余白の上限を各辺5%とし、v5の候補決定と拒否条件は保持した。
+  v5が指定の4理由で辞退した場合だけ、同じ範囲・列特徴・厳しいパネル境界から2枚つながりの候補を探す。
+  RGB全成分の標準偏差、符号付きのインク差、最終境界の帯幅0.2w〜0.8wを検査し、弱い表表紙・別位置が濃い候補の拒否条件をv5と共用した。
+  整数の探索端・帯幅は試作と同じ切り捨て、最大値が同じ場合は左側を先に選ぶ。最終の帯幅は設計どおり丸め前のwに対して検査する。
+- 見送りは元のv5理由と2枚つながり側の理由を両方持ち、既存のreport／debug logへ
+  `no-local-evidence/two-weakfront`などの形で出す。入口の門とv5の`RicherElsewhere`は新しい規則へ進めない。
+  デコード・永続化・描画・UIの経路は変更していない。
+- 自動キーは**v2を維持する**。§21のv2と今回の判定はともに未出荷で、保存する素材の形式（全体画素と4方向の結果）は同じ。
+  出荷済みv1との分離は既に§21で済んでいるため、今回さらにキーの版を上げない。
+  開発中に旧判定で生成したv2行を確認する場合は、既存のサムネイル再生成で作り直す。自動削除や追加の移行処理は設けない。
+- 追加した回帰テスト（すべてRustで生成した画素）:
+  - `two_panel_paper_front_both_bindings_and_four_saved_rotations`: 紙の帯＋絵、細い背の除外、両綴じ方向と保存回転4方向の範囲。
+  - `two_panel_art_on_outer_band_and_near_square_illustrations_decline`: 外側にも絵がある負例と正方形に近い負例。
+  - `two_panel_final_outer_width_rejects_just_over_point_eight`: 形の門を通っても最終の帯幅が0.8wを超える境界例。
+  - `two_panel_signed_ink_gap_rejects_a_darker_outer_band`: 外側のほうが濃いインクの逆転。
+  - `two_panel_candidate_still_obeys_weak_front_and_richer_elsewhere_vetoes`: v5の位置の門を通らず、新しい候補が共通拒否条件に当たる負例。
+  - `two_panel_fallback_whitelist_preserves_entry_and_v5_veto_declines`: 新規規則へ進む4理由と進まない5理由、reportの綴り。
+  - `white_front_content_margin_stops_at_five_percent_on_each_edge`: 白い地を各辺5%より多く外さない。
+  - `two_panel_band_std_uses_all_rgb_values_not_luminance_variance`: 帯の標準偏差は輝度の空間分散ではなくRGB全成分から計算する。
+- 既存の細縞・網点・ノイズ・上下の模様帯のmust-decline、縮小率の境界安定性、保存回転のテストを含む
+  `cover_auto`の焦点nextestは57件成功。既存負例は最終的な辞退を必須としたまま、複合理由から元のv5理由を取り出して従来の期待値も検査する。
+- 公開文書`grid.html`の説明との食い違いはないため、公開文書・UI文言・snapshotは変更していない。
+  利用者の実データは使わず、評価入力・出力画像・sheetを画像として開いていない。
+- 共通の判定用デコード（`MIV_COVER_AUTO_EVAL_DECODE=worker`）によるdirectory evaluation。
+  画像の回転0/90/180/270°に対し、保存回転を0/270/180/90°として同じ正立方向を評価した。
+
+  | 入力 | 画像の回転 | 陽性good | wrong | 負例の切り出し | 負例の見送り |
+  |---|---|---:|---:|---:|---:|
+  | dummies | 0/90/180/270°すべて | 51 | 0 | 0 | 22 |
+  | realistic | 0° | 41 | 0 | 0 | 30 |
+  | realistic | 90° | 40 | 0 | 0 | 30 |
+  | realistic | 180° | 43 | 0 | 0 | 30 |
+  | realistic | 270° | 42 | 0 | 0 | 30 |
+
+  全方向でwrong 0・負例の切り出し0を保ち、陽性goodは§21.11の各方向の件数以上。
+  再符号化による件数の揺れは§22.3の条件に従い、数をそろえるための閾値変更はしていない。
+  出力先は`target/cover-auto-eval-{dummies,realistic}-773-22/rot{0,90,180,270}`。
+- 最終検証は共有runner（`773 s22`）経由。上記57件に加えて、`auto_cover_crop|representative_cache_key`の焦点nextest8件も成功。
+  `cargo fmt`・`git diff --check`も成功。製品起動・build-dev・lib全件・コミット・追加の独立レビューは行っていない。

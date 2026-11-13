@@ -121,7 +121,8 @@ fn smoothing_native_rows_would_manufacture_an_accepted_front_cover() {
     );
     let raster = analysis_raster(&DynamicImage::ImageRgb8(image));
     assert_eq!(
-        cover_auto_crop(&raster, (300, 256), Some(0.7), ReadingDirection::Rtl),
+        cover_auto_crop(&raster, (300, 256), Some(0.7), ReadingDirection::Rtl)
+            .map_err(AutoCropDecline::v5_reason),
         Err(AutoCropDecline::NoJacketEvidence)
     );
 }
@@ -134,7 +135,8 @@ fn fine_stripes_halftone_and_noise_do_not_manufacture_jacket_evidence() {
             let dims = image.dimensions();
             let raster = analysis_raster(&DynamicImage::ImageRgb8(image));
             assert_eq!(
-                cover_auto_crop(&raster, dims, Some(0.7), binding),
+                cover_auto_crop(&raster, dims, Some(0.7), binding)
+                    .map_err(AutoCropDecline::v5_reason),
                 Err(AutoCropDecline::NoJacketEvidence),
                 "{binding:?}, texture={texture}"
             );
@@ -188,7 +190,8 @@ fn patterned_margin_rows_remain_content_and_decline_without_jacket_evidence() {
             image.dimensions(),
             Some(0.7),
             ReadingDirection::Rtl
-        ),
+        )
+        .map_err(AutoCropDecline::v5_reason),
         Err(AutoCropDecline::NoJacketEvidence)
     );
 }
@@ -638,7 +641,8 @@ fn color_is_a_veto_and_does_not_relocate_to_the_back() {
         }
         let dims = image.dimensions();
         let raster = analysis_raster(&DynamicImage::ImageRgb8(image));
-        let result = cover_auto_crop(&raster, dims, Some(0.7), binding);
+        let result =
+            cover_auto_crop(&raster, dims, Some(0.7), binding).map_err(AutoCropDecline::v5_reason);
         assert!(
             matches!(
                 result,

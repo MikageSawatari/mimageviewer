@@ -5,6 +5,26 @@ use crate::folder_thumb_pins::CoverCrop;
 use crate::rotation_db::Rotation;
 use crate::settings::ReadingDirection;
 use image::{DynamicImage, RgbImage};
+use std::borrow::Cow;
+
+const CONTENT_MARGIN_CAP: f64 = 0.05;
+const TWO_SPINE_MIN: f64 = 0.04;
+const TWO_SPINE_MAX: f64 = 0.16;
+const TWO_SHAPE_MIN: f64 = 1.25;
+const TWO_SHAPE_MAX: f64 = 1.8;
+const TWO_FRONT_MIN: f64 = 0.95;
+const TWO_FRONT_MAX: f64 = 1.15;
+const TWO_BAND_FRACTION: f64 = 0.08;
+const TWO_BAND_MIN: usize = 3;
+const TWO_BOUNDARY_MIN: f64 = 40.0;
+const TWO_STD_WEIGHT: f64 = 0.5;
+const TWO_EDGE_WEIGHT: f64 = 0.3;
+const TWO_OUTER_MIN: f64 = 0.2;
+const TWO_OUTER_MAX: f64 = 0.8;
+const TWO_PAPER_INK_MAX: f64 = 0.35;
+const TWO_INK_GAP_MIN: f64 = 0.2;
+const FRONT_SCORE_MIN: f64 = 0.6;
+const RICHER_SCORE_GAP: f64 = 0.5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AutoCropIdentity {
@@ -35,11 +55,59 @@ pub(crate) enum AutoCropDecline {
     NoSpine,
     WeakFront,
     RicherElsewhere,
+    TwoPanel {
+        v5: TwoPanelTrigger,
+        reason: TwoPanelDecline,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TwoPanelTrigger {
+    NoJacketEvidence,
+    NoLocalEvidence,
+    NoSpine,
+    WeakFront,
+}
+
+impl TwoPanelTrigger {
+    fn decline(self) -> AutoCropDecline {
+        match self {
+            Self::NoJacketEvidence => AutoCropDecline::NoJacketEvidence,
+            Self::NoLocalEvidence => AutoCropDecline::NoLocalEvidence,
+            Self::NoSpine => AutoCropDecline::NoSpine,
+            Self::WeakFront => AutoCropDecline::WeakFront,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TwoPanelDecline {
+    Shape,
+    NoRange,
+    WeakBoundary,
+    OuterWide,
+    NotPaper,
+    WeakFront,
+    RicherElsewhere,
+}
+
+impl TwoPanelDecline {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Shape => "u-out",
+            Self::NoRange => "no-range",
+            Self::WeakBoundary => "two-weak",
+            Self::OuterWide => "outer-wide",
+            Self::NotPaper => "flap-not-paper",
+            Self::WeakFront => "two-weakfront",
+            Self::RicherElsewhere => "two-richer",
+        }
+    }
 }
 
 impl AutoCropDecline {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
+    pub(crate) fn as_str(self) -> Cow<'static, str> {
+        let label = match self {
             Self::RawAspectGate => "not-wide-raw",
             Self::PageAspectMissing => "no-page-aspect",
             Self::NotWide => "not-wide",
@@ -49,6 +117,28 @@ impl AutoCropDecline {
             Self::NoSpine => "no-spine",
             Self::WeakFront => "weak",
             Self::RicherElsewhere => "richer-elsewhere",
+            Self::TwoPanel { v5, reason } => {
+                return format!("{}/{}", v5.decline().as_str(), reason.as_str()).into();
+            }
+        };
+        label.into()
+    }
+
+    fn two_panel_trigger(self) -> Option<TwoPanelTrigger> {
+        match self {
+            Self::NoJacketEvidence => Some(TwoPanelTrigger::NoJacketEvidence),
+            Self::NoLocalEvidence => Some(TwoPanelTrigger::NoLocalEvidence),
+            Self::NoSpine => Some(TwoPanelTrigger::NoSpine),
+            Self::WeakFront => Some(TwoPanelTrigger::WeakFront),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn v5_reason(self) -> Self {
+        match self {
+            Self::TwoPanel { v5, .. } => v5.decline(),
+            other => other,
         }
     }
 }
@@ -278,7 +368,7 @@ fn luminance(p: Pixel) -> f64 {
     p[0] * 0.299 + p[1] * 0.587 + p[2] * 0.114
 }
 
-/// Each edge has its own reference color and 20% cap; a few dust pixels do not
+/// Each edge has its own reference color and 5% cap; a few dust pixels do not
 /// terminate an otherwise blank margin.
 fn content_bounds(raster: &Raster, sample: impl Fn(usize, usize) -> Pixel) -> [usize; 4] {
     let walk = |vertical: bool, reverse: bool| {
@@ -292,7 +382,7 @@ fn content_bounds(raster: &Raster, sample: impl Fn(usize, usize) -> Pixel) -> [u
             if vertical { sample(i, d) } else { sample(d, i) }
         };
         let reference = color_median((0..length).map(|i| pixel(0, i)));
-        (0..depth / 5)
+        (0..(depth as f64 * CONTENT_MARGIN_CAP) as usize)
             .take_while(|&d| {
                 let close = (0..length)
                     .filter(|&i| distance_squared(pixel(d, i), reference) <= 40.0 * 40.0)
@@ -464,6 +554,39 @@ pub(crate) fn cover_auto_crop(
     let width = aspect * sub.height as f64;
     let features = Features::new(&sub);
     let edges = panel_edges(&sub);
+    let (mut start, mut end) = match v5_candidate(&sub, width, &features, &edges) {
+        Ok(candidate) => candidate,
+        Err(reason) => {
+            let Some(v5) = reason.two_panel_trigger() else {
+                return Err(reason);
+            };
+            two_panel_candidate(&sub, width, &features, &edges)
+                .map_err(|reason| AutoCropDecline::TwoPanel { v5, reason })?
+        }
+    };
+    if binding == ReadingDirection::Ltr {
+        (start, end) = (sub.width - end, sub.width - start);
+    }
+    let normalized =
+        |value: usize, extent: usize| (value as f64 * 1_000_000.0 / extent as f64).round() as u32;
+    CoverCrop::new([
+        normalized(bounds[0] + start, source.width),
+        normalized(bounds[1], source.height),
+        normalized(bounds[0] + end, source.width),
+        normalized(bounds[3], source.height),
+    ])
+    .ok()
+    .flatten()
+    .ok_or(NoStructure)
+}
+
+fn v5_candidate(
+    sub: &Raster,
+    width: f64,
+    features: &Features,
+    edges: &[usize],
+) -> Result<(usize, usize), AutoCropDecline> {
+    use AutoCropDecline::*;
     let panels: Vec<_> = edges.windows(2).map(|p| (p[0], p[1])).collect();
     let spines: Vec<_> = panels
         .iter()
@@ -503,7 +626,7 @@ pub(crate) fn cover_auto_crop(
         .copied()
         .filter(|&e| (e as f64 - target).abs() <= 0.10 * width)
         .min_by(|a, b| ((*a as f64 - target).abs()).total_cmp(&(*b as f64 - target).abs()));
-    let mut end = detected_end.unwrap_or_else(|| target.round_ties_even() as usize);
+    let end = detected_end.unwrap_or_else(|| target.round_ties_even() as usize);
     if end > sub.width || end <= start {
         return Err(NoStructure);
     }
@@ -514,35 +637,128 @@ pub(crate) fn cover_auto_crop(
     if !flap && !spines.iter().any(|&(a, _)| a.abs_diff(end) <= near) {
         return Err(NoSpine);
     }
+    candidate_veto(features, start, end)?;
+    Ok((start, end))
+}
+
+fn candidate_veto(features: &Features, start: usize, end: usize) -> Result<(), AutoCropDecline> {
+    use AutoCropDecline::*;
     let score = features.score(start, end);
-    if score < 0.6 {
+    if score < FRONT_SCORE_MIN {
         return Err(WeakFront);
     }
     let span = end - start;
-    for x in (0..=sub.width - span).step_by(1.max(span / 20)) {
+    for x in (0..=features.columns.len() - span).step_by(1.max(span / 20)) {
         // Signed overlap is intentional: disjoint intervals must qualify.
         let overlap = (x + span).min(end) as i64 - x.max(start) as i64;
-        if (overlap as f64) < 0.5 * span as f64 && features.score(x, x + span) - score >= 0.5 {
+        if (overlap as f64) < 0.5 * span as f64
+            && features.score(x, x + span) - score >= RICHER_SCORE_GAP
+        {
             return Err(RicherElsewhere);
         }
     }
-    if binding == ReadingDirection::Ltr {
-        (start, end) = (sub.width - end, sub.width - start);
+    Ok(())
+}
+
+/// Per-channel means, and population standard deviation over all RGB values
+/// together (the prototype's array.std(), not luminance / per-channel std).
+fn rgb_band_stats(raster: &Raster, start: usize, end: usize) -> (Pixel, f64) {
+    let mut sum = [0.0; 3];
+    let mut squared = 0.0;
+    for y in 0..raster.height {
+        for x in start..end {
+            for (channel, value) in raster.get(x, y).into_iter().enumerate() {
+                sum[channel] += value;
+                squared += value * value;
+            }
+        }
     }
-    let normalized =
-        |value: usize, extent: usize| (value as f64 * 1_000_000.0 / extent as f64).round() as u32;
-    CoverCrop::new([
-        normalized(bounds[0] + start, source.width),
-        normalized(bounds[1], source.height),
-        normalized(bounds[0] + end, source.width),
-        normalized(bounds[3], source.height),
-    ])
-    .ok()
-    .flatten()
-    .ok_or(NoStructure)
+    let count = ((end - start) * raster.height) as f64;
+    let mean = sum.map(|value| value / count);
+    let scalar_mean = mean.iter().sum::<f64>() / 3.0;
+    (
+        mean,
+        (squared / (count * 3.0) - scalar_mean * scalar_mean)
+            .max(0.0)
+            .sqrt(),
+    )
+}
+
+fn two_panel_candidate(
+    sub: &Raster,
+    width: f64,
+    features: &Features,
+    edges: &[usize],
+) -> Result<(usize, usize), TwoPanelDecline> {
+    use TwoPanelDecline::*;
+    let end = edges
+        .iter()
+        .copied()
+        .filter(|&edge| {
+            edge as f64 >= sub.width as f64 - TWO_SPINE_MAX * width
+                && edge as f64 <= sub.width as f64 - TWO_SPINE_MIN * width
+        })
+        .max()
+        .unwrap_or(sub.width);
+    if !(TWO_SHAPE_MIN..=TWO_SHAPE_MAX).contains(&(end as f64 / width)) {
+        return Err(Shape);
+    }
+    // Python int truncates these positive bounds; retain its inclusive search
+    // and leftmost-first tie, then check the final band's exact width below.
+    let lo = ((end as f64 - TWO_FRONT_MAX * width) as usize).max((TWO_OUTER_MIN * width) as usize);
+    let hi = ((end as f64 - TWO_FRONT_MIN * width) as usize).min(sub.width - 1);
+    if lo >= hi {
+        return Err(NoRange);
+    }
+    let band = TWO_BAND_MIN.max((TWO_BAND_FRACTION * width) as usize);
+    let mut best = None;
+    for x in lo..=hi {
+        // A zero-width left band has NaN statistics in the prototype and never
+        // wins. Avoid evaluating it rather than dividing by zero.
+        if x == 0 {
+            continue;
+        }
+        let (left, left_std) = rgb_band_stats(sub, x.saturating_sub(band), x);
+        let (right, right_std) = rgb_band_stats(sub, x, (x + band).min(sub.width));
+        let edge = (0..sub.height)
+            .map(|y| {
+                sub.get(x - 1, y)
+                    .into_iter()
+                    .zip(sub.get(x, y))
+                    .map(|(a, b)| (a - b).abs())
+                    .sum::<f64>()
+            })
+            .sum::<f64>()
+            / sub.height as f64;
+        let score = distance_squared(left, right).sqrt()
+            + TWO_STD_WEIGHT * (left_std - right_std).abs()
+            + TWO_EDGE_WEIGHT * edge;
+        if best.is_none_or(|(_, previous)| score > previous) {
+            best = Some((x, score));
+        }
+    }
+    let Some((start, _)) = best.filter(|&(_, score)| score >= TWO_BOUNDARY_MIN) else {
+        return Err(WeakBoundary);
+    };
+    if (start as f64) < TWO_OUTER_MIN * width || start as f64 > TWO_OUTER_MAX * width {
+        return Err(OuterWide);
+    }
+    let outer_ink = features.ink(0, start);
+    let front_ink = features.ink(start, end);
+    if outer_ink > TWO_PAPER_INK_MAX || front_ink - outer_ink < TWO_INK_GAP_MIN {
+        return Err(NotPaper);
+    }
+    candidate_veto(features, start, end).map_err(|reason| match reason {
+        AutoCropDecline::WeakFront => WeakFront,
+        AutoCropDecline::RicherElsewhere => RicherElsewhere,
+        _ => unreachable!("common candidate veto has only two rejection reasons"),
+    })?;
+    Ok((start, end))
 }
 
 #[cfg(test)]
 mod evaluation;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod two_panel_tests;

@@ -414,14 +414,14 @@ fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Erro
                 if expected.is_none() {
                     negative_declined += 1;
                 }
-                *reasons.entry(reason.as_str().to_owned()).or_default() += 1;
+                *reasons.entry(reason.as_str().into_owned()).or_default() += 1;
                 ("declined", [115, 115, 115])
             }
         };
         let reason = detected
             .err()
             .map(AutoCropDecline::as_str)
-            .unwrap_or("cropped");
+            .unwrap_or_else(|| "cropped".into());
         rows.push(json!({"index":index,"name":name,"status":status,"reason":reason,"iou":iou,"truth":expected,"prediction":predicted,"page_aspect":aspect,"zip_leaf":zip_leaf,"ltr":truth.ltr,
             "decoded_dims":[decoded_image.width(),decoded_image.height()],"native_dims":native_dims,
             "saved_rotation":saved.degrees(),"image_rotation":mode.image_rotation.degrees(),

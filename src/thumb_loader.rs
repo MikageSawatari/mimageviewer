@@ -6971,7 +6971,8 @@ pub(crate) fn load_one_cached(
                         aspect,
                         auto.binding,
                         |rotation, result| {
-                            let reason = result.map_or_else(|decline| decline.as_str(), |_| "crop");
+                            let reason =
+                                result.map_or_else(|decline| decline.as_str(), |_| "crop".into());
                             crate::logger::log(format!(
                                 "auto cover: rotation={rotation:?} {reason} {display_name}"
                             ));
