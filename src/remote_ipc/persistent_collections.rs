@@ -2200,6 +2200,61 @@ mod tests {
     use super::*;
     use crate::collection_store::CollectionSourcePath;
 
+    #[test]
+    fn search_input_history_is_private_in_persistent_collection_snapshot() {
+        let data = crate::settings_db::DataDirOverrideGuard::new();
+        let sentinel = "miv-history-sentinel-756";
+        let mut settings = Settings::default();
+        settings
+            .search_input_history
+            .record(crate::ui_pinned_search::PinnedSearchKind::Local, sentinel);
+        let db = crate::settings_db::SettingsDb::create_new(data.path()).unwrap();
+        db.save_full(&settings).unwrap();
+        drop(db);
+        assert_eq!(load_settings().unwrap().search_input_history.len(), 1);
+        let runtime = crate::collection_store::CollectionStoreRuntime::start_at(
+            data.path().join("collection.db"),
+        )
+        .unwrap();
+        assert!(matches!(
+            runtime.recv_event_timeout_for_test(Duration::from_secs(10)),
+            Ok(crate::collection_store::CollectionRuntimeEvent::Ready(_))
+        ));
+        let collection = runtime
+            .client()
+            .create_collection("public collection".into())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        let engine =
+            PersistentCollectionEngine::new(CollectionRemoteProducerControl::new(runtime.client()));
+        let owner = RemoteSessionIdentity {
+            client_id: "test device".into(),
+            session_id: "test session".into(),
+        };
+        let (cancellation, _wake) = RemoteOperationCancellation::for_test();
+        let response = engine.snapshot(
+            1,
+            PersistentCollectionSnapshotRequest {
+                collection_id: collection.collection_id().to_string(),
+                spread_mode: None,
+                reading_direction: None,
+                force_single_page: false,
+            },
+            &owner,
+            &cancellation,
+        );
+        assert!(matches!(
+            &response,
+            PersistentCollectionSnapshotResponse::Success(_)
+        ));
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains(sentinel));
+        assert!(!json.contains("search_input_history"));
+        runtime.shutdown_and_join();
+    }
+
     fn prepared_entry(id: &str, path: &str) -> PreparedCollectionEntry {
         let source = CollectionSourcePath::from_trusted(Path::new(path)).unwrap();
         let source_path = source.path().to_path_buf();

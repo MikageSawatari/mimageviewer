@@ -3,6 +3,143 @@ use super::*;
 use crate::folder_pane::{FolderPaneCursorScroll, FolderPaneState};
 use std::time::SystemTime;
 
+#[cfg(windows)]
+#[test]
+fn folder_pane_user_search_click_and_enter_adopt_then_history_back_to_pre_search() {
+    for kind in 0..4 {
+        for enter in [false, true] {
+            let mut app = App::navigation_search_fixture_for_test(kind);
+            let origin = app.tmp.path().join("pre-search");
+            let target = app.tmp.path().join("pane-user-target");
+            std::fs::create_dir_all(&origin).unwrap();
+            std::fs::create_dir(&target).unwrap();
+            let root = app.tmp.path().to_path_buf();
+            app.set_folder_tree_pane_visible(true);
+            if kind == 1 {
+                // adopt_everything_for_test reserves the temporary search editor's
+                // first focus. This isolated pane frame does not draw that bar to
+                // acknowledge the user's move to the tree. Retire only its editor
+                // reservation through the existing focus-loss/navigation API; the
+                // accepted dataset and producer/modal state are left intact.
+                assert!(app.global_search.pending.is_none());
+                assert!(app.global_search.focus_request || app.global_search.has_focus);
+                app.retire_search_input_focus(
+                    crate::ui_pinned_search::PinnedSearchKind::Everything,
+                );
+                assert!(!app.global_search.focus_request && !app.global_search.has_focus);
+            }
+            app.folder_pane =
+                FolderPaneState::test_tree(&root, vec![origin.clone(), target.clone()]);
+            app.folder_pane.test_seed_listing(&target, vec![], false);
+            app.folder_pane.set_cursor(origin.clone());
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            ctx.enable_accesskit();
+            ctx.options_mut(|options| options.max_passes = std::num::NonZeroUsize::new(1).unwrap());
+            let mut frame = 0;
+            navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+            assert!(app.global_search.active || app.favsearch.active || app.tag_view.active);
+            if enter {
+                app.folder_pane.set_focus_tree();
+                app.folder_pane.set_cursor(target.clone());
+                assert!(
+                    app.folder_pane_blocks_grid_keyboard(),
+                    "kind={kind}: tree owns Enter"
+                );
+                assert!(
+                    !app.everything_search_progress_visible(),
+                    "kind={kind}: Enter must not be a new search submission"
+                );
+                assert!(
+                    !app.main_chrome_pointer_blocked(),
+                    "kind={kind}: pane has no modal owner"
+                );
+                assert!(
+                    matches!(app.folder_pane.handle_tree_key(crate::folder_pane::FolderPaneTreeKey::Enter), Some(crate::folder_pane::FolderPaneCommand::Open(path)) if path == target),
+                    "kind={kind}: real cursor resolves the target"
+                );
+                navigation_tree_frame(
+                    &mut app,
+                    &ctx,
+                    &mut frame,
+                    vec![tree_key_event(egui::Key::Enter)],
+                );
+            } else {
+                let id: egui::Id = ctx
+                    .data(|data| {
+                        data.get_temp(egui::Id::unique((
+                            "folder_pane_test_label_id",
+                            target.as_path(),
+                        )))
+                    })
+                    .expect("real rendered destination row");
+                let rect = ctx.read_response(id).unwrap().rect;
+                let viewport: egui::Rect = ctx
+                    .data(|data| data.get_temp(egui::Id::unique("folder_pane_test_viewport")))
+                    .unwrap();
+                let clickable = rect.intersect(viewport);
+                assert!(
+                    clickable.is_positive(),
+                    "kind={kind}: rendered target must be visible"
+                );
+                assert_ne!(app.folder_pane.active_path(), Some(target.as_path()));
+                let pos = clickable.center();
+                for pressed in [true, false] {
+                    navigation_tree_frame(
+                        &mut app,
+                        &ctx,
+                        &mut frame,
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                    );
+                }
+            }
+            if let Some(pending) = app.folder_pane_open_pending.as_ref() {
+                assert_eq!(
+                    pending.path, target,
+                    "kind={kind} enter={enter}: actual handler requested path"
+                );
+                assert!(
+                    matches!(
+                        pending.purpose,
+                        FolderOpenScanPurpose::JumpToPhysicalFolder { .. }
+                    ),
+                    "kind={kind} enter={enter}: user scan must exit search"
+                );
+            } else {
+                assert_eq!(
+                    app.current_folder.as_ref(),
+                    Some(&target),
+                    "kind={kind} enter={enter}: actual handler must start or finish navigation; pane_focus={} blocked={} modal={:?} cursor={:?}",
+                    app.folder_pane.has_focus,
+                    app.shortcuts_blocked_by_text_input(&ctx),
+                    app.modal_dialog_block_reason(),
+                    app.folder_pane
+                        .visible_rows()
+                        .iter()
+                        .filter(|row| row.is_cursor)
+                        .map(|row| row.path.clone())
+                        .collect::<Vec<_>>()
+                );
+            }
+            app.verify_admitted_user_navigation_for_test(&target, &origin);
+            assert_eq!(
+                app.current_folder.as_ref(),
+                Some(&origin),
+                "kind={kind} enter={enter}"
+            );
+            assert!(!app.global_search.active && !app.favsearch.active && !app.tag_view.active);
+        }
+    }
+}
+
 fn tree_frame(app: &mut App, ctx: &egui::Context, frame: &mut u64, toggle: bool) {
     let events = if toggle {
         vec![egui::Event::Key {
@@ -179,7 +316,352 @@ fn tree_key_event(key: egui::Key) -> egui::Event {
     }
 }
 
+fn scrollable_tree_click_fixture(
+    expanded: bool,
+) -> (AppTestEnvForTest, egui::Context, u64, PathBuf) {
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    crate::ui_fonts::configure_fonts(&ctx);
+    let root = app.tmp.path().join("click-scroll-tree");
+    let children: Vec<_> = (0..80).map(|i| root.join(format!("row-{i:03}"))).collect();
+    for child in &children {
+        std::fs::create_dir_all(child).unwrap();
+    }
+    let clicked = children[34].clone();
+    let grandchild = clicked.join("child");
+    std::fs::create_dir(&grandchild).unwrap();
+    app.load_folder(children[40].clone());
+    settle(&mut app, &ctx);
+    app.set_folder_tree_pane_visible(true);
+    app.folder_pane = FolderPaneState::test_tree(&root, children.clone());
+    app.folder_pane.test_scan_subtree(root);
+    app.folder_pane
+        .test_seed_listing(&clicked, vec![grandchild], expanded);
+    app.folder_pane.set_cursor(children[40].clone());
+    let mut frame = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+        if !app.folder_pane.has_pending() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    for _ in 0..3 {
+        navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+    }
+    let rect = label_click_rect(&ctx, &clicked);
+    let viewport = tree_click_viewport(&ctx);
+    assert!(viewport.contains_rect(rect), "click a fully visible label");
+    assert!((rect.center().y - viewport.center().y).abs() > 100.0);
+    assert!(pane_scroll_state(&ctx).unclamped_offset().y > 100.0);
+    assert_eq!(app.folder_pane.cursor_scroll, FolderPaneCursorScroll::Idle);
+    (app, ctx, frame, clicked)
+}
+
+fn tree_click_viewport(ctx: &egui::Context) -> egui::Rect {
+    ctx.data(|data| data.get_temp(egui::Id::unique("folder_pane_test_viewport")))
+        .unwrap()
+}
+
 fn label_click_rect(ctx: &egui::Context, path: &Path) -> egui::Rect {
+    let id = ctx
+        .data(|data| {
+            data.get_temp::<egui::Id>(egui::Id::unique(("folder_pane_test_label_id", path)))
+        })
+        .unwrap();
+    ctx.read_response(id).unwrap().rect
+}
+
+fn pointer_tree_click(app: &mut App, ctx: &egui::Context, frame: &mut u64, pos: egui::Pos2) {
+    for pressed in [true, false] {
+        navigation_tree_frame(
+            app,
+            ctx,
+            frame,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+    }
+}
+
+fn assert_tree_click_position(ctx: &egui::Context, path: &Path, offset: f32, rect: egui::Rect) {
+    let actual_offset = pane_scroll_state(ctx).unclamped_offset().y;
+    assert!(
+        (actual_offset - offset).abs() < 0.1,
+        "clicked row must not scroll: {actual_offset} != {offset}"
+    );
+    let actual = label_click_rect(ctx, path);
+    assert!(
+        (actual.top() - rect.top()).abs() < 0.1,
+        "clicked row must stay on screen at the same y: {actual:?} != {rect:?}"
+    );
+}
+
+#[test]
+fn folder_pane_pointer_label_click_keeps_scroll_through_navigation_completion() {
+    let (mut app, ctx, mut frame, clicked) = scrollable_tree_click_fixture(false);
+    let rect = label_click_rect(&ctx, &clicked);
+    let offset = pane_scroll_state(&ctx).unclamped_offset().y;
+    let paths: Vec<_> = app
+        .folder_pane
+        .visible_rows()
+        .into_iter()
+        .map(|row| row.path)
+        .collect();
+    let scrolls = tree_scrolls(&ctx);
+    pointer_tree_click(&mut app, &ctx, &mut frame, rect.center());
+    let pending = app
+        .folder_pane_open_pending
+        .as_mut()
+        .expect("label starts navigation");
+    assert_eq!(pending.path, clicked);
+    // Keep the real worker reply, but delay its adoption at the existing receiver
+    // boundary so both pending frames and the actual completion are checked.
+    let (_held_reply, rx) = mpsc::channel();
+    let actual_reply = std::mem::replace(&mut pending.rx, rx);
+    assert!(app.folder_pane.has_focus);
+    for _ in 0..4 {
+        navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+        assert_tree_click_position(&ctx, &clicked, offset, rect);
+    }
+    app.folder_pane_open_pending.as_mut().unwrap().rx = actual_reply;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+        settle(&mut app, &ctx);
+        assert_tree_click_position(&ctx, &clicked, offset, rect);
+        if app.folder_pane_open_pending.is_none() && !app.folder_pane.has_pending() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "clicked navigation did not finish"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(app.current_folder.as_ref(), Some(&clicked));
+    for _ in 0..4 {
+        navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+        assert_tree_click_position(&ctx, &clicked, offset, rect);
+    }
+    assert_eq!(
+        app.folder_pane
+            .visible_rows()
+            .into_iter()
+            .map(|row| row.path)
+            .collect::<Vec<_>>(),
+        paths
+    );
+    assert_eq!(
+        tree_scrolls(&ctx),
+        scrolls,
+        "completion must not add a reveal"
+    );
+    assert!(
+        app.folder_pane
+            .visible_rows()
+            .iter()
+            .any(|row| row.path == clicked && row.is_cursor && row.is_active)
+    );
+}
+
+fn folder_pane_pointer_arrow_keeps_scroll(expanded: bool) {
+    let (mut app, ctx, mut frame, clicked) = scrollable_tree_click_fixture(expanded);
+    let rect = label_click_rect(&ctx, &clicked);
+    let offset = pane_scroll_state(&ctx).unclamped_offset().y;
+    let scrolls = tree_scrolls(&ctx);
+    let active = app.current_folder.clone();
+    // The 24pt arrow ends one item-spacing before the rendered label.
+    let pos = egui::pos2(
+        rect.left() - ctx.global_style().spacing.item_spacing.x - 12.0,
+        rect.center().y,
+    );
+    pointer_tree_click(&mut app, &ctx, &mut frame, pos);
+    assert!(app.folder_pane.has_focus);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+        assert_tree_click_position(&ctx, &clicked, offset, rect);
+        if !app.folder_pane.has_pending() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    for _ in 0..4 {
+        navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+        assert_tree_click_position(&ctx, &clicked, offset, rect);
+    }
+    let rows = app.folder_pane.visible_rows();
+    let row = rows.iter().find(|row| row.path == clicked).unwrap();
+    assert_eq!(row.expanded, !expanded);
+    assert!(row.is_cursor);
+    assert_eq!(
+        rows.iter().any(|row| row.path == clicked.join("child")),
+        !expanded
+    );
+    assert_eq!(app.current_folder, active, "arrow must not navigate");
+    assert!(app.folder_pane_open_pending.is_none());
+    assert_eq!(tree_scrolls(&ctx), scrolls);
+}
+
+#[test]
+fn folder_pane_pointer_expand_click_keeps_scroll() {
+    folder_pane_pointer_arrow_keeps_scroll(false);
+}
+
+#[test]
+fn folder_pane_pointer_collapse_click_keeps_scroll() {
+    folder_pane_pointer_arrow_keeps_scroll(true);
+}
+
+fn pointer_click_retires_waiting_cursor_request(arrow: bool, expanded: bool) {
+    let (mut app, ctx, mut frame, clicked) = scrollable_tree_click_fixture(expanded);
+    let waiting_parent = clicked.parent().unwrap().join("row-050");
+    let waiting_cursor = waiting_parent.join("waiting-child");
+    std::fs::create_dir(&waiting_cursor).unwrap();
+    let release = app.folder_pane.test_hold_next_scan(waiting_parent.clone());
+    app.folder_pane.set_cursor(waiting_parent);
+    let _ = app
+        .folder_pane
+        .handle_tree_key(crate::folder_pane::FolderPaneTreeKey::Right);
+    app.folder_pane.set_cursor(waiting_cursor.clone());
+    let rect = label_click_rect(&ctx, &clicked);
+    let offset = pane_scroll_state(&ctx).unclamped_offset().y;
+    let scrolls = tree_scrolls(&ctx);
+    // The expanded parent is still awaiting its first listing. Its child cursor
+    // cannot be drawn, so Requested must survive multiple real pane frames.
+    for _ in 0..2 {
+        navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+        assert!(app.folder_pane.has_pending());
+        assert!(
+            !app.folder_pane
+                .visible_rows()
+                .iter()
+                .any(|row| row.path == waiting_cursor)
+        );
+        assert_eq!(
+            app.folder_pane.cursor_scroll,
+            FolderPaneCursorScroll::Requested
+        );
+        assert_tree_click_position(&ctx, &clicked, offset, rect);
+    }
+    let pos = if arrow {
+        egui::pos2(
+            rect.left() - ctx.global_style().spacing.item_spacing.x - 12.0,
+            rect.center().y,
+        )
+    } else {
+        rect.center()
+    };
+    pointer_tree_click(&mut app, &ctx, &mut frame, pos);
+    let row = app
+        .folder_pane
+        .visible_rows()
+        .into_iter()
+        .find(|row| row.path == clicked)
+        .unwrap();
+    assert!(
+        row.is_cursor,
+        "the actual pointer handler must replace the missing cursor"
+    );
+    if arrow {
+        assert_eq!(row.expanded, !expanded);
+        assert!(app.folder_pane_open_pending.is_none());
+    } else {
+        assert_eq!(app.folder_pane_open_pending.as_ref().unwrap().path, clicked);
+    }
+    for _ in 0..4 {
+        navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+        assert_tree_click_position(&ctx, &clicked, offset, rect);
+        assert_eq!(app.folder_pane.cursor_scroll, FolderPaneCursorScroll::Idle);
+    }
+    release.send(()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+        settle(&mut app, &ctx);
+        assert_tree_click_position(&ctx, &clicked, offset, rect);
+        if !app.folder_pane.has_pending() && app.folder_pane_open_pending.is_none() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    for _ in 0..4 {
+        navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+        assert_tree_click_position(&ctx, &clicked, offset, rect);
+    }
+    assert!(
+        app.folder_pane
+            .visible_rows()
+            .iter()
+            .any(|row| row.path == waiting_cursor)
+    );
+    assert_eq!(
+        tree_scrolls(&ctx),
+        scrolls,
+        "the obsolete reveal must stay retired after the listing arrives"
+    );
+}
+
+#[test]
+fn folder_pane_pointer_label_click_retires_waiting_cursor_request() {
+    pointer_click_retires_waiting_cursor_request(false, false);
+}
+
+#[test]
+fn folder_pane_pointer_expand_click_retires_waiting_cursor_request() {
+    pointer_click_retires_waiting_cursor_request(true, false);
+}
+
+#[test]
+fn folder_pane_pointer_collapse_click_retires_waiting_cursor_request() {
+    pointer_click_retires_waiting_cursor_request(true, true);
+}
+
+#[test]
+fn folder_pane_pointer_click_then_keyboard_down_still_centers_cursor() {
+    let (mut app, ctx, mut frame, clicked) = scrollable_tree_click_fixture(false);
+    let rect = label_click_rect(&ctx, &clicked);
+    let pos = egui::pos2(
+        rect.left() - ctx.global_style().spacing.item_spacing.x - 12.0,
+        rect.center().y,
+    );
+    pointer_tree_click(&mut app, &ctx, &mut frame, pos);
+    let scrolls = tree_scrolls(&ctx);
+    navigation_tree_frame(
+        &mut app,
+        &ctx,
+        &mut frame,
+        vec![tree_key_event(egui::Key::ArrowDown)],
+    );
+    for _ in 0..3 {
+        navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
+    }
+    let rows = app.folder_pane.visible_rows();
+    let cursor = &rows.iter().find(|row| row.is_cursor).unwrap().path;
+    assert_ne!(cursor, &clicked);
+    assert!(
+        (label_click_rect(&ctx, cursor).center().y - tree_click_viewport(&ctx).center().y).abs()
+            < 4.0
+    );
+    assert!(
+        tree_scrolls(&ctx) > scrolls,
+        "keyboard must still request reveal"
+    );
+}
+
+fn visible_label_click_rect(ctx: &egui::Context, path: &Path) -> egui::Rect {
     let id = ctx
         .data(|data| {
             data.get_temp::<egui::Id>(egui::Id::unique(("folder_pane_test_label_id", path)))
@@ -206,22 +688,6 @@ fn assert_label_double_clicked(ctx: &egui::Context, path: &Path) {
         response.rect,
         ctx.input(|input| input.pointer.latest_pos())
     );
-}
-
-fn pointer_tree_click(app: &mut App, ctx: &egui::Context, frame: &mut u64, pos: egui::Pos2) {
-    let event = |pressed| egui::Event::PointerButton {
-        pos,
-        button: egui::PointerButton::Primary,
-        pressed,
-        modifiers: egui::Modifiers::NONE,
-    };
-    navigation_tree_frame(
-        app,
-        ctx,
-        frame,
-        vec![egui::Event::PointerMoved(pos), event(true)],
-    );
-    navigation_tree_frame(app, ctx, frame, vec![event(false)]);
 }
 
 fn assert_pointer_click_count(ctx: &egui::Context, expected: u8) {
@@ -508,7 +974,7 @@ fn folder_pane_label_r1_long_sequence_preserves_the_first_pending_open() {
     for _ in 0..3 {
         navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
     }
-    let pos = label_click_rect(&ctx, &b).center();
+    let pos = visible_label_click_rect(&ctx, &b).center();
     pointer_tree_click(&mut app, &ctx, &mut frame, pos);
     assert_pointer_click_count(&ctx, 1);
     let first_frame = frame;
@@ -564,8 +1030,8 @@ fn folder_pane_label_r1_boundary_then_double_click_opens_the_second_row_once() {
     for _ in 0..3 {
         navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
     }
-    let ra = label_click_rect(&ctx, &a);
-    let rb = label_click_rect(&ctx, &b);
+    let ra = visible_label_click_rect(&ctx, &a);
+    let rb = visible_label_click_rect(&ctx, &b);
     let first_pos = egui::pos2(ra.center().x, ra.bottom() - 0.1);
     let second_pos = egui::pos2(ra.center().x, rb.top() + 0.1);
     assert!(first_pos.distance(second_pos) < 6.0);
@@ -680,7 +1146,7 @@ fn label_double_click_scenario(scenario: &str) {
         initial.has_children_or_unknown,
         "empty branches retain the arrow too"
     );
-    let pos = label_click_rect(&ctx, &b).center();
+    let pos = visible_label_click_rect(&ctx, &b).center();
     pointer_tree_click(&mut app, &ctx, &mut frame, pos);
     assert!(app.folder_pane.has_focus);
     assert!(
@@ -793,7 +1259,7 @@ fn folder_pane_label_triple_click_toggles_once() {
 fn folder_pane_label_clicks_beyond_double_delay_navigate_twice() {
     let (mut app, ctx, mut frame, b, _) = navigation_tree_fixture();
     navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
-    let pos = label_click_rect(&ctx, &b).center();
+    let pos = visible_label_click_rect(&ctx, &b).center();
     pointer_tree_click(&mut app, &ctx, &mut frame, pos);
     let pending = app.folder_pane_open_pending.as_mut().unwrap();
     let first = pending.cancel.clone();
@@ -822,8 +1288,8 @@ fn folder_pane_label_clicks_beyond_double_delay_navigate_twice() {
 fn folder_pane_label_boundary_double_count_navigates_to_second_row() {
     let (mut app, ctx, mut frame, b, c) = navigation_tree_fixture();
     navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
-    let rb = label_click_rect(&ctx, &b);
-    let rc = label_click_rect(&ctx, &c);
+    let rb = visible_label_click_rect(&ctx, &b);
+    let rc = visible_label_click_rect(&ctx, &c);
     let x = rb.center().x;
     let first_pos = egui::pos2(x, rb.bottom() - 0.1);
     let second_pos = egui::pos2(x, rc.top() + 0.1);
@@ -861,7 +1327,7 @@ fn folder_pane_label_boundary_double_count_navigates_to_second_row() {
 fn folder_pane_label_arrow_and_keyboard_keep_existing_behavior() {
     let (mut app, ctx, mut frame, b, _) = navigation_tree_fixture();
     navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
-    let label = label_click_rect(&ctx, &b);
+    let label = visible_label_click_rect(&ctx, &b);
     // The arrow and label allocations are 2pt apart. These points cross the
     // arrow/label boundary within egui's double-click distance.
     let arrow_pos = egui::pos2(label.left() - 3.0, label.center().y);

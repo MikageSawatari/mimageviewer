@@ -381,7 +381,8 @@ mod section1452_book_cover_cache {
                         entry_name: entry.into(),
                     },
                 )
-                .unwrap(),
+                .unwrap()
+                .into(),
             );
             let mut req = request(&app, &cover, (9, 10));
             let key = crate::thumb_loader::cache_key_for_request(&req)
@@ -1037,10 +1038,11 @@ fn mixed_path_favorite_direct_navigation_standardizes_input_without_rewriting_sa
         for source in ["menu-toolbar", "gamepad-ring"] {
             assert_mixed_path_favorite_direct_navigation(folder_name, source, |app, ctx| {
                 if source == "menu-toolbar" {
-                    // render_menubar / render_toolbar return this saved copy. App::update
-                    // sends it directly to open_direct_navigation_target, bypassing _owned.
+                    // Plain favorites preserve this saved copy through the shared dispatcher
+                    // before the frame sends it to its existing Direct acceptance call.
                     (
-                        app.settings.favorites[0].path.clone(),
+                        app.dispatch_favorite_navigation(app.settings.favorites[0].path.clone())
+                            .expect("Plain favorites continue through Direct"),
                         StartupListIntent::ExplicitList,
                     )
                 } else {
@@ -1052,10 +1054,14 @@ fn mixed_path_favorite_direct_navigation_standardizes_input_without_rewriting_sa
                             "mixed_favorite_regression",
                         )
                         .unwrap();
-                    let crate::ui_main::AddressBarNav::Direct(path, intent) = nav else {
-                        panic!("favorite input must produce a direct navigation");
+                    let crate::ui_main::AddressBarNav::Favorite(path) = nav else {
+                        panic!("favorite input must produce a favorite navigation");
                     };
-                    (path, intent)
+                    (
+                        app.dispatch_favorite_navigation(path)
+                            .expect("Plain favorites continue through Direct"),
+                        StartupListIntent::ExplicitList,
+                    )
                 }
             });
         }
@@ -2218,7 +2224,7 @@ fn ordinary_video_folder_seed_upgrades_identity_only_and_then_preserves_the_row(
         .unwrap();
     app.folder_pin_map.insert(
         crate::path_key::normalize_keep_drive(&folder),
-        source.clone(),
+        source.clone().into(),
     );
     app.current_folder = Some(parent.clone());
     app.items = vec![GridItem::Folder(folder.clone())];
@@ -2231,7 +2237,7 @@ fn ordinary_video_folder_seed_upgrades_identity_only_and_then_preserves_the_row(
         crate::catalog::FolderThumbProvenance::Seeded,
     )
     .unwrap();
-    let key = crate::thumb_loader::pinned_folder_row_key(&base, &resolved.source_id, None);
+    let key = resolved.pinned_cache_key(&base, crate::folder_thumb_pins::PinKeyMode::Exact, None);
     let catalog = Arc::new(
         crate::catalog::CatalogDb::open(&app.tmp.path().join("seed-cache"), &parent).unwrap(),
     );
@@ -9894,7 +9900,7 @@ fn rating_filter_suppression_is_owned_by_the_context_that_established_it() {
 
 #[test]
 #[cfg(windows)]
-fn forked_search_snapshots_each_restore_their_own_synthetic_subfolder_fallback() {
+fn forked_search_snapshots_each_restore_their_own_canonical_subfolder_origin() {
     let mut app = phase_c_support::setup_app();
     let root = app.tmp.path().join("forked-search-restore");
     std::fs::create_dir_all(&root).unwrap();
@@ -9907,10 +9913,16 @@ fn forked_search_snapshots_each_restore_their_own_synthetic_subfolder_fallback()
     );
     app.global_search.active = true;
     app.global_search.saved_folder = Some(subfolder_expansion_synthetic_path());
+    let expected_restore = crate::app::top_level_grid_view::TopLevelGridRestore::SubfolderExpansion(
+        snapshot_subfolder_restore(root.clone()),
+    );
     app.global_search_subfolder_restore = Some(snapshot_subfolder_restore(root.clone()));
     app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::GlobalSearch {
         query: "hit".into(),
     });
+    assert!(app.global_search_subfolder_restore.is_none());
+    assert_eq!(app.top_level_grid_view.return_to(), Some(&expected_restore));
+    let canonical_origin = app.top_level_grid_view.return_origin().cloned();
 
     app.bind_mounted_context_for_test(906);
     let first = app.fork_mounted_live_media_context(906);
@@ -9918,14 +9930,19 @@ fn forked_search_snapshots_each_restore_their_own_synthetic_subfolder_fallback()
     let second = app.fork_mounted_live_media_context(907);
     let main_facet = app.facet_navigation.clone();
     let main_history = app.folder_nav_history_snapshot();
+    let main_items = app.items.clone();
+    let main_folder = app.current_folder.clone();
     for (position, context_id) in [first, second].into_iter().enumerate() {
         if position != 0 {
             // Eliminate the first restore's legacy App-global runtime as an accidental fallback.
             app.clear_subfolder_expansion_view_state();
         }
         let mounted = app.with_viewer_context(context_id, |ctx| {
-            assert!(ctx.global_search_subfolder_restore.is_some());
-            assert!(ctx.top_level_grid_view.take_return_to().is_some());
+            assert!(ctx.global_search_subfolder_restore.is_none());
+            assert_eq!(
+                ctx.top_level_grid_view.return_origin(),
+                canonical_origin.as_ref()
+            );
             let source_items = ctx.items.clone();
             ctx.deactivate_snapshot();
             assert_eq!(ctx.items, source_items);
@@ -9951,6 +9968,14 @@ fn forked_search_snapshots_each_restore_their_own_synthetic_subfolder_fallback()
             ));
         });
         assert!(mounted.is_ok());
+        assert!(app.is_snapshot_active());
+        assert!(app.global_search_subfolder_restore.is_none());
+        assert_eq!(
+            app.top_level_grid_view.return_origin(),
+            canonical_origin.as_ref()
+        );
+        assert_eq!(app.items, main_items);
+        assert_eq!(app.current_folder, main_folder);
         assert_eq!(app.facet_navigation, main_facet);
         assert_eq!(
             app.folder_nav_history_snapshot().back_stack,
@@ -9967,7 +9992,7 @@ fn forked_search_snapshots_each_restore_their_own_synthetic_subfolder_fallback()
 #[cfg(windows)]
 fn dismissing_snapshot_with_owned_return_preserves_unused_search_restore_fallback() {
     let mut app = phase_c_support::setup_app();
-    let root = app.tmp.path().join("unused-search-restore");
+    let root = app.tmp.path().join("owned-search-restore");
     std::fs::create_dir_all(&root).unwrap();
     let search_path = crate::app::search_results_synthetic_path();
     seed_snapshot_context(
@@ -9977,17 +10002,32 @@ fn dismissing_snapshot_with_owned_return_preserves_unused_search_restore_fallbac
     );
     app.global_search.active = true;
     app.global_search.saved_folder = Some(subfolder_expansion_synthetic_path());
+    let expected_restore = crate::app::top_level_grid_view::TopLevelGridRestore::SubfolderExpansion(
+        snapshot_subfolder_restore(root.clone()),
+    );
     app.global_search_subfolder_restore = Some(snapshot_subfolder_restore(root));
     app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::GlobalSearch {
         query: "hit".into(),
     });
+    assert!(app.global_search_subfolder_restore.is_none());
+    assert_eq!(app.top_level_grid_view.return_to(), Some(&expected_restore));
+
+    // A separate unused legacy slot must survive dismissal of the canonical snapshot owner.
+    let unused_restore = snapshot_subfolder_restore(app.tmp.path().join("unused-search-restore"));
+    app.global_search_subfolder_restore = Some(unused_restore.clone());
 
     let returned = app.dismiss_snapshot_without_restore();
-    assert!(matches!(
-        returned,
-        Some(crate::app::top_level_grid_view::TopLevelGridRestore::SubfolderExpansion(_))
-    ));
-    assert!(app.global_search_subfolder_restore.is_some());
+    assert_eq!(returned, Some(expected_restore));
+    assert_eq!(
+        app.global_search_subfolder_restore
+            .clone()
+            .map(crate::app::top_level_grid_view::TopLevelGridRestore::SubfolderExpansion),
+        Some(
+            crate::app::top_level_grid_view::TopLevelGridRestore::SubfolderExpansion(
+                unused_restore
+            )
+        )
+    );
 }
 
 #[test]
@@ -19933,8 +19973,10 @@ mod phase_c_key_tests {
         let other = GridItem::Folder(PathBuf::from(r"C:\OtherFolder"));
         let source = crate::folder_thumb_pins::source_from_grid_item(&drive_root, &pinned).unwrap();
         app.current_folder = Some(drive_root.clone());
-        app.folder_pin_map
-            .insert(crate::path_key::normalize_keep_drive(&drive_root), source);
+        app.folder_pin_map.insert(
+            crate::path_key::normalize_keep_drive(&drive_root),
+            source.into(),
+        );
 
         assert!(
             app.should_force_cache_for_drive_list_pin(&pinned),
@@ -20000,8 +20042,11 @@ mod phase_c_key_tests {
             app.settings.folder_thumb_depth as usize,
         )
         .unwrap();
-        let pinned_parent_key =
-            crate::thumb_loader::pinned_folder_row_key(&parent_key, &resolved.source_id, None);
+        let pinned_parent_key = resolved.pinned_cache_key(
+            &parent_key,
+            crate::folder_thumb_pins::PinKeyMode::Exact,
+            None,
+        );
         parent_db
             .save(
                 &pinned_parent_key,
@@ -20036,8 +20081,10 @@ mod phase_c_key_tests {
 
         app.items = vec![GridItem::Folder(drive_root.clone())];
         app.image_metas = vec![None];
-        app.folder_pin_map
-            .insert(crate::path_key::normalize_keep_drive(&drive_root), source);
+        app.folder_pin_map.insert(
+            crate::path_key::normalize_keep_drive(&drive_root),
+            source.into(),
+        );
 
         let drive_list_db = std::sync::Arc::new(
             crate::catalog::CatalogDb::open(&cache_dir, &drive_list_catalog_path()).unwrap(),
@@ -20216,7 +20263,7 @@ mod phase_c_key_tests {
             ContainerKindForPin::Folder,
             &std::collections::HashMap::from([(
                 crate::path_key::normalize_keep_drive(&child),
-                page_pin,
+                page_pin.into(),
             )]),
             &std::collections::HashMap::new(),
             Some(pins.as_ref()),
@@ -20273,7 +20320,8 @@ mod phase_c_key_tests {
             crate::folder_thumb_pins::FolderPinSource::File {
                 rel: "child".into(),
                 kind: crate::folder_thumb_pins::FileKind::Folder,
-            },
+            }
+            .into(),
         );
         let drive_catalog = std::sync::Arc::new(
             crate::catalog::CatalogDb::open(&cache_dir, &drive_list_catalog_path()).unwrap(),
@@ -20398,8 +20446,10 @@ mod phase_c_key_tests {
             kind: crate::folder_thumb_pins::FileKind::Folder,
         };
         app.items = vec![GridItem::Folder(drive.clone())];
-        app.folder_pin_map
-            .insert(crate::path_key::normalize_keep_drive(&drive), root_pin);
+        app.folder_pin_map.insert(
+            crate::path_key::normalize_keep_drive(&drive),
+            root_pin.into(),
+        );
         let req = make_drive_list_pin_load_request(
             &app.items[0],
             0,
@@ -20610,7 +20660,7 @@ mod phase_c_key_tests {
         app.image_metas = vec![None];
         app.folder_pin_map.insert(
             crate::path_key::normalize_keep_drive(&drive),
-            source.clone(),
+            source.clone().into(),
         );
         let target = std::sync::Arc::new(
             crate::catalog::CatalogDb::open(&cache_dir, &drive_list_catalog_path()).unwrap(),
@@ -20759,7 +20809,7 @@ mod phase_c_key_tests {
         };
         let writer_pins = std::collections::HashMap::from([(
             crate::path_key::normalize_keep_drive(&child),
-            page_zero.clone(),
+            page_zero.clone().into(),
         )]);
         let writer_req = apply_folder_thumb_pin(
             writer_base,
@@ -20827,7 +20877,7 @@ mod phase_c_key_tests {
         };
         let page_one_pins = std::collections::HashMap::from([(
             crate::path_key::normalize_keep_drive(&child),
-            page_one.clone(),
+            page_one.clone().into(),
         )]);
         let page_one_writer = apply_folder_thumb_pin(
             LoadRequest {
@@ -21063,7 +21113,7 @@ mod phase_c_key_tests {
             pins.set(&grandchild, page).unwrap();
             let pin_map = std::collections::HashMap::from([(
                 crate::path_key::normalize_keep_drive(&child),
-                child_source.clone(),
+                child_source.clone().into(),
             )]);
             let request = apply_folder_thumb_pin(
                 LoadRequest {
@@ -21138,7 +21188,8 @@ mod phase_c_key_tests {
             crate::folder_thumb_pins::FolderPinSource::File {
                 rel: "child".into(),
                 kind: crate::folder_thumb_pins::FileKind::Folder,
-            },
+            }
+            .into(),
         );
         let drive_list_db = std::sync::Arc::new(
             crate::catalog::CatalogDb::open(&cache_dir, &drive_list_catalog_path()).unwrap(),
@@ -21211,7 +21262,8 @@ mod phase_c_key_tests {
             crate::folder_thumb_pins::FolderPinSource::PdfPage {
                 pdf_rel: "moved.epub".into(),
                 page: 0,
-            },
+            }
+            .into(),
         )]);
         let req = apply_folder_thumb_pin(
             base,
@@ -21315,8 +21367,10 @@ mod phase_c_key_tests {
 
         app.items = vec![GridItem::Folder(drive_root.clone())];
         app.image_metas = vec![None];
-        app.folder_pin_map
-            .insert(crate::path_key::normalize_keep_drive(&drive_root), source);
+        app.folder_pin_map.insert(
+            crate::path_key::normalize_keep_drive(&drive_root),
+            source.into(),
+        );
 
         let drive_list_db = std::sync::Arc::new(
             crate::catalog::CatalogDb::open(&cache_dir, &drive_list_catalog_path()).unwrap(),
@@ -21410,8 +21464,10 @@ mod phase_c_key_tests {
 
         app.items = vec![GridItem::Folder(drive_root.clone())];
         app.image_metas = vec![None];
-        app.folder_pin_map
-            .insert(crate::path_key::normalize_keep_drive(&drive_root), source);
+        app.folder_pin_map.insert(
+            crate::path_key::normalize_keep_drive(&drive_root),
+            source.into(),
+        );
 
         let drive_list_db = std::sync::Arc::new(
             crate::catalog::CatalogDb::open(&cache_dir, &drive_list_catalog_path()).unwrap(),
@@ -29720,13 +29776,14 @@ mod phase_c_folder_nav_history_tests {
         app.settings.sidecar_backup_enabled = false;
         let origin = app.tmp.path().join("pane-search-origin");
         let directory = app.tmp.path().join("pane-search-destination");
+        std::fs::create_dir_all(&origin).unwrap();
         std::fs::create_dir_all(&directory).unwrap();
         let book = directory.join("z-book.zip");
         write_1328_zip(&book);
         arm_context_jump_source(
             &mut app,
             TopLevelSearchView::Favorite,
-            origin,
+            origin.clone(),
             GridItem::ZipFile(book.clone()),
         );
         app.favsearch.query = "book".into();
@@ -29736,7 +29793,8 @@ mod phase_c_folder_nav_history_tests {
         app.sync_folder_pane_state(&ctx);
         app.folder_pane.set_cursor(directory.clone());
         app.folder_pane.set_focus_tree();
-        // Real pane keyboard gate consumes Enter and starts the real directory scan.
+        // The real root pass decides keyboard ownership before the fixed pane
+        // consumer claims Enter and starts the directory scan.
         ctx.run_pass(
             egui::RawInput {
                 events: vec![egui::Event::Key {
@@ -29749,43 +29807,78 @@ mod phase_c_folder_nav_history_tests {
                 ..Default::default()
             },
             |ctx| {
-                assert!(app.handle_folder_pane_keyboard(ctx).is_none());
+                assert!(app.input_root_keyboard(ctx).0.is_none());
             },
         )
         .drop_without_applying_deltas();
-        assert!(app.folder_pane_open_pending.is_some());
+        let pending = app.folder_pane_open_pending.as_ref().unwrap();
+        assert!(matches!(
+            pending.purpose,
+            super::FolderOpenScanPurpose::JumpToPhysicalFolder { .. }
+        ));
+        let navigation = pending.navigation.clone().unwrap();
+        let cancel = pending.cancel.clone();
+        assert!(app.main_list_navigation_is_current(&navigation));
         refresh_favorite_zip_search_for_test(&mut app, &directory, &book);
+        assert!(app.main_list_navigation_is_current(&navigation));
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(
+            app.folder_pane_open_pending
+                .as_ref()
+                .unwrap()
+                .navigation
+                .as_ref(),
+            Some(&navigation),
+            "same-query publication must retain the original pane request"
+        );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let ready = loop {
-            if let Some(ready) = app.poll_folder_pane_open(&ctx) {
-                break ready;
-            }
-            assert!(
-                app.folder_pane_open_pending.is_some(),
-                "same-query result publication cannot cancel pane navigation"
+        while app.current_folder.as_ref() != Some(&directory)
+            || app.folder_pane_open_pending.is_some()
+            || app.sidecar_restore_active()
+        {
+            // Use the real frame consumer: JumpToPhysicalFolder is adopted inside
+            // resolve_main_folder_open_ready and returns None rather than a Direct load.
+            app.post_render_main_navigation(
+                &ctx,
+                crate::app::update_phases::MainFrameNavigation {
+                    fav_nav: None,
+                    toolbar_fav_nav: None,
+                    fullscreen_close_nav: None,
+                    keyboard_nav: None,
+                    keyboard_nav_from_fullscreen_close: false,
+                    gamepad_nav: None,
+                    address_nav: None,
+                    open_folder_nav: None,
+                    context_nav: None,
+                    folder_pane_nav: None,
+                    grid_nav: None,
+                },
             );
+            app.poll_sidecar_restore(&ctx);
             assert!(
                 std::time::Instant::now() < deadline,
-                "pane scan must complete"
+                "pane scan must adopt through the main frame after the same-query refresh"
             );
             std::thread::yield_now();
-        };
-        let ready = app.resolve_main_folder_open_ready(&ctx, ready).unwrap();
-        app.load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation(
-            ready.path,
-            Some(ready.scan),
-            super::OpenRequestOwner::Navigation,
-            None,
-            None,
-            ready.restore_intent,
-            ready.navigation,
-        );
+        }
         assert_eq!(app.current_folder.as_ref(), Some(&directory));
-        assert_eq!(app.favsearch.nav_stack.last(), Some(&directory));
+        assert!(!app.favsearch.active);
+        assert_eq!(
+            app.folder_history_back_target(),
+            Some(&FolderNavHistoryTarget::Path(origin.clone()))
+        );
         assert!(
             app.items
                 .iter()
                 .any(|item| item.drag_source_path() == Some(book.as_path()))
+        );
+        app.dispatch_folder_history_input_for_test(FolderHistoryDirection::Back);
+        finish_staged_physical_history_for_test(&mut app);
+        assert_eq!(app.current_folder.as_ref(), Some(&origin));
+        assert!(!app.favsearch.active);
+        assert_eq!(
+            app.folder_history_forward_target(),
+            Some(&FolderNavHistoryTarget::Path(directory))
         );
     }
 
@@ -30076,18 +30169,11 @@ mod phase_c_folder_nav_history_tests {
                 app.update_ime_state(ctx);
                 app.note_main_chrome_pointer_block_transition(ctx);
                 if let Some(nav) = app.render_toolbar(root_ui).1 {
-                    let crate::ui_main::AddressBarNav::Direct(path, restore_intent) = nav else {
-                        panic!("address Enter must produce Direct navigation");
+                    let crate::ui_main::AddressBarNav::AddressInput(target) = nav else {
+                        panic!("address Enter must produce address-input navigation");
                     };
-                    // The exact consumer used by App::update after merging AddressBarNav::Direct.
-                    app.open_direct_navigation_target(
-                        path,
-                        None,
-                        crate::app::OpenRequestOwner::Navigation,
-                        None,
-                        None,
-                        restore_intent,
-                    );
+                    // The exact consumer used by App::update for address Enter.
+                    app.dispatch_address_input(target);
                 }
             });
         harness.run();
@@ -36261,7 +36347,8 @@ fn begin_detached_bookmark_media_test(
         crate::folder_thumb_pins::FolderPinSource::File {
             rel: "cover.jpg".to_string(),
             kind: crate::folder_thumb_pins::FileKind::Image,
-        },
+        }
+        .into(),
     );
     app.converted_archive_cache_paths.insert(
         "main-grid-archive".to_string(),
@@ -36958,21 +37045,16 @@ mod phase_c_drill_address_tests {
         );
     }
 
-    /// 入力変更後の debounce 待ち / worker 実行中相当では、0 件確定に見えないよう
-    /// address の件数表示にも検索中を出す。
+    /// 最初の検索を実行する前は、下書きも件数も address に出さない。
     #[test]
-    fn aggregated_address_marks_unsettled_results_as_searching() {
+    fn aggregated_address_omits_unsubmitted_query_and_count() {
         let mut app = setup_app();
         app.global_search.active = true;
         app.global_search.metadata_draft = "グルグル".to_string();
         app.global_search.last_executed.clear();
         app.update_global_search_address();
 
-        assert!(
-            app.address.contains("検索中"),
-            "未確定の Ctrl+G 検索は address に検索中を出す: {}",
-            app.address
-        );
+        assert_eq!(app.address, "🌐 アイテム検索");
     }
 
     #[test]
@@ -40376,7 +40458,8 @@ mod favorite_adjustment_defaults_tests {
             crate::folder_thumb_pins::FolderPinSource::File {
                 rel: "clip.mp4".to_string(),
                 kind: crate::folder_thumb_pins::FileKind::Video,
-            },
+            }
+            .into(),
         );
         app.items.push(GridItem::Folder(folder));
         app.image_metas.push(Some((10, 20)));
@@ -47105,7 +47188,7 @@ mod favorite_adjustment_defaults_tests {
                 path: cache.clone(),
             },
         );
-        let pins: std::collections::HashMap<String, FolderPinSource> =
+        let pins: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin> =
             std::collections::HashMap::new();
 
         let req = make_load_request(
@@ -48811,7 +48894,10 @@ mod favorite_adjustment_defaults_tests {
             },
         );
         let mut pins = std::collections::HashMap::new();
-        pins.insert(crate::path_key::normalize_keep_drive(&src), source.clone());
+        pins.insert(
+            crate::path_key::normalize_keep_drive(&src),
+            source.clone().into(),
+        );
 
         let req = make_load_request(
             &item,
@@ -48867,7 +48953,8 @@ mod favorite_adjustment_defaults_tests {
             FolderPinSource::ZipEntry {
                 zip_rel: String::new(),
                 entry: "inner/pinned.png".to_string(),
-            },
+            }
+            .into(),
         );
         let sources = std::collections::HashMap::from([(
             crate::path_key::normalize_keep_drive(&source_path),
@@ -48963,7 +49050,10 @@ mod favorite_adjustment_defaults_tests {
             entry: "chapter/page01.jpg".to_string(),
         };
         let mut pins = std::collections::HashMap::new();
-        pins.insert(crate::path_key::normalize_keep_drive(&folder), source);
+        pins.insert(
+            crate::path_key::normalize_keep_drive(&folder),
+            source.into(),
+        );
 
         let req = make_load_request(
             &item,
@@ -49010,7 +49100,8 @@ mod favorite_adjustment_defaults_tests {
             crate::folder_thumb_pins::FolderPinSource::File {
                 rel: "book.7z".to_string(),
                 kind: crate::folder_thumb_pins::FileKind::ConvertibleArchive,
-            },
+            }
+            .into(),
         );
         let mut converted = std::collections::HashMap::new();
         converted.insert(
@@ -49096,7 +49187,8 @@ mod favorite_adjustment_defaults_tests {
             crate::folder_thumb_pins::FolderPinSource::File {
                 rel: "book.7z".to_string(),
                 kind: crate::folder_thumb_pins::FileKind::ConvertibleArchive,
-            },
+            }
+            .into(),
         );
         app.folder_thumb_pin_db
             .as_ref()
@@ -49187,7 +49279,7 @@ mod favorite_adjustment_defaults_tests {
         ] {
             let pins = std::collections::HashMap::from([(
                 crate::path_key::normalize_keep_drive(&folder),
-                source,
+                source.into(),
             )]);
             let req = make_load_request(
                 &item,
@@ -49237,7 +49329,8 @@ mod favorite_adjustment_defaults_tests {
             crate::folder_thumb_pins::FolderPinSource::File {
                 rel: "book.zip".to_string(),
                 kind: crate::folder_thumb_pins::FileKind::ZipFile,
-            },
+            }
+            .into(),
         );
         let zip_page = crate::folder_thumb_pins::FolderPinSource::ZipEntry {
             zip_rel: String::new(),
@@ -49343,7 +49436,8 @@ mod favorite_adjustment_defaults_tests {
             crate::folder_thumb_pins::FolderPinSource::File {
                 rel: "book.pdf".to_string(),
                 kind: crate::folder_thumb_pins::FileKind::PdfFile,
-            },
+            }
+            .into(),
         );
         app.folder_thumb_pin_db
             .as_ref()
@@ -49590,10 +49684,12 @@ mod favorite_adjustment_defaults_tests {
         let book_key = source.join("bookA");
         assert_eq!(
             app.folder_thumb_pin_for(&book_key),
-            Some(&crate::folder_thumb_pins::FolderPinSource::ZipEntry {
-                zip_rel: String::new(),
-                entry: "bookA/p1.jpg".to_string(),
-            })
+            Some(&crate::folder_thumb_pins::FolderPin::from(
+                crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+                    zip_rel: String::new(),
+                    entry: "bookA/p1.jpg".to_string(),
+                }
+            ))
         );
 
         app.settings.show_address_bar_folder_pin = true;
@@ -49659,10 +49755,12 @@ mod favorite_adjustment_defaults_tests {
         app.toggle_folder_pin_for_idx(0);
         assert_eq!(
             app.folder_thumb_pin_for(&folder),
-            Some(&crate::folder_thumb_pins::FolderPinSource::File {
-                rel: "book.7z".to_string(),
-                kind: crate::folder_thumb_pins::FileKind::ConvertibleArchive,
-            })
+            Some(&crate::folder_thumb_pins::FolderPin::from(
+                crate::folder_thumb_pins::FolderPinSource::File {
+                    rel: "book.7z".to_string(),
+                    kind: crate::folder_thumb_pins::FileKind::ConvertibleArchive,
+                }
+            ))
         );
     }
 
@@ -49691,10 +49789,12 @@ mod favorite_adjustment_defaults_tests {
 
         assert_eq!(
             app.folder_thumb_pin_for(&zip_path),
-            Some(&FolderPinSource::ZipDir {
-                zip_rel: String::new(),
-                dir_prefix: "bookB/only/".to_string(),
-            })
+            Some(&crate::folder_thumb_pins::FolderPin::from(
+                FolderPinSource::ZipDir {
+                    zip_rel: String::new(),
+                    dir_prefix: "bookB/only/".to_string(),
+                }
+            ))
         );
     }
 
@@ -49735,7 +49835,10 @@ mod favorite_adjustment_defaults_tests {
             .set(&child_key, &child_source)
             .unwrap();
         let mut pins = std::collections::HashMap::new();
-        pins.insert(crate::path_key::normalize_keep_drive(&book_key), source);
+        pins.insert(
+            crate::path_key::normalize_keep_drive(&book_key),
+            source.into(),
+        );
 
         let req = make_load_request(
             &item,
@@ -49758,7 +49861,7 @@ mod favorite_adjustment_defaults_tests {
 
         assert_eq!(req.path, zip_path);
         assert_eq!(req.zip_entry.as_deref(), Some("bookA/ch02/page01.jpg"));
-        assert_eq!(req.zip_dir_prefix, None);
+        assert_eq!(req.zip_dir_prefix.as_deref(), Some("bookA/"));
         assert_eq!(req.resolve_override, None);
         assert_eq!(
             req.edit_preview_key.as_deref(),
@@ -81055,7 +81158,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             crate::folder_thumb_pins::FolderPinSource::File {
                 rel: "clip.mp4".to_string(),
                 kind: crate::folder_thumb_pins::FileKind::Video,
-            },
+            }
+            .into(),
         );
         let dirty: std::collections::HashSet<std::path::PathBuf> =
             [video.clone()].into_iter().collect();
@@ -112592,7 +112696,8 @@ fn file_type_visibility_thumbnail_request_routes_policy_before_pin_resolution() 
         crate::folder_thumb_pins::FolderPinSource::File {
             rel: "hidden.png".into(),
             kind: crate::folder_thumb_pins::FileKind::Image,
-        },
+        }
+        .into(),
     );
     let mut policy = crate::file_type_visibility::FileTypeVisibility::default();
     policy.excluded_extensions.insert("png".into());

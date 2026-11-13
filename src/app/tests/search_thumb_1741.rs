@@ -265,7 +265,7 @@ fn section1741_parent_rows_are_only_unpinned_single_file_cover_branches() {
     ] {
         env.folder_pin_map.insert(
             crate::path_key::normalize_keep_drive(item.drag_source_path().unwrap()),
-            source,
+            source.into(),
         );
         let mut req = request(&env, &item, (1, 0)).unwrap();
         assert!(

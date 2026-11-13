@@ -167,9 +167,10 @@ fn cover_identity_zip_first_and_resolved_pin_follow_the_decoded_entry() {
         3,
     )
     .unwrap();
-    let key = format!(
-        "zipthumb:book.zip{CACHE_KEY_PIN_SUFFIX}{}",
-        target.source_id
+    let key = target.pinned_cache_key(
+        "zipthumb:book.zip",
+        crate::folder_thumb_pins::PinKeyMode::Exact,
+        None,
     );
     let mut pinned = request(&target.abs_path, &key);
     pinned.zip_entry = target.zip_entry;
@@ -326,9 +327,10 @@ fn cover_identity_child_cache_preserves_pixels_identity_and_resolves_legacy_pin(
         3,
     )
     .unwrap();
-    let child_key = format!(
-        "zipthumb:book.zip{CACHE_KEY_PIN_SUFFIX}{}",
-        target.source_id
+    let child_key = target.pinned_cache_key(
+        "zipthumb:book.zip",
+        crate::folder_thumb_pins::PinKeyMode::Exact,
+        None,
     );
     children
         .save_thumb_bytes(
@@ -506,7 +508,7 @@ fn cover_identity_drive_seed_same_bytes_with_changed_identity_sends_terminal_pix
         crate::catalog::FolderThumbProvenance::Seeded,
     )
     .unwrap();
-    let key = pinned_folder_row_key(&base, &target.source_id, None);
+    let key = target.pinned_cache_key(&base, crate::folder_thumb_pins::PinKeyMode::Exact, None);
     let catalog = Arc::new(
         crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &root).unwrap(),
     );

@@ -299,7 +299,237 @@ struct ScenarioFrame {
     records: HashMap<egui::ViewportId, Vec<PaintRecord>>,
     white: HashMap<egui::ViewportId, Vec<WhiteCompanionPaintRecord>>,
     errors: HashMap<egui::ViewportId, Vec<String>>,
+    labels: HashMap<egui::ViewportId, Vec<String>>,
 }
+
+fn visible_labels(output: &egui::FullOutput) -> Vec<String> {
+    fn collect(shape: &egui::Shape, labels: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(text) => labels.push(text.galley.text().to_owned()),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, labels)),
+            _ => {}
+        }
+    }
+    let mut labels = vec![];
+    for shape in &output.shapes {
+        collect(&shape.shape, &mut labels);
+    }
+    labels
+}
+
+fn run_depth_dialog_owner_case(host: &'static str, export: bool) {
+    std::thread::spawn(move || {
+        let _input = crate::key_input::lock_test_input();
+        let mut app = setup_app_for_test();
+        // This scenario starts with an already open viewer, after startup navigation.
+        app.initialized = true;
+        app.indexer_init.mark_unavailable_if_not_ready();
+        let mut viewer = if host.starts_with("linked") {
+            super::depth_main_window_tests::RootDepthViewer::linked(&mut app)
+        } else {
+            super::depth_main_window_tests::RootDepthViewer::new(&mut app)
+        };
+        if export {
+            viewer.ready(&mut app);
+            viewer.frame(&mut app, vec![]);
+            viewer.frame(&mut app, vec![]);
+            let button = viewer.label("書き出し…").center();
+            viewer.click(&mut app, button, false);
+            assert!(app.depth_export_dialog_open());
+        } else {
+            app.set_fs_exclusive_view(
+                crate::fs_exclusive_view::FsExclusiveView::None,
+                "addon_owner_scenario",
+            );
+        }
+        if host == "grid" {
+            app.close_fullscreen();
+        }
+        if host == "fullscreen" {
+            app.viewer_presentation = ViewerPresentation::Fullscreen;
+            app.native_video_in_window_active = false;
+            app.settings.video_in_window_mode = false;
+        }
+        let ctx = viewer.ctx.clone();
+        let sibling_id = 88_950;
+        let media_path = app.tmp.path().join("disconnected-dialog-media.mp4");
+        let render = app.wgpu_render_state.clone();
+        let mut sibling = None;
+        if host.contains("independent") || host.ends_with("parked-media") {
+            let configure = |owner: &mut App| {
+                super::depth_view_tests::install_pages(owner, &ctx);
+                owner.wgpu_render_state = render.clone();
+                crate::app::source_texture_test_support::seed(owner, &ctx, 0);
+                owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+                owner.detached_viewer_independent_active = true;
+                owner.native_video_in_window_active = false;
+                owner.set_fs_exclusive_view(
+                    crate::fs_exclusive_view::FsExclusiveView::None,
+                    "addon_sibling",
+                );
+                if host.ends_with("video") || host.ends_with("parked-media") {
+                    let path = media_path.clone();
+                    owner.items[0] = GridItem::Video(path.clone());
+                    owner.fs_cache.insert(
+                        0,
+                        FsCacheEntry::Video {
+                            player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                                path, 3.0,
+                            )),
+                            load_seq: 0,
+                        },
+                    );
+                }
+            };
+            sibling = Some(if host.ends_with("parked-media") {
+                let id = app.push_window_context_for_test(&ctx, sibling_id, configure);
+                app.transition_detached_window_state(
+                    sibling_id,
+                    DetachedWindowState::ParkedLive,
+                    "depth_dialog_test",
+                );
+                id
+            } else {
+                app.build_active_context_for_test(
+                    Some(sibling_id),
+                    DetachedSource::Image,
+                    configure,
+                )
+            });
+        }
+        if !export {
+            app.depth_setup
+                .set_status_for_test(crate::addon::AddonStatus::Missing);
+            if host == "grid" {
+                app.request_depth_addon_setup(&ctx);
+            } else {
+                app.toggle_depth_parallax(&ctx, 0);
+            }
+            assert!(app.depth_setup.dialog_open_for_test());
+        }
+        let mut driver = ScenarioDriver::with_ctx(ctx);
+        let expected_presentation = app.viewer_presentation;
+        let assert_viewer_alive = |app: &App| {
+            if host != "grid" {
+                assert_eq!(
+                    app.fullscreen_idx,
+                    Some(0),
+                    "{host}: main viewer remains open"
+                );
+                assert_eq!(
+                    app.viewer_presentation, expected_presentation,
+                    "{host}: presentation remains unchanged"
+                );
+            }
+        };
+        assert_viewer_alive(&app);
+        if host == "fullscreen" {
+            driver.focus(app.fullscreen_viewport_id());
+        }
+        let mut last = driver.root(&mut app);
+        assert_viewer_alive(&app);
+        for _ in 0..3 {
+            last = driver.root(&mut app);
+            assert_viewer_alive(&app);
+        }
+        let title = if export {
+            "3D 写真の書き出し"
+        } else {
+            "3D 写真の追加モデル"
+        };
+        let dialogs: Vec<_> = last
+            .labels
+            .iter()
+            .filter(|(_, labels)| labels.iter().any(|s| s == title))
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(dialogs.len(), 1, "one dialog in {host}: {:?}", last.labels);
+        if host == "grid" || host.starts_with("embedded") {
+            assert_eq!(dialogs, vec![egui::ViewportId::ROOT], "{host}");
+        } else {
+            assert_ne!(
+                dialogs[0],
+                egui::ViewportId::ROOT,
+                "{host}: ROOT must not draw a viewer-owned addon dialog"
+            );
+        }
+        if let Some(sibling) = sibling {
+            assert!(
+                !app.with_viewer_context(sibling, |owner| owner
+                    .mounted_viewer_owns_depth_dialogs())
+                    .unwrap()
+            );
+            assert!(
+                last.labels
+                    .get(&App::detached_image_window_viewport_id(sibling_id))
+                    .is_some_and(|labels| !labels.iter().any(|s| s == title)),
+                "sibling body ran without a main dialog: {host}"
+            );
+        }
+        if host.starts_with("linked") && !export {
+            app.close_fullscreen();
+            driver.root(&mut app);
+            let closed = driver.root(&mut app);
+            assert!(
+                closed
+                    .labels
+                    .get(&egui::ViewportId::ROOT)
+                    .is_some_and(|labels| labels.iter().any(|s| s == title)),
+                "addon returns to actual ROOT update after linked close"
+            );
+        }
+        // Keep the generated viewer fixture alive through the application passes.
+        viewer.shapes.clear();
+        crate::key_input::clear_test_frame();
+    })
+    .join()
+    .unwrap();
+}
+
+macro_rules! depth_dialog_owner_scenario {
+    ($name:ident, $host:literal, $export:literal) => {
+        #[test]
+        fn $name() {
+            run_depth_dialog_owner_case($host, $export);
+        }
+    };
+}
+depth_dialog_owner_scenario!(multiwindow_depth_addon_grid, "grid", false);
+depth_dialog_owner_scenario!(multiwindow_depth_addon_embedded, "embedded", false);
+depth_dialog_owner_scenario!(multiwindow_depth_export_embedded, "embedded", true);
+depth_dialog_owner_scenario!(multiwindow_depth_addon_fullscreen, "fullscreen", false);
+depth_dialog_owner_scenario!(multiwindow_depth_addon_linked, "linked", false);
+depth_dialog_owner_scenario!(multiwindow_depth_export_linked, "linked", true);
+depth_dialog_owner_scenario!(
+    multiwindow_depth_addon_embedded_independent_still,
+    "embedded-independent-still",
+    false
+);
+depth_dialog_owner_scenario!(
+    multiwindow_depth_export_embedded_independent_still,
+    "embedded-independent-still",
+    true
+);
+depth_dialog_owner_scenario!(
+    multiwindow_depth_addon_embedded_independent_video,
+    "embedded-independent-video",
+    false
+);
+depth_dialog_owner_scenario!(
+    multiwindow_depth_export_embedded_independent_video,
+    "embedded-independent-video",
+    true
+);
+depth_dialog_owner_scenario!(
+    multiwindow_depth_addon_linked_parked_media,
+    "linked-parked-media",
+    false
+);
+depth_dialog_owner_scenario!(
+    multiwindow_depth_export_linked_parked_media,
+    "linked-parked-media",
+    true
+);
 
 fn collect_visible_errors(shape: &egui::Shape, errors: &mut Vec<String>) {
     match shape {
@@ -341,7 +571,10 @@ struct ScenarioDriver {
 
 impl ScenarioDriver {
     fn new() -> Self {
-        let ctx = egui::Context::default();
+        Self::with_ctx(egui::Context::default())
+    }
+
+    fn with_ctx(ctx: egui::Context) -> Self {
         ctx.set_embed_viewports(false);
         crate::ui_fonts::configure_fonts(&ctx);
         let child_outputs = Rc::new(RefCell::new(Vec::new()));
@@ -432,6 +665,8 @@ impl ScenarioDriver {
         let mut records = HashMap::new();
         let mut white = HashMap::new();
         let mut errors = HashMap::new();
+        let mut labels = HashMap::new();
+        labels.insert(egui::ViewportId::ROOT, visible_labels(&output));
         records.insert(
             egui::ViewportId::ROOT,
             paint_records(egui::ViewportId::ROOT, &output),
@@ -442,6 +677,7 @@ impl ScenarioDriver {
         );
         errors.insert(egui::ViewportId::ROOT, error_messages(&output));
         for (id, output) in self.child_outputs.borrow_mut().drain(..) {
+            labels.insert(id, visible_labels(&output));
             records.insert(id, paint_records(id, &output));
             white.insert(id, white_companion_paint_records(id, &output));
             errors.insert(id, error_messages(&output));
@@ -467,6 +703,7 @@ impl ScenarioDriver {
             records,
             white,
             errors,
+            labels,
         }
     }
 
@@ -480,6 +717,8 @@ impl ScenarioDriver {
         let mut records = HashMap::new();
         let mut white = HashMap::new();
         let mut errors = HashMap::new();
+        let mut labels = HashMap::new();
+        labels.insert(id, visible_labels(&output));
         records.insert(id, paint_records(id, &output));
         white.insert(id, white_companion_paint_records(id, &output));
         errors.insert(id, error_messages(&output));
@@ -489,6 +728,7 @@ impl ScenarioDriver {
             records,
             white,
             errors,
+            labels,
         }
     }
 
@@ -595,11 +835,13 @@ fn multiwindow_scenario_i1_ignores_root_and_sibling_errors() {
         records: HashMap::new(),
         white: HashMap::new(),
         errors: HashMap::new(),
+        labels: HashMap::new(),
     };
     let after = ScenarioFrame {
         number: 1,
         records: HashMap::new(),
         white: HashMap::new(),
+        labels: HashMap::new(),
         errors: HashMap::from([
             (egui::ViewportId::ROOT, vec!["root error".to_owned()]),
             (sibling, vec!["sibling error".to_owned()]),
@@ -1311,6 +1553,7 @@ fn run_scenario_a(book: ScenarioABook) {
         records: HashMap::new(),
         white: HashMap::new(),
         errors: HashMap::new(),
+        labels: HashMap::new(),
     };
     let held = driver.root(&mut app);
     assert!(
@@ -1440,6 +1683,7 @@ fn multiwindow_scenario_search_result_image_sidecar_reaches_paint() {
             records: HashMap::new(),
             white: HashMap::new(),
             errors: HashMap::new(),
+        labels: HashMap::new(),
         };
         let held = driver.root(&mut app);
         assert!(

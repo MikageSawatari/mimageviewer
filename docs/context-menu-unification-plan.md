@@ -421,13 +421,16 @@ A-only のうち、仮想 item で失われている / いないを分ける。
 ### 5.7 静的 mIV 項目の表示・順序設定（2026-09-13 §1.221）
 
 §1.221 では、統一済み `MenuNode` tree を capability filter 後に一度だけ解決し、native Win32 と
-egui fallback が同じ結果を描く。設定対象は `ContextMenuItemId` catalog にある静的 leaf だけで、
-Root と Open With の階層を分ける。表示名、外部ツール ID、関連付け handler ID は永続 ID に使わない。
+egui fallback が同じ結果を描く。設定対象は `ContextMenuItemId` catalog にある静的項目で、
+Root、Open With、名前で検索の階層を分ける。名前で検索は親自身も静的項目として設定できる。
+表示名、外部ツール ID、関連付け handler ID は永続 ID に使わない。
 
 登録済み外部ツール群、Open With submenu、関連付けアプリ群は元 tree 内の位置と内部順を保つ
 固定 slot とする。設定 UI や共有 payload へ固定 slot ID を公開しない。Windows Shell 群も従来の
 sub-menu / inline 設定を保って末尾へ置く。静的項目を非表示・並べ替えても、固定 slot の位置を
 設定操作で動かさない。
+順序は非表示項目を除く前に全 eligible static slot へ割り当て、その後で表示と子 layout を解決する。
+空 submenu を除いてから区切り線を出し、表示設定によって他項目が固定枠を跨いだり、消えた親の区切り線が漏れたりしない。
 
 未知 / 重複 / 親違いの保存 ID は無視し、欠落した新規 static ID は canonical 位置へ補完する。
 利用不能項目は capability-filtered tree に存在しないため復活しない。最後に既存 `normalize_menu` で

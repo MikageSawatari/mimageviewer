@@ -2285,7 +2285,9 @@ mod tests {
         let report = restore_candidates_at(data.path(), &selected, &[], false);
         assert!(!report.errors.is_empty());
         assert_eq!(report.committed_thumbnail_pins, 1);
-        assert_eq!(pins.lookup(&target_path), Some(source_pin));
+        let restored_pin = pins.lookup(&target_path).unwrap();
+        assert_eq!(restored_pin.source, source_pin);
+        assert_eq!(restored_pin.cover_crop, None);
         let repeated = restore_candidates_at(data.path(), &selected, &[], false);
         assert_eq!(repeated.committed_thumbnail_pins, 0);
     }

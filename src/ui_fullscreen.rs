@@ -30219,7 +30219,9 @@ impl App {
                 // 「DL ボタンを押しても何も起きない」状態になる (実機 FB 2026-06-06)。
                 // メイン update 側は fullscreen 中スキップするので二重描画にはならない。
                 self.show_editing_addon_dialog(ctx);
-                self.show_depth_addon_dialog(ctx);
+                if self.mounted_viewer_owns_depth_dialogs() {
+                    self.show_depth_addon_dialog(ctx);
+                }
 
                 // 編集内容貼り付けの全置換確認は、操作した fullscreen viewport 上に出す。
                 self.show_edit_bundle_paste_confirm_dialog(ctx);
@@ -34256,6 +34258,7 @@ impl App {
 
         let pdf_warm_adoption = crate::test_script::pdf_warm_adoption_checkpoint();
         crate::test_script::TestScriptSnapshot {
+            gamepad: self.gamepad.script_snapshot(self.settings.gamepad_enabled),
             clipboard_capture: {
                 let diagnostics = crate::clipboard_capture::diagnostics::snapshot();
                 let selection = self.clipboard_capture_smoke_selection();
@@ -73816,6 +73819,7 @@ mod tests {
             .replace_surface(crate::app::top_level_grid_view::TopLevelGridSurface::Folder);
         app.list_order = Some(Arc::new(crate::app::ListOrderSnapshot {
             owner: app.virtual_list_context_id(),
+            scope: crate::app::ListOrderScope::Folder,
             entries: vec![crate::app::ListOrderEntry {
                 path: folder,
                 kind: crate::app::ListOrderEntryKind::Folder,

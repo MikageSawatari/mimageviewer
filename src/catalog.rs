@@ -1582,6 +1582,24 @@ impl CatalogDb {
         prefix: &str,
         stamp: Option<(i64, i64)>,
     ) -> rusqlite::Result<Option<(String, CacheEntry)>> {
+        self.load_latest_with_prefix_filtered(prefix, stamp, false)
+    }
+
+    /// Cache-only approximation must not copy a row with a representative crop identity.
+    pub(crate) fn load_latest_uncropped_with_prefix_matching(
+        &self,
+        prefix: &str,
+        stamp: Option<(i64, i64)>,
+    ) -> rusqlite::Result<Option<(String, CacheEntry)>> {
+        self.load_latest_with_prefix_filtered(prefix, stamp, true)
+    }
+
+    fn load_latest_with_prefix_filtered(
+        &self,
+        prefix: &str,
+        stamp: Option<(i64, i64)>,
+        uncropped_only: bool,
+    ) -> rusqlite::Result<Option<(String, CacheEntry)>> {
         let conn = self.phase()?;
         let layout_columns = if self.has_layout_dims_columns {
             "layout_width, layout_height"
@@ -1602,6 +1620,7 @@ impl CatalogDb {
             "SELECT filename, mtime, file_size, thumb_data, source_width, source_height, \
                     {layout_columns}, {proof_columns}, {cover_column} FROM thumbnails \
              WHERE substr(filename, 1, ?1) = ?2 AND (?3 IS NULL OR (mtime = ?3 AND file_size = ?4)) \
+             AND (?5 = 0 OR (instr(filename, '|crop:') = 0 AND instr(filename, '|autocrop:') = 0)) \
              ORDER BY mtime DESC, file_size DESC, filename DESC \
              LIMIT 1"
         );
@@ -1611,7 +1630,8 @@ impl CatalogDb {
                 prefix.chars().count() as i64,
                 prefix,
                 stamp.map(|stamp| stamp.0),
-                stamp.map(|stamp| stamp.1)
+                stamp.map(|stamp| stamp.1),
+                uncropped_only
             ],
             |row| {
                 Ok((

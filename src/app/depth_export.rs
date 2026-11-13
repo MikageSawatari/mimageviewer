@@ -554,6 +554,14 @@ pub(crate) fn record_display(
     });
 }
 
+/// Observe the real child's paint receipt without clearing the previous pass's
+/// snapshot, which the export button needs before the next image is painted.
+#[cfg(test)]
+pub(crate) fn display_painted_this_pass_for_test(ctx: &egui::Context) -> bool {
+    ctx.data(|data| data.get_temp::<DisplaySnapshot>(snapshot_id()))
+        .is_some_and(|display| display.paint_pass == ctx.cumulative_pass_nr())
+}
+
 enum Phase {
     Settings(DepthExportOptions),
     Running {

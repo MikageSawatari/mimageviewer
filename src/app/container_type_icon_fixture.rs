@@ -115,7 +115,11 @@ pub fn draw_container_type_icon_snapshot_fixture(ui: &mut egui::Ui) {
                     ui.label(egui::RichText::new(*label).small());
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(174.0, 122.0), egui::Sense::hover());
-                    let thumb = effective_thumbnail_state(item, &loaded, true);
+                    let thumb = effective_thumbnail_state(
+                        item,
+                        &loaded,
+                        crate::grid_item::ContainerIconKinds::ALL,
+                    );
                     let layout = layout_cell_overlays(
                         ui.painter(),
                         rect,

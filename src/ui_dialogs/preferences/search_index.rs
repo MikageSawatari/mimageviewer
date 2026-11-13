@@ -300,8 +300,13 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     entry!(
         "thumbnail/container-type-icon",
         Thumbnail,
-        "フォルダ・書庫・PDF を種類のアイコンで表示する",
+        "代表画像の代わりに種類のアイコンで表示する",
         [
+            "実フォルダ",
+            "フォルダ",
+            "書庫",
+            "PDF",
+            "EPUB",
             "サムネイル",
             "コンテナ",
             "代表画像",
@@ -310,6 +315,21 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
             "ZIP",
             "RAR",
             "アイコン"
+        ]
+    ),
+    entry!(
+        "thumbnail/cover-auto-crop",
+        Thumbnail,
+        "つながった表紙から表表紙を自動で切り出す (書庫・PDF の本)",
+        [
+            "表紙",
+            "背",
+            "裏表紙",
+            "切り出し",
+            "範囲",
+            "綴じ方向",
+            "書庫",
+            "PDF"
         ]
     ),
     entry!(
@@ -1335,6 +1355,25 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["履歴件数", "最大", "記憶"]
     ),
     entry!(
+        "resume/search-input-history-enabled",
+        PlaybackResume,
+        "検索欄の入力履歴を保存する",
+        [
+            "検索",
+            "履歴",
+            "入力履歴",
+            "history",
+            "コンテナ",
+            "Everything"
+        ]
+    ),
+    entry!(
+        "resume/search-input-history-clear",
+        PlaybackResume,
+        "検索欄の入力履歴をすべて消去",
+        ["検索", "履歴", "入力履歴", "history", "削除", "クリア"]
+    ),
+    entry!(
         "susie/enabled",
         SusiePlugins,
         "Susie 画像プラグインを有効にする",
@@ -2260,18 +2299,33 @@ mod tests {
     }
 
     #[test]
-    fn thumb_container_type_icon_only_search_finds_its_anchor() {
-        for query in ["代表画像 アイコン", "コンテナ", "フォルダ 種類", "書庫 PDF"]
-        {
+    fn thumb_cover_auto_crop_search_finds_its_anchor() {
+        for query in ["表表紙", "表紙 切り出し", "綴じ方向 書庫"] {
+            let entry = search_preferences(query, test_tree_position)
+                .into_iter()
+                .find(|entry| entry.anchor == "thumbnail/cover-auto-crop")
+                .unwrap_or_else(|| panic!("missing automatic cover crop setting for {query}"));
+            assert_eq!(entry.page, PreferencesPage::Thumbnail);
+        }
+        assert!(PAGES_SOURCE.contains("anchored(ui, state, \"thumbnail/cover-auto-crop\""));
+    }
+
+    #[test]
+    fn thumb_container_icon_kinds_search_finds_its_anchor() {
+        for query in [
+            "代表画像 アイコン",
+            "コンテナ",
+            "実フォルダ",
+            "フォルダ 種類",
+            "書庫 PDF",
+            "EPUB",
+        ] {
             let entry = search_preferences(query, test_tree_position)
                 .into_iter()
                 .find(|entry| entry.anchor == "thumbnail/container-type-icon")
                 .unwrap_or_else(|| panic!("missing container icon setting for {query}"));
             assert_eq!(entry.page, PreferencesPage::Thumbnail);
-            assert_eq!(
-                entry.title,
-                "フォルダ・書庫・PDF を種類のアイコンで表示する"
-            );
+            assert_eq!(entry.title, "代表画像の代わりに種類のアイコンで表示する");
         }
         assert!(PAGES_SOURCE.contains("anchored(ui, state, \"thumbnail/container-type-icon\""));
     }
@@ -2313,6 +2367,25 @@ mod tests {
                         && entry.anchor == "thumbnail/details-name-colors"),
                 "missing name-color result: {query}"
             );
+        }
+    }
+
+    #[test]
+    fn search_input_history_search_finds_save_and_clear_controls() {
+        let placed = anchors_in_pages_source(PAGES_SOURCE);
+        for query in ["検索", "履歴", "入力履歴", "history"] {
+            let found = search_preferences(query, test_tree_position);
+            for anchor in [
+                "resume/search-input-history-enabled",
+                "resume/search-input-history-clear",
+            ] {
+                assert!(
+                    found.iter().any(|entry| entry.anchor == anchor
+                        && entry.page == PreferencesPage::PlaybackResume),
+                    "missing search history control for {query}: {anchor}"
+                );
+                assert!(placed.contains(&anchor));
+            }
         }
     }
 }

@@ -72,8 +72,9 @@ fn assert_modal_layers(viewer: &RootDepthViewer) {
         egui::Order::Foreground,
         egui::Id::unique("depth_parallax_panel"),
     );
-    viewer.ctx.memory(|memory| {
-        let layers: Vec<_> = memory.layer_ids().collect();
+    {
+        let evidence = viewer.modal_layers();
+        let layers = evidence.layers;
         let at = |layer| {
             layers
                 .iter()
@@ -82,10 +83,10 @@ fn assert_modal_layers(viewer: &RootDepthViewer) {
         };
         assert!(at(panel) < at(backdrop));
         assert_eq!(at(backdrop) + 1, at(dialog));
-        assert_eq!(memory.top_modal_layer(), Some(backdrop));
-        assert!(!memory.allows_interaction(panel));
-        assert!(memory.allows_interaction(dialog));
-    });
+        assert_eq!(evidence.top_modal, Some(backdrop));
+        assert!(!evidence.panel_interactive);
+        assert!(evidence.dialog_interactive);
+    }
 }
 
 fn background(
@@ -130,9 +131,13 @@ fn key(key: egui::Key, modifiers: egui::Modifiers) -> Vec<egui::Event> {
 fn depth_main_window_export_real_root_modal_owns_all_phases_and_reopen_inputs() {
     let _input = crate::key_input::lock_test_input();
     let _foreground = crate::test_native_focus::scoped(1, 1, true);
-    for batched in [false, true] {
+    for (linked, batched) in [(false, false), (false, true), (true, false), (true, true)] {
         let mut app = setup_app_for_test();
-        let mut viewer = RootDepthViewer::new(&mut app);
+        let mut viewer = if linked {
+            RootDepthViewer::linked(&mut app)
+        } else {
+            RootDepthViewer::new(&mut app)
+        };
         transparent_source(&mut app);
         viewer.ready(&mut app);
         let handle = crate::remote_ipc::session::SessionHandle::new();
@@ -391,4 +396,127 @@ fn depth_main_window_export_root_small_geometry_at_100_and_200_percent() {
         }
     }
     crate::key_input::clear_test_frame();
+}
+
+#[test]
+fn depth_linked_dialogs_draw_only_in_main_context_and_return_to_root_after_close() {
+    std::thread::spawn(|| {
+        let _input = crate::key_input::lock_test_input();
+        for addon in [false, true] {
+            let mut app = setup_app_for_test();
+            let mut viewer = RootDepthViewer::linked(&mut app);
+            viewer.ready(&mut app);
+            let render = app.wgpu_render_state.clone();
+            let sibling = app.build_window_context_for_test(88_940, |owner| {
+                crate::app::depth_view_tests::install_pages(owner, &viewer.ctx);
+                owner.wgpu_render_state = render.clone();
+                crate::app::source_texture_test_support::seed(owner, &viewer.ctx, 0);
+                owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+                owner.detached_viewer_independent_active = true;
+                owner.native_video_in_window_active = false;
+                owner.set_fs_exclusive_view(FsExclusiveView::None, "independent_dialog_fixture");
+            });
+            viewer.frame(&mut app, vec![]);
+            viewer.frame(&mut app, vec![]);
+            let (heading, finished, cancel) = if addon {
+                app.set_fs_exclusive_view(FsExclusiveView::None, "missing_model_linked_entry");
+                app.depth_setup
+                    .set_status_for_test(crate::addon::AddonStatus::Missing);
+                viewer.frame(&mut app, key(egui::Key::D, egui::Modifiers::NONE));
+                assert!(app.depth_setup.dialog_open_for_test());
+                ("3D 写真の追加モデル", None, None)
+            } else {
+                let export = viewer.label("書き出し…").center();
+                viewer.click(&mut app, export, false);
+                assert!(app.depth_export_dialog_open());
+                let (job, events, cancel) = DepthExportJob::controlled_for_test();
+                app.depth_export_operation.as_mut().unwrap().phase = Phase::Running {
+                    job,
+                    completed: 1,
+                    total: 3,
+                    status: RunStatus::Active,
+                };
+                ("3D 写真の書き出し状況", Some(events), Some(cancel))
+            };
+            viewer.frame(&mut app, vec![]);
+            viewer.frame(&mut app, vec![]);
+            viewer.label(heading);
+            app.with_viewer_context(sibling, |owner| {
+                assert!(!owner.mounted_viewer_owns_depth_dialogs());
+                let before = viewer.child_passes();
+                viewer.frame(owner, vec![]);
+                viewer.frame(owner, vec![]);
+                assert!(
+                    viewer.child_passes() > before,
+                    "independent body really ran"
+                );
+                assert!(
+                    viewer.text_rects(heading).is_empty(),
+                    "main dialog leaked into independent child"
+                );
+            })
+            .unwrap();
+            assert!(app.mounted_viewer_owns_depth_dialogs());
+            viewer.frame(&mut app, vec![]);
+            viewer.label(heading);
+            app.close_fullscreen();
+            assert!(app.fullscreen_idx.is_none());
+            assert!(app.main_window_should_draw_export_dialogs());
+            if let Some(cancel) = cancel {
+                assert!(cancel.load(std::sync::atomic::Ordering::Acquire));
+                assert!(matches!(
+                    app.depth_export_operation.as_ref().unwrap().phase,
+                    Phase::Running {
+                        status: RunStatus::Stopping,
+                        ..
+                    }
+                ));
+            }
+            // Run the existing ROOT dialog drawing owner after its viewer is closed.
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            let draw_root = |app: &mut App| {
+                let output = ctx.run_pass(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1093., 614.),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        if addon {
+                            app.show_depth_addon_dialog(ctx);
+                        } else {
+                            app.draw_depth_export_dialog(ctx);
+                        }
+                    },
+                );
+                fn text(shape: &egui::Shape, label: &str) -> bool {
+                    match shape {
+                        egui::Shape::Text(t) => t.galley.text() == label,
+                        egui::Shape::Vec(shapes) => shapes.iter().any(|s| text(s, label)),
+                        _ => false,
+                    }
+                }
+                let visible = output.shapes.iter().any(|s| text(&s.shape, heading));
+                output.drop_without_applying_deltas();
+                visible
+            };
+            draw_root(&mut app);
+            assert!(draw_root(&mut app), "closed viewer dialog returns to ROOT");
+            if let Some(events) = finished {
+                events.send(DepthExportEvent::Cancelled).unwrap();
+                app.poll_depth_export();
+                assert!(matches!(
+                    app.depth_export_operation.as_ref().unwrap().phase,
+                    Phase::Finished { .. }
+                ));
+                assert!(draw_root(&mut app));
+            }
+        }
+        crate::key_input::clear_test_frame();
+    })
+    .join()
+    .unwrap();
 }

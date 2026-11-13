@@ -11,6 +11,7 @@ impl App {
             // Popups have independent Uis; disabling their anchor cannot revoke
             // an already open menu. Submenus keep a separate open-item owner.
             egui::Popup::close_all(ctx);
+            crate::ui_history_field::close(ctx);
             ctx.data_mut(|data| data.remove_by_type::<egui::containers::menu::MenuState>());
         }
         self.main_chrome_pointer_was_blocked = blocked;

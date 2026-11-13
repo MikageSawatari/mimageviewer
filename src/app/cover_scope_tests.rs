@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 
 fn request(
     item: &GridItem,
-    pins: &HashMap<String, FolderPinSource>,
+    pins: &HashMap<String, crate::folder_thumb_pins::FolderPin>,
     converted: &HashMap<String, ConvertedArchiveSourceState>,
     visibility: &FileTypeVisibility,
 ) -> LoadRequest {
@@ -178,7 +178,8 @@ fn zip_directory_exact_pin_uses_selected_page_scope() {
         FolderPinSource::ZipEntry {
             zip_rel: String::new(),
             entry: "outside/pinned.png".into(),
-        },
+        }
+        .into(),
     )]);
     let req = request(
         &item,
@@ -231,7 +232,7 @@ fn zip_pdf_and_epub_exact_pins_do_not_include_other_pages() {
                 crate::edit_source::page_key_for_pdf(&path, 0),
             )
         };
-        let pins = HashMap::from([(crate::path_key::normalize_keep_drive(&path), source)]);
+        let pins = HashMap::from([(crate::path_key::normalize_keep_drive(&path), source.into())]);
         let req = request(
             &item,
             &pins,
@@ -263,7 +264,8 @@ fn folder_pin_of_converted_archive_covers_original_and_cache() {
         FolderPinSource::File {
             rel: "book.rar".into(),
             kind: FileKind::ConvertibleArchive,
-        },
+        }
+        .into(),
     )]);
     let req = request(
         &GridItem::Folder(folder.clone()),
@@ -317,7 +319,8 @@ fn nested_archive_pin_fallback_unions_folder_cover_and_propagates_refresh() {
         FolderPinSource::ZipEntry {
             zip_rel: "book.cbz".into(),
             entry: "inner.zip/page.png".into(),
-        },
+        }
+        .into(),
     )]);
     let visibility = FileTypeVisibility {
         excluded_extensions: ["zip".into()].into_iter().collect(),
@@ -362,7 +365,8 @@ fn pending_archive_with_policy_fallback_has_no_refreshable_scope() {
         FolderPinSource::ZipEntry {
             zip_rel: String::new(),
             entry: "chapter/page.png".into(),
-        },
+        }
+        .into(),
     )]);
     let converted = HashMap::from([(
         crate::path_key::normalize_keep_drive(&source),

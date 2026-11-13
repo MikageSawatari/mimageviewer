@@ -6,6 +6,10 @@ use top_level_grid_view::{TopLevelGridSurface, TopLevelSearchView};
 #[path = "list_order_ratingnav649_tests.rs"]
 mod ratingnav649;
 
+#[cfg(test)]
+#[path = "list_order_everything_tests.rs"]
+mod everything;
+
 fn install_rows(app: &mut App, folder: &Path, rows: Vec<GridItem>) {
     app.current_folder = Some(folder.to_path_buf());
     app.archive_source_override = None;
@@ -289,10 +293,17 @@ fn list_order_enter_and_explicit_archive_requests_capture_even_if_open_cannot_fi
 }
 
 #[test]
-fn list_order_capture_excluded_surfaces_preserve_the_previous_snapshot() {
+fn list_order_capture_excluded_surfaces_and_metadata_preserve_the_previous_snapshot() {
     let mut app = setup_app();
     let folder = app.tmp.path().join("excluded");
     let snapshot = capture_fixture(&mut app, &folder);
+    // Search(Global) alone is insufficient: accepted Everything is now supported,
+    // whereas an active Metadata search must retain the ordinary folder snapshot.
+    app.global_search.active = true;
+    assert!(matches!(
+        app.global_search.accepted,
+        crate::global_search_ui::SearchAccepted::Metadata { .. }
+    ));
     let surfaces = [
         TopLevelGridSurface::DriveList,
         TopLevelGridSurface::Search(TopLevelSearchView::Global),

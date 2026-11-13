@@ -363,7 +363,8 @@ mod tests {
             crate::folder_thumb_pins::FolderPinSource::ZipEntry {
                 zip_rel: String::new(),
                 entry: "cover.png".into(),
-            },
+            }
+            .into(),
         );
         assert!(matches!(
             app.release_check_catalog_target(&item),

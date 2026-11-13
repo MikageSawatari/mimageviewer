@@ -9,6 +9,7 @@
 
 mod about;
 pub(crate) mod agent_integration;
+mod clear_history;
 pub(crate) mod depth_addon;
 mod model_addon;
 #[doc(hidden)]
@@ -24,6 +25,7 @@ pub(crate) mod collections;
 pub mod content_restore;
 pub(crate) mod context_menu;
 mod context_shortcuts;
+pub(crate) mod cover_crop;
 pub(crate) mod editing_addon;
 pub(crate) mod epub_batch_convert;
 pub(crate) mod epub_convert;

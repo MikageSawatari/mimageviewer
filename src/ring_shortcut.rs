@@ -549,6 +549,8 @@ pub enum RingActionId {
     OpenPreferences,
     OpenOperationCustomize,
     ClearRecentFolders,
+    ClearSearchInputHistory,
+    ClearReadingHistory,
     ClearQuickFolderSlots,
     CycleFavorite,
     OpenFavorite1,
@@ -1288,6 +1290,8 @@ impl RingActionId {
             Self::OpenPreferences => "open_preferences",
             Self::OpenOperationCustomize => "open_operation_customize",
             Self::ClearRecentFolders => "clear_recent_folders",
+            Self::ClearSearchInputHistory => "clear_search_input_history",
+            Self::ClearReadingHistory => "clear_reading_history",
             Self::ClearQuickFolderSlots => "clear_quick_folder_slots",
             Self::CycleFavorite => "cycle_favorite",
             Self::CollectionPrev => "collection_prev",
@@ -1505,6 +1509,8 @@ impl RingActionId {
             "open_preferences" => Self::OpenPreferences,
             "open_operation_customize" => Self::OpenOperationCustomize,
             "clear_recent_folders" => Self::ClearRecentFolders,
+            "clear_search_input_history" => Self::ClearSearchInputHistory,
+            "clear_reading_history" => Self::ClearReadingHistory,
             "clear_quick_folder_slots" => Self::ClearQuickFolderSlots,
             "cycle_favorite" => Self::CycleFavorite,
             "collection_prev" => Self::CollectionPrev,
@@ -1647,6 +1653,8 @@ impl RingActionId {
             Self::OpenPreferences => "環境設定を開く",
             Self::OpenOperationCustomize => "操作カスタマイズを開く",
             Self::ClearRecentFolders => "最近開いたフォルダ履歴をクリア",
+            Self::ClearSearchInputHistory => "検索欄の入力履歴をすべて消去",
+            Self::ClearReadingHistory => "閲覧履歴をすべてクリア",
             Self::ClearQuickFolderSlots => "A/B の記憶した場所と一覧位置をクリア",
             Self::CycleFavorite => "お気に入り巡回",
             Self::CollectionPrev
@@ -1843,6 +1851,8 @@ impl RingActionId {
                     | Self::OpenPreferences
                     | Self::OpenOperationCustomize
                     | Self::ClearRecentFolders
+                    | Self::ClearSearchInputHistory
+                    | Self::ClearReadingHistory
                     | Self::ClearQuickFolderSlots
                     | Self::AddToBook
                     | Self::AddToCollection
@@ -2005,6 +2015,8 @@ impl RingActionId {
                 Self::OpenPreferences,
                 Self::OpenOperationCustomize,
                 Self::ClearRecentFolders,
+                Self::ClearSearchInputHistory,
+                Self::ClearReadingHistory,
                 Self::ClearQuickFolderSlots,
                 Self::AddToBook,
                 Self::AddToCollection,
@@ -3973,6 +3985,16 @@ mod tests {
     #[test]
     fn history_clear_actions_round_trip_and_are_grid_only() {
         let samples = [
+            (
+                RingActionId::ClearSearchInputHistory,
+                "clear_search_input_history",
+                "検索欄の入力履歴をすべて消去",
+            ),
+            (
+                RingActionId::ClearReadingHistory,
+                "clear_reading_history",
+                "閲覧履歴をすべてクリア",
+            ),
             (
                 RingActionId::ClearRecentFolders,
                 "clear_recent_folders",

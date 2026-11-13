@@ -31,13 +31,41 @@ channel/queue/cancelとpool catalogの型は同じviewer contextで移譲・退�
 
 `previous_run_diagnostics` は main 所有の終了状態と専用 writer を持ち、通常 GUI の first admission 後だけ開始する。`GuiRunSession` は single-instance guard を最終保存まで保持する。前回資料の読取り・活動中のAI/GPU checkpoint・置換保存・保持整理はworker、UIは不変な許可項目本文を非blockingで受け取る。panicの小sinkは今回参照の保存後に公開し、nativeはrun相関、device-lostは専用atomic latchからworkerで記録する。`ui_previous_run_notice`は本文の表示と明示コピーを担当する。現役DisplayのORT Failedは既存の結果採用/失敗key寿命で一度だけ所有contextへError feedbackを出し、固定分類と数値だけの詳細をhover・明示コピーへ渡す。通常/startupログと終了状態の保存後に、必要な制御エラーのnative通知を行う。設定DBへの項目追加・回復処理はない。採取・保存範囲と制約は [設計](ai-crash-655-investigation.md#確定設計-2026-10-30) を参照。
 
-## 通常フォルダ一覧の表示順ナビゲーション (§1.444)
+## 通常フォルダ・Everything 結果一覧の表示順ナビゲーション (§1.444、§1.682)
 
-`app/list_order_navigation` は、main の通常フォルダ一覧から本を開く受付時の本の行だけを
-`ListOrderSnapshot` として凍結する。`ViewerContextBundle` が列と取得元 context id を持ち、
-現在位置は表示中の論理 source から導く。fork の子には渡さず、promote 後の旧 main は id の照合で使えない。
+`app/list_order_navigation` は、main の通常フォルダ一覧、または Everything Root の結果そのものから本を開く受付時の本の行だけを
+`ListOrderSnapshot` として凍結する。`ViewerContextBundle` が 1 つの列・取得元 context id・
+`Folder` / `Everything { run }` scope を持つ。Everything の run は accepted dataset のもの。
+現在位置は通常フォルダなら表示中の論理 source、Everything なら `PhysicalChild.logical_source` の完全一致と
+現在の場所の所属確認で導く。一覧順の要求だけが移動先行を search origin に載せ、成功採用で検索側の帰路基準を揃える。
+fork の子には渡さず、promote 後の旧 main は id の照合で使えない。
 `FolderNavMode::ListOrder` の行き先選択だけを worker に足し、停止判定・事前走査・採用・本の再表示は
 既存の Fullscreen フォルダナビゲーションと共有する。[仕様と検証](list-order-book-navigation-plan.md)。
+検索中の場所ジャンプ（§1.688）は対象入口を型付き要求へ揃え、dispatch 時の admission 後、既存の
+`ExitTemporaryView` の成功採用境界で検索を終了する。[検索結果ナビゲーション設計](search-result-navigation-682-688-plan.md)。
+追補 §9・§10 はツールバーのお気に入り・ピン留め本、アドレス欄の Enter、利用者のフォルダペイン操作も
+成功時終了へそろえる。アドレス欄は dispatch 時、ペインは受付時に検索 owner を判定し、内部の pane scan は変更しない。
+検索外の経路は維持し、検索中の移動成功後は結果を復元せず、履歴 Back は検索前の場所へ戻る。
+追補 §11 は §9・§10 で残した例外を改訂し、メニューバー・キー・リング・ゲームパッド等の全お気に入り入口を
+ツールバーと同じ受付・成功時終了へそろえる。メニューバーの本棚も `LocationJumpTarget::BooksRoot` へ渡す。
+失敗・取消・stale では結果と選択を保つ。ペインの Enter は検索の有無によらずフォーカス所有に従い、一覧へ漏らさない。
+アドレス欄で移れる親もない場合は通知し、存在しない子から既存の親へ移る従来の解決は維持する。
+追補 §12 は保存済みの本・コレクションを開く入口も対象にする。追加先・管理順の番号/前後・固定ボタン・管理画面からの
+明示 open は、検索中なら移動先の成功採用で検索を終え、失敗・取消・stale は検索結果と選択を保持する。
+検索外の既存 open・待機/取消・番号解決・本棚順は維持する。検索結果の行から本やフォルダを開く操作は検索を継続する。
+ファイルメニュー/`GlobalOpenFolder` の「フォルダを開く」も、検索中だけ同じ成功時終了へ渡し、検索なしは旧 Direct を維持する。
+saved-group は source を `Plain(既存lease)` / `Search(受付時MainListNavigation)` の単一 owner とし、
+Search の surface proof/switch sequence を poll・ready・adopt まで照合する。Book は既存 prepared scan、Collection は
+既存 History prepare に同じ要求を渡し、既存の成功採用だけが検索を退役する。
+検索内の子から明示移動する要求は currentness 用の child route を保ち、成功採用時にだけ履歴記録用の検索前 route を導く。
+一致する return origin の保存 route を保ち、保存が空/無い場合だけ元 location の root へ正規化する。
+§12.3 改訂1 の所有境界修正では、検索中の `ExitTemporaryView` の成功採用で既存の出発 context 移譲を
+検索退役・facet/rows の採用より先に通す。移譲済みの事実は採用内の局所の型で installer へ渡し、
+非冪等な移譲を二重に呼ばない。source 履歴は移譲前に捕捉し、移譲後に旧 context の proof を再検証しない。
+Collection の採用直前 locked 検査と同じ binding の `NotNeeded`、検索なし/他 purpose の順序は維持する。
+App field・bundle field・registry 本体・detached 述語・viewport は変更しない。bundle 所有の Metadata / Everything 等は
+移譲先へ保持するが、App 共有の `favsearch` / `tag_view` owner が bundle に無い既存の欠けは今回未対応である。
+Smart root の `Direct(Navigation)` の既存順序は変更しない。実装・検証記録とこの範囲の詳細は設計書 §8.14・§12.3 を参照。
 
 ## 本のitems生成境界（§1.242 G1）
 
@@ -125,10 +153,28 @@ IPCのHWND/send/pump/packetは検索ごとの`everything-ipc` runが一括所有
 完了event/取消eventで待つ。native sendが遅くても取消は先に返し、旧runは有限deadlineで自然退役する。
 [遅いsendと取消の契約](everything-search-plan.md#17-wm_copydataの遅い送信と取消2026-10-12)。
 raw10,000件・明示送信・完了後一括採用・mainの取消可能modalを使う。
-新設定field/DB/schema/検索履歴/Remote APIは追加せず、query/result一覧は永続化・診断ログへ保存しない。
+Everything 専用DB/schema/Remote APIは追加せず、result一覧は永続化しない。query/result一覧は診断ログへ保存しない。
+検索語の永続化は §1.756 の共通入力履歴に従う（下記）。
 PDF共有poolの失効は先行改修 `4510346f5` / master `c1e66f589` のviewer-context ownerを使う。
 最新実装の独立レビューと自動/実機検証の受入は未完了。
 [仕様・履歴・検証台帳](everything-search-plan.md#14-実装記録2026-10-12検証待ち)。
+
+## 検索入力履歴と履歴欄の所有（§1.756）
+
+`Settings.search_input_history` が `PinnedSearchKind` ごとに最近 20 件を持ち、常設欄と一時バーで共有する。
+保存可否は `save_search_input_history`（既定 true）。通常の settings.db 保存へ載せ、新しいファイル・I/O・workerは足さない。
+環境設定の OK は live の履歴を引き継ぎ、オフなら現行履歴を空にする。設定の持ち運びでは履歴本体を除外する。
+世代バックアップは復旧用途として維持し、消去前の語が残ることを公開文書へ明記する。
+
+`ui_history_field` は IME helper を通す TextEdit に▼を内蔵する共有部品で、検索欄とフォルダアドレス欄が使う。
+viewport ごとの単一 `HistoryPopupState` が owner・選択位置・描画 pass を所有し、egui Popup と状態を二重化しない。
+部品は一覧の表示と選択だけを扱い、保存・検索実行・フォルダ移動は各呼び出し側が所有する。
+未フォーカス欄の▼はAppの既存pending focus claimに接続し、部品内に別の予約は持たない。
+IME helperが予約を描画前の実フォーカスへ渡し、本体facadeが同じ入力ownerのphaseを更新する。
+明示的な確定では実フォーカスと同viewport/widgetの復帰契約をIME側で一緒に終了する。
+検索履歴の記録は共通 submit の受付と、App update の一箇所で直前 pass の検索入力フォーカスから判定する通常離脱だけ。
+非同期結果の到着や個々の欄の lost_focus では記録しない。ログ・Remote・MCPの出力境界には履歴を公開しない。
+詳細は [入力履歴の設計](search-input-history-plan.md)。
 
 ## PDF render epochのviewer-context所有（§1.377）
 
@@ -727,6 +773,8 @@ detachedは既存の共通パネルを使い、述語・viewport・bundleの交�
 | モジュール | 役割 |
 | --- | --- |
 | `search_query.rs` | 検索クエリのトークナイザ + マッチャ (AND / OR / NOT / `"..."` フレーズ、`MatchMode`)。Ctrl+S/F/G共通、Everythingは通さない |
+| `search_request.rs` | 既存検索欄の渡し先と文字列、項目の名前生成、入力欄 id に結び付いた全選択の一時印。新しい永続データは持たない |
+| `app/search_request.rs` | 一覧の「名前で検索」と3つの Grid KeyAction の共通受付・入力受け渡し。既存セッションを開き、Enterまで検索を実行しない |
 | `search_norm.rs` | `normalize_for_match` — ingest / クエリ / post-filter で共有する唯一の正規化関数 (lowercase) |
 | `search_index_db.rs` | Ctrl+S 用 `search_index.db` (お気に入り配下のフォルダ / ZIP / PDF / 動画名) |
 | `fts_index.rs` | Tantivy 0.26 ラッパ。`IndexDoc` / `Fields` / `QueryFilters` / `build_bigram_and_query` / `search_page`。bigram tokenizer + lower_caser |

@@ -2111,6 +2111,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let interrupt = Arc::new(super::super::InterruptState::default());
         let bridge = RunnerBridge {
+            gamepad: super::super::gamepad_input::WorkerState::default(),
             tx,
             snapshot: Arc::clone(&snapshot),
             interrupt: Arc::clone(&interrupt),

@@ -488,6 +488,8 @@ fn section1708_stale_pinned_lost_focus_does_not_submit_another_fields_enter() {
                         focus == Some(kind),
                         enter,
                         false,
+                        None,
+                        false,
                     );
                     if kind == Kind::Local {
                         local_lost_focus = response.inner.input.lost_focus();
