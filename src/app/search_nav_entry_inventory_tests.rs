@@ -219,6 +219,8 @@ fn key_entry(action: KeyAction) -> Entry {
         | HelpShowContextShortcuts
         | GridManageFavorites
         | GridClearRecentFolders
+        | GridClearSearchInputHistory
+        | GridClearReadingHistory
         | GridClearQuickFolderSlots
         | GridTogglePinnedTag1
         | GridTogglePinnedTag2

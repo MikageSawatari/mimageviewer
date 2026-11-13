@@ -1826,6 +1826,8 @@ fn grid_ring_action_allowed_during_refresh(action: &RingActionId) -> bool {
                 | RingActionId::OpenPreferences
                 | RingActionId::OpenOperationCustomize
                 | RingActionId::ClearRecentFolders
+                | RingActionId::ClearSearchInputHistory
+                | RingActionId::ClearReadingHistory
                 | RingActionId::ClearQuickFolderSlots
                 | RingActionId::CycleFavorite
                 | RingActionId::OpenLocationDriveList
@@ -1946,6 +1948,8 @@ fn ring_location_action_for_key_action(action: KeyAction) -> Option<RingActionId
 fn ring_history_clear_action_for_key_action(action: KeyAction) -> Option<RingActionId> {
     Some(match action {
         KeyAction::GridClearRecentFolders => RingActionId::ClearRecentFolders,
+        KeyAction::GridClearSearchInputHistory => RingActionId::ClearSearchInputHistory,
+        KeyAction::GridClearReadingHistory => RingActionId::ClearReadingHistory,
         KeyAction::GridClearQuickFolderSlots => RingActionId::ClearQuickFolderSlots,
         _ => return None,
     })
@@ -8271,6 +8275,14 @@ impl App {
             }
             RingActionId::OpenOperationCustomize if context == RingShortcutContext::Grid => {
                 self.show_operation_customize = true;
+                None
+            }
+            RingActionId::ClearSearchInputHistory if context == RingShortcutContext::Grid => {
+                self.execute_clear_search_input_history();
+                None
+            }
+            RingActionId::ClearReadingHistory if context == RingShortcutContext::Grid => {
+                self.request_clear_reading_history();
                 None
             }
             RingActionId::ClearRecentFolders if context == RingShortcutContext::Grid => {

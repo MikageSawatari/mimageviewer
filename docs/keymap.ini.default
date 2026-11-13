@@ -198,6 +198,8 @@
 # GridOpenLocationPictures = none ; ピクチャを開く
 # GridOpenLocationDownloads = none ; ダウンロードを開く
 # GridClearRecentFolders = none ; 最近開いたフォルダ履歴をクリアする
+# GridClearSearchInputHistory = none ; 検索欄の入力履歴をすべて消去
+# GridClearReadingHistory = none ; 閲覧履歴をすべてクリア
 # GridClearQuickFolderSlots = none ; A/B の記憶した場所と一覧位置をクリアする
 # GridTogglePinnedTag1 = none ; ピン留めタグ1を付与/解除する
 # GridTogglePinnedTag2 = none ; ピン留めタグ2を付与/解除する

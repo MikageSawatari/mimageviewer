@@ -2543,13 +2543,31 @@ impl App {
         if !requested {
             return;
         }
-        let count = self.settings.search_input_history.len();
-        self.settings.search_input_history.clear();
-        if let Some(state) = self.pref_state.as_mut() {
-            state.settings.search_input_history.clear();
-            state.search_input_history_entry_count = 0;
-            state.search_input_history_clear_result =
-                Some(format!("検索欄の入力履歴を {count} 件消去しました。"));
+        self.clear_search_input_history();
+    }
+
+    fn apply_reading_history_clear_request(&mut self) {
+        let mut clear_reading_history_requested = false;
+        if let Some(ps) = self.pref_state.as_mut() {
+            if ps.reading_history_clear_requested {
+                ps.reading_history_clear_requested = false;
+                clear_reading_history_requested = true;
+            }
+        }
+        if clear_reading_history_requested && let Some(result) = self.clear_reading_history() {
+            if let Some(ps) = self.pref_state.as_mut() {
+                match result {
+                    Ok((deleted, remaining)) => {
+                        ps.reading_history_entry_count = remaining;
+                        ps.reading_history_clear_result =
+                            Some(format!("閲覧履歴を {deleted} 件削除しました。"));
+                    }
+                    Err(err) => {
+                        ps.reading_history_clear_result =
+                            Some(format!("閲覧履歴の削除に失敗しました: {err}"));
+                    }
+                }
+            }
         }
     }
 
@@ -3725,41 +3743,7 @@ impl App {
         self.apply_search_input_history_clear_request();
 
         // 履歴と復元ページ: 閲覧履歴クリア (one-shot)。
-        let mut clear_reading_history_requested = false;
-        if let Some(ps) = self.pref_state.as_mut() {
-            if ps.reading_history_clear_requested {
-                ps.reading_history_clear_requested = false;
-                clear_reading_history_requested = true;
-            }
-        }
-        if clear_reading_history_requested && self.admit_book_append_followup_mutation() {
-            let result = match self.reading_history_db.as_ref() {
-                Some(db) => match db.clear_all() {
-                    Ok(deleted) => {
-                        crate::logger::log(format!("[reading_history] cleared {deleted} entries"));
-                        Ok((deleted, db.count()))
-                    }
-                    Err(e) => Err(format!("{e}")),
-                },
-                None => Err("閲覧履歴 DB を開けませんでした".to_string()),
-            };
-            if let Some(ps) = self.pref_state.as_mut() {
-                match result {
-                    Ok((deleted, remaining)) => {
-                        ps.reading_history_entry_count = remaining;
-                        ps.reading_history_clear_result =
-                            Some(format!("閲覧履歴を {deleted} 件削除しました。"));
-                    }
-                    Err(err) => {
-                        ps.reading_history_clear_result =
-                            Some(format!("閲覧履歴の削除に失敗しました: {err}"));
-                    }
-                }
-            }
-            if self.items_are_reading_history_view {
-                self.enter_reading_history();
-            }
-        }
+        self.apply_reading_history_clear_request();
 
         // 「TensorRT パックをダウンロード」ボタンが押されていたら、環境設定ダイアログを
         // 閉じて TRT install dialog を開く (= ユーザーは設定変更を保存しなくてもインストール
@@ -4544,6 +4528,48 @@ mod tests {
             draft.search_input_history.entries(Kind::Local),
             ["later record"]
         );
+    }
+
+    #[test]
+    fn reading_history_preferences_clear_keeps_result_and_is_one_shot() {
+        use crate::reading_history_db::{ReadingHistoryEntry, ReadingHistoryKind};
+        let mut app = crate::app::setup_app_for_test();
+        let entry = ReadingHistoryEntry::new(
+            std::path::PathBuf::from("C:/preferences-clear/book.zip"),
+            ReadingHistoryKind::Zip,
+            None,
+            "book.zip".into(),
+            Some(1),
+            Some(2),
+        );
+        app.reading_history_db
+            .as_ref()
+            .unwrap()
+            .upsert(entry.clone(), 1000)
+            .unwrap();
+        app.open_preferences_page(PreferencesPage::PlaybackResume);
+        app.ensure_preferences_state();
+        app.pref_state
+            .as_mut()
+            .unwrap()
+            .reading_history_clear_requested = true;
+        app.apply_reading_history_clear_request();
+        assert_eq!(app.reading_history_db.as_ref().unwrap().count(), 0);
+        assert!(!app.reading_history_clear_dialog_visible());
+        let state = app.pref_state.as_ref().unwrap();
+        assert!(!state.reading_history_clear_requested);
+        assert_eq!(state.reading_history_entry_count, 0);
+        assert_eq!(
+            state.reading_history_clear_result.as_deref(),
+            Some("閲覧履歴を 1 件削除しました。")
+        );
+        app.reading_history_db
+            .as_ref()
+            .unwrap()
+            .upsert(entry, 1000)
+            .unwrap();
+        app.apply_reading_history_clear_request();
+        assert_eq!(app.reading_history_db.as_ref().unwrap().count(), 1);
     }
 
     #[test]

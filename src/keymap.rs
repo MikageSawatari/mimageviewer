@@ -1589,6 +1589,8 @@ pub enum KeyAction {
     GridOpenLocationPictures,
     GridOpenLocationDownloads,
     GridClearRecentFolders,
+    GridClearSearchInputHistory,
+    GridClearReadingHistory,
     GridClearQuickFolderSlots,
     GridTogglePinnedTag1,
     GridTogglePinnedTag2,
@@ -2203,6 +2205,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridOpenLocationPictures,
     KeyAction::GridOpenLocationDownloads,
     KeyAction::GridClearRecentFolders,
+    KeyAction::GridClearSearchInputHistory,
+    KeyAction::GridClearReadingHistory,
     KeyAction::GridClearQuickFolderSlots,
     KeyAction::GridTogglePinnedTag1,
     KeyAction::GridTogglePinnedTag2,
@@ -4472,6 +4476,8 @@ impl KeyAction {
             GridOpenLocationPictures => "GridOpenLocationPictures",
             GridOpenLocationDownloads => "GridOpenLocationDownloads",
             GridClearRecentFolders => "GridClearRecentFolders",
+            GridClearSearchInputHistory => "GridClearSearchInputHistory",
+            GridClearReadingHistory => "GridClearReadingHistory",
             GridClearQuickFolderSlots => "GridClearQuickFolderSlots",
             ExternalToolPicker => "ExternalToolPicker",
             ExternalToolForContainer => "ExternalToolForContainer",
@@ -5243,6 +5249,8 @@ impl KeyAction {
             GridOpenLocationPictures => "ピクチャを開く",
             GridOpenLocationDownloads => "ダウンロードを開く",
             GridClearRecentFolders => "最近開いたフォルダ履歴をクリアする",
+            GridClearSearchInputHistory => "検索欄の入力履歴をすべて消去",
+            GridClearReadingHistory => "閲覧履歴をすべてクリア",
             GridClearQuickFolderSlots => "A/B の記憶した場所と一覧位置をクリアする",
             ExternalToolPicker => "登録済みの外部ツールを選んで起動する",
             ExternalToolForContainer => "現在のフォルダー / 本を外部ツールで開く",
@@ -5824,6 +5832,8 @@ impl KeyAction {
             | GridOpenLocationPictures
             | GridOpenLocationDownloads
             | GridClearRecentFolders
+            | GridClearSearchInputHistory
+            | GridClearReadingHistory
             | GridClearQuickFolderSlots
             | GridTogglePinnedTag1
             | GridTogglePinnedTag2
@@ -6380,6 +6390,8 @@ impl KeyAction {
             | GridOpenLocationPictures
             | GridOpenLocationDownloads
             | GridClearRecentFolders
+            | GridClearSearchInputHistory
+            | GridClearReadingHistory
             | GridClearQuickFolderSlots
             | GridTogglePinnedTag1
             | GridTogglePinnedTag2
@@ -6964,6 +6976,8 @@ impl KeyAction {
             | GridOpenLocationPictures
             | GridOpenLocationDownloads
             | GridClearRecentFolders
+            | GridClearSearchInputHistory
+            | GridClearReadingHistory
             | GridClearQuickFolderSlots
             | GridTogglePinnedTag1
             | GridTogglePinnedTag2
@@ -11758,6 +11772,8 @@ mod tests {
             "OpenPreferences".to_string(),
             "OpenOperationCustomize".to_string(),
             "ClearRecentFolders".to_string(),
+            "ClearSearchInputHistory".to_string(),
+            "ClearReadingHistory".to_string(),
             "ClearQuickFolderSlots".to_string(),
             "GridToggleDetails".to_string(),
             "GridToggleCheck".to_string(),
@@ -13486,6 +13502,8 @@ mod tests {
     fn grid_history_clear_actions_are_default_unassigned() {
         for action in [
             KeyAction::GridClearRecentFolders,
+            KeyAction::GridClearSearchInputHistory,
+            KeyAction::GridClearReadingHistory,
             KeyAction::GridClearQuickFolderSlots,
         ] {
             assert!(KeyAction::all().contains(&action));
@@ -13494,6 +13512,13 @@ mod tests {
             assert_eq!(action.trigger(), KeyTrigger::Press);
             assert!(action.default_chords().is_empty());
             assert!(action.is_user_facing());
+            let keymap = Keymap::from_ini_str(&format!("[Grid]\n{} = F13\n", action.ini_name()));
+            assert!(keymap.warnings().is_empty(), "{:?}", keymap.warnings());
+            let restored = Keymap::from_settings(&KeymapSettings::from_keymap(&keymap));
+            assert_eq!(
+                restored.effective_chords(action),
+                vec![Chord::key(KeyName::F13)]
+            );
         }
 
         let action = KeyAction::GridClearQuickFolderSlots;
