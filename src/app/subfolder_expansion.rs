@@ -471,7 +471,7 @@ pub(crate) struct PreparedSubfolderMetadata {
     pub(crate) video_pin_blobs: HashMap<PathBuf, Vec<u8>>,
     /// サブ展開は synthetic path のため、通常フォルダの同期 lookup を使わず prepare
     /// worker でコンテナ項目だけを一括照会する。スマートフォルダは aggregate 側に持つ。
-    pub(crate) folder_pin_map: Option<HashMap<String, crate::folder_thumb_pins::FolderPinSource>>,
+    pub(crate) folder_pin_map: Option<HashMap<String, crate::folder_thumb_pins::FolderPin>>,
     /// Additional exact-key metadata for aggregate views whose items come from unrelated real
     /// folders.  A normal folder can hydrate by one path prefix; a smart folder cannot, so its
     /// prepare worker supplies the finished sparse maps instead of making the UI thread query
@@ -496,7 +496,7 @@ pub(crate) struct PreparedAggregateMetadata {
     pub(crate) mask_pages: HashSet<usize>,
     pub(crate) conceal_pages: HashSet<usize>,
     pub(crate) comic_pages: HashSet<usize>,
-    pub(crate) folder_pin_map: HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    pub(crate) folder_pin_map: HashMap<String, crate::folder_thumb_pins::FolderPin>,
     pub(crate) converted_archive_cache_paths: HashMap<String, ConvertedArchiveSourceState>,
     pub(crate) catalog: Option<PreparedAggregateCatalog>,
 }
@@ -2642,7 +2642,8 @@ impl App {
             else {
                 return;
             };
-            self.adopt_main_list_navigation(adoption, |app| {
+            let boundary_plan = self.physical_main_list_boundary_plan(&token);
+            self.adopt_main_list_navigation(adoption, boundary_plan, |app, boundary| {
                 app.folder_nav_subfolder_restore = None;
                 app.subfolder_expansion_removed_paths = owned.removed_paths;
                 app.cancel_stack_script_pending();
@@ -2650,7 +2651,12 @@ impl App {
                 app.stack_view = None;
                 app.stack_return_state = None;
                 app.stack_showing_flat = false;
-                app.install_prepared_subfolder_expansion_memory(prepared, ctx, token, owned.purpose)
+                app.install_prepared_subfolder_expansion_memory(
+                    prepared,
+                    ctx,
+                    token.with_install_boundary(boundary),
+                    owned.purpose,
+                )
             });
         } else {
             let hydration = self.install_prepared_subfolder_expansion_memory(

@@ -494,6 +494,36 @@ pub(crate) fn show_singleline<'text>(
     output
 }
 
+/// Transfer the already-admitted pending owner to the helper's actual focus.
+pub(crate) fn activate_reserved_focus(ui: &egui::Ui, id: egui::Id) -> bool {
+    begin_pass_diagnostics(ui.ctx());
+    if !egui_ime::activate_reserved_focus(ui, id) {
+        return false;
+    }
+    if let Some(crate::keyboard_input::KeyboardOwner::TextInput {
+        viewport,
+        widget_id,
+        phase: crate::keyboard_input::TextInputPhase::PendingFocus,
+    }) = crate::keyboard_input::cached_keyboard_owner(ui.ctx())
+        && viewport == ui.ctx().viewport_id()
+        && widget_id == id
+    {
+        crate::keyboard_input::cache_keyboard_owner(
+            ui.ctx(),
+            crate::keyboard_input::KeyboardOwner::TextInput {
+                viewport,
+                widget_id,
+                phase: crate::keyboard_input::TextInputPhase::Focused,
+            },
+        );
+    }
+    true
+}
+
+pub(crate) fn end_text_input(ctx: &egui::Context, id: egui::Id) {
+    egui_ime::end_text_input(ctx, id);
+}
+
 pub(crate) fn add_singleline<'text>(
     ui: &mut egui::Ui,
     text: &'text mut dyn egui::TextBuffer,
@@ -1302,12 +1332,6 @@ mod tests {
             line_anchor: "singleline(&mut self.color_filter.hex_input)",
             expected_occurrences: 1,
             reason: "RRGGBB 専用の ASCII 制約入力で日本語自由入力ではない",
-        },
-        RawTextEditExemption {
-            path: "src/ui_main.rs",
-            line_anchor: "singleline(&mut self.address)",
-            expected_occurrences: 1,
-            reason: "snapshot 表示中だけ描く disabled 読み取り専用欄",
         },
         RawTextEditExemption {
             path: "src/ui_text.rs",

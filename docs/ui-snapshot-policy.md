@@ -1,5 +1,22 @@
 # UI スナップショットテスト運用方針
 
+§1.764の自動切り出しは `cover_auto_crop_small_100_light` / `cover_auto_crop_small_200_dark` の2枚を追加する。
+1093×614、UI倍率100%/200%で、製品と同じ純粋rendererに自動設定ON・手動範囲ありを渡す。
+「手動の範囲を解除すると、自動の判定に戻ります。」の全文、固定操作行、画像全体とhandleを実装担当が目視した。
+2枚は計165,429 bytes。既存の手動用2枚は更新しない。生成画素のみを使い、App・worker・製品アプリを起動しない。
+共有のサムネイル設定を描く `preferences_favorite_view_state_dark` は、新しいcheckboxと説明に合わせ1枚だけ更新した。
+620×260、77,887 bytes。実装担当が追加文の全文、後続の文字サイズ等の項目、scrollbarを目視確認した。
+独立レビューと外部画像による検出精度の受入れは設計担当が別に行う。検証結果は[表紙範囲設計 §16](cover-crop-plan.md#16-第2段自動の実装引き継ぎ2026-11-12)へ記録する。
+
+§1.764 の手動表紙範囲は `cover_crop_small_100_light` / `cover_crop_small_200_dark` の2枚を追加。
+1093×614の物理領域で、200% は546.5×307の論理領域として検査する。2枚は計150,038 bytes。
+製品と共通の純粋 Window renderer に生成画像を渡し、App・worker・製品アプリを起動しない。
+実装担当と独立 reviewer が、100% の全説明文・画像・handle、200% の初期表示での画像全体・handle・固定操作行を目視した。
+200% の補足文は同じ本文を下へスクロールして読む。headless 回帰は本文 clip と handle 全体、補足文への wheel 到達、
+各操作の実クリック、無効な範囲の OK 後のエラー表示・DB 不変を100%/200%で検査する。
+新規2件の更新後、更新指定なしの `ui_snapshot` 251件が成功。既存 PNG の変更はない。
+これは実機の操作感・実 IME・GPU 表示の受入れではない。検証の正本は [表紙範囲設計 §15](cover-crop-plan.md#15-第1段手動の実装と検証2026-11-11)。
+
 §1.732 はフォルダを含む削除の必須確認に合わせ、環境設定の説明文と既存の
 `preferences_recycle_bin_delete_confirmation`（560×230、61,954 bytes）だけを更新した。
 実装担当と独立 reviewer が全文・折り返し・余白を目視し、欠けや重なりがないことを確認した。
@@ -596,3 +613,24 @@ UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --lib local_adjust_panel_snapshot
 integrationの `book_manager_window_close_and_mode_controls_in_small_viewport` は12条件で×と方式ボタンを検査し、
 geometryの全組合せへPNGを増やさない。
 更新モードを外した `ui_snapshot` 全224件の通常比較も成功した。
+
+検索欄の入力履歴（§1.756、2026-11-11）は、本体の共有部品を使う
+`toolbar_pinned_search_history_light`（560×100）、`search_history_popup_dark`（440×240）、
+`folder_address_history_light`（560×120）の3枚を追加した。計18,852 bytes。
+既存の常設欄2枚・Everythingバー3枚・フォルダバー設定/整理先3枚・フォルダバー配置10枚、
+計18枚を更新した。新規と更新の21枚は計729,735 bytesで、実装担当が全枚を目視し、
+明暗・狭幅・150%で▼と文字、枠、右側操作、一覧の末尾に欠けや重なりがないことを確認した。
+フォルダバーは全36条件のgeometry/hit検査を維持し、従来の23名を保持する。
+履歴ボタンの移設でnormal/middleのinlineがrowとは異なる配置になるため、
+現在は23名・23種類の画素配置を検査する（0.37採用時の22種類から1種類増加）。
+更新指定あり/なしのintegration `ui_snapshot` は各251件成功した。
+既存の整理先画像3枚はlibの該当25件でも通常比較を確認した。
+新しい部品のfixtureも本体フォントを使い、glyphとaccessibilityの検査を無効にしない。
+製品GUIの起動・実IMEの検収ではなく、設計担当の画像確認と実機確認は別に行う。
+
+§1.756の設計担当の目視後、常設欄は履歴なしと同じ欄全体の幅へ戻し、履歴行は左揃え・
+通常行の塗りなしへ修正した。`toolbar_pinned_search_light` / `toolbar_pinned_search_narrow_dark` /
+`toolbar_pinned_search_history_light` / `search_history_popup_dark` の4枚だけを再更新（計61,794 bytes）。
+実装担当が4枚を目視し、通常幅の折り返し、狭幅、選択行と通常行の区別を確認した。
+一時バーとフォルダバーの既存PNGは変更していない。更新指定あり/なしで各251件成功。
+追補の検証記録は設計書§12。

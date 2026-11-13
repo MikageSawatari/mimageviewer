@@ -1,0 +1,893 @@
+# 検索欄の入力履歴 (§1.756) 設計
+
+状態: 実装・対象自動検証済み、設計担当の受け入れ・実機確認待ち (2026-11-11、設計担当 ClaudeCode Opus 5.5)。実装は Codex GPT-6.1 Sol / high、レビューは別の Sol / xhigh。
+正本の仕様は [next-release-backlog.md §1.756](next-release-backlog.md)。本書はその実装設計。
+関連: §1.690 (一覧の項目から検索欄へ条件を渡す「検索要求」の型。同じ入力欄を触る)、保留側 §1.692。
+
+## 1. 利用者が決めたこと (変えない)
+
+- 検索欄ごと (コンテナ検索・現在地の絞り込み・アイテム検索・Everything 検索) に、実行した検索語を
+  最近のものから 20 件覚え、選び直せる。
+- 環境設定に「検索欄の入力履歴を保存する」(**既定オン**) と「履歴を消去」。1 件ずつの削除は付けない。
+- 一覧は入力欄を開いただけでは出さない。▼か ↓ キーで自分で開いたときだけ出す。
+- 診断ログ・mIV Remote・AI 連携 (MCP) には渡さない。
+- 見た目: 入力欄の右端に▼だけのボタンを置き、枠ごと 1 つの入力欄に見える形。▼で入力欄のすぐ下に一覧。
+  **フォルダバーの「履歴▼」も同じ形にそろえる** (リリース済みの見た目の変更。更新履歴で知らせる)。
+  部品は検索欄とフォルダバーで共有する。
+
+## 2. 対象の入力欄
+
+| 欄 | 描画箇所 | input id |
+| --- | --- | --- |
+| 常設の検索欄 ×4 | `ui_pinned_search::draw_pinned_search` | `PinnedSearchKind::input_id()` |
+| 現在地の絞り込み (一時バー) | `ui_main.rs` `render_search_bar` | `Local.temporary_id()` |
+| コンテナ検索 (一時バー) | `ui_main.rs` (favsearch バー) | `Container.temporary_id()` |
+| アイテム検索 (一時バー) | `global_search_ui.rs` | `Metadata.temporary_id()` |
+| Everything 検索 (一時バー) | `global_search_ui/everything/ui.rs` | `Everything.temporary_id()` |
+| フォルダバーのアドレス欄 | `ui_main.rs` `FolderTailPart::Input` | `"folder_address_input"` |
+
+検索の履歴は常設欄と一時バーで**同じ種類 (kind) の 1 つの一覧を共有する** (同じ検索の入力欄なので)。
+タグビューの入力欄 (「一覧▼」) は対象外 (既存の「最近使ったタグ」がある)。
+
+## 3. 共有部品 `src/ui_history_field.rs` (新規)
+
+1 行入力欄の右端に▼を内蔵し、▼ / ↓ で入力欄の下に一覧を出す部品。検索欄・フォルダバーで共有し、
+§1.690 でも使えるよう、一覧の中身と「選んだら何をするか」は呼び出し側が決める。
+
+### 3.1 形
+
+- TextEdit は従来どおり **`crate::ime_focus` の helper (`show_singleline` など) で描く**。部品は呼び出し側の
+  builder closure (id・幅・margin・hint) をそのまま受け取り、末尾に
+  `.suffix(egui::Atom::custom(<▼の atom id>, <▼の大きさ>))` を足すだけにする。
+  egui 0.37 の TextEdit は suffix を枠の内側に並べ、フォーカス時の枠色 (selection stroke) も TextEdit 自身が
+  描くので、「枠ごと 1 つの入力欄」に見える。外側に偽の枠を描かない。
+- 描画後に `output.response.rect(<atom id>)` で▼の位置を取り、その矩形へ枠なしの▼ボタン
+  (`ui.put` / `ui.interact` で TextEdit より後に追加 = ヒットテストで手前) を置く。
+  ▼を押したら一覧を開閉する。入力欄にフォーカスがあれば保ち (§3.4)、無ければ次の pass で IME helper の
+  予約受付用のIME helperを通して入力欄へフォーカスを渡す (helper の契約を保つため、helper の外で
+  `request_focus` を呼ばない)。
+- 未フォーカス欄の▼はpass限りの `focus_requested` を返し、呼び出し側が既存の
+  `App::pending_text_input_focus` にviewport・widget・passを登録する。部品内に別の予約を持たない。
+  次passの `focus_pending` はこのclaimと有効な一覧ownerから導出する。IME helper内でTextEdit描画前に
+  実フォーカスへ渡し、begin-passの矢印フォーカス移動も終端する。同じownerのphaseだけPendingからFocusedへ渡す。
+  別widgetの実フォーカスや欄/一覧の外のpointer pressは優先し、予約で奪わない。
+  main/keymapの描画前判定では当該PendingFocusを保護し、通常の予約検索Enter振り分けにも渡さない。
+  フォルダ欄も同じclaimを使う。未選択Enterはpass限りの `submit_requested` で通常の確定/claimへ送る。
+  これはeguiの `lost_focus` が過去2passの履歴だけを見るため、取得と確定が同じpassに起きる場合の通知であり、
+  入力の編集はTextEditが行う。描画前に満たした要求を描画後に再度要求しない。
+- 入力欄が無効 (disabled) のときは▼も無効。▼だけを無効にする理由 (検索中は使えない等) は
+  呼び出し側が tooltip 文字列で渡す。
+- 履歴の機能自体を出さないとき (検索: 設定オフ、フォルダ: `show_address_bar_history_menu` オフ) は suffix を
+  付けず、従来と同じ TextEdit にする (空白も予約しない)。
+- 常設欄・一時バーは従来の欄全体の幅を保ち、▼の分だけ本文領域を狭める。常設欄の
+  `search_section_width` の140〜220ptのclamp・折り返し判定にsuffix幅を足さない。
+  フォルダバーのアドレス欄は別の幅方針で、本文幅を維持する予約を保つ。
+
+### 3.2 一覧 (popup) と、その状態の所有者
+
+- **`egui::Popup` は使わない**。`egui::Popup` は IME 変換中かどうかを見ずに Esc で自分を閉じ
+  (`vendor/egui/src/containers/popup.rs` の `should_close`)、開閉の正本が egui 側に移るため、
+  §4 の Esc の扱いと二重になる。代わりに部品が自分の `egui::Area` (`Order::Foreground`) を
+  **TextEdit 全体の rect の直下**に左揃えで描く。
+- 一覧の状態は **viewport ごとに 1 つの値** として ctx の temp data に置く (部品の module だけが読み書きする):
+
+  ```rust
+  struct HistoryPopupState {
+      owner: egui::Id,          // 一覧を開いた入力欄の id
+      highlight: Option<usize>, // ↑↓ の選択位置
+      drawn_pass: u64,          // owner の部品を最後に描いた cumulative_pass_nr
+  }
+  ```
+
+  `None` = 閉じている。開閉・選択位置・持ち主はこの 1 つだけで表し、別の bool や egui の popup 状態と
+  二重に持たない。部品の module に `close(ctx)` を 1 つ置き、次の**既存の遷移の境界**で明示的に閉じる
+  (同時表示を追跡せず、境界で閉じる):
+  - owner の部品が前の pass で描かれていない (バーを閉じた・検索終了・別の表示へ切り替えた)。次に触った時点で閉じる。
+  - owner の入力欄が無効 (disabled) で描かれた。
+  - 本物のモーダルが入力を取った: `App::note_main_chrome_pointer_block_transition` (`src/app/main_chrome.rs`) が
+    `egui::Popup::close_all` を呼ぶ箇所で同じく `close`。モーダルが入力欄の描画前に Esc で閉じる pass でも、
+    §4.2 の手順 2 で閉じる (Esc はモーダルのもの)。
+  - 別の egui の popup / menu が開いている (`egui::Popup::is_any_open(ctx)`。入力欄の右クリックの編集メニュー
+    `ui_helpers::singleline_text_edit_context_menu` を含む。履歴の一覧は egui の Popup ではないので数に入らない)。
+    部品の描画時と、§4.2 の `take_escape` の両方で見て閉じる (編集メニューは部品の後に開くので、
+    次の pass の Esc を履歴が取らないように)。
+  - 持ち主の viewport が OS のフォーカスを失った (`ctx.input(|i| i.focused)` が false)。
+- 幅は呼び出し側指定の最小幅 (既定 = 入力欄の幅) 以上。配色は `os_theme` の popup helper
+  (`dark_popup_style` 等、coding-conventions の配色の節) を使う。
+- 一覧は 1 行のボタンの並び。項目の表示文字列は呼び出し側が渡す (検索 = 検索語、フォルダ = フル
+  パスの monospace)。入りきらない文字列は省略し、hover で全文を出す。0 件なら弱い文字で
+  「履歴はありません」。
+- 行は `Button::selectable` を使い文字を左寄せにする。選択中とhover中の行だけ強調し、
+  それ以外の行は塗りなし。検索語とmonospaceのフルパスで同じ描画を使う。
+- 高さが画面に入らないときに備えて `ScrollArea` に入れる。**popup が開いている frame では
+  wheel を消費する** (coding-conventions「Popup / menu wheel passthrough」、既存例
+  `suppress_menu_button_wheel_passthrough`)。
+- 閉じる条件: 項目を選んだ / Esc (§4) / ▼をもう一度押した / 入力欄・一覧の外でポインタを押した /
+  入力欄を編集した (文字入力・削除・貼り付け) / 入力欄からフォーカスが離れた / 上の境界。
+- 一覧の中・▼の操作でフォーカスを失わない方法は §3.4。
+- 初回Areaのsizing passは、内容の計測とArea終端まで行った上で `request_discard` を要求する。
+  通常の複数pass内で既知サイズ・対話可能な一覧を保存し、次のbackend frameのヒットテストへ渡す。
+  sizing中のAreaを強制的に対話可能にしたり、入力を保存・再送したりしない。
+- 一覧の中身は開いている pass ごとに呼び出し側から受け取る (snapshot を持たない)。highlight が
+  件数を超えたら末尾へ寄せる。
+
+### 3.3 戻り値 (案)
+
+```rust
+pub struct HistoryFieldOutput {
+    pub text: <ime_focus helper の既存の出力型>, // 呼び出し側は従来どおり response / changed / lost_focus を見る
+    pub picked: Option<usize>, // 一覧から選んだ (呼び出し側の entries の index)。通常の確定とは排他
+}
+```
+
+API の細部 (entries を `&[String]` で渡すか表示用 closure にするか等) は実装担当が既存コードに合わせて
+決めてよい。条件は: (1) IME helper を経由する、(2) 呼び出し側は `Picked` に対して自分の確定経路を呼ぶ、
+(3) 部品は履歴の保存・記録を一切知らない、(4) `picked` が `Some` の pass では、呼び出し側は
+その欄の従来の確定判定 (`lost_focus && enter` など) を**実行しない** (排他の根拠はフォーカスではなくこの契約)。
+「入力欄から離れた」通知は部品から出さない (離脱の判定は §5.2 で App が 1 か所で行う)。
+
+### 3.4 一覧・▼の操作で入力欄のフォーカスを手放さない
+
+egui は既定 (`SurrenderFocusOn::Clicks`) で、フォーカス中の TextEdit の外でクリックが成立した pass
+(離しの pass) にフォーカスを手放す。押下の pass で戻しても離しの pass を守れず、IME helper の
+フォーカス契約も helper の外の `request_focus` では戻らない (`crates/egui-ime` は描画後に、フォーカスを
+失った入力欄の記録を消す)。そこで egui 0.37 の TextEdit 補完 (`vendor/egui/src/widgets/text_edit/completion.rs`
+の `CompletionPopup::show`) と同じく、**フォーカスを最初から失わせない**:
+
+- 部品は TextEdit (= IME helper の呼び出し) を描く直前に、ポインタが「履歴の一覧の layer の上」または
+  「この欄の▼の矩形 (前 pass の値を temp data に置く)」にあれば、`ctx.options_mut` で
+  `input_options.surrender_focus_on` を `Never` にし、短いDrop guardで描画直後（panic時も）元へ戻す。押下・離し・ドラッグ
+  (スクロールバー・空白部分のクリックを含む) のどの pass でも同じ判定なので、一覧の中の操作は
+  離しまで内部の操作として扱われ、離脱にも閉鎖にもならない。
+- 一覧の layer は部品が描く `Area` の `LayerId` (id は owner から作る) で判定する (`ctx.layer_id_at`)。
+- helperより前の入力欄の矩形参照には `read_response` を使わない。これは内部で `get_response` を呼び、
+  同passの押下＋離しで保護前にfocusを手放し得る。viewportのWidgetRectから矩形だけを読む。
+
+## 4. キー操作
+
+入力欄にフォーカスがあり、**IME の変換中でない** (`ime_focus::ime_input_active` が false) ときだけ部品が扱う。
+変換中の ↓ / ↑ / Enter / Esc は従来どおり IME に渡す。
+
+| キー | 一覧が閉じているとき | 一覧が開いているとき |
+| --- | --- | --- |
+| ↓ | 一覧を開き、先頭を選択状態にする (履歴 0 件なら開いて「履歴はありません」) | 選択を 1 つ下へ (末尾で止まる) |
+| ↑ | 何もしない (従来どおり) | 選択を 1 つ上へ (先頭で止まる) |
+| Enter (NumpadEnter を含む) | 従来どおり (各欄の確定) | 選択中の項目があれば選ぶ (`Picked`)。**選択が無ければ消費せず**一覧を閉じ、従来の確定へそのまま流す |
+| Esc | 従来どおり (検索の終了など) | **一覧だけを閉じる** (検索は終了せず、入力欄のフォーカスも残す) |
+
+#### 4.1 egui のフォーカス移動と Enter
+
+- egui は `Memory::begin_pass` で、フォーカス中の widget の event filter に含まれない ↑↓ をフォーカス移動に、
+  Esc をフォーカス解除に使う (`vendor/egui/src/memory/mod.rs` の `begin_pass` の Key 処理)。IME helper
+  (`crates/egui-ime` の描画後処理) はフォーカス中の入力欄に `horizontal_arrows` / `vertical_arrows` を含む
+  filter を毎 pass 設定しているので、**↓ / ↑ はすでに入力欄に残る**。部品は ↑↓ の filter には手を出さない。
+  Esc だけは §4.2 のとおり、helper の呼び出しの**後で**部品が filter に足す (同じ pass で後に設定した値が効く)。
+  ↑ は一覧が閉じているとき、今の ↑ と同じ結果を保つ (部品は消費しない)。
+- ↓ / ↑ / (選択中の) Enter は TextEdit を描く**前に**部品が消費する (TextEdit が Enter でフォーカスを
+  手放したり、カーソルを動かしたりしないように)。各欄は Enter を描画前に `bool` で先読みしている
+  (`ui_main.rs` の一時バー、`global_search_ui/everything.rs` 等) ので、**排他は §3.3 の契約 (`picked` が
+  `Some` の pass では従来の確定判定を実行しない) で保証する**。
+- `picked` の確定は、検索欄では既存の `App::submit_search_input` を通す (egui / native の押下をまとめて
+  claim する `finish_text_input_submit` を含む。確定後は Enter と同じくフォーカスを手放す)。フォルダ欄も
+  同じ `claim_text_input_submit(ctx, <アドレス欄の id>)` で押下を claim してから移動する。同じ backend frame の
+  再 pass (egui の discard による同じ入力の再実行) で 2 回選ばれないことを、この claim で保証し、テストで確かめる。
+- 消費した ↓ / ↑ / Enter / Esc の押下が native 側の KeySlot から後段のショートカットへ漏れないことを確かめる
+  (§1.723 と同型の二重消費を作らない)。
+
+#### 4.2 Esc
+
+- egui は `begin_pass` で、フォーカス中の widget の filter に Esc が無ければフォーカスを外す。部品は、
+  **一覧が開いていて入力欄がフォーカスを持つ pass では、IME helper の呼び出しの後に
+  `memory.set_focus_lock_filter(id, <helper と同じ filter に escape: true を足したもの>)`** を設定する
+  (`set_focus_lock_filter` は前の pass にもフォーカスがあった欄だけを更新する。helper が描画後に
+  毎 pass 設定する filter より後に呼ぶので、その pass の値として残る)。次の pass の Esc では egui はフォーカスを外さず、
+  Esc の event も残る。一覧を閉じた pass からは設定しない (従来の Esc に戻る)。
+- 部品の module に前処理 `take_escape(ctx) -> bool` を 1 つ置き、**メイン viewport の update で
+  `EscapeClaim::for_frame` を初期化した直後、`capture_search_escape_input` より前** (app.rs の描画前、
+  現在 `capture_search_escape_input` を呼んでいる箇所) に呼ぶ。`EscapeClaim` は 1 回だけ初期化し、
+  `take_escape` が true ならそれを claim 済みにする (その後に初期化し直さない)。処理は次の順:
+  1. この pass の入力に**修飾キーなしの Esc の押下**が無い、または IME 変換中なら何もしない。
+  2. `HistoryPopupState` が無ければ何もしない。前の pass で owner が描かれていない (退役) なら状態を消して何もしない。
+  3. 別の egui の popup / menu が開いている (`egui::Popup::is_any_open`)、または共通モーダル・ダイアログが
+     開いている (`EscapeClaim::for_frame` が claim 済みになる理由と同じ判定) なら、状態を消して一覧を閉じるが、
+     Esc は消費しない (前面のメニュー・モーダルのもの)。
+  4. それ以外: 状態を消して一覧を閉じ、Esc を egui から消費し、同じ viewport の native の Esc 押下を claim する。
+     true を返し、`EscapeClaim` を claim 済みにする。検索の Esc 振り分け (`route_search_escape`) と
+     フォーカス回復 (`recovering_text_input`) による Esc の扱いに渡さない。入力欄のフォーカスは、上の filter で
+     egui が外していないので、そのまま残る (部品は `request_focus` を呼ばない)。
+- 割り切り: 一覧を開いた pass と次の pass の間に Esc が来た場合 (filter がまだ効いていない。たとえば
+  フォーカスの無い欄の▼で開いた直後の 1〜2 pass) は、egui がフォーカスを外すことがある。その場合も
+  手順 4 で一覧は閉じ、検索は終了しない。フォーカスが外れるだけなので、回復処理は足さない。
+- claim は「検索を終了させない」ためのもので、一覧を閉じるのは `take_escape` 自身が行う。
+- `take_escape` が true を返した pass は、§5.2 の離脱の判定 (`settle_search_input_departure`) から除外する
+  (戻り値を同じ pass の update の中で settle へ渡すだけで、状態は持たない)。filter が効く前の Esc で
+  フォーカスが外れても、一覧を閉じただけの操作として記録しない。
+- 既存の挙動 (今回は変えない): 入力欄の右クリックの編集メニュー (egui の Popup) は Esc を見て閉じるが消費しないので、
+  今の版でも、編集メニューを開いた検索欄で Esc を押すと、メニューが閉じたうえで検索の Esc 振り分けも動く。
+  履歴の一覧はこの場合に Esc を取らない (手順 3) ので、この挙動を変えも悪化させもしない。直すなら別の項目にする。
+- 確かめる操作: 一覧が閉じた状態での Esc (従来どおり)、▼で開いてから Esc、↓で開いてから Esc、
+  一覧を閉じた直後にもう一度 Esc (従来の Esc の動作になる)、履歴を開いたまま入力欄を右クリック→Esc
+  (履歴の一覧は閉じ、その Esc は従来どおり編集メニューと検索に渡る)、アドレス欄での同じ操作。
+  フォーカスの無い欄の▼で開き、フォーカスが入った直後の Esc で、一覧が閉じ、検索は続き、記録されないこと。
+- これらは入力欄の中だけで効く固定の部品操作 (ComboBox と同じ扱い) なので `KeyAction` にはしない。
+  固定にする理由を [keymap-spec.md](keymap-spec.md) の固定入力の節に書く。
+
+## 5. 履歴の記録と選び直し
+
+### 5.1 データ
+
+`Settings` に 2 項目を足す (新機能なので移行は不要。`serde(default)`):
+
+- `save_search_input_history: bool` (既定 `true`)
+- `search_input_history: SearchInputHistory` — `PinnedSearchKind` ごとの `Vec<String>` (新しい順、最大 20 件)
+
+規則 (純関数 + 単体テストで固定):
+
+- 前後の空白を除いた文字列を記録する。空なら記録しない。1,000 文字を超える語は記録しない。
+- 同じ語 (除いた後で完全一致、大文字小文字を区別) は先頭へ移す。21 件目以降は捨てる。
+- 読み込み時も同じ規則で正規化する (壊れた値・重複・件数超過を落とす)。
+
+保存は `settings.db` の他の項目と同じ経路 (メモリ上の `Settings` を通常の保存時機で書く) に乗せ、
+新しい I/O・ワーカー・ファイルを作らない (フォルダの履歴 `quick_folder_recent_folders` と同じ)。
+したがって保存先は通常版 `%APPDATA%\mimageviewer\settings.db`、ポータブル版は `data\settings.db` で、
+data_dir の解決に従う。
+
+- 環境設定の OK による全体差し替えで巻き戻さないよう、`settings.rs` の live 値を引き継ぐ一覧
+  (`quick_folder_recent_folders` を引き継いでいる関数) に `search_input_history` を足す。
+  `save_search_input_history` は環境設定で編集するので draft の値を使う。
+- `settings_transfer`: `search_input_history` は除外 (`"利用データ・登録先・履歴・検索対象"`)。
+  `save_search_input_history` は移行できる設定として扱う (既存の bool 設定と同じ書き方)。
+- 設定の世代バックアップ (`settings.db.bak1`〜`bak10`、`src/db_backup.rs`) には、消去前の履歴が残る。
+  フォルダの履歴と同じ扱いとし、消去の対象にしない (世代バックアップは設定の復旧手段なので、履歴のためだけに
+  書き換えない)。その代わり**「消去」の説明では、現在の入力履歴を消すこと・設定の自動バックアップには
+  しばらく残ることを書く** (環境設定の説明・マニュアル・privacy の日英)。
+
+### 5.2 記録する時点 (2 つだけ)
+
+1. **確定したとき**: `App::submit_search_input(ctx, kind, widget)` が受け付けた時点 (利用可否の検査を
+   通った後) に、その kind の下書きを記録する。Enter・「検索」ボタン・履歴からの選び直しは全部ここを通る
+   (常設欄・一時バー・`route_pending_search_submit` の予約経路とも)。結果が 0 件・失敗でも記録する
+   (仕様: 見つからなかった語も入る)。
+2. **入力欄から通常に離れたとき、その語で検索を実行済みなら**: 入力するだけで検索するコンテナ検索と
+   アイテム検索で、「入力して結果をクリックした」語を残すため。各欄の `lost_focus()` では判定しない
+   (描画の途中では、描画後に処理される Esc による終了や常設欄の × と区別できない。また egui の
+   `lost_focus()` は 2 pass にわたって true になり得て、描画順によって古い離脱が新しいものを上書きする)。
+   代わりに、**前の pass のフォーカス所有者と今のフォーカスを、pass の中の 1 か所で比べる**:
+   - 既存の `App::record_search_input_focus` は、フォーカス中の検索入力欄 (`SearchInputId`。常設・一時バー) を
+     viewport の temp data `search_input_owner` に記録している。ただし update が途中で return する pass
+     (起動時の overlay、native 動画、埋め込みのフルスクリーン等、app.rs の `record_search_input_focus` より前の
+     return) では更新されず、古い値が残る。そこで**記録を `(SearchInputId, 記録した cumulative_pass_nr)` の
+     一体の値に変え**、`capture_search_escape_input` もこの値の `SearchInputId` を使うように合わせる。
+   - 新しい `App::settle_search_input_departure(ctx)` を、メイン viewport の update で
+     **`route_search_escape` の直後、`record_search_input_focus` の直前** (app.rs の現在 101051〜101052 行の間。
+     `render_grid` より前) に呼ぶ。ここでは記録 (`search_input_owner` の古い値) を読み、それが
+     **直前の pass (`記録した pass + 1 == 今の pass`) の記録**で、この pass で `take_escape` が Esc を取っておらず、`Some(input)` で、今フォーカスがその入力欄に
+     無ければ、`input.kind()` の離脱として次をすべて満たすときだけ記録する (途中 return を挟んだ古い記録は
+     使わず、過去の離脱を後から補わない):
+     - その kind の検索がまだ続いている (`edit_owner(kind)`。この pass の Esc・× で終了・解除していれば false)
+     - 下書き (`search_draft(kind)`) が空でない
+     - その下書きで**検索を実行済み** (結果の到着は問わない)。kind ごとの「最後に実行した要求の検索語」:
+       - 現在地: `App::submitted_local_search()` (実行中の要求 → 適用済みの順。検索対象・OR の変更から
+         `submit_search_input` を通らず直接実行される要求も含む) の検索語
+       - コンテナ: `favsearch.last_executed`
+       - アイテム: `global_search.source == Metadata` のときの `global_search.last_executed`
+       - Everything: 実行中の要求、無ければ受け付けた結果 (`SearchAccepted::Everything`) の送った検索語
+       実装担当が各 owner の既存の値から取り出す (新しい状態は足さない)。
+   - 部品自身の操作 (▼・一覧内の操作・Esc で一覧を閉じた) では、入力欄はフォーカスを失わない (§3.4・§4.2) ので
+     離脱にならない。`picked` の確定は 1 で記録済みで、ここで再び記録されても先頭へ移すだけ。
+   - 判定は pass ごとに 1 回で、候補を持ち越さない。ここは `render_grid` より前なので、グリッドの操作
+     (別ウィンドウの準備・閲覧の開始) で検索の状態が変わる前に判定できる。結果のクリックで入力欄が
+     フォーカスを手放すのはツールバーの描画中 (グリッドより前) なので、同じ pass の判定で捕まる。
+   入力途中の語 (デバウンス待ち) は、フォーカスが入力欄にある間は判定しないので残らない。
+   結果の取得中 (Running) に結果をクリックしても、実行済みの語なので記録される。
+   現在地の絞り込みと Everything でも、実行済みの語のまま離れれば記録される (多くは 1 の重複で、先頭へ移すだけ)。
+
+記録しないもの: mIV Remote・AI 連携 (MCP)・タグビュー・フォルダバー (フォルダは既存のフォルダ履歴)。
+Remote と MCP は `submit_search_input` と上の入力欄を通らない。実装時に `submit_search_input` と
+`settle_search_input_departure` の呼び出し元を列挙し、UI の入力欄以外から呼ばれていないことを確かめる。
+test-script は通常の入力 (Enter・クリック) を配送するので、通常の操作と同じく記録される (遮断しない。
+試験は隔離したデータで行う)。
+
+`save_search_input_history == false` のときは記録しない。
+
+### 5.3 選び直し
+
+一覧で選んだら、その kind の下書きをその語に置き換え、`submit_search_input(ctx, kind, <その欄の id>)` を
+呼ぶ (Enter と同じ確定。記録で先頭へ移る)。確定後のフォーカスは Enter と同じ状態にする
+(入力欄はフォーカスを手放す)。利用できない状態 (`pinned_search_availability(kind)` が Err) では▼も無効。
+
+検索の対象・OR・種類などの絞り込み条件は保存も復元もしない (検索語だけ)。
+
+### 5.4 環境設定
+
+「履歴と復元」ページの末尾に節「検索欄の入力履歴」を足す (閲覧履歴と同じ並び):
+
+- チェック「検索欄の入力履歴を保存する」(既定オン)。説明 (弱い文字):
+  「コンテナ検索・現在地の絞り込み・アイテム検索・Everything 検索で実行した検索語を、欄ごとに最近の
+  20 件まで PC 内に保存し、入力欄の▼か ↓ キーで選び直せます。オフにすると、今の入力履歴も消去します
+  (設定の自動バックアップには、しばらく残ります)。」
+- 「入力履歴: N 件を記憶。」と、N > 0 のとき「検索欄の入力履歴をすべて消去」ボタン。押したら App 側で
+  すぐ消去し (閲覧履歴の消去と同じ one-shot 方式)、結果の一言を出す。
+- **オフで OK したら、保存済みの入力履歴も消去する**。「保存しない」と選んだ人の PC に見えない履歴を
+  残さないため、オフの状態を「記録しない・▼を出さない・中身が空」の 1 つにする (§7)。
+- 環境設定の検索索引 (`preferences/search_index.rs`) に 2 項目を登録する (「検索」「履歴」「入力履歴」
+  「history」などで引ける)。
+
+## 6. フォルダバー
+
+- `show_address_bar_history_menu` がオンのとき、アドレス欄に共有部品で▼を内蔵する。右側の
+  「履歴▼」ボタンは無くす。フォルダバーの右側の幅計算 (`ui_main.rs` の right controls の一覧の
+  `"履歴▼"`) からも外し、入力欄の最小幅に▼の幅を含める。
+- 一覧の中身は今の「履歴▼」と同じ: 現在のフォルダを除いた `recent_folders` を最大 20 件、フルパスの
+  monospace、幅は今と同じ `(content_rect.width * 0.72).clamp(560, 1100)` (入力欄より狭くはしない)。
+  選んだら今と同じ `AddressBarNav::Direct(resolve_folder_bar_nav_path(..), ExplicitList)`
+  (アドレス欄の文字は書き換えない)。0 件なら「履歴はありません」。
+- 無効になる条件と tooltip も今と同じ (検索中・★固定中)。★固定中はアドレス欄自体が無効なので▼も無効。
+- フォルダバーの右クリックメニューの表示切り替え・「最近開いたフォルダ履歴をクリア」はそのまま。
+  切り替えの項目名に「履歴▼」と書いているなら、新しい見た目に合う名前 (例:「履歴 (入力欄の▼)」) にする。
+- **フォルダのアドレス欄でも ↓ で一覧が開く**ようになる (部品の共有による新しい操作。今の ↓ は
+  1 行入力では実質何もしない)。
+
+## 7. 状態の組み合わせを減らす検討 (CLAUDE.md の設計原則)
+
+- **一覧の状態は viewport ごとに 1 つの値** (`HistoryPopupState`: 持ち主・選択位置・最後に描いた pass)。
+  egui の popup 状態と二重に持たない。編集・離脱・検索終了・モーダル表示 (入力欄が無効で描かれる)・
+  持ち主が描かれなくなったことで閉じるので、「一覧を開いたまま検索が変わる」「開いたまま別の欄・別の
+  viewport に移る」「開いたまま検索ソースが切り替わる」組み合わせを扱わない (持ち主の id が変われば
+  退役で閉じる)。常設欄と一時バーが同時に描かれても、持ち主は 1 つの入力欄 id なので混ざらない。
+- 一覧の中身は開いている pass ごとに Settings から引く (snapshot を持たない)。開いている間に
+  中身が変わるのは記録 (§5.2) だけで、記録は確定・離脱のときに起き、どちらでも一覧は閉じる。
+- **記録の時点を 2 つに絞る** (確定と、実行済みの語での通常の離脱)。検索の結果到着・デバウンス・ソース切り替え
+  などの非同期の完了では記録しない。離脱の判定は pass の中の 1 か所 (`route_search_escape` の直後) だけで、前の pass のフォーカス所有者との比較で
+  行い、候補を持ち越さない。
+- **オフ = 空** にして「オフだが中身がある」状態を作らない。
+- 環境設定を開いている間は検索欄が使えない (`pinned_search_availability` が Err) ので、消去と記録が
+  競合しない。ダイアログが開いた瞬間のフォーカス喪失で記録されても、live 値を引き継ぐので消えない。
+- まれな失敗は割り切り: 保存は既存の設定保存に任せ、強制終了などで直前の記録が失われても回復処理は
+  足さない (ログと通知も既存の設定保存のまま)。
+
+## 8. 診断ログ・Remote・MCP
+
+- 履歴の中身 (検索語) をログ・perf event・診断 ZIP に出さない。新しい perf event を足すなら件数だけ。
+  既存の text input のキー診断は文字キーを伏せる (`ime_focus.rs` の非文字 allowlist) ので変えない。
+- Remote の一覧系は `settings_kv` から決まったキーだけを読む (`REMOTE_LISTING_SETTINGS_SQL` 等)。新しいキーを
+  その一覧に足さない。ただし Remote のコレクション経路 (`remote_ipc/collections.rs`・
+  `persistent_collections.rs`) と agent_ipc には `Settings` 全体を読む経路がある。読むこと自体は問題ないが、
+  **応答・ログに `search_input_history` が出ないこと**を、実装時に `Settings` を読む経路の出力境界を
+  監査して確かめ、§10 の検査で固定する。
+
+## 9. 公開文書・設計文書
+
+- `htdocs/mimageviewer/manual/search.html`: 「検索欄の常設」付近に入力履歴の説明 (記録する時点・▼と ↓・
+  欄ごと 20 件・オフと消去の場所・Remote/AI 連携に渡さない)。Everything 節の「検索語と結果一覧は
+  mImageViewer の履歴や診断ログに保存しません」を「結果一覧は保存しません。検索語は入力履歴が有効なら
+  PC 内の入力履歴に保存し、診断ログには保存しません」の趣旨に書き直す。
+- `htdocs/mimageviewer/manual/` のフォルダバーの説明 (「履歴▼」の位置・見た目) と設定リファレンス
+  (「履歴と復元」の新項目)、キーボードショートカット (検索欄・アドレス欄の ↓)。
+- `htdocs/mimageviewer/privacy.html`: 日本語の Everything の段落を同じ趣旨で書き直し、
+  「端末内に保存されるデータ」に「検索欄の入力履歴 (欄ごとに最近 20 件、設定と同じ settings.db。
+  環境設定の『履歴と復元』でオフ・消去できる。消去しても設定の自動バックアップにはしばらく残る。
+  リモート閲覧と AI 連携には渡さない)」を足す。**英語側には今 Everything の段落が無い**ので、入力履歴の
+  説明を新しく足す。最終更新日 (日英)。
+- `htdocs/mimageviewer/index.html`: trust-note の「Everything 検索の検索語と結果一覧は保存しません」を
+  「Everything 検索の結果一覧は保存しません。検索欄の入力履歴は PC 内に保存し、環境設定でオフにできます」
+  の趣旨に。カードの字数規則 (`scripts/check_site_cards.py`) を確かめる。
+- 設計文書: `docs/keymap-spec.md` (固定キー)、`docs/README.md` (本書を索引へ)、`docs/ui-responsiveness.md`
+  に影響が無いことの確認 (新しい I/O なし)。「検索語を保存しない / 新しい設定なし」と書いている
+  `docs/spec.md` (111 行付近)・`docs/architecture-overview.md` (128 行付近)・`docs/everything-search-plan.md`
+  (412 行付近) を、§1.756 で入力履歴を保存するようになったことに合わせて直す。
+- 更新履歴と「重要な変更点」(`src/version_highlights.rs` の must_read) は**リリース作業 (Phase 0) で書く**
+  (release-checklist の手順。版番号もそこで決まる)。文面の案をバックログ §1.756 に残しておく。
+
+## 10. テスト
+
+- 単体: `SearchInputHistory` の記録規則 (空白・空・長さ・重複・上限・kind 独立・読み込み正規化)。
+- 状態遷移 (App テスト、常設欄と一時バーの両方で):
+  - 4 種類とも、確定 (Enter・「検索」・予約経路) で記録されること。
+  - コンテナ検索・アイテム検索で、実行済みの語のまま入力欄から離れる (結果のクリック) と記録されること。
+    アイテム検索の取得中 (Running) に結果をクリックしても記録されること。
+  - 入力途中 (フォーカスあり) の語、まだ実行していない語 (デバウンス待ち) は記録されないこと。
+  - Esc で検索を終了した pass、× で解除した pass では記録されないこと。
+  - 現在地の絞り込みで検索対象・OR を変えて実行中のまま離れると、新しい要求の語で記録されること。
+  - 正常な描画 → 途中 return の pass → 正常な描画、と続いたとき、遅れて離脱を記録しないこと。
+  - 検索欄 A → B → 結果一覧と 2 pass で移ったとき、A と B がそれぞれ正しく判定されること (常設欄の並び順を
+    入れ替えても同じ)。
+  - 設定オフでは記録されないこと。オフで OK すると消えること。消去ボタン。環境設定の OK で live の履歴が
+    巻き戻らないこと。
+  - 永続化: settings.db への保存と再読込で履歴が戻ること、キーの無い旧設定を読むと既定オン・空になること、
+    消去後に保存・再読込しても空のままであること。
+- 部品 (handler-level、egui_kittest): ↓ で開く・↑↓・選択中の Enter / NumpadEnter で `Picked` (従来の確定は
+  起きない)・選択なしの Enter は従来の確定・同じ入力の再 pass で 2 回選ばれない・Esc で一覧だけ閉じて
+  入力欄のフォーカスと検索は続く・IME 変換中の ↓ / Enter / Esc では一覧を触らない (開いていても閉じない)・
+  編集で閉じる・▼クリックで開閉し入力欄のフォーカスが保たれる (フォーカスの無い欄では次の pass で入る)・
+  一覧の項目・空白・スクロールバーを、押下と離しを別の pass にして操作しても離脱にならず、項目なら選べる・
+  外側のクリックで閉じる・無効時は開かない・持ち主が描かれなくなったら閉じる (バーを閉じる・
+  モーダルで無効化・検索ソースの切り替え・別 viewport)・一覧が開いている frame で wheel が背面に通らない・
+  消費したキーが native 側からショートカットに漏れない。
+- 非公開: 識別できる語 (例 `miv-history-sentinel-756`) を履歴に入れた状態で、設定の書き出し
+  (`settings_transfer` の既存の非公開値検査を拡張)、Remote のコレクション応答・agent_ipc の代表的な応答に
+  その語が含まれないこと。ログ・perf event に出さないことはコードの監査で確かめる。
+- フォルダバー: ▼で開き、選ぶと移動し、現在のフォルダは出ない。検索中・★固定中は無効。
+  右側の幅計算からボタンが消えても既存の折り返しテスト (`ui_main.rs` の `"履歴▼"` を使うテスト) が通るよう
+  更新する。▼を除いた入力部分が従来の最小幅を保つこと。
+- settings_transfer の分類テスト (全フィールドの分類) が通ること。
+- UI スナップショット: 常設欄 (▼入り)、一覧を開いた状態、フォルダバー。`UPDATE_SNAPSHOTS=1` で更新し、
+  PNG を目視確認する ([ui-snapshot-policy.md](ui-snapshot-policy.md))。`python scripts/check_ui_glyphs.py`。
+
+## 11. 実機で確かめること (サブ PC / 利用者)
+
+- 4 種類の常設欄と一時バーで、▼が入力欄の枠の中に見え、フォーカス時に枠ごと強調されること。
+- Ctrl+G で入力して結果をクリックしたあと、▼にその語が出ること。入力途中の語が出ないこと。
+- ↓ / ↑ / Enter / Esc、日本語の変換中の ↓ / Enter / Esc。
+- フォルダバーの▼の見た目・一覧の幅・選んだときの移動。小さいウィンドウ・UI 倍率での折り返し。
+- 環境設定の「履歴と復元」でオフ・消去。
+
+## 12. 実装・検証記録 (2026-11-11)
+
+作業場所は `G:\home\mimageviewer-756`、`feat-756-search-history`、開始時 HEAD は
+`1d5f5436682690fff6d097c8ee6e14291239b418`。未コミットで設計担当へ渡す。
+製品 exe は起動しない。本体 lib 全件・`test-full.ps1` は設計担当の検証枠へ残す。
+
+### 実装時の確認と調整
+
+仕様の変更はない。TextEdit suffix、IME helper の描画後の focus filter、検索確定・Esc・
+実行済み要求・live Settings の引継ぎを既存コードで確認した。独立レビューでも設計の実質的な矛盾は見つからなかった。
+
+- egui 0.37 では旧 `raw_scroll_delta` の代わりに、既存の
+  `wheel_input::consume_wheel_input` を使う。既存 menu の wheel 消費と同じ経路。
+- suffix atom は22ptで、本文との間には `icon_spacing` が加わる。
+  `ui_history_field::reserved_width(ui)` にまとめ、フォルダバー・その折り返し判定・fixtureで共有する。
+  当初は常設欄にも加算したが、下記の設計担当の目視後の修正で取り除いた。
+  フォルダ欄は従来の欄全幅168ptを基準に、suffix追加後も実 `text_clip_rect` 幅を維持する。
+  TextEditの内側余白はeguiのstyleが所有し、本文160ptという固定値は仮定しない。
+- 編集とEnterが同じ入力batchに来た場合は編集を優先して一覧を閉じ、従来のTextEdit確定へ渡す。
+  他のegui menu表示中の再openを抑え、補助の矩形・focus要求もviewportごとのkeyにした。
+- `search_input_owner` のkey/passはContextのdata lockを取る前に取得する。
+  最初の対象試験で見つかったlock再入をこの境界で修正した。
+
+### 記録元・非公開の監査
+
+`submit_search_input` の本番の呼出し元は常設欄のSubmit/Picked、現在地・コンテナ・アイテム・
+Everythingの一時バー、`route_pending_search_submit` の予約入力経路だけ。
+`settle_search_input_departure` の本番の呼出し元はmain updateの
+`route_search_escape` 直後・`record_search_input_focus` 直前の1箇所だけ。
+Remote・MCP・タグビューからの呼出しはない。
+
+Settings全体を読む次の8箇所を、応答・logの出力境界まで確認した。
+
+| 読み込み境界 | 出力で使う情報 |
+| --- | --- |
+| `remote_ipc/collections.rs` `CollectionSettingsSource::load` | Homeの登録先、SmartFolder・お気に入り検索・タグの固定DTO。表示/サムネイル設定と結果項目だけ |
+| `remote_ipc/persistent_collections.rs` のSettings読み込み | snapshot/navigationのprepared entries・view facts・表示設定。wire/cache keyとも列挙フィールドだけ |
+| `agent_ipc/library.rs` の2箇所 | 本棚の場所、一覧の表示順 |
+| `agent_ipc/folder.rs` | 表示/走査条件 |
+| `agent_ipc/thumbnail.rs` | サムネイル品質とI/O許可 |
+| `agent_ipc/metadata_write.rs` | 本棚の場所 |
+| `agent_ipc/mod.rs` のSearchItems | 可視性・EPUB・書庫のpolicy |
+
+いずれもSettings全体をserializeせず、履歴をDTOへ投影しない。Remote/agentのperf・request logは
+operation/tool/id/count/outcome/ms等で、応答本文や履歴を出さない。
+新しい履歴のDebugは件数だけ。設定書き出しは履歴を除外する。
+診断ZIPはlogの収集であり、設定DBを同梱しない。新しいlog/perf出力は追加していない。
+`miv-history-sentinel-756` を実際の履歴に入れた設定書き出し・Remote・agentの応答/log検査を追加した。
+
+### 対象検証
+
+以下のbuild/testにはすべて `$env:MSBUILDDISABLENODEREUSE='1'` を設定した。
+nativeの並列buildが失敗したため、以後はCargoの `-j 1` を使った。
+
+| 検証 | 結果・log |
+| --- | --- |
+| 初回 `cargo check -p mimageviewer --bin mimageviewer-core` | turbojpeg native build失敗。serial cmake build成功後に進めた。`target/history756-check.log` / `history756-native-build.log` |
+| 初回の絞ったnextest 589件 | focus記録のContext lock再入を検出して中断。修正後の検証へ。`target/history756-focused.log` |
+| 関連nextest 1,076件 | 1,071成功・5失敗。分類件数と整形依存のtest各1、意図した画像差分3。`target/history756-related.log` |
+| 幅補正後の影響nextest 157件 (`UPDATE_SNAPSHOTS=1`) | 142成功・15失敗。失敗は部品fixtureの▼フォント未登録。本体フォントへ統一。分類/index修正と画像3枚更新は成功。`target/history756-affected-update-final.log` |
+| 本体フォントでの部品16件 | 15成功・1失敗。新規testの本文160pt仮定だけを訂正し、従来の全幅168ptに対する実本文幅一致を検査。`target/history756-field-fonts.log` |
+
+最終の対象結果（すべてCargoの実exit codeを確認）:
+
+| 検証 | 結果・log |
+| --- | --- |
+| 部品16件（本体フォント、glyph/accessibility検査あり） | 16成功・0失敗。間隔0/4/9ptで従来本文幅を維持。`target/history756-field-green.log` |
+| フォルダバーの既存group、更新なしの通常比較 | 25成功・0失敗。幅・折り返し・移動・IME・3画像の通常比較を含む。`target/history756-folder-green.log` |
+| `UPDATE_SNAPSHOTS=1` のintegration UI全件 | 251成功・0失敗。`target/history756-ui-update-final.log` |
+| 更新指定なしのintegration UI全件 | 251成功・0失敗。`target/history756-ui-green.log` |
+| core check | exit 0、2分52秒。既存警告326箇所を差分の追加行/新規ファイルと照合し、変更由来は0。`target/history756-check-final.log` / `history756-warning-audit.json` |
+| workspace全体 `cargo fmt` / `cargo fmt --check` | 成功 |
+| UI glyph / site cards / `git diff --check` | glyph問題0、53 cards中超過0、diff check成功 |
+| 確認用 `build-dev.ps1 -PreserveRuntime` | exit 0。normal feature set、`CARGO_BUILD_JOBS=1`。core（30分37秒）とRemote・EPUB worker・MCP adapter・music-video editorを生成。依存検査 `runtime=4 pe=5` 成功。製品は起動していない |
+
+影響外の成功結果を再利用し、失敗した分類/index、部品、幅/フォルダバー、画像の経路を修正後に再検証した。
+1回の「1,076件全成功」や、本体lib全件の成功として合算しない。
+最初の部品fixtureの不足は本体フォント・明示的なアクセシビリティ名で訂正し、検査は無効にしていない。
+
+実行コマンド（上記表のlogと対応。全件lib/full gateではなく明示filterだけ）:
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+# 関連1,076件の調査・回帰
+cargo nextest run -j 1 -p mimageviewer --lib --no-fail-fast -E 'test(/search|section207|section1684|ui_toolbar_layout|settings_transfer|keymap|ime_focus|main_chrome|ui_dialogs::preferences::/)'
+# 幅補正後の157件と既存画像3枚の更新
+$env:UPDATE_SNAPSHOTS='1'
+cargo nextest run -j 1 -p mimageviewer --lib --no-fail-fast -E 'test(/ui_history_field|pinned_search|section207|section1684|ui_toolbar_layout|settings_transfer|search_input_history/)'
+# 部品の最終16件
+cargo test -j 1 -p mimageviewer --lib ui_history_field::tests -- --test-threads=1
+# フォルダバー通常比較25件
+Remove-Item Env:UPDATE_SNAPSHOTS -ErrorAction SilentlyContinue
+cargo test -j 1 -p mimageviewer --lib ui_main::section207_tests -- --test-threads=1
+# 全UI画像の更新と通常比較
+$env:UPDATE_SNAPSHOTS='1'
+cargo test -j 1 --test ui_snapshot
+Remove-Item Env:UPDATE_SNAPSHOTS -ErrorAction SilentlyContinue
+cargo test -j 1 --test ui_snapshot
+cargo check -j 1 -p mimageviewer --bin mimageviewer-core
+cargo fmt
+cargo fmt --check
+python scripts/check_ui_glyphs.py
+python scripts/check_site_cards.py
+git diff --check
+$env:CARGO_BUILD_JOBS='1'
+.\scripts\build-dev.ps1 -PreserveRuntime
+```
+
+PowerShellのstderr出力と終了状態を混同しないよう、記録用に出力をredirectしたCargoコマンドでは
+`$LASTEXITCODE` を明示的に保存して同じ値で終了した。確認用build scriptはredirectせずに呼び出した。
+
+### 画像
+
+追加3枚、更新18枚、計729,735 bytes。実装担当は21枚すべてを目視した。
+normal/middleのinline配置が独立したため、既存のフォルダバー36条件は23名・23種類の画素配置を厳密に検査する。
+一時的なalias診断モードは削除し、viewport内矩形・全操作のhit検査は維持した。
+画像一覧は下の変更ファイル一覧のPNG項目を参照。設計担当の目視確認は別に残す。
+
+### 変更ファイル
+
+変更はこのworktreeの59ファイル。新規Rustは共有部品とApp回帰、PNGは新規3枚・更新18枚。
+`CHANGELOG.md` と `src/version_highlights.rs` は変更していない。
+公開・設定・キー・フォルダバーの説明と、リリース担当向け文面の案も含む。
+
+- `docs/README.md`
+- `docs/architecture-overview.md`
+- `docs/everything-search-plan.md`
+- `docs/keymap-spec.md`
+- `docs/next-release-backlog.md`
+- `docs/search-input-history-plan.md`
+- `docs/spec.md`
+- `docs/ui-snapshot-policy.md`
+- `htdocs/mimageviewer/index.html`
+- `htdocs/mimageviewer/manual/grid.html`
+- `htdocs/mimageviewer/manual/search.html`
+- `htdocs/mimageviewer/manual/settings.html`
+- `htdocs/mimageviewer/manual/shortcuts.html`
+- `htdocs/mimageviewer/privacy.html`
+- `src/agent_ipc/logging_tests.rs`
+- `src/app.rs`
+- `src/app/main_chrome.rs`
+- `src/app/pinned_search.rs`
+- `src/app/pinned_search/history_tests.rs` (new)
+- `src/app/tests/search_submit.rs`
+- `src/global_search_ui.rs`
+- `src/global_search_ui/everything.rs`
+- `src/global_search_ui/everything/shortcut.rs`
+- `src/global_search_ui/everything/ui.rs`
+- `src/ime_focus.rs`
+- `src/lib.rs`
+- `src/remote_ipc/collections.rs`
+- `src/remote_ipc/persistent_collections.rs`
+- `src/settings.rs`
+- `src/settings_transfer.rs`
+- `src/ui_dialogs/preferences.rs`
+- `src/ui_dialogs/preferences/pages.rs`
+- `src/ui_dialogs/preferences/search_index.rs`
+- `src/ui_history_field.rs` (new)
+- `src/ui_main.rs`
+- `src/ui_pinned_search.rs`
+- `src/ui_toolbar_layout.rs`
+- `tests/snapshots/everything_search_bar_dark.png`
+- `tests/snapshots/everything_search_bar_light.png`
+- `tests/snapshots/everything_search_bar_narrow_dark.png`
+- `tests/snapshots/folder_address_history_light.png` (new)
+- `tests/snapshots/folder_bar_organize_destinations.png`
+- `tests/snapshots/folder_bar_organize_destinations_scrolled.png`
+- `tests/snapshots/folder_bar_organize_destinations_toggle.png`
+- `tests/snapshots/folder_toolbar_dpi150_first_row.png`
+- `tests/snapshots/folder_toolbar_dpi150_last_row.png`
+- `tests/snapshots/folder_toolbar_dpi150_middle_row.png`
+- `tests/snapshots/folder_toolbar_narrow_first_row.png`
+- `tests/snapshots/folder_toolbar_narrow_last_row.png`
+- `tests/snapshots/folder_toolbar_narrow_middle_row.png`
+- `tests/snapshots/folder_toolbar_normal_first_row.png`
+- `tests/snapshots/folder_toolbar_normal_last_row.png`
+- `tests/snapshots/folder_toolbar_normal_middle_inline.png`
+- `tests/snapshots/folder_toolbar_normal_middle_row.png`
+- `tests/snapshots/search_history_popup_dark.png` (new)
+- `tests/snapshots/toolbar_pinned_search_history_light.png` (new)
+- `tests/snapshots/toolbar_pinned_search_light.png`
+- `tests/snapshots/toolbar_pinned_search_narrow_dark.png`
+- `tests/ui_snapshot.rs`
+
+### 実機・全体gate
+
+本体lib全件・workspace/vendorのfull gate、実機の日本語IMEと操作・倍率・見た目の確認は未実施。
+製品の起動やforeground/inputの操作はしていない。強制終了・保存失敗の回復処理は追加していない。
+
+確認用一式は `target/dev-runtime/` に配置済み。通常版・トレイ常駐のmImageViewerを先に終了し、
+このworktreeから利用者が起動する（単一起動mutexを共有）。
+通常の `%APPDATA%\mimageviewer` を使うため、実際の設定・データを更新する可能性がある。
+
+```powershell
+Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
+```
+
+確認する操作: 4種類それぞれの検索確定後、▼/↓で選び直してEnterで1回だけ実行されること、
+Escで一覧だけが閉じること、日本語IME変換中のキー、フォルダバー右端の▼、
+環境設定での全件消去・保存オフでOKした後の▼非表示。
+
+### 設計担当の目視後の修正
+
+初回実装は設計担当が `ff5e51641` にコミット済み。この追補は同commitを基点とする
+未コミット差分で、作業場所・全件テスト禁止・製品起動禁止は上記と同じ。
+
+- 常設欄だけでsuffix幅をsectionのframe予約とTextEdit幅へ加算していたため、
+  `toolbar_pinned_search_light` の折り返しが1段増えていた。加算を両方から外し、
+  140〜220ptのclampを含む従来の幅計算に戻した。▼はその内側に入り、本文領域が譲る。
+  一時バーとフォルダバーの幅計算は変更しない。
+- 共有の履歴行を通常の `Button::new(...).selected(...)` から `Button::selectable` へ変更。
+  文字の右にgrow atomを置き、行幅いっぱいのクリック領域と省略・tooltipを保ったまま左寄せにする。
+  通常行の塗りを消し、選択・hoverの強調はeguiの標準styleに任せる。monospaceのフルパスも同じ経路。
+- `section1409_*` の既存期待値を変更せず、1120/720/360/240pt・4種類の実rendererで、
+  履歴オン/オフのsection・入力欄・解除/検索ボタンの矩形が完全一致する回帰を追加した。
+
+独立レビューでは重要な問題・不足なし。レビュー担当は編集・build/test・製品起動を行わず、
+検証は実装担当が所有した。
+
+追補のbuild/testもすべて `MSBUILDDISABLENODEREUSE=1`、Cargoは `-j 1`（build scriptは
+`CARGO_BUILD_JOBS=1`）。本体lib全件/full gateは実行していない。
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+$env:UPDATE_SNAPSHOTS='1'
+cargo nextest run -j 1 -p mimageviewer --lib --no-fail-fast -E 'test(/ui_history_field::tests|ui_pinned_search::tests/)'
+cargo test -j 1 --test ui_snapshot
+Remove-Item Env:UPDATE_SNAPSHOTS -ErrorAction SilentlyContinue
+cargo test -j 1 --test ui_snapshot
+cargo check -j 1 -p mimageviewer --bin mimageviewer-core
+cargo fmt
+cargo fmt --check
+python scripts/check_ui_glyphs.py
+python scripts/check_site_cards.py
+$env:CARGO_BUILD_JOBS='1'
+.\scripts\build-dev.ps1 -PreserveRuntime
+git diff --check
+```
+
+| 追補の検証 | 結果・log |
+| --- | --- |
+| 部品16件・常設欄4件 | 20成功・0失敗。`target/history756-followup-focused.log` |
+| integration UI更新 | 251成功・0失敗、40.97秒。`target/history756-followup-ui-update.log` |
+| integration UI通常比較 | 251成功・0失敗、37.49秒。`target/history756-followup-ui-green.log` |
+| core check | exit 0、16.37秒。警告326件で初回と同じ。`target/history756-followup-check.log` |
+| workspace全体fmt / fmt check / glyph / site cards | 成功。glyph問題0、53 cards中超過0 |
+| 確認用 `build-dev.ps1 -PreserveRuntime` | exit 0。coreは4分18秒、付属exeも成功。依存検査 `runtime=4 pe=5` 成功。通常構成、製品は未起動 |
+| `git diff --check` | 成功 |
+
+更新PNGは次の4枚だけ（新規なし、計61,794 bytes）。全4枚を実装担当が目視し、
+常設欄のアイテム検索が他の常設欄と同じ行に収まること、暗色一覧の左揃えと選択行だけの塗り、
+狭幅時の欄・ボタンの配置、▼と文字の非重複を確認した。
+一時バー・フォルダバーのPNGは変更なし。
+
+- `tests/snapshots/toolbar_pinned_search_light.png`
+- `tests/snapshots/toolbar_pinned_search_narrow_dark.png`
+- `tests/snapshots/toolbar_pinned_search_history_light.png`
+- `tests/snapshots/search_history_popup_dark.png`
+
+PNG以外の変更は `src/ui_pinned_search.rs`、`src/ui_history_field.rs`、本書、
+`docs/ui-snapshot-policy.md`。計8ファイルを未コミットで引き渡し、製品exeは未起動。
+更新済みの確認用coreの起動コマンドと実設定への注意は上の「実機・全体gate」と同じ。
+今回の実機確認対象は通常幅の常設欄の折り返しと、検索語/フォルダパスの履歴行の左揃え・
+通常/選択/hoverの見た目。実機確認自体は未実施。
+
+### 独立実装レビュー後の修正（9eedaabd9基点）
+
+設計担当からのP2 1件・P3 2件への対応。作業はこのworktreeだけ、未コミットで引き渡す。
+P2はコードから確認した未フォーカス欄の▼の同passクリック→次passキーの所有権漏れで、
+実機での発生を確認したという意味ではない。
+
+- 部品のprivate tempフォーカス予約を廃止し、pass通知を経由して既存のAppの単一claimへ統合した。
+  常設4種類・一時バー4種類・フォルダ欄が同じviewport/widget/passを使う。
+- 描画前のmain/keymapと通常予約Enter経路は、同ownerの履歴PendingFocusを保護する。
+  既存のほかのPendingFocusの挙動を一律には変えない。
+- IME helperの従来要求は描画後にfocusを付けるため、予約直後の編集とEnterを保持するには
+  IME所有者内で描画前に実体化する入口が必要だった。短い `activate_reserved_focus` を追加し、
+  begin-passが残した矢印のfocus directionを終端する。同じownerのphaseを更新し、入力編集器・待機・
+  retry/discard・新しい保持状態を追加せずTextEditに編集を任せる。
+  plain Enterの同pass取得/確定は `lost_focus` の過去pass制約をpass通知で補い、通常の確定・claimへ流す。
+- 予約の新規経路で既存の共有focus flagを立てない。別欄へのpointer pressや実フォーカスを優先し、
+  無効化/非表示/利用不可の退役後には予約からfocusを付けない。
+- `surrender_focus_on` の変更は短いDrop guardで通常終了とpanicの両方を復元する。復旧処理は足さない。
+- フォルダの通常確定でもfocus claimと `address_has_focus` を終了し、次passのグリッド入力へ戻す。
+  履歴pick後にhelperの復帰契約が残ることを次pass回帰で検出したため、明示確定はIME側の短い
+  `end_text_input` で実フォーカスと同viewport/widgetの契約を一緒に終了する。
+  現在passのcached ownerとキーclaimは保持し、別欄・別viewportの契約は消さない。
+- `search-thumb-parent-catalog-plan.md` §15は、キャッシュ自体に検索語/結果の並びを保存しないことと、
+  別途有効なら入力履歴を保存することを分け、§1.756への参照を付けた。
+
+簡素化の検討: 短い入力欄のfocus引渡しなのでモーダル化は不要。既存の1pass claimを使い、
+別のpending、入力イベントの保存/再送、独自のテキスト編集を持たない方法を採った。
+構造は実装前に独立reviewerと合意し、実装中の退役・通常Enter・pointer優先・pass終端も指摘に合わせて確認した。
+実装と関連文書の独立レビューでは、残る重要指摘はない。検証は実装担当が所有し、reviewerは再実行していない。
+
+すべて `MSBUILDDISABLENODEREUSE=1`、Cargoのコンパイルは `-j 1`。
+
+| 今回の検証 | 結果・log |
+| --- | --- |
+| 初回追加3件 | 2成功・1失敗。folder fixtureが既定quick slotの別履歴を読んでいた。`target/history756-reviewfix-new.log` |
+| 描画前IME受付と編集batchを追加した5件 | 4成功・1失敗。同じfixture前提を修正し、active slotなし・target履歴を明示した。`target/history756-reviewfix-new2.log` |
+| 関連filter 134件 | 133成功・1失敗。履歴pick後の次pass復帰契約残留を検出し、上記IME終了境界で修正した。`target/history756-reviewfix-related.log` |
+| `cargo test -j 1 -p egui-ime --lib` | 31成功・0失敗。別widget/viewportの契約を保持する追加1件を含む。`target/history756-reviewfix-ime.log` |
+| 本体の最終関連filter | 146成功・0失敗、340.546秒。`target/history756-reviewfix-related-final.log` |
+| UIスナップショット通常比較 | 251成功・0失敗、42.96秒。`target/history756-reviewfix-ui.log`。更新モードなし |
+| 最終core check | exit 0、33.54秒。警告326件は既存と同じ。追加行上の警告参照0。`target/history756-reviewfix-check-final.log` / `history756-reviewfix-warning-audit.json` |
+| workspace全体fmt / fmt check / glyph / site cards / diff check | 成功。glyph問題0、53 cards中超過0 |
+| 確認用 `build-dev.ps1 -PreserveRuntime` | exit 0。通常構成のcore（16分）と付属exeを更新。依存検査 `runtime=4 pe=5` 成功。製品は未起動 |
+
+追加App handler回帰は、実際の▼の押下・離しを同じpassに入れ、待機passを挟まず次passに
+↓/↑/Enter/↓＋Enterを入れる。常設4種・一時4種・フォルダの36条件、Text/Paste＋Enterの16条件、
+Metadata/Everythingの▼の移動順×描画順の4条件を検査する。
+描画前と描画後の実handler、egui/nativeのキーclaim、end-pass後のfocus維持、フォルダ確定後の
+次passグリッド復帰も対象。部品の退役3条件とconfigure panic時の設定復元も追加した。
+
+本体lib全件・full gateと実機確認は今回も未実施。PNGは更新も追加もなく、既存251件との通常比較が成功した。
+`CHANGELOG.md` と `src/version_highlights.rs` は変更しない。
+
+最終検証のコマンド（すべてこのworktreeで実行。確認用buildはstderrをredirectせず呼び出した）:
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+cargo test -j 1 -p egui-ime --lib
+cargo nextest run -j 1 -p mimageviewer --lib --no-fail-fast -E 'test(/ui_history_field::tests|pinned_search::|keyboard_input::tests|ime_focus::|section207|section1684|section1409|keymap::.*owner/)'
+Remove-Item Env:UPDATE_SNAPSHOTS -ErrorAction SilentlyContinue
+cargo test -j 1 --test ui_snapshot
+cargo check -j 1 -p mimageviewer --bin mimageviewer-core
+cargo fmt
+cargo fmt --check
+python scripts/check_ui_glyphs.py
+python scripts/check_site_cards.py
+git diff --check
+$env:CARGO_BUILD_JOBS='1'
+.\scripts\build-dev.ps1 -PreserveRuntime
+```
+
+今回の変更は次の19ファイル。保持stateやSettings/公開文言の変更は増やしていない。
+
+- `crates/egui-ime/src/lib.rs`
+- `docs/architecture-overview.md`
+- `docs/coding-conventions.md`
+- `docs/keymap-spec.md`
+- `docs/search-input-history-plan.md`
+- `docs/search-thumb-parent-catalog-plan.md`
+- `src/app.rs`
+- `src/app/pinned_search.rs`
+- `src/app/pinned_search/history_tests.rs`
+- `src/app/tests/search_submit.rs`
+- `src/global_search_ui.rs`
+- `src/global_search_ui/everything.rs`
+- `src/global_search_ui/everything/shortcut.rs`
+- `src/global_search_ui/everything/ui.rs`
+- `src/ime_focus.rs`
+- `src/keyboard_input.rs`
+- `src/ui_history_field.rs`
+- `src/ui_main.rs`
+- `src/ui_pinned_search.rs`
+
+確認用coreは `target/dev-runtime/mimageviewer-core.exe` に更新済み。起動コマンドと通常プロファイルへの
+注意は上の「実機・全体gate」と同じ。今回の実機確認対象は、未フォーカス欄の▼からすぐ↓/Enter、
+別欄への▼移動、日本語IME中のキー、フォルダ確定後のグリッドキー復帰。実機確認は行っていない。
+
+### 高速クリックの取りこぼし（3d5c221e8基点）
+
+2026-11-11。サブPCの画面操作ツールによる報告を調査した。人による操作・こちらでの製品起動は行っていない。
+実Appのrendererを使うheadless回帰とvendor/eguiのソースで、別々の2経路を確認した。
+
+1. `show_singleline` の `outside_pointer` がhelperの前で `ctx.read_response(id)` を呼んでいた。
+   `vendor/egui/src/context.rs` の `read_response` は矩形の参照だけではなく `get_response` を呼ぶ。
+   同passのPointerMoved＋押下＋離しでは `pointer.any_pressed()` と `pointer.any_click()` がともに成立し、
+   `SurrenderFocusOn::Clicks` が履歴ownerのfocusを保護前に外す。その後の `!has_focus` により一覧が閉じ、
+   行のクリックを読むところへ届かない。行のhoverが既に成立していても起きる。
+   押下・離しを分けると、押下時はany_clickがなく、離し時はoutside_pointerの参照がなく、この経路を通らない。
+   入力欄の矩形は公開viewportのWidgetRectから直接読み、currentの有効矩形→prevのfallbackを保つ形で修正した。
+2. 初回のAreaはサイズ未確定で、`area.rs` のsizing passは不可視・非対話として保存される。
+   次passの `Context::begin_pass` はprevのwidgetsとAreasのinteractableを使うため、このlayerをhit testから除外する。
+   描画中にAreaが対話可能になっても、そのpassの押下先は既に背面へ決まっている。
+   未focus欄から開いた直後に押すと `outside_pointer` が真になり、既存予約からのfocus取得を行わず閉じる。
+   150%小窓で、同frameの押下＋離しと、hoverなしの連続2frameの両方を再現した。
+   Areaの `ui.is_sizing_pass()` のときだけ `request_discard` を要求し、本文の計測とArea終端は最後まで通す。
+   通常の複数passで既知サイズ・対話可能な状態を保存し、次backend frameの入力を受けるようにした。
+
+レイヤーの確認: 実フォルダ欄の一覧と実facet「サイズ」の交差部分をクリックする配置を使用した。
+安定表示後の失敗では履歴のForeground layerがhit対象で、行もenabled/visibleだった。初回表示の失敗では
+同じ交差部分のhit対象がBackgroundになり、履歴行はenabled=false/visible=falseだった。
+実facetはContextのrootから継承するBackgroundなので、準備済みの履歴Foregroundより上に並ぶものではない。
+Areasの順序は非表示でも残るが、`layer_id_at` はcurrent/lastのvisibleとinteractableも要求する。
+2pass以上非表示のAreaが順序だけで入力を覆う経路はなかった。`move_to_top` はend-passまで順序を確定せず、
+同時要求では以前の相対順を維持するため、履歴が必ず最前面になることは保証しない。
+根拠のないtop要求の追加はしていない。
+`retire` は同ownerを毎pass描く今回の条件で閉じず、行の点は入力欄・一覧の外を押す `outside_press` にも該当しない。
+安定表示後の取りこぼしは1のfocus離脱、初回は2のhit testと予約受付の境界で説明できる。
+
+簡素化とレビュー: 実装前の独立ソースレビューで2経路と修正方針を確認した。
+この短い一覧をモーダル化する必要はなく、状態・入力の保存/再送・時間待ち・click先の後付け変更を増やさない。
+初回レイアウト計測を通常の複数passで完了させる。sizing中のinteractableを強制変更せず、
+max_passesの強制変更やdiscard予算超過時のretryも加えない。IME helper、既存focus予約、通常の行のクリックを使う。
+
+追加回帰は `src/app/pinned_search/history_tests.rs` の `section1756_history_pointer_*` 7件。
+常設4種・一時4種の実描画、フォルダtoolbarと実facet、同frameの移動＋押下＋離し、hoverなし2frame、
+hover済の行からの高速クリック、初回直後、100%/150%小窓を検査する。
+初回は待機frameを入れず、Contextの `run_ui` を使って本番と同じlayoutの再passを実行する。
+フォルダ一覧が入力欄より広く「サイズ」と重なること、hit対象、選んだ語/移動先、Sizeメニューが開かないことも確認する。
+App fixtureの隔離データを使い、Everythingは不正queryで実IPCを開始しない。desktop/GPUの操作は行わない。
+
+修正前後の切り分け:
+
+| 段階 | 結果・log |
+| --- | --- |
+| 製品コード未変更の新規7件 | 2成功・5失敗。安定表示後のフォルダ・一時欄・hover済一時欄の高速クリック不達を再現。初回2件は下記fixtureの読み取り誤り。`target/history-pointer-red.log` |
+| 矩形参照だけ修正、初回fixture修正後の7件 | 5成功・2失敗。初回フォルダの同frame/連続2frameで実際のpick不達、背景hit、非対話行を再現。`target/history-pointer-red-sizing.log` |
+| 両修正後の関連filter | 新規7件（28条件）を含む182件すべて成功、17093件は対象外。`target/history-pointer-related.log` |
+| `cargo test -j 1 --test ui_snapshot` | 251件すべて成功。既存PNGとの通常比較、PNG更新・追加なし。`target/history-pointer-ui.log` |
+| `cargo check -j 1 -p mimageviewer --bin mimageviewer-core` | exit 0。既存と同じ326警告、追加行の警告参照0。`target/history-pointer-check.log` / `target/history-pointer-warning-audit.json` |
+| workspace全体の `cargo fmt` / `cargo fmt --check` / `git diff --check` | すべて成功 |
+| `python scripts/check_ui_glyphs.py` / `python scripts/check_site_cards.py` | glyph問題0、53 cards中超過0 |
+| 通常構成の `build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | exit 0。coreを7分47秒で更新、付属exeも成功。`target/vcrt-pe-reports/dev-runtime.json` の依存検査runtime=4/pe=5成功。製品未起動 |
+
+初回fixtureはend_pass後のthis_passを読んで0行だったため、完了したprev_passを読むよう直した。
+これはテスト側の誤りであり製品不具合とは数えない。初回の製品不具合は2段階目のクリック不達で確認した。
+
+残る不明点: サブPCの実入力イベント列や各時点のArea idを採取していないため、報告された全クリックを
+この2経路のどちらかへ個別に断定はできない。長くhoverしても背面が強調され続けたか、人の通常操作でも
+同じ頻度かは未確認。今回の再現で、少なくとも初回表示時に背景がhit対象となる経路と、hover後でも
+同frameクリックが失われる経路は確認できた。
+
+最終差分の独立レビューでは重要な問題は見つからなかった。追加のlayout passで予約のissued+1・
+ownerのdrawn_pass+1の範囲を外れず、RawInputの再送も行われないことを確認した。
+検証実行は実装担当が所有し、reviewerはソースと同じ結果を確認して再実行しない。
+
+自動検証のコマンド（すべてこのworktree、全Cargoコマンドで `MSBUILDDISABLENODEREUSE=1`）:
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+# 上記redの切り分け2段階でそれぞれ実行
+cargo nextest run -j 1 -p mimageviewer --lib --no-fail-fast -E 'test(/section1756_history_pointer/)'
+# 両修正後。新規7件をこの182件に含め、重複実行していない
+cargo nextest run -j 1 -p mimageviewer --lib --no-fail-fast -E 'test(/ui_history_field::tests|pinned_search::|keyboard_input::tests|ime_focus::|section207|section1684|section1409|keymap::.*owner|folder_bar_|address_bar_focus|section292|main_chrome::tests/)'
+Remove-Item Env:UPDATE_SNAPSHOTS -ErrorAction SilentlyContinue
+cargo test -j 1 --test ui_snapshot
+cargo check -j 1 -p mimageviewer --bin mimageviewer-core
+cargo fmt
+cargo fmt --check
+python scripts/check_ui_glyphs.py
+python scripts/check_site_cards.py
+git diff --check
+```
+
+変更は `src/ui_history_field.rs`、`src/app/pinned_search/history_tests.rs`、本書の3ファイル。
+このworktreeに未コミットで残す。本体lib全件・full gateは指示どおり実行していない。
+
+確認用ビルドは通常構成で次を使用した（製品は起動しない）:
+
+```powershell
+$env:MSBUILDDISABLENODEREUSE='1'
+$env:CARGO_BUILD_JOBS='1'
+.\scripts\build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0
+```
+
+初回の既定指定は、MSBuildプロセス存在による待機に入ったところで自分のscriptだけ中断した。
+今回の差分はUI・test・文書だけで、前回の確認用ビルドからネイティブ依存は変更されていないため、
+既存の待機なしオプションで再開した。実際にネイティブ依存の再コンパイルはなく、coreの再コンパイルから進めた。
+他のMSBuildプロセスや稼働中アプリの停止・製品起動は行っていない。
+
+確認用coreは `target/dev-runtime/mimageviewer-core.exe`。手動確認は、フォルダ履歴のfacet「サイズ」と重なる行、
+常設・一時検索欄の行を素早くクリックし、150%の小窓でも選択できることを対象とする。
+起動コマンドは `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`。
+通常の `%APPDATA%\mimageviewer` を使い実設定・データを更新し得るので、インストール版・常駐tray版を先に終了する。
+本実装担当による実機・人手確認は行っていない。

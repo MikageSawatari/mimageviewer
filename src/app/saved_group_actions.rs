@@ -40,11 +40,32 @@ enum SavedGroupOpenPhase {
     },
 }
 
+enum SavedGroupOpenSource {
+    Plain(SmartFolderSourceLease),
+    Search(super::MainListNavigation),
+}
+
+impl SavedGroupOpenSource {
+    fn is_current(&self, app: &App) -> bool {
+        match self {
+            Self::Plain(source) => app.smart_folder_source_lease().as_ref() == Some(source),
+            Self::Search(navigation) => app.main_list_navigation_is_current(navigation),
+        }
+    }
+
+    fn search_navigation(&self) -> Option<&super::MainListNavigation> {
+        match self {
+            Self::Plain(_) => None,
+            Self::Search(navigation) => Some(navigation),
+        }
+    }
+}
+
 /// One main-grid navigation request owns its source, preparation, and ready payload.
 pub(super) struct SavedGroupOpenTransition {
     id: u64,
     action: KeyAction,
-    source: SmartFolderSourceLease,
+    source: SavedGroupOpenSource,
     current_book: Option<PathBuf>,
     current_collection: Option<CollectionId>,
     requested_collection_target: Option<CollectionId>,
@@ -122,6 +143,54 @@ fn saved_group_source_unavailable_message(projected_main_context: bool) -> &'sta
 }
 
 impl App {
+    /// A prepared book selected by the user leaves a temporary search only at
+    /// the shared successful list-adoption boundary. Plain keeps its old loader.
+    pub(crate) fn open_user_book_with_scan(
+        &mut self,
+        path: PathBuf,
+        scan: ScannedDir,
+        navigation: Option<super::MainListNavigation>,
+    ) -> bool {
+        if navigation.is_none()
+            && !(self.global_search.active || self.favsearch.active || self.tag_view.active)
+        {
+            return self.load_folder_with_scan_owned(
+                path,
+                Some(scan),
+                super::OpenRequestOwner::Navigation,
+                super::StartupListIntent::ExplicitList,
+            );
+        }
+        if self.location_jump_admission_blocked() {
+            return false;
+        }
+        let navigation = navigation.unwrap_or_else(|| {
+            self.capture_main_list_navigation(
+                super::MainHistoryOperation::Direct(
+                    super::DirectNavigationPurpose::ExitTemporaryView {
+                        selection: crate::ui_dialogs::context_menu::JumpToFolderSelection::None,
+                    },
+                ),
+                self.copied_destination_source_proof(),
+            )
+        });
+        if !self.main_list_navigation_is_current(&navigation) {
+            return false;
+        }
+        matches!(
+            self.load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation(
+                path,
+                Some(scan),
+                super::OpenRequestOwner::Navigation,
+                None,
+                Some(super::OpenPathKind::Directory),
+                super::StartupListIntent::ExplicitList,
+                Some(navigation),
+            ),
+            super::FolderOpenOutcome::Loaded | super::FolderOpenOutcome::Classifying
+        )
+    }
+
     pub(crate) fn open_book_manager_from_action(&mut self) {
         self.show_book_manager = true;
         self.book_manager_rename_name = self.active_book_name();
@@ -245,8 +314,7 @@ impl App {
             return;
         }
         let replaced = self.saved_group_open.as_ref().is_some_and(|request| {
-            self.smart_folder_source_lease().as_ref() != Some(&request.source)
-                || self.saved_group_other_main_nav_pending()
+            !request.source.is_current(self) || self.saved_group_other_main_nav_pending()
         });
         if replaced {
             self.cancel_saved_group_open_for_other_nav();
@@ -368,6 +436,21 @@ impl App {
             _ => {}
         }
         let source = self.saved_group_open_source_if_allowed(action)?;
+        let source = if self.global_search.active || self.favsearch.active || self.tag_view.active {
+            // Search departure owns the existing switch epoch as well as the
+            // surface lease. Re-selecting the same query/location must retire an
+            // old prepared result even when its source text is unchanged.
+            SavedGroupOpenSource::Search(self.capture_main_list_navigation(
+                super::MainHistoryOperation::Direct(
+                    super::DirectNavigationPurpose::ExitTemporaryView {
+                        selection: crate::ui_dialogs::context_menu::JumpToFolderSelection::None,
+                    },
+                ),
+                super::MainListSourceProof::Surface(source),
+            ))
+        } else {
+            SavedGroupOpenSource::Plain(source)
+        };
         let current_book = self.book_action_current_folder();
         let current_collection = self
             .top_level_grid_view
@@ -467,6 +550,24 @@ impl App {
                 };
                 match collection_action_target(&ids, target, action, current_collection) {
                     Ok(id) => {
+                        if source.search_navigation().is_some() {
+                            let request_id = self.next_saved_group_open_id();
+                            self.saved_group_open = Some(SavedGroupOpenTransition {
+                                id: request_id,
+                                action,
+                                source,
+                                current_book,
+                                current_collection,
+                                requested_collection_target,
+                                lease,
+                                phase: SavedGroupOpenPhase::ReadyCollection { id },
+                            });
+                            // Frame-tail arbitration offers the existing owned
+                            // ready candidate. Returning it as a new external nav
+                            // would cancel its own request before dispatch.
+                            ctx.request_repaint();
+                            return None;
+                        }
                         lease.finish(Instant::now(), "adopted");
                         return Some(AddressBarNav::CollectionOpen(id));
                     }
@@ -519,9 +620,7 @@ impl App {
             ctx.request_repaint_after(delay);
             return;
         }
-        if self.smart_folder_source_lease().as_ref() != Some(&request.source)
-            || self.saved_group_other_main_nav_pending()
-        {
+        if !request.source.is_current(self) || self.saved_group_other_main_nav_pending() {
             request.lease.finish(now, "replaced");
             self.detach_saved_group_book_list(request.id);
             return;
@@ -625,7 +724,7 @@ impl App {
             return None;
         }
         self.saved_group_open.as_ref().and_then(|request| {
-            if self.smart_folder_source_lease().as_ref() != Some(&request.source) {
+            if !request.source.is_current(self) {
                 return None;
             }
             matches!(
@@ -648,20 +747,17 @@ impl App {
             self.saved_group_open = Some(request);
             return;
         }
-        if self.smart_folder_source_lease().as_ref() != Some(&request.source)
-            || self.saved_group_other_main_nav_pending()
-        {
+        if !request.source.is_current(self) || self.saved_group_other_main_nav_pending() {
             return;
         }
         match std::mem::replace(&mut request.phase, SavedGroupOpenPhase::WaitingBookList) {
             SavedGroupOpenPhase::ReadyBook { path, scan } => {
                 request.lease.finish(Instant::now(), "adopted");
                 self.bump_input_seq("grid-book-key", Some(&format!("{:?}", request.action)));
-                if !self.load_folder_with_scan_owned(
+                if !self.open_user_book_with_scan(
                     path,
-                    Some(scan),
-                    super::OpenRequestOwner::Navigation,
-                    crate::app::StartupListIntent::ExplicitList,
+                    scan,
+                    request.source.search_navigation().cloned(),
                 ) {
                     self.show_feedback_warning("本を開けませんでした".into());
                 }
@@ -695,7 +791,13 @@ impl App {
                 }
                 request.lease.finish(Instant::now(), "adopted");
                 self.bump_input_seq("grid-collection-key", Some(&format!("{current_id:?}")));
-                self.open_collection_grid_from_navigation(current_id);
+                if let Some(navigation) = request.source.search_navigation().cloned() {
+                    if !self.location_jump_admission_blocked() {
+                        self.open_collection_grid_with_search_navigation(current_id, navigation);
+                    }
+                } else {
+                    self.open_collection_grid_from_navigation(current_id);
+                }
             }
             _ => self.saved_group_open = Some(request),
         }

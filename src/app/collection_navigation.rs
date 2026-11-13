@@ -3834,7 +3834,8 @@ impl App {
             }
             _ => unreachable!("native outer adoption has a prepared Collection destination"),
         };
-        self.adopt_main_list_navigation(prepared.adoption, |app| {
+        let boundary_plan = self.physical_main_list_boundary_plan(&prepared.token);
+        self.adopt_main_list_navigation(prepared.adoption, boundary_plan, |app, boundary| {
             if !matches!(request.action, CollectionNavigationAction::OuterGrid { .. }) {
                 app.close_fullscreen_for_folder_nav_reopen();
             }
@@ -3854,7 +3855,7 @@ impl App {
                 prepared.listing,
                 super::VisibleInstallAuthority::Ordinary,
                 restore_intent,
-                prepared.token,
+                prepared.token.with_install_boundary(boundary),
             )
         });
     }
@@ -6693,7 +6694,13 @@ mod tests {
                 page: 3,
             },
         )]);
+        let folder_pins: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin> =
+            folder_pins
+                .into_iter()
+                .map(|(key, source)| (key, source.into()))
+                .collect();
         let sources = prepared_thumbnail_sources(CollectionGridThumbnailSources {
+            auto_cover_crop: None,
             folder_pin_map: folder_pins.clone(),
             video_folder_pin_seeds: Arc::clone(&seeds),
             video_sidecars: std::collections::HashMap::from([(
@@ -6920,6 +6927,7 @@ mod tests {
             vec![7; MAX_RETAINED_COLLECTION_PIN_BLOB_BYTES + 1],
         )]));
         let delivery = prepared_thumbnail_sources(CollectionGridThumbnailSources {
+            auto_cover_crop: None,
             folder_pin_map: Default::default(),
             video_folder_pin_seeds: Default::default(),
             video_sidecars: std::collections::HashMap::new(),
@@ -7431,6 +7439,7 @@ mod tests {
             &app,
             &prepared,
             prepared_thumbnail_sources(CollectionGridThumbnailSources {
+                auto_cover_crop: None,
                 folder_pin_map: Default::default(),
                 video_folder_pin_seeds: Default::default(),
                 video_sidecars: std::collections::HashMap::from([(
@@ -7691,6 +7700,7 @@ mod tests {
         );
         let prepared = prepare_snapshot(&added.snapshot);
         let sources_a = CollectionGridThumbnailSources {
+            auto_cover_crop: None,
             folder_pin_map: Default::default(),
             video_folder_pin_seeds: Default::default(),
             video_sidecars: std::collections::HashMap::from([(
@@ -7772,6 +7782,7 @@ mod tests {
 
         std::fs::write(&sidecar_a, b"same-path-sidecar-updated").unwrap();
         let sidecar_changed = CollectionGridThumbnailSources {
+            auto_cover_crop: None,
             folder_pin_map: Default::default(),
             video_folder_pin_seeds: Default::default(),
             video_sidecars: std::collections::HashMap::from([(
@@ -7805,6 +7816,7 @@ mod tests {
         assert_eq!(app.video_thumb_overrides.get("video-key"), Some(&sidecar_a));
 
         let pin_changed = CollectionGridThumbnailSources {
+            auto_cover_crop: None,
             folder_pin_map: Default::default(),
             video_folder_pin_seeds: Default::default(),
             video_sidecars: std::collections::HashMap::from([(

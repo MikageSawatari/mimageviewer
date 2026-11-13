@@ -4123,7 +4123,7 @@ impl App {
             return;
         }
         match action {
-            CollectionUiAction::Open(id) => self.open_collection_grid_from_navigation(id),
+            CollectionUiAction::Open(id) => self.open_collection_grid_from_manager(id),
             CollectionUiAction::SetTarget(id) => self.select_collection_toolbar_target(id),
             CollectionUiAction::SetPinned { id, pinned } => self.set_collection_pinned(id, pinned),
             CollectionUiAction::Create(name) => {

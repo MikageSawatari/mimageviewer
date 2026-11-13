@@ -258,6 +258,14 @@ pub(crate) struct TagViewPending {
 }
 
 impl TagViewPending {
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        cancel: Arc<AtomicBool>,
+        rx: mpsc::Receiver<Result<TagViewResult, String>>,
+    ) -> Self {
+        Self { cancel, rx }
+    }
+
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }

@@ -17,7 +17,7 @@ pub struct DepthPanelResponse {
     pub footer_rect: egui::Rect,
     pub close_rect: egui::Rect,
     pub export_rect: egui::Rect,
-    pub scroll: egui::scroll_area::ScrollAreaOutput<()>,
+    pub scroll: Option<egui::scroll_area::ScrollAreaOutput<()>>,
 }
 
 /// Draw a fixed right panel. `status` is supplied by the request owner, with no I/O here.
@@ -55,14 +55,60 @@ pub fn draw_depth_parallax_panel_with_export(
                 ui.set_width(content_width);
                 let mut close_requested = false;
                 let mut close_rect = egui::Rect::NOTHING;
+                let mut changed = false;
                 let header = ui.horizontal(|ui| {
-                    ui.heading("3D 写真");
+                    let title = egui::RichText::new("3D 写真").heading();
+                    let title = egui::WidgetText::from(title).into_galley(
+                        ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Heading,
+                    );
+                    let icon_width = ui.spacing().icon_width;
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(icon_width + ui.spacing().icon_spacing + title.size().x,
+                            title.size().y.max(ui.spacing().interact_size.y)),
+                        egui::Sense::click(),
+                    );
+                    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if response.clicked() {
+                        settings.panel_collapsed = !settings.panel_collapsed;
+                        changed = true;
+                        // Rebuild Area's move-widget bounds in this frame before
+                        // the next input can hit the previous body rectangle.
+                        ctx.request_discard("depth panel collapsed/expanded");
+                    }
+                    let visuals = *ui.style().interact(&response);
+                    if response.hovered() || response.is_pointer_button_down_on() {
+                        ui.painter().rect_filled(rect, visuals.corner_radius, visuals.weak_bg_fill);
+                    }
+                    let mut icon_response = response.clone();
+                    icon_response.rect = egui::Rect::from_center_size(
+                        egui::pos2(rect.left() + icon_width * 0.5, rect.center().y),
+                        egui::Vec2::splat(icon_width),
+                    );
+                    egui::collapsing_header::paint_default_icon(
+                        ui, if settings.panel_collapsed { 0.0 } else { 1.0 }, &icon_response,
+                    );
+                    ui.painter().galley(
+                        egui::pos2(rect.right() - title.size().x, rect.center().y - title.size().y * 0.5),
+                        title, visuals.text_color(),
+                    );
+                    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "3D 写真"));
+                    response.on_hover_text(if settings.panel_collapsed {
+                        "設定を表示する"
+                    } else {
+                        "設定を折りたたむ"
+                    });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let close = ui.button("×").on_hover_text("3D 写真を終了");
                         close_requested = close.clicked();
                         close_rect = close.rect;
                     });
                 });
+                if settings.panel_collapsed {
+                    return (
+                        changed, false, close_requested, header.response.rect,
+                        egui::Rect::NOTHING, close_rect, egui::Rect::NOTHING, false, None,
+                    );
+                }
                 ui.separator();
                 // Measure the very same wrapped galleys that the fixed footer paints.
                 // Include both its row spacing and the gap after the scroll body.
@@ -94,7 +140,6 @@ pub fn draw_depth_parallax_panel_with_export(
                     - ui.cursor().top()
                     - footer_height)
                 .clamp(0.0, 380.0);
-                let mut changed = false;
                 let mut focus_adjusting = false;
                 let mut export_rect = egui::Rect::NOTHING;
                 let mut export_requested = false;
@@ -228,7 +273,7 @@ pub fn draw_depth_parallax_panel_with_export(
                     close_rect,
                     export_rect,
                     export_requested,
-                    scroll,
+                    Some(scroll),
                 )
             })
         });

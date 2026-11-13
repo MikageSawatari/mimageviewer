@@ -55,9 +55,35 @@ mod container_icon_scroll_tests {
     }
 
     #[test]
+    fn container_icon_scroll_partial_selection_still_waits_for_archive() {
+        let mut app = setup_scroll(vec![
+            GridItem::Folder("folder".into()),
+            GridItem::ZipFile("book.zip".into()),
+        ]);
+        app.emit_scroll_settle_event();
+        app.settings.thumb_container_icon_kinds = crate::grid_item::ContainerIconKinds {
+            folder: true,
+            ..crate::grid_item::ContainerIconKinds::NONE
+        };
+        app.check_visible_thumb_ready();
+        let state = app.scroll_settle_state.as_ref().unwrap();
+        assert_eq!(state.visible_target, HashSet::from([1]));
+        assert!(!state.all_ready_emitted);
+        app.thumbnails[1] = loaded_thumb(&egui::Context::default());
+        app.check_visible_thumb_ready();
+        assert!(app.scroll_settle_state.as_ref().unwrap().all_ready_emitted);
+        app.emit_scroll_settle_event();
+        assert_eq!(
+            app.scroll_settle_state.as_ref().unwrap().visible_target,
+            HashSet::from([1])
+        );
+        assert!(app.scroll_settle_state.as_ref().unwrap().all_ready_emitted);
+    }
+
+    #[test]
     fn container_icon_scroll_empty_and_already_loaded_targets_complete() {
         let mut app = setup_scroll(vec![GridItem::Folder("folder".into())]);
-        app.settings.thumb_container_type_icon_only = true;
+        app.settings.thumb_container_icon_kinds = crate::grid_item::ContainerIconKinds::ALL;
         app.emit_scroll_settle_event();
         let state = app.scroll_settle_state.as_ref().unwrap();
         assert_eq!(state.seq, app.scroll_settle_seq);
@@ -69,7 +95,7 @@ mod container_icon_scroll_tests {
             crate::grid_item::ThumbnailState::Pending
         ));
 
-        app.settings.thumb_container_type_icon_only = false;
+        app.settings.thumb_container_icon_kinds = crate::grid_item::ContainerIconKinds::NONE;
         app.thumbnails[0] = loaded_thumb(&egui::Context::default());
         app.emit_scroll_settle_event();
         let state = app.scroll_settle_state.as_ref().unwrap();
@@ -85,7 +111,7 @@ mod container_icon_scroll_tests {
             GridItem::Folder("folder".into()),
             GridItem::Image("image.jpg".into()),
         ]);
-        app.settings.thumb_container_type_icon_only = true;
+        app.settings.thumb_container_icon_kinds = crate::grid_item::ContainerIconKinds::ALL;
         app.emit_scroll_settle_event();
         let state = app.scroll_settle_state.as_ref().unwrap();
         assert_eq!(state.visible_target, HashSet::from([1]));
@@ -106,7 +132,7 @@ mod container_icon_scroll_tests {
         let seq = app.scroll_settle_seq;
         assert!(!app.scroll_settle_state.as_ref().unwrap().all_ready_emitted);
 
-        app.settings.thumb_container_type_icon_only = true;
+        app.settings.thumb_container_icon_kinds = crate::grid_item::ContainerIconKinds::ALL;
         app.check_visible_thumb_ready();
         let state = app.scroll_settle_state.as_ref().unwrap();
         assert_eq!(state.seq, seq);
@@ -132,7 +158,7 @@ mod container_icon_scroll_tests {
         assert_eq!(state.newly_loaded, HashSet::from([1]));
         assert!(!state.all_ready_emitted);
 
-        app.settings.thumb_container_type_icon_only = true;
+        app.settings.thumb_container_icon_kinds = crate::grid_item::ContainerIconKinds::ALL;
         app.check_visible_thumb_ready();
         let state = app.scroll_settle_state.as_ref().unwrap();
         assert_eq!(state.visible_target, HashSet::from([2]));
@@ -281,7 +307,7 @@ impl App {
                 !self.items.get(idx).is_some_and(|item| {
                     crate::grid_item::container_icon_only(
                         item,
-                        self.settings.thumb_container_type_icon_only,
+                        self.settings.thumb_container_icon_kinds,
                     )
                 })
             })
@@ -371,7 +397,7 @@ impl App {
             !self.items.get(idx).is_some_and(|item| {
                 crate::grid_item::container_icon_only(
                     item,
-                    self.settings.thumb_container_type_icon_only,
+                    self.settings.thumb_container_icon_kinds,
                 )
             })
         });

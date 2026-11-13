@@ -397,6 +397,7 @@ fn depth_actual_independent_activation_retires_own_request_or_slot_and_keeps_sib
     for presentation in [
         ViewerPresentation::MainWindow,
         ViewerPresentation::Fullscreen,
+        ViewerPresentation::DetachedWindow,
     ] {
         for ready in [false, true] {
             let ctx = egui::Context::default();
@@ -427,10 +428,70 @@ fn depth_actual_independent_activation_retires_own_request_or_slot_and_keeps_sib
 
 #[cfg(windows)]
 #[test]
+fn depth_linked_independent_open_retires_before_publishing_the_new_session_flag() {
+    for ready in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = setup_app_for_test();
+        install_pages(&mut app, &ctx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = false;
+        app.settings.detached_viewer_enabled = true;
+        app.settings.detached_viewer_open_images_in_window = true;
+        let render = isolate_depth_renderer(&mut app);
+        let own = tracked_depth(&mut app, ready);
+        app.prepare_viewer_presentation_open(0, false);
+        assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        assert!(app.detached_viewer_independent_active);
+        assert!(matches!(app.fs_exclusive_view, FsExclusiveView::None));
+        if let Some(cancel) = own.cancel {
+            assert!(cancel.load(Ordering::Acquire));
+        }
+        assert!(
+            render
+                .renderer
+                .read()
+                .callback_resources
+                .get::<crate::depth_parallax_wgpu::DepthRenderResourcesRef>()
+                .is_none()
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn depth_linked_close_retires_request_or_gpu_slot_immediately() {
+    for ready in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = setup_app_for_test();
+        install_pages(&mut app, &ctx);
+        app.viewer_presentation = ViewerPresentation::DetachedWindow;
+        app.settings.detached_viewer_enabled = true;
+        let render = isolate_depth_renderer(&mut app);
+        let own = tracked_depth(&mut app, ready);
+        app.close_fullscreen();
+        assert!(app.fullscreen_idx.is_none());
+        assert!(matches!(app.fs_exclusive_view, FsExclusiveView::None));
+        if let Some(cancel) = own.cancel {
+            assert!(cancel.load(Ordering::Acquire));
+        }
+        assert!(
+            render
+                .renderer
+                .read()
+                .callback_resources
+                .get::<crate::depth_parallax_wgpu::DepthRenderResourcesRef>()
+                .is_none()
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
 fn depth_actual_forks_retire_before_new_identity_and_keep_sibling_request_or_slot() {
     for presentation in [
         ViewerPresentation::MainWindow,
         ViewerPresentation::Fullscreen,
+        ViewerPresentation::DetachedWindow,
     ] {
         for live in [false, true] {
             for ready in [false, true] {
@@ -718,45 +779,36 @@ fn depth_presentation_entry_continuation_and_commit_share_context_eligibility() 
                 ViewerPresentation::Fullscreen,
                 ViewerPresentation::DetachedWindow,
             ] {
-                let eligible = context == owner.viewer_context_main()
-                    && matches!(
-                        source,
-                        ViewerPresentation::MainWindow | ViewerPresentation::Fullscreen
-                    );
-                owner.viewer_presentation = source;
-                assert_eq!(
-                    owner.depth_entry_allowed(0),
-                    if eligible {
-                        Ok(())
-                    } else {
-                        Err(DepthEntryBlock::Detached)
-                    }
-                );
-                depth(owner);
-                assert_eq!(owner.depth_view_may_continue(0), eligible);
-                for target in [
-                    ViewerPresentation::MainWindow,
-                    ViewerPresentation::Fullscreen,
-                    ViewerPresentation::DetachedWindow,
-                ] {
+                for independent in [false, true] {
+                    let eligible = context == owner.viewer_context_main()
+                        && (source != ViewerPresentation::DetachedWindow || !independent);
                     owner.viewer_presentation = source;
+                    owner.detached_viewer_independent_active = independent;
+                    assert_eq!(owner.depth_entry_allowed(0), if eligible { Ok(()) } else {
+                        Err(DepthEntryBlock::Detached)
+                    }, "context={context:?}, source={source:?}, independent={independent}");
                     depth(owner);
-                    owner.feedback_toasts_for_test.clear();
-                    owner.commit_viewer_presentation(target, "depth_test_presentation_matrix");
-                    assert_eq!(owner.viewer_presentation, target);
-                    assert_eq!(
-                        owner.fs_exclusive_view.is_depth(),
-                        eligible && source == target,
-                        "context={context:?} {source:?} -> {target:?}"
-                    );
-                    if eligible && source == target {
-                        assert!(owner.feedback_toasts_for_test.is_empty());
-                    } else {
-                        assert_eq!(owner.feedback_toasts_for_test.len(), 1);
-                        assert_eq!(
-                            owner.feedback_toasts_for_test[0].0.contains("D キー"),
-                            owner.depth_presentation_eligible(target)
-                        );
+                    assert_eq!(owner.depth_view_may_continue(0), eligible);
+                    for target in [ViewerPresentation::MainWindow, ViewerPresentation::Fullscreen,
+                        ViewerPresentation::DetachedWindow] {
+                        for target_independent in [false, true] {
+                            owner.viewer_presentation = source;
+                            owner.detached_viewer_independent_active = independent;
+                            depth(owner);
+                            owner.feedback_toasts_for_test.clear();
+                            owner.commit_viewer_session(target, target_independent, "depth_session_matrix");
+                            assert_eq!(owner.viewer_presentation, target);
+                            let target_eligible = context == owner.viewer_context_main()
+                                && (target != ViewerPresentation::DetachedWindow || !target_independent);
+                            let continues = eligible && target_eligible && source == target
+                                && independent == target_independent;
+                            assert_eq!(owner.fs_exclusive_view.is_depth(), continues,
+                                "context={context:?} ({source:?},{independent}) -> ({target:?},{target_independent})");
+                            assert_eq!(owner.feedback_toasts_for_test.len(), usize::from(!continues));
+                            if !continues {
+                                assert_eq!(owner.feedback_toasts_for_test[0].0.contains("D キー"), target_eligible);
+                            }
+                        }
                     }
                 }
             }
@@ -791,6 +843,22 @@ fn depth_presentation_toast_uses_effective_reentry_key_or_button() {
                 ViewerPresentation::Fullscreen,
                 ViewerPresentation::MainWindow,
             ),
+            (
+                ViewerPresentation::MainWindow,
+                ViewerPresentation::DetachedWindow,
+            ),
+            (
+                ViewerPresentation::Fullscreen,
+                ViewerPresentation::DetachedWindow,
+            ),
+            (
+                ViewerPresentation::DetachedWindow,
+                ViewerPresentation::MainWindow,
+            ),
+            (
+                ViewerPresentation::DetachedWindow,
+                ViewerPresentation::Fullscreen,
+            ),
         ] {
             app.viewer_presentation = from;
             depth(&mut app);
@@ -813,6 +881,7 @@ fn depth_same_presentation_preserves_request_lru_and_slot() {
     for presentation in [
         ViewerPresentation::MainWindow,
         ViewerPresentation::Fullscreen,
+        ViewerPresentation::DetachedWindow,
     ] {
         for ready in [false, true] {
             app.viewer_presentation = presentation;
@@ -841,6 +910,173 @@ fn depth_same_presentation_preserves_request_lru_and_slot() {
             );
         }
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn depth_linked_f11_keeps_readback_estimation_and_ready_owners_in_both_directions() {
+    std::thread::spawn(|| {
+        use crate::depth_parallax::DepthSourcePhase;
+        let _input = crate::key_input::lock_test_input();
+        for phase in ["reading", "estimating", "ready"] {
+            let mut app = setup_app_for_test();
+            let mut viewer = super::depth_main_window_tests::RootDepthViewer::linked(&mut app);
+            viewer.ready(&mut app);
+            viewer.frame(&mut app, vec![]);
+            let child = viewer.child_viewport();
+            let render = app.wgpu_render_state.clone().unwrap();
+            let source = app.ensure_final_composite_material(&viewer.ctx, 0).unwrap();
+            let key = crate::depth_estimation::DepthSourceKey {
+                texture_id: source.source_texture().id(),
+            };
+            let backing = render
+                .renderer
+                .read()
+                .texture(&key.texture_id)
+                .unwrap()
+                .texture
+                .clone()
+                .unwrap();
+            let mut cancel = None;
+            if phase != "ready" {
+                let FsExclusiveView::Depth(old) = &app.fs_exclusive_view else {
+                    unreachable!()
+                };
+                let cached = old.ready().unwrap().depth.clone();
+                let mut state = DepthViewState::new(app.edit_request_owner_context());
+                state.attach_renderer(&render);
+                state.lru.insert(
+                    crate::depth_estimation::DepthSourceKey {
+                        texture_id: egui::TextureId::Managed(88_901),
+                    },
+                    cached,
+                );
+                state
+                    .select_source(&render.device, &render.queue, &backing, key)
+                    .unwrap();
+                if phase == "estimating" {
+                    let pending = crate::depth_estimation::DepthPending::completed_for_test(
+                        state.context,
+                        88_902,
+                        crate::depth_estimation::DepthMap {
+                            key,
+                            width: 4,
+                            height: 6,
+                            values: vec![half::f16::from_f32(0.5); 24],
+                            median: 0.5,
+                        },
+                    );
+                    cancel = Some(pending.cancellation_token_for_test());
+                    state.source = DepthSourcePhase::Estimating { key, pending };
+                }
+                app.set_fs_exclusive_view(FsExclusiveView::Depth(state), "linked_f11_pending");
+            }
+            let FsExclusiveView::Depth(before) = &app.fs_exclusive_view else {
+                unreachable!()
+            };
+            let started = before.started_at;
+            let bytes = before.lru.resident_bytes();
+            let ready_id = before.ready().map(|r| r.resource_id);
+            app.window_visible = false; // No worker/model; only exercise the real F11 input owner.
+            for borderless in [false, true] {
+                app.detached_viewer_borderless_fullscreen = borderless;
+                app.detached_viewer_borderless_transition = None;
+                viewer.frame(
+                    &mut app,
+                    [true, false]
+                        .map(|pressed| egui::Event::Key {
+                            key: egui::Key::F11,
+                            physical_key: Some(egui::Key::F11),
+                            pressed,
+                            repeat: false,
+                            modifiers: egui::Modifiers::NONE,
+                        })
+                        .to_vec(),
+                );
+                assert!(app.detached_viewer_borderless_transition.is_some());
+                assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+                let FsExclusiveView::Depth(state) = &app.fs_exclusive_view else {
+                    panic!("F11 retired {phase}");
+                };
+                assert_eq!(state.started_at, started);
+                assert_eq!(state.lru.resident_bytes(), bytes);
+                assert_eq!(state.ready().map(|r| r.resource_id), ready_id);
+                assert_eq!(
+                    matches!(state.source, DepthSourcePhase::ReadingBack { .. }),
+                    phase == "reading"
+                );
+                assert_eq!(
+                    matches!(state.source, DepthSourcePhase::Estimating { .. }),
+                    phase == "estimating"
+                );
+                if let Some(cancel) = &cancel {
+                    assert!(!cancel.load(Ordering::Acquire));
+                }
+                assert_eq!(
+                    render
+                        .renderer
+                        .read()
+                        .callback_resources
+                        .get::<crate::depth_parallax_wgpu::DepthRenderResourcesRef>()
+                        .map(|r| r.0.resource_id),
+                    ready_id
+                );
+            }
+            // Complete pending GPU maps after both F11 requests. The same owner must adopt.
+            render
+                .device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })
+                .unwrap();
+            let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+                unreachable!()
+            };
+            let context = state.context;
+            state.advance(
+                &render.device,
+                &render.queue,
+                &viewer.ctx,
+                child,
+                |submitted, _, _| {
+                    assert_eq!(submitted, key);
+                    Ok(crate::depth_estimation::DepthPending::completed_for_test(
+                        context,
+                        88_903,
+                        crate::depth_estimation::DepthMap {
+                            key,
+                            width: 4,
+                            height: 6,
+                            values: vec![half::f16::from_f32(0.5); 24],
+                            median: 0.5,
+                        },
+                    ))
+                },
+            );
+            assert!(
+                matches!(state.source, DepthSourcePhase::Ready { .. }),
+                "{phase} result adopted after F11"
+            );
+            app.detached_viewer_borderless_transition = None; // Native window application is outside headless tests.
+            app.window_visible = true;
+            viewer.size = egui::vec2(820., 600.);
+            viewer.frame(&mut app, vec![]);
+            assert_eq!(
+                viewer.callbacks(),
+                vec![
+                    app.fullscreen_page_layout
+                        .single_page()
+                        .unwrap()
+                        .transform
+                        .paint_rect
+                ]
+            );
+        }
+        crate::key_input::clear_test_frame();
+    })
+    .join()
+    .unwrap();
 }
 
 #[cfg(windows)]
@@ -1029,7 +1265,7 @@ fn depth_f11_d_reentry_rejects_old_readback_and_estimation_after_new_slot_is_pub
 
 #[cfg(windows)]
 #[test]
-fn depth_actual_f12_transition_has_no_depth_frame_in_detached_or_after_return() {
+fn depth_actual_f12_both_directions_end_depth_and_offer_reentry() {
     let ctx = egui::Context::default();
     let mut app = setup_app_for_test();
     for presentation in [
@@ -1053,8 +1289,14 @@ fn depth_actual_f12_transition_has_no_depth_frame_in_detached_or_after_return() 
         assert_eq!(app.feedback_toasts_for_test.len(), 1, "F12 publishes once");
         assert_eq!(
             app.fs_feedback_toast.as_ref().unwrap().0,
-            "別ウィンドウモード ON (3D 写真を終了しました: メインウィンドウの画像表示で使えます)"
+            "別ウィンドウモード ON (3D 写真を終了しました: 表示を切り替えました。D キーでもう一度使えます)"
         );
+        assert_eq!(
+            app.depth_entry_allowed(0),
+            Ok(()),
+            "linked F12 accepts reentry"
+        );
+        depth(&mut app);
         app.feedback_toasts_for_test.clear();
         app.toggle_detached_viewer_mode();
         assert!(!app.settings.detached_viewer_enabled);
@@ -1063,7 +1305,7 @@ fn depth_actual_f12_transition_has_no_depth_frame_in_detached_or_after_return() 
         assert_eq!(app.feedback_toasts_for_test.len(), 1);
         assert_eq!(
             app.fs_feedback_toast.as_ref().unwrap().0,
-            "別ウィンドウモード OFF"
+            "別ウィンドウモード OFF (3D 写真を終了しました: 表示を切り替えました。D キーでもう一度使えます)"
         );
     }
 }
@@ -1518,6 +1760,7 @@ fn depth_i_and_tab_toggle_only_the_depth_panel_through_the_shared_key_handler() 
     let mut app = setup_app_for_test();
     install_pages(&mut app, &ctx);
     depth(&mut app);
+    app.settings.depth_parallax.panel_collapsed = true;
     let side_panel_mode = app.settings.fullscreen_side_panel_mode;
     for (key, visible) in [(egui::Key::I, false), (egui::Key::Tab, true)] {
         ctx.begin_pass(egui::RawInput {
@@ -1536,8 +1779,40 @@ fn depth_i_and_tab_toggle_only_the_depth_panel_through_the_shared_key_handler() 
             panic!("metadata key must keep the depth owner");
         };
         assert_eq!(state.panel_visible, visible, "{key:?}");
+        assert!(app.settings.depth_parallax.panel_collapsed);
         assert_eq!(app.settings.fullscreen_side_panel_mode, side_panel_mode);
         assert!(!app.show_metadata_panel);
+    }
+    crate::key_input::clear_test_frame();
+}
+
+#[cfg(windows)]
+#[test]
+fn depth_collapsed_preference_survives_d_exit_and_reentry() {
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let mut app = setup_app_for_test();
+    install_pages(&mut app, &ctx);
+    let model_path = app.tmp.path().join("unused-depth.onnx");
+    app.depth_setup
+        .set_status_for_test(crate::addon::AddonStatus::Valid {
+            model_id: "collapsed-fixture".into(),
+            bytes: 1,
+            model_path,
+            mmproj_path: None,
+        });
+    app.settings.depth_parallax.panel_collapsed = true;
+    for active in [true, false, true] {
+        depth_key_frame(
+            &mut app,
+            &ctx,
+            &[(egui::Key::D, true), (egui::Key::D, false)],
+        );
+        assert_eq!(app.fs_exclusive_view.is_depth(), active);
+        assert!(app.settings.depth_parallax.panel_collapsed);
+        if let FsExclusiveView::Depth(state) = &app.fs_exclusive_view {
+            assert!(state.panel_visible);
+        }
     }
     crate::key_input::clear_test_frame();
 }
@@ -1628,6 +1903,7 @@ fn depth_panel_hide_toast_uses_first_chord_once_and_show_is_silent_through_key_a
     let mut app = setup_app_for_test();
     install_pages(&mut app, &ctx);
     depth(&mut app);
+    app.settings.depth_parallax.panel_collapsed = true;
     let side_panel_mode = app.settings.fullscreen_side_panel_mode;
     for (ini, keys, hint) in [
         ("", vec![egui::Key::I, egui::Key::Tab], "I"),
@@ -1688,6 +1964,7 @@ fn depth_panel_hide_toast_uses_first_chord_once_and_show_is_silent_through_key_a
                         panic!("panel toggle must preserve the Depth owner");
                     };
                     assert_eq!(state.panel_visible, visible, "{ini}, {key:?}");
+                    assert!(app.settings.depth_parallax.panel_collapsed);
                     assert_eq!(
                         app.feedback_toasts_for_test.len(),
                         cycle,

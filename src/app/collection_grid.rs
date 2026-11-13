@@ -228,7 +228,8 @@ pub(in crate::app) fn prepare_collection_grid_thumbnail_sources(
 ) -> Result<CollectionGridPreparedThumbnailDelivery, CollectionPrepareError> {
     use sha2::Digest as _;
 
-    if sources.video_sidecars.is_empty()
+    if sources.auto_cover_crop.is_none()
+        && sources.video_sidecars.is_empty()
         && sources.video_pin_blobs.is_empty()
         && sources.folder_pin_map.is_empty()
         && sources.video_folder_pin_seeds.is_empty()
@@ -237,6 +238,10 @@ pub(in crate::app) fn prepare_collection_grid_thumbnail_sources(
     }
     let mut digest = sha2::Sha256::new();
     digest.update(b"miv.collection-thumbnail-sources.v2\0");
+    if let Some(auto) = sources.auto_cover_crop {
+        digest.update(b"auto-cover-crop\0");
+        hash_collection_thumbnail_identity_part(&mut digest, auto.suffix().as_bytes());
+    }
 
     let mut sidecars = sources.video_sidecars.iter().collect::<Vec<_>>();
     sidecars.sort_unstable_by(|left, right| left.0.cmp(right.0));
@@ -295,7 +300,13 @@ pub(in crate::app) fn prepare_collection_grid_thumbnail_sources(
         hash_collection_thumbnail_identity_part(&mut digest, source.db_kind().as_bytes());
         hash_collection_thumbnail_identity_part(&mut digest, source.rel().as_bytes());
         use crate::folder_thumb_pins::FolderPinSource;
-        match source {
+        if let Some(crop) = source.cover_crop {
+            digest.update(b"cover-crop\0");
+            for value in crop.values() {
+                digest.update(value.to_le_bytes());
+            }
+        }
+        match &source.source {
             FolderPinSource::ZipEntry { entry, .. } => {
                 hash_collection_thumbnail_identity_part(&mut digest, entry.as_bytes())
             }
@@ -546,6 +557,7 @@ pub(in crate::app) fn prepare_collection_grid_install(
     let identity_start = crate::perf::is_enabled().then(Instant::now);
     let thumbnail_sources = prepare_collection_grid_thumbnail_sources(
         CollectionGridThumbnailSources {
+            auto_cover_crop: super::configured_thumbnail_auto_crop(settings),
             video_sidecars: sidecars.by_video_path,
             video_pin_blobs: Arc::new(video_pin_blobs),
             folder_pin_map,
@@ -2060,6 +2072,17 @@ impl App {
     }
 
     pub(crate) fn open_collection_grid_from_navigation(&mut self, collection_id: CollectionId) {
+        // Snapshot is the owning surface and already closed the live searches.
+        // Preserve its existing retirement order even for legacy leftover search flags.
+        if !self.is_snapshot_active()
+            && (self.global_search.active || self.favsearch.active || self.tag_view.active)
+        {
+            if self.location_jump_admission_blocked() {
+                return;
+            }
+            self.start_search_collection_navigation(collection_id);
+            return;
+        }
         if self.document_open_modal_admission_blocked() {
             return;
         }
@@ -2070,6 +2093,58 @@ impl App {
             self.copied_destination_source_proof(),
         );
         self.adopt_direct_collection_shell(collection_id, None, origin, nav, false);
+    }
+
+    /// A manager button has already been admitted by its owning dialog. Its own modal
+    /// must not reject the navigation it initiated; document operations still exclude opens.
+    pub(crate) fn open_collection_grid_from_manager(&mut self, collection_id: CollectionId) {
+        if !self.is_snapshot_active()
+            && (self.global_search.active || self.favsearch.active || self.tag_view.active)
+        {
+            if self.location_jump_snapshot_blocked() || self.document_open_modal_admission_blocked()
+            {
+                return;
+            }
+            self.start_search_collection_navigation(collection_id);
+        } else {
+            self.open_collection_grid_from_navigation(collection_id);
+        }
+    }
+
+    fn start_search_collection_navigation(&mut self, collection_id: CollectionId) {
+        let navigation = self.capture_main_list_navigation(
+            super::MainHistoryOperation::Direct(
+                super::DirectNavigationPurpose::ExitTemporaryView {
+                    selection: crate::ui_dialogs::context_menu::JumpToFolderSelection::None,
+                },
+            ),
+            self.copied_destination_source_proof(),
+        );
+        self.open_collection_grid_with_search_navigation(collection_id, navigation);
+    }
+
+    pub(super) fn open_collection_grid_with_search_navigation(
+        &mut self,
+        collection_id: CollectionId,
+        navigation: super::MainListNavigation,
+    ) {
+        // Keep the search mounted while the existing history worker prepares a usable
+        // collection. Only its admitted install retires the temporary view and records Back.
+        let origin = self.collection_open_return_origin(collection_id, false);
+        let target = super::FolderNavHistoryTarget::Collection(CollectionGridRestore {
+            identity: CollectionGridIdentity { collection_id },
+            revision_at_open: self.collection_catalog_revision(collection_id).unwrap_or(0),
+            viewport_anchor: None,
+            return_to: origin.clone().map(Box::new),
+        });
+        if !self.start_collection_history_transition_owned(
+            target,
+            super::CollectionHistoryIntent::Restore,
+            origin,
+            navigation,
+        ) {
+            self.show_feedback_warning("コレクションを開けませんでした".into());
+        }
     }
 
     pub(crate) fn adopt_direct_collection_shell(
@@ -2096,21 +2171,27 @@ impl App {
         let Some(adoption) = self.prepare_main_list_adoption(navigation, destination) else {
             return false;
         };
-        self.adopt_main_list_navigation(adoption, move |app| {
-            app.prepare_collection_main_context_change(collection_id);
-            if fullscreen_close_origin {
-                app.close_fullscreen();
-            }
-            app.open_collection_grid_after_context_change(
-                collection_id,
-                restore,
-                origin.as_ref().map(|origin| origin.restore.clone()),
-            );
-            if let Some(origin) = origin {
-                app.top_level_grid_view.install_return_origin(origin);
-            }
-            None
-        })
+        self.adopt_main_list_navigation(
+            adoption,
+            super::MainListContextBoundaryPlan::Collection(collection_id),
+            move |app, boundary| {
+                if boundary.uses_installer_boundary() {
+                    app.prepare_collection_main_context_change(collection_id);
+                }
+                if fullscreen_close_origin {
+                    app.close_fullscreen();
+                }
+                app.open_collection_grid_after_context_change(
+                    collection_id,
+                    restore,
+                    origin.as_ref().map(|origin| origin.restore.clone()),
+                );
+                if let Some(origin) = origin {
+                    app.top_level_grid_view.install_return_origin(origin);
+                }
+                None
+            },
+        )
     }
 
     pub(crate) fn start_collection_history_prepare(
@@ -2339,30 +2420,37 @@ impl App {
         let Some(adoption) = self.prepare_main_list_adoption(navigation, destination) else {
             return false;
         };
-        self.adopt_main_list_navigation(adoption, |app| {
-            // The read-only admission above makes this native transfer non-rejecting.
-            let _ = app.prepare_collection_main_context_change(identity.collection_id);
-            app.save_departing_session_grid_positions();
-            if !retaining_binding {
-                app.top_level_grid_view
-                    .begin_with_origin(TopLevelGridSurface::Collection(identity), return_to);
-            }
-            if let Some(session) = app.top_level_grid_view.collection_session_mut() {
-                if retaining_binding {
-                    session.cancel_pending();
+        self.adopt_main_list_navigation(
+            adoption,
+            super::MainListContextBoundaryPlan::Collection(identity.collection_id),
+            |app, boundary| {
+                // The read-only admission above makes this native transfer non-rejecting.
+                if boundary.uses_installer_boundary() {
+                    let _ = app.prepare_collection_main_context_change(identity.collection_id);
                 }
-                session.wanted_revision = restore.revision_at_open.max(session.accepted_revision);
-                session.restore_anchor = restore.viewport_anchor;
-                session.watch = watch;
-            }
-            if retaining_binding {
-                app.schedule_collection_grid_snapshot();
-            } else {
-                app.reset_details_sort_to_toolbar();
-                app.apply_collection_grid_prepared_install(prepared, None);
-            }
-            None
-        })
+                app.save_departing_session_grid_positions();
+                if !retaining_binding {
+                    app.top_level_grid_view
+                        .begin_with_origin(TopLevelGridSurface::Collection(identity), return_to);
+                }
+                if let Some(session) = app.top_level_grid_view.collection_session_mut() {
+                    if retaining_binding {
+                        session.cancel_pending();
+                    }
+                    session.wanted_revision =
+                        restore.revision_at_open.max(session.accepted_revision);
+                    session.restore_anchor = restore.viewport_anchor;
+                    session.watch = watch;
+                }
+                if retaining_binding {
+                    app.schedule_collection_grid_snapshot();
+                } else {
+                    app.reset_details_sort_to_toolbar();
+                    app.apply_collection_grid_prepared_install(prepared, None);
+                }
+                None
+            },
+        )
     }
 
     /// Keep the replay/restore lineage while refreshing only the native destination payload.
@@ -2632,64 +2720,71 @@ impl App {
         if let super::PreparedPhysicalListing::Zip { prepared, .. } = &listing {
             self.reconcile_zip_refresh_adoption(&mut adoption, prepared);
         }
-        self.adopt_main_list_navigation(adoption, |app| {
-            let _ = app.prepare_collection_main_context_change(session.identity.collection_id);
-            app.save_departing_session_grid_positions();
-            app.install_collection_history_child_session(session);
-            app.pending_auto_fs_open = false;
-            app.cancel_folder_pane_open(super::PaneOpenRestoreExit::Adopted);
-            app.reset_details_sort_to_toolbar();
-            app.reconcile_bookmark_return_target_for_folder_load(&path);
-            if app
-                .reading_history_return_from
-                .as_ref()
-                .is_some_and(|from| !crate::folder_tree::path_eq(&from.container, &path))
-            {
-                app.reading_history_return_from = None;
-            }
-            if folder_changes {
-                if !app.navigation_scope.is_detached_physical() {
-                    crate::thumb_loader::bump_catchup_epoch();
+        self.adopt_main_list_navigation(
+            adoption,
+            super::MainListContextBoundaryPlan::Collection(session.identity.collection_id),
+            |app, boundary| {
+                if boundary.uses_installer_boundary() {
+                    let _ =
+                        app.prepare_collection_main_context_change(session.identity.collection_id);
                 }
-                app.bump_render_epoch_only();
-            }
-            if folder {
-                app.transition_favorite_view_for_path(Some(&path));
-                app.clear_meta_undo();
-                crate::zip_loader::clear_nested_cache();
-                app.zip_nav = None;
-            }
-            let authority = if aliased {
-                super::VisibleInstallAuthority::StagedArchive {
-                    logical_source: &path,
+                app.save_departing_session_grid_positions();
+                app.install_collection_history_child_session(session);
+                app.pending_auto_fs_open = false;
+                app.cancel_folder_pane_open(super::PaneOpenRestoreExit::Adopted);
+                app.reset_details_sort_to_toolbar();
+                app.reconcile_bookmark_return_target_for_folder_load(&path);
+                if app
+                    .reading_history_return_from
+                    .as_ref()
+                    .is_some_and(|from| !crate::folder_tree::path_eq(&from.container, &path))
+                {
+                    app.reading_history_return_from = None;
                 }
-            } else {
-                super::VisibleInstallAuthority::Ordinary
-            };
-            let hydration = app.install_prepared_physical_listing(
-                listing,
-                authority,
-                super::StartupListIntent::ExplicitList,
-                token,
-            );
-            if aliased {
-                app.address = path.to_string_lossy().to_string();
-                if !(app.global_search.active || app.favsearch.active) {
-                    app.forget_recent_folder(&backing);
-                    app.remember_recent_folder(&path);
+                if folder_changes {
+                    if !app.navigation_scope.is_detached_physical() {
+                        crate::thumb_loader::bump_catchup_epoch();
+                    }
+                    app.bump_render_epoch_only();
                 }
-                app.update_active_quick_folder_target(&path);
-                app.archive_source_override = Some(path.clone());
-                app.transition_favorite_view_for_path(Some(&path));
-                if let Some(return_to) = restore_reading_history {
-                    app.reading_history_return_from = Some(return_to);
+                if folder {
+                    app.transition_favorite_view_for_path(Some(&path));
+                    app.clear_meta_undo();
+                    crate::zip_loader::clear_nested_cache();
+                    app.zip_nav = None;
                 }
-                if let Some(state) = restore_bookmark_view {
-                    app.bookmark_view_state = Some(state);
+                let authority = if aliased {
+                    super::VisibleInstallAuthority::StagedArchive {
+                        logical_source: &path,
+                    }
+                } else {
+                    super::VisibleInstallAuthority::Ordinary
+                };
+                let hydration = app.install_prepared_physical_listing(
+                    listing,
+                    authority,
+                    super::StartupListIntent::ExplicitList,
+                    token.with_install_boundary(boundary),
+                );
+                if aliased {
+                    app.address = path.to_string_lossy().to_string();
+                    if !(app.global_search.active || app.favsearch.active) {
+                        app.forget_recent_folder(&backing);
+                        app.remember_recent_folder(&path);
+                    }
+                    app.update_active_quick_folder_target(&path);
+                    app.archive_source_override = Some(path.clone());
+                    app.transition_favorite_view_for_path(Some(&path));
+                    if let Some(return_to) = restore_reading_history {
+                        app.reading_history_return_from = Some(return_to);
+                    }
+                    if let Some(state) = restore_bookmark_view {
+                        app.bookmark_view_state = Some(state);
+                    }
                 }
-            }
-            hydration
-        })
+                hydration
+            },
+        )
     }
 
     fn schedule_collection_grid_snapshot(&mut self) {
@@ -3695,10 +3790,7 @@ impl App {
         selected: Option<usize>,
         video_sidecars: std::collections::HashMap<String, std::path::PathBuf>,
         video_pin_blobs: Arc<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>,
-        folder_pin_map: std::collections::HashMap<
-            String,
-            crate::folder_thumb_pins::FolderPinSource,
-        >,
+        folder_pin_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin>,
         folder_pin_cache: std::collections::HashMap<String, crate::catalog::CacheEntry>,
         collection_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
         auto_aspect_eligible_total: usize,
@@ -5489,6 +5581,10 @@ mod tests {
             std::fs::create_dir(&saved_folder).unwrap();
             let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
             let target = recv(client.create_collection("Target".into()).unwrap());
+            poll_until(&mut app, "target was not cataloged", |app| {
+                app.collection_catalog_revision(target.collection_id())
+                    .is_some()
+            });
             seed_search_or_snapshot_without_return_to(
                 &mut app,
                 source,
@@ -5496,8 +5592,25 @@ mod tests {
                 snapshot,
             );
 
+            let source_generation = app.items_generation;
+            let source_keys: Vec<_> = app.items.iter().map(GridItem::perf_key).collect();
             app.open_collection_grid_from_navigation(target.collection_id());
-            assert_collection_return_folder(&app, &saved_folder);
+            if snapshot {
+                assert_collection_return_folder(&app, &saved_folder);
+            } else {
+                assert!(app.global_search.active);
+                assert_eq!(app.items_generation, source_generation);
+                assert_eq!(
+                    app.items.iter().map(GridItem::perf_key).collect::<Vec<_>>(),
+                    source_keys
+                );
+                assert!(app.top_level_grid_view.return_to().is_none());
+                assert!(
+                    app.top_level_grid_view
+                        .history_navigation_transition()
+                        .is_some()
+                );
+            }
             wait_for_grid(&mut app, target.collection_id());
             assert_collection_return_folder(&app, &saved_folder);
             app.shutdown_collection_runtime_for_exit();
@@ -5516,6 +5629,10 @@ mod tests {
         std::fs::create_dir(&tag_folder).unwrap();
         let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
         let target = recv(client.create_collection("Target".into()).unwrap());
+        poll_until(&mut app, "target was not cataloged", |app| {
+            app.collection_catalog_revision(target.collection_id())
+                .is_some()
+        });
         seed_search_or_snapshot_without_return_to(&mut app, source, search_folder.clone(), true);
         app.top_level_grid_view
             .install_return_to(TopLevelGridRestore::Folder(search_folder));
@@ -5541,6 +5658,10 @@ mod tests {
             std::fs::create_dir(&saved_folder).unwrap();
             let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
             let target = recv(client.create_collection("Target".into()).unwrap());
+            poll_until(&mut app, "target was not cataloged", |app| {
+                app.collection_catalog_revision(target.collection_id())
+                    .is_some()
+            });
             seed_search_or_snapshot_without_return_to(
                 &mut app,
                 source.clone(),
@@ -5550,23 +5671,38 @@ mod tests {
             let generation = mount_detached_collection_media(&mut app, source, 1_314, false);
 
             app.open_collection_grid_from_navigation(target.collection_id());
-            assert_collection_return_folder(&app, &saved_folder);
-            app.with_window_viewer_context(1_314, |window| {
-                assert_eq!(window.fullscreen_idx, Some(0));
-                assert_eq!(window.items_generation, generation);
-                assert!(matches!(window.items.as_slice(), [GridItem::Video(_)]));
-                assert!(matches!(
-                    window.fs_cache.get(&0),
-                    Some(super::super::FsCacheEntry::Video { .. })
-                ));
-                assert!(matches!(
-                    window.top_level_grid_view.surface(),
-                    TopLevelGridSurface::Snapshot | TopLevelGridSurface::Search(_)
-                ));
-            })
-            .unwrap();
+            if snapshot {
+                assert_collection_return_folder(&app, &saved_folder);
+            } else {
+                assert!(app.global_search.active);
+                assert_eq!(app.items_generation, generation);
+                assert!(app.top_level_grid_view.return_to().is_none());
+                assert!(
+                    app.top_level_grid_view
+                        .history_navigation_transition()
+                        .is_some()
+                );
+            }
+            let assert_source_window = |app: &mut App| {
+                app.with_window_viewer_context(1_314, |window| {
+                    assert_eq!(window.fullscreen_idx, Some(0));
+                    assert_eq!(window.items_generation, generation);
+                    assert!(matches!(window.items.as_slice(), [GridItem::Video(_)]));
+                    assert!(matches!(
+                        window.fs_cache.get(&0),
+                        Some(super::super::FsCacheEntry::Video { .. })
+                    ));
+                    assert!(matches!(
+                        window.top_level_grid_view.surface(),
+                        TopLevelGridSurface::Snapshot | TopLevelGridSurface::Search(_)
+                    ));
+                })
+                .unwrap();
+            };
+            assert_source_window(&mut app);
             wait_for_grid(&mut app, target.collection_id());
             assert_collection_return_folder(&app, &saved_folder);
+            assert_source_window(&mut app);
             app.shutdown_collection_runtime_for_exit();
         }
     }
@@ -5663,6 +5799,11 @@ mod tests {
                 },
             ),
         ]);
+        let expected: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin> =
+            expected
+                .into_iter()
+                .map(|(key, source)| (key, source.into()))
+                .collect();
         for path in [&folder, &zip, &pdf, &archive, &epub] {
             app.folder_thumb_pin_db
                 .as_ref()
@@ -5794,6 +5935,11 @@ mod tests {
                 page: 7,
             },
         )]);
+        let sibling_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin> =
+            sibling_map
+                .into_iter()
+                .map(|(key, source)| (key, source.into()))
+                .collect();
         let expected_sibling = sibling_map.clone();
         let sibling = app.build_window_context_for_test(1307, move |context| {
             context.folder_pin_map = sibling_map;
@@ -5969,7 +6115,8 @@ mod tests {
             FolderPinSource::PdfPage {
                 pdf_rel: String::new(),
                 page: 1,
-            },
+            }
+            .into(),
         );
         let pinned = prepare(sources.clone()).presentation.identity();
         assert_ne!(pinned, empty);
@@ -5978,9 +6125,35 @@ mod tests {
             FolderPinSource::PdfPage {
                 pdf_rel: String::new(),
                 page: 2,
-            },
+            }
+            .into(),
         );
         assert_ne!(prepare(sources.clone()).presentation.identity(), pinned);
+        let uncropped = prepare(sources.clone()).presentation.identity();
+        sources
+            .folder_pin_map
+            .get_mut("container")
+            .unwrap()
+            .cover_crop =
+            crate::folder_thumb_pins::CoverCrop::new([0, 0, 500_000, 1_000_000]).unwrap();
+        let cropped = prepare(sources.clone()).presentation.identity();
+        assert_ne!(
+            cropped, uncropped,
+            "crop changes must retire the accepted source identity"
+        );
+        sources
+            .folder_pin_map
+            .get_mut("container")
+            .unwrap()
+            .cover_crop =
+            crate::folder_thumb_pins::CoverCrop::new([500_000, 0, 1_000_000, 1_000_000]).unwrap();
+        assert_ne!(prepare(sources.clone()).presentation.identity(), cropped);
+        sources
+            .folder_pin_map
+            .get_mut("container")
+            .unwrap()
+            .cover_crop = None;
+        assert_eq!(prepare(sources.clone()).presentation.identity(), uncropped);
         let seed = super::super::smart_folder::PreparedVideoFolderPinSeed {
             cache_key: "seed#pin:key".into(),
             video_path: PathBuf::from("clip.mp4"),
@@ -6395,7 +6568,7 @@ mod tests {
     }
 
     #[test]
-    fn thumb_container_type_icon_only_preferences_preserve_collection_root_and_denominator() {
+    fn thumb_container_icon_kinds_preferences_preserve_collection_root_and_denominator() {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let folder = temp.path().join("folder");
@@ -6413,7 +6586,7 @@ mod tests {
                 (image, CollectionResolvedKind::Image),
             ],
         );
-        app.settings.thumb_container_type_icon_only = true;
+        app.settings.thumb_container_icon_kinds = crate::grid_item::ContainerIconKinds::ALL;
         app.settings.thumb_aspect_auto = true;
         app.open_collection_grid(created.collection_id(), None);
         wait_for_grid(&mut app, created.collection_id());
@@ -6427,7 +6600,10 @@ mod tests {
         assert_eq!(presentation.prepared.auto_aspect_eligible_total, 3);
         assert_eq!(app.auto_aspect_eligible_total(), 1);
         for idx in 0..app.items.len() {
-            if crate::grid_item::container_icon_only(&app.items[idx], true) {
+            if crate::grid_item::container_icon_only(
+                &app.items[idx],
+                crate::grid_item::ContainerIconKinds::ALL,
+            ) {
                 app.thumbnails[idx] = ThumbnailState::NoArt;
             }
         }
@@ -6444,9 +6620,12 @@ mod tests {
             .as_mut()
             .unwrap()
             .settings
-            .thumb_container_type_icon_only = false;
+            .thumb_container_icon_kinds = crate::grid_item::ContainerIconKinds::NONE;
         app.apply_preferences_dialog(&egui::Context::default());
-        assert!(!app.settings.thumb_container_type_icon_only);
+        assert_eq!(
+            app.settings.thumb_container_icon_kinds,
+            crate::grid_item::ContainerIconKinds::NONE
+        );
         assert_eq!(app.auto_aspect_eligible_total(), 3);
         assert_eq!(app.items, items);
         assert_eq!(app.current_folder, folder);
@@ -6463,7 +6642,10 @@ mod tests {
             &presentation,
         ));
         for (item, thumb) in app.items.iter().zip(&app.thumbnails) {
-            if crate::grid_item::container_icon_only(item, true) {
+            if crate::grid_item::container_icon_only(
+                item,
+                crate::grid_item::ContainerIconKinds::ALL,
+            ) {
                 assert!(matches!(thumb, ThumbnailState::Pending));
             }
         }
@@ -8763,7 +8945,14 @@ mod tests {
         assert_eq!(app.current_folder.as_deref(), Some(cached.as_path()));
         assert_eq!(app.address, zip_path.to_string_lossy());
         assert_eq!(app.pin_container_key().as_deref(), Some(zip_path.as_path()));
-        assert_eq!(app.folder_thumb_pin_for(&zip_path), Some(&logical_pin));
+        assert_eq!(
+            app.folder_thumb_pin_for(&zip_path).map(|pin| &pin.source),
+            Some(&logical_pin)
+        );
+        assert_eq!(
+            app.folder_thumb_pin_for(&zip_path).unwrap().cover_crop,
+            None
+        );
         assert!(matches!(
             app.folder_history_back_target(),
             Some(super::super::FolderNavHistoryTarget::Collection(restore))

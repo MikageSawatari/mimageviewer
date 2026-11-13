@@ -377,6 +377,13 @@ fn forget_text_focus(ctx: &egui::Context, widget_id: egui::Id) {
     });
 }
 
+/// Finish explicit editing without leaving a keyboard-driven recovery claim.
+/// Other widgets and viewports keep their own focus contracts.
+pub fn end_text_input(ctx: &egui::Context, widget_id: egui::Id) {
+    ctx.memory_mut(|memory| memory.surrender_focus(widget_id));
+    forget_text_focus(ctx, widget_id);
+}
+
 /// Return the helper-managed field whose keyboard-driven focus loss must retain
 /// text-input ownership in this pass.
 ///
@@ -470,6 +477,22 @@ fn restore_focus_for_ime_key(
     }
 
     restored
+}
+
+/// Materialize an accepted viewport/widget focus reservation before editing.
+/// The host owns the reservation; this function stores no pending state.
+pub fn activate_reserved_focus(ui: &egui::Ui, id: egui::Id) -> bool {
+    let _ = ime_input_active(ui.ctx());
+    if !ui.is_enabled() || !ui.input(|input| input.focused) {
+        return false;
+    }
+    ui.memory_mut(|memory| {
+        // begin_pass may already have interpreted the reserved arrow as focus
+        // navigation. It belongs to this editor rather than another widget.
+        memory.move_focus(egui::FocusDirection::None);
+        memory.request_focus(id);
+    });
+    true
 }
 
 pub fn show_singleline<'text>(
@@ -600,6 +623,62 @@ mod explicit_retirement_tests {
                 .response
             })
             .inner
+    }
+
+    #[test]
+    fn explicit_text_end_releases_recovery_only_for_the_owning_widget_and_viewport() {
+        let ctx = egui::Context::default();
+        install_ime_input_policy(&ctx);
+        ctx.set_embed_viewports(false);
+        let sibling = egui::ViewportId::from_hash_of("text-end-sibling");
+        let field = egui::Id::unique("text-end-field");
+        let input = |viewport_id| {
+            let mut raw = egui::RawInput {
+                viewport_id,
+                ..Default::default()
+            };
+            raw.viewports.insert(
+                sibling,
+                egui::ViewportInfo {
+                    parent: Some(egui::ViewportId::ROOT),
+                    ..Default::default()
+                },
+            );
+            raw
+        };
+        for viewport in [sibling, egui::ViewportId::ROOT] {
+            ctx.run_ui(input(viewport), |ui| {
+                let mut text = String::new();
+                let mut focus = true;
+                draw_field(ui, field, &mut text, Some(&mut focus), false);
+                assert_eq!(focused_text_input(&ctx), Some(field));
+                end_text_input(&ctx, field.with("unrelated"));
+                assert_eq!(focused_text_input(&ctx), Some(field));
+                if viewport == egui::ViewportId::ROOT {
+                    end_text_input(&ctx, field);
+                    assert!(!ctx.memory(|memory| memory.has_focus(field)));
+                    assert!(text_focus_contract_snapshot(&ctx).is_none());
+                    let sibling_key = text_focus_contract_id(sibling);
+                    assert_eq!(
+                        ctx.data(|data| data.get_temp::<ImeTextFocusContract>(sibling_key))
+                            .unwrap()
+                            .widget_id,
+                        field
+                    );
+                }
+            })
+            .drop_without_applying_deltas();
+        }
+        let mut raw = input(egui::ViewportId::ROOT);
+        raw.events.push(egui::Event::Key {
+            key: egui::Key::ArrowDown,
+            physical_key: Some(egui::Key::ArrowDown),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        ctx.run_ui(raw, |_ui| assert!(recovering_text_input(&ctx).is_none()))
+            .drop_without_applying_deltas();
     }
 
     #[test]

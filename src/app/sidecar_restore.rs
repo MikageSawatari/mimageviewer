@@ -3788,13 +3788,17 @@ mod tests {
             let adoption = app
                 .prepare_main_list_adoption(navigation, destination.clone())
                 .unwrap();
-            assert!(app.adopt_main_list_navigation(adoption, |app| {
-                app.install_prepared_scanned_folder_listing(
-                    prepared,
-                    super::super::VisibleInstallAuthority::Ordinary,
-                    visible,
-                )
-            }));
+            assert!(app.adopt_main_list_navigation(
+                adoption,
+                crate::app::MainListContextBoundaryPlan::None,
+                |app, _boundary| {
+                    app.install_prepared_scanned_folder_listing(
+                        prepared,
+                        super::super::VisibleInstallAuthority::Ordinary,
+                        visible,
+                    )
+                }
+            ));
             assert_eq!(app.current_folder.as_ref(), Some(&child));
             assert_eq!(app.facet_navigation.route(), &destination.route);
             assert!(!app.settings.facet_filter.is_active());

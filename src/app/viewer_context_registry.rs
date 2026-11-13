@@ -1767,7 +1767,7 @@ pub(in crate::app) struct ViewerContextBundle {
     current_folder_watch_failed: Option<PathBuf>,
     external_rescan_pending: Option<ExternalRescanPending>,
     folder_refresh_pending: Option<book_append_refresh::FolderRefreshRequest>,
-    folder_pin_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    folder_pin_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin>,
     converted_archive_cache_paths: std::collections::HashMap<String, ConvertedArchiveSourceState>,
     converted_archive_pin_root_states:
         std::collections::HashMap<String, ConvertedArchivePinRootState>,
@@ -3334,8 +3334,9 @@ impl App {
             // already owns its independent list loses passive observation here.
             self.retire_passive_folder_observation();
         }
-        self.commit_viewer_presentation(
+        self.commit_viewer_session(
             ViewerPresentation::DetachedWindow,
+            true,
             "activate_independent_detached",
         );
         self.ensure_mounted_detached_session_binding(window_id);
@@ -6720,6 +6721,7 @@ mod tests {
     ) -> Arc<super::super::ListOrderSnapshot> {
         Arc::new(super::super::ListOrderSnapshot {
             owner,
+            scope: super::super::ListOrderScope::Folder,
             entries: Arc::from([super::super::ListOrderEntry {
                 path: folder.to_path_buf(),
                 kind: super::super::ListOrderEntryKind::Folder,
