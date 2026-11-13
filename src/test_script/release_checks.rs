@@ -796,31 +796,47 @@ pub(super) fn register(engine: &mut Engine, bridge: RunnerBridge) {
         }
         super::tap_key_impl(&b,"Home",crate::key_input::SyntheticModifiers::default())?;
         super::tap_key_impl(&b,"Enter",crate::key_input::SyntheticModifiers::default())?;
-        loop {
+        let fullscreen = loop {
             let o=request(&b,Operation::Observe).map_err(rhai_error)?;
             if o.value["is_fullscreen"]==true {
                 if o.value["ai_ready"].as_u64().unwrap_or(0)!=0 || o.value["ai_pending"].as_u64().unwrap_or(0)!=0 {return Err(rhai_error("environment: first AI case already has AI work"));}
-                break;
+                // The dedicated host/witness may be published after is_fullscreen.
+                if let Some(window) = b.latest_snapshot().map_err(rhai_error)?.windows.into_iter().find(|window| matches!(window.identity, Some(TestScriptWindowIdentity::MainFullscreen { .. }))) {
+                    break window;
+                }
             }
             if Instant::now()>=deadline {return Err(rhai_error("environment: first AI fullscreen unavailable"));}
             b.interrupt.wait(Duration::from_millis(100)).map_err(rhai_error)?;
-        }
+        };
         let start=crate::perf::program_start().ok_or_else(||rhai_error("environment: perf clock unavailable"))?;
         let start_t=start.elapsed().as_secs_f64();
-        b.run_action(crate::keymap::KeyAction::FsAiModelRealEsrGeneralV3,Duration::from_secs(30)).map_err(rhai_error)?;
+        run_first_ai_viewer_action(&b, &fullscreen, crate::keymap::KeyAction::FsAiModelRealEsrGeneralV3).map_err(rhai_error)?;
         loop {
             let o=request(&b,Operation::Observe).map_err(rhai_error)?;
             if o.value["ai_ready"].as_u64().unwrap_or(0)>0 && o.value["ai_pending"]==0 && o.value["ai_backend"].is_string() {
                 let proof=json!({"included":true,"first":true,"started":true,"start_t":start_t,
                     "end_t":start.elapsed().as_secs_f64(),"model":"realesr_general_v3","backend":o.value["ai_backend"],"pack":pack});
                 protocol_ai_trace(&proof);
-                b.run_action(crate::keymap::KeyAction::FsClose,Duration::from_secs(30)).map_err(rhai_error)?;
+                run_first_ai_viewer_action(&b, &fullscreen, crate::keymap::KeyAction::FsClose).map_err(rhai_error)?;
                 return Ok(to_dynamic(&proof));
             }
             if Instant::now()>=deadline {return Err(rhai_error("environment: actual isolated AI inference did not complete"));}
             b.interrupt.wait(Duration::from_millis(100)).map_err(rhai_error)?;
         }
     });
+}
+
+pub(super) fn run_first_ai_viewer_action(
+    bridge: &RunnerBridge,
+    fullscreen: &super::TestScriptWindowSnapshot,
+    action: crate::keymap::KeyAction,
+) -> Result<(), String> {
+    // Reuse the original exact host for both actions; never follow a replacement.
+    bridge.select_window_snapshot(fullscreen)?;
+    bridge.run_action(action, Duration::from_secs(30))?;
+    // Observe/evidence/quit require Root. Selection itself never requests Focus.
+    bridge.select_root()?;
+    Ok(())
 }
 fn validate_foreground_grant(
     case_id: &str,

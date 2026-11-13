@@ -308,6 +308,18 @@ impl App {
         ) {
             windows.push(root);
         }
+        if let Some(identity) = self.test_script_main_fullscreen_identity()
+            && let Some(mut fullscreen) = self.test_script_context_window_snapshot(
+                root_context,
+                "fullscreen",
+                None,
+                identity.viewport_id(),
+                Some(identity),
+            )
+        {
+            fullscreen.presentation = TestScriptWindowPresentation::ActiveImmediate;
+            windows.push(fullscreen);
+        }
         windows.sort_by_key(|window| window.window_id);
         windows
     }
@@ -440,6 +452,43 @@ impl App {
         })
     }
 
+    /// The dedicated main fullscreen host is an input owner distinct from ROOT.
+    /// Do not reinterpret an active/switching detached host as this owner.
+    fn test_script_main_fullscreen_identity(
+        &self,
+    ) -> Option<crate::test_script::TestScriptWindowIdentity> {
+        let context = self.viewer_context_main();
+        if self.mounted_viewer_context_id() != Some(context)
+            || self.fullscreen_idx.is_none()
+            || !self.fs_viewport_shown
+            || self.viewer_presentation != super::ViewerPresentation::Fullscreen
+            || self.fs_viewport_presentation != Some(super::ViewerPresentation::Fullscreen)
+            || self.active_detached_window_id().is_some()
+            || self.viewer_session_is_detached_or_switching()
+        {
+            return None;
+        }
+        let viewport_id = self.fullscreen_viewport_id();
+        let witness = eframe::miv_test_script_window_witness::latest(viewport_id)?;
+        if !eframe::miv_test_script_window_witness::is_current(
+            viewport_id,
+            witness.hwnd(),
+            witness.token(),
+        )
+        .ok()?
+        {
+            return None;
+        }
+        Some(
+            crate::test_script::TestScriptWindowIdentity::MainFullscreen {
+                context_serial: context.serial(),
+                viewport_id,
+                hwnd: witness.hwnd(),
+                backend_token: witness.token(),
+            },
+        )
+    }
+
     pub(crate) fn test_script_window_identity(
         &self,
         window_id: u64,
@@ -479,6 +528,10 @@ impl App {
         let identity = if viewport_id == egui::ViewportId::ROOT {
             let identity = self.test_script_root_window_identity(viewport_id)?;
             (identity.context_serial() == mounted_context.serial()).then_some(identity)
+        } else if let Some(identity) = self.test_script_main_fullscreen_identity()
+            && identity.viewport_id() == viewport_id
+        {
+            Some(identity)
         } else {
             let window_id = self.active_detached_window_id()?;
             let identity = self.test_script_window_identity(window_id, viewport_id)?;
@@ -1029,6 +1082,134 @@ mod tests {
             );
         })
         .expect("temporarily mount detached context");
+    }
+
+    #[test]
+    fn main_fullscreen_action_owner_is_published_only_for_its_own_pass() {
+        let mut app = crate::app::setup_app_for_test();
+        app.main_hwnd = Some(0x4830);
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = super::super::ViewerPresentation::Fullscreen;
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(super::super::ViewerPresentation::Fullscreen);
+        let ctx = egui::Context::default();
+        let root_backend = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let _root_scope = root_backend.enter(&ctx, egui::ViewportId::ROOT, 0x4830);
+        let root = app.test_script_action_owner_for_pass(&ctx).unwrap();
+        let viewport = app.fullscreen_viewport_id();
+        assert!(
+            app.test_script_main_fullscreen_identity().is_none(),
+            "wait for real host registration"
+        );
+        let fullscreen_backend =
+            eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        {
+            let _scope = fullscreen_backend.enter(&ctx, viewport, 0x4831);
+            let mut input = egui::RawInput {
+                viewport_id: viewport,
+                ..Default::default()
+            };
+            input.viewports.insert(
+                viewport,
+                egui::ViewportInfo {
+                    parent: Some(egui::ViewportId::ROOT),
+                    ..Default::default()
+                },
+            );
+            ctx.begin_pass(input);
+            let fullscreen = app.test_script_main_fullscreen_identity().unwrap();
+            assert_eq!(fullscreen.context_serial(), root.context_serial());
+            assert_ne!(fullscreen.viewport_id(), root.viewport_id());
+            assert_eq!(
+                app.test_script_action_owner_for_pass(&ctx),
+                Some(fullscreen.clone())
+            );
+            let windows = app.test_script_window_snapshots();
+            let published = windows
+                .iter()
+                .find(|window| window.identity.as_ref() == Some(&fullscreen))
+                .unwrap();
+            assert_eq!(published.role, "fullscreen");
+            assert_eq!(
+                published.presentation,
+                TestScriptWindowPresentation::ActiveImmediate
+            );
+            assert_eq!(published.host_incarnation, None);
+            assert!(
+                !published.viewport_rendered,
+                "no paint proof added by this input adapter"
+            );
+            ctx.end_pass().drop_without_applying_deltas();
+        }
+        ctx.begin_pass(Default::default());
+        assert_eq!(app.test_script_action_owner_for_pass(&ctx), Some(root));
+        ctx.end_pass().drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn main_fullscreen_identity_retires_on_close_recreate_and_backend_replacement() {
+        let mut app = crate::app::setup_app_for_test();
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = super::super::ViewerPresentation::Fullscreen;
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(super::super::ViewerPresentation::Fullscreen);
+        let ctx = egui::Context::default();
+        let viewport = app.fullscreen_viewport_id();
+        let first = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let original = {
+            let _scope = first.enter(&ctx, viewport, 0x4831);
+            app.test_script_main_fullscreen_identity().unwrap()
+        };
+        app.fullscreen_idx = None;
+        assert!(app.test_script_main_fullscreen_identity().is_none());
+        assert!(
+            !app.test_script_window_snapshots()
+                .iter()
+                .any(|window| window.role == "fullscreen")
+        );
+        app.fullscreen_idx = Some(0);
+        app.fs_viewport_shown = false;
+        assert!(app.test_script_main_fullscreen_identity().is_none());
+        app.fs_viewport_shown = true;
+        app.fs_viewport_generation += 1;
+        assert!(
+            app.test_script_main_fullscreen_identity().is_none(),
+            "old viewport witness cannot serve a new host"
+        );
+        app.fs_viewport_generation -= 1;
+        let replacement = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let _scope = replacement.enter(&ctx, viewport, original.hwnd());
+        let current = app.test_script_main_fullscreen_identity().unwrap();
+        assert_eq!(current.hwnd(), original.hwnd());
+        assert_ne!(current.backend_token(), original.backend_token());
+        assert!(
+            !original
+                .matches_backend_witness(eframe::miv_test_script_window_witness::active().unwrap())
+        );
+    }
+
+    #[test]
+    fn main_fullscreen_identity_excludes_detached_hosts_and_temporary_mounts() {
+        let mut app = crate::app::setup_app_for_test();
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = super::super::ViewerPresentation::Fullscreen;
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(super::super::ViewerPresentation::Fullscreen);
+        let ctx = egui::Context::default();
+        let backend = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let _scope = backend.enter(&ctx, app.fullscreen_viewport_id(), 0x4831);
+        assert!(app.test_script_main_fullscreen_identity().is_some());
+        let detached = app.build_window_context_for_test(7483, |_| {});
+        app.with_viewer_context(detached, |app| {
+            assert!(app.test_script_main_fullscreen_identity().is_none());
+        })
+        .unwrap();
+        assert!(app.test_script_main_fullscreen_identity().is_some());
+        app.fs_viewport_presentation = Some(super::super::ViewerPresentation::DetachedWindow);
+        assert!(app.test_script_main_fullscreen_identity().is_none());
+        app.fs_viewport_presentation = Some(super::super::ViewerPresentation::Fullscreen);
+        app.begin_active_detached_session(7483, crate::app::DetachedSource::Image);
+        assert!(app.test_script_main_fullscreen_identity().is_none());
     }
 
     #[test]

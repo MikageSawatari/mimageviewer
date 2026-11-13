@@ -652,10 +652,11 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.483 ReleaseChecks の first-ai が、全画面を開いた後にメイン窓へ focus して全画面を閉じてしまう (2026-10-30)
 
-- 状態: **次の版に入れる (利用者決定 2026-11-10)**。**未着手** (v4.10.0 の ReleaseChecks で判明。製品の不具合ではなくテスト台本の不具合)。
+- 状態: **次の版に入れる (利用者決定 2026-11-10)**。**実装済み・実アプリでの ReleaseChecks 未実行** (2026-11-11。製品の不具合ではなくテスト台本の不具合)。
 - 内容: `ui-smoke.ps1 -Scenario ReleaseChecks -IncludeFirstAi` の first-ai case で、台本が全画面を開いた後に AI モデル切替の action (`FsAiModelRealEsrGeneralV3`) を `owner=root` (メイン窓) へ focus して送る。既存の main focus guard (`should_close_fullscreen_from_main_focus`、2026-07 から) が全画面を閉じ、AI ジョブが取り消されて「actual isolated AI inference did not complete」で FAIL になる。証跡: run `release-checks-20261029-161208-c3ed5627/first-ai/mimageviewer.log` の 2.081s `fullscreen: main focus guard closing session`。first-ai は 2026-10-09 の追加以降、実 suite で PASS した記録がない。
-- 直し方: AI action を全画面の viewport (表示中の viewer の入力所有者) へ送る。製品の main focus guard は変えない。直したら AI / GPU 経路を変える次の版で `-IncludeFirstAi` 付きの ReleaseChecks を実行して採用する。
-- 関連: [release-check-automation-plan.md](release-check-automation-plan.md)、`src/test_script.rs` の `release_check_first_ai`。規模: Small。
+- 実装: test-script の typed owner に `MainFullscreen` を追加し、main context serial・専用 viewport ID・HWND・backend token を固定する。表示済みのメイン全画面 host を待って AI action を送り、Root 選択で Observe、保存した同じ全画面 identity へ `FsClose` を送り Root 選択へ戻す。閉鎖・host 置換後は既存と同じ stale 拒否。製品の main focus guard・detached の述語／activation は変更していない。
+- 残る確認: AI / GPU 経路を変える次の版で、利用者の了承後に `-IncludeFirstAi` 付きの ReleaseChecks を実行して採用する。今回の実装担当は実アプリ／ui-smoke を起動していない。
+- 関連: [release-check-automation-plan.md](release-check-automation-plan.md)、[harness の宛先設計](ui-smoke-automation-plan.md#s1-窓snapshotとtargetの所有)、`src/test_script/release_checks.rs` の `release_check_first_ai`。規模: Small。
 
 ### 1.667 ReleaseChecks の起動直後 frame 1→2 の判定が、ログ時刻の 1ms 丸めで成り立たないことがある (2026-10-31)
 

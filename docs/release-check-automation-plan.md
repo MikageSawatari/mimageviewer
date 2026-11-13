@@ -494,11 +494,53 @@ feature 有無の Rust 焦点テスト、normal / portable check、full lib、fm
 | static 2件 / video-pin-background | 同じ Open / settle を使い、pause 前に実 readiness を確認 |
 | tray 2件 | close 前の実 loading / cache 不在と exact PID/HWND を確認。非表示後も update の早期 return より前に UI request が処理され、既存 request ID witness が成立するまで Observe を行う |
 | perf 2件 | startup の many-folder を再 open せず、ready 後に navigation の実 Ctrl+Down と generation/path の変化を待つ。検索も seed と同じ通常入力経路 |
-| optional first-ai | root 選択後、通常 fullscreen / AI action と Observe で実 ready / backend を確認。今回の必須8 sessionとは別の了承範囲 |
+| optional first-ai | root 選択から通常 fullscreen を開き、表示済みの専用 host identity を待ってその viewport へ AI action を送る。Root 選択で Observe し、実 ready / backend を観測後、保存した同じ全画面 identity へ `FsClose`、Root 選択へ戻す。選択自体は Focus を送らない。必須8 sessionとは別の了承範囲。§1.483 修正後の実アプリ確認は未実行 |
 | idle / evidence / exit | `ready.json` 後は既存の単一 interrupt wait と sampler 完了待ちだけで、Observe・UI command を送らない。計測完了後に evidence を読むための wake と通常 tray Quit を行う |
 
 非対話検証と診断 portable の再準備は `target/F-phase4-fix2-msg.txt` へ記録する。
 修正後の実 suite 完走・採用は利用者実行待ち。アプリ起動、ui-smoke、commit は行わない。
+
+### §1.483 optional first-ai の入力宛先修正（2026-11-11）
+
+状態: **実装済み・実アプリでの ReleaseChecks 未実行**。
+ClaudeCode が読んだ v4.10.0 / v5.1.0 の run ログでは、AI action が `owner=root` へ Focus を
+要求し、製品の main focus guard が全画面を閉じていた。実装担当も v5.1.0 の保存ログとコードを
+照合した。first-ai が実 suite で PASS した証跡はまだない。
+
+test-script に専用の `MainFullscreen` identity（main context serial・viewport ID・HWND・
+backend token）を追加する。main が mounted、専用全画面 host が表示済みで、active detached や
+detached 切替中ではない場合だけ公開する。`is_fullscreen` だけでは操作を始めず、実 backend
+witness の公開も待つ。既存の focus 取得・actual pass owner 照合・stale 拒否をそのまま使い、
+製品 guard と detached の述語／activation は変えない。
+
+AI action と `FsClose` は最初に保存した同じ identity へ送る。両 action の ACK 後は Root を
+選択する。Observe・evidence・quit の Root 要求を維持し、選択時には Focus を送らない。
+途中で閉じた／再生成された host へ宛先を付け替えず、既存の明示失敗にする。
+一般 Rhai API は増やさず、この台本内で既存の選択関数を使う。
+
+簡素化: Root の意味を「現在の入力 viewport」へ変える案は既存の root 宛て操作を曖昧にするため
+採らない。LegacyImplicit への退避・Focus を抑える特例 bool・guard 緩和も採らない。
+新しい pending state や回復経路は追加しない。まれな失敗は既定の割り切り方針による。
+非対話回帰で Focus 先、Root／fullscreen／Detached の排他、close／host 置換の stale、
+AI／close 後の Root 復帰と capture を検査する。実アプリ／ui-smoke は今回起動しない。
+
+実装担当の非対話検証（`fix-483-first-ai` の未コミット差分、2026-11-11）:
+
+- `MSBUILDDISABLENODEREUSE=1`、`CARGO_BUILD_JOBS=1` で core check は
+  `--features test-script` 有り／無しとも exit 0。
+  [feature 有り](../target/483-check-test-script-retry.log)／[通常](../target/483-check-normal.log)。
+- `cargo nextest run -p mimageviewer --lib --features test-script -E 'test(/main_fullscreen/) | test(/first_ai_actions/)'`:
+  9 passed／exit 0（追加7件と既存2件）。[ログ](../target/483-tests-new-retry.log)。
+  初回は8 passed／1 failed／exit 100。追加テストの child viewport の `RawInput.viewports` 登録漏れを
+  修正した結果であり、製品実装は変更していない。[初回ログ](../target/483-tests-new.log)。
+- `cargo nextest run -p mimageviewer --lib --features test-script -E 'test(/test_script/)'`:
+  180 passed／exit 0。App adapter と既存 Detached 宛て回帰を含む。[ログ](../target/483-tests-test-script.log)。
+- workspace 全体の `cargo fmt`（引数なし）、`cargo fmt --check`、`git diff --check` は exit 0。
+- 初回 feature check は turbojpeg の MSBuild 並列24で exit 101（Rust 本体の検査に未到達）。
+  同じ生成 project の単一ノード build が exit 0 となった後に上記 check を実行した。
+  [初回ログ](../target/483-check-test-script.log)。製品／build 設定ファイルの回避変更はない。
+- 独立 Sol / xhigh は設計・実装・fixture 修正を ACCEPT。lib 全件 gate は ClaudeCode 担当として未実行。
+  通常 profile の確認 binary は test-script 専用変更の確認には使わず、今回 build-dev は実行していない。
 
 ### Phase 4 seed の pin 再ロード待機修正（2026-10-11）
 
