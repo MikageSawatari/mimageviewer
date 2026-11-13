@@ -6544,7 +6544,7 @@ fn recreated_detached_host_preserves_maximized_placement_until_visible_commit() 
                 id: 41,
                 current: ViewerPresentation::Fullscreen,
                 target: ViewerPresentation::DetachedWindow,
-                target_independent: false,
+                target_independent: None,
                 activate: true,
                 announce_main_hint: false,
                 outgoing_presenter_hwnd: 0xA117,

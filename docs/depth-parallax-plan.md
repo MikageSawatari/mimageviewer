@@ -3791,3 +3791,78 @@ HEAD は `01f5e898f`、ブランチは `feat-767-stage2` のまま。変更は�
 製品起動・検証用 build・全件 gate・commit / push は依頼どおり実施しない。
 描画 / レイアウトは変更しておらず ui_snapshot は実施しない。実 OS / 再生音 / focus・F11・DPI / 実3Dなど、
 上記の未確認点は引き続き実機確認へ引き継ぐ。
+
+#### 独立実装レビュー r1 (2026-11-14、Sol / xhigh)
+
+上記実装 `9044445e6` に対する設計担当の独立実装レビューは「指摘修正後に受入可」。
+構造的変更であることには合意し、P2 1件を指摘した。今回の修正基点は文書記録を含む `bc5c3415a`。
+上記の当時の検証・レビュー記録は履歴として残し、この指摘の修正と検証を以下に追記する。
+
+**P2 — 遅着した同一ホストの保守要求が、fork / 再開で確定した独立性を巻き戻す。**
+連動 media A で rect 同期等を発行すると、generic native request が発行時の独立性 false を保存していた。
+D の実 activation は `park_current_viewer_context_as_live_media_inner` で A を新 context C に fork し、
+独立 true と runtime linked=false を確定する。request も C に移るが、旧要求の Apply が保存済み false を
+session / runtime に書き戻していた。A の再 activation 後に完了した場合、次の画像送りが B への交換にならない。
+D が active のままの完了でも、A の独立性が巻き戻る。前回の same-host apply 所有分離だけでは防げなかった。
+
+**修正（BA-7）:**
+
+- `src/app/presentation_transition.rs`: 既存 `PresentationRequest.target_independent` を `Option<bool>` にし、
+  factory は `None`、明示 F12 setter だけ `Some(解決値)` を保存する。
+- `src/app/native_video.rs`: generic request では独立性を捕捉しない。実 Apply effect で `None` を
+  その時点の mounted C の独立性へ解決し、session と runtime linked flag へ同じ値を渡す。
+  明示 F12 は従来どおり保存した解決値を確定する。同 host の同期 F12 / 反転時の同期確定も維持する。
+- `src/app/detached_media_exchange_tests.rs`: 実 linked open → D activation / fork → A 再 activation →
+  旧 native 完了 → 実画像 navigation で B へ交換する回帰と、D が active のまま完了する回帰を追加。
+  どちらも bool を手で立てず、C の独立性・runtime・binding、一覧 / 順序・main・D の内容 / binding / runtime を検査する。
+  明示 F12 の対照は実 Fullscreen open → 実 F12 toggle による Detached 要求 → 既存の独立化部品で現在値 true →
+  native 完了の実 Apply で `Some(false)` を確定する。host / decoder の事実だけを headless seam で供給する。
+- `src/app/tests.rs`: 既存 host effect fixture の request literal を新しい保守要求の型（`None`）に合わせる。
+  assertion は変更しない。
+- 本書と `docs/detached-rework-plan.md` §11 に記録する。変更は以上の6ファイル。
+
+待ち / activation 制限や guard を追加して組合せを抑える案は、通常操作を制限するため採らない。
+保守要求が独立性の決定を運ばない型にすることで、時間順の例外処理を増やさず正本を C に一本化する。
+新しい App の bool / Option / pending、retry、追加 repaint、silent fallback は加えない。
+request の abort / retire 中の後継は外側 `Preparing.request` が所有し、既存 setter で更新できる。
+内側の旧 aborted / retiring request は変更しない。setter 前に新要求の payload が effects に逃げる経路もない。
+
+**同型経路の列挙監査（実装者と独立 Sol / xhigh）:**
+
+| 経路 | 独立性の扱い・結論 |
+| --- | --- |
+| native rect 同期、音声モード復帰の generic switch、F11 の main / fullscreen 間要求 | `None`。発行時の独立性を持たず、完了時の C を継承する。activate の有無を F12 の代用にはしない |
+| native 明示 F12、同 host F12、反転して現在の表示先へ戻る F12 | 明示の非同期要求だけ `Some`。同期確定 / reducer の Stable 短絡は既存 handler がその場で確定する |
+| `apply_video_presentation_switched` 同期 wrapper | 呼出時に解決し、非同期 request に古い bool を保存しない。非同期の実 Apply は上記 typed request の確定点に集約する |
+| `apply_egui_viewer_presentation_for_current_item`、`commit_viewer_session_deferred_feedback` | F12 の同 stack 同期確定。後者で deferred なのは通知だけであり、古い独立性を非同期保存しない |
+| descriptor 開始 / 再開、列挙完了 | binding の初期確定は開始時の runtime / 設定から同期解決。列挙後の open は現在の binding / session を継承し、旧 bool を持たない |
+| folder / PDF / ZIP の遅延 reopen | close を挟む pair の捕捉・復元は同 stack。worker 完了は現在の binding / session で open し、独立性の旧値を書き戻さない |
+| ViewerSession / registry の swap、fork / resume | C 自身の正本の所有移動、または独立への明示移行。遅着結果による scalar の書き戻しではない |
+| NativeVideoOpenPending、source-swap、VST deferred、Manual / Collection の遅延確定 | 独立 bool を payload に持たず、現在の C の load / open に着地する。追加の同型 P2 は確認できなかった |
+
+**旧コードでの再現:**
+
+`cargo nextest run -p mimageviewer --lib -E 'test(/independent_media_exchange_request_independence/)' --no-fail-fast`
+を指定 `run-heavy.ps1` 経由で実行。**3実行 / 0成功 / 3失敗、exit 100**、compile 9分05秒、実行0.465秒。
+証拠は `target/767-issue1-r1-red.log`。保守要求の2件は、実 fork 後 true の事前条件を満たしてから、
+旧 Apply 後 false（期待 true）になることを確認し、P2 の再現とした。
+残る1件は旧 F12 対照 fixture の setup failure。同 host の AwaitingHost 要求を置換すると reducer が Stable へ
+短絡するため遅延 Apply に到達しなかった。上記の Fullscreen→Detached fixture に直し、製品 reducer は変更しない。
+
+**修正後の検証:** すべて同じ worktree で指定 runner 経由・直列とし、
+設計担当の全件ロックがあれば解放を待つ。全件 gate / 検証用 build / 製品起動 / commit / push は実施しない。
+
+| コマンド | 件数 / exit code / 証拠 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/independent_media_exchange/)' --no-fail-fast` | **21成功 / 0失敗、exit 0**。compile 12分42秒、実行15.204秒。`target/767-issue1-r1-focused.log`。新規3件と既存同 host / 反転 F12・descriptor / 遅延 reopen を含む |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth\|export\|presentation\|window_mode\|panorama\|detached\|multiwindow_scenario\|slideshow\|admission/)' --no-fail-fast` | **1,557成功 / 0失敗、exit 0**。build確認3.06秒、実行240.304秒。`target/767-issue1-r1-regression.log`。depth focus の1件は SLOW 表示（65.364秒）だったが成功 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/native_video\|video_audio\|video_presentation\|presentation_transition/)' --no-fail-fast` | **197成功 / 0失敗、exit 0**。build確認2.45秒、実行26.901秒。`target/767-issue1-r1-native.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **exit 0**、3分08秒（テスト実行なし）。`target/767-issue1-r1-check.log` |
+| `cargo fmt`（最後の Cargo 操作、引数なし） | **exit 0**。`target/767-issue1-r1-fmt.log`。以後の Rust 変更なし |
+| `git diff --check` | **exit 0**。`target/767-issue1-r1-diff-check.log` |
+
+指定の自動検証を完了した。描画 / レイアウト / UI文字列の変更はなく、ui_snapshot / glyph / site card の再実行は不要。
+実 HWND / focus / F11・DPI / 実再生などの実機確認は今回未実施で、headless の状態・handler 検証と区別する。
+こちらから全件 gate・検証用 build・製品起動・commit / push は実施していない。vendor 差分なし、
+ブランチ `feat-767-stage2` / HEAD `bc5c3415a` のまま。独立 Sol / xhigh が整形後の差分と全証跡を照合し、
+r1 P2 の指定スコープを **受入可、未解決 P1 / P2 なし** と判定した。

@@ -393,6 +393,286 @@ fn independent_media_exchange_native_f12_reversal_commits_linked_session() {
     .unwrap();
 }
 
+/// Supply native acknowledgements, then execute the real App commit effects.
+fn complete_native_request(app: &mut App, ctx: &egui::Context, request: u64, host: u64) {
+    assert_eq!(
+        app.video_presentation_transition.request_id(),
+        Some(request)
+    );
+    assert!(matches!(
+        app.video_presentation_transition.state(),
+        PresentationTransitionState::Preparing {
+            progress: PreparingProgress::AwaitingNative { .. },
+            ..
+        }
+    ));
+    app.video_presentation_transition
+        .dispatch(PresentationTransitionEvent::NativeReady {
+            request_id: request,
+            candidate: PresentationCandidate {
+                presenter_hwnd: 0xA,
+                native_generation: 1,
+                host_hwnd: host,
+                requires_retire: false,
+            },
+        });
+    app.video_presentation_transition.drive();
+    let effects = app.video_presentation_transition.take_effects();
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, PresentationTransitionEffect::PublishNative { .. }))
+    );
+    app.video_presentation_transition
+        .dispatch(PresentationTransitionEvent::NativeCommitted {
+            request_id: request,
+            candidate_generation: 1,
+        });
+    app.execute_video_presentation_transition_effects(ctx);
+    assert!(!app.video_presentation_transition.is_transitioning());
+    assert!(!app.video_presentation_transition.has_pending_effects());
+}
+
+fn run_maintenance_independence_after_live_fork(reactivate: bool) {
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    let root = app.tmp.path().to_path_buf();
+    install_items(&mut app, &ctx, &root, false);
+    let d = 76_795;
+    let d_context = app.push_window_context_for_test(&ctx, d, |owner| {
+        owner.items = vec![GridItem::Image(root.join("2.png"))];
+        owner.image_metas = vec![None];
+        owner.thumbnails = vec![ThumbnailState::Pending];
+        owner.rebuild_visible_indices();
+        owner.fullscreen_idx = Some(0);
+        owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+        install_still(owner, &ctx, 0);
+    });
+    open_grid(&mut app, &ctx, 0);
+    let a = app.detached_viewer_window_id().unwrap();
+    let initial_owner = app.projected_viewer_context_id();
+    assert!(
+        !app.detached_viewer_independent_active,
+        "A starts linked through the real list open"
+    );
+    assert!(app.detached_window_manager.runtime(a).unwrap().linked);
+    let request = app
+        .request_native_video_viewer_presentation(ViewerPresentation::DetachedWindow, false)
+        .unwrap();
+    let host = 0x7678;
+    app.set_detached_window_host_for_test(a, host);
+    app.set_detached_window_live_hwnds_for_test([host]);
+    detached_placement::with_host_geometry_for_test(a, placement(false).outer, false, || {
+        app.poll_video_presentation_transition(&ctx);
+    });
+    assert!(matches!(
+        app.video_presentation_transition.state(),
+        PresentationTransitionState::Preparing {
+            progress: PreparingProgress::AwaitingNative { .. },
+            ..
+        }
+    ));
+    assert!(app.activate_detached_image_window_snapshot(&ctx, d));
+    let (c, residence) = app.locate_window_context(a).unwrap();
+    assert_ne!(
+        c, initial_owner,
+        "D activation forks the linked media owner"
+    );
+    assert_eq!(residence, ContextResidence::AtRest);
+    assert_eq!(
+        app.detached_window_state(a),
+        Some(DetachedWindowState::ParkedLive)
+    );
+    assert!(!app.detached_window_manager.runtime(a).unwrap().linked);
+    app.with_viewer_context(c, |owner| {
+        assert!(owner.detached_viewer_independent_active);
+        assert_eq!(
+            owner.video_presentation_transition.request_id(),
+            Some(request),
+            "request ownership transfers with C"
+        );
+    })
+    .unwrap();
+    let main = (
+        app.items.clone(),
+        app.selected,
+        app.fullscreen_idx,
+        app.items_generation,
+    );
+    if reactivate {
+        assert!(app.activate_detached_image_window_snapshot(&ctx, a));
+    }
+    let active_before = format!("{:?}", app.active_detached_session);
+    let d_binding = app.locate_window_context(d);
+    let d_runtime = app.detached_window_manager.runtime(d).unwrap().clone();
+    let d_content = app
+        .with_viewer_context(d_context, |owner| {
+            (
+                owner.items.clone(),
+                owner.fullscreen_idx,
+                owner.items_generation,
+                owner.viewer_presentation,
+                owner.detached_viewer_independent_active,
+            )
+        })
+        .unwrap();
+    let globals = (
+        app.fs_viewport_shown,
+        app.fs_viewport_presentation,
+        app.fs_viewport_generation,
+        app.detached_viewer_borderless_fullscreen,
+        app.detached_viewer_restore_placement,
+        format!("{:?}", app.detached_viewer_borderless_transition),
+        app.detached_viewer_focus_requested,
+    );
+    app.with_viewer_context(c, |owner| {
+        assert!(
+            owner.detached_viewer_independent_active,
+            "fork/reactivation has settled independence before completion"
+        );
+        complete_native_request(owner, &ctx, request, host);
+        assert!(
+            owner.detached_viewer_independent_active,
+            "maintenance inherits current independence"
+        );
+        assert!(!owner.detached_window_manager.runtime(a).unwrap().linked);
+        assert_eq!(owner.detached_viewer_window_id(), Some(a));
+        assert_eq!(owner.fullscreen_idx, Some(0));
+        if reactivate {
+            let items = owner.items.clone();
+            let order = owner.visible_indices.clone();
+            install_still(owner, &ctx, 2);
+            resolve_navigation(owner, &ctx, Some(2), true);
+            let b = owner.detached_viewer_window_id().unwrap();
+            assert_ne!(
+                a, b,
+                "the real image navigation still exchanges independent A for B"
+            );
+            assert_eq!(owner.viewer_context_window(c), Some(b));
+            assert_eq!(owner.locate_window_context(a), None);
+            assert_eq!(owner.detached_window_state(a), None);
+            assert!(owner.detached_viewer_independent_active);
+            assert!(!owner.detached_window_manager.runtime(b).unwrap().linked);
+            assert_eq!(owner.items, items);
+            assert_eq!(owner.visible_indices, order);
+            assert_eq!(owner.fullscreen_idx, Some(2));
+        }
+    })
+    .unwrap();
+    assert_eq!(
+        (
+            app.items.clone(),
+            app.selected,
+            app.fullscreen_idx,
+            app.items_generation
+        ),
+        main
+    );
+    assert_eq!(app.locate_window_context(d), d_binding);
+    assert_eq!(app.viewer_context_window(d_context), Some(d));
+    let current_d = app.detached_window_manager.runtime(d).unwrap();
+    assert_eq!(
+        (
+            current_d.state,
+            current_d.hwnd,
+            current_d.host_incarnation,
+            current_d.linked,
+            current_d.placement
+        ),
+        (
+            d_runtime.state,
+            d_runtime.hwnd,
+            d_runtime.host_incarnation,
+            d_runtime.linked,
+            d_runtime.placement
+        )
+    );
+    assert_eq!(
+        app.with_viewer_context(d_context, |owner| {
+            (
+                owner.items.clone(),
+                owner.fullscreen_idx,
+                owner.items_generation,
+                owner.viewer_presentation,
+                owner.detached_viewer_independent_active,
+            )
+        })
+        .unwrap(),
+        d_content
+    );
+    if !reactivate {
+        assert_eq!(format!("{:?}", app.active_detached_session), active_before);
+        assert_eq!(app.active_detached_window_id(), Some(d));
+        assert_eq!(
+            app.detached_window_state(a),
+            Some(DetachedWindowState::ParkedLive)
+        );
+        assert_eq!(
+            (
+                app.fs_viewport_shown,
+                app.fs_viewport_presentation,
+                app.fs_viewport_generation,
+                app.detached_viewer_borderless_fullscreen,
+                app.detached_viewer_restore_placement,
+                format!("{:?}", app.detached_viewer_borderless_transition),
+                app.detached_viewer_focus_requested
+            ),
+            globals
+        );
+    }
+}
+
+#[test]
+fn independent_media_exchange_request_independence_maintenance_after_reactivation() {
+    run_maintenance_independence_after_live_fork(true);
+}
+
+#[test]
+fn independent_media_exchange_request_independence_maintenance_while_parked() {
+    run_maintenance_independence_after_live_fork(false);
+}
+
+#[test]
+fn independent_media_exchange_request_independence_explicit_f12_completion() {
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    let root = app.tmp.path().to_path_buf();
+    install_items(&mut app, &ctx, &root, false);
+    app.settings.fullfeature_media_window = false;
+    app.settings.video_in_window_mode = false;
+    open_grid(&mut app, &ctx, 0);
+    assert_eq!(app.viewer_presentation, ViewerPresentation::Fullscreen);
+    app.toggle_detached_viewer_mode();
+    assert!(app.settings.detached_viewer_enabled);
+    let request = app.video_presentation_transition.request_id().unwrap();
+    let PresentationTransitionState::Preparing {
+        request: pending, ..
+    } = app.video_presentation_transition.state()
+    else {
+        panic!("F12 created an asynchronous request")
+    };
+    assert_eq!(pending.target, ViewerPresentation::DetachedWindow);
+    assert_eq!(pending.target_independent, Some(false));
+    let a = app.detached_viewer_window_id().unwrap();
+    // Use the existing ownership transition, rather than setting the bool by hand.
+    app.activate_mounted_as_independent_detached(a);
+    assert!(app.detached_viewer_independent_active);
+    let host = 0x7679;
+    app.set_detached_window_host_for_test(a, host);
+    app.set_detached_window_live_hwnds_for_test([host]);
+    detached_placement::with_host_geometry_for_test(a, placement(false).outer, false, || {
+        app.poll_video_presentation_transition(&ctx);
+    });
+    complete_native_request(&mut app, &ctx, request, host);
+    assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+    assert!(
+        !app.detached_viewer_independent_active,
+        "explicit F12 applies its stored decision at completion"
+    );
+    assert!(app.detached_window_manager.runtime(a).unwrap().linked);
+    assert_eq!(app.active_detached_window_id(), Some(a));
+}
+
 #[test]
 fn independent_media_exchange_descriptor_activation_and_scan_keep_resolved_session() {
     for toggle_f12 in [false, true] {

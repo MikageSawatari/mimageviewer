@@ -2787,13 +2787,6 @@ impl App {
             current_detached,
             target_detached,
         );
-        let independent = if target_presentation == self.viewer_presentation {
-            self.detached_viewer_independent_active
-        } else {
-            self.explicit_presentation_is_independent(target_presentation)
-        };
-        self.video_presentation_transition
-            .set_target_independent(request_id, independent);
         let probe_host = if target_presentation == ViewerPresentation::DetachedWindow {
             target_detached
                 .and_then(|lease| lease.host)
@@ -3135,7 +3128,10 @@ impl App {
                 if let Some(idx) = source_idx {
                     self.bump_native_video_committed_generation(idx, candidate_generation);
                 }
-                self.apply_video_session_switched(request.target, request.target_independent);
+                let independent = request
+                    .target_independent
+                    .unwrap_or(self.detached_viewer_independent_active);
+                self.apply_video_session_switched(request.target, independent);
                 if let Some(idx) = source_idx {
                     self.emit_audio_output_binding(idx, "placement_switched", request.target);
                 }

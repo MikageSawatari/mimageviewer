@@ -1486,6 +1486,7 @@ F11 の戻り Settle は restore を既に消費しているので runtime の�
 
 設計担当の追加決定 (2026-11-14): 交換を要する Manual の遅着結果は owner が inactive なら採用前にログ付きで捨て、同種メディアの背景採用は維持する。
 通常 resolver と Collection の採用境界から共通判定を呼び、背景media採用は旧EOF部品と共有、same-host native確定は所有contextに閉じる。新pending・背景B・描画guardは追加しない。決定と検証は正本 §6.4.5 / §17.18。
+独立実装レビュー r1 の P2（2026-11-14、BA-7）: 既存 request の独立性を明示 F12 だけが持つ `Some` と保守の `None` に分け、保守完了は現在の所有 context の確定値を継承する。App の状態や待ちは増やさず、実 fork / 再 activation / 旧 native 完了 / B 交換の回帰と検証を正本 §17.18 に追記する。
 
 ### 2026-11-13: 3D 写真第 2 段の実機課題の修正 (再開の所有の移動、メインが表示を失う確定点での 3D 終了)
 

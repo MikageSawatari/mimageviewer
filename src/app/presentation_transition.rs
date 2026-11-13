@@ -69,7 +69,9 @@ pub(crate) struct PresentationRequest {
     pub(crate) id: u64,
     pub(crate) current: ViewerPresentation,
     pub(crate) target: ViewerPresentation,
-    pub(crate) target_independent: bool,
+    /// Only explicit F12 decisions travel with a request. Maintenance inherits
+    /// the owning context's current independence at completion.
+    pub(crate) target_independent: Option<bool>,
     pub(crate) activate: bool,
     pub(crate) announce_main_hint: bool,
     pub(crate) outgoing_presenter_hwnd: u64,
@@ -368,7 +370,7 @@ impl PresentationTransitionOwner {
         }
     }
 
-    /// Resolve the whole viewer session on the existing asynchronous request owner.
+    /// Store an explicit F12 decision on the existing asynchronous request owner.
     pub(crate) fn set_target_independent(&mut self, request_id: u64, independent: bool) {
         match &mut self.state {
             PresentationTransitionState::Preparing { request, .. }
@@ -376,7 +378,7 @@ impl PresentationTransitionOwner {
             | PresentationTransitionState::Committing { request, .. }
                 if request.id == request_id =>
             {
-                request.target_independent = independent;
+                request.target_independent = Some(independent);
             }
             _ => {}
         }
@@ -436,7 +438,7 @@ impl PresentationTransitionOwner {
                 id,
                 current,
                 target,
-                target_independent: false,
+                target_independent: None,
                 activate,
                 announce_main_hint,
                 outgoing_presenter_hwnd,
