@@ -1461,6 +1461,8 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 設計担当の [フォルダツリー計画 §12.5](folder-tree-refresh-plan.md#125-再開時の設計-2-回目は押した瞬間に1-回目の位置と時刻で判定する-2026-11-13claudecode) の ROOT 限定契約を実装したもの。Codex 実装者と独立 Sol / xhigh レビューは、他機能の入力を正しい表示先へ限定する構造修正であり、detached の症状パッチではないと照合した。今回の回帰は headless 入力を使い、実ウィンドウの起動・操作は行わない。
 
+`6f5791d1e` の独立レビュー P3 への対応では、入力側に再記述していた表示条件を既存描画側から共用する。native backdrop と embedded still は既存の述語を継続利用する。重複していた in-window deferred reopen の条件を副作用のない述語にまとめ、入力・描画前 poll・描画前 pending の保持・holdover 描画から参照する。静止画 viewport enter suppression は読み取り専用の真偽判定を切り出し、入力と既存の描画側抑止処理が共用する。描画側の `until=None` 即 return、invalid context / expired の cleanup 二枝、描画前の active / pending の保持、描画後 active の OR、早期 return の順序・副作用は維持する。新しい状態・時間窓・条件は加えず、detached 述語自体・状態遷移・所有先も変えない。利用者から指定された共通化と Codex / 独立 Sol / xhigh の事前照合により、症状パッチではなく読み取り条件の正本を一つにする構造修正と判断した。実装・検証の結果はフォルダツリー計画 §12.5 に記録する。
+
 ### 2026-11-12: 検索中の移動で、出発 context の移譲を検索の退役より先に行う (§1.682 / §1.688 §12.3)
 
 検索中に本・コレクション・場所へ移る共通 adopter (`adopt_main_list_navigation_with_completion`) が、`ExitTemporaryView` の検索退役を

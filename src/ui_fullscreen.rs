@@ -27375,11 +27375,27 @@ impl App {
         }
     }
 
+    /// Shared read-only gate for ROOT input and fullscreen holdover drawing.
+    #[cfg(windows)]
+    pub(crate) fn main_embedded_fullscreen_reopen_pending(&self) -> bool {
+        self.native_video_in_window_active && self.fs_nav_deferred_reopen_wait_active()
+    }
+
+    /// Query the presentation hold without retiring its deadline or holdover.
+    #[cfg(windows)]
+    pub(crate) fn still_fullscreen_viewport_enter_suppressed_now(&self) -> bool {
+        self.fullscreen_idx.is_some()
+            && !self.native_video_in_window_active
+            && self
+                .still_fullscreen_viewport_enter_suppress_until
+                .is_some_and(|until| std::time::Instant::now() <= until)
+    }
+
     /// in-window 静止画から専用 fullscreen viewport へ切り替える直後、
     /// OS が新 viewport を前面表示するまで main 側の通常グリッド描画を抑止する。
     #[cfg(windows)]
     pub(crate) fn still_fullscreen_viewport_enter_suppressed(&mut self) -> bool {
-        let Some(until) = self.still_fullscreen_viewport_enter_suppress_until else {
+        let Some(_) = self.still_fullscreen_viewport_enter_suppress_until else {
             return false;
         };
 
@@ -27394,7 +27410,7 @@ impl App {
             return false;
         }
 
-        if std::time::Instant::now() <= until {
+        if self.still_fullscreen_viewport_enter_suppressed_now() {
             return true;
         }
 
@@ -27500,7 +27516,7 @@ impl App {
             // 別 viewport で同じ役割を担うので、ここで二重に描かないよう
             // `native_video_in_window_active` で gate する。
             #[cfg(windows)]
-            if self.native_video_in_window_active && self.fs_nav_deferred_reopen_wait_active() {
+            if self.main_embedded_fullscreen_reopen_pending() {
                 self.render_embedded_fs_nav_holdover(root_ui);
             }
             finish_fs_render_perf(

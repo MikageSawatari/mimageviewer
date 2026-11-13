@@ -1340,6 +1340,120 @@ fn folder_pane_label_ordered_two_clicks_in_one_pass() {
 }
 
 #[test]
+fn folder_pane_label_ordered_other_then_active_clears_navigation() {
+    ordered_other_then_active_clears_navigation(false);
+}
+
+#[test]
+fn folder_pane_label_pointer_then_active_accesskit_clears_navigation() {
+    ordered_other_then_active_clears_navigation(true);
+}
+
+fn ordered_other_then_active_clears_navigation(accesskit: bool) {
+    let (mut app, ctx, mut frame, b, _, pos) = ordered_label_fixture();
+    ctx.enable_accesskit();
+    ctx.options_mut(|options| options.max_passes = std::num::NonZeroUsize::new(1).unwrap());
+    let a = app.current_folder.clone().unwrap();
+    let active_pos = visible_label_click_rect(&ctx, &a).center();
+    assert!(pos.distance(active_pos) > 6.0);
+    assert!(app.folder_pane_open_pending.is_none());
+    let label_id = |path: &Path| {
+        ctx.data(|data| {
+            data.get_temp::<egui::Id>(egui::Id::unique(("folder_pane_test_label_id", path)))
+        })
+        .unwrap()
+    };
+    let (b_id, a_id) = (label_id(&b), label_id(&a));
+    let mut events = vec![
+        egui::Event::PointerMoved(pos),
+        primary_event(pos, true),
+        primary_event(pos, false),
+    ];
+    if accesskit {
+        events.push(egui::Event::AccessKitActionRequest(
+            egui::accesskit::ActionRequest {
+                action: egui::accesskit::Action::Click,
+                target_tree: egui::accesskit::TreeId::ROOT,
+                target_node: a_id.accesskit_id(),
+                data: None,
+            },
+        ));
+    } else {
+        events.extend([
+            egui::Event::PointerMoved(active_pos),
+            primary_event(active_pos, true),
+            primary_event(active_pos, false),
+        ]);
+    }
+    frame += 1;
+    ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 600.0),
+            )),
+            time: Some(frame as f64 / 60.0),
+            events,
+            ..Default::default()
+        },
+        |ui| {
+            let witnesses = ctx.pointer_button_targets();
+            let expected_ids = if accesskit {
+                vec![b_id, b_id]
+            } else {
+                vec![b_id, b_id, a_id, a_id]
+            };
+            assert_eq!(witnesses.len(), expected_ids.len());
+            for (edge, expected) in witnesses.iter().zip(expected_ids) {
+                assert_eq!(edge.3, Some(expected));
+                assert!(edge.4, "each pointer edge is eligible");
+            }
+            ctx.input(|input| {
+                let releases = input
+                    .pointer
+                    .released_buttons_with_click_counts()
+                    .collect::<Vec<_>>();
+                assert_eq!(releases.len(), if accesskit { 1 } else { 2 });
+                assert!(releases.iter().all(|(button, click)| {
+                    *button == egui::PointerButton::Primary && click.is_some()
+                }));
+            });
+            app.input_update_begin(&ctx);
+            let keyboard_nav = app.handle_keyboard(&ctx);
+            let (toolbar_fav_nav, address_nav) = app.render_toolbar(ui);
+            let folder_pane_nav = app.render_folder_pane(ui).0;
+            assert!(
+                app.folder_pane
+                    .visible_rows()
+                    .iter()
+                    .any(|row| row.path == a && row.is_cursor)
+            );
+            assert_eq!(
+                folder_pane_nav, None,
+                "the last single click on the active row retires B's candidate"
+            );
+            let grid_nav = app.render_grid(ui);
+            app.post_render_main_navigation(
+                &ctx,
+                update_phases::MainFrameNavigation {
+                    keyboard_nav,
+                    toolbar_fav_nav,
+                    address_nav,
+                    folder_pane_nav,
+                    grid_nav,
+                    ..empty_main_navigation()
+                },
+            );
+            app.finish_folder_pane_presentation(&ctx, true);
+        },
+    )
+    .drop_without_applying_deltas();
+    assert!(app.folder_pane_open_pending.is_none());
+    assert_eq!(app.current_folder.as_ref(), Some(&a));
+    assert_label_expanded(&app, &b, false);
+}
+
+#[test]
 fn folder_pane_label_ordered_release_press_release_in_one_pass() {
     let (mut app, ctx, mut frame, b, _, pos) = ordered_label_fixture();
     navigation_tree_frame(

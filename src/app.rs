@@ -24326,12 +24326,8 @@ impl App {
         let visible = visible
             && !self.native_video_fullscreen_active_for_main_backdrop()
             && !self.fullscreen_embedded_still_active()
-            && !(self.native_video_in_window_active && self.fs_nav_deferred_reopen_wait_active())
-            && !(self.fullscreen_idx.is_some()
-                && !self.native_video_in_window_active
-                && self
-                    .still_fullscreen_viewport_enter_suppress_until
-                    .is_some_and(|until| std::time::Instant::now() <= until));
+            && !self.main_embedded_fullscreen_reopen_pending()
+            && !self.still_fullscreen_viewport_enter_suppressed_now();
         visible
     }
 
@@ -101251,8 +101247,7 @@ impl App {
         #[cfg(windows)]
         let main_embedded_transitions_polled_before_render = {
             let embedded_active = self.fullscreen_embedded_still_active();
-            let embedded_pending =
-                self.native_video_in_window_active && self.fs_nav_deferred_reopen_wait_active();
+            let embedded_pending = self.main_embedded_fullscreen_reopen_pending();
             let should_poll = should_poll_main_embedded_transitions_before_render(
                 embedded_active,
                 embedded_pending,
@@ -101284,8 +101279,7 @@ impl App {
         // 続くグリッド描画は同じく抑止する必要がある
         // (両方の CentralPanel が走ると二重描画 + 白フラッシュ)。
         #[cfg(windows)]
-        let embedded_fs_pending =
-            self.native_video_in_window_active && self.fs_nav_deferred_reopen_wait_active();
+        let embedded_fs_pending = self.main_embedded_fullscreen_reopen_pending();
         #[cfg(not(windows))]
         let embedded_fs_pending = false;
         let should_render_main_fullscreen_viewport =

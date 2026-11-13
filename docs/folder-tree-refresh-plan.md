@@ -712,6 +712,35 @@ focused の指定順は `src/folder_pane.rs`、`src/ui_folder_pane.rs`、`src/ap
 
 独立 Sol / xhigh の実装静的レビューは、モーダル再確認・layerの境界・stable widget ID・最終fixture補正を含め ACCEPT（自動テストは上記を実装担当が実行）。HEADは `4e856f29b` のまま、変更は未コミット。製品起動・実機入力・backlog変更は行っていない。
 
+#### 独立コードレビュー P2・P3 の修正（`6f5791d1e` 上の未コミット差分）
+
+P2 の原因は、同じ pass の名前クリック結果を順に適用する際、現在地への Single が先行する移動候補を上書きしないことだった。現在地 A で B → A の順に単クリックすると cursor は A に戻るが、B の `Some(B)` が後段の移動裁定へ残る。名前の各 Single で `Some(path)` / `None` の両方を代入して候補を置換する。同じ形の非 pointer 活性化（キー / AccessKit）も揃え、Arrow / Toggle は直前の Single の移動候補を消さない既定のままにする。
+
+製品ファイルが `6f5791d1e` のまま、次の2件を新しい実 handler 回帰として実行した。ポインター版は 6pt より離れた B / A の押下・離し4 edgeを同じ ROOT pass に渡し、4 witness が B / B / A / A で受付可、release 2件がともにクリック成立、cursor が A であることを先に確認する。AccessKit 版はポインター B のクリックと A の Click 活性化を同じ pass に渡す。**両方とも上記前提を通過し、移動候補 `Some(B) != None` の製品 assert で失敗**した。各1件実行 / 0成功 / 1失敗、exit100、実行0.613秒 / 0.653秒。ログは `target/769-review-p2-red.log` / `target/769-review-accesskit-red.log`、その時点のテストソースは `target/769-review-red-tests-source.rs`。最初の実行は先行の全件テストのロックを待ち、迂回しなかった。
+
+P3 は読み取り条件の共通化に限定する。detached の述語・状態遷移を変えず、描画側の後始末や描画前後の保持位置も維持する。触れた範囲は `docs/detached-rework-plan.md` §11 に追記する。
+
+| 既存の描画条件 | 共通の読み取りと呼び出し対応 | 維持する描画処理 |
+| --- | --- | --- |
+| native backdrop | 既存 `native_video_fullscreen_active_for_main_backdrop()` を入力と描画の両方から利用（元から共通） | backdrop 側の subclass / chrome / cloak / navigation / return を変更しない |
+| embedded still | 既存 `fullscreen_embedded_still_active()` を入力と描画の両方から利用（元から共通） | 描画直前 active の capture と、描画後 active との OR を変更しない |
+| in-window かつ deferred reopen 待ち | 描画側の式 `native_video_in_window_active && fs_nav_deferred_reopen_wait_active()` を `main_embedded_fullscreen_reopen_pending(&self)` へ移す。入力、描画前 poll、描画前 pending capture、`render_fullscreen_viewport_with_root_input` の holdover 描画の計4箇所が利用 | 各呼び出しの位置、pending の描画前 capture と後段 gate を維持 |
+| still viewport enter suppression | `still_fullscreen_viewport_enter_suppressed_now(&self)` が fullscreen_idx / in-window / 期限の真偽だけを読む。入力と既存の mut 版 `still_fullscreen_viewport_enter_suppressed` が利用 | `until=None` の即 return と、invalid context / expired それぞれの deadline・PresentationSwitch holdover 破棄を元の分岐・位置のまま維持 |
+
+新しい条件・状態・時間窓はない。上のコード対応により、共通化前と同じ入力を同じ時点で描画条件へ渡すことを確認する。読み取りだけの ROOT 入力は deadline / holdover を消さず、既存の mut 版だけが元の描画 checkpoint で後始末を行う。
+
+修正後の検証は Windows MSVC / default features / test・dev profile。Cargo のビルド・テスト・整形はすべて `run-heavy.ps1 -Owner "codex-769" -WorkDir G:\home\mimageviewer-769` 経由。先行全件テストの終了後は、lock 領域への書込み不可の警告に従い BelowNormal / `CARGO_BUILD_JOBS=6` で実行した。core check は前回の native 検証と同じく `-j 1` を明示した。
+
+| コマンド・範囲 | 結果 | 証跡 (`target/`) |
+| --- | --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/folder_pane/) \| test(/label_click/) \| test(/sidecar_restore/)' --no-fail-fast --retries 0 --no-tests fail` | **251成功 / 失敗0、22.655秒、exit0**。修正前に失敗した新2件を含む | `769-review-related.log` |
+| `scripts/test-focused.ps1 -Path src/ui_folder_pane.rs,src/app/folder_pane_refresh_tests.rs,src/ui_fullscreen.rs`（配列で指定） | **18 / 112 / 1,359件の3群すべて成功、計1,489実行、exit0**。1.391 / 19.601 / 152.298秒。関連filterとの重複を含む | `769-review-focused.log`、`769-review-focused.ps1`、ログに記録した `test-focused/runs/*` の各結果 |
+| `cargo check -p mimageviewer --bin mimageviewer-core -j 1` | **exit0、54.90秒** | `769-review-check.log` |
+| 引数なし `cargo fmt` / `cargo fmt --check` | **各exit0** | `769-review-fmt.log` / `769-review-fmt-check.log` |
+| `git diff --check` / 検証前後のRust SHA-256照合 | **各成功** | `769-review-diff-check.log` / `769-review-source-hashes.json` |
+
+focused の `src/app.rs` は前回同様 broad path（全lib指定になる）のため除外し、共有判定は上のコード対応・独立静的レビューと変更した呼び出し元モジュールの回帰・core checkで確認した。独立 Sol / xhigh の P2・P3 フォローアップ静的レビューは **ACCEPT**、追加findingなし。HEADは `6f5791d1e` のまま未コミット。本体全lib・ui_snapshot・build-dev・製品起動は指定どおり実施せず、backlogにも触れていない。
+
 ## 13. マウスでクリックした行を中央へ寄せない (2026-11-12 設計、ClaudeCode)
 
 利用者決定 (2026-11-12 夜、§1.769 の実機確認 依頼 40 から派生)。ツリーで行の名前、または ▶ / ▼ をマウスでクリックしたときは、その行を中央へ寄せない。押した行は既に見えているので、Windows のエクスプローラのナビゲーション ウィンドウと同じく、スクロール位置をそのままにする。

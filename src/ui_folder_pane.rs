@@ -818,13 +818,13 @@ impl App {
                     }
                     self.folder_pane.set_focus_tree();
                     self.folder_pane.set_cursor(path.clone());
-                    if self
+                    // The last name activation replaces even an earlier move
+                    // candidate when it selects the current location.
+                    nav = self
                         .folder_pane
                         .active_path()
                         .is_none_or(|active| !crate::folder_tree::path_eq(active, &path))
-                    {
-                        nav = Some(path);
-                    }
+                        .then_some(path);
                     pointer_row_clicked = true;
                     self.folder_pane.cursor_scroll = FolderPaneCursorScroll::Idle;
                 }
@@ -980,13 +980,11 @@ impl App {
                     self.folder_pane.clear_label_click();
                     self.folder_pane.set_focus_tree();
                     self.folder_pane.set_cursor(row.path.clone());
-                    if self
+                    nav = self
                         .folder_pane
                         .active_path()
                         .is_none_or(|active| !crate::folder_tree::path_eq(active, &row.path))
-                    {
-                        nav = Some(row.path.clone());
-                    }
+                        .then(|| row.path.clone());
                 }
                 if cursor_scroll != FolderPaneCursorScroll::Idle && row.is_cursor {
                     cursor_drawn = true;
