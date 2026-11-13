@@ -4,8 +4,8 @@ use eframe::egui;
 
 use crate::app::App;
 use crate::folder_pane::{
-    self, FolderPaneCommand, FolderPaneCursorScroll, FolderPaneLabelClick,
-    FolderPaneListingOptions, FolderPaneTreeKey,
+    self, FolderPaneCommand, FolderPaneCursorScroll, FolderPaneLabelDisplay, FolderPaneLabelResult,
+    FolderPaneLabelWidgets, FolderPaneListingOptions, FolderPaneTreeKey,
 };
 use crate::ui_main::AddressBarNav;
 
@@ -234,6 +234,226 @@ fn draw_folder_pane_row(
 }
 
 impl App {
+    /// Observe ROOT before sidecar restore discards semantic input and pointer history.
+    pub(crate) fn begin_folder_pane_label_input(&mut self, ctx: &egui::Context) {
+        use folder_pane::{
+            FolderPaneLabelInput as Input, FolderPanePointerHit as Hit,
+            FolderPanePointerSource as Source,
+        };
+        if ctx.viewport_id() != egui::ViewportId::ROOT {
+            return;
+        }
+        let pass = ctx.cumulative_pass_nr();
+        if !self.folder_pane.begin_label_input(pass) {
+            return;
+        }
+        // Provenance observes even a hidden/disabled interval without driving the grid.
+        let touch = crate::touch_correlation::observe_primary_pointer_provenance(ctx);
+        let visible = self.folder_pane_main_chrome_visible_now(ctx);
+        let fresh = self
+            .folder_pane
+            .label_display
+            .as_ref()
+            .is_some_and(|display| display.pass.checked_add(1) == Some(pass));
+        if !visible || !fresh {
+            self.folder_pane.invalidate_label_display();
+            return;
+        }
+        if !self.folder_pane.has_focus && self.folder_pane.label_gesture_requires_tree_focus() {
+            self.folder_pane.clear_label_click();
+        }
+        // Actual tree-key execution stays at its old checkpoint; only end the
+        // old mouse gesture before recognizing this batch's new pointer input.
+        if self.folder_pane.has_focus
+            && ctx.input(|input| {
+                input.events.iter().any(|event| {
+                    let egui::Event::Key {
+                        key,
+                        pressed: true,
+                        modifiers,
+                        ..
+                    } = event
+                    else {
+                        return false;
+                    };
+                    use crate::keymap::{Chord, KeyName};
+                    [
+                        KeyName::Up,
+                        KeyName::Down,
+                        KeyName::Left,
+                        KeyName::Right,
+                        KeyName::Enter,
+                    ]
+                    .into_iter()
+                    .any(|key_name| {
+                        [false, true].into_iter().any(|shift| {
+                            [false, true].into_iter().any(|alt| {
+                                Chord::new(false, shift, alt, key_name)
+                                    .matches_egui(*key, *modifiers)
+                            })
+                        })
+                    })
+                })
+            })
+        {
+            self.folder_pane.clear_label_click();
+        }
+        let start_allowed = self.modal_dialog_block_reason().is_none();
+        let continue_allowed = !self.modal_input_blocked_except_sidecar_restore();
+        if !continue_allowed {
+            self.folder_pane.clear_label_click();
+        }
+        let mut witnesses = ctx.pointer_button_targets().into_iter();
+        let (events, releases, time) = ctx.input(|input| {
+            (
+                input.events.clone(),
+                input
+                    .pointer
+                    .released_buttons_with_click_counts()
+                    .collect::<Vec<_>>(),
+                input.time,
+            )
+        });
+        let has_touch = events
+            .iter()
+            .any(|event| matches!(event, egui::Event::Touch { .. }));
+        let (max_dist, max_delay) = ctx.options(|options| {
+            (
+                options.input_options.max_click_dist,
+                options.input_options.max_double_click_delay,
+            )
+        });
+        let mut releases = releases.into_iter();
+        let mut ordinal = 0;
+        let mut resolved = Vec::new();
+        let display = self.folder_pane.label_display.as_ref().unwrap();
+        for event in events {
+            match event {
+                egui::Event::WindowFocused(false)
+                | egui::Event::Touch {
+                    phase: egui::TouchPhase::Cancel,
+                    ..
+                } => resolved.push((Input::Cancel, None)),
+                egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    ..
+                } => {
+                    let Some((p, b, down, widget, allowed)) = witnesses.next() else {
+                        self.folder_pane.clear_label_click();
+                        return;
+                    };
+                    if (p, b, down) != (pos, button, pressed) {
+                        self.folder_pane.clear_label_click();
+                        return;
+                    }
+                    let click = if pressed {
+                        None
+                    } else {
+                        let Some((released_button, click)) = releases.next() else {
+                            self.folder_pane.clear_label_click();
+                            return;
+                        };
+                        if released_button != button {
+                            self.folder_pane.clear_label_click();
+                            return;
+                        }
+                        click
+                    };
+                    if button != egui::PointerButton::Primary {
+                        if pressed {
+                            resolved.push((Input::Cancel, None));
+                        }
+                        continue;
+                    }
+                    let edge = touch.grid_primary_edge(ordinal, pressed);
+                    if !pressed {
+                        ordinal += 1;
+                    }
+                    // A mixed/ambiguous touch batch cannot be reclassified as mouse.
+                    if (has_touch && !edge.touch_derived)
+                        || (edge.suppressed && !edge.touch_derived)
+                    {
+                        resolved.push((Input::Cancel, None));
+                        continue;
+                    }
+                    let source = if edge.touch_derived {
+                        Source::Touch
+                    } else {
+                        Source::Mouse
+                    };
+                    let label = display.rows.iter().find(|row| Some(row.label) == widget);
+                    let arrow = display.rows.iter().find(|row| Some(row.arrow) == widget);
+                    let hit = if let Some(row) =
+                        label.filter(|row| pressed || row.label_rect.contains(pos))
+                    {
+                        Hit::Label(row.path.clone())
+                    } else if let Some(row) =
+                        arrow.filter(|row| pressed || row.arrow_rect.contains(pos))
+                    {
+                        Hit::Arrow(row.path.clone())
+                    } else {
+                        Hit::None
+                    };
+                    if pressed {
+                        let continuation_layer = ctx.layer_id_at(pos).is_none_or(|layer| {
+                            layer == display.layer || layer == Self::sidecar_restore_modal_layer()
+                        });
+                        let continuation_hit = widget.is_none()
+                            || label.is_some()
+                            || widget.is_some_and(|widget| {
+                                Self::is_sidecar_restore_modal_widget(ctx, widget)
+                            });
+                        resolved.push((
+                            Input::Press {
+                                pos,
+                                hit,
+                                source,
+                                start_allowed: start_allowed && allowed,
+                                continue_allowed: continue_allowed
+                                    && continuation_layer
+                                    && display.rect.contains(pos)
+                                    && continuation_hit,
+                                arrow_rect: display
+                                    .rows
+                                    .iter()
+                                    .any(|row| row.arrow_rect.contains(pos)),
+                            },
+                            widget,
+                        ));
+                    } else {
+                        resolved.push((
+                            Input::Release {
+                                hit,
+                                source,
+                                start_allowed: start_allowed && allowed,
+                                clicked: click.is_some(),
+                            },
+                            widget,
+                        ));
+                    }
+                }
+                // Release adjudication includes the whole movement/hold history.
+                egui::Event::PointerMoved(_) => {}
+                _ => {}
+            }
+        }
+        if witnesses.next().is_some() || releases.next().is_some() {
+            self.folder_pane.clear_label_click();
+            return;
+        }
+        for (event, widget) in resolved {
+            if self
+                .folder_pane
+                .process_label_input(event, time, max_dist, max_delay)
+                && let Some(widget) = widget
+            {
+                self.folder_pane.record_label_pointer_activation(widget);
+            }
+        }
+    }
+
     pub(crate) fn request_folder_tree_pane_toggle(&mut self, kind: FolderPaneToggleKind) {
         use FolderPaneVisibilityRequest::{Hide, HideAndNavigate, Show};
         let visible = self
@@ -410,7 +630,7 @@ impl App {
             });
             if let Some(key) = key {
                 if let Some(FolderPaneCommand::Open(path)) = self.folder_pane.handle_tree_key(key) {
-                    self.folder_pane.set_focus_grid();
+                    self.folder_pane.release_tree_keyboard_focus();
                     // クリック経路と同じく worker scan 経由で開く (UI スレッドの
                     // read_dir ブロック回避)。Enter は consume 済みなので、この後
                     // grid keyboard へ抜けても二重発火しない。
@@ -459,6 +679,10 @@ impl App {
         ctx: &egui::Context,
         main_chrome_drawn: bool,
     ) {
+        if ctx.viewport_id() != egui::ViewportId::ROOT {
+            return;
+        }
+        self.folder_pane.finish_label_input();
         if !main_chrome_drawn {
             self.folder_pane.suspend_display();
         }
@@ -565,13 +789,78 @@ impl App {
         });
     }
 
-    fn apply_folder_pane_branch_click(&mut self, path: &std::path::Path, key: FolderPaneTreeKey) {
+    fn apply_folder_pane_branch_click(&mut self, path: &std::path::Path, expanded: bool) {
         self.folder_pane.set_focus_tree();
         self.folder_pane.set_cursor(path.to_path_buf());
-        let _ = self.folder_pane.handle_tree_key(key);
+        self.folder_pane.set_branch_expanded(path, expanded);
     }
 
     fn render_folder_pane_tree(&mut self, ui: &mut egui::Ui) -> Option<std::path::PathBuf> {
+        if ui.ctx().viewport_id() != egui::ViewportId::ROOT {
+            return None;
+        }
+        if self.folder_pane_disabled() {
+            self.folder_pane.invalidate_label_display();
+        }
+        let mut nav = None;
+        let mut pointer_row_clicked = false;
+        // The keyboard phase has completed. Apply each pointer outcome once,
+        // including arrows, before drawing the resulting pane state.
+        for result in self
+            .folder_pane
+            .take_label_results(ui.ctx().cumulative_pass_nr())
+        {
+            match result {
+                FolderPaneLabelResult::Single(path) => {
+                    if self.modal_dialog_block_reason().is_some() {
+                        self.folder_pane.clear_label_click();
+                        continue;
+                    }
+                    self.folder_pane.set_focus_tree();
+                    self.folder_pane.set_cursor(path.clone());
+                    if self
+                        .folder_pane
+                        .active_path()
+                        .is_none_or(|active| !crate::folder_tree::path_eq(active, &path))
+                    {
+                        nav = Some(path);
+                    }
+                    pointer_row_clicked = true;
+                    self.folder_pane.cursor_scroll = FolderPaneCursorScroll::Idle;
+                }
+                FolderPaneLabelResult::Arrow(path) => {
+                    if self.modal_dialog_block_reason().is_some() {
+                        self.folder_pane.clear_label_click();
+                        continue;
+                    }
+                    if let Some(row) = self
+                        .folder_pane
+                        .visible_rows()
+                        .into_iter()
+                        .find(|row| crate::folder_tree::path_eq(&row.path, &path))
+                        && (row.expanded || row.has_children_or_unknown)
+                    {
+                        self.apply_folder_pane_branch_click(&path, !row.expanded);
+                        pointer_row_clicked = true;
+                        self.folder_pane.cursor_scroll = FolderPaneCursorScroll::Idle;
+                    }
+                }
+                FolderPaneLabelResult::Toggle { path, expanded } => {
+                    if self.modal_input_blocked_except_sidecar_restore() {
+                        self.folder_pane.clear_label_click();
+                        continue;
+                    }
+                    if self
+                        .folder_pane
+                        .visible_rows()
+                        .iter()
+                        .any(|row| crate::folder_tree::path_eq(&row.path, &path))
+                    {
+                        self.folder_pane.set_branch_expanded(&path, expanded);
+                    }
+                }
+            }
+        }
         let rows = self.folder_pane.visible_rows();
         if rows.is_empty() {
             ui.centered_and_justified(|ui| {
@@ -580,7 +869,6 @@ impl App {
             return None;
         }
 
-        let mut nav = None;
         // Take the old request so clicks/arrows during this draw can publish a
         // new Requested without the old draw's completion overwriting it.
         let mut cursor_scroll = std::mem::take(&mut self.folder_pane.cursor_scroll);
@@ -601,7 +889,7 @@ impl App {
             cursor_scroll = FolderPaneCursorScroll::Idle;
         }
         let mut cursor_drawn = false;
-        let mut pointer_row_clicked = false;
+        let mut label_widgets = Vec::new();
         // Preserve a path and its in-row offset across automatic cache replacement.
         // Button/text minimum sizes can exceed the requested 24pt label height.
         // Reuse the pitch measured from the actual row allocation on the last draw.
@@ -639,9 +927,30 @@ impl App {
             let mut cursor_revealed = false;
             ui.set_width(ui.available_width());
             for row in rows {
-                let (arrow_resp, resp, row_rect) =
-                    draw_folder_pane_row(ui, &row, self.folder_pane.has_focus);
+                // Expansion can add rows before an AccessKit target in this
+                // same pass. Component identity belongs to the path, not its
+                // current ordinal in the tree.
+                let row_id = ui.make_persistent_id((
+                    "folder_pane_row",
+                    crate::path_key::normalize_keep_drive(&row.path),
+                ));
+                let (arrow_resp, resp, row_rect) = ui
+                    .scope_builder(egui::UiBuilder::new().scope_id(row_id), |ui| {
+                        draw_folder_pane_row(ui, &row, self.folder_pane.has_focus)
+                    })
+                    .inner;
                 drawn_pitch = row_rect.height() + ui.spacing().item_spacing.y;
+                label_widgets.push(FolderPaneLabelWidgets {
+                    path: row.path.clone(),
+                    label: resp.id,
+                    label_rect: resp.rect,
+                    arrow: arrow_resp.id,
+                    arrow_rect: if row.expanded || row.has_children_or_unknown {
+                        arrow_resp.rect
+                    } else {
+                        egui::Rect::NOTHING
+                    },
+                });
                 #[cfg(test)]
                 ui.ctx().data_mut(|data| {
                     data.insert_temp(folder_pane_test_row_rect_id(&row.path), row_rect);
@@ -649,59 +958,35 @@ impl App {
                         egui::Id::unique(("folder_pane_test_label_id", row.path.as_path())),
                         resp.id,
                     );
-                });
-                if (row.expanded || row.has_children_or_unknown) && arrow_resp.clicked() {
-                    self.folder_pane.clear_label_click();
-                    let key = if row.expanded {
-                        FolderPaneTreeKey::Left
-                    } else {
-                        FolderPaneTreeKey::Right
-                    };
-                    self.apply_folder_pane_branch_click(&row.path, key);
-                }
-                if resp.clicked() {
-                    let count = if resp.triple_clicked() {
-                        3
-                    } else if resp.double_clicked() {
-                        2
-                    } else {
-                        1
-                    };
-                    let time = ui.input(|input| input.time);
-                    let delay = ui
-                        .ctx()
-                        .options(|options| options.input_options.max_double_click_delay);
-                    let click = self.folder_pane.handle_label_click(
-                        &row.path,
-                        count,
-                        row.expanded,
-                        row.expanded || row.has_children_or_unknown,
-                        time,
-                        delay,
+                    data.insert_temp(
+                        egui::Id::unique(("folder_pane_test_label_rect", row.path.as_path())),
+                        resp.rect,
                     );
-                    if let FolderPaneLabelClick::Repeated(Some(key)) = click {
-                        self.apply_folder_pane_branch_click(&row.path, key);
-                    } else {
-                        self.folder_pane.set_focus_tree();
-                        self.folder_pane.set_cursor(row.path.clone());
-                    }
-                    if click == FolderPaneLabelClick::Single
-                        && self
-                            .folder_pane
-                            .active_path()
-                            .is_none_or(|active| !crate::folder_tree::path_eq(active, &row.path))
+                });
+                if (row.expanded || row.has_children_or_unknown)
+                    && arrow_resp.clicked()
+                    && !arrow_resp.clicked_by(egui::PointerButton::Primary)
+                    && !self
+                        .folder_pane
+                        .label_pointer_activation_owned(arrow_resp.id)
+                {
+                    self.folder_pane.clear_label_click();
+                    self.apply_folder_pane_branch_click(&row.path, !row.expanded);
+                }
+                if resp.clicked()
+                    && !resp.clicked_by(egui::PointerButton::Primary)
+                    && !self.folder_pane.label_pointer_activation_owned(resp.id)
+                {
+                    self.folder_pane.clear_label_click();
+                    self.folder_pane.set_focus_tree();
+                    self.folder_pane.set_cursor(row.path.clone());
+                    if self
+                        .folder_pane
+                        .active_path()
+                        .is_none_or(|active| !crate::folder_tree::path_eq(active, &row.path))
                     {
                         nav = Some(row.path.clone());
                     }
-                }
-                if resp.clicked_by(egui::PointerButton::Primary)
-                    || ((row.expanded || row.has_children_or_unknown)
-                        && arrow_resp.clicked_by(egui::PointerButton::Primary))
-                {
-                    // Pointer input replaces the cursor without revealing it.
-                    // Retire the captured request before later rows can apply it.
-                    cursor_scroll = FolderPaneCursorScroll::Idle;
-                    pointer_row_clicked = true;
                 }
                 if cursor_scroll != FolderPaneCursorScroll::Idle && row.is_cursor {
                     cursor_drawn = true;
@@ -721,6 +1006,16 @@ impl App {
                 }
             }
             cursor_revealed
+        });
+        for widget in &mut label_widgets {
+            widget.label_rect = widget.label_rect.intersect(output.inner_rect);
+            widget.arrow_rect = widget.arrow_rect.intersect(output.inner_rect);
+        }
+        self.folder_pane.label_display = Some(FolderPaneLabelDisplay {
+            pass: ui.ctx().cumulative_pass_nr(),
+            layer: ui.layer_id(),
+            rect: output.inner_rect,
+            rows: label_widgets,
         });
         if output.inner {
             // The new reveal owns this vertical position. Retire the previous
@@ -886,6 +1181,12 @@ mod tests {
     fn actual_folder_pane_empty_branch_can_collapse_and_mouse_reexpand_after_external_add() {
         use std::{cell::RefCell, rc::Rc};
         let app = Rc::new(RefCell::new(crate::app::setup_app_for_test()));
+        // This harness draws the main pane after startup, without running the
+        // indexer initialization driver or its startup overlay.
+        app.borrow_mut()
+            .indexer_init
+            .mark_unavailable_if_not_ready();
+        app.borrow_mut().settings.folder_tree_pane_visible = true;
         let root = app.borrow().tmp.path().join("tree");
         let branch = root.join("empty");
         std::fs::create_dir_all(&branch).unwrap();
@@ -906,7 +1207,13 @@ mod tests {
                     return;
                 }
                 crate::test_ui::full_viewport_ui(ui, |ui| {
+                    captured
+                        .borrow_mut()
+                        .begin_folder_pane_label_input(ui.ctx());
                     captured.borrow_mut().render_folder_pane_tree(ui);
+                    captured
+                        .borrow_mut()
+                        .finish_folder_pane_presentation(ui.ctx(), true);
                 });
             });
         h.run_steps(3);

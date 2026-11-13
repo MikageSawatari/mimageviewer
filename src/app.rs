@@ -24315,9 +24315,45 @@ impl App {
             })
     }
 
+    /// Read the main presentation predicates without changing viewer ownership.
+    pub(crate) fn folder_pane_main_chrome_visible_now(&self, ctx: &egui::Context) -> bool {
+        let visible = self.settings.folder_tree_pane_visible
+            && !self.folder_pane_disabled()
+            && self.window_visible
+            && !ctx.input(|input| input.viewport().minimized.unwrap_or(false))
+            && !self.indexer_init.overlay_active();
+        #[cfg(windows)]
+        let visible = visible
+            && !self.native_video_fullscreen_active_for_main_backdrop()
+            && !self.fullscreen_embedded_still_active()
+            && !(self.native_video_in_window_active && self.fs_nav_deferred_reopen_wait_active())
+            && !(self.fullscreen_idx.is_some()
+                && !self.native_video_in_window_active
+                && self
+                    .still_fullscreen_viewport_enter_suppress_until
+                    .is_some_and(|until| std::time::Instant::now() <= until));
+        visible
+    }
+
+    /// Query the same blocker table, allowing only an existing tree gesture
+    /// to continue through sidecar hydration. Other simultaneous blockers count.
+    pub(crate) fn modal_input_blocked_except_sidecar_restore(&self) -> bool {
+        self.modal_dialog_block_reason_filtered(true, false)
+            .is_some()
+            || self.omitted_entries_dialog_visible()
+    }
+
     fn modal_dialog_block_reason_without_omitted_entries(
         &self,
         include_menus: bool,
+    ) -> Option<&'static str> {
+        self.modal_dialog_block_reason_filtered(include_menus, true)
+    }
+
+    fn modal_dialog_block_reason_filtered(
+        &self,
+        include_menus: bool,
+        include_sidecar_restore: bool,
     ) -> Option<&'static str> {
         macro_rules! first {
             ($( $cond:expr => $name:literal ),+ $(,)?) => {
@@ -24337,7 +24373,7 @@ impl App {
             self.everything_search_progress_visible() => "everything_search",
             self.capture_selection_open() => "clipboard_capture_selection",
             self.cover_crop_dialog_open() => "cover_crop",
-            self.sidecar_restore_active() => "sidecar_restore",
+            include_sidecar_restore && self.sidecar_restore_active() => "sidecar_restore",
             self.remote_session_blocks_local_control() => "remote_session",
             self.remote_connection_dialog_open() => "remote_connection",
             self.show_stats_dialog => "stats",

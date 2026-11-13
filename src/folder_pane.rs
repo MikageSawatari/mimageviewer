@@ -49,17 +49,95 @@ pub(crate) enum FolderPaneCommand {
     Open(PathBuf),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FolderPaneLabelClick {
-    Single,
-    Repeated(Option<FolderPaneTreeKey>),
+/// The sole owner of an ordered primary-pointer gesture in the tree.
+#[derive(Debug, Default)]
+enum FolderPaneLabelGesture {
+    #[default]
+    Idle,
+    FirstPress {
+        path: PathBuf,
+        pos: egui::Pos2,
+        source: FolderPanePointerSource,
+    },
+    AwaitingPress {
+        anchor: FolderPaneLabelAnchor,
+        time: f64,
+    },
+    PressAccepted(FolderPaneLabelAnchor),
+    ArrowPress {
+        path: PathBuf,
+        source: FolderPanePointerSource,
+    },
 }
 
-struct FolderPaneLabelClickRecord {
+#[derive(Debug)]
+struct FolderPaneLabelAnchor {
     path: PathBuf,
-    expanded: bool,
-    time: f64,
+    first_expanded: bool,
+    pos: egui::Pos2,
     toggled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FolderPanePointerSource {
+    Mouse,
+    Touch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FolderPanePointerHit {
+    Label(PathBuf),
+    Arrow(PathBuf),
+    None,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FolderPaneLabelResult {
+    Single(PathBuf),
+    Arrow(PathBuf),
+    Toggle { path: PathBuf, expanded: bool },
+}
+
+/// Rebuilt at the tree drawing boundary; never used after a skipped frame.
+pub(crate) struct FolderPaneLabelDisplay {
+    pub pass: u64,
+    pub layer: egui::LayerId,
+    pub rect: egui::Rect,
+    pub rows: Vec<FolderPaneLabelWidgets>,
+}
+
+pub(crate) struct FolderPaneLabelWidgets {
+    pub path: PathBuf,
+    pub label: egui::Id,
+    pub label_rect: egui::Rect,
+    pub arrow: egui::Id,
+    pub arrow_rect: egui::Rect,
+}
+
+#[derive(Default)]
+struct FolderPaneLabelInputPass {
+    pass: Option<u64>,
+    results: Vec<FolderPaneLabelResult>,
+    pointer_activations: HashSet<egui::Id>,
+}
+
+/// Witness acceptance, modal eligibility and touch provenance come from ROOT input.
+pub(crate) enum FolderPaneLabelInput {
+    Press {
+        pos: egui::Pos2,
+        hit: FolderPanePointerHit,
+        start_allowed: bool,
+        continue_allowed: bool,
+        arrow_rect: bool,
+        source: FolderPanePointerSource,
+    },
+    Release {
+        hit: FolderPanePointerHit,
+        start_allowed: bool,
+        clicked: bool,
+        source: FolderPanePointerSource,
+    },
+    Cancel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,7 +304,9 @@ pub(crate) struct FolderPaneState {
     participation: PaneParticipation,
     listing_options: FolderPaneListingOptions,
     last_drive_refresh: Option<std::time::Instant>,
-    label_click: Option<FolderPaneLabelClickRecord>,
+    label_gesture: FolderPaneLabelGesture,
+    pub(crate) label_display: Option<FolderPaneLabelDisplay>,
+    label_input: FolderPaneLabelInputPass,
     #[cfg(test)]
     scan_backend: Option<TestScanBackend>,
 }
@@ -252,7 +332,9 @@ impl Default for FolderPaneState {
             participation: PaneParticipation::Suspended,
             listing_options: FolderPaneListingOptions::default(),
             last_drive_refresh: None,
-            label_click: None,
+            label_gesture: FolderPaneLabelGesture::Idle,
+            label_display: None,
+            label_input: FolderPaneLabelInputPass::default(),
             #[cfg(test)]
             scan_backend: None,
         }
@@ -260,50 +342,210 @@ impl Default for FolderPaneState {
 }
 
 impl FolderPaneState {
-    /// Resolve a label gesture without navigation, I/O, or changing tree state.
-    /// The first click's display owns the target even if active sync runs meanwhile.
-    pub(crate) fn handle_label_click(
-        &mut self,
-        path: &Path,
-        count: u8,
-        expanded: bool,
-        can_expand: bool,
-        time: f64,
-        max_double_click_delay: f64,
-    ) -> FolderPaneLabelClick {
-        if count >= 2
-            && let Some(record) = self.label_click.as_mut().filter(|record| {
-                crate::folder_tree::path_eq(&record.path, path)
-                    && (0.0..=max_double_click_delay * 2.0).contains(&(time - record.time))
-            })
-        {
-            // Keep the burst alive without replacing its first display state.
-            record.time = time;
-            let key = if !record.toggled {
-                record.toggled = true;
-                if record.expanded && expanded {
-                    Some(FolderPaneTreeKey::Left)
-                } else if !record.expanded && !expanded && can_expand {
-                    Some(FolderPaneTreeKey::Right)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            return FolderPaneLabelClick::Repeated(key);
-        }
-        self.label_click = Some(FolderPaneLabelClickRecord {
-            path: path.to_path_buf(),
-            expanded,
-            time,
-            toggled: false,
-        });
-        FolderPaneLabelClick::Single
+    pub(crate) fn clear_label_click(&mut self) {
+        self.label_gesture = FolderPaneLabelGesture::Idle;
     }
 
-    pub(crate) fn clear_label_click(&mut self) {
-        self.label_click = None;
+    pub(crate) fn label_gesture_requires_tree_focus(&self) -> bool {
+        matches!(
+            self.label_gesture,
+            FolderPaneLabelGesture::AwaitingPress { .. } | FolderPaneLabelGesture::PressAccepted(_)
+        )
+    }
+
+    pub(crate) fn invalidate_label_display(&mut self) {
+        self.clear_label_click();
+        self.label_display = None;
+        self.label_input.results.clear();
+        self.label_input.pointer_activations.clear();
+    }
+
+    pub(crate) fn begin_label_input(&mut self, pass: u64) -> bool {
+        if self.label_input.pass == Some(pass) {
+            return false;
+        }
+        self.label_input = FolderPaneLabelInputPass {
+            pass: Some(pass),
+            ..Default::default()
+        };
+        true
+    }
+
+    pub(crate) fn take_label_results(&mut self, pass: u64) -> Vec<FolderPaneLabelResult> {
+        if self.label_input.pass == Some(pass) {
+            std::mem::take(&mut self.label_input.results)
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub(crate) fn finish_label_input(&mut self) {
+        self.label_input.results.clear();
+        self.label_input.pointer_activations.clear();
+    }
+
+    pub(crate) fn record_label_pointer_activation(&mut self, widget: egui::Id) {
+        self.label_input.pointer_activations.insert(widget);
+    }
+
+    pub(crate) fn label_pointer_activation_owned(&self, widget: egui::Id) -> bool {
+        self.label_input.pointer_activations.contains(&widget)
+    }
+
+    /// Recognition only: expansion, focus, cursor and navigation belong to drawing.
+    pub(crate) fn process_label_input(
+        &mut self,
+        input: FolderPaneLabelInput,
+        time: f64,
+        max_dist: f32,
+        max_delay: f64,
+    ) -> bool {
+        use FolderPaneLabelGesture::*;
+        use FolderPanePointerHit as Hit;
+        let prior_results = self.label_input.results.len();
+        let mut continuation_owned = false;
+        let previous = std::mem::take(&mut self.label_gesture);
+        self.label_gesture = match input {
+            FolderPaneLabelInput::Cancel => Idle,
+            FolderPaneLabelInput::Press {
+                pos,
+                hit,
+                start_allowed,
+                continue_allowed,
+                arrow_rect,
+                source,
+            } => {
+                // A second input source cannot acquire an unreleased press.
+                // A completed mouse click may still be followed by an ordinary tap.
+                let mixed_press = match &previous {
+                    FirstPress {
+                        source: pressed_source,
+                        ..
+                    }
+                    | ArrowPress {
+                        source: pressed_source,
+                        ..
+                    } => source != *pressed_source,
+                    PressAccepted(_) => source != FolderPanePointerSource::Mouse,
+                    _ => false,
+                };
+                // Arrow geometry also terminates a name gesture when disabled
+                // widgets have no accepted witness during sidecar restore.
+                if mixed_press {
+                    Idle
+                } else if let Hit::Arrow(path) = hit {
+                    if start_allowed {
+                        ArrowPress { path, source }
+                    } else {
+                        Idle
+                    }
+                } else if arrow_rect {
+                    Idle
+                } else if let AwaitingPress {
+                    mut anchor,
+                    time: released,
+                } = previous
+                    && source == FolderPanePointerSource::Mouse
+                    && continue_allowed
+                    && pos.distance(anchor.pos) <= max_dist
+                    && (0.0..=max_delay).contains(&(time - released))
+                {
+                    continuation_owned = true;
+                    if !anchor.toggled {
+                        self.label_input
+                            .results
+                            .push(FolderPaneLabelResult::Toggle {
+                                path: anchor.path.clone(),
+                                expanded: !anchor.first_expanded,
+                            });
+                        anchor.toggled = true;
+                    }
+                    PressAccepted(anchor)
+                } else if start_allowed && let Hit::Label(path) = hit {
+                    FirstPress { path, pos, source }
+                } else {
+                    Idle
+                }
+            }
+            FolderPaneLabelInput::Release {
+                hit,
+                start_allowed,
+                clicked,
+                source,
+            } => match previous {
+                PressAccepted(anchor) if source == FolderPanePointerSource::Mouse => {
+                    continuation_owned = true;
+                    AwaitingPress { anchor, time }
+                }
+                FirstPress {
+                    path,
+                    pos,
+                    source: pressed_source,
+                } if source == pressed_source
+                    && clicked
+                    && start_allowed
+                    && matches!(&hit, Hit::Label(hit) if crate::folder_tree::path_eq(hit, &path)) =>
+                {
+                    let first_expanded = self.is_expanded_key(&key_for(&path));
+                    self.label_input
+                        .results
+                        .push(FolderPaneLabelResult::Single(path.clone()));
+                    if source == FolderPanePointerSource::Touch {
+                        Idle
+                    } else {
+                        AwaitingPress {
+                            anchor: FolderPaneLabelAnchor {
+                                path,
+                                first_expanded,
+                                pos,
+                                toggled: false,
+                            },
+                            time,
+                        }
+                    }
+                }
+                ArrowPress {
+                    path,
+                    source: pressed_source,
+                } if source == pressed_source
+                    && clicked
+                    && start_allowed
+                    && matches!(&hit, Hit::Arrow(hit) if crate::folder_tree::path_eq(hit, &path)) =>
+                {
+                    self.label_input
+                        .results
+                        .push(FolderPaneLabelResult::Arrow(path));
+                    Idle
+                }
+                _ => Idle,
+            },
+        };
+        continuation_owned || self.label_input.results.len() > prior_results
+    }
+
+    /// The only expansion writer shared by arrows, tree keys and mouse gestures.
+    /// It owns pane listings, never focus, cursor, reveal or viewer navigation.
+    pub(crate) fn set_branch_expanded(&mut self, path: &Path, expanded: bool) {
+        let key = key_for(path);
+        if self.is_expanded_key(&key) == expanded {
+            return;
+        }
+        if expanded {
+            self.user_expanded.insert(key.clone());
+            self.user_collapsed.remove(&key);
+            self.ensure_node(path.to_path_buf());
+            self.request_recheck(path);
+        } else {
+            self.user_expanded.remove(&key);
+            if self.auto_expanded.contains(&key) {
+                self.user_collapsed.insert(key.clone());
+            }
+            // The root stays demanded, but reopening it must recheck too.
+            if let Some(node) = self.nodes.get_mut(&key) {
+                node.scan = NodeScan::Unverified;
+            }
+        }
+        self.reconcile_demand();
     }
 
     pub(crate) fn selected_drive(&self) -> Option<&Path> {
@@ -342,6 +584,7 @@ impl FolderPaneState {
     }
 
     pub(crate) fn suspend_display(&mut self) {
+        self.invalidate_label_display();
         if self.participation == PaneParticipation::Suspended {
             return;
         }
@@ -375,6 +618,12 @@ impl FolderPaneState {
     }
 
     pub(crate) fn set_focus_grid(&mut self) {
+        self.clear_label_click();
+        self.release_tree_keyboard_focus();
+    }
+
+    /// Apply a key already adjudicated before this pass's pointer sequence.
+    pub(crate) fn release_tree_keyboard_focus(&mut self) {
         self.has_focus = false;
         // Preserve the shown cursor until the next location change, as before.
         self.selection.follow_next_active_change();
@@ -420,6 +669,7 @@ impl FolderPaneState {
         }) {
             return;
         }
+        self.invalidate_label_display();
         if !self.selection.has_explicit_position() && self.active_path.is_some() {
             self.resolve_follow_position();
         } else {
@@ -433,6 +683,7 @@ impl FolderPaneState {
     }
 
     pub(crate) fn select_drive(&mut self, drive: PathBuf) {
+        self.invalidate_label_display();
         self.has_focus = true;
         // An actual selection, including the selected drive, is an explicit recheck.
         // Invalidate all participants, so an unchanged root also refreshes its open branches.
@@ -452,6 +703,7 @@ impl FolderPaneState {
         active: Option<&Path>,
         options: FolderPaneListingOptions,
     ) {
+        self.invalidate_label_display();
         self.cancel_pending();
         let retired = std::mem::take(&mut self.nodes);
         rayon::spawn(move || drop(retired));
@@ -895,15 +1147,7 @@ impl FolderPaneState {
         self.selection.make_explicit();
         let key = key_for(&cursor);
         if self.is_expanded_key(&key) {
-            self.user_expanded.remove(&key);
-            if self.auto_expanded.contains(&key) {
-                self.user_collapsed.insert(key);
-            }
-            // The root is always demanded, but its next expansion must also recheck.
-            if let Some(node) = self.nodes.get_mut(&key_for(&cursor)) {
-                node.scan = NodeScan::Unverified;
-            }
-            self.reconcile_demand();
+            self.set_branch_expanded(&cursor, false);
             self.cursor_scroll = FolderPaneCursorScroll::Requested;
         } else if let Some(parent) = cursor
             .parent()
@@ -920,11 +1164,7 @@ impl FolderPaneState {
         self.selection.make_explicit();
         let key = key_for(&cursor);
         if !self.is_expanded_key(&key) {
-            self.user_expanded.insert(key.clone());
-            self.user_collapsed.remove(&key);
-            self.ensure_node(cursor.clone());
-            self.request_recheck(&cursor);
-            self.reconcile_demand();
+            self.set_branch_expanded(&cursor, true);
             self.cursor_scroll = FolderPaneCursorScroll::Requested;
         } else if let Some(child) = self
             .nodes
@@ -1428,154 +1668,762 @@ impl FolderPaneState {
 mod tests {
     use super::*;
 
-    #[test]
-    fn label_click_single_replaces_record_and_matches_normalized_path() {
-        let mut state = FolderPaneState::default();
-        let path = Path::new(r"C:\tree\branch");
-        assert_eq!(
-            state.handle_label_click(path, 1, false, true, 1.0, 0.3),
-            FolderPaneLabelClick::Single
-        );
-        assert_eq!(
-            state.handle_label_click(Path::new("c:/TREE/branch"), 2, false, true, 1.2, 0.3),
-            FolderPaneLabelClick::Repeated(Some(FolderPaneTreeKey::Right))
-        );
-        assert_eq!(
-            state.handle_label_click(path, 1, true, true, 1.3, 0.3),
-            FolderPaneLabelClick::Single
-        );
-        assert_eq!(
-            state.handle_label_click(path, 2, true, true, 1.4, 0.3),
-            FolderPaneLabelClick::Repeated(Some(FolderPaneTreeKey::Left))
+    fn label_press(state: &mut FolderPaneState, path: &str, x: f32, time: f64) {
+        pointer_press(
+            state,
+            FolderPanePointerHit::Label(p(path)),
+            x,
+            time,
+            FolderPanePointerSource::Mouse,
+            true,
+            true,
+            false,
         );
     }
 
+    fn pointer_press(
+        state: &mut FolderPaneState,
+        hit: FolderPanePointerHit,
+        x: f32,
+        time: f64,
+        source: FolderPanePointerSource,
+        start_allowed: bool,
+        continue_allowed: bool,
+        arrow_rect: bool,
+    ) -> bool {
+        state.process_label_input(
+            FolderPaneLabelInput::Press {
+                pos: egui::pos2(x, 0.0),
+                hit,
+                start_allowed,
+                continue_allowed,
+                arrow_rect,
+                source,
+            },
+            time,
+            6.0,
+            0.3,
+        )
+    }
+
+    fn label_release(state: &mut FolderPaneState, path: &str, time: f64, clicked: bool) {
+        pointer_release(
+            state,
+            FolderPanePointerHit::Label(p(path)),
+            time,
+            FolderPanePointerSource::Mouse,
+            true,
+            clicked,
+        );
+    }
+
+    fn pointer_release(
+        state: &mut FolderPaneState,
+        hit: FolderPanePointerHit,
+        time: f64,
+        source: FolderPanePointerSource,
+        start_allowed: bool,
+        clicked: bool,
+    ) -> bool {
+        state.process_label_input(
+            FolderPaneLabelInput::Release {
+                hit,
+                start_allowed,
+                clicked,
+                source,
+            },
+            time,
+            6.0,
+            0.3,
+        )
+    }
+
     #[test]
-    fn label_click_double_uses_first_display_and_toggles_only_once() {
-        for (first, current, can_expand, expected) in [
-            (false, false, true, Some(FolderPaneTreeKey::Right)),
-            (true, true, true, Some(FolderPaneTreeKey::Left)),
-            (true, false, true, None),
-            (false, true, true, None),
-            (false, false, false, None),
+    fn label_click_first_release_uses_egui_adjudication_and_normalized_path() {
+        for clicked in [false, true] {
+            let mut state = FolderPaneState::default();
+            label_press(&mut state, "C:/tree/branch", 0.0, 1.0);
+            assert!(state.label_input.results.is_empty());
+            assert!(!state.label_gesture_requires_tree_focus());
+            label_release(&mut state, "c:/TREE/branch", 1.01, clicked);
+            assert_eq!(state.label_input.results.len(), usize::from(clicked));
+            assert_eq!(state.label_gesture_requires_tree_focus(), clicked);
+        }
+    }
+
+    #[test]
+    fn label_click_second_press_owns_first_row_and_never_reissues_navigation() {
+        let mut state = FolderPaneState::default();
+        label_press(&mut state, "C:/a", 0.0, 1.0);
+        label_release(&mut state, "C:/a", 1.01, true);
+        label_press(&mut state, "C:/other", 4.0, 1.1);
+        assert_eq!(
+            state.label_input.results,
+            vec![
+                FolderPaneLabelResult::Single(p("C:/a")),
+                FolderPaneLabelResult::Toggle {
+                    path: p("C:/a"),
+                    expanded: true
+                },
+            ]
+        );
+        // Even a dragged or long-held accepted continuation never becomes a single.
+        label_release(&mut state, "C:/other", 9.0, false);
+        for time in [9.2, 9.4, 9.6, 9.8] {
+            label_press(&mut state, "C:/other", 4.0, time);
+            label_release(&mut state, "C:/other", time + 0.01, true);
+        }
+        assert_eq!(state.label_input.results.len(), 2);
+    }
+
+    #[test]
+    fn label_click_timeout_or_distance_starts_the_next_single() {
+        for (x, time) in [(6.01, 1.1), (0.0, 1.311)] {
+            let mut state = FolderPaneState::default();
+            label_press(&mut state, "C:/a", 0.0, 1.0);
+            label_release(&mut state, "C:/a", 1.01, true);
+            label_press(&mut state, "C:/b", x, time);
+            label_release(&mut state, "C:/b", time + 0.01, true);
+            assert_eq!(
+                state.label_input.results,
+                vec![
+                    FolderPaneLabelResult::Single(p("C:/a")),
+                    FolderPaneLabelResult::Single(p("C:/b")),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn label_click_arrow_and_cancel_break_only_the_gesture_not_prior_results() {
+        for arrow in [false, true] {
+            let mut state = FolderPaneState::default();
+            label_press(&mut state, "C:/a", 0.0, 1.0);
+            label_release(&mut state, "C:/a", 1.01, true);
+            if arrow {
+                pointer_press(
+                    &mut state,
+                    FolderPanePointerHit::Arrow(p("C:/a")),
+                    0.0,
+                    1.02,
+                    FolderPanePointerSource::Mouse,
+                    true,
+                    true,
+                    true,
+                );
+            } else {
+                state.process_label_input(FolderPaneLabelInput::Cancel, 1.02, 6.0, 0.3);
+            }
+            label_press(&mut state, "C:/b", 0.0, 1.03);
+            label_release(&mut state, "C:/b", 1.04, true);
+            assert_eq!(
+                state.label_input.results,
+                vec![
+                    FolderPaneLabelResult::Single(p("C:/a")),
+                    FolderPaneLabelResult::Single(p("C:/b")),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn label_click_release_rechecks_admission_target_and_source() {
+        for (path, allowed, source) in [
+            ("C:/a", false, FolderPanePointerSource::Mouse),
+            ("C:/b", true, FolderPanePointerSource::Mouse),
+            ("C:/a", true, FolderPanePointerSource::Touch),
         ] {
             let mut state = FolderPaneState::default();
-            let path = Path::new("C:/branch");
-            state.handle_label_click(path, 1, first, can_expand, 1.0, 0.3);
-            assert_eq!(
-                state.handle_label_click(path, 2, current, can_expand, 1.2, 0.3),
-                FolderPaneLabelClick::Repeated(expected)
+            label_press(&mut state, "C:/a", 0.0, 1.0);
+            pointer_release(
+                &mut state,
+                FolderPanePointerHit::Label(p(path)),
+                1.01,
+                source,
+                allowed,
+                true,
             );
-            assert_eq!(
-                state.handle_label_click(path, 3, first, can_expand, 1.25, 0.3),
-                FolderPaneLabelClick::Repeated(None)
-            );
+            assert!(state.label_input.results.is_empty());
+            assert!(matches!(state.label_gesture, FolderPaneLabelGesture::Idle));
         }
     }
 
     #[test]
-    fn label_click_triple_and_further_clicks_do_not_navigate_or_toggle() {
-        let mut state = FolderPaneState::default();
-        let path = Path::new("C:/branch");
-        state.handle_label_click(path, 1, false, true, 1.0, 0.3);
-        assert_eq!(
-            state.handle_label_click(path, 2, false, true, 1.2, 0.3),
-            FolderPaneLabelClick::Repeated(Some(FolderPaneTreeKey::Right))
-        );
-        for time in [1.3, 1.5] {
-            assert_eq!(
-                state.handle_label_click(path, 3, false, true, time, 0.3),
-                FolderPaneLabelClick::Repeated(None)
-            );
-        }
-    }
-
-    #[test]
-    fn label_click_path_mismatch_or_timeout_starts_a_new_single() {
-        for count in [2, 3] {
-            for (next, time) in [("C:/other", 1.2), ("C:/branch", 1.601)] {
-                let mut state = FolderPaneState::default();
-                state.handle_label_click(Path::new("C:/branch"), 1, false, true, 1.0, 0.3);
+    fn label_click_first_display_owns_target_without_mutating_pane_state() {
+        for first in [false, true] {
+            for current in [false, true] {
+                let root = p("C:/");
+                let a = p("C:/a");
+                let mut state = FolderPaneState::test_tree(&root, vec![a.clone()]);
+                if first {
+                    state.user_expanded.insert(key_for(&a));
+                }
+                label_press(&mut state, "C:/a", 0.0, 1.0);
+                label_release(&mut state, "C:/a", 1.01, true);
+                if current {
+                    state.user_expanded.insert(key_for(&a));
+                } else {
+                    state.user_expanded.remove(&key_for(&a));
+                }
+                let cursor = state.cursor_path().map(Path::to_path_buf);
+                let focus = state.has_focus;
+                let scroll = state.cursor_scroll;
+                let demand = state.demand.clone();
+                let nodes = state.nodes.len();
+                label_press(&mut state, "C:/other", 4.0, 1.1);
                 assert_eq!(
-                    state.handle_label_click(Path::new(next), count, true, true, time, 0.3),
-                    FolderPaneLabelClick::Single
+                    state.label_input.results.last(),
+                    Some(&FolderPaneLabelResult::Toggle {
+                        path: a.clone(),
+                        expanded: !first,
+                    })
                 );
-                assert_eq!(
-                    state.handle_label_click(Path::new(next), 3, true, true, time + 0.1, 0.3),
-                    FolderPaneLabelClick::Repeated(Some(FolderPaneTreeKey::Left))
-                );
+                assert_eq!(state.is_expanded_key(&key_for(&a)), current);
+                assert_eq!(state.cursor_path(), cursor.as_deref());
+                assert_eq!(state.has_focus, focus);
+                assert_eq!(state.cursor_scroll, scroll);
+                assert_eq!(state.demand, demand);
+                assert_eq!(state.nodes.len(), nodes);
             }
         }
     }
 
     #[test]
-    fn label_click_arrow_clear_breaks_the_label_sequence() {
+    fn label_click_results_belong_only_to_the_input_pass_and_are_taken_once() {
         let mut state = FolderPaneState::default();
-        let path = Path::new("C:/branch");
-        state.handle_label_click(path, 1, false, true, 1.0, 0.3);
+        assert!(state.begin_label_input(1));
+        label_press(&mut state, "C:/a", 0.0, 1.0);
+        label_release(&mut state, "C:/a", 1.01, true);
+        assert!(!state.begin_label_input(1));
+        assert!(state.take_label_results(0).is_empty());
+        assert_eq!(state.take_label_results(1).len(), 1);
+        assert!(state.take_label_results(1).is_empty());
+        label_press(&mut state, "C:/b", 20.0, 1.1);
+        label_release(&mut state, "C:/b", 1.11, true);
+        assert!(state.begin_label_input(2));
+        assert!(state.take_label_results(2).is_empty());
+        label_press(&mut state, "C:/c", 40.0, 1.2);
+        label_release(&mut state, "C:/c", 1.21, true);
+        state.finish_label_input();
+        assert!(state.take_label_results(2).is_empty());
+    }
+
+    #[test]
+    fn label_click_arrow_results_preserve_edge_order_and_do_not_mutate_expansion() {
+        let mut state = FolderPaneState::default();
+        pointer_press(
+            &mut state,
+            FolderPanePointerHit::Arrow(p("C:/a")),
+            0.0,
+            1.0,
+            FolderPanePointerSource::Mouse,
+            true,
+            true,
+            true,
+        );
+        pointer_release(
+            &mut state,
+            FolderPanePointerHit::Arrow(p("c:/A")),
+            1.01,
+            FolderPanePointerSource::Mouse,
+            true,
+            true,
+        );
+        label_press(&mut state, "C:/a", 4.0, 1.02);
+        label_release(&mut state, "C:/a", 1.03, true);
+        label_press(&mut state, "C:/a", 4.0, 1.04);
+        assert_eq!(
+            state.label_input.results,
+            vec![
+                FolderPaneLabelResult::Arrow(p("C:/a")),
+                FolderPaneLabelResult::Single(p("C:/a")),
+                FolderPaneLabelResult::Toggle {
+                    path: p("C:/a"),
+                    expanded: true
+                },
+            ]
+        );
+        assert!(!state.is_expanded_key(&key_for(Path::new("C:/a"))));
+    }
+
+    #[test]
+    fn label_click_arrow_release_requires_matching_accepted_click() {
+        for (hit, source, allowed, clicked) in [
+            (
+                FolderPanePointerHit::Label(p("C:/a")),
+                FolderPanePointerSource::Mouse,
+                true,
+                true,
+            ),
+            (
+                FolderPanePointerHit::Arrow(p("C:/b")),
+                FolderPanePointerSource::Mouse,
+                true,
+                true,
+            ),
+            (
+                FolderPanePointerHit::Arrow(p("C:/a")),
+                FolderPanePointerSource::Touch,
+                true,
+                true,
+            ),
+            (
+                FolderPanePointerHit::Arrow(p("C:/a")),
+                FolderPanePointerSource::Mouse,
+                false,
+                true,
+            ),
+            (
+                FolderPanePointerHit::Arrow(p("C:/a")),
+                FolderPanePointerSource::Mouse,
+                true,
+                false,
+            ),
+        ] {
+            let mut state = FolderPaneState::default();
+            pointer_press(
+                &mut state,
+                FolderPanePointerHit::Arrow(p("C:/a")),
+                0.0,
+                1.0,
+                FolderPanePointerSource::Mouse,
+                true,
+                true,
+                true,
+            );
+            pointer_release(&mut state, hit, 1.01, source, allowed, clicked);
+            assert!(state.label_input.results.is_empty());
+            assert!(matches!(state.label_gesture, FolderPaneLabelGesture::Idle));
+        }
+    }
+
+    #[test]
+    fn label_click_touch_taps_never_start_or_continue_a_double_gesture() {
+        for arrow in [false, true] {
+            let mut state = FolderPaneState::default();
+            label_press(&mut state, "C:/a", 0.0, 1.0);
+            label_release(&mut state, "C:/a", 1.01, true);
+            for time in [1.1, 1.2] {
+                let hit = if arrow {
+                    FolderPanePointerHit::Arrow(p("C:/a"))
+                } else {
+                    FolderPanePointerHit::Label(p("C:/a"))
+                };
+                pointer_press(
+                    &mut state,
+                    hit.clone(),
+                    0.0,
+                    time,
+                    FolderPanePointerSource::Touch,
+                    true,
+                    true,
+                    arrow,
+                );
+                pointer_release(
+                    &mut state,
+                    hit,
+                    time + 0.01,
+                    FolderPanePointerSource::Touch,
+                    true,
+                    true,
+                );
+                assert!(matches!(state.label_gesture, FolderPaneLabelGesture::Idle));
+            }
+            assert_eq!(state.label_input.results.len(), 3);
+            assert!(
+                !state
+                    .label_input
+                    .results
+                    .iter()
+                    .any(|result| matches!(result, FolderPaneLabelResult::Toggle { .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn label_click_disabled_arrow_geometry_and_modal_admission_cancel_continuations() {
+        for (hit, arrow_rect) in [
+            (FolderPanePointerHit::None, true),
+            (FolderPanePointerHit::Label(p("C:/a")), false),
+        ] {
+            let mut state = FolderPaneState::default();
+            label_press(&mut state, "C:/a", 0.0, 1.0);
+            label_release(&mut state, "C:/a", 1.01, true);
+            pointer_press(
+                &mut state,
+                hit,
+                0.0,
+                1.1,
+                FolderPanePointerSource::Mouse,
+                false,
+                arrow_rect,
+                arrow_rect,
+            );
+            assert!(matches!(state.label_gesture, FolderPaneLabelGesture::Idle));
+            assert_eq!(state.label_input.results.len(), 1);
+        }
+    }
+
+    #[test]
+    fn label_click_sidecar_continuation_accepts_without_new_click_admission() {
+        let mut state = FolderPaneState::default();
+        label_press(&mut state, "C:/a", 0.0, 1.0);
+        label_release(&mut state, "C:/a", 1.01, true);
+        pointer_press(
+            &mut state,
+            FolderPanePointerHit::None,
+            0.0,
+            1.1,
+            FolderPanePointerSource::Mouse,
+            false,
+            true,
+            false,
+        );
+        pointer_release(
+            &mut state,
+            FolderPanePointerHit::None,
+            1.11,
+            FolderPanePointerSource::Mouse,
+            false,
+            false,
+        );
+        assert_eq!(
+            state.label_input.results.last(),
+            Some(&FolderPaneLabelResult::Toggle {
+                path: p("C:/a"),
+                expanded: true,
+            })
+        );
+        assert!(state.label_gesture_requires_tree_focus());
+    }
+
+    #[test]
+    fn label_click_display_invalidation_discards_unapplied_results_and_gesture() {
+        let mut state = FolderPaneState::default();
+        label_press(&mut state, "C:/a", 0.0, 1.0);
+        label_release(&mut state, "C:/a", 1.01, true);
+        state.label_display = Some(FolderPaneLabelDisplay {
+            pass: 1,
+            layer: egui::LayerId::background(),
+            rect: egui::Rect::NOTHING,
+            rows: vec![],
+        });
+        state.invalidate_label_display();
+        assert!(state.label_display.is_none());
+        assert!(state.label_input.results.is_empty());
+        assert!(matches!(state.label_gesture, FolderPaneLabelGesture::Idle));
+    }
+
+    #[test]
+    fn label_click_key_application_preserves_a_new_gesture_recognized_after_key_cancel() {
+        let mut state = FolderPaneState::test_tree(Path::new("C:/"), vec![p("C:/a")]);
+        label_press(&mut state, "C:/a", 0.0, 1.0);
+        label_release(&mut state, "C:/a", 1.01, true);
+        // The key cancels before the new pointer sequence, not during key application.
         state.clear_label_click();
         assert_eq!(
-            state.handle_label_click(path, 3, true, true, 1.2, 0.3),
-            FolderPaneLabelClick::Single
+            state.label_input.results,
+            vec![FolderPaneLabelResult::Single(p("C:/a"))]
         );
+        state.label_input.results.clear();
+        label_press(&mut state, "C:/a", 0.0, 1.1);
+        label_release(&mut state, "C:/a", 1.11, true);
+        state.handle_tree_key(FolderPaneTreeKey::Down);
+        state.set_focus_tree();
+        state.set_cursor(p("C:/a"));
+        assert_eq!(
+            state.label_input.results,
+            vec![FolderPaneLabelResult::Single(p("C:/a"))]
+        );
+        assert!(state.label_gesture_requires_tree_focus());
     }
 
     #[test]
-    fn label_click_r1_long_sequence_keeps_navigation_suppressed() {
-        let path = Path::new("C:/branch");
+    fn label_click_shared_expansion_writer_preserves_selection_and_reveal() {
+        let root = Path::new("C:/");
+        let a = p("C:/a");
+        let mut state = FolderPaneState::test_tree(root, vec![a.clone()]);
+        state.auto_expanded.insert(key_for(&a));
+        let cursor = state.cursor_path().map(Path::to_path_buf);
+        let focus = state.has_focus;
+        let scroll = state.cursor_scroll;
         for expanded in [false, true] {
+            state.set_branch_expanded(&a, expanded);
+            assert_eq!(state.is_expanded_key(&key_for(&a)), expanded);
+            assert_eq!(state.cursor_path(), cursor.as_deref());
+            assert_eq!(state.has_focus, focus);
+            assert_eq!(state.cursor_scroll, scroll);
+            let demand = state.demand.clone();
+            state.set_branch_expanded(&a, expanded);
+            assert_eq!(state.demand, demand);
+        }
+    }
+
+    #[test]
+    fn label_click_explicit_focus_loss_cancels_press_but_key_application_preserves_it() {
+        for explicit_loss in [false, true] {
             let mut state = FolderPaneState::default();
-            assert_eq!(
-                state.handle_label_click(path, 1, expanded, true, 0.0, 0.3),
-                FolderPaneLabelClick::Single
-            );
-            let key = if expanded {
-                FolderPaneTreeKey::Left
+            state.set_focus_tree();
+            label_press(&mut state, "C:/a", 0.0, 1.0);
+            if explicit_loss {
+                state.set_focus_grid();
             } else {
-                FolderPaneTreeKey::Right
+                state.release_tree_keyboard_focus();
+            }
+            label_release(&mut state, "C:/a", 1.01, true);
+            assert_eq!(state.label_input.results.len(), usize::from(!explicit_loss));
+        }
+    }
+
+    #[test]
+    fn label_click_hide_drive_switch_and_reload_retire_display_input() {
+        for lifecycle in 0..3 {
+            let mut state = FolderPaneState::default();
+            state.last_drive_refresh = Some(std::time::Instant::now());
+            label_press(&mut state, "C:/a", 0.0, 1.0);
+            label_release(&mut state, "C:/a", 1.01, true);
+            state.label_display = Some(FolderPaneLabelDisplay {
+                pass: 1,
+                layer: egui::LayerId::background(),
+                rect: egui::Rect::NOTHING,
+                rows: vec![],
+            });
+            match lifecycle {
+                0 => state.suspend_display(),
+                1 => state.select_drive(p("C:/")),
+                _ => state.reload_for_active(None, FolderPaneListingOptions::default()),
+            }
+            assert!(state.label_display.is_none());
+            assert!(state.label_input.results.is_empty());
+            assert!(matches!(state.label_gesture, FolderPaneLabelGesture::Idle));
+        }
+    }
+
+    #[test]
+    fn label_click_pointer_ownership_requires_commit_or_accepted_continuation() {
+        let mut state = FolderPaneState::default();
+        let hit = FolderPanePointerHit::Label(p("C:/a"));
+        assert!(!pointer_press(
+            &mut state,
+            hit.clone(),
+            0.0,
+            1.0,
+            FolderPanePointerSource::Mouse,
+            true,
+            true,
+            false
+        ));
+        assert!(pointer_release(
+            &mut state,
+            hit.clone(),
+            1.01,
+            FolderPanePointerSource::Mouse,
+            true,
+            true
+        ));
+        for time in [1.1, 1.2] {
+            assert!(pointer_press(
+                &mut state,
+                hit.clone(),
+                0.0,
+                time,
+                FolderPanePointerSource::Mouse,
+                true,
+                true,
+                false
+            ));
+            assert!(pointer_release(
+                &mut state,
+                hit.clone(),
+                time + 0.01,
+                FolderPanePointerSource::Mouse,
+                true,
+                false
+            ));
+        }
+        assert_eq!(state.label_input.results.len(), 2);
+        state.clear_label_click();
+        assert!(!pointer_press(
+            &mut state,
+            hit.clone(),
+            0.0,
+            1.3,
+            FolderPanePointerSource::Mouse,
+            true,
+            true,
+            false
+        ));
+        assert!(!pointer_release(
+            &mut state,
+            hit,
+            1.31,
+            FolderPanePointerSource::Mouse,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn label_click_widget_activation_ownership_is_local_and_pass_scoped() {
+        let mut state = FolderPaneState::default();
+        let arrow = egui::Id::new("arrow");
+        let label = egui::Id::new("label");
+        state.begin_label_input(1);
+        state.record_label_pointer_activation(arrow);
+        assert!(state.label_pointer_activation_owned(arrow));
+        assert!(!state.label_pointer_activation_owned(label));
+        state.take_label_results(1);
+        assert!(state.label_pointer_activation_owned(arrow));
+        state.begin_label_input(2);
+        assert!(!state.label_pointer_activation_owned(arrow));
+        state.record_label_pointer_activation(label);
+        state.finish_label_input();
+        assert!(!state.label_pointer_activation_owned(label));
+        state.record_label_pointer_activation(arrow);
+        state.invalidate_label_display();
+        assert!(!state.label_pointer_activation_owned(arrow));
+    }
+
+    #[test]
+    fn label_click_unreleased_mixed_source_presses_cancel_across_passes() {
+        for first_source in [
+            FolderPanePointerSource::Mouse,
+            FolderPanePointerSource::Touch,
+        ] {
+            let second_source = match first_source {
+                FolderPanePointerSource::Mouse => FolderPanePointerSource::Touch,
+                FolderPanePointerSource::Touch => FolderPanePointerSource::Mouse,
             };
-            assert_eq!(
-                state.handle_label_click(path, 2, expanded, true, 0.25, 0.3),
-                FolderPaneLabelClick::Repeated(Some(key))
-            );
-            for time in [0.50, 0.75, 1.0] {
-                assert_eq!(
-                    state.handle_label_click(path, 3, !expanded, true, time, 0.3),
-                    FolderPaneLabelClick::Repeated(None),
-                    "repeat at {time}s"
-                );
+            for first_arrow in [false, true] {
+                for second_arrow in [false, true] {
+                    let mut state = FolderPaneState::default();
+                    let first_hit = if first_arrow {
+                        FolderPanePointerHit::Arrow(p("C:/a"))
+                    } else {
+                        FolderPanePointerHit::Label(p("C:/a"))
+                    };
+                    let second_hit = if second_arrow {
+                        FolderPanePointerHit::Arrow(p("C:/a"))
+                    } else {
+                        FolderPanePointerHit::Label(p("C:/a"))
+                    };
+                    state.begin_label_input(1);
+                    assert!(!pointer_press(
+                        &mut state,
+                        first_hit.clone(),
+                        0.0,
+                        1.0,
+                        first_source,
+                        true,
+                        true,
+                        first_arrow
+                    ));
+                    state.begin_label_input(2);
+                    assert!(!pointer_press(
+                        &mut state,
+                        second_hit.clone(),
+                        0.0,
+                        1.1,
+                        second_source,
+                        true,
+                        true,
+                        second_arrow
+                    ));
+                    assert!(matches!(state.label_gesture, FolderPaneLabelGesture::Idle));
+                    assert!(!pointer_release(
+                        &mut state,
+                        second_hit,
+                        1.11,
+                        second_source,
+                        true,
+                        true
+                    ));
+                    assert!(!pointer_release(
+                        &mut state,
+                        first_hit,
+                        1.12,
+                        first_source,
+                        true,
+                        true
+                    ));
+                    assert!(state.label_input.results.is_empty());
+                }
             }
         }
     }
 
     #[test]
-    fn label_click_r1_boundary_count_three_performs_the_second_rows_toggle() {
-        let a = Path::new("C:/a");
-        let b = Path::new("C:/b");
-        for (first, current, can_expand, expected) in [
-            (false, false, true, Some(FolderPaneTreeKey::Right)),
-            (true, true, true, Some(FolderPaneTreeKey::Left)),
-            (true, false, true, None),
-            (false, true, true, None),
-            (false, false, false, None),
-        ] {
-            let mut state = FolderPaneState::default();
-            assert_eq!(
-                state.handle_label_click(a, 1, !first, true, 0.0, 0.3),
-                FolderPaneLabelClick::Single
-            );
-            assert_eq!(
-                state.handle_label_click(b, 2, first, can_expand, 0.1, 0.3),
-                FolderPaneLabelClick::Single
-            );
-            assert_eq!(
-                state.handle_label_click(b, 3, current, can_expand, 0.2, 0.3),
-                FolderPaneLabelClick::Repeated(expected)
-            );
-            assert_eq!(
-                state.handle_label_click(b, 3, first, can_expand, 0.3, 0.3),
-                FolderPaneLabelClick::Repeated(None)
-            );
+    fn label_click_mixed_source_cancel_keeps_committed_result_prefix() {
+        for pending_phase in 0..3 {
+            for touch_arrow in [false, true] {
+                for same_pass in [false, true] {
+                    let mut state = FolderPaneState::default();
+                    state.begin_label_input(1);
+                    label_press(&mut state, "C:/a", 0.0, 1.0);
+                    label_release(&mut state, "C:/a", 1.01, true);
+                    match pending_phase {
+                        0 => label_press(&mut state, "C:/b", 20.0, 1.1),
+                        1 => {
+                            pointer_press(
+                                &mut state,
+                                FolderPanePointerHit::Arrow(p("C:/b")),
+                                20.0,
+                                1.1,
+                                FolderPanePointerSource::Mouse,
+                                true,
+                                true,
+                                true,
+                            );
+                        }
+                        _ => label_press(&mut state, "C:/a", 0.0, 1.1),
+                    }
+                    let mut expected = Vec::new();
+                    if same_pass {
+                        expected.push(FolderPaneLabelResult::Single(p("C:/a")));
+                        if pending_phase == 2 {
+                            expected.push(FolderPaneLabelResult::Toggle {
+                                path: p("C:/a"),
+                                expanded: true,
+                            });
+                        }
+                    } else {
+                        state.begin_label_input(2);
+                    }
+                    let touch_hit = if touch_arrow {
+                        FolderPanePointerHit::Arrow(p("C:/b"))
+                    } else {
+                        FolderPanePointerHit::Label(p("C:/b"))
+                    };
+                    assert!(!pointer_press(
+                        &mut state,
+                        touch_hit.clone(),
+                        0.0,
+                        1.11,
+                        FolderPanePointerSource::Touch,
+                        true,
+                        true,
+                        touch_arrow
+                    ));
+                    assert!(matches!(state.label_gesture, FolderPaneLabelGesture::Idle));
+                    assert!(!pointer_release(
+                        &mut state,
+                        touch_hit,
+                        1.12,
+                        FolderPanePointerSource::Touch,
+                        true,
+                        true
+                    ));
+                    assert!(!pointer_release(
+                        &mut state,
+                        FolderPanePointerHit::Label(p("C:/a")),
+                        1.13,
+                        FolderPanePointerSource::Mouse,
+                        true,
+                        true
+                    ));
+                    assert_eq!(state.label_input.results, expected);
+                }
+            }
         }
     }
 

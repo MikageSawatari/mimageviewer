@@ -1455,6 +1455,12 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-14: フォルダツリーのポインター入力を ROOT の pass に所有させる (§1.769)
+
+`begin_folder_pane_label_input` は ROOT だけで、前の ROOT pass のツリー描画表を使う。メインの枠を描かない表示形態では表・ジェスチャ・結果を失効させるため、既存の native backdrop / embedded still / deferred reopen / viewport enter holdover の判定を読み取る。これらの述語、detached の状態・遷移・HWND・viewport identity・context bundle は変更しない。ROOT 以外からはツリーの新しい入力所有へ触れず、表示を飛ばした pass の結果も持ち越さない。
+
+設計担当の [フォルダツリー計画 §12.5](folder-tree-refresh-plan.md#125-再開時の設計-2-回目は押した瞬間に1-回目の位置と時刻で判定する-2026-11-13claudecode) の ROOT 限定契約を実装したもの。Codex 実装者と独立 Sol / xhigh レビューは、他機能の入力を正しい表示先へ限定する構造修正であり、detached の症状パッチではないと照合した。今回の回帰は headless 入力を使い、実ウィンドウの起動・操作は行わない。
+
 ### 2026-11-12: 検索中の移動で、出発 context の移譲を検索の退役より先に行う (§1.682 / §1.688 §12.3)
 
 検索中に本・コレクション・場所へ移る共通 adopter (`adopt_main_list_navigation_with_completion`) が、`ExitTemporaryView` の検索退役を

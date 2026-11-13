@@ -670,6 +670,48 @@ Windows のダブルクリック (`WM_LBUTTONDBLCLK`) は、**2 回目のボタ�
 - 結果と、部品ごとの重複の判定は、ROOT のその pass 限り。取消・ドラッグ・受付不可になった入力で、ポインタ由来の `clicked()` を従来の経路へ戻さない (`clicked_by(Primary)` は描画側で常に処理しない)。早期 return の pass の結果は次の pass へ持ち越さない (設計レビュー r5 の P3)。
 - これにより、同じ pass の「▶ のクリック → 6pt 未満の名前のクリック」は、▶ の開閉と名前への 1 回クリックの両方になる (v5.2.0 では egui の集約で片方だけになり得た)。
 
+#### r4・r5 の実装記録 (2026-11-14、`4e856f29b` 上の未コミット差分)
+
+- `FolderPaneState` の旧 count 記録を、名前・矢印・マウス・タッチの型付きジェスチャへ置換。ROOT の入力開始で、変更前のイベント列・edge ごとの witness・egui の release 判定を対応付け、Single / Arrow / Toggle の結果を積む。ここでは展開・focus・cursor・reveal・移動を変えない。部品表・結果・部品別の pointer 活性化記録は ROOT の pass で区切り、未描画の表や未適用結果を次へ持ち越さない。
+- 描画側ではキー処理後に結果を列順で適用する。`set_branch_expanded(path, target)` は展開集合とペインの列挙要求だけを変更し、矢印・← / →・ダブルクリックで共有する。ダブルクリックは初回表示の逆を目標とし、移動・focus・cursor・reveal を再発行しない。Single / Arrow は従来の操作と §13 の reveal 取消を行う。部品ごとの非 pointer 活性化は残し、同じ pass の pointer との二重適用だけを抑止する。
+- サイドカー以外の停止理由は、既存の modal 診断と同じ表を読む。サイドカーの例外はその modal に属する実 widget の layer で区別し、単純な widget id 一致には依存しない。入力の破棄そのものは変更していない。独立実装レビューの P2（認識後にモーダルが始まった場合）に従い、適用点でも Single / Arrow は全停止理由、Toggle はサイドカー以外の停止理由を再確認して拒否・退役する。
+- タッチの出どころは既存の相関処理を、専用の観測状態で共用する。グリッドの scope・初回 command・入力列・pointer 状態は消費しない。名前のタップは Single、矢印のタップは Arrow にし、タッチでダブルクリックを開始・継続しない。別々の pass の相関と、観測後もグリッドの初回 command が届くことを回帰で確認する。
+- 通常の `set_focus_grid` は未確定 press も含めてジェスチャを終了する。既に入力列の前に打ち切ったキーボード Enter の後段だけは、別の focus 解放入口を使い、同じ pass の新しい名前クリックを失わない。固定キーボードの操作は入力列より前に打ち切りを反映する。ゲームパッドの step 経路は今回変更していない。独立レビューの静的所見（名前 single → PadDown → 時間内のマウス press では旧ジェスチャを継続し得る）は、物理キーボード以外を追加の打切り条件とするかの設計担当への引継ぎとする。
+
+**製品変更前の実復元回帰:** `folder_pane_label_sidecar_second_press_during_restore` / `across_restore` / `after_restore` の3件を、製品が HEAD のまま実行し、全件が実移動の採用・実 Checking worker の relay 受信保留を通った後、「2回目の押下で初回行が開く」の製品 assert で失敗した。**3件実行 / 0成功 / 3失敗、exit100、実行0.839秒、コンパイル2分27秒**。証跡は `target/769-resume-red.log` と `target/769-resume-red-tests-source.rs`。指定の `run-heavy.ps1 -Owner "769-impl"` 経由の nextest、Windows MSVC / default features / test profile。前回・再開直後の Quiescing timeout は根拠に含めない。実 root の worker / writer 結果受信 checkpoint の不足を補完して fixture が成立したが、busy だった個別 writer は特定していない。
+
+TurboJPEG の初回 core check は CMake / MSBuild の6並列 install がエラー本文を出さず exit1 となり、Cargo は exit101（`target/769-r5-check-initial.log`）。同じ source / Debug / CRT 設定の verbose 再現も「0警告・0エラー」のまま失敗した（`target/769-r5-cmake-diagnostic.log`）。同じ native 出力への直列 install は成功、2分48秒（`target/769-r5-cmake-diagnostic-serial.log`）。6並列の失敗と直列の成功を確認したところまでで、それ以上の原因は未特定。依存ソースや Cargo 設定は変更せず、以降の core check は `-j 1` とする。旧 `target/769-env.ps1` の作成・流用はしていない。
+
+本体 lib 全件・`build-dev`・`ui_snapshot` は指定どおり設計担当の所有。製品起動・実機操作・コミットは行わず、backlog は変更しない。以下に最終の自動検証結果を追記する。
+
+初回の関連 filter は **244件中180成功 / 64失敗、exit100**（`target/769-r5-related.log`）。headless の既存ハーネスは、起動索引の `NotStarted`（`overlay_active() == true`）を終端しないままツリーを直接描いていたため、新しい「今もメイン画面を描く」条件が正しく入力を拒否した。起動後の画面を対象とする fixture の初期化だけで `NotStarted` を `Unavailable` へ進め、製品の入力許可は弱めない。直接 tree を描く UI unit にも入力開始・表示完了の checkpoint を加えた。
+
+結果の先行適用で子行が挿入されても AccessKit の宛先が別行へ移らないよう、行全体の `scope_id` を正規化した path に固定した。egui 0.37 の通常の `push_id` は親の auto 順序を `unique_id` に混ぜるため、この用途では使わない。子 cache を開いて温めてから閉じ、次行 B の id を取得して、同 pass の矢印展開・AccessKit B 活性化で B の画面位置が動いても id と移動先が B のままである回帰を追加した。これは入力結果の順序を変えず部品 identity の生成境界を正す実装として、独立レビューとも照合した。
+
+混在取消は、同じ入力列の mouse / touch の混在だけでなく、未 release の FirstPress / ArrowPress に異なる入力元の press が来た場合、PressAccepted 中に touch press が来た場合も既存の typed state から判定する。新しい保持フラグは足さず Idle へ退役し、確定済み結果の prefix は維持する。両方向・名前 / 矢印の組合せを跨 pass の純粋回帰でも確認する。
+
+2回目の関連 filter は **247件中198成功 / 49失敗、exit100**（`target/769-r5-related-2.log`）。多くは入力前の label 可視前提で止まった。最小1件の診断（`target/769-r5-geometry-diagnostic.log`）では B の読取矩形が `[[48,98],[178,122]]`、最新 viewport が `[[8,143.4],[178,598]]`、offset は0だった。vendor の `end_pass` は `prev_pass` / `this_pass` を swap し、`run_ui` 終了後の `read_response` は古い `this_pass` の同じ id を先に読むため、stable id 化で以前の toolbar 無し画面の矩形が優先されていた。レイアウトを推測で変えず、cfg(test) で実描画中の `Response.rect` を記録し、frame 後の幾何検査・クリック座標はその最新矩形を読むように補正した。id・witness・入力列は実物のまま。
+
+独立レビューの追加指摘に従い、`widget == None` をツリー背景の証明にしない。クリック部品を持たない hover-only Area / DRAG-only Window 本文も None になり得るため、実描画の tree layer を cache に記録し、続きの押下全体を `layer_id_at(pos)` が None / tree / sidecar modal の場合に限る。上位 layer と witness None の前提を先に確認する回帰2件と、overlay 退役後の独立 single の継続確認を追加した。
+
+3回目の関連 filter は **249件中240成功 / 9失敗、exit100**（`target/769-r5-related-3.log`）。残った試験の前提を照合し、製品の受付条件や入力破棄は緩めず、次を補正した。取消 token を比較する試験だけは最初の移動の receiver を保留し、正常採用との競走を除く。非表示から再表示した後と req40 の祖先展開は、Suspended の `has_pending == false` を完了とせず、実描画で resume / scan / poll を通して待つ（egui 時刻は固定し、続きが delay 内であることも検査）。実復元中の入力破棄は既存の release edge 保持契約を検査し、Text / Wheel / press が残らず pointer と scroll が初期化されることを確認する。連続タッチは実 backend と同じ End → primary release → PointerGone の列にした。
+
+`docs/spec.md` と `docs/keymap-spec.md` を初回行への結び付き・押下時の確定と描画側適用・タッチの対象範囲に合わせた。マニュアル `htdocs/mimageviewer/manual/tut-navigation.html` の「ダブルクリックで枝を開閉、1回目で移動」の一文はこの実装とも一致するため変更しない。
+
+**最終検証:** Windows MSVC / default features / test・dev profile。すべて指定の `run-heavy.ps1 -Owner "769-impl"` 経由。外部 lock 領域への書込み不可の警告に従い BelowNormal / `CARGO_BUILD_JOBS=6` で実行し、native の直列再確認後の core check だけは `-j 1` を明示した。
+
+| コマンド・範囲 | 結果 | 証跡 (`target/`) |
+| --- | --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/folder_pane/) \| test(/label_click/) \| test(/sidecar_restore/)' --no-fail-fast --retries 0 --no-tests fail` | **249成功 / 失敗0、21.022秒、exit0**。修正前に失敗した実復元3件、改訂後の矢印→近傍名前の前提検証、req40置換、§13の既存回帰を含む | `769-r5-related-final.log` |
+| `scripts/test-focused.ps1 -Path ...`（変更したテスト保有Rust 6ファイル） | **66 / 18 / 4 / 57 / 110 / 46件の6群すべて成功、計301実行、exit0**。関連filterとの重複を含む | `769-r5-focused-final.log`、`769-r5-focused.ps1`、`test-focused/runs/20261113T171450879Z-b2b2a889` から `20261113T171534946Z-f3f852f5` までの各実行（各directoryはログ参照） |
+| `cargo check -p mimageviewer --bin mimageviewer-core -j 1` | **exit0、1分25秒** | `769-r5-check-final.log` |
+| 引数なし `cargo fmt` / `cargo fmt --check` | **各exit0** | `769-r5-fmt-final.log` / `769-r5-fmt-check-final.log` |
+| `git diff --check` / 検証前後のRust SHA-256照合 | **各成功** | `769-r5-diff-check-final.log` / `769-r5-verified-source-hashes.json` |
+
+focused の指定順は `src/folder_pane.rs`、`src/ui_folder_pane.rs`、`src/app/update_phases.rs`、`src/app/sidecar_restore.rs`、`src/app/folder_pane_refresh_tests.rs`、`src/touch_correlation.rs`。共有の `src/app.rs` は focused script が全libへ送る broad path のため、全libを実行しない今回の分担では指定しない。`src/ui_dialogs/sidecar_restore.rs` の modal ID 共用には独立の同moduleテストがなく、実modalを描く復元handler回帰で確認した。共有停止表・表示形態判定は関連handler / core checkでも確認し、全lib・build-dev・ui_snapshotは依頼どおり設計担当へ引き継ぐ。
+
+独立 Sol / xhigh の実装静的レビューは、モーダル再確認・layerの境界・stable widget ID・最終fixture補正を含め ACCEPT（自動テストは上記を実装担当が実行）。HEADは `4e856f29b` のまま、変更は未コミット。製品起動・実機入力・backlog変更は行っていない。
+
 ## 13. マウスでクリックした行を中央へ寄せない (2026-11-12 設計、ClaudeCode)
 
 利用者決定 (2026-11-12 夜、§1.769 の実機確認 依頼 40 から派生)。ツリーで行の名前、または ▶ / ▼ をマウスでクリックしたときは、その行を中央へ寄せない。押した行は既に見えているので、Windows のエクスプローラのナビゲーション ウィンドウと同じく、スクロール位置をそのままにする。
