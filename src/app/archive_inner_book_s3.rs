@@ -833,7 +833,14 @@ fn section1675_multiwindow_scope_literal_prefix_prepared() {
         let open = request(target(source, "Upper/", "Upper/One"), true);
         let before = main_state(&app);
         assert!(app.start_active_detached_loading_context(
-            &ctx, None, DetachedSource::Book, source.clone(), |viewer, _| {
+            &ctx, None, DetachedSource::Book, source.clone(), |viewer, window| {
+                assert_eq!(viewer.viewer_context_residence(viewer.projected_viewer_context_id()), ContextResidence::Building);
+                assert_eq!(viewer.detached_viewer_window_id(), Some(window));
+                assert!(viewer.locate_window_context(window).is_none(), "binding remains private until commit");
+                assert!(viewer.fullscreen_idx.is_none(), "the reserved session precedes the first page");
+                assert_eq!(viewer.viewer_presentation, ViewerPresentation::DetachedWindow);
+                assert!(viewer.detached_viewer_independent_active);
+                assert!(!viewer.detached_window_manager.runtime(window).unwrap().linked);
                 viewer.load_zip_as_folder_with_presentation(
                     backing.clone(), viewer.input_seq, Some(enumeration),
                     ZipCacheRouting::ProvenBacking, converted.then_some(source.as_path()),
@@ -844,6 +851,10 @@ fn section1675_multiwindow_scope_literal_prefix_prepared() {
                 assert!(viewer.items.iter().all(|item| matches!(item, GridItem::ZipImage { entry_name, .. } if entry_name.starts_with("Upper/One/"))));
                 assert_eq!(viewer.archive_source_override.as_deref(), converted.then_some(source.as_path()));
                 assert!(!viewer.pending_auto_fs_open);
+                assert_eq!(viewer.detached_viewer_window_id(), Some(window));
+                assert_eq!(viewer.viewer_presentation, ViewerPresentation::DetachedWindow);
+                assert!(viewer.detached_viewer_independent_active, "prepared content install preserves the reserved session");
+                assert!(!viewer.detached_window_manager.runtime(window).unwrap().linked);
                 DetachedLoadingContextInit::Continue
             },
         ).is_some());

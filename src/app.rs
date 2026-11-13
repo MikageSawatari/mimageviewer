@@ -67885,6 +67885,16 @@ impl App {
                 let window_id = app.allocate_detached_viewer_window_id();
                 allocated_window_id = Some(window_id);
                 app.reserve_window_binding_for_build(window_id);
+                app.commit_viewer_session(
+                    ViewerPresentation::DetachedWindow,
+                    true,
+                    "detached_loading_binding",
+                );
+                app.update_detached_window_runtime_flags(
+                    window_id,
+                    false,
+                    "detached_loading_binding",
+                );
                 app.last_active_detached_window_id = Some(window_id);
                 let seed = placement_seed.unwrap_or_else(|| app.detached_viewer_window_placement());
                 app.set_detached_window_runtime_placement(
@@ -67897,12 +67907,6 @@ impl App {
                     DetachedWindowState::Opening,
                     "start_active_detached_loading_context",
                 );
-                app.commit_viewer_session(
-                    ViewerPresentation::DetachedWindow,
-                    true,
-                    "detached_commit",
-                );
-                app.detached_viewer_independent_active = true;
                 app.address = address.to_string_lossy().to_string();
                 let outcome = initialize
                     .take()
@@ -68016,6 +68020,16 @@ impl App {
                     );
                 }
                 app.reserve_window_binding_for_build(window_id);
+                app.commit_viewer_session(
+                    ViewerPresentation::DetachedWindow,
+                    true,
+                    "detached_collection_binding",
+                );
+                app.update_detached_window_runtime_flags(
+                    window_id,
+                    false,
+                    "detached_collection_binding",
+                );
                 app.last_active_detached_window_id = Some(window_id);
                 if resume_window_id.is_some() {
                     app.adopt_active_detached_viewport_runtime_from_passive(
@@ -68039,12 +68053,6 @@ impl App {
                     },
                     "start_active_detached_collection_root_image",
                 );
-                app.commit_viewer_session(
-                    ViewerPresentation::DetachedWindow,
-                    true,
-                    "detached_commit",
-                );
-                app.detached_viewer_independent_active = true;
                 app.fs_open_intent_from_grid = false;
                 app.top_level_grid_view.begin(
                     top_level_grid_view::TopLevelGridSurface::Collection(plan.identity),
@@ -82664,7 +82672,17 @@ impl App {
         // This method only resets presentation/content state; terminal close and context
         // retire own the binding lifetime. An alive session also retains its presentation
         // intent (including borderless state) through intermediate folder-nav closes.
-        let preserve_detached_for_folder_nav = self.detached_active_window_alive_wanted();
+        // Before publication, a Building context owns the same intent through its
+        // private binding. Synchronous material installation closes old content, not
+        // that reserved destination session. Closing/absent runtimes own no live intent.
+        let preserve_detached_for_folder_nav = self.detached_active_window_alive_wanted()
+            || (self.viewer_context_residence(self.projected_viewer_context_id())
+                == ContextResidence::Building
+                && self.viewer_presentation == ViewerPresentation::DetachedWindow
+                && self.detached_viewer_window_id().is_some_and(|id| {
+                    self.detached_window_state(id)
+                        .is_some_and(|state| state != DetachedWindowState::Closing)
+                }));
         if !preserve_detached_for_folder_nav {
             self.commit_viewer_session(
                 self.non_detached_viewer_presentation(),

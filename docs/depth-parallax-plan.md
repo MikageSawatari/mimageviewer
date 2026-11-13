@@ -3874,3 +3874,100 @@ A の再 activation 後の完了と、D が active のままの完了を検査�
 非 detached の独立性 false を継承するので正しい。新規 open とメディアウィンドウ設定による移動は `prepare_viewer_presentation_open` が同期で確定する。
 F12 の経路 (native・egui・`toggle_detached_viewer_mode`) は明示値を保つ。**症状パッチではなく構造的な変更であることに合意** (保守完了が参照する独立性の正本を
 所有 context に一本化した)。r1 (`9044445e6`) の判定「指摘修正後に受入可・構造的変更に合意」と合わせ、課題 1 の実装を設計担当 (ClaudeCode) が検収した。
+
+#### 全件 gate の失敗 2 件の修正 (2026-11-14)
+
+設計担当が `600b0a99d` で実行した本体 lib 全件は **17,643実行 / 17,641成功 / 2失敗、exit 100**。
+証拠は `target/test-lib-full/runs/20261113T192240046Z-e0d51430/stderr.log`。
+今回の作業基点も同じ HEAD とし、以下の2件を修正した。全件 gate 自体はこちらから再実行しない。
+
+**prepared 内部本の独立性（BA-7）:**
+
+`section1675_multiwindow_scope_literal_prefix_prepared` は、loading shell が private binding を予約し、
+`(DetachedWindow, true)` を確定した後、prepared ZIP の同期 install 中に失っていた。
+`finalize_zip_enumerate` → `install_prepared_zip_grid` → 一覧の内容入替 → 内部 content close の
+`prepare_viewer_presentation_close` が、公開後の active session だけで生存を判定していたためである。
+Building の予約はまだ逆引きに公開されておらず、session pair が非 detached / false に消された。
+`9044445e6` より前は、その後の open が設定から独立性を再決定してこの欠落を隠していた。
+設定の再参照や install 後の true の再代入で修復せず、予約から公開まで同じ所有者の確定値を保つ。
+
+- `src/app.rs`: 内容だけの close は、公開済みの既存生存条件に加え、Building の projected context が
+  Detached session と private binding の生存 runtime を所有している間、その初期 pair を維持する。
+  Closing / runtime 不在にはこの保持を適用しない。連動 false もそのまま保持し、独立へ強制しない。
+  terminal close / abort の binding 退役・非公開規則は変更しない。
+- loading shell と Collection root の新規 context は、予約直後に session pair と runtime linked flag を
+  一緒に初期確定する。descriptor builder と同じ順序とし、ページ open 前の runtime も独立にそろえる。
+  新しい App 状態、描画 guard、待ち、retry、追加 repaint、一括 reset は追加しない。
+- `src/app/archive_inner_book_s3.rs`: 元の期待をすべて残し、通常 ZIP / 変換元付き ZIP の両方で
+  prepared install 前後の pair・runtime と、公開前の private binding を追加検査する。
+  同じ context の内容・literal prefix / raw scope・main 不変も従来どおり検査する。
+- `src/app/tests.rs`: 実 loading-shell 入口と Collection root の既存テストを強化し、
+  新規 `detached_scanned_folder_binding_session_follows_new_open_setting` は実 ScannedFolder handler で
+  設定から得た独立 true / 連動 false の両方、runtime / binding、main の一覧・選択・世代不変を検査する。
+
+**同型入口の確認:** production の新規 `build_viewer_context` は次の3系統で、残りの直接呼出しは test fixture。
+
+| 予約・公開の所有者 | 入口 / prepared・deferred の扱い |
+| --- | --- |
+| `start_active_detached_loading_context` | §1.675 の prepared scope / literal prefix 回帰が直接使う先行 shell。production では Bookmark / startup、FolderCandidate / ConvertibleArchive が共用する。同期 prepared install の欠落を上記共通 close で修正し、非同期完了は公開済みの同じ pair を継承する |
+| `start_active_detached_book_context_with_start` | 新規 / 再開の descriptor（フォルダ・PDF・ZIP・画像、§1.675 の ZIP BookScope を含む）と ScannedFolder。予約時の pair / runtime 初期確定は既存どおり。同期 ScannedFolder でも今回の保持規則が必要。deferred enumerate / reopen は所有 context の現在値を継承し、新たな設定の再決定はしない |
+| `start_active_detached_collection_root_image` | 独自の一覧 install は共有 content close を通らず pair の欠落はないが、予約時の runtime 初期値も session に一致させる。既存の独立 true 方針と一覧 policy / identity は変えない |
+
+ScannedFolder の直接入口は現在 test wrapper のみだが、共有 factory の同期 install 分岐も実経路で検査する。
+
+**close seam の source-text test:**
+
+`the_close_and_retire_seam_finishes_the_transition_it_starts` は課題2の `53d224a5c` で本体が
+明示 id の `take_and_close_context_with_cause` へ移ったことに追従していなかった。
+検査対象をその本体へ移し、帰還の移譲 → `close_and_retire_context` の順序、terminal closure の
+`close_fullscreen_to_completion`、Windows 側に素の `close_fullscreen()` がないこと、終端 owner の一意性を維持する。
+active wrapper が active id を先に解決して typed cause とともに本体へ渡すことも追加検査する。
+明示 id のもう1つの入口は `park_detached_viewer_for_handoff` で、snapshot がない移動元を同じ本体へ渡す。
+`take_detached_snapshot_for_activation` が、取り出す前に捕捉した source をこの handoff へ渡す順序も検査する。
+これらはテストの更新だけで、close 本体や課題2の所有移動は変更しない。
+
+変更ファイルは上記 Rust 3ファイルと本書、`docs/detached-rework-plan.md` の5ファイル。
+独立 Sol / xhigh は実行前の差分と同型入口の監査を確認し、追加 P1 / P2 なし、予約中の所有境界を直す構造修正と評価した。
+
+**検証記録:** Cargo は指定 `run-heavy.ps1`（Owner `codex/767-issue1`、WorkDir は本 worktree）経由で直列実行し、
+他セッションの全件ロックがあれば変更せず解放を待つ。既存の検証と同じく jobs=1 / incremental=0 / MSBuild node reuse 無効を使用する。
+
+- 修正前の `600b0a99d` で失敗2件だけを再実行し、**2実行 / 0成功 / 2失敗、exit 100**。
+  `cargo nextest run -p mimageviewer --lib -E 'test(section1675_multiwindow_scope_literal_prefix_prepared) | test(the_close_and_retire_seam_finishes_the_transition_it_starts)' --no-fail-fast`。
+  compile 9分31秒、実行0.580秒、`target/767-gate-current-red.log`。
+- 旧版比較は worktree 内の `target/767-gate-old-01f5e898f` に Git blob から物理コピーを作り、
+  `src` の1,036 blob 全件が `01f5e898f` と一致することを検証した。
+  同じ版の依存（`Cargo.toml` / lock / build.rs / crates / vendor に基点との差分なし）を使うため、
+  snapshot の manifest だけ path dependency を既存実体の絶対パスへ変更し、共通 target を指定する。
+  native の必要資産は実体コピーし、junction / symlink は作らない。比較対象の App ソースと既存テストは変更しない。
+  一致検証の証拠は `target/767-gate-old-source-verify.log`（exit 0）。
+  `CARGO_TARGET_DIR` を本 worktree の target にして、
+  `cargo nextest run --manifest-path .\target\767-gate-old-01f5e898f\Cargo.toml -p mimageviewer --lib -E 'test(section1675_multiwindow_scope_literal_prefix_prepared)' --no-fail-fast`
+  を同じ runner 経由で実行し、**1実行 / 1成功 / 0失敗、exit 0**。compile 12分24秒、実行0.827秒。
+  `target/767-gate-old-test.log`。旧版で同じ既存テストが通り、基点で落ちる退行を確認した。
+  runner は別セッションの全件ロック解放を待ち、解放後は書込不可の警告に従って slot なし・低優先度で続行した。
+
+修正途中の最初の2件検証は **2実行 / 1成功 / 1失敗、exit 100**（compile 8分16秒、実行0.551秒、
+`target/767-gate-two-r1.log`）。close seam は成功したが、prepared install 後の追加 pair 検査で Fullscreen を検出した。
+Building の保持条件で用いた `viewer_session_is_detached()` は `fullscreen_idx.is_some()` も要求するため、
+ページがない初期予約を表せなかった。同じ所有境界で予約済みの `viewer_presentation == DetachedWindow` を直接参照する形に直し、
+テストでも最初のページ前であることを明示する。設定の再決定や後段の修復は加えない。
+
+**修正後の最終検証（指定 runner 経由・直列）:**
+
+| コマンド | 件数 / exit code / 証拠 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(section1675_multiwindow_scope_literal_prefix_prepared) \| test(the_close_and_retire_seam_finishes_the_transition_it_starts)' --no-fail-fast` | **2成功 / 0失敗、exit 0**。compile 7分58秒、実行0.820秒。`target/767-gate-two-green.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/section1675\|archive_inner_book\|multiwindow\|close_and_retire/)' --no-fail-fast` | **160成功 / 0失敗、exit 0**。build確認1.02秒、実行16.511秒。`target/767-gate-related.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/independent_media_exchange/)' --no-fail-fast` | **21成功 / 0失敗、exit 0**。build確認0.98秒、実行3.690秒。`target/767-gate-focused.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth\|export\|presentation\|window_mode\|panorama\|detached\|multiwindow_scenario\|slideshow\|admission/)' --no-fail-fast` | **1,558成功 / 0失敗、exit 0**。build確認0.97秒、実行102.260秒。`target/767-gate-regression.log`。新規 ScannedFolder の両設定と、強化した loading shell（所属 module の `window_mode` で選択）/ Collection root、課題2/3・abortの既存対照を含む |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **exit 0**、56.95秒（テスト実行なし）。`target/767-gate-check.log` |
+| `cargo fmt`（最後の Cargo 操作、引数なし） | **exit 0**。`target/767-gate-fmt.log`。以後の Rust 変更なし |
+| `git diff --check` | **exit 0**。`target/767-gate-diff-check.log`。既存 LF→CRLF 設定の警告のみ |
+
+指定の自動検証を完了した。既存テストの期待をすべて維持し、予約中の pair / runtime と入口の委譲検査を追加した。
+描画・レイアウト・UI文字列の変更はなく、ui_snapshot / glyph / site card は再実行しない。
+実 HWND / focus / F11・DPI / 実再生などの実機確認と、本体 lib 全件 gate の再実行は未実施。
+全件 gate・検証用 build・製品起動・commit / push は今回の指示どおり実行していない。
+変更は上記5ファイルで vendor 差分なし、ブランチ `feat-767-stage2` / HEAD `600b0a99d` のまま。
+独立 GPT-6.1 Sol / xhigh が整形後の5ファイル差分と全証跡を照合し、今回の修正は **受入可、未解決 P1 / P2 なし** と判定した。

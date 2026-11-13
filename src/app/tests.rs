@@ -76178,6 +76178,67 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     #[cfg(windows)]
+    fn detached_scanned_folder_binding_session_follows_new_open_setting() {
+        for independent in [false, true] {
+            let mut app = setup_app();
+            app.settings.detached_viewer_enabled = true;
+            app.settings.detached_viewer_open_images_in_window = independent;
+            let folder = app.tmp.path().join("prepared-folder-session");
+            std::fs::create_dir(&folder).unwrap();
+            image::RgbImage::new(8, 12)
+                .save(folder.join("page.png"))
+                .unwrap();
+            let before = (
+                app.items.clone(),
+                app.selected,
+                app.current_folder.clone(),
+                app.items_generation,
+            );
+            assert!(
+                app.start_active_detached_book_context_from_scanned_folder_with_restore(
+                    folder.clone(),
+                    scan_directory(&folder),
+                    &egui::Context::default(),
+                    None,
+                    None,
+                )
+            );
+            app.with_active_viewer_context(|viewer| {
+                assert_eq!(
+                    viewer.viewer_presentation,
+                    ViewerPresentation::DetachedWindow
+                );
+                assert_eq!(viewer.detached_viewer_independent_active, independent);
+                let window = viewer.detached_viewer_window_id().unwrap();
+                assert_eq!(
+                    viewer
+                        .detached_window_manager
+                        .runtime(window)
+                        .unwrap()
+                        .linked,
+                    !independent
+                );
+                assert_eq!(
+                    viewer.viewer_context_window(viewer.projected_viewer_context_id()),
+                    Some(window)
+                );
+                assert_eq!(viewer.current_folder.as_deref(), Some(folder.as_path()));
+            })
+            .unwrap();
+            assert_eq!(
+                (
+                    app.items.clone(),
+                    app.selected,
+                    app.current_folder.clone(),
+                    app.items_generation
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn mixed_folder_completion_uses_request_collection_anchor_after_selection_moves() {
         let mut app = setup_app();
         app.settings.detached_viewer_open_images_in_window = true;
@@ -76650,6 +76711,11 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                     ));
                     assert!(
                         app.with_active_viewer_context(|mounted| {
+                            assert_eq!(mounted.viewer_presentation, ViewerPresentation::DetachedWindow);
+                            assert!(mounted.detached_viewer_independent_active);
+                            let window = mounted.detached_viewer_window_id().unwrap();
+                            assert!(!mounted.detached_window_manager.runtime(window).unwrap().linked,
+                                "the loading shell publishes its initial independent runtime before any page opens");
                             mounted.folder_pane_open_pending.is_none()
                         })
                         .unwrap_or(false)
@@ -110213,7 +110279,26 @@ fn the_close_and_retire_seam_finishes_the_transition_it_starts() {
     let body = method_body("take_and_close_current_active_viewer_context_with_metadata_boundary");
     assert!(body.contains("self.take_and_close_active_context_with_cause(ctx, reason, boundary, ViewerCloseCause::User)"),
         "metadata境界付きseamがUser causeを持つterminal ownerへ配送されていない");
-    let body = method_body("take_and_close_active_context_with_cause");
+    let active = method_body("take_and_close_active_context_with_cause");
+    let resolve = active
+        .find("let id = self.active_viewer_context_id()?;")
+        .expect("active wrapper must resolve its owner");
+    let delegate = active
+        .find("self.take_and_close_context_with_cause(ctx, id, reason, boundary, cause)")
+        .expect("active wrapper must delegate its resolved id and typed cause");
+    assert!(
+        resolve < delegate,
+        "resolve the active id before delegation"
+    );
+    let body = method_body("take_and_close_context_with_cause");
+    assert!(
+        body.contains("id: ViewerContextId"),
+        "terminal owner accepts the explicit context id"
+    );
+    assert!(
+        !body.contains("self.active_viewer_context_id()"),
+        "terminal owner must not retarget the supplied id"
+    );
     let body = body.as_str();
     let transfer = body
         .find("self.transfer_terminal_close_return(id, cause);")
@@ -110272,6 +110357,42 @@ fn the_close_and_retire_seam_finishes_the_transition_it_starts() {
             .unwrap()
             .0
             .contains("close_fullscreen_to_completion")
+    );
+
+    // Resume handoff retains the source resolved before the destination is taken.
+    let handoff = method_body("park_detached_viewer_for_handoff");
+    assert!(handoff.contains("source: Option<ViewerContextId>"));
+    assert!(handoff.contains("else if let Some(id) = source_at_rest"));
+    let explicit_args = handoff
+        .split_once(".take_and_close_context_with_cause(")
+        .expect("snapshot-less handoff must use the same explicit-id terminal owner")
+        .1
+        .split_once(')')
+        .expect("handoff terminal call must close its argument list")
+        .0
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>();
+    assert!(explicit_args.starts_with("ctx,id,"));
+    assert!(explicit_args.contains("FsMetadataBoundary::Manual"));
+    assert!(explicit_args.contains("ViewerCloseCause::Replaced"));
+    assert_eq!(
+        src.matches("take_and_close_context_with_cause(").count(),
+        3,
+        "explicit-id terminal owner has its definition, active wrapper and handoff caller; audit any new entry"
+    );
+    let activation = method_body("take_detached_snapshot_for_activation");
+    let park = activation
+        .find(
+            "self.park_detached_viewer_for_handoff(ctx, source, preserve_fullfeature_linked_still)",
+        )
+        .expect("activation must hand off its captured source through the shared owner");
+    let take = activation
+        .find("self.detached_image_windows.remove(pos)")
+        .expect("activation must take its destination snapshot");
+    assert!(
+        park < take,
+        "handoff the captured source before taking the destination"
     );
 }
 
@@ -112678,6 +112799,19 @@ fn visibility_detached_collection_root_adopts_its_captured_policy_and_identity()
         None
     ));
     app.with_active_viewer_context(|active| {
+        assert_eq!(
+            active.viewer_presentation,
+            ViewerPresentation::DetachedWindow
+        );
+        assert!(active.detached_viewer_independent_active);
+        let window = active.detached_viewer_window_id().unwrap();
+        assert!(
+            !active
+                .detached_window_manager
+                .runtime(window)
+                .unwrap()
+                .linked
+        );
         assert_eq!(active.page_identity_index.policy, accepted_policy);
         assert!(Arc::ptr_eq(&active.page_identity_index, &accepted_map));
         assert_eq!(

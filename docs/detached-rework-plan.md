@@ -1488,6 +1488,7 @@ F11 の戻り Settle は restore を既に消費しているので runtime の�
 通常 resolver と Collection の採用境界から共通判定を呼び、背景media採用は旧EOF部品と共有、same-host native確定は所有contextに閉じる。新pending・背景B・描画guardは追加しない。決定と検証は正本 §6.4.5 / §17.18。
 独立実装レビュー r1 の P2（2026-11-14、BA-7）: 既存 request の独立性を明示 F12 だけが持つ `Some` と保守の `None` に分け、保守完了は現在の所有 context の確定値を継承する。App の状態や待ちは増やさず、実 fork / 再 activation / 旧 native 完了 / B 交換の回帰と検証を正本 §17.18 に追記する。
 独立実装レビュー r2 (2026-11-14、Sol / xhigh、対象 `01c9b2195`) は受入可・指摘なし。課題 1 の実装 (`9044445e6` + `01c9b2195`) について、設計担当 (ClaudeCode) と独立レビューの双方が**症状パッチではなく構造的な変更であることに合意**した。
+全件 gate の prepared 内部本の退行修正（2026-11-14、BA-7）: 内容 close が Building の private binding の初期 pair を公開まで保持し、loading shell / Collection root は予約時に runtime も同期する。独立 reviewer は所有境界の構造修正と確認し、同型入口の監査・検証結果を正本 §17.18 に記録する。
 
 ### 2026-11-13: 3D 写真第 2 段の実機課題の修正 (再開の所有の移動、メインが表示を失う確定点での 3D 終了)
 
