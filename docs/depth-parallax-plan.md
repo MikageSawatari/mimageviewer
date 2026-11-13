@@ -884,6 +884,33 @@ App に detached 用の bool / Option を足さない。viewport の生成・HWN
 (課題 2 の snapshot の push / remove の順序と、課題 1 の確定点に渡す値は変える)。detached-rework-plan §11 に範囲と理由を記録する。
 まれな失敗は既定の割り切り (ログ + 通知)。
 
+**設計レビュー r1 (GPT-6.1 Sol / xhigh、read-only、対象 `3108c2cd2`)**: P1 1 件・P2 2 件、判定「指摘修正後に実装開始可」、構造的変更であることに**合意**。
+課題 2・3 の原因、BA 分類、触れない範囲の見通しは妥当とされた。反映:
+
+- **P1 (課題 1)**: 独立性を引き継ぐだけでは、既存の 2 つの操作が変わる。(a) 独立した静止画の窓は動画・音声への送りを断る
+  (`should_block_detached_independent_still_navigation_to_video`、`open_fullscreen_from_fs_navigation_with_contract`) ので、3D を使わない
+  「動画→画像→動画」の往復が新たに止まる。(b) F12 は `requested_viewer_presentation_for_open` の「今の session が独立」の条件が優先され、
+  設定を OFF にしてもメインへ移らなくなる。「できなくなる操作は無い」の評価は誤りだった。**課題 1 は利用者の判断待ちとし、実装から外す**。案:
+  - 案 A: 独立したメディアウィンドウを「メディアの窓」として扱い続ける (画像も動画も送れる、F12 でメインへ移せる)。送りの可否・F12・
+    フォルダ / 本 / PDF / ZIP の遅延 reopen・再開・新規 open・fork / promote の入口ごとに所有の扱いを決める (P2-3 の分類表) 必要があり、規模が大きい。
+  - 案 B: メディアウィンドウを 3D の対象から外す。入場条件を「メインの context か、独立した session (複数ウィンドウモードの窓など)」にし、
+    動画から画像へ進んで連動になったメディアウィンドウでは D を断る。行き先の規則は変えず (リリース済みの「2 枚目からメインへ」のまま)、状態の組み合わせが最も少ない。
+  - 案 C: 今のまま (メディアウィンドウの 3D は最初の 1 枚だけで、送るとメインへ移り 3D が終わる)。
+- **P2-2 (課題 3)**: 表示を失う境界では、Depth だけでなく、その表示から出た未完了のモデル確認の入場要求 (`DepthEntryRequest`、Checking) も同じ寿命として
+  失効させる。メインの全画面で初回 D → 確認中に独立した窓を再開 → 確認完了で見えないメインが Depth に入る、という通常の非同期の順序を閉じるため。
+  モデルの確認処理そのもの・環境設定由来の案内は取り消さない。境界の入口は、`activate_parked_live_media_window_snapshot`・
+  `activate_detached_image_window_snapshot` に加えて `start_active_detached_loading_context`・`start_active_detached_collection_root_image`・
+  `start_active_detached_book_context_with_start`・materialized fork の後の open を監査し、通常の更新や一時 mount と、初めて表示の所有が移る確定を区別する。
+  パノラマ (360°) は対象に含めない。
+- **P2-3 (課題 1 の入口分類)**: 案 A を採る場合に限り、同じ閲覧内の送り・フォルダ / 本 / PDF / ZIP 移動後の reopen (`close_fullscreen_for_folder_nav_reopen`、
+  `DeferredFsReopen`)・passive / ParkedLive の再開と descriptor による再構築 (`continue_active_detached_book_context_from_descriptor` は既存窓でも
+  `fs_open_intent_from_grid=true` を立てる)・新規 open・F12・fork / promote の分類と、遅延する要求への由来の受け渡しを設計に書いてから実装する。
+- 課題 2 の共通 helper は、移動元を先に確定して park し、対象を id で取り直して消費する順序にする。ParkedLive 側の `preserve_fullfeature_linked_still=true`
+  と各再開方式に固有の処理は保つ。helper の中で移動元を推定し直さない。テストは `last_active_detached_window_id=A` を持つ実際の pause → 再開を使う。
+- pin (切り離し) は現行の正本では廃止済みなので、範囲の記述から外す。「送りでは 3D が続く」は同じ一覧の中の静止画の送りに限る (フォルダ移動は既存の閲覧終了で 3D が終わる)。
+
+**実装の範囲 (r1 の後)**: 課題 2・課題 3 (P2-2 を含む)・課題 4 の文言を先に実装する。課題 1 は利用者の判断の後に別に設計・実装する。
+
 ### 6.5 他の機能との関係 — 「表示を占有するモード」を 1 つの述語にする
 
 360° が他の機能を止めている箇所 (調査では 30 か所余り: キー・編集ツールの入口・補正パネル・
