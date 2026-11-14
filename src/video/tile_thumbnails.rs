@@ -403,6 +403,7 @@ fn run_worker(
 
 struct TileThumbnailDecoder {
     input: ffmpeg_the_third::format::context::Input,
+    timeline: crate::video::media_timeline::MediaTimeline,
     stream_idx: usize,
     tb_num: f64,
     tb_den: f64,
@@ -430,6 +431,7 @@ impl TileThumbnailDecoder {
         use ffmpeg_the_third as ffmpeg;
 
         let input = ffmpeg::format::input(path).map_err(|e| format!("open input failed: {e}"))?;
+        let timeline = crate::video::media_timeline::MediaTimeline::from_input(&input);
         let video_stream = input
             .streams()
             .best(MediaType::Video)
@@ -489,6 +491,7 @@ impl TileThumbnailDecoder {
 
         Ok(Self {
             input,
+            timeline,
             stream_idx,
             tb_num,
             tb_den,
@@ -520,7 +523,7 @@ impl TileThumbnailDecoder {
         use ffmpeg::util::frame::video::Video;
         use ffmpeg_the_third as ffmpeg;
 
-        let target_pts = (target_secs * 1_000_000.0) as i64;
+        let target_pts = self.timeline.media_to_av_time_base(target_secs);
         let seek_ok = unsafe {
             use ffmpeg::ffi::{AVSEEK_FLAG_BACKWARD, av_seek_frame};
             av_seek_frame(
@@ -570,7 +573,9 @@ impl TileThumbnailDecoder {
                     got_frame = Some(frame);
                     break;
                 };
-                let pts_secs = ts as f64 * self.tb_num / self.tb_den;
+                let pts_secs = self
+                    .timeline
+                    .raw_to_media_secs(ts as f64 * self.tb_num / self.tb_den);
                 // クリックで target_secs にシークしたとき表示される frame と一致
                 // させるため「target_secs 以降の最初の frame」を採用する。以前は
                 // `target_secs - 0.5` で 0.5s 手前の frame を拾っていた。
@@ -658,6 +663,26 @@ impl TileThumbnailDecoder {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn timeline_origin_tile_thumbnail_returns_requested_colour() {
+        use crate::video::screenshot::timeline_test_support::{
+            VIDEO_FIXTURES, assert_colour, fixture,
+        };
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        for &(name, content_start) in VIDEO_FIXTURES {
+            let mut decoder =
+                super::TileThumbnailDecoder::open(&fixture(name), 320, 180, false, "test").unwrap();
+            for second in [0, 4, 11] {
+                let target = content_start + second as f64 + 0.5;
+                let image = decoder
+                    .decode_thumbnail(target, &cancel, "test")
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{name}: missing thumbnail for {target}"));
+                assert_colour(&image.rgba, image.width, image.height, second);
+            }
+        }
+    }
+
     #[test]
     fn fit_within_preserves_aspect() {
         // 16:9 source, fit into 320x180 → (320, 180)

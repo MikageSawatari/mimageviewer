@@ -36,6 +36,7 @@ bench_thumbs.tsv
 !/testdata/video-deinterlace/
 !/testdata/rating-sort/
 !/testdata/audio-tracks/
+!/testdata/timeline-origin/
 !/testdata/audio-tail/
 !/testdata/avif/
 # Local tooling / scratch (Claude Code, Codex レビューメモ)

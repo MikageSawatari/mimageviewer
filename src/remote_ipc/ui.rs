@@ -6712,7 +6712,10 @@ mod tests {
                 UiWriteOutcome::Write(RemoteWriteResponse::Success(_))
             ));
             assert_eq!(
-                app.settings.video_resume_positions.get(&key),
+                app.settings
+                    .video_resume_positions
+                    .get(&key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&if sequence == 3 { 40.0 } else { 30.0 })
             );
         }
@@ -6768,7 +6771,10 @@ mod tests {
                 UiWriteOutcome::Write(RemoteWriteResponse::Success(_))
             ));
             assert_eq!(
-                app.settings.video_resume_positions.get(&key),
+                app.settings
+                    .video_resume_positions
+                    .get(&key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&15.0),
                 "{name}"
             );
@@ -6826,7 +6832,11 @@ mod tests {
                     UiWriteOutcome::Write(RemoteWriteResponse::Success(_))
                 ));
                 assert_eq!(
-                    app.settings.video_resume_positions.get(&key).copied(),
+                    app.settings
+                        .video_resume_positions
+                        .get(&key)
+                        .map(crate::settings::VideoResumePosition::stored_secs)
+                        .copied(),
                     expected_position
                 );
                 assert_eq!(app.settings.video_watched_to_end.contains(&key), watched);

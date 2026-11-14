@@ -379,6 +379,7 @@ enum DecodeOutcome {
 
 struct SeekThumbnailDecoder {
     input: ffmpeg_the_third::format::context::Input,
+    timeline: crate::video::media_timeline::MediaTimeline,
     stream_idx: usize,
     tb_num: f64,
     tb_den: f64,
@@ -401,6 +402,7 @@ impl SeekThumbnailDecoder {
 
         ffmpeg::init().map_err(|e| format!("ffmpeg init failed: {e}"))?;
         let input = ffmpeg::format::input(path).map_err(|e| format!("open input failed: {e}"))?;
+        let timeline = crate::video::media_timeline::MediaTimeline::from_input(&input);
         let video_stream = input
             .streams()
             .best(MediaType::Video)
@@ -461,6 +463,7 @@ impl SeekThumbnailDecoder {
 
         Ok(Self {
             input,
+            timeline,
             stream_idx,
             tb_num,
             tb_den,
@@ -501,7 +504,7 @@ impl SeekThumbnailDecoder {
         use ffmpeg_the_third as ffmpeg;
 
         let target_secs = request.target_secs;
-        let target_pts = (target_secs * 1_000_000.0) as i64;
+        let target_pts = self.timeline.media_to_av_time_base(target_secs);
         let seek_ok = unsafe {
             use ffmpeg::ffi::{AVSEEK_FLAG_BACKWARD, av_seek_frame};
             av_seek_frame(
@@ -553,7 +556,9 @@ impl SeekThumbnailDecoder {
                     got_frame = Some(frame);
                     break;
                 };
-                let pts_secs = ts as f64 * self.tb_num / self.tb_den;
+                let pts_secs = self
+                    .timeline
+                    .raw_to_media_secs(ts as f64 * self.tb_num / self.tb_den);
                 if !landed_frame_checked {
                     landed_frame_checked = true;
                     if should_adopt_seek_keyframe(target_secs, pts_secs, request.tolerance_secs) {
@@ -580,7 +585,10 @@ impl SeekThumbnailDecoder {
             return Ok(DecodeOutcome::NoFrame);
         };
         let frame_pts_secs = crate::video::decoder::video_frame_timestamp(&frame)
-            .map(|pts| pts as f64 * self.tb_num / self.tb_den)
+            .map(|pts| {
+                self.timeline
+                    .raw_to_media_secs(pts as f64 * self.tb_num / self.tb_den)
+            })
             .unwrap_or(target_secs);
         if !is_within_tolerance(target_secs, frame_pts_secs, request.lookup_tolerance_secs) {
             return Ok(DecodeOutcome::NoFrame);
@@ -796,6 +804,33 @@ fn run_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeline_origin_seek_thumbnail_returns_requested_colour() {
+        use crate::video::screenshot::timeline_test_support::{
+            VIDEO_FIXTURES, assert_colour, fixture,
+        };
+        let cancel = AtomicBool::new(false);
+        let requests = Mutex::new(ThumbnailRequestState::default());
+        for &(name, content_start) in VIDEO_FIXTURES {
+            let mut decoder = SeekThumbnailDecoder::open(&fixture(name), false).unwrap();
+            for second in [0, 4, 11] {
+                let target = content_start + second as f64 + 0.5;
+                let DecodeOutcome::Ready(image) = decoder
+                    .decode_thumbnail(request(target, 0.08), &requests, &cancel)
+                    .unwrap()
+                else {
+                    panic!("{name}: missing thumbnail for {target}");
+                };
+                assert!(
+                    (image.target_secs - target).abs() < 0.08,
+                    "{name}: {} != {target}",
+                    image.target_secs
+                );
+                assert_colour(&image.rgba, image.width, image.height, second);
+            }
+        }
+    }
 
     fn thumbnail(actual_secs: f64) -> Thumbnail {
         Thumbnail {

@@ -58,6 +58,39 @@ D1設計受入とI1の自動/実機受入は別であり、[調査・I1台帳](v
 **スコープ外**: NVIDIA RTX VSR / Super Resolution、HDR 表示、外部プレイヤー (この機能はあり)、
 動画編集機能。
 
+## 時刻の原点 (メディア時刻)
+
+mIV の動画・音声の位置はメディア時刻 `t = raw PTS 秒 − O_eff` で統一する。
+表示、seek の引数、clock、engine、native presenter、Remote、ブックマーク・ピン・
+続きから再生の新しい保存値は同じ時刻を使い、位置の範囲は `[0, D]` とする。
+`D` は FFmpeg の format duration で、原点補正では変更しない。
+
+原点を決めて raw との変換を行う唯一の所有者は `src/video/media_timeline.rs` の
+`MediaTimeline`。`MediaTimeline::from_input(&Input)` は demuxer 名が `mpegts`、
+`mpegtsraw`、`mpeg` (MPEG-PS) の場合だけ format の `start_time` を `O_eff` に使う。
+これらは duration が `end − start` であり、時計の値としての PTS を原点へ戻す必要がある。
+開始時刻が不明なら原点は 0。それ以外の形式は `O_eff=0` を維持する。
+`AVFMT_TS_DISCONT` flag から補正対象を推測しない。
+
+特に O>0 の Matroska は duration 自体が原点前の空区間を含むので、原点を引かない。
+例えば O=10、内容 12 秒なら、映像は時刻 10〜22、D=22 のまま扱う。
+MP4 の edit list、MP3 の encoder delay、Ogg の pre-skip も既存の扱いを保つ。
+TS の 33 bit PTS 折り返しは FFmpeg の unwrap 後にこの変換を行う。
+
+再生 decoder は demux thread が Input を開いたときに不変の `MediaTimeline` を作り、
+映像・音声 lane へ渡す。独立して Input を開くサムネイル、seek strip、範囲音声 decode、
+Remote の clockless transcode などの worker は、自分の Input から原点を決める。
+入力の frame PTS・チャプター・音声トラック範囲は FFmpeg 境界でメディア時刻へ変換し、
+seek は FFmpeg へ渡す直前に raw locator へ戻す。duration や時刻差、FFmpeg の索引・
+upscale manifest の source seek PTS など内部の raw locator は補正しない。
+`VideoInfo.timeline_origin_secs` は旧続き位置の復元・ログ・診断用で、通常の時刻変換に使わない。
+
+Remote は source のメディア時刻から、さらに配信 generation の `source_origin_secs` を
+`StreamTimeline` で引いて session 相対時刻へ写す。`source_origin_secs` は raw PTS ではなく
+メディア時刻であり、端末は `source_origin_secs + currentTime` で元の位置を復元する。
+保存済みの旧続き位置とキャッシュの互換方針、fixture、受入条件の正本は
+[動画の時刻原点の設計](video-timeline-origin-plan.md)。
+
 ## 採用アーキテクチャ: native presenter (独立 HWND + D3D11 swap chain) 必須
 
 旧版では「DX12 wgpu backend なら egui_wgpu callback で zero-copy GPU 描画、それ以外
@@ -3174,8 +3207,9 @@ logs\perf_events.jsonl` を `python scripts/analyze_perf.py <path> av_drift [--p
 
 ### 用語と単位
 
-- **PTS (Presentation Timestamp)**: 動画ファイルに焼き付けられた各 video frame /
-  audio frame の表示時刻 (秒、f64)。FFmpeg avformat が抽出する。
+- **PTS (Presentation Timestamp)**: 各 video frame / audio frame の表示時刻。
+  FFmpeg の raw PTS は stream time base の tick だが、mIV の clock・frame・音声処理へ
+  渡す PTS 秒 (f64) は上記 `MediaTimeline` で変換したメディア時刻。
 - mIV は **音声マスタークロック方式** (mpv / ffplay と同じ)。音声 pump が物理出力した
   サンプルの audible PTS を `AvClock::set_audio_pts` に渡し、video 側は `now_secs()` を
   見て表示・スキップ・待機を決める。

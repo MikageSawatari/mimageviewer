@@ -727,7 +727,10 @@ fn acceptance_f_resume_thumbnails_require_a_video_stream_and_keep_audio_position
             .unwrap();
         app.save_all_video_resume_positions();
         assert_eq!(
-            app.settings.video_resume_positions.get(&key),
+            app.settings
+                .video_resume_positions
+                .get(&key)
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&15.0),
             "{name}"
         );
@@ -744,7 +747,10 @@ fn acceptance_f_resume_thumbnails_require_a_video_stream_and_keep_audio_position
         );
         app.save_viewer_context_media_teardown_resumes(&[plan]);
         assert_eq!(
-            app.settings.video_resume_positions.get(&key),
+            app.settings
+                .video_resume_positions
+                .get(&key)
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&15.0),
             "teardown {name}"
         );
@@ -763,7 +769,13 @@ fn acceptance_f_remote_audio_progress_saves_position_without_thumbnail() {
     let path = app.tmp.path().join("RemoteAudio.MP3");
     let key = crate::adjustment_db::normalize_path(&path);
     app.apply_remote_media_resume_update(path, 15.0, 60.0, false, false);
-    assert_eq!(app.settings.video_resume_positions.get(&key), Some(&15.0));
+    assert_eq!(
+        app.settings
+            .video_resume_positions
+            .get(&key)
+            .map(crate::settings::VideoResumePosition::stored_secs),
+        Some(&15.0)
+    );
     assert!(!app.video_resume_thumb_last_request.contains_key(&key));
 }
 
@@ -14140,7 +14152,7 @@ fn video_resume_for_open_grid_and_nav_modes() {
         None,
         "grid 開く・先頭から"
     );
-    assert_eq!(video_resume_for_open(None, true, true, Resume), None);
+    assert_eq!(video_resume_for_open(None::<f64>, true, true, Resume), None);
 
     // Ctrl+↑↓ / ホイール等 (from_grid=false): nav_resume が判定、open 設定は無視。
     assert_eq!(
@@ -14153,7 +14165,10 @@ fn video_resume_for_open_grid_and_nav_modes() {
         None,
         "nav・先頭から"
     );
-    assert_eq!(video_resume_for_open(None, false, false, Resume), None);
+    assert_eq!(
+        video_resume_for_open(None::<f64>, false, false, Resume),
+        None
+    );
 }
 
 #[test]
@@ -22518,9 +22533,10 @@ mod phase_c_folder_nav_history_tests {
             None,
             None,
         ));
-        app.settings
-            .video_resume_positions
-            .insert("/miv-test/movie.mp4".to_string(), 91.5);
+        app.settings.video_resume_positions.insert(
+            "/miv-test/movie.mp4".to_string(),
+            crate::settings::VideoResumePosition::Media(91.5),
+        );
         app.settings.save();
 
         let _ = app.apply_ring_action(
@@ -22590,7 +22606,8 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(
             app.settings
                 .video_resume_positions
-                .get("/miv-test/movie.mp4"),
+                .get("/miv-test/movie.mp4")
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&91.5)
         );
         assert_eq!(
@@ -22625,7 +22642,10 @@ mod phase_c_folder_nav_history_tests {
                 .all(Vec::is_empty)
         );
         assert_eq!(
-            persisted.video_resume_positions.get("/miv-test/movie.mp4"),
+            persisted
+                .video_resume_positions
+                .get("/miv-test/movie.mp4")
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&91.5)
         );
         assert_eq!(
@@ -33998,7 +34018,13 @@ mod phase_c_drill_nav_tests {
 
         app.record_reading_history_path(path.clone(), ReadingHistoryKind::Video, None, None, None);
         app.apply_remote_media_resume_update(path.clone(), 20.0, 100.0, false, true);
-        assert_eq!(app.settings.video_resume_positions.get(&key), Some(&20.0));
+        assert_eq!(
+            app.settings
+                .video_resume_positions
+                .get(&key)
+                .map(crate::settings::VideoResumePosition::stored_secs),
+            Some(&20.0)
+        );
         #[cfg(windows)]
         assert_eq!(app.video_resume_thumb_last_request.get(&key), Some(&20_000));
         app.apply_remote_media_resume_update(path.clone(), 2.0, 100.0, false, true);
@@ -34053,7 +34079,10 @@ mod phase_c_drill_nav_tests {
 
         let path = std::path::PathBuf::from("c:/media/completed.mp4");
         let key = crate::adjustment_db::normalize_path(&path);
-        let mut resume = std::collections::HashMap::from([(key.clone(), 90.0)]);
+        let mut resume = std::collections::HashMap::from([(
+            key.clone(),
+            crate::settings::VideoResumePosition::Media(90.0),
+        )]);
         let mut watched = std::collections::HashSet::new();
         assert!(!crate::app::save_video_resume_position(
             &mut resume,
@@ -78748,7 +78777,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             assert_eq!(
                 app.settings
                     .video_resume_positions
-                    .get(&crate::adjustment_db::normalize_path(&path)),
+                    .get(&crate::adjustment_db::normalize_path(&path))
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&30.0)
             );
 
@@ -78827,7 +78857,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(
             app.settings
                 .video_resume_positions
-                .get(&crate::adjustment_db::normalize_path(&video_path)),
+                .get(&crate::adjustment_db::normalize_path(&video_path))
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&17.5)
         );
         assert!(!app.slideshow_playing);
@@ -79843,7 +79874,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             assert_eq!(
                 app.settings
                     .video_resume_positions
-                    .get(&crate::adjustment_db::normalize_path(path)),
+                    .get(&crate::adjustment_db::normalize_path(path))
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&position)
             );
         }
@@ -79886,7 +79918,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             assert_eq!(
                 app.settings
                     .video_resume_positions
-                    .get(&crate::adjustment_db::normalize_path(&path)),
+                    .get(&crate::adjustment_db::normalize_path(&path))
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&42.0)
             );
 
@@ -79958,13 +79991,15 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(
             app.settings
                 .video_resume_positions
-                .get(&crate::adjustment_db::normalize_path(&active_path)),
+                .get(&crate::adjustment_db::normalize_path(&active_path))
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&51.0)
         );
         assert_eq!(
             app.settings
                 .video_resume_positions
-                .get(&crate::adjustment_db::normalize_path(&parked_path)),
+                .get(&crate::adjustment_db::normalize_path(&parked_path))
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&63.0)
         );
     }
@@ -81228,9 +81263,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.transition_detached_window_state(61, DetachedWindowState::ParkedLive, "test_setup");
 
         let resume_key = crate::adjustment_db::normalize_path(std::path::Path::new(video_path));
-        app.settings
-            .video_resume_positions
-            .insert(resume_key.clone(), 12.5);
+        app.settings.video_resume_positions.insert(
+            resume_key.clone(),
+            crate::settings::VideoResumePosition::Media(12.5),
+        );
         app.video_resume_thumb_last_request
             .insert(resume_key.clone(), 1);
 
@@ -81399,16 +81435,19 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.comic_page_keys.insert(format!("{old_k}::p1.jpg"));
         app.export_crop_page_keys
             .insert(format!("{old_k}/cropped.jpg"));
-        app.settings
-            .video_resume_positions
-            .insert(format!("{old_k}/v.mp4"), 12.0);
+        app.settings.video_resume_positions.insert(
+            format!("{old_k}/v.mp4"),
+            crate::settings::VideoResumePosition::Media(12.0),
+        );
         // 新キー側に既存値 (リネーム後に先へ再生した想定) → 既存優先。
-        app.settings
-            .video_resume_positions
-            .insert(format!("{old_k}/w.mp4"), 5.0);
-        app.settings
-            .video_resume_positions
-            .insert(format!("{new_k}/w.mp4"), 99.0);
+        app.settings.video_resume_positions.insert(
+            format!("{old_k}/w.mp4"),
+            crate::settings::VideoResumePosition::Media(5.0),
+        );
+        app.settings.video_resume_positions.insert(
+            format!("{new_k}/w.mp4"),
+            crate::settings::VideoResumePosition::Media(99.0),
+        );
 
         app.rewrite_page_edit_presence_for_rename(old, new);
         app.migrate_video_resume_positions_for_renamed_path(old, new);
@@ -81433,14 +81472,16 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(
             app.settings
                 .video_resume_positions
-                .get(&format!("{new_k}/v.mp4")),
+                .get(&format!("{new_k}/v.mp4"))
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&12.0),
             "再生位置が新キーへ移る"
         );
         assert_eq!(
             app.settings
                 .video_resume_positions
-                .get(&format!("{new_k}/w.mp4")),
+                .get(&format!("{new_k}/w.mp4"))
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&99.0),
             "新キー側の既存値を優先する"
         );
@@ -82253,7 +82294,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 audio_track_choice: None,
             },
         ];
-        let mut resume = std::collections::HashMap::from([(finished.clone(), 10.0)]);
+        let mut resume = std::collections::HashMap::from([(
+            finished.clone(),
+            crate::settings::VideoResumePosition::Media(10.0),
+        )]);
         let mut watched = std::collections::HashSet::from([kept.clone()]);
 
         let removed = apply_viewer_context_media_resume_updates(
@@ -82264,7 +82308,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             0,
         );
 
-        assert_eq!(resume.get(&kept), Some(&37.5));
+        assert_eq!(
+            resume.get(&kept),
+            Some(&crate::settings::VideoResumePosition::Media(37.5))
+        );
         assert!(!resume.contains_key(&finished));
         assert!(!watched.contains(&kept));
         assert!(watched.contains(&finished));
@@ -82445,9 +82492,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 load_seq: 0,
             },
         );
-        app.settings
-            .video_resume_positions
-            .insert(eof_key.clone(), 13.046);
+        app.settings.video_resume_positions.insert(
+            eof_key.clone(),
+            crate::settings::VideoResumePosition::Media(13.046),
+        );
         app.settings.video_watched_to_end.insert(mid_key.clone());
 
         app.save_all_video_resume_positions();
@@ -82456,7 +82504,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert!(app.settings.video_watched_to_end.contains(&eof_key));
         assert!(!app.settings.video_watched_to_end.contains(&mid_key));
         assert_eq!(
-            app.settings.video_resume_positions.get(&mid_key),
+            app.settings
+                .video_resume_positions
+                .get(&mid_key)
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&40.0),
             "normal midpoint remains saved when the player is not at EOF"
         );
@@ -82484,7 +82535,13 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.settings.video_watched_to_end.insert(key.clone());
 
         app.save_all_video_resume_positions();
-        assert_eq!(app.settings.video_resume_positions.get(&key), Some(&40.0));
+        assert_eq!(
+            app.settings
+                .video_resume_positions
+                .get(&key)
+                .map(crate::settings::VideoResumePosition::stored_secs),
+            Some(&40.0)
+        );
         assert!(!app.settings.video_watched_to_end.contains(&key));
 
         let items = app.items.clone();
@@ -82564,13 +82621,15 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(
             app.settings
                 .video_resume_positions
-                .get(&crate::adjustment_db::normalize_path(&active_path)),
+                .get(&crate::adjustment_db::normalize_path(&active_path))
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&41.0)
         );
         assert_eq!(
             app.settings
                 .video_resume_positions
-                .get(&crate::adjustment_db::normalize_path(&parked_path)),
+                .get(&crate::adjustment_db::normalize_path(&parked_path))
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&52.0)
         );
         assert!(app.active_viewer_context_id().is_some());
@@ -82610,7 +82669,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(plan.resume_updates.len(), 1);
         assert!(plan.resume_updates[0].at_eof);
         assert_eq!(plan.resume_updates[0].duration, 0.0);
-        let mut resume = std::collections::HashMap::from([(key.clone(), 13.046)]);
+        let mut resume = std::collections::HashMap::from([(
+            key.clone(),
+            crate::settings::VideoResumePosition::Media(13.046),
+        )]);
         let mut watched = std::collections::HashSet::new();
 
         let removed = apply_viewer_context_media_resume_updates(
@@ -82705,9 +82767,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.transition_detached_window_state(98, DetachedWindowState::ParkedLive, "test_setup");
         let old_key = crate::adjustment_db::normalize_path(&old_path);
         let new_key = crate::adjustment_db::normalize_path(&new_path);
-        app.settings
-            .video_resume_positions
-            .insert(old_key.clone(), 32.5);
+        app.settings.video_resume_positions.insert(
+            old_key.clone(),
+            crate::settings::VideoResumePosition::Media(32.5),
+        );
 
         app.release_viewer_surfaces_for_removed_paths(
             &ctx,
@@ -82715,14 +82778,20 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             "test_rename_close",
         );
         assert_eq!(
-            app.settings.video_resume_positions.get(&old_key),
+            app.settings
+                .video_resume_positions
+                .get(&old_key)
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&37.5),
             "close 時点の最終位置が旧 path へ先に保存される"
         );
 
         app.migrate_video_resume_positions_for_renamed_path(&old_path, &new_path);
         assert_eq!(
-            app.settings.video_resume_positions.get(&new_key),
+            app.settings
+                .video_resume_positions
+                .get(&new_key)
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&37.5)
         );
         assert!(!app.settings.video_resume_positions.contains_key(&old_key));
@@ -91607,13 +91676,15 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(
             app.settings
                 .video_resume_positions
-                .get(&crate::adjustment_db::normalize_path(&first_path)),
+                .get(&crate::adjustment_db::normalize_path(&first_path))
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&21.0)
         );
         assert_eq!(
             app.settings
                 .video_resume_positions
-                .get(&crate::adjustment_db::normalize_path(&second_path)),
+                .get(&crate::adjustment_db::normalize_path(&second_path))
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&42.0)
         );
         assert!(
@@ -91700,7 +91771,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(
             app.settings
                 .video_resume_positions
-                .get(&crate::adjustment_db::normalize_path(&path)),
+                .get(&crate::adjustment_db::normalize_path(&path))
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&33.0)
         );
         assert!(

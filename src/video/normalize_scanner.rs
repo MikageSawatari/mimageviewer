@@ -100,6 +100,7 @@ impl std::fmt::Display for NormalizeScanError {
 impl std::error::Error for NormalizeScanError {}
 
 struct PreparedNormalizeAudio {
+    timeline: super::media_timeline::MediaTimeline,
     stream_idx: usize,
     stream_tb: ffmpeg::Rational,
     decoder: ffmpeg::decoder::Audio,
@@ -129,6 +130,7 @@ fn prepare_normalize_audio_stream(
         .map_err(|e| NormalizeScanError::Ffmpeg(format!("audio decoder: {e}")))?;
     crate::audio_decode::discard_unselected_streams(input, stream_idx);
     Ok(PreparedNormalizeAudio {
+        timeline: super::media_timeline::MediaTimeline::from_input(input),
         stream_idx,
         stream_tb,
         decoder,
@@ -209,6 +211,7 @@ fn scan_audio_loudness_impl(
 
     // ── audio stream 選択 ──
     let PreparedNormalizeAudio {
+        timeline,
         stream_idx,
         stream_tb,
         mut decoder,
@@ -283,8 +286,9 @@ fn scan_audio_loudness_impl(
         }
         // 進捗更新
         if let Some(pts) = packet.pts() {
-            let pts_secs =
-                pts as f64 * stream_tb.numerator() as f64 / stream_tb.denominator() as f64;
+            let pts_secs = timeline.raw_to_media_secs(
+                pts as f64 * stream_tb.numerator() as f64 / stream_tb.denominator() as f64,
+            );
             if pts_secs.is_finite() && pts_secs >= 0.0 {
                 last_processed_secs = pts_secs;
                 progress

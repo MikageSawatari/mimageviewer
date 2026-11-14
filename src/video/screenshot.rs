@@ -29,6 +29,7 @@ pub fn capture_frame(path: &Path, target_secs: f64) -> Result<CapturedVideoFrame
 
     let mut input = ffmpeg::format::input(path)
         .map_err(|e| format!("open input failed: {}: {e}", path.display()))?;
+    let timeline = crate::video::media_timeline::MediaTimeline::from_input(&input);
     let video_stream = input
         .streams()
         .best(MediaType::Video)
@@ -57,7 +58,7 @@ pub fn capture_frame(path: &Path, target_secs: f64) -> Result<CapturedVideoFrame
     // する。HW frame は `prepare_frame_for_swscale` で SW download してから渡す。
     // (詳細は `src/video/swscale_helpers.rs`)
 
-    let target_pts = (target_secs * 1_000_000.0) as i64;
+    let target_pts = timeline.media_to_av_time_base(target_secs);
     let seek_ok = unsafe {
         use ffmpeg::ffi::{AVSEEK_FLAG_BACKWARD, av_seek_frame};
         av_seek_frame(
@@ -98,7 +99,7 @@ pub fn capture_frame(path: &Path, target_secs: f64) -> Result<CapturedVideoFrame
                 frame = Video::empty();
                 continue;
             };
-            let pts_secs = raw_pts as f64 * tb_num / tb_den;
+            let pts_secs = timeline.raw_to_media_secs(raw_pts as f64 * tb_num / tb_den);
             if (pts_secs - target_secs).abs() <= timestamp_epsilon_secs {
                 got_frame = Some((frame, pts_secs));
                 break;
@@ -187,7 +188,76 @@ fn timestamp_epsilon_secs(tb_num: f64, tb_den: f64) -> f64 {
 }
 
 #[cfg(test)]
+pub(crate) mod timeline_test_support {
+    use std::path::{Path, PathBuf};
+
+    /// Second item is the content's start on the media axis, not container start_time.
+    pub(crate) const VIDEO_FIXTURES: &[(&str, f64)] = &[
+        ("small-origin.ts", 0.0),
+        ("large-origin.ts", 0.0),
+        ("wrap-origin.ts", 0.0),
+        ("interlaced-origin.ts", 0.0),
+        ("late-audio-origin.ts", 0.0),
+        ("large-origin.mpg", 0.0),
+        ("positive-origin.mkv", 10.0),
+    ];
+
+    pub(crate) fn fixture(name: &str) -> PathBuf {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/timeline-origin")
+            .join(name);
+        assert!(path.is_file(), "missing fixture {}", path.display());
+        path
+    }
+
+    pub(crate) fn assert_colour(rgba: &[u8], width: u32, height: u32, second: usize) {
+        const RGB: [[u8; 3]; 12] = [
+            [255, 0, 0],
+            [0, 255, 0],
+            [0, 0, 255],
+            [255, 255, 0],
+            [255, 0, 255],
+            [0, 255, 255],
+            [255, 255, 255],
+            [0, 0, 0],
+            [255, 128, 0],
+            [128, 0, 255],
+            [0, 128, 128],
+            [128, 128, 128],
+        ];
+        let offset = ((height / 2 * width + width / 2) * 4) as usize;
+        let pixel = &rgba[offset..offset + 3];
+        for (actual, expected) in pixel.iter().zip(RGB[second]) {
+            assert!(
+                actual.abs_diff(expected) <= 5,
+                "second={second} RGB={pixel:?}, expected={:?}",
+                RGB[second]
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    #[test]
+    fn timeline_origin_screenshot_returns_requested_colour() {
+        use super::timeline_test_support::{VIDEO_FIXTURES, assert_colour, fixture};
+        for &(name, content_start) in VIDEO_FIXTURES {
+            let path = fixture(name);
+            for second in [0, 4, 11] {
+                let target = content_start + second as f64 + 0.5;
+                let image =
+                    super::capture_frame(&path, target).unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert!(
+                    (image.target_secs - target).abs() < 0.08,
+                    "{name}: {} != {target}",
+                    image.target_secs
+                );
+                assert_colour(&image.rgba, image.width, image.height, second);
+            }
+        }
+    }
+
     #[test]
     fn timestamp_epsilon_is_tiny_even_for_millisecond_timebase() {
         let eps = super::timestamp_epsilon_secs(1.0, 1000.0);

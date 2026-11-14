@@ -39,6 +39,14 @@
 
 ## 1. 優先候補
 
+### 1.779 音声 decoder の pkt_timebase と encoder delay / pre-skip の PTS — コード調査 (2026-11-14)
+
+`decoder.rs` の音声 decoder は `pkt_timebase` を設定していないため、MP3 や Ogg Opus の
+skip sample / pre-skip が適用された音声サンプルと frame PTS の関係を別途確認する。
+[動画の時刻原点の設計](video-timeline-origin-plan.md) §8 の対象外項目であり、同修正では
+これらの形式の O_eff=0 と従来の音声時刻を維持する。`pkt_timebase` を設定する際は
+先頭の可聴サンプル・seek 後の trim・EOF drain・Remote と範囲デコードを回帰検証する。
+
 ### 1.474 通常のページ表示でページ内スクロールと N 字スクロールを使う — 5ch >>642・767 (2026-10-29 起票、2026-11-12 採用)
 
 - 状態: **未着手・対応方針決定**。収録版は未定。[>>642](https://egg.5ch.io/test/read.cgi/software/1782419551/642) の、画像の端を基準にキーで表示範囲を動かしたい要望を保留側に記録していた。[>>767](https://egg.5ch.io/test/read.cgi/software/1782419551/767) で、縦連結のように次のページを見せず、今のページ内を矢印キーやホイールで動かしたいことと、NeeView のような N 字スクロールの要望が追加された。2026-11-12 の利用者決定で通常バックログへ移す。

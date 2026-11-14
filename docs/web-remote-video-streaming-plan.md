@@ -259,8 +259,18 @@ HW デコード時 (`AV_PIX_FMT_D3D11`) は既存の `av_hwframe_transfer_data`
 - 音声: `ProcessedChunk::audible_pts_secs` (source timeline、PDC 補正済み)
 - 映像: frame の pts (source timeline)
 
-両方を **source timeline のまま**セグメンタへ渡し、セッション開始時刻を 0 とする相対
-タイムスタンプへ写す。音声側が既に PDC を吸収しているので、リップシンクは自動的に合う。
+ここでいう **source timeline は mIV のメディア時刻** (`raw PTS 秒 − O_eff`) であり、
+raw のコンテナ時計ではない。clockless worker は自分の Input から `MediaTimeline` を作り、
+入力の映像・音声 PTS と stream start をこの時刻へ変換し、seek 時だけ raw locator へ戻す。
+原点を引く demuxer は `mpegts`・`mpegtsraw`・`mpeg` に限る。MKV・MP4・MP3 等は
+従来のコンテナ時刻を保つ。原点・duration の契約は
+[動画アーキテクチャの時刻の原点](video-architecture.md#時刻の原点-メディア時刻) を参照。
+
+音声・映像は同じ source timeline を使い、`StreamTimeline` が generation の開始位置
+`source_origin_secs` を引いてセッション相対タイムスタンプへ写す。`source_origin_secs` 自体も
+メディア時刻であり、例えば原点が約 36000 秒の TS を位置 4 秒から配信すると、
+`source_origin_secs=4`、最初の encoded segment の時刻は約 0、端末の位置は約 4 秒になる。
+音声側が既に PDC を吸収しているので、リップシンクは自動的に合う。
 
 レジューム位置で session を attach すると、最初の post-DSP 音声区間は PDC 分だけ session
 原点より前から始まり得る。AAC 入力境界は現 seek 世代の初期 chunk を点ではなく
@@ -800,8 +810,9 @@ guard で、動画処理開始後の timeout 9 個には数えない。
 | 画質 | メニュー | — | `media_quality` |
 | 全画面 | メニュー | `F11` | `toggle_fullscreen` (既存) |
 
-- シークバーは自前 DOM。generation ごとに state の `source_origin_secs` を 1 度だけ基準点へ
-  置き、以後は `<video>.currentTime` を足して表示する。生成端は playhead に使わない
+- シークバーは自前 DOM。generation ごとに state の `source_origin_secs` (source のメディア時刻) を
+  1 度だけ基準点へ置き、以後は `<video>.currentTime` (session 相対時刻) を足して表示する。
+  TS の raw 時計への変換は端末に持ち込まない。生成端は playhead に使わない
 - バッファ不足 (`waiting` イベント) が 3 秒以上続いたら画質を 1 段下げる提案を出す
   (自動では下げない。§2 のとおり ABR は持たない)
 - iOS のバックグラウンド復帰時はセッション生存を `/api/video/state` で確認し、

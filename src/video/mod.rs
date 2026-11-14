@@ -45,6 +45,7 @@ pub mod ffmpeg_loader;
 mod frame_selection;
 #[cfg(windows)]
 pub mod gpu_renderer;
+pub(crate) mod media_timeline;
 pub mod mvexport;
 #[cfg(windows)]
 pub(crate) mod native_cursor;
@@ -246,6 +247,26 @@ pub(crate) fn sanitize_resume_for_duration(resume: Option<f64>, duration: f64) -
         .then_some(resume)
 }
 
+/// Resolve released raw resume values only once metadata supplies the source origin.
+fn resolve_resume_for_info(
+    resume: Option<crate::settings::VideoResumePosition>,
+    info: &VideoInfo,
+) -> Option<f64> {
+    let position = match resume? {
+        crate::settings::VideoResumePosition::LegacyRaw(raw) => {
+            let timeline =
+                media_timeline::MediaTimeline::for_resume_migration(info.timeline_origin_secs);
+            let media = timeline.raw_to_media_secs(raw);
+            if media < 0.0 {
+                return None;
+            }
+            media
+        }
+        crate::settings::VideoResumePosition::Media(media) => media,
+    };
+    sanitize_resume_for_duration(Some(position), info.duration_secs)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum VideoContinuousMode {
     #[default]
@@ -435,7 +456,7 @@ pub struct VideoPlayer {
     /// 高 fps コンテンツでも display が channel head の far-future にジャンプしない。
     future_frames: std::collections::VecDeque<VideoFrame>,
     /// 起動時 resume 用の保留シーク target (秒)。info 到着後に 1 度だけ実行する。
-    pending_resume_secs: Option<f64>,
+    pending_resume_secs: Option<crate::settings::VideoResumePosition>,
     /// 直前 tick で観測した seek_serial。新世代に変わったら future_frames を一掃する。
     last_seen_seek_serial: u64,
     /// EOF 到達時に先頭から再生し直すか (= 設定の video_loop_mode != Off の effective)。
@@ -9125,6 +9146,7 @@ impl VideoPlayer {
             width: 640,
             height: 360,
             duration_secs: 30.0,
+            timeline_origin_secs: 0.0,
             video_codec: "h264".to_owned(),
             video_decoder: "test".to_owned(),
             d3d11va_supported: false,
@@ -9462,7 +9484,7 @@ impl VideoPlayer {
         initial_normalize_gain: f64,
         initial_audio_preroll_suspended: bool,
         autoplay: bool,
-        resume_secs: Option<f64>,
+        resume_secs: Option<crate::settings::VideoResumePosition>,
         initial_audio_track: Option<SavedAudioTrackChoice>,
         hw_decode: bool,
         deinterlace: crate::settings::VideoDeinterlaceMode,
@@ -9500,7 +9522,7 @@ impl VideoPlayer {
         normalize_enabled: bool,
         initial_audio_preroll_suspended: bool,
         autoplay: bool,
-        resume_secs: Option<f64>,
+        resume_secs: Option<crate::settings::VideoResumePosition>,
         initial_audio_track: Option<SavedAudioTrackChoice>,
         hw_decode: bool,
         deinterlace: crate::settings::VideoDeinterlaceMode,
@@ -9551,7 +9573,7 @@ impl VideoPlayer {
                 OpenOptions {
                     initial_volume,
                     autoplay,
-                    resume_secs,
+                    resume_secs: None,
                     ..Default::default()
                 },
                 seek_serial,
@@ -9661,7 +9683,8 @@ impl VideoPlayer {
         let opts = OpenOptions {
             initial_volume,
             autoplay,
-            resume_secs,
+            // Saved raw values must never reach a clock before VideoInfo resolves the basis.
+            resume_secs: None,
             loop_enabled: false, // VideoPlayer 側で個別管理 (Phase 3+ で統合予定)
             hw_decode,
             playback_start: PlaybackStartContext::default(),
@@ -11206,12 +11229,14 @@ impl VideoPlayer {
 
     #[cfg(test)]
     pub(crate) fn set_pending_remote_resume_for_test(&mut self, target_secs: f64) {
-        self.pending_resume_secs = Some(target_secs);
+        self.pending_resume_secs = Some(crate::settings::VideoResumePosition::Media(target_secs));
     }
 
     #[cfg(test)]
     pub(crate) fn apply_pending_remote_resume_for_test(&mut self) {
-        if let Some(target_secs) = self.pending_resume_secs.take() {
+        if let Some(crate::settings::VideoResumePosition::Media(target_secs)) =
+            self.pending_resume_secs.take()
+        {
             let epoch = self.clock.current_seek_serial();
             self.engine.lock().unwrap().handle_decoder_event(
                 engine::state::DecoderEvent::InfoReceived {
@@ -12430,10 +12455,8 @@ impl VideoPlayer {
                             info.orientation,
                         );
                         // Phase 3c: engine にも InfoReceived event を流す。
-                        // resume_secs は **AvClock 経由の旧経路** で処理し続け、
-                        // engine 側でも resume_secs を OpenOptions で受領済みなので
-                        // engine の InfoReceived ハンドラ内で並行処理される。
-                        // (= 二重で seek が走らないよう、Phase 3d で旧経路を撤去する。)
+                        // Saved resume is owned here until metadata resolves its time basis;
+                        // the engine receives only the resolved media seek below.
                         if !self.info_event_emitted {
                             // audio output 起動に失敗した場合 (`self.audio.is_none()`)
                             // は has_audio=false で engine に通知する。さもなくば engine が
@@ -12486,7 +12509,7 @@ impl VideoPlayer {
                         let resume = if requested_before_metadata {
                             None
                         } else {
-                            sanitize_resume_for_duration(pending_resume, info.duration_secs)
+                            resolve_resume_for_info(pending_resume, &info)
                         };
                         if let Some(resume) = resume {
                             self.clock.request_seek(resume);
@@ -12494,10 +12517,6 @@ impl VideoPlayer {
                             // 共有 seek_serial は clock.request_seek で 1 回 bump。
                             // 続く engine.handle_seek_request は adaptive ロジックで
                             // 「外部 bump 検知」となり、自身は bump せず state 更新のみ。
-                            // engine の InfoReceived ハンドラ内 resume 経路と二重に
-                            // 走ったとしても、後発側は observed (= bump 後) と
-                            // last_observed_serial (= 進行済) で外部判定 → 余計な
-                            // bump を避ける構造になっている。
                             //
                             // **意図的に apply_command(Play) は呼ばない**:
                             // open-time の resume は user 操作ではなく自動復元なので、
@@ -13484,6 +13503,47 @@ fn dummy_video_rx() -> crossbeam_channel::Receiver<VideoFrame> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resume_migration_resolves_raw_only_after_info_and_never_converts_media_twice() {
+        use crate::settings::VideoResumePosition::{LegacyRaw, Media};
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+            std::path::PathBuf::from("resume-origin.ts"),
+        );
+        let info = player.info.as_mut().unwrap();
+        info.duration_secs = 12.0;
+        info.timeline_origin_secs = 36000.0;
+        assert_eq!(
+            super::resolve_resume_for_info(Some(LegacyRaw(36004.0)), info),
+            Some(4.0)
+        );
+        assert_eq!(
+            super::resolve_resume_for_info(Some(LegacyRaw(35999.0)), info),
+            None
+        );
+        assert_eq!(
+            super::resolve_resume_for_info(Some(Media(4.0)), info),
+            Some(4.0)
+        );
+        assert_eq!(
+            super::resolve_resume_for_info(Some(LegacyRaw(36008.0)), info),
+            None
+        );
+        assert_eq!(
+            super::resolve_resume_for_info(Some(LegacyRaw(f64::NAN)), info),
+            None
+        );
+        // Files outside the corrected demuxers have an identity timeline, even with raw start > 0.
+        info.timeline_origin_secs = 0.0;
+        assert_eq!(
+            super::resolve_resume_for_info(Some(LegacyRaw(4.0)), info),
+            Some(4.0)
+        );
+        assert_eq!(
+            super::resolve_resume_for_info(Some(Media(4.0)), info),
+            Some(4.0)
+        );
+    }
+
     #[test]
     fn playback_start_user_seek_from_eof_emits_one_new_success_for_each_api() {
         use super::{PlaybackStartOrigin, SeekOrigin};
@@ -15543,7 +15603,7 @@ mod tests {
             let info = player.info.take().unwrap();
             let (info_tx, info_rx) = crossbeam_channel::bounded(1);
             player.decode.info_rx = info_rx;
-            player.pending_resume_secs = Some(12.0);
+            player.pending_resume_secs = Some(crate::settings::VideoResumePosition::Media(12.0));
             player.audio = Some(player.audio.take().unwrap().with_dsp_chain_for_test(
                 AudioDspChain {
                     user: None,
@@ -15594,7 +15654,7 @@ mod tests {
         let info = player.info.take().unwrap();
         let (info_tx, info_rx) = crossbeam_channel::bounded(1);
         player.decode.info_rx = info_rx;
-        player.pending_resume_secs = Some(12.0);
+        player.pending_resume_secs = Some(crate::settings::VideoResumePosition::Media(12.0));
         player.audio = Some(player.audio.take().unwrap().with_dsp_chain_for_test(
             AudioDspChain {
                 user: None,
