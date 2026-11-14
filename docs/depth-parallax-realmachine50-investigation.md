@@ -397,6 +397,8 @@ AppCreator で一度接続する `NativeWindowInputListener` に ROOT の既存 
 listener は mutex 外で入力 owner に lease を導入し、App / plugin を再入しない。
 Wgpu の ROOT `init_run_state` と child `initialize_window`、Glow の ROOT 初期化と child を接続する。
 immediate / deferred は両 backend の同じ native 生成点を通り、再生成・GC・suspend・終了も明示退役へ接続する。
+Wgpuのsuspend経路はnative leaseと旧WindowIdの撤去に接続済みだが、ROOTの論理入力の保持は未対応である。
+Windowsではwinitが`Suspended`を送らず当該helperもAndroid限定のため、独立レビュー（2026-11-14）のP2-2は設計担当判断で対象外として見送る。
 生成が `initialize_window` だけを通るという前提は Wgpu ROOT に当てはまらず、別の ROOT 生成点も接続した。
 独立実装レビューで、descriptor の `(registration, WindowId, HWND)` はすべて再利用され得るため、
 値だけでは App の host cache の寿命を表せない点も確認した。backend lease だけが strong を持つ
@@ -508,6 +510,64 @@ atomicな一意IDではない（winit 0.30.13 `platform_impl/windows/mod.rs:101`
 一方、winitのreentrant queueはWindowId付きEventのFIFOで、一般のallocation tag / purgeは持たない
 （`event_loop/runner.rs:208–253`）。任意のnested native pumpと数値再利用の組合せまで一般保証したとは扱わず、
 実機での配送確認は未実施として残す。通常経路で成立する証拠のない組合せのため、新しい待機・世代機構やwinit改変は追加しない。
+
+### 4.5 C 独立実装レビュー指摘の対応（2026-11-14）
+
+基準`dc0546d27`への独立レビュー（Sol / xhigh）のP2-1を、A後の`61495274a`で確認した。
+syntheticキーのDownは終端権限を登録する一方、physical Downでその権限を手放さず、
+後からnative allocationが退役すると旧Upが物理保持を解除していた。既存
+`terminal_synthetic_input_is_consumed_once_before_physical_takeover_and_real_discard`は、
+takeover後に退役するbranchのキー登録を省いていた。両branchで登録すると、次の空RawInputで
+`key_down(ArrowRight)`がfalseになることを確認した（1実行 / 0成功 / 1失敗、exit 100、
+`target/rm50-c2-red.log`）。
+
+修正は既存の`SyntheticLogicalGesture`とone-frame prepared transportの所有境界へ集約した。
+元RawInputのphysical KeyDownが同じlogical registration／keyのsynthetic保持を`Releasing`に移し、
+その入力hookの先頭で旧Upを一度消費してからphysical Downへ渡す。物理Downはfresh pressのままになり、
+以後のallocation退役はそのキーのUpを発行しない。別key／別registration／IMEは変更しない。
+通常timelineのUpも現存する所有権だけを消費し、repeatは所有の継続に限定して再取得に使わない。
+初回Downも既存physical保持へ割り込まない。producerの初回／repeat／Upの事実を
+`PreparedSyntheticKey`へ残し、eguiへ渡す`event.repeat=false`の従来規則は維持した。
+拒否した入力はprepared transportから除去し、discardで元のphysical eventが消えても再取得しない。
+新しいApp field、待ち、時間窓、再試行、repaint、native配送の変更はない。
+
+既存のsynthetic専用fixtureも、同じContext／実logical registrationを継続して使う前提へ揃えた。
+modifier順序の対照はphysical Aとsynthetic Enterを使い、今回禁止した同じkeyの共有を前提にしない。
+元のイベント順・modifiers・配送数のassertは維持する。追加5件は実plugin＋discardの4件と、
+兄弟registrationの所有を確認する1件で、takeover→再生成、無権限repeat／Up、既存physical保持、
+同frame physical tapを検査する。
+レビュー中の「値が等しい旧Upと新Upをまとめて削除する」P2は、受理列そのものをcacheへ保持する形へ
+修正し、旧Up→新Down→新Up＋実discardで両passのidleを固定した。
+独立ソースレビューはACCEPT、追加P1/P2なし（担当は編集・Cargo未実行）。
+
+P2-2は設計担当判断どおりコードを変更していない。lockfileのwinitはregistry版`0.30.13`で、
+その`src/platform_impl/windows/`全体に`Suspended`／`suspended`の発行箇所はない。
+Windowsの`event_loop/runner.rs:355`は初回`Resumed`だけを送る。
+`Suspended`のproducerはAndroid `mod.rs:218`、iOS `event_loop.rs:202`、
+Web `event_loop/runner.rs:230`にあり、API解説`application.rs`のplatform別記録とも一致した。
+eframeの`wgpu_integration.rs`の`drop_window`／`recreate_window`も`cfg(target_os="android")`である。
+実装前の`452eda75b`にもROOT viewport全体のremoveがあり、Cで新たに導入した挙動ではない。
+上流へ戻す際の論理入力保持の未対応点を`vendor/eframe/PATCHES.md`へ明記した。
+
+検証は指定`run-heavy.ps1`、Owner `codex/767-rm50-c2`、WorkDir `G:/home/mimageviewer-767s2`で直列実行した。
+レビュー修正のため型検査中に中断した1回は0件・exit 1であり、テスト失敗には数えない
+（`target/rm50-c2-compile-interrupted.log`）。書込不可警告後はrunner指定のBelowNormal・6 build jobsで続けた。
+
+| コマンド | 件数・exit code・証拠 |
+| --- | --- |
+| 修正前 `cargo nextest run -p mimageviewer --lib -E 'test(=key_input::tests::terminal_synthetic_input_is_consumed_once_before_physical_takeover_and_real_discard)' --no-fail-fast` | **1実行 / 0成功 / 1失敗、exit 100**。両側のsynthetic key登録を補った状態で再現。`target/rm50-c2-red.log` |
+| 最終 `cargo nextest run -p mimageviewer --lib -E 'test(/key_input\|synthetic\|realmachine50_\|native_focus\|detached/)' --no-fail-fast --test-threads 6` | **630実行 / 628成功（4 slow）/ 2失敗、exit 100**。125.050秒。追加5件・既存回帰の両branch・A/Cのrealmachine50回帰は成功。失敗は今回対象外の既知B2件のみで、JUnitでも完全名を照合した。`target/rm50-c2-focused.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **core 1対象、exit 0**。既存警告あり。`target/rm50-c2-check.log` |
+| 最後のCargo操作 `cargo fmt`（引数なし） | **exit 0**。`target/rm50-c2-fmt.log`。外側の`target/rm50-c2-wrapper.log`は既知B2件を許容してexit 0 |
+
+Bの失敗は`realmachine50_forwarded_open_without_dialog_retires_previous_live_owner`と
+`realmachine50_forwarded_open_after_independent_export_retires_previous_live_owner`。
+いずれも従来の旧Depth owner未退役のassertで、ignore／除外／期待の変更はしていない。
+
+変更ファイルは`src/key_input.rs`、本書、`docs/detached-rework-plan.md`、
+`docs/architecture-overview.md`、`vendor/eframe/PATCHES.md`。
+実機のkeyboard／IME／native再生成は未確認。製品起動・確認用build・全件gate・commit／pushは行わない。
+描画・UI文言は変更していない。
 
 ## 5. 退行の確認と補足2件
 

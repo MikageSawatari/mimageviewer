@@ -2003,19 +2003,6 @@ impl MaterializedSyntheticEvent {
             alt: self.modifiers.alt,
         }
     }
-
-    fn egui_event(self) -> egui::Event {
-        let key = self.key.egui_key();
-        egui::Event::Key {
-            key,
-            physical_key: Some(key),
-            pressed: self.pressed,
-            // Match egui-winit: egui derives repeat from viewport-local
-            // keys_down while processing the event stream.
-            repeat: false,
-            modifiers: self.modifiers.to_egui(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2756,6 +2743,61 @@ impl KeyInputState {
         }
     }
 
+    fn relinquish_synthetic_keys(
+        &mut self,
+        registration: egui::ViewportRegistration,
+        keys: &[egui::Key],
+    ) {
+        for gesture in &mut self.synthetic_logical_gestures {
+            if let SyntheticLogicalGesture::Held {
+                source,
+                registration: held_registration,
+                input: input @ SyntheticLogicalInput::Key { key, .. },
+            } = *gesture
+                && held_registration == registration
+                && keys.contains(&key)
+            {
+                // Finish the old level before the incoming physical Down. Its
+                // owner is consumed in this hook, never on a later retirement.
+                *gesture = SyntheticLogicalGesture::Releasing {
+                    source,
+                    registration,
+                    input,
+                };
+            }
+        }
+    }
+
+    fn admit_synthetic_key(
+        &mut self,
+        source: SyntheticRoutingTarget,
+        registration: egui::ViewportRegistration,
+        event: &PreparedSyntheticKey,
+        key_down_before: bool,
+    ) -> bool {
+        let input = SyntheticLogicalInput::Key {
+            key: event.key,
+            physical_key: event.physical_key,
+        };
+        let owned = self.synthetic_logical_gestures.iter().any(|gesture| {
+            matches!(gesture, SyntheticLogicalGesture::Held {
+                source: held_source, registration: held_registration, input: held_input,
+            } if *held_source == source && *held_registration == registration && held_input.same_slot(input))
+        });
+        match event.phase {
+            SyntheticKeyPhase::Repeat => owned,
+            SyntheticKeyPhase::Down if owned || !key_down_before => {
+                self.record_synthetic_logical_input(source, registration, input, true);
+                true
+            }
+            SyntheticKeyPhase::Up if owned => {
+                self.record_synthetic_logical_input(source, registration, input, false);
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn unregister_subclass(
         &mut self,
         hwnd_raw: u64,
@@ -2958,7 +3000,53 @@ impl From<Option<f64>> for RawInputTimeKey {
 #[derive(Clone, Debug)]
 struct SyntheticViewportBatch {
     target: SyntheticRoutingTarget,
-    events: Vec<egui::Event>,
+    events: Vec<PreparedSyntheticKey>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyntheticKeyPhase {
+    Down,
+    Repeat,
+    Up,
+}
+
+/// Keep the producer's phase until delivery. egui derives its own repeat flag,
+/// which cannot establish or restore synthetic release authority.
+#[derive(Clone, Debug, PartialEq)]
+struct PreparedSyntheticKey {
+    key: egui::Key,
+    physical_key: Option<egui::Key>,
+    modifiers: egui::Modifiers,
+    phase: SyntheticKeyPhase,
+}
+
+impl From<MaterializedSyntheticEvent> for PreparedSyntheticKey {
+    fn from(event: MaterializedSyntheticEvent) -> Self {
+        Self {
+            key: event.key.egui_key(),
+            physical_key: Some(event.key.egui_key()),
+            modifiers: event.modifiers.to_egui(),
+            phase: if !event.pressed {
+                SyntheticKeyPhase::Up
+            } else if event.repeat {
+                SyntheticKeyPhase::Repeat
+            } else {
+                SyntheticKeyPhase::Down
+            },
+        }
+    }
+}
+
+impl PreparedSyntheticKey {
+    fn egui_event(&self) -> egui::Event {
+        egui::Event::Key {
+            key: self.key,
+            physical_key: self.physical_key,
+            pressed: self.phase != SyntheticKeyPhase::Up,
+            repeat: false,
+            modifiers: self.modifiers,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3163,16 +3251,16 @@ impl SyntheticInputPlugin {
 
         let mut batches: Vec<SyntheticViewportBatch> = Vec::new();
         for event in materialized.events {
-            let egui_event = event.egui_event();
+            let prepared_event = PreparedSyntheticKey::from(event);
             if let Some(batch) = batches
                 .iter_mut()
                 .find(|batch| batch.target == event.target)
             {
-                batch.events.push(egui_event);
+                batch.events.push(prepared_event);
             } else {
                 batches.push(SyntheticViewportBatch {
                     target: event.target,
-                    events: vec![egui_event],
+                    events: vec![prepared_event],
                 });
             }
         }
@@ -3243,34 +3331,37 @@ impl SyntheticInputPlugin {
             append_modifiers(&mut input.events, prepared.final_modifiers);
             return;
         };
+        let Some(registration) = ctx.viewport_registration(input.viewport_id) else {
+            return;
+        };
+        let mut admitted = Vec::new();
         for event in &batch.events {
-            if let egui::Event::Key { modifiers, .. } = event {
-                append_modifiers(&mut input.events, *modifiers);
+            let key_down_before = input.events.iter().fold(
+                ctx.input_for(input.viewport_id, |state| state.key_down(event.key)),
+                |down, existing| match existing {
+                    egui::Event::Key { key, pressed, .. } if *key == event.key => *pressed,
+                    _ => down,
+                },
+            );
+            let deliver = state().lock().is_ok_and(|mut guard| {
+                guard.admit_synthetic_key(batch.target, registration, event, key_down_before)
+            });
+            if deliver {
+                append_modifiers(&mut input.events, event.modifiers);
+                input.events.push(event.egui_event());
+                admitted.push(event);
             }
-            input.events.push(event.clone());
         }
-        if let Some(registration) = ctx.viewport_registration(input.viewport_id)
-            && let Ok(mut guard) = state().lock()
+        // Admission belongs to this one-frame transport. A discard replay must
+        // not reacquire a key whose physical input was present only in pass one.
+        if admitted.len() != batch.events.len()
+            && let Some(mut frame) = self.prepared.as_ref().and_then(|frame| frame.lock().ok())
+            && let Some(batch) = frame
+                .batches
+                .iter_mut()
+                .find(|cached| cached.target == batch.target)
         {
-            for event in &batch.events {
-                if let egui::Event::Key {
-                    key,
-                    physical_key,
-                    pressed,
-                    ..
-                } = event
-                {
-                    guard.record_synthetic_logical_input(
-                        batch.target,
-                        registration,
-                        SyntheticLogicalInput::Key {
-                            key: *key,
-                            physical_key: *physical_key,
-                        },
-                        *pressed,
-                    );
-                }
-            }
+            batch.events = admitted.iter().map(|event| (*event).clone()).collect();
         }
         append_modifiers(&mut input.events, prepared.final_modifiers);
         if !prepared.delivered_viewports.contains(&input.viewport_id) {
@@ -3278,14 +3369,14 @@ impl SyntheticInputPlugin {
             if crate::test_script::release_checks::is_active() {
                 let hwnd = eframe::miv_test_script_window_witness::latest(input.viewport_id)
                     .map(|w| w.hwnd());
-                for event in &batch.events {
+                for event in admitted {
                     if let egui::Event::Key {
                         key,
                         pressed,
                         repeat,
                         modifiers,
                         ..
-                    } = event
+                    } = event.egui_event()
                     {
                         let name = match key {
                             egui::Key::ArrowDown => "Down",
@@ -3304,6 +3395,35 @@ impl SyntheticInputPlugin {
             }
             if let Some(mut frame) = self.prepared.as_ref().and_then(|frame| frame.lock().ok()) {
                 frame.delivered_viewports.push(input.viewport_id);
+            }
+        }
+    }
+
+    fn hand_off_keys_to_physical_input(&mut self, ctx: &egui::Context, input: &egui::RawInput) {
+        let keys: Vec<_> = input
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::Key {
+                    key, pressed: true, ..
+                } => Some(*key),
+                _ => None,
+            })
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+        let Some(registration) = ctx.viewport_registration(input.viewport_id) else {
+            return;
+        };
+        if let Ok(mut guard) = state().lock() {
+            guard.relinquish_synthetic_keys(registration, &keys);
+        }
+        if let Some(mut frame) = self.prepared.as_ref().and_then(|frame| frame.lock().ok()) {
+            for batch in &mut frame.batches {
+                if batch.target.viewport == input.viewport_id {
+                    batch.events.retain(|event| !keys.contains(&event.key));
+                }
             }
         }
     }
@@ -3578,6 +3698,7 @@ impl egui::Plugin for SyntheticInputPlugin {
         }
         #[cfg(all(windows, any(test, feature = "test-script")))]
         self.reject_physical_pointer_mix(input);
+        self.hand_off_keys_to_physical_input(ctx, input);
         self.inject_logical_releases(ctx, input);
         self.inject_prepared(ctx, input);
         #[cfg(all(windows, any(test, feature = "test-script")))]
@@ -6686,12 +6807,52 @@ mod tests {
         input
     }
 
-    fn run_input_hook(plugin: &mut SyntheticInputPlugin, input: &mut egui::RawInput) {
-        <SyntheticInputPlugin as egui::Plugin>::input_hook(
-            plugin,
-            &egui::Context::default(),
-            input,
-        );
+    fn synthetic_test_context(viewports: &[egui::ViewportId]) -> egui::Context {
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            for &viewport in viewports {
+                if viewport != egui::ViewportId::ROOT {
+                    ui.ctx()
+                        .show_viewport_deferred(viewport, Default::default(), |_, _| {});
+                }
+            }
+        })
+        .drop_without_applying_deltas();
+        ctx
+    }
+
+    fn prepared_key(event: egui::Event) -> super::PreparedSyntheticKey {
+        let egui::Event::Key {
+            key,
+            physical_key,
+            pressed,
+            repeat,
+            modifiers,
+        } = event
+        else {
+            panic!("synthetic key fixture requires a key event");
+        };
+        super::PreparedSyntheticKey {
+            key,
+            physical_key,
+            modifiers,
+            phase: if !pressed {
+                super::SyntheticKeyPhase::Up
+            } else if repeat {
+                super::SyntheticKeyPhase::Repeat
+            } else {
+                super::SyntheticKeyPhase::Down
+            },
+        }
+    }
+
+    fn run_input_hook(
+        ctx: &egui::Context,
+        plugin: &mut SyntheticInputPlugin,
+        input: &mut egui::RawInput,
+    ) {
+        <SyntheticInputPlugin as egui::Plugin>::input_hook(plugin, ctx, input);
     }
 
     fn raw_edge(virtual_key: u32, pressed: bool) -> RawKeyEdge {
@@ -7453,14 +7614,14 @@ mod tests {
                         hwnd: 0x830,
                         viewport,
                     },
-                    events: vec![key.clone()],
+                    events: vec![prepared_key(key.clone())],
                 },
                 super::SyntheticViewportBatch {
                     target: super::SyntheticRoutingTarget {
                         hwnd: 0x840,
                         viewport: sibling,
                     },
-                    events: vec![key.clone()],
+                    events: vec![prepared_key(key.clone())],
                 },
             ],
             hold_attributions: vec![(viewport, 1), (sibling, 2)],
@@ -7506,8 +7667,9 @@ mod tests {
         replacement.events.push(received.clone());
         plugin.inject_prepared(&egui::Context::default(), &mut replacement);
         assert_eq!(replacement.events, vec![received]);
+        let ctx = synthetic_test_context(&[sibling]);
         let mut sibling_input = raw_input(sibling, 1.0, true);
-        plugin.inject_prepared(&egui::Context::default(), &mut sibling_input);
+        plugin.inject_prepared(&ctx, &mut sibling_input);
         assert_eq!(sibling_input.events, vec![key]);
     }
 
@@ -7589,14 +7751,14 @@ mod tests {
             batches: vec![
                 super::SyntheticViewportBatch {
                     target: super::SyntheticRoutingTarget { hwnd, viewport },
-                    events: vec![key(egui::Key::ArrowRight, true)],
+                    events: vec![prepared_key(key(egui::Key::ArrowRight, true))],
                 },
                 super::SyntheticViewportBatch {
                     target: super::SyntheticRoutingTarget {
                         hwnd: sibling_hwnd,
                         viewport: egui::ViewportId::ROOT,
                     },
-                    events: vec![key(egui::Key::ArrowLeft, true)],
+                    events: vec![prepared_key(key(egui::Key::ArrowLeft, true))],
                 },
             ],
             hold_attributions: Vec::new(),
@@ -7829,17 +7991,15 @@ mod tests {
                     super::SyntheticLogicalInput::Primary { owner: widget_id },
                     true,
                 );
-                if retire_before_takeover {
-                    input.record_synthetic_logical_input(
-                        source,
-                        registration,
-                        super::SyntheticLogicalInput::Key {
-                            key: egui::Key::ArrowRight,
-                            physical_key: Some(egui::Key::ArrowRight),
-                        },
-                        true,
-                    );
-                }
+                input.record_synthetic_logical_input(
+                    source,
+                    registration,
+                    super::SyntheticLogicalInput::Key {
+                        key: egui::Key::ArrowRight,
+                        physical_key: Some(egui::Key::ArrowRight),
+                    },
+                    true,
+                );
                 let old = input
                     .installed_hwnds
                     .registration(0x870)
@@ -7904,6 +8064,389 @@ mod tests {
                 "the successor's real physical click still completes normally"
             );
         }
+    }
+
+    fn synthetic_key_event(key: egui::Key, pressed: bool, repeat: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed,
+            repeat,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn prepare_key_delivery(
+        ctx: &egui::Context,
+        target: super::SyntheticRoutingTarget,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) {
+        ctx.plugin::<SyntheticInputPlugin>().lock().prepared = Some(super::Arc::new(
+            super::Mutex::new(super::PreparedSyntheticFrame {
+                frame_nr: time as u64,
+                time_key: super::RawInputTimeKey::from(Some(time)),
+                raw_input_time: Some(time),
+                batches: vec![super::SyntheticViewportBatch {
+                    target,
+                    events: events.into_iter().map(prepared_key).collect(),
+                }],
+                hold_attributions: Vec::new(),
+                delivered_viewports: Vec::new(),
+                final_modifiers: egui::Modifiers::NONE,
+                armed: true,
+                #[cfg(windows)]
+                pointer_delivery: super::PreparedSyntheticPointerDelivery::Absent,
+            }),
+        ));
+    }
+
+    #[test]
+    fn synthetic_key_physical_takeover_survives_repeat_up_and_native_recreation() {
+        let _serial = lock_test_input();
+        let _cleanup = ClearSyntheticInput;
+        let ctx = egui::Context::default();
+        ctx.add_plugin(SyntheticInputPlugin::default());
+        crate::ime_focus::install_ime_input_policy(&ctx);
+        let viewport = egui::ViewportId::ROOT;
+        let source = super::SyntheticRoutingTarget {
+            hwnd: 0x871,
+            viewport,
+        };
+        state().lock().unwrap().register_hwnd(source.hwnd, viewport);
+        prepare_key_delivery(
+            &ctx,
+            source,
+            1.0,
+            vec![
+                synthetic_key_event(egui::Key::ArrowRight, true, false),
+                synthetic_key_event(egui::Key::ArrowLeft, true, false),
+            ],
+        );
+        let mut first = raw_input(viewport, 1.0, true);
+        first.events = vec![
+            synthetic_key_event(egui::Key::A, true, false),
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+        ];
+        ctx.run_ui(first, |ui| {
+            assert!(ui.input(|input| input.key_down(egui::Key::ArrowRight)
+                && input.key_down(egui::Key::ArrowLeft)));
+        })
+        .drop_without_applying_deltas();
+        prepare_key_delivery(
+            &ctx,
+            source,
+            2.0,
+            vec![
+                synthetic_key_event(egui::Key::ArrowRight, true, true),
+                synthetic_key_event(egui::Key::ArrowRight, false, false),
+            ],
+        );
+        let mut takeover = raw_input(viewport, 2.0, true);
+        takeover.events = vec![
+            synthetic_key_event(egui::Key::ArrowRight, true, false),
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "継続".into(),
+                active_range_chars: None,
+            }),
+        ];
+        let mut passes = 0;
+        ctx.run_ui(takeover, |ui| {
+            passes += 1;
+            assert!(ui.input(|input| input.key_down(egui::Key::ArrowRight)));
+            if passes == 1 {
+                let right = ui.input(|input| {
+                    input
+                        .raw
+                        .events
+                        .iter()
+                        .filter_map(|event| match event {
+                            egui::Event::Key {
+                                key: egui::Key::ArrowRight,
+                                pressed,
+                                repeat,
+                                ..
+                            } => Some((*pressed, *repeat)),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                });
+                assert_eq!(
+                    right,
+                    [(false, false), (true, false)],
+                    "old owner ends before the fresh physical Down"
+                );
+                ui.ctx().request_discard("synthetic key physical handoff");
+            }
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(passes, 2);
+        {
+            let mut input = state().lock().unwrap();
+            input.unregister_hwnd(source.hwnd);
+            input.register_hwnd(source.hwnd, viewport);
+        }
+        // No replacement Down is supplied: the previous physical level itself
+        // must survive, while the unrelated synthetic key ends normally.
+        ctx.run_ui(raw_input(viewport, 3.0, true), |ui| {
+            assert!(ui.input(
+                |input| input.key_down(egui::Key::ArrowRight) && input.key_down(egui::Key::A)
+            ));
+            assert!(!ui.input(|input| input.key_down(egui::Key::ArrowLeft)));
+            assert!(crate::ime_focus::ime_input_active_in_viewport(
+                ui.ctx(),
+                viewport
+            ));
+        })
+        .drop_without_applying_deltas();
+        // A later old timeline repeat/Up cannot reacquire terminal authority.
+        prepare_key_delivery(
+            &ctx,
+            source,
+            4.0,
+            vec![
+                synthetic_key_event(egui::Key::ArrowRight, true, true),
+                synthetic_key_event(egui::Key::ArrowRight, false, false),
+            ],
+        );
+        ctx.run_ui(raw_input(viewport, 4.0, true), |ui| {
+            assert!(ui.input(|input| {
+                input
+                    .raw
+                    .events
+                    .iter()
+                    .all(|event| !matches!(event, egui::Event::Key { .. }))
+            }));
+            assert!(ui.input(|input| input.key_down(egui::Key::ArrowRight)));
+        })
+        .drop_without_applying_deltas();
+        let mut up = raw_input(viewport, 5.0, true);
+        up.events
+            .push(synthetic_key_event(egui::Key::ArrowRight, false, false));
+        ctx.run_ui(up, |ui| {
+            assert!(!ui.input(|input| input.key_down(egui::Key::ArrowRight)))
+        })
+        .drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn synthetic_key_down_cannot_acquire_a_retained_physical_key() {
+        let _serial = lock_test_input();
+        let _cleanup = ClearSyntheticInput;
+        let ctx = egui::Context::default();
+        ctx.add_plugin(SyntheticInputPlugin::default());
+        let source = super::SyntheticRoutingTarget {
+            hwnd: 0x872,
+            viewport: egui::ViewportId::ROOT,
+        };
+        state()
+            .lock()
+            .unwrap()
+            .register_hwnd(source.hwnd, source.viewport);
+        let mut physical = raw_input(source.viewport, 1.0, true);
+        physical
+            .events
+            .push(synthetic_key_event(egui::Key::ArrowRight, true, false));
+        ctx.run_ui(physical, |_| {}).drop_without_applying_deltas();
+        prepare_key_delivery(
+            &ctx,
+            source,
+            2.0,
+            vec![synthetic_key_event(egui::Key::ArrowRight, true, false)],
+        );
+        let mut passes = 0;
+        ctx.run_ui(raw_input(source.viewport, 2.0, true), |ui| {
+            passes += 1;
+            assert!(ui.input(|input| input.key_down(egui::Key::ArrowRight)));
+            assert!(ui.input(|input| {
+                input
+                    .raw
+                    .events
+                    .iter()
+                    .all(|event| !matches!(event, egui::Event::Key { .. }))
+            }));
+            if passes == 1 {
+                ui.ctx().request_discard("physical key already owns level");
+            }
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(passes, 2);
+        state().lock().unwrap().unregister_hwnd(source.hwnd);
+        ctx.run_ui(raw_input(source.viewport, 3.0, true), |ui| {
+            assert!(ui.input(|input| input.key_down(egui::Key::ArrowRight)))
+        })
+        .drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn synthetic_key_physical_tap_rejection_is_stable_through_discard() {
+        let _serial = lock_test_input();
+        let _cleanup = ClearSyntheticInput;
+        let ctx = egui::Context::default();
+        ctx.add_plugin(SyntheticInputPlugin::default());
+        let source = super::SyntheticRoutingTarget {
+            hwnd: 0x873,
+            viewport: egui::ViewportId::ROOT,
+        };
+        state()
+            .lock()
+            .unwrap()
+            .register_hwnd(source.hwnd, source.viewport);
+        prepare_key_delivery(
+            &ctx,
+            source,
+            1.0,
+            vec![synthetic_key_event(egui::Key::ArrowRight, true, false)],
+        );
+        let mut physical = raw_input(source.viewport, 1.0, true);
+        physical.events = vec![
+            synthetic_key_event(egui::Key::ArrowRight, true, false),
+            synthetic_key_event(egui::Key::ArrowRight, false, false),
+        ];
+        let mut passes = 0;
+        ctx.run_ui(physical, |ui| {
+            passes += 1;
+            assert!(!ui.input(|input| input.key_down(egui::Key::ArrowRight)));
+            if passes == 1 {
+                ui.ctx()
+                    .request_discard("physical tap cannot become a synthetic hold");
+            }
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(passes, 2);
+        // A fresh synthetic operation can acquire the now idle key normally.
+        prepare_key_delivery(
+            &ctx,
+            source,
+            2.0,
+            vec![synthetic_key_event(egui::Key::ArrowRight, true, false)],
+        );
+        ctx.run_ui(raw_input(source.viewport, 2.0, true), |ui| {
+            assert!(ui.input(|input| input.key_down(egui::Key::ArrowRight)))
+        })
+        .drop_without_applying_deltas();
+        prepare_key_delivery(
+            &ctx,
+            source,
+            3.0,
+            vec![synthetic_key_event(egui::Key::ArrowRight, false, false)],
+        );
+        ctx.run_ui(raw_input(source.viewport, 3.0, true), |ui| {
+            assert!(!ui.input(|input| input.key_down(egui::Key::ArrowRight)))
+        })
+        .drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn synthetic_key_takeover_keeps_other_registration_authority() {
+        let _serial = lock_test_input();
+        let _cleanup = ClearSyntheticInput;
+        let child = egui::ViewportId::from_hash_of("synthetic-key-sibling");
+        let ctx = synthetic_test_context(&[child]);
+        let root = ctx.viewport_registration(egui::ViewportId::ROOT).unwrap();
+        let sibling = ctx.viewport_registration(child).unwrap();
+        let slot = super::SyntheticLogicalInput::Key {
+            key: egui::Key::ArrowRight,
+            physical_key: Some(egui::Key::ArrowRight),
+        };
+        let mut input = state().lock().unwrap();
+        for (hwnd, registration) in [(0x874, root), (0x875, sibling)] {
+            input.record_synthetic_logical_input(
+                super::SyntheticRoutingTarget {
+                    hwnd,
+                    viewport: registration.viewport_id(),
+                },
+                registration,
+                slot,
+                true,
+            );
+        }
+        input.relinquish_synthetic_keys(root, &[egui::Key::ArrowRight]);
+        assert_eq!(
+            input.take_synthetic_logical_terminations(root.viewport_id(), |_| true),
+            [(root, slot)]
+        );
+        assert!(
+            input
+                .take_synthetic_logical_terminations(child, |_| true)
+                .is_empty()
+        );
+        assert!(input.admit_synthetic_key(
+            super::SyntheticRoutingTarget {
+                hwnd: 0x875,
+                viewport: child
+            },
+            sibling,
+            &prepared_key(synthetic_key_event(egui::Key::ArrowRight, false, false)),
+            true
+        ));
+    }
+
+    #[test]
+    fn synthetic_key_rejected_old_up_keeps_equal_new_up_through_discard() {
+        let _serial = lock_test_input();
+        let _cleanup = ClearSyntheticInput;
+        let ctx = egui::Context::default();
+        ctx.add_plugin(SyntheticInputPlugin::default());
+        let source = super::SyntheticRoutingTarget {
+            hwnd: 0x876,
+            viewport: egui::ViewportId::ROOT,
+        };
+        state()
+            .lock()
+            .unwrap()
+            .register_hwnd(source.hwnd, source.viewport);
+        prepare_key_delivery(
+            &ctx,
+            source,
+            1.0,
+            vec![synthetic_key_event(egui::Key::ArrowRight, true, false)],
+        );
+        ctx.run_ui(raw_input(source.viewport, 1.0, true), |_| {})
+            .drop_without_applying_deltas();
+        for (time, pressed) in [(2.0, true), (3.0, false)] {
+            let mut physical = raw_input(source.viewport, time, true);
+            physical
+                .events
+                .push(synthetic_key_event(egui::Key::ArrowRight, pressed, false));
+            ctx.run_ui(physical, |_| {}).drop_without_applying_deltas();
+        }
+        prepare_key_delivery(
+            &ctx,
+            source,
+            4.0,
+            vec![
+                synthetic_key_event(egui::Key::ArrowRight, false, false),
+                synthetic_key_event(egui::Key::ArrowRight, true, false),
+                synthetic_key_event(egui::Key::ArrowRight, false, false),
+            ],
+        );
+        let mut passes = 0;
+        ctx.run_ui(raw_input(source.viewport, 4.0, true), |ui| {
+            passes += 1;
+            assert!(
+                !ui.input(|input| input.key_down(egui::Key::ArrowRight)),
+                "pass={passes}: the fresh hold must retain its own Up"
+            );
+            assert_eq!(
+                ui.input(|input| input
+                    .raw
+                    .events
+                    .iter()
+                    .filter_map(|event| match event {
+                        egui::Event::Key { pressed, .. } => Some(*pressed),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()),
+                [true, false]
+            );
+            if passes == 1 {
+                ui.ctx()
+                    .request_discard("distinct old/new Up have equal payloads");
+            }
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(passes, 2);
     }
 
     #[cfg(windows)]
@@ -8011,13 +8554,14 @@ mod tests {
             SyntheticNavigationKey::Right,
         ));
 
+        let ctx = synthetic_test_context(&[viewport]);
         let mut plugin = SyntheticInputPlugin::default();
         let mut root = raw_input(egui::ViewportId::ROOT, 1.0, true);
         root.viewports.entry(viewport).or_default().focused = Some(true);
-        run_input_hook(&mut plugin, &mut root);
+        run_input_hook(&ctx, &mut plugin, &mut root);
         assert!(root.events.is_empty());
         let mut child = raw_input(viewport, 1.0, true);
-        run_input_hook(&mut plugin, &mut child);
+        run_input_hook(&ctx, &mut plugin, &mut child);
 
         let edges: Vec<_> = state()
             .lock()
@@ -8316,16 +8860,17 @@ mod tests {
             },
         ));
 
+        let ctx = egui::Context::default();
         let mut plugin = SyntheticInputPlugin::default();
         let mut first = raw_input(egui::ViewportId::ROOT, 7.0, true);
-        run_input_hook(&mut plugin, &mut first);
+        run_input_hook(&ctx, &mut plugin, &mut first);
         let pending_after_first = state()
             .lock()
             .expect("key input state poisoned")
             .pending
             .len();
         let mut second = raw_input(egui::ViewportId::ROOT, 7.0, true);
-        run_input_hook(&mut plugin, &mut second);
+        run_input_hook(&ctx, &mut plugin, &mut second);
         let pending_after_second = state()
             .lock()
             .expect("key input state poisoned")
@@ -8395,14 +8940,14 @@ mod tests {
     fn synthetic_modifier_changes_precede_their_edges_without_rewriting_received_keys() {
         let _serial = lock_test_input();
         let ctx = egui::Context::default();
-        let key = |modifiers, pressed| egui::Event::Key {
-            key: egui::Key::Enter,
+        let key = |key, modifiers, pressed| egui::Event::Key {
+            key,
             physical_key: None,
             pressed,
             repeat: false,
             modifiers,
         };
-        let received = key(egui::Modifiers::ALT, true);
+        let received = key(egui::Key::A, egui::Modifiers::ALT, true);
         let mut plugin = SyntheticInputPlugin {
             prepared: Some(super::Arc::new(super::Mutex::new(
                 super::PreparedSyntheticFrame {
@@ -8415,8 +8960,8 @@ mod tests {
                             viewport: egui::ViewportId::ROOT,
                         },
                         events: vec![
-                            key(egui::Modifiers::CTRL, true),
-                            key(egui::Modifiers::NONE, false),
+                            prepared_key(key(egui::Key::Enter, egui::Modifiers::CTRL, true)),
+                            prepared_key(key(egui::Key::Enter, egui::Modifiers::NONE, false)),
                         ],
                     }],
                     hold_attributions: Vec::new(),
@@ -8443,9 +8988,9 @@ mod tests {
                 egui::Event::ModifiersChanged(egui::Modifiers::ALT),
                 received,
                 egui::Event::ModifiersChanged(egui::Modifiers::CTRL),
-                key(egui::Modifiers::CTRL, true),
+                key(egui::Key::Enter, egui::Modifiers::CTRL, true),
                 egui::Event::ModifiersChanged(egui::Modifiers::NONE),
-                key(egui::Modifiers::NONE, false),
+                key(egui::Key::Enter, egui::Modifiers::NONE, false),
             ]
         );
         ctx.begin_pass(input);
@@ -8465,13 +9010,14 @@ mod tests {
             SyntheticModifiers::default(),
         ));
 
+        let ctx = synthetic_test_context(&[viewport]);
         let mut undrawn_plugin = SyntheticInputPlugin::default();
         let mut first_root = raw_input(egui::ViewportId::ROOT, 10.0, true);
         first_root.viewports.entry(viewport).or_default().focused = Some(true);
-        run_input_hook(&mut undrawn_plugin, &mut first_root);
+        run_input_hook(&ctx, &mut undrawn_plugin, &mut first_root);
         let mut next_root = raw_input(egui::ViewportId::ROOT, 11.0, true);
         next_root.viewports.entry(viewport).or_default().focused = Some(true);
-        run_input_hook(&mut undrawn_plugin, &mut next_root);
+        run_input_hook(&ctx, &mut undrawn_plugin, &mut next_root);
         assert!(undrawn_plugin.issues.iter().any(|issue| matches!(
             issue,
             SyntheticInputIssue::TargetViewportNotRendered {
@@ -8491,16 +9037,16 @@ mod tests {
         let mut focus_plugin = SyntheticInputPlugin::default();
         let mut focused_root = raw_input(egui::ViewportId::ROOT, 20.0, true);
         focused_root.viewports.entry(viewport).or_default().focused = Some(true);
-        run_input_hook(&mut focus_plugin, &mut focused_root);
+        run_input_hook(&ctx, &mut focus_plugin, &mut focused_root);
         let mut focused_child = raw_input(viewport, 20.0, true);
-        run_input_hook(&mut focus_plugin, &mut focused_child);
+        run_input_hook(&ctx, &mut focus_plugin, &mut focused_child);
         assert!(physical_key_down(PhysicalKeySlot::new(0x23, false)));
 
         let mut blurred_root = raw_input(egui::ViewportId::ROOT, 21.0, true);
         blurred_root.viewports.entry(viewport).or_default().focused = Some(false);
-        run_input_hook(&mut focus_plugin, &mut blurred_root);
+        run_input_hook(&ctx, &mut focus_plugin, &mut blurred_root);
         let mut blurred_child = raw_input(viewport, 21.0, false);
-        run_input_hook(&mut focus_plugin, &mut blurred_child);
+        run_input_hook(&ctx, &mut focus_plugin, &mut blurred_child);
         assert!(!physical_key_down(PhysicalKeySlot::new(0x23, false)));
         assert!(matches!(
             blurred_child.events.as_slice(),

@@ -348,6 +348,7 @@ Eqはweak pointer identityで判定する。既存Copy descriptor queryは互換
   Viewport ownerのDropはnative windowのArc保持とは独立に入力leaseを明示終了する。
   backend shutdownも入力とsource mapsを明示退役し、初期化失敗等のDropは同じ冪等終了を使う。
   Android suspendも同じnative退役へ接続し、Glowの論理入力はState置換前に保持する。
+  上流移植時の注意: Wgpu suspendでのROOT論理入力保持は未対応（WindowsではwinitがSuspendedを送らず、2026-11-14独立レビューP2-2は設計担当判断で対象外）。
 - producer factory/owned leaseはheadless backendにも同じregistry経路を提供する。
   test-script window witnessやgeometryを製品の入力登録正本として使わない。
 

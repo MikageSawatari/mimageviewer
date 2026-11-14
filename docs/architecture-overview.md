@@ -655,6 +655,7 @@ Active時に蓄積した入力を新deferred callbackへ再所属させないた
 完了したclick／tapをactivation intentへ送る。State再生成時の保留RawInput・IME終端は一括clearせず保持する。
 logical targetはその窓のregistrationの終端／Manager dropで退役し、native allocationの再生成では維持する。
 既に egui に渡した synthetic Primary は通常入力境界で対象 button / widget の所有だけを一度取り消し、通常の click / drag 完了を発生させない。
+synthetic keyもlogical registration／key単位で終端権限を持ち、physical Downへの移譲後は旧repeat／Upで保持を再取得・解除しない。
 
 ### 補正 / 編集 / AI
 

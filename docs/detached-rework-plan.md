@@ -1458,6 +1458,10 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-14: §1.767 サブPC依頼50 C 独立レビュー P2 対応
+
+設計担当と独立レビュー（Sol / xhigh）が構造修正に合意した範囲で、synthetic keyの終端権限をphysical takeoverで同registration／keyから移譲し、旧repeat／Upが再取得・解除しない所有境界へ集約した（BA-1／BA-7）。App field・待ち・retryは追加せず、Aの復帰・backend hookは変更しない。Wgpu suspendのROOT論理入力保持はWindows対象外として設計担当判断で見送り。根拠・回帰・検証は[依頼50調査書 §4.5](depth-parallax-realmachine50-investigation.md#45-c-独立実装レビュー指摘の対応2026-11-14)。
+
 ### 2026-11-14: §1.767 サブPC依頼50 A — Parked静止画の復帰を離散入力へ集約
 
 設計担当と独立設計レビュー（Sol / xhigh、2026-11-14）が、BA-7の入力所有・確定点を直す構造的な変更であることに合意した。
