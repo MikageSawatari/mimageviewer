@@ -13,6 +13,7 @@
 - 開発機の ffprobe で作った合成 TS (`-output_ts_offset 36000`): format start_time=36001.376778、duration=6.023222。
 - 同梱 avformat で `AVFMT_TS_DISCONT` を持つ demuxer を列挙した結果 (2026-11-14、python ctypes):
   `mpegts`、`mpegtsraw`、`mpeg` (MPEG-PS)、`ogg`、`m4v`、`dhav`、`live_flv`、`hls`、`rcwt`、`ty`。
+  この flag は原点の判定には使わない (§2)。
 - 実機での再生挙動は**未確認** (エージェントは製品バイナリを起動しない)。下の「壊れ方」はコードから導いたもの。
 
 O = コンテナの開始時刻 (`AVFormatContext.start_time`)、D = `VideoInfo.duration_secs` (= `AVFormatContext.duration`)。
@@ -59,10 +60,16 @@ O = コンテナの開始時刻 (`AVFormatContext.start_time`)、D = `VideoInfo.
 保存値 = メディア時刻で、seek できる範囲は `[0, D]`。**
 
 - **O_eff** (原点) は次で決める。
-  - demuxer (`AVInputFormat.flags`) が `AVFMT_TS_DISCONT` を持つ (時刻が自由に走る時計の値で、コンテナに 0 が無い):
-    O_eff = `AVFormatContext.start_time`。`AV_NOPTS_VALUE` または有限でない値なら 0。
-  - それ以外 (MP4・MKV・MP3・AVI・FLAC 等): O_eff = 0 (今の挙動のまま)。
-  この判定は FFmpeg 自身の分類を使い、拡張子や形式名の一覧は持たない。
+  - demuxer 名 (`AVInputFormat.name`) が `mpegts`・`mpegtsraw`・`mpeg` (MPEG-PS) のどれか: O_eff =
+    `AVFormatContext.start_time`。`AV_NOPTS_VALUE` または有限でない値なら 0。これらは時刻が自由に走る時計の値で
+    コンテナに 0 が無く、長さを持つ header も無いので、FFmpeg が PTS から `end − start` として長さを推定する。
+  - それ以外 (MP4・MKV・MP3・Ogg・FLV・AVI・FLAC 等): O_eff = 0 (今の挙動のまま)。
+  対象 demuxer の一覧は `MediaTimeline` の中だけに 1 つ置き、「長さが `end − start` であることを確かめた
+  demuxer」として理由を書く。足すときは、その demuxer の長さの決め方を FFmpeg のソースで確かめてからにする。
+  `AVFMT_TS_DISCONT` (時刻の不連続を許すだけの flag) では判定しない。`live_flv` のように flag を持ちながら
+  metadata の長さや最後の tag の raw 時刻を長さにする demuxer があり、補正すると EOF と長さが食い違う。
+  Ogg も flag を持ち、`-output_ts_offset` で開始 ≠ 0 の Ogg を作れるが、通常のファイルは開始 0 で今の不具合の
+  報告も無いので対象外にする。
 - O_eff が 0 のファイル (TS/PS 以外の全部と、開始 0 の TS/PS) では変換は恒等で、挙動は変わらない。
 - raw PTS は **FFmpeg を直接呼ぶ箇所の中だけ**に閉じる。変換は新しい型 `MediaTimeline`
   (`src/video/media_timeline.rs`) のメソッドだけで行い、`start_time` を読む箇所・O_eff を足し引きする箇所を
@@ -142,15 +149,29 @@ O_eff ≠ 0 のファイル (MPEG-TS / PS 系) だけ。
   (`native_video.rs` の一括登録) や時刻指定 (`add_native_video_bookmark` の `target_secs`) で付けたもの
   (0 起点の値) が同じ列に混ざり、区別できない。一律に O を引くと後者を壊す。
 
-**判断 (利用者確認待ち、2026-11-14)**: 初回の質問 (移行しない) は「O が大きいと有効な保存値はほぼ無い」という
-誤った前提で答えてもらったため、上の訂正を添えて取り直している。案は A: 続きから再生だけ移行 (行に変換済みの印を
-足し、O_eff ≠ 0 のファイルを開いたとき旧行を −O_eff。値 < O_eff の旧行は raw としてあり得ないので捨てる)、
-ブックマーク・ピンは移行しない。B: どれも移行しない。回答に従ってこの節を確定させる。
+**判断 (利用者決定、2026-11-14、統括経由)**: 続きから再生だけ移行し、ブックマーク・ピンは移行しない。
+初回は「O が大きいと有効な保存値はほぼ無い」という誤った前提で「移行しない」と答えてもらったため、上の訂正を
+添えて取り直した。
+
+- 続きから再生: `video_resume_positions` に「メディア時刻で保存した」印の列を足す (旧行は印なし)。新しく保存する
+  行は印付き。**印は「その値が実際にメディア時刻で書かれた」ときだけ付ける**。今の保存は表を全削除して map の
+  全件を INSERT し直す (`settings_db.rs` の全量保存) ので、map と全量の読み書きでも旧 raw / メディア時刻の区別を
+  保ち、開いていない動画の旧 raw 行を別の設定保存のついでに印付きへ変えない。読み込んだ値は「メディア時刻」か「旧 raw」かを型で持ったまま (bool や sentinel にしない) player
+  へ渡し、O_eff が分かる既存の復元判定の時点 (`sanitize_resume_for_duration` の呼び出し元、`VideoInfo` 受領時) で
+  旧 raw を `value − O_eff` に変換してから判定する。O_eff = 0 なら値はそのまま。値 < O_eff の旧 raw は再生位置と
+  してあり得ないので復元しない。行の書き直しは専用の経路を作らず、既存の定期保存 (印付き) に任せる
+  (保存されないまま閉じた旧行は、次に開いたときも同じ変換を受けるだけ)。
+  続きから再生の縮小画像は下のキャッシュの扱いで作り直される。
+- ブックマーク・ピン: 再生位置から付けたもの (raw) と、時刻の貼り付け・時刻指定で付けたもの (0 起点) を区別
+  できないので移行しない。O_eff ≠ 0 のファイルで再生位置から付けたものは、修正後に O_eff だけ後ろの位置へ移る。
 
 時刻をキーにしたキャッシュ (`tile_thumb_cache.rs` のタイル縮小画像・続きから再生の縮小画像・波形) は、O_eff ≠ 0
 のファイルで旧 raw 時刻の画を持っている。キャッシュなので、既存の version gate の仕組みで 1 回だけ
 **MPEG-TS / PS 系の拡張子の行を捨てて作り直す** (全動画の作り直しは一覧の表示が一時的に遅くなるので避ける。
-拡張子と中身が食い違うファイルは古い画が残り得るが、キャッシュなので割り切る)。ブックマーク・ピンの縮小画像 BLOB は
+拡張子と中身が食い違うファイルは古い画が残り得るが、キャッシュなので割り切る)。O_eff の対象 demuxer
+(`mpegts`・`mpegtsraw`・`mpeg`) と拡張子の範囲を揃える (例: ts・m2ts・mts・m2t・tp・trp・tts・mpg・mpeg・m2p・vob・
+mod・tod・evo。実装では mIV が動画として扱う拡張子の一覧と突き合わせる)。一回だけの削除は、全体の
+`THUMB_RENDER_VERSION` を上げる方法と混ぜない (上げると他形式の行も miss して全部作り直しになる)。ブックマーク・ピンの縮小画像 BLOB は
 付けた時点の表示 frame なので変えない。
 
 ## 5. 文字起こし T1 との関係
@@ -177,7 +198,7 @@ fixture は `testdata/timeline-origin/` に、システムの ffmpeg と lavfi �
 
 受入条件:
 
-- `MediaTimeline` の単体: TS_DISCONT の有無による O_eff、NOPTS → 0、raw ↔ media の往復、AV_TIME_BASE と
+- `MediaTimeline` の単体: demuxer 名による O_eff (対象外の `ogg`・`matroska,webm`・`mov,mp4,...` は 0)、NOPTS → 0、raw ↔ media の往復、AV_TIME_BASE と
   stream tick の丸め。
 - decoder 層: TS 各 fixture で最初の映像・音声 frame の時刻が 0 付近、`D−0.5` への seek の後の最初の frame の
   時刻と**画素の色**が D−0.5 付近、EOF の時刻が D 付近、チャプター・音声トラック範囲が media。
@@ -189,7 +210,10 @@ fixture は `testdata/timeline-origin/` に、システムの ffmpeg と lavfi �
   `AudioRangeDecoder` は既知の位置のパルスで判定する。
 - Remote: 開始位置 t の transcode で、`source_origin_secs` = t、最初の segment の時刻 ≈ 0、端末側の位置 = t。
 - キャッシュ: 旧 version の TS 系の行が捨てられ、他の行は残る。
-- §4 で移行する場合: 旧行の変換、変換済みの印、値 < O_eff の旧行の破棄、O_eff = 0 のファイルの行が変わらないこと。
+- 続きから再生の移行: schema の列追加が既存 DB で冪等、旧 raw 行が大きな O の TS で `value − O_eff` に復元される、
+  値 < O_eff の旧行は復元しない、O_eff = 0 のファイルの旧行は値が変わらない、定期保存で印付きに置き換わる、
+  印付きの行は二重に変換されない。旧行の動画を開かずに別の設定を保存 → 再起動 → その動画を開くと、旧 raw として
+  変換される (全量保存で印が付かない)。ブックマーク・ピンの値は変わらない。
 
 ## 7. 文書
 
