@@ -218,7 +218,7 @@ fixture は `testdata/timeline-origin/` に、システムの ffmpeg と lavfi �
 `3 <= position < D−5` を作るため D > 8)。
 
 **fixture の分離 (2026-11-14 設計担当決定)**: TS/PS の timestamp seek が非 key packet に着地する既存不具合は
-[バックログ §1.780](next-release-backlog.md) へ分離し、このブランチでは修正しない。原点の変換漏れを検出する
+[バックログ §1.785](next-release-backlog.md) へ分離し、このブランチでは修正しない。原点の変換漏れを検出する
 素材は 12 fps・全 intra (`-g 1 -bf 0`) にし、低 fps で PTS/DTS の一フレーム差が seek の厳密な期待値へ
 影響しないよう MPEG-2 の low delay も指定する。色と tail の許容誤差は緩めず、frame-step の隣接 frame 時刻は
 この frame grid に合わせる。インターレース属性は維持し、既存の別素材による inter-frame / filter 回帰も残す。
@@ -257,7 +257,7 @@ fixture は `testdata/timeline-origin/` に、システムの ffmpeg と lavfi �
 
 ## 8. 対象外とまれな失敗
 
-- TS/PS の keyframe より後ろへの seek 着地は原点とは独立した既存不具合で、§1.780 の共通 seek owner と
+- TS/PS の keyframe より後ろへの seek 着地は原点とは独立した既存不具合で、§1.785 の共通 seek owner と
   bounded な cold seek 設計で別途扱う。このブランチに byte locator、走査、固定 preroll は追加しない。
 - 音声 decoder に `pkt_timebase` を渡していない件 (MP3・Ogg Opus の encoder delay 補正が PTS に反映されない) は、
   この修正の原点の判定 (O_eff = 0) では影響しないので対象外。別の項目としてバックログに記録する。

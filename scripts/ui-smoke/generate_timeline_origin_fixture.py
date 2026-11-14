@@ -14,7 +14,7 @@ COLOURS = (
     "ffffff", "000000", "ff8000", "8000ff", "008080", "808080",
 )
 # All-intra isolates the origin contract from the pre-existing TS keyframe seek
-# defect tracked in docs/next-release-backlog.md section 1.780.
+# defect tracked in docs/next-release-backlog.md section 1.785.
 VIDEO_OPTIONS = [
     "-c:v", "mpeg2video", "-q:v", "3", "-g", "1", "-bf", "0",
     "-flags:v", "+low_delay",

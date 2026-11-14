@@ -4,7 +4,7 @@
 
 映像は 96×64、12 fps、144 フレーム、内容の長さは 12 秒です。フレーム間隔は `1/12` 秒 (約 0.083333 秒)。MPEG-2、`-g 1 -bf 0 -flags:v +low_delay` の全フレーム intra で、すべての映像素材について 144/144 フレームが `key_frame=1`、`pict_type=I`、144/144 映像 packet が PTS=DTS であることを検査しています。通常の TS 音声は 48 kHz mono AAC、32 kbit/s です。
 
-全 intra は時刻原点の契約を、既存の TS keyframe seek 不具合から切り離して検査するための素材側の選択です。通常 GOP の seek が直ったことを示す素材ではありません。その不具合は [次のリリースのバックログ §1.780](../../docs/next-release-backlog.md) で別に扱います。12 fps は素材を小さく保ちつつ、最終 frame と EOF の間隔を 0.1 秒未満にするためです。
+全 intra は時刻原点の契約を、既存の TS keyframe seek 不具合から切り離して検査するための素材側の選択です。通常 GOP の seek が直ったことを示す素材ではありません。その不具合は [次のリリースのバックログ §1.785](../../docs/next-release-backlog.md) で別に扱います。12 fps は素材を小さく保ちつつ、最終 frame と EOF の間隔を 0.1 秒未満にするためです。
 
 MPEG-2 の sequence extension に `low_delay=1` を設定し、decoder の frame reorder delay を不要にしています。B frame がなくても通常の encoder 出力では DTS が PTS より 1 frame 早く、TS の DTS 基準 seek が低 fps の 1 frame 分先の画へ着くことがあります。素材では low delay により PTS=DTS を揃え、原点検査へこの量子化差を持ち込みません。インターレース素材では `+low_delay+ilme+ildct` を併用します。製品の seek 実装や既存 assertion の許容差はこの素材変更では変えません。
 

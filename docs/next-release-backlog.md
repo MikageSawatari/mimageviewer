@@ -39,7 +39,7 @@
 
 ## 1. 優先候補
 
-### 1.779 音声 decoder の pkt_timebase と encoder delay / pre-skip の PTS — コード調査 (2026-11-14)
+### 1.784 音声 decoder の pkt_timebase と encoder delay / pre-skip の PTS — コード調査 (2026-11-14)
 
 `decoder.rs` の音声 decoder は `pkt_timebase` を設定していないため、MP3 や Ogg Opus の
 skip sample / pre-skip が適用された音声サンプルと frame PTS の関係を別途確認する。
@@ -47,7 +47,7 @@ skip sample / pre-skip が適用された音声サンプルと frame PTS の関�
 これらの形式の O_eff=0 と従来の音声時刻を維持する。`pkt_timebase` を設定する際は
 先頭の可聴サンプル・seek 後の trim・EOF drain・Remote と範囲デコードを回帰検証する。
 
-### 1.780 MPEG-TS / PS の seek が keyframe の手前に着地しない — コード調査 (2026-11-14)
+### 1.785 MPEG-TS / PS の seek が keyframe の手前に着地しない — コード調査 (2026-11-14)
 
 - 状態: **未着手・原因確認済み**。時刻原点の補正とは独立した既存不具合で、
   [動画の時刻原点の修正](video-timeline-origin-plan.md) の対象外とする (2026-11-14 設計担当決定)。

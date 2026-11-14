@@ -127,7 +127,7 @@ The follow-up keeps one restoration owner: VideoPlayer retains the typed pending
 
 These are source and headless state-transition assertions, not observations of live native UI. References: VideoPlayer::open/open_with_output_consumer, initial_position_for_resume, tick's VideoInfo adoption, remote_stream_start_inputs; actor::new/begin_loading/InfoReceived; native presenter samples source.clock.now_secs() in mod.rs and gates progress by video_position_controls_available(duration); center preparing status is guarded by !first_frame_presented.
 
-## Pre-existing seek-preroll finding (out of scope, backlog 1.780)
+## Pre-existing seek-preroll finding (out of scope, backlog 1.785)
 
 The original checkpoint30030f112 fixtures were 25 fps with inter-predicted GOPs. Linked avformat-61/avcodec-61 headless probes on those original fixtures found the following pre-existing timestamp-seek behavior (not product runs). These measurements describe the original fixtures, not the regenerated all-intra files:
 
@@ -142,7 +142,7 @@ The original checkpoint30030f112 fixtures were 25 fps with inter-predicted GOPs.
 
 This is a seek/preroll defect, not a wrong origin or an incorrect expected colour. FFmpeg n7.1 [mpegts_get_dts](https://github.com/FFmpeg/FFmpeg/blob/n7.1/libavformat/mpegts.c#L3146-L3149) labels timestamp probes `AVINDEX_KEYFRAME /* FIXME keyframe? */`; [seek.c](https://github.com/FFmpeg/FFmpeg/blob/n7.1/libavformat/seek.c#L581-L584) selects binary search for read_timestamp demuxers. These explain why AVSEEK_FLAG_BACKWARD alone does not establish the required keyframe invariant.
 
-The design lead classified this as a pre-existing, origin-independent defect, including O=0 TS, outside this branch (2026-11-14). It is recorded as [backlog 1.780](next-release-backlog.md). A future fix needs a common owner for verified key locators and bounded cold-seek/cancellation/performance design, including PS parser restart and missing packet positions. This branch adds no seek owner, byte locator, scans, offsets or retries.
+The design lead classified this as a pre-existing, origin-independent defect, including O=0 TS, outside this branch (2026-11-14). It is recorded as [backlog 1.785](next-release-backlog.md). A future fix needs a common owner for verified key locators and bounded cold-seek/cancellation/performance design, including PS parser restart and missing packet positions. This branch adds no seek owner, byte locator, scans, offsets or retries.
 
 For this branch, the lead explicitly selected all-intra origin fixtures. The final files use 12 fps, -g1, -bf0 and MPEG-2 low_delay so all video packets are true keys and PTS=DTS. Twelve fps keeps frame-quantization below the existing strict0.1s EOF assertion; low_delay avoids a PTS/DTS one-frame seek bias crossing the unchanged0.05s tail assertion. Interlaced material remains interlaced. The fixture README records the final origins/durations/sizes and the reason for this isolation. Assertions were not loosened; exact bwdif neighboring-frame expectations were recalculated for the 12fps grid. Existing separate inter-frame decoder/filter regressions remain unchanged.
 
@@ -226,9 +226,9 @@ Concrete manual scenarios (not yet performed):
 | `src/video/screenshot.rs:231` from `seek_strip_thumbs.rs:3241` / timeline_origin_strip_decoders_return_requested_colour | Requested scene0 is green scene1, not red. | Same pre-existing non-key seek landing; accepted all-intra fixture isolates origin conversion. |
 | `src/video/timeline_origin_tests.rs:189` / timeline_origin_ts_decoder_first_frames_seek_tail_colour_and_eof | No post-seek tail frame for small-origin.ts. | Same pre-existing landing after the last usable GOP; accepted all-intra fixture isolates origin conversion. |
 
-The origin assertions retain their original tolerances and pixel checks. Common seek/preroll correction is deferred to backlog1.780 across playback and all independent auxiliary/Remote Inputs. Existing Remote tests verify actual encoded segment timestamps and source origin; between-key behavior with inter-predicted TS/PS belongs to that backlog.
+The origin assertions retain their original tolerances and pixel checks. Common seek/preroll correction is deferred to backlog1.785 across playback and all independent auxiliary/Remote Inputs. Existing Remote tests verify actual encoded segment timestamps and source origin; between-key behavior with inter-predicted TS/PS belongs to that backlog.
 
-No additional commits were attempted after the lead's instruction. Follow-up edits include the bootstrap test setup, single-owner resume/initial-anchor behavior and adoption tests, regenerated all-intra fixtures/generator/README, backlog1.780 and the matching architecture/report updates.
+No additional commits were attempted after the lead's instruction. Follow-up edits include the bootstrap test setup, single-owner resume/initial-anchor behavior and adoption tests, regenerated all-intra fixtures/generator/README, backlog1.785 and the matching architecture/report updates.
 
 ## FFmpeg boundary inventory
 
@@ -310,7 +310,7 @@ The exact plan section 3 search was rerun at this checkpoint: 281 matches across
 | `src/video/seek_strip.rs`: `read_index_keyframes` | raw locator -> input absolute | AVIndexEntry remains raw; only its published seconds on the strip axis convert. |
 | `src/video/upscale/job.rs`: `frame_to_pts`, manifest source PTS and stream seek | raw locator kept raw | No migration/rebase. Encoder receives its own segment frame index; original-audio remux remains unchanged. |
 
-The static boundary review found no further unconverted FFmpeg-facing source-time boundary. This is not evidence of live-product acceptance. The grid-meter exception is explicitly accepted in plan section 4; the pre-existing seek/preroll defect is deferred to backlog1.780 by the design lead.
+The static boundary review found no further unconverted FFmpeg-facing source-time boundary. This is not evidence of live-product acceptance. The grid-meter exception is explicitly accepted in plan section 4; the pre-existing seek/preroll defect is deferred to backlog1.785 by the design lead.
 
 ## Exact conversion call sites
 
