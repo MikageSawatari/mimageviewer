@@ -1,12 +1,16 @@
 //! Experimental evaluation policy only; never linked into production detection.
 use super::*;
 
+mod layout;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FallbackMode {
     Edge,
     Edge18,
     Density,
     Density18,
+    Layout,
+    LayoutSnap,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -23,9 +27,11 @@ impl FallbackConfig {
             Some("edge18") => Some(FallbackMode::Edge18),
             Some("density") => Some(FallbackMode::Density),
             Some("density18") => Some(FallbackMode::Density18),
+            Some("layout") => Some(FallbackMode::Layout),
+            Some("layout-snap") => Some(FallbackMode::LayoutSnap),
             Some(_) => {
                 return Err(
-                    "MIV_COVER_AUTO_EVAL_FALLBACK must be edge, edge18, density or density18",
+                    "MIV_COVER_AUTO_EVAL_FALLBACK must be edge, edge18, density, density18, layout or layout-snap",
                 );
             }
         };
@@ -51,6 +57,8 @@ impl FallbackConfig {
             FallbackMode::Edge18 => "edge18",
             FallbackMode::Density => "density",
             FallbackMode::Density18 => "density18",
+            FallbackMode::Layout => "layout",
+            FallbackMode::LayoutSnap => "layout-snap",
         })
     }
 
@@ -81,12 +89,17 @@ pub(super) struct FallbackDiagnostic {
     width: u32,
     inward: u32,
     score: Option<f64>,
+    layout: Option<layout::LayoutDiagnostic>,
 }
 
 impl FallbackDiagnostic {
     pub(super) fn json(self, config: FallbackConfig) -> serde_json::Value {
-        json!({"mode": config.name(), "width": self.width, "inward": self.inward,
-            "inward_fraction": f64::from(self.inward) / f64::from(self.width), "density_score": self.score})
+        let mut value = json!({"mode": config.name(), "width": self.width, "inward": self.inward,
+            "inward_fraction": f64::from(self.inward) / f64::from(self.width), "density_score": self.score});
+        if let Some(layout) = self.layout {
+            value["layout"] = layout.json();
+        }
+        value
     }
 }
 
@@ -125,6 +138,20 @@ pub(super) const EVAL_ROTATIONS: [Rotation; 4] = [
     Rotation::Cw180,
     Rotation::Cw270,
 ];
+
+/// Native saved-angle cover width / unrounded inferred page width. Also valid
+/// outside the four layouts, so callers can count guarded/declined inputs.
+pub(super) fn layout_ratio(
+    native_dims: (u32, u32),
+    aspect: Option<f64>,
+    rotation: Rotation,
+) -> Option<f64> {
+    let (width, height) = match rotation {
+        Rotation::Cw90 | Rotation::Cw270 => (native_dims.1, native_dims.0),
+        _ => native_dims,
+    };
+    layout::ratio(f64::from(width), aspect? * f64::from(height))
+}
 
 pub(super) fn evaluate_angles(
     image: &DynamicImage,
@@ -179,6 +206,25 @@ fn fallback_crop(
         Rotation::Cw90 | Rotation::Cw270 => (native_dims.1, native_dims.0),
         _ => native_dims,
     };
+    if matches!(mode, FallbackMode::Layout | FallbackMode::LayoutSnap) {
+        let (crop, diagnostic) = layout::crop(
+            image,
+            (width, height),
+            aspect,
+            binding,
+            rotation,
+            matches!(mode, FallbackMode::LayoutSnap),
+        )?;
+        return Some((
+            crop,
+            FallbackDiagnostic {
+                width: (1.02 * aspect * f64::from(height)).round().max(1.0) as u32,
+                inward: 0,
+                score: None,
+                layout: Some(diagnostic),
+            },
+        ));
+    }
     let panel_width = (aspect * f64::from(height)).round();
     if width == 0 || height == 0 || panel_width < 1.0 || panel_width > 0.9 * f64::from(width) {
         return None;
@@ -242,6 +288,7 @@ fn fallback_crop(
             width: panel_width,
             inward,
             score,
+            layout: None,
         },
     ))
 }
@@ -316,6 +363,15 @@ pub(super) struct FallbackStats {
     pub(super) wrong: u32,
     pub(super) reasons: BTreeMap<String, u32>,
     inward_fractions: Vec<f64>,
+    layouts: [LayoutCount; 4],
+    layout_ratios: Vec<f64>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct LayoutCount {
+    count: u32,
+    good: u32,
+    wrong: u32,
 }
 
 impl FallbackStats {
@@ -335,6 +391,18 @@ impl FallbackStats {
                 .or_default() += 1;
             self.inward_fractions
                 .push(f64::from(diagnostic.inward) / f64::from(diagnostic.width));
+            if let Some(layout) = diagnostic.layout {
+                let counts = &mut self.layouts[layout.kind];
+                counts.count += 1;
+                if has_truth {
+                    if iou.is_some_and(|value| value >= 0.85) {
+                        counts.good += 1;
+                    } else {
+                        counts.wrong += 1;
+                    }
+                }
+                self.layout_ratios.push(layout.ratio);
+            }
         }
     }
 
@@ -347,6 +415,26 @@ impl FallbackStats {
                 .copied()
         };
         json!({"count": values.len(), "min": quantile(0.0), "median": quantile(0.5), "p90": quantile(0.9), "max": quantile(1.0)})
+    }
+
+    pub(super) fn layout_summary(&self, has_truth: bool) -> serde_json::Value {
+        let mut result = serde_json::Map::new();
+        for (index, counts) in self.layouts.iter().enumerate() {
+            result.insert(format!("T{}", index + 1), json!({"cropped": counts.count,
+                "good": has_truth.then_some(counts.good), "wrong": has_truth.then_some(counts.wrong)}));
+        }
+        result.into()
+    }
+
+    pub(super) fn layout_ratio_distribution(&self) -> serde_json::Value {
+        // Integer bin indices avoid accumulating decimal boundaries. These
+        // counts cover applied layout fallbacks; parent owns all-case counts.
+        let mut bins = [0_u32; 20];
+        for ratio in &self.layout_ratios {
+            bins[(*ratio * 5.0 + 1e-9).floor() as usize] += 1;
+        }
+        json!({"bin_width": 0.2, "count": self.layout_ratios.len(), "bins": bins.into_iter().enumerate().map(|(index, count)|
+            json!({"lower": index as f64 / 5.0, "upper": (index + 1) as f64 / 5.0, "count": count})).collect::<Vec<_>>()})
     }
 }
 
@@ -378,7 +466,14 @@ mod tests {
     #[test]
     fn evaluation_fallback_decline_allowlist_preserves_every_guard() {
         let image = DynamicImage::new_rgb8(240, 100);
-        for mode in ["edge", "edge18", "density", "density18"] {
+        for mode in [
+            "edge",
+            "edge18",
+            "density",
+            "density18",
+            "layout",
+            "layout-snap",
+        ] {
             for richer in [false, true] {
                 let config = FallbackConfig::parse(Some(mode), richer).unwrap();
                 let guards = [
@@ -705,5 +800,114 @@ mod tests {
         assert_eq!(stats.reasons["no-structure"], 3);
         assert_eq!(stats.distribution()["count"], 3);
         assert_eq!(stats.distribution()["max"], 0.0);
+    }
+
+    #[test]
+    fn evaluation_layout_summary_keeps_all_types_truth_semantics_and_ratio_bins() {
+        let mut stats = FallbackStats::default();
+        for (index, width) in [150, 200, 270, 350].into_iter().enumerate() {
+            let image = DynamicImage::new_rgb8(width, 150);
+            let result = AngleOutcome::new(
+                Err(AutoCropDecline::NoStructure),
+                &image,
+                (width, 150),
+                Some(2.0 / 3.0),
+                ReadingDirection::Rtl,
+                Rotation::None,
+                config("layout"),
+            );
+            let iou = [Some(0.9), Some(0.8), None, Some(0.9)][index];
+            stats.record(result, iou, true);
+            let diagnostic = result.fallback.unwrap().json(config("layout"));
+            assert_eq!(diagnostic["layout"]["kind"], format!("T{}", index + 1));
+            assert_eq!(diagnostic["layout"]["snap_applied"], false);
+        }
+        let summary = stats.layout_summary(true);
+        let no_truth = stats.layout_summary(false);
+        for index in 0..4 {
+            let key = format!("T{}", index + 1);
+            assert_eq!(summary[&key]["cropped"], 1);
+            assert_eq!(summary[&key]["good"], u32::from(index == 0 || index == 3));
+            assert_eq!(summary[&key]["wrong"], u32::from(index == 1 || index == 2));
+            assert_eq!(no_truth[&key]["cropped"], 1);
+            assert!(no_truth[&key]["good"].is_null());
+            assert!(no_truth[&key]["wrong"].is_null());
+        }
+        assert_eq!((stats.cropped, stats.good, stats.wrong), (4, 2, 2));
+        let histogram = stats.layout_ratio_distribution();
+        assert_eq!(histogram["count"], 4);
+        assert_eq!(
+            histogram["bins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|bin| bin["count"].as_u64().unwrap())
+                .sum::<u64>(),
+            4
+        );
+        for index in [7, 10, 13, 17] {
+            assert_eq!(histogram["bins"][index]["count"], 1);
+        }
+        let empty = FallbackStats::default().layout_summary(true);
+        assert_eq!(empty.as_object().unwrap().len(), 4);
+        assert_eq!(empty["T4"]["cropped"], 0);
+    }
+
+    #[test]
+    fn evaluation_layout_ratio_uses_native_saved_angle_and_accepts_outside_layout() {
+        assert_eq!(
+            layout_ratio((120, 80), Some(0.5), Rotation::None),
+            Some(3.0)
+        );
+        assert_eq!(
+            layout_ratio((120, 80), Some(0.5), Rotation::Cw180),
+            Some(3.0)
+        );
+        for rotation in [Rotation::Cw90, Rotation::Cw270] {
+            assert_eq!(
+                layout_ratio((120, 80), Some(0.5), rotation),
+                Some(4.0 / 3.0)
+            );
+        }
+        assert_eq!(
+            layout_ratio((50, 100), Some(1.0), Rotation::None),
+            Some(0.5)
+        );
+        assert_eq!(
+            layout_ratio((186, 150), Some(0.67), Rotation::None),
+            Some(186.0 / 100.5)
+        );
+        for aspect in [
+            None,
+            Some(0.0),
+            Some(-1.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+        ] {
+            assert!(layout_ratio((120, 80), aspect, Rotation::None).is_none());
+        }
+        assert!(layout_ratio((0, 80), Some(0.5), Rotation::None).is_none());
+    }
+
+    #[test]
+    fn evaluation_layout_extension_preserves_legacy_crop_and_diagnostic_goldens() {
+        let image = DynamicImage::new_rgb8(240, 100);
+        for mode in ["edge", "edge18", "density", "density18"] {
+            for binding in [ReadingDirection::Rtl, ReadingDirection::Ltr] {
+                let result = outcome(&image, binding, Rotation::None, config(mode));
+                let expected = match binding {
+                    ReadingDirection::Rtl => [720_833, 0, 1_000_000, 1_000_000],
+                    ReadingDirection::Ltr => [0, 0, 279_167, 1_000_000],
+                };
+                assert_eq!(result.final_result.unwrap().values(), expected);
+                let density_score = mode.starts_with("density").then_some(0.0);
+                assert_eq!(
+                    result.fallback.unwrap().json(config(mode)),
+                    json!({
+                        "mode": mode, "width": 67, "inward": 0, "inward_fraction": 0.0, "density_score": density_score
+                    })
+                );
+            }
+        }
     }
 }

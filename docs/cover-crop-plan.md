@@ -1665,3 +1665,32 @@ r2 = REVISE (P2 1 件、ほかは r1 の指摘を閉じた)。v2 キーで `auto
 `18` 付きは表紙がその幅の1.8倍以上のときだけ。summaryには `fallback_cropped/good/wrong`、元の見送り理由、角度別の後押し、IoUと内側移動量を追加する。
 `MIV_COVER_AUTO_EVAL_FOLDER_LIST` でも同じ指定を使える。フォルダ入力は引き続きsummaryだけを出し、画像・個別名は出さない。
 正解がないフォルダ入力のIoUとgood/wrongは `null`。本番の判定は変えない。
+
+#### 型による後押しの使い方 (cfg(test) のみ、2026-11-14)
+
+`MIV_COVER_AUTO_EVAL_FALLBACK=layout` / `layout-snap` を追加する。対象の見送り理由・G1等の守り・
+`MIV_COVER_AUTO_EVAL_FALLBACK_RICHER=1`・保存回転ごとの扱いは既存の後押しと同じ。未指定と旧4方式の範囲は変えない。
+各角度の元寸法から丸めずに `W=p×Hc`、`R=Wc/W`、`F=1.02W` を求め、右綴じでは次の位置へ置く（高さは全体）。
+
+| 型 | R | 範囲の左端 |
+|---|---|---|
+| T1 | `[1.35, 1.85)` | `Wc-F` |
+| T2 | `[1.85, 2.4)` | `0` |
+| T3 | `[2.4, 3.1)` | `0.63W` |
+| T4 | `[3.1, 3.9)` | `(Wc-2F-0.1W)/2` |
+
+右端は左端+F、左綴じは左右反転する。表紙の外へは出さず、型の外のRには後押ししない。
+`layout-snap` は保存回転後の高さ256行の解析rasterで、中央90%の行の輝度
+`Y=0.2126R+0.7152G+0.0722B`（0〜255）の隣接列差 `D(x)=平均|Y(x,y)-Y(x-1,y)|` を取り、
+3列平均 `d(x)=(D(x-1)+D(x)+D(x+1))/3`、`S(x)=d(x)/max(表紙内のdの中央値,1)` とする。
+予測左端±0.15W、幅0.95〜1.08Wの組を解析列の境界から探す。背側（右綴じは右端・左綴じは左端）を2倍とし、
+scoreは `(S(袖側)+2S(背側))/3`。選んだ背側のSとscoreが両方3以上で、予測位置のscoreから1e-9を超えて改善したときだけ合わせる。
+弱い場合や予測と同点なら型の位置を保ち、候補同士の同点は予測位置に近い方を選ぶ。
+
+行の `fallback.layout` に `kind`、`ratio`、`predicted`、`final_position`、`snap_applied` と境目の強度を記録する。
+位置はその保存回転の元寸法の座標で、既存の `prediction` とIoUは保存回転前の座標へ戻して集計する。
+summaryの `fallback_by_layout` はT1〜T4別の `cropped/good/wrong`、`fallback_layout_ratio_distribution` は後押しした型のRの0.2刻み分布。
+`ratio_distribution` は守りや見送りも含め、本文比率の取れた全入力の選択角度のRを0.2刻みで数える（空のbinは省略）。
+フォルダ一覧でも同じ情報を出し、引き続きsummaryだけで画像・個別名は出さず、正解のないgood/wrongとIoUはnullとする。
+`truth.json` の `page_aspect: null` は受理する。ZIPは既存どおり本番の本文標本から比率を取り、
+本文を持たないPNG入力のnullは比率不足として見送る。行の `page_aspect_decline` で不足・横長過多等を区別する。
