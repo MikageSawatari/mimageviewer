@@ -118,9 +118,21 @@ struct ProcessOwner {
     _child: JobChild,
     kill: KillHandle,
 }
+
+fn should_log_failure(error: &AsrError, killed: bool) -> bool {
+    // 自分たちのkillで解けたpipe待ちは正常な終了。内容の検査失敗やGPUの失敗は隠さない。
+    !killed || !matches!(error, AsrError::Transport(WorkerError::Io(_)))
+}
+
+fn log_failure(kill: &KillHandle, error: &AsrError) {
+    if should_log_failure(error, kill.is_killed()) {
+        crate::logger::log(format!("asr_worker: {error}"));
+    }
+}
+
 impl ProcessOwner {
     fn fail<T>(&self, error: AsrError) -> Result<T, AsrError> {
-        crate::logger::log(format!("asr_worker: {error}"));
+        log_failure(&self.kill, &error);
         let _ = self.kill.kill();
         Err(error)
     }
@@ -163,6 +175,12 @@ impl AsrWorkerClient {
                 loop {
                     let frame = read_frame(&mut stdout);
                     let failed = frame.is_err();
+                    if let Err(error @ WorkerError::Io(_)) = &frame {
+                        // このthreadが先にkillするため、I/O失敗はkill前の状態で記録する。
+                        // 異常終了の最初のEOFは残し、recv側へ渡った同じ失敗と、killで解けた
+                        // 書込み側の失敗は抑制する。protocol/fatalは従来どおり受信側で記録する。
+                        log_failure(&kill, &AsrError::Transport(error.clone()));
+                    }
                     if failed {
                         let _ = kill.kill();
                     }

@@ -101,3 +101,73 @@ runner引数は修正前が `pre`、関連131件が `related`、native最終5件
 
 計画書と異なる保存・時刻・session境界は導入していない。隙間の送り先を直前の区間とする細部は今回の修正で明示した。
 build-devは今回の「最後にcargo fmtだけ」の指示に従い実行していない。修正後の実機結果はこの報告には含めない。
+
+## C. 中止後のworker I/O失敗をログに残さない（基点e934fd3f3）
+
+### 原因と終了経路
+
+Opusの見立ては正しい。修正前の `src/ai/asr_worker.rs:122` の `ProcessOwner::fail` は、
+`KillHandle` の状態に関係なく `asr_worker: ...` を記録してからkillしていた。
+
+中止では `ui_dialogs::transcript_job::TranscriptJob::stop` がStoppingへ移り、待ち行列を空にして
+`TranscriptWorker::stop` → `Control::stop`（`src/ai/transcript_job_worker.rs`）を呼ぶ。
+Controlは取消の印を立ててからKillHandleをkillする。`src/job_process.rs` の `KillHandle::kill` は、
+atomicのkilledをtrueにしてから `TerminateJobObject` を呼ぶ（UIで終了待ちはしない）。
+
+kill後に起こる2つの失敗の順序は固定されていない。
+
+- 抽出threadがpipeへの `write_all` で待っていれば、killによりI/O失敗で解け、`AsrInput::send` → `ProcessOwner::fail` が記録する。
+- `asr-stdout` threadの `read_frame` もI/O失敗で解ける。このthreadはkillしてからエラーを容量1のchannelへ渡す。
+  結果側が `AsrOutput::recv`（hello/load中なら `exchange`）で受け、`ProcessOwner::fail` が再び記録する。
+
+このため、報告されたreadの「failed to fill whole buffer」とwriteの「os error 109」が、正常な中止でも同時刻に記録される。
+
+### 修正
+
+判定を `should_log_failure(error, killed)`（`src/ai/asr_worker.rs:122`）に分け、`log_failure` が実際の `KillHandle::is_killed()` を渡す。
+**kill済みの `AsrError::Transport(WorkerError::Io(_))` だけを記録しない**。
+メッセージの内容・言語・OS error番号では判定しない。エラーの返却、kill、ジョブの中止/終了処理は従来どおり。
+
+ただし、stdout threadは自発的なEOFやread失敗でも、受信側より先にkillする。
+`ProcessOwner::fail` だけを変えると、この最初の本当のI/O失敗まで消える。
+そこで**読取側のI/O失敗だけは、このthreadがkillする前に同じ判定で記録する**（同`:178`）。
+その後に受信側へ届く同じI/O失敗と、killで解けた書込み側のI/O失敗は抑制される。
+framing/protocol不正、GPU/modelのfatal応答、timeoutなどはkill済みでも従来どおり受信側で記録する。
+先にqueueへ届いたfatal応答をkill済みだからと読み捨てる変更もしていない。
+
+中止以外の終了経路も照合した。
+
+| 経路 | この規則でよい理由 |
+| --- | --- |
+| App終了、TranscriptWorkerのDrop | `stop_for_exit` → `stop` が同じKillHandleを使う。後続のpipe失敗は終了に伴うもの |
+| 作成完了後 | `Finish`で実行役が戻り、AsrOutput/InputのDropがkillする。読取threadの後続EOFを失敗扱いしない |
+| ASRの実際の失敗 | 検出時のI/O失敗をkill前に記録し、それによる他方のI/O失敗は記録しない。protocol/fatalはkill後でも残す |
+| WriterAbortによる終了 | endを送れない失敗やpanicでkillし、他方のpipe待ちを解く。原因は既存のASR/job失敗経路で記録・通知し、後続I/Oを重ねない |
+
+終了理由の追加state、待ち、再試行は導入していない。共有のKillHandle、VLM client、worker protocolも変更していない。
+
+### テストと結果
+
+変更は `src/ai/asr_worker.rs`、`src/ai/asr_worker_tests.rs`、本報告のみ。
+loggerは共有sinkのままなので、実際の記録分岐が使う純関数で状態を検査する。
+
+- `asr_io_failures_are_logged_only_before_kill_regardless_of_error_text`: 観測された2種の文言と任意のI/O文言で、kill前は記録、kill後は非記録。
+  読取threadが先に記録・killし、受信側で同じエラーを受ける場合にも同じ判定となる。
+- `asr_protocol_and_worker_failures_still_log_after_kill`: framing/protocol、fatal、GPU、timeout等はkill前後とも記録。
+- 既存のkillによる読取・PCM書込の解除、先にqueueへ届いたfatal/framingエラー、中止・完了・保存通知の状態遷移も対象filterへ含める。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local\miv-locks\run-heavy.ps1 -Owner asr-t1 -WorkDir G:\home\mimageviewer-asr-t1 -Command 'python -B -I target/asr-t1-chunk5/run.py cancel-io'
+```
+
+runner内部のコマンド:
+
+```text
+cargo nextest run -j 1 -p mimageviewer --lib -E "test(ai::asr_worker::tests) | test(ai::transcript_job_worker::tests) | test(ui_dialogs::transcript_job::tests)" --no-fail-fast --success-output final
+```
+
+結果は **35/35成功**（8.520秒、compile 4分48秒）。追加2件の状態テスト、既存の読取・PCM書込のkill解除、kill後のfatal/framingエラー受信、
+作成ジョブの中止・追加・保存通知の回帰を含む。log: `target/asr-t1-chunk5/cancel-io.log`。
+ロックへの書込不可警告後、run-heavyの既定どおりBelowNormalで実行。環境は上のA/Bと同じ。
+最後に引数なしの `cargo fmt` を実行し成功。`git diff --check` も成功。
+製品の起動・コミット・build-devは実施していない。

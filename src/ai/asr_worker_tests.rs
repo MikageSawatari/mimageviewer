@@ -1,6 +1,49 @@
 use super::super::vlm_worker::tests::fake_worker;
 use super::*;
 
+#[test]
+fn asr_io_failures_are_logged_only_before_kill_regardless_of_error_text() {
+    // ログsinkは共有なので、実際にlog_failureが使う純粋な判定を検査する。
+    for message in [
+        "failed to fill whole buffer",
+        "パイプは終了しました。 (os error 109)",
+        "arbitrary I/O error",
+    ] {
+        let error = AsrError::Transport(WorkerError::Io(message.into()));
+        assert!(
+            should_log_failure(&error, false),
+            "自発的なread/write失敗は記録する"
+        );
+        // 読取thread自身のkill後に受信側が同じエラーを受ける場合も、
+        // 中止・終了・Dropが先にkillした場合も同じ規則。
+        assert!(
+            !should_log_failure(&error, true),
+            "kill後のI/O失敗は重ねて記録しない"
+        );
+    }
+}
+
+#[test]
+fn asr_protocol_and_worker_failures_still_log_after_kill() {
+    // framing不正を読取threadが検出すると、受信側が読むより先にkillされる。
+    // queueに先着したGPUのfatal応答も含め、I/O以外はkill済みでも記録する。
+    for error in [
+        AsrError::Protocol("invalid timestamps".into()),
+        AsrError::Transport(WorkerError::Protocol("invalid UTF-8".into())),
+        AsrError::Transport(WorkerError::Fatal("worker exited".into())),
+        AsrError::Transport(WorkerError::Timeout),
+        AsrError::Transport(WorkerError::Unavailable),
+        AsrError::Unavailable,
+        AsrError::Worker {
+            code: "gpu_failure".into(),
+            message: "out of VRAM".into(),
+        },
+    ] {
+        assert!(should_log_failure(&error, false));
+        assert!(should_log_failure(&error, true));
+    }
+}
+
 fn new_client(mode: &str) -> AsrWorkerClient {
     let args: Vec<_> = ["--asr-serve", "--fake-mode", mode]
         .into_iter()
