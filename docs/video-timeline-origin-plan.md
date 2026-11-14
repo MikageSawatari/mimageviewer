@@ -38,6 +38,12 @@ O = コンテナの開始時刻 (`AVFormatContext.start_time`)、D = `VideoInfo.
 
 壊れているのは前者 (時計の値の形式) だけ。O>0 の MPEG-TS / M2TS / MPEG-PS で次のように壊れる (コード由来、未確認)。
 
+**対象になるファイル (2026-11-14 追記)**: mIV が動画として扱う拡張子は `folder_tree.rs` の
+`SUPPORTED_VIDEO_EXTENSIONS` (mpg・mpeg・mp4・avi・mov・mkv・wmv) だけで、`.ts` / `.m2ts` / `.mts` は一覧・検索・直接開く
+経路のどれでも動画として扱わない (サブ PC の実機確認で `.ts` が「非表示」に数えられたことから確認)。原点の判定は拡張子ではなく
+FFmpeg が中身から選んだ demuxer で行うので、この修正が実際に効くのは、中身が MPEG-PS または MPEG-TS の `.mpg` / `.mpeg`
+(と、まれに中身が TS の別拡張子のファイル) になる。`.ts` 等を対応形式に足すかは別件 (利用者に相談する機能追加)。
+
 | 箇所 | 壊れ方 (小さな O / 録画 TS のような大きな O) |
 | --- | --- |
 | `VideoPlayer::clamp_seek_target` `[0, D-0.1]`、`EngineActor::handle_seek_request` の clamp | 最後の約 O 秒へ移れない / どの seek も先頭へ戻る |
