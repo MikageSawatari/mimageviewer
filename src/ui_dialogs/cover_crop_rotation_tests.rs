@@ -52,7 +52,7 @@ fn pdf_pages(path: &Path) {
     std::fs::write(path, bytes).unwrap();
 }
 
-fn worker(
+pub(super) fn worker(
     request: &mut LoadRequest,
     catalog: &Arc<crate::catalog::CatalogDb>,
     pins: &crate::folder_thumb_pins::FolderThumbPinDb,

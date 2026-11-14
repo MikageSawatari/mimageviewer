@@ -761,3 +761,70 @@ fn cover_auto_photo_keeps_missing_page_aspect_before_photo_reason() {
         );
     }
 }
+
+#[test]
+fn cover_auto_photo_g2_matches_physical_and_saved_rotation_combinations() {
+    use crate::cover_auto_sample::{PageAspectSample, PageDimensionUnits};
+    let rotations = [
+        Rotation::None,
+        Rotation::Cw90,
+        Rotation::Cw180,
+        Rotation::Cw270,
+    ];
+    for units in [PageDimensionUnits::Pixels, PageDimensionUnits::PdfPoints] {
+        let points = if units == PageDimensionUnits::PdfPoints {
+            (90.075, 60.025)
+        } else {
+            (900.0, 600.0)
+        };
+        for shot_exif in [false, true] {
+            let sample = PageAspectSample {
+                aspect: Ok(points.1 / points.0),
+                dimensions: vec![Some((points.1, points.0)); 3],
+                units,
+            };
+            for physical in rotations {
+                let image = match physical {
+                    Rotation::None | Rotation::Cw180 => DynamicImage::new_rgb8(900, 600),
+                    _ => DynamicImage::new_rgb8(600, 900),
+                };
+                let dims = (image.width(), image.height());
+                let mut reports = Vec::new();
+                detect_cover_crops_with_photo_report(
+                    &image,
+                    dims,
+                    &sample,
+                    photo::PhotoEvidence {
+                        shot_exif,
+                        dimensions: if matches!(physical, Rotation::Cw90 | Rotation::Cw270) {
+                            (points.1, points.0)
+                        } else {
+                            points
+                        },
+                    },
+                    ReadingDirection::Rtl,
+                    |saved, result| reports.push((saved, result)),
+                );
+                for (saved, result) in reports {
+                    let landscape = (physical.degrees() + saved.degrees()) % 180 == 0;
+                    let expected = if landscape {
+                        AutoCropDecline::PhotoLike {
+                            reason: if shot_exif {
+                                photo::PhotoLikeReason::ShotExif
+                            } else {
+                                photo::PhotoLikeReason::TransposedPage
+                            },
+                        }
+                    } else {
+                        AutoCropDecline::RawAspectGate
+                    };
+                    assert_eq!(
+                        result,
+                        Err(expected),
+                        "{units:?}/{physical:?}/{saved:?}/{shot_exif}"
+                    );
+                }
+            }
+        }
+    }
+}

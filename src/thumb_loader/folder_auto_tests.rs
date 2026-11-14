@@ -324,12 +324,21 @@ fn cover_auto_photo_shot_exif_reaches_zip_and_folder_workers_with_upright_materi
                     );
                     let messages = run_cover_crop_request(&mut req, &catalog, None);
                     let pixels = messages.iter().find_map(ThumbMsg::pixels).unwrap();
+                    // File decoding retains the legacy WIC fallback (which
+                    // supports WebP orientation on Windows); ZIP bytes retain
+                    // rexif only. Compare against the released route, not an
+                    // assumption that every non-JPEG format ignores its tag.
+                    let legacy_orientation = if folder {
+                        read_exif_orientation(&req.path.join(&leaf))
+                    } else {
+                        read_exif_orientation_from_bytes(&bytes)
+                    };
                     assert_eq!(
                         pixels.source_dims,
-                        Some(if orientation == 1 {
-                            dims
-                        } else {
+                        Some(if (5..=8).contains(&legacy_orientation) {
                             (dims.1, dims.0)
+                        } else {
+                            dims
                         }),
                         "{extension}/{orientation}/{folder}"
                     );

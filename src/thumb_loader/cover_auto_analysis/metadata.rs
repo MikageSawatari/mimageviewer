@@ -18,19 +18,22 @@ impl Default for AnalysisExif {
     }
 }
 
-fn from_rexif(exif: &rexif::ExifData) -> AnalysisExif {
+fn has_shot_exif(exif: &rexif::ExifData) -> bool {
+    // Numeric tags in another IFD must not count as exposure information.
+    exif.entries
+        .iter()
+        .any(|entry| entry.kind == rexif::IfdKind::Exif && matches!(entry.ifd.tag, 33434 | 33437))
+}
+
+fn from_rexif(exif: &rexif::ExifData, fallback: impl FnOnce() -> u16) -> AnalysisExif {
     AnalysisExif {
         orientation: exif
             .entries
             .iter()
             .find(|entry| entry.ifd.tag == 274)
             .and_then(crate::thumb_loader::orientation_from_rexif_entry)
-            .unwrap_or(1),
-        // The numeric tags in another IFD must not accidentally count as
-        // photographic exposure information.
-        shot_exif: exif.entries.iter().any(|entry| {
-            entry.kind == rexif::IfdKind::Exif && matches!(entry.ifd.tag, 33434 | 33437)
-        }),
+            .unwrap_or_else(fallback),
+        shot_exif: has_shot_exif(exif),
     }
 }
 
@@ -41,7 +44,12 @@ fn from_tiff_payload(bytes: &[u8]) -> AnalysisExif {
     rexif::parse_buffer(bytes)
         .ok()
         .as_ref()
-        .map(from_rexif)
+        // Decoder metadata extends G1 only. Its orientation is not part of
+        // the released bytes decoder's rexif-only coordinate system.
+        .map(|exif| AnalysisExif {
+            orientation: 1,
+            shot_exif: has_shot_exif(exif),
+        })
         .unwrap_or_default()
 }
 
@@ -57,7 +65,7 @@ pub(super) fn from_decoder(decoder: &mut impl ImageDecoder) -> AnalysisExif {
 
 pub(super) fn from_bytes(bytes: &[u8]) -> AnalysisExif {
     if let Ok(exif) = rexif::parse_buffer(bytes) {
-        return from_rexif(&exif);
+        return from_rexif(&exif, || 1);
     }
     // PNG eXIf / WebP EXIF are extracted from bytes the analysis already owns.
     // No path reopening or metadata-only full-file read is introduced.
@@ -72,14 +80,11 @@ pub(super) fn from_bytes(bytes: &[u8]) -> AnalysisExif {
 pub(super) fn from_path(path: &Path) -> AnalysisExif {
     let parsed = crate::exif_reader::read_rexif_from_path(path);
     if let Some(exif) = parsed.exif {
-        let mut result = from_rexif(&exif);
-        if !exif.entries.iter().any(|entry| {
-            entry.ifd.tag == 274
-                && crate::thumb_loader::orientation_from_rexif_entry(entry).is_some()
-        }) {
-            result.orientation = crate::wic_decoder::read_wic_orientation(path).unwrap_or(1);
-        }
-        return result;
+        // Match read_exif_orientation_from_file's first-tag rule exactly,
+        // including an invalid first tag followed by another orientation.
+        return from_rexif(&exif, || {
+            crate::wic_decoder::read_wic_orientation(path).unwrap_or(1)
+        });
     }
     // Preserve the existing WIC orientation fallback. G1 is unavailable for a
     // non-JPEG/TIFF path whose full raster was supplied by another caller:
@@ -87,6 +92,20 @@ pub(super) fn from_path(path: &Path) -> AnalysisExif {
     AnalysisExif {
         orientation: crate::wic_decoder::read_wic_orientation(path).unwrap_or(1),
         shot_exif: false,
+    }
+}
+
+/// JPEG analysis already owns these bytes. Preserve the file decoder's WIC
+/// fallback without parsing its rexif data or reading its prefix a second time.
+pub(super) fn from_path_bytes(path: &Path, bytes: &[u8]) -> AnalysisExif {
+    match crate::exif_reader::read_rexif_from_path_bytes(bytes) {
+        Some(exif) => from_rexif(&exif, || {
+            crate::wic_decoder::read_wic_orientation(path).unwrap_or(1)
+        }),
+        None => AnalysisExif {
+            orientation: crate::wic_decoder::read_wic_orientation(path).unwrap_or(1),
+            shot_exif: false,
+        },
     }
 }
 
@@ -185,6 +204,59 @@ pub(in crate::thumb_loader) mod tests {
     }
 
     #[test]
+    fn cover_auto_analysis_legacy_orientation_uses_first_tag_then_fallback() {
+        let valid = rexif::parse_buffer(&tiff_fixture(6, &[], true)).unwrap();
+        assert_eq!(
+            from_rexif(&valid, || panic!("valid rexif orientation wins")).orientation,
+            6
+        );
+        let mut invalid = rexif::parse_buffer(&tiff_fixture(99, &[], true)).unwrap();
+        invalid.entries.extend(
+            valid
+                .entries
+                .into_iter()
+                .filter(|entry| entry.ifd.tag == 274),
+        );
+        // The ordinary reader finds the first tag before validating it. A
+        // later valid duplicate must not suppress the file's WIC fallback.
+        assert_eq!(from_rexif(&invalid, || 7).orientation, 7);
+    }
+
+    #[test]
+    fn cover_auto_analysis_owned_file_bytes_keep_legacy_jpeg_prefix_limit() {
+        let suffix = jpeg_with_exif(
+            &[0xff, 0xd8, 0xff, 0xda, 0, 2],
+            &tiff_fixture(6, &[33434], true),
+        );
+        let mut bytes = vec![0xff, 0xd8, 0xff, 0xe0, 0, 16];
+        bytes.extend_from_slice(b"JFIF\0\x01\x01\0\0\x01\0\x01\0\0");
+        for _ in 0..260 {
+            bytes.extend([0xff, 0xef, 0xff, 0xff]);
+            bytes.resize(bytes.len() + 65_533, 0);
+        }
+        bytes.extend_from_slice(&suffix[2..]);
+        // The legacy bytes reader has no file-prefix bound, while the file
+        // reader deliberately stops before this late APP1 segment.
+        assert_eq!(
+            from_bytes(&bytes),
+            AnalysisExif {
+                orientation: 6,
+                shot_exif: true
+            }
+        );
+        assert!(crate::exif_reader::read_rexif_from_path_bytes(&bytes).is_none());
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("late-exif.jpg");
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(from_path_bytes(&path, &bytes), from_path(&path));
+        assert_eq!(
+            from_path_bytes(&path, &bytes).orientation,
+            crate::thumb_loader::read_exif_orientation(&path)
+        );
+        assert!(!from_path_bytes(&path, &bytes).shot_exif);
+    }
+
+    #[test]
     fn cover_auto_analysis_jpeg_and_tiff_metadata_bytes_match_existing_path_prefix() {
         let temp = tempfile::tempdir().unwrap();
         for tags in [&[][..], &[33434][..], &[33437][..], &[33434, 33437][..]] {
@@ -194,6 +266,11 @@ pub(in crate::thumb_loader) mod tests {
                 let path = temp.path().join(name);
                 std::fs::write(&path, bytes).unwrap();
                 assert_eq!(from_path(&path), from_bytes(bytes));
+                assert_eq!(from_path_bytes(&path, bytes), from_path(&path));
+                assert_eq!(
+                    from_path(&path).orientation,
+                    crate::thumb_loader::read_exif_orientation(&path)
+                );
                 assert_eq!(from_path(&path).shot_exif, !tags.is_empty());
             }
         }
@@ -206,7 +283,7 @@ pub(in crate::thumb_loader) mod tests {
                 assert_eq!(
                     from_bytes(&native_with_exif(webp, tiff_fixture(6, tags, true))),
                     AnalysisExif {
-                        orientation: 6,
+                        orientation: 1,
                         shot_exif: !tags.is_empty()
                     }
                 );

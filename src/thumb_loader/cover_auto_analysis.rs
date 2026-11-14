@@ -15,10 +15,10 @@ const ANALYSIS_DECODE_HEIGHT: u32 = 1024;
 pub(crate) struct CoverAutoAnalysis {
     pub image: image::DynamicImage,
     pub decoder: crate::stats::DecodeSource,
-    /// EXIF-upright image dimensions; PDF uses page-box catalog units, because
+    /// Dimensions after the released decoder's orientation rules. PDF uses page-box catalog units, because
     /// only the ratio enters the detector (not the display raster's rounding).
     pub native_dims: (u32, u32),
-    /// Native EXIF-upright pixels, or unrounded PDF page-box points for G2.
+    /// Native pixels in the released decoder's coordinates, or unrounded PDF page-box points for G2.
     pub photo_dims: (f64, f64),
     pub shot_exif: bool,
     pub orientation: u16,
@@ -33,7 +33,7 @@ fn check_cancel(cancel: Option<&Arc<AtomicBool>>) -> Result<(), String> {
     }
 }
 
-/// `full_decode`, when supplied, is already EXIF-upright and full resolution.
+/// `full_decode`, when supplied, already uses the released orientation rules and is full resolution.
 /// A JPEG never reuses it: its fixed DCT selection must be identical in every
 /// caller even if the display path happened to decode a different resolution.
 pub(crate) fn decode_cover_auto_analysis_image(
@@ -66,7 +66,10 @@ pub(crate) fn decode_cover_auto_analysis_image(
         };
         if let Some(bytes) = bytes {
             check_cancel(cancel)?;
-            let metadata = metadata::from_bytes(bytes);
+            let metadata = match source {
+                Source::Path(path) => metadata::from_path_bytes(path, bytes),
+                Source::Bytes { .. } => metadata::from_bytes(bytes),
+            };
             exif = Some(metadata);
             match decode_jpeg_turbo_scaled_with_orientation(
                 bytes,
@@ -109,17 +112,8 @@ pub(crate) fn decode_cover_auto_analysis_image(
         Source::Bytes { bytes, .. } => metadata::from_bytes(bytes),
     });
     let orientation = metadata.orientation;
-    // Ordinary bytes decodes currently apply rexif orientation only, which
-    // cannot see PNG/WebP EXIF. Own this analysis decode when decoder metadata
-    // reveals a transform; do not change the separate display decode contract.
-    let reuse_full = !matches!(source, Source::Bytes { bytes, .. }
-        if orientation != 1 && matches!(image::guess_format(bytes),
-            Ok(image::ImageFormat::Png | image::ImageFormat::WebP)));
     let mut decoder = crate::stats::DecodeSource::Native;
-    let image = if !jpeg
-        && reuse_full
-        && let Some(image) = full_decode
-    {
+    let image = if !jpeg && let Some(image) = full_decode {
         image.clone()
     } else {
         let decoded = crate::image_decode::decode(
@@ -178,11 +172,14 @@ fn decode_native_metadata_path(
     })
     .map_err(|error| error.to_string())?;
     check_cancel(cancel)?;
-    let metadata = metadata.unwrap_or_else(|| metadata::from_path(path));
+    let mut metadata = metadata.unwrap_or_default();
     let decoder = decoded.decoder;
     let image = if decoded.orientation == crate::image_decode::Orientation::Applied {
         decoded.image
     } else {
+        // Decoder metadata is for G1 only. File orientation must use exactly
+        // the same rexif -> WIC fallback as ordinary/manual file decoding.
+        metadata.orientation = read_exif_orientation(path);
         apply_orientation(decoded.image, metadata.orientation)
     };
     Ok(CoverAutoAnalysis {
@@ -366,10 +363,26 @@ mod tests {
                 },
             ] {
                 let analysis = decode_cover_auto_analysis_image(source, None, None).unwrap();
-                assert_eq!(analysis.orientation, 6);
+                let legacy = match source {
+                    Source::Path(path) => read_exif_orientation(path),
+                    Source::Bytes { bytes, .. } => read_exif_orientation_from_bytes(bytes),
+                };
+                let expected = crate::image_decode::decode(
+                    source,
+                    crate::avif_decoder::Workload::Background,
+                    false,
+                    None,
+                )
+                .unwrap()
+                .oriented(source);
+                assert_eq!(analysis.orientation, legacy);
                 assert!(analysis.shot_exif);
-                assert_eq!(analysis.native_dims, (60, 90));
-                assert_eq!(analysis.photo_dims, (60.0, 90.0));
+                assert_eq!(analysis.native_dims, (expected.width(), expected.height()));
+                assert_eq!(
+                    analysis.photo_dims,
+                    (f64::from(expected.width()), f64::from(expected.height()))
+                );
+                assert_eq!(analysis.image.to_rgba8(), expected.to_rgba8());
             }
             let display = image::load_from_memory(&bytes).unwrap();
             let owned = decode_cover_auto_analysis_image(
@@ -381,7 +394,8 @@ mod tests {
                 None,
             )
             .unwrap();
-            assert_eq!(owned.native_dims, (60, 90));
+            assert_eq!(owned.native_dims, (90, 60));
+            assert_eq!(owned.image.to_rgba8(), display.to_rgba8());
             assert!(owned.shot_exif);
             // A supplied upright PNG/WebP file raster is reused. G1 is skipped
             // because collecting it would require another file read.

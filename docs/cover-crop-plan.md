@@ -1577,7 +1577,7 @@ r2 = REVISE (P2 1 件、ほかは r1 の指摘を閉じた)。v2 キーで `auto
     カメラの写真の多くは JPEG なので、効き目の大半は JPEG で得られる。
   - PDF の表紙 (描画したページ) は EXIF を持たないので、G1 は掛からない。EXIF を持たない画像も同じ。
   - テスト: EXIF 付きの JPEG (bytes・ファイル)、EXIF 付きの PNG と WebP (取り出せる場合)、EXIF の無い画像。
-- **G2 縦横を入れ替えた寸法**: 表紙の寸法 (EXIF の向きを適用後) の縦横を入れ替えたものが、比率の標本に読んだページのどれかの寸法と一致する。
+- **G2 縦横を入れ替えた寸法**: 表紙の寸法 (従来のデコードと同じ向きの規則を適用後、その判定角度の保存回転を適用した寸法) の縦横を入れ替えたものが、比率の標本に読んだページのどれかの寸法と一致する。
   - 画像 (ZIP・フォルダ) は画素で比べ、±1 px まで一致とみなす。PDF はページの大きさ (point) で比べ、相対 0.5% まで一致とみなす。
   - **A 判・B 判の除外 (独立レビュー r2)**: 本文の比率 (§24 で決まった値) が 1/√2 (0.7071) の ±1% に入るときは G2 を掛けない。
     A 判・B 判 (日本の漫画の B6 も含む) では、表表紙と裏表紙の 2 ページを並べた表紙が、ちょうど本文のページの縦横を入れ替えた
@@ -1588,6 +1588,11 @@ r2 = REVISE (P2 1 件、ほかは r1 の指摘を閉じた)。v2 キーで `auto
     比率の helper が寸法の並びも返す形にする。
 - 正例への影響: 利用者の画像フォルダの本で表紙が横長の 795 冊のうち、G1 に当たるのは 0 冊、G2 に当たるのは 1 冊 (件数だけ記録)。
   利用者の PDF の正例 17 冊・合成本・合成ダミーは、EXIF も同じ寸法も無いので結果は変わらない。
+- **G2 が落とし得る非写真の正例 (独立レビュー r3、受け入れ)**: 表紙と本文を違う解像度で取り込み、表紙の寸法の縦横を入れ替えたものが
+  本文の寸法に画素単位で一致すると、写真でない正常な表紙でも G2 で切らない (例: 表紙 900×600 と本文 600×900)。同じ解像度で取り込んだ
+  本 (本文の比率 0.5 以上) では、つながった表紙の幅 (表表紙・裏表紙の 2 枚だけで本文の幅の 2 倍) が本文の高さを超えるので起きない。
+  2 ページを並べた A 判・B 判は上の除外で扱う。残るのは解像度の組み合わせが画素単位で合う偶然だけで、上の 795 冊中 1 冊がこれに当たり得る。
+  写真のアルバムを切らない効果と引き換えに受け入れる (利用者決定 案 1 の数字の範囲内)。切れない本は手動の範囲指定で扱える。
 - 写真の負例 34 組への効き方: G1 で 15 組、G2 で 8 組、どちらかで 17 組を止める (pxhere の写真は 77% が撮影情報を消してあり、
   G2 は写真をランダムに組んだ。1 台のカメラで撮った実際のフォルダやアルバムでは、どちらも効きやすい見込み)。
 - 範囲画面 (§25) の理由の言葉: 「写真のように見えるため自動では切りません」。
@@ -1604,3 +1609,9 @@ r2 = REVISE (P2 1 件、ほかは r1 の指摘を閉じた)。v2 キーで `auto
 - 主な回帰: `cover_auto_analysis_exif_requires_exif_ifd_and_extracts_orientation_in_same_parse`、JPEG/TIFFのbytes/path一致、PNG/WebPのmetadata、`cover_auto_photo_pixels_accept_one_pixel_and_keep_all_sample_slots`、`cover_auto_photo_pdf_preserves_points_and_relative_tolerance`、A判/B判の画像・PDF除外、`cover_auto_photo_guard_follows_raw_gate_and_does_not_reach_jacket_rules`、`cover_auto_photo_shot_exif_reaches_zip_and_folder_workers_with_upright_material`、`cover_auto_photo_pdf_worker_applies_transposed_page_guard_with_same_lease`、worker/範囲画面4方向一致と理由表示。
 - 検証:上記の焦点nextest **629件成功**。G1はJPEG/PNG/WebP×向き2通り×撮影情報の有無×ZIP/フォルダの24入力組合せで、撮影情報が無ければ切れる同じ表紙が見送られることと正立寸法を検査した。worker/範囲画面の比較は16入力組合せ×4方向で一致。PDFは同じpassword/leaseのままG2で見送る。
 - 合成フォルダ評価1件は切り出し0・見送り1で、summary.jsonだけを出力し、画像出力や個別名が無いことを検査した。UI snapshot **257件成功**。利用者データ・外部評価画像・sheetは使用/閲覧していない。
+- r3対応: PNG/WebPのデコーダmetadataはG1の撮影情報だけに使い、bytesの向きは従来のrexifだけ、ファイルの向きは従来のrexif→WICに合わせた。`read_exif_orientation(path)`が実際にWICへfallbackするため、そのfallbackは維持する。JPEGの既読bytesから解析する場合も、従来のファイル経路と同じfallbackを使う。出荷済みの手動範囲・本文標本の座標系は変えない。
+- r3対応: JPEGファイルの16MiBの先頭上限・壊れたmarkerの扱いも、`exif_reader`の同じreader処理を既読bytesへ適用して維持する。追加のファイル読み直しはない。`cover_auto_analysis_owned_file_bytes_keep_legacy_jpeg_prefix_limit`で、上限の後ろのEXIFについてbytes経路とファイル経路の従来の差も固定する。
+- r3検証時の確認: このWindows環境ではWebPファイルのOrientation=6は従来のWIC経路で適用され、同じWebPのZIP bytes経路では適用されない。形式名で一律に向きを決めず、各入力の従来経路をoracleにして検査する。PNGのOrientation=6はZIP/フォルダとも従来の座標のままで、自動枠のOK保存・再読込の回帰が成功した。
+- r3対応: G2へ渡す画素/point寸法は、その保存回転の判定角度へ投影してから比較する。G1の撮影情報は回転で変えない。
+- r3回帰: `cover_crop_png_orientation6_auto_accept_reload_keeps_legacy_manual_pixels_in_zip_and_folder`で、Orientation=6のPNG表紙・本文を実デコードし、自動枠→画面のOK→保存→再読込→手動workerの画素とcache行まで検査する。`cover_crop_worker_and_dialog_g2_match_every_physical_and_saved_rotation`は、G2なしなら切れる合成ジャケットを物理回転4方向×保存回転4方向で比較し、ZIP/フォルダのworker・範囲画面の結果を固定する。画素/point両方のG1/G2の回転行列と、JPEGの従来の向きも焦点テストで確認する。
+- r3検証: `cover_auto|cover_crop|cover_rotation|exif_reader` の焦点nextest **220件成功・失敗0**（既存EXIF読取15件を含む）。初回の既存G1テストのWebPファイル寸法の期待値は、従来のWIC経路をoracleにして修正後、全件再実行した。`cargo fmt`・`git diff --check`成功。レイアウト・文言を変更していないためUI snapshotは再実行せず、PNG更新なし。利用者データ・外部評価画像は使用していない。

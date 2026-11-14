@@ -22,6 +22,9 @@ use eframe::egui;
 mod automatic;
 #[cfg(test)]
 mod automatic_tests;
+#[cfg(test)]
+#[path = "cover_crop/legacy_orientation_tests.rs"]
+mod legacy_orientation_tests;
 use automatic::{AutoDetection, AutoStop};
 
 const UNIT: usize = 1_000_000;

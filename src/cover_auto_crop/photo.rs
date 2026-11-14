@@ -1,10 +1,11 @@
-//! Photo evidence is source metadata, independent of saved display rotation.
+//! Photo evidence projected by the caller into the current saved display rotation.
 use crate::cover_auto_sample::{PageAspectSample, PageDimensionUnits};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PhotoEvidence {
     pub shot_exif: bool,
-    /// EXIF-upright native pixels, or actual PDF page-box points.
+    /// Native pixels under the released orientation rules, or actual PDF page-box points,
+    /// projected into the angle currently being analyzed.
     pub dimensions: (f64, f64),
 }
 

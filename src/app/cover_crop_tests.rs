@@ -6,15 +6,19 @@ impl App {
     pub(crate) fn cover_crop_tile_request_for_test(&self, idx: usize) -> LoadRequest {
         let item = &self.items[idx];
         let path = match item {
-            GridItem::ZipFile(path) | GridItem::PdfFile(path) => path,
-            _ => panic!("rotation fixture expects a ZIP/PDF book tile"),
+            GridItem::Folder(path) | GridItem::ZipFile(path) | GridItem::PdfFile(path) => path,
+            _ => panic!("crop fixture expects a folder/ZIP/PDF book tile"),
         };
         let metadata = std::fs::metadata(path).unwrap();
         make_load_request_with_visibility(
             item,
             idx,
             crate::ui_helpers::mtime_secs(&metadata),
-            metadata.len() as i64,
+            if metadata.is_dir() {
+                0
+            } else {
+                metadata.len() as i64
+            },
             false,
             None,
             Some(crate::settings::SortOrder::Numeric),

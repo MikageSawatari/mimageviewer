@@ -277,10 +277,15 @@ fn detect_cover_crop_at_rotation_with_evidence(
     page_aspect
         .filter(|aspect| aspect.is_finite() && *aspect > 0.0)
         .ok_or(AutoCropDecline::PageAspectMissing)?;
-    if let Some((sample, evidence)) = evidence
-        && let Some(reason) = photo::photo_like_reason(evidence, sample)
-    {
-        return Err(AutoCropDecline::PhotoLike { reason });
+    if let Some((sample, mut evidence)) = evidence {
+        // G2 compares the cover as displayed at this saved angle. Keep PDF
+        // point precision here instead of substituting rounded native_dims.
+        if matches!(rotation, Rotation::Cw90 | Rotation::Cw270) {
+            evidence.dimensions = (evidence.dimensions.1, evidence.dimensions.0);
+        }
+        if let Some(reason) = photo::photo_like_reason(evidence, sample) {
+            return Err(AutoCropDecline::PhotoLike { reason });
+        }
     }
     let rotated;
     let image = match rotation {
