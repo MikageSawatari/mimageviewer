@@ -60,7 +60,7 @@
 
 ### 1.786 MCP の許可を変えても、AI アプリの tool 一覧が変わらないことがある (list_changed を取り直さないクライアント) — サブ PC の確認から (2026-11-14)
 
-- 状態: **未着手・調査から。出荷済みの MCP の挙動に関わるので、直し方は利用者の判断が要る**。
+- 状態: **方針決定 (利用者 2026-11-14): 許可で隠している tool をすべて常に tools/list に出し、許可が無ければ permission の error を返す。v5.3.0 で文字起こし T1 と一緒に出す (feat-asr-t1 の上で実装)。** マニュアルと privacy.html (許可 OFF でも機能の名前は見える) を直す。
 - 観測 (サブ PC 担当、依頼 52 第 4 部、文字起こし T1 のビルド): 「文字起こしを AI に見せる」を ON にした後も、Claude Code のセッションの tool 一覧に `get_transcript` が出なかった (2 回確認)。adapter は initialize で `tools.listChanged: true` を宣言し、許可の OFF・ON のたびに `notifications/tools/list_changed` を送っていた。同じ adapter を小さな stdio client で起動すると、ON 時の tools/list に含まれ、本文も読めた。
 - 原因の位置づけ (T1 担当のコード参照): T1 だけの作りではない。出荷済みの MCP の設計 ([MCP 連携の計画](mcp-integration-plan.md) 247 行目付近と §8.x) は、許可より上の tool を tools/list に出さず、許可を変えたら list_changed を送る方式で、`get_thumbnail` (縮小画像)・`open_in_viewer`・書き込み系も同じ。クライアントが list_changed で一覧を取り直さないなら、それらでも同じことが起きるはず (未確認)。マニュアル ai-integration.html の「変えた時点で反映されます」は、その場合は偽になる。
 - 次にすること: Claude Desktop・Claude Code・ChatGPT Codex が list_changed で一覧を取り直すかを確かめる (サブ PC では、縮小画像のチェックを ON にして `get_thumbnail` が出るかを見れば、既存の tool でも同じかが分かる)。取り直さないクライアントがあるなら、(a) 許可で隠す tool をすべて「常に一覧に出し、許可が無ければ permission の error を返す」形にそろえる (許可 OFF でも tool 名が見える。マニュアル・プライバシーの説明も変わる)、(b) 「許可を変えたら AI アプリを起動し直す」と案内する、のどちらかを利用者と決める。get_transcript だけを特別扱いにはしない (1 つの規則を 2 通りに書かない)。
