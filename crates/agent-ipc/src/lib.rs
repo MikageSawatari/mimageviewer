@@ -11,7 +11,7 @@ pub use read_types::*;
 mod folder_types;
 pub use folder_types::*;
 
-pub const AGENT_PROTOCOL_VERSION: u32 = 3;
+pub const AGENT_PROTOCOL_VERSION: u32 = 4;
 pub const MAX_CLIENT_NAME_CHARS: usize = 128;
 pub const MAX_CLIENT_VERSION_CHARS: usize = 64;
 
@@ -121,6 +121,11 @@ pub enum Command {
         limit: Option<u32>,
         cursor: Option<String>,
     },
+    GetTranscript {
+        item: ItemRef,
+        start_secs: Option<f64>,
+        cursor: Option<String>,
+    },
     ListFolder {
         path: String,
         subresource: Option<String>,
@@ -187,6 +192,7 @@ pub enum Payload {
     Collections(CollectionPage),
     Library(LibraryPage),
     Info(InfoPage),
+    Transcript(TranscriptReadResult),
     Folder(FolderPage),
     Thumbnails(ThumbnailResponse),
     Opened(OpenResult),
@@ -315,6 +321,8 @@ pub struct PermissionSnapshot {
     pub gps: bool,
     #[serde(default)]
     pub ai_captions: bool,
+    #[serde(default)]
+    pub transcripts: bool,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -552,7 +560,7 @@ mod tests {
     use super::*;
     #[test]
     fn handshake_version_requires_exact_equality() {
-        for version in [0, 1, 2, AGENT_PROTOCOL_VERSION, u32::MAX] {
+        for version in [0, 1, 2, 3, AGENT_PROTOCOL_VERSION, u32::MAX] {
             if version == AGENT_PROTOCOL_VERSION {
                 assert!(check_version(version).is_ok());
             } else {
@@ -677,7 +685,7 @@ mod tests {
             incomplete["command"].as_object_mut().unwrap().remove(field);
             assert!(serde_json::from_value::<Request>(incomplete).is_err());
         }
-        assert_eq!(AGENT_PROTOCOL_VERSION, 3);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 4);
     }
 
     #[test]
@@ -725,6 +733,14 @@ mod tests {
                 }],
                 limit: Some(MAX_INFO_LIMIT),
                 cursor: Some("info-cursor".into()),
+            },
+            Command::GetTranscript {
+                item: ItemRef {
+                    path: "C:/videos/cat.mkv".into(),
+                    subresource: None,
+                },
+                start_secs: Some(12.5),
+                cursor: Some("transcript-cursor".into()),
             },
             Command::Cancel { request_id: 2 },
             Command::OpenInViewer {
@@ -784,13 +800,14 @@ mod tests {
                 thumbnails: false,
                 gps: false,
                 ai_captions: false,
+                transcripts: false,
             }
         );
     }
 
     #[test]
     fn collection_write_wire_roundtrips_grouped_input_positions() {
-        assert_eq!(AGENT_PROTOCOL_VERSION, 3);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 4);
         let reference = ItemRef {
             path: "C:/本.zip".into(),
             subresource: Some("001.png".into()),
@@ -848,11 +865,13 @@ mod tests {
     }
 
     #[test]
-    fn caption_permission_defaults_false_without_protocol_change() {
+    fn caption_and_transcript_permissions_default_false() {
         let old = r#"{"level":"read_only","thumbnails":true,"gps":false}"#;
         let mut permission: PermissionSnapshot = serde_json::from_str(old).unwrap();
         assert!(!permission.ai_captions);
+        assert!(!permission.transcripts);
         permission.ai_captions = true;
+        permission.transcripts = true;
         assert_eq!(
             serde_json::from_str::<PermissionSnapshot>(
                 &serde_json::to_string(&permission).unwrap()
@@ -860,12 +879,86 @@ mod tests {
             .unwrap(),
             permission
         );
-        assert_eq!(AGENT_PROTOCOL_VERSION, 3);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 4);
+    }
+
+    #[test]
+    fn transcript_wire_roundtrips_tagged_states_and_flattened_pages() {
+        let info = TranscriptInfo {
+            model: "fixture-model".into(),
+            created_at: 1_730_000_000_000,
+            audio_stream: Some(2),
+            duration_secs: 60.5,
+            segment_count: 2,
+            char_count: 8,
+            stale: false,
+        };
+        for field in [
+            TranscriptField::Present(info.clone()),
+            TranscriptField::None,
+            TranscriptField::Failed,
+            TranscriptField::NotPermitted,
+        ] {
+            let value = serde_json::to_value(&field).unwrap();
+            assert_eq!(
+                serde_json::from_value::<TranscriptField>(value.clone()).unwrap(),
+                field
+            );
+            assert_eq!(
+                value.get("value").is_some(),
+                matches!(field, TranscriptField::Present(_))
+            );
+        }
+        let page = TranscriptPage {
+            info,
+            segments: vec![TranscriptSegmentInfo {
+                start_secs: 12.5,
+                end_secs: 15.0,
+                text: TextValue {
+                    text: "猫の声".into(),
+                    truncated: true,
+                },
+            }],
+            cursor: Some("opaque".into()),
+            truncated: true,
+        };
+        let value = serde_json::to_value(&page).unwrap();
+        assert!(value.get("info").is_none());
+        assert_eq!(value["model"], "fixture-model");
+        assert_eq!(value["segments"][0]["start_secs"], 12.5);
+        assert_eq!(value["segments"][0]["text"]["truncated"], true);
+        for read in [
+            TranscriptReadResult::Present(page),
+            TranscriptReadResult::None,
+            TranscriptReadResult::Failed,
+            TranscriptReadResult::NotApplicable,
+        ] {
+            let response = Response {
+                id: 5,
+                result: Ok(Payload::Transcript(read.clone())),
+            };
+            let mut bytes = vec![];
+            write_frame(&mut bytes, &response).unwrap();
+            assert_eq!(
+                read_frame::<_, Response>(&mut &bytes[..]).unwrap(),
+                Some(response)
+            );
+            let value = serde_json::to_value(&read).unwrap();
+            assert_eq!(
+                value.get("value").is_some(),
+                matches!(read, TranscriptReadResult::Present(_))
+            );
+        }
+        assert!(serde_json::from_str::<TranscriptField>(r#"{"status":"not_applicable"}"#).is_err());
+        assert!(
+            serde_json::from_str::<TranscriptReadResult>(r#"{"status":"not_permitted"}"#).is_err()
+        );
+        assert!(serde_json::from_str::<TranscriptReadResult>(r#"{"status":"present"}"#).is_err());
     }
 
     #[test]
     fn metadata_write_wire_roundtrips_and_full_batch_outcomes_fit_budget() {
-        assert_eq!(AGENT_PROTOCOL_VERSION, 3);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 4);
         let reference = ItemRef {
             path: "C:/本.zip".into(),
             subresource: Some("001.png".into()),
@@ -942,7 +1035,7 @@ mod tests {
 
     #[test]
     fn open_wire_uses_typed_accepted_result_without_changing_protocol_version() {
-        assert_eq!(AGENT_PROTOCOL_VERSION, 3);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 4);
         assert_eq!(
             serde_json::to_value(Command::OpenInViewer {
                 path: "C:/猫.png".into(),

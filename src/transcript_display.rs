@@ -149,8 +149,6 @@ pub(crate) fn build_transcript_snapshot(
     }
     snapshot.segments = Arc::clone(&row.segments);
     let stale = value.is_stale();
-    #[cfg(windows)]
-    let stale = stale || row.config_version != crate::ai::transcript_job_worker::CONFIG_VERSION;
     snapshot.state = if stale {
         TranscriptDataState::Stale
     } else {

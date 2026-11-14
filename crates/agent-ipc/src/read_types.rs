@@ -167,6 +167,55 @@ pub struct AiCaptionInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TranscriptInfo {
+    pub model: String,
+    /// UTC Unix milliseconds, matching the transcript store.
+    pub created_at: i64,
+    pub audio_stream: Option<usize>,
+    /// Seconds relative to the container's start, matching saved segment times.
+    pub duration_secs: f64,
+    pub segment_count: u64,
+    pub char_count: u64,
+    pub stale: bool,
+}
+
+/// Transcript permission is independent of caption and other metadata access.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "status", content = "value", rename_all = "snake_case")]
+pub enum TranscriptField {
+    Present(TranscriptInfo),
+    None,
+    Failed,
+    NotPermitted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TranscriptSegmentInfo {
+    /// Seconds relative to the container's start, without conversion to raw PTS.
+    pub start_secs: f64,
+    pub end_secs: f64,
+    pub text: TextValue,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TranscriptPage {
+    #[serde(flatten)]
+    pub info: TranscriptInfo,
+    pub segments: Vec<TranscriptSegmentInfo>,
+    pub cursor: Option<String>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "status", content = "value", rename_all = "snake_case")]
+pub enum TranscriptReadResult {
+    Present(TranscriptPage),
+    None,
+    Failed,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ItemInfo {
     pub item: ItemRef,
     pub name: String,
@@ -183,6 +232,7 @@ pub struct ItemInfo {
     pub generation: InfoField<GenerationInfo>,
     pub ai_caption: CaptionField,
     pub container_ai_caption: Option<CaptionField>,
+    pub transcript: TranscriptField,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

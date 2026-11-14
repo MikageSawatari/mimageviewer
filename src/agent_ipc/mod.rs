@@ -27,6 +27,7 @@ mod collection_write;
 #[cfg(test)]
 mod collection_write_tests;
 mod thumbnail;
+mod transcript;
 mod work;
 use work::*;
 
@@ -423,6 +424,13 @@ impl Connection {
             ));
             return None;
         }
+        if matches!(request.command, Command::GetTranscript { .. }) && !granted.0.transcripts {
+            reject(error(
+                ErrorCode::Disabled,
+                "AI に文字起こしを見せる設定は無効です",
+            ));
+            return None;
+        }
         if matches!(request.command, Command::OpenInViewer { .. })
             && granted.0.level < AgentLevel::ReadAndOpen
         {
@@ -606,6 +614,7 @@ fn tool_name(command: &Command) -> &'static str {
         Command::GetItemInfo { .. } => "get_item_info",
         Command::ListFolder { .. } => "list_folder",
         Command::GetThumbnail { .. } => "get_thumbnail",
+        Command::GetTranscript { .. } => "get_transcript",
         Command::OpenInViewer { .. } => "open_in_viewer",
         Command::CreateCollection { .. } => "create_collection",
         Command::RenameCollection { .. } => "rename_collection",
@@ -626,6 +635,9 @@ fn result_summary(result: &Result<Payload, AgentError>) -> (usize, &'static str)
         Ok(Payload::Info(p)) => (p.items.len(), "none"),
         Ok(Payload::Folder(p)) => (p.items.len(), "none"),
         Ok(Payload::Thumbnails(p)) => (p.page.items.len(), "none"),
+        Ok(Payload::Transcript(TranscriptReadResult::Present(page))) => {
+            (page.segments.len(), "none")
+        }
         Ok(Payload::CollectionWrite(result)) => (
             match result {
                 CollectionWriteResult::Created { .. } | CollectionWriteResult::Renamed { .. } => 1,
@@ -803,6 +815,13 @@ impl Handlers {
                 long_side,
                 cursor,
             } => self.get_thumbnail(items, long_side, cursor, ctx),
+            Command::GetTranscript {
+                item,
+                start_secs,
+                cursor,
+            } => self
+                .get_transcript(item, start_secs, cursor, ctx)
+                .map(Payload::Transcript),
             Command::Cancel { .. }
             | Command::SearchItems { .. }
             | Command::OpenInViewer { .. }

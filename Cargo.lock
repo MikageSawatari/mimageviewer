@@ -4153,6 +4153,7 @@ dependencies = [
  "fs4",
  "gilrs",
  "half",
+ "hmac",
  "image",
  "kamadak-exif",
  "libavif-sys",

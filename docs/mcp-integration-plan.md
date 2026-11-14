@@ -118,7 +118,7 @@ master は v4 系に保ち、v5 の公開時期は別途判断する。[統合�
       │ stdio (JSON-RPC, MCP)
       ▼
 [mimageviewer-mcp.exe]  … AI アプリが起動・終了する。業務上の状態を持たない
-      │ named pipe  \\.\pipe\mimageviewer-agent-v1-<user SID>-<data dir hash> (§4.2)
+      │ named pipe  \\.\pipe\mimageviewer-agent-v4-<user SID>-<data dir hash> (§4.2)
       ▼                (current user only, PIPE_REJECT_REMOTE_CLIENTS)
 [mimageviewer-core.exe]  agent lane (新設 src/agent_ipc/)
       ├─ 読み取り: worker thread で既存 reader を呼ぶ
@@ -158,7 +158,7 @@ master は v4 系に保ち、v5 の公開時期は別途判断する。[統合�
 - agent lane の型は新しい crate `crates/agent-ipc` (package `mimageviewer-agent-ipc`) に置き、
   **Remote の `PROTOCOL_VERSION` (現在 72) とは独立した `AGENT_PROTOCOL_VERSION`** を持つ。
   Remote 側の版上げ (他 branch と頻繁に衝突し、max+1 で合わせる運用、web-remote-plan §13.5) に
-  巻き込まない。
+  巻き込まない。T1文字起こしの追加でagentの版は3から4へ上げる。
 - 照合は Remote と同じ厳密一致。MCP exe と core は同じビルドで作り同じフォルダに置くので、
   ずれるのは古い exe を指す設定が残った時だけ。ずれたら tool の結果を
   「mIV と AI 連携の版が違います。設定の案内に従って登録し直してください」の error にする。
@@ -297,13 +297,15 @@ Codex の `auto` や tool 単位の承認設定、Claude の「常に許可」�
   種類・大きさ・寸法・日時、タグ・★・コレクション・本棚・閲覧履歴、画像に埋め込まれたメタ情報
   (撮影日時・機種などの EXIF、AI 生成画像の生成情報 (PNG tEXt チャンク・EXIF UserComment))。
   段階 0 の試験実装はこのうち索引・タグ・コレクションの範囲。
-- **設定で選ぶもの**: 縮小画像 (既定 OFF、§11.1 U2)、撮影位置 (GPS、既定 OFF、§11.1 U6)、AI 説明文 (既定 OFF、local-vlm-caption-plan §21.18)。
+- **設定で選ぶもの**: 縮小画像 (既定 OFF、§11.1 U2)、撮影位置 (GPS、既定 OFF、§11.1 U6)、AI 説明文 (既定 OFF、local-vlm-caption-plan §21.18)、文字起こし (既定 OFF、local-asr-transcript-plan §10)。
   AI 説明文は説明文・画像内の文字・検索語・モデル名・作成日時を含む。表紙に固定した本文のページや ZIP 内の画像から読み取った文字も含む。
   OFF では内容で検索せず内容も返さないが、名前に当たった書庫・フォルダの本が検索に出ることで、説明文の存在を推測できる場合がある。
+- 文字起こしをONにすると、保存済みの音声の文字起こし本文と要約を渡す。話された氏名・私的な会話も文字のままAIアプリへ渡る。
+  AI説明文とは独立した許可であり、OFFでは文字起こしDBを開かず、本文toolの受付でも拒む。
 - **見せないもの**: 画像・動画・音声の元データ、PDF / ZIP の本文そのもの (ページの画像や文章を直接取り出すこと)、mIV の設定・PDF の
   パスワード・リモート接続の暗証番号。
 - 有効化の画面は「AI に見せるもの」「見せないもの」「AI に許す操作」の 3 つの区画を枠付きで縦に並べ、
-  見出し + 箇条書きで示す。選んだ許可の範囲と縮小画像・撮影位置・AI 説明文の設定から生成し、範囲を変えると
+  見出し + 箇条書きで示す。選んだ許可の範囲と縮小画像・撮影位置・AI 説明文・文字起こしの設定から生成し、範囲を変えると
   その場で変わる。3 区画は行の対応が無い独立した一覧なので表 (Grid) にはせず、横並びの無罫線 3 列は
   読みにくいとの利用者の指摘 (2026-11-05) と、狭い幅で項目が何行にも折り返すことを踏まえた配置とする。
   下に「この情報は、お使いの AI アプリ (Claude / ChatGPT) の提供元へ送られます。
@@ -1154,19 +1156,21 @@ U8 で 1 段足して 6 段にする。順序のある 1 つの選択のまま (
 - 設定画面には実装済みの段だけを出す (段階 1 では 1〜3)。設定値は未リリース (2026-10-31 時点で
   `v4.10.1` までのタグに `agent_level` は無い、独立レビューで確認) なので移行は要らない。
   `AgentLevel` に `ReadAndOpen` を足し、保存値は `"read_and_open"`。
-- 縮小画像・撮影位置・AI 説明文 (すべて既定 OFF) のチェックは段とは別に置く (U2・U6、local-vlm-caption-plan §21.18)。
-- **権限 snapshot**: 段・縮小画像・撮影位置・AI 説明文の 4 つを 1 つの値として読み、どれが変わっても epoch を進める。
+- 縮小画像・撮影位置・AI 説明文・文字起こし (すべて既定 OFF) のチェックは段とは別に置く (U2・U6、local-vlm-caption-plan §21.18)。
+- **権限 snapshot**: 段・縮小画像・撮影位置・AI 説明文・文字起こしの 5 つを 1 つの値として読み、どれが変わっても epoch を進める。
   段階 0 の「受付ごとの判定」と「送信直前の再照合」はこの snapshot 全体で行う。生成中に縮小画像・
-  撮影位置・AI 説明文を OFF にしたら、その結果は送らず拒否に置き換える (独立レビュー P1-1)。
+  撮影位置・AI 説明文・文字起こしを OFF にしたら、その結果は送らず拒否に置き換える (独立レビュー P1-1)。
 - 旧版の握手の通知監視は、有効/無効の bool ではなく「その snapshot で出す tool の集合」を比べ、
   変わったら `notifications/tools/list_changed` を送る。
-- 設定の自動転送では、3 つのチェックも `agent_level` と同じく移行対象外にする。
+- 設定の自動転送では、4 つのチェックも `agent_level` と同じく移行対象外にする。
 - V3: `ReadContext` は受付の `(PermissionSnapshot, epoch)` を一組で保持し、`Cursor` と `FolderCursor` の作成・検査にその版を使う。
   cursor の版は 3。続きの受付で許可の版が違えば `PermissionChanged`、連携全体が無効なら `Disabled`、旧版は `BadRequest`。
-  ただし、ツール自体の許可 (縮小画像) が外れた場合は、cursor の検査より前の受付で `Disabled` になる。
+  ただし、ツール自体の許可 (縮小画像・文字起こし) が外れた場合は、cursor の検査より前の受付で `Disabled` になる。
   縮小画像 ON で取得した `get_thumbnail` の cursor でも、連携が有効なまま縮小画像だけ OFF にした続きはこの例外に当たる。
   版はプロセス内の番号なので再起動後に一致することはあるが、検索対象は現在の許可から作る。再起動を越えた件数ずれは既定の割り切りとする。
-  `PermissionSnapshot.ai_captions` は serde の既定 false。未リリースで core/adapter を同時配布するため agent protocol は 2 のまま、tool の一覧も変えない。
+  T1文字起こし追加時は `PermissionSnapshot.transcripts`（serde既定false）を足し、agent IPCを3→4へ上げる。
+  core/adapterは同梱でstrict-equalityのまま。旧設定JSON/DBにkeyが無い場合もOFF。
+  以下はV3追加当時の記録: `PermissionSnapshot.ai_captions` は serde の既定 false。未リリースで core/adapter を同時配布するため agent protocol は 2 のまま、tool の一覧も変えない。
 
 ### 15.3 読み取り tool の拡充 (1a)
 
@@ -1176,7 +1180,27 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
 |---|---|---|
 | `get_collection` | コレクションの中身 (`id` か名前)。並びは一覧画面と同じ | collection actor の `load_collection` + `prepare_collection_snapshot_while` (全項目の stat を伴うが画像の decode はしない)。Remote の view cache (`PersistentCollectionEngine::snapshot`) は使わない |
 | `list_library` | `kind` = `favorites` / `reading_history` / `bookshelf` / `bookmarks` / `rated` | 下の表 |
-| `get_item_info` | 1 回 50 件まで。名前・種類・大きさ・更新日時・寸法・★・タグ・撮影情報・AI 生成情報 | 列ごとの専用の読み取り (下) |
+| `get_item_info` | 1 回 50 件まで。名前・種類・大きさ・更新日時・寸法・★・タグ・撮影情報・AI 生成情報。文字起こしは権限付き要約のみ | 列ごとの専用の読み取り (下) |
+| `get_transcript` | 1本の保存済み文字起こし。`item`、`start_secs?`、`cursor?`。区間・モデル・作成日・音声track・古さを返す | `transcript.db`のread-only取得＋rev/epoch付きcursor。応答worker上のみ |
+
+`get_transcript`（T1区切り4）は `item:{path,subresource?}`、`start_secs?`（既定0）、`cursor?` を受ける。
+時刻は保存済みのコンテナ開始=0秒で、開始秒より後まで続く区間（開始秒に重なる区間も含む）を返す。
+続きは同じitemを指定し、開始秒は省略または初回と同じ値にする。動画/音声の実ファイルのみ対象。
+本文の取得・要約は `agent-read-worker` 上のread-only DB操作で、UI描画や作成ジョブに処理を送らない。
+
+- `get_item_info.transcript` は `present`（model、UTC Unix msのcreated_at、audio_stream、duration_secs、segment_count、char_count、stale）/
+  `none` / `failed` / `not_permitted`。本文は含めない。画像・本・部分指定はcaption同様の空値、DBを読まない。
+- `get_transcript` は `present`（同じ要約＋区間とcursor）/ `none` / `failed` / `not_applicable`。
+  作成中は未保存ならnone、旧行があれば旧行を読む。失敗理由の文字列は返さない。生成や検索は行わない。
+- 区間はstart_secs/end_secsと `text:{text,truncated}`。通常は区間境界でページを切る。
+  1区間だけで項目上限を超える場合のみ本文をUTF-8文字境界で切り、truncatedを付けて次の区間へ進める。
+  ページはcursorを含め `mcp_content_chars` の既存予算内にする。
+- cursorは許可epoch、対象キーdigest、行rev、次の区間位置、初回開始秒を持つ。
+  FolderCursorと同様に要求ごとに行を読み直し、rev変更/削除なら取り直し、epoch変更ならPermissionChanged。
+  文字起こしのチェックOFFはcursor検査前の受付でDisabledとなる（縮小画像と同じ）。
+  HMAC-SHA256のプロセス共通鍵で内容の改ざんも拒否する。行snapshotやcursor台帳はサーバ側に保持しない。
+  再起動前のcursorも無効になる。本文は他のtool文字列と同じuntrusted dataとして扱う。
+- 検索対象Transcript・索引はT2、open_in_viewerの開始時刻はT3。今回追加しない。
 
 `list_library` の各 kind (独立レビュー P2-4):
 

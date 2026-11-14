@@ -180,6 +180,7 @@ fn permission_is_live_and_handshake_is_strict() {
     assert_eq!(
         status.permission,
         PermissionSnapshot {
+            transcripts: false,
             level: AgentLevel::ReadOnly,
             thumbnails: false,
             gps: false,

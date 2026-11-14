@@ -14,6 +14,24 @@ use crate::transcript_db::{
 
 const MAX_ENTRIES: usize = 32;
 
+/// UI と MCP に共通の古さ判定。現在の署名が無い場合は lifecycle に任せる。
+/// DB とファイルには触れず、worker が読んだ値だけを比較する。
+pub(crate) fn transcript_is_stale(
+    saved_signature: FileSignature,
+    current_signature: Option<FileSignature>,
+    saved_config_version: i64,
+) -> bool {
+    let signature_changed = current_signature.is_some_and(|current| current != saved_signature);
+    #[cfg(windows)]
+    let config_changed = saved_config_version != crate::ai::transcript_job_worker::CONFIG_VERSION;
+    #[cfg(not(windows))]
+    let config_changed = {
+        let _ = saved_config_version;
+        false
+    };
+    signature_changed || config_changed
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TranscriptDisplayRow {
     pub signature: FileSignature,
@@ -50,10 +68,9 @@ pub(crate) struct TranscriptDisplayValue {
 impl TranscriptDisplayValue {
     /// 消えたファイルは一覧の lifecycle が処理する。署名が揃うときだけ比較する。
     pub fn is_stale(&self) -> bool {
-        self.row
-            .as_ref()
-            .zip(self.current_signature)
-            .is_some_and(|(row, signature)| row.signature != signature)
+        self.row.as_ref().is_some_and(|row| {
+            transcript_is_stale(row.signature, self.current_signature, row.config_version)
+        })
     }
 
     fn failed() -> Self {

@@ -111,6 +111,44 @@ fn snapshot_staleness_compares_both_signature_fields_but_missing_stat_is_not_sta
     );
 }
 
+#[test]
+fn shared_staleness_rule_matches_ui_snapshot_for_worker_inputs() {
+    use crate::transcript_display_cache::transcript_is_stale;
+    let saved = value();
+    let row = saved.row.as_ref().unwrap();
+    let mut changed_size = row.signature;
+    changed_size.size += 1;
+    let mut changed_mtime = row.signature;
+    changed_mtime.mtime_ms += 1;
+    for signature in [
+        None,
+        Some(row.signature),
+        Some(changed_size),
+        Some(changed_mtime),
+    ] {
+        for version in [current_config_version(), current_config_version() + 1] {
+            let expected = signature.is_some_and(|signature| signature != row.signature)
+                || (cfg!(windows) && version != current_config_version());
+            assert_eq!(
+                transcript_is_stale(row.signature, signature, version),
+                expected
+            );
+            let mut input = saved.clone();
+            input.current_signature = signature;
+            input.row.as_mut().unwrap().config_version = version;
+            assert_eq!(input.is_stale(), expected);
+            assert_eq!(
+                snapshot(Some(&input), TranscriptActivity::None, Some(1)).state,
+                if expected {
+                    TranscriptDataState::Stale
+                } else {
+                    TranscriptDataState::Available
+                }
+            );
+        }
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn snapshot_config_version_change_is_stale_without_discarding_saved_text() {

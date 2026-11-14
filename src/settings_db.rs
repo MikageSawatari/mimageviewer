@@ -1073,6 +1073,7 @@ impl SettingsDb {
                 thumbnails: settings.agent_show_thumbnails,
                 gps: settings.agent_show_gps,
                 ai_captions: settings.agent_show_ai_captions,
+                transcripts: settings.agent_show_transcripts,
             };
 
         // 1. 事前の差分判定 (transaction 外)。共有 `Arc` の同一性で見るので O(行数)。
@@ -3360,6 +3361,7 @@ fn read_agent_permission(conn: &Connection) -> Result<PermissionSnapshot, Settin
         thumbnails: read_settings_kv_typed(conn, "agent_show_thumbnails", || false)?,
         gps: read_settings_kv_typed(conn, "agent_show_gps", || false)?,
         ai_captions: read_settings_kv_typed(conn, "agent_show_ai_captions", || false)?,
+        transcripts: read_settings_kv_typed(conn, "agent_show_transcripts", || false)?,
     })
 }
 
@@ -4830,6 +4832,7 @@ mod tests {
         assert!(!missing.agent_show_thumbnails);
         assert!(!missing.agent_show_gps);
         assert!(!missing.agent_show_ai_captions);
+        assert!(!missing.agent_show_transcripts);
         let dir = TempDir::new().unwrap();
         let db = SettingsDb::create_new(dir.path()).unwrap();
         assert_eq!(
@@ -4841,6 +4844,7 @@ mod tests {
             agent_show_thumbnails: true,
             agent_show_gps: true,
             agent_show_ai_captions: true,
+            agent_show_transcripts: true,
             ..Settings::default()
         };
         db.save_full(&settings).unwrap();
@@ -4852,6 +4856,7 @@ mod tests {
                 thumbnails: true,
                 gps: true,
                 ai_captions: true,
+                transcripts: true,
             }
         );
         db.save_full(&settings).unwrap();
@@ -4861,20 +4866,23 @@ mod tests {
         assert_eq!(db.load_agent_permission().unwrap(), admitted);
 
         let mut previous = admitted;
-        for (level, thumbnails, gps, ai_captions) in [
-            (AgentLevel::ReadAndOpen, false, true, true),
-            (AgentLevel::ReadAndOpen, true, true, true),
-            (AgentLevel::ReadAndOpen, true, false, true),
-            (AgentLevel::ReadAndOpen, true, true, true),
-            (AgentLevel::ReadAndOpen, true, true, false),
-            (AgentLevel::ReadAndOpen, true, true, true),
-            (AgentLevel::ReadOnly, true, true, true),
-            (AgentLevel::ReadAndOpen, true, true, true),
+        for (level, thumbnails, gps, ai_captions, transcripts) in [
+            (AgentLevel::ReadAndOpen, false, true, true, true),
+            (AgentLevel::ReadAndOpen, true, true, true, true),
+            (AgentLevel::ReadAndOpen, true, false, true, true),
+            (AgentLevel::ReadAndOpen, true, true, true, true),
+            (AgentLevel::ReadAndOpen, true, true, false, true),
+            (AgentLevel::ReadAndOpen, true, true, true, true),
+            (AgentLevel::ReadAndOpen, true, true, true, false),
+            (AgentLevel::ReadAndOpen, true, true, true, true),
+            (AgentLevel::ReadOnly, true, true, true, true),
+            (AgentLevel::ReadAndOpen, true, true, true, true),
         ] {
             settings.agent_level = level;
             settings.agent_show_thumbnails = thumbnails;
             settings.agent_show_gps = gps;
             settings.agent_show_ai_captions = ai_captions;
+            settings.agent_show_transcripts = transcripts;
             db.save_full(&settings).unwrap();
             let current = db.load_agent_permission().unwrap();
             assert_eq!(
@@ -4884,6 +4892,7 @@ mod tests {
                     thumbnails,
                     gps,
                     ai_captions,
+                    transcripts,
                 }
             );
             assert_ne!(current.1, previous.1);
@@ -4899,12 +4908,13 @@ mod tests {
         assert!(loaded.agent_show_thumbnails);
         assert!(loaded.agent_show_gps);
         assert!(loaded.agent_show_ai_captions);
+        assert!(loaded.agent_show_transcripts);
         db.inner
             .lock()
             .unwrap()
             .conn
             .execute(
-                "DELETE FROM settings_kv WHERE key IN ('agent_show_thumbnails', 'agent_show_gps', 'agent_show_ai_captions')",
+                "DELETE FROM settings_kv WHERE key IN ('agent_show_thumbnails', 'agent_show_gps', 'agent_show_ai_captions', 'agent_show_transcripts')",
                 [],
             )
             .unwrap();
@@ -4913,6 +4923,8 @@ mod tests {
         assert!(!missing.thumbnails);
         assert!(!missing.gps);
         assert!(!missing.ai_captions);
+        assert!(!missing.transcripts);
+        assert!(!db.load_into_settings().unwrap().agent_show_transcripts);
     }
 
     #[test]
@@ -4929,11 +4941,11 @@ mod tests {
             .unwrap()
             .conn
             .execute_batch(
-                "CREATE TRIGGER reject_agent_ai_captions BEFORE INSERT ON settings_kv
-             WHEN NEW.key = 'agent_show_ai_captions' BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
+                "CREATE TRIGGER reject_agent_transcripts BEFORE INSERT ON settings_kv
+             WHEN NEW.key = 'agent_show_transcripts' BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;",
             )
             .unwrap();
-        settings.agent_show_ai_captions = true;
+        settings.agent_show_transcripts = true;
         assert!(db.save_full(&settings).is_err());
         assert_eq!(db.load_agent_permission().unwrap(), admitted);
     }
