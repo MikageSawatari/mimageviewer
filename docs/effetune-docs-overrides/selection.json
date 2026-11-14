@@ -45,7 +45,7 @@
   },
   "pipeline-analyzer.md": {
     "include": false,
-    "reason": "v0.15.0 ui-manager.js disables Pipeline Analyzer in VST mode; JS analysis would not measure native VST DSP."
+    "reason": "Pipeline Analyzer is disabled in VST mode; JS analysis would not measure native VST DSP."
   },
   "bus-function.md": {
     "include": true,
@@ -89,7 +89,13 @@
   },
   "plugins/others.md": {
     "include": true,
-    "reason": "Bundled signal generators and other effects."
+    "reason": "Keep Oscillator and SoundFont Note Player (formerly SFZ Note Player). Exclude MIDI-file/live-MIDI SoundFont Player: mIV supplies audio but no MIDI note events; Mixwright Instrument is not registered.",
+    "title": "その他のオーディオツール",
+    "sections": [
+      "プラグイン一覧",
+      "Oscillator",
+      "SoundFont Note Player"
+    ]
   },
   "plugins/resonator.md": {
     "include": true,
@@ -121,6 +127,10 @@
   },
   "openhome.md": {
     "include": false,
-    "reason": "Standalone OpenHome network renderer; electronAPI.remoteV1/OpenHome APIs are absent in VST."
+    "reason": "Standalone network music sharing, Subsonic, OpenHome/UPnP/DLNA/AirPlay and remote playback; their player/server APIs are absent in bundled VST."
+  },
+  "mastering-presets.md": {
+    "include": true,
+    "reason": "System Presets > Mastering chains use bundled effects and work on mIV playback. Correct the standalone offline file export workflow in mastering-presets.json."
   }
 }

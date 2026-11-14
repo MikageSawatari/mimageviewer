@@ -27,7 +27,7 @@ from urllib.parse import unquote, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 MANUAL = ROOT / "htdocs/mimageviewer/manual"
 RULES = ROOT / "docs/effetune-docs-overrides"
-DEFAULT_SOURCE = ROOT / "third_party/effetune-docs/c506bbab"
+DEFAULT_SOURCE = ROOT / "third_party/effetune-docs/5ffca1b3"
 UPSTREAM = "https://effetune.frieve.com"
 VERSION_PATTERN = r'v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?'
 REDIRECT_BEGIN = '  # BEGIN GENERATED EFFETUNE REDIRECTS'
@@ -266,6 +266,11 @@ class Converter:
                 output.append("<br>")
                 i += match.end()
                 continue
+            match = re.match(r'<a id="([\w-]+)"></a>', tail)
+            if match:
+                output.append(match[0])
+                i += match.end()
+                continue
             if re.match(r'</?[A-Za-z][^>]*>', tail) or tail.startswith("{%") or tail.startswith("{{"):
                 raise ConversionError(f"Unsupported HTML/Liquid: {tail[:80]}")
             marker = next((m for m in ("**", "__", "*", "_") if tail.startswith(m)), None)
@@ -423,6 +428,18 @@ def section_span(body, heading):
     following = re.search(rf'<h[1-{int(match[1])}]\b', body[match.end():])
     end = match.end() + following.start() if following else len(body)
     return match, end
+
+
+def apply_metadata_overrides(metadata, rules):
+    """Correct search metadata with the same exact-match policy as the body."""
+    metadata = metadata.copy()
+    for rule in rules:
+        if rule['operation'] == 'replace_metadata':
+            field = rule['field']
+            if field not in {'title', 'description'} or metadata.get(field) != rule['anchor']:
+                raise ConversionError(f'Override metadata must match once: {rule}')
+            metadata[field] = rule['replacement']
+    return metadata
 
 
 def apply_overrides(body, rules, converter):
@@ -641,9 +658,11 @@ def generate(snapshot, version, docs_version=None):
         meta, source = front_matter(path.read_text(encoding='utf-8'))
         source = expand_liquid(source, path.parent, source_dir, (path.resolve(),))
         source = select_sections(source, selection[page])
+        page_rules = overrides.get(path.stem, [])
+        meta = apply_metadata_overrides(meta, page_rules)
         converter = Converter(page, published, known, images)
         body = converter.render(source)
-        body = apply_overrides(body, overrides.get(path.stem, []), converter)
+        body = apply_overrides(body, [r for r in page_rules if r['operation'] != 'replace_metadata'], converter)
         body = body.replace('EffeTune', 'mIV Sound')
         title = (meta.get('title') or re.search(r'^# (.+)$', source, re.M)[1]).replace('EffeTune', 'mIV Sound')
         label = re.sub(r' - mIV Sound$', '', title)

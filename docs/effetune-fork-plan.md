@@ -1183,3 +1183,102 @@ portable zip実物の生成・内容確認、署名あり配布とVirusTotal (�
 - `python scripts/check_site_cards.py`: **52枚、超過0**。`git diff --check`: **成功**。
   cargo のビルド・テスト、製品起動、コミット・公開は行っていない。`target/` と実際の
   `config/miv-sound.rs` には触れず、候補のビルド・承認は設計担当へ引き継ぐ。
+
+## 20. 0.17.0-miv.1 への更新 (2026-11-11)
+
+対象は `feat-755-miv-sound`。説明書・生成器・生成回帰だけを更新した。
+設計担当が更新済みの `config/miv-sound.rs` はそのまま利用し、編集していない。
+
+- 新しい snapshot は `5ffca1b31e8a74ada7140aefd0c9c9fe4b7740da`。
+  Mixwright v0.17.0 release `60c7629f8bc6e848995bca4d9dd754f8600c069a` の
+  `external/effetune` に対応し、`SOURCE.md` に派生版 `0.17.0-miv.1` と説明書 `v0.17.0` を記録した。
+  日本語原文30ファイルは参照先の上流作業ツリーとバイト一致し、LICENSE・4画像は旧 snapshot と一致した。
+  上流原文と旧 snapshot は変更していない。
+- `mastering-presets.md` は、同梱の System Presets > Mastering を使う再生音の調整として採用。
+  10種類のチェーンと音量調整・制限事項は残し、オフライン出力の設定とファイル処理の手順・書き出し案内は外した。
+  README の新しいリンクも、選び方と入力レベルの説明に訂正した。
+- 一致しなくなった4規則のうち、SoundFont の取込、Visualizer の追加一覧、共通プリセット数を新原文へ移した。
+  容量上限を変えた後の再取込指示は上流から消えたため、その旧補正を削除し、新しいサンプルキャッシュの説明を採用した。
+  SoundFont の登録・原本参照・バックアップ範囲は維持し、SF2/SF3 にも表記を広げた。
+- SoundFont Note Player の改名後も `others-sfz-note-player.html` を維持する。
+  空の旧アンカーを安全に変換してから h2 へ移し、ID の重複を除いた。
+  mIV の `plugin_loader.cpp` は MIDI 音符イベントを渡さないため、SoundFont Player の節を見出し選別で除外し、
+  一覧と案内文、検索用 title / description も完全一致の規則で外した。選別で外れるカテゴリ導入は一覧前へ戻した。
+  `replace_metadata` を追加し、本文と同様に欠落・不一致・重複の訂正を拒否する。
+- Visualizer の追加一覧から Video / Playback Control / Seek Bar / Track Information を除き、
+  再生操作・外観設定のまとまりは、完全一致で節境界を作って `remove_section` で除外した。
+  AirPlay の時計・ネットワーク曲情報、MIDI/WRD/MusicXML歌詞、MIDI色と拍の説明も除外・訂正した。
+  MIDI の表示節は「ホストから音符・イベントを受け取らない」と明記した注記へ置き換えた。
+  Groove Lounge / Listening Room / MIDI Monitor は選べるレイアウトとして残し、再生操作やMIDI再生の説明を訂正した。
+  Lyrics / Counter、Drums / Key / Chord と音声解析の新機能は残した。
+  DAW の別クラス Mixwright Instrument を案内する原文は今回の snapshot にはなく、生成回帰で混入を検査する。
+- `manual/sound/` に134 HTML＋4画像を再生成。既存の固定 URL・旧版301を維持し、新ガイドだけを追加した。
+  sitemap は217 URLへ再生成した。指定の公開5ファイルと `native-dependencies.md` に更新対象の `0.15.0` 表記はなかった。
+- 検証: `test_gen_effetune_docs.py` **40件成功**、生成器 `--check` **138ファイル＋301一致**、
+  sitemap `--check` **217 URL一致**、`check_site_cards.py` **53枚・超過0**、
+  `check_ui_glyphs.py` **問題0**、`git diff --check` **成功**。
+  新しい除外・採用、旧 URL、メタ情報の一意一致、旧 snapshot の版付け替え拒否を回帰検査に含めた。
+  cargo のビルド・テスト、製品の起動、コミットは行っていない。`target/`・`vendor/` には触れていない。
+  本体の候補ビルド・承認と、コミット後の sitemap の日付確定は設計担当へ引き継ぐ。
+
+### 20.1 独立レビューの P3 訂正 (2026-11-12)
+
+- `analyzer.json` の `scope_heading_id` と完全一致の HTML 訂正で、Note Spectrogram の新しい
+  「制限事項」を `note-spectrogram-limitations`、Rhythm Analyzer の既存節を従来の `制限事項` にした。
+  同名見出し追加による自動採番のずれを補正し、旧フラグメントがテンポ・拍の制限事項を指すことを回帰検査に追加した。
+- `7e38bde18` の旧生成 HTML 全133ページを `git show` で比較し、既存644 IDに欠落がないことを確認した。
+  ほかに変更された既存 ID はなかった。`sfz-note-player` は同じ音源機能の公開 ID として維持し、表示名だけが改名されている。
+  新規の `mastering-presets.html` は旧版に対応ページがない。
+- MIDI Monitor の「ホストから受け取った内容」を「mImageViewer で再生中の曲の情報と再生位置、21:9では歌詞」へ訂正した。
+  `now_playing_notify.cpp` の曲名・アルバム・アーティスト・歌詞と再生位置の通知を照合した。
+  新しい補正文も確認し、MIDI節の注記をデータ受け渡しの説明から、演奏情報を表示しないという利用者向けの説明へ揃えた。
+- 生成 HTML 3ページを再生成。`test_gen_effetune_docs.py` **41件成功**、生成器 `--check` **138ファイル＋301一致**、
+  `check_site_cards.py` **53枚・超過0**、`git diff --check` **成功**。
+  sitemap・上流 snapshot・`target/`・`vendor/` は変更せず、コミットは行っていない。
+
+### 20.2 派生版の取り込みと候補 (2026-11-12、設計担当)
+
+- 派生版 `G:\home\miv-sound` のブランチ `miv-0.17`: 上流 v0.17.0 (`60c7629`) の merge `992f200`、
+  独立レビュー (GPT-6.1 Sol / xhigh) の P2 修正 `459a5dc`。再レビューは ACCEPT。
+  衝突は 11 ファイル 20 箇所。派生版の名称・クラス ID・保存先・歌詞と再生時計・Last view・mIV Original は維持した。
+- 上流 v0.17.0 で増えた **Instrument クラス (`kInstrumentId`) は登録しない**。mIV はエフェクトだけを使い、
+  派生版は上流のクラス ID・製品名を出さない (§3)。内部の音源処理はコンパイルしたまま残す。
+- mIV の host は MIDI を渡さない (イベントバスを有効にせず、空のイベント一覧を渡す)。そのため
+  Visualizer の MIDI 表示は、実際に MIDI が届いた後にだけ使う (上流は SoundFont Player がパイプラインにあるだけで
+  MIDI 表示に切り替え、mIV Original の Notes が空になっていた。レビュー P2)。MIDI で鳴らす SoundFont Player は
+  追加一覧と検索から外し、保存済みのパイプラインからは読み込める。SoundFont Note Player (旧 SFZ Note Player) は使える。
+- 上流の Space キーの転送 (`vst_forwardHostSpace`) は残す。mIV の host の子窓は既定の処理に渡すだけで、
+  再生は切り替わらない (0.15.0-miv.7 でもプラグインの窓の Space は何もしなかった)。mIV の再生へつなぐのは別の機能追加。
+- 候補 `93c07e961a200f901ad4f8df6335c20bf99b1c3a1da4f5a8f403a5fccc4c55ca`: ctest 138/138 成功。
+  1 回目の ctest では `effetune_plugin_processing_lifecycle_tests` が高負荷で 300 秒のタイムアウトになった。
+  原因は、高負荷のときテスト終了時に WebView2 のブラウザプロセス (6 本) が残り、テストがその終了を待ち続けること。
+  0.15.0-miv.7 の同じテストでも同じ負荷 (6 本同時) で 6 本中 4 本が止まる既存の問題で、今回の退行ではない。
+  製品で窓を閉じた後にブラウザプロセスが残るかは未調査 (別項目の候補)。
+
+### 20.3 旧名の段の見出しの修正 (2026-11-13、設計担当)
+
+- サブ PC 担当の実機確認 (依頼 37、候補 `93c07e96…55ca`) で、0.15.0-miv.7 で追加した「SFZ Note Player」の段は
+  新しい部品として動いたが、見出しが旧名のまま残り、保存し直しても直らなかった。旧名だとその段の「?」
+  (説明書を開く) も効かない (0.15 では開いた)。上流の復元処理 (`applySerializedState`) が保存名をそのまま
+  `plugin.name` に入れる、上流の素の挙動 (コード調査)。
+- 修正は派生版 `e96bd95`。`tools/build-ui-assets.mjs` で、部品を作るときの旧名→新名の読み替え
+  (`resolvePluginName`) を復元の 2 か所 (短い形式・長い形式) にも通す。上流のファイルは変えない。
+  ほかの復元経路 (起動時・元に戻す・プリセット・貼り付け・A/B の複製・mIV Sound の状態からの復元) は
+  すべてこの処理を通る。
+- 状態ファイルは、ホストが状態を読み込んだ直後の組み直しで、使用中のパイプラインの段が新しい名前で
+  保存される。使っていない A/B の片側は同期されるまで旧名のまま残ることがあるが、読み込めば見出しは新しい名前になる。
+- **前の版へ戻したときの扱い (判断)**: 修正後の 0.17 で保存すると、引き継いだ段も新しい名前で保存され、
+  0.15.0-miv.7 へ戻すとその段は作れない (起動時に「一部のエフェクトを使えない」として外れる)。
+  独立レビュー (GPT-6.1 Sol / xhigh) の P2。修正前の 0.17 は旧名を書き戻していたので、偶然 0.15 でも読めていた。
+  ただし 0.17 で新しく追加した SoundFont Note Player の段は、修正の有無にかかわらず 0.15 では読めない。
+  派生版の保存互換の文書 (`json-storage-compatibility.md` の「再保存と旧版への持ち戻しで変わる点」6) も、
+  新しいエフェクトを旧版が実行できることまでは保証していない。表示名と保存名を分けて旧版向けの名前を
+  書き続けると、同じ部品に 2 つの名前を持つ状態が増えるので採らない。すべての段を同じ規則
+  (0.17 で保存した SoundFont Note Player の段は 0.15 では読めない) にそろえる。
+  **利用者決定 (2026-11-14、統括経由)**: 推奨どおり。すべての段を新しい名前で保存し、0.15 へ戻したときの互換は保証しない。
+- **ユーザープリセットの段名 (仕様)**: ユーザープリセット (`effetune_presets.json`) に旧名で保存された段は、
+  プリセットを読み込むだけではファイル上の名前が旧名のまま残る。読み込んだ段の見出しは新しい名前になり、
+  動作も変わらないので、ファイルの書き換えはしない (サブ PC 担当の実機確認、依頼 37b)。
+- サブ PC 担当の実機確認 (依頼 37b、候補 `a4bb8a04…9a91d`) で、旧名の段は開いた直後・プリセット読み込み後・再起動後の
+  いずれも「SoundFont Note Player」と表示され、「?」も開き、状態ファイルも新しい名前になった。
+  利用者の採用判断 (2026-11-14、統括経由) を受けて、この候補を 0.17.0-miv.1 として承認した。
