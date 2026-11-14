@@ -139,24 +139,44 @@ fn active_row(segments: &[TranscriptSegment], position: Option<f64>) -> Option<u
 }
 
 /// offset の変化から推測せず、この一覧に対する実際の入力だけで自動送りを止める。
-fn manual_scroll_input(ui: &egui::Ui, rect: egui::Rect, gutter_width: f32) -> bool {
-    ui.input(|input| {
-        let Some(pos) = input.pointer.interact_pos() else {
-            return false;
-        };
-        if !rect.contains(pos) {
-            return false;
-        }
-        let wheel = input
-            .events
-            .iter()
-            .any(|event| matches!(event, egui::Event::MouseWheel { .. }));
-        let drag = input.pointer.primary_down()
-            && input.pointer.is_decidedly_dragging()
-            && input.pointer.delta() != egui::Vec2::ZERO;
-        let scrollbar = input.pointer.primary_pressed() && pos.x >= rect.right() - gutter_width;
-        wheel || drag || scrollbar
-    })
+fn manual_scroll_input<R>(ui: &egui::Ui, output: &egui::scroll_area::ScrollAreaOutput<R>) -> bool {
+    if !ui.is_enabled() {
+        return false;
+    }
+    let (pos, wheel, pressed, moved) = ui.input(|input| {
+        (
+            input.pointer.interact_pos(),
+            input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::MouseWheel { .. })),
+            input.pointer.primary_pressed(),
+            input.pointer.delta() != egui::Vec2::ZERO,
+        )
+    });
+    let Some(pos) = pos else { return false };
+    if ui.ctx().layer_id_at(pos) != Some(ui.layer_id()) {
+        return false;
+    }
+    // 同梱eguiのScrollAreaが登録したResponseを読む。押下の所属はeguiに任せ、
+    // 外で始まったdragを現在の座標だけで一覧へ付け替えない。
+    let drag = ui
+        .ctx()
+        .read_response(output.id.with("area"))
+        .is_some_and(|response| response.dragged_by(egui::PointerButton::Primary) && moved);
+    let bar = (output.content_size.y > output.inner_rect.height().ceil())
+        .then(|| ui.ctx().read_response(output.id.with(1_usize)))
+        .flatten();
+    let scrollbar = pressed
+        && bar.as_ref().is_some_and(|response| {
+            ui.rect_contains_pointer(response.rect)
+                && (response.is_pointer_button_down_on()
+                    || response.clicked_by(egui::PointerButton::Primary))
+        });
+    let outer = bar.as_ref().map_or(output.inner_rect, |response| {
+        output.inner_rect.union(response.rect)
+    });
+    drag || scrollbar || (wheel && ui.rect_contains_pointer(outer))
 }
 
 /// 戻り値だけが操作。caller は既存の seek 経路へ再生側の秒を渡す。
@@ -234,11 +254,6 @@ pub(crate) fn draw_transcript_panel_body(
             ScrollMode::Manual(anchor) => Some(anchor),
             ScrollMode::Following(_) => None,
         };
-    }
-    if manual_scroll_input(ui, outer, gutter) && matches!(state.mode, ScrollMode::Following(_)) {
-        state.mode = ScrollMode::Manual(match state.mode {
-            ScrollMode::Following(anchor) | ScrollMode::Manual(anchor) => anchor,
-        });
     }
     let mut scroll = egui::ScrollArea::vertical()
         .id_salt(("transcript_rows", &snapshot.key))
@@ -328,6 +343,11 @@ pub(crate) fn draw_transcript_panel_body(
             })
         })
         .inner;
+    if manual_scroll_input(ui, &output) && matches!(state.mode, ScrollMode::Following(_)) {
+        state.mode = ScrollMode::Manual(match state.mode {
+            ScrollMode::Following(anchor) | ScrollMode::Manual(anchor) => anchor,
+        });
+    }
     if fresh || resumed {
         let mut scroll_state = output.state;
         scroll_state.stop_vertical_scroll_motion();
@@ -555,6 +575,196 @@ mod tests {
             ScrollMode::Following(_)
         ));
     }
+
+    struct InputView {
+        view: View,
+        outside: egui::Rect,
+        outside_id: egui::Id,
+        list_layer: egui::LayerId,
+        cover: Option<egui::Rect>,
+        enabled: bool,
+        clipped: bool,
+    }
+
+    fn input_harness() -> egui_kittest::Harness<'static, InputView> {
+        crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(320.0, 460.0))
+            .build_ui_state(
+                |ui, input: &mut InputView| {
+                    // seek barなど、一覧の外でdragを受け取る実widgetを置く。
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 32.0),
+                        egui::Sense::drag(),
+                    );
+                    input.outside = rect;
+                    input.outside_id = response.id;
+                    input.list_layer = ui.layer_id();
+                    ui.add_enabled_ui(input.enabled, |ui| {
+                        if input.clipped {
+                            let mut clip = ui.clip_rect();
+                            clip.max.y = 120.0;
+                            ui.set_clip_rect(clip);
+                        }
+                        draw_transcript_panel_body(
+                            ui,
+                            &input.view.snapshot,
+                            input.view.position,
+                            &mut input.view.state,
+                        );
+                    });
+                    if let Some(rect) = input.cover {
+                        egui::Area::new(egui::Id::new("transcript_input_cover"))
+                            .order(egui::Order::Foreground)
+                            .fixed_pos(rect.min)
+                            .constrain(false)
+                            .movable(false)
+                            .show(ui.ctx(), |ui| {
+                                ui.allocate_exact_size(rect.size(), egui::Sense::click_and_drag());
+                            });
+                    }
+                },
+                InputView {
+                    view: View {
+                        snapshot: fixture(5000),
+                        state: Default::default(),
+                        seek: None,
+                        position: 11.5,
+                    },
+                    outside: egui::Rect::NOTHING,
+                    outside_id: egui::Id::NULL,
+                    list_layer: egui::LayerId::background(),
+                    cover: None,
+                    enabled: true,
+                    clipped: false,
+                },
+            )
+    }
+
+    fn pointer_press(harness: &mut egui_kittest::Harness<'_, InputView>, pos: egui::Pos2) {
+        harness.event(egui::Event::PointerMoved(pos));
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.step();
+    }
+
+    fn wheel(harness: &mut egui_kittest::Harness<'_, InputView>, pos: egui::Pos2) {
+        harness.event(egui::Event::PointerMoved(pos));
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -160.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
+        });
+        harness.step();
+    }
+
+    #[test]
+    fn transcript_panel_external_drag_crossing_body_keeps_follow() {
+        let mut harness = input_harness();
+        harness.run_steps(6);
+        let outside = harness.state().outside.center();
+        pointer_press(&mut harness, outside);
+        harness.event(egui::Event::PointerMoved(egui::pos2(150.0, 200.0)));
+        harness.step();
+        assert_eq!(harness.ctx.dragged_id(), Some(harness.state().outside_id));
+        assert!(matches!(
+            harness.state().view.state.mode,
+            ScrollMode::Following(_)
+        ));
+    }
+
+    #[test]
+    fn transcript_panel_foreground_wheel_keeps_follow() {
+        let mut harness = input_harness();
+        harness.state_mut().cover = Some(egui::Rect::from_min_size(
+            egui::pos2(100.0, 150.0),
+            egui::vec2(160.0, 140.0),
+        ));
+        harness.run_steps(6);
+        let pos = egui::pos2(150.0, 200.0);
+        assert_ne!(
+            harness.ctx.layer_id_at(pos),
+            Some(harness.state().list_layer)
+        );
+        wheel(&mut harness, pos);
+        assert!(matches!(
+            harness.state().view.state.mode,
+            ScrollMode::Following(_)
+        ));
+    }
+
+    #[test]
+    fn transcript_panel_body_wheel_pauses_follow() {
+        let mut harness = input_harness();
+        harness.run_steps(6);
+        wheel(&mut harness, egui::pos2(150.0, 200.0));
+        assert!(matches!(
+            harness.state().view.state.mode,
+            ScrollMode::Manual(_)
+        ));
+    }
+
+    #[test]
+    fn transcript_panel_body_drag_pauses_follow() {
+        let mut harness = input_harness();
+        harness.run_steps(6);
+        pointer_press(&mut harness, egui::pos2(150.0, 200.0));
+        harness.event(egui::Event::PointerMoved(egui::pos2(150.0, 150.0)));
+        harness.step();
+        assert!(harness.ctx.dragged_id().is_some());
+        assert_ne!(harness.ctx.dragged_id(), Some(harness.state().outside_id));
+        assert!(matches!(
+            harness.state().view.state.mode,
+            ScrollMode::Manual(_)
+        ));
+    }
+
+    #[test]
+    fn transcript_panel_scrollbar_press_pauses_follow_only_without_foreground_cover() {
+        for covered in [false, true] {
+            let mut harness = input_harness();
+            if covered {
+                harness.state_mut().cover = Some(egui::Rect::from_min_size(
+                    egui::pos2(280.0, 140.0),
+                    egui::vec2(40.0, 160.0),
+                ));
+            }
+            harness.run_steps(6);
+            let inner = harness.state().view.state.last_scroll.unwrap().inner;
+            let pos = egui::pos2(inner.right() + 6.0, 200.0);
+            assert_eq!(
+                harness.ctx.layer_id_at(pos) == Some(harness.state().list_layer),
+                !covered
+            );
+            pointer_press(&mut harness, pos);
+            assert_eq!(
+                matches!(harness.state().view.state.mode, ScrollMode::Manual(_)),
+                !covered
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_panel_disabled_or_clipped_wheel_keeps_follow() {
+        for disabled in [false, true] {
+            let mut harness = input_harness();
+            harness.state_mut().enabled = !disabled;
+            harness.state_mut().clipped = !disabled;
+            harness.run_steps(6);
+            wheel(&mut harness, egui::pos2(150.0, 200.0));
+            assert!(matches!(
+                harness.state().view.state.mode,
+                ScrollMode::Following(_)
+            ));
+        }
+    }
+
     #[test]
     fn transcript_panel_width_change_keeps_manual_row_anchor() {
         let mut harness = harness(5000);

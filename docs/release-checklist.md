@@ -678,6 +678,21 @@ GitHub Release 公開後、各配布チャネルへ反映・申請する。**Vec
    公開済みタグ・assets を上書き・削除しない。旧本体の取得先として残す。
    新タグへの本体の取得先変更は開発側へ戻し、モデル ID・検証・LICENSE / NOTICE・公開文書との整合を確認してから本体を公開する。
 
+#### 文字起こしの追加モデルの公開（初回・モデル更新時）
+
+`asr-model-v1` も `vlm-model-v1`・`depth-model-v1` と同じく本体と独立した GitHub Release (prerelease、latest にしない)。
+**版ごとの作業ではない。一度公開したモデルは残し、本体のリリースごとには作り直さない。**
+
+- **公開済み (2026-11-14、利用者の了承を得て統括が実施)**: https://github.com/MikageSawatari/mimageviewer/releases/tag/asr-model-v1
+  (target `230228e25`)。資産 4 点 `ggml-large-v3-turbo-q5_0.bin` (574,041,195 bytes、SHA-256 `394221709cd5…ffa7e2`) /
+  `asr-model-index.json` / `LICENSE` / `NOTICE`。GitHub 側の digest が手元 (`G:\home\asr-model-prep\release\asr-model-v1\`) と一致し、
+  `releases/download/asr-model-v1/` から取得できることを確認済み。
+- 作り方の正本は `scripts/asr-model/prepare_model_release.py` の冒頭 (公式 `large-v3-turbo.pt` → `convert-pt-to-ggml.py` →
+  `whisper-quantize q5_0`、結果は評価で使ったファイルとバイト一致)。NOTICE は `scripts/asr-model/model-NOTICE.txt`。
+  同 script が index を書き、空の出力フォルダに添付する 4 ファイルを揃える。
+- 取得元の正本は `src/addon.rs` の ASR の `default_base_url()` / `index_name()`。
+- モデル・変換条件・index を差し替えるときは **新しいタグ** (例: `asr-model-v2`) で別 Release を作り、公開済みのタグ・assets は上書き・削除しない。
+
 ### Phase 6: 公開後の後始末 (毎リリース、2026-10-07 利用者指示)
 
 GitHub Release の公開と Phase 5 の案内が済んだら、同じ作業の中で次を片付ける。放置するとビルドキャッシュは

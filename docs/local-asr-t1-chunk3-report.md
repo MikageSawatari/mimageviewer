@@ -276,3 +276,58 @@ single-instance mutexが共通なので、installed版・tray常駐版を先に�
 確認対象は動画の左3タブと音楽の左2タブ、右1行、行clickのseekと強調、手動scroll停止/戻る、
 track切替の案内、保存/削除/取込後の更新、F12往復後の本文再表示。
 非0原点TSの末尾は上記の既存seek制限を受けることを前提とする。
+
+
+## 独立レビュー後の修正
+
+2026-11-14、基準commit `e34a28713`。P2「一覧以外の入力でも自動送りが止まる」を修正した。
+今回の変更ファイルは `src/transcript_panel.rs` と本報告書のみ。コミット・製品exeの起動はしていない。
+
+### 原因と対応
+
+従来はポインタの現在位置とglobalなdrag/wheelの有無で判定していたため、
+一覧外のwidgetが保持するdragが本文を横切った場合や、前面layer上のwheelもManualへ移していた。
+
+判定をScrollArea描画後の1か所へ移し、実際の入力所属へ合わせた。
+
+- dragは同梱eguiのScrollAreaが登録した本文Responseの `dragged_by(Primary)` と移動の有無で判定する。
+  pressの所属を再実装せず、eguiが保持するwidgetの所有を使う。
+- スクロールバーも実Responseの押下/clickで判定し、UIの有効状態・最上位layer・clip内の位置を確認する。
+- wheelはUIの有効状態、最上位layer、ScrollAreaの本文/バーの矩形とUIのclip内であることを確認する。
+- `ScrollAreaOutput` にはResponseが直接含まれないため、返されたidから `Context::read_response` で
+  同梱ScrollAreaの本文（`id.with("area")`）/縦バー（`id.with(1_usize)`）のResponseを読む。
+  この対応は共通helper内だけに閉じ、handler-level testで実際のegui入力を検査する。
+- offsetの変化からの推測、新しい状態、UI I/Oは追加していない。動画と音楽は同じ修正を使う。
+
+### 回帰テストと結果
+
+6件のhandler-level testを追加し、次を確認した。
+
+- 一覧外の実drag widgetから始めたdragが本文を横切ってもFollowingのまま（drag所有idも検査）。
+- 本文と重なる前面Area上のwheelでFollowingのまま（最上位layerが異なることも検査）。
+- 本文上のwheel、本文で始めたdragではManualへ移る。
+- 縦スクロールバーの押下ではManualへ移り、前面Areaに覆われたバーの押下ではFollowingのまま。
+- 無効なUI、clip外のwheelではFollowingのまま。
+
+コンパイル・テストは従来どおりrun-heavy経由で実行した。
+CARGO_BUILD_JOBS=1、MSBUILDDISABLENODEREUSE=1、CMAKE_BUILD_PARALLEL_LEVEL=1。
+ロック領域への書込み不可の警告後はBelowNormalで継続した。retry・期待値変更はしていない。
+
+| wrapper内のコマンド | 結果 |
+| --- | --- |
+| `cargo nextest run -j 1 -p mimageviewer --lib -E 'test(transcript_panel::tests::)' --no-fail-fast --success-output final` | **13件すべて成功**、5.346秒（compile 4分28秒）。新規6件＋既存7件。perf測定のignored testは除外 |
+| `cargo nextest run -j 1 -p mimageviewer --lib -E '<対象filter>' --no-fail-fast --success-output final` | **385件すべて成功**、134.909秒。filterの実値は前述の対象filterと同じ。13件もこの385件に含む |
+| `cargo fmt`（引数なし） / `cargo fmt --check` | 成功 |
+| `python scripts/check_ui_glyphs.py` | 成功、危険なグリフ0件 |
+| `git diff --check -- src/transcript_panel.rs docs/local-asr-t1-chunk3-report.md` | 成功 |
+
+実行入口は `run-heavy.ps1 -Owner asr-t1-codex -WorkDir G:\home\mimageviewer-asr-t1 -Command 'python -B -I target/asr-t1-chunk3/p2.py'`。
+ログは `target/asr-t1-chunk3/p2-panel.log` と `p2-focused.log`。
+最初のwrapper呼出しはfilterの括弧のshell引用が不足し、テスト起動前に終了したため、
+引数配列で渡す開発用Pythonへ直して上記2段を実行した。
+
+既存の自動送り停止/再開・source切替・幅変更、およびnative/musicの表示snapshot比較も成功した。
+PNGの更新はない。今回の修正で計画書との食い違いは増えていない。
+
+利用者指示に従い、build-devは今回は実行していない。前節の確認用バイナリとSHAはこのP2修正を含まない。
+確認用buildは区切り4の最後に作り直す。

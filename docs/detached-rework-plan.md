@@ -7443,3 +7443,14 @@ mount・swap・兄弟 context の表示状態の変更はしない。作り直�
 別窓を実際にmountするheadlessテストで拒否を確認し、mainへ戻ると同じ本を再び受け付けることも検査する。
 独立追レビューはこの受付を対象ownerの構造的一致としてACCEPT。
 焦点検証・確認用buildの結果は `cover-crop-plan.md` §15.4に記録した。
+
+### ローカル文字起こしの表示（2026-11-14、ASR T1 区切り3）
+
+動画の左パネルに「文字起こし」タブを足し、表示用 snapshot を再生器へ渡す値として 1 つ追加した。
+presenter は既存の latest-value の command slot と同じ形で受け取り、source swap で空へ戻す。
+F12 の配置変更で render core を作り直すときは、既存の再生成データの復元 batch に snapshot を 1 つ足して渡し直す。
+detached の述語・viewport／host／placement の判断経路、bundle の所有・交換は変更していない。
+表示キャッシュは AI 説明文 (V1-4a) と同じく bundle の外の App 共有 owner に置き、読み込みは専用 worker が行う。
+独立レビュー (gpt-6.1-sol / xhigh、コミット `e34a28713`) と設計担当 ClaudeCode は、これを既存の復元 batch に値を足す構造的変更であり
+症状パッチではないことに合意した。正本は [文字起こし計画 §8.2](local-asr-transcript-plan.md#82-データの流れ)。
+同じ output 内の F12 往復は実機未確認。
