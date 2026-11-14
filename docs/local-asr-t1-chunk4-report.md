@@ -221,3 +221,55 @@ single-instance mutexが共通なので、installed版・tray常駐版を先に�
 登録先adapterが今回の `G:\home\mimageviewer-asr-t1\target\dev-runtime\mimageviewer-mcp.exe` を指すことも確認する。
 既存登録が別の古いadapterを指している場合は、そのまま今回のcoreと組み合わせない（IPCは厳密一致）。
 実登録の変更は利用者が既存のAI連携画面から行い、この作業では登録先ファイルを変更していない。
+
+## 追加作業: Aboutのソフトウェア情報（2026-11-14）
+
+### 変更と判断
+
+今回の変更は `src/ui_dialogs/about.rs`、下記PNG 2枚、本報告書の計4ファイル。
+
+- `src/ui_dialogs/about.rs`: 見出しと全文の折りたたみを「AI 説明文・文字起こし」に揃え、使用ライブラリに whisper.cpp を追加した。Qwen の案内の次に Whisper large-v3-turbo の MIT・ggml 変換・Q5_0 量子化・再学習なしの案内を加えた。
+- 全文は既存の `VLM-WORKER-LICENSE.txt` 1つをそのまま使う。同梱本文には whisper.cpp v1.9.5 と MIT の著作権表記が既にある。折りたたみの ID `about_vlm_worker_license` も維持した。
+- `asr_addon::addon_root()` と `addon` の公開先を確認した。LICENSE / NOTICE の保存先は `<data_dir>/addons/asr/packs/<model_id>/` なので、About もこの具体的な階層を案内する。ASR の環境設定ページやフォルダを開く導線は追加しない。
+- 製品とテストが同じ `draw_ai_worker_credits` を描く。UIで新しい I/O は行わない。installer readme・ライセンス全文・worker exe・モデルpackは変更していない。計画書との新たな食い違いはない。
+
+### スナップショット
+
+追加したPNGは以下の2枚。既存PNGの更新はない。
+
+| ファイル | 寸法 | bytes |
+| --- | --- | ---: |
+| `tests/snapshots/ai_worker_credits_light.png` | 520×300 | 70,515 |
+| `tests/snapshots/ai_worker_credits_dark.png` | 520×300 | 69,872 |
+
+実装担当が両方を目視し、見出し・共通全文の折りたたみ・Qwen と Whisper の案内・保存先の全文が欠けずに読めることを確認した。純粋な描画fixtureであり、製品アプリは起動していない。
+同じテストで折りたたみを実クリックし、whisper.cpp を含む共通ライセンス全文が表示されることも確かめた。
+
+### 検証
+
+以下の Cargo / ビルドコマンドはすべて、この入口を通した。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local\miv-locks\run-heavy.ps1 -Owner asr-t1-codex -WorkDir G:\home\mimageviewer-asr-t1 -Command "<コマンド>"
+```
+
+ログを残すため `<コマンド>` 内で `python -B -I target/asr-t1-chunk4/run.py <label> ...` を使い、Cargo / CMake のジョブ数を1にした。ロック領域に書けない警告後は、指定どおり低優先度で続けた。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo nextest run -j 1 -p mimageviewer --lib ai_worker_credits_snapshot --no-fail-fast --success-output final`（`UPDATE_SNAPSHOTS=1`） | 1件成功、上記2枚を生成（6.072秒）。初回のテスト用import不足を修正した後の結果。 |
+| `cargo nextest run -j 1 -p mimageviewer --lib ui_dialogs::about::tests --no-fail-fast --success-output final`（更新指定なし） | 9件すべて成功（16.630秒）。新規2枚の通常比較、既存ライセンス・全文表示・Aboutのスクロールも含む。 |
+| `cargo fmt`（引数なし）、`cargo fmt --check` | 成功 |
+| `python scripts/check_ui_glyphs.py` | 成功、危険なグリフ0件 |
+| `git diff --check` | 成功 |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-dev.ps1 -PreserveRuntime` | 成功。core・remote・EPUB worker・MCP adapter・music-video editor を配置し、VCRT/PE検査も成功（runtime=4 / pe=5）。 |
+
+ログは `target/asr-t1-chunk4/about-credits-update-fixed.log` と `about-credits-compare.log`。
+確認用ビルドのログは `target/asr-t1-chunk4/about-credits-build-dev.log`。
+run-heavy は11:13:36開始、別worktreeのnative build終了を待って11:30:55にexit 0で完了した。
+core のコンパイルは5分54秒。最終 core は `target/dev-runtime/mimageviewer-core.exe`、393,921,536 bytes、
+SHA-256 は `5918dba6cfb7ca841b190f5b6e118ceb06a1ca6f1aad5c15115225440334f192`。
+
+コミット・製品バイナリの起動は行っていない。並行して変更された `htdocs/mimageviewer/manual/tut-ai-transcript.html` は、この追加作業の対象外として保持した。
+起動コマンドと通常profileの注意は前節と同じ。利用者が確認する箇所は「バージョン情報 → ソフトウェア情報」の
+「AI 説明文・文字起こし」、モデルの案内、共通のライセンス全文。

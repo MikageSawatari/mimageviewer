@@ -37,6 +37,19 @@ fn draw_miv_sound_credits(ui: &mut egui::Ui) {
     }
 }
 
+fn draw_ai_worker_credits(ui: &mut egui::Ui) {
+    ui.label(egui::RichText::new("AI 説明文・文字起こし").strong());
+    ui.label("llama.cpp / whisper.cpp / ggml (MIT) を使用しています。");
+    draw_license_text(
+        ui,
+        "AI 説明文・文字起こしのライセンス・著作権表記 全文",
+        "about_vlm_worker_license",
+        VLM_WORKER_LICENSE,
+    );
+    ui.label("追加モデル: Qwen3.5-4B (Apache License 2.0)。モデルの LICENSE と NOTICE は環境設定の「AI 説明文」から保存先フォルダを開いて確認できます。");
+    ui.label(r"追加モデル: Whisper large-v3-turbo (MIT) の派生物。whisper.cpp で ggml 形式へ変換し、Q5_0 に量子化しています。再学習は行っていません。モデルの LICENSE と NOTICE は、データフォルダ内の addons\asr\packs\<model_id>\ に保存されます。");
+}
+
 fn draw_license_text(ui: &mut egui::Ui, title: &str, id: &str, text: &str) {
     egui::CollapsingHeader::new(title)
         .id_salt(id)
@@ -314,10 +327,7 @@ impl App {
                 ui.separator();
                 draw_avif_license_snapshot_fixture(ui);
                 ui.add_space(8.0);
-                ui.label(egui::RichText::new("AI 説明文").strong());
-                ui.label("llama.cpp / ggml (MIT) を使用しています。");
-                draw_license_text(ui, "AI 説明文のライセンス・著作権表記 全文", "about_vlm_worker_license", VLM_WORKER_LICENSE);
-                ui.label("追加モデル: Qwen3.5-4B (Apache License 2.0)。モデルの LICENSE と NOTICE は環境設定の「AI 説明文」から保存先フォルダを開いて確認できます。");
+                draw_ai_worker_credits(ui);
                 ui.add_space(8.0);
                 ui.label(egui::RichText::new("3D 写真").strong());
                 ui.label("追加モデル: Depth Anything 3 (DA3 Mono-Large、Apache-2.0) の派生物。重みと内部計算を fp16 化し、入力を 1 枚・504 × 504 px に固定しています。再学習は行っていません。");
@@ -545,6 +555,50 @@ mod tests {
         assert!(EGUI_LICENSE_MIT.contains("Copyright (c) 2018-2021 Emil Ernerfeldt"));
         assert!(EGUI_LICENSE_APACHE.contains("Apache License"));
         assert!(EGUI_LICENSE_APACHE.contains("Version 2.0, January 2004"));
+    }
+
+    #[test]
+    fn ai_worker_credits_snapshot_light_and_dark() {
+        use super::VLM_WORKER_LICENSE;
+        use egui_kittest::kittest::Queryable;
+        let mut snapshots = egui_kittest::SnapshotResults::default();
+        for (name, theme) in [
+            (
+                "ai_worker_credits_light",
+                crate::os_theme::ResolvedTheme::Light,
+            ),
+            (
+                "ai_worker_credits_dark",
+                crate::os_theme::ResolvedTheme::Dark,
+            ),
+        ] {
+            let mut fonts_ready = false;
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(520.0, 300.0))
+                .build_ui(move |ui| {
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ui.ctx());
+                        fonts_ready = true;
+                        ui.ctx().request_repaint();
+                        return;
+                    }
+                    crate::os_theme::apply_resolved(ui.ctx(), theme);
+                    super::draw_ai_worker_credits(ui);
+                });
+            harness.run();
+            harness.get_by_label("AI 説明文・文字起こし");
+            harness.get_by_label("llama.cpp / whisper.cpp / ggml (MIT) を使用しています。");
+            harness.snapshot(name);
+            snapshots.extend(harness.take_snapshot_results());
+            // 同じ全文を開き、静的リンクした whisper.cpp の表記まで含むことを確認する。
+            harness
+                .get_by_label("AI 説明文・文字起こしのライセンス・著作権表記 全文")
+                .click();
+            harness.run();
+            harness.get_by_label(VLM_WORKER_LICENSE);
+            assert!(VLM_WORKER_LICENSE.contains("whisper.cpp source: v1.9.5"));
+        }
+        snapshots.unwrap();
     }
 
     #[test]
