@@ -58,6 +58,14 @@
 - 直し方の方向: 入力欄の編集中の Esc は、まず編集を取り消す (欄からフォーカスを外す) だけにし、モードは終わらせない。IME の Esc の扱い (`dialog_escape_pressed`) と keymap の規則に合わせる。
 - 関連: §1.775、[SNS 分割書き出しの設計](sns-split-export-plan.md)。規模 / 優先度: Small / P3。
 
+### 1.786 MCP の許可を変えても、AI アプリの tool 一覧が変わらないことがある (list_changed を取り直さないクライアント) — サブ PC の確認から (2026-11-14)
+
+- 状態: **未着手・調査から。出荷済みの MCP の挙動に関わるので、直し方は利用者の判断が要る**。
+- 観測 (サブ PC 担当、依頼 52 第 4 部、文字起こし T1 のビルド): 「文字起こしを AI に見せる」を ON にした後も、Claude Code のセッションの tool 一覧に `get_transcript` が出なかった (2 回確認)。adapter は initialize で `tools.listChanged: true` を宣言し、許可の OFF・ON のたびに `notifications/tools/list_changed` を送っていた。同じ adapter を小さな stdio client で起動すると、ON 時の tools/list に含まれ、本文も読めた。
+- 原因の位置づけ (T1 担当のコード参照): T1 だけの作りではない。出荷済みの MCP の設計 ([MCP 連携の計画](mcp-integration-plan.md) 247 行目付近と §8.x) は、許可より上の tool を tools/list に出さず、許可を変えたら list_changed を送る方式で、`get_thumbnail` (縮小画像)・`open_in_viewer`・書き込み系も同じ。クライアントが list_changed で一覧を取り直さないなら、それらでも同じことが起きるはず (未確認)。マニュアル ai-integration.html の「変えた時点で反映されます」は、その場合は偽になる。
+- 次にすること: Claude Desktop・Claude Code・ChatGPT Codex が list_changed で一覧を取り直すかを確かめる (サブ PC では、縮小画像のチェックを ON にして `get_thumbnail` が出るかを見れば、既存の tool でも同じかが分かる)。取り直さないクライアントがあるなら、(a) 許可で隠す tool をすべて「常に一覧に出し、許可が無ければ permission の error を返す」形にそろえる (許可 OFF でも tool 名が見える。マニュアル・プライバシーの説明も変わる)、(b) 「許可を変えたら AI アプリを起動し直す」と案内する、のどちらかを利用者と決める。get_transcript だけを特別扱いにはしない (1 つの規則を 2 通りに書かない)。
+- 関連: ローカル文字起こし T1 (feat-asr-t1)。規模 / 優先度: 調査から / P2。
+
 ### 1.783 SNS 分割で Instagram の比率の検査が先頭の枠しか見ていない (2026-11-14)
 
 - 状態: **未着手**。§1.775 の実装担当のコード調査で判明 (4 枚上限の版からある問題、実画面での確認はまだ)。例: 836x1000 の絵を 3 枚・3:4 で切ると、中央の枠が 278x372 (0.747) になり、3:4 (0.75) を下回るのに書き出しが止まらない。
