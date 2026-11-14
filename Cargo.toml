@@ -422,7 +422,6 @@ rexif = "0.7"
 rayon = "1.10"
 rusqlite = { version = "0.31", features = ["bundled", "hooks"] }
 sha2 = "0.10"
-hmac = "0.12"
 url = "2"
 # CF_HTML uses a browser-grade HTML parser; inline background-image values use
 # the same CSS tokenizer already required by scraper (ISC / MPL-2.0).

@@ -273,3 +273,72 @@ SHA-256 は `5918dba6cfb7ca841b190f5b6e118ceb06a1ca6f1aad5c15115225440334f192`�
 コミット・製品バイナリの起動は行っていない。並行して変更された `htdocs/mimageviewer/manual/tut-ai-transcript.html` は、この追加作業の対象外として保持した。
 起動コマンドと通常profileの注意は前節と同じ。利用者が確認する箇所は「バージョン情報 → ソフトウェア情報」の
 「AI 説明文・文字起こし」、モデルの案内、共通のライセンス全文。
+
+## 独立レビュー後の修正（2026-11-14）
+
+### 変更と判断
+
+この節は、初期実装の「詳細説明のinstructionsへの移動」「cursorのHMAC」「Aboutの内部model_id表記」を置き換える。
+
+- P2-1: `crates/mcp-server/src/schema.rs` の各tool descriptionへ、権限・入力の条件・返す内容の意味・untrusted dataの注意を戻した。`get_thumbnail` の補正非反映・画像blockの並び・上限、タグの正規化・64文字・空白不可・失敗/queuedの意味なども各tool単体で読める。`lib.rs` の INSTRUCTIONS は共通の補足に絞った。
+- 予算調整として、条件を保って説明を短くし、schemaのdescriptionとの重複を除いた。outputSchemaのrootが保証するobject型を直下の分岐へ重ねる指定も除いた。rootのobject型、必須列、追加列の拒否、値の制約、各tool単独のschemaは保持する。40,000文字と512文字の余裕は変更していない。
+- P2-2: `src/transcript_panel.rs` は、eguiがzoom修飾を取り除いた `smooth_scroll_delta()` をScrollAreaが消費する前に読む。raw MouseWheelの有無では止めない。一覧・scrollbarの所属、layer、clip、有効状態の既存の判定は維持した。Ctrl+wheelはzoomされてもFollowingを保ち、通常のwheelはManualへ移るhandler-level回帰を加えた。
+- P3: `src/agent_ipc/transcript.rs` のHMAC・SignedCursor・プロセス鍵を削除した。hex JSONには対象キーと初回開始秒の引数digest・rev・epoch・位置を持ち、要求ごとに行と照合する。同じ本文内の有効な別位置は許可し、範囲外・引数不一致・行変更/削除・権限変更は既存の拒否を返す。認可の受付・handler・送信直前の照合は維持した。
+- `Cargo.toml` と `Cargo.lock` からcoreのhmac直接依存を外した。Remoteが使う別のhmac依存とlock内のpackageは残す。
+- `src/agent_ipc/transcript_tests.rs` は、署名の改ざん拒否から、引数・rev・epoch・範囲の照合と有効な別位置を読めることの検査へ変更した。cursorの再符号化も同じ値になり、再起動だけを理由にした鍵由来の失効条件はなくなった。
+- `src/ui_dialogs/about.rs` のWhisperの保存先は、指定どおり「データフォルダ内の addons\asr\ に保存されます。」へ変更した。ライセンス全文と折りたたみIDは維持した。
+- `docs/mcp-integration-plan.md` は、instructionsの任意性と操作条件の配置、mIVの応答予算、署名を使わないcursorの照合に合わせた。
+
+変更ファイルは上記に加え、MCPのテスト2ファイル（`crates/mcp-server/src/tests.rs`・`schema.rs`内）、AboutのPNG 2枚、本報告書。
+予算の最悪値と検証の最終結果は以下。build-devは指示どおり省略し、コミット・製品バイナリの起動は行っていない。
+
+### P2-1の予算不足による停止
+
+操作条件を戻した最初の計測は41,754文字のケースで失敗した。上記の重複削減後も予算内には収まらなかった。
+全toolを公開し、modern形式・64文字のIDを使った最悪条件の実測は以下。
+
+| 項目 | 文字数 |
+| --- | ---: |
+| 最終tools/list JSON | 40,636 |
+| 既存の予約余裕 | 512 |
+| 余裕を含めて必要な予算 | 41,148 |
+| 現行の予算 | 40,000 |
+| 不足（予約余裕を含む） | 1,148 |
+
+応答そのものも現行予算を636文字超える。予算・予約余裕の値やテストの閾値は変更していない。
+残す必要がある内容は、縮小画像の補正非反映・編集で隠した画像の扱い・blockの順序/サイズ、
+タグの正規化/64文字/空白/queuedと完了の区別、各書込みの対象/結果/タイムスタンプ保持、
+メタ情報の状態/古さ/生データの除外、一覧の並び/対象外/フィルタ/cursorの無効化、
+文字起こしの時刻/続き/切詰め/保存状態、各toolの権限とuntrusted dataの注意。
+
+指示どおり、P2-1は上限を変えずここで停止し、予算の見直しか現行予算での再設計を設計担当へ確認中。
+このworktreeは全tool公開時にtools/listが予算で拒まれる状態なので、P2-1を完成品としては扱わない。
+
+### 検証（独立レビュー後）
+
+今回もCargoのビルド・テストはすべて前節の `run-heavy.ps1 -Owner asr-t1-codex -WorkDir G:\home\mimageviewer-asr-t1 -Command "<コマンド>"` 経由。
+ログ用Pythonを内側に使い、Cargo/CMakeは1ジョブ。共用full testの実行中は入口で待機し、
+ロック領域に書けない警告後は指定どおり低優先度で続行した。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo nextest run -j 1 -p mimageviewer-mcp --lib stage2_complete_tool_discovery_fits_final_envelope_budget --no-fail-fast --success-output final` | 予算超過で失敗。最終の最大条件40,636文字を記録。`review-budget-first.log` / `review-budget-compact.log` / `review-budget-worst.log`。 |
+| `cargo nextest run -j 1 -p mimageviewer-mcp --lib --no-fail-fast --success-output final` | 77件中74成功・3失敗、63.884秒。descriptionの条件・schema制約・認可・cursorのadapter側検査は成功。失敗は上記予算1件と既知のnamed pipe 2件（fixture thread開始前のOS error 5）。`review-adapter.log`。 |
+| `cargo nextest run -j 1 -p mimageviewer-mcp --lib -E 'test(tool_descriptions_preserve) \| test(schema::tests)' --no-fail-fast --success-output final` | 条件のassertを補った最終テストで5件すべて成功、0.261秒。補正非反映・権限・古さ・各toolのuntrusted注意もdescription単体で検査。`review-conditions.log`。 |
+| `cargo nextest run -j 1 -p mimageviewer --lib ai_worker_credits_snapshot --no-fail-fast --success-output final`（`UPDATE_SNAPSHOTS=1`） | 1件成功、2.251秒。下記のAbout PNG 2枚だけを更新。`review-snapshot.log`。 |
+| `cargo nextest run -j 1 -p mimageviewer --lib -E 'test(agent_ipc::transcript::tests) \| test(transcript_panel::tests) \| test(ui_dialogs::about::tests)' --no-fail-fast --success-output final`（更新指定なし） | 32件すべて成功、13.121秒。cursor・認可・Ctrl/通常wheel・外部drag/layer/clip・既存パネルとAboutの画像比較を含む。`review-core.log`。 |
+| `cargo fmt`（引数なし）、`cargo fmt --check` | 成功 |
+| `python scripts/check_ui_glyphs.py` | 成功、危険なグリフ0件 |
+| `git diff --check` | 成功 |
+
+ログのディレクトリは `target/asr-t1-chunk4/`。
+
+更新したPNGは以下の2枚。ほかのPNGは変更していない。明暗それぞれを実装担当が目視し、
+`<model_id>`を含まない `addons\asr\` の案内と本文全体の折り返し・末尾が読めることを確認した。
+
+| ファイル | 寸法 | bytes |
+| --- | --- | ---: |
+| `tests/snapshots/ai_worker_credits_light.png` | 520×300 | 67,931 |
+| `tests/snapshots/ai_worker_credits_dark.png` | 520×300 | 67,375 |
+
+未完了はP2-1の予算不足に対する設計判断のみ。P2-2・P3・Aboutは対象の回帰検査と通常画像比較まで完了した。

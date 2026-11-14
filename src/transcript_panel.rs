@@ -139,17 +139,17 @@ fn active_row(segments: &[TranscriptSegment], position: Option<f64>) -> Option<u
 }
 
 /// offset の変化から推測せず、この一覧に対する実際の入力だけで自動送りを止める。
-fn manual_scroll_input<R>(ui: &egui::Ui, output: &egui::scroll_area::ScrollAreaOutput<R>) -> bool {
+fn manual_scroll_input<R>(
+    ui: &egui::Ui,
+    output: &egui::scroll_area::ScrollAreaOutput<R>,
+    wheel: bool,
+) -> bool {
     if !ui.is_enabled() {
         return false;
     }
-    let (pos, wheel, pressed, moved) = ui.input(|input| {
+    let (pos, pressed, moved) = ui.input(|input| {
         (
             input.pointer.interact_pos(),
-            input
-                .events
-                .iter()
-                .any(|event| matches!(event, egui::Event::MouseWheel { .. })),
             input.pointer.primary_pressed(),
             input.pointer.delta() != egui::Vec2::ZERO,
         )
@@ -275,6 +275,9 @@ pub(crate) fn draw_transcript_panel_body(
     }
     let mut seek = None;
     let mut measured = Vec::new();
+    // eguiがzoom修飾を除いた値を、ScrollAreaが消費する前に読む。
+    // raw MouseWheelはCtrl+wheelでも届くため、一覧のスクロールとは見なさない。
+    let wheel = ui.input(|input| input.smooth_scroll_delta() != egui::Vec2::ZERO);
     let output = ui
         .scope(|ui| {
             ui.spacing_mut().scroll.floating = false;
@@ -343,7 +346,7 @@ pub(crate) fn draw_transcript_panel_body(
             })
         })
         .inner;
-    if manual_scroll_input(ui, &output) && matches!(state.mode, ScrollMode::Following(_)) {
+    if manual_scroll_input(ui, &output, wheel) && matches!(state.mode, ScrollMode::Following(_)) {
         state.mode = ScrollMode::Manual(match state.mode {
             ScrollMode::Following(anchor) | ScrollMode::Manual(anchor) => anchor,
         });
@@ -653,11 +656,19 @@ mod tests {
     }
 
     fn wheel(harness: &mut egui_kittest::Harness<'_, InputView>, pos: egui::Pos2) {
+        wheel_with_modifiers(harness, pos, egui::Modifiers::NONE);
+    }
+
+    fn wheel_with_modifiers(
+        harness: &mut egui_kittest::Harness<'_, InputView>,
+        pos: egui::Pos2,
+        modifiers: egui::Modifiers,
+    ) {
         harness.event(egui::Event::PointerMoved(pos));
         harness.event(egui::Event::MouseWheel {
             unit: egui::MouseWheelUnit::Point,
             delta: egui::vec2(0.0, -160.0),
-            modifiers: egui::Modifiers::NONE,
+            modifiers,
             phase: egui::TouchPhase::Move,
             source: egui::MouseWheelSource::Unknown,
         });
@@ -707,6 +718,36 @@ mod tests {
         assert!(matches!(
             harness.state().view.state.mode,
             ScrollMode::Manual(_)
+        ));
+    }
+
+    #[test]
+    fn transcript_panel_ctrl_wheel_zoom_keeps_follow() {
+        let mut harness = input_harness();
+        harness.run_steps(6);
+        wheel_with_modifiers(
+            &mut harness,
+            egui::pos2(150.0, 200.0),
+            // Windowsの入力と同じく、論理commandにもCtrlが入る。
+            egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..egui::Modifiers::NONE
+            },
+        );
+        assert_eq!(
+            harness.ctx.input(|input| input.smooth_scroll_delta()),
+            egui::Vec2::ZERO
+        );
+        assert_ne!(harness.ctx.input(|input| input.zoom_delta()), 1.0);
+        assert!(matches!(
+            harness.state().view.state.mode,
+            ScrollMode::Following(_)
+        ));
+        harness.run_steps(3);
+        assert!(matches!(
+            harness.state().view.state.mode,
+            ScrollMode::Following(_)
         ));
     }
 

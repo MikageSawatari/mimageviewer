@@ -353,8 +353,9 @@ fn transcript_deadline_returns_committed_prefix_and_continuation_advances() {
     assert!(!prefix.segments[0].text.truncated);
     assert!(prefix.truncated);
     let cursor = prefix.cursor.unwrap();
-    let signed: SignedCursor = serde_json::from_slice(&unhex(&cursor).unwrap()).unwrap();
-    assert_eq!(signed.data.next, 1);
+    let data: TranscriptCursor = serde_json::from_slice(&unhex(&cursor).unwrap()).unwrap();
+    assert_eq!(data.next, 1);
+    assert_eq!(encode(data).unwrap(), cursor);
     Arc::get_mut(&mut fixture.handlers).unwrap().read_hooks = None;
     let continuation = present(read(&fixture, item(&path), None, Some(cursor)).unwrap());
     assert_eq!(continuation.info, prefix.info);
@@ -426,7 +427,7 @@ fn transcript_cursor_rejects_rewritten_deleted_rows_and_current_permission_epoch
 }
 
 #[test]
-fn transcript_cursor_rejects_mac_tampering_other_items_and_explicit_start_changes() {
+fn transcript_cursor_checks_arguments_revision_epoch_and_position_without_process_key() {
     let fixture = Fixture::new();
     set_transcripts(true);
     let path = media(&fixture, "long.mp4");
@@ -452,36 +453,49 @@ fn transcript_cursor_rejects_mac_tampering_other_items_and_explicit_start_change
             .code,
         ErrorCode::BadRequest
     );
-    for field in [
-        "next",
-        "rev",
-        "permission_epoch",
-        "start_secs",
-        "key_digest",
-        "tool",
-        "version",
+    for (field, replacement, expected) in [
+        ("next", serde_json::json!(0), ErrorCode::BadRequest),
+        ("next", serde_json::json!(20), ErrorCode::BadRequest),
+        ("next", serde_json::json!(usize::MAX), ErrorCode::BadRequest),
+        ("rev", serde_json::json!(0), ErrorCode::BadRequest),
+        ("rev", serde_json::json!(i64::MAX), ErrorCode::BadRequest),
+        ("start_secs", serde_json::json!(3.0), ErrorCode::BadRequest),
+        ("start_secs", serde_json::json!(-1.0), ErrorCode::BadRequest),
+        (
+            "args_digest",
+            serde_json::json!("other"),
+            ErrorCode::BadRequest,
+        ),
+        (
+            "tool",
+            serde_json::json!("list_folder"),
+            ErrorCode::BadRequest,
+        ),
+        ("version", serde_json::json!(2), ErrorCode::BadRequest),
+        (
+            "permission_epoch",
+            serde_json::json!(u64::MAX),
+            ErrorCode::PermissionChanged,
+        ),
     ] {
         let mut encoded: serde_json::Value =
             serde_json::from_slice(&unhex(&cursor).unwrap()).unwrap();
-        let data = &mut encoded["data"];
-        let replacement = match field {
-            "next" | "rev" | "permission_epoch" | "version" => {
-                serde_json::json!(data[field].as_u64().unwrap() + 1)
-            }
-            "start_secs" => serde_json::json!(3.0),
-            _ => serde_json::json!("tampered"),
-        };
-        data[field] = replacement;
-        // Preserve the old MAC while rewriting syntactically valid JSON fields.
+        encoded[field] = replacement;
         let forged = hex(&serde_json::to_vec(&encoded).unwrap());
         assert_eq!(
             read(&fixture, item(&path), None, Some(forged))
                 .unwrap_err()
                 .code,
-            ErrorCode::BadRequest,
+            expected,
             "{field}"
         );
     }
+    // 許可された同じ本文内の別位置は認可を広げない。鍵や台帳を使わず読み直せる。
+    let mut data: TranscriptCursor = serde_json::from_slice(&unhex(&cursor).unwrap()).unwrap();
+    data.next = 19;
+    let page = present(read(&fixture, item(&path), None, Some(encode(data).unwrap())).unwrap());
+    assert_eq!(page.segments.len(), 1);
+    assert!(page.segments[0].text.text.starts_with("segment-19:"));
     for malformed in [String::new(), "0".into(), "zz".into(), "0".repeat(8194)] {
         assert_eq!(
             read(&fixture, item(&path), None, Some(malformed))

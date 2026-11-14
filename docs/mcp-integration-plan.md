@@ -1195,11 +1195,12 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
 - 区間はstart_secs/end_secsと `text:{text,truncated}`。通常は区間境界でページを切る。
   1区間だけで項目上限を超える場合のみ本文をUTF-8文字境界で切り、truncatedを付けて次の区間へ進める。
   ページはcursorを含め `mcp_content_chars` の既存予算内にする。
-- cursorは許可epoch、対象キーdigest、行rev、次の区間位置、初回開始秒を持つ。
+- cursorは許可epoch、対象キーと初回開始秒の引数digest、行rev、次の区間位置、初回開始秒を持つ。
   FolderCursorと同様に要求ごとに行を読み直し、rev変更/削除なら取り直し、epoch変更ならPermissionChanged。
   文字起こしのチェックOFFはcursor検査前の受付でDisabledとなる（縮小画像と同じ）。
-  HMAC-SHA256のプロセス共通鍵で内容の改ざんも拒否する。行snapshotやcursor台帳はサーバ側に保持しない。
-  再起動前のcursorも無効になる。本文は他のtool文字列と同じuntrusted dataとして扱う。
+  FolderCursorと同じhex JSONで、引数digest・rev・epoch・位置の範囲を照合する。認可はcursorと独立に行い、
+  許可された同じ本文内の位置の書き換えには署名を使わない。プロセス鍵・行snapshot・cursor台帳は保持せず、
+  再起動だけを理由とする失効条件も足さない。本文は他のtool文字列と同じuntrusted dataとして扱う。
 - 検索対象Transcript・索引はT2、open_in_viewerの開始時刻はT3。今回追加しない。
 
 `list_library` の各 kind (独立レビュー P2-4):
@@ -1253,6 +1254,12 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
 - 全 tool で `readOnlyHint=true`。
 
 ### 15.4 出力予算・期限・取消 (1a、全 tool 共通)
+
+40,000文字は応答肥大化を防ぐmIVの予算であり、MCP規格の制限ではない。toolの操作条件（引数の制約、
+返す内容の意味、権限、untrusted dataの注意）は各toolのdescriptionに残す。
+initializeのinstructionsをモデルへ渡すかはclient任意なので、そこへ条件を移して依存しない。
+instructionsには共通のページ上限・cursor・too_long等の補足を集約し、予算調整は条件を保った重複削減で行う。
+tools/listは全権限・プロトコル・IDの組合せで最終JSONを測り、既存の512文字の余裕も確保する。
 
 - **予算** (独立レビュー P2-6、2 巡目 P2-4、3 巡目 P2-1)。**大きさは最終の MCP 形式で数える**: 同じ JSON を
   `structuredContent` (そのまま) と text (JSON 文字列として escape) の 2 か所に入れるので、ある JSON の

@@ -47,7 +47,7 @@ fn draw_ai_worker_credits(ui: &mut egui::Ui) {
         VLM_WORKER_LICENSE,
     );
     ui.label("追加モデル: Qwen3.5-4B (Apache License 2.0)。モデルの LICENSE と NOTICE は環境設定の「AI 説明文」から保存先フォルダを開いて確認できます。");
-    ui.label(r"追加モデル: Whisper large-v3-turbo (MIT) の派生物。whisper.cpp で ggml 形式へ変換し、Q5_0 に量子化しています。再学習は行っていません。モデルの LICENSE と NOTICE は、データフォルダ内の addons\asr\packs\<model_id>\ に保存されます。");
+    ui.label(r"追加モデル: Whisper large-v3-turbo (MIT) の派生物。whisper.cpp で ggml 形式へ変換し、Q5_0 に量子化しています。再学習は行っていません。モデルの LICENSE と NOTICE は、データフォルダ内の addons\asr\ に保存されます。");
 }
 
 fn draw_license_text(ui: &mut egui::Ui, title: &str, id: &str, text: &str) {

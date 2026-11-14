@@ -89,10 +89,6 @@ fn transcript_arguments_preserve_one_reference_start_and_cursor() {
     ] {
         assert!(description.contains(text), "{text}");
     }
-    let details = INSTRUCTIONS
-        .lines()
-        .find(|line| line.starts_with("get_transcript: "))
-        .unwrap();
     for text in [
         "UTF-8",
         "text.truncated=true",
@@ -101,19 +97,18 @@ fn transcript_arguments_preserve_one_reference_start_and_cursor() {
         "omit start_secs or repeat",
         "old saved row remains readable",
     ] {
-        assert!(details.contains(text), "{text}");
+        assert!(description.contains(text), "{text}");
     }
     assert!(!description.contains("too_long"));
 }
 
 #[test]
-fn initialization_instructions_preserve_common_and_tool_output_details() {
+fn tool_descriptions_preserve_operation_conditions_without_initialization_instructions() {
     for text in [
-        "Max 200/page clamped",
+        "max 200/page clamped",
         "library/index changes/restart",
         "digest ID/too_long",
         "No file bytes",
-        "WebP only in image/webp blocks",
     ] {
         assert!(INSTRUCTIONS.contains(text), "{text}");
     }
@@ -131,6 +126,8 @@ fn initialization_instructions_preserve_common_and_tool_output_details() {
             vec![
                 "cursor resumes at next input",
                 "present/none/failed/not_permitted",
+                "GPS/captions/transcript summaries require permission",
+                "stale compares source/saved rotation, null if unresolved",
                 "No raw metadata/workflow JSON/UserComment/external sidecars",
             ],
         ),
@@ -147,9 +144,13 @@ fn initialization_instructions_preserve_common_and_tool_output_details() {
             "get_thumbnail",
             vec![
                 "<256 rejected",
+                ">512 clamped",
+                "no adjustments",
+                "No folder/archive representatives",
+                "thumbnail permission required",
                 "withhold edited-hidden images",
                 "256 KiB/image, 1 MiB total",
-                "Image blocks follow ok rows",
+                "image/webp blocks follow ok rows",
             ],
         ),
         (
@@ -201,10 +202,9 @@ fn initialization_instructions_preserve_common_and_tool_output_details() {
             ],
         ),
     ] {
-        let prefix = format!("{name}: ");
-        let details = INSTRUCTIONS
-            .lines()
-            .find(|line| line.starts_with(&prefix))
+        let tools = schema::tools();
+        let details = tools.iter().find(|tool| tool["name"] == name).unwrap()["description"]
+            .as_str()
             .unwrap();
         for text in expected {
             assert!(details.contains(text), "{name}: {text}");
@@ -1603,7 +1603,7 @@ fn stage1c_open_arguments_and_results_match_schema_and_budget() {
         "fullscreen",
         "Other files",
         "ZIP/PDF",
-        "not that display completed",
+        "not display completed",
         "untrusted data",
     ] {
         assert!(description.contains(text), "{text}");
@@ -2182,6 +2182,16 @@ fn stage2_metadata_tools_transport_typed_commands_and_results_on_all_protocols()
 
 #[test]
 fn stage2_complete_tool_discovery_fits_final_envelope_budget() {
+    // 途中の予算assertで止まっても、設計判断に必要な全tool・最大IDの計測値を残す。
+    let maximal = success(
+        json!("x".repeat(64)),
+        json!({"tools":schema::tools()}),
+        true,
+    );
+    eprintln!(
+        "All tools, modern, 64-char ID: {} chars",
+        response_non_image_chars(&maximal)
+    );
     let mut largest = (0, String::new());
     for level in [
         AgentLevel::Disabled,

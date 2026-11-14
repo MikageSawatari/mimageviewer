@@ -1,9 +1,6 @@
 //! 保存済み文字起こしのworker専用read。行snapshotは要求内だけで保持する。
 use super::*;
 use crate::transcript_db::{FileSignature, TranscriptDb, TranscriptStatus};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-use std::sync::OnceLock;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -11,17 +8,10 @@ struct TranscriptCursor {
     version: u32,
     tool: String,
     permission_epoch: u64,
-    key_digest: String,
+    args_digest: String,
     rev: i64,
     next: usize,
     start_secs: f64,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SignedCursor {
-    data: TranscriptCursor,
-    mac: String,
 }
 
 fn bad_cursor() -> AgentError {
@@ -45,46 +35,27 @@ fn unhex(value: &str) -> Result<Vec<u8>, AgentError> {
         .collect()
 }
 
-fn cursor_mac(data: &TranscriptCursor) -> Result<Hmac<Sha256>, AgentError> {
-    // 改ざんされた位置/rev/許可版も拒む。保持するのはプロセス共通の鍵だけで、
-    // cursorの台帳や行snapshotは持たない。再起動前のcursorは取り直してもらう。
-    static KEY: OnceLock<[u8; 32]> = OnceLock::new();
-    let key = KEY.get_or_init(|| {
-        let mut key = [0; 32];
-        key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-        key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-        key
-    });
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("32-byte HMAC key");
-    mac.update(&serde_json::to_vec(data).map_err(|_| internal())?);
-    Ok(mac)
-}
-
 fn encode(data: TranscriptCursor) -> Result<String, AgentError> {
-    let mac = hex(&cursor_mac(&data)?.finalize().into_bytes());
-    Ok(hex(
-        &serde_json::to_vec(&SignedCursor { data, mac }).map_err(|_| internal())?
-    ))
+    // FolderCursorと同じく位置は認可に使わない。要求ごとに対象・rev・epoch・範囲を照合する。
+    // プロセス固有の鍵やcursor台帳は持たない。
+    Ok(hex(&serde_json::to_vec(&data).map_err(|_| internal())?))
 }
 
 fn decode(
     value: &str,
-    key_digest: &str,
+    key: &str,
     epoch: u64,
     start: Option<f64>,
 ) -> Result<TranscriptCursor, AgentError> {
-    let cursor: SignedCursor = serde_json::from_slice(&unhex(value)?).map_err(|_| bad_cursor())?;
-    cursor_mac(&cursor.data)?
-        .verify_slice(&unhex(&cursor.mac)?)
-        .map_err(|_| bad_cursor())?;
-    let data = cursor.data;
+    let data: TranscriptCursor =
+        serde_json::from_slice(&unhex(value)?).map_err(|_| bad_cursor())?;
     if data.version != 1
         || data.tool != "get_transcript"
-        || data.key_digest != key_digest
         || data.rev <= 0
         || data.next == 0
         || !valid_start(data.start_secs)
         || start.is_some_and(|start| start != data.start_secs)
+        || data.args_digest != wire_digest(&(key, data.start_secs)).map_err(|_| internal())?
     {
         return Err(bad_cursor());
     }
@@ -153,10 +124,9 @@ impl Handlers {
         }
         let path = input_path::validate(&item.path)?;
         let key = TranscriptDb::normalize_path(path);
-        let key_digest = wire_digest(&key).map_err(|_| internal())?;
         let continuation = cursor
             .as_deref()
-            .map(|cursor| decode(cursor, &key_digest, ctx.granted.1, start_secs))
+            .map(|cursor| decode(cursor, &key, ctx.granted.1, start_secs))
             .transpose()?;
         ctx.checkpoint()?;
         let metadata = std::fs::metadata(path).ok();
@@ -215,6 +185,7 @@ impl Handlers {
             .as_ref()
             .map_or(start_secs.unwrap_or(0.0), |cursor| cursor.start_secs);
         let start = if start == 0.0 { 0.0 } else { start };
+        let args_digest = wire_digest(&(key.as_str(), start)).map_err(|_| internal())?;
         let first = continuation.as_ref().map_or_else(
             || {
                 row.segments
@@ -255,7 +226,7 @@ impl Handlers {
                         version: 1,
                         tool: "get_transcript".into(),
                         permission_epoch: ctx.granted.1,
-                        key_digest: key_digest.clone(),
+                        args_digest: args_digest.clone(),
                         rev: row.rev,
                         next: index + 1,
                         start_secs: start,
@@ -276,7 +247,7 @@ impl Handlers {
                     version: 1,
                     tool: "get_transcript".into(),
                     permission_epoch: ctx.granted.1,
-                    key_digest: key_digest.clone(),
+                    args_digest: args_digest.clone(),
                     rev: row.rev,
                     next: index,
                     start_secs: start,
