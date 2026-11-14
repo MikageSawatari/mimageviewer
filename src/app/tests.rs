@@ -50879,8 +50879,11 @@ mod favorite_adjustment_defaults_tests {
         )
         .unwrap();
         assert_eq!(
-            entries.iter().map(|entry| entry.suffix).collect::<Vec<_>>(),
-            vec![0, 1, 2, 3, 4]
+            entries
+                .iter()
+                .map(|entry| entry.suffix.as_str())
+                .collect::<Vec<_>>(),
+            vec!["0", "1", "2", "3", "4"]
         );
     }
 
@@ -50985,7 +50988,7 @@ mod favorite_adjustment_defaults_tests {
         let entries = (0..5)
             .map(|suffix| crate::export_dialog::ExportEntry {
                 label: format!("preset {suffix}"),
-                suffix,
+                suffix: suffix.to_string(),
                 conceal_preset: None,
                 crop_override: None,
             })

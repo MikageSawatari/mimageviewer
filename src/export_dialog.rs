@@ -277,9 +277,9 @@ mod composite_tests {
         assert_eq!(
             entries
                 .iter()
-                .map(|entry| (entry.label.as_str(), entry.suffix))
+                .map(|entry| (entry.label.as_str(), entry.suffix.as_str()))
                 .collect::<Vec<_>>(),
-            vec![("1 / 3", 1), ("2 / 3", 2), ("3 / 3", 3)]
+            vec![("1 / 3", "1"), ("2 / 3", "2"), ("3 / 3", "3")]
         );
         assert_eq!(entries[1].crop_override, Some((frames[1], [832, 400])));
         assert!(entries.iter().all(|entry| entry.conceal_preset.is_none()));
@@ -305,12 +305,12 @@ mod composite_tests {
         assert_eq!(
             entries
                 .iter()
-                .map(|entry| (entry.label.as_str(), entry.suffix))
+                .map(|entry| (entry.label.as_str(), entry.suffix.as_str()))
                 .collect::<Vec<_>>(),
             vec![
-                ("現在の設定", 0),
-                ("プリセット1: one", 1),
-                ("プリセット4", 4),
+                ("現在の設定", "0"),
+                ("プリセット1: one", "1"),
+                ("プリセット4", "4"),
             ]
         );
         assert!(entries[0].conceal_preset.is_none());
@@ -323,15 +323,61 @@ mod composite_tests {
     }
 
     #[test]
+    fn sns_split_filename_numbers_follow_total_digits_and_reserve_every_target() {
+        for total in [3, 9, 10, 12, 20] {
+            let frames = vec![crate::export_crop::CropRect::full(10, 10); total];
+            let entries = plan_export_entries(
+                &frames,
+                Some([10, 10]),
+                &[true; 5],
+                true,
+                &[None, None, None, None],
+            )
+            .unwrap();
+            let suffixes: Vec<&str> = entries.iter().map(|entry| entry.suffix.as_str()).collect();
+            let expected: Vec<String> = (1..=total)
+                .map(|n| {
+                    if total < 10 {
+                        n.to_string()
+                    } else {
+                        format!("{n:02}")
+                    }
+                })
+                .collect();
+            assert_eq!(suffixes, expected);
+            for suffix in &suffixes {
+                let temp = tempfile::tempdir().unwrap();
+                assert_eq!(
+                    resolve_session_basename(temp.path(), "split", "png", &suffixes).unwrap(),
+                    "split"
+                );
+                let occupied = temp.path().join(format!("split_{suffix}.png"));
+                assert_eq!(target_path(temp.path(), "split", suffix, "png"), occupied);
+                std::fs::write(&occupied, b"occupied").unwrap();
+                std::fs::write(
+                    temp.path().join(format!("split_0001_{suffix}.png")),
+                    b"occupied",
+                )
+                .unwrap();
+                assert_eq!(
+                    resolve_session_basename(temp.path(), "split", "png", &suffixes).unwrap(),
+                    "split_0002"
+                );
+                assert_eq!(std::fs::read(occupied).unwrap(), b"occupied");
+            }
+        }
+    }
+
+    #[test]
     fn session_basename_keeps_a_free_name_and_reserves_every_suffix() {
         let temp = tempfile::tempdir().unwrap();
         assert_eq!(
-            resolve_session_basename(temp.path(), "sample", "png", &[0, 1]).unwrap(),
+            resolve_session_basename(temp.path(), "sample", "png", &["0", "1"]).unwrap(),
             "sample"
         );
         std::fs::write(temp.path().join("sample_1.png"), b"occupied").unwrap();
         assert_eq!(
-            resolve_session_basename(temp.path(), "sample", "png", &[0, 1]).unwrap(),
+            resolve_session_basename(temp.path(), "sample", "png", &["0", "1"]).unwrap(),
             "sample_0001"
         );
     }
@@ -421,7 +467,8 @@ pub enum ExportSource {
 #[derive(Clone)]
 pub struct ExportEntry {
     pub label: String,
-    pub suffix: u8,
+    /// File-name number, including any zero padding decided by `plan_export_entries`.
+    pub suffix: String,
     pub conceal_preset: Option<ConcealPreset>,
     /// SNS 分割の枠と、その枠を作成したときの合成画像サイズ。
     pub crop_override: Option<(crate::export_crop::CropRect, [usize; 2])>,
@@ -574,6 +621,7 @@ pub(crate) fn plan_export_entries(
         let source_size = sns_split_source_size
             .ok_or_else(|| "SNS 分割枠の基準サイズがありません".to_string())?;
         let total = sns_split_frames.len();
+        let width = total.to_string().len();
         if total > usize::from(u8::MAX) {
             return Err("SNS 分割の枚数が多すぎます".to_string());
         }
@@ -583,7 +631,7 @@ pub(crate) fn plan_export_entries(
             .enumerate()
             .map(|(index, crop)| ExportEntry {
                 label: format!("{} / {total}", index + 1),
-                suffix: (index + 1) as u8,
+                suffix: format!("{:0width$}", index + 1),
                 conceal_preset: None,
                 crop_override: Some((crop, source_size)),
             })
@@ -594,7 +642,7 @@ pub(crate) fn plan_export_entries(
     if selection[0] {
         entries.push(ExportEntry {
             label: "現在の設定".to_string(),
-            suffix: 0,
+            suffix: "0".to_string(),
             conceal_preset: None,
             crop_override: None,
         });
@@ -613,7 +661,7 @@ pub(crate) fn plan_export_entries(
         };
         entries.push(ExportEntry {
             label,
-            suffix: (slot_idx + 1) as u8,
+            suffix: (slot_idx + 1).to_string(),
             conceal_preset: Some(preset),
             crop_override: None,
         });
@@ -683,7 +731,7 @@ pub fn resolve_session_basename(
     output_dir: &Path,
     requested_basename: &str,
     extension: &str,
-    suffixes: &[u8],
+    suffixes: &[&str],
 ) -> Result<String, String> {
     let base = crate::capture::basename_from_text(requested_basename);
     if suffixes.is_empty() {
@@ -704,7 +752,7 @@ pub fn resolve_session_basename(
     ))
 }
 
-pub fn target_path(output_dir: &Path, basename: &str, suffix: u8, extension: &str) -> PathBuf {
+pub fn target_path(output_dir: &Path, basename: &str, suffix: &str, extension: &str) -> PathBuf {
     output_dir.join(format!("{basename}_{suffix}.{extension}"))
 }
 
@@ -712,7 +760,7 @@ fn session_targets_available(
     output_dir: &Path,
     basename: &str,
     extension: &str,
-    suffixes: &[u8],
+    suffixes: &[&str],
 ) -> bool {
     suffixes
         .iter()
@@ -839,7 +887,7 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
         let path = target_path(
             &request.output_dir,
             &request.basename,
-            entry.suffix,
+            &entry.suffix,
             extension,
         );
         // 複数バリエーションでは前の entry のために decode 結果を残す必要があるが、

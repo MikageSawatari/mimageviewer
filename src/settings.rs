@@ -5388,7 +5388,7 @@ pub struct Settings {
     /// 直前に選んだ投稿先 (`"x"` / `"instagram"`)。ページ固有の配置は保存しない。
     #[serde(default = "default_sns_split_target")]
     pub sns_split_target: Option<String>,
-    /// 直前に選んだ分割枚数 (2..=4)。ページ固有の配置は保存しない。
+    /// 直前に選んだ分割枚数 (2..=20)。ページ固有の配置は保存しない。
     #[serde(default = "default_sns_split_count")]
     pub sns_split_count: u8,
     /// 直前に選んだ継ぎ目幅。枠幅に対する千分率 (0..=100)。
@@ -11931,6 +11931,20 @@ mod tests {
         assert_eq!(restored.sns_split_count, 4);
         assert_eq!(restored.sns_split_seam_permille, 100);
         assert_eq!(restored.sns_split_frame_ratio.as_deref(), Some("4:5"));
+    }
+
+    #[test]
+    fn sns_split_saved_counts_preserve_valid_values_and_clamp_at_twenty() {
+        for input in [4, 20, 21, u8::MAX] {
+            let saved = Settings {
+                sns_split_count: input,
+                ..Settings::default()
+            };
+            let mut restored: Settings =
+                serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+            restored.sanitize();
+            assert_eq!(restored.sns_split_count, input.min(20));
+        }
     }
 
     #[test]
