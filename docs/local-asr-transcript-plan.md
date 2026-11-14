@@ -314,6 +314,11 @@ transcript_removed(item_key TEXT, rev INTEGER, PRIMARY KEY (item_key, rev))
   再生側の `clamp_seek_target` は `[0, duration - 0.1]` で、`duration` がコンテナの開始を含まないため、開始が 0 でないファイル (MPEG-TS など) では
   最後の約「開始」秒へ移れない。これはシークバー・ブックマーク・チャプターにも同じく効く既存の再生側の問題で、T1 では直さない。
   文字起こしの行もほかのジャンプと同じ seek の経路に乗せ、専用の迂回は足さない。
+- **再生側の原点の修正との合わせ方 (2026-11-14 決定)**: 上の再生側の問題は別ブランチ `fix-video-timeline-origin`
+  (正本 `docs/video-timeline-origin-plan.md`) で直し、v5.2.1 経由で T1 より先に master へ入る。修正後の再生時刻は
+  「raw PTS − `VideoInfo.timeline_origin_secs`」(MPEG-TS/PS の demuxer だけコンテナの開始、ほかは 0)。T1 は master を取り込むときに、
+  `src/video/transcript_time.rs` の変換に渡す差を `container_start_secs − timeline_origin_secs` に直す (TS/PS では恒等、MKV・MP4 などは今と同じ)。
+  保存の時刻 (コンテナの開始 = 0) は変えない。`VideoInfo` の 2 つのフィールドは並べて残し、TS fixture の回帰テストの期待値も合わせて直す。
 
 ### 8.4 右パネル
 
