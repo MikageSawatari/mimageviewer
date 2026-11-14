@@ -418,3 +418,7 @@ tools/list全体の文字数に同じ上限を適用する根拠にはしない�
 今回の追加はテストと文書のみのため、前節のMCP lib全件・対象filterの結果を再利用した。
 変更対象はMCPのテスト、MCP計画書、本報告書の3ファイル（既存の未コミット差分に追加）。
 UI・PNGは変更せず、build-dev・コミット・製品バイナリの起動は行っていない。設計判断との食い違いはない。
+
+- 再レビューP3（2026-11-14）: `schema.rs`でcursorを返す9 toolのdescriptionへ変更・再起動の注意を復帰し、`tests.rs`で全対象を検査。`get_transcript`は既存のrev/epoch拒否の説明を維持した。
+- run-heavy経由 `cargo nextest run -j 1 -p mimageviewer-mcp --lib --no-fail-fast --success-output final`: 83件中81成功・既知のnamed pipe制約2失敗（OS error 5）、68.949秒。最長description612文字・INSTRUCTIONS852文字・tools/list最大41,380文字で全上限内、2,048文字超のtoolは0件。
+- MCP crate内で `cargo fmt`・`cargo fmt --check`、`git diff --check`成功。コード変更はMCP内2ファイルのみで、本体ソース変更・コミット・製品起動はなし。ログ: `target/asr-t1-chunk4/p3-cursor-descriptions.log`。

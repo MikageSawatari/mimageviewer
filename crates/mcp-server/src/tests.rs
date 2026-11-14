@@ -2,6 +2,48 @@ use super::*;
 use std::{sync::Mutex, time::Duration};
 
 #[test]
+fn cursor_tools_keep_continuation_warning_in_each_description() {
+    let tools = schema::tools();
+    let mut warned = Vec::new();
+    for tool in &tools {
+        let name = tool["name"].as_str().unwrap();
+        let description = tool["description"].as_str().unwrap();
+        if tool["inputSchema"]["properties"].get("cursor").is_none() {
+            assert!(!description.contains("Continuations may shift"), "{name}");
+            continue;
+        }
+        if name == "get_transcript" {
+            assert!(description.contains("rev/epoch changes invalidate it"));
+            assert!(!description.contains("may shift"));
+            continue;
+        }
+        assert!(
+            description.contains("Continuations may shift or be rejected"),
+            "{name}"
+        );
+        assert!(
+            description.contains("library/index changes or restart"),
+            "{name}"
+        );
+        warned.push(name);
+    }
+    assert_eq!(
+        warned,
+        [
+            "search_items",
+            "list_tags",
+            "items_by_tag",
+            "list_collections",
+            "get_collection",
+            "list_library",
+            "get_item_info",
+            "list_folder",
+            "get_thumbnail",
+        ]
+    );
+}
+
+#[test]
 fn client_text_limits_tool_descriptions() {
     let tools = schema::tools();
     let mut longest = ("", 0, 0);
