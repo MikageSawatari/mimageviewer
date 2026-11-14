@@ -20,11 +20,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    HTCLOSE, SC_CLOSE, WM_CANCELMODE, WM_CAPTURECHANGED, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOVING, WM_NCDESTROY, WM_NCLBUTTONDBLCLK,
-    WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCPOINTERDOWN, WM_NCPOINTERUP, WM_NCPOINTERUPDATE,
-    WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_SIZING,
-    WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    HTCLOSE, HTHELP, HTMAXBUTTON, HTMINBUTTON, SC_CLOSE, WM_CANCELMODE, WM_CAPTURECHANGED,
+    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOVING, WM_NCDESTROY, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
+    WM_NCMOUSEMOVE, WM_NCPOINTERDOWN, WM_NCPOINTERUP, WM_NCPOINTERUPDATE, WM_POINTERCAPTURECHANGED,
+    WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_SIZING, WM_SYSCOMMAND, WM_SYSKEYDOWN,
+    WM_SYSKEYUP,
 };
 
 const MAX_PENDING_EVENTS: usize = 256;
@@ -1674,6 +1675,25 @@ enum NativeMouseOrigin {
     PointerPromotion,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeNonClientPressTarget {
+    hit: u32,
+    screen_position: [i32; 2],
+}
+
+impl NativeNonClientPressTarget {
+    fn is_button(self) -> bool {
+        matches!(self.hit, HTMINBUTTON | HTMAXBUTTON | HTHELP)
+    }
+
+    fn contains_click(self, location: Self) -> bool {
+        let dx = i64::from(location.screen_position[0]) - i64::from(self.screen_position[0]);
+        let dy = i64::from(location.screen_position[1]) - i64::from(self.screen_position[1]);
+        location.hit == self.hit
+            && dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy)) <= 8 * 8
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum NativeDetachedGesture {
     #[default]
@@ -1688,6 +1708,7 @@ enum NativeDetachedGesture {
     },
     NonClient {
         source: NativePointerSource,
+        press_target: NativeNonClientPressTarget,
         phase: NativeNonClientPhase,
         scope: NativeNonClientScope,
         initial_rect: Option<[i32; 4]>,
@@ -5293,6 +5314,8 @@ fn native_detached_message_interesting(message: u32) -> bool {
             | WM_NCLBUTTONDOWN
             | WM_NCLBUTTONDBLCLK
             | WM_NCLBUTTONUP
+            | WM_MOUSEMOVE
+            | WM_NCMOUSEMOVE
             | WM_NCPOINTERDOWN
             | WM_NCPOINTERUP
             | WM_NCPOINTERUPDATE
@@ -5314,7 +5337,12 @@ fn native_detached_message_interesting(message: u32) -> bool {
 fn native_mouse_origin(message: u32) -> NativeMouseOrigin {
     if !matches!(
         message,
-        WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK | WM_NCLBUTTONUP
+        WM_NCLBUTTONDOWN
+            | WM_NCLBUTTONDBLCLK
+            | WM_NCLBUTTONUP
+            | WM_NCMOUSEMOVE
+            | WM_MOUSEMOVE
+            | WM_LBUTTONUP
     ) {
         return NativeMouseOrigin::Ordinary;
     }
@@ -5358,6 +5386,106 @@ fn native_pointer_release(message: u32, wparam: usize) -> Option<NativePointerSo
     }
 }
 
+fn native_pointer_location_source(message: u32, wparam: usize) -> Option<NativePointerSource> {
+    match message {
+        WM_MOUSEMOVE | WM_NCMOUSEMOVE => Some(NativePointerSource::Mouse),
+        WM_POINTERUPDATE | WM_NCPOINTERUPDATE => {
+            Some(NativePointerSource::Pointer((wparam & 0xffff) as u64))
+        }
+        _ => native_pointer_release(message, wparam),
+    }
+}
+
+fn native_message_position(lparam: isize) -> [i32; 2] {
+    // GET_X/Y_LPARAM semantics: screen coordinates may be negative on a
+    // secondary monitor, as may captured mouse coordinates in the client area.
+    [lparam as i16 as i32, (lparam >> 16) as i16 as i32]
+}
+
+fn native_non_client_location(
+    hwnd: u64,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+) -> Option<NativeNonClientPressTarget> {
+    let mut screen_position = native_message_position(lparam);
+    let hit = match message {
+        WM_NCMOUSEMOVE | WM_NCLBUTTONUP => wparam as u32,
+        WM_NCPOINTERUPDATE | WM_NCPOINTERUP => ((wparam >> 16) & 0xffff) as u32,
+        _ => {
+            let hwnd = HWND(hwnd as *mut _);
+            if matches!(message, WM_MOUSEMOVE | WM_LBUTTONUP) {
+                let mut point = windows::Win32::Foundation::POINT {
+                    x: screen_position[0],
+                    y: screen_position[1],
+                };
+                if !unsafe { windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut point) }
+                    .as_bool()
+                {
+                    report_native_window_input_failure(format!(
+                        "non-client button ClientToScreen failed hwnd={hwnd:?}"
+                    ));
+                    return None;
+                }
+                screen_position = [point.x, point.y];
+            }
+            // Captured mouse/pointer messages have no hit-test payload. Query
+            // this same HWND at the message's point, never the current cursor.
+            // This synchronously enters its wndproc, so callers hold no owner
+            // lock. DefSubclassProc still receives every original message.
+            let point =
+                u32::from(screen_position[0] as u16) | (u32::from(screen_position[1] as u16) << 16);
+            unsafe {
+                windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                    hwnd,
+                    windows::Win32::UI::WindowsAndMessaging::WM_NCHITTEST,
+                    None,
+                    Some(LPARAM(point as isize)),
+                )
+                .0 as u32
+            }
+        }
+    };
+    Some(NativeNonClientPressTarget {
+        hit,
+        screen_position,
+    })
+}
+
+fn native_non_client_button_location(
+    hwnd: u64,
+    subclass_id: Option<usize>,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+) -> Option<(NativePointerSource, Option<NativeNonClientPressTarget>)> {
+    let source = native_pointer_location_source(message, wparam)?;
+    let button_pressed = {
+        let guard = state().lock().ok()?;
+        let entry = guard.installed_hwnds.entries.iter().find(|entry| {
+            entry.hwnd_raw == hwnd && subclass_id.is_none_or(|id| entry.subclass_id() == id)
+        })?;
+        matches!(
+            entry.native_detached,
+            NativeDetachedInputBinding::Bound {
+                gesture: NativeDetachedGesture::NonClient {
+                    source: owner,
+                    press_target,
+                    phase: NativeNonClientPhase::Pressed,
+                    ..
+                },
+                ..
+            } if owner == source && press_target.is_button()
+        )
+    };
+    button_pressed.then(|| {
+        (
+            source,
+            native_non_client_location(hwnd, message, wparam, lparam),
+        )
+    })
+}
+
 fn native_detached_message(
     hwnd: u64,
     subclass_id: Option<usize>,
@@ -5395,6 +5523,8 @@ fn native_detached_message_with_origin(
         return;
     }
     let pointer_cancelled = native_pointer_cancelled(message, wparam);
+    let button_location =
+        native_non_client_button_location(hwnd, subclass_id, message, wparam, lparam);
     let non_client_start = dispatching
         .then(|| native_non_client_start(message, wparam, origin))
         .flatten();
@@ -5451,6 +5581,29 @@ fn native_detached_message_with_origin(
         return;
     };
 
+    if !pointer_cancelled
+        && let Some((observed_source, location)) = button_location
+        && let NativeDetachedGesture::NonClient {
+            source,
+            press_target,
+            phase: phase @ NativeNonClientPhase::Pressed,
+            ..
+        } = gesture
+        && *source == observed_source
+    {
+        // Motion and Up share this owner and the ordered native transcript.
+        // Once outside/dragged, coming back or duplicate hook/subclass delivery
+        // cannot turn this operation into an activation. Caption/resize retain
+        // their existing WM_MOVING/SIZING rectangle rule; close stays OS-owned.
+        if !location.is_some_and(|location| press_target.contains_click(location)) {
+            *phase = NativeNonClientPhase::Cancelled(if location.is_some() {
+                NativeInputCancelReason::Drag
+            } else {
+                NativeInputCancelReason::CancelMode
+            });
+        }
+    }
+
     // Raw NC pointer input owns touch/pen operations. Promoted NC mouse input
     // is never another producer, including after raw cancellation or retirement.
     if let Some((source, hit)) = non_client_start {
@@ -5468,6 +5621,10 @@ fn native_detached_message_with_origin(
         };
         *gesture = NativeDetachedGesture::NonClient {
             source,
+            press_target: NativeNonClientPressTarget {
+                hit,
+                screen_position: native_message_position(lparam),
+            },
             phase,
             scope: NativeNonClientScope::InNativeCall,
             initial_rect,
@@ -5815,7 +5972,8 @@ mod native_detached_tests {
     use super::*;
     use egui_winit::pointer_input_observer::{NormalizedPointerInput, PointerInputSource};
     use windows::Win32::UI::WindowsAndMessaging::{
-        HTCAPTION, SC_MAXIMIZE, WM_NCPOINTERDOWN, WM_NCPOINTERUP,
+        HTCAPTION, HTMAXBUTTON, HTMINBUTTON, SC_MAXIMIZE, WM_NCMOUSEMOVE, WM_NCPOINTERDOWN,
+        WM_NCPOINTERUP,
     };
 
     struct Fixture {
@@ -6033,6 +6191,167 @@ mod native_detached_tests {
             vec![NativeDetachedInputEventKind::NonClient(
                 NativeNonClientOutcome::CloseOwned
             )]
+        );
+    }
+
+    fn screen_point(x: i16, y: i16) -> isize {
+        (u32::from(x as u16) | (u32::from(y as u16) << 16)) as isize
+    }
+
+    #[test]
+    fn native_detached_caption_button_outside_release_cancels_without_rect_change() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("native-button-outside", 0x720);
+        let sibling = Fixture::new("native-button-outside-sibling", 0x721);
+        for hit in [HTMAXBUTTON, HTMINBUTTON] {
+            let point = screen_point(-120, 30);
+            sibling.message(WM_NCLBUTTONDOWN, hit as usize, point);
+            f.message(WM_NCLBUTTONDOWN, hit as usize, point);
+            // PM_REMOVE sees the Up inside DefSubclassProc's native button
+            // loop. No WM_MOVING/SIZING or rectangle change occurs.
+            observe_native_detached_message(f.hwnd, WM_NCLBUTTONUP, HTCAPTION as usize, point);
+            f.finish(WM_NCLBUTTONDOWN);
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Cancelled(NativeInputCancelReason::Drag)
+                )],
+                "release on a different hit-test target must not resume"
+            );
+            assert!(sibling.take().is_empty());
+            sibling.message(WM_NCLBUTTONUP, hit as usize, point);
+            sibling.finish(WM_NCLBUTTONDOWN);
+            assert_eq!(
+                sibling.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Completed
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn native_detached_caption_button_out_and_back_is_terminal_even_with_inside_up() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("native-button-out-back", 0x722);
+        let point = screen_point(300, 25);
+        f.message(WM_NCLBUTTONDOWN, HTMAXBUTTON as usize, point);
+        observe_native_detached_message(f.hwnd, WM_NCMOUSEMOVE, HTCAPTION as usize, point);
+        observe_native_detached_message(f.hwnd, WM_NCMOUSEMOVE, HTMAXBUTTON as usize, point);
+        observe_native_detached_message(f.hwnd, WM_NCLBUTTONUP, HTMAXBUTTON as usize, point);
+        f.finish(WM_NCLBUTTONDOWN);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::Drag)
+            )]
+        );
+        f.message(WM_NCLBUTTONUP, HTMAXBUTTON as usize, point);
+        f.finish(WM_NCLBUTTONUP);
+        assert!(
+            f.take().is_empty(),
+            "late Up cannot revive cancelled ownership"
+        );
+        f.message(WM_NCLBUTTONDOWN, HTMAXBUTTON as usize, point);
+        f.promoted_mouse(WM_NCMOUSEMOVE);
+        observe_native_detached_message(
+            f.hwnd,
+            WM_NCMOUSEMOVE,
+            HTMAXBUTTON as usize,
+            screen_point(308, 25),
+        );
+        observe_native_detached_message(f.hwnd, WM_NCLBUTTONUP, HTMAXBUTTON as usize, point);
+        f.finish(WM_NCLBUTTONDOWN);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Completed
+            )],
+            "the next ordinary button click remains available"
+        );
+    }
+
+    #[test]
+    fn native_detached_caption_button_far_motion_cancels_inside_same_target() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("native-button-far-motion", 0x723);
+        f.message(
+            WM_NCLBUTTONDOWN,
+            HTMINBUTTON as usize,
+            screen_point(300, 25),
+        );
+        observe_native_detached_message(
+            f.hwnd,
+            WM_NCMOUSEMOVE,
+            HTMINBUTTON as usize,
+            screen_point(309, 25),
+        );
+        observe_native_detached_message(
+            f.hwnd,
+            WM_NCLBUTTONUP,
+            HTMINBUTTON as usize,
+            screen_point(300, 25),
+        );
+        f.finish(WM_NCLBUTTONDOWN);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::Drag)
+            )]
+        );
+    }
+
+    #[test]
+    fn native_detached_raw_caption_button_tracks_only_own_pointer_target() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("native-pointer-button-out-back", 0x724);
+        let point = screen_point(300, 25);
+        let pointer = |hit: u32, id: usize| (hit as usize) << 16 | id;
+        f.message(WM_NCPOINTERDOWN, pointer(HTMAXBUTTON, 7), point);
+        observe_native_detached_message(f.hwnd, WM_NCPOINTERUPDATE, pointer(HTCAPTION, 8), point);
+        f.message(WM_NCPOINTERUP, pointer(HTMAXBUTTON, 7), point);
+        f.finish(WM_NCPOINTERDOWN);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Completed
+            )],
+            "another contact cannot cancel this button"
+        );
+        f.message(WM_NCPOINTERDOWN, pointer(HTMAXBUTTON, 7), point);
+        observe_native_detached_message(f.hwnd, WM_NCPOINTERUPDATE, pointer(HTCAPTION, 7), point);
+        f.message(WM_NCPOINTERUP, pointer(HTMAXBUTTON, 7), point);
+        f.finish(WM_NCPOINTERDOWN);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::Drag)
+            )]
+        );
+        f.message(WM_NCPOINTERDOWN, pointer(HTMINBUTTON, 7), point);
+        observe_native_detached_message(f.hwnd, WM_NCPOINTERUP, pointer(HTCAPTION, 7), point);
+        f.finish(WM_NCPOINTERDOWN);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::Drag)
+            )]
+        );
+
+        f.message(WM_NCPOINTERDOWN, pointer(HTCLOSE, 7), point);
+        observe_native_detached_message(
+            f.hwnd,
+            WM_NCPOINTERUPDATE,
+            pointer(HTCAPTION, 7),
+            screen_point(350, 25),
+        );
+        f.finish(WM_NCPOINTERDOWN);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::CloseOwned
+            )],
+            "the activation owner never consumes the OS close operation"
         );
     }
 

@@ -2266,17 +2266,13 @@ struct DeferredDetachedRightDragCapture {
 #[cfg(windows)]
 #[derive(Default)]
 struct DeferredDetachedClientCapture {
-    scope: Option<DetachedActivationRequest>,
     gesture: detached_activation_gesture::DeferredClientActivationGesture,
 }
 
 #[cfg(windows)]
 impl DeferredDetachedClientCapture {
     fn set_scope(&mut self, request: DetachedActivationRequest) {
-        if self.scope.as_ref().is_some_and(|old| old != &request) {
-            self.gesture.retire_scope_for(&request);
-        }
-        self.scope = Some(request);
+        self.gesture.set_scope(request);
     }
 
     #[cfg(test)]
@@ -2344,10 +2340,10 @@ impl DeferredDetachedImageWindowShared {
 
     pub(crate) fn drain_client_activation_decisions(
         &self,
-    ) -> Vec<detached_activation_gesture::ClientActivationDecision> {
+    ) -> Vec<detached_activation_gesture::ScopedClientActivationDecision> {
         self.activation_gesture
             .lock()
-            .map(|mut gesture| gesture.gesture.drain_decisions())
+            .map(|mut gesture| gesture.gesture.drain_scoped_decisions())
             .unwrap_or_default()
     }
 

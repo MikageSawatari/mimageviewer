@@ -250,6 +250,62 @@ ignore・除外・期待の変更は行っていない。
 未確認は実OSのfocus／non-client native loop／touchと、サブPCでのAの入力到達・復帰の再確認。
 新しい通常ログを含む実機結果を、今回のheadless成功で代替しない。
 
+#### A 独立実装レビュー指摘の対応（2026-11-14、第4回）
+
+基点は `395ef758e`（C独立レビューP2対応済み）。`61495274a` を対象とした独立実装レビュー
+（Sol / xhigh）のP2 2件・P3 1件を修正した。既存gesture ownerの責務を保ち、gestureファイル全体を作り直さない。
+構造的な修正であることは設計担当と独立設計レビューで合意済み（BA-7）。Cのbackend lifecycle hook、
+synthetic keyの終端権限、Bの外部openは変更していない。
+
+- **P2-1／non-client button drag。** 旧実装は `WM_MOVING` / `WM_SIZING` の矩形変更だけでdragを終端し、
+  caption buttonの外へ出て離す／外へ出て戻る操作を通常clickとして確定できた。
+  同じnative ownerの `NonClient` 操作に押下hit-test対象とscreen座標を持たせ、同ownerの順序付きmotion / Upを照合する。
+  最小化・最大化・help buttonでは対象逸脱または既存のclick距離超過を不可逆のDrag取消にする。
+  NC messageのhit-test payloadを使い、captureされたclient / pointer messageではそのmessage座標を同じ確定HWNDへ
+  `ClientToScreen` / `WM_NCHITTEST` で問い合わせる。owner lock外で問い合わせ、現在cursorやrect探索へ代替しない。
+  client座標変換失敗は既存のログ＋通知と取消にとどめる。raw pointer IDと昇格mouseを分離し、別pointer／兄弟は操作しない。
+  caption移動・resizeの既存矩形履歴、native close優先、`DefSubclassProc` のOS既定動作は維持する。
+- **P2-2／touch強制無効。** 旧実装は診断switchでTouchFrameを空にして、raw Touchに対応する昇格Pointerのtap完了も失っていた。
+  callbackのcorrelation / tap完了という入力factと、追加touch command／primary suppressionを分離した。
+  `MIV_DISABLE_TOUCH_GESTURES` 設定時も生成時provenanceを持つ単指tapは復帰／closeを完結し、追加touch commandは実行しない。
+  drag・複数接点・Cancel・modal・scope退役の取消、および一般App / Gridの診断無効処理は維持する。
+  テストはprocess環境／production OnceLockを書き換えず、thread-localのRAII policy seamで同条件を再現する。
+- **P3／取消ログのidentity。** 旧実装のdecisionには元scopeがなく、callbackが現在templateでログを再構築していた。
+  既存gesture ownerへscopeの正本を集約し、native proof→実操作→queued decisionが元window / registration / context /
+  native allocation epochを保持する。Sharedの重複scope fieldを撤去し、callbackはdecisionの元scopeだけを記録する。
+  未captureの旧proofも診断metadataとして残すが、退役したadmissionは不可逆の `RetiredRegistration` とし、
+  後から同じscope値が公開されても認可し直さない。生成時proofのない入力はscopeなしとして記録し、後継contextを代入しない。
+  旧scopeのproofそのものを消すtest期待は、元identityを保持したまま権限を退役する期待へ変更した。
+  拒否・二重消費防止のassertは維持し、P3で必要な理由を `NotParked` から `RetiredRegistration` へ正確にした。
+
+回帰はoutside release、out-and-back、同button内の距離超過、raw pointer／promotion／兄弟、既存WM_MOVING dragを検査する。
+強制無効のsame / split batch tap・bar closeはhelperと、正規化API→実deferred callback→既存service / root commitの
+multiwindow scenarioでも検査する。後者は復帰clickのpage非再配送、DownだけではParked維持、close時のbinding終端とmain不変も要求する。
+取消の元scopeはactive gesture・queued decision・未capture proof・同scope値への再入を型で検査する。
+最終source差分は独立レビュー（Sol / xhigh）がACCEPT、blocking findingなしとした。レビュー担当はCargoを実行していない。
+
+変更ファイルは `src/key_input.rs`、`src/touch_correlation.rs`、`src/app/detached_activation_gesture.rs`、
+`src/app.rs`、`src/ui_fullscreen.rs`、`src/app/multiwindow_scenario_tests.rs`、本書、`docs/detached-rework-plan.md`。
+vendor、描画・layout・表示文言を変更しないため、vendor crate／ui_snapshot／glyph検査は今回不要。
+新しいApp field、待ち、retry、時間窓、追加repaintはない。製品起動・build-dev・全件gate・commit / pushは実行しない。
+
+検証は全て指定 `run-heavy.ps1`、Owner `codex/767-rm50-a2`、同作業ツリー、重い処理は直列で実行した。
+共有全件ロックを待ち、ロック書込み不可の警告後はrunner指定のBelowNormal・6並列で継続した。
+
+| コマンド | 件数・exit code・証拠 |
+| --- | --- |
+| 修正前 `cargo nextest run -p mimageviewer --lib -E 'test(/native_detached_caption_button_\|native_detached_raw_caption_button_\|diagnostic_touch_disable_keeps_canonical_tap_and_close/)' --no-fail-fast --test-threads 6` | **5実行 / 0成功 / 5失敗、exit 100**。NC 4件と診断touch 1件の意図したassertで失敗。`target/rm50-a2-red.log` |
+| 修正後 `cargo nextest run -p mimageviewer --lib -E 'test(/realmachine50_\|detached_activation\|native_detached\|discrete_activation\|deferred_activation_queues\|callback_and_app_frame/)' --no-fail-fast --test-threads 6` | **99実行 / 97成功 / 2失敗、exit 100**。今回の修正・追加回帰とA／Cの実機再現テストは成功。失敗は対象外Bの既知赤2件だけ。`target/rm50-a2-focused.log`、`target/rm50-a2-focused-junit.xml` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/detached\|multiwindow\|activation\|key_input\|native_focus\|viewport\|fullscreen\|touch_correlation\|native_video\|parked_live/)' --no-fail-fast --test-threads 6` | **2,602実行 / 2,602成功（4 slow）/ 0失敗、exit 0**。433.539秒。`target/rm50-a2-regression.log`、`target/rm50-a2-regression-junit.xml` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **core 1対象、exit 0**。警告あり。`target/rm50-a2-check.log` |
+| 最後のCargo操作: `cargo fmt`（引数なし） | **exit 0**。`target/rm50-a2-fmt.log` |
+| 最終 `git diff --check` | **exit 0**。`target/rm50-a2-diff-check.log` |
+
+焦点nextestの失敗2件は、上記A実装時と同じBのforwarded open赤テストである。JUnitでもその2件だけと照合し、
+ignore・除外・期待の変更は行っていない。NC 4件と診断touch 1件の修正前赤テストは、修正後の焦点nextestですべて成功した。
+実OSでのcaption buttonのcapture / hit-test／focus、mouse・touch・pen入力、サブPCでの再確認は未実施である。
+headlessの入力配送／終端検査を実機確認の代わりにはしない。設計とコードの前提に実装を止める矛盾はなかった。
+
 ## 3. B — 外部openが旧独立ownerを退役させずsessionを置き換える
 
 ### 3.1 観測と原因

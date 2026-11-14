@@ -894,7 +894,7 @@ impl ScenarioDriver {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ParkedActivationCase {
     Click,
     TouchTap,
@@ -911,8 +911,18 @@ enum ParkedActivationCase {
 }
 
 fn realmachine50_parked_click_case(depth: bool, case: ParkedActivationCase) {
+    realmachine50_parked_click_case_with_touch_policy(depth, case, false, false);
+}
+
+fn realmachine50_parked_click_case_with_touch_policy(
+    depth: bool,
+    case: ParkedActivationCase,
+    gestures_disabled: bool,
+    split_batch: bool,
+) {
     std::thread::spawn(move || {
         let _input = crate::key_input::lock_test_input();
+        crate::touch_correlation::with_gestures_disabled(gestures_disabled, || {
         let mut app = setup_app_for_test();
         app.initialized = true;
         app.indexer_init.mark_unavailable_if_not_ready();
@@ -942,7 +952,7 @@ fn realmachine50_parked_click_case(depth: bool, case: ParkedActivationCase) {
         assert_ne!(owner, app.viewer_context_main());
         driver.focus(App::detached_image_window_viewport_id(first));
         for _ in 0..3 { driver.root(&mut app); }
-        let canonical_input = if matches!(case, ParkedActivationCase::CanonicalFreshClick | ParkedActivationCase::BufferedActiveClick | ParkedActivationCase::BarClose | ParkedActivationCase::TouchBarClose | ParkedActivationCase::OverviewTouchClose | ParkedActivationCase::OverviewCloseMargin) {
+        let canonical_input = if matches!(case, ParkedActivationCase::CanonicalFreshClick | ParkedActivationCase::BufferedActiveClick | ParkedActivationCase::TouchTap | ParkedActivationCase::BarClose | ParkedActivationCase::TouchBarClose | ParkedActivationCase::OverviewTouchClose | ParkedActivationCase::OverviewCloseMargin) {
             let registration = ctx.viewport_registration(App::detached_image_window_viewport_id(first)).unwrap();
             Some(crate::key_input::register_test_native_input_allocation(registration, 0x7675_0001))
         } else { None };
@@ -1061,16 +1071,33 @@ fn realmachine50_parked_click_case(depth: bool, case: ParkedActivationCase) {
         }
         events.push(edge(false));
         if matches!(case, ParkedActivationCase::TouchTap | ParkedActivationCase::TouchBarClose | ParkedActivationCase::OverviewTouchClose) { events.push(egui::Event::PointerGone); }
-        if matches!(case, ParkedActivationCase::CanonicalFreshClick | ParkedActivationCase::BarClose | ParkedActivationCase::TouchBarClose | ParkedActivationCase::OverviewTouchClose | ParkedActivationCase::OverviewCloseMargin) {
+        if matches!(case, ParkedActivationCase::CanonicalFreshClick | ParkedActivationCase::TouchTap | ParkedActivationCase::BarClose | ParkedActivationCase::TouchBarClose | ParkedActivationCase::OverviewTouchClose | ParkedActivationCase::OverviewCloseMargin) {
             use egui_winit::pointer_input_observer::{NormalizedPointerInput as Phase, PointerInputSource as Source};
             let input = canonical_input.as_ref().unwrap();
-            let touch = matches!(case, ParkedActivationCase::TouchBarClose | ParkedActivationCase::OverviewTouchClose);
+            let touch = matches!(case, ParkedActivationCase::TouchTap | ParkedActivationCase::TouchBarClose | ParkedActivationCase::OverviewTouchClose);
             let source = if touch { Source::Touch(1) } else { Source::Mouse };
             let operation = input.normalized_input(Phase::Pressed(source)).expect("parked canonical owner proves the press");
-            assert!(input.normalized_input(Phase::Released(source)).is_none());
+            if !split_batch {
+                assert!(input.normalized_input(Phase::Released(source)).is_none());
+            }
             events.insert(if touch { 0 } else { 1 }, egui::Event::PointerInputProvenance(operation));
         }
-        driver.deferred_with_events(viewport, events);
+        if split_batch {
+            assert_eq!(case, ParkedActivationCase::TouchTap);
+            let end = events.iter().position(|event| matches!(event,
+                egui::Event::Touch { phase: egui::TouchPhase::End, .. })).unwrap();
+            let released = events.split_off(end);
+            driver.deferred_with_events(viewport, events);
+            app.process_deferred_detached_image_window_events_for_test(&ctx);
+            assert!(!app.detached_window_deferred_activation_pending(first));
+            assert_eq!(app.detached_window_state(first), Some(DetachedWindowState::Parked));
+            assert!(canonical_input.as_ref().unwrap().normalized_input(
+                egui_winit::pointer_input_observer::NormalizedPointerInput::Released(
+                    egui_winit::pointer_input_observer::PointerInputSource::Touch(1))).is_none());
+            driver.deferred_with_events(viewport, released);
+        } else {
+            driver.deferred_with_events(viewport, events);
+        }
         let main = app.viewer_context_main();
         let main_before = app.with_viewer_context_ref(main, |viewer| (viewer.selected(), viewer.items_generation())).unwrap();
         app.process_deferred_detached_image_window_events_for_test(&ctx);
@@ -1126,6 +1153,7 @@ fn realmachine50_parked_click_case(depth: bool, case: ParkedActivationCase) {
         driver.root(&mut app);
         assert_eq!(app.active_detached_window_id(), Some(first));
         app.with_viewer_context(owner, |viewer| assert_eq!(viewer.fullscreen_idx, Some(0))).unwrap();
+        });
     }).join().unwrap();
 }
 
@@ -1142,6 +1170,33 @@ fn realmachine50_parked_flat_window_click_reactivates_after_sibling_close() {
 #[test]
 fn realmachine50_parked_touch_tap_reactivates_without_page_delivery() {
     realmachine50_parked_click_case(false, ParkedActivationCase::TouchTap);
+}
+#[test]
+fn realmachine50_parked_diagnostic_touch_disable_same_batch_tap_reactivates() {
+    realmachine50_parked_click_case_with_touch_policy(
+        false,
+        ParkedActivationCase::TouchTap,
+        true,
+        false,
+    );
+}
+#[test]
+fn realmachine50_parked_diagnostic_touch_disable_split_batch_tap_reactivates() {
+    realmachine50_parked_click_case_with_touch_policy(
+        false,
+        ParkedActivationCase::TouchTap,
+        true,
+        true,
+    );
+}
+#[test]
+fn realmachine50_parked_diagnostic_touch_disable_bar_close_owns_the_tap() {
+    realmachine50_parked_click_case_with_touch_policy(
+        false,
+        ParkedActivationCase::TouchBarClose,
+        true,
+        false,
+    );
 }
 #[test]
 fn realmachine50_parked_drag_does_not_activate_and_next_click_works() {

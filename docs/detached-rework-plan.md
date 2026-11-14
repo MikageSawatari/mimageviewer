@@ -1458,6 +1458,10 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-14: §1.767 サブPC依頼50 A 独立レビュー P2 / P3 対応
+
+設計担当と独立設計レビュー（Sol / xhigh、2026-11-14）が構造的な修正に合意した範囲で、同native ownerのcaption button押下対象・motion / Upによるdrag終端、診断touch無効時の入力相関とcommand抑制の分離、取消decisionの元scope保持へ揃えた（BA-7）。Sharedの重複scopeを撤去し、退役proofは認可せず元identityだけを診断に保持する。Cのbackend hook・B・新しいApp field・待ち・retryは変更／追加しない。変更と検証は[依頼50調査書 §2.4](depth-parallax-realmachine50-investigation.md#24-a-実装記録2026-11-14ba-7)に記録する。
+
 ### 2026-11-14: §1.767 サブPC依頼50 C 独立レビュー P2 対応
 
 設計担当と独立レビュー（Sol / xhigh）が構造修正に合意した範囲で、synthetic keyの終端権限をphysical takeoverで同registration／keyから移譲し、旧repeat／Upが再取得・解除しない所有境界へ集約した（BA-1／BA-7）。App field・待ち・retryは追加せず、Aの復帰・backend hookは変更しない。Wgpu suspendのROOT論理入力保持はWindows対象外として設計担当判断で見送り。根拠・回帰・検証は[依頼50調査書 §4.5](depth-parallax-realmachine50-investigation.md#45-c-独立実装レビュー指摘の対応2026-11-14)。

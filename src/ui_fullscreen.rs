@@ -24721,50 +24721,42 @@ impl App {
                 use crate::app::detached_activation_gesture::{
                     ClientActivationCancelReason, ClientActivationDecision,
                 };
-                for decision in shared.drain_client_activation_decisions() {
-                    if let ClientActivationDecision::CompletedClose(source) = decision {
-                        bar_close_requested = true;
-                        let mut request = client_scope.clone();
-                        request.source = match source {
-                            ClientActivationSource::MouseClick => {
-                                crate::app::DetachedActivationSource::ClientClick
-                            }
-                            ClientActivationSource::TouchTap => {
-                                crate::app::DetachedActivationSource::TouchTap
-                            }
-                        };
-                        request.log(
-                            "callback",
-                            crate::app::DetachedActivationDecision::CloseOwned,
-                        );
+                let log_client_decision = |origin: Option<crate::app::DetachedActivationRequest>,
+                                           source: ClientActivationSource,
+                                           boundary: &str,
+                                           decision: crate::app::DetachedActivationDecision| {
+                    let source = match source {
+                        ClientActivationSource::MouseClick => crate::app::DetachedActivationSource::ClientClick,
+                        ClientActivationSource::TouchTap => crate::app::DetachedActivationSource::TouchTap,
+                    };
+                    if let Some(mut request) = origin {
+                        request.source = source;
+                        request.log(boundary, decision);
+                    } else {
+                        // No generation-time proof exists for this input. Record
+                        // that absence without attributing it to a successor.
+                        crate::logger::log(format!(
+                            "[detached-activation] boundary={boundary} source={source:?} decision={decision:?} window=unknown registration=None context=None viewport={viewport_id:?}"
+                        ));
                     }
-                    if let ClientActivationDecision::Cancelled { source, reason } = decision {
-                        let mut request = activation_template.clone();
-                        request.registration = vp_ctx.viewport_registration(viewport_id);
-                        request.source = match source {
-                            ClientActivationSource::MouseClick => {
-                                crate::app::DetachedActivationSource::ClientClick
-                            }
-                            ClientActivationSource::TouchTap => {
-                                crate::app::DetachedActivationSource::TouchTap
-                            }
-                        };
-                        let decision = match reason {
-                            ClientActivationCancelReason::NotParked => {
-                                crate::app::DetachedActivationDecision::NotParked
-                            }
-                            ClientActivationCancelReason::ModalOwned => {
-                                crate::app::DetachedActivationDecision::ModalOwned
-                            }
-                            ClientActivationCancelReason::CommandOwned => {
-                                crate::app::DetachedActivationDecision::CommandOwned
-                            }
-                            ClientActivationCancelReason::Native(
-                                crate::key_input::NativeInputCancelReason::RetiredRegistration,
-                            ) => crate::app::DetachedActivationDecision::RetiredRegistration,
-                            _ => crate::app::DetachedActivationDecision::GestureCancelled,
-                        };
-                        request.log("callback_discard", decision);
+                };
+                for scoped in shared.drain_client_activation_decisions() {
+                    match scoped.decision {
+                        ClientActivationDecision::CompletedClose(source) => {
+                            bar_close_requested = true;
+                            log_client_decision(scoped.scope, source, "callback", crate::app::DetachedActivationDecision::CloseOwned);
+                        }
+                        ClientActivationDecision::Cancelled { source, reason } => {
+                            let decision = match reason {
+                                ClientActivationCancelReason::NotParked => crate::app::DetachedActivationDecision::NotParked,
+                                ClientActivationCancelReason::ModalOwned => crate::app::DetachedActivationDecision::ModalOwned,
+                                ClientActivationCancelReason::CommandOwned => crate::app::DetachedActivationDecision::CommandOwned,
+                                ClientActivationCancelReason::Native(crate::key_input::NativeInputCancelReason::RetiredRegistration) => crate::app::DetachedActivationDecision::RetiredRegistration,
+                                _ => crate::app::DetachedActivationDecision::GestureCancelled,
+                            };
+                            log_client_decision(scoped.scope, source, "callback_discard", decision);
+                        }
+                        ClientActivationDecision::Completed(_) => {}
                     }
                 }
                 // Passive deferred still windows carry only pointer samples back to the root;

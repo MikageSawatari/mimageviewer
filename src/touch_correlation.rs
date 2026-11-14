@@ -104,9 +104,15 @@ impl TouchFrame {
     /// Keep read-only observation results while removing everything that may
     /// authorize a caller-side gesture action or primary-pointer suppression.
     fn suppress_execution(&mut self) {
+        self.suppress_commands();
+        self.tap_completion_event_indices.clear();
+    }
+
+    /// A callback may still own an ordinary completed click while the optional
+    /// touch command layer is disabled. Keep that input fact and its provenance.
+    fn suppress_commands(&mut self) {
         self.commands.clear();
         self.command_event_indices.clear();
-        self.tap_completion_event_indices.clear();
         for event in &mut self.primary_events {
             event.should_suppress = false;
         }
@@ -1066,8 +1072,31 @@ fn primary_button_matches(event: &Event, pos: Pos2, pressed: bool) -> bool {
 }
 
 pub(crate) fn touch_gestures_disabled() -> bool {
+    #[cfg(test)]
+    if let Some(disabled) = TEST_GESTURES_DISABLED.with(std::cell::Cell::get) {
+        return disabled;
+    }
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DISABLED.get_or_init(|| std::env::var_os("MIV_DISABLE_TOUCH_GESTURES").is_some())
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_GESTURES_DISABLED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Scoped per-thread policy seam; never changes the process environment or the
+/// production OnceLock, and restores the previous value even after a panic.
+#[cfg(test)]
+pub(crate) fn with_gestures_disabled<T>(disabled: bool, action: impl FnOnce() -> T) -> T {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_GESTURES_DISABLED.with(|value| value.set(self.0));
+        }
+    }
+    let _restore = Restore(TEST_GESTURES_DISABLED.with(|value| value.replace(Some(disabled))));
+    action()
 }
 
 fn state_id(viewport: egui::ViewportId, surface: TouchSurface) -> egui::Id {
@@ -1226,16 +1255,23 @@ pub(crate) fn drive_egui_touch_input_with_recognition_cancellations(
     enabled: bool,
     cancellation_indices: &[usize],
 ) -> TouchFrame {
-    drive_egui_touch_input_with_policy(
+    // Parked activation and close are the ordinary click contract. The global
+    // diagnostic switch disables added touch commands, but must not erase the
+    // correlation needed to complete that click or reject a drag/pinch/cancel.
+    let mut touch = drive_egui_touch_input_with_policy(
         ctx,
         surface,
         geometry,
         FrameIdentity::Callback(frame),
         enabled,
-        touch_gestures_disabled(),
+        false,
         CommandScope::Unscoped,
         cancellation_indices,
-    )
+    );
+    if touch_gestures_disabled() {
+        touch.suppress_commands();
+    }
+    touch
 }
 
 /// MainGrid recognition is owned by the visible viewer context and list session;
@@ -1826,6 +1862,50 @@ mod tests {
             frame.tap_completion_event_indices.is_empty(),
             "pending commands are not completion facts"
         );
+    }
+
+    #[test]
+    fn diagnostic_disable_callback_keeps_tap_fact_without_commands_or_suppression() {
+        with_gestures_disabled(true, || {
+            let ctx = egui::Context::default();
+            let pos = pos2(500.0, 400.0);
+            ctx.run_pass(
+                egui::RawInput {
+                    screen_rect: Some(geometry().surface),
+                    time: Some(1.0),
+                    events: tap_events(1, pos),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let frame = drive_egui_touch_input_with_recognition_cancellations(
+                        ctx,
+                        TouchSurface::StillFullscreen,
+                        geometry(),
+                        1,
+                        true,
+                        &[],
+                    );
+                    assert!(frame.commands().is_empty());
+                    assert!(frame.completed_tap_at(4));
+                    assert!(!frame.should_suppress_primary(pos, true));
+                    assert!(!frame.should_suppress_primary(pos, false));
+                    assert!(frame.grid_primary_edge(0, true).touch_derived);
+                    assert!(frame.grid_primary_edge(0, false).touch_derived);
+                    let repeated = drive_egui_touch_input_with_recognition_cancellations(
+                        ctx,
+                        TouchSurface::StillFullscreen,
+                        geometry(),
+                        1,
+                        true,
+                        &[],
+                    );
+                    assert!(repeated.commands().is_empty());
+                    assert!(!repeated.completed_tap_at(4));
+                    assert!(!repeated.should_suppress_primary(pos, false));
+                },
+            )
+            .drop_without_applying_deltas();
+        });
     }
 
     #[test]
