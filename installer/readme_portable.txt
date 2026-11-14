@@ -197,6 +197,13 @@ HEIC / JPEG XL 表示は Windows Imaging Component（WIC）を
     環境設定の「3D 写真の追加モデル」から保存先フォルダを開いて確認できます。
     保存先は実行ファイルと同じ場所の data\addons\depth\ 内です。
 
+文字起こしの追加モデル（任意ダウンロード）:
+
+  - OpenAI Whisper large-v3-turbo (MIT) の派生物
+    whisper.cpp v1.9.5 で ggml 形式へ変換し、Q5_0 に量子化しています。
+    再学習は行っていません。LICENSE と NOTICE はモデルと一緒に取得します。
+    保存先は実行ファイルと同じ場所の data\addons\asr\ 内です。
+
 AI モデルは各配布元のライセンスに従います。詳細は
 オンラインマニュアル（下記）を参照してください。
 
