@@ -1663,7 +1663,7 @@ r2 = REVISE (P2 1 件、ほかは r1 の指摘を閉じた)。v2 キーで `auto
 比率未確定・横長でない・写真の守りには掛けない。入力の指定・`target/` 内の出力先・共有runner経由の実行方法は既存評価と同じ。
 `edge` は本文比率から丸めた全高の幅を綴じ方向側の外端へ置き、`density` は最大0.3幅だけ内側を探す。
 `18` 付きは表紙がその幅の1.8倍以上のときだけ。summaryには `fallback_cropped/good/wrong`、元の見送り理由、角度別の後押し、IoUと内側移動量を追加する。
-`MIV_COVER_AUTO_EVAL_FOLDER_LIST` でも同じ指定を使える。フォルダ入力は引き続きsummaryだけを出し、画像・個別名は出さない。
+`MIV_COVER_AUTO_EVAL_FOLDER_LIST` でも同じ指定を使える。フォルダ入力はTHUMBS未指定時、summaryだけを出し、画像・個別名は出さない。
 正解がないフォルダ入力のIoUとgood/wrongは `null`。本番の判定は変えない。
 
 #### 型による後押しの使い方 (cfg(test) のみ、2026-11-14)
@@ -1691,6 +1691,54 @@ scoreは `(S(袖側)+2S(背側))/3`。選んだ背側のSとscoreが両方3以�
 位置はその保存回転の元寸法の座標で、既存の `prediction` とIoUは保存回転前の座標へ戻して集計する。
 summaryの `fallback_by_layout` はT1〜T4別の `cropped/good/wrong`、`fallback_layout_ratio_distribution` は後押しした型のRの0.2刻み分布。
 `ratio_distribution` は守りや見送りも含め、本文比率の取れた全入力の選択角度のRを0.2刻みで数える（空のbinは省略）。
-フォルダ一覧でも同じ情報を出し、引き続きsummaryだけで画像・個別名は出さず、正解のないgood/wrongとIoUはnullとする。
+フォルダ一覧でも同じ情報を出し、THUMBS未指定時はsummaryだけで画像・個別名は出さず、正解のないgood/wrongとIoUはnullとする。
 `truth.json` の `page_aspect: null` は受理する。ZIPは既存どおり本番の本文標本から比率を取り、
 本文を持たないPNG入力のnullは比率不足として見送る。行の `page_aspect_decline` で不足・横長過多等を区別する。
+
+#### 本の一覧と確認用画像の書き出し (cfg(test) のみ、2026-11-15)
+
+`MIV_COVER_AUTO_EVAL_BOOK_LIST` にPDF・ZIP・画像フォルダの絶対パスのJSON配列を渡す。
+既存の本の表紙解決、従来の向き、解析用デコード、本文比率の標本取得を共用する。
+設定や固定は取り込まず、既定の並びから表紙を選ぶ。
+`MIV_COVER_AUTO_EVAL_BINDING=rtl|ltr` は全冊共通で既定rtl。既存の後押しの変数も使える。
+PDFは既存のテスト用in-processバックエンドで同じPageSizes・描画操作を行い、製品を起動しない。
+
+`MIV_COVER_AUTO_EVAL_THUMBS=1` を併用すると、BOOK_LISTとFOLDER_LISTの両方で
+`<OUTPUT>/thumbs/00001.jpg` のように入力順の5桁番号で書き出す。保存回転後の表紙を長辺640px以下へ縮め、
+通常の判定の枠は赤、後押しの枠は青、見送りは枠なしとする。文字は描かない。
+回転は既存のページキーでrotation.dbを読取専用で引く。既定は通常のデータ置き場、
+`MIV_COVER_AUTO_EVAL_ROTATION_DB` で別のrotation.dbを指定でき、存在しなければ0°。
+`MIV_COVER_AUTO_EVAL_SAVED_ROTATION=0|90|180|270` を明示した場合は全冊でその角度を優先する。
+設定・回転DBを変更せず、表紙解決用キャッシュはテスト用の一時データ置き場に隔離する。
+
+summaryの行には `sequence`（1始まり）、`path`、`kind`、`reason`、`rotation`、`R`、
+`current_crop`、`fallback_crop`、`fallback_type`、`image_filename`（出力先からの相対名）を置く。
+`current_crop` と `fallback_crop` は保存回転後の表紙の0〜1の辺座標。
+FOLDER_LISTの既存の `crop` / `all_crops` は互換用の保存回転前のppm座標のまま保つ。
+元の見送り・フォルダ入力の後押しの詳細と既存の集計も保つ。
+開けない本・デコード失敗は `reason: error` と `error` を書き、後続を処理する。
+重いI/Oのサムネイルと同じくCPU数が4以下なら1本、それ以外は最大2本で処理し、100冊ごとに進捗を出す。
+FOLDER_LISTはTHUMBS未指定なら従来どおり画像・個別名を出さず、summaryだけ。
+THUMBS指定時は画像とパスの対応を出す。BOOK_LISTは画像なしでもパスを含む。
+生成画像を開いて確認するのは利用者のみとし、実装・設計担当は数値だけを扱う。
+
+```powershell
+$env:MIV_COVER_AUTO_EVAL_BOOK_LIST='G:\books-to-check.json'
+$env:MIV_COVER_AUTO_EVAL_BINDING='rtl'
+$env:MIV_COVER_AUTO_EVAL_THUMBS='1'
+$env:MIV_COVER_AUTO_EVAL_OUTPUT='target/cover-auto-books'
+# 任意: $env:MIV_COVER_AUTO_EVAL_FALLBACK='layout-snap'
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local\miv-locks\run-heavy.ps1 -Owner '773 rc3' -WorkDir G:\home\mimageviewer-773 -Command 'cargo test -p mimageviewer --lib cover_auto_crop_directory_evaluation -- --ignored --nocapture'
+```
+
+合成PDF・ZIP・画像フォルダ、保存回転DB、開けない本・壊れた画像の混在を使い、入力順の行とJPEG、
+赤青の画素、回転後の寸法、THUMBS未指定時の画像なしをテストする。利用者データや評価画像を閲覧しない。
+
+検証:共有runner経由の `cargo nextest run -p mimageviewer --lib -E 'test(/cover_auto_crop::evaluation/)'` は
+**25件成功・失敗0**。新規は `evaluation_book_list_mixed_real_sources_saved_rotations_and_failures_continue`、
+`evaluation_book_list_binding_fallback_blue_and_folder_thumbnail_opt_in`、
+`evaluation_book_list_binding_parser_keeps_default_and_rejects_invalid_values` と
+`evaluation_thumbnails_*` の4件。PDFの実際の寸法取得・描画、同じPDFの重複、保存回転DBの不変、
+UTF-8 BOM、開けない本と壊れた画像の後の継続を含む。`cargo fmt`・`git diff --check` 成功。
+テストのTEMP/TMPはworktree内のG:に置き、少数の合成入力だけを使用した。本番・UI・設定・snapshotは変更せず、
+製品起動・利用者データの評価・画像の閲覧・lib全件・build-dev・コミットは行っていない。

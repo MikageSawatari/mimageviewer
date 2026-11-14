@@ -1,6 +1,6 @@
 //! Opt-in evaluation. Generated artifacts must stay under target/.
 //! FOLDER_LIST accepts a JSON array of absolute image-folder paths and writes
-//! numeric/count-only JSON; this branch never creates image artifacts.
+//! numeric/count-only JSON unless THUMBS=1 explicitly opts into framed JPEGs.
 //!
 //! The default worker decode shares production's fixed analysis decode. Explicit
 //! MIV_COVER_AUTO_EVAL_DECODE=full remains a diagnostic comparison. DISPLAY_PX
@@ -21,7 +21,9 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+mod book_list;
 mod fallback;
+mod thumbs;
 use fallback::*;
 
 #[derive(Deserialize)]
@@ -353,115 +355,13 @@ fn evaluate_folder_list(
     output: &Path,
     fallback_config: FallbackConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let folders: Vec<PathBuf> = serde_json::from_slice(&std::fs::read(list)?)
-        .map_err(|_| "folder evaluation list must be a JSON array of absolute paths")?;
-    if folders.is_empty() || folders.iter().any(|path| !path.is_absolute()) {
-        return Err("folder evaluation list must contain nonempty absolute paths".into());
-    }
-    let output = target_output(output.to_path_buf())?;
-    let _worker_data = crate::data_dir::TestDataDirGuard::new();
-    let (mut cropped, mut declined) = (0, 0);
-    let mut reasons = BTreeMap::<String, u32>::new();
-    let mut rows = Vec::new();
-    let mut fallback_stats = FallbackStats::default();
-    let mut ratio_distribution = RatioDistribution::default();
-    for (index, folder) in folders.iter().enumerate() {
-        let mut request = crate::thumb_loader::LoadRequest {
-            idx: index,
-            path: folder.clone(),
-            cache_key_override: Some(format!("folderthumb:case-{index}")),
-            source_policy: crate::thumb_loader::LoadSourcePolicy::SourceOnly,
-            folder_thumb_sort: Some(crate::settings::SortOrder::Numeric),
-            folder_thumb_depth: 3,
-            ..Default::default()
-        };
-        request.set_auto_cover_crop(Some(AutoCropIdentity {
-            binding: ReadingDirection::Rtl,
-            folders: true,
-        }));
-        let resolved = crate::thumb_loader::resolve_read_after_cache_miss(&request, None, None);
-        let (
-            crate::thumb_loader::ReadLocation::File(cover),
-            Ok(crate::thumb_loader::ResolvedAutoCover {
-                identity,
-                input: crate::thumb_loader::AutoCoverInput::FolderPages(pages),
-            }),
-        ) = (resolved.location, resolved.auto_cover_crop)
-        else {
-            return Err(format!("folder evaluation case {index} has no direct image cover").into());
-        };
-        let sample = crate::cover_auto_sample::sample_folder_pages(&pages, &cover);
-        let analysis = crate::thumb_loader::decode_cover_auto_analysis_image(
-            crate::image_decode::Source::Path(&cover),
-            None,
-            None,
-        )
-        .map_err(|_| format!("folder evaluation case {index} could not decode its cover"))?;
-        let outcomes = evaluate_angles(
-            &analysis.image,
-            analysis.native_dims,
-            sample.ok(),
-            analysis.shot_exif,
-            identity.binding,
-            fallback_config,
-        );
-        let ratio = ratio_distribution.record(analysis.native_dims, sample.ok(), Rotation::None);
-        let selected = outcomes[0];
-        let unrotated = selected.final_result;
-        fallback_stats.record(selected, None, false);
-        let reason = match unrotated {
-            Ok(_) => {
-                cropped += 1;
-                "cropped".to_owned()
-            }
-            Err(reason) => {
-                declined += 1;
-                let reason = reason.as_str().into_owned();
-                *reasons.entry(reason.clone()).or_default() += 1;
-                reason
-            }
-        };
-        rows.push(json!({
-            "index": index,
-            "reason": reason,
-            "native_dims": analysis.native_dims,
-            "decoded_dims": [analysis.image.width(), analysis.image.height()],
-            "page_aspect": sample.ok(),
-            "layout_ratio": ratio,
-            "page_aspect_decline": sample.err().map(crate::cover_auto_sample::PageAspectDecline::as_str),
-            "crop": unrotated.ok().map(CoverCrop::values),
-            "all_crops": outcomes.map(|outcome| outcome.final_result.ok().map(CoverCrop::values)),
-            "original_decline": selected.original.err().map(|reason| reason.as_str().into_owned()),
-            "fallback": selected.fallback.map(|diagnostic| diagnostic.json(fallback_config)),
-            "iou": null,
-            "all_fallbacks": outcomes.map(|outcome| outcome.fallback.map(|diagnostic| diagnostic.json(fallback_config))),
-        }));
-    }
-    let summary = json!({
-        "algorithm": "autocrop:v2f",
-        "source": "folder-list",
-        "total": folders.len(),
-        "cropped": cropped,
-        "declined": declined,
-        "decline_reasons": reasons,
-        "fallback_mode": fallback_config.name(),
-        "fallback_richer": fallback_config.includes_richer(),
-        "fallback_cropped": fallback_stats.cropped,
-        "fallback_good": null,
-        "fallback_wrong": null,
-        "fallback_original_declines": fallback_stats.reasons,
-        "fallback_inward_fraction_distribution": fallback_stats.distribution(),
-        "fallback_by_layout": fallback_stats.layout_summary(false),
-        "fallback_layout_ratio_distribution": fallback_stats.layout_ratio_distribution(),
-        "ratio_distribution": ratio_distribution.json(),
-        "rows": rows,
-    });
-    std::fs::write(
-        output.join("summary.json"),
-        serde_json::to_vec_pretty(&summary)?,
-    )?;
-    println!("cover auto folder evaluation: cropped={cropped} declined={declined}");
-    Ok(())
+    book_list::evaluate(
+        list,
+        output,
+        true,
+        fallback_config,
+        &book_list::Options::default(),
+    )
 }
 
 /// Run one directory per invocation, e.g. dummies and realistic separately.
@@ -469,7 +369,7 @@ fn evaluate_folder_list(
 /// Green = truth, red = prediction; bottom status strip: green good, red wrong,
 /// gray declined. Missing or unreadable inputs fail instead of inflating counts.
 #[test]
-#[ignore = "requires MIV_COVER_AUTO_EVAL_DIR or MIV_COVER_AUTO_EVAL_FOLDER_LIST; external evaluation images are never repository fixtures"]
+#[ignore = "requires MIV_COVER_AUTO_EVAL_DIR, MIV_COVER_AUTO_EVAL_FOLDER_LIST or MIV_COVER_AUTO_EVAL_BOOK_LIST; external evaluation images are never repository fixtures"]
 fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Error>> {
     let fallback_config = FallbackConfig::from_env()?;
     let output = target_output(
@@ -477,8 +377,23 @@ fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Erro
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("target/cover-auto-eval")),
     )?;
+    if let Some(list) = std::env::var_os("MIV_COVER_AUTO_EVAL_BOOK_LIST") {
+        return book_list::evaluate(
+            Path::new(&list),
+            &output,
+            false,
+            fallback_config,
+            &book_list::Options::from_env()?,
+        );
+    }
     if let Some(list) = std::env::var_os("MIV_COVER_AUTO_EVAL_FOLDER_LIST") {
-        return evaluate_folder_list(Path::new(&list), &output, fallback_config);
+        return book_list::evaluate(
+            Path::new(&list),
+            &output,
+            true,
+            fallback_config,
+            &book_list::Options::from_env()?,
+        );
     }
     let directory = PathBuf::from(
         std::env::var_os("MIV_COVER_AUTO_EVAL_DIR").ok_or("set MIV_COVER_AUTO_EVAL_DIR")?,
