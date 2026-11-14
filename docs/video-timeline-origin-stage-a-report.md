@@ -2,6 +2,13 @@
 
 2026-11-14. Stage A implementation and independent-review fixes are applied. The review-fix focused run passed1014/1014; the requested full lib run completed once with17629 passed,6 failed,1 timed out,76 skipped. All nine newly added review regressions passed in its JUnit. Complete failures and subsequent test-harness correction/diagnostics are recorded below; this is not a successful full gate. No product binary has been launched; all playback observations below are noninteractive decoder/FFmpeg tests or source inspection.
 
+## Acceptance by the design lead (880718eb0, outside the Codex sandbox)
+
+- Independent implementation review (GPT-6.1 Sol / xhigh, thread `01a1d7f1-e551-71f1-93bd-7714a9678ea5`): "accept after fixes" on 553140833, then **accept** on 880718eb0.
+- `run-heavy.ps1 -FullTest .\scripts\test-lib-full.ps1` at 880718eb0: 17636 run, 3 failed, all in `app::folder_pane_refresh_tests` at about 115 s each while other heavy jobs shared the PC. Re-run alone (`cargo nextest run -p mimageviewer --lib -E 'test(/folder_pane_refresh_tests/)'`): 48/48 passed. The Codex-sandbox failures listed below (agent_ipc named pipes, scan deadlines, log-writer barrier) did not recur; `agent_ipc` alone: 176/176 passed.
+- `.\scripts\build-dev.ps1` at 880718eb0: passed.
+- Runtime behaviour in the real app is not verified (agents do not launch the product binary); the user checks it with the dev-runtime build.
+
 ## Commits and ownership
 
 - `30030f112` - `feat(video): Rebase MPEG-TS/PS timestamps to media time (WIP checkpoint)` (committed by the design lead).
