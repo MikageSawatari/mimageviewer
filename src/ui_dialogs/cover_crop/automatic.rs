@@ -30,14 +30,16 @@ impl AutoDetection {
     pub(super) fn analyze(
         image: &image::DynamicImage,
         dimensions: (u32, u32),
-        aspect: f64,
+        sample: &crate::cover_auto_sample::PageAspectSample,
+        evidence: crate::cover_auto_crop::photo::PhotoEvidence,
         binding: ReadingDirection,
     ) -> Self {
         let mut reports = [Err(AutoCropDecline::NoStructure); 4];
-        crate::cover_auto_crop::detect_cover_crops_with_report(
+        crate::cover_auto_crop::detect_cover_crops_with_photo_report(
             image,
             dimensions,
-            Some(aspect),
+            sample,
+            evidence,
             binding,
             |angle, result| reports[angle.degrees() as usize / 90] = result,
         );
@@ -117,6 +119,7 @@ fn stop_text(stop: AutoStop) -> &'static str {
 fn decline_text(reason: AutoCropDecline) -> &'static str {
     use AutoCropDecline::*;
     match reason {
+        PhotoLike { .. } => "写真のように見えるため自動では切りません",
         RawAspectGate | NotWide => "表紙がつながった形 (横長) ではありません",
         // The dialog normally stops before analysis with the sampler's exact
         // typed cause. Keep a diagnostic for a detector-only missing aspect.
@@ -192,6 +195,18 @@ mod tests {
             (NoSpine, boundary),
             (WeakFront, color),
             (RicherElsewhere, color),
+            (
+                PhotoLike {
+                    reason: crate::cover_auto_crop::photo::PhotoLikeReason::ShotExif,
+                },
+                "写真のように見えるため自動では切りません",
+            ),
+            (
+                PhotoLike {
+                    reason: crate::cover_auto_crop::photo::PhotoLikeReason::TransposedPage,
+                },
+                "写真のように見えるため自動では切りません",
+            ),
         ] {
             assert_eq!(decline_text(reason), text);
         }

@@ -2,13 +2,25 @@
 use super::*;
 use crate::image_decode::Source;
 
+#[path = "cover_auto_analysis/metadata.rs"]
+pub(super) mod metadata;
+
+#[cfg(test)]
+pub(super) fn shot_exif_from_bytes(bytes: &[u8]) -> bool {
+    metadata::from_bytes(bytes).shot_exif
+}
+
 const ANALYSIS_DECODE_HEIGHT: u32 = 1024;
 
 pub(crate) struct CoverAutoAnalysis {
     pub image: image::DynamicImage,
+    pub decoder: crate::stats::DecodeSource,
     /// EXIF-upright image dimensions; PDF uses page-box catalog units, because
     /// only the ratio enters the detector (not the display raster's rounding).
     pub native_dims: (u32, u32),
+    /// Native EXIF-upright pixels, or unrounded PDF page-box points for G2.
+    pub photo_dims: (f64, f64),
+    pub shot_exif: bool,
     pub orientation: u16,
     pub dct_scale_num: Option<u32>,
 }
@@ -31,6 +43,7 @@ pub(crate) fn decode_cover_auto_analysis_image(
 ) -> Result<CoverAutoAnalysis, String> {
     check_cancel(cancel)?;
     let jpeg = is_jpeg_extension(source.extension());
+    let mut exif = None;
     if jpeg {
         let owned;
         let bytes = match source {
@@ -53,13 +66,25 @@ pub(crate) fn decode_cover_auto_analysis_image(
         };
         if let Some(bytes) = bytes {
             check_cancel(cancel)?;
-            match decode_jpeg_turbo_scaled_with_axis(bytes, ANALYSIS_DECODE_HEIGHT, None, true) {
+            let metadata = metadata::from_bytes(bytes);
+            exif = Some(metadata);
+            match decode_jpeg_turbo_scaled_with_orientation(
+                bytes,
+                ANALYSIS_DECODE_HEIGHT,
+                None,
+                true,
+                metadata.orientation,
+            ) {
                 Ok((image, stats)) => {
                     check_cancel(cancel)?;
-                    let orientation = read_exif_orientation_from_bytes(bytes);
+                    let orientation = metadata.orientation;
+                    let native_dims = stats.source_dims_after_exif(orientation);
                     return Ok(CoverAutoAnalysis {
                         image: apply_orientation(image, orientation),
-                        native_dims: stats.source_dims_after_exif(orientation),
+                        decoder: crate::stats::DecodeSource::Native,
+                        native_dims,
+                        photo_dims: (f64::from(native_dims.0), f64::from(native_dims.1)),
+                        shot_exif: metadata.shot_exif,
                         orientation,
                         dct_scale_num: Some(stats.scale_num),
                     });
@@ -71,27 +96,102 @@ pub(crate) fn decode_cover_auto_analysis_image(
             }
         }
     }
-    let orientation = match source {
-        Source::Path(path) => read_exif_orientation(path),
-        Source::Bytes { bytes, .. } => read_exif_orientation_from_bytes(bytes),
-    };
-    let image = if !jpeg && let Some(image) = full_decode {
+    if full_decode.is_none()
+        && let Source::Path(path) = source
+        && ["png", "webp"]
+            .iter()
+            .any(|ext| source.extension().eq_ignore_ascii_case(ext))
+    {
+        return decode_native_metadata_path(path, cancel);
+    }
+    let metadata = exif.unwrap_or_else(|| match source {
+        Source::Path(path) => metadata::from_path(path),
+        Source::Bytes { bytes, .. } => metadata::from_bytes(bytes),
+    });
+    let orientation = metadata.orientation;
+    // Ordinary bytes decodes currently apply rexif orientation only, which
+    // cannot see PNG/WebP EXIF. Own this analysis decode when decoder metadata
+    // reveals a transform; do not change the separate display decode contract.
+    let reuse_full = !matches!(source, Source::Bytes { bytes, .. }
+        if orientation != 1 && matches!(image::guess_format(bytes),
+            Ok(image::ImageFormat::Png | image::ImageFormat::WebP)));
+    let mut decoder = crate::stats::DecodeSource::Native;
+    let image = if !jpeg
+        && reuse_full
+        && let Some(image) = full_decode
+    {
         image.clone()
     } else {
-        crate::image_decode::decode(
+        let decoded = crate::image_decode::decode(
             source,
             crate::avif_decoder::Workload::Background,
             false,
             cancel,
         )
-        .map_err(|error| error.to_string())?
-        .oriented(source)
+        .map_err(|error| error.to_string())?;
+        decoder = decoded.decoder;
+        if decoded.orientation == crate::image_decode::Orientation::Applied {
+            decoded.image
+        } else {
+            apply_orientation(decoded.image, orientation)
+        }
     };
     check_cancel(cancel)?;
     Ok(CoverAutoAnalysis {
         native_dims: (image.width(), image.height()),
+        photo_dims: (f64::from(image.width()), f64::from(image.height())),
+        shot_exif: metadata.shot_exif,
         image,
+        decoder,
         orientation,
+        dct_scale_num: None,
+    })
+}
+
+/// When analysis owns the initial PNG/WebP decode, take metadata from that
+/// same decoder/file handle. A reused full raster deliberately does not enter
+/// this route: an extra file read solely for G1 is outside the design budget.
+fn decode_native_metadata_path(
+    path: &Path,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Result<CoverAutoAnalysis, String> {
+    let source = Source::Path(path);
+    let mut metadata = None;
+    let decoded = crate::image_decode::primary(
+        source,
+        crate::avif_decoder::Workload::Background,
+        None,
+        cancel.map(Arc::as_ref),
+        || {
+            let mut decoder = image::ImageReader::open(path)?
+                .with_guessed_format()?
+                .into_decoder()?;
+            metadata = Some(metadata::from_decoder(&mut decoder));
+            image::DynamicImage::from_decoder(decoder)
+        },
+    )
+    .or_else(|primary| {
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            return Err(primary);
+        }
+        crate::image_decode::susie(source, false, cancel.cloned()).map_err(|_| primary)
+    })
+    .map_err(|error| error.to_string())?;
+    check_cancel(cancel)?;
+    let metadata = metadata.unwrap_or_else(|| metadata::from_path(path));
+    let decoder = decoded.decoder;
+    let image = if decoded.orientation == crate::image_decode::Orientation::Applied {
+        decoded.image
+    } else {
+        apply_orientation(decoded.image, metadata.orientation)
+    };
+    Ok(CoverAutoAnalysis {
+        native_dims: (image.width(), image.height()),
+        photo_dims: (f64::from(image.width()), f64::from(image.height())),
+        shot_exif: metadata.shot_exif,
+        image,
+        decoder,
+        orientation: metadata.orientation,
         dct_scale_num: None,
     })
 }
@@ -141,7 +241,10 @@ pub(crate) fn decode_cover_auto_analysis_pdf(
     .map_err(|error| error.to_string())?;
     Ok(CoverAutoAnalysis {
         image: rendered.image,
+        decoder: crate::stats::DecodeSource::Native,
         native_dims,
+        photo_dims: (f64::from(width), f64::from(height)),
+        shot_exif: false,
         orientation: 1,
         dct_scale_num: None,
     })
@@ -209,7 +312,86 @@ mod tests {
         assert_eq!(from_bytes.dct_scale_num, Some(6));
         assert_eq!(from_bytes.image.height(), 1050);
         assert_eq!(from_bytes.native_dims, (2048, 1400));
+        assert!(!from_bytes.shot_exif);
+        assert!(!from_path.shot_exif);
         assert_eq!(from_path.dct_scale_num, from_bytes.dct_scale_num);
         assert_eq!(from_path.image.to_rgb8(), from_bytes.image.to_rgb8());
+    }
+
+    #[test]
+    fn cover_auto_analysis_jpeg_metadata_and_upright_dimensions_match_path_and_bytes() {
+        let pixels = image::RgbImage::from_pixel(90, 60, image::Rgb([20, 80, 180]));
+        let jpeg = turbojpeg::compress_image(&pixels, 85, turbojpeg::Subsamp::Sub2x2)
+            .unwrap()
+            .to_vec();
+        let bytes = metadata::tests::jpeg_with_exif(
+            &jpeg,
+            &metadata::tests::tiff_fixture(6, &[33434], true),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cover.jpg");
+        std::fs::write(&path, &bytes).unwrap();
+        for source in [
+            Source::Path(&path),
+            Source::Bytes {
+                bytes: &bytes,
+                hint: "cover.jpg",
+            },
+        ] {
+            let analysis = decode_cover_auto_analysis_image(source, None, None).unwrap();
+            assert_eq!(analysis.orientation, 6);
+            assert!(analysis.shot_exif);
+            assert_eq!(analysis.native_dims, (60, 90));
+            assert_eq!(analysis.photo_dims, (60.0, 90.0));
+            assert_eq!((analysis.image.width(), analysis.image.height()), (60, 90));
+        }
+    }
+
+    #[test]
+    fn cover_auto_analysis_native_png_webp_metadata_uses_initial_decode_and_owned_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        for webp in [false, true] {
+            let bytes = metadata::tests::native_with_exif(
+                webp,
+                metadata::tests::tiff_fixture(6, &[33437], true),
+            );
+            let name = if webp { "cover.webp" } else { "cover.png" };
+            let path = temp.path().join(name);
+            std::fs::write(&path, &bytes).unwrap();
+            for source in [
+                Source::Path(&path),
+                Source::Bytes {
+                    bytes: &bytes,
+                    hint: name,
+                },
+            ] {
+                let analysis = decode_cover_auto_analysis_image(source, None, None).unwrap();
+                assert_eq!(analysis.orientation, 6);
+                assert!(analysis.shot_exif);
+                assert_eq!(analysis.native_dims, (60, 90));
+                assert_eq!(analysis.photo_dims, (60.0, 90.0));
+            }
+            let display = image::load_from_memory(&bytes).unwrap();
+            let owned = decode_cover_auto_analysis_image(
+                Source::Bytes {
+                    bytes: &bytes,
+                    hint: name,
+                },
+                Some(&display),
+                None,
+            )
+            .unwrap();
+            assert_eq!(owned.native_dims, (60, 90));
+            assert!(owned.shot_exif);
+            // A supplied upright PNG/WebP file raster is reused. G1 is skipped
+            // because collecting it would require another file read.
+            let upright = image::DynamicImage::new_rgb8(60, 90);
+            let reused =
+                decode_cover_auto_analysis_image(Source::Path(&path), Some(&upright), None)
+                    .unwrap();
+            assert!(!reused.shot_exif);
+            assert_eq!(reused.photo_dims, (60.0, 90.0));
+            assert_eq!(reused.image.to_rgb8(), upright.to_rgb8());
+        }
     }
 }

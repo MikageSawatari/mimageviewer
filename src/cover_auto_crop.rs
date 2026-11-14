@@ -7,6 +7,8 @@ use crate::settings::ReadingDirection;
 use image::{DynamicImage, RgbImage};
 use std::borrow::Cow;
 
+pub(crate) mod photo;
+
 const CONTENT_MARGIN_CAP: f64 = 0.05;
 const TWO_SPINE_MIN: f64 = 0.04;
 const TWO_SPINE_MAX: f64 = 0.16;
@@ -29,17 +31,30 @@ const RICHER_SCORE_GAP: f64 = 0.5;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AutoCropIdentity {
     pub binding: ReadingDirection,
+    pub folders: bool,
 }
 
 impl AutoCropIdentity {
     pub(crate) fn new(binding: ReadingDirection) -> Self {
-        Self { binding }
+        Self {
+            binding,
+            folders: false,
+        }
     }
 
     pub(crate) fn suffix(self) -> &'static str {
-        match self.binding {
-            ReadingDirection::Rtl => "v2:rtl",
-            ReadingDirection::Ltr => "v2:ltr",
+        self.suffix_for_key("")
+    }
+
+    pub(crate) fn suffix_for_key(self, key: &str) -> &'static str {
+        match (
+            self.folders && key.starts_with(crate::thumb_loader::CACHE_KEY_FOLDER),
+            self.binding,
+        ) {
+            (true, ReadingDirection::Rtl) => "v2f:rtl",
+            (true, ReadingDirection::Ltr) => "v2f:ltr",
+            (false, ReadingDirection::Rtl) => "v2:rtl",
+            (false, ReadingDirection::Ltr) => "v2:ltr",
         }
     }
 }
@@ -48,6 +63,9 @@ impl AutoCropIdentity {
 pub(crate) enum AutoCropDecline {
     RawAspectGate,
     PageAspectMissing,
+    PhotoLike {
+        reason: photo::PhotoLikeReason,
+    },
     NotWide,
     NoJacketEvidence,
     NoStructure,
@@ -110,6 +128,7 @@ impl AutoCropDecline {
         let label = match self {
             Self::RawAspectGate => "not-wide-raw",
             Self::PageAspectMissing => "no-page-aspect",
+            Self::PhotoLike { reason } => return format!("photo-like/{}", reason.as_str()).into(),
             Self::NotWide => "not-wide",
             Self::NoJacketEvidence => "no-jacket-evidence",
             Self::NoStructure => "no-structure",
@@ -161,6 +180,40 @@ pub(crate) fn detect_cover_crops_with_report(
     original_dims: (u32, u32),
     page_aspect: Option<f64>,
     binding: ReadingDirection,
+    report: impl FnMut(Rotation, Result<CoverCrop, AutoCropDecline>),
+) -> AutoCropResults {
+    detect_cover_crops_with_evidence(image, original_dims, page_aspect, binding, None, report)
+}
+
+/// Worker, range dialog, and evaluation share the same metadata gates and all
+/// four saved-angle decisions. Metadata comes from the existing decode/sample.
+pub(crate) fn detect_cover_crops_with_photo_report(
+    image: &DynamicImage,
+    original_dims: (u32, u32),
+    sample: &crate::cover_auto_sample::PageAspectSample,
+    evidence: photo::PhotoEvidence,
+    binding: ReadingDirection,
+    report: impl FnMut(Rotation, Result<CoverCrop, AutoCropDecline>),
+) -> AutoCropResults {
+    detect_cover_crops_with_evidence(
+        image,
+        original_dims,
+        sample.aspect.ok(),
+        binding,
+        Some((sample, evidence)),
+        report,
+    )
+}
+
+fn detect_cover_crops_with_evidence(
+    image: &DynamicImage,
+    original_dims: (u32, u32),
+    page_aspect: Option<f64>,
+    binding: ReadingDirection,
+    evidence: Option<(
+        &crate::cover_auto_sample::PageAspectSample,
+        photo::PhotoEvidence,
+    )>,
     mut report: impl FnMut(Rotation, Result<CoverCrop, AutoCropDecline>),
 ) -> AutoCropResults {
     AutoCropResults::new(
@@ -171,14 +224,21 @@ pub(crate) fn detect_cover_crops_with_report(
             Rotation::Cw270,
         ]
         .map(|rotation| {
-            let result =
-                detect_cover_crop_at_rotation(image, original_dims, page_aspect, binding, rotation);
+            let result = detect_cover_crop_at_rotation_with_evidence(
+                image,
+                original_dims,
+                page_aspect,
+                binding,
+                rotation,
+                evidence,
+            );
             report(rotation, result);
             result.ok()
         }),
     )
 }
 
+#[cfg(test)]
 fn detect_cover_crop_at_rotation(
     image: &DynamicImage,
     original_dims: (u32, u32),
@@ -186,12 +246,42 @@ fn detect_cover_crop_at_rotation(
     binding: ReadingDirection,
     rotation: Rotation,
 ) -> Result<CoverCrop, AutoCropDecline> {
+    detect_cover_crop_at_rotation_with_evidence(
+        image,
+        original_dims,
+        page_aspect,
+        binding,
+        rotation,
+        None,
+    )
+}
+
+fn detect_cover_crop_at_rotation_with_evidence(
+    image: &DynamicImage,
+    original_dims: (u32, u32),
+    page_aspect: Option<f64>,
+    binding: ReadingDirection,
+    rotation: Rotation,
+    evidence: Option<(
+        &crate::cover_auto_sample::PageAspectSample,
+        photo::PhotoEvidence,
+    )>,
+) -> Result<CoverCrop, AutoCropDecline> {
     let dimensions = match rotation {
         Rotation::Cw90 | Rotation::Cw270 => (original_dims.1, original_dims.0),
         Rotation::None | Rotation::Cw180 => original_dims,
     };
     // Reject from dimensions before allocating a rotated copy or analysis raster.
     raw_aspect_gate(dimensions)?;
+    // Preserve the dialog's pre-analysis page-aspect stop before photo reasons.
+    page_aspect
+        .filter(|aspect| aspect.is_finite() && *aspect > 0.0)
+        .ok_or(AutoCropDecline::PageAspectMissing)?;
+    if let Some((sample, evidence)) = evidence
+        && let Some(reason) = photo::photo_like_reason(evidence, sample)
+    {
+        return Err(AutoCropDecline::PhotoLike { reason });
+    }
     let rotated;
     let image = match rotation {
         Rotation::None => image,

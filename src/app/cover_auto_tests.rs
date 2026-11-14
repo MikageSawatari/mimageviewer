@@ -677,6 +677,21 @@ fn cover_auto_collection_source_digest_and_reuse_follow_enabled_binding() {
         let current = identity(delivery);
         assert_ne!(off, current);
         identities.push(current);
+        let folders = identity(
+            super::collection_grid::prepare_collection_grid_thumbnail_sources(
+                CollectionGridThumbnailSources {
+                    auto_cover_crop: Some(AutoCropIdentity {
+                        binding: direction,
+                        folders: true,
+                    }),
+                    ..Default::default()
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap(),
+        );
+        assert_ne!(folders, current);
+        assert_ne!(folders, off);
     }
     assert_ne!(identities[0], identities[1]);
     let id = crate::collection_store::CollectionId::new();
@@ -696,4 +711,75 @@ fn cover_auto_collection_source_digest_and_reuse_follow_enabled_binding() {
     assert_eq!(reuse(&settings), ltr);
     settings.thumb_cover_auto_crop_binding = ReadingDirection::Rtl;
     assert_ne!(reuse(&settings), ltr);
+    let rtl = reuse(&settings);
+    settings.thumb_cover_auto_crop_folders = true;
+    assert_ne!(reuse(&settings), rtl);
+    settings.thumb_cover_auto_crop = false;
+    assert_eq!(reuse(&settings), off);
+}
+
+#[test]
+fn cover_auto_folder_switch_keeps_list_survival_rating_and_dialog_identity_consistent() {
+    let mut app = super::tests::phase_c_support::setup_app();
+    app.settings.thumb_cover_auto_crop = true;
+    for binding in [ReadingDirection::Rtl, ReadingDirection::Ltr] {
+        app.settings.thumb_cover_auto_crop_binding = binding;
+        for folders in [false, true] {
+            app.settings.thumb_cover_auto_crop_folders = folders;
+            let auto = app.thumbnail_auto_crop_identity();
+            assert_eq!(app.book_cover_env().auto_cover_crop, auto);
+            for item in [
+                GridItem::Folder(app.tmp.path().join("book")),
+                GridItem::ZipFile(app.tmp.path().join("book.zip")),
+            ] {
+                let req = request(&item, &HashMap::new(), auto);
+                let key = crate::thumb_loader::cache_key_for_request(&req)
+                    .unwrap()
+                    .into_owned();
+                assert_eq!(
+                    key.contains("|autocrop:v2f:"),
+                    folders && matches!(item, GridItem::Folder(_))
+                );
+                let survival = folder_thumb_existing_keys_for_with_auto_crop(
+                    &item,
+                    Some((17, 23)),
+                    &HashMap::new(),
+                    None,
+                    None,
+                    3,
+                    false,
+                    &Default::default(),
+                    auto,
+                );
+                assert!(survival.contains(&key));
+                if matches!(item, GridItem::Folder(_)) {
+                    let opposite = crate::cover_auto_crop::AutoCropIdentity {
+                        binding,
+                        folders: !folders,
+                    };
+                    let retired =
+                        crate::thumb_loader::representative_cache_key_for_policy_with_auto(
+                            &key,
+                            &Default::default(),
+                            Some(opposite),
+                        );
+                    assert!(!survival.contains(&retired));
+                }
+                // Rating and the list both use this canonical setting capture
+                // and representative normalizer, never a reading direction.
+                assert_eq!(
+                    crate::app::configured_thumbnail_auto_crop(&app.settings),
+                    auto
+                );
+                assert_eq!(
+                    crate::thumb_loader::representative_cache_key_for_policy_with_auto(
+                        &key,
+                        &Default::default(),
+                        auto
+                    ),
+                    key
+                );
+            }
+        }
+    }
 }

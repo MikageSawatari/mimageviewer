@@ -5006,6 +5006,9 @@ pub struct Settings {
     /// 自動切り出しで表表紙の側を決める綴じ方向（横連結とは独立）。
     #[serde(default = "default_thumb_cover_auto_crop_binding")]
     pub thumb_cover_auto_crop_binding: ReadingDirection,
+    /// 直下の画像を表紙にする画像フォルダの本も自動切り出しの対象にする。
+    #[serde(default)]
+    pub thumb_cover_auto_crop_folders: bool,
     /// サムネイル右下に動画・音声の長さを表示する。
     #[serde(default = "default_true")]
     pub thumb_show_media_duration: bool,
@@ -7990,6 +7993,7 @@ impl Default for Settings {
             thumb_container_icon_kinds: crate::grid_item::ContainerIconKinds::NONE,
             thumb_cover_auto_crop: false,
             thumb_cover_auto_crop_binding: default_thumb_cover_auto_crop_binding(),
+            thumb_cover_auto_crop_folders: false,
             selection_info_display_mode: SelectionInfoDisplayMode::Tooltip,
             thumb_show_media_duration: true,
             thumb_show_resume_meter: true,
@@ -11454,6 +11458,51 @@ mod tests {
         )
         .unwrap();
         assert!(!db.load_into_settings().unwrap().thumb_cover_auto_crop);
+    }
+
+    #[test]
+    fn thumb_cover_auto_crop_folders_default_missing_and_db_roundtrip() {
+        assert!(!Settings::default().thumb_cover_auto_crop_folders);
+        assert!(
+            !serde_json::from_str::<Settings>("{}")
+                .unwrap()
+                .thumb_cover_auto_crop_folders
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(temp.path()).unwrap();
+        for enabled in [false, true] {
+            let settings = Settings {
+                thumb_cover_auto_crop_folders: enabled,
+                ..Settings::default()
+            };
+            let restored: Settings =
+                serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(restored.thumb_cover_auto_crop_folders, enabled);
+            assert_eq!(
+                settings
+                    .thumbnail_source_discovery_snapshot()
+                    .thumb_cover_auto_crop_folders,
+                enabled
+            );
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings()
+                    .unwrap()
+                    .thumb_cover_auto_crop_folders,
+                enabled
+            );
+        }
+        let conn = rusqlite::Connection::open(temp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'thumb_cover_auto_crop_folders'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            !db.load_into_settings()
+                .unwrap()
+                .thumb_cover_auto_crop_folders
+        );
     }
 
     #[test]
@@ -20952,6 +21001,7 @@ impl Settings {
             // Rating preparation also builds representative survival keys.
             thumb_cover_auto_crop: self.thumb_cover_auto_crop,
             thumb_cover_auto_crop_binding: self.thumb_cover_auto_crop_binding,
+            thumb_cover_auto_crop_folders: self.thumb_cover_auto_crop_folders,
             file_type_visibility: self.file_type_visibility.clone(),
             skip_image_if_video_exists: self.skip_image_if_video_exists,
             video_thumb_use_sidecar_image: self.video_thumb_use_sidecar_image,

@@ -49,8 +49,8 @@
 5. **範囲で切る代表は元画像から作る** (編集プレビューは使わない。利用者決定 §13-4)。
 6. **座標は leaf 元画像の EXIF 適用後・保存回転前の正規化座標**。描画時の回転 (§1.718) はそのまま掛かる。
 7. **範囲指定の画面はモーダル**。代表の解決と画像の読み込みは 1 つの worker 仕事 (§8)。
-8. **自動切り出しは、ファイルの本 (ZIP・変換アーカイブ・PDF・EPUB とその中の ZipDir) の代表だけ**に掛ける、記録を作らない派生値。
-   本のファイルの stamp が中身の変更を表すので、周辺ページの変更で自然に作り直される。判定できないときは切らない (§12)。
+8. **自動切り出しは、ファイルの本 (ZIP・変換アーカイブ・PDF・EPUB とその中の ZipDir) と、専用設定がオンの画像フォルダの本の代表**に掛ける、記録を作らない派生値。
+   ファイルの本は中身の変更で、画像フォルダは表紙の変更で判定し直す (§26)。判定できないときは切らない (§12)。
 9. **ドライブ一覧と mIV Remote の本のタイルには、範囲も自動も反映しない** (どちらも今もピンの解決を近似・省略している画面)。
 
 ## 3. 状態を減らす検討 (CLAUDE.md「設計の簡素化」)
@@ -61,8 +61,8 @@
   画面と結果の不一致の組み合わせを消す。代償は、範囲を付けた表紙のタイルに消しゴム・注釈・編集の切り取りが出ないこと (色調補正は出る)。
 - **編集プレビューがある固定ページには自動を掛けない** (r2 指摘 1)。worker は今と同じく編集プレビューを先に確かめ、あれば返す。
   自動の判定は catalog の経路にだけある。判定結果を記録して「切った / 切らなかった」で編集プレビューの優先を変える仕組みを持たない。
-- **自動の対象をファイルの本に限る** (r2 指摘 3)。フォルダの本では周辺ページの変更を表す stamp が無く、入力ページの stamp を証明に
-  持たせる仕組みが要る。ZipPla からの移行で問題になるのは書庫の本で、フォルダは手動で指定できる。
+- **画像フォルダは専用設定の後ろに置き、表紙が変わったときに判定し直す** (§26 の利用者決定で旧 r2 指摘3の方針を置換)。
+  本文ページの同名上書きで判定結果を失効させる仕組みは足さない。既存の代表選択の証明をそのまま使う。
 - **ドライブ一覧に範囲も自動も反映しない** (r2 指摘 2)。ドライブ一覧の行を正しく作る作り手 (代表専用の要求) を新設しない。
   ドライブの根に範囲は付けられない (入口を出さない)。
 - **RAW の leaf には範囲も自動も付けない** (r1 指摘 10)。
@@ -472,7 +472,7 @@ ZipPlaFork (commit 07955f52、**AGPL v3**) の公開コードを読んだ結果�
    タイルに反映しない。色調補正は反映する。
 5. **決定 (利用者 2026-11-11)**: 自動の評価に手元の実際の本を使ってよい。手元の本は表紙が処理済みのものが多いので、代わりに
    報告者の構成図を参考に手元の画像を素材にした合成本で評価する (§12.6)。素材は読み取りだけ、結果は Git 管理外。
-6. **決定 (利用者 2026-11-11)**: 自動はファイルの本だけ。フォルダの本は自動の対象外 (手動の範囲指定は使える)。
+6. **決定 (利用者 2026-11-14、§26で置換)**: 画像フォルダの本も専用設定 (既定オフ) で自動の対象にする。直下の画像だけを判定し、表紙が変わったときに判定し直す。
    ドライブ一覧・Remote の本のタイルには範囲も自動も反映しない。本ごとの綴じ方向は読まず、既定の綴じ方向を使う。
    自動の ON / OFF では種類の表示設定と同じく本のタイルを作り直す。(設計担当の提案に利用者が同意)
 
@@ -1542,6 +1542,18 @@ r2 = REVISE (P2 1 件、ほかは r1 の指摘を閉じた)。v2 キーで `auto
   この入力では**画像の出力 (sheet) を作らない** (利用者の指定した場所は成人向けを含むため)。結果は件数と理由の分布だけ。
   正解が無いので、切った本の正否は実機確認で利用者に頼む。
 
+### 26.6 実装記録 (2026-11-14)
+
+- `thumb_cover_auto_crop_folders` を既定・欠落時ともfalseで追加。保存・設定転送・検索・無効表示・OK/キャンセル・有効中の再読み込みを既存経路へ接続した。
+- 印は `AutoCropIdentity::suffix_for_key` で決め、フォルダだけv2fにする。一覧・存続集合・レーティング・範囲画面は同じ設定captureと正規化を使う。v2fをv1移行へ含めない。
+- 代表選択結果に直下の一覧と所有ディレクトリを付け、解決後の自動指示と標本の入力を `ResolvedAutoCover` にまとめた。再帰先・Seededは親の判定対象から外し、K2の素材コピーは変更しない。
+- 比率は選択時の一覧を `FileNameSortKey` 順で引き継ぎ、最大8枚×256KiBをworkerで読む。フォルダを再走査せず、本文の変更を追跡する仕組みも追加しない。
+- `MIV_COVER_AUTO_EVAL_FOLDER_LIST` のJSON配列を受けるcfg(test)評価を追加。専用分岐は画像を出力せず、summary.jsonの行は番号・寸法・理由・数値の範囲だけ。合成フォルダで出力がsummary.jsonだけで名前を含まないことを検査する。利用者データでの評価は実行していない。
+- 主な回帰: `cover_auto_folder_direct_selection_reuses_listing_and_excludes_descendants_and_seeds`、`cover_auto_folder_v2f_identity_roundtrips_and_never_uses_v1_migration`、`cover_auto_folder_switch_keeps_list_survival_rating_and_dialog_identity_consistent`、`cover_auto_rating_folder_switch_uses_v2f_from_settings_snapshot`、`folder_evaluation_emits_counts_and_numeric_rows_without_images_or_names`、設定の既定・欠落・DB/転送往復・無効表示・OK/キャンセルのテスト。
+- K2のr2修正は `auto_material_k2_prefers_v2_and_legacy_fallback_requires_missing_exact_v2` に、同方向v1だけ古い場合を追加。同方向が現行なら優先し、v2が存在する場合は別方向v2やv1へ戻らない条件を維持した。
+- 検証: `cover_auto|cover_crop|auto_material|representative_cache_key|folder_thumb|thumb_cover|settings_transfer|settings::` の焦点nextest **629件成功・失敗0**。設定の分類項目数の期待値も新項目分を更新して再実行した。`cargo fmt`・`git diff --check`・UI glyph検査成功。
+- UI snapshotは設定画面1件を更新後、通常比較で **257件成功・失敗0**。更新PNGは `tests/snapshots/preferences_favorite_view_state_dark.png` だけ（設定と補足文の追加）。画像は開いていない。公開説明はgrid/settingsに加え、移行案内に残っていた対象外の1文も合わせた。
+
 ## 27. 写真のように見える表紙は自動で切らない (§1.773、2026-11-14、利用者決定 案 1・v5.2.1)
 
 ### 27.1 経緯と数字 (Git 管理外・件数だけ)
@@ -1582,3 +1594,13 @@ r2 = REVISE (P2 1 件、ほかは r1 の指摘を閉じた)。v2 キーで `auto
 - 判定の中身が変わるので、自動の印は未出荷の v2 のまま据え置く (§23・§24 と同じ。開発中に作った v2 の行は既存の再生成で作り直す)。
 - テスト: G1 (ExposureTime だけ・FNumber だけ・両方・無し・向きと一緒に取れる)、G2 (±1 px、PDF の相対 0.5%、一致しない場合)、
   全種類 (ZIP・PDF・フォルダ) で門が掛かること、範囲画面の理由の表示。
+
+### 27.3 実装記録 (2026-11-14)
+
+- `cover_auto_crop/photo.rs` に `PhotoEvidence` と `PhotoLikeReason` を置き、保存回転ごとの元寸法の門を通った後、画像の回転・解析rasterの作成前にG1/G2を掛ける。worker・範囲画面・評価器は同じreport付きhelperを使う。
+- JPEG/TIFFは向きとExif IFDの撮影情報を一度のrexif解析で取得し、JPEGのDCT倍率選択にも解析済みの向きを渡す。PNG/WebPは既に所有するbytes、または最初のdecodeのfile handleとデコーダから取得する。全体画像・向き・撮影情報・バックエンドを同じdecode結果に保持し、メタデータだけのためにファイルを読み直さない。
+- WIC専用形式など、既存のdecodeがEXIFのbytesを持たず追加読み取りが必要な経路ではG1を使わずG2だけにする。PDFはG1なし、G2には丸めた描画寸法でなく実際のpage-box point値を渡す。
+- 比率標本は取り除く前の全枠の寸法も返し、G2へ再利用する。A判/B判の±1%除外を維持し、見送りは `photo-like/shot-exif` / `photo-like/transposed-page` と範囲画面の対応文言で示す。未出荷の判定版v2は据え置く。
+- 主な回帰: `cover_auto_analysis_exif_requires_exif_ifd_and_extracts_orientation_in_same_parse`、JPEG/TIFFのbytes/path一致、PNG/WebPのmetadata、`cover_auto_photo_pixels_accept_one_pixel_and_keep_all_sample_slots`、`cover_auto_photo_pdf_preserves_points_and_relative_tolerance`、A判/B判の画像・PDF除外、`cover_auto_photo_guard_follows_raw_gate_and_does_not_reach_jacket_rules`、`cover_auto_photo_shot_exif_reaches_zip_and_folder_workers_with_upright_material`、`cover_auto_photo_pdf_worker_applies_transposed_page_guard_with_same_lease`、worker/範囲画面4方向一致と理由表示。
+- 検証:上記の焦点nextest **629件成功**。G1はJPEG/PNG/WebP×向き2通り×撮影情報の有無×ZIP/フォルダの24入力組合せで、撮影情報が無ければ切れる同じ表紙が見送られることと正立寸法を検査した。worker/範囲画面の比較は16入力組合せ×4方向で一致。PDFは同じpassword/leaseのままG2で見送る。
+- 合成フォルダ評価1件は切り出し0・見送り1で、summary.jsonだけを出力し、画像出力や個別名が無いことを検査した。UI snapshot **257件成功**。利用者データ・外部評価画像・sheetは使用/閲覧していない。

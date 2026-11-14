@@ -2,6 +2,10 @@
 //! of display/thumb geometry. Production builds omit this adapter.
 use super::*;
 
+pub(crate) fn shot_exif(bytes: &[u8]) -> bool {
+    super::cover_auto_analysis::shot_exif_from_bytes(bytes)
+}
+
 pub(crate) type DecodedCover = CoverAutoAnalysis;
 
 pub(crate) fn decode(

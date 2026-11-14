@@ -328,6 +328,9 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
             "切り出し",
             "範囲",
             "綴じ方向",
+            "画像フォルダの本も対象にする",
+            "写真",
+            "表紙が変わったとき",
             "書庫",
             "PDF"
         ]
@@ -2300,7 +2303,15 @@ mod tests {
 
     #[test]
     fn thumb_cover_auto_crop_search_finds_its_anchor() {
-        for query in ["表表紙", "表紙 切り出し", "綴じ方向", "綴じ方向 書庫"] {
+        for query in [
+            "表表紙",
+            "表紙 切り出し",
+            "綴じ方向",
+            "綴じ方向 書庫",
+            "画像フォルダの本も対象にする",
+            "画像フォルダ 写真",
+            "表紙 変わったとき",
+        ] {
             let entry = search_preferences(query, test_tree_position)
                 .into_iter()
                 .find(|entry| entry.anchor == "thumbnail/cover-auto-crop")

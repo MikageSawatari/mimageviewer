@@ -1446,8 +1446,13 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
                     "左綴じ",
                 );
             });
+            ui.checkbox(
+                &mut state.settings.thumb_cover_auto_crop_folders,
+                "画像フォルダの本も対象にする",
+            );
         });
         ui.small("表表紙の側はこの綴じ方向で判定します。手動で指定した範囲を優先し、判定できない表紙は全体を表示します。");
+        ui.small("写真のように見える表紙は切りません。画像フォルダの本は、表紙が変わったときに判定し直します。");
     });
     anchored(ui, state, "thumbnail/name-font-scale", |ui, state| {
         ui.horizontal_wrapped(|ui| {

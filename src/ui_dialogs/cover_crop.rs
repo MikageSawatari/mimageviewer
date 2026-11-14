@@ -510,7 +510,50 @@ fn prepare_cover_inner(
     if crate::raw_format::is_raw_path(hint) {
         return Err("RAW 画像は範囲を指定できません".into());
     }
+    let mut predecoded_auto_analysis = None;
     let image = match &cover.location {
+        ReadLocation::File(path)
+            if cover.cover_crop.is_none()
+                && env.auto_cover_crop.is_some()
+                && (container.kind != BookKind::Folder || cover.auto_cover_crop.is_some())
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| {
+                        ext.eq_ignore_ascii_case("png") || ext.eq_ignore_ascii_case("webp")
+                    }) =>
+        {
+            let analysis = crate::thumb_loader::decode_cover_auto_analysis_image(
+                crate::image_decode::Source::Path(path),
+                None,
+                Some(cancel),
+            )?;
+            let image = analysis.image.clone();
+            predecoded_auto_analysis = Some(analysis);
+            image
+        }
+        ReadLocation::ArchiveEntry { entry, .. }
+            if cover.auto_cover_crop.is_some()
+                && cover.cover_crop.is_none()
+                && cover.preloaded_bytes.as_deref().is_some_and(|bytes| {
+                    matches!(
+                        image::guess_format(bytes),
+                        Ok(image::ImageFormat::Png | image::ImageFormat::WebP)
+                    )
+                }) =>
+        {
+            let analysis = crate::thumb_loader::decode_cover_auto_analysis_image(
+                crate::image_decode::Source::Bytes {
+                    bytes: cover.preloaded_bytes.as_deref().unwrap(),
+                    hint: entry,
+                },
+                None,
+                Some(cancel),
+            )?;
+            let image = analysis.image.clone();
+            predecoded_auto_analysis = Some(analysis);
+            image
+        }
         ReadLocation::PdfPage { pdf, page } => {
             use crate::pdf_loader::{CancelWaitPolicy, JobPriority, PdfRenderValidity};
             crate::pdf_loader::render_page_with_read_target(
@@ -552,15 +595,23 @@ fn prepare_cover_inner(
             .oriented(source)
         }
     };
-    let supported = container.kind != BookKind::Folder
-        && match &cover.location {
+    let supported = if container.kind == BookKind::Folder {
+        cover.auto_cover_crop.as_ref().is_some_and(|auto| {
+            matches!(
+                auto.input,
+                crate::thumb_loader::AutoCoverInput::FolderPages(_)
+            )
+        })
+    } else {
+        match &cover.location {
             ReadLocation::PdfPage { .. } => true,
             ReadLocation::ArchiveEntry { archive, entry } => {
                 !crate::rar_loader::is_rar_path(archive)
                     && crate::zip_loader::split_nested_zip_path(entry).len() == 1
             }
             _ => false,
-        };
+        }
+    };
     let auto_crop = env.auto_cover_crop.filter(|_| supported);
     let auto_enabled = auto_crop.is_some();
     let has_edit_preview = auto_enabled
@@ -608,80 +659,96 @@ fn prepare_cover_inner(
     } else if has_edit_preview {
         AutoDetection::Stopped(AutoStop::EditPreview)
     } else if let Some(auto) = auto_crop.filter(|_| !cancel.load(Ordering::Relaxed)) {
-        let page_aspect = match &cover.location {
+        let sample = match &cover.location {
+            ReadLocation::File(path) => {
+                match cover.auto_cover_crop.as_ref().map(|auto| &auto.input) {
+                    Some(crate::thumb_loader::AutoCoverInput::FolderPages(pages)) => {
+                        crate::cover_auto_sample::sample_folder_pages(pages, path)
+                    }
+                    _ => crate::cover_auto_sample::page_aspect_sample_from_sizes(&[], 0),
+                }
+            }
             ReadLocation::ArchiveEntry { archive, entry } => {
-                crate::cover_auto_sample::sample_zip_page_aspect_report(
+                crate::cover_auto_sample::sample_zip_pages(
                     archive,
                     entry,
                     cover.zip_dir_prefix.as_deref(),
                 )
             }
-            ReadLocation::PdfPage { pdf, page } => cover
-                .epub_read
-                .as_ref()
-                .ok_or(crate::cover_auto_sample::PageAspectDecline::TooFew)
-                .and_then(|read| {
-                    crate::pdf_loader::get_page_sizes_with_read_target(
-                        pdf,
-                        read,
-                        cover.pdf_password.as_deref(),
-                    )
-                    .map_err(|_| crate::cover_auto_sample::PageAspectDecline::TooFew)
-                    .and_then(|sizes| {
-                        crate::cover_auto_sample::page_aspect_from_sizes_report(
-                            &sizes,
-                            *page as usize,
+            ReadLocation::PdfPage { pdf, page } => {
+                let sizes = cover
+                    .epub_read
+                    .as_ref()
+                    .and_then(|read| {
+                        crate::pdf_loader::get_page_sizes_with_read_target(
+                            pdf,
+                            read,
+                            cover.pdf_password.as_deref(),
                         )
+                        .ok()
                     })
-                }),
-            _ => Err(crate::cover_auto_sample::PageAspectDecline::TooFew),
+                    .unwrap_or_default();
+                crate::cover_auto_sample::page_aspect_sample_from_sizes(&sizes, *page as usize)
+            }
+            _ => crate::cover_auto_sample::page_aspect_sample_from_sizes(&[], 0),
         };
+        let page_aspect = sample.aspect;
         if let Err(reason) = page_aspect {
             crate::logger::log(format!(
                 "auto cover: dialog page-aspect={}",
                 reason.as_str()
             ));
         }
-        let analyze = |page_aspect| -> Result<AutoDetection, String> {
-            let analysis = match &cover.location {
-                ReadLocation::PdfPage { pdf, page } => {
-                    use crate::pdf_loader::{CancelWaitPolicy, JobPriority, PdfRenderValidity};
-                    crate::thumb_loader::decode_cover_auto_analysis_pdf(
-                        pdf,
-                        cover.epub_read.as_ref(),
-                        *page,
-                        cover.pdf_password.as_deref(),
-                        Some(cancel),
-                        JobPriority::Normal,
-                        PdfRenderValidity::Unscoped,
-                        CancelWaitPolicy::AbortOnCancel,
-                    )
+        let mut analyze = || -> Result<AutoDetection, String> {
+            let analysis = if let Some(analysis) = predecoded_auto_analysis.take() {
+                Ok(analysis)
+            } else {
+                match &cover.location {
+                    ReadLocation::PdfPage { pdf, page } => {
+                        use crate::pdf_loader::{CancelWaitPolicy, JobPriority, PdfRenderValidity};
+                        crate::thumb_loader::decode_cover_auto_analysis_pdf(
+                            pdf,
+                            cover.epub_read.as_ref(),
+                            *page,
+                            cover.pdf_password.as_deref(),
+                            Some(cancel),
+                            JobPriority::Normal,
+                            PdfRenderValidity::Unscoped,
+                            CancelWaitPolicy::AbortOnCancel,
+                        )
+                    }
+                    ReadLocation::File(path) => {
+                        crate::thumb_loader::decode_cover_auto_analysis_image(
+                            crate::image_decode::Source::Path(path),
+                            Some(&image),
+                            Some(cancel),
+                        )
+                    }
+                    ReadLocation::ArchiveEntry { entry, .. } => {
+                        crate::thumb_loader::decode_cover_auto_analysis_image(
+                            crate::image_decode::Source::Bytes {
+                                bytes: cover
+                                    .preloaded_bytes
+                                    .as_deref()
+                                    .ok_or("書庫の画像を読み込めませんでした")?,
+                                hint: entry,
+                            },
+                            Some(&image),
+                            Some(cancel),
+                        )
+                    }
+                    _ => unreachable!(),
                 }
-                ReadLocation::File(path) => crate::thumb_loader::decode_cover_auto_analysis_image(
-                    crate::image_decode::Source::Path(path),
-                    Some(&image),
-                    Some(cancel),
-                ),
-                ReadLocation::ArchiveEntry { entry, .. } => {
-                    crate::thumb_loader::decode_cover_auto_analysis_image(
-                        crate::image_decode::Source::Bytes {
-                            bytes: cover
-                                .preloaded_bytes
-                                .as_deref()
-                                .ok_or("書庫の画像を読み込めませんでした")?,
-                            hint: entry,
-                        },
-                        Some(&image),
-                        Some(cancel),
-                    )
-                }
-                _ => unreachable!(),
             };
             Ok(match analysis {
                 Ok(analysis) => AutoDetection::analyze(
                     &analysis.image,
                     analysis.native_dims,
-                    page_aspect,
+                    &sample,
+                    crate::cover_auto_crop::photo::PhotoEvidence {
+                        shot_exif: analysis.shot_exif,
+                        dimensions: analysis.photo_dims,
+                    },
                     auto.binding,
                 ),
                 Err(error) => {
@@ -691,7 +758,7 @@ fn prepare_cover_inner(
             })
         };
         match page_aspect {
-            Ok(aspect) => analyze(aspect)?,
+            Ok(_) => analyze()?,
             Err(reason) => AutoDetection::Stopped(AutoStop::PageAspect(reason)),
         }
     } else {

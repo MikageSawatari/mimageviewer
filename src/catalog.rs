@@ -988,8 +988,11 @@ impl ThumbnailColumns {
 fn decode_auto_material(filename: &str, value: Option<&str>) -> Option<AutoMaterial> {
     match value {
         Some(value) => AutoMaterial::decode(value),
-        None => (!crate::thumb_loader::representative_auto_crop_key_parts(filename)
-            .is_some_and(|(_, token, _)| token.starts_with("|autocrop:v2:")))
+        None => (!crate::thumb_loader::representative_auto_crop_key_parts(filename).is_some_and(
+            |(_, token, _)| {
+                token.starts_with("|autocrop:v2:") || token.starts_with("|autocrop:v2f:")
+            },
+        ))
         .then_some(AutoMaterial::NotAutomatic),
     }
 }
@@ -3311,6 +3314,11 @@ mod tests {
         let db = open_in_memory();
         for (key, value) in [
             ("zipthumb:null|autocrop:v2:rtl", None),
+            ("folderthumb:null|autocrop:v2f:rtl", None),
+            (
+                "folderthumb:bad|autocrop:v2f:ltr",
+                Some("automatic-v1:-;-;-"),
+            ),
             ("zipthumb:bad|autocrop:v2:ltr", Some("automatic-v1:-;-;-")),
             ("zipthumb:pinned|autocrop:v2:rtl#pin:page", None),
             ("ordinary-malformed", Some("broken")),

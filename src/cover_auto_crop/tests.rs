@@ -652,3 +652,112 @@ fn color_is_a_veto_and_does_not_relocate_to_the_back() {
         );
     }
 }
+
+#[test]
+fn cover_auto_photo_guard_follows_raw_gate_and_does_not_reach_jacket_rules() {
+    let image = DynamicImage::new_rgb8(900, 600);
+    let sample = crate::cover_auto_sample::PageAspectSample {
+        aspect: Ok(2.0 / 3.0),
+        dimensions: vec![Some((600.0, 900.0)); 3],
+        units: crate::cover_auto_sample::PageDimensionUnits::Pixels,
+    };
+    for shot_exif in [false, true] {
+        let mut reports = Vec::new();
+        let results = detect_cover_crops_with_photo_report(
+            &image,
+            (900, 600),
+            &sample,
+            photo::PhotoEvidence {
+                shot_exif,
+                dimensions: (900.0, 600.0),
+            },
+            ReadingDirection::Rtl,
+            |angle, result| reports.push((angle, result)),
+        );
+        assert_eq!(results.crops(), [None; 4]);
+        for (angle, result) in reports {
+            assert_eq!(
+                result,
+                Err(if matches!(angle, Rotation::Cw90 | Rotation::Cw270) {
+                    AutoCropDecline::RawAspectGate
+                } else {
+                    AutoCropDecline::PhotoLike {
+                        reason: if shot_exif {
+                            photo::PhotoLikeReason::ShotExif
+                        } else {
+                            photo::PhotoLikeReason::TransposedPage
+                        },
+                    }
+                })
+            );
+        }
+    }
+}
+
+#[test]
+fn cover_auto_photo_a_paper_image_and_pdf_reach_detector_instead_of_transpose_guard() {
+    for (units, (width, height)) in [
+        (
+            crate::cover_auto_sample::PageDimensionUnits::Pixels,
+            (2480.0, 3508.0),
+        ),
+        (
+            crate::cover_auto_sample::PageDimensionUnits::PdfPoints,
+            (595.28, 841.89),
+        ),
+    ] {
+        let sample = crate::cover_auto_sample::PageAspectSample {
+            aspect: Ok(width / height),
+            dimensions: vec![Some((width, height)); 3],
+            units,
+        };
+        let mut reports = Vec::new();
+        detect_cover_crops_with_photo_report(
+            &DynamicImage::new_rgb8(424, 300),
+            (424, 300),
+            &sample,
+            photo::PhotoEvidence {
+                shot_exif: false,
+                dimensions: (height, width),
+            },
+            ReadingDirection::Rtl,
+            |_, result| reports.push(result),
+        );
+        assert!(
+            reports
+                .into_iter()
+                .all(|result| !matches!(result, Err(AutoCropDecline::PhotoLike { .. })))
+        );
+    }
+}
+
+#[test]
+fn cover_auto_photo_keeps_missing_page_aspect_before_photo_reason() {
+    let sample = crate::cover_auto_sample::PageAspectSample {
+        aspect: Err(crate::cover_auto_sample::PageAspectDecline::TooFew),
+        dimensions: Vec::new(),
+        units: crate::cover_auto_sample::PageDimensionUnits::Pixels,
+    };
+    let mut reports = Vec::new();
+    detect_cover_crops_with_photo_report(
+        &DynamicImage::new_rgb8(900, 600),
+        (900, 600),
+        &sample,
+        photo::PhotoEvidence {
+            shot_exif: true,
+            dimensions: (900.0, 600.0),
+        },
+        ReadingDirection::Rtl,
+        |angle, result| reports.push((angle, result)),
+    );
+    for (angle, result) in reports {
+        assert_eq!(
+            result,
+            Err(if matches!(angle, Rotation::Cw90 | Rotation::Cw270) {
+                AutoCropDecline::RawAspectGate
+            } else {
+                AutoCropDecline::PageAspectMissing
+            })
+        );
+    }
+}

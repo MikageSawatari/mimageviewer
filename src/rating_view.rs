@@ -912,6 +912,70 @@ mod tests {
     }
 
     #[test]
+    fn cover_auto_rating_folder_switch_uses_v2f_from_settings_snapshot() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("book");
+        std::fs::create_dir(&folder).unwrap();
+        let db_path = temp.path().join("ratings.db");
+        let db = crate::rating_db::RatingDb::open_at(&db_path).unwrap();
+        db.set_user_rating(
+            &crate::path_key::normalize_keep_drive(&folder),
+            3,
+            Some(
+                &crate::rating_db::RatingMeta::new(RatingItemKind::Folder)
+                    .with_source_path(&folder),
+            ),
+        )
+        .unwrap();
+        drop(db);
+        for folders in [false, true] {
+            for binding in [
+                crate::settings::ReadingDirection::Rtl,
+                crate::settings::ReadingDirection::Ltr,
+            ] {
+                let settings = crate::settings::Settings {
+                    thumb_cover_auto_crop: true,
+                    thumb_cover_auto_crop_folders: folders,
+                    thumb_cover_auto_crop_binding: binding,
+                    ..Default::default()
+                };
+                let mut options = membership_options(Default::default());
+                options.sidecar_settings = settings.thumbnail_source_discovery_snapshot();
+                let prepared =
+                    prepare_rating_view(db_path.clone(), 3, options, &AtomicBool::new(false))
+                        .unwrap()
+                        .prepared
+                        .unwrap();
+                let expected = format!(
+                    "|autocrop:{}:{}",
+                    if folders { "v2f" } else { "v2" },
+                    if binding == crate::settings::ReadingDirection::Rtl {
+                        "rtl"
+                    } else {
+                        "ltr"
+                    }
+                );
+                let keys: Vec<_> = prepared
+                    .existing_keys
+                    .iter()
+                    .filter(|key| key.starts_with("folderthumb:"))
+                    .collect();
+                assert!(!keys.is_empty());
+                assert!(
+                    keys.iter().any(|key| key.contains(&expected)),
+                    "{keys:?} expected {expected}"
+                );
+                assert!(!keys.iter().any(|key| key.contains(if folders {
+                    "|autocrop:v2:"
+                } else {
+                    "|autocrop:v2f:"
+                })));
+            }
+        }
+    }
+
+    #[test]
     fn rating_membership_prepare_rejects_active_write_and_old_ready_after_restore() {
         let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let tmp = tempfile::tempdir().unwrap();

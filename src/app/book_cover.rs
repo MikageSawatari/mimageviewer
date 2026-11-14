@@ -143,6 +143,7 @@ pub(crate) struct ResolvedBookCover {
     pub(crate) edit_preview_key: Option<String>,
     /// Sampling scope from the shared thumbnail request, never the outer ZIP.
     pub(crate) zip_dir_prefix: Option<String>,
+    pub(crate) auto_cover_crop: Option<crate::thumb_loader::ResolvedAutoCover>,
 }
 
 #[derive(Debug)]
@@ -359,6 +360,7 @@ impl CoverResolver<'_> {
                 cover_crop: None,
                 edit_preview_key: None,
                 zip_dir_prefix: None,
+                auto_cover_crop: None,
             });
         }
         let pin_container = zip_prefix.map_or_else(
@@ -494,6 +496,7 @@ impl CoverResolver<'_> {
             })
         })
         .ok_or(BookCoverFailure::ReadFailed)?;
+        request.set_auto_cover_crop(self.env.auto_cover_crop);
         // The selected cached row owns its exact fixed page/entry. The synthetic
         // source above feeds that position back through the released App planner.
         if request.folder_thumb_provenance == Some(crate::catalog::FolderThumbProvenance::Seeded)
@@ -570,6 +573,8 @@ impl CoverResolver<'_> {
                     self.resolve(child, BookKind::for_path(child), selected.pin.as_ref())?;
                 cover.persistent_source =
                     source_for_location(path, &cover.signature_path, &cover.location);
+                // K2 is child-owned material, not a direct image of this folder.
+                cover.auto_cover_crop = None;
                 return Ok(cover);
             }
             let physical_path = match &resolved.location {
@@ -624,6 +629,7 @@ impl CoverResolver<'_> {
                     self.env.books_root.as_deref(),
                 ),
                 cover_crop: resolved.cover_crop,
+                auto_cover_crop: resolved.auto_cover_crop,
                 edit_preview_key,
                 zip_dir_prefix: request.zip_dir_prefix.clone(),
                 location: resolved.location,

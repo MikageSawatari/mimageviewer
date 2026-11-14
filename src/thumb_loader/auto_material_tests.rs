@@ -200,6 +200,12 @@ fn auto_material_k2_prefers_v2_and_legacy_fallback_requires_missing_exact_v2() {
     let legacy = auto_material_candidate(&cache, &directory, key).unwrap();
     assert_eq!(legacy.auto_material, AutoMaterial::LegacyV1);
     assert_eq!(legacy.cover, CoverIdentity::Page("old-ltr".into()));
+    // A stale preferred v1 must not hide the valid opposite-binding row.
+    writer.save(old, 6, 9, 8, 8, None, &bytes,
+        &CoverIdentity::Page("stale-rtl".into()), AutoMaterial::NotAutomatic).unwrap();
+    let legacy = auto_material_candidate(&cache, &directory, key).unwrap();
+    assert_eq!(legacy.auto_material, AutoMaterial::LegacyV1);
+    assert_eq!(legacy.cover, CoverIdentity::Page("old-ltr".into()));
     writer
         .save(
             old,

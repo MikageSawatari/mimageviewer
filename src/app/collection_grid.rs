@@ -240,7 +240,11 @@ pub(in crate::app) fn prepare_collection_grid_thumbnail_sources(
     digest.update(b"miv.collection-thumbnail-sources.v2\0");
     if let Some(auto) = sources.auto_cover_crop {
         digest.update(b"auto-cover-crop\0");
-        hash_collection_thumbnail_identity_part(&mut digest, auto.suffix().as_bytes());
+        hash_collection_thumbnail_identity_part(
+            &mut digest,
+            auto.suffix_for_key(crate::thumb_loader::CACHE_KEY_FOLDER)
+                .as_bytes(),
+        );
     }
 
     let mut sidecars = sources.video_sidecars.iter().collect::<Vec<_>>();

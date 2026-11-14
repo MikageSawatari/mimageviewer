@@ -1,4 +1,6 @@
-//! Opt-in synthetic evaluation. Generated artifacts must stay under target/.
+//! Opt-in evaluation. Generated artifacts must stay under target/.
+//! FOLDER_LIST accepts a JSON array of absolute image-folder paths and writes
+//! numeric/count-only JSON; this branch never creates image artifacts.
 //!
 //! The default worker decode shares production's fixed analysis decode. Explicit
 //! MIV_COVER_AUTO_EVAL_DECODE=full remains a diagnostic comparison. DISPLAY_PX
@@ -105,7 +107,8 @@ fn rotated_rect(rect: [f64; 4], dims: (u32, u32), rotation: Rotation) -> [f64; 4
 
 struct LoadedCase {
     image: DynamicImage,
-    aspect: Option<f64>,
+    sample: crate::cover_auto_sample::PageAspectSample,
+    shot_exif: bool,
     zip_leaf: Option<String>,
     worker: Option<crate::thumb_loader::cover_auto_eval_decode::DecodedCover>,
     original_dims: (u32, u32),
@@ -181,11 +184,8 @@ fn load_case(
             .map(|(parent, _)| format!("{parent}/"));
         // Deliberately use the production prefix-only dimension sampler. Truth
         // aspect is allowed only for PNG dummies, never to rescue a ZIP sample.
-        let aspect = crate::cover_auto_sample::sample_zip_page_aspect(
-            &decode_path,
-            &leaf,
-            prefix.as_deref(),
-        );
+        let sample =
+            crate::cover_auto_sample::sample_zip_pages(&decode_path, &leaf, prefix.as_deref());
         let worker = mode
             .worker
             .then(|| {
@@ -199,7 +199,8 @@ fn load_case(
             .transpose()?;
         Ok(LoadedCase {
             image,
-            aspect,
+            sample,
+            shot_exif: crate::thumb_loader::cover_auto_eval_decode::shot_exif(&bytes),
             zip_leaf: Some(leaf),
             worker,
             original_dims,
@@ -230,7 +231,14 @@ fn load_case(
             .transpose()?;
         Ok(LoadedCase {
             image,
-            aspect: truth.page_aspect,
+            sample: crate::cover_auto_sample::PageAspectSample {
+                aspect: truth
+                    .page_aspect
+                    .ok_or(crate::cover_auto_sample::PageAspectDecline::TooFew),
+                dimensions: Vec::new(),
+                units: crate::cover_auto_sample::PageDimensionUnits::Pixels,
+            },
+            shot_exif: crate::thumb_loader::cover_auto_eval_decode::shot_exif(&bytes),
             zip_leaf: None,
             worker,
             original_dims,
@@ -313,21 +321,126 @@ fn target_output(output: PathBuf) -> Result<PathBuf, Box<dyn std::error::Error>>
     Ok(current)
 }
 
+/// Folder inputs have no ground truth and may contain private images. Use the
+/// representative worker's source selection, bounded sample and analysis, but
+/// emit neither source identities nor a contact sheet or copied input images.
+fn evaluate_folder_list(list: &Path, output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let folders: Vec<PathBuf> = serde_json::from_slice(&std::fs::read(list)?)
+        .map_err(|_| "folder evaluation list must be a JSON array of absolute paths")?;
+    if folders.is_empty() || folders.iter().any(|path| !path.is_absolute()) {
+        return Err("folder evaluation list must contain nonempty absolute paths".into());
+    }
+    let output = target_output(output.to_path_buf())?;
+    let _worker_data = crate::data_dir::TestDataDirGuard::new();
+    let (mut cropped, mut declined) = (0, 0);
+    let mut reasons = BTreeMap::<String, u32>::new();
+    let mut rows = Vec::new();
+    for (index, folder) in folders.iter().enumerate() {
+        let mut request = crate::thumb_loader::LoadRequest {
+            idx: index,
+            path: folder.clone(),
+            cache_key_override: Some(format!("folderthumb:case-{index}")),
+            source_policy: crate::thumb_loader::LoadSourcePolicy::SourceOnly,
+            folder_thumb_sort: Some(crate::settings::SortOrder::Numeric),
+            folder_thumb_depth: 3,
+            ..Default::default()
+        };
+        request.set_auto_cover_crop(Some(AutoCropIdentity {
+            binding: ReadingDirection::Rtl,
+            folders: true,
+        }));
+        let resolved = crate::thumb_loader::resolve_read_after_cache_miss(&request, None, None);
+        let (
+            crate::thumb_loader::ReadLocation::File(cover),
+            Some(crate::thumb_loader::ResolvedAutoCover {
+                identity,
+                input: crate::thumb_loader::AutoCoverInput::FolderPages(pages),
+            }),
+        ) = (resolved.location, resolved.auto_cover_crop)
+        else {
+            return Err(format!("folder evaluation case {index} has no direct image cover").into());
+        };
+        let sample = crate::cover_auto_sample::sample_folder_pages(&pages, &cover);
+        let analysis = crate::thumb_loader::decode_cover_auto_analysis_image(
+            crate::image_decode::Source::Path(&cover),
+            None,
+            None,
+        )
+        .map_err(|_| format!("folder evaluation case {index} could not decode its cover"))?;
+        let mut unrotated = Err(AutoCropDecline::RawAspectGate);
+        let results = detect_cover_crops_with_photo_report(
+            &analysis.image,
+            analysis.native_dims,
+            &sample,
+            photo::PhotoEvidence {
+                shot_exif: analysis.shot_exif,
+                dimensions: analysis.photo_dims,
+            },
+            identity.binding,
+            |rotation, result| {
+                if rotation.is_none() {
+                    unrotated = result;
+                }
+            },
+        );
+        let reason = match unrotated {
+            Ok(_) => {
+                cropped += 1;
+                "cropped".to_owned()
+            }
+            Err(reason) => {
+                declined += 1;
+                let reason = reason.as_str().into_owned();
+                *reasons.entry(reason.clone()).or_default() += 1;
+                reason
+            }
+        };
+        rows.push(json!({
+            "index": index,
+            "reason": reason,
+            "native_dims": analysis.native_dims,
+            "decoded_dims": [analysis.image.width(), analysis.image.height()],
+            "page_aspect": sample.aspect.ok(),
+            "page_aspect_decline": sample.aspect.err().map(crate::cover_auto_sample::PageAspectDecline::as_str),
+            "crop": unrotated.ok().map(CoverCrop::values),
+            "all_crops": results.crops().map(|crop| crop.map(CoverCrop::values)),
+        }));
+    }
+    let summary = json!({
+        "algorithm": "autocrop:v2f",
+        "source": "folder-list",
+        "total": folders.len(),
+        "cropped": cropped,
+        "declined": declined,
+        "decline_reasons": reasons,
+        "rows": rows,
+    });
+    std::fs::write(
+        output.join("summary.json"),
+        serde_json::to_vec_pretty(&summary)?,
+    )?;
+    println!("cover auto folder evaluation: cropped={cropped} declined={declined}");
+    Ok(())
+}
+
 /// Run one directory per invocation, e.g. dummies and realistic separately.
 /// The JSON row index maps to the contact sheet (left-to-right, top-to-bottom).
 /// Green = truth, red = prediction; bottom status strip: green good, red wrong,
 /// gray declined. Missing or unreadable inputs fail instead of inflating counts.
 #[test]
-#[ignore = "requires MIV_COVER_AUTO_EVAL_DIR; external evaluation images are never repository fixtures"]
+#[ignore = "requires MIV_COVER_AUTO_EVAL_DIR or MIV_COVER_AUTO_EVAL_FOLDER_LIST; external evaluation images are never repository fixtures"]
 fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Error>> {
-    let directory = PathBuf::from(
-        std::env::var_os("MIV_COVER_AUTO_EVAL_DIR").ok_or("set MIV_COVER_AUTO_EVAL_DIR")?,
-    );
     let output = target_output(
         std::env::var_os("MIV_COVER_AUTO_EVAL_OUTPUT")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("target/cover-auto-eval")),
     )?;
+    if let Some(list) = std::env::var_os("MIV_COVER_AUTO_EVAL_FOLDER_LIST") {
+        return evaluate_folder_list(Path::new(&list), &output);
+    }
+    let directory = PathBuf::from(
+        std::env::var_os("MIV_COVER_AUTO_EVAL_DIR").ok_or("set MIV_COVER_AUTO_EVAL_DIR")?,
+    );
     let mode = DecodeMode::from_env()?;
     let _worker_data = mode.worker.then(crate::data_dir::TestDataDirGuard::new);
     std::fs::create_dir_all(&output)?;
@@ -351,7 +464,8 @@ fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Erro
     for (index, (name, truth)) in truth.iter().enumerate() {
         let LoadedCase {
             image,
-            aspect,
+            sample,
+            shot_exif,
             zip_leaf,
             worker,
             original_dims,
@@ -376,12 +490,30 @@ fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Erro
         let saved = mode.saved_rotation.unwrap_or_else(|| {
             Rotation::from_degrees(truth.saved_rotation - mode.image_rotation.degrees())
         });
-        let results = detect_cover_crops(decoded_image, native_dims, aspect, binding);
+        let aspect = sample.aspect.ok();
+        let evidence = photo::PhotoEvidence {
+            shot_exif: worker
+                .as_ref()
+                .map_or(shot_exif, |decoded| decoded.shot_exif),
+            dimensions: worker.as_ref().map_or(
+                (f64::from(native_dims.0), f64::from(native_dims.1)),
+                |decoded| decoded.photo_dims,
+            ),
+        };
+        let mut detected = Err(AutoCropDecline::RawAspectGate);
+        let results = detect_cover_crops_with_photo_report(
+            decoded_image,
+            native_dims,
+            &sample,
+            evidence,
+            binding,
+            |rotation, result| {
+                if rotation == saved {
+                    detected = result
+                }
+            },
+        );
         let prediction = results.crop_for(saved);
-        // Preserve typed diagnostics without making diagnostic information part
-        // of the immutable material's persistent representation.
-        let detected =
-            detect_cover_crop_at_rotation(decoded_image, native_dims, aspect, binding, saved);
         assert_eq!(prediction, detected.as_ref().ok().copied());
         let expected = truth.front.map(|x| {
             let y = truth.front_y.unwrap_or([0.0, original_dims.1 as f64]);
@@ -474,6 +606,44 @@ fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Erro
         "cover auto evaluation: good={good} wrong={wrong} declined={declined}; {}",
         output.display()
     );
+    Ok(())
+}
+
+#[test]
+fn folder_evaluation_emits_counts_and_numeric_rows_without_images_or_names()
+-> Result<(), Box<dyn std::error::Error>> {
+    let target = std::env::current_dir()?.join("target");
+    std::fs::create_dir_all(&target)?;
+    let temp = tempfile::Builder::new()
+        .prefix("cover-auto-folder-eval-")
+        .tempdir_in(&target)?;
+    let folder = temp.path().join("private-folder-name");
+    std::fs::create_dir(&folder)?;
+    image::DynamicImage::new_rgb8(150, 100).save(folder.join("000-private-cover-name.png"))?;
+    for index in 1..=8 {
+        image::DynamicImage::new_rgb8(100, 150)
+            .save(folder.join(format!("{index:03}-private-body-name.png")))?;
+    }
+    let list = temp.path().join("folders.json");
+    std::fs::write(&list, serde_json::to_vec(&vec![folder])?)?;
+    let output = temp.path().join("output");
+    evaluate_folder_list(&list, &output)?;
+    let artifacts: Vec<_> = std::fs::read_dir(&output)?
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(artifacts, vec![std::ffi::OsString::from("summary.json")]);
+    let text = std::fs::read_to_string(output.join("summary.json"))?;
+    assert!(!text.contains("private-"));
+    assert!(!text.contains(&temp.path().to_string_lossy().into_owned()));
+    let summary: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(summary["total"], 1);
+    assert_eq!(summary["cropped"], 0);
+    assert_eq!(summary["declined"], 1);
+    assert_eq!(summary["decline_reasons"]["photo-like/transposed-page"], 1);
+    assert_eq!(summary["rows"][0]["index"], 0);
+    assert_eq!(summary["rows"][0]["native_dims"], json!([150, 100]));
+    assert_eq!(summary["rows"][0]["reason"], "photo-like/transposed-page");
+    assert!(summary["rows"][0]["crop"].is_null());
     Ok(())
 }
 

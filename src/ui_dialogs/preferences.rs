@@ -5963,6 +5963,113 @@ mod tests {
     }
 
     #[test]
+    fn thumb_cover_auto_crop_folders_reload_only_when_automatic_is_enabled() {
+        for enabled in [false, true] {
+            for folders in [false, true] {
+                let before = Settings {
+                    thumb_cover_auto_crop: enabled,
+                    thumb_cover_auto_crop_folders: folders,
+                    ..Settings::default()
+                };
+                let mut after = before.clone();
+                after.thumb_cover_auto_crop_folders = !folders;
+                assert_eq!(cover_auto_crop_changed(&before, &after), enabled);
+                assert_eq!(cover_auto_crop_changed(&after, &before), enabled);
+                after.thumb_cover_auto_crop = !enabled;
+                assert!(cover_auto_crop_changed(&before, &after));
+            }
+        }
+    }
+
+    #[test]
+    fn thumb_cover_auto_crop_folders_preferences_disabled_ok_cancel_save_and_reopen() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let mut harness = preferences_view_harness(PreferencesPage::Thumbnail);
+        let automatic = "つながった表紙から表表紙を自動で切り出す (書庫・PDF の本)";
+        let folders = "画像フォルダの本も対象にする";
+        assert!(harness.get_by_label(folders).accesskit_node().is_disabled());
+        harness.get_by_label(automatic).scroll_to_me();
+        harness.run_steps(3);
+        harness.get_by_label(automatic).click();
+        harness.run_steps(3);
+        assert!(!harness.get_by_label(folders).accesskit_node().is_disabled());
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        let db = crate::settings_db::SettingsDb::open(harness.state().tmp.path()).unwrap();
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Thumbnail);
+        harness.run_steps(3);
+        for (cancel, expected) in [(true, false), (false, true), (true, true)] {
+            harness.get_by_label(folders).scroll_to_me();
+            harness.run_steps(3);
+            harness.get_by_label(folders).click();
+            harness.run_steps(3);
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .thumb_cover_auto_crop_folders,
+                !harness.state().settings.thumb_cover_auto_crop_folders
+            );
+            harness
+                .get_by_label(if cancel { "キャンセル" } else { "  OK  " })
+                .click();
+            harness.run_steps(3);
+            if cancel {
+                harness.get_by_label("破棄して閉じる").click();
+                harness.run_steps(3);
+            }
+            assert_eq!(
+                harness.state().settings.thumb_cover_auto_crop_folders,
+                expected
+            );
+            assert_eq!(
+                db.load_into_settings()
+                    .unwrap()
+                    .thumb_cover_auto_crop_folders,
+                expected
+            );
+            harness
+                .state_mut()
+                .open_preferences_page(PreferencesPage::Thumbnail);
+            harness.run_steps(3);
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .thumb_cover_auto_crop_folders,
+                expected
+            );
+        }
+        harness.get_by_label(automatic).scroll_to_me();
+        harness.run_steps(3);
+        harness.get_by_label(automatic).click();
+        harness.run_steps(3);
+        assert!(harness.get_by_label(folders).accesskit_node().is_disabled());
+        assert!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .thumb_cover_auto_crop_folders
+        );
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        let saved = db.load_into_settings().unwrap();
+        assert!(!saved.thumb_cover_auto_crop);
+        assert!(saved.thumb_cover_auto_crop_folders);
+    }
+
+    #[test]
     fn thumb_cover_auto_crop_binding_preferences_disabled_ok_cancel_save_and_reopen() {
         use crate::settings::ReadingDirection::{Ltr, Rtl};
         use egui_kittest::kittest::{NodeT, Queryable};

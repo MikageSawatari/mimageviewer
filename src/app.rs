@@ -103109,9 +103109,12 @@ fn parent_row_for_item(
 pub(crate) fn configured_thumbnail_auto_crop(
     settings: &crate::settings::Settings,
 ) -> Option<crate::cover_auto_crop::AutoCropIdentity> {
-    settings.thumb_cover_auto_crop.then(|| {
-        crate::cover_auto_crop::AutoCropIdentity::new(settings.thumb_cover_auto_crop_binding)
-    })
+    settings
+        .thumb_cover_auto_crop
+        .then(|| crate::cover_auto_crop::AutoCropIdentity {
+            binding: settings.thumb_cover_auto_crop_binding,
+            folders: settings.thumb_cover_auto_crop_folders,
+        })
 }
 
 impl App {

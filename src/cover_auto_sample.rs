@@ -1,5 +1,6 @@
 //! Bounded dimension-only sampling for a representative jacket leaf.
-use std::path::Path;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 pub(crate) const MAX_SAMPLE_PAGES: usize = 8;
 pub(crate) const MAX_SAMPLE_PREFIX_BYTES: u64 = 256 * 1024;
@@ -22,6 +23,37 @@ pub(crate) enum PageAspectDecline {
     TooFew,
     Landscape,
     Inconsistent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PageDimensionUnits {
+    Pixels,
+    PdfPoints,
+}
+
+/// Dimensions keep every selected slot, including unknown pages and the
+/// leading landscape pages omitted only from the aspect consensus. Photo
+/// detection uses these original slots without another read.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PageAspectSample {
+    pub(crate) aspect: Result<f64, PageAspectDecline>,
+    pub(crate) dimensions: Vec<Option<(f64, f64)>>,
+    pub(crate) units: PageDimensionUnits,
+}
+
+impl PageAspectSample {
+    fn new(dimensions: Vec<Option<(f64, f64)>>, units: PageDimensionUnits) -> Self {
+        let aspect = aspect_from_slots(
+            dimensions
+                .iter()
+                .map(|size| size.map(|(width, height)| width / height)),
+        );
+        Self {
+            aspect,
+            dimensions,
+            units,
+        }
+    }
 }
 
 impl PageAspectDecline {
@@ -82,11 +114,19 @@ pub(crate) fn page_aspect_from_sizes_report(
     sizes: &[(f32, f32)],
     leaf: usize,
 ) -> Result<f64, PageAspectDecline> {
-    aspect_from_slots(sample_indices(sizes.len(), leaf).into_iter().map(|index| {
-        let (width, height) = sizes[index];
-        (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
-            .then_some(f64::from(width) / f64::from(height))
-    }))
+    page_aspect_sample_from_sizes(sizes, leaf).aspect
+}
+
+pub(crate) fn page_aspect_sample_from_sizes(sizes: &[(f32, f32)], leaf: usize) -> PageAspectSample {
+    let dimensions = sample_indices(sizes.len(), leaf)
+        .into_iter()
+        .map(|index| {
+            let (width, height) = sizes[index];
+            (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
+                .then_some((f64::from(width), f64::from(height)))
+        })
+        .collect();
+    PageAspectSample::new(dimensions, PageDimensionUnits::PdfPoints)
 }
 
 /// Read no more than eight 256 KiB prefixes, without nested archive expansion,
@@ -104,17 +144,60 @@ pub(crate) fn sample_zip_page_aspect_report(
     leaf_entry: &str,
     prefix: Option<&str>,
 ) -> Result<f64, PageAspectDecline> {
+    sample_zip_pages(path, leaf_entry, prefix).aspect
+}
+
+pub(crate) fn sample_zip_pages(
+    path: &Path,
+    leaf_entry: &str,
+    prefix: Option<&str>,
+) -> PageAspectSample {
     if crate::rar_loader::is_rar_path(path)
         || crate::zip_loader::split_nested_zip_path(leaf_entry).len() > 1
     {
-        return Err(PageAspectDecline::TooFew);
+        return PageAspectSample::new(Vec::new(), PageDimensionUnits::Pixels);
     }
     let prefixes = crate::zip_loader::read_cover_auto_page_prefixes(path, leaf_entry, prefix)
-        .map_err(|_| PageAspectDecline::TooFew)?;
-    aspect_from_slots(prefixes.into_iter().map(|(name, bytes)| {
-        let (width, height) = crate::app::probe_image_dims_from_bytes(bytes.as_deref()?, &name)?;
-        (width > 0 && height > 0).then_some(f64::from(width) / f64::from(height))
-    }))
+        .unwrap_or_default();
+    let dimensions = prefixes
+        .into_iter()
+        .map(|(name, bytes)| dimensions_from_prefix(bytes.as_deref()?, &name))
+        .collect();
+    PageAspectSample::new(dimensions, PageDimensionUnits::Pixels)
+}
+
+fn dimensions_from_prefix(bytes: &[u8], name: &str) -> Option<(f64, f64)> {
+    let (width, height) = crate::app::probe_image_dims_from_bytes(bytes, name)?;
+    (width > 0 && height > 0).then_some((f64::from(width), f64::from(height)))
+}
+
+fn read_folder_prefix(path: &Path) -> Option<Vec<u8>> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SAMPLE_PREFIX_BYTES)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(bytes)
+}
+
+/// The caller supplies the already enumerated image paths in FileNameSortKey
+/// order. Do not enumerate or sort again: this is the representative worker's
+/// same direct-child snapshot, and only eight bounded reads are allowed.
+pub(crate) fn sample_folder_pages(paths: &[PathBuf], cover: &Path) -> PageAspectSample {
+    let leaf = paths
+        .iter()
+        .position(|path| crate::path_key::eq_keep_drive(path, cover));
+    let dimensions = leaf.map_or_else(Vec::new, |leaf| {
+        sample_indices(paths.len(), leaf)
+            .into_iter()
+            .map(|index| {
+                let path = &paths[index];
+                let bytes = read_folder_prefix(path)?;
+                dimensions_from_prefix(&bytes, &path.to_string_lossy())
+            })
+            .collect()
+    });
+    PageAspectSample::new(dimensions, PageDimensionUnits::Pixels)
 }
 
 #[cfg(test)]
@@ -141,6 +224,118 @@ mod tests {
         }
         writer.finish().unwrap();
         file
+    }
+
+    #[test]
+    fn full_pdf_sample_retains_unknown_and_leading_slots_in_points() {
+        let sizes = [
+            (300.0, 100.0),
+            (140.0, 100.0),
+            (0.0, 100.0),
+            (70.0, 100.0),
+            (70.0, 100.0),
+            (70.0, 100.0),
+            (f32::NAN, 100.0),
+        ];
+        let sample = page_aspect_sample_from_sizes(&sizes, 0);
+        assert_eq!(sample.aspect, Ok(0.7));
+        assert_eq!(sample.units, PageDimensionUnits::PdfPoints);
+        assert_eq!(
+            sample.dimensions,
+            vec![
+                Some((140.0, 100.0)),
+                None,
+                Some((70.0, 100.0)),
+                Some((70.0, 100.0)),
+                Some((70.0, 100.0)),
+                None,
+            ]
+        );
+        assert_eq!(page_aspect_from_sizes_report(&sizes, 0), sample.aspect);
+    }
+
+    #[test]
+    fn folder_uses_supplied_name_order_and_eight_attempts_without_rescan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for i in [10, 0, 9, 2, 3, 1, 4, 5, 6, 7, 8, 11] {
+            let path = dir.path().join(format!("{i:02}.png"));
+            let bytes = if i == 1 {
+                b"unknown".to_vec()
+            } else {
+                png(60 + i, 100)
+            };
+            std::fs::write(&path, bytes).unwrap();
+            paths.push(path);
+        }
+        paths.sort_by_cached_key(|path| {
+            crate::filename_sort::FileNameSortKey::new(&path.file_name().unwrap().to_string_lossy())
+        });
+        assert_eq!(paths[2].file_name().unwrap(), "02.png");
+        assert_eq!(paths[10].file_name().unwrap(), "10.png");
+        // This direct child is deliberately absent from the supplied snapshot.
+        std::fs::write(dir.path().join("00a.png"), png(200, 100)).unwrap();
+        let sample = sample_folder_pages(&paths, &paths[0]);
+        assert_eq!(sample.units, PageDimensionUnits::Pixels);
+        assert_eq!(sample.aspect, Ok(0.65));
+        assert_eq!(sample.dimensions.len(), MAX_SAMPLE_PAGES);
+        assert_eq!(sample.dimensions[0], None);
+        assert_eq!(sample.dimensions[1], Some((62.0, 100.0)));
+        assert_eq!(sample.dimensions[7], Some((68.0, 100.0)));
+        let backwards = sample_folder_pages(&paths, &paths[11]);
+        assert_eq!(backwards.dimensions.len(), MAX_SAMPLE_PAGES);
+        assert_eq!(backwards.dimensions[0], Some((70.0, 100.0)));
+        assert_eq!(backwards.dimensions[7], Some((63.0, 100.0)));
+        assert!(
+            sample_folder_pages(&paths, &dir.path().join("missing.png"))
+                .dimensions
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn folder_prefix_read_is_bounded_and_failed_reads_remain_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let cover = dir.path().join("0.png");
+        let large = dir.path().join("1.png");
+        let missing = dir.path().join("2.png");
+        std::fs::write(&large, vec![0; 300 * 1024]).unwrap();
+        assert_eq!(
+            read_folder_prefix(&large).unwrap().len(),
+            MAX_SAMPLE_PREFIX_BYTES as usize
+        );
+        let sample = sample_folder_pages(&[cover.clone(), large, missing], &cover);
+        assert_eq!(sample.dimensions, vec![None, None]);
+        assert_eq!(sample.aspect, Err(PageAspectDecline::TooFew));
+    }
+
+    #[test]
+    fn full_zip_sample_retains_unknown_and_leading_slots_in_pixels() {
+        let file = zip(vec![
+            ("0.png".into(), png(300, 100)),
+            ("1.png".into(), png(140, 100)),
+            ("2.png".into(), b"unknown".to_vec()),
+            ("3.png".into(), png(70, 100)),
+            ("4.png".into(), png(70, 100)),
+            ("5.png".into(), png(70, 100)),
+        ]);
+        let sample = sample_zip_pages(file.path(), "0.png", None);
+        assert_eq!(sample.units, PageDimensionUnits::Pixels);
+        assert_eq!(sample.aspect, Ok(0.7));
+        assert_eq!(
+            sample.dimensions,
+            vec![
+                Some((140.0, 100.0)),
+                None,
+                Some((70.0, 100.0)),
+                Some((70.0, 100.0)),
+                Some((70.0, 100.0)),
+            ]
+        );
+        assert_eq!(
+            sample_zip_page_aspect_report(file.path(), "0.png", None),
+            sample.aspect
+        );
     }
 
     #[test]
@@ -383,5 +578,16 @@ mod tests {
             sample_zip_page_aspect(file.path(), "000.jpg", None),
             Some(0.7)
         );
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..4)
+            .map(|i| {
+                let path = dir.path().join(format!("{i:03}.jpg"));
+                std::fs::write(&path, &bytes).unwrap();
+                path
+            })
+            .collect();
+        let sample = sample_folder_pages(&paths, &paths[0]);
+        assert_eq!(sample.aspect, Ok(0.7));
+        assert_eq!(sample.dimensions, vec![Some((70.0, 100.0)); 3]);
     }
 }
