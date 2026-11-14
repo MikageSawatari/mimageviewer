@@ -66,6 +66,22 @@ skip sample / pre-skip が適用された音声サンプルと frame PTS の関�
   `read_timestamp` がある demuxer で binary search を使い、実際の key packet を確定しない。
 - mIV への影響 (コードと headless 検証から): seek は最大で次の GOP まで遅れ、末尾近くでは frame が
   出ないまま既存 EOF 処理へ進み得る。サムネイルも次の GOP の画になり、許容範囲外なら生成されない。
+- 実機での観測 (依頼 51、サブ PC 担当、時刻原点ブランチ e7c0fbae4、合成素材 60 秒・GOP 0.5 秒):
+  - 中身が TS / PS の `.mpg` で → キーを押して末尾へ進めると、`seek: target=59.923s` の直後に EOF へ進み、
+    時刻表示は `1:00 / 1:00` になるが、画面は押す前の画 (56 / 58) のまま残る。MP4 では 59 の画が出る。
+    target が最後の keyframe より後ろなので、上の着地の問題そのもの。時刻原点の修正の前は、開始時刻の分だけ
+    target が手前で止まっていたため目立たなかった。
+  - 中身が TS の `.mpg` で、シークストリップの「場面 (全体)」の枠が全部空になる
+    (`MaterialUnavailable(KeyframesTooSparse)`)。TS / PS には本物の索引が無い。ストリップが読む
+    `AVIndexEntry` は、索引を作るための捨てシーク (`seek_strip.rs` の warmup) で `mpegts_get_dts` が登録した
+    探索点だけになる (60 秒の素材で 6〜9 点、最大の間隔は約 30 秒で、`SEEK_STRIP_MAX_RAW_KEYFRAME_GAP_SECS`
+    = 15 秒を超える)。
+    同梱 DLL の probe では、修正前のコードでも開始時刻が 0 や 1.4 秒の TS は同じ判定になる。修正前に大きな
+    開始時刻の TS で枠が出ていたのは、warmup の時刻が開始より前で索引が 1 点しかできず、時刻格子へ
+    退いていたため (その画は開始時刻の分ずれていた)。
+- 共通 seek owner より手前で小さく直せる候補: ストリップの軸の判定で、`mpegts` / `mpegtsraw` / `mpeg`
+  demuxer の `AVIndexEntry` を索引として使わず、時刻格子 (`TimeGrid`) に回す (探索点は keyframe ではないため)。
+  各枠の画は上の着地の問題で次の GOP の画になり得るが、空にはならない。
 - 修正には、各 Input の真の key locator を検証・所有する共通 seek owner と、走査量・応答時間・取消を
   含めた bounded な cold seek 設計が必要。decoder、hover・tile・strip・screenshot、Remote の独立 Input を
   同じ不変条件で扱う。固定秒数の preroll や全ファイル走査を無断で追加しない。
