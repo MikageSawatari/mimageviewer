@@ -9,14 +9,6 @@ use super::DetachedRightDragViewerIdentity;
 use crate::ring_shortcut::RightDragCommand;
 
 #[cfg(windows)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum DetachedWindowHwndDiff {
-    Created(u64),
-    NoChange,
-    Ambiguous(Vec<u64>),
-}
-
-#[cfg(windows)]
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DetachedWindowState {
@@ -564,11 +556,46 @@ pub(crate) struct DetachedTrimBBoxEntry {
 }
 
 #[cfg(windows)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum DetachedNativeHost {
+    #[default]
+    Absent,
+    Backend(eframe::native_window_input::NativeWindowAllocationWitness),
+    #[cfg(test)]
+    Fixture(u64),
+}
+
+#[cfg(windows)]
+impl DetachedNativeHost {
+    fn cached_hwnd(&self) -> u64 {
+        match self {
+            Self::Absent => 0,
+            Self::Backend(owner) => owner
+                .allocation()
+                .windows_hwnd
+                .map(|hwnd| hwnd as u64)
+                .unwrap_or(0),
+            #[cfg(test)]
+            Self::Fixture(hwnd) => *hwnd,
+        }
+    }
+
+    fn is_current(&self) -> bool {
+        match self {
+            Self::Absent => false,
+            Self::Backend(owner) => owner.is_alive(),
+            #[cfg(test)]
+            Self::Fixture(hwnd) => *hwnd != 0,
+        }
+    }
+}
+
+#[cfg(windows)]
 #[derive(Debug, Clone)]
 pub(crate) struct DetachedWindowRuntime {
     pub(crate) window_id: u64,
     pub(crate) state: DetachedWindowState,
-    pub(crate) hwnd: u64,
+    native_host: DetachedNativeHost,
     pub(crate) host_incarnation: u64,
     viewport_binding: Option<super::viewport_retirement::ViewportCommandBinding>,
     pub(crate) placement: Option<crate::detached_window_geometry::PhysicalWindowPlacement>,
@@ -583,11 +610,20 @@ pub(crate) struct DetachedWindowRuntime {
 
 #[cfg(windows)]
 impl DetachedWindowRuntime {
+    /// Current backend allocation only; a retained old Window Arc is not authority.
+    pub(crate) fn hwnd(&self) -> u64 {
+        if self.native_host.is_current() {
+            self.native_host.cached_hwnd()
+        } else {
+            0
+        }
+    }
+
     fn new(window_id: u64, linked: bool) -> Self {
         Self {
             window_id,
             state: DetachedWindowState::Opening,
-            hwnd: 0,
+            native_host: DetachedNativeHost::Absent,
             host_incarnation: 0,
             viewport_binding: None,
             placement: None,
@@ -742,7 +778,7 @@ impl DetachedWindowManager {
 
     pub(super) fn hwnd_raw(&self, window_id: u64) -> Option<u64> {
         self.runtime(window_id)
-            .map(|runtime| runtime.hwnd)
+            .map(|runtime| runtime.hwnd())
             .filter(|hwnd| *hwnd != 0)
     }
 
@@ -750,7 +786,7 @@ impl DetachedWindowManager {
         let runtime = self.runtime(window_id)?;
         Some(match runtime.host_placement {
             HostPlacement::Placed { incarnation, .. }
-                if runtime.hwnd == 0 || incarnation != runtime.host_incarnation =>
+                if runtime.hwnd() == 0 || incarnation != runtime.host_incarnation =>
             {
                 HostPlacement::default()
             }
@@ -946,64 +982,99 @@ impl DetachedWindowManager {
     pub(super) fn host_claim_alive(&self, window_id: u64) -> Option<DetachedHostClaim> {
         let runtime = self.runtime(window_id)?;
         if runtime.state == DetachedWindowState::Closing
-            || runtime.hwnd == 0
+            || runtime.hwnd() == 0
             || runtime.host_incarnation == 0
-            || !self.hwnd_is_alive(runtime.hwnd)
+            || !self.hwnd_is_alive(runtime.hwnd())
         {
             return None;
         }
         Some(DetachedHostClaim {
             lease: DetachedSessionLease { window_id },
             incarnation: runtime.host_incarnation,
-            hwnd: runtime.hwnd,
+            hwnd: runtime.hwnd(),
         })
     }
 
     pub(super) fn host_claim_is_alive(&self, claim: DetachedHostClaim) -> bool {
         self.runtime(claim.lease.window_id).is_some_and(|runtime| {
             runtime.state != DetachedWindowState::Closing
-                && runtime.hwnd == claim.hwnd
+                && runtime.hwnd() == claim.hwnd
                 && runtime.host_incarnation == claim.incarnation
-                && self.hwnd_is_alive(runtime.hwnd)
+                && self.hwnd_is_alive(runtime.hwnd())
         })
     }
 
     pub(super) fn clear_hwnd(&mut self, window_id: u64) -> Option<u64> {
         let runtime = self.runtimes.get_mut(&window_id)?;
-        let hwnd = std::mem::take(&mut runtime.hwnd);
+        let hwnd = runtime.native_host.cached_hwnd();
+        runtime.native_host = DetachedNativeHost::Absent;
         runtime.host_placement = HostPlacement::default();
         runtime.last_geometry_notification = None;
         (hwnd != 0).then_some(hwnd)
     }
 
     pub(super) fn clear_hwnd_if_dead(&mut self, window_id: u64) -> Option<u64> {
-        let hwnd = self.hwnd_raw(window_id)?;
-        if self.hwnd_is_alive(hwnd) {
+        let runtime = self.runtime(window_id)?;
+        let hwnd = runtime.native_host.cached_hwnd();
+        if hwnd == 0 || (runtime.native_host.is_current() && self.hwnd_is_alive(hwnd)) {
             None
         } else {
             self.clear_hwnd(window_id)
         }
     }
 
+    pub(super) fn has_native_allocation(
+        &self,
+        window_id: u64,
+        owner: &eframe::native_window_input::NativeWindowAllocationWitness,
+    ) -> bool {
+        self.runtime(window_id).is_some_and(|runtime|
+            matches!(&runtime.native_host, DetachedNativeHost::Backend(current) if current == owner && current.is_alive()))
+    }
+
+    pub(super) fn set_native_allocation(
+        &mut self,
+        window_id: u64,
+        owner: eframe::native_window_input::NativeWindowAllocationWitness,
+        default_linked: bool,
+    ) -> Option<u64> {
+        self.set_native_host(
+            window_id,
+            DetachedNativeHost::Backend(owner),
+            default_linked,
+        )
+    }
+
+    #[cfg(test)]
     pub(super) fn set_hwnd(
         &mut self,
         window_id: u64,
         hwnd: u64,
         default_linked: bool,
     ) -> Option<u64> {
-        if hwnd == 0 {
+        self.set_native_host(window_id, DetachedNativeHost::Fixture(hwnd), default_linked)
+    }
+
+    fn set_native_host(
+        &mut self,
+        window_id: u64,
+        host: DetachedNativeHost,
+        default_linked: bool,
+    ) -> Option<u64> {
+        if host.cached_hwnd() == 0 {
             return self.clear_hwnd(window_id);
         }
         let needs_new_incarnation = self
             .runtime(window_id)
-            .is_none_or(|runtime| runtime.hwnd != hwnd || runtime.host_incarnation == 0);
+            .is_none_or(|runtime| runtime.native_host != host || runtime.host_incarnation == 0);
         let new_incarnation = needs_new_incarnation.then(|| {
             self.next_host_incarnation = self.next_host_incarnation.wrapping_add(1).max(1);
             self.next_host_incarnation
         });
         let runtime = self.entry_mut(window_id, default_linked);
-        let previous = (runtime.hwnd != 0).then_some(runtime.hwnd);
-        runtime.hwnd = hwnd;
+        let previous =
+            (runtime.native_host.cached_hwnd() != 0).then_some(runtime.native_host.cached_hwnd());
+        runtime.native_host = host;
         if let Some(incarnation) = new_incarnation {
             runtime.last_geometry_notification = None;
             if runtime.host_incarnation != 0 {
@@ -1026,14 +1097,14 @@ impl DetachedWindowManager {
     pub(super) fn registered_hwnds(&self) -> HashSet<u64> {
         self.runtimes
             .values()
-            .map(|runtime| runtime.hwnd)
+            .map(|runtime| runtime.hwnd())
             .filter(|hwnd| *hwnd != 0)
             .collect()
     }
 
     pub(super) fn hwnd_claimed_by_other(&self, window_id: u64, hwnd: u64) -> Option<u64> {
         self.runtimes.iter().find_map(|(&other_id, runtime)| {
-            (other_id != window_id && runtime.hwnd == hwnd).then_some(other_id)
+            (other_id != window_id && runtime.hwnd() == hwnd).then_some(other_id)
         })
     }
 
@@ -1048,7 +1119,7 @@ impl DetachedWindowManager {
             window_id: runtime.window_id,
             from: runtime.state,
             to: new_state,
-            hwnd: runtime.hwnd,
+            hwnd: runtime.hwnd(),
             linked: runtime.linked,
         };
         runtime.state = new_state;
@@ -1432,7 +1503,7 @@ impl DetachedWindowManager {
     pub(super) fn claimed_hwnds(&self) -> Vec<u64> {
         self.runtimes
             .values()
-            .map(|runtime| runtime.hwnd)
+            .map(|runtime| runtime.hwnd())
             .filter(|hwnd| *hwnd != 0)
             .collect()
     }

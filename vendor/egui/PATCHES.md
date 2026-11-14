@@ -1,5 +1,27 @@
 # egui 0.37.0 のローカル変更（段2a-1／2a-2／2a-3）
 
+## §1.767: native入力所有者の正確なpointer取消（2026-11-14）
+
+`Context::cancel_pointer_button_for(ViewportRegistration, PointerButton, Id)` は、
+integrationが継続して所有するsynthetic gestureだけを、通常入力を処理する前の
+input pluginから一度だけ取り消す。呼出側はlogical registrationと押下先widgetの所有を
+保持し、physical takeoverを受ける前にsynthetic所有を手放すこと。backendのnative退役hookから
+Contextへ再入する用途ではない。
+
+一致する既存logical lifetimeの指定button levelだけを終了し、release/clickを生成しない。
+Memoryのclick/drag captureと前passのinteraction snapshotは指定widget一致分だけを除去し、
+通常の`drag_stopped` commitを生成させない。他buttonのlevel、別widgetのcapture、兄弟viewport、
+座標、キー、IMEを保持する。logical lifetimeが消えていればno-opで、新しいviewportを作らない。
+cancelをlayout再passへ再配送すると第1passの後継pressを消すため、呼出側は終端要求を一度で消費する。
+
+`src/context/pointer_cancellation_tests.rs` は短時間click/dragと通常releaseの対照、他buttonと
+別widget captureの保持をheadlessな実widgetで検査する。本体の入力回帰は実`run_ui`の
+`request_discard`、physical takeover、その後のnative退役、同logical/native再生成と
+logical ID再openを区別して検査する。
+最終検証は本crateの `pointer_cancellation|viewport_retirement|input_state` 26件成功、
+本体の指定回帰2,257件成功、引数なしfmt成功。コマンドと中間失敗を含む証跡は
+[依頼50調査書 §4.4](../../docs/depth-parallax-realmachine50-investigation.md#44-c-実装記録2026-11-14独立設計レビュー反映)に記録する。
+
 原本とchecksum・VCSの記録は [upstream-provenance.json](../upstream-provenance.json) を参照。
 段2a-1では0.37.0原本を基準に、旧`vendor/egui`の既存パッチを付け直した。
 段2a-2のIME中断要求の生成・集約修正と段2a-3の非描画退役は末尾の追補に記録する。

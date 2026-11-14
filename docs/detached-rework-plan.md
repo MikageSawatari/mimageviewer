@@ -1455,6 +1455,20 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-14: §1.767 サブPC依頼50 C — native allocation に入力 HWND の正本を集約
+
+設計担当は全 child 版を採用し、**構造的な変更であることに独立設計レビュー (Sol xhigh、2026-11-14) が合意**した（BA-1）。
+Wgpu / Glow の root・immediate / deferred child・再生成・GC・終了を backend 所有 lease へそろえる。
+旧 key subclass・入力 registry・当該 allocation の未配送 native edge / gesture と旧 WindowId 配送対応の撤去後に後継を公開する。
+logical viewport の保持済み RawInput / IME は別の寿命として維持する。App の detached host 採用も backend 正本を参照し、
+rect・窓列挙差分・唯一の未登録窓からの推定と、そのための deferred 生成の直列化を撤去する。
+backend の失効可能な Weak owner を既存 host cache に持たせ、同 HWND 再利用と旧 Window Arc 残存でも寿命を取り違えない。
+既配送 synthetic Primary の終端は egui の対象 button / widget だけを取り消す正規 API へ接続し、通常 click / drag commit や layout 再passへの再配送を作らない。
+仮想デスクトップ同期など入力以外の rect 利用、配置・focus / z-order の計算は対象外。新しい App 状態・待機・retry は足さない。
+A（再 activation）と B（外部 open の前景 owner 移動）は次回で、今回の修正に含めない。
+実装・検証の記録は [依頼50調査書 §4](depth-parallax-realmachine50-investigation.md#4-c--rectによるキーsubclassの誤同定)。
+実装後の独立レビュー (Sol xhigh、2026-11-14) はCスコープ受入可・追加P1/P2なし。同条件回帰2,257件成功と最終fmtを確認した。A/Bの赤4件と製品実機未確認は別の残件として保持する。
+
 ### 2026-11-14: §1.767 サブPC依頼50の原因調査と赤テスト（製品未変更）
 
 正本は [依頼50の調査と修正設計](depth-parallax-realmachine50-investigation.md)。

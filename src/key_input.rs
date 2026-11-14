@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 #[cfg(all(windows, any(test, feature = "test-script")))]
@@ -18,12 +18,11 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_CONTROL, VK_MENU, VK_PROCESSKEY, VK_SHIFT,
 };
-use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_NCDESTROY, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
-const MAIN_KEY_INPUT_SUBCLASS_ID: usize = 0x6D69_6B31; // "mik1"
 const MAX_PENDING_EVENTS: usize = 256;
 const MAX_LOGGED_UNREGISTERED_HWND: usize = 16;
 const MAX_SYNTHETIC_INPUT_ISSUES: usize = 64;
@@ -684,6 +683,34 @@ impl SyntheticPointerTransaction {
             Self::Held { latch, .. } => Some(&latch.owner),
             Self::TerminalFailure { handle, .. } => Some(&handle.owner),
             Self::Idle => None,
+        }
+    }
+
+    fn retire_hwnd(&mut self, hwnd: u64) {
+        if !self
+            .owner()
+            .is_some_and(|owner| owner.identity.hwnd() == hwnd)
+        {
+            return;
+        }
+        // The native allocation is leaving, so no cleanup may be delivered to
+        // a successor's show. Complete only its outstanding waiter and retire
+        // the native gesture; egui's logical viewport/IME state is independent.
+        match std::mem::replace(self, Self::Idle) {
+            Self::Queued(mut step)
+            | Self::Prepared(mut step)
+            | Self::DeliveredAwaitingTail(mut step)
+            | Self::Cancelling(SyntheticPointerCancelPhase::Queued(mut step))
+            | Self::Cancelling(SyntheticPointerCancelPhase::Prepared(mut step))
+            | Self::Cancelling(SyntheticPointerCancelPhase::AwaitingOriginalTail(mut step))
+            | Self::Cancelling(SyntheticPointerCancelPhase::DeliveredCleanupAwaitingTail(
+                mut step,
+            )) => {
+                step.complete(Err(
+                    "synthetic pointer native window allocation retired".into()
+                ));
+            }
+            Self::Idle | Self::Held { .. } | Self::TerminalFailure { .. } => {}
         }
     }
 
@@ -1353,10 +1380,20 @@ impl ReturnKeyState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct InstalledHwnd {
     hwnd_raw: u64,
     viewport: egui::ViewportId,
+    // This allocation stays alive in the backend-owned lease until explicit
+    // retirement. Its address also distinguishes a reused numeric HWND from
+    // callbacks/cleanup belonging to its previous native allocation.
+    subclass_owner: Arc<()>,
+}
+
+impl InstalledHwnd {
+    fn subclass_id(&self) -> usize {
+        Arc::as_ptr(&self.subclass_owner) as usize
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1380,8 +1417,21 @@ impl HwndViewportRegistry {
                 RegisterHwndResult::ConflictingViewport(existing.viewport)
             };
         }
-        self.entries.push(InstalledHwnd { hwnd_raw, viewport });
+        self.entries.push(InstalledHwnd {
+            hwnd_raw,
+            viewport,
+            subclass_owner: Arc::new(()),
+        });
         RegisterHwndResult::Inserted
+    }
+
+    fn registration(&self, hwnd_raw: u64) -> Option<&InstalledHwnd> {
+        self.entries.iter().find(|entry| entry.hwnd_raw == hwnd_raw)
+    }
+
+    fn owns_subclass(&self, hwnd_raw: u64, subclass_id: usize) -> bool {
+        self.registration(hwnd_raw)
+            .is_some_and(|entry| entry.subclass_id() == subclass_id)
     }
 
     fn viewport_for_hwnd(&self, hwnd_raw: u64) -> Option<egui::ViewportId> {
@@ -1413,6 +1463,7 @@ impl HwndViewportRegistry {
         viewports
     }
 
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -1600,6 +1651,12 @@ impl Default for SyntheticTimeline {
 }
 
 impl SyntheticTimeline {
+    fn retire_hwnd(&mut self, hwnd: u64) {
+        self.held.retain(|held| held.target.hwnd != hwnd);
+        #[cfg(all(windows, any(test, feature = "test-script")))]
+        self.pointer.retire_hwnd(hwnd);
+    }
+
     #[cfg(any(test, feature = "test-script"))]
     fn arm(&mut self) {
         *self = Self::default();
@@ -2052,6 +2109,10 @@ struct KeyInputState {
     return_keys: ViewportReturnKeyStates,
     logged_unregistered_hwnds: Vec<u64>,
     synthetic: SyntheticTimeline,
+    // Plugin transports outlive timeline arm/disarm. Keep their native input
+    // retirement ownership here, alongside the HWND registry and edge queues.
+    prepared_frames: Vec<Weak<Mutex<PreparedSyntheticFrame>>>,
+    synthetic_logical_gestures: Vec<SyntheticLogicalGesture>,
     #[cfg(test)]
     test_foreground_hwnd: Option<u64>,
 }
@@ -2075,17 +2136,134 @@ impl KeyInputState {
         self.frame.retain(|edge| edge.source_hwnd != hwnd_raw);
         self.operation_frame
             .retain(|edge| edge.source_hwnd != hwnd_raw);
+        self.synthetic.retire_hwnd(hwnd_raw);
+        self.retire_prepared_hwnd(hwnd_raw, viewport);
+        for gesture in &mut self.synthetic_logical_gestures {
+            if let SyntheticLogicalGesture::Held {
+                source,
+                registration,
+                input,
+            } = *gesture
+                && source.hwnd == hwnd_raw
+            {
+                *gesture = SyntheticLogicalGesture::Releasing {
+                    source,
+                    registration,
+                    input,
+                };
+            }
+        }
         if !self.installed_hwnds.contains_viewport(viewport) {
             self.return_keys.clear_viewport(viewport);
-        }
-        if self.installed_hwnds.is_empty() {
-            self.pending.clear();
-            self.frame.clear();
-            self.operation_frame.clear();
-            self.frame_active_viewports.clear();
-            self.return_keys.clear();
+            self.frame_active_viewports
+                .retain(|active| *active != viewport);
         }
         Some(viewport)
+    }
+
+    fn retire_prepared_hwnd(&mut self, hwnd: u64, viewport: egui::ViewportId) {
+        let final_modifiers = self.synthetic.modifiers().to_egui();
+        self.prepared_frames.retain(|weak| {
+            let Some(prepared) = weak.upgrade() else {
+                return false;
+            };
+            if let Ok(mut frame) = prepared.lock() {
+                frame.batches.retain(|batch| batch.target.hwnd != hwnd);
+                frame
+                    .hold_attributions
+                    .retain(|(target, _)| *target != viewport);
+                frame.final_modifiers = final_modifiers;
+                #[cfg(all(windows, any(test, feature = "test-script")))]
+                if matches!(
+                    &frame.pointer_delivery,
+                    PreparedSyntheticPointerDelivery::Pending(pointer)
+                        | PreparedSyntheticPointerDelivery::Delivered(pointer)
+                        if pointer.step.latch.owner.identity.hwnd() == hwnd
+                ) {
+                    frame.pointer_delivery = PreparedSyntheticPointerDelivery::Absent;
+                }
+            }
+            true
+        });
+    }
+
+    fn record_synthetic_logical_input(
+        &mut self,
+        source: SyntheticRoutingTarget,
+        registration: egui::ViewportRegistration,
+        input: SyntheticLogicalInput,
+        pressed: bool,
+    ) {
+        self.synthetic_logical_gestures.retain(|gesture| {
+            !matches!(gesture, SyntheticLogicalGesture::Held { source: held_source, registration: held_registration, input: held_input }
+                if *held_source == source && *held_registration == registration && held_input.same_slot(input))
+        });
+        if pressed {
+            self.synthetic_logical_gestures
+                .push(SyntheticLogicalGesture::Held {
+                    source,
+                    registration,
+                    input,
+                });
+        }
+    }
+
+    fn take_synthetic_logical_terminations(
+        &mut self,
+        viewport: egui::ViewportId,
+        mut registration_is_live: impl FnMut(egui::ViewportRegistration) -> bool,
+    ) -> Vec<(egui::ViewportRegistration, SyntheticLogicalInput)> {
+        let mut terminations = Vec::new();
+        self.synthetic_logical_gestures.retain(|gesture| {
+            match *gesture {
+                SyntheticLogicalGesture::Releasing {
+                    source,
+                    registration,
+                    input,
+                } => {
+                    if !registration_is_live(registration) {
+                        return false;
+                    }
+                    if source.viewport != viewport {
+                        return true;
+                    }
+                    terminations.push((registration, input));
+                    return false;
+                }
+                _ => {}
+            }
+            true
+        });
+        terminations
+    }
+
+    fn relinquish_synthetic_pointer(&mut self, viewport: egui::ViewportId) {
+        for gesture in &mut self.synthetic_logical_gestures {
+            if let SyntheticLogicalGesture::Held {
+                source,
+                registration,
+                input: input @ SyntheticLogicalInput::Primary { .. },
+            } = *gesture
+                && source.viewport == viewport
+            {
+                *gesture = SyntheticLogicalGesture::Releasing {
+                    source,
+                    registration,
+                    input,
+                };
+            }
+        }
+    }
+
+    fn unregister_subclass(
+        &mut self,
+        hwnd_raw: u64,
+        subclass_id: usize,
+    ) -> Option<egui::ViewportId> {
+        if !self.installed_hwnds.owns_subclass(hwnd_raw, subclass_id) {
+            return None;
+        }
+        self.unregister_hwnd(hwnd_raw)
     }
 
     fn stamp_key_edge(&mut self, mut edge: KeyEdge) -> KeyEdge {
@@ -2278,8 +2456,46 @@ impl From<Option<f64>> for RawInputTimeKey {
 
 #[derive(Clone, Debug)]
 struct SyntheticViewportBatch {
-    viewport: egui::ViewportId,
+    target: SyntheticRoutingTarget,
     events: Vec<egui::Event>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SyntheticLogicalInput {
+    Key {
+        key: egui::Key,
+        physical_key: Option<egui::Key>,
+    },
+    Primary {
+        owner: egui::Id,
+    },
+}
+
+impl SyntheticLogicalInput {
+    fn same_slot(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Key { key: left, .. }, Self::Key { key: right, .. }) => left == right,
+            (Self::Primary { .. }, Self::Primary { .. }) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Only a synthetic Down actually delivered to egui owns a logical release.
+/// Native retirement changes that ownership into a terminal transport, rather
+/// than clearing unrelated physical keys, pointer state, text or IME state.
+#[derive(Clone, Copy, Debug)]
+enum SyntheticLogicalGesture {
+    Held {
+        source: SyntheticRoutingTarget,
+        registration: egui::ViewportRegistration,
+        input: SyntheticLogicalInput,
+    },
+    Releasing {
+        source: SyntheticRoutingTarget,
+        registration: egui::ViewportRegistration,
+        input: SyntheticLogicalInput,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -2311,7 +2527,7 @@ enum PreparedSyntheticPointerDelivery {
 
 #[derive(Default)]
 struct SyntheticInputPlugin {
-    prepared: Option<PreparedSyntheticFrame>,
+    prepared: Option<Arc<Mutex<PreparedSyntheticFrame>>>,
     issues: VecDeque<SyntheticInputIssue>,
     next_frame_nr: u64,
 }
@@ -2327,19 +2543,25 @@ impl SyntheticInputPlugin {
     fn record_undelivered_previous_frame(&mut self) {
         // Clone the immutable one-frame transport before recording issues, because issue
         // recording mutates the plugin queue.
-        let Some(prepared) = self.prepared.clone() else {
+        let Some(prepared) = self
+            .prepared
+            .as_ref()
+            .and_then(|prepared| prepared.lock().ok().map(|frame| frame.clone()))
+        else {
             return;
         };
         let misses: Vec<_> = prepared
             .batches
             .iter()
             .filter(|batch| {
-                batch.viewport != egui::ViewportId::ROOT
+                batch.target.viewport != egui::ViewportId::ROOT
                     && !batch.events.is_empty()
-                    && !prepared.delivered_viewports.contains(&batch.viewport)
+                    && !prepared
+                        .delivered_viewports
+                        .contains(&batch.target.viewport)
             })
             .map(|batch| SyntheticInputIssue::TargetViewportNotRendered {
-                viewport: batch.viewport,
+                viewport: batch.target.viewport,
                 raw_input_time: prepared.raw_input_time,
                 event_count: batch.events.len(),
             })
@@ -2388,11 +2610,11 @@ impl SyntheticInputPlugin {
 
     fn prepare_root(&mut self, input: &egui::RawInput) {
         let time_key = RawInputTimeKey::from(input.time);
-        if self
-            .prepared
-            .as_ref()
-            .is_some_and(|prepared| prepared.time_key == time_key)
-        {
+        if self.prepared.as_ref().is_some_and(|prepared| {
+            prepared
+                .lock()
+                .is_ok_and(|frame| frame.time_key == time_key)
+        }) {
             return;
         }
 
@@ -2443,12 +2665,12 @@ impl SyntheticInputPlugin {
             let egui_event = event.egui_event();
             if let Some(batch) = batches
                 .iter_mut()
-                .find(|batch| batch.viewport == event.target.viewport)
+                .find(|batch| batch.target == event.target)
             {
                 batch.events.push(egui_event);
             } else {
                 batches.push(SyntheticViewportBatch {
-                    viewport: event.target.viewport,
+                    target: event.target,
                     events: vec![egui_event],
                 });
             }
@@ -2456,7 +2678,7 @@ impl SyntheticInputPlugin {
         if let Some(issue) = materialized.issue {
             self.record_issue(issue);
         }
-        self.prepared = Some(PreparedSyntheticFrame {
+        let prepared = Arc::new(Mutex::new(PreparedSyntheticFrame {
             frame_nr,
             time_key,
             raw_input_time: input.time,
@@ -2478,11 +2700,22 @@ impl SyntheticInputPlugin {
                     })
                 })
                 .unwrap_or(PreparedSyntheticPointerDelivery::Absent),
-        });
+        }));
+        if let Ok(mut guard) = state().lock() {
+            guard
+                .prepared_frames
+                .retain(|frame| frame.strong_count() != 0);
+            guard.prepared_frames.push(Arc::downgrade(&prepared));
+        }
+        self.prepared = Some(prepared);
     }
 
     fn inject_prepared(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
-        let Some(prepared) = self.prepared.as_mut() else {
+        let Some(prepared) = self
+            .prepared
+            .as_ref()
+            .and_then(|frame| frame.lock().ok().map(|prepared| prepared.clone()))
+        else {
             return;
         };
         if !prepared.armed {
@@ -2504,7 +2737,7 @@ impl SyntheticInputPlugin {
         let Some(batch) = prepared
             .batches
             .iter()
-            .find(|batch| batch.viewport == input.viewport_id)
+            .find(|batch| batch.target.viewport == input.viewport_id)
         else {
             append_modifiers(&mut input.events, prepared.final_modifiers);
             return;
@@ -2514,6 +2747,29 @@ impl SyntheticInputPlugin {
                 append_modifiers(&mut input.events, *modifiers);
             }
             input.events.push(event.clone());
+        }
+        if let Some(registration) = ctx.viewport_registration(input.viewport_id)
+            && let Ok(mut guard) = state().lock()
+        {
+            for event in &batch.events {
+                if let egui::Event::Key {
+                    key,
+                    physical_key,
+                    pressed,
+                    ..
+                } = event
+                {
+                    guard.record_synthetic_logical_input(
+                        batch.target,
+                        registration,
+                        SyntheticLogicalInput::Key {
+                            key: *key,
+                            physical_key: *physical_key,
+                        },
+                        *pressed,
+                    );
+                }
+            }
         }
         append_modifiers(&mut input.events, prepared.final_modifiers);
         if !prepared.delivered_viewports.contains(&input.viewport_id) {
@@ -2545,8 +2801,52 @@ impl SyntheticInputPlugin {
                     }
                 }
             }
-            prepared.delivered_viewports.push(input.viewport_id);
+            if let Some(mut frame) = self.prepared.as_ref().and_then(|frame| frame.lock().ok()) {
+                frame.delivered_viewports.push(input.viewport_id);
+            }
         }
+    }
+
+    fn inject_logical_releases(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        let modifiers = input.events.iter().fold(
+            ctx.input_for(input.viewport_id, |state| state.modifiers),
+            |current, event| match event {
+                egui::Event::ModifiersChanged(modifiers) => *modifiers,
+                _ => current,
+            },
+        );
+        let terminations = state()
+            .lock()
+            .map(|mut guard| {
+                guard.take_synthetic_logical_terminations(input.viewport_id, |registration| {
+                    ctx.viewport_registration(registration.viewport_id()) == Some(registration)
+                })
+            })
+            .unwrap_or_default();
+        let mut releases = Vec::new();
+        for (registration, termination) in terminations {
+            match termination {
+                SyntheticLogicalInput::Key { key, physical_key } => {
+                    releases.push(egui::Event::Key {
+                        key,
+                        physical_key,
+                        pressed: false,
+                        repeat: false,
+                        modifiers,
+                    })
+                }
+                SyntheticLogicalInput::Primary { owner } => {
+                    ctx.cancel_pointer_button_for(
+                        registration,
+                        egui::PointerButton::Primary,
+                        owner,
+                    );
+                }
+            }
+        }
+        // End the previous synthetic ownership before this allocation's native
+        // input. A new press of the same key/button remains a new press.
+        input.events.splice(0..0, releases);
     }
 
     #[cfg(all(windows, any(test, feature = "test-script")))]
@@ -2563,6 +2863,7 @@ impl SyntheticInputPlugin {
             return;
         }
         let handle = state().lock().ok().and_then(|mut guard| {
+            guard.relinquish_synthetic_pointer(input.viewport_id);
             guard
                 .synthetic
                 .pointer
@@ -2574,15 +2875,16 @@ impl SyntheticInputPlugin {
     }
 
     #[cfg(all(windows, any(test, feature = "test-script")))]
-    fn inject_prepared_pointer(&mut self, input: &mut egui::RawInput) {
-        let Some(pointer) =
-            self.prepared
-                .as_ref()
-                .and_then(|frame| match &frame.pointer_delivery {
-                    PreparedSyntheticPointerDelivery::Pending(pointer) => Some(pointer.clone()),
-                    PreparedSyntheticPointerDelivery::Absent
-                    | PreparedSyntheticPointerDelivery::Delivered(_) => None,
-                })
+    fn inject_prepared_pointer(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        let Some(pointer) = self
+            .prepared
+            .as_ref()
+            .and_then(|frame| frame.lock().ok())
+            .and_then(|frame| match &frame.pointer_delivery {
+                PreparedSyntheticPointerDelivery::Pending(pointer) => Some(pointer.clone()),
+                PreparedSyntheticPointerDelivery::Absent
+                | PreparedSyntheticPointerDelivery::Delivered(_) => None,
+            })
         else {
             return;
         };
@@ -2601,6 +2903,26 @@ impl SyntheticInputPlugin {
                     .identity
                     .matches_backend_witness(witness)
             });
+        // A synthetic gesture acquires an otherwise idle pointer. Without
+        // this ownership boundary a pre-existing physical button would share
+        // egui's single widget capture with the synthetic primary button.
+        if owner_matches
+            && witness_matches
+            && input.time.is_some()
+            && matches!(pointer.step.kind, SyntheticPointerStepKind::Down { .. })
+            && ctx.input_for(input.viewport_id, |input| input.pointer.any_down())
+        {
+            let handle = state().lock().ok().and_then(|mut guard| {
+                guard
+                    .synthetic
+                    .pointer
+                    .fail_physical_input_mixed(input.viewport_id)
+            });
+            if let Some(handle) = handle {
+                self.record_issue(SyntheticInputIssue::PointerPhysicalInputMixed { handle });
+            }
+            return;
+        }
         let rejection = if !owner_matches || !witness_matches {
             Some("prepared pointer did not join the active lexical child show".to_string())
         } else if input.time.is_none() {
@@ -2634,8 +2956,26 @@ impl SyntheticInputPlugin {
             PreparedPointerDeliveryDisposition::Delivered => {}
         }
         input.events.extend(pointer.step.egui_events());
+        if let Some(registration) = ctx.viewport_registration(input.viewport_id)
+            && let Ok(mut guard) = state().lock()
+        {
+            guard.record_synthetic_logical_input(
+                SyntheticRoutingTarget {
+                    hwnd: pointer.step.latch.owner.identity.hwnd(),
+                    viewport: input.viewport_id,
+                },
+                registration,
+                SyntheticLogicalInput::Primary {
+                    owner: pointer.step.latch.widget_id,
+                },
+                matches!(
+                    pointer.step.kind,
+                    SyntheticPointerStepKind::Down { .. } | SyntheticPointerStepKind::Move { .. }
+                ),
+            );
+        }
         crate::test_script::pointer_input::record_delivery_proof(&pointer, input);
-        if let Some(prepared_frame) = self.prepared.as_mut()
+        if let Some(mut prepared_frame) = self.prepared.as_ref().and_then(|frame| frame.lock().ok())
             && matches!(
                 &prepared_frame.pointer_delivery,
                 PreparedSyntheticPointerDelivery::Pending(cached) if cached.same_payload(&pointer)
@@ -2737,9 +3077,10 @@ impl egui::Plugin for SyntheticInputPlugin {
         }
         #[cfg(all(windows, any(test, feature = "test-script")))]
         self.reject_physical_pointer_mix(input);
+        self.inject_logical_releases(ctx, input);
         self.inject_prepared(ctx, input);
         #[cfg(all(windows, any(test, feature = "test-script")))]
-        self.inject_prepared_pointer(input);
+        self.inject_prepared_pointer(ctx, input);
         #[cfg(all(windows, feature = "test-script"))]
         crate::test_script::append_widget_click_events(input);
     }
@@ -3067,6 +3408,7 @@ pub(crate) fn synthetic_hold_observations(ctx: &egui::Context) -> Vec<SyntheticH
             plugin
                 .prepared
                 .as_ref()
+                .and_then(|prepared| prepared.lock().ok())
                 .map(|prepared| (prepared.frame_nr, prepared.armed))
         })
         .flatten()
@@ -3114,9 +3456,10 @@ pub(crate) fn synthetic_frame_hold_id(
             plugin
                 .prepared
                 .as_ref()
+                .and_then(|prepared| prepared.lock().ok())
                 .into_iter()
-                .flat_map(|prepared| prepared.hold_attributions.iter())
-                .filter_map(|(target, hold_id)| (*target == viewport).then_some(*hold_id))
+                .flat_map(|prepared| prepared.hold_attributions.clone())
+                .filter_map(|(target, hold_id)| (target == viewport).then_some(hold_id))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -3367,53 +3710,181 @@ pub fn disarm_synthetic_input() {
     }
 }
 
+#[cfg(test)]
 pub fn install_main_window_subclass(hwnd_raw: u64) -> bool {
     install_window_subclass(hwnd_raw, egui::ViewportId::ROOT, "main")
 }
 
+#[cfg(test)]
 pub fn install_viewport_window_subclass(hwnd_raw: u64, viewport: egui::ViewportId) -> bool {
     install_window_subclass(hwnd_raw, viewport, "viewport")
 }
 
+#[cfg(test)]
 fn install_window_subclass(hwnd_raw: u64, viewport: egui::ViewportId, label: &'static str) -> bool {
-    if hwnd_raw == 0 {
-        return false;
+    match install_window_input(hwnd_raw, viewport) {
+        Ok(_) => true,
+        Err(error) => {
+            crate::logger::log(format!("key-input: {label}: {error}"));
+            false
+        }
     }
-    let registration = match state().lock() {
-        Ok(mut guard) => guard.register_hwnd(hwnd_raw, viewport),
-        Err(_) => return false,
-    };
-    match registration {
-        RegisterHwndResult::AlreadyRegistered => return true,
+}
+
+fn install_window_input(
+    hwnd_raw: u64,
+    viewport: egui::ViewportId,
+) -> Result<Option<InstalledHwnd>, String> {
+    if hwnd_raw == 0 {
+        return Err("cannot install key input on a null HWND".into());
+    }
+    let mut guard = state()
+        .lock()
+        .map_err(|_| "key input state poisoned".to_string())?;
+    match guard.register_hwnd(hwnd_raw, viewport) {
+        RegisterHwndResult::AlreadyRegistered => return Ok(None),
         RegisterHwndResult::ConflictingViewport(existing) => {
-            crate::logger::log(format!(
-                "key-input: HWND registration conflict label={label} hwnd=0x{hwnd_raw:x} \
+            return Err(format!(
+                "HWND registration conflict hwnd=0x{hwnd_raw:x} \
                  existing_viewport={existing:?} requested_viewport={viewport:?}"
             ));
-            return false;
         }
         RegisterHwndResult::Inserted => {}
     }
+    let registration = guard
+        .installed_hwnds
+        .registration(hwnd_raw)
+        .expect("inserted input registration")
+        .clone();
+    drop(guard);
     let hwnd = HWND(hwnd_raw as *mut _);
     let ok = unsafe {
         SetWindowSubclass(
             hwnd,
             Some(main_key_input_subclass_proc),
-            MAIN_KEY_INPUT_SUBCLASS_ID,
+            registration.subclass_id(),
             0,
         )
         .as_bool()
     };
     if !ok {
         if let Ok(mut guard) = state().lock() {
-            guard.unregister_hwnd(hwnd_raw);
+            guard.unregister_subclass(hwnd_raw, registration.subclass_id());
         }
-        crate::logger::log(format!(
-            "key-input: SetWindowSubclass failed label={label} hwnd=0x{hwnd_raw:x} \
+        return Err(format!(
+            "SetWindowSubclass failed hwnd=0x{hwnd_raw:x} \
              viewport={viewport:?}"
         ));
     }
-    ok
+    Ok(Some(registration))
+}
+
+/// The backend owns one of these leases for each native allocation. A lease is
+/// explicitly retired while the old HWND still exists, before publishing its
+/// successor; WM_NCDESTROY is only an additional terminal path.
+enum NativeKeyInputLease {
+    Installed(InstalledHwnd),
+    Retired,
+}
+
+impl NativeKeyInputLease {
+    fn retire_with(&mut self, remove: impl FnOnce(&InstalledHwnd) -> bool) {
+        let Self::Installed(registration) = std::mem::replace(self, Self::Retired) else {
+            return;
+        };
+        let owns_subclass = state().lock().map(|guard| {
+            guard
+                .installed_hwnds
+                .owns_subclass(registration.hwnd_raw, registration.subclass_id())
+        });
+        match owns_subclass {
+            Ok(false) => return, // NCDESTROY already retired this exact allocation.
+            Err(_) => {
+                report_native_window_input_failure(
+                    "key input state poisoned during retirement".into(),
+                );
+                return;
+            }
+            Ok(true) => {}
+        }
+        if !remove(&registration) {
+            report_native_window_input_failure(format!(
+                "RemoveWindowSubclass failed hwnd=0x{:x} viewport={:?}",
+                registration.hwnd_raw, registration.viewport,
+            ));
+        }
+        // Even a rare native removal failure must withdraw the old input
+        // owner. Its exact subclass ID can never publish into a successor.
+        match state().lock() {
+            Ok(mut guard) => {
+                guard.unregister_subclass(registration.hwnd_raw, registration.subclass_id());
+            }
+            Err(_) => report_native_window_input_failure(
+                "key input state poisoned during retirement".into(),
+            ),
+        }
+    }
+}
+
+impl eframe::native_window_input::NativeWindowInputLease for NativeKeyInputLease {
+    fn retire(&mut self) {
+        self.retire_with(|registration| unsafe {
+            RemoveWindowSubclass(
+                HWND(registration.hwnd_raw as *mut _),
+                Some(main_key_input_subclass_proc),
+                registration.subclass_id(),
+            )
+            .as_bool()
+        });
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct NativeKeyInputListener;
+
+impl eframe::native_window_input::NativeWindowInputListener for NativeKeyInputListener {
+    fn install(
+        &self,
+        allocation: eframe::native_window_input::NativeWindowAllocation,
+    ) -> Result<Box<dyn eframe::native_window_input::NativeWindowInputLease>, String> {
+        let result = allocation
+            .windows_hwnd
+            .ok_or_else(|| "native window allocation has no Windows HWND".to_string())
+            .and_then(|hwnd| install_window_input(hwnd as u64, allocation.viewport_id))
+            .and_then(|registration| {
+                registration.ok_or_else(|| {
+                    "native window allocation already has a key input owner".to_string()
+                })
+            });
+        match result {
+            Ok(registration) => Ok(Box::new(NativeKeyInputLease::Installed(registration))),
+            Err(error) => {
+                report_native_window_input_failure(error.clone());
+                Err(error)
+            }
+        }
+    }
+}
+
+fn native_window_input_failures() -> &'static Mutex<Vec<String>> {
+    static FAILURES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn report_native_window_input_failure(error: String) {
+    crate::logger::log(format!("key-input: {error}"));
+    if let Ok(mut failures) = native_window_input_failures().lock() {
+        failures.push(error);
+    }
+}
+
+/// Drain on the App's normal update path into its existing error feedback.
+/// Native backend hooks never enter App or acquire its UI/plugin state.
+pub(crate) fn take_native_window_input_failures() -> Vec<String> {
+    native_window_input_failures()
+        .lock()
+        .map(|mut failures| std::mem::take(&mut *failures))
+        .unwrap_or_default()
 }
 
 pub fn begin_frame() {
@@ -3964,10 +4435,13 @@ pub fn routed_return_key_held(viewport: egui::ViewportId, extended: bool) -> Opt
         .and_then(|guard| guard.routed_return_key_held(viewport, extended))
 }
 
-fn push_edge(hwnd_raw: u64, raw: RawKeyEdge) {
+fn push_edge(hwnd_raw: u64, subclass_id: usize, raw: RawKeyEdge) {
     let Ok(mut guard) = state().lock() else {
         return;
     };
+    if !guard.installed_hwnds.owns_subclass(hwnd_raw, subclass_id) {
+        return;
+    }
     let (edge, should_log_unregistered) = guard.enqueue_raw_edge(hwnd_raw, raw);
     drop(guard);
     if should_log_unregistered {
@@ -4015,14 +4489,16 @@ unsafe extern "system" fn main_key_input_subclass_proc(
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
-    _id: usize,
+    id: usize,
     _ref_data: usize,
 ) -> LRESULT {
     let hwnd_raw = hwnd.0 as u64;
     if let Some(edge) = key_edge_from_message(msg, wparam, lparam) {
-        push_edge(hwnd_raw, edge);
+        push_edge(hwnd_raw, id, edge);
     } else if msg == WM_KILLFOCUS {
-        if let Ok(mut guard) = state().lock() {
+        if let Ok(mut guard) = state().lock()
+            && guard.installed_hwnds.owns_subclass(hwnd_raw, id)
+        {
             // A key-up can be delivered to another HWND after focus moves. Do
             // not let an Enter flavor remain latched in a later frame.
             let viewport = guard
@@ -4034,7 +4510,7 @@ unsafe extern "system" fn main_key_input_subclass_proc(
     } else if msg == WM_NCDESTROY
         && let Ok(mut guard) = state().lock()
     {
-        guard.unregister_hwnd(hwnd_raw);
+        guard.unregister_subclass(hwnd_raw, id);
     }
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }
@@ -4781,6 +5257,662 @@ mod tests {
     }
 
     #[test]
+    fn native_allocation_retirement_precedes_hwnd_reuse_and_preserves_siblings() {
+        let _serial = lock_test_input();
+        for viewport in [
+            egui::ViewportId::ROOT,
+            egui::ViewportId::from_hash_of("native-child"),
+        ] {
+            clear_test_synthetic_input();
+            let sibling = egui::ViewportId::from_hash_of(("native-sibling", viewport));
+            let old = {
+                let mut input = state().lock().unwrap();
+                input.register_hwnd(0x810, viewport);
+                input.register_hwnd(0x820, sibling);
+                input.enqueue_raw_edge(0x810, raw_edge(0x0D, true));
+                input.enqueue_raw_edge(0x820, raw_edge(0x0D, true));
+                input.installed_hwnds.registration(0x810).unwrap().clone()
+            };
+            begin_frame();
+            {
+                let mut input = state().lock().unwrap();
+                input.enqueue_raw_edge(0x810, raw_edge(0x44, true));
+                input.enqueue_raw_edge(0x820, raw_edge(0x26, true));
+            }
+            let mut lease = super::NativeKeyInputLease::Installed(old.clone());
+            let mut removed = 0;
+            lease.retire_with(|registration| {
+                removed += 1;
+                let input = state().lock().unwrap();
+                assert!(
+                    input
+                        .installed_hwnds
+                        .owns_subclass(0x810, registration.subclass_id())
+                );
+                true
+            });
+            assert_eq!(removed, 1);
+            let replacement = {
+                let mut input = state().lock().unwrap();
+                assert_eq!(input.installed_hwnds.viewport_for_hwnd(0x810), None);
+                assert!(input.pending.iter().all(|edge| edge.source_hwnd == 0x820));
+                assert!(input.frame.iter().all(|edge| edge.source_hwnd == 0x820));
+                assert!(
+                    input
+                        .operation_frame
+                        .iter()
+                        .all(|edge| edge.source_hwnd == 0x820)
+                );
+                assert!(!input.return_keys.is_down(viewport, false));
+                assert!(input.return_keys.is_down(sibling, false));
+                assert!(!input.frame_active_viewports.contains(&viewport));
+                assert!(input.frame_active_viewports.contains(&sibling));
+                assert_eq!(
+                    input.register_hwnd(0x810, viewport),
+                    RegisterHwndResult::Inserted
+                );
+                input.enqueue_raw_edge(0x810, raw_edge(0x44, true));
+                input.installed_hwnds.registration(0x810).unwrap().clone()
+            };
+            assert_ne!(replacement.subclass_id(), old.subclass_id());
+            lease.retire_with(|_| panic!("retired lease must not remove its successor"));
+            // A delayed native callback and an old cleanup cannot affect a
+            // successor even when both HWND and logical viewport are reused.
+            super::push_edge(0x810, old.subclass_id(), raw_edge(0x5A, true));
+            {
+                let mut input = state().lock().unwrap();
+                assert_eq!(input.unregister_subclass(0x810, old.subclass_id()), None);
+                assert!(
+                    input
+                        .installed_hwnds
+                        .owns_subclass(0x810, replacement.subclass_id())
+                );
+                assert_eq!(
+                    input
+                        .pending
+                        .iter()
+                        .filter(|edge| edge.source_hwnd == 0x810)
+                        .count(),
+                    1
+                );
+                assert!(input.pending.iter().all(|edge| edge.virtual_key != 0x5A));
+            }
+            super::push_edge(0x810, replacement.subclass_id(), raw_edge(0x27, true));
+            assert!(state().lock().unwrap().pending.iter().any(|edge| {
+                edge.source_hwnd == 0x810
+                    && edge.source_viewport == viewport
+                    && edge.virtual_key == 0x27
+            }));
+        }
+    }
+
+    #[test]
+    fn native_allocation_retirement_withdraws_only_its_synthetic_transports_and_holds() {
+        let _serial = lock_test_input();
+        let viewport = egui::ViewportId::from_hash_of("retired-synthetic-native");
+        let sibling = egui::ViewportId::ROOT;
+        let start = Instant::now();
+        arm_test_synthetic_input(0x830, viewport);
+        enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+            start,
+            SyntheticNavigationKey::Right,
+            SyntheticModifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        ));
+        materialize_test_synthetic_input(start, |_| Some(true));
+        {
+            let mut input = state().lock().unwrap();
+            input.register_hwnd(0x840, sibling);
+            input.test_foreground_hwnd = Some(0x840);
+            input.synthetic.enqueue(SyntheticKeyCommand::down(
+                start,
+                SyntheticNavigationKey::Left,
+                SyntheticModifiers::default(),
+            ));
+        }
+        materialize_test_synthetic_input(start, |_| Some(true));
+        let key = egui::Event::Key {
+            key: egui::Key::ArrowRight,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let prepared = super::Arc::new(super::Mutex::new(super::PreparedSyntheticFrame {
+            frame_nr: 1,
+            time_key: super::RawInputTimeKey::from(Some(1.0)),
+            raw_input_time: Some(1.0),
+            batches: vec![
+                super::SyntheticViewportBatch {
+                    target: super::SyntheticRoutingTarget {
+                        hwnd: 0x830,
+                        viewport,
+                    },
+                    events: vec![key.clone()],
+                },
+                super::SyntheticViewportBatch {
+                    target: super::SyntheticRoutingTarget {
+                        hwnd: 0x840,
+                        viewport: sibling,
+                    },
+                    events: vec![key.clone()],
+                },
+            ],
+            hold_attributions: vec![(viewport, 1), (sibling, 2)],
+            delivered_viewports: Vec::new(),
+            final_modifiers: egui::Modifiers::CTRL,
+            armed: true,
+            #[cfg(windows)]
+            pointer_delivery: super::PreparedSyntheticPointerDelivery::Absent,
+        }));
+        {
+            let mut input = state().lock().unwrap();
+            input.prepared_frames.push(super::Arc::downgrade(&prepared));
+            input.unregister_hwnd(0x830);
+            assert_eq!(input.synthetic.held.len(), 1);
+            assert_eq!(input.synthetic.held[0].target.hwnd, 0x840);
+            assert!(
+                !input
+                    .synthetic
+                    .physical_key_down(PhysicalKeySlot::new(0x27, true))
+            );
+            assert!(
+                input
+                    .synthetic
+                    .physical_key_down(PhysicalKeySlot::new(0x25, true))
+            );
+        }
+        {
+            let frame = prepared.lock().unwrap();
+            assert_eq!(frame.batches.len(), 1);
+            assert_eq!(frame.batches[0].target.hwnd, 0x840);
+            assert_eq!(frame.hold_attributions, vec![(sibling, 2)]);
+            assert_eq!(frame.final_modifiers, egui::Modifiers::NONE);
+        }
+        let mut plugin = SyntheticInputPlugin {
+            prepared: Some(prepared),
+            ..Default::default()
+        };
+        let received = egui::Event::Ime(egui::ImeEvent::Preedit {
+            text: "入力".into(),
+            active_range_chars: None,
+        });
+        let mut replacement = raw_input(viewport, 1.0, true);
+        replacement.events.push(received.clone());
+        plugin.inject_prepared(&egui::Context::default(), &mut replacement);
+        assert_eq!(replacement.events, vec![received]);
+        let mut sibling_input = raw_input(sibling, 1.0, true);
+        plugin.inject_prepared(&egui::Context::default(), &mut sibling_input);
+        assert_eq!(sibling_input.events, vec![key]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_allocation_retirement_completes_only_its_pointer_waiter() {
+        let _serial = lock_test_input();
+        let viewport = egui::ViewportId::from_hash_of("retired-pointer-native");
+        let owner = pointer_owner(viewport, 41, 43);
+        let hwnd = owner.identity.hwnd();
+        let (reply, completion) = super::mpsc::sync_channel(1);
+        let mut step = pointer_step(
+            owner,
+            13,
+            13 << 32,
+            SyntheticPointerStepKind::Down {
+                point: egui::pos2(50.0, 30.0),
+            },
+        );
+        step.completion = Some(reply);
+        let mut input = KeyInputState::default();
+        input.register_hwnd(hwnd, viewport);
+        input.register_hwnd(0x850, egui::ViewportId::ROOT);
+        input.synthetic.pointer = SyntheticPointerTransaction::Prepared(step);
+        input.unregister_hwnd(0x850);
+        assert!(matches!(
+            input.synthetic.pointer,
+            SyntheticPointerTransaction::Prepared(_)
+        ));
+        assert!(matches!(
+            completion.try_recv(),
+            Err(super::mpsc::TryRecvError::Empty)
+        ));
+        input.unregister_hwnd(hwnd);
+        assert!(input.synthetic.pointer.is_idle());
+        assert!(
+            completion
+                .try_recv()
+                .unwrap()
+                .unwrap_err()
+                .contains("allocation retired")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_recreation_releases_delivered_synthetic_keys_and_primary_only() {
+        let _serial = lock_test_input();
+        let ctx = egui::Context::default();
+        crate::ime_focus::install_ime_input_policy(&ctx);
+        ctx.set_embed_viewports(false);
+        let viewport = egui::ViewportId::from_hash_of("retained-synthetic-child");
+        let hwnd = 0x503d;
+        let sibling_hwnd = 0x860;
+        let backend = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let _backend_scope = backend.enter(&ctx, viewport, hwnd);
+        let witness = eframe::miv_test_script_window_witness::active().unwrap();
+        let owner = pointer_owner(viewport, 61, witness.token());
+        assert_eq!(owner.identity.hwnd(), hwnd);
+        let step = pointer_step(
+            owner.clone(),
+            17,
+            17 << 32,
+            SyntheticPointerStepKind::Down {
+                point: egui::pos2(50.0, 30.0),
+            },
+        );
+        let key = |key, pressed| egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let prepared = super::Arc::new(super::Mutex::new(PreparedSyntheticFrame {
+            frame_nr: 1,
+            time_key: super::RawInputTimeKey::from(Some(1.0)),
+            raw_input_time: Some(1.0),
+            batches: vec![
+                super::SyntheticViewportBatch {
+                    target: super::SyntheticRoutingTarget { hwnd, viewport },
+                    events: vec![key(egui::Key::ArrowRight, true)],
+                },
+                super::SyntheticViewportBatch {
+                    target: super::SyntheticRoutingTarget {
+                        hwnd: sibling_hwnd,
+                        viewport: egui::ViewportId::ROOT,
+                    },
+                    events: vec![key(egui::Key::ArrowLeft, true)],
+                },
+            ],
+            hold_attributions: Vec::new(),
+            delivered_viewports: Vec::new(),
+            final_modifiers: egui::Modifiers::NONE,
+            armed: true,
+            pointer_delivery: PreparedSyntheticPointerDelivery::Pending(
+                PreparedSyntheticPointerStep {
+                    raw_frame: 1,
+                    raw_time_bits: 1.0_f64.to_bits(),
+                    step: step.clone(),
+                },
+            ),
+        }));
+        {
+            let mut input = state().lock().unwrap();
+            input.register_hwnd(hwnd, viewport);
+            input.register_hwnd(sibling_hwnd, egui::ViewportId::ROOT);
+            input.prepared_frames.push(super::Arc::downgrade(&prepared));
+            input.synthetic.pointer = SyntheticPointerTransaction::Prepared(step);
+        }
+        let mut plugin = SyntheticInputPlugin {
+            prepared: Some(prepared),
+            ..Default::default()
+        };
+        let mut sibling_input = raw_input(egui::ViewportId::ROOT, 1.0, true);
+        sibling_input.viewports.entry(viewport).or_default();
+        plugin.inject_prepared(&ctx, &mut sibling_input);
+        ctx.run_ui(sibling_input, |ui| {
+            ui.ctx()
+                .show_viewport_deferred(viewport, Default::default(), |_, _| {});
+        })
+        .drop_without_applying_deltas();
+
+        let _show = crate::test_script::pointer_input::enter_show(Some(
+            crate::test_script::pointer_input::ShowOwner {
+                identity: owner.identity,
+                items_generation: owner.items_generation,
+            },
+        ));
+        let mut first = raw_input(viewport, 1.0, true);
+        first.events = vec![
+            key(egui::Key::A, true),
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+        ];
+        plugin.inject_prepared(&ctx, &mut first);
+        plugin.inject_prepared_pointer(&ctx, &mut first);
+        ctx.begin_pass(first);
+        assert!(ctx.input(|input| input.key_down(egui::Key::ArrowRight)));
+        assert!(ctx.input(|input| input.key_down(egui::Key::A)));
+        assert!(ctx.input(|input| input.pointer.primary_down()));
+        assert!(crate::ime_focus::ime_input_active_in_viewport(
+            &ctx, viewport
+        ));
+        ctx.end_pass().drop_without_applying_deltas();
+        {
+            let mut input = state().lock().unwrap();
+            // Transport ownership survives script disarm, independently of the
+            // native allocation and logical egui viewport lifetimes.
+            input.synthetic.disarm();
+            input.unregister_hwnd(hwnd);
+            input.register_hwnd(hwnd, viewport);
+        }
+        let make_replacement = || {
+            let mut input = raw_input(viewport, 1.01, true);
+            input.events = vec![
+                key(egui::Key::B, true),
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "継続".into(),
+                    active_range_chars: None,
+                }),
+            ];
+            input
+        };
+        let mut replacement = make_replacement();
+        plugin.inject_logical_releases(&ctx, &mut replacement);
+        assert!(matches!(
+            replacement.events.as_slice(),
+            [
+                egui::Event::Key {
+                    key: egui::Key::ArrowRight,
+                    pressed: false,
+                    ..
+                },
+                egui::Event::Key {
+                    key: egui::Key::B,
+                    pressed: true,
+                    ..
+                },
+                egui::Event::Ime(_),
+            ]
+        ));
+        ctx.begin_pass(replacement);
+        assert!(!ctx.input(|input| input.key_down(egui::Key::ArrowRight)));
+        assert!(!ctx.input(|input| input.pointer.primary_down()));
+        assert!(ctx.input(|input| input.key_down(egui::Key::A)));
+        assert!(ctx.input(|input| input.key_down(egui::Key::B)));
+        assert!(ctx.input_for(egui::ViewportId::ROOT, |input| {
+            input.key_down(egui::Key::ArrowLeft)
+        }));
+        assert!(crate::ime_focus::ime_input_active_in_viewport(
+            &ctx, viewport
+        ));
+        ctx.end_pass().drop_without_applying_deltas();
+        let mut next = raw_input(viewport, 3.0, true);
+        plugin.inject_logical_releases(&ctx, &mut next);
+        assert!(
+            next.events.is_empty(),
+            "terminal releases last only one input frame"
+        );
+
+        let old_registration = ctx.viewport_registration(viewport).unwrap();
+        let source = super::SyntheticRoutingTarget { hwnd, viewport };
+        let point = egui::pos2(50.0, 30.0);
+        let mut closing = raw_input(viewport, 3.5, true);
+        closing.events = vec![
+            key(egui::Key::ArrowRight, true),
+            egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        ctx.begin_pass(closing);
+        ctx.end_pass().drop_without_applying_deltas();
+        {
+            let mut input = state().lock().unwrap();
+            input.record_synthetic_logical_input(
+                source,
+                old_registration,
+                super::SyntheticLogicalInput::Key {
+                    key: egui::Key::ArrowRight,
+                    physical_key: Some(egui::Key::ArrowRight),
+                },
+                true,
+            );
+            input.record_synthetic_logical_input(
+                source,
+                old_registration,
+                super::SyntheticLogicalInput::Primary {
+                    owner: egui::Id::unique("pointer-track"),
+                },
+                true,
+            );
+            input.unregister_hwnd(hwnd);
+        }
+        // Logical retirement removes the old egui state. Reusing its ID is a
+        // different lifetime, so the former lifetime has nothing to release.
+        ctx.run_ui(raw_input(egui::ViewportId::ROOT, 4.0, true), |ui| {
+            ui.ctx().approve_viewport_retirement(old_registration);
+        })
+        .drop_without_applying_deltas();
+        assert!(ctx.viewport_registration(viewport).is_none());
+        ctx.run_ui(raw_input(egui::ViewportId::ROOT, 5.0, true), |ui| {
+            ui.ctx()
+                .show_viewport_deferred(viewport, Default::default(), |_, _| {});
+        })
+        .drop_without_applying_deltas();
+        assert_ne!(ctx.viewport_registration(viewport), Some(old_registration));
+        state().lock().unwrap().register_hwnd(hwnd, viewport);
+        let mut reopened = raw_input(viewport, 6.0, true);
+        reopened.events = vec![
+            key(egui::Key::ArrowRight, true),
+            egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let new_events = reopened.events.clone();
+        plugin.inject_logical_releases(&ctx, &mut reopened);
+        assert_eq!(
+            reopened.events, new_events,
+            "old logical releases cannot enter a reopened registration"
+        );
+        ctx.begin_pass(reopened);
+        assert!(ctx.input(|input| input.key_down(egui::Key::ArrowRight)));
+        assert!(ctx.input(|input| input.pointer.primary_down()));
+        ctx.end_pass().drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn terminal_synthetic_input_is_consumed_once_before_physical_takeover_and_real_discard() {
+        let _serial = lock_test_input();
+        for retire_before_takeover in [false, true] {
+            clear_test_synthetic_input();
+            let ctx = egui::Context::default();
+            ctx.add_plugin(SyntheticInputPlugin::default());
+            let widget_id = egui::Id::unique("terminal-pointer-widget");
+            let rect = egui::Rect::from_min_max(egui::pos2(10.0, 10.0), egui::pos2(110.0, 60.0));
+            let pointer = |pressed| egui::Event::PointerButton {
+                pos: rect.center(),
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let key = |pressed| egui::Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: Some(egui::Key::ArrowRight),
+                pressed,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let draw =
+                |ui: &mut egui::Ui| ui.interact(rect, widget_id, egui::Sense::click_and_drag());
+            ctx.run_ui(raw_input(egui::ViewportId::ROOT, 0.9, true), |ui| {
+                draw(ui);
+            })
+            .drop_without_applying_deltas();
+            let registration = ctx.viewport_registration(egui::ViewportId::ROOT).unwrap();
+            let mut first = raw_input(egui::ViewportId::ROOT, 1.0, true);
+            first.events = vec![key(true), pointer(true)];
+            ctx.run_ui(first, |ui| {
+                let response = draw(ui);
+                assert!(response.is_pointer_button_down_on());
+            })
+            .drop_without_applying_deltas();
+            let old_subclass = {
+                let mut input = state().lock().unwrap();
+                input.register_hwnd(0x870, egui::ViewportId::ROOT);
+                let source = super::SyntheticRoutingTarget {
+                    hwnd: 0x870,
+                    viewport: egui::ViewportId::ROOT,
+                };
+                input.record_synthetic_logical_input(
+                    source,
+                    registration,
+                    super::SyntheticLogicalInput::Primary { owner: widget_id },
+                    true,
+                );
+                if retire_before_takeover {
+                    input.record_synthetic_logical_input(
+                        source,
+                        registration,
+                        super::SyntheticLogicalInput::Key {
+                            key: egui::Key::ArrowRight,
+                            physical_key: Some(egui::Key::ArrowRight),
+                        },
+                        true,
+                    );
+                }
+                let old = input.installed_hwnds.registration(0x870).unwrap().clone();
+                if retire_before_takeover {
+                    input.unregister_hwnd(0x870);
+                    input.register_hwnd(0x870, egui::ViewportId::ROOT);
+                }
+                old
+            };
+            let mut takeover = raw_input(egui::ViewportId::ROOT, 1.01, true);
+            takeover.events = vec![key(true), pointer(true)];
+            let mut passes = 0;
+            ctx.run_ui(takeover, |ui| {
+                passes += 1;
+                let response = draw(ui);
+                assert!(
+                    !response.clicked(),
+                    "terminal cancellation must not commit a short click"
+                );
+                assert!(
+                    !response.drag_stopped(),
+                    "terminal cancellation must not finish a drag"
+                );
+                assert!(ui.input(|input| input.pointer.primary_down()));
+                assert!(ui.input(|input| input.key_down(egui::Key::ArrowRight)));
+                if passes == 1 {
+                    ui.ctx()
+                        .request_discard("terminal input ownership regression");
+                }
+            })
+            .drop_without_applying_deltas();
+            assert_eq!(passes, 2, "exercise egui's actual RawInput::take replay");
+            {
+                let mut input = state().lock().unwrap();
+                if !retire_before_takeover {
+                    input.unregister_hwnd(0x870);
+                    input.register_hwnd(0x870, egui::ViewportId::ROOT);
+                }
+                assert_eq!(
+                    input.unregister_subclass(0x870, old_subclass.subclass_id()),
+                    None
+                );
+            }
+            ctx.run_ui(raw_input(egui::ViewportId::ROOT, 1.02, true), |ui| {
+                let response = draw(ui);
+                assert!(ui.input(|input| input.pointer.primary_down()));
+                assert!(ui.input(|input| input.key_down(egui::Key::ArrowRight)));
+                assert!(!response.clicked() && !response.drag_stopped());
+            })
+            .drop_without_applying_deltas();
+            let mut released = raw_input(egui::ViewportId::ROOT, 1.03, true);
+            released.events = vec![key(false), pointer(false)];
+            let mut committed = false;
+            ctx.run_ui(released, |ui| {
+                committed |= draw(ui).clicked();
+            })
+            .drop_without_applying_deltas();
+            assert!(
+                committed,
+                "the successor's real physical click still completes normally"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn synthetic_pointer_down_cannot_acquire_a_retained_physical_button() {
+        let _serial = lock_test_input();
+        let ctx = egui::Context::default();
+        let viewport = egui::ViewportId::ROOT;
+        let mut retained = raw_input(viewport, 1.0, true);
+        retained.events.push(egui::Event::PointerButton {
+            pos: egui::pos2(50.0, 30.0),
+            button: egui::PointerButton::Secondary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        ctx.begin_pass(retained);
+        ctx.end_pass().drop_without_applying_deltas();
+        let backend = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let _backend_scope = backend.enter(&ctx, viewport, 0x880);
+        let witness = eframe::miv_test_script_window_witness::active().unwrap();
+        let owner = SyntheticPointerOwner {
+            identity: crate::test_script::TestScriptWindowIdentity::Root {
+                context_serial: 81,
+                hwnd: 0x880,
+                backend_token: witness.token(),
+            },
+            items_generation: 7,
+        };
+        let step = pointer_step(
+            owner.clone(),
+            19,
+            19 << 32,
+            SyntheticPointerStepKind::Down {
+                point: egui::pos2(50.0, 30.0),
+            },
+        );
+        state().lock().unwrap().synthetic.pointer =
+            SyntheticPointerTransaction::Prepared(step.clone());
+        let _show = crate::test_script::pointer_input::enter_show(Some(
+            crate::test_script::pointer_input::ShowOwner {
+                identity: owner.identity,
+                items_generation: owner.items_generation,
+            },
+        ));
+        let mut plugin = SyntheticInputPlugin {
+            prepared: Some(super::Arc::new(super::Mutex::new(PreparedSyntheticFrame {
+                frame_nr: 1,
+                time_key: super::RawInputTimeKey::from(Some(1.01)),
+                raw_input_time: Some(1.01),
+                batches: Vec::new(),
+                hold_attributions: Vec::new(),
+                delivered_viewports: Vec::new(),
+                final_modifiers: egui::Modifiers::NONE,
+                armed: true,
+                pointer_delivery: PreparedSyntheticPointerDelivery::Pending(
+                    PreparedSyntheticPointerStep {
+                        raw_frame: 1,
+                        raw_time_bits: 1.01_f64.to_bits(),
+                        step,
+                    },
+                ),
+            }))),
+            ..Default::default()
+        };
+        let mut input = raw_input(viewport, 1.01, true);
+        plugin.inject_prepared_pointer(&ctx, &mut input);
+        assert!(input.events.is_empty());
+        assert!(matches!(
+            plugin.issues.front(),
+            Some(SyntheticInputIssue::PointerPhysicalInputMixed { .. })
+        ));
+        assert!(ctx.input(|input| input.pointer.secondary_down()));
+        assert!(!ctx.input(|input| input.pointer.primary_down()));
+    }
+
+    #[test]
     fn unregistered_hwnd_edge_is_explicitly_routed_to_root() {
         let mut input = KeyInputState::default();
         let (edge, should_log) = input.enqueue_raw_edge(0x301, raw_edge(0x27, true));
@@ -5194,6 +6326,7 @@ mod tests {
 
     #[test]
     fn synthetic_modifier_changes_precede_their_edges_without_rewriting_received_keys() {
+        let _serial = lock_test_input();
         let ctx = egui::Context::default();
         let key = |modifiers, pressed| egui::Event::Key {
             key: egui::Key::Enter,
@@ -5204,24 +6337,29 @@ mod tests {
         };
         let received = key(egui::Modifiers::ALT, true);
         let mut plugin = SyntheticInputPlugin {
-            prepared: Some(super::PreparedSyntheticFrame {
-                frame_nr: 3,
-                time_key: super::RawInputTimeKey::from(Some(1.0)),
-                raw_input_time: Some(1.0),
-                batches: vec![super::SyntheticViewportBatch {
-                    viewport: egui::ViewportId::ROOT,
-                    events: vec![
-                        key(egui::Modifiers::CTRL, true),
-                        key(egui::Modifiers::NONE, false),
-                    ],
-                }],
-                hold_attributions: Vec::new(),
-                delivered_viewports: Vec::new(),
-                final_modifiers: egui::Modifiers::NONE,
-                armed: true,
-                #[cfg(windows)]
-                pointer_delivery: super::PreparedSyntheticPointerDelivery::Absent,
-            }),
+            prepared: Some(super::Arc::new(super::Mutex::new(
+                super::PreparedSyntheticFrame {
+                    frame_nr: 3,
+                    time_key: super::RawInputTimeKey::from(Some(1.0)),
+                    raw_input_time: Some(1.0),
+                    batches: vec![super::SyntheticViewportBatch {
+                        target: super::SyntheticRoutingTarget {
+                            hwnd: 1,
+                            viewport: egui::ViewportId::ROOT,
+                        },
+                        events: vec![
+                            key(egui::Modifiers::CTRL, true),
+                            key(egui::Modifiers::NONE, false),
+                        ],
+                    }],
+                    hold_attributions: Vec::new(),
+                    delivered_viewports: Vec::new(),
+                    final_modifiers: egui::Modifiers::NONE,
+                    armed: true,
+                    #[cfg(windows)]
+                    pointer_delivery: super::PreparedSyntheticPointerDelivery::Absent,
+                },
+            ))),
             ..Default::default()
         };
         let mut input = egui::RawInput {
@@ -5428,7 +6566,7 @@ mod tests {
         }
 
         let mut plugin = SyntheticInputPlugin {
-            prepared: Some(PreparedSyntheticFrame {
+            prepared: Some(super::Arc::new(super::Mutex::new(PreparedSyntheticFrame {
                 frame_nr: 3,
                 time_key: super::RawInputTimeKey::from(Some(1.0)),
                 raw_input_time: Some(1.0),
@@ -5438,7 +6576,7 @@ mod tests {
                 final_modifiers: egui::Modifiers::NONE,
                 armed: true,
                 pointer_delivery: PreparedSyntheticPointerDelivery::Pending(prepared),
-            }),
+            }))),
             ..Default::default()
         };
         let context = egui::Context::default();
@@ -5454,7 +6592,7 @@ mod tests {
             },
         ));
         let mut input = raw_input(viewport, 1.005, true);
-        plugin.inject_prepared_pointer(&mut input);
+        plugin.inject_prepared_pointer(&context, &mut input);
 
         assert!(input.events.is_empty());
         assert!(plugin.issues.is_empty());

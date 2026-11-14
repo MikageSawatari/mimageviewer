@@ -631,7 +631,8 @@ GPU 情報・ドライバー・段階・エラー行・試行履歴と条件付�
 | detached open request state (app.rs) | 通常画像のscan、ZIP/PDF enumerate、protected PDFのpassword request・session password・保存予約、明示leafの`Required` targetをbundle内に保持する。グリッドのFolderはmain-owned worker scanで「候補」を先に分類し、画像本と確定したcompleted scanだけをdetached contextへ移譲する。混在Folderはsession/runtimeを作らず通常main navigationへ戻す。password dialogはowner bundleをmountして再開する。空／error／必須target消失でviewportが未生成でも共通terminal closeがsession finishとwindow runtime削除を行う。実フォルダscan errorは空一覧と区別し、catalogへ適用しない |
 | `ViewerSession` (`app/viewer_session.rs`) | 退避中 bundle の表示先・同期 stamp・独立 detached 状態・window ID を一括所有する。現在表示中の session は当面 `App` の既存フィールドへマウントし、`swap_with_mounted` で5項目を同時交換する |
 | `DetachedWindowManager` (`app/detached_window_manager.rs`) | 窓ごとの HWND / placement / 状態遷移 (`Opening/Active/Parked/ParkedLive/Resuming/Closing`) と activation watcher を一元管理する。passive window は window collection / frozen 表示上の役割であり、runtime state 名ではない。`ViewerSession` の意味状態とは分離する |
-| `dwm_transitions.rs` | DWM トランジション抑止 + UI スレッド窓 snapshot (HWND を生成イベントの before/after 差分で同定 = rect 一致捕捉の全廃、BA-1 根治) + 仮想デスクトップ移動 |
+| `dwm_transitions.rs` | DWM トランジション抑止・窓状態の観測・仮想デスクトップ移動。入力 HWND の所有は決めない |
+| `eframe::native_window_input` / `key_input.rs` | backend の native allocation が root / child の HWND と viewport の唯一の正本。backend 所有 lease が key subclass・入力対応・未配送 native 入力を同期退役し、旧 WindowId の配送対応を撤去してから後継を公開する。App の detached host はこの対応を参照し、rect や列挙差分では同定しない |
 | `app/native_video.rs` | F12 host migration / source-swap / 動画→音声モード enter/exit など、native 動画 presenter と detached 窓の接続層 |
 
 ★固定の `snapshot`、評価 filter の一時解除 anchor、Ctrl+S / Ctrl+G 由来の synthetic
@@ -641,9 +642,13 @@ context は空から始める。snapshot が `items` を直接交換するとき
 `thumbnails` / `image_metas` と Details の order / prewarm / metadata pending も同じ generation
 境界で交換・失効・再構築する。
 
-BA-1 の不変条件は geometry 非依存の HWND 所有である。detached host 登録は registry 化済みだが、
-キー入力 subclass に rect 選択が残る具体的な仕様違反は
-[v2.8.1 detached 監査](review-v2.8.1/s2-detached.md) に記録されており、後続リワークへ引き継ぐ。
+BA-1 の不変条件は geometry 非依存の HWND 所有である。依頼50 Cでは、
+[v2.8.1 detached 監査](review-v2.8.1/s2-detached.md) で残っていた入力用 rect 選択も撤去する。
+Wgpu / Glow の生成・再生成・GC・終了を同じ native allocation lease へ接続し、
+logical viewport の RawInput / IME の保持とは寿命を分ける。immediate 生成の hook は
+App に再入せず共有入力 owner だけを変更する。仮想デスクトップ同期など入力以外の rect 利用は残る。
+App の host cache は backend lease の撤去で失効する Weak owner を参照し、同じ HWND 数値を再利用した別 allocation を区別する。
+既に egui に渡した synthetic Primary は通常入力境界で対象 button / widget の所有だけを一度取り消し、通常の click / drag 完了を発生させない。
 
 ### 補正 / 編集 / AI
 

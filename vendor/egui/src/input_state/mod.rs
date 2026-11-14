@@ -1133,6 +1133,28 @@ impl Default for PointerState {
 }
 
 impl PointerState {
+    /// Withdraw an owned button without creating a release or click.
+    pub(crate) fn cancel_button(&mut self, button: PointerButton) {
+        self.down[button as usize] = false;
+        self.pointer_events.retain(|event| match event {
+            PointerEvent::Pressed {
+                button: event_button,
+                ..
+            }
+            | PointerEvent::Released {
+                button: event_button,
+                ..
+            } => *event_button != button,
+            PointerEvent::Moved(_) => true,
+        });
+        if !self.any_down() {
+            self.press_origin = None;
+            self.press_start_time = None;
+            self.has_moved_too_much_for_a_click = false;
+            self.started_decidedly_dragging = false;
+        }
+    }
+
     #[must_use]
     pub(crate) fn begin_pass(mut self, time: f64, new: &RawInput, options: InputOptions) -> Self {
         let was_decidedly_dragging = self.is_decidedly_dragging();

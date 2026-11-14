@@ -36,7 +36,7 @@ fn realmachine50_equal_rect_replacement_keeps_keys_on_owning_hwnd() {
             if visible { let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) }; }
             window
         };
-        let main = create(false);
+        let _main = create(false);
         let first = create(true);
         let second = create(true);
         let mut rect = RECT::default();
@@ -47,21 +47,26 @@ fn realmachine50_equal_rect_replacement_keeps_keys_on_owning_hwnd() {
                    (same.left, same.top, same.right, same.bottom));
         assert!(unsafe { IsWindowVisible(first.0) }.as_bool());
         assert!(unsafe { IsWindowVisible(second.0) }.as_bool());
-        // Enumeration order is deliberately not part of the test contract:
-        // whichever equal rectangle geometry selects is the retiring source.
-        let chosen = crate::dwm_transitions::find_visible_thread_window_matching_rect(main.0, rect).unwrap();
-        let replacement = if chosen == first.0 { second.0 } else { first.0 };
-        assert!(chosen == first.0 || chosen == second.0);
+        // Native allocation ownership is explicit even while both windows have equal rects.
+        let chosen = first.0;
+        let replacement = second.0;
         let old_viewport = egui::ViewportId::from_hash_of("realmachine50-old-media");
         let new_viewport = egui::ViewportId::from_hash_of("realmachine50-new-still");
-        assert!(crate::key_input::install_viewport_window_subclass(chosen.0 as u64, old_viewport));
-        let mut app = crate::app::setup_app_for_test();
-        app.main_hwnd = Some(main.0.0 as isize);
-        app.install_key_input_subclass_for_viewport_rect(
-            new_viewport,
-            egui::Rect::from_min_max(egui::pos2(rect.left as f32, rect.top as f32),
-                egui::pos2(rect.right as f32, rect.bottom as f32)), 1.,
-        );
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        for viewport in [old_viewport, new_viewport] {
+            ctx.show_viewport_deferred(viewport, Default::default(), |_, _| {});
+        }
+        use eframe::native_window_input::*;
+        set_native_window_input_listener(&ctx, std::sync::Arc::new(crate::key_input::NativeKeyInputListener)).unwrap();
+        let register = |hwnd: HWND, viewport_id| register_native_window_allocation(&ctx, NativeWindowAllocation {
+            viewport_id, registration: ctx.viewport_registration(viewport_id).unwrap(),
+            window_id: NativeWindowId::from(hwnd.0 as u64), windows_hwnd: Some(hwnd.0 as isize),
+        });
+        let mut old = register(chosen, old_viewport);
+        let _new = register(replacement, new_viewport);
+        let old_owner = native_window_allocation_witness(&ctx, old_viewport).unwrap();
+        let new_owner = native_window_allocation_witness(&ctx, new_viewport).unwrap();
         unsafe { SendMessageW(replacement, WM_KEYDOWN, Some(WPARAM(0x44)), Some(LPARAM(1 | (0x20 << 16)))) };
         unsafe { SendMessageW(chosen, WM_KEYDOWN, Some(WPARAM(0x26)), Some(LPARAM(1 | (0x48 << 16)))) };
         crate::key_input::begin_frame();
@@ -73,6 +78,21 @@ fn realmachine50_equal_rect_replacement_keeps_keys_on_owning_hwnd() {
         assert!(edges.iter().any(|edge| edge.source_hwnd == replacement.0 as u64
             && edge.source_viewport == new_viewport && edge.virtual_key == 0x44 && edge.pressed),
             "replacement viewport must receive D from its own HWND while an older HWND has the same rectangle; edges={edges:?}");
+        assert!(edges.iter().all(|edge| edge.source_hwnd == replacement.0 as u64));
+        assert!(old_edges.iter().all(|edge| edge.source_hwnd == chosen.0 as u64));
+        old.retire();
+        assert!(!old_owner.is_alive());
+        assert!(new_owner.is_alive());
+        // Retiring the allocation withdraws input while the old HWND still
+        // exists, and its later lease Drop cannot erase the successor's edge.
+        unsafe { SendMessageW(chosen, WM_KEYDOWN, Some(WPARAM(0x45)), Some(LPARAM(1 | (0x12 << 16)))) };
+        unsafe { SendMessageW(replacement, WM_KEYDOWN, Some(WPARAM(0x26)), Some(LPARAM(1 | (0x48 << 16)))) };
+        drop(old);
+        crate::key_input::begin_frame();
+        assert!(crate::key_input::native_operation_key_edges(old_viewport).is_empty());
+        let successor_edges = crate::key_input::native_operation_key_edges(new_viewport);
+        assert!(successor_edges.iter().any(|edge| edge.virtual_key == 0x26 && edge.pressed
+            && edge.source_hwnd == replacement.0 as u64));
     }).join().unwrap();
 }
 

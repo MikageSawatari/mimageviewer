@@ -48,6 +48,10 @@ impl App {
             .begin(_ctx.cumulative_frame_nr_for(egui::ViewportId::ROOT));
         #[cfg(test)]
         super::egui037_connection_tests::observe("update_begin", self, _ctx);
+        #[cfg(windows)]
+        for _ in crate::key_input::take_native_window_input_failures() {
+            self.show_feedback_toast("ウィンドウの入力を開始できませんでした".to_owned());
+        }
         self.acknowledge_tray_resident_media_wake();
         crate::record_ui_heartbeat_tick();
         // Remote service runs in logic. Display continuation stays at the old
@@ -277,7 +281,6 @@ impl App {
                     // フックで拾い、進む/戻るボタンを Ctrl+↑/↓ と等価に扱う。詳細は
                     // main.rs の `install_mouse_nav_hook` のコメント参照。
                     crate::install_mouse_nav_hook();
-                    crate::key_input::install_main_window_subclass(hwnd_raw as u64);
                     self.effetune.set_main_hwnd(hwnd_raw as u64);
                     #[cfg(windows)]
                     self.dsp_bridge.set_main_hwnd(hwnd_raw as u64);

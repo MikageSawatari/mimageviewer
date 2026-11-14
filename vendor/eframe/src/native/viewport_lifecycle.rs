@@ -279,6 +279,12 @@ pub(super) mod viewport_retirement_tests {
     pub trait Adapter: ChildCloseBackend + Sized {
         fn new(ctx: &Context) -> Self;
         fn sync(&mut self, ctx: &Context, outputs: &OrderedViewportIdMap<ViewportOutput>);
+        fn prepare_immediate(
+            &mut self,
+            ctx: &Context,
+            ids: egui::ViewportIdPair,
+            builder: egui::ViewportBuilder,
+        );
         fn registration_for(&self, id: ViewportId) -> Option<ViewportRegistration>;
         fn set_close(&mut self, id: ViewportId);
         fn pending(&self, id: ViewportId) -> Vec<egui::Event>;
@@ -287,6 +293,157 @@ pub(super) mod viewport_retirement_tests {
         fn replace_stale_native(&mut self, ctx: &Context, id: ViewportId);
         fn seed_stale_native(&mut self, ctx: &Context, id: ViewportId) -> egui::TextureId;
         fn native_input(&self, id: ViewportId) -> Vec<egui::Event>;
+        fn allocation_sources(
+            &self,
+        ) -> Vec<(
+            crate::native_window_input::NativeWindowId,
+            ViewportId,
+            egui::ViewportClass,
+        )>;
+        fn shutdown_native_input(&mut self);
+    }
+
+    type AllocationCalls = std::sync::Arc<egui::mutex::Mutex<Vec<(bool, ViewportId)>>>;
+
+    fn observe_native_input(ctx: &Context) -> AllocationCalls {
+        use crate::native_window_input::{
+            NativeWindowAllocation, NativeWindowInputLease, NativeWindowInputListener,
+            set_native_window_input_listener,
+        };
+        struct Listener(AllocationCalls);
+        struct Lease(AllocationCalls, ViewportId);
+        impl NativeWindowInputListener for Listener {
+            fn install(
+                &self,
+                allocation: NativeWindowAllocation,
+            ) -> Result<Box<dyn NativeWindowInputLease>, String> {
+                self.0.lock().push((true, allocation.viewport_id));
+                Ok(Box::new(Lease(self.0.clone(), allocation.viewport_id)))
+            }
+        }
+        impl NativeWindowInputLease for Lease {
+            fn retire(&mut self) {
+                self.0.lock().push((false, self.1));
+            }
+        }
+        let calls = AllocationCalls::default();
+        set_native_window_input_listener(ctx, std::sync::Arc::new(Listener(calls.clone())))
+            .unwrap();
+        calls
+    }
+
+    fn assert_native_allocations_retired<A: Adapter>(ctx: &Context, adapter: &A) {
+        use crate::native_window_input::native_window_allocation;
+        let (child, descendant, sibling) = ids();
+        let sources = adapter.allocation_sources();
+        for id in [child, descendant] {
+            assert!(native_window_allocation(ctx, id).is_none());
+            assert!(!sources.iter().any(|(_, owner, _)| *owner == id));
+        }
+        for id in [ViewportId::ROOT, sibling] {
+            let allocation = native_window_allocation(ctx, id).unwrap();
+            assert!(
+                sources
+                    .iter()
+                    .any(|(source, owner, _)| { *owner == id && *source == allocation.window_id })
+            );
+        }
+    }
+
+    fn cached_native_witnesses(
+        ctx: &Context,
+    ) -> Vec<crate::native_window_input::NativeWindowAllocationWitness> {
+        let (child, descendant, sibling) = ids();
+        [ViewportId::ROOT, child, descendant, sibling]
+            .into_iter()
+            .map(|id| {
+                crate::native_window_input::native_window_allocation_witness(ctx, id).unwrap()
+            })
+            .collect()
+    }
+
+    fn assert_cached_native_children_retired(
+        witnesses: &[crate::native_window_input::NativeWindowAllocationWitness],
+    ) {
+        let (_, _, sibling) = ids();
+        for witness in witnesses {
+            let id = witness.allocation().viewport_id;
+            assert_eq!(witness.is_alive(), id == ViewportId::ROOT || id == sibling);
+        }
+    }
+
+    fn assert_native_shutdown<A: Adapter>(ctx: &Context, adapter: &mut A, calls: &AllocationCalls) {
+        use crate::native_window_input::native_window_allocation;
+        adapter.shutdown_native_input();
+        adapter.shutdown_native_input();
+        assert!(adapter.allocation_sources().is_empty());
+        let (child, descendant, sibling) = ids();
+        for id in [ViewportId::ROOT, child, descendant, sibling] {
+            assert!(native_window_allocation(ctx, id).is_none());
+            assert_eq!(
+                calls
+                    .lock()
+                    .iter()
+                    .filter(|(install, owner)| { *install && *owner == id })
+                    .count(),
+                1
+            );
+            assert_eq!(
+                calls
+                    .lock()
+                    .iter()
+                    .filter(|(install, owner)| { !*install && *owner == id })
+                    .count(),
+                1
+            );
+        }
+        // Ending input does not destroy the logical surviving viewport owners.
+        assert!(adapter.registration_for(ViewportId::ROOT).is_some());
+        assert!(adapter.registration_for(sibling).is_some());
+    }
+
+    /// Existing adapters/Close dispatcher/GC and shutdown boundaries, with
+    /// synthetic native sources and real allocation/input leases.
+    pub fn native_window_input_lifecycle<A: Adapter + 'static>() {
+        for terminal_close in [false, true] {
+            let (integration, mut adapter) = fixture::<A>();
+            let ctx = &integration.egui_ctx;
+            let calls = observe_native_input(ctx);
+            let witnesses = cached_native_witnesses(ctx);
+            let (child, _, _) = ids();
+            let sources = adapter.allocation_sources();
+            assert_eq!(sources.len(), 4);
+            assert!(sources.iter().any(|(_, id, class)| {
+                *id == ViewportId::ROOT && *class == egui::ViewportClass::Root
+            }));
+            assert!(
+                sources.iter().any(|(_, id, class)| {
+                    *id == child && *class == egui::ViewportClass::Deferred
+                })
+            );
+            if terminal_close {
+                let mut app = HookApp {
+                    binding: ctx.viewport_registration(child),
+                    response: crate::ViewportCloseResponse::Close,
+                    calls: 0,
+                };
+                adapter.set_close(child);
+                dispatch_child_close_requests(ctx, &mut app, &mut adapter);
+                assert_eq!(app.calls, 1);
+            } else {
+                let _ = ctx.retire_viewport(child);
+                adapter.gc(ctx);
+            }
+            assert_native_allocations_retired(ctx, &adapter);
+            assert_cached_native_children_retired(&witnesses);
+            assert_native_shutdown(ctx, &mut adapter, &calls);
+            assert!(witnesses.iter().all(|witness| !witness.is_alive()));
+            drop(adapter);
+            assert_eq!(calls.lock().len(), 8, "Drop must not retire input twice");
+        }
+        // This pre-existing driver enters a real immediate callback and accepts
+        // its child output before the outer completed-output retirement.
+        immediate_nested_with_fixture::<A>(true);
     }
 
     pub struct HeadlessDisplay;
@@ -689,16 +846,57 @@ pub(super) mod viewport_retirement_tests {
     }
 
     pub fn immediate_nested<A: Adapter + 'static>() {
+        immediate_nested_with_fixture::<A>(false);
+    }
+
+    fn immediate_nested_with_fixture<A: Adapter + 'static>(fresh_immediate: bool) {
         use std::{cell::RefCell, rc::Rc};
-        let (integration, adapter) = fixture::<A>();
+        let (integration, adapter) = if fresh_immediate {
+            let integration = headless_integration();
+            let ctx = &integration.egui_ctx;
+            let mut adapter = A::new(ctx);
+            let output = ctx.run_ui(Default::default(), |ui| {
+                declare(ui.ctx(), ids().2);
+            });
+            deliver(ctx, &mut adapter, output);
+            assert!(adapter.registration_for(ids().0).is_none());
+            (integration, adapter)
+        } else {
+            fixture::<A>()
+        };
         let ctx = &integration.egui_ctx;
+        let calls = observe_native_input(ctx);
         let adapter = Rc::new(RefCell::new(adapter));
         let (child, descendant, sibling) = ids();
         let retained = adapter.clone();
         Context::set_immediate_viewport_renderer(move |ctx, mut immediate| {
-            let output = ctx.run_ui(input(immediate.ids.this, false), |ui| {
-                (immediate.viewport_ui_cb)(ui)
-            });
+            retained
+                .borrow_mut()
+                .prepare_immediate(ctx, immediate.ids, immediate.builder.clone());
+            let output =
+                ctx.run_ui(input(immediate.ids.this, false), |ui| {
+                    // This is the native prepare -> UI callback boundary. Output
+                    // reconciliation follows the callback and may update class.
+                    assert!(
+                        retained
+                            .borrow()
+                            .allocation_sources()
+                            .iter()
+                            .any(|(_, id, class)| {
+                                *id == child && *class == egui::ViewportClass::Immediate
+                            })
+                    );
+                    let witness =
+                        crate::native_window_input::native_window_allocation_witness(ctx, child)
+                            .unwrap();
+                    assert!(witness.is_alive());
+                    assert!(retained.borrow().allocation_sources().iter().any(
+                        |(source, id, _)| {
+                            *id == child && *source == witness.allocation().window_id
+                        }
+                    ));
+                    (immediate.viewport_ui_cb)(ui)
+                });
             assert!(!output.viewport_output.values().any(|vp| {
                 vp.commands
                     .iter()
@@ -724,11 +922,29 @@ pub(super) mod viewport_retirement_tests {
                 });
             assert!(ui.ctx().viewport_registration(child).is_some());
             assert!(adapter.borrow().registration_for(child).is_some());
+            let witness =
+                crate::native_window_input::native_window_allocation_witness(ui.ctx(), child)
+                    .unwrap();
+            assert!(witness.is_alive());
+            assert!(
+                adapter
+                    .borrow()
+                    .allocation_sources()
+                    .iter()
+                    .any(|(source, id, _)| {
+                        *id == child && *source == witness.allocation().window_id
+                    })
+            );
         });
+        let witnesses = cached_native_witnesses(ctx);
         deliver(ctx, &mut *adapter.borrow_mut(), output);
         assert!(adapter.borrow().registration_for(child).is_none());
         assert!(adapter.borrow().registration_for(descendant).is_none());
         assert!(adapter.borrow().registration_for(sibling).is_some());
+        assert_native_allocations_retired(ctx, &*adapter.borrow());
+        assert_cached_native_children_retired(&witnesses);
+        assert_native_shutdown(ctx, &mut *adapter.borrow_mut(), &calls);
+        assert!(witnesses.iter().all(|witness| !witness.is_alive()));
     }
 
     pub fn discard_immediate_reopen_replaces_native<A: Adapter + 'static>() {

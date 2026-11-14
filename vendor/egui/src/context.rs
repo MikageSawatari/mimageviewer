@@ -5245,6 +5245,51 @@ impl Context {
         self.write(|w| reader(&w.viewport().interact_widgets))
     }
 
+    /// Cancel an integration-owned pointer button before processing new input.
+    ///
+    /// Unlike an ordinary release this never completes a click or drag. The
+    /// caller must still own the continuing gesture for `button` and `owner`;
+    /// it must relinquish that ownership before accepting physical takeover.
+    /// Call once from an input plugin, outside Context accessors, before the
+    /// new raw input is processed. Do not replay cancellation after new input
+    /// has acquired the button. Other buttons, widgets, keys and IME are kept.
+    /// A retired logical registration is a no-op and is never recreated.
+    pub fn cancel_pointer_button_for(
+        &self,
+        registration: crate::ViewportRegistration,
+        button: crate::PointerButton,
+        owner: Id,
+    ) {
+        self.write(|ctx| {
+            let Some(viewport) = ctx.viewports.get_mut(&registration.id) else {
+                return;
+            };
+            if viewport.lifetime != registration.lifetime {
+                return;
+            }
+            viewport.input.pointer.cancel_button(button);
+            for captured in [
+                &mut viewport.interact_widgets.clicked,
+                &mut viewport.interact_widgets.long_touched,
+                &mut viewport.interact_widgets.drag_started,
+                &mut viewport.interact_widgets.dragged,
+                &mut viewport.interact_widgets.drag_stopped,
+            ] {
+                if *captured == Some(owner) {
+                    *captured = None;
+                }
+            }
+            if let Some(interaction) = ctx.memory.interactions.get_mut(&registration.id) {
+                if interaction.potential_click_id == Some(owner) {
+                    interaction.potential_click_id = None;
+                }
+                if interaction.potential_drag_id == Some(owner) {
+                    interaction.potential_drag_id = None;
+                }
+            }
+        });
+    }
+
     /// The widget currently being dragged, if any.
     ///
     /// For widgets that sense both clicks and drags, this will
@@ -5523,6 +5568,9 @@ fn flatten_labelled_by(nodes: &mut [(accesskit::NodeId, accesskit::Node)]) {
 
 #[cfg(test)]
 mod ime_interrupt_tests;
+
+#[cfg(test)]
+mod pointer_cancellation_tests;
 
 #[cfg(test)]
 mod modal_capture_response_tests {

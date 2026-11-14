@@ -232,9 +232,132 @@ HWNDの唯一の正本を、backendが所有するviewportの生成／再生成�
 `ViewportRegistration` はlifetimeとViewportIdだけ、builder / event-loop hookは生成前でHWNDを渡さない。
 `eframe::miv_test_script_window_witness` には正確なchildのhandleがあるがtest-script用のfeatureで、
 製品の所有契約として利用しない。既存公開APIだけで全childの正確なHWNDを取得する経路は見つからなかった。
-通常Fullscreenまでの正規hookはeframe側の変更を要する。**今回のvendor変更禁止を越えて実装しない。**
+通常Fullscreenまでの正規hookはeframe側の変更を要する。**調査時点ではvendor変更禁止のため実装していない。**
 次段の設計検収で、backend hookを実装範囲へ含めるか、まずdetachedの既存正本への共用に限定するかを明示決定する。
 後者の場合、通常Fullscreenのrect経路が残ることを完了扱いに混ぜない。
+
+### 4.4 C 実装記録（2026-11-14、独立設計レビュー反映）
+
+設計担当の決定により、git管理下の `vendor/eframe` の変更を含む全 child 版を採用した。
+独立設計レビュー (Sol xhigh) の P2 を反映し、撤去対象を subclass / 入力 registry / backend WindowId 配送対応 / allocation の未配送 native edge・gesture の4つとする。
+
+`eframe::native_window_input` は Context の共有 registry と、backend が一つだけ所有する非 Clone の `NativeWindowAllocationLease` を持つ。
+実 winit window の生成時に `(ViewportId, ViewportRegistration, WindowId, HWND)` を公開し、
+AppCreator で一度接続する `NativeWindowInputListener` に ROOT の既存 allocation も一度通知する。
+listener は mutex 外で入力 owner に lease を導入し、App / plugin を再入しない。
+Wgpu の ROOT `init_run_state` と child `initialize_window`、Glow の ROOT 初期化と child を接続する。
+immediate / deferred は両 backend の同じ native 生成点を通り、再生成・GC・suspend・終了も明示退役へ接続する。
+生成が `initialize_window` だけを通るという前提は Wgpu ROOT に当てはまらず、別の ROOT 生成点も接続した。
+独立実装レビューで、descriptor の `(registration, WindowId, HWND)` はすべて再利用され得るため、
+値だけでは App の host cache の寿命を表せない点も確認した。backend lease だけが strong を持つ
+Weak の `NativeWindowAllocationWitness` を query から参照し、明示退役開始時に同期失効する。
+runtime の旧 HWND フィールドを `Absent / Backend(owner)`（test fixture は試験専用）へ置換し、
+失効した host は `raw / alive / host_claim / placed` の既存境界で使えなくする。
+同じ HWND 数値での再生成も、新しい owner の採用で既存 clear→set / host incarnation 更新を通す。
+App に新しい flag / pending を足さず、配置・focus の計算や保存形式は変えない。
+
+退役は successor の公開前に、backend が allocation lease を take → input lease が exact subclass を外す →
+その owner の HWND ↔ viewport 対応と未配送 native edge / synthetic transport・gesture を終端 →
+旧 WindowId の `viewport_from_window` を撤去（Glow は逆対応も撤去）→ 旧 native window / State を置換する。
+Drop は同じ lease の冪等な最終手段で、`WM_NCDESTROY` や最後の `Arc<Window>` の解放を待たない。
+RawInput / IME の retain は logical viewport の所有として従来どおり先に捕捉する。
+既に egui に渡した synthetic Down だけは、入力 owner の終端を次の通常入力境界で一度消費する。
+キーは正確な Up、Primary は操作を確定しない取消で終える。通常 Up は短時間の再生成で clicked / drag_stopped を
+作り得るため、egui 側の所有者を指定した最小 cancel API に接続する（表示 consumer の guard は足さない）。
+同じ logical registration の native 再生成では解放し、logical registration 自体が消滅した場合は resource も消えたものとして撤去する。
+同じ ViewportId の新しい閲覧へ旧終端を持ち越さず、通常の physical held / IME / 兄弟入力は保持する。
+layout の discard 再passでは元 RawInput のイベントが再配送されないため、旧終端も再適用しない。
+
+`register_detached_window_hwnd_after_show` / `adopt_deferred_detached_window_hwnd_after_callback` は backend query を参照する。
+watcher の観測 HWND もその viewport の正本と照合するだけで、候補を新しい正本にはしない。
+入力用 rect 登録入口・before/after 差分・unclaimed 採用と、曖昧性回避のための「未確認 deferred は1窓/フレーム」を撤去した。
+仮想デスクトップ同期・配置・raise 等の **入力以外の rect 利用は残す**。完了範囲は **入力 HWND 同定の rect 依存を解消**。
+入力導入失敗はログと入力 owner の通知 queue → 既存 toast で通知し、その allocation の導入を終える。
+物理 window の query は事実として維持するが、再導入・rect fallback・次 frame の retry はしない。
+
+旧 geometry 候補分類の単体試験は、正規 backend factory の所有 lease から App の実採用を駆動する試験へ置き換える。
+C の元の赤テストは同 rect の2つの実 test HWND に backend factory / listener を導入する入口へ変更し、
+旧 HWND の↑と新 HWND のDがそれぞれ自分の viewport へ届く要求を維持する。
+実 event loop / GPU を起動しない backend 試験は、共通 factory と両 backend の実 recreate helper / source lookup / State を検査する。
+既存の両 backend headless lifecycle adapter に同じ正規 lease を載せ、実 GC・terminal Close dispatcher・
+immediate callback 後の退役・終了用入力 helper についても query / source map / 一度だけの入力退役を検査する。
+実 native 生成の root / child / immediate / deferred 到達はソース照合で、OS / GPU による全 lifecycle の実行証明とは区別する。
+
+A / B の4件の赤テストはこの回の対象外である。
+
+Cargo の検証はすべて `powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local\miv-locks\run-heavy.ps1 -Owner "codex/767-rm50-c" -WorkDir G:\home\mimageviewer-767s2 -Command "<command>"` を経由し、直列で実施した。共有の全件ロック中は待機し、書込不可の警告後はスクリプト指定の低優先度・6 build jobsで継続した。
+
+- 本体焦点: `cargo nextest run -p mimageviewer --lib -E 'test(/key_input|realmachine50_equal_rect|detached_backend_hwnd|watcher.*repair|late_post_show_hwnd|parked_live_hwnd_recreation|detached_placement/)' --no-fail-fast --test-threads 6`
+  — **80 / 80 成功、exit 0** (`target/rm50-c-focused-final.log`)。
+- egui: `cargo nextest run --manifest-path vendor/egui/Cargo.toml --lib -E 'test(/pointer_cancellation|viewport_retirement|input_state/)' --no-fail-fast`
+  — **26 / 26 成功、exit 0** (`target/rm50-c-egui-final.log`、初回も26成功)。
+- Wgpu: `cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features default_fonts,wgpu --lib -E 'test(/native_window_input|viewport_input|viewport_retirement|child_close/)' --no-fail-fast`
+  — **27 / 27 成功、exit 0** (`target/rm50-c-eframe-wgpu-final.log`、egui取消追補後の最終結果)。
+- Glow: `cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features default_fonts,glow --lib -E 'test(/native_window_input|viewport_input|viewport_retirement|child_close/)' --no-fail-fast`
+  — **28 / 28 成功、exit 0** (`target/rm50-c-eframe-glow.log`)。
+- 本体check: `cargo check -p mimageviewer --bin mimageviewer-core` — **exit 0** (`target/rm50-c-core-check-final.log`)。
+- UI文字列: `python scripts/check_ui_glyphs.py` — 危険な glyph 0、exit 0。
+- 本体回帰: `cargo nextest run -p mimageviewer --lib -E 'test(/key_input|native_focus|detached|multiwindow|viewport|fullscreen/) & not test(/realmachine50_/)' --no-fail-fast --test-threads 6`
+  — **2,257 件中 2,256 成功・1失敗、exit 100** (`target/rm50-c-regression.log`)。
+  失敗は `app::search_nav_entry_inventory_tests::search_nav_inventory_container_all_independent_key_inputs`。
+  未変更の `src/app/search_nav_book_tests.rs:498`、collection fixture の `create_collection` 応答の
+  `recv_timeout(5s)` が Timeout を返した。焦点80件では同じ試験が成功している。
+  単独コマンド `cargo nextest run -p mimageviewer --lib -E 'test(=app::search_nav_entry_inventory_tests::search_nav_inventory_container_all_independent_key_inputs)' --no-fail-fast --test-threads 1`
+  は **1 / 1 成功、exit 0** (`target/rm50-c-regression-isolated.log`)。
+  ソース・fixture の待ち時間は変更していない。広い実行時の Timeout の原因は未特定で、負荷と断定しない。
+  **整形後に同じfilter・6並列で再実行し、2,257 / 2,257 成功、exit 0**
+  (`target/rm50-c-regression-same-conditions.log`, run `e3929d7a-7cfa-4193-b5e1-ec470e15bbce`)。
+  単独成功との合算ではなく、この2,257件runを最終の指定回帰成功とする。初回Timeoutは同条件再実行でも再現しなかった。
+- 依頼50: `cargo nextest run -p mimageviewer --lib -E 'test(/realmachine50_/)' --no-fail-fast`
+  — **5件中 C 1成功、対象外の A/B 4失敗、exit 100** (`target/rm50-c-realmachine50.log`)。
+  Aはflat/depthのpause後再activation、Bはmodal有無の外部openの旧前景owner退役の各2件で、期待・ignoreを変更していない。
+
+途中の失敗と修正も残す。初稿の焦点 nextest は consumer enum の Drop と move の競合 E0509 で0件実行・exit 101、
+core check は旧 RawInput.modifiers フィールド参照 E0609 で exit 101。
+backend Wgpu 初回は27件中25成功・2失敗・exit 100で、headless immediate driver が実 prepare を省いていた点を直した。
+本体焦点 v2 は旧配置 fixture 7箇所の HWND → witness の型移行漏れ E0308 で0件実行・exit 101。
+v3 は80件中79成功・1失敗・exit 100で、watcher の passive 採用の期待を変換時に Opening にしてしまった点を、
+元の Parked へ戻した（製品コードの変更なし、既存期待の維持）。最終焦点80件は上記のとおり成功した。
+最後のCargoコマンドは引数なし `cargo fmt` — **exit 0** (`target/rm50-c-fmt-final.log`)。
+最終の同条件回帰とfmtは、同じrun-heavy配下の `powershell -NoProfile -ExecutionPolicy Bypass -File target/rm50-c-final-gate.ps1`
+で直列実行した（外側のログ `target/rm50-c-final-gate.log`、exit 0）。
+`git diff --check` — **exit 0**（CRLF変換の警告のみ）。最終UI glyph検査も危険0・exit 0。
+独立実装レビュー (Sol xhigh、2026-11-14) は最新の2,257件run、最終fmt、整形後差分、初回失敗との分離を確認し、
+**Cスコープ受入可・追加P1/P2なし・記録不一致なし**と判定した。
+
+変更ファイル:
+
+- 本体: `src/lib.rs`, `src/key_input.rs`, `src/app.rs`, `src/app/update_phases.rs`,
+  `src/app/detached_window_manager.rs`, `src/app/detached_placement.rs`, `src/ui_fullscreen.rs`。
+- 本体テスト: `src/app/tests.rs`, `src/app/detached_media_exchange_tests.rs`,
+  `src/ui_fullscreen/native_focus_tests.rs`。既存の配置試験も正規 backend factory の lease を保持して駆動する。
+- eframe: `vendor/eframe/src/lib.rs`, `vendor/eframe/src/native_window_input.rs`,
+  `vendor/eframe/src/native/wgpu_integration.rs`, `vendor/eframe/src/native/glow_integration.rs`,
+  `vendor/eframe/src/native/viewport_lifecycle.rs`, `vendor/eframe/PATCHES.md`。
+- egui: `vendor/egui/src/context.rs`, `vendor/egui/src/input_state/mod.rs`,
+  `vendor/egui/src/context/pointer_cancellation_tests.rs`, `vendor/egui/PATCHES.md`。
+- 文書: 本書、`docs/detached-rework-plan.md` §11、`docs/architecture-overview.md`。
+
+実装中の独立レビュー (Sol xhigh) は、host cache の allocation 寿命と、synthetic Primary の
+通常 Up / layout 再passでの再終端を P2 とした。Weak owner と runtime enum、正規 cancel と一度だけの
+終端へ修正した差分の再レビューでは追加 P1/P2 なし。最終検証・整形後も上記の受入可を確認した。
+
+未確認: 製品は起動していない。実event loop / GPUを伴うROOT・childの生成、実機focus / z-order、
+F11・仮想デスクトップ・OS API失敗注入は今回実行していない。両backendの実生成点への接続はソース照合、
+実HWNDのキー配送と撤去は空regionの非対話fixture、GC / Close / immediate / deferred / shutdownは共有の実helperを通すheadless試験で確認した。
+描画・レイアウトは変更していないため `ui_snapshot` は実行していない。広い回帰時のDB fixture Timeoutの原因は未特定で、
+単独成功を合算して指定回帰をgreenとは扱わない。独立レビューの照合を受け、整形後に同じ2,257件filter・6並列を再実行し、
+全件成功を確認した。初回非ゼロと単独成功の履歴も別証跡として保持する。初回Timeout自体の原因は未特定である。
+`test-lib-full.ps1` / `test-full.ps1` / `build-dev.ps1`、製品起動、commit / pushは実施していない。
+
+追加のwinit境界監査（ソース照合、製品変更なし）: lock中の確認では Windows の `WindowId` はHWND由来で、
+atomicな一意IDではない（winit 0.30.13 `platform_impl/windows/mod.rs:101`, `window.rs:645–646`）。
+`Window::drop` は専用messageをPostして破棄する（`window.rs:1107–1114`, `event_loop.rs:2445–2447`）ため、
+通常の同一handler内recreateでは後継生成時に旧HWNDがまだ存在する。Glowのcurrent描画窓はArcも保持する。
+この通常経路で旧buffered eventが同値WindowIdの後継Stateへ渡る確定例は確認されなかった。
+一方、winitのreentrant queueはWindowId付きEventのFIFOで、一般のallocation tag / purgeは持たない
+（`event_loop/runner.rs:208–253`）。任意のnested native pumpと数値再利用の組合せまで一般保証したとは扱わず、
+実機での配送確認は未実施として残す。通常経路で成立する証拠のない組合せのため、新しい待機・世代機構やwinit改変は追加しない。
 
 ## 5. 退行の確認と補足2件
 

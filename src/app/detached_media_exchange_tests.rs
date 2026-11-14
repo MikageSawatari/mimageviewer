@@ -574,14 +574,14 @@ fn run_maintenance_independence_after_live_fork(reactivate: bool) {
     assert_eq!(
         (
             current_d.state,
-            current_d.hwnd,
+            current_d.hwnd(),
             current_d.host_incarnation,
             current_d.linked,
             current_d.placement
         ),
         (
             d_runtime.state,
-            d_runtime.hwnd,
+            d_runtime.hwnd(),
             d_runtime.host_incarnation,
             d_runtime.linked,
             d_runtime.placement
@@ -1154,14 +1154,14 @@ fn run_late_manual_case(
     assert_eq!(
         (
             runtime.state,
-            runtime.hwnd,
+            runtime.hwnd(),
             runtime.host_incarnation,
             runtime.linked,
             runtime.placement
         ),
         (
             d_runtime.state,
-            d_runtime.hwnd,
+            d_runtime.hwnd(),
             d_runtime.host_incarnation,
             d_runtime.linked,
             d_runtime.placement

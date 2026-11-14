@@ -105,7 +105,7 @@ impl App {
             .runtime(window_id)
             .is_some_and(|runtime| {
                 matches!(runtime.host_placement, HostPlacement::Placed { incarnation, .. }
-                if incarnation == runtime.host_incarnation && runtime.hwnd != 0)
+                if incarnation == runtime.host_incarnation && runtime.hwnd() != 0)
             })
     }
 
@@ -829,6 +829,22 @@ mod tests {
     use super::super::tests::phase_c_support::setup_app;
     use super::*;
 
+    fn backend_host(
+        ctx: &egui::Context,
+        owner: &mut Option<eframe::native_window_input::NativeWindowAllocationLease>,
+        hwnd: u64,
+    ) -> eframe::native_window_input::NativeWindowAllocationWitness {
+        use eframe::native_window_input::native_window_allocation_witness;
+        let viewport = App::detached_image_window_viewport_id(12);
+        if let Some(witness) = native_window_allocation_witness(ctx, viewport) {
+            assert_eq!(witness.allocation().windows_hwnd, Some(hwnd as isize));
+            return witness;
+        }
+        *owner = None;
+        *owner = Some(super::super::tests::backend_window_for_test(ctx, 12, hwnd));
+        native_window_allocation_witness(ctx, viewport).unwrap()
+    }
+
     fn context(viewport_id: egui::ViewportId) -> egui::Context {
         let ctx = egui::Context::default();
         ctx.set_embed_viewports(false);
@@ -856,6 +872,7 @@ mod tests {
 
     #[test]
     fn hidden_maximized_seed_during_native_transition_waits_for_visible_commit() {
+        let mut native_owner = None;
         let mut app = setup_app();
         app.window_visible = true;
         let mut target = app.default_detached_viewer_window_placement();
@@ -876,8 +893,13 @@ mod tests {
         let ctx = context(id);
         with_host_geometry_for_test(12, target.outer, false, || {
             with_host_visibility_for_test(12, false, || {
-                app.detached_window_hwnd_set_for_reusable_lease(&ctx, 12, 0x1234, "hidden_native")
-                    .unwrap();
+                app.detached_window_hwnd_set_for_reusable_lease(
+                    &ctx,
+                    12,
+                    backend_host(&ctx, &mut native_owner, 0x1234),
+                    "hidden_native",
+                )
+                .unwrap();
                 assert!(app.detached_window_host_is_placed(12));
                 assert_eq!(app.detached_window_runtime_placement(12), Some(target));
             });
@@ -1224,6 +1246,7 @@ mod tests {
 
     #[test]
     fn initial_callback_mode_survives_post_show_adoption_and_recreation() {
+        let mut native_owner = None;
         for recreate in [false, true] {
             let mut app = setup_app();
             app.window_visible = true;
@@ -1246,11 +1269,12 @@ mod tests {
             assert_eq!(app.detached_window_manager.pending_mode(12), Some(true));
             with_host_geometry_for_test(12, target.outer, false, || {
                 with_host_visibility_for_test(12, false, || {
-                    app.set_detached_window_host_for_test(12, 0x5678);
+                    app.detached_window_manager
+                        .set_live_hwnds_for_test([0x5678]);
                     app.detached_window_hwnd_set_for_reusable_lease(
                         &ctx,
                         12,
-                        0x5678,
+                        backend_host(&ctx, &mut native_owner, 0x5678),
                         "post_show_adopt",
                     )
                     .unwrap();
@@ -1534,6 +1558,7 @@ mod tests {
 
     #[test]
     fn registration_places_before_releasing_combined_show_and_focus() {
+        let mut native_owner = None;
         let mut app = setup_app();
         app.transition_detached_window_state(12, DetachedWindowState::Opening, "test");
         let target = app.default_detached_viewer_window_placement();
@@ -1555,8 +1580,13 @@ mod tests {
         initial.left += 50;
         initial.right += 50;
         with_host_geometry_for_test(12, initial, false, || {
-            app.detached_window_hwnd_set_for_reusable_lease(&ctx, 12, 0x1234, "test_created")
-                .unwrap();
+            app.detached_window_hwnd_set_for_reusable_lease(
+                &ctx,
+                12,
+                backend_host(&ctx, &mut native_owner, 0x1234),
+                "test_created",
+            )
+            .unwrap();
             assert!(app.detached_window_host_is_placed(12));
             assert_eq!(host_geometry_for_test(12), Some((target.outer, false)));
         });
@@ -1577,6 +1607,7 @@ mod tests {
 
     #[test]
     fn unplaced_observation_cannot_replace_seed_and_same_host_is_not_reapplied() {
+        let mut native_owner = None;
         let mut app = setup_app();
         let target = app.default_detached_viewer_window_placement();
         app.set_detached_window_runtime_placement(12, target, "test");
@@ -1585,14 +1616,22 @@ mod tests {
         moved.left += 80;
         moved.right += 80;
         let ctx = context(App::detached_image_window_viewport_id(12));
+        let owner = backend_host(&ctx, &mut native_owner, 0x1234);
+        app.detached_window_manager
+            .set_native_allocation(12, owner, false);
         with_host_geometry_for_test(12, moved, false, || {
             app.observe_detached_window_host_placement(12, "unplaced");
             assert_eq!(app.detached_window_runtime_placement(12), Some(target));
             app.apply_detached_window_host_placement(&ctx, 12);
             assert_eq!(host_geometry_for_test(12), Some((target.outer, false)));
             set_host_geometry_for_test(12, moved, false);
-            app.detached_window_hwnd_set_for_reusable_lease(&ctx, 12, 0x1234, "same_incarnation")
-                .unwrap();
+            app.detached_window_hwnd_set_for_reusable_lease(
+                &ctx,
+                12,
+                backend_host(&ctx, &mut native_owner, 0x1234),
+                "same_incarnation",
+            )
+            .unwrap();
             assert_eq!(host_geometry_for_test(12), Some((moved, false)));
             app.observe_detached_window_host_placement(12, "placed");
             assert_eq!(
@@ -1600,8 +1639,13 @@ mod tests {
                 moved
             );
             app.detached_window_hwnd_clear(12);
-            app.detached_window_hwnd_set_for_reusable_lease(&ctx, 12, 0x1234, "new_incarnation")
-                .unwrap();
+            app.detached_window_hwnd_set_for_reusable_lease(
+                &ctx,
+                12,
+                backend_host(&ctx, &mut native_owner, 0x1234),
+                "new_incarnation",
+            )
+            .unwrap();
             assert!(app.detached_window_host_is_placed(12));
         });
         ctx.end_pass().drop_without_applying_deltas();
@@ -1803,6 +1847,7 @@ mod tests {
 
     #[test]
     fn replacement_host_during_f11_wait_receives_the_captured_target_on_registration() {
+        let mut native_owner = None;
         let mut app = setup_app();
         app.window_visible = true;
         app.set_detached_window_binding_for_test(Some(12));
@@ -1819,8 +1864,13 @@ mod tests {
         app.set_detached_window_host_for_test(12, 0x1234);
         let ctx = context(App::detached_image_window_viewport_id(12));
         with_host_geometry_for_test(12, restore.outer, false, || {
-            app.detached_window_hwnd_set_for_reusable_lease(&ctx, 12, 0x1234, "f11_replacement")
-                .unwrap();
+            app.detached_window_hwnd_set_for_reusable_lease(
+                &ctx,
+                12,
+                backend_host(&ctx, &mut native_owner, 0x1234),
+                "f11_replacement",
+            )
+            .unwrap();
             assert_eq!(host_geometry_for_test(12), Some((target, false)));
             assert!(app.detached_window_host_is_placed(12));
         });
@@ -1836,6 +1886,7 @@ mod tests {
 
     #[test]
     fn f11_step_tray_restore_uses_applied_mode_in_both_directions() {
+        let mut native_owner = None;
         use super::super::{
             DetachedViewerBorderlessTransition as Transition,
             DetachedViewerBorderlessTransitionPhase as Phase,
@@ -1898,11 +1949,12 @@ mod tests {
                     assert_eq!(host_geometry_for_test(12), Some((initial, false)));
                     if replace_host {
                         app.detached_window_hwnd_clear(12);
-                        app.set_detached_window_host_for_test(12, 0x5678);
+                        app.detached_window_manager
+                            .set_live_hwnds_for_test([0x5678]);
                         app.detached_window_hwnd_set_for_reusable_lease(
                             &ctx,
                             12,
-                            0x5678,
+                            backend_host(&ctx, &mut native_owner, 0x5678),
                             "tray_rehost",
                         )
                         .unwrap();

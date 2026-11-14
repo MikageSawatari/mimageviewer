@@ -3,6 +3,27 @@ use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, Pre
 use super::*;
 use crate::ui_dialogs::context_menu::DeleteTarget;
 
+#[cfg(windows)]
+pub(super) fn backend_window_for_test(
+    ctx: &egui::Context,
+    window_id: u64,
+    hwnd: u64,
+) -> eframe::native_window_input::NativeWindowAllocationLease {
+    use eframe::native_window_input::*;
+    let viewport_id = App::detached_image_window_viewport_id(window_id);
+    ctx.set_embed_viewports(false);
+    ctx.show_viewport_deferred(viewport_id, Default::default(), |_, _| {});
+    register_native_window_allocation(
+        ctx,
+        NativeWindowAllocation {
+            viewport_id,
+            registration: ctx.viewport_registration(viewport_id).unwrap(),
+            window_id: NativeWindowId::from(hwnd),
+            windows_hwnd: Some(hwnd as isize),
+        },
+    )
+}
+
 pub(crate) fn assert_cache_book_cover_only_worker_catalog_contract(
     app: &mut App,
     directory: &Path,
@@ -6823,17 +6844,11 @@ fn late_post_show_hwnd_registration_cannot_recreate_a_terminal_lease() {
     let old_viewport_h = App::detached_image_window_viewport_id(OLD_WINDOW_H);
     app.set_detached_window_binding_for_test(Some(OLD_WINDOW_H));
     app.begin_active_detached_session(OLD_WINDOW_H, DetachedSource::Video);
+    let _backend = backend_window_for_test(&ctx, OLD_WINDOW_H, LATE_HWND);
 
     app.begin_active_detached_session_close("test_late_registration_closing");
-    assert!(
-        app.detached_window_hwnd_snapshot_before_show(
-            OLD_WINDOW_H,
-            "test_late_registration_closing",
-            old_viewport_h,
-        )
-        .is_none(),
-        "pre-show registration must reject a Closing lease"
-    );
+    app.register_detached_window_hwnd_after_show(&ctx, OLD_WINDOW_H, "test_late", old_viewport_h);
+    assert_eq!(app.detached_window_hwnd_get_raw(OLD_WINDOW_H), None);
     app.adopt_deferred_detached_window_hwnd_after_callback(&ctx, OLD_WINDOW_H, old_viewport_h);
     assert_eq!(
         app.detached_window_state(OLD_WINDOW_H),
@@ -6844,7 +6859,8 @@ fn late_post_show_hwnd_registration_cannot_recreate_a_terminal_lease() {
         app.detached_window_hwnd_set_for_reusable_lease(
             &ctx,
             OLD_WINDOW_H,
-            LATE_HWND,
+            eframe::native_window_input::native_window_allocation_witness(&ctx, old_viewport_h)
+                .unwrap(),
             "test_late_registration_closing",
         )
         .is_err(),
@@ -6854,15 +6870,8 @@ fn late_post_show_hwnd_registration_cannot_recreate_a_terminal_lease() {
 
     app.finish_active_detached_session_close("test_late_registration_removed");
     assert!(app.detached_window_manager.runtime(OLD_WINDOW_H).is_none());
-    assert!(
-        app.detached_window_hwnd_snapshot_before_show(
-            OLD_WINDOW_H,
-            "test_late_registration_removed",
-            old_viewport_h,
-        )
-        .is_none(),
-        "a stale pre-show path must not recreate a removed lease"
-    );
+    app.register_detached_window_hwnd_after_show(&ctx, OLD_WINDOW_H, "test_late", old_viewport_h);
+    assert_eq!(app.detached_window_hwnd_get_raw(OLD_WINDOW_H), None);
     app.adopt_deferred_detached_window_hwnd_after_callback(&ctx, OLD_WINDOW_H, old_viewport_h);
     assert!(
         app.detached_window_manager.runtime(OLD_WINDOW_H).is_none(),
@@ -6872,7 +6881,8 @@ fn late_post_show_hwnd_registration_cannot_recreate_a_terminal_lease() {
         app.detached_window_hwnd_set_for_reusable_lease(
             &ctx,
             OLD_WINDOW_H,
-            LATE_HWND,
+            eframe::native_window_input::native_window_allocation_witness(&ctx, old_viewport_h)
+                .unwrap(),
             "test_late_registration_removed",
         )
         .is_err(),
@@ -69947,28 +69957,6 @@ mod still_window_mode_key_tests {
         .expect("the deferred reopen owner must stay mounted");
     }
 
-    fn thread_window_entry(
-        hwnd_raw: u64,
-        is_main: bool,
-        class_name: &str,
-    ) -> crate::dwm_transitions::ThreadWindowSnapshotEntry {
-        crate::dwm_transitions::ThreadWindowSnapshotEntry {
-            hwnd_raw,
-            is_main,
-            visible: true,
-            iconic: false,
-            rect_ok: true,
-            rect: windows::Win32::Foundation::RECT {
-                left: 0,
-                top: 0,
-                right: 800,
-                bottom: 600,
-            },
-            class_name: class_name.to_string(),
-            title: String::new(),
-        }
-    }
-
     #[test]
     fn grid_updater_preserves_fullscreen_right_drag_state_owned_by_other_surface() {
         let mut app = setup_app();
@@ -70967,49 +70955,6 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn detached_hwnd_diff_accepts_single_created_egui_window() {
-        let before = vec![thread_window_entry(0x10, true, "Window Class")];
-        let after = vec![
-            thread_window_entry(0x10, true, "Window Class"),
-            thread_window_entry(0x20, false, "Window Class"),
-        ];
-
-        assert_eq!(
-            App::select_detached_created_hwnd(&before, &after),
-            DetachedWindowHwndDiff::Created(0x20)
-        );
-    }
-
-    #[test]
-    fn detached_hwnd_diff_retries_on_no_change_or_ambiguous_created_windows() {
-        let before = vec![thread_window_entry(0x10, true, "Window Class")];
-        let no_change = before.clone();
-        assert_eq!(
-            App::select_detached_created_hwnd(&before, &no_change),
-            DetachedWindowHwndDiff::NoChange
-        );
-
-        let ambiguous = vec![
-            thread_window_entry(0x10, true, "Window Class"),
-            thread_window_entry(0x20, false, "Window Class"),
-            thread_window_entry(0x30, false, "Window Class"),
-        ];
-        assert_eq!(
-            App::select_detached_created_hwnd(&before, &ambiguous),
-            DetachedWindowHwndDiff::Ambiguous(vec![0x20, 0x30])
-        );
-
-        let wrong_class = vec![
-            thread_window_entry(0x10, true, "Window Class"),
-            thread_window_entry(0x40, false, "Other Class"),
-        ];
-        assert_eq!(
-            App::select_detached_created_hwnd(&before, &wrong_class),
-            DetachedWindowHwndDiff::NoChange
-        );
-    }
-
-    #[test]
     fn detached_hwnd_registry_clears_dead_hwnd_and_retries_generation_diff() {
         let mut app = setup_app();
         app.detached_window_hwnd_set(7, 0x700);
@@ -71020,23 +70965,6 @@ mod still_window_mode_key_tests {
         assert_eq!(app.detached_window_hwnd_alive(7), None);
         assert_eq!(app.detached_window_hwnd_clear_if_dead(7), Some(0x700));
         assert_eq!(app.detached_window_hwnd_get_raw(7), None);
-    }
-
-    #[test]
-    fn detached_hwnd_snapshot_is_skipped_while_registered_hwnd_is_alive() {
-        let mut app = setup_app();
-        set_detached_host_for_test(&mut app, 12, 0x1200, true);
-        app.main_hwnd = None;
-
-        assert!(
-            app.detached_window_hwnd_snapshot_before_show(
-                12,
-                "test",
-                App::detached_image_window_viewport_id(12),
-            )
-            .is_none(),
-            "live registry entries must avoid per-frame thread-window snapshots"
-        );
     }
 
     #[test]
@@ -71055,14 +70983,11 @@ mod still_window_mode_key_tests {
         set_detached_host_for_test(&mut app, 12, 0x1200, false);
         app.main_hwnd = None;
 
-        assert!(
-            app.detached_window_hwnd_snapshot_before_show(
-                12,
-                "passive",
-                App::detached_image_window_viewport_id(12),
-            )
-            .is_none(),
-            "without a main HWND the test stops after the dead-host ownership transition"
+        app.register_detached_window_hwnd_after_show(
+            &ctx,
+            12,
+            "passive",
+            App::detached_image_window_viewport_id(12),
         );
         assert_eq!(
             app.detached_window_state(12),
@@ -71093,25 +71018,15 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn watcher_repair_rejects_when_target_hwnd_is_still_alive() {
+    fn watcher_repair_rejects_hwnd_without_its_backend_owner() {
         let mut app = setup_app();
+        let ctx = egui::Context::default();
         app.detached_window_hwnd_set(7, 0x7000);
-        app.transition_detached_window_state(7, DetachedWindowState::Parked, "test_repair");
+        app.transition_detached_window_state(7, DetachedWindowState::Parked, "test");
+        let _backend = backend_window_for_test(&ctx, 7, 0x7000);
+        let _sibling = backend_window_for_test(&ctx, 9, 0x9000);
         app.set_detached_window_live_hwnds_for_test([0x7000, 0x9000]);
-        let snapshot = [
-            thread_window_entry(0x10, true, "Window Class"),
-            thread_window_entry(0x9000, false, App::EGUI_VIEWPORT_CLASS),
-        ];
-
-        assert!(
-            !app.repair_detached_window_hwnd_from_watcher_with_snapshot(
-                &egui::Context::default(),
-                7,
-                0x9000,
-                &snapshot,
-            ),
-            "watcher repair must not replace a live registered HWND with a geometry-derived one"
-        );
+        assert!(!app.repair_detached_window_hwnd_from_watcher(&ctx, 7, 0x9000));
         assert_eq!(app.detached_window_hwnd_raw_for_window_id(7), 0x7000);
         assert_eq!(
             app.detached_window_state(7),
@@ -71122,40 +71037,25 @@ mod still_window_mode_key_tests {
     #[test]
     fn watcher_hwnd_repair_does_not_demote_parked_live_media() {
         let mut app = setup_app();
-        app.transition_detached_window_state(7, DetachedWindowState::ParkedLive, "test_setup");
-
-        assert!(app.repair_detached_window_hwnd_from_watcher_unchecked(
-            &egui::Context::default(),
-            7,
-            0x7000,
-        ));
+        let ctx = egui::Context::default();
+        app.transition_detached_window_state(7, DetachedWindowState::ParkedLive, "test");
+        let _backend = backend_window_for_test(&ctx, 7, 0x7000);
+        assert!(app.repair_detached_window_hwnd_from_watcher(&ctx, 7, 0x7000));
         assert_eq!(
             app.detached_window_state(7),
-            Some(DetachedWindowState::ParkedLive),
-            "HWND repair changes the OS host identity, not the media lifecycle"
+            Some(DetachedWindowState::ParkedLive)
         );
     }
 
     #[test]
-    fn watcher_repair_adopts_observed_hwnd_when_registered_hwnd_is_dead() {
+    fn watcher_repair_adopts_backend_hwnd_when_registered_hwnd_is_dead() {
         let mut app = setup_app();
+        let ctx = egui::Context::default();
         app.detached_window_hwnd_set(7, 0x7000);
-        app.transition_detached_window_state(7, DetachedWindowState::Opening, "test_repair");
+        app.transition_detached_window_state(7, DetachedWindowState::Opening, "test");
+        let _backend = backend_window_for_test(&ctx, 7, 0x9000);
         app.set_detached_window_live_hwnds_for_test([0x9000]);
-        let snapshot = [
-            thread_window_entry(0x10, true, "Window Class"),
-            thread_window_entry(0x9000, false, App::EGUI_VIEWPORT_CLASS),
-        ];
-
-        assert!(
-            app.repair_detached_window_hwnd_from_watcher_with_snapshot(
-                &egui::Context::default(),
-                7,
-                0x9000,
-                &snapshot,
-            ),
-            "watcher repair remains valid when the registered HWND is genuinely stale"
-        );
+        assert!(app.repair_detached_window_hwnd_from_watcher(&ctx, 7, 0x9000));
         assert_eq!(app.detached_window_hwnd_raw_for_window_id(7), 0x9000);
         assert_eq!(
             app.detached_window_state(7),
@@ -71184,18 +71084,6 @@ mod still_window_mode_key_tests {
             Some(0x4200),
             "active->passive handoff keeps the same live OS window registered"
         );
-        let mut another_unknown_already_claimed = true;
-        assert!(
-            app.deferred_detached_window_registration_allowed(
-                42,
-                &mut another_unknown_already_claimed
-            ),
-            "a parked window with a live HWND must never be delayed by deferred creation serialization"
-        );
-        assert!(
-            another_unknown_already_claimed,
-            "confirmed windows must not consume the per-frame unknown-window slot"
-        );
         assert_eq!(
             app.detached_image_window_cursor_show_pending,
             vec![42],
@@ -71205,126 +71093,6 @@ mod still_window_mode_key_tests {
         assert!(
             !app.cursor_hidden(),
             "active viewer auto-hide state must not leak into the passive or next viewer"
-        );
-    }
-
-    #[test]
-    fn detached_hwnd_unclaimed_adopts_single_unregistered_egui_window() {
-        let mut app = setup_app();
-        app.detached_window_hwnd_set(7, 0x700);
-        app.detached_window_hwnd_set(8, 0x800);
-        app.set_detached_window_live_hwnds_for_test([0x800]);
-        assert_eq!(app.detached_window_hwnd_clear_if_dead(7), Some(0x700));
-
-        let after = vec![
-            thread_window_entry(0x10, true, "Window Class"),
-            thread_window_entry(0x800, false, "Window Class"),
-            thread_window_entry(0x900, false, "Window Class"),
-        ];
-        let claimed = app.detached_window_registered_hwnds();
-
-        assert_eq!(
-            App::select_detached_unclaimed_hwnd(&after, &claimed),
-            DetachedWindowHwndDiff::Created(0x900)
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn unclaimed_hwnd_adoption_ignores_hidden_and_iconic_viewports() {
-        // review-v2.3.0 hunt P2 (BA-1/BA-4): hidden / minimized / rect 取得不能な stale
-        // egui viewport を「唯一の未登録窓」として detached host に誤採用しない。
-        let claimed = std::collections::HashSet::from([0x800_u64]);
-        let mut hidden = thread_window_entry(0x900, false, "Window Class");
-        hidden.visible = false;
-        let mut iconic = thread_window_entry(0xa00, false, "Window Class");
-        iconic.iconic = true;
-        let mut rect_err = thread_window_entry(0xb00, false, "Window Class");
-        rect_err.rect_ok = false;
-        let after = vec![
-            thread_window_entry(0x10, true, "Window Class"),
-            thread_window_entry(0x800, false, "Window Class"),
-            hidden,
-            iconic,
-            rect_err,
-        ];
-        assert_eq!(
-            App::select_detached_unclaimed_hwnd(&after, &claimed),
-            DetachedWindowHwndDiff::NoChange,
-            "不可視 viewport はフォールバック採用しない (次フレーム再試行に任せる)"
-        );
-
-        // 可視の未登録窓が 1 つだけなら、hidden が同居していても曖昧化せず採用する。
-        let mut hidden2 = thread_window_entry(0x900, false, "Window Class");
-        hidden2.visible = false;
-        let after_with_visible = vec![
-            thread_window_entry(0x10, true, "Window Class"),
-            thread_window_entry(0x800, false, "Window Class"),
-            hidden2,
-            thread_window_entry(0xc00, false, "Window Class"),
-        ];
-        assert_eq!(
-            App::select_detached_unclaimed_hwnd(&after_with_visible, &claimed),
-            DetachedWindowHwndDiff::Created(0xc00)
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn detached_hwnd_no_change_path_adopts_single_unclaimed_egui_window() {
-        let mut app = setup_app();
-        app.transition_detached_window_state(7, DetachedWindowState::Opening, "test");
-        app.detached_window_hwnd_set(8, 0x800);
-        app.set_detached_window_live_hwnds_for_test([0x800]);
-
-        let after = vec![
-            thread_window_entry(0x10, true, "Window Class"),
-            thread_window_entry(0x800, false, "Window Class"),
-            thread_window_entry(0x900, false, "Window Class"),
-        ];
-
-        assert!(app.adopt_unclaimed_detached_window_hwnd_after_show(
-            &egui::Context::default(),
-            7,
-            "active_render",
-            App::detached_image_window_viewport_id(7),
-            &after,
-            None,
-        ));
-        assert_eq!(
-            app.detached_window_hwnd_raw_for_window_id(7),
-            0x900,
-            "a no-diff show frame must still claim the one unregistered egui viewport"
-        );
-        assert_eq!(
-            app.detached_window_state(7),
-            Some(DetachedWindowState::Opening),
-            "HWND adoption alone must not complete the content lifecycle"
-        );
-    }
-
-    #[test]
-    fn detached_hwnd_unclaimed_retries_on_zero_or_multiple_unregistered_egui_windows() {
-        let mut claimed = std::collections::HashSet::new();
-        claimed.insert(0x800);
-        let none = vec![
-            thread_window_entry(0x10, true, "Window Class"),
-            thread_window_entry(0x800, false, "Window Class"),
-        ];
-        assert_eq!(
-            App::select_detached_unclaimed_hwnd(&none, &claimed),
-            DetachedWindowHwndDiff::NoChange
-        );
-
-        let ambiguous = vec![
-            thread_window_entry(0x10, true, "Window Class"),
-            thread_window_entry(0x900, false, "Window Class"),
-            thread_window_entry(0xa00, false, "Window Class"),
-            thread_window_entry(0xb00, false, "Other Class"),
-        ];
-        assert_eq!(
-            App::select_detached_unclaimed_hwnd(&ambiguous, &claimed),
-            DetachedWindowHwndDiff::Ambiguous(vec![0x900, 0xa00])
         );
     }
 
@@ -94105,40 +93873,6 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         );
     }
 
-    #[test]
-    #[cfg(windows)]
-    fn deferred_detached_registration_serializes_unconfirmed_hwnds_per_frame() {
-        let mut app = setup_app();
-        app.detached_window_hwnd_set(10, 0x1010);
-        app.set_detached_window_live_hwnds_for_test([0x1010]);
-
-        let mut unconfirmed_claimed = false;
-        assert!(
-            app.deferred_detached_window_registration_allowed(10, &mut unconfirmed_claimed),
-            "an already confirmed deferred viewport may be registered even after another unknown one"
-        );
-        assert!(!unconfirmed_claimed);
-        assert!(
-            app.deferred_detached_window_registration_allowed(11, &mut unconfirmed_claimed),
-            "the first unknown deferred viewport in a frame is allowed to create its HWND"
-        );
-        assert!(unconfirmed_claimed);
-        assert!(
-            app.deferred_detached_window_registration_allowed(10, &mut unconfirmed_claimed),
-            "confirmed deferred viewports must not be delayed even after another unknown viewport claimed the frame"
-        );
-        assert!(
-            !app.deferred_detached_window_registration_allowed(12, &mut unconfirmed_claimed),
-            "a second unknown deferred viewport in the same frame would make unclaimed HWND adoption ambiguous"
-        );
-
-        let mut next_frame_claim = false;
-        assert!(
-            app.deferred_detached_window_registration_allowed(12, &mut next_frame_claim),
-            "serialization is per-frame; the delayed viewport is allowed on the next root pass"
-        );
-    }
-
     #[cfg(windows)]
     fn activation_target_rect(eligible: bool) -> DetachedActivationWatchTargetRect {
         activation_target_rect_with_close_hit_test(
@@ -111180,7 +110914,8 @@ fn detached_host_change_wakes_root_without_touching_sibling_context() {
     app.transition_detached_window_state(7, DetachedWindowState::ParkedLive, "test_setup");
     app.pending_detached_video_host_resync = true;
 
-    assert!(app.repair_detached_window_hwnd_from_watcher_unchecked(&ctx, 7, 0x7000));
+    let _backend = backend_window_for_test(&ctx, 7, 0x7000);
+    assert!(app.repair_detached_window_hwnd_from_watcher(&ctx, 7, 0x7000));
 
     assert!(requests.lock().unwrap().iter().any(|request| {
         request.viewport_id == egui::ViewportId::ROOT && request.delay.is_zero()
@@ -115598,4 +115333,109 @@ mod ring_saved_group_fullscreen_tests {
         assert!(app.saved_group_open.is_none());
         app.shutdown_collection_runtime_for_exit();
     }
+}
+
+#[test]
+#[cfg(windows)]
+fn detached_backend_hwnd_authority_is_per_viewport_and_recreation_keeps_sibling() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    for id in [7, 8] {
+        app.transition_detached_window_state(id, DetachedWindowState::Opening, "test");
+    }
+    app.set_detached_window_live_hwnds_for_test([0x7000, 0x7100, 0x8000]);
+    let mut old = backend_window_for_test(&ctx, 7, 0x7000);
+    let _sibling = backend_window_for_test(&ctx, 8, 0x8000);
+    let vp = App::detached_image_window_viewport_id(7);
+    app.register_detached_window_hwnd_after_show(&ctx, 7, "active_render", vp);
+    app.adopt_deferred_detached_window_hwnd_after_callback(
+        &ctx,
+        8,
+        App::detached_image_window_viewport_id(8),
+    );
+    assert_eq!(app.detached_window_hwnd_raw_for_window_id(7), 0x7000);
+    assert_eq!(app.detached_window_hwnd_raw_for_window_id(8), 0x8000);
+    old.retire();
+    let _new = backend_window_for_test(&ctx, 7, 0x7100);
+    app.register_detached_window_hwnd_after_show(&ctx, 7, "active_render", vp);
+    drop(old);
+    assert_eq!(app.detached_window_hwnd_raw_for_window_id(7), 0x7100);
+    assert_eq!(app.detached_window_hwnd_raw_for_window_id(8), 0x8000);
+    assert_eq!(
+        app.detached_window_state(7),
+        Some(DetachedWindowState::Opening)
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn detached_backend_hwnd_adoption_requires_current_logical_lifetime() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    app.transition_detached_window_state(7, DetachedWindowState::Opening, "test");
+    let mut old = backend_window_for_test(&ctx, 7, 0x7000);
+    let viewport = App::detached_image_window_viewport_id(7);
+    let old_registration = ctx.viewport_registration(viewport).unwrap();
+    ctx.retire_viewport(viewport);
+    ctx.show_viewport_deferred(viewport, Default::default(), |_, _| {});
+    assert_ne!(ctx.viewport_registration(viewport), Some(old_registration));
+    // Logical retirement precedes the backend's native cleanup. An old physical
+    // allocation may still be queried, but it cannot become the new host.
+    app.adopt_deferred_detached_window_hwnd_after_callback(&ctx, 7, viewport);
+    assert_eq!(app.detached_window_hwnd_raw_for_window_id(7), 0);
+    old.retire();
+    let _new = backend_window_for_test(&ctx, 7, 0x7100);
+    app.adopt_deferred_detached_window_hwnd_after_callback(&ctx, 7, viewport);
+    assert_eq!(app.detached_window_hwnd_raw_for_window_id(7), 0x7100);
+}
+
+#[test]
+#[cfg(windows)]
+fn detached_backend_hwnd_reuse_retires_host_claim_and_reseeds_same_handle() {
+    use super::detached_window_manager::PlacementOutcome;
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    app.push_window_context_for_test(&ctx, 7, |_| {});
+    let placement = app.default_detached_viewer_window_placement();
+    app.detached_window_manager
+        .set_placement(7, placement, false);
+    app.set_detached_window_live_hwnds_for_test([0x7000]);
+    let mut old = backend_window_for_test(&ctx, 7, 0x7000);
+    let viewport = App::detached_image_window_viewport_id(7);
+    app.register_detached_window_hwnd_after_show(&ctx, 7, "passive", viewport);
+    let old_claim = app.detached_window_manager.host_claim_alive(7).unwrap();
+    app.detached_window_manager
+        .mark_host_placed(old_claim, PlacementOutcome::Exact);
+    app.detached_image_windows
+        .iter_mut()
+        .find(|window| window.id == 7)
+        .unwrap()
+        .initial_placement_applied = true;
+    assert!(app.detached_window_host_is_placed(7));
+    old.retire();
+    // IsWindow alone still reports this numeric handle alive (e.g. a retained
+    // old Arc<Window>); the native owner has nevertheless ended synchronously.
+    assert!(app.detached_window_hwnd_is_alive(0x7000));
+    assert_eq!(app.detached_window_hwnd_raw_for_window_id(7), 0);
+    assert_eq!(app.detached_window_hwnd_alive(7), None);
+    assert!(!app.detached_window_manager.host_claim_is_alive(old_claim));
+    assert!(!app.detached_window_host_is_placed(7));
+    let _new = backend_window_for_test(&ctx, 7, 0x7000);
+    app.register_detached_window_hwnd_after_show(&ctx, 7, "passive", viewport);
+    let new_claim = app.detached_window_manager.host_claim_alive(7).unwrap();
+    assert_ne!(old_claim.incarnation, new_claim.incarnation);
+    assert!(!app.detached_window_manager.host_claim_is_alive(old_claim));
+    assert_eq!(
+        app.detached_window_manager.runtime(7).unwrap().placement,
+        Some(placement)
+    );
+    assert!(
+        !app.detached_image_windows
+            .iter()
+            .find(|window| window.id == 7)
+            .unwrap()
+            .initial_placement_applied
+    );
+    drop(old);
+    assert!(app.detached_window_manager.host_claim_is_alive(new_claim));
 }

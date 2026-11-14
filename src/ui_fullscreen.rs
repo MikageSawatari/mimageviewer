@@ -24462,7 +24462,6 @@ impl App {
             }
         }
         let mut render_batch = DetachedImageWindowEventBatch::default();
-        let mut unconfirmed_deferred_registered = false;
         for window in &deferred_windows {
             let sidecar_restore_presentation = self
                 .sidecar_restore_blocks_window(window.id)
@@ -24490,18 +24489,6 @@ impl App {
                 ));
             }
             let right_drag_owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(window.id);
-            if !self.deferred_detached_window_registration_allowed(
-                window.id,
-                &mut unconfirmed_deferred_registered,
-            ) {
-                self.log_detached_image_window_debug(format!(
-                    "deferred_registration_delayed id={} reason=unconfirmed_hwnd_serialized \
-                     passive_windows={}",
-                    window.id,
-                    self.detached_image_windows.len()
-                ));
-                continue;
-            }
             self.request_detached_right_drag_guide_repaint(ctx, right_drag_owner, viewport_id);
             let apply_initial_placement = self
                 .detached_window_hwnd_alive_for_window_id(window.id)
@@ -24739,10 +24726,6 @@ impl App {
             let mut scroll_activation_candidate = false;
             let mut key_activation_candidate = false;
             let mut wheel_activation_candidate = false;
-
-            #[cfg(windows)]
-            let hwnd_before =
-                self.detached_window_hwnd_snapshot_before_show(window.id, "passive", viewport_id);
             let view = crate::app::DeferredDetachedImageWindowView::from_snapshot(
                 &window,
                 window_placement,
@@ -24879,13 +24862,7 @@ impl App {
                 }
             });
             #[cfg(windows)]
-            self.register_detached_window_hwnd_after_show(
-                ctx,
-                window.id,
-                "passive",
-                viewport_id,
-                hwnd_before.as_deref(),
-            );
+            self.register_detached_window_hwnd_after_show(ctx, window.id, "passive", viewport_id);
             if apply_initial_placement && self.window_visible {
                 self.request_detached_window_visibility(
                     ctx,
@@ -25037,37 +25014,6 @@ impl App {
             }
         }
         self.apply_detached_image_window_event_batch(ctx, render_batch, false);
-    }
-
-    #[cfg(windows)]
-    fn install_key_input_subclass_for_viewport_rect(
-        &self,
-        viewport: egui::ViewportId,
-        outer_rect: egui::Rect,
-        pixels_per_point: f32,
-    ) {
-        use windows::Win32::Foundation::{HWND, RECT};
-
-        let Some(main_hwnd) = self.main_hwnd else {
-            return;
-        };
-        let scale = pixels_per_point.max(0.5);
-        let expected = RECT {
-            left: (outer_rect.min.x * scale).round() as i32,
-            top: (outer_rect.min.y * scale).round() as i32,
-            right: (outer_rect.max.x * scale).round() as i32,
-            bottom: (outer_rect.max.y * scale).round() as i32,
-        };
-        let Some(hwnd) = crate::dwm_transitions::find_visible_thread_window_matching_rect(
-            HWND(main_hwnd as *mut _),
-            expected,
-        ) else {
-            return;
-        };
-        let hwnd_raw = hwnd.0 as usize as u64;
-        if hwnd_raw != 0 {
-            crate::key_input::install_viewport_window_subclass(hwnd_raw, viewport);
-        }
     }
 
     pub(crate) fn fullscreen_seek_overlay_allowed(&self, fs_idx: usize, is_video: bool) -> bool {
@@ -26710,11 +26656,6 @@ impl App {
                 builder_placement,
                 "detached_loading_shell",
             );
-            let hwnd_before = self.detached_window_hwnd_snapshot_before_show(
-                window_id,
-                "detached_loading_shell",
-                fs_id,
-            );
             let loading_location = self.address.clone();
             let mut cancel = false;
             ctx.show_viewport_immediate(fs_id, builder, |vp_ctx_ui, _class| {
@@ -26746,7 +26687,6 @@ impl App {
                 window_id,
                 "detached_loading_shell",
                 fs_id,
-                hwnd_before.as_deref(),
             );
             self.fs_viewport_shown = true;
             self.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
@@ -26839,14 +26779,6 @@ impl App {
             }
             #[cfg(windows)]
             let keep_alive_window_id = self.active_detached_hwnd_window_id();
-            #[cfg(windows)]
-            let hwnd_before = keep_alive_window_id.and_then(|window_id| {
-                self.detached_window_hwnd_snapshot_before_show(
-                    window_id,
-                    "keep_alive_holdover",
-                    fs_id,
-                )
-            });
             ctx.show_viewport_immediate(fs_id, fs_builder, |ctx_ui, _class| {
                 let ctx = &ctx_ui.ctx().clone();
                 #[cfg(windows)]
@@ -26883,7 +26815,6 @@ impl App {
                     window_id,
                     "keep_alive_holdover",
                     fs_id,
-                    hwnd_before.as_deref(),
                 );
             }
             #[cfg(windows)]
@@ -27189,13 +27120,6 @@ impl App {
         } else {
             egui::Color32::BLACK
         };
-        let hwnd_before = backstop_window_id.and_then(|window_id| {
-            self.detached_window_hwnd_snapshot_before_show(
-                window_id,
-                "keepalive_backstop",
-                viewport_id,
-            )
-        });
         // Separate our drawing from what eframe does around it (render + present of
         // the child viewport), because only one of the two can be made cheaper.
         let show_t0 = std::time::Instant::now();
@@ -27284,7 +27208,6 @@ impl App {
                 window_id,
                 "keepalive_backstop",
                 viewport_id,
-                hwnd_before.as_deref(),
             );
         }
         if detached_host_needs_create
@@ -27800,10 +27723,6 @@ impl App {
             None
         };
         #[cfg(windows)]
-        let active_render_hwnd_before = active_render_window_id.and_then(|window_id| {
-            self.detached_window_hwnd_snapshot_before_show(window_id, "active_render", fs_id)
-        });
-        #[cfg(windows)]
         if detached && !embedded && need_show && Self::detached_image_window_debug_enabled() {
             self.log_detached_image_window_debug(format!(
                 "open_visibility_probe stage=before_show label=active_render fs_idx={fs_idx} \
@@ -27971,24 +27890,6 @@ impl App {
                 } = presentation;
                 let mut presentation_trace_allowed = display_permission_allowed && !continuous;
                 frame_snapshot = Some((fs_idx, state.is_video));
-                #[cfg(windows)]
-                if !embedded {
-                    let (outer_rect, pixels_per_point, minimized) = ctx.input(|i| {
-                        let vp = i.viewport();
-                        (
-                            vp.outer_rect,
-                            i.pixels_per_point,
-                            vp.minimized.unwrap_or(false),
-                        )
-                    });
-                    if !minimized && let Some(rect) = outer_rect {
-                        self.install_key_input_subclass_for_viewport_rect(
-                            fs_id,
-                            rect,
-                            pixels_per_point,
-                        );
-                    }
-                }
                 #[cfg(windows)]
                 if detached {
                     let (outer_rect, _inner_rect, pixels_per_point, minimized, _maximized) = ctx
@@ -30333,13 +30234,7 @@ impl App {
         };
         #[cfg(windows)]
         if let Some(window_id) = active_render_window_id {
-            self.register_detached_window_hwnd_after_show(
-                ctx,
-                window_id,
-                "active_render",
-                fs_id,
-                active_render_hwnd_before.as_deref(),
-            );
+            self.register_detached_window_hwnd_after_show(ctx, window_id, "active_render", fs_id);
             if need_show && Self::detached_image_window_debug_enabled() {
                 self.log_detached_image_window_debug(format!(
                     "open_visibility_probe stage=after_show label=active_render window_id={} \
