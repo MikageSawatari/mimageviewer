@@ -71018,7 +71018,7 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn watcher_repair_rejects_hwnd_without_its_backend_owner() {
+    fn backend_adoption_keeps_own_hwnd_without_rect_guessing() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         app.detached_window_hwnd_set(7, 0x7000);
@@ -71026,7 +71026,21 @@ mod still_window_mode_key_tests {
         let _backend = backend_window_for_test(&ctx, 7, 0x7000);
         let _sibling = backend_window_for_test(&ctx, 9, 0x9000);
         app.set_detached_window_live_hwnds_for_test([0x7000, 0x9000]);
-        assert!(!app.repair_detached_window_hwnd_from_watcher(&ctx, 7, 0x9000));
+        assert!(app.adopt_backend_detached_window_hwnd(
+            &ctx,
+            7,
+            "passive",
+            App::detached_image_window_viewport_id(7)
+        ));
+        assert_eq!(
+            eframe::native_window_input::native_window_allocation(
+                &ctx,
+                App::detached_image_window_viewport_id(9)
+            )
+            .unwrap()
+            .windows_hwnd,
+            Some(0x9000)
+        );
         assert_eq!(app.detached_window_hwnd_raw_for_window_id(7), 0x7000);
         assert_eq!(
             app.detached_window_state(7),
@@ -71035,12 +71049,17 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn watcher_hwnd_repair_does_not_demote_parked_live_media() {
+    fn backend_adoption_does_not_demote_parked_live_media() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         app.transition_detached_window_state(7, DetachedWindowState::ParkedLive, "test");
         let _backend = backend_window_for_test(&ctx, 7, 0x7000);
-        assert!(app.repair_detached_window_hwnd_from_watcher(&ctx, 7, 0x7000));
+        assert!(app.adopt_backend_detached_window_hwnd(
+            &ctx,
+            7,
+            "passive",
+            App::detached_image_window_viewport_id(7)
+        ));
         assert_eq!(
             app.detached_window_state(7),
             Some(DetachedWindowState::ParkedLive)
@@ -71048,14 +71067,19 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn watcher_repair_adopts_backend_hwnd_when_registered_hwnd_is_dead() {
+    fn backend_adoption_replaces_dead_registered_hwnd() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         app.detached_window_hwnd_set(7, 0x7000);
         app.transition_detached_window_state(7, DetachedWindowState::Opening, "test");
         let _backend = backend_window_for_test(&ctx, 7, 0x9000);
         app.set_detached_window_live_hwnds_for_test([0x9000]);
-        assert!(app.repair_detached_window_hwnd_from_watcher(&ctx, 7, 0x9000));
+        assert!(app.adopt_backend_detached_window_hwnd(
+            &ctx,
+            7,
+            "passive",
+            App::detached_image_window_viewport_id(7)
+        ));
         assert_eq!(app.detached_window_hwnd_raw_for_window_id(7), 0x9000);
         assert_eq!(
             app.detached_window_state(7),
@@ -93873,667 +93897,6 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         );
     }
 
-    #[cfg(windows)]
-    fn activation_target_rect(eligible: bool) -> DetachedActivationWatchTargetRect {
-        activation_target_rect_with_close_hit_test(
-            eligible,
-            DetachedActivationCloseHitTest::ImageBar,
-        )
-    }
-
-    #[cfg(windows)]
-    fn activation_target_rect_with_close_hit_test(
-        eligible: bool,
-        close_hit_test: DetachedActivationCloseHitTest,
-    ) -> DetachedActivationWatchTargetRect {
-        DetachedActivationWatchTargetRect {
-            window_id: 7,
-            hwnd: 0x1000,
-            eligible,
-            close_hit_test,
-            left: 100,
-            top: 100,
-            right: 300,
-            bottom: 240,
-        }
-    }
-
-    #[cfg(windows)]
-    fn activation_sample(
-        left_button_down: bool,
-        foreground_hwnd: u64,
-        cursor_root_hwnd: u64,
-        cursor_pos: Option<(i32, i32)>,
-    ) -> DetachedActivationWatchSample {
-        DetachedActivationWatchSample {
-            left_button_down,
-            foreground_hwnd,
-            cursor_root_hwnd,
-            native_close_hit_hwnd: 0,
-            cursor_pos,
-        }
-    }
-
-    #[cfg(windows)]
-    fn activation_sample_native_close(
-        left_button_down: bool,
-        foreground_hwnd: u64,
-        cursor_root_hwnd: u64,
-        native_close_hit_hwnd: u64,
-        cursor_pos: Option<(i32, i32)>,
-    ) -> DetachedActivationWatchSample {
-        DetachedActivationWatchSample {
-            left_button_down,
-            foreground_hwnd,
-            cursor_root_hwnd,
-            native_close_hit_hwnd,
-            cursor_pos,
-        }
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_commits_click_release_inside_passive_window() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x1000, 0x1000, Some((120, 130))),
-                &targets,
-            ),
-            None
-        );
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(false, 0x1000, 0x1000, Some((123, 132))),
-                &targets,
-            ),
-            Some(7),
-            "down/up with a small movement inside the passive HWND should activate"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_ignores_alt_tab_focus_without_mouse_down() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(false, 0x1000, 0x1000, Some((120, 130))),
-                &targets,
-            ),
-            None,
-            "focus changes without a physical left-button down edge must not activate"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_drops_title_bar_drag_release() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x1000, 0x1000, Some((120, 112))),
-                &targets,
-            ),
-            None
-        );
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x1000, 0x1000, Some((160, 112))),
-                &targets,
-            ),
-            None
-        );
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(false, 0x1000, 0x1000, Some((160, 112))),
-                &targets,
-            ),
-            None,
-            "large movement from the passive title bar is treated as a window drag, not activation"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_commits_content_drag_release() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x1000, 0x1000, Some((120, 170))),
-                &targets,
-            ),
-            None
-        );
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x1000, 0x1000, Some((190, 210))),
-                &targets,
-            ),
-            None
-        );
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(false, 0x1000, 0x1000, Some((190, 210))),
-                &targets,
-            ),
-            Some(7),
-            "content-area pointer movement is still an activation click because passive content has no drag operation"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_close_button_sends_close_not_activation() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step_result(
-                &mut state,
-                activation_sample(true, 0x1000, 0x1000, Some((270, 120))),
-                &targets,
-            ),
-            DetachedActivationWatchStepResult::default()
-        );
-        let result = App::detached_activation_watch_step_result(
-            &mut state,
-            activation_sample(false, 0x1000, 0x1000, Some((270, 120))),
-            &targets,
-        );
-        assert_eq!(result.activation, None);
-        assert_eq!(result.close, Some(DetachedCloseRequest { window_id: 7 }));
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_close_button_release_outside_is_ignored() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step_result(
-                &mut state,
-                activation_sample(true, 0x1000, 0x1000, Some((270, 120))),
-                &targets,
-            ),
-            DetachedActivationWatchStepResult::default()
-        );
-        let result = App::detached_activation_watch_step_result(
-            &mut state,
-            activation_sample(false, 0x1000, 0x1000, Some((250, 120))),
-            &targets,
-        );
-        assert_eq!(result.activation, None);
-        assert_eq!(result.close, None);
-        assert_eq!(
-            result.diagnostic.map(|diagnostic| diagnostic.reason),
-            Some("up_close_outside"),
-            "a close-button press released outside the button is a canceled button click"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_native_caption_close_sends_close_not_activation() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step_result(
-                &mut state,
-                activation_sample_native_close(true, 0x2000, 0x1000, 0x1000, Some((294, 106))),
-                &targets,
-            ),
-            DetachedActivationWatchStepResult::default()
-        );
-        let result = App::detached_activation_watch_step_result(
-            &mut state,
-            activation_sample_native_close(false, 0x1000, 0x1000, 0x1000, Some((294, 106))),
-            &targets,
-        );
-        assert_eq!(
-            result.close,
-            Some(DetachedCloseRequest { window_id: 7 }),
-            "the OS caption close button must close a passive window even before it activates"
-        );
-        assert_eq!(
-            result.activation, None,
-            "native caption close must win over passive activation"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_native_caption_close_release_outside_is_ignored() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step_result(
-                &mut state,
-                activation_sample_native_close(true, 0x2000, 0x1000, 0x1000, Some((294, 106))),
-                &targets,
-            ),
-            DetachedActivationWatchStepResult::default()
-        );
-        let result = App::detached_activation_watch_step_result(
-            &mut state,
-            activation_sample_native_close(false, 0x1000, 0x1000, 0, Some((294, 106))),
-            &targets,
-        );
-        assert_eq!(result.close, None);
-        assert_eq!(result.activation, None);
-        assert_eq!(
-            result.diagnostic.map(|diagnostic| diagnostic.reason),
-            Some("up_close_outside"),
-            "native caption close is canceled when release no longer hits HTCLOSE"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_native_caption_close_works_before_activation_ready() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(false)];
-
-        assert_eq!(
-            App::detached_activation_watch_step_result(
-                &mut state,
-                activation_sample_native_close(true, 0x2000, 0x1000, 0x1000, Some((294, 106))),
-                &targets,
-            ),
-            DetachedActivationWatchStepResult::default()
-        );
-        let result = App::detached_activation_watch_step_result(
-            &mut state,
-            activation_sample_native_close(false, 0x1000, 0x1000, 0x1000, Some((294, 106))),
-            &targets,
-        );
-        assert_eq!(
-            result.close,
-            Some(DetachedCloseRequest { window_id: 7 }),
-            "window manager close must not be gated by passive activation readiness"
-        );
-        assert_eq!(result.activation, None);
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn detached_window_close_button_hit_uses_bar_layout_rect() {
-        let target = activation_target_rect(true);
-        assert!(App::detached_activation_close_button_contains(
-            target,
-            Some((target.right - 10, target.top + 10))
-        ));
-        assert!(!App::detached_activation_close_button_contains(
-            target,
-            Some((target.right - 50, target.top + 10))
-        ));
-        assert!(!App::detached_activation_close_button_contains(
-            target,
-            Some((target.right - 10, target.top + 50))
-        ));
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn detached_music_window_close_button_hit_uses_music_chrome_slot() {
-        let target = activation_target_rect_with_close_hit_test(
-            true,
-            DetachedActivationCloseHitTest::MusicChrome,
-        );
-        let full = egui::Rect::from_min_max(
-            egui::pos2(target.left as f32, target.top as f32),
-            egui::pos2(target.right as f32, target.bottom as f32),
-        );
-        let close = App::parked_live_music_close_slot_rect(
-            full,
-            crate::ui_helpers::panel_edge_trigger_px(full.width()),
-        )
-        .expect("normal music parked window should have a close slot");
-
-        assert!(App::detached_activation_close_button_contains(
-            target,
-            Some((close.center().x as i32, close.center().y as i32))
-        ));
-        assert!(
-            !App::detached_activation_close_button_contains(
-                target,
-                Some((target.right - 10, target.top + 10))
-            ),
-            "music parked windows must not reuse the legacy image close-bar hit rect"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn detached_music_window_close_button_hit_ignores_invalid_layout() {
-        let target = DetachedActivationWatchTargetRect {
-            window_id: 7,
-            hwnd: 0x7000,
-            left: 100,
-            top: 100,
-            right: 140,
-            bottom: 140,
-            eligible: true,
-            close_hit_test: DetachedActivationCloseHitTest::MusicChrome,
-        };
-
-        assert!(
-            App::parked_live_music_close_slot_rect(
-                egui::Rect::from_min_max(
-                    egui::pos2(target.left as f32, target.top as f32),
-                    egui::pos2(target.right as f32, target.bottom as f32),
-                ),
-                crate::ui_helpers::panel_edge_trigger_px((target.right - target.left) as f32),
-            )
-            .is_none(),
-            "the tiny music window layout has no valid close slot"
-        );
-        assert!(
-            !App::detached_activation_close_button_contains(
-                target,
-                Some((
-                    (target.left + target.right) / 2,
-                    (target.top + target.bottom) / 2
-                ))
-            ),
-            "invalid music chrome layout must not treat the whole window as the close button"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_ignores_down_edge_outside_passive_hwnd() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x2000, 0x2000, Some((20, 30))),
-                &targets,
-            ),
-            None
-        );
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(false, 0x2000, 0x2000, Some((20, 30))),
-                &targets,
-            ),
-            None,
-            "clicks whose cursor root HWND is not a passive window are ignored"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_resolves_overlapping_targets_by_cursor_root_hwnd() {
-        // findings-19 実機バグ: parked 窓が重なっているとき、targets のリスト順
-        // (≠ z-order) の矩形あたり判定が背面窓を照準に選び、前面窓へのクリックが
-        // hwnd 不一致で丸ごと棄却されていた。OS の cursor_root_hwnd と一致する
-        // target を優先して解決することを固定する。
-        let back = DetachedActivationWatchTargetRect {
-            window_id: 3,
-            hwnd: 0x3000,
-            eligible: true,
-            close_hit_test: DetachedActivationCloseHitTest::ImageBar,
-            left: 50,
-            top: 50,
-            right: 350,
-            bottom: 300,
-        };
-        let front = DetachedActivationWatchTargetRect {
-            window_id: 6,
-            hwnd: 0x6000,
-            eligible: true,
-            close_hit_test: DetachedActivationCloseHitTest::ImageBar,
-            left: 100,
-            top: 100,
-            right: 400,
-            bottom: 350,
-        };
-        // 背面窓がリスト先頭 = 実機で踏んだ順序。クリック点は両矩形の重なり内。
-        let targets = [back, front];
-        let mut state = DetachedActivationWatchState::default();
-
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x6000, 0x6000, Some((200, 200))),
-                &targets,
-            ),
-            None
-        );
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(false, 0x6000, 0x6000, Some((200, 200))),
-                &targets,
-            ),
-            Some(6),
-            "a click on the front window must activate it even when a back window's \
-             rect also contains the cursor and precedes it in the target list"
-        );
-
-        // 逆方向: 同じ重なり点でも root が背面窓なら背面窓が照準になる。
-        let mut state = DetachedActivationWatchState::default();
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x3000, 0x3000, Some((200, 200))),
-                &targets,
-            ),
-            None
-        );
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(false, 0x3000, 0x3000, Some((200, 200))),
-                &targets,
-            ),
-            Some(3),
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_rejects_repair_candidate_claimed_by_other_runtime() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-        let result = App::detached_activation_watch_step_result_with_context(
-            &mut state,
-            activation_sample(true, 0x4000, 0x4000, Some((120, 170))),
-            &targets,
-            0,
-            &[0x4000],
-        );
-        assert_eq!(result.activation, None);
-        assert_eq!(
-            result.diagnostic.map(|diagnostic| diagnostic.reason),
-            Some("down_claimed_window"),
-            "rect fallback must not attribute clicks on an already-claimed HWND to another parked window"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_rejects_repair_candidate_on_main_window() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-        let result = App::detached_activation_watch_step_result_with_context(
-            &mut state,
-            activation_sample(true, 0x5000, 0x5000, Some((120, 170))),
-            &targets,
-            0x5000,
-            &[],
-        );
-        assert_eq!(result.activation, None);
-        assert_eq!(
-            result.diagnostic.map(|diagnostic| diagnostic.reason),
-            Some("down_main_window"),
-            "rect fallback must not treat a main-window click as a parked-window repair candidate"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_allows_foreground_lag_on_down_edge() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x2000, 0x1000, Some((120, 130))),
-                &targets,
-            ),
-            None,
-            "down edge should use the cursor root HWND, not the still-stale foreground HWND"
-        );
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(false, 0x1000, 0x1000, Some((122, 131))),
-                &targets,
-            ),
-            Some(7),
-            "up edge validates foreground after Windows has completed activation"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_rejects_when_foreground_never_moves_to_target() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x2000, 0x1000, Some((120, 130))),
-                &targets,
-            ),
-            None
-        );
-        let result = App::detached_activation_watch_step_result(
-            &mut state,
-            activation_sample(false, 0x2000, 0x1000, Some((122, 131))),
-            &targets,
-        );
-        assert_eq!(result.activation, None);
-        assert_eq!(
-            result.diagnostic.map(|diagnostic| diagnostic.reason),
-            Some("up_foreground_mismatch"),
-            "up edge remains the safety gate when foreground did not settle on the clicked window"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_requests_hwnd_repair_for_stale_registry() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x2000, 0x3000, Some((120, 130))),
-                &targets,
-            ),
-            None,
-            "down edge may see a newly recreated HWND under the cursor before the registry updates"
-        );
-        let result = App::detached_activation_watch_step_result(
-            &mut state,
-            activation_sample(false, 0x3000, 0x3000, Some((122, 131))),
-            &targets,
-        );
-        assert_eq!(
-            result.activation,
-            Some(DetachedActivationRequest {
-                window_id: 7,
-                repair_hwnd: Some(0x3000),
-            }),
-            "up edge should preserve activation and carry the observed HWND for App-side validation"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_consumes_park_origin_click_while_ineligible() {
-        let mut state = DetachedActivationWatchState::default();
-        let ineligible = [activation_target_rect(false)];
-        let eligible = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x1000, 0x1000, Some((120, 130))),
-                &ineligible,
-            ),
-            None
-        );
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(false, 0x1000, 0x1000, Some((120, 130))),
-                &eligible,
-            ),
-            None,
-            "the click that caused park is consumed before activation becomes eligible"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_resets_when_no_passive_targets_exist() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x1000, 0x1000, Some((120, 130))),
-                &targets,
-            ),
-            None
-        );
-        assert!(state.left_button_was_down);
-
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x1000, 0x1000, Some((120, 130))),
-                &[],
-            ),
-            None
-        );
-        assert_eq!(
-            state,
-            DetachedActivationWatchState::default(),
-            "passive zero stops the watcher state instead of carrying a stale press"
-        );
-    }
-
     #[test]
     #[cfg(windows)]
     fn parked_hwnd_liveness_recreation_returns_to_activatable_parked() {
@@ -94599,12 +93962,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             Some(DetachedWindowState::Parked),
             "passive post-show registration must return a recreated host to Parked"
         );
-        assert!(
-            app.deferred_detached_activation_watch_targets()
-                .iter()
-                .any(|target| target.window_id == 7),
-            "the recreated passive window must re-enter activation watcher ownership"
-        );
+        assert!(app.detached_window_can_activate(7));
     }
 
     #[test]
@@ -94677,8 +94035,93 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             right_drag: None,
         });
 
+        ctx.set_embed_viewports(false);
+        let viewport = App::detached_image_window_viewport_id(7);
+        let template =
+            app.detached_activation_request(&ctx, 7, DetachedActivationSource::ClientClick);
+        let callback_shared = shared.clone();
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let callback_shared = callback_shared.clone();
+            let template = template.clone();
+            ui.ctx().show_viewport_deferred(
+                viewport,
+                egui::ViewportBuilder::default(),
+                move |ui, _| {
+                    let ctx = ui.ctx();
+                    let geometry = crate::touch_input::TapZoneGeometry {
+                        surface: egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(400.0, 300.0),
+                        ),
+                        excluded: Vec::new(),
+                        behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                            accepts_pinch: true,
+                            tap_zones: true,
+                        },
+                    };
+                    let mut request = template.clone();
+                    request.registration = ctx.viewport_registration(viewport);
+                    if callback_shared
+                        .capture_client_activation(
+                            ctx,
+                            geometry,
+                            detached_activation_gesture::ClientActivationAvailability::Available,
+                            request.clone(),
+                            egui::Rect::NOTHING,
+                        )
+                        .is_some()
+                    {
+                        callback_shared
+                            .push_event(DeferredDetachedImageWindowEvent::Activation { request });
+                    }
+                },
+            );
+        });
+        let callback = output.viewport_output[&viewport]
+            .viewport_ui_cb
+            .clone()
+            .unwrap();
+        output.drop_without_applying_deltas();
+        let pos = egui::pos2(100.0, 100.0);
+        let mut input = egui::RawInput {
+            viewport_id: viewport,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            )),
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        input.viewports.insert(
+            viewport,
+            egui::ViewportInfo {
+                parent: Some(egui::ViewportId::ROOT),
+                ..Default::default()
+            },
+        );
+        ctx.run_ui(input, |ui| callback(ui))
+            .drop_without_applying_deltas();
         app.process_deferred_detached_image_window_events_for_test(&ctx);
-        app.queue_deferred_detached_window_activation(7, "test_watcher");
+        // A late passive render in this root frame must not commit the queued
+        // client request after the active viewer's update has already finished.
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.render_detached_image_windows(ui.ctx());
+        })
+        .drop_without_applying_deltas();
 
         assert_eq!(
             app.detached_image_windows.len(),
@@ -110915,7 +110358,12 @@ fn detached_host_change_wakes_root_without_touching_sibling_context() {
     app.pending_detached_video_host_resync = true;
 
     let _backend = backend_window_for_test(&ctx, 7, 0x7000);
-    assert!(app.repair_detached_window_hwnd_from_watcher(&ctx, 7, 0x7000));
+    assert!(app.adopt_backend_detached_window_hwnd(
+        &ctx,
+        7,
+        "passive",
+        App::detached_image_window_viewport_id(7)
+    ));
 
     assert!(requests.lock().unwrap().iter().any(|request| {
         request.viewport_id == egui::ViewportId::ROOT && request.delay.is_zero()

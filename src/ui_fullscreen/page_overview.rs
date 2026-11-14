@@ -201,12 +201,16 @@ impl App {
         ctx.data(|data| data.get_temp(page_overview_layout_cache_id(view)))
     }
 
-    pub(super) fn draw_page_overview_window_close(ui: &mut egui::Ui, surface: egui::Rect) -> bool {
-        let rect = egui::Rect::from_min_size(
+    pub(crate) fn page_overview_window_close_rect(surface: egui::Rect) -> egui::Rect {
+        egui::Rect::from_min_size(
             egui::pos2(surface.right() - 28.0, surface.top() + 4.0),
             egui::vec2(24.0, 24.0),
         )
-        .intersect(surface);
+        .intersect(surface)
+    }
+
+    pub(super) fn draw_page_overview_window_close(ui: &mut egui::Ui, surface: egui::Rect) -> bool {
+        let rect = Self::page_overview_window_close_rect(surface);
         let _response = ui.interact(
             rect,
             ui.scope_id().with("overview-window-close"),

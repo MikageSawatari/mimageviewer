@@ -555,11 +555,19 @@ mod color_filter;
 mod content_identity_detection;
 pub(crate) mod content_identity_restore;
 #[cfg(windows)]
+mod detached_activation;
+#[cfg(windows)]
+pub(crate) mod detached_activation_gesture;
+#[cfg(windows)]
 mod detached_page_overview;
 #[cfg(windows)]
 mod detached_placement;
 #[cfg(windows)]
 mod detached_window_manager;
+#[cfg(windows)]
+pub(crate) use detached_activation::{
+    DetachedActivationDecision, DetachedActivationRequest, DetachedActivationSource,
+};
 #[cfg(windows)]
 pub(crate) use detached_page_overview::DetachedPageOverviewInputProvenance;
 mod facet_name_filter;
@@ -782,13 +790,8 @@ pub(crate) use startup_ops::{
 
 #[cfg(windows)]
 pub(crate) use detached_window_manager::{
-    DetachedActivationClickCandidate, DetachedActivationClickIntent,
-    DetachedActivationCloseHitTest, DetachedActivationDispatch, DetachedActivationRequest,
-    DetachedActivationWatchDiagnostic, DetachedActivationWatchSample, DetachedActivationWatchState,
-    DetachedActivationWatchStepResult, DetachedActivationWatchTarget,
-    DetachedActivationWatchTargetRect, DetachedCloseRequest, DetachedHostClaim,
-    DetachedSessionLease, DetachedWindowCommand, DetachedWindowManager, DetachedWindowRuntime,
-    DetachedWindowState, IdentifiedRightDragCommand,
+    DetachedActivationDispatch, DetachedHostClaim, DetachedSessionLease, DetachedWindowCommand,
+    DetachedWindowManager, DetachedWindowRuntime, DetachedWindowState, IdentifiedRightDragCommand,
 };
 #[cfg(all(windows, test))]
 pub(crate) use detached_window_manager::{DetachedActivationIntent, PendingRightDragCommand};
@@ -2183,6 +2186,9 @@ impl DeferredDetachedImageWindowView {
 #[cfg(windows)]
 #[derive(Debug, Clone)]
 pub(crate) enum DeferredDetachedImageWindowEvent {
+    Activation {
+        request: DetachedActivationRequest,
+    },
     PageOverview {
         id: u64,
         command: page_overview::PageOverviewCommand,
@@ -2258,21 +2264,106 @@ struct DeferredDetachedRightDragCapture {
 }
 
 #[cfg(windows)]
+#[derive(Default)]
+struct DeferredDetachedClientCapture {
+    scope: Option<DetachedActivationRequest>,
+    gesture: detached_activation_gesture::DeferredClientActivationGesture,
+}
+
+#[cfg(windows)]
+impl DeferredDetachedClientCapture {
+    fn set_scope(&mut self, request: DetachedActivationRequest) {
+        if self.scope.as_ref().is_some_and(|old| old != &request) {
+            self.gesture.retire_scope_for(&request);
+        }
+        self.scope = Some(request);
+    }
+
+    #[cfg(test)]
+    fn capture(
+        &mut self,
+        ctx: &egui::Context,
+        geometry: crate::touch_input::TapZoneGeometry,
+        availability: detached_activation_gesture::ClientActivationAvailability,
+        scope: DetachedActivationRequest,
+    ) -> Option<detached_activation_gesture::ClientActivationSource> {
+        self.set_scope(scope.clone());
+        self.gesture
+            .capture_for_scope(ctx, geometry, availability, &scope)
+    }
+}
+
+#[cfg(windows)]
 pub(crate) struct DeferredDetachedImageWindowShared {
     view: Mutex<DeferredDetachedImageWindowView>,
     events: Mutex<Vec<DeferredDetachedImageWindowEvent>>,
     first_callback_sent: AtomicBool,
     right_drag_capture: Mutex<DeferredDetachedRightDragCapture>,
+    activation_gesture: Mutex<DeferredDetachedClientCapture>,
 }
 
 #[cfg(windows)]
 impl DeferredDetachedImageWindowShared {
+    pub(crate) fn set_activation_availability(
+        &self,
+        availability: detached_activation_gesture::ClientActivationAvailability,
+    ) {
+        if let Ok(mut gesture) = self.activation_gesture.lock() {
+            gesture.gesture.set_availability(availability);
+        }
+    }
+
+    pub(crate) fn feed_native_activation_boundary(
+        &self,
+        scope: DetachedActivationRequest,
+        boundary: crate::key_input::NativeClientInputBoundary,
+    ) {
+        if let Ok(mut gesture) = self.activation_gesture.lock() {
+            gesture.gesture.feed_native_scoped_boundary(scope, boundary);
+        }
+    }
+
+    pub(crate) fn capture_client_activation(
+        &self,
+        ctx: &egui::Context,
+        geometry: crate::touch_input::TapZoneGeometry,
+        availability: detached_activation_gesture::ClientActivationAvailability,
+        scope: DetachedActivationRequest,
+        close_rect: egui::Rect,
+    ) -> Option<detached_activation_gesture::ClientActivationSource> {
+        let mut capture = self.activation_gesture.lock().ok()?;
+        capture.set_scope(scope.clone());
+        capture.gesture.capture_for_scope_with_close(
+            ctx,
+            geometry,
+            availability,
+            &scope,
+            close_rect,
+        )
+    }
+
+    pub(crate) fn drain_client_activation_decisions(
+        &self,
+    ) -> Vec<detached_activation_gesture::ClientActivationDecision> {
+        self.activation_gesture
+            .lock()
+            .map(|mut gesture| gesture.gesture.drain_decisions())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn set_client_activation_scope(&self, scope: DetachedActivationRequest) {
+        if let Ok(mut capture) = self.activation_gesture.lock() {
+            capture.set_scope(scope);
+        }
+    }
+
     pub(crate) fn new(view: DeferredDetachedImageWindowView) -> Self {
         Self {
             view: Mutex::new(view),
             events: Mutex::new(Vec::new()),
             first_callback_sent: AtomicBool::new(false),
             right_drag_capture: Mutex::new(DeferredDetachedRightDragCapture::default()),
+            activation_gesture: Mutex::new(Default::default()),
         }
     }
 
@@ -2409,8 +2500,6 @@ impl App {
                 .smart_folder_session()
                 .is_some_and(|session| session.test_script_phase() == "Root")
     }
-
-    const DETACHED_PHYSICAL_ACTIVATION_MAX_DRAG_PX: i32 = 8;
 
     fn detached_window_runtime_default_linked(&self) -> bool {
         !self.detached_viewer_independent_active
@@ -3087,435 +3176,6 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn detached_physical_activation_dragged_too_far(
-        start: Option<(i32, i32)>,
-        current: Option<(i32, i32)>,
-    ) -> bool {
-        let (Some((sx, sy)), Some((cx, cy))) = (start, current) else {
-            return false;
-        };
-        let dx = i64::from(cx) - i64::from(sx);
-        let dy = i64::from(cy) - i64::from(sy);
-        let limit = i64::from(Self::DETACHED_PHYSICAL_ACTIVATION_MAX_DRAG_PX);
-        dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy)) > limit.saturating_mul(limit)
-    }
-
-    #[cfg(windows)]
-    #[cfg(windows)]
-    fn detached_activation_target_full_rect(
-        target: DetachedActivationWatchTargetRect,
-    ) -> egui::Rect {
-        egui::Rect::from_min_max(
-            egui::pos2(target.left as f32, target.top as f32),
-            egui::pos2(target.right as f32, target.bottom as f32),
-        )
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn detached_activation_close_button_contains(
-        target: DetachedActivationWatchTargetRect,
-        cursor_pos: Option<(i32, i32)>,
-    ) -> bool {
-        let Some((x, y)) = cursor_pos else {
-            return false;
-        };
-        let full_rect = Self::detached_activation_target_full_rect(target);
-        let rect = match target.close_hit_test {
-            DetachedActivationCloseHitTest::ImageBar => {
-                crate::ui_fullscreen::detached_image_window_bar_close_button_rect(full_rect)
-            }
-            DetachedActivationCloseHitTest::MusicChrome => {
-                match Self::parked_live_music_close_slot_rect(
-                    full_rect,
-                    crate::ui_helpers::panel_edge_trigger_px(full_rect.width()),
-                ) {
-                    Some(rect) => rect,
-                    None => return false,
-                }
-            }
-        };
-        (x as f32) >= rect.left()
-            && (x as f32) < rect.right()
-            && (y as f32) >= rect.top()
-            && (y as f32) < rect.bottom()
-    }
-
-    #[cfg(windows)]
-    fn detached_activation_native_close_hit(
-        target: DetachedActivationWatchTargetRect,
-        sample: DetachedActivationWatchSample,
-    ) -> bool {
-        sample.native_close_hit_hwnd != 0 && sample.native_close_hit_hwnd == target.hwnd
-    }
-
-    #[cfg(windows)]
-    fn detached_activation_close_hit(
-        target: DetachedActivationWatchTargetRect,
-        sample: DetachedActivationWatchSample,
-    ) -> bool {
-        Self::detached_activation_native_close_hit(target, sample)
-            || Self::detached_activation_close_button_contains(target, sample.cursor_pos)
-    }
-
-    #[cfg(windows)]
-    fn detached_activation_title_bar_contains(
-        target: DetachedActivationWatchTargetRect,
-        cursor_pos: Option<(i32, i32)>,
-    ) -> bool {
-        let Some((x, y)) = cursor_pos else {
-            return false;
-        };
-        x >= target.left
-            && x < target.right
-            && y >= target.top
-            && (y as f32) < target.top as f32 + crate::ui_fullscreen::TOP_BAR_HEIGHT
-    }
-
-    #[cfg(windows)]
-    fn detached_activation_cursor_root_allows_repair(
-        targets: &[DetachedActivationWatchTargetRect],
-        sample: DetachedActivationWatchSample,
-        main_hwnd: u64,
-        claimed_hwnds: &[u64],
-    ) -> bool {
-        sample.cursor_root_hwnd != 0
-            && sample.cursor_root_hwnd != main_hwnd
-            && !claimed_hwnds.contains(&sample.cursor_root_hwnd)
-            && !targets
-                .iter()
-                .any(|target| target.hwnd == sample.cursor_root_hwnd)
-    }
-
-    #[cfg(windows)]
-    fn detached_activation_candidate_for_down_edge(
-        targets: &[DetachedActivationWatchTargetRect],
-        sample: DetachedActivationWatchSample,
-        main_hwnd: u64,
-        claimed_hwnds: &[u64],
-    ) -> Option<DetachedActivationClickCandidate> {
-        // 直接ヒットは「OS が報告したクリック先 (cursor_root_hwnd) と一致する target」を
-        // 最優先で探す。targets のリスト順は z-order ではないため、矩形あたり判定を
-        // リスト先頭から行うと、重なった parked 窓で背面窓が前面窓へのクリックを吸い、
-        // hwnd 不一致でクリックが丸ごと棄却される (findings-19 実機バグ: 重なった
-        // Page 107 窓がクリック不能)。
-        if let Some(target) = Self::detached_activation_target_for_cursor_root(
-            targets,
-            sample.cursor_pos,
-            sample.cursor_root_hwnd,
-        ) {
-            let intent = if Self::detached_activation_close_hit(target, sample) {
-                DetachedActivationClickIntent::Close
-            } else {
-                if !target.eligible {
-                    return None;
-                }
-                DetachedActivationClickIntent::Activate
-            };
-            return Some(DetachedActivationClickCandidate {
-                window_id: target.window_id,
-                hwnd: target.hwnd,
-                repair_hwnd: None,
-                start_screen_pos: sample.cursor_pos,
-                drag_sensitive: Self::detached_activation_title_bar_contains(
-                    target,
-                    sample.cursor_pos,
-                ),
-                intent,
-                moved_too_far: false,
-            });
-        }
-        let target =
-            Self::detached_activation_target_containing_cursor(targets, sample.cursor_pos)?;
-        if !Self::detached_activation_cursor_root_allows_repair(
-            targets,
-            sample,
-            main_hwnd,
-            claimed_hwnds,
-        ) {
-            return None;
-        }
-        let intent = if Self::detached_activation_close_hit(target, sample) {
-            DetachedActivationClickIntent::Close
-        } else {
-            if !target.eligible {
-                return None;
-            }
-            DetachedActivationClickIntent::Activate
-        };
-        Some(DetachedActivationClickCandidate {
-            window_id: target.window_id,
-            hwnd: sample.cursor_root_hwnd,
-            repair_hwnd: (intent == DetachedActivationClickIntent::Activate)
-                .then_some(sample.cursor_root_hwnd),
-            start_screen_pos: sample.cursor_pos,
-            drag_sensitive: Self::detached_activation_title_bar_contains(target, sample.cursor_pos),
-            intent,
-            moved_too_far: false,
-        })
-    }
-
-    #[cfg(windows)]
-    fn detached_activation_target_containing_cursor(
-        targets: &[DetachedActivationWatchTargetRect],
-        cursor_pos: Option<(i32, i32)>,
-    ) -> Option<DetachedActivationWatchTargetRect> {
-        let (x, y) = cursor_pos?;
-        targets.iter().copied().find(|target| {
-            x >= target.left && x < target.right && y >= target.top && y < target.bottom
-        })
-    }
-
-    /// cursor_root_hwnd (OS の WindowFromPoint root) と一致する target を返す。
-    /// 矩形あたり判定だけの `detached_activation_target_containing_cursor` と違い、
-    /// parked 窓が重なっていても実際にクリックされた窓を一意に特定できる。
-    /// 矩形包含も併せて確認するのは、close ボタン / タイトルバー判定が
-    /// target の矩形を基準にしているため。hwnd 一致で矩形だけ外れたクリックは、
-    /// repair 側も targets 内 hwnd を除外するため結局棄却される (= 従来と同じ保守挙動)。
-    #[cfg(windows)]
-    fn detached_activation_target_for_cursor_root(
-        targets: &[DetachedActivationWatchTargetRect],
-        cursor_pos: Option<(i32, i32)>,
-        cursor_root_hwnd: u64,
-    ) -> Option<DetachedActivationWatchTargetRect> {
-        if cursor_root_hwnd == 0 {
-            return None;
-        }
-        let (x, y) = cursor_pos?;
-        targets.iter().copied().find(|target| {
-            target.hwnd == cursor_root_hwnd
-                && x >= target.left
-                && x < target.right
-                && y >= target.top
-                && y < target.bottom
-        })
-    }
-
-    #[cfg(windows)]
-    fn detached_activation_down_rejection_diagnostic(
-        targets: &[DetachedActivationWatchTargetRect],
-        sample: DetachedActivationWatchSample,
-        main_hwnd: u64,
-        claimed_hwnds: &[u64],
-    ) -> Option<DetachedActivationWatchDiagnostic> {
-        let target =
-            Self::detached_activation_target_containing_cursor(targets, sample.cursor_pos)?;
-        let reason = if !target.eligible {
-            "down_ineligible"
-        } else if sample.cursor_root_hwnd == 0 {
-            "down_no_window_from_point"
-        } else if sample.cursor_root_hwnd == main_hwnd {
-            "down_main_window"
-        } else if claimed_hwnds.contains(&sample.cursor_root_hwnd)
-            || targets
-                .iter()
-                .any(|candidate| candidate.hwnd == sample.cursor_root_hwnd)
-        {
-            "down_claimed_window"
-        } else if sample.cursor_root_hwnd != target.hwnd {
-            "down_window_from_point_mismatch"
-        } else {
-            "down_unknown"
-        };
-        Some(DetachedActivationWatchDiagnostic {
-            reason,
-            foreground_hwnd: sample.foreground_hwnd,
-            cursor_root_hwnd: sample.cursor_root_hwnd,
-            cursor_pos: sample.cursor_pos,
-            target_window_id: Some(target.window_id),
-            target_hwnd: Some(target.hwnd),
-        })
-    }
-
-    #[cfg(windows)]
-    fn detached_activation_up_rejection_diagnostic(
-        reason: &'static str,
-        click: DetachedActivationClickCandidate,
-        sample: DetachedActivationWatchSample,
-    ) -> DetachedActivationWatchDiagnostic {
-        DetachedActivationWatchDiagnostic {
-            reason,
-            foreground_hwnd: sample.foreground_hwnd,
-            cursor_root_hwnd: sample.cursor_root_hwnd,
-            cursor_pos: sample.cursor_pos,
-            target_window_id: Some(click.window_id),
-            target_hwnd: Some(click.hwnd),
-        }
-    }
-
-    #[cfg(all(windows, test))]
-    pub(crate) fn detached_activation_watch_step_result(
-        state: &mut DetachedActivationWatchState,
-        sample: DetachedActivationWatchSample,
-        targets: &[DetachedActivationWatchTargetRect],
-    ) -> DetachedActivationWatchStepResult {
-        Self::detached_activation_watch_step_result_with_context(state, sample, targets, 0, &[])
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn detached_activation_watch_step_result_with_context(
-        state: &mut DetachedActivationWatchState,
-        sample: DetachedActivationWatchSample,
-        targets: &[DetachedActivationWatchTargetRect],
-        main_hwnd: u64,
-        claimed_hwnds: &[u64],
-    ) -> DetachedActivationWatchStepResult {
-        if targets.is_empty() {
-            *state = DetachedActivationWatchState::default();
-            return DetachedActivationWatchStepResult::default();
-        }
-
-        let down_edge = sample.left_button_down && !state.left_button_was_down;
-        let up_edge = !sample.left_button_down && state.left_button_was_down;
-        let mut diagnostic = None;
-
-        if down_edge {
-            state.active_click = Self::detached_activation_candidate_for_down_edge(
-                targets,
-                sample,
-                main_hwnd,
-                claimed_hwnds,
-            );
-            if state.active_click.is_none() {
-                diagnostic = Self::detached_activation_down_rejection_diagnostic(
-                    targets,
-                    sample,
-                    main_hwnd,
-                    claimed_hwnds,
-                );
-            }
-        } else if sample.left_button_down
-            && let Some(click) = state.active_click.as_mut()
-            && !click.moved_too_far
-            && click.drag_sensitive
-            && Self::detached_physical_activation_dragged_too_far(
-                click.start_screen_pos,
-                sample.cursor_pos,
-            )
-        {
-            click.moved_too_far = true;
-        }
-
-        let mut activate = None;
-        let mut close = None;
-        if up_edge && let Some(click) = state.active_click.take() {
-            let target = targets
-                .iter()
-                .copied()
-                .find(|target| target.window_id == click.window_id);
-            let target_still_exists = target.is_some();
-            let dragged = click.moved_too_far
-                || (click.drag_sensitive
-                    && Self::detached_physical_activation_dragged_too_far(
-                        click.start_screen_pos,
-                        sample.cursor_pos,
-                    ));
-            if !target_still_exists {
-                diagnostic = Some(Self::detached_activation_up_rejection_diagnostic(
-                    "up_target_gone",
-                    click,
-                    sample,
-                ));
-            } else if click.intent == DetachedActivationClickIntent::Close {
-                if target.is_some_and(|target| Self::detached_activation_close_hit(target, sample))
-                {
-                    close = Some(DetachedCloseRequest {
-                        window_id: click.window_id,
-                    });
-                } else {
-                    diagnostic = Some(Self::detached_activation_up_rejection_diagnostic(
-                        "up_close_outside",
-                        click,
-                        sample,
-                    ));
-                }
-            } else if dragged {
-                diagnostic = Some(Self::detached_activation_up_rejection_diagnostic(
-                    "up_dragged",
-                    click,
-                    sample,
-                ));
-            } else if sample.foreground_hwnd != click.hwnd {
-                diagnostic = Some(Self::detached_activation_up_rejection_diagnostic(
-                    "up_foreground_mismatch",
-                    click,
-                    sample,
-                ));
-            } else {
-                activate = Some(DetachedActivationRequest {
-                    window_id: click.window_id,
-                    repair_hwnd: click.repair_hwnd,
-                });
-            }
-        }
-
-        state.left_button_was_down = sample.left_button_down;
-        DetachedActivationWatchStepResult {
-            activation: activate,
-            close,
-            diagnostic,
-        }
-    }
-
-    #[cfg(all(windows, test))]
-    pub(crate) fn detached_activation_watch_step(
-        state: &mut DetachedActivationWatchState,
-        sample: DetachedActivationWatchSample,
-        targets: &[DetachedActivationWatchTargetRect],
-    ) -> Option<u64> {
-        Self::detached_activation_watch_step_result(state, sample, targets)
-            .activation
-            .map(|request| request.window_id)
-    }
-
-    #[cfg(windows)]
-    fn repair_detached_window_hwnd_from_watcher(
-        &mut self,
-        ctx: &egui::Context,
-        window_id: u64,
-        hwnd: u64,
-    ) -> bool {
-        let viewport_id = Self::detached_image_window_viewport_id(window_id);
-        let Some(allocation) =
-            eframe::native_window_input::native_window_allocation(ctx, viewport_id)
-        else {
-            return false;
-        };
-        if allocation.windows_hwnd.map(|raw| raw as u64) != Some(hwnd) {
-            return false;
-        }
-        self.adopt_backend_detached_window_hwnd(ctx, window_id, "passive", viewport_id)
-    }
-
-    #[cfg(windows)]
-    fn deferred_detached_activation_watch_targets(&self) -> Vec<DetachedActivationWatchTarget> {
-        self.detached_image_windows
-            .iter()
-            .filter(|window| self.detached_window_can_activate(window.id))
-            .filter_map(|window| {
-                let runtime = self.detached_window_manager.runtime(window.id)?;
-                if runtime.state != DetachedWindowState::Parked {
-                    return None;
-                }
-                let hwnd = self.detached_window_hwnd_alive_for_window_id(window.id)?;
-                let close_hit_test = if self
-                    .parked_live_music_window_info_for_window_id(window.id)
-                    .is_some()
-                {
-                    DetachedActivationCloseHitTest::MusicChrome
-                } else {
-                    DetachedActivationCloseHitTest::ImageBar
-                };
-                Some(DetachedActivationWatchTarget {
-                    window_id: window.id,
-                    hwnd,
-                    eligible: self.frame_counter >= window.activation_ready_frame,
-                    close_hit_test,
-                })
-            })
-            .collect()
-    }
-
-    #[cfg(windows)]
     pub(crate) fn refresh_parked_detached_window_hwnd_liveness(&mut self) {
         let ids = self
             .detached_image_windows
@@ -3545,102 +3205,6 @@ impl App {
         }
     }
 
-    #[cfg(windows)]
-    pub(crate) fn sync_deferred_detached_activation_watcher(&self, ctx: &egui::Context) {
-        self.detached_window_manager
-            .update_activation_watch_targets(
-                self.deferred_detached_activation_watch_targets(),
-                self.main_hwnd
-                    .and_then(|hwnd| u64::try_from(hwnd).ok())
-                    .unwrap_or(0),
-                ctx,
-            );
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn service_detached_watcher_close_requests(&mut self, ctx: &egui::Context) {
-        let close_ids = self
-            .detached_window_manager
-            .drain_close_requests()
-            .into_iter()
-            .map(|request| request.window_id)
-            .collect::<Vec<_>>();
-        if !close_ids.is_empty() {
-            self.request_detached_image_window_close_by_ids(
-                ctx,
-                &close_ids,
-                "watcher_passive_close",
-                None,
-            );
-        }
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn drain_deferred_detached_activation_watcher(&mut self, ctx: &egui::Context) {
-        for diagnostic in self.detached_window_manager.drain_watch_diagnostics() {
-            let cursor = diagnostic
-                .cursor_pos
-                .map(|(x, y)| format!("({x},{y})"))
-                .unwrap_or_else(|| "none".to_string());
-            let target_id = diagnostic
-                .target_window_id
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "none".to_string());
-            let target_hwnd = diagnostic
-                .target_hwnd
-                .map(|hwnd| format!("0x{hwnd:x}"))
-                .unwrap_or_else(|| "none".to_string());
-            self.log_detached_image_window_debug(format!(
-                "deferred_activate_watcher_rejected reason={} foreground=0x{:x} \
-                 cursor_root=0x{:x} cursor={} target_id={} target_hwnd={} frame={}",
-                diagnostic.reason,
-                diagnostic.foreground_hwnd,
-                diagnostic.cursor_root_hwnd,
-                cursor,
-                target_id,
-                target_hwnd,
-                self.frame_counter
-            ));
-        }
-        for request in self.detached_window_manager.drain_activation_requests() {
-            let id = request.window_id;
-            if let Some(repair_hwnd) = request.repair_hwnd
-                && !self.repair_detached_window_hwnd_from_watcher(ctx, id, repair_hwnd)
-            {
-                let known_hwnd = self.detached_window_hwnd_raw_for_window_id(id);
-                let known_state = self.detached_window_state(id);
-                let claimed_by = self
-                    .detached_window_manager
-                    .hwnd_claimed_by_other(id, repair_hwnd);
-                self.log_detached_image_window_debug(format!(
-                    "deferred_activate_watcher_dropped id={id} reason=repair_failed \
-                     observed_hwnd=0x{repair_hwnd:x} observed_state=\"{}\" \
-                     known_hwnd=0x{known_hwnd:x} known_state={known_state:?} \
-                     known_hwnd_state=\"{}\" claimed_by={claimed_by:?} frame={}",
-                    Self::win32_hwnd_debug_state(repair_hwnd),
-                    Self::win32_hwnd_debug_state(known_hwnd),
-                    self.frame_counter
-                ));
-                continue;
-            }
-            let can_activate = self.detached_image_windows.iter().any(|window| {
-                window.id == id
-                    && self.detached_window_can_activate(window.id)
-                    && self.detached_window_state(id) == Some(DetachedWindowState::Parked)
-            });
-            if can_activate {
-                self.queue_deferred_detached_window_activation(id, "watcher_left_release");
-                ctx.request_repaint();
-            } else {
-                self.log_detached_image_window_debug(format!(
-                    "deferred_activate_watcher_dropped id={id} reason=no_reopen_route \
-                     frame={}",
-                    self.frame_counter
-                ));
-            }
-        }
-    }
-
     #[cfg(all(windows, test))]
     pub(crate) fn detached_window_deferred_activation_pending(&self, window_id: u64) -> bool {
         self.detached_window_manager
@@ -3664,6 +3228,13 @@ impl App {
             return false;
         };
         let id = dispatch.window_id;
+        if let Some(request) = dispatch.activation.as_ref() {
+            let decision = self.detached_activation_admission(ctx, request);
+            if decision != DetachedActivationDecision::Accepted {
+                request.log("commit", decision);
+                return false;
+            }
+        }
         if let Some(DetachedWindowCommand::PageOverview(command)) = dispatch.command.as_ref() {
             if !self.can_activate_detached_page_overview_command(id, command) {
                 self.detached_window_manager.discard_detached_command(id);
@@ -3678,6 +3249,10 @@ impl App {
             self.active_detached_context_is_at_rest()
         ));
         if self.activate_detached_image_window_snapshot(ctx, id) {
+            self.sync_detached_native_input_targets(ctx);
+            if let Some(request) = dispatch.activation.as_ref() {
+                request.log("commit", DetachedActivationDecision::Committed);
+            }
             if let Some(command) = dispatch.command {
                 if self.active_detached_window_id() == Some(id) {
                     if self
@@ -3712,6 +3287,9 @@ impl App {
             ));
             true
         } else {
+            if let Some(request) = dispatch.activation.as_ref() {
+                request.log("commit", DetachedActivationDecision::ActivationFailed);
+            }
             self.detached_window_manager.discard_detached_command(id);
             self.log_detached_image_window_debug(format!(
                 "deferred_activate_commit_failed frame={frame} id={id} \
@@ -101022,9 +100600,7 @@ impl App {
         #[cfg(windows)]
         self.refresh_parked_detached_window_hwnd_liveness();
         #[cfg(windows)]
-        self.sync_deferred_detached_activation_watcher(ctx);
-        #[cfg(windows)]
-        self.drain_deferred_detached_activation_watcher(ctx);
+        self.service_deferred_detached_window_events(ctx);
         #[cfg(windows)]
         self.advance_detached_window_host_placements(ctx);
         #[cfg(all(windows, feature = "test-script"))]

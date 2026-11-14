@@ -284,6 +284,9 @@ R2b 完了条件 (純粋 reducer / 合法遷移 / typed state 集約) を満た�
 `DetachedWindowRuntime` と watcher の型・worker 実装も同モジュールへ移し、`App` は設定への
 placement 永続化、メディア presenter、ログなど複数領域をまたぐオーケストレーションだけを担う。
 
+2026-11-14の依頼50 Aで、このwatcherは撤去し、callback／native input ownerの離散入力から
+Managerの同じintentへ配送する構造へ置き換えた（§11）。以下は構造分離当時の記録。
+
 - runtime の生成、state / linked / placement / trim bbox / builder latch / HWND / deferred activation
   の変更は Manager の意味付き API を経由する。runtime map への直接変更は残さない。
 - gamepad の固定入力は Manager が保持する最後の入力面を fallback に使う。通常は OS 前面 HWND
@@ -1454,6 +1457,23 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ---
 
 ## 11. リワーク外からの変更記録
+
+### 2026-11-14: §1.767 サブPC依頼50 A — Parked静止画の復帰を離散入力へ集約
+
+設計担当と独立設計レビュー（Sol / xhigh、2026-11-14）が、BA-7の入力所有・確定点を直す構造的な変更であることに合意した。
+managerのactivation polling watcher、Appのwatch step／target／drain、watcherのHWND repairを撤去した。
+clientはdeferred callbackのgesture owner、non-clientはCの確定HWNDのnative owner、mediaは既存native入力から、
+生成時window／registration／context／allocationを持つ同じintentとroot commitへ配送する。
+client closeも同gestureの排他的destinationとして既存Frame closeへ渡し、keyboard／accessibilityとnative closeは既存ownerを保つ。
+overview／right-drag優先・modal／capture lost／touch Cancelの終端・
+discard再passでの一回消費を同ownerで扱う。focusだけ・keyboardだけの復帰は追加しない。
+Cのeframe/backend hook、Bの外部open、placement／focus基盤は変更しない。
+Active時の保留raw inputが新callbackへ届く前提を確認し、Aの所有証跡をegui-winitの実正規化点で発行しeguiの非操作markerと共に運ぶ。
+旧State入力のappendや先頭spliceでproofが別操作へ移らず、RawInput／IME終端は保持する。
+新しいApp field・時間窓・retry・追加repaintはない。
+過去の§9.3／§9.4等のwatcher記載は当時の履歴で、現在の所有は本項とarchitecture-overviewを正本とする。
+変更範囲、旧テストとの対応、診断ログ、検証結果と実機未確認は
+[依頼50調査書 §2.4](depth-parallax-realmachine50-investigation.md#24-a-実装記録2026-11-14ba-7)に記録する。
 
 ### 2026-11-14: §1.767 サブPC依頼50 C — native allocation に入力 HWND の正本を集約
 

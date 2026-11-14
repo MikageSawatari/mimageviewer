@@ -1,5 +1,26 @@
 # egui 0.37.0 のローカル変更（段2a-1／2a-2／2a-3）
 
+## §1.767 A: pointer開始の所有証跡（2026-11-14）
+
+`Event::PointerInputProvenance(Id)`は、直後のraw Touch Start／primary pressだけに属するopaqueな証跡で、
+単独ではpointer・キー・IME・focusを操作しない。egui-winitの実入力追加点で所有者が返したIDを付け、
+Appの既存gesture ownerが同じIDのscope付きproofと照合する。旧Active表示の蓄積済clickを新Parked callbackへ
+再所属させないためのAの契約であり、Cのnative allocation寿命・HWND同定は変更しない。
+並列Vecのindexではなく同じevent列に置くため、RawInputのtake／append、native State再生成時の保留入力、
+先頭へのキーrelease追加、layout replayでも証跡とpressの関係が保たれる。孤立markerを後のpressへ持ち越してはならない。
+InputStateの既存event保持を使い、RawInput／IME／touch終端の一括clearをしない。
+
+上流へ戻すときはegui-winitのobserver・本体gesture consumerと一緒に扱うこと。
+observerを導入しないintegrationはmarkerを生成せず、従来の入力動作を維持する。
+`data/input/event.rs`のheadless試験で非操作性・take／append・replay時の保持を検査する。
+
+`Response::clicked_with_keyboard_or_accessibility()`は既存の`FAKE_PRIMARY_CLICKED`だけを公開する。
+Parked窓のpointer closeを同じcanonical gesture ownerへ移し、既存keyboard／accessibility操作は
+保持するためのprojectionであり、新たなキー判定・focus変更を加えない。同frameのpointer操作と
+keyboard操作が共存しても、pointer位置や`clicked_by`の否定から入力元を推測しない。
+`response.rs`の3試験でpointerだけ／keyboardだけ／同時入力を検査する。
+上流へ戻す際は既存`clicked()`の意味を保ち、アプリ側のpointer command ownerと合わせて移す。
+
 ## §1.767: native入力所有者の正確なpointer取消（2026-11-14）
 
 `Context::cancel_pointer_button_for(ViewportRegistration, PointerButton, Id)` は、

@@ -96,6 +96,15 @@ pub enum Event {
     /// The mouse or touch moved to a new place.
     PointerMoved(Pos2),
 
+    /// Opaque provenance for the immediately following primary press or raw
+    /// touch start. This is metadata, never a pointer operation by itself.
+    ///
+    /// An integration may attach an input-owner proof without separating it
+    /// from its event when RawInput is retained, appended or replayed. Consumers
+    /// must validate the matching proof and must not carry an orphan marker to
+    /// a later press. Ordinary egui pointer/keyboard/IME handling ignores it.
+    PointerInputProvenance(crate::Id),
+
     /// The mouse moved, the units are unspecified.
     /// Represents the actual movement of the mouse, without acceleration or clamped by screen edges.
     /// `PointerMoved` and `MouseMoved` can be sent at the same time.
@@ -203,4 +212,105 @@ pub enum Event {
 
     /// An assistive technology (e.g. screen reader) requested an action.
     AccessKitActionRequest(accesskit::ActionRequest),
+}
+
+#[cfg(test)]
+mod pointer_provenance_tests {
+    use super::*;
+    use crate::{Context, Id, RawInput};
+
+    fn press() -> Event {
+        Event::PointerButton {
+            pos: crate::pos2(20.0, 30.0),
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn pointer_input_provenance_is_metadata_without_pointer_or_key_effects() {
+        let ctx = Context::default();
+        let marker = Event::PointerInputProvenance(Id::new("owner-proof"));
+        ctx.run_ui(
+            RawInput {
+                events: vec![marker.clone()],
+                ..Default::default()
+            },
+            |ui| {
+                ui.ctx().input(|input| {
+                    assert_eq!(input.raw.events, vec![marker.clone()]);
+                    assert!(!input.pointer.any_down());
+                    assert!(!input.pointer.any_pressed());
+                    assert!(!input.pointer.any_released());
+                    assert!(input.keys_down.is_empty());
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn pointer_input_provenance_survives_take_append_and_prepended_key_release() {
+        let old_id = Id::new("retained-owner");
+        let new_id = Id::new("successor-owner");
+        let mut old = RawInput {
+            events: vec![Event::PointerInputProvenance(old_id), press()],
+            ..Default::default()
+        };
+        let mut retained = old.take();
+        assert!(old.events.is_empty());
+        retained.append(RawInput {
+            events: vec![Event::PointerInputProvenance(new_id), press()],
+            ..Default::default()
+        });
+        retained.events.insert(
+            0,
+            Event::Key {
+                key: crate::Key::A,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            },
+        );
+        assert_eq!(
+            &retained.events[1..],
+            &[
+                Event::PointerInputProvenance(old_id),
+                press(),
+                Event::PointerInputProvenance(new_id),
+                press(),
+            ]
+        );
+    }
+
+    #[test]
+    fn pointer_input_provenance_is_not_replayed_apart_from_its_press() {
+        let ctx = Context::default();
+        let marker = Event::PointerInputProvenance(Id::new("replay-owner"));
+        let mut passes = 0;
+        ctx.run_ui(
+            RawInput {
+                events: vec![marker.clone(), press()],
+                ..Default::default()
+            },
+            |ui| {
+                passes += 1;
+                let first_pass = ui.ctx().current_pass_index() == 0;
+                ui.ctx().input(|input| {
+                    if first_pass {
+                        assert_eq!(input.raw.events, vec![marker.clone(), press()]);
+                    } else {
+                        assert!(input.raw.events.is_empty());
+                    }
+                });
+                if first_pass {
+                    ui.ctx().request_discard("provenance replay");
+                }
+            },
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(passes, 2);
+    }
 }

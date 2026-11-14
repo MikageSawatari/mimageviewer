@@ -5690,6 +5690,12 @@ impl App {
             .native_video_parked_live_activation_requests
             .contains(&window_id)
         {
+            let request = self.detached_activation_request(
+                ctx,
+                window_id,
+                super::DetachedActivationSource::NativeMedia,
+            );
+            self.accept_discrete_detached_activation(ctx, request);
             self.native_video_parked_live_activation_requests
                 .push(window_id);
             ctx.request_repaint();

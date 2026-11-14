@@ -4144,6 +4144,7 @@ dependencies = [
  "egui",
  "egui-ime",
  "egui-wgpu",
+ "egui-winit",
  "egui_kittest",
  "encoding_rs",
  "fast_image_resize",

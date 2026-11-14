@@ -27,6 +27,7 @@ mod macos_scroll_momentum;
 pub mod clipboard;
 #[cfg(not(target_arch = "wasm32"))]
 mod dropped_file;
+pub mod pointer_input_observer;
 mod safe_area;
 mod window_settings;
 
@@ -371,6 +372,23 @@ impl State {
         window: &Window,
         event: &winit::event::WindowEvent,
     ) -> EventResponse {
+        let events_before = self.egui_input.events.len();
+        let response = self.on_window_event_inner(window, event);
+        pointer_input_observer::observe(
+            &self.egui_ctx,
+            self.viewport_id,
+            event,
+            &mut self.egui_input.events,
+            events_before,
+        );
+        response
+    }
+
+    fn on_window_event_inner(
+        &mut self,
+        window: &Window,
+        event: &winit::event::WindowEvent,
+    ) -> EventResponse {
         profiling::function_scope!(short_window_event_description(event));
 
         #[cfg(feature = "accesskit")]
@@ -444,7 +462,7 @@ impl State {
             }
             // WindowEvent::TouchpadPressure {device_id, pressure, stage, ..  } => {} // TODO(emilk)
             WindowEvent::Touch(touch) => {
-                self.on_touch(window, touch);
+                self.on_touch(touch, pixels_per_point(&self.egui_ctx, window));
                 let consumed = match touch.phase {
                     winit::event::TouchPhase::Started
                     | winit::event::TouchPhase::Ended
@@ -865,6 +883,10 @@ impl State {
             pos_in_pixels.x as f32 / pixels_per_point,
             pos_in_pixels.y as f32 / pixels_per_point,
         );
+        self.on_cursor_moved_in_points(pos_in_points);
+    }
+
+    fn on_cursor_moved_in_points(&mut self, pos_in_points: egui::Pos2) {
         self.pointer_pos_in_points = Some(pos_in_points);
 
         if self.simulate_touch_screen {
@@ -888,18 +910,18 @@ impl State {
         }
     }
 
-    fn on_touch(&mut self, window: &Window, touch: &winit::event::Touch) {
-        let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
+    fn on_touch(&mut self, touch: &winit::event::Touch, pixels_per_point: f32) {
+        let pos_in_points = egui::pos2(
+            touch.location.x as f32 / pixels_per_point,
+            touch.location.y as f32 / pixels_per_point,
+        );
 
         // Emit touch event
         self.egui_input.events.push(egui::Event::Touch {
             device_id: egui::TouchDeviceId(egui::epaint::util::hash(touch.device_id)),
             id: egui::TouchId::from(touch.id),
             phase: to_egui_touch_phase(touch.phase),
-            pos: egui::pos2(
-                touch.location.x as f32 / pixels_per_point,
-                touch.location.y as f32 / pixels_per_point,
-            ),
+            pos: pos_in_points,
             force: match touch.force {
                 Some(winit::event::Force::Normalized(force)) => Some(force as f32),
                 Some(winit::event::Force::Calibrated {
@@ -919,14 +941,14 @@ impl State {
                 winit::event::TouchPhase::Started => {
                     self.pointer_touch_id = Some(touch.id);
                     // First move the pointer to the right location
-                    self.on_cursor_moved(window, touch.location);
+                    self.on_cursor_moved_in_points(pos_in_points);
                     self.on_mouse_button_input(
                         winit::event::ElementState::Pressed,
                         winit::event::MouseButton::Left,
                     );
                 }
                 winit::event::TouchPhase::Moved => {
-                    self.on_cursor_moved(window, touch.location);
+                    self.on_cursor_moved_in_points(pos_in_points);
                 }
                 winit::event::TouchPhase::Ended => {
                     self.pointer_touch_id = None;

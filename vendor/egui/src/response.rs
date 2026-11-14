@@ -186,7 +186,17 @@ impl Response {
     /// You can use [`Self::interact`] to sense more things *after* adding a widget.
     #[inline(always)]
     pub fn clicked(&self) -> bool {
-        self.flags.contains(Flags::FAKE_PRIMARY_CLICKED) || self.clicked_by(PointerButton::Primary)
+        self.clicked_with_keyboard_or_accessibility() || self.clicked_by(PointerButton::Primary)
+    }
+
+    /// Whether an existing keyboard or accessibility action activated this widget.
+    ///
+    /// Unlike [`Self::clicked`], this excludes pointer input, even when pointer
+    /// and keyboard actions arrive in the same frame. This lets an application
+    /// route pointer gestures through their own owner without losing other input.
+    #[inline(always)]
+    pub fn clicked_with_keyboard_or_accessibility(&self) -> bool {
+        self.flags.contains(Flags::FAKE_PRIMARY_CLICKED)
     }
 
     /// Returns true if this widget was clicked this frame by the given mouse button.
@@ -1291,5 +1301,84 @@ impl<R> InnerResponse<R> {
     #[inline]
     pub fn new(inner: R, response: Response) -> Self {
         Self { inner, response }
+    }
+}
+
+#[cfg(test)]
+mod non_pointer_click_tests {
+    use super::*;
+
+    fn response_for_input(keyboard: bool, pointer: bool) -> Response {
+        let ctx = Context::default();
+        let mut response = None;
+        let screen = Rect::from_min_size(Pos2::ZERO, crate::vec2(400.0, 300.0));
+        ctx.run_ui(
+            crate::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                response = Some(ui.button("close"));
+            },
+        )
+        .drop_without_applying_deltas();
+        let previous = response.take().unwrap();
+        ctx.memory_mut(|memory| memory.request_focus(previous.id));
+        let mut events = Vec::new();
+        if keyboard {
+            events.push(crate::Event::Key {
+                key: crate::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: crate::Modifiers::NONE,
+            });
+        }
+        if pointer {
+            let pos = previous.rect.center();
+            events.push(crate::Event::PointerMoved(pos));
+            for pressed in [true, false] {
+                events.push(crate::Event::PointerButton {
+                    pos,
+                    pressed,
+                    button: PointerButton::Primary,
+                    modifiers: crate::Modifiers::NONE,
+                });
+            }
+        }
+        ctx.run_ui(
+            crate::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                response = Some(ui.button("close"));
+            },
+        )
+        .drop_without_applying_deltas();
+        response.unwrap()
+    }
+
+    #[test]
+    fn non_pointer_click_excludes_pointer_only_input() {
+        let response = response_for_input(false, true);
+        assert!(response.clicked_by(PointerButton::Primary));
+        assert!(!response.clicked_with_keyboard_or_accessibility());
+    }
+
+    #[test]
+    fn non_pointer_click_keeps_keyboard_input() {
+        let response = response_for_input(true, false);
+        assert!(response.clicked_with_keyboard_or_accessibility());
+        assert!(!response.clicked_by(PointerButton::Primary));
+    }
+
+    #[test]
+    fn non_pointer_click_keeps_keyboard_with_simultaneous_pointer() {
+        let response = response_for_input(true, true);
+        assert!(response.clicked_by(PointerButton::Primary));
+        assert!(response.interact_pointer_pos().is_some());
+        assert!(response.clicked_with_keyboard_or_accessibility());
     }
 }

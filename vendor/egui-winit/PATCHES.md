@@ -74,3 +74,42 @@ The shared IME implementation lives in crates/egui-ime; egui-winit and
 eframe use ../../crates/egui-ime. Archive/VCS/checksum and original file hashes
 were moved to vendor/upstream-provenance.json. Graph migration is not evidence
 that runtime checks or release gates have passed.
+
+## 依頼50 A: normalized pointer observer（2026-11-14）
+
+Parked静止画の復帰gestureを、後続passでRawInputを読む時点ではなく、実入力を生成した時点の
+ownerに所属させるための観測APIを追加した。Active時に蓄積したDown/Upを、Immediateから
+Deferredへ切り替えた後の新callbackが復帰操作として再所属させないために使う。
+
+- `pointer_input_observer`の公開APIはContext共有のobserverを登録・解除する。
+  `State::on_window_event`は既存変換をinnerへ委譲し、そのWindowEventが実際に追加した
+  `egui_input.events`のsliceだけを観測する。observerはContext data lockを解放してから
+  最大一度呼ぶ。利用側は共有input ownerへのenqueueだけを行い、App/eframeへ再入しない。
+- observerは`Option<egui::Id>`を返す。Pressedの生成時ownerを証明できた場合のopaque tokenだけを、
+  そのWindowEventが追加した最初のraw Touch Startまたはprimary pressの直前へ
+  `Event::PointerInputProvenance(id)`として挿入する。NoneとReleased/Cancelledの返値では挿入しない。
+  markerは非操作イベントで、古いActive入力と新しいParked入力が同じbatchへ合流しても
+  新しいproofを古いDownが奪わないための相関である。event indexによる推測は使わず、
+  RawInputのtake/append、旧Stateの保留入力との合流、key releaseの先頭追加、raw列の再利用でも
+  markerが対応Startと一緒に移動する。eguiの通常pointer操作を生成・取消するmarkerではない。
+  egui自身のdiscard再passはvolatile eventsを再配送しないため、markerもStartも再配送しない。
+- sourceは物理WindowEventに従い、MouseInputのtouch simulationもMouse、TouchはTouch(id)とする。
+  mouse primaryのraw pressがなければPressedを生成しない。位置消失等でraw releaseを追加できない
+  mouse releaseはCancelledを通知し、既存gestureを未来のreleaseへ残さない。
+  Touchはraw Start/End/Cancelを使い、primary昇格のない指も通知する。昇格分の二重通知はしない。
+  motion、focus、keyboard、非primary mouseは復帰producerにしない。
+- RawInput/IME/event列を消去・再構成せず、State fieldを追加しない。winitのWM_POINTER履歴や
+  WM_TOUCH、eframeのallocation/lifecycleには手を入れない。headlessテストのため、既存のtouch
+  変換が必要とするWindow由来のscaleとcursor座標変換だけをhelper境界へ分けた。
+
+回帰は実WindowEvent・Stateの実mouse/touch producer・追加sliceのmappingを使い、位置なし、
+既存queueの非再所属、touch simulation、非昇格touch、取消、二重昇格なし、Context/viewportの
+所有、callbackからのContext参照・observer解除を検査する。Window/EventLoopは生成しない。
+provenanceのSome/None、fresh Start直前だけの挿入、Touchの昇格有無、terminal返値の無視、
+RawInputの実take/appendとkey先頭追加、eguiのdiscardによる実再passも検査する。
+実Window経由の配送・実機での復帰はこのheadless回帰の証明範囲には含めない。
+
+上流へ戻す際は、このAPIを削除するだけで利用側を古いRawInputの推測へ戻さないこと。
+同等の生成時通知・物理source・一イベント一通知・Context lock外callbackの契約を保ち、
+利用側のowner証明と、markerによる実Startとの相関を合わせて移植する。
+単なるnative Down/Up通知やbatch内FIFO/indexで置換してはならない。

@@ -21,6 +21,9 @@ impl ViewportCommandBinding {
     pub(super) fn viewport_id(&self) -> egui::ViewportId {
         self.registration.viewport_id()
     }
+    pub(super) fn registration(&self) -> egui::ViewportRegistration {
+        self.registration
+    }
     pub(super) fn transfer_retirement(self) {
         self.context.approve_viewport_retirement(self.registration);
     }

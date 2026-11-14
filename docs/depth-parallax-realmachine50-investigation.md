@@ -100,6 +100,156 @@ polling周期短縮、eligibleへの例外追加、focusで強制resume、pause�
 実装前レビューではnon-client / touchも含む入力producerの対応表と一意性を確定する。
 この修正だけで今回のAが直ったとは扱わず、§6の診断と実機再確認を残す。
 
+### 2.4 A 実装記録（2026-11-14、BA-7）
+
+設計担当の決定と独立設計レビュー（Sol / xhigh、2026-11-14）のP2を反映した。
+これは入力の所有・確定点を離散イベントへ集約する構造的な変更であることに双方が合意した。
+Cのnative allocation契約を参照し、Cのeframe/backend hookは変更しない。Aの入力正規化通知を
+`vendor/egui-winit`へ、非操作のprovenance markerを`vendor/egui`へ追加した。Bは今回の対象外。
+
+| 入力 | producerと確定 |
+| --- | --- |
+| client click / 単指tap | deferred callbackの`DeferredClientActivationGesture`。順序付きraw primary edgeとeguiのclick判定、既存TouchFrameのraw Touch／昇格Pointer相関で完結した操作だけを既存event queueへ送る。最初の操作は復帰だけに消費しactiveへ再配送しない |
+| non-client | Cの確定HWNDに付いたkey subclassのnative input owner。`Mouse / Pointer(id)`が押下からDefSubclassProcのnative操作終了／取消まで所有する。既存WH_GETMESSAGEのPM_REMOVE観測でnative move/resize loopが消費する終端も同ownerへ渡す。昇格NC mouseはraw pointerの第二producerにしない |
+| page-overview / right-drag | 既存command ownerを維持。overview面全体・secondary操作は通常clickのproducerにしない。認識済commandは同じmanager intentの中でactivation-onlyより優先する |
+| bar close / native close | clientの同gesture ownerがStart時に`WindowClose(close_rect)`を確定し、同じcontrol内での完結だけを既存`Frame.bar_close_requested`へ渡す。outside／drag／取消は終端し復帰へ転用しない。keyboard／accessibilityの既存widget factとbackend native closeは維持する。closeが先に確定し、同操作からactivationを作らない。non-clientの移動・resize・最大化・閉じるはDefの処理を継続する |
+| native media | 既存native入力経路から生成時identityを持つ同じDiscrete activation intentへ配送。従来のID通知は配送のackとしてdrainし、破棄・消費済の要求をIDから作り直さない |
+
+**撤去した責務。** managerのwatcher worker、8ms sleep、GetAsyncKeyState level sampling、
+rect／foregroundからの候補推定、close hit-test、watch step／target／drain、watcher HWND repairを撤去した。
+watcherのclose責務は上表のUI／native closeへ移し、HWND登録はCのbackend正本だけを参照する。
+既存のParked HWND livenessと再生成時のpost-show adoptionは維持した。
+focus metadataは表示情報の更新だけに使い、focusだけ・keyboardだけの復帰を追加していない。
+architecture-overviewのmanager記述を更新した。ui-responsiveness／async-architectureのwatcher記載は
+索引・folder等の別workerの記述で、削除対象のactivation workerを定義していないことを確認した。
+detached計画の過去の実装記録は履歴として残し、§11に今回の撤去を記録する。
+
+**一度だけ消費する契約。** callbackのshared ownerがgesture、入力scope、native control transcriptを所有する。
+前提確認で、Active中に`egui_winit::State`へ蓄積したraw Down/Upを、ROOTのEnterによるopenが先にpauseし、
+同じStateを引き継いだ新deferred callbackが後からtakeする順序がコード上成立すると分かった。
+native allocation／logical registration／contextは同じなので、callback時点のscopeだけでは旧操作の再所属を防げない。
+そこでStateの実RawInput追加点でclient操作の開始を一度通知し、その時点で登録済みのParked input ownerだけがproofを発行する。
+WM_TOUCHとpointer historyはwinitが正規化済みのWindowEventから受け、Win32側で別のtouch正規化を実装しない。
+proofのopaque operation IDを`Event::PointerInputProvenance`として実Start直前へ置き、同IDのScopedNative proofと照合する。
+並列Vecのindex／ordinalを使わないため、旧Stateの保留RawInputのappend、キーreleaseの先頭spliceでも旧入力が新proofを奪わない。
+marker自体は入力操作でなく、単独／孤立markerやproof無し開始は権限を持たない。headless論理fixtureの例外は`cfg(test)`に限る。
+本体からのobserver参照は既存path patchのegui-winitを直接依存するだけで、別版のegui graphを作らない。
+scopeはwindow、context、viewport registration、Cの入力allocation epochである。
+scope交代は旧gestureを即時終端し、旧touch recognitionを次batchの先頭で退役する。
+未captureのnative pressも生成時scopeで照合し、旧scopeの操作を新contextへ付け替えない。
+正常Up後のReleaseCaptureは取消と区別し、真のcapture lost／modal／touch Cancelは旧操作を終端する。
+native controlとmodal／retireはgestureの同じ順序付きキューへ到着時に入れ、未captureの押下より取消が先へ移る二重キューを作らない。
+raw Touchだけで昇格primaryがない操作も、既存correlationの読み取りpreviewで終端前に取消を対応付ける。
+同callback frameのdiscard再passではgesture・commandを再消費しない。
+touch correlationのApp frameとCallback frameは型で区別し、同じ数値による誤replayを防ぐ。
+既存のframe全体ambiguous規則とcommand実行は変えない。別ownerの旧mouse入力が同batchにある場合も、
+exact相関を通ってflush済みのtap完了factだけを現Canonical ownerがそのevent indexで消費し、復帰を一度確定する。
+未flush／drag／pinch／cancelからfactを合成せず、一般のtouch command判定を緩めない。
+transport mirrorと論理viewportのRawInput／IMEの終端は一括resetしない。
+managerの既存intentが要求を所有し、rootの受理・commit両境界がregistration／allocation／context／Parked／modalを照合する。
+commitはmediaを含め次rootのactive更新前の既存境界だけにそろえ、late callback受付後のpassive renderでは消費しない。
+不在runtimeを遅着eventから再作成しない。新しいApp field、時間窓、retry、polling、追加repaintはない。
+root wakeは既存event配送に含める。
+
+**診断。** 通常ログ`[detached-activation]`に`boundary=normalized/normalized_release/normalized_discard/callback/callback_discard/accept/discard/commit`、型付きsource
+`ClientClick / TouchTap / NonClientClick / NativeMedia`、型付きdecision
+`Accepted / Committed / ModalOwned / NotParked / RetiredRegistration / GestureCancelled / CloseOwned / CommandOwned / ActivationFailed`、
+window／registration／contextを1行で記録する。gesture終端・root受理／破棄・commit時だけ出し、frameやsampleごとには出さない。
+command上書き・close・retireによる既受理要求の破棄もmanagerの所有境界で一度記録する。
+正規化まで届いたがcallbackまで届かない場合も区別できる。破棄だけの診断はsourceで記録し、それだけのためにrootをwakeしない。
+例（identityは説明用）:
+
+```text
+[detached-activation] boundary=accept source=ClientClick decision=Accepted window=1 registration=Some(...) context=Some(ViewerContextId(1))
+[detached-activation] boundary=commit source=ClientClick decision=Committed window=1 registration=Some(...) context=Some(ViewerContextId(1))
+[detached-activation] boundary=discard source=TouchTap decision=GestureCancelled window=1 registration=Some(...) context=Some(ViewerContextId(1))
+```
+
+**旧watcher testの対応。** polling専用helper／reducer／hit-test群は撤去し、release一回・focusだけ不可・
+drag不可・modal取消・touch相関・replayをgestureの実egui入力試験、source同定・NC close優先・
+native loop終端・退役／same-HWND reuse・兄弟不変をkey_inputのnative owner試験へ置換した。
+旧content dragの復帰期待は今回の「dragでは復帰しない」決定に従って拒否へ変更した。
+repair 3件はbackend adoptionの正本照合／ParkedLive維持／後継採用へ置換し、root wake＋兄弟不変試験も正規adoptionへそろえた。
+`deferred_activation_queues_until_next_root_frame`はPDF再開・次root commitの期待を保ち、実deferred callbackのclickで要求を作る。
+Aの赤2件はpoll controlだけを撤去し、実grid open→pause→兄弟close→実callback→同window/context復帰の期待を維持した。
+さらにtap、drag、modal介入、active兄弟のbinding／page保持、bar close優先と、復帰click非再配送をscenarioで検査する。
+
+撤去した21件（4つのsample helperは件数外）の対応は次のとおり。
+
+| 旧watcher試験の期待 | 置換・維持する試験 |
+| --- | --- |
+| release一回、focusだけ不可、title/content drag | `coalesced_mouse_click_is_completed_once_even_after_layout_discard`、`held_mouse_waits_for_release_and_egui_rejects_an_out_and_back_drag`、`native_boundary_metadata_focus_and_keyboard_never_activate_without_a_click`、`realmachine50_parked_drag_does_not_activate_and_next_click_works` |
+| bar close優先／outside、music slotと不正layout | `realmachine50_parked_bar_close_wins_over_client_activation`、`realmachine50_parked_coalesced_touch_closes_without_previous_bar_target`とgestureのclose対照、既存`parked_live_music_uses_music_chrome_close_slot`。旧watcherのclient closeはStart時に実controlを選ぶ同gesture ownerへ移す |
+| native caption close優先、release outside／ready以前 | `native_detached_drag_maximize_and_close_have_one_owner`、`native_detached_cancel_ends_at_native_return_and_does_not_resume_on_late_up`。close成立のhit-test／release-outsideはOSの既存Def処理の責務とし、activation ownerはcloseを消費しない |
+| 他HWND、重複rect、main／兄弟をrepairしない、foreground遅延 | Cの`realmachine50_equal_rect_replacement_keeps_keys_on_owning_hwnd`、`native_detached_target_block_retirement_and_same_hwnd_reuse_are_scoped`、backend adoption 3件。rect／foregroundの推測自体を撤去し、source registration／allocationを照合する |
+| park起因押下の持越し不可、対象消失で旧押下取消 | `scope_retirement_precedes_an_already_queued_native_release`、`uncaptured_old_native_press_is_not_relabelled_but_new_click_in_same_batch_survives`、`stale_discrete_request_is_rejected_without_recreating_a_runtime`、`native_detached_sink_update_keeps_press_context_and_removal_is_terminal` |
+
+最初のdeferred callbackにTouch Start／End／PointerGoneが同時に届く場合、hoverがなくバーは描かれず、
+egui／既存bar touchの前pass widget targetもない。このためwidgetの常時宣言だけでは旧watcherのclose責務を
+移せないことをsourceで確認した。独立レビューと合意し、復帰とcloseを同一gestureの排他的destinationへ
+揃えた。描画条件・位置・shapeは変えず、pointer操作のwidget出力だけは二重producerにしない。
+既存keyboard／accessibility factはeguiの型付きresponseから直接読み、pointer位置から推定しない。
+page-overviewのcloseは通常バーとは実矩形が違うため、描画と同じ純geometry helperを共有する。
+overviewの余白はcommand ownerに残し、実ボタンの端のcoalesced tapは同じcanonical close ownerで受ける。
+active／ParkedLiveの既存overview closeと描画は変更しない。
+
+終端監査では、Aの新logical targetがsink経由でShared／Contextを強保持するため、次のroot描画を
+待たずterminal／manager dropで自分のexact registrationだけを退役する契約を追加した。
+native allocationの再生成ではlogical targetを維持する。native key leaseへ保存する値も入力identityだけとし、
+Aで追加したmutable gesture／sinkを余分に複製しない。これはAの参照所有の修正で、Cのbackend hookは変更しない。
+独立実装レビュー（Sol / xhigh）は、終端参照所有・sinkのlock外解放・overviewの実矩形と入力元の分離・
+fixtureの正規入力／immutable metadataの補足まで照合し、source上ACCEPT、未解決P1/P2なしとした。
+レビュー担当はCargoを実行せず、自動検証の証拠は下表の実行結果とする。
+関連する入力消費者も棚卸しし、raw event列のtake／append・キーreleaseの先頭追加・synthetic入力の末尾追加が
+markerと実Startの対応を壊さないこと、modal等の既存retainは`InputState.events`側であることを確認した。
+test-script用featureは製品の所有契約に使わず、同機能の変更も行っていない。
+
+**変更ファイル（25件）。**
+
+- 依存: `Cargo.toml`、`Cargo.lock`。
+- 本体: `src/app.rs`、`src/key_input.rs`、`src/lib.rs`、`src/touch_correlation.rs`、`src/ui_fullscreen.rs`、
+  `src/ui_fullscreen/page_overview.rs`。
+- 閲覧owner／回帰: `src/app/detached_activation.rs`（新規）、`src/app/detached_activation_gesture.rs`（新規）、
+  `src/app/detached_window_manager.rs`、`src/app/logic_service.rs`、`src/app/native_video.rs`、
+  `src/app/viewport_retirement.rs`、`src/app/multiwindow_scenario_tests.rs`、`src/app/tests.rs`。
+- vendor: `vendor/egui-winit/src/lib.rs`、`vendor/egui-winit/src/pointer_input_observer.rs`（新規）、
+  `vendor/egui-winit/PATCHES.md`、`vendor/egui/src/data/input/event.rs`、`vendor/egui/src/response.rs`、
+  `vendor/egui/PATCHES.md`。`vendor/eframe`は変更していない。
+- 文書: 本書、`docs/detached-rework-plan.md`、`docs/architecture-overview.md`。
+
+検証コマンド・件数・exit codeは本節末尾に記録する。実機のfocus／native loop／touch／HWNDでの動作と、
+サブPCでのA入力到達の再確認は未実施。製品起動・確認用build・commitは利用者の指定により行わない。
+
+検証はすべて指定`run-heavy.ps1`、Owner `codex/767-rm50-a`、WorkDir
+`G:/home/mimageviewer-767s2`経由で直列実行した。共有全件ロック／slotを待ち、書込不可警告後は
+runner指定どおりBelowNormal・6並列で継続した。待機中にソース点検のため止めたwrapper 2回は
+Cargo開始前・0件・exit 1であり、テストの失敗・成功証拠には数えない。
+
+| コマンド | 件数・exit code・証拠 |
+| --- | --- |
+| 本体の初回焦点nextest（下記filter） | **0件、compile failure、exit 101**。callback fixture 1か所のclose control引数不足（E0061）。実行開始前に判明し修正。`target/rm50-a-focused-compile-r1.log` |
+| 本体の中間焦点nextest（同filter） | **81実行 / 77成功 / 4失敗、exit 100**。Bの既知2件と追加close fixture 2件。後者はcanonical proofを生成しないfixtureだったため、正規化APIを通す起点へ修正し、window／binding撤去の期待を維持した。A元赤2件・C1件は成功。`target/rm50-a-focused-r2.log` |
+| 本体の中間回帰nextest（下記回帰filter） | **2,578実行 / 2,576成功（6 slow、2 leaky）/ 2失敗、exit 100**。同close fixture 2件だけの失敗。`target/rm50-a-regression-r2.log` |
+| 中間 `cargo check -p mimageviewer --bin mimageviewer-core` / 引数なし `cargo fmt` | **ともにexit 0**。`target/rm50-a-check-r2.log`、`target/rm50-a-fmt-r2.log` |
+| overview追加後の焦点nextest（同filter） | **84実行 / 80成功 / 4失敗、exit 100**。Bの既知2件と、直接itemsをseedしたoverview fixtureでimmutable page identity metadataを準備していない2件。既存overview fixtureと同じ`PreparedPageIdentityIndex::prepare`を補い、実open handler／snapshot種別／closeとownerの期待は維持した。この回は焦点の想定外失敗で止め、広域回帰／check／fmtは実行していない。`target/rm50-a-focused-r3.log` |
+| `cargo nextest run --manifest-path vendor/egui-winit/Cargo.toml --lib --no-fail-fast` | **60実行 / 60成功 / 0失敗、exit 0**。`target/rm50-a-egui-winit.log` |
+| `cargo nextest run --manifest-path vendor/egui/Cargo.toml --lib -E 'test(/non_pointer_click\|pointer_input_provenance\|pointer_cancellation\|viewport_retirement\|input_state/)' --no-fail-fast` | **32実行 / 32成功 / 0失敗、exit 0**。`target/rm50-a-egui.log` |
+| 最終 `cargo nextest run -p mimageviewer --lib -E 'test(/realmachine50_\|detached_activation\|native_detached\|discrete_activation\|deferred_activation_queues\|callback_and_app_frame/)' --no-fail-fast` | **84実行 / 82成功 / 2失敗、exit 100**。A・Cおよび追加回帰は成功。失敗は今回対象外のB赤2件だけ。`target/rm50-a-focused.log` |
+| 最終 `cargo nextest run -p mimageviewer --lib -E 'test(/detached\|multiwindow\|activation\|key_input\|native_focus\|viewport\|fullscreen\|touch_correlation\|native_video\|parked_live/)' --no-fail-fast` | **2,581実行 / 2,581成功（6 slow）/ 0失敗、exit 0**。281.982秒。`target/rm50-a-regression.log` |
+| 最終 `cargo check -p mimageviewer --bin mimageviewer-core` | **core 1対象、exit 0**。既存警告あり。`target/rm50-a-check.log` |
+| 最後のCargo操作: `cargo fmt`（引数なし） | **exit 0**。`target/rm50-a-fmt.log`。wrapperもexit 0（Bの既知2件だけを許容）。`target/rm50-a-root-wrapper.log` |
+| 最終 `git diff --check` | **exit 0**。`target/rm50-a-diff-check.log`。改行コードの既存設定に由来するLF→CRLF警告のみ |
+
+Bの失敗は`realmachine50_forwarded_open_without_dialog_retires_previous_live_owner`と
+`realmachine50_forwarded_open_after_independent_export_retires_previous_live_owner`で、どちらも従来どおり
+「forwarded open replaced the active session without retiring its old Depth owner」のassertである。
+ignore・除外・期待の変更は行っていない。
+
+描画条件・shape・layout・表示文言は変えていないため、`ui_snapshot`とUI glyph検査は今回の対象外。
+全件gate、確認用build、製品起動、commit／pushは指定どおり実行していない。
+未確認は実OSのfocus／non-client native loop／touchと、サブPCでのAの入力到達・復帰の再確認。
+新しい通常ログを含む実機結果を、今回のheadless成功で代替しない。
+
 ## 3. B — 外部openが旧独立ownerを退役させずsessionを置き換える
 
 ### 3.1 観測と原因
@@ -379,7 +529,10 @@ Cのrect入力登録も旧版に残っている。§8の同じ5テストは現�
   main fullscreenから↓で動画へ進むとmain fullscreenのままなのは従来仕様。
   同じ処理と2026-07-02の理由コメントがv5.2.0にもある。いずれも今回変更する案を含めない。
 
-## 6. 診断の設計案（今回は追加しない）
+## 6. 診断（初回調査の案、A実装で導入）
+
+初回調査では案だけを記録した。依頼50 Aでは、以下の入力診断を製品の通常ログへ実装した。
+最終的な型・出力境界・例は§2.4を参照。session差替えの診断はBの実装範囲に残る。
 
 通常ログで不足しているのは、クリックの受領から復帰要求の受理までの相関である。
 既存の所有window / viewport registration / contextと、型付きの入力元・理由を、受理／破棄／commit時に記録する。

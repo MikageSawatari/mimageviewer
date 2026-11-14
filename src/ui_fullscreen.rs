@@ -8988,6 +8988,7 @@ pub(crate) fn detached_image_window_bar_close_button_rect(full_rect: egui::Rect)
 #[cfg(windows)]
 #[derive(Default)]
 struct DetachedImageWindowEventBatch {
+    activation_requests: Vec<crate::app::DetachedActivationRequest>,
     close_ids: Vec<u64>,
     activate_ids: Vec<u64>,
     focus_updates: Vec<(u64, bool)>,
@@ -23623,15 +23624,6 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn parked_live_music_close_slot_rect(
-        full_rect: egui::Rect,
-        edge_trigger: f32,
-    ) -> Option<egui::Rect> {
-        Self::parked_live_music_window_layout(full_rect, edge_trigger)
-            .map(|layout| Self::music_chrome_close_slot_rect(layout.top_rect))
-    }
-
-    #[cfg(windows)]
     fn music_chrome_title_clip_rect(
         top_rect: egui::Rect,
         first_right_control_left: f32,
@@ -23788,6 +23780,7 @@ impl App {
         ui: &mut egui::Ui,
         full_rect: egui::Rect,
         id: &'static str,
+        pointer_close_owned_by_gesture: bool,
         close_requested: &mut bool,
     ) -> egui::Rect {
         let close_rect = detached_image_window_bar_close_button_rect(full_rect);
@@ -23807,7 +23800,13 @@ impl App {
             |p, c, r| draw_close_icon(p, c, r),
         )
         .hover_tip_dark("閉じる");
-        if close_resp.clicked() {
+        // The callback's canonical gesture owner consumes pointer close. Keep
+        // the existing keyboard/accessibility fact independent of pointer input.
+        if if pointer_close_owned_by_gesture {
+            close_resp.clicked_with_keyboard_or_accessibility()
+        } else {
+            close_resp.clicked()
+        } {
             *close_requested = true;
         }
         close_rect
@@ -23819,6 +23818,7 @@ impl App {
         ctx: &egui::Context,
         full_rect: egui::Rect,
         window: &crate::app::DeferredDetachedImageWindowView,
+        pointer_close_owned_by_gesture: bool,
         close_requested: &mut bool,
     ) {
         let hover_in_top = ctx.input(|i| {
@@ -23853,6 +23853,7 @@ impl App {
             ui,
             full_rect,
             "detached_image_close_btn",
+            pointer_close_owned_by_gesture,
             close_requested,
         );
         let mut next_x = close_rect.left();
@@ -23887,6 +23888,9 @@ impl App {
         batch: &mut DetachedImageWindowEventBatch,
     ) {
         match event {
+            crate::app::DeferredDetachedImageWindowEvent::Activation { request } => {
+                batch.activation_requests.push(request);
+            }
             crate::app::DeferredDetachedImageWindowEvent::PageOverview {
                 id,
                 command,
@@ -24126,7 +24130,6 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         mut batch: DetachedImageWindowEventBatch,
-        defer_activations: bool,
     ) {
         if let Some(target_window_id) = self.sidecar_restore_target_window_id() {
             // Only the restore target owns the modal. Sibling passive/native windows keep their
@@ -24197,33 +24200,36 @@ impl App {
                 window.activation_armed = activation_armed;
             }
         }
+        for request in batch.activation_requests.drain(..) {
+            if batch.close_ids.contains(&request.window_id) {
+                request.log(
+                    "discard",
+                    crate::app::DetachedActivationDecision::CloseOwned,
+                );
+            } else {
+                self.accept_discrete_detached_activation(ctx, request);
+            }
+        }
         batch.activate_ids.sort_unstable();
         batch.activate_ids.dedup();
         for id in batch.activate_ids {
-            if batch.close_ids.contains(&id) {
-                self.log_detached_image_window_debug(format!(
-                    "passive_activate_skipped id={id} close=true",
-                ));
-                continue;
-            }
-            if defer_activations {
-                self.queue_deferred_detached_window_activation(id, "deferred_passive_activate");
-                ctx.request_repaint();
-                break;
-            }
-            if self.activate_detached_image_window_snapshot(ctx, id) {
-                self.log_detached_image_window_debug(format!(
-                    "passive_activate_committed id={id} passive_windows={} active_context={}",
-                    self.detached_image_windows.len(),
-                    self.active_detached_context_is_at_rest()
-                ));
-                break;
+            let source = if self.detached_window_state_is_parked_live(id) {
+                crate::app::DetachedActivationSource::NativeMedia
             } else {
-                self.log_detached_image_window_debug(format!(
-                    "passive_activate_failed id={id} passive_windows={} active_context={}",
-                    self.detached_image_windows.len(),
-                    self.active_detached_context_is_at_rest()
-                ));
+                crate::app::DetachedActivationSource::ClientClick
+            };
+            let request = self.detached_activation_request(ctx, id, source);
+            if batch.close_ids.contains(&id) {
+                request.log(
+                    "discard",
+                    crate::app::DetachedActivationDecision::CloseOwned,
+                );
+            } else {
+                if self.accept_discrete_detached_activation(ctx, request)
+                    == crate::app::DetachedActivationDecision::Accepted
+                {
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
             }
         }
         self.prune_deferred_detached_image_window_views();
@@ -24325,7 +24331,7 @@ impl App {
                 self.queue_deferred_detached_image_window_event(ctx, event, &mut deferred_batch);
             }
         }
-        self.apply_detached_image_window_event_batch(ctx, deferred_batch, true);
+        self.apply_detached_image_window_event_batch(ctx, deferred_batch);
     }
 
     #[cfg(all(windows, test))]
@@ -24347,7 +24353,7 @@ impl App {
             right_drag_events: events,
             ..Default::default()
         };
-        self.apply_detached_image_window_event_batch(ctx, batch, true);
+        self.apply_detached_image_window_event_batch(ctx, batch);
     }
 
     #[cfg(windows)]
@@ -24404,6 +24410,7 @@ impl App {
 
         if self.detached_image_windows.is_empty() {
             self.prune_deferred_detached_image_window_views();
+            self.sync_detached_native_input_targets(ctx);
             return;
         }
 
@@ -24444,6 +24451,7 @@ impl App {
 
         if self.detached_image_windows.is_empty() {
             self.prune_deferred_detached_image_window_views();
+            self.sync_detached_native_input_targets(ctx);
             return;
         }
         #[cfg(feature = "test-script")]
@@ -24520,6 +24528,19 @@ impl App {
                 apply_initial_placement,
             );
             let shared = self.deferred_detached_image_window_shared(view);
+            let activation_template = self.detached_activation_request(
+                ctx,
+                window.id,
+                crate::app::DetachedActivationSource::ClientClick,
+            );
+            let activation_blocked = self.common_modal_dialog_open()
+                || self.document_open_modal_admission_blocked()
+                || sidecar_restore_presentation.is_some();
+            shared.set_activation_availability(if activation_blocked {
+                crate::app::detached_activation_gesture::ClientActivationAvailability::Blocked
+            } else {
+                crate::app::detached_activation_gesture::ClientActivationAvailability::Available
+            });
             ctx.show_viewport_deferred(viewport_id, builder, move |vp_ctx_ui, _class| {
                 let vp_ctx = &vp_ctx_ui.ctx().clone();
                 #[cfg(feature = "test-script")]
@@ -24552,10 +24573,12 @@ impl App {
                     .then(|| shared.capture_right_drag_event(vp_ctx, focused))
                     .flatten();
                 let mut bar_close_requested = false;
+                let mut activation_surface = egui::Rect::NOTHING;
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(view.margin_color))
                     .show(vp_ctx_ui, |ui| {
                         let full_rect = ui.max_rect();
+                        activation_surface = full_rect;
                         if first_callback {
                             Self::log_detached_frozen_page_restore_debug(
                                 &view,
@@ -24603,14 +24626,16 @@ impl App {
                             crate::test_script::discard_drawn_paint(vp_ctx.viewport_id());
                         }
                         if view.display.overview().is_some() {
-                            bar_close_requested |=
-                                Self::draw_page_overview_window_close(ui, full_rect);
+                            // Pointer close has the same canonical owner as the
+                            // ordinary bar, including an initial coalesced tap.
+                            Self::draw_page_overview_window_close(ui, full_rect);
                         } else {
                             Self::draw_detached_image_window_bar(
                                 ui,
                                 vp_ctx,
                                 full_rect,
                                 &view,
+                                true,
                                 &mut bar_close_requested,
                             );
                         }
@@ -24626,6 +24651,121 @@ impl App {
                         vp_ctx,
                         presentation,
                     );
+                }
+                use crate::app::detached_activation_gesture::{
+                    ClientActivationAvailability, ClientActivationSource,
+                };
+                let command_owned = bar_close_requested
+                    || view.display.overview().is_some()
+                    || right_drag.is_some()
+                    || vp_ctx.input(|input| {
+                        input.pointer.secondary_down()
+                            || input.events.iter().any(|event| {
+                                matches!(
+                                    event,
+                                    egui::Event::PointerButton {
+                                        button: egui::PointerButton::Secondary,
+                                        ..
+                                    }
+                                )
+                            })
+                    });
+                let availability = if activation_blocked {
+                    ClientActivationAvailability::Blocked
+                } else if command_owned {
+                    ClientActivationAvailability::CommandOwned
+                } else {
+                    ClientActivationAvailability::Available
+                };
+                let geometry = crate::touch_input::TapZoneGeometry {
+                    surface: activation_surface,
+                    excluded: Vec::new(),
+                    behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                        accepts_pinch: true,
+                        tap_zones: true,
+                    },
+                };
+                let mut client_scope = activation_template.clone();
+                client_scope.registration = vp_ctx.viewport_registration(viewport_id);
+                client_scope.allocation = client_scope
+                    .registration
+                    .and_then(crate::key_input::native_input_allocation_witness);
+                let close_rect = if view.display.overview().is_some() {
+                    Self::page_overview_window_close_rect(activation_surface)
+                } else {
+                    detached_image_window_bar_close_button_rect(activation_surface)
+                };
+                let source = shared.capture_client_activation(
+                    vp_ctx,
+                    geometry,
+                    availability,
+                    client_scope.clone(),
+                    close_rect,
+                );
+                if let Some(source) = source {
+                    let mut request = client_scope.clone();
+                    request.source = match source {
+                        ClientActivationSource::MouseClick => {
+                            crate::app::DetachedActivationSource::ClientClick
+                        }
+                        ClientActivationSource::TouchTap => {
+                            crate::app::DetachedActivationSource::TouchTap
+                        }
+                    };
+                    request.log("callback", crate::app::DetachedActivationDecision::Accepted);
+                    shared.push_event(crate::app::DeferredDetachedImageWindowEvent::Activation {
+                        request,
+                    });
+                    vp_ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
+                use crate::app::detached_activation_gesture::{
+                    ClientActivationCancelReason, ClientActivationDecision,
+                };
+                for decision in shared.drain_client_activation_decisions() {
+                    if let ClientActivationDecision::CompletedClose(source) = decision {
+                        bar_close_requested = true;
+                        let mut request = client_scope.clone();
+                        request.source = match source {
+                            ClientActivationSource::MouseClick => {
+                                crate::app::DetachedActivationSource::ClientClick
+                            }
+                            ClientActivationSource::TouchTap => {
+                                crate::app::DetachedActivationSource::TouchTap
+                            }
+                        };
+                        request.log(
+                            "callback",
+                            crate::app::DetachedActivationDecision::CloseOwned,
+                        );
+                    }
+                    if let ClientActivationDecision::Cancelled { source, reason } = decision {
+                        let mut request = activation_template.clone();
+                        request.registration = vp_ctx.viewport_registration(viewport_id);
+                        request.source = match source {
+                            ClientActivationSource::MouseClick => {
+                                crate::app::DetachedActivationSource::ClientClick
+                            }
+                            ClientActivationSource::TouchTap => {
+                                crate::app::DetachedActivationSource::TouchTap
+                            }
+                        };
+                        let decision = match reason {
+                            ClientActivationCancelReason::NotParked => {
+                                crate::app::DetachedActivationDecision::NotParked
+                            }
+                            ClientActivationCancelReason::ModalOwned => {
+                                crate::app::DetachedActivationDecision::ModalOwned
+                            }
+                            ClientActivationCancelReason::CommandOwned => {
+                                crate::app::DetachedActivationDecision::CommandOwned
+                            }
+                            ClientActivationCancelReason::Native(
+                                crate::key_input::NativeInputCancelReason::RetiredRegistration,
+                            ) => crate::app::DetachedActivationDecision::RetiredRegistration,
+                            _ => crate::app::DetachedActivationDecision::GestureCancelled,
+                        };
+                        request.log("callback_discard", decision);
+                    }
                 }
                 // Passive deferred still windows carry only pointer samples back to the root;
                 // they contain no text input, so IME state remains owned by the root App pass.
@@ -24843,6 +24983,7 @@ impl App {
                                 vp_ctx,
                                 full_rect,
                                 &view,
+                                false,
                                 &mut bar_close_requested,
                             );
                         }
@@ -25000,20 +25141,12 @@ impl App {
             }
             render_batch.focus_updates.push((window.id, focused_now));
         }
-        for id in self.take_parked_live_activation_requests_after_passive_render() {
-            if self.detached_window_state_is_parked_live(id) {
-                self.log_detached_image_window_debug(format!(
-                    "parked_live_native_activate_request_after_passive_render id={id}"
-                ));
-                render_batch.activate_ids.push(id);
-            } else {
-                self.log_detached_image_window_debug(format!(
-                    "parked_live_native_activate_request_dropped id={id} state={:?}",
-                    self.detached_window_state(id)
-                ));
-            }
-        }
-        self.apply_detached_image_window_event_batch(ctx, render_batch, false);
+        // Native media has already submitted an identity-bearing intent at its
+        // input owner. These legacy transport IDs are acknowledgements only;
+        // discarded/committed requests must never be reconstructed from them.
+        self.take_parked_live_activation_requests_after_passive_render();
+        self.apply_detached_image_window_event_batch(ctx, render_batch);
+        self.sync_detached_native_input_targets(ctx);
     }
 
     pub(crate) fn fullscreen_seek_overlay_allowed(&self, fs_idx: usize, is_video: bool) -> bool {

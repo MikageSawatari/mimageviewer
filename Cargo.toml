@@ -296,6 +296,7 @@ bench = false
 required-features = ["manual-e2e"]
 
 [target.'cfg(windows)'.dependencies]
+egui-winit = { version = "0.37.0", default-features = false }
 libraw-sys = { path = "crates/libraw-sys" }
 libavif-sys = { path = "crates/libavif-sys" }
 windows-sys = { version = "0.61.2", features = [

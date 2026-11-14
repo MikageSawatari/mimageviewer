@@ -48,6 +48,9 @@ enum PrimaryPhase {
 pub(crate) struct TouchFrame {
     scope: CommandScope,
     commands: Vec<TouchCommand>,
+    command_event_indices: Vec<usize>,
+    tap_completion_event_indices: Vec<usize>,
+    gesture_events: Vec<CorrelatedTouchGestureEvent>,
     primary_events: Vec<CorrelatedPrimary>,
     owner: TouchOwner,
     active: bool,
@@ -88,6 +91,9 @@ impl TouchFrame {
         Self {
             scope: self.scope,
             commands: Vec::new(),
+            command_event_indices: Vec::new(),
+            tap_completion_event_indices: Vec::new(),
+            gesture_events: self.gesture_events.clone(),
             primary_events: self.primary_events.clone(),
             owner: self.owner,
             active: self.active,
@@ -99,6 +105,8 @@ impl TouchFrame {
     /// authorize a caller-side gesture action or primary-pointer suppression.
     fn suppress_execution(&mut self) {
         self.commands.clear();
+        self.command_event_indices.clear();
+        self.tap_completion_event_indices.clear();
         for event in &mut self.primary_events {
             event.should_suppress = false;
         }
@@ -106,6 +114,45 @@ impl TouchFrame {
 
     pub(crate) fn commands(&self) -> &[TouchCommand] {
         &self.commands
+    }
+
+    /// Exact raw-event completion boundaries for commands in this drive.
+    /// Discarded passes expose observations but never replay these actions.
+    pub(crate) fn commands_with_event_indices(
+        &self,
+    ) -> impl Iterator<Item = (usize, TouchCommand)> + '_ {
+        self.command_event_indices
+            .iter()
+            .copied()
+            .zip(self.commands.iter().copied())
+    }
+
+    /// A tap already completed through the exact raw touch/pointer signature.
+    /// This is an input fact, not permission to execute a normal viewer command.
+    /// Canonical consumers must separately own this operation and its scope.
+    pub(crate) fn completed_tap_at(&self, index: usize) -> bool {
+        self.tap_completion_event_indices.contains(&index)
+    }
+
+    pub(crate) fn continues_gesture_at(&self, index: usize) -> bool {
+        self.gesture_events.iter().any(|event| {
+            event.index == index && matches!(event.kind, TouchGestureEventKind::ContinuingStart)
+        })
+    }
+
+    pub(crate) fn gesture_active_after(&self, index: usize) -> bool {
+        self.gesture_events.iter().any(|event| {
+            event.index == index && matches!(event.kind, TouchGestureEventKind::ActiveAfter)
+        })
+    }
+
+    pub(crate) fn ended_gesture_at(&self, index: usize) -> Option<TouchOwner> {
+        self.gesture_events
+            .iter()
+            .find_map(|event| match event.kind {
+                TouchGestureEventKind::Ended(owner) if event.index == index => Some(owner),
+                _ => None,
+            })
     }
 
     /// A batch generated before an adoption cannot act on the new list owner.
@@ -133,6 +180,9 @@ impl TouchFrame {
 
     fn retire(&mut self) {
         self.commands.clear();
+        self.command_event_indices.clear();
+        self.tap_completion_event_indices.clear();
+        self.gesture_events.clear();
         self.scope = CommandScope::Retired;
         self.owner = TouchOwner::Undecided;
         self.active = false;
@@ -358,6 +408,19 @@ impl TouchCorrelationState {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+struct CorrelatedTouchGestureEvent {
+    index: usize,
+    kind: TouchGestureEventKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TouchGestureEventKind {
+    ContinuingStart,
+    ActiveAfter,
+    Ended(TouchOwner),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct CorrelatedPrimary {
     pos: Pos2,
     /// Raw primary-release order, including current events later discarded as
@@ -542,6 +605,8 @@ impl Default for TouchCorrelationState {
 #[derive(Default)]
 struct FrameBuilder {
     commands: Vec<TouchCommand>,
+    command_event_indices: Vec<usize>,
+    gesture_events: Vec<CorrelatedTouchGestureEvent>,
     primary_events: Vec<CorrelatedPrimary>,
     ambiguous: bool,
     touch_cancelled: bool,
@@ -587,10 +652,26 @@ impl FrameBuilder {
         active: bool,
         after: CorrelationStateSnapshot,
     ) -> (TouchFrame, Option<CorrelationDiagnostics>) {
+        // Record only tap commands already flushed by exact transport
+        // correlation. A later unrelated mouse edge may forbid normal command
+        // execution without undoing the earlier input completion fact.
+        let tap_completion_event_indices = self
+            .command_event_indices
+            .iter()
+            .zip(&self.commands)
+            .filter_map(|(index, command)| {
+                matches!(
+                    command,
+                    TouchCommand::ToggleChrome | TouchCommand::PageSide { .. }
+                )
+                .then_some(*index)
+            })
+            .collect();
         if self.ambiguous {
             // Ambiguous input cannot authorize a current gesture action or
             // suppress its ordinary pointer fallback.
             self.commands.clear();
+            self.command_event_indices.clear();
             // Exact retired provenance remains valid even when a separate
             // real mouse event makes current gesture execution ambiguous.
             self.primary_events
@@ -603,6 +684,9 @@ impl FrameBuilder {
             TouchFrame {
                 scope,
                 commands: self.commands,
+                command_event_indices: self.command_event_indices,
+                tap_completion_event_indices,
+                gesture_events: self.gesture_events,
                 primary_events: self.primary_events,
                 owner,
                 active,
@@ -658,6 +742,7 @@ impl TouchCorrelationState {
             .0
     }
 
+    #[cfg(test)]
     fn process_frame_with_diagnostics(
         &mut self,
         geometry: &TapZoneGeometry,
@@ -666,10 +751,96 @@ impl TouchCorrelationState {
         execution_enabled: bool,
         diagnostics_enabled: bool,
     ) -> (TouchFrame, Option<CorrelationDiagnostics>) {
+        self.process_frame_with_recognition_cancellations(
+            geometry,
+            events,
+            now_ms,
+            execution_enabled,
+            diagnostics_enabled,
+            &[],
+        )
+    }
+
+    /// Cancel gesture recognition without changing the backend transport mirror.
+    /// Pending signatures still classify their physical tails as retired touch.
+    fn cancel_recognition(&mut self, geometry: &TapZoneGeometry, now_ms: u64) {
+        let _ = self.recognition.recognizer_mut().handle_sample(
+            geometry,
+            TouchSample {
+                id: 0,
+                pos: Pos2::ZERO,
+                phase: TouchPhase::Cancel,
+                now_ms,
+            },
+        );
+        if let Some(pending) = &mut self.transport.pending {
+            match pending {
+                PendingSignature::StartMoved(touch)
+                | PendingSignature::StartButton(touch)
+                | PendingSignature::MoveMoved(touch)
+                | PendingSignature::EndButton(touch) => {
+                    touch.commands.clear();
+                    touch.ownership = PrimaryOwnership::Retired;
+                    touch.accepted_grid_tap = false;
+                }
+                PendingSignature::EndGone(commands) => commands.clear(),
+                PendingSignature::CancelGone => {}
+            }
+        }
+    }
+
+    fn process_frame_with_recognition_cancellations(
+        &mut self,
+        geometry: &TapZoneGeometry,
+        events: &[Event],
+        now_ms: u64,
+        execution_enabled: bool,
+        diagnostics_enabled: bool,
+        cancellation_indices: &[usize],
+    ) -> (TouchFrame, Option<CorrelationDiagnostics>) {
         let mut frame = FrameBuilder::new(self, diagnostics_enabled);
         let mut release_ordinal = 0;
-        for event in events {
+        for (event_index, event) in events.iter().enumerate() {
+            if cancellation_indices.contains(&event_index) {
+                self.cancel_recognition(geometry, now_ms);
+                frame.touch_cancelled = true;
+            }
+            if matches!(
+                event,
+                Event::Touch {
+                    phase: egui::TouchPhase::Start,
+                    ..
+                }
+            ) && self.recognizer().is_active()
+            {
+                frame.gesture_events.push(CorrelatedTouchGestureEvent {
+                    index: event_index,
+                    kind: TouchGestureEventKind::ContinuingStart,
+                });
+            }
+            let previous_commands = frame.commands.len();
             self.process_event(geometry, event, release_ordinal, now_ms, &mut frame);
+            if self.recognizer().is_active() {
+                frame.gesture_events.push(CorrelatedTouchGestureEvent {
+                    index: event_index,
+                    kind: TouchGestureEventKind::ActiveAfter,
+                });
+            } else if matches!(
+                event,
+                Event::Touch {
+                    phase: egui::TouchPhase::End | egui::TouchPhase::Cancel,
+                    ..
+                }
+            ) {
+                frame.gesture_events.push(CorrelatedTouchGestureEvent {
+                    index: event_index,
+                    kind: TouchGestureEventKind::Ended(self.recognizer().owner()),
+                });
+            }
+            frame.command_event_indices.extend(std::iter::repeat_n(
+                event_index,
+                frame.commands.len() - previous_commands,
+            ));
             if matches!(
                 event,
                 Event::PointerButton {
@@ -680,6 +851,10 @@ impl TouchCorrelationState {
             ) {
                 release_ordinal += 1;
             }
+        }
+        if cancellation_indices.contains(&events.len()) {
+            self.cancel_recognition(geometry, now_ms);
+            frame.touch_cancelled = true;
         }
         let (mut touch_frame, diagnostics) = frame.finish(
             self.recognition.scope(),
@@ -905,8 +1080,25 @@ fn driven_surface_id(viewport: egui::ViewportId) -> egui::Id {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DrivenSurface {
-    frame: u64,
+    frame: FrameIdentity,
     outcome: FrameDrive,
+}
+
+/// App update counters and deferred viewport callback counters are independent.
+/// Keeping their source here prevents a transition from replaying an unrelated
+/// batch merely because its numeric counter happens to match.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameIdentity {
+    App(u64),
+    Callback(u64),
+}
+
+impl FrameIdentity {
+    fn counter(self) -> u64 {
+        match self {
+            Self::App(frame) | Self::Callback(frame) => frame,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -973,10 +1165,76 @@ pub(crate) fn drive_egui_touch_input(
         ctx,
         surface,
         geometry,
-        frame,
+        FrameIdentity::App(frame),
         enabled,
         touch_gestures_disabled(),
         CommandScope::Unscoped,
+        &[],
+    )
+}
+
+/// Read exact promoted-primary raw ordinals without advancing the owner.
+/// Native control metadata uses raw Touch Start/End as its operation boundary;
+/// these ordinals prevent consuming the same metadata again at a promoted
+/// Pointer edge, including a pending signature continued from a prior frame.
+pub(crate) fn preview_touch_primary_event_indices(
+    ctx: &egui::Context,
+    surface: TouchSurface,
+    geometry: &TapZoneGeometry,
+) -> Vec<usize> {
+    let (events, now_ms) = input_events_and_time(ctx);
+    let viewport = ctx.viewport_id();
+    let mut state = ctx.data(|data| {
+        data.get_temp::<TouchCorrelationState>(state_id(viewport, surface))
+            .unwrap_or_default()
+    });
+    let mut frame = FrameBuilder::new(&state, false);
+    let mut release_ordinal = 0;
+    let mut indices = Vec::new();
+    for (index, event) in events.iter().enumerate() {
+        state.process_event(geometry, event, release_ordinal, now_ms, &mut frame);
+        if let Event::PointerButton {
+            button: PointerButton::Primary,
+            pressed,
+            ..
+        } = event
+        {
+            if frame.primary_events.last().is_some_and(|edge| {
+                edge.phase == PrimaryPhase::Button(*pressed)
+                    && edge.release_ordinal == release_ordinal
+                    && edge.ownership != PrimaryOwnership::Mouse
+            }) {
+                indices.push(index);
+            }
+            if !pressed {
+                release_ordinal += 1;
+            }
+        }
+    }
+    indices
+}
+
+/// Drive existing recognition with cancellation at ordered raw-event boundaries.
+/// Indices denote the event before which recognition ends (`events.len()` is
+/// after the batch). Native capture loss and modal ownership do not rewrite
+/// egui-winit's independent contact/pending-pointer transport.
+pub(crate) fn drive_egui_touch_input_with_recognition_cancellations(
+    ctx: &egui::Context,
+    surface: TouchSurface,
+    geometry: TapZoneGeometry,
+    frame: u64,
+    enabled: bool,
+    cancellation_indices: &[usize],
+) -> TouchFrame {
+    drive_egui_touch_input_with_policy(
+        ctx,
+        surface,
+        geometry,
+        FrameIdentity::Callback(frame),
+        enabled,
+        touch_gestures_disabled(),
+        CommandScope::Unscoped,
+        cancellation_indices,
     )
 }
 
@@ -992,10 +1250,11 @@ pub(crate) fn drive_egui_grid_touch_input(
         ctx,
         TouchSurface::MainGrid,
         geometry,
-        ctx.cumulative_frame_nr(),
+        FrameIdentity::App(ctx.cumulative_frame_nr()),
         enabled,
         touch_gestures_disabled(),
         CommandScope::MainGrid(scope),
+        &[],
     )
 }
 
@@ -1018,7 +1277,8 @@ fn observe_main_grid_transport(ctx: &egui::Context) {
         let marker_id = driven_surface_id(viewport);
         let previous = data
             .get_temp::<DrivenSurface>(marker_id)
-            .filter(|marker| marker.frame == frame);
+            .filter(|marker| marker.frame.counter() == frame);
+        let identity = previous.map_or(FrameIdentity::App(frame), |marker| marker.frame);
         let outcome = match previous.map(|marker| marker.outcome) {
             Some(
                 FrameDrive::GridDriven(_)
@@ -1044,8 +1304,15 @@ fn observe_main_grid_transport(ctx: &egui::Context) {
             false,
             touch_gestures_disabled(),
             false,
+            &[],
         );
-        data.insert_temp(marker_id, DrivenSurface { frame, outcome });
+        data.insert_temp(
+            marker_id,
+            DrivenSurface {
+                frame: identity,
+                outcome,
+            },
+        );
     });
 }
 
@@ -1061,10 +1328,11 @@ fn drive_egui_touch_input_inner(
         ctx,
         surface,
         geometry,
-        frame,
+        FrameIdentity::App(frame),
         execution_enabled,
         false,
         CommandScope::Unscoped,
+        &[],
     )
 }
 
@@ -1073,10 +1341,11 @@ fn drive_egui_touch_input_with_policy(
     ctx: &egui::Context,
     surface: TouchSurface,
     geometry: TapZoneGeometry,
-    frame: u64,
+    frame: FrameIdentity,
     execution_enabled: bool,
     gestures_disabled: bool,
     scope: CommandScope,
+    cancellation_indices: &[usize],
 ) -> TouchFrame {
     let viewport = ctx.viewport_id();
     let (events, now_ms) = input_events_and_time(ctx);
@@ -1091,6 +1360,7 @@ fn drive_egui_touch_input_with_policy(
         now_ms,
         execution_enabled,
         gestures_disabled,
+        cancellation_indices,
     )
 }
 
@@ -1109,7 +1379,7 @@ fn input_events_and_time(ctx: &egui::Context) -> (Vec<Event>, u64) {
 fn process_in_temp_data(
     ctx: &egui::Context,
     viewport: egui::ViewportId,
-    frame: u64,
+    frame: FrameIdentity,
     surface: TouchSurface,
     scope: CommandScope,
     geometry: TapZoneGeometry,
@@ -1117,6 +1387,7 @@ fn process_in_temp_data(
     now_ms: u64,
     execution_enabled: bool,
     gestures_disabled: bool,
+    cancellation_indices: &[usize],
 ) -> TouchFrame {
     let diagnostics_enabled = crate::touch_debug::touch_debug_enabled();
     let pass = diagnostics_enabled.then(|| (ctx.cumulative_pass_nr(), ctx.current_pass_index()));
@@ -1155,6 +1426,7 @@ fn process_in_temp_data(
             execution_enabled,
             gestures_disabled,
             diagnostics_enabled,
+            cancellation_indices,
         );
         (
             touch_frame,
@@ -1170,7 +1442,7 @@ fn process_in_temp_data(
         log_correlation_diagnostics(
             viewport,
             surface,
-            frame,
+            frame.counter(),
             egui_pass,
             pass_index,
             drive_kind,
@@ -1237,6 +1509,7 @@ fn process_surface_state(
     execution_enabled: bool,
     gestures_disabled: bool,
     diagnostics_enabled: bool,
+    cancellation_indices: &[usize],
 ) -> (TouchFrame, Option<CorrelationDiagnostics>) {
     let id = state_id(viewport, surface);
     let mut state = data
@@ -1246,12 +1519,13 @@ fn process_surface_state(
     let (frame, diagnostics) = if gestures_disabled {
         state.reset_for_global_disable(diagnostics_enabled)
     } else {
-        state.process_frame_with_diagnostics(
+        state.process_frame_with_recognition_cancellations(
             geometry,
             events,
             now_ms,
             execution_enabled,
             diagnostics_enabled,
+            cancellation_indices,
         )
     };
     state.repeatable_frame = frame.replay_for_later_passes();
@@ -1513,6 +1787,106 @@ mod tests {
         })
         .drop_without_applying_deltas();
         frames.unwrap()
+    }
+
+    #[test]
+    fn exact_tap_facts_survive_generic_ambiguity_without_replaying_command_authority() {
+        let pos = pos2(500.0, 400.0);
+        let mut events = mouse_click(pos2(50.0, 50.0));
+        let tap_release = events.len() + 4;
+        events.extend(tap_events(1, pos));
+        let mut state = TouchCorrelationState::default();
+        let frame = state.process_frame(&geometry(), &events, 100, true);
+        assert!(
+            frame.commands().is_empty(),
+            "generic Phase 1 ambiguity policy is unchanged"
+        );
+        assert!(!frame.should_suppress_primary(pos, false));
+        assert!(frame.completed_tap_at(tap_release));
+        assert!(
+            !frame
+                .replay_for_later_passes()
+                .completed_tap_at(tap_release)
+        );
+        let mut disabled = TouchCorrelationState::default();
+        assert!(
+            !disabled
+                .process_frame(&geometry(), &events, 100, false)
+                .completed_tap_at(tap_release)
+        );
+        let mut pending = TouchCorrelationState::default();
+        let incomplete = [
+            touch(1, egui::TouchPhase::Start, pos),
+            Event::PointerMoved(pos),
+            primary(pos, true),
+            touch(1, egui::TouchPhase::End, pos),
+        ];
+        let frame = pending.process_frame(&geometry(), &incomplete, 100, true);
+        assert!(
+            frame.tap_completion_event_indices.is_empty(),
+            "pending commands are not completion facts"
+        );
+    }
+
+    #[test]
+    fn callback_and_app_frames_with_the_same_counter_do_not_replay_each_other() {
+        let ctx = egui::Context::default();
+        install_main_grid_touch_transport_observer(&ctx);
+        let pos = pos2(500.0, 400.0);
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(geometry().surface),
+                time: Some(1.0),
+                events: tap_events(1, pos),
+                ..Default::default()
+            },
+            |ctx| {
+                assert_eq!(ctx.cumulative_frame_nr(), 0);
+                let frame = drive_egui_touch_input_with_recognition_cancellations(
+                    ctx,
+                    TouchSurface::StillFullscreen,
+                    geometry(),
+                    0,
+                    true,
+                    &[],
+                );
+                assert_eq!(frame.commands(), &[TouchCommand::ToggleChrome]);
+            },
+        )
+        .drop_without_applying_deltas();
+        // The installed observer must preserve Callback(0), including its
+        // transport-only bookkeeping, until a distinct App(0) drive arrives.
+        assert_eq!(
+            ctx.data(
+                |data| data.get_temp::<DrivenSurface>(driven_surface_id(egui::ViewportId::ROOT))
+            )
+            .unwrap()
+            .frame,
+            FrameIdentity::Callback(0)
+        );
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(geometry().surface),
+                time: Some(1.1),
+                events: tap_events(2, pos),
+                ..Default::default()
+            },
+            |ctx| {
+                let frame =
+                    drive_egui_touch_input(ctx, TouchSurface::StillFullscreen, geometry(), 0, true);
+                assert_eq!(
+                    frame.commands(),
+                    &[TouchCommand::ToggleChrome],
+                    "App(0) is fresh input after Callback(0)"
+                );
+                assert!(
+                    drive_egui_touch_input(ctx, TouchSurface::StillFullscreen, geometry(), 0, true)
+                        .commands()
+                        .is_empty()
+                );
+            },
+        )
+        .drop_without_applying_deltas();
     }
 
     #[test]
@@ -2464,7 +2838,7 @@ mod tests {
         assert_eq!(
             ctx.data(|data| data.get_temp::<DrivenSurface>(driven_surface_id(ctx.viewport_id()))),
             Some(DrivenSurface {
-                frame: ctx.cumulative_frame_nr(),
+                frame: FrameIdentity::App(ctx.cumulative_frame_nr()),
                 outcome: FrameDrive::GridDriven(CommandScope::MainGrid(scope)),
             })
         );
@@ -2601,7 +2975,7 @@ mod tests {
             assert_eq!(
                 ctx.data(|data| data.get_temp::<DrivenSurface>(driven_surface_id(root))),
                 Some(DrivenSurface {
-                    frame: 0,
+                    frame: FrameIdentity::App(0),
                     outcome: FrameDrive::GridTransportOnly,
                 })
             );
@@ -2637,7 +3011,7 @@ mod tests {
         assert_eq!(
             ctx.data(|data| data.get_temp::<DrivenSurface>(driven_surface_id(root))),
             Some(DrivenSurface {
-                frame: 1,
+                frame: FrameIdentity::App(1),
                 outcome: FrameDrive::GridTransportOnly,
             })
         );
