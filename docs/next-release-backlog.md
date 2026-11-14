@@ -148,6 +148,7 @@
 - 対応の方向: 上限を延ばして隠すのではなく、テストが待つ対象を決定的にする (別スレッドの完了を明示的に待つ・テスト内で同期実行する)。原因が分かるまでは、全件で落ちたテストを単独で流し直して切り分ける運用を続ける。
 - 規模 / 優先度: Small / P3。
 
+- 追記 (2026-11-14、統括): 3 件目の候補。`ui_fullscreen::continuous_quality_tests::section1674_paged_continuous_round_trip_refreshes_pdf_geometry_and_visible_quality` が、feat-755-miv-sound の lib 全件 (run-heavy -FullTest、ほかのセッションの重い処理と並行) で 1 回だけ "reverse paged current is undersampled: idx=3 Ltr/Vertical animation=false" で落ちた。同じブランチで continuous_quality_tests の 9 件を単独で流すと全件成功 (§1.755 の担当の観測)。そのブランチに Rust の変更は無い。master で出るかは未確認。
 ### 1.773 表紙ページを回転した本でも、自動の表紙の切り出しを回転した向きで行う (描画時に切る) — 利用者要望 (2026-11-12)
 
 - 状態: **未着手・§1.764 を出荷する版 (2026-11-13 予定) の、その次の版で入れる (利用者決定 2026-11-12)**。§1.764 は回転を見ない自動のまま出荷し、この項目で直す。
