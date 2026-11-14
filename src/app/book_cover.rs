@@ -143,7 +143,8 @@ pub(crate) struct ResolvedBookCover {
     pub(crate) edit_preview_key: Option<String>,
     /// Sampling scope from the shared thumbnail request, never the outer ZIP.
     pub(crate) zip_dir_prefix: Option<String>,
-    pub(crate) auto_cover_crop: Option<crate::thumb_loader::ResolvedAutoCover>,
+    pub(crate) auto_cover_crop:
+        Result<crate::thumb_loader::ResolvedAutoCover, crate::thumb_loader::AutoCoverSkip>,
 }
 
 #[derive(Debug)]
@@ -360,7 +361,7 @@ impl CoverResolver<'_> {
                 cover_crop: None,
                 edit_preview_key: None,
                 zip_dir_prefix: None,
-                auto_cover_crop: None,
+                auto_cover_crop: Err(crate::thumb_loader::AutoCoverSkip::ChildRepresentative),
             });
         }
         let pin_container = zip_prefix.map_or_else(
@@ -574,7 +575,15 @@ impl CoverResolver<'_> {
                 cover.persistent_source =
                     source_for_location(path, &cover.signature_path, &cover.location);
                 // K2 is child-owned material, not a direct image of this folder.
-                cover.auto_cover_crop = None;
+                cover.auto_cover_crop = if cover.cover_crop.is_some() {
+                    Err(crate::thumb_loader::AutoCoverSkip::Manual {
+                        auto_eligible_after_clear: false,
+                    })
+                } else {
+                    resolved
+                        .auto_cover_crop
+                        .and_then(|_| Err(crate::thumb_loader::AutoCoverSkip::ChildRepresentative))
+                };
                 return Ok(cover);
             }
             let physical_path = match &resolved.location {
@@ -1339,6 +1348,45 @@ mod tests {
     }
 
     #[test]
+    fn book_cover_fixed_pdf_keeps_worker_auto_input_for_range_dialog() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("book.pdf");
+        std::fs::write(&path, b"native boundary fixture").unwrap();
+        let mut env = pin_env(&tmp);
+        env.books_root = Some(tmp.path().to_owned());
+        env.auto_cover_crop = Some(crate::cover_auto_crop::AutoCropIdentity::new(
+            crate::settings::ReadingDirection::Rtl,
+        ));
+        env.pin_db
+            .as_ref()
+            .unwrap()
+            .set(
+                &path,
+                &FolderPinSource::PdfPage {
+                    pdf_rel: String::new(),
+                    page: 2,
+                },
+            )
+            .unwrap();
+        with_pdf(
+            PdfFixture {
+                path: path.clone(),
+                password: None,
+                pages: 3,
+                source: None,
+            },
+            || {
+                let cover = readable(resolve_book_cover(&path, BookKind::Pdf, &env));
+                assert_eq!(cover.cover_ref, "#page=2");
+                assert!(matches!(
+                    cover.auto_cover_crop.unwrap().input,
+                    crate::thumb_loader::AutoCoverInput::Container
+                ));
+            },
+        );
+    }
+
+    #[test]
     fn book_cover_epub_uses_the_leased_generation_source_signature() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("book.epub");
@@ -1466,6 +1514,55 @@ mod tests {
         let cover = readable(resolve_book_cover(&root, BookKind::Folder, &env));
         assert_eq!(cover.cover_ref, "child.zip#entry=fixed.jpg");
         assert_eq!(cover.signature_path, zip);
+    }
+
+    #[test]
+    fn book_cover_auto_cached_child_retains_parent_stop_instead_of_child_eligibility() {
+        let _data = crate::data_dir::TestDataDirGuard::new();
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("book");
+        std::fs::create_dir_all(&root).unwrap();
+        let zip = root.join("child.zip");
+        write_zip(&zip, &["001.jpg", "fixed.jpg"]);
+        let mut env = pin_env(&tmp);
+        env.books_root = Some(tmp.path().to_owned());
+        let identity = crate::cover_auto_crop::AutoCropIdentity {
+            binding: crate::settings::ReadingDirection::Rtl,
+            folders: true,
+        };
+        env.auto_cover_crop = Some(identity);
+        let source = FolderPinSource::ZipEntry {
+            zip_rel: String::new(),
+            entry: "fixed.jpg".into(),
+        };
+        env.pin_db.as_ref().unwrap().set(&zip, &source).unwrap();
+        let target = resolve_pin_target_cascaded(&zip, &source, env.pin_db.as_deref(), 3).unwrap();
+        let key = crate::thumb_loader::representative_cache_key_for_policy_with_auto(
+            &target.pinned_cache_key("zipthumb:child.zip", PinKeyMode::Exact, None),
+            &env.visibility,
+            Some(identity),
+        );
+        let catalog =
+            crate::catalog::CatalogDb::open(&crate::catalog::default_cache_dir(), &root).unwrap();
+        catalog
+            .save_thumb_bytes(
+                &key,
+                target.mtime,
+                target.file_size,
+                Some((8, 8)),
+                &webp(),
+                &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::Automatic(
+                    crate::cover_auto_material::AutoCropResults::new([None; 4]),
+                ),
+            )
+            .unwrap();
+        let cover = readable(resolve_book_cover(&root, BookKind::Folder, &env));
+        assert_eq!(
+            cover.auto_cover_crop.unwrap_err(),
+            crate::thumb_loader::AutoCoverSkip::ChildRepresentative
+        );
+        assert_eq!(cover.cover_ref, "child.zip#entry=fixed.jpg");
     }
 
     #[test]

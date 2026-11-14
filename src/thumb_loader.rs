@@ -1074,10 +1074,24 @@ pub(crate) enum AutoCoverInput {
     FolderPages(Arc<[std::path::PathBuf]>),
 }
 
+/// Source-resolution stops, shared by the worker and range dialog. Keep this
+/// alongside the resolved input, rather than inferring a cause from None in UI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AutoCoverSkip {
+    Manual { auto_eligible_after_clear: bool },
+    Off,
+    PinnedFolder,
+    ChildRepresentative,
+    FolderDisabled,
+    DirectRar,
+    NestedZip,
+    Unsupported,
+}
+
 pub(crate) struct ResolvedRead {
     pub(crate) location: ReadLocation,
     pub(crate) cover_crop: Option<crate::folder_thumb_pins::CoverCrop>,
-    pub(crate) auto_cover_crop: Option<ResolvedAutoCover>,
+    pub(crate) auto_cover_crop: Result<ResolvedAutoCover, AutoCoverSkip>,
     pub(crate) folder_selection_proof: Option<crate::catalog::FolderSelectionProof>,
     pub(crate) preloaded_zip_bytes: Option<Vec<u8>>,
     pub(crate) child_selection: Option<CachedChildSelection>,
@@ -1091,7 +1105,7 @@ impl ResolvedRead {
         Self {
             location: ReadLocation::Unreadable { cancelled },
             cover_crop: None,
-            auto_cover_crop: None,
+            auto_cover_crop: Err(AutoCoverSkip::Unsupported),
             folder_selection_proof: None,
             preloaded_zip_bytes: None,
             child_selection: None,
@@ -1325,35 +1339,18 @@ pub(crate) fn resolve_read_after_cache_miss(
     } else {
         ReadLocation::File(load_path.to_path_buf())
     };
+    let cover_crop = folder_cover_crop.or(req.cover_crop);
+    let auto_cover_crop = resolve_auto_cover_input(
+        req,
+        &location,
+        cover_crop,
+        is_folder_thumb,
+        folder_auto_pages,
+    );
     ResolvedRead {
         location,
-        cover_crop: folder_cover_crop.or(req.cover_crop),
-        auto_cover_crop: req
-            .auto_cover_crop
-            .filter(|_| folder_cover_crop.or(req.cover_crop).is_none())
-            .and_then(|identity| {
-                if is_folder_thumb {
-                    identity
-                        .folders
-                        .then_some(folder_auto_pages)
-                        .flatten()
-                        .map(|pages| ResolvedAutoCover {
-                            identity,
-                            input: AutoCoverInput::FolderPages(pages),
-                        })
-                } else if !req
-                    .cache_key_override
-                    .as_deref()
-                    .is_some_and(|key| key.starts_with(CACHE_KEY_FOLDER))
-                {
-                    Some(ResolvedAutoCover {
-                        identity,
-                        input: AutoCoverInput::Container,
-                    })
-                } else {
-                    None
-                }
-            }),
+        cover_crop,
+        auto_cover_crop,
         folder_selection_proof,
         preloaded_zip_bytes,
         child_selection: cached_pinned_folder_thumb
@@ -1367,6 +1364,81 @@ pub(crate) fn resolve_read_after_cache_miss(
         effective_stamp: (req.mtime, req.file_size),
         needs_heavy_io,
     }
+}
+
+fn resolve_auto_cover_input(
+    req: &LoadRequest,
+    location: &ReadLocation,
+    crop: Option<crate::folder_thumb_pins::CoverCrop>,
+    is_folder_thumb: bool,
+    folder_pages: Option<Arc<[std::path::PathBuf]>>,
+) -> Result<ResolvedAutoCover, AutoCoverSkip> {
+    let folder = is_folder_thumb
+        || req
+            .cache_key_override
+            .as_deref()
+            .is_some_and(|key| key.starts_with(CACHE_KEY_FOLDER));
+    if crop.is_some() {
+        return Err(AutoCoverSkip::Manual {
+            // Clearing keeps the page pin. Folder pins do not become automatic.
+            auto_eligible_after_clear: !folder && automatic_container_location(location).is_ok(),
+        });
+    }
+    if folder && req.folder_thumb_provenance == Some(crate::catalog::FolderThumbProvenance::Seeded)
+    {
+        return Err(AutoCoverSkip::PinnedFolder);
+    }
+    let identity = req.auto_cover_crop.ok_or(AutoCoverSkip::Off)?;
+    let input = if folder {
+        if !identity.folders {
+            return Err(AutoCoverSkip::FolderDisabled);
+        }
+        AutoCoverInput::FolderPages(folder_pages.ok_or(AutoCoverSkip::ChildRepresentative)?)
+    } else {
+        automatic_container_location(location)?;
+        AutoCoverInput::Container
+    };
+    Ok(ResolvedAutoCover { identity, input })
+}
+
+fn automatic_container_location(location: &ReadLocation) -> Result<(), AutoCoverSkip> {
+    match location {
+        ReadLocation::PdfPage { .. } => Ok(()),
+        ReadLocation::ArchiveEntry { archive, entry } => {
+            automatic_container_source(archive, Some(entry), None)
+        }
+        _ => Err(AutoCoverSkip::Unsupported),
+    }
+}
+
+// Shared by source resolution and the decoder's last eligibility check.
+fn automatic_container_source(
+    path: &Path,
+    entry: Option<&str>,
+    page: Option<u32>,
+) -> Result<(), AutoCoverSkip> {
+    if page.is_some() {
+        return Ok(());
+    }
+    let entry = entry.ok_or(AutoCoverSkip::Unsupported)?;
+    if crate::rar_loader::is_rar_path(path) {
+        return Err(AutoCoverSkip::DirectRar);
+    }
+    if crate::zip_loader::split_nested_zip_path(entry).len() != 1 {
+        return Err(AutoCoverSkip::NestedZip);
+    }
+    if crate::raw_format::is_raw_path(Path::new(entry))
+        || matches!(
+            crate::file_type_visibility::category_for_extension(&ext_lower(Path::new(entry))),
+            Some(
+                crate::file_type_visibility::FileTypeCategory::Video
+                    | crate::file_type_visibility::FileTypeCategory::Audio
+            )
+        )
+    {
+        return Err(AutoCoverSkip::Unsupported);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Default)]
@@ -4059,7 +4131,7 @@ fn process_load_request_with_provider(
     };
     debug_assert_eq!(resolved.effective_stamp, (req.mtime, req.file_size));
     let cover_crop = resolved.cover_crop;
-    let auto_cover_crop = resolved.auto_cover_crop;
+    let auto_cover_crop = resolved.auto_cover_crop.ok();
     let needs_heavy_io = resolved.needs_heavy_io;
     let folder_selection_proof = resolved.folder_selection_proof;
     let cached_pinned_folder_thumb = resolved.cached_child;
@@ -6349,6 +6421,15 @@ pub(crate) fn load_one_cached(
     // `path` is now its selected image. Diagnostics never register another owner.
     #[cfg(all(windows, any(test, feature = "test-script")))]
     let diagnostic_key = deferred_req.as_ref().and_then(diagnostic_request_key);
+    // Capture before the RAW continuation can consume deferred_req. Folder
+    // source resolution has replaced path with its selected leaf.
+    let auto_book_display = auto_cover_crop.as_ref().map(|_| {
+        deferred_req
+            .as_ref()
+            .map_or(path, |req| req.path.as_path())
+            .display()
+            .to_string()
+    });
     let total_started = std::time::Instant::now();
     let total_cycles_started = crate::perf::stall::TotalCycles::start();
     // カタログキー (保存・参照で一致させる) と表示名 (ログ用) を分離。
@@ -7047,28 +7128,13 @@ pub(crate) fn load_one_cached(
     let mut auto_material = crate::cover_auto_material::AutoMaterial::NotAutomatic;
     if let Some(auto) = auto_cover_crop.filter(|_| cover_crop.is_none()) {
         let started = std::time::Instant::now();
+        let book_display = auto_book_display.as_deref().unwrap_or("?");
         let native = layout_dims
             .or(source_dims)
             .unwrap_or((img.width(), img.height()));
         let supported = !is_raw
             && (matches!(auto.input, AutoCoverInput::FolderPages(_))
-                || pdf_page.is_some()
-                || zip_entry.is_some_and(|entry| {
-                    crate::zip_loader::split_nested_zip_path(entry).len() == 1
-                        && !matches!(
-                            crate::file_type_visibility::category_for_extension(&ext_lower(
-                                Path::new(entry)
-                            )),
-                            Some(
-                                crate::file_type_visibility::FileTypeCategory::Video
-                                    | crate::file_type_visibility::FileTypeCategory::Audio
-                            )
-                        )
-                        && !path
-                            .extension()
-                            .and_then(|ext| ext.to_str())
-                            .is_some_and(|ext| ext.eq_ignore_ascii_case("rar"))
-                }));
+                || automatic_container_source(path, zip_entry, pdf_page).is_ok());
         let pdf_priority = if priority {
             crate::pdf_loader::JobPriority::HighNormal
         } else {
@@ -7142,8 +7208,9 @@ pub(crate) fn load_one_cached(
                             let reason =
                                 result.map_or_else(|decline| decline.as_str(), |_| "crop".into());
                             crate::logger::log(format!(
-                                "auto cover: rotation={rotation:?} {reason} page-aspect={} {display_name}",
-                                aspect_result.map_or_else(|reason| reason.as_str(), |_| "ok")
+                                "auto cover: rotation={rotation:?} {reason} page-aspect={} book={} leaf={display_name}",
+                                aspect_result.map_or_else(|reason| reason.as_str(), |_| "ok"),
+                                book_display
                             ));
                         },
                     );
@@ -7216,7 +7283,9 @@ pub(crate) fn load_one_cached(
                 }
             }
         }
-        crate::logger::log(format!("auto cover material: {reason} {display_name}"));
+        crate::logger::log(format!(
+            "auto cover material: {reason} book={book_display} leaf={display_name}"
+        ));
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "thumb",

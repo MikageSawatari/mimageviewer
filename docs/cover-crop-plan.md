@@ -1490,6 +1490,31 @@ r2 = REVISE (P2 1 件、ほかは r1 の指摘を閉じた)。v2 キーで `auto
   利用者データ・評価フォルダ・共有先のデータは使わず、画像・sheetは開いていない。
   lib全件・build-dev・製品起動・コミット・追加の独立レビューは行っていない。
 
+### 25.2 実機確認後の停止理由の具体化 (2026-11-14)
+
+- `ResolvedRead` と `ResolvedBookCover` の自動入力は、入力または `AutoCoverSkip` の `Result` で保持する。
+  従来の `None` から画面で推測せず、workerの解決時に手動範囲・フォルダの固定代表・子フォルダ/中の本の代表・
+  画像フォルダの設定OFF・直接読むRAR・入れ子ZIP・残りの対象外を区別して渡す。手動範囲は自動設定のOFFより先に表示する。
+  手動停止の値には解除後の自動適用資格も持たせ、自動OFFや固定フォルダを「解除すると自動に戻る」と案内しない。
+- ZIP/PDF自身の固定ページには、従来どおり自動を掛ける（手動範囲や編集previewがある場合を除く）。
+  フォルダの固定代表には掛けない。K2の画面用leaf再構築でも親側の停止理由を保ち、子の判定入力で置き換えない。
+  K2素材の保存/伝播・判定の規則・キー・UIスレッドのI/Oは変更しない。
+- `auto cover: rotation=...` と `auto cover material: ...` は、同名leafを区別できるよう `book=<要求元タイルのパス>` と
+  `leaf=<従来の表示名>` を併記する。RAW継続が要求を消費する前にログ用の本の名前だけを捕捉する。
+- 一般の `Unsupported` は、RAW/動画/音声の書庫leaf、通常の本代表では生じない直接ファイル等の解決位置、読めない要求の
+  予備値に残す。RAW/動画等は通常、範囲画面の画像準備の段階で既存の専用エラーとなり、この一般文言まで到達しない。
+  マニュアルの範囲画面の説明には理由の列挙がなく、従来の説明と矛盾しないため変更しない。
+- 回帰: `cover_crop_folder_stops_arrive_from_worker_for_pin_manual_setting_and_descendant`、
+  `cover_crop_archive_exclusions_and_fixed_container_pages_use_worker_types`、
+  `book_cover_fixed_pdf_keeps_worker_auto_input_for_range_dialog`、
+  `book_cover_auto_cached_child_retains_parent_stop_instead_of_child_eligibility`。
+  `cover_crop_auto_reason_mapping_covers_all_detector_and_preanalysis_reasons` の対応表も全停止理由へ広げる。
+- 検証: 最終差分で `cover_auto|cover_crop|book_cover|cover_rotation|auto_material|exif_reader` の焦点nextest **283件成功・失敗0**。
+  `ui_snapshot cover_` **5件成功**（範囲画面4件と既存の環境設定1件）、PNG変更なし。
+  `cargo fmt`・`python scripts/check_ui_glyphs.py`・`git diff --check`成功。全cargoは共有runner `773 rc1` 経由で逐次実行した。
+  型変更に合わせたAI説明文と回転テストのfixture補正を含むが、AI本番処理・detached・設定保存・判定器は変更していない。
+  lib全件・製品起動・検証用build・コミット・追加の独立レビューは行わず、利用者データや外部評価画像も使用していない。
+
 ## 26. 画像フォルダの本も自動の対象にする (§1.773、2026-11-14、利用者決定 B・v5.2.1)
 
 ### 26.1 経緯と方針
@@ -1621,3 +1646,13 @@ r2 = REVISE (P2 1 件、ほかは r1 の指摘を閉じた)。v2 キーで `auto
 - r4の順序確認: 標本取得はworker・範囲画面・評価器とも判定の門より前。元寸法の門は各保存回転の `w/h >= 0.85` で、4方向一括の素材では正の寸法なら必ずどこかが通る。現在角度が縦長でも90/270度の結果を作るため標本が必要で、現在角度だけを見たskipは§21のDを変えてしまう。後段の `NotWide` の門は本文比率自体が必要なので標本取得をその後へは移せない。したがって順序は維持し、縦長の表紙でもrexif欠落時のWIC openが最大8回増える費用を明記する。
 - r4回帰: `folder_webp_orientation_matches_cover_file_decode_and_zip_stays_bytes_only`、`folder_png_and_jpeg_orientation6_keep_released_dimensions`、`folder_wic_fallback_only_for_missing_rexif_and_never_double_rotates`、`folder_wic_budget_keeps_eight_attempts_and_256k_prefixes`を追加。実際のWICでWebP本文と表紙の寸法を比較し、PNG/JPEG・ZIPの従来結果、rexifのあるときのWIC省略、未知寸法での省略、先頭256KiB・最大8枠を固定する。
 - r4検証: `cover_auto|cover_crop|cover_rotation|read_exif_orientation|exif_reader` の焦点nextest **225件成功・失敗0**。`cargo fmt`・`git diff --check`成功。UIの文言・レイアウトは変更せず、snapshot更新なし。利用者データ・外部評価画像は使用していない。
+
+#### 評価器の後押し比較の使い方 (cfg(test) のみ、2026-11-14)
+
+既存のignored評価に `MIV_COVER_AUTO_EVAL_FALLBACK=edge|edge18|density|density18` を指定すると、境目等の理由で見送った角度だけ後押しで切る。
+未指定なら従来の判定のまま。`MIV_COVER_AUTO_EVAL_FALLBACK_RICHER=1` を併用すると `RicherElsewhere` も含める。
+比率未確定・横長でない・写真の守りには掛けない。入力の指定・`target/` 内の出力先・共有runner経由の実行方法は既存評価と同じ。
+`edge` は本文比率から丸めた全高の幅を綴じ方向側の外端へ置き、`density` は最大0.3幅だけ内側を探す。
+`18` 付きは表紙がその幅の1.8倍以上のときだけ。summaryには `fallback_cropped/good/wrong`、元の見送り理由、角度別の後押し、IoUと内側移動量を追加する。
+`MIV_COVER_AUTO_EVAL_FOLDER_LIST` でも同じ指定を使える。フォルダ入力は引き続きsummaryだけを出し、画像・個別名は出さない。
+正解がないフォルダ入力のIoUとgood/wrongは `null`。本番の判定は変えない。

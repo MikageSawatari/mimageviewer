@@ -59,7 +59,7 @@ fn cover_auto_folder_direct_selection_reuses_listing_and_excludes_descendants_an
     assert!(
         resolve_read_after_cache_miss(&req, None, None)
             .auto_cover_crop
-            .is_none()
+            .is_err()
     );
     req.folder_thumb_provenance = None;
     req.path = temp.path().to_owned();
@@ -67,7 +67,7 @@ fn cover_auto_folder_direct_selection_reuses_listing_and_excludes_descendants_an
     assert!(
         resolve_read_after_cache_miss(&req, None, None)
             .auto_cover_crop
-            .is_none(),
+            .is_err(),
         "parent must not analyze a descendant"
     );
     req.path = folder;
@@ -77,7 +77,7 @@ fn cover_auto_folder_direct_selection_reuses_listing_and_excludes_descendants_an
     assert!(
         resolve_read_after_cache_miss(&req, None, None)
             .auto_cover_crop
-            .is_none(),
+            .is_err(),
         "folder switch OFF"
     );
 }

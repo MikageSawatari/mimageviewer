@@ -10,6 +10,9 @@
 //! saved rotation is truth.saved_rotation minus IMAGE_ROTATION (default 0).
 //! REENCODE_INPUT=1 also reencodes the zero-degree ZIP cover, providing a
 //! numerical control for JPEG recompression in the physical-rotation matrix.
+//! FALLBACK=edge/edge18/density/density18 enables evaluation-only experimental
+//! crops after structural declines. FALLBACK_RICHER=1 also permits richer-elsewhere.
+//! All angles are evaluated; directory counts use the selected saved angle.
 use super::*;
 use image::Rgb;
 use serde::Deserialize;
@@ -17,6 +20,9 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+
+mod fallback;
+use fallback::*;
 
 #[derive(Deserialize)]
 struct Truth {
@@ -324,7 +330,11 @@ fn target_output(output: PathBuf) -> Result<PathBuf, Box<dyn std::error::Error>>
 /// Folder inputs have no ground truth and may contain private images. Use the
 /// representative worker's source selection, bounded sample and analysis, but
 /// emit neither source identities nor a contact sheet or copied input images.
-fn evaluate_folder_list(list: &Path, output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn evaluate_folder_list(
+    list: &Path,
+    output: &Path,
+    fallback_config: FallbackConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     let folders: Vec<PathBuf> = serde_json::from_slice(&std::fs::read(list)?)
         .map_err(|_| "folder evaluation list must be a JSON array of absolute paths")?;
     if folders.is_empty() || folders.iter().any(|path| !path.is_absolute()) {
@@ -335,6 +345,7 @@ fn evaluate_folder_list(list: &Path, output: &Path) -> Result<(), Box<dyn std::e
     let (mut cropped, mut declined) = (0, 0);
     let mut reasons = BTreeMap::<String, u32>::new();
     let mut rows = Vec::new();
+    let mut fallback_stats = FallbackStats::default();
     for (index, folder) in folders.iter().enumerate() {
         let mut request = crate::thumb_loader::LoadRequest {
             idx: index,
@@ -352,7 +363,7 @@ fn evaluate_folder_list(list: &Path, output: &Path) -> Result<(), Box<dyn std::e
         let resolved = crate::thumb_loader::resolve_read_after_cache_miss(&request, None, None);
         let (
             crate::thumb_loader::ReadLocation::File(cover),
-            Some(crate::thumb_loader::ResolvedAutoCover {
+            Ok(crate::thumb_loader::ResolvedAutoCover {
                 identity,
                 input: crate::thumb_loader::AutoCoverInput::FolderPages(pages),
             }),
@@ -367,8 +378,7 @@ fn evaluate_folder_list(list: &Path, output: &Path) -> Result<(), Box<dyn std::e
             None,
         )
         .map_err(|_| format!("folder evaluation case {index} could not decode its cover"))?;
-        let mut unrotated = Err(AutoCropDecline::RawAspectGate);
-        let results = detect_cover_crops_with_photo_report(
+        let outcomes = evaluate_angles(
             &analysis.image,
             analysis.native_dims,
             &sample,
@@ -377,12 +387,11 @@ fn evaluate_folder_list(list: &Path, output: &Path) -> Result<(), Box<dyn std::e
                 dimensions: analysis.photo_dims,
             },
             identity.binding,
-            |rotation, result| {
-                if rotation.is_none() {
-                    unrotated = result;
-                }
-            },
+            fallback_config,
         );
+        let selected = outcomes[0];
+        let unrotated = selected.final_result;
+        fallback_stats.record(selected, None, false);
         let reason = match unrotated {
             Ok(_) => {
                 cropped += 1;
@@ -403,7 +412,11 @@ fn evaluate_folder_list(list: &Path, output: &Path) -> Result<(), Box<dyn std::e
             "page_aspect": sample.aspect.ok(),
             "page_aspect_decline": sample.aspect.err().map(crate::cover_auto_sample::PageAspectDecline::as_str),
             "crop": unrotated.ok().map(CoverCrop::values),
-            "all_crops": results.crops().map(|crop| crop.map(CoverCrop::values)),
+            "all_crops": outcomes.map(|outcome| outcome.final_result.ok().map(CoverCrop::values)),
+            "original_decline": selected.original.err().map(|reason| reason.as_str().into_owned()),
+            "fallback": selected.fallback.map(|diagnostic| diagnostic.json(fallback_config)),
+            "iou": null,
+            "all_fallbacks": outcomes.map(|outcome| outcome.fallback.map(|diagnostic| diagnostic.json(fallback_config))),
         }));
     }
     let summary = json!({
@@ -413,6 +426,13 @@ fn evaluate_folder_list(list: &Path, output: &Path) -> Result<(), Box<dyn std::e
         "cropped": cropped,
         "declined": declined,
         "decline_reasons": reasons,
+        "fallback_mode": fallback_config.name(),
+        "fallback_richer": fallback_config.includes_richer(),
+        "fallback_cropped": fallback_stats.cropped,
+        "fallback_good": null,
+        "fallback_wrong": null,
+        "fallback_original_declines": fallback_stats.reasons,
+        "fallback_inward_fraction_distribution": fallback_stats.distribution(),
         "rows": rows,
     });
     std::fs::write(
@@ -430,13 +450,14 @@ fn evaluate_folder_list(list: &Path, output: &Path) -> Result<(), Box<dyn std::e
 #[test]
 #[ignore = "requires MIV_COVER_AUTO_EVAL_DIR or MIV_COVER_AUTO_EVAL_FOLDER_LIST; external evaluation images are never repository fixtures"]
 fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Error>> {
+    let fallback_config = FallbackConfig::from_env()?;
     let output = target_output(
         std::env::var_os("MIV_COVER_AUTO_EVAL_OUTPUT")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("target/cover-auto-eval")),
     )?;
     if let Some(list) = std::env::var_os("MIV_COVER_AUTO_EVAL_FOLDER_LIST") {
-        return evaluate_folder_list(Path::new(&list), &output);
+        return evaluate_folder_list(Path::new(&list), &output, fallback_config);
     }
     let directory = PathBuf::from(
         std::env::var_os("MIV_COVER_AUTO_EVAL_DIR").ok_or("set MIV_COVER_AUTO_EVAL_DIR")?,
@@ -461,6 +482,7 @@ fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Erro
     let (mut negative_cropped, mut negative_declined) = (0, 0);
     let mut reasons = BTreeMap::<String, u32>::new();
     let mut rows = Vec::new();
+    let mut fallback_stats = FallbackStats::default();
     for (index, (name, truth)) in truth.iter().enumerate() {
         let LoadedCase {
             image,
@@ -500,21 +522,19 @@ fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Erro
                 |decoded| decoded.photo_dims,
             ),
         };
-        let mut detected = Err(AutoCropDecline::RawAspectGate);
-        let results = detect_cover_crops_with_photo_report(
+        let outcomes = evaluate_angles(
             decoded_image,
             native_dims,
             &sample,
             evidence,
             binding,
-            |rotation, result| {
-                if rotation == saved {
-                    detected = result
-                }
-            },
+            fallback_config,
         );
-        let prediction = results.crop_for(saved);
-        assert_eq!(prediction, detected.as_ref().ok().copied());
+        let selected = outcomes[EVAL_ROTATIONS
+            .iter()
+            .position(|&rotation| rotation == saved)
+            .unwrap()];
+        let detected = selected.final_result;
         let expected = truth.front.map(|x| {
             let y = truth.front_y.unwrap_or([0.0, original_dims.1 as f64]);
             rotated_rect([x[0], y[0], x[1], y[1]], original_dims, mode.image_rotation)
@@ -529,6 +549,7 @@ fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Erro
             ]
         });
         let iou = predicted.zip(expected).map(|(a, b)| box_iou(a, b));
+        fallback_stats.record(selected, iou, true);
         let (status, color) = match detected {
             Ok(_) if iou.is_some_and(|iou| iou >= 0.85) => {
                 good += 1;
@@ -557,7 +578,10 @@ fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Erro
         rows.push(json!({"index":index,"name":name,"status":status,"reason":reason,"iou":iou,"truth":expected,"prediction":predicted,"page_aspect":aspect,"zip_leaf":zip_leaf,"ltr":truth.ltr,
             "decoded_dims":[decoded_image.width(),decoded_image.height()],"native_dims":native_dims,
             "saved_rotation":saved.degrees(),"image_rotation":mode.image_rotation.degrees(),
-            "all_crops":results.crops().map(|crop|crop.map(CoverCrop::values)),
+            "all_crops":outcomes.map(|outcome|outcome.final_result.ok().map(CoverCrop::values)),
+            "original_decline":selected.original.err().map(|reason|reason.as_str().into_owned()),
+            "fallback":selected.fallback.map(|diagnostic|diagnostic.json(fallback_config)),
+            "all_fallbacks":outcomes.map(|outcome|outcome.fallback.map(|diagnostic|diagnostic.json(fallback_config))),
             "dct_scale_num":worker.as_ref().and_then(|decoded|decoded.dct_scale_num),"orientation":worker.as_ref().map(|decoded|decoded.orientation)}));
         let mut tile = image.thumbnail(cell_width - 12, cell_height - 14).to_rgb8();
         let project = |r: [f64; 4]| {
@@ -597,6 +621,11 @@ fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Erro
         "reencode_input_control":mode.reencode_input,
         "saved_rotation_override":mode.saved_rotation.map(Rotation::degrees),
         "iou_threshold":0.85,"good":good,"wrong":wrong,"declined":declined,
+        "fallback_mode":fallback_config.name(),"fallback_cropped":fallback_stats.cropped,
+        "fallback_richer":fallback_config.includes_richer(),
+        "fallback_good":fallback_stats.good,"fallback_wrong":fallback_stats.wrong,
+        "fallback_original_declines":fallback_stats.reasons,
+        "fallback_inward_fraction_distribution":fallback_stats.distribution(),
         "negative_cropped":negative_cropped,"negative_declined":negative_declined,"decline_reasons":reasons,"sheet_columns":columns,"rows":rows});
     std::fs::write(
         output.join("summary.json"),
@@ -627,7 +656,7 @@ fn folder_evaluation_emits_counts_and_numeric_rows_without_images_or_names()
     let list = temp.path().join("folders.json");
     std::fs::write(&list, serde_json::to_vec(&vec![folder])?)?;
     let output = temp.path().join("output");
-    evaluate_folder_list(&list, &output)?;
+    evaluate_folder_list(&list, &output, FallbackConfig::default())?;
     let artifacts: Vec<_> = std::fs::read_dir(&output)?
         .map(|entry| entry.unwrap().file_name())
         .collect();
@@ -674,4 +703,82 @@ fn evaluation_truth_rotation_uses_source_edges_without_pixel_center_drift() {
         rotated_rect(bounds, (200, 300), Rotation::Cw90),
         [131.0, 11.0, 277.0, 81.0]
     );
+}
+
+#[test]
+fn folder_evaluation_fallback_synthetic_counts_keep_guard_and_emit_no_images_or_identities()
+-> Result<(), Box<dyn std::error::Error>> {
+    let target = std::env::current_dir()?.join("target");
+    std::fs::create_dir_all(&target)?;
+    let temp = tempfile::Builder::new()
+        .prefix("cover-auto-fallback-eval-")
+        .tempdir_in(&target)?;
+    let mut folders = Vec::new();
+    for (index, width) in [150, 240].into_iter().enumerate() {
+        let folder = temp.path().join(format!("private-folder-{index}"));
+        std::fs::create_dir(&folder)?;
+        DynamicImage::new_rgb8(width, 100).save(folder.join("000-private-cover.png"))?;
+        for page in 1..=8 {
+            DynamicImage::new_rgb8(100, 150)
+                .save(folder.join(format!("{page:03}-private-body.png")))?;
+        }
+        folders.push(folder);
+    }
+    let list = temp.path().join("folders.json");
+    std::fs::write(&list, serde_json::to_vec(&folders)?)?;
+    for mode in [
+        None,
+        Some("edge"),
+        Some("edge18"),
+        Some("density"),
+        Some("density18"),
+    ] {
+        // No process environment mutation: production defaults and each
+        // experiment can run concurrently with unrelated test processes.
+        let config = FallbackConfig::parse(mode, false)?;
+        let output = temp.path().join(mode.unwrap_or("baseline"));
+        evaluate_folder_list(&list, &output, config)?;
+        let artifacts: Vec<_> = std::fs::read_dir(&output)?
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(artifacts, vec![std::ffi::OsString::from("summary.json")]);
+        let text = std::fs::read_to_string(output.join("summary.json"))?;
+        assert!(!text.contains("private-"));
+        assert!(!text.contains(&temp.path().to_string_lossy().into_owned()));
+        let summary: serde_json::Value = serde_json::from_str(&text)?;
+        let count = u32::from(mode.is_some());
+        assert_eq!(summary["total"], 2);
+        assert_eq!(summary["cropped"], count);
+        assert_eq!(summary["declined"], 2 - count);
+        assert_eq!(summary["fallback_cropped"], count);
+        assert!(summary["fallback_good"].is_null());
+        assert!(summary["fallback_wrong"].is_null());
+        assert_eq!(
+            summary["rows"][0]["original_decline"],
+            "photo-like/transposed-page"
+        );
+        assert!(summary["rows"][0]["fallback"].is_null());
+        assert!(summary["rows"][0]["crop"].is_null());
+        assert_eq!(summary["rows"][1]["fallback"].is_object(), mode.is_some());
+        assert_eq!(summary["rows"][1]["crop"].is_array(), mode.is_some());
+        assert_eq!(
+            summary["fallback_inward_fraction_distribution"]["count"],
+            count
+        );
+        if mode.is_some() {
+            let reason = summary["rows"][1]["original_decline"].as_str().unwrap();
+            assert_eq!(summary["fallback_original_declines"][reason], 1);
+            assert_eq!(summary["rows"][1]["all_crops"].as_array().unwrap().len(), 4);
+            assert_eq!(
+                summary["rows"][1]["all_fallbacks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|value| value.is_object())
+                    .count(),
+                2
+            );
+        }
+    }
+    Ok(())
 }

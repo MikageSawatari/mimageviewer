@@ -17,6 +17,7 @@ use crate::export_crop::{CropHandle, CropRect};
 use crate::folder_thumb_pins::{CoverCrop, FolderPin, FolderPinSource};
 use crate::grid_item::GridItem;
 use crate::rotation_db::Rotation;
+use crate::thumb_loader::AutoCoverSkip;
 use eframe::egui;
 
 mod automatic;
@@ -25,6 +26,8 @@ mod automatic_tests;
 #[cfg(test)]
 #[path = "cover_crop/legacy_orientation_tests.rs"]
 mod legacy_orientation_tests;
+#[cfg(test)]
+mod source_reason_tests;
 use automatic::{AutoDetection, AutoStop};
 
 const UNIT: usize = 1_000_000;
@@ -518,7 +521,7 @@ fn prepare_cover_inner(
         ReadLocation::File(path)
             if cover.cover_crop.is_none()
                 && env.auto_cover_crop.is_some()
-                && (container.kind != BookKind::Folder || cover.auto_cover_crop.is_some())
+                && (container.kind != BookKind::Folder || cover.auto_cover_crop.is_ok())
                 && path
                     .extension()
                     .and_then(|ext| ext.to_str())
@@ -536,7 +539,7 @@ fn prepare_cover_inner(
             image
         }
         ReadLocation::ArchiveEntry { entry, .. }
-            if cover.auto_cover_crop.is_some()
+            if cover.auto_cover_crop.is_ok()
                 && cover.cover_crop.is_none()
                 && cover.preloaded_bytes.as_deref().is_some_and(|bytes| {
                     matches!(
@@ -598,24 +601,11 @@ fn prepare_cover_inner(
             .oriented(source)
         }
     };
-    let supported = if container.kind == BookKind::Folder {
-        cover.auto_cover_crop.as_ref().is_some_and(|auto| {
-            matches!(
-                auto.input,
-                crate::thumb_loader::AutoCoverInput::FolderPages(_)
-            )
-        })
-    } else {
-        match &cover.location {
-            ReadLocation::PdfPage { .. } => true,
-            ReadLocation::ArchiveEntry { archive, entry } => {
-                !crate::rar_loader::is_rar_path(archive)
-                    && crate::zip_loader::split_nested_zip_path(entry).len() == 1
-            }
-            _ => false,
-        }
-    };
-    let auto_crop = env.auto_cover_crop.filter(|_| supported);
+    let auto_crop = cover
+        .auto_cover_crop
+        .as_ref()
+        .ok()
+        .map(|auto| auto.identity);
     let auto_enabled = auto_crop.is_some();
     let has_edit_preview = auto_enabled
         && cover.cover_crop.is_none()
@@ -653,18 +643,16 @@ fn prepare_cover_inner(
                 }
                 .is_some()
             });
-    let auto_detection = if env.auto_cover_crop.is_none() {
-        AutoDetection::Stopped(AutoStop::Off)
-    } else if !supported {
-        AutoDetection::Stopped(AutoStop::Unsupported)
-    } else if cover.cover_crop.is_some() {
-        AutoDetection::Stopped(AutoStop::Manual)
+    let auto_detection = if let Some(stop) =
+        AutoStop::for_source(&cover.auto_cover_crop, env.auto_cover_crop.is_some())
+    {
+        AutoDetection::Stopped(stop)
     } else if has_edit_preview {
         AutoDetection::Stopped(AutoStop::EditPreview)
     } else if let Some(auto) = auto_crop.filter(|_| !cancel.load(Ordering::Relaxed)) {
         let sample = match &cover.location {
             ReadLocation::File(path) => {
-                match cover.auto_cover_crop.as_ref().map(|auto| &auto.input) {
+                match cover.auto_cover_crop.as_ref().ok().map(|auto| &auto.input) {
                     Some(crate::thumb_loader::AutoCoverInput::FolderPages(pages)) => {
                         crate::cover_auto_sample::sample_folder_pages(pages, path)
                     }
@@ -1161,9 +1149,11 @@ fn draw_cover_crop_snapshot(ui: &mut egui::Ui, auto_enabled: bool) {
         crop: crop_rect(CoverCrop::new([15_000, 45_000, 450_000, 955_000]).unwrap()),
         had_manual_crop: true,
         auto_detection: AutoDetection::Stopped(if auto_enabled {
-            AutoStop::Manual
+            AutoStop::Manual {
+                automatic_enabled: true,
+            }
         } else {
-            AutoStop::Off
+            AutoStop::Source(AutoCoverSkip::Off)
         }),
         drag: None,
         error: None,
@@ -1194,7 +1184,7 @@ mod tests {
             },
             rotation_key: None,
             crop,
-            auto_detection: AutoDetection::Stopped(AutoStop::Off),
+            auto_detection: AutoDetection::Stopped(AutoStop::Source(AutoCoverSkip::Off)),
             image: egui::ColorImage::new(
                 [120, 80],
                 vec![egui::Color32::from_rgb(55, 125, 180); 120 * 80],
@@ -2022,7 +2012,7 @@ mod tests {
                             1=>{
                                 let prepared=fake_prepared(CoverCrop::new([0,0,500_000,1_000_000]).unwrap());
                                 Phase::Ready(CropDraft {source:prepared.source,texture:ctx.load_texture("pure-cover",prepared.image,egui::TextureOptions::LINEAR),rotation:Rotation::None,
-                                    crop:crop_rect(prepared.crop),had_manual_crop:true,auto_detection:AutoDetection::Stopped(AutoStop::Manual),drag:None,error:None})
+                                    crop:crop_rect(prepared.crop),had_manual_crop:true,auto_detection:AutoDetection::Stopped(AutoStop::Manual { automatic_enabled: true }),drag:None,error:None})
                             }
                             _=>Phase::Failed("代表画像を読み込めませんでした。別のページで指定してください。".into()),
                         });
@@ -2149,9 +2139,11 @@ mod tests {
                                         crop: crop_rect(prepared.crop),
                                         had_manual_crop: true,
                                         auto_detection: AutoDetection::Stopped(if auto_enabled {
-                                            AutoStop::Manual
+                                            AutoStop::Manual {
+                                                automatic_enabled: true,
+                                            }
                                         } else {
-                                            AutoStop::Off
+                                            AutoStop::Source(AutoCoverSkip::Off)
                                         }),
                                         drag: None,
                                         error: None,

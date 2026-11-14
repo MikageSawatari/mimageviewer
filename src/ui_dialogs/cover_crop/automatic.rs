@@ -6,15 +6,38 @@ use crate::cover_auto_sample::PageAspectDecline;
 use crate::folder_thumb_pins::CoverCrop;
 use crate::rotation_db::Rotation;
 use crate::settings::ReadingDirection;
+use crate::thumb_loader::AutoCoverSkip;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AutoStop {
-    Off,
-    Manual,
+    /// Manual wins in the reason line even when auto is off. Retain the setting
+    /// here solely for the existing clear-crop explanatory text.
+    Manual {
+        automatic_enabled: bool,
+    },
+    Source(AutoCoverSkip),
     EditPreview,
-    Unsupported,
     PageAspect(PageAspectDecline),
     AnalysisFailed,
+}
+
+impl AutoStop {
+    pub(super) fn for_source(
+        source: &Result<crate::thumb_loader::ResolvedAutoCover, AutoCoverSkip>,
+        configured: bool,
+    ) -> Option<Self> {
+        // A manual crop is effective even with automatic cropping switched off.
+        match source {
+            Err(AutoCoverSkip::Manual {
+                auto_eligible_after_clear,
+            }) => Some(Self::Manual {
+                automatic_enabled: configured && *auto_eligible_after_clear,
+            }),
+            _ if !configured => Some(Self::Source(AutoCoverSkip::Off)),
+            Err(reason) => Some(Self::Source(*reason)),
+            Ok(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,7 +70,10 @@ impl AutoDetection {
     }
 
     pub(super) fn enabled(self) -> bool {
-        !matches!(self, Self::Stopped(AutoStop::Off | AutoStop::Unsupported))
+        if let Self::Stopped(AutoStop::Manual { automatic_enabled }) = self {
+            return automatic_enabled;
+        }
+        !matches!(self, Self::Stopped(AutoStop::Source(_)))
     }
 
     pub(super) fn crop_for(self, rotation: Rotation) -> Option<CoverCrop> {
@@ -99,10 +125,22 @@ impl AutoDetection {
 
 fn stop_text(stop: AutoStop) -> &'static str {
     match stop {
-        AutoStop::Off => "自動の切り出しはオフです",
-        AutoStop::Manual => "手動の範囲を使っています",
+        AutoStop::Manual { .. } => "手動の範囲を使っています",
+        AutoStop::Source(AutoCoverSkip::Off) => "自動の切り出しはオフです",
+        AutoStop::Source(AutoCoverSkip::Manual { .. }) => "手動の範囲を使っています",
         AutoStop::EditPreview => "編集のプレビューがあるため自動は使いません",
-        AutoStop::Unsupported => "この形式の本は自動の対象外です",
+        AutoStop::Source(AutoCoverSkip::Unsupported) => "この形式の本は自動の対象外です",
+        AutoStop::Source(AutoCoverSkip::PinnedFolder) => {
+            "代表のページを固定しているため、自動の判定は使いません"
+        }
+        AutoStop::Source(AutoCoverSkip::ChildRepresentative) => {
+            "代表が子フォルダや中の本の画像なので、自動の判定は使いません"
+        }
+        AutoStop::Source(AutoCoverSkip::FolderDisabled) => {
+            "画像フォルダの本は自動の対象にしていません (環境設定で変えられます)"
+        }
+        AutoStop::Source(AutoCoverSkip::DirectRar) => "変換前の RAR は自動の対象外です",
+        AutoStop::Source(AutoCoverSkip::NestedZip) => "ZIP の中の ZIP は自動の対象外です",
         AutoStop::AnalysisFailed => "表紙を解析できませんでした",
         AutoStop::PageAspect(PageAspectDecline::TooFew) => {
             "本文ページの形が決まりません (ページが少ない)"
@@ -229,13 +267,44 @@ mod tests {
             }
         }
         for (stop, text) in [
-            (AutoStop::Off, "自動の切り出しはオフです"),
-            (AutoStop::Manual, "手動の範囲を使っています"),
+            (
+                AutoStop::Source(AutoCoverSkip::Off),
+                "自動の切り出しはオフです",
+            ),
+            (
+                AutoStop::Manual {
+                    automatic_enabled: true,
+                },
+                "手動の範囲を使っています",
+            ),
             (
                 AutoStop::EditPreview,
                 "編集のプレビューがあるため自動は使いません",
             ),
-            (AutoStop::Unsupported, "この形式の本は自動の対象外です"),
+            (
+                AutoStop::Source(AutoCoverSkip::Unsupported),
+                "この形式の本は自動の対象外です",
+            ),
+            (
+                AutoStop::Source(AutoCoverSkip::PinnedFolder),
+                "代表のページを固定しているため、自動の判定は使いません",
+            ),
+            (
+                AutoStop::Source(AutoCoverSkip::ChildRepresentative),
+                "代表が子フォルダや中の本の画像なので、自動の判定は使いません",
+            ),
+            (
+                AutoStop::Source(AutoCoverSkip::FolderDisabled),
+                "画像フォルダの本は自動の対象にしていません (環境設定で変えられます)",
+            ),
+            (
+                AutoStop::Source(AutoCoverSkip::DirectRar),
+                "変換前の RAR は自動の対象外です",
+            ),
+            (
+                AutoStop::Source(AutoCoverSkip::NestedZip),
+                "ZIP の中の ZIP は自動の対象外です",
+            ),
             (AutoStop::AnalysisFailed, "表紙を解析できませんでした"),
             (
                 AutoStop::PageAspect(PageAspectDecline::TooFew),

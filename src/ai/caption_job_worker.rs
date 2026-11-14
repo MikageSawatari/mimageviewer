@@ -1359,7 +1359,7 @@ mod tests {
             cover_crop: None,
             edit_preview_key: None,
             zip_dir_prefix: None,
-            auto_cover_crop: None,
+            auto_cover_crop: Err(crate::thumb_loader::AutoCoverSkip::Off),
         })
     }
 
