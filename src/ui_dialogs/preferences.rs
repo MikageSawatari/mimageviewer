@@ -5819,9 +5819,10 @@ mod tests {
         let later_key = key("later-watched.mkv");
         let after_clear_key = key("after-clear-watched.mp3");
         app.settings.video_watched_to_end.insert(old_key.clone());
-        app.settings
-            .video_resume_positions
-            .insert(resume_key.clone(), 18.0);
+        app.settings.video_resume_positions.insert(
+            resume_key.clone(),
+            crate::settings::VideoResumePosition::Media(18.0),
+        );
         app.settings.video_audio_track_choices.insert(
             video_key.clone(),
             saved_audio_choice_for_preferences_test(2),
@@ -6400,12 +6401,14 @@ mod tests {
             (false, FullscreenSeekDirection::LeftToRight),
             (true, FullscreenSeekDirection::FollowReading),
         ] {
-            app.settings
-                .video_resume_positions
-                .insert(video_key.clone(), 7.0);
-            app.settings
-                .video_resume_positions
-                .insert(audio_key.clone(), 9.0);
+            app.settings.video_resume_positions.insert(
+                video_key.clone(),
+                crate::settings::VideoResumePosition::Media(7.0),
+            );
+            app.settings.video_resume_positions.insert(
+                audio_key.clone(),
+                crate::settings::VideoResumePosition::Media(9.0),
+            );
             let mut state = preferences_state_for_test(&app.settings);
             state.settings.thumb_show_resume_meter = enabled;
             state.settings.fullscreen_seek_direction = direction;
@@ -6426,11 +6429,19 @@ mod tests {
             }
             app.save_all_video_resume_positions();
             assert_eq!(
-                state.settings.video_resume_positions.get(&video_key),
+                state
+                    .settings
+                    .video_resume_positions
+                    .get(&video_key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&7.0)
             );
             assert_eq!(
-                state.settings.video_resume_positions.get(&audio_key),
+                state
+                    .settings
+                    .video_resume_positions
+                    .get(&audio_key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&9.0)
             );
 
@@ -6450,11 +6461,17 @@ mod tests {
             assert_eq!(app.settings.details_name_width, width);
             assert_eq!(app.settings.favorites[0].id, favorite_id);
             assert_eq!(
-                app.settings.video_resume_positions.get(&video_key),
+                app.settings
+                    .video_resume_positions
+                    .get(&video_key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&18.0)
             );
             assert_eq!(
-                app.settings.video_resume_positions.get(&audio_key),
+                app.settings
+                    .video_resume_positions
+                    .get(&audio_key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&28.0)
             );
             app.settings.save();
@@ -6465,11 +6482,17 @@ mod tests {
             assert_eq!(persisted.thumb_show_resume_meter, enabled);
             assert_eq!(persisted.fullscreen_seek_direction, direction);
             assert_eq!(
-                persisted.video_resume_positions.get(&video_key),
+                persisted
+                    .video_resume_positions
+                    .get(&video_key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&18.0)
             );
             assert_eq!(
-                persisted.video_resume_positions.get(&audio_key),
+                persisted
+                    .video_resume_positions
+                    .get(&audio_key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&28.0)
             );
             let mut reopened = preferences_state_for_test(&persisted);
@@ -6488,22 +6511,34 @@ mod tests {
             assert_eq!(app.settings.thumb_show_resume_meter, enabled);
             assert_eq!(app.settings.fullscreen_seek_direction, direction);
             assert_eq!(
-                app.settings.video_resume_positions.get(&video_key),
+                app.settings
+                    .video_resume_positions
+                    .get(&video_key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&18.0)
             );
             assert_eq!(
-                app.settings.video_resume_positions.get(&audio_key),
+                app.settings
+                    .video_resume_positions
+                    .get(&audio_key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&28.0)
             );
             let after_cancel = db.load_into_settings().unwrap();
             assert_eq!(after_cancel.thumb_show_resume_meter, enabled);
             assert_eq!(after_cancel.fullscreen_seek_direction, direction);
             assert_eq!(
-                after_cancel.video_resume_positions.get(&video_key),
+                after_cancel
+                    .video_resume_positions
+                    .get(&video_key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&18.0)
             );
             assert_eq!(
-                after_cancel.video_resume_positions.get(&audio_key),
+                after_cancel
+                    .video_resume_positions
+                    .get(&audio_key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&28.0)
             );
             assert_eq!(
@@ -6573,7 +6608,10 @@ mod tests {
         let key = crate::adjustment_db::normalize_path(&path);
         for commit in [true, false] {
             let mut app = crate::app::setup_app_for_test();
-            app.settings.video_resume_positions.insert(key.clone(), 7.0);
+            app.settings.video_resume_positions.insert(
+                key.clone(),
+                crate::settings::VideoResumePosition::Media(7.0),
+            );
             let state = preferences_state_for_test(&app.settings);
             let player = crate::video::VideoPlayer::disconnected_for_test(path.clone(), 18.0);
             app.fs_cache.insert(
@@ -6585,7 +6623,13 @@ mod tests {
             );
             // 周期保存と close 時保存が共有する App の書き手を、ダイアログ表示中に実行。
             app.save_all_video_resume_positions();
-            assert_eq!(app.settings.video_resume_positions.get(&key), Some(&18.0));
+            assert_eq!(
+                app.settings
+                    .video_resume_positions
+                    .get(&key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
+                Some(&18.0)
+            );
 
             if commit {
                 let mut state = state;
@@ -6596,7 +6640,13 @@ mod tests {
                 assert!(!app.preferences_dialog_has_unsaved_changes());
                 app.discard_preferences_dialog();
             }
-            assert_eq!(app.settings.video_resume_positions.get(&key), Some(&18.0));
+            assert_eq!(
+                app.settings
+                    .video_resume_positions
+                    .get(&key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
+                Some(&18.0)
+            );
         }
     }
 
@@ -6605,9 +6655,10 @@ mod tests {
         for commit in [false, true] {
             let mut app = crate::app::setup_app_for_test();
             let key = "media/cleared-live.mkv".to_owned();
-            app.settings
-                .video_resume_positions
-                .insert(key.clone(), 18.0);
+            app.settings.video_resume_positions.insert(
+                key.clone(),
+                crate::settings::VideoResumePosition::Media(18.0),
+            );
             app.settings.video_watched_to_end.insert(key.clone());
             app.settings
                 .video_audio_track_choices
@@ -6692,9 +6743,10 @@ mod tests {
 
         let mut state = preferences_state_for_test(&app.settings);
         state.clear_video_media_memory();
-        app.settings
-            .video_resume_positions
-            .insert(key.clone(), 12.0);
+        app.settings.video_resume_positions.insert(
+            key.clone(),
+            crate::settings::VideoResumePosition::Media(12.0),
+        );
         app.settings.video_audio_track_choices.insert(
             "later.mkv".to_owned(),
             saved_audio_choice_for_preferences_test(3),

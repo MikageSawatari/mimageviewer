@@ -225,7 +225,7 @@ impl App {
             if self.settings.video_watched_to_end.contains(key) {
                 return Some(1.0);
             }
-            let position = *self.settings.video_resume_positions.get(key)?;
+            let position = *self.settings.video_resume_positions.get(key)?.stored_secs();
             // Same source-stamp validation as details_lazy_meta_for_idx, using the memoized key.
             let meta = self
                 .details_lazy_meta

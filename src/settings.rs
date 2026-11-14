@@ -3199,6 +3199,47 @@ impl AiFeatureMode {
     }
 }
 
+/// Saved playback position, retaining its time basis until metadata is available.
+/// Old JSON settings used a bare number, which always represented raw PTS seconds.
+#[derive(serde::Serialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoResumePosition {
+    LegacyRaw(f64),
+    Media(f64),
+}
+
+impl VideoResumePosition {
+    /// Stored value for existing list previews; restoration must resolve the basis first.
+    pub fn stored_secs(&self) -> &f64 {
+        match self {
+            Self::LegacyRaw(secs) | Self::Media(secs) => secs,
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for VideoResumePosition {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Tagged {
+            LegacyRaw(f64),
+            Media(f64),
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Compatible {
+            Legacy(f64),
+            Tagged(Tagged),
+        }
+        Ok(match Compatible::deserialize(deserializer)? {
+            Compatible::Legacy(secs) | Compatible::Tagged(Tagged::LegacyRaw(secs)) => {
+                Self::LegacyRaw(secs)
+            }
+            Compatible::Tagged(Tagged::Media(secs)) => Self::Media(secs),
+        })
+    }
+}
+
 /// - `RtlCover`: 見開き 右→左（表紙あり）— [0] [1,2] [3,4] ...
 /// 動画 / ZIP・PDF 本を開く・移動したときに、前回位置 (続き) から始めるか先頭からか。
 /// 「エントリ方法 (一覧から開く / Ctrl+↑↓ 移動) × メディア (動画 / 本)」の各セルに使う共通 enum。
@@ -6170,7 +6211,7 @@ pub struct Settings {
     /// `VideoPlayer::open` 時に自動 resume、5 秒ごと + drop 時に保存。
     /// 動画末尾近く (残り 5 秒以内) は 0 にリセットして "次回最初から" の挙動。
     #[serde(default)]
-    pub video_resume_positions: std::collections::HashMap<String, f64>,
+    pub video_resume_positions: std::collections::HashMap<String, VideoResumePosition>,
     /// 最後まで視聴した動画・音声の正規化済み絶対パス。再生位置の復元とは独立。
     #[serde(default)]
     pub video_watched_to_end: std::collections::HashSet<String>,

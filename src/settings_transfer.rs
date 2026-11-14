@@ -2711,9 +2711,10 @@ mod tests {
             gui_pos: None,
             gui_size: None,
         }];
-        settings
-            .video_resume_positions
-            .insert(sentinel.into(), 88.5);
+        settings.video_resume_positions.insert(
+            sentinel.into(),
+            crate::settings::VideoResumePosition::Media(88.5),
+        );
         settings.video_watched_to_end.insert(sentinel.into());
         settings.reading_history_limit = 17;
         settings.remote_service_enabled = true;

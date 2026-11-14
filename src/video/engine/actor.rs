@@ -107,13 +107,13 @@ enum PlaybackStart {
 static NEXT_PLAYBACK_START_ID: AtomicU64 = AtomicU64::new(1);
 
 /// VideoEngine 構築時の options (= `VideoPlayer::open(path, opts)` の opts)。
-/// resume seek を atomic open path に取り込むため、`open` に渡す。
+/// The initial media position freezes loading; VideoPlayer owns saved-position restoration.
 #[derive(Debug, Clone)]
 pub struct OpenOptions {
     pub initial_volume: f64,
     pub autoplay: bool,
-    /// 過去再生位置からの再開。`None` なら 0 から。
-    pub resume_secs: Option<f64>,
+    /// Loading anchor only; this never requests a seek or owns a pending resume.
+    pub initial_position_secs: f64,
     pub loop_enabled: bool,
     pub hw_decode: bool,
     pub playback_start: PlaybackStartContext,
@@ -124,7 +124,7 @@ impl Default for OpenOptions {
         Self {
             initial_volume: 0.6,
             autoplay: true,
-            resume_secs: None,
+            initial_position_secs: 0.0,
             loop_enabled: false,
             hw_decode: false,
             playback_start: PlaybackStartContext::default(),
@@ -205,7 +205,7 @@ pub struct EngineActor {
     last_audio_pts: f64,
     last_audio_epoch: SeekEpoch,
 
-    /// 構築時に渡された options。autoplay 判定や resume 履歴に使う。
+    /// Construction options: autoplay intent and the initial loading anchor.
     opts: OpenOptions,
     /// 現在の再生速度。現行 path の source of truth は AvClock だが、EngineActor
     /// 内部の MasterClock も同じ速度で動かして future integration と tests を保つ。
@@ -241,8 +241,7 @@ impl EngineActor {
         seek_serial: Arc<AtomicU64>,
         av_clock: Arc<crate::video::clock::AvClock>,
     ) -> Self {
-        let clock =
-            MasterClock::with_anchor(ClockAnchor::frozen_at(opts.resume_secs.unwrap_or(0.0)));
+        let clock = MasterClock::with_anchor(ClockAnchor::frozen_at(opts.initial_position_secs));
         let initial_serial = seek_serial.load(Ordering::Acquire);
         Self {
             clock,
@@ -571,7 +570,7 @@ impl EngineActor {
     // ──────────────────────────────────────────────────────────────
 
     /// 構築直後の最初の遷移。`Idle → Loading` を実行する (= decoder spawn 直後に呼ぶ)。
-    /// resume_secs が指定されていれば anchor を resume 値で凍結する。
+    /// Freeze at the initial media position without issuing a seek.
     /// `pub` (= video::engine 外から呼べる) にしているのは、VideoPlayer::open が
     /// Phase 3b で本関数を直接呼ぶため。Phase 3d でカプセル化する予定。
     pub fn begin_loading(&mut self) {
@@ -579,8 +578,7 @@ impl EngineActor {
         if self.opts.autoplay {
             self.register_playback_start(self.opts.playback_start.origin);
         }
-        let initial_pts = self.opts.resume_secs.unwrap_or(0.0);
-        self.transition_to_loading(initial_pts);
+        self.transition_to_loading(self.opts.initial_position_secs);
     }
 
     /// command 処理。`select!` の cmd lane から呼ぶ。
@@ -758,22 +756,11 @@ impl EngineActor {
                 self.has_audio = has_audio && !self.av_clock.audio_lane_lost();
                 self.has_video = has_video;
                 // 状態遷移は state=Loading のときだけ行う。
-                // pre-info で user seek が走って既に Seeking に入っている場合は、
-                // resume_secs を消費せずに残し、次回ファイル open でも作用させない。
+                // A seek issued before metadata keeps ownership of its target.
                 if !matches!(self.state, EngineState::Loading) {
                     return;
                 }
-                // resume が指定されていれば、open path 内で seek を発火する。
-                // resume_secs を一度消費して以降の再 InfoReceived では発火しない。
-                if let Some(resume) = crate::video::sanitize_resume_for_duration(
-                    self.opts.resume_secs.take(),
-                    duration_secs,
-                ) {
-                    // Loading → Seeking{resume} へ。epoch++ + latch reset を伴う。
-                    self.handle_seek_request(resume);
-                    return;
-                }
-                // resume 不要ケース: Loading → Buffering (preroll、READY を待つ)
+                // Saved resume is resolved and issued only by VideoPlayer after VideoInfo.
                 self.transition_to_buffering(0.0);
             }
             DecoderEvent::SeekCompleted { epoch, actual_pts } => {
@@ -1311,7 +1298,7 @@ mod tests {
     }
 
     #[test]
-    fn new_actor_is_idle_with_resume_zero() {
+    fn new_actor_is_idle_with_initial_position_zero() {
         let a = fresh_actor();
         assert_eq!(a.state, EngineState::Idle);
         assert_eq!(a.published_state_code(), state_code::IDLE);
@@ -1321,9 +1308,9 @@ mod tests {
     }
 
     #[test]
-    fn new_actor_with_resume_initializes_clock() {
+    fn new_actor_initial_position_initializes_clock() {
         let opts = OpenOptions {
-            resume_secs: Some(42.5),
+            initial_position_secs: 42.5,
             ..Default::default()
         };
         let a = fresh_actor_with_opts(opts);
@@ -1647,9 +1634,9 @@ mod tests {
     // Phase 3a: full handler tests
     // ──────────────────────────────────────────────────────────────
 
-    fn fresh_with_resume(secs: f64, autoplay: bool) -> EngineActor {
+    fn fresh_with_initial_position(secs: f64, autoplay: bool) -> EngineActor {
         fresh_actor_with_opts(OpenOptions {
-            resume_secs: Some(secs),
+            initial_position_secs: secs,
             autoplay,
             ..Default::default()
         })
@@ -1741,8 +1728,8 @@ mod tests {
     }
 
     #[test]
-    fn open_path_with_resume_triggers_seek() {
-        let mut a = fresh_with_resume(15.0, true);
+    fn open_path_initial_anchor_requires_explicit_seek() {
+        let mut a = fresh_with_initial_position(15.0, true);
         a.begin_loading();
         a.handle_decoder_event(DecoderEvent::InfoReceived {
             epoch: 0,
@@ -1750,7 +1737,14 @@ mod tests {
             has_audio: true,
             has_video: true,
         });
-        // resume が消費されて Seeking に遷移
+        // The immutable initial anchor is not a pending resume request.
+        assert_eq!(a.state, EngineState::Buffering);
+        assert_eq!(
+            a.current_seek_epoch(),
+            0,
+            "initial anchor never issues resume"
+        );
+        a.handle_seek_request(15.0);
         assert_eq!(a.state, EngineState::Seeking { target_secs: 15.0 });
         assert_eq!(a.current_seek_epoch(), 1);
 
@@ -1775,33 +1769,21 @@ mod tests {
     }
 
     #[test]
-    fn resume_too_close_to_end_is_ignored() {
-        let mut a = fresh_with_resume(28.0, true);
-        a.begin_loading();
-        a.handle_decoder_event(DecoderEvent::InfoReceived {
-            epoch: 0,
-            duration_secs: 30.0,
-            has_audio: false,
-            has_video: true,
-        });
-        // resume=28 > duration=30 - 5 (= END_GUARD) → 末尾近くなので無視 → 通常 Buffering
-        assert_eq!(a.state, EngineState::Buffering);
-        assert_eq!(a.current_seek_epoch(), 0, "no seek consumed");
-    }
-
-    #[test]
-    fn resume_too_small_is_ignored() {
-        let mut a = fresh_with_resume(0.5, true);
-        a.begin_loading();
-        a.handle_decoder_event(DecoderEvent::InfoReceived {
-            epoch: 0,
-            duration_secs: 30.0,
-            has_audio: false,
-            has_video: true,
-        });
-        // resume=0.5 < MIN(1.0) → 無視 → 通常 Buffering
-        assert_eq!(a.state, EngineState::Buffering);
-        assert_eq!(a.current_seek_epoch(), 0);
+    fn metadata_never_interprets_initial_anchor_as_resume() {
+        for initial in [0.5, 15.0, 28.0] {
+            let mut actor = fresh_with_initial_position(initial, false);
+            actor.begin_loading();
+            assert_eq!(actor.av_clock.now_secs(), initial);
+            actor.handle_decoder_event(DecoderEvent::InfoReceived {
+                epoch: 0,
+                duration_secs: 30.0,
+                has_audio: false,
+                has_video: true,
+            });
+            assert_eq!(actor.state, EngineState::Buffering);
+            assert_eq!(actor.current_seek_epoch(), 0);
+            assert_eq!(actor.av_clock.now_secs(), 0.0);
+        }
     }
 
     #[test]
@@ -2782,11 +2764,11 @@ mod tests {
     }
 
     #[test]
-    fn begin_loading_freezes_av_clock_at_resume_pts() {
+    fn begin_loading_freezes_av_clock_at_initial_position() {
         // resume 値がある場合、begin_loading → transition_to_loading(resume)
         // で AvClock も resume pts で frozen になる。
         let (mut actor, av_clock) = fresh_actor_with_av_clock(OpenOptions {
-            resume_secs: Some(42.5),
+            initial_position_secs: 42.5,
             ..Default::default()
         });
         actor.begin_loading();
