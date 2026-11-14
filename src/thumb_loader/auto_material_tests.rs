@@ -166,11 +166,11 @@ fn auto_material_k2_prefers_v2_and_legacy_fallback_requires_missing_exact_v2() {
     let writer = crate::catalog::CatalogDb::open(&cache, &directory).unwrap();
     let key = "zipthumb:book.zip|autocrop:v2:rtl#pin:cover";
     let old = "zipthumb:book.zip|autocrop:v1:rtl#pin:cover";
-    let unrelated = "zipthumb:book.zip|autocrop:v1:ltr#pin:cover";
+    let opposite = "zipthumb:book.zip|autocrop:v1:ltr#pin:cover";
     let bytes = fixture_webp();
     writer
         .save(
-            unrelated,
+            "zipthumb:book.zip|autocrop:v2:ltr#pin:cover",
             7,
             9,
             8,
@@ -195,6 +195,11 @@ fn auto_material_k2_prefers_v2_and_legacy_fallback_requires_missing_exact_v2() {
         )
         .unwrap();
     assert!(auto_material_candidate(&cache, &directory, key).is_none());
+    writer.save(opposite, 7, 9, 8, 8, None, &bytes,
+        &CoverIdentity::Page("old-ltr".into()), AutoMaterial::NotAutomatic).unwrap();
+    let legacy = auto_material_candidate(&cache, &directory, key).unwrap();
+    assert_eq!(legacy.auto_material, AutoMaterial::LegacyV1);
+    assert_eq!(legacy.cover, CoverIdentity::Page("old-ltr".into()));
     writer
         .save(
             old,
@@ -204,12 +209,13 @@ fn auto_material_k2_prefers_v2_and_legacy_fallback_requires_missing_exact_v2() {
             8,
             None,
             &bytes,
-            &CoverIdentity::Legacy,
+            &CoverIdentity::Page("old-rtl".into()),
             AutoMaterial::NotAutomatic,
         )
         .unwrap();
     let legacy = auto_material_candidate(&cache, &directory, key).unwrap();
     assert_eq!(legacy.auto_material, AutoMaterial::LegacyV1);
+    assert_eq!(legacy.cover, CoverIdentity::Page("old-rtl".into()));
     assert_eq!(legacy.webp_data, bytes);
     writer
         .save(
@@ -270,6 +276,37 @@ fn auto_material_k2_prefers_v2_and_legacy_fallback_requires_missing_exact_v2() {
         )
         .unwrap();
     assert!(auto_material_candidate(&cache, &directory, key).is_none());
+}
+
+#[test]
+fn auto_material_k2_missing_binding_setting_keeps_parent_from_old_ltr_child() {
+    let temp = TempDir::new().unwrap();
+    let prefs = crate::settings_db::SettingsDb::create_new(&temp.path().join("prefs")).unwrap();
+    prefs.save_full(&crate::settings::Settings {
+        thumb_cover_auto_crop: true,
+        default_reading_direction: crate::settings::ReadingDirection::Ltr,
+        ..Default::default()
+    }).unwrap();
+    rusqlite::Connection::open(temp.path().join("prefs/settings.db")).unwrap()
+        .execute("DELETE FROM settings_kv WHERE key='thumb_cover_auto_crop_binding'", []).unwrap();
+    let settings = prefs.load_into_settings().unwrap();
+    assert_eq!(settings.thumb_cover_auto_crop_binding, crate::settings::ReadingDirection::Rtl);
+    let folder = temp.path().join("books");
+    std::fs::create_dir_all(&folder).unwrap();
+    let book = folder.join("book.zip");
+    std::fs::write(&book, b"old bytes").unwrap();
+    let meta = std::fs::metadata(&book).unwrap();
+    let cache = temp.path().join("cache");
+    let writer = crate::catalog::CatalogDb::open(&cache, &folder).unwrap();
+    let bytes = fixture_webp();
+    writer.save("zipthumb:book.zip|autocrop:v1:ltr", crate::ui_helpers::mtime_secs(&meta), meta.len() as i64,
+        8, 8, None, &bytes, &CoverIdentity::Page("old-ltr".into()), crate::cover_auto_material::AutoMaterial::NotAutomatic).unwrap();
+    let (selected, _) = select_folder_thumb_image_with_policy_and_auto(
+        &folder, crate::settings::SortOrder::Numeric, 3, None, &cache, None,
+        &Default::default(), crate::app::configured_thumbnail_auto_crop(&settings));
+    let Some(FolderThumbResolution::CachedPinned(selected)) = selected else { panic!("parent representative must survive the upgrade"); };
+    assert_eq!(selected.auto_material, crate::cover_auto_material::AutoMaterial::LegacyV1);
+    assert_eq!(selected.webp_data, bytes);
 }
 
 #[test]

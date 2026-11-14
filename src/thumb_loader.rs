@@ -426,10 +426,14 @@ pub(crate) fn representative_auto_crop_key_parts(key: &str) -> Option<(&str, &st
 
 /// Only K2 may reuse the old, already-cropped child pixels. Keep the same
 /// unambiguous suffix position as the builder, including pinned EPUB tails.
-fn legacy_auto_child_key(key: &str) -> Option<String> {
+fn legacy_auto_child_keys(key: &str) -> Option<[String; 2]> {
     let (base, token, tail) = representative_auto_crop_key_parts(key)?;
     let binding = token.strip_prefix("|autocrop:v2:")?;
-    Some(format!("{base}|autocrop:v1:{binding}{tail}"))
+    let other = if binding == "rtl" { "ltr" } else { "rtl" };
+    Some([
+        format!("{base}|autocrop:v1:{binding}{tail}"),
+        format!("{base}|autocrop:v1:{other}{tail}"),
+    ])
 }
 
 // Keep the released (c4e92e5df) policy algorithm intact. Auto normalization is
@@ -5194,23 +5198,28 @@ impl FolderResolveContext<'_> {
         };
         let mut legacy_key = None;
         if stamp.is_none()
-            && let Some(old_key) = legacy_auto_child_key(key)
+            && let Some(old_keys) = legacy_auto_child_keys(key)
         {
-            self.record_dependency(directory, state.clone());
-            match self
-                .catalogs
-                .get(directory)?
-                .as_ref()?
-                .load_stamp_snapshot(&old_key)
-            {
-                Ok((old_state, old_stamp)) => {
-                    state = old_state;
-                    stamp = old_stamp;
-                    legacy_key = Some(old_key);
-                }
-                Err(error) => {
-                    crate::logger::log(format!("K2 v1 compatibility lookup failed: {error}"));
-                    return None;
+            for old_key in old_keys {
+                self.record_dependency(directory, state.clone());
+                match self
+                    .catalogs
+                    .get(directory)?
+                    .as_ref()?
+                    .load_stamp_snapshot(&old_key)
+                {
+                    Ok((old_state, old_stamp)) => {
+                        state = old_state;
+                        stamp = old_stamp;
+                        legacy_key = Some(old_key);
+                        if stamp.is_some() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        crate::logger::log(format!("K2 v1 compatibility lookup failed: {error}"));
+                        return None;
+                    }
                 }
             }
         }
@@ -6925,17 +6934,23 @@ pub(crate) fn load_one_cached(
         };
         let mut reason = "unsupported_source";
         if supported {
-            let aspect = if let Some(page) = pdf_page {
+            let aspect_result = if let Some(page) = pdf_page {
                 cover_pdf_page_sizes(path, epub_read, pdf_password)
-                    .ok()
+                    .map_err(|_| crate::cover_auto_sample::PageAspectDecline::TooFew)
                     .and_then(|sizes| {
-                        crate::cover_auto_sample::page_aspect_from_sizes(&sizes, page as usize)
+                        crate::cover_auto_sample::page_aspect_from_sizes_report(
+                            &sizes,
+                            page as usize,
+                        )
                     })
             } else {
-                zip_entry.and_then(|entry| {
-                    crate::cover_auto_sample::sample_zip_page_aspect(path, entry, auto_zip_prefix)
-                })
+                crate::cover_auto_sample::sample_zip_page_aspect_report(
+                    path,
+                    zip_entry.expect("supported ZIP leaf"),
+                    auto_zip_prefix,
+                )
             };
+            let aspect = aspect_result.ok();
             let analysis = if let Some(page) = pdf_page {
                 decode_cover_auto_analysis_pdf(
                     path,
@@ -6974,7 +6989,8 @@ pub(crate) fn load_one_cached(
                             let reason =
                                 result.map_or_else(|decline| decline.as_str(), |_| "crop".into());
                             crate::logger::log(format!(
-                                "auto cover: rotation={rotation:?} {reason} {display_name}"
+                                "auto cover: rotation={rotation:?} {reason} page-aspect={} {display_name}",
+                                aspect_result.map_or_else(|reason| reason.as_str(), |_| "ok")
                             ));
                         },
                     );

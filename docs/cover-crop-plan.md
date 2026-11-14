@@ -1366,6 +1366,15 @@ r2 = REVISE (P2 1 件、ほかは r1 の指摘を閉じた)。v2 キーで `auto
   新規ファイルはない。UIスレッドの新しい同期I/O・detached経路の変更・判定ロジックの変更はなく、
   評価フォルダ／利用者データの使用、製品起動、build-dev、lib全件、コミット、追加の独立レビューは行っていない。
 
+#### §23.3 K2移行の実装追記
+
+- `legacy_auto_child_keys`が同方向→逆方向のv1キーを返す。K2の共通候補読み取りだけで使い、v2は方向をまたがない。
+  存在するv2が壊れている・署名が古い場合にv1へ戻らない既存の条件も保った。子のタイル自身の要求は変更していない。
+- 変更: `src/thumb_loader.rs`、`src/thumb_loader/auto_material_tests.rs`。
+  `auto_material_k2_missing_binding_setting_keeps_parent_from_old_ltr_child`で旧設定DBの新キー欠落から親の代表選択までを通した。
+  `auto_material_k2_prefers_v2_and_legacy_fallback_requires_missing_exact_v2`は、逆方向v2の拒否・逆方向v1の流用・同方向v1の優先を検査する。
+  子自身の`auto_material_main_tile_cache_only_does_not_read_v1_compatibility_row`と設定既定のテストを合わせ、独立した焦点4件が成功。
+
 ## 24. 本文ページの比率の読み方: 表紙の直後の横長を数えない (§1.773、2026-11-14、利用者決定)
 
 ### 24.1 経緯と数字 (Git 管理外の数値のみ、画像は開いていない)
@@ -1406,6 +1415,18 @@ r2 = REVISE (P2 1 件、ほかは r1 の指摘を閉じた)。v2 キーで `auto
   表紙が最後のページで前へ読む場合、理由の型。ZIP の読み取り回数が 8 のままであること。
 - 評価: 新しく比率が決まる実データの 3 冊を評価器で流す。正解が無いので、切れた場合の正否は統括経由で利用者に確認する (画像は開かない)。
 
+### 24.3 実装記録
+
+- `cover_auto_sample.rs`で枠を`Option`のまま保持し、先頭から続く0.9以上を最大3枠だけ外してから不明枠を落とす。
+  PDFもZIPも同じ`aspect_from_slots`→`aspect_consensus`を使い、逆順のサンプルも表紙に近い側を先頭とする。
+- `PageAspectDecline::{TooFew,Landscape,Inconsistent}`を追加した。既存の値だけのAPIはreport APIの`.ok()`で保ち、評価器の呼び方は変えていない。
+  workerの`auto cover:`ログに`page-aspect=...`を付け、範囲画面は型を表示へ渡す。
+- `zip_loader.rs`は読み取り失敗も不明な1枠として返す。最大8回・各256KiBの既存の制限を維持し、追加読み取りや全体decodeはしない。
+- 変更: `src/cover_auto_sample.rs`、`src/zip_loader.rs`、`src/thumb_loader.rs`（ログ）。範囲画面の受取りは§25と共通。
+  `leading_landscape_slots_pdf_zip_forward_backward_and_typed_reasons`は先頭1〜3枚・4枚・途中の横長・全ページ横長・不明枠・3種類の辞退を
+  PDF/ZIPと前後両方向で検査する。`[不明, 横×4, 縦×3]`も含む。既存の8回のprefix量制限・EXIF・ZIP内scopeのテストと合わせ、独立した焦点5件が成功。
+- v2を維持する。今回の実装では評価フォルダや利用者データを使っていない。
+
 ## 25. 範囲画面に自動の判定結果を出す (§1.773、2026-11-14、利用者決定)
 
 - 利用者の提案: 切り出されないときに理由が分からない。範囲画面で自動の判定結果を確かめ、その判定に戻せるとよい。
@@ -1434,3 +1455,37 @@ r2 = REVISE (P2 1 件、ほかは r1 の指摘を閉じた)。v2 キーで `auto
 - UI: 1093×614 でも操作が見えること (§19 の配置の決まり)。snapshot を更新する。マニュアル (`grid.html` の「判定できない画像は全体を表示」の節) に、
   範囲画面で判定の結果と理由を確かめられることを書く。
 - 規模: Small〜Medium。
+
+### 25.1 実装記録
+
+- `cover_crop/automatic.rs`に`AutoDetection`（判定前に停止／4方向の判定済み）を置き、workerの準備結果と編集中の画面が同じ型を持つ。
+  既存の`auto_crops`・`auto_enabled`の組を置き換えた。`detect_cover_crops_with_report`で各方向の範囲または辞退理由を保持し、
+  UIは既存のメモリownerから受けた保存回転で選ぶだけ。判定・先読み・解析decodeは既存の`cover-crop-prepare`内に残す。
+- ON/OFF・対象形式・手動範囲・編集preview・比率の3理由・解析失敗を区別する。表示は本文の対応表どおりとし、
+  `TwoPanel`は内側の`WeakFront`／`RicherElsewhere`を色の拒否へ、それ以外を境目の理由へ分ける。
+- 結果の行は画像直下のスクロール本文、戻すボタンは固定の操作行へ置いた。操作行は実測した4ボタン分の必要幅で折り返し、
+  下段も実際の高さを本文から引く。1093×614の100%／200%で従来の画像高さを維持し、最小幅の操作も保つ。
+  戻す操作は現在角度の範囲がある場合だけ有効で、draftの枠・drag・検証エラーだけを更新する。保存は既存のOK経路だけ。
+- 追加テスト:
+  - `cover_crop_auto_reason_mapping_covers_all_detector_and_preanalysis_reasons`: 全`AutoCropDecline`、全`TwoPanel`内側理由（4つのv5理由それぞれ）、全判定前理由の文言。
+  - `cover_crop_auto_success_uses_current_angle_and_binding`: 現在角度での成否と右／左綴じの表示。
+  - `cover_crop_worker_and_dialog_match_all_four_angles_for_png_jpeg_and_binding`: 生成したPNG・JPEG、両綴じ方向、先頭に横長3枚を含む同じZIPから、
+    実際の`process_load_request`と画面の`prepare_cover`を通し、4方向すべての範囲が同じこと（少なくとも1方向は切る正例）。
+  - `cover_crop_auto_reset_is_visible_in_small_viewport_and_only_ok_saves`: 100%／200%・4方向でボタンの可視性・非重複・クリック・角度別の無効化、
+    結果の行へのscroll到達、枠の復帰、クリックだけではDB不変、Cancelで不変、OKで元座標の範囲を保存すること。
+  - `cover_crop_auto_reset_keyboard_enter_does_not_accept`: 戻すボタンをEnterで実行しても、画面を閉じずDBへ保存しない。
+  - `cover_crop_enter_uses_focused_clear_when_footer_wraps`: 操作行が折り返した場合も、フォーカスした解除ボタンのEnterがOKへ化けない。
+- ボタン固有の操作を`Action`で受け、ダイアログ全体のEnter＝OKは他の操作が無かった場合だけにした。
+  戻す操作には保存を伴わない専用の`ResetAutomatic`を使う。既存のIME-safe Enter／Escapeの取得は変更していない。
+- 変更: `src/ui_dialogs/cover_crop.rs`、新規`src/ui_dialogs/cover_crop/automatic.rs`・`automatic_tests.rs`、
+  `src/ui_dialogs/cover_crop_rotation_tests.rs`（fixtureの型変更だけ）、`htdocs/mimageviewer/manual/grid.html`、本書、バックログ。
+- 最終コードでK2・比率・画面・設定・素材を合わせた焦点nextest155件成功（`cover_auto|cover_crop|auto_material|thumb_cover_auto_crop`）。
+  素材の独立した焦点15件も成功。既存の小画面・最小幅・1822cd0efからの画像高さ・回転／手動範囲の回帰も成功。
+- `UPDATE_SNAPSHOTS=1`で`crop_small`4件を更新し、最終コードの通常モードの`ui_snapshot`257件も成功。
+  変更PNGは次の4枚だけ（判定結果の行と、自動枠へ戻す固定ボタンを追加）:
+  `tests/snapshots/cover_crop_small_100_light.png`、`tests/snapshots/cover_crop_small_200_dark.png`、
+  `tests/snapshots/cover_auto_crop_small_100_light.png`、`tests/snapshots/cover_auto_crop_small_200_dark.png`。
+- 全cargo検証は共有runner（`773 s24`）経由で逐次実行した。`cargo fmt`・`git diff --check`・`python scripts/check_ui_glyphs.py`も成功。
+  UIスレッドへの新しい同期I/O、detached経路の変更、判定器の閾値変更はない。
+  利用者データ・評価フォルダ・共有先のデータは使わず、画像・sheetは開いていない。
+  lib全件・build-dev・製品起動・コミット・追加の独立レビューは行っていない。

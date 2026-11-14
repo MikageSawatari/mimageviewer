@@ -17,14 +17,31 @@ pub(crate) fn sample_indices(len: usize, leaf: usize) -> Vec<usize> {
     }
 }
 
-fn aspect_consensus(ratios: impl Iterator<Item = f64>) -> Option<f64> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PageAspectDecline {
+    TooFew,
+    Landscape,
+    Inconsistent,
+}
+
+impl PageAspectDecline {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::TooFew => "too-few",
+            Self::Landscape => "landscape",
+            Self::Inconsistent => "inconsistent",
+        }
+    }
+}
+
+fn aspect_consensus(ratios: impl Iterator<Item = f64>) -> Result<f64, PageAspectDecline> {
     let ratios: Vec<_> = ratios.filter(|r| r.is_finite() && *r > 0.0).collect();
     if ratios.len() < 3 {
-        return None;
+        return Err(PageAspectDecline::TooFew);
     }
     let mut portrait: Vec<_> = ratios.iter().copied().filter(|&r| r < 0.9).collect();
     if portrait.len() * 10 < ratios.len() * 7 {
-        return None;
+        return Err(PageAspectDecline::Landscape);
     }
     portrait.sort_unstable_by(f64::total_cmp);
     let count = portrait.len();
@@ -33,19 +50,43 @@ fn aspect_consensus(ratios: impl Iterator<Item = f64>) -> Option<f64> {
         .iter()
         .filter(|&&r| (r - median).abs() <= median * 0.06)
         .count();
-    (consistent * 10 >= count * 7).then_some(median)
+    if consistent * 10 >= count * 7 {
+        Ok(median)
+    } else {
+        Err(PageAspectDecline::Inconsistent)
+    }
+}
+
+/// Keep unknown slots until after the leading run is removed: an unknown
+/// page stops the run, rather than exposing a later landscape as a new first.
+fn aspect_from_slots(
+    slots: impl IntoIterator<Item = Option<f64>>,
+) -> Result<f64, PageAspectDecline> {
+    let slots: Vec<_> = slots
+        .into_iter()
+        .map(|r| r.filter(|r| r.is_finite() && *r > 0.0))
+        .collect();
+    let skip = slots
+        .iter()
+        .take(3)
+        .take_while(|r| r.is_some_and(|r| r >= 0.9))
+        .count();
+    aspect_consensus(slots.into_iter().skip(skip).flatten())
 }
 
 pub(crate) fn page_aspect_from_sizes(sizes: &[(f32, f32)], leaf: usize) -> Option<f64> {
-    aspect_consensus(
-        sample_indices(sizes.len(), leaf)
-            .into_iter()
-            .filter_map(|index| {
-                let (width, height) = sizes[index];
-                (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
-                    .then_some(f64::from(width) / f64::from(height))
-            }),
-    )
+    page_aspect_from_sizes_report(sizes, leaf).ok()
+}
+
+pub(crate) fn page_aspect_from_sizes_report(
+    sizes: &[(f32, f32)],
+    leaf: usize,
+) -> Result<f64, PageAspectDecline> {
+    aspect_from_slots(sample_indices(sizes.len(), leaf).into_iter().map(|index| {
+        let (width, height) = sizes[index];
+        (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
+            .then_some(f64::from(width) / f64::from(height))
+    }))
 }
 
 /// Read no more than eight 256 KiB prefixes, without nested archive expansion,
@@ -55,15 +96,23 @@ pub(crate) fn sample_zip_page_aspect(
     leaf_entry: &str,
     prefix: Option<&str>,
 ) -> Option<f64> {
+    sample_zip_page_aspect_report(path, leaf_entry, prefix).ok()
+}
+
+pub(crate) fn sample_zip_page_aspect_report(
+    path: &Path,
+    leaf_entry: &str,
+    prefix: Option<&str>,
+) -> Result<f64, PageAspectDecline> {
     if crate::rar_loader::is_rar_path(path)
         || crate::zip_loader::split_nested_zip_path(leaf_entry).len() > 1
     {
-        return None;
+        return Err(PageAspectDecline::TooFew);
     }
-    let prefixes =
-        crate::zip_loader::read_cover_auto_page_prefixes(path, leaf_entry, prefix).ok()?;
-    aspect_consensus(prefixes.into_iter().filter_map(|(name, bytes)| {
-        let (width, height) = crate::app::probe_image_dims_from_bytes(&bytes, &name)?;
+    let prefixes = crate::zip_loader::read_cover_auto_page_prefixes(path, leaf_entry, prefix)
+        .map_err(|_| PageAspectDecline::TooFew)?;
+    aspect_from_slots(prefixes.into_iter().map(|(name, bytes)| {
+        let (width, height) = crate::app::probe_image_dims_from_bytes(bytes.as_deref()?, &name)?;
         (width > 0 && height > 0).then_some(f64::from(width) / f64::from(height))
     }))
 }
@@ -109,10 +158,148 @@ mod tests {
         sizes[2] = (200.0, 100.0);
         assert_eq!(page_aspect_from_sizes(&sizes, 0), Some(0.7)); // 6/8 portrait
         sizes[3] = (200.0, 100.0);
-        assert_eq!(page_aspect_from_sizes(&sizes, 0), None); // 5/8 portrait
-        assert_eq!(aspect_consensus([0.5, 0.6, 0.7, 0.8].into_iter()), None);
-        assert_eq!(aspect_consensus([0.7, 0.7].into_iter()), None);
-        assert_eq!(aspect_consensus([0.9, 0.9, 0.9].into_iter()), None);
+        assert_eq!(page_aspect_from_sizes(&sizes, 0), Some(0.7)); // leading three omitted
+        assert_eq!(
+            aspect_consensus([0.5, 0.6, 0.7, 0.8].into_iter()),
+            Err(PageAspectDecline::Inconsistent)
+        );
+        assert_eq!(
+            aspect_consensus([0.7, 0.7].into_iter()),
+            Err(PageAspectDecline::TooFew)
+        );
+        assert_eq!(
+            aspect_consensus([0.9, 0.9, 0.9].into_iter()),
+            Err(PageAspectDecline::Landscape)
+        );
+    }
+
+    #[test]
+    fn leading_landscape_slots_pdf_zip_forward_backward_and_typed_reasons() {
+        use PageAspectDecline::*;
+        let mut cases = Vec::new();
+        for count in 1..=3 {
+            cases.push((
+                vec![Some(1.4); count]
+                    .into_iter()
+                    .chain(vec![Some(0.7); 8 - count])
+                    .collect::<Vec<_>>(),
+                Ok(0.7),
+            ));
+        }
+        cases.extend([
+            (
+                vec![
+                    Some(1.4),
+                    Some(1.4),
+                    Some(1.4),
+                    Some(1.4),
+                    Some(0.7),
+                    Some(0.7),
+                    Some(0.7),
+                    Some(0.7),
+                ],
+                Ok(0.7),
+            ),
+            (
+                vec![
+                    Some(1.4),
+                    Some(1.4),
+                    Some(1.4),
+                    Some(1.4),
+                    Some(0.7),
+                    Some(0.7),
+                ],
+                Err(Landscape),
+            ),
+            (
+                vec![
+                    Some(0.7),
+                    Some(1.4),
+                    Some(1.4),
+                    Some(1.4),
+                    Some(0.7),
+                    Some(0.7),
+                    Some(0.7),
+                    Some(0.7),
+                ],
+                Err(Landscape),
+            ),
+            (vec![Some(1.4); 8], Err(Landscape)),
+            (
+                vec![
+                    None,
+                    Some(1.4),
+                    Some(1.4),
+                    Some(1.4),
+                    Some(1.4),
+                    Some(0.7),
+                    Some(0.7),
+                    Some(0.7),
+                ],
+                Err(Landscape),
+            ),
+            (
+                vec![
+                    Some(1.4),
+                    None,
+                    Some(1.4),
+                    Some(1.4),
+                    Some(1.4),
+                    Some(0.7),
+                    Some(0.7),
+                    Some(0.7),
+                ],
+                Err(Landscape),
+            ),
+            (vec![Some(0.7); 2], Err(TooFew)),
+            (
+                vec![Some(0.5), Some(0.6), Some(0.7), Some(0.8)],
+                Err(Inconsistent),
+            ),
+        ]);
+        for (slots, expected) in cases {
+            assert_eq!(aspect_from_slots(slots.clone()), expected, "{slots:?}");
+            for backwards in [false, true] {
+                let mut values = vec![Some(3.0)];
+                values.extend(slots.iter().copied());
+                if backwards {
+                    values.reverse();
+                }
+                let leaf = if backwards { values.len() - 1 } else { 0 };
+                let sizes: Vec<_> = values
+                    .iter()
+                    .map(|r| r.map_or((0.0, 0.0), |r| ((r * 100.0) as f32, 100.0)))
+                    .collect();
+                assert_eq!(
+                    page_aspect_from_sizes_report(&sizes, leaf),
+                    expected,
+                    "PDF {slots:?}/{backwards}"
+                );
+                let entries = values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        (
+                            format!("{i:03}.png"),
+                            r.map_or_else(|| b"unknown".to_vec(), |r| png((r * 100.0) as u32, 100)),
+                        )
+                    })
+                    .collect();
+                let file = zip(entries);
+                let prefixes = crate::zip_loader::read_cover_auto_page_prefixes(
+                    file.path(),
+                    &format!("{leaf:03}.png"),
+                    None,
+                )
+                .unwrap();
+                assert_eq!(prefixes.len(), slots.len());
+                assert_eq!(
+                    sample_zip_page_aspect_report(file.path(), &format!("{leaf:03}.png"), None),
+                    expected,
+                    "ZIP {slots:?}/{backwards}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -127,12 +314,15 @@ mod tests {
         assert!(
             prefixes
                 .iter()
-                .all(|(_, bytes)| bytes.len() == MAX_SAMPLE_PREFIX_BYTES as usize)
+                .all(|(_, bytes)| bytes.as_ref().unwrap().len() == MAX_SAMPLE_PREFIX_BYTES as usize)
         );
         assert_eq!(prefixes.first().unwrap().0, "001.png");
         assert_eq!(prefixes.last().unwrap().0, "008.png");
         assert_eq!(
-            prefixes.iter().map(|(_, bytes)| bytes.len()).sum::<usize>(),
+            prefixes
+                .iter()
+                .map(|(_, bytes)| bytes.as_ref().unwrap().len())
+                .sum::<usize>(),
             8 * 256 * 1024
         );
         assert_eq!(sample_zip_page_aspect(file.path(), "000.png", None), None);
