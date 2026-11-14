@@ -1,5 +1,53 @@
 use super::*;
 use std::{sync::Mutex, time::Duration};
+
+#[test]
+fn client_text_limits_tool_descriptions() {
+    let tools = schema::tools();
+    let mut longest = ("", 0, 0);
+    let mut over_target = Vec::new();
+    for tool in &tools {
+        let name = tool["name"].as_str().unwrap();
+        let description = tool["description"].as_str().unwrap();
+        let chars = description.chars().count();
+        // 非BMP文字が増えても過小に見積もらないよう、UTF-16長でも上限を守る。
+        let utf16 = description.encode_utf16().count();
+        if utf16 > longest.2 {
+            longest = (name, chars, utf16);
+        }
+        if utf16 > 2_048 {
+            over_target.push(format!("{name}: {chars} chars / {utf16} UTF-16 units"));
+        }
+    }
+    eprintln!(
+        "Longest tool description: {}: {} chars / {} UTF-16 units",
+        longest.0, longest.1, longest.2
+    );
+    eprintln!(
+        "Tools over 2048-character compatibility target: {}",
+        if over_target.is_empty() {
+            "none".into()
+        } else {
+            over_target.join(", ")
+        }
+    );
+    assert!(
+        longest.2 <= 4_096,
+        "tool description exceeds client truncation limit: {longest:?}"
+    );
+}
+
+#[test]
+fn client_text_limits_server_instructions() {
+    let chars = INSTRUCTIONS.chars().count();
+    let utf16 = INSTRUCTIONS.encode_utf16().count();
+    eprintln!("Server instructions: {chars} chars / {utf16} UTF-16 units");
+    assert!(
+        utf16 <= 4_096,
+        "server instructions exceed client truncation limit: {chars} chars / {utf16} UTF-16 units"
+    );
+}
+
 struct Input {
     receiver: mpsc::Receiver<Vec<u8>>,
     current: io::Cursor<Vec<u8>>,
@@ -849,7 +897,7 @@ fn stage1b_images_stay_out_of_metadata_and_have_separate_budgets() {
     }
     for modern in [true, false] {
         let envelope = success(json!("id".repeat(128)), result.clone(), modern);
-        let serialized = serialize_response(&envelope);
+        let serialized = serialize_response(&envelope, ResponseKind::Data);
         assert!(serialized.len() > MAX_MCP_RESPONSE_CHARS);
         assert!(
             serde_json::from_str::<Value>(&serialized)
@@ -894,7 +942,7 @@ fn stage1b_images_stay_out_of_metadata_and_have_separate_budgets() {
         true,
     );
     assert!(
-        serde_json::from_str::<Value>(&serialize_response(&too_large))
+        serde_json::from_str::<Value>(&serialize_response(&too_large, ResponseKind::Data))
             .unwrap()
             .get("error")
             .is_some()
@@ -913,7 +961,7 @@ fn stage1b_final_budget_exempts_only_image_content_data() {
     response["result"]["content"][1]["data"] = json!("x".repeat(MAX_THUMBNAIL_TOTAL_BYTES));
     assert_eq!(response_non_image_chars(&response), baseline);
     assert!(
-        serde_json::from_str::<Value>(&serialize_response(&response))
+        serde_json::from_str::<Value>(&serialize_response(&response, ResponseKind::Data))
             .unwrap()
             .get("error")
             .is_none()
@@ -927,7 +975,7 @@ fn stage1b_final_budget_exempts_only_image_content_data() {
         let mut oversized = response.clone();
         *oversized.pointer_mut(pointer).unwrap() = json!("x".repeat(MAX_MCP_RESPONSE_CHARS));
         assert!(
-            serde_json::from_str::<Value>(&serialize_response(&oversized))
+            serde_json::from_str::<Value>(&serialize_response(&oversized, ResponseKind::Data))
                 .unwrap()
                 .get("error")
                 .is_some(),
@@ -941,14 +989,14 @@ fn stage1b_final_budget_exempts_only_image_content_data() {
     exact["result"]["structuredContent"]["padding"] = json!("x".repeat(padding));
     assert_eq!(response_non_image_chars(&exact), MAX_MCP_RESPONSE_CHARS);
     assert!(
-        serde_json::from_str::<Value>(&serialize_response(&exact))
+        serde_json::from_str::<Value>(&serialize_response(&exact, ResponseKind::Data))
             .unwrap()
             .get("error")
             .is_none()
     );
     exact["result"]["structuredContent"]["padding"] = json!("x".repeat(padding + 1));
     assert!(
-        serde_json::from_str::<Value>(&serialize_response(&exact))
+        serde_json::from_str::<Value>(&serialize_response(&exact, ResponseKind::Data))
             .unwrap()
             .get("error")
             .is_some()
@@ -1633,7 +1681,7 @@ fn stage1c_open_arguments_and_results_match_schema_and_budget() {
     let response = success(json!(1), result, true);
     assert!(response_non_image_chars(&response) <= MAX_MCP_RESPONSE_CHARS);
     assert!(
-        serde_json::from_str::<Value>(&serialize_response(&response))
+        serde_json::from_str::<Value>(&serialize_response(&response, ResponseKind::Data))
             .unwrap()
             .get("error")
             .is_none()
@@ -1808,7 +1856,7 @@ fn stage2_collection_arguments_results_and_full_batch_budget() {
             let response = success(json!(1), result.clone(), modern);
             assert!(response_non_image_chars(&response) < MAX_MCP_RESPONSE_CHARS);
             assert!(
-                serde_json::from_str::<Value>(&serialize_response(&response))
+                serde_json::from_str::<Value>(&serialize_response(&response, ResponseKind::Data))
                     .unwrap()
                     .get("error")
                     .is_none()
@@ -2049,7 +2097,7 @@ fn stage2_metadata_results_use_matching_payloads_schemas_and_bounded_text() {
             let response = success(json!(1), result.clone(), modern);
             assert!(response_non_image_chars(&response) < MAX_MCP_RESPONSE_CHARS);
             assert!(
-                serde_json::from_str::<Value>(&serialize_response(&response))
+                serde_json::from_str::<Value>(&serialize_response(&response, ResponseKind::Data))
                     .unwrap()
                     .get("error")
                     .is_none()
@@ -2181,16 +2229,166 @@ fn stage2_metadata_tools_transport_typed_commands_and_results_on_all_protocols()
 }
 
 #[test]
-fn stage2_complete_tool_discovery_fits_final_envelope_budget() {
-    // 途中の予算assertで止まっても、設計判断に必要な全tool・最大IDの計測値を残す。
-    let maximal = success(
-        json!("x".repeat(64)),
-        json!({"tools":schema::tools()}),
+fn tools_list_discovery_budget_does_not_leak_to_other_response_kinds() {
+    let discovery = Envelope::tools_list(
+        json!(1),
+        vec![json!({"name":"fixture","description":"x".repeat(MAX_MCP_RESPONSE_CHARS)})],
         true,
     );
+    assert!(response_non_image_chars(&discovery.value) > MAX_MCP_RESPONSE_CHARS);
+    assert!(response_non_image_chars(&discovery.value) < MAX_MCP_DISCOVERY_CHARS);
+    let same_json = Envelope::plain(discovery.value.clone());
+    let initialize = Envelope::plain(success(
+        json!(2),
+        json!({
+            "instructions":"x".repeat(MAX_MCP_RESPONSE_CHARS),"capabilities":{"tools":{}}
+        }),
+        false,
+    ));
+    let server_discover = Envelope::plain(success(
+        json!(3),
+        json!({
+            "supportedVersions":VERSIONS,"instructions":"x".repeat(MAX_MCP_RESPONSE_CHARS)
+        }),
+        true,
+    ));
+    let notification = Envelope::plain(json!({"jsonrpc":"2.0",
+        "method":"notifications/tools/list_changed","params":{"padding":"x".repeat(MAX_MCP_RESPONSE_CHARS)}
+    }));
+    let failure = Envelope::plain(error(json!(4), -32000, &"x".repeat(MAX_MCP_RESPONSE_CHARS)));
+    let (tx, rx) = mpsc::sync_channel(8);
+    for envelope in [
+        discovery,
+        same_json,
+        initialize,
+        server_discover,
+        notification,
+        failure,
+    ] {
+        tx.send(envelope).unwrap();
+    }
+    drop(tx);
+    let owner = Arc::new(Mutex::new(None));
+    let (events, _receiver) = mpsc::sync_channel(8);
+    let mut output = Vec::new();
+    writer_loop(&mut output, &rx, &owner, &events).unwrap();
+    let responses: Vec<Value> = String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(responses.len(), 6);
+    assert!(responses[0].get("error").is_none());
+    for response in &responses[1..] {
+        assert_eq!(response["error"]["code"], -32603);
+    }
+}
+
+#[test]
+fn tools_list_discovery_budget_has_its_own_boundary_and_shared_frame_limit() {
+    assert_eq!(MAX_MCP_RESPONSE_CHARS, 40_000);
+    assert_eq!(MAX_MCP_DISCOVERY_CHARS, 48_000);
+    assert_eq!(MAX_PAGE_CHARS, 38_000);
+    let mut response = Envelope::tools_list(json!(1), vec![json!({"description":""})], true);
+    let padding = MAX_MCP_DISCOVERY_CHARS - response_non_image_chars(&response.value);
+    response.value["result"]["tools"][0]["description"] = json!("x".repeat(padding));
+    assert_eq!(
+        response_non_image_chars(&response.value),
+        MAX_MCP_DISCOVERY_CHARS
+    );
+    let serialized = serialize_response(&response.value, response.kind);
+    assert!(serialized.len() <= MAX_FRAME_BYTES);
+    assert!(
+        serde_json::from_str::<Value>(&serialized)
+            .unwrap()
+            .get("error")
+            .is_none()
+    );
+    response.value["result"]["tools"][0]["description"] = json!("x".repeat(padding + 1));
+    assert!(
+        serde_json::from_str::<Value>(&serialize_response(&response.value, response.kind))
+            .unwrap()
+            .get("error")
+            .is_some()
+    );
+
+    // 画像dataの文字数除外があっても、どちらの種別もbyte上限を迂回できない。
+    let oversized_frame = success(
+        json!(1),
+        json!({"content":[{
+            "type":"image","data":"x".repeat(MAX_FRAME_BYTES)
+        }]}),
+        true,
+    );
+    assert!(response_non_image_chars(&oversized_frame) < MAX_MCP_RESPONSE_CHARS);
+    for kind in [ResponseKind::Data, ResponseKind::ToolsList] {
+        assert!(
+            serde_json::from_str::<Value>(&serialize_response(&oversized_frame, kind))
+                .unwrap()
+                .get("error")
+                .is_some()
+        );
+    }
+}
+
+#[test]
+fn tools_list_all_protocols_send_full_discovery_through_the_writer() {
+    struct AllPermissions;
+    impl Backend for AllPermissions {
+        fn call(
+            &self,
+            command: Command,
+            _: &ClientIdentity,
+            _: RequestKind,
+            _: Arc<CallControl>,
+        ) -> BackendResult {
+            assert_eq!(command, Command::Status);
+            Ok(Payload::Status(StatusPayload {
+                app_version: "fixture".into(),
+                permission: PermissionSnapshot {
+                    level: AgentLevel::Organize,
+                    thumbnails: true,
+                    gps: true,
+                    ai_captions: true,
+                    transcripts: true,
+                },
+                fts_ready: true,
+                remote_active: false,
+            }))
+        }
+    }
+    for version in VERSIONS {
+        let mut harness = Harness::new(Arc::new(AllPermissions));
+        if version != MODERN {
+            harness.send(json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{
+                "protocolVersion":version,"capabilities":{},"clientInfo":{"name":"fixture","version":"1"}
+            }}));
+            harness.receive();
+            harness.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+        }
+        let mut request = if version == MODERN {
+            modern(1, "tools/list", json!({}))
+        } else {
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}})
+        };
+        request["id"] = json!("x".repeat(64));
+        harness.send(request);
+        let response = harness.receive();
+        assert_eq!(response["result"]["tools"], json!(schema::tools()));
+        assert!(response_non_image_chars(&response) > MAX_MCP_RESPONSE_CHARS);
+        assert!(response_non_image_chars(&response) + 512 <= MAX_MCP_DISCOVERY_CHARS);
+        assert!(response.to_string().len() + 1 <= MAX_FRAME_BYTES);
+        harness.close();
+    }
+}
+
+#[test]
+fn stage2_complete_tool_discovery_fits_final_envelope_budget() {
+    // 途中の予算assertで止まっても、設計判断に必要な全tool・最大IDの計測値を残す。
+    let maximal = Envelope::tools_list(json!("x".repeat(64)), schema::tools(), true);
     eprintln!(
         "All tools, modern, 64-char ID: {} chars",
-        response_non_image_chars(&maximal)
+        response_non_image_chars(&maximal.value)
     );
     let mut largest = (0, String::new());
     for level in [
@@ -2203,7 +2401,8 @@ fn stage2_complete_tool_discovery_fits_final_envelope_budget() {
             for gps in [false, true] {
                 for ai_captions in [false, true] {
                     for transcripts in [false, true] {
-                        for modern in [false, true] {
+                        for version in VERSIONS {
+                            let modern = version == MODERN;
                             let tools = schema::tools_for(PermissionSnapshot {
                                 level,
                                 thumbnails,
@@ -2216,26 +2415,28 @@ fn stage2_complete_tool_discovery_fits_final_envelope_budget() {
                                 json!("01234567-89ab-cdef-0123-456789abcdef"),
                                 json!("x".repeat(64)),
                             ] {
-                                let response = success(id, json!({"tools":tools}), modern);
-                                let chars = response_non_image_chars(&response);
+                                let response = Envelope::tools_list(id, tools.clone(), modern);
+                                let chars = response_non_image_chars(&response.value);
                                 if chars > largest.0 {
                                     largest = (
                                         chars,
                                         format!(
-                                            "{level:?}/{thumbnails}/{gps}/{ai_captions}/{transcripts}/{modern}"
+                                            "{level:?}/{thumbnails}/{gps}/{ai_captions}/{transcripts}/{version}"
                                         ),
                                     );
                                 }
                                 assert!(
-                                    chars + 512 <= MAX_MCP_RESPONSE_CHARS,
-                                    "discovery {level:?}/{thumbnails}/{gps}/{ai_captions}/{transcripts}/{modern}: {chars} chars, needs 512 reserve"
+                                    chars + 512 <= MAX_MCP_DISCOVERY_CHARS,
+                                    "discovery {level:?}/{thumbnails}/{gps}/{ai_captions}/{transcripts}/{version}: {chars} chars, needs 512 reserve"
                                 );
+                                let serialized = serialize_response(&response.value, response.kind);
                                 assert!(
-                                    serde_json::from_str::<Value>(&serialize_response(&response))
+                                    serde_json::from_str::<Value>(&serialized)
                                         .unwrap()
                                         .get("error")
                                         .is_none()
                                 );
+                                assert!(serialized.len() <= MAX_FRAME_BYTES);
                             }
                         }
                     }
@@ -3025,6 +3226,7 @@ fn queued_response_is_suppressed_when_cancelled_before_writer_commit() {
     entered.recv_timeout(Duration::from_secs(5)).unwrap();
     tx.send(Envelope {
         value: success(json!(2), json!({}), true),
+        kind: ResponseKind::Data,
         request: Some((2, control)),
     })
     .unwrap();
@@ -4421,7 +4623,7 @@ fn stage1a_shared_content_budget_and_final_envelope_include_escaping() {
     let result = tool_result("get_item_info", Ok(Payload::Info(page)));
     assert_eq!(result["isError"], false);
     let envelope = success(json!("id".repeat(128)), result, true);
-    let serialized = serialize_response(&envelope);
+    let serialized = serialize_response(&envelope, ResponseKind::Data);
     assert!(serialized.chars().count() <= MAX_MCP_RESPONSE_CHARS);
     assert!(serialized.chars().count() - content_chars <= MCP_ENVELOPE_RESERVE_CHARS);
     assert!(

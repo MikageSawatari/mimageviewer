@@ -342,3 +342,79 @@ SHA-256 は `5918dba6cfb7ca841b190f5b6e118ceb06a1ca6f1aad5c15115225440334f192`�
 | `tests/snapshots/ai_worker_credits_dark.png` | 520×300 | 67,375 |
 
 未完了はP2-1の予算不足に対する設計判断のみ。P2-2・P3・Aboutは対象の回帰検査と通常画像比較まで完了した。
+
+### P2-1の予算分離（設計担当決定 2026-11-14、61a8cee41後）
+
+設計担当の決定に従い、tools/listだけを別予算に分ける。上記の停止理由に対する追加修正であり、
+各toolのdescriptionとINSTRUCTIONSは61a8cee41の内容から変更していない。
+
+- `crates/mcp-server/src/lib.rs`: adapter内に `MAX_MCP_DISCOVERY_CHARS = 48_000` を追加した。
+  `Envelope`に `ResponseKind::Data / ToolsList` を持たせ、tools/list成功結果の生成箇所だけがToolsListを指定する。
+  writerへ種別を渡し、`serialize_response`は種別で予算を選ぶ。JSONのキーや本文の文字列では分類しない。
+- 初期化・server/discover・通知・エラー・tools/callはDataのまま40,000文字を適用する。
+  shared crateの `MAX_MCP_RESPONSE_CHARS = 40_000`、coreの `MAX_PAGE_CHARS = 38_000`、項目上限、画像上限は変更していない。
+  `MAX_FRAME_BYTES`による共通のbyte検査も維持した。
+- `crates/mcp-server/src/tests.rs`: 全権限・3プロトコル・3種類のID、計576組合せで、48,000文字以内かつ余裕512文字を検査する。
+  tools/listの実際の生成関数を使い、従来の計測が含めていなかったmodernの `ttlMs / cacheScope` も数える。
+  同一JSONをDataとToolsListで送るwriterテスト、初期化等への別予算の非適用、48,000文字境界、共通frame上限、
+  3プロトコルの実受付→writerでの全tool応答を追加した。データの40,000文字境界テストも維持した。
+- `docs/mcp-integration-plan.md`: §4.3・§15.4へ、データとdiscoveryの予算・理由・種別の受渡しを追記した。
+  tools/listはtool数に比例するセッション開始時の一覧なので、操作条件を削るよりT2の拡張等を含む別枠を確保する。
+- 本報告書を含め、今回の編集対象は上記の計4ファイル。並行して追加された `docs/local-asr-transcript-plan.md` と
+  `src/agent_ipc/transcript.rs` の説明コメントは保持し、今回の変更には含めない。
+
+UIの描画・文言・PNGは変更していない。build-devは指示どおり省略し、コミット・製品バイナリの起動は行っていない。
+検証コマンドは前節と同じrun-heavy経由（内側のPythonでログ保存・1ジョブに制限）。
+
+全576組合せの最大は **40,669文字**（Organize・縮小画像/文字起こし許可ON・modern・64文字ID）。
+従来の40,636文字との差33文字は、実際の送信形に含まれる `ttlMs / cacheScope`。
+description・schema・INSTRUCTIONSを61a8cee41と照合し、変更していないことを確認した。
+最大値＋既存の余裕512文字は **41,181文字**、discovery予算48,000文字に対して **6,819文字**残る。
+全組合せで実際のJSONのbyte数（改行込み）が `MAX_FRAME_BYTES = 4,194,304` 以下になることも検査した。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo nextest run -j 1 -p mimageviewer-mcp --lib -E 'test(tools_list_) \| test(stage2_complete_tool_discovery) \| test(stage1b_final_budget) \| test(stage1a_shared_content_budget)' --no-fail-fast --success-output final` | 6件すべて成功、3.139秒。全576組合せ、3プロトコルの受付→writer、別予算の非漏洩、40,000/48,000文字境界と共通byte上限を含む。`target/asr-t1-chunk4/discovery-focused.log`。 |
+| `cargo nextest run -j 1 -p mimageviewer-mcp --lib --no-fail-fast --success-output final` | 80件中78成功・2失敗、68.614秒。失敗は既知のnamed pipe 2件のみ（fixture thread開始前のOS error 5）。文字数予算を含め残りはすべて成功。`target/asr-t1-chunk4/discovery-all.log`。 |
+| `cargo fmt`（引数なし）、`cargo fmt --check` | 成功 |
+| `python scripts/check_ui_glyphs.py` | 成功、危険なグリフ0件 |
+| `git diff --check` | 成功 |
+
+対象filterは共用full testの終了後12:52:20に開始し、12:52:30にexit 0で完了した。
+MCP lib全件はheavy枠の空き待ち後12:57:08に開始し、12:58:20にexit 100で完了した。
+環境制約2件の内容は前節と同じで、`pipe.rs`は変更していない。上記のP2-1の停止状態はこの予算分離で解消した。
+設計担当の判断との食い違いはない。従来値との差33文字は計測の補正で、toolの説明文の追加や削減ではない。
+
+### client側のdescription・instructions上限（2026-11-14）
+
+[Claude Code公式MCP文書](https://code.claude.com/docs/en/mcp.md) のHTML版でも、
+[tool結果の上限](https://code.claude.com/docs/en/mcp#mcp-output-limits-and-warnings) と
+[description・instructionsの切詰め](https://code.claude.com/docs/en/mcp#tool-search-for-mcp-server-authors)
+を確認した。25,000トークンと既定50,000文字超のファイル退避はtools/callの結果の扱いであり、
+tools/list全体の文字数に同じ上限を適用する根拠にはしない。データ40,000・discovery 48,000の分離は維持した。
+
+`crates/mcp-server/src/tests.rs` に `client_text_limits_tool_descriptions` と
+`client_text_limits_server_instructions` を追加した。各toolとinitializeのINSTRUCTIONSは4,096文字超で失敗する。
+各toolの2,048文字超過は互換性の目標として警告出力し、その目標超過だけでは失敗にしない。
+非BMP文字を過小に数えないようUnicode文字数に加えUTF-16長でも上限を検査する。
+`docs/mcp-integration-plan.md` §15.4へ出典・予算分離の根拠・4,096文字の検査を追記した。
+
+| 対象 | 最長の文字数 | UTF-16長 |
+| --- | ---: | ---: |
+| tool description（`get_transcript`） | 569 | 569 |
+| initialize INSTRUCTIONS | 852 | 852 |
+
+2,048文字を超えるtoolは0件。全toolとinstructionsが4,096文字以内なので、重要条件の並べ替えや文言の削減は不要だった。
+実際のdescription・INSTRUCTIONS、40,000/48,000の予算、coreのページ計算は前節から変更していない。
+設計担当所有の `src/agent_ipc/transcript.rs` のコメントと文字起こし計画書§10には触れていない。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo nextest run -j 1 -p mimageviewer-mcp --lib client_text_limits --no-fail-fast --success-output final` | 前節と同じrun-heavy・Owner・WorkDir経由。2件すべて成功、0.038秒。上記の最長値と2,048文字超過0件を出力。`target/asr-t1-chunk4/client-text-limits.log`。 |
+| `cargo fmt`（引数なし）、`cargo fmt --check` | 成功 |
+| `python scripts/check_ui_glyphs.py` | 成功、危険なグリフ0件 |
+| `git diff --check` | 成功 |
+
+今回の追加はテストと文書のみのため、前節のMCP lib全件・対象filterの結果を再利用した。
+変更対象はMCPのテスト、MCP計画書、本報告書の3ファイル（既存の未コミット差分に追加）。
+UI・PNGは変更せず、build-dev・コミット・製品バイナリの起動は行っていない。設計判断との食い違いはない。

@@ -36,8 +36,12 @@ fn unhex(value: &str) -> Result<Vec<u8>, AgentError> {
 }
 
 fn encode(data: TranscriptCursor) -> Result<String, AgentError> {
-    // FolderCursorと同じく位置は認可に使わない。要求ごとに対象・rev・epoch・範囲を照合する。
-    // プロセス固有の鍵やcursor台帳は持たない。
+    // cursorはAIアプリが書き換えられる値なので、認可にも対象の決定にも使わない (FolderCursorと同じ)。
+    // - 許可: 要求ごとにadmission snapshotの `transcripts` を見る (handler冒頭と受付)。送信直前はepochを再照合する。
+    // - 対象: 読む行は常に要求の `item` から決める。cursorの引数digestが要求の対象・開始秒と一致しなければ拒否するので、
+    //   別の項目の続きとしては使えない。
+    // - 位置: 書き換えても、許可された同じ行の別の区間を読むだけになる。rev・範囲外は取り直しを求める。
+    // このため署名・プロセス固有の鍵・cursor台帳は持たない (独立レビュー区切り4 P3、状態と依存を減らすため)。
     Ok(hex(&serde_json::to_vec(&data).map_err(|_| internal())?))
 }
 
