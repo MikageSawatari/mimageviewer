@@ -16188,6 +16188,195 @@ fn draw_native_bottom_snapshot(ui: &mut egui::Ui, scan: bool) {
 
 #[cfg(test)]
 mod chrome_suppression_interaction_tests {
+    mod transcript_native_tests {
+        use super::*;
+
+        fn overlay_with_transcript(position: f64) -> NativeEguiOverlayState {
+            let (mut overlay, _) = fixture(false);
+            // 実際のnative contextと同じキーボードzoom設定で検査する。
+            // wheelのzoom修飾判定は、これとは独立にeguiのInputStateが行う。
+            overlay
+                .egui_ctx
+                .options_mut(|options| options.zoom_with_keyboard = false);
+            overlay.update_video_state(position, 600.0, true, 1.0, false, 0, 1.0, false, false, 0);
+            overlay.transcript_snapshot = crate::transcript_display::TranscriptSnapshot {
+                key: "recreated.mp4".into(),
+                state: crate::transcript_display::TranscriptDataState::Available,
+                segments: Arc::new(
+                    (0..300)
+                        .map(|row| (row * 2000, row * 2000 + 1000, format!("発話{row}")))
+                        .collect(),
+                ),
+                time_mapping: crate::video::transcript_time::TranscriptTimeMapping::raw_pts(0.0),
+                ..Default::default()
+            };
+            overlay.set_side_panel_state(
+                FsSidePanelMode::ClickToShow,
+                crate::ui_helpers::MetadataPanelOpenState::ByPointer,
+                false,
+            );
+            overlay.left_panel_open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
+            for _ in 0..4 {
+                frame(&mut overlay);
+            }
+            overlay
+        }
+
+        fn open_transcript_tab(overlay: &mut NativeEguiOverlayState) {
+            assert_eq!(overlay.video_left_panel_tab, NativeVideoLeftPanelTab::Jump);
+            let pos = overlay
+                .egui_ctx
+                .read_response(egui::Id::unique(("native_video_left_panel_tab", 1)))
+                .expect("文字起こしタブの実Response")
+                .rect
+                .center();
+            overlay.pending_events.push(egui::Event::PointerMoved(pos));
+            for pressed in [true, false] {
+                overlay.pending_events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                frame(overlay);
+            }
+            for _ in 0..4 {
+                frame(overlay);
+            }
+            assert_eq!(
+                overlay.video_left_panel_tab,
+                NativeVideoLeftPanelTab::Transcript
+            );
+        }
+
+        #[test]
+        fn native_transcript_recreated_presenter_follows_active_row() {
+            // F12往復で新しいpresenterが同じsnapshotと現在位置を受ける。タブはJumpのまま初期化する。
+            for _ in 0..2 {
+                let mut overlay = overlay_with_transcript(118.5);
+                open_transcript_tab(&mut overlay);
+                let (following, layout) = overlay.transcript_panel_state.scroll_state_for_test();
+                assert!(following);
+                assert!(
+                    layout.expect("一覧を描画").offset.y > 1000.0,
+                    "既知の再生中の行へ送る"
+                );
+            }
+        }
+
+        #[test]
+        fn native_transcript_recreated_presenter_follows_position_in_gap() {
+            for position in [119.5, 118.0] {
+                let mut overlay = overlay_with_transcript(position);
+                if position == 118.0 {
+                    // m6の保存済み最終worker出力: 116.80〜118.92秒は発話の隙間。
+                    // 本文の転載は不要なので、時刻だけを合成の前後の行へ挟む。
+                    let mut segments: Vec<_> = (0..54)
+                        .map(|row| (row * 2000, row * 2000 + 1000, format!("発話{row}")))
+                        .collect();
+                    segments.extend([
+                        (109340, 116800, "直前の発話".into()),
+                        (118920, 122220, "次の発話".into()),
+                    ]);
+                    segments.extend((0..100).map(|row| {
+                        (
+                            124000 + row * 2000,
+                            125000 + row * 2000,
+                            format!("後続の発話{row}"),
+                        )
+                    }));
+                    overlay.transcript_snapshot.segments = Arc::new(segments);
+                }
+                open_transcript_tab(&mut overlay);
+                let (following, layout) = overlay.transcript_panel_state.scroll_state_for_test();
+                assert!(following);
+                assert!(
+                    layout.expect("一覧を描画").offset.y > 1000.0,
+                    "区間の隙間でも再生位置の近くを出す"
+                );
+            }
+        }
+
+        #[test]
+        fn native_transcript_wheel_entry_only_plain_wheel_scrolls_and_pauses_follow() {
+            for ctrl in [true, false] {
+                let mut overlay = overlay_with_transcript(118.5);
+                open_transcript_tab(&mut overlay);
+                let before = overlay
+                    .transcript_panel_state
+                    .scroll_state_for_test()
+                    .1
+                    .unwrap()
+                    .offset;
+                let disposition = overlay.push_native_wheel_event(
+                    crate::video::native_window::NativeVideoMouseWheelEvent {
+                        delta: 360,
+                        x: 150,
+                        y: 300,
+                        shift: false,
+                        ctrl,
+                        alt: false,
+                    },
+                );
+                assert!(matches!(
+                    disposition,
+                    NativeOverlayInputDisposition::OverlayRegion
+                ));
+                assert!(overlay.pending_overlay_commands.is_empty());
+                assert!(overlay.pending_events.iter().any(|event| matches!(event,
+                    egui::Event::MouseWheel { modifiers, .. } if modifiers.ctrl == ctrl && modifiers.command == ctrl)));
+                for _ in 0..4 {
+                    frame(&mut overlay);
+                }
+                let (following, layout) = overlay.transcript_panel_state.scroll_state_for_test();
+                assert_eq!(following, ctrl, "Ctrlが届いたwheelだけは追従を止めない");
+                if ctrl {
+                    assert_eq!(layout.unwrap().offset, before);
+                } else {
+                    assert!(
+                        layout.unwrap().offset.y < before.y,
+                        "通常の上wheelは実際に一覧を送る"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn native_transcript_hidden_panel_reopens_at_current_gap_on_first_draw() {
+            let mut overlay = overlay_with_transcript(118.5);
+            open_transcript_tab(&mut overlay);
+            overlay.set_side_panel_state(
+                FsSidePanelMode::Hover,
+                crate::ui_helpers::MetadataPanelOpenState::Closed,
+                false,
+            );
+            pointer(&mut overlay, egui::pos2(2.0, 300.0));
+            frame(&mut overlay);
+            assert!(overlay.jump_panel_visible);
+            pointer(&mut overlay, egui::pos2(700.0, 300.0));
+            frame(&mut overlay);
+            assert!(!overlay.jump_panel_visible);
+            assert!(
+                overlay
+                    .transcript_panel_state
+                    .scroll_state_for_test()
+                    .1
+                    .is_none()
+            );
+            // 非表示中に進んだ位置を通常のcontrols経路で受ける。
+            overlay.update_video_state(399.5, 600.0, true, 1.0, false, 0, 1.0, false, false, 0);
+            pointer(&mut overlay, egui::pos2(2.0, 300.0));
+            frame(&mut overlay);
+            assert!(overlay.jump_panel_visible);
+            let (following, layout) = overlay.transcript_panel_state.scroll_state_for_test();
+            assert!(following);
+            assert!(
+                layout.unwrap().offset.y > 5000.0,
+                "再表示の最初の描画で現在位置へ送る"
+            );
+        }
+    }
+
     mod seek_terminal_tests {
         // GPU-free regressions using the production overlay and logical batch driver.
         use super::*;

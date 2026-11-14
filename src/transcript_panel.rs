@@ -128,6 +128,16 @@ impl TranscriptPanelState {
     pub(crate) fn reset(&mut self) {
         *self = Self::default();
     }
+
+    #[cfg(test)]
+    pub(crate) fn scroll_state_for_test(
+        &self,
+    ) -> (bool, Option<crate::test_ui::scroll_layout::ScrollLayout>) {
+        (
+            matches!(self.mode, ScrollMode::Following(_)),
+            self.last_scroll,
+        )
+    }
 }
 
 fn active_row(segments: &[TranscriptSegment], position: Option<f64>) -> Option<usize> {
@@ -136,6 +146,17 @@ fn active_row(segments: &[TranscriptSegment], position: Option<f64>) -> Option<u
         .partition_point(|row| row.0 as f64 <= millis)
         .checked_sub(1)?;
     (millis < segments[index].1 as f64).then_some(index)
+}
+
+/// 発話の隙間も現在位置の直前の行へ送る。強調は active_row の区間内だけに限る。
+/// 最初の発話より前は先頭、最後の発話より後は末尾を表示する。
+fn follow_row(segments: &[TranscriptSegment], position: Option<f64>) -> Option<usize> {
+    let millis = position.filter(|value| value.is_finite() && *value >= 0.0)? * 1000.0;
+    (!segments.is_empty()).then(|| {
+        segments
+            .partition_point(|row| row.0 as f64 <= millis)
+            .saturating_sub(1)
+    })
 }
 
 /// offset の変化から推測せず、この一覧に対する実際の入力だけで自動送りを止める。
@@ -197,10 +218,9 @@ pub(crate) fn draw_transcript_panel_body(
     if snapshot.segments.is_empty() {
         return None;
     }
-    let active = active_row(
-        &snapshot.segments,
-        snapshot.time_mapping.to_transcript(raw_position_secs),
-    );
+    let position = snapshot.time_mapping.to_transcript(raw_position_secs);
+    let active = active_row(&snapshot.segments, position);
+    let following_row = active.or_else(|| follow_row(&snapshot.segments, position));
     let mut resumed = false;
     ui.horizontal(|ui| {
         if ui
@@ -265,7 +285,7 @@ pub(crate) fn draw_transcript_panel_body(
             ..Default::default()
         });
     if matches!(state.mode, ScrollMode::Following(_)) {
-        if let Some(row) = active {
+        if let Some(row) = following_row {
             scroll = scroll.vertical_scroll_offset(state.heights.prefix(row));
         } else if fresh {
             scroll = scroll.vertical_scroll_offset(0.0);
@@ -421,6 +441,21 @@ mod tests {
         assert_eq!(active_row(&rows, None), None);
     }
 
+    #[test]
+    fn transcript_follow_row_covers_gaps_and_edges_without_highlighting_silence() {
+        let rows = vec![(1000, 2000, "a".into()), (4000, 6000, "b".into())];
+        for (position, expected) in [(0.0, 0), (1.5, 0), (2.0, 0), (3.0, 0), (4.0, 1), (9.0, 1)] {
+            assert_eq!(follow_row(&rows, Some(position)), Some(expected));
+        }
+        for position in [None, Some(-1.0), Some(f64::NAN), Some(f64::INFINITY)] {
+            assert_eq!(follow_row(&rows, position), None);
+        }
+        assert_eq!(follow_row(&[], Some(3.0)), None);
+        assert_eq!(active_row(&rows, Some(0.0)), None);
+        assert_eq!(active_row(&rows, Some(3.0)), None);
+        assert_eq!(active_row(&rows, Some(9.0)), None);
+    }
+
     fn fixture(count: usize) -> TranscriptSnapshot {
         TranscriptSnapshot {key:"sample.mp4".into(),state:crate::transcript_display::TranscriptDataState::Available,
             segments:Arc::new((0..count).map(|index| ((index as u64+1)*1000,(index as u64+2)*1000,format!("行{index}：幅に合わせて折り返す日本語の文字起こしです。長い文章も全文を表示します。"))).collect()),
@@ -454,6 +489,39 @@ mod tests {
                     position: 11.5,
                 },
             )
+    }
+
+    #[test]
+    fn transcript_panel_gap_follow_on_source_change_reset_and_origin_arrival() {
+        let mut harness = harness(300);
+        harness.state_mut().snapshot.segments = Arc::new(
+            (0..300)
+                .map(|row| (row * 2000, row * 2000 + 1000, format!("発話{row}")))
+                .collect(),
+        );
+        // 再生側原点10秒を含む現在位置。保存時刻119.5秒は発話の隙間。
+        harness.state_mut().position = 129.5;
+        harness.run_steps(6);
+        assert!(harness.state().state.last_scroll.unwrap().offset.y > 1000.0);
+        // 同じegui contextの別ファイルへ移動。古いManual/offsetを引き継がない。
+        harness.state_mut().state.mode = ScrollMode::Manual(Anchor::default());
+        harness.state_mut().snapshot.key = "next.mp4".into();
+        harness.state_mut().position = 409.5;
+        harness.run_steps(1);
+        assert!(matches!(
+            harness.state().state.mode,
+            ScrollMode::Following(_)
+        ));
+        assert!(harness.state().state.last_scroll.unwrap().offset.y > 5000.0);
+        // hide/closeのセッション境界と、原点が後から届く場合。
+        harness.state_mut().state.reset();
+        harness.state_mut().snapshot.time_mapping = Default::default();
+        harness.run_steps(1);
+        assert_eq!(harness.state().state.last_scroll.unwrap().offset.y, 0.0);
+        harness.state_mut().snapshot.time_mapping =
+            crate::video::transcript_time::TranscriptTimeMapping::raw_pts(10.0);
+        harness.run_steps(1);
+        assert!(harness.state().state.last_scroll.unwrap().offset.y > 5000.0);
     }
     #[test]
     fn transcript_panel_5000_rows_only_measures_visible_and_wraps_text() {

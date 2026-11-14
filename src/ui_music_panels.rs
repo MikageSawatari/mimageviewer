@@ -267,6 +267,71 @@ mod transcript_session_tests {
         harness.run_steps(2);
         assert_eq!(harness.state().tab, MusicLeftPanelTab::Jump);
     }
+
+    #[test]
+    fn music_transcript_tab_reopens_and_switches_source_at_current_gap() {
+        let snapshot = crate::transcript_display::TranscriptSnapshot {
+            key: "sample.flac".into(),
+            state: crate::transcript_display::TranscriptDataState::Available,
+            segments: std::sync::Arc::new(
+                (0..300)
+                    .map(|row| (row * 2000, row * 2000 + 1000, format!("発話{row}")))
+                    .collect(),
+            ),
+            time_mapping: crate::video::transcript_time::TranscriptTimeMapping::raw_pts(10.0),
+            ..Default::default()
+        };
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(320.0, 460.0))
+            .build_ui_state(
+                |ui,
+                 (session, snapshot, position): &mut (
+                    MusicTranscriptPanelSession,
+                    crate::transcript_display::TranscriptSnapshot,
+                    f64,
+                )| {
+                    session.bind(egui::Id::unique((1, &snapshot.key)));
+                    draw_music_left_panel_tabs(
+                        ui,
+                        egui::Rect::from_min_size(egui::pos2(8.0, 4.0), egui::vec2(270.0, 26.0)),
+                        session,
+                    );
+                    if session.tab == MusicLeftPanelTab::Transcript {
+                        let body = egui::Rect::from_min_max(
+                            egui::pos2(8.0, 40.0),
+                            egui::pos2(312.0, 454.0),
+                        );
+                        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(body));
+                        child.set_clip_rect(body);
+                        crate::transcript_panel::draw_transcript_panel_body(
+                            &mut child,
+                            snapshot,
+                            *position,
+                            &mut session.transcript,
+                        );
+                    }
+                },
+                (MusicTranscriptPanelSession::default(), snapshot, 129.5),
+            );
+        harness.run_steps(4);
+        for boundary in 0..3 {
+            if boundary == 1 {
+                // パネルのclose/hideは既存のsession境界で破棄する。
+                harness.state_mut().0.reset();
+                harness.state_mut().2 = 409.5;
+            } else if boundary == 2 {
+                harness.state_mut().1.key = "next.flac".into();
+            }
+            harness.run_steps(2);
+            assert_eq!(harness.state().0.tab, MusicLeftPanelTab::Jump);
+            harness.get_by_label("文字起こし").click();
+            harness.run_steps(2);
+            let (following, layout) = harness.state().0.transcript.scroll_state_for_test();
+            assert!(following);
+            assert!(layout.unwrap().offset.y > if boundary == 0 { 1000.0 } else { 5000.0 });
+        }
+    }
 }
 // 音楽ビューはメイン egui ctx (アプリテーマ = Light になり得る) に描くため、egui 既定の
 // `on_hover_text` はツールチップが明色になる。動画 native HUD (専用ダーク ctx) と見た目を
