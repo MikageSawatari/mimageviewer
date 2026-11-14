@@ -202,8 +202,24 @@ pub(crate) fn dark_popup_style(ctx: &egui::Context) -> StyleModifier {
 
 /// 暗色固定 popup / tooltip の背景枠。
 pub(crate) fn dark_popup_frame(ctx: &egui::Context) -> egui::Frame {
+    popup_frame_with_visuals(ctx, dark_visuals(current_text_contrast(ctx)))
+}
+
+/// 呼び出し元の表示面に合わせた popup の正規 Visuals。
+/// toolbar 等の局所的な widget fill は引き継がず、文字コントラストだけを共有する。
+pub(crate) fn popup_visuals_for_ui(ui: &egui::Ui) -> egui::Visuals {
+    let theme = if ui.visuals().dark_mode {
+        ResolvedTheme::Dark
+    } else {
+        ResolvedTheme::Light
+    };
+    app_visuals(theme, current_text_contrast(ui.ctx()))
+}
+
+/// popup の子 UI と同じ Visuals で背景枠を作る。Context の Style は変更しない。
+pub(crate) fn popup_frame_with_visuals(ctx: &egui::Context, visuals: egui::Visuals) -> egui::Frame {
     let mut style = (*ctx.global_style()).clone();
-    style.visuals = dark_visuals(current_text_contrast(ctx));
+    style.visuals = visuals;
     egui::Frame::popup(&style)
 }
 
@@ -417,6 +433,36 @@ pub(crate) fn contrast_ratio(a: egui::Color32, b: egui::Color32) -> f64 {
 mod tests {
     use super::*;
     use egui::Color32;
+
+    #[test]
+    fn popup_visuals_follow_surface_without_local_widget_overrides() {
+        for theme in [ResolvedTheme::Light, ResolvedTheme::Dark] {
+            for contrast in [TextContrast::Standard, TextContrast::Strong] {
+                let ctx = egui::Context::default();
+                apply_resolved_with_contrast(&ctx, theme, contrast);
+                for surface in [ResolvedTheme::Light, ResolvedTheme::Dark] {
+                    ctx.run_ui(Default::default(), |ui| {
+                        let expected = app_visuals(surface, contrast);
+                        *ui.visuals_mut() = expected.clone();
+                        ui.visuals_mut().widgets.inactive.weak_bg_fill = Color32::GREEN;
+                        ui.visuals_mut().override_text_color = Some(Color32::MAGENTA);
+                        let visuals = popup_visuals_for_ui(ui);
+                        assert_eq!(visuals, expected);
+                        let mut style = (*ctx.global_style()).clone();
+                        style.visuals = expected;
+                        assert_eq!(
+                            popup_frame_with_visuals(&ctx, visuals),
+                            egui::Frame::popup(&style)
+                        );
+                        if surface == ResolvedTheme::Dark {
+                            assert_eq!(dark_popup_frame(&ctx), egui::Frame::popup(&style));
+                        }
+                    })
+                    .drop_without_applying_deltas();
+                }
+            }
+        }
+    }
 
     #[test]
     fn book_resume_meter_palette_has_opaque_distinct_track_and_fill() {

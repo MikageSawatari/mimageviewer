@@ -488,6 +488,17 @@ fn search_history_popup_dark() {
 }
 
 #[test]
+fn search_history_popup_light() {
+    snapshot_with_theme_at_size(
+        "search_history_popup_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(440.0, 240.0),
+        None,
+        |ui| mimageviewer::ui_history_field::draw_history_field_snapshot_fixture(ui, true),
+    );
+}
+
+#[test]
 fn folder_address_history_light() {
     snapshot_with_theme_at_size(
         "folder_address_history_light",
