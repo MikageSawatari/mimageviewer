@@ -9,6 +9,17 @@ master は v4 系に保ち、v5 の公開時期は別途判断する。[統合�
 
 ## 0. 要約
 
+**2026-11-14 利用者決定（backlog §1.786、区切り6）**: `tools/list` は許可・coreの起動状態によらず、
+公開の機能名・説明・schema（現行19 tool）を常にすべて返す。Disabledでも同じ一覧だが、ファイル・ライブラリの情報は渡さない。
+呼出し時はcoreの要求受付で現在の許可を検査し、不足する許可と設定場所を名指すtool error（`isError=true`、code `disabled`）を返す。
+GPS・AI説明文はtool自体の有無ではなく応答内容の許可のまま。送信前のsnapshot/epoch照合も変えない。
+理由はサブPC依頼52・53（Claude Code 2.1.72）で、`tools.listChanged=true` と変更通知があっても途中の許可変更で一覧が更新されず、
+新しい会話でしか使える機能が増えなかったため。公開済みの縮小画像・open・整理toolにも同じ影響があった。
+一覧をcoreへ問い合わせずadapterで生成する。集合が不変になったので、旧版の5秒Status照会・PermissionObserver・revision・
+list_changed通知・listChanged広告は削除する。再試行・push・別の認可は追加しない。
+以下の旧実装・検証履歴にある「許可で隠す」「offlineはmiv_statusだけ」「poll/通知で一覧を更新」は、この決定で置き換わる。
+実装と棚卸し・検証は [常時一覧の報告](mcp-always-list-report.md) を参照。
+
 - 目的: mIV の操作を AI (Claude / ChatGPT) からも使えるようにする。最初の用途は
   画像・本の整理 (検索・タグ付け・コレクション整理)、後段で音楽ビデオエディタの編集代行。
 - 推奨構成: **本体とは別の小さな exe `mimageviewer-mcp.exe` を AI アプリが PC 内で起動する
@@ -244,8 +255,8 @@ tool ごとの許可表は持たない。**mIV が保証するのはこの許可
 AI アプリの設定に依存する (独立レビュー P1-2)。`readOnlyHint=false` は確認を促すヒントに過ぎず、
 Codex の `auto` や tool 単位の承認設定、Claude の「常に許可」で確認は省ける。設定画面にそう書く。
 有効化と範囲変更の画面で、AI アプリに渡る情報 (§5.4) と、その AI の提供元へ送られることを明示する。
-許可の範囲より上の tool は `tools/list` に出さず、呼ばれても拒否する。範囲を変えたら
-`notifications/tools/list_changed` を送る (送れない版では次の要求から反映)。
+許可の範囲より上のtoolも `tools/list` に常に出す。呼出し時はcoreが不足する許可を名指して拒否する。
+Disabledも公開の機能説明だけは同じ一覧を返す（2026-11-14、§0の利用者決定）。一覧変更の監視・通知は不要となり削除する。
 
 **削除の注意 (コードで確認)**: mIV の既存のごみ箱移動 (`src/delete_worker.rs`) は、移動に成功した
 項目の mIV 側の情報 (タグ・★・回転・補正・ブックマーク等、`rename_key_migration` の purge) を
@@ -264,7 +275,7 @@ Codex の `auto` や tool 単位の承認設定、Claude の「常に許可」�
 - 渡るものの一覧は §5.6。段階 0 で渡るもの: ファイルの場所 (絶対パス)、ファイル名、種類、タグ、★、
   コレクション名と登録内容、検索結果。**画像そのもの・サムネイルは渡さない**。段階 1 から、利用者が
   「AI に縮小画像を見せる」を ON にした時だけ縮小画像 (本体のサムネイル生成経路の WebP、§15.4) を
-  返す tool を出す (§11.1 U2)。
+  `get_thumbnail` から返す (§11.1 U2)。toolの名前・説明は許可によらず常に一覧に出す（2026-11-14、§0）。
   AI 生成画像の生成プロンプト (PNG tEXt / EXIF UserComment 由来の索引テキスト) を返すかは段階 1 で判断する。
 - mIV は AI からの検索語と結果を履歴・診断ログへ保存しない (Everything 検索と同じ方針)。
   agent lane のログに残すのは tool 名・所要時間・件数・error 種別だけ。共有している既存処理の
@@ -806,16 +817,11 @@ Cargo artifact を通して行い、起動先には使い捨て fixture の `--d
 `4b3c9da43..28664e3dd` に対する独立レビュー (gpt-6.1-sol / xhigh、read-only) の
 P2 3件・P3 2件を設計担当がすべて受理した。
 
-- **legacy の tool 一覧更新**: 実際の agent wire 応答には permission epoch が含まれないため、
-  adapter が既存 Status IPC を legacy Ready 中に1秒間隔で照会し、有効な tool 集合の変化を観測する。
-  Stage 0 の集合は Disabled/ReadOnly の2通りだけなので wire の epoch 追加は不要。
-  第二の設定 reader や core 側の subscription/接続所有を作らず、idle 中も照会できるこの方式を選ぶ。
-  legacy handshake では `tools.listChanged=true` を広告し、変化時に
-  `notifications/tools/list_changed` を送る。監視停止時は timer を止め、未完了の同期 IPC を join しない。
-  古い poll 結果が新しい tools/list・Disabled 観測を上書きしないよう、Session 内の局所 revision で照合する。
-- **modern の更新**: `subscriptions/listen` には filter・ack・終了/cancel の所有が追加で必要になる。
-  Stage 0 ではこれを増やさず、2026-07-28 の tools/list は引き続き `ttlMs=0` / `cacheScope=private`
-  とし、必要時の再一覧取得で更新する。modern に `listChanged` を広告せず、未購読の通知も送らない。
+- **legacy のtool一覧（2026-11-14変更）**: 許可変更の通知を受けてもClaude Code 2.1.72では一覧が更新されなかった（依頼52・53）。
+  利用者決定で全toolを固定表示し、従来のStatus poll（初期1秒・後に5秒）と集合比較・revision・通知を削除した。
+  initializeの `capabilities.tools` は空objectで、`listChanged` を広告しない。実行可否は毎回coreで判定する。
+- **modern の一覧**: subscriptionは足さず、同じ全toolをadapterだけで返す。`ttlMs=0` / `cacheScope=private` は互換のため維持する。
+  modernにも `listChanged` は広告せず、未購読の通知は送らない。
   [公式 SDK の版移行説明](https://ts.sdk.modelcontextprotocol.io/v2/migration/support-2026-07-28) の
   subscription による change 通知の扱いを確認した。
   [公式 caching](https://modelcontextprotocol.io/specification/2026-07-28/server/utilities/caching) は
@@ -1163,8 +1169,8 @@ U8 で 1 段足して 6 段にする。順序のある 1 つの選択のまま (
 - **権限 snapshot**: 段・縮小画像・撮影位置・AI 説明文・文字起こしの 5 つを 1 つの値として読み、どれが変わっても epoch を進める。
   段階 0 の「受付ごとの判定」と「送信直前の再照合」はこの snapshot 全体で行う。生成中に縮小画像・
   撮影位置・AI 説明文・文字起こしを OFF にしたら、その結果は送らず拒否に置き換える (独立レビュー P1-1)。
-- 旧版の握手の通知監視は、有効/無効の bool ではなく「その snapshot で出す tool の集合」を比べ、
-  変わったら `notifications/tools/list_changed` を送る。
+- tool一覧はsnapshotを参照しない固定の公開情報。旧版の握手の通知監視は2026-11-14の決定で削除（§0・§8）。
+  許可snapshotはcoreの要求受付・実行中・送信前の認可に使い続ける。
 - 設定の自動転送では、4 つのチェックも `agent_level` と同じく移行対象外にする。
 - V3: `ReadContext` は受付の `(PermissionSnapshot, epoch)` を一組で保持し、`Cursor` と `FolderCursor` の作成・検査にその版を使う。
   cursor の版は 3。続きの受付で許可の版が違えば `PermissionChanged`、連携全体が無効なら `Disabled`、旧版は `BadRequest`。
@@ -1402,7 +1408,7 @@ tool searchで後から読むdescriptionは16,384文字だが、検索時にも�
 類似索引の prefill・`pdf_meta` の更新・Susie などの副作用と取消を受けない読み取りを内側に持ち、agent 用に抑止する
 箇所が巡ごとに増えたため、使わない):
 
-- 「AI に縮小画像を見せる」が ON の時だけ `tools/list` に出し、OFF なら拒否する。
+- `tools/list` には常に出す。「縮小画像を AI に見せる」がOFFなら、coreの受付で設定名を示して拒否する。
 - **指定された 1 枚から直接作る。thumbnail cache (catalog) は読みも書きもしない。** 本の構成の編集画面の縮小画像
   (`app/book_composition_editor_thumbnails.rs` の `decode_thumbnail`。cache なし・取消付き・回転 DB を読み取り専用) と
   同じ考え方。これで代表の解決、ドライブの違う同名フォルダの cache の取り違え、cache の保存方針との整合、
@@ -1581,8 +1587,9 @@ tool searchで後から読むdescriptionは16,384文字だが、検索時にも�
   **`Hello` は版と名乗りを受け取るだけの軽い処理にし、許可の判定と同時実行の枠を外す** (今は `Hello` で許可を判定し、
   無効なら adapter が tool の要求を送らずに終わるので、拒否を記録できない。設計レビュー 12 巡目 P2-3)。許可・混雑の判定は
   tool の要求の側で行う (今の要求の判定と同じ場所)。MCP exe は、旧版の握手では `initialize` の `clientInfo` (名前・版) を接続の間持ち、2026-07-28 版では
-  各要求の `_meta` から取る。**5 秒ごとの状態の照会と `tools/list` から作る照会は `internal`**、AI が呼んだ tool
-  (`miv_status` を含む) は `tool`。
+  各要求の `_meta` から取る。AIが呼んだtool（`miv_status`を含む）は `tool`。
+  2026-11-14に5秒照会とtools/listからのStatus IPCを削除したため、adapterからの定期的な `internal` 要求は無い。
+  既存agent wireの `internal` 区分自体は変更しない。
 - core は `Connection` に名前・版・種類を持ち、`tool` の要求の結果を記録する所 (既存の `record`) で、共有の
   「最近の AI アプリ」の表 (`Arc<Mutex<..>>`) の時刻を更新する。拒否 (無効・混雑を含む)・時間切れも「実行した」に数える
   (呼ばれた事実を示す)。`Hello`・`Cancel`・`internal` は数えない。MCP exe の中で終わる引数の検証の拒否 (core に届かない) も
@@ -1753,6 +1760,9 @@ MCP の exe は console subsystem・CRT 静的リンク (DLL 不要)・引数は
   前提の本数・署名の一覧・内包の木) を同時に直す。
 - MSIX・winget の manifest は無く、CI は release の exe を作らない (変更不要)。Store はインストーラの提出なので変更不要。
 - 1e までは配布物に入れて作れるところまでで、公開しない (U10)。公開文書 (§6) は段階 2 で直す。
+
+**旧仕様の記録（2026-11-14に§0の決定で変更）**: 下記のoffline/Disabledの一覧とpollは当時の判断。
+現在はcoreの起動状態・許可によらず全19 toolをadapterだけで返し、未起動のerrorはtoolの呼出し時に返す。
 
 **mIV が起動していない時の `tools/list`** (1e の実装レビューの見解を受けて ClaudeCode が判断、2026-11-01): 段階 0 から、core に
 繋がらない時の `tools/list` は JSON-RPC の error (-32603) だった。AI アプリを先に起動して mIV を後から起動するのは通常の使い方で
@@ -5277,7 +5287,7 @@ CSS、画像、製品コード、実際の登録先ファイルは変更して�
 | 主張 | 限定と照合理由 |
 |---|---|
 | 既定では無効、縮小画像/GPS も既定でオフ | `AgentLevel` と各 bool の default。登録しただけで許可を上げる処理はない |
-| 無効なら情報を渡さず操作しない | core の毎回の許可検査と adapter の空の tool 一覧。挨拶の受付を、ライブラリ情報の取得とは扱わない |
+| 無効ならファイル・ライブラリ情報を渡さず操作しない | coreの毎回の許可検査。挨拶と固定の機能名・説明・schemaは公開情報として返す（2026-11-14、§1.786） |
 | 本体の画像 AI は PC 内 | アップスケール等の機能に限定。画像 AI のための非アップロードを、AI アプリ連携の縮小画像まで含む主張にはしない |
 | mIV 自身は通信しない、開発者へ送らない | 「この AI 連携」に限定。同じ PC の接続先へ返し、その AI アプリが提供元へ送る。アプリ全体の非通信は主張しない |
 | 開発者による非収集・非受信・非提供 | AI アプリから提供元への送信は開発者を経由しない。既存の説明は成立するので、privacy の文言を弱めず原文を保持 (§30.5 / §30.6) |

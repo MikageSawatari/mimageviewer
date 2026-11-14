@@ -118,7 +118,7 @@ impl Handlers {
     ) -> Result<TranscriptReadResult, AgentError> {
         // 受付だけに依存しない。DB/statを行う前に同じadmission snapshotで拒否する。
         if !ctx.granted.0.transcripts {
-            return Err(error(ErrorCode::Disabled, "文字起こしの共有は無効です"));
+            return Err(error(ErrorCode::Disabled, TRANSCRIPT_PERMISSION_MESSAGE));
         }
         if start_secs.is_some_and(|value| !valid_start(value)) {
             return Err(error(

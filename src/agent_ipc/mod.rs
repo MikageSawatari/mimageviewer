@@ -37,6 +37,8 @@ mod logging_tests;
 mod media_read_tests;
 #[cfg(test)]
 mod open_connection_tests;
+#[cfg(test)]
+mod permission_admission_tests;
 #[cfg(windows)]
 mod pipe;
 #[cfg(test)]
@@ -281,9 +283,43 @@ fn load_permission() -> Result<PermissionGrant, AgentError> {
     crate::settings_db::with_db_result(|db| db.load_agent_permission())
         .map_err(|_| error(ErrorCode::Busy, "設定を読み込めませんでした"))
 }
+const DISABLED_PERMISSION_MESSAGE: &str =
+    "mIV の AI 連携が無効です。mIV の「設定」→「AI 連携…」で許可の範囲を選んでください";
+const THUMBNAIL_PERMISSION_MESSAGE: &str =
+    "mIV の「設定」→「AI 連携…」で「縮小画像を AI に見せる」を ON にしてください";
+const TRANSCRIPT_PERMISSION_MESSAGE: &str =
+    "mIV の「設定」→「AI 連携…」で「文字起こしを AI に見せる」を ON にしてください";
+const OPEN_PERMISSION_MESSAGE: &str =
+    "mIV の「設定」→「AI 連携…」で許可の範囲を「読み取りと、mIV で開く」以上にしてください";
+const ORGANIZE_PERMISSION_MESSAGE: &str =
+    "mIV の「設定」→「AI 連携…」で許可の範囲を「整理まで」にしてください";
+
+/// 一覧は公開の機能説明として固定。要求の認可はcoreのこの受付で行う。
+fn check_tool_permission(
+    snapshot: PermissionSnapshot,
+    command: &Command,
+) -> Result<(), AgentError> {
+    let denied = match command {
+        Command::GetThumbnail { .. } if !snapshot.thumbnails => Some(THUMBNAIL_PERMISSION_MESSAGE),
+        Command::GetTranscript { .. } if !snapshot.transcripts => {
+            Some(TRANSCRIPT_PERMISSION_MESSAGE)
+        }
+        Command::OpenInViewer { .. } if snapshot.level < AgentLevel::ReadAndOpen => {
+            Some(OPEN_PERMISSION_MESSAGE)
+        }
+        _ if (collection_write::is_write(command) || metadata_write::is_write(command))
+            && snapshot.level < AgentLevel::Organize =>
+        {
+            Some(ORGANIZE_PERMISSION_MESSAGE)
+        }
+        _ => None,
+    };
+    denied.map_or(Ok(()), |message| Err(error(ErrorCode::Disabled, message)))
+}
+
 fn enabled_permission((snapshot, epoch): PermissionGrant) -> Result<PermissionGrant, AgentError> {
     if snapshot.level == AgentLevel::Disabled {
-        Err(error(ErrorCode::Disabled, "AI 連携 (MCP) は無効です"))
+        Err(error(ErrorCode::Disabled, DISABLED_PERMISSION_MESSAGE))
     } else {
         Ok((snapshot, epoch))
     }
@@ -417,38 +453,8 @@ impl Connection {
             ));
             return None;
         }
-        if matches!(request.command, Command::GetThumbnail { .. }) && !granted.0.thumbnails {
-            reject(error(
-                ErrorCode::Disabled,
-                "AI に縮小画像を見せる設定は無効です",
-            ));
-            return None;
-        }
-        if matches!(request.command, Command::GetTranscript { .. }) && !granted.0.transcripts {
-            reject(error(
-                ErrorCode::Disabled,
-                "AI に文字起こしを見せる設定は無効です",
-            ));
-            return None;
-        }
-        if matches!(request.command, Command::OpenInViewer { .. })
-            && granted.0.level < AgentLevel::ReadAndOpen
-        {
-            reject(error(ErrorCode::Disabled, "mIV で開く許可がありません"));
-            return None;
-        }
-        if (collection_write::is_write(&request.command)
-            || metadata_write::is_write(&request.command))
-            && granted.0.level < AgentLevel::Organize
-        {
-            reject(error(
-                ErrorCode::Disabled,
-                if metadata_write::is_write(&request.command) {
-                    "タグ・★を変更する許可がありません"
-                } else {
-                    "コレクションを変更する許可がありません"
-                },
-            ));
+        if let Err(err) = check_tool_permission(granted.0, &request.command) {
+            reject(err);
             return None;
         }
         let (permit, cancel) = match self.acquire(request.id) {

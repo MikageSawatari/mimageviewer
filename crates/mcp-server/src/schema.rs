@@ -1,7 +1,6 @@
 use mimageviewer_agent_ipc::{
-    AgentLevel, DEFAULT_FOLDER_LIMIT, DEFAULT_LIMIT, DEFAULT_THUMBNAIL_SIDE, MAX_INFO_LIMIT,
-    MAX_LIMIT, MAX_THUMBNAIL_ITEMS, MAX_THUMBNAIL_SIDE, MAX_WRITE_ITEMS, MAX_WRITE_TAGS,
-    PermissionSnapshot,
+    DEFAULT_FOLDER_LIMIT, DEFAULT_LIMIT, DEFAULT_THUMBNAIL_SIDE, MAX_INFO_LIMIT, MAX_LIMIT,
+    MAX_THUMBNAIL_ITEMS, MAX_THUMBNAIL_SIDE, MAX_WRITE_ITEMS, MAX_WRITE_TAGS,
 };
 use serde_json::{Value, json};
 
@@ -428,28 +427,6 @@ fn output(name: &str) -> Value {
         _ => unreachable!(),
     }
 }
-pub fn tool_names(permission: PermissionSnapshot) -> Vec<&'static str> {
-    if permission.level >= AgentLevel::ReadOnly {
-        TOOL_NAMES
-            .into_iter()
-            .filter(|name| *name != "get_thumbnail" || permission.thumbnails)
-            .filter(|name| *name != "get_transcript" || permission.transcripts)
-            .filter(|name| *name != "open_in_viewer" || permission.level >= AgentLevel::ReadAndOpen)
-            .filter(|name| !write(name) || permission.level >= AgentLevel::Organize)
-            .collect()
-    } else {
-        vec![]
-    }
-}
-pub fn tools_for(permission: PermissionSnapshot) -> Vec<Value> {
-    tools_named(&tool_names(permission))
-}
-pub fn tools_named(names: &[&str]) -> Vec<Value> {
-    tools()
-        .into_iter()
-        .filter(|tool| names.contains(&tool["name"].as_str().unwrap()))
-        .collect()
-}
 pub fn tools() -> Vec<Value> {
     TOOL_NAMES.into_iter().map(|name| {
         let description=match name {
@@ -474,6 +451,18 @@ pub fn tools() -> Vec<Value> {
             "get_transcript"=>"Read a saved mImageViewer (mIV) video/audio transcript; transcript permission required. start_secs: saved container-relative seconds (container start=0), not raw PTS; segments ending after start_secs. Cursor: same item; omit start_secs or repeat initial value; rev/epoch changes invalidate it. Whole segments; oversized text cut at UTF-8 boundary, text.truncated=true, then next segment. Missing/unpublished: none; old saved row remains readable while generating. States: present/none/failed/not_applicable. No generate/search/open.",
             _=>unreachable!(),
         };
+        let required = if write(name) {
+            "mImageViewer (mIV) Organize permission required."
+        } else if name == "open_in_viewer" {
+            "mImageViewer (mIV) Read and Open permission or higher required."
+        } else if name == "get_thumbnail" {
+            "mImageViewer (mIV) Read permission and thumbnail sharing required."
+        } else if name == "get_transcript" {
+            "mImageViewer (mIV) Read permission and transcript sharing required."
+        } else {
+            "mImageViewer (mIV) Read permission or higher required."
+        };
+        let description = format!("{required} {description}");
         let input=match name {
             "add_tags"|"remove_tags"=>object(json!({"items":{"type":"array","minItems":1,"maxItems":MAX_WRITE_ITEMS,"items":object(json!({"path":string()}),&["path"])},"tags":{"type":"array","minItems":1,"maxItems":MAX_WRITE_TAGS,"items":string()}}),&["items","tags"]),
             "set_rating"=>object(json!({"items":{"type":"array","minItems":1,"maxItems":MAX_WRITE_ITEMS,"items":object(json!({"path":string(),"subresource":nullable_string()}),&["path"])},"stars":{"type":"integer","minimum":0,"maximum":5}}),&["items","stars"]),

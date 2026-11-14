@@ -57,7 +57,7 @@ impl CallControl {
 }
 
 /// Adapter-local transport state is distinct from a reachable core's NotReady.
-/// Keep this off the agent wire: readiness errors must not advertise tools.
+/// Tool calls report these failures; static discovery never depends on reachability.
 #[derive(Debug)]
 pub enum BackendError {
     Unreachable,
