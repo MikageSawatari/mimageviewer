@@ -103106,12 +103106,12 @@ fn parent_row_for_item(
 
 /// Settings alone are used while preparing a new list; its previous mounted
 /// context (possibly Drive) must not affect the incoming cache namespace.
-fn configured_thumbnail_auto_crop(
+pub(crate) fn configured_thumbnail_auto_crop(
     settings: &crate::settings::Settings,
 ) -> Option<crate::cover_auto_crop::AutoCropIdentity> {
-    settings
-        .thumb_cover_auto_crop
-        .then(|| crate::cover_auto_crop::AutoCropIdentity::new(settings.default_reading_direction))
+    settings.thumb_cover_auto_crop.then(|| {
+        crate::cover_auto_crop::AutoCropIdentity::new(settings.thumb_cover_auto_crop_binding)
+    })
 }
 
 impl App {

@@ -1229,12 +1229,16 @@ mod tests {
     fn cover_auto_color_identity_follows_binding_and_manual_range_without_source_io() {
         let mut app = representative_app();
         let off = app.color_identity_for_idx(0).unwrap().0;
-        app.settings.default_reading_direction = crate::settings::ReadingDirection::Ltr;
+        app.settings.thumb_cover_auto_crop_binding = crate::settings::ReadingDirection::Ltr;
         assert_eq!(app.color_identity_for_idx(0).unwrap().0, off);
         app.settings.thumb_cover_auto_crop = true;
         let ltr = app.color_identity_for_idx(0).unwrap().0;
         assert_ne!(ltr, off);
         assert!(ltr.contains("|autocrop:v2:ltr"));
+        app.settings.default_reading_direction = crate::settings::ReadingDirection::Rtl;
+        assert_eq!(app.color_identity_for_idx(0).unwrap().0, ltr);
+        app.settings.default_reading_direction = crate::settings::ReadingDirection::Ltr;
+        assert_eq!(app.color_identity_for_idx(0).unwrap().0, ltr);
         let (_, request) = app.color_work_identity_for_idx(0).unwrap();
         assert_eq!(
             request.auto_cover_crop,
@@ -1242,7 +1246,7 @@ mod tests {
                 crate::settings::ReadingDirection::Ltr
             ))
         );
-        app.settings.default_reading_direction = crate::settings::ReadingDirection::Rtl;
+        app.settings.thumb_cover_auto_crop_binding = crate::settings::ReadingDirection::Rtl;
         assert_ne!(app.color_identity_for_idx(0).unwrap().0, ltr);
         let path = app.items[0].container_path().unwrap().to_owned();
         app.folder_pin_map.insert(
@@ -1258,7 +1262,7 @@ mod tests {
         );
         let manual = app.color_identity_for_idx(0).unwrap().0;
         assert!(!manual.contains("|autocrop:"));
-        app.settings.default_reading_direction = crate::settings::ReadingDirection::Ltr;
+        app.settings.thumb_cover_auto_crop_binding = crate::settings::ReadingDirection::Ltr;
         assert_eq!(app.color_identity_for_idx(0).unwrap().0, manual);
     }
 

@@ -16,6 +16,11 @@ use crate::ring_shortcut::{
 };
 use crate::settings::{Parallelism, Settings};
 
+fn cover_auto_crop_changed(before: &Settings, after: &Settings) -> bool {
+    crate::app::configured_thumbnail_auto_crop(before)
+        != crate::app::configured_thumbnail_auto_crop(after)
+}
+
 pub(crate) fn draw_same_name_folder_book_settings(
     ui: &mut egui::Ui,
     policy: &mut crate::same_name_folder_book::SameNameFolderBookPolicy,
@@ -2889,11 +2894,7 @@ impl App {
             let old_show_hidden_files = self.settings.show_hidden_files;
             let file_type_visibility_changed =
                 self.settings.file_type_visibility != state.settings.file_type_visibility;
-            let cover_auto_crop_changed = self.settings.thumb_cover_auto_crop
-                != state.settings.thumb_cover_auto_crop
-                || (state.settings.thumb_cover_auto_crop
-                    && self.settings.default_reading_direction
-                        != state.settings.default_reading_direction);
+            let cover_auto_crop_changed = cover_auto_crop_changed(&self.settings, &state.settings);
             let old_exif = self.settings.exif_hidden_tags.clone();
 
             let old_susie = (
@@ -5940,6 +5941,100 @@ mod tests {
         assert_eq!(
             db.load_into_settings().unwrap().thumb_show_type_icon,
             !initial
+        );
+    }
+
+    #[test]
+    fn thumb_cover_auto_crop_binding_reload_ignores_reading_direction_and_disabled_binding() {
+        use crate::settings::ReadingDirection::{Ltr, Rtl};
+        for enabled in [false, true] {
+            let before = Settings {
+                thumb_cover_auto_crop: enabled,
+                ..Settings::default()
+            };
+            let mut after = before.clone();
+            after.default_reading_direction = Rtl;
+            assert!(!cover_auto_crop_changed(&before, &after));
+            after.thumb_cover_auto_crop_binding = Ltr;
+            assert_eq!(cover_auto_crop_changed(&before, &after), enabled);
+            after.thumb_cover_auto_crop = !enabled;
+            assert!(cover_auto_crop_changed(&before, &after));
+        }
+    }
+
+    #[test]
+    fn thumb_cover_auto_crop_binding_preferences_disabled_ok_cancel_save_and_reopen() {
+        use crate::settings::ReadingDirection::{Ltr, Rtl};
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let mut harness = preferences_view_harness(PreferencesPage::Thumbnail);
+        let toggle = "つながった表紙から表表紙を自動で切り出す (書庫・PDF の本)";
+        for label in ["右綴じ", "左綴じ"] {
+            assert!(harness.get_by_label(label).accesskit_node().is_disabled());
+        }
+        harness.get_by_label(toggle).scroll_to_me();
+        harness.run_steps(3);
+        harness.get_by_label(toggle).click();
+        harness.run_steps(3);
+        for label in ["右綴じ", "左綴じ"] {
+            assert!(!harness.get_by_label(label).accesskit_node().is_disabled());
+        }
+        harness.get_by_label("左綴じ").scroll_to_me();
+        harness.run_steps(3);
+        harness.get_by_label("左綴じ").click();
+        harness.run_steps(3);
+        assert_eq!(harness.state().settings.thumb_cover_auto_crop_binding, Rtl);
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        let db = crate::settings_db::SettingsDb::open(harness.state().tmp.path()).unwrap();
+        assert_eq!(harness.state().settings.thumb_cover_auto_crop_binding, Ltr);
+        assert_eq!(
+            db.load_into_settings()
+                .unwrap()
+                .thumb_cover_auto_crop_binding,
+            Ltr
+        );
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Thumbnail);
+        harness.run_steps(3);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .thumb_cover_auto_crop_binding,
+            Ltr
+        );
+        harness.get_by_label("右綴じ").scroll_to_me();
+        harness.run_steps(3);
+        harness.get_by_label("右綴じ").click();
+        harness.run_steps(3);
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(3);
+        harness.get_by_label("破棄して閉じる").click();
+        harness.run_steps(3);
+        assert_eq!(harness.state().settings.thumb_cover_auto_crop_binding, Ltr);
+        assert_eq!(
+            db.load_into_settings()
+                .unwrap()
+                .thumb_cover_auto_crop_binding,
+            Ltr
+        );
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Thumbnail);
+        harness.run_steps(3);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .thumb_cover_auto_crop_binding,
+            Ltr
         );
     }
 

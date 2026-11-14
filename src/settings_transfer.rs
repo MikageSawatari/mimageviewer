@@ -330,6 +330,7 @@ preferences_policy! {
         folder_thumb_sort: SortOrder => ("フォルダ代表画像の選定順", |v, _raw| matches!(v, SortOrder::FileName | SortOrder::Numeric | SortOrder::DateAsc | SortOrder::DateDesc), plain, plain);
         folder_thumb_depth: u32 => ("フォルダ代表画像の探索深さ", |v, _raw| (0..=10).contains(v), plain, plain);
         thumb_cover_auto_crop: bool => ("つながった表紙の自動切り出し", |_, _| true, plain, plain);
+        thumb_cover_auto_crop_binding: ReadingDirection => ("表紙の自動切り出しの綴じ方向", |_, _| true, plain, plain);
         folder_skip_limit: usize => ("画像なしフォルダを飛ばす上限", |v, _raw| (1..=30).contains(v), plain, plain);
         edit_restore_prompt_enabled: bool => ("編集の復元確認", |_, _| true, plain, plain);
         sidecar_backup_enabled: bool => ("編集データのサイドカーバックアップ", |_, _| true, plain, plain);
@@ -1290,6 +1291,10 @@ mod tests {
             30
         };
         settings.thumb_cover_auto_crop = !settings.thumb_cover_auto_crop;
+        settings.thumb_cover_auto_crop_binding = different_enum(
+            &settings.thumb_cover_auto_crop_binding,
+            &[ReadingDirection::Rtl, ReadingDirection::Ltr],
+        );
         settings.edit_restore_prompt_enabled = !settings.edit_restore_prompt_enabled;
         settings.sidecar_backup_enabled = !settings.sidecar_backup_enabled;
         settings.tag_sidecar_backup_enabled = !settings.tag_sidecar_backup_enabled;
@@ -2078,6 +2083,41 @@ mod tests {
     }
 
     #[test]
+    fn thumb_cover_auto_crop_binding_transfer_roundtrip_missing_invalid() {
+        for binding in [ReadingDirection::Rtl, ReadingDirection::Ltr] {
+            let source = Settings {
+                thumb_cover_auto_crop_binding: binding,
+                ..Settings::default()
+            };
+            let mut destination = Settings {
+                thumb_cover_auto_crop_binding: if binding == ReadingDirection::Rtl {
+                    ReadingDirection::Ltr
+                } else {
+                    ReadingDirection::Rtl
+                },
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.thumb_cover_auto_crop_binding, binding);
+            parse_preferences(&document(json!({})))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.thumb_cover_auto_crop_binding, binding);
+            for invalid in [json!("right"), json!(true), json!(1), Value::Null] {
+                let report =
+                    parse_preferences(&document(json!({"thumb_cover_auto_crop_binding": invalid})))
+                        .unwrap()
+                        .apply_to(&mut destination);
+                assert_eq!(report.issues.len(), 1);
+                assert_eq!(destination.thumb_cover_auto_crop_binding, binding);
+            }
+        }
+    }
+
+    #[test]
     fn thumb_show_type_icon_transfer_roundtrip_missing_invalid() {
         for enabled in [false, true] {
             let source = Settings {
@@ -2199,13 +2239,13 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 495);
+        assert_eq!(entries.len(), 496);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            159
+            160
         );
         assert_eq!(
             entries
@@ -2241,7 +2281,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 157);
+        assert_eq!(wire.len(), 158);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);

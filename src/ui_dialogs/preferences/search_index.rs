@@ -2300,7 +2300,7 @@ mod tests {
 
     #[test]
     fn thumb_cover_auto_crop_search_finds_its_anchor() {
-        for query in ["表表紙", "表紙 切り出し", "綴じ方向 書庫"] {
+        for query in ["表表紙", "表紙 切り出し", "綴じ方向", "綴じ方向 書庫"] {
             let entry = search_preferences(query, test_tree_position)
                 .into_iter()
                 .find(|entry| entry.anchor == "thumbnail/cover-auto-crop")

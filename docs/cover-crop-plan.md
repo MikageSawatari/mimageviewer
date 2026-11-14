@@ -1321,3 +1321,42 @@ r2 = REVISE (P2 1 件、ほかは r1 の指摘を閉じた)。v2 キーで `auto
 - キー: 新しい設定から `rtl`・`ltr` の識別子が作られ、`default_reading_direction` を変えてもキーが変わらない (一覧・レーティング・範囲画面の各経路)。
 - 評価 (設計担当、Git 管理外・件数だけ): 利用者の正例 17 冊を右綴じで流して good 9・誤り 0 (§22.4)。§23.1 の誤りの 1 冊は、
   右綴じでは正しい側を切る (IoU 0.99、good)。判定そのものは変えないので、実装後の再評価は要らない。
+
+### 23.5 実装記録 (2026-11-14)
+
+- `Settings::thumb_cover_auto_crop_binding`を追加し、`Settings::default`とserdeの欠落時の値をともに`Rtl`にした。
+  保存は既存の`settings_kv`経路、設定転送は既存の項目定義に追加した。横連結の値の引き継ぎ・DBの移行は設けない。
+- `configured_thumbnail_auto_crop`を一覧・レーティング・範囲画面で共用する。`BookCoverEnv`の自動専用だったON/OFFと読み方向の2 fieldは、
+  同helperが返す`Option<AutoCropIdentity>`を捕捉する形に置き換え、workerはそのbindingで判定する。
+  判定の内容とキーの綴りは変えず、v2を維持する。OFF・手動・ドライブ・Remoteの区別も既存のまま。
+- レーティングを実際のApp入口まで確認したところ、`thumbnail_source_discovery_snapshot`が自動のON/OFFを捕捉しておらず、
+  workerの存続キーがOFFの既定値になることを確認した。指定のレーティング経路を成立させるため、この既存の軽量コピーにもON/OFFと新しいbindingを渡す。
+  回帰テストはliveなSettingsを直接workerへ渡さず、このコピーを通して両方向の存続キーを検査する。
+- 環境設定の同じanchorに「綴じ方向:」のradio（右綴じ／左綴じ）を追加し、OFFでは無効にした。
+  再読み込みの条件は共通helperの結果の変化で比較し、OFF中のbinding変更と横連結の変更は自動の読み直しを起こさない。
+  検索keywordは既に同anchorに「綴じ方向」があったため、単独語でも当たる回帰を追加した。
+- `default_reading_direction`と「横連結」の参照を確認した。自動用の読み取りは残さず、閲覧・見開き・Remoteの通常用途は維持した。
+  範囲画面の補足文には既に横連結への言及が無かった。公開文書は`grid.html`に加え、同じ説明が残っていた`settings.html`と`migrate-zippla.html`を更新した。
+- 変更パス（snapshotと検証結果は後記）:
+  `src/settings.rs`、`src/settings_transfer.rs`、`src/app.rs`、`src/app/book_cover.rs`、`src/app/cover_auto_tests.rs`、`src/app/color_filter.rs`、
+  `src/rating_view.rs`、`src/ui_dialogs/cover_crop.rs`、`src/ui_dialogs/preferences.rs`、`src/ui_dialogs/preferences/pages.rs`、
+  `src/ui_dialogs/preferences/search_index.rs`、`htdocs/mimageviewer/manual/grid.html`、`htdocs/mimageviewer/manual/settings.html`、
+  `htdocs/mimageviewer/migrate-zippla.html`、本書、`docs/next-release-backlog.md`。
+- 追加したテスト:
+  - `thumb_cover_auto_crop_binding_default_missing_and_db_roundtrip`
+  - `thumb_cover_auto_crop_binding_transfer_roundtrip_missing_invalid`
+  - `thumb_cover_auto_crop_binding_reload_ignores_reading_direction_and_disabled_binding`
+  - `thumb_cover_auto_crop_binding_preferences_disabled_ok_cancel_save_and_reopen`
+  - `cover_auto_binding_is_shared_by_list_and_dialog_independent_of_reading_direction`
+  - `cover_auto_rating_prepare_uses_binding_snapshot_and_ignores_reading_direction`
+  既存の`cover_auto_color_identity_follows_binding_and_manual_range_without_source_io`、ZipDirの存続集合・collectionの再利用key、
+  `thumb_cover_auto_crop_search_finds_its_anchor`も、新しい設定の変更と横連結からの独立性を検査する。
+- 焦点nextestは共有runner（`773 s23`）経由で189件成功。
+  filterは`cover_auto|cover_crop|settings_transfer|representative_cache_key|thumb_.*preferences|container_icon_kinds_preferences`。
+  設定転送の項目数の固定値は、新しい許可項目1つ分だけ増やした（分類496・許可160・wire 158、除外336は不変）。
+- snapshotは`UPDATE_SNAPSHOTS=1`で`preferences_favorite_view_state_dark`だけを更新した。
+  変更PNGは`tests/snapshots/preferences_favorite_view_state_dark.png`の1枚（専用の綴じ方向のradioと補足文）。
+  更新指定を外した`cargo test -p mimageviewer --test ui_snapshot`は257件成功。他のPNGの変更はない。
+- `cargo fmt`・`git diff --check`・`python scripts/check_ui_glyphs.py`は成功（危険glyphなし）。
+  新規ファイルはない。UIスレッドの新しい同期I/O・detached経路の変更・判定ロジックの変更はなく、
+  評価フォルダ／利用者データの使用、製品起動、build-dev、lib全件、コミット、追加の独立レビューは行っていない。

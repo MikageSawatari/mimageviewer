@@ -1432,7 +1432,22 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
             &mut state.settings.thumb_cover_auto_crop,
             "つながった表紙から表表紙を自動で切り出す (書庫・PDF の本)",
         );
-        ui.small("閲覧表示の横連結の方向で判定します。手動で指定した範囲を優先し、判定できない表紙は全体を表示します。");
+        ui.add_enabled_ui(state.settings.thumb_cover_auto_crop, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("綴じ方向:");
+                ui.radio_value(
+                    &mut state.settings.thumb_cover_auto_crop_binding,
+                    settings::ReadingDirection::Rtl,
+                    "右綴じ",
+                );
+                ui.radio_value(
+                    &mut state.settings.thumb_cover_auto_crop_binding,
+                    settings::ReadingDirection::Ltr,
+                    "左綴じ",
+                );
+            });
+        });
+        ui.small("表表紙の側はこの綴じ方向で判定します。手動で指定した範囲を優先し、判定できない表紙は全体を表示します。");
     });
     anchored(ui, state, "thumbnail/name-font-scale", |ui, state| {
         ui.horizontal_wrapped(|ui| {

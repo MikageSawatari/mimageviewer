@@ -546,7 +546,10 @@ fn prepare_cover_inner(
             .oriented(source)
         }
     };
-    let auto_enabled = env.thumb_cover_auto_crop && container.kind != BookKind::Folder;
+    let auto_crop = env
+        .auto_cover_crop
+        .filter(|_| container.kind != BookKind::Folder);
+    let auto_enabled = auto_crop.is_some();
     let has_edit_preview = auto_enabled
         && cover.cover_crop.is_none()
         && cover
@@ -583,11 +586,9 @@ fn prepare_cover_inner(
                 }
                 .is_some()
             });
-    let auto_crops = if auto_enabled
-        && cover.cover_crop.is_none()
-        && !has_edit_preview
-        && !cancel.load(Ordering::Relaxed)
-    {
+    let auto_crops = if let Some(auto) = auto_crop.filter(|_| {
+        cover.cover_crop.is_none() && !has_edit_preview && !cancel.load(Ordering::Relaxed)
+    }) {
         let page_aspect = match &cover.location {
             ReadLocation::ArchiveEntry { archive, entry } => {
                 crate::cover_auto_sample::sample_zip_page_aspect(
@@ -648,7 +649,7 @@ fn prepare_cover_inner(
                 &analysis.image,
                 analysis.native_dims,
                 page_aspect,
-                env.default_reading_direction,
+                auto.binding,
             )),
             Err(error) => {
                 crate::logger::log(format!("cover crop dialog analysis failed: {error}"));

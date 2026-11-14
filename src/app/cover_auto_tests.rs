@@ -329,11 +329,45 @@ fn cover_auto_folder_seeded_pin_stays_outside_automatic_namespace() {
 }
 
 #[test]
+fn cover_auto_binding_is_shared_by_list_and_dialog_independent_of_reading_direction() {
+    let mut app = super::tests::phase_c_support::setup_app();
+    let item = GridItem::ZipFile(app.tmp.path().join("book.zip"));
+    app.settings.thumb_cover_auto_crop = true;
+    for binding in [ReadingDirection::Rtl, ReadingDirection::Ltr] {
+        app.settings.thumb_cover_auto_crop_binding = binding;
+        let expected = Some(AutoCropIdentity::new(binding));
+        let mut previous = None;
+        for reading in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
+            app.settings.default_reading_direction = reading;
+            assert_eq!(app.thumbnail_auto_crop_identity(), expected);
+            let dialog = app.book_cover_env();
+            assert_eq!(dialog.auto_cover_crop, expected);
+            let req = request(&item, &HashMap::new(), app.thumbnail_auto_crop_identity());
+            let key = crate::thumb_loader::cache_key_for_request(&req)
+                .unwrap()
+                .into_owned();
+            assert_eq!(req.auto_cover_crop, expected);
+            assert_eq!(
+                key,
+                format!("zipthumb:book.zip|autocrop:{}", expected.unwrap().suffix())
+            );
+            if let Some(previous) = previous {
+                assert_eq!(key, previous);
+            }
+            previous = Some(key);
+        }
+    }
+    app.settings.thumb_cover_auto_crop = false;
+    assert!(app.thumbnail_auto_crop_identity().is_none());
+    assert!(app.book_cover_env().auto_cover_crop.is_none());
+}
+
+#[test]
 fn cover_auto_drive_guard_does_not_leak_into_incoming_list_settings() {
     let mut app = super::tests::phase_c_support::setup_app();
     assert!(app.thumbnail_auto_crop_identity().is_none());
     app.settings.thumb_cover_auto_crop = true;
-    app.settings.default_reading_direction = ReadingDirection::Ltr;
+    app.settings.thumb_cover_auto_crop_binding = ReadingDirection::Ltr;
     let expected = Some(AutoCropIdentity::new(ReadingDirection::Ltr));
     assert_eq!(app.thumbnail_auto_crop_identity(), expected);
     app.items_are_drive_list = true;
@@ -477,7 +511,7 @@ fn cover_auto_zipdir_pinned_and_unpinned_rows_survive_current_binding_only() {
     for crop in [None, CoverCrop::new([0, 0, 500_000, 1_000_000]).unwrap()] {
         pin_db.set_with_cover_crop(&owner, &source, crop).unwrap();
         for direction in [ReadingDirection::Rtl, ReadingDirection::Ltr] {
-            app.settings.default_reading_direction = direction;
+            app.settings.thumb_cover_auto_crop_binding = direction;
             let enumeration = crate::zip_loader::PreparedZipEnumeration::prepare(
                 zip.clone(),
                 crate::zip_loader::ZipEnumeration {
@@ -653,11 +687,13 @@ fn cover_auto_collection_source_digest_and_reuse_follow_enabled_binding() {
         )
     };
     let off = reuse(&settings);
-    settings.default_reading_direction = ReadingDirection::Ltr;
+    settings.thumb_cover_auto_crop_binding = ReadingDirection::Ltr;
     assert_eq!(reuse(&settings), off);
     settings.thumb_cover_auto_crop = true;
     let ltr = reuse(&settings);
     assert_ne!(ltr, off);
     settings.default_reading_direction = ReadingDirection::Rtl;
+    assert_eq!(reuse(&settings), ltr);
+    settings.thumb_cover_auto_crop_binding = ReadingDirection::Rtl;
     assert_ne!(reuse(&settings), ltr);
 }

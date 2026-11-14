@@ -363,11 +363,7 @@ fn prepare_rating_view(
                 options.folder_thumb_depth,
                 true,
                 &options.visibility,
-                options.sidecar_settings.thumb_cover_auto_crop.then(|| {
-                    crate::cover_auto_crop::AutoCropIdentity::new(
-                        options.sidecar_settings.default_reading_direction,
-                    )
-                }),
+                crate::app::configured_thumbnail_auto_crop(&options.sidecar_settings),
             )
         })
         .collect();
@@ -850,6 +846,68 @@ mod tests {
             edits: Default::default(),
             tags_db_path: None,
             sidecar_settings: Default::default(),
+        }
+    }
+
+    #[test]
+    fn cover_auto_rating_prepare_uses_binding_snapshot_and_ignores_reading_direction() {
+        use crate::settings::ReadingDirection::{Ltr, Rtl};
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let zip = temp.path().join("book.zip");
+        write_zip_entries(&zip, &["cover.jpg"]);
+        let db_path = temp.path().join("rating.db");
+        let db = crate::rating_db::RatingDb::open_at(&db_path).unwrap();
+        let key = crate::path_key::normalize_keep_drive(&zip);
+        db.set_user_rating(
+            &key,
+            3,
+            Some(
+                &crate::rating_db::RatingMeta::new(RatingItemKind::ZipFile).with_source_path(&zip),
+            ),
+        )
+        .unwrap();
+        drop(db);
+        for binding in [Rtl, Ltr] {
+            let mut previous = None;
+            for reading in [Ltr, Rtl] {
+                let settings = crate::settings::Settings {
+                    thumb_cover_auto_crop: true,
+                    thumb_cover_auto_crop_binding: binding,
+                    default_reading_direction: reading,
+                    ..Default::default()
+                };
+                let mut options = membership_options(Default::default());
+                // Match App's capture at the rating worker boundary, rather
+                // than passing the live Settings directly.
+                options.sidecar_settings = settings.thumbnail_source_discovery_snapshot();
+                let prepared =
+                    prepare_rating_view(db_path.clone(), 3, options, &AtomicBool::new(false))
+                        .unwrap()
+                        .prepared
+                        .unwrap();
+                let expected = format!(
+                    "zipthumb:{}|autocrop:{}",
+                    zip.display(),
+                    crate::cover_auto_crop::AutoCropIdentity::new(binding).suffix()
+                );
+                assert!(
+                    prepared.existing_keys.contains(&expected),
+                    "missing {expected}: {:?}",
+                    prepared.existing_keys
+                );
+                let other = if binding == Rtl { Ltr } else { Rtl };
+                let stale = format!(
+                    "zipthumb:{}|autocrop:{}",
+                    zip.display(),
+                    crate::cover_auto_crop::AutoCropIdentity::new(other).suffix()
+                );
+                assert!(!prepared.existing_keys.contains(&stale));
+                if let Some(previous) = previous {
+                    assert_eq!(prepared.existing_keys, previous);
+                }
+                previous = Some(prepared.existing_keys);
+            }
         }
     }
 
