@@ -445,6 +445,393 @@ P2-2の不変条件は「未確定時の代替位置と利用者が選んだ位�
 
 新規warningなし（既存lib test warning153件）。指定により全lib・全snapshot・build-dev・製品起動・コミットは行わない。
 
+## 12. §1.769 フォルダ名のダブルクリックで開閉する (2026-11-11 設計、ClaudeCode)
+
+5ch >>764 の要望。ツリー行のフォルダ名 (label) のダブルクリックを、既存の ▶ / ▼ と同じ開閉処理 (`handle_tree_key(Left/Right)`) につなぐ。単クリックでそのフォルダへ移る動作 (`resp.clicked()` → pane navigation) は変えない。新しい列挙経路・新しい scan 要求は作らない。
+
+### 12.1 egui のクリック回数と、守ること
+
+- egui 0.37 は 2 回目のボタンを離した frame で、同じ label の `clicked()` と `double_clicked()` を両方立てる (`Click::count`、0.3 秒以内かつ 6pt 以内)。3 回目は `triple_clicked()`、それ以降の速い連打も count 3 のまま。行の高さは 24pt なので、別の行どうしで count 2 になるのは行境界の ±6pt に限られる。
+- 守ること: (1) 1 回目のクリックは従来どおり即時に移動する (移動を 0.3 秒遅らせて単クリック確定を待つ案は、リリース済みの単クリックを遅くするので採らない)。(2) 同じ行の 2 回目・3 回目のクリックでは移動を出さない。読み込み中の同じフォルダに 2 回目の移動を出すと `start_folder_open_scan` が pending を取り消して scan をやり直すため。(3) 開閉はダブルクリック 1 回につき 1 回だけ。
+
+### 12.2 開閉の向きは 1 回目のクリック時点の表示で決める
+
+2 回目のクリック時点の表示を反転するだけ (状態を持たない案) では、現在地の祖先として自動で開いている枝をダブルクリックしたとき結果が速さで変わる。1 回目のクリックでその枝へ移る移動が 2 回目より先に終わると、`sync_to_active` の現在地変更で `auto_expanded` / `user_collapsed` が消え、その枝は閉じて見える (既存の挙動、現在地自身は自動展開しない)。2 回目で反転すると開き直ってしまい、閉じたかった利用者の意図と逆になる。移動が後に終わる場合は閉じたまま。
+
+そこで、単クリックとして扱ったクリックの時点で「どの行を、開いていたか」を 1 件だけ記録し、同じ行のダブルクリックでは「1 回目の時点の逆」を目標にして、今の表示と違うときだけ既存の開閉を 1 回呼ぶ (目標どおりなら何もしない)。
+
+- 記録: `FolderPaneState` に一時的な 1 件 (行の path、1 回目の時点の `row.expanded`、egui の時刻、開閉済みか)。保存しない。
+- 単クリック扱い (count 1、または count 2/3 でも時間内の記録が無い): 従来の処理 (focus、cursor、現在地と違えば移動) をして記録を置き換える。
+- **count 2 / 3 は、当たった行ではなく記録した行 (1 回目の行) に結びつける** (2026-11-12 改訂、サブ PC の実機確認 依頼 40 で判明)。1 回目のクリックは既存の作り (v5.1.0 から) で `set_cursor` が cursor の reveal を要求し、次のフレームで `scroll_to_me(Align::Center)` が行を中央へ寄せる (`animated(false)` なので一瞬)。人の手のダブルクリックの間 (0.1〜0.2 秒) に必ず動くので、egui が count 2 と判定する同じ画面位置の 2 回目は、中央へ来た別の行に当たる。また 1 回目の移動が完了すると、前の現在地の祖先の自動展開が閉じて、クリックした行より上の行が減ることがある (既存の作り)。どちらも画面上の行がずれるだけで、利用者の意図は 1 回目の行のダブルクリックなので、2 回目は当たった行を見ずに記録の行へ適用する。中央へ寄せる既存の動き自体は変えない (変えるかは利用者に別途確認する、案 A)。
+  - これにより、行境界の ±6pt で「A をクリック→すぐ B をクリック」は egui 上 A のダブルクリックなので A の開閉になり、B へは移らない (r1 指摘 2 で入れた「B へ移って B を開閉」は廃止)。行の中央どうし (24pt 離れる) なら egui は count 1 なので、従来どおり B へ移る。
+  - 記録の行が今の表示行に無い (親が閉じた等) 場合は、移動も開閉もせず、cursor も動かさない。
+- 記録と一致する count 2 / 3 で、記録がまだ開閉済みでないとき: 移動しない。focus と cursor は記録の行。目標が「開く」で、記録の行が今閉じていて開ける (▶ と同じ条件 `row.expanded || row.has_children_or_unknown`。現状は常に開ける) なら `Right`、目標が「閉じる」で今開いていれば `Left`。今の開閉状態は当たった行ではなく記録の行のもの (`FolderPaneState` 内で求める)。それ以外は何もしない。記録を開閉済みにする。count 3 も含めるのは、時間内の別の count 1 の直後など、egui の count 3 が最初の一致になる並びを取りこぼさないため (独立レビュー r1 指摘 2 の名残)。
+- 記録と一致する count 2 / 3 で、記録が開閉済みのとき: 移動も開閉もしない。
+- 一致の条件 (2026-11-12 改訂で path の一致は外した): egui の count が 2 / 3、かつ記録の時刻 (直前の一致したクリックの時刻) から egui の `max_double_click_delay` の 2 倍以内。一致したクリックごとに記録の時刻を更新し、1 回目の時点の展開状態は保つ (更新しないと、0.25 秒間隔の 4 連打目で記録が期限切れになり単クリック扱いで移動を出し直す。独立レビュー r1 指摘 1)。▶ / ▼ をクリックしたら記録を消す (▶ と label の境界をまたいだ count 2 を label のダブルクリックと取り違えない)。
+- 判定と記録は `folder_pane.rs` の純粋な関数に置き、UI 側は count・行の状態・時刻を渡して結果 (移動するか、どちらへ開閉するか) を受け取る。開閉は ▶ / ▼ と同じ helper を通す (開閉の書き手を 1 つにする)。
+
+### 12.3 確かめる組み合わせ (handler-level test)
+
+既存の `navigation_tree_frame` 形式で実際の pointer event を流す。
+
+1. 閉じた枝 (現在地以外) のダブルクリック: 移動は 1 回 (1 回目の pending の取消 token が立たず、2 回目で新しい pending が作られない)、枝は開く。
+2. ユーザーが開いた枝のダブルクリック: 移動 1 回、閉じる。
+3. 現在地の祖先 (自動で開いている枝) のダブルクリック: 2 回のクリックの間に移動が完了する場合と、両方のクリックの後に完了する場合の両方で、最後は閉じている。
+4. 現在地の行のダブルクリック: 移動なし、開閉 1 回。
+5. 子の無いフォルダ (確定済みで空): §1.686 以降は空の枝にも常に ▶ / ▼ が出て開閉できる (`has_children_or_unknown` は常に true、外部で子が増えたときに開き直して確かめるため)。ダブルクリックも ▶ と同じく開閉 1 回 (子の行は出ない)、移動 1 回。空の枝だけ特別扱いしない。
+6. 3 回の連打: 移動 1 回、開閉 1 回。
+7. 0.3 秒を超えた 2 回のクリック: 従来の単クリック 2 回 (開閉なし)。
+8. 行境界 ±6pt で別の行を続けてクリック: (2026-11-12 改訂) egui が count 2 なら 1 行目のダブルクリック (1 行目の開閉、2 行目へは移らない)。行の中央どうし (6pt 超) なら 2 行目へ普通に移る。
+9. ▶ / ▼ のクリック、矢印キー・Enter の従来の動作 (既存のテストを含めて退行がない)。
+10. (2026-11-12 追加) **ツリーがスクロールする高さ**で、中央にない行をダブルクリック: 1 回目の後に行が中央へ動き、同じ画面位置の 2 回目が別の行に当たることを実 egui の count 2 と行の位置で確認する。移動は 1 回目の行へ 1 回だけ (pending の取消・置換なし)、1 回目の行が 1 回だけ開閉し、2 回目に当たった行は移動も開閉もしない。3 回の連打も同じ。
+11. (2026-11-12 追加) 1 回目の移動が 2 回目の前に完了し、前の現在地の祖先の自動展開が閉じて行が上へずれる場合: 1 回目の行が開閉し、ずれて当たった行へは移らない。
+
+まれな失敗は既定の割り切り方針による (この変更には書き込み・永続化がない)。★固定中はペイン全体が disabled のまま。
+
+### 12.4 状態を増やさない案の検討
+
+- 単クリックの移動をダブルクリック判定まで遅らせる: 単クリックが毎回遅くなるリリース済み挙動の退行なので採らない。
+- 移動完了で現在地の展開状態を保つように既存の展開規則を変える: 範囲外で、他の移動 (Ctrl+↑↓ など) の見え方も変わるので採らない。
+- 上の 1 件の記録は、egui が count 2 以上と判定したときだけ参照し、利用者に見える状態や保存データにはならない。組み合わせは「単クリック扱い / 一致した count 2 / 一致した count 3」の 3 通りに限る。
+
+### 実装記録 (2026-11-12、`bdd537a48` 上の未コミット差分)
+
+| 項目 | 実装・確認方法 |
+| --- | --- |
+| §12.1 | label の `clicked()` 内で triple → double → single の優先順で回数を渡す。単クリックは従来の即時 navigation、一致した 2/3 回目は navigation を出さない |
+| §12.2 | `FolderPaneState::handle_label_click` が path・初回 expanded・egui time・処理済みの一時記録 1 件を所有する。path は `folder_tree::path_eq`、時刻は実際の `max_double_click_delay` の 2 倍以内で照合。初回表示の逆を目標とし、現在表示と異なる時だけ Left/Right を返す |
+| 開閉の共通化 | ▶ / ▼ と label の開閉を `apply_folder_pane_branch_click` へ合流。既存の focus/cursor と `handle_tree_key` を使う。矢印 click は label 記録を消す。空の枝にも同じ「開けるか」の条件を渡す |
+| §12.3 | 純粋判定 5 件と実 pointer handler 10 件を追加。祖先への移動の前後完了を別試験とし、pending receiver を一時保持して cancel token / `Arc::ptr_eq`、最終現在地・枝の状態・子行を検査する。移動完了待ちは egui time を進めずに既存 navigation 裁定・採用を poll する |
+| §12.4・範囲 | 記録は永続化しない。新しい列挙経路・scan 要求・repaint・delay・retry・UI 同期 I/O は追加しない。▶ / ▼・矢印キー・Enter の処理と disabled gate は維持 |
+| 文書 | `docs/spec.md` と `manual/tut-navigation.html` を更新。公開ページを検索した範囲では、同じフォルダツリーのマウス操作を記述した他ページは見つからず、追加変更なし。backlog §1.769 の状態行は変更しない |
+
+検証は Windows MSVC / default features。初回の TurboJPEG 自動 CMake build は exit 1 で停止し、Rust test build は exit 101 (試験開始前)。同じ crate 同梱ソースを本 worktree の `target/769-native/source` へ実コピーし、SIMD 有効・Release `/MT`・直列で静的 build した。`turbojpeg.lib` / `turbojpeg-static.lib` とヘッダを `target/769-native/` に配置し、検証プロセスだけ explicit library と通常形式の include path を使う (`target/769-env.ps1`)。製品の依存設定・build script は変更しない。準備途中の LibRaw library/header 配置不足による exit 101 は成功根拠に含めない。
+
+途中の test compile は `InputState::options` が非公開のため exit 101。間隔の取得を公開の `Context::options` へ補正し、その後の core check は成功した。最初に実行できた追加 filter は **15件中12成功/3失敗、exit 100** (`769-added-tests-pass.log`)。祖先 2 件は arbitration fixture が意図的に subtree を drive として選び自動 reveal を抑止していた setup 不備、行境界 1 件は距離が egui の strict `< 6pt` の上限ちょうどになった setup 不備。祖先は既存の synthetic-ancestor/real-subtree backend を実 drive root で使い、境界は行内 0.1pt の点で strict 上限内に補正した。製品コードによる対処や仕様変更は行っていない。
+
+次の追加 filter は **13成功/2失敗、exit 100** (`769-added-tests-final.log`)。実 drive の長い祖先経路を使ったことで、小さい setup viewport と pointer 用 viewport の間で cursor reveal の hit target が変わる fixture 不備が残った。クリック前に B の cursor reveal を pointer 用の 1600×600 viewport で消化させ、2 回目が B の実 response の `double_clicked()` に届いたことも検査するよう補正した。最終追加 filter は **15成功/失敗0、3.441秒、exit 0**。製品コードの追加変更はない。
+
+| 検証コマンド | 結果 | 証跡 (`target/`) |
+| --- | --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/label_click/) \| test(/folder_pane_label/)' --no-fail-fast` | **15成功/失敗0、3.441秒、exit 0** | `769-added-tests-stable.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/folder_pane/)' --no-fail-fast` | **104成功/失敗0、24.803秒、exit 0** | `769-folder-filter.log` |
+| `scripts/test-focused.ps1 -Path @('src/folder_pane.rs','src/ui_folder_pane.rs','src/app/folder_pane_refresh_tests.rs')` | **50 / 18 / 50 件すべて成功、計118実行 (重複あり)、exit 0** | `769-focused.log`、`test-focused/runs/20261111T155821843Z-9838ebb3` / `20261111T155831717Z-172044d5` / `20261111T155841206Z-15d1f67f` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **exit 0、4分07秒**。既存 warning あり | `769-check.log` |
+| `cargo test --test ui_snapshot folder_pane` | **4成功/失敗0、1.37秒、exit 0**。基準画像更新なし | `769-snapshot.log` |
+| 引数なし `cargo fmt` / `cargo fmt --check` / `git diff --check` | **各 exit 0** | `769-fmt.log` / `769-fmt-check.log` / `769-diff-check.log` |
+| `scripts/build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0` | 初回 **exit 101**、並列数 1 の再実行は **exit 0**。通常 features / dev-runtime で core・remote・EPUB worker・MCP・music-video editor の5本を生成。runtime 4本 / PE 5本の検査成功。起動なし | `769-build-dev.log` / `769-build-dev-serial.log`、`vcrt-pe-reports/dev-runtime.json` |
+
+UI 文字列は変更していないため UI glyph 検査は対象外。全 lib gate は設計担当へ引き継ぎ、ここでは実行しない。製品バイナリ起動・実機操作・コミットは行わない。修正済み §12 からの設計変更はない。
+
+確認用 build の初回は依存 `inventory` の rustc 起動が `0xc0000142 (STATUS_DLL_INIT_FAILED)` で失敗し、wrapper は exit 101。製品ソースの compile error ではない。source / feature / profile は変えず、同じ native 環境に `CARGO_BUILD_JOBS=1` を指定して一度再実行し成功した。core の Cargo build は依存込み41分50秒、remote 3分20秒。成果物は `target/dev-runtime/mimageviewer-core.exe` と上記 companion 4本。通常 `%APPDATA%/mimageviewer` profile を既定とする非 portable build であり、エージェントによる起動・既存 process の停止は行っていない。
+
+### 独立レビュー r1 対応 (2026-11-12、`2f82b8b74` 上の未コミット差分)
+
+設計担当が受理した P2 2件と、同 commit で改訂された §12.2 に対応する。
+
+| 指摘 | 原因・修正 |
+| --- | --- |
+| P2-1：長い連打で同じフォルダの移動を再発行 | 記録時刻が最初のクリックのままで、0 / 0.25 / 0.50 / 0.75 秒の4回目を `Single` としていた。一致した count 2 / 3 のたびに既存の `record.time` を更新する。初回の `expanded` は保持する |
+| P2-2：A→Bダブルクリックの B が開閉しない | egui の count は 1(A)→2(B)→3(B)。B の最初の count 2 は path 不一致で単クリック扱いとなるため、次の count 3 が B の開閉を担当する必要がある。回数の `count == 2` 制限を除き、一致したクリックのうち `!record.toggled` の最初の1回だけ既存の目標状態判定を行う。目標どおりで開閉不要の場合も処理済みにする |
+
+変更は判定 owner の時刻更新と既存 `toggled` の利用だけ。UI renderer、共通の開閉 helper、path 同一性、開ける条件、単クリックの即時移動、scan / repaint / I/O / 永続化は変更しない。追加状態・新しい列挙経路はない。公開マニュアルの操作仕様はそのまま成立し、UI 文字列の変更もない。
+
+製品コードを直す前に、新規の純粋判定2件と実 pointer handler 2件、および既存テストの count 列の補正を先に用意し、新規4件だけを選択して実行した。**4件実行 / 0成功 / 4失敗、exit 100、1.488秒** (`target/769-r1-red.log`)。純粋判定は 0.75秒で `Single` が返ることと、B の count 3 が `Repeated(None)` になることで失敗。handler は egui の count 列を確認した後、長い連打の4回目で最初の cancel token が立つことと、B の count 3 後も枝が閉じていることで失敗した。compile / fixture の準備失敗を再現根拠にしていない。この結果を確認してから製品コードを修正した。
+
+| テスト | 検査内容 |
+| --- | --- |
+| `label_click_r1_long_sequence_keeps_navigation_suppressed` | 0 / 0.25 / 0.50 / 0.75 / 1.0秒、count 1→2→3→3→3。初回が開/閉の双方で、開閉は1回、以降は `Repeated(None)` を維持 |
+| `label_click_r1_boundary_count_three_performs_the_second_rows_toggle` | A の count 1、B の count 2（単クリック扱い）、B の count 3（初回状態の逆を目標に開閉）、以後 count 3 は抑止。現在表示が既に目標どおりの場合も検査 |
+| `folder_pane_label_r1_long_sequence_preserves_the_first_pending_open` | 実 PointerButton と RawInput.time で上記5連打と、最初からの経過が 2×delay を超えることを確認。各回で取消 token が立たず pending の `Arc::ptr_eq` が成立し、枝が1回だけ開く。元 receiver を戻して完了後の現在地・子行も検査 |
+| `folder_pane_label_r1_boundary_then_double_click_opens_the_second_row_once` | 行境界の6pt未満の点で A→B→B をクリックし、実 egui count 1→2→3 を確認。A から B への移動を採用し、B の2回目は pending を置換せず開閉する。完了後の現在地と子行も検査 |
+
+既存の `label_click_double_uses_first_display_and_toggles_only_once`、`label_click_triple_and_further_clicks_do_not_navigate_or_toggle`、`label_click_path_mismatch_or_timeout_starts_a_new_single`、`label_click_arrow_clear_breaks_the_label_sequence` の count 列も、先行クリックを踏まえた count 3 に合わせた。
+
+全 cargo 処理（fmt を含む）は利用者指定の `powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local\miv-locks\run-heavy.ps1 -Owner "769-impl" -WorkDir G:\home\mimageviewer-769 -Command "<コマンド>"` 経由で順に実行した。同時に複数の重い処理は起動していない。共有の全 lib gate 待ちの後、red / green ともロック領域への書き込み不可の警告が出たため、指示どおり BelowNormal / `CARGO_BUILD_JOBS=6` で継続した。前回の native 環境 `target/769-env.ps1` は継承し、親プロセスでも並列数を6に指定した。feature / profile は既定、既存 warning あり。
+
+| 検証コマンド・範囲 | 結果 | 証跡 (`target/`) |
+| --- | --- | --- |
+| 修正前：`cargo nextest run -p mimageviewer --lib -E 'test(/label_click_r1/) \| test(/folder_pane_label_r1/)' --no-fail-fast` | **0成功 / 4失敗、exit 100** | `769-r1-red.log` |
+| 修正後：同じ新規4件の filter | **4成功 / 失敗0、0.654秒、exit 0** | `769-r1-new-tests.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **exit 0、18.41秒** | `769-r1-check.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/label_click/) \| test(/folder_pane/)' --no-fail-fast` | **108成功 / 失敗0、10.949秒、exit 0** | `769-r1-regression.log` |
+| `scripts/test-focused.ps1 -Path @('src/folder_pane.rs','src/app/folder_pane_refresh_tests.rs')` | **52 / 52件成功、計104実行、exit 0** | `769-r1-focused.log`、`test-focused/runs/20261111T181625877Z-bb563bd8` / `20261111T181629881Z-4ce92ecb` |
+| 引数なし `cargo fmt` / `cargo fmt --check` / `git diff --check` | **各 exit 0** | `769-r1-fmt.log` / `769-r1-fmt-check.log`、最終diff検査 |
+
+今回の `build-dev.ps1` と本体 lib 全件は利用者指定により設計担当へ引き継ぎ、実行しない。製品起動・実機操作・コミットも行わない。改訂された §12.2 からの設計変更はない。
+
+### 12.5 再開時の設計: 2 回目は「押した瞬間」に、1 回目の位置と時刻で判定する (2026-11-13、ClaudeCode)
+
+v5.2.0 の公開後に再開 (統括の指示 2026-11-13)。サブ PC の依頼 40 (サブ PC 担当の観測、画面操作ツールでのダブルクリック) で、今いる行以外では開閉しなかった。原因は 2 つ (設計担当がコードと依頼 40 のログで確認、backlog §1.769 にも記録)。
+
+1. 1 回目のクリックで、カーソル行を中央へ寄せる動きが入り、同じ画面位置の 2 回目が別の行に当たった。**この動き自体は v5.2.0 で「マウスのクリックでは中央へ寄せない」(§13) に変わったので、マウスの 1 回目でツリーは動かなくなった。** ただし、移動の完了で前の現在地の祖先の自動展開が閉じ、行がずれることは残る。
+2. 1 回目の移動でフォルダを開くと、サイドカー復元 (`src/app/sidecar_restore.rs`) が始まる。復元中は `input_update_begin` → `consume_input_during_sidecar_restore` が、毎フレームの入力から押下を捨て、egui のマウスの状態を初期化する (`input.pointer = PointerState::default()`)。依頼 40 のログでは、復元は移動の開始から約 25 ms 後に始まり、約 0.1 秒続いた。2 回目の押下がこの間に来ると消える。この後に来ても、egui はクリックの履歴を失っているので count 1 と判定する。
+
+#### 方針 (設計レビュー r1〜r3 の指摘を反映、2026-11-14)
+
+Windows のダブルクリック (`WM_LBUTTONDBLCLK`) は、**2 回目のボタンを押した瞬間**に、1 回目のクリックとの時間と位置で決まり、当たった行には左右されない。mIV もこれに合わせる。**ツリーの行の名前へのマウスの主ボタン操作は、1 回目のクリックも含めて、1 つの持ち主がフレームの入力の列を順に処理して「何が起きたか」を決める。** 決めた結果の適用 (focus・cursor・reveal 取消・移動の要求) は、今までの描画側の適用点で行う。描画中の `clicked()` (egui がフレーム全体で集約した値) では決めない。
+
+**入力の列。** グリッドの主ボタン操作 (`src/ui_main.rs` の `GridPrimaryInput` / `GridPressWitnesses`) と同じ土台を使う: 生の `input.events` (押下・離し・`PointerMoved`・`WindowFocused(false)`・`Touch` の Cancel) を順に読み、各押下・離しを `ctx.pointer_button_targets()` の witness (前のフレームの部品への当たり・受付可否) と、離しを `input.pointer.released_buttons_with_click_counts()` (egui がクリックとして成立させたか。途中の移動超過・長押しも egui の判定どおり) と対応付ける。対応が取れなければその列は打ち切り。これらはサイドカー復元が入力を書き換える前に読む。
+
+**持ち主 (`FolderPaneState` の型付きの 1 件、§12.2 の記録を置き換える。保存しない。)**
+
+- `Idle`
+- `FirstPress { path, pos }`: マウスの主ボタンで行の名前を押した (まだ離していない)。
+- `AwaitingPress { path, first_expanded, pos, time, toggled }`: 1 回目のクリック (またはジェスチャ内の離し) の後で、次の押下を待っている。`pos` は 1 回目のクリックの位置、`time` は直前の離しの時刻。
+- `PressAccepted { path, first_expanded, pos, toggled }`: ジェスチャの続きとして受け取った押下の離し (または取消) を待っている。
+- 適用待ちの結果: 「1 回クリックが確定した行」と「開閉した行」を、列の順に並べた短い一覧。描画側の適用点で取り出して空にする。
+
+前のフレームに描いたツリーの領域、行の名前と ▶ / ▼ の部品 id・矩形と path の対応は、描画のたびに作り直す一時的な表 (表示用の cache) として持つ。ツリーが描かれなかったフレームの後は使わない。
+
+**処理する場所。** ROOT の入力処理の最初 (`input_update_begin`) で、サイドカー復元の入力破棄より前、かつフルスクリーン等の早期 return より前に 1 回呼ぶ。ROOT 以外の viewport では、ROOT の持ち主・表・結果を変更しない。ここでは focus・cursor・reveal・移動の要求を直接変えない (ダブルクリックの開閉だけは、表示状態の変更としてここで行う)。
+
+**入力元。** タッチから egui-winit が作る主ボタンの押下・離しは、この持ち主の対象外にする (グリッドと同じ既存のタッチの相関で見分ける)。タッチのタップは今までどおり描画中の `clicked()` で 1 回クリックとして扱い、ダブルタップでの開閉はしない。タッチの Cancel、マウスとタッチの混在、主ボタン以外の押下は、進行中のジェスチャを打ち切る。
+
+**列の処理 (順に):**
+
+- **押下** (位置 p、witness の当たり c と受付可否):
+  - p が前のフレームの ▶ / ▼ の矩形の内側なら `Idle` にする (矢印は描画中の今までの処理に任せる)。サイドカー復元中はツリーが disabled で当たり c が取れないので、矢印の判定は矩形で行う。
+  - `AwaitingPress` で、`|p - pos| <= max_click_dist` (6pt) かつ `今 - time <= max_double_click_delay` (2 倍の許容はしない)、かつ「続きを受け取ってよい条件」を満たすなら、受け取る。まだ開閉していなければ、`first_expanded` の逆を目標に `path` の行を開閉する (今の状態が目標と違うときだけ)。結果の一覧に「開閉した行」を足し、`toggled` にして `PressAccepted` にする。c が別の行でも構わない (当たった行は見ない。§12.2 の案 B)。
+  - そうでなく、c が行の名前で、受付可で、「新しいクリックを始めてよい条件」を満たすなら、`FirstPress { path: c の行, pos: p }` にする。
+  - それ以外は `Idle` にする。
+- **離し**:
+  - `PressAccepted` なら `AwaitingPress { time: 今, .. }` に戻す。この離しはジェスチャの続きで、移動もカーソルの変更もしない。
+  - `FirstPress` で、egui がその離しをクリックとして成立させ (`Some(click)`)、離しの当たりが同じ行で、**離しの時点でも**「新しいクリックを始めてよい条件」を満たす (押下と離しの間に前の移動が完了して復元が始まった等なら取り消す) なら、**1 回クリックが確定**: 結果の一覧に「1 回クリックが確定した行」を足し、`AwaitingPress { path, first_expanded: その行の今の表示, pos, time: 今, toggled: false }` にする。
+  - それ以外 (ドラッグ・別の部品で離した等) は `Idle` にする。
+- フォーカス喪失・タッチの Cancel は `Idle` にする。
+
+列を順に処理するので、1 フレームに「1 回目の離し→2 回目の押下→2 回目の離し」や 2 回分のクリックがまとめて届いても、ふつうのフレームと同じ結果になる。▶ / ▼ や別の場所の押下が間に入れば、その時点で打ち切られる。
+
+**描画側の適用点。** 今まで行の名前の `clicked()` を処理していた位置 (キー処理の後) で、結果の一覧を順に取り出して適用する。「1 回クリックが確定した行」には、従来の 1 回クリック (focus・cursor、§13 の reveal 取消、現在地と違えば同じ pane navigation の要求) を行う。「開閉した行」は既に開閉済みなので何もしない (focus・cursor も変えない)。行の名前の `clicked()` による処理は、マウスの主ボタン以外 (タッチのタップ・キーボード・AccessKit の活性化) に限って残す。これで、同じフレームのキー処理との順序は今までと変わらない。
+
+**新しいクリックを始めてよい条件**: ツリーが表示中で disabled でない (★固定ではない)。今の表示形態でメイン画面を描く (前のフレームも描いた)。モーダル・入力停止が何も無い (サイドカー復元を含む)。当たり c が受付可 (egui の層・モーダルの判定を通っている)。
+
+**続きを受け取ってよい条件**: ツリーが表示中 (サイドカー復元による一時的な disabled は除く。★固定は不可)。今の表示形態でメイン画面を描く (前のフレームも描いた)。サイドカー復元**以外**の停止理由が無い。押下位置が前のフレームのツリーの領域の内側。押下の当たり c が、ツリーの行の名前、当たり無し (ツリーの背景、または復元中で disabled のツリー)、またはサイドカー復元のモーダルに属する層・部品のいずれか (ポップアップ・メニュー・浮動ウィンドウ・ほかの部品なら打ち切り)。サイドカー復元のモーダルは、作成時の id との単純な一致ではなく、そのモーダルに属する層・部品として見分ける。
+
+**停止理由の判定。** 今の `modal_dialog_block_reason` は最初に一致した理由の名前を返す診断用なので、許可の判定には使わない。同じ判定の表を共有し、サイドカー復元の項目だけを除いた「ほかの停止理由があるか」を返す関数を作る (表は 1 か所に置き、2 つの関数が同じ表を読む)。
+
+**開閉の書き手。** `FolderPaneState` に「path と目標の展開状態だけを受け取り、展開集合と列挙要求だけを変える」処理を切り出し、▶ / ▼・キー (← →)・ダブルクリックが共有する。フォーカス・カーソル・reveal は、▶ / ▼ とキーの呼び出し側に今までどおり残す。
+
+**打ち切り。** 上の列の処理に加えて、ツリーでのキー操作、ツリーのフォーカス喪失、ペインの非表示・★固定、ドライブ切替・再読み込みで `Idle` にする。1 回目のクリックで始まった移動の完了 (行のずれ・サイドカー復元) では打ち切らない。
+
+- 復元中の開閉を許す根拠: 復元が止めるのは、復元対象の閲覧 context への操作と移動。ツリーの開閉はフォルダペイン自身の表示状態 (`FolderPaneState`) で、展開で始まる列挙はペイン専用の worker・channel・cancel・cache を使い、閲覧 context や DB の書き手に接続しない (設計レビュー r1 で確認)。復元中に新しいクリック (移動を伴う) は始めず、確定もしない。
+- 行の境目の ±6pt で「A をクリック→すぐ B」は、A のダブルクリックになる。
+
+**実装時の確認点 (設計レビュー r4 = ACCEPT の P3)。** 適用待ちの結果は、その ROOT の入力 pass 限りにする。キー処理などで表示形態が変わり描画側の適用点を通らなかったら、未適用の結果は捨て、次のフレームやフルスクリーン終了後へ持ち越さない (取り出しは 1 回だけ)。キーによる打ち切りは、入力開始の列の処理 (続きの押下の判定) より前に反映する。後段のキー処理で初めて `Idle` にすると、入力開始で既に開閉してしまう。「1 回目のクリック済み → 次の列が ↓ キー・押下・離し」と「キー処理の後に 1 回クリックの結果を適用したら、その新しいジェスチャが残る」を確かめる。
+
+#### 採らなかった案
+
+- 案 C (1 回クリックでの移動を 0.3 秒待つ): 確実だが、リリース済みの 1 回クリックの即時の移動が遅くなる。利用者の判断が要るので、上の方針で足りる限り採らない。
+- 案 D (egui の回数に頼らず自前で判定するが、復元中の押下は捨てたまま): 速いダブルクリックほど 2 回目が復元中に入るので不確実。
+- サイドカー復元の入力破棄に、ツリーの領域だけ例外を作る: 復元中にツリーの移動まで通ってしまう。上の方針は、破棄の前に「記録と一致する押下」だけを開閉として受け取り、破棄そのものは変えない。
+
+まれな失敗は既定の割り切り方針による (書き込み・永続化なし)。
+
+#### 確かめること (§12.3 に加えて。設計レビュー r1 の提案を含む)
+
+- 実際のサイドカー復元を通す handler テスト: サイドカーを有効にした専用 fixture で、最初の実クリックから通常の移動・復元の開始まで通す。描画ハーネスに `input_update_begin` を含め、入力開始・描画・移動の採用・復元の poll を実際の順序で回す。`SidecarCheckingRelay` で worker の受信だけを保留し、固定時刻で次を流す: 復元中の押下と離し、復元をまたぐ押下と離し (押下は復元中・離しは復元後)、復元の後の押下と離し (egui の履歴が消えた状態)。いずれも開閉 1 回・移動 1 回。取消 token・復元 request・フォーカス・カーソル・reveal・キーボード所有が変わらず、ほかの入力の破棄も変わらない。
+- 移動の完了で行がずれた後の 2 回目 (当たった行が別) でも、1 回目の行が開閉する (既存の祖先が閉じるシナリオを使う)。
+- 1 フレームに 2 回分のクリック (押下・離し・押下・離し) が届く場合: 移動 1 回・開閉 1 回。
+- 同じフレームの並び (r2 の指摘): 「前のフレームで 1 回目の押下 → このフレームで 1 回目の離し・2 回目の押下・2 回目の離し」は移動 1 回・開閉 1 回。「▶ の押下・離し → 6pt 未満の名前の押下・離し」は矢印の開閉と 1 回クリックだけ (名前のダブルクリックにしない)。「A の続きの押下・離し → 離れた B の押下・離し」は A の開閉と B への 1 回クリック (B を抑止しない)。
+- サイドカー復元と、ほかの停止理由 (例: 設定ダイアログ) が同時にあるときは、続きを受け取らない。
+- r3 の指摘: 押下→6pt 超の移動→元の位置へ戻って離す (egui がクリックにしない) は 1 回クリックにしない。押下の後・離しの前に前の移動が完了して復元が始まったら、その離しで移動を出さない。復元中 (猶予の 100 ms 中・モーダル描画後の両方) に名前から 6pt 未満で ▶ / ▼ を押したら打ち切る。タッチのタップは今までどおり 1 回クリックで、ダブルタップは開閉しない。同じフレームに「↓ キー → B の名前のクリック」が届いたら、今までどおりキー処理の後に B へ確定する。
+- 押下で受け取り、離しが 1 回目の位置から 6pt を超える (例: 1 回目 x=0、2 回目の押下 x=4、離し x=8) 場合と、長く押してから離す場合: 移動を出し直さない。
+- 判定しないとき: 6pt を超える位置、間隔が delay を超える (既存の間隔超過テストと同じく 2 回の移動)、名前から ▶ / ▼ へまたぐ押下 (矢印の開閉だけ)、ほかのモーダル・ポップアップ・浮動ウィンドウが重なる位置、ツリー非表示、間にキー操作や別の場所のクリック。
+- 今いる行のダブルクリック、▶ / ▼、キー操作、1 回クリックの即時の移動、§13 (クリックで中央へ寄せない) が変わらない。
+- 途中で残した req40 のテストは、§13 で「1 回目で中央へ寄る」前提が成り立たないので、中央へ寄らない状態での続きの確認と、移動完了による行のずれの確認に分けて作り直す。
+
+#### 実装前提の照合で停止 (2026-11-14、`e1dfa0008`)
+
+製品コードの変更前に、上の「▶ / ▼ の処理は描画中の従来処理へ任せる」と、同一 ROOT pass の「▶ の押下・離し → 6pt 未満の名前の押下・離し」で矢印の開閉と名前の単クリックの両方を要求する条件が両立しないことを確認した。実装依頼の「設計の前提がコードと食い違う場合は実装を止めて報告する」に従い、設計を勝手に拡張せず停止する。
+
+- `vendor/egui/src/context.rs` は最終ポインター位置から `viewport.hits` を1回作る。`interaction.rs` は同じ `hits.click` を各押下へ使い、フレームのクリック先を単一の `clicked: Option<Id>` に集約する。最後が名前なら、矢印の `Response::clicked()` は成立しない。
+- `pointer_button_targets()` は各 edge の前フレームの当たりを別々に記録する観測 API であり、集約された `Response` を変えない。名前の持ち主だけを入力列へ移しても、矢印の処理は復元できない。
+- 独立の `gpt-6.1-sol` / `xhigh` にこの前提だけを照合してもらい、同じ矛盾と、実装の通常の裁量では解消できないことを確認した。設計の再 ACCEPT や実装の完了レビューを意味しない。
+- 設計担当へ戻す論点: 矢印の主マウス操作も順序付き入力・適用結果へ含めるか。その場合の開閉の実行時点、focus・cursor・reveal取消、キー処理との順序、従来の `clicked()` との二重処理防止を明記する必要がある。
+
+製品コード、`docs/spec.md`、`docs/keymap-spec.md`、マニュアル、backlog は変更していない。テストの差分は既存ハーネスへの `input_update_begin` 呼出しと、前提検証1件だけ。実装途中の草稿・テスト準備は `target/769-gesture-*.txt`、`target/769-input-method.txt`、`target/769-handler-tests-draft.rs` に保持する。本体 lib 全件・`build-dev`・`ui_snapshot`・製品起動・コミットは実施していない。
+
+前提検証: `folder_pane_label_ordered_arrow_then_nearby_label_is_single` を、製品コードが HEAD のまま実行した。1 pass に矢印の押下・離し、名前の押下・離しを4ptの距離で渡し、4 edge の witness が矢印・矢印・名前・名前、全て受付可、両者の id が別、矢印の矩形内であることを先に検査する。これらは通過し、「矢印クリックで枝が開く」の検査で失敗した。**1件実行 / 0成功 / 1失敗、exit100、実行0.706秒**。ログ: `target/769-arrow-design-premise.log`。コマンドは指定の `run-heavy.ps1 -Owner "769-impl"` 経由で `cargo nextest run -p mimageviewer --lib -E 'test(=app::folder_pane_refresh_tests::folder_pane_label_ordered_arrow_then_nearby_label_is_single)' --no-fail-fast --retries 0 --no-tests fail`。Windows MSVC / default features / test profile、コンパイル2分59秒、TurboJPEG CMake失敗なし。
+
+先行した実サイドカー復元テスト3件は2回とも Checking worker の受信前の Quiescing で止まった。これはハーネスの成立未確認であり、依頼40の不具合を修正前に再現した証拠には扱わない (`target/769-red.log`、最終試行3件失敗)。設計前提の矛盾を確認したため、そのハーネスの修正と製品実装は継続していない。
+
+停止時の整形検査: 指定の `run-heavy.ps1` 経由の引数なし `cargo fmt`、`cargo fmt --check` は各 exit0 (`target/769-premise-fmt.log`、`target/769-premise-fmt-check.log`)。`git diff --check` も exit0。変更は上記テストファイルと本節の2ファイルのみ。実装停止のため、関連 filter 全体・`test-focused.ps1`・core の `cargo check` は未実施であり、実装や回帰全体の成功を示すものではない。
+
+#### 設計の改訂 r4・r5: ▶ / ▼ も同じ持ち主で扱い、開閉はすべて適用点で行う (2026-11-14、ClaudeCode)
+
+上の停止報告は妥当 (egui はフレームのクリック先を 1 つに集約するので、名前だけを入力の列へ移すと、同じ pass の ▶ / ▼ のクリックが失われる)。§12.5 の方針を次のとおり改める。以下が、これまでの「矢印は描画中の今までの処理に任せる」「タッチは対象外」「ダブルクリックの開閉は入力開始で行う」を置き換える (r5 は r4 への設計レビューの P2 2 件の反映)。
+
+- **ツリーの行 (名前と ▶ / ▼) へのポインタの主ボタン操作は、マウスもタッチも、すべて入力開始の持ち主が列の順に認識する。入力開始では状態を変えず、認識した結果を列の順に一覧に積むだけにする。** 結果は 3 種類: 「1 回クリック (path)」「▶ / ▼ のクリック (path)」「ダブルクリックの開閉 (path、目標の展開状態)」。ダブルクリックの目標は `first_expanded` の逆で、判定時点では開閉しない。
+- **描画側の適用点で、結果を列の順に 1 つずつ適用する。** 「1 回クリック」は従来の 1 回クリック (focus・cursor、§13 の reveal 取消、現在地と違えば移動の要求)。「▶ / ▼ のクリック」は今までの矢印の処理 (focus・cursor、適用時点の行の状態で開いていれば閉じる・閉じていて開けるなら開く、§13 の reveal 取消)。「ダブルクリックの開閉」は、適用時点の状態が目標と違うときだけ目標へ揃える (focus・cursor・reveal は変えない)。開閉の書き手は共通の「path と目標の展開状態」処理。適用はキー処理の後で、今までと同じ順序になる。これで、同じ pass に「▶ のクリック → 名前のダブルクリック」が届いても、▶ の開閉の後に、名前のダブルクリックの目標へ揃う (r5 の指摘 1)。
+- サイドカー復元中も、描画側の適用点は通る (ツリーは disabled で描かれる)。復元中に積まれ得る結果は「ダブルクリックの開閉」だけで、適用はペインの表示状態だけを変える。表示形態が変わり適用点を通らなかった pass の結果は捨てる。
+- **キーボード・AccessKit の活性化は部品ごとに見分ける (r5 の指摘 2)。** egui の `Response::clicked()` は、ポインタのクリック (`clicked_by(Primary)`) とキー (Space / Enter)・AccessKit の活性化 (`FAKE_PRIMARY_CLICKED`) の和。描画側は各部品について `clicked() && !clicked_by(Primary)` (ポインタ以外の活性化) のときだけ従来の処理をする。ポインタのクリック (`clicked_by(Primary)`) は持ち主の結果で扱うので、描画側では処理しない。同じ部品にポインタのクリックとポインタ以外の活性化が同じ pass に重なったときは、持ち主の結果だけを使う。pass 全体の有無では判定しない。
+- 持ち主の状態に `ArrowPress { path }` を足す。押下の当たりが ▶ / ▼ の部品で、受付可で、「新しいクリックを始めてよい条件」を満たすなら `ArrowPress` (名前のジェスチャはここで打ち切り)。サイドカー復元中などで当たりが取れない場合は、矩形で ▶ / ▼ と分かれば `Idle` (今までどおり、復元中に矢印は効かない)。離し: `ArrowPress` で、egui がクリックとして成立させ (`Some(click)`)、離しの当たりが同じ矢印で、離しの時点でも「新しいクリックを始めてよい条件」を満たすなら、「▶ / ▼ のクリック」を積んで `Idle`。それ以外は `Idle`。
+- タッチ: 1 回のタップは名前なら「1 回クリック」、▶ / ▼ なら「▶ / ▼ のクリック」として同じ一覧に積む。ただしタッチではダブルクリックのジェスチャを始めない・続けない (タップの離しの後は `Idle`)。タッチの Cancel・マウスとタッチの混在は打ち切り。入力元の判定には既存のタッチの相関 (`src/touch_correlation.rs`) を使うが、グリッドのジェスチャの駆動 (`drive_egui_grid_touch_input` の scope や初回の command) を奪わない形で共用する。ツリーの通常の入力では pointer の状態を消費・初期化せず、ScrollArea のドラッグは今までどおり (設計レビュー r5 の P3)。
+- 結果と、部品ごとの重複の判定は、ROOT のその pass 限り。取消・ドラッグ・受付不可になった入力で、ポインタ由来の `clicked()` を従来の経路へ戻さない (`clicked_by(Primary)` は描画側で常に処理しない)。早期 return の pass の結果は次の pass へ持ち越さない (設計レビュー r5 の P3)。
+- これにより、同じ pass の「▶ のクリック → 6pt 未満の名前のクリック」は、▶ の開閉と名前への 1 回クリックの両方になる (v5.2.0 では egui の集約で片方だけになり得た)。
+
+#### r4・r5 の実装記録 (2026-11-14、`4e856f29b` 上の未コミット差分)
+
+- `FolderPaneState` の旧 count 記録を、名前・矢印・マウス・タッチの型付きジェスチャへ置換。ROOT の入力開始で、変更前のイベント列・edge ごとの witness・egui の release 判定を対応付け、Single / Arrow / Toggle の結果を積む。ここでは展開・focus・cursor・reveal・移動を変えない。部品表・結果・部品別の pointer 活性化記録は ROOT の pass で区切り、未描画の表や未適用結果を次へ持ち越さない。
+- 描画側ではキー処理後に結果を列順で適用する。`set_branch_expanded(path, target)` は展開集合とペインの列挙要求だけを変更し、矢印・← / →・ダブルクリックで共有する。ダブルクリックは初回表示の逆を目標とし、移動・focus・cursor・reveal を再発行しない。Single / Arrow は従来の操作と §13 の reveal 取消を行う。部品ごとの非 pointer 活性化は残し、同じ pass の pointer との二重適用だけを抑止する。
+- サイドカー以外の停止理由は、既存の modal 診断と同じ表を読む。サイドカーの例外はその modal に属する実 widget の layer で区別し、単純な widget id 一致には依存しない。入力の破棄そのものは変更していない。独立実装レビューの P2（認識後にモーダルが始まった場合）に従い、適用点でも Single / Arrow は全停止理由、Toggle はサイドカー以外の停止理由を再確認して拒否・退役する。
+- タッチの出どころは既存の相関処理を、専用の観測状態で共用する。グリッドの scope・初回 command・入力列・pointer 状態は消費しない。名前のタップは Single、矢印のタップは Arrow にし、タッチでダブルクリックを開始・継続しない。別々の pass の相関と、観測後もグリッドの初回 command が届くことを回帰で確認する。
+- 通常の `set_focus_grid` は未確定 press も含めてジェスチャを終了する。既に入力列の前に打ち切ったキーボード Enter の後段だけは、別の focus 解放入口を使い、同じ pass の新しい名前クリックを失わない。固定キーボードの操作は入力列より前に打ち切りを反映する。ゲームパッドの step 経路は今回変更していない。独立レビューの静的所見（名前 single → PadDown → 時間内のマウス press では旧ジェスチャを継続し得る）は、物理キーボード以外を追加の打切り条件とするかの設計担当への引継ぎとする。
+
+**製品変更前の実復元回帰:** `folder_pane_label_sidecar_second_press_during_restore` / `across_restore` / `after_restore` の3件を、製品が HEAD のまま実行し、全件が実移動の採用・実 Checking worker の relay 受信保留を通った後、「2回目の押下で初回行が開く」の製品 assert で失敗した。**3件実行 / 0成功 / 3失敗、exit100、実行0.839秒、コンパイル2分27秒**。証跡は `target/769-resume-red.log` と `target/769-resume-red-tests-source.rs`。指定の `run-heavy.ps1 -Owner "769-impl"` 経由の nextest、Windows MSVC / default features / test profile。前回・再開直後の Quiescing timeout は根拠に含めない。実 root の worker / writer 結果受信 checkpoint の不足を補完して fixture が成立したが、busy だった個別 writer は特定していない。
+
+TurboJPEG の初回 core check は CMake / MSBuild の6並列 install がエラー本文を出さず exit1 となり、Cargo は exit101（`target/769-r5-check-initial.log`）。同じ source / Debug / CRT 設定の verbose 再現も「0警告・0エラー」のまま失敗した（`target/769-r5-cmake-diagnostic.log`）。同じ native 出力への直列 install は成功、2分48秒（`target/769-r5-cmake-diagnostic-serial.log`）。6並列の失敗と直列の成功を確認したところまでで、それ以上の原因は未特定。依存ソースや Cargo 設定は変更せず、以降の core check は `-j 1` とする。旧 `target/769-env.ps1` の作成・流用はしていない。
+
+本体 lib 全件・`build-dev`・`ui_snapshot` は指定どおり設計担当の所有。製品起動・実機操作・コミットは行わず、backlog は変更しない。以下に最終の自動検証結果を追記する。
+
+初回の関連 filter は **244件中180成功 / 64失敗、exit100**（`target/769-r5-related.log`）。headless の既存ハーネスは、起動索引の `NotStarted`（`overlay_active() == true`）を終端しないままツリーを直接描いていたため、新しい「今もメイン画面を描く」条件が正しく入力を拒否した。起動後の画面を対象とする fixture の初期化だけで `NotStarted` を `Unavailable` へ進め、製品の入力許可は弱めない。直接 tree を描く UI unit にも入力開始・表示完了の checkpoint を加えた。
+
+結果の先行適用で子行が挿入されても AccessKit の宛先が別行へ移らないよう、行全体の `scope_id` を正規化した path に固定した。egui 0.37 の通常の `push_id` は親の auto 順序を `unique_id` に混ぜるため、この用途では使わない。子 cache を開いて温めてから閉じ、次行 B の id を取得して、同 pass の矢印展開・AccessKit B 活性化で B の画面位置が動いても id と移動先が B のままである回帰を追加した。これは入力結果の順序を変えず部品 identity の生成境界を正す実装として、独立レビューとも照合した。
+
+混在取消は、同じ入力列の mouse / touch の混在だけでなく、未 release の FirstPress / ArrowPress に異なる入力元の press が来た場合、PressAccepted 中に touch press が来た場合も既存の typed state から判定する。新しい保持フラグは足さず Idle へ退役し、確定済み結果の prefix は維持する。両方向・名前 / 矢印の組合せを跨 pass の純粋回帰でも確認する。
+
+2回目の関連 filter は **247件中198成功 / 49失敗、exit100**（`target/769-r5-related-2.log`）。多くは入力前の label 可視前提で止まった。最小1件の診断（`target/769-r5-geometry-diagnostic.log`）では B の読取矩形が `[[48,98],[178,122]]`、最新 viewport が `[[8,143.4],[178,598]]`、offset は0だった。vendor の `end_pass` は `prev_pass` / `this_pass` を swap し、`run_ui` 終了後の `read_response` は古い `this_pass` の同じ id を先に読むため、stable id 化で以前の toolbar 無し画面の矩形が優先されていた。レイアウトを推測で変えず、cfg(test) で実描画中の `Response.rect` を記録し、frame 後の幾何検査・クリック座標はその最新矩形を読むように補正した。id・witness・入力列は実物のまま。
+
+独立レビューの追加指摘に従い、`widget == None` をツリー背景の証明にしない。クリック部品を持たない hover-only Area / DRAG-only Window 本文も None になり得るため、実描画の tree layer を cache に記録し、続きの押下全体を `layer_id_at(pos)` が None / tree / sidecar modal の場合に限る。上位 layer と witness None の前提を先に確認する回帰2件と、overlay 退役後の独立 single の継続確認を追加した。
+
+3回目の関連 filter は **249件中240成功 / 9失敗、exit100**（`target/769-r5-related-3.log`）。残った試験の前提を照合し、製品の受付条件や入力破棄は緩めず、次を補正した。取消 token を比較する試験だけは最初の移動の receiver を保留し、正常採用との競走を除く。非表示から再表示した後と req40 の祖先展開は、Suspended の `has_pending == false` を完了とせず、実描画で resume / scan / poll を通して待つ（egui 時刻は固定し、続きが delay 内であることも検査）。実復元中の入力破棄は既存の release edge 保持契約を検査し、Text / Wheel / press が残らず pointer と scroll が初期化されることを確認する。連続タッチは実 backend と同じ End → primary release → PointerGone の列にした。
+
+`docs/spec.md` と `docs/keymap-spec.md` を初回行への結び付き・押下時の確定と描画側適用・タッチの対象範囲に合わせた。マニュアル `htdocs/mimageviewer/manual/tut-navigation.html` の「ダブルクリックで枝を開閉、1回目で移動」の一文はこの実装とも一致するため変更しない。
+
+**最終検証:** Windows MSVC / default features / test・dev profile。すべて指定の `run-heavy.ps1 -Owner "769-impl"` 経由。外部 lock 領域への書込み不可の警告に従い BelowNormal / `CARGO_BUILD_JOBS=6` で実行し、native の直列再確認後の core check だけは `-j 1` を明示した。
+
+| コマンド・範囲 | 結果 | 証跡 (`target/`) |
+| --- | --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/folder_pane/) \| test(/label_click/) \| test(/sidecar_restore/)' --no-fail-fast --retries 0 --no-tests fail` | **249成功 / 失敗0、21.022秒、exit0**。修正前に失敗した実復元3件、改訂後の矢印→近傍名前の前提検証、req40置換、§13の既存回帰を含む | `769-r5-related-final.log` |
+| `scripts/test-focused.ps1 -Path ...`（変更したテスト保有Rust 6ファイル） | **66 / 18 / 4 / 57 / 110 / 46件の6群すべて成功、計301実行、exit0**。関連filterとの重複を含む | `769-r5-focused-final.log`、`769-r5-focused.ps1`、`test-focused/runs/20261113T171450879Z-b2b2a889` から `20261113T171534946Z-f3f852f5` までの各実行（各directoryはログ参照） |
+| `cargo check -p mimageviewer --bin mimageviewer-core -j 1` | **exit0、1分25秒** | `769-r5-check-final.log` |
+| 引数なし `cargo fmt` / `cargo fmt --check` | **各exit0** | `769-r5-fmt-final.log` / `769-r5-fmt-check-final.log` |
+| `git diff --check` / 検証前後のRust SHA-256照合 | **各成功** | `769-r5-diff-check-final.log` / `769-r5-verified-source-hashes.json` |
+
+focused の指定順は `src/folder_pane.rs`、`src/ui_folder_pane.rs`、`src/app/update_phases.rs`、`src/app/sidecar_restore.rs`、`src/app/folder_pane_refresh_tests.rs`、`src/touch_correlation.rs`。共有の `src/app.rs` は focused script が全libへ送る broad path のため、全libを実行しない今回の分担では指定しない。`src/ui_dialogs/sidecar_restore.rs` の modal ID 共用には独立の同moduleテストがなく、実modalを描く復元handler回帰で確認した。共有停止表・表示形態判定は関連handler / core checkでも確認し、全lib・build-dev・ui_snapshotは依頼どおり設計担当へ引き継ぐ。
+
+独立 Sol / xhigh の実装静的レビューは、モーダル再確認・layerの境界・stable widget ID・最終fixture補正を含め ACCEPT（自動テストは上記を実装担当が実行）。HEADは `4e856f29b` のまま、変更は未コミット。製品起動・実機入力・backlog変更は行っていない。
+
+#### 独立コードレビュー P2・P3 の修正（`6f5791d1e` 上の未コミット差分）
+
+P2 の原因は、同じ pass の名前クリック結果を順に適用する際、現在地への Single が先行する移動候補を上書きしないことだった。現在地 A で B → A の順に単クリックすると cursor は A に戻るが、B の `Some(B)` が後段の移動裁定へ残る。名前の各 Single で `Some(path)` / `None` の両方を代入して候補を置換する。同じ形の非 pointer 活性化（キー / AccessKit）も揃え、Arrow / Toggle は直前の Single の移動候補を消さない既定のままにする。
+
+製品ファイルが `6f5791d1e` のまま、次の2件を新しい実 handler 回帰として実行した。ポインター版は 6pt より離れた B / A の押下・離し4 edgeを同じ ROOT pass に渡し、4 witness が B / B / A / A で受付可、release 2件がともにクリック成立、cursor が A であることを先に確認する。AccessKit 版はポインター B のクリックと A の Click 活性化を同じ pass に渡す。**両方とも上記前提を通過し、移動候補 `Some(B) != None` の製品 assert で失敗**した。各1件実行 / 0成功 / 1失敗、exit100、実行0.613秒 / 0.653秒。ログは `target/769-review-p2-red.log` / `target/769-review-accesskit-red.log`、その時点のテストソースは `target/769-review-red-tests-source.rs`。最初の実行は先行の全件テストのロックを待ち、迂回しなかった。
+
+P3 は読み取り条件の共通化に限定する。detached の述語・状態遷移を変えず、描画側の後始末や描画前後の保持位置も維持する。触れた範囲は `docs/detached-rework-plan.md` §11 に追記する。
+
+| 既存の描画条件 | 共通の読み取りと呼び出し対応 | 維持する描画処理 |
+| --- | --- | --- |
+| native backdrop | 既存 `native_video_fullscreen_active_for_main_backdrop()` を入力と描画の両方から利用（元から共通） | backdrop 側の subclass / chrome / cloak / navigation / return を変更しない |
+| embedded still | 既存 `fullscreen_embedded_still_active()` を入力と描画の両方から利用（元から共通） | 描画直前 active の capture と、描画後 active との OR を変更しない |
+| in-window かつ deferred reopen 待ち | 描画側の式 `native_video_in_window_active && fs_nav_deferred_reopen_wait_active()` を `main_embedded_fullscreen_reopen_pending(&self)` へ移す。入力、描画前 poll、描画前 pending capture、`render_fullscreen_viewport_with_root_input` の holdover 描画の計4箇所が利用 | 各呼び出しの位置、pending の描画前 capture と後段 gate を維持 |
+| still viewport enter suppression | `still_fullscreen_viewport_enter_suppressed_now(&self)` が fullscreen_idx / in-window / 期限の真偽だけを読む。入力と既存の mut 版 `still_fullscreen_viewport_enter_suppressed` が利用 | `until=None` の即 return と、invalid context / expired それぞれの deadline・PresentationSwitch holdover 破棄を元の分岐・位置のまま維持 |
+
+新しい条件・状態・時間窓はない。上のコード対応により、共通化前と同じ入力を同じ時点で描画条件へ渡すことを確認する。読み取りだけの ROOT 入力は deadline / holdover を消さず、既存の mut 版だけが元の描画 checkpoint で後始末を行う。
+
+修正後の検証は Windows MSVC / default features / test・dev profile。Cargo のビルド・テスト・整形はすべて `run-heavy.ps1 -Owner "codex-769" -WorkDir G:\home\mimageviewer-769` 経由。先行全件テストの終了後は、lock 領域への書込み不可の警告に従い BelowNormal / `CARGO_BUILD_JOBS=6` で実行した。core check は前回の native 検証と同じく `-j 1` を明示した。
+
+| コマンド・範囲 | 結果 | 証跡 (`target/`) |
+| --- | --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/folder_pane/) \| test(/label_click/) \| test(/sidecar_restore/)' --no-fail-fast --retries 0 --no-tests fail` | **251成功 / 失敗0、22.655秒、exit0**。修正前に失敗した新2件を含む | `769-review-related.log` |
+| `scripts/test-focused.ps1 -Path src/ui_folder_pane.rs,src/app/folder_pane_refresh_tests.rs,src/ui_fullscreen.rs`（配列で指定） | **18 / 112 / 1,359件の3群すべて成功、計1,489実行、exit0**。1.391 / 19.601 / 152.298秒。関連filterとの重複を含む | `769-review-focused.log`、`769-review-focused.ps1`、ログに記録した `test-focused/runs/*` の各結果 |
+| `cargo check -p mimageviewer --bin mimageviewer-core -j 1` | **exit0、54.90秒** | `769-review-check.log` |
+| 引数なし `cargo fmt` / `cargo fmt --check` | **各exit0** | `769-review-fmt.log` / `769-review-fmt-check.log` |
+| `git diff --check` / 検証前後のRust SHA-256照合 | **各成功** | `769-review-diff-check.log` / `769-review-source-hashes.json` |
+
+focused の `src/app.rs` は前回同様 broad path（全lib指定になる）のため除外し、共有判定は上のコード対応・独立静的レビューと変更した呼び出し元モジュールの回帰・core checkで確認した。独立 Sol / xhigh の P2・P3 フォローアップ静的レビューは **ACCEPT**、追加findingなし。HEADは `6f5791d1e` のまま未コミット。本体全lib・ui_snapshot・build-dev・製品起動は指定どおり実施せず、backlogにも触れていない。
+
+#### 全libで見つかった8件の調査と設計境界での停止（`b01467f52`）
+
+利用者の8件を、製品・テストが HEAD のまま指定の `run-heavy.ps1 -Owner "codex-769"` 経由で再実行した。**8件実行 / 0成功 / 8失敗、1.004秒、exit100**。失敗箇所は提供ログと一致する。証跡は `target/769-harness-red.log`。実行は次の nextest filter に限定し、全libは実行していない。
+
+`cargo nextest run -p mimageviewer --lib -E 'test(=app::folder_pane_refresh_tests::folder_pane_label_arrow_and_keyboard_keep_existing_behavior) | test(=app::main_chrome::tests::main_chrome_folder_tree_clicks_follow_common_modal_ownership) | test(/search_nav_pane_frame_/)' --no-fail-fast --retries 0 --no-tests fail`
+
+本番の描画入口は `App::ui → update_frame → input_update_begin → render_main_bars → render_folder_pane → render_folder_pane_tree`。`input_update_begin`（`src/app.rs:100977`）は起動overlay・native backdrop・fullscreen等の早期 return より前にあり、`App::ui` の `finish_folder_pane_presentation`（同102268）は早期 return の後も通る。child viewport は eframe が個別callbackへ送り `App::ui` を呼ばず、tree 自体にも ROOT guard がある。**入力開始を通らずツリーを描く本番入口は見つからなかった。**
+
+ただし、**本番でメニュー外のツリークリックを取りこぼす別の不一致を source 上で確認したため、依頼の停止条件に従って修正を停止する。** 独立 Sol / xhigh の読み取り専用監査も同じ結論だった。
+
+- `main_chrome_pointer_blocked()` は既存の共有停止表を `include_menus=false` で読み、グリッドメニュー外のポインター操作を許す。`main_chrome_modal_classification_keeps_menu_tools_and_hidden_scans_distinct` も GridMenu を common-modal ではあるが pointer chrome の blocker ではないと明示している。
+- 一方、ツリーの入力開始（`src/ui_folder_pane.rs:300`）と Single / Arrow の適用時判定は `modal_dialog_block_reason()`（`include_menus=true`）、継続判定も同じ true 側を使う。共有表でこの引数が変えるのは `grid_context_menu` の1項目である。
+- 本番の順序は入力開始（`src/app.rs:100977`）→キー（101151）→メニュー描画・退役（`show_context_menu`、101600）→ツールバー（101614）→main bars / tree（101658）。メニュー外の press / release は、入力開始ではまだ menu owner があるため FirstPress / ArrowPress を作らず、その後 `show_context_menu` の外側クリック処理が `context_menu_idx=None` にする（`src/ui_dialogs/context_menu.rs:1216–1227`）。描画時に chrome が許可状態へ戻っても適用結果がなく、Primary の旧 `clicked()` は意図的に除外されているので、従来は届いたクリックが失われる。
+- 稀な native メニュー失敗だけの問題ではない。ブックマークのグリッドメニューは専用の egui Window を使い、読書履歴ビューも通常から native メニューを飛ばして egui メニューを使う（同ファイルの `items_are_bookmark_view` / `!items_are_reading_history_view` の分岐）。どちらもメニュー外クリックで退役する通常経路がある。実機起動・操作はしておらず、これは本番コードの順序と条件による確認である。
+
+設計担当へ戻す論点は、§12.5 の新規開始・継続・適用時の停止理由を、既存の pointer chrome と同じ「メニュー外は操作可」にどう揃えるか。メニューが重なる位置の witness / layer による拒否と、メニューが存在するだけで全ツリーを拒否する判定を区別する必要がある。これはハーネスだけの修正では解消しないため、今回その場で製品条件を変更しない。
+
+8件について確認できた範囲は次のとおり。クリックの期待は書き換えていない。
+
+| テスト（`app::` 以下） | 確認できた失敗・前提 |
+| --- | --- |
+| `main_chrome::tests::main_chrome_folder_tree_clicks_follow_common_modal_ownership` | callback に入力開始・表示完了がない。最初の Blocker::None で要求0件のまま失敗し、GridMenu ケースには未到達。入力開始を補っても上記の本番不一致が残る |
+| `search_nav_pane_frame_tests::search_nav_pane_frame_metadata_enter_opens_tree_target` | 共通 `main_frame` に入力開始がなく、実矢印クリックによる tree focus 取得（168行）で失敗 |
+| `search_nav_pane_frame_tests::search_nav_pane_frame_everything_enter_opens_tree_target` | 同じ共通frame・同じ失敗箇所 |
+| `search_nav_pane_frame_tests::search_nav_pane_frame_favorite_search_enter_opens_tree_target` | 同じ共通frame・同じ失敗箇所 |
+| `search_nav_pane_frame_tests::search_nav_pane_frame_tag_enter_opens_tree_target` | 同じ共通frame・同じ失敗箇所 |
+| `search_nav_pane_frame_tests::search_nav_pane_frame_plain_enter_opens_tree_target` | 同じ共通frame・同じ失敗箇所 |
+| `search_nav_pane_frame_tests::search_nav_pane_frame_enter_preserves_modifiers_keypad_and_coalescing` | 同じ共通frame・同じ失敗箇所。native Enter を投入する前なので native-key 経路の失敗を示さない |
+| `folder_pane_refresh_tests::folder_pane_label_arrow_and_keyboard_keep_existing_behavior` | 共通frameは既に入力開始を通る。2607行の Enter 後 pending unwrap が None。別原因として、Enter が開始した実scanが描画中に完了して同じ pass の後段裁定で採用される競走があるが、今回はその実測確定まで進めていない。入力開始不足と断定しない |
+
+前の7件の fixture は、描画だけを直接呼ぶ一方 `IndexerInit::NotStarted` を終端していない点も新しい表示受付と合わない。search の矢印座標も古い `read_response(id).rect` を読むため、再開時は既存 cfg(test) の実描画矩形との照合が必要（この6件の直接原因が幾何かどうかは未観測）。検索 editor の実描画・focus・クリックによる blur、pane の Enter が grid/native twin に漏れないという元の検査意図は維持する。投入済み native test frame を消す `input_begin_key_frame` の単純追加はしない。
+
+リポジトリ全体で実tree / main bars の全呼び出しを列挙し、入力 owner を通らないテスト用描画を次の5系統として確認した。今回は通っているものは変更しない。
+
+| ハーネス | 入力開始なしの描画と現在の用途 |
+| --- | --- |
+| `src/app/main_chrome.rs:337` 上記のmodal ownership試験callback | 生の名前クリック・resizeを送る。入力開始と表示完了がない（失敗対象） |
+| `src/app/search_nav_pane_frame_tests.rs:240` `main_frame` | 生の矢印クリック・キー・native twinを送る。root keyboardはあるが入力開始がない（6失敗の共通frame） |
+| `src/ui_folder_pane.rs:1290` `actual_folder_pane_deep_scroll_anchor_keeps_real_coordinate_and_cursor_scroll_wins` | 実treeを描くが生イベントなし。scroll / cursor / listingを直接設定する描画試験 |
+| `src/app/tests.rs:27377` `rating_1328_large_folder_return` 内 `draw` | 実paneを描くが `RawInput.events` なし。履歴・お気に入り復元の4テストが共用 |
+| `src/app/folder_pane_refresh_tests.rs:3830` `folder_pane_main_return_rechecks_other_branch_even_when_list_a_is_equal` 末尾の再表示closure | 実paneを描くが生イベントなし。復帰時のscan再開だけを検査 |
+
+`ui_folder_pane` の empty-branch 実UI試験は完全な `input_update_begin` ではないが、専用 `begin_folder_pane_label_input → tree → finish` を既に通るため owner 欠落ではない。`folder_pane_refresh_tests` の他9描画siteもすべて `input_update_begin` が先行する。header-only / WidthTest / loading-width / snapshot fixture は header・splitter・純粋行描画だけで、名前・矢印の状態ownerを使うframeとは別に扱った。
+
+停止により製品・テストの修正はしていない。変更はこの調査記録のみ。8件は上記のとおり失敗したままで、関連群全体・focused・core check・fmt の成功を今回の結果として主張しない。全lib・ui_snapshot・build-dev・製品起動・コミット・backlog変更は行っていない。
+
+### 設計の改訂 r6: 停止理由はメインの枠のポインター判定に揃える (2026-11-14、ClaudeCode)
+
+上の停止記録の指摘を受けて、§12.5 と r4・r5 の「停止理由」を次のとおり改める。r6 はそれより前の記述に優先する。
+
+- 従来のツリーは `gate_main_chrome` で `main_chrome_pointer_blocked()` (共有の停止表を `include_menus=false` で読む) によってだけ止まり、グリッドのメニューが開いていてもメニュー外のクリックは届いていた。新しい入力の持ち主もこれと同じ判定を使う。新しいクリックの条件・継続の条件・適用時の確認はすべて、メニューを含まない停止表で評価する。継続の条件は「サイドカー復元の項目とメニューを除いた停止理由が無い」(`include_menus=false`、`include_sidecar_restore=false`) にする。`modal_dialog_block_reason()` (`include_menus=true`) はツリーの入力判定に使わない。
+- メニューがツリーに重なる位置の押下は、停止表ではなく押下の witness で区別する。capture がメニューの部品なら、ツリーの名前・矢印の押下ではないので `FirstPress` / `ArrowPress` を作らず、継続中なら打ち切る (capture の条件は r4・r5 のまま)。メニュー外の押下は、そのあと `show_context_menu` がメニューを閉じても、従来どおり 1 回のクリックとして描画側の適用点で適用する。
+- 停止表そのもの (項目と順序) は変えない。読み方の引数を揃えるだけなので、新しい状態や時間窓は増えない。メニューの有無で状態の組み合わせを足さず、従来のツリーと同じ判定にまとめる。
+- 確かめること: グリッドのメニュー (egui メニュー、ブックマーク表示の専用 Window、読書履歴表示) が開いた状態で、メニュー外のツリーの名前・矢印をクリックすると従来どおり移動・開閉する。メニューに重なる位置の押下はツリーへ届かない。サイドカー復元中にメニューが開いている場合は、復元中の新しいクリックを受け付けない既定のまま。`main_chrome_folder_tree_clicks_follow_common_modal_ownership` の GridMenu ケースを本番の入力開始を通して通す。
+
+#### r6 の実装と全libで見つかった8件への対応（`762936a9c` 上の未コミット差分）
+
+**Enter の原因の確定。** `6f5791d1e` と `b01467f52` 以降で異なる Rust 4ファイル（`app.rs`、`ui_fullscreen.rs`、`ui_folder_pane.rs`、`app/folder_pane_refresh_tests.rs`）を一時的にすべて `6f5791d1e` の内容へ戻し、他の Rust source は両commitで同一であることを照合して、対象の arrow / keyboard 試験1件だけを実行した。**0成功 / 1失敗、0.702秒、exit100**。この環境では `6f5791d1e` でも Enter 後 pending の unwrap が None で失敗した（旧2493行、現在の2607行に対応）。ログは `target/769-r6-enter-6f.log`。HEAD・branchは動かさず、比較後は保存した現行4ファイルを復元した。
+
+現行へ戻して一時診断を加えた実測（`target/769-r6-red-and-enter-diagnostic-2.log`）では、Enter pass は次の順だった。
+
+1. 入力前: tree focusあり、cursor=B、pendingなし。
+2. キー処理後: Enter消費済み、tree focus解放済み、実 pending=B。
+3. 描画した全ラベル: `clicked=false`、`clicked_by(Primary)=false`、Enter=false、AccessKit Click要求=false。描画の移動候補は None。
+4. 移動裁定前: pending=B。裁定後: 開始tokenあり・cancel=false、pendingなし・現在地=B。
+
+従って実scanの成功応答が同じpassの裁定で採用される競走であり、P2 の候補None代入や `FAKE_PRIMARY_CLICKED` の重複ではない。vendor の fake flag は `get_response` がその時点のキー・focus・AccessKit要求から都度生成し、begin-passに保存されないことも照合した。**製品の Enter・非pointer活性化・P2 の候補更新は変更しない。** 試験frame本体を共有したまま裁定直前の hook を追加し、対象 Enter frame だけ、実handlerが作った目的=PaneNavigation・path=B・focus解放を検査して受信を一時保留する。裁定後も同じpath/token・非取消を検査し、実receiverへ戻して既存の実完了を通す。pending先Bという元の期待は維持し、scan速度に左右されない観測境界にした。
+
+最初の診断試行は、診断用の `data_mut` 内で同じ Context を読むロック入れ子を実行前に発見し、コンパイル中に Ctrl+C で取り下げた（`target/769-r6-red-and-enter-diagnostic.log`）。pass番号をロック外で読む形へ直した **`-2.log` だけを有効な診断・失敗証拠とする**。一時診断は製品・テストからすべて撤去済み。
+
+**r6 の実装。** 新規入力の開始、Single / Arrow の適用時確認は既存 `main_chrome_pointer_blocked()` を使う。継続と Toggle の適用時確認は、`main_chrome_pointer_blocked_except_sidecar_restore()` が同じ表を `(include_menus=false, include_sidecar_restore=false)` で読む。計5箇所を揃え、ツリー入力から `modal_dialog_block_reason()` を使わない。停止表の項目・順序、keyboard側の診断と停止、witness / layer によるメニュー重なりの拒否は変更しない。
+
+**7件のハーネス。** main_chrome の既存試験と search_nav の共通 `main_frame` は、fixture開始時の NotStarted だけを終端し、ROOT入力開始をキー・ツールバー・main barsより先に通す。main_chrome に表示完了も加え、search は既存の表示完了を維持する。search の矢印座標は cfg(test) で記録する実描画矩形に揃えた。実search editorのfocus・クリックでのblur・native twin / 修飾 / keypad / coalescing、gridの選択本が開かないこと、PaneNavigationの採用先の期待は書き換えていない。通過していた入力なしの3系統の描画ハーネスは変更しない。
+
+**修正前のr6回帰。** 実 `show_context_menu` を ROOT入力・キーの後、ツールバー・main barsの前に通すfixtureを追加。Grid / Bookmark専用Window / ReadingHistory × 名前・矢印の外側クリック6件、メニュー外の続きのpress、メニューに重なるcaptureの拒否、認識後にmenu ownerが始まるSingle / Arrow / Toggleの適用を検査する。さらに実CheckingRelayで復元の受信を保留した既存fixtureで、実メニュー併存時の新規クリック拒否と初回行への継続Toggle許可を別々に検査する。メニューのlive ownerと実Window、領域・capture・クリック成立を前提として確認し、メニューのcommandを実行しないよう overlapのrelease前にcaptureが実背景move widgetまたは非CLICK部品であることを検査する。全fixtureのデータはTempDir、nativeメニューはmain_hwnd無しで既存Fallbackへ送る。
+
+ハーネス修正と新11件を加えたが、製品のr6停止条件を変える前に上記の診断と合わせて19件を実行した。**8成功 / 11失敗、4.974秒、exit100、コンパイル5分39秒**（`target/769-r6-red-and-enter-diagnostic-2.log`、当時のsourceは `target/769-r6-red-source/`）。searchの6件、メニュー重なり拒否、新クリックの復元中拒否は成功。失敗は、旧main_chromeが最初のNoneを通ってGridMenuで失敗、Enterの上記競走、および新r6回帰のうち正の9件すべてが実メニュー等の前提を通過後の移動・展開の製品assertで失敗した。fixture成立の失敗は含まない。
+
+**最終検証:** Windows MSVC / default features / test・dev profile。すべて指定の `run-heavy.ps1 -Owner "codex-769"` 経由。比較用の実行は先行全件テストのlockを待ち、その後はlock領域への書込み不可の警告に従い BelowNormal / `CARGO_BUILD_JOBS=6` で実行した。core checkのみ既存native検証に合わせ `-j 1` を明示した。
+
+| コマンド・範囲 | 結果 | 証跡 (`target/`) |
+| --- | --- | --- |
+| 元の8件 + 新r6回帰11件の明示filter | **19成功 / 失敗0、18.007秒、exit0**。コンパイル9分24秒。上の修正前失敗11件を含む | `769-r6-green.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/folder_pane/) \| test(/main_chrome/) \| test(/search_nav/) \| test(/sidecar_restore/)' --no-fail-fast --retries 0 --no-tests fail` | **306成功 / 失敗0、169.094秒、exit0**（既存search_nav入力経路列挙等のslow 6件も成功）。P2のpointer B→現在地A / pointer→AccessKit現在地A回帰を含む | `769-r6-related.log` |
+| `scripts/test-focused.ps1 -Path ...`（変更したテスト保有Rust 4ファイルを配列指定） | **18 / 114 / 17 / 6件の4群すべて成功、計155実行、exit0**。2.133 / 28.554 / 15.612 / 12.342秒。上のfilterとの重複を含む | `769-r6-focused.log`、`769-r6-focused.ps1`、ログ内の `test-focused/runs/*` の各結果 |
+| `cargo check -p mimageviewer --bin mimageviewer-core -j 1` | **exit0、1分09秒** | `769-r6-check.log` |
+| 引数なし `cargo fmt` / `cargo fmt --check` | **各exit0** | `769-r6-fmt.log` / `769-r6-fmt-check.log` |
+| `git diff --check` / 検証前後のRust SHA-256照合 | **各成功** | `769-r6-diff-check.log` / `769-r6-source-hashes.json` |
+
+focused の指定順は `src/ui_folder_pane.rs`、`src/app/folder_pane_refresh_tests.rs`、`src/app/main_chrome.rs`、`src/app/search_nav_pane_frame_tests.rs`。`src/app.rs` はscriptのbroad判定で全lib指定になるため、従来と同じ分担で除外した。共有表helperの引数修正は上記の実入力回帰・停止理由の既存回帰・core checkで確認した。独立 Sol / xhigh のr6実装静的レビューは **ACCEPT**、追加findingなし。HEADは `762936a9c` のまま未コミット。全lib・ui_snapshot・build-dev・製品起動は行わず、backlogにも触れていない。
+
 ## 13. マウスでクリックした行を中央へ寄せない (2026-11-12 設計、ClaudeCode)
 
 利用者決定 (2026-11-12 夜、§1.769 の実機確認 依頼 40 から派生)。ツリーで行の名前、または ▶ / ▼ をマウスでクリックしたときは、その行を中央へ寄せない。押した行は既に見えているので、Windows のエクスプローラのナビゲーション ウィンドウと同じく、スクロール位置をそのままにする。
