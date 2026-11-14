@@ -83,14 +83,14 @@ pub(super) fn from_path(path: &Path) -> AnalysisExif {
         // Match read_exif_orientation_from_file's first-tag rule exactly,
         // including an invalid first tag followed by another orientation.
         return from_rexif(&exif, || {
-            crate::wic_decoder::read_wic_orientation(path).unwrap_or(1)
+            crate::thumb_loader::file_orientation_or_wic(None, path)
         });
     }
     // Preserve the existing WIC orientation fallback. G1 is unavailable for a
     // non-JPEG/TIFF path whose full raster was supplied by another caller:
     // rereading that file just to obtain EXIF is intentionally out of scope.
     AnalysisExif {
-        orientation: crate::wic_decoder::read_wic_orientation(path).unwrap_or(1),
+        orientation: crate::thumb_loader::file_orientation_or_wic(None, path),
         shot_exif: false,
     }
 }
@@ -100,10 +100,10 @@ pub(super) fn from_path(path: &Path) -> AnalysisExif {
 pub(super) fn from_path_bytes(path: &Path, bytes: &[u8]) -> AnalysisExif {
     match crate::exif_reader::read_rexif_from_path_bytes(bytes) {
         Some(exif) => from_rexif(&exif, || {
-            crate::wic_decoder::read_wic_orientation(path).unwrap_or(1)
+            crate::thumb_loader::file_orientation_or_wic(None, path)
         }),
         None => AnalysisExif {
-            orientation: crate::wic_decoder::read_wic_orientation(path).unwrap_or(1),
+            orientation: crate::thumb_loader::file_orientation_or_wic(None, path),
             shot_exif: false,
         },
     }

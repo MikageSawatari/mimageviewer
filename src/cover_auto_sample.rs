@@ -182,8 +182,19 @@ fn read_folder_prefix(path: &Path) -> Option<Vec<u8>> {
 
 /// The caller supplies the already enumerated image paths in FileNameSortKey
 /// order. Do not enumerate or sort again: this is the representative worker's
-/// same direct-child snapshot, and only eight bounded reads are allowed.
+/// same direct-child snapshot, and only eight bounded reads are allowed. On the
+/// worker only, a missing rexif orientation may query WIC once per sampled file.
 pub(crate) fn sample_folder_pages(paths: &[PathBuf], cover: &Path) -> PageAspectSample {
+    sample_folder_pages_with_wic(paths, cover, |path| {
+        crate::thumb_loader::file_orientation_or_wic(None, path)
+    })
+}
+
+fn sample_folder_pages_with_wic(
+    paths: &[PathBuf],
+    cover: &Path,
+    mut wic_orientation: impl FnMut(&Path) -> u16,
+) -> PageAspectSample {
     let leaf = paths
         .iter()
         .position(|path| crate::path_key::eq_keep_drive(path, cover));
@@ -193,11 +204,35 @@ pub(crate) fn sample_folder_pages(paths: &[PathBuf], cover: &Path) -> PageAspect
             .map(|index| {
                 let path = &paths[index];
                 let bytes = read_folder_prefix(path)?;
-                dimensions_from_prefix(&bytes, &path.to_string_lossy())
+                folder_dimensions_from_prefix(&bytes, path, &mut wic_orientation)
             })
             .collect()
     });
     PageAspectSample::new(dimensions, PageDimensionUnits::Pixels)
+}
+
+fn folder_dimensions_from_prefix(
+    bytes: &[u8],
+    path: &Path,
+    wic_orientation: &mut impl FnMut(&Path) -> u16,
+) -> Option<(f64, f64)> {
+    // This probe has already applied rexif, or native RAW/AVIF orientation.
+    // Never apply that transform twice. Reuse the owned prefix for the
+    // presence check; no second file read is needed for rexif.
+    let (mut width, mut height) = dimensions_from_prefix(bytes, &path.to_string_lossy())?;
+    if crate::raw_format::is_raw_path(path)
+        || path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("avif"))
+        || crate::thumb_loader::read_exif_orientation_from_bytes_if_present(bytes).is_some()
+    {
+        return Some((width, height));
+    }
+    if (5..=8).contains(&wic_orientation(path)) {
+        std::mem::swap(&mut width, &mut height);
+    }
+    Some((width, height))
 }
 
 #[cfg(test)]
@@ -211,6 +246,175 @@ mod tests {
             .write_to(&mut output, image::ImageFormat::Png)
             .unwrap();
         output.into_inner()
+    }
+
+    fn oriented_image(extension: &str, width: u32, height: u32, orientation: u16) -> Vec<u8> {
+        use image::ImageEncoder;
+        let mut exif = b"II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
+        exif.extend(orientation.to_le_bytes());
+        exif.extend([0; 6]);
+        let pixels = image::RgbImage::from_pixel(width, height, image::Rgb([30, 80, 140]));
+        let mut bytes = Vec::new();
+        match extension {
+            "webp" => {
+                let mut encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut bytes);
+                encoder.set_exif_metadata(exif).unwrap();
+                encoder
+                    .write_image(&pixels, width, height, image::ExtendedColorType::Rgb8)
+                    .unwrap();
+            }
+            "png" => {
+                let mut encoder = image::codecs::png::PngEncoder::new(&mut bytes);
+                encoder.set_exif_metadata(exif).unwrap();
+                encoder
+                    .write_image(&pixels, width, height, image::ExtendedColorType::Rgb8)
+                    .unwrap();
+            }
+            "jpg" => {
+                image::DynamicImage::ImageRgb8(pixels)
+                    .write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Jpeg)
+                    .unwrap();
+                let mut app1 = vec![0xff, 0xe1];
+                app1.extend(((exif.len() + 8) as u16).to_be_bytes());
+                app1.extend(b"Exif\0\0");
+                app1.extend(exif);
+                bytes.splice(2..2, app1);
+            }
+            _ => unreachable!(),
+        }
+        bytes
+    }
+
+    #[test]
+    fn folder_webp_orientation_matches_cover_file_decode_and_zip_stays_bytes_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = oriented_image("webp", 900, 600, 6);
+        let paths: Vec<_> = (0..11)
+            .map(|index| {
+                let path = dir.path().join(format!("{index:03}.webp"));
+                std::fs::write(&path, &bytes).unwrap();
+                path
+            })
+            .collect();
+        assert_eq!(
+            crate::app::probe_image_dims_from_bytes(&bytes, "page.webp"),
+            Some((900, 600))
+        );
+        let cover = crate::thumb_loader::decode_cover_auto_analysis_image(
+            crate::image_decode::Source::Path(&paths[0]),
+            None,
+            None,
+        )
+        .unwrap();
+        // This Windows WIC decoder exposes WebP's orientation, unlike rexif.
+        #[cfg(windows)]
+        assert_eq!(cover.native_dims, (600, 900));
+        let sample = sample_folder_pages(&paths, &paths[0]);
+        assert_eq!(
+            sample.dimensions,
+            vec![
+                Some((
+                    f64::from(cover.native_dims.0),
+                    f64::from(cover.native_dims.1)
+                ));
+                8
+            ]
+        );
+        #[cfg(windows)]
+        assert_eq!(sample.aspect, Ok(2.0 / 3.0));
+        let archive = zip((0..11)
+            .map(|i| (format!("{i:03}.webp"), bytes.clone()))
+            .collect());
+        let zip_sample = sample_zip_pages(archive.path(), "000.webp", None);
+        assert_eq!(zip_sample.dimensions, vec![Some((900.0, 600.0)); 8]);
+        assert_eq!(zip_sample.aspect, Err(PageAspectDecline::Landscape));
+    }
+
+    #[test]
+    fn folder_png_and_jpeg_orientation6_keep_released_dimensions() {
+        for (extension, stored) in [("png", (70, 100)), ("jpg", (100, 70))] {
+            let dir = tempfile::tempdir().unwrap();
+            let bytes = oriented_image(extension, stored.0, stored.1, 6);
+            let paths: Vec<_> = (0..4)
+                .map(|index| {
+                    let path = dir.path().join(format!("{index:03}.{extension}"));
+                    std::fs::write(&path, &bytes).unwrap();
+                    path
+                })
+                .collect();
+            let cover = crate::thumb_loader::decode_cover_auto_analysis_image(
+                crate::image_decode::Source::Path(&paths[0]),
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(cover.native_dims, (70, 100));
+            let sample = sample_folder_pages(&paths, &paths[0]);
+            assert_eq!(sample.dimensions, vec![Some((70.0, 100.0)); 3]);
+            assert_eq!(sample.aspect, Ok(0.7));
+        }
+    }
+
+    #[test]
+    fn folder_wic_fallback_only_for_missing_rexif_and_never_double_rotates() {
+        for orientation in [1, 6] {
+            let bytes = oriented_image("jpg", 100, 70, orientation);
+            let result = folder_dimensions_from_prefix(&bytes, Path::new("page.jpg"), &mut |_| {
+                panic!("valid rexif must not open WIC")
+            });
+            assert_eq!(
+                result,
+                Some(if orientation == 6 {
+                    (70.0, 100.0)
+                } else {
+                    (100.0, 70.0)
+                })
+            );
+        }
+        assert_eq!(
+            folder_dimensions_from_prefix(
+                b"invalid header",
+                Path::new("bad.png"),
+                &mut |_| panic!("no dimensions must not open WIC")
+            ),
+            None
+        );
+        let mut calls = 0;
+        let mut fallback = |_: &Path| {
+            calls += 1;
+            6
+        };
+        assert_eq!(
+            folder_dimensions_from_prefix(&png(100, 70), Path::new("plain.png"), &mut fallback),
+            Some((70.0, 100.0))
+        );
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn folder_wic_budget_keeps_eight_attempts_and_256k_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = png(100, 70);
+        bytes.resize(300 * 1024, 0);
+        let paths: Vec<_> = (0..12)
+            .map(|i| {
+                let path = dir.path().join(format!("{i:03}.png"));
+                std::fs::write(&path, &bytes).unwrap();
+                path
+            })
+            .collect();
+        assert_eq!(
+            read_folder_prefix(&paths[1]).unwrap().len(),
+            MAX_SAMPLE_PREFIX_BYTES as usize
+        );
+        let mut opened = Vec::new();
+        let sample = sample_folder_pages_with_wic(&paths, &paths[0], |path| {
+            opened.push(path.to_owned());
+            6
+        });
+        assert_eq!(opened, paths[1..=8]);
+        assert_eq!(sample.dimensions, vec![Some((70.0, 100.0)); 8]);
+        assert_eq!(sample.aspect, Ok(0.7));
     }
 
     fn zip(entries: Vec<(String, Vec<u8>)>) -> tempfile::NamedTempFile {

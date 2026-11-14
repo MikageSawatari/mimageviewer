@@ -2194,18 +2194,13 @@ pub fn apply_exif_orientation_from_bytes(
 }
 
 fn read_exif_orientation(path: &std::path::Path) -> u16 {
-    // まず rexif でファイルから EXIF を読む (JPEG, PNG, TIFF 等)
-    if let Some(orient) = read_exif_orientation_from_file(path) {
-        return orient;
-    }
+    file_orientation_or_wic(read_exif_orientation_from_file(path), path)
+}
 
-    // rexif が対応しない RAW 形式 (ORF, CR2, NEF 等) は
-    // WIC のメタデータクエリリーダーで Orientation を取得する
-    if let Some(orient) = crate::wic_decoder::read_wic_orientation(path) {
-        return orient;
-    }
-
-    1 // デフォルト: 回転なし
+/// The file display rule, shared with bounded folder-page sampling. A valid
+/// rexif value (including 1) wins; only an absent/invalid value queries WIC.
+pub(crate) fn file_orientation_or_wic(orientation: Option<u16>, path: &Path) -> u16 {
+    orientation.unwrap_or_else(|| crate::wic_decoder::read_wic_orientation(path).unwrap_or(1))
 }
 
 /// ファイルから Orientation タグだけを読む。
@@ -2228,15 +2223,16 @@ fn read_exif_orientation_from_file(path: &std::path::Path) -> Option<u16> {
 }
 
 pub(crate) fn read_exif_orientation_from_bytes(bytes: &[u8]) -> u16 {
-    rexif::parse_buffer(bytes)
-        .ok()
-        .and_then(|exif| {
-            exif.entries
-                .iter()
-                .find(|e| e.ifd.tag == 274)
-                .and_then(orientation_from_rexif_entry)
-        })
-        .unwrap_or(1)
+    read_exif_orientation_from_bytes_if_present(bytes).unwrap_or(1)
+}
+
+pub(crate) fn read_exif_orientation_from_bytes_if_present(bytes: &[u8]) -> Option<u16> {
+    rexif::parse_buffer(bytes).ok().and_then(|exif| {
+        exif.entries
+            .iter()
+            .find(|e| e.ifd.tag == 274)
+            .and_then(orientation_from_rexif_entry)
+    })
 }
 
 fn orientation_from_rexif_entry(entry: &rexif::ExifEntry) -> Option<u16> {
