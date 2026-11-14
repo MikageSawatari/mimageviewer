@@ -177,6 +177,7 @@
 - 規模 / 優先度: Small / P3。
 
 - 追記 (2026-11-14、統括): 3 件目の候補。`ui_fullscreen::continuous_quality_tests::section1674_paged_continuous_round_trip_refreshes_pdf_geometry_and_visible_quality` が、feat-755-miv-sound の lib 全件 (run-heavy -FullTest、ほかのセッションの重い処理と並行) で 1 回だけ "reverse paged current is undersampled: idx=3 Ltr/Vertical animation=false" で落ちた。同じブランチで continuous_quality_tests の 9 件を単独で流すと全件成功 (§1.755 の担当の観測)。そのブランチに Rust の変更は無い。master で出るかは未確認。
+- 追記 (2026-11-14、統括): 別の型の揺れ。feat-asr-t1 (8ff1c4ed0) の lib 全件で `ui_fullscreen::page_turn` と `wheel_frame_tests` の 21 件が「ordinal (フレームの `raw.events` の添字) が期待とずれる」で落ち、同じソースで 219 件を流し直すと全件成功 (文字起こし T1 の担当の観測)。失敗は 2 つの時間帯に固まっていた。これらのテストは `key_input` 経由で OS の実際のキー状態 (GetAsyncKeyState / GetKeyState) を読むので、全件の実行中に利用者が PC を操作すると修飾キーの事象が混ざって添字がずれる、という見立て (未確定)。負荷ではなく実機の入力に依存する揺れなら、テスト側でキー状態の読み出しを差し替えられるようにするのが根本の直し方。
 ### 1.773 表紙ページを回転した本でも、自動の表紙の切り出しを回転した向きで行う (描画時に切る) — 利用者要望 (2026-11-12)
 
 - 状態: **未着手・§1.764 を出荷する版 (2026-11-13 予定) の、その次の版で入れる (利用者決定 2026-11-12)**。§1.764 は回転を見ない自動のまま出荷し、この項目で直す。
