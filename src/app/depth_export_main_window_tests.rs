@@ -4,6 +4,189 @@ use crate::app::depth_main_window_tests::{RootDepthViewer, wheel};
 use crate::fs_exclusive_view::FsExclusiveView;
 use crate::ring_shortcut::{RingActionId, RingDirection};
 
+#[test]
+fn realmachine50_forwarded_open_after_independent_export_retires_previous_live_owner() {
+    realmachine50_forwarded_open_case(true);
+}
+
+#[test]
+fn realmachine50_forwarded_open_without_dialog_retires_previous_live_owner() {
+    realmachine50_forwarded_open_case(false);
+}
+
+fn realmachine50_forwarded_open_case(export: bool) {
+    let _input = crate::key_input::lock_test_input();
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    crate::ui_fonts::configure_fonts(&ctx);
+    crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
+    app.initialized = true;
+    app.indexer_init.mark_unavailable_if_not_ready();
+    app.settings.sidecar_backup_enabled = false;
+    app.settings.tag_sidecar_backup_enabled = false;
+    app.settings.detached_viewer_enabled = true;
+    app.settings.detached_viewer_open_images_in_window = true;
+    app.settings.page_turn_animation_enabled = false;
+    crate::app::depth_view_tests::install_pages(&mut app, &ctx);
+    app.fullscreen_idx = None;
+    let folder = app.tmp.path().join("forwarded-depth-export");
+    std::fs::create_dir_all(&folder).unwrap();
+    let requested = folder.join("forwarded.jpg");
+    image::RgbImage::from_pixel(8, 12, image::Rgb([90, 100, 110]))
+        .save(&requested)
+        .unwrap();
+    let old_window = 88_997;
+    let old = app.build_active_context_for_test(Some(old_window), DetachedSource::Image, |owner| {
+        crate::app::depth_view_tests::install_pages(owner, &ctx);
+        owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+        owner.detached_viewer_independent_active = true;
+        owner.native_video_in_window_active = false;
+        crate::app::depth_view_tests::install_ready_depth_for_export(owner);
+    });
+    let old_render = app
+        .with_viewer_context(old, |owner| {
+            owner.mark_active_detached_viewport_rendered(&ctx);
+            let FsExclusiveView::Depth(state) = &owner.fs_exclusive_view else {
+                unreachable!()
+            };
+            let paint_pass = ctx.cumulative_pass_nr();
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    snapshot_id(old),
+                    DisplaySnapshot {
+                        resource_id: state.ready().unwrap().resource_id,
+                        paint_pass,
+                        page_idx: 0,
+                        items_generation: owner.items_generation,
+                        uv: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1., 1.)),
+                        quarter_turns: 0,
+                        paint_size: egui::vec2(200., 300.),
+                        underlay: crate::ui_fullscreen::FsBgStyle::Solid(egui::Color32::BLACK),
+                    },
+                )
+            });
+            if export {
+                owner.open_depth_export(&ctx, 0);
+                assert!(owner.depth_export_dialog_open());
+            }
+            owner.wgpu_render_state.clone().unwrap()
+        })
+        .unwrap();
+    assert_eq!(app.depth_export_owner_context(), export.then_some(old));
+    app.activation_open_path_tx
+        .send(crate::single_instance::ActivationOpenPath::received(
+            requested.clone(),
+            app.remote_session_handle(),
+        ))
+        .unwrap();
+    app.poll_activation_open_paths(&ctx);
+    if export {
+        assert!(app.startup_open_path_resolve_pending.is_none());
+        assert_eq!(app.active_detached_window_id(), Some(old_window));
+        assert!(app.document_open_modal_admission_blocked());
+        // Real Escape -> Cancel; never clear the modal operation to bypass admission.
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000., 800.),
+            )),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        });
+        app.with_viewer_context(old, |owner| owner.draw_depth_export_dialog(&ctx))
+            .unwrap();
+        ctx.end_pass().drop_without_applying_deltas();
+        assert!(!app.depth_export_dialog_open());
+        assert!(!app.document_open_modal_admission_blocked());
+        app.poll_activation_open_paths(&ctx);
+    }
+    assert!(
+        app.startup_open_path_resolve_pending.is_some(),
+        "held open reaches the real resolver"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        app.poll_startup_open_path_resolve(&ctx);
+        app.poll_sidecar_restore(&ctx);
+        app.poll_book_composition_read(&ctx);
+        let opened = app.active_detached_window_id().filter(|window| *window != old_window)
+            .and_then(|window| app.with_window_viewer_context(window, |owner| {
+                owner.poll_sidecar_restore(&ctx);
+                owner.poll_book_composition_read(&ctx);
+                owner.fullscreen_idx.and_then(|idx| owner.items.get(idx)).is_some_and(|item|
+                    matches!(item, GridItem::Image(path) if crate::path_key::eq_keep_drive(path, &requested)))
+            }).ok()).unwrap_or(false);
+        if opened
+            && app.startup_open_path_resolve_pending.is_none()
+            && !app.sidecar_restore_active()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "forwarded target did not finish: session={:?}, main_idx={:?}, modal={}, pending={}",
+            app.active_detached_window_id(),
+            app.fullscreen_idx,
+            app.document_open_modal_admission_blocked(),
+            app.startup_open_path_resolve_pending.is_some()
+        );
+        std::thread::yield_now();
+    }
+    // The target was accepted and opened. The old owner must no longer hold Depth.
+    app.with_viewer_context(old, |owner| {
+        assert!(
+            !owner.fs_exclusive_view.is_depth(),
+            "forwarded open replaced the active session without retiring its old Depth owner"
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        app.detached_image_windows
+            .iter()
+            .filter(|window| window.id == old_window)
+            .count(),
+        1,
+        "the previous independent window is preserved as one passive snapshot"
+    );
+    assert_eq!(
+        app.detached_window_state(old_window),
+        Some(DetachedWindowState::Parked)
+    );
+    assert!(
+        old_render
+            .renderer
+            .read()
+            .callback_resources
+            .get::<crate::depth_parallax_wgpu::DepthRenderResourcesRef>()
+            .is_none(),
+        "the retired owner's GPU publication is removed"
+    );
+    let new_window = app.active_detached_window_id().unwrap();
+    app.with_window_viewer_context(new_window, |owner| {
+        let idx = owner.fullscreen_idx.unwrap();
+        assert_ne!(
+            owner.depth_entry_allowed(idx),
+            Err(crate::depth_parallax::DepthEntryBlock::OtherWindow)
+        );
+    })
+    .unwrap();
+    assert!(app.activate_detached_image_window_snapshot(&ctx, old_window));
+    app.with_viewer_context(old, |owner| {
+        let idx = owner.fullscreen_idx.unwrap();
+        assert_ne!(
+            owner.depth_entry_allowed(idx),
+            Err(crate::depth_parallax::DepthEntryBlock::OtherWindow)
+        );
+    })
+    .unwrap();
+}
+
 fn transparent_source(app: &mut App) {
     let Some(FsCacheEntry::Static { pixels, tex, .. }) = app.fs_cache.get_mut(&0) else {
         unreachable!()

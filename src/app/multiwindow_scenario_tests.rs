@@ -858,9 +858,18 @@ impl ScenarioDriver {
     /// Deferred children repaint independently after ROOT registration. Their events
     /// become visible to the App on the next ROOT update.
     fn deferred(&mut self, id: egui::ViewportId) -> ScenarioFrame {
+        self.deferred_with_events(id, Vec::new())
+    }
+
+    fn deferred_with_events(
+        &mut self,
+        id: egui::ViewportId,
+        events: Vec<egui::Event>,
+    ) -> ScenarioFrame {
         self.number += 1;
         let callback = Arc::clone(self.callbacks.get(&id).expect("ROOT registered child"));
-        let input = Self::input(id, *self.focused.borrow(), CHILD_SIZE, &self.known.borrow());
+        let mut input = Self::input(id, *self.focused.borrow(), CHILD_SIZE, &self.known.borrow());
+        input.events = events;
         let output = with_capture(|| self.ctx.run_ui(input, |ui| callback(ui)));
         let mut records = HashMap::new();
         let mut white = HashMap::new();
@@ -883,6 +892,119 @@ impl ScenarioDriver {
     fn focus(&mut self, id: egui::ViewportId) {
         *self.focused.borrow_mut() = Some(id);
     }
+}
+
+fn realmachine50_parked_click_case(depth: bool) {
+    std::thread::spawn(move || {
+        use super::detached_window_manager::{
+            DetachedActivationWatchSample, DetachedActivationWatchState,
+            DetachedActivationWatchTargetRect,
+        };
+        let _input = crate::key_input::lock_test_input();
+        let mut app = setup_app_for_test();
+        app.initialized = true;
+        app.indexer_init.mark_unavailable_if_not_ready();
+        app.settings.detached_viewer_enabled = true;
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.fullscreen_keep_on_app_switch = true;
+        app.settings.page_turn_animation_enabled = false;
+        let mut driver = ScenarioDriver::new();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
+        let ctx = driver.ctx.clone();
+        let paths = [app.tmp.path().join("first.png"), app.tmp.path().join("second.png")];
+        for path in &paths { save_portrait(path, [60, 90, 120]); }
+        app.current_folder = Some(app.tmp.path().to_path_buf());
+        app.items = paths.iter().cloned().map(GridItem::Image).collect();
+        app.image_metas = vec![None; 2];
+        app.thumbnails = vec![ThumbnailState::Pending; 2];
+        app.rebuild_visible_indices();
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        for idx in 0..2 {
+            super::source_texture_test_support::seed(&mut app, &ctx, idx);
+        }
+        assert!(app.prepare_detached_context_for_grid_open(&ctx, 0));
+        app.fs_open_intent_from_grid = true;
+        app.open_fullscreen(0, HistoryTrigger::UserChosen);
+        let first = app.active_detached_window_id().unwrap();
+        let owner = app.locate_window_context(first).unwrap().0;
+        assert_ne!(owner, app.viewer_context_main());
+        driver.focus(App::detached_image_window_viewport_id(first));
+        for _ in 0..3 { driver.root(&mut app); }
+        app.with_viewer_context(owner, |viewer| {
+            assert!(viewer.detached_viewer_independent_active);
+            if depth {
+                viewer.set_fs_exclusive_view(
+                    crate::fs_exclusive_view::FsExclusiveView::Depth(
+                        crate::depth_parallax::DepthViewState::new(viewer.edit_request_owner_context())),
+                    "realmachine50_depth_before_pause",
+                );
+            }
+        }).unwrap();
+        assert!(app.prepare_detached_context_for_grid_open(&ctx, 1));
+        app.fs_open_intent_from_grid = true;
+        app.open_fullscreen(1, HistoryTrigger::UserChosen);
+        let second = app.active_detached_window_id().unwrap();
+        assert_ne!(second, first);
+        assert_eq!(app.detached_window_state(first), Some(DetachedWindowState::Parked));
+        app.with_viewer_context(owner, |viewer| assert!(!viewer.fs_exclusive_view.is_depth())).unwrap();
+        driver.focus(App::detached_image_window_viewport_id(second));
+        driver.root(&mut app);
+        assert_eq!(app.accept_active_detached_window_close(&ctx, second, "realmachine50_sibling_close"), Some(true));
+        let viewport = App::detached_image_window_viewport_id(first);
+        let hwnd = 0x7675_0001;
+        app.detached_window_hwnd_set(first, hwnd);
+        app.set_detached_window_live_hwnds_for_test([hwnd]);
+        driver.focus(egui::ViewportId::ROOT);
+        for _ in 0..3 { driver.root(&mut app); }
+        assert!(driver.callbacks.contains_key(&viewport));
+        let target = app.deferred_detached_activation_watch_targets().into_iter()
+            .find(|target| target.window_id == first).expect("paused live HWND remains a watch target");
+        assert!(target.eligible);
+        let target = DetachedActivationWatchTargetRect {
+            window_id: first, hwnd, eligible: target.eligible,
+            close_hit_test: target.close_hit_test,
+            left: 0, top: 0, right: CHILD_SIZE.x as i32, bottom: CHILD_SIZE.y as i32,
+        };
+        let up = DetachedActivationWatchSample {
+            foreground_hwnd: hwnd, cursor_root_hwnd: hwnd, cursor_pos: Some((80, 100)),
+            ..Default::default()
+        };
+        // The physical watcher works when it samples both edges. Do not deliver
+        // that control request: this case exercises delivery from the actual child.
+        let mut control = DetachedActivationWatchState::default();
+        assert!(App::detached_activation_watch_step_result(&mut control,
+            DetachedActivationWatchSample { left_button_down: true, ..up }, &[target]).activation.is_none());
+        assert_eq!(App::detached_activation_watch_step_result(&mut control, up, &[target])
+            .activation.unwrap().window_id, first);
+        let mut between_polls = DetachedActivationWatchState::default();
+        assert!(App::detached_activation_watch_step_result(&mut between_polls, up, &[target]).activation.is_none());
+        driver.focus(viewport);
+        let pos = egui::pos2(80., 100.);
+        driver.deferred_with_events(viewport, vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary,
+                pressed: true, modifiers: egui::Modifiers::NONE },
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary,
+                pressed: false, modifiers: egui::Modifiers::NONE },
+        ]);
+        assert!(App::detached_activation_watch_step_result(&mut between_polls, up, &[target]).activation.is_none());
+        driver.root(&mut app);
+        assert_eq!(app.active_detached_window_id(), Some(first),
+            "the paused viewport received a complete click, even though neither OS sample contained its down edge");
+        assert_eq!(app.active_viewer_context_id(), Some(owner));
+        assert_eq!(app.viewer_context_window(owner), Some(first));
+        assert!(!app.detached_image_windows.iter().any(|window| window.id == first));
+    }).join().unwrap();
+}
+
+#[test]
+fn realmachine50_parked_depth_window_click_reactivates_after_sibling_close() {
+    realmachine50_parked_click_case(true);
+}
+
+#[test]
+fn realmachine50_parked_flat_window_click_reactivates_after_sibling_close() {
+    realmachine50_parked_click_case(false);
 }
 
 fn records_for(frame: &ScenarioFrame, id: egui::ViewportId) -> &[PaintRecord] {

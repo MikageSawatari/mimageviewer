@@ -1455,6 +1455,14 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-14: §1.767 サブPC依頼50の原因調査と赤テスト（製品未変更）
+
+正本は [依頼50の調査と修正設計](depth-parallax-realmachine50-investigation.md)。
+停止静止画のprimary click配送（BA-7、実機Aの原因は未確定）、外部openの旧owner handoff迂回（BA-7 / BA-5）、
+キーsubclassだけに残るrect HWND同定（BA-1）を分離して調査する。製品・viewport・registry・vendorは変えず失敗回帰を追加する段階。
+修正案は既存intent／採用handoffと生成・破棄の正本へそろえ、guard / delay / retry / 追加repaint / Appの新しいpendingは使わない。
+全childの正確なHWNDを渡す正規backend hookは今回のvendor変更禁止を越えて実装せず、次段の範囲を設計担当と独立レビューで確定する。
+
 ### 2026-11-14: 3D 写真第 2 段の課題 1 — 独立したメディアウィンドウから静止画の窓への交換と、独立性の確定 (§1.767)
 
 正本は [depth-parallax-plan §6.4.5](depth-parallax-plan.md)。利用者の決定 (2026-11-14): 独立したメディアウィンドウから同じ閲覧の送りで画像へ進んだら、
