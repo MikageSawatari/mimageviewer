@@ -57912,7 +57912,7 @@ impl App {
             return Err("出力するバリエーションを選んでください".to_string());
         }
 
-        let suffixes: Vec<u8> = entries.iter().map(|entry| entry.suffix).collect();
+        let suffixes: Vec<&str> = entries.iter().map(|entry| entry.suffix.as_str()).collect();
         let resolved_basename = crate::export_dialog::resolve_session_basename(
             &output_dir,
             &basename,
