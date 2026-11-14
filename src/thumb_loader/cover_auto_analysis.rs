@@ -18,8 +18,6 @@ pub(crate) struct CoverAutoAnalysis {
     /// Dimensions after the released decoder's orientation rules. PDF uses page-box catalog units, because
     /// only the ratio enters the detector (not the display raster's rounding).
     pub native_dims: (u32, u32),
-    /// Native pixels in the released decoder's coordinates, or unrounded PDF page-box points for G2.
-    pub photo_dims: (f64, f64),
     pub shot_exif: bool,
     pub orientation: u16,
     pub dct_scale_num: Option<u32>,
@@ -86,7 +84,6 @@ pub(crate) fn decode_cover_auto_analysis_image(
                         image: apply_orientation(image, orientation),
                         decoder: crate::stats::DecodeSource::Native,
                         native_dims,
-                        photo_dims: (f64::from(native_dims.0), f64::from(native_dims.1)),
                         shot_exif: metadata.shot_exif,
                         orientation,
                         dct_scale_num: Some(stats.scale_num),
@@ -133,7 +130,6 @@ pub(crate) fn decode_cover_auto_analysis_image(
     check_cancel(cancel)?;
     Ok(CoverAutoAnalysis {
         native_dims: (image.width(), image.height()),
-        photo_dims: (f64::from(image.width()), f64::from(image.height())),
         shot_exif: metadata.shot_exif,
         image,
         decoder,
@@ -184,7 +180,6 @@ fn decode_native_metadata_path(
     };
     Ok(CoverAutoAnalysis {
         native_dims: (image.width(), image.height()),
-        photo_dims: (f64::from(image.width()), f64::from(image.height())),
         shot_exif: metadata.shot_exif,
         image,
         decoder,
@@ -240,7 +235,6 @@ pub(crate) fn decode_cover_auto_analysis_pdf(
         image: rendered.image,
         decoder: crate::stats::DecodeSource::Native,
         native_dims,
-        photo_dims: (f64::from(width), f64::from(height)),
         shot_exif: false,
         orientation: 1,
         dct_scale_num: None,
@@ -339,7 +333,6 @@ mod tests {
             assert_eq!(analysis.orientation, 6);
             assert!(analysis.shot_exif);
             assert_eq!(analysis.native_dims, (60, 90));
-            assert_eq!(analysis.photo_dims, (60.0, 90.0));
             assert_eq!((analysis.image.width(), analysis.image.height()), (60, 90));
         }
     }
@@ -378,10 +371,6 @@ mod tests {
                 assert_eq!(analysis.orientation, legacy);
                 assert!(analysis.shot_exif);
                 assert_eq!(analysis.native_dims, (expected.width(), expected.height()));
-                assert_eq!(
-                    analysis.photo_dims,
-                    (f64::from(expected.width()), f64::from(expected.height()))
-                );
                 assert_eq!(analysis.image.to_rgba8(), expected.to_rgba8());
             }
             let display = image::load_from_memory(&bytes).unwrap();
@@ -404,7 +393,7 @@ mod tests {
                 decode_cover_auto_analysis_image(Source::Path(&path), Some(&upright), None)
                     .unwrap();
             assert!(!reused.shot_exif);
-            assert_eq!(reused.photo_dims, (60.0, 90.0));
+            assert_eq!(reused.native_dims, (60, 90));
             assert_eq!(reused.image.to_rgb8(), upright.to_rgb8());
         }
     }

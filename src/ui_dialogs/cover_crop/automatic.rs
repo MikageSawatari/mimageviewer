@@ -53,16 +53,16 @@ impl AutoDetection {
     pub(super) fn analyze(
         image: &image::DynamicImage,
         dimensions: (u32, u32),
-        sample: &crate::cover_auto_sample::PageAspectSample,
-        evidence: crate::cover_auto_crop::photo::PhotoEvidence,
+        page_aspect: Option<f64>,
+        shot_exif: bool,
         binding: ReadingDirection,
     ) -> Self {
         let mut reports = [Err(AutoCropDecline::NoStructure); 4];
         crate::cover_auto_crop::detect_cover_crops_with_photo_report(
             image,
             dimensions,
-            sample,
-            evidence,
+            page_aspect,
+            shot_exif,
             binding,
             |angle, result| reports[angle.degrees() as usize / 90] = result,
         );
@@ -236,12 +236,6 @@ mod tests {
             (
                 PhotoLike {
                     reason: crate::cover_auto_crop::photo::PhotoLikeReason::ShotExif,
-                },
-                "写真のように見えるため自動では切りません",
-            ),
-            (
-                PhotoLike {
-                    reason: crate::cover_auto_crop::photo::PhotoLikeReason::TransposedPage,
                 },
                 "写真のように見えるため自動では切りません",
             ),

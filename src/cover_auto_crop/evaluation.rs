@@ -113,7 +113,7 @@ fn rotated_rect(rect: [f64; 4], dims: (u32, u32), rotation: Rotation) -> [f64; 4
 
 struct LoadedCase {
     image: DynamicImage,
-    sample: crate::cover_auto_sample::PageAspectSample,
+    sample: Result<f64, crate::cover_auto_sample::PageAspectDecline>,
     shot_exif: bool,
     zip_leaf: Option<String>,
     worker: Option<crate::thumb_loader::cover_auto_eval_decode::DecodedCover>,
@@ -237,13 +237,9 @@ fn load_case(
             .transpose()?;
         Ok(LoadedCase {
             image,
-            sample: crate::cover_auto_sample::PageAspectSample {
-                aspect: truth
-                    .page_aspect
-                    .ok_or(crate::cover_auto_sample::PageAspectDecline::TooFew),
-                dimensions: Vec::new(),
-                units: crate::cover_auto_sample::PageDimensionUnits::Pixels,
-            },
+            sample: truth
+                .page_aspect
+                .ok_or(crate::cover_auto_sample::PageAspectDecline::TooFew),
             shot_exif: crate::thumb_loader::cover_auto_eval_decode::shot_exif(&bytes),
             zip_leaf: None,
             worker,
@@ -381,11 +377,8 @@ fn evaluate_folder_list(
         let outcomes = evaluate_angles(
             &analysis.image,
             analysis.native_dims,
-            &sample,
-            photo::PhotoEvidence {
-                shot_exif: analysis.shot_exif,
-                dimensions: analysis.photo_dims,
-            },
+            sample.ok(),
+            analysis.shot_exif,
             identity.binding,
             fallback_config,
         );
@@ -409,8 +402,8 @@ fn evaluate_folder_list(
             "reason": reason,
             "native_dims": analysis.native_dims,
             "decoded_dims": [analysis.image.width(), analysis.image.height()],
-            "page_aspect": sample.aspect.ok(),
-            "page_aspect_decline": sample.aspect.err().map(crate::cover_auto_sample::PageAspectDecline::as_str),
+            "page_aspect": sample.ok(),
+            "page_aspect_decline": sample.err().map(crate::cover_auto_sample::PageAspectDecline::as_str),
             "crop": unrotated.ok().map(CoverCrop::values),
             "all_crops": outcomes.map(|outcome| outcome.final_result.ok().map(CoverCrop::values)),
             "original_decline": selected.original.err().map(|reason| reason.as_str().into_owned()),
@@ -512,21 +505,15 @@ fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Erro
         let saved = mode.saved_rotation.unwrap_or_else(|| {
             Rotation::from_degrees(truth.saved_rotation - mode.image_rotation.degrees())
         });
-        let aspect = sample.aspect.ok();
-        let evidence = photo::PhotoEvidence {
-            shot_exif: worker
-                .as_ref()
-                .map_or(shot_exif, |decoded| decoded.shot_exif),
-            dimensions: worker.as_ref().map_or(
-                (f64::from(native_dims.0), f64::from(native_dims.1)),
-                |decoded| decoded.photo_dims,
-            ),
-        };
+        let aspect = sample.ok();
+        let shot_exif = worker
+            .as_ref()
+            .map_or(shot_exif, |decoded| decoded.shot_exif);
         let outcomes = evaluate_angles(
             decoded_image,
             native_dims,
-            &sample,
-            evidence,
+            aspect,
+            shot_exif,
             binding,
             fallback_config,
         );
@@ -638,6 +625,40 @@ fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+fn synthetic_shot_jpeg(width: u32, height: u32) -> Result<Vec<u8>, image::ImageError> {
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90)
+        .encode_image(&DynamicImage::new_rgb8(width, height))?;
+    // IFD0: Orientation=1 and ExifIFD pointer at byte 38. ExifIFD:
+    // ExposureTime=1/125, stored as a rational at byte 56. This exercises G1
+    // through actual JPEG metadata, independently of cover/body dimensions.
+    let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+    let entry = |bytes: &mut Vec<u8>, tag: u16, format: u16, value: u32| {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&format.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+    };
+    tiff.extend_from_slice(&2_u16.to_le_bytes());
+    entry(&mut tiff, 274, 3, 1);
+    entry(&mut tiff, 34665, 4, 38);
+    tiff.extend_from_slice(&0_u32.to_le_bytes());
+    tiff.extend_from_slice(&1_u16.to_le_bytes());
+    entry(&mut tiff, 33434, 5, 56);
+    tiff.extend_from_slice(&0_u32.to_le_bytes());
+    tiff.extend_from_slice(&1_u32.to_le_bytes());
+    tiff.extend_from_slice(&125_u32.to_le_bytes());
+    let mut bytes = vec![0xff, 0xd8, 0xff, 0xe1];
+    bytes.extend_from_slice(&((tiff.len() + 8) as u16).to_be_bytes());
+    bytes.extend_from_slice(b"Exif\0\0");
+    bytes.extend_from_slice(&tiff);
+    bytes.extend_from_slice(&jpeg[2..]);
+    assert!(crate::thumb_loader::cover_auto_eval_decode::shot_exif(
+        &bytes
+    ));
+    Ok(bytes)
+}
+
 #[test]
 fn folder_evaluation_emits_counts_and_numeric_rows_without_images_or_names()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -648,7 +669,10 @@ fn folder_evaluation_emits_counts_and_numeric_rows_without_images_or_names()
         .tempdir_in(&target)?;
     let folder = temp.path().join("private-folder-name");
     std::fs::create_dir(&folder)?;
-    image::DynamicImage::new_rgb8(150, 100).save(folder.join("000-private-cover-name.png"))?;
+    std::fs::write(
+        folder.join("000-private-cover-name.jpg"),
+        synthetic_shot_jpeg(150, 100)?,
+    )?;
     for index in 1..=8 {
         image::DynamicImage::new_rgb8(100, 150)
             .save(folder.join(format!("{index:03}-private-body-name.png")))?;
@@ -668,10 +692,10 @@ fn folder_evaluation_emits_counts_and_numeric_rows_without_images_or_names()
     assert_eq!(summary["total"], 1);
     assert_eq!(summary["cropped"], 0);
     assert_eq!(summary["declined"], 1);
-    assert_eq!(summary["decline_reasons"]["photo-like/transposed-page"], 1);
+    assert_eq!(summary["decline_reasons"]["photo-like/shot-exif"], 1);
     assert_eq!(summary["rows"][0]["index"], 0);
     assert_eq!(summary["rows"][0]["native_dims"], json!([150, 100]));
-    assert_eq!(summary["rows"][0]["reason"], "photo-like/transposed-page");
+    assert_eq!(summary["rows"][0]["reason"], "photo-like/shot-exif");
     assert!(summary["rows"][0]["crop"].is_null());
     Ok(())
 }
@@ -714,10 +738,20 @@ fn folder_evaluation_fallback_synthetic_counts_keep_guard_and_emit_no_images_or_
         .prefix("cover-auto-fallback-eval-")
         .tempdir_in(&target)?;
     let mut folders = Vec::new();
-    for (index, width) in [150, 240].into_iter().enumerate() {
+    // Both covers transpose the body dimensions. Only real shooting EXIF may
+    // guard them now; the otherwise identical plain cover reaches fallback.
+    for index in 0..2 {
+        let width = 150;
         let folder = temp.path().join(format!("private-folder-{index}"));
         std::fs::create_dir(&folder)?;
-        DynamicImage::new_rgb8(width, 100).save(folder.join("000-private-cover.png"))?;
+        if index == 0 {
+            std::fs::write(
+                folder.join("000-private-cover.jpg"),
+                synthetic_shot_jpeg(width, 100)?,
+            )?;
+        } else {
+            DynamicImage::new_rgb8(width, 100).save(folder.join("000-private-cover.png"))?;
+        }
         for page in 1..=8 {
             DynamicImage::new_rgb8(100, 150)
                 .save(folder.join(format!("{page:03}-private-body.png")))?;
@@ -755,7 +789,7 @@ fn folder_evaluation_fallback_synthetic_counts_keep_guard_and_emit_no_images_or_
         assert!(summary["fallback_wrong"].is_null());
         assert_eq!(
             summary["rows"][0]["original_decline"],
-            "photo-like/transposed-page"
+            "photo-like/shot-exif"
         );
         assert!(summary["rows"][0]["fallback"].is_null());
         assert!(summary["rows"][0]["crop"].is_null());

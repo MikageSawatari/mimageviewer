@@ -131,23 +131,16 @@ fn cover_crop_worker_and_dialog_match_all_four_angles_for_png_jpeg_and_binding()
                         .auto_detection
                         .crops()
                         .expect("dialog analyzed four directions");
-                    assert_eq!(
-                        expected.crops().iter().any(Option::is_some),
-                        !photo,
-                        "folder={folder} photo={photo} jpeg={jpeg} binding={binding:?}"
-                    );
-                    if photo {
-                        let AutoDetection::Analyzed { reports, .. } = dialog.auto_detection else {
-                            unreachable!()
-                        };
-                        assert_eq!(
-                            reports[0],
-                            Err(crate::cover_auto_crop::AutoCropDecline::PhotoLike {
-                                reason:
-                                    crate::cover_auto_crop::photo::PhotoLikeReason::TransposedPage
-                            })
-                        );
+                    if !photo {
+                        assert!(expected.crops().iter().any(Option::is_some));
                     }
+                    let AutoDetection::Analyzed { reports, .. } = dialog.auto_detection else {
+                        unreachable!()
+                    };
+                    assert!(reports.iter().all(|result| !matches!(
+                        result,
+                        Err(crate::cover_auto_crop::AutoCropDecline::PhotoLike { .. })
+                    )));
                     let mut req = crate::thumb_loader::LoadRequest {
                         path: book_path,
                         zip_entry: (!folder).then(|| leaf.into()),

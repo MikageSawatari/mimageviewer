@@ -1,6 +1,6 @@
 //! Real decoders, dialog acceptance, pin persistence, and thumbnail workers.
 use super::*;
-use crate::cover_auto_crop::{AutoCropDecline, photo::PhotoLikeReason};
+use crate::cover_auto_crop::AutoCropDecline;
 use crate::cover_auto_material::AutoMaterial;
 use crate::thumb_loader::{LoadRequest, LoadSourcePolicy, ThumbMsg};
 use egui_kittest::kittest::Queryable;
@@ -174,8 +174,7 @@ fn cover_crop_png_orientation6_auto_accept_reload_keeps_legacy_manual_pixels_in_
         } else {
             crate::cover_auto_sample::sample_zip_pages(&book, "000.png", None)
         };
-        assert_eq!(sample.aspect, Ok(0.7));
-        assert_eq!(sample.dimensions, vec![Some((70.0, 100.0)); 8]);
+        assert_eq!(sample, Ok(0.7));
         let catalog =
             Arc::new(crate::catalog::CatalogDb::open(&root.join("cache"), &root).unwrap());
         let mut auto_request = request(&book, folder, env.auto_cover_crop);
@@ -236,7 +235,7 @@ fn cover_crop_png_orientation6_auto_accept_reload_keeps_legacy_manual_pixels_in_
 }
 
 #[test]
-fn cover_crop_worker_and_dialog_g2_match_every_physical_and_saved_rotation() {
+fn cover_crop_worker_and_dialog_continue_for_transposed_page_dimensions_at_every_rotation() {
     let upright = jacket().resize_exact(810, 512, image::imageops::FilterType::Nearest);
     let aspect = 512.0 / 810.0;
     assert!(
@@ -248,7 +247,7 @@ fn cover_crop_worker_and_dialog_g2_match_every_physical_and_saved_rotation() {
         )
         .crop_for(Rotation::None)
         .is_some(),
-        "fixture must crop without G2"
+        "fixture must crop without shooting metadata"
     );
     for folder in [false, true] {
         for physical in [
@@ -300,19 +299,23 @@ fn cover_crop_worker_and_dialog_g2_match_every_physical_and_saved_rotation() {
             .into_iter()
             .enumerate()
             {
-                let expected = if (physical.degrees() + saved.degrees()) % 180 == 0 {
-                    AutoCropDecline::PhotoLike {
-                        reason: PhotoLikeReason::TransposedPage,
-                    }
+                if (physical.degrees() + saved.degrees()) % 180 == 0 {
+                    assert!(
+                        !matches!(reports[index], Err(AutoCropDecline::PhotoLike { .. })),
+                        "same-sized scan must continue: folder={folder}/{physical:?}/{saved:?}: {:?}",
+                        reports[index]
+                    );
                 } else {
-                    AutoCropDecline::RawAspectGate
-                };
-                assert_eq!(
-                    reports[index],
-                    Err(expected),
-                    "folder={folder}/{physical:?}/{saved:?}"
-                );
+                    assert_eq!(reports[index], Err(AutoCropDecline::RawAspectGate));
+                }
             }
+            assert!(
+                prepared
+                    .auto_detection
+                    .crop_for(Rotation::from_degrees(-physical.degrees()))
+                    .is_some(),
+                "corrective saved rotation must crop despite matching page dimensions"
+            );
             let pins =
                 crate::folder_thumb_pins::FolderThumbPinDb::open_at(&root.join("pins.db")).unwrap();
             let catalog =
@@ -331,7 +334,7 @@ fn cover_crop_worker_and_dialog_g2_match_every_physical_and_saved_rotation() {
                     .unwrap()
                     .crops()
                     .iter()
-                    .all(Option::is_none)
+                    .any(Option::is_some)
             );
         }
     }

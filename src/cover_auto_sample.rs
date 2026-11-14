@@ -25,37 +25,6 @@ pub(crate) enum PageAspectDecline {
     Inconsistent,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PageDimensionUnits {
-    Pixels,
-    PdfPoints,
-}
-
-/// Dimensions keep every selected slot, including unknown pages and the
-/// leading landscape pages omitted only from the aspect consensus. Photo
-/// detection uses these original slots without another read.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct PageAspectSample {
-    pub(crate) aspect: Result<f64, PageAspectDecline>,
-    pub(crate) dimensions: Vec<Option<(f64, f64)>>,
-    pub(crate) units: PageDimensionUnits,
-}
-
-impl PageAspectSample {
-    fn new(dimensions: Vec<Option<(f64, f64)>>, units: PageDimensionUnits) -> Self {
-        let aspect = aspect_from_slots(
-            dimensions
-                .iter()
-                .map(|size| size.map(|(width, height)| width / height)),
-        );
-        Self {
-            aspect,
-            dimensions,
-            units,
-        }
-    }
-}
-
 impl PageAspectDecline {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -114,19 +83,11 @@ pub(crate) fn page_aspect_from_sizes_report(
     sizes: &[(f32, f32)],
     leaf: usize,
 ) -> Result<f64, PageAspectDecline> {
-    page_aspect_sample_from_sizes(sizes, leaf).aspect
-}
-
-pub(crate) fn page_aspect_sample_from_sizes(sizes: &[(f32, f32)], leaf: usize) -> PageAspectSample {
-    let dimensions = sample_indices(sizes.len(), leaf)
-        .into_iter()
-        .map(|index| {
-            let (width, height) = sizes[index];
-            (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
-                .then_some((f64::from(width), f64::from(height)))
-        })
-        .collect();
-    PageAspectSample::new(dimensions, PageDimensionUnits::PdfPoints)
+    aspect_from_slots(sample_indices(sizes.len(), leaf).into_iter().map(|index| {
+        let (width, height) = sizes[index];
+        (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
+            .then_some(f64::from(width) / f64::from(height))
+    }))
 }
 
 /// Read no more than eight 256 KiB prefixes, without nested archive expansion,
@@ -144,26 +105,25 @@ pub(crate) fn sample_zip_page_aspect_report(
     leaf_entry: &str,
     prefix: Option<&str>,
 ) -> Result<f64, PageAspectDecline> {
-    sample_zip_pages(path, leaf_entry, prefix).aspect
+    sample_zip_pages(path, leaf_entry, prefix)
 }
 
 pub(crate) fn sample_zip_pages(
     path: &Path,
     leaf_entry: &str,
     prefix: Option<&str>,
-) -> PageAspectSample {
+) -> Result<f64, PageAspectDecline> {
     if crate::rar_loader::is_rar_path(path)
         || crate::zip_loader::split_nested_zip_path(leaf_entry).len() > 1
     {
-        return PageAspectSample::new(Vec::new(), PageDimensionUnits::Pixels);
+        return Err(PageAspectDecline::TooFew);
     }
     let prefixes = crate::zip_loader::read_cover_auto_page_prefixes(path, leaf_entry, prefix)
         .unwrap_or_default();
-    let dimensions = prefixes
-        .into_iter()
-        .map(|(name, bytes)| dimensions_from_prefix(bytes.as_deref()?, &name))
-        .collect();
-    PageAspectSample::new(dimensions, PageDimensionUnits::Pixels)
+    aspect_from_slots(prefixes.into_iter().map(|(name, bytes)| {
+        let (width, height) = dimensions_from_prefix(bytes.as_deref()?, &name)?;
+        Some(width / height)
+    }))
 }
 
 fn dimensions_from_prefix(bytes: &[u8], name: &str) -> Option<(f64, f64)> {
@@ -184,7 +144,10 @@ fn read_folder_prefix(path: &Path) -> Option<Vec<u8>> {
 /// order. Do not enumerate or sort again: this is the representative worker's
 /// same direct-child snapshot, and only eight bounded reads are allowed. On the
 /// worker only, a missing rexif orientation may query WIC once per sampled file.
-pub(crate) fn sample_folder_pages(paths: &[PathBuf], cover: &Path) -> PageAspectSample {
+pub(crate) fn sample_folder_pages(
+    paths: &[PathBuf],
+    cover: &Path,
+) -> Result<f64, PageAspectDecline> {
     sample_folder_pages_with_wic(paths, cover, |path| {
         crate::thumb_loader::file_orientation_or_wic(None, path)
     })
@@ -194,21 +157,19 @@ fn sample_folder_pages_with_wic(
     paths: &[PathBuf],
     cover: &Path,
     mut wic_orientation: impl FnMut(&Path) -> u16,
-) -> PageAspectSample {
+) -> Result<f64, PageAspectDecline> {
     let leaf = paths
         .iter()
         .position(|path| crate::path_key::eq_keep_drive(path, cover));
-    let dimensions = leaf.map_or_else(Vec::new, |leaf| {
-        sample_indices(paths.len(), leaf)
-            .into_iter()
-            .map(|index| {
-                let path = &paths[index];
-                let bytes = read_folder_prefix(path)?;
-                folder_dimensions_from_prefix(&bytes, path, &mut wic_orientation)
-            })
-            .collect()
-    });
-    PageAspectSample::new(dimensions, PageDimensionUnits::Pixels)
+    let Some(leaf) = leaf else {
+        return Err(PageAspectDecline::TooFew);
+    };
+    aspect_from_slots(sample_indices(paths.len(), leaf).into_iter().map(|index| {
+        let path = &paths[index];
+        let bytes = read_folder_prefix(path)?;
+        let (width, height) = folder_dimensions_from_prefix(&bytes, path, &mut wic_orientation)?;
+        Some(width / height)
+    }))
 }
 
 fn folder_dimensions_from_prefix(
@@ -311,23 +272,31 @@ mod tests {
         assert_eq!(cover.native_dims, (600, 900));
         let sample = sample_folder_pages(&paths, &paths[0]);
         assert_eq!(
-            sample.dimensions,
-            vec![
-                Some((
-                    f64::from(cover.native_dims.0),
-                    f64::from(cover.native_dims.1)
-                ));
-                8
-            ]
+            folder_dimensions_from_prefix(&bytes, &paths[1], &mut |path| {
+                crate::thumb_loader::file_orientation_or_wic(None, path)
+            }),
+            Some((
+                f64::from(cover.native_dims.0),
+                f64::from(cover.native_dims.1)
+            ))
+        );
+        assert_eq!(
+            sample,
+            aspect_from_slots(
+                [Some(f64::from(cover.native_dims.0) / f64::from(cover.native_dims.1)); 8]
+            )
         );
         #[cfg(windows)]
-        assert_eq!(sample.aspect, Ok(2.0 / 3.0));
+        assert_eq!(sample, Ok(2.0 / 3.0));
         let archive = zip((0..11)
             .map(|i| (format!("{i:03}.webp"), bytes.clone()))
             .collect());
         let zip_sample = sample_zip_pages(archive.path(), "000.webp", None);
-        assert_eq!(zip_sample.dimensions, vec![Some((900.0, 600.0)); 8]);
-        assert_eq!(zip_sample.aspect, Err(PageAspectDecline::Landscape));
+        assert_eq!(
+            dimensions_from_prefix(&bytes, "001.webp"),
+            Some((900.0, 600.0))
+        );
+        assert_eq!(zip_sample, Err(PageAspectDecline::Landscape));
     }
 
     #[test]
@@ -350,8 +319,13 @@ mod tests {
             .unwrap();
             assert_eq!(cover.native_dims, (70, 100));
             let sample = sample_folder_pages(&paths, &paths[0]);
-            assert_eq!(sample.dimensions, vec![Some((70.0, 100.0)); 3]);
-            assert_eq!(sample.aspect, Ok(0.7));
+            assert_eq!(
+                folder_dimensions_from_prefix(&bytes, &paths[1], &mut |path| {
+                    crate::thumb_loader::file_orientation_or_wic(None, path)
+                }),
+                Some((70.0, 100.0))
+            );
+            assert_eq!(sample, Ok(0.7));
         }
     }
 
@@ -413,8 +387,11 @@ mod tests {
             6
         });
         assert_eq!(opened, paths[1..=8]);
-        assert_eq!(sample.dimensions, vec![Some((70.0, 100.0)); 8]);
-        assert_eq!(sample.aspect, Ok(0.7));
+        assert_eq!(
+            folder_dimensions_from_prefix(&bytes, &paths[1], &mut |_| 6),
+            Some((70.0, 100.0))
+        );
+        assert_eq!(sample, Ok(0.7));
     }
 
     fn zip(entries: Vec<(String, Vec<u8>)>) -> tempfile::NamedTempFile {
@@ -431,31 +408,22 @@ mod tests {
     }
 
     #[test]
-    fn full_pdf_sample_retains_unknown_and_leading_slots_in_points() {
+    fn pdf_sample_preserves_unknown_slots_until_leading_trim() {
         let sizes = [
             (300.0, 100.0),
             (140.0, 100.0),
-            (0.0, 100.0),
-            (70.0, 100.0),
-            (70.0, 100.0),
-            (70.0, 100.0),
             (f32::NAN, 100.0),
+            (140.0, 100.0),
+            (140.0, 100.0),
+            (140.0, 100.0),
+            (70.0, 100.0),
+            (70.0, 100.0),
+            (70.0, 100.0),
         ];
-        let sample = page_aspect_sample_from_sizes(&sizes, 0);
-        assert_eq!(sample.aspect, Ok(0.7));
-        assert_eq!(sample.units, PageDimensionUnits::PdfPoints);
         assert_eq!(
-            sample.dimensions,
-            vec![
-                Some((140.0, 100.0)),
-                None,
-                Some((70.0, 100.0)),
-                Some((70.0, 100.0)),
-                Some((70.0, 100.0)),
-                None,
-            ]
+            page_aspect_from_sizes_report(&sizes, 0),
+            Err(PageAspectDecline::Landscape)
         );
-        assert_eq!(page_aspect_from_sizes_report(&sizes, 0), sample.aspect);
     }
 
     #[test]
@@ -479,21 +447,27 @@ mod tests {
         assert_eq!(paths[10].file_name().unwrap(), "10.png");
         // This direct child is deliberately absent from the supplied snapshot.
         std::fs::write(dir.path().join("00a.png"), png(200, 100)).unwrap();
-        let sample = sample_folder_pages(&paths, &paths[0]);
-        assert_eq!(sample.units, PageDimensionUnits::Pixels);
-        assert_eq!(sample.aspect, Ok(0.65));
-        assert_eq!(sample.dimensions.len(), MAX_SAMPLE_PAGES);
-        assert_eq!(sample.dimensions[0], None);
-        assert_eq!(sample.dimensions[1], Some((62.0, 100.0)));
-        assert_eq!(sample.dimensions[7], Some((68.0, 100.0)));
-        let backwards = sample_folder_pages(&paths, &paths[11]);
-        assert_eq!(backwards.dimensions.len(), MAX_SAMPLE_PAGES);
-        assert_eq!(backwards.dimensions[0], Some((70.0, 100.0)));
-        assert_eq!(backwards.dimensions[7], Some((63.0, 100.0)));
-        assert!(
-            sample_folder_pages(&paths, &dir.path().join("missing.png"))
-                .dimensions
-                .is_empty()
+        let mut opened = Vec::new();
+        let sample = sample_folder_pages_with_wic(&paths, &paths[0], |path| {
+            opened.push(path.to_owned());
+            1
+        });
+        assert_eq!(sample, Ok(0.65));
+        // The unknown first slot consumes an attempt without querying WIC.
+        assert_eq!(opened, paths[2..=8]);
+        opened.clear();
+        let backwards = sample_folder_pages_with_wic(&paths, &paths[11], |path| {
+            opened.push(path.to_owned());
+            1
+        });
+        assert_eq!(backwards, Ok((0.66 + 0.67) * 0.5));
+        assert_eq!(
+            opened,
+            paths[3..=10].iter().rev().cloned().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            sample_folder_pages(&paths, &dir.path().join("missing.png")),
+            Err(PageAspectDecline::TooFew)
         );
     }
 
@@ -508,37 +482,38 @@ mod tests {
             read_folder_prefix(&large).unwrap().len(),
             MAX_SAMPLE_PREFIX_BYTES as usize
         );
-        let sample = sample_folder_pages(&[cover.clone(), large, missing], &cover);
-        assert_eq!(sample.dimensions, vec![None, None]);
-        assert_eq!(sample.aspect, Err(PageAspectDecline::TooFew));
+        let mut paths = vec![cover.clone(), large, missing];
+        for i in 3..9 {
+            let path = dir.path().join(format!("{i}.png"));
+            std::fs::write(&path, png(if i < 6 { 140 } else { 70 }, 100)).unwrap();
+            paths.push(path);
+        }
+        // Neither the unreadable header nor the failed read may expose the
+        // later landscape run to leading-slot trimming.
+        assert_eq!(
+            sample_folder_pages(&paths, &cover),
+            Err(PageAspectDecline::Landscape)
+        );
     }
 
     #[test]
-    fn full_zip_sample_retains_unknown_and_leading_slots_in_pixels() {
+    fn zip_sample_preserves_unknown_slots_until_leading_trim() {
         let file = zip(vec![
             ("0.png".into(), png(300, 100)),
             ("1.png".into(), png(140, 100)),
             ("2.png".into(), b"unknown".to_vec()),
-            ("3.png".into(), png(70, 100)),
-            ("4.png".into(), png(70, 100)),
-            ("5.png".into(), png(70, 100)),
+            ("3.png".into(), png(140, 100)),
+            ("4.png".into(), png(140, 100)),
+            ("5.png".into(), png(140, 100)),
+            ("6.png".into(), png(70, 100)),
+            ("7.png".into(), png(70, 100)),
+            ("8.png".into(), png(70, 100)),
         ]);
         let sample = sample_zip_pages(file.path(), "0.png", None);
-        assert_eq!(sample.units, PageDimensionUnits::Pixels);
-        assert_eq!(sample.aspect, Ok(0.7));
-        assert_eq!(
-            sample.dimensions,
-            vec![
-                Some((140.0, 100.0)),
-                None,
-                Some((70.0, 100.0)),
-                Some((70.0, 100.0)),
-                Some((70.0, 100.0)),
-            ]
-        );
+        assert_eq!(sample, Err(PageAspectDecline::Landscape));
         assert_eq!(
             sample_zip_page_aspect_report(file.path(), "0.png", None),
-            sample.aspect
+            sample
         );
     }
 
@@ -791,7 +766,10 @@ mod tests {
             })
             .collect();
         let sample = sample_folder_pages(&paths, &paths[0]);
-        assert_eq!(sample.aspect, Ok(0.7));
-        assert_eq!(sample.dimensions, vec![Some((70.0, 100.0)); 3]);
+        assert_eq!(sample, Ok(0.7));
+        assert_eq!(
+            dimensions_from_prefix(&bytes, "001.jpg"),
+            Some((70.0, 100.0))
+        );
     }
 }

@@ -654,99 +654,40 @@ fn color_is_a_veto_and_does_not_relocate_to_the_back() {
 }
 
 #[test]
-fn cover_auto_photo_guard_follows_raw_gate_and_does_not_reach_jacket_rules() {
+fn cover_auto_photo_shot_exif_guard_follows_raw_gate_and_does_not_reach_jacket_rules() {
     let image = DynamicImage::new_rgb8(900, 600);
-    let sample = crate::cover_auto_sample::PageAspectSample {
-        aspect: Ok(2.0 / 3.0),
-        dimensions: vec![Some((600.0, 900.0)); 3],
-        units: crate::cover_auto_sample::PageDimensionUnits::Pixels,
-    };
-    for shot_exif in [false, true] {
-        let mut reports = Vec::new();
-        let results = detect_cover_crops_with_photo_report(
-            &image,
-            (900, 600),
-            &sample,
-            photo::PhotoEvidence {
-                shot_exif,
-                dimensions: (900.0, 600.0),
-            },
-            ReadingDirection::Rtl,
-            |angle, result| reports.push((angle, result)),
-        );
-        assert_eq!(results.crops(), [None; 4]);
-        for (angle, result) in reports {
-            assert_eq!(
-                result,
-                Err(if matches!(angle, Rotation::Cw90 | Rotation::Cw270) {
-                    AutoCropDecline::RawAspectGate
-                } else {
-                    AutoCropDecline::PhotoLike {
-                        reason: if shot_exif {
-                            photo::PhotoLikeReason::ShotExif
-                        } else {
-                            photo::PhotoLikeReason::TransposedPage
-                        },
-                    }
-                })
-            );
-        }
-    }
-}
-
-#[test]
-fn cover_auto_photo_a_paper_image_and_pdf_reach_detector_instead_of_transpose_guard() {
-    for (units, (width, height)) in [
-        (
-            crate::cover_auto_sample::PageDimensionUnits::Pixels,
-            (2480.0, 3508.0),
-        ),
-        (
-            crate::cover_auto_sample::PageDimensionUnits::PdfPoints,
-            (595.28, 841.89),
-        ),
-    ] {
-        let sample = crate::cover_auto_sample::PageAspectSample {
-            aspect: Ok(width / height),
-            dimensions: vec![Some((width, height)); 3],
-            units,
-        };
-        let mut reports = Vec::new();
-        detect_cover_crops_with_photo_report(
-            &DynamicImage::new_rgb8(424, 300),
-            (424, 300),
-            &sample,
-            photo::PhotoEvidence {
-                shot_exif: false,
-                dimensions: (height, width),
-            },
-            ReadingDirection::Rtl,
-            |_, result| reports.push(result),
-        );
-        assert!(
-            reports
-                .into_iter()
-                .all(|result| !matches!(result, Err(AutoCropDecline::PhotoLike { .. })))
+    let mut reports = Vec::new();
+    let results = detect_cover_crops_with_photo_report(
+        &image,
+        (900, 600),
+        Some(2.0 / 3.0),
+        true,
+        ReadingDirection::Rtl,
+        |angle, result| reports.push((angle, result)),
+    );
+    assert_eq!(results.crops(), [None; 4]);
+    for (angle, result) in reports {
+        assert_eq!(
+            result,
+            Err(if matches!(angle, Rotation::Cw90 | Rotation::Cw270) {
+                AutoCropDecline::RawAspectGate
+            } else {
+                AutoCropDecline::PhotoLike {
+                    reason: photo::PhotoLikeReason::ShotExif,
+                }
+            })
         );
     }
 }
 
 #[test]
 fn cover_auto_photo_keeps_missing_page_aspect_before_photo_reason() {
-    let sample = crate::cover_auto_sample::PageAspectSample {
-        aspect: Err(crate::cover_auto_sample::PageAspectDecline::TooFew),
-        dimensions: Vec::new(),
-        units: crate::cover_auto_sample::PageDimensionUnits::Pixels,
-    };
     let mut reports = Vec::new();
     detect_cover_crops_with_photo_report(
         &DynamicImage::new_rgb8(900, 600),
         (900, 600),
-        &sample,
-        photo::PhotoEvidence {
-            shot_exif: true,
-            dimensions: (900.0, 600.0),
-        },
+        None,
+        true,
         ReadingDirection::Rtl,
         |angle, result| reports.push((angle, result)),
     );
@@ -763,68 +704,55 @@ fn cover_auto_photo_keeps_missing_page_aspect_before_photo_reason() {
 }
 
 #[test]
-fn cover_auto_photo_g2_matches_physical_and_saved_rotation_combinations() {
-    use crate::cover_auto_sample::{PageAspectSample, PageDimensionUnits};
+fn cover_auto_no_shot_exif_keeps_jacket_decisions_for_every_physical_and_saved_rotation() {
     let rotations = [
         Rotation::None,
         Rotation::Cw90,
         Rotation::Cw180,
         Rotation::Cw270,
     ];
-    for units in [PageDimensionUnits::Pixels, PageDimensionUnits::PdfPoints] {
-        let points = if units == PageDimensionUnits::PdfPoints {
-            (90.075, 60.025)
-        } else {
-            (900.0, 600.0)
-        };
-        for shot_exif in [false, true] {
-            let sample = PageAspectSample {
-                aspect: Ok(points.1 / points.0),
-                dimensions: vec![Some((points.1, points.0)); 3],
-                units,
+    for binding in [ReadingDirection::Rtl, ReadingDirection::Ltr] {
+        let (pixels, _) = jacket(binding, false, false, false, true);
+        let upright = DynamicImage::ImageRgb8(pixels).resize_exact(
+            810,
+            512,
+            image::imageops::FilterType::Nearest,
+        );
+        let aspect = Some(512.0 / 810.0);
+        assert!(
+            detect_cover_crops(&upright, (810, 512), aspect, binding)
+                .crop_for(Rotation::None)
+                .is_some()
+        );
+        for physical in rotations {
+            let image = match physical {
+                Rotation::None => upright.clone(),
+                Rotation::Cw90 => upright.rotate90(),
+                Rotation::Cw180 => upright.rotate180(),
+                Rotation::Cw270 => upright.rotate270(),
             };
-            for physical in rotations {
-                let image = match physical {
-                    Rotation::None | Rotation::Cw180 => DynamicImage::new_rgb8(900, 600),
-                    _ => DynamicImage::new_rgb8(600, 900),
-                };
-                let dims = (image.width(), image.height());
-                let mut reports = Vec::new();
-                detect_cover_crops_with_photo_report(
-                    &image,
-                    dims,
-                    &sample,
-                    photo::PhotoEvidence {
-                        shot_exif,
-                        dimensions: if matches!(physical, Rotation::Cw90 | Rotation::Cw270) {
-                            (points.1, points.0)
-                        } else {
-                            points
-                        },
-                    },
-                    ReadingDirection::Rtl,
-                    |saved, result| reports.push((saved, result)),
-                );
-                for (saved, result) in reports {
-                    let landscape = (physical.degrees() + saved.degrees()) % 180 == 0;
-                    let expected = if landscape {
-                        AutoCropDecline::PhotoLike {
-                            reason: if shot_exif {
-                                photo::PhotoLikeReason::ShotExif
-                            } else {
-                                photo::PhotoLikeReason::TransposedPage
-                            },
-                        }
-                    } else {
-                        AutoCropDecline::RawAspectGate
-                    };
-                    assert_eq!(
-                        result,
-                        Err(expected),
-                        "{units:?}/{physical:?}/{saved:?}/{shot_exif}"
-                    );
-                }
-            }
+            let dims = (image.width(), image.height());
+            let mut plain = Vec::new();
+            let expected =
+                detect_cover_crops_with_report(&image, dims, aspect, binding, |angle, result| {
+                    plain.push((angle, result))
+                });
+            let mut with_metadata = Vec::new();
+            let actual = detect_cover_crops_with_photo_report(
+                &image,
+                dims,
+                aspect,
+                false,
+                binding,
+                |angle, result| with_metadata.push((angle, result)),
+            );
+            assert_eq!(with_metadata, plain, "{physical:?}/{binding:?}");
+            assert_eq!(actual, expected);
+            assert!(
+                actual
+                    .crop_for(Rotation::from_degrees(-physical.degrees()))
+                    .is_some()
+            );
         }
     }
 }

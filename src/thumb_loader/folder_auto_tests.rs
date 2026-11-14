@@ -40,7 +40,7 @@ fn cover_auto_folder_direct_selection_reuses_listing_and_excludes_descendants_an
     assert_eq!(pages.len(), 9);
     assert_eq!(pages[0], folder.join("000.png"));
     assert_eq!(
-        crate::cover_auto_sample::sample_folder_pages(&pages, &pages[0]).aspect,
+        crate::cover_auto_sample::sample_folder_pages(&pages, &pages[0]),
         Ok(0.7)
     );
     let cache =
@@ -130,24 +130,25 @@ fn cover_auto_folder_v2f_identity_roundtrips_and_never_uses_v1_migration() {
 }
 
 #[test]
-fn cover_auto_photo_pdf_worker_applies_transposed_page_guard_with_same_lease() {
+fn cover_auto_pdf_transposed_page_dimensions_continue_detection_with_same_lease() {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("book.epub");
     let read = Some(crate::pdf_loader::generation_target_for_test(
         &path, 17, 4096,
     ));
     let observed = Arc::new(Mutex::new(Vec::new()));
-    let jacket = auto_cover_jacket();
+    let jacket = auto_cover_jacket().resize_exact(810, 512, image::imageops::FilterType::Nearest);
     let mut first = cover_only_pdf_result();
     first.image = jacket.resize_exact(224, 128, image::imageops::FilterType::CatmullRom);
     first.page_size_points = crate::pdf_loader::PdfPageSizePoints {
-        width: 892.0,
+        width: 810.0,
         height: 512.0,
     };
     let mut second = cover_only_pdf_result();
-    second.image = jacket.resize_exact(1784, 1024, image::imageops::FilterType::CatmullRom);
-    let mut sizes = vec![(512.0, 892.0); 9];
-    sizes[0] = (892.0, 512.0);
+    second.image = jacket.resize_exact(1620, 1024, image::imageops::FilterType::CatmullRom);
+    second.page_size_points = first.page_size_points;
+    let mut sizes = vec![(512.0, 810.0); 9];
+    sizes[0] = (810.0, 512.0);
     AUTO_CROP_PDF_FIXTURE.with(|current| {
         *current.borrow_mut() = Some(AutoCropPdfFixture {
             sizes,
@@ -207,13 +208,10 @@ fn cover_auto_photo_pdf_worker_applies_transposed_page_guard_with_same_lease() {
     assert_eq!(done.load(Ordering::Relaxed), 1);
     let messages: Vec<_> = rx.try_iter().collect();
     let pixels = messages.iter().find_map(ThumbMsg::pixels).unwrap();
-    assert_eq!(pixels.source_dims, Some((224, 128)));
-    assert_eq!(
-        pixels.auto_material,
-        crate::cover_auto_material::AutoMaterial::Automatic(
-            crate::cover_auto_material::AutoCropResults::new([None; 4])
-        )
-    );
+    assert_eq!(pixels.source_dims, Some((1620, 1024)));
+    assert!(matches!(pixels.auto_material,
+        crate::cover_auto_material::AutoMaterial::Automatic(results)
+            if results.crop_for(crate::rotation_db::Rotation::None).is_some()));
     AUTO_CROP_PDF_FIXTURE
         .with(|current| assert!(current.borrow_mut().take().unwrap().renders.is_empty()));
     let observed = observed.lock().unwrap();
@@ -221,7 +219,7 @@ fn cover_auto_photo_pdf_worker_applies_transposed_page_guard_with_same_lease() {
     assert_eq!(observed[0].render, Some((0, 256)));
     assert_eq!(observed[1].render, None);
     assert_eq!(observed[2].render, None);
-    assert_eq!(observed[3].render, Some((0, 1784)));
+    assert_eq!(observed[3].render, Some((0, 1620)));
     for request in observed.iter() {
         assert_eq!(request.password.as_deref(), Some("session password"));
         assert_eq!(request.read_address, observed[0].read_address);

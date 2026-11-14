@@ -656,7 +656,7 @@ fn prepare_cover_inner(
                     Some(crate::thumb_loader::AutoCoverInput::FolderPages(pages)) => {
                         crate::cover_auto_sample::sample_folder_pages(pages, path)
                     }
-                    _ => crate::cover_auto_sample::page_aspect_sample_from_sizes(&[], 0),
+                    _ => crate::cover_auto_sample::page_aspect_from_sizes_report(&[], 0),
                 }
             }
             ReadLocation::ArchiveEntry { archive, entry } => {
@@ -679,11 +679,11 @@ fn prepare_cover_inner(
                         .ok()
                     })
                     .unwrap_or_default();
-                crate::cover_auto_sample::page_aspect_sample_from_sizes(&sizes, *page as usize)
+                crate::cover_auto_sample::page_aspect_from_sizes_report(&sizes, *page as usize)
             }
-            _ => crate::cover_auto_sample::page_aspect_sample_from_sizes(&[], 0),
+            _ => crate::cover_auto_sample::page_aspect_from_sizes_report(&[], 0),
         };
-        let page_aspect = sample.aspect;
+        let page_aspect = sample;
         if let Err(reason) = page_aspect {
             crate::logger::log(format!(
                 "auto cover: dialog page-aspect={}",
@@ -735,11 +735,8 @@ fn prepare_cover_inner(
                 Ok(analysis) => AutoDetection::analyze(
                     &analysis.image,
                     analysis.native_dims,
-                    &sample,
-                    crate::cover_auto_crop::photo::PhotoEvidence {
-                        shot_exif: analysis.shot_exif,
-                        dimensions: analysis.photo_dims,
-                    },
+                    sample.ok(),
+                    analysis.shot_exif,
                     auto.binding,
                 ),
                 Err(error) => {

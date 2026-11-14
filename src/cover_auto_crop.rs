@@ -182,38 +182,35 @@ pub(crate) fn detect_cover_crops_with_report(
     binding: ReadingDirection,
     report: impl FnMut(Rotation, Result<CoverCrop, AutoCropDecline>),
 ) -> AutoCropResults {
-    detect_cover_crops_with_evidence(image, original_dims, page_aspect, binding, None, report)
+    detect_cover_crops_with_photo(image, original_dims, page_aspect, binding, false, report)
 }
 
 /// Worker, range dialog, and evaluation share the same metadata gates and all
-/// four saved-angle decisions. Metadata comes from the existing decode/sample.
+/// four saved-angle decisions. Shooting metadata comes from the existing decode.
 pub(crate) fn detect_cover_crops_with_photo_report(
     image: &DynamicImage,
     original_dims: (u32, u32),
-    sample: &crate::cover_auto_sample::PageAspectSample,
-    evidence: photo::PhotoEvidence,
+    page_aspect: Option<f64>,
+    shot_exif: bool,
     binding: ReadingDirection,
     report: impl FnMut(Rotation, Result<CoverCrop, AutoCropDecline>),
 ) -> AutoCropResults {
-    detect_cover_crops_with_evidence(
+    detect_cover_crops_with_photo(
         image,
         original_dims,
-        sample.aspect.ok(),
+        page_aspect,
         binding,
-        Some((sample, evidence)),
+        shot_exif,
         report,
     )
 }
 
-fn detect_cover_crops_with_evidence(
+fn detect_cover_crops_with_photo(
     image: &DynamicImage,
     original_dims: (u32, u32),
     page_aspect: Option<f64>,
     binding: ReadingDirection,
-    evidence: Option<(
-        &crate::cover_auto_sample::PageAspectSample,
-        photo::PhotoEvidence,
-    )>,
+    shot_exif: bool,
     mut report: impl FnMut(Rotation, Result<CoverCrop, AutoCropDecline>),
 ) -> AutoCropResults {
     AutoCropResults::new(
@@ -224,13 +221,13 @@ fn detect_cover_crops_with_evidence(
             Rotation::Cw270,
         ]
         .map(|rotation| {
-            let result = detect_cover_crop_at_rotation_with_evidence(
+            let result = detect_cover_crop_at_rotation_with_photo(
                 image,
                 original_dims,
                 page_aspect,
                 binding,
                 rotation,
-                evidence,
+                shot_exif,
             );
             report(rotation, result);
             result.ok()
@@ -246,26 +243,23 @@ fn detect_cover_crop_at_rotation(
     binding: ReadingDirection,
     rotation: Rotation,
 ) -> Result<CoverCrop, AutoCropDecline> {
-    detect_cover_crop_at_rotation_with_evidence(
+    detect_cover_crop_at_rotation_with_photo(
         image,
         original_dims,
         page_aspect,
         binding,
         rotation,
-        None,
+        false,
     )
 }
 
-fn detect_cover_crop_at_rotation_with_evidence(
+fn detect_cover_crop_at_rotation_with_photo(
     image: &DynamicImage,
     original_dims: (u32, u32),
     page_aspect: Option<f64>,
     binding: ReadingDirection,
     rotation: Rotation,
-    evidence: Option<(
-        &crate::cover_auto_sample::PageAspectSample,
-        photo::PhotoEvidence,
-    )>,
+    shot_exif: bool,
 ) -> Result<CoverCrop, AutoCropDecline> {
     let dimensions = match rotation {
         Rotation::Cw90 | Rotation::Cw270 => (original_dims.1, original_dims.0),
@@ -277,15 +271,8 @@ fn detect_cover_crop_at_rotation_with_evidence(
     page_aspect
         .filter(|aspect| aspect.is_finite() && *aspect > 0.0)
         .ok_or(AutoCropDecline::PageAspectMissing)?;
-    if let Some((sample, mut evidence)) = evidence {
-        // G2 compares the cover as displayed at this saved angle. Keep PDF
-        // point precision here instead of substituting rounded native_dims.
-        if matches!(rotation, Rotation::Cw90 | Rotation::Cw270) {
-            evidence.dimensions = (evidence.dimensions.1, evidence.dimensions.0);
-        }
-        if let Some(reason) = photo::photo_like_reason(evidence, sample) {
-            return Err(AutoCropDecline::PhotoLike { reason });
-        }
+    if let Some(reason) = photo::photo_like_reason(shot_exif) {
+        return Err(AutoCropDecline::PhotoLike { reason });
     }
     let rotated;
     let image = match rotation {

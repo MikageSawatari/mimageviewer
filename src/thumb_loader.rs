@@ -7150,7 +7150,7 @@ pub(crate) fn load_one_cached(
                     if let Some(page) = pdf_page {
                         let sizes =
                             cover_pdf_page_sizes(path, epub_read, pdf_password).unwrap_or_default();
-                        crate::cover_auto_sample::page_aspect_sample_from_sizes(
+                        crate::cover_auto_sample::page_aspect_from_sizes_report(
                             &sizes,
                             page as usize,
                         )
@@ -7163,7 +7163,7 @@ pub(crate) fn load_one_cached(
                     }
                 }
             };
-            let aspect_result = sample.aspect;
+            let aspect_result = sample;
             let analysis = if let Some(analysis) = predecoded_auto_analysis.take() {
                 Ok(analysis)
             } else if let Some(page) = pdf_page {
@@ -7198,11 +7198,8 @@ pub(crate) fn load_one_cached(
                     let results = crate::cover_auto_crop::detect_cover_crops_with_photo_report(
                         &analysis.image,
                         analysis.native_dims,
-                        &sample,
-                        crate::cover_auto_crop::photo::PhotoEvidence {
-                            shot_exif: analysis.shot_exif,
-                            dimensions: analysis.photo_dims,
-                        },
+                        sample.ok(),
+                        analysis.shot_exif,
                         auto.identity.binding,
                         |rotation, result| {
                             let reason =

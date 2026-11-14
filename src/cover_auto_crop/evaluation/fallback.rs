@@ -129,8 +129,8 @@ pub(super) const EVAL_ROTATIONS: [Rotation; 4] = [
 pub(super) fn evaluate_angles(
     image: &DynamicImage,
     native_dims: (u32, u32),
-    sample: &crate::cover_auto_sample::PageAspectSample,
-    evidence: photo::PhotoEvidence,
+    page_aspect: Option<f64>,
+    shot_exif: bool,
     binding: ReadingDirection,
     config: FallbackConfig,
 ) -> [AngleOutcome; 4] {
@@ -143,8 +143,8 @@ pub(super) fn evaluate_angles(
     detect_cover_crops_with_photo_report(
         image,
         native_dims,
-        sample,
-        evidence,
+        page_aspect,
+        shot_exif,
         binding,
         |rotation, result| {
             let index = EVAL_ROTATIONS
@@ -155,7 +155,7 @@ pub(super) fn evaluate_angles(
                 result,
                 image,
                 native_dims,
-                sample.aspect.ok(),
+                page_aspect,
                 binding,
                 rotation,
                 config,
@@ -387,9 +387,6 @@ mod tests {
                     AutoCropDecline::NotWide,
                     AutoCropDecline::PhotoLike {
                         reason: photo::PhotoLikeReason::ShotExif,
-                    },
-                    AutoCropDecline::PhotoLike {
-                        reason: photo::PhotoLikeReason::TransposedPage,
                     },
                 ];
                 for reason in guards {
@@ -642,20 +639,12 @@ mod tests {
     #[test]
     fn evaluation_fallback_absent_matches_production_at_all_angles_and_preserves_success() {
         let image = DynamicImage::new_rgb8(240, 100);
-        let sample = crate::cover_auto_sample::PageAspectSample {
-            aspect: Ok(2.0 / 3.0),
-            dimensions: Vec::new(),
-            units: crate::cover_auto_sample::PageDimensionUnits::Pixels,
-        };
-        let evidence = photo::PhotoEvidence {
-            shot_exif: false,
-            dimensions: (240.0, 100.0),
-        };
+        let page_aspect = Some(2.0 / 3.0);
         let outcomes = evaluate_angles(
             &image,
             (240, 100),
-            &sample,
-            evidence,
+            page_aspect,
+            false,
             ReadingDirection::Rtl,
             FallbackConfig::parse(None, true).unwrap(),
         );
@@ -663,8 +652,8 @@ mod tests {
         detect_cover_crops_with_photo_report(
             &image,
             (240, 100),
-            &sample,
-            evidence,
+            page_aspect,
+            false,
             ReadingDirection::Rtl,
             |_, result| original.push(result),
         );
