@@ -19,11 +19,12 @@ MPEG-2 の sequence extension に `low_delay=1` を設定し、decoder の frame
 | `wrap-origin.ts` | 99,076 | mpegts | -4.621333 | 12.021333 | `2^33/90000 - 6` 秒の offset、33 bit PTS の折り返し |
 | `interlaced-origin.ts` | 101,332 | mpegts | 36001.378667 | 12.021333 | top field first のインターレース MPEG-2、bwdif 経路 |
 | `late-audio-origin.ts` | 108,100 | mpegts | 36001.378667 | 12.021333 | 4 秒後から始まる 2 本目の AAC トラック |
+| `rounded-origin-video-only.ts` | 83,472 | mpegts | 36001.666667 | 12.000000 | 音声なし、先頭映像より format 原点が 1/3 μs 後ろへ丸まる境界 |
 | `large-origin.mpg` | 136,192 | mpeg | 35999.989978 | 12.010022 | MPEG-PS、MPEG-2 + 48 kHz mono MP2 / 64 kbit/s |
 | `positive-origin.mkv` | 59,391 | matroska,webm | 10.000000 | 22.000000 | 原点を引かない対照、FLAC 音声、チャプター付き |
 | `encoder-delay.mp3` | 48,332 | mp3 | 0.023021 | 12.000000 | 原点を引かない対照、48 kHz mono MP3 / 32 kbit/s、Xing header |
 
-TS の映像・音声 time base は `1/90000`。先頭映像は O + 0.021333 秒、最終映像は O + 11.938000 秒です。先頭音声 packet は O で、AAC priming による約 21 ms の区間の後に内容が始まります。`wrap-origin.ts` は raw の 33 bit 時刻が途中で折り返しますが、FFmpeg が unwrap した映像時刻は -4.600000〜7.316667 秒の単調な列になります。メディア時刻へ直すと他の TS と同じです。
+TS の映像・音声 time base は `1/90000`。音声付き TS の先頭映像は O + 0.021333 秒、最終映像は O + 11.938000 秒です。先頭音声 packet は O で、AAC priming による約 21 ms の区間の後に内容が始まります。`wrap-origin.ts` は raw の 33 bit 時刻が途中で折り返しますが、FFmpeg が unwrap した映像時刻は -4.600000〜7.316667 秒の単調な列になります。メディア時刻へ直すと他の音声付き TS と同じです。
 
 | 映像素材 | 最初の raw PTS 秒 | 最後の raw PTS 秒 | frame 数 / keyframe 数 |
 | --- | ---: | ---: | ---: |
@@ -32,6 +33,7 @@ TS の映像・音声 time base は `1/90000`。先頭映像は O + 0.021333 秒
 | `wrap-origin.ts` | -4.600000 | 7.316667 | 144 / 144 |
 | `interlaced-origin.ts` | 36001.400000 | 36013.316667 | 144 / 144 |
 | `late-audio-origin.ts` | 36001.400000 | 36013.316667 | 144 / 144 |
+| `rounded-origin-video-only.ts` | 36001.666667 | 36013.583333 | 144 / 144 |
 | `large-origin.mpg` | 36000.000000 | 36011.916667 | 144 / 144 |
 | `positive-origin.mkv` | 10.000000 | 21.917000 | 144 / 144 |
 
@@ -41,13 +43,17 @@ TS の映像・音声 time base は `1/90000`。先頭映像は O + 0.021333 秒
 
 `late-audio-origin.ts` の第 1 音声は `jpn`、第 2 音声は `eng`。第 2 音声の raw start は 36005.378667 秒、メディア時刻の start は 4 秒です。内容は 6 秒で、約 10 秒に終わり、12 秒の映像はその後も続きます。ffprobe が TS から推定する第 2 音声 stream duration は 5.824000 秒です。実際の decode sample 数や厳密な終端とこの推定値は区別してください。
 
+第 1 音声の start は `3240124080/90000 = 36001.3786666667` 秒、stream duration は `1079040/90000 = 11.9893333333` 秒です。format 原点 `36001.378667` 秒との差は約 −1/3 μs で、メディア時刻の start は丸め誤差だけを補正して 0、end は変換した start と stream duration から `1079040/90000` 秒になります。end の計算を start の非負判定に依存させず、start が負という理由で start/end 両方を不明にしないことを、decoder の metadata と availability 判定で検査します。
+
+`rounded-origin-video-only.ts` は `-output_ts_offset 36000.266667` で作った音声なし素材です。先頭 raw PTS は `3240150000/90000 = 36001.6666666667` 秒で、format 原点 `36001.666667` 秒を引くと約 −1/3 μs になります。AV_TIME_BASE の丸め差だけを 0 へ補正し、実際の負の preroll は保持します。全 144 映像 packet が PTS=DTS、全 144 frame が intra です。回帰テストは実際に読んだ key packet の raw DTS・PTS・byte位置を記録し、テスト専用の Input に索引 entry を追加して worker へ渡します。indexed 経路の最初のセルが失敗せず赤い画素を返すことを検査します。TS の全 packet 読取だけでは索引は揃わないため、この準備はテスト内に限定し、製品へ索引走査や seek の変更は加えません。これだけで cold probe の索引 coverage 判定や通常 GOP seek の修正を示すものではありません。
+
 PS は小さな PES packet (`-packetsize 128`) で duration の推定を安定させています。先頭映像は 36000.000000 秒、メディア時刻 0.010022 秒です。今回の全 intra 素材では最終フレームを含む 144/144 frame に `best_effort_timestamp_time` があり、最終メディア時刻は約 11.926689 秒です。
 
 MKV の映像・音声 time base は `1/1000`、先頭映像は 10 秒、最終映像は 21.917 秒です。PTS は 1 ms 単位に丸められるので frame 間隔は 0.083/0.084 秒になります。チャプターは 10〜14、14〜18、18〜22 秒。O を引かないため D=22 とこれらの時刻がそのまま保たれます。MP3 も O を引かず、encoder delay / skip sample の従来の扱いを保ちます。
 
 ## 画素と音声の期待値
 
-内容時刻 u の `[n, n+1)` 秒ごとの単色は次のとおりです。TS のメディア時刻では u = t - 0.021333、PS では u = t - 0.010022、MKV では u = t - 10 です。色変化の境界から離れた `u=n+0.5` を検査します。`D-0.5` の色は全映像素材で最後の灰色です。
+内容時刻 u の `[n, n+1)` 秒ごとの単色は次のとおりです。音声付き TS のメディア時刻では u = t - 0.021333、音声なし TS では u ≈ t、PS では u = t - 0.010022、MKV では u = t - 10 です。色変化の境界から離れた `u=n+0.5` を検査します。`D-0.5` の色は全映像素材で最後の灰色です。
 
 | n | 入力 RGB (hex) | decode 後の中心画素 RGB (測定値) |
 | ---: | --- | --- |

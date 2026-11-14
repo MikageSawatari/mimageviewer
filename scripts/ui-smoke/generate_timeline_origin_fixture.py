@@ -72,6 +72,7 @@ def generate(output: Path) -> None:
     generate_ts(output, "wrap-origin.ts", (2**33 / 90000) - 6)
     generate_ts(output, "interlaced-origin.ts", 36000, interlaced=True)
     generate_ts(output, "late-audio-origin.ts", 36000, late_audio=True)
+    generate_rounded_origin_ts(output)
     run_ffmpeg(
         output / "large-origin.mpg",
         "-f", "lavfi", "-i", VIDEO_SOURCE,
@@ -100,6 +101,17 @@ def generate(output: Path) -> None:
         output / "encoder-delay.mp3",
         "-f", "lavfi", "-i", pulse_source(),
         "-c:a", "libmp3lame", "-b:a", "32k", "-write_xing", "1",
+    )
+
+
+def generate_rounded_origin_ts(output: Path) -> None:
+    # No audio: the first video PTS itself determines format start_time. The
+    # offset puts it at 36001 + 2/3 seconds, rounded up to AV_TIME_BASE units.
+    run_ffmpeg(
+        output / "rounded-origin-video-only.ts",
+        "-f", "lavfi", "-i", VIDEO_SOURCE,
+        "-map", "0:v", *VIDEO_OPTIONS,
+        "-output_ts_offset", "36000.266667", "-f", "mpegts",
     )
 
 

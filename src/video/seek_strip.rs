@@ -588,12 +588,8 @@ pub(crate) fn enumerate_index_keyframes(
         return cold;
     }
     let duration = input.duration();
-    let warmup_secs = if duration > 0 {
-        (duration / 2) as f64 / f64::from(ffmpeg::ffi::AV_TIME_BASE)
-    } else {
-        0.0
-    };
-    let warmup_target = timeline.media_to_av_time_base(warmup_secs);
+    let warmup_media_timestamp = if duration > 0 { duration / 2 } else { 0 };
+    let warmup_target = timeline.media_av_time_base_to_raw(warmup_media_timestamp);
 
     // SAFETY: `format_context` は上で null でないことを確認した有効な Input の所有ポインタ。
     // stream_index=-1 の timestamp は AV_TIME_BASE 単位であり、Input::duration() も同じ単位。

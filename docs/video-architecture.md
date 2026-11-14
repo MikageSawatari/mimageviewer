@@ -72,6 +72,11 @@ mIV の動画・音声の位置はメディア時刻 `t = raw PTS 秒 − O_eff`
 開始時刻が不明なら原点は 0。それ以外の形式は `O_eff=0` を維持する。
 `AVFMT_TS_DISCONT` flag から補正対象を推測しない。
 
+format の原点は 1 µs 精度の整数で保持する。より細かい source tick からの変換で生じる
+`(-1 µs, 0)` の負値だけを `MediaTimeline` 内で 0 に揃え、実際の preroll は保つ。
+O_eff=0 はこの丸め補正も行わない。整数 AV_TIME_BASE の seek は整数 API を使い、
+秒との往復で microsecond を失わない。音声トラックの end は start の有効性と独立して判定する。
+
 特に O>0 の Matroska は duration 自体が原点前の空区間を含むので、原点を引かない。
 例えば O=10、内容 12 秒なら、映像は時刻 10〜22、D=22 のまま扱う。
 MP4 の edit list、MP3 の encoder delay、Ogg の pre-skip も既存の扱いを保つ。
@@ -89,6 +94,8 @@ upscale manifest の source seek PTS など内部の raw locator は補正しな
 `VideoInfo` 受領後に変換・期間判定して seek を発行する。engine の
 `OpenOptions.initial_position_secs` は初期凍結位置だけで、自動 resume は発行しない。
 Media の値は読み込み中からその位置で凍結し、原点不明の LegacyRaw は 0 で待機する。
+未解決の保存位置を所有している間は、その凍結位置を保存しない。全保存経路は
+`VideoPlayer::resume_position_for_save` で保存可能性と位置を取得し、未解決なら既存行を維持する。
 metadata 前に発行された seek と DSP の明示位置は保存位置より優先する。Remote の開始情報は
 metadata と保留値の処理が完了してから公開し、最初の表示 frame の到着は条件にしない。
 

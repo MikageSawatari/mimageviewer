@@ -9205,6 +9205,38 @@ impl VideoPlayer {
     }
 
     #[cfg(test)]
+    pub(crate) fn loading_resume_disconnected_for_test(
+        path: PathBuf,
+        resume: crate::settings::VideoResumePosition,
+        autoplay: bool,
+    ) -> (
+        Self,
+        crossbeam_channel::Sender<Result<VideoInfo, String>>,
+        VideoInfo,
+    ) {
+        let mut player = Self::stream_ready_disconnected_for_test(path);
+        let info = player.info.take().unwrap();
+        player.set_last_displayed_pts_for_test(f64::NAN);
+        let serial = Arc::new(AtomicU64::new(0));
+        player.clock = Arc::new(AvClock::new(1.0, Arc::clone(&serial)));
+        player.engine = Arc::new(Mutex::new(EngineActor::new(
+            OpenOptions {
+                autoplay,
+                initial_position_secs: initial_position_for_resume(Some(resume)),
+                ..Default::default()
+            },
+            serial,
+            Arc::clone(&player.clock),
+        )));
+        player.engine_state_atomic = player.engine.lock().unwrap().published_state_handle();
+        player.engine.lock().unwrap().begin_loading();
+        player.pending_resume_secs = Some(resume);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        player.decode.info_rx = rx;
+        (player, tx, info)
+    }
+
+    #[cfg(test)]
     pub(crate) fn local_ready_disconnected_for_test(path: PathBuf) -> Self {
         let player = Self::stream_ready_disconnected_for_test(path);
         // The generic disconnected fixture is deliberately pre-cancelled. Local
@@ -11502,6 +11534,22 @@ impl VideoPlayer {
         self.clock.now_secs()
     }
 
+    /// A saved resume remains authoritative until metadata resolves and validates it.
+    /// In particular, the loading clock is zero for LegacyRaw and is not a new position.
+    pub(crate) fn resume_position_for_save(&self, audio_mode_without_vst: bool) -> Option<f64> {
+        if self.info.is_none() && self.pending_resume_secs.is_some() {
+            return None;
+        }
+        // Pure audio mode hides the presenter, so its last displayed PTS stops advancing.
+        // A visible VST host uses the ordinary video position instead.
+        Some(if audio_mode_without_vst {
+            self.position()
+        } else {
+            self.last_displayed_pts_secs()
+                .unwrap_or_else(|| self.position())
+        })
+    }
+
     pub fn screenshot_target_secs(&self) -> f64 {
         self.last_displayed_pts_secs()
             .unwrap_or_else(|| self.position())
@@ -13529,29 +13577,13 @@ mod tests {
         crossbeam_channel::Sender<Result<super::VideoInfo, String>>,
         super::VideoInfo,
     ) {
-        use std::sync::{Arc, Mutex, atomic::AtomicU64};
-        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+        let (player, tx, mut info) = super::VideoPlayer::loading_resume_disconnected_for_test(
             std::path::PathBuf::from("resume-origin.ts"),
+            resume,
+            autoplay,
         );
-        let mut info = player.info.take().unwrap();
         info.duration_secs = 30.0;
         info.timeline_origin_secs = 36000.0;
-        let serial = Arc::new(AtomicU64::new(0));
-        player.clock = Arc::new(super::AvClock::new(1.0, Arc::clone(&serial)));
-        player.engine = Arc::new(Mutex::new(super::EngineActor::new(
-            super::OpenOptions {
-                autoplay,
-                initial_position_secs: super::initial_position_for_resume(Some(resume)),
-                ..Default::default()
-            },
-            serial,
-            Arc::clone(&player.clock),
-        )));
-        player.engine_state_atomic = player.engine.lock().unwrap().published_state_handle();
-        player.engine.lock().unwrap().begin_loading();
-        player.pending_resume_secs = Some(resume);
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        player.decode.info_rx = rx;
         (player, tx, info)
     }
 
@@ -13565,6 +13597,8 @@ mod tests {
                 assert!(!player.is_playing());
                 assert_eq!(player.current_seek_serial(), 0);
                 assert!(player.remote_stream_start_inputs().is_none());
+                assert_eq!(player.resume_position_for_save(false), None);
+                assert_eq!(player.resume_position_for_save(true), None);
                 tx.send(Ok(info)).unwrap();
                 let ctx = egui::Context::default();
                 player.tick(&ctx);
@@ -13574,6 +13608,8 @@ mod tests {
                 assert_eq!(player.intent_playing(), autoplay);
                 assert!(!player.is_playing());
                 assert!(player.pending_resume_secs.is_none());
+                assert_eq!(player.resume_position_for_save(false), Some(12.0));
+                assert_eq!(player.resume_position_for_save(true), Some(12.0));
                 assert_eq!(player.displayed_frame_seq.load(super::Ordering::Acquire), 0);
                 let remote = player.remote_stream_start_inputs().unwrap();
                 assert_eq!(remote.source_origin_secs, 12.0);

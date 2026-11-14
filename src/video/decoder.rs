@@ -2185,7 +2185,7 @@ fn enumerate_audio_tracks_with_decoder_and_timeline(
                 .map(str::to_owned);
             let raw_start = stream.start_time();
             let time_base = stream.time_base();
-            let start_secs = (raw_start != ffmpeg_the_third::ffi::AV_NOPTS_VALUE
+            let media_start = (raw_start != ffmpeg_the_third::ffi::AV_NOPTS_VALUE
                 && time_base.numerator() > 0
                 && time_base.denominator() > 0)
                 .then(|| {
@@ -2193,15 +2193,17 @@ fn enumerate_audio_tracks_with_decoder_and_timeline(
                         raw_start as f64 * f64::from(stream.time_base().numerator())
                             / f64::from(stream.time_base().denominator()),
                     )
-                })
-                .and_then(valid_stream_secs);
+                });
+            let start_secs = media_start.and_then(valid_stream_secs);
             let stream_duration =
                 stream_timestamp_secs(stream.duration(), stream.time_base(), false);
             let end_secs = if let Some(duration) = stream_duration {
                 let origin = if raw_start == ffmpeg_the_third::ffi::AV_NOPTS_VALUE {
                     Some(timeline.raw_to_media_secs(0.0))
                 } else {
-                    start_secs
+                    // An actual negative preroll start can still have a known,
+                    // nonnegative end. Validate the two absolute bounds separately.
+                    media_start
                 };
                 origin.and_then(|start| valid_stream_secs(start + duration))
             } else if raw_start == 0 || raw_start == ffmpeg_the_third::ffi::AV_NOPTS_VALUE {
@@ -9979,6 +9981,28 @@ mod audio_track_fixture_tests {
             Arc::new(super::VideoDynamicState::default()),
             Some(saved),
         )
+    }
+
+    #[test]
+    fn enumerate_audio_track_end_survives_a_genuinely_negative_start() {
+        let mut input = ffmpeg_the_third::format::input(&fixture_path("multi.mkv")).unwrap();
+        let audio_index = input.streams().best(MediaType::Audio).unwrap().index();
+        let time_base = input.stream(audio_index).unwrap().time_base();
+        assert_eq!((time_base.numerator(), time_base.denominator()), (1, 1000));
+        // SAFETY: this test exclusively owns Input, and no borrowed stream is
+        // retained. Model known stream metadata spanning media time -1..1.
+        unsafe {
+            let stream = *(*input.as_mut_ptr()).streams.add(audio_index);
+            (*stream).start_time = -1000;
+            (*stream).duration = 2000;
+        }
+        let tracks = enumerate_audio_tracks(&input);
+        let track = tracks
+            .iter()
+            .find(|track| track.stream_index == audio_index)
+            .unwrap();
+        assert_eq!(track.start_secs, None);
+        assert_eq!(track.end_secs, Some(1.0));
     }
 
     #[test]

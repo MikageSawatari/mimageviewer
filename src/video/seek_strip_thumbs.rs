@@ -3325,6 +3325,101 @@ mod tests {
         }
     }
 
+    #[test]
+    fn timeline_origin_rounded_first_indexed_strip_cell_returns_first_colour() {
+        use crate::video::screenshot::timeline_test_support::{assert_colour, fixture};
+
+        ffmpeg::init().unwrap();
+        let path = fixture("rounded-origin-video-only.ts");
+        let mut input = ffmpeg::format::input(&path).unwrap();
+        let timeline = crate::video::media_timeline::MediaTimeline::from_input(&input);
+        assert_eq!(timeline.origin_secs(), 36001.666667);
+        assert_eq!(input.streams().count(), 1, "fixture must have no audio");
+        let (stream_index, time_base) = {
+            let stream = input.streams().best(ffmpeg::media::Type::Video).unwrap();
+            (stream.index(), stream.time_base())
+        };
+        let duration_secs = input.duration() as f64 / f64::from(ffmpeg::ffi::AV_TIME_BASE);
+        let seconds_per_tick =
+            f64::from(time_base.numerator()) / f64::from(time_base.denominator());
+        let mut key_packets = Vec::new();
+        // TS packet reads do not populate a complete demux index. Retain actual
+        // key packet locators, then seed only this test's Input to exercise the
+        // indexed worker path independently of cold-index coverage fallback.
+        for item in input.packets() {
+            let (stream, packet) = item.unwrap();
+            if stream.index() == stream_index && packet.is_key() {
+                key_packets.push((
+                    packet.dts().unwrap(),
+                    packet.pts().unwrap(),
+                    packet.position(),
+                    packet.size(),
+                ));
+            }
+        }
+        assert_eq!(key_packets.len(), 144);
+        let first_raw_secs = key_packets[0].1 as f64 * seconds_per_tick;
+        let rounding_deficit = first_raw_secs - timeline.origin_secs();
+        assert!(rounding_deficit > -0.000001 && rounding_deficit < 0.0);
+        for (raw_dts, raw_pts, position, size) in key_packets {
+            assert_eq!(raw_dts, raw_pts, "all-intra fixture must have PTS=DTS");
+            assert!(position >= 0);
+            // SAFETY: the open Input exclusively owns this valid stream index.
+            // Every entry uses a demuxed key packet's original raw locator.
+            let result = unsafe {
+                let stream = *(*input.as_mut_ptr()).streams.add(stream_index);
+                ffmpeg::ffi::av_add_index_entry(
+                    stream,
+                    position as i64,
+                    raw_dts,
+                    i32::try_from(size).unwrap(),
+                    0,
+                    ffmpeg::ffi::AVINDEX_KEYFRAME,
+                )
+            };
+            assert!(result >= 0);
+        }
+        let index = enumerate_index_keyframes(&mut input, stream_index, time_base).unwrap();
+        assert_eq!(index.keyframes.len(), 144);
+        let adopted = thin_keyframes(&index.keyframes, 1.0);
+        let axis = Arc::new(StripAxis::KeyframeIndex {
+            keyframes: index.keyframes,
+            adopted,
+            duration_secs,
+        });
+        let first_cell_secs = axis.cell(0).unwrap();
+        let worker = SeekStripThumbnailWorker::spawn(path, false, None, duration_secs, 1.0, 1.0);
+        worker
+            .request(
+                axis,
+                0.0,
+                1,
+                StripLookahead::default(),
+                StripThumbnailRequestTrigger::StripRedisplayed,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(40);
+        loop {
+            let snapshot = worker.snapshot();
+            match snapshot.outcome_for_secs(first_cell_secs) {
+                Some(StripThumbnailOutcome::Ready(image)) => {
+                    assert_colour(&image.rgba, image.width, image.height, 0);
+                    assert_eq!(first_cell_secs, 0.0);
+                    break;
+                }
+                Some(StripThumbnailOutcome::Failed(failure)) => {
+                    panic!("rounded first indexed cell failed: {failure:?}");
+                }
+                None => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "first indexed cell timed out: {snapshot:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn cell_of(secs: f64, bytes: usize) -> (StripCellId, StripThumbnailOutcome) {
         let id = StripCellId::from_secs(secs).expect("finite seconds");
         (

@@ -4455,8 +4455,9 @@ mod tests {
             "{fixture_name}: client position {client_position}"
         );
 
-        // Both requests address the fifth one-second colour (magenta). This
-        // proves the input seek, not just the outgoing timestamp arithmetic.
+        // All requests address the fifth one-second colour (magenta). The
+        // negative-origin case also rejects a missing input seek conversion:
+        // seeking raw +4s would skip the requested content around raw -0.6s.
         let frame = first_frame.expect("decoded first output video frame");
         let mut scaler = ScaleContext::get(
             frame.format(),
@@ -4483,6 +4484,11 @@ mod tests {
     #[test]
     fn remote_timeline_origin_large_ts_seeks_media_time_and_encodes_relative_segments() {
         assert_remote_timeline_origin("large-origin.ts", 4.0, 4.0);
+    }
+
+    #[test]
+    fn remote_timeline_origin_wrap_ts_seeks_negative_raw_locator_and_relative_segments() {
+        assert_remote_timeline_origin("wrap-origin.ts", 4.0, 4.0);
     }
 
     #[test]

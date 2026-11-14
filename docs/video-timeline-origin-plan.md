@@ -71,6 +71,13 @@ O = コンテナの開始時刻 (`AVFormatContext.start_time`)、D = `VideoInfo.
   Ogg も flag を持ち、`-output_ts_offset` で開始 ≠ 0 の Ogg を作れるが、通常のファイルは開始 0 で今の不具合の
   報告も無いので対象外にする。
 - O_eff が 0 のファイル (TS/PS 以外の全部と、開始 0 の TS/PS) では変換は恒等で、挙動は変わらない。
+- **原点の精度 (独立レビュー後の補足、2026-11-14)**: `AVFormatContext.start_time` は
+  `AV_TIME_BASE` の整数、すなわち 1 µs 単位へ丸められた値である。90 kHz など、より細かい source tick の
+  先頭時刻を引くと微小な負値になることがあるため、`MediaTimeline` は O_eff ≠ 0 の変換結果が
+  半開区間 `(-1 µs, 0)` に入る場合だけ 0 とする。`-1 µs` 以下の実際の負時刻は保ち、O_eff=0 では
+  この補正も行わない。音声トラックの start と end は個別に妥当性を判定し、負の start だけで既知の end を捨てない。
+  原点は整数のまま保持し、整数 AV_TIME_BASE の seek locator は整数 API で変換する。特に O_eff=0 の整数値は
+  f64 を往復させず bit 単位で恒等に保つ。
 - raw PTS は **FFmpeg を直接呼ぶ箇所の中だけ**に閉じる。変換は新しい型 `MediaTimeline`
   (`src/video/media_timeline.rs`) のメソッドだけで行い、`start_time` を読む箇所・O_eff を足し引きする箇所を
   他に作らない。`MediaTimeline::from_input(&Input)` が O_eff を決める唯一の場所。
@@ -161,6 +168,10 @@ O_eff ≠ 0 のファイル (MPEG-TS / PS 系) だけ。
   旧 raw を `value − O_eff` に変換してから判定する。O_eff = 0 なら値はそのまま。値 < O_eff の旧 raw は再生位置と
   してあり得ないので復元しない。行の書き直しは専用の経路を作らず、既存の定期保存 (印付き) に任せる
   (保存されないまま閉じた旧行は、次に開いたときも同じ変換を受けるだけ)。
+  `VideoInfo` 未受領で保留中の保存位置を所有している間は、表示用の凍結位置は保存可能な再生位置ではない。
+  `VideoPlayer::resume_position_for_save` が保存可能性と位置を一度に返し、この間は更新を作らない。
+  定期保存、全件保存、detached / parked / passive context の終了、exit の全経路が同じ query を使い、
+  旧行の値と LegacyRaw / Media の印をそのまま保持する。metadata 採用後は既存の保存規則へ戻る。
   続きから再生の縮小画像は下のキャッシュの扱いで作り直される。
 - ブックマーク・ピン: 再生位置から付けたもの (raw) と、時刻の貼り付け・時刻指定で付けたもの (0 起点) を区別
   できないので移行しない。O_eff ≠ 0 のファイルで再生位置から付けたものは、修正後に O_eff だけ後ろの位置へ移る。
@@ -196,6 +207,10 @@ MKV では O_eff = 0 なので T1 の「コンテナ開始 = 0」と食い違う
 T1 側のファイルはこのブランチで触らない。master へ後から入る側が合わせる (統括と合意済み)。
 
 ## 6. テスト (受入条件)
+
+チャプターの変換は維持するが、補正対象の MPEG-TS / PS demuxer はチャプターを持たないため、
+補正付きチャプターの実コンテナ試験はできない。O>0 MKV の O_eff=0 とチャプター時刻が不変であることを
+検査し、補正付きチャプターを試験済みとは扱わない。
 
 fixture は `testdata/timeline-origin/` に、システムの ffmpeg と lavfi だけで作る小さな素材を置き、生成スクリプトを
 `scripts/ui-smoke/generate_timeline_origin_fixture.py` に置く (既存 `generate_audio_tracks_fixture.py` と同じ流儀)。

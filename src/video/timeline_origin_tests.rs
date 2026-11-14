@@ -17,6 +17,7 @@ struct Session {
     clock: Arc<AvClock>,
     cancel: Arc<AtomicBool>,
     info: VideoInfo,
+    skipped_frames: Arc<AtomicU64>,
 }
 
 impl Drop for Session {
@@ -35,6 +36,7 @@ fn start(name: &str, step: Option<(f64, i32)>) -> Session {
         clock.request_frame_step_seek((base - 1.0).max(0.0), base, direction);
     }
     let cancel = Arc::new(AtomicBool::new(false));
+    let skipped_frames = Arc::new(AtomicU64::new(0));
     let (tx, _rx) = bounded(64);
     let handles = spawn(
         fixture(name),
@@ -52,10 +54,13 @@ fn start(name: &str, step: Option<(f64, i32)>) -> Session {
         Arc::new(AtomicU8::new(if step.is_some() {
             state_code::SEEKING
         } else {
-            state_code::PLAYING
+            // This fixture consumer verifies every decoded frame without a
+            // presenter. PLAYING deliberately drops on a full output queue;
+            // BUFFERING uses the existing lossless backpressure instead.
+            state_code::BUFFERING
         })),
         EngineEventSender::new(tx, Arc::new(VideoUiWake::default())),
-        Arc::new(AtomicU64::new(0)),
+        Arc::clone(&skipped_frames),
         Arc::new(VideoDynamicState::default()),
     );
     let info = handles
@@ -68,6 +73,7 @@ fn start(name: &str, step: Option<(f64, i32)>) -> Session {
         clock,
         cancel,
         info,
+        skipped_frames,
     }
 }
 
@@ -158,6 +164,8 @@ fn timeline_origin_ts_decoder_first_frames_seek_tail_colour_and_eof() {
         let session = start(name, None);
         assert!(session.info.timeline_origin_secs.abs() > 1.0, "{name}");
         let (video, audio) = drain(&session, 0, -1.0);
+        assert_eq!(session.skipped_frames.load(Ordering::Acquire), 0, "{name}");
+        assert_eq!(video.len(), 144, "{name}: every fixture frame must arrive");
         assert!(
             (video[0].pts_secs - 0.021333).abs() < 0.002,
             "{name}: {}",
@@ -170,7 +178,12 @@ fn timeline_origin_ts_decoder_first_frames_seek_tail_colour_and_eof() {
         );
         assert_colour(&video[0], 0);
         assert_colour(video.last().unwrap(), 11);
-        assert!((video.last().unwrap().pts_secs - session.info.duration_secs).abs() < 0.1);
+        assert!(
+            (video.last().unwrap().pts_secs - session.info.duration_secs).abs() < 0.1,
+            "{name}: final PTS {} duration {}",
+            video.last().unwrap().pts_secs,
+            session.info.duration_secs,
+        );
         let target = session.info.duration_secs - 0.5;
         session.clock.request_seek(target);
         let serial = session.clock.current_seek_serial();
@@ -246,6 +259,28 @@ fn timeline_origin_late_track_metadata_and_availability_are_media() {
     assert!(audio_track_available_at(late, 6.0));
     // TS stream duration is estimated (5.824s), not the decoded six-second span.
     assert!((9.5..10.1).contains(&late.end_secs.unwrap()));
+}
+
+#[test]
+fn timeline_origin_first_audio_track_keeps_end_when_start_rounds_to_zero() {
+    use crate::video::audio_track_selection::audio_track_available_at;
+
+    let session = start("late-audio-origin.ts", None);
+    let first = &session.info.audio_tracks[0];
+    assert_eq!(first.stream_index, 1);
+    // 3240124080/90000 is 1/3 microsecond before format start_time
+    // 36001.378667. Its independently known end must survive that rounding.
+    assert_eq!(first.start_secs, Some(0.0));
+    let end = first
+        .end_secs
+        .expect("first audio track must retain its end");
+    // FFmpeg's measured stream duration is 1079040 ticks, not format D.
+    let expected_end = 1_079_040.0 / 90_000.0;
+    assert!((end - expected_end).abs() < 1e-9, "{end}");
+    assert!(audio_track_available_at(first, 0.0));
+    let ready_margin = crate::video::audio::AUDIO_TRACK_READY_MARGIN_SECS;
+    assert!(audio_track_available_at(first, end - ready_margin - 0.01));
+    assert!(!audio_track_available_at(first, end + 0.01));
 }
 
 #[test]

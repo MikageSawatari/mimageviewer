@@ -82466,6 +82466,179 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     #[cfg(windows)]
+    fn saved_resume_pending_metadata_survives_periodic_and_save_all() {
+        use crate::settings::VideoResumePosition::{LegacyRaw, Media};
+        for saved in [LegacyRaw(36012.0), Media(12.0), Media(28.0)] {
+            for audio_mode in [false, true] {
+                let mut app = setup_app();
+                app.video_tile_cache = None;
+                let path = app.tmp.path().join("loading-resume.ts");
+                let idx = push_video(&mut app, path.to_str().unwrap());
+                let key = crate::adjustment_db::normalize_path(&path);
+                let (player, _tx, _info) =
+                    crate::video::VideoPlayer::loading_resume_disconnected_for_test(
+                        path, saved, false,
+                    );
+                app.fs_cache.insert(
+                    idx,
+                    FsCacheEntry::Video {
+                        player: Box::new(player),
+                        load_seq: 0,
+                    },
+                );
+                app.video_audio_mode = audio_mode.then_some(idx);
+                app.settings
+                    .video_resume_positions
+                    .insert(key.clone(), saved);
+                app.settings.video_watched_to_end.insert(key.clone());
+                app.video_resume_thumb_last_request
+                    .insert(key.clone(), 12_000);
+                let positions = app.settings.video_resume_positions.clone();
+                let watched = app.settings.video_watched_to_end.clone();
+                let thumbnails = app.video_resume_thumb_last_request.clone();
+                let ctx = egui::Context::default();
+                for _ in 0..2 {
+                    app.video_resume_last_save = None;
+                    app.poll_video(&ctx);
+                    app.save_all_video_resume_positions();
+                    assert_eq!(app.settings.video_resume_positions, positions, "{saved:?}");
+                    assert_eq!(app.settings.video_watched_to_end, watched, "{saved:?}");
+                    assert_eq!(app.video_resume_thumb_last_request, thumbnails, "{saved:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn saved_resume_metadata_resolution_enables_periodic_migration() {
+        use crate::settings::VideoResumePosition::{LegacyRaw, Media};
+        for saved in [LegacyRaw(36012.0), Media(12.0)] {
+            let mut app = setup_app();
+            app.video_tile_cache = None;
+            let path = app.tmp.path().join("resolved-resume.ts");
+            let idx = push_video(&mut app, path.to_str().unwrap());
+            let key = crate::adjustment_db::normalize_path(&path);
+            let (player, tx, mut info) =
+                crate::video::VideoPlayer::loading_resume_disconnected_for_test(path, saved, false);
+            info.timeline_origin_secs = 36000.0;
+            app.fs_cache.insert(
+                idx,
+                FsCacheEntry::Video {
+                    player: Box::new(player),
+                    load_seq: 0,
+                },
+            );
+            app.settings
+                .video_resume_positions
+                .insert(key.clone(), saved);
+            let ctx = egui::Context::default();
+            app.poll_video(&ctx);
+            assert_eq!(app.settings.video_resume_positions.get(&key), Some(&saved));
+            tx.send(Ok(info)).unwrap();
+            app.video_resume_last_save = None;
+            app.poll_video(&ctx);
+            assert_eq!(
+                app.settings.video_resume_positions.get(&key),
+                Some(&Media(12.0))
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn saved_resume_pending_metadata_survives_detached_exit_and_passive_teardown() {
+        use crate::settings::VideoResumePosition::{LegacyRaw, Media};
+        for saved in [LegacyRaw(36012.0), Media(12.0), Media(28.0)] {
+            let mut app = setup_app();
+            app.video_tile_cache = None;
+            let ctx = egui::Context::default();
+            let active_path = app.tmp.path().join("loading-active.ts");
+            let parked_path = app.tmp.path().join("loading-parked.ts");
+            let (active_player, _active_tx, _) =
+                crate::video::VideoPlayer::loading_resume_disconnected_for_test(
+                    active_path.clone(),
+                    saved,
+                    false,
+                );
+            let (parked_player, _parked_tx, _) =
+                crate::video::VideoPlayer::loading_resume_disconnected_for_test(
+                    parked_path.clone(),
+                    saved,
+                    false,
+                );
+            app.build_active_context_for_test(None, DetachedSource::Video, move |active| {
+                active.items.push(GridItem::Video(active_path));
+                active.fullscreen_idx = Some(0);
+                active.fs_cache.insert(
+                    0,
+                    FsCacheEntry::Video {
+                        player: Box::new(active_player),
+                        load_seq: 0,
+                    },
+                );
+            });
+            let parked_key = crate::adjustment_db::normalize_path(&parked_path);
+            app.push_window_context_for_test(&ctx, 613, move |parked| {
+                parked.items.push(GridItem::Video(parked_path));
+                parked.fullscreen_idx = Some(0);
+                parked.fs_cache.insert(
+                    0,
+                    FsCacheEntry::Video {
+                        player: Box::new(parked_player),
+                        load_seq: 0,
+                    },
+                );
+            });
+            let active_key = app
+                .with_active_viewer_context(|active| match &active.items[0] {
+                    GridItem::Video(path) => crate::adjustment_db::normalize_path(path),
+                    _ => unreachable!(),
+                })
+                .unwrap();
+            for key in [&active_key, &parked_key] {
+                app.settings
+                    .video_resume_positions
+                    .insert(key.clone(), saved);
+                app.settings.video_watched_to_end.insert(key.clone());
+                app.video_resume_thumb_last_request
+                    .insert(key.clone(), 12_000);
+            }
+            let positions = app.settings.video_resume_positions.clone();
+            let watched = app.settings.video_watched_to_end.clone();
+            let thumbnails = app.video_resume_thumb_last_request.clone();
+            app.save_detached_video_resume_positions_for_exit();
+            assert_eq!(
+                app.settings.video_resume_positions, positions,
+                "exit {saved:?}"
+            );
+            assert_eq!(app.settings.video_watched_to_end, watched, "exit {saved:?}");
+            assert_eq!(
+                app.video_resume_thumb_last_request, thumbnails,
+                "exit {saved:?}"
+            );
+            assert!(
+                app.teardown_paused_media_bundles_for_window_ids(
+                    &[613],
+                    "test_pending_saved_resume_teardown",
+                )
+                .is_ok()
+            );
+            assert!(app.locate_window_context(613).is_none());
+            assert_eq!(
+                app.settings.video_resume_positions, positions,
+                "drop {saved:?}"
+            );
+            assert_eq!(app.settings.video_watched_to_end, watched, "drop {saved:?}");
+            assert_eq!(
+                app.video_resume_thumb_last_request, thumbnails,
+                "drop {saved:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn save_all_video_resume_removes_eof_even_when_duration_is_zero() {
         let mut app = setup_app();
         let eof_path = PathBuf::from(r"C:\clips\mpeg-ps-eof.mpg");

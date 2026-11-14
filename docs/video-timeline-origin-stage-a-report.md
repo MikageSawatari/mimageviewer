@@ -1,12 +1,102 @@
 # Video timeline origin: stage A verification record
 
-2026-11-14. Stage A implementation and focused automated verification are complete under the accepted scope. The requested full lib run completed once with two existing IPC PermissionDenied failures in this environment, recorded below. No product binary has been launched; all playback observations below are noninteractive decoder/FFmpeg tests or source inspection.
+2026-11-14. Stage A implementation and independent-review fixes are applied. The review-fix focused run passed1014/1014; the requested full lib run completed once with17629 passed,6 failed,1 timed out,76 skipped. All nine newly added review regressions passed in its JUnit. Complete failures and subsequent test-harness correction/diagnostics are recorded below; this is not a successful full gate. No product binary has been launched; all playback observations below are noninteractive decoder/FFmpeg tests or source inspection.
 
 ## Commits and ownership
 
 - `30030f112` - `feat(video): Rebase MPEG-TS/PS timestamps to media time (WIP checkpoint)` (committed by the design lead).
+- `553140833` - `fix(video): Finish the media-time origin stage A (Codex follow-up)` (committed by the design lead before this review-fix round).
 - Follow-up edits remain in this worktree, `fix-video-timeline-origin`. The design lead performs commits; the implementer does not run git add/commit.
 - The design lead removed the inaccessible generator scratch directory. Cargo now compiles in this worktree.
+
+## Independent review fixes after 553140833
+
+The separate design-lead review accepted after fixes P2-1, P2-2, P2-3, P3-4 and P3-5. The changes below address those findings; follow-up independent Sol/xhigh source review found no remaining P1/P2 issue. These are headless checks and source review, not live-product observations.
+
+| Finding | Root correction | Regression coverage |
+|---|---|---|
+| P2-1: unresolved saved resume erased before metadata | One `VideoPlayer::resume_position_for_save(audio_mode_without_vst) -> Option<f64>` owns both position selection and save availability. While the player owns a saved row without VideoInfo it returns None. Every local producer omits the resume update and thumbnail request, leaving the existing value, LegacyRaw/Media basis and watched state untouched. After metadata it uses the existing save rules. No new pending state is added. | Three actual App regressions cover repeated periodic/save-all, metadata adoption enabling the ordinary periodic migration, detached exit harvesting and passive-context teardown. The Player metadata test also asserts save-query availability before/after adoption. Both typed bases and an initially invalid Media value are covered. |
+| P2-2 / P2-3: format origin rounding creates tiny negative source times | `MediaTimeline` retains the AV_TIME_BASE integer origin. For nonzero effective origins it maps only converted values in `(-1 us, 0)` to zero. Exact -1 us and genuinely negative preroll remain negative; O_eff=0 returns source seconds unchanged. Audio end validity is independent of start validity. No strip-specific fallback is added. | Precision boundary/identity unit coverage; late-audio first stream (index1) startSome(0), known end1079040/90000, availability before/after end; a genuine negative-start/known-positive-end metadata unit; actual indexed-strip worker first-cell pixel check on an audio-less TS. |
+| P3-4: integer warmup seek loses a microsecond through f64 | Strip warmup retains duration/2 in integer AV_TIME_BASE units and uses `MediaTimeline::media_av_time_base_to_raw`. No seconds round trip. The integer origin is the canonical stored origin, with seconds derived for seconds callers. | 2003500 stays2003500, plus signed/extreme O_eff=0 values and positive/negative-origin integer translations. |
+| P3-5: positive origin Remote case cannot prove seek conversion | Add actual clockless transcode of wrap-origin.ts requested at media4s, whose raw locator is about-0.621333s. A missing conversion instead seeks raw+4s, past the requested scene/window. | Existing fMP4 packet timestamps, client position and first-frame magenta pixels are all asserted for the new negative-origin case as well. |
+
+### Every local resume-save route
+
+| Producer / caller | Shared query or route |
+|---|---|
+| `src/app.rs:100530` periodic poll | Calls `resume_position_for_save` before creating MediaResumeUpdate. |
+| `src/app.rs:98844` save-all | Calls the same query before row/thumbnail work. |
+| `src/app.rs:15597` context teardown plan | Calls the same query; media paths are captured before skipping an unavailable resume update, so disposal still occurs. |
+| `src/app.rs:66621` passive/parked teardown | Uses the context teardown plan. |
+| `src/app.rs:66952` detached exit harvesting | Uses the context teardown plan. |
+| `src/app/runtime_ops.rs:593,595` application exit | Uses save-all and detached exit harvesting. |
+| `src/tray_integration.rs:423,425` tray exit | Uses save-all and detached exit harvesting. |
+| `src/app.rs:66832,66834` Remote handoff | Uses save-all and detached exit harvesting. |
+| `src/app.rs:80830,80976,82299,82961` replacement/prefetch/fullscreen close | Uses save-all. |
+| `src/app/native_video.rs:3423,15321`; `src/ui_fullscreen.rs:47624` native swap/continuous-reading prefetch | Uses save-all. |
+
+Remote progress updates have their own resolved source-position snapshot; they do not sample an unresolved local player and keep that existing ownership. The shared store mutation policy itself is unchanged.
+
+### Precision and fixture evidence
+
+New `rounded-origin-video-only.ts`: 83472 bytes, SHA256 `f4efbc860b24afe91a807f5386c8cab10bc6f7e7878274eda5f17bb0a12f6d15`. It has no audio,144 I/key frames and144 PTS=DTS packets; first raw PTS3240150000/90000=36001.666666666664, format origin36001.666667, D12. The first center pixel is(253,0,0). This is system FFmpeg/lavfi generation and headless measurement. Regeneration uses the existing exact command `python .\scripts\ui-smoke\generate_timeline_origin_fixture.py .\testdata\timeline-origin`; all eight existing fixture SHA256 values stayed unchanged. Total nine fixture files:834047 bytes. Generator/README describe this added precision case.
+
+The indexed-strip regression explicitly installs the144 actual verified key-packet raw DTS/PTS/byte-position/size locators with av_add_index_entry into a test-owned Input, then requests the real worker's first indexed cell. A first narrow run found the test-setup assumption that TS demux alone would populate the full index was false (6 entries, expected144). Setup was corrected without weakening that assertion. It explicitly checks Ready/red rather than accepting DecodeFailed or a cold TimeGrid fallback. No production scan or new seek path is introduced. Independent follow-up review accepted this test-only correction.
+
+The integer audit found the introduced integer -> seconds -> integer FFmpeg locator round trip only at strip warmup. Playback/thumbnail/screenshot take seconds from their APIs; strip decode, range audio and Remote also start with seconds and retain their existing rounding rules. Upscale source locators already use raw integer rescaling and remain unchanged. Waveform quantization/cache keys are not FFmpeg seek locators and were not changed.
+
+Chapter conversion remains in production. MPEG-TS/MPEG-PS do not carry chapters, so a rebased-container chapter regression is unavailable. The positive-origin MKV regression verifies unchanged O_eff=0 chapter times; no artificial chapter test or claim of rebased chapter runtime coverage is added.
+
+### Review-fix verification commands and results
+
+All commands use the required outer runner:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local\miv-locks\run-heavy.ps1 -Owner "timeline-origin codex" -WorkDir G:\home\mimageviewer-timeline-origin -Command "<inner command>"
+```
+
+The shared lock directory remains unwritable in the sandbox; the runner reports and uses its authorized BelowNormal/6-job fallback. No dependency settings or personal configuration are changed.
+
+| Exact inner command / phase | Result |
+|---|---|
+| `cargo fmt` | PASS, workspace-wide, no arguments. |
+| Initial narrow run: `cargo nextest run -p mimageviewer --lib -E 'test(/saved_resume_|origin_precision_|integer_seek_locators|enumerate_audio_track_end_survives|timeline_origin_first_audio_track|timeline_origin_rounded_first_indexed|remote_timeline_origin_wrap|player_resume_media_and_legacy/ )' --no-fail-fast --status-level fail --final-status-level fail` | 11 run:10 passed,1 failed in2.125s (c79de616-b946-440f-8107-8271bbb456f8). Sole failure was the TS index preparation assumption, corrected as described above. |
+| Review-fix focused before full: `cargo nextest run -p mimageviewer --lib -E 'test(/timeline_origin|media_timeline|timeline_migration|video_resume|resume_migration|resume_for_open|sanitize_resume|tile_thumb_cache|seek_strip|audio_decode|clockless|enumerate_audio|audio_track|thumbnail|screenshot|video::tests::|engine::actor|saved_resume_/)' --no-fail-fast --status-level fail --final-status-level fail` | PASS:1014 run,1014 passed,16698 not selected in75.354s (56595f9b-cbcb-459d-8fda-10636abac799). |
+| Full lib, exactly once: outer runner with `-FullTest -Command ".\scripts\test-lib-full.ps1"` | FAIL:17636 run,17629 passed,6 failed,1 timed out,76 skipped in1756.772s;60 slow,2 leaky. JUnit a18dfa16-aeb9-4445-b29b-f5cb115ad2e9. |
+| Post-full diagnostic: `cargo nextest run -p mimageviewer --lib -E 'test(/no_resident_smart_pdf_missing_root_row_rolls_back_history|visibility_settings_ok_retires_extracting_and_grouping_on_worker_scan_path|rotation_stall_and_snapshot_handle_preserve_saved_prefix|timeline_origin_ts_decoder_first_frames_seek_tail_colour_and_eof/)' --no-fail-fast --status-level fail --final-status-level fail` | PASS:4 run,4 passed in2.934s (8baeeb77-6fea-4a79-9399-a590b473de52). Includes corrected EOF harness. The three other assertions passed unchanged in isolation; their full-run failures remain failures with unconfirmed causes. |
+| `cargo fmt`; `cargo fmt --check`; `git diff --check` | PASS after the test-only harness correction. Run before the diagnostic by ignored `target/timeline-origin-review-diagnostics.ps1`, supplied to the same runner. |
+| Final focused after the EOF harness correction: same exact1014-test command above, through `target/timeline-origin-review-focused.ps1` | PASS:1014 run,1014 passed,16698 not selected in76.667s (4be74915-224b-4c9b-b5a1-0502371065c3). This is the final-source focused result. |
+| Verification build: same outer runner with `-Command ".\target\timeline-origin-build-dev.ps1"` | PASS:exit0 at13:06:21 JST. Normal-feature core3m35s; Remote0.93s, EPUB0.73s, MCP0.60s, music-video5.79s. Runtime/PE checks passed:runtime=4 / pe=5. Uses the process-only explicit/static native prerequisite environment documented in the historical build record below, then `build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0`. No application launch. |
+
+The final focused invocation is wrapped by ignored local `target/timeline-origin-review-focused.ps1`, which runs `cargo fmt`, checks its exit code, then executes exactly the focused command above. The wrapper itself is passed as the runner's inner command. Nine tests are newly added in this round:3 App save lifecycle,2 MediaTimeline precision/integer,1 independent audio end,1 late-audio metadata,1 indexed strip pixel,1 negative-origin Remote. Existing Player resume assertions are also expanded. No assertions were loosened.
+
+| Newly added test | File:line |
+|---|---|
+| saved_resume_pending_metadata_survives_periodic_and_save_all | src/app/tests.rs:82469 |
+| saved_resume_metadata_resolution_enables_periodic_migration | src/app/tests.rs:82514 |
+| saved_resume_pending_metadata_survives_detached_exit_and_passive_teardown | src/app/tests.rs:82550 |
+| origin_precision_zeroes_only_sub_microsecond_negative_rounding | src/video/media_timeline.rs:153 |
+| integer_seek_locators_preserve_microseconds_and_identity | src/video/media_timeline.rs:179 |
+| enumerate_audio_track_end_survives_a_genuinely_negative_start | src/video/decoder.rs:9987 |
+| timeline_origin_first_audio_track_keeps_end_when_start_rounds_to_zero | src/video/timeline_origin_tests.rs:265 |
+| timeline_origin_rounded_first_indexed_strip_cell_returns_first_colour | src/video/seek_strip_thumbs.rs:3329 |
+| remote_timeline_origin_wrap_ts_seeks_negative_raw_locator_and_relative_segments | src/video/clockless_transcode.rs:4490 |
+
+Full evidence: `target/test-lib-full/runs/20261114T031625908Z-ca627b6d/{stderr.log,junit.xml}`, source hash `68fd0a25a0c5eca1ad80d9af90e10a9f1f664eb65e62bf2e5d7b93156ddd1b89`. Source stayed unchanged throughout that run. Its JUnit confirms all nine new review regressions passed. After the run, only the existing EOF test's harness configuration (described below), documentation and ignored diagnostic scripts changed; production code did not change.
+
+| Full failure / location at that snapshot | Exact observation / disposition |
+|---|---|
+| `agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry`, `src/agent_ipc/pipe.rs:334` | Windows code5 / PermissionDenied connecting to the named pipe. Same known sandbox restriction; design lead separately reports176/176 IPC tests passed outside the sandbox. |
+| `agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`, `src/agent_ipc/tests.rs:762` | Windows code5 / PermissionDenied preparing fixture server. Same known sandbox restriction. |
+| `app::tests::smart_folder_transition_tests::no_resident_smart_pdf_missing_root_row_rolls_back_history`, `src/app/tests.rs:103139` | Existing5s scan deadline: `missing row scan timed out`. Test/Smart-PDF path unchanged; no video player is created. Same named failure is recorded in docs/egui-0.37-stage1a-verification.md:353. Current causal diagnosis remains unconfirmed. |
+| `app::folder_scan::section1375_scan_perf_tests::section1375_large_physical_scan_10k_100k`, `src/app/folder_scan.rs:3605` | Nextest terminated this existing performance test at600.258s. No assertion/deadline/source changes; not rerun as part of the lightweight diagnostics. |
+| `filename_stack_ui::tests::visibility_settings_ok_retires_extracting_and_grouping_on_worker_scan_path`, `src/filename_stack_ui.rs:2392`, assertion `src/app/tests.rs:1208` | Existing10s listing-identity wait did not settle. This unchanged test creates PNG/JPEG entries and no video player. The helper's deadline remains unchanged. |
+| `log_writer::tests::rotation_stall_and_snapshot_handle_preserve_saved_prefix`, `src/log_writer/tests.rs:184` | `service.shutdown(Instant::now() + BARRIER_WAIT)` returned false; BARRIER_WAIT is2s (`src/log_writer.rs:18`). Unchanged log-writer files; no saved-prefix assertion was reached. |
+| `video::decoder::timeline_origin_tests::timeline_origin_ts_decoder_first_frames_seek_tail_colour_and_eof`, `src/video/timeline_origin_tests.rs:173` | Final-frame distance from D failed the unchanged0.1s assertion. The harness supplied engine PLAYING although it consumes frames without a paced presenter; production intentionally drops full-queue frames in PLAYING (`decoder.rs` CPU enqueue path). Corrected the test setup to existing lossless BUFFERING backpressure; frame-step stays SEEKING. Retained the skipped-frame counter and strengthened checks to zero skips and144 delivered frames. No product path or EOF tolerance changed. Independent follow-up review accepted the harness correction. |
+
+The initial full-result status filter missed TIMEOUT lines; the final accounting above is from complete nextest summary/JUnit and includes the600s timeout. No failure is omitted. The same runner's full-test lock was observed to belong to another live full run started12:25:07 while this run used its authorized no-slot fallback. This records observed overlap, not proof of the cause of each timing failure. No other worktree/process/lock was changed. Subsequent diagnostics queued behind that full-test lock.
+
+The three unchanged assertion failures passed in the single4-test diagnostic; their full-run causes remain unconfirmed. The600s performance timeout was not rerun. The EOF harness correction passed both the diagnostic and final1014-test focused run with zero drops/all144 frames and the unchanged tail tolerance. No second full run was made, as requested. Thus the full result above is the pre-harness-correction snapshot of the same production code, not a claimed successful full gate for the final test source.
 
 ## Accepted stored-value display exception
 
@@ -51,7 +141,7 @@ For this branch, the lead explicitly selected all-intra origin fixtures. The fin
 
 Diagnostic scripts remain under ignored `target/`: `timeline_aux_probe.py`, `timeline_aux_seek_modes.py`, `timeline_aux_byte_decode.py` (linked DLL probes, no product launch).
 
-## Automated verification
+## Checkpoint verification through 553140833 (historical)
 
 The original implementation added 25 tests (the follow-up also adds three Player metadata-adoption tests and replaces obsolete actor resume tests): MediaTimeline policy/roundtrip/ticks (2), decoder/player/filter/late-track/identity-format regressions (6), thumbnail/index/range-audio pixel/pulse regressions (8), Remote actual fMP4 origin/segment/pixel regressions (2), selective cache migration (4), released resume migration (3).
 
@@ -102,7 +192,7 @@ The ordinary include spelling supplements the canonical Windows extended-path in
 
 ## Verification handoff
 
-The normal-feature `dev-runtime` build completed successfully at11:42:12 JST on2026-11-14. The core, Remote service, EPUB PDF worker, MCP adapter and music-video editor were produced; FFmpeg/VCRT companions were staged. The existing PE check passed for all five executables and four VCRT files; its local report is `target/vcrt-pe-reports/dev-runtime.json`. This build does not enable `portable` or `test-script`.
+The latest normal-feature `dev-runtime` build, including the review corrections, completed successfully at13:06:21 JST on2026-11-14. The core and Remote service, EPUB PDF worker, MCP adapter and music-video editor are ready; FFmpeg/VCRT companions are staged. The existing PE check passed for all five executables and four VCRT files; its local report is `target/vcrt-pe-reports/dev-runtime.json`. This build does not enable `portable` or `test-script`. The earlier11:42 build remains recorded only in the historical checkpoint table above.
 
 The user launches the normal-profile core from this worktree:
 
@@ -135,7 +225,7 @@ No additional commits were attempted after the lead's instruction. Follow-up edi
 
 ## FFmpeg boundary inventory
 
-The exact plan section 3 search was rerun at this checkpoint: 271 matches across 58 files. A = input absolute (convert to media), S = seek locator (convert media to raw immediately before FFmpeg), R = raw locator kept raw, O = output-own (unchanged), D = difference/duration only (unchanged), M = upper media API (not an FFmpeg boundary), N = not a time/no time operation. All matching lines are included, including false positives. Supplemental helper exits follow because the search does not select every timestamp consumer.
+The exact plan section 3 search was rerun at this checkpoint: 281 matches across 58 files. A = input absolute (convert to media), S = seek locator (convert media to raw immediately before FFmpeg), R = raw locator kept raw, O = output-own (unchanged), D = difference/duration only (unchanged), M = upper media API (not an FFmpeg boundary), N = not a time/no time operation. All matching lines are included, including false positives. Supplemental helper exits follow because the search does not select every timestamp consumer.
 
 | File:line(s) | Kind and action |
 |---|---|
@@ -144,7 +234,7 @@ The exact plan section 3 search was rerun at this checkpoint: 271 matches across
 | `crates/musicvideo-editor/src/resource_blobs.rs:250` | N: byte-offset seek, search-index identifier, UI wall clock, process-start identity, or explanatory comment. No FFmpeg media time. |
 | `crates/vst3-host/src/plugin_loader.cpp:1137,2454,2509,2535` | N: byte-offset seek, search-index identifier, UI wall clock, process-start identity, or explanatory comment. No FFmpeg media time. |
 | `src/ai/tensorrt_installer.rs:726` | N: byte-offset seek, search-index identifier, UI wall clock, process-start identity, or explanatory comment. No FFmpeg media time. |
-| `src/app.rs:55026,72925,99781,99929,99959,100081,100232,105040` | M: upper VideoPlayer/Remote session media API; conversion is at decoder/clockless boundary. |
+| `src/app.rs:55011,72910,99768,99916,99946,100068,100219,105021` | M: upper VideoPlayer/Remote session media API; conversion is at decoder/clockless boundary. |
 | `src/app/collection_navigation.rs:3922,9759` | M: upper VideoPlayer/Remote session media API; conversion is at decoder/clockless boundary. |
 | `src/app/gamepad_input.rs:710,713,5411` | M: upper VideoPlayer/Remote session media API; conversion is at decoder/clockless boundary. N: UI gesture/toast Instant/elapsed or comments. |
 | `src/app/native_video.rs:7113,7178,7208,7510,12864,13574,13611,14620,15923,15925,16206,16216` | M: upper VideoPlayer/Remote session media API; conversion is at decoder/clockless boundary. N: UI gesture/toast Instant/elapsed or comments. |
@@ -176,21 +266,21 @@ The exact plan section 3 search was rerun at this checkpoint: 271 matches across
 | `src/video/avio_progress.rs:276` | N: byte-offset seek, search-index identifier, UI wall clock, process-start identity, or explanatory comment. No FFmpeg media time. |
 | `src/video/clock.rs:693` | N: explanatory comments; actual FFmpeg seek boundary in decoder.rs. |
 | `src/video/clockless_transcode.rs:1193,1220,1255,2198,2375,2726,2730,4425,4426` | O: timed_packet consumes encoded segment DTS. A: source time bases/audio frame PTS/stream start -> raw_to_media_secs. S: media source_origin -> media_to_raw_secs then seek ticks. O: generated MP4 regression reads encoded output-relative timestamps. |
-| `src/video/decoder.rs:11,444,450,462,469,488,1186,1201,2186,2187,2193,2194,2199,2486,2797,2801,3419,3421,3424,3425,3430,3432,3447,3448,3476,6232,7617,8989,11531,11700,12357` | R: raw frame/packet tick helpers. R: bwdif internal time-base rescale, no rebasing. A: stream start -> raw_to_media_secs. D: stream duration. A: lane time bases, converted at exits below. A: chapter start/end -> raw_to_media_secs. S: demux seek/comments: media_to_av_time_base before both FFmpeg calls. D: container duration. S: existing fixed-O=0 audio-only.flac raw seek test. R: internal raw/filter explanation and existing fixed-O=0 MKV filter test. |
+| `src/video/decoder.rs:11,444,450,462,469,488,1186,1201,2186,2187,2193,2194,2199,2488,2799,2803,3421,3423,3426,3427,3432,3434,3449,3450,3478,6234,7619,8991,9990,9996,11555,11724,12381` | R: raw frame/packet tick helpers. R: bwdif internal time-base rescale, no rebasing. A: stream start -> raw_to_media_secs. D: stream duration. A: lane time bases, converted at exits below. A: chapter start/end -> raw_to_media_secs. S: demux seek/comments: media_to_av_time_base before both FFmpeg calls. D: container duration. S: existing fixed-O=0 audio-only.flac raw seek test. R: internal raw/filter explanation and existing fixed-O=0 MKV filter test. |
 | `src/video/engine/state.rs:131` | N: explanatory comments; actual FFmpeg seek boundary in decoder.rs. |
-| `src/video/media_timeline.rs:15,36,63` | A: sole start_time/NOPTS -> effective origin policy. S: media_to_raw_secs then AV_TIME_BASE conversion. |
-| `src/video/mod.rs:13639,13720,13748,13750,13779,13795,13818,13860,13866,13907,13914,15139,15152,15167,15187,15203,15245,17601,17617,17618` | M: upper VideoPlayer/Remote session media API; conversion is at decoder/clockless boundary. |
+| `src/video/media_timeline.rs:7,17,52,58,68,79,85` | A: sole start_time/NOPTS -> integer effective origin policy; sub-microsecond input rounding normalization only here. S: seconds locator conversion, plus exact integer AV_TIME_BASE conversion. |
+| `src/video/mod.rs:13675,13756,13784,13786,13815,13831,13854,13896,13902,13943,13950,15175,15188,15203,15223,15239,15281,17637,17653,17654` | M: upper VideoPlayer/Remote session media API; conversion is at decoder/clockless boundary. |
 | `src/video/mvexport/mux.rs:103,109,134,137,200` | O: custom H264/AAC encoder packet DTS ordering/rescale/mux, independent of source-media origin. |
 | `src/video/mvexport/video_only_tests.rs:50` | D: generated MP4 duration/frame count checks. |
 | `src/video/normalize_scanner.rs:121,288,564` | A: packet PTS -> raw_to_media_secs before progress publication. D: container duration. Filter-internal timestamps remain raw. |
 | `src/video/screenshot.rs:38,63,64,194` | A: input time base; frame exit covered below. S: media_to_av_time_base then seek. N: fixture documentation. |
-| `src/video/seek_strip.rs:566,592,599,602,629,660,1526` | R: raw AVIndexEntry locator retained; only published axis -> raw_to_media_secs. D: duration/2 computes warmup media position. S: warmup -> media_to_av_time_base. S: regression uses media_to_stream_ticks to install raw index entries. |
+| `src/video/seek_strip.rs:566,595,598,625,656,1522` | R: raw AVIndexEntry locator retained; only published axis -> raw_to_media_secs. D: integer duration/2 computes warmup locator. S: warmup -> media_av_time_base_to_raw, without seconds round trip. S: regression uses media_to_stream_ticks to install raw index entries. |
 | `src/video/seek_strip_batch.rs:71,605,746` | N: byte seek. D: container duration supplies media axis. N: error name. |
-| `src/video/seek_strip_thumbs.rs:1669,2548,2676,2681,2693,2886,2887,3060,3287,3288,3299,3303,3891,3966` | A: input time bases; timeline created from same Input. S: target -> media_to_raw_secs -> checked secs_to_av_time_base. R: packet DTS->PTS mapping; both compared on converted media axis. A: regression packet PTS/DTS -> media before colour assertion. D: probe duration. |
+| `src/video/seek_strip_thumbs.rs:1669,2548,2676,2681,2693,2886,2887,3060,3287,3288,3299,3303,3340,3342,3353,3354,3986,4061` | A: input time bases; timeline created from same Input. S: target -> media_to_raw_secs -> checked secs_to_av_time_base. R: packet DTS->PTS mapping; both compared on converted media axis. A: regression packet PTS/DTS -> media before colour assertion. D: probe duration. |
 | `src/video/stream/segmenter.rs:819,822,896,899,1526,1527,1534,1627,1871,1881,1886` | O: encoded session-relative packet PTS/DTS and output regression tests. Source-origin restoration stays in upper media contract. |
 | `src/video/thumbnail.rs:411,509,510` | A: input time base; frame adoption/publication below. S: media_to_av_time_base then seek. |
 | `src/video/tile_thumbnails.rs:440,528,529,569` | A: input time base; frame adoption below. S: media_to_av_time_base then seek. N: missing-PTS comment. |
-| `src/video/timeline_origin_tests.rs:327` | M: upper VideoPlayer/Remote session media API; conversion is at decoder/clockless boundary. |
+| `src/video/timeline_origin_tests.rs:271,362` | M: upper VideoPlayer/Remote session media API; conversion is at decoder/clockless boundary. |
 | `src/video/upscale/job.rs:729,739,887,900,901,1622,1623,1897,1908,1991,2003,2032,2042,2043,2087,2103,2135,2140,2247,2270,2351,2383,2539,2808` | D: stream duration -> estimated frame count. R: source_time_base/manifest/keyframe/source_last_pts and stream seek use raw source locators, never published as mIV seconds. O: segment encoder/concatenation remux/original audio remux output axis remains unchanged. |
 | `src/video/upscale/manifest.rs:388` | N: byte-offset seek, search-index identifier, UI wall clock, process-start identity, or explanatory comment. No FFmpeg media time. |
 | `src/video/upscale/sidecar.rs:139` | N: byte-offset seek, search-index identifier, UI wall clock, process-start identity, or explanatory comment. No FFmpeg media time. |
@@ -225,15 +315,15 @@ These supplement the required search, which does not match all helper consumers.
 | `src/audio_decode.rs:281` | seek locator -> raw; MediaTimeline is the only origin arithmetic. |
 | `src/video/clockless_transcode.rs:1258,2426,2524,2731` | input absolute -> media; MediaTimeline is the only origin arithmetic. |
 | `src/video/clockless_transcode.rs:2373` | seek locator -> raw; MediaTimeline is the only origin arithmetic. |
-| `src/video/decoder.rs:2192,2202,2806,3708,3842,4385,4811,5587,6460,6656,6660,7012,7013` | input absolute -> media; MediaTimeline is the only origin arithmetic. |
-| `src/video/decoder.rs:3422` | seek locator -> raw; MediaTimeline is the only origin arithmetic. |
-| `src/video/media_timeline.rs:63,67,114,118,120,123,125` | canonical conversion / unit coverage; MediaTimeline is the only origin arithmetic. |
+| `src/video/decoder.rs:2192,2202,2808,3710,3844,4387,4813,5589,6462,6658,6662,7014,7015` | input absolute -> media; MediaTimeline is the only origin arithmetic. |
+| `src/video/decoder.rs:3424` | seek locator -> raw; MediaTimeline is the only origin arithmetic. |
+| `src/video/media_timeline.rs:85,89,136,140,142,145,147,155,156,157,158,164,165,173,186,191,195` | canonical conversion / unit coverage; MediaTimeline is the only origin arithmetic. |
 | `src/video/mod.rs:259` | input absolute -> media; MediaTimeline is the only origin arithmetic. |
 | `src/video/normalize_scanner.rs:289` | input absolute -> media; MediaTimeline is the only origin arithmetic. |
 | `src/video/screenshot.rs:102` | input absolute -> media; MediaTimeline is the only origin arithmetic. |
 | `src/video/screenshot.rs:61` | seek locator -> raw; MediaTimeline is the only origin arithmetic. |
-| `src/video/seek_strip.rs:661` | input absolute -> media; MediaTimeline is the only origin arithmetic. |
-| `src/video/seek_strip.rs:596,1531` | seek locator -> raw; MediaTimeline is the only origin arithmetic. |
+| `src/video/seek_strip.rs:657` | input absolute -> media; MediaTimeline is the only origin arithmetic. |
+| `src/video/seek_strip.rs:592,1527` | seek locator -> raw; MediaTimeline is the only origin arithmetic. |
 | `src/video/seek_strip_thumbs.rs:2769,2892,2894,3299,3302` | input absolute -> media; MediaTimeline is the only origin arithmetic. |
 | `src/video/seek_strip_thumbs.rs:2673` | seek locator -> raw; MediaTimeline is the only origin arithmetic. |
 | `src/video/thumbnail.rs:561,590` | input absolute -> media; MediaTimeline is the only origin arithmetic. |

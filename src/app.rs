@@ -15533,24 +15533,6 @@ fn viewer_context_is_music_consumer(context: ContextRef<'_>) -> bool {
                 .is_some_and(|state| state.fs_idx == idx))
 }
 
-/// resume 保存に使う現在位置を、映像の表示状態に合わせて選ぶ。
-///
-/// 純粋な動画→音声モードでは presenter が hidden のため表示 PTS が入口で止まる。
-/// VST ホスト表示中は presenter が再び進むので、通常動画と同じ表示 PTS を優先する。
-/// (review-v2.3.0 追補6: R1-1 audio-mode resume)
-fn video_resume_position_for_save(
-    player: &crate::video::VideoPlayer,
-    audio_mode_without_vst: bool,
-) -> f64 {
-    if audio_mode_without_vst {
-        player.position()
-    } else {
-        player
-            .last_displayed_pts_secs()
-            .unwrap_or_else(|| player.position())
-    }
-}
-
 fn playback_position_deadline(
     current_secs: f64,
     target_secs: f64,
@@ -15612,11 +15594,14 @@ fn viewer_context_media_teardown_plan(
                 && !context
                     .video_audio_vst()
                     .is_some_and(|state| state.fs_idx == *idx);
+            let Some(position) = player.resume_position_for_save(audio_mode_without_vst) else {
+                continue;
+            };
             plan.resume_updates.push(MediaResumeUpdate {
                 clear_generation,
                 key: crate::adjustment_db::normalize_path(&path),
                 path,
-                position: video_resume_position_for_save(player, audio_mode_without_vst),
+                position,
                 duration: player.duration(),
                 at_eof: player.is_at_eof(),
                 has_video: player.info().is_some_and(|info| info.has_video),
@@ -98856,7 +98841,9 @@ impl App {
                         .video_audio_vst
                         .as_ref()
                         .is_some_and(|state| state.fs_idx == *idx);
-                let pos = video_resume_position_for_save(player, audio_mode_without_vst);
+                let Some(pos) = player.resume_position_for_save(audio_mode_without_vst) else {
+                    continue;
+                };
                 #[cfg(windows)]
                 if player.info().is_some_and(|info| info.has_video) {
                     thumb_requests.push((player.path().clone(), key.clone(), pos));
@@ -100539,18 +100526,12 @@ impl App {
                             .map(|event| (*idx, event)),
                     );
                 }
-                if do_save {
-                    let path_key = crate::adjustment_db::normalize_path(player.path());
-                    // 音声モードにトグルした動画 (Inc 7) は映像フレームが進まず `last_displayed_pts`
-                    // が detach 時点で固着するので、音声クロックの `position()` を保存位置に使う。
-                    // 音声ファイルは従来どおり (last_displayed_pts は None なので実質 position、Codex 7c
-                    // で byte-equivalent を維持するため video_audio_mode 限定で分岐)。
-                    // 7e: VST ホスト表示中は映像フレームが進むので last_displayed_pts を使う
-                    // (native video と同じ)。純粋な音声モード (映像固着) のときだけ position()。
-                    let pos = video_resume_position_for_save(
-                        player,
+                if do_save
+                    && let Some(pos) = player.resume_position_for_save(
                         video_audio_mode == Some(*idx) && video_audio_vst_idx != Some(*idx),
-                    );
+                    )
+                {
+                    let path_key = crate::adjustment_db::normalize_path(player.path());
                     updates.push(MediaResumeUpdate {
                         clear_generation: self.media_memory_clear_generation,
                         path: player.path().clone(),
