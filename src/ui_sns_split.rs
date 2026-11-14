@@ -1057,8 +1057,31 @@ impl App {
         let count_label = ui.label("枚数");
         let mut count = layout.count;
         let count_response = ui
-            .add(egui::Slider::new(&mut count, MIN_COUNT..=MAX_COUNT).step_by(1.0))
-            .labelled_by(count_label.id);
+            .horizontal(|ui| {
+                let value_width = egui::WidgetText::from(format!("{MAX_COUNT} 枚"))
+                    .into_galley(
+                        ui,
+                        Some(egui::TextWrapMode::Extend),
+                        f32::INFINITY,
+                        egui::FontSelection::Default,
+                    )
+                    .size()
+                    .x;
+                ui.spacing_mut().slider_width =
+                    (ui.available_width() - value_width - ui.spacing().item_spacing.x).max(0.0);
+                let response = ui
+                    .add(
+                        egui::Slider::new(&mut count, MIN_COUNT..=MAX_COUNT)
+                            .step_by(1.0)
+                            .show_value(false),
+                    )
+                    .labelled_by(count_label.id);
+                ui.add(
+                    egui::Label::new(format!("{count} 枚")).wrap_mode(egui::TextWrapMode::Extend),
+                );
+                response
+            })
+            .inner;
 
         let target_changed = target != layout.target;
         let count_changed = count != layout.count;
@@ -2074,10 +2097,17 @@ mod tests {
                     return;
                 }
                 egui::CentralPanel::default().show(root_ui, |ui| {
-                    ui.set_max_width(PANEL_W - 24.0);
-                    let _ = app_for_ui
-                        .borrow_mut()
-                        .draw_sns_split_controls(ui, image_size, None);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(PANEL_W - 24.0, ui.available_height()),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
+                            ui.set_max_width(PANEL_W - 24.0);
+                            assert!(ui.available_width() <= PANEL_W - 24.0 + 0.5);
+                            let _ = app_for_ui
+                                .borrow_mut()
+                                .draw_sns_split_controls(ui, image_size, None);
+                        },
+                    );
                 });
             });
         harness.run();
@@ -2086,6 +2116,13 @@ mod tests {
             .get_by_role_and_label(egui::accesskit::Role::Slider, "枚数")
             .rect();
         assert!(count_slider.right() <= PANEL_W);
+        assert!(count_slider.width() >= (PANEL_W - 24.0) * 0.7);
+        assert!(
+            harness
+                .query_by_role_and_label(egui::accesskit::Role::SpinButton, "枚数")
+                .is_none()
+        );
+        assert!(harness.query_by_label("3 枚").is_some());
         let original_group = app.borrow().sns_split.unwrap().group;
         harness.hover_at(count_slider.center());
         harness.drag_at(count_slider.center());
@@ -2095,21 +2132,29 @@ mod tests {
         assert_eq!(app.borrow().sns_split.unwrap().count, 20);
         assert_eq!(app.borrow().settings.sns_split_count, 20);
         assert_eq!(app.borrow().sns_split.unwrap().group, original_group);
+        let count_value = harness.get_by_label("20 枚").rect();
+        assert!(count_value.left() >= count_slider.right());
+        assert!(count_value.right() <= PANEL_W);
+        assert!(count_value.right() <= count_slider.left() + PANEL_W - 24.0 + 0.5);
+        assert!((count_value.center().y - count_slider.center().y).abs() < 1.0);
         harness.drop_at(count_slider.right_center());
         harness.run();
-        let count_value = harness
-            .get_by_role_and_label(egui::accesskit::Role::SpinButton, "枚数")
-            .rect();
-        assert!(count_value.right() <= PANEL_W);
         harness
-            .get_by_role_and_label(egui::accesskit::Role::SpinButton, "枚数")
+            .get_by_role_and_label(egui::accesskit::Role::Slider, "枚数")
             .focus();
         harness.run();
-        harness
-            .get_by_role_and_label(egui::accesskit::Role::SpinButton, "枚数")
-            .type_text("3");
-        harness.key_press(egui::Key::Enter);
-        harness.run();
+        for expected in (3..20).rev() {
+            harness.key_press(egui::Key::ArrowLeft);
+            harness.run();
+            assert_eq!(app.borrow().sns_split.unwrap().count, expected);
+            assert_eq!(app.borrow().settings.sns_split_count, expected);
+            assert!(harness.query_by_label(&format!("{expected} 枚")).is_some());
+            assert!(
+                harness
+                    .query_by_role_and_label(egui::accesskit::Role::SpinButton, "枚数")
+                    .is_none()
+            );
+        }
         assert_eq!(app.borrow().settings.sns_split_count, 3);
 
         assert!(
