@@ -59,7 +59,7 @@
 - 記録 (統括が読み取りで確認): Application ログには 2026-11-13 20:16 に同じ例外の msedgewebview2.exe (157.0.4341.46、オフセット 0x14d30c) の記録が 1 件あり、WER の ReportArchive にも同じ 1 件がある (親プロセスの記録は無い)。11-14 の分は、確認した時点 (12:09) ではまだ記録が無く、落ちたプロセスも残っていなかった。そのとき動いていた WebView2 のブラウザは、Windows の検索・LINE・mIV Sound (`mimageviewer-vst3-host.exe`、`%APPDATA%\mimageviewer\effetune\webview`) の 3 つだけ。
 - 既知の原因 (前例): WebView2 のコントローラを閉じきらずにホストが終わると、残ったブラウザが 0x80000003 で落ちてダイアログが出る ([派生版計画](effetune-fork-plan.md) §5、2026-10-24 にテストで発生)。mIV Sound のホストは「閉じて、その保存領域のブラウザの終了を待つ」形に直してある。このほか WebView2 を使うのは EPUB→PDF 変換の worker (`mimageviewer-epub-pdf.exe`) と、テスト (miv-sound の ctest、lib 全件の WebView2 を使うテスト) で、11-13〜14 は複数のセッションがこれらのテストを並行で回していた。
 - 次にすること: どのプログラムの WebView2 かを特定する。次に出たときに、ダイアログを閉じる前に、落ちたプロセスの親とコマンドライン (`--user-data-dir`) を読めるようにする (例: WER の LocalDumps を msedgewebview2.exe に設定して、ダンプからコマンドラインを読む)。mIV 側 (mIV Sound のホスト・EPUB worker) とテストの終了経路で、閉じきらずに終わる道が残っていないかをコードで洗う。利用者に追加の作業を頼むのは、開発側の手がかりで絞れなかった場合だけ。
-- 関連: [[feedback-webview2-tests-close-and-wait]] の方針、§1.755。規模 / 優先度: 調査から / P3。
+- 関連: テストや試作で WebView2 を作るときは閉じてから終了を待つ方針 (派生版計画 §5)、§1.755。規模 / 優先度: 調査から / P3。
 
 ### 1.779 表示中の画像を任意の角度 (0〜360 度) で回せるようにする — 利用者要望 (2026-11-14)
 
