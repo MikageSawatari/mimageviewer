@@ -199,10 +199,13 @@ fn timeline_origin_ts_decoder_first_frames_seek_tail_colour_and_eof() {
 
 #[test]
 fn timeline_origin_bwdif_frame_step_uses_media_before_and_after_filter() {
+    // The origin fixtures are all-intra at 12 fps. Keep exact adjacent-frame
+    // expectations, including the last frame emitted by the filter's EOF drain.
+    let pts = |frame: u32| 0.021333333333333 + f64::from(frame) / 12.0;
     for (base, direction, expected) in [
-        (5.021333333, 1, 5.061333333),
-        (5.101333333, -1, 5.061333333),
-        (11.941333333, 1, 11.981333333),
+        (pts(60), 1, pts(61)),
+        (pts(62), -1, pts(61)),
+        (pts(142), 1, pts(143)),
     ] {
         let session = start("interlaced-origin.ts", Some((base, direction)));
         let serial = session.clock.current_seek_serial();

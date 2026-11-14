@@ -13,11 +13,14 @@ COLOURS = (
     "ff0000", "00ff00", "0000ff", "ffff00", "ff00ff", "00ffff",
     "ffffff", "000000", "ff8000", "8000ff", "008080", "808080",
 )
-# At least one keyframe per second makes accurate seek tests cheap, while keeping
-# inter-frame decoding and the interlaced filter/drain paths exercised.
-VIDEO_OPTIONS = ["-c:v", "mpeg2video", "-q:v", "3", "-g", "25", "-bf", "0"]
+# All-intra isolates the origin contract from the pre-existing TS keyframe seek
+# defect tracked in docs/next-release-backlog.md section 1.780.
+VIDEO_OPTIONS = [
+    "-c:v", "mpeg2video", "-q:v", "3", "-g", "1", "-bf", "0",
+    "-flags:v", "+low_delay",
+]
 VIDEO_SOURCE = ";".join(
-    f"color=c=0x{colour}:s=96x64:r=25:d=1[v{index}]"
+    f"color=c=0x{colour}:s=96x64:r=12:d=1[v{index}]"
     for index, colour in enumerate(COLOURS)
 ) + ";" + "".join(f"[v{index}]" for index in range(12)) + "concat=n=12:v=1:a=0"
 
@@ -52,7 +55,7 @@ def generate_ts(output: Path, name: str, offset: float = 0, *,
         ]
     arguments += VIDEO_OPTIONS
     if interlaced:
-        arguments += ["-vf", "setfield=tff", "-flags", "+ilme+ildct"]
+        arguments += ["-vf", "setfield=tff", "-flags:v", "+low_delay+ilme+ildct"]
     arguments += [
         "-c:a", "aac", "-b:a", "32k", "-output_ts_offset", str(offset),
         "-f", "mpegts",

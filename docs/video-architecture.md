@@ -85,6 +85,13 @@ seek は FFmpeg へ渡す直前に raw locator へ戻す。duration や時刻差
 upscale manifest の source seek PTS など内部の raw locator は補正しない。
 `VideoInfo.timeline_origin_secs` は旧続き位置の復元・ログ・診断用で、通常の時刻変換に使わない。
 
+続きから再生の保留値は `VideoPlayer` が `LegacyRaw` / `Media` の型で一度だけ所有し、
+`VideoInfo` 受領後に変換・期間判定して seek を発行する。engine の
+`OpenOptions.initial_position_secs` は初期凍結位置だけで、自動 resume は発行しない。
+Media の値は読み込み中からその位置で凍結し、原点不明の LegacyRaw は 0 で待機する。
+metadata 前に発行された seek と DSP の明示位置は保存位置より優先する。Remote の開始情報は
+metadata と保留値の処理が完了してから公開し、最初の表示 frame の到着は条件にしない。
+
 Remote は source のメディア時刻から、さらに配信 generation の `source_origin_secs` を
 `StreamTimeline` で引いて session 相対時刻へ写す。`source_origin_secs` は raw PTS ではなく
 メディア時刻であり、端末は `source_origin_secs + currentTime` で元の位置を復元する。

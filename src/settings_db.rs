@@ -5772,6 +5772,8 @@ mod tests {
         use crate::settings::VideoResumePosition::{LegacyRaw, Media};
         let dir = TempDir::new().unwrap();
         let db = SettingsDb::create_new(dir.path()).unwrap();
+        // A released DB has completed its initial settings transaction.
+        db.save_full(&Settings::default()).unwrap();
         drop(db);
         let conn = Connection::open(dir.path().join("settings.db")).unwrap();
         // Recreate the released three-column shape, including a raw row.

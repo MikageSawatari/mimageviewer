@@ -267,6 +267,18 @@ fn resolve_resume_for_info(
     sanitize_resume_for_duration(Some(position), info.duration_secs)
 }
 
+/// Known media values can freeze loading immediately; legacy raw values need VideoInfo first.
+fn initial_position_for_resume(resume: Option<crate::settings::VideoResumePosition>) -> f64 {
+    match resume {
+        Some(crate::settings::VideoResumePosition::Media(secs))
+            if secs.is_finite() && secs >= 0.0 =>
+        {
+            secs
+        }
+        _ => 0.0,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum VideoContinuousMode {
     #[default]
@@ -9573,7 +9585,7 @@ impl VideoPlayer {
                 OpenOptions {
                     initial_volume,
                     autoplay,
-                    resume_secs: None,
+                    initial_position_secs: initial_position_for_resume(resume_secs),
                     ..Default::default()
                 },
                 seek_serial,
@@ -9683,8 +9695,7 @@ impl VideoPlayer {
         let opts = OpenOptions {
             initial_volume,
             autoplay,
-            // Saved raw values must never reach a clock before VideoInfo resolves the basis.
-            resume_secs: None,
+            initial_position_secs: initial_position_for_resume(resume_secs),
             loop_enabled: false, // VideoPlayer 側で個別管理 (Phase 3+ で統合予定)
             hw_decode,
             playback_start: PlaybackStartContext::default(),
@@ -12454,10 +12465,8 @@ impl VideoPlayer {
                             info.sar_den,
                             info.orientation,
                         );
-                        // Phase 3c: engine にも InfoReceived event を流す。
-                        // Saved resume is owned here until metadata resolves its time basis;
-                        // the engine receives only the resolved media seek below.
-                        if !self.info_event_emitted {
+                        // Validate outputs before restoring or publishing adopted metadata.
+                        let info_event = if !self.info_event_emitted {
                             // audio output 起動に失敗した場合 (`self.audio.is_none()`)
                             // は has_audio=false で engine に通知する。さもなくば engine が
                             // BufferReady を永久に待ち Buffering で固まる (= audio が決して
@@ -12476,16 +12485,15 @@ impl VideoPlayer {
                                 self.shutdown_workers_for_error();
                                 return None;
                             }
-                            let _ = self.engine_event_tx.try_send(EngineEvent::Decoder(
-                                engine::state::DecoderEvent::InfoReceived {
-                                    epoch: self.engine.lock().unwrap().current_seek_epoch(),
-                                    duration_secs: info.duration_secs,
-                                    has_audio: has_audio_effective,
-                                    has_video: has_video_effective,
-                                },
-                            ));
-                            self.info_event_emitted = true;
-                        }
+                            Some(engine::state::DecoderEvent::InfoReceived {
+                                epoch: self.engine.lock().unwrap().current_seek_epoch(),
+                                duration_secs: info.duration_secs,
+                                has_audio: has_audio_effective,
+                                has_video: has_video_effective,
+                            })
+                        } else {
+                            None
+                        };
 
                         // resume 指定があれば最初の info 到着時に 1 度だけ実行。
                         // 末尾近く (残り 5 秒以下) なら 0 から再生 (= 完走済みと見なす)。
@@ -12506,7 +12514,10 @@ impl VideoPlayer {
                             }
                         };
                         let pending_resume = self.pending_resume_secs.take();
-                        let resume = if requested_before_metadata {
+                        // Every issued seek advances this player's serial, including paused,
+                        // Remote and frame-step routes. A newer request supersedes saved resume.
+                        let resume = if requested_before_metadata || self.current_seek_serial() != 0
+                        {
                             None
                         } else {
                             resolve_resume_for_info(pending_resume, &info)
@@ -12525,6 +12536,13 @@ impl VideoPlayer {
                             // user 操作の seek/seek_relative/toggle_play は
                             // 別経路で apply_command(Play) を呼ぶ。
                             self.engine.lock().unwrap().handle_seek_request(resume);
+                        }
+                        // Complete adoption in this tick. A valid resume/newer seek already
+                        // owns Seeking, so metadata preserves its target. Without a seek,
+                        // Loading enters Buffering(0) before Remote can observe self.info.
+                        if let Some(event) = info_event {
+                            self.engine.lock().unwrap().handle_decoder_event(event);
+                            self.info_event_emitted = true;
                         }
                         self.info = Some(info);
                         #[cfg(windows)]
@@ -13503,6 +13521,152 @@ fn dummy_video_rx() -> crossbeam_channel::Receiver<VideoFrame> {
 
 #[cfg(test)]
 mod tests {
+    fn loading_resume_player(
+        resume: crate::settings::VideoResumePosition,
+        autoplay: bool,
+    ) -> (
+        super::VideoPlayer,
+        crossbeam_channel::Sender<Result<super::VideoInfo, String>>,
+        super::VideoInfo,
+    ) {
+        use std::sync::{Arc, Mutex, atomic::AtomicU64};
+        let mut player = super::VideoPlayer::stream_ready_disconnected_for_test(
+            std::path::PathBuf::from("resume-origin.ts"),
+        );
+        let mut info = player.info.take().unwrap();
+        info.duration_secs = 30.0;
+        info.timeline_origin_secs = 36000.0;
+        let serial = Arc::new(AtomicU64::new(0));
+        player.clock = Arc::new(super::AvClock::new(1.0, Arc::clone(&serial)));
+        player.engine = Arc::new(Mutex::new(super::EngineActor::new(
+            super::OpenOptions {
+                autoplay,
+                initial_position_secs: super::initial_position_for_resume(Some(resume)),
+                ..Default::default()
+            },
+            serial,
+            Arc::clone(&player.clock),
+        )));
+        player.engine_state_atomic = player.engine.lock().unwrap().published_state_handle();
+        player.engine.lock().unwrap().begin_loading();
+        player.pending_resume_secs = Some(resume);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        player.decode.info_rx = rx;
+        (player, tx, info)
+    }
+
+    #[test]
+    fn player_resume_media_and_legacy_restore_once_through_metadata_before_first_frame() {
+        use crate::settings::VideoResumePosition::{LegacyRaw, Media};
+        for (resume, initial) in [(Media(12.0), 12.0), (LegacyRaw(36012.0), 0.0)] {
+            for autoplay in [false, true] {
+                let (mut player, tx, info) = loading_resume_player(resume, autoplay);
+                assert_eq!(player.position(), initial);
+                assert!(!player.is_playing());
+                assert_eq!(player.current_seek_serial(), 0);
+                assert!(player.remote_stream_start_inputs().is_none());
+                tx.send(Ok(info)).unwrap();
+                let ctx = egui::Context::default();
+                player.tick(&ctx);
+                assert_eq!(player.position(), 12.0);
+                assert_eq!(player.current_seek_serial(), 1);
+                assert_eq!(player.clock.take_seek_request().unwrap().target_secs, 12.0);
+                assert_eq!(player.intent_playing(), autoplay);
+                assert!(!player.is_playing());
+                assert!(player.pending_resume_secs.is_none());
+                assert_eq!(player.displayed_frame_seq.load(super::Ordering::Acquire), 0);
+                let remote = player.remote_stream_start_inputs().unwrap();
+                assert_eq!(remote.source_origin_secs, 12.0);
+                // Repeated metadata must not issue another restore or reset the target.
+                player.engine.lock().unwrap().handle_decoder_event(
+                    super::engine::state::DecoderEvent::InfoReceived {
+                        epoch: 0,
+                        duration_secs: 30.0,
+                        has_audio: true,
+                        has_video: true,
+                    },
+                );
+                player.tick(&ctx);
+                assert_eq!(player.position(), 12.0);
+                assert_eq!(player.current_seek_serial(), 1);
+                assert!(player.clock.take_seek_request().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn player_resume_rejects_invalid_or_finished_values_at_metadata() {
+        use crate::settings::VideoResumePosition::{LegacyRaw, Media};
+        for resume in [
+            Media(0.5),
+            Media(28.0),
+            Media(f64::NAN),
+            Media(f64::INFINITY),
+            Media(-1.0),
+            LegacyRaw(35999.0),
+            LegacyRaw(36000.5),
+            LegacyRaw(36028.0),
+        ] {
+            let (mut player, tx, info) = loading_resume_player(resume, false);
+            assert!(player.position().is_finite());
+            tx.send(Ok(info)).unwrap();
+            let ctx = egui::Context::default();
+            player.tick(&ctx);
+            assert!(player.pending_resume_secs.is_none());
+            assert_eq!(player.position(), 0.0, "{resume:?}");
+            assert_eq!(
+                player
+                    .remote_stream_start_inputs()
+                    .unwrap()
+                    .source_origin_secs,
+                0.0,
+                "{resume:?}"
+            );
+            assert_eq!(player.current_seek_serial(), 0, "{resume:?}");
+            assert!(player.clock.take_seek_request().is_none());
+            player.tick(&ctx);
+            assert_eq!(player.position(), 0.0, "{resume:?}");
+        }
+    }
+
+    #[test]
+    fn player_premetadata_seek_supersedes_saved_resume_across_sibling_routes() {
+        use crate::settings::VideoResumePosition::{LegacyRaw, Media};
+        for resume in [Media(12.0), LegacyRaw(36012.0)] {
+            for route in ["absolute", "paused", "strip-paused", "remote"] {
+                let (mut player, tx, info) = loading_resume_player(resume, false);
+                match route {
+                    "absolute" => player.seek(20.0, super::SeekOrigin::User),
+                    "paused" => player.seek_paused(20.0),
+                    "strip-paused" => {
+                        player.seek_with_play_state(20.0, false, super::SeekOrigin::User)
+                    }
+                    "remote" => player.seek_for_remote_streaming(20.0),
+                    _ => unreachable!(),
+                }
+                assert_eq!(player.current_seek_serial(), 1);
+                assert_eq!(player.clock.take_seek_request().unwrap().target_secs, 20.0);
+                tx.send(Ok(info)).unwrap();
+                let ctx = egui::Context::default();
+                player.tick(&ctx);
+                assert!(player.pending_resume_secs.is_none());
+                assert_eq!(player.position(), 20.0, "{route}");
+                assert_eq!(player.current_seek_serial(), 1, "{route}");
+                assert!(player.clock.take_seek_request().is_none(), "{route}");
+                assert_eq!(
+                    player
+                        .remote_stream_start_inputs()
+                        .unwrap()
+                        .source_origin_secs,
+                    20.0
+                );
+                player.tick(&ctx);
+                assert_eq!(player.position(), 20.0, "{route}");
+                assert_eq!(player.current_seek_serial(), 1, "{route}");
+            }
+        }
+    }
+
     #[test]
     fn resume_migration_resolves_raw_only_after_info_and_never_converts_media_twice() {
         use crate::settings::VideoResumePosition::{LegacyRaw, Media};

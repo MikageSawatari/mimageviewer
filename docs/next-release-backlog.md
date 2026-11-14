@@ -47,6 +47,29 @@ skip sample / pre-skip が適用された音声サンプルと frame PTS の関�
 これらの形式の O_eff=0 と従来の音声時刻を維持する。`pkt_timebase` を設定する際は
 先頭の可聴サンプル・seek 後の trim・EOF drain・Remote と範囲デコードを回帰検証する。
 
+### 1.780 MPEG-TS / PS の seek が keyframe の手前に着地しない — コード調査 (2026-11-14)
+
+- 状態: **未着手・原因確認済み**。時刻原点の補正とは独立した既存不具合で、
+  [動画の時刻原点の修正](video-timeline-origin-plan.md) の対象外とする (2026-11-14 設計担当決定)。
+- 観測は同梱 FFmpeg DLL を使った headless probe。製品アプリの起動・実画面確認はしていない。
+  TS の backward timestamp seek は、0.5 秒を要求すると非 key packet の PTS 0.501333 秒へ着地し、
+  最初に復号できる frame は次の GOP の 1.021333 秒になる。11.5 秒への seek は最後の keyframe より
+  後ろへ着地し、復号 frame が出ない。O=0 の TS でも起こり、原点の補正漏れではない。
+- 全体を demux しても改善せず、真の key packet を `AVIndexEntry` へ登録しても通常の timestamp seek は
+  同じ非 key packet へ着地した。検証済みの key packet の byte locator へ seek すると、先行 GOP から
+  正しい色の frame を復号できた。PS には key packet の `packet.pos=-1` や parser 再開時の時刻差があり、
+  TS の byte seek だけをそのまま一般化できない。
+- 根拠: FFmpeg n7.1 の
+  [mpegts_get_dts](https://github.com/FFmpeg/FFmpeg/blob/n7.1/libavformat/mpegts.c#L3126-L3159) は
+  timestamp 探索中の任意 packet を `AVINDEX_KEYFRAME` として登録する。
+  [seek_frame_internal](https://github.com/FFmpeg/FFmpeg/blob/n7.1/libavformat/seek.c#L551-L589) は
+  `read_timestamp` がある demuxer で binary search を使い、実際の key packet を確定しない。
+- mIV への影響 (コードと headless 検証から): seek は最大で次の GOP まで遅れ、末尾近くでは frame が
+  出ないまま既存 EOF 処理へ進み得る。サムネイルも次の GOP の画になり、許容範囲外なら生成されない。
+- 修正には、各 Input の真の key locator を検証・所有する共通 seek owner と、走査量・応答時間・取消を
+  含めた bounded な cold seek 設計が必要。decoder、hover・tile・strip・screenshot、Remote の独立 Input を
+  同じ不変条件で扱う。固定秒数の preroll や全ファイル走査を無断で追加しない。
+
 ### 1.474 通常のページ表示でページ内スクロールと N 字スクロールを使う — 5ch >>642・767 (2026-10-29 起票、2026-11-12 採用)
 
 - 状態: **未着手・対応方針決定**。収録版は未定。[>>642](https://egg.5ch.io/test/read.cgi/software/1782419551/642) の、画像の端を基準にキーで表示範囲を動かしたい要望を保留側に記録していた。[>>767](https://egg.5ch.io/test/read.cgi/software/1782419551/767) で、縦連結のように次のページを見せず、今のページ内を矢印キーやホイールで動かしたいことと、NeeView のような N 字スクロールの要望が追加された。2026-11-12 の利用者決定で通常バックログへ移す。
