@@ -183,6 +183,7 @@ impl App {
         }
         Some(CloseReturnOrigin {
             navigation: MainListNavigation {
+                viewer_adoption: super::ViewerOpenAdoption::ContextContinuation,
                 history_before: Box::new(self.folder_nav_history_snapshot()),
                 source_context: self.projected_viewer_context_id(),
                 source_surface_generation: self.top_level_grid_view.generation(),

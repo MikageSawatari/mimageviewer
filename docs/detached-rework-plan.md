@@ -1458,6 +1458,12 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-14: §1.767 サブPC依頼50 B — 外部openの採用をgrid handoffへ接続
+
+設計担当と独立設計レビュー（Sol / xhigh、2026-11-14）が構造的な変更に合意した範囲で、startupのtyped ownerが新規main採用／既存C継続を確定し、既存navigation・hydration・composition／sidecar／列挙reopenへ保持する。採用可能な最終rowの境界で新規mainだけが既存gridのpark／closeを一度通し、旧Depthを終えてから新sessionを公開する（BA-7主・BA-5関連）。Bookmark／Collectionは自己parkせず、mainの一覧、DirectMedia／mediaの所有モデル、PDF cached即時採用、A／Cの入力契約は維持する。記録・経路表・検証は[依頼50調査書 §3.5](depth-parallax-realmachine50-investigation.md#35-b-実装記録2026-11-14ba-7主ba-5関連)。
+
+DirectMedia静止画の既存の独立reader／main basis分離に到達して露見した、forkのpending中owner getterも修正。TableOpと禁止assertは維持し、local復帰情報を使って`finish_fork`直後にsourceの世代・観測・選択を確定する。split直呼びの既存testに加え、本番両fork・旧兄弟なし／ありの外部openで所有を検査する。これも独立レビューが構造修正としてACCEPTした（main reader固定という実装時の誤った前提は調査書で訂正）。
+
 ### 2026-11-14: §1.767 サブPC依頼50 A 独立レビュー P2 / P3 対応
 
 設計担当と独立設計レビュー（Sol / xhigh、2026-11-14）が構造的な修正に合意した範囲で、同native ownerのcaption button押下対象・motion / Upによるdrag終端、診断touch無効時の入力相関とcommand抑制の分離、取消decisionの元scope保持へ揃えた（BA-7）。Sharedの重複scopeを撤去し、退役proofは認可せず元identityだけを診断に保持する。Cのbackend hook・B・新しいApp field・待ち・retryは変更／追加しない。変更と検証は[依頼50調査書 §2.4](depth-parallax-realmachine50-investigation.md#24-a-実装記録2026-11-14ba-7)に記録する。

@@ -1100,7 +1100,10 @@ pub(super) enum MainListAfterHydration {
         destination: PathBuf,
         completed: mpsc::Sender<()>,
     },
-    DirectMedia(startup_ops::DirectMediaPrepared),
+    DirectMedia {
+        prepared: startup_ops::DirectMediaPrepared,
+        viewer_adoption: ViewerOpenAdoption,
+    },
     StackSelection {
         select: usize,
     },
@@ -1116,6 +1119,7 @@ pub(super) enum MainListAfterHydration {
     RequiredFullscreen {
         target: crate::snapshot::SnapshotTarget,
         history_trigger: HistoryTrigger,
+        viewer_adoption: ViewerOpenAdoption,
     },
 }
 
@@ -1457,6 +1461,8 @@ pub(crate) enum MainHistoryOperation {
 /// Native row fields are captured once; Surface ignores row generation, never the switch epoch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MainListNavigation {
+    /// Viewer adoption is independent of load execution/history continuation.
+    viewer_adoption: ViewerOpenAdoption,
     history_before: Box<FolderNavHistorySnapshot>,
     source_context: ViewerContextId,
     source_surface_generation: u64,
@@ -4132,6 +4138,7 @@ impl DeferredBookResume {
 /// 別ページへ fallback しない。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DeferredFsReopen {
+    pub viewer_adoption: ViewerOpenAdoption,
     pub history_trigger: HistoryTrigger,
     /// true なら reopen 後にスライドショーを再開する (SlideshowNext 由来のときだけ)。
     /// また true のときは先頭の **静止画のみ** (Video 除外) を開く。
@@ -4150,6 +4157,15 @@ pub(crate) struct DeferredFsReopen {
     /// パスワード付き PDF で入力ダイアログを挟んでも、この reopen 意図を維持するか。
     /// grid / CLI / SendTo の明示オープンは true、Ctrl+↑↓ などのナビ由来は false。
     pub preserve_after_password_prompt: bool,
+}
+
+/// Captured by the semantic request owner, never inferred from a load stage or
+/// the session that happens to be mounted when an asynchronous result arrives.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ViewerOpenAdoption {
+    MainNew,
+    #[default]
+    ContextContinuation,
 }
 
 impl DeferredFsReopen {
@@ -4478,6 +4494,12 @@ pub(crate) enum StartupOpenPathOwner {
 }
 
 impl StartupOpenPathOwner {
+    fn viewer_open_adoption(&self) -> ViewerOpenAdoption {
+        match self {
+            Self::InitialStartup | Self::Activation => ViewerOpenAdoption::MainNew,
+            Self::Bookmark(_) => ViewerOpenAdoption::ContextContinuation,
+        }
+    }
     fn source(&self) -> StartupOpenPathSource {
         match self {
             Self::InitialStartup => StartupOpenPathSource::InitialStartup,
@@ -25187,6 +25209,7 @@ impl App {
             history
         };
         MainListNavigation {
+            viewer_adoption: ViewerOpenAdoption::ContextContinuation,
             history_before: Box::new(self.folder_nav_history_snapshot()),
             source_context: self.projected_viewer_context_id(),
             source_surface_generation: self.top_level_grid_view.generation(),
@@ -25493,6 +25516,14 @@ impl App {
             self.dismiss_transparent_view_for_admitted_jump();
         }
         let mut hydration = install(self, install_boundary);
+        if let Some((continuation, _)) = hydration.as_mut() {
+            continuation.viewer_adoption = navigation.viewer_adoption;
+            if let sidecar_restore::FirstDisplayAction::ArchiveBook(deferred) =
+                &mut continuation.first_display_action
+            {
+                deferred.viewer_adoption = navigation.viewer_adoption;
+            }
+        }
         if !matches!(
             destination.location,
             FolderNavHistoryTarget::Rating(_) | FolderNavHistoryTarget::RatingPhysical(_)
@@ -37696,6 +37727,7 @@ impl App {
             }
             _ => None,
         };
+        let viewer_adoption = request.navigation.viewer_adoption;
         let Some(mut adoption) = self.prepare_main_list_adoption(request.navigation, destination)
         else {
             return;
@@ -37721,6 +37753,7 @@ impl App {
                 history_trigger,
                 ..
             } => Some(MainListAfterHydration::RequiredFullscreen {
+                viewer_adoption,
                 target: target.clone(),
                 history_trigger,
             }),
@@ -37755,6 +37788,7 @@ impl App {
             }
             if auto_fullscreen && !matches!(prepared, PreparedPhysicalListing::Folder(_)) {
                 app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                    viewer_adoption,
                     history_trigger: HistoryTrigger::UserChosen,
                     resume_slideshow: false,
                     target: DeferredFsTarget::None,
@@ -39385,6 +39419,7 @@ impl App {
                 );
             }
             self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                 history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
@@ -40199,11 +40234,13 @@ impl App {
                 .is_some_and(|nav| self.zip_foreign_offer_applicable(&nav.tree.zip_path));
         let mut offer_now = offer_foreign;
         let mut offer_auto_fs = false;
+        let mut viewer_adoption = ViewerOpenAdoption::ContextContinuation;
         if offer_foreign && self.fs_nav_after_pdf_enumerate.is_some() {
             if self.fs_nav_is_locked() {
                 offer_now = false;
             } else {
-                self.fs_nav_after_pdf_enumerate = None;
+                let deferred = self.fs_nav_after_pdf_enumerate.take().unwrap();
+                viewer_adoption = deferred.viewer_adoption;
                 offer_auto_fs = true;
             }
         }
@@ -40221,10 +40258,11 @@ impl App {
         if offer_now {
             let zip_path = self.zip_nav.as_ref().map(|nav| nav.tree.zip_path.clone());
             if let Some(zip_path) = zip_path {
-                self.offer_zip_foreign_archive_conversion(
+                self.offer_zip_foreign_archive_conversion_with_adoption(
                     &zip_path,
                     offer_auto_fs,
                     restore_intent.clone(),
+                    viewer_adoption,
                 );
             }
         }
@@ -40251,14 +40289,30 @@ impl App {
         auto_fullscreen: bool,
         restore_intent: crate::app::StartupListIntent,
     ) {
+        self.offer_zip_foreign_archive_conversion_with_adoption(
+            zip_path,
+            auto_fullscreen,
+            restore_intent,
+            ViewerOpenAdoption::ContextContinuation,
+        );
+    }
+
+    fn offer_zip_foreign_archive_conversion_with_adoption(
+        &mut self,
+        zip_path: &Path,
+        auto_fullscreen: bool,
+        restore_intent: crate::app::StartupListIntent,
+        viewer_adoption: ViewerOpenAdoption,
+    ) {
         if !self.zip_foreign_offer_applicable(zip_path) {
             return;
         }
         if self.main_folder_history_available() {
-            let navigation = self.capture_main_list_navigation(
+            let mut navigation = self.capture_main_list_navigation(
                 MainHistoryOperation::SameLocation,
                 self.copied_destination_source_proof(),
             );
+            navigation.viewer_adoption = viewer_adoption;
             let owner = self.current_folder_reload_owner(zip_path);
             let Some(intent) = Self::physical_open_intent(&owner, auto_fullscreen) else {
                 return;
@@ -40844,6 +40898,7 @@ impl App {
         match target {
             Ok(target) => {
                 let deferred = DeferredFsReopen {
+                    viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                     history_trigger: HistoryTrigger::UserChosen,
                     resume_slideshow: sequence_ctx.is_none(),
                     target: DeferredFsTarget::CurrentArchiveBook(target),
@@ -41450,6 +41505,18 @@ impl App {
                 )
             })
         });
+        let viewer_adoption = navigation
+            .as_ref()
+            .map(|navigation| navigation.viewer_adoption)
+            .or_else(|| {
+                restore_override.as_ref().and_then(|restore| {
+                    restore
+                        .adoption
+                        .as_ref()
+                        .map(|adoption| adoption.navigation.viewer_adoption)
+                })
+            })
+            .unwrap_or(ViewerOpenAdoption::ContextContinuation);
         let mut open_restore = restore_override.or_else(|| {
             prepared_pages
                 .is_none()
@@ -41504,6 +41571,7 @@ impl App {
         // pending_auto_fs_open=false なのでここでは触らない (reopen が後段で set する)。
         if std::mem::take(&mut self.pending_auto_fs_open) {
             self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                viewer_adoption,
                 history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
@@ -41820,14 +41888,15 @@ impl App {
             if deferred.from_explicit_open {
                 self.fs_open_intent_from_grid = true;
             }
-            self.open_fullscreen_with_resume_notice(
-                new_idx,
-                deferred.history_trigger,
-                resume_notice,
-            );
             self.move_grid_cursor(Some(new_idx), crate::app::GridCursorIntent::Automatic);
             self.grid_scroll.set_reveal_requested(true);
             self.update_last_selected_image();
+            self.open_fullscreen_with_adoption(
+                new_idx,
+                deferred.history_trigger,
+                resume_notice,
+                deferred.viewer_adoption,
+            );
             if deferred.resume_slideshow {
                 self.slideshow_playing = true;
                 self.schedule_next_slideshow_from_now();
@@ -44196,6 +44265,7 @@ impl App {
         // The old synchronous import stopped the UI here. Move the exact first-display tail into
         // the App-global restore owner before returning to the event loop.
         let continuation = sidecar_restore::SidecarLoadContinuation {
+            viewer_adoption: ViewerOpenAdoption::ContextContinuation,
             restore_intent: StartupListIntent::InternalInstall,
             first_display_action: sidecar_restore::FirstDisplayAction::None,
             navigation_after_hydration: None,
@@ -44231,10 +44301,12 @@ impl App {
     ) {
         if matches!(
             continuation.navigation_after_hydration,
-            Some(MainListAfterHydration::DirectMedia(_))
+            Some(MainListAfterHydration::DirectMedia { .. })
         ) {
-            let Some(MainListAfterHydration::DirectMedia(prepared)) =
-                continuation.navigation_after_hydration.take()
+            let Some(MainListAfterHydration::DirectMedia {
+                prepared,
+                viewer_adoption,
+            }) = continuation.navigation_after_hydration.take()
             else {
                 unreachable!()
             };
@@ -44244,6 +44316,7 @@ impl App {
                     Some(MainListAfterHydration::RequiredFullscreen {
                         target,
                         history_trigger: HistoryTrigger::UserChosen,
+                        viewer_adoption,
                     });
                 continuation.items_len = self.items.len();
                 continuation.video_items = self
@@ -44268,6 +44341,7 @@ impl App {
             }
         }
         let sidecar_restore::SidecarLoadContinuation {
+            viewer_adoption,
             mut restore_intent,
             first_display_action,
             navigation_after_hydration,
@@ -44836,14 +44910,15 @@ impl App {
                 {
                     self.fs_open_intent_from_grid = true;
                 }
-                self.open_fullscreen_with_resume_notice(
-                    new_idx,
-                    HistoryTrigger::UserChosen,
-                    resume_notice,
-                );
                 self.move_grid_cursor(Some(new_idx), crate::app::GridCursorIntent::Automatic);
                 self.grid_scroll.set_reveal_requested(true);
                 self.update_last_selected_image();
+                self.open_fullscreen_with_adoption(
+                    new_idx,
+                    HistoryTrigger::UserChosen,
+                    resume_notice,
+                    viewer_adoption,
+                );
             } else {
                 #[cfg(windows)]
                 if detached_physical {
@@ -44917,9 +44992,16 @@ impl App {
                 self.move_grid_cursor(Some(select), crate::app::GridCursorIntent::Automatic);
                 self.grid_scroll.set_reveal_requested(true);
             }
-            MainListAfterHydration::DirectMedia(prepared) => {
+            MainListAfterHydration::DirectMedia {
+                prepared,
+                viewer_adoption,
+            } => {
                 if let Some(target) = self.install_direct_media_reader(prepared) {
-                    self.finish_required_fullscreen_load(target, HistoryTrigger::UserChosen);
+                    self.finish_required_fullscreen_load_with_adoption(
+                        target,
+                        HistoryTrigger::UserChosen,
+                        viewer_adoption,
+                    );
                 }
             }
             MainListAfterHydration::JumpSelection(selection) => {
@@ -44929,7 +45011,12 @@ impl App {
             MainListAfterHydration::RequiredFullscreen {
                 target,
                 history_trigger,
-            } => self.finish_required_fullscreen_load(target, history_trigger),
+                viewer_adoption,
+            } => self.finish_required_fullscreen_load_with_adoption(
+                target,
+                history_trigger,
+                viewer_adoption,
+            ),
             MainListAfterHydration::Dfs { continuation, ctx } => {
                 if continuation.fullscreen {
                     let _ = self.reopen_fullscreen_after_folder_nav_load(
@@ -61587,11 +61674,29 @@ impl App {
         resume_slideshow: bool,
         history_trigger: HistoryTrigger,
     ) -> &'static str {
+        self.reopen_fullscreen_after_folder_nav_load_with_adoption(
+            ctx,
+            restore_video_tile,
+            resume_slideshow,
+            history_trigger,
+            ViewerOpenAdoption::ContextContinuation,
+        )
+    }
+
+    pub(crate) fn reopen_fullscreen_after_folder_nav_load_with_adoption(
+        &mut self,
+        ctx: &egui::Context,
+        restore_video_tile: bool,
+        resume_slideshow: bool,
+        history_trigger: HistoryTrigger,
+        viewer_adoption: ViewerOpenAdoption,
+    ) -> &'static str {
         // フォルダナビ経路は特定 leaf を持たない (= target: None)。先頭着地。
         // 退出ルーティング (Esc→L1 / BS→L2) は現在のコンテナと設定で判定するので
         // ここでフラグを立てる必要はない。
         if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
             self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                viewer_adoption,
                 history_trigger,
                 resume_slideshow,
                 target: DeferredFsTarget::None,
@@ -61631,6 +61736,7 @@ impl App {
             // find_fullscreen_nav_target_filtered が loose 画像なしフォルダで先頭 ZIP/PDF を
             // 仮想展開した場合もここに来る (current_folder が ZIP/PDF になっている)。
             self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                viewer_adoption,
                 history_trigger,
                 resume_slideshow,
                 target: DeferredFsTarget::None,
@@ -61652,10 +61758,10 @@ impl App {
             #[cfg(not(windows))]
             let _ = restore_video_tile;
 
-            self.open_fullscreen(new_idx, history_trigger);
             self.move_grid_cursor(Some(new_idx), crate::app::GridCursorIntent::Automatic);
             self.grid_scroll.set_reveal_requested(true);
             self.update_last_selected_image();
+            self.open_fullscreen_with_adoption(new_idx, history_trigger, None, viewer_adoption);
 
             // スライドショー NextFolder の着地: 静止画を開けたのでスライドショーを再開。
             if resume_slideshow {
@@ -67365,6 +67471,7 @@ impl App {
                 let presentation = match target {
                     DetachedZipTarget::BookScope(target) => {
                         ZipEnumerationPresentation::ArchiveBook(DeferredFsReopen {
+                            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                             history_trigger: HistoryTrigger::UserChosen,
                             resume_slideshow: false,
                             target: DeferredFsTarget::CurrentArchiveBook(target),
@@ -67461,6 +67568,7 @@ impl App {
             && let Some(target) = target
         {
             self.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                 history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::Required(target),
@@ -67633,6 +67741,7 @@ impl App {
                     && let Some(target) = target
                 {
                     app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                        viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                         history_trigger: crate::app::HistoryTrigger::UserChosen,
                         resume_slideshow: false,
                         target: DeferredFsTarget::Required(target),
@@ -71667,6 +71776,25 @@ impl App {
         );
     }
 
+    fn open_fullscreen_with_adoption(
+        &mut self,
+        idx: usize,
+        history_trigger: HistoryTrigger,
+        resume_notice: Option<BookResumeNotice>,
+        viewer_adoption: ViewerOpenAdoption,
+    ) {
+        self.open_fullscreen_with_metadata_boundary_and_adoption(
+            idx,
+            history_trigger,
+            FsOpenMaterialization::Eager,
+            FsPageLoadContract::Sequential,
+            None,
+            FsMetadataBoundary::Manual,
+            resume_notice,
+            viewer_adoption,
+        );
+    }
+
     pub(crate) fn open_fullscreen_with_materialization(
         &mut self,
         idx: usize,
@@ -71706,20 +71834,30 @@ impl App {
     }
 
     pub(crate) fn try_own_fullscreen_epub_at(&mut self, idx: usize) -> OpenAdmission {
-        let path = match self.items.get(idx) {
-            Some(GridItem::PdfPage { pdf_path, .. } | GridItem::PdfFile(pdf_path)) => pdf_path,
-            None => return OpenAdmission::NotApplicable,
-            _ => {
-                self.fullscreen_epub_source = None;
-                return OpenAdmission::Accepted;
-            }
+        let Some(item) = self.items.get(idx) else {
+            return OpenAdmission::NotApplicable;
         };
-        let source = match crate::pdf_loader::LeasedEpubPath::try_new(path.clone()) {
+        let source = match Self::prepare_fullscreen_epub_source(item) {
             Ok(source) => source,
-            Err(reason) => return OpenAdmission::Refused(reason.into()),
+            Err(reason) => return OpenAdmission::Refused(reason),
         };
-        self.fullscreen_epub_source = source.has_epub_lease().then_some(source);
+        self.fullscreen_epub_source = source;
         OpenAdmission::Accepted
+    }
+
+    /// Keep admission local until the outgoing viewer has handed off. The read
+    /// lease also spans a physical fork's own acquisition; no context field is
+    /// published just to prove that a destination can be opened.
+    fn prepare_fullscreen_epub_source(
+        item: &GridItem,
+    ) -> Result<Option<crate::pdf_loader::LeasedEpubPath>, OpenAdmissionRefusal> {
+        let path = match item {
+            GridItem::PdfPage { pdf_path, .. } | GridItem::PdfFile(pdf_path) => pdf_path,
+            _ => return Ok(None),
+        };
+        let source = crate::pdf_loader::LeasedEpubPath::try_new(path.clone())
+            .map_err(OpenAdmissionRefusal::from)?;
+        Ok(source.has_epub_lease().then_some(source))
     }
 
     pub(crate) fn open_fullscreen_with_materialization_and_contract(
@@ -71769,9 +71907,75 @@ impl App {
         history_trigger: HistoryTrigger,
         requested_materialization: FsOpenMaterialization,
         load_contract: FsPageLoadContract,
+        perf: Option<&mut FsOpenPerfRecorder>,
+        boundary: FsMetadataBoundary,
+        resume_notice: Option<BookResumeNotice>,
+    ) {
+        self.open_fullscreen_with_metadata_boundary_inner(
+            idx,
+            history_trigger,
+            requested_materialization,
+            load_contract,
+            perf,
+            boundary,
+            resume_notice,
+            ViewerOpenAdoption::ContextContinuation,
+        );
+    }
+
+    fn open_fullscreen_with_metadata_boundary_and_adoption(
+        &mut self,
+        idx: usize,
+        history_trigger: HistoryTrigger,
+        requested_materialization: FsOpenMaterialization,
+        load_contract: FsPageLoadContract,
+        perf: Option<&mut FsOpenPerfRecorder>,
+        boundary: FsMetadataBoundary,
+        resume_notice: Option<BookResumeNotice>,
+        viewer_adoption: ViewerOpenAdoption,
+    ) {
+        #[cfg(windows)]
+        let previous = (
+            self.active_detached_window_id(),
+            self.active_viewer_context_id()
+                .unwrap_or(self.projected_viewer_context_id()),
+        );
+        self.open_fullscreen_with_metadata_boundary_inner(
+            idx,
+            history_trigger,
+            requested_materialization,
+            load_contract,
+            perf,
+            boundary,
+            resume_notice,
+            viewer_adoption,
+        );
+        #[cfg(windows)]
+        {
+            let next = (
+                self.active_detached_window_id(),
+                self.active_viewer_context_id()
+                    .unwrap_or(self.projected_viewer_context_id()),
+            );
+            if previous != next {
+                crate::logger::log(format!(
+                    "[viewer-adoption] source={viewer_adoption:?} previous_window={:?} previous_context={:?} next_window={:?} next_context={:?}",
+                    previous.0, previous.1, next.0, next.1,
+                ));
+            }
+        }
+    }
+
+    fn open_fullscreen_with_metadata_boundary_inner(
+        &mut self,
+        idx: usize,
+        history_trigger: HistoryTrigger,
+        requested_materialization: FsOpenMaterialization,
+        load_contract: FsPageLoadContract,
         mut perf: Option<&mut FsOpenPerfRecorder>,
         boundary: FsMetadataBoundary,
         resume_notice: Option<BookResumeNotice>,
+        viewer_adoption: ViewerOpenAdoption,
     ) {
         if self.remote_session_blocks_local_control() {
             crate::logger::log("remote_ipc: rejected fullscreen open outside Local phase");
@@ -71788,7 +71992,7 @@ impl App {
         let Some(idx) = self.poll_and_remap_book_target(&composition_ctx, idx) else {
             return;
         };
-        if self.defer_book_composition_fullscreen_open_with_notice(
+        if self.defer_book_composition_fullscreen_open_with_adoption(
             idx,
             history_trigger,
             requested_materialization,
@@ -71796,18 +72000,37 @@ impl App {
             book_composition_permission::BookTargetPurpose::Explicit,
             boundary,
             resume_notice.clone(),
+            viewer_adoption,
         ) {
             return;
         }
-        if self.defer_sidecar_restore_fullscreen_with_notice(
+        if self.defer_sidecar_restore_fullscreen_with_adoption(
             idx,
             history_trigger,
             requested_materialization,
             load_contract,
             boundary,
             resume_notice.clone(),
+            viewer_adoption,
         ) {
             return;
+        }
+        let Some(item) = self.items.get(idx) else {
+            return;
+        };
+        let prepared_source = match Self::prepare_fullscreen_epub_source(item) {
+            Ok(source) => source,
+            Err(reason) => {
+                self.show_open_admission_refusal(reason);
+                return;
+            }
+        };
+        #[cfg(windows)]
+        if viewer_adoption == ViewerOpenAdoption::MainNew {
+            if !self.prepare_detached_context_for_grid_open(&composition_ctx, idx) {
+                return;
+            }
+            self.fs_open_intent_from_grid = true;
         }
         let total_perf_t0 = start_fs_open_perf_span(&perf);
         #[cfg(windows)]
@@ -71830,14 +72053,7 @@ impl App {
             return;
         }
 
-        match self.try_own_fullscreen_epub_at(idx) {
-            OpenAdmission::Accepted => {}
-            OpenAdmission::NotApplicable => return,
-            OpenAdmission::Refused(reason) => {
-                self.show_open_admission_refusal(reason);
-                return;
-            }
-        }
+        self.fullscreen_epub_source = prepared_source;
 
         #[cfg(windows)]
         self.exchange_independent_media_window_for_still(idx);

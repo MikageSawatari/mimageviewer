@@ -85,6 +85,7 @@ fn legacy_document_resume_deferred_opens_saved_raw_with_exclusions() {
     let mut app = legacy_resume_fixture(true, false);
     assert_eq!(
         app.open_deferred_fullscreen_after_enumerate(super::DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: super::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: super::DeferredFsTarget::None,
@@ -112,6 +113,7 @@ fn resume_refusal_deferred_opens_first_page_with_notice(hidden: bool) {
     let mut app = legacy_resume_fixture(false, hidden);
     assert_eq!(
         app.open_deferred_fullscreen_after_enumerate(super::DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: super::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: super::DeferredFsTarget::None,
@@ -186,6 +188,7 @@ fn resume_refusal_deferred_warning_survives_first_page_adjustment_notice() {
             .insert(0, crate::adjustment::AdjustParams::default());
         assert_eq!(
             app.open_deferred_fullscreen_after_enumerate(super::DeferredFsReopen {
+                viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                 history_trigger: super::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: super::DeferredFsTarget::None,
@@ -263,6 +266,7 @@ fn resume_refusal_open_warning_survives_cached_panorama_hint() {
             } else {
                 assert_eq!(
                     app.open_deferred_fullscreen_after_enumerate(super::DeferredFsReopen {
+                        viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                         history_trigger: super::HistoryTrigger::UserChosen,
                         resume_slideshow: false,
                         target: super::DeferredFsTarget::None,

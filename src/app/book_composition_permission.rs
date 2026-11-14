@@ -30,6 +30,7 @@ enum BookTargetRoute {
     FullscreenOpen {
         metadata_boundary: FsMetadataBoundary,
         resume_notice: Option<BookResumeNotice>,
+        viewer_adoption: super::ViewerOpenAdoption,
     },
     FullscreenNavigation,
     ContinuousSeek,
@@ -1322,6 +1323,29 @@ impl App {
         metadata_boundary: FsMetadataBoundary,
         resume_notice: Option<BookResumeNotice>,
     ) -> bool {
+        self.defer_book_composition_fullscreen_open_with_adoption(
+            idx,
+            history_trigger,
+            materialization,
+            contract,
+            purpose,
+            metadata_boundary,
+            resume_notice,
+            super::ViewerOpenAdoption::ContextContinuation,
+        )
+    }
+
+    pub(super) fn defer_book_composition_fullscreen_open_with_adoption(
+        &mut self,
+        idx: usize,
+        history_trigger: HistoryTrigger,
+        materialization: FsOpenMaterialization,
+        contract: FsPageLoadContract,
+        purpose: BookTargetPurpose,
+        metadata_boundary: FsMetadataBoundary,
+        resume_notice: Option<BookResumeNotice>,
+        viewer_adoption: super::ViewerOpenAdoption,
+    ) -> bool {
         self.defer_book_composition_target_route(
             idx,
             history_trigger,
@@ -1331,6 +1355,7 @@ impl App {
             BookTargetRoute::FullscreenOpen {
                 metadata_boundary,
                 resume_notice,
+                viewer_adoption,
             },
             Vec::new(),
         )
@@ -2151,7 +2176,8 @@ impl App {
             BookTargetRoute::FullscreenOpen {
                 metadata_boundary,
                 resume_notice,
-            } => self.open_fullscreen_with_metadata_boundary(
+                viewer_adoption,
+            } => self.open_fullscreen_with_metadata_boundary_and_adoption(
                 intent.idx,
                 intent.history_trigger,
                 intent.materialization,
@@ -2159,6 +2185,7 @@ impl App {
                 None,
                 *metadata_boundary,
                 resume_notice.clone(),
+                *viewer_adoption,
             ),
             BookTargetRoute::FullscreenNavigation => self.complete_book_navigation_target(
                 ctx,

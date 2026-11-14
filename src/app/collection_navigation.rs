@@ -298,6 +298,7 @@ impl PreparedCollectionPhysicalNavigation {
                     .unwrap_or(super::DeferredFsTarget::None),
                 resume_to_last_page: (app.settings.book_nav_resume.resumes()).into(),
                 from_explicit_open: false,
+                viewer_adoption: super::ViewerOpenAdoption::ContextContinuation,
                 preserve_after_password_prompt: false,
             });
         }
@@ -311,11 +312,14 @@ impl PreparedCollectionPhysicalNavigation {
                 if !self.deferred_pdf() =>
             {
                 let restore_video_tile = self.restore_video_tile;
-                let _ = app.reopen_fullscreen_after_folder_nav_load(
+                // The native request's origin/action owns this viewer continuation, even
+                // when preparation crossed ordinary physical/conversion navigation owners.
+                let _ = app.reopen_fullscreen_after_folder_nav_load_with_adoption(
                     ctx,
                     restore_video_tile,
                     self.resume_slideshow(),
                     self.request.action.history_trigger(),
+                    super::ViewerOpenAdoption::ContextContinuation,
                 );
             }
             CollectionNavigationAction::OuterFullscreen { .. }
@@ -4142,11 +4146,12 @@ impl App {
                     resume_slideshow, ..
                 } => match outcome {
                     FolderOpenOutcome::Loaded => {
-                        let _ = self.reopen_fullscreen_after_folder_nav_load(
+                        let _ = self.reopen_fullscreen_after_folder_nav_load_with_adoption(
                             ctx,
                             restore_video_tile,
                             resume_slideshow,
                             history_trigger,
+                            super::ViewerOpenAdoption::ContextContinuation,
                         );
                     }
                     FolderOpenOutcome::Classifying | FolderOpenOutcome::ConversionDialogOpened => {
@@ -4162,11 +4167,12 @@ impl App {
                 },
                 CollectionNavigationAction::Slideshow { .. } => match outcome {
                     FolderOpenOutcome::Loaded => {
-                        let _ = self.reopen_fullscreen_after_folder_nav_load(
+                        let _ = self.reopen_fullscreen_after_folder_nav_load_with_adoption(
                             ctx,
                             restore_video_tile,
                             true,
                             history_trigger,
+                            super::ViewerOpenAdoption::ContextContinuation,
                         );
                     }
                     FolderOpenOutcome::Classifying | FolderOpenOutcome::ConversionDialogOpened => {
@@ -4302,6 +4308,7 @@ impl App {
                         .unwrap_or(super::DeferredFsTarget::None),
                     resume_to_last_page: (self.settings.book_nav_resume.resumes()).into(),
                     from_explicit_open: false,
+                    viewer_adoption: super::ViewerOpenAdoption::ContextContinuation,
                     preserve_after_password_prompt: false,
                 });
                 self.install_collection_outer_physical_adoption(
@@ -4434,6 +4441,7 @@ impl App {
                         .unwrap_or(super::DeferredFsTarget::None),
                     resume_to_last_page: (self.settings.book_nav_resume.resumes()).into(),
                     from_explicit_open: false,
+                    viewer_adoption: super::ViewerOpenAdoption::ContextContinuation,
                     preserve_after_password_prompt: false,
                 });
             }
@@ -4448,11 +4456,12 @@ impl App {
                     resume_slideshow, ..
                 } => {
                     if matches!(outcome, FolderOpenOutcome::Loaded) && !deferred_pdf {
-                        let _ = self.reopen_fullscreen_after_folder_nav_load(
+                        let _ = self.reopen_fullscreen_after_folder_nav_load_with_adoption(
                             ctx,
                             restore_video_tile,
                             resume_slideshow,
                             history_trigger,
+                            super::ViewerOpenAdoption::ContextContinuation,
                         );
                     } else if matches!(outcome, FolderOpenOutcome::ConversionDialogOpened)
                         && self.epub_convert.is_none()
@@ -4468,11 +4477,12 @@ impl App {
                 }
                 CollectionNavigationAction::Slideshow { .. } => {
                     if matches!(outcome, FolderOpenOutcome::Loaded) && !deferred_pdf {
-                        let _ = self.reopen_fullscreen_after_folder_nav_load(
+                        let _ = self.reopen_fullscreen_after_folder_nav_load_with_adoption(
                             ctx,
                             restore_video_tile,
                             true,
                             history_trigger,
+                            super::ViewerOpenAdoption::ContextContinuation,
                         );
                     } else if matches!(outcome, FolderOpenOutcome::ConversionDialogOpened)
                         && self.epub_convert.is_none()
@@ -7053,6 +7063,154 @@ mod tests {
             source_path: entry.source_path.clone(),
             resolved_kind,
         }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn realmachine50_collection_physical_finish_continues_owning_context_without_parking() {
+        use crate::app::{DetachedSource, ViewerNavigationScope, ViewerPresentation};
+        use crate::grid_item::{GridItem, ThumbnailState};
+
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("continued-book");
+        std::fs::create_dir(&folder).unwrap();
+        let page = folder.join("page.jpg");
+        image::RgbImage::from_pixel(2, 3, image::Rgb([80, 90, 100]))
+            .save(&page)
+            .unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("continued-owner.db"));
+        let created = recv(client.create_collection("continued owner".into()).unwrap());
+        let snapshot = recv(
+            client
+                .add_batch(
+                    created.collection_id(),
+                    created.revision(),
+                    vec![
+                        crate::collection_store::CollectionRegistration::from_trusted_path(
+                            &folder,
+                            CollectionResolvedKind::Folder,
+                        )
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+        )
+        .snapshot;
+        let prepared = prepare_snapshot(&snapshot);
+        let target = prepared_target(&prepared.entries[0], CollectionResolvedKind::Folder);
+        app.settings.detached_viewer_enabled = true;
+        app.settings.detached_viewer_open_images_in_window = true;
+        let ctx = egui::Context::default();
+        let sibling_window = 94_150;
+        let sibling = app.push_window_context_for_test(&ctx, sibling_window, |owner| {
+            owner.current_folder = Some(PathBuf::from("C:/fixture/unrelated"));
+            owner.items = vec![GridItem::Image(PathBuf::from(
+                "C:/fixture/unrelated/page.jpg",
+            ))];
+            owner.selected = Some(0);
+            owner.fullscreen_idx = Some(0);
+            owner.fs_nav_locked_gen = Some(owner.items_generation);
+        });
+        let sibling_before = app
+            .with_viewer_context(sibling, |owner| {
+                (
+                    owner.current_folder.clone(),
+                    owner.items.clone(),
+                    owner.items_generation,
+                    owner.selected,
+                    owner.fullscreen_idx,
+                    owner.fs_nav_locked_gen,
+                )
+            })
+            .unwrap();
+        let sibling_binding = app.viewer_context_window_binding_probe(sibling_window);
+        let active_window = 94_151;
+        let active =
+            app.build_active_context_for_test(Some(active_window), DetachedSource::Book, |owner| {
+                owner.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+                owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+                owner.detached_viewer_independent_active = true;
+                owner.top_level_grid_view.begin(
+                    TopLevelGridSurface::Collection(CollectionGridIdentity {
+                        collection_id: prepared.collection_id,
+                    }),
+                    None,
+                );
+                owner.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+            });
+        let active_binding = app.viewer_context_window_binding_probe(active_window);
+        app.with_viewer_context(active, |owner| {
+            let origin = owner.collection_outer_navigation_origin(Some(0)).unwrap();
+            assert_eq!(origin.context_id, active);
+            let continuation = PreparedCollectionPhysicalNavigation {
+                request: CollectionNavigationRequest {
+                    origin,
+                    action: CollectionNavigationAction::OuterFullscreen {
+                        fs_idx: 0,
+                        forward: true,
+                        resume_slideshow: false,
+                        native_toast: false,
+                        queued_steps: 0,
+                    },
+                    root_thumbnail_sources: None,
+                    perf_started_at: None,
+                    lease: navigation_test_lease(),
+                    book_owner: None,
+                    navigation: None,
+                },
+                watch: client.subscribe().unwrap(),
+                root: Arc::clone(&prepared),
+                target,
+                restore_video_tile: false,
+            };
+            // The accepted physical installer has materialized its destination; this is
+            // its real post-hydration tail, while the original viewer still owns the open.
+            owner.current_folder = Some(folder.clone());
+            owner.items = vec![GridItem::Image(page.clone())];
+            owner.image_metas = vec![None];
+            owner.thumbnails = vec![ThumbnailState::Pending];
+            owner.selected = Some(0);
+            owner.fullscreen_idx = None;
+            owner.rebuild_visible_indices();
+            continuation.finish(owner, &ctx);
+            assert_eq!(owner.projected_viewer_context_id(), active);
+            assert_eq!(owner.active_detached_window_id(), Some(active_window));
+            assert_eq!(owner.fullscreen_idx, Some(0));
+            assert_eq!(owner.items[0], GridItem::Image(page.clone()));
+            assert_eq!(
+                owner.viewer_presentation,
+                ViewerPresentation::DetachedWindow
+            );
+            assert!(!owner.active_detached_window_is_closing());
+        })
+        .unwrap();
+        assert_eq!(app.active_viewer_context_id(), Some(active));
+        assert_eq!(
+            app.viewer_context_window_binding_probe(active_window),
+            active_binding
+        );
+        assert_eq!(
+            app.viewer_context_window_binding_probe(sibling_window),
+            sibling_binding
+        );
+        assert_eq!(app.detached_image_windows.len(), 1);
+        assert_eq!(app.detached_image_windows[0].id, sibling_window);
+        assert_eq!(
+            app.with_viewer_context(sibling, |owner| {
+                (
+                    owner.current_folder.clone(),
+                    owner.items.clone(),
+                    owner.items_generation,
+                    owner.selected,
+                    owner.fullscreen_idx,
+                    owner.fs_nav_locked_gen,
+                )
+            })
+            .unwrap(),
+            sibling_before
+        );
+        app.shutdown_collection_runtime_for_exit();
     }
 
     fn thumbnail_state_kinds(app: &App) -> Vec<&'static str> {

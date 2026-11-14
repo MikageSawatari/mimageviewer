@@ -363,11 +363,17 @@ modalなしでも同じ外部openを通す。targetの画像が開いた事前�
 | close | 明示idのterminal owner→`close_fullscreen_to_completion`→所有context退役。別contextをmountしただけでは終了しない |
 | mode変更 | 残ったother contextも列挙してcloseする。今回ctx3がこの時点で消えることと整合 |
 | F12 | `commit_viewer_session_deferred_feedback` がpair変更の所有Depthを終了する。nativeの保守完了は明示F12と区別済み |
-| 外部openの通常main leaf（startup_ops:1806） | 共通grid handoffを迂回する。採用済みの宛先を使い、旧ownerのpark／close→新viewer公開を同じ確定点へ接続する |
-| Bookmark既存Cの継続（:1638） | Preparing中の所有Cの処理。無条件のgrid handoffを入れて自己parkしない |
-| Bookmark media新Cのinitializer（:2070） | 既に新しいloading ownerが予約されている。新規main openと区別し、継続は同じCで完了させる |
-| 表示対象外のDirectMedia（:1797） | `MainListAfterHydration::DirectMedia` → `install_direct_media_reader` → required fullscreen loadへ迂回する。同型の所有移動を実装時に検証する。今回の赤テストは許可jpgで、この枝は未再現 |
-| フォルダ／PDF／ZIPの列挙・deferred reopen | 新規閲覧の採用と、既に所有Cへ渡ったcontinuationを区別する。継続時に再度handoffしない。Bookmark、Collection、error/cancelも同じ所有区分で棚卸しする |
+| 外部openの通常main leaf | `StartupOpenPathOwner::InitialStartup / Activation` が `MainNew` を確定。実row・composition・sidecar・source leaseの採用可能性を確認した共通openでgrid handoffを一度行い、通常物理静止画は既存のmaterialized forkへ進む。mainの採用一覧を残す |
+| Bookmark既存Cの継続 | typed Bookmark ownerとPreparing Cの既存leaseによる `ContextContinuation`。loaded leafもdescriptor継続も自己parkしない |
+| Bookmark media新Cのinitializer | 予約済みloading C内の `ContextContinuation`。メディアの所有モデル・同窓再開を維持する |
+| 表示対象外のDirectMedia | `DirectMedia { viewer_adoption }` → reader導入 → `RequiredFullscreen { viewer_adoption }` → `DeferredFsReopen`で同じ区分を保持。新規mainなら旧ownerをhandoffし、以後は既存のreader／basis分離条件へ進む。複数窓の静止画はreaderを独立Cへ移し、mainには保存済みbasisを戻す |
+| フォルダ自動fullscreen | `MainListNavigation` → common adopterが返された正本hydrationへ区分を移す → `AutoFullscreenFolder`の実row採用で一度消費。明示leafをsidecar ownerが受理したときはauto page-choiceをそのexact要求へ置換し、二重openしない |
+| PDF direct / warm | navigationまたは既存restore ownerが持つ区分を、移動前に同じPDFの `DeferredFsReopen`へコピー。cached rowsの即時採用・既存verificationの時点は維持し、最終ページ採用で一度消費する |
+| ZIP・staged physicalの列挙 | 既存physical requestのnavigation由来を、その要求が作るauto reopenへ移す。composition／sidecar保留にも保持し、Cへ渡った継続は `ContextContinuation` |
+| Collection physical finish → reopen | `CollectionNavigationRequest.origin.context_id / action`が既存Cを所有。`PreparedCollectionPhysicalNavigation::finish`とPDF deferredは明示 `ContextContinuation`で同じCを継続する |
+| Smart childの独自install | 既存navigation由来をready adopterから独自 `DeferredFsReopen` constructorへ渡す。通常staged physicalを通らない枝でも失わない |
+| ZIP内foreign archive変換提案 | 自動reopenを変換提案に移す際、auto boolだけに縮めず、その区分を新しい既存physical navigationへ移譲する。取消はhandoffしない |
+| 未発見・hidden・拒否・取消・stale | 既存ownerで要求を終端し、新viewer公開のhandoffを行わない。別ページへ流用しない |
 
 ### 3.4 修正案（BA-7主、BA-5関連）
 
@@ -384,6 +390,105 @@ modalは既存の最後の1件の保留を維持し、閉じた後に通常の�
 session setter内の兄弟Depth一括OFF、OtherWindow検査のlive-only化、modal解除だけへのcleanup追加は採らない。
 既存のmodal化は既に組合せを減らしており、今回足りないのは解除後の通常採用の所有移動である。
 外部openを禁止する／操作を送り直させる簡素化は、受理した要求を閉じた後に開く既存仕様を削るため採らない。
+
+### 3.5 B 実装記録（2026-11-14、BA-7主・BA-5関連）
+
+基点は `92daa6e3c`。設計担当と独立設計レビュー（Sol / xhigh、2026-11-14）が構造的な修正に
+合意した範囲で、外部openを通常gridと同じviewer採用へ接続した。§3.3の表は実装の確定版である。
+
+**区分の正本。** `ViewerOpenAdoption::MainNew / ContextContinuation`を既存request/actionへ同居させる。
+`StartupOpenPathOwner`が意味を持っている境界で確定し、履歴の `MainListNavigation`、common adopterの返す
+`SidecarLoadContinuation`、exact leafのsidecar `DeferredFullscreen`、compositionの `FullscreenOpen`、
+required／列挙の `DeferredFsReopen`へ保留・変換・再入を通して保持する。
+`OpenRequestOwner::Navigation`や `MainListRequestStage::Continuation`のvariantだけでは分類しない。
+main-list boundary receiptは一覧のsource close済みという既存の意味のままとし、viewer採用資格を混ぜない。
+既存のgrid open・Bookmark／CollectionのC内継続は明示 `ContextContinuation`である。
+
+**一度だけの確定。** 共通fullscreen入口でcomposition／sidecarの既存保留が終わり、実rowとsource leaseを
+採用できることが分かった後、`MainNew`だけが `prepare_detached_context_for_grid_open` →
+`park_active_detached_context_for_new_grid_open`へ進む。旧ownerのDepth終端・snapshot保存／closeを終えてから
+既存の `route_materialized_physical_still_open_to_active_context` → session公開へ進む。
+複数窓の通常物理静止画の新Cはmainとも旧ownerとも異なる。DirectMediaのreader／basis対、動画・音声の既存ownerは維持する。
+区分は表示先設定や、その時点でmountされたsessionから再推定しない。
+複数window設定を外した後も独立静止画Cが残り得るため、MainNewのhandoffをmodeだけで除外しない。
+単一窓で通常のmain画像を開く場合は、既存seamがno-opとなりmainを再利用する。
+
+EPUBのread leaseはpureな準備helperでlocalに保持し、handoff前のmain fieldへ公開しない。
+handoff内の既存cleanupに消されず、fork先の既存取得が完了するまで生存する。非forkの場合だけ所属fieldへ採用する。
+拒否は旧ownerの退役より前で終わる。新しいI/O、scan、完了待ち、App field／pending、rollback、retry、repaintは足していない。
+まれな失敗は既定のログ＋通知に従う。
+
+**同型経路。** DirectMediaのsidecar変換、PDF warm、staged ZIP/PDF、Smart childの独自reopen、
+ZIP内変換提案のauto boolへの縮退を棚卸しし、§3.3の所有連鎖へそろえた。
+明示leafとauto-folderが重なるときは、sidecarの同じownerでauto page-choiceをexact leafへ置換する。
+hydrate後に一旦別の先頭ページを開いてから再handoffする組合せを作らず、指定leafの既存即時採用を保つ。
+modalの最後の1件保留、native input／focus、A／Cの入力修正、DepthのOtherWindow判定は変更しない。
+
+**診断。** 実sessionの差替え時に `[viewer-adoption]` の1行で `source=MainNew / ContextContinuation`、
+`previous_window / previous_context / next_window / next_context`を記録する。保留・拒否だけでは差替えを記録しない。
+生成元の区分は、再開後に現在のsessionから作り直さない。
+
+**実行で判明した前提の訂正。** 当初の「DirectMediaの静止画はmain readerのまま」という実装側・独立レビュー側の
+前提は誤りだった。`is_snapshot_active`はDirectMediaを意図的に除外し、既存のmaterialized／live forkはreaderを
+実Cへ移してmainを保存済みbasisへ戻す。正本はdetached計画のDirectMedia fork記録、および既存
+`visibility_direct_media_successful_fork_moves_owner_and_preserves_main_basis`等のtestである。
+旧AtRest分岐がforkを迂回してmainへ直openした結果を、所有モデルの仕様として扱ってはならない。
+
+handoffを正すと、この既存forkがpending中に `bump_items_generation` → projected owner getterを呼びassertした。
+本番のTableOp列・pending中getter禁止は変えず、typedなlocal `DirectMediaMainRestore`でsource owner／basis世代／
+origin／保存選択を捕捉し、`finish_fork`直後・incoming rating publication前にsourceの世代更新・observation再bind・
+render／cover／cursorの復帰を完了させた。低level splitの直接呼出しも同じ完了処理を一度使う。
+さらにrequired／auto-folder／reopenの選択確定をowner移動前へそろえ、fork後に消えたhidden indexをmainへ書き戻さない。
+既存split直呼びtestを弱めず、本物の両production forkでmain世代・選択・観測、reader順と対応表、兄弟epochを検査する。
+旧ownerなしの実外部openも同じ独立readerモデルを要求する。訂正とこの完了境界の修正も独立レビューが構造的修正としてACCEPTした。
+
+**検証。** 全Cargo検証は指定 `run-heavy.ps1`、Owner `codex/767-rm50-b`、同作業ツリーで直列実行した。
+修正前の `cargo nextest run -p mimageviewer --lib -E 'test(/realmachine50_forwarded/)' --no-fail-fast --test-threads 6`
+は **5実行／2成功／3失敗、exit 100**（`target/rm50-b-red.log`）。元B2件と追加DirectMediaが旧Depth残存の同じassertで失敗し、
+単一窓・未発見の対照は成功した。最終コマンド・件数・exit codeは下表に記録する。
+
+修正後の初回焦点 `test(/realmachine50_/)` は **35実行／34成功／1失敗、exit 100**
+（`target/rm50-b-focused-r1.log`）。元B2件・Folder／ZIP／fullfeature・Bookmark／取消／stale・A／Cは成功し、
+DirectMediaだけ上記pending中getterで失敗した。`RUST_BACKTRACE=1`の同DirectMedia一件は
+**1実行／0成功／1失敗、exit 100**（`target/rm50-b-direct-trace.log`）で呼出し列を確定した。
+基点ソースにも同じfork内呼出しがあるが、基点でこの追加production fork testを実行した証拠はない。
+
+次の焦点は **38実行／35成功／3失敗、exit 100**（`target/rm50-b-focused-r2.log`）。pending中assertは解消し、
+新規fixtureの期待が残った。DirectMedia readerの`saved_items`等はmainへmove済みなので空であることが正本で、
+reader実体2行・main basis1行の期待は維持したまま、保存配列の移譲も検査した。
+Live forkの一覧選択は有効な可視行、表示中のhidden項目は`fullscreen_idx`で別に所有するため、
+fixtureは前者0／後者2を設定しそれぞれ保持を要求する。materialized明示openは選択2を要求し続ける。
+両訂正は独立レビューで既存契約への適正化と確認し、製品変更・検査の弱体化ではない。
+
+最終検証（共通nextest引数: `cargo nextest run -p mimageviewer --lib -E 'FILTER' --no-fail-fast --test-threads 6`）。
+共有全件ロックを待ち、ロック書込不可の警告後は指定runnerのBelowNormal・6並列で継続した。
+
+| コマンド／FILTER | 件数・exit code・証拠 |
+| --- | --- |
+| `test(/realmachine50_/)` | **38実行／38成功／0失敗、exit 0**。B元赤2件と追加19件、A／Cの実機再現テストを含む。`target/rm50-b-focused.log`、`target/rm50-b-focused-junit.xml` |
+| `test(/depth\|detached\|multiwindow\|startup\|forward\|bookmark\|collection\|direct_media\|sidecar\|grid_open/)` | **2,265実行／2,265成功／0失敗、exit 0**。282.318秒。`target/rm50-b-regression.log`、`target/rm50-b-regression-junit.xml` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **core 1対象、exit 0**。警告あり。`target/rm50-b-check.log` |
+| 中間 `cargo fmt`（引数なし） | **exit 0**。`target/rm50-b-fmt.log`。既存DirectMedia／registry testが指定filter外にもあるため、下記の追加検査後に最後のfmtを行う |
+| `test(/direct_reader\|viewer_context_registry/)` | **109実行／109成功／0失敗、exit 0**。7.920秒。既存のbasis復帰・両fork・epoch／table契約を補完。`target/rm50-b-registry.log`、`target/rm50-b-registry-junit.xml` |
+| 最後のCargo操作: `cargo fmt`（引数なし） | **exit 0**。`target/rm50-b-fmt-final.log` |
+| 最終 `git diff --check` | **exit 0**。`target/rm50-b-diff-check.log` |
+
+**変更ファイル（31件）。**
+
+- 製品の採用／所有: `src/app.rs`、`src/app/startup_ops.rs`、`src/app/snapshot_ops.rs`、`src/app/sidecar_restore.rs`、
+  `src/app/book_composition_permission.rs`、`src/app/collection_navigation.rs`、`src/app/smart_folder.rs`、
+  `src/app/viewer_context_registry.rs`。`src/app/archive_inner_book.rs`と`src/app/close_return.rs`は既存C継続の区分明示。
+- 新規／既存回帰と必須field対応: `src/app/depth_export_main_window_tests.rs`、`src/app/book_composition_permission_tests.rs`、
+  `src/app/tests.rs`、`src/app/tests/startup_restore.rs`、`src/app/archive_inner_book_s2.rs`、`src/app/archive_inner_book_s3.rs`、
+  `src/app/book_composition_revision_tests.rs`、`src/app/book_composition_runtime_tests.rs`、`src/app/book_resume_meter_tests.rs`、
+  `src/app/rating_membership_tests.rs`、`src/app/similar_navigation_tests.rs`、`src/app/spread_shift_owner_tests.rs`、
+  `src/app/tests/manual_nav_wrap_book.rs`、`src/app/tests/startup_notices.rs`、`src/filename_stack_ui.rs`、
+  `src/ui_dialogs/epub_convert.rs`、`src/ui_fullscreen/continuous_quality_tests.rs`。後ろ3件はtest内のfield追加だけ。
+- 文書: 本書、`docs/detached-rework-plan.md`、`docs/virtual-folders.md`、`docs/async-architecture.md`。
+
+製品起動・build-dev・全件gate・commit／push・vendor変更は行っていない。描画・layout・表示文言は変更していない。
+実OSの外部起動・focus／z-order、サブPCでの最終確認、PDFのnative描画は未確認。
+PDF warmの追加検査は実resolver／loaderの即時行採用と保留ownerまでで、描画成功を意味しない。
 
 ## 4. C — rectによるキーsubclassの誤同定
 

@@ -783,6 +783,7 @@ fn section1675_multiwindow_scope_no_main_return() {
 
 fn request(target: ArchiveBookTarget, resume: bool) -> DeferredFsReopen {
     DeferredFsReopen {
+        viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::CurrentArchiveBook(target),

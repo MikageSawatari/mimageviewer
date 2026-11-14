@@ -1076,6 +1076,7 @@ mod tests {
             unreachable!()
         };
         state.deferred_fullscreen = Some(crate::app::DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: crate::app::DeferredFsTarget::None,
@@ -1117,6 +1118,7 @@ mod tests {
             unreachable!()
         };
         state.deferred_fullscreen = Some(crate::app::DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: crate::app::DeferredFsTarget::None,
@@ -1158,6 +1160,7 @@ mod tests {
         let ctx = egui::Context::default();
         let (mut state, tx, cancel) = fake_state(EpubConvertPhase::Converting(None));
         state.deferred_fullscreen = Some(crate::app::DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: crate::app::DeferredFsTarget::None,
@@ -1219,6 +1222,7 @@ mod tests {
             let ctx = egui::Context::default();
             let (mut state, tx, cancel) = fake_state(EpubConvertPhase::Converting(None));
             state.deferred_fullscreen = Some(crate::app::DeferredFsReopen {
+                viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                 history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: crate::app::DeferredFsTarget::None,

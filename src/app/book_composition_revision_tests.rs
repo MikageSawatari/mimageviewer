@@ -121,6 +121,7 @@ fn g3_hidden_required_detached_open_terminates_session_runtime_and_preserves_sib
         }
         env.with_active_viewer_context(|app| {
             let deferred = DeferredFsReopen {
+                viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                 history_trigger: HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::Required(crate::snapshot::SnapshotTarget::PdfPage {

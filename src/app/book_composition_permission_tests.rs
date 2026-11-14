@@ -52,6 +52,7 @@ fn composition1669_extracted_absence_is_rechecked_after_sibling_save_and_remove(
         contract: FsPageLoadContract::Sequential,
         purpose: BookTargetPurpose::Explicit,
         route: BookTargetRoute::FullscreenOpen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             metadata_boundary: FsMetadataBoundary::Manual,
             resume_notice: None,
         },
@@ -305,6 +306,7 @@ fn book_structure_waits_for_open_permission_but_not_passive_display_reads_or_ado
         contract: FsPageLoadContract::Sequential,
         purpose: BookTargetPurpose::Explicit,
         route: BookTargetRoute::FullscreenOpen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             metadata_boundary: FsMetadataBoundary::Manual,
             resume_notice: None,
         },
@@ -380,6 +382,7 @@ fn deferred_projection_wait_is_retired_by_close_source_replacement_and_fork() {
                 origin: Default::default(),
             };
         let deferred = DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: super::super::DeferredFsTarget::None,
@@ -431,6 +434,7 @@ fn deferred_projection_carry_requires_original_context_generation_and_scope() {
         let context_id = env.spread_shift_context_id().serial();
         let old_generation = env.items_generation;
         let deferred = DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: super::super::DeferredFsTarget::None,
@@ -523,6 +527,7 @@ fn fullscreen_open_captures_rating_metadata_boundary_in_composition_continuation
         assert_eq!(
             intent.route,
             BookTargetRoute::FullscreenOpen {
+                viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                 metadata_boundary: boundary,
                 resume_notice: None
             }
@@ -530,6 +535,7 @@ fn fullscreen_open_captures_rating_metadata_boundary_in_composition_continuation
         assert_eq!(
             intent.clone().route,
             BookTargetRoute::FullscreenOpen {
+                viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                 metadata_boundary: boundary,
                 resume_notice: None
             }
@@ -624,6 +630,278 @@ fn resume_notice_survives_permission_recheck_and_open_feedback() {
         );
         process.shutdown_and_join();
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn realmachine50_composition_main_open_recheck_parks_previous_owner() {
+    realmachine50_composition_open_recheck(false, false);
+}
+
+#[cfg(windows)]
+#[test]
+fn realmachine50_composition_hidden_main_target_does_not_handoff_previous_owner() {
+    realmachine50_composition_open_recheck(false, true);
+}
+
+#[cfg(windows)]
+#[test]
+fn realmachine50_composition_context_continuation_recheck_keeps_its_window_owner() {
+    realmachine50_composition_open_recheck(true, false);
+}
+
+#[cfg(windows)]
+fn realmachine50_composition_open_recheck(continuation: bool, hidden_target: bool) {
+    use crate::app::{
+        DetachedSource, DetachedWindowState, StartupOpenPathOwner, ViewerOpenAdoption,
+    };
+    use crate::fs_exclusive_view::FsExclusiveView;
+    let _input = crate::key_input::lock_test_input();
+    let mut env = crate::app::tests::phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    env.active_quick_folder_slot = None;
+    env.settings.detached_viewer_enabled = true;
+    env.settings.detached_viewer_open_images_in_window = true;
+    env.settings.page_turn_animation_enabled = false;
+    let main = env.viewer_context_main();
+    let old_window = 89_052;
+    let old = env.build_active_context_for_test(Some(old_window), DetachedSource::Image, |owner| {
+        crate::app::depth_view_tests::install_pages(owner, &ctx);
+        owner.viewer_presentation = crate::app::ViewerPresentation::DetachedWindow;
+        owner.detached_viewer_independent_active = true;
+        if !continuation {
+            crate::app::depth_view_tests::install_ready_depth_for_export(owner);
+        }
+    });
+    let previous_depth = env
+        .with_viewer_context(old, |owner| {
+            owner.mark_active_detached_viewport_rendered(&ctx);
+            match &owner.fs_exclusive_view {
+                FsExclusiveView::Depth(depth) => Some(depth.ready().unwrap().resource_id),
+                _ => None,
+            }
+        })
+        .unwrap();
+    let old_before = env
+        .with_viewer_context(old, |owner| (owner.items.clone(), owner.items_generation))
+        .unwrap();
+    let main_before = env
+        .with_viewer_context(main, |owner| {
+            (
+                owner.items.clone(),
+                owner.items_generation,
+                owner.fullscreen_idx,
+            )
+        })
+        .unwrap();
+    let root = env.tmp.path().join("realmachine50-permission.pdf");
+    let scope = crate::book_scope::BookScopeKey::document(&root).unwrap();
+    let page = CompositionPageRef::PdfPage { page_num: 0 };
+    let (service, process) = BookCompositionService::spawn_at(
+        env.tmp.path().join("realmachine50-permission-data"),
+        None,
+    )
+    .unwrap();
+    service
+        .save(
+            scope.clone(),
+            PageDomain::Document,
+            BookComposition::new(ReadingDirection::Ltr, vec![page.clone()]),
+        )
+        .recv()
+        .unwrap()
+        .status
+        .unwrap();
+    env.install_book_composition_runtime(service.clone());
+    let typed_owner = if continuation {
+        StartupOpenPathOwner::Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner {
+            request_id: crate::bookmark_browser::BookmarkOpenRequestId(50_304),
+            target: crate::bookmark_browser::BookmarkViewReturnTarget::Book(root.clone()),
+            detached_lease: Some(crate::app::DetachedSessionLease {
+                window_id: old_window,
+            }),
+        })
+    } else {
+        StartupOpenPathOwner::Activation
+    };
+    let adoption = typed_owner.viewer_open_adoption();
+    assert_eq!(
+        adoption,
+        if continuation {
+            ViewerOpenAdoption::ContextContinuation
+        } else {
+            ViewerOpenAdoption::MainNew
+        }
+    );
+    let target_owner = if continuation { old } else { main };
+    let notice = crate::app::BookResumeNotice {
+        label: crate::book_resume_key::BookResumeKey::legacy(&root).display_label(),
+        resolution: crate::app::file_type_resume::PositionResolution::LegacyWithExclusions,
+    };
+    env.with_viewer_context(target_owner, |owner| {
+        owner.items = vec![crate::grid_item::GridItem::PdfPage {
+            pdf_path: root.clone(),
+            page_num: 0,
+            content_type: None,
+        }];
+        owner.current_folder = None;
+        owner.projection_recipe = crate::app::book_materialization::ProjectionRecipe::OrdinaryList;
+        owner.visible_indices = vec![0];
+        owner.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+        owner.image_metas = vec![None];
+        owner.fullscreen_idx = None;
+        owner
+            .adjustment_page_params
+            .insert(0, crate::adjustment::AdjustParams::default());
+        owner.open_fullscreen_with_metadata_boundary_and_adoption(
+            0,
+            HistoryTrigger::UserChosen,
+            FsOpenMaterialization::Eager,
+            FsPageLoadContract::Sequential,
+            None,
+            FsMetadataBoundary::RatingMembership,
+            Some(notice.clone()),
+            adoption,
+        );
+    })
+    .unwrap();
+    assert_eq!(env.active_viewer_context_id(), Some(old));
+    assert!(
+        env.detached_image_windows.is_empty(),
+        "permission wait precedes handoff"
+    );
+    let (intent, candidates) = env
+        .with_viewer_context(target_owner, |owner| {
+            let OpenPermission::Checking { intent, candidates } =
+                std::mem::take(&mut owner.book_composition_permission.open)
+            else {
+                panic!("the real common open must defer for composition permission");
+            };
+            (intent, candidates)
+        })
+        .unwrap();
+    let expected_route = BookTargetRoute::FullscreenOpen {
+        metadata_boundary: FsMetadataBoundary::RatingMembership,
+        resume_notice: Some(notice.clone()),
+        viewer_adoption: adoption,
+    };
+    assert_eq!(intent.route, expected_route);
+
+    // Advance the real service revision before its callback rechecks the open.
+    // The callback supplies ordinary defaults; the accepted request retains
+    // its metadata, notice and viewer owner through the renewed qualification.
+    let mut revised = BookComposition::new(ReadingDirection::Rtl, vec![page.clone()]);
+    if hidden_target {
+        revised.hidden_pages.push(page);
+    }
+    service
+        .save(scope, PageDomain::Document, revised)
+        .recv()
+        .unwrap()
+        .status
+        .unwrap();
+    env.with_viewer_context(target_owner, |owner| {
+        owner.book_composition_permission.open = OpenPermission::Resuming { intent, candidates };
+        owner.open_fullscreen(0, HistoryTrigger::UserChosen);
+        let OpenPermission::Checking { intent, .. } = &owner.book_composition_permission.open
+        else {
+            panic!("callback must requalify against the changed service revision");
+        };
+        assert_eq!(intent.route, expected_route);
+        assert!(owner.fullscreen_idx.is_none());
+    })
+    .unwrap();
+    assert_eq!(env.active_viewer_context_id(), Some(old));
+    assert!(
+        env.detached_image_windows.is_empty(),
+        "requalification still precedes handoff"
+    );
+    if let Some(resource) = previous_depth {
+        env.with_viewer_context(old, |owner| {
+            let FsExclusiveView::Depth(depth) = &owner.fs_exclusive_view else {
+                panic!("pending permission must preserve the live Depth owner");
+            };
+            assert_eq!(depth.ready().unwrap().resource_id, resource);
+        })
+        .unwrap();
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let finished = env
+            .with_viewer_context(target_owner, |owner| {
+                owner.poll_book_presentation_permission(&ctx);
+                matches!(owner.book_composition_permission.open, OpenPermission::Idle)
+                    && (hidden_target || owner.fullscreen_idx == Some(0))
+            })
+            .unwrap();
+        if finished {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "composition open did not reach its terminal"
+        );
+        std::thread::yield_now();
+    }
+    if hidden_target {
+        assert_eq!(env.active_viewer_context_id(), Some(old));
+        assert_eq!(env.active_detached_window_id(), Some(old_window));
+        assert_eq!(env.viewer_context_window(old), Some(old_window));
+        assert!(env.detached_image_windows.is_empty());
+        env.with_viewer_context(old, |owner| {
+            let FsExclusiveView::Depth(depth) = &owner.fs_exclusive_view else {
+                panic!("hidden target must not retire the old Depth owner");
+            };
+            assert_eq!(Some(depth.ready().unwrap().resource_id), previous_depth);
+            assert_eq!(owner.fullscreen_idx, Some(0));
+            assert_eq!(owner.items, old_before.0);
+            assert_eq!(owner.items_generation, old_before.1);
+        })
+        .unwrap();
+        env.with_viewer_context(main, |owner| assert!(owner.fullscreen_idx.is_none()))
+            .unwrap();
+    } else if continuation {
+        assert_eq!(env.active_viewer_context_id(), Some(old));
+        assert_eq!(env.active_detached_window_id(), Some(old_window));
+        assert_eq!(env.viewer_context_window(old), Some(old_window));
+        assert!(
+            env.detached_image_windows.is_empty(),
+            "the continuation cannot park itself"
+        );
+        env.with_window_viewer_context(old_window, |owner| {
+            assert_eq!(owner.fullscreen_idx, Some(0));
+            assert!(
+                matches!(&owner.items[0], crate::grid_item::GridItem::PdfPage { pdf_path, .. }
+                if pdf_path == &root)
+            );
+        })
+        .unwrap();
+        env.with_viewer_context(main, |owner| {
+            assert_eq!(owner.items, main_before.0);
+            assert_eq!(owner.items_generation, main_before.1);
+            assert_eq!(owner.fullscreen_idx, main_before.2);
+        })
+        .unwrap();
+    } else {
+        assert_ne!(env.active_viewer_context_id(), Some(old));
+        assert_eq!(
+            env.detached_window_state(old_window),
+            Some(DetachedWindowState::Parked)
+        );
+        assert_eq!(
+            env.detached_image_windows
+                .iter()
+                .filter(|window| window.id == old_window)
+                .count(),
+            1
+        );
+        env.with_viewer_context(old, |owner| assert!(!owner.fs_exclusive_view.is_depth()))
+            .unwrap();
+        env.with_viewer_context(main, |owner| assert_eq!(owner.fullscreen_idx, Some(0)))
+            .unwrap();
+    }
+    process.shutdown_and_join();
 }
 
 #[test]
@@ -2155,6 +2433,7 @@ fn section1675_inner_resume_hidden_saved_reprojection_defers_fallback_until_adop
             contract: FsPageLoadContract::Sequential,
             purpose: BookTargetPurpose::Explicit,
             route: BookTargetRoute::DeferredBook(Box::new(DeferredFsReopen {
+                viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                 history_trigger: HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::CurrentArchiveBook(ArchiveBookTarget {

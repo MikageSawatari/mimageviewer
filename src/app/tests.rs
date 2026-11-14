@@ -4296,6 +4296,7 @@ fn epub_modal_rejects_second_direct_open_and_cancel_preserves_history() {
         PdfOpenFailureRoute::ConversionDialogOpened
     );
     app.epub_convert.as_mut().unwrap().deferred_fullscreen = Some(DeferredFsReopen {
+        viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::None,
@@ -4530,6 +4531,7 @@ fn epub_modal_blocks_pane_scan_until_cancel() {
     app.address = epub.to_string_lossy().into_owned();
     let state = app.epub_convert.as_mut().unwrap();
     state.deferred_fullscreen = Some(DeferredFsReopen {
+        viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::None,
@@ -4598,6 +4600,7 @@ fn epub_modal_blocks_failed_pane_scan_and_cancel_restores_source() {
     );
     let state = app.epub_convert.as_mut().unwrap();
     state.deferred_fullscreen = Some(DeferredFsReopen {
+        viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::None,
@@ -4672,6 +4675,7 @@ fn epub_ready_pane_replacement_scenario(c_succeeds: bool) {
     );
     let state = app.epub_convert.as_mut().unwrap();
     state.deferred_fullscreen = Some(DeferredFsReopen {
+        viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::None,
@@ -4807,6 +4811,7 @@ fn epub_published_stale_collection_reopen_preserves_other_pending_attachments() 
         crate::app::StartupListIntent::ExplicitList,
     );
     state.deferred_fullscreen = Some(DeferredFsReopen {
+        viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::None,
@@ -43882,6 +43887,7 @@ mod favorite_adjustment_defaults_tests {
     fn pdf_password_prompt_preserves_only_explicit_deferred_reopen() {
         let mut app = setup_app();
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
@@ -43896,6 +43902,7 @@ mod favorite_adjustment_defaults_tests {
         );
 
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
@@ -53810,6 +53817,7 @@ mod favorite_adjustment_defaults_tests {
         app.fullscreen_idx = None;
         app.items_generation = locked_gen + 1;
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
@@ -54790,6 +54798,7 @@ mod favorite_adjustment_defaults_tests {
         app.fullscreen_idx = None;
         app.items_generation += 1;
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
@@ -69828,6 +69837,7 @@ mod still_window_mode_key_tests {
 
     fn keep_detached_transition_gap_open(app: &mut App) {
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
@@ -69929,6 +69939,7 @@ mod still_window_mode_key_tests {
 
         install_detached_transition_gap_for_test(&mut app, window_id, move |bundle| {
             bundle.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                 history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
@@ -77423,6 +77434,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         install_detached_transition_gap_for_test(&mut app, window_id, |bundle| {
             bundle.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                 history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
@@ -77462,6 +77474,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let window_id = 22u64;
         let viewport_id = install_detached_transition_gap_for_test(&mut app, window_id, |bundle| {
             bundle.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                 history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
@@ -78070,6 +78083,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         install_detached_transition_gap_for_test(&mut app, window_id, |bundle| {
             bundle.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                 history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
@@ -83199,6 +83213,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.visible_indices = vec![0];
 
         app.open_deferred_fullscreen_after_enumerate(DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
@@ -83245,6 +83260,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.visible_indices = vec![0];
 
         let outcome = app.open_deferred_fullscreen_after_enumerate(DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::Required(crate::snapshot::SnapshotTarget::PdfPage {
@@ -83850,6 +83866,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 "test_new_book_binding",
             );
             app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                 history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
@@ -99106,6 +99123,7 @@ mod smart_folder_transition_tests {
                 owner_context: app.projected_viewer_context_id(),
                 restore_video_tile: false,
                 reopen: DeferredFsReopen {
+                    viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                     history_trigger: crate::app::HistoryTrigger::UserChosen,
                     resume_slideshow: false,
                     target: DeferredFsTarget::None,
@@ -99393,6 +99411,74 @@ mod smart_folder_transition_tests {
             app.show_archive_convert_dialog(ctx);
         })
         .drop_without_applying_deltas();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn realmachine50_foreign_zip_offer_transfers_main_origin_and_cancel_does_not_handoff() {
+        let _input = crate::key_input::lock_test_input();
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        app.settings
+            .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+        let path = app.tmp.path().join("main-origin-foreign.zip");
+        write_convert_completion_zip(&path);
+        app.load_folder(path.clone());
+        super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+        app.finish_page_identity_preparation_for_test();
+        let ctx = egui::Context::default();
+        let old_window = 88_995;
+        let old =
+            app.build_active_context_for_test(Some(old_window), DetachedSource::Image, |viewer| {
+                crate::app::depth_view_tests::install_pages(viewer, &ctx);
+                viewer.viewer_presentation = ViewerPresentation::DetachedWindow;
+                viewer.detached_viewer_independent_active = true;
+                viewer.set_fs_exclusive_view(
+                    crate::fs_exclusive_view::FsExclusiveView::Depth(
+                        crate::depth_parallax::DepthViewState::new(
+                            viewer.edit_request_owner_context(),
+                        ),
+                    ),
+                    "realmachine50_foreign_offer_before_confirmation",
+                );
+            });
+        let origin = StartupOpenPathOwner::Activation.viewer_open_adoption();
+        app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+            viewer_adoption: origin,
+            history_trigger: HistoryTrigger::UserChosen,
+            resume_slideshow: false,
+            target: DeferredFsTarget::None,
+            resume_to_last_page: false.into(),
+            from_explicit_open: true,
+            preserve_after_password_prompt: true,
+        });
+        app.finish_installed_zip_first_display(true, StartupListIntent::PageContinuation);
+        let Some(HistoryNavigationTransition::Physical(request)) =
+            app.top_level_grid_view.history_navigation_transition()
+        else {
+            panic!("the offer must own the same main viewer adoption");
+        };
+        assert_eq!(request.navigation.viewer_adoption, origin);
+        assert!(app.fs_nav_after_pdf_enumerate.is_none());
+        assert_eq!(app.active_detached_window_id(), Some(old_window));
+        assert_eq!(app.locate_window_context(old_window).unwrap().0, old);
+        app.with_viewer_context(old, |viewer| assert!(viewer.fs_exclusive_view.is_depth()))
+            .unwrap();
+        assert!(app.detached_image_windows.is_empty());
+        assert!(app.cancel_archive_convert_for_navigation("realmachine50_foreign_cancel"));
+        app.poll_collection_history_transition(&ctx);
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_none()
+        );
+        assert_eq!(app.active_detached_window_id(), Some(old_window));
+        assert_eq!(app.locate_window_context(old_window).unwrap().0, old);
+        app.with_viewer_context(old, |viewer| assert!(viewer.fs_exclusive_view.is_depth()))
+            .unwrap();
+        assert!(app.detached_image_windows.is_empty());
     }
 
     #[test]
