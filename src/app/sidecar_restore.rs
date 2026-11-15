@@ -637,6 +637,21 @@ fn reuse_proof_apply(
 
 impl SidecarRestoreState {
     #[cfg(test)]
+    pub(super) fn cancel_for_test(&self) -> Arc<AtomicBool> {
+        Arc::clone(self.common.continuation.cancel())
+    }
+
+    #[cfg(test)]
+    pub(super) fn elapse_modal_grace_for_test(&mut self) {
+        self.common.started_at = std::time::Instant::now() - SIDECAR_RESTORE_MODAL_GRACE;
+    }
+
+    #[cfg(test)]
+    pub(super) fn reset_modal_grace_for_test(&mut self) {
+        self.common.started_at = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    }
+
+    #[cfg(test)]
     pub(super) fn connection_request_ids_for_test(&self) -> (u64, Option<u64>) {
         (
             self.common.request_id,
@@ -716,6 +731,18 @@ impl SidecarRestoreState {
 }
 
 impl App {
+    pub(crate) fn sidecar_restore_modal_layer() -> egui::LayerId {
+        egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::unique("sidecar_restore_modal"),
+        )
+    }
+
+    pub(crate) fn is_sidecar_restore_modal_widget(ctx: &egui::Context, widget: egui::Id) -> bool {
+        ctx.read_response(widget)
+            .is_some_and(|response| response.layer_id == Self::sidecar_restore_modal_layer())
+    }
+
     /// A global memory change supersedes only the shift dependency of an unopened Book.
     /// Its original resume cutoff remains mandatory; an already shown sibling keeps its session.
     pub(super) fn refresh_pending_book_shift_memory_policy(&mut self) {

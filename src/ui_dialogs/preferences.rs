@@ -16,6 +16,11 @@ use crate::ring_shortcut::{
 };
 use crate::settings::{Parallelism, Settings};
 
+fn cover_auto_crop_changed(before: &Settings, after: &Settings) -> bool {
+    crate::app::configured_thumbnail_auto_crop(before)
+        != crate::app::configured_thumbnail_auto_crop(after)
+}
+
 pub(crate) fn draw_same_name_folder_book_settings(
     ui: &mut egui::Ui,
     policy: &mut crate::same_name_folder_book::SameNameFolderBookPolicy,
@@ -252,7 +257,7 @@ pub fn draw_favorite_view_state_settings_snapshot_fixture(ui: &mut egui::Ui) {
     );
     state.favorite_view_state_entry_count = 3;
     state.favorite_view_state_active = true;
-    pages::page_thumbnail(ui, &mut state);
+    pages::draw_favorite_view_state_section(ui, &mut state);
 }
 
 fn pref_panel_scroll_style() -> egui::style::ScrollStyle {
@@ -2892,11 +2897,7 @@ impl App {
             let old_show_hidden_files = self.settings.show_hidden_files;
             let file_type_visibility_changed =
                 self.settings.file_type_visibility != state.settings.file_type_visibility;
-            let cover_auto_crop_changed = self.settings.thumb_cover_auto_crop
-                != state.settings.thumb_cover_auto_crop
-                || (state.settings.thumb_cover_auto_crop
-                    && self.settings.default_reading_direction
-                        != state.settings.default_reading_direction);
+            let cover_auto_crop_changed = cover_auto_crop_changed(&self.settings, &state.settings);
             let old_exif = self.settings.exif_hidden_tags.clone();
 
             let old_susie = (
@@ -5822,9 +5823,10 @@ mod tests {
         let later_key = key("later-watched.mkv");
         let after_clear_key = key("after-clear-watched.mp3");
         app.settings.video_watched_to_end.insert(old_key.clone());
-        app.settings
-            .video_resume_positions
-            .insert(resume_key.clone(), 18.0);
+        app.settings.video_resume_positions.insert(
+            resume_key.clone(),
+            crate::settings::VideoResumePosition::Media(18.0),
+        );
         app.settings.video_audio_track_choices.insert(
             video_key.clone(),
             saved_audio_choice_for_preferences_test(2),
@@ -5947,6 +5949,207 @@ mod tests {
     }
 
     #[test]
+    fn thumb_cover_auto_crop_binding_reload_ignores_reading_direction_and_disabled_binding() {
+        use crate::settings::ReadingDirection::{Ltr, Rtl};
+        for enabled in [false, true] {
+            let before = Settings {
+                thumb_cover_auto_crop: enabled,
+                ..Settings::default()
+            };
+            let mut after = before.clone();
+            after.default_reading_direction = Rtl;
+            assert!(!cover_auto_crop_changed(&before, &after));
+            after.thumb_cover_auto_crop_binding = Ltr;
+            assert_eq!(cover_auto_crop_changed(&before, &after), enabled);
+            after.thumb_cover_auto_crop = !enabled;
+            assert!(cover_auto_crop_changed(&before, &after));
+        }
+    }
+
+    #[test]
+    fn thumb_cover_auto_crop_folders_reload_only_when_automatic_is_enabled() {
+        for enabled in [false, true] {
+            for folders in [false, true] {
+                let before = Settings {
+                    thumb_cover_auto_crop: enabled,
+                    thumb_cover_auto_crop_folders: folders,
+                    ..Settings::default()
+                };
+                let mut after = before.clone();
+                after.thumb_cover_auto_crop_folders = !folders;
+                assert_eq!(cover_auto_crop_changed(&before, &after), enabled);
+                assert_eq!(cover_auto_crop_changed(&after, &before), enabled);
+                after.thumb_cover_auto_crop = !enabled;
+                assert!(cover_auto_crop_changed(&before, &after));
+            }
+        }
+    }
+
+    #[test]
+    fn thumb_cover_auto_crop_folders_preferences_disabled_ok_cancel_save_and_reopen() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let mut harness = preferences_view_harness(PreferencesPage::Thumbnail);
+        let automatic = "つながった表紙から表表紙を自動で切り出す (書庫・PDF の本)";
+        let folders = "画像フォルダの本も対象にする";
+        assert!(harness.get_by_label(folders).accesskit_node().is_disabled());
+        harness.get_by_label(automatic).scroll_to_me();
+        harness.run_steps(3);
+        harness.get_by_label(automatic).click();
+        harness.run_steps(3);
+        assert!(!harness.get_by_label(folders).accesskit_node().is_disabled());
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        let db = crate::settings_db::SettingsDb::open(harness.state().tmp.path()).unwrap();
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Thumbnail);
+        harness.run_steps(3);
+        for (cancel, expected) in [(true, false), (false, true), (true, true)] {
+            harness.get_by_label(folders).scroll_to_me();
+            harness.run_steps(3);
+            harness.get_by_label(folders).click();
+            harness.run_steps(3);
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .thumb_cover_auto_crop_folders,
+                !harness.state().settings.thumb_cover_auto_crop_folders
+            );
+            harness
+                .get_by_label(if cancel { "キャンセル" } else { "  OK  " })
+                .click();
+            harness.run_steps(3);
+            if cancel {
+                harness.get_by_label("破棄して閉じる").click();
+                harness.run_steps(3);
+            }
+            assert_eq!(
+                harness.state().settings.thumb_cover_auto_crop_folders,
+                expected
+            );
+            assert_eq!(
+                db.load_into_settings()
+                    .unwrap()
+                    .thumb_cover_auto_crop_folders,
+                expected
+            );
+            harness
+                .state_mut()
+                .open_preferences_page(PreferencesPage::Thumbnail);
+            harness.run_steps(3);
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .thumb_cover_auto_crop_folders,
+                expected
+            );
+        }
+        harness.get_by_label(automatic).scroll_to_me();
+        harness.run_steps(3);
+        harness.get_by_label(automatic).click();
+        harness.run_steps(3);
+        assert!(harness.get_by_label(folders).accesskit_node().is_disabled());
+        assert!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .thumb_cover_auto_crop_folders
+        );
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        let saved = db.load_into_settings().unwrap();
+        assert!(!saved.thumb_cover_auto_crop);
+        assert!(saved.thumb_cover_auto_crop_folders);
+    }
+
+    #[test]
+    fn thumb_cover_auto_crop_binding_preferences_disabled_ok_cancel_save_and_reopen() {
+        use crate::settings::ReadingDirection::{Ltr, Rtl};
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let mut harness = preferences_view_harness(PreferencesPage::Thumbnail);
+        let toggle = "つながった表紙から表表紙を自動で切り出す (書庫・PDF の本)";
+        for label in ["右綴じ", "左綴じ"] {
+            assert!(harness.get_by_label(label).accesskit_node().is_disabled());
+        }
+        harness.get_by_label(toggle).scroll_to_me();
+        harness.run_steps(3);
+        harness.get_by_label(toggle).click();
+        harness.run_steps(3);
+        for label in ["右綴じ", "左綴じ"] {
+            assert!(!harness.get_by_label(label).accesskit_node().is_disabled());
+        }
+        harness.get_by_label("左綴じ").scroll_to_me();
+        harness.run_steps(3);
+        harness.get_by_label("左綴じ").click();
+        harness.run_steps(3);
+        assert_eq!(harness.state().settings.thumb_cover_auto_crop_binding, Rtl);
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        let db = crate::settings_db::SettingsDb::open(harness.state().tmp.path()).unwrap();
+        assert_eq!(harness.state().settings.thumb_cover_auto_crop_binding, Ltr);
+        assert_eq!(
+            db.load_into_settings()
+                .unwrap()
+                .thumb_cover_auto_crop_binding,
+            Ltr
+        );
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Thumbnail);
+        harness.run_steps(3);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .thumb_cover_auto_crop_binding,
+            Ltr
+        );
+        harness.get_by_label("右綴じ").scroll_to_me();
+        harness.run_steps(3);
+        harness.get_by_label("右綴じ").click();
+        harness.run_steps(3);
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(3);
+        harness.get_by_label("破棄して閉じる").click();
+        harness.run_steps(3);
+        assert_eq!(harness.state().settings.thumb_cover_auto_crop_binding, Ltr);
+        assert_eq!(
+            db.load_into_settings()
+                .unwrap()
+                .thumb_cover_auto_crop_binding,
+            Ltr
+        );
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Thumbnail);
+        harness.run_steps(3);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .thumb_cover_auto_crop_binding,
+            Ltr
+        );
+    }
+
+    #[test]
     fn thumb_cover_auto_crop_preferences_ok_cancel_save_and_reopen() {
         use egui_kittest::kittest::Queryable;
         let mut harness = preferences_view_harness(PreferencesPage::Thumbnail);
@@ -6043,6 +6246,56 @@ mod tests {
             harness.state().settings.thumb_container_icon_kinds,
             crate::grid_item::ContainerIconKinds::ALL
         );
+    }
+
+    /// The favorite view state section comes after the category order grid and
+    /// the name color table. At narrow widths those tables are wider than the
+    /// page and widen its region; the section must still wrap to the visible
+    /// width (sub-PC request 56, 2026-11-15).
+    #[test]
+    fn favorite_view_state_section_wraps_to_the_visible_width_after_wide_tables() {
+        use egui_kittest::kittest::Queryable;
+        const WIDTH: f32 = 220.0;
+        let mut state = preferences_state_for_test(&Settings::default());
+        state.favorite_view_state_entry_count = 3;
+        state.favorite_view_state_active = true;
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(WIDTH, 600.0))
+            .build_ui_state(
+                |root_ui, state| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .show(ui, |ui| pages::page_thumbnail(ui, state));
+                    });
+                },
+                state,
+            );
+        harness.run_steps(3);
+        let category_grid_right = harness
+            .get_by_role_and_label(egui::accesskit::Role::RadioButton, "動画・音声 / 1")
+            .rect()
+            .right();
+        assert!(
+            category_grid_right > WIDTH,
+            "fixture must keep a table wider than the page: {category_grid_right}"
+        );
+        let checkbox = harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::CheckBox,
+                "お気に入りごとに表示状態を記憶する",
+            )
+            .rect();
+        let clear = harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                "保存済みの表示状態をすべてクリア…",
+            )
+            .rect();
+        let count = harness.get_by_label("保存済み: 3 件").rect();
+        for rect in [checkbox, clear, count] {
+            assert!(rect.right() <= WIDTH, "{rect:?}");
+        }
     }
 
     #[test]
@@ -6403,12 +6656,14 @@ mod tests {
             (false, FullscreenSeekDirection::LeftToRight),
             (true, FullscreenSeekDirection::FollowReading),
         ] {
-            app.settings
-                .video_resume_positions
-                .insert(video_key.clone(), 7.0);
-            app.settings
-                .video_resume_positions
-                .insert(audio_key.clone(), 9.0);
+            app.settings.video_resume_positions.insert(
+                video_key.clone(),
+                crate::settings::VideoResumePosition::Media(7.0),
+            );
+            app.settings.video_resume_positions.insert(
+                audio_key.clone(),
+                crate::settings::VideoResumePosition::Media(9.0),
+            );
             let mut state = preferences_state_for_test(&app.settings);
             state.settings.thumb_show_resume_meter = enabled;
             state.settings.fullscreen_seek_direction = direction;
@@ -6429,11 +6684,19 @@ mod tests {
             }
             app.save_all_video_resume_positions();
             assert_eq!(
-                state.settings.video_resume_positions.get(&video_key),
+                state
+                    .settings
+                    .video_resume_positions
+                    .get(&video_key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&7.0)
             );
             assert_eq!(
-                state.settings.video_resume_positions.get(&audio_key),
+                state
+                    .settings
+                    .video_resume_positions
+                    .get(&audio_key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&9.0)
             );
 
@@ -6453,11 +6716,17 @@ mod tests {
             assert_eq!(app.settings.details_name_width, width);
             assert_eq!(app.settings.favorites[0].id, favorite_id);
             assert_eq!(
-                app.settings.video_resume_positions.get(&video_key),
+                app.settings
+                    .video_resume_positions
+                    .get(&video_key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&18.0)
             );
             assert_eq!(
-                app.settings.video_resume_positions.get(&audio_key),
+                app.settings
+                    .video_resume_positions
+                    .get(&audio_key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&28.0)
             );
             app.settings.save();
@@ -6468,11 +6737,17 @@ mod tests {
             assert_eq!(persisted.thumb_show_resume_meter, enabled);
             assert_eq!(persisted.fullscreen_seek_direction, direction);
             assert_eq!(
-                persisted.video_resume_positions.get(&video_key),
+                persisted
+                    .video_resume_positions
+                    .get(&video_key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&18.0)
             );
             assert_eq!(
-                persisted.video_resume_positions.get(&audio_key),
+                persisted
+                    .video_resume_positions
+                    .get(&audio_key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&28.0)
             );
             let mut reopened = preferences_state_for_test(&persisted);
@@ -6491,22 +6766,34 @@ mod tests {
             assert_eq!(app.settings.thumb_show_resume_meter, enabled);
             assert_eq!(app.settings.fullscreen_seek_direction, direction);
             assert_eq!(
-                app.settings.video_resume_positions.get(&video_key),
+                app.settings
+                    .video_resume_positions
+                    .get(&video_key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&18.0)
             );
             assert_eq!(
-                app.settings.video_resume_positions.get(&audio_key),
+                app.settings
+                    .video_resume_positions
+                    .get(&audio_key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&28.0)
             );
             let after_cancel = db.load_into_settings().unwrap();
             assert_eq!(after_cancel.thumb_show_resume_meter, enabled);
             assert_eq!(after_cancel.fullscreen_seek_direction, direction);
             assert_eq!(
-                after_cancel.video_resume_positions.get(&video_key),
+                after_cancel
+                    .video_resume_positions
+                    .get(&video_key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&18.0)
             );
             assert_eq!(
-                after_cancel.video_resume_positions.get(&audio_key),
+                after_cancel
+                    .video_resume_positions
+                    .get(&audio_key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&28.0)
             );
             assert_eq!(
@@ -6576,7 +6863,10 @@ mod tests {
         let key = crate::adjustment_db::normalize_path(&path);
         for commit in [true, false] {
             let mut app = crate::app::setup_app_for_test();
-            app.settings.video_resume_positions.insert(key.clone(), 7.0);
+            app.settings.video_resume_positions.insert(
+                key.clone(),
+                crate::settings::VideoResumePosition::Media(7.0),
+            );
             let state = preferences_state_for_test(&app.settings);
             let player = crate::video::VideoPlayer::disconnected_for_test(path.clone(), 18.0);
             app.fs_cache.insert(
@@ -6588,7 +6878,13 @@ mod tests {
             );
             // 周期保存と close 時保存が共有する App の書き手を、ダイアログ表示中に実行。
             app.save_all_video_resume_positions();
-            assert_eq!(app.settings.video_resume_positions.get(&key), Some(&18.0));
+            assert_eq!(
+                app.settings
+                    .video_resume_positions
+                    .get(&key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
+                Some(&18.0)
+            );
 
             if commit {
                 let mut state = state;
@@ -6599,7 +6895,13 @@ mod tests {
                 assert!(!app.preferences_dialog_has_unsaved_changes());
                 app.discard_preferences_dialog();
             }
-            assert_eq!(app.settings.video_resume_positions.get(&key), Some(&18.0));
+            assert_eq!(
+                app.settings
+                    .video_resume_positions
+                    .get(&key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
+                Some(&18.0)
+            );
         }
     }
 
@@ -6608,9 +6910,10 @@ mod tests {
         for commit in [false, true] {
             let mut app = crate::app::setup_app_for_test();
             let key = "media/cleared-live.mkv".to_owned();
-            app.settings
-                .video_resume_positions
-                .insert(key.clone(), 18.0);
+            app.settings.video_resume_positions.insert(
+                key.clone(),
+                crate::settings::VideoResumePosition::Media(18.0),
+            );
             app.settings.video_watched_to_end.insert(key.clone());
             app.settings
                 .video_audio_track_choices
@@ -6695,9 +6998,10 @@ mod tests {
 
         let mut state = preferences_state_for_test(&app.settings);
         state.clear_video_media_memory();
-        app.settings
-            .video_resume_positions
-            .insert(key.clone(), 12.0);
+        app.settings.video_resume_positions.insert(
+            key.clone(),
+            crate::settings::VideoResumePosition::Media(12.0),
+        );
         app.settings.video_audio_track_choices.insert(
             "later.mkv".to_owned(),
             saved_audio_choice_for_preferences_test(3),

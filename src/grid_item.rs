@@ -604,6 +604,7 @@ pub enum ThumbnailState {
     /// `layout_dims` は PDF page box の 1/1000 point 寸法で、raster の丸めと独立する。
     Loaded {
         cover: crate::cover_source_scope::LoadedCoverIdentity,
+        auto_material: crate::cover_auto_material::AutoMaterial,
         tex: egui::TextureHandle,
         origin: crate::thumb_loader::ThumbLoadOrigin,
         /// 非破壊編集プレビュー由来。通常の低品質 catalog cache と異なり、
@@ -639,6 +640,7 @@ impl ThumbnailState {
             Self::raster_thumbnail_display_basis(tex.size(), source_coverage, source_dims);
         Self::Loaded {
             cover: crate::cover_source_scope::LoadedCoverIdentity::Unrotatable,
+            auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
             tex,
             origin,
             from_edit_preview,
@@ -648,6 +650,40 @@ impl ThumbnailState {
             layout_dims,
             display_basis,
         }
+    }
+
+    /// The selected area of the texture, resolved at paint time from the current angle.
+    /// Ordinary/manual thumbnails keep their existing sampler geometry.
+    pub(crate) fn tile_view_for_texture(
+        &self,
+        tex: &egui::TextureHandle,
+        angle: crate::rotation_db::Rotation,
+    ) -> crate::cover_auto_material::AutoCropView {
+        let [width, height] = tex.size();
+        let raster_dims = (width as u32, height as u32);
+        if let Self::Loaded {
+            auto_material: material @ crate::cover_auto_material::AutoMaterial::Automatic(_),
+            source_dims,
+            layout_dims,
+            ..
+        } = self
+        {
+            // The full raster can be rounded by DCT scaling / PDF rendering.
+            // Automatic geometry follows the source/page-box coordinates used
+            // by the detector; texture resolution only governs pixel quality.
+            return crate::cover_auto_material::auto_crop_view(
+                source_dims.unwrap_or(raster_dims),
+                *layout_dims,
+                *material,
+                angle,
+            );
+        }
+        crate::cover_auto_material::auto_crop_view(
+            raster_dims,
+            None,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic,
+            angle,
+        )
     }
 
     /// Accepted ordinary thumbnail facts. A sampler represents itself in Single,

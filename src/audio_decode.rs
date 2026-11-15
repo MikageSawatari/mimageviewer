@@ -163,6 +163,7 @@ struct AudioDecodeCtx {
 /// flushes this decoder, then recreates only the lightweight resampler state.
 pub(crate) struct AudioRangeDecoder {
     inner: AudioDecodeCtx,
+    timeline: crate::video::media_timeline::MediaTimeline,
     discarded_non_audio_streams: usize,
 }
 
@@ -239,10 +240,12 @@ fn open_audio_decode(
 impl AudioRangeDecoder {
     pub(crate) fn open(path: &Path, stream_index: usize) -> Result<Self, AudioDecodeOpenError> {
         let mut inner = open_audio_decode(path, stream_index)?;
+        let timeline = crate::video::media_timeline::MediaTimeline::from_input(&inner.ictx);
         let discarded_non_audio_streams =
             discard_unselected_streams(&mut inner.ictx, inner.stream_index);
         Ok(Self {
             inner,
+            timeline,
             discarded_non_audio_streams,
         })
     }
@@ -270,8 +273,9 @@ impl AudioRangeDecoder {
         {
             return Err("invalid audio decode range".to_string());
         }
-        let seek_value = start_secs * ffmpeg::ffi::AV_TIME_BASE as f64;
-        if !seek_value.is_finite() || seek_value > i64::MAX as f64 {
+        let seek_value =
+            self.timeline.media_to_raw_secs(start_secs) * ffmpeg::ffi::AV_TIME_BASE as f64;
+        if !seek_value.is_finite() || seek_value < i64::MIN as f64 || seek_value > i64::MAX as f64 {
             return Err("audio decode range is too large".to_string());
         }
 
@@ -291,6 +295,7 @@ impl AudioRangeDecoder {
 
         let tb_num = f64::from(self.inner.stream_time_base.numerator());
         let tb_den = f64::from(self.inner.stream_time_base.denominator()).max(1.0);
+        let timeline = self.timeline;
         let mut decoded = Vec::new();
         let mut first_pts_secs = None;
         let mut estimated_next_pts = None;
@@ -314,7 +319,7 @@ impl AudioRangeDecoder {
                 }
                 let frame_pts = frame
                     .timestamp()
-                    .map(|pts| pts as f64 * tb_num / tb_den)
+                    .map(|pts| timeline.raw_to_media_secs(pts as f64 * tb_num / tb_den))
                     .filter(|pts| pts.is_finite())
                     .or(estimated_next_pts)
                     .unwrap_or(start_secs);
@@ -926,6 +931,64 @@ fn append_resampled(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeline_origin_audio_range_preserves_pulse_positions() {
+        use crate::video::screenshot::timeline_test_support::{VIDEO_FIXTURES, fixture};
+        for (name, content_start) in VIDEO_FIXTURES
+            .iter()
+            .copied()
+            .chain([("encoder-delay.mp3", 0.0)])
+        {
+            let path = fixture(name);
+            let mut decoder =
+                AudioRangeDecoder::open(&path, if name.ends_with(".mp3") { 0 } else { 1 }).unwrap();
+            for pulse in [2.0, 6.0, 10.0] {
+                let start = content_start + pulse - 0.25;
+                let pcm = decoder
+                    .decode_range_to_stereo_f32(start, start + 0.75, &|| false)
+                    .unwrap();
+                let rms = |from: f64, to: f64| {
+                    let samples = &pcm.stereo_samples[(from * OUT_RATE as f64) as usize * 2
+                        ..(to * OUT_RATE as f64) as usize * 2];
+                    (samples.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>()
+                        / samples.len() as f64)
+                        .sqrt()
+                };
+                let pulse_rms = rms(0.29, 0.33);
+                let silence_rms = rms(0.05, 0.15).max(rms(0.5, 0.6));
+                assert!(
+                    pulse_rms > 0.1,
+                    "{name}: pulse {pulse} missing ({pulse_rms})"
+                );
+                assert!(
+                    silence_rms < 0.01,
+                    "{name}: pulse {pulse} shifted into silence ({silence_rms})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn timeline_origin_late_audio_range_uses_selected_track_media_axis() {
+        use crate::video::screenshot::timeline_test_support::fixture;
+        let mut decoder = AudioRangeDecoder::open(&fixture("late-audio-origin.ts"), 2).unwrap();
+        for pulse in [4.5, 6.5, 8.5] {
+            let pcm = decoder
+                .decode_range_to_stereo_f32(pulse - 0.25, pulse + 0.5, &|| false)
+                .unwrap();
+            let peak = |from: f64, to: f64| {
+                pcm.stereo_samples
+                    [(from * OUT_RATE as f64) as usize * 2..(to * OUT_RATE as f64) as usize * 2]
+                    .iter()
+                    .copied()
+                    .map(f32::abs)
+                    .fold(0.0, f32::max)
+            };
+            assert!(peak(0.29, 0.33) > 0.2, "late pulse {pulse} missing");
+            assert!(peak(0.05, 0.15) < 0.01, "late pulse {pulse} shifted");
+        }
+    }
 
     #[test]
     fn range_decoder_opens_the_requested_audio_stream() {

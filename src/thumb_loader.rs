@@ -387,12 +387,8 @@ pub(crate) fn representative_cache_key_for_policy_with_auto(
     // #pin:, or at the end of an unpinned key. In particular, |generation: is
     // not a delimiter here: it can be literal ZIP name text, and the released
     // policy function treats an unpinned generation as part of its base.
-    let split = key.find(CACHE_KEY_PIN_SUFFIX).unwrap_or(key.len());
-    let (base, pin) = key.split_at(split);
-    let without_auto = base
-        .strip_suffix("|autocrop:v1:rtl")
-        .or_else(|| base.strip_suffix("|autocrop:v1:ltr"))
-        .map(|base| format!("{base}{pin}"));
+    let without_auto =
+        representative_auto_crop_key_parts(key).map(|(base, _, pin)| format!("{base}{pin}"));
     let mut normalized = released_representative_cache_key_for_policy(
         without_auto.as_deref().unwrap_or(key),
         policy,
@@ -401,9 +397,59 @@ pub(crate) fn representative_cache_key_for_policy_with_auto(
         let split = normalized
             .find(CACHE_KEY_PIN_SUFFIX)
             .unwrap_or(normalized.len());
-        normalized.insert_str(split, &format!("|autocrop:{}", auto.suffix()));
+        normalized.insert_str(
+            split,
+            &format!("|autocrop:{}", auto.suffix_for_key(&normalized)),
+        );
     }
     normalized
+}
+
+/// Recognize only a representative's derived suffix at the builder's position.
+/// Returns the base, exact token, and pinned tail. Ordinary ZIP page names may
+/// contain every delimiter here and must never be interpreted as derived keys.
+pub(crate) fn representative_auto_crop_key_parts(key: &str) -> Option<(&str, &str, &str)> {
+    if !is_representative_cache_key(key) {
+        return None;
+    }
+    let split = key.find(CACHE_KEY_PIN_SUFFIX).unwrap_or(key.len());
+    let (base, pin) = key.split_at(split);
+    for token in [
+        "|autocrop:v3:rtl",
+        "|autocrop:v3:ltr",
+        "|autocrop:v3f:rtl",
+        "|autocrop:v3f:ltr",
+        "|autocrop:v2:rtl",
+        "|autocrop:v2:ltr",
+        "|autocrop:v2f:rtl",
+        "|autocrop:v2f:ltr",
+        "|autocrop:v1:rtl",
+        "|autocrop:v1:ltr",
+    ] {
+        // Folder-only versions are emitted only for folder representatives. On another kind they
+        // remains literal source text, just like any unknown derived token.
+        if (token.starts_with("|autocrop:v3f:") || token.starts_with("|autocrop:v2f:"))
+            && !key.starts_with(CACHE_KEY_FOLDER)
+        {
+            continue;
+        }
+        if let Some(base) = base.strip_suffix(token) {
+            return Some((base, token, pin));
+        }
+    }
+    None
+}
+
+/// Only K2 may reuse the old, already-cropped child pixels. Keep the same
+/// unambiguous suffix position as the builder, including pinned EPUB tails.
+fn legacy_auto_child_keys(key: &str) -> Option<[String; 2]> {
+    let (base, token, tail) = representative_auto_crop_key_parts(key)?;
+    let binding = token.strip_prefix("|autocrop:v3:")?;
+    let other = if binding == "rtl" { "ltr" } else { "rtl" };
+    Some([
+        format!("{base}|autocrop:v1:{binding}{tail}"),
+        format!("{base}|autocrop:v1:{other}{tail}"),
+    ])
 }
 
 // Keep the released (c4e92e5df) policy algorithm intact. Auto normalization is
@@ -751,6 +797,7 @@ pub enum ThumbMsgPayload {
 }
 
 pub struct ThumbPixels {
+    pub auto_material: crate::cover_auto_material::AutoMaterial,
     pub cover: CoverIdentity,
     pub image: egui::ColorImage,
     pub origin: ThumbLoadOrigin,
@@ -762,6 +809,18 @@ pub struct ThumbPixels {
 }
 
 impl ThumbMsg {
+    pub fn with_auto_material(
+        mut self,
+        material: crate::cover_auto_material::AutoMaterial,
+    ) -> Self {
+        match &mut self.payload {
+            ThumbMsgPayload::Pixels(p)
+            | ThumbMsgPayload::SourcePixels(p)
+            | ThumbMsgPayload::ProvisionalPixels(p) => p.auto_material = material,
+            _ => {}
+        }
+        self
+    }
     pub fn with_cover(mut self, cover: CoverIdentity) -> Self {
         match &mut self.payload {
             ThumbMsgPayload::Pixels(p)
@@ -800,6 +859,7 @@ impl ThumbMsg {
             ThumbMsgPayload::Finalized
         } else if let Some(image) = image {
             ThumbMsgPayload::Pixels(ThumbPixels {
+                auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 cover: CoverIdentity::Unrotatable,
                 image,
                 origin,
@@ -1008,10 +1068,36 @@ pub(crate) fn cover_identity_for_location(
         .map_or(CoverIdentity::Unrotatable, CoverIdentity::Page)
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedAutoCover {
+    pub(crate) identity: crate::cover_auto_crop::AutoCropIdentity,
+    pub(crate) input: AutoCoverInput,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum AutoCoverInput {
+    Container,
+    FolderPages(Arc<[std::path::PathBuf]>),
+}
+
+/// Source-resolution stops, shared by the worker and range dialog. Keep this
+/// alongside the resolved input, rather than inferring a cause from None in UI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AutoCoverSkip {
+    Manual { auto_eligible_after_clear: bool },
+    Off,
+    PinnedFolder,
+    ChildRepresentative,
+    FolderDisabled,
+    DirectRar,
+    NestedZip,
+    Unsupported,
+}
+
 pub(crate) struct ResolvedRead {
     pub(crate) location: ReadLocation,
     pub(crate) cover_crop: Option<crate::folder_thumb_pins::CoverCrop>,
-    pub(crate) auto_cover_crop: Option<crate::cover_auto_crop::AutoCropIdentity>,
+    pub(crate) auto_cover_crop: Result<ResolvedAutoCover, AutoCoverSkip>,
     pub(crate) folder_selection_proof: Option<crate::catalog::FolderSelectionProof>,
     pub(crate) preloaded_zip_bytes: Option<Vec<u8>>,
     pub(crate) child_selection: Option<CachedChildSelection>,
@@ -1025,7 +1111,7 @@ impl ResolvedRead {
         Self {
             location: ReadLocation::Unreadable { cancelled },
             cover_crop: None,
-            auto_cover_crop: None,
+            auto_cover_crop: Err(AutoCoverSkip::Unsupported),
             folder_selection_proof: None,
             preloaded_zip_bytes: None,
             child_selection: None,
@@ -1090,6 +1176,7 @@ pub(crate) fn resolve_read_after_cache_miss(
         folder_cover_crop,
         cached_pinned_folder_thumb,
         folder_selection_proof,
+        folder_auto_pages,
     ) = if is_folder_thumb {
         let t_resolve = std::time::Instant::now();
         let (resolution, proof) = select_folder_thumb_image_with_policy_and_auto(
@@ -1112,8 +1199,23 @@ pub(crate) fn resolve_read_after_cache_miss(
             ));
         }
         match resolution {
-            Some(FolderThumbResolution::Image(path, crop)) => (Some(path), crop, None, proof),
-            Some(FolderThumbResolution::CachedPinned(cached)) => (None, None, Some(cached), proof),
+            Some(FolderThumbResolution::Image(path, crop, origin)) => {
+                let pages = match origin {
+                    FolderImageOrigin::Direct { directory, pages }
+                        if crate::path_key::normalize_keep_drive(&directory)
+                            == crate::path_key::normalize_keep_drive(&req.path)
+                            && req.folder_thumb_provenance
+                                != Some(crate::catalog::FolderThumbProvenance::Seeded) =>
+                    {
+                        Some(pages)
+                    }
+                    _ => None,
+                };
+                (Some(path), crop, None, proof, pages)
+            }
+            Some(FolderThumbResolution::CachedPinned(cached)) => {
+                (None, None, Some(cached), proof, None)
+            }
             None => {
                 return ResolvedRead::unreadable(
                     req,
@@ -1122,7 +1224,7 @@ pub(crate) fn resolve_read_after_cache_miss(
             }
         }
     } else {
-        (None, None, None, None)
+        (None, None, None, None, None)
     };
     let load_path: &Path = resolved_folder_image.as_deref().unwrap_or(&req.path);
 
@@ -1243,17 +1345,18 @@ pub(crate) fn resolve_read_after_cache_miss(
     } else {
         ReadLocation::File(load_path.to_path_buf())
     };
+    let cover_crop = folder_cover_crop.or(req.cover_crop);
+    let auto_cover_crop = resolve_auto_cover_input(
+        req,
+        &location,
+        cover_crop,
+        is_folder_thumb,
+        folder_auto_pages,
+    );
     ResolvedRead {
         location,
-        cover_crop: folder_cover_crop.or(req.cover_crop),
-        auto_cover_crop: req.auto_cover_crop.filter(|_| {
-            !is_folder_thumb
-                && !req
-                    .cache_key_override
-                    .as_deref()
-                    .is_some_and(|key| key.starts_with(CACHE_KEY_FOLDER))
-                && folder_cover_crop.or(req.cover_crop).is_none()
-        }),
+        cover_crop,
+        auto_cover_crop,
         folder_selection_proof,
         preloaded_zip_bytes,
         child_selection: cached_pinned_folder_thumb
@@ -1267,6 +1370,81 @@ pub(crate) fn resolve_read_after_cache_miss(
         effective_stamp: (req.mtime, req.file_size),
         needs_heavy_io,
     }
+}
+
+fn resolve_auto_cover_input(
+    req: &LoadRequest,
+    location: &ReadLocation,
+    crop: Option<crate::folder_thumb_pins::CoverCrop>,
+    is_folder_thumb: bool,
+    folder_pages: Option<Arc<[std::path::PathBuf]>>,
+) -> Result<ResolvedAutoCover, AutoCoverSkip> {
+    let folder = is_folder_thumb
+        || req
+            .cache_key_override
+            .as_deref()
+            .is_some_and(|key| key.starts_with(CACHE_KEY_FOLDER));
+    if crop.is_some() {
+        return Err(AutoCoverSkip::Manual {
+            // Clearing keeps the page pin. Folder pins do not become automatic.
+            auto_eligible_after_clear: !folder && automatic_container_location(location).is_ok(),
+        });
+    }
+    if folder && req.folder_thumb_provenance == Some(crate::catalog::FolderThumbProvenance::Seeded)
+    {
+        return Err(AutoCoverSkip::PinnedFolder);
+    }
+    let identity = req.auto_cover_crop.ok_or(AutoCoverSkip::Off)?;
+    let input = if folder {
+        if !identity.folders {
+            return Err(AutoCoverSkip::FolderDisabled);
+        }
+        AutoCoverInput::FolderPages(folder_pages.ok_or(AutoCoverSkip::ChildRepresentative)?)
+    } else {
+        automatic_container_location(location)?;
+        AutoCoverInput::Container
+    };
+    Ok(ResolvedAutoCover { identity, input })
+}
+
+fn automatic_container_location(location: &ReadLocation) -> Result<(), AutoCoverSkip> {
+    match location {
+        ReadLocation::PdfPage { .. } => Ok(()),
+        ReadLocation::ArchiveEntry { archive, entry } => {
+            automatic_container_source(archive, Some(entry), None)
+        }
+        _ => Err(AutoCoverSkip::Unsupported),
+    }
+}
+
+// Shared by source resolution and the decoder's last eligibility check.
+fn automatic_container_source(
+    path: &Path,
+    entry: Option<&str>,
+    page: Option<u32>,
+) -> Result<(), AutoCoverSkip> {
+    if page.is_some() {
+        return Ok(());
+    }
+    let entry = entry.ok_or(AutoCoverSkip::Unsupported)?;
+    if crate::rar_loader::is_rar_path(path) {
+        return Err(AutoCoverSkip::DirectRar);
+    }
+    if crate::zip_loader::split_nested_zip_path(entry).len() != 1 {
+        return Err(AutoCoverSkip::NestedZip);
+    }
+    if crate::raw_format::is_raw_path(Path::new(entry))
+        || matches!(
+            crate::file_type_visibility::category_for_extension(&ext_lower(Path::new(entry))),
+            Some(
+                crate::file_type_visibility::FileTypeCategory::Video
+                    | crate::file_type_visibility::FileTypeCategory::Audio
+            )
+        )
+    {
+        return Err(AutoCoverSkip::Unsupported);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Default)]
@@ -1806,7 +1984,7 @@ pub(crate) fn remote_raw_thumbnail_requirement(
         )
         .0
         {
-            Some(FolderThumbResolution::Image(selected, _)) => path = selected,
+            Some(FolderThumbResolution::Image(selected, _, _)) => path = selected,
             Some(FolderThumbResolution::CachedPinned(cached)) => {
                 path = cached.source_path;
                 cached_pin_source = true;
@@ -2094,18 +2272,13 @@ pub fn apply_exif_orientation_from_bytes(
 }
 
 fn read_exif_orientation(path: &std::path::Path) -> u16 {
-    // まず rexif でファイルから EXIF を読む (JPEG, PNG, TIFF 等)
-    if let Some(orient) = read_exif_orientation_from_file(path) {
-        return orient;
-    }
+    file_orientation_or_wic(read_exif_orientation_from_file(path), path)
+}
 
-    // rexif が対応しない RAW 形式 (ORF, CR2, NEF 等) は
-    // WIC のメタデータクエリリーダーで Orientation を取得する
-    if let Some(orient) = crate::wic_decoder::read_wic_orientation(path) {
-        return orient;
-    }
-
-    1 // デフォルト: 回転なし
+/// The file display rule, shared with bounded folder-page sampling. A valid
+/// rexif value (including 1) wins; only an absent/invalid value queries WIC.
+pub(crate) fn file_orientation_or_wic(orientation: Option<u16>, path: &Path) -> u16 {
+    orientation.unwrap_or_else(|| crate::wic_decoder::read_wic_orientation(path).unwrap_or(1))
 }
 
 /// ファイルから Orientation タグだけを読む。
@@ -2128,15 +2301,16 @@ fn read_exif_orientation_from_file(path: &std::path::Path) -> Option<u16> {
 }
 
 pub(crate) fn read_exif_orientation_from_bytes(bytes: &[u8]) -> u16 {
-    rexif::parse_buffer(bytes)
-        .ok()
-        .and_then(|exif| {
-            exif.entries
-                .iter()
-                .find(|e| e.ifd.tag == 274)
-                .and_then(orientation_from_rexif_entry)
-        })
-        .unwrap_or(1)
+    read_exif_orientation_from_bytes_if_present(bytes).unwrap_or(1)
+}
+
+pub(crate) fn read_exif_orientation_from_bytes_if_present(bytes: &[u8]) -> Option<u16> {
+    rexif::parse_buffer(bytes).ok().and_then(|exif| {
+        exif.entries
+            .iter()
+            .find(|e| e.ifd.tag == 274)
+            .and_then(orientation_from_rexif_entry)
+    })
 }
 
 fn orientation_from_rexif_entry(entry: &rexif::ExifEntry) -> Option<u16> {
@@ -2309,6 +2483,66 @@ fn cover_crop_decode_target(
     ((f64::from(target_px) * width.max(height) / crop_edge).ceil() as u32).min(limit)
 }
 
+fn uncapped_material_raster_target(
+    dimensions: (u32, u32),
+    material: crate::cover_auto_material::AutoMaterial,
+    target: u32,
+) -> u32 {
+    let crate::cover_auto_material::AutoMaterial::Automatic(results) = material else {
+        return target;
+    };
+    results
+        .crops()
+        .into_iter()
+        .flatten()
+        .map(|crop| {
+            cover_crop_decode_target(
+                target,
+                (f64::from(dimensions.0), f64::from(dimensions.1)),
+                crop,
+                u32::MAX,
+            )
+        })
+        .max()
+        .unwrap_or(target)
+}
+
+fn material_raster_target(
+    dimensions: (u32, u32),
+    material: crate::cover_auto_material::AutoMaterial,
+    target: u32,
+) -> u32 {
+    match material {
+        crate::cover_auto_material::AutoMaterial::Automatic(results)
+            if results.crops().iter().any(Option::is_some) =>
+        {
+            let mut whole_target =
+                uncapped_material_raster_target(dimensions, material, target).min(4096);
+            // The existing aspect-accurate fitter can choose a slightly smaller
+            // integer raster than the requested long edge. Budget against its
+            // actual output, so that adjustment cannot shrink an ROI below the
+            // display/storage target. This is only an automatic-material budget;
+            // ordinary and manual thumbnails retain their released sizing.
+            while whole_target < 4096 {
+                let (width, height) = crate::fast_resize::aspect_accurate_fit_dimensions(
+                    (u32::MAX, u32::MAX),
+                    (whole_target, whole_target),
+                    dimensions,
+                );
+                if results.crops().into_iter().flatten().all(|crop| {
+                    let (_, _, width, height) = crop.pixel_bounds(width, height);
+                    width.max(height) >= target
+                }) {
+                    break;
+                }
+                whole_target += 1;
+            }
+            whole_target
+        }
+        _ => target,
+    }
+}
+
 fn apply_cover_crop(
     image: image::DynamicImage,
     source_dims: Option<(u32, u32)>,
@@ -2369,6 +2603,28 @@ fn decode_jpeg_turbo_scaled_from_bytes_with_crop(
     target_px: u32,
     crop: Option<crate::folder_thumb_pins::CoverCrop>,
 ) -> Result<(image::DynamicImage, ScaleStats), DctDecodeError> {
+    decode_jpeg_turbo_scaled_with_axis(data, target_px, crop, false)
+}
+
+fn decode_jpeg_turbo_scaled_with_axis(
+    data: &[u8],
+    target_px: u32,
+    crop: Option<crate::folder_thumb_pins::CoverCrop>,
+    analysis_height: bool,
+) -> Result<(image::DynamicImage, ScaleStats), DctDecodeError> {
+    let orientation = (analysis_height || crop.is_some())
+        .then(|| read_exif_orientation_from_bytes(data))
+        .unwrap_or(1);
+    decode_jpeg_turbo_scaled_with_orientation(data, target_px, crop, analysis_height, orientation)
+}
+
+fn decode_jpeg_turbo_scaled_with_orientation(
+    data: &[u8],
+    target_px: u32,
+    crop: Option<crate::folder_thumb_pins::CoverCrop>,
+    analysis_height: bool,
+    orientation: u16,
+) -> Result<(image::DynamicImage, ScaleStats), DctDecodeError> {
     use DctDecodeError::*;
     use turbojpeg::{Decompressor, Image, PixelFormat, ScalingFactor};
 
@@ -2380,7 +2636,7 @@ fn decode_jpeg_turbo_scaled_from_bytes_with_crop(
     // lossless JPEG は `set_scaling_factor != 1/1` がエラー。scale=1/1 強制で
     // TurboJPEG full decode を維持する (None で fallback すると遅くなるため)。
     let target_px = crop.map_or(target_px, |crop| {
-        let (width, height) = if (5..=8).contains(&read_exif_orientation_from_bytes(data)) {
+        let (width, height) = if (5..=8).contains(&orientation) {
             (header.height, header.width)
         } else {
             (header.width, header.height)
@@ -2396,7 +2652,15 @@ fn decode_jpeg_turbo_scaled_from_bytes_with_crop(
     let m = if header.is_lossless {
         8
     } else {
-        let src_max = (header.width as u32).max(header.height as u32);
+        let src_max = if analysis_height {
+            if (5..=8).contains(&orientation) {
+                header.width as u32
+            } else {
+                header.height as u32
+            }
+        } else {
+            (header.width as u32).max(header.height as u32)
+        };
         pick_dct_scale_num(src_max, target_px)
     };
     let scale = ScalingFactor::new(m as usize, 8);
@@ -2519,11 +2783,28 @@ fn decode_zip_chain(
     cancel: Option<Arc<AtomicBool>>,
     decode_source: &mut crate::stats::DecodeSource,
     orientation: &mut crate::image_decode::Orientation,
+    auto_analysis: Option<&mut Option<CoverAutoAnalysis>>,
 ) -> image::ImageResult<image::DynamicImage> {
     let source = crate::image_decode::Source::Bytes {
         bytes,
         hint: entry_name,
     };
+    if let Some(owner) = auto_analysis
+        && matches!(
+            image::guess_format(bytes),
+            Ok(image::ImageFormat::Png | image::ImageFormat::WebP)
+        )
+    {
+        // Own metadata and the initial full decode together. The same upright
+        // raster goes to the index, material, and detector; no metadata reread.
+        let analysis = decode_cover_auto_analysis_image(source, None, cancel.as_ref())
+            .map_err(|error| image::ImageError::IoError(std::io::Error::other(error)))?;
+        *decode_source = analysis.decoder;
+        *orientation = crate::image_decode::Orientation::Applied;
+        let image = analysis.image.clone();
+        *owner = Some(analysis);
+        return Ok(image);
+    }
     let decoded = if is_susie_only_ext(&ext_lower_str(entry_name)) {
         crate::image_decode::susie(source, priority, cancel.clone())
             .map_err(image::ImageError::IoError)?
@@ -2645,6 +2926,7 @@ fn send_cached_cover(
             input_seq,
             items_gen,
         )
+        .with_auto_material(entry.auto_material)
         .with_cover(entry.cover)
         .with_request_id(request_id),
     );
@@ -2751,6 +3033,7 @@ fn send_pinned_only_cached(
                         req.items_gen,
                     )
                     .with_request_id(req.request_id)
+                    .with_auto_material(entry.auto_material)
                     .with_cover(entry.cover.clone())
                     .provisional_pixels(),
                 );
@@ -3039,6 +3322,7 @@ fn send_pinned_child_folder_cached(
             req.input_seq,
             req.items_gen,
         )
+        .with_auto_material(entry.auto_material)
         .with_cover(entry.cover)
         .with_request_id(req.request_id),
     );
@@ -3242,6 +3526,7 @@ fn process_load_request_with_provider(
             &should_cancel,
         ) {
             Ok(Some(pixels)) => ThumbMsgPayload::Pixels(ThumbPixels {
+                auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 cover: CoverIdentity::Unrotatable,
                 image: pixels.image,
                 origin: pixels.origin,
@@ -3345,7 +3630,7 @@ fn process_load_request_with_provider(
             ),
             None,
             req.cover_crop,
-            req.auto_cover_crop,
+            None, // RAW development never enters automatic cover detection.
             req.zip_dir_prefix.as_deref(),
         );
         return;
@@ -3721,6 +4006,7 @@ fn process_load_request_with_provider(
                         req.input_seq,
                         req.items_gen,
                     )
+                    .with_auto_material(entry.auto_material)
                     .with_cover(entry.cover.clone())
                     .with_request_id(req.request_id),
                 );
@@ -3851,7 +4137,7 @@ fn process_load_request_with_provider(
     };
     debug_assert_eq!(resolved.effective_stamp, (req.mtime, req.file_size));
     let cover_crop = resolved.cover_crop;
-    let auto_cover_crop = resolved.auto_cover_crop;
+    let auto_cover_crop = resolved.auto_cover_crop.ok();
     let needs_heavy_io = resolved.needs_heavy_io;
     let folder_selection_proof = resolved.folder_selection_proof;
     let cached_pinned_folder_thumb = resolved.cached_child;
@@ -3964,12 +4250,14 @@ fn process_load_request_with_provider(
                 &cached.webp_data,
                 folder_selection_proof.as_ref(),
                 &cover,
+                cached.auto_material,
             ) {
                 Ok(true) => {
                     if let Ok(mut map) = cache_map.write() {
                         map.insert(
                             filename.to_owned(),
                             crate::catalog::CacheEntry {
+                                auto_material: cached.auto_material,
                                 cover: cover.clone(),
                                 mtime: req.mtime,
                                 file_size: req.file_size,
@@ -4013,6 +4301,7 @@ fn process_load_request_with_provider(
                 req.input_seq,
                 req.items_gen,
             )
+            .with_auto_material(cached.auto_material)
             .with_cover(cover)
             .with_request_id(req.request_id),
         );
@@ -4880,11 +5169,23 @@ enum FolderThumbResolution {
     Image(
         std::path::PathBuf,
         Option<crate::folder_thumb_pins::CoverCrop>,
+        FolderImageOrigin,
     ),
     CachedPinned(CachedPinnedFolderThumb),
 }
 
+/// A directory listing belongs to the directory that actually selected this
+/// image, never to a parent that reached it recursively or through a pin.
+enum FolderImageOrigin {
+    Direct {
+        directory: std::path::PathBuf,
+        pages: Arc<[std::path::PathBuf]>,
+    },
+    Pinned,
+}
+
 struct CachedPinnedFolderThumb {
+    auto_material: crate::cover_auto_material::AutoMaterial,
     cover: CoverIdentity,
     image: egui::ColorImage,
     webp_data: Vec<u8>,
@@ -5055,7 +5356,7 @@ impl FolderResolveContext<'_> {
                 hook.token.store(true, Ordering::Relaxed);
             }
         }
-        let (state, stamp) = match snapshot {
+        let (mut state, mut stamp) = match snapshot {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 crate::logger::log(format!(
@@ -5066,6 +5367,33 @@ impl FolderResolveContext<'_> {
                 return None;
             }
         };
+        let mut legacy_key = None;
+        if stamp.is_none()
+            && let Some(old_keys) = legacy_auto_child_keys(key)
+        {
+            for old_key in old_keys {
+                self.record_dependency(directory, state.clone());
+                match self
+                    .catalogs
+                    .get(directory)?
+                    .as_ref()?
+                    .load_stamp_snapshot(&old_key)
+                {
+                    Ok((old_state, old_stamp)) => {
+                        state = old_state;
+                        stamp = old_stamp;
+                        legacy_key = Some(old_key);
+                        if stamp == Some((expected_mtime, expected_size)) {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        crate::logger::log(format!("K2 v1 compatibility lookup failed: {error}"));
+                        return None;
+                    }
+                }
+            }
+        }
         self.record_dependency(directory, state);
         if self.cancelled() || stamp != Some((expected_mtime, expected_size)) {
             return None;
@@ -5074,7 +5402,7 @@ impl FolderResolveContext<'_> {
             .catalogs
             .get(directory)?
             .as_ref()?
-            .load_one(key)
+            .load_one(legacy_key.as_deref().unwrap_or(key))
             .ok()??;
         if (entry.mtime, entry.file_size) != (expected_mtime, expected_size) {
             return None;
@@ -5124,6 +5452,11 @@ impl FolderResolveContext<'_> {
         };
         let image = crate::catalog::decode_thumb_to_color_image(&entry.jpeg_data)?;
         Some(CachedPinnedFolderThumb {
+            auto_material: if legacy_key.is_some() {
+                crate::cover_auto_material::AutoMaterial::LegacyV1
+            } else {
+                entry.auto_material
+            },
             cover: entry.cover,
             image,
             webp_data: entry.jpeg_data,
@@ -5449,7 +5782,7 @@ fn select_folder_thumb_image_with_policy_and_auto(
     );
     // pin 経路の切り分け用診断ログ (= 最上位 entry 点のみ。再帰ステップ内側は出さない)
     let result_label = match result.as_ref() {
-        Some(FolderThumbResolution::Image(path, _)) => path.display().to_string(),
+        Some(FolderThumbResolution::Image(path, _, _)) => path.display().to_string(),
         Some(FolderThumbResolution::CachedPinned(cached)) => {
             format!("<cached-pin:{}>", cached.cache_key)
         }
@@ -5465,7 +5798,7 @@ fn select_folder_thumb_image_with_policy_and_auto(
     ));
     let proof = result.as_ref().and_then(|resolution| {
         let (path, archive_row_key, epub_stamp) = match resolution {
-            FolderThumbResolution::Image(path, _) => (path.as_path(), None, None),
+            FolderThumbResolution::Image(path, _, _) => (path.as_path(), None, None),
             FolderThumbResolution::CachedPinned(cached) => (
                 cached.source_path.as_path(),
                 Some(cached.cache_key.clone()),
@@ -5636,7 +5969,29 @@ fn resolve_folder_thumb_image_inner(
             .collect();
         keyed_images
             .sort_by(|(_, a_mt, ak), (_, b_mt, bk)| sort.compare_name_keys(ak, *a_mt, bk, *b_mt));
-        return Some(FolderThumbResolution::Image(keyed_images.remove(0).0, None));
+        let mut pages: Vec<_> = if context.auto_cover_crop.is_some_and(|auto| auto.folders) {
+            keyed_images
+                .iter()
+                .map(|(path, _, _)| path.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        pages.sort_by_cached_key(|path| {
+            crate::filename_sort::FileNameSortKey::new(
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(""),
+            )
+        });
+        return Some(FolderThumbResolution::Image(
+            keyed_images.remove(0).0,
+            None,
+            FolderImageOrigin::Direct {
+                directory: folder.to_owned(),
+                pages: pages.into(),
+            },
+        ));
     }
     if remaining_depth == 0 {
         return None;
@@ -5796,6 +6151,7 @@ fn resolve_folder_thumb_image_inner(
                         return Some(FolderThumbResolution::Image(
                             pin.abs_path.clone(),
                             leaf.cover_crop,
+                            FolderImageOrigin::Pinned,
                         ));
                     }
                     ResolvedKind::Folder => {
@@ -6063,7 +6419,7 @@ pub(crate) fn load_one_cached(
     cover: CoverIdentity,
     legacy_fallback: Option<crate::catalog::CacheEntry>,
     cover_crop: Option<crate::folder_thumb_pins::CoverCrop>,
-    auto_cover_crop: Option<crate::cover_auto_crop::AutoCropIdentity>,
+    auto_cover_crop: Option<ResolvedAutoCover>,
     auto_zip_prefix: Option<&str>,
 ) {
     let catalog = save_target.fixed_catalog();
@@ -6071,6 +6427,15 @@ pub(crate) fn load_one_cached(
     // `path` is now its selected image. Diagnostics never register another owner.
     #[cfg(all(windows, any(test, feature = "test-script")))]
     let diagnostic_key = deferred_req.as_ref().and_then(diagnostic_request_key);
+    // Capture before the RAW continuation can consume deferred_req. Folder
+    // source resolution has replaced path with its selected leaf.
+    let auto_book_display = auto_cover_crop.as_ref().map(|_| {
+        deferred_req
+            .as_ref()
+            .map_or(path, |req| req.path.as_path())
+            .display()
+            .to_string()
+    });
     let total_started = std::time::Instant::now();
     let total_cycles_started = crate::perf::stall::TotalCycles::start();
     // カタログキー (保存・参照で一致させる) と表示名 (ログ用) を分離。
@@ -6113,6 +6478,7 @@ pub(crate) fn load_one_cached(
     let mut decoded_orientation = crate::image_decode::Orientation::NeedsExif;
     let mut dct_stats: Option<ScaleStats> = None;
     let mut auto_jpeg_bytes: Option<Vec<u8>> = None;
+    let mut predecoded_auto_analysis = None;
     // PDF thumbnail の整数丸め後 raster ではなく、PDFium が読んだ page box の
     // 縦横比を catalog に残す。値は 1/1000 point の固定小数点レイアウト寸法。
     let mut pdf_layout_dims: Option<(u32, u32)> = None;
@@ -6406,6 +6772,9 @@ pub(crate) fn load_one_cached(
             })
             .map_err(|e| image::ImageError::IoError(e))
     } else if let Some(bytes) = verified_source_bytes {
+        if auto_cover_crop.is_some() {
+            auto_jpeg_bytes = Some(bytes.clone());
+        }
         byte_orientation = read_exif_orientation_from_bytes(&bytes);
         let hint = path
             .file_name()
@@ -6435,6 +6804,9 @@ pub(crate) fn load_one_cached(
                     cancel.cloned(),
                     &mut decode_source,
                     &mut decoded_orientation,
+                    auto_cover_crop
+                        .as_ref()
+                        .map(|_| &mut predecoded_auto_analysis),
                 ),
             }
         } else {
@@ -6445,6 +6817,9 @@ pub(crate) fn load_one_cached(
                 cancel.cloned(),
                 &mut decode_source,
                 &mut decoded_orientation,
+                auto_cover_crop
+                    .as_ref()
+                    .map(|_| &mut predecoded_auto_analysis),
             )
         }
     } else if let Some(entry_name) = zip_entry {
@@ -6489,6 +6864,9 @@ pub(crate) fn load_one_cached(
                             cancel.cloned(),
                             &mut decode_source,
                             &mut decoded_orientation,
+                            auto_cover_crop
+                                .as_ref()
+                                .map(|_| &mut predecoded_auto_analysis),
                         ),
                     }
                 } else {
@@ -6499,14 +6877,29 @@ pub(crate) fn load_one_cached(
                         cancel.cloned(),
                         &mut decode_source,
                         &mut decoded_orientation,
+                        auto_cover_crop
+                            .as_ref()
+                            .map(|_| &mut predecoded_auto_analysis),
                     )
                 };
-                if auto_cover_crop.is_some() && dct_stats.is_some() {
+                if auto_cover_crop.is_some() {
                     auto_jpeg_bytes = Some(bytes);
                 }
                 decoded
             }
         }
+    } else if auto_cover_crop.is_some() && ["png", "webp"].contains(&ext_lower(path).as_str()) {
+        // Capture decoder metadata on the same initial full decode/file handle.
+        // Later analysis reuses this owner instead of opening the file for G1.
+        decode_cover_auto_analysis_image(crate::image_decode::Source::Path(path), None, cancel)
+            .map(|analysis| {
+                decoded_orientation = crate::image_decode::Orientation::Applied;
+                decode_source = analysis.decoder;
+                let image = analysis.image.clone();
+                predecoded_auto_analysis = Some(analysis);
+                image
+            })
+            .map_err(|error| image::ImageError::IoError(std::io::Error::other(error)))
     } else if is_susie_only_ext(&ext_lower(path)) {
         // Susie 専用拡張子の高速パス: image::open + WIC をスキップして直接 Susie へ。
         // MAG / PI / PIC / Q4 / MAKI 等で 1 枚あたり約 5ms 短縮。
@@ -6736,110 +7129,180 @@ pub(crate) fn load_one_cached(
         source_dims.unwrap_or_else(|| (img.width(), img.height())),
     );
     let offer_raster = offer_started.map(|at| at.finish()).unwrap_or_default();
-    #[cfg(test)]
-    cover_auto_eval_decode::capture(&img, source_dims, dct_stats, orientation);
     let mut img = img;
     let mut source_dims = source_dims;
-    let mut effective_crop = cover_crop;
+    let mut auto_material = crate::cover_auto_material::AutoMaterial::NotAutomatic;
     if let Some(auto) = auto_cover_crop.filter(|_| cover_crop.is_none()) {
         let started = std::time::Instant::now();
+        let book_display = auto_book_display.as_deref().unwrap_or("?");
         let native = layout_dims
             .or(source_dims)
             .unwrap_or((img.width(), img.height()));
         let supported = !is_raw
-            && (pdf_page.is_some()
-                || zip_entry.is_some_and(|entry| {
-                    crate::zip_loader::split_nested_zip_path(entry).len() == 1
-                        && !matches!(
-                            crate::file_type_visibility::category_for_extension(&ext_lower(
-                                Path::new(entry)
-                            )),
-                            Some(
-                                crate::file_type_visibility::FileTypeCategory::Video
-                                    | crate::file_type_visibility::FileTypeCategory::Audio
-                            )
-                        )
-                        && !path
-                            .extension()
-                            .and_then(|ext| ext.to_str())
-                            .is_some_and(|ext| ext.eq_ignore_ascii_case("rar"))
-                }));
+            && (matches!(auto.input, AutoCoverInput::FolderPages(_))
+                || automatic_container_source(path, zip_entry, pdf_page).is_ok());
+        let pdf_priority = if priority {
+            crate::pdf_loader::JobPriority::HighNormal
+        } else {
+            crate::pdf_loader::JobPriority::Normal
+        };
         let mut reason = "unsupported_source";
-        if supported && native.1 > 0 && f64::from(native.0) / f64::from(native.1) >= 0.85 {
-            let aspect = if let Some(page) = pdf_page {
-                cover_pdf_page_sizes(path, epub_read, pdf_password)
-                    .ok()
-                    .and_then(|sizes| {
-                        crate::cover_auto_sample::page_aspect_from_sizes(&sizes, page as usize)
-                    })
-            } else {
-                zip_entry.and_then(|entry| {
-                    crate::cover_auto_sample::sample_zip_page_aspect(path, entry, auto_zip_prefix)
-                })
-            };
-            let raster = crate::cover_auto_crop::analysis_raster(&img);
-            match crate::cover_auto_crop::cover_auto_crop(&raster, native, aspect, auto.binding) {
-                Ok(crop) => {
-                    effective_crop = Some(crop);
-                    reason = "cropped";
-                }
-                Err(decline) => {
-                    reason = decline.as_str();
-                }
-            }
-        } else if supported {
-            reason = crate::cover_auto_crop::AutoCropDecline::RawAspectGate.as_str();
-        }
-        if let Some(crop) = effective_crop {
-            let (_, _, width, height) = crop.pixel_bounds(img.width(), img.height());
-            if width.max(height) < display_px {
-                if let Some(bytes) = auto_jpeg_bytes.as_deref() {
-                    let target = thumbnail_jpeg_decode_target(display_px, thumb_px);
-                    match decode_jpeg_turbo_scaled_from_bytes_with_crop(bytes, target, Some(crop)) {
-                        Ok((decoded, stats)) => {
-                            img = apply_orientation(decoded, orientation);
-                            source_dims = Some(stats.source_dims_after_exif(orientation));
-                            dct_stats = Some(stats);
-                        }
-                        Err(error) => crate::logger::log(format!(
-                            "auto cover crop larger JPEG decode failed: {error:?}"
-                        )),
-                    }
-                } else if let Some(page) = pdf_page {
-                    let target = cover_crop_decode_target(
-                        thumbnail_pdf_render_target(display_px),
-                        (f64::from(native.0), f64::from(native.1)),
-                        crop,
-                        crate::pdf_loader::PDF_RENDER_MAX_LONG_PX,
-                    );
-                    let priority = if priority {
-                        crate::pdf_loader::JobPriority::HighNormal
-                    } else {
-                        crate::pdf_loader::JobPriority::Normal
-                    };
-                    match render_cover_pdf(
+        if supported {
+            // Source/decode worker only. Cache hits and CacheOnly never reach
+            // this bounded page sampling or open the rotation store.
+            let sample_rotations = crate::cover_auto_sample::SampleRotations::for_worker();
+            let sample = match &auto.input {
+                AutoCoverInput::FolderPages(pages) => {
+                    crate::cover_auto_sample::sample_folder_pages_with_rotations(
+                        pages,
                         path,
-                        epub_read,
-                        page,
-                        target,
-                        pdf_password,
-                        cancel,
-                        priority,
-                        pdf_render_validity.clone(),
-                        cancel_policy,
-                    ) {
-                        Ok(rendered) => {
-                            img = rendered.image;
-                            source_dims = Some((img.width(), img.height()));
-                        }
-                        Err(error) => crate::logger::log(format!(
-                            "auto cover crop larger PDF render failed: {error}"
-                        )),
+                        |key| sample_rotations.get(key),
+                    )
+                }
+                AutoCoverInput::Container => {
+                    if let Some(page) = pdf_page {
+                        let sizes =
+                            cover_pdf_page_sizes(path, epub_read, pdf_password).unwrap_or_default();
+                        crate::cover_auto_sample::page_aspect_from_sizes_with_rotations_report(
+                            &sizes,
+                            page as usize,
+                            path,
+                            |key| sample_rotations.get(key),
+                        )
+                    } else {
+                        crate::cover_auto_sample::sample_zip_pages_with_rotations(
+                            path,
+                            zip_entry.expect("supported ZIP leaf"),
+                            auto_zip_prefix,
+                            path,
+                            |key| sample_rotations.get(key),
+                        )
                     }
+                }
+            };
+            let aspect_result = sample;
+            let analysis = if let Some(analysis) = predecoded_auto_analysis.take() {
+                Ok(analysis)
+            } else if let Some(page) = pdf_page {
+                decode_cover_auto_analysis_pdf(
+                    path,
+                    epub_read,
+                    page,
+                    pdf_password,
+                    cancel,
+                    pdf_priority,
+                    pdf_render_validity.clone(),
+                    cancel_policy,
+                )
+            } else if let Some(bytes) = auto_jpeg_bytes.as_deref() {
+                decode_cover_auto_analysis_image(
+                    crate::image_decode::Source::Bytes {
+                        bytes,
+                        hint: zip_entry.unwrap_or(""),
+                    },
+                    Some(&img),
+                    cancel,
+                )
+            } else {
+                decode_cover_auto_analysis_image(
+                    crate::image_decode::Source::Path(path),
+                    Some(&img),
+                    cancel,
+                )
+            };
+            match analysis {
+                Ok(analysis) => {
+                    let results =
+                        crate::cover_auto_crop::detect_cover_crops_with_photo_detailed_report(
+                            &analysis.image,
+                            analysis.native_dims,
+                            sample.ok(),
+                            analysis.shot_exif,
+                            auto.identity.binding,
+                            |rotation, result| {
+                                let reason = result.map_or_else(
+                                    |decline| decline.as_str(),
+                                    |success| success.as_str(),
+                                );
+                                crate::logger::log(format!(
+                                    "auto cover: rotation={rotation:?} {reason} page-aspect={} book={} leaf={display_name}",
+                                    aspect_result.map_or_else(|reason| reason.as_str(), |_| "ok"),
+                                    book_display
+                                ));
+                            },
+                        );
+                    auto_material = crate::cover_auto_material::AutoMaterial::Automatic(results);
+                    reason = if results.crops().iter().any(Option::is_some) {
+                        "cropped-at-draw"
+                    } else {
+                        "declined-all-directions"
+                    };
+                    let requested = uncapped_material_raster_target(
+                        native,
+                        auto_material,
+                        display_px.max(thumb_px),
+                    );
+                    let wanted =
+                        material_raster_target(native, auto_material, display_px.max(thumb_px));
+                    if wanted == 4096 {
+                        crate::logger::log(format!(
+                            "auto cover material resolution capped at 4096: requested={requested} {display_name}"
+                        ));
+                    }
+                    if results.crops().iter().any(Option::is_some)
+                        && img.width().max(img.height()) < wanted
+                    {
+                        if analysis.image.width().max(analysis.image.height()) >= wanted {
+                            img = analysis.image;
+                            if pdf_page.is_some() {
+                                source_dims = Some((img.width(), img.height()));
+                            }
+                        } else if let Some(bytes) = auto_jpeg_bytes
+                            .as_deref()
+                            .filter(|bytes| bytes.starts_with(&[0xff, 0xd8]))
+                        {
+                            match decode_jpeg_turbo_scaled_from_bytes(bytes, wanted) {
+                                Ok((decoded, stats)) => {
+                                    img = apply_orientation(decoded, orientation);
+                                    source_dims = Some(stats.source_dims_after_exif(orientation));
+                                    dct_stats = Some(stats);
+                                }
+                                Err(error) => crate::logger::log(format!(
+                                    "auto cover larger JPEG decode failed: {error:?}"
+                                )),
+                            }
+                        } else if let Some(page) = pdf_page {
+                            match render_cover_pdf(
+                                path,
+                                epub_read,
+                                page,
+                                wanted,
+                                pdf_password,
+                                cancel,
+                                pdf_priority,
+                                pdf_render_validity.clone(),
+                                cancel_policy,
+                            ) {
+                                Ok(rendered) => {
+                                    img = rendered.image;
+                                    source_dims = Some((img.width(), img.height()));
+                                }
+                                Err(error) => crate::logger::log(format!(
+                                    "auto cover larger PDF render failed: {error}"
+                                )),
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    reason = "analysis-decode-failed";
+                    crate::logger::log(format!("auto cover analysis decode failed: {error}"));
                 }
             }
         }
-        crate::logger::log(format!("auto cover crop: {reason} {display_name}"));
+        crate::logger::log(format!(
+            "auto cover material: {reason} book={book_display} leaf={display_name}"
+        ));
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "thumb",
@@ -6856,8 +7319,9 @@ pub(crate) fn load_one_cached(
             );
         }
     }
+    // Manual ranges remain destructive and do not carry automatic material.
     let (img, source_dims, layout_dims) =
-        apply_cover_crop(img, source_dims, layout_dims, effective_crop);
+        apply_cover_crop(img, source_dims, layout_dims, cover_crop);
 
     let perf_log_started = crate::perf::stall::Span::start();
     if let Some(stats) = dct_stats {
@@ -6884,7 +7348,15 @@ pub(crate) fn load_one_cached(
     //     WebP 量子化を経由しないため画質劣化なし、かつ WebP encode を待たない
     //     from_cache = false: 元画像由来の高画質 (段階 E アップグレード不要)
     let t_display = std::time::Instant::now();
-    let display_ci = resize_to_display_color_image(&img, display_px, layout_dims.or(source_dims));
+    let display_target = material_raster_target(
+        layout_dims
+            .or(source_dims)
+            .unwrap_or((img.width(), img.height())),
+        auto_material,
+        display_px,
+    );
+    let display_ci =
+        resize_to_display_color_image(&img, display_target, layout_dims.or(source_dims));
     let display_ci = match pinned_page_adjustment {
         Some(params) => crate::adjustment::apply_adjustments_fast(&display_ci, params),
         None => display_ci,
@@ -6913,6 +7385,7 @@ pub(crate) fn load_one_cached(
         )
         .with_request_id(request_id)
         .with_cover(cover.clone())
+        .with_auto_material(auto_material)
         .source_pixels(),
     );
     let send_display_ms = send_display_started.elapsed().as_secs_f64() * 1000.0;
@@ -7003,7 +7476,13 @@ pub(crate) fn load_one_cached(
             let t_enc = std::time::Instant::now();
             let encoded = crate::catalog::encode_thumb_webp_with_aspect_dims(
                 &img,
-                thumb_px,
+                material_raster_target(
+                    layout_dims
+                        .or(source_dims)
+                        .unwrap_or((img.width(), img.height())),
+                    auto_material,
+                    thumb_px,
+                ),
                 thumb_quality as f32,
                 layout_dims
                     .or(source_dims)
@@ -7026,6 +7505,7 @@ pub(crate) fn load_one_cached(
                         folder_provenance,
                         folder_selection_proof,
                         &cover,
+                        auto_material,
                     );
                     cache_save_ms = cache_save_started.elapsed().as_secs_f64() * 1000.0;
                     if let Err(e) = save_result {
@@ -7042,6 +7522,7 @@ pub(crate) fn load_one_cached(
                             map.insert(
                                 name.to_owned(),
                                 crate::catalog::CacheEntry {
+                                    auto_material,
                                     cover: cover.clone(),
                                     mtime,
                                     file_size,
@@ -7237,8 +7718,17 @@ pub(crate) fn with_test_pdf_render_result<T>(
 #[path = "thumb_loader/cover_auto_eval_decode.rs"]
 pub(crate) mod cover_auto_eval_decode;
 
+#[path = "thumb_loader/cover_auto_analysis.rs"]
+mod cover_auto_analysis;
+pub(crate) use cover_auto_analysis::{
+    CoverAutoAnalysis, decode_cover_auto_analysis_image, decode_cover_auto_analysis_pdf,
+};
+
 #[cfg(test)]
 mod tests {
+    include!("thumb_loader/auto_material_tests.rs");
+    include!("thumb_loader/folder_auto_tests.rs");
+    include!("thumb_loader/saved_rotation_sample_tests.rs");
     use super::*;
     use crate::settings::{CachePolicy, Settings, SortOrder};
     use std::collections::HashMap;
@@ -7788,7 +8278,15 @@ mod tests {
             );
             if !child_folder {
                 catalog
-                    .save_thumb_bytes(&key, 4, 5, Some((8, 8)), &bytes, &CoverIdentity::Legacy)
+                    .save_thumb_bytes(
+                        &key,
+                        4,
+                        5,
+                        Some((8, 8)),
+                        &bytes,
+                        &CoverIdentity::Legacy,
+                        crate::cover_auto_material::AutoMaterial::NotAutomatic,
+                    )
                     .unwrap();
             }
             let mut stale = catalog.load_all().unwrap();
@@ -7906,7 +8404,15 @@ mod tests {
                 crate::catalog::CatalogDb::open(&fixture.cache_dir, &fixture.root).unwrap();
             if !child_folder {
                 catalog
-                    .save_thumb_bytes(&key, 4, 5, Some((8, 8)), &bytes, &CoverIdentity::Legacy)
+                    .save_thumb_bytes(
+                        &key,
+                        4,
+                        5,
+                        Some((8, 8)),
+                        &bytes,
+                        &CoverIdentity::Legacy,
+                        crate::cover_auto_material::AutoMaterial::NotAutomatic,
+                    )
                     .unwrap();
             }
             let map = std::sync::RwLock::new(catalog.load_all().unwrap());
@@ -8092,6 +8598,7 @@ mod tests {
                 cache.write().unwrap().insert(
                     "image.png".to_owned(),
                     crate::catalog::CacheEntry {
+                        auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                         cover: CoverIdentity::Legacy,
                         mtime: 7,
                         file_size: 9,
@@ -9479,6 +9986,7 @@ mod tests {
                 Some((8, 12)),
                 &old_bytes,
                 &CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let cache = std::sync::RwLock::new(catalog.load_all().unwrap());
@@ -10234,7 +10742,7 @@ mod tests {
 
     fn resolved_image_path(result: Option<FolderThumbResolution>) -> Option<PathBuf> {
         match result {
-            Some(FolderThumbResolution::Image(path, _)) => Some(path),
+            Some(FolderThumbResolution::Image(path, _, _)) => Some(path),
             Some(FolderThumbResolution::CachedPinned(_)) | None => None,
         }
     }
@@ -10249,13 +10757,15 @@ mod tests {
     fn auto_cover_crop_key_is_canonical_before_pin_and_generation() {
         let rtl = crate::cover_auto_crop::AutoCropIdentity {
             binding: crate::settings::ReadingDirection::Rtl,
+            folders: false,
         };
         let ltr = crate::cover_auto_crop::AutoCropIdentity {
             binding: crate::settings::ReadingDirection::Ltr,
+            folders: false,
         };
         let policy = crate::file_type_visibility::FileTypeVisibility::default();
-        let key = "zipthumb:book.zip|autocrop:v1:ltr#pin:entry|generation:10:20";
-        let expected = "zipthumb:book.zip|autocrop:v1:rtl#pin:entry|generation:10:20";
+        let key = "zipthumb:book.zip|autocrop:v3:ltr#pin:entry|generation:10:20";
+        let expected = "zipthumb:book.zip|autocrop:v3:rtl#pin:entry|generation:10:20";
         assert_eq!(
             representative_cache_key_for_policy_with_auto(key, &policy, Some(rtl)),
             expected
@@ -10282,6 +10792,7 @@ mod tests {
     fn auto_cover_crop_request_binds_instruction_and_key_and_manual_wins() {
         let identity = crate::cover_auto_crop::AutoCropIdentity {
             binding: crate::settings::ReadingDirection::Rtl,
+            folders: false,
         };
         let mut request = LoadRequest {
             cache_key_override: Some("zipthumb:book.zip#pin:entry".into()),
@@ -10291,7 +10802,7 @@ mod tests {
         assert_eq!(request.auto_cover_crop, Some(identity));
         assert_eq!(
             cache_key_for_request(&request).unwrap(),
-            "zipthumb:book.zip|autocrop:v1:rtl#pin:entry"
+            "zipthumb:book.zip|autocrop:v3:rtl#pin:entry"
         );
         request.cover_crop = Some(manual_cover_crop([0, 0, 500_000, 1_000_000]));
         request.set_auto_cover_crop(Some(identity));
@@ -10375,7 +10886,7 @@ mod tests {
             "zipdir:chapter/|autocrop:v1:rtl|suffix/",
             "zipdir:chapter/|autocrop:v1:ltr|suffix/",
             "zipdir:chapter/|types:0000000000000001|suffix/",
-            "zipthumb:a.zip|autocrop:v2:ltr",
+            "zipthumb:a.zip|autocrop:v4:ltr",
             "zipdir:chapter/|types:not-a-fingerprint/",
         ] {
             assert_eq!(representative_cache_key_for_policy(key, &visible), key);
@@ -10535,7 +11046,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_cover_crop_zip_worker_saves_crop_and_cache_only_reuses_exact_identity() {
+    fn auto_cover_crop_zip_worker_saves_full_material_and_cache_only_reuses_exact_identity() {
         use std::io::Write;
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("book.zip");
@@ -10581,14 +11092,14 @@ mod tests {
         let messages = run_cover_crop_request(&mut request, &catalog, None);
         let pixels = messages.iter().find_map(ThumbMsg::pixels).unwrap();
         let dims = pixels.source_dims.unwrap();
-        assert!(dims.0 > 330 && dims.0 < 385, "{dims:?}");
-        assert_eq!(dims.1, 512);
+        assert_eq!(dims, (892, 512));
+        let material = pixels.auto_material;
+        auto_material_assert_roi(material, pixels.image.size, 64);
         assert_eq!(pixels.layout_dims, None);
         let key = cache_key_for_request(&request).unwrap().into_owned();
-        assert_eq!(
-            catalog.load_one(&key).unwrap().unwrap().source_dims,
-            Some(dims)
-        );
+        let stored = catalog.load_one(&key).unwrap().unwrap();
+        assert_eq!(stored.source_dims, Some(dims));
+        assert_eq!(stored.auto_material, material);
         assert!(catalog.load_one("zipthumb:book.zip").unwrap().is_none());
         // An excluded pinned leaf uses its substitute's pixels and automatic
         // instruction, but publishes under the original pinned identity (K3).
@@ -10635,7 +11146,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_cover_crop_pdf_widens_once_and_keeps_password_and_read_lease() {
+    fn auto_cover_crop_pdf_fixed_analysis_keeps_password_and_read_lease() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("book.epub");
         let read = Some(crate::pdf_loader::generation_target_for_test(
@@ -10650,7 +11161,7 @@ mod tests {
             height: 512.0,
         };
         let mut second = cover_only_pdf_result();
-        second.image = jacket;
+        second.image = jacket.resize_exact(1784, 1024, image::imageops::FilterType::CatmullRom);
         let mut sizes = vec![(70.0, 100.0); 9];
         sizes[0] = (892.0, 512.0);
         AUTO_CROP_PDF_FIXTURE.with(|current| {
@@ -10703,26 +11214,25 @@ mod tests {
             CoverIdentity::Page(crate::adjustment_db::normalize_path(&path)),
             None,
             None,
-            Some(identity),
+            Some(ResolvedAutoCover {
+                identity,
+                input: AutoCoverInput::Container,
+            }),
             None,
         );
         assert_eq!(done.load(Ordering::Relaxed), 1);
         let messages: Vec<_> = rx.try_iter().collect();
-        let dims = messages
-            .iter()
-            .find_map(ThumbMsg::pixels)
-            .unwrap()
-            .source_dims
-            .unwrap();
-        assert!(dims.0 > 330 && dims.0 < 385, "{dims:?}");
-        assert_eq!(dims.1, 512);
+        let pixels = messages.iter().find_map(ThumbMsg::pixels).unwrap();
+        assert_eq!(pixels.source_dims, Some((1784, 1024)));
+        auto_material_assert_roi(pixels.auto_material, pixels.image.size, 256);
         AUTO_CROP_PDF_FIXTURE
             .with(|current| assert!(current.borrow_mut().take().unwrap().renders.is_empty()));
         let observed = observed.lock().unwrap();
-        assert_eq!(observed.len(), 3);
+        assert_eq!(observed.len(), 4);
         assert_eq!(observed[0].render, Some((0, 256)));
         assert_eq!(observed[1].render, None);
-        assert!(observed[2].render.unwrap().1 > 256);
+        assert_eq!(observed[2].render, None);
+        assert_eq!(observed[3].render, Some((0, 1784)));
         for request in observed.iter() {
             assert_eq!(request.password.as_deref(), Some("session password"));
             assert_eq!(request.read_address, observed[0].read_address);
@@ -10943,6 +11453,7 @@ mod tests {
                     Some((7, 11)),
                     &fixture_webp(),
                     &CoverIdentity::Legacy,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 )
                 .unwrap();
             let (selected, _) = select_folder_thumb_image_with_policy_and_auto(
@@ -11007,6 +11518,7 @@ mod tests {
                     Some((7, 11)),
                     &fixture_webp(),
                     &CoverIdentity::Legacy,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 )
                 .unwrap();
             let (selected, _) = select_folder_thumb_image_with_policy_and_auto(
@@ -11398,6 +11910,7 @@ mod tests {
                 Some((8, 8)),
                 &fixture_webp(),
                 &CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         assert!(
@@ -11698,7 +12211,8 @@ mod tests {
                     metadata.len() as i64,
                     Some((8, 8)),
                     &fixture_webp(),
-                    &CoverIdentity::Legacy
+                    &CoverIdentity::Legacy,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 )
                 .unwrap()
         );
@@ -11878,6 +12392,7 @@ mod tests {
                 Some((8, 8)),
                 &fixture_webp(),
                 &CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let meta = std::fs::metadata(&corrupt).unwrap();
@@ -11891,6 +12406,7 @@ mod tests {
                 Some((8, 8)),
                 b"not webp",
                 &CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         assert!(
@@ -12011,6 +12527,7 @@ mod tests {
             ..Default::default()
         };
         let entry = |proof: crate::catalog::FolderSelectionProof| crate::catalog::CacheEntry {
+            auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
             cover: CoverIdentity::Legacy,
             mtime: 0,
             file_size: 0,
@@ -12088,6 +12605,7 @@ mod tests {
         let image = tmp.path().join("video.mp4");
         std::fs::write(&image, b"video").unwrap();
         let legacy = crate::catalog::CacheEntry {
+            auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
             cover: CoverIdentity::Legacy,
             mtime: 0,
             file_size: 0,
@@ -12179,6 +12697,7 @@ mod tests {
                 Some((8, 8)),
                 &fixture_webp(),
                 &CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let result = resolve_folder_thumb_image_with_cache_dir(
@@ -12195,6 +12714,7 @@ mod tests {
 
     fn proof_entry(proof: crate::catalog::FolderSelectionProof) -> crate::catalog::CacheEntry {
         crate::catalog::CacheEntry {
+            auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
             cover: CoverIdentity::Legacy,
             mtime: 0,
             file_size: 0,
@@ -12423,6 +12943,7 @@ mod tests {
             ..Default::default()
         };
         let entry = crate::catalog::CacheEntry {
+            auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
             cover: CoverIdentity::Legacy,
             mtime: 0,
             file_size: 0,
@@ -12485,6 +13006,7 @@ mod tests {
             ..Default::default()
         };
         let entry = crate::catalog::CacheEntry {
+            auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
             cover: CoverIdentity::Legacy,
             mtime: 0,
             file_size: 0,
@@ -12555,6 +13077,7 @@ mod tests {
                 &fixture_webp(),
                 Some(&proof),
                 &CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let stored = catalog.load_one(&key).unwrap().unwrap();
@@ -12592,6 +13115,7 @@ mod tests {
             ..Default::default()
         };
         let entry = crate::catalog::CacheEntry {
+            auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
             cover: CoverIdentity::Legacy,
             mtime: 0,
             file_size: 0,
@@ -12685,7 +13209,8 @@ mod tests {
                     fixture.resolved.file_size,
                     Some((8, 8)),
                     bytes,
-                    &CoverIdentity::Legacy
+                    &CoverIdentity::Legacy,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 )
                 .unwrap()
         );
@@ -12863,7 +13388,7 @@ mod tests {
                 assert_eq!(cached.image.size, [8, 8]);
                 assert_eq!(cached.webp_data, webp);
             }
-            Some(FolderThumbResolution::Image(path, _)) => {
+            Some(FolderThumbResolution::Image(path, _, _)) => {
                 panic!("expected cached PDF pin, got image {}", path.display())
             }
             None => panic!("expected cached PDF pin"),
@@ -12971,6 +13496,7 @@ mod tests {
                 Some((8, 8)),
                 b"not a webp",
                 &CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         drop(catalog);
@@ -13571,6 +14097,7 @@ mod tests {
         let cache_map = std::sync::RwLock::new(std::collections::HashMap::from([(
             key,
             crate::catalog::CacheEntry {
+                auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 cover: CoverIdentity::Legacy,
                 mtime: fixture.current.generation_id,
                 file_size: fixture.current.pdf_size as i64,
@@ -13863,6 +14390,7 @@ fn encode_and_save_with_geometry(
             layout_dims,
             &webp_data,
             cover,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic,
         )
         .ok()?;
     Some(webp_data.len())
@@ -14036,6 +14564,7 @@ mod avif_tests {
             None,
             &mut decoder,
             &mut orientation,
+            None,
         )
         .unwrap();
         assert_eq!(orientation, crate::image_decode::Orientation::Applied);
@@ -14057,6 +14586,7 @@ mod avif_tests {
                 None,
                 &mut decoder,
                 &mut orientation,
+                None,
             )
             .unwrap();
             assert_eq!(decoder, crate::stats::DecodeSource::Libavif);

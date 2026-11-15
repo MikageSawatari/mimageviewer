@@ -56,7 +56,11 @@ fn representative_cache_key_matches_master_on_literal_names_and_generation_layou
         "book|generation:10:20/",
         "book|generation:10:20|types:0000000000000001",
         "book|autocrop:v1:rtl|types:0000000000000001/",
-        "book|autocrop:v2:rtl",
+        "book|autocrop:v2:rtl/",
+        "book|autocrop:v2:ltr|generation:one/",
+        "book|autocrop:v3:rtl/",
+        "book|autocrop:v3:ltr|generation:one/",
+        "book|autocrop:v4:rtl",
         "book|autocrop:v1:rtl|types:0000000000000001",
     ] {
         for prefix in ["zipdir:", "zipthumb:", "pdfthumb:", "page:"] {

@@ -99,12 +99,14 @@ fn media_resume_meter_video_and_audio_use_live_positions_and_memory_duration() {
     let audio = media_key(&app, 1);
     seed_duration(&mut app, 0, Some(100.0));
     seed_duration(&mut app, 1, Some(200.0));
-    app.settings
-        .video_resume_positions
-        .insert(video.clone(), 25.0);
-    app.settings
-        .video_resume_positions
-        .insert(audio.clone(), 100.0);
+    app.settings.video_resume_positions.insert(
+        video.clone(),
+        crate::settings::VideoResumePosition::Media(25.0),
+    );
+    app.settings.video_resume_positions.insert(
+        audio.clone(),
+        crate::settings::VideoResumePosition::Media(100.0),
+    );
     assert_eq!(app.thumbnail_resume_meter(0), Some(0.25));
     assert_eq!(app.thumbnail_resume_meter(1), Some(0.5));
     assert_eq!(
@@ -114,12 +116,14 @@ fn media_resume_meter_video_and_audio_use_live_positions_and_memory_duration() {
     );
     assert_eq!(app.thumbnail_media_duration_text(1), None);
 
-    app.settings
-        .video_resume_positions
-        .insert(video.clone(), 75.0);
-    app.settings
-        .video_resume_positions
-        .insert(audio.clone(), 50.0);
+    app.settings.video_resume_positions.insert(
+        video.clone(),
+        crate::settings::VideoResumePosition::Media(75.0),
+    );
+    app.settings.video_resume_positions.insert(
+        audio.clone(),
+        crate::settings::VideoResumePosition::Media(50.0),
+    );
     assert_eq!(app.thumbnail_resume_meter(0), Some(0.75));
     assert_eq!(app.thumbnail_resume_meter(1), Some(0.25));
     app.top_level_grid_view
@@ -147,9 +151,10 @@ fn media_resume_meter_requires_saved_position_and_valid_current_duration() {
     let mut app = media_app();
     let key = media_key(&app, 0);
     assert_eq!(app.thumbnail_resume_meter(0), None);
-    app.settings
-        .video_resume_positions
-        .insert(key.clone(), 10.0);
+    app.settings.video_resume_positions.insert(
+        key.clone(),
+        crate::settings::VideoResumePosition::Media(10.0),
+    );
     assert_eq!(app.thumbnail_resume_meter(0), None, "duration missing");
 
     for state in [
@@ -176,14 +181,16 @@ fn media_resume_meter_requires_saved_position_and_valid_current_duration() {
     }
     seed_duration(&mut app, 0, Some(100.0));
     for position in [0.0, -1.0, 101.0, f64::NAN, f64::INFINITY] {
-        app.settings
-            .video_resume_positions
-            .insert(key.clone(), position);
+        app.settings.video_resume_positions.insert(
+            key.clone(),
+            crate::settings::VideoResumePosition::Media(position),
+        );
         assert_eq!(app.thumbnail_resume_meter(0), None, "position={position}");
     }
-    app.settings
-        .video_resume_positions
-        .insert(key.clone(), 10.0);
+    app.settings.video_resume_positions.insert(
+        key.clone(),
+        crate::settings::VideoResumePosition::Media(10.0),
+    );
     app.image_metas[0] = Some((101, 2048));
     assert_eq!(app.thumbnail_resume_meter(0), None, "stale mtime");
     app.image_metas[0] = Some((100, 2049));
@@ -199,9 +206,10 @@ fn media_resume_meter_shared_setting_hides_meter_and_preserves_duration_badge() 
     let mut app = media_app();
     let key = media_key(&app, 0);
     seed_duration(&mut app, 0, Some(100.0));
-    app.settings
-        .video_resume_positions
-        .insert(key.clone(), 25.0);
+    app.settings.video_resume_positions.insert(
+        key.clone(),
+        crate::settings::VideoResumePosition::Media(25.0),
+    );
     app.settings.thumb_show_media_duration = true;
     app.settings.thumb_show_resume_meter = false;
     assert!(
@@ -215,7 +223,13 @@ fn media_resume_meter_shared_setting_hides_meter_and_preserves_duration_badge() 
     );
     app.settings.thumb_show_resume_meter = true;
     assert_eq!(app.thumbnail_resume_meter(0), Some(0.25));
-    assert_eq!(app.settings.video_resume_positions.get(&key), Some(&25.0));
+    assert_eq!(
+        app.settings
+            .video_resume_positions
+            .get(&key)
+            .map(crate::settings::VideoResumePosition::stored_secs),
+        Some(&25.0)
+    );
 }
 
 #[test]
@@ -234,12 +248,14 @@ fn media_resume_meter_preserves_drive_keys_and_replaced_index_identity() {
     for idx in [0, 1] {
         seed_duration(&mut app, idx, Some(100.0));
     }
-    app.settings
-        .video_resume_positions
-        .insert(first.clone(), 25.0);
-    app.settings
-        .video_resume_positions
-        .insert(second.clone(), 75.0);
+    app.settings.video_resume_positions.insert(
+        first.clone(),
+        crate::settings::VideoResumePosition::Media(25.0),
+    );
+    app.settings.video_resume_positions.insert(
+        second.clone(),
+        crate::settings::VideoResumePosition::Media(75.0),
+    );
     assert_eq!(app.thumbnail_resume_meter(0), Some(0.25));
     assert_eq!(app.thumbnail_resume_meter(1), Some(0.75));
     app.settings.video_watched_to_end.insert(first);
@@ -360,7 +376,10 @@ fn media_resume_meter_stage_replacement_preserves_idle_and_generation_cancellati
 #[test]
 fn media_resume_meter_watched_transitions_preserve_short_replay_and_clear_on_midpoint() {
     let key = crate::adjustment_db::normalize_path(std::path::Path::new(r"C:\clips\watched.mp4"));
-    let mut positions = std::collections::HashMap::from([(key.clone(), 13.046)]);
+    let mut positions = std::collections::HashMap::from([(
+        key.clone(),
+        crate::settings::VideoResumePosition::Media(13.046),
+    )]);
     let mut watched = HashSet::new();
 
     for (position, duration, at_eof, saved, completed) in [
@@ -382,7 +401,13 @@ fn media_resume_meter_watched_transitions_preserve_short_replay_and_clear_on_mid
             saved
         );
         assert_eq!(watched.contains(&key), completed);
-        assert_eq!(positions.get(&key).copied(), saved.then_some(position));
+        assert_eq!(
+            positions
+                .get(&key)
+                .map(crate::settings::VideoResumePosition::stored_secs)
+                .copied(),
+            saved.then_some(position)
+        );
     }
 }
 
@@ -415,9 +440,10 @@ fn media_resume_meter_watched_video_and_audio_are_full_without_duration_and_live
         app.settings.video_watched_to_end.remove(&key);
         assert_eq!(app.thumbnail_resume_meter(idx), None);
         app.image_metas[idx] = Some((100, 2048));
-        app.settings
-            .video_resume_positions
-            .insert(key.clone(), 25.0);
+        app.settings.video_resume_positions.insert(
+            key.clone(),
+            crate::settings::VideoResumePosition::Media(25.0),
+        );
         assert_eq!(app.thumbnail_resume_meter(idx), Some(0.25));
         app.settings.video_watched_to_end.insert(key.clone());
         assert_eq!(app.thumbnail_resume_meter(idx), Some(1.0));
@@ -465,7 +491,12 @@ fn media_resume_meter_watched_only_opens_video_and_audio_from_start() {
         let key = media_key(&app, idx);
         app.settings.video_watched_to_end.insert(key.clone());
         assert_eq!(app.thumbnail_resume_meter(idx), Some(1.0));
-        let saved = app.settings.video_resume_positions.get(&key).copied();
+        let saved = app
+            .settings
+            .video_resume_positions
+            .get(&key)
+            .map(crate::settings::VideoResumePosition::stored_secs)
+            .copied();
         assert_eq!(saved, None);
         for from_grid in [false, true] {
             for open_starts_from_beginning in [false, true] {
@@ -548,8 +579,14 @@ fn media_resume_meter_watched_rename_preserves_destination_media_state() {
     app.settings.video_watched_to_end =
         HashSet::from([watched_source, watched_destination.clone()]);
     app.settings.video_resume_positions = std::collections::HashMap::from([
-        (resume_source, 25.0),
-        (resumed_destination.clone(), 50.0),
+        (
+            resume_source,
+            crate::settings::VideoResumePosition::Media(25.0),
+        ),
+        (
+            resumed_destination.clone(),
+            crate::settings::VideoResumePosition::Media(50.0),
+        ),
     ]);
 
     app.migrate_video_resume_positions_for_renamed_path(&old, &new);
@@ -560,7 +597,10 @@ fn media_resume_meter_watched_rename_preserves_destination_media_state() {
     );
     assert_eq!(
         app.settings.video_resume_positions,
-        std::collections::HashMap::from([(resumed_destination, 50.0)])
+        std::collections::HashMap::from([(
+            resumed_destination,
+            crate::settings::VideoResumePosition::Media(50.0)
+        )])
     );
 }
 
@@ -652,12 +692,14 @@ fn media_resume_meter_exit_harvest_marks_active_and_parked_eof_without_dropping_
             },
         );
     });
-    app.settings
-        .video_resume_positions
-        .insert(active_key.clone(), 13.0);
-    app.settings
-        .video_resume_positions
-        .insert(parked_key.clone(), 21.0);
+    app.settings.video_resume_positions.insert(
+        active_key.clone(),
+        crate::settings::VideoResumePosition::Media(13.0),
+    );
+    app.settings.video_resume_positions.insert(
+        parked_key.clone(),
+        crate::settings::VideoResumePosition::Media(21.0),
+    );
 
     app.save_detached_video_resume_positions_for_exit();
 

@@ -3266,7 +3266,7 @@ mod tests {
     #[test]
     fn cover_rotation_snapshot_return_reconciles_retained_legacy_and_preserves_current_material() {
         use crate::cover_source_scope::{CoverSourceScope, LoadedCoverIdentity};
-        for material in 0..4 {
+        for material in 0..5 {
             let mut app = setup_app_for_test();
             let ctx = egui::Context::default();
             let (_, book, key) = snapshot_cover_rotation_zip(&app);
@@ -3274,13 +3274,27 @@ mod tests {
                 0 => LoadedCoverIdentity::Legacy {
                     scope: Some(CoverSourceScope::archive(&book)),
                 },
-                1 => LoadedCoverIdentity::Page(key.clone()),
+                1 | 4 => LoadedCoverIdentity::Page(key.clone()),
                 2 => LoadedCoverIdentity::Legacy { scope: None },
                 _ => LoadedCoverIdentity::Unknown,
             };
             app.current_folder = Some(app.tmp.path().to_path_buf());
             app.items = vec![GridItem::ZipFile(book.clone())];
             app.thumbnails = vec![snapshot_loaded_cover(&ctx, cover)];
+            let automatic = crate::cover_auto_material::AutoMaterial::Automatic(
+                crate::cover_auto_material::AutoCropResults::new([
+                    None,
+                    crate::folder_thumb_pins::CoverCrop::new([0, 0, 500_000, 1_000_000]).unwrap(),
+                    None,
+                    None,
+                ]),
+            );
+            if material == 4 {
+                let ThumbnailState::Loaded { auto_material, .. } = &mut app.thumbnails[0] else {
+                    unreachable!()
+                };
+                *auto_material = automatic;
+            }
             app.image_metas = vec![Some((1, std::fs::metadata(&book).unwrap().len() as i64))];
             app.visible_indices = vec![0];
             app.settings.thumb_idle_upgrade = false;
@@ -3301,12 +3315,25 @@ mod tests {
                     assert_eq!(snapshot_cover_texture_id(&app.thumbnails[0]), texture_id);
                     assert_eq!(
                         app.grid_tile_rotation_memory(0),
-                        if material == 1 {
+                        if material == 1 || material == 4 {
                             crate::rotation_db::Rotation::Cw90
                         } else {
                             crate::rotation_db::Rotation::None
                         },
                     );
+                    if material == 4 {
+                        let ThumbnailState::Loaded {
+                            tex, auto_material, ..
+                        } = &app.thumbnails[0]
+                        else {
+                            unreachable!()
+                        };
+                        assert_eq!(*auto_material, automatic);
+                        let view = app.thumbnails[0]
+                            .tile_view_for_texture(tex, app.grid_tile_rotation_memory(0));
+                        assert_eq!(view.uv.max.x, 0.5);
+                        assert_eq!(view.displayed_size, egui::vec2(1.0, 1.0));
+                    }
                 }
             }
         }

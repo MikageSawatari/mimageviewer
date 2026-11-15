@@ -68,6 +68,7 @@ mod app;
 pub mod asr_addon;
 pub(crate) mod caption_display_cache;
 pub(crate) mod cover_auto_crop;
+pub(crate) mod cover_auto_material;
 pub(crate) mod cover_auto_sample;
 pub mod cover_identity;
 pub mod cover_source_scope;

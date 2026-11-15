@@ -116,7 +116,8 @@ pub fn prepare_with_saved(
     crate::audio_decode::ensure_ffmpeg_init();
     let mut input = open_input(path, &cancel)?;
     check_cancel(&cancel)?;
-    let tracks = crate::video::decoder::enumerate_audio_tracks(&input);
+    let timeline = crate::video::media_timeline::MediaTimeline::from_input(&input);
+    let tracks = crate::video::decoder::enumerate_audio_tracks_with_timeline(&input, timeline);
     let default = input
         .streams()
         .best(ffmpeg::media::Type::Audio)

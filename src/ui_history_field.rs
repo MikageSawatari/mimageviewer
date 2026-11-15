@@ -409,6 +409,8 @@ pub(crate) fn show_singleline<'text>(
         let pos = output.response.rect.left_bottom();
         let max_height =
             (ctx.content_rect().bottom() - pos.y - 8.0).max(ui.spacing().interact_size.y);
+        let popup_visuals = crate::os_theme::popup_visuals_for_ui(ui);
+        let popup_frame = crate::os_theme::popup_frame_with_visuals(&ctx, popup_visuals.clone());
         let popup = egui::Area::new(popup_id(id))
             .order(egui::Order::Foreground)
             .fixed_pos(pos)
@@ -419,8 +421,8 @@ pub(crate) fn show_singleline<'text>(
                     // next layout pass before accepting the next input frame.
                     ui.ctx().request_discard("measure input history popup");
                 }
-                crate::os_theme::apply_dark_ui(ui);
-                crate::os_theme::dark_popup_frame(&ctx).show(ui, |ui| {
+                *ui.visuals_mut() = popup_visuals;
+                popup_frame.show(ui, |ui| {
                     ui.set_width((popup_width - ui.spacing().window_margin.sum().x).max(0.0));
                     egui::ScrollArea::vertical()
                         .max_height(max_height)
@@ -540,6 +542,135 @@ mod tests {
 
     fn field_id() -> Id {
         Id::unique("history_test_input")
+    }
+
+    fn assert_popup_theme(theme: crate::os_theme::ResolvedTheme, fixed_dark: bool) {
+        use crate::{os_theme, settings::TextContrast};
+
+        fn rect_fill(shape: &egui::Shape) -> Option<egui::Color32> {
+            match shape {
+                // Frame paints a blurred shadow before its actual background.
+                egui::Shape::Rect(rect) if rect.blur_width == 0.0 => Some(rect.fill),
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(rect_fill),
+                _ => None,
+            }
+        }
+
+        fn entry_text_color(shape: &egui::Shape) -> Option<egui::Color32> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.job.text == "entry" => {
+                    let color = text.galley.job.sections.first()?.format.color;
+                    Some(text.override_text_color.unwrap_or(
+                        if color == egui::Color32::PLACEHOLDER {
+                            text.fallback_color
+                        } else {
+                            color
+                        },
+                    ))
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(entry_text_color),
+                _ => None,
+            }
+        }
+
+        for contrast in [TextContrast::Standard, TextContrast::Strong] {
+            let ctx = Context::default();
+            crate::ime_focus::install_ime_input_policy(&ctx);
+            crate::ui_fonts::configure_fonts(&ctx);
+            os_theme::apply_resolved_with_contrast(&ctx, theme, contrast);
+            let global_style = ctx.global_style();
+            let mut painted_fill = None;
+            let mut painted_text = None;
+            let surface_theme = if fixed_dark {
+                os_theme::ResolvedTheme::Dark
+            } else {
+                theme
+            };
+            let expected = os_theme::app_visuals(surface_theme, contrast);
+            for frame in 0..3 {
+                ctx.run_ui(
+                    egui::RawInput {
+                        // Inspect settled colors after the Area's fade-in.
+                        time: Some(frame as f64),
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(440.0, 240.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        if fixed_dark {
+                            os_theme::apply_dark_ui(ui);
+                        }
+                        assert_eq!(ui.visuals().dark_mode, expected.dark_mode);
+                        // Toolbar overrides must not become popup background colors.
+                        ui.visuals_mut().window_fill = egui::Color32::MAGENTA;
+                        ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::GREEN;
+                        store(
+                            &ctx,
+                            HistoryPopupState {
+                                owner: field_id(),
+                                highlight: None,
+                                drawn_pass: ctx.cumulative_pass_nr(),
+                            },
+                        );
+                        show_singleline(
+                            ui,
+                            &mut "draft".to_owned(),
+                            Some(&mut true),
+                            field_id(),
+                            &["entry".to_owned()],
+                            Default::default(),
+                            |edit| edit.desired_width(280.0),
+                        );
+                        assert!(state(&ctx).is_some());
+                        painted_fill = ctx.graphics(|graphics| {
+                            graphics
+                                .get(egui::LayerId::new(
+                                    egui::Order::Foreground,
+                                    popup_id(field_id()),
+                                ))
+                                .and_then(|list| {
+                                    list.all_entries().find_map(|entry| rect_fill(&entry.shape))
+                                })
+                        });
+                        painted_text = ctx.graphics(|graphics| {
+                            graphics
+                                .get(egui::LayerId::new(
+                                    egui::Order::Foreground,
+                                    popup_id(field_id()),
+                                ))
+                                .and_then(|list| {
+                                    list.all_entries()
+                                        .find_map(|entry| entry_text_color(&entry.shape))
+                                })
+                        });
+                        assert_eq!(ctx.global_style(), global_style);
+                    },
+                )
+                .drop_without_applying_deltas();
+            }
+            assert_eq!(painted_fill, Some(expected.window_fill));
+            assert_eq!(
+                painted_text,
+                Some(expected.widgets.inactive.fg_stroke.color)
+            );
+        }
+    }
+
+    #[test]
+    fn history_field_popup_matches_light_surface() {
+        assert_popup_theme(crate::os_theme::ResolvedTheme::Light, false);
+    }
+
+    #[test]
+    fn history_field_popup_matches_dark_surface() {
+        assert_popup_theme(crate::os_theme::ResolvedTheme::Dark, false);
+    }
+
+    #[test]
+    fn history_field_popup_matches_fixed_dark_child_on_light_main() {
+        assert_popup_theme(crate::os_theme::ResolvedTheme::Light, true);
     }
 
     fn harness(focused: bool) -> Harness<'static, Fixture> {

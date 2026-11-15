@@ -443,9 +443,10 @@ mod tests {
             app.tmp.path().join("favorite"),
         )];
         app.settings.tags = vec![crate::settings::TagDef::new("target tag definition".into())];
-        app.settings
-            .video_resume_positions
-            .insert("target.mp4".into(), 12.5);
+        app.settings.video_resume_positions.insert(
+            "target.mp4".into(),
+            crate::settings::VideoResumePosition::Media(12.5),
+        );
         assert!(app.settings.save_checked());
         let target_db = crate::settings_db::SettingsDb::open(app.tmp.path()).unwrap();
         app.settings = target_db.load_into_settings().unwrap();

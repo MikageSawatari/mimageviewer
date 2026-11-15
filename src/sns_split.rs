@@ -6,7 +6,7 @@
 use crate::export_crop::CropRect;
 
 pub const MIN_COUNT: u8 = 2;
-pub const MAX_COUNT: u8 = 4;
+pub const MAX_COUNT: u8 = 20;
 pub const MAX_SEAM_PERMILLE: u16 = 100;
 
 const PERMILLE_DENOMINATOR: u128 = 1000;
@@ -277,7 +277,7 @@ impl SnsSplitLayout {
             self.group.width(),
             self.group.height(),
         );
-        let minimum_width = usize::from(count);
+        let minimum_width = minimum_group_width(count, seam_permille);
         let extent_width = if image_width < minimum_width {
             minimum_width
         } else {
@@ -321,6 +321,14 @@ pub fn clamped_seam_permille(seam_permille: u16) -> u16 {
     seam_permille.min(MAX_SEAM_PERMILLE)
 }
 
+/// ceil(total_units / 1000) keeps each unrounded frame at least 1px wide,
+/// so rounding cumulative boundaries cannot create an empty frame.
+fn minimum_group_width(count: u8, seam_permille: u16) -> usize {
+    let count = usize::from(clamped_count(count));
+    let seam_units = (count - 1) * usize::from(clamped_seam_permille(seam_permille));
+    count + seam_units.div_ceil(PERMILLE_DENOMINATOR as usize)
+}
+
 fn frame_metrics(
     count: u8,
     seam_permille: u16,
@@ -328,8 +336,8 @@ fn frame_metrics(
     group_height: f32,
 ) -> FrameMetrics {
     let count = clamped_count(count);
-    let extent_width =
-        finite_rounded_usize(finite_positive_or(group_width, 1.0) as f64).max(usize::from(count));
+    let extent_width = finite_rounded_usize(finite_positive_or(group_width, 1.0) as f64)
+        .max(minimum_group_width(count, seam_permille));
     let height = finite_rounded_usize(finite_positive_or(group_height, 1.0) as f64);
     frame_metrics_for_width(count, seam_permille, extent_width, height)
 }
@@ -347,7 +355,7 @@ fn frame_metrics_for_width(
         .saturating_mul(count_units)
         .saturating_add(seam_units.saturating_mul(count_units - 1));
     FrameMetrics {
-        extent_width: extent_width.max(usize::from(count)),
+        extent_width: extent_width.max(minimum_group_width(count, seam_permille)),
         height: height.max(1),
         total_units,
         step_units: PERMILLE_DENOMINATOR.saturating_add(seam_units),
@@ -476,7 +484,10 @@ mod tests {
             .map(|pair| gap_width(pair[0], pair[1]))
             .collect::<Vec<_>>();
 
-        assert!(widths.iter().all(|&width| width >= 1));
+        assert!(
+            widths.iter().all(|&width| width >= 1),
+            "zero-width frame: {layout:?}, widths={widths:?}"
+        );
         assert!(heights.iter().all(|&height| height >= 1));
         assert!(heights.iter().all(|&height| height == heights[0]));
         assert!(widths.iter().max().unwrap() - widths.iter().min().unwrap() <= 1);
@@ -529,6 +540,25 @@ mod tests {
     }
 
     #[test]
+    fn twenty_seamless_frames_cover_a_three_by_two_image() {
+        let size = [1536, 1024];
+        for target in SnsTarget::ALL {
+            let layout = SnsSplitLayout::centered_max(target, 20, size).with_seam_permille(0, size);
+            assert_partition_invariants(layout);
+            let frames = layout.frames();
+            assert_eq!(frames.len(), 20);
+            assert!(
+                frames
+                    .iter()
+                    .all(|&frame| matches!(raw_width(frame), 76 | 77) && raw_height(frame) == 1024)
+            );
+            assert_eq!(frames.iter().copied().map(raw_width).sum::<usize>(), 1536);
+            assert!(frames.windows(2).all(|pair| pair[0].max_x == pair[1].min_x));
+            assert_eq!(layout.group, CropRect::full(1536, 1024));
+        }
+    }
+
+    #[test]
     fn zero_seam_partitions_the_group_without_gaps_or_overlap() {
         for count in MIN_COUNT..=MAX_COUNT {
             for width in usize::from(count)..=1031 {
@@ -566,6 +596,63 @@ mod tests {
                 assert_partition_invariants(layout);
             }
         }
+    }
+
+    #[test]
+    fn minimum_group_width_preserves_seamless_counts_and_rounds_seams_up() {
+        for count in MIN_COUNT..=MAX_COUNT {
+            assert_eq!(minimum_group_width(count, 0), usize::from(count));
+            for seam_permille in [1, 17, 100] {
+                let total_units =
+                    usize::from(count) * 1000 + usize::from(count - 1) * usize::from(seam_permille);
+                let minimum = minimum_group_width(count, seam_permille);
+                assert!(minimum * 1000 >= total_units);
+                assert!((minimum - 1) * 1000 < total_units);
+            }
+        }
+        assert_eq!(minimum_group_width(13, 100), 15);
+        assert_eq!(minimum_group_width(0, 0), usize::from(MIN_COUNT));
+        assert_eq!(minimum_group_width(u8::MAX, u16::MAX), 22);
+    }
+
+    #[test]
+    fn minimum_and_nearby_group_widths_keep_all_partition_invariants() {
+        for target in SnsTarget::ALL {
+            for count in MIN_COUNT..=MAX_COUNT {
+                for seam_permille in [0, 1, 17, 100] {
+                    let minimum = minimum_group_width(count, seam_permille);
+                    for width in minimum..=minimum + 8 {
+                        let layout = layout_for_extent(target, count, seam_permille, width, 3);
+                        assert_eq!(raw_width(layout.group), width);
+                        assert!(layout.fits([width, 3]));
+                        assert_partition_invariants(layout);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn thirteen_frames_with_ten_percent_seams_require_fifteen_pixels() {
+        let requested = SnsSplitLayout {
+            target: SnsTarget::X,
+            count: 13,
+            seam_permille: 100,
+            group: CropRect::full(14, 313),
+        };
+        let frames = requested.frames();
+        assert_eq!(frames.len(), 13);
+        assert!(frames.iter().copied().all(|frame| raw_width(frame) >= 1));
+        assert_eq!(raw_width(requested.frames_extent()), 15);
+        assert!(!requested.fits([14, 313]));
+
+        let clamped = requested.clamped([14, 313]);
+        assert_eq!(raw_width(clamped.group), 15);
+        assert!(!clamped.fits([14, 313]));
+        assert_partition_invariants(clamped);
+        let fitting = requested.clamped([15, 313]);
+        assert!(fitting.fits([15, 313]));
+        assert_partition_invariants(fitting);
     }
 
     #[test]
@@ -721,7 +808,15 @@ mod tests {
 
     #[test]
     fn count_and_seam_are_clamped_at_every_entry_point() {
-        for (input, expected) in [(0, 2), (1, 2), (5, 4), (255, 4)] {
+        for (input, expected) in [
+            (0, 2),
+            (1, 2),
+            (4, 4),
+            (5, 5),
+            (20, 20),
+            (21, 20),
+            (255, 20),
+        ] {
             let layout = SnsSplitLayout::centered_max(SnsTarget::X, input, [4000, 3000]);
             assert_eq!(layout.count, expected);
             assert_eq!(layout.frames().len(), usize::from(expected));
@@ -746,16 +841,31 @@ mod tests {
     fn minimum_non_degenerate_row_reports_when_it_cannot_fit() {
         for target in SnsTarget::ALL {
             for count in MIN_COUNT..=MAX_COUNT {
-                let too_narrow = [usize::from(count) - 1, 3];
-                let layout = SnsSplitLayout::centered_max(target, count, too_narrow);
-                assert!(!layout.fits(too_narrow));
-                assert_eq!(raw_width(layout.group), usize::from(count));
-                assert_partition_invariants(layout);
+                for seam_permille in [0, 1, 17, 100] {
+                    let minimum = minimum_group_width(count, seam_permille);
+                    let too_narrow = [minimum - 1, 3];
+                    let layout = layout_for_extent(
+                        target,
+                        count,
+                        seam_permille,
+                        too_narrow[0],
+                        too_narrow[1],
+                    );
+                    assert!(!layout.fits(too_narrow));
+                    assert_eq!(raw_width(layout.group), minimum);
+                    assert_partition_invariants(layout);
 
-                let just_wide_enough = [usize::from(count), 1];
-                let layout = SnsSplitLayout::centered_max(target, count, just_wide_enough);
-                assert!(layout.fits(just_wide_enough));
-                assert_partition_invariants(layout);
+                    let just_wide_enough = [minimum, 1];
+                    let layout = layout_for_extent(
+                        target,
+                        count,
+                        seam_permille,
+                        just_wide_enough[0],
+                        just_wide_enough[1],
+                    );
+                    assert!(layout.fits(just_wide_enough));
+                    assert_partition_invariants(layout);
+                }
             }
         }
     }

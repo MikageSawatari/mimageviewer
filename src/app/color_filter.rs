@@ -1229,12 +1229,16 @@ mod tests {
     fn cover_auto_color_identity_follows_binding_and_manual_range_without_source_io() {
         let mut app = representative_app();
         let off = app.color_identity_for_idx(0).unwrap().0;
-        app.settings.default_reading_direction = crate::settings::ReadingDirection::Ltr;
+        app.settings.thumb_cover_auto_crop_binding = crate::settings::ReadingDirection::Ltr;
         assert_eq!(app.color_identity_for_idx(0).unwrap().0, off);
         app.settings.thumb_cover_auto_crop = true;
         let ltr = app.color_identity_for_idx(0).unwrap().0;
         assert_ne!(ltr, off);
-        assert!(ltr.contains("|autocrop:v1:ltr"));
+        assert!(ltr.contains("|autocrop:v3:ltr"));
+        app.settings.default_reading_direction = crate::settings::ReadingDirection::Rtl;
+        assert_eq!(app.color_identity_for_idx(0).unwrap().0, ltr);
+        app.settings.default_reading_direction = crate::settings::ReadingDirection::Ltr;
+        assert_eq!(app.color_identity_for_idx(0).unwrap().0, ltr);
         let (_, request) = app.color_work_identity_for_idx(0).unwrap();
         assert_eq!(
             request.auto_cover_crop,
@@ -1242,7 +1246,7 @@ mod tests {
                 crate::settings::ReadingDirection::Ltr
             ))
         );
-        app.settings.default_reading_direction = crate::settings::ReadingDirection::Rtl;
+        app.settings.thumb_cover_auto_crop_binding = crate::settings::ReadingDirection::Rtl;
         assert_ne!(app.color_identity_for_idx(0).unwrap().0, ltr);
         let path = app.items[0].container_path().unwrap().to_owned();
         app.folder_pin_map.insert(
@@ -1258,7 +1262,7 @@ mod tests {
         );
         let manual = app.color_identity_for_idx(0).unwrap().0;
         assert!(!manual.contains("|autocrop:"));
-        app.settings.default_reading_direction = crate::settings::ReadingDirection::Ltr;
+        app.settings.thumb_cover_auto_crop_binding = crate::settings::ReadingDirection::Ltr;
         assert_eq!(app.color_identity_for_idx(0).unwrap().0, manual);
     }
 
@@ -1447,6 +1451,7 @@ mod tests {
                         stale.source_dims,
                         &stale.jpeg_data,
                         &stale.cover,
+                        stale.auto_material,
                     )
                     .unwrap();
                 }
@@ -1598,6 +1603,7 @@ mod tests {
         ));
         let (jpeg_data, _, _) = crate::catalog::encode_thumb_webp(&image, 8, 100.0).unwrap();
         crate::catalog::CacheEntry {
+            auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
             cover: crate::cover_identity::CoverIdentity::Legacy,
             mtime,
             file_size,
@@ -1632,6 +1638,7 @@ mod tests {
             green.source_dims,
             &green.jpeg_data,
             &crate::cover_identity::CoverIdentity::Legacy,
+            green.auto_material,
         )
         .unwrap();
         let palette = scan_one(req, None, Default::default(), Some(db));
@@ -1698,6 +1705,7 @@ mod tests {
             blue.source_dims,
             &blue.jpeg_data,
             &crate::cover_identity::CoverIdentity::Legacy,
+            blue.auto_material,
         )
         .unwrap();
         let palette = scan_one(
@@ -1749,6 +1757,7 @@ mod tests {
         ));
         let (bytes, _, _) = crate::catalog::encode_thumb_webp(&image, 8, 100.0).unwrap();
         let entry = crate::catalog::CacheEntry {
+            auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
             cover: crate::cover_identity::CoverIdentity::Legacy,
             mtime: 10,
             file_size: 20,
@@ -1780,7 +1789,8 @@ mod tests {
                 20,
                 Some((8, 8)),
                 &bytes,
-                &crate::cover_identity::CoverIdentity::Legacy
+                &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic
             )
             .unwrap()
         );
@@ -1840,6 +1850,7 @@ mod tests {
         ));
         let (bytes, _, _) = crate::catalog::encode_thumb_webp(&green, 8, 100.0).unwrap();
         let entry = crate::catalog::CacheEntry {
+            auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
             cover: crate::cover_identity::CoverIdentity::Legacy,
             mtime: req.mtime - 1,
             file_size: req.file_size,
@@ -1857,6 +1868,7 @@ mod tests {
             entry.source_dims,
             &entry.jpeg_data,
             &crate::cover_identity::CoverIdentity::Legacy,
+            entry.auto_material,
         )
         .unwrap();
         let cover = scan_one(
@@ -2008,6 +2020,7 @@ mod tests {
                 entry.source_dims,
                 &entry.jpeg_data,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                entry.auto_material,
             )
             .unwrap();
         assert!(req.catalog_target.is_retired());
@@ -2118,6 +2131,7 @@ mod tests {
                     green.source_dims,
                     &green.jpeg_data,
                     &crate::cover_identity::CoverIdentity::Legacy,
+                    green.auto_material,
                 )
                 .unwrap();
             }

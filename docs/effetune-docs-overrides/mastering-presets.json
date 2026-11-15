@@ -1,0 +1,26 @@
+[
+  {
+    "operation": "replace_inline",
+    "anchor": "再生中やファイル処理中に、",
+    "replacement": "mImageViewer での再生中に、",
+    "reason": "Bundled presets process mIV playback; no standalone offline processor."
+  },
+  {
+    "operation": "replace_html",
+    "anchor": "<h2 id=\"完成したミックスを書き出す\">完成したミックスを書き出す</h2>",
+    "replacement": "<h2 id=\"再生音で調整する\">再生音で調整する</h2>",
+    "reason": "Describe playback adjustment rather than unavailable file export."
+  },
+  {
+    "operation": "replace_html",
+    "anchor": "<li><p><strong>設定 &gt; 環境設定... &gt; オフラインファイル出力</strong>でWAVまたはFLACと、出力サンプルレート・品質を選びます。Effect Pipelineの下にあるファイル処理エリアへ元のミックスをドロップすると、処理済みのコピーを保存できます。</p></li>",
+    "replacement": "",
+    "reason": "Offline file output preferences and the file processing drop area are absent in bundled VST."
+  },
+  {
+    "operation": "replace_inline",
+    "anchor": "Limiterは最後に置き、納品などでラウドネスやトゥルーピークの指定がある場合は、書き出したファイルを測定してください。これらのプリセットは特定の値を保証するものではありません。",
+    "replacement": "Limiterは最後に置いてください。これらのプリセットは特定のラウドネスやトゥルーピークの値を保証するものではありません。",
+    "reason": "Preserve the limitation without suggesting mIV Sound can export processed audio files."
+  }
+]

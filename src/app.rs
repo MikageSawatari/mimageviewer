@@ -15428,8 +15428,8 @@ fn migrate_key_map_for_rename<V>(
 }
 
 /// Resume and watched describe the same media entry; an existing destination wins.
-fn migrate_media_memory_for_rename(
-    positions: &mut HashMap<String, f64>,
+fn migrate_media_memory_for_rename<T>(
+    positions: &mut HashMap<String, T>,
     watched: &mut HashSet<String>,
     old_k: &str,
     new_k: &str,
@@ -15534,24 +15534,6 @@ fn viewer_context_is_music_consumer(context: ContextRef<'_>) -> bool {
                 .is_some_and(|state| state.fs_idx == idx))
 }
 
-/// resume 保存に使う現在位置を、映像の表示状態に合わせて選ぶ。
-///
-/// 純粋な動画→音声モードでは presenter が hidden のため表示 PTS が入口で止まる。
-/// VST ホスト表示中は presenter が再び進むので、通常動画と同じ表示 PTS を優先する。
-/// (review-v2.3.0 追補6: R1-1 audio-mode resume)
-fn video_resume_position_for_save(
-    player: &crate::video::VideoPlayer,
-    audio_mode_without_vst: bool,
-) -> f64 {
-    if audio_mode_without_vst {
-        player.position()
-    } else {
-        player
-            .last_displayed_pts_secs()
-            .unwrap_or_else(|| player.position())
-    }
-}
-
 fn playback_position_deadline(
     current_secs: f64,
     target_secs: f64,
@@ -15613,11 +15595,14 @@ fn viewer_context_media_teardown_plan(
                 && !context
                     .video_audio_vst()
                     .is_some_and(|state| state.fs_idx == *idx);
+            let Some(position) = player.resume_position_for_save(audio_mode_without_vst) else {
+                continue;
+            };
             plan.resume_updates.push(MediaResumeUpdate {
                 clear_generation,
                 key: crate::adjustment_db::normalize_path(&path),
                 path,
-                position: video_resume_position_for_save(player, audio_mode_without_vst),
+                position,
                 duration: player.duration(),
                 at_eof: player.is_at_eof(),
                 has_video: player.info().is_some_and(|info| info.has_video),
@@ -15706,7 +15691,7 @@ fn pause_viewer_context_bundle_media_for_remote_session(context: ContextRef<'_>)
 
 #[cfg(windows)]
 fn apply_viewer_context_media_resume_updates(
-    map: &mut std::collections::HashMap<String, f64>,
+    map: &mut std::collections::HashMap<String, crate::settings::VideoResumePosition>,
     watched: &mut HashSet<String>,
     choices: &mut std::collections::HashMap<String, crate::video::SavedAudioTrackChoice>,
     updates: &[MediaResumeUpdate],
@@ -23218,27 +23203,23 @@ impl App {
                 source_dims,
                 layout_dims,
                 from_edit_preview,
+                auto_material,
                 tex,
                 ..
             } = state
             {
-                let listing_dims = if *from_edit_preview {
-                    *source_dims
-                } else {
-                    (*layout_dims).or(*source_dims)
-                };
-                let ratio = match listing_dims {
-                    Some((sw, sh)) if sw > 0 => sh as f32 / sw as f32,
-                    _ => {
-                        // source_dims が無くても、テクスチャ寸法から比率を拾える
-                        // (アスペクト保持リサイズ済みなので比率は保たれる)
-                        let size = tex.size();
-                        if size[0] == 0 {
-                            continue;
-                        }
-                        size[1] as f32 / size[0] as f32
-                    }
-                };
+                let size = tex.size();
+                let view = crate::cover_auto_material::auto_crop_view(
+                    source_dims.unwrap_or((size[0] as u32, size[1] as u32)),
+                    if *from_edit_preview {
+                        None
+                    } else {
+                        *layout_dims
+                    },
+                    *auto_material,
+                    crate::rotation_db::Rotation::None,
+                );
+                let ratio = view.displayed_size.y / view.displayed_size.x;
                 if ratio > 0.0 && ratio.is_finite() {
                     self.auto_aspect.samples.insert(idx, ratio);
                 }
@@ -23434,8 +23415,8 @@ impl App {
                 if entry.mtime != req.mtime || entry.file_size != req.file_size {
                     continue;
                 }
-                let ratio = match entry.source_dims {
-                    Some((w, h)) if w > 0 => h as f32 / w as f32,
+                let dims = match entry.source_dims {
+                    Some((w, h)) if w > 0 => (w, h),
                     Some(_) => continue,
                     None if probe_budget > 0 => {
                         probe_budget -= 1;
@@ -23447,10 +23428,17 @@ impl App {
                         if w == 0 {
                             continue;
                         }
-                        h as f32 / w as f32
+                        (w, h)
                     }
                     None => continue,
                 };
+                let view = crate::cover_auto_material::auto_crop_view(
+                    dims,
+                    entry.layout_dims,
+                    entry.auto_material,
+                    crate::rotation_db::Rotation::None,
+                );
+                let ratio = view.displayed_size.y / view.displayed_size.x;
                 staged.push((idx, ratio));
             }
         } // ← read guard が落ちる
@@ -24340,9 +24328,41 @@ impl App {
             })
     }
 
+    /// Read the main presentation predicates without changing viewer ownership.
+    pub(crate) fn folder_pane_main_chrome_visible_now(&self, ctx: &egui::Context) -> bool {
+        let visible = self.settings.folder_tree_pane_visible
+            && !self.folder_pane_disabled()
+            && self.window_visible
+            && !ctx.input(|input| input.viewport().minimized.unwrap_or(false))
+            && !self.indexer_init.overlay_active();
+        #[cfg(windows)]
+        let visible = visible
+            && !self.native_video_fullscreen_active_for_main_backdrop()
+            && !self.fullscreen_embedded_still_active()
+            && !self.main_embedded_fullscreen_reopen_pending()
+            && !self.still_fullscreen_viewport_enter_suppressed_now();
+        visible
+    }
+
+    /// Query the pointer blocker table (without menus), allowing a tree gesture
+    /// to continue through sidecar hydration. Other simultaneous blockers count.
+    pub(crate) fn main_chrome_pointer_blocked_except_sidecar_restore(&self) -> bool {
+        self.modal_dialog_block_reason_filtered(false, false)
+            .is_some()
+            || self.omitted_entries_dialog_visible()
+    }
+
     fn modal_dialog_block_reason_without_omitted_entries(
         &self,
         include_menus: bool,
+    ) -> Option<&'static str> {
+        self.modal_dialog_block_reason_filtered(include_menus, true)
+    }
+
+    fn modal_dialog_block_reason_filtered(
+        &self,
+        include_menus: bool,
+        include_sidecar_restore: bool,
     ) -> Option<&'static str> {
         macro_rules! first {
             ($( $cond:expr => $name:literal ),+ $(,)?) => {
@@ -24366,7 +24386,7 @@ impl App {
             self.everything_search_progress_visible() => "everything_search",
             self.capture_selection_open() => "clipboard_capture_selection",
             self.cover_crop_dialog_open() => "cover_crop",
-            self.sidecar_restore_active() => "sidecar_restore",
+            include_sidecar_restore && self.sidecar_restore_active() => "sidecar_restore",
             self.remote_session_blocks_local_control() => "remote_session",
             self.remote_connection_dialog_open() => "remote_connection",
             self.show_stats_dialog => "stats",
@@ -43577,6 +43597,7 @@ impl App {
                 entry.layout_dims,
                 &entry.jpeg_data,
                 &entry.cover,
+                entry.auto_material,
             ) {
                 Ok(b) => b,
                 Err(e) => {
@@ -43663,6 +43684,7 @@ impl App {
                 entry.layout_dims,
                 &entry.jpeg_data,
                 &entry.cover,
+                entry.auto_material,
             );
             crate::perf::event("nav", "virtual_writeback", Some(&parent_key), 0, &[]);
         }
@@ -46658,6 +46680,7 @@ impl App {
                 None,
                 &webp,
                 &cover,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             ) {
                 Ok(true) => {}
                 Ok(false) => {
@@ -46685,6 +46708,7 @@ impl App {
                 map.insert(
                     pinned_key.clone(),
                     crate::catalog::CacheEntry {
+                        auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                         mtime: resolved.mtime,
                         file_size: resolved.file_size,
                         jpeg_data: webp,
@@ -46739,6 +46763,7 @@ impl App {
                             .map(|pin| pin.thumb_webp)
                             .filter(|b| !b.is_empty())?;
                         Some(crate::catalog::CacheEntry {
+                            auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                             mtime: 0,
                             file_size: 0,
                             jpeg_data: webp,
@@ -46972,6 +46997,7 @@ impl App {
                 entry.source_dims,
                 &entry.jpeg_data,
                 &entry.cover,
+                entry.auto_material,
             ) {
                 Ok(true) => {
                     if let Ok(mut map) = cache_map.write() {
@@ -57272,6 +57298,7 @@ impl App {
             let pixels = msg.into_pixels().expect("owner queues only image messages");
             let crate::thumb_loader::ThumbPixels {
                 cover,
+                auto_material,
                 image: color_image,
                 origin,
                 from_edit_preview,
@@ -57362,6 +57389,7 @@ impl App {
                     cover: crate::cover_source_scope::LoadedCoverIdentity::from_material(
                         cover, scope,
                     ),
+                    auto_material,
                     display_basis,
                     tex: handle,
                     origin,
@@ -57405,16 +57433,13 @@ impl App {
                         self.settings.thumb_container_icon_kinds,
                     )
                 {
-                    let listing_dims = if from_edit_preview {
-                        source_dims
-                    } else {
-                        layout_dims.or(source_dims)
-                    };
-                    let ratio = match listing_dims {
-                        Some((sw, sh)) if sw > 0 => sh as f32 / sw as f32,
-                        _ if w > 0 => h as f32 / w as f32,
-                        _ => -1.0,
-                    };
+                    let view = crate::cover_auto_material::auto_crop_view(
+                        source_dims.unwrap_or((w as u32, h as u32)),
+                        if from_edit_preview { None } else { layout_dims },
+                        auto_material,
+                        crate::rotation_db::Rotation::None,
+                    );
+                    let ratio = view.displayed_size.y / view.displayed_size.x;
                     if ratio > 0.0 && ratio.is_finite() {
                         self.auto_aspect.samples.insert(i, ratio);
                     }
@@ -59149,6 +59174,8 @@ impl App {
                     from_edit_preview,
                     rendered_at_px,
                     source_dims,
+                    auto_material,
+                    tex,
                     ..
                 }) => {
                     // 1. キャッシュ由来 (品質アップグレード)
@@ -59161,11 +59188,37 @@ impl App {
                     // しない)。source で頭打ちにしないと永久に「解像度不足」判定が
                     // 続き、アイドル時に同じセルを毎サイクル re-enqueue する無限
                     // ループ (進捗バーが高速に左右を往復する原因) になる。
-                    let source_long_edge = source_dims.map(|(w, h)| w.max(h));
+                    let angle = self.grid_tile_rotation_memory(i);
+                    let source_long_edge = source_dims.map(|dims| {
+                        let (w, h) = crate::cover_auto_material::auto_crop_view(
+                            dims,
+                            None,
+                            *auto_material,
+                            angle,
+                        )
+                        .source_dims;
+                        w.max(h)
+                    });
+                    let effective_rendered_at_px = if matches!(
+                        auto_material,
+                        crate::cover_auto_material::AutoMaterial::Automatic(_)
+                    ) {
+                        let [w, h] = tex.size();
+                        let (w, h) = crate::cover_auto_material::auto_crop_view(
+                            (w as u32, h as u32),
+                            None,
+                            *auto_material,
+                            angle,
+                        )
+                        .source_dims;
+                        w.max(h)
+                    } else {
+                        *rendered_at_px
+                    };
                     let target_px = source_long_edge
                         .map(|src| src.min(current_display_px))
                         .unwrap_or(current_display_px);
-                    let undersized = (*rendered_at_px as u64) * 5 < (target_px as u64) * 4;
+                    let undersized = (effective_rendered_at_px as u64) * 5 < (target_px as u64) * 4;
                     let origin_needs_upgrade = match *origin {
                         crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache => true,
                         crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
@@ -79864,7 +79917,9 @@ impl App {
             let config_key = crate::adjustment_db::normalize_path(&state.config.path);
             config_key == path_key
         });
-        let play_test_start = play_test_for_video.and_then(|state| state.config.start_secs);
+        let play_test_start = play_test_for_video
+            .and_then(|state| state.config.start_secs)
+            .map(crate::settings::VideoResumePosition::Media);
         let play_test_mute = play_test_for_video.is_some_and(|state| state.config.mute);
         let saved_resume = self.settings.video_resume_positions.get(&path_key).copied();
         let initial_audio_track = self.saved_audio_track_choice_for_path(&vp);
@@ -98879,7 +98934,9 @@ impl App {
                         .video_audio_vst
                         .as_ref()
                         .is_some_and(|state| state.fs_idx == *idx);
-                let pos = video_resume_position_for_save(player, audio_mode_without_vst);
+                let Some(pos) = player.resume_position_for_save(audio_mode_without_vst) else {
+                    continue;
+                };
                 #[cfg(windows)]
                 if player.info().is_some_and(|info| info.has_video) {
                     thumb_requests.push((player.path().clone(), key.clone(), pos));
@@ -100562,18 +100619,12 @@ impl App {
                             .map(|event| (*idx, event)),
                     );
                 }
-                if do_save {
-                    let path_key = crate::adjustment_db::normalize_path(player.path());
-                    // 音声モードにトグルした動画 (Inc 7) は映像フレームが進まず `last_displayed_pts`
-                    // が detach 時点で固着するので、音声クロックの `position()` を保存位置に使う。
-                    // 音声ファイルは従来どおり (last_displayed_pts は None なので実質 position、Codex 7c
-                    // で byte-equivalent を維持するため video_audio_mode 限定で分岐)。
-                    // 7e: VST ホスト表示中は映像フレームが進むので last_displayed_pts を使う
-                    // (native video と同じ)。純粋な音声モード (映像固着) のときだけ position()。
-                    let pos = video_resume_position_for_save(
-                        player,
+                if do_save
+                    && let Some(pos) = player.resume_position_for_save(
                         video_audio_mode == Some(*idx) && video_audio_vst_idx != Some(*idx),
-                    );
+                    )
+                {
+                    let path_key = crate::adjustment_db::normalize_path(player.path());
                     updates.push(MediaResumeUpdate {
                         clear_generation: self.media_memory_clear_generation,
                         path: player.path().clone(),
@@ -101241,8 +101292,7 @@ impl App {
         #[cfg(windows)]
         let main_embedded_transitions_polled_before_render = {
             let embedded_active = self.fullscreen_embedded_still_active();
-            let embedded_pending =
-                self.native_video_in_window_active && self.fs_nav_deferred_reopen_wait_active();
+            let embedded_pending = self.main_embedded_fullscreen_reopen_pending();
             let should_poll = should_poll_main_embedded_transitions_before_render(
                 embedded_active,
                 embedded_pending,
@@ -101274,8 +101324,7 @@ impl App {
         // 続くグリッド描画は同じく抑止する必要がある
         // (両方の CentralPanel が走ると二重描画 + 白フラッシュ)。
         #[cfg(windows)]
-        let embedded_fs_pending =
-            self.native_video_in_window_active && self.fs_nav_deferred_reopen_wait_active();
+        let embedded_fs_pending = self.main_embedded_fullscreen_reopen_pending();
         #[cfg(not(windows))]
         let embedded_fs_pending = false;
         let should_render_main_fullscreen_viewport =
@@ -103107,12 +103156,15 @@ fn parent_row_for_item(
 
 /// Settings alone are used while preparing a new list; its previous mounted
 /// context (possibly Drive) must not affect the incoming cache namespace.
-fn configured_thumbnail_auto_crop(
+pub(crate) fn configured_thumbnail_auto_crop(
     settings: &crate::settings::Settings,
 ) -> Option<crate::cover_auto_crop::AutoCropIdentity> {
     settings
         .thumb_cover_auto_crop
-        .then(|| crate::cover_auto_crop::AutoCropIdentity::new(settings.default_reading_direction))
+        .then(|| crate::cover_auto_crop::AutoCropIdentity {
+            binding: settings.thumb_cover_auto_crop_binding,
+            folders: settings.thumb_cover_auto_crop_folders,
+        })
 }
 
 impl App {
@@ -104574,6 +104626,27 @@ pub(crate) fn draw_rotated_image_ex(
     free_rotation_rad: f32,
     center: egui::Pos2,
 ) {
+    draw_rotated_image_uv_ex(
+        painter,
+        texture_id,
+        rect,
+        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        rotation,
+        free_rotation_rad,
+        center,
+    );
+}
+
+/// Quarter-turn drawing over an unrotated source UV subrectangle.
+pub(crate) fn draw_rotated_image_uv_ex(
+    painter: &egui::Painter,
+    texture_id: egui::TextureId,
+    rect: egui::Rect,
+    uv: egui::Rect,
+    rotation: crate::rotation_db::Rotation,
+    free_rotation_rad: f32,
+    center: egui::Pos2,
+) {
     // UV 座標を回転に合わせて変換
     // 頂点順: 左上, 右上, 右下, 左下 (画面座標)
     let uvs = match rotation {
@@ -104603,6 +104676,7 @@ pub(crate) fn draw_rotated_image_ex(
         ],
     };
 
+    let uvs = uvs.map(|p| uv.min + p.to_vec2() * uv.size());
     let mut positions = [
         rect.left_top(),
         rect.right_top(),
@@ -104655,7 +104729,7 @@ pub(crate) const VIDEO_RESUME_END_GUARD_SECS: f64 = 5.0;
 /// - 残り `VIDEO_RESUME_END_GUARD_SECS` 以下 → エントリ削除 (完走済み)
 /// - それ以外 → position を保存
 fn save_video_resume_position(
-    map: &mut std::collections::HashMap<String, f64>,
+    map: &mut std::collections::HashMap<String, crate::settings::VideoResumePosition>,
     watched: &mut HashSet<String>,
     key: String,
     position: f64,
@@ -104677,7 +104751,7 @@ fn save_video_resume_position(
         return false;
     }
     watched.remove(&key);
-    map.insert(key, position);
+    map.insert(key, crate::settings::VideoResumePosition::Media(position));
     true
 }
 
@@ -104800,12 +104874,12 @@ pub(crate) fn color_image_to_dynamic_composited(
 /// `from_grid` = 一覧から明示的に開いた (= `open_starts_from_beginning` で判定)、
 /// それ以外 (Ctrl+↑↓ / ホイール / キー移動 / 再開) は `nav_resume` で判定。
 /// 「最初から」なら `None` (= 先頭再生)、「続きから」なら保存済み位置。
-fn video_resume_for_open(
-    saved_resume: Option<f64>,
+fn video_resume_for_open<T>(
+    saved_resume: Option<T>,
     from_grid: bool,
     open_starts_from_beginning: bool,
     nav_resume: crate::settings::ResumeMode,
-) -> Option<f64> {
+) -> Option<T> {
     let from_start = if from_grid {
         open_starts_from_beginning
     } else {

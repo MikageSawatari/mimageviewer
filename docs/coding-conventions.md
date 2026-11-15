@@ -51,6 +51,9 @@
   タイトルバーを含む暗色 `egui::Window` は `with_dark_context_style` を使う。
   popup / Window のために `ctx.set_theme` / `ctx.set_visuals` を直接呼ばない。限定スコープが
   Light / Dark 両 Style と theme preference を復元することが、メインテーマへ漏らさない不変条件。
+  入力履歴等、呼び出し元の表示面に従う popup は `popup_visuals_for_ui` で
+  `ui.visuals().dark_mode` と現在の文字コントラストから正規 Visuals を取り、子 UI と
+  `popup_frame_with_visuals` の両方へ適用する。toolbar の局所的な fill 等は複製しない。
 - **ドラッグ移動**: `anchor()` を使うとウィンドウが固定されドラッグできなくなる。
   必ず `default_pos()` を使う。定番の初期位置は `ctx.content_rect().min + egui::vec2(60.0, 40.0)`。
 - **閉じるボタン**: `.open(&mut open)` でタイトルバーに × ボタンが付く。

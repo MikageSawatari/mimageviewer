@@ -3199,6 +3199,47 @@ impl AiFeatureMode {
     }
 }
 
+/// Saved playback position, retaining its time basis until metadata is available.
+/// Old JSON settings used a bare number, which always represented raw PTS seconds.
+#[derive(serde::Serialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoResumePosition {
+    LegacyRaw(f64),
+    Media(f64),
+}
+
+impl VideoResumePosition {
+    /// Stored value for existing list previews; restoration must resolve the basis first.
+    pub fn stored_secs(&self) -> &f64 {
+        match self {
+            Self::LegacyRaw(secs) | Self::Media(secs) => secs,
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for VideoResumePosition {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Tagged {
+            LegacyRaw(f64),
+            Media(f64),
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Compatible {
+            Legacy(f64),
+            Tagged(Tagged),
+        }
+        Ok(match Compatible::deserialize(deserializer)? {
+            Compatible::Legacy(secs) | Compatible::Tagged(Tagged::LegacyRaw(secs)) => {
+                Self::LegacyRaw(secs)
+            }
+            Compatible::Tagged(Tagged::Media(secs)) => Self::Media(secs),
+        })
+    }
+}
+
 /// - `RtlCover`: 見開き 右→左（表紙あり）— [0] [1,2] [3,4] ...
 /// 動画 / ZIP・PDF 本を開く・移動したときに、前回位置 (続き) から始めるか先頭からか。
 /// 「エントリ方法 (一覧から開く / Ctrl+↑↓ 移動) × メディア (動画 / 本)」の各セルに使う共通 enum。
@@ -3726,6 +3767,10 @@ pub enum ReadingDirection {
     #[default]
     Ltr,
     Rtl,
+}
+
+fn default_thumb_cover_auto_crop_binding() -> ReadingDirection {
+    ReadingDirection::Rtl
 }
 
 impl ReadingDirection {
@@ -4999,6 +5044,12 @@ pub struct Settings {
     /// 書庫・PDF のつながった表紙から表表紙を自動で切り出す。
     #[serde(default)]
     pub thumb_cover_auto_crop: bool,
+    /// 自動切り出しで表表紙の側を決める綴じ方向（横連結とは独立）。
+    #[serde(default = "default_thumb_cover_auto_crop_binding")]
+    pub thumb_cover_auto_crop_binding: ReadingDirection,
+    /// 直下の画像を表紙にする画像フォルダの本も自動切り出しの対象にする。
+    #[serde(default)]
+    pub thumb_cover_auto_crop_folders: bool,
     /// サムネイル右下に動画・音声の長さを表示する。
     #[serde(default = "default_true")]
     pub thumb_show_media_duration: bool,
@@ -5388,7 +5439,7 @@ pub struct Settings {
     /// 直前に選んだ投稿先 (`"x"` / `"instagram"`)。ページ固有の配置は保存しない。
     #[serde(default = "default_sns_split_target")]
     pub sns_split_target: Option<String>,
-    /// 直前に選んだ分割枚数 (2..=4)。ページ固有の配置は保存しない。
+    /// 直前に選んだ分割枚数 (2..=20)。ページ固有の配置は保存しない。
     #[serde(default = "default_sns_split_count")]
     pub sns_split_count: u8,
     /// 直前に選んだ継ぎ目幅。枠幅に対する千分率 (0..=100)。
@@ -6174,7 +6225,7 @@ pub struct Settings {
     /// `VideoPlayer::open` 時に自動 resume、5 秒ごと + drop 時に保存。
     /// 動画末尾近く (残り 5 秒以内) は 0 にリセットして "次回最初から" の挙動。
     #[serde(default)]
-    pub video_resume_positions: std::collections::HashMap<String, f64>,
+    pub video_resume_positions: std::collections::HashMap<String, VideoResumePosition>,
     /// 最後まで視聴した動画・音声の正規化済み絶対パス。再生位置の復元とは独立。
     #[serde(default)]
     pub video_watched_to_end: std::collections::HashSet<String>,
@@ -7986,6 +8037,8 @@ impl Default for Settings {
             thumb_show_type_icon: default_thumb_show_type_icon(),
             thumb_container_icon_kinds: crate::grid_item::ContainerIconKinds::NONE,
             thumb_cover_auto_crop: false,
+            thumb_cover_auto_crop_binding: default_thumb_cover_auto_crop_binding(),
+            thumb_cover_auto_crop_folders: false,
             selection_info_display_mode: SelectionInfoDisplayMode::Tooltip,
             thumb_show_media_duration: true,
             thumb_show_resume_meter: true,
@@ -11370,6 +11423,57 @@ mod tests {
     }
 
     #[test]
+    fn thumb_cover_auto_crop_binding_default_missing_and_db_roundtrip() {
+        assert_eq!(
+            Settings::default().thumb_cover_auto_crop_binding,
+            ReadingDirection::Rtl
+        );
+        assert_eq!(
+            serde_json::from_str::<Settings>("{}")
+                .unwrap()
+                .thumb_cover_auto_crop_binding,
+            ReadingDirection::Rtl
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(temp.path()).unwrap();
+        for binding in [ReadingDirection::Rtl, ReadingDirection::Ltr] {
+            let settings = Settings {
+                thumb_cover_auto_crop_binding: binding,
+                ..Settings::default()
+            };
+            let restored: Settings =
+                serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(restored.thumb_cover_auto_crop_binding, binding);
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings()
+                    .unwrap()
+                    .thumb_cover_auto_crop_binding,
+                binding
+            );
+        }
+        let conn = rusqlite::Connection::open(temp.path().join("settings.db")).unwrap();
+        for reading in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
+            db.save_full(&Settings {
+                default_reading_direction: reading,
+                ..Settings::default()
+            })
+            .unwrap();
+            conn.execute(
+                "DELETE FROM settings_kv WHERE key = 'thumb_cover_auto_crop_binding'",
+                [],
+            )
+            .unwrap();
+            assert_eq!(
+                db.load_into_settings()
+                    .unwrap()
+                    .thumb_cover_auto_crop_binding,
+                ReadingDirection::Rtl
+            );
+        }
+    }
+
+    #[test]
     fn thumb_cover_auto_crop_default_missing_and_db_roundtrip() {
         assert!(!Settings::default().thumb_cover_auto_crop);
         assert!(
@@ -11400,6 +11504,51 @@ mod tests {
         )
         .unwrap();
         assert!(!db.load_into_settings().unwrap().thumb_cover_auto_crop);
+    }
+
+    #[test]
+    fn thumb_cover_auto_crop_folders_default_missing_and_db_roundtrip() {
+        assert!(!Settings::default().thumb_cover_auto_crop_folders);
+        assert!(
+            !serde_json::from_str::<Settings>("{}")
+                .unwrap()
+                .thumb_cover_auto_crop_folders
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(temp.path()).unwrap();
+        for enabled in [false, true] {
+            let settings = Settings {
+                thumb_cover_auto_crop_folders: enabled,
+                ..Settings::default()
+            };
+            let restored: Settings =
+                serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(restored.thumb_cover_auto_crop_folders, enabled);
+            assert_eq!(
+                settings
+                    .thumbnail_source_discovery_snapshot()
+                    .thumb_cover_auto_crop_folders,
+                enabled
+            );
+            db.save_full(&settings).unwrap();
+            assert_eq!(
+                db.load_into_settings()
+                    .unwrap()
+                    .thumb_cover_auto_crop_folders,
+                enabled
+            );
+        }
+        let conn = rusqlite::Connection::open(temp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'thumb_cover_auto_crop_folders'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            !db.load_into_settings()
+                .unwrap()
+                .thumb_cover_auto_crop_folders
+        );
     }
 
     #[test]
@@ -11936,6 +12085,20 @@ mod tests {
         assert_eq!(restored.sns_split_count, 4);
         assert_eq!(restored.sns_split_seam_permille, 100);
         assert_eq!(restored.sns_split_frame_ratio.as_deref(), Some("4:5"));
+    }
+
+    #[test]
+    fn sns_split_saved_counts_preserve_valid_values_and_clamp_at_twenty() {
+        for input in [4, 20, 21, u8::MAX] {
+            let saved = Settings {
+                sns_split_count: input,
+                ..Settings::default()
+            };
+            let mut restored: Settings =
+                serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+            restored.sanitize();
+            assert_eq!(restored.sns_split_count, input.min(20));
+        }
     }
 
     #[test]
@@ -20895,6 +21058,10 @@ impl Settings {
     pub(crate) fn thumbnail_source_discovery_snapshot(&self) -> Self {
         Self {
             tag_view_sort: self.tag_view_sort,
+            // Rating preparation also builds representative survival keys.
+            thumb_cover_auto_crop: self.thumb_cover_auto_crop,
+            thumb_cover_auto_crop_binding: self.thumb_cover_auto_crop_binding,
+            thumb_cover_auto_crop_folders: self.thumb_cover_auto_crop_folders,
             file_type_visibility: self.file_type_visibility.clone(),
             skip_image_if_video_exists: self.skip_image_if_video_exists,
             video_thumb_use_sidecar_image: self.video_thumb_use_sidecar_image,

@@ -2504,6 +2504,7 @@ fn flush_deferred_cache_writes(
 
 struct SeekStripDecoder {
     input: ffmpeg::format::context::Input,
+    timeline: crate::video::media_timeline::MediaTimeline,
     stream_idx: usize,
     tb_num: f64,
     tb_den: f64,
@@ -2538,6 +2539,7 @@ impl SeekStripDecoder {
         ffmpeg::init().map_err(|error| format!("ffmpeg init failed: {error}"))?;
         let input =
             ffmpeg::format::input(path).map_err(|error| format!("open input failed: {error}"))?;
+        let timeline = crate::video::media_timeline::MediaTimeline::from_input(&input);
         let video_stream = input
             .streams()
             .best(MediaType::Video)
@@ -2605,6 +2607,7 @@ impl SeekStripDecoder {
 
         Ok(Self {
             input,
+            timeline,
             stream_idx,
             tb_num,
             tb_den,
@@ -2666,7 +2669,9 @@ impl SeekStripDecoder {
         } else {
             first.target_secs
         };
-        let Some(seek_pts) = secs_to_av_time_base(seek_target_secs) else {
+        let Some(seek_pts) =
+            secs_to_av_time_base(self.timeline.media_to_raw_secs(seek_target_secs))
+        else {
             return RunDecodeResult::failed(StripThumbnailFailure::SeekFailed(
                 "target is outside AV_TIME_BASE range".to_string(),
             ));
@@ -2700,6 +2705,7 @@ impl SeekStripDecoder {
         let stream_idx = self.stream_idx;
         let tb_num = self.tb_num;
         let tb_den = self.tb_den;
+        let timeline = self.timeline;
         let hw_active = self.hw_decode_active();
         let input = &mut self.input;
         let decoder = &mut self.decoder;
@@ -2760,7 +2766,7 @@ impl SeekStripDecoder {
                 last_frame = None;
                 return Ok(cursor >= run.cells.len());
             };
-            let pts_secs = pts as f64 * tb_num / tb_den;
+            let pts_secs = timeline.raw_to_media_secs(pts as f64 * tb_num / tb_den);
             if !pts_secs.is_finite() || pts_secs < 0.0 {
                 return Err(StripThumbnailFailure::DecodeFailed(
                     "decoded keyframe has invalid PTS".to_string(),
@@ -2880,8 +2886,12 @@ impl SeekStripDecoder {
                 && let Some(packet_dts) = packet.dts().or_else(|| packet.pts())
                 && let Some(packet_pts) = packet.pts().or_else(|| packet.dts())
             {
-                let packet_dts_secs = packet_dts as f64 * tb_num / tb_den;
-                let packet_pts_secs = packet_pts as f64 * tb_num / tb_den;
+                // Packet DTS/PTS stay raw locators in FFmpeg. Convert only when
+                // comparing them with the already-published media-time strip cells.
+                let packet_dts_secs =
+                    timeline.raw_to_media_secs(packet_dts as f64 * tb_num / tb_den);
+                let packet_pts_secs =
+                    timeline.raw_to_media_secs(packet_pts as f64 * tb_num / tb_den);
                 let mut targets = indexed_presentation_targets.borrow_mut();
                 for cell in run.cells.iter().filter(|cell| cell.exact_keyframe) {
                     if targets.contains_key(&cell.id) {
@@ -3106,6 +3116,7 @@ impl RunDecodeResult {
     }
 }
 
+#[derive(Debug)]
 enum RunStop {
     Complete,
     Superseded,
@@ -3213,6 +3224,201 @@ fn convert_keyframe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn timeline_test_cell(target_secs: f64, exact_keyframe: bool) -> PlannedStripCell {
+        PlannedStripCell {
+            index: 0,
+            id: StripCellId::from_secs(target_secs).unwrap(),
+            target_secs,
+            timestamp_ms: (target_secs * 1000.0).round() as i64,
+            visible: true,
+            exact_keyframe,
+            frame_match_tolerance: FrameMatchTolerance::symmetric(1.0),
+        }
+    }
+
+    #[test]
+    fn timeline_origin_strip_decoders_return_requested_colour() {
+        use crate::video::screenshot::timeline_test_support::{
+            VIDEO_FIXTURES, assert_colour, fixture,
+        };
+        let requests = Mutex::new(LatestWindowRequest::default());
+        let cancel = AtomicBool::new(false);
+        for &(name, content_start) in VIDEO_FIXTURES {
+            for mode in [StripDecodeMode::FullFrames, StripDecodeMode::KeyframesOnly] {
+                let mut decoder = SeekStripDecoder::open(&fixture(name), false, mode).unwrap();
+                for second in [0, 4, 11] {
+                    let target = content_start + second as f64 + 0.5;
+                    let run = StripDecodeRun {
+                        cells: vec![timeline_test_cell(target, false)],
+                    };
+                    let mut published = Vec::new();
+                    let result = decoder.decode_run(&run, 1, &requests, &cancel, &mut |image| {
+                        published.push(image)
+                    });
+                    assert!(
+                        matches!(result.stop, RunStop::Complete),
+                        "{name} {mode:?}: {:?}",
+                        result.stop
+                    );
+                    assert_eq!(published.len(), 1, "{name} {mode:?} target={target}");
+                    let image = &published[0].thumbnail;
+                    assert_colour(&image.rgba, image.width, image.height, second);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn timeline_origin_indexed_strip_maps_packet_dts_to_presentation_colour() {
+        use crate::video::screenshot::timeline_test_support::{
+            VIDEO_FIXTURES, assert_colour, fixture,
+        };
+        let requests = Mutex::new(LatestWindowRequest::default());
+        let cancel = AtomicBool::new(false);
+        for &(name, content_start) in VIDEO_FIXTURES {
+            let path = fixture(name);
+            let mut input = ffmpeg::format::input(&path).unwrap();
+            let timeline = crate::video::media_timeline::MediaTimeline::from_input(&input);
+            let (stream_idx, seconds_per_tick) = {
+                let stream = input.streams().best(ffmpeg::media::Type::Video).unwrap();
+                (
+                    stream.index(),
+                    f64::from(stream.time_base().numerator())
+                        / f64::from(stream.time_base().denominator()),
+                )
+            };
+            let target = input
+                .packets()
+                .find_map(|item| {
+                    let (stream, packet) = item.unwrap();
+                    if stream.index() != stream_idx || !packet.is_key() {
+                        return None;
+                    }
+                    let presentation =
+                        timeline.raw_to_media_secs(packet.pts()? as f64 * seconds_per_tick);
+                    (presentation >= content_start + 4.0 && presentation < content_start + 4.25)
+                        .then(|| {
+                            timeline.raw_to_media_secs(
+                                packet.dts().or(packet.pts()).unwrap() as f64 * seconds_per_tick,
+                            )
+                        })
+                })
+                .unwrap_or_else(|| panic!("{name}: missing scene-four key packet"));
+            let run = StripDecodeRun {
+                cells: vec![timeline_test_cell(target, true)],
+            };
+            let mut decoder =
+                SeekStripDecoder::open(&path, false, StripDecodeMode::KeyframesOnly).unwrap();
+            let mut published = Vec::new();
+            let result = decoder.decode_run(&run, 1, &requests, &cancel, &mut |image| {
+                published.push(image)
+            });
+            assert!(
+                matches!(result.stop, RunStop::Complete),
+                "{name}: {:?}",
+                result.stop
+            );
+            assert_eq!(published.len(), 1, "{name}: target DTS={target}");
+            let image = &published[0].thumbnail;
+            assert_colour(&image.rgba, image.width, image.height, 4);
+        }
+    }
+
+    #[test]
+    fn timeline_origin_rounded_first_indexed_strip_cell_returns_first_colour() {
+        use crate::video::screenshot::timeline_test_support::{assert_colour, fixture};
+
+        ffmpeg::init().unwrap();
+        let path = fixture("rounded-origin-video-only.ts");
+        let mut input = ffmpeg::format::input(&path).unwrap();
+        let timeline = crate::video::media_timeline::MediaTimeline::from_input(&input);
+        assert_eq!(timeline.origin_secs(), 36001.666667);
+        assert_eq!(input.streams().count(), 1, "fixture must have no audio");
+        let (stream_index, time_base) = {
+            let stream = input.streams().best(ffmpeg::media::Type::Video).unwrap();
+            (stream.index(), stream.time_base())
+        };
+        let duration_secs = input.duration() as f64 / f64::from(ffmpeg::ffi::AV_TIME_BASE);
+        let seconds_per_tick =
+            f64::from(time_base.numerator()) / f64::from(time_base.denominator());
+        let mut key_packets = Vec::new();
+        // TS packet reads do not populate a complete demux index. Retain actual
+        // key packet locators, then seed only this test's Input to exercise the
+        // indexed worker path independently of cold-index coverage fallback.
+        for item in input.packets() {
+            let (stream, packet) = item.unwrap();
+            if stream.index() == stream_index && packet.is_key() {
+                key_packets.push((
+                    packet.dts().unwrap(),
+                    packet.pts().unwrap(),
+                    packet.position(),
+                    packet.size(),
+                ));
+            }
+        }
+        assert_eq!(key_packets.len(), 144);
+        let first_raw_secs = key_packets[0].1 as f64 * seconds_per_tick;
+        let rounding_deficit = first_raw_secs - timeline.origin_secs();
+        assert!(rounding_deficit > -0.000001 && rounding_deficit < 0.0);
+        for (raw_dts, raw_pts, position, size) in key_packets {
+            assert_eq!(raw_dts, raw_pts, "all-intra fixture must have PTS=DTS");
+            assert!(position >= 0);
+            // SAFETY: the open Input exclusively owns this valid stream index.
+            // Every entry uses a demuxed key packet's original raw locator.
+            let result = unsafe {
+                let stream = *(*input.as_mut_ptr()).streams.add(stream_index);
+                ffmpeg::ffi::av_add_index_entry(
+                    stream,
+                    position as i64,
+                    raw_dts,
+                    i32::try_from(size).unwrap(),
+                    0,
+                    ffmpeg::ffi::AVINDEX_KEYFRAME,
+                )
+            };
+            assert!(result >= 0);
+        }
+        let index = enumerate_index_keyframes(&mut input, stream_index, time_base).unwrap();
+        assert_eq!(index.keyframes.len(), 144);
+        let adopted = thin_keyframes(&index.keyframes, 1.0);
+        let axis = Arc::new(StripAxis::KeyframeIndex {
+            keyframes: index.keyframes,
+            adopted,
+            duration_secs,
+        });
+        let first_cell_secs = axis.cell(0).unwrap();
+        let worker = SeekStripThumbnailWorker::spawn(path, false, None, duration_secs, 1.0, 1.0);
+        worker
+            .request(
+                axis,
+                0.0,
+                1,
+                StripLookahead::default(),
+                StripThumbnailRequestTrigger::StripRedisplayed,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(40);
+        loop {
+            let snapshot = worker.snapshot();
+            match snapshot.outcome_for_secs(first_cell_secs) {
+                Some(StripThumbnailOutcome::Ready(image)) => {
+                    assert_colour(&image.rgba, image.width, image.height, 0);
+                    assert_eq!(first_cell_secs, 0.0);
+                    break;
+                }
+                Some(StripThumbnailOutcome::Failed(failure)) => {
+                    panic!("rounded first indexed cell failed: {failure:?}");
+                }
+                None => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "first indexed cell timed out: {snapshot:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 
     fn cell_of(secs: f64, bytes: usize) -> (StripCellId, StripThumbnailOutcome) {
         let id = StripCellId::from_secs(secs).expect("finite seconds");

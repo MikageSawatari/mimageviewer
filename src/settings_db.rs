@@ -1898,7 +1898,8 @@ fn init_schema_inner(conn: &Connection) -> rusqlite::Result<()> {
          CREATE TABLE IF NOT EXISTS video_resume_positions (
             path_normalized TEXT PRIMARY KEY,
             position_secs   REAL NOT NULL,
-            updated_at      INTEGER NOT NULL
+            updated_at      INTEGER NOT NULL,
+            media_time      INTEGER NOT NULL DEFAULT 0
          );
 
          CREATE TABLE IF NOT EXISTS video_watched_to_end (
@@ -1978,6 +1979,12 @@ fn init_schema_inner(conn: &Connection) -> rusqlite::Result<()> {
     if !table_has_column(conn, "recent_open_with_apps", "launch_kind")? {
         conn.execute(
             "ALTER TABLE recent_open_with_apps ADD COLUMN launch_kind TEXT",
+            [],
+        )?;
+    }
+    if !table_has_column(conn, "video_resume_positions", "media_time")? {
+        conn.execute(
+            "ALTER TABLE video_resume_positions ADD COLUMN media_time INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
     }
@@ -2553,7 +2560,7 @@ fn read_tags(conn: &Connection) -> Result<Vec<TagDef>, SettingsDbError> {
 
 fn write_video_resume_positions(
     tx: &rusqlite::Transaction<'_>,
-    map: &std::collections::HashMap<String, f64>,
+    map: &std::collections::HashMap<String, crate::settings::VideoResumePosition>,
 ) -> rusqlite::Result<()> {
     tx.execute("DELETE FROM video_resume_positions", [])?;
     let now = std::time::SystemTime::now()
@@ -2561,35 +2568,44 @@ fn write_video_resume_positions(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let mut stmt = tx.prepare(
-        "INSERT INTO video_resume_positions (path_normalized, position_secs, updated_at)
-         VALUES (?1, ?2, ?3)",
+        "INSERT INTO video_resume_positions (path_normalized, position_secs, updated_at, media_time)
+         VALUES (?1, ?2, ?3, ?4)",
     )?;
-    for (path, secs) in map.iter() {
+    for (path, position) in map.iter() {
+        let secs = position.stored_secs();
         // f64 が非有限値 (NaN / Inf) で入ってきた場合は弾く (SQLite の REAL は IEEE 754
         // を許容するが、後段で round/clamp する箇所で問題化するため)。
         if !secs.is_finite() {
             continue;
         }
-        stmt.execute(params![path, secs, now])?;
+        let media_time = matches!(position, crate::settings::VideoResumePosition::Media(_));
+        stmt.execute(params![path, secs, now, media_time])?;
     }
     Ok(())
 }
 
 fn read_video_resume_positions(
     conn: &Connection,
-) -> Result<std::collections::HashMap<String, f64>, SettingsDbError> {
-    let mut stmt =
-        conn.prepare("SELECT path_normalized, position_secs FROM video_resume_positions")?;
+) -> Result<std::collections::HashMap<String, crate::settings::VideoResumePosition>, SettingsDbError>
+{
+    let mut stmt = conn
+        .prepare("SELECT path_normalized, position_secs, media_time FROM video_resume_positions")?;
     let rows = stmt.query_map([], |row| {
         let path: String = row.get(0)?;
         let secs: f64 = row.get(1)?;
-        Ok((path, secs))
+        let media_time: bool = row.get(2)?;
+        Ok((path, secs, media_time))
     })?;
     let mut out = std::collections::HashMap::new();
     for row in rows {
-        let (path, secs) = row?;
+        let (path, secs, media_time) = row?;
         if secs.is_finite() {
-            out.insert(path, secs);
+            let position = if media_time {
+                crate::settings::VideoResumePosition::Media(secs)
+            } else {
+                crate::settings::VideoResumePosition::LegacyRaw(secs)
+            };
+            out.insert(path, position);
         }
     }
     Ok(out)
@@ -5381,8 +5397,14 @@ mod tests {
             TagDef::new("風景".to_string()),
         ];
         let mut resume = HashMap::new();
-        resume.insert(r"C:\v\a.mp4".to_string(), 12.5);
-        resume.insert(r"C:\v\b.mkv".to_string(), 3600.25);
+        resume.insert(
+            r"C:\v\a.mp4".to_string(),
+            crate::settings::VideoResumePosition::Media(12.5),
+        );
+        resume.insert(
+            r"C:\v\b.mkv".to_string(),
+            crate::settings::VideoResumePosition::Media(3600.25),
+        );
         s.video_resume_positions = resume;
         s.video_grid_open_starts_from_beginning = true;
         s.video_playback_speed = 1.75;
@@ -5758,13 +5780,93 @@ mod tests {
     }
 
     #[test]
+    fn video_resume_media_basis_upgrade_is_additive_and_idempotent() {
+        use crate::settings::VideoResumePosition::{LegacyRaw, Media};
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        // A released DB has completed its initial settings transaction.
+        db.save_full(&Settings::default()).unwrap();
+        drop(db);
+        let conn = Connection::open(dir.path().join("settings.db")).unwrap();
+        // Recreate the released three-column shape, including a raw row.
+        conn.execute_batch(
+            "DROP TABLE video_resume_positions;
+             CREATE TABLE video_resume_positions (
+                path_normalized TEXT PRIMARY KEY,
+                position_secs REAL NOT NULL,
+                updated_at INTEGER NOT NULL
+             );
+             INSERT INTO video_resume_positions VALUES ('old.ts', 36004.0, 123);",
+        )
+        .unwrap();
+        drop(conn);
+        for _ in 0..2 {
+            let db = SettingsDb::open(dir.path()).unwrap();
+            let mut loaded = db.load_into_settings().unwrap();
+            assert_eq!(loaded.video_resume_positions["old.ts"], LegacyRaw(36004.0));
+            // An unrelated setting save rewrites the entire map, without migrating unopened rows.
+            loaded.video_volume = 0.25;
+            loaded
+                .video_resume_positions
+                .insert("new.ts".into(), Media(4.0));
+            db.save_full(&loaded).unwrap();
+            let reread = db.load_into_settings().unwrap();
+            assert_eq!(reread.video_resume_positions["old.ts"], LegacyRaw(36004.0));
+            assert_eq!(reread.video_resume_positions["new.ts"], Media(4.0));
+            let inner = db.inner.lock().unwrap();
+            let row: (f64, i64) = inner.conn.query_row(
+                "SELECT position_secs, media_time FROM video_resume_positions WHERE path_normalized = 'old.ts'",
+                [], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!(row, (36004.0, 0));
+        }
+        // The normal periodic-save value replaces the old row with an explicit media basis.
+        let db = SettingsDb::open(dir.path()).unwrap();
+        let mut loaded = db.load_into_settings().unwrap();
+        loaded
+            .video_resume_positions
+            .insert("old.ts".into(), Media(4.0));
+        db.save_full(&loaded).unwrap();
+        drop(db);
+        let db = SettingsDb::open(dir.path()).unwrap();
+        assert_eq!(
+            db.load_into_settings().unwrap().video_resume_positions["old.ts"],
+            Media(4.0)
+        );
+    }
+
+    #[test]
+    fn video_resume_legacy_json_numbers_retain_raw_basis_through_db_roundtrip() {
+        use crate::settings::VideoResumePosition::{LegacyRaw, Media};
+        let legacy: Settings =
+            serde_json::from_str(r#"{"video_resume_positions":{"old.ts":36004.0,"old.mp4":4.0}}"#)
+                .unwrap();
+        assert_eq!(legacy.video_resume_positions["old.ts"], LegacyRaw(36004.0));
+        assert_eq!(legacy.video_resume_positions["old.mp4"], LegacyRaw(4.0));
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        db.save_full(&legacy).unwrap();
+        let mut loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.video_resume_positions, legacy.video_resume_positions);
+        loaded
+            .video_resume_positions
+            .insert("new.ts".into(), Media(4.0));
+        let json = serde_json::to_string(&loaded).unwrap();
+        let restored: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.video_resume_positions,
+            loaded.video_resume_positions
+        );
+    }
+
+    #[test]
     fn video_watched_to_end_upgrades_old_db_without_changing_resume_positions() {
         let dir = TempDir::new().unwrap();
         let db = SettingsDb::create_new(dir.path()).unwrap();
         let mut settings = Settings::default();
-        settings
-            .video_resume_positions
-            .insert("c:/media/unfinished.mp4".into(), 123.5);
+        settings.video_resume_positions.insert(
+            "c:/media/unfinished.mp4".into(),
+            crate::settings::VideoResumePosition::Media(123.5),
+        );
         db.save_full(&settings).unwrap();
         drop(db);
         let conn = Connection::open(dir.path().join("settings.db")).unwrap();
@@ -5798,9 +5900,10 @@ mod tests {
             "c:/media/finished.mp4".into(),
             "d:/music/finished.flac".into(),
         ]);
-        settings
-            .video_resume_positions
-            .insert("c:/media/unfinished.mp4".into(), 12.5);
+        settings.video_resume_positions.insert(
+            "c:/media/unfinished.mp4".into(),
+            crate::settings::VideoResumePosition::Media(12.5),
+        );
         db.save_full(&settings).unwrap();
         let loaded = db.load_into_settings().unwrap();
         assert_eq!(loaded.video_watched_to_end, settings.video_watched_to_end);
@@ -7722,8 +7825,14 @@ mod tests {
         let db = SettingsDb::open_in_memory_for_test().unwrap();
         let mut s = Settings::default();
         let mut resume = HashMap::new();
-        resume.insert("ok".to_string(), 10.0);
-        resume.insert("bad".to_string(), f64::NAN);
+        resume.insert(
+            "ok".to_string(),
+            crate::settings::VideoResumePosition::Media(10.0),
+        );
+        resume.insert(
+            "bad".to_string(),
+            crate::settings::VideoResumePosition::Media(f64::NAN),
+        );
         s.video_resume_positions = resume;
         db.save_full(&s).unwrap();
         let loaded = db.load_into_settings().unwrap();
