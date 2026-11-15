@@ -6043,6 +6043,56 @@ mod tests {
         );
     }
 
+    /// The favorite view state section comes after the category order grid and
+    /// the name color table. At narrow widths those tables are wider than the
+    /// page and widen its region; the section must still wrap to the visible
+    /// width (sub-PC request 56, 2026-11-15).
+    #[test]
+    fn favorite_view_state_section_wraps_to_the_visible_width_after_wide_tables() {
+        use egui_kittest::kittest::Queryable;
+        const WIDTH: f32 = 220.0;
+        let mut state = preferences_state_for_test(&Settings::default());
+        state.favorite_view_state_entry_count = 3;
+        state.favorite_view_state_active = true;
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(WIDTH, 600.0))
+            .build_ui_state(
+                |root_ui, state| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .show(ui, |ui| pages::page_thumbnail(ui, state));
+                    });
+                },
+                state,
+            );
+        harness.run_steps(3);
+        let category_grid_right = harness
+            .get_by_role_and_label(egui::accesskit::Role::RadioButton, "動画・音声 / 1")
+            .rect()
+            .right();
+        assert!(
+            category_grid_right > WIDTH,
+            "fixture must keep a table wider than the page: {category_grid_right}"
+        );
+        let checkbox = harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::CheckBox,
+                "お気に入りごとに表示状態を記憶する",
+            )
+            .rect();
+        let clear = harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::Button,
+                "保存済みの表示状態をすべてクリア…",
+            )
+            .rect();
+        let count = harness.get_by_label("保存済み: 3 件").rect();
+        for rect in [checkbox, clear, count] {
+            assert!(rect.right() <= WIDTH, "{rect:?}");
+        }
+    }
+
     #[test]
     fn container_icon_kinds_preferences_narrow_row_wraps() {
         use egui_kittest::kittest::Queryable;

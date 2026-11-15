@@ -1406,6 +1406,7 @@ fn favorite_standard_settings_notice(ui: &mut egui::Ui, state: &PreferencesState
 }
 
 pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    let page_width = ui.available_width();
     anchored(ui, state, "thumbnail/type-icon", |ui, state| {
         ui.checkbox(
             &mut state.settings.thumb_show_type_icon,
@@ -1695,7 +1696,13 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(12.0);
     ui.separator();
     ui.add_space(8.0);
-    draw_favorite_view_state_section(ui, state);
+    // 狭い幅では、上のカテゴリ表示順の表や名前の色の表がページより広くなり、egui の領域
+    // (`Region::expand_to_include_rect`) がその幅まで広がる。この区切りは長い説明文を持つので、
+    // 広がった幅ではなくページを描き始めた時点の見えている幅で折り返す (依頼 56、2026-11-15)。
+    ui.scope(|ui| {
+        ui.set_max_width(page_width);
+        draw_favorite_view_state_section(ui, state);
+    });
 }
 
 /// サムネイルページ末尾の「お気に入りごとの表示状態」の区切り。
@@ -1718,11 +1725,11 @@ pub(super) fn draw_favorite_view_state_section(ui: &mut egui::Ui, state: &mut Pr
             "このページのほかの設定 (種類アイコン、表表紙の自動切り出し、名前の表示、ツールチップの項目など) と、詳細一覧の列設定・選択列は、すべての場所で共通です。OFF にしても保存済みの状態は残ります。",
         );
         favorite_standard_settings_notice(ui, state);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
                     state.favorite_view_state_entry_count > 0,
-                    egui::Button::new("保存済みの表示状態をすべてクリア…"),
+                    egui::Button::new("保存済みの表示状態をすべてクリア…").wrap(),
                 )
                 .clicked()
             {
