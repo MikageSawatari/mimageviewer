@@ -1335,7 +1335,21 @@ fn move_selected_collection_reorder_group(
     state: &mut CollectionReorderState,
     insert_index: usize,
 ) -> bool {
-    let selected_indices = selected_collection_reorder_indices(state);
+    let ids = state.selected_ids.clone();
+    move_collection_reorder_group(state, &ids, insert_index)
+}
+
+fn move_collection_reorder_group(
+    state: &mut CollectionReorderState,
+    ids: &HashSet<CollectionEntryId>,
+    insert_index: usize,
+) -> bool {
+    let selected_indices = state
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| ids.contains(&entry.entry.id).then_some(index))
+        .collect::<Vec<_>>();
     if selected_indices.is_empty() {
         return false;
     }
@@ -1348,6 +1362,14 @@ fn move_selected_collection_reorder_group(
         .selected
         .and_then(|index| state.entries.get(index))
         .map(|entry| entry.entry.id);
+    let anchor_id = state
+        .selection_anchor
+        .and_then(|index| state.entries.get(index))
+        .map(|entry| entry.entry.id);
+    let drag_id = state
+        .dragging
+        .and_then(|index| state.entries.get(index))
+        .map(|entry| entry.entry.id);
     let removed_before = selected_indices
         .iter()
         .filter(|index| **index < insert_index.min(state.entries.len()))
@@ -1355,11 +1377,10 @@ fn move_selected_collection_reorder_group(
     let destination = insert_index
         .min(state.entries.len())
         .saturating_sub(removed_before);
-    let selected_ids = state.selected_ids.clone();
     let mut moving = Vec::with_capacity(selected_indices.len());
     let mut remaining = Vec::with_capacity(state.entries.len() - selected_indices.len());
     for entry in state.entries.drain(..) {
-        if selected_ids.contains(&entry.entry.id) {
+        if ids.contains(&entry.entry.id) {
             moving.push(entry);
         } else {
             remaining.push(entry);
@@ -1370,6 +1391,11 @@ fn move_selected_collection_reorder_group(
     state.entries = remaining;
     state.selected =
         focus_id.and_then(|id| state.entries.iter().position(|entry| entry.entry.id == id));
+    state.selection_anchor =
+        anchor_id.and_then(|id| state.entries.iter().position(|entry| entry.entry.id == id));
+    state.dragging =
+        drag_id.and_then(|id| state.entries.iter().position(|entry| entry.entry.id == id));
+    state.drag_insert_index = None;
     let after = state
         .entries
         .iter()
@@ -4835,13 +4861,35 @@ impl App {
                             .clamp(0.0, max_offset);
                     }
                 }
-                let pointer_released = ui.input(|input| input.pointer.any_released());
-                let pointer_pos = ui.input(|input| {
-                    input
+                let (terminal, pointer_pos) = ui.input(|input| {
+                    let terminal = input.pointer.button_releases().next();
+                    let pos = input
                         .pointer
                         .hover_pos()
-                        .or_else(|| input.pointer.interact_pos())
+                        .or_else(|| input.pointer.interact_pos());
+                    (terminal, pos)
                 });
+                // Retire/freeze the old operation before the current row pass
+                // can acquire a fresh drag and a different selected group.
+                let ending_drag = terminal.and_then(|(button, pos)| {
+                    state
+                        .dragging
+                        .take()
+                        .and_then(|source| state.entries.get(source))
+                        .map(|source| {
+                            (
+                                source.entry.id,
+                                state.selected_ids.clone(),
+                                (button == egui::PointerButton::Primary)
+                                    .then_some(pos)
+                                    .flatten(),
+                            )
+                        })
+                });
+                if terminal.is_some() {
+                    state.drag_auto_scroll_enabled = false;
+                    state.drag_insert_index = None;
+                }
                 let mut move_request = None;
                 state.drag_insert_index = None;
                 ui.allocate_ui_with_layout(
@@ -4875,6 +4923,13 @@ impl App {
                                                         egui::Sense::hover(),
                                                     );
                                                     if !busy
+                                                        && let Some((_, _, Some(pos))) =
+                                                            ending_drag.as_ref()
+                                                        && rect.contains(*pos)
+                                                    {
+                                                        move_request = Some(state.entries.len());
+                                                    }
+                                                    if !busy
                                                         && state.dragging.is_some()
                                                         && pointer_pos
                                                             .is_some_and(|pos| rect.contains(pos))
@@ -4886,10 +4941,6 @@ impl App {
                                                             rect.left(),
                                                             rect,
                                                         );
-                                                        if pointer_released {
-                                                            move_request =
-                                                                Some(state.entries.len());
-                                                        }
                                                     }
                                                     continue;
                                                 };
@@ -4899,10 +4950,37 @@ impl App {
                                                 let texture = entry.texture.clone();
                                                 let selected =
                                                     state.selected_ids.contains(&entry_id);
-                                                let (rect, response) = ui.allocate_exact_size(
+                                                let (rect, _) = ui.allocate_exact_size(
                                                     tile,
+                                                    egui::Sense::hover(),
+                                                );
+                                                // Entry identity owns the press even when an older
+                                                // completed drag moves this tile to another index.
+                                                let response = ui.interact(
+                                                    rect,
+                                                    ui.make_persistent_id((
+                                                        "collection_reorder_entry",
+                                                        entry_id,
+                                                    )),
                                                     egui::Sense::click_and_drag(),
                                                 );
+                                                #[cfg(test)]
+                                                ui.ctx().data_mut(|data| {
+                                                    data.insert_temp(
+                                                        egui::Id::unique((
+                                                            "collection_reorder_test_rect",
+                                                            index,
+                                                        )),
+                                                        rect,
+                                                    );
+                                                    data.insert_temp(
+                                                        egui::Id::unique((
+                                                            "collection_reorder_test_response_id",
+                                                            index,
+                                                        )),
+                                                        response.id,
+                                                    );
+                                                });
                                                 let fill = if state.dragging.is_some() && selected {
                                                     ui.visuals().selection.bg_fill
                                                 } else if selected {
@@ -5040,9 +5118,19 @@ impl App {
                                                         indicator_x,
                                                         rect,
                                                     );
-                                                    if pointer_released {
-                                                        move_request = Some(insert_index);
-                                                    }
+                                                }
+                                                if !busy
+                                                    && let Some((_, _, Some(pos))) =
+                                                        ending_drag.as_ref()
+                                                    && let Some((insert_index, _)) =
+                                                        collection_reorder_drop_target_for_pos(
+                                                            rect,
+                                                            index,
+                                                            state.entries.len(),
+                                                            Some(*pos),
+                                                        )
+                                                {
+                                                    move_request = Some(insert_index);
                                                 }
                                             }
                                             ui.end_row();
@@ -5052,7 +5140,6 @@ impl App {
                         );
                         state.scroll_offset_y = scroll_output.state.clamped_offset().y;
                         if !busy
-                            && !pointer_released
                             && state.dragging.is_some()
                             && state.drag_auto_scroll_enabled
                             && let Some(pos) = pointer_pos
@@ -5073,17 +5160,14 @@ impl App {
                         }
                     },
                 );
-                if let Some(insert_index) = move_request {
-                    if move_selected_collection_reorder_group(state, insert_index) {
+                if let Some(insert_index) = move_request
+                    && let Some((source, ids, _)) = ending_drag.as_ref()
+                {
+                    if state.entries.iter().any(|entry| entry.entry.id == *source)
+                        && move_collection_reorder_group(state, ids, insert_index)
+                    {
                         state.dirty = true;
                     }
-                    state.dragging = None;
-                    state.drag_auto_scroll_enabled = false;
-                    state.drag_insert_index = None;
-                } else if pointer_released {
-                    state.dragging = None;
-                    state.drag_auto_scroll_enabled = false;
-                    state.drag_insert_index = None;
                 }
             });
 
@@ -6212,6 +6296,145 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![ids[0], ids[2], ids[1], ids[3], ids[4]],
         );
+    }
+
+    #[test]
+    fn realmachine55_collection_reorder_old_release_preserves_fresh_group_identity() {
+        let mut state = reorder_test_state(&["A", "B", "C", "D", "E"]);
+        let ids = state
+            .entries
+            .iter()
+            .map(|entry| entry.entry.id)
+            .collect::<Vec<_>>();
+        let old_group = HashSet::from([ids[0]]);
+        collection_reorder_select_single(&mut state, 1);
+        state.selection_anchor = Some(1);
+        state.dragging = Some(1);
+        state.drag_auto_scroll_enabled = true;
+
+        assert!(move_collection_reorder_group(&mut state, &old_group, 3));
+        assert_eq!(
+            state
+                .entries
+                .iter()
+                .map(|entry| entry.entry.id)
+                .collect::<Vec<_>>(),
+            vec![ids[1], ids[2], ids[0], ids[3], ids[4]]
+        );
+        assert_eq!(state.selected_ids, HashSet::from([ids[1]]));
+        assert_eq!(state.selected, Some(0));
+        assert_eq!(state.selection_anchor, Some(0));
+        assert_eq!(state.dragging, Some(0));
+        assert!(state.drag_auto_scroll_enabled);
+    }
+
+    #[test]
+    fn realmachine55_collection_reorder_handler_known_end_then_fresh_drag_same_batch() {
+        let mut app = crate::app::setup_app_for_test();
+        app.collection_ui.reorder = Some(reorder_test_state(&["A", "B", "C", "D", "E"]));
+        let ids = app
+            .collection_ui
+            .reorder
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|entry| entry.entry.id)
+            .collect::<Vec<_>>();
+        let ctx = egui::Context::default();
+        let frame = |app: &mut crate::app::App, events| {
+            ctx.run_pass(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1500.0, 1000.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.draw_collection_reorder(ctx),
+            )
+            .drop_without_applying_deltas();
+        };
+        for _ in 0..3 {
+            frame(&mut app, vec![]);
+        }
+        let rect = |index| {
+            ctx.data(|data| {
+                data.get_temp::<egui::Rect>(egui::Id::unique((
+                    "collection_reorder_test_rect",
+                    index,
+                )))
+                .unwrap()
+            })
+        };
+        let a = rect(0usize).center();
+        let b = rect(1usize).center();
+        let b_response_id = ctx.data(|data| {
+            data.get_temp::<egui::Id>(egui::Id::unique((
+                "collection_reorder_test_response_id",
+                1usize,
+            )))
+            .unwrap()
+        });
+        let c = rect(2usize).right_center() - egui::vec2(6.0, 0.0);
+        let edge = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut app, vec![egui::Event::PointerMoved(a), edge(a, true)]);
+        frame(&mut app, vec![egui::Event::PointerMoved(c)]);
+        assert_eq!(
+            app.collection_ui.reorder.as_ref().unwrap().dragging,
+            Some(0)
+        );
+        frame(
+            &mut app,
+            vec![
+                edge(c, false),
+                edge(b, true),
+                egui::Event::PointerMoved(b + egui::vec2(20.0, 0.0)),
+            ],
+        );
+        assert!(
+            ctx.read_response(b_response_id)
+                .unwrap()
+                .is_pointer_button_down_on()
+        );
+        assert!(!ctx.read_response(b_response_id).unwrap().drag_started());
+        assert_eq!(ctx.dragged_id(), None);
+        // The new click_and_drag press matures next pass. Its captured
+        // identity must follow B through A's just-completed reorder.
+        frame(&mut app, vec![]);
+        assert_eq!(
+            ctx.data(|data| data
+                .get_temp::<egui::Id>(egui::Id::unique((
+                    "collection_reorder_test_response_id",
+                    0usize
+                )))
+                .unwrap()),
+            b_response_id
+        );
+        assert_eq!(ctx.dragged_id(), Some(b_response_id));
+        let response = ctx.read_response(b_response_id).unwrap();
+        assert!(response.drag_started() && response.dragged());
+        assert!(response.is_pointer_button_down_on());
+        let state = app.collection_ui.reorder.as_ref().unwrap();
+        assert_eq!(
+            state
+                .entries
+                .iter()
+                .map(|entry| entry.entry.id)
+                .collect::<Vec<_>>(),
+            vec![ids[1], ids[2], ids[0], ids[3], ids[4]]
+        );
+        assert_eq!(state.selected_ids, HashSet::from([ids[1]]));
+        assert_eq!(state.selected, Some(0));
+        assert_eq!(state.selection_anchor, Some(0));
+        assert_eq!(state.dragging, Some(0));
+        assert!(state.drag_auto_scroll_enabled);
     }
 
     #[test]

@@ -1135,6 +1135,229 @@ forward済Downの位置なしUpだけは一回のReleased、という両方を�
 全件gate・build-dev・製品起動・commit / pushは実施しない。
 見た目・レイアウトは変更せず、ui_snapshotは実行しない。
 
+### 5.9 位置なし終端を操作の認可から分離する（2026-11-15、再レビュー対応）
+
+基点は `1f7d9de2b`。再レビュー（Sol / xhigh）は `PointerButtonReleased` の必要性と
+構造修正に合意し、保持終端をクリック／dropの権限へ転用していたconsumerを指摘した。
+設計担当の規則は「位置なしの終端は保持だけを終え、操作を認可しない」。
+例外は案1のParked / ParkedLiveの復帰だけであり、既存activation経路は維持する。
+通常dragの終了通知は消さず、クリック／短押し／drop先／seek／close等の確定資格と分ける。
+
+**共有の正本。** `PointerEvent::Released` に `position: Option<Pos2>` を保持する。
+正常な `PointerButton` UpだけがSome、`PointerButtonReleased`はNoneで、クリック分類の
+`click=None`とは別の事実である。正常dragのUpもclick=Noneになり得るので、clickの有無を
+代用してはならない。`any_released` / `button_released` / `drag_stopped`は引き続き保持の終端通知。
+`PointerState::button_events()` の順序付き `PointerButtonEvent` と `button_releases()` は
+同じcanonical列からのread-only projectionで、解放点を後のhoverや過去のpressから作らない。
+`button_release_position(button)` は当該buttonの最後のrelease位置だけを返す。
+`button_click_position(button)` はclickとして受理された終端の実点だけを返す。
+旧終端→新pressを同frameで扱うrecognizerは順序付きprojectionを消費し、frame全体のboolで取り消さない。
+
+検討した簡素化は、(a)位置なし終端を `any_released=false` にする、(b)クリック判定だけを使う、
+(c)frame全体の「位置なしUpあり」で一括取消にする、の3つ。
+(a)は通常dragの保持を残し、(b)は正当なdrag releaseを失い、(c)は後続の新しい操作まで捨てるので採らない。
+新しいApp field、時間窓、座標推定、retryは追加しない。
+
+**P2-1／独自recognizer。** 通常viewerのpassive右押下が開始位置へfallbackし、
+位置なしUpを移動量0のShortTapとしてCloseへ渡していた。viewer／grid／deferred transport、
+ring・mouse gesture・middle short-clickを同じcanonical button列へ揃える。
+既知Upはそのeventの点だけで確定し、未知Upは既存ownerを取消し、後続の新Downは別の保持として受け付ける。
+OSのnative media入力の位置付き経路を、この判定のために変更しない。
+
+**P2-2／D&D。** `Response::dnd_release_payload` がany_releasedと最終contains_pointerを組み合わせ、
+未知Upの後に来たMoveや古いinteract_posで製本のMovePageを作っていた。
+payloadは単一のDragAndDrop owner内で、現在のheldと、受理済みの位置付き終端readyを分ける。
+pass開始時、既存heldを最初の終端へ一度だけ結ぶ。未知Upなら破棄、既知Upならその点とviewportを持つready。
+UIが後から作った新heldには旧終端を適用せず、終了時に捨てるのは同viewportのreadyだけとする。
+旧known dropと新heldは同frameに共存し得る別操作なので、排他的なHeld/Released enumに押し込めない。
+ready列は当該passで実際に終わった操作の投影であり、再activation等まで持ち越す新しいApp pendingではない。
+public payload/hoverはheldを優先し、dropはreadyだけを消費する。
+これにより、別buttonのdownやpass番号から新旧payloadを推測する必要がない。
+drop先は、通常と同じprevious-widget／layer／modalのhit-testを実release点で評価する。
+最終hoverのcontains_pointerはdropの認可に用いない。child passは親Releasedの消費・退役を行わない。
+
+`Context::get_response` のraw-release loopも、最終snapshotで既に確定したDRAGGED／IS_DOWNを
+旧Upで再度OFFにしていた。levelの正本を最終memory／snapshotへ一本化し、新pressのdragを保持する。
+同じwidgetに再度pressした場合も、releaseで旧dragが終わった事実から新drag_startedを出す。
+最終的に新しい同widgetの保持があるResponseへ、旧drag_stoppedを付けない。
+停止した旧dragの位置は、interactionでそのIdを実際に終えた終端と一緒にsnapshotへ確定し、
+`Response::drag_stopped_pos()` から公開する。未知Up／Escape等の取消ではNoneにする。
+frame中の最初のbutton releaseを参照するだけでは、Escape後の別clickのUpを借用するため採らない。
+同frameの新しい保持がある場合、通常のinteract_posは新操作を示すため、
+停止操作の確定にはこの専用projectionを使う。seekの目標解決側も同じprojectionへ揃える。
+同frameに完結した次の正常clickもあり得るため、clickの目標点、現在のdrag開始／更新点、
+旧dragの停止点をそれぞれの操作から得る。後着hoverや別操作の点を共有しない。
+通常dragは終わるが、古いinteract_posを操作の座標として再公開しない。
+
+**P3／page-turn。** 位置なしUpで該当buttonの `PointerPresses` deliveryだけを退役する。
+navigation候補は作らず、他button・touchの所有には触れない。
+
+**同型consumer。** 全Rust sourceの検索式、数え方、全source siteとconsumerごとの判定は
+[監査表](positionless-release-consumer-audit.md)を正本の付表とする。
+click Someを必要とする通常widget、保持だけのcleanup、raw ordinal transport、操作確定を区別する。
+追加修正は、一覧／Collection／toolbar／detailsの並べ替え、text選択、seek track／strip、範囲コピー、
+外部scroll captureのshort press／bar終端、通常scrollのrelease inertiaなど。
+panelのresizeも、停止時の新しいcollapse／expandを解放位置なしで認可しない。
+すでにdrag中に適用した幅はresize widget所有のgeometryとして保存し、終端で保持だけを終える。
+適用済geometryの保存を、未知releaseの位置に転用しない。
+既存PanelStateは閉じて再展開するためのpre-drag自然幅で、最後のlive幅ではない。
+前widgetのrectもanimationでshift済みなので、そこから自然幅を復元する案は採らず、
+実dragで適用した幅1値だけを同じresize IDへ持たせる。new start／stop／idle／再出現で寿命を閉じる。
+すでに適用した連続編集値の保存やslider／panのowner清掃を、新しいdrop先の確定と混同しない。
+egui-winitのsimulate_touch_screenも、未知mouse Upから最後の検出点を持つTouch Endを生成していたため、
+Touch Cancelで接点だけを終える。physical mouseの終端とParked復帰の例外は保持する。
+
+**赤確認。** 製品未変更時の焦点は **5実行／1成功／4失敗、exit 100**
+（`target/rm55-r2-red-main.log`）。P2-1・P3・middle短押し・右flick/gestureを再現した。
+実Stateからの製本D&Dは **4実行／0成功／4失敗、exit 100**
+（`target/rm55-r2-red-dnd.log`）。後着Move、古いinteract_pos、既知／未知Up混在、新drag寿命を検査する。
+追加の赤filterは共有runnerが別作業のfull gate待機中だったため、無実行のまま取り下げて緑検証へ回した。
+この待機を製品のテスト失敗として数えない。
+
+中間の本体焦点は **1,011実行／1,002成功／9失敗、exit 100**。
+追加fixtureが新Downと同じframeで即drag_startedを要求した点、settling後のframeで一度限りの
+drag_stoppedを検査した点、連続repaintする保持中にrunで収束を要求した点、canonical寸法未導入を修正した。
+pendingのcaptureと次frameのdrag、実終端の1回を分けて検査し、drop先・項目identity・非操作の期待は維持する。
+その過程で、Book／Collectionのtileがindex依存auto IDのため、旧dropによる並べ替え後に
+新pending pressの所有が別項目へ移る経路も確認した。配置とauto IDの進行は従来どおりのまま、
+interaction IDをBookのentry key／Collectionのentry IDへ固定する。
+並べ替え前後で同じBのID・capture・選択・anchor・新dragを実handlerで検査する。
+コンパイル中間失敗は条件式の括弧、共有cleanupメソッドの可視性、テストのroot_ui引数の3種類を修正した。
+最終焦点の最初のcompileも追加text fixtureのE0502で **0件実行、exit 101**
+（`target/rm55-r2-focused-final-compile.log`）。DerefするテストAppの世代番号をlocalへ先に読み、
+cacheのmutable借用と分離した。製品処理の変更はない。
+続く焦点は **1,015実行／1,009成功／6失敗、exit 100**
+（`target/rm55-r2-focused-final-r1-fail.log`）。6件は追加seek fixtureの観測方法によるもの。
+`egui_kittest 0.37 Harness::step` はqueueの各eventごとに `step_impl` を実行する
+（registryの `egui_kittest-0.37.0/src/lib.rs:368–378`）。実Stateから得た1 batchを
+`harness.event` の列へ渡したため、終端後のMovedが別frameとなりlast観測のedgeが消えていた。
+State生成Vecを `input_mut().events` へ一括導入し、一度のstepで実handlerへ渡す形へ修正した。
+手作りreleaseや期待値への置換はせず、終了・非操作・次click／dragの点の全assertを維持した。
+このfixture修正も別contextのSol / xhighがread-onlyで照合し、正規の同batchを保つ修正としてACCEPT。
+最小6件の再実行は **6実行／6成功／0失敗、exit 0**。
+次のFは **1,015実行／1,014成功／1失敗、exit 100**
+（`target/rm55-r2-focused-final-archive-fail.log`）。失敗は既存の
+`section1675_inner_resume_fence_across_composition_wait` の `sidecar_restore_active` 事前条件で、
+今回の新規回帰はすべて成功した。同一sourceの単独確認は **1実行／1成功、exit 0**。
+この失敗を解消した製品変更は入れず、非同期fixtureの条件を別途照合した。
+同一sourceで後続Fは **1,015/1,015成功**、Rは **2,687/2,687成功**（4 slow）となった。
+sourceで確認できたのは、`book_resume_db.rs:807` のPauseがadmitted sequenceを増やさず、
+`:859` のadmitted/completed一致時にはpublished snapshotから即replyする経路である。
+`sidecar_restore.rs:2231` でindex完了後Resumingへ進み、`:2673`／`:2728` で同poll中に
+依存が完了するとsidecarを保持せずcomposition待ちへ移れる。該当fixtureとこれらの製品処理は今回差分なしで、
+native／UI入力の経路も通らない。saved=false・index完了済みの時期依存が有力だが、
+実失敗のlive/saved組合せはログにないため確定できない。キャッシュ済み即時完了を遅らせる変更も行わない。
+vendorの中間 **72実行／70成功／2失敗**、次回 **72実行／71成功／1失敗** は、
+旧releaseが新しい同widgetの保持をclearする旧挙動を期待したfixtureを修正したもの。
+新holdの通常位置と旧drag_stopped_posを同時に検査した後、**72/72成功、exit 0**。
+
+追加panel回帰の中間は **83実行／80成功／3失敗、exit 100** が2回。
+空contentsではPanelStateがdefault幅ではなく自然な最小幅を保存することと、最初のsizing passでは
+handleがまだ入力対象でないことを、fixtureの事前条件へ反映した。
+実handleへのpress、live幅122／pre-drag保存幅150、既適用cache、unknown／known終端後の幅と
+pending capture、取消／非表示後のcache退役をすべて維持して最終83件が成功した。
+
+**最終検証。** Cargoはすべて指定runner経由で直列。
+共有lock/TEMPへの書込不可の警告時は、runner既定の低優先度・6並列で続行した。
+実装者とは別contextのGPT-6.1 Sol / xhighによる最終source reviewは **ACCEPT、要修正事項なし**。
+位置資格、旧ready／新held、seekの3種の点、通常drag終端、後続入力、owner別清掃を照合し、
+症状パッチではなく構造修正であると確認した。レビュー担当は編集・Cargoを実行せず、以下の実行はroot担当。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local\miv-locks\run-heavy.ps1 -Owner "codex/767-rm55" -WorkDir G:\home\mimageviewer-767s2 -Command "<下記のCargoコマンド>"
+```
+
+F（本体焦点）:
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/realmachine55_|realmachine50_|native_unknown_|native_positioned_|detached_activation|non_client|pointer_input_observer|viewer_chrome|right_drag|page_turn|composition|grid_reclick_open/)' --no-fail-fast --test-threads 6
+```
+
+S（失敗したseek batchの最小再確認、Fより先に実行）:
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/realmachine55_.*seek/)' --no-fail-fast --test-threads 6
+```
+
+A（既存archive fence失敗の単独照合）:
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/section1675_inner_resume_fence_across_composition_wait/)' --no-fail-fast --test-threads 6
+```
+
+R（本体回帰、今回の共有consumerと従来の入力対照）:
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/realmachine50_|realmachine55_|detached_activation|native_detached|non_client|pointer_input_observer|parked|native_video|touch|key_input|native_focus|grid|composition|page_turn|viewer_chrome|right_drag|ui_text|still_seek|capture_region|canvas_gesture|similar_preview|sidecar_restore|navigator|overflow|logger/)' --no-fail-fast --test-threads 6
+```
+
+E / W / G / L（vendor）:
+
+```powershell
+cargo nextest run --manifest-path vendor/egui/Cargo.toml --lib -E 'test(/release|unknown_|pointer_cancellation|input_state|external|slider|interaction|old_drag_stop|panel/)' --no-fail-fast --test-threads 6
+cargo nextest run --manifest-path vendor/egui-winit/Cargo.toml --lib --no-fail-fast --test-threads 6
+cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features default_fonts,wgpu --lib -E 'test(/realmachine55_|viewport_retirement|native_window_input/)' --no-fail-fast --test-threads 6
+cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features default_fonts,glow --lib -E 'test(/realmachine55_|viewport_retirement|native_window_input/)' --no-fail-fast --test-threads 6
+```
+
+| コマンド | 実行／成功／失敗 | exit code | 証跡 |
+| --- | --- | --- | --- |
+| S | 6／6／0 | 0 | `target/rm55-r2-seek-batch.log` |
+| A | 1／1／0 | 0 | `target/rm55-r2-archive-fence.log` |
+| F | 1,015／1,015／0 | 0 | `target/rm55-r2-focused-final.log` |
+| R | 2,687／2,687／0 | 0 | `target/rm55-r2-regression.log` |
+| E | 83／83／0 | 0 | `target/rm55-r2-vendor-egui-gate.log` |
+| W | 73／73／0 | 0 | `target/rm55-r2-vendor-winit-gate.log` |
+| G | 21／21／0 | 0 | `target/rm55-r2-vendor-wgpu.log` |
+| L | 21／21／0 | 0 | `target/rm55-r2-vendor-glow.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | compile成功 | 0 | `target/rm55-r2-check.log` |
+| `cargo fmt --manifest-path vendor/egui/Cargo.toml` | 整形 | 0 | `target/rm55-r2-vendor-format-egui.log` |
+| `cargo fmt --manifest-path vendor/egui-winit/Cargo.toml` | 整形 | 0 | `target/rm55-r2-vendor-format-winit.log` |
+| `cargo fmt`（最後のCargo操作、引数なし） | 整形成功 | 0 | `target/rm55-r2-fmt.log` |
+| `python scripts/check_ui_glyphs.py` | 危険glyph 0 | 0 | 15:46実行 |
+| `git diff --check` | whitespace異常0 | 0 | 最終文書更新後 |
+
+最終sourceの監査は **1,613使用箇所／546関数＋2 macro**、直接認可を修正したconsumerは **25関数**。
+共有のcanonical／snapshot基盤と、そのprojection経由だけで安全になるcallerは直接修正数へ重複加算しない。
+全使用箇所・関数別の判定は監査付表へ記録し、未分類は0。
+
+変更ファイルは **29件**（製品・共有vendor・回帰・文書）:
+
+- `docs/architecture-overview.md`
+- `docs/depth-parallax-realmachine50-investigation.md`
+- `docs/detached-rework-plan.md`
+- `docs/positionless-release-consumer-audit.md`
+- `src/app.rs`
+- `src/app/gamepad_input.rs`
+- `src/app/tests.rs`
+- `src/ui_composition_editor.rs`
+- `src/ui_dialogs/collections.rs`
+- `src/ui_fullscreen.rs`
+- `src/ui_fullscreen/page_turn.rs`
+- `src/ui_fullscreen/page_turn/input_regression_tests.rs`
+- `src/ui_fullscreen/viewer_chrome.rs`
+- `src/ui_fullscreen/viewer_chrome/release_tests.rs`
+- `src/ui_main.rs`
+- `src/ui_text.rs`
+- `vendor/egui-winit/PATCHES.md`
+- `vendor/egui-winit/src/lib.rs`
+- `vendor/egui-winit/src/pointer_input_observer.rs`
+- `vendor/egui/PATCHES.md`
+- `vendor/egui/src/containers/panel.rs`
+- `vendor/egui/src/containers/scroll_area.rs`
+- `vendor/egui/src/context.rs`
+- `vendor/egui/src/context/pointer_cancellation_tests.rs`
+- `vendor/egui/src/drag_and_drop.rs`
+- `vendor/egui/src/input_state/mod.rs`
+- `vendor/egui/src/interaction.rs`
+- `vendor/egui/src/lib.rs`
+- `vendor/egui/src/response.rs`
+
+未確認はWindowsの実capture／OS通知／実UIでの操作結果と、既存archive失敗の実iteration。
+実Stateとegui widgetのheadless回帰を
+実機確認の代わりとは扱わない。描画・layout・UI文字列の変更はなく、ui_snapshotは実施しない。
+全件gate・build-dev・製品起動・commit／pushは指示に従い実施しない。
+
 ## 6. 診断（初回調査の案、A実装で導入）
 
 初回調査では案だけを記録した。依頼50 Aでは、以下の入力診断を製品の通常ログへ実装した。

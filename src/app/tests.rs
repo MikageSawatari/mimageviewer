@@ -70066,9 +70066,20 @@ mod still_window_mode_key_tests {
         DetachedRightDragEvent {
             sequence,
             kind: DetachedRightDragEventKind::Input {
-                secondary_pressed,
+                button_events: secondary_pressed
+                    .then_some(egui::PointerButtonEvent::Pressed {
+                        button: egui::PointerButton::Secondary,
+                        pos,
+                    })
+                    .into_iter()
+                    .chain(
+                        secondary_released.then_some(egui::PointerButtonEvent::Released {
+                            button: egui::PointerButton::Secondary,
+                            pos: Some(pos),
+                        }),
+                    )
+                    .collect(),
                 secondary_down,
-                secondary_released,
                 pointer_pos: Some(pos),
             },
         }
@@ -70314,7 +70325,9 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let pos = egui::pos2(120.0, 90.0);
-        app.build_window_context_for_test(79, |context| {
+        app.settings.ring_shortcuts.right_drag_image =
+            Some(crate::ring_shortcut::RightDragMode::MouseGesture);
+        app.push_window_context_for_test(&ctx, 79, |context| {
             configure_passive_right_drag_image(context, r"C:\pics\deferred-primary-cancel.jpg");
         });
         let window = contextless_test_window(&ctx, 79);
@@ -70324,35 +70337,39 @@ mod still_window_mode_key_tests {
             false,
         );
         let shared = DeferredDetachedImageWindowShared::new(view);
+        app.transition_detached_window_state(79, DetachedWindowState::Parked, "test");
 
-        assert!(matches!(
-            capture_deferred_pointer_button(
-                &shared,
-                &ctx,
-                pos,
-                egui::PointerButton::Secondary,
-                true,
-            )
-            .map(|event| event.kind),
-            Some(DetachedRightDragEventKind::Input {
-                secondary_pressed: true,
-                secondary_down: true,
-                secondary_released: false,
-                ..
-            })
-        ));
+        let pressed = capture_deferred_pointer_button(
+            &shared,
+            &ctx,
+            pos,
+            egui::PointerButton::Secondary,
+            true,
+        )
+        .unwrap();
+        assert!(matches!(&pressed.kind, DetachedRightDragEventKind::Input {
+            button_events, secondary_down: true, ..
+        } if *button_events == vec![egui::PointerButtonEvent::Pressed { button: egui::PointerButton::Secondary, pos }]));
+        app.process_passive_detached_right_drag_events_for_test(&ctx, vec![(79, pressed)]);
+        assert!(app.mouse_gesture.is_some());
+        let primary =
+            capture_deferred_pointer_button(&shared, &ctx, pos, egui::PointerButton::Primary, true)
+                .unwrap();
         assert_eq!(
-            capture_deferred_pointer_button(
-                &shared,
-                &ctx,
-                pos,
-                egui::PointerButton::Primary,
-                true,
-            )
-            .map(|event| event.kind),
-            Some(DetachedRightDragEventKind::Cancel {
-                reason: DetachedRightDragCancelReason::PrimaryButtonPressed,
-            })
+            primary.kind,
+            DetachedRightDragEventKind::Input {
+                button_events: vec![egui::PointerButtonEvent::Pressed {
+                    button: egui::PointerButton::Primary,
+                    pos
+                }],
+                secondary_down: true,
+                pointer_pos: Some(pos),
+            }
+        );
+        app.process_passive_detached_right_drag_events_for_test(&ctx, vec![(79, primary)]);
+        assert!(
+            app.mouse_gesture.is_none(),
+            "the transported primary press must cancel the owning right drag"
         );
     }
 

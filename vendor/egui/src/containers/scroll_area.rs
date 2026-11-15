@@ -965,9 +965,14 @@ fn external_capture_input(
                 down[button as usize] = true;
                 ordinal += 1;
             }
-            PointerEvent::Released { button, .. } => {
+            PointerEvent::Released {
+                button, position, ..
+            } => {
                 if tail.is_some_and(|press| press.button == button) {
-                    short_press = tail.take();
+                    let ended = tail.take();
+                    if position.is_some() {
+                        short_press = ended;
+                    }
                 }
                 down[button as usize] = false;
             }
@@ -1045,7 +1050,9 @@ fn external_capture_input(
                     *previous = position;
                 }
             }
-            PointerEvent::Released { button, .. } => {
+            PointerEvent::Released {
+                button, position, ..
+            } => {
                 if let ExternalScrollCapture::Sequence {
                     press_stamp,
                     session,
@@ -1057,11 +1064,12 @@ fn external_capture_input(
                     && *owner_button == button
                     && matches!(phase, ExternalCapturePhase::Held { .. })
                 {
-                    result.background_released = *session == external.interaction_session
+                    result.background_released = position.is_some()
+                        && *session == external.interaction_session
                         && *role == ExternalCaptureRole::Background;
                     if *session == external.interaction_session
                         && *role == ExternalCaptureRole::VerticalBar
-                        && let ExternalCapturePhase::Held { position, .. } = *phase
+                        && let Some(position) = position
                     {
                         result.bar_position = Some(ExternalPress {
                             stamp: *press_stamp,
@@ -1506,7 +1514,7 @@ impl ScrollArea {
             } else {
                 background_drag_response
                     .as_ref()
-                    .is_some_and(|response| response.drag_stopped())
+                    .is_some_and(|response| response.drag_stopped_pos().is_some())
             } {
                 // Offset has an inverted coordinate system compared to the pointer:
                 state.vel =
@@ -3363,10 +3371,8 @@ mod tests {
                 let response = ctx
                     .read_response(Id::unique("external-test-transport").with("area"))
                     .unwrap();
-                assert!(
-                    !response.dragged() && !response.drag_started() && !response.drag_stopped()
-                );
-                assert!(!response.is_pointer_button_down_on() && !response.clicked());
+                assert!(response.dragged() && response.drag_started() && !response.drag_stopped());
+                assert!(response.is_pointer_button_down_on() && !response.clicked());
                 assert_eq!(
                     ctx.memory(|m| m.interaction().potential_drag_id),
                     Some(Id::unique("external-test-transport").with("area"))
@@ -3521,7 +3527,13 @@ mod tests {
             let response = ctx
                 .read_response(Id::unique("external-test-transport").with(1_usize))
                 .unwrap();
-            assert!(!response.is_pointer_button_down_on() && !response.dragged());
+            assert!(response.is_pointer_button_down_on());
+            assert!(!response.dragged() && !response.drag_started() && response.drag_stopped());
+            assert_eq!(response.interact_pointer_pos(), Some(start));
+            assert_eq!(
+                response.drag_stopped_pos(),
+                Some(start + Vec2::new(0.0, 30.0))
+            );
             assert!(switched.state.scroll_start_offset_from_top_left[1].is_some());
             assert!(
                 matches!(capture(&ctx), ExternalScrollCapture::Sequence { session, role: ExternalCaptureRole::VerticalBar, phase: ExternalCapturePhase::Held { .. }, .. } if session == b)
@@ -3988,6 +4000,112 @@ mod tests {
             )),
         );
         assert_eq!(moved.state.offset.y, 500.0);
+    }
+
+    #[test]
+    fn external_capture_unknown_short_release_does_not_jump_the_bar() {
+        let ctx = Context::default();
+        external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(0.0),
+            vec![],
+        );
+        let first = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(0.0),
+            vec![],
+        );
+        let press = pos2(
+            first.inner_rect.right() + 3.0,
+            first.inner_rect.top() + 130.0,
+        );
+        let ended = external_frame(
+            &ctx,
+            1200.0,
+            200.0,
+            ExternalScrollPosition::Sync(0.0),
+            vec![
+                pointer_button(press, true),
+                crate::Event::PointerGone,
+                crate::Event::PointerButtonReleased {
+                    button: crate::PointerButton::Primary,
+                    modifiers: crate::Modifiers::NONE,
+                },
+                crate::Event::PointerMoved(press),
+            ],
+        );
+        assert_eq!(ended.state.offset.y, 0.0);
+        assert_eq!(ended.state.vel.y, 0.0);
+        assert!(!ctx.input(|input| input.pointer.primary_down()));
+        assert!(!matches!(
+            capture(&ctx),
+            ExternalScrollCapture::Sequence {
+                phase: ExternalCapturePhase::Held { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unknown_background_drag_release_ends_without_coasting_or_later_move() {
+        for external in [false, true] {
+            let ctx = Context::default();
+            let session = Id::unique("unknown-background");
+            let geometry = Id::unique("unknown-background-geometry");
+            let position = |offset| external.then_some(ExternalScrollPosition::Sync(offset));
+            let first = owner_frame(
+                &ctx,
+                1200.0,
+                200.0,
+                position(0.0),
+                session,
+                geometry,
+                vec![],
+            );
+            let start = first.inner_rect.center();
+            owner_frame(
+                &ctx,
+                1200.0,
+                200.0,
+                position(0.0),
+                session,
+                geometry,
+                vec![pointer_button(start, true)],
+            );
+            let moved = owner_frame(
+                &ctx,
+                1200.0,
+                200.0,
+                position(0.0),
+                session,
+                geometry,
+                vec![crate::Event::PointerMoved(start - Vec2::new(0.0, 40.0))],
+            );
+            let ended = owner_frame(
+                &ctx,
+                1200.0,
+                200.0,
+                position(moved.state.offset.y),
+                session,
+                geometry,
+                vec![
+                    crate::Event::PointerGone,
+                    crate::Event::PointerButtonReleased {
+                        button: crate::PointerButton::Primary,
+                        modifiers: crate::Modifiers::NONE,
+                    },
+                    crate::Event::PointerMoved(start + Vec2::new(0.0, 70.0)),
+                ],
+            );
+            assert!(!ctx.input(|input| input.pointer.primary_down()));
+            assert!(ctx.dragged_id().is_none());
+            assert_eq!(ended.state.vel.y, 0.0);
+            assert_eq!(ended.state.offset.y, moved.state.offset.y);
+        }
     }
 
     #[test]

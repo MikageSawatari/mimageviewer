@@ -517,6 +517,26 @@ impl Response {
         self.drag_stopped() && self.ctx.input(|i| i.pointer.button_released(button))
     }
 
+    /// Actual position that ended the previous drag, in this response's layer.
+    /// A positionless terminal or non-pointer cancellation returns `None`.
+    /// This is distinct from `interact_pointer_pos`: a fresh held press can
+    /// coexist with an old stopped drag on the same widget in one input batch.
+    pub fn drag_stopped_pos(&self) -> Option<Pos2> {
+        if !self.drag_stopped() {
+            return None;
+        }
+        let pos = self.ctx.interaction_snapshot(|snapshot| {
+            (snapshot.drag_stopped == Some(self.id))
+                .then_some(snapshot.drag_stopped_pos)
+                .flatten()
+        })?;
+        Some(
+            self.ctx
+                .layer_transform_from_global(self.layer_id)
+                .map_or(pos, |transform| transform * pos),
+        )
+    }
+
     /// If dragged, how many points were we dragged in since last frame?
     #[inline]
     pub fn drag_delta(&self) -> Vec2 {
@@ -591,15 +611,19 @@ impl Response {
 
     /// Drag-and-Drop: Return what is being dropped onto this widget, if any.
     ///
-    /// Only returns something if [`Self::contains_pointer`] is true,
-    /// the user is drag-dropping something of this type,
-    /// and they released it this frame.
+    /// Only returns something if the payload's actual release position hits
+    /// this widget, with the normal layer/widget occlusion rules. A later hover
+    /// or a positionless terminal cannot authorize a drop.
     #[doc(alias = "drag and drop")]
     pub fn dnd_release_payload<Payload: Any + Send + Sync>(&self) -> Option<Arc<Payload>> {
         // NOTE: we use `response.contains_pointer` here instead of `hovered`, because
         // `hovered` is always false when another widget is being dragged.
-        if self.contains_pointer() && self.ctx.input(|i| i.pointer.any_released()) {
-            crate::DragAndDrop::take_payload::<Payload>(&self.ctx)
+        let pos = crate::DragAndDrop::release_position(&self.ctx)?;
+        if self
+            .ctx
+            .widget_contains_pointer_at(self.id, self.layer_id, pos)
+        {
+            crate::DragAndDrop::take_released_payload::<Payload>(&self.ctx)
         } else {
             None
         }

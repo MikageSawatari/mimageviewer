@@ -1460,6 +1460,12 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ### 2026-11-15: §1.767 サブPC依頼55 — caption／長押し／ParkedLiveと入力入口の診断
 
+再レビューの位置なし終端の認可分離を反映（BA-7）。eguiのcanonical release位置を正本にし、
+独自recognizer／deferred transport／page-turn deliveryも同じ順序と所有へ揃える。
+保持の終了通知と通常dragは維持し、位置なしでの操作確定はParked復帰だけに限定する。
+新App field・時間窓・座標推定は追加せず、構造修正の合意とconsumer全件監査を
+[再レビュー対応 §5.9](depth-parallax-realmachine50-investigation.md#59-位置なし終端を操作の認可から分離する2026-11-15再レビュー対応)へ記録する。
+
 独立実装レビューのP1 / P2と設計担当のcaption指摘を受け、同Stateがforwardした物理押下の位置なしreleaseを
 typed raw終端へ接続し、egui保持・observer・callbackと既存command ownerのrelease順序を揃えた（BA-7）。
 caption buttonは途中のmotionではなく解放対象とOSの選択確定で判定する。

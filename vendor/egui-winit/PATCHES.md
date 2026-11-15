@@ -115,6 +115,11 @@ RawInputの実take/appendとkey先頭追加、eguiのdiscardによる実再pass�
 単なるnative Down/Up通知やbatch内FIFO/indexで置換してはならない。
 ## 依頼55 独立レビュー: 位置なしreleaseと診断sink（2026-11-15）
 
+再レビュー§5.9では、simulate_touch_screenの位置なしmouse Upから出すraw Touchを
+EndではなくCancelに変更した。最後の検出点をTouch Endへ渡すとtap等の認可になり得るため、
+接点保持だけを終える。physical `PointerButtonReleased`とobserverのReleasedは維持し、
+案1のParked復帰は同じ既存ownerで完了できる。通常の位置付きtouch／mouse入力は変更しない。
+
 winit 0.30.13 Windowsはcapture中にも窓外座標のCursorMovedを送り、後着の
 WM_MOUSELEAVEがCursorLeftだけを出し得る。WM_LBUTTONUPはReleaseCaptureの後に
 位置なしMouseInputを送り、last_positionを更新しない。logical位置Noneはrelease取消の証拠ではない。

@@ -430,13 +430,13 @@ impl State {
                         });
                     if self.simulate_touch_screen {
                         self.any_pointer_button_down = false;
-                        // Raw Touch explicitly permits the last detected point;
-                        // unlike PointerButton, this does not assert a cursor
-                        // coordinate at the physical release boundary.
+                        // End the simulated contact without tap/drop authority.
+                        // Touch Cancel permits its last detected point, unlike
+                        // an unknown release promoted into a positioned End.
                         self.egui_input.events.push(egui::Event::Touch {
                             device_id: egui::TouchDeviceId(0),
                             id: egui::TouchId(0),
-                            phase: egui::TouchPhase::End,
+                            phase: egui::TouchPhase::Cancel,
                             pos: last_detected_pos,
                             force: None,
                         });

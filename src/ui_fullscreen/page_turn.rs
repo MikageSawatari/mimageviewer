@@ -186,6 +186,13 @@ fn observe_pointer_transaction(ctx: &egui::Context) {
                             .map(|_| (original, OperationPhase::Press, "pointer"))
                     }
                 }
+                egui::Event::PointerButtonReleased { button, .. } => {
+                    // The physical sequence ended without a release position.
+                    // Retire only its press delivery; it cannot authorize a
+                    // click operation or be revived by a later positioned Up.
+                    presses.buttons[*button as usize] = PointerDelivery::Empty;
+                    None
+                }
                 egui::Event::MouseWheel { .. } => Some((delivery, OperationPhase::Press, "wheel")),
                 egui::Event::WindowFocused(false) => {
                     Some((delivery, OperationPhase::Continuous, "focus_lost"))

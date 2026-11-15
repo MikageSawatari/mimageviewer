@@ -660,6 +660,9 @@ Windowsのegui-winit Stateは最後のCursorMovedの物理位置を保持し、C
 Stateがforwardした実mouse押下は、CursorLeft後の位置なしUpでも
 `Event::PointerButtonReleased`で一度だけ終わる。古い座標のclickやhoverは作らず、
 eguiの保持・observer・callbackと各command ownerのrelease順序を同じraw終端へ揃える。
+releaseの位置資格はeguiのcanonical列に保持し、停止Response／drop／独自recognizerは
+その実点だけを使う。位置なし終端は保持清掃だけで、操作認可の例外はParked復帰に限る。
+受理済みdropと同frameの新heldは同一plugin内の別操作として扱い、互いの終端を流用しない。
 caption buttonは解放時のhitとOSの選択確定を同native ownerで扱い、途中のmotionでは取り消さない。
 vendorの入力診断Infoは専用の正確な2targetだけが製品の非同期通常sinkへ届く。
 logical targetはその窓のregistrationの終端／Manager dropで退役し、native allocationの再生成では維持する。

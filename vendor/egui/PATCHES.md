@@ -2,6 +2,29 @@
 
 ## 依頼55 独立レビュー: 位置のない物理button終端（2026-11-15）
 
+再レビューの規則を反映し、位置なし終端は保持だけを終え、click／tap／短押し／drop／seek／closeの
+認可にはしない。例外は本体のParked復帰だけ。`PointerEvent::Released.position: Option<Pos2>`を
+同じcanonical列に保持し、`PointerState::button_events`／`button_releases`／`button_release_position`で
+公開する。既存release／drag_stopped通知はcleanup用として維持し、frameの一括bool取消に置き換えない。
+
+`Context::get_response`は最終snapshotのdrag levelを旧releaseで再clearしない。
+`Response::drag_stopped_pos()` はinteraction snapshotで旧Idを実際に終えた終端だけに結ぶ。
+未知終端・Escape等はNoneとし、同frameの別clickのUpや旧interact_posを借用しない。
+同frameの新しい保持がある通常interact_posと、停止した旧操作の位置を区別する。
+`button_click_position`はcanonicalなclick終端の実点だけを公開し、seekのclick目標とheld更新を分離する。
+同widgetへの終端→再pressも別operationとして新drag_startedを出し、新heldへ旧stopを付けない。
+Dndは単一plugin内で新heldと既知終端のready payloadを別操作として保持する。
+旧heldは最初の終端でtakeし、未知なら破棄、既知なら実点／viewport付きreadyへ渡す。
+新UI発行heldは旧readyを消さず、drop／終了は対象viewportのreadyだけを消費・退役する。
+drop先は通常と同じwidget/layer hit-testを実release点で評価し、後着hoverや開始位置で認可しない。
+scrollの外部capture short press／barと通常inertiaもこの位置資格に揃える。
+Panelの位置なし停止も新collapse/expandを認可しない。pre-drag自然幅を保持する既存PanelStateとは別に、
+resize widgetが適用済みの幅だけをtemp geometryとして持ち、未知終端ではその幅の保存と保持終了だけを行う。
+
+上流へ戻す際は本体の独自recognizer・並べ替え・seek／text／captureのconsumer移行と一緒に扱う。
+`any_released=false`や`click=None`への一括置換では、通常dragの保持終端と正当なdropを両立できない。
+全consumerの検索・判定と実State回帰、テスト証跡は依頼50調査書§5.9とその監査付表を参照。
+
 `Event::PointerButtonReleased { button, modifiers }` はintegrationがforwardした押下に対する
 実releaseで、解放座標がない場合に用いる。PointerStateのdown／press_originを終え、
 click=NoneのReleasedを一つ記録する。hover／interact位置を作らず、PointerGone自体の意味は変えない。

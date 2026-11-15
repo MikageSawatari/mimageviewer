@@ -389,7 +389,7 @@ mod tests {
         dispatch(&mut state, &left());
         let terminal = dispatch(&mut state, &mouse(false, MouseButton::Left));
         assert!(
-            matches!(terminal.as_slice(), [Event::PointerButtonReleased { .. }, Event::Touch { phase: TouchPhase::End, pos, .. }] if *pos == egui::pos2(-20.0,40.0))
+            matches!(terminal.as_slice(), [Event::PointerButtonReleased { .. }, Event::Touch { phase: TouchPhase::Cancel, pos, .. }] if *pos == egui::pos2(-20.0,40.0))
         );
         assert!(!state.any_pointer_button_down);
     }

@@ -1995,8 +1995,8 @@ impl Context {
                             res.flags.set(Flags::CLICKED, true);
                         }
 
-                        res.flags.set(Flags::IS_POINTER_BUTTON_DOWN_ON, false);
-                        res.flags.set(Flags::DRAGGED, false);
+                        // Final memory/snapshot above owns these levels. An
+                        // older release must not erase a later fresh drag.
                     }
                 }
             }
@@ -2007,7 +2007,32 @@ impl Context {
                 || res.long_touched()
                 || clicked
                 || res.drag_stopped();
-            if is_interacted_with && let Some(mut pos) = input.pointer.interact_pos() {
+            let operation_pos =
+                if res.is_pointer_button_down_on() || res.dragged() || res.long_touched() {
+                    input.pointer.interact_pos()
+                } else if clicked {
+                    // A fresh completed click can coexist with an older stopped
+                    // drag. Its own release point wins over both the old terminal
+                    // and any movement delivered after the click.
+                    input
+                        .pointer
+                        .pointer_events
+                        .iter()
+                        .rev()
+                        .find_map(|event| match event {
+                            PointerEvent::Released {
+                                click: Some(click), ..
+                            } => Some(click.pos),
+                            _ => None,
+                        })
+                } else if res.drag_stopped() {
+                    // The previous drag ends at its first terminal, not at a later
+                    // move or another gesture's point in the same batch.
+                    viewport.interact_widgets.drag_stopped_pos
+                } else {
+                    input.pointer.interact_pos()
+                };
+            if is_interacted_with && let Some(mut pos) = operation_pos {
                 if let Some(to_global) = memory.to_global.get(&res.layer_id) {
                     pos = to_global.inverse() * pos;
                 }
@@ -3235,6 +3260,7 @@ impl Context {
                     drag_started: _,
                     dragged,
                     drag_stopped: _,
+                    drag_stopped_pos: _,
                     contains_pointer,
                     hovered,
                 } = interact_widgets;
@@ -4151,6 +4177,38 @@ impl Context {
     /// Retrieve the [`LayerId`] of the top level windows.
     pub fn top_layer_id(&self) -> Option<LayerId> {
         self.memory(|mem| mem.areas().top_layer_id(Order::Middle))
+    }
+
+    /// Same widget/layer hit-test as the normal pointer snapshot, evaluated at
+    /// an explicit physical release point. Never borrows the final hover point.
+    pub(crate) fn widget_contains_pointer_at(&self, id: Id, layer_id: LayerId, pos: Pos2) -> bool {
+        self.read(|ctx| {
+            if !ctx.memory.allows_interaction(layer_id) {
+                return false;
+            }
+            let Some(viewport) = ctx.viewports.get(&ctx.viewport_id()) else {
+                return false;
+            };
+            let mut layers: Vec<_> = viewport
+                .prev_pass
+                .widgets
+                .layer_ids()
+                .filter(|layer| ctx.memory.areas().is_interactable(*layer))
+                .collect();
+            layers.sort_by(|&a, &b| ctx.memory.areas().compare_order(a, b));
+            let hits = crate::hit_test::hit_test(
+                &viewport.prev_pass.widgets,
+                &layers,
+                &ctx.memory.to_global,
+                pos,
+                ctx.memory.options.style().interaction.interact_radius,
+            );
+            hits.contains_pointer
+                .iter()
+                .chain(hits.click.iter())
+                .chain(hits.drag.iter())
+                .any(|widget| widget.id == id && widget.layer_id == layer_id)
+        })
     }
 
     /// Does the given rectangle contain the mouse pointer?
@@ -5280,6 +5338,9 @@ impl Context {
                     *captured = None;
                 }
             }
+            if viewport.interact_widgets.drag_stopped.is_none() {
+                viewport.interact_widgets.drag_stopped_pos = None;
+            }
             if let Some(interaction) = ctx.memory.interactions.get_mut(&registration.id) {
                 if interaction.potential_click_id == Some(owner) {
                     interaction.potential_click_id = None;
@@ -5330,6 +5391,9 @@ impl Context {
             let vp = ctx.viewport();
             let i = &mut vp.interact_widgets;
             if i.dragged != Some(id) {
+                if i.dragged.is_some() {
+                    i.drag_stopped_pos = None;
+                }
                 i.drag_stopped = i.dragged.or(i.drag_stopped);
                 i.dragged = Some(id);
                 i.drag_started = Some(id);
@@ -5346,6 +5410,7 @@ impl Context {
             let i = &mut vp.interact_widgets;
             if i.dragged.is_some() {
                 i.drag_stopped = i.dragged;
+                i.drag_stopped_pos = None;
                 i.dragged = None;
             }
 

@@ -2245,9 +2245,8 @@ pub(crate) struct DetachedRightDragEvent {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum DetachedRightDragEventKind {
     Input {
-        secondary_pressed: bool,
+        button_events: Vec<egui::PointerButtonEvent>,
         secondary_down: bool,
-        secondary_released: bool,
         pointer_pos: Option<egui::Pos2>,
     },
     Cancel {
@@ -2404,21 +2403,42 @@ impl DeferredDetachedImageWindowShared {
         ctx: &egui::Context,
         focused: bool,
     ) -> Option<DetachedRightDragEvent> {
-        let (primary_pressed, secondary_pressed, secondary_down, secondary_released, pointer_pos) =
-            ctx.input(|i| {
-                (
-                    i.pointer.primary_pressed(),
-                    i.pointer.secondary_pressed(),
-                    i.pointer.secondary_down(),
-                    i.pointer.secondary_released(),
-                    i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()),
+        let (button_events, secondary_down, secondary_released, pointer_pos) = ctx.input(|i| {
+            (
+                i.pointer.button_events().collect::<Vec<_>>(),
+                i.pointer.secondary_down(),
+                i.pointer.secondary_released(),
+                i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()),
+            )
+        });
+        let mut capture = self.right_drag_capture.lock().ok()?;
+        let right_drag_live = capture.secondary_was_down
+            || secondary_down
+            || button_events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::PointerButtonEvent::Pressed {
+                        button: egui::PointerButton::Secondary,
+                        ..
+                    }
                 )
             });
-        let mut capture = self.right_drag_capture.lock().ok()?;
-        let right_drag_live = capture.secondary_was_down || secondary_pressed || secondary_down;
-        let cancel_reason = if primary_pressed && right_drag_live {
-            Some(DetachedRightDragCancelReason::PrimaryButtonPressed)
-        } else if capture.focused_was && !focused {
+        let relevant_edges = button_events.iter().any(|event| match event {
+            egui::PointerButtonEvent::Pressed {
+                button: egui::PointerButton::Secondary,
+                ..
+            }
+            | egui::PointerButtonEvent::Released {
+                button: egui::PointerButton::Secondary,
+                ..
+            } => true,
+            egui::PointerButtonEvent::Pressed {
+                button: egui::PointerButton::Primary,
+                ..
+            } => right_drag_live,
+            _ => false,
+        });
+        let cancel_reason = if capture.focused_was && !focused {
             Some(DetachedRightDragCancelReason::FocusLost)
         } else if capture.secondary_was_down && !secondary_down && !secondary_released {
             Some(DetachedRightDragCancelReason::ButtonStateLost)
@@ -2429,11 +2449,10 @@ impl DeferredDetachedImageWindowShared {
         capture.focused_was = focused;
         let kind = if let Some(reason) = cancel_reason {
             DetachedRightDragEventKind::Cancel { reason }
-        } else if secondary_pressed || secondary_down || secondary_released {
+        } else if relevant_edges || secondary_down {
             DetachedRightDragEventKind::Input {
-                secondary_pressed,
+                button_events,
                 secondary_down,
-                secondary_released,
                 pointer_pos,
             }
         } else {
