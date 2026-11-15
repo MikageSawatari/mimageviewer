@@ -21668,8 +21668,10 @@ impl App {
 
     /// 表示中のページと分割モードから、左右の記憶を辻褄の合う値へ寄せる。
     ///
-    /// ページを開く入口 (一覧・しおり・検索・シークバー・履歴・Ctrl+↑↓) は多く、その
-    /// すべてに「左右を戻す」を足すと必ずどれか漏れる。**表示側で 1 か所そろえる。**
+    /// ページを開く入口 (一覧・しおり・検索・シークバー・履歴・Ctrl+↑↓) は多いので、
+    /// 新規入場・別ページの slice は共通 open の受理境界で `Full` に戻す。
+    /// ここでは寸法と分割方向を **表示側で 1 か所そろえる。** 明示 slice と、
+    /// 同一ページの refresh・方向切替で見ている半分は保つ。
     /// 分割していないページや分割 OFF では `Full` に戻すので、記憶が居残らない。
     fn reconcile_fullscreen_page_slice(&mut self, fs_idx: usize) {
         let Some(direction) = self.split_direction_now() else {
@@ -22312,7 +22314,10 @@ impl App {
         self.fullscreen_navigator_interaction.invalidate();
     }
 
-    fn set_fullscreen_page_slice_for_display_unit(&mut self, slice: crate::page_split::PageSlice) {
+    pub(crate) fn set_fullscreen_page_slice_for_display_unit(
+        &mut self,
+        slice: crate::page_split::PageSlice,
+    ) {
         if self.fullscreen_page_slice == slice {
             return;
         }

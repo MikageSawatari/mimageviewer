@@ -72745,6 +72745,12 @@ impl App {
                 self.begin_extracted_result_view();
             }
         }
+        // 新規入場と別ページへの open は、前のページで見ていた半分を引き継がない。
+        // 同一 index の内部 refresh は保持し、明示 slice を持つ移動は着地後に採用する。
+        // 分割方向と寸法による最初の半分の解決は、表示側の reconcile に任せる。
+        if self.fullscreen_idx != Some(idx) {
+            self.set_fullscreen_page_slice_for_display_unit(crate::page_split::PageSlice::Full);
+        }
         self.fullscreen_idx = Some(idx);
         #[cfg(windows)]
         self.publish_effetune_auto_fullscreen();

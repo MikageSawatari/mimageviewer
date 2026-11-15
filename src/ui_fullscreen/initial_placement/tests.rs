@@ -6,6 +6,8 @@ use crate::ui_fullscreen::page_turn_submission_tests::{frame, ready_app};
 #[cfg(windows)]
 mod viewport_input;
 
+mod split_open;
+
 fn viewport() -> egui::Rect {
     egui::Rect::from_min_size(egui::pos2(30.0, 50.0), egui::vec2(600.0, 400.0))
 }
