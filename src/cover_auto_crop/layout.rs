@@ -72,7 +72,9 @@ pub(crate) fn crop(
     let width = f64::from(dimensions.0);
     // Intentionally unrounded. A 1px rounding error can cross a layout boundary.
     let panel = aspect * f64::from(dimensions.1);
-    let (kind, ratio, predicted) = predict(width, panel, binding)?;
+    // Search in canonical RTL coordinates, including candidate widths and tie breaks.
+    // Reflect the image before measuring edges so LTR uses exactly the same search.
+    let (kind, ratio, predicted) = predict(width, panel, ReadingDirection::Rtl)?;
     let mut diagnostic = LayoutDiagnostic {
         kind,
         ratio,
@@ -85,13 +87,17 @@ pub(crate) fn crop(
     };
     if snap {
         if raster.width() > 0 && raster.height() > 0 {
+            let mirrored;
+            let raster = if binding == ReadingDirection::Ltr {
+                mirrored = image::imageops::flip_horizontal(raster);
+                &mirrored
+            } else {
+                raster
+            };
             let edges = ColumnEdges::new(raster);
             let scale = width / f64::from(raster.width());
             let strength = |rect: [f64; 2]| rect.map(|x| edges.at(x / scale));
-            let weighted = |values: [f64; 2]| match binding {
-                ReadingDirection::Rtl => (values[0] + 2.0 * values[1]) / 3.0,
-                ReadingDirection::Ltr => (2.0 * values[0] + values[1]) / 3.0,
-            };
+            let weighted = |values: [f64; 2]| (values[0] + 2.0 * values[1]) / 3.0;
             let baseline = weighted(strength(predicted));
             let mut best = predicted;
             let mut best_score = baseline;
@@ -116,10 +122,7 @@ pub(crate) fn crop(
                 }
             }
             let best_strengths = strength(best);
-            let spine = match binding {
-                ReadingDirection::Rtl => best_strengths[1],
-                ReadingDirection::Ltr => best_strengths[0],
-            };
+            let spine = best_strengths[1];
             diagnostic.searched_score = Some(best_score);
             // Require both a strong spine and a weighted score above threshold.
             // Weak evidence or a score tied with the exact layout keeps layout.
@@ -134,6 +137,12 @@ pub(crate) fn crop(
             diagnostic.strengths = Some(final_strengths);
             diagnostic.score = Some(weighted(final_strengths));
         }
+    }
+    if binding == ReadingDirection::Ltr {
+        let reflect = |[left, right]: [f64; 2]| [width - right, width - left];
+        diagnostic.predicted = reflect(diagnostic.predicted);
+        diagnostic.final_position = reflect(diagnostic.final_position);
+        diagnostic.strengths = diagnostic.strengths.map(|[left, right]| [right, left]);
     }
     let [left, right] = diagnostic.final_position;
     let ppm = |x: f64| (x.clamp(0.0, width) / width * 1_000_000.0).round() as u32;
@@ -188,5 +197,109 @@ impl ColumnEdges {
         let left = (x.floor() as usize).min(self.0.len() - 1);
         let right = (left + 1).min(self.0.len() - 1);
         self.0[left] + (self.0[right] - self.0[left]) * x.fract()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_snap_mirrors_wider_and_narrower_candidates_and_preserves_rtl_positions() {
+        // W=200, predicted width=204. The first case is the review reproduction.
+        // These RTL positions pin the pre-fix search, including plateau tie breaks.
+        for (right_edge, expected) in [(240, [23.0, 239.0]), (214, [23.0, 213.0])] {
+            let raster = RgbImage::from_fn(420, 256, |x, _| {
+                let value = if x < 24 {
+                    30
+                } else if x < right_edge {
+                    100
+                } else {
+                    240
+                };
+                Rgb([value; 3])
+            });
+            let mirrored = image::imageops::flip_horizontal(&raster);
+            for scale in [1, 2] {
+                let dimensions = (420 * scale, 256 * scale);
+                let (rtl_crop, rtl) = crop(
+                    &raster,
+                    dimensions,
+                    200.0 / 256.0,
+                    ReadingDirection::Rtl,
+                    true,
+                )
+                .unwrap();
+                let (ltr_crop, ltr) = crop(
+                    &mirrored,
+                    dimensions,
+                    200.0 / 256.0,
+                    ReadingDirection::Ltr,
+                    true,
+                )
+                .unwrap();
+                assert!(rtl.snap_applied);
+                assert_eq!(rtl.final_position, expected.map(|x| x * f64::from(scale)));
+                let width = f64::from(dimensions.0);
+                assert_eq!(
+                    ltr.final_position,
+                    [width - rtl.final_position[1], width - rtl.final_position[0]]
+                );
+                assert_eq!(
+                    ltr.predicted,
+                    [width - rtl.predicted[1], width - rtl.predicted[0]]
+                );
+                let [left, top, right, bottom] = rtl_crop.values();
+                assert_eq!(
+                    ltr_crop.values(),
+                    [1_000_000 - right, top, 1_000_000 - left, bottom]
+                );
+                assert_eq!(ltr.snap_applied, rtl.snap_applied);
+                assert_eq!(ltr.score, rtl.score);
+                assert_eq!(ltr.searched_score, rtl.searched_score);
+                assert_eq!(
+                    ltr.strengths,
+                    rtl.strengths.map(|[left, right]| [right, left])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn layout_snap_mirrors_weak_edges_and_unsnapped_predictions_for_all_types() {
+        for width in [300, 420, 540, 700] {
+            let raster = RgbImage::from_pixel(width, 256, Rgb([100; 3]));
+            for snap in [false, true] {
+                let (rtl_crop, rtl) = crop(
+                    &raster,
+                    (width, 256),
+                    200.0 / 256.0,
+                    ReadingDirection::Rtl,
+                    snap,
+                )
+                .unwrap();
+                let (ltr_crop, ltr) = crop(
+                    &raster,
+                    (width, 256),
+                    200.0 / 256.0,
+                    ReadingDirection::Ltr,
+                    snap,
+                )
+                .unwrap();
+                assert!(!rtl.snap_applied && !ltr.snap_applied);
+                assert_eq!(
+                    ltr.final_position,
+                    [
+                        f64::from(width) - rtl.final_position[1],
+                        f64::from(width) - rtl.final_position[0]
+                    ]
+                );
+                let [left, top, right, bottom] = rtl_crop.values();
+                assert_eq!(
+                    ltr_crop.values(),
+                    [1_000_000 - right, top, 1_000_000 - left, bottom]
+                );
+            }
+        }
     }
 }
