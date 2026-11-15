@@ -3621,6 +3621,9 @@ fn mutation_refresh_zip_pin_keeps_level_cursor_scroll_filter_and_checks() {
 #[test]
 fn history_transition_storage_keeps_app_stack_footprint_bounded() {
     use std::mem::size_of;
+    fn storage<T>(_: fn(&App) -> &T) -> usize {
+        size_of::<T>()
+    }
     println!(
         "sizes App={} FolderNavHistoryTarget={} OpenRequestOwner={} DirectPdfAdoption={} EpubOpenRestore={} PdfPasswordRequestOwner={} PdfPasswordRequest={} PdfEnumeratePending={}",
         size_of::<App>(),
@@ -3631,6 +3634,29 @@ fn history_transition_storage_keeps_app_stack_footprint_bounded() {
         size_of::<PdfPasswordRequestOwner>(),
         size_of::<PdfPasswordRequest>(),
         size_of::<PdfEnumeratePending>(),
+    );
+    #[cfg(windows)]
+    println!(
+        "T1 storage asr_setup={} transcript_job={} transcript_delete={} show_transcript_progress={} transcript_display={} music_transcript_panel={}; payload AsrSetup={} TranscriptJob={} TranscriptDeleteState={} TranscriptDisplayCache={} MusicTranscriptPanelSession={}",
+        storage(|app| &app.asr_setup),
+        storage(|app| &app.transcript_job),
+        storage(|app| &app.transcript_delete),
+        storage(|app| &app.show_transcript_progress),
+        storage(|app| &app.transcript_display),
+        storage(|app| &app.music_transcript_panel),
+        size_of::<crate::ui_dialogs::asr_addon::AsrSetup>(),
+        size_of::<crate::ui_dialogs::transcript_job::TranscriptJob>(),
+        size_of::<crate::ui_dialogs::transcript_delete::TranscriptDeleteState>(),
+        size_of::<crate::transcript_display_cache::TranscriptDisplayCache>(),
+        size_of::<crate::ui_music_panels::MusicTranscriptPanelSession>(),
+    );
+    println!(
+        "master storage Settings={} thumb_cover_auto_crop_binding={} thumb_cover_auto_crop_folders={} video_resume_positions={} legacy_resume_map={}",
+        storage(|app| &app.settings),
+        storage(|app| &app.settings.thumb_cover_auto_crop_binding),
+        storage(|app| &app.settings.thumb_cover_auto_crop_folders),
+        storage(|app| &app.settings.video_resume_positions),
+        size_of::<HashMap<String, f64>>(),
     );
     // A staged history request is rarely active and must not be stored inline in every App.
     // The capture/fullscreen input test creates several App values on a default test stack.
@@ -3660,6 +3686,8 @@ fn history_transition_storage_keeps_app_stack_footprint_bounded() {
         size_of::<Option<Box<crate::ui_dialogs::epub_convert::EpubConvertState>>>(),
         size_of::<usize>()
     );
+    #[cfg(windows)]
+    assert_eq!(storage(|app| &app.asr_setup), size_of::<usize>());
     assert!(size_of::<App>() < 110_000);
 }
 

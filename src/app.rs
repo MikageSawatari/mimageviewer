@@ -19328,8 +19328,9 @@ pub struct App {
     /// 編集用追加パックの確認ダイアログを「今はしない」で閉じたか (このセッション中)。
     /// true の間は編集系入口での再 prompt を抑制する (spec §4.1 `declined_this_session`)。
     pub(crate) editing_addon_declined_session: bool,
+    /// モデル準備の状態はヒープに置き、Appのstackサイズを抑える。
     #[cfg(windows)]
-    pub(crate) asr_setup: crate::ui_dialogs::asr_addon::AsrSetup,
+    pub(crate) asr_setup: Box<crate::ui_dialogs::asr_addon::AsrSetup>,
     #[cfg(windows)]
     pub(crate) transcript_job: Option<Box<crate::ui_dialogs::transcript_job::TranscriptJob>>,
     #[cfg(windows)]
