@@ -17,10 +17,22 @@ use crate::export_crop::{CropHandle, CropRect};
 use crate::folder_thumb_pins::{CoverCrop, FolderPin, FolderPinSource};
 use crate::grid_item::GridItem;
 use crate::rotation_db::Rotation;
+use crate::thumb_loader::AutoCoverSkip;
 use eframe::egui;
+
+mod automatic;
+#[cfg(test)]
+mod automatic_tests;
+#[cfg(test)]
+#[path = "cover_crop/legacy_orientation_tests.rs"]
+mod legacy_orientation_tests;
+#[cfg(test)]
+mod source_reason_tests;
+use automatic::{AutoDetection, AutoStop};
 
 const UNIT: usize = 1_000_000;
 const OK_LABEL: &str = "  OK  ";
+const AUTO_RESET_LABEL: &str = "自動の判定の枠にする";
 const CORNER_HIT_RADIUS: f32 = 9.0;
 const EDGE_HIT_RADIUS: f32 = 6.0;
 // The sides face the window resize edge: 9 pt handle hit radius + egui's
@@ -46,6 +58,12 @@ pub(crate) struct CoverCropDialog {
     container: PathBuf,
     cancel: Arc<AtomicBool>,
     phase: Phase,
+    placement: WindowPlacement,
+}
+
+enum WindowPlacement {
+    Initial,
+    UserManaged,
 }
 
 enum Phase {
@@ -58,8 +76,7 @@ struct PreparedCover {
     source: FolderPinSource,
     rotation_key: Option<String>,
     crop: Option<CoverCrop>,
-    auto_crop: Option<CoverCrop>,
-    auto_enabled: bool,
+    auto_detection: AutoDetection,
     image: egui::ColorImage,
 }
 
@@ -69,7 +86,7 @@ struct CropDraft {
     rotation: Rotation,
     crop: CropRect,
     had_manual_crop: bool,
-    auto_enabled: bool,
+    auto_detection: AutoDetection,
     drag: Option<CropDrag>,
     error: Option<String>,
 }
@@ -106,6 +123,7 @@ enum Action {
     None,
     Accept,
     Clear,
+    ResetAutomatic,
     Cancel,
 }
 
@@ -298,6 +316,7 @@ impl App {
             container: owner,
             cancel,
             phase,
+            placement: WindowPlacement::Initial,
         });
     }
 
@@ -331,11 +350,15 @@ impl App {
                             ),
                             rotation,
                             crop: rotate_rect(
-                                crop_rect(prepared.crop.or(prepared.auto_crop)),
+                                crop_rect(
+                                    prepared
+                                        .crop
+                                        .or_else(|| prepared.auto_detection.crop_for(rotation)),
+                                ),
                                 rotation,
                             ),
                             had_manual_crop: prepared.crop.is_some(),
-                            auto_enabled: prepared.auto_enabled,
+                            auto_detection: prepared.auto_detection,
                             drag: None,
                             error: None,
                         })
@@ -347,7 +370,14 @@ impl App {
         let enter = self.dialog_enter_pressed(ctx);
         let escape = self.dialog_escape_pressed(ctx);
         let mut open = true;
-        let action = draw_window(ctx, &mut open, &mut dialog.phase, enter, escape);
+        let action = draw_window(
+            ctx,
+            &mut open,
+            &mut dialog.phase,
+            enter,
+            escape,
+            &mut dialog.placement,
+        );
         let close = !open
             || match action {
                 Action::Cancel => true,
@@ -403,7 +433,7 @@ impl App {
                         false
                     }
                 }
-                Action::None => false,
+                Action::None | Action::ResetAutomatic => false,
             };
         if !close {
             self.cover_crop_dialog = Some(dialog);
@@ -486,7 +516,50 @@ fn prepare_cover_inner(
     if crate::raw_format::is_raw_path(hint) {
         return Err("RAW 画像は範囲を指定できません".into());
     }
+    let mut predecoded_auto_analysis = None;
     let image = match &cover.location {
+        ReadLocation::File(path)
+            if cover.cover_crop.is_none()
+                && env.auto_cover_crop.is_some()
+                && (container.kind != BookKind::Folder || cover.auto_cover_crop.is_ok())
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| {
+                        ext.eq_ignore_ascii_case("png") || ext.eq_ignore_ascii_case("webp")
+                    }) =>
+        {
+            let analysis = crate::thumb_loader::decode_cover_auto_analysis_image(
+                crate::image_decode::Source::Path(path),
+                None,
+                Some(cancel),
+            )?;
+            let image = analysis.image.clone();
+            predecoded_auto_analysis = Some(analysis);
+            image
+        }
+        ReadLocation::ArchiveEntry { entry, .. }
+            if cover.auto_cover_crop.is_ok()
+                && cover.cover_crop.is_none()
+                && cover.preloaded_bytes.as_deref().is_some_and(|bytes| {
+                    matches!(
+                        image::guess_format(bytes),
+                        Ok(image::ImageFormat::Png | image::ImageFormat::WebP)
+                    )
+                }) =>
+        {
+            let analysis = crate::thumb_loader::decode_cover_auto_analysis_image(
+                crate::image_decode::Source::Bytes {
+                    bytes: cover.preloaded_bytes.as_deref().unwrap(),
+                    hint: entry,
+                },
+                None,
+                Some(cancel),
+            )?;
+            let image = analysis.image.clone();
+            predecoded_auto_analysis = Some(analysis);
+            image
+        }
         ReadLocation::PdfPage { pdf, page } => {
             use crate::pdf_loader::{CancelWaitPolicy, JobPriority, PdfRenderValidity};
             crate::pdf_loader::render_page_with_read_target(
@@ -528,7 +601,12 @@ fn prepare_cover_inner(
             .oriented(source)
         }
     };
-    let auto_enabled = env.thumb_cover_auto_crop && container.kind != BookKind::Folder;
+    let auto_crop = cover
+        .auto_cover_crop
+        .as_ref()
+        .ok()
+        .map(|auto| auto.identity);
+    let auto_enabled = auto_crop.is_some();
     let has_edit_preview = auto_enabled
         && cover.cover_crop.is_none()
         && cover
@@ -565,42 +643,127 @@ fn prepare_cover_inner(
                 }
                 .is_some()
             });
-    let auto_crop = if auto_enabled
-        && cover.cover_crop.is_none()
-        && !has_edit_preview
-        && u64::from(image.width()) * 100 >= u64::from(image.height()) * 85
-        && !cancel.load(Ordering::Relaxed)
+    let auto_detection = if let Some(stop) =
+        AutoStop::for_source(&cover.auto_cover_crop, env.auto_cover_crop.is_some())
     {
-        let page_aspect = match &cover.location {
+        AutoDetection::Stopped(stop)
+    } else if has_edit_preview {
+        AutoDetection::Stopped(AutoStop::EditPreview)
+    } else if let Some(auto) = auto_crop.filter(|_| !cancel.load(Ordering::Relaxed)) {
+        // This function runs on cover-crop-prepare, never on the UI thread.
+        let sample_rotations = crate::cover_auto_sample::SampleRotations::for_worker();
+        let sample = match &cover.location {
+            ReadLocation::File(path) => {
+                match cover.auto_cover_crop.as_ref().ok().map(|auto| &auto.input) {
+                    Some(crate::thumb_loader::AutoCoverInput::FolderPages(pages)) => {
+                        crate::cover_auto_sample::sample_folder_pages_with_rotations(
+                            pages,
+                            path,
+                            |key| sample_rotations.get(key),
+                        )
+                    }
+                    _ => crate::cover_auto_sample::page_aspect_from_sizes_report(&[], 0),
+                }
+            }
             ReadLocation::ArchiveEntry { archive, entry } => {
-                crate::cover_auto_sample::sample_zip_page_aspect(
+                crate::cover_auto_sample::sample_zip_pages_with_rotations(
                     archive,
                     entry,
                     cover.zip_dir_prefix.as_deref(),
+                    archive,
+                    |key| sample_rotations.get(key),
                 )
             }
-            ReadLocation::PdfPage { pdf, page } => cover.epub_read.as_ref().and_then(|read| {
-                crate::pdf_loader::get_page_sizes_with_read_target(
+            ReadLocation::PdfPage { pdf, page } => {
+                let sizes = cover
+                    .epub_read
+                    .as_ref()
+                    .and_then(|read| {
+                        crate::pdf_loader::get_page_sizes_with_read_target(
+                            pdf,
+                            read,
+                            cover.pdf_password.as_deref(),
+                        )
+                        .ok()
+                    })
+                    .unwrap_or_default();
+                crate::cover_auto_sample::page_aspect_from_sizes_with_rotations_report(
+                    &sizes,
+                    *page as usize,
                     pdf,
-                    read,
-                    cover.pdf_password.as_deref(),
+                    |key| sample_rotations.get(key),
                 )
-                .ok()
-                .and_then(|sizes| {
-                    crate::cover_auto_sample::page_aspect_from_sizes(&sizes, *page as usize)
-                })
-            }),
-            _ => None,
+            }
+            _ => crate::cover_auto_sample::page_aspect_from_sizes_report(&[], 0),
         };
-        crate::cover_auto_crop::cover_auto_crop(
-            &crate::cover_auto_crop::analysis_raster(&image),
-            (image.width(), image.height()),
-            page_aspect,
-            env.default_reading_direction,
-        )
-        .ok()
+        let page_aspect = sample;
+        if let Err(reason) = page_aspect {
+            crate::logger::log(format!(
+                "auto cover: dialog page-aspect={}",
+                reason.as_str()
+            ));
+        }
+        let mut analyze = || -> Result<AutoDetection, String> {
+            let analysis = if let Some(analysis) = predecoded_auto_analysis.take() {
+                Ok(analysis)
+            } else {
+                match &cover.location {
+                    ReadLocation::PdfPage { pdf, page } => {
+                        use crate::pdf_loader::{CancelWaitPolicy, JobPriority, PdfRenderValidity};
+                        crate::thumb_loader::decode_cover_auto_analysis_pdf(
+                            pdf,
+                            cover.epub_read.as_ref(),
+                            *page,
+                            cover.pdf_password.as_deref(),
+                            Some(cancel),
+                            JobPriority::Normal,
+                            PdfRenderValidity::Unscoped,
+                            CancelWaitPolicy::AbortOnCancel,
+                        )
+                    }
+                    ReadLocation::File(path) => {
+                        crate::thumb_loader::decode_cover_auto_analysis_image(
+                            crate::image_decode::Source::Path(path),
+                            Some(&image),
+                            Some(cancel),
+                        )
+                    }
+                    ReadLocation::ArchiveEntry { entry, .. } => {
+                        crate::thumb_loader::decode_cover_auto_analysis_image(
+                            crate::image_decode::Source::Bytes {
+                                bytes: cover
+                                    .preloaded_bytes
+                                    .as_deref()
+                                    .ok_or("書庫の画像を読み込めませんでした")?,
+                                hint: entry,
+                            },
+                            Some(&image),
+                            Some(cancel),
+                        )
+                    }
+                    _ => unreachable!(),
+                }
+            };
+            Ok(match analysis {
+                Ok(analysis) => AutoDetection::analyze(
+                    &analysis.image,
+                    analysis.native_dims,
+                    sample.ok(),
+                    analysis.shot_exif,
+                    auto.binding,
+                ),
+                Err(error) => {
+                    crate::logger::log(format!("cover crop dialog analysis failed: {error}"));
+                    AutoDetection::Stopped(AutoStop::AnalysisFailed)
+                }
+            })
+        };
+        match page_aspect {
+            Ok(_) => analyze()?,
+            Err(reason) => AutoDetection::Stopped(AutoStop::PageAspect(reason)),
+        }
     } else {
-        None
+        AutoDetection::Stopped(AutoStop::AnalysisFailed)
     };
     let image = if image.width().max(image.height()) > target_px {
         image.resize(target_px, target_px, image::imageops::FilterType::Triangle)
@@ -612,8 +775,7 @@ fn prepare_cover_inner(
         source: cover.persistent_source,
         rotation_key: cover.rotation_key,
         crop: cover.cover_crop,
-        auto_crop,
-        auto_enabled,
+        auto_detection,
         image: egui::ColorImage::from_rgba_unmultiplied(
             [rgba.width() as usize, rgba.height() as usize],
             rgba.as_raw(),
@@ -664,6 +826,7 @@ fn draw_window(
     phase: &mut Phase,
     enter: bool,
     escape: bool,
+    placement: &mut WindowPlacement,
 ) -> Action {
     let bounds = ctx.content_rect();
     let safe = bounds.shrink2(window_margin(bounds));
@@ -675,11 +838,29 @@ fn draw_window(
             .allocated_width();
     let size = egui::vec2(safe.width().min(900.0 + scroll_width), safe.height());
     let mut action = if escape { Action::Cancel } else { Action::None };
-    egui::Window::new("代表サムネの範囲").id(egui::Id::new("cover-crop-window"))
-        .open(open).default_pos(safe.min)
-        .default_size(size).min_size(egui::vec2(240.0,120.0).min(size))
-        .max_size(size).constrain_to(safe).collapsible(false).resizable(true)
-        .show(ctx, |parent| {
+    let mut window = egui::Window::new("代表サムネの範囲")
+        .id(egui::Id::new("cover-crop-window"))
+        .open(open)
+        .default_pos(safe.min)
+        .default_size(size)
+        .min_size(egui::vec2(240.0, 120.0).min(size))
+        .max_size(size)
+        .constrain_to(safe)
+        .collapsible(false)
+        .resizable(true);
+    if matches!(
+        std::mem::replace(placement, WindowPlacement::UserManaged),
+        WindowPlacement::Initial
+    ) {
+        // Apply this opening's geometry once, including when egui still holds
+        // an earlier opening's size. Later frames leave user resizing/moving
+        // to egui. Reuse the id to keep area, scroll and animation state bounded.
+        window = window
+            .current_pos(safe.min)
+            .fixed_size(size)
+            .resizable(true);
+    }
+    window.show(ctx, |parent| {
             let content_rect = parent.available_rect_before_wrap();
             let mut reserved = parent.new_child(
                 egui::UiBuilder::new().max_rect(content_rect)
@@ -689,7 +870,7 @@ fn draw_window(
             // rectangles (including wrapped validation/auto text) consume the
             // height before the scroll body receives the remainder.
             if let Phase::Ready(draft)=phase
-                && draft.had_manual_crop && draft.auto_enabled
+                && draft.had_manual_crop && draft.auto_detection.enabled()
             { reserved.small("手動の範囲を解除すると、自動の判定に戻ります。"); }
             if let Phase::Ready(draft)=phase
                 && let Some(error)=&draft.error
@@ -701,30 +882,30 @@ fn draw_window(
                 let mut measure = reserved.new_child(egui::UiBuilder::new()
                     .id_salt("cover-crop-button-sizing").invisible().sizing_pass()
                     .layout(egui::Layout::top_down(egui::Align::Min)));
-                [OK_LABEL, "キャンセル", "手動の範囲を解除"].map(|label| {
+                [OK_LABEL, "キャンセル", "手動の範囲を解除", AUTO_RESET_LABEL].map(|label| {
                     measure.add(egui::Button::new(label).wrap_mode(egui::TextWrapMode::Extend)).rect.size()
                 })
             };
             let row_height = button_sizes.iter().map(|size| size.y).fold(0.0, f32::max);
             let row_width = button_sizes.iter().map(|size| size.x).sum::<f32>()
-                + 2.0 * reserved.spacing().item_spacing.x + reserved.visuals().resize_corner_size;
+                + 3.0 * reserved.spacing().item_spacing.x + reserved.visuals().resize_corner_size;
             let wrap_clear = reserved.available_width() < row_width;
             let can_clear = matches!(phase, Phase::Ready(draft) if draft.had_manual_crop);
             if wrap_clear {
                 // The footer grows bottom-up, so allocate its lower row first.
                 // Its actual height and inter-row spacing reduce the body below.
-                reserved.allocate_ui_with_layout(
-                    egui::vec2(reserved.available_width(), button_sizes[2].y),
-                    egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                reserved.horizontal_wrapped(|ui| {
                     if ui.add_enabled(can_clear, egui::Button::new("手動の範囲を解除")).clicked() { action = Action::Clear; }
+                    if draw_auto_reset_button(ui, phase) { action = Action::ResetAutomatic; }
                 });
             }
             reserved.allocate_ui_with_layout(
                 egui::vec2(reserved.available_width(), row_height),
                 egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 let ready = matches!(phase, Phase::Ready(_));
-                if ui.add_enabled(ready, egui::Button::new(OK_LABEL)).clicked() || enter && ready { action = Action::Accept; }
+                if ui.add_enabled(ready, egui::Button::new(OK_LABEL)).clicked() { action = Action::Accept; }
                 if ui.button("キャンセル").clicked() { action = Action::Cancel; }
+                if !wrap_clear && draw_auto_reset_button(ui, phase) { action = Action::ResetAutomatic; }
                 if !wrap_clear { ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(ui.visuals().resize_corner_size);
                     if ui.add_enabled(can_clear, egui::Button::new("手動の範囲を解除")).clicked() { action = Action::Clear; }
@@ -754,6 +935,7 @@ fn draw_window(
                         let _canvas = draw_canvas(ui,draft,height);
                         #[cfg(test)]
                         { canvas_rect = Some(_canvas); }
+                        ui.label(draft.auto_detection.message(draft.rotation));
                         ui.weak("ドラッグで範囲を作成・移動できます。枠の辺と角で大きさを変更できます。");
                     }
                 }
@@ -773,7 +955,29 @@ fn draw_window(
             drop(body);
             parent.advance_cursor_after_rect(content_rect);
         });
-    action
+    // Focused buttons accept Enter themselves. The dialog-wide OK shortcut
+    // is only a fallback, after either row's explicit action has been chosen.
+    if action == Action::None && enter && matches!(phase, Phase::Ready(_)) {
+        Action::Accept
+    } else {
+        action
+    }
+}
+
+fn draw_auto_reset_button(ui: &mut egui::Ui, phase: &mut Phase) -> bool {
+    let crop = match phase {
+        Phase::Ready(draft) => draft.auto_detection.crop_for(draft.rotation),
+        _ => None,
+    };
+    let clicked = ui
+        .add_enabled(crop.is_some(), egui::Button::new(AUTO_RESET_LABEL))
+        .clicked();
+    if clicked && let Phase::Ready(draft) = phase {
+        draft.crop = rotate_rect(crop_rect(crop), draft.rotation);
+        draft.drag = None;
+        draft.error = None;
+    }
+    clicked
 }
 
 fn draw_canvas(ui: &mut egui::Ui, draft: &mut CropDraft, height: f32) -> egui::Rect {
@@ -954,11 +1158,24 @@ fn draw_cover_crop_snapshot(ui: &mut egui::Ui, auto_enabled: bool) {
         rotation: Rotation::None,
         crop: crop_rect(CoverCrop::new([15_000, 45_000, 450_000, 955_000]).unwrap()),
         had_manual_crop: true,
-        auto_enabled,
+        auto_detection: AutoDetection::Stopped(if auto_enabled {
+            AutoStop::Manual {
+                automatic_enabled: true,
+            }
+        } else {
+            AutoStop::Source(AutoCoverSkip::Off)
+        }),
         drag: None,
         error: None,
     });
-    let _ = draw_window(ui.ctx(), &mut true, &mut phase, false, false);
+    let _ = draw_window(
+        ui.ctx(),
+        &mut true,
+        &mut phase,
+        false,
+        false,
+        &mut WindowPlacement::UserManaged,
+    );
 }
 
 #[cfg(test)]
@@ -977,8 +1194,7 @@ mod tests {
             },
             rotation_key: None,
             crop,
-            auto_crop: None,
-            auto_enabled: false,
+            auto_detection: AutoDetection::Stopped(AutoStop::Source(AutoCoverSkip::Off)),
             image: egui::ColorImage::new(
                 [120, 80],
                 vec![egui::Color32::from_rgb(55, 125, 180); 120 * 80],
@@ -1030,6 +1246,7 @@ mod tests {
             container: root.clone(),
             cancel: Arc::new(AtomicBool::new(false)),
             phase: Phase::Loading(rx),
+            placement: WindowPlacement::Initial,
         });
         (app, tx, root, crop)
     }
@@ -1058,6 +1275,55 @@ mod tests {
     }
 
     #[test]
+    fn cover_crop_late_prepare_selects_current_angle_and_saves_source_coordinates() {
+        let automatic = CoverCrop::new([0, 0, 500_000, 1_000_000]).unwrap();
+        let manual = CoverCrop::new([100_000, 200_000, 600_000, 900_000]).unwrap();
+        for (saved, expected_screen) in
+            [(None, [0.0, 0.0, 1.0, 0.5]), (manual, [0.1, 0.1, 0.8, 0.6])]
+        {
+            let (mut app, tx, root, _) = fake_loading_app();
+            let mut prepared = fake_prepared(saved);
+            prepared.rotation_key = Some("delayed-cover-page".into());
+            prepared.auto_detection =
+                AutoDetection::from_crops(crate::cover_auto_material::AutoCropResults::new([
+                    None, automatic, None, None,
+                ]));
+            // The worker material has no captured angle. A later owner update wins.
+            app.update_rotation_page_owner([("delayed-cover-page".into(), Rotation::Cw90)]);
+            tx.send((7, Ok(prepared))).ok().unwrap();
+            let mut h = app_harness(app);
+            h.run_steps(4);
+            let Phase::Ready(draft) = &h.state().cover_crop_dialog.as_ref().unwrap().phase else {
+                panic!("prepared rotated crop");
+            };
+            assert_eq!(draft.rotation, Rotation::Cw90);
+            for (actual, expected) in [
+                draft.crop.min_x,
+                draft.crop.min_y,
+                draft.crop.max_x,
+                draft.crop.max_y,
+            ]
+            .into_iter()
+            .zip(expected_screen)
+            {
+                assert!((actual / UNIT as f32 - expected).abs() < 0.000_001);
+            }
+            h.get_by_label(OK_LABEL).click();
+            h.run_steps(2);
+            assert_eq!(
+                h.state()
+                    .folder_thumb_pin_db
+                    .as_ref()
+                    .unwrap()
+                    .lookup(&root)
+                    .unwrap()
+                    .cover_crop,
+                saved.or(automatic)
+            );
+        }
+    }
+
+    #[test]
     fn cover_crop_initial_range_prefers_manual_then_auto_then_full() {
         let manual = CoverCrop::new([100_000, 0, 500_000, 1_000_000]).unwrap();
         let automatic = CoverCrop::new([500_000, 0, 950_000, 1_000_000]).unwrap();
@@ -1068,8 +1334,9 @@ mod tests {
         ] {
             let (app, tx, _, _) = fake_loading_app();
             let mut prepared = fake_prepared(manual_crop);
-            prepared.auto_crop = auto_crop;
-            prepared.auto_enabled = true;
+            prepared.auto_detection = AutoDetection::from_crops(
+                crate::cover_auto_material::AutoCropResults::new([auto_crop; 4]),
+            );
             tx.send((7, Ok(prepared))).ok().unwrap();
             let mut h = app_harness(app);
             h.run_steps(4);
@@ -1106,12 +1373,301 @@ mod tests {
     }
 
     #[test]
+    fn cover_crop_layout_reasons_keep_small_viewport_actions_reachable() {
+        use crate::cover_auto_crop::{
+            AutoCropDecline, AutoCropLayout, AutoCropMethod, AutoCropSuccess,
+        };
+        let crop = CoverCrop::new([0, 0, 500_000, 1_000_000]).unwrap().unwrap();
+        for scale in [1.0, 2.0] {
+            for report in [
+                Ok(AutoCropSuccess::for_test(
+                    crop,
+                    AutoCropMethod::LayoutFallback(AutoCropLayout::T2),
+                )),
+                Ok(AutoCropSuccess::for_test(
+                    crop,
+                    AutoCropMethod::LayoutReplaced(AutoCropLayout::T2),
+                )),
+                Err(AutoCropDecline::PhotoLike {
+                    reason: crate::cover_auto_crop::photo::PhotoLikeReason::ShotExif,
+                }),
+            ] {
+                let (app, tx, _, _) = fake_loading_app();
+                let mut prepared = fake_prepared(Some(crop));
+                prepared.auto_detection = AutoDetection::Analyzed {
+                    binding: crate::settings::ReadingDirection::Rtl,
+                    reports: [report; 4],
+                };
+                let message = prepared.auto_detection.message(Rotation::None);
+                tx.send((7, Ok(prepared))).ok().unwrap();
+                let mut h = app_harness(app);
+                crate::settings::apply_ui_scale_factor(&h.ctx, scale);
+                h.run_steps(4);
+                h.get_by_label(&message);
+                for label in [
+                    OK_LABEL,
+                    "キャンセル",
+                    "手動の範囲を解除",
+                    AUTO_RESET_LABEL,
+                    "Close window",
+                ] {
+                    assert!(
+                        h.ctx
+                            .content_rect()
+                            .contains_rect(h.get_by_label(label).rect()),
+                        "{scale}: {message}: {label}"
+                    );
+                }
+                assert_eq!(
+                    h.get_by_label(AUTO_RESET_LABEL)
+                        .accesskit_node()
+                        .is_disabled(),
+                    report.is_err()
+                );
+                if report.is_ok() {
+                    h.get_by_label(AUTO_RESET_LABEL).click();
+                    h.run_steps(2);
+                    let Phase::Ready(draft) = &h.state().cover_crop_dialog.as_ref().unwrap().phase
+                    else {
+                        panic!("reset keeps range editor open");
+                    };
+                    let expected = crop_rect(Some(crop));
+                    assert_eq!(draft.crop.min_x, expected.min_x);
+                    assert_eq!(draft.crop.max_x, expected.max_x);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cover_crop_auto_reset_is_visible_in_small_viewport_and_only_ok_saves() {
+        for scale in [1.0, 2.0] {
+            for rotation in [
+                Rotation::None,
+                Rotation::Cw90,
+                Rotation::Cw180,
+                Rotation::Cw270,
+            ] {
+                for accept in [false, true] {
+                    let (mut app, tx, root, _) = fake_loading_app();
+                    let before = app.folder_thumb_pin_db.as_ref().unwrap().lookup(&root);
+                    let automatic = CoverCrop::new([500_000, 0, 1_000_000, 1_000_000])
+                        .unwrap()
+                        .unwrap();
+                    let mut prepared = fake_prepared(None);
+                    prepared.rotation_key = Some("reset-page".into());
+                    let mut crops = [None; 4];
+                    crops[rotation.degrees() as usize / 90] = Some(automatic);
+                    prepared.auto_detection = AutoDetection::from_crops(
+                        crate::cover_auto_material::AutoCropResults::new(crops),
+                    );
+                    app.update_rotation_page_owner([("reset-page".into(), rotation)]);
+                    tx.send((7, Ok(prepared))).ok().unwrap();
+                    let mut h = app_harness(app);
+                    crate::settings::apply_ui_scale_factor(&h.ctx, scale);
+                    h.run_steps(4);
+                    let Phase::Ready(draft) =
+                        &mut h.state_mut().cover_crop_dialog.as_mut().unwrap().phase
+                    else {
+                        panic!("ready");
+                    };
+                    draft.crop = crop_rect(CoverCrop::new([0, 0, 250_000, 500_000]).unwrap());
+                    draft.error = Some("範囲を確認してください".into());
+                    h.run_steps(2);
+                    let viewport = h.ctx.content_rect();
+                    let rects: Vec<_> = [
+                        OK_LABEL,
+                        "キャンセル",
+                        "手動の範囲を解除",
+                        AUTO_RESET_LABEL,
+                        "Close window",
+                    ]
+                    .map(|label| {
+                        let rect = h.get_by_label(label).rect();
+                        assert!(
+                            viewport.contains_rect(rect),
+                            "{scale}/{rotation:?}: {label} {rect:?}"
+                        );
+                        rect
+                    })
+                    .into_iter()
+                    .collect();
+                    for (i, a) in rects.iter().enumerate() {
+                        for b in &rects[i + 1..] {
+                            assert!(!a.intersects(*b));
+                        }
+                    }
+                    assert!(
+                        !h.get_by_label(AUTO_RESET_LABEL)
+                            .accesskit_node()
+                            .is_disabled()
+                    );
+                    h.get_by_label(AUTO_RESET_LABEL).click();
+                    h.run_steps(2);
+                    let Phase::Ready(draft) = &h.state().cover_crop_dialog.as_ref().unwrap().phase
+                    else {
+                        panic!("reset must keep the editor open");
+                    };
+                    let expected = rotate_rect(crop_rect(Some(automatic)), rotation);
+                    assert_eq!(
+                        [
+                            draft.crop.min_x,
+                            draft.crop.min_y,
+                            draft.crop.max_x,
+                            draft.crop.max_y
+                        ],
+                        [
+                            expected.min_x,
+                            expected.min_y,
+                            expected.max_x,
+                            expected.max_y
+                        ]
+                    );
+                    assert!(draft.error.is_none());
+                    let message = draft.auto_detection.message(rotation);
+                    let Phase::Ready(draft) =
+                        &mut h.state_mut().cover_crop_dialog.as_mut().unwrap().phase
+                    else {
+                        panic!("ready");
+                    };
+                    draft.rotation = Rotation::from_degrees(rotation.degrees() + 90);
+                    h.run_steps(2);
+                    assert!(
+                        h.get_by_label(AUTO_RESET_LABEL)
+                            .accesskit_node()
+                            .is_disabled()
+                    );
+                    let Phase::Ready(draft) =
+                        &mut h.state_mut().cover_crop_dialog.as_mut().unwrap().phase
+                    else {
+                        panic!("ready");
+                    };
+                    draft.rotation = rotation;
+                    h.run_steps(2);
+                    h.get_by_label(&message).scroll_to_me();
+                    h.run_steps(3);
+                    assert!(viewport.contains_rect(h.get_by_label(&message).rect()));
+                    assert_eq!(
+                        h.state()
+                            .folder_thumb_pin_db
+                            .as_ref()
+                            .unwrap()
+                            .lookup(&root),
+                        before
+                    );
+                    h.get_by_label(if accept { OK_LABEL } else { "キャンセル" })
+                        .click();
+                    h.run_steps(2);
+                    assert!(!h.state().cover_crop_dialog_open());
+                    let saved = h
+                        .state()
+                        .folder_thumb_pin_db
+                        .as_ref()
+                        .unwrap()
+                        .lookup(&root);
+                    if accept {
+                        assert_eq!(saved.unwrap().cover_crop, Some(automatic));
+                    } else {
+                        assert_eq!(saved, before);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cover_crop_enter_uses_focused_clear_when_footer_wraps() {
+        let (app, tx, root, crop) = fake_loading_app();
+        tx.send((7, Ok(fake_prepared(Some(crop))))).ok().unwrap();
+        let mut h = app_harness(app);
+        h.set_size(egui::vec2(380.0, 614.0));
+        h.run_steps(4);
+        assert!(
+            h.get_by_label("手動の範囲を解除").rect().top()
+                > h.get_by_label(OK_LABEL).rect().bottom()
+        );
+        h.get_by_label("手動の範囲を解除").focus();
+        h.run_steps(1);
+        h.key_press(egui::Key::Enter);
+        h.run_steps(2);
+        assert!(!h.state().cover_crop_dialog_open());
+        assert!(
+            h.state()
+                .folder_thumb_pin_db
+                .as_ref()
+                .unwrap()
+                .lookup(&root)
+                .unwrap()
+                .cover_crop
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cover_crop_auto_reset_keyboard_enter_does_not_accept() {
+        let (app, tx, root, _) = fake_loading_app();
+        let before = app.folder_thumb_pin_db.as_ref().unwrap().lookup(&root);
+        let automatic = CoverCrop::new([500_000, 0, 1_000_000, 1_000_000])
+            .unwrap()
+            .unwrap();
+        let mut prepared = fake_prepared(None);
+        prepared.auto_detection = AutoDetection::from_crops(
+            crate::cover_auto_material::AutoCropResults::new([Some(automatic); 4]),
+        );
+        tx.send((7, Ok(prepared))).ok().unwrap();
+        let mut h = app_harness(app);
+        h.run_steps(4);
+        let Phase::Ready(draft) = &mut h.state_mut().cover_crop_dialog.as_mut().unwrap().phase
+        else {
+            panic!("ready");
+        };
+        draft.crop = crop_rect(CoverCrop::new([0, 0, 250_000, 500_000]).unwrap());
+        h.get_by_label(AUTO_RESET_LABEL).focus();
+        h.run_steps(1);
+        h.key_press(egui::Key::Enter);
+        h.run_steps(2);
+        assert!(
+            h.state().cover_crop_dialog_open(),
+            "reset via Enter must not also accept"
+        );
+        assert_eq!(
+            h.state()
+                .folder_thumb_pin_db
+                .as_ref()
+                .unwrap()
+                .lookup(&root),
+            before
+        );
+        let Phase::Ready(draft) = &h.state().cover_crop_dialog.as_ref().unwrap().phase else {
+            panic!("ready");
+        };
+        let expected = crop_rect(Some(automatic));
+        assert_eq!(
+            [
+                draft.crop.min_x,
+                draft.crop.min_y,
+                draft.crop.max_x,
+                draft.crop.max_y
+            ],
+            [
+                expected.min_x,
+                expected.min_y,
+                expected.max_x,
+                expected.max_y
+            ]
+        );
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        assert!(!h.state().cover_crop_dialog_open());
+    }
+
+    #[test]
     fn cover_crop_accept_auto_draft_saves_manual_range() {
         let (app, tx, root, _) = fake_loading_app();
         let crop = CoverCrop::new([500_000, 0, 1_000_000, 1_000_000]).unwrap();
         let mut prepared = fake_prepared(None);
-        prepared.auto_crop = crop;
-        prepared.auto_enabled = true;
+        prepared.auto_detection =
+            AutoDetection::from_crops(crate::cover_auto_material::AutoCropResults::new([crop; 4]));
         tx.send((7, Ok(prepared))).ok().unwrap();
         let mut h = app_harness(app);
         h.run_steps(4);
@@ -1533,11 +2089,11 @@ mod tests {
                             1=>{
                                 let prepared=fake_prepared(CoverCrop::new([0,0,500_000,1_000_000]).unwrap());
                                 Phase::Ready(CropDraft {source:prepared.source,texture:ctx.load_texture("pure-cover",prepared.image,egui::TextureOptions::LINEAR),rotation:Rotation::None,
-                                    crop:crop_rect(prepared.crop),had_manual_crop:true,auto_enabled:true,drag:None,error:None})
+                                    crop:crop_rect(prepared.crop),had_manual_crop:true,auto_detection:AutoDetection::Stopped(AutoStop::Manual { automatic_enabled: true }),drag:None,error:None})
                             }
                             _=>Phase::Failed("代表画像を読み込めませんでした。別のページで指定してください。".into()),
                         });
-                        let action=draw_window(ctx,&mut state.open,phase,false,false);
+                        let action=draw_window(ctx,&mut state.open,phase,false,false,&mut WindowPlacement::UserManaged);
                         if action!=Action::None {state.action=action;}
                         state.responses=state.watched.iter().filter_map(|id|ctx.read_response(*id)).collect();
                         state.canvas=ctx.data(|data|data.get_temp(egui::Id::new("cover-crop-canvas-geometry")));
@@ -1659,12 +2215,25 @@ mod tests {
                                         rotation: Rotation::None,
                                         crop: crop_rect(prepared.crop),
                                         had_manual_crop: true,
-                                        auto_enabled,
+                                        auto_detection: AutoDetection::Stopped(if auto_enabled {
+                                            AutoStop::Manual {
+                                                automatic_enabled: true,
+                                            }
+                                        } else {
+                                            AutoStop::Source(AutoCoverSkip::Off)
+                                        }),
                                         drag: None,
                                         error: None,
                                     })
                                 });
-                                let action = draw_window(ctx, &mut state.open, phase, false, false);
+                                let action = draw_window(
+                                    ctx,
+                                    &mut state.open,
+                                    phase,
+                                    false,
+                                    false,
+                                    &mut WindowPlacement::UserManaged,
+                                );
                                 if action != Action::None {
                                     state.action = action;
                                 }
@@ -1763,6 +2332,212 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn cover_crop_repeated_openings_keep_egui_memory_bounded_and_siblings_unchanged() {
+        for scale in [1.0, 2.0] {
+            let (mut app, tx, _root, crop) = fake_loading_app();
+            let dialog = app.cover_crop_dialog.take();
+            let mut h = app_harness(app);
+            crate::settings::apply_ui_scale_factor(&h.ctx, scale);
+            h.run_steps(2);
+            h.set_size(egui::vec2(1920.0, 1080.0) / scale);
+            h.run_steps(2);
+            h.state_mut().cover_crop_dialog = dialog;
+            tx.send((7, Ok(fake_prepared(Some(crop))))).unwrap();
+            h.run_steps(8);
+            let sibling_id = egui::Id::new("cover-crop-unrelated-window-test");
+            let sibling_rect =
+                egui::Rect::from_min_size(egui::pos2(500.0, 100.0), egui::vec2(200.0, 150.0));
+            h.ctx.memory_mut(|memory| {
+                memory.areas_mut().set_state(
+                    egui::LayerId::new(egui::Order::Middle, sibling_id),
+                    egui::AreaState {
+                        pivot_pos: Some(sibling_rect.min),
+                        size: Some(sibling_rect.size()),
+                        ..Default::default()
+                    },
+                );
+                memory.data.insert_temp(sibling_id, 0x773_u64);
+            });
+            let mut warm_size = None;
+            for generation in 8..20 {
+                h.get_by_label("キャンセル").click();
+                h.run_steps(3);
+                assert!(h.state().cover_crop_dialog.is_none());
+                let (tx, rx) = mpsc::channel();
+                let app = h.state_mut();
+                app.cover_crop_generation = generation;
+                app.cover_crop_dialog = Some(CoverCropDialog {
+                    generation,
+                    container: app.current_folder.clone().unwrap(),
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    phase: Phase::Loading(rx),
+                    placement: WindowPlacement::Initial,
+                });
+                tx.send((generation, Ok(fake_prepared(Some(crop)))))
+                    .unwrap();
+                h.run_steps(8);
+                assert_eq!(
+                    h.ctx.memory(|memory| memory.area_rect(sibling_id)),
+                    Some(sibling_rect)
+                );
+                assert_eq!(
+                    h.ctx.data(|data| data.get_temp::<u64>(sibling_id)),
+                    Some(0x773)
+                );
+                let count = h.ctx.data(|data| data.len());
+                if generation == 10 {
+                    warm_size = Some(count);
+                }
+                if let Some(limit) = warm_size {
+                    assert!(
+                        count <= limit,
+                        "{scale}: egui memory grew with opening {generation}: {count} > {limit}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cover_crop_user_geometry_survives_loading_and_ready_frames_at_100_and_200_percent() {
+        fn drag(
+            h: &mut Harness<'static, crate::app::AppTestEnvForTest>,
+            from: egui::Pos2,
+            to: egui::Pos2,
+        ) {
+            h.hover_at(from);
+            h.run_steps(2);
+            h.event(egui::Event::PointerButton {
+                pos: from,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            });
+            h.run_steps(1);
+            h.event(egui::Event::PointerMoved(to));
+            h.run_steps(3);
+            h.event(egui::Event::PointerButton {
+                pos: to,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            h.run_steps(8);
+        }
+        let id = egui::Id::new("cover-crop-window");
+        for scale in [1.0, 2.0] {
+            let (mut app, tx, _root, crop) = fake_loading_app();
+            let dialog = app.cover_crop_dialog.take();
+            let mut h = app_harness(app);
+            crate::settings::apply_ui_scale_factor(&h.ctx, scale);
+            h.run_steps(2);
+            h.set_size(egui::vec2(1920.0, 1080.0) / scale);
+            h.run_steps(2);
+            h.state_mut().cover_crop_dialog = dialog;
+            h.run_steps(8);
+            let initial = h.ctx.memory(|m| m.area_rect(id)).unwrap();
+            drag(
+                &mut h,
+                initial.right_bottom(),
+                initial.min + egui::vec2(420.0, 260.0),
+            );
+            let resized = h.ctx.memory(|m| m.area_rect(id)).unwrap();
+            assert!(resized.width() + 40.0 < initial.width());
+            assert!(resized.height() + 40.0 < initial.height());
+            let title = resized.center_top() + egui::vec2(0.0, 16.0);
+            drag(&mut h, title, title + egui::vec2(30.0, 20.0));
+            let moved = h.ctx.memory(|m| m.area_rect(id)).unwrap();
+            assert!((moved.size() - resized.size()).length() <= 1.0);
+            assert!((moved.min - resized.min - egui::vec2(30.0, 20.0)).length() <= 1.0);
+            h.set_size(egui::vec2(2200.0, 1400.0) / scale);
+            h.run_steps(3);
+            assert_eq!(h.ctx.memory(|m| m.area_rect(id)).unwrap(), moved);
+            tx.send((7, Ok(fake_prepared(Some(crop))))).unwrap();
+            h.run_steps(10);
+            assert!(matches!(
+                h.state().cover_crop_dialog.as_ref().unwrap().phase,
+                Phase::Ready(_)
+            ));
+            let ready = h.ctx.memory(|m| m.area_rect(id)).unwrap();
+            assert!(
+                (ready.min - moved.min).length() <= 1.0
+                    && (ready.size() - moved.size()).length() <= 1.0,
+                "{scale}: worker completion overwrote user geometry: {moved:?} -> {ready:?}"
+            );
+            h.run_steps(10);
+            assert_eq!(h.ctx.memory(|m| m.area_rect(id)).unwrap(), ready);
+        }
+    }
+
+    #[test]
+    fn cover_crop_reopen_uses_current_viewport_at_100_and_200_percent() {
+        fn ready_harness(
+            scale: f32,
+            physical: egui::Vec2,
+        ) -> Harness<'static, crate::app::AppTestEnvForTest> {
+            let (mut app, tx, _root, crop) = fake_loading_app();
+            let dialog = app.cover_crop_dialog.take();
+            let mut h = app_harness(app);
+            crate::settings::apply_ui_scale_factor(&h.ctx, scale);
+            h.run_steps(2);
+            h.set_size(physical / scale);
+            // Harness builds an initial frame; do not open the dialog until
+            // the requested viewport/zoom has been applied to that context.
+            h.run_steps(2);
+            assert!((h.ctx.content_rect().size() * scale - physical).length() <= 1.0);
+            h.state_mut().cover_crop_dialog = dialog;
+            tx.send((7, Ok(fake_prepared(Some(crop))))).unwrap();
+            h.run_steps(8);
+            h
+        }
+        let window_id = egui::Id::new("cover-crop-window");
+        let mut failures = Vec::new();
+        for scale in [1.0, 2.0] {
+            let large_size = egui::vec2(1920.0, 1080.0);
+            let expected = {
+                let reference = ready_harness(scale, large_size);
+                reference
+                    .ctx
+                    .memory(|memory| memory.area_rect(window_id))
+                    .unwrap()
+            };
+            let mut h = ready_harness(scale, egui::vec2(1100.0, 620.0));
+            let small = h.ctx.memory(|memory| memory.area_rect(window_id)).unwrap();
+            h.get_by_label("キャンセル").click();
+            h.run_steps(3);
+            assert!(h.state().cover_crop_dialog.is_none());
+            h.set_size(large_size / scale);
+            h.run_steps(2);
+            let (tx, rx) = mpsc::channel();
+            let app = h.state_mut();
+            app.cover_crop_generation = 8;
+            app.cover_crop_dialog = Some(CoverCropDialog {
+                generation: 8,
+                container: app.current_folder.clone().unwrap(),
+                cancel: Arc::new(AtomicBool::new(false)),
+                phase: Phase::Loading(rx),
+                placement: WindowPlacement::Initial,
+            });
+            let crop = CoverCrop::new([0, 0, 500_000, 1_000_000]).unwrap().unwrap();
+            tx.send((8, Ok(fake_prepared(Some(crop))))).unwrap();
+            h.run_steps(8);
+            let reopened = h.ctx.memory(|memory| memory.area_rect(window_id)).unwrap();
+            println!(
+                "scale={scale}: small={small:?}, reopened={reopened:?}, fresh large={expected:?}"
+            );
+            if (reopened.size() - expected.size()).length() > 1.0
+                || (reopened.min - expected.min).length() > 1.0
+            {
+                failures.push(format!("{scale}: {reopened:?} != {expected:?}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "reopening retained old geometry: {failures:?}"
+        );
     }
 
     #[test]
@@ -1992,6 +2767,7 @@ mod tests {
             container: PathBuf::from("book.zip"),
             cancel: cancel.clone(),
             phase: Phase::Loading(rx),
+            placement: WindowPlacement::Initial,
         };
         drop(dialog);
         assert!(cancel.load(Ordering::Relaxed));

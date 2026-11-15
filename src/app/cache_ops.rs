@@ -154,6 +154,7 @@ mod epub_stamp_tests {
         let map = std::collections::HashMap::from([(
             key.clone(),
             crate::catalog::CacheEntry {
+                auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 mtime: 17,
                 file_size: 4096,
                 jpeg_data: Vec::new(),

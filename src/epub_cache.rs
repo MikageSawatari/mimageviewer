@@ -2092,6 +2092,7 @@ mod tests {
                 None,
                 b"old",
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
 

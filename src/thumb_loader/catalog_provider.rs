@@ -527,7 +527,17 @@ mod tests {
             let cover = CoverIdentity::Page(format!("{drive}:/books/book.zip::nested/001.png"));
             let writer = provider.writer(&req).unwrap();
             writer
-                .save("cover", 1, 2, 3, 4, None, b"pixels", &cover)
+                .save(
+                    "cover",
+                    1,
+                    2,
+                    3,
+                    4,
+                    None,
+                    b"pixels",
+                    &cover,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
+                )
                 .unwrap();
             assert_eq!(writer.load_one("cover").unwrap().unwrap().cover, cover);
             let reader = provider.resolve(&req, None).unwrap();
@@ -698,6 +708,7 @@ mod tests {
                 Some(crate::catalog::FolderThumbProvenance::AutoSelected),
                 Some(&proof),
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let reader = provider.resolve(&req, None).unwrap();
@@ -742,6 +753,7 @@ mod tests {
                 row.folder_provenance,
                 row.selection_proof.as_ref(),
                 &row.cover,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let continued = provider
@@ -968,6 +980,7 @@ mod tests {
             None,
             b"broken WebP",
             &crate::cover_identity::CoverIdentity::Legacy,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic,
         )
         .unwrap();
         req.force_cache = false;
@@ -1059,6 +1072,7 @@ mod tests {
                 None,
                 b"still live",
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
     }
@@ -1101,6 +1115,7 @@ mod tests {
                 None,
                 b"C contents",
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         assert_eq!(
@@ -1134,6 +1149,7 @@ mod tests {
                 Some((8, 8)),
                 &bytes,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         }
@@ -1172,6 +1188,7 @@ mod tests {
                 None,
                 b"ambiguous old row",
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let identity =
@@ -1267,6 +1284,7 @@ mod tests {
                 None,
                 b"old",
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let c_path = db_path_for(
@@ -1326,6 +1344,7 @@ mod tests {
             Some((8, 8)),
             &bytes,
             &crate::cover_identity::CoverIdentity::Legacy,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic,
         )
         .unwrap();
         let map = RwLock::new(std::collections::HashMap::from([(
@@ -1357,6 +1376,7 @@ mod tests {
                 Some((8, 8)),
                 &bytes,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let messages = run(&mut req, &provider, CachePolicy::Always, &map);
@@ -1399,6 +1419,7 @@ mod tests {
                 None,
                 b"still writable",
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         assert!(!db.is_retired());
@@ -1454,6 +1475,7 @@ mod tests {
             Some((8, 6)),
             &valid_webp(),
             &crate::cover_identity::CoverIdentity::Legacy,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic,
         )
         .unwrap();
         db
@@ -1536,6 +1558,7 @@ mod tests {
         let map = RwLock::new(std::collections::HashMap::from([(
             req.cache_key_override.clone().unwrap(),
             crate::catalog::CacheEntry {
+                auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 cover: crate::cover_identity::CoverIdentity::Legacy,
                 mtime: req.mtime,
                 file_size: req.file_size,
@@ -1845,6 +1868,7 @@ mod tests {
         RwLock::new(std::collections::HashMap::from([(
             req.cache_key_override.clone().unwrap(),
             crate::catalog::CacheEntry {
+                auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 cover: crate::cover_identity::CoverIdentity::Legacy,
                 mtime: req.mtime,
                 file_size: req.file_size,
@@ -2088,6 +2112,7 @@ mod tests {
         let map = RwLock::new(std::collections::HashMap::from([(
             key.clone(),
             crate::catalog::CacheEntry {
+                auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 cover: crate::cover_identity::CoverIdentity::Legacy,
                 mtime: generation.0,
                 file_size: generation.1,
@@ -2226,6 +2251,7 @@ mod tests {
         let map = RwLock::new(std::collections::HashMap::from([(
             req.cache_key_override.clone().unwrap(),
             crate::catalog::CacheEntry {
+                auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 cover: crate::cover_identity::CoverIdentity::Legacy,
                 mtime: req.mtime,
                 file_size: req.file_size,
@@ -2249,6 +2275,7 @@ mod tests {
                 Some((16, 12)),
                 &valid_webp(),
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         req.source_policy = LoadSourcePolicy::CacheOnly;

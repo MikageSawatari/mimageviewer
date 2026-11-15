@@ -3890,27 +3890,70 @@ fn details_shared_preview_hover_text(
 }
 
 fn details_thumbnail_preview_size(
-    texture_size: egui::Vec2,
+    view: crate::cover_auto_material::AutoCropView,
+    texture_size: [usize; 2],
     rotation: crate::rotation_db::Rotation,
 ) -> egui::Vec2 {
-    if texture_size.x <= 0.0 || texture_size.y <= 0.0 {
+    if texture_size.contains(&0) {
         return egui::vec2(180.0, 120.0);
     }
-    let display_size = match rotation {
-        crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
-            egui::vec2(texture_size.y, texture_size.x)
-        }
-        _ => texture_size,
-    };
-    let scale = (320.0 / display_size.x)
-        .min(320.0 / display_size.y)
-        .min(1.0);
-    display_size * scale
+    view.fit_texture(texture_size, rotation, egui::vec2(320.0, 320.0), 1.0)
 }
 
 #[cfg(test)]
 mod details_thumbnail_preview_tests {
     use super::*;
+
+    #[test]
+    fn auto_cover_details_hover_limits_actual_pixels_for_cropped_and_declined_material() {
+        use crate::cover_auto_material::{AutoCropResults, AutoMaterial};
+        use crate::rotation_db::Rotation;
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "small cached material",
+            egui::ColorImage::filled([128, 64], egui::Color32::WHITE),
+            Default::default(),
+        );
+        let crop =
+            crate::folder_thumb_pins::CoverCrop::new([250_000, 0, 750_000, 1_000_000]).unwrap();
+        for selected in [None, crop] {
+            let mut thumb = crate::grid_item::ThumbnailState::loaded_raster(
+                texture.clone(),
+                crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+                false,
+                128,
+                crate::source_coverage::SourceCoverage::FullSource,
+                Some((8000, 4000)),
+                Some((800_000, 400_000)),
+            );
+            if let crate::grid_item::ThumbnailState::Loaded { auto_material, .. } = &mut thumb {
+                *auto_material = AutoMaterial::Automatic(AutoCropResults::new([selected; 4]));
+            }
+            for rotation in [
+                Rotation::None,
+                Rotation::Cw90,
+                Rotation::Cw180,
+                Rotation::Cw270,
+            ] {
+                let view = thumb.tile_view_for_texture(&texture, rotation);
+                assert!(
+                    view.displayed_size.max_elem() > 320.0,
+                    "geometry must still use page-box dimensions"
+                );
+                let expected = if selected.is_some() {
+                    egui::vec2(64.0, 64.0)
+                } else if matches!(rotation, Rotation::Cw90 | Rotation::Cw270) {
+                    egui::vec2(64.0, 128.0)
+                } else {
+                    egui::vec2(128.0, 64.0)
+                };
+                assert_eq!(
+                    details_thumbnail_preview_size(view, texture.size(), rotation),
+                    expected
+                );
+            }
+        }
+    }
 
     #[test]
     fn details_thumbnail_hover_fits_rotated_pixels_without_upscaling() {
@@ -3922,11 +3965,29 @@ mod details_thumbnail_preview_tests {
             (Rotation::Cw270, egui::vec2(160.0, 320.0)),
         ] {
             assert_eq!(
-                details_thumbnail_preview_size(egui::vec2(640.0, 320.0), rotation),
+                details_thumbnail_preview_size(
+                    crate::cover_auto_material::auto_crop_view(
+                        (640, 320),
+                        None,
+                        crate::cover_auto_material::AutoMaterial::NotAutomatic,
+                        rotation
+                    ),
+                    [640, 320],
+                    rotation
+                ),
                 expected
             );
             assert_eq!(
-                details_thumbnail_preview_size(egui::vec2(64.0, 32.0), rotation),
+                details_thumbnail_preview_size(
+                    crate::cover_auto_material::auto_crop_view(
+                        (64, 32),
+                        None,
+                        crate::cover_auto_material::AutoMaterial::NotAutomatic,
+                        rotation
+                    ),
+                    [64, 32],
+                    rotation
+                ),
                 expected * 0.2
             );
         }
@@ -19037,9 +19098,14 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 )
             });
         let rotation = self.grid_tile_rotation_memory(idx);
-        let image_size = texture
+        let view = texture
             .as_ref()
-            .map(|tex| details_thumbnail_preview_size(tex.size_vec2(), rotation))
+            .zip(self.thumbnails.get(idx))
+            .map(|(tex, thumb)| thumb.tile_view_for_texture(tex, rotation));
+        let image_size = view
+            .as_ref()
+            .zip(texture.as_ref())
+            .map(|(view, texture)| details_thumbnail_preview_size(*view, texture.size(), rotation))
             .unwrap_or_else(|| egui::vec2(180.0, 120.0));
         let padding = 8.0;
         let viewport_size = image_size + egui::vec2(padding * 2.0, padding * 2.0);
@@ -19083,7 +19149,15 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     let rect = ui.max_rect().shrink(padding);
                     if let Some(tex) = texture.as_ref() {
                         let img_rect = egui::Rect::from_center_size(rect.center(), image_size);
-                        crate::app::draw_rotated_image(ui.painter(), tex.id(), img_rect, rotation);
+                        crate::app::draw_rotated_image_uv_ex(
+                            ui.painter(),
+                            tex.id(),
+                            img_rect,
+                            view.expect("loaded tooltip has a material view").uv,
+                            rotation,
+                            0.0,
+                            img_rect.center(),
+                        );
                         if is_audio && let Some(parts) = audio_parts {
                             let marker_rect = if parts.music_icon {
                                 egui::Rect::from_center_size(

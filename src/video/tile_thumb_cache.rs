@@ -4,6 +4,8 @@
 //!
 //! `%APPDATA%/mimageviewer/video_tile_thumbs.db` にサムネイルと粗い波形 chunk を保存する。
 //! タイルモードや波形ストリップを 2 度目以降開いたとき、再度の decode を省略できる。
+//! 現在の `timestamp_ms` は MediaTimeline が定めるメディア時刻のミリ秒値。
+//! TS/PS 系の旧 raw 時刻による行は DB の一回限りの移行 gate で失効させる。
 //!
 //! ## スキーマ (v3)
 //!
@@ -11,7 +13,7 @@
 //! CREATE TABLE IF NOT EXISTS video_tile_thumbs (
 //!     path         TEXT NOT NULL,
 //!     tile_w       INTEGER NOT NULL,
-//!     timestamp_ms INTEGER NOT NULL,    -- 絶対 PTS をミリ秒単位の整数キーで記録
+//!     timestamp_ms INTEGER NOT NULL,    -- メディア時刻をミリ秒単位の整数キーで記録
 //!     tile_h       INTEGER NOT NULL,
 //!     webp         BLOB NOT NULL,
 //!     video_mtime  INTEGER NOT NULL,
@@ -92,6 +94,19 @@ const THUMB_RENDER_VERSION: i64 = 2;
 /// Increment when the seven-byte `QuantizedWaveformBin` byte layout changes.
 const WAVE_COLUMN_FORMAT_VERSION: i64 = 1;
 
+/// The previously unused DB user_version records the one-time timeline migration.
+/// Keep row render/format versions unchanged so other formats retain their cache.
+const MEDIA_TIMELINE_CACHE_VERSION: i64 = 1;
+
+/// Extension approximation of MediaTimeline's mpegts/mpegtsraw/mpeg demuxers.
+/// Cross-checked against folder_tree::SUPPORTED_VIDEO_EXTENSIONS (currently only
+/// mpg/mpeg overlap); keep the other TS/PS suffixes for directly opened files.
+/// This list is only for discarding rebuildable legacy cache, not origin detection.
+const LEGACY_RAW_TIMELINE_EXTENSIONS: &[&str] = &[
+    "ts", "m2ts", "mts", "m2t", "tp", "trp", "tts", "mpg", "mpeg", "m2p", "vob", "mod", "tod",
+    "evo",
+];
+
 pub struct TileThumbCache {
     conn: Mutex<rusqlite::Connection>,
 }
@@ -166,7 +181,8 @@ impl TileThumbCache {
                     ON video_resume_thumbs(path);",
             )?;
             Self::ensure_render_version_columns(conn)?;
-            return Self::init_wave_schema(conn);
+            Self::init_wave_schema(conn)?;
+            return Self::migrate_media_timeline_cache(conn);
         }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS video_tile_thumbs (
@@ -200,6 +216,36 @@ impl TileThumbCache {
         })
         .and_then(|_| Self::ensure_render_version_columns(conn))
         .and_then(|_| Self::init_wave_schema(conn))
+        .and_then(|_| Self::migrate_media_timeline_cache(conn))
+    }
+
+    fn migrate_media_timeline_cache(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version >= MEDIA_TIMELINE_CACHE_VERSION {
+            return Ok(());
+        }
+        // Commit the selective invalidation and marker together. A failed migration
+        // leaves both unchanged; it must never mark stale rows as already migrated.
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        let version: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version < MEDIA_TIMELINE_CACHE_VERSION {
+            let suffixes = LEGACY_RAW_TIMELINE_EXTENSIONS
+                .iter()
+                .map(|extension| format!("lower(path) GLOB '*.{extension}'"))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            for table in [
+                "video_tile_thumbs",
+                "video_resume_thumbs",
+                "video_wave_chunks",
+                "video_wave_chunks_track",
+            ] {
+                tx.execute(&format!("DELETE FROM {table} WHERE {suffixes}"), [])?;
+            }
+            tx.pragma_update(None, "user_version", MEDIA_TIMELINE_CACHE_VERSION)?;
+        }
+        tx.commit()
     }
 
     fn init_wave_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
@@ -754,6 +800,188 @@ mod tests {
                 row.get(0)
             })
             .unwrap()
+    }
+
+    fn seed_time_keyed_rows(conn: &Connection, path: &str) {
+        for table in ["video_tile_thumbs", "video_resume_thumbs"] {
+            conn.execute(
+                &format!(
+                    "INSERT INTO {table}
+                     (path, tile_w, timestamp_ms, tile_h, webp, video_mtime, render_version)
+                     VALUES (?1, 320, 5000, 180, X'010203', 100, ?2)"
+                ),
+                rusqlite::params![path, THUMB_RENDER_VERSION],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO video_wave_chunks
+             (path, bin_secs_millis, chunk_index, bins, bin_count, video_mtime, video_size, format_version)
+             VALUES (?1, 100, 0, X'04', 600, 100, 4096, ?2)",
+            rusqlite::params![path, WAVE_COLUMN_FORMAT_VERSION],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO video_wave_chunks_track
+             (path, stream_index, bin_secs_millis, chunk_index, bins, bin_count, video_mtime, video_size, format_version)
+             VALUES (?1, 1, 100, 0, X'05', 600, 100, 4096, ?2)",
+            rusqlite::params![path, WAVE_COLUMN_FORMAT_VERSION],
+        )
+        .unwrap();
+    }
+
+    fn assert_time_keyed_paths(conn: &Connection, expected: &[&str]) {
+        let mut expected = expected.to_vec();
+        expected.sort_unstable();
+        for table in [
+            "video_tile_thumbs",
+            "video_resume_thumbs",
+            "video_wave_chunks",
+            "video_wave_chunks_track",
+        ] {
+            let mut stmt = conn
+                .prepare(&format!("SELECT path FROM {table} ORDER BY path"))
+                .unwrap();
+            let paths = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(paths, expected, "{table}");
+        }
+    }
+
+    #[test]
+    fn timeline_migration_discards_only_ts_ps_rows_once_across_reopens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("video_tile_thumbs.db");
+        let unaffected = [
+            "c:/v.mp4",
+            "c:/v.mkv",
+            "c:/v.mp3",
+            "c:/v.ogg",
+            "c:/v.flv",
+            "c:/v.ts.bak",
+            "c:/dir.ts/file",
+            "c:/%_'日本語.mp4",
+        ];
+        {
+            let conn = Connection::open(&path).unwrap();
+            TileThumbCache::init_schema(&conn).unwrap();
+            // Before this change the same tables existed without any DB gate.
+            conn.pragma_update(None, "user_version", 0).unwrap();
+            for extension in LEGACY_RAW_TIMELINE_EXTENSIONS {
+                seed_time_keyed_rows(&conn, &format!("c:/v.{}", extension.to_ascii_uppercase()));
+            }
+            for item in unaffected {
+                seed_time_keyed_rows(&conn, item);
+            }
+        }
+        {
+            let conn = Connection::open(&path).unwrap();
+            TileThumbCache::init_schema(&conn).unwrap();
+            assert_time_keyed_paths(&conn, &unaffected);
+            let version: i64 = conn
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, MEDIA_TIMELINE_CACHE_VERSION);
+            // Newly generated media-time rows must survive the next startup.
+            seed_time_keyed_rows(&conn, "c:/regenerated.ts");
+            let db = TileThumbCache {
+                conn: Mutex::new(conn),
+            };
+            assert_eq!(
+                db.lookup_webp(Path::new("c:/v.mp4"), 5000, 100, 320),
+                Some(vec![1, 2, 3])
+            );
+            assert_eq!(
+                db.lookup_resume_webp(Path::new("c:/v.mp4"), 100, 320),
+                Some((5000, vec![1, 2, 3]))
+            );
+            assert_eq!(
+                db.lookup_wave_chunks(Path::new("c:/v.mp4"), 1, Some(1), 100, 4096, 100, 600),
+                vec![(0, vec![5])]
+            );
+        }
+        let conn = Connection::open(&path).unwrap();
+        TileThumbCache::init_schema(&conn).unwrap();
+        let mut expected = unaffected.to_vec();
+        expected.push("c:/regenerated.ts");
+        assert_time_keyed_paths(&conn, &expected);
+    }
+
+    #[test]
+    fn timeline_migration_preserves_future_gate_and_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        TileThumbCache::init_schema(&conn).unwrap();
+        seed_time_keyed_rows(&conn, "c:/v.ts");
+        conn.pragma_update(None, "user_version", MEDIA_TIMELINE_CACHE_VERSION + 1)
+            .unwrap();
+        TileThumbCache::init_schema(&conn).unwrap();
+        assert_time_keyed_paths(&conn, &["c:/v.ts"]);
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MEDIA_TIMELINE_CACHE_VERSION + 1);
+    }
+
+    #[test]
+    fn timeline_migration_failure_rolls_back_rows_and_gate() {
+        let conn = Connection::open_in_memory().unwrap();
+        TileThumbCache::init_schema(&conn).unwrap();
+        seed_time_keyed_rows(&conn, "c:/v.ts");
+        conn.pragma_update(None, "user_version", 0).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_wave_delete BEFORE DELETE ON video_wave_chunks
+             BEGIN SELECT RAISE(ABORT, 'test migration failure'); END;",
+        )
+        .unwrap();
+        assert!(TileThumbCache::init_schema(&conn).is_err());
+        assert_time_keyed_paths(&conn, &["c:/v.ts"]);
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 0);
+    }
+
+    #[test]
+    fn timeline_migration_upgrades_v2_without_render_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE video_tile_thumbs (
+                path TEXT NOT NULL, tile_w INTEGER NOT NULL, timestamp_ms INTEGER NOT NULL,
+                tile_h INTEGER NOT NULL, webp BLOB NOT NULL, video_mtime INTEGER NOT NULL,
+                PRIMARY KEY (path, tile_w, timestamp_ms)
+             );
+             CREATE TABLE video_resume_thumbs (
+                path TEXT NOT NULL PRIMARY KEY, tile_w INTEGER NOT NULL,
+                timestamp_ms INTEGER NOT NULL, tile_h INTEGER NOT NULL,
+                webp BLOB NOT NULL, video_mtime INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        for table in ["video_tile_thumbs", "video_resume_thumbs"] {
+            for path in ["c:/v.mpg", "c:/v.mp4"] {
+                conn.execute(
+                    &format!("INSERT INTO {table} VALUES (?1, 320, 5000, 180, X'01', 100)"),
+                    [path],
+                )
+                .unwrap();
+            }
+        }
+        TileThumbCache::init_schema(&conn).unwrap();
+        for table in ["video_tile_thumbs", "video_resume_thumbs"] {
+            let (path, version): (String, i64) = conn
+                .query_row(
+                    &format!("SELECT path, render_version FROM {table}"),
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(path, "c:/v.mp4");
+            // Keep the old orientation version stale, independently of timeline.
+            assert_eq!(version, 1);
+        }
     }
 
     #[test]
@@ -1350,7 +1578,25 @@ mod tests {
             rusqlite::params!["c:/v.mp4", 5000, 320, 180, 2, &[42u8] as &[u8], 100],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO video_tile_thumbs
+                (path, interval_ms, tile_w, tile_h, slot, webp, video_mtime)
+             VALUES ('c:/legacy.ts', 5000, 320, 180, 2, X'01', 100)",
+            [],
+        )
+        .unwrap();
         TileThumbCache::init_schema(&conn).expect("migrate");
+        let legacy_ts_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM video_tile_thumbs WHERE path = 'c:/legacy.ts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            legacy_ts_rows, 0,
+            "v1 migration must also pass the timeline gate"
+        );
         let db = TileThumbCache {
             conn: Mutex::new(conn),
         };
