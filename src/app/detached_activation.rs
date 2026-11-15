@@ -499,8 +499,8 @@ mod tests {
     #[test]
     fn realmachine55_parked_live_caption_button_and_doubleclick_resume_same_context() {
         use windows::Win32::UI::WindowsAndMessaging::{
-            HTCAPTION, HTLEFT, HTMAXBUTTON, WM_CAPTURECHANGED, WM_MOVING, WM_NCLBUTTONDBLCLK,
-            WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_SIZING,
+            HTCAPTION, HTLEFT, HTMAXBUTTON, SC_MAXIMIZE, WM_CAPTURECHANGED, WM_MOVING,
+            WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_SIZING, WM_SYSCOMMAND,
         };
         let _input = crate::key_input::lock_test_input();
         for (start, hit, movement) in [
@@ -529,7 +529,7 @@ mod tests {
                 allocation.native_message_for_test(movement, 0, (&mut rect as *mut _) as isize);
             }
             if hit == HTMAXBUTTON {
-                allocation.native_message_for_test(WM_NCLBUTTONUP, hit as usize, 0);
+                allocation.native_message_for_test(WM_SYSCOMMAND, SC_MAXIMIZE as usize, 0);
             } else {
                 allocation.native_message_for_test(WM_CAPTURECHANGED, 0, 0);
             }

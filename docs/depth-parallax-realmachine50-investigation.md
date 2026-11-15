@@ -1419,6 +1419,8 @@ hookはPM_REMOVEだけを観測し、自身は開始producerにならない。
 | D → F(D)、U／Cなし | 未完了・AwaitingRelease | buttonはcaptionと異なりDown returnだけでは完了しない |
 | HTCLOSEの操作 | CloseOwned | 再開へ変換しない |
 
+**依頼57の結論:** 実測は「異なるhitのU → 一致C」の列だった。release hitの引き直しを撤去し、同じ押下call内の一致Cと押下返却へ一本化する（§5.11）。上表は依頼56時点の履歴として残す。
+
 参照関数は `key_input.rs` の `native_non_client_location`／`native_non_client_button_location`、
 `native_detached_message_with_hit_test`、`finish_native_detached_dispatch`、`set_native_detached_input_targets`。
 `e9c909f56` と `81406ab92` を比較し、依頼55の `25f3f9e41` も照合した。
@@ -1541,6 +1543,123 @@ exe SHA256: `5769572b5d2caa20f348925d97e237f3a164d7652e89f92b1ae287bab9da1ba5`�
 独立source review（Sol / xhigh）は、認識規則を変えない診断と同じownerを使うprobeを
 症状パッチではない構造としてACCEPT。実API compileと実機順序の確認をその判定へ代用しない。
 未確認は実OS列、native theme／mIV host差、手動・auto実行、実機reason。製品起動・全件gate・build-dev・commit／pushは実施しない。
+
+### 5.11 依頼57: caption buttonの確定をOSの一致コマンドへ統一（2026-11-15）
+
+基点は `5919fe4dc`。観測者はすべてサブPC担当で、根拠は
+`C:/miv-subpc/results-57/notes.md`、`manual.log`、`auto.log` と製品logs。
+manual sequence 1～6は、HTMAXBUTTONのDown → hookのclient Up →
+CaptureChanged(0) → subclassのSC_MAXIMIZE／SC_RESTORE → SCのfinish → Downのfinish。
+Upのclient座標を画面座標へ戻して同じHWNDへWM_NCHITTESTを送っても、返値は
+最大化時HTCAPTION、復元時HTMINBUTTONとなり、OSの実行前にCaptionButtonOutsideへ変わっていた。
+製品も6回とも同理由で取消となった。sequence 8の外で離す操作にはSCが無く、OSも最大化しない。
+sequence 7のcaption clickはCompleted。表示倍率125%／snap一覧の有無は観測条件であり、
+倍率が原因だとは断定しない。依頼55で1回commitした理由は未解明のまま残す。
+
+**確定点と終端。** HTMINBUTTON／HTMAXBUTTON／HTHELPは、同じ押下のnative call中に
+subclassでdispatchされた一致WM_SYSCOMMANDだけを選択の事実とする。
+押下のDefSubclassProc返却だけで終端し、一致SCがあればCompleted、無ければ
+Cancelled(CaptionButtonOutside)とする。このreasonは「OSがボタンを選択しなかった」の意味になる。
+Upの位置・有無、CaptureLost／FocusLost／CancelMode／Escapeはボタンの採否に使わない。
+targetのblock／retireは既存bindingの取消として維持し、後続SCで復活させない。
+HTCLOSEのCloseOwned、caption／resize、ClientBoundaryは変更しない。
+CLAUDE.md「設計の簡素化」の「確定の時点を1つにする」「OSと同じ経路に揃える」を採り、
+位置照合とSCという二重決定、release待ちとの組合せを取り除く（BA-7）。
+
+**撤去範囲。** ボタン用release位置照合、ClientToScreen／WM_NCHITTEST送信、専用の座標helper、
+hit-test注入用のproduction seamとprobeのrelease_hit traceを撤去する。
+ボタンはReleasedにもAwaitingReleaseにも移らない。これらの共用enum variantは
+caption／resizeなどの非ボタン操作が使うため残す。
+
+**touch／pen。** WM_NCPOINTERDOWNも同じ一致SCだけを採用し、その押下call返却で完結させる。
+押下返却後のUpやSCを待つ状態は作らない。raw pointerがOSの追跡を同期実行するのか、
+昇格mouseで実行するのかは実機未確認。昇格mouseを別ownerにしない既存規則は維持する。
+
+**probe。** §5.10のautoの事前WM_NCHITTEST確認は本節で置き換える。
+TITLEBARINFOEXの最大化ボタン矩形と送信直前のWindowFromPoint=自窓だけを確認して入力し、
+実際のWM_NCLBUTTONDOWNのwParamがHTMAXBUTTONであることを観測した後だけWM_SIZEを採用する。
+不一致なら失敗終了し、追加clickは送らない。最大化→復元を各1回、手動／autoの起動方法は§5.10と同じ。
+コピー用 `target/rm56-native-detached-probe/` はexeだけ更新し、DLLは変更しない。
+現在のtraceにはrelease_hitは無く、SC dispatchと押下finish、outcomeを読む。
+
+通知列の新しい判定は次のとおり。hookだけのSCは確定の事実にしない。
+
+| 同じ押下call内の列 | 押下返却時の結果 |
+| --- | --- |
+| MAX Down → client Up（再照会ならHTCAPTION）→ CaptureChanged(0) → dispatch SC_MAXIMIZE | Completed |
+| MAX Down → client Up（再照会ならHTMINBUTTON）→ dispatch SC_RESTORE | Completed |
+| Down → Up → CaptureChanged、SCなし | Cancelled(CaptionButtonOutside) |
+| Down → KillFocus／CancelMode／Escape／capture取消 → 一致SC | Completed |
+| MAX Down → 不一致SC／hookだけの一致SC | Cancelled(CaptionButtonOutside) |
+| MIN Down → dispatch SC_MINIMIZE、HELP Down → dispatch SC_CONTEXTHELP | Completed |
+| Down → target block／retire → 一致SC | ModalOwned／RetiredRegistration（復活しない） |
+| Down返却（SCなし）→ 遅着SC／Up | 返却時に取消済み、追加の結果なし |
+| HTCLOSE → SC_CLOSE | CloseOwned |
+
+**回帰と仕様変更の対応。** 実測列の赤テストは旧実装で1件実行・1件失敗、nextest exit 100
+（run-heavy外側PowerShellのexit 1）。実出力は
+`left: [NonClient(Cancelled(CaptionButtonOutside))] / right: [NonClient(Completed)]`、
+証跡 `target/rm57-red.log`。最終テストは表示しないmessage-only HWNDのWndProcに
+HTCAPTION／HTMINBUTTONを返すfakeを設置し、実SendMessageでfakeの動作を確認してから
+query回数を0に戻す。製品reducerの実測列を通した後も0であることを検査する。
+旧production注入seamをこの検査のために残さない。
+
+意味を更新したテストは8件（prefixの省略なしで列挙）。通常のclient／caption／resizeの回帰は維持する。
+
+| 旧テスト名 | 変更後の検査 |
+| --- | --- |
+| `realmachine55_caption_button_native_command_cannot_revive_true_cancellation` | `realmachine57_caption_button_native_side_effects_do_not_override_os_choice`。nativeのfocus／capture／CancelMode／Escape後も一致SCを採用 |
+| `realmachine55_caption_button_captured_mouse_up_uses_release_hit_until_native_return` | `realmachine57_caption_button_os_command_survives_misleading_release_hit`へ置換。実query境界のfakeが未呼出で一致SCを採用 |
+| `realmachine55_caption_button_raw_committed_action_waits_for_own_up_return` | `realmachine57_caption_button_raw_committed_action_finishes_at_down_return`。pointerも押下call返却で完了 |
+| `realmachine55_caption_button_unmatched_or_queued_command_is_not_execution_proof` | 不一致／hookだけのSCはFocusLostではなくOS未選択のCaptionButtonOutside |
+| `native_detached_cancel_ends_at_native_return_and_does_not_resume_on_late_up` | buttonのcapture(0)ケースは押下返却時のOS未選択取消。残るcaptionの取消理由と遅着Up無効は維持 |
+| `native_detached_caption_button_out_and_back_completes_with_inside_up` | `native_detached_caption_button_out_and_back_completes_with_os_command`。戻った位置ではなく一致SCで確定 |
+| `native_detached_caption_button_far_motion_completes_inside_same_target` | `native_detached_caption_button_far_motion_completes_with_os_command`。最小化SCで確定 |
+| `native_detached_raw_caption_button_tracks_only_own_pointer_target` | pointerの早い押下返却もSCがなければ取消し、後のUp／SCで復活しない |
+
+block／retireの兄弟fixtureとParkedLiveの実handlerは、成功側の入力列へ一致SCを追加し、
+所有context・兄弟保全・一度だけのcommitという既存の期待を維持した。
+独立source review（Sol / xhigh）はBA-7の構造修正としてACCEPT、阻害指摘なし。
+製品・probe・autoはエージェントから起動しない。
+
+**検証。** すべて指定run-heavy、Owner `codex/767-rm57`、6並列、gate同士は直列。
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/realmachine57_|caption_button|native_detached_cancel_ends|realmachine55_parked_live_caption/)' --no-fail-fast --test-threads 6
+cargo nextest run -p mimageviewer --lib -E 'test(/native_detached|non_client|caption|detached_activation|realmachine55_|realmachine57_|parked|native_video/)' --no-fail-fast --test-threads 6
+cargo test -p mimageviewer --features dev-tools --bin native_detached_probe -- --test-threads 6
+cargo build -p mimageviewer --features dev-tools --bin native_detached_probe
+cargo check -p mimageviewer --bin mimageviewer-core
+cargo fmt
+```
+
+| 検証 | 件数／exit code | 証跡 |
+| --- | --- | --- |
+| 旧コード＋実測列の赤テスト | 1実行／1失敗、nextest exit 100 | `target/rm57-red.log` |
+| 最終焦点 | 14実行／14成功／0失敗、exit 0 | `target/rm57-focused-final.log` |
+| 指定回帰＋新テスト | 664実行／664成功／0失敗、exit 0 | `target/rm57-regression.log` |
+| probe pure unit | 5実行／5成功／0失敗、exit 0 | `target/rm57-probe-unit.log` |
+| probe build | 1 exe、exit 0 | `target/rm57-probe-build.log` |
+| core check | 1 core対象、exit 0 | `target/rm57-check.log` |
+| 最後の引数なしfmt | exit 0 | `target/rm57-fmt.log` |
+
+赤テストのコマンドは `cargo nextest run -p mimageviewer --lib -E 'test(/realmachine57_/ )' --no-fail-fast --test-threads 6`。
+初回の緑焦点も14成功（`target/rm57-focused.log`）。その後SC_CLOSEの不一致とpointer captureの
+対照を強化した最終sourceで、上記の焦点と回帰を実行した。
+run-heavyはlock領域への書込不可の警告に従い低優先度・6並列で続行し、重いgateを重複実行しない。
+
+コピー済みexeは `target/rm56-native-detached-probe/native_detached_probe.exe`、33,449,984 bytes。
+SHA256は `f370650399ea78e72f56e6b7254f2666c4abafc3bf8556184d843d3c75d1fc71`。
+build出力とのhash一致と6 DLLの旧manifest hash一致を検査した。exe＋6 DLLは151,263,248 bytes。
+`PE-IMPORTS.json`とREADMEを更新し、DLL本体は変更していない。静的PE記録は
+`target/rm57-pe-imports.json`。起動検査の代用とはしない。
+
+変更ファイルは `src/key_input.rs`（ownerと回帰）、`src/key_input/native_detached_probe.rs`（不要trace撤去）、
+`src/bin/native_detached_probe.rs`（autoとpure unit）、`src/app/detached_activation.rs`（ParkedLiveのtest入力列）、
+本書と `docs/detached-rework-plan.md` の6件。vendor、App field、通常配布物は変更しない。
+
+未確認は実OSでの修正後のmouse／pointer列と、pointerからmouseへの昇格、実機での再開。
+依頼55で1回成功した条件の違いは未解明。全件gate／build-dev／製品起動／probe起動／commit／pushは行わない。
 
 ## 6. 診断（初回調査の案、A実装で導入）
 

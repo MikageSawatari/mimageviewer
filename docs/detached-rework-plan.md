@@ -1458,6 +1458,15 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-15: §1.767 サブPC依頼57 — caption buttonの確定点を一致SCに統一
+
+依頼57の実OS列で、release位置のWM_NCHITTESTがOSのbutton選択と一致しないことを確認した
+（観測者: サブPC担当）。MIN／MAX／HELPは同じ押下native call内の一致WM_SYSCOMMANDだけで確定し、
+押下call返却だけで終端する。buttonの位置照合とrelease待ちを撤去し、block／retireと
+CloseOwned／caption／resize／clientの所有は維持する。BA-7の確定点の構造修正として
+設計担当と独立Sol / xhighが合意。probeのautoも事前hit推測を外し、実押下のhitを確認する。
+詳細・検証・pointer実機未確認は[調査 §5.11](depth-parallax-realmachine50-investigation.md#511-依頼57-caption-buttonの確定をosの一致コマンドへ統一2026-11-15)へ記録する。
+
 ### 2026-11-15: §1.767 サブPC依頼56 — 最大化buttonの理由付き診断と独立probe
 
 BA-7のnative操作終端を調査。通常最大化／復元の取消理由を一つに確定できないため、

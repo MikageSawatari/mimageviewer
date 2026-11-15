@@ -100,18 +100,6 @@ impl Drop for MessageTrace {
     }
 }
 
-pub(super) fn release_hit(hwnd: u64, message: u32, hit: Option<u32>) {
-    if trace_sink()
-        .lock()
-        .expect("probe trace lock poisoned")
-        .is_some()
-    {
-        emit(format!(
-            "boundary=release_hit hwnd=0x{hwnd:x} message=0x{message:04x} hit={hit:?}"
-        ));
-    }
-}
-
 /// Only call for HC_ACTION + PM_REMOVE on the UI thread's WH_GETMESSAGE hook.
 pub fn observe_removed_message(hwnd: u64, message: u32, wparam: usize, lparam: isize) {
     observe_native_detached_message(hwnd, message, wparam, lparam);

@@ -2,6 +2,7 @@
 //! No App, eframe backend, renderer, runtime DLL setup, or settings are opened.
 //! Manual mode never injects input. Only an explicit `--auto` clicks the native
 //! maximize button twice, with an OS-confirmed size transition between clicks.
+//! The OS hit is checked on the actual button-down, never by a preparatory hit test.
 
 use std::path::PathBuf;
 
@@ -72,13 +73,30 @@ mod host {
     enum Phase {
         Manual,
         ReadyMaximize,
+        AwaitMaximizePress,
         Maximizing,
         ReadyRestore,
+        AwaitRestorePress,
         Restoring,
         Done,
+        Failed { message: u32, wparam: usize },
     }
 
     impl Phase {
+        fn pressed(self, message: u32, wparam: usize) -> Self {
+            let next = match self {
+                Self::AwaitMaximizePress => Self::Maximizing,
+                Self::AwaitRestorePress => Self::Restoring,
+                _ => return self,
+            };
+            match message {
+                WM_NCLBUTTONDOWN if wparam == HTMAXBUTTON as usize => next,
+                WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK | WM_LBUTTONDOWN | WM_LBUTTONDBLCLK
+                | WM_NCLBUTTONUP | WM_LBUTTONUP => Self::Failed { message, wparam },
+                _ => self,
+            }
+        }
+
         fn sized(self, size: usize) -> Self {
             match (self, size) {
                 (Self::Maximizing, n) if n == SIZE_MAXIMIZED as usize => Self::ReadyRestore,
@@ -141,7 +159,7 @@ mod host {
                 Some(wp as isize)
             }
             // Captured client messages can be outside the client area. They
-            // carry no hit payload; the shared release_hit query is authoritative.
+            // carry no hit payload; button selection is witnessed by matching SC.
             _ => None,
         }
     }
@@ -154,6 +172,21 @@ mod host {
             lp.0,
             message_hit(msg, wp.0)
         ));
+        let current = phase();
+        let next = current.pressed(msg, wp.0);
+        if current != next {
+            set_phase(next);
+            record(format!(
+                "source=auto actual_press msg=0x{msg:04x} wparam=0x{:x} verified={}",
+                wp.0,
+                matches!(next, Phase::Maximizing | Phase::Restoring)
+            ));
+            if matches!(next, Phase::Failed { .. }) {
+                // Do not enter an unrelated OS caption loop on a bad target.
+                // The outer dispatch returns the error without another click.
+                return LRESULT(0);
+            }
+        }
         if msg == WM_SIZE {
             let current = phase();
             let next = current.sized(wp.0);
@@ -217,14 +250,6 @@ mod host {
         }
     }
 
-    fn packed_point(point: POINT) -> Result<LPARAM, String> {
-        let x = i16::try_from(point.x).map_err(|_| "button x exceeds WM_NCHITTEST range")?;
-        let y = i16::try_from(point.y).map_err(|_| "button y exceeds WM_NCHITTEST range")?;
-        Ok(LPARAM(
-            ((x as u16 as u32) | ((y as u16 as u32) << 16)) as isize,
-        ))
-    }
-
     fn absolute_axis(value: i32, origin: i32, extent: i32) -> Result<i32, String> {
         if extent <= 1
             || value < origin
@@ -260,15 +285,6 @@ mod host {
                 x: ((i64::from(rect.left) + i64::from(rect.right)) / 2) as i32,
                 y: ((i64::from(rect.top) + i64::from(rect.bottom)) / 2) as i32,
             };
-            let hit = SendMessageW(
-                hwnd,
-                WM_NCHITTEST,
-                Some(WPARAM(0)),
-                Some(packed_point(point)?),
-            );
-            if hit.0 != HTMAXBUTTON as isize {
-                return Err(format!("OS button point is not HTMAXBUTTON: hit={}", hit.0));
-            }
             let x = absolute_axis(
                 point.x,
                 GetSystemMetrics(SM_XVIRTUALSCREEN),
@@ -286,8 +302,8 @@ mod host {
                 );
             }
             record(format!(
-                "source=auto send_click x={} y={} hit={} hwnd=0x{:x}",
-                point.x, point.y, hit.0, hwnd.0 as usize
+                "source=auto send_click x={} y={} hwnd=0x{:x} hit=await_actual_press",
+                point.x, point.y, hwnd.0 as usize
             ));
             let mouse = |flags| INPUT {
                 r#type: INPUT_MOUSE,
@@ -321,17 +337,22 @@ mod host {
         // inside DefWindowProc's caption loop never injects the next click there.
         match phase() {
             Phase::ReadyMaximize => {
-                set_phase(Phase::Maximizing);
+                set_phase(Phase::AwaitMaximizePress);
                 click_maximize_button(hwnd)?;
             }
             Phase::ReadyRestore => {
-                set_phase(Phase::Restoring);
+                set_phase(Phase::AwaitRestorePress);
                 click_maximize_button(hwnd)?;
             }
             Phase::Done => unsafe {
                 PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0))
                     .map_err(|e| e.to_string())?;
             },
+            Phase::Failed { message, wparam } => {
+                return Err(format!(
+                    "actual click was not WM_NCLBUTTONDOWN/HTMAXBUTTON: msg=0x{message:04x} wparam=0x{wparam:x}; auto aborted"
+                ));
+            }
             _ => {}
         }
         Ok(())
@@ -503,20 +524,68 @@ mod host {
                 Phase::Restoring
             );
             assert_eq!(Phase::Restoring.sized(SIZE_RESTORED as usize), Phase::Done);
+            for phase in [Phase::AwaitMaximizePress, Phase::AwaitRestorePress] {
+                assert_eq!(phase.sized(SIZE_MAXIMIZED as usize), phase);
+                assert_eq!(phase.sized(SIZE_RESTORED as usize), phase);
+            }
         }
 
         #[test]
-        fn native_coordinates_keep_signed_screen_positions() {
+        fn auto_requires_actual_max_button_press_before_each_size_transition() {
+            let maximizing =
+                Phase::AwaitMaximizePress.pressed(WM_NCLBUTTONDOWN, HTMAXBUTTON as usize);
+            assert_eq!(maximizing, Phase::Maximizing);
+            assert_eq!(
+                maximizing.sized(SIZE_MAXIMIZED as usize),
+                Phase::ReadyRestore
+            );
+            let restoring =
+                Phase::AwaitRestorePress.pressed(WM_NCLBUTTONDOWN, HTMAXBUTTON as usize);
+            assert_eq!(restoring, Phase::Restoring);
+            assert_eq!(restoring.sized(SIZE_RESTORED as usize), Phase::Done);
+            // Size changes and later input cannot restart either completed click.
+            assert_eq!(
+                Phase::Done.pressed(WM_NCLBUTTONDOWN, HTMAXBUTTON as usize),
+                Phase::Done
+            );
+            assert_eq!(Phase::Done.sized(SIZE_MAXIMIZED as usize), Phase::Done);
+        }
+
+        #[test]
+        fn auto_rejects_wrong_actual_hit_and_never_retries() {
+            for awaiting in [Phase::AwaitMaximizePress, Phase::AwaitRestorePress] {
+                for (message, wparam) in [
+                    (WM_NCLBUTTONDOWN, HTCAPTION as usize),
+                    (WM_NCLBUTTONDOWN, HTMINBUTTON as usize),
+                    (WM_NCLBUTTONDOWN, HTCLOSE as usize),
+                    (WM_NCLBUTTONDBLCLK, HTMAXBUTTON as usize),
+                    (WM_LBUTTONDOWN, 0),
+                    (WM_LBUTTONDBLCLK, 0),
+                    (WM_LBUTTONUP, 0),
+                    (WM_NCLBUTTONUP, HTMAXBUTTON as usize),
+                ] {
+                    let failed = awaiting.pressed(message, wparam);
+                    assert_eq!(failed, Phase::Failed { message, wparam });
+                    assert_eq!(failed.sized(SIZE_MAXIMIZED as usize), failed);
+                    assert_eq!(failed.sized(SIZE_RESTORED as usize), failed);
+                    assert_eq!(
+                        failed.pressed(WM_NCLBUTTONDOWN, HTMAXBUTTON as usize),
+                        failed
+                    );
+                }
+                for message in [WM_NCHITTEST, WM_NCMOUSEMOVE, WM_MOUSEMOVE] {
+                    assert_eq!(awaiting.pressed(message, HTMAXBUTTON as usize), awaiting);
+                }
+            }
+        }
+
+        #[test]
+        fn native_hit_payload_and_virtual_desktop_coordinates() {
             assert_eq!(message_hit(WM_LBUTTONUP, 0), None);
             assert_eq!(
                 message_hit(WM_NCLBUTTONUP, HTMAXBUTTON as usize),
                 Some(HTMAXBUTTON as isize)
             );
-            assert_eq!(
-                packed_point(POINT { x: -20, y: -40 }).unwrap().0 as u32,
-                0xffd8_ffec
-            );
-            assert!(packed_point(POINT { x: 40_000, y: 0 }).is_err());
             assert!(absolute_axis(0, 0, 0).is_err());
             assert!(absolute_axis(-101, -100, 200).is_err());
             assert!(absolute_axis(100, -100, 200).is_err());
