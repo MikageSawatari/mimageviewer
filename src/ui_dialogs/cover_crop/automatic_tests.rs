@@ -47,7 +47,7 @@ fn cover_crop_auto_method_layout_binding_messages_keep_one_typed_result() {
                 Rotation::Cw180,
                 Rotation::Cw270,
             ] {
-                let mut reports = [Err(AutoCropDecline::CameraPageAspect); 4];
+                let mut reports = [Err(AutoCropDecline::RawAspectGate); 4];
                 reports[angle.degrees() as usize / 90] = Ok(success);
                 let detection = AutoDetection::Analyzed { binding, reports };
                 assert_eq!(detection.message(angle), expected_message);
@@ -64,7 +64,7 @@ fn cover_crop_auto_method_layout_binding_messages_keep_one_typed_result() {
                     if other != angle {
                         assert_eq!(
                             detection.message(other),
-                            "自動の判定: 切り出していません。本文ページの形が写真の比率に近いため、寸法の型による切り出しは使いません"
+                            "自動の判定: 切り出していません。表紙がつながった形 (横長) ではありません"
                         );
                     }
                 }

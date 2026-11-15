@@ -177,9 +177,6 @@ fn decline_text(reason: AutoCropDecline) -> &'static str {
         // The dialog normally stops before analysis with the sampler's exact
         // typed cause. Keep a diagnostic for a detector-only missing aspect.
         PageAspectMissing => stop_text(AutoStop::PageAspect(PageAspectDecline::TooFew)),
-        CameraPageAspect => {
-            "本文ページの形が写真の比率に近いため、寸法の型による切り出しは使いません"
-        }
         NoJacketEvidence | NoStructure | NoLocalEvidence | NoSpine => {
             "表表紙と背・袖の境目が見つかりません"
         }
@@ -244,10 +241,6 @@ mod tests {
             (
                 PageAspectMissing,
                 "本文ページの形が決まりません (ページが少ない)",
-            ),
-            (
-                CameraPageAspect,
-                "本文ページの形が写真の比率に近いため、寸法の型による切り出しは使いません",
             ),
             (NoJacketEvidence, boundary),
             (NoStructure, boundary),

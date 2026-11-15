@@ -1752,8 +1752,7 @@ UTF-8 BOM、開けない本と壊れた画像の後の継続を含む。`cargo f
 - 証拠不足の見送り（NoJacketEvidence/NoLocalEvidence/NoSpine/WeakFront/NoStructure/TwoPanelと
   RicherElsewhere）に、評価器のlayout-snapを同じ式・重み・閾値で適用する。
   RawAspectGate/PageAspectMissing/PhotoLike/NotWideは越えない。Rは `[1.35,3.9)` に限る。
-  本文比率が2/3・3/4・9/16・4/5のどれかから0.002未満の差なら、この補完だけを
-  `CameraPageAspect` (`camera-page-aspect`) で見送る。従来の成功と次のT2置換には掛けない。
+  本文が写真の比率であることによる除外は行わない（利用者決定、§28.5）。
 - 従来の判定が成功したT2 (`R ∈ [1.85,2.4)`) だけ、合わせる前のlayout位置との横方向IoUを比べる。
   0.6未満ならlayout-snapへ置き換える。0.6以上とT1/T3/T4では従来の横位置を保つ。左綴じは左右反転する。
 - `cover_auto_crop/layout.rs` が予測・境目・snapの単一実装。評価器側はadapterから共用する。
@@ -1770,7 +1769,7 @@ UTF-8 BOM、開けない本と壊れた画像の後の継続を含む。`cargo f
   K2の出荷済みv1の流用は従来どおり残し、未出荷v2からの移行は追加しない。
 - 評価器の未指定baselineは、全高化・型の補完・T2置換を含む本番の詳細report関数をそのまま使う。
   `MIV_COVER_AUTO_EVAL_FALLBACK` は比較用として残す。本番で成功済みなら追加の後押しはしない。
-  写真比率の見送りも比較用の後押しでは越えない。赤枠/current_cropは本番v3、青枠/fallback_cropは追加の比較だけ。
+  赤枠/current_cropは本番v3、青枠/fallback_cropは追加の比較だけ。
   JSONの `production_method` / `production_layout` で本番の方法と型も記録する。
 
 ### 28.3 変更2は失効の設計待ち（未実装）
@@ -1805,7 +1804,6 @@ request・catalog・K2・結果採用・保持した一覧まで一組で運ぶ�
 - 変更1・3・4とv3/v3fのキー更新を実装。worker・範囲画面・評価器は詳細reportの共通入口を使う。
   変更2は§28.3のとおり未実装で、既存の回転変更・detached・本文標本の経路は触っていない。
 - 新規の判定回帰は `production_layout_fallback_accepts_every_structural_decline_and_preserves_guards`、
-  `production_camera_page_ratios_guard_only_layout_fallback_with_strict_tolerance`、
   `production_t2_replacement_uses_unsnapped_horizontal_iou_and_strict_point_six`、
   `production_full_height_preserves_horizontal_structural_crop_at_every_rotation`、
   `production_layout_ratio_boundaries_and_all_saved_rotations_share_the_prediction`。
@@ -1824,3 +1822,25 @@ request・catalog・K2・結果採用・保持した一覧まで一組で運ぶ�
   既存物を変更せず `target/773-rc5-build` にビルド先を分け、FFmpegのDLL参照を既存vendor/binから補って完走した。
   TEMP/TMPもG:のworktree内、コンパイル並列数は2。利用者データ・外部評価画像・sheetは使わず開いていない。
   lib全件・製品起動・build-dev・独立レビュー・コミットは行っていない。
+
+### 28.5 本文の写真比率による守りを入れない (利用者決定、2026-11-15)
+
+設計担当の評価では、写真の負例390枚で後押しの誤りが14→236枚に増え、うち225枚は本文の比率が
+写真の縦横比と一致していた。2/3・3/4・9/16・4/5との差0.002未満を除外する守りを入れると
+誤りは11枚程度に減るが、画像フォルダの本18冊ほど（本文がちょうど3:4・2:3の本）が後押しで切られなくなる。
+機能は利用者がオンにするまで効かず、切るほうを優先する方針なので、利用者の判断でこの守りは入れない。
+
+本文が写真の比率で、かつ表紙が本文を横に倒した形（差2%以内）のときだけ止める弱い守りも検討した。
+後押しの写真の誤りは222→92枚となる一方、画像フォルダの本4冊が切られなくなるため、これも入れない。
+写真の比率ちょうどの本は、画素数で作られた本などで実在する（画像フォルダの本430冊中12冊）。
+
+本文比率による除外のコード・専用の見送り理由・守りを検証するテストと公開文書の説明を撤去した。
+撮影情報による既存のG1、全高化、型の補完、T2の置換、v3/v3fと変更2の設計待ちはそのまま。
+`production_layout_fallback_accepts_photographic_page_ratios_without_shooting_exif` で
+写真の比率でも型の補完へ進むことと、撮影情報がある場合は従来どおり見送ることを固定する。
+
+撤去後の検証:共有runner `773 rc5` 経由の焦点nextest `test(/cover_auto|cover_crop/)` は
+**210件成功・失敗0**。`cargo check -p mimageviewer --bin mimageviewer-core` 成功、
+`cargo test -p mimageviewer --test ui_snapshot cover_` は **5件成功・PNG更新なし**。
+`cargo fmt`・`git diff --check`・`python scripts/check_ui_glyphs.py`（危険な字形0件）も成功。
+利用者データ・評価画像は使わず開いていない。製品起動・lib全件・build-dev・コミットは行っていない。

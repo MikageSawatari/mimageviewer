@@ -53,7 +53,6 @@ fn production_layout_fallback_accepts_every_structural_decline_and_preserves_gua
         AutoCropDecline::RawAspectGate,
         AutoCropDecline::PageAspectMissing,
         AutoCropDecline::NotWide,
-        AutoCropDecline::CameraPageAspect,
         AutoCropDecline::PhotoLike {
             reason: photo::PhotoLikeReason::ShotExif,
         },
@@ -63,46 +62,44 @@ fn production_layout_fallback_accepts_every_structural_decline_and_preserves_gua
 }
 
 #[test]
-fn production_camera_page_ratios_guard_only_layout_fallback_with_strict_tolerance() {
-    let image = RgbImage::new(300, 200);
-    for camera in [2.0 / 3.0, 3.0 / 4.0, 9.0 / 16.0, 4.0 / 5.0] {
-        for offset in [-0.001999, 0.0, 0.001999, -0.002001, 0.002001] {
-            let aspect = camera + offset;
-            let result = apply_layout_policy(
-                &image,
-                (300, 200),
-                Some(aspect),
-                ReadingDirection::Rtl,
-                Err(AutoCropDecline::RicherElsewhere),
-            );
-            if offset.abs() < 0.002 {
-                assert_eq!(result, Err(AutoCropDecline::CameraPageAspect));
-            } else {
-                assert!(matches!(
-                    result.unwrap().method,
-                    AutoCropMethod::LayoutFallback(_)
-                ));
+fn production_layout_fallback_accepts_photographic_page_ratios_without_shooting_exif() {
+    // Also covers a landscape cover transposed exactly from a 2:3 body page.
+    // Neither an exact camera aspect nor that shape alone vetoes a layout.
+    let image = DynamicImage::new_rgb8(300, 200);
+    for aspect in [2.0 / 3.0, 3.0 / 4.0, 9.0 / 16.0, 4.0 / 5.0] {
+        for binding in [ReadingDirection::Rtl, ReadingDirection::Ltr] {
+            for shot_exif in [false, true] {
+                let mut report = None;
+                let results = detect_cover_crops_with_photo_detailed_report(
+                    &image,
+                    (300, 200),
+                    Some(aspect),
+                    shot_exif,
+                    binding,
+                    |angle, result| {
+                        if angle == Rotation::None {
+                            report = Some(result);
+                        }
+                    },
+                );
+                if shot_exif {
+                    assert_eq!(
+                        report.unwrap(),
+                        Err(AutoCropDecline::PhotoLike {
+                            reason: photo::PhotoLikeReason::ShotExif,
+                        })
+                    );
+                    assert!(results.crops().iter().all(Option::is_none));
+                } else {
+                    let success = report.unwrap().unwrap();
+                    assert!(matches!(success.method, AutoCropMethod::LayoutFallback(_)));
+                    assert_eq!(success.crop.values()[1], 0);
+                    assert_eq!(success.crop.values()[3], 1_000_000);
+                    assert_eq!(results.crop_for(Rotation::None), Some(success.crop));
+                }
             }
         }
-        let current = CoverCrop::new([0, 30_000, 500_000, 970_000])
-            .unwrap()
-            .unwrap();
-        assert!(
-            apply_layout_policy(
-                &image,
-                (300, 200),
-                Some(camera),
-                ReadingDirection::Rtl,
-                Ok(current),
-            )
-            .is_ok(),
-            "camera ratio must not veto an existing success"
-        );
     }
-    assert_eq!(
-        AutoCropDecline::CameraPageAspect.as_str(),
-        "camera-page-aspect"
-    );
 }
 
 #[test]
@@ -156,7 +153,7 @@ fn production_t2_replacement_uses_unsnapped_horizontal_iou_and_strict_point_six(
             );
             assert_eq!(success.crop, disjoint);
         }
-        // Camera page ratios also keep the T2 replacement rule active.
+        // Exact 2:3 page ratios also keep the T2 replacement rule active.
         let success = apply_layout_policy(
             &image,
             (200, 150),

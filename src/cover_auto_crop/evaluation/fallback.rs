@@ -79,7 +79,6 @@ impl FallbackConfig {
                 AutoCropDecline::RawAspectGate
                 | AutoCropDecline::PageAspectMissing
                 | AutoCropDecline::PhotoLike { .. }
-                | AutoCropDecline::CameraPageAspect
                 | AutoCropDecline::NotWide => false,
             }
     }
@@ -494,7 +493,6 @@ mod tests {
                     AutoCropDecline::RawAspectGate,
                     AutoCropDecline::PageAspectMissing,
                     AutoCropDecline::NotWide,
-                    AutoCropDecline::CameraPageAspect,
                     AutoCropDecline::PhotoLike {
                         reason: photo::PhotoLikeReason::ShotExif,
                     },

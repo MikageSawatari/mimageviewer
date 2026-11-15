@@ -68,7 +68,6 @@ pub(crate) enum AutoCropDecline {
         reason: photo::PhotoLikeReason,
     },
     NotWide,
-    CameraPageAspect,
     NoJacketEvidence,
     NoStructure,
     NoLocalEvidence,
@@ -132,7 +131,6 @@ impl AutoCropDecline {
             Self::PageAspectMissing => "no-page-aspect",
             Self::PhotoLike { reason } => return format!("photo-like/{}", reason.as_str()).into(),
             Self::NotWide => "not-wide",
-            Self::CameraPageAspect => "camera-page-aspect",
             Self::NoJacketEvidence => "no-jacket-evidence",
             Self::NoStructure => "no-structure",
             Self::NoLocalEvidence => "no-local-evidence",
@@ -743,12 +741,6 @@ fn structural_decline(reason: AutoCropDecline) -> bool {
     )
 }
 
-fn camera_page_aspect(aspect: f64) -> bool {
-    [2.0 / 3.0, 3.0 / 4.0, 9.0 / 16.0, 4.0 / 5.0]
-        .into_iter()
-        .any(|camera| (aspect - camera).abs() < 0.002)
-}
-
 fn horizontal_iou(first: [f64; 2], second: [f64; 2]) -> f64 {
     let overlap = (first[1].min(second[1]) - first[0].max(second[0])).max(0.0);
     overlap / (first[1] - first[0] + second[1] - second[0] - overlap)
@@ -796,13 +788,8 @@ fn apply_layout_policy(
             AutoCropMethod::LayoutReplaced(kind.expect("T2 prediction has a layout type"))
         }
         Err(reason) => {
-            // This guard applies only to a layout fallback; existing successes,
-            // including T2 replacements, remain eligible at camera page ratios.
             if prediction.is_none() {
                 return Err(reason);
-            }
-            if camera_page_aspect(aspect) {
-                return Err(AutoCropDecline::CameraPageAspect);
             }
             AutoCropMethod::LayoutFallback(kind.expect("fallback prediction has a layout type"))
         }

@@ -1375,7 +1375,9 @@ mod tests {
                     crop,
                     AutoCropMethod::LayoutReplaced(AutoCropLayout::T2),
                 )),
-                Err(AutoCropDecline::CameraPageAspect),
+                Err(AutoCropDecline::PhotoLike {
+                    reason: crate::cover_auto_crop::photo::PhotoLikeReason::ShotExif,
+                }),
             ] {
                 let (app, tx, _, _) = fake_loading_app();
                 let mut prepared = fake_prepared(Some(crop));
