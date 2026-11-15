@@ -1,6 +1,8 @@
 //! Keep the pre-input preparation and actual viewport paint in the same pass.
 use super::*;
 
+mod canvas_click;
+
 struct PaintedFrame {
     pages: Vec<DisplayedImageTransform>,
     unit: egui::Rect,

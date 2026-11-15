@@ -13283,6 +13283,7 @@ impl App {
         self.fs_zoom = 1.0;
         self.fs_pan = egui::Vec2::ZERO;
         self.clear_fs_initial_placement_request();
+        self.fs_automatic_initial_view = None;
     }
 
     /// 編集ツールを抜けたのに見開きが戻っていない状態を解消する。
@@ -13352,6 +13353,7 @@ impl App {
         self.fs_zoom = 1.0;
         self.fs_pan = egui::Vec2::ZERO;
         self.clear_fs_initial_placement_request();
+        self.fs_automatic_initial_view = None;
     }
 }
 
@@ -18384,6 +18386,7 @@ pub struct App {
     pub(crate) fs_pan: egui::Vec2,
     pub(crate) fs_initial_placement_request:
         Option<crate::ui_fullscreen::FsInitialPlacementRequest>,
+    pub(crate) fs_automatic_initial_view: Option<crate::ui_fullscreen::FsAutomaticInitialView>,
 
     // ── ZipPla 風 全画面ズームモード (Z キー、v2.0.0) ──────────────
     // 画像の一部を画面いっぱいに拡大 (cover) し、マウス位置で表示範囲をパンする
@@ -21811,6 +21814,7 @@ impl App {
             fs_zoom: 1.0,
             fs_pan: egui::Vec2::ZERO,
             fs_initial_placement_request: None,
+            fs_automatic_initial_view: None,
             fs_zoom_active: false,
             fs_zoom_aiming: false,
             // 既定 1.0 = cover (縦長画像では横幅目一杯)。ZipPla 単ページの既定に合わせる。
@@ -45628,6 +45632,7 @@ impl App {
     fn set_items_generation(&mut self, items_generation: u64) {
         if self.items_generation != items_generation {
             self.clear_fs_initial_placement_request();
+            self.fs_automatic_initial_view = None;
             self.close_page_overview();
             self.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
             self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
@@ -82945,6 +82950,7 @@ impl App {
         destination: FullscreenCloseDestination,
     ) {
         self.clear_fs_initial_placement_request();
+        self.fs_automatic_initial_view = None;
         self.cancel_original_material_entry_intents(None);
         self.pending_fs_page_turn_ready = None;
         self.page_turn_presentation.deactivate("closed");

@@ -1,4 +1,4 @@
-//! Page-entry positioning: provisional paint aligns until the first complete unit.
+//! Page-entry positioning and automatic-view identity for canvas clicks.
 use super::*;
 use crate::gpu_lanczos::FullscreenPageMaterialKind;
 
@@ -15,6 +15,16 @@ pub(crate) struct FsInitialPlacementRequest {
     /// Last automatic placement, used only to detect an intervening writer.
     pub(crate) applied_zoom: f32,
     pub(crate) applied_pan: egui::Vec2,
+}
+
+/// Pure automatic placement, retained after the placement request completes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct FsAutomaticInitialView {
+    items_generation: u64,
+    anchor_idx: usize,
+    slice: crate::page_split::PageSlice,
+    zoom: f32,
+    pan: egui::Vec2,
 }
 
 /// `unit` is the union of the canonical, trimmed paint rects at pan zero.
@@ -38,11 +48,32 @@ fn reading_start_pan(
 }
 
 impl App {
+    /// Whether the user has moved this display unit away from its initial view.
+    ///
+    /// The 2026-08-15 rule deliberately excluded pan: counting a nudge would
+    /// stop click navigation without a marked way back. On 2026-11-15 the
+    /// user reversed that decision after §1.745: a double-click cannot both
+    /// reset the view and turn pages. The manual now documents double-click
+    /// reset as the way back. Automatic ReadingStart placement is not a move.
+    pub(super) fn fs_view_has_moved(&self, zoom: f32, pan: egui::Vec2, free_rotation: f32) -> bool {
+        zoom_differs_from_fit(zoom)
+            || free_rotation.abs() > TRANSFORM_EPSILON
+            || (pan.length_sq() > PAN_EPSILON_SQ
+                && !self.fs_automatic_initial_view.is_some_and(|initial| {
+                    initial.items_generation == self.items_generation
+                        && self.fullscreen_idx == Some(initial.anchor_idx)
+                        && initial.slice == self.fullscreen_page_slice
+                        && initial.zoom == zoom
+                        && initial.pan == pan
+                }))
+    }
+
     pub(crate) fn clear_fs_initial_placement_request(&mut self) {
         self.fs_initial_placement_request = None;
     }
 
     pub(crate) fn request_fs_initial_placement(&mut self, anchor_idx: usize) {
+        self.fs_automatic_initial_view = None;
         self.fs_initial_placement_request =
             (self.settings.fullscreen_page_start_position.normalized()
                 == crate::settings::FullscreenPageStartPosition::ReadingStart)
@@ -58,6 +89,7 @@ impl App {
 
     /// Accepted composition changes use the zoom selected by the existing path.
     pub(crate) fn request_fs_initial_placement_after_composition_change(&mut self) {
+        self.fs_automatic_initial_view = None;
         if !self.reading_flow.is_paged()
             || self.settings.fullscreen_page_start_position.normalized()
                 != crate::settings::FullscreenPageStartPosition::ReadingStart
@@ -143,6 +175,22 @@ impl App {
             .fs_initial_placement_request
             .expect("validated placement request");
         self.fs_pan = pan;
+        self.fs_automatic_initial_view = Some(FsAutomaticInitialView {
+            items_generation: self.items_generation,
+            anchor_idx,
+            slice: self.fullscreen_page_slice,
+            zoom: self.fs_zoom,
+            // Half navigation preserves manual pan on non-overflowing axes.
+            // Only the placement computed from zero is an automatic baseline.
+            pan: reading_start_pan(
+                zero_pan_unit.expect("validated placement material"),
+                viewport,
+                self.spread_mode
+                    .reading_direction()
+                    .unwrap_or(self.reading_direction),
+                egui::Vec2::ZERO,
+            ),
+        });
         self.fs_initial_placement_request = match material_kind {
             FullscreenPageMaterialKind::Complete => None,
             FullscreenPageMaterialKind::Provisional => Some(FsInitialPlacementRequest {
