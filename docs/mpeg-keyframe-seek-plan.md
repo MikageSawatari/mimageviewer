@@ -1,6 +1,6 @@
 # MPEG-TS / PS の keyframe 確認付き seek (§1.785)
 
-状態: 設計 第 3 版 (2026-11-15、設計担当 ClaudeCode Opus)。第 1 版・第 2 版は実装前の独立レビュー (gpt-6.1-sol / xhigh)
+状態: 設計 第 4 版 (2026-11-15、設計担当 ClaudeCode Opus)。第 1〜3 版は実装前の独立レビュー (gpt-6.1-sol / xhigh)
 で REJECT になり、その指摘 (§8) を反映した。対象は v5.3.0。経緯は [バックログ §1.785](next-release-backlog.md)、
 時刻の契約は [動画の時刻原点](video-timeline-origin-plan.md)。
 
@@ -57,22 +57,37 @@ for back in [1, 2, 4, 8, 16, 32] 秒:
 - 後段は decoder を flush した後、保持した列を先頭から読み、尽きたら Input を読む。復号は着地点の後の最初の key から始まる。
   最初の key より前の映像 packet も渡す (SPS / PPS・SEI・extradata の更新を含み得るので、codec ごとに捨てる判定をしない)。
   表示の抑制は既存の「目標より前の frame を出さない」処理が受け持つ。
-- 保持した列は Input から読んだ packet と同じ順・同じ中身 (side data を含む) で、後段の配送 (decoder の demux thread の
-  backpressure・`pending_video_packets` の処理を含む) は Input から読んだ packet と区別しない。
+- 保持した列は Input から読んだ packet と同じ順・同じ中身 (side data を含む)。各 stream の中の順序は必ず保つ。
+- **再生 decoder の demux thread での接続**: 音声の送信が詰まったとき (`send_audio_packet_with_video_drain`) に救出できる
+  映像は `pending_video_packets` にあるものだけなので、保持列の映像が音声の後ろに残ると届かない。そこで Verified のときは、
+  保持列の**映像 packet を全部、順に `pending_video_packets` へ入れて** (バイト数の計上も既存のとおり) から、保持列の
+  **映像以外の packet を順に既存の配送へ流し**、その後に Input の続きを読む。stream をまたぐ順序は、既存の
+  `pending_video_packets` と同じく緩めてよい。こうすると音声待ちの間も既存の drain が保持列の映像を届ける。
+  他の worker (サムネイルなど) は映像だけを復号するので、読み口から順に読めばよい。
 
 ### key の判定
 
-FFmpeg の key の印は「復号を始められる位置の候補」で、表示時刻の保証ではない。窓の中の映像 key について:
+FFmpeg の key の印は「復号を始められる位置の候補」で、表示時刻の保証ではない。
 
-- **pts が分かる key が窓にあり、その pts <= target** → 成功。窓の最初の key は、それ以前の GOP の key なので表示時刻も
-  それ以下で、そこから目標まで復号できる。
-- **窓に key が 2 つ以上ある** → 成功 (pts が無くてもよい)。最初の key K1 の表示時刻 pts(K1) は、次の key K2 の dts 以下で、
-  K2 の dts は窓の中なので target 以下。根拠: decoder の並べ替えの深さ (B frame の数) が GOP の frame 数より小さければ、
-  K1 は K2 の復号より前に表示される。これは MPEG-2 / H.264 / HEVC の実用の stream の構造で成り立つ (GOP が並べ替えの
-  深さ以下の stream は想定しない)。
-- どちらでもない (pts の無い key が 1 つだけ、key が無い、pts > target の key だけ) → この back では失敗。pts の無い key の
-  表示時刻を dts や `video_delay` から推定しない (MPEG-2 の `video_delay` は B frame の数ではなく、推定は表示時刻の上限に
-  ならない。レビュー担当が PS 素材で確認)。
+判定に使う集合 J = 窓の中の映像 key packet のうち、**dts が分かり dts <= target のもの** (窓の終わりの dts > target の
+packet は、保持して後段へ渡すが J には入れない)。成功の条件は次の真偽式で、それ以外はすべてこの back では失敗:
+
+```
+success = A or B
+A = J の中に、pts が分かり pts <= target の key がある
+B = 映像の codec が MPEG-1 / MPEG-2 video であり、かつ J の key がすべて pts 不明であり、かつ |J| >= 2
+```
+
+- **A の根拠**: key (random access point) どうしは表示の順が復号の順と同じなので、復号を始める最初の key K1 の表示時刻は、
+  pts <= target の key の表示時刻以下。K1 が pts 不明でもよい。
+- **B の根拠 (MPEG-1 / MPEG-2 に限る)**: MPEG-1 / MPEG-2 の並べ替えは「I / P (anchor) の表示は次の anchor の復号の時」で、
+  K1 の表示時刻 = K1 の次の anchor の dts <= K2 の dts <= target (K2 も anchor)。これは codec の規格の並べ替えの規則で、
+  GOP の長さや B frame の数によらない。H.264 / HEVC は B frame の階層などでこの規則が成り立たないので、pts 不明の key だけ
+  では成功にしない (次の back へ進み、最後は Unverified = 今の seek)。
+- J に pts の分かる key が 1 つでもあれば B は使わない。pts の分かる key がすべて target より後なら、key の数によらず失敗
+  (pts と dts の差が大きい stream で、key の数から成功にしない)。
+- pts の無い key の表示時刻を dts や `video_delay` から推定しない (MPEG-2 の `video_delay` は B frame の数ではなく、推定は
+  表示時刻の上限にならない。レビュー担当が PS 素材で確認)。
 - MPEG-2 の open GOP の B frame と HEVC の CRA の後の RASL は、key より pts が小さく、復号されないか捨てられる。
   pts >= key の pts の frame は復号できる。
 - **対象外 (この修正では保証しない)**: H.264 の recovery point で `recovery_frame_cnt > 0` のもの、intra refresh の stream。
@@ -191,6 +206,8 @@ TS / PS の `AVIndexEntry` は `mpegts_get_dts` などが探索中に登録し�
   - PS: MPEG-2 + MP2、GOP 0.5 秒 (pts の無い key を含むことを生成時に検査する)
   - 録画の途中から始まる TS と PS (先頭が GOP の途中。既存の素材の先頭を切る)
   - 長い GOP の TS: GOP 6 秒・60 fps (back を 2 回以上倍にする経路、スクリーンショットの 240 を超える preroll)
+  - 反例: pts だけを 2 秒遅らせた MPEG-2 TS (`setts`。key が 2 つ以上でも pts > target なら失敗すること)、key の間隔が
+    一か所だけ 3 frame の MPEG-2 TS (窓の終わりの key を J に数えないこと)
   - 対照の MP4 (同じ映像) — 動きが変わらないこと
 
 受入条件 (frame は表示順の番号で判定する。1 秒ごとの色では 0.5 秒のずれを見逃すので使わない):
@@ -206,7 +223,9 @@ TS / PS の `AVIndexEntry` は `mpegts_get_dts` などが探索中に登録し�
   frame (D − 1 frame) でも画が返る。スクリーンショットは 240 を超える preroll でも t の frame を返す。
 - 再生 decoder: TS / PS / HEVC で seek(t) の後の最初の表示 frame の番号が正解表の期待値。最初に採用される音声 sample の
   時刻が今の採用規則どおりで、その後の音声が途切れない。frame step の前後、D − 0.3 秒への seek の後の最初の frame と
-  EOF の時刻。音声 queue が詰まった状態 (Buffering 中の音声 backpressure) でも保持列の映像が届いて表示が進む。
+  EOF の時刻。音声 queue が詰まった状態 (Buffering 中の音声 backpressure) で、seek の直前に `pending_video_packets` が空、目標の
+  映像が保持列の音声 packet より後ろにある場合でも、映像が届いて表示が進む (既存の queue の drain だけでは合格しない
+  ように状態を作る)。
   連続した seek の supersede (`Aborted`) で古い要求の `SeekCompleted` が出ず、最新の要求が採用される。音声トラック
   切り替え中の supersede。
 - シークストリップ: TS / PS の軸が `TimeGrid` になり、枠が空にならない。MP4 の軸の判定は今と同じ。
@@ -245,3 +264,11 @@ TS / PS の `AVIndexEntry` は `mpegts_get_dts` などが探索中に登録し�
 - P2 fallback の時刻の単位 → 元の seek の引数のまま呼ぶ (§3)。
 - P2 サムネイル・タイルの EOF drain とスクリーンショットの予算 → §3.2。
 - P2 推定を正解にする検査 → 正解表を生成時の全復号から作る (§6)。§3.1 の取消に serial の不一致を足した。
+
+第 3 版 (665b57dc2) への指摘と、第 4 版での扱い (範囲の判断 2 点はレビュー担当が了承):
+
+- P1 「key が 2 つ以上」は pts と矛盾しても成功になる (pts を 2 秒遅らせた素材) → 判定を真偽式 A or B にし、B は
+  MPEG-1 / MPEG-2 で J の key がすべて pts 不明のときだけ。根拠を規格の並べ替えの規則に限定 (§2)。
+- P2 窓の終わりの packet と判定の集合の区別 → J を「dts が分かり dts <= target の key」と定義し、終わりの packet は保持だけ (§2)。
+- P2 音声 backpressure → Verified では保持列の映像を先に `pending_video_packets` へ入れる (§2)。§6 の回帰の状態を指定。
+- §6 に追加: pts を遅らせた反例素材、key の間隔が短い (3 frame) 箇所を持つ MPEG-2 TS。
