@@ -116,15 +116,16 @@ skip sample / pre-skip が適用された音声サンプルと frame PTS の関�
 - 追記 (2026-11-14、サブ PC の依頼 53、サブ PC 担当と利用者が開いたセッションの観測): 出荷済みの tool でも同じことが起きる。Claude Code 2.1.72 (デスクトップアプリのセッション) で、セッションの途中に「縮小画像」を ON にしても `get_thumbnail` は出ず、許可の範囲を「整理まで」に上げても書き込み系の tool は出なかった (一覧は 9 件のまま、list_changed の通知も届かなかった)。新しく始めたセッションでは 18 件 (get_thumbnail・書き込み系・open_in_viewer を含む) が見えた。Claude Desktop のチャット・ChatGPT Codex は未確認。
 ### 1.789 AI アプリが MCP を使っている間も更新でき、更新の後もそのまま使い続けられるようにする — v5.2.1 の公開作業から (2026-11-15)
 
-- 状態: **設計済み・利用者の判断待ち (下の「決めてもらう点」)。独立レビュー (gpt-6.1-sol / xhigh、read-only、3 巡) を通した。実装は未着手。**
+- 状態: **設計済み・利用者の判断待ち (下の「決めてもらう点」)。独立レビュー (gpt-6.1-sol / xhigh、read-only、3 巡) を通した。実装は未着手で、文字起こし T1 (feat-asr-t1) が master に入った後、またはその上で行う。決めてもらう点は、統括が §1.745 などが落ち着いてからまとめて聞く。**
   v5.2.1 の公開作業中、インストーラが「AI アプリ (Claude・ChatGPT など) が mImageViewer を使っています」で止まり、利用者はインストーラ版を確かめられなかった (利用者の観測)。
   要件 (利用者、2026-11-15、統括経由の原文):「MCPですが、新しいバージョンにさしかえたあとも、AIツールからそのまま使い続けられるようにしたいです。難しいでしょうか？」 = AI アプリを止めずに更新でき、IPC の版が変わる更新 (3 → 4 など) の後も AI アプリを再起動せずに使い続けたい。
 - 現状 (コード参照): AI アプリは `C:\Program Files\mImageViewer\mimageviewer.exe --mcp` (launcher) を起動し、launcher は `%APPDATA%\mimageviewer\runtime\<版>\mimageviewer-mcp.exe` (adapter) を子にして、子が終わるまで動き続ける (`crates/launcher/src/mcp_launch.rs`)。インストール先で使用中になるのは launcher 1 本だけ ([Files] の exe は launcher のみ)。adapter は版ごとのフォルダなので新しい版と衝突しない。`installer/mimageviewer.iss` の `CheckMcpStopped` は `Global\mImageViewerMcp_v1` があると更新もアンインストールも止める。
-- 確かめた事実:
+- 確かめた事実 (行番号は特記の無いものは master 8d6201dce。feat-asr-t1 (1340503b7) で変わる所は併記する):
   - adapter はツールの呼び出しごとに pipe へつなぎ直し、Hello で版を厳密一致で照合する (`crates/mcp-server/src/pipe.rs` 227 行付近)。
-  - **pipe 名に `AGENT_PROTOCOL_VERSION` が入る** (`crates/agent-ipc/src/lib.rs` 498 行)。版が違う adapter と core は Hello まで届かず、「mIV が起動していません。mIV を起動して…」になり、tools/list は `miv_status` だけになる (`crates/mcp-server/src/lib.rs` 172 行)。`check_version` の「版が違います」は実際には出ない。[MCP 連携の計画](mcp-integration-plan.md) §G はこれを「AI アプリを再起動すると直る」と割り切っていたが、古い adapter が残るのは手で置き換える単体 exe 版とポータブル版だけという前提だった。
+  - **pipe 名に `AGENT_PROTOCOL_VERSION` が入る** (`crates/agent-ipc/src/lib.rs` 498 行)。版が違う adapter と core は Hello まで届かず、「mIV が起動していません。mIV を起動して…」になり。master では tools/list も `miv_status` だけになる (`crates/mcp-server/src/lib.rs` 172 行)。feat-asr-t1 では §1.786 (9576a84dc) により tools/list は core に問い合わせない固定の一覧になり (同 461 行)、この扱いは無くなった。各 tool は今も「起動していません」を返す (`crates/mcp-server/src/pipe.rs` 124 行)。`check_version` の「版が違います」は実際には出ない。[MCP 連携の計画](mcp-integration-plan.md) §G はこれを「AI アプリを再起動すると直る」と割り切っていたが、古い adapter が残るのは手で置き換える単体 exe 版とポータブル版だけという前提だった。
+  - feat-asr-t1 は `AGENT_PROTOCOL_VERSION` を 3 → 4 に上げるだけで、pipe 名の作り方と握手の frame の形は変えていない (T1 担当の知らせ、共有メモ)。ただし名前は版の定数から作るので (feat-asr-t1 の `crates/agent-ipc/src/lib.rs` 506 行)、v5.3.0 の core の pipe は `-v4-` になる。A-2 が無いと、v5.2.x の adapter (`-v3-` を探す) は v5.3.0 の core に届かない。
   - 版 3 → 4 (ブランチ feat-asr-t1、9576a84dc) の agent-ipc の差分は追加だけ: `Command::GetTranscript`、`Payload::Transcript`、`PermissionSnapshot.transcripts`、`ItemInfo.transcript`。既存の行の型・enum・`ErrorCode` は変わらず、§1.786 の拒否も既存の `Disabled` を使う (レビュー担当がコードで確認)。`ai_captions` は以前、版を上げずに足している。
-  - agent-ipc の型に `deny_unknown_fields` は無く、adapter は core の応答を型付きで読み直して structuredContent を作る (JSON を素通ししない。`crates/mcp-server/src/lib.rs` 1146・1205 行、レビュー担当が確認)。よって古い adapter は新しい core の追加項目を読み捨て、古い outputSchema の形のまま返す。
+  - agent-ipc の型に `deny_unknown_fields` は無く、adapter は core の応答を型付きで読み直して structuredContent を作る (JSON を素通ししない。`crates/mcp-server/src/lib.rs` 1146・1205 行、feat-asr-t1 では 1118 行付近。レビュー担当が確認)。よって古い adapter は新しい core の追加項目を読み捨て、古い outputSchema の形のまま返す。
   - MCP 2026-07-28 版は initialize が無く、要求ごとに `_meta` へ版とクライアントの capability を載せる (`crates/mcp-server/src/lib.rs` 470〜540 行)。resources・購読・sampling・elicitation は adapter に無い。
   - cursor は core が出す。共通の `Cursor` は版と `permission_epoch` を含み、`permission_epoch` は process 内の数で起動時に初めから数え直す (`src/agent_ipc/mod.rs` 1218・1271 行、`src/settings_db.rs` 292・702 行)。`list_folder` は別の `FolderCursor` で一覧の digest も照合する (`src/agent_ipc/folder.rs` 552・605 行)。
   - 動いている exe は削除できないが、名前は変えられ、空いた名前に新しいファイルを置ける。元の process は動き続け、名前を変えたファイルは終了後に消せる (ClaudeCode が製品ではない exe の複製で確かめた。製品の exe では未確認)。
@@ -140,13 +141,13 @@ skip sample / pre-skip が適用された音声サンプルと frame PTS の関�
     - アンインストールは今のまま (mutex があれば止める) にする。消すための操作なので、AI アプリの終了を頼むのは妥当。加えて `[UninstallDelete] Type: files; Name: "{app}\mimageviewer.exe.*.old"`。再起動時の削除予約 (`RestartReplace`) は作らない。
     - 古い adapter を使い続けるので、AI アプリが動いている間は、その launcher の退避ファイルも残り続ける (版ごとに約 593 MB。Claude Code のように会話ごとに MCP を起動するクライアントでは、動いている版の数だけ残り得る)。
   - A-2 新しい core が古い adapter を受け付ける:
-    - **pipe 名を今の `mimageviewer-agent-v3-<SID>-<hash>` に固定する**。名前の "v3" は `AGENT_PROTOCOL_VERSION` から切り離した、名前空間の固定の識別子にする。SID・正規化した data dir の hash、最初の `FILE_FLAG_FIRST_PIPE_INSTANCE` はそのまま。これで配布済みの v5.2.x の adapter (版 3) も新しい core に届く。
+    - **pipe 名を今の `mimageviewer-agent-v3-<SID>-<hash>` に固定する**。名前の "v3" は `AGENT_PROTOCOL_VERSION` から切り離した、名前空間の固定の識別子にする。feat-asr-t1 の名前の作り方 (`v{AGENT_PROTOCOL_VERSION}`、506 行) をここで置き換える。SID・正規化した data dir の hash、最初の `FILE_FLAG_FIRST_PIPE_INSTANCE` はそのまま。これで配布済みの v5.2.x の adapter (版 3) も新しい core に届く。
     - Hello で版を取り決める: core は `[MIN_ADAPTER_VERSION, AGENT_PROTOCOL_VERSION]` を受け付ける (最初は MIN = 3)。範囲内なら **adapter が送った版をそのまま返す** (版 3 の adapter は厳密一致で 3 を期待しているので、それで通る)。範囲外なら自分の版を返し、その接続では業務の要求を受け付けない。adapter (版 4 以降) は、返った版が自分の版と同じ時だけ続け、違えば下の中立の文言を各 tool の error にする。**core は古い adapter を受けるが、adapter は古い core を受けない** (向きを 1 つにする。古い core + 新しい adapter は版を戻した時などに限られる)。今の core は厳密一致で 3 を拒むので (`src/agent_ipc/mod.rs` 388 行、feat-asr-t1)、ここを変える。
     - 握手の形を業務 IPC の型とは別に固定する: 4 byte little-endian の本文長、UTF-8 JSON、握手 frame の上限、要求は `id`・`command.type = "hello"`・`command.version` だけを読む、応答は `{"id":1,"result":{"Ok":{"type":"hello","data":{"version":N}}}}` の形 (大文字の `Ok` を含む)。今の core は業務用の `Request` 全体を読んでから版を見る (`src/agent_ipc/pipe.rs` 165 行) ので、最初の握手はこの経路を通さない。
     - 互換の契約 (`crates/agent-ipc` の先頭に書き、テストで固定する):
       - wire の変更は追加だけにする。新しい Command、新しい Payload (古い adapter が送らない Command の応答だけに使う)、新しい項目。既存の項目の削除・名前の変更・型や意味の変更はしない。「古い要求を新しい core が読むための省略時の default」と「新しい応答の未知の項目を古い adapter が無視すること」は分けて書く (応答だけに足す項目に default は要らない)。
       - **古い adapter が受け取り得る enum に値を足さない** (`ErrorCode`、行の中の種類など)。足すなら、core が接続ごとの adapter の版を見て、古い adapter には既存の値へ読み替える。
-      - 古い adapter が受ける応答では、frame・画像・行・ページの上限も保つ (古い adapter は読めた後にも文字数や画像の大きさを検査する。`crates/mcp-server/src/lib.rs` 1179 行、`crates/agent-ipc/src/folder_types.rs` 89 行)。
+      - 古い adapter が受ける応答では、frame・画像・行・ページの上限も保つ (古い adapter は読めた後にも文字数や画像の大きさを検査する。`crates/mcp-server/src/lib.rs` 1179 行 (feat-asr-t1 では 1099〜1102 行)、`crates/agent-ipc/src/folder_types.rs` 89 行)。
       - adapter は IPC の値を型付きで読み、structuredContent を自分の型から作る (今の作りを契約として残す)。
       - テスト: 出荷した各版 (3 から) の adapter の型と要求の frame を fixture に残し、新しい core の応答が古い型で読めることに加え、古い adapter の structuredContent の生成と出力の検査を通ることまで確かめる。
       - 互換を壊す変更が避けられない時だけ MIN を上げる。これは計画した仕様の変更として、その版の設計で判断して記録する (まれな障害の扱いではない)。そのとき古い adapter には中立の文言が出て、AI アプリの再起動が要る。
@@ -155,7 +156,7 @@ skip sample / pre-skip が適用された音声サンプルと frame PTS の関�
   - 更新の間 (インストーラが mIV 本体を終了させてから、利用者が新しい mIV を起動するまで) は、今と同じく「mIV が起動していません」。進行中の要求は、mIV の終了で今と同じ切断の error になる。自動の再送はしない (書き込みは「処理済みだが応答を受け取れなかった」場合がある。レビュー指摘)。
   - 新しい mIV が起動すれば、古い adapter で**それまで使えていた tool をそのまま使い続けられる**。AI アプリの再起動は要らない。
   - cursor は形を保つが、mIV の再起動・許可の変更・一覧の変更で「最初からやり直してください」になることがある (`permission_epoch` は起動時に数え直すため。通常の更新で起こり得る)。AI アプリの再起動は要らず、一覧を取り直せば続けられる。cursor を続けるための永続化や回復の仕組みは作らない。
-  - 古い adapter の作りはそのまま残る。版 3 の adapter は許可で一覧を絞り、mIV が起動していない時は `miv_status` だけを返す (§1.786 の「常に全部出す」は新しい adapter から)。古い adapter の不具合も、AI アプリが MCP を起動し直すまで残る。
+  - 古い adapter の作りはそのまま残る。版 3 の adapter は許可で一覧を絞り、mIV が起動していない時は `miv_status` だけを返す (§1.786 の「常に全部出す」は feat-asr-t1 の adapter から。こちらは tools/list で core に問い合わせないので、版が違っても一覧は全件のまま。A-2 で tools/list に足すことは無い)。古い adapter の不具合も、AI アプリが MCP を起動し直すまで残る。
   - **新しい版で増えた tool (例: `get_transcript`) は、新しい adapter へつなぎ直す (AI アプリの再起動か MCP の再接続) まで使えない**。Claude Code の新しいセッションだけで足りるかは、そのとき古い adapter の process が新しいものに置き換わることを確かめてから案内する (§1.786 の「新しいセッションで 18 件見えた」は、新しい adapter が起動した証拠ではない。レビュー指摘)。
   - **配布済みの v5.2.x からの最初の更新でも、再起動は要らない** (インストーラは新しい版の A-1 で通り、pipe 名が同じで core が版 3 を受けるため)。v5.0・v5.1 (版 2 以前) の adapter は対象外で、再起動が要る。
 - 統括の候補 (1) 中継を作らない理由:
@@ -171,11 +172,12 @@ skip sample / pre-skip が適用された音声サンプルと frame PTS の関�
   - 1 巡目 (要件の追加の前): ACCEPT WITH CHANGES。P2 が 4 件 (取消で launcher が失われる、mutex で分岐すると新規インストールまで止まる、Restart Manager は元の宛先名を登録する、握手の契約を frame と外側の JSON まで固定する)。P3 が 1 件 (案 B の理由の言い過ぎ)。すべて受け入れた。
   - 2 巡目: ACCEPT。P3 が 1 件 (`CloseApplicationsFilterExcludes` を選ぶ)。
   - 3 巡目 (要件の追加の後、中継を作らず互換で受ける案): ACCEPT WITH CHANGES。P1 は無し。P2 が 1 件 (cursor は形を保っても続けられる保証にならない。`permission_epoch` と `FolderCursor`)。P3 が 2 件 (互換の契約に古い adapter の上限を含める、古い adapter に残る制約と「新しいセッションで新しい tool が使える」の保証を分ける)。どれも保証の書き方と契約の項目の直しで、設計の構造は変えないため、上に反映して 4 巡目は回していない。中継を作らない判断と、範囲を「最小の版から今の版まで」にすることは、レビュー担当も支持した。
-- **利用者に決めてもらう点**:
+- **利用者に決めてもらう点** (統括が §1.745 などが落ち着いてからまとめて聞く):
   1. 推奨の形 (更新の後も、それまで使えていた tool はそのまま使える。**新しい版で増えた tool は、AI アプリの再起動か MCP の再接続まで使えない**) で要望に足りるか。増えた tool まで再起動なしで使いたいなら中継が要るが、Claude Code は一覧を取り直さないので、中継を作っても Claude Code では見えない。
   2. 候補 (1) 中継・(3) 組み合わせ・案 B と、部分案 (MCP 用の小さな launcher) は作らないこと。
   3. 古い launcher の退避ファイル (版ごとに約 593 MB) が、AI アプリが MCP を終えた後の次の更新かアンインストールまで残ってよいか (再起動時の削除予約は作らない案)。
   4. A-2 を IPC の版 3 → 4 (文字起こし T1、v5.3.0 の予定) と同じ版に入れるか。入れないと、v5.3.0 への更新で版 3 の adapter が新しい core とつながらず、AI アプリの再起動が要る。A-1 は先に単独で出してもよい。
+- 実装の前提: feat-asr-t1 が master に入った後、またはその上で行う。A-2 は feat-asr-t1 と同じ所 (`crates/agent-ipc/src/lib.rs` の版の定数と pipe 名、`crates/mcp-server/src/pipe.rs` の Hello の照合、`src/agent_ipc/pipe.rs`・`src/agent_ipc/mod.rs` の握手) を触る。A-2 を v5.3.0 に入れるなら、T1 の版上げと同じ版で出す (pipe 名を `-v4-` にした core を出すと、v5.2.x の adapter が届かなくなるため)。
 - 実装の時に直す文書: [MCP 連携の計画](mcp-integration-plan.md) の §4.2 (pipe 名と版)・§15.8 (インストーラ)・§G、`installer/readme.txt` と `installer/readme_portable.txt`、マニュアルの「AI アプリとの連携」。規模 / 優先度: Medium / P2。
 
 ### 1.783 SNS 分割で Instagram の比率の検査が先頭の枠しか見ていない (2026-11-14)
