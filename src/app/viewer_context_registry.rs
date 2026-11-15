@@ -20,6 +20,156 @@ fn clear_independent_zip_list_choices(
 }
 
 impl App {
+    #[cfg(all(test, windows))]
+    pub(super) fn retire_cover_context_for_test(&mut self, id: ViewerContextId) {
+        self.viewer_contexts.table.begin_retire(id).unwrap();
+    }
+    #[cfg(all(test, windows))]
+    pub(super) fn cover_cache_context_rows_for_test(
+        &self,
+        id: ViewerContextId,
+    ) -> Vec<(bool, bool, bool, bool)> {
+        let state = match self.viewer_contexts.table.slots.get(&id).unwrap() {
+            Slot::AtRest(state) | Slot::Retiring(state) => state,
+        };
+        state
+            .thumbnails
+            .iter()
+            .enumerate()
+            .map(|(idx, thumbnail)| {
+                (
+                    matches!(thumbnail, ThumbnailState::Evicted),
+                    state.requested.contains_key(&idx),
+                    state.thumb_pixels.contains_key(&idx),
+                    state.auto_aspect.samples.contains_key(&idx),
+                )
+            })
+            .collect()
+    }
+    pub(super) fn append_parked_cover_cache_inputs(
+        &self,
+        inputs: &mut super::cover_rotation_cache::CoverCacheInputs,
+    ) {
+        #[cfg(windows)]
+        for slot in self.viewer_contexts.table.slots.values() {
+            let state = match slot {
+                Slot::AtRest(state) | Slot::Retiring(state) => state,
+            };
+            inputs.grid(
+                &state.items,
+                &state.thumbnails,
+                Some(&state.requested),
+                state.archive_source_override.as_deref(),
+                &state.converted_archive_cache_paths,
+                &state.thumbnail_pool_catalog,
+                state.current_color_cache_map.as_ref(),
+                &self.settings,
+                self.folder_thumb_pin_db.as_ref(),
+            );
+            if let Some(snapshot) = &state.snapshot {
+                for (items, thumbs) in [
+                    (&snapshot.saved_items, &snapshot.saved_thumbnails),
+                    (&snapshot.list_view_items, &snapshot.list_view_thumbnails),
+                ] {
+                    inputs.grid(
+                        items,
+                        thumbs,
+                        None,
+                        None,
+                        &state.converted_archive_cache_paths,
+                        &state.thumbnail_pool_catalog,
+                        state.current_color_cache_map.as_ref(),
+                        &self.settings,
+                        self.folder_thumb_pin_db.as_ref(),
+                    );
+                }
+            }
+            if let Some(session) = state.top_level_grid_view.smart_folder_session() {
+                session.append_cover_cache_inputs(
+                    inputs,
+                    &self.settings,
+                    self.folder_thumb_pin_db.as_ref(),
+                );
+            }
+        }
+    }
+
+    pub(super) fn evict_parked_automatic_covers(
+        &mut self,
+        completed: &[crate::cover_rotation_cache::InvalidationCompletion],
+    ) {
+        #[cfg(windows)]
+        {
+            let main = self.viewer_context_main();
+            let mut color_keys = std::collections::HashSet::new();
+            for (id, slot) in &mut self.viewer_contexts.table.slots {
+                let state = match slot {
+                    Slot::AtRest(state) | Slot::Retiring(state) => state,
+                };
+                super::cover_rotation_cache::clear_deleted_cover_memory(
+                    state.current_color_cache_map.as_ref(),
+                    &state.thumbnail_pool_catalog,
+                    completed,
+                );
+                let matching = super::cover_rotation_cache::affected_cover_indices(
+                    &state.items,
+                    &state.thumbnails,
+                    &state.requested,
+                    state.archive_source_override.as_deref(),
+                    completed,
+                );
+                if matching.is_empty() {
+                    continue;
+                }
+                for queue in [&state.reload_queue, &state.heavy_io_queue]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Ok(mut queue) = queue.0.lock() {
+                        queue.retain(|request| {
+                            !request
+                                .grid_index()
+                                .is_some_and(|idx| matching.contains(&idx))
+                        });
+                    }
+                }
+                for idx in matching {
+                    if *id == main
+                        && state
+                            .items
+                            .get(idx)
+                            .is_some_and(super::color_filter::color_filter_representative_supported)
+                    {
+                        color_keys.insert(state.items[idx].perf_key());
+                    }
+                    state.requested.remove(&idx);
+                    state.thumb_pixels.remove(&idx);
+                    state.thumb_edit_preview_layers.remove(&idx);
+                    state.thumb_adjust_tex.remove(&idx);
+                    state.idle_upgrade_cache_bypass_ineligible.remove(&idx);
+                    state.auto_aspect.samples.remove(&idx);
+                    if let Some(thumbnail) = state.thumbnails.get_mut(idx) {
+                        *thumbnail = ThumbnailState::Evicted;
+                    }
+                }
+                state.auto_aspect.streak = None;
+                state.auto_aspect.cached_sample_gate = None;
+            }
+            if !color_keys.is_empty() {
+                for key in color_keys {
+                    let revision = self
+                        .color_filter
+                        .palettes
+                        .representative_revisions
+                        .entry(key)
+                        .or_default();
+                    *revision = revision.wrapping_add(1);
+                }
+                self.mark_color_filter_scope_dirty();
+            }
+        }
+    }
+
     /// Terminal ownership boundary, shared by accepted viewer closes and context retirement.
     /// Content-only close/reopen never comes here. Workers/list adoption remain alive.
     pub(super) fn retire_viewer_reopen_requests(&mut self, id: ViewerContextId) {

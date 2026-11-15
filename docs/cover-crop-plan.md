@@ -1878,7 +1878,7 @@ lib全件・build-dev・製品起動・独立レビュー・コミットは行�
 
 ## 29. 本文の保存回転による自動切り出しの作り直し (§1.773 続編、v5.3.0)
 
-設計日: 2026-11-15。コード確認対象は `68101a56e`（設計更新を含む `cf50483ee` でも該当コードを再確認）。**利用者決定（2026-11-15、統括経由）により単純な保存側失効案へ改訂。独立設計レビュー前・実装は未着手。**
+設計日: 2026-11-15。コード確認対象は `68101a56e`（設計更新を含む `cf50483ee` でも該当コードを再確認）。**利用者決定（2026-11-15、統括経由）により単純な保存側失効案へ改訂。2026-11-16にkey-only v4/v4fへの更新を含めて独立設計レビューと設計担当の合意を得た。実装・検証の集約先は§29.12。**
 本節は§28.3の「作り直さない」という制約を解消する次段の設計であり、§28.3の出荷記録は残す。
 判定の式・標本の選択・4方向の結果・手動範囲の座標系は変えない。
 
@@ -1994,7 +1994,9 @@ Pのproof/codec変更・読取照合・K2内生成・子の世代の引継ぎは
 利用者決定（2026-11-15、統括経由）により、**回転保存側で本の自動代表cacheを消し、完了後に通常の要求で読み直す案**を採る。
 §29.0の比較で挙げた親代表の制約を受け入れる。P案の「子を必ず親の中で生成する」という保証は要件から外す。
 
-- v3/v3fのキー、`AutoMaterial`、`auto_crops`、4方向の結果は変更しない。v4を導入せず、schema/codecの移行も行わない。
+- 自動のキーだけを `|autocrop:v4:{rtl|ltr}`、画像フォルダを `v4f` へ更新する。出荷済みv3/v3fには本文回転後の古い結果が残り得るため、新しいキーの通常要求で作り直す。旧行のコピー・一括移行・削除は行わない。
+  `AutoMaterial`、`auto_crops`、4方向の結果、schema/codecは変更せず、本文proofも追加しない。v4はキーの世代であり、新しい素材形式を意味しない。
+  K2の出荷済みv1互換は保つが、v3/v3fへのfallbackは追加しない。現行行が無い場合の既存v1互換だけを維持し、現行行の不正・署名不一致時に旧行へ戻らない。
 - 新しい本文proof、読取の5入口での照合、採用直前の本文角度照合、K2内の子生成、子の世代/素材の新しい運搬は作らない。
 - 対象は回転の変わったページを本文として持つ**本自身のAutomatic**。全方向が見送りのAutomaticも含む。
   手動範囲・edit preview・NotAutomatic・LegacyV1・通常のページ行・RAW/動画/Remoteの対象範囲を変えない。
@@ -2048,7 +2050,8 @@ PDFの既定page、ZIPの先頭選択、folderの既存sortを共有し、**deco
    `|types:<16hex>` は過去のpolicyのdigestであり、pin・sort/depth・generationの過去の組合せもある。
    対象catalogで既存行のkey/cover/material/selectionのヘッダを読み、保持memoryの実在キーも候補にする。
    WebP blobを全件decodeせず、必要ならヘッダ専用のcatalog readerを既存readerの列互換規則に沿って用意する。
-3. `representative_auto_crop_key_parts` の厳密な位置/文法でv3/v3fを識別する。
+3. `representative_auto_crop_key_parts` の厳密な位置/文法で現行v4/v4fを識別する。
+   v1/v2/v2f/v3/v3fは正規化で旧印として認識するが、旧行の移行・再採用やprefix削除には使わない。
    `folder_thumb_*_cache_key_for_path`、`cache_key_for_request`、`pinned_cache_key`、
    `representative_cache_key_for_policy_with_auto` 等の既存builderと照合する小さな単一helperで、その本自身の行かを確認する。
    行から得た検証済みderived部品はそのまま保持し、生成元を復元できないtypes digestを推測しない。
@@ -2167,9 +2170,11 @@ viewport生成/破棄、HWND、geometry、入力述語、promote/retireの状態
 これは共有データの変更通知を該当ownerのcacheに反映し、古い保持素材を識別する構造的変更であり、
 windowの表示状態を推測して症状を隠す修正ではない。`detached-rework-plan.md` §2に沿う。
 
-**以前の双方合意はP案の依存proof/退避の範囲に対するもの。** 今回はproofを外し、削除完了通知とUI側のsession stampへ変える。
-この差分を独立設計レビューで改めて確認し、設計担当/レビュー担当の構造的修正としての合意を得てから実装する。
-実装時に同計画§11へ新しい範囲と判断を記録する。前の合意を今回の設計の承認として流用しない。
+**2026-11-16、単純な保存側失効について設計担当と独立レビュー担当が改めて合意した。**
+今回の合意は、key-only v4/v4f、削除完了後のowner別退避、UI側session stampとclone/復元、Smartのsamples代入順を対象とする。
+P案の本文proof/codec変更やK2内生成を承認したものではなく、以前のP案への合意の流用でもない。
+新しいdetached専用状態、時間窓、viewport推測を作らず、共有cache変更の事実を既存context所有境界へ届ける構造的修正として§2に適合すると判断した。
+同計画§11にもこの範囲と合意を記録する。
 
 ### 29.9 触るファイルと関数（実装時）
 
@@ -2179,11 +2184,11 @@ windowの表示状態を推測して症状を隠す修正ではない。`detache
 | `src/app/viewer_context_registry.rs` | Legacyと同じowner別走査で対象のmemory/request/textureを退避。stampの保持とclone。兄弟/通常ページの要求はそのまま。 |
 | `src/grid_item.rs` | Loadedのruntime stamp。AutoMaterial/永続codecを変えず、snapshot等で自然にcloneする。 |
 | `src/catalog.rs` / 既存metadata worker周辺 | ヘッダ読取と厳密キーの削除batch、既存CatalogWork/admission/column互換を維持。新しいschemaや全cacheのretirementを行わない。 |
-| `src/thumb_loader.rs` / `src/app/book_cover.rs` / `src/app.rs` のkey builder周辺 | 本と代表の共通識別、削除する実在キーの厳密な照合helper。source生成/K2/判定式/AutoMaterialは変更しない。 |
+| `src/thumb_loader.rs` / `src/app/book_cover.rs` / `src/app.rs` のkey builder周辺 | 本と代表の共通識別、削除する実在キーの厳密な照合helper、自動keyだけのv4/v4f更新。source生成/K2の選択規則/判定式/AutoMaterialは変更せず、v1互換を保つ。 |
 | `src/app/thumbnail_requests.rs` | 必要な論理本のsource factsの保持と、対象のPending/Upgrade/CPU待ちの既存remove経路への接続。新しい子requestや世代は作らない。 |
 | `src/app/snapshot_ops.rs` / `src/app/smart_folder.rs` | 保存素材のstampを保持し、復元先の全状態を代入してから照合。Smartのauto_aspectの順序を修正。 |
 | `docs/display-pipeline.md` / `docs/ui-responsiveness.md` / `docs/virtual-folders.md` | write側失効、worker限定SQL、復元順序、親の制約。新しいread proofがあるという説明は書かない。 |
-| `htdocs/mimageviewer/manual/known-issues.html` / `manual/grid.html` | 実装後に旧問題の項目を削除し、下記の受入れ制約を説明する。今回の設計作業では変更しない。 |
+| `htdocs/mimageviewer/manual/known-issues.html` / `manual/grid.html` | 旧問題の項目を削除し、下記の受入れ制約を説明する。CHANGELOGは公開担当が扱う。 |
 
 ### 29.10 テスト方針と公開文書
 
@@ -2207,15 +2212,17 @@ windowの表示状態を推測して症状を隠す修正ではない。`detache
 7. **親の制約**: 子行を消した後で親を先に読むと別代表/Noneになる既存K2を固定する。
    子の通常生成と保存後、親の次の読取でcatalog revisionにより再選択する。子を生成しない/Off非保存/正常再起動では
    制約が残ることも期待値に書き、隠れた強制生成・force-save・親の即時退避をしないことを検査する。
-8. **互換/失敗**: v3/v3fと全kindのcodecは不変。UIのSQL read counterを増やさず、LIKE/prefix DELETEを使わない。
+8. **互換/失敗**: キーだけv4/v4fに更新し、出荷済みv3/v3fの旧行を再採用/移行しない。K2のv1互換と全kindのcodecは不変で、v3 fallbackは無い。
+   UIのSQL read counterを増やさず、LIKE/prefix DELETEを使わない。
    削除失敗はログ/既存通知で完了し、retry/印の永続化/保存データの再作成を起こさない。
 
-実装後、現在の既知問題「本文のページを回転した後も、表表紙の自動切り出しの結果が前のまま残る」のh3/pは削除する。
-受入れた親の挙動は**既知の不具合として新設せず、grid.htmlの自動切り出しの説明へ制約として記載する**ことを提案する。
-意図的に採った選択規則だからである。公開文の案（実装時に文脈へ合わせる）:
+既知問題「本文のページを回転した後も、表表紙の自動切り出しの結果が前のまま残る」のh3/pを削除する。
+受入れた親の挙動は**既知の不具合として新設せず、grid.htmlの自動切り出しの説明へ制約として記載する**。
+意図的に採った選択規則だからである。公開文:
 
 > 本文のページを回転した後、本のタイルを表示する前に上のフォルダを開くと、代表が別の表紙になったり、表示されなくなったりすることがあります。
-> 本のタイルを表示してから、フォルダの一覧を読み直してください。サムネイルを保存しない設定では、別の代表のままになる場合があります。
+> 本のタイルを表示してサムネイルが保存されると、その後でフォルダの一覧を読み直したときに、再びその本が代表に選ばれるようになります。
+> キャッシュポリシーが「Off」の場合や、「Auto」で保存されなかった場合は、本のタイルを表示しても、別の代表または代表なしの状態が続くことがあります。
 
 実装用語・版の説明を公開文へ出さない。CHANGELOGは公開担当が扱う。
 
@@ -2225,9 +2232,20 @@ windowの表示状態を推測して症状を隠す修正ではない。`detache
   PDFの世代ticketの引継ぎが必要となり、独立設計レビューでREVISEが続いた。
   さらに失敗時のBとAへの復帰のために一時選択証拠と認証memoまで必要になった。
   利用者が親の制約を受け入れたので、より小さい保存側失効を採る（2026-11-15）。旧詳細は `9a8a37f4e` 以前の設計履歴と§29.0に残る。
-  BodyRotationProof / ReadUnavailable / v4 / FolderSelectionEvidence / K2の子生成helper / 認証失敗LRUは今回作らない。
+  BodyRotationProof / ReadUnavailable / FolderSelectionEvidence / K2の子生成helper / 認証失敗LRUは今回作らない。
+  P案の素材形式としてのv4は撤回し、採用案では旧結果を避けるキーだけのv4/v4fを使う。
 - **消す前に退避して新要求を抑止する案**: 抑止/解除の状態が必要。削除完了後に既存退避を使えば足りる。
 - **保持時点で現在番号を付ける案**: 古いLoadedを保存し直すと失効を隠す。実際の採用時のstampをcloneする。
 - **全回転revision/全context clear**: 無関係な本や通常ページまで失効するため採らない。
 - **親の即時更新・非表示の子生成・強制保存**: 制約をなくす代わりに生成/完了ownerや保存policyの変更が要る。利用者の今回の決定では採らない。
 - **旧writerの停止・永続dirty・終了待ち・retry**: まれな組合せのために設けず、ログと手動の範囲指定/cache再作成で扱う。
+
+### 29.12 実装・検証の記録（2026-11-16）
+
+- 設計: §29.1のkey-only v4/v4fと、§29.8の単純な保存側失効に対する独立設計レビュー／設計担当の合意を反映した。
+- 文書: display-pipeline／ui-responsiveness／virtual-folders、detached計画§11、公開マニュアルの自動切り出しと既知問題を同じ範囲へ更新した。
+- 実装: `cover_rotation_cache.rs` に短命workerとApp所有の完了channel／slot番号、`app/cover_rotation_cache.rs` にsource捕捉と完了後退避を置いた。workerは既存catalogのヘッダだけを読み、既存builderで検証した実在キーをtransactionで厳密削除する。memoryのlock中にSQLを実行しない。新たなschema・素材codec・本文proof・K2生成は追加していない。
+- 完了は `app/logic_service.rs` で非blockingに受ける。mountedとregistryのAtRest／Retiringの該当要求・CPU待ち・画素のみを除去し、全体epochを進めない。workerは既存のrepaint contextで完了を通知する。`ThumbnailState::Loaded` のstampをcloneのまま保持し、snapshot saved／list-view、Smart、direct-sourceの復元時に照合する。復元後に設置されたmemoryも厳密なslot／source照合で除去する。
+- 回帰テスト: `cover_cache_completion_*`（通知前の画素保持、通知後の対象別退避、mounted／AtRest／Retiring、CPU待ち、旧IDの画像／Finalized拒否）、`cover_cache_snapshot_saved_and_list_view_restore_evict_old_material_and_samples`、`smart_folder_cover_cache_restore_does_not_resurrect_stale_auto_aspect`、`cover_cache_direct_reader_split_restores_stale_saved_basis_without_pixels_or_aspect_sample`。worker側の `cover_rotation_*` は厳密キー、表紙除外、PDF／EPUB／変換書庫／ZipDir／画像folder、Collectionのdrive、未表示source、初回pending、復元memoryを検査する。
+- 更新互換と親の制約: `auto_material_v4_source_rebuilds_v3_with_preexisting_saved_body_rotation` と `cover_rotation_k2_keeps_parent_until_normal_reread_and_child_save` を追加した。v3の後に本文回転済みでも追加操作なしでv4を生成し、K2は子の削除後の別代表／再起動相当のcold状態と、通常保存後の次回再選択を検査する。
+- 自動検証: core check成功。焦点テスト、関連snapshot、fmt、glyph、diff検査の最終結果は集約後に追記する。独立実装レビューは設計担当へ引き継ぐ。利用者の指定によりlib全件・確認用build・製品起動・実データ評価・commitは実行しない。

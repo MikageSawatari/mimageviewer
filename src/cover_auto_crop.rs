@@ -52,10 +52,10 @@ impl AutoCropIdentity {
             self.folders && key.starts_with(crate::thumb_loader::CACHE_KEY_FOLDER),
             self.binding,
         ) {
-            (true, ReadingDirection::Rtl) => "v3f:rtl",
-            (true, ReadingDirection::Ltr) => "v3f:ltr",
-            (false, ReadingDirection::Rtl) => "v3:rtl",
-            (false, ReadingDirection::Ltr) => "v3:ltr",
+            (true, ReadingDirection::Rtl) => "v4f:rtl",
+            (true, ReadingDirection::Ltr) => "v4f:ltr",
+            (false, ReadingDirection::Rtl) => "v4:rtl",
+            (false, ReadingDirection::Ltr) => "v4:ltr",
         }
     }
 }

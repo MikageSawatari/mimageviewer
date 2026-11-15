@@ -1,5 +1,8 @@
 mod ai_failure_feedback;
 mod cover_rotation;
+mod cover_rotation_cache;
+#[cfg(test)]
+mod cover_rotation_cache_tests;
 mod diagnostic_checkpoint;
 use crate::previous_run_diagnostics::checkpoint::{
     ActivityLease, CheckpointPublisher, JobLease, JobMetadata, JobStage, JobUpdate,
@@ -18845,6 +18848,7 @@ pub struct App {
     pub(crate) comic_page_keys: std::collections::BTreeSet<String>,
     /// 非破壊回転の非 0 角度の正本 (page_path / video key)。
     pub(crate) rotation_page_keys: std::collections::BTreeMap<String, crate::rotation_db::Rotation>,
+    pub(crate) cover_rotation_cache: crate::cover_rotation_cache::CoverRotationCache,
     /// 最後段 crop を持つ page_path キー集合 (親コンテナへの「切」状態ロールアップ用)。
     pub(crate) export_crop_page_keys: std::collections::BTreeSet<String>,
     /// お気に入り単位の標準パラメータ: favorite_id → AdjustParams。
@@ -21967,6 +21971,7 @@ impl App {
             conceal_page_keys,
             comic_page_keys,
             rotation_page_keys,
+            cover_rotation_cache: Default::default(),
             export_crop_page_keys,
             adjustment_favorite_params: std::collections::HashMap::new(),
             favorite_view_states: std::collections::HashMap::new(),
@@ -57361,11 +57366,13 @@ impl App {
                     source_dims,
                     layout_dims,
                 );
+                let cover_cache_stamp = self.automatic_cover_stamp(i, &cover, auto_material);
                 self.thumbnails[i] = ThumbnailState::Loaded {
                     cover: crate::cover_source_scope::LoadedCoverIdentity::from_material(
                         cover, scope,
                     ),
                     auto_material,
+                    cover_cache_stamp,
                     display_basis,
                     tex: handle,
                     origin,
@@ -77473,6 +77480,7 @@ impl App {
         }
         self.caption_display
             .invalidate_rotation_keys(changed.iter().map(String::as_str));
+        self.invalidate_automatic_covers_after_rotation(&changed);
         self.evict_legacy_cover_thumbnails();
     }
 

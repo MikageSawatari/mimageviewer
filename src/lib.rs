@@ -70,6 +70,7 @@ pub(crate) mod cover_auto_crop;
 pub(crate) mod cover_auto_material;
 pub(crate) mod cover_auto_sample;
 pub mod cover_identity;
+pub(crate) mod cover_rotation_cache;
 pub mod cover_source_scope;
 pub mod depth_addon;
 pub(crate) mod depth_estimation;
