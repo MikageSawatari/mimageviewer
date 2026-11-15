@@ -1772,12 +1772,28 @@ UTF-8 BOM、開けない本と壊れた画像の後の継続を含む。`cargo f
   赤枠/current_cropは本番v3、青枠/fallback_cropは追加の比較だけ。
   JSONの `production_method` / `production_layout` で本番の方法と型も記録する。
 
-### 28.3 変更2は失効の設計待ち（未実装）
+### 28.3 本文の保存回転を作り直し無しで実装 (利用者判断、2026-11-15)
 
-本文の保存回転を標本の比率へ適用する決定は受領したが、再読込まで一貫する既存経路は見つからなかった。
-指示の例外に従い、この変更だけは実装せず設計を返す。本文の比率・サンプルの向きは今回まだ従来のまま。
+本文の標本ごとに、既存のEXIF/WICの向きの規則を適用した寸法へ、保存した90°/270°の回転を一度だけ掛ける。
+0°/180°と未登録はそのまま。回転後の寸法で先頭の横長の除外・比率の合議を行う。
+PDFは0始まりの `page_key_for_pdf`、ZIPは `zip_entry_key`、画像フォルダは `normalize_path` のviewer共通キーを使う。
+変換書庫の現行viewerは変換後ZIPのパスでページを保存しているため、そのキーを使い、元RARのキーへ置き換えない。
+EPUBの生成PDFと評価用の複製ZIPは読取先とページ識別元を分ける。
 
-確認した既存経路:
+`SampleRotations` は判定worker内だけで回転DBを読取専用で開く。DBが無ければ作らず回転なし、
+読取エラーはログを出して回転なしとして続ける。再試行やUIスレッドからの同期I/Oは追加しない。
+ZIP/フォルダの最大8枚×先頭256KiB・一覧の再走査なし・未知の枠の位置は従来どおり。
+通常worker・範囲画面の専用thread・BOOK_LIST/DIR/FOLDER_LIST評価が同じrotation-aware samplerを使う。
+評価器は既存のrotation_db指定をそのまま使い、表紙だけの角度overrideを本文へは掛けない。
+DIRのPNGダミーは本文を持たないので、従来どおりtruthの比率を使う。
+
+**本文を後から回しても作り済みの切り出しは作り直さない。** キー・依存の記録・退避の述語は変更しない。
+キャッシュを消すか、既存の内容変更による再生成条件を満たすまで前の結果が残る
+（画像フォルダの本文だけの差し替えは§26の既存の扱い）。範囲画面は開くたびに現在の回転で判定するので、
+合わなくなった本は手動の範囲を指定し直す。利用者の判断として、後から回転するのはまれで、手動の範囲指定で直せるため、
+作り直しは次の版で依存証明の形で直す。今回の版には依存証明・再生成制御を入れない。
+
+将来の作り直しに向けて確認した既存経路:
 
 - `App::rotation_page_owner_changed` → `evict_legacy_cover_thumbnails` →
   `legacy_book_cover_needs_reload` は、在メモリの回転ownerに合う旧Legacy代表だけを退避する。
@@ -1792,17 +1808,27 @@ UTF-8 BOM、開けない本と壊れた画像の後の継続を含む。`cargo f
 request・catalog・K2・結果採用・保持した一覧まで一組で運ぶ。workerのキャッシュ読取ではその証明を読取専用の
 回転DBと照合し、UIの採用/復元では在メモリownerと照合する。表紙のキーは標本から外すので表紙回転では再生成せず、
 本文の依存キーが変わった本だけ既存の退避・request取消経路に通す。遅い旧結果も同じ証明で拒否する。
-変換書庫は読取先と論理ページキーを分け、PDFは `page_key_for_pdf`、ZIPは `zip_entry_key`、
-画像フォルダは `normalize_path` の既存viewerキーを使う。比率計算は既存EXIF/WICの向きの適用後に保存回転を一度だけ掛ける。
+今回のsamplerはキーを照合するだけで依存を返さない。将来の依存証明の所有・永続化・採用境界は別に設計確認する。
+全回転のglobal revisionや全contextの一括消去は使わず、detachedの述語・viewport経路は変更しない。
 
-これは新しい依存証明の所有・永続化・採用境界を要するため、設計確認前に追加していない。
-全回転のglobal revisionや全contextの一括消去は使わない。`cover_auto_sample.rs` とdetachedの述語・viewport経路は変更していない。
-失敗時はログと回転なしの扱いとし、再試行機構は追加しない。
+実装検証（2026-11-15）: `cover_auto_sample/saved_rotation_tests.rs` の7件で、PDFの0始まりキー・前後の8標本・
+未知の枠・回転後の先頭横長除外、ZIPの識別元と読取先・8枚×256KiB、フォルダの既存EXIF/WICと保存回転の一回適用、
+読取専用DBの欠落/破損/表なし時の継続を検査した。
+`cover_auto_worker_zip_and_folder_sample_saved_body_rotations_without_cache_invalidation` は実workerで
+0°/180°と90°/270°の違いを確認し、本文回転後のCacheOnly読取でキー・行・画素・結果が変わらないことも検査する。
+`cover_auto_pdf_worker_samples_body_rotation_from_logical_page_with_same_password_and_lease` は
+EPUBの論理キーと同じpassword/ReadTarget leaseを固定する。
+`cover_crop_dialog_reads_saved_body_rotations_with_worker_sample_keys` と評価器のBOOK_LIST/FOLDER_LIST/DIRの3回帰も追加した。
+
+共有runner `773 rc5` の焦点nextest `test(/cover_auto|cover_crop|cover_rotation/)` は **251件成功・失敗0**。
+`cargo check -p mimageviewer --bin mimageviewer-core` 成功、範囲関連snapshotは **5件成功・PNG更新なし**。
+`cargo fmt`・`git diff --check`・グリフ検査も成功。利用者データ・評価画像は使わず開いていない。
+lib全件・build-dev・製品起動・独立レビュー・コミットは行っていない。
 
 ### 28.4 実装・検証記録
 
 - 変更1・3・4とv3/v3fのキー更新を実装。worker・範囲画面・評価器は詳細reportの共通入口を使う。
-  変更2は§28.3のとおり未実装で、既存の回転変更・detached・本文標本の経路は触っていない。
+  この段階では変更2は未実装だった。後続の利用者判断による実装は現在の§28.3を参照。
 - 新規の判定回帰は `production_layout_fallback_accepts_every_structural_decline_and_preserves_guards`、
   `production_t2_replacement_uses_unsnapped_horizontal_iou_and_strict_point_six`、
   `production_full_height_preserves_horizontal_structural_crop_at_every_rotation`、
@@ -1835,7 +1861,7 @@ request・catalog・K2・結果採用・保持した一覧まで一組で運ぶ�
 写真の比率ちょうどの本は、画素数で作られた本などで実在する（画像フォルダの本430冊中12冊）。
 
 本文比率による除外のコード・専用の見送り理由・守りを検証するテストと公開文書の説明を撤去した。
-撮影情報による既存のG1、全高化、型の補完、T2の置換、v3/v3fと変更2の設計待ちはそのまま。
+撮影情報による既存のG1、全高化、型の補完、T2の置換、v3/v3fはそのまま。本文回転の後続判断は§28.3を参照。
 `production_layout_fallback_accepts_photographic_page_ratios_without_shooting_exif` で
 写真の比率でも型の補完へ進むことと、撮影情報がある場合は従来どおり見送ることを固定する。
 

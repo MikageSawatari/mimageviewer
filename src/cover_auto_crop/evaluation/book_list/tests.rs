@@ -59,14 +59,20 @@ fn folder_book(path: &Path, cover: &DynamicImage) {
 }
 
 fn pdf_book(path: &Path) {
+    pdf_book_with_cover(path, (360, 200));
+}
+
+fn pdf_book_with_cover(path: &Path, cover: (u32, u32)) {
     // Four real pages, vector content on the cover. PageSizes + rendering use
     // the ordinary shared PDF operations through the in-process test backend.
     let content = "0.2 0.4 0.7 rg 0 0 360 200 re f\n";
     let objects = [
         "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
         "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R] /Count 4 >>".to_owned(),
-        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 360 200] /Resources << >> /Contents 7 0 R >>"
-            .to_owned(),
+        format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {} {}] /Resources << >> /Contents 7 0 R >>",
+            cover.0, cover.1
+        ),
         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 140 200] >>".to_owned(),
         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 140 200] >>".to_owned(),
         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 140 200] >>".to_owned(),
@@ -231,6 +237,133 @@ fn evaluation_book_list_mixed_real_sources_saved_rotations_and_failures_continue
             .get_key(&crate::edit_source::page_key_for_pdf(&pdf, 0)),
         Some(Rotation::Cw90)
     );
+}
+
+#[test]
+fn evaluation_book_and_folder_lists_sample_body_rotations_without_changing_cover_rotation() {
+    let temp = temporary();
+    let zip = temp.path().join("book.zip");
+    let folder = temp.path().join("folder");
+    let pdf = temp.path().join("book.pdf");
+    let cover = rotated_image(&DynamicImage::new_rgb8(150, 100), Rotation::Cw270);
+    zip_book(&zip, &cover);
+    folder_book(&folder, &cover);
+    pdf_book_with_cover(&pdf, (200, 360));
+    let books = vec![zip.clone(), pdf.clone(), folder.clone()];
+    let input = temp.path().join("books.json");
+    list(&input, &books);
+    let rotation_path = temp.path().join("rotations.db");
+    let db = crate::rotation_db::RotationDb::open_at(&rotation_path).unwrap();
+    for key in [
+        crate::adjustment_db::zip_entry_key(&zip, "000.png"),
+        crate::edit_source::page_key_for_pdf(&pdf, 0),
+        crate::adjustment_db::normalize_path(&folder.join("000.png")),
+    ] {
+        db.set_key(&key, Rotation::Cw90).unwrap();
+    }
+    let baseline = temp.path().join("baseline");
+    let options = Options {
+        thumbs: true,
+        rotation_db: Some(rotation_path.clone()),
+        ..Default::default()
+    };
+    evaluate(
+        &input,
+        &baseline,
+        false,
+        FallbackConfig::default(),
+        &options,
+    )
+    .unwrap();
+    let baseline = summary(&baseline);
+    for row in baseline["rows"].as_array().unwrap() {
+        assert_eq!(row["rotation"], 90);
+        assert!((row["page_aspect"].as_f64().unwrap() - 0.7).abs() < 1e-6);
+    }
+    for (page, rotation) in [(2, Rotation::Cw90), (3, Rotation::Cw270)] {
+        for key in [
+            crate::adjustment_db::zip_entry_key(&zip, &format!("{page:03}.png")),
+            crate::edit_source::page_key_for_pdf(&pdf, page),
+            crate::adjustment_db::normalize_path(&folder.join(format!("{page:03}.png"))),
+        ] {
+            db.set_key(&key, rotation).unwrap();
+        }
+    }
+    drop(db);
+    let before = std::fs::read(&rotation_path).unwrap();
+    // A cover override changes only the selected cover angle. Body sampling
+    // must still consult the configured store, including in FOLDER_LIST.
+    for (name, folders_only, saved_rotation) in [
+        ("book-list", false, None),
+        ("cover-override", false, Some(Rotation::Cw90)),
+        ("folder-list", true, Some(Rotation::Cw90)),
+    ] {
+        let output = temp.path().join(name);
+        let selected_input = if folders_only {
+            let path = temp.path().join("folders.json");
+            list(&path, std::slice::from_ref(&folder));
+            path
+        } else {
+            input.clone()
+        };
+        evaluate(
+            &selected_input,
+            &output,
+            folders_only,
+            FallbackConfig::default(),
+            &Options {
+                saved_rotation,
+                thumbs: true,
+                rotation_db: Some(rotation_path.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let data = summary(&output);
+        assert_eq!(data["failed"], 0);
+        assert_eq!(data["cropped"], 0);
+        for (index, row) in data["rows"].as_array().unwrap().iter().enumerate() {
+            let original = &baseline["rows"][if folders_only { 2 } else { index }];
+            assert_eq!(row["rotation"], 90);
+            assert_eq!(row["native_dims"], original["native_dims"]);
+            assert_eq!(row["decoded_dims"], original["decoded_dims"]);
+            assert!(row["page_aspect"].is_null());
+            assert_eq!(row["page_aspect_decline"], "landscape");
+            assert_eq!(row["reason"], "no-page-aspect");
+            assert!(row["current_crop"].is_null());
+            assert!(row["fallback_crop"].is_null());
+        }
+    }
+    assert_eq!(std::fs::read(&rotation_path).unwrap(), before);
+}
+
+#[test]
+fn evaluation_rotation_db_failure_falls_back_without_changing_the_store() {
+    let temp = temporary();
+    let folder = temp.path().join("folder");
+    folder_book(&folder, &DynamicImage::new_rgb8(150, 100));
+    let input = temp.path().join("folders.json");
+    list(&input, &[folder]);
+    let rotation_path = temp.path().join("invalid.db");
+    let invalid = b"not a sqlite database";
+    std::fs::write(&rotation_path, invalid).unwrap();
+    let output = temp.path().join("output");
+    evaluate(
+        &input,
+        &output,
+        false,
+        FallbackConfig::default(),
+        &Options {
+            rotation_db: Some(rotation_path.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let data = summary(&output);
+    assert_eq!(data["failed"], 0);
+    assert_eq!(data["rows"][0]["rotation"], 0);
+    assert_eq!(data["rows"][0]["page_aspect"], 0.7);
+    assert_eq!(std::fs::read(rotation_path).unwrap(), invalid);
 }
 
 #[test]

@@ -3,6 +3,89 @@ use std::io::{Cursor, Write};
 use std::sync::{Mutex, RwLock, atomic::AtomicUsize};
 
 #[test]
+fn cover_crop_dialog_reads_saved_body_rotations_with_worker_sample_keys() {
+    use crate::rotation_db::RotationDb;
+    let data = crate::data_dir::TestDataDirGuard::new();
+    let folder = data.path().join("folder");
+    std::fs::create_dir(&folder).unwrap();
+    let archive = data.path().join("converted.zip");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+    for page in 0..=8 {
+        let image = if page == 0 {
+            image::DynamicImage::new_rgb8(150, 100)
+        } else {
+            image::DynamicImage::new_rgb8(70, 100)
+        };
+        let name = format!("{page:03}.png");
+        image.save(folder.join(&name)).unwrap();
+        let mut bytes = Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        zip.start_file(&name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(bytes.get_ref()).unwrap();
+    }
+    zip.finish().unwrap();
+    let rotations = RotationDb::open().unwrap();
+    for is_folder in [false, true] {
+        let env = BookCoverEnv {
+            books_root: Some(data.path().join("unused-books")),
+            auto_cover_crop: Some(crate::cover_auto_crop::AutoCropIdentity {
+                binding: crate::settings::ReadingDirection::Rtl,
+                folders: is_folder,
+            }),
+            ..Default::default()
+        };
+        let container = BookCoverContainer {
+            path: if is_folder {
+                folder.clone()
+            } else {
+                archive.clone()
+            },
+            kind: if is_folder {
+                BookKind::Folder
+            } else {
+                BookKind::Zip
+            },
+            zip_dir_prefix: None,
+        };
+        for angle in [
+            Rotation::None,
+            Rotation::Cw180,
+            Rotation::Cw90,
+            Rotation::Cw270,
+        ] {
+            for page in 1..=8 {
+                let name = format!("{page:03}.png");
+                let key = if is_folder {
+                    crate::adjustment_db::normalize_path(&folder.join(name))
+                } else {
+                    crate::adjustment_db::zip_entry_key(&archive, &name)
+                };
+                rotations.set_key(&key, angle).unwrap();
+            }
+            let prepared = prepare_cover(
+                &container,
+                None,
+                &env,
+                64,
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+            if matches!(angle, Rotation::Cw90 | Rotation::Cw270) {
+                assert_eq!(
+                    prepared.auto_detection,
+                    AutoDetection::Stopped(AutoStop::PageAspect(
+                        crate::cover_auto_sample::PageAspectDecline::Landscape
+                    ))
+                );
+            } else {
+                assert!(prepared.auto_detection.crop_for(Rotation::None).is_some());
+            }
+        }
+    }
+}
+
+#[test]
 fn cover_crop_auto_method_layout_binding_messages_keep_one_typed_result() {
     use crate::cover_auto_crop::{
         AutoCropDecline, AutoCropLayout, AutoCropMethod, AutoCropSuccess,

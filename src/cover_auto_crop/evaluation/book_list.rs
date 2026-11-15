@@ -30,14 +30,16 @@ impl Options {
             // Only the explicitly invoked list tool reads this existing store,
             // read-only. Caches stay in the disposable TestDataDirGuard below.
             // Tests pass a temporary DB explicitly and never call from_env.
-            rotation_db: Some(
-                std::env::var_os("MIV_COVER_AUTO_EVAL_ROTATION_DB")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| crate::data_dir::flavor_default().join("rotation.db")),
-            ),
+            rotation_db: Some(evaluation_rotation_db()),
             saved_rotation: env_rotation("MIV_COVER_AUTO_EVAL_SAVED_ROTATION")?,
         })
     }
+}
+
+pub(super) fn evaluation_rotation_db() -> PathBuf {
+    std::env::var_os("MIV_COVER_AUTO_EVAL_ROTATION_DB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::data_dir::flavor_default().join("rotation.db"))
 }
 
 fn parse_binding(value: Option<&str>) -> Result<ReadingDirection, &'static str> {
@@ -46,24 +48,6 @@ fn parse_binding(value: Option<&str>) -> Result<ReadingDirection, &'static str> 
         Some("ltr") => Ok(ReadingDirection::Ltr),
         _ => Err("MIV_COVER_AUTO_EVAL_BINDING must be rtl or ltr"),
     }
-}
-
-fn saved_rotation(options: &Options, key: Option<&str>) -> Result<Rotation, String> {
-    if let Some(angle) = options.saved_rotation {
-        return Ok(angle);
-    }
-    let Some(path) = options.rotation_db.as_ref() else {
-        return Ok(Rotation::None);
-    };
-    match std::fs::metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Rotation::None),
-        Err(error) => return Err(format!("rotation DB metadata: {error}")),
-        Ok(_) => (),
-    }
-    let db = crate::rotation_db::RotationDb::open_readonly_at(path)
-        .map_err(|error| format!("rotation DB read: {error}"))?;
-    crate::edit_source::read_caption_rotation(Some(&db), key)
-        .map_err(|error| format!("rotation DB lookup: {error}"))
 }
 
 struct Row {
@@ -126,7 +110,14 @@ fn evaluate_one(
         BookCover::Unreadable(reason) => return Err(format!("cover resolution: {reason:?}")),
         BookCover::VideoFrame { .. } => return Err("cover is a video frame".into()),
     };
-    let saved = saved_rotation(options, cover.rotation_key.as_deref())?;
+    let rotations =
+        crate::cover_auto_sample::SampleRotations::from_path_worker(options.rotation_db.as_deref());
+    let saved = options.saved_rotation.unwrap_or_else(|| {
+        cover
+            .rotation_key
+            .as_deref()
+            .map_or(Rotation::None, |key| rotations.get(key))
+    });
     let analysis = match &cover.location {
         ReadLocation::File(path) => crate::thumb_loader::decode_cover_auto_analysis_image(
             crate::image_decode::Source::Path(path),
@@ -160,15 +151,19 @@ fn evaluate_one(
     let sample = match (&cover.location, &cover.auto_cover_crop) {
         (ReadLocation::File(leaf), Ok(auto)) => match &auto.input {
             AutoCoverInput::FolderPages(pages) => {
-                crate::cover_auto_sample::sample_folder_pages(pages, leaf)
+                crate::cover_auto_sample::sample_folder_pages_with_rotations(pages, leaf, |key| {
+                    rotations.get(key)
+                })
             }
             _ => Err(crate::cover_auto_sample::PageAspectDecline::TooFew),
         },
         (ReadLocation::ArchiveEntry { archive, entry }, Ok(_)) => {
-            crate::cover_auto_sample::sample_zip_pages(
+            crate::cover_auto_sample::sample_zip_pages_with_rotations(
                 archive,
                 entry,
                 cover.zip_dir_prefix.as_deref(),
+                archive,
+                |key| rotations.get(key),
             )
         }
         (ReadLocation::PdfPage { pdf, page }, Ok(_)) => {
@@ -179,7 +174,12 @@ fn evaluate_one(
                 cover.pdf_password.as_deref(),
             )
             .map_err(|error| format!("page sizes: {error}"))?;
-            crate::cover_auto_sample::page_aspect_from_sizes_report(&sizes, *page as usize)
+            crate::cover_auto_sample::page_aspect_from_sizes_with_rotations_report(
+                &sizes,
+                *page as usize,
+                pdf,
+                |key| rotations.get(key),
+            )
         }
         _ => Err(crate::cover_auto_sample::PageAspectDecline::TooFew),
     };

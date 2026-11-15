@@ -2,8 +2,63 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::rotation_db::{Rotation, RotationDb};
+
 pub(crate) const MAX_SAMPLE_PAGES: usize = 8;
 pub(crate) const MAX_SAMPLE_PREFIX_BYTES: u64 = 256 * 1024;
+
+/// Ephemeral, read-only rotation lookup. Construct and query this handle only
+/// on a sampling worker: opening the DB and reading a key both perform I/O.
+pub(crate) struct SampleRotations(Option<RotationDb>);
+
+impl SampleRotations {
+    pub(crate) fn for_worker() -> Self {
+        Self::from_path_worker(Some(&RotationDb::db_path()))
+    }
+
+    /// `None` explicitly disables lookup (for example in isolated evaluation).
+    /// A missing DB is normal and must never be created by sampling.
+    pub(crate) fn from_path_worker(path: Option<&Path>) -> Self {
+        let Some(path) = path else {
+            return Self(None);
+        };
+        match std::fs::metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Self(None),
+            Err(error) => {
+                log::warn!("Cover page sampling could not inspect rotation DB: {error}");
+                return Self(None);
+            }
+        }
+        match RotationDb::open_readonly_at(path) {
+            Ok(db) => Self(Some(db)),
+            Err(error) => {
+                log::warn!("Cover page sampling could not open rotation DB: {error}");
+                Self(None)
+            }
+        }
+    }
+
+    pub(crate) fn get(&self, key: &str) -> Rotation {
+        let Some(db) = &self.0 else {
+            return Rotation::None;
+        };
+        match db.get_key_checked(key) {
+            Ok(rotation) => rotation.unwrap_or_default(),
+            Err(error) => {
+                log::warn!("Cover page sampling could not read saved rotation: {error}");
+                Rotation::None
+            }
+        }
+    }
+}
+
+fn aspect_after_rotation(width: f64, height: f64, rotation: Rotation) -> f64 {
+    match rotation {
+        Rotation::Cw90 | Rotation::Cw270 => height / width,
+        Rotation::None | Rotation::Cw180 => width / height,
+    }
+}
 
 /// The representative never counts as a sample. Only a final representative
 /// samples backwards; other representatives sample the remaining next pages.
@@ -83,10 +138,23 @@ pub(crate) fn page_aspect_from_sizes_report(
     sizes: &[(f32, f32)],
     leaf: usize,
 ) -> Result<f64, PageAspectDecline> {
+    page_aspect_from_sizes_with_rotations_report(sizes, leaf, Path::new(""), |_| Rotation::None)
+}
+
+/// `sizes` uses the PDF worker's zero-based page order. `logical_pdf_path`
+/// is the viewer's page-key container, which may differ from the read target.
+pub(crate) fn page_aspect_from_sizes_with_rotations_report(
+    sizes: &[(f32, f32)],
+    leaf: usize,
+    logical_pdf_path: &Path,
+    mut lookup: impl FnMut(&str) -> Rotation,
+) -> Result<f64, PageAspectDecline> {
     aspect_from_slots(sample_indices(sizes.len(), leaf).into_iter().map(|index| {
         let (width, height) = sizes[index];
-        (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0)
-            .then_some(f64::from(width) / f64::from(height))
+        (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0).then(|| {
+            let key = crate::edit_source::page_key_for_pdf(logical_pdf_path, index as u32);
+            aspect_after_rotation(f64::from(width), f64::from(height), lookup(&key))
+        })
     }))
 }
 
@@ -113,6 +181,18 @@ pub(crate) fn sample_zip_pages(
     leaf_entry: &str,
     prefix: Option<&str>,
 ) -> Result<f64, PageAspectDecline> {
+    sample_zip_pages_with_rotations(path, leaf_entry, prefix, path, |_| Rotation::None)
+}
+
+/// Keep physical reads on `path` while looking up saved rotations using the
+/// viewer's container identity. This also covers evaluation copies of a ZIP.
+pub(crate) fn sample_zip_pages_with_rotations(
+    path: &Path,
+    leaf_entry: &str,
+    prefix: Option<&str>,
+    logical_zip_path: &Path,
+    mut lookup: impl FnMut(&str) -> Rotation,
+) -> Result<f64, PageAspectDecline> {
     if crate::rar_loader::is_rar_path(path)
         || crate::zip_loader::split_nested_zip_path(leaf_entry).len() > 1
     {
@@ -122,7 +202,8 @@ pub(crate) fn sample_zip_pages(
         .unwrap_or_default();
     aspect_from_slots(prefixes.into_iter().map(|(name, bytes)| {
         let (width, height) = dimensions_from_prefix(bytes.as_deref()?, &name)?;
-        Some(width / height)
+        let key = crate::adjustment_db::zip_entry_key(logical_zip_path, &name);
+        Some(aspect_after_rotation(width, height, lookup(&key)))
     }))
 }
 
@@ -148,14 +229,32 @@ pub(crate) fn sample_folder_pages(
     paths: &[PathBuf],
     cover: &Path,
 ) -> Result<f64, PageAspectDecline> {
-    sample_folder_pages_with_wic(paths, cover, |path| {
+    sample_folder_pages_with_rotations(paths, cover, |_| Rotation::None)
+}
+
+pub(crate) fn sample_folder_pages_with_rotations(
+    paths: &[PathBuf],
+    cover: &Path,
+    lookup: impl FnMut(&str) -> Rotation,
+) -> Result<f64, PageAspectDecline> {
+    sample_folder_pages_with_rotations_and_wic(paths, cover, lookup, |path| {
         crate::thumb_loader::file_orientation_or_wic(None, path)
     })
 }
 
+#[cfg(test)]
 fn sample_folder_pages_with_wic(
     paths: &[PathBuf],
     cover: &Path,
+    wic_orientation: impl FnMut(&Path) -> u16,
+) -> Result<f64, PageAspectDecline> {
+    sample_folder_pages_with_rotations_and_wic(paths, cover, |_| Rotation::None, wic_orientation)
+}
+
+fn sample_folder_pages_with_rotations_and_wic(
+    paths: &[PathBuf],
+    cover: &Path,
+    mut lookup: impl FnMut(&str) -> Rotation,
     mut wic_orientation: impl FnMut(&Path) -> u16,
 ) -> Result<f64, PageAspectDecline> {
     let leaf = paths
@@ -168,7 +267,8 @@ fn sample_folder_pages_with_wic(
         let path = &paths[index];
         let bytes = read_folder_prefix(path)?;
         let (width, height) = folder_dimensions_from_prefix(&bytes, path, &mut wic_orientation)?;
-        Some(width / height)
+        let key = crate::adjustment_db::normalize_path(path);
+        Some(aspect_after_rotation(width, height, lookup(&key)))
     }))
 }
 
@@ -197,11 +297,15 @@ fn folder_dimensions_from_prefix(
 }
 
 #[cfg(test)]
+#[path = "cover_auto_sample/saved_rotation_tests.rs"]
+mod saved_rotation_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Cursor, Write};
 
-    fn png(width: u32, height: u32) -> Vec<u8> {
+    pub(super) fn png(width: u32, height: u32) -> Vec<u8> {
         let mut output = Cursor::new(Vec::new());
         image::DynamicImage::ImageRgb8(image::RgbImage::new(width, height))
             .write_to(&mut output, image::ImageFormat::Png)
@@ -209,7 +313,12 @@ mod tests {
         output.into_inner()
     }
 
-    fn oriented_image(extension: &str, width: u32, height: u32, orientation: u16) -> Vec<u8> {
+    pub(super) fn oriented_image(
+        extension: &str,
+        width: u32,
+        height: u32,
+        orientation: u16,
+    ) -> Vec<u8> {
         use image::ImageEncoder;
         let mut exif = b"II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
         exif.extend(orientation.to_le_bytes());
@@ -394,7 +503,7 @@ mod tests {
         assert_eq!(sample, Ok(0.7));
     }
 
-    fn zip(entries: Vec<(String, Vec<u8>)>) -> tempfile::NamedTempFile {
+    pub(super) fn zip(entries: Vec<(String, Vec<u8>)>) -> tempfile::NamedTempFile {
         let file = tempfile::NamedTempFile::new().unwrap();
         let mut writer = zip::ZipWriter::new(file.reopen().unwrap());
         let options = zip::write::SimpleFileOptions::default()

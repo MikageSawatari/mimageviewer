@@ -7148,23 +7148,34 @@ pub(crate) fn load_one_cached(
         };
         let mut reason = "unsupported_source";
         if supported {
+            // Source/decode worker only. Cache hits and CacheOnly never reach
+            // this bounded page sampling or open the rotation store.
+            let sample_rotations = crate::cover_auto_sample::SampleRotations::for_worker();
             let sample = match &auto.input {
                 AutoCoverInput::FolderPages(pages) => {
-                    crate::cover_auto_sample::sample_folder_pages(pages, path)
+                    crate::cover_auto_sample::sample_folder_pages_with_rotations(
+                        pages,
+                        path,
+                        |key| sample_rotations.get(key),
+                    )
                 }
                 AutoCoverInput::Container => {
                     if let Some(page) = pdf_page {
                         let sizes =
                             cover_pdf_page_sizes(path, epub_read, pdf_password).unwrap_or_default();
-                        crate::cover_auto_sample::page_aspect_from_sizes_report(
+                        crate::cover_auto_sample::page_aspect_from_sizes_with_rotations_report(
                             &sizes,
                             page as usize,
+                            path,
+                            |key| sample_rotations.get(key),
                         )
                     } else {
-                        crate::cover_auto_sample::sample_zip_pages(
+                        crate::cover_auto_sample::sample_zip_pages_with_rotations(
                             path,
                             zip_entry.expect("supported ZIP leaf"),
                             auto_zip_prefix,
+                            path,
+                            |key| sample_rotations.get(key),
                         )
                     }
                 }
@@ -7717,6 +7728,7 @@ pub(crate) use cover_auto_analysis::{
 mod tests {
     include!("thumb_loader/auto_material_tests.rs");
     include!("thumb_loader/folder_auto_tests.rs");
+    include!("thumb_loader/saved_rotation_sample_tests.rs");
     use super::*;
     use crate::settings::{CachePolicy, Settings, SortOrder};
     use std::collections::HashMap;

@@ -650,20 +650,28 @@ fn prepare_cover_inner(
     } else if has_edit_preview {
         AutoDetection::Stopped(AutoStop::EditPreview)
     } else if let Some(auto) = auto_crop.filter(|_| !cancel.load(Ordering::Relaxed)) {
+        // This function runs on cover-crop-prepare, never on the UI thread.
+        let sample_rotations = crate::cover_auto_sample::SampleRotations::for_worker();
         let sample = match &cover.location {
             ReadLocation::File(path) => {
                 match cover.auto_cover_crop.as_ref().ok().map(|auto| &auto.input) {
                     Some(crate::thumb_loader::AutoCoverInput::FolderPages(pages)) => {
-                        crate::cover_auto_sample::sample_folder_pages(pages, path)
+                        crate::cover_auto_sample::sample_folder_pages_with_rotations(
+                            pages,
+                            path,
+                            |key| sample_rotations.get(key),
+                        )
                     }
                     _ => crate::cover_auto_sample::page_aspect_from_sizes_report(&[], 0),
                 }
             }
             ReadLocation::ArchiveEntry { archive, entry } => {
-                crate::cover_auto_sample::sample_zip_pages(
+                crate::cover_auto_sample::sample_zip_pages_with_rotations(
                     archive,
                     entry,
                     cover.zip_dir_prefix.as_deref(),
+                    archive,
+                    |key| sample_rotations.get(key),
                 )
             }
             ReadLocation::PdfPage { pdf, page } => {
@@ -679,7 +687,12 @@ fn prepare_cover_inner(
                         .ok()
                     })
                     .unwrap_or_default();
-                crate::cover_auto_sample::page_aspect_from_sizes_report(&sizes, *page as usize)
+                crate::cover_auto_sample::page_aspect_from_sizes_with_rotations_report(
+                    &sizes,
+                    *page as usize,
+                    pdf,
+                    |key| sample_rotations.get(key),
+                )
             }
             _ => crate::cover_auto_sample::page_aspect_from_sizes_report(&[], 0),
         };

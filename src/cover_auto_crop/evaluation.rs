@@ -44,6 +44,7 @@ struct DecodeMode {
     thumb_px: u32,
     image_rotation: Rotation,
     saved_rotation: Option<Rotation>,
+    rotation_db: Option<PathBuf>,
     reencode_input: bool,
 }
 
@@ -71,6 +72,7 @@ impl DecodeMode {
             image_rotation: env_rotation("MIV_COVER_AUTO_EVAL_IMAGE_ROTATION")?
                 .unwrap_or(Rotation::None),
             saved_rotation: env_rotation("MIV_COVER_AUTO_EVAL_SAVED_ROTATION")?,
+            rotation_db: Some(book_list::evaluation_rotation_db()),
             reencode_input: std::env::var("MIV_COVER_AUTO_EVAL_REENCODE_INPUT").as_deref()
                 == Ok("1"),
         })
@@ -215,8 +217,16 @@ fn load_case(
             .map(|(parent, _)| format!("{parent}/"));
         // Deliberately use the production prefix-only dimension sampler. Truth
         // aspect is allowed only for PNG dummies, never to rescue a ZIP sample.
-        let sample =
-            crate::cover_auto_sample::sample_zip_pages(&decode_path, &leaf, prefix.as_deref());
+        let rotations = crate::cover_auto_sample::SampleRotations::from_path_worker(
+            mode.rotation_db.as_deref(),
+        );
+        let sample = crate::cover_auto_sample::sample_zip_pages_with_rotations(
+            &decode_path,
+            &leaf,
+            prefix.as_deref(),
+            &zip_path,
+            |key| rotations.get(key),
+        );
         let worker = mode
             .worker
             .then(|| {
@@ -787,6 +797,7 @@ fn synthetic_decode_mode(worker: bool) -> DecodeMode {
         thumb_px: crate::settings::Settings::default().thumb_px,
         image_rotation: Rotation::None,
         saved_rotation: None,
+        rotation_db: None,
         reencode_input: false,
     }
 }
@@ -907,6 +918,90 @@ fn evaluation_null_page_aspect_samples_zip_and_declines_missing_png_without_earl
             }
         }
     }
+    Ok(())
+}
+
+#[test]
+fn evaluation_directory_zip_body_rotations_keep_original_keys_for_generated_inputs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let target = std::env::current_dir()?.join("target");
+    std::fs::create_dir_all(&target)?;
+    let temp = tempfile::Builder::new()
+        .prefix("cover-auto-body-rotation-eval-")
+        .tempdir_in(target)?;
+    let zip_path = temp.path().join("rotated-body.zip");
+    synthetic_zip_pages(&zip_path, (280, 200), (70, 100))?;
+    let truth = json!({"rotated-body": {"front":null,"page_aspect":null,"ltr":false}});
+    std::fs::write(temp.path().join("truth.json"), serde_json::to_vec(&truth)?)?;
+    let parsed: BTreeMap<String, Truth> = serde_json::from_value(truth)?;
+    let rotation_path = temp.path().join("rotations.db");
+    let db = crate::rotation_db::RotationDb::open_at(&rotation_path)?;
+    // Leave the first body page portrait so the existing leading-landscape
+    // exclusion cannot hide the saved rotation's consensus change.
+    for page in 2..=8 {
+        db.set_key(
+            &crate::adjustment_db::zip_entry_key(&zip_path, &format!("{page:03}.png")),
+            if page % 2 == 0 {
+                Rotation::Cw90
+            } else {
+                Rotation::Cw270
+            },
+        )?;
+    }
+    drop(db);
+    let before = std::fs::read(&rotation_path)?;
+    for (name, physical, reencode) in [
+        ("original", Rotation::None, false),
+        ("reencoded", Rotation::None, true),
+        ("physical", Rotation::Cw90, true),
+    ] {
+        let output = temp.path().join(name);
+        let mut mode = synthetic_decode_mode(true);
+        mode.image_rotation = physical;
+        mode.reencode_input = reencode;
+        mode.rotation_db = Some(rotation_path.clone());
+        {
+            let _data = crate::data_dir::TestDataDirGuard::new();
+            let loaded = load_case(
+                temp.path(),
+                "rotated-body",
+                &parsed["rotated-body"],
+                &mode,
+                &output,
+            )?;
+            assert_eq!(
+                loaded.sample,
+                Err(crate::cover_auto_sample::PageAspectDecline::Landscape)
+            );
+            assert_eq!(loaded.original_dims, (280, 200));
+            assert_eq!(
+                (loaded.image.width(), loaded.image.height()),
+                if physical.is_none() {
+                    (280, 200)
+                } else {
+                    (200, 280)
+                }
+            );
+        }
+        evaluate_directory(temp.path(), &output, &mode, FallbackConfig::default())?;
+        let summary: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output.join("summary.json"))?)?;
+        let row = &summary["rows"][0];
+        assert!(row["page_aspect"].is_null());
+        assert_eq!(row["page_aspect_decline"], "landscape");
+        assert_eq!(row["reason"], "no-page-aspect");
+        assert_eq!(
+            row["saved_rotation"],
+            Rotation::from_degrees(-physical.degrees()).degrees()
+        );
+        assert!(row["prediction"].is_null());
+        assert_eq!(summary["negative_cropped"], 0);
+        assert_eq!(summary["negative_declined"], 1);
+        if reencode {
+            assert!(output.join("inputs/rotated-body.zip").is_file());
+        }
+    }
+    assert_eq!(std::fs::read(rotation_path)?, before);
     Ok(())
 }
 
