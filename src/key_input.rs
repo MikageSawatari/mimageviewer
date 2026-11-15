@@ -1757,6 +1757,7 @@ pub(crate) enum NativeInputCancelReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NativeNonClientOutcome {
     Completed,
+    MinimizeOwned,
     Cancelled(NativeInputCancelReason),
     CloseOwned,
 }
@@ -1879,11 +1880,19 @@ impl std::fmt::Debug for NativeDetachedInputTarget {
     }
 }
 
+/// The OS selected one matching button command. This is a closed disposition,
+/// not a second request: minimizing never authorizes viewer activation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeButtonAction {
+    ActivateViewer,
+    MinimizeOwned,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeNonClientPhase {
     Pressed,
     Released,
-    ButtonActionCommitted,
+    ButtonActionCommitted(NativeButtonAction),
     Cancelled(NativeInputCancelReason),
     CloseOwned,
 }
@@ -6160,7 +6169,13 @@ fn native_detached_message_with_origin(
                 // selection fact, including when it consumed Up internally.
                 // Its focus/capture side effects cannot undo that selection.
                 // Target blocking/retirement still cancels the binding itself.
-                *phase = NativeNonClientPhase::ButtonActionCommitted;
+                *phase = NativeNonClientPhase::ButtonActionCommitted(
+                    if press_target.hit == HTMINBUTTON && command == SC_MINIMIZE {
+                        NativeButtonAction::MinimizeOwned
+                    } else {
+                        NativeButtonAction::ActivateViewer
+                    },
+                );
             }
         }
     } else if message == WM_EXITSIZEMOVE {
@@ -6369,9 +6384,15 @@ fn finish_native_detached_dispatch(hwnd: u64, subclass_id: usize, call: NativeDe
     }
     let outcome = match *gesture {
         NativeDetachedGesture::NonClient {
-            phase: NativeNonClientPhase::Released | NativeNonClientPhase::ButtonActionCommitted,
+            phase:
+                NativeNonClientPhase::Released
+                | NativeNonClientPhase::ButtonActionCommitted(NativeButtonAction::ActivateViewer),
             ..
         } => Some(NativeNonClientOutcome::Completed),
+        NativeDetachedGesture::NonClient {
+            phase: NativeNonClientPhase::ButtonActionCommitted(NativeButtonAction::MinimizeOwned),
+            ..
+        } => Some(NativeNonClientOutcome::MinimizeOwned),
         NativeDetachedGesture::NonClient {
             phase: NativeNonClientPhase::Cancelled(reason),
             ..
@@ -7471,6 +7492,33 @@ mod native_detached_tests {
     }
 
     #[test]
+    fn realmachine58_minimize_button_keeps_os_action_without_activation() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm58-minimize", 0x8058);
+        for origin in [
+            NativeMouseOrigin::Ordinary,
+            NativeMouseOrigin::PointerPromotion,
+        ] {
+            let down = f.message_with_origin(WM_NCLBUTTONDOWN, HTMINBUTTON as usize, 0, origin);
+            let sc = f.message(WM_SYSCOMMAND, SC_MINIMIZE as usize | 2, 0);
+            f.message(WM_KILLFOCUS, 0, 0);
+            f.message(WM_CAPTURECHANGED, 0, 0);
+            f.finish_call(sc);
+            assert!(
+                f.take().is_empty(),
+                "the selected command is not the owning return"
+            );
+            f.finish_call(down);
+            let events = f.take();
+            assert_eq!(events.len(), 1);
+            let NativeDetachedInputEventKind::NonClient(outcome) = events[0] else {
+                panic!("non-client outcome required");
+            };
+            assert_eq!(outcome, NativeNonClientOutcome::MinimizeOwned);
+        }
+    }
+
+    #[test]
     fn realmachine57_touch_button_observed_maximize_restore_sequence() {
         let _serial = lock_test_input();
         let f = Fixture::new("rm57-touch-observed", 0x7957);
@@ -7553,7 +7601,11 @@ mod native_detached_tests {
             assert_eq!(
                 f.take(),
                 vec![NativeDetachedInputEventKind::NonClient(
-                    NativeNonClientOutcome::Completed
+                    if command == SC_MINIMIZE {
+                        NativeNonClientOutcome::MinimizeOwned
+                    } else {
+                        NativeNonClientOutcome::Completed
+                    }
                 )]
             );
         }
@@ -7933,7 +7985,11 @@ mod native_detached_tests {
             assert_eq!(
                 f.take(),
                 vec![NativeDetachedInputEventKind::NonClient(
-                    NativeNonClientOutcome::Completed
+                    if command == SC_MINIMIZE {
+                        NativeNonClientOutcome::MinimizeOwned
+                    } else {
+                        NativeNonClientOutcome::Completed
+                    }
                 )]
             );
             f.message(WM_NCLBUTTONUP, hit as usize, 0);
@@ -7964,7 +8020,7 @@ mod native_detached_tests {
         assert_eq!(
             f.take(),
             vec![NativeDetachedInputEventKind::NonClient(
-                NativeNonClientOutcome::Completed
+                NativeNonClientOutcome::MinimizeOwned
             )]
         );
     }
@@ -8120,7 +8176,11 @@ mod native_detached_tests {
             assert_eq!(
                 sibling.take(),
                 vec![NativeDetachedInputEventKind::NonClient(
-                    NativeNonClientOutcome::Completed
+                    if hit == HTMINBUTTON {
+                        NativeNonClientOutcome::MinimizeOwned
+                    } else {
+                        NativeNonClientOutcome::Completed
+                    }
                 )]
             );
         }
@@ -8195,7 +8255,7 @@ mod native_detached_tests {
         assert_eq!(
             f.take(),
             vec![NativeDetachedInputEventKind::NonClient(
-                NativeNonClientOutcome::Completed
+                NativeNonClientOutcome::MinimizeOwned
             )]
         );
     }

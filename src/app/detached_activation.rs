@@ -46,6 +46,7 @@ pub(crate) enum DetachedActivationDecision {
     RetiredRegistration,
     GestureCancelled,
     CloseOwned,
+    MinimizeOwned,
     CommandOwned,
     ActivationFailed,
 }
@@ -115,6 +116,7 @@ impl DetachedActivationRequest {
         let decision = match outcome {
             Outcome::Completed => DetachedActivationDecision::Accepted,
             Outcome::CloseOwned => DetachedActivationDecision::CloseOwned,
+            Outcome::MinimizeOwned => DetachedActivationDecision::MinimizeOwned,
             Outcome::Cancelled(Reason::ModalOwned) => DetachedActivationDecision::ModalOwned,
             Outcome::Cancelled(Reason::RetiredRegistration) => {
                 DetachedActivationDecision::RetiredRegistration
@@ -394,6 +396,10 @@ mod tests {
             for (outcome, expected) in [
                 (Outcome::Completed, DetachedActivationDecision::Accepted),
                 (Outcome::CloseOwned, DetachedActivationDecision::CloseOwned),
+                (
+                    Outcome::MinimizeOwned,
+                    DetachedActivationDecision::MinimizeOwned,
+                ),
             ] {
                 let (decision, line) = request.native_outcome_diagnostic("normalized", outcome);
                 assert_eq!(decision, expected);
@@ -449,6 +455,92 @@ mod tests {
         app.prune_deferred_detached_image_window_views();
         assert!(app.deferred_detached_image_window_views.contains_key(&id));
         (app, ctx, id)
+    }
+
+    #[test]
+    fn realmachine58_minimize_outcome_keeps_parked_owner_and_emits_no_restore_or_focus() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            HTMINBUTTON, SC_MINIMIZE, WM_NCLBUTTONDOWN, WM_SYSCOMMAND,
+        };
+        let _input = crate::key_input::lock_test_input();
+        for live in [false, true] {
+            let (mut app, ctx, id) = if live {
+                realmachine55_parked_media_fixture()
+            } else {
+                use super::super::detached_media_exchange_tests as media;
+                let mut app = super::super::tests::phase_c_support::setup_app();
+                let ctx = egui::Context::default();
+                ctx.set_embed_viewports(false);
+                let root = app.tmp.path().to_path_buf();
+                media::install_items(&mut app, &ctx, &root, false);
+                app.settings.detached_viewer_enabled = true;
+                app.settings.detached_viewer_open_images_in_window = true;
+                media::open_grid(&mut app, &ctx, 2);
+                let id = app.active_detached_window_id().unwrap();
+                media::open_grid(&mut app, &ctx, 3);
+                assert_eq!(
+                    app.detached_window_state(id),
+                    Some(DetachedWindowState::Parked)
+                );
+                ctx.run_ui(egui::RawInput::default(), |ui| {
+                    app.render_detached_image_windows(ui.ctx())
+                })
+                .drop_without_applying_deltas();
+                (app, ctx, id)
+            };
+            let active_before = app.active_viewer_context_id();
+            let window_before = app.active_detached_window_id();
+            let owner_before = app.locate_window_context(id);
+            let state_before = app.detached_window_state(id);
+            let focus_before = app.detached_viewer_focus_requested;
+            let registration = ctx
+                .viewport_registration(App::detached_image_window_viewport_id(id))
+                .unwrap();
+            let allocation = crate::key_input::register_test_native_input_allocation(
+                registration,
+                0x8059 + u64::from(live),
+            );
+            app.sync_detached_native_input_targets(&ctx);
+            let request =
+                app.detached_activation_request(&ctx, id, DetachedActivationSource::NonClientClick);
+            assert_eq!(
+                app.detached_activation_admission(&ctx, &request),
+                DetachedActivationDecision::Accepted,
+                "the native input must address a live, activatable parked owner"
+            );
+            allocation.native_message_for_test(WM_NCLBUTTONDOWN, HTMINBUTTON as usize, 0);
+            allocation.native_message_for_test(WM_SYSCOMMAND, SC_MINIMIZE as usize, 0);
+            allocation.finish_native_dispatch_for_test(WM_SYSCOMMAND);
+            allocation.finish_native_dispatch_for_test(WM_NCLBUTTONDOWN);
+            // Native transport is drained before the next UI pass, as in the
+            // real handler tests. An empty ROOT-only pass would retire the
+            // parked registration before its request could be admitted.
+            app.service_deferred_detached_window_events(&ctx);
+            let committed = app.commit_pending_deferred_detached_window_activation(&ctx);
+            assert!(
+                !committed,
+                "minimizing a parked window must not enter the activation commit"
+            );
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                app.render_detached_image_windows(ui.ctx());
+            });
+            assert_eq!(app.active_viewer_context_id(), active_before);
+            assert_eq!(app.active_detached_window_id(), window_before);
+            assert_eq!(app.locate_window_context(id), owner_before);
+            assert_eq!(app.detached_window_state(id), state_before);
+            assert_eq!(app.detached_viewer_focus_requested, focus_before);
+            assert!(!app.detached_window_deferred_activation_pending(id));
+            assert!(
+                !output
+                    .viewport_output
+                    .values()
+                    .any(|viewport| viewport.commands.iter().any(|command| matches!(
+                        command,
+                        egui::ViewportCommand::Focus | egui::ViewportCommand::Minimized(false)
+                    )))
+            );
+            output.drop_without_applying_deltas();
+        }
     }
 
     #[test]

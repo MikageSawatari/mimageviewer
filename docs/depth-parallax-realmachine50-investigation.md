@@ -1558,7 +1558,7 @@ sequence 7のcaption clickはCompleted。表示倍率125%／snap一覧の有無�
 
 **確定点と終端。** HTMINBUTTON／HTMAXBUTTON／HTHELPは、同じ押下のnative call中に
 subclassでdispatchされた一致WM_SYSCOMMANDだけを選択の事実とする。
-開始を所有した押下のDefSubclassProc返却（後述のcall tokenで照合）だけで終端し、一致SCがあればCompleted、無ければ
+開始を所有した押下のDefSubclassProc返却（後述のcall tokenで照合）だけで終端し、一致SCの結果（最小化は後述のMinimizeOwned）を返し、無ければ
 Cancelled(CaptionButtonOutside)とする。このreasonは「OSがボタンを選択しなかった」の意味になる。
 Upの位置・有無、CaptureLost／FocusLost／CancelMode／Escapeはボタンの採否に使わない。
 targetのblock／retireは既存bindingの取消として維持し、後続SCで復活させない。
@@ -1590,9 +1590,10 @@ caption／resizeなどの非ボタン操作が使うため残す。
 | MAX Down → client Up（再照会ならHTCAPTION）→ CaptureChanged(0) → dispatch SC_MAXIMIZE | Completed |
 | MAX Down → client Up（再照会ならHTMINBUTTON）→ dispatch SC_RESTORE | Completed |
 | Down → Up → CaptureChanged、SCなし | Cancelled(CaptionButtonOutside) |
-| Down → KillFocus／CancelMode／Escape／capture取消 → 一致SC | Completed |
+| Down → KillFocus／CancelMode／Escape／capture取消 → 一致SC | 選択SCの結果（MIN＋SC_MINIMIZEはMinimizeOwned、他はCompleted） |
 | MAX Down → 不一致SC／hookだけの一致SC | Cancelled(CaptionButtonOutside) |
-| MIN Down → dispatch SC_MINIMIZE、HELP Down → dispatch SC_CONTEXTHELP | Completed |
+| MIN Down → dispatch SC_MINIMIZE | 初回はCompleted、依頼58の決定でMinimizeOwnedへ変更（後述） |
+| HELP Down → dispatch SC_CONTEXTHELP | Completed |
 | Down → target block／retire → 一致SC | ModalOwned／RetiredRegistration（復活しない） |
 | Down返却（SCなし）→ 遅着SC／Up | 返却時に取消済み、追加の結果なし |
 | HTCLOSE → SC_CLOSE | CloseOwned |
@@ -1859,6 +1860,114 @@ PE記録 `target/rm57t-pe-imports.json`、同梱manifest／READMEを更新した
 
 変更ファイルは `src/key_input.rs` と本書、`docs/detached-rework-plan.md` の3件。
 App field／vendor／通常配布物は変更しない。全件gate、build-dev、commit／pushは行っていない。
+
+#### 依頼58: 最小化はOSに委ねて再開しない（2026-11-15）
+
+基点は `c22de91e4`（タッチの所有変更をコミット済み）。観測者はサブPC担当、対象buildは
+`b325cc1ed`。根拠は `C:/miv-subpc/results-58/notes.md` §4.4 と
+`logs/mimageviewer.log` の221.915s／263.851s。止めたwindow=1／context=1の最小化buttonを
+画面操作ツールとmouse_eventで各1回押すと、どちらもAccepted→commitとなり、
+窓は元の大きさで前面に出て再開した（IsIconic=False）。動いている同窓の同位置では最小化された。
+道具の最小化も旧結果はCompletedだった。
+
+**原因のsource確認。** 旧native結果のCompletedは
+`DetachedActivationRequest::native_outcome_diagnostic` でAcceptedとなり、
+`sync_detached_native_input_targets` のsinkがactivationを配送してrootをwakeする。
+service→commit→snapshot再開→`App::adopt_active_detached_viewport_runtime_from_passive`
+（app.rs:66835、focus要求は66860）が `detached_viewer_focus_requested=true` にする。
+active描画でこの要求をtake（ui_fullscreen.rs:27892）し、28282付近の
+`request_detached_window_visibility(focus=true)` → `dispatch_detached_show`
+（detached_placement.rs:120／128）でMinimized(false)とFocusを送る。
+fallbackのui_fullscreen.rs:28284／28286も同じ復元／前面化を送る。
+これは最小化を打ち消せるsource経路であり、実機ログの再開commitと整合する。
+
+**利用者決定（2026-11-15、統括経由）。** Parked／ParkedLiveの最小化buttonは最小化だけを行い、
+再開しない。×・button外releaseと並ぶ例外とする。タスクバーから戻す際の扱いは
+master §1.790の別件で、この回では変更しない。
+
+**実装。** 一致SCの選択確定・同Down call tokenの返却という境界は変えない。
+既存 `ButtonActionCommitted` に閉じた `NativeButtonAction`（ActivateViewer／MinimizeOwned）を保持し、
+HTMINBUTTON＋low 4 bitsを除いたSC_MINIMIZEだけをMinimizeOwnedにする。
+HTMINBUTTON＋SC_RESTORE、MAX／HELPの一致SCは従来のCompleted。
+raw pointer buttonは引き続きownerを作らず、touch／penの昇格mouseも同じ結果へ到達する。
+選択SCなしは従来どおりCancelled(CaptionButtonOutside)。modal／retireの取消優先も変えない。
+
+native outcomeとApp decisionの新名はともに **MinimizeOwned**。
+normalizedは次の形になり、Accepted限定の既存輸送へ入らないため、accept／commitは発生しない。
+
+```text
+[detached-activation] boundary=normalized source=NonClientClick decision=MinimizeOwned reason=None window=... registration=... context=... expected_state=Parked
+```
+
+Appに最小化用flag／pendingを追加せず、focus要求を後からclearする処理も足さない。
+安定したParked窓の通常描画は復元／前面化を要求しないことをreadonly監査した。
+passive builderはlive HWNDへ初期配置を適用せず、minimized時はgeometryの保存を止めるだけ。
+ほかの復元／focusは明示grid再open、F11、media presentationのFocusHost、trayなど各既存ownerの契機。
+非detached専用restore_fullscreen_focus_from_mainはdetached sessionならreturnする。
+mediaの同一host保守完了も `request.current==request.target` のためFocusHostを発行しない
+（presentation_transition.rs:869）。ParkedLiveのsession確定は `parked_same_host` のearly returnで
+active窓の公開を避ける（native_video.rs:5307／5335）。
+最小化の結果を再開へ変換しなければ、今回の経路から別の自動restoreは起こさない。
+最小化を遅延・抑止するguardや追加repaintは不要（BA-7）。
+
+**回帰。** 新nativeテストは通常mouse／昇格mouseでSC_MINIMIZEの選択、focus／capture副作用、
+SC返却ではなく本人Down返却でMinimizeOwnedとなることを検査する。
+新Appテストは実grid openで作るParkedと既存実handlerのParkedLiveを使い、入力前の
+admission=Acceptedを固定した上で、実native輸送→service→commitを通す。
+active context／window／binding／runtime state／focus要求が変わらず、commitしないこと、
+出力にMinimized(false)／Focusがないことを検査する。
+初回fixtureのempty ROOT passはchild登録をGCし、旧コードでも入力が退役してしまったため、
+そのpassを除き、登録が生きている境界で再検証した（製品の登録寿命は変更しない）。
+旧コードではnativeのCompletedと、Appの実activation commitの両方で2実行／2失敗、exit 100
+（`target/rm58-red.log`、初回fixture記録は `target/rm58-red-before-registration-fix.log`）。
+
+最小化をCompletedとみなしていた更新対象は次の5件。外で離す取消、他button、call所有の期待は維持する。
+
+| テスト | 変更 |
+| --- | --- |
+| `realmachine55_caption_button_native_command_finishes_at_outer_return_without_up` | MIN＋SC_MINIMIZEだけMinimizeOwned、MIN＋SC_RESTORE／MAX／HELPはCompleted |
+| `realmachine55_caption_button_committed_minimize_keeps_its_native_focus_side_effect` | OSのfocus side effectを取消にせず、MinimizeOwnedで終端 |
+| `realmachine57_touch_button_promoted_call_is_the_only_button_owner` | 昇格MINの結果だけMinimizeOwned、本人callまで未終端・1回だけは維持 |
+| `native_detached_caption_button_outside_release_cancels_without_rect_change` | 正常選択する兄弟MINだけMinimizeOwned。対象のoutside取消は維持 |
+| `native_detached_caption_button_far_motion_completes_with_os_command` | MINの選択結果をMinimizeOwnedへ |
+
+独立source review（Sol / xhigh）は所有境界の構造修正としてACCEPT、阻害指摘なし。
+検証は本項末尾へ記録した。道具／auto／製品はこの作業で起動していない。
+
+最終gateは指定run-heavy、Owner `codex/767-rm58-minimize`、gate同士は直列。
+別作業の全件gateが保有する共有lockの解放を待ってから開始し、他process／lockは変更していない。
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/realmachine57_|realmachine58_|caption_button/)' --no-fail-fast --test-threads 6
+cargo nextest run -p mimageviewer --lib -E 'test(/native_detached|non_client|caption|detached_activation|realmachine55_|realmachine57_|realmachine58_|parked|native_video/)' --no-fail-fast --test-threads 6
+cargo test -p mimageviewer --features dev-tools --bin native_detached_probe -- --test-threads 6
+cargo build -p mimageviewer --features dev-tools --bin native_detached_probe
+cargo check -p mimageviewer --bin mimageviewer-core
+cargo fmt
+```
+
+| 検証 | 件数／exit code | 証跡 |
+| --- | --- | --- |
+| 旧コードでのnative／Appの赤テスト | 2実行／2失敗、exit 100 | `target/rm58-red.log` |
+| タッチ＋最小化の最終焦点 | 25実行／25成功、exit 0 | `target/rm58-focused.log` |
+| 指定回帰 | 676実行／676成功、exit 0 | `target/rm58-regression.log` |
+| probe pure unit | 7実行／7成功、exit 0 | `target/rm58-probe-unit.log` |
+| probe build | 1 exe、exit 0 | `target/rm58-probe-build.log` |
+| core check | 1 core対象、exit 0 | `target/rm58-check.log` |
+| 最後の引数なしfmt | exit 0 | `target/rm58-fmt.log` |
+
+全件gateの後も共有heavy枠待ちがあり、指定runnerの待機を維持した。
+コピー用 `target/rm56-native-detached-probe/native_detached_probe.exe` は新buildへ差替え済み。
+33,466,368 bytes、SHA256は `57a554dc687ddd7d4742b00475815df1aee9b7bf2a9d2625a238c9eef74fdcf5`。
+build出力とのhash一致、6 DLLと元touch.logが変更されていないことを検査した。
+exe＋6 DLLは151,279,632 bytes。PE記録は `target/rm58-pe-imports.json`、同梱manifest／READMEも更新した。
+
+タッチ側は `c22de91e4` として確定済みのraw／昇格の所有を維持し、この回の焦点・回帰に含めた。
+タッチの3変更ファイルと今回の最小化の変更を合わせると、`src/key_input.rs`、
+`src/app/detached_activation.rs`、本書、`docs/detached-rework-plan.md` の4ファイル。
+App field／vendor／通常配布物は変更しない。修正後の最小化の実機動作、修正後touch、penの列は未確認。
+元touch操作の目視報告は未着。タスクバー復元§1.790は対象外。
+全件gate、build-dev、製品／道具／auto起動、commit／pushはこの作業から実行していない。
 
 ## 6. 診断（初回調査の案、A実装で導入）
 

@@ -1460,6 +1460,14 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ### 2026-11-15: §1.767 サブPC依頼57 — caption buttonの確定点を一致SCに統一
 
+依頼58の利用者決定で最小化は再開しない例外へ変更。HTMINBUTTON＋一致SC_MINIMIZEの
+結果を既存native確定相の閉じたpayloadへ保持し、同call返却でMinimizeOwnedを出す。
+Appのnormalized decisionもMinimizeOwnedとし、既存のAccepted限定輸送へ入れないため
+再開／復元／focus要求を作らない（BA-7）。既存focus boolのclearや新App fieldは追加しない。
+設計担当と独立Sol / xhighが構造修正に合意。タッチの昇格mouse所有を維持し、rawとの相関は作らない。
+Parked／ParkedLiveの実handler対照とsource経路を調査書§5.11の依頼58記録へ追記。
+タスクバー復元§1.790は対象外。
+
 利用者のメインPC touch.logでP2-2の実列を採取。buttonだけraw NC pointerをownerにせず、
 OSが動作を選ぶ昇格mouse NCLBUTTONDOWNへ既存Mouse owner／一致SC／同call返却を統一した。
 既存call tokenにcaptured originを保持し、dispatch／finishを同じ所有判定へそろえる（BA-7）。
