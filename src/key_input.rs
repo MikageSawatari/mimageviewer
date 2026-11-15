@@ -1442,7 +1442,11 @@ impl NativeInputAllocationWitness {
                 wparam,
                 lparam,
                 NativeDetachedDispatch::Subclass(test_native_call(
-                    self.hwnd, subclass, message, wparam,
+                    self.hwnd,
+                    subclass,
+                    message,
+                    wparam,
+                    NativeMouseOrigin::Ordinary,
                 )),
                 NativeMouseOrigin::Ordinary,
             );
@@ -1898,14 +1902,16 @@ struct NativeDetachedCall {
     sequence: u64,
     message: u32,
     wparam: usize,
+    origin: NativeMouseOrigin,
 }
 
 impl NativeDetachedCall {
-    fn new(message: u32, wparam: usize) -> Self {
+    fn new(message: u32, wparam: usize, origin: NativeMouseOrigin) -> Self {
         Self {
             sequence: native_input_sequence(),
             message,
             wparam,
+            origin,
         }
     }
 }
@@ -1926,8 +1932,14 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn test_native_call(hwnd: u64, subclass: usize, message: u32, wparam: usize) -> NativeDetachedCall {
-    let call = NativeDetachedCall::new(message, wparam);
+fn test_native_call(
+    hwnd: u64,
+    subclass: usize,
+    message: u32,
+    wparam: usize,
+    origin: NativeMouseOrigin,
+) -> NativeDetachedCall {
+    let call = NativeDetachedCall::new(message, wparam, origin);
     TEST_NATIVE_CALLS.with(|calls| calls.borrow_mut().push((hwnd, subclass, call)));
     call
 }
@@ -5915,19 +5927,34 @@ fn native_mouse_origin(message: u32) -> NativeMouseOrigin {
     }
 }
 
-fn native_non_client_start(
+/// Raw pointers own caption/resize/close. For buttons the OS instead selects
+/// the action in its promoted mouse Down call (observed in touch.log). That
+/// call is the only button producer; no raw-to-promoted correlation is needed.
+fn native_detached_message_is_owned(
     message: u32,
     wparam: usize,
     origin: NativeMouseOrigin,
-) -> Option<(NativePointerSource, u32)> {
+) -> bool {
+    match (message, origin) {
+        (WM_NCPOINTERDOWN, _) => !NativeNonClientPressTarget {
+            hit: ((wparam >> 16) & 0xffff) as u32,
+        }
+        .is_button(),
+        (WM_NCLBUTTONDOWN, NativeMouseOrigin::PointerPromotion) => {
+            NativeNonClientPressTarget { hit: wparam as u32 }.is_button()
+        }
+        (_, NativeMouseOrigin::PointerPromotion) => false,
+        (_, NativeMouseOrigin::Ordinary) => true,
+    }
+}
+
+fn native_non_client_start(message: u32, wparam: usize) -> Option<(NativePointerSource, u32)> {
     match message {
         WM_NCPOINTERDOWN => Some((
             NativePointerSource::Pointer((wparam & 0xffff) as u64),
             ((wparam >> 16) & 0xffff) as u32,
         )),
-        WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK if origin == NativeMouseOrigin::Ordinary => {
-            Some((NativePointerSource::Mouse, wparam as u32))
-        }
+        WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK => Some((NativePointerSource::Mouse, wparam as u32)),
         _ => None,
     }
 }
@@ -5970,6 +5997,12 @@ fn native_detached_message_with_origin(
     dispatch: NativeDetachedDispatch,
     origin: NativeMouseOrigin,
 ) {
+    // A subclass invocation keeps its captured origin through DefSubclassProc.
+    // Only the hook has no call token and supplies the message-source hint.
+    let origin = match dispatch {
+        NativeDetachedDispatch::Subclass(call) => call.origin,
+        NativeDetachedDispatch::Hook => origin,
+    };
     #[cfg(feature = "dev-tools")]
     let _probe_trace = native_detached_probe::MessageTrace::begin(
         hwnd,
@@ -5982,9 +6015,7 @@ fn native_detached_message_with_origin(
         },
         &format!("dispatch={dispatch:?} origin={origin:?}"),
     );
-    if origin == NativeMouseOrigin::PointerPromotion {
-        // The raw pointer owner receives its own Up/cancellation. None of a
-        // promoted NC mouse sequence may mutate an independent mouse owner.
+    if !native_detached_message_is_owned(message, wparam, origin) {
         return;
     }
     let pointer_cancelled = native_pointer_cancelled(message, wparam);
@@ -5992,7 +6023,7 @@ fn native_detached_message_with_origin(
         NativeDetachedDispatch::Subclass(call) => Some(call),
         NativeDetachedDispatch::Hook => None,
     };
-    let non_client_start = call.and_then(|_| native_non_client_start(message, wparam, origin));
+    let non_client_start = call.and_then(|_| native_non_client_start(message, wparam));
     let Ok(mut guard) = state().lock() else {
         return;
     };
@@ -6046,8 +6077,8 @@ fn native_detached_message_with_origin(
         return;
     };
 
-    // Raw NC pointer input owns touch/pen operations. Promoted NC mouse input
-    // is never another producer, including after raw cancellation or retirement.
+    // The admission above chooses raw pointers for non-buttons and the OS's
+    // promoted mouse Down for buttons. They never both own the same operation.
     if let Some((source, hit)) = non_client_start {
         if matches!(gesture, NativeDetachedGesture::NonClient { .. }) {
             return;
@@ -6265,6 +6296,9 @@ fn finish_native_detached_dispatch(hwnd: u64, subclass_id: usize, call: NativeDe
         "finish",
         &format!("returned_call={call:?}"),
     );
+    if !native_detached_message_is_owned(message, call.wparam, call.origin) {
+        return;
+    }
     let Ok(mut guard) = state().lock() else {
         return;
     };
@@ -6447,9 +6481,9 @@ unsafe extern "system" fn main_key_input_subclass_proc(
     _ref_data: usize,
 ) -> LRESULT {
     let hwnd_raw = hwnd.0 as u64;
-    let call = NativeDetachedCall::new(msg, wparam.0);
     let native_interesting = native_detached_message_interesting(msg);
     let native_origin = native_mouse_origin(msg);
+    let call = NativeDetachedCall::new(msg, wparam.0, native_origin);
     if native_interesting {
         native_detached_message_with_origin(
             hwnd_raw,
@@ -6482,9 +6516,7 @@ unsafe extern "system" fn main_key_input_subclass_proc(
         guard.unregister_subclass(hwnd_raw, id);
     }
     let result = unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
-    if (native_interesting && native_origin != NativeMouseOrigin::PointerPromotion)
-        || msg == WM_NCDESTROY
-    {
+    if native_interesting || msg == WM_NCDESTROY {
         finish_native_detached_dispatch(hwnd_raw, id, call);
         dispatch_native_detached_input();
     }
@@ -6555,7 +6587,17 @@ mod native_detached_tests {
         }
 
         fn message(&self, message: u32, wparam: usize, lparam: isize) -> NativeDetachedCall {
-            let call = test_native_call(self.hwnd, self.subclass, message, wparam);
+            self.message_with_origin(message, wparam, lparam, NativeMouseOrigin::Ordinary)
+        }
+
+        fn message_with_origin(
+            &self,
+            message: u32,
+            wparam: usize,
+            lparam: isize,
+            origin: NativeMouseOrigin,
+        ) -> NativeDetachedCall {
+            let call = test_native_call(self.hwnd, self.subclass, message, wparam, origin);
             native_detached_message_with_origin(
                 self.hwnd,
                 Some(self.subclass),
@@ -6563,28 +6605,24 @@ mod native_detached_tests {
                 wparam,
                 lparam,
                 NativeDetachedDispatch::Subclass(call),
-                NativeMouseOrigin::Ordinary,
+                origin,
             );
             dispatch_native_detached_input();
             call
         }
 
         fn promoted_mouse(&self, message: u32) {
-            native_detached_message_with_origin(
-                self.hwnd,
-                Some(self.subclass),
+            self.message_with_origin(
                 message,
                 HTCAPTION as usize,
                 0,
-                NativeDetachedDispatch::Subclass(test_native_call(
-                    self.hwnd,
-                    self.subclass,
-                    message,
-                    HTCAPTION as usize,
-                )),
                 NativeMouseOrigin::PointerPromotion,
             );
-            dispatch_native_detached_input();
+        }
+
+        fn finish_promoted_call(&self, call: NativeDetachedCall) {
+            assert_eq!(call.origin, NativeMouseOrigin::PointerPromotion);
+            self.finish_call(call);
         }
 
         fn canonical(&self, input: NormalizedPointerInput) -> Option<egui::Id> {
@@ -7433,18 +7471,216 @@ mod native_detached_tests {
     }
 
     #[test]
+    fn realmachine57_touch_button_observed_maximize_restore_sequence() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm57-touch-observed", 0x7957);
+        for command in [SC_MAXIMIZE, SC_RESTORE] {
+            let pointer = (HTMAXBUTTON as usize) << 16 | 2;
+            let down = f.message(WM_NCPOINTERDOWN, pointer, 0);
+            f.finish_call(down);
+            assert!(
+                f.take().is_empty(),
+                "raw Down does not own OS button selection"
+            );
+            let up = f.message(WM_NCPOINTERUP, pointer, 0);
+            f.finish_call(up);
+            assert!(
+                f.take().is_empty(),
+                "raw Up does not produce a button outcome"
+            );
+            let promoted = f.message_with_origin(
+                WM_NCLBUTTONDOWN,
+                HTMAXBUTTON as usize,
+                0,
+                NativeMouseOrigin::PointerPromotion,
+            );
+            f.message(WM_CAPTURECHANGED, 0, 0);
+            let sc = f.message(WM_SYSCOMMAND, command as usize, 0);
+            f.finish_call(sc);
+            assert!(
+                f.take().is_empty(),
+                "SC return is not the owning Down return"
+            );
+            f.finish_promoted_call(promoted);
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Completed
+                )]
+            );
+            let tail = f.message_with_origin(
+                WM_NCLBUTTONUP,
+                HTMAXBUTTON as usize,
+                0,
+                NativeMouseOrigin::PointerPromotion,
+            );
+            f.finish_promoted_call(tail);
+            assert!(f.take().is_empty(), "promotion yields one outcome only");
+        }
+    }
+
+    #[test]
+    fn realmachine57_touch_button_promoted_call_is_the_only_button_owner() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm57-touch-owner", 0x7958);
+        for (hit, command) in [
+            (HTMAXBUTTON, SC_MAXIMIZE),
+            (HTMINBUTTON, SC_MINIMIZE),
+            (HTHELP, SC_CONTEXTHELP),
+        ] {
+            // There is deliberately no raw-to-mouse correlation or pending.
+            let down = f.message_with_origin(
+                WM_NCLBUTTONDOWN,
+                hit as usize,
+                0,
+                NativeMouseOrigin::PointerPromotion,
+            );
+            let nested = f.message_with_origin(
+                WM_NCLBUTTONDOWN,
+                hit as usize,
+                0,
+                NativeMouseOrigin::PointerPromotion,
+            );
+            f.finish_promoted_call(nested);
+            assert!(
+                f.take().is_empty(),
+                "a nested Down cannot end the owning call"
+            );
+            let sc = f.message(WM_SYSCOMMAND, command as usize, 0);
+            f.finish_call(sc);
+            assert!(f.take().is_empty());
+            f.finish_promoted_call(down);
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Completed
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn realmachine57_touch_button_without_promotion_or_without_command() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm57-touch-no-selection", 0x7959);
+        let down = f.message(WM_NCPOINTERDOWN, (HTMAXBUTTON as usize) << 16 | 2, 0);
+        f.finish_call(down);
+        let up = f.message(WM_NCPOINTERUP, (HTCAPTION as usize) << 16 | 2, 0);
+        f.finish_call(up);
+        assert!(
+            f.take().is_empty(),
+            "no promotion means no button gesture or outcome"
+        );
+        let down = f.message_with_origin(
+            WM_NCLBUTTONDOWN,
+            HTMAXBUTTON as usize,
+            0,
+            NativeMouseOrigin::PointerPromotion,
+        );
+        f.message(WM_CAPTURECHANGED, 0, 0);
+        f.finish_promoted_call(down);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::CaptionButtonOutside)
+            )]
+        );
+    }
+
+    #[test]
+    fn realmachine57_touch_raw_button_leaves_client_operation_unchanged() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm57-touch-client-owner", 0x7961);
+        let operation = f
+            .canonical(NormalizedPointerInput::Pressed(PointerInputSource::Mouse))
+            .unwrap();
+        assert_eq!(
+            f.take_client_inputs(),
+            vec![NativeClientInputBoundary {
+                operation,
+                boundary: NativeClientBoundary::Pressed
+            }]
+        );
+        for hit in [HTMINBUTTON, HTMAXBUTTON, HTHELP] {
+            let raw = f.message(WM_NCPOINTERDOWN, (hit as usize) << 16 | 9, 0);
+            f.finish_call(raw);
+            let up = f.message(WM_NCPOINTERUP, (hit as usize) << 16 | 9, 0);
+            f.finish_call(up);
+            assert!(
+                f.take().is_empty(),
+                "a raw button must not cancel or replace the client owner"
+            );
+        }
+        // Released appends the operation boundary; only Pressed returns the
+        // RawInput correlation marker. Inspect the actual delivered owner.
+        let _ = f.canonical(NormalizedPointerInput::Released(PointerInputSource::Mouse));
+        assert_eq!(
+            f.take_client_inputs(),
+            vec![NativeClientInputBoundary {
+                operation,
+                boundary: NativeClientBoundary::Released
+            }]
+        );
+    }
+
+    #[test]
+    fn realmachine57_touch_caption_and_close_keep_raw_owner_without_second_outcome() {
+        use windows::Win32::UI::WindowsAndMessaging::SC_MOVE;
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm57-touch-non-button", 0x7960);
+        for (hit, command, expected) in [
+            (HTCAPTION, SC_MOVE | 2, NativeNonClientOutcome::Completed),
+            (HTCLOSE, SC_CLOSE, NativeNonClientOutcome::CloseOwned),
+        ] {
+            let raw_down = f.message(WM_NCPOINTERDOWN, (hit as usize) << 16 | 5, 0);
+            f.finish_call(raw_down);
+            if hit == HTCAPTION {
+                assert!(f.take().is_empty());
+            } else {
+                assert_eq!(
+                    f.take(),
+                    vec![NativeDetachedInputEventKind::NonClient(expected)]
+                );
+            }
+            let raw_up = f.message(WM_NCPOINTERUP, (hit as usize) << 16 | 5, 0);
+            f.finish_call(raw_up);
+            if hit == HTCAPTION {
+                assert_eq!(
+                    f.take(),
+                    vec![NativeDetachedInputEventKind::NonClient(expected)]
+                );
+            } else {
+                assert!(f.take().is_empty());
+            }
+            let mouse_down = f.message_with_origin(
+                WM_NCLBUTTONDOWN,
+                hit as usize,
+                0,
+                NativeMouseOrigin::PointerPromotion,
+            );
+            let sc = f.message(WM_SYSCOMMAND, command as usize, 0);
+            f.finish_call(sc);
+            f.finish_promoted_call(mouse_down);
+            assert!(
+                f.take().is_empty(),
+                "caption/close promotion cannot produce another outcome"
+            );
+        }
+    }
+
+    #[test]
     fn realmachine57_reentrant_pointer_down_returns_only_its_own_call() {
         let _serial = lock_test_input();
         let f = Fixture::new("rm57-nested-pointer", 0x7857);
-        let outer = f.message(WM_NCPOINTERDOWN, (HTMAXBUTTON as usize) << 16 | 7, 0);
-        let nested = f.message(WM_NCPOINTERDOWN, (HTCAPTION as usize) << 16 | 8, 0);
+        let outer = f.message(WM_NCPOINTERDOWN, (HTCAPTION as usize) << 16 | 7, 0);
+        let nested = f.message(WM_NCPOINTERDOWN, (HTLEFT as usize) << 16 | 8, 0);
         f.finish_call(nested);
         assert!(
             f.take().is_empty(),
             "contact 8 did not start contact 7's operation"
         );
-        f.message(WM_SYSCOMMAND, SC_MAXIMIZE as usize, 0);
-        f.finish(WM_SYSCOMMAND);
+        let up = f.message(WM_NCPOINTERUP, 7, 0);
+        f.finish_call(up);
         assert!(f.take().is_empty());
         f.finish_call(outer);
         assert_eq!(
@@ -7759,33 +7995,23 @@ mod native_detached_tests {
     }
 
     #[test]
-    fn realmachine57_caption_button_raw_committed_action_finishes_at_down_return() {
-        use windows::Win32::UI::WindowsAndMessaging::SC_MINIMIZE;
+    fn realmachine57_caption_button_raw_calls_cannot_commit_without_promotion() {
         let _serial = lock_test_input();
-        let f = Fixture::new("rm55-button-raw-commit", 0x7574);
+        let f = Fixture::new("rm57-raw-button-no-owner", 0x7574);
         let pointer = (HTMINBUTTON as usize) << 16 | 7;
-        f.message(WM_NCPOINTERDOWN, pointer, 0);
-        f.message(WM_NCPOINTERUP, pointer, 0);
+        let down = f.message(WM_NCPOINTERDOWN, pointer, 0);
+        let up = f.message(WM_NCPOINTERUP, pointer, 0);
         f.message(WM_POINTERCAPTURECHANGED, 7, 0);
-        f.message(WM_SYSCOMMAND, SC_MINIMIZE as usize, 0);
+        let sc = f.message(WM_SYSCOMMAND, SC_MINIMIZE as usize, 0);
         f.message(WM_KILLFOCUS, 0, 0);
         f.message(WM_CAPTURECHANGED, 0, 0);
-        f.finish(WM_KILLFOCUS);
-        f.finish(WM_SYSCOMMAND);
-        f.finish(WM_NCPOINTERUP);
+        f.finish_call(sc);
+        f.finish_call(up);
+        f.finish_call(down);
         assert!(
             f.take().is_empty(),
-            "the raw Down native call still owns the input"
+            "raw button messages never own or commit a button gesture"
         );
-        f.finish(WM_NCPOINTERDOWN);
-        assert_eq!(
-            f.take(),
-            vec![NativeDetachedInputEventKind::NonClient(
-                NativeNonClientOutcome::Completed
-            )]
-        );
-        f.finish(WM_NCPOINTERUP);
-        assert!(f.take().is_empty());
     }
 
     #[test]
@@ -7975,65 +8201,34 @@ mod native_detached_tests {
     }
 
     #[test]
-    fn native_detached_raw_caption_button_tracks_only_own_pointer_target() {
+    fn native_detached_raw_caption_button_leaves_other_pointer_owner_unchanged() {
         let _serial = lock_test_input();
-        let f = Fixture::new("native-pointer-button-out-back", 0x724);
-        let point = screen_point(300, 25);
-        let pointer = |hit: u32, id: usize| (hit as usize) << 16 | id;
-        f.message(WM_NCPOINTERDOWN, pointer(HTMAXBUTTON, 7), point);
-        observe_native_detached_message(f.hwnd, WM_NCPOINTERUPDATE, pointer(HTCAPTION, 8), point);
-        f.message(WM_NCPOINTERUP, pointer(HTMAXBUTTON, 7), point);
-        f.message(WM_SYSCOMMAND, SC_MAXIMIZE as usize, 0);
-        f.finish(WM_NCPOINTERDOWN);
-        assert_eq!(
-            f.take(),
-            vec![NativeDetachedInputEventKind::NonClient(
-                NativeNonClientOutcome::Completed
-            )],
-            "another contact cannot cancel this button"
-        );
-        f.message(WM_NCPOINTERDOWN, pointer(HTMAXBUTTON, 7), point);
-        f.finish(WM_NCPOINTERDOWN);
-        assert_eq!(
-            f.take(),
-            vec![NativeDetachedInputEventKind::NonClient(
-                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::CaptionButtonOutside)
-            )],
-            "a pointer button never waits beyond its Down call"
-        );
-        observe_native_detached_message(f.hwnd, WM_NCPOINTERUPDATE, pointer(HTCAPTION, 7), point);
-        f.message(WM_NCPOINTERUP, pointer(HTMAXBUTTON, 7), point);
-        f.message(WM_SYSCOMMAND, SC_MAXIMIZE as usize, 0);
-        f.finish(WM_SYSCOMMAND);
-        assert!(
-            f.take().is_empty(),
-            "late raw tails cannot revive the operation"
-        );
-        f.message(WM_NCPOINTERDOWN, pointer(HTMINBUTTON, 7), point);
-        observe_native_detached_message(f.hwnd, WM_NCPOINTERUP, pointer(HTCAPTION, 7), point);
-        f.finish(WM_NCPOINTERDOWN);
-        assert_eq!(
-            f.take(),
-            vec![NativeDetachedInputEventKind::NonClient(
-                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::CaptionButtonOutside)
-            )]
-        );
-
-        f.message(WM_NCPOINTERDOWN, pointer(HTCLOSE, 7), point);
-        observe_native_detached_message(
-            f.hwnd,
-            WM_NCPOINTERUPDATE,
-            pointer(HTCAPTION, 7),
-            screen_point(350, 25),
-        );
-        f.finish(WM_NCPOINTERDOWN);
-        assert_eq!(
-            f.take(),
-            vec![NativeDetachedInputEventKind::NonClient(
-                NativeNonClientOutcome::CloseOwned
-            )],
-            "the activation owner never consumes the OS close operation"
-        );
+        let f = Fixture::new("native-pointer-button-pass-through", 0x724);
+        for hit in [HTMAXBUTTON, HTMINBUTTON, HTHELP] {
+            let owner = f.message(WM_NCPOINTERDOWN, (HTCAPTION as usize) << 16 | 7, 0);
+            let raw_button = f.message(WM_NCPOINTERDOWN, (hit as usize) << 16 | 8, 0);
+            f.finish_call(raw_button);
+            let other_up = f.message(WM_NCPOINTERUP, (hit as usize) << 16 | 8, 0);
+            f.finish_call(other_up);
+            assert!(
+                f.take().is_empty(),
+                "raw button calls cannot end another pointer's owner"
+            );
+            // Caption may end over a button. Up's hit must not select ownership.
+            let own_up = f.message(WM_NCPOINTERUP, (hit as usize) << 16 | 7, 0);
+            f.finish_call(own_up);
+            assert!(
+                f.take().is_empty(),
+                "the original Down call still owns the return"
+            );
+            f.finish_call(owner);
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Completed
+                )]
+            );
+        }
     }
 
     #[test]

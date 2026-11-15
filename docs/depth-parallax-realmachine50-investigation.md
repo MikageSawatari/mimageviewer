@@ -1571,7 +1571,7 @@ hit-test注入用のproduction seamとprobeのrelease_hit traceを撤去する�
 ボタンはReleasedにもAwaitingReleaseにも移らない。これらの共用enum variantは
 caption／resizeなどの非ボタン操作が使うため残す。
 
-**touch／pen（列は未採取）。** WM_NCPOINTERDOWNも同じ一致SCだけを採用し、その押下call返却で完結させる。
+**初回のtouch／penの仮定（後述のタッチ実測で置換）。** WM_NCPOINTERDOWNも同じ一致SCだけを採用し、その押下call返却で完結させる。
 押下返却後のUpやSCを待つ状態は作らない。raw pointerがOSの追跡を同期実行するのか、
 昇格mouseで実行するのかは実機未確認。昇格mouseを別ownerにしない既存規則は維持する。
 
@@ -1766,6 +1766,99 @@ exe＋DLLは151,274,512 bytes。PE／hash記録は `target/rm57r-pe-imports.json
 本書と `docs/detached-rework-plan.md` の5件。vendor／App field／通常配布物は変更しない。
 未確認はpointerの実列・昇格、修正後の実OS動作とautoの実行。P2-3のkeyboard入口は未対応。
 製品／probe／auto起動、全件gate、build-dev、commit／pushは行わない。
+
+#### タッチ実測: buttonの所有者を昇格mouseへ統一（2026-11-15）
+
+基点は `b325cc1ed`（2回目の独立レビューACCEPT）。観測者は利用者、メインPCのtouch panelで
+道具の手動モードを操作した。根拠は `target/rm56-native-detached-probe/touch.log`（6,488行）、
+手順は `C:/miv-subpc/steps-767-touch-probe.md`。窓が実際に最大化／復元した等の目視報告は未着。
+以下はログから読める通知列であり、目視結果の代用とはしない。
+
+| 操作／時刻 | ログ上の列と旧実装の結果 |
+| --- | --- |
+| 最大化button tap、約8.865s（4147行付近から） | raw NCPOINTERDOWN（HTMAXBUTTON、id=2）が約20msで返却しCaptionButtonOutside → raw Up → touch由来の昇格NCLBUTTONDOWN（hit=9）→ call内にCaptureChangedとSC_MAXIMIZE |
+| 復元button tap、約16.615s | 同じraw→昇格列でSC_RESTORE |
+| 指を外へずらす操作、約22.08s | client POINTERDOWN／UP。SC・outcomeなし |
+| caption tap、約27.31s | raw NCPOINTERDOWN（HTCAPTION）→ raw Up返却でCompleted → 昇格Down内のSC_MOVE、追加outcomeなし |
+| × tap、約31.06s | raw NCPOINTERDOWN（HTCLOSE）でCloseOwned → 昇格Down内のSC_CLOSE、追加outcomeなし |
+
+raw NCPOINTERDOWNの既定処理内のNCHITTESTもHTCAPTIONを返しており、buttonのrelease hit再照会へは戻さない。
+**P2-2の設計上の残りを閉じる。** タッチbuttonはraw pointerのDownでOSの選択が完了するという
+旧仮定が実測で否定された。HTMINBUTTON／HTMAXBUTTON／HTHELPに限り、OSが選択を行う
+昇格mouseのWM_NCLBUTTONDOWNを唯一のownerにする。
+
+- raw NC pointer Downがbutton hitなら、bindingの取消／target差替えより前に対象外とする。
+  raw Down自身の返却も対象外で、gestureもoutcomeも作らない。
+- 昇格mouseのNCLBUTTONDOWNがbutton hitなら、既存 `NativePointerSource::Mouse` のownerを開始する。
+  call内の一致SCだけで確定し、そのcall tokenの返却だけで終端する。SC無しならCaptionButtonOutside。
+- invocationの既存token `NativeDetachedCall` にcaptured `NativeMouseOrigin` を保持する。
+  subclassのdispatchとfinishはこの不変の出自と同じ純粋な所有判定を使う。
+  native callから戻った時点の入力元を再取得しない。
+- raw Upはhitだけで除外しない。captionで始め、button上で離した場合も、既存pointer IDのownerへ終端を返す。
+- caption／resize／×はraw ownerを維持し、昇格mouseのDown／DoubleClick／Move／Upは別producerにしない。
+  buttonの昇格でも許可する開始はNCLBUTTONDOWNだけ。clientの経路は変更しない。
+- 昇格が無ければbuttonのgesture自体が無い。rawと昇格を結ぶpending、相関、時間窓、retry、App fieldは追加しない。
+
+「昇格mouseは別producerにならない」という従来規則のbuttonだけを、
+「OSがbuttonを選ぶ唯一のcallが所有する」へ置き換えた（BA-7）。
+mouseとtouchのbuttonが同じ既存owner／確定点を使うので、raw／昇格の二重完了や待合せを作らない。
+ペンは未採取で、タッチと同じ昇格経路を使うと仮定して同じ規則を適用する。
+タッチの修正後の実機確認も未実施。keyboard最大化の入口不足（P2-3）は従来どおり別件のまま残す。
+
+**意味を更新したpointerテスト（3件）。**
+
+| テスト | 更新内容 |
+| --- | --- |
+| `realmachine57_reentrant_pointer_down_returns_only_its_own_call` | raw buttonをownerにする前提を外し、raw caption／resize＋own Upで元Downの返却まで未終端を検査。pointer IDとcall identityの保護を維持 |
+| `realmachine57_caption_button_raw_committed_action_finishes_at_down_return` | `realmachine57_caption_button_raw_calls_cannot_commit_without_promotion`へ変更。raw call内にSCがあってもbuttonのownerを作らない |
+| `native_detached_raw_caption_button_tracks_only_own_pointer_target` | `native_detached_raw_caption_button_leaves_other_pointer_owner_unchanged`へ変更。他pointerのraw caption ownerをbutton Down／Upが変更しないこと、captionからbutton上へのreleaseは終わることを検査 |
+
+実測列とその所有規則を検査する新3件は旧コードで3実行／3失敗、nextest／run-heavy exit 100を確認した。
+commandは `cargo nextest run -p mimageviewer --lib -E 'test(/realmachine57_touch_button/)' --no-fail-fast --test-threads 6`、
+証跡は `target/rm57t-red.log`。raw返却での不要な取消と、昇格Downだけの列でCompletedが無いことを検出した。
+新たなcaption／closeの実測対照も加え、昇格後にoutcomeが二重にならないことを検査する。
+
+最終検証は下表へ記録した。道具／auto／製品はこの作業で起動していない。
+
+初回の修正後焦点ビルドはtest helper 1箇所のorigin引数更新漏れでcompile exit 101、テスト未実行
+（`target/rm57t-focused.log`）。引数を補い、最終gateを実行した。
+追加client対照の初回は23実行／22成功／1失敗、exit 100
+（`target/rm57t-focused-before-client-api-fix.log`）。Release APIの戻り値にもoperation markerを
+期待したテスト側の誤りで、markerを返すのはPressedだけだった。製品コードは変えず、
+配送された `NativeClientInputBoundary::Released` が元のoperation IDを持つという既存契約で検査する。
+独立source review（Sol / xhigh）はBA-7の構造修正としてACCEPT、追加P1／P2なし。
+
+最終gateは指定run-heavy、Owner `codex/767-rm57-touch`、gate同士は直列。
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/realmachine57_|caption_button/)' --no-fail-fast --test-threads 6
+cargo nextest run -p mimageviewer --lib -E 'test(/native_detached|non_client|caption|detached_activation|realmachine55_|realmachine57_|parked|native_video/)' --no-fail-fast --test-threads 6
+cargo test -p mimageviewer --features dev-tools --bin native_detached_probe -- --test-threads 6
+cargo build -p mimageviewer --features dev-tools --bin native_detached_probe
+cargo check -p mimageviewer --bin mimageviewer-core
+cargo fmt
+```
+
+| 検証 | 件数／exit code | 証跡 |
+| --- | --- | --- |
+| 旧コードでの新規3件 | 3実行／3失敗、exit 100 | `target/rm57t-red.log` |
+| 最終焦点 | 23実行／23成功、exit 0 | `target/rm57t-focused-final.log` |
+| 指定回帰 | 674実行／674成功、exit 0 | `target/rm57t-regression.log` |
+| probe pure unit | 7実行／7成功、exit 0 | `target/rm57t-probe-unit.log` |
+| probe build | 1 exe、exit 0 | `target/rm57t-probe-build.log` |
+| core check | 1 core対象、exit 0 | `target/rm57t-check.log` |
+| 最後の引数なしfmt | exit 0 | `target/rm57t-fmt.log` |
+
+run-heavyはlock領域／G: TEMPへの書込不可の警告に従い、低優先度・6並列で続行した。
+コピー用 `target/rm56-native-detached-probe/native_detached_probe.exe` を新buildへ差替え、
+build出力とのSHA256一致を確認した。33,465,856 bytes、SHA256は
+`ac3d99e98c55bfee58dfc82a7b9e4200d19be451b30779d4a854e743ef4bfc84`。
+exe＋6 DLLは151,279,120 bytes。6 DLLは旧manifestのhashのまま、元touch.logも変更していない。
+元touch.logのSHA256は `cd4e888c2f7c82978cda37769786fb0a5b08f15ed4528a25f0db4815f49cd857`。
+PE記録 `target/rm57t-pe-imports.json`、同梱manifest／READMEを更新した。
+
+変更ファイルは `src/key_input.rs` と本書、`docs/detached-rework-plan.md` の3件。
+App field／vendor／通常配布物は変更しない。全件gate、build-dev、commit／pushは行っていない。
 
 ## 6. 診断（初回調査の案、A実装で導入）
 

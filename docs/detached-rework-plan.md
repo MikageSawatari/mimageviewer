@@ -1460,18 +1460,26 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ### 2026-11-15: §1.767 サブPC依頼57 — caption buttonの確定点を一致SCに統一
 
+利用者のメインPC touch.logでP2-2の実列を採取。buttonだけraw NC pointerをownerにせず、
+OSが動作を選ぶ昇格mouse NCLBUTTONDOWNへ既存Mouse owner／一致SC／同call返却を統一した。
+既存call tokenにcaptured originを保持し、dispatch／finishを同じ所有判定へそろえる（BA-7）。
+rawとの相関pendingやApp fieldは作らず、caption／resize／×／clientは維持する。
+設計担当と独立Sol / xhighが構造修正として合意。ペンの昇格と修正後実機は未確認。
+詳細・テストは調査書§5.11末尾のタッチ実測記録へ追記する。
+
 独立レビュー（e81ac0d94基準、Sol / xhigh、REJECT）のP2-1／P2-4を反映。
 既存native scopeがsubclass invocation tokenを所有し、開始したDown／claimしたUp・ExitSizeMoveの
 返却だけを終端にする（button／caption／resizeの再入を同じ所有で解決、BA-7）。
 probe autoは送信直前のforeground／前面thread capture／全mouse button未押下も要求する。
-pointer列の未採取とkeyboard最大化の入口不足は設計担当決定により未対応として記録する。
+初回独立レビュー対応時点ではpointer列の未採取とkeyboard最大化の入口不足を設計担当決定で未対応とした。
+touch列は上記の利用者記録で採取済みとなり、buttonの所有を更新した。keyboard入口は未対応のまま。
 
 依頼57の実OS列で、release位置のWM_NCHITTESTがOSのbutton選択と一致しないことを確認した
 （観測者: サブPC担当）。MIN／MAX／HELPは同じ押下native call内の一致WM_SYSCOMMANDだけで確定し、
 押下call返却だけで終端する。buttonの位置照合とrelease待ちを撤去し、block／retireと
 CloseOwned／caption／resize／clientの所有は維持する。BA-7の確定点の構造修正として
 設計担当と独立Sol / xhighが合意。probeのautoも事前hit推測を外し、実押下のhitを確認する。
-詳細・検証・pointer実機未確認は[調査 §5.11](depth-parallax-realmachine50-investigation.md#511-依頼57-caption-buttonの確定をosの一致コマンドへ統一2026-11-15)へ記録する。
+詳細・検証・初回時点のpointer未確認と後続のタッチ実測は[調査 §5.11](depth-parallax-realmachine50-investigation.md#511-依頼57-caption-buttonの確定をosの一致コマンドへ統一2026-11-15)へ記録する。
 
 ### 2026-11-15: §1.767 サブPC依頼56 — 最大化buttonの理由付き診断と独立probe
 
