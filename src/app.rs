@@ -23178,27 +23178,23 @@ impl App {
                 source_dims,
                 layout_dims,
                 from_edit_preview,
+                auto_material,
                 tex,
                 ..
             } = state
             {
-                let listing_dims = if *from_edit_preview {
-                    *source_dims
-                } else {
-                    (*layout_dims).or(*source_dims)
-                };
-                let ratio = match listing_dims {
-                    Some((sw, sh)) if sw > 0 => sh as f32 / sw as f32,
-                    _ => {
-                        // source_dims が無くても、テクスチャ寸法から比率を拾える
-                        // (アスペクト保持リサイズ済みなので比率は保たれる)
-                        let size = tex.size();
-                        if size[0] == 0 {
-                            continue;
-                        }
-                        size[1] as f32 / size[0] as f32
-                    }
-                };
+                let size = tex.size();
+                let view = crate::cover_auto_material::auto_crop_view(
+                    source_dims.unwrap_or((size[0] as u32, size[1] as u32)),
+                    if *from_edit_preview {
+                        None
+                    } else {
+                        *layout_dims
+                    },
+                    *auto_material,
+                    crate::rotation_db::Rotation::None,
+                );
+                let ratio = view.displayed_size.y / view.displayed_size.x;
                 if ratio > 0.0 && ratio.is_finite() {
                     self.auto_aspect.samples.insert(idx, ratio);
                 }
@@ -23394,8 +23390,8 @@ impl App {
                 if entry.mtime != req.mtime || entry.file_size != req.file_size {
                     continue;
                 }
-                let ratio = match entry.source_dims {
-                    Some((w, h)) if w > 0 => h as f32 / w as f32,
+                let dims = match entry.source_dims {
+                    Some((w, h)) if w > 0 => (w, h),
                     Some(_) => continue,
                     None if probe_budget > 0 => {
                         probe_budget -= 1;
@@ -23407,10 +23403,17 @@ impl App {
                         if w == 0 {
                             continue;
                         }
-                        h as f32 / w as f32
+                        (w, h)
                     }
                     None => continue,
                 };
+                let view = crate::cover_auto_material::auto_crop_view(
+                    dims,
+                    entry.layout_dims,
+                    entry.auto_material,
+                    crate::rotation_db::Rotation::None,
+                );
+                let ratio = view.displayed_size.y / view.displayed_size.x;
                 staged.push((idx, ratio));
             }
         } // ← read guard が落ちる
@@ -43533,6 +43536,7 @@ impl App {
                 entry.layout_dims,
                 &entry.jpeg_data,
                 &entry.cover,
+                entry.auto_material,
             ) {
                 Ok(b) => b,
                 Err(e) => {
@@ -43619,6 +43623,7 @@ impl App {
                 entry.layout_dims,
                 &entry.jpeg_data,
                 &entry.cover,
+                entry.auto_material,
             );
             crate::perf::event("nav", "virtual_writeback", Some(&parent_key), 0, &[]);
         }
@@ -46614,6 +46619,7 @@ impl App {
                 None,
                 &webp,
                 &cover,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             ) {
                 Ok(true) => {}
                 Ok(false) => {
@@ -46641,6 +46647,7 @@ impl App {
                 map.insert(
                     pinned_key.clone(),
                     crate::catalog::CacheEntry {
+                        auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                         mtime: resolved.mtime,
                         file_size: resolved.file_size,
                         jpeg_data: webp,
@@ -46695,6 +46702,7 @@ impl App {
                             .map(|pin| pin.thumb_webp)
                             .filter(|b| !b.is_empty())?;
                         Some(crate::catalog::CacheEntry {
+                            auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                             mtime: 0,
                             file_size: 0,
                             jpeg_data: webp,
@@ -46928,6 +46936,7 @@ impl App {
                 entry.source_dims,
                 &entry.jpeg_data,
                 &entry.cover,
+                entry.auto_material,
             ) {
                 Ok(true) => {
                     if let Ok(mut map) = cache_map.write() {
@@ -57233,6 +57242,7 @@ impl App {
             let pixels = msg.into_pixels().expect("owner queues only image messages");
             let crate::thumb_loader::ThumbPixels {
                 cover,
+                auto_material,
                 image: color_image,
                 origin,
                 from_edit_preview,
@@ -57323,6 +57333,7 @@ impl App {
                     cover: crate::cover_source_scope::LoadedCoverIdentity::from_material(
                         cover, scope,
                     ),
+                    auto_material,
                     display_basis,
                     tex: handle,
                     origin,
@@ -57366,16 +57377,13 @@ impl App {
                         self.settings.thumb_container_icon_kinds,
                     )
                 {
-                    let listing_dims = if from_edit_preview {
-                        source_dims
-                    } else {
-                        layout_dims.or(source_dims)
-                    };
-                    let ratio = match listing_dims {
-                        Some((sw, sh)) if sw > 0 => sh as f32 / sw as f32,
-                        _ if w > 0 => h as f32 / w as f32,
-                        _ => -1.0,
-                    };
+                    let view = crate::cover_auto_material::auto_crop_view(
+                        source_dims.unwrap_or((w as u32, h as u32)),
+                        if from_edit_preview { None } else { layout_dims },
+                        auto_material,
+                        crate::rotation_db::Rotation::None,
+                    );
+                    let ratio = view.displayed_size.y / view.displayed_size.x;
                     if ratio > 0.0 && ratio.is_finite() {
                         self.auto_aspect.samples.insert(i, ratio);
                     }
@@ -59110,6 +59118,8 @@ impl App {
                     from_edit_preview,
                     rendered_at_px,
                     source_dims,
+                    auto_material,
+                    tex,
                     ..
                 }) => {
                     // 1. キャッシュ由来 (品質アップグレード)
@@ -59122,11 +59132,37 @@ impl App {
                     // しない)。source で頭打ちにしないと永久に「解像度不足」判定が
                     // 続き、アイドル時に同じセルを毎サイクル re-enqueue する無限
                     // ループ (進捗バーが高速に左右を往復する原因) になる。
-                    let source_long_edge = source_dims.map(|(w, h)| w.max(h));
+                    let angle = self.grid_tile_rotation_memory(i);
+                    let source_long_edge = source_dims.map(|dims| {
+                        let (w, h) = crate::cover_auto_material::auto_crop_view(
+                            dims,
+                            None,
+                            *auto_material,
+                            angle,
+                        )
+                        .source_dims;
+                        w.max(h)
+                    });
+                    let effective_rendered_at_px = if matches!(
+                        auto_material,
+                        crate::cover_auto_material::AutoMaterial::Automatic(_)
+                    ) {
+                        let [w, h] = tex.size();
+                        let (w, h) = crate::cover_auto_material::auto_crop_view(
+                            (w as u32, h as u32),
+                            None,
+                            *auto_material,
+                            angle,
+                        )
+                        .source_dims;
+                        w.max(h)
+                    } else {
+                        *rendered_at_px
+                    };
                     let target_px = source_long_edge
                         .map(|src| src.min(current_display_px))
                         .unwrap_or(current_display_px);
-                    let undersized = (*rendered_at_px as u64) * 5 < (target_px as u64) * 4;
+                    let undersized = (effective_rendered_at_px as u64) * 5 < (target_px as u64) * 4;
                     let origin_needs_upgrade = match *origin {
                         crate::thumb_loader::ThumbLoadOrigin::UpgradeableCache => true,
                         crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
@@ -103053,12 +103089,15 @@ fn parent_row_for_item(
 
 /// Settings alone are used while preparing a new list; its previous mounted
 /// context (possibly Drive) must not affect the incoming cache namespace.
-fn configured_thumbnail_auto_crop(
+pub(crate) fn configured_thumbnail_auto_crop(
     settings: &crate::settings::Settings,
 ) -> Option<crate::cover_auto_crop::AutoCropIdentity> {
     settings
         .thumb_cover_auto_crop
-        .then(|| crate::cover_auto_crop::AutoCropIdentity::new(settings.default_reading_direction))
+        .then(|| crate::cover_auto_crop::AutoCropIdentity {
+            binding: settings.thumb_cover_auto_crop_binding,
+            folders: settings.thumb_cover_auto_crop_folders,
+        })
 }
 
 impl App {
@@ -104520,6 +104559,27 @@ pub(crate) fn draw_rotated_image_ex(
     free_rotation_rad: f32,
     center: egui::Pos2,
 ) {
+    draw_rotated_image_uv_ex(
+        painter,
+        texture_id,
+        rect,
+        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        rotation,
+        free_rotation_rad,
+        center,
+    );
+}
+
+/// Quarter-turn drawing over an unrotated source UV subrectangle.
+pub(crate) fn draw_rotated_image_uv_ex(
+    painter: &egui::Painter,
+    texture_id: egui::TextureId,
+    rect: egui::Rect,
+    uv: egui::Rect,
+    rotation: crate::rotation_db::Rotation,
+    free_rotation_rad: f32,
+    center: egui::Pos2,
+) {
     // UV 座標を回転に合わせて変換
     // 頂点順: 左上, 右上, 右下, 左下 (画面座標)
     let uvs = match rotation {
@@ -104549,6 +104609,7 @@ pub(crate) fn draw_rotated_image_ex(
         ],
     };
 
+    let uvs = uvs.map(|p| uv.min + p.to_vec2() * uv.size());
     let mut positions = [
         rect.left_top(),
         rect.right_top(),

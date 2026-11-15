@@ -1161,6 +1161,7 @@ mod tests {
                 Some((8, 8)),
                 &webp,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let bytes = engine
@@ -1210,6 +1211,7 @@ mod tests {
                 Some((8, 8)),
                 &webp,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let bytes = engine
@@ -1365,6 +1367,7 @@ mod tests {
                 &webp,
                 Some(&proof),
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         assert!(catalog.load_one(&key).unwrap().is_some());
@@ -1684,6 +1687,7 @@ mod tests {
                 Some((8, 8)),
                 &webp,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let second = engine

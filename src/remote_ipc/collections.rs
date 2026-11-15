@@ -2251,6 +2251,7 @@ mod tests {
                 Some((1200, 1800)),
                 b"a",
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         first_catalog
@@ -2263,6 +2264,7 @@ mod tests {
                 Some((1200, 1800)),
                 b"b",
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         drop(first_catalog);
@@ -2277,6 +2279,7 @@ mod tests {
                 Some((1800, 1200)),
                 b"wide",
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         second_catalog
@@ -2289,6 +2292,7 @@ mod tests {
                 Some((1200, 1800)),
                 b"c",
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         drop(second_catalog);
@@ -2392,6 +2396,7 @@ mod tests {
                 None,
                 &jpeg,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         catalog
@@ -2404,6 +2409,7 @@ mod tests {
                 Some((600, 800)),
                 b"thumb",
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         drop(catalog);

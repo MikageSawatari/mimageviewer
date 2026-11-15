@@ -220,6 +220,7 @@ mod section1452_book_cover_cache {
                         Some((8, 12)),
                         &webp,
                         &crate::cover_identity::CoverIdentity::Legacy,
+                        crate::cover_auto_material::AutoMaterial::NotAutomatic,
                     )
                     .unwrap();
                 let catalog = crate::catalog::CatalogDb::open(&cache_dir, &path).unwrap();
@@ -293,7 +294,15 @@ mod section1452_book_cover_cache {
             crate::adjustment_db::zip_entry_key(&zip_path, "root.png"),
         );
         parent_db
-            .save_thumb_bytes(parent_key, 1, 2, None, &webp, &cover)
+            .save_thumb_bytes(
+                parent_key,
+                1,
+                2,
+                None,
+                &webp,
+                &cover,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
+            )
             .unwrap();
         // The projected first row differs from the source page of the parent's pixels.
         let target_key = "chapter/page.png";
@@ -465,6 +474,7 @@ mod section1452_book_cover_cache {
                         Some((4, 6)),
                         &webp,
                         &crate::cover_identity::CoverIdentity::Legacy,
+                        crate::cover_auto_material::AutoMaterial::NotAutomatic,
                     )
                     .unwrap();
             }
@@ -2261,6 +2271,7 @@ fn ordinary_video_folder_seed_upgrades_identity_only_and_then_preserves_the_row(
             None,
             &webp,
             &CoverIdentity::Legacy,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic,
         )
         .unwrap();
     let map = Arc::new(std::sync::RwLock::new(catalog.load_all().unwrap()));
@@ -2358,6 +2369,7 @@ fn mutation_refresh_synthetic_worker_prepares_cascade_and_video_seed_before_ui_a
             None,
             &webp,
             &crate::cover_identity::CoverIdentity::Legacy,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic,
         )
         .unwrap();
     let source = app
@@ -2391,6 +2403,7 @@ fn mutation_refresh_synthetic_worker_prepares_cascade_and_video_seed_before_ui_a
             None,
             &webp,
             &crate::cover_identity::CoverIdentity::Legacy,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic,
         )
         .unwrap();
     let old_map = Arc::new(std::sync::RwLock::new(catalog.load_all().unwrap()));
@@ -2625,7 +2638,8 @@ fn mutation_refresh_synthetic_worker_seed_failure_purges_same_key_old_frame() {
                 resolved.file_size,
                 None,
                 &old_bytes,
-                &crate::cover_identity::CoverIdentity::Legacy
+                &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic
             )
             .unwrap()
     );
@@ -5571,6 +5585,7 @@ fn epub_auto_aspect_seed_ignores_source_metadata_cache_hit() {
     let map = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::from([(
         key,
         crate::catalog::CacheEntry {
+            auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
             cover: crate::cover_identity::CoverIdentity::Legacy,
             mtime: 123,
             file_size: 456,
@@ -9297,12 +9312,14 @@ fn metadata_folder_pin_refresh_does_not_navigate_or_close_detached_viewers() {
             None,
             b"x",
             &crate::cover_identity::CoverIdentity::Legacy,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic,
         )
         .unwrap();
     let cache_map =
         std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::from([(
             stale_pin_key.clone(),
             crate::catalog::CacheEntry {
+                auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 cover: crate::cover_identity::CoverIdentity::Legacy,
                 mtime: 1,
                 file_size: 1,
@@ -20072,6 +20089,7 @@ mod phase_c_key_tests {
                 Some((80, 60)),
                 &webp_bytes,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let auto_key = container_cache_base_key(
@@ -20091,6 +20109,7 @@ mod phase_c_key_tests {
                 Some((80, 60)),
                 &webp_bytes,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
 
@@ -20138,6 +20157,7 @@ mod phase_c_key_tests {
                 Some((80, 60)),
                 &webp_bytes,
                 &cover,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         // §1.718 §7: the provisional seed copies the selected catalog row.
@@ -20162,6 +20182,7 @@ mod phase_c_key_tests {
                 Some((80, 60)),
                 &webp_bytes,
                 &cover,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         app.seed_drive_list_pin_thumbs_from_catalog(&cache_map, Some(&drive_list_db));
@@ -20314,6 +20335,7 @@ mod phase_c_key_tests {
                 None,
                 &webp,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         parent
@@ -20326,6 +20348,7 @@ mod phase_c_key_tests {
                 None,
                 &webp,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         app.items = vec![GridItem::Folder(drive.clone())];
@@ -20669,6 +20692,7 @@ mod phase_c_key_tests {
                 Some(crate::catalog::FolderThumbProvenance::AutoSelected),
                 Some(&proof),
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         app.items = vec![GridItem::Folder(drive.clone())];
@@ -20789,6 +20813,7 @@ mod phase_c_key_tests {
                 Some(crate::catalog::FolderThumbProvenance::AutoSelected),
                 Some(&current_proof),
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         app.seed_drive_list_pin_thumbs_from_catalog(&map, Some(&target));
@@ -20854,6 +20879,7 @@ mod phase_c_key_tests {
                 None,
                 &old_webp,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         map.write()
@@ -20880,6 +20906,7 @@ mod phase_c_key_tests {
                 None,
                 &old_webp,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         app.seed_drive_list_pin_thumbs_from_catalog(&map, Some(&target));
@@ -20938,6 +20965,7 @@ mod phase_c_key_tests {
                 None,
                 &page_one_webp,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         if case == "new_generation" {
@@ -20967,6 +20995,7 @@ mod phase_c_key_tests {
                     Some(crate::catalog::FolderThumbProvenance::AutoSelected),
                     Some(&old_proof),
                     &crate::cover_identity::CoverIdentity::Legacy,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 )
                 .unwrap();
             map.write()
@@ -20994,6 +21023,7 @@ mod phase_c_key_tests {
                     None,
                     &new_webp,
                     &crate::cover_identity::CoverIdentity::Legacy,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 )
                 .unwrap();
             let (seed, final_red, finalized, messages) = load(&app, &map);
@@ -21182,6 +21212,7 @@ mod phase_c_key_tests {
                 None,
                 &webp(240),
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         parent
@@ -21194,6 +21225,7 @@ mod phase_c_key_tests {
                 None,
                 &webp(40),
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         app.items = vec![GridItem::Folder(drive.clone())];
@@ -21377,6 +21409,7 @@ mod phase_c_key_tests {
                 Some((100, 50)),
                 &webp_bytes,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
 
@@ -21474,6 +21507,7 @@ mod phase_c_key_tests {
                 Some((120, 80)),
                 &wrong_webp_bytes,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
 
@@ -27479,6 +27513,7 @@ mod phase_c_folder_nav_history_tests {
                     Some((36, 48)),
                     root_png.get_ref(),
                     &crate::cover_identity::CoverIdentity::Legacy,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 )
                 .unwrap();
         }
@@ -27797,6 +27832,7 @@ mod phase_c_folder_nav_history_tests {
                         Some((96, 128)),
                         encoded.get_ref(),
                         &crate::cover_identity::CoverIdentity::Legacy,
+                        crate::cover_auto_material::AutoMaterial::NotAutomatic,
                     )
                     .unwrap();
             }
@@ -36390,6 +36426,7 @@ fn begin_detached_bookmark_media_test(
         std::collections::HashMap::from([(
             "main-grid-color".to_string(),
             crate::catalog::CacheEntry {
+                auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 cover: crate::cover_identity::CoverIdentity::Legacy,
                 mtime: 1,
                 file_size: 2,
@@ -47530,6 +47567,7 @@ mod favorite_adjustment_defaults_tests {
         let cache_map = std::sync::RwLock::new(std::collections::HashMap::from([(
             key,
             crate::catalog::CacheEntry {
+                auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 cover: crate::cover_identity::CoverIdentity::Legacy,
                 mtime: 11,
                 file_size: 22,
@@ -49027,6 +49065,7 @@ mod favorite_adjustment_defaults_tests {
         let cache_map = std::sync::RwLock::new(std::collections::HashMap::from([(
             pinned_key,
             crate::catalog::CacheEntry {
+                auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 cover: crate::cover_identity::CoverIdentity::Legacy,
                 mtime: 333,
                 file_size: 444,
@@ -53250,6 +53289,7 @@ mod favorite_adjustment_defaults_tests {
                     Some((8, 8)),
                     &webp,
                     &crate::cover_identity::CoverIdentity::Legacy,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 )
                 .unwrap();
             let folder_meta = std::fs::metadata(&folder).unwrap();
@@ -53363,6 +53403,7 @@ mod favorite_adjustment_defaults_tests {
                 Some((100, 100)),
                 &webp_bytes,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
 
@@ -53471,6 +53512,7 @@ mod favorite_adjustment_defaults_tests {
         cache_map.write().unwrap().insert(
             target_key.clone(),
             crate::catalog::CacheEntry {
+                auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 cover: crate::cover_identity::CoverIdentity::Legacy,
                 mtime: 999,
                 file_size: 4096,
@@ -53615,6 +53657,7 @@ mod favorite_adjustment_defaults_tests {
                 None,
                 &bad_bytes,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
 
@@ -53659,6 +53702,7 @@ mod favorite_adjustment_defaults_tests {
                 None,
                 &bad,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .expect("Err なし、Ok(false) で skip 表現");
         assert!(!saved, "壊れたバイト列は save 断念 → false");
@@ -76946,6 +76990,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 None,
                 b"cached-thumbnail",
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         assert!(catalog.load_one("keep.jpg").unwrap().is_some());
@@ -113007,6 +113052,7 @@ fn excluded_png_zip_parent_seed_never_becomes_first_visible_jpg_cache() {
             None,
             &old_png,
             &crate::cover_identity::CoverIdentity::Legacy,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic,
         )
         .unwrap();
     app.settings

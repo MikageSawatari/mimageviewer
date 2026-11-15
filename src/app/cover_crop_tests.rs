@@ -6,15 +6,19 @@ impl App {
     pub(crate) fn cover_crop_tile_request_for_test(&self, idx: usize) -> LoadRequest {
         let item = &self.items[idx];
         let path = match item {
-            GridItem::ZipFile(path) | GridItem::PdfFile(path) => path,
-            _ => panic!("rotation fixture expects a ZIP/PDF book tile"),
+            GridItem::Folder(path) | GridItem::ZipFile(path) | GridItem::PdfFile(path) => path,
+            _ => panic!("crop fixture expects a folder/ZIP/PDF book tile"),
         };
         let metadata = std::fs::metadata(path).unwrap();
         make_load_request_with_visibility(
             item,
             idx,
             crate::ui_helpers::mtime_secs(&metadata),
-            metadata.len() as i64,
+            if metadata.is_dir() {
+                0
+            } else {
+                metadata.len() as i64
+            },
             false,
             None,
             Some(crate::settings::SortOrder::Numeric),
@@ -155,6 +159,8 @@ fn cover_crop_drive_catalog_prefix_skips_newer_cropped_and_auto_rows() {
         ("17|23", 17),
         ("crop:0,0,500000,1000000|30|23", 30),
         ("40|23|autocrop:v1:rtl", 40),
+        ("50|23|autocrop:v2:rtl", 50),
+        ("60|23|autocrop:v3:rtl", 60),
     ] {
         db.save_thumb_bytes(
             &format!("{prefix}{suffix}"),
@@ -163,6 +169,7 @@ fn cover_crop_drive_catalog_prefix_skips_newer_cropped_and_auto_rows() {
             Some((1, 1)),
             &thumbnail_bytes(),
             &crate::cover_identity::CoverIdentity::Unknown,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic,
         )
         .unwrap();
     }
@@ -282,6 +289,7 @@ fn cover_crop_completed_rows_survive_cleanup_and_replaced_crops_do_not_for_folde
                     Some((4, 10)),
                     &thumbnail_bytes(),
                     &crate::cover_identity::CoverIdentity::Unknown,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 )
                 .unwrap();
             catalog.delete_missing(&existing).unwrap();
@@ -390,6 +398,7 @@ fn cover_crop_zipdir_changed_crop_replaces_existing_key_and_prunes_old_row() {
                 Some((4, 10)),
                 &thumbnail_bytes(),
                 &crate::cover_identity::CoverIdentity::Unknown,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         catalog.delete_missing(&prepared.existing_keys).unwrap();
@@ -466,6 +475,7 @@ fn cover_crop_epub_completed_key_retention_matches_existing_1742_limit() {
                 Some((4, 10)),
                 &thumbnail_bytes(),
                 &crate::cover_identity::CoverIdentity::Unknown,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         assert!(catalog.load_one(&key).unwrap().is_some());

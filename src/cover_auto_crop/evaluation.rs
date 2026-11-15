@@ -1,17 +1,31 @@
-//! Opt-in evaluation: input books and all generated artifacts stay outside the
-//! source tree when MIV_COVER_AUTO_EVAL_OUTPUT names an external directory.
+//! Opt-in evaluation. Generated artifacts must stay under target/.
+//! FOLDER_LIST accepts a JSON array of absolute image-folder paths and writes
+//! numeric/count-only JSON unless THUMBS=1 explicitly opts into framed JPEGs.
 //!
-//! MIV_COVER_AUTO_EVAL_DECODE=worker selects the real thumbnail worker's source
-//! decode (default: full). MIV_COVER_AUTO_EVAL_DISPLAY_PX overrides its display
-//! target, 256..=2048; the default is the App startup geometry's 256 pixels.
-//! thumb_px comes from Settings::default() (512). No saved user settings are read.
+//! The default worker decode shares production's fixed analysis decode. Explicit
+//! MIV_COVER_AUTO_EVAL_DECODE=full remains a diagnostic comparison. DISPLAY_PX
+//! is accepted to verify analysis independence from display geometry.
+//! IMAGE_ROTATION physically rotates a disposable input (0/90/180/270), while
+//! SAVED_ROTATION overrides the corrective saved angle. Without that override,
+//! saved rotation is truth.saved_rotation minus IMAGE_ROTATION (default 0).
+//! REENCODE_INPUT=1 also reencodes the zero-degree ZIP cover, providing a
+//! numerical control for JPEG recompression in the physical-rotation matrix.
+//! The default is production v3, including full height and layout-snap policy.
+//! FALLBACK=edge/edge18/density/density18/layout/layout-snap enables additional
+//! experiments after remaining structural declines; metadata guards stay final.
+//! All angles are evaluated; directory counts use the selected saved angle.
 use super::*;
 use image::Rgb;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+
+mod book_list;
+mod fallback;
+mod thumbs;
+use fallback::*;
 
 #[derive(Deserialize)]
 struct Truth {
@@ -20,19 +34,25 @@ struct Truth {
     #[serde(default)]
     ltr: bool,
     page_aspect: Option<f64>,
+    #[serde(default)]
+    saved_rotation: i32,
 }
 
 struct DecodeMode {
     worker: bool,
     display_px: u32,
     thumb_px: u32,
+    image_rotation: Rotation,
+    saved_rotation: Option<Rotation>,
+    rotation_db: Option<PathBuf>,
+    reencode_input: bool,
 }
 
 impl DecodeMode {
     fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
         let worker = match std::env::var("MIV_COVER_AUTO_EVAL_DECODE").as_deref() {
-            Err(std::env::VarError::NotPresent) | Ok("full") => false,
-            Ok("worker") => true,
+            Ok("full") => false,
+            Err(std::env::VarError::NotPresent) | Ok("worker") => true,
             _ => return Err("MIV_COVER_AUTO_EVAL_DECODE must be full or worker".into()),
         };
         // App initialization: last_cell_size/h=200, pixels_per_point=1.
@@ -49,6 +69,12 @@ impl DecodeMode {
             worker,
             display_px,
             thumb_px: crate::settings::Settings::default().thumb_px,
+            image_rotation: env_rotation("MIV_COVER_AUTO_EVAL_IMAGE_ROTATION")?
+                .unwrap_or(Rotation::None),
+            saved_rotation: env_rotation("MIV_COVER_AUTO_EVAL_SAVED_ROTATION")?,
+            rotation_db: Some(book_list::evaluation_rotation_db()),
+            reencode_input: std::env::var("MIV_COVER_AUTO_EVAL_REENCODE_INPUT").as_deref()
+                == Ok("1"),
         })
     }
 
@@ -57,11 +83,68 @@ impl DecodeMode {
     }
 }
 
+fn env_rotation(name: &str) -> Result<Option<Rotation>, Box<dyn std::error::Error>> {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            let degrees: i32 = value.parse()?;
+            if ![0, 90, 180, 270].contains(&degrees) {
+                return Err(format!("{name} must be 0, 90, 180 or 270").into());
+            }
+            Ok(Rotation::from_degrees(degrees))
+        })
+        .transpose()
+}
+
+fn rotated_image(image: &DynamicImage, rotation: Rotation) -> DynamicImage {
+    match rotation {
+        Rotation::None => image.clone(),
+        Rotation::Cw90 => image.rotate90(),
+        Rotation::Cw180 => image.rotate180(),
+        Rotation::Cw270 => image.rotate270(),
+    }
+}
+
+fn rotated_rect(rect: [f64; 4], dims: (u32, u32), rotation: Rotation) -> [f64; 4] {
+    let [x0, y0, x1, y1] = rect;
+    let (w, h) = (f64::from(dims.0), f64::from(dims.1));
+    match rotation {
+        Rotation::None => rect,
+        Rotation::Cw90 => [h - y1, x0, h - y0, x1],
+        Rotation::Cw180 => [w - x1, h - y1, w - x0, h - y0],
+        Rotation::Cw270 => [y0, w - x1, y1, w - x0],
+    }
+}
+
 struct LoadedCase {
     image: DynamicImage,
-    aspect: Option<f64>,
+    sample: Result<f64, crate::cover_auto_sample::PageAspectDecline>,
+    shot_exif: bool,
     zip_leaf: Option<String>,
     worker: Option<crate::thumb_loader::cover_auto_eval_decode::DecodedCover>,
+    original_dims: (u32, u32),
+}
+
+#[derive(Default)]
+struct RatioDistribution(BTreeMap<i64, u32>);
+
+impl RatioDistribution {
+    fn record(&mut self, native: (u32, u32), aspect: Option<f64>, saved: Rotation) -> Option<f64> {
+        let ratio = layout_ratio(native, aspect, saved)?;
+        // Stabilize exact decimal bin boundaries against floating point division.
+        let scaled = (ratio * 5.0 + 1e-9).floor();
+        if scaled < i64::MAX as f64 {
+            *self.0.entry(scaled as i64).or_default() += 1;
+        }
+        Some(ratio)
+    }
+
+    fn json(&self) -> serde_json::Value {
+        json!({"bin_width": 0.2, "count": self.0.values().copied().sum::<u32>(),
+            "bins": self.0.iter().map(|(&bin, &count)| json!({
+                "lower": bin as f64 / 5.0, "upper": (bin + 1) as f64 / 5.0, "count": count,
+            })).collect::<Vec<_>>()})
+    }
 }
 
 fn load_case(
@@ -69,7 +152,16 @@ fn load_case(
     name: &str,
     truth: &Truth,
     mode: &DecodeMode,
+    output: &Path,
 ) -> Result<LoadedCase, Box<dyn std::error::Error>> {
+    if Path::new(name).components().count() != 1
+        || !matches!(
+            Path::new(name).components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return Err("truth case name must be one normal filename component".into());
+    }
     let zip_path = directory.join(format!("{name}.zip"));
     if zip_path.is_file() {
         let mut archive = zip::ZipArchive::new(std::fs::File::open(&zip_path)?)?;
@@ -89,18 +181,57 @@ fn load_case(
             .ok_or("ZIP has no 000_cover entry")?;
         let mut bytes = Vec::new();
         archive.by_name(&leaf)?.read_to_end(&mut bytes)?;
+        let reference = crate::thumb_loader::apply_exif_orientation_from_bytes(
+            image::load_from_memory(&bytes)?,
+            &bytes,
+        );
+        let original_dims = (reference.width(), reference.height());
+        let image = rotated_image(&reference, mode.image_rotation);
+        let mut decode_path = zip_path.clone();
+        if !mode.image_rotation.is_none() || mode.reencode_input {
+            // Replace only the cover; real following pages remain the source
+            // for the bounded production page-aspect sampler.
+            decode_path = target_output(output.join("inputs"))?.join(format!("{name}.zip"));
+            let mut generated = zip::ZipWriter::new(std::fs::File::create(&decode_path)?);
+            for index in 0..archive.len() {
+                let entry = archive.by_index(index)?;
+                if entry.name() == leaf {
+                    let format = image::ImageFormat::from_path(&leaf)?;
+                    let mut encoded = std::io::Cursor::new(Vec::new());
+                    if format == image::ImageFormat::Jpeg {
+                        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 95)
+                            .encode_image(&image)?;
+                    } else {
+                        image.write_to(&mut encoded, format)?;
+                    }
+                    generated.start_file(&leaf, zip::write::SimpleFileOptions::default())?;
+                    generated.write_all(encoded.get_ref())?;
+                } else {
+                    generated.raw_copy_file(entry)?;
+                }
+            }
+            generated.finish()?;
+        }
         let prefix = leaf
             .rsplit_once('/')
             .map(|(parent, _)| format!("{parent}/"));
         // Deliberately use the production prefix-only dimension sampler. Truth
         // aspect is allowed only for PNG dummies, never to rescue a ZIP sample.
-        let aspect =
-            crate::cover_auto_sample::sample_zip_page_aspect(&zip_path, &leaf, prefix.as_deref());
+        let rotations = crate::cover_auto_sample::SampleRotations::from_path_worker(
+            mode.rotation_db.as_deref(),
+        );
+        let sample = crate::cover_auto_sample::sample_zip_pages_with_rotations(
+            &decode_path,
+            &leaf,
+            prefix.as_deref(),
+            &zip_path,
+            |key| rotations.get(key),
+        );
         let worker = mode
             .worker
             .then(|| {
                 crate::thumb_loader::cover_auto_eval_decode::decode(
-                    &zip_path,
+                    &decode_path,
                     Some(&leaf),
                     mode.display_px,
                     mode.thumb_px,
@@ -108,13 +239,26 @@ fn load_case(
             })
             .transpose()?;
         Ok(LoadedCase {
-            image: image::load_from_memory(&bytes)?,
-            aspect,
+            image,
+            sample,
+            shot_exif: crate::thumb_loader::cover_auto_eval_decode::shot_exif(&bytes),
             zip_leaf: Some(leaf),
             worker,
+            original_dims,
         })
     } else {
-        let path = directory.join(format!("{name}.png"));
+        let mut path = directory.join(format!("{name}.png"));
+        let bytes = std::fs::read(&path)?;
+        let reference = crate::thumb_loader::apply_exif_orientation_from_bytes(
+            image::load_from_memory(&bytes)?,
+            &bytes,
+        );
+        let original_dims = (reference.width(), reference.height());
+        let image = rotated_image(&reference, mode.image_rotation);
+        if !mode.image_rotation.is_none() {
+            path = target_output(output.join("inputs"))?.join(format!("{name}.png"));
+            image.save(&path)?;
+        }
         let worker = mode
             .worker
             .then(|| {
@@ -127,10 +271,14 @@ fn load_case(
             })
             .transpose()?;
         Ok(LoadedCase {
-            image: image::open(path)?,
-            aspect: truth.page_aspect,
+            image,
+            sample: truth
+                .page_aspect
+                .ok_or(crate::cover_auto_sample::PageAspectDecline::TooFew),
+            shot_exif: crate::thumb_loader::cover_auto_eval_decode::shot_exif(&bytes),
             zip_leaf: None,
             worker,
+            original_dims,
         })
     }
 }
@@ -166,24 +314,119 @@ fn outline(image: &mut RgbImage, bounds: [f64; 4], color: Rgb<u8>) {
     }
 }
 
+fn target_output(output: PathBuf) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let target = std::env::current_dir()?.join("target");
+    // canonical paths returned from this helper have a verbatim prefix on
+    // Windows; accept them too when creating the nested disposable inputs.
+    let resolved_target = target.canonicalize().ok();
+    let requested = if output.is_absolute() {
+        output
+    } else {
+        std::env::current_dir()?.join(output)
+    };
+    let relative = requested
+        .strip_prefix(&target)
+        .or_else(|error| {
+            resolved_target
+                .as_ref()
+                .map_or(Err(error), |resolved| requested.strip_prefix(resolved))
+        })
+        .map_err(|_| "evaluation output must be under this workspace's target directory")?;
+    if !relative
+        .components()
+        .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(
+            "evaluation output must contain only normal path components under target".into(),
+        );
+    }
+    std::fs::create_dir_all(&target)?;
+    let target = target.canonicalize()?;
+    let mut current = target.clone();
+    // Verify existing ancestors before creating the next level, including
+    // Windows junctions. Never materialize rotated inputs outside target.
+    for part in relative.components() {
+        current.push(part.as_os_str());
+        if current.exists() {
+            if !current.canonicalize()?.starts_with(&target) {
+                return Err("evaluation output traverses a link outside target".into());
+            }
+        } else {
+            std::fs::create_dir(&current)?;
+        }
+    }
+    Ok(current)
+}
+
+/// Folder inputs have no ground truth and may contain private images. Use the
+/// representative worker's source selection, bounded sample and analysis, but
+/// emit neither source identities nor a contact sheet or copied input images.
+fn evaluate_folder_list(
+    list: &Path,
+    output: &Path,
+    fallback_config: FallbackConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    book_list::evaluate(
+        list,
+        output,
+        true,
+        fallback_config,
+        &book_list::Options::default(),
+    )
+}
+
 /// Run one directory per invocation, e.g. dummies and realistic separately.
 /// The JSON row index maps to the contact sheet (left-to-right, top-to-bottom).
 /// Green = truth, red = prediction; bottom status strip: green good, red wrong,
 /// gray declined. Missing or unreadable inputs fail instead of inflating counts.
 #[test]
-#[ignore = "requires MIV_COVER_AUTO_EVAL_DIR; external evaluation images are never repository fixtures"]
+#[ignore = "requires MIV_COVER_AUTO_EVAL_DIR, MIV_COVER_AUTO_EVAL_FOLDER_LIST or MIV_COVER_AUTO_EVAL_BOOK_LIST; external evaluation images are never repository fixtures"]
 fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Error>> {
+    let fallback_config = FallbackConfig::from_env()?;
+    let output = target_output(
+        std::env::var_os("MIV_COVER_AUTO_EVAL_OUTPUT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("target/cover-auto-eval")),
+    )?;
+    if let Some(list) = std::env::var_os("MIV_COVER_AUTO_EVAL_BOOK_LIST") {
+        return book_list::evaluate(
+            Path::new(&list),
+            &output,
+            false,
+            fallback_config,
+            &book_list::Options::from_env()?,
+        );
+    }
+    if let Some(list) = std::env::var_os("MIV_COVER_AUTO_EVAL_FOLDER_LIST") {
+        return book_list::evaluate(
+            Path::new(&list),
+            &output,
+            true,
+            fallback_config,
+            &book_list::Options::from_env()?,
+        );
+    }
     let directory = PathBuf::from(
         std::env::var_os("MIV_COVER_AUTO_EVAL_DIR").ok_or("set MIV_COVER_AUTO_EVAL_DIR")?,
     );
-    let output = std::env::var_os("MIV_COVER_AUTO_EVAL_OUTPUT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("target/cover-auto-eval"));
     let mode = DecodeMode::from_env()?;
+    evaluate_directory(&directory, &output, &mode, fallback_config)
+}
+
+// The ignored entry and synthetic tests share parsing, decode, sampling,
+// angle selection, scoring, and artifact output without process env mutation.
+fn evaluate_directory(
+    directory: &Path,
+    output: &Path,
+    mode: &DecodeMode,
+    fallback_config: FallbackConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let output = target_output(output.to_path_buf())?;
     let _worker_data = mode.worker.then(crate::data_dir::TestDataDirGuard::new);
     std::fs::create_dir_all(&output)?;
     let truth: BTreeMap<String, Truth> =
-        serde_json::from_slice(&std::fs::read(directory.join("truth.json"))?)?;
+        serde_json::from_slice(&std::fs::read(directory.join("truth.json"))?)
+            .map_err(|error| format!("truth.json parse failed: {error}"))?;
     if truth.is_empty() {
         return Err("truth.json contains no cases".into());
     }
@@ -199,18 +442,17 @@ fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Erro
     let (mut negative_cropped, mut negative_declined) = (0, 0);
     let mut reasons = BTreeMap::<String, u32>::new();
     let mut rows = Vec::new();
+    let mut fallback_stats = FallbackStats::default();
+    let mut ratio_distribution = RatioDistribution::default();
     for (index, (name, truth)) in truth.iter().enumerate() {
         let LoadedCase {
-            mut image,
-            aspect,
+            image,
+            sample,
+            shot_exif,
             zip_leaf,
             worker,
-        } = load_case(&directory, name, truth, &mode)?;
-        if let Some(decoded) = &worker {
-            // Worker-mode truth coordinates are EXIF-upright, like CoverCrop.
-            // This reference raster is used only for the comparison sheet.
-            image = crate::thumb_loader::apply_orientation(image, decoded.orientation);
-        }
+            original_dims,
+        } = load_case(&directory, name, truth, &mode, &output)?;
         let dims = (image.width(), image.height());
         let decoded_image = worker.as_ref().map_or(&image, |decoded| &decoded.image);
         let native_dims = worker.as_ref().map_or(dims, |decoded| decoded.native_dims);
@@ -220,16 +462,38 @@ fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Erro
             )
             .into());
         }
-        let raster = analysis_raster(decoded_image);
         let binding = if truth.ltr {
             ReadingDirection::Ltr
         } else {
             ReadingDirection::Rtl
         };
-        let detected = cover_auto_crop(&raster, native_dims, aspect, binding);
+        if ![0, 90, 180, 270].contains(&truth.saved_rotation) {
+            return Err(format!("{name}: truth.saved_rotation must be 0, 90, 180 or 270").into());
+        }
+        let saved = mode.saved_rotation.unwrap_or_else(|| {
+            Rotation::from_degrees(truth.saved_rotation - mode.image_rotation.degrees())
+        });
+        let aspect = sample.ok();
+        let shot_exif = worker
+            .as_ref()
+            .map_or(shot_exif, |decoded| decoded.shot_exif);
+        let outcomes = evaluate_angles(
+            decoded_image,
+            native_dims,
+            aspect,
+            shot_exif,
+            binding,
+            fallback_config,
+        );
+        let selected = outcomes[EVAL_ROTATIONS
+            .iter()
+            .position(|&rotation| rotation == saved)
+            .unwrap()];
+        let ratio = ratio_distribution.record(native_dims, aspect, saved);
+        let detected = selected.final_result;
         let expected = truth.front.map(|x| {
-            let y = truth.front_y.unwrap_or([0.0, dims.1 as f64]);
-            [x[0], y[0], x[1], y[1]]
+            let y = truth.front_y.unwrap_or([0.0, original_dims.1 as f64]);
+            rotated_rect([x[0], y[0], x[1], y[1]], original_dims, mode.image_rotation)
         });
         let predicted = detected.as_ref().ok().map(|crop| {
             let [x0, y0, x1, y1] = crop.values();
@@ -241,6 +505,7 @@ fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Erro
             ]
         });
         let iou = predicted.zip(expected).map(|(a, b)| box_iou(a, b));
+        fallback_stats.record(selected, iou, true);
         let (status, color) = match detected {
             Ok(_) if iou.is_some_and(|iou| iou >= 0.85) => {
                 good += 1;
@@ -258,16 +523,24 @@ fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Erro
                 if expected.is_none() {
                     negative_declined += 1;
                 }
-                *reasons.entry(reason.as_str().to_owned()).or_default() += 1;
+                *reasons.entry(reason.as_str().into_owned()).or_default() += 1;
                 ("declined", [115, 115, 115])
             }
         };
         let reason = detected
             .err()
             .map(AutoCropDecline::as_str)
-            .unwrap_or("cropped");
-        rows.push(json!({"index":index,"name":name,"status":status,"reason":reason,"iou":iou,"truth":expected,"prediction":predicted,"page_aspect":aspect,"zip_leaf":zip_leaf,"ltr":truth.ltr,
+            .unwrap_or_else(|| "cropped".into());
+        rows.push(json!({"index":index,"name":name,"status":status,"reason":reason,"iou":iou,"truth":expected,"prediction":predicted,"page_aspect":aspect,"layout_ratio":ratio,"zip_leaf":zip_leaf,"ltr":truth.ltr,
+            "page_aspect_decline":sample.err().map(crate::cover_auto_sample::PageAspectDecline::as_str),
             "decoded_dims":[decoded_image.width(),decoded_image.height()],"native_dims":native_dims,
+            "saved_rotation":saved.degrees(),"image_rotation":mode.image_rotation.degrees(),
+            "all_crops":outcomes.map(|outcome|outcome.final_result.ok().map(CoverCrop::values)),
+            "original_decline":selected.original.err().map(|reason|reason.as_str().into_owned()),
+            "production_method":selected.original.ok().map(|success|success.method.as_str()),
+            "production_layout":selected.original.ok().and_then(|success|success.layout()).map(AutoCropLayout::as_str),
+            "fallback":selected.fallback.map(|diagnostic|diagnostic.json(fallback_config)),
+            "all_fallbacks":outcomes.map(|outcome|outcome.fallback.map(|diagnostic|diagnostic.json(fallback_config))),
             "dct_scale_num":worker.as_ref().and_then(|decoded|decoded.dct_scale_num),"orientation":worker.as_ref().map(|decoded|decoded.orientation)}));
         let mut tile = image.thumbnail(cell_width - 12, cell_height - 14).to_rgb8();
         let project = |r: [f64; 4]| {
@@ -301,8 +574,20 @@ fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Erro
         }
     }
     sheet.save(output.join("sheet.png"))?;
-    let summary = json!({"algorithm":"autocrop:v1","decode_mode":mode.name(),"display_px":mode.display_px,"thumb_px":mode.thumb_px,
-        "jpeg_decode_target":mode.display_px.max(mode.thumb_px),"iou_threshold":0.85,"good":good,"wrong":wrong,"declined":declined,
+    let summary = json!({"algorithm":"autocrop:v3","decode_mode":mode.name(),"display_px":mode.display_px,"thumb_px":mode.thumb_px,
+        "analysis_decode_height":1024,"image_rotation":mode.image_rotation.degrees(),
+        "physical_jpeg_reencode_quality":(!mode.image_rotation.is_none() || mode.reencode_input).then_some(95),
+        "reencode_input_control":mode.reencode_input,
+        "saved_rotation_override":mode.saved_rotation.map(Rotation::degrees),
+        "iou_threshold":0.85,"good":good,"wrong":wrong,"declined":declined,
+        "fallback_mode":fallback_config.name(),"fallback_cropped":fallback_stats.cropped,
+        "fallback_richer":fallback_config.includes_richer(),
+        "fallback_good":fallback_stats.good,"fallback_wrong":fallback_stats.wrong,
+        "fallback_original_declines":fallback_stats.reasons,
+        "fallback_inward_fraction_distribution":fallback_stats.distribution(),
+        "fallback_by_layout":fallback_stats.layout_summary(true),
+        "fallback_layout_ratio_distribution":fallback_stats.layout_ratio_distribution(),
+        "ratio_distribution":ratio_distribution.json(),
         "negative_cropped":negative_cropped,"negative_declined":negative_declined,"decline_reasons":reasons,"sheet_columns":columns,"rows":rows});
     std::fs::write(
         output.join("summary.json"),
@@ -313,4 +598,484 @@ fn cover_auto_crop_directory_evaluation() -> Result<(), Box<dyn std::error::Erro
         output.display()
     );
     Ok(())
+}
+
+fn synthetic_shot_jpeg(width: u32, height: u32) -> Result<Vec<u8>, image::ImageError> {
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90)
+        .encode_image(&DynamicImage::new_rgb8(width, height))?;
+    // IFD0: Orientation=1 and ExifIFD pointer at byte 38. ExifIFD:
+    // ExposureTime=1/125, stored as a rational at byte 56. This exercises G1
+    // through actual JPEG metadata, independently of cover/body dimensions.
+    let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+    let entry = |bytes: &mut Vec<u8>, tag: u16, format: u16, value: u32| {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&format.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+    };
+    tiff.extend_from_slice(&2_u16.to_le_bytes());
+    entry(&mut tiff, 274, 3, 1);
+    entry(&mut tiff, 34665, 4, 38);
+    tiff.extend_from_slice(&0_u32.to_le_bytes());
+    tiff.extend_from_slice(&1_u16.to_le_bytes());
+    entry(&mut tiff, 33434, 5, 56);
+    tiff.extend_from_slice(&0_u32.to_le_bytes());
+    tiff.extend_from_slice(&1_u32.to_le_bytes());
+    tiff.extend_from_slice(&125_u32.to_le_bytes());
+    let mut bytes = vec![0xff, 0xd8, 0xff, 0xe1];
+    bytes.extend_from_slice(&((tiff.len() + 8) as u16).to_be_bytes());
+    bytes.extend_from_slice(b"Exif\0\0");
+    bytes.extend_from_slice(&tiff);
+    bytes.extend_from_slice(&jpeg[2..]);
+    assert!(crate::thumb_loader::cover_auto_eval_decode::shot_exif(
+        &bytes
+    ));
+    Ok(bytes)
+}
+
+#[test]
+fn folder_evaluation_emits_counts_and_numeric_rows_without_images_or_names()
+-> Result<(), Box<dyn std::error::Error>> {
+    let target = std::env::current_dir()?.join("target");
+    std::fs::create_dir_all(&target)?;
+    let temp = tempfile::Builder::new()
+        .prefix("cover-auto-folder-eval-")
+        .tempdir_in(&target)?;
+    let folder = temp.path().join("private-folder-name");
+    std::fs::create_dir(&folder)?;
+    std::fs::write(
+        folder.join("000-private-cover-name.jpg"),
+        synthetic_shot_jpeg(150, 100)?,
+    )?;
+    for index in 1..=8 {
+        image::DynamicImage::new_rgb8(100, 150)
+            .save(folder.join(format!("{index:03}-private-body-name.png")))?;
+    }
+    let list = temp.path().join("folders.json");
+    std::fs::write(&list, serde_json::to_vec(&vec![folder])?)?;
+    let output = temp.path().join("output");
+    evaluate_folder_list(&list, &output, FallbackConfig::default())?;
+    let artifacts: Vec<_> = std::fs::read_dir(&output)?
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(artifacts, vec![std::ffi::OsString::from("summary.json")]);
+    let text = std::fs::read_to_string(output.join("summary.json"))?;
+    assert!(!text.contains("private-"));
+    assert!(!text.contains(&temp.path().to_string_lossy().into_owned()));
+    let summary: serde_json::Value = serde_json::from_str(&text)?;
+    assert_eq!(summary["total"], 1);
+    assert_eq!(summary["cropped"], 0);
+    assert_eq!(summary["declined"], 1);
+    assert_eq!(summary["decline_reasons"]["photo-like/shot-exif"], 1);
+    assert_eq!(summary["rows"][0]["index"], 0);
+    assert_eq!(summary["rows"][0]["native_dims"], json!([150, 100]));
+    assert_eq!(summary["rows"][0]["reason"], "photo-like/shot-exif");
+    assert!(summary["rows"][0]["crop"].is_null());
+    Ok(())
+}
+
+#[test]
+fn evaluation_truth_rotation_uses_source_edges_without_pixel_center_drift() {
+    let bounds = [11.0, 23.0, 81.0, 169.0];
+    for rotation in [
+        Rotation::None,
+        Rotation::Cw90,
+        Rotation::Cw180,
+        Rotation::Cw270,
+    ] {
+        let rotated = rotated_rect(bounds, (200, 300), rotation);
+        let dimensions = match rotation {
+            Rotation::Cw90 | Rotation::Cw270 => (300, 200),
+            Rotation::None | Rotation::Cw180 => (200, 300),
+        };
+        assert_eq!(
+            rotated_rect(
+                rotated,
+                dimensions,
+                Rotation::from_degrees(-rotation.degrees())
+            ),
+            bounds
+        );
+    }
+    assert_eq!(
+        rotated_rect(bounds, (200, 300), Rotation::Cw90),
+        [131.0, 11.0, 277.0, 81.0]
+    );
+}
+
+#[test]
+fn folder_evaluation_production_v3_counts_keep_guard_and_emit_no_images_or_identities()
+-> Result<(), Box<dyn std::error::Error>> {
+    let target = std::env::current_dir()?.join("target");
+    std::fs::create_dir_all(&target)?;
+    let temp = tempfile::Builder::new()
+        .prefix("cover-auto-fallback-eval-")
+        .tempdir_in(&target)?;
+    let mut folders = Vec::new();
+    // Identical flat covers: shooting EXIF guards the first, production v3
+    // handles the second as T2 even when no comparison fallback is selected.
+    for index in 0..2 {
+        let folder = temp.path().join(format!("private-folder-{index}"));
+        std::fs::create_dir(&folder)?;
+        if index == 0 {
+            std::fs::write(
+                folder.join("000-private-cover.jpg"),
+                synthetic_shot_jpeg(150, 100)?,
+            )?;
+        } else {
+            DynamicImage::new_rgb8(150, 100).save(folder.join("000-private-cover.png"))?;
+        }
+        for page in 1..=8 {
+            DynamicImage::new_rgb8(105, 150)
+                .save(folder.join(format!("{page:03}-private-body.png")))?;
+        }
+        folders.push(folder);
+    }
+    let list = temp.path().join("folders.json");
+    std::fs::write(&list, serde_json::to_vec(&folders)?)?;
+    for mode in [
+        None,
+        Some("edge"),
+        Some("edge18"),
+        Some("density"),
+        Some("density18"),
+        Some("layout"),
+        Some("layout-snap"),
+    ] {
+        let config = FallbackConfig::parse(mode, false)?;
+        let output = temp.path().join(mode.unwrap_or("baseline"));
+        evaluate_folder_list(&list, &output, config)?;
+        let artifacts: Vec<_> = std::fs::read_dir(&output)?
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(artifacts, vec![std::ffi::OsString::from("summary.json")]);
+        let text = std::fs::read_to_string(output.join("summary.json"))?;
+        assert!(!text.contains("private-"));
+        assert!(!text.contains(&temp.path().to_string_lossy().into_owned()));
+        let summary: serde_json::Value = serde_json::from_str(&text)?;
+        assert_eq!(summary["algorithm"], "autocrop:v3f");
+        assert_eq!(summary["total"], 2);
+        assert_eq!(summary["cropped"], 1);
+        assert_eq!(summary["declined"], 1);
+        assert_eq!(summary["fallback_cropped"], 0);
+        assert!(summary["fallback_good"].is_null());
+        assert!(summary["fallback_wrong"].is_null());
+        assert_eq!(
+            summary["rows"][0]["original_decline"],
+            "photo-like/shot-exif"
+        );
+        assert!(summary["rows"][0]["crop"].is_null());
+        assert_eq!(summary["ratio_distribution"]["count"], 2);
+        assert_eq!(
+            summary["ratio_distribution"]["bins"],
+            json!([{"lower":2.0,"upper":2.2,"count":2}])
+        );
+        let row = &summary["rows"][1];
+        assert!(row["crop"].is_array());
+        assert!(row["current_crop"].is_array());
+        assert!(row["fallback_crop"].is_null());
+        assert!(row["fallback"].is_null());
+        assert_eq!(row["production_method"], "layout-fallback");
+        assert_eq!(row["production_layout"], "T2");
+        assert!(
+            row["all_fallbacks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(serde_json::Value::is_null)
+        );
+        assert_eq!(summary["fallback_inward_fraction_distribution"]["count"], 0);
+    }
+    Ok(())
+}
+
+fn synthetic_decode_mode(worker: bool) -> DecodeMode {
+    DecodeMode {
+        worker,
+        display_px: 256,
+        thumb_px: crate::settings::Settings::default().thumb_px,
+        image_rotation: Rotation::None,
+        saved_rotation: None,
+        rotation_db: None,
+        reencode_input: false,
+    }
+}
+
+fn synthetic_zip_pages(
+    path: &Path,
+    cover: (u32, u32),
+    page: (u32, u32),
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut archive = zip::ZipWriter::new(std::fs::File::create(path)?);
+    for index in 0..=8 {
+        let dims = if index == 0 { cover } else { page };
+        let mut png = std::io::Cursor::new(Vec::new());
+        DynamicImage::new_rgb8(dims.0, dims.1).write_to(&mut png, image::ImageFormat::Png)?;
+        archive.start_file(
+            if index == 0 {
+                "000_cover.png".to_owned()
+            } else {
+                format!("{index:03}.png")
+            },
+            zip::write::SimpleFileOptions::default(),
+        )?;
+        archive.write_all(png.get_ref())?;
+    }
+    archive.finish()?;
+    Ok(())
+}
+
+#[test]
+fn evaluation_null_page_aspect_samples_zip_and_declines_missing_png_without_early_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let target = std::env::current_dir()?.join("target");
+    std::fs::create_dir_all(&target)?;
+    let temp = tempfile::Builder::new()
+        .prefix("cover-auto-null-eval-")
+        .tempdir_in(target)?;
+    synthetic_zip_pages(
+        &temp.path().join("null-sampled-zip.zip"),
+        (280, 200),
+        (70, 100),
+    )?;
+    synthetic_zip_pages(
+        &temp.path().join("null-square-zip.zip"),
+        (200, 200),
+        (100, 100),
+    )?;
+    DynamicImage::new_rgb8(200, 200).save(temp.path().join("null-square-png.png"))?;
+    let truth = json!({
+        "null-sampled-zip": {"front":[0.0,142.8],"page_aspect":null,"ltr":false},
+        "null-square-zip": {"front":null,"page_aspect":null,"ltr":false},
+        "null-square-png": {"front":null,"page_aspect":null,"ltr":false}
+    });
+    // Option<f64> has always accepted JSON null. Do not turn missing PNG
+    // page evidence into a fabricated ratio, or rescue a bad ZIP sample via truth.
+    let parsed: BTreeMap<String, Truth> = serde_json::from_value(truth.clone())?;
+    assert!(parsed.values().all(|case| case.page_aspect.is_none()));
+    std::fs::write(temp.path().join("truth.json"), serde_json::to_vec(&truth)?)?;
+    {
+        let _data = crate::data_dir::TestDataDirGuard::new();
+        let mode = synthetic_decode_mode(true);
+        let loaded = load_case(
+            temp.path(),
+            "null-sampled-zip",
+            &parsed["null-sampled-zip"],
+            &mode,
+            temp.path(),
+        )?;
+        assert_eq!(loaded.sample, Ok(0.7));
+        let loaded = load_case(
+            temp.path(),
+            "null-square-zip",
+            &parsed["null-square-zip"],
+            &mode,
+            temp.path(),
+        )?;
+        assert_eq!(
+            loaded.sample,
+            Err(crate::cover_auto_sample::PageAspectDecline::Landscape)
+        );
+        let loaded = load_case(
+            temp.path(),
+            "null-square-png",
+            &parsed["null-square-png"],
+            &mode,
+            temp.path(),
+        )?;
+        assert_eq!(
+            loaded.sample,
+            Err(crate::cover_auto_sample::PageAspectDecline::TooFew)
+        );
+    }
+    for worker in [false, true] {
+        let output = temp.path().join(if worker { "worker" } else { "full" });
+        evaluate_directory(
+            temp.path(),
+            &output,
+            &synthetic_decode_mode(worker),
+            FallbackConfig::parse(Some("layout"), false)?,
+        )?;
+        let summary: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output.join("summary.json"))?)?;
+        assert_eq!(summary["good"], 1);
+        assert_eq!(summary["wrong"], 0);
+        assert_eq!(summary["negative_cropped"], 0);
+        assert_eq!(summary["negative_declined"], 2);
+        assert_eq!(summary["fallback_cropped"], 0);
+        for row in summary["rows"].as_array().unwrap() {
+            match row["name"].as_str().unwrap() {
+                "null-sampled-zip" => {
+                    assert_eq!(row["page_aspect"], 0.7);
+                    assert_eq!(row["status"], "good");
+                }
+                _ => {
+                    assert!(row["page_aspect"].is_null());
+                    assert_eq!(row["reason"], "no-page-aspect");
+                    assert!(row["fallback"].is_null());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn evaluation_directory_zip_body_rotations_keep_original_keys_for_generated_inputs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let target = std::env::current_dir()?.join("target");
+    std::fs::create_dir_all(&target)?;
+    let temp = tempfile::Builder::new()
+        .prefix("cover-auto-body-rotation-eval-")
+        .tempdir_in(target)?;
+    let zip_path = temp.path().join("rotated-body.zip");
+    synthetic_zip_pages(&zip_path, (280, 200), (70, 100))?;
+    let truth = json!({"rotated-body": {"front":null,"page_aspect":null,"ltr":false}});
+    std::fs::write(temp.path().join("truth.json"), serde_json::to_vec(&truth)?)?;
+    let parsed: BTreeMap<String, Truth> = serde_json::from_value(truth)?;
+    let rotation_path = temp.path().join("rotations.db");
+    let db = crate::rotation_db::RotationDb::open_at(&rotation_path)?;
+    // Leave the first body page portrait so the existing leading-landscape
+    // exclusion cannot hide the saved rotation's consensus change.
+    for page in 2..=8 {
+        db.set_key(
+            &crate::adjustment_db::zip_entry_key(&zip_path, &format!("{page:03}.png")),
+            if page % 2 == 0 {
+                Rotation::Cw90
+            } else {
+                Rotation::Cw270
+            },
+        )?;
+    }
+    drop(db);
+    let before = std::fs::read(&rotation_path)?;
+    for (name, physical, reencode) in [
+        ("original", Rotation::None, false),
+        ("reencoded", Rotation::None, true),
+        ("physical", Rotation::Cw90, true),
+    ] {
+        let output = temp.path().join(name);
+        let mut mode = synthetic_decode_mode(true);
+        mode.image_rotation = physical;
+        mode.reencode_input = reencode;
+        mode.rotation_db = Some(rotation_path.clone());
+        {
+            let _data = crate::data_dir::TestDataDirGuard::new();
+            let loaded = load_case(
+                temp.path(),
+                "rotated-body",
+                &parsed["rotated-body"],
+                &mode,
+                &output,
+            )?;
+            assert_eq!(
+                loaded.sample,
+                Err(crate::cover_auto_sample::PageAspectDecline::Landscape)
+            );
+            assert_eq!(loaded.original_dims, (280, 200));
+            assert_eq!(
+                (loaded.image.width(), loaded.image.height()),
+                if physical.is_none() {
+                    (280, 200)
+                } else {
+                    (200, 280)
+                }
+            );
+        }
+        evaluate_directory(temp.path(), &output, &mode, FallbackConfig::default())?;
+        let summary: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output.join("summary.json"))?)?;
+        let row = &summary["rows"][0];
+        assert!(row["page_aspect"].is_null());
+        assert_eq!(row["page_aspect_decline"], "landscape");
+        assert_eq!(row["reason"], "no-page-aspect");
+        assert_eq!(
+            row["saved_rotation"],
+            Rotation::from_degrees(-physical.degrees()).degrees()
+        );
+        assert!(row["prediction"].is_null());
+        assert_eq!(summary["negative_cropped"], 0);
+        assert_eq!(summary["negative_declined"], 1);
+        if reencode {
+            assert!(output.join("inputs/rotated-body.zip").is_file());
+        }
+    }
+    assert_eq!(std::fs::read(rotation_path)?, before);
+    Ok(())
+}
+
+#[test]
+fn evaluation_layout_directory_summary_counts_each_type_and_keeps_positions_and_iou()
+-> Result<(), Box<dyn std::error::Error>> {
+    let target = std::env::current_dir()?.join("target");
+    std::fs::create_dir_all(&target)?;
+    let temp = tempfile::Builder::new()
+        .prefix("cover-auto-layout-summary-")
+        .tempdir_in(target)?;
+    let mut truth = serde_json::Map::new();
+    for (kind, width, left) in [
+        ("T1", 224, 81.2),
+        ("T2", 280, 0.0),
+        ("T3", 392, 88.2),
+        ("T4", 476, 88.2),
+    ] {
+        for ltr in [false, true] {
+            let name = format!("{kind}-{}", if ltr { "ltr" } else { "rtl" });
+            DynamicImage::new_rgb8(width, 200).save(temp.path().join(format!("{name}.png")))?;
+            let front = if ltr {
+                [f64::from(width) - left - 142.8, f64::from(width) - left]
+            } else {
+                [left, left + 142.8]
+            };
+            truth.insert(name, json!({"front":front,"ltr":ltr,"page_aspect":0.7}));
+        }
+    }
+    std::fs::write(temp.path().join("truth.json"), serde_json::to_vec(&truth)?)?;
+    for mode in [None, Some("layout"), Some("layout-snap")] {
+        let output = temp.path().join(mode.unwrap_or("baseline"));
+        evaluate_directory(
+            temp.path(),
+            &output,
+            &synthetic_decode_mode(true),
+            FallbackConfig::parse(mode, false)?,
+        )?;
+        let summary: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output.join("summary.json"))?)?;
+        assert_eq!(summary["good"], 8);
+        assert_eq!(summary["wrong"], 0);
+        assert_eq!(summary["fallback_cropped"], 0);
+        assert_eq!(summary["algorithm"], "autocrop:v3");
+        assert_eq!(summary["ratio_distribution"]["count"], 8);
+        for row in summary["rows"].as_array().unwrap() {
+            assert_eq!(row["production_method"], "layout-fallback");
+            assert_eq!(
+                row["production_layout"].as_str().unwrap(),
+                &row["name"].as_str().unwrap()[..2]
+            );
+            assert!(row["fallback"].is_null());
+            assert!(row["iou"].as_f64().unwrap() > 0.999);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn evaluation_layout_ratio_histogram_keeps_decimal_boundaries_and_saved_angle() {
+    let mut histogram = RatioDistribution::default();
+    for width in [160, 180, 200, 240] {
+        histogram.record((width, 200), Some(0.5), Rotation::None);
+    }
+    histogram.record((200, 240), Some(0.5), Rotation::Cw90);
+    assert_eq!(
+        histogram.json(),
+        json!({"bin_width":0.2,"count":5,"bins":[
+            {"lower":1.6,"upper":1.8,"count":1},
+            {"lower":1.8,"upper":2.0,"count":1},
+            {"lower":2.0,"upper":2.2,"count":1},
+            {"lower":2.4,"upper":2.6,"count":2}
+        ]})
+    );
+    assert!(histogram.record((200, 200), None, Rotation::None).is_none());
+    assert_eq!(histogram.json()["count"], 5);
 }

@@ -120,6 +120,7 @@ fn seed_legacy(
             Some((12, 8)),
             &webp(),
             &CoverIdentity::Legacy,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic,
         )
         .unwrap();
     let row = catalog.load_one(&key).unwrap().unwrap();
@@ -298,6 +299,7 @@ fn cover_identity_child_cache_preserves_pixels_identity_and_resolves_legacy_pin(
                 Some((12, 8)),
                 &webp(),
                 &child_identity,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let key = format!("folderthumb:child-{index}");
@@ -340,6 +342,7 @@ fn cover_identity_child_cache_preserves_pixels_identity_and_resolves_legacy_pin(
             Some((12, 8)),
             &webp(),
             &CoverIdentity::Legacy,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic,
         )
         .unwrap();
     let mut req = request(&folder, "folderthumb:pinned-child");
@@ -521,6 +524,7 @@ fn cover_identity_drive_seed_same_bytes_with_changed_identity_sends_terminal_pix
             Some((12, 8)),
             &webp(),
             &expected,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic,
         )
         .unwrap();
     let current = catalog.load_one(&key).unwrap().unwrap();

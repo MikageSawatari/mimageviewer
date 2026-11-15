@@ -165,6 +165,7 @@ pub(crate) fn prepare(
                 entries.push((
                     cache_key,
                     crate::catalog::CacheEntry {
+                        auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                         cover: crate::cover_identity::CoverIdentity::Page(
                             crate::adjustment_db::normalize_path(&seed.video_path),
                         ),
