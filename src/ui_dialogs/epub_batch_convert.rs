@@ -292,6 +292,91 @@ mod tests {
     use super::*;
 
     #[test]
+    fn section1761_batch_completion_adopts_committed_rotation() {
+        let mut app = crate::app::setup_app_for_test();
+        let source = app.tmp.path().join("batch.epub");
+        let destination = source.with_extension("pdf");
+        let source_key = format!("{}::page_1", crate::adjustment_db::normalize_path(&source));
+        let destination_key = format!(
+            "{}::page_1",
+            crate::adjustment_db::normalize_path(&destination)
+        );
+        app.rotation_db
+            .as_ref()
+            .unwrap()
+            .set_key(&source_key, crate::rotation_db::Rotation::Cw90)
+            .unwrap();
+        app.update_rotation_page_owner([(source_key, crate::rotation_db::Rotation::Cw90)]);
+        app.items = vec![GridItem::PdfFile(source.clone())];
+        let data_dir = app.tmp.path().to_path_buf();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel();
+        // Exercise run_batch's real Done/Finished producer. PDF rendering and
+        // publication are omitted; its save callback runs the actual DB-copy tail.
+        let epoch = crate::page_edit_write_epoch::TestEpochScope::capture().unwrap();
+        std::thread::spawn(move || {
+            let _epoch = crate::page_edit_write_epoch::TestEpochScope::enter(epoch);
+            run_batch(vec![source], worker_cancel, tx, |source| {
+                let destination = source.with_extension("pdf");
+                let mappings = [
+                    crate::rename_key_migration::StoreCopyPathMapping::exact(source, &destination),
+                    crate::rename_key_migration::StoreCopyPathMapping::virtual_prefix(
+                        source,
+                        &destination,
+                    ),
+                ];
+                let copied = crate::rename_key_migration::copy_restore_stores_without_identity_at(
+                    &data_dir, &mappings,
+                );
+                assert!(copied.errors.is_empty(), "{:?}", copied.errors);
+                let key = format!(
+                    "{}::page_1",
+                    crate::adjustment_db::normalize_path(&destination)
+                );
+                assert!(copied.store_mutations.rotation_keys().contains(&key));
+                Ok(epub_convert::SavedPdf {
+                    path: destination,
+                    reused_cache: false,
+                    user_data_errors: copied.errors,
+                })
+            });
+        })
+        .join()
+        .unwrap();
+        app.epub_batch_convert = Some(EpubBatchPending {
+            rx,
+            cancel_after_current: cancel,
+            total: 1,
+            current_name: String::new(),
+            results: Vec::new(),
+            finished: false,
+            refreshed: false,
+        });
+        app.poll_epub_batch_convert();
+        let pending = app.epub_batch_convert.as_ref().unwrap();
+        assert!(pending.finished && pending.refreshed);
+        assert!(matches!(
+            &pending.results[0].1,
+            EpubBatchResult::Saved(path, warnings) if path == &destination && warnings.is_empty()
+        ));
+        assert_eq!(
+            app.rotation_db.as_ref().unwrap().get_key(&destination_key),
+            Some(crate::rotation_db::Rotation::Cw90),
+            "the batch worker committed the copied destination rotation"
+        );
+        app.items = vec![GridItem::PdfFile(destination)];
+        assert_eq!(
+            (
+                app.rotation_for_page_key(&destination_key),
+                app.grid_edit_badges(0).rotation,
+            ),
+            (crate::rotation_db::Rotation::Cw90, true),
+            "batch refresh must adopt the copied rotation into the memory-only cover and badge owner"
+        );
+    }
+
+    #[test]
     fn epub_batch_uses_clicked_book_when_none_checked_and_filters_mixed_selection() {
         let items = vec![
             GridItem::PdfFile(PathBuf::from("first.pdf")),

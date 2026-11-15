@@ -3,6 +3,9 @@ use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, Pre
 use super::*;
 use crate::ui_dialogs::context_menu::DeleteTarget;
 
+mod repro742;
+mod section1768;
+
 pub(crate) fn assert_cache_book_cover_only_worker_catalog_contract(
     app: &mut App,
     directory: &Path,
