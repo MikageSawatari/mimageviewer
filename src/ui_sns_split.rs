@@ -92,10 +92,12 @@ fn sns_split_instagram_ratio_is_out_of_range(
     if layout.target != SnsTarget::Instagram {
         return false;
     }
-    let (_, _, width, height) = layout.frames()[0].pixel_bounds(image_size[0], image_size[1]);
-    let width = width as u128;
-    let height = height as u128;
-    width * 4 < height * 3 || width * 100 > height * 191
+    layout.frames().iter().any(|frame| {
+        let (_, _, width, height) = frame.pixel_bounds(image_size[0], image_size[1]);
+        let width = width as u128;
+        let height = height as u128;
+        width * 4 < height * 3 || width * 100 > height * 191
+    })
 }
 
 fn sns_split_export_disabled_reason(
@@ -241,7 +243,7 @@ enum SnsSplitVerticalAnchor {
     Max,
 }
 
-/// 理論上の group aspect を整数化したあと、先頭の実枠がプリセット比率へ最も
+/// 理論上の group aspect を整数化したあと、いちばん細い実枠がプリセット比率へ最も
 /// 近くなる整数高さへ揃える。割り切れない横幅でも 3:4 プリセット自身が
 /// Instagram の 0.75 下限を丸め誤差だけで外れないよう、判定と同じ実枠を正にする。
 fn snap_fixed_frame_height(
@@ -253,13 +255,18 @@ fn snap_fixed_frame_height(
     let Some((ratio_width, ratio_height)) = frame_ratio.frame_ratio_parts() else {
         return layout;
     };
-    let first_frame_width = layout.frames()[0].width().round().max(1.0) as usize;
+    let narrowest_frame_width = layout
+        .frames()
+        .iter()
+        .map(|frame| frame.pixel_bounds(image_size[0], image_size[1]).2)
+        .min()
+        .unwrap_or(1);
     // 固定プリセットはすべて 3:4 以上だが、最近傍への整数丸めだけで実枠が
     // 0.75 未満になる場合がある (3k+2 px の 3:4 や極小の 4:5)。幅は保ち、
     // Instagram 下限を満たす最大整数高さへ内側から制限する。
-    let height_numerator = first_frame_width as u128 * ratio_height;
+    let height_numerator = narrowest_frame_width as u128 * ratio_height;
     let nearest_height = (height_numerator + ratio_width / 2) / ratio_width;
-    let instagram_safe_height = first_frame_width as u128 * 4 / 3;
+    let instagram_safe_height = narrowest_frame_width as u128 * 4 / 3;
     let desired_height = nearest_height
         .min(instagram_safe_height)
         .max(1)
@@ -838,7 +845,18 @@ impl App {
             self.show_context_shortcuts_help = true;
             return action;
         }
-        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        if self
+            .keyboard_owner_for_pass(ctx)
+            .fullscreen_raw_key_permit()
+            .is_some_and(|permit| {
+                crate::keyboard_input::consume_fullscreen_raw_key(
+                    ctx,
+                    permit,
+                    egui::Modifiers::NONE,
+                    egui::Key::Escape,
+                )
+            })
+        {
             if !self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::Escape) {
                 self.reset_sns_split_mode();
             }
@@ -1143,6 +1161,7 @@ impl App {
                         .suffix("%"),
                 )
                 .labelled_by(seam_label.id);
+            crate::ime_focus::track_drag_value_focus(&response);
             if response.changed() {
                 seam_permille = (seam_percent * 10.0)
                     .round()
@@ -1603,7 +1622,15 @@ mod tests {
                                 ..Default::default()
                             },
                             |ctx| {
-                                app.handle_sns_split_keys(ctx, 0);
+                                let action = app.handle_fs_key_input(ctx, 0, false);
+                                assert!(!action.close);
+                                app.draw_sns_split_panel(
+                                    ctx,
+                                    0,
+                                    ctx.content_rect(),
+                                    Some(size),
+                                    None,
+                                );
                             },
                         )
                         .drop_without_applying_deltas();
@@ -2439,9 +2466,19 @@ mod tests {
         let two = transition_count(initial, 2);
         let baseline = transition_count(two, 4);
         assert_eq!(center_cell(baseline), center_cell(initial));
+        // The narrowest actual frame is 205px; its nearest 4:5 height is
+        // 256px. Keep the full round-trip invariants below after this snap.
+        assert_eq!(
+            baseline
+                .frames()
+                .iter()
+                .map(|frame| frame.width())
+                .fold(f32::INFINITY, f32::min),
+            205.0
+        );
         assert_eq!(
             [baseline.group.width(), baseline.group.height()],
-            [877.0, 257.0]
+            [877.0, 256.0]
         );
 
         let mut repeated = baseline;
@@ -2484,6 +2521,7 @@ mod tests {
     fn fixed_presets_stay_inside_instagram_limit_after_integer_rounding() {
         let cases = [
             ([834, 1000], 3, SnsFrameRatio::Ratio3x4, [278, 370]),
+            ([836, 1000], 3, SnsFrameRatio::Ratio3x4, [279, 370]),
             ([4, 3], 2, SnsFrameRatio::Ratio4x5, [2, 2]),
             (
                 [12_582_916, 8_388_611],
@@ -2505,6 +2543,36 @@ mod tests {
             assert_eq!([frame_width, frame_height], expected_frame_size);
             assert!(frame_width as u128 * 4 >= frame_height as u128 * 3);
             assert_eq!(sns_split_export_disabled_reason(layout, image_size), None);
+        }
+    }
+
+    #[test]
+    fn fixed_presets_pass_all_instagram_frames_for_every_count() {
+        for count in crate::sns_split::MIN_COUNT..=crate::sns_split::MAX_COUNT {
+            for ratio in [
+                SnsFrameRatio::Ratio3x4,
+                SnsFrameRatio::Ratio4x5,
+                SnsFrameRatio::Ratio1x1,
+            ] {
+                for image_size in [
+                    [836, 1000],
+                    [832, 1216],
+                    [1921, 1081],
+                    [41, 100],
+                    [1001, 37],
+                ] {
+                    let layout = fit_sns_split_to_full_image(
+                        SnsSplitLayout::centered_max(SnsTarget::Instagram, count, image_size),
+                        ratio,
+                        image_size,
+                    );
+                    assert_eq!(
+                        sns_split_export_disabled_reason(layout, image_size),
+                        None,
+                        "{image_size:?}, count={count}, {ratio:?}: {layout:?}"
+                    );
+                }
+            }
         }
     }
 
@@ -2677,7 +2745,7 @@ mod tests {
     }
 
     #[test]
-    fn instagram_ratio_check_uses_the_first_actual_frame_when_widths_differ() {
+    fn instagram_ratio_check_rejects_a_wider_middle_frame() {
         let image_size = [574, 100];
         let layout = SnsSplitLayout::centered_max(SnsTarget::Instagram, 3, image_size);
         let frames = layout.frames();
@@ -2689,7 +2757,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![191, 192, 191]
         );
-        assert_eq!(sns_split_export_disabled_reason(layout, image_size), None);
+        assert_eq!(
+            sns_split_export_disabled_reason(layout, image_size),
+            Some(SNS_SPLIT_INSTAGRAM_RATIO_REASON)
+        );
+    }
+
+    #[test]
+    fn instagram_ratio_check_rejects_a_narrower_middle_frame() {
+        let image_size = [836, 372];
+        let layout = SnsSplitLayout::centered_max(SnsTarget::Instagram, 3, image_size);
+        let widths: Vec<_> = layout
+            .frames()
+            .iter()
+            .map(|frame| frame.pixel_bounds(image_size[0], image_size[1]).2)
+            .collect();
+        assert_eq!(widths, [279, 278, 279]);
+        assert_eq!(
+            sns_split_export_disabled_reason(layout, image_size),
+            Some(SNS_SPLIT_INSTAGRAM_RATIO_REASON)
+        );
     }
 
     #[test]
@@ -2728,7 +2815,7 @@ mod tests {
     #[test]
     fn minimum_group_width_rejection_uses_the_shared_too_small_reason() {
         for target in SnsTarget::ALL {
-            for (width, expected_reason) in [(14, Some(SNS_SPLIT_TOO_SMALL_REASON)), (15, None)] {
+            for width in [14, 15] {
                 let image_size = [width, 1];
                 let layout = SnsSplitLayout {
                     target,
@@ -2737,7 +2824,17 @@ mod tests {
                     group: CropRect::full(width, 1),
                 }
                 .clamped(image_size);
-                assert_eq!(layout.fits(image_size), expected_reason.is_none());
+                let fits = width == 15;
+                assert_eq!(layout.fits(image_size), fits);
+                // Width 15 can place every frame, but some are 2x1: the
+                // all-frame Instagram check must reject those wide frames.
+                let expected_reason = if !fits {
+                    Some(SNS_SPLIT_TOO_SMALL_REASON)
+                } else if target == SnsTarget::Instagram {
+                    Some(SNS_SPLIT_INSTAGRAM_RATIO_REASON)
+                } else {
+                    None
+                };
                 assert_eq!(
                     sns_split_export_disabled_reason(layout, image_size),
                     expected_reason
