@@ -578,6 +578,26 @@ impl DeferredClientActivationGesture {
                     }
                     release_ordinal += 1;
                 }
+                Event::PointerButtonReleased {
+                    button: PointerButton::Primary,
+                    ..
+                } => {
+                    // A real captured release has no coordinate after CursorLeft.
+                    // The raw fact ends only this operation; it cannot authorize
+                    // a close hit, page command or a new pointer position.
+                    match self.owner.gesture {
+                        ClientGestureOwner::Mouse(ClientGesture {
+                            destination: ClientGestureDestination::ActivateOnly,
+                            ..
+                        }) => self.complete(ClientActivationSource::MouseClick, &mut activation),
+                        ClientGestureOwner::Mouse(_) => {
+                            self.cancel_owner(ClientActivationCancelReason::PointerGone)
+                        }
+                        ClientGestureOwner::SuppressedMouse(reason, _) => self.cancel_owner(reason),
+                        _ => {}
+                    }
+                    release_ordinal += 1;
+                }
                 _ => {}
             }
             // A canonical owner may consume its own completed input fact even
@@ -1028,6 +1048,10 @@ fn ordered_cancellations(
                 pressed,
                 ..
             } if !promoted_primary_indices.contains(&index) => *pressed,
+            Event::PointerButtonReleased {
+                button: PointerButton::Primary,
+                ..
+            } => false,
             _ => continue,
         };
         let before = index;

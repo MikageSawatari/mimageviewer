@@ -260,9 +260,11 @@ impl TouchFrame {
             .filter(|event| {
                 event.phase == PrimaryPhase::Button(false)
                     && event.ownership != PrimaryOwnership::Mouse
-                    && self.is_touch_primary(event.pos, false)
+                    && event
+                        .pos
+                        .is_some_and(|pos| self.is_touch_primary(pos, false))
             })
-            .map(|event| event.pos)
+            .filter_map(|event| event.pos)
     }
 
     pub(crate) fn is_touch_primary(&self, pos: Pos2, pressed: bool) -> bool {
@@ -281,7 +283,7 @@ impl TouchFrame {
         self.primary_events
             .iter()
             .rev()
-            .find(|event| event.pos == pos && event.phase == PrimaryPhase::Button(pressed))
+            .find(|event| event.pos == Some(pos) && event.phase == PrimaryPhase::Button(pressed))
     }
 
     pub(crate) fn accepts_grid_tap_release(&self, pos: Pos2) -> bool {
@@ -361,7 +363,7 @@ impl TouchCorrelationState {
                     return false;
                 }
                 frame.primary_events.push(CorrelatedPrimary {
-                    pos: touch.pos,
+                    pos: Some(touch.pos),
                     release_ordinal,
                     phase: PrimaryPhase::Button(true),
                     ownership: touch.ownership,
@@ -374,7 +376,7 @@ impl TouchCorrelationState {
             PendingSignature::MoveMoved(touch) => {
                 if matches!(event, Event::PointerMoved(pos) if *pos == touch.pos) {
                     frame.primary_events.push(CorrelatedPrimary {
-                        pos: touch.pos,
+                        pos: Some(touch.pos),
                         release_ordinal,
                         phase: PrimaryPhase::Moved,
                         ownership: touch.ownership,
@@ -392,7 +394,7 @@ impl TouchCorrelationState {
                     return false;
                 }
                 frame.primary_events.push(CorrelatedPrimary {
-                    pos: touch.pos,
+                    pos: Some(touch.pos),
                     release_ordinal,
                     phase: PrimaryPhase::Button(false),
                     ownership: touch.ownership,
@@ -465,7 +467,9 @@ enum TouchGestureEventKind {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct CorrelatedPrimary {
-    pos: Pos2,
+    // A physical terminal can have no coordinate after PointerGone. It still
+    // occupies its exact release ordinal, but can never be a touch/tap hit.
+    pos: Option<Pos2>,
     /// Raw primary-release order, including current events later discarded as
     /// ambiguous. A press carries the ordinal of its upcoming release as well.
     release_ordinal: usize,
@@ -896,6 +900,9 @@ impl TouchCorrelationState {
                     button: PointerButton::Primary,
                     pressed: false,
                     ..
+                } | Event::PointerButtonReleased {
+                    button: PointerButton::Primary,
+                    ..
                 }
             ) {
                 release_ordinal += 1;
@@ -984,7 +991,7 @@ impl TouchCorrelationState {
                 frame.record_cancel_stream_call();
                 self.cancel_stream(geometry, now_ms);
                 frame.primary_events.push(CorrelatedPrimary {
-                    pos: *pos,
+                    pos: Some(*pos),
                     release_ordinal,
                     phase: PrimaryPhase::Button(*pressed),
                     ownership: PrimaryOwnership::Mouse,
@@ -992,8 +999,25 @@ impl TouchCorrelationState {
                     accepted_grid_tap: false,
                 });
             }
+            Event::PointerButtonReleased {
+                button: PointerButton::Primary,
+                ..
+            } => {
+                frame.ambiguous = true;
+                frame.record_unmatched_primary(event);
+                frame.record_cancel_stream_call();
+                self.cancel_stream(geometry, now_ms);
+                frame.primary_events.push(CorrelatedPrimary {
+                    pos: None,
+                    release_ordinal,
+                    phase: PrimaryPhase::Button(false),
+                    ownership: PrimaryOwnership::Mouse,
+                    should_suppress: false,
+                    accepted_grid_tap: false,
+                });
+            }
             Event::PointerMoved(pos) => frame.primary_events.push(CorrelatedPrimary {
-                pos: *pos,
+                pos: Some(*pos),
                 release_ordinal,
                 phase: PrimaryPhase::Moved,
                 ownership: PrimaryOwnership::Mouse,
@@ -1306,6 +1330,14 @@ pub(crate) fn preview_touch_primary_event_indices(
             if !pressed {
                 release_ordinal += 1;
             }
+        } else if matches!(
+            event,
+            Event::PointerButtonReleased {
+                button: PointerButton::Primary,
+                ..
+            }
+        ) {
+            release_ordinal += 1;
         }
     }
     indices
@@ -1813,6 +1845,36 @@ mod tests {
                 tap_zones: true,
             },
         }
+    }
+
+    #[test]
+    fn realmachine55_positionless_mouse_release_preserves_following_release_ordinals() {
+        let mut state = TouchCorrelationState::default();
+        let pos = pos2(500.0, 400.0);
+        let next = pos2(700.0, 400.0);
+        let mut events = vec![Event::PointerButtonReleased {
+            button: PointerButton::Primary,
+            modifiers: Modifiers::NONE,
+        }];
+        events.extend(tap_events(1, pos));
+        events.extend(mouse_click(next));
+        let frame = process(&mut state, &events, 100);
+        let old = frame.grid_primary_edge(0, false);
+        assert!(old.ordinary_mouse && !old.touch_derived && !old.accepted_tap);
+        // The existing mixed mouse/touch policy drops Current touch authority.
+        // Its raw Up still occupies ordinal 1; it cannot steal the next mouse Up.
+        assert!(!frame.grid_primary_edge(1, false).touch_derived);
+        for pressed in [true, false] {
+            let fresh = frame.grid_primary_edge(2, pressed);
+            assert!(fresh.ordinary_mouse && !fresh.touch_derived && !fresh.accepted_tap);
+        }
+        assert!(frame.commands().is_empty());
+        assert!(
+            frame
+                .correlated_primary_release_positions()
+                .next()
+                .is_none()
+        );
     }
 
     fn touch(id: u64, phase: egui::TouchPhase, pos: Pos2) -> Event {

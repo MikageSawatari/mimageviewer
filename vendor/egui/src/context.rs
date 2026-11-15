@@ -556,6 +556,7 @@ impl ContextImpl {
             for event in &viewport.input.events {
                 match *event {
                     crate::Event::WindowFocused(false) => capture = None,
+                    crate::Event::PointerButtonReleased { .. } => capture = None,
                     crate::Event::PointerButton {
                         pos,
                         button,

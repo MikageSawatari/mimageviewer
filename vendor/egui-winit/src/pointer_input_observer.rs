@@ -22,8 +22,8 @@ pub enum PointerInputSource {
 pub enum NormalizedPointerInput {
     Pressed(PointerInputSource),
     Released(PointerInputSource),
-    /// Includes a native mouse release for which no egui primary release could
-    /// be emitted (for example after the cursor position became unavailable).
+    /// A native cancellation or an unmatched mouse release (no forwarded hold).
+    /// A forwarded physical hold can end without a current pointer position.
     Cancelled(PointerInputSource),
 }
 
@@ -56,7 +56,7 @@ pub(crate) fn log_pressed_discard(
         PointerInputSource::Mouse => "ClientClick",
         PointerInputSource::Touch(_) => "TouchTap",
     };
-    log::info!(
+    log::info!(target: "egui_winit::pointer_input_observer::diagnostic",
         "[detached-activation] boundary=normalized_input source={source} decision={reason:?} input=Pressed({input_source:?}) viewport={viewport:?} registration={:?}",
         ctx.viewport_registration(viewport),
     );
@@ -136,6 +136,14 @@ fn normalized_input(event: &WindowEvent, appended: &[Event]) -> Option<Normalize
                     pressed: emitted_pressed,
                     ..
                 } if *emitted_pressed == pressed)
+                    || (!pressed
+                        && matches!(
+                            event,
+                            Event::PointerButtonReleased {
+                                button: PointerButton::Primary,
+                                ..
+                            }
+                        ))
             });
             match (pressed, emitted) {
                 (true, true) => Some(NormalizedPointerInput::Pressed(PointerInputSource::Mouse)),
@@ -299,6 +307,91 @@ mod tests {
             primary_position(&dispatch(&mut state, &mouse(true, MouseButton::Left))),
             Some(egui::pos2(40.0, 50.0))
         );
+    }
+
+    #[test]
+    fn realmachine55_captured_outside_release_is_terminal_without_position() {
+        let (mut state, observed) = fixture();
+        dispatch(&mut state, &moved(40.0, 60.0));
+        dispatch(&mut state, &mouse(true, MouseButton::Left));
+        dispatch(&mut state, &moved(-40.0, 60.0));
+        dispatch(&mut state, &left());
+        dispatch(&mut state, &mouse(false, MouseButton::Left));
+        assert_eq!(
+            phases(&observed),
+            vec![
+                NormalizedPointerInput::Pressed(PointerInputSource::Mouse),
+                NormalizedPointerInput::Released(PointerInputSource::Mouse),
+            ]
+        );
+        let events = state.egui_input_mut().take().events;
+        let ctx = state.egui_ctx.clone();
+        ctx.run_ui(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .drop_without_applying_deltas();
+        assert!(!ctx.input(|input| input.pointer.primary_down()));
+        assert_eq!(ctx.input(|input| input.pointer.hover_pos()), None);
+        assert!(!ctx.input(|input| input.pointer.any_click()));
+    }
+
+    #[test]
+    fn realmachine55_positionless_mouse_terminal_is_owned_once_per_button() {
+        for button in [
+            MouseButton::Left,
+            MouseButton::Right,
+            MouseButton::Middle,
+            MouseButton::Back,
+            MouseButton::Forward,
+        ] {
+            let (mut state, _) = fixture();
+            dispatch(&mut state, &moved(40.0, 60.0));
+            dispatch(&mut state, &mouse(true, button));
+            dispatch(&mut state, &left());
+            let terminal = dispatch(&mut state, &mouse(false, button));
+            assert!(
+                matches!(terminal.as_slice(), [Event::PointerButtonReleased { button: released, .. }] if Some(*released) == crate::translate_mouse_button(button))
+            );
+            assert!(dispatch(&mut state, &mouse(false, button)).is_empty());
+        }
+    }
+
+    #[test]
+    fn realmachine55_touch_promotion_does_not_own_a_physical_mouse_terminal() {
+        for phase in [
+            winit::event::TouchPhase::Ended,
+            winit::event::TouchPhase::Cancelled,
+        ] {
+            let (mut state, observed) = fixture();
+            dispatch(&mut state, &touch(1, winit::event::TouchPhase::Started));
+            dispatch(&mut state, &touch(1, phase));
+            assert!(dispatch(&mut state, &mouse(false, MouseButton::Left)).is_empty());
+            assert_eq!(
+                phases(&observed).last(),
+                Some(&NormalizedPointerInput::Cancelled(
+                    PointerInputSource::Mouse
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn realmachine55_simulated_touch_and_physical_mouse_both_end_without_cursor() {
+        let (mut state, _) = fixture();
+        state.simulate_touch_screen = true;
+        dispatch(&mut state, &moved(40.0, 60.0));
+        dispatch(&mut state, &mouse(true, MouseButton::Left));
+        dispatch(&mut state, &moved(-40.0, 80.0));
+        dispatch(&mut state, &left());
+        let terminal = dispatch(&mut state, &mouse(false, MouseButton::Left));
+        assert!(
+            matches!(terminal.as_slice(), [Event::PointerButtonReleased { .. }, Event::Touch { phase: TouchPhase::End, pos, .. }] if *pos == egui::pos2(-20.0,40.0))
+        );
+        assert!(!state.any_pointer_button_down);
     }
 
     #[test]
@@ -621,19 +714,31 @@ mod tests {
     }
 
     #[test]
-    fn pointer_input_observer_positionless_press_has_no_proof_and_release_cancels() {
+    fn pointer_input_observer_positionless_press_has_no_proof_but_owned_release_completes() {
         let (mut state, observed) = fixture();
         assert!(dispatch(&mut state, &mouse(true, MouseButton::Left)).is_empty());
         assert!(phases(&observed).is_empty());
-        state.pointer_pos_in_points = Some(egui::Pos2::ZERO);
-        dispatch(&mut state, &mouse(true, MouseButton::Left));
-        state.pointer_pos_in_points = None;
         assert!(dispatch(&mut state, &mouse(false, MouseButton::Left)).is_empty());
         assert_eq!(
             phases(&observed),
+            [NormalizedPointerInput::Cancelled(PointerInputSource::Mouse)]
+        );
+        state.pointer_pos_in_points = Some(egui::Pos2::ZERO);
+        dispatch(&mut state, &mouse(true, MouseButton::Left));
+        dispatch(&mut state, &left());
+        assert!(matches!(
+            dispatch(&mut state, &mouse(false, MouseButton::Left)).as_slice(),
+            [Event::PointerButtonReleased {
+                button: PointerButton::Primary,
+                ..
+            }]
+        ));
+        assert_eq!(
+            phases(&observed),
             [
-                NormalizedPointerInput::Pressed(PointerInputSource::Mouse),
                 NormalizedPointerInput::Cancelled(PointerInputSource::Mouse),
+                NormalizedPointerInput::Pressed(PointerInputSource::Mouse),
+                NormalizedPointerInput::Released(PointerInputSource::Mouse),
             ]
         );
     }

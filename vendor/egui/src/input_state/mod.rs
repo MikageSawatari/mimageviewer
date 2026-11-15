@@ -1248,6 +1248,19 @@ impl PointerState {
 
                     self.down[button as usize] = pressed; // must be done after the above call to `could_any_button_be_click`
                 }
+                Event::PointerButtonReleased { button, .. } => {
+                    let button = *button;
+                    // The integration owns a real press/release pair but has no
+                    // release coordinate. Do not reuse the old interact_pos for
+                    // a click or restore hover after PointerGone.
+                    self.pointer_events.push(PointerEvent::Released {
+                        click: None,
+                        button,
+                    });
+                    self.down[button as usize] = false;
+                    self.press_origin = None;
+                    self.press_start_time = None;
+                }
                 Event::PointerGone => {
                     self.latest_pos = None;
                     // When dragging a slider and the mouse leaves the viewport, we still want the drag to work,

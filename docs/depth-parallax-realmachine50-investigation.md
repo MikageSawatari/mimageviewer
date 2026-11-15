@@ -271,6 +271,8 @@ synthetic keyの終端権限、Bの外部openは変更していない。
   `ClientToScreen` / `WM_NCHITTEST` で問い合わせる。owner lock外で問い合わせ、現在cursorやrect探索へ代替しない。
   client座標変換失敗は既存のログ＋通知と取消にとどめる。raw pointer IDと昇格mouseを分離し、別pointer／兄弟は操作しない。
   caption移動・resizeの既存矩形履歴、native close優先、`DefSubclassProc` のOS既定動作は維持する。
+  この時点の「外へ出て戻っても取消」は依頼55の設計担当訂正で置き換えた。
+  現在は解放対象だけを照合し、戻って対象上で離した操作は完了する（§5.8）。
 - **P2-2／touch強制無効。** 旧実装は診断switchでTouchFrameを空にして、raw Touchに対応する昇格Pointerのtap完了も失っていた。
   callbackのcorrelation / tap完了という入力factと、追加touch command／primary suppressionを分離した。
   `MIV_DISABLE_TOUCH_GESTURES` 設定時も生成時provenanceを持つ単指tapは復帰／closeを完結し、追加touch commandは実行しない。
@@ -799,7 +801,8 @@ captionのMouse Down／DoubleClickが `DefSubclassProc` のmodal処理へ入っ�
 foreign HWNDへのcapture移譲、focus／cancel／Escapeは取消を維持する。
 利用者決定「案1」によりcaption／resizeの移動は取消にせず、native操作の終端で復帰する。
 旧initial_rectの捕捉・GetWindowRect・移動量比較・8px閾値は撤去した。
-caption buttonは押下時のhit-test対象から外れた場合だけ取消し、一度外へ出て戻す場合も取消を維持する。
+caption buttonは解放時のhit-test対象が押下対象と違う場合だけ取り消す。
+途中で外へ出ても戻って対象上で離せば完了する（独立レビュー後の設計担当訂正、§5.8）。
 同じbutton内の大きな移動だけでは取り消さない。×のCloseOwnedとOSのDefSubclassProcは維持する。
 
 ### 5.3 C: 復帰だけは保持時間をクリック条件に使わない
@@ -1000,6 +1003,137 @@ source交換・各取消・fresh操作と旧tailの分離までACCEPT、追加P1
 NonClient／長押し／ParkedLive transport、今回のcursor寿命とdrag／native touchを合わせて検証した。
 未確認は実機の同座標イベント列とpart3の座標差、OS caption modal loop／最大化・resize・touch・focus。
 製品起動・全件gate・確認用build・commit／pushは行わない。描画・レイアウトは変更せず、ui_snapshotは実行していない。
+
+### 5.8 依頼55の独立レビュー指摘の修正（2026-11-15）
+
+基点は `1d99a7a87`。独立レビュー（Sol / xhigh）の P1・P2 と設計担当の
+caption button 指摘を扱う。案1の「復帰に用いた操作は閲覧へ再配送しない」、
+modal / 退役 / CloseOwned の既存規則を維持する。構造変更への合意は継続し、
+実装時にも別の Sol / xhigh が生成・配送・取消・終端と同frame後続入力を監査した。
+
+**P1: 位置なしの物理releaseを失っていた。** winit 0.30.13 の
+`src/platform_impl/windows/event_loop.rs` の `capture_mouse`（978行付近）は
+SetCaptureで窓外入力も同じ窓へ配送する。WM_MOUSEMOVE（1643行付近）は
+signed client座標を取得し、`get_pointer_move_kind`（2652行付近）が外へ出たと判定すると
+CursorLeftを出し、その後に位置が変わっていれば窓外座標のCursorMovedを出す。
+`mouse.last_position` はこのMoveで更新する。一方、WM_MOUSELEAVE（1712行付近）は
+CursorLeftだけを出し、last_positionを消さない。したがって窓外Moveの後に届くLeaveで
+egui-winitのlogical位置が再びNoneになり得る。WM_LBUTTONUP（1797行付近）は
+`release_mouse`（985行付近、ReleaseCapture）を先に実行し、位置なしのMouseInput Releasedを出す。
+UpのlParamからCursorMovedを補わず、last_positionも更新しない。
+これはregistry内の当該版ソースとの照合であり、実機で全通知順を記録した証拠ではない。
+
+eguiのPointerGoneはhoverを消すだけでdownを解除しない。位置必須のPointerButtonへ
+過去の座標を代入すると、実際には窓外で離した操作を古い座標のclickにできてしまう。
+observerだけReleasedに変えても、eguiの保持とcallbackのraw入力終端が残る。
+このため `Event::PointerButtonReleased { button, modifiers }` を位置なしの終端として導入した。
+egui-winit Stateは実MouseInputでforwardしたbuttonの保持を所有し、その同じStateの
+位置なしUpを一度だけこのeventへ変換する。touchのpointer昇格は物理mouse保持を作らない。
+新Stateは保持を継承しない。focusだけでは実Upの配送権を捨てず、App側の既存取消が
+その操作の復帰を拒否する。simulate_touch_screenのraw Touch Endには、Touchの既存契約である
+「最後に検出した位置」を渡すが、mouse releaseの位置やhoverには転用しない。
+
+eguiは新eventでdown / press_originを終え、click=Noneのreleaseを記録し、位置を作らない。
+observerはその実終端をReleasedとして通知し、callbackは同じ順序のraw eventでActivateOnlyだけを完了する。
+closeのhitは認可しない。grid / front pointer / music / flat・panorama navigator / depth / touch correlationの
+release ordinal、canvas取消、modal終端保持、syntheticとの混在判定も同じeventへ接続した。
+前回の手作りUpテストを根拠にはせず、実State→observer→deferred callback→root commitを通す
+窓内・窓外・外から戻ったreleaseの3件を追加した。どれもページ・panの不変と次の通常操作を検査する。
+
+**P2: 診断が製品sinkへ届かなかった。** log facadeの最大levelがWarnであり、
+dependency filterにもvendor診断の許可がなかった。次の2targetのInfoだけを明示的に許可し、
+facade最大levelをInfoにする。一般のvendor Info、近似target、Debugは引き続き通さない。
+
+- `egui_winit::pointer_input_observer::diagnostic`
+- `eframe::native_window_input::diagnostic`
+
+producerの押下境界・理由型は維持し、毎frameの出力は追加しない。GPU診断の所有lock照会は
+対象Errorだけへ短絡させ、一般Infoに共有lockを増やさない。
+回帰は別test processで通常loggerを初期化し、実Stateの位置なし押下・observer未設置押下から
+log facade→非同期writer→通常log fileまで到達することを検査する。
+eframeのexact targetと、一般vendor Info拒否・既存Tantivy / surface Warn・GPU起動時Errorの対照も含む。
+
+**caption button: 解放時の対象とOSの選択を使う。** motionだけでは取り消さず、
+同じownerのUpのhit-testが押下対象と一致すれば完了候補にする。外で離した場合だけ
+CaptionButtonOutsideとし、外へ出て戻って対象上で離せば完了する。
+WM_NCLBUTTONUPはcapture中にはpostされないという
+[Win32仕様](https://learn.microsoft.com/en-us/windows/win32/inputdev/wm-nclbuttonup)がある。
+capture中の[WM_LBUTTONUP](https://learn.microsoft.com/en-us/windows/win32/inputdev/wm-lbuttonup)を、
+既存の同thread [WH_GETMESSAGE hook](https://learn.microsoft.com/en-us/windows/win32/winmsg/getmsgproc)で
+modal loopの消費前に観測し、そのmessageの座標をclient→screen→WM_NCHITTESTへ渡す。
+これは新しい位置推定・rect探索ではない。
+[WM_NCPOINTERUP](https://learn.microsoft.com/en-us/windows/win32/inputmsg/wm-ncpointerup)のhitと
+pointer capture時のWM_POINTERUPも同じownerで扱う。
+
+[WM_SYSCOMMAND](https://learn.microsoft.com/en-us/windows/win32/menurc/wm-syscommand)の
+実dispatchで押下対象に対応する最大化・最小化・復元等が選ばれた事実を
+`ButtonActionCommitted`へ確定し、native callの返却まで所有する。
+確定後のOSによるfocus / capture副作用では選択を巻き戻さない。
+確定前のtrue cancel、modal、registration退役、CloseOwnedは引き続き優先する。
+SCだけがqueueから見えた段階では確定しない。
+公開仕様が保証するcapture / hook / commandとrelease対象を合わせた設計であり、
+実Windowsのbutton tracking内部をheadlessで再現したという意味ではない。
+Upがhookにも一切見えずcapture0取消が先に届く列は従来どおりCaptureLostとし、
+未検証のOS列を推測で復活させる状態は足さない。
+
+**検証記録。** 全Cargo操作はOwner `codex/767-rm55` の指定run-heavy経由、直列。
+修正前のmain焦点は9実行 / 3成功 / 6失敗、exit 100（`target/rm55-r1-red-main.log`）。
+窓外release・sink・外戻り2件・SC完了2件が狙った境界で失敗した。
+vendorの実State窓外releaseも1実行 / 0成功 / 1失敗、exit 100
+（`target/rm55-r1-red-vendor.log`、Pressed→Cancelledと期待Releasedの不一致）。
+途中の焦点は254実行 / 253成功 / 1失敗、exit 100（`target/rm55-r1-focused.log`）。
+新規touch回帰が、実mouse混在でCurrent touchの実行権を落とす既存規則とViewer geometryに対して
+accepted grid tapを期待していたfixtureの誤りだった。製品規則は変えず、raw ordinal 1を消費した後の
+ordinal 2の新mouse press / releaseがMouse所属であることと、touch commandが空の対照へ直した。
+さらに3件の実State試験をzoom=2で強化した後の焦点は254実行 / 251成功 / 3失敗、exit 100
+（`target/rm55-r1-focused-final.log`）。復帰・ページ・pan不変までは成功し、次の通常クリックにpage1を
+期待した点が既存の「拡大時clickはview操作」という仕様に合わなかった。`fullscreen_click_belongs_to_view`
+を照合し、拡大したまま次の新dragでpanできる期待へ直した。製品変更は追加していない。
+
+最後の焦点は **254実行 / 254成功 / 0失敗、exit 0**
+（`target/rm55-r1-focused-green.log`）。位置なしreleaseの下流共有consumerを含む。
+loggerのignored child helperは通常sinkのglobal初期化を隔離するため、親testが別processで明示実行する。
+
+vendorの最初の緑確認は73実行 / 72成功 / 1失敗、exit 100
+（`target/rm55-r1-vendor-winit.log`）。従来の「位置なしUpは、forward済DownがあってもCancelled」
+という旧期待を、新しい終端契約へ合わせた。Down未受領時のUpはCancelled、
+forward済Downの位置なしUpだけは一回のReleased、という両方を同じテストで検査する。
+
+**最終結果。** nextestの共通引数は `--no-fail-fast --test-threads 6`。
+下表の件数は重複があるため合算しない。全行exit 0。
+
+| コマンド（nextestは上記共通引数を付与） | 件数／exit code／証拠 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/realmachine55_\|realmachine50_\|detached_activation\|native_detached\|non_client\|pointer_input_observer\|native_touch\|touch_correlation\|canvas_gesture/)'` | **254 / 254成功、exit 0**。`target/rm55-r1-focused-green.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/realmachine50_\|realmachine55_\|detached_activation\|native_detached\|non_client\|pointer_input_observer\|parked\|native_video\|touch\|key_input\|native_focus\|canvas_gesture\|similar_preview\|sidecar_restore\|navigator\|overflow\|grid_reclick_open\|logger/)'` | **1,113 / 1,113成功（1 slow）、exit 0**、138.201秒。`target/rm55-r1-regression.log` |
+| `cargo nextest run --manifest-path vendor/egui-winit/Cargo.toml --lib` | **73 / 73成功、exit 0**。`target/rm55-r1-vendor-winit-gate.log` |
+| `cargo nextest run --manifest-path vendor/egui/Cargo.toml --lib -E 'test(/positionless_release\|pointer_cancellation\|pointer_button_target\|input_state/)'` | **17 / 17成功、exit 0**。`target/rm55-r1-vendor-egui-gate.log` |
+| `cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features default_fonts,wgpu --lib -E 'test(/realmachine55_\|viewport_retirement\|native_window_input/)'` | **21 / 21成功、exit 0**。`target/rm55-r1-vendor-wgpu.log` |
+| 上行と同じコマンドで `--features default_fonts,glow` | **21 / 21成功、exit 0**。`target/rm55-r1-vendor-glow.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **core 1対象、exit 0**、349警告。`target/rm55-r1-check.log` |
+| `cargo fmt --manifest-path vendor/egui/Cargo.toml`、同 `vendor/egui-winit/Cargo.toml`、同 `vendor/eframe/Cargo.toml` | **3コマンド、各exit 0**。`target/rm55-r1-vendor-format-*.log` |
+| `python scripts/check_ui_glyphs.py` | **危険なglyph 0、exit 0** |
+
+最後のCargo操作は引数なし `cargo fmt`（同run-heavy経由、**exit 0**）。
+その後の `git diff --check` も **exit 0**。改行形式の既存設定による警告だけで、空白エラーはない。
+
+**変更ファイル（26件）。**
+
+- 入力／consumer: `src/key_input.rs`、`src/logger.rs`、`src/touch_correlation.rs`、
+  `src/ui_fullscreen.rs`、`src/ui_main.rs`、`src/similar_preview.rs`、`src/test_script.rs`、`src/app.rs`。
+- App: `src/app/detached_activation_gesture.rs`、`src/app/multiwindow_scenario_tests.rs`、
+  `src/app/canvas_gesture.rs`、`src/app/sidecar_restore.rs`、`src/app/update_phases.rs`。
+- vendor: `vendor/egui-winit/src/lib.rs`、`vendor/egui-winit/src/pointer_input_observer.rs`、
+  `vendor/eframe/src/native_window_input.rs`、`vendor/egui/src/data/input/event.rs`、
+  `vendor/egui/src/input_state/mod.rs`、`vendor/egui/src/context.rs`、
+  `vendor/egui/src/context/pointer_cancellation_tests.rs`、3 crateの `PATCHES.md`。
+- 文書: 本書、`docs/detached-rework-plan.md`、`docs/architecture-overview.md`。
+
+独立実装担当とは別のSol / xhighによる完成source監査はACCEPT、追加P1 / P2なし。
+テスト実行は実装担当が所有し、上記証跡を共有する。実Windowsのcapture / button tracking / focusの
+通知列、part2a / part3との実測対応、実機での製品動作は未確認。
+全件gate・build-dev・製品起動・commit / pushは実施しない。
+見た目・レイアウトは変更せず、ui_snapshotは実行しない。
 
 ## 6. 診断（初回調査の案、A実装で導入）
 

@@ -916,6 +916,9 @@ enum ParkedActivationCase {
     OverviewTouchClose,
     OverviewCloseMargin,
     CanonicalFreshClick,
+    StateInsideRelease,
+    StateOutsideRelease,
+    StateReenteredRelease,
     BufferedActiveClick,
 }
 
@@ -964,7 +967,8 @@ fn realmachine50_parked_click_case_with_touch_policy(
         assert_ne!(owner, app.viewer_context_main());
         driver.focus(App::detached_image_window_viewport_id(first));
         for _ in 0..3 { driver.root(&mut app); }
-        let canonical_input = if matches!(case, ParkedActivationCase::CanonicalFreshClick | ParkedActivationCase::BufferedActiveClick | ParkedActivationCase::Drag | ParkedActivationCase::TouchDrag | ParkedActivationCase::TouchTap | ParkedActivationCase::BarClose | ParkedActivationCase::TouchBarClose | ParkedActivationCase::OverviewTouchClose | ParkedActivationCase::OverviewCloseMargin) {
+        let real_state = matches!(case, ParkedActivationCase::StateInsideRelease | ParkedActivationCase::StateOutsideRelease | ParkedActivationCase::StateReenteredRelease);
+        let canonical_input = if real_state || matches!(case, ParkedActivationCase::CanonicalFreshClick | ParkedActivationCase::BufferedActiveClick | ParkedActivationCase::Drag | ParkedActivationCase::TouchDrag | ParkedActivationCase::TouchTap | ParkedActivationCase::BarClose | ParkedActivationCase::TouchBarClose | ParkedActivationCase::OverviewTouchClose | ParkedActivationCase::OverviewCloseMargin) {
             let registration = ctx.viewport_registration(App::detached_image_window_viewport_id(first)).unwrap();
             Some(crate::key_input::register_test_native_input_allocation(registration, 0x7675_0001))
         } else { None };
@@ -978,6 +982,10 @@ fn realmachine50_parked_click_case_with_touch_policy(
         }
         app.with_viewer_context(owner, |viewer| {
             assert!(viewer.detached_viewer_independent_active);
+            if real_state {
+                viewer.fs_zoom = 2.0;
+                viewer.fs_pan = egui::vec2(12.0, 8.0);
+            }
             if depth {
                 viewer.set_fs_exclusive_view(
                     crate::fs_exclusive_view::FsExclusiveView::Depth(
@@ -1104,7 +1112,32 @@ fn realmachine50_parked_click_case_with_touch_policy(
             events.insert(if touch { 0 } else { 1 }, egui::Event::PointerInputProvenance(operation));
         }
         let pan_before = app.with_viewer_context(owner, |viewer| (viewer.fs_zoom, viewer.fs_pan)).unwrap();
-        if matches!(case, ParkedActivationCase::Drag | ParkedActivationCase::TouchDrag) {
+        if real_state {
+            use winit::event::{DeviceId, ElementState, MouseButton, WindowEvent};
+            crate::key_input::install_normalized_pointer_input_observer(&ctx);
+            let mut state = realmachine55_pointer_state(&ctx, viewport);
+            let mouse = |phase| WindowEvent::MouseInput { device_id: DeviceId::dummy(), state: phase, button: MouseButton::Left };
+            state.on_pointer_event(&mouse(ElementState::Pressed), 2.0);
+            state.on_pointer_event(&WindowEvent::CursorMoved { device_id: DeviceId::dummy(), position: winit::dpi::PhysicalPosition::new(if case == ParkedActivationCase::StateInsideRelease { 500.0 } else { -40.0 }, 340.0) }, 2.0);
+            if case != ParkedActivationCase::StateInsideRelease {
+                // Captured outside motion followed by TrackMouseEvent's leave.
+                state.on_pointer_event(&WindowEvent::CursorLeft { device_id: DeviceId::dummy() }, 2.0);
+            }
+            if case == ParkedActivationCase::StateReenteredRelease {
+                state.on_pointer_event(&WindowEvent::CursorEntered { device_id: DeviceId::dummy() }, 2.0);
+                state.on_pointer_event(&WindowEvent::CursorMoved { device_id: DeviceId::dummy(), position: winit::dpi::PhysicalPosition::new(160.0, 200.0) }, 2.0);
+            }
+            driver.deferred_with_events(viewport, state.egui_input_mut().take().events);
+            app.process_deferred_detached_image_window_events_for_test(&ctx);
+            assert!(!app.detached_window_deferred_activation_pending(first), "held State drag cannot resume");
+            assert_eq!(app.detached_window_state(first), Some(DetachedWindowState::Parked));
+            state.on_pointer_event(&mouse(ElementState::Released), 2.0);
+            driver.deferred_with_events(viewport, state.egui_input_mut().take().events);
+            assert!(!ctx.input_for(viewport, |input| input.pointer.primary_down()), "physical release must terminate egui hold without inventing position");
+            if case == ParkedActivationCase::StateOutsideRelease {
+                assert_eq!(ctx.input_for(viewport, |input| input.pointer.hover_pos()), None);
+            }
+        } else if matches!(case, ParkedActivationCase::Drag | ParkedActivationCase::TouchDrag) {
             let release = events.iter().position(|event| matches!(event, egui::Event::Touch { phase: egui::TouchPhase::End, .. }))
                 .unwrap_or_else(|| events.iter().position(|event| matches!(event, egui::Event::PointerButton { pressed: false, .. })).unwrap());
             let released = events.split_off(release);
@@ -1188,9 +1221,28 @@ fn realmachine50_parked_click_case_with_touch_policy(
         driver.root(&mut app);
         assert_eq!(app.active_detached_window_id(), Some(first));
         app.with_viewer_context(owner, |viewer| assert_eq!(viewer.fullscreen_idx, Some(0))).unwrap();
-        if matches!(case, ParkedActivationCase::Drag | ParkedActivationCase::TouchDrag) {
+        if real_state || matches!(case, ParkedActivationCase::Drag | ParkedActivationCase::TouchDrag) {
             assert_eq!(app.with_viewer_context(owner, |viewer| (viewer.fs_zoom, viewer.fs_pan)).unwrap(), pan_before,
                 "the resume drag must not pan the reactivated viewer");
+            if real_state {
+                // A zoomed canvas owns clicks as view operations; it does not
+                // turn pages. Prove the next fresh drag reaches that same view.
+                let start = egui::pos2(CHILD_SIZE.x * 0.5, CHILD_SIZE.y * 0.5);
+                let end = start + egui::vec2(40.0, 30.0);
+                let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+                for events in [vec![egui::Event::PointerMoved(start), button(start, true)],
+                    vec![egui::Event::PointerMoved(end)], vec![button(end, false)]] {
+                    driver.child_events.borrow_mut().insert(viewport, events);
+                    driver.root(&mut app);
+                    assert!(driver.child_events.borrow().is_empty());
+                }
+                app.with_viewer_context(owner, |viewer| {
+                    assert_eq!(viewer.fullscreen_idx, Some(0));
+                    assert_eq!(viewer.fs_zoom, pan_before.0);
+                    assert_ne!(viewer.fs_pan, pan_before.1, "the next fresh drag must pan the zoomed viewer");
+                }).unwrap();
+                return;
+            }
             let rtl = app.with_viewer_context(owner, |viewer| {
                 assert_eq!(viewer.fullscreen_idx, Some(0));
                 assert_eq!(viewer.items.len(), 2, "the restored viewer has a next page");
@@ -1267,6 +1319,18 @@ fn realmachine50_parked_diagnostic_touch_disable_bar_close_owns_the_tap() {
 #[test]
 fn realmachine55_parked_drag_reactivates_without_page_delivery() {
     realmachine50_parked_click_case(false, ParkedActivationCase::Drag);
+}
+#[test]
+fn realmachine55_real_state_inside_release_resumes_without_page_or_pan() {
+    realmachine50_parked_click_case(false, ParkedActivationCase::StateInsideRelease);
+}
+#[test]
+fn realmachine55_real_state_outside_release_resumes_without_page_or_pan() {
+    realmachine50_parked_click_case(false, ParkedActivationCase::StateOutsideRelease);
+}
+#[test]
+fn realmachine55_real_state_reentered_release_resumes_without_page_or_pan() {
+    realmachine50_parked_click_case(false, ParkedActivationCase::StateReenteredRelease);
 }
 #[test]
 fn realmachine55_parked_touch_drag_reactivates_without_page_or_pan_delivery() {

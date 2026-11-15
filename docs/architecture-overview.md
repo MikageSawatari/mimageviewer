@@ -657,6 +657,11 @@ Active時に蓄積した入力を新deferred callbackへ再所属させないた
 Windowsのegui-winit Stateは最後のCursorMovedの物理位置を保持し、CursorLeftではlogical位置だけを消す。
 同座標再入でwinitがCursorMovedを省略しても、CursorEnteredで現在の実効倍率へ戻す。
 新native allocationのStateは履歴なしで始まり、touchのlogical位置清掃や兄弟viewportと履歴を共有しない。
+Stateがforwardした実mouse押下は、CursorLeft後の位置なしUpでも
+`Event::PointerButtonReleased`で一度だけ終わる。古い座標のclickやhoverは作らず、
+eguiの保持・observer・callbackと各command ownerのrelease順序を同じraw終端へ揃える。
+caption buttonは解放時のhitとOSの選択確定を同native ownerで扱い、途中のmotionでは取り消さない。
+vendorの入力診断Infoは専用の正確な2targetだけが製品の非同期通常sinkへ届く。
 logical targetはその窓のregistrationの終端／Manager dropで退役し、native allocationの再生成では維持する。
 既に egui に渡した synthetic Primary は通常入力境界で対象 button / widget の所有だけを一度取り消し、通常の click / drag 完了を発生させない。
 synthetic keyもlogical registration／key単位で終端権限を持ち、physical Downへの移譲後は旧repeat／Upで保持を再取得・解除しない。

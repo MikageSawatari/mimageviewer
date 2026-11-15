@@ -368,6 +368,16 @@ Glow shutdownの入力ループはGL ownerから小helperへ抽出し、製品�
 Cargo実行・独立レビュー・受入結果は
 [実機50調査書](../../docs/depth-parallax-realmachine50-investigation.md) の後続記録を正本とする。
 
+## 依頼55 独立レビュー: 診断の製品sink（2026-11-15）
+
+native allocation入力診断のInfo targetを`eframe::native_window_input::diagnostic`へ固定する。
+製品のlog facadeは正確なこのtargetとegui-winitのpointer診断だけを通常sinkへ通す。
+vendor全体のInfo、近似target、毎frameログは許可しない。上流へ戻す際は製品側の
+max level／target filterとの接続と、実非同期sinkまでの回帰を併せて移すこと。
+位置なしの物理releaseはegui-winit／eguiのraw終端として配送し、backendで位置を推定しない。
+caption buttonはAppの既存native ownerが解放hitとOS選択を消費し、native call返却まで所有する。
+allocation leaseや配送対応の寿命をこの判定で変更しない。根拠と検証範囲は依頼50調査書§5.8を参照。
+
 ## 依頼55: 反復するmain fullscreen退役のheadless対照（2026-11-15）
 
 既存Wgpu／Glow lifecycle adapterでchildのImmediate／Deferred切替と、別main viewerの

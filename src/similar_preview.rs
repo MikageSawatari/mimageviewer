@@ -388,6 +388,9 @@ impl SimilarPreviewInput {
                         button: egui::PointerButton::Primary,
                         pressed: false,
                         ..
+                    } | egui::Event::PointerButtonReleased {
+                        button: egui::PointerButton::Primary,
+                        ..
                     }
                 )
             }),

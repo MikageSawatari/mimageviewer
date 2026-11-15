@@ -344,6 +344,7 @@ pub(crate) fn log_unmapped_primary_press(
 ) {
     if let Some(reason) = unmapped_primary_press_reason(viewport, event) {
         log::info!(
+            target: "eframe::native_window_input::diagnostic",
             "[detached-activation] boundary=backend_input source=ClientClick decision={reason:?} backend={backend} window_id={window:?}"
         );
     }

@@ -126,6 +126,16 @@ pub enum Event {
         modifiers: Modifiers,
     },
 
+    /// A button whose press was forwarded was physically released, but its
+    /// current position is unavailable (for example after `PointerGone`).
+    ///
+    /// End the button hold without restoring a hover/interact position or
+    /// generating a click. This is a release, not a fabricated positioned Up.
+    PointerButtonReleased {
+        button: PointerButton,
+        modifiers: Modifiers,
+    },
+
     /// The mouse left the screen, or the last/primary touch input disappeared.
     ///
     /// This means there is no longer a cursor on the screen for hovering etc.

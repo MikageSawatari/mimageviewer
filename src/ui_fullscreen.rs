@@ -190,6 +190,9 @@ impl FsFrontPointerFrameInput {
                         egui::Event::PointerButton {
                             button, pressed, ..
                         } => self.owns(*button) || (!pressed && self.owns_release(*button)),
+                        egui::Event::PointerButtonReleased { button, .. } => {
+                            self.owns(*button) || self.owns_release(*button)
+                        }
                         egui::Event::PointerMoved(_) | egui::Event::PointerGone => {
                             self.owns(egui::PointerButton::Primary)
                         }
@@ -350,6 +353,20 @@ impl FsFrontPointerOwnership {
                                 self.clicks = FsBackingClickBoundary::default();
                             }
                         } else {
+                            event_owned = self.buttons[index];
+                            release_owned[index] = self.buttons[index];
+                            owned[index] |= self.buttons[index];
+                            self.buttons[index] = false;
+                        }
+                    }
+                    egui::Event::PointerButtonReleased { button, .. } => {
+                        let index = match button {
+                            egui::PointerButton::Primary => Some(0),
+                            egui::PointerButton::Secondary => Some(1),
+                            egui::PointerButton::Middle => Some(2),
+                            _ => None,
+                        };
+                        if let Some(index) = index {
                             event_owned = self.buttons[index];
                             release_owned[index] = self.buttons[index];
                             owned[index] |= self.buttons[index];
@@ -3080,6 +3097,9 @@ enum FsNavigatorInputEvent {
         pressed: bool,
         adjudicated_click: Option<(egui::Pos2, u32)>,
     },
+    PointerButtonReleased {
+        button: egui::PointerButton,
+    },
     MouseWheel {
         delta_y: f32,
     },
@@ -3115,6 +3135,7 @@ fn fs_navigator_tracks_event(event: &egui::Event) -> bool {
         event,
         egui::Event::PointerMoved(_)
             | egui::Event::PointerButton { .. }
+            | egui::Event::PointerButtonReleased { .. }
             | egui::Event::MouseWheel { .. }
             | egui::Event::PointerGone
             | egui::Event::WindowFocused(_)
@@ -3132,11 +3153,12 @@ impl FsNavigatorFrameInput {
                 .events
                 .into_iter()
                 .zip(ownership.iter())
-                .map(|(event, owned)| match (event, owned) {
+                .filter_map(|(event, owned)| match (event, owned) {
                     (FsNavigatorInputEvent::PointerButton { pos, .. }, true) => {
-                        FsNavigatorInputEvent::PointerMoved(pos)
+                        Some(FsNavigatorInputEvent::PointerMoved(pos))
                     }
-                    (event, _) => event,
+                    (FsNavigatorInputEvent::PointerButtonReleased { .. }, true) => None,
+                    (event, _) => Some(event),
                 })
                 .collect();
         }
@@ -3203,6 +3225,14 @@ impl FsNavigatorFrameInput {
                             adjudicated_click,
                         })
                     }
+                    egui::Event::PointerButtonReleased { button, .. } => {
+                        let (adjudicated_button, click) = adjudicated_releases
+                            .next()
+                            .expect("each raw release must have one adjudicated egui release");
+                        debug_assert_eq!(adjudicated_button, *button);
+                        debug_assert!(click.is_none());
+                        Some(FsNavigatorInputEvent::PointerButtonReleased { button: *button })
+                    }
                     egui::Event::MouseWheel { delta, .. } => {
                         Some(FsNavigatorInputEvent::MouseWheel { delta_y: delta.y })
                     }
@@ -3243,7 +3273,8 @@ impl FsNavigatorFrameInput {
                     FsNavigatorInputEvent::PointerMoved(pos)
                     | FsNavigatorInputEvent::PointerButton { pos, .. } => Some(*pos),
                     FsNavigatorInputEvent::PointerGone => None,
-                    FsNavigatorInputEvent::MouseWheel { .. }
+                    FsNavigatorInputEvent::PointerButtonReleased { .. }
+                    | FsNavigatorInputEvent::MouseWheel { .. }
                     | FsNavigatorInputEvent::WindowFocused(_) => pointer_pos,
                 });
         let input = Self {
@@ -3290,14 +3321,16 @@ impl FsNavigatorFrameInput {
             _ => false,
         };
         for event in self.events.iter().rev() {
-            if let FsNavigatorInputEvent::PointerButton {
-                button: event_button,
-                pressed,
-                ..
-            } = event
-                && *event_button == button
-            {
-                down = !pressed;
+            match event {
+                FsNavigatorInputEvent::PointerButton {
+                    button: event_button,
+                    pressed,
+                    ..
+                } if *event_button == button => down = !pressed,
+                FsNavigatorInputEvent::PointerButtonReleased {
+                    button: event_button,
+                } if *event_button == button => down = true,
+                _ => {}
             }
         }
         down
@@ -3310,7 +3343,8 @@ impl FsNavigatorFrameInput {
                 FsNavigatorInputEvent::PointerMoved(pos)
                 | FsNavigatorInputEvent::PointerButton { pos, .. } => Some(*pos),
                 FsNavigatorInputEvent::PointerGone => None,
-                FsNavigatorInputEvent::MouseWheel { .. }
+                FsNavigatorInputEvent::PointerButtonReleased { .. }
+                | FsNavigatorInputEvent::MouseWheel { .. }
                 | FsNavigatorInputEvent::WindowFocused(_) => current,
             })
     }
@@ -3348,6 +3382,7 @@ impl FsNavigatorFrameInput {
                 }
                 FsNavigatorInputEvent::PointerGone => pointer_pos = None,
                 FsNavigatorInputEvent::WindowFocused(next) => focused = *next,
+                FsNavigatorInputEvent::PointerButtonReleased { .. } => {}
             }
         }
         if saw_wheel_event {
@@ -6355,6 +6390,9 @@ impl MusicOverflowPointerStream {
                     } else {
                         *buttons &= !mask;
                     }
+                }
+                egui::Event::PointerButtonReleased { button, .. } => {
+                    *buttons &= !(1 << (*button as u8));
                 }
                 egui::Event::Touch {
                     device_id,
@@ -37653,6 +37691,7 @@ impl App {
                 None
             }
             FsNavigatorInputEvent::MouseWheel { .. } => None,
+            FsNavigatorInputEvent::PointerButtonReleased { .. } => None,
         })?;
         Some(target)
     }
@@ -38787,6 +38826,31 @@ impl App {
                         }
                     }
                 }
+                FsNavigatorInputEvent::PointerButtonReleased { button } => {
+                    let owns_gesture = match button {
+                        egui::PointerButton::Primary => {
+                            primary_down = false;
+                            matches!(
+                                interaction,
+                                Some(
+                                    PanoramaNavigatorInteraction::Header(_)
+                                        | PanoramaNavigatorInteraction::Pan { .. }
+                                )
+                            )
+                        }
+                        egui::PointerButton::Secondary => {
+                            secondary_down = false;
+                            matches!(
+                                interaction,
+                                Some(PanoramaNavigatorInteraction::Select { .. })
+                            )
+                        }
+                        _ => false,
+                    };
+                    if owns_gesture {
+                        interaction = None;
+                    }
+                }
                 FsNavigatorInputEvent::PointerButton { pos, .. } => {
                     event_pointer_pos = Some(*pos);
                 }
@@ -39167,6 +39231,30 @@ impl App {
                             // pointer gesture that requested a following pan.
                             interaction.gesture = FsNavigatorPointerGesture::Idle;
                         }
+                    }
+                }
+                FsNavigatorInputEvent::PointerButtonReleased { button } => {
+                    let owns_gesture = match button {
+                        egui::PointerButton::Primary => {
+                            primary_down = false;
+                            matches!(
+                                interaction.gesture,
+                                FsNavigatorPointerGesture::Header(_)
+                                    | FsNavigatorPointerGesture::AwaitingPan { .. }
+                                    | FsNavigatorPointerGesture::Pan { .. }
+                            )
+                        }
+                        egui::PointerButton::Secondary => {
+                            secondary_down = false;
+                            matches!(
+                                interaction.gesture,
+                                FsNavigatorPointerGesture::Select { .. }
+                            )
+                        }
+                        _ => false,
+                    };
+                    if owns_gesture {
+                        interaction.gesture = FsNavigatorPointerGesture::Idle;
                     }
                 }
                 FsNavigatorInputEvent::PointerButton { pos, .. } => {
@@ -41706,7 +41794,10 @@ impl App {
                             pressed: false,
                             modifiers,
                             ..
-                        } => Some((*button, *modifiers)),
+                        }
+                        | egui::Event::PointerButtonReleased { button, modifiers } => {
+                            Some((*button, *modifiers))
+                        }
                         _ => None,
                     })
                     .zip(input.pointer.released_buttons_with_click_counts())
@@ -59324,6 +59415,7 @@ impl App {
                             event,
                             egui::Event::PointerMoved(_)
                                 | egui::Event::PointerButton { .. }
+                                | egui::Event::PointerButtonReleased { .. }
                                 | egui::Event::PointerGone
                                 | egui::Event::Touch { .. }
                         )
@@ -59335,6 +59427,7 @@ impl App {
                         event,
                         egui::Event::PointerMoved(_)
                             | egui::Event::PointerButton { .. }
+                            | egui::Event::PointerButtonReleased { .. }
                             | egui::Event::PointerGone
                             | egui::Event::Touch { .. }
                     )
@@ -60423,6 +60516,195 @@ mod music_full_width_hud_tests {
 #[cfg(test)]
 mod tests {
     include!("ui_fullscreen/compare_original_tests.rs");
+
+    #[test]
+    fn realmachine55_front_positionless_release_keeps_backing_navigator_edges() {
+        let ctx = egui::Context::default();
+        install_fs_navigator_input_tracking(&ctx);
+        let mut owner = FsFrontPointerOwnership::default();
+        let front = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(100.0, 80.0));
+        let backing = egui::pos2(240.0, 160.0);
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input(
+                    vec![navigator_button_event(
+                        front.center(),
+                        egui::PointerButton::Primary,
+                        true,
+                    )],
+                    0.0,
+                ),
+                |ctx| {
+                    owner.capture(ctx, false, &[front]);
+                },
+            )
+            .drop_without_applying_deltas();
+        assert!(owner.is_active());
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input(
+                    vec![
+                        egui::Event::PointerButtonReleased {
+                            button: egui::PointerButton::Primary,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                        navigator_button_event(backing, egui::PointerButton::Primary, true),
+                        navigator_button_event(backing, egui::PointerButton::Primary, false),
+                    ],
+                    0.1,
+                ),
+                |ctx| {
+                    let front_input = owner.capture(ctx, false, &[front]);
+                    let events = front_input.canvas_events(ctx);
+                    assert_eq!(
+                        events.iter().map(|(_, owned)| *owned).collect::<Vec<_>>(),
+                        [true, false, false]
+                    );
+                    let navigator = FsNavigatorFrameInput::for_current_pass(ctx)
+                        .without_front_buttons(&front_input);
+                    assert_eq!(navigator.events.len(), 2);
+                    assert!(
+                        matches!(navigator.events[1], FsNavigatorInputEvent::PointerButton {
+                    pressed: false, adjudicated_click: Some((pos, 1)), ..
+                } if pos == backing)
+                    );
+                },
+            )
+            .drop_without_applying_deltas();
+        assert!(!owner.is_active());
+    }
+
+    #[test]
+    fn realmachine55_navigator_positionless_release_cancels_without_header_action() {
+        for panorama in [false, true] {
+            let ctx = egui::Context::default();
+            let (mut app, image_rect, fs_idx) = if panorama {
+                setup_panorama_navigator_input_test(&ctx)
+            } else {
+                setup_flat_navigator_input_test()
+            };
+            let header_rect = if panorama {
+                app.panorama_navigator_layout(image_rect, fs_idx)
+                    .unwrap()
+                    .header_rect
+            } else {
+                app.fs_navigator_layout(image_rect).unwrap().header_rect
+            };
+            let corner = fs_navigator_corner_button_rect(header_rect, 0).center();
+            let initial_corner = app.settings.fullscreen_navigator_corner;
+            assert!(run_flat_navigator_input_frame(
+                &mut app,
+                &ctx,
+                image_rect,
+                navigator_ordered_input(
+                    vec![navigator_button_event(
+                        corner,
+                        egui::PointerButton::Primary,
+                        true,
+                    )],
+                    0.0
+                )
+            ));
+            assert!(app.fullscreen_navigator_interaction.is_active());
+            assert!(run_flat_navigator_input_frame(
+                &mut app,
+                &ctx,
+                image_rect,
+                navigator_ordered_input(
+                    vec![egui::Event::PointerButtonReleased {
+                        button: egui::PointerButton::Primary,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    0.1
+                )
+            ));
+            assert!(!app.fullscreen_navigator_interaction.is_active());
+            assert_eq!(app.settings.fullscreen_navigator_corner, initial_corner);
+            assert!(run_flat_navigator_input_frame(
+                &mut app,
+                &ctx,
+                image_rect,
+                navigator_ordered_input(
+                    vec![
+                        navigator_button_event(corner, egui::PointerButton::Primary, true),
+                        navigator_button_event(corner, egui::PointerButton::Primary, false),
+                    ],
+                    0.2
+                )
+            ));
+            assert_eq!(
+                app.settings.fullscreen_navigator_corner.normalized(),
+                FullscreenNavigatorCorner::TopLeft
+            );
+        }
+    }
+
+    #[test]
+    fn realmachine55_navigator_positionless_release_retires_only_its_selection() {
+        for panorama in [false, true] {
+            let ctx = egui::Context::default();
+            let (mut app, image_rect, fs_idx) = if panorama {
+                setup_panorama_navigator_input_test(&ctx)
+            } else {
+                setup_flat_navigator_input_test()
+            };
+            let canvas = if panorama {
+                app.panorama_navigator_layout(image_rect, fs_idx)
+                    .unwrap()
+                    .canvas_rect
+            } else {
+                app.fs_navigator_layout(image_rect).unwrap().canvas_rect
+            };
+            let zoom = app.fs_zoom;
+            let fov = app.panorama_state().map(|state| state.fov_y);
+            assert!(run_flat_navigator_input_frame(
+                &mut app,
+                &ctx,
+                image_rect,
+                navigator_ordered_input(
+                    vec![
+                        navigator_button_event(
+                            canvas.left_top() + egui::vec2(8.0, 8.0),
+                            egui::PointerButton::Secondary,
+                            true
+                        ),
+                        egui::Event::PointerMoved(canvas.center()),
+                    ],
+                    0.0
+                )
+            ));
+            assert!(app.fullscreen_navigator_interaction.is_active());
+            assert!(run_flat_navigator_input_frame(
+                &mut app,
+                &ctx,
+                image_rect,
+                navigator_ordered_input(
+                    vec![egui::Event::PointerButtonReleased {
+                        button: egui::PointerButton::Primary,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    0.1
+                )
+            ));
+            assert!(app.fullscreen_navigator_interaction.is_active());
+            assert!(run_flat_navigator_input_frame(
+                &mut app,
+                &ctx,
+                image_rect,
+                navigator_ordered_input(
+                    vec![egui::Event::PointerButtonReleased {
+                        button: egui::PointerButton::Secondary,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    0.2
+                )
+            ));
+            assert!(!app.fullscreen_navigator_interaction.is_active());
+            assert_eq!(app.fs_zoom, zoom);
+            assert_eq!(app.panorama_state().map(|state| state.fov_y), fov);
+        }
+    }
+
     #[test]
     fn chrome_suppression_right_close_hit_keeps_raw_lock_in_still_and_music() {
         use crate::ui_helpers::MetadataPanelOpenState;
@@ -97885,6 +98167,43 @@ pub(crate) mod page_turn_submission_tests {
 
 #[cfg(all(test, windows))]
 mod music_overflow_tests {
+    #[test]
+    fn realmachine55_music_positionless_release_retires_only_its_button_stream() {
+        let owner = crate::app::ViewerContextId::for_test(55);
+        let mut stream = MusicOverflowPointerStream::default();
+        let press = |button| egui::Event::PointerButton {
+            pos: egui::pos2(20.0, 30.0),
+            button,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let release = |button| egui::Event::PointerButtonReleased {
+            button,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for button in [
+            egui::PointerButton::Primary,
+            egui::PointerButton::Secondary,
+            egui::PointerButton::Middle,
+            egui::PointerButton::Extra1,
+            egui::PointerButton::Extra2,
+        ] {
+            stream.update(&press(button), owner, true);
+            stream.update(&release(button), owner, false);
+            assert!(matches!(stream, MusicOverflowPointerStream::Idle));
+        }
+        stream.update(&press(egui::PointerButton::Primary), owner, true);
+        stream.update(&press(egui::PointerButton::Secondary), owner, false);
+        stream.update(&release(egui::PointerButton::Primary), owner, false);
+        assert!(
+            matches!(stream, MusicOverflowPointerStream::Captured { buttons, .. }
+            if buttons == 1 << (egui::PointerButton::Secondary as u8))
+        );
+        stream.update(&release(egui::PointerButton::Secondary), owner, false);
+        stream.update(&press(egui::PointerButton::Primary), owner, false);
+        assert!(matches!(stream, MusicOverflowPointerStream::Idle));
+    }
+
     use super::*;
     use crate::music_note_color::MusicNoteColorScheme;
 

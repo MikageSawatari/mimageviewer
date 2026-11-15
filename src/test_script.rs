@@ -1845,6 +1845,7 @@ pub(crate) fn append_widget_click_events(input: &mut egui::RawInput) {
                 event,
                 egui::Event::PointerMoved(_)
                     | egui::Event::PointerButton { .. }
+                    | egui::Event::PointerButtonReleased { .. }
                     | egui::Event::PointerGone
             )
         })

@@ -33945,6 +33945,7 @@ impl App {
                     egui::Event::Key { .. }
                         | egui::Event::Text(_)
                         | egui::Event::PointerButton { .. }
+                        | egui::Event::PointerButtonReleased { .. }
                         | egui::Event::PointerMoved(_)
                         | egui::Event::MouseWheel { .. }
                         | egui::Event::Touch { .. }

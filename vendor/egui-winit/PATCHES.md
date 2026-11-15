@@ -113,6 +113,26 @@ RawInputの実take/appendとkey先頭追加、eguiのdiscardによる実再pass�
 同等の生成時通知・物理source・一イベント一通知・Context lock外callbackの契約を保ち、
 利用側のowner証明と、markerによる実Startとの相関を合わせて移植する。
 単なるnative Down/Up通知やbatch内FIFO/indexで置換してはならない。
+## 依頼55 独立レビュー: 位置なしreleaseと診断sink（2026-11-15）
+
+winit 0.30.13 Windowsはcapture中にも窓外座標のCursorMovedを送り、後着の
+WM_MOUSELEAVEがCursorLeftだけを出し得る。WM_LBUTTONUPはReleaseCaptureの後に
+位置なしMouseInputを送り、last_positionを更新しない。logical位置Noneはrelease取消の証拠ではない。
+
+Stateは実MouseInputでforwardした保持をbuttonごとに所有し、位置なしの実Upは
+eguiの`PointerButtonReleased`で一度だけ終える。過去の座標をPointerButtonへ代入しない。
+observerはこのraw終端をReleasedとして認め、downを見ていないUpは従来どおりCancelled。
+touch昇格は物理mouse保持を作らず、State再生成でも保持を移さない。
+simulate_touch_screenのraw Touch Endは既存Touch契約の最後に検出した点で終え、hoverを復元しない。
+上流へ戻す際はegui側の位置なし終端とAppのordered consumerを一緒に移し、
+通常のPointerGoneはdownを消さないという上流の意味を維持すること。
+
+診断Infoのtargetは`egui_winit::pointer_input_observer::diagnostic`へ固定する。
+製品loggerはこの正確なtargetだけを許可し、vendor全体のInfoは開けない。
+入力破棄の押下境界だけで出力する。通常sinkへの到達も製品側の実writer回帰で検査する。
+caption buttonの判定はvendorで推測せず、既存native ownerの解放hit／WM_SYSCOMMANDに委ねる。
+根拠・headlessと実機未確認の区別は依頼50調査書§5.8を参照。
+
 ## 依頼55: client入力破棄の診断（2026-11-15）
 
 primary押下の境界だけで `PointerInputDiscardReason` を通常ログへ出す。

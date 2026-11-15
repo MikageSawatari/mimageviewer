@@ -1460,6 +1460,12 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ### 2026-11-15: §1.767 サブPC依頼55 — caption／長押し／ParkedLiveと入力入口の診断
 
+独立実装レビューのP1 / P2と設計担当のcaption指摘を受け、同Stateがforwardした物理押下の位置なしreleaseを
+typed raw終端へ接続し、egui保持・observer・callbackと既存command ownerのrelease順序を揃えた（BA-7）。
+caption buttonは途中のmotionではなく解放対象とOSの選択確定で判定する。
+診断Infoは正確な2targetだけ通常sinkへ通す。独立 Sol / xhigh と構造適合を確認し、
+新App field・時間窓・座標推定は追加しない。[レビュー対応 §5.8](depth-parallax-realmachine50-investigation.md#58-依頼55の独立レビュー指摘の修正2026-11-15)に根拠と検証を記録する。
+
 同日の追加決定「案1」を反映し、通常canvasのprimary／単指touchとcaption／resizeのdragは
 操作終端で復帰し、その入力でページ／パンを動かさない。移動量の取消・不要なrect捕捉と閾値を撤去し、
 caption buttonのhit対象外取消とCloseOwnedは維持する。Aはwinitとのcursor位置寿命不一致を

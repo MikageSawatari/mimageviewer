@@ -212,6 +212,9 @@ pub(crate) fn canvas_pointer_inputs(
                 egui::Event::PointerButton {
                     button: egui::PointerButton::Primary,
                     ..
+                } | egui::Event::PointerButtonReleased {
+                    button: egui::PointerButton::Primary,
+                    ..
                 } | egui::Event::PointerMoved(_)
                     | egui::Event::PointerGone
             ) && matches!(owner.gesture, Gesture::Pressed { .. })
@@ -280,7 +283,12 @@ pub(crate) fn canvas_pointer_inputs(
                 inputs.push(CanvasPointerInput::Secondary(pos, m));
             }
             egui::Event::WindowFocused(true) => focused = true,
-            egui::Event::PointerGone | egui::Event::WindowFocused(false) => {
+            egui::Event::PointerGone
+            | egui::Event::WindowFocused(false)
+            | egui::Event::PointerButtonReleased {
+                button: egui::PointerButton::Primary,
+                ..
+            } => {
                 if matches!(event, egui::Event::WindowFocused(false)) {
                     focused = false;
                 }
@@ -314,6 +322,49 @@ pub(crate) fn canvas_pointer_inputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn realmachine55_positionless_release_cancels_old_canvas_before_fresh_press() {
+        let ctx = egui::Context::default();
+        let app = crate::app::setup_app_for_test();
+        let scope = app.canvas_gesture_scope(0, CanvasTool::Erase(EraseTool::Brush));
+        let pos = egui::pos2(10.0, 10.0);
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let collect = |events| {
+            let mut inputs = Vec::new();
+            ctx.run_pass(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    inputs =
+                        canvas_pointer_inputs(ctx, scope.clone(), Default::default(), true, |_| {
+                            true
+                        });
+                },
+            )
+            .drop_without_applying_deltas();
+            inputs
+        };
+        assert!(collect(vec![button(true)])[0].pressed());
+        let inputs = collect(vec![
+            egui::Event::PointerButtonReleased {
+                button: egui::PointerButton::Primary,
+                modifiers: egui::Modifiers::NONE,
+            },
+            button(true),
+        ]);
+        assert!(matches!(inputs[0], CanvasPointerInput::Cancel));
+        assert!(inputs[1].pressed());
+        assert!(!inputs.iter().any(|input| input.released()));
+        assert!(collect(vec![button(false)]).last().unwrap().released());
+    }
 
     #[test]
     fn section1679_scope_change_cancels_only_the_same_document_owner() {

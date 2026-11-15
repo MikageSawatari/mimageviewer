@@ -126,6 +126,11 @@ pub struct State {
     // A new State belongs to a new native allocation and starts without history.
     #[cfg(target_os = "windows")]
     last_cursor_position_in_pixels: Option<winit::dpi::PhysicalPosition<f64>>,
+    // Only real MouseInput owns these forwarded holds. Touch promotion uses
+    // on_mouse_button_input too, but cannot create a physical mouse tail.
+    // The position is only the last detected point for simulated raw Touch;
+    // it must never stand in for an unknown mouse release coordinate.
+    forwarded_mouse_buttons: [Option<egui::Pos2>; egui::NUM_POINTER_BUTTONS],
     any_pointer_button_down: bool,
     current_cursor_icon: Option<egui::CursorIcon>,
 
@@ -208,6 +213,7 @@ impl State {
             pointer_pos_in_points: None,
             #[cfg(target_os = "windows")]
             last_cursor_position_in_pixels: None,
+            forwarded_mouse_buttons: [None; egui::NUM_POINTER_BUTTONS],
             any_pointer_button_down: false,
             current_cursor_icon: None,
             current_custom_cursor: None,
@@ -405,7 +411,46 @@ impl State {
         use winit::event::WindowEvent;
         Some(match event {
             WindowEvent::MouseInput { state, button, .. } => {
-                self.on_mouse_button_input(*state, *button);
+                let translated = translate_mouse_button(*button);
+                let hold = if *state == winit::event::ElementState::Released {
+                    translated
+                        .and_then(|button| self.forwarded_mouse_buttons[button as usize].take())
+                } else {
+                    None
+                };
+                if *state == winit::event::ElementState::Released
+                    && self.pointer_pos_in_points.is_none()
+                    && let (Some(button), Some(last_detected_pos)) = (translated, hold)
+                {
+                    self.egui_input
+                        .events
+                        .push(egui::Event::PointerButtonReleased {
+                            button,
+                            modifiers: self.modifiers,
+                        });
+                    if self.simulate_touch_screen {
+                        self.any_pointer_button_down = false;
+                        // Raw Touch explicitly permits the last detected point;
+                        // unlike PointerButton, this does not assert a cursor
+                        // coordinate at the physical release boundary.
+                        self.egui_input.events.push(egui::Event::Touch {
+                            device_id: egui::TouchDeviceId(0),
+                            id: egui::TouchId(0),
+                            phase: egui::TouchPhase::End,
+                            pos: last_detected_pos,
+                            force: None,
+                        });
+                    }
+                } else {
+                    self.on_mouse_button_input(*state, *button);
+                    if *state == winit::event::ElementState::Pressed
+                        && let Some(button) = translated
+                    {
+                        if let Some(pos) = self.pointer_pos_in_points {
+                            self.forwarded_mouse_buttons[button as usize] = Some(pos);
+                        }
+                    }
+                }
                 EventResponse {
                     repaint: true,
                     consumed: self.egui_ctx.egui_wants_pointer_input(),
@@ -954,6 +999,9 @@ impl State {
             pos_in_pixels.x as f32 / pixels_per_point,
             pos_in_pixels.y as f32 / pixels_per_point,
         );
+        for last_detected in self.forwarded_mouse_buttons.iter_mut().flatten() {
+            *last_detected = pos_in_points;
+        }
         self.on_cursor_moved_in_points(pos_in_points);
     }
 

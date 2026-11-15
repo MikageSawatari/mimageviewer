@@ -1,5 +1,15 @@
 # egui 0.37.0 のローカル変更（段2a-1／2a-2／2a-3）
 
+## 依頼55 独立レビュー: 位置のない物理button終端（2026-11-15）
+
+`Event::PointerButtonReleased { button, modifiers }` はintegrationがforwardした押下に対する
+実releaseで、解放座標がない場合に用いる。PointerStateのdown／press_originを終え、
+click=NoneのReleasedを一つ記録する。hover／interact位置を作らず、PointerGone自体の意味は変えない。
+Contextの順序付きbutton capture witnessも終端し、同frame後続pressに旧widgetを渡さない。
+上流へ戻す際はegui-winitの実mouse保持所有とraw終端、Appのrelease ordinal／command取消を
+一緒に移す。既知の古い座標を通常PointerButton releaseへ転用してはならない。
+実widgetとState・callbackのheadless回帰および根拠は依頼50調査書§5.8を参照。
+
 ## §1.767 A: pointer開始の所有証跡（2026-11-14）
 
 `Event::PointerInputProvenance(Id)`は、直後のraw Touch Start／primary pressだけに属するopaqueな証跡で、

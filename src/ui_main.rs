@@ -1175,6 +1175,20 @@ fn grid_primary_input_events(
                     phase: egui::TouchPhase::Cancel,
                     ..
                 } => events.push(GridPrimaryInput::TouchCancelled),
+                egui::Event::PointerButtonReleased { button, .. } => {
+                    // This release has no widget witness or click position. It
+                    // still occupies its adjudicated release and primary ordinal.
+                    let Some((released_button, click)) = releases.next() else {
+                        return vec![GridPrimaryInput::Cancelled];
+                    };
+                    if released_button != button || click.is_some() {
+                        return vec![GridPrimaryInput::Cancelled];
+                    }
+                    if button == egui::PointerButton::Primary {
+                        ordinal += 1;
+                    }
+                    events.push(GridPrimaryInput::Cancelled);
+                }
                 egui::Event::PointerButton {
                     pos,
                     button,
@@ -32637,6 +32651,32 @@ mod grid_reclick_open_tests {
         assert_eq!(harness.state().app.selected, Some(1));
         assert_eq!(harness.state().app.checked, HashSet::from([0, 1]));
         assert_eq!(harness.state().activations, 0);
+    }
+
+    #[test]
+    fn realmachine55_positionless_grid_release_preserves_the_next_cell_click() {
+        for button in [egui::PointerButton::Primary, egui::PointerButton::Secondary] {
+            let mut harness =
+                handler_harness(GridClickSelectionMode::Check, false, None, false, false);
+            harness.hover_at(cell_rect(0).center());
+            harness.run();
+            pointer_button(&mut harness, cell_rect(0).center(), button, true);
+            let mut events = vec![egui::Event::PointerButtonReleased {
+                button,
+                modifiers: egui::Modifiers::NONE,
+            }];
+            events.extend(section1680_edges(
+                cell_rect(1).center(),
+                &[true, false],
+                egui::Modifiers::CTRL,
+            ));
+            harness.input_mut().events = events;
+            harness.run();
+            assert_eq!(harness.state().app.selected, Some(1));
+            assert_eq!(harness.state().app.checked, HashSet::from([1]));
+            assert_eq!(harness.state().activations, 0);
+            assert!(harness.state().app.context_menu_idx.is_none());
+        }
     }
 
     #[test]

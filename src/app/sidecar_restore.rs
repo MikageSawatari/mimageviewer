@@ -3178,6 +3178,7 @@ fn sidecar_restore_retains_egui_event(event: &egui::Event) -> bool {
         event,
         egui::Event::Key { pressed: false, .. }
             | egui::Event::PointerButton { pressed: false, .. }
+            | egui::Event::PointerButtonReleased { .. }
             | egui::Event::PointerGone
             | egui::Event::Touch {
                 phase: egui::TouchPhase::End | egui::TouchPhase::Cancel,

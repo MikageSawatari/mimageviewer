@@ -114,3 +114,46 @@ fn pointer_cancellation_keeps_other_button_and_other_widget_capture() {
     let state = ctx.interaction_snapshot(Clone::clone);
     assert_eq!(state.dragged, Some(Id::unique("owned")));
 }
+
+#[test]
+fn positionless_release_ends_hold_without_hover_or_click_and_next_press_works() {
+    for button in [PointerButton::Primary, PointerButton::Secondary] {
+        let ctx = Context::default();
+        let sense = Sense::click_and_drag();
+        frame(&ctx, 0.9, Vec::new(), sense);
+        frame(&ctx, 1.0, vec![self::button(button, true)], sense);
+        let released = frame(
+            &ctx,
+            2.5,
+            vec![
+                Event::PointerGone,
+                Event::PointerButtonReleased {
+                    button,
+                    modifiers: Modifiers::NONE,
+                },
+            ],
+            sense,
+        );
+        assert!(!released.clicked);
+        assert!(!ctx.input(|input| input.pointer.button_down(button)));
+        assert_eq!(ctx.input(|input| input.pointer.hover_pos()), None);
+        assert_eq!(ctx.input(|input| input.pointer.press_origin()), None);
+        assert_eq!(
+            ctx.input(|input| input
+                .pointer
+                .released_buttons_with_click_counts()
+                .collect::<Vec<_>>()),
+            vec![(button, None)]
+        );
+        let next = frame(
+            &ctx,
+            3.0,
+            vec![
+                self::button(PointerButton::Primary, true),
+                self::button(PointerButton::Primary, false),
+            ],
+            sense,
+        );
+        assert!(next.clicked);
+    }
+}
