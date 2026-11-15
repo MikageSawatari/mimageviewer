@@ -1875,3 +1875,277 @@ lib全件・build-dev・製品起動・独立レビュー・コミットは行�
 ### 28.6 実機確認と左右の欠けの扱い (利用者確認、2026-11-15)
 
 利用者が切り出しの結果を見て、概ね正しく切れていると判断した。表表紙の左右がわずかに欠ける本がある。裁断してスキャンした本は本文のページの中央側が少し削られるため、本文の比率ちょうどの幅で切ると表紙の左右が少し欠ける。利用者の判断で、これは仕様とする (幅の補正は入れない)。お気に入りごとの入/切は次以降の版で検討する。
+
+## 29. 本文の保存回転による自動切り出しの作り直し (§1.773 続編、v5.3.0)
+
+設計日: 2026-11-15。確認対象は `68101a56e`。**設計案・独立設計レビュー前、実装は未着手。**
+本節は§28.3の「作り直さない」という制約を解消する次段の設計であり、§28.3の出荷記録は残す。
+判定の式・標本の選択・4方向の結果・手動範囲の座標系は変えない。
+
+### 29.1 簡素化を先に適用した結論
+
+長い処理をモーダル化する案は採らない。回転操作は即時の既存操作であり、裏のサムネイル判定が終わるまで
+回転・ページ移動・別contextの操作を止めると、出荷済みの操作性を損なう。
+代わりに、**不変な素材に実際の入力だけを記録し、読む側で照合する**。状態を戻す処理やwriterの待ち合わせを作らない。
+
+| 簡素化の見立て | コード確認と採用範囲 |
+| --- | --- |
+| 素材に最大8ページのキー・角度を持たせる | 成立。samplerは既にlookup callbackへviewerキーを渡す。`AutoMaterial` は `CacheEntry` → `ThumbPixels` → `ThumbnailState::Loaded` →保持一覧へ運ばれ、K2も同じ素材をコピーする。ここへ一体化すれば別の依存管理ownerは要らない。 |
+| workerの読取照合で遅いDB書戻し・再起動を処理する | 成立。ただしDB行だけでなく、`cache_map` のhit、K2の子行、provisional seedを含む全ての素材の入口で照合する必要がある。 |
+| 既存の退避・取消だけで遅い結果も処理する | 一部成立。既知のLoadedを退避して `requested.remove` した場合はrequest IDで遅着を拒否できる。しかし初回生成中は依存がまだ不明で、回転通知で取り消せない。従って結果採用直前のメモリ照合を1か所追加する。 |
+| 表紙の回転は依存に入れない | 成立。`sample_indices` は代表自身を除外しており、表紙の角度だけを変える場合は4方向の既存結果を描画時に選び直せばよい。 |
+
+§28.3の案から、requestへの依存snapshot、回転の通知履歴、保存前のcurrentness照合、writerの停止・取消、
+専用の再生成job/channel、専用の保持一覧ownerを外す。`LoadRequest` に依存や回転revisionを足さない。
+必要なのは素材の依存、workerの読取照合、既存UI退避の拡張、採用/復元の純粋な照合だけである。
+
+### 29.2 依存の型と標本の記録
+
+以下の名前は実装時の型名の案。責務と不変条件はこの形で固定する。
+
+```rust
+struct BodyRotationSample { page_key: String, rotation: Rotation }
+struct BodyRotationProof { samples: Arc<[BodyRotationSample]> } // 0..=8組
+struct AutomaticCoverMaterial {
+    crops: AutoCropResults, // 従来のCopy可能な4方向の値
+    body_rotations: BodyRotationProof,
+}
+enum AutoMaterial {
+    NotAutomatic,
+    Automatic(AutomaticCoverMaterial),
+    LegacyV1,
+}
+```
+
+- `AutoMaterial` 全体は `Clone` とし、`Copy` 前提の呼出しを借用/cloneへ改める。
+  描画用の `AutoCropResults` はCopyのままでよい。依存と結果を別のOptionフィールドへ分散させない。
+  `auto_crop_view` 等の描画・寸法helperは素材を借用し、描画ごとにキー配列を複製しない。
+- proofは**比率計算で実際に保存回転を問い合わせたページ**のキーと、その寸法へ適用した角度を記録する。
+  0°（DBに行が無い場合を含む）も記録する。非ゼロだけを記録すると、初めて90°へ回す操作を検出できない。
+  0↔180、90↔270も記録値の変更として扱う。比率が同じになる組合せでも、最大8組の完全一致という単純な規則を保つ。
+- `aspect_from_slots` で先頭から除いた横長の枠や、合議で少数派となった枠も含める。
+  それらの回転も先頭除外・portrait share・中央値を変え得る。寸法不明でlookupしなかった枠は含めない。
+  未知の枠の位置を保つ§24の規則と最大8枚×先頭256KiBは変更しない。
+- 表紙のキーは含めない。重複キーを許さず、構築時に上限・一意性を検査する。
+  標本が無い場合の空proofは有効であり、proof欠落を空proofとみなさない。
+  全方向が見送りでも標本があればproofを残す。回転後には切れるようになる場合があるためである。
+- `page_aspect_from_sizes_with_rotations_report` / `sample_zip_pages_with_rotations` /
+  `sample_folder_pages_with_rotations` の共通の記録adapterで、比率の `Result` とproofを一緒に返す。
+  `TooFew` / `Landscape` / `Inconsistent` でも、それまでに使った保存角度を捨てない。
+  `SampleRotations::get` を二度呼んで証明を作らず、寸法へ適用した一回の戻り値を記録する。
+- PDFは `page_key_for_pdf`、ZIP/ZipDirは `zip_entry_key`、フォルダは `normalize_path`。
+  EPUBは論理EPUBのキー、変換書庫は**現在のviewerが使う変換後ZIPのキー**を使う（§28.3の確認どおり）。
+  読取先の生成PDF/評価用コピーZIPをページ識別元にしない。EXIF/WIC後に保存回転を一回だけ掛ける既存処理を保つ。
+
+#### 読取失敗の扱い
+
+回転DBの欠落は正常な0°として記録する。DBのopen/SQL失敗は既定どおりログと一回通知、0°でその要求を完了する。
+ただし「読めず0°を仮定した値」を完全なproofとして永続化してはならない。
+この場合だけ、素材のproofを `Observed(BodyRotationProof)` / `ReadUnavailable` の二択で表す形へ上記の型を拡張し、
+後者はその要求内の非永続の結果とする。UIは後者を不一致として再要求せず、その回の0° fallbackを表示する。
+cache保存を既存の保存判断で抑止し、正常な永続行を削除・置換しない。次の通常要求は通常どおりDBを読む。
+これは採用照合が障害時に再要求を繰り返すことを避けるための最小限の信頼性の区別であり、
+エラー分類・retry・回復job・待合せ・障害履歴を作らない。以下の一致規則は通常のObserved proofについて述べる。
+
+### 29.3 永続化とリリース済みv3の扱い
+
+**キーを `|autocrop:v4:{rtl|ltr}` / `|autocrop:v4f:{rtl|ltr}` に上げ、一度作り直す。移行しない。**
+新規列を追加せず、既存 `thumbnails.auto_crops` に結果とproofを一つのpayloadとして保存する。
+schema世代・RO handleの列再検出には新しい分岐を足さない。
+
+- `AutoMaterial` の単一codecを拡張し、例として `automatic-v2:` + JSON
+  `{ "crops": [null, [x0,y0,x1,y1], null, null], "samples": [["q:/book.zip::001.jpg",90], ...] }`
+  とする。実装ではcanonicalなフィールド順・角度0/90/180/270・範囲検証・最大8組・重複拒否を固定する。
+  任意文字を含むZIP名を区切り文字で自作分割せずJSON文字列として扱う。
+  `not-automatic` / `legacy-v1` は従来のkindのまま。
+- proofのページキーの永続化は `CoverIdentity::Page` の `to_sql` / `from_sql` と同じdrive規則を共用する。
+  自catalogと同じdriveだけ相対化し、変換キャッシュなど外部driveは絶対のまま。
+  読取時にviewerキーへ戻せないproofはmissとする。K2の親への保存は、子catalogのdriveで復元後、親catalogのdriveで再符号化する。
+- v4/v4f行のNULL・旧 `automatic-v1:`・samples欠落・不正値はmiss。
+  `NotAutomatic` は手動範囲やedit preview等に正当な結果なので許す。
+  古いautomatic行を新しい空proofへ読み替えず、新キーへコピーしない。
+  v3/v3fは旧キーとして正規化の識別対象には残すが、新規要求・存続キー・K2の現在候補に使わない。
+- 新キーの生成・除去・識別は既存 `representative_cache_key_for_policy_with_auto` /
+  `representative_auto_crop_key_parts` とidentityのsuffix helperへ集約する。
+  EPUBのgeneration、#pin位置、ZIP内の文字との境界は既存の規則を保つ。OFF/手動/通常ページのキーは変更しない。
+- K2の出荷済みv1専用互換は維持する。`legacy_auto_child_keys` の現在キーの入口をv4へ更新し、
+  現行v4が無いときだけ同方向→逆方向のv1を署名一致まで探す。v3へのfallbackや綴じ方向をまたいだ現行v4の流用はしない。
+  `LegacyV1` は本文比率を参照しない旧画素であり、架空の本文依存を付けない。子自身はv4で生成する既存方針を保つ。
+
+同じv3キーで依存欠落をmissにする案も可能だが、旧形式と新形式の意味を同一identityへ重ねるより、
+既存の版更新の経路で切り替える方が単純。再生成可能なキャッシュだけを対象とし、回転DB・pin・手動範囲の移行は行わない。
+
+### 29.4 workerのキャッシュ読取照合
+
+純粋helper `BodyRotationProof::matches(lookup)` を一つ用意し、同じ全組一致をworkerのRO lookupとUIのメモリlookupで共用する。
+workerは `SampleRotations` を要求内で遅延作成し、automaticの依存がある場合だけ読む。
+ファイルの再走査・寸法probe・decode・PDFのPageSizesはhitの照合には不要。
+回転DBのhandleをUIへ公開せず、SQL中に `cache_map` / queue / registryのlockを保持しない。
+
+照合する入口は次のとおり。
+
+| 入口 | 照合位置と不一致時 |
+| --- | --- |
+| `process_load_request_with_provider` の通常hit | `cache_map` とlazy catalogの候補について、stamp・既存folder proofの検査と同じhit確定境界で照合する。WebP decode/send、PDF meta catch-up、Parent memory昇格より前。不一致は通常のmiss。memory候補を外す位置は `observe_parent_stamp` / provider解決より前にし、Parentの通常missの観測を省略させない。 |
+| Fixed catalogの `load_all` から作ったmemory | preload自体を検証済みとはしない。個々の要求が取り出す上記の入口で同じ照合を通す。UI側のload_allに回転SQLを足さない。 |
+| `FolderResolveContext::cached_candidate` | 子の署名・folder proof確認後、K2の勝者にする前に照合。不一致ならその候補を使わず既存の次候補/画像auto-pickへ進む。K2で子をdecode/判定し直す処理は追加しない。 |
+| K2の親行/seed/provisional hit | 親自身がauto判定しない場合も素材のproofを検査する。`send_pinned_child_folder_cached`、drive-listのprefix seed等、通常hitより前の送信経路も同じ入口helperへ通す。previewとfinalの同一性比較にも素材全体を含める。 |
+| 色フィルター・レーティング・Remote等 | catalogからのseedは検証済みと見なさず、共通workerの採用入口で照合する。別実装のrotation読取/判定式を増やさない。 |
+
+`CacheOnly` でも依存の照合は行うが、missなら既存の `CacheOnlyMiss` とし、その要求内では標本を再読込・判定しない。
+`CacheOrSource` は既存のsource miss経路、`SourceOnly` はそのまま現在の標本で生成する。
+保存policy・CatalogWork/admission・親catalogの宛先・PDFのlease/password・取消方針を変更しない。
+照合のRO読取そのものが失敗した場合も、保存済みの枠を検証済みとはしない。その要求は通常のmiss経路に進み、
+source生成を許す場合だけ§29.2の0°・非永続の結果で完了する。CacheOnlyはmissで完了し、再試行を起こさない。
+
+古いworkerが回転前のproof付き行を後から保存しても、その行は次の読取でmissになる。
+行を先にDELETEする必要も、writerが現在の回転を読み直して保存を止める必要もない。
+保存後に `cache_map` へ戻った古い行にも同じ規則を適用する。UIの退避だけではこのmemory hitを解決できないため、
+**memoryとDBの双方の照合を必須**とする。
+読取照合の直後に回転する競合はUIの採用照合で扱う。headlessの一要求の照合完了後の変更について、
+送信全体を回転DBのtransactionで拘束しない。次の要求では必ず再照合する。
+
+### 29.5 K2・結果の運搬
+
+`CachedPinnedFolderThumb.auto_material`、K2の親への `save_auto_folder_bytes`、`CacheEntry`、
+`ThumbPixels`、`ThumbnailState::Loaded`、snapshotのcloneは同じproofを運ぶ。
+K2で複数候補を調べても、**勝者の素材に属する最大8組だけ**を継承する。他候補や親の標本をunionしない。
+既存のfolder選択proof（catalog revision / pin store / winner stamp）と、本文回転proofは別の入力を証明する。
+前者を流用してrotationのglobal revisionを載せたり、相互に代替したりしない。
+
+手動範囲・編集previewは `NotAutomatic`、v1互換は `LegacyV1` のまま。これらに本文回転での作り直しを掛けない。
+4方向とも見送りのAutomaticは、依存付きのautomaticとして扱う。
+
+### 29.6 UIの回転通知・表示中と保持中の一覧
+
+`rotation_page_owner_changed(changed)` の既存通知を使い、Legacyの退避に加えて本文proofの対象だけを退避する。
+Appに新しいrotation owner、全回転revision、再生成pending集合を設けない。
+
+1. `changed` とproofのページキーが交差し、記録角度が現在の `rotation_page_keys`（未登録は0°）と違う
+   Loadedの本タイルを選ぶ。表紙のキーだけの変更、無関係の本・非標本の本文ページ・手動素材では選ばない。
+2. mounted contextは `evict_thumbnail_for_reload` を使う。reload/heavy queueの該当idxだけを除き、
+   `requested.remove`、画素/補正textureの除去、`ThumbnailState::Evicted` まで既存と同じ一単位で行う。
+   次の通常demandが新しいrequest IDで読取/生成を要求する。即時に専用workerを起動しない。
+3. `evict_legacy_cover_thumbnails` のregistry走査と同じ形で、AtRest/Retiringの各bundleの**自分の**idx・queue・
+   requested・pixelsだけへ適用する。context全体のgenerationは進めず、兄弟の無関係な要求を取り消さない。
+   取消できない実行中のworkerがDBへ保存することは許す（§29.4）。
+4. 色フィルターの主一覧ownerだけに既存 `invalidate_color_representative` 相当の通知を出す。
+   parked mainの扱いも既存registry経路を踏襲し、別contextの完了からmainのscanを一括失効させない。
+
+通常のR/L・絶対角度設定・reset・import・rename等は既存 `update_rotation_page_owner` /
+`replace_rotation_page_owner` に集約されている。この通知入口を広げ、個々の操作handlerへ本文専用通知を重複追加しない。
+DB書込みが失敗した単一操作でセッションの角度だけを変える従来の扱いは残す（障害時の扱いは§29.2）。
+
+snapshot内の `saved_thumbnails` / `list_view_thumbnails` やSmartの退避一覧は、新しい逆引き索引に登録しない。
+**再び表示可能になる前に**、既存 `reconcile_restored_cover_thumbnails` に同じproofのメモリ照合を追加し、
+一致するものだけを残す。休眠配列を通知ごとに再帰走査したり、そのためだけにcontextをmountしたりしない。
+snapshotのrestore/list-view切替、Smart復元、registryのdirect-source復元は既にこの入口を持つ。
+同一handler内のZIP階層切替の保持texture移送とrating membershipのcloneも監査し、
+復元元が現在の検証済みLoadedであることを固定する。非同期に保存した配列から移す経路なら同じ再照合を必須にする。
+read-onlyなopen/closeは、他contextへの変更通知として発行しない。
+
+### 29.7 遅い結果の採用照合が必要な理由と位置
+
+既存 `ThumbnailRequests::matches` はrequest IDとitems generationを照合し、`remove` はCPU upload backlogも取り除く。
+従って「Loadedの依存が既知→回転→該当requestをremove」では既存機構だけで十分である。
+ただし次の通常の順序は防げない。
+
+```text
+初回要求Qが本文P=0°でsampling（まだUIへ素材を送っていない）
+→ 利用者がPを90°へ保存（Qの依存はUIに無いのでQは残る）
+→ Qが0°の素材を送信、request IDもitems generationも現在と一致
+```
+
+また、受信時には一致していたCPU画像がupload予算待ちの間に回転する場合もある。
+そのため `poll_thumbnails` の **`requested.next_image()` の直後、texture/画素/auto-aspect採用の前**に、
+素材のproofを `rotation_page_keys` と照合する。既存のLegacy採用guardの隣へ置き、両方を同じ退避入口へ通す。
+不一致は該当idxの `evict_thumbnail_for_reload` と通常の再要求へ戻す。古いFinalizedが新しいrequestをsettleしないことも
+既存request ID照合で固定する。受信時だけの照合、新しいtimer、polling worker、requestへの回転snapshotは要らない。
+
+受信・採用・復元の照合は全てメモリだけで行う。Appは初期化時に `load_rotated_keys` でownerを用意し、
+以後同じownerを更新している。SQLをhelperの内側へ隠さない。
+一覧のauto-aspectが `CacheEntry` を直接使うメモリseedでも、同じメモリpredicateで不一致素材をサンプルから除く。
+既に採用した該当タイルのaspect寄与も退避時に外し、従来の再集計へ渡す。描画だけ新しく寸法だけ古い状態を残さない。
+
+### 29.8 Remoteとdetachedの境界
+
+- Remoteの本タイルは現在 `auto_cover_crop` を指定せず、自動切り出しを新たに有効にはしない。
+  `remote_ipc/thumbnail.rs` のcatalog seedから共通 `process_load_request` に入るため、
+  依存付き素材を消費する場合はそこで同じRO照合を受ける。Remote専用の依存DBやwire字段・protocol変更は不要。
+  「Remoteの全タイルが新たに自動判定する」という意味にはしない。画像応答の既存in-flight合流は維持する。
+- detachedのviewport生成・HWND・geometry・入力述語・promote/retireの状態遷移を変更しない。
+  触る可能性があるのは `viewer_context_registry.rs` の既存素材退避と、同じbundleの保持/復元境界だけ。
+  これは同一データのcurrentnessをownerごとに保つ変更であり、windowの状態から推測して症状を隠す修正ではない。
+  `docs/detached-rework-plan.md` §2（特に所有境界・時刻の一致・追加bool禁止）に沿う。
+  **実装前に設計担当と独立レビュー側がこの構造的な理由へ合意し、実装時に同計画§11へ範囲と判断を記録する。**
+  本設計だけでその合意や実装完了を宣言しない。
+
+### 29.9 触るファイルと関数（実装時の範囲）
+
+| ファイル | 変更する境界 |
+| --- | --- |
+| `src/cover_auto_sample.rs` | `SampleRotations` と3種類のrotation-aware sampler。比率結果と実際のlookupのproofを返し、純粋な一致helperを共有する。 |
+| `src/cover_auto_material.rs` | Automaticの素材型・proofのcodec・借用する描画helper。判定の数学は変更しない。 |
+| `src/cover_auto_crop.rs` | identityのv4/v4f更新だけ。detectorの `AutoCropResults` と判定規則は維持。 |
+| `src/catalog.rs` / `src/cover_identity.rs` | 既存 `auto_crops` の単一codecのdrive文脈、全reader/writer/copyでの運搬と不正値miss。schema追加なし。ページキーcodecは既存規則を共用する。 |
+| `src/thumb_loader.rs` | `process_load_request_with_provider` のmemory/DB hit、`FolderResolveContext::cached_candidate`、seed/send各入口、生成結果とK2保存、auto-key helperとv1互換入口。 |
+| `src/grid_item.rs` 等の素材consumer | `ThumbnailState::Loaded` の一体的な保持、Copyから借用/cloneへの型変更。描画時のDB参照なし。 |
+| `src/app.rs` / `src/app/cover_rotation.rs` | `rotation_page_owner_changed`、`evict_thumbnail_for_reload`、`reconcile_restored_cover_thumbnails`、`poll_thumbnails`、auto-aspectのcache seed/寄与の除去。 |
+| `src/app/viewer_context_registry.rs` | 既存Legacyと並ぶowner単位の素材退避。contextの作成/移譲/退役は変更しない。 |
+| `src/app/snapshot_ops.rs` / `src/app/smart_folder.rs` / `src/app/rating_membership_ops.rs` | 保持/復元/clone入口の共通predicate適用の監査と、必要な復元境界だけの接続。 |
+| `src/app/color_filter.rs` / `src/rating_view.rs` | 新版identity・共通workerへの接続、素材の型変更とmain-only失効の検証。独自判定を追加しない。 |
+| `src/ui_dialogs/cover_crop.rs` / `src/cover_auto_crop/evaluation*` | 新しいsampler戻り値と共通素材型への接続。ダイアログは従来どおり開くたびworkerで判定、本文変更への専用live追従は追加しない。 |
+| `src/remote_ipc/thumbnail.rs` | 共通workerを経由する検査、必要な借用/cloneの型追従だけ。auto対象やwireを拡張しない。 |
+| `docs/display-pipeline.md` / `docs/virtual-folders.md` / `docs/ui-responsiveness.md` | 新版identity・読取/採用/復元照合・worker限定SQLを更新する（現行文書に残るv2表記も実コードの版と揃える）。 |
+| `htdocs/mimageviewer/manual/known-issues.html` / `manual/grid.html` | 実装・回帰確認後に本文回転の既知問題のh3/pを削除し、gridの「前の判定が残るため手動で指定し直す」という制約を外す。表紙は4方向の結果を選び、本文は必要な本だけ再判定する説明に揃える。 |
+
+今回の設計作業では本節以外のコード・公開ページは変更しない。CHANGELOGは公開担当が扱う。
+
+### 29.10 テスト方針と完了条件
+
+全て合成入力・隔離したDBを使い、利用者データ・評価画像を使わない。
+以下は追加するテストの責務であり、設計段階の実行済み結果ではない。
+
+1. **proofとcodec**: 0/90/180/270、空/8組、全方向None、0°の未登録を含む往復。
+   9組・重複・samples欠落・不正角度・不正cropを全catalog readerでmissにする。
+   ZIP名の区切り文字、日本語、driveの付替え、外部driveの変換ZIP、K2親での再encodeを検査する。
+2. **標本**: PDF・ZIP/ZipDir・変換書庫・EPUB・画像フォルダで既存viewerキーを使い、
+   EXIF/WIC→保存回転が一回、表紙を除外、横長の先頭除外前の標本も記録、未知枠・8枚×256KiBを維持する。
+   `Landscape` / `TooFew` / `Inconsistent` の後で回転が変わり、判定が変化する例も固定する。
+3. **読取**: memory hit・Fixed preload・Parent/lazy catalog・K2・provisional seedで、
+   一致ならdecode/標本probe無しのhit、不一致ならmiss。CacheOnlyは判定せずmiss、通常要求だけ再生成する。
+4. **再起動と遅い保存**: 0°で作った行→本文90°保存→新しいRO handle/新process相当の要求で再生成。
+   古いworkerの保存をbarrierで最後に解放して新行を上書きさせても、次の読取で古いproofをhitにしない。
+   sleepや実時間の猶予に頼らない。mtime/sizeを同じにして回転だけが理由であることを検査する。
+5. **UI状態遷移**: Loaded→本文回転→そのidxだけEvicted→新request ID→新しいAutomaticの採用。
+   表紙だけの回転はtexture/key/行を変えず描画角度だけが変わる。非標本ページ・別の本・手動・preview・LegacyV1は不変。
+   0°へ戻すresetとimport/rename等も同じowner通知で通す。
+6. **遅着**: 依存不明の初回要求が回転前をsampling→回転→旧結果受信、および受信済みCPU backlog→回転→uploadの両方を検査。
+   旧結果はtexture・画素・aspectへ採用せず、次の要求のFinalizedを旧IDで消さない。
+7. **複数context**: 同じ本を持つmounted/AtRestの両方だけが退避され、別の本の兄弟contextのrequest ID・queue・
+   pixels・items generation・色scanは不変。主一覧がparkedの場合もmain-only色失効を維持する。
+8. **保持一覧**: snapshotのsaved/list-view、Smart、direct-source復元で古いproofを表示前に除く。
+   同じ一覧の同期的な再利用・read-onlyなopen/closeは、無変更の兄弟に失効を発行しない。
+9. **K2**: 子のproofと全方向の結果を親まで一致させ、本文変更で両方が古くなること、親で再判定しないこと、
+   staleな子を勝者にしないこと、v1の同方向優先/署名不一致時の逆方向探索を維持することを検査する。
+10. **Remoteと補助consumer**: 共通workerを経由するreaderに古い依存付き素材をseedし、stampだけではhitにならないことを検査。
+    現行Remoteのauto OFFと通常page keyを変えず、色フィルター/レーティングも同じ照合を通す。
+11. **障害**: 読取失敗はログ・通知と0°の非永続結果で完了し、再要求ループ・DB再作成・既存行削除を起こさない。
+    UI採用/復元/回転通知のテストではSQL read counterが増えないことを固定する。
+12. **互換**: v4/v4fのキーgolden、OFFのmaster互換、ZIP名のauto token誤認防止、v3から移行しないことを検査。
+    本文回転後もキャッシュをそのまま使う§28.3の旧回帰は、今回の読取再生成/表紙だけ不変の回帰へ置き換える。
+
+実装時は焦点nextest（cover_auto_sample / auto_material / catalog / cover_rotation / thumbnail_request_lifecycle /
+snapshot_ops / K2 / color_filter / Remote関連）、coreのcheck、fmt、diff checkを行う。
+出荷前の全体gate・独立実装レビューは設計担当の検証計画へ渡す。
+
+### 29.11 退けた案
+
+- **全回転global revision・全contextの一括消去**: 無関係な本・兄弟context・通常ページまで再生成するため不採用。
+- **回転値をcache keyへ入れる**: 代表の4方向素材という§21の構造を崩し、標本を読む前にkeyを作れないため不採用。
+- **行を先に削除するだけ**: 遅い書戻しとmemory hit、保持済みtextureを解決しないため不採用。
+- **writerのcurrentness保証・保存barrier**: 読取照合で遅い行を無害にできる。既存の取消後保存/投資回収を壊してまで保証しない。
+- **requestへ全ownerのsnapshot・変更履歴を載せる**: proofは標本決定後にしか分からず、採用時のboundedなメモリ照合で足りるため不採用。
+- **全休眠snapshotの通知時の再帰走査と逆引き登録**: 既存の復元境界で同じ照合を掛ければ足り、登録/解除/dropの別管理が不要。
+- **一覧全体を閉じて開き直す**: 同じcontextの無関係な選択・scroll・要求まで動かす。既存のidx単位退避の方が小さい。
+- **回転DBや判定をUIで読み直す**: 在メモリownerで採用を判定でき、§4の応答性規則に反するため不採用。
