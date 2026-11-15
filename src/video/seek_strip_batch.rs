@@ -742,6 +742,11 @@ fn axis_reason(diagnostics: &StripAxisDiagnostics) -> (String, String) {
             "index_unavailable",
             "container exposes no usable keyframe index; using time grid".to_string(),
         ),
+        StripAxisResolutionReason::DemuxerIndexIsNotKeyframes => (
+            "demuxer_index_is_not_keyframes",
+            "demuxer timestamp-search entries do not identify keyframes; using time grid"
+                .to_string(),
+        ),
         StripAxisResolutionReason::TooFewIndexEntries => (
             "too_few_index_entries",
             "container exposes fewer than two keyframe index entries; using time grid".to_string(),

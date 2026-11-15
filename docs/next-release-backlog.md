@@ -49,7 +49,10 @@ skip sample / pre-skip が適用された音声サンプルと frame PTS の関�
 
 ### 1.785 MPEG-TS / PS の seek が keyframe の手前に着地しない — コード調査 (2026-11-14)
 
-- 状態: **未着手・原因確認済み**。時刻原点の補正とは独立した既存不具合で、
+- 状態: **実装済み・レビュー待ち**。第4版の [keyframe 確認付き seek 設計](mpeg-keyframe-seek-plan.md) に沿って
+    共通 seek owner・保持列・各 worker の接続・TS/PS の TimeGrid を実装。
+    [実装の検証記録](mpeg-keyframe-seek-verification.md)。独立レビューと設計担当の検収は未完了。
+  時刻原点の補正とは独立した既存不具合で、
   [動画の時刻原点の修正](video-timeline-origin-plan.md) の対象外とする (2026-11-14 設計担当決定)。
 - 観測は同梱 FFmpeg DLL を使った headless probe。製品アプリの起動・実画面確認はしていない。
   TS の backward timestamp seek は、0.5 秒を要求すると非 key packet の PTS 0.501333 秒へ着地し、
@@ -85,6 +88,18 @@ skip sample / pre-skip が適用された音声サンプルと frame PTS の関�
 - 修正には、各 Input の真の key locator を検証・所有する共通 seek owner と、走査量・応答時間・取消を
   含めた bounded な cold seek 設計が必要。decoder、hover・tile・strip・screenshot、Remote の独立 Input を
   同じ不変条件で扱う。固定秒数の preroll や全ファイル走査を無断で追加しない。
+
+### 1.795 upscale の分割で key の packet 順と表示順の frame 番号を区別する (2026-11-15)
+
+- 状態: **未着手・コード上の問題候補**。`KeyframePoint.frame` は key の packet 順の番号だが、
+  `src/video/upscale/job.rs` の分割復号は表示順の frame 番号として扱っている。
+  open GOP の映像では境界の frame がずれ得る。レビュー担当の独立 headless probe では
+  MPEG-2 TS の2個目の key が packet 順13番・表示順15番だった。
+- §1.785 の seek 着地とは別の番号付けの問題で、seek を確認付きに差し替えても直らない。
+  そのため今回の修正では upscale の seek・分割を変更していない。
+- 次の調査では索引作成・manifest・各分割の decoder 出力の番号の所有を整理し、open GOP / B frame の
+  境界で重複・欠落がないことを、先頭からの全復号の表示順と比較する。
+  根拠と範囲は [seek 設計 §3.2](mpeg-keyframe-seek-plan.md#32-置き換える呼び出し-全部)。
 
 ### 1.474 通常のページ表示でページ内スクロールと N 字スクロールを使う — 5ch >>642・767 (2026-10-29 起票、2026-11-12 採用)
 

@@ -145,6 +145,14 @@ pub struct AvClock {
     #[cfg(test)]
     fail_next_demux_seek: AtomicBool,
     #[cfg(test)]
+    demux_seek_gate: Mutex<
+        Option<(
+            usize,
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
     fail_next_audio_setup: AtomicBool,
     #[cfg(test)]
     fail_next_audio_flush: AtomicBool,
@@ -312,6 +320,8 @@ impl AvClock {
             demux_after_audio_packet_gate: Mutex::new(None),
             #[cfg(test)]
             fail_next_demux_seek: AtomicBool::new(false),
+            #[cfg(test)]
+            demux_seek_gate: Mutex::new(None),
             #[cfg(test)]
             fail_next_audio_setup: AtomicBool::new(false),
             #[cfg(test)]
@@ -760,6 +770,40 @@ impl AvClock {
     #[cfg(test)]
     pub(super) fn take_demux_seek_failure_for_test(&self) -> bool {
         self.fail_next_demux_seek.swap(false, Ordering::AcqRel)
+    }
+
+    /// Pause a real seek at a cancellation checkpoint, after audio setup has
+    /// been prepared. The skip count can place this after a demux read.
+    #[cfg(test)]
+    pub(super) fn gate_demux_seek_for_test(
+        &self,
+        skip: usize,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        *self.demux_seek_gate.lock().unwrap() = Some((skip, entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub(super) fn wait_at_demux_seek_gate_for_test(&self) {
+        let gate = {
+            let mut guard = self.demux_seek_gate.lock().unwrap();
+            if let Some((skip, _, _)) = guard.as_mut() {
+                if *skip > 0 {
+                    *skip -= 1;
+                    return;
+                }
+            }
+            guard.take()
+        };
+        if let Some((_, entered_tx, release_rx)) = gate {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        }
     }
 
     #[cfg(test)]

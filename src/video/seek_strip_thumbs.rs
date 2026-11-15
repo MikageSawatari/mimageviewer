@@ -18,8 +18,8 @@ use ffmpeg_the_third as ffmpeg;
 
 use super::seek_strip::{
     CellRange, StripAxis, StripAxisDecision, StripAxisUnavailableReason, StripLookahead,
-    TimeGridReason, compute_strip_window, decide_enumerated_strip_axis, enumerate_index_keyframes,
-    thin_keyframes,
+    TimeGridReason, compute_strip_window, decide_enumerated_strip_axis, demuxer_time_grid_reason,
+    enumerate_index_keyframes, thin_keyframes,
 };
 use super::tile_thumb_cache::TileThumbCache;
 
@@ -372,6 +372,7 @@ pub(crate) enum StripAxisResolutionReason {
     InputOpenFailed,
     VideoStreamMissing,
     IndexUnavailable,
+    DemuxerIndexIsNotKeyframes,
     TooFewIndexEntries,
     NonMonotonicIndexTimestamps,
     InvalidIndexCoverage,
@@ -401,6 +402,18 @@ impl StripAxisDiagnostics {
             first_keyframe_secs: None,
             last_keyframe_secs: None,
             maximum_keyframe_gap_secs: None,
+        }
+    }
+}
+
+impl From<TimeGridReason> for StripAxisResolutionReason {
+    fn from(reason: TimeGridReason) -> Self {
+        match reason {
+            TimeGridReason::DemuxerIndexIsNotKeyframes => Self::DemuxerIndexIsNotKeyframes,
+            TimeGridReason::TooFewEntries => Self::TooFewIndexEntries,
+            TimeGridReason::NonMonotonicTimestamps => Self::NonMonotonicIndexTimestamps,
+            TimeGridReason::InvalidCoverage => Self::InvalidIndexCoverage,
+            TimeGridReason::IncompleteCoverage => Self::IncompleteIndexCoverage,
         }
     }
 }
@@ -1668,6 +1681,14 @@ fn resolve_strip_axis(
         };
         (stream.index(), stream.time_base())
     };
+    if let Some(reason) = demuxer_time_grid_reason(input.format().name()) {
+        return fallback_strip_axis(
+            duration_secs,
+            fallback_interval_secs,
+            min_gap_secs,
+            StripAxisDiagnostics::without_index(reason.into()),
+        );
+    }
     let Some(index) = enumerate_index_keyframes(&mut input, stream_index, time_base) else {
         return fallback_strip_axis(
             duration_secs,
@@ -1722,16 +1743,7 @@ fn resolve_strip_axis(
             })
         }
         StripAxisDecision::TimeGrid(reason) => {
-            diagnostics.reason = match reason {
-                TimeGridReason::TooFewEntries => StripAxisResolutionReason::TooFewIndexEntries,
-                TimeGridReason::NonMonotonicTimestamps => {
-                    StripAxisResolutionReason::NonMonotonicIndexTimestamps
-                }
-                TimeGridReason::InvalidCoverage => StripAxisResolutionReason::InvalidIndexCoverage,
-                TimeGridReason::IncompleteCoverage => {
-                    StripAxisResolutionReason::IncompleteIndexCoverage
-                }
-            };
+            diagnostics.reason = reason.into();
             fallback_strip_axis(
                 duration_secs,
                 fallback_interval_secs,
@@ -2504,6 +2516,7 @@ fn flush_deferred_cache_writes(
 
 struct SeekStripDecoder {
     input: ffmpeg::format::context::Input,
+    packet_reader: super::keyframe_seek::PacketReader,
     timeline: crate::video::media_timeline::MediaTimeline,
     stream_idx: usize,
     tb_num: f64,
@@ -2607,6 +2620,7 @@ impl SeekStripDecoder {
 
         Ok(Self {
             input,
+            packet_reader: super::keyframe_seek::PacketReader::default(),
             timeline,
             stream_idx,
             tb_num,
@@ -2654,6 +2668,7 @@ impl SeekStripDecoder {
         use ffmpeg::util::frame::video::Video;
 
         let run_t0 = Instant::now();
+        self.packet_reader.clear();
         let Some(first) = run.cells.first() else {
             return RunDecodeResult::complete();
         };
@@ -2677,20 +2692,32 @@ impl SeekStripDecoder {
             ));
         };
         let seek_t0 = Instant::now();
-        let seek_result = unsafe {
-            ffmpeg::ffi::av_seek_frame(
-                self.input.as_mut_ptr(),
-                -1,
-                seek_pts,
-                ffmpeg::ffi::AVSEEK_FLAG_BACKWARD as i32,
-            )
-        };
+        let seek_result =
+            self.packet_reader
+                .seek(&mut self.input, -1, seek_pts, Some(self.stream_idx), || {
+                    cancelled_or_superseded(cancel, requests, request_id)
+                });
         self.decoder.decoder_mut().flush();
         let seek_elapsed = seek_t0.elapsed();
-        if seek_result < 0 {
+        if matches!(seek_result, Ok(super::keyframe_seek::SeekOutcome::Aborted)) {
+            return RunDecodeResult {
+                stop: if cancel.load(Ordering::Acquire) {
+                    RunStop::Cancelled
+                } else {
+                    RunStop::Superseded
+                },
+                metrics: RunDecodeMetrics {
+                    seek: seek_elapsed,
+                    total: run_t0.elapsed(),
+                    ..RunDecodeMetrics::default()
+                },
+                cell_failures: Vec::new(),
+            };
+        }
+        if let Err(error) = seek_result {
             return RunDecodeResult {
                 stop: RunStop::Failed(StripThumbnailFailure::SeekFailed(format!(
-                    "av_seek_frame returned {seek_result}"
+                    "keyframe seek failed: {error}"
                 ))),
                 metrics: RunDecodeMetrics {
                     seek: seek_elapsed,
@@ -2708,6 +2735,7 @@ impl SeekStripDecoder {
         let timeline = self.timeline;
         let hw_active = self.hw_decode_active();
         let input = &mut self.input;
+        let packet_reader = &mut self.packet_reader;
         let decoder = &mut self.decoder;
         let scaler = &mut self.scaler;
         let scaler_src_fmt = &mut self.scaler_src_fmt;
@@ -2855,7 +2883,7 @@ impl SeekStripDecoder {
 
         let mut stop = RunStop::Complete;
         let mut run_completed = false;
-        'packets: for item in input.packets() {
+        'packets: while let Some(item) = packet_reader.next(input) {
             if let Some(cell) = timed_out_active_cell(
                 run,
                 active_cell_index.get(),
@@ -2879,7 +2907,7 @@ impl SeekStripDecoder {
                     break;
                 }
             };
-            if stream.index() != stream_idx {
+            if stream != stream_idx {
                 continue;
             }
             if packet.is_key()
@@ -3039,6 +3067,7 @@ impl SeekStripDecoder {
         }
 
         drop(publish_frame_for);
+        packet_reader.clear();
         RunDecodeResult {
             stop,
             metrics: RunDecodeMetrics {
@@ -3225,6 +3254,25 @@ fn convert_keyframe(
 mod tests {
     use super::*;
 
+    #[test]
+    fn mpeg_strip_axis_does_not_treat_timestamp_search_entries_as_keyframes() {
+        use crate::video::screenshot::timeline_test_support::fixture;
+        for name in ["large-origin.ts", "wrap-origin.ts"] {
+            let resolved = resolve_strip_axis(&fixture(name), 12.0, 0.5, 0.5).unwrap();
+            let ResolvedStripAxisOutcome::Ready(resolved) = resolved else {
+                panic!("{name}: TS must have a usable time-grid axis");
+            };
+            assert!(matches!(resolved.axis, StripAxis::TimeGrid { .. }));
+            assert_eq!(
+                resolved.diagnostics.reason,
+                StripAxisResolutionReason::DemuxerIndexIsNotKeyframes,
+            );
+            assert_eq!(resolved.diagnostics.keyframe_count, 0);
+            assert_eq!(resolved.diagnostics.index_timestamps_monotonic, None);
+            assert!(resolved.axis.cell_count() > 0);
+        }
+    }
+
     fn timeline_test_cell(target_secs: f64, exact_keyframe: bool) -> PlannedStripCell {
         PlannedStripCell {
             index: 0,
@@ -3235,6 +3283,116 @@ mod tests {
             exact_keyframe,
             frame_match_tolerance: FrameMatchTolerance::symmetric(1.0),
         }
+    }
+
+    #[test]
+    fn mpeg_strip_real_cells_preserve_keyframe_only_and_end_frame_adoption() {
+        use crate::video::keyframe_seek_test_support::{Fixture, WORKER_FIXTURES, assert_frame_id};
+        let requests = Mutex::new(LatestWindowRequest::default());
+        let cancel = AtomicBool::new(false);
+        for name in WORKER_FIXTURES {
+            let fixture = Fixture::load(name);
+            let last = fixture.frames.last().unwrap();
+            let last_key = fixture.frames.iter().rev().find(|f| f.key_frame).unwrap();
+            for (mode, target, expected) in [
+                // At EOF the full-frame path must drain the delayed last frame.
+                (StripDecodeMode::FullFrames, last.media_secs + 0.010, last),
+                // A narrow tolerance excludes earlier keys while retaining the
+                // existing keyframe-only decoder and its exact-key adoption.
+                (
+                    StripDecodeMode::KeyframesOnly,
+                    last_key.media_secs,
+                    last_key,
+                ),
+            ] {
+                let mut decoder = SeekStripDecoder::open(&fixture.path, false, mode).unwrap();
+                let mut cell = timeline_test_cell(target, false);
+                cell.frame_match_tolerance = FrameMatchTolerance::symmetric(0.020);
+                let run = StripDecodeRun { cells: vec![cell] };
+                let mut published = Vec::new();
+                let result = decoder.decode_run(&run, 1, &requests, &cancel, &mut |image| {
+                    published.push(image);
+                });
+                assert!(
+                    matches!(result.stop, RunStop::Complete),
+                    "{name} {mode:?}: {:?}",
+                    result.stop,
+                );
+                assert_eq!(published.len(), 1, "{name} {mode:?}");
+                let image = &published[0].thumbnail;
+                assert_frame_id(
+                    &image.rgba,
+                    image.width,
+                    image.height,
+                    expected.frame_id,
+                    &format!("{name} {mode:?} target={target}"),
+                );
+            }
+            if name.ends_with(".ts") || name.ends_with(".mpg") {
+                let duration = last.media_secs + 1.0;
+                let resolved = resolve_strip_axis(&fixture.path, duration, 0.5, 0.5).unwrap();
+                let ResolvedStripAxisOutcome::Ready(resolved) = resolved else {
+                    panic!("{name}: MPEG strip axis must remain available");
+                };
+                assert!(matches!(resolved.axis, StripAxis::TimeGrid { .. }));
+                assert_eq!(
+                    resolved.diagnostics.reason,
+                    StripAxisResolutionReason::DemuxerIndexIsNotKeyframes,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mpeg_strip_cancelled_or_superseded_seek_does_not_publish_and_next_request_can_seek() {
+        use crate::video::screenshot::timeline_test_support::fixture;
+        let mut decoder = SeekStripDecoder::open(
+            &fixture("large-origin.ts"),
+            false,
+            StripDecodeMode::FullFrames,
+        )
+        .unwrap();
+        let requests = Mutex::new(LatestWindowRequest::default());
+        let cancel = AtomicBool::new(true);
+        let run = StripDecodeRun {
+            cells: vec![timeline_test_cell(4.5, false)],
+        };
+        let mut published = Vec::new();
+        let result = decoder.decode_run(&run, 1, &requests, &cancel, &mut |image| {
+            published.push(image);
+        });
+        assert!(matches!(result.stop, RunStop::Cancelled));
+        assert!(published.is_empty());
+        cancel.store(false, Ordering::Release);
+        let result = decoder.decode_run(&run, 2, &requests, &cancel, &mut |image| {
+            published.push(image);
+        });
+        assert!(matches!(result.stop, RunStop::Complete));
+        assert_eq!(published.len(), 1);
+
+        let axis = Arc::new(StripAxis::TimeGrid {
+            interval_secs: 0.5,
+            fallback_interval_secs: 0.5,
+            duration_secs: 12.0,
+        });
+        lock_recover(&requests).replace(WindowRequest {
+            id: 4,
+            axis,
+            spec: StripWindowSpec::new(9.0, 1, StripLookahead::default()),
+            trigger: StripThumbnailRequestTrigger::StripRedisplayed,
+            requested_at: Instant::now(),
+        });
+        let result = decoder.decode_run(&run, 3, &requests, &cancel, &mut |image| {
+            published.push(image);
+        });
+        assert!(matches!(result.stop, RunStop::Superseded));
+        assert_eq!(published.len(), 1);
+        lock_recover(&requests).take();
+        let result = decoder.decode_run(&run, 4, &requests, &cancel, &mut |image| {
+            published.push(image);
+        });
+        assert!(matches!(result.stop, RunStop::Complete));
+        assert_eq!(published.len(), 2);
     }
 
     #[test]

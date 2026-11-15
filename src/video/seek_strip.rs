@@ -463,10 +463,18 @@ pub(crate) fn step_seek_strip_range(
 /// 等時間グリッドを選んだ理由。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TimeGridReason {
+    DemuxerIndexIsNotKeyframes,
     TooFewEntries,
     NonMonotonicTimestamps,
     InvalidCoverage,
     IncompleteCoverage,
+}
+
+/// TS/PS timestamp-search entries are arbitrary packets, even when FFmpeg marks
+/// them as keyframes. Decide before enumeration, including its warmup seek.
+pub(crate) fn demuxer_time_grid_reason(demuxer_name: &str) -> Option<TimeGridReason> {
+    super::keyframe_seek::needs_verification(demuxer_name)
+        .then_some(TimeGridReason::DemuxerIndexIsNotKeyframes)
 }
 
 /// Keyframe timestamps from the container index plus their enumeration-order health.
@@ -1510,6 +1518,19 @@ mod tests {
     use super::*;
 
     const EPSILON: f64 = 1.0e-9;
+
+    #[test]
+    fn mpeg_timestamp_search_index_uses_time_grid_before_enumeration() {
+        for demuxer in ["mpegts", "mpegtsraw", "mpeg"] {
+            assert_eq!(
+                demuxer_time_grid_reason(demuxer),
+                Some(TimeGridReason::DemuxerIndexIsNotKeyframes),
+            );
+        }
+        for demuxer in ["mov,mp4,m4a,3gp,3g2,mj2", "matroska,webm", "avi"] {
+            assert_eq!(demuxer_time_grid_reason(demuxer), None);
+        }
+    }
 
     #[test]
     fn timeline_origin_index_enumeration_publishes_media_axis() {

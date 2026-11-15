@@ -2368,21 +2368,19 @@ fn run_clockless_stream_inner(
         f64::from(time_base.numerator()) / f64::from(time_base.denominator())
     });
     let mut next_video_pts = source_origin_secs;
+    let mut packet_reader = super::keyframe_seek::PacketReader::default();
     if source_origin_secs > source_start_secs + f64::EPSILON {
         let target =
             (media_timeline.media_to_raw_secs(source_origin_secs) * 1_000_000.0).round() as i64;
-        let seek_result = unsafe {
-            ffmpeg::ffi::av_seek_frame(
-                input.as_mut_ptr(),
-                -1,
-                target,
-                ffmpeg::ffi::AVSEEK_FLAG_BACKWARD as i32,
-            )
-        };
-        if seek_result < 0 {
-            return Err(format!(
-                "clockless seek to {source_origin_secs:.3}s failed: {seek_result}"
-            ));
+        let seek_result = packet_reader
+            .seek(&mut input, -1, target, video_stream_index, || {
+                control.checkpoint().is_err()
+            })
+            .map_err(|error| {
+                format!("clockless seek to {source_origin_secs:.3}s failed: {error}")
+            })?;
+        if matches!(seek_result, super::keyframe_seek::SeekOutcome::Aborted) {
+            return Err("clockless transcode cancelled".to_owned());
         }
         if let Some(decoder) = video_decoder.as_mut() {
             decoder.decoder_mut().flush();
@@ -2393,18 +2391,17 @@ fn run_clockless_stream_inner(
         }
     }
     let mut reached_limit = false;
-    let mut packets = input.packets();
     while !reached_limit {
         state.checkpoint()?;
         let started = Instant::now();
-        let item = packets.next();
+        let item = packet_reader.next(&mut input);
         state.times.demux_secs += started.elapsed().as_secs_f64();
         let Some(item) = item else {
             break;
         };
         let (stream, packet) = item.map_err(|error| format!("demux packet: {error}"))?;
         state.packets = state.packets.saturating_add(1);
-        if Some(stream.index()) == video_stream_index {
+        if Some(stream) == video_stream_index {
             state.checkpoint()?;
             let send_started = Instant::now();
             let decoder = video_decoder
@@ -2456,16 +2453,25 @@ fn run_clockless_stream_inner(
                     Err(error) => return Err(format!("video receive_frame: {error}")),
                 }
             }
-        } else if Some(stream.index()) == audio_stream_index {
+        } else if Some(stream) == audio_stream_index {
             let path = audio_path
                 .as_mut()
                 .expect("index exists only with audio path");
             state.checkpoint()?;
             let send_started = Instant::now();
-            path.decoder
-                .send_packet(&packet)
-                .map_err(|error| format!("audio send_packet: {error}"))?;
+            let send_result = path.decoder.send_packet(&packet);
             state.times.audio_decode_resample_secs += send_started.elapsed().as_secs_f64();
+            if let Err(error) = send_result {
+                if matches!(error, ffmpeg::Error::InvalidData) {
+                    // PS seek can expose a partial first MP2 packet. As in the
+                    // playback audio decoder, log it and decode the next packet.
+                    crate::logger::log(format!(
+                        "remote-stream clockless audio send_packet: {error}; skipping invalid packet"
+                    ));
+                    continue;
+                }
+                return Err(format!("audio send_packet: {error}"));
+            }
             loop {
                 let mut frame = Audio::empty();
                 let receive_started = Instant::now();
@@ -4484,6 +4490,133 @@ mod tests {
     #[test]
     fn remote_timeline_origin_large_ts_seeks_media_time_and_encodes_relative_segments() {
         assert_remote_timeline_origin("large-origin.ts", 4.0, 4.0);
+    }
+
+    #[test]
+    fn remote_mpeg_seek_first_segment_starts_with_oracle_frame_after_origin() {
+        use crate::video::keyframe_seek_test_support::{Fixture, assert_frame_id};
+        for name in [
+            "h264-small.ts",
+            "mpeg2-large.ts",
+            "hevc-open.ts",
+            "mpeg2-missing-pts.mpg",
+            "mid-gop.ts",
+            "mid-gop.mpg",
+            "control.mp4",
+        ] {
+            let fixture = Fixture::load(name);
+            // The request is after the final key but before a delayed tail
+            // frame. Remote keeps its existing first-PTS-at-or-after rule.
+            let requested = fixture.frames[fixture.frames.len() - 7].media_secs - 0.003;
+            let expected = fixture.first_at_or_after(requested);
+            let mut options = ClocklessTranscodeOptions::benchmark(fixture.path.clone(), 1);
+            options.hw_decode = false;
+            options.encoder = EncoderPreference::Encoder(
+                super::super::stream::encoder::H264EncoderKind::OpenH264,
+            );
+            options.quality = ClocklessQuality::Minimum;
+            options.source_origin_secs = requested;
+            options.max_source_secs = None;
+            options.segment_capacity = 4;
+            let control = ClocklessTranscodeControl::auto_releasing(4).unwrap();
+            let output = ClocklessStreamOutput::new(4, requested).unwrap();
+            let report = run_clockless_stream(
+                &options,
+                &control,
+                output.clone(),
+                ClocklessAudioProcessing::default(),
+                |_| {},
+            )
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert!(report.video_frames > 0, "{name}: no encoded tail frame");
+            assert!(report.audio_frames > 0, "{name}: no encoded tail audio");
+            let mut bytes = output.init_segment().expect("encoded init segment");
+            let ClocklessSegmentBytes::Found(segment) = output.segment(0) else {
+                panic!("{name}: missing first media segment");
+            };
+            bytes.extend(segment);
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("first-segment.mp4");
+            std::fs::write(&path, bytes).unwrap();
+            let mut input = ffmpeg::format::input(&path).unwrap();
+            let stream = input.streams().best(MediaType::Video).unwrap();
+            let video_index = stream.index();
+            let mut decoder = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
+                .unwrap()
+                .decoder()
+                .video()
+                .unwrap();
+            let audio_stream = input.streams().best(MediaType::Audio).unwrap();
+            assert_eq!(
+                audio_stream.parameters().id(),
+                ffmpeg::codec::Id::AAC,
+                "{name}: first segment must retain AAC audio",
+            );
+            let audio_index = audio_stream.index();
+            let mut audio_decoder =
+                ffmpeg::codec::context::Context::from_parameters(audio_stream.parameters())
+                    .unwrap()
+                    .decoder()
+                    .audio()
+                    .unwrap();
+            let mut first_frame = None;
+            let mut nonzero_audio = false;
+            for item in input.packets() {
+                let (stream, packet) = item.unwrap();
+                if stream.index() == video_index && first_frame.is_none() {
+                    decoder.send_packet(&packet).unwrap();
+                    let mut frame = Video::empty();
+                    if decoder.receive_frame(&mut frame).is_ok() {
+                        first_frame = Some(frame);
+                    }
+                } else if stream.index() == audio_index {
+                    audio_decoder.send_packet(&packet).unwrap();
+                    let mut audio = Audio::empty();
+                    while audio_decoder.receive_frame(&mut audio).is_ok() {
+                        assert_eq!(audio.format(), Sample::F32(SampleType::Planar));
+                        nonzero_audio |= audio
+                            .plane::<f32>(0)
+                            .iter()
+                            .any(|sample| sample.is_finite() && sample.abs() > 1.0e-6);
+                    }
+                }
+            }
+            assert!(
+                nonzero_audio,
+                "{name}: first segment lost the sine PCM audio"
+            );
+            let frame = first_frame.unwrap_or_else(|| {
+                decoder.send_eof().unwrap();
+                let mut frame = Video::empty();
+                decoder.receive_frame(&mut frame).unwrap();
+                frame
+            });
+            let mut scaler = ScaleContext::get(
+                frame.format(),
+                frame.width(),
+                frame.height(),
+                Pixel::RGBA,
+                96,
+                64,
+                ScaleFlags::BILINEAR,
+            )
+            .unwrap();
+            let mut rgba = Video::empty();
+            scaler.run(&frame, &mut rgba).unwrap();
+            let packed = (0..64)
+                .flat_map(|row| {
+                    let offset = row * rgba.stride(0);
+                    rgba.data(0)[offset..offset + 96 * 4].iter().copied()
+                })
+                .collect::<Vec<_>>();
+            assert_frame_id(
+                &packed,
+                96,
+                64,
+                expected.frame_id,
+                &format!("Remote first segment {name} origin={requested}"),
+            );
+        }
     }
 
     #[test]
