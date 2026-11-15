@@ -821,6 +821,17 @@ impl State {
         state: winit::event::ElementState,
         button: winit::event::MouseButton,
     ) {
+        if self.pointer_pos_in_points.is_none()
+            && state == winit::event::ElementState::Pressed
+            && button == winit::event::MouseButton::Left
+        {
+            pointer_input_observer::log_pressed_discard(
+                &self.egui_ctx,
+                self.viewport_id,
+                pointer_input_observer::PointerInputDiscardReason::PointerPositionUnavailable,
+                pointer_input_observer::PointerInputSource::Mouse,
+            );
+        }
         if let Some(pos) = self.pointer_pos_in_points
             && let Some(button) = translate_mouse_button(button)
         {

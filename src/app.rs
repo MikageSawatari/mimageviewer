@@ -567,6 +567,7 @@ mod detached_window_manager;
 #[cfg(windows)]
 pub(crate) use detached_activation::{
     DetachedActivationDecision, DetachedActivationRequest, DetachedActivationSource,
+    DetachedActivationTargetState,
 };
 #[cfg(windows)]
 pub(crate) use detached_page_overview::DetachedPageOverviewInputProvenance;
@@ -66648,7 +66649,6 @@ impl App {
         let live_ids: HashSet<u64> = self
             .detached_image_windows
             .iter()
-            .filter(|window| !self.detached_window_state_is_parked_live(window.id))
             .map(|window| window.id)
             .collect();
         self.deferred_detached_image_window_views

@@ -24724,19 +24724,25 @@ impl App {
                 let log_client_decision = |origin: Option<crate::app::DetachedActivationRequest>,
                                            source: ClientActivationSource,
                                            boundary: &str,
-                                           decision: crate::app::DetachedActivationDecision| {
+                                           decision: crate::app::DetachedActivationDecision,
+                                           reason: Option<ClientActivationCancelReason>| {
                     let source = match source {
                         ClientActivationSource::MouseClick => crate::app::DetachedActivationSource::ClientClick,
                         ClientActivationSource::TouchTap => crate::app::DetachedActivationSource::TouchTap,
                     };
                     if let Some(mut request) = origin {
                         request.source = source;
-                        request.log(boundary, decision);
+                        if let Some(reason) = reason {
+                            request.log_client_cancelled(boundary, decision, reason);
+                        } else {
+                            request.log(boundary, decision);
+                        }
                     } else {
                         // No generation-time proof exists for this input. Record
                         // that absence without attributing it to a successor.
+                        let reason = reason.map(|reason| format!(" reason={reason:?}")).unwrap_or_default();
                         crate::logger::log(format!(
-                            "[detached-activation] boundary={boundary} source={source:?} decision={decision:?} window=unknown registration=None context=None viewport={viewport_id:?}"
+                            "[detached-activation] boundary={boundary} source={source:?} decision={decision:?}{reason} window=unknown registration=None context=None viewport={viewport_id:?}"
                         ));
                     }
                 };
@@ -24744,7 +24750,7 @@ impl App {
                     match scoped.decision {
                         ClientActivationDecision::CompletedClose(source) => {
                             bar_close_requested = true;
-                            log_client_decision(scoped.scope, source, "callback", crate::app::DetachedActivationDecision::CloseOwned);
+                            log_client_decision(scoped.scope, source, "callback", crate::app::DetachedActivationDecision::CloseOwned, None);
                         }
                         ClientActivationDecision::Cancelled { source, reason } => {
                             let decision = match reason {
@@ -24754,7 +24760,7 @@ impl App {
                                 ClientActivationCancelReason::Native(crate::key_input::NativeInputCancelReason::RetiredRegistration) => crate::app::DetachedActivationDecision::RetiredRegistration,
                                 _ => crate::app::DetachedActivationDecision::GestureCancelled,
                             };
-                            log_client_decision(scoped.scope, source, "callback_discard", decision);
+                            log_client_decision(scoped.scope, source, "callback_discard", decision, Some(reason));
                         }
                         ClientActivationDecision::Completed(_) => {}
                     }
@@ -24865,6 +24871,9 @@ impl App {
                 None,
                 egui::Color32::BLACK,
             );
+            // Keep the existing native input observer registered for this live
+            // parked viewport; its non-client producer uses the shared queue.
+            let _native_transport = self.deferred_detached_image_window_shared(view.clone());
             #[cfg(feature = "test-script")]
             let mut test_script_passive_frame = None;
             let right_drag_guide = egui_owns_right_drag

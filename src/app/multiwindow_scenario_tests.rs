@@ -1242,6 +1242,377 @@ fn realmachine50_parked_bar_close_wins_over_client_activation() {
     realmachine50_parked_click_case(false, ParkedActivationCase::BarClose);
 }
 
+/// App lifecycle coverage with the real allocation registry and input lease.
+/// Native allocation creation/retirement is supplied here; the backend's actual
+/// WindowId map, egui-winit State and GC are covered by its separate adapter tests.
+fn realmachine55_repeated_client_resume_case(stop_by_sibling: bool, reactivate_sibling: bool) {
+    std::thread::spawn(move || {
+        use eframe::native_window_input::*;
+        use egui_winit::pointer_input_observer::{
+            NormalizedPointerInput as Phase, PointerInputSource as Source,
+        };
+
+        let _input = crate::key_input::lock_test_input();
+        let mut app = setup_app_for_test();
+        app.initialized = true;
+        app.indexer_init.mark_unavailable_if_not_ready();
+        app.settings.detached_viewer_enabled = false;
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings.video_in_window_mode = false;
+        app.settings.fullscreen_keep_on_app_switch = false;
+        app.settings.page_turn_animation_enabled = false;
+        let mut driver = ScenarioDriver::new();
+        let ctx = driver.ctx.clone();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
+        crate::key_input::install_normalized_pointer_input_observer(&ctx);
+        set_native_window_input_listener(
+            &ctx,
+            Arc::new(crate::key_input::TestNativeWindowInputListener),
+        )
+        .unwrap();
+
+        let paths = [
+            app.tmp.path().join("main.png"),
+            app.tmp.path().join("sibling.png"),
+        ];
+        let first_path = app.tmp.path().join("resumed.png");
+        for path in paths.iter().chain([&first_path]) {
+            save_portrait(path, [60, 90, 120]);
+        }
+        app.current_folder = Some(app.tmp.path().to_path_buf());
+        app.items = paths.iter().cloned().map(GridItem::Image).collect();
+        app.image_metas = vec![None; 2];
+        app.thumbnails = vec![ThumbnailState::Pending; 2];
+        app.rebuild_visible_indices();
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        for idx in 0..2 {
+            super::source_texture_test_support::seed(&mut app, &ctx, idx);
+        }
+
+        let window = 89_155;
+        let owner =
+            app.build_active_context_for_test(Some(window), DetachedSource::Image, |viewer| {
+                configure_active_still(viewer, &ctx, first_path, window, egui::Color32::LIGHT_BLUE);
+            });
+        let viewport = App::detached_image_window_viewport_id(window);
+        driver.focus(viewport);
+        driver.root(&mut app);
+        let register = |viewport_id, hwnd: u64| {
+            register_native_window_allocation(
+                &ctx,
+                NativeWindowAllocation {
+                    viewport_id,
+                    registration: ctx.viewport_registration(viewport_id).unwrap(),
+                    window_id: NativeWindowId::from(hwnd),
+                    windows_hwnd: Some(hwnd as isize),
+                },
+            )
+        };
+        let _root_lease = register(egui::ViewportId::ROOT, 0x7675_5500);
+        let _first_lease = register(viewport, 0x7675_5501);
+        let root_allocation =
+            native_window_allocation_witness(&ctx, egui::ViewportId::ROOT).unwrap();
+        let first_allocation = native_window_allocation_witness(&ctx, viewport).unwrap();
+        let registration = ctx.viewport_registration(viewport).unwrap();
+        let input_allocation =
+            crate::key_input::native_input_allocation_witness(registration).unwrap();
+        app.set_detached_window_live_hwnds_for_test([0x7675_5501]);
+        for _ in 0..2 {
+            driver.root(&mut app);
+        }
+        assert_eq!(app.active_detached_window_id(), Some(window));
+        assert_eq!(app.locate_window_context(window).unwrap().0, owner);
+
+        let mut retained_sibling: Option<(
+            u64,
+            ViewerContextId,
+            egui::ViewportRegistration,
+            NativeWindowAllocationWitness,
+            NativeWindowAllocationLease,
+        )> = None;
+        // The first sibling round establishes the two existing windows. Then
+        // the control performs three B -> A client reactivation round trips.
+        let cycles = if reactivate_sibling { 4 } else { 3 };
+        for cycle in 0..cycles {
+            let (opened_viewport, mut opened_lease, opened_allocation) = if let Some((
+                sibling,
+                sibling_owner,
+                sibling_registration,
+                sibling_allocation,
+                _lease,
+            )) = &retained_sibling
+            {
+                // This is the part3 control: an already existing sibling resumes
+                // through client input and parks A, without another grid open.
+                let sibling_viewport = App::detached_image_window_viewport_id(*sibling);
+                driver.focus(sibling_viewport);
+                for _ in 0..3 {
+                    driver.root(&mut app);
+                }
+                assert!(driver.callbacks.contains_key(&sibling_viewport));
+                assert_eq!(
+                    ctx.viewport_registration(sibling_viewport),
+                    Some(*sibling_registration)
+                );
+                let sibling_input =
+                    crate::key_input::native_input_allocation_witness(*sibling_registration)
+                        .unwrap();
+                let operation = sibling_input
+                    .normalized_input(Phase::Pressed(Source::Mouse))
+                    .unwrap_or_else(|| {
+                        panic!("cycle={cycle}: existing sibling owns its new press")
+                    });
+                assert!(
+                    sibling_input
+                        .normalized_input(Phase::Released(Source::Mouse))
+                        .is_none()
+                );
+                let pos = egui::pos2(80.0, 100.0);
+                driver.deferred_with_events(
+                    sibling_viewport,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerInputProvenance(operation),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+                app.process_deferred_detached_image_window_events_for_test(&ctx);
+                assert!(app.detached_window_deferred_activation_pending(*sibling));
+                driver.root(&mut app);
+                assert_eq!(app.active_detached_window_id(), Some(*sibling));
+                assert_eq!(app.active_viewer_context_id(), Some(*sibling_owner));
+                assert_eq!(
+                    app.detached_window_state(window),
+                    Some(DetachedWindowState::Parked)
+                );
+                assert_eq!(
+                    native_window_allocation_witness(&ctx, sibling_viewport),
+                    Some(sibling_allocation.clone())
+                );
+                assert!(sibling_allocation.is_alive());
+                assert!(sibling_input.is_current());
+                (sibling_viewport, None, sibling_allocation.clone())
+            } else {
+                let idx = usize::from(stop_by_sibling);
+                assert!(app.prepare_detached_context_for_grid_open(&ctx, idx));
+                assert_eq!(
+                    app.detached_window_state(window),
+                    Some(DetachedWindowState::Parked)
+                );
+                app.detached_viewer_open_next_still_detached_once = stop_by_sibling;
+                app.fs_open_intent_from_grid = true;
+                app.open_fullscreen(idx, HistoryTrigger::UserChosen);
+                let opened_viewport = if stop_by_sibling {
+                    let sibling = app
+                        .active_detached_window_id()
+                        .expect("grid opens an independent sibling");
+                    assert_ne!(sibling, window);
+                    App::detached_image_window_viewport_id(sibling)
+                } else {
+                    assert_eq!(app.fullscreen_idx, Some(0));
+                    assert_eq!(app.viewer_presentation, ViewerPresentation::Fullscreen);
+                    app.fullscreen_viewport_id()
+                };
+                driver.focus(opened_viewport);
+                driver.root(&mut app);
+                let lease = register(opened_viewport, 0x7675_5510 + cycle);
+                let allocation = native_window_allocation_witness(&ctx, opened_viewport).unwrap();
+                if reactivate_sibling {
+                    let sibling = app.active_detached_window_id().unwrap();
+                    retained_sibling = Some((
+                        sibling,
+                        app.locate_window_context(sibling).unwrap().0,
+                        ctx.viewport_registration(opened_viewport).unwrap(),
+                        allocation.clone(),
+                        lease,
+                    ));
+                    app.set_detached_window_live_hwnds_for_test([0x7675_5501, 0x7675_5510]);
+                    (opened_viewport, None, allocation)
+                } else {
+                    (opened_viewport, Some(lease), allocation)
+                }
+            };
+            if stop_by_sibling && !reactivate_sibling {
+                let sibling = app.active_detached_window_id().unwrap();
+                assert_eq!(
+                    app.accept_active_detached_window_close(
+                        &ctx,
+                        sibling,
+                        "realmachine55_sibling_close"
+                    ),
+                    Some(true)
+                );
+                opened_lease.as_mut().unwrap().retire();
+            }
+            driver.focus(viewport);
+            for _ in 0..3 {
+                driver.root(&mut app);
+            }
+            assert!(
+                driver.callbacks.contains_key(&viewport),
+                "cycle={cycle}: parked callback remains registered"
+            );
+            assert_eq!(ctx.viewport_registration(viewport), Some(registration));
+            assert_eq!(
+                native_window_allocation_witness(&ctx, viewport),
+                Some(first_allocation.clone())
+            );
+            assert!(first_allocation.is_alive());
+            assert!(root_allocation.is_alive());
+            assert!(input_allocation.is_current());
+
+            let operation = input_allocation
+                .normalized_input(Phase::Pressed(Source::Mouse))
+                .unwrap_or_else(|| {
+                    panic!("cycle={cycle}: parked native owner must prove a new client press")
+                });
+            assert!(
+                input_allocation
+                    .normalized_input(Phase::Released(Source::Mouse))
+                    .is_none()
+            );
+            let pos = egui::pos2(80.0, 100.0);
+            driver.deferred_with_events(
+                viewport,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerInputProvenance(operation),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            app.process_deferred_detached_image_window_events_for_test(&ctx);
+            assert!(
+                app.detached_window_deferred_activation_pending(window),
+                "cycle={cycle}: client click queues activation"
+            );
+            driver.root(&mut app);
+            assert_eq!(
+                app.active_detached_window_id(),
+                Some(window),
+                "cycle={cycle}: client click resumes the same window"
+            );
+            assert_eq!(app.active_viewer_context_id(), Some(owner));
+            assert_eq!(app.locate_window_context(window).unwrap().0, owner);
+            assert_eq!(app.viewer_context_window(owner), Some(window));
+            assert!(
+                !app.detached_image_windows
+                    .iter()
+                    .any(|snapshot| snapshot.id == window)
+            );
+            app.with_viewer_context(owner, |viewer| {
+                assert_eq!(
+                    viewer.fullscreen_idx,
+                    Some(0),
+                    "cycle={cycle}: activation does not turn the resumed page"
+                )
+            })
+            .unwrap();
+
+            if !stop_by_sibling {
+                // The observed sequence contains a real main-focus close between
+                // successive grid opens. Exercise that consumer, not close_fullscreen.
+                app.fs_focus_grace_elapsed = true;
+                app.reconcile_fullscreen_after_main_focus(&ctx, true, true, false);
+                assert_eq!(
+                    app.fullscreen_idx, None,
+                    "cycle={cycle}: main focus guard closes its own fullscreen"
+                );
+                opened_lease.as_mut().unwrap().retire();
+            }
+            if let Some((
+                sibling,
+                sibling_owner,
+                sibling_registration,
+                sibling_allocation,
+                _lease,
+            )) = &retained_sibling
+            {
+                assert!(opened_allocation.is_alive());
+                assert_eq!(
+                    app.detached_window_state(*sibling),
+                    Some(DetachedWindowState::Parked)
+                );
+                assert_eq!(
+                    app.locate_window_context(*sibling).unwrap().0,
+                    *sibling_owner
+                );
+                assert_eq!(app.viewer_context_window(*sibling_owner), Some(*sibling));
+                assert_eq!(
+                    ctx.viewport_registration(opened_viewport),
+                    Some(*sibling_registration)
+                );
+                assert_eq!(
+                    native_window_allocation_witness(&ctx, opened_viewport),
+                    Some(sibling_allocation.clone())
+                );
+                app.with_viewer_context(*sibling_owner, |viewer| {
+                    assert_eq!(
+                        viewer.fullscreen_idx,
+                        Some(1),
+                        "cycle={cycle}: sibling activation preserves its page"
+                    )
+                })
+                .unwrap();
+                assert!(
+                    app.fullscreen_idx.is_none(),
+                    "sibling reactivation does not create main fullscreen"
+                );
+            } else {
+                assert!(!opened_allocation.is_alive());
+            }
+            driver.root(&mut app);
+            assert_eq!(app.active_detached_window_id(), Some(window));
+            assert_eq!(ctx.viewport_registration(viewport), Some(registration));
+            assert_eq!(
+                native_window_allocation_witness(&ctx, viewport),
+                Some(first_allocation.clone())
+            );
+            assert!(first_allocation.is_alive());
+            assert!(root_allocation.is_alive());
+            assert!(input_allocation.is_current());
+        }
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
+fn realmachine55_client_resume_survives_repeated_main_focus_close_and_grid_open() {
+    realmachine55_repeated_client_resume_case(false, false);
+}
+
+#[test]
+fn realmachine55_client_resume_survives_repeated_sibling_open_and_close() {
+    realmachine55_repeated_client_resume_case(true, false);
+}
+
+#[test]
+fn realmachine55_client_resume_survives_repeated_sibling_reactivation() {
+    realmachine55_repeated_client_resume_case(true, true);
+}
+
 fn records_for(frame: &ScenarioFrame, id: egui::ViewportId) -> &[PaintRecord] {
     frame.records.get(&id).map(Vec::as_slice).unwrap_or(&[])
 }

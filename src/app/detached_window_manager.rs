@@ -1392,6 +1392,7 @@ mod tests {
             registration: None,
             context_id: None,
             source: DetachedActivationSource::ClientClick,
+            expected_state: super::super::DetachedActivationTargetState::Parked,
             allocation: None,
         };
         let mut manager = DetachedWindowManager::new();

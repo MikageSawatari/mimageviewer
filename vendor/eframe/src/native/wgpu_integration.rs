@@ -1236,6 +1236,12 @@ impl WgpuWinitRunning<'_> {
         let mut shared = shared_owner.borrow_mut();
 
         let viewport_id = viewport_for_native_event(&shared.viewport_from_window, window_id);
+        crate::native_window_input::log_unmapped_primary_press(
+            "wgpu",
+            window_id,
+            viewport_id,
+            event,
+        );
 
         // A renderer may be entered from message dispatch only for an InteractiveResize frame
         // responding to this window's non-zero client resize. This decision uses event provenance
@@ -3667,6 +3673,11 @@ mod viewport_retirement_tests {
         fn shutdown_native_input(&mut self) {
             self.borrow_mut().retire_native_input();
         }
+    }
+
+    #[test]
+    fn realmachine55_wgpu_repeated_park_main_retirement_keeps_native_source() {
+        scenarios::realmachine55_repeated_park_main_retirement::<Headless>();
     }
 
     #[test]

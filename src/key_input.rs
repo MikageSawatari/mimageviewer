@@ -20,12 +20,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    HTCLOSE, HTHELP, HTMAXBUTTON, HTMINBUTTON, SC_CLOSE, WM_CANCELMODE, WM_CAPTURECHANGED,
-    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOVING, WM_NCDESTROY, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
-    WM_NCMOUSEMOVE, WM_NCPOINTERDOWN, WM_NCPOINTERUP, WM_NCPOINTERUPDATE, WM_POINTERCAPTURECHANGED,
-    WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_SIZING, WM_SYSCOMMAND, WM_SYSKEYDOWN,
-    WM_SYSKEYUP,
+    HTCAPTION, HTCLOSE, HTHELP, HTMAXBUTTON, HTMINBUTTON, SC_CLOSE, WM_CANCELMODE,
+    WM_CAPTURECHANGED, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOVING, WM_NCDESTROY, WM_NCLBUTTONDBLCLK,
+    WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSEMOVE, WM_NCPOINTERDOWN, WM_NCPOINTERUP,
+    WM_NCPOINTERUPDATE, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE,
+    WM_SIZING, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 const MAX_PENDING_EVENTS: usize = 256;
@@ -1418,6 +1418,45 @@ impl NativeInputAllocationWitness {
     ) -> Option<egui::Id> {
         observe_normalized_pointer_input(self.registration, input)
     }
+
+    #[cfg(test)]
+    pub(crate) fn native_message_for_test(&self, message: u32, wparam: usize, lparam: isize) {
+        let subclass = state()
+            .lock()
+            .unwrap()
+            .installed_hwnds
+            .registration(self.hwnd)
+            .filter(|entry| Weak::ptr_eq(&self.epoch, &Arc::downgrade(&entry.subclass_owner)))
+            .map(InstalledHwnd::subclass_id);
+        if let Some(subclass) = subclass {
+            native_detached_message_with_origin(
+                self.hwnd,
+                Some(subclass),
+                message,
+                wparam,
+                lparam,
+                true,
+                Some([10, 10, 410, 310]),
+                NativeMouseOrigin::Ordinary,
+            );
+            dispatch_native_detached_input();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finish_native_dispatch_for_test(&self, message: u32) {
+        let subclass = state()
+            .lock()
+            .unwrap()
+            .installed_hwnds
+            .registration(self.hwnd)
+            .filter(|entry| Weak::ptr_eq(&self.epoch, &Arc::downgrade(&entry.subclass_owner)))
+            .map(InstalledHwnd::subclass_id);
+        if let Some(subclass) = subclass {
+            finish_native_detached_dispatch(self.hwnd, subclass, message);
+            dispatch_native_detached_input();
+        }
+    }
 }
 
 pub(crate) fn native_input_allocation_witness(
@@ -1445,10 +1484,43 @@ pub(crate) fn install_normalized_pointer_input_observer(ctx: &egui::Context) {
     egui_winit::pointer_input_observer::set_observer(
         ctx,
         Some(Arc::new(|context, viewport, input| {
-            let registration = context.viewport_registration(viewport)?;
+            let Some(registration) = context.viewport_registration(viewport) else {
+                log_normalized_pointer_discard(
+                    viewport,
+                    None,
+                    input,
+                    NormalizedPointerDiscardReason::MissingViewportRegistration,
+                );
+                return None;
+            };
             observe_normalized_pointer_input(registration, input)
         })),
     );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NormalizedPointerDiscardReason {
+    MissingViewportRegistration,
+    RegistrationNotInstalled,
+    Unbound,
+    GestureOwned(NativeDetachedGesture),
+    InputStateUnavailable,
+}
+
+fn log_normalized_pointer_discard(
+    viewport: egui::ViewportId,
+    registration: Option<egui::ViewportRegistration>,
+    input: egui_winit::pointer_input_observer::NormalizedPointerInput,
+    reason: NormalizedPointerDiscardReason,
+) {
+    if matches!(
+        input,
+        egui_winit::pointer_input_observer::NormalizedPointerInput::Pressed(_)
+    ) {
+        crate::logger::log(format!(
+            "[detached-activation] boundary=normalized_discard input={input:?} reason={reason:?} viewport={viewport:?} registration={registration:?}"
+        ));
+    }
 }
 
 fn observe_normalized_pointer_input(
@@ -1460,15 +1532,40 @@ fn observe_normalized_pointer_input(
     if let Ok(mut guard) = state().lock() {
         let mut retired = Vec::new();
         let targets = guard.native_detached_targets.clone();
-        let entry = guard
+        let Some(entry) = guard
             .installed_hwnds
             .entries
             .iter_mut()
-            .find(|entry| entry.logical_registration == Some(registration))?;
-        let NativeDetachedInputBinding::Bound { target, gesture } = &mut entry.native_detached
+            .find(|entry| entry.logical_registration == Some(registration))
         else {
+            log_normalized_pointer_discard(
+                registration.viewport_id(),
+                Some(registration),
+                input,
+                NormalizedPointerDiscardReason::RegistrationNotInstalled,
+            );
             return None;
         };
+        let NativeDetachedInputBinding::Bound { target, gesture } = &mut entry.native_detached
+        else {
+            log_normalized_pointer_discard(
+                registration.viewport_id(),
+                Some(registration),
+                input,
+                NormalizedPointerDiscardReason::Unbound,
+            );
+            return None;
+        };
+        if matches!(input, NormalizedPointerInput::Pressed(_))
+            && *gesture != NativeDetachedGesture::Idle
+        {
+            log_normalized_pointer_discard(
+                registration.viewport_id(),
+                Some(registration),
+                input,
+                NormalizedPointerDiscardReason::GestureOwned(*gesture),
+            );
+        }
         let pointer_source = match input {
             NormalizedPointerInput::Pressed(source)
             | NormalizedPointerInput::Released(source)
@@ -1546,6 +1643,13 @@ fn observe_normalized_pointer_input(
                 .map(NativeDetachedInputEffect::Deliver),
         );
         guard.native_detached_effects.extend(retired);
+    } else {
+        log_normalized_pointer_discard(
+            registration.viewport_id(),
+            Some(registration),
+            input,
+            NormalizedPointerDiscardReason::InputStateUnavailable,
+        );
     }
     dispatch_native_detached_input();
     marker
@@ -1568,6 +1672,41 @@ pub(crate) fn register_test_native_input_allocation(
     drop(guard);
     dispatch_native_detached_input();
     witness
+}
+
+/// Exercise the backend allocation/retirement contract with synthetic HWNDs,
+/// without installing a Win32 subclass on a real desktop window.
+#[cfg(test)]
+pub(crate) struct TestNativeWindowInputListener;
+
+#[cfg(test)]
+impl eframe::native_window_input::NativeWindowInputListener for TestNativeWindowInputListener {
+    fn install(
+        &self,
+        allocation: eframe::native_window_input::NativeWindowAllocation,
+    ) -> Result<Box<dyn eframe::native_window_input::NativeWindowInputLease>, String> {
+        struct Lease(Option<NativeInputAllocationWitness>);
+        impl eframe::native_window_input::NativeWindowInputLease for Lease {
+            fn retire(&mut self) {
+                if let Some(witness) = self.0.take() {
+                    if let Ok(mut guard) = state().lock()
+                        && let Some(entry) = guard.installed_hwnds.registration(witness.hwnd)
+                        && Weak::ptr_eq(&witness.epoch, &Arc::downgrade(&entry.subclass_owner))
+                    {
+                        let subclass = entry.subclass_id();
+                        guard.unregister_subclass(witness.hwnd, subclass);
+                    }
+                    dispatch_native_detached_input();
+                }
+            }
+        }
+        let hwnd = allocation
+            .windows_hwnd
+            .ok_or("test allocation has no HWND")?;
+        Ok(Box::new(Lease(Some(
+            register_test_native_input_allocation(allocation.registration, hwnd as u64),
+        ))))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5331,6 +5470,7 @@ fn native_detached_message_interesting(message: u32) -> bool {
             | WM_CAPTURECHANGED
             | WM_MOVING
             | WM_SIZING
+            | WM_EXITSIZEMOVE
     )
 }
 
@@ -5665,6 +5805,17 @@ fn native_detached_message_with_origin(
         if let NativeDetachedGesture::NonClient { phase, .. } = gesture {
             *phase = NativeNonClientPhase::CloseOwned;
         }
+    } else if message == WM_EXITSIZEMOVE {
+        if let NativeDetachedGesture::NonClient {
+            press_target: NativeNonClientPressTarget { hit: HTCAPTION, .. },
+            phase: phase @ NativeNonClientPhase::Pressed,
+            ..
+        } = gesture
+        {
+            // The OS modal loop can consume Up without forwarding it through
+            // the subclass or PM_REMOVE hook. Its explicit end is conclusive.
+            *phase = NativeNonClientPhase::Released;
+        }
     } else {
         let pointer_owner_matches = match *gesture {
             NativeDetachedGesture::ClientPressed {
@@ -5696,6 +5847,16 @@ fn native_detached_message_with_origin(
             Some(NativeInputCancelReason::Escape)
         } else if message == WM_CAPTURECHANGED
             && lparam as u64 != hwnd
+            && !(lparam == 0
+                && matches!(
+                    gesture,
+                    NativeDetachedGesture::NonClient {
+                        source: NativePointerSource::Mouse,
+                        press_target: NativeNonClientPressTarget { hit: HTCAPTION, .. },
+                        scope: NativeNonClientScope::InNativeCall,
+                        ..
+                    }
+                ))
             && matches!(
                 gesture,
                 NativeDetachedGesture::ClientPressed {
@@ -5778,6 +5939,7 @@ fn finish_native_detached_dispatch(hwnd: u64, subclass_id: usize, message: u32) 
     };
     if let NativeDetachedGesture::NonClient {
         source,
+        press_target,
         scope,
         phase,
         ..
@@ -5787,12 +5949,22 @@ fn finish_native_detached_dispatch(hwnd: u64, subclass_id: usize, message: u32) 
             NativePointerSource::Mouse => matches!(message, WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK),
             NativePointerSource::Pointer(_) => message == WM_NCPOINTERDOWN,
         } && *scope == NativeNonClientScope::InNativeCall;
+        if native_call_returned
+            && *source == NativePointerSource::Mouse
+            && press_target.hit == HTCAPTION
+            && *phase == NativeNonClientPhase::Pressed
+        {
+            // Mouse caption Down/DoubleClick owns the synchronous native
+            // operation until DefSubclassProc returns. No later Up is owed.
+            *phase = NativeNonClientPhase::Released;
+        }
         let awaited_release_returned = *scope == NativeNonClientScope::AwaitingRelease
             && match phase {
                 NativeNonClientPhase::Released => match source {
                     NativePointerSource::Mouse => matches!(message, WM_LBUTTONUP | WM_NCLBUTTONUP),
                     NativePointerSource::Pointer(_) => {
                         matches!(message, WM_POINTERUP | WM_NCPOINTERUP)
+                            || (message == WM_EXITSIZEMOVE && press_target.hit == HTCAPTION)
                     }
                 },
                 NativeNonClientPhase::Cancelled(_) | NativeNonClientPhase::CloseOwned => true,
@@ -6092,6 +6264,85 @@ mod native_detached_tests {
     }
 
     #[test]
+    fn realmachine55_caption_native_return_finishes_without_forwarded_up() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm55-caption-return", 0x7550);
+        for start in [WM_NCLBUTTONDOWN, WM_NCLBUTTONDBLCLK] {
+            f.message(start, HTCAPTION as usize, 0);
+            // DefSubclassProc's move loop can consume Up itself, then release
+            // capture before returning. Neither is an external cancellation.
+            observe_native_detached_message(f.hwnd, WM_CAPTURECHANGED, 0, 0);
+            f.finish(WM_CAPTURECHANGED);
+            assert!(f.take().is_empty(), "the outer native call owns completion");
+            f.finish(start);
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Completed
+                )]
+            );
+            let operation = f.canonical(NormalizedPointerInput::Pressed(PointerInputSource::Mouse));
+            assert!(
+                operation.is_some(),
+                "caption completion must release the client owner"
+            );
+            f.canonical(NormalizedPointerInput::Released(PointerInputSource::Mouse));
+            f.take();
+        }
+    }
+
+    #[test]
+    fn realmachine55_caption_exit_size_move_is_terminal_without_up() {
+        use windows::Win32::UI::WindowsAndMessaging::WM_EXITSIZEMOVE;
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm55-caption-exit", 0x7551);
+        f.message(WM_NCPOINTERDOWN, (HTCAPTION as usize) << 16 | 7, 0);
+        f.finish(WM_NCPOINTERDOWN);
+        assert!(
+            f.take().is_empty(),
+            "raw pointer Down may return before its operation"
+        );
+        f.message(WM_EXITSIZEMOVE, 0, 0);
+        f.finish(WM_EXITSIZEMOVE);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+        f.message(WM_NCPOINTERUP, 7, 0);
+        f.finish(WM_NCPOINTERUP);
+        assert!(
+            f.take().is_empty(),
+            "late Up cannot create a second activation"
+        );
+    }
+
+    #[test]
+    fn realmachine55_caption_modal_drag_stays_cancelled_at_native_return() {
+        use windows::Win32::UI::WindowsAndMessaging::WM_EXITSIZEMOVE;
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm55-caption-drag", 0x7552);
+        f.message(WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+        let mut rect = windows::Win32::Foundation::RECT {
+            left: 19,
+            top: 10,
+            right: 419,
+            bottom: 310,
+        };
+        f.message(WM_MOVING, 0, (&mut rect as *mut _) as isize);
+        observe_native_detached_message(f.hwnd, WM_CAPTURECHANGED, 0, 0);
+        f.message(WM_EXITSIZEMOVE, 0, 0);
+        f.finish(WM_NCLBUTTONDOWN);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::Drag)
+            )]
+        );
+    }
+
+    #[test]
     fn native_detached_modal_loop_up_finishes_once_without_client_producer() {
         let _serial = lock_test_input();
         let f = Fixture::new("native-nc-click", 0x701);
@@ -6125,10 +6376,23 @@ mod native_detached_tests {
                 0,
                 NativeInputCancelReason::CaptureLost,
             ),
+            (
+                WM_CAPTURECHANGED,
+                0,
+                0x777,
+                NativeInputCancelReason::CaptureLost,
+            ),
             (WM_CANCELMODE, 0, 0, NativeInputCancelReason::CancelMode),
             (WM_KEYDOWN, 0x1b, 0, NativeInputCancelReason::Escape),
         ] {
-            f.message(WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+            // Capture loss remains cancellation for a caption button. A
+            // caption move-loop ReleaseCapture is covered by realmachine55.
+            let hit = if message == WM_CAPTURECHANGED && lparam == 0 {
+                HTMAXBUTTON
+            } else {
+                HTCAPTION
+            };
+            f.message(WM_NCLBUTTONDOWN, hit as usize, 0);
             observe_native_detached_message(f.hwnd, message, wparam, lparam);
             f.finish(message);
             assert!(f.take().is_empty());
@@ -6173,15 +6437,16 @@ mod native_detached_tests {
         f.message(WM_SYSCOMMAND, SC_MAXIMIZE as usize, 0);
         f.finish(WM_SYSCOMMAND);
         f.finish(WM_NCLBUTTONDBLCLK);
-        assert!(f.take().is_empty(), "maximize preserves press until its Up");
-        f.message(WM_NCLBUTTONUP, 0, 0);
-        f.finish(WM_NCLBUTTONUP);
         assert_eq!(
             f.take(),
             vec![NativeDetachedInputEventKind::NonClient(
                 NativeNonClientOutcome::Completed
-            )]
+            )],
+            "caption double-click completes at its native return"
         );
+        f.message(WM_NCLBUTTONUP, 0, 0);
+        f.finish(WM_NCLBUTTONUP);
+        assert!(f.take().is_empty(), "late Up cannot activate twice");
 
         f.message(WM_NCLBUTTONDOWN, HTCLOSE as usize, 0);
         f.message(WM_SYSCOMMAND, SC_CLOSE as usize, 0);

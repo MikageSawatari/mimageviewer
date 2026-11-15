@@ -218,8 +218,11 @@ impl Contact {
     }
 
     fn is_tap(self, now_ms: u64) -> bool {
+        self.is_stationary_press() && now_ms.saturating_sub(self.start_ms) <= TAP_MAX_DURATION_MS
+    }
+
+    fn is_stationary_press(self) -> bool {
         self.max_distance_sq <= TAP_MAX_DISTANCE_PT * TAP_MAX_DISTANCE_PT
-            && now_ms.saturating_sub(self.start_ms) <= TAP_MAX_DURATION_MS
     }
 }
 
@@ -440,6 +443,29 @@ impl TouchRecognizer {
             })
     }
 
+    /// Input evidence for a parked owner's activation, independent of the
+    /// duration policy for normal viewer commands. This does not change owner,
+    /// suppression, or commands; the adapter must still prove exact transport.
+    pub(crate) fn accepts_stationary_press_end(&self, sample: TouchSample) -> bool {
+        if sample.phase != TouchPhase::End
+            || self.contacts.len() != 1
+            || !matches!(
+                self.owner,
+                TouchOwner::Undecided | TouchOwner::WidgetPassthrough
+            )
+        {
+            return false;
+        }
+        self.contacts
+            .iter()
+            .find(|contact| contact.id == sample.id)
+            .is_some_and(|contact| {
+                let mut contact = *contact;
+                contact.update(sample.pos);
+                contact.is_stationary_press()
+            })
+    }
+
     fn handle_end(&mut self, geom: &TapZoneGeometry, sample: TouchSample) -> Vec<TouchCommand> {
         let Some(index) = self
             .contacts
@@ -490,7 +516,7 @@ impl TouchRecognizer {
                         }
                     }
                 }
-            } else if contact.max_distance_sq > TAP_MAX_DISTANCE_PT * TAP_MAX_DISTANCE_PT {
+            } else if !contact.is_stationary_press() {
                 self.owner = match geom.behavior {
                     TouchSurfaceBehavior::Grid => TouchOwner::GridScroll,
                     TouchSurfaceBehavior::Viewer { .. } => TouchOwner::ViewerPointerPassthrough,
@@ -544,7 +570,7 @@ impl TouchRecognizer {
         contact: Contact,
     ) -> Vec<TouchCommand> {
         let delta = contact.pos - contact.start_pos;
-        let moved_beyond_tap = contact.max_distance_sq > TAP_MAX_DISTANCE_PT * TAP_MAX_DISTANCE_PT;
+        let moved_beyond_tap = !contact.is_stationary_press();
 
         if behavior == TouchSurfaceBehavior::Grid {
             if moved_beyond_tap {

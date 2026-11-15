@@ -1179,6 +1179,12 @@ impl GlowWinitRunning<'_> {
     ) -> EventResult {
         let mut glutin = self.glutin.borrow_mut();
         let viewport_id = viewport_for_native_event(&glutin.viewport_from_window, window_id);
+        crate::native_window_input::log_unmapped_primary_press(
+            "glow",
+            window_id,
+            viewport_id,
+            event,
+        );
 
         // On Windows, if a window is resized by the user, it should repaint synchronously, inside the
         // event handler.
@@ -3783,6 +3789,11 @@ mod viewport_retirement_tests {
             );
         }
     }
+    #[test]
+    fn realmachine55_glow_repeated_park_main_retirement_keeps_native_source() {
+        scenarios::realmachine55_repeated_park_main_retirement::<Headless>();
+    }
+
     #[test]
     fn native_window_input_glow_gc_terminal_close_shutdown() {
         scenarios::native_window_input_lifecycle::<Headless>();

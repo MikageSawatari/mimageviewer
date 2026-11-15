@@ -1458,6 +1458,14 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-15: §1.767 サブPC依頼55 — caption／長押し／ParkedLiveと入力入口の診断
+
+設計担当の指定と独立設計レビュー（Sol / xhigh）の構造合意に従い、captionの同期native操作終端、
+復帰専用の時間に依存しないclick／単指完了、ParkedLiveのNonClient transportと生成時のtyped期待状態を
+既存ownerへ揃える（BA-7主、BA-1関連）。drag取消は今回維持する。Aの反復停止後の入力消失は
+headlessで再現した原因とはせず、App／両backend／Stateの反復対照と押下時の型付き破棄診断を追加し、
+推測によるlease／routing変更は行わない。[依頼50調査書 §5](depth-parallax-realmachine50-investigation.md#5-依頼55の対応2026-11-15)に根拠・検証・未確認を記録する。
+
 ### 2026-11-14: §1.767 サブPC依頼50 B — 外部openの採用をgrid handoffへ接続
 
 設計担当と独立設計レビュー（Sol / xhigh、2026-11-14）が構造的な変更に合意した範囲で、startupのtyped ownerが新規main採用／既存C継続を確定し、既存navigation・hydration・composition／sidecar／列挙reopenへ保持する。採用可能な最終rowの境界で新規mainだけが既存gridのpark／closeを一度通し、旧Depthを終えてから新sessionを公開する（BA-7主・BA-5関連）。Bookmark／Collectionは自己parkせず、mainの一覧、DirectMedia／mediaの所有モデル、PDF cached即時採用、A／Cの入力契約は維持する。記録・経路表・検証は[依頼50調査書 §3.5](depth-parallax-realmachine50-investigation.md#35-b-実装記録2026-11-14ba-7主ba-5関連)。

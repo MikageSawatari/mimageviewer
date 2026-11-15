@@ -113,3 +113,10 @@ RawInputの実take/appendとkey先頭追加、eguiのdiscardによる実再pass�
 同等の生成時通知・物理source・一イベント一通知・Context lock外callbackの契約を保ち、
 利用側のowner証明と、markerによる実Startとの相関を合わせて移植する。
 単なるnative Down/Up通知やbatch内FIFO/indexで置換してはならない。
+## 依頼55: client入力破棄の診断（2026-11-15）
+
+primary押下の境界だけで `PointerInputDiscardReason` を通常ログへ出す。
+Stateにpointer位置がない場合は `PointerPositionUnavailable`、raw押下が生成されても
+Context共有observerが未設置なら `ObserverNotInstalled`。viewportと現在registrationを併記する。
+入力生成・配送・cursor寿命は変更せず、位置のOS再探索、observerの再設置、retryはしない。
+上流移植時は観測と対処を分け、この診断の代わりに位置推定や入力再生を導入しないこと。

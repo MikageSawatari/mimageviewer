@@ -10,6 +10,33 @@ pub(crate) enum DetachedActivationSource {
     NativeMedia,
 }
 
+/// Expected residence belongs to the request's creation boundary. Input source
+/// is diagnostic provenance and does not decide which parked state it owns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DetachedActivationTargetState {
+    Parked,
+    ParkedLive,
+    Unavailable,
+}
+
+impl DetachedActivationTargetState {
+    fn from_runtime(state: Option<DetachedWindowState>) -> Self {
+        match state {
+            Some(DetachedWindowState::Parked) => Self::Parked,
+            Some(DetachedWindowState::ParkedLive) => Self::ParkedLive,
+            _ => Self::Unavailable,
+        }
+    }
+
+    fn matches(self, state: Option<DetachedWindowState>) -> bool {
+        matches!(
+            (self, state),
+            (Self::Parked, Some(DetachedWindowState::Parked))
+                | (Self::ParkedLive, Some(DetachedWindowState::ParkedLive))
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DetachedActivationDecision {
     Accepted,
@@ -29,6 +56,7 @@ pub(crate) struct DetachedActivationRequest {
     pub(crate) registration: Option<egui::ViewportRegistration>,
     pub(crate) context_id: Option<ViewerContextId>,
     pub(crate) source: DetachedActivationSource,
+    pub(crate) expected_state: DetachedActivationTargetState,
     pub(crate) allocation: Option<crate::key_input::NativeInputAllocationWitness>,
 }
 
@@ -38,6 +66,7 @@ impl PartialEq for DetachedActivationRequest {
             && self.registration == other.registration
             && self.context_id == other.context_id
             && self.source == other.source
+            && self.expected_state == other.expected_state
             && match (&self.allocation, &other.allocation) {
                 (None, None) => true,
                 (Some(a), Some(b)) => a.same_allocation(b),
@@ -48,9 +77,30 @@ impl PartialEq for DetachedActivationRequest {
 
 impl DetachedActivationRequest {
     pub(crate) fn log(&self, boundary: &str, decision: DetachedActivationDecision) {
+        self.log_with_client_reason(boundary, decision, None);
+    }
+
+    pub(crate) fn log_client_cancelled(
+        &self,
+        boundary: &str,
+        decision: DetachedActivationDecision,
+        reason: super::detached_activation_gesture::ClientActivationCancelReason,
+    ) {
+        self.log_with_client_reason(boundary, decision, Some(reason));
+    }
+
+    fn log_with_client_reason(
+        &self,
+        boundary: &str,
+        decision: DetachedActivationDecision,
+        reason: Option<super::detached_activation_gesture::ClientActivationCancelReason>,
+    ) {
+        let reason = reason
+            .map(|reason| format!(" reason={reason:?}"))
+            .unwrap_or_default();
         crate::logger::log(format!(
-            "[detached-activation] boundary={boundary} source={:?} decision={decision:?} window={} registration={:?} context={:?}",
-            self.source, self.window_id, self.registration, self.context_id,
+            "[detached-activation] boundary={boundary} source={:?} decision={decision:?}{reason} window={} registration={:?} context={:?} expected_state={:?}",
+            self.source, self.window_id, self.registration, self.context_id, self.expected_state,
         ));
     }
 }
@@ -69,6 +119,9 @@ impl App {
             registration,
             context_id: self.locate_window_context(window_id).map(|(id, _)| id),
             source,
+            expected_state: DetachedActivationTargetState::from_runtime(
+                self.detached_window_state(window_id),
+            ),
             allocation: registration.and_then(crate::key_input::native_input_allocation_witness),
         }
     }
@@ -99,12 +152,9 @@ impl App {
         {
             return ModalOwned;
         }
-        let expected = if request.source == DetachedActivationSource::NativeMedia {
-            DetachedWindowState::ParkedLive
-        } else {
-            DetachedWindowState::Parked
-        };
-        if self.detached_window_state(request.window_id) != Some(expected)
+        if !request
+            .expected_state
+            .matches(self.detached_window_state(request.window_id))
             || !self.detached_window_can_activate(request.window_id)
         {
             return NotParked;
@@ -152,7 +202,10 @@ impl App {
         use crate::key_input::*;
         let mut targets = Vec::new();
         for (id, shared) in &self.deferred_detached_image_window_views {
-            if self.detached_window_state(*id) != Some(DetachedWindowState::Parked) {
+            if !matches!(
+                self.detached_window_state(*id),
+                Some(DetachedWindowState::Parked | DetachedWindowState::ParkedLive)
+            ) {
                 continue;
             }
             let Some(registration) =
@@ -188,6 +241,11 @@ impl App {
                 sink: Arc::new(move |event| {
                     match event.kind {
                         NativeDetachedInputEventKind::ClientBoundary(boundary) => {
+                            // ParkedLive's existing immediate/native media
+                            // producer retains client activation ownership.
+                            if request.expected_state != DetachedActivationTargetState::Parked {
+                                return;
+                            }
                             let mut origin = request.clone();
                             origin.source = DetachedActivationSource::ClientClick;
                             origin.registration = Some(event.source.registration);
@@ -258,6 +316,170 @@ mod tests {
     use super::super::detached_activation_gesture::*;
     use super::*;
 
+    fn realmachine55_parked_media_fixture() -> (
+        super::super::tests::phase_c_support::AppTestEnv,
+        egui::Context,
+        u64,
+    ) {
+        use super::super::detached_media_exchange_tests as media;
+        let mut app = super::super::tests::phase_c_support::setup_app();
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let root = app.tmp.path().to_path_buf();
+        media::install_items(&mut app, &ctx, &root, false);
+        media::open_grid(&mut app, &ctx, 0);
+        let id = app.detached_viewer_window_id().unwrap();
+        media::open_grid(&mut app, &ctx, 3);
+        assert_eq!(
+            app.detached_window_state(id),
+            Some(DetachedWindowState::ParkedLive)
+        );
+        egui::Context::set_immediate_viewport_renderer(|ctx, mut viewport| {
+            let id = viewport.ids.this;
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+            let mut input = egui::RawInput {
+                viewport_id: id,
+                screen_rect: Some(rect),
+                focused: false,
+                ..Default::default()
+            };
+            let info = input.viewports.entry(id).or_default();
+            info.parent = Some(egui::ViewportId::ROOT);
+            info.focused = Some(false);
+            info.outer_rect = Some(rect);
+            info.inner_rect = Some(rect);
+            ctx.run_ui(input, |ui| (viewport.viewport_ui_cb)(ui))
+                .drop_without_applying_deltas();
+        });
+        assert!(!app.deferred_detached_image_window_views.contains_key(&id));
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.render_detached_image_windows(ui.ctx())
+        })
+        .drop_without_applying_deltas();
+        assert!(
+            app.deferred_detached_image_window_views.contains_key(&id),
+            "the real ParkedLive render branch must create and retain its native event transport"
+        );
+        app.prune_deferred_detached_image_window_views();
+        assert!(app.deferred_detached_image_window_views.contains_key(&id));
+        (app, ctx, id)
+    }
+
+    #[test]
+    fn realmachine55_parked_live_nonclient_is_admitted_without_changing_native_media() {
+        let _input = crate::key_input::lock_test_input();
+        let (app, ctx, id) = realmachine55_parked_media_fixture();
+        for source in [
+            DetachedActivationSource::NativeMedia,
+            DetachedActivationSource::NonClientClick,
+        ] {
+            let request = app.detached_activation_request(&ctx, id, source);
+            assert_eq!(
+                app.detached_activation_admission(&ctx, &request),
+                DetachedActivationDecision::Accepted,
+                "both producers preserve the ParkedLive intent: {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn realmachine55_parked_live_native_target_reaches_existing_transport() {
+        use egui_winit::pointer_input_observer::{
+            NormalizedPointerInput as Phase, PointerInputSource as Source,
+        };
+        let _input = crate::key_input::lock_test_input();
+        let (app, ctx, id) = realmachine55_parked_media_fixture();
+        let registration = ctx
+            .viewport_registration(App::detached_image_window_viewport_id(id))
+            .unwrap();
+        let allocation =
+            crate::key_input::register_test_native_input_allocation(registration, 0x7553);
+        app.sync_detached_native_input_targets(&ctx);
+        assert!(
+            allocation
+                .normalized_input(Phase::Pressed(Source::Mouse))
+                .is_some(),
+            "ParkedLive must publish its exact native allocation input target"
+        );
+        allocation.normalized_input(Phase::Released(Source::Mouse));
+        assert!(
+            app.deferred_detached_image_window_views[&id]
+                .drain_events()
+                .is_empty(),
+            "client activation remains owned by the existing NativeMedia producer"
+        );
+    }
+
+    #[test]
+    fn realmachine55_parked_live_caption_button_and_doubleclick_resume_same_context() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            HTCAPTION, HTMAXBUTTON, WM_CAPTURECHANGED, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
+            WM_NCLBUTTONUP,
+        };
+        let _input = crate::key_input::lock_test_input();
+        for (start, hit) in [
+            (WM_NCLBUTTONDOWN, HTCAPTION),
+            (WM_NCLBUTTONDOWN, HTMAXBUTTON),
+            (WM_NCLBUTTONDBLCLK, HTCAPTION),
+        ] {
+            let (mut app, ctx, id) = realmachine55_parked_media_fixture();
+            let context = app.locate_window_context(id).unwrap().0;
+            let registration = ctx
+                .viewport_registration(App::detached_image_window_viewport_id(id))
+                .unwrap();
+            let allocation =
+                crate::key_input::register_test_native_input_allocation(registration, 0x7554);
+            app.sync_detached_native_input_targets(&ctx);
+            allocation.native_message_for_test(start, hit as usize, 0);
+            if hit == HTMAXBUTTON {
+                allocation.native_message_for_test(WM_NCLBUTTONUP, hit as usize, 0);
+            } else {
+                allocation.native_message_for_test(WM_CAPTURECHANGED, 0, 0);
+            }
+            allocation.finish_native_dispatch_for_test(start);
+            let shared = Arc::clone(&app.deferred_detached_image_window_views[&id]);
+            let events = shared.drain_events();
+            assert_eq!(events.len(), 1, "one NC operation has one request");
+            for event in events {
+                let DeferredDetachedImageWindowEvent::Activation { request } = &event else {
+                    panic!("NC operation must use existing activation transport");
+                };
+                assert_eq!(request.source, DetachedActivationSource::NonClientClick);
+                assert_eq!(
+                    request.expected_state,
+                    DetachedActivationTargetState::ParkedLive
+                );
+                shared.push_event(event);
+            }
+            app.service_deferred_detached_window_events(&ctx);
+            assert!(app.detached_window_deferred_activation_pending(id));
+            assert!(app.commit_pending_deferred_detached_window_activation(&ctx));
+            assert_eq!(app.active_detached_window_id(), Some(id));
+            assert_eq!(app.active_viewer_context_id(), Some(context));
+            assert!(
+                !app.detached_image_windows
+                    .iter()
+                    .any(|window| window.id == id)
+            );
+            app.prune_deferred_detached_image_window_views();
+            assert!(!app.deferred_detached_image_window_views.contains_key(&id));
+            assert!(!app.commit_pending_deferred_detached_window_activation(&ctx));
+        }
+    }
+
+    #[test]
+    fn realmachine55_parked_live_request_does_not_follow_a_later_runtime_state() {
+        let _input = crate::key_input::lock_test_input();
+        let (mut app, ctx, id) = realmachine55_parked_media_fixture();
+        let request =
+            app.detached_activation_request(&ctx, id, DetachedActivationSource::NonClientClick);
+        app.transition_detached_window_state(id, DetachedWindowState::Parked, "test_late_nc");
+        assert_eq!(
+            app.detached_activation_admission(&ctx, &request),
+            DetachedActivationDecision::NotParked
+        );
+    }
+
     #[test]
     fn client_press_cannot_be_reassigned_to_a_replacement_context() {
         let ctx = egui::Context::default();
@@ -267,6 +489,7 @@ mod tests {
             registration: None,
             context_id: Some(ViewerContextId::for_test(1)),
             source: DetachedActivationSource::ClientClick,
+            expected_state: DetachedActivationTargetState::Parked,
             allocation: None,
         };
         let geometry = crate::touch_input::TapZoneGeometry {
@@ -340,6 +563,7 @@ mod tests {
             registration: ctx.viewport_registration(egui::ViewportId::ROOT),
             context_id: None,
             source: DetachedActivationSource::ClientClick,
+            expected_state: DetachedActivationTargetState::Parked,
             allocation: None,
         };
         assert_eq!(
@@ -366,6 +590,7 @@ mod tests {
             registration: Some(registration),
             context_id: Some(ViewerContextId::for_test(1)),
             source: DetachedActivationSource::ClientClick,
+            expected_state: DetachedActivationTargetState::Parked,
             allocation: Some(allocation),
         };
         let mut current = old.clone();

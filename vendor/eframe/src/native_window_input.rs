@@ -313,6 +313,42 @@ pub(crate) fn register_window(
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeWindowInputDiscardReason {
+    UnmappedWindowId,
+}
+
+fn unmapped_primary_press_reason(
+    viewport: Option<egui::ViewportId>,
+    event: &winit::event::WindowEvent,
+) -> Option<NativeWindowInputDiscardReason> {
+    use winit::event::{ElementState, MouseButton, WindowEvent};
+    (viewport.is_none()
+        && matches!(
+            event,
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            }
+        ))
+    .then_some(NativeWindowInputDiscardReason::UnmappedWindowId)
+}
+
+/// Observe the actual dispatch boundary; never infer a replacement viewport.
+pub(crate) fn log_unmapped_primary_press(
+    backend: &str,
+    window: NativeWindowId,
+    viewport: Option<egui::ViewportId>,
+    event: &winit::event::WindowEvent,
+) {
+    if let Some(reason) = unmapped_primary_press_reason(viewport, event) {
+        log::info!(
+            "[detached-activation] boundary=backend_input source=ClientClick decision={reason:?} backend={backend} window_id={window:?}"
+        );
+    }
+}
+
 /// Remove the native input owner and every old event source for this viewport.
 /// Logical RawInput belongs to the viewport and is retained separately.
 pub(crate) fn retire_window<K: Eq + std::hash::Hash, S: std::hash::BuildHasher>(
@@ -329,6 +365,33 @@ pub(crate) fn retire_window<K: Eq + std::hash::Hash, S: std::hash::BuildHasher>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_window_input_unmapped_diagnostic_is_only_a_primary_press() {
+        use winit::event::{DeviceId, ElementState, MouseButton, WindowEvent};
+        for state in [ElementState::Pressed, ElementState::Released] {
+            for button in [MouseButton::Left, MouseButton::Right] {
+                let event = WindowEvent::MouseInput {
+                    device_id: DeviceId::dummy(),
+                    state,
+                    button,
+                };
+                assert_eq!(
+                    unmapped_primary_press_reason(None, &event),
+                    (state == ElementState::Pressed && button == MouseButton::Left)
+                        .then_some(NativeWindowInputDiscardReason::UnmappedWindowId)
+                );
+                assert_eq!(
+                    unmapped_primary_press_reason(Some(egui::ViewportId::ROOT), &event),
+                    None
+                );
+            }
+        }
+        assert_eq!(
+            unmapped_primary_press_reason(None, &WindowEvent::Focused(true)),
+            None
+        );
+    }
 
     type Calls = Arc<Mutex<Vec<(&'static str, NativeWindowAllocation)>>>;
 

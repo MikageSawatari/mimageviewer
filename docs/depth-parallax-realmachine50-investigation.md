@@ -730,7 +730,143 @@ Bの失敗は`realmachine50_forwarded_open_without_dialog_retires_previous_live_
 実機のkeyboard／IME／native再生成は未確認。製品起動・確認用build・全件gate・commit／pushは行わない。
 描画・UI文言は変更していない。
 
-## 5. 退行の確認と補足2件
+## 5. 依頼55の対応（2026-11-15）
+
+基点は `25f3f9e41`。実機の観測者はすべてサブPC担当。
+`C:/miv-subpc/results-55/notes.md` と `logs/part2a`、`logs/part3`、`logs/part1` の
+`mimageviewer.log` を照合した。以下のheadless結果を実機での修正確認とは扱わない。
+
+### 5.1 A: client入力の消失は未特定、推測によるlifecycle変更はしない
+
+**観測。** part2aの窓4は281.456秒のnormalized Press、281.457秒のRelease／callback、
+281.552秒のcommitが揃う。300.456秒の2回目pause後はclient行がなく、394.117秒のNonClient取消は
+同じregistration `866D`／lifetime12を指す。窓2も2回目pause後に同症状となる。
+part3では兄弟窓の復帰でpauseした後にもclient復帰が複数回成立している。
+
+**検査した境界。** 本体の `realmachine55_client_resume_survives_repeated_main_focus_close_and_grid_open` は
+正規native allocation registry／入力leaseと既存ScenarioDriverで、実grid open、pause、callbackの
+生成時proof、既存transport、root commit、実 `reconcile_fullscreen_after_main_focus` を3往復する。
+兄弟open／closeの対照は `realmachine55_client_resume_survives_repeated_sibling_open_and_close`。
+既存兄弟の交互再開で相手をpauseする対照は `realmachine55_client_resume_survives_repeated_sibling_reactivation`。
+App側はnative sourceの生成・退役とnormalized入力を合成し、実backend配送の証明ではない。
+別にeframeの既存Wgpu／Glow lifecycle adapterで、同childのImmediate／Deferred切替、
+別main fullscreenのImmediate生成／明示退役を3往復し、child／兄弟の同leaseとWindowId対応を検査する。
+egui-winitの実State変換・raw drain／observerにも反復する別main viewport退役の対照を追加した。
+backend adapterはOS windowを作らず、State変換は別試験である。
+
+**コードから言える最有力経路（未確認）。** `State::on_mouse_button_input` はpointer位置がない押下を
+raw PointerButtonへ変換せず、`pointer_input_observer::normalized_input` はその押下を通知しない。
+winit 0.30.13のWindows `event_loop.rs` はWM_MOUSELEAVEでCursorLeftを送る一方last_positionを消さず、
+同座標のWM_MOUSEMOVEではCursorMovedを省略する。egui-winitはCursorLeftで位置を失うため、
+位置なしの期間が残る組合せはコード上可能。ただし実機のこの列は記録されていない。
+WindowId mapからState以前に落ちる候補も未除外であり、part3との差の原因は断定しない。
+
+入力routing、lease生成／退役、State cursor寿命は推測で変更していない。押下時診断だけを追加した。
+
+| 入口 | 型付き理由 | 記録するidentity |
+| --- | --- | --- |
+| 両backendの実WindowId配送直後 | `NativeWindowInputDiscardReason::UnmappedWindowId` | backend、実WindowId。viewportを推定しない |
+| Stateのmouse生成境界 | `PointerInputDiscardReason::PointerPositionUnavailable` | 物理source、viewport、現在registration |
+| observer呼出し境界 | `PointerInputDiscardReason::ObserverNotInstalled` | Mouse／Touch(id)と入力元、viewport、現在registration |
+| mIV observer closure／entry照合 | `MissingViewportRegistration` / `RegistrationNotInstalled` | 入力phase/source、実viewport、照合registration |
+| mIV native binding | `Unbound` / `GestureOwned(実gesture)` / `InputStateUnavailable` | 入力phase/source、実viewport、registration |
+
+すべてprimary押下の境界だけで通常ログに1行出し、毎frame・motion・releaseでは出さない。
+observer再設置・rect探索・入力再送はしない。
+
+### 5.2 B: captionの同期native操作の終端を同じownerで確定
+
+captionのMouse Down／DoubleClickが `DefSubclassProc` のmodal処理へ入った場合、
+そのnative callが返るまで同じownerが操作を所有する。call内のWM_CAPTURECHANGEDでcaptureが0へ
+返却される事実を外部取消と混同せず、call return（またはWM_EXITSIZEMOVE）で完了する。
+foreign HWNDへのcapture移譲、focus／cancel／Escapeは取消を維持する。
+WM_MOVING／WM_SIZINGの既存閾値によるdrag取消、caption buttonの押下対象外release、
+外へ動かして戻す取消、×のCloseOwned、OSのDefSubclassProcは維持する。
+移動による取消は既存ownerの判定点に残し、将来の利用者判断を時間窓へ分散させない。
+
+### 5.3 C: 復帰だけは保持時間をクリック条件に使わない
+
+mouseのActivateOnlyが `released_buttons_with_click_counts` のSomeに依存したため、
+eguiのクリック時間上限（既定0.8秒）を超えるとDragへ誤分類された。
+touchも既存TouchCommandのtap時間（700ms）に依存して長押しを取り消していた。
+mouseはcallbackの同gesture ownerでpress位置と順序付き移動・releaseを照合し、
+既存max_click_distの距離を超えたときだけdragとして終端する。
+touchは既存単指ownerと最大距離、exactな昇格pointer相関から復帰専用の完了factを取り、
+保持時間を復帰の条件にしない。一般のtouch command／tap時間、バーcloseの既存click／tap規則は変更しない。
+したがって窓内のtouch長押しも同じ復帰仕様にでき、今回の既存command所有との矛盾はない。
+`callback_discard` は `decision=GestureCancelled` に加えて `reason=Drag` 等の実際の
+`ClientActivationCancelReason` を同じ1行へ出す。元scopeのidentityは維持する。
+
+### 5.4 D: ParkedLiveへNonClient ownerと既存transportを接続
+
+`DetachedActivationRequest` が生成時の `DetachedActivationTargetState` を保持し、
+sourceがNonClientだからParkedと推定する規則を撤去した。targetはParked／ParkedLiveを対象にする。
+ParkedLiveの実描画枝には従来Shared transportがなく、pruneもそれを除外していたため、
+既存Sharedを同じsnapshotの寿命で生成・保持する。新しいApp pendingは作らない。
+NonClientの完了だけを既存transport→intent→root commit→`resume_parked_live_media`へ渡す。
+ParkedLiveの窓内クリックは既存NativeMedia producerが所有し、新しいclient復帰producerを競合させない。
+復帰／close後は既存target退役とpruneでSharedを解放する。
+
+### 5.5 外した候補・設計合意・検証
+
+- 同registrationのNonClientが届くため「旧allocationだから一律破棄」は全体説明にならない。
+  最終成功clickのReleaseも揃い、NC開始後もclient無反応が続くので、ClientPressedの単純な残留だけでも
+  説明できない。ViewportId衝突候補も設計担当の既存照合で除外されている。
+- これらの除外は「backend mapも正常」「Stateに位置がある」という証拠にはならない。
+  新しい診断と実機イベント列で切り分ける。Aをheadlessで再現できたとは記載しない。
+- B／C／Dは同操作のownerと終端を揃える構造修正であり、独立設計レビュー（Sol / xhigh、2026-11-15）も
+  BA-7主／BA-1関連の修正として合意した。時間による待ち、追加repaint、App状態、入力再試行は不要。
+  全停止窓の一括resetや再生成は、既存閲覧の所有と表示を壊すため採らない。
+- caption／clientのdragで復帰する仕様は利用者判断待ちで、今回は距離超過の取消を維持する。
+
+検証は指定 `run-heavy.ps1`、Owner `codex/767-rm55`、同WorkDirで直列実行する。
+ロック場所への書込不可警告後も、runnerのBelowNormal／6 build jobsのまま継続した。
+
+修正前の `test(/realmachine55_caption|realmachine55_parked_live|realmachine55_parked_long/)` は
+**7実行／1成功／6失敗、cargo exit 100**（`target/rm55-red.log`）。Bのmodal終端2件、
+Cのmouse／touch長押し2件、Dのadmission／target2件が失敗し、drag取消の対照は成功した。
+初回焦点試験は **132実行／131成功／1失敗、exit 100**（`target/rm55-focused-r1.log`）。
+Aの反復main focus guard／兄弟open-closeも成功した。失敗した旧テスト
+`native_cancel_between_old_down_and_new_click_preserves_the_new_click` は、operationを持たない
+テスト専用Native列が取消を次Start直前へ配置し、その前の新PointerMovedが距離取消を先に作るもの。
+製品と同じcanonical proof／ScopedNativeへ起点を揃え、CaptureLostという取消理由の期待は維持し、
+元scope・fresh click成功・翌frameの非再生を検査した。製品の取消順を変更するための対処はしていない。
+
+最終結果（nextestはすべて `--no-fail-fast --test-threads 6`）。件数は各コマンドの実行数で、
+焦点と回帰の重複を合計していない。
+
+| コマンド | 件数・exit code・証拠 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/realmachine55_\|realmachine50_\|detached_activation\|native_detached\|non_client\|pointer_input_observer/)'` | **133実行／133成功／0失敗、exit 0**、10.363秒。`target/rm55-focused.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/realmachine50_\|realmachine55_\|detached_activation\|native_detached\|non_client\|pointer_input_observer\|parked\|native_video\|touch\|key_input/)'` | **715実行／715成功（4 slow）／0失敗、exit 0**、99.168秒。`target/rm55-regression.log` |
+| `cargo nextest run --manifest-path vendor/egui-winit/Cargo.toml --lib` | **61実行／61成功／0失敗、exit 0**。物理sourceの診断補足後の最終結果は `target/rm55-egui-winit-final.log` |
+| `cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features default_fonts,wgpu --lib -E 'test(/realmachine55_\|viewport_retirement\|native_window_input/)'` | **21実行／21成功／0失敗、exit 0**。`target/rm55-eframe-wgpu-final.log` |
+| 上と同じeframeコマンドで `--features default_fonts,glow` | **21実行／21成功／0失敗、exit 0**。`target/rm55-eframe-glow-final.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **core 1対象、exit 0**。警告あり、`target/rm55-check.log` |
+| 最後のCargo操作 `cargo fmt`（引数なし） | **exit 0**。`target/rm55-fmt.log`。vendorは各manifestの `cargo fmt` もrun-heavy経由で先行実施 |
+
+AのApp反復3件、両backendのnative source保持、State変換の対照はすべて成功し、
+**Aの実機症状はheadlessで再現できなかった**。main focus guardとpart3の既存兄弟再開との差を
+説明できる故障点も未確定である。B／C／Dの赤テストと追加対照、既存NativeMedia、A／Cの
+realmachine50回帰はすべて成功した。独立source review（Sol / xhigh）は最終の所有・終端・
+診断metadata・canonical fixtureとA対照の補足までACCEPT、追加P1/P2なし。
+
+**変更ファイル（19件）。**
+
+- 本体: `src/app.rs`、`src/app/detached_activation.rs`、`src/app/detached_activation_gesture.rs`、
+  `src/app/detached_window_manager.rs`、`src/key_input.rs`、`src/touch_correlation.rs`、
+  `src/touch_input.rs`、`src/ui_fullscreen.rs`。
+- App層の反復テスト: `src/app/multiwindow_scenario_tests.rs`。
+- vendor: `vendor/eframe/src/native/{wgpu_integration,glow_integration,viewport_lifecycle}.rs`、
+  `vendor/eframe/src/native_window_input.rs`、`vendor/eframe/PATCHES.md`、
+  `vendor/egui-winit/src/{lib,pointer_input_observer}.rs`、`vendor/egui-winit/PATCHES.md`。
+- 文書: 本書、`docs/detached-rework-plan.md`。
+
+実OSのcaption modal loop／ダブルクリック最大化・touch・focusは未確認。
+静止画Parkedのdoubleclickはnative ownerと共通transport／commitの組合せで守り、
+静止画のOS操作そのものを実行した証拠とはしない。製品起動、全件gate、確認用build、commit／pushは行わない。
+
+### 5.6 初回依頼50時点の退行の確認と補足2件
 
 ソース比較では、Aのwatch/callback経路は `53d224a5c` より前から同じ。
 `9044445e6` のui_fullscreen差分はテスト追加で、`01c9b2195` はnative requestの独立性、

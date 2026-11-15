@@ -1,6 +1,6 @@
 //! One callback-owned client gesture for a parked still viewport.
 //!
-//! Recognition never changes viewer state. Only a completed click/tap is sent
+//! Recognition never changes viewer state. Only a completed press/release is sent
 //! through the existing activation transport; its original input is not replayed.
 
 use crate::key_input::{NativeClientBoundary, NativeClientInputBoundary, NativeInputCancelReason};
@@ -79,9 +79,10 @@ enum ClientGestureOwner {
 struct ClientGesture {
     operation: ClientOperation,
     destination: ClientGestureDestination,
+    press_pos: egui::Pos2,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum ClientGestureDestination {
     ActivateOnly,
     WindowClose(egui::Rect),
@@ -338,6 +339,7 @@ impl DeferredClientActivationGesture {
                 input.pointer.primary_down(),
             )
         });
+        let mouse_drag_distance = ctx.options(|options| options.input_options.max_click_dist);
         let promoted =
             preview_touch_primary_event_indices(ctx, TouchSurface::StillFullscreen, &geometry);
         let held_operation = self.current_operation();
@@ -431,6 +433,12 @@ impl DeferredClientActivationGesture {
                                 _
                             )
                         );
+                    // A raw End may leave only its exact synthetic tail pending.
+                    // A fresh contact owns a new operation and destination; it
+                    // cannot complete that old press after a tail mismatch.
+                    if !continues_owned_gesture {
+                        self.cancel_owner(ClientActivationCancelReason::PointerTakeover);
+                    }
                     if require_proof
                         && operation == ClientOperation::Unowned
                         && !continues_owned_gesture
@@ -456,6 +464,7 @@ impl DeferredClientActivationGesture {
                                 ClientGesture {
                                     operation,
                                     destination,
+                                    press_pos: *pos,
                                 },
                                 TouchContactEnd::ContactDown,
                             ),
@@ -519,6 +528,7 @@ impl DeferredClientActivationGesture {
                                 Ok(()) => ClientGestureOwner::Mouse(ClientGesture {
                                     operation,
                                     destination,
+                                    press_pos: *pos,
                                 }),
                                 Err(reason) => {
                                     ClientGestureOwner::SuppressedMouse(reason, operation)
@@ -541,7 +551,22 @@ impl DeferredClientActivationGesture {
                     if !edge.touch_derived {
                         match self.owner.gesture {
                             ClientGestureOwner::Mouse(gesture) => {
-                                if releases.get(release_ordinal).is_some_and(Option::is_some)
+                                // Resuming a parked owner needs a completed
+                                // stationary press, independent of its duration.
+                                // Window close retains the ordinary click policy.
+                                let completed = match gesture.destination {
+                                    ClientGestureDestination::ActivateOnly => {
+                                        !mouse_press_became_drag(
+                                            gesture.press_pos,
+                                            *pos,
+                                            mouse_drag_distance,
+                                        )
+                                    }
+                                    ClientGestureDestination::WindowClose(_) => {
+                                        releases.get(release_ordinal).is_some_and(Option::is_some)
+                                    }
+                                };
+                                if completed
                                     && release_inside(
                                         gesture.destination,
                                         &geometry,
@@ -569,6 +594,13 @@ impl DeferredClientActivationGesture {
                     }
                     release_ordinal += 1;
                 }
+                Event::PointerMoved(pos) => {
+                    if let ClientGestureOwner::Mouse(gesture) = self.owner.gesture
+                        && mouse_press_became_drag(gesture.press_pos, *pos, mouse_drag_distance)
+                    {
+                        self.cancel_owner(ClientActivationCancelReason::Drag);
+                    }
+                }
                 _ => {}
             }
             // A canonical owner may consume its own completed input fact even
@@ -581,7 +613,10 @@ impl DeferredClientActivationGesture {
                         ..
                     },
                     _,
-                ) => touch.completed_tap_at(index),
+                ) => {
+                    touch.completed_tap_at(index)
+                        || (self.owns_activation() && touch.completed_stationary_press_at(index))
+                }
                 ClientGestureOwner::Touch(
                     ClientGesture {
                         operation: ClientOperation::LogicalFixture,
@@ -622,7 +657,9 @@ impl DeferredClientActivationGesture {
                         self.cancel_owner(ClientActivationCancelReason::Drag)
                     }
                     Some(crate::touch_input::TouchOwner::Undecided) => {
-                        self.cancel_owner(ClientActivationCancelReason::TouchCancelled)
+                        if !(self.owns_activation() && touch.stationary_press_ended_at(index)) {
+                            self.cancel_owner(ClientActivationCancelReason::TouchCancelled);
+                        }
                     }
                     Some(crate::touch_input::TouchOwner::Pinch) => {
                         self.cancel_owner(ClientActivationCancelReason::MultipleTouch)
@@ -705,6 +742,22 @@ impl DeferredClientActivationGesture {
         )
     }
 
+    fn owns_activation(&self) -> bool {
+        matches!(
+            self.owner.gesture,
+            ClientGestureOwner::Mouse(ClientGesture {
+                destination: ClientGestureDestination::ActivateOnly,
+                ..
+            }) | ClientGestureOwner::Touch(
+                ClientGesture {
+                    destination: ClientGestureDestination::ActivateOnly,
+                    ..
+                },
+                _
+            )
+        )
+    }
+
     fn complete(&mut self, source: ClientActivationSource, activation: &mut ClientFrameCompletion) {
         let destination = match self.owner.gesture {
             ClientGestureOwner::Mouse(gesture) | ClientGestureOwner::Touch(gesture, _) => {
@@ -754,6 +807,12 @@ impl DeferredClientActivationGesture {
             decision: ClientActivationDecision::Cancelled { source, reason },
         });
     }
+}
+
+/// Keep parked mouse drag cancellation at egui's existing distance boundary,
+/// including an out-and-back move. Duration is deliberately not part of it.
+fn mouse_press_became_drag(origin: egui::Pos2, pos: egui::Pos2, max_distance: f32) -> bool {
+    origin.distance(pos) > max_distance
 }
 
 impl ClientActivationAvailability {
@@ -1179,6 +1238,7 @@ mod tests {
             registration: None,
             context_id: Some(super::super::ViewerContextId::for_test(context)),
             source: super::super::DetachedActivationSource::ClientClick,
+            expected_state: super::super::DetachedActivationTargetState::Parked,
             allocation: None,
         }
     }
@@ -3367,6 +3427,332 @@ mod tests {
     }
 
     #[test]
+    fn realmachine55_parked_long_mouse_press_completes_on_release_once() {
+        let ctx = Context::default();
+        let mut owner = DeferredClientActivationGesture::default();
+        let scope = scope(55);
+        let pos = pos2(100.0, 100.0);
+        owner.feed_native_scoped_boundary(
+            scope.clone(),
+            fixture_input(&owner, NativeClientBoundary::Pressed),
+        );
+        assert!(scoped(&ctx, &mut owner, 1.0, vec![primary(pos, true)], &scope).is_empty());
+        assert!(scoped(&ctx, &mut owner, 2.0, Vec::new(), &scope).is_empty());
+        owner.feed_native_scoped_boundary(
+            scope.clone(),
+            fixture_input(&owner, NativeClientBoundary::Released),
+        );
+        assert_eq!(
+            scoped(&ctx, &mut owner, 2.5, vec![primary(pos, false)], &scope),
+            [ClientActivationSource::MouseClick],
+            "a stationary 1.5-second press resumes the parked owner on release"
+        );
+        assert_eq!(
+            owner.drain_scoped_decisions(),
+            [ScopedClientActivationDecision {
+                scope: Some(scope.clone()),
+                decision: ClientActivationDecision::Completed(ClientActivationSource::MouseClick),
+            }]
+        );
+        assert!(scoped(&ctx, &mut owner, 2.6, Vec::new(), &scope).is_empty());
+        assert!(owner.drain_decisions().is_empty());
+    }
+
+    #[test]
+    fn realmachine55_parked_long_touch_press_completes_on_release_once() {
+        let ctx = Context::default();
+        let mut owner = DeferredClientActivationGesture::default();
+        let scope = scope(55);
+        let pos = pos2(100.0, 100.0);
+        owner.feed_native_scoped_boundary(
+            scope.clone(),
+            fixture_input(&owner, NativeClientBoundary::Pressed),
+        );
+        assert!(
+            scoped(
+                &ctx,
+                &mut owner,
+                1.0,
+                vec![
+                    touch(1, TouchPhase::Start, pos),
+                    Event::PointerMoved(pos),
+                    primary(pos, true),
+                ],
+                &scope,
+            )
+            .is_empty()
+        );
+        assert!(scoped(&ctx, &mut owner, 2.0, Vec::new(), &scope).is_empty());
+        owner.feed_native_scoped_boundary(
+            scope.clone(),
+            fixture_input(&owner, NativeClientBoundary::Released),
+        );
+        assert_eq!(
+            scoped(
+                &ctx,
+                &mut owner,
+                2.5,
+                vec![
+                    touch(1, TouchPhase::End, pos),
+                    primary(pos, false),
+                    Event::PointerGone,
+                ],
+                &scope,
+            ),
+            [ClientActivationSource::TouchTap],
+            "the correlated 1.5-second touch resumes only its captured parked scope"
+        );
+        assert_eq!(
+            owner.drain_scoped_decisions(),
+            [ScopedClientActivationDecision {
+                scope: Some(scope.clone()),
+                decision: ClientActivationDecision::Completed(ClientActivationSource::TouchTap),
+            }]
+        );
+        assert!(scoped(&ctx, &mut owner, 2.6, Vec::new(), &scope).is_empty());
+        assert!(owner.drain_decisions().is_empty());
+    }
+
+    #[test]
+    fn realmachine55_fresh_touch_close_cannot_complete_an_old_unmatched_activation() {
+        let _input = crate::key_input::lock_test_input();
+        for old_release_time in [1.1, 2.5] {
+            let ctx = Context::default();
+            let scope = canonical_scope(&ctx);
+            let mut owner = DeferredClientActivationGesture::default();
+            let pos = pos2(100.0, 100.0);
+            let old = fixture_input(&owner, NativeClientBoundary::Pressed);
+            owner.feed_native_scoped_boundary(scope.clone(), old);
+            assert!(
+                close_frame(
+                    &ctx,
+                    &mut owner,
+                    1.0,
+                    marked(
+                        vec![
+                            touch(1, TouchPhase::Start, pos),
+                            Event::PointerMoved(pos),
+                            primary(pos, true),
+                        ],
+                        old.operation,
+                    ),
+                    &scope,
+                    ClientActivationAvailability::Available,
+                    false,
+                )
+                .is_empty()
+            );
+            owner.feed_native_scoped_boundary(
+                scope.clone(),
+                NativeClientInputBoundary {
+                    operation: old.operation,
+                    boundary: NativeClientBoundary::Released,
+                },
+            );
+            assert!(
+                close_frame(
+                    &ctx,
+                    &mut owner,
+                    old_release_time,
+                    vec![touch(1, TouchPhase::End, pos)],
+                    &scope,
+                    ClientActivationAvailability::Available,
+                    false,
+                )
+                .is_empty()
+            );
+            assert!(owner.drain_decisions().is_empty());
+            let new = feed_scoped_click(&mut owner, &scope);
+            let mut events = vec![Event::PointerMoved(pos2(200.0, 150.0))];
+            events.extend(marked(tap(2, close_rect().center()), new));
+            assert!(
+                close_frame(
+                    &ctx,
+                    &mut owner,
+                    old_release_time + 0.1,
+                    events,
+                    &scope,
+                    ClientActivationAvailability::Available,
+                    false,
+                )
+                .is_empty(),
+                "a new close must not inherit the old activation destination"
+            );
+            assert_eq!(
+                owner.drain_decisions(),
+                [
+                    ClientActivationDecision::Cancelled {
+                        source: ClientActivationSource::TouchTap,
+                        reason: ClientActivationCancelReason::PointerTakeover,
+                    },
+                    ClientActivationDecision::CompletedClose(ClientActivationSource::TouchTap),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn realmachine55_mouse_release_without_move_uses_the_existing_drag_distance() {
+        for distance in [6.0, 6.01] {
+            let ctx = Context::default();
+            let mut owner = DeferredClientActivationGesture::default();
+            let scope = scope(55);
+            let pos = pos2(100.0, 100.0);
+            owner.feed_native_scoped_boundary(
+                scope.clone(),
+                fixture_input(&owner, NativeClientBoundary::Pressed),
+            );
+            assert!(scoped(&ctx, &mut owner, 1.0, vec![primary(pos, true)], &scope).is_empty());
+            owner.feed_native_scoped_boundary(
+                scope.clone(),
+                fixture_input(&owner, NativeClientBoundary::Released),
+            );
+            let result = scoped(
+                &ctx,
+                &mut owner,
+                2.5,
+                vec![primary(pos + egui::vec2(distance, 0.0), false)],
+                &scope,
+            );
+            if distance <= 6.0 {
+                assert_eq!(result, [ClientActivationSource::MouseClick]);
+            } else {
+                assert!(result.is_empty());
+                assert_eq!(
+                    owner.drain_decisions(),
+                    [ClientActivationDecision::Cancelled {
+                        source: ClientActivationSource::MouseClick,
+                        reason: ClientActivationCancelReason::Drag,
+                    }]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn realmachine55_long_drag_still_cancels_with_the_actual_typed_reason() {
+        for touch_input in [false, true] {
+            let ctx = Context::default();
+            let mut owner = DeferredClientActivationGesture::default();
+            let scope = scope(55);
+            let pos = pos2(100.0, 100.0);
+            let away = pos2(150.0, 100.0);
+            let press = fixture_input(&owner, NativeClientBoundary::Pressed);
+            owner.feed_native_scoped_boundary(scope.clone(), press);
+            let start = if touch_input {
+                vec![
+                    touch(1, TouchPhase::Start, pos),
+                    Event::PointerMoved(pos),
+                    primary(pos, true),
+                ]
+            } else {
+                vec![Event::PointerMoved(pos), primary(pos, true)]
+            };
+            assert!(scoped(&ctx, &mut owner, 1.0, start, &scope).is_empty());
+            let motion = if touch_input {
+                vec![
+                    touch(1, TouchPhase::Move, away),
+                    Event::PointerMoved(away),
+                    touch(1, TouchPhase::Move, pos),
+                    Event::PointerMoved(pos),
+                ]
+            } else {
+                vec![Event::PointerMoved(away), Event::PointerMoved(pos)]
+            };
+            assert!(scoped(&ctx, &mut owner, 2.0, motion, &scope).is_empty());
+            owner.feed_native_scoped_boundary(
+                scope.clone(),
+                NativeClientInputBoundary {
+                    operation: press.operation,
+                    boundary: NativeClientBoundary::Released,
+                },
+            );
+            let end = if touch_input {
+                vec![
+                    touch(1, TouchPhase::End, pos),
+                    primary(pos, false),
+                    Event::PointerGone,
+                ]
+            } else {
+                vec![primary(pos, false)]
+            };
+            assert!(scoped(&ctx, &mut owner, 2.5, end, &scope).is_empty());
+            assert_eq!(
+                owner.drain_scoped_decisions(),
+                [ScopedClientActivationDecision {
+                    scope: Some(scope),
+                    decision: ClientActivationDecision::Cancelled {
+                        source: if touch_input {
+                            ClientActivationSource::TouchTap
+                        } else {
+                            ClientActivationSource::MouseClick
+                        },
+                        reason: ClientActivationCancelReason::Drag,
+                    },
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn realmachine55_long_press_does_not_change_window_close_duration_policy() {
+        for touch_input in [false, true] {
+            let ctx = Context::default();
+            let mut owner = DeferredClientActivationGesture::default();
+            let scope = scope(55);
+            let pos = close_rect().center();
+            let start = if touch_input {
+                vec![
+                    touch(1, TouchPhase::Start, pos),
+                    Event::PointerMoved(pos),
+                    primary(pos, true),
+                ]
+            } else {
+                vec![Event::PointerMoved(pos), primary(pos, true)]
+            };
+            assert!(
+                close_frame(
+                    &ctx,
+                    &mut owner,
+                    1.0,
+                    start,
+                    &scope,
+                    ClientActivationAvailability::Available,
+                    false,
+                )
+                .is_empty()
+            );
+            let end = if touch_input {
+                vec![
+                    touch(1, TouchPhase::End, pos),
+                    primary(pos, false),
+                    Event::PointerGone,
+                ]
+            } else {
+                vec![primary(pos, false)]
+            };
+            assert!(
+                close_frame(
+                    &ctx,
+                    &mut owner,
+                    2.5,
+                    end,
+                    &scope,
+                    ClientActivationAvailability::Available,
+                    false,
+                )
+                .is_empty()
+            );
+            let decisions = owner.drain_decisions();
+            assert_eq!(decisions.len(), 1);
+            assert!(matches!(
+                decisions[0],
+                ClientActivationDecision::Cancelled { .. }
+            ));
+        }
+    }
+
+    #[test]
     fn coalesced_mouse_click_is_completed_once_even_after_layout_discard() {
         let ctx = Context::default();
         let mut owner = DeferredClientActivationGesture::default();
@@ -3697,35 +4083,51 @@ mod tests {
 
     #[test]
     fn native_cancel_between_old_down_and_new_click_preserves_the_new_click() {
+        let _input = crate::key_input::lock_test_input();
         let ctx = Context::default();
+        let scope = canonical_scope(&ctx);
         let mut owner = DeferredClientActivationGesture::default();
-        for boundary in [
-            NativeClientBoundary::Pressed,
-            NativeClientBoundary::Cancelled(NativeInputCancelReason::CaptureLost),
-            NativeClientBoundary::Pressed,
-            NativeClientBoundary::Released,
-        ] {
-            owner.feed_native_boundary(boundary);
-        }
+        let old = fixture_input(&owner, NativeClientBoundary::Pressed);
+        owner.feed_native_scoped_boundary(scope.clone(), old);
+        owner.feed_native_scoped_boundary(
+            scope.clone(),
+            NativeClientInputBoundary {
+                operation: old.operation,
+                boundary: NativeClientBoundary::Cancelled(NativeInputCancelReason::CaptureLost),
+            },
+        );
+        let fresh = feed_scoped_click(&mut owner, &scope);
         let pos = pos2(100.0, 100.0);
-        let mut events = vec![primary(pos, true)];
-        events.extend(mouse_click(pos2(200.0, 100.0)));
+        let mut events = marked(vec![primary(pos, true)], old.operation);
+        events.extend(marked(mouse_click(pos2(200.0, 100.0)), fresh));
+        // Production metadata belongs to an operation, so capture loss retires
+        // the old press before the fresh click's cursor motion reaches it.
         assert_eq!(
-            available(&ctx, &mut owner, 1.0, events),
+            scoped(&ctx, &mut owner, 1.0, events, &scope),
             [ClientActivationSource::MouseClick]
         );
         assert_eq!(
-            owner.drain_decisions(),
+            owner.drain_scoped_decisions(),
             [
-                ClientActivationDecision::Cancelled {
-                    source: ClientActivationSource::MouseClick,
-                    reason: ClientActivationCancelReason::Native(
-                        NativeInputCancelReason::CaptureLost
+                ScopedClientActivationDecision {
+                    scope: Some(scope.clone()),
+                    decision: ClientActivationDecision::Cancelled {
+                        source: ClientActivationSource::MouseClick,
+                        reason: ClientActivationCancelReason::Native(
+                            NativeInputCancelReason::CaptureLost
+                        ),
+                    },
+                },
+                ScopedClientActivationDecision {
+                    scope: Some(scope.clone()),
+                    decision: ClientActivationDecision::Completed(
+                        ClientActivationSource::MouseClick
                     ),
                 },
-                ClientActivationDecision::Completed(ClientActivationSource::MouseClick),
             ]
         );
+        assert!(scoped(&ctx, &mut owner, 1.1, Vec::new(), &scope).is_empty());
+        assert!(owner.drain_decisions().is_empty());
     }
 
     #[test]

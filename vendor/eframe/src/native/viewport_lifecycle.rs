@@ -446,6 +446,82 @@ pub(super) mod viewport_retirement_tests {
         immediate_nested_with_fixture::<A>(true);
     }
 
+    /// A repeated App-style class switch, with a distinct immediate main viewer
+    /// retired between two parks. Keep the real backend source-map/lease owner.
+    pub fn realmachine55_repeated_park_main_retirement<A: Adapter + 'static>() {
+        use std::{cell::RefCell, rc::Rc};
+        let integration = headless_integration();
+        let ctx = &integration.egui_ctx;
+        let child = ids().0;
+        let sibling = ids().2;
+        let main = ViewportId::from_hash_of("rm55-main-fullscreen");
+        let adapter = Rc::new(RefCell::new(A::new(ctx)));
+        let retained = adapter.clone();
+        Context::set_immediate_viewport_renderer(move |ctx, mut immediate| {
+            retained
+                .borrow_mut()
+                .prepare_immediate(ctx, immediate.ids, immediate.builder.clone());
+            let mut output = ctx.run_ui(input(immediate.ids.this, false), |ui| {
+                (immediate.viewport_ui_cb)(ui);
+            });
+            let mut backend = retained.borrow_mut();
+            backend.accept_delta(core::mem::take(&mut output.textures_delta));
+            backend.sync(ctx, &output.viewport_output);
+            output.drop_without_applying_deltas();
+        });
+        let output = ctx.run_ui(input(ViewportId::ROOT, false), |ui| {
+            declare(ui.ctx(), child);
+            declare(ui.ctx(), sibling);
+        });
+        deliver(ctx, &mut *adapter.borrow_mut(), output);
+        let original =
+            crate::native_window_input::native_window_allocation_witness(ctx, child).unwrap();
+        let sibling_original =
+            crate::native_window_input::native_window_allocation_witness(ctx, sibling).unwrap();
+        for _ in 0..3 {
+            // Client resume changes the same logical/native child to immediate.
+            let output = ctx.run_ui(input(ViewportId::ROOT, false), |ui| {
+                declare(ui.ctx(), sibling);
+                ui.ctx()
+                    .show_viewport_immediate(child, Default::default(), |_, _| {});
+                ui.ctx()
+                    .show_viewport_immediate(main, Default::default(), |_, _| {});
+            });
+            deliver(ctx, &mut *adapter.borrow_mut(), output);
+            // Main focus guard closes the separate main-fullscreen lifetime.
+            ctx.approve_viewport_retirement(ctx.viewport_registration(main).unwrap());
+            let output = ctx.run_ui(input(ViewportId::ROOT, false), |ui| {
+                declare(ui.ctx(), sibling);
+                declare(ui.ctx(), child);
+            });
+            deliver(ctx, &mut *adapter.borrow_mut(), output);
+            assert!(ctx.viewport_registration(main).is_none());
+            assert!(original.is_alive());
+            assert_eq!(
+                crate::native_window_input::native_window_allocation_witness(ctx, child),
+                Some(original.clone())
+            );
+            assert_eq!(
+                crate::native_window_input::native_window_allocation_witness(ctx, sibling),
+                Some(sibling_original.clone())
+            );
+            for witness in [&original, &sibling_original] {
+                let allocation = witness.allocation();
+                assert!(
+                    adapter
+                        .borrow()
+                        .allocation_sources()
+                        .iter()
+                        .any(|(source, id, _)| {
+                            *source == allocation.window_id && *id == allocation.viewport_id
+                        }),
+                    "a surviving child must still route its native WindowId"
+                );
+            }
+        }
+        adapter.borrow_mut().shutdown_native_input();
+    }
+
     pub struct HeadlessDisplay;
     impl raw_window_handle::HasDisplayHandle for HeadlessDisplay {
         fn display_handle(

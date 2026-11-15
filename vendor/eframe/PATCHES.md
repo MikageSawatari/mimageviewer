@@ -367,3 +367,11 @@ Glow shutdownの入力ループはGL ownerから小helperへ抽出し、製品�
 これらはnative windowやGPUを作らず、実OSのfocus/DPI/IME/入力動作の確認は代替しない。
 Cargo実行・独立レビュー・受入結果は
 [実機50調査書](../../docs/depth-parallax-realmachine50-investigation.md) の後続記録を正本とする。
+
+## 依頼55: 反復するmain fullscreen退役のheadless対照（2026-11-15）
+
+既存Wgpu／Glow lifecycle adapterでchildのImmediate／Deferred切替と、別main viewerの
+Immediate生成・明示退役を3往復し、生存child／兄弟のnative leaseとWindowId配送対応が
+保たれることを検査する。backend製品lifecycleは変更していない。実配送mapにないprimary押下だけは
+共通の型付き `UnmappedWindowId` 診断を出し、State以前の欠落を区別する（配送先は推定しない）。App層の反復試験と
+State変換の試験を分け、実OSイベント到達の証明とは扱わない。

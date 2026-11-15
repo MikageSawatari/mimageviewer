@@ -38,6 +38,30 @@ pub enum NormalizedPointerInput {
 pub type PointerInputObserver =
     Arc<dyn Fn(&Context, ViewportId, NormalizedPointerInput) -> Option<egui::Id> + Send + Sync>;
 
+/// A physical primary press which could not reach the normalized observer.
+/// Diagnostics only: no input is synthesized or retried for these failures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerInputDiscardReason {
+    ObserverNotInstalled,
+    PointerPositionUnavailable,
+}
+
+pub(crate) fn log_pressed_discard(
+    ctx: &Context,
+    viewport: ViewportId,
+    reason: PointerInputDiscardReason,
+    input_source: PointerInputSource,
+) {
+    let source = match input_source {
+        PointerInputSource::Mouse => "ClientClick",
+        PointerInputSource::Touch(_) => "TouchTap",
+    };
+    log::info!(
+        "[detached-activation] boundary=normalized_input source={source} decision={reason:?} input=Pressed({input_source:?}) viewport={viewport:?} registration={:?}",
+        ctx.viewport_registration(viewport),
+    );
+}
+
 fn observer_id() -> egui::Id {
     egui::Id::new("egui_winit::pointer_input_observer")
 }
@@ -88,6 +112,13 @@ pub(crate) fn observe(
                 Event::PointerInputProvenance(provenance),
             );
         }
+    } else if let NormalizedPointerInput::Pressed(source) = input {
+        log_pressed_discard(
+            ctx,
+            viewport,
+            PointerInputDiscardReason::ObserverNotInstalled,
+            source,
+        );
     }
 }
 
@@ -615,6 +646,56 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn pointer_input_observer_repeated_main_retirement_keeps_child_conversion() {
+        let (mut root, observed) = fixture();
+        let ctx = root.egui_ctx.clone();
+        ctx.set_embed_viewports(false);
+        let child_id = ViewportId::from_hash_of("rm55-surviving-client");
+        let main_id = ViewportId::from_hash_of("rm55-main-viewer");
+        ctx.run_ui(Default::default(), |ui| {
+            ui.ctx()
+                .show_viewport_deferred(child_id, Default::default(), |_, _| {});
+        })
+        .drop_without_applying_deltas();
+        let registration = ctx.viewport_registration(child_id).unwrap();
+        let mut child = State::new(ctx.clone(), child_id, &NoDisplay, None, None, None);
+        child.on_cursor_moved_in_points(egui::pos2(50.0, 60.0));
+        for _ in 0..3 {
+            ctx.run_ui(Default::default(), |ui| {
+                ui.ctx()
+                    .show_viewport_deferred(child_id, Default::default(), |_, _| {});
+                ui.ctx()
+                    .show_viewport_deferred(main_id, Default::default(), |_, _| {});
+            })
+            .drop_without_applying_deltas();
+            let _ = ctx.retire_viewport(main_id);
+            assert_eq!(ctx.viewport_registration(child_id), Some(registration));
+            for pressed in [true, false] {
+                let events = dispatch(&mut child, &mouse(pressed, MouseButton::Left));
+                assert!(events.iter().any(|event| matches!(event, Event::PointerButton { pressed: actual, .. } if *actual == pressed)));
+            }
+            // Normal RawInput consumption does not discard State cursor ownership.
+            child.egui_input.take();
+        }
+        assert_eq!(phases(&observed).len(), 6);
+        assert!(
+            observed
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(id, _)| *id == child_id)
+        );
+        root.pointer_pos_in_points = Some(egui::Pos2::ZERO);
+        set_observer(&ctx, None);
+        // Missing observer is diagnostic only: the physical input is preserved.
+        assert_eq!(
+            dispatch(&mut root, &mouse(true, MouseButton::Left)).len(),
+            1
+        );
+        assert_eq!(phases(&observed).len(), 6);
     }
 
     #[test]
