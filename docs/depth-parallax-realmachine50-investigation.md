@@ -102,6 +102,10 @@ polling周期短縮、eligibleへの例外追加、focusで強制resume、pause�
 
 ### 2.4 A 実装記録（2026-11-14、BA-7）
 
+2026-11-15の利用者決定「案1」により、以下の初回記録のdrag拒否は§5.7の完了時復帰へ改訂した。
+通常canvasのprimary／単指touchとcaption／resizeは押下から終端まで復帰ownerが消費し、
+ページ送り／パンへ再配送しない。close、caption buttonの対象外取消、真のOS取消、modal／退役は維持する。
+
 設計担当の決定と独立設計レビュー（Sol / xhigh、2026-11-14）のP2を反映した。
 これは入力の所有・確定点を離散イベントへ集約する構造的な変更であることに双方が合意した。
 Cのnative allocation契約を参照し、Cのeframe/backend hookは変更しない。Aの入力正規化通知を
@@ -144,7 +148,8 @@ raw Touchだけで昇格primaryがない操作も、既存correlationの読み�
 touch correlationのApp frameとCallback frameは型で区別し、同じ数値による誤replayを防ぐ。
 既存のframe全体ambiguous規則とcommand実行は変えない。別ownerの旧mouse入力が同batchにある場合も、
 exact相関を通ってflush済みのtap完了factだけを現Canonical ownerがそのevent indexで消費し、復帰を一度確定する。
-未flush／drag／pinch／cancelからfactを合成せず、一般のtouch command判定を緩めない。
+未flush／pinch／cancelからfactを合成せず、一般のtouch command判定を緩めない。
+復帰用の単指完了factは§5.7でdragも含める形へ改訂し、通常tapの距離／時間規則とは分離した。
 transport mirrorと論理viewportのRawInput／IMEの終端は一括resetしない。
 managerの既存intentが要求を所有し、rootの受理・commit両境界がregistration／allocation／context／Parked／modalを照合する。
 commitはmediaを含め次rootのactive更新前の既存境界だけにそろえ、late callback受付後のpassive renderでは消費しない。
@@ -166,15 +171,16 @@ command上書き・close・retireによる既受理要求の破棄もmanagerの�
 ```
 
 **旧watcher testの対応。** polling専用helper／reducer／hit-test群は撤去し、release一回・focusだけ不可・
-drag不可・modal取消・touch相関・replayをgestureの実egui入力試験、source同定・NC close優先・
+drag終端・modal取消・touch相関・replayをgestureの実egui入力試験、source同定・NC close優先・
 native loop終端・退役／same-HWND reuse・兄弟不変をkey_inputのnative owner試験へ置換した。
-旧content dragの復帰期待は今回の「dragでは復帰しない」決定に従って拒否へ変更した。
+初回はcontent dragを拒否したが、2026-11-15の利用者決定「案1」により完了時復帰へ変更した。
 repair 3件はbackend adoptionの正本照合／ParkedLive維持／後継採用へ置換し、root wake＋兄弟不変試験も正規adoptionへそろえた。
 `deferred_activation_queues_until_next_root_frame`はPDF再開・次root commitの期待を保ち、実deferred callbackのclickで要求を作る。
 Aの赤2件はpoll controlだけを撤去し、実grid open→pause→兄弟close→実callback→同window/context復帰の期待を維持した。
 さらにtap、drag、modal介入、active兄弟のbinding／page保持、bar close優先と、復帰click非再配送をscenarioで検査する。
 
 撤去した21件（4つのsample helperは件数外）の対応は次のとおり。
+この対応表の試験名は初回時点の記録で、drag拒否を改訂した現在の回帰は§5.7を参照。
 
 | 旧watcher試験の期待 | 置換・維持する試験 |
 | --- | --- |
@@ -736,7 +742,7 @@ Bの失敗は`realmachine50_forwarded_open_without_dialog_retires_previous_live_
 `C:/miv-subpc/results-55/notes.md` と `logs/part2a`、`logs/part3`、`logs/part1` の
 `mimageviewer.log` を照合した。以下のheadless結果を実機での修正確認とは扱わない。
 
-### 5.1 A: client入力の消失は未特定、推測によるlifecycle変更はしない
+### 5.1 A: winitとegui-winitのcursor寿命不一致をソースと赤テストで確認
 
 **観測。** part2aの窓4は281.456秒のnormalized Press、281.457秒のRelease／callback、
 281.552秒のcommitが揃う。300.456秒の2回目pause後はclient行がなく、394.117秒のNonClient取消は
@@ -748,20 +754,31 @@ part3では兄弟窓の復帰でpauseした後にもclient復帰が複数回成�
 生成時proof、既存transport、root commit、実 `reconcile_fullscreen_after_main_focus` を3往復する。
 兄弟open／closeの対照は `realmachine55_client_resume_survives_repeated_sibling_open_and_close`。
 既存兄弟の交互再開で相手をpauseする対照は `realmachine55_client_resume_survives_repeated_sibling_reactivation`。
-App側はnative sourceの生成・退役とnormalized入力を合成し、実backend配送の証明ではない。
+初回App試験はnative sourceの生成・退役とnormalized入力を合成していた。追加修正では
+実Stateの共通pointer変換APIへCursorMovedを一度与え、その後はCursorLeft→CursorEntered→
+MouseInput Down／Up（再入時のCursorMovedなし）を与える。実observerが生成したproofとRawInputを
+callbackへ渡し、同座標再入で3往復しても同window／context／pageと兄弟の資源を保持する。
+native sourceの生成・退役は合成し、実backend配送／OS focusの証明とはしない。
 別にeframeの既存Wgpu／Glow lifecycle adapterで、同childのImmediate／Deferred切替、
 別main fullscreenのImmediate生成／明示退役を3往復し、child／兄弟の同leaseとWindowId対応を検査する。
 egui-winitの実State変換・raw drain／observerにも反復する別main viewport退役の対照を追加した。
 backend adapterはOS windowを作らず、State変換は別試験である。
 
-**コードから言える最有力経路（未確認）。** `State::on_mouse_button_input` はpointer位置がない押下を
+**ソース照合と赤テストで確認した故障機構。** `State::on_mouse_button_input` はpointer位置がない押下を
 raw PointerButtonへ変換せず、`pointer_input_observer::normalized_input` はその押下を通知しない。
 winit 0.30.13のWindows `event_loop.rs` はWM_MOUSELEAVEでCursorLeftを送る一方last_positionを消さず、
 同座標のWM_MOUSEMOVEではCursorMovedを省略する。egui-winitはCursorLeftで位置を失うため、
-位置なしの期間が残る組合せはコード上可能。ただし実機のこの列は記録されていない。
-WindowId mapからState以前に落ちる候補も未除外であり、part3との差の原因は断定しない。
+出たときと同じclient座標へ戻ると位置なしのまま押下を失う。vendorの実State／observer試験で
+この列を赤化した。設計担当は同じソース照合によりこれをAの修正対象と確定した。
+実機でこのイベント列を採取した証拠はなく、part3との差を座標の違いで説明する点も未確認である。
 
-入力routing、lease生成／退役、State cursor寿命は推測で変更していない。押下時診断だけを追加した。
+WindowsのStateは最後のCursorMovedの物理座標を保持し、CursorLeftでは従来どおりlogical位置を
+消してPointerGoneを出す。CursorEnteredで保持位置を現在の実効pixels_per_pointへ変換し、
+通常のon_cursor_movedと同じPointerMoved生成経路へ戻す。実際の位置が変わっていれば後続の
+CursorMovedが上書きする。保持値はwinitのlast_positionとCursorMovedごとに一致し、
+touchのEnd／Cancelでは消さず、新しいnative allocationのStateはNoneから始める。
+root／child全Windows viewportに適用し、根拠のない他platformのEntered復元は追加しない。
+WindowId routing／native leaseの生成・退役は変更せず、前回の押下時診断もすべて残した。
 
 | 入口 | 型付き理由 | 記録するidentity |
 | --- | --- | --- |
@@ -780,19 +797,21 @@ captionのMouse Down／DoubleClickが `DefSubclassProc` のmodal処理へ入っ�
 そのnative callが返るまで同じownerが操作を所有する。call内のWM_CAPTURECHANGEDでcaptureが0へ
 返却される事実を外部取消と混同せず、call return（またはWM_EXITSIZEMOVE）で完了する。
 foreign HWNDへのcapture移譲、focus／cancel／Escapeは取消を維持する。
-WM_MOVING／WM_SIZINGの既存閾値によるdrag取消、caption buttonの押下対象外release、
-外へ動かして戻す取消、×のCloseOwned、OSのDefSubclassProcは維持する。
-移動による取消は既存ownerの判定点に残し、将来の利用者判断を時間窓へ分散させない。
+利用者決定「案1」によりcaption／resizeの移動は取消にせず、native操作の終端で復帰する。
+旧initial_rectの捕捉・GetWindowRect・移動量比較・8px閾値は撤去した。
+caption buttonは押下時のhit-test対象から外れた場合だけ取消し、一度外へ出て戻す場合も取消を維持する。
+同じbutton内の大きな移動だけでは取り消さない。×のCloseOwnedとOSのDefSubclassProcは維持する。
 
 ### 5.3 C: 復帰だけは保持時間をクリック条件に使わない
 
 mouseのActivateOnlyが `released_buttons_with_click_counts` のSomeに依存したため、
 eguiのクリック時間上限（既定0.8秒）を超えるとDragへ誤分類された。
 touchも既存TouchCommandのtap時間（700ms）に依存して長押しを取り消していた。
-mouseはcallbackの同gesture ownerでpress位置と順序付き移動・releaseを照合し、
-既存max_click_distの距離を超えたときだけdragとして終端する。
-touchは既存単指ownerと最大距離、exactな昇格pointer相関から復帰専用の完了factを取り、
-保持時間を復帰の条件にしない。一般のtouch command／tap時間、バーcloseの既存click／tap規則は変更しない。
+利用者決定「案1」によりmouseの復帰用距離判定／press_posを撤去し、同gesture ownerのreleaseで
+復帰する。client外やcloseの上で離しても、ActivateOnlyで開始した操作はcloseへ付け替えない。
+capture中のmouse PointerGoneは終端とせず、真のcapture loss等の取消は維持する。
+touchは既存単指ownerとexactな昇格pointer相関からsingle_contact完了factを取り、
+距離・保持時間を復帰の条件にしない。一般のtouch command／tap時間、バーcloseの既存click／tap規則は変更しない。
 したがって窓内のtouch長押しも同じ復帰仕様にでき、今回の既存command所有との矛盾はない。
 `callback_discard` は `decision=GestureCancelled` に加えて `reason=Drag` 等の実際の
 `ClientActivationCancelReason` を同じ1行へ出す。元scopeのidentityは維持する。
@@ -817,7 +836,9 @@ ParkedLiveの窓内クリックは既存NativeMedia producerが所有し、新�
 - B／C／Dは同操作のownerと終端を揃える構造修正であり、独立設計レビュー（Sol / xhigh、2026-11-15）も
   BA-7主／BA-1関連の修正として合意した。時間による待ち、追加repaint、App状態、入力再試行は不要。
   全停止窓の一括resetや再生成は、既存閲覧の所有と表示を壊すため採らない。
-- caption／clientのdragで復帰する仕様は利用者判断待ちで、今回は距離超過の取消を維持する。
+- 2026-11-15の利用者決定「案1」で、通常canvasのprimary／単指touchとcaption／resizeのdragは
+  操作終端で復帰と確定した。既存HUD／右ドラッグ／ページ一覧等のcommand ownerは維持し、
+  通常tapの認識規則や複数接点・OS取消を復帰操作へ変換しない。
 
 検証は指定 `run-heavy.ps1`、Owner `codex/767-rm55`、同WorkDirで直列実行する。
 ロック場所への書込不可警告後も、runnerのBelowNormal／6 build jobsのまま継続した。
@@ -846,8 +867,9 @@ Aの反復main focus guard／兄弟open-closeも成功した。失敗した旧�
 | 最後のCargo操作 `cargo fmt`（引数なし） | **exit 0**。`target/rm55-fmt.log`。vendorは各manifestの `cargo fmt` もrun-heavy経由で先行実施 |
 
 AのApp反復3件、両backendのnative source保持、State変換の対照はすべて成功し、
-**Aの実機症状はheadlessで再現できなかった**。main focus guardとpart3の既存兄弟再開との差を
-説明できる故障点も未確定である。B／C／Dの赤テストと追加対照、既存NativeMedia、A／Cの
+**初回時点ではAの実機症状はheadlessで再現できなかった**。追加修正では§5.1／§5.7の
+同座標再入による故障機構をソース・vendor赤テストで確認した。実機part3の座標差との対応は未確認である。
+B／C／Dの赤テストと追加対照、既存NativeMedia、A／Cの
 realmachine50回帰はすべて成功した。独立source review（Sol / xhigh）は最終の所有・終端・
 診断metadata・canonical fixtureとA対照の補足までACCEPT、追加P1/P2なし。
 
@@ -885,6 +907,99 @@ Cのrect入力登録も旧版に残っている。§8の同じ5テストは現�
 - **手順15補足:** `src/app.rs:72774–72795` の既存one-shotは、viewer内のメディア送りで今のpresentationを維持する。
   main fullscreenから↓で動画へ進むとmain fullscreenのままなのは従来仕様。
   同じ処理と2026-07-02の理由コメントがv5.2.0にもある。いずれも今回変更する案を含めない。
+
+### 5.7 利用者決定「案1」とAの追加修正（2026-11-15）
+
+追加実装の基点は `e9c909f56`（前回A〜Dの修正を設計担当がcommitしたもの）。
+利用者の決定（統括経由、2026-11-15、案1）により、通常canvasのprimary／単指touchは
+クリック・長押し・dragをすべて操作終端で復帰に使う。captionのclick／drag／double-click、
+最大化・resizeもOS操作終了時に復帰する。入力列は終端までそのownerが消費し、
+同操作でページ送り／パンを行わず、次の通常操作から閲覧へ届ける。
+×は従来のCloseOwned、caption buttonは押下対象の外へ出た場合の取消を維持する。
+modal／退役・capture loss／OS取消・複数接点の取消も既存の所有契約を維持する。
+既存HUD／右ドラッグ／ページ一覧等のcommand ownerは変更せず、通常canvasの復帰producerを競合させない。
+
+**Aの根本修正。** §5.1のWindows cursor寿命不一致を直し、物理座標は実CursorMovedだけから保持する。
+Stateのlogical位置とwinitの物理履歴を同じものとして消していた点が誤りである。
+CursorLeftは従来のPointerGoneを維持し、Enteredで保持位置を現在倍率へ復元する。
+touchのlogical清掃では物理mouse履歴を消さず、別native allocationでは引き継がない。
+`on_pointer_event` はWindow不要の正規pointer変換APIとして既存private helper／observerを共有し、
+Appの反復テストも実State変換→observer→provenance→callback→intent→root commitを通す。
+normal `on_window_event` のAccessKit／IME trace／observerの順序は維持した。
+
+**client／captionの簡素化。** mouseの復帰用press位置・距離helper、NCのinitial_rect捕捉・
+GetWindowRect・移動量閾値とgeometry取消を撤去した。触れたものはplacementの保存計算ではない。
+ActivateOnlyのclient外release／close上releaseは開始destinationを維持し、caption buttonはhit-test対象の外へ
+一度出れば戻っても取り消す。同じbutton内の大移動は完了とする。
+touchはstationary完了factをsingle_contact完了factへ改め、一般のtap時間／距離やcommand実行を変えず、
+raw End後のexactな昇格pointer tailが揃ったときだけ復帰する。
+
+**ParkedLive native動画のtouch。** 既存native mouseはDown／Up所有で既にdrag・長押しを終端復帰へ
+渡せたが、native canvas touchは通常recognizerへ流れ、長押し・drag Endを復帰に使えなかった。
+描画側のdimmed状態で新しく分類する案は、control／raw入力が別queueのためActive時のStartを
+Parked後に再所属させる。これを採らず、native HWNDの入力生成境界で既存key_input bindingを捕捉する。
+通常入力／ActivateOnly／既存command／抑止を既存NativeTouchOwnershipの排他的routeとし、
+source epoch、正規logical hostのallocation、操作tokenをEndまで照合する。
+media窓のOS ownerが0でも、placementの変換前に確定済みlogical hostを使い、親探索はしない。
+sink生成時に正規親allocationのwitnessを捕捉し、後継の同HWNDをStart時に採り直さない。
+既存pumpのVisible入力epochをstate採用直後・効果実行前にread-only projectionへ公開し、
+native子窓のepochと既存output cancel tokenもStart／Endで照合する。
+これにより旧presenterの後段event gateやreceiver dropを直接入力経路が迂回する穴を閉じた。
+旧scopeが失効したときだけ新child／outputのfresh操作を開始でき、旧tailはoperation identityで拒否する。
+正規F12の親変更は既存pump switchで新sinkを作り、旧outputのDropは既存cancel→shutdownへ進む。
+request全体へ新しいproofや保留を増やす代わりに、これら既存ownerの寿命を参照する。
+source交換／modal／focus・capture loss／CancelMode／Escape／destroy／multi-contactは元tokenを終端する。
+rendererへActivateOnlyを渡さず、通常touch command／panoramaへの副作用を出さない。
+完了は既存Shared transportへNativeMediaのwindow／context復帰intentとして渡す。
+End後の同C内の通常メディア送りは完了済みintentを取り消さず、context／window／registrationの
+差替えは既存admissionが拒否する。新しいApp pending・時間窓・retry・repaintは追加しない。
+
+独立設計レビュー（Sol / xhigh）は、Aのcursor寿命、drag終端、native touchの生成時ownerを
+根本境界の構造修正として合意した。完成source reviewも親allocation／native子窓／output寿命・
+source交換・各取消・fresh操作と旧tailの分離までACCEPT、追加P1/P2なし。
+
+**追加検証の途中記録。** すべて同じ `run-heavy.ps1`／Owner `codex/767-rm55` で直列実行した。
+
+- drag仕様の赤: `test(/realmachine55_.*(drag|caption|resize|mouse_release)|native_detached_drag_maximize|native_detached_caption_button_far_motion|held_mouse_and_out_and_back_drag|touch_drag_completes_but_multiple/)` は
+  **16実行／2成功／14失敗、exit 100**（`target/rm55-drag-red.log`）。
+- Aの赤: vendorの `test(/realmachine55_cursor_|realmachine55_recreated_state|realmachine55_pointer_adapter/)` は
+  **7実行／4成功／3失敗、exit 100**（`target/rm55-reentry-red.log`）。同座標復元・倍率変更・touch終端後が失敗した。
+- 初回追加焦点は **146実行／143成功／3失敗、exit 100**（`target/rm55-drag-focused-r1.log`）。
+  native canvas touch Endから復帰する実handlerが未接続の赤1件と、次click／tapのfixture座標誤り2件。
+  後者はLTRの先頭ページで前ページ側を押していたためで、製品変更はせずactual modeのforward側へ直し、
+  items2／page0／paged、touch PageSideをassertしたうえでpage1への期待を維持した。
+- output cancel参照の最終補完前は **233実行／233成功、exit 0**
+  （`target/rm55-drag-focused-before-output-cancel.log`）。最後の補完には同親の旧／新outputを扱う回帰を追加した。
+
+**追加修正の最終結果。** nextestはすべて `--no-fail-fast --test-threads 6`。
+焦点／回帰の件数には重複があるため合計しない。全Cargo操作は指定run-heavy経由で直列実行した。
+
+| コマンド | 件数・exit code・証拠 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/realmachine55_\|realmachine50_\|detached_activation\|native_detached\|non_client\|pointer_input_observer\|native_touch\|touch_correlation/)'` | **234実行／234成功／0失敗、exit 0**、13.336秒。`target/rm55-drag-focused.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/realmachine50_\|realmachine55_\|detached_activation\|native_detached\|non_client\|pointer_input_observer\|parked\|native_video\|touch\|key_input\|native_window/)'` | **770実行／770成功（1 slow）／0失敗、exit 0**、95.816秒。`target/rm55-drag-regression.log` |
+| `cargo nextest run --manifest-path vendor/egui-winit/Cargo.toml --lib` | **69実行／69成功／0失敗、exit 0**。`target/rm55-drag-vendor-winit.log` |
+| `cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features --features default_fonts,wgpu --lib -E 'test(/realmachine55_\|viewport_retirement\|native_window_input/)'` | **21実行／21成功／0失敗、exit 0**。`target/rm55-drag-vendor-wgpu.log` |
+| 上と同じeframeコマンドで `--features default_fonts,glow` | **21実行／21成功／0失敗、exit 0**。`target/rm55-drag-vendor-glow.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **core 1対象、exit 0**。警告あり。`target/rm55-drag-check.log` |
+| `python scripts/check_ui_glyphs.py` | **危険なglyph 0、exit 0** |
+
+最後のCargo操作 `cargo fmt`（引数なし、同run-heavy経由）は **exit 0**
+（`target/rm55-drag-fmt-final.log`）。`git diff --check` も **exit 0**。
+
+**今回の変更ファイル（16件）。**
+
+- App／入力: `src/app/detached_activation.rs`、`src/app/detached_activation_gesture.rs`、
+  `src/app/detached_window_manager.rs`（テストのkind補完）、`src/app/multiwindow_scenario_tests.rs`、
+  `src/key_input.rs`、`src/touch_correlation.rs`、`src/touch_input.rs`。
+- native入力: `src/video/native_touch.rs`、`src/video/native_window.rs`、`src/video/native_window_pump.rs`。
+- vendor: `vendor/egui-winit/src/lib.rs`、`vendor/egui-winit/src/pointer_input_observer.rs`、`vendor/egui-winit/PATCHES.md`。
+- 文書: 本書、`docs/detached-rework-plan.md`、`docs/architecture-overview.md`。
+
+前回A〜Dを含む `25f3f9e41` からの変更は23ファイル。前回のnative allocation lease／WindowId退役、
+NonClient／長押し／ParkedLive transport、今回のcursor寿命とdrag／native touchを合わせて検証した。
+未確認は実機の同座標イベント列とpart3の座標差、OS caption modal loop／最大化・resize・touch・focus。
+製品起動・全件gate・確認用build・commit／pushは行わない。描画・レイアウトは変更せず、ui_snapshotは実行していない。
 
 ## 6. 診断（初回調査の案、A実装で導入）
 

@@ -84,11 +84,12 @@ pub(crate) enum NativeTouchOwnershipDecision {
     Passed(NativeTouchPassReason),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct OwnedTouchPointer {
     id: u32,
     last_client_position: Option<[i32; 2]>,
     suppress_widget_primary: bool,
+    route: crate::key_input::NativeMediaTouchRoute,
 }
 
 /// Pure, bounded ownership state for one native input HWND.
@@ -146,6 +147,7 @@ impl NativeTouchOwnership {
             id: pointer_id,
             last_client_position: None,
             suppress_widget_primary: false,
+            route: crate::key_input::NativeMediaTouchRoute::Unstarted,
         });
         NativeTouchOwnershipDecision::Owned
     }
@@ -206,12 +208,62 @@ impl NativeTouchOwnership {
         else {
             return false;
         };
-        self.pointers.swap_remove(index);
+        let pointer = self.pointers.swap_remove(index);
+        match pointer.route {
+            crate::key_input::NativeMediaTouchRoute::ActivateOnly(token)
+            | crate::key_input::NativeMediaTouchRoute::CommandOwned(token) => {
+                crate::key_input::end_native_media_touch(&token, true);
+            }
+            _ => {}
+        }
         true
     }
 
     pub(crate) fn clear(&mut self) {
-        self.pointers.clear();
+        while let Some(id) = self.first_pointer_id() {
+            self.release(id);
+        }
+    }
+
+    pub(crate) fn input_route(&self, pointer_id: u32) -> crate::key_input::NativeMediaTouchRoute {
+        self.pointers
+            .iter()
+            .find(|pointer| pointer.id == pointer_id)
+            .map(|pointer| pointer.route.clone())
+            .unwrap_or(crate::key_input::NativeMediaTouchRoute::Suppressed)
+    }
+
+    pub(crate) fn set_input_route(
+        &mut self,
+        pointer_id: u32,
+        route: crate::key_input::NativeMediaTouchRoute,
+    ) {
+        if let Some(pointer) = self
+            .pointers
+            .iter_mut()
+            .find(|pointer| pointer.id == pointer_id)
+        {
+            pointer.route = route;
+        }
+    }
+
+    pub(crate) fn only_contact(&self, pointer_id: u32) -> bool {
+        self.pointers.len() == 1 && self.contains(pointer_id)
+    }
+
+    pub(crate) fn cancel_detached_activation(
+        &self,
+        reason: crate::key_input::NativeInputCancelReason,
+    ) {
+        for pointer in &self.pointers {
+            match &pointer.route {
+                crate::key_input::NativeMediaTouchRoute::ActivateOnly(token)
+                | crate::key_input::NativeMediaTouchRoute::CommandOwned(token) => {
+                    crate::key_input::cancel_native_media_touch(token, reason);
+                }
+                _ => {}
+            }
+        }
     }
 
     pub(crate) fn contains(&self, pointer_id: u32) -> bool {

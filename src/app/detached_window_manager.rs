@@ -1278,6 +1278,7 @@ mod tests {
         (
             crate::key_input::NativeDetachedInputTarget {
                 registration: context.viewport_registration(viewport).unwrap(),
+                kind: crate::key_input::NativeDetachedInputTargetKind::Parked,
                 availability: crate::key_input::NativeTargetAvailability::Enabled,
                 sink: std::sync::Arc::new(move |_| {
                     let _ = (&retained, &captured_context);

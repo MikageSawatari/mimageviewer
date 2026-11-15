@@ -79,7 +79,6 @@ enum ClientGestureOwner {
 struct ClientGesture {
     operation: ClientOperation,
     destination: ClientGestureDestination,
-    press_pos: egui::Pos2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -339,7 +338,6 @@ impl DeferredClientActivationGesture {
                 input.pointer.primary_down(),
             )
         });
-        let mouse_drag_distance = ctx.options(|options| options.input_options.max_click_dist);
         let promoted =
             preview_touch_primary_event_indices(ctx, TouchSurface::StillFullscreen, &geometry);
         let held_operation = self.current_operation();
@@ -464,7 +462,6 @@ impl DeferredClientActivationGesture {
                                 ClientGesture {
                                     operation,
                                     destination,
-                                    press_pos: *pos,
                                 },
                                 TouchContactEnd::ContactDown,
                             ),
@@ -528,7 +525,6 @@ impl DeferredClientActivationGesture {
                                 Ok(()) => ClientGestureOwner::Mouse(ClientGesture {
                                     operation,
                                     destination,
-                                    press_pos: *pos,
                                 }),
                                 Err(reason) => {
                                     ClientGestureOwner::SuppressedMouse(reason, operation)
@@ -551,28 +547,16 @@ impl DeferredClientActivationGesture {
                     if !edge.touch_derived {
                         match self.owner.gesture {
                             ClientGestureOwner::Mouse(gesture) => {
-                                // Resuming a parked owner needs a completed
-                                // stationary press, independent of its duration.
-                                // Window close retains the ordinary click policy.
+                                // The initial operation belongs entirely to
+                                // resumption, including a long press or drag.
+                                // Window close retains ordinary click policy.
                                 let completed = match gesture.destination {
-                                    ClientGestureDestination::ActivateOnly => {
-                                        !mouse_press_became_drag(
-                                            gesture.press_pos,
-                                            *pos,
-                                            mouse_drag_distance,
-                                        )
-                                    }
+                                    ClientGestureDestination::ActivateOnly => true,
                                     ClientGestureDestination::WindowClose(_) => {
                                         releases.get(release_ordinal).is_some_and(Option::is_some)
                                     }
                                 };
-                                if completed
-                                    && release_inside(
-                                        gesture.destination,
-                                        &geometry,
-                                        *pos,
-                                        close_rect,
-                                    )
+                                if completed && release_inside(gesture.destination, &geometry, *pos)
                                 {
                                     self.complete(
                                         ClientActivationSource::MouseClick,
@@ -594,19 +578,13 @@ impl DeferredClientActivationGesture {
                     }
                     release_ordinal += 1;
                 }
-                Event::PointerMoved(pos) => {
-                    if let ClientGestureOwner::Mouse(gesture) = self.owner.gesture
-                        && mouse_press_became_drag(gesture.press_pos, *pos, mouse_drag_distance)
-                    {
-                        self.cancel_owner(ClientActivationCancelReason::Drag);
-                    }
-                }
                 _ => {}
             }
             // A canonical owner may consume its own completed input fact even
             // when an unrelated older mouse event forbids generic touch commands.
-            // Logical fixtures continue to use the unchanged command permission.
-            let owned_tap_completed = match self.owner.gesture {
+            // Logical fixtures use the same release evidence for activation;
+            // close still needs ordinary tap permission.
+            let owned_touch_completed = match self.owner.gesture {
                 ClientGestureOwner::Touch(
                     ClientGesture {
                         operation: ClientOperation::Canonical(_),
@@ -615,7 +593,7 @@ impl DeferredClientActivationGesture {
                     _,
                 ) => {
                     touch.completed_tap_at(index)
-                        || (self.owns_activation() && touch.completed_stationary_press_at(index))
+                        || (self.owns_activation() && touch.completed_single_contact_at(index))
                 }
                 ClientGestureOwner::Touch(
                     ClientGesture {
@@ -623,19 +601,22 @@ impl DeferredClientActivationGesture {
                         ..
                     },
                     _,
-                ) => touch.commands_with_event_indices().any(|(at, command)| {
-                    at == index
-                        && matches!(
-                            command,
-                            TouchCommand::ToggleChrome | TouchCommand::PageSide { .. }
-                        )
-                }),
+                ) => {
+                    (self.owns_activation() && touch.completed_single_contact_at(index))
+                        || touch.commands_with_event_indices().any(|(at, command)| {
+                            at == index
+                                && matches!(
+                                    command,
+                                    TouchCommand::ToggleChrome | TouchCommand::PageSide { .. }
+                                )
+                        })
+                }
                 _ => false,
             };
-            if owned_tap_completed {
+            if owned_touch_completed {
                 let release_inside = match self.owner.gesture {
                     ClientGestureOwner::Touch(gesture, TouchContactEnd::Released(pos)) => {
-                        release_inside(gesture.destination, &geometry, pos, close_rect)
+                        release_inside(gesture.destination, &geometry, pos)
                     }
                     _ => false,
                 };
@@ -654,10 +635,12 @@ impl DeferredClientActivationGesture {
             if matches!(self.owner.gesture, ClientGestureOwner::Touch(..)) {
                 match touch.ended_gesture_at(index) {
                     Some(crate::touch_input::TouchOwner::ViewerPointerPassthrough) => {
-                        self.cancel_owner(ClientActivationCancelReason::Drag)
+                        if !self.owns_activation() {
+                            self.cancel_owner(ClientActivationCancelReason::Drag);
+                        }
                     }
                     Some(crate::touch_input::TouchOwner::Undecided) => {
-                        if !(self.owns_activation() && touch.stationary_press_ended_at(index)) {
+                        if !(self.owns_activation() && touch.single_contact_ended_at(index)) {
                             self.cancel_owner(ClientActivationCancelReason::TouchCancelled);
                         }
                     }
@@ -668,6 +651,13 @@ impl DeferredClientActivationGesture {
                 }
             }
             if matches!(event, Event::PointerGone)
+                && !matches!(
+                    self.owner.gesture,
+                    ClientGestureOwner::Mouse(ClientGesture {
+                        destination: ClientGestureDestination::ActivateOnly,
+                        ..
+                    })
+                )
                 && !(matches!(self.owner.gesture, ClientGestureOwner::Touch(..))
                     && touch.gesture_active_after(index))
             {
@@ -809,12 +799,6 @@ impl DeferredClientActivationGesture {
     }
 }
 
-/// Keep parked mouse drag cancellation at egui's existing distance boundary,
-/// including an out-and-back move. Duration is deliberately not part of it.
-fn mouse_press_became_drag(origin: egui::Pos2, pos: egui::Pos2, max_distance: f32) -> bool {
-    origin.distance(pos) > max_distance
-}
-
 impl ClientActivationAvailability {
     fn cancel_reason(self) -> Option<ClientActivationCancelReason> {
         match self {
@@ -888,15 +872,13 @@ fn release_inside(
     destination: ClientGestureDestination,
     geometry: &TapZoneGeometry,
     pos: egui::Pos2,
-    close_rect: Option<egui::Rect>,
 ) -> bool {
-    geometry.surface.contains(pos)
-        && match destination {
-            ClientGestureDestination::WindowClose(rect) => rect.contains(pos),
-            ClientGestureDestination::ActivateOnly => {
-                in_client(geometry, pos) && !close_rect.is_some_and(|rect| rect.contains(pos))
-            }
+    match destination {
+        ClientGestureDestination::WindowClose(rect) => {
+            geometry.surface.contains(pos) && rect.contains(pos)
         }
+        ClientGestureDestination::ActivateOnly => true,
+    }
 }
 
 fn scoped_press_proof_required(scope: Option<&super::DetachedActivationRequest>) -> bool {
@@ -1550,7 +1532,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_touch_disable_still_rejects_cancel_drag_and_multiple_contacts() {
+    fn diagnostic_touch_disable_keeps_drag_completion_and_close_cancel_boundaries() {
         let _input = crate::key_input::lock_test_input();
         crate::touch_correlation::with_gestures_disabled(true, || {
             for close in [false, true] {
@@ -1596,23 +1578,33 @@ mod tests {
                     };
                     events.extend([primary(pos, false), Event::PointerGone]);
                     let operation = feed_scoped_click(&mut owner, &scope);
-                    assert!(
-                        close_frame(
-                            &ctx,
-                            &mut owner,
-                            1.0,
-                            marked(events, operation),
-                            &scope,
-                            ClientActivationAvailability::Available,
-                            false
-                        )
-                        .is_empty()
+                    let accepted = close_frame(
+                        &ctx,
+                        &mut owner,
+                        1.0,
+                        marked(events, operation),
+                        &scope,
+                        ClientActivationAvailability::Available,
+                        false,
+                    );
+                    let activation_drag = !close && failure == 1;
+                    assert_eq!(
+                        accepted,
+                        if activation_drag {
+                            vec![ClientActivationSource::TouchTap]
+                        } else {
+                            vec![]
+                        }
                     );
                     assert_eq!(
                         owner.drain_decisions(),
-                        [ClientActivationDecision::Cancelled {
-                            source: ClientActivationSource::TouchTap,
-                            reason,
+                        [if activation_drag {
+                            ClientActivationDecision::Completed(ClientActivationSource::TouchTap)
+                        } else {
+                            ClientActivationDecision::Cancelled {
+                                source: ClientActivationSource::TouchTap,
+                                reason,
+                            }
                         }]
                     );
                     let fresh = feed_scoped_click(&mut owner, &scope);
@@ -2284,7 +2276,7 @@ mod tests {
                     primary(end, false),
                 ]
             };
-            assert!(
+            assert_eq!(
                 close_frame(
                     &ctx,
                     &mut owner,
@@ -2293,14 +2285,20 @@ mod tests {
                     &scope,
                     ClientActivationAvailability::Available,
                     false
-                )
-                .is_empty()
+                ),
+                [if touch_input {
+                    ClientActivationSource::TouchTap
+                } else {
+                    ClientActivationSource::MouseClick
+                }]
             );
-            assert!(
-                owner
-                    .drain_decisions()
-                    .iter()
-                    .all(|decision| matches!(decision, ClientActivationDecision::Cancelled { .. }))
+            assert_eq!(
+                owner.drain_decisions(),
+                [ClientActivationDecision::Completed(if touch_input {
+                    ClientActivationSource::TouchTap
+                } else {
+                    ClientActivationSource::MouseClick
+                })]
             );
         }
     }
@@ -3592,7 +3590,7 @@ mod tests {
     }
 
     #[test]
-    fn realmachine55_mouse_release_without_move_uses_the_existing_drag_distance() {
+    fn realmachine55_mouse_release_without_move_completes_regardless_of_distance() {
         for distance in [6.0, 6.01] {
             let ctx = Context::default();
             let mut owner = DeferredClientActivationGesture::default();
@@ -3614,23 +3612,18 @@ mod tests {
                 vec![primary(pos + egui::vec2(distance, 0.0), false)],
                 &scope,
             );
-            if distance <= 6.0 {
-                assert_eq!(result, [ClientActivationSource::MouseClick]);
-            } else {
-                assert!(result.is_empty());
-                assert_eq!(
-                    owner.drain_decisions(),
-                    [ClientActivationDecision::Cancelled {
-                        source: ClientActivationSource::MouseClick,
-                        reason: ClientActivationCancelReason::Drag,
-                    }]
-                );
-            }
+            assert_eq!(result, [ClientActivationSource::MouseClick]);
+            assert_eq!(
+                owner.drain_decisions(),
+                [ClientActivationDecision::Completed(
+                    ClientActivationSource::MouseClick,
+                )]
+            );
         }
     }
 
     #[test]
-    fn realmachine55_long_drag_still_cancels_with_the_actual_typed_reason() {
+    fn realmachine55_long_drag_completes_only_at_release_with_original_scope() {
         for touch_input in [false, true] {
             let ctx = Context::default();
             let mut owner = DeferredClientActivationGesture::default();
@@ -3676,21 +3669,98 @@ mod tests {
             } else {
                 vec![primary(pos, false)]
             };
-            assert!(scoped(&ctx, &mut owner, 2.5, end, &scope).is_empty());
+            let source = if touch_input {
+                ClientActivationSource::TouchTap
+            } else {
+                ClientActivationSource::MouseClick
+            };
+            assert_eq!(scoped(&ctx, &mut owner, 2.5, end, &scope), [source]);
             assert_eq!(
                 owner.drain_scoped_decisions(),
                 [ScopedClientActivationDecision {
-                    scope: Some(scope),
-                    decision: ClientActivationDecision::Cancelled {
-                        source: if touch_input {
-                            ClientActivationSource::TouchTap
-                        } else {
-                            ClientActivationSource::MouseClick
-                        },
-                        reason: ClientActivationCancelReason::Drag,
-                    },
+                    scope: Some(scope.clone()),
+                    decision: ClientActivationDecision::Completed(source),
                 }]
             );
+            assert!(scoped(&ctx, &mut owner, 2.6, Vec::new(), &scope).is_empty());
+            assert!(owner.drain_decisions().is_empty());
+        }
+    }
+
+    #[test]
+    fn realmachine55_captured_mouse_drag_survives_pointer_gone_and_outside_release() {
+        let _input = crate::key_input::lock_test_input();
+        for end in [pos2(500.0, 100.0), close_rect().center()] {
+            let ctx = Context::default();
+            let scope = canonical_scope(&ctx);
+            let mut owner = DeferredClientActivationGesture::default();
+            let start = pos2(100.0, 100.0);
+            let operation = feed_scoped_click(&mut owner, &scope);
+            assert!(
+                close_frame(
+                    &ctx,
+                    &mut owner,
+                    1.0,
+                    marked(
+                        vec![Event::PointerMoved(start), primary(start, true)],
+                        operation
+                    ),
+                    &scope,
+                    ClientActivationAvailability::Available,
+                    false
+                )
+                .is_empty()
+            );
+            assert!(
+                close_frame(
+                    &ctx,
+                    &mut owner,
+                    1.1,
+                    vec![Event::PointerMoved(end), Event::PointerGone],
+                    &scope,
+                    ClientActivationAvailability::Available,
+                    false
+                )
+                .is_empty()
+            );
+            assert!(
+                owner.drain_decisions().is_empty(),
+                "cursor exit preserves captured operation"
+            );
+            assert_eq!(
+                close_frame(
+                    &ctx,
+                    &mut owner,
+                    1.2,
+                    vec![primary(end, false)],
+                    &scope,
+                    ClientActivationAvailability::Available,
+                    false
+                ),
+                [ClientActivationSource::MouseClick]
+            );
+            assert_eq!(
+                owner.drain_scoped_decisions(),
+                [ScopedClientActivationDecision {
+                    scope: Some(scope.clone()),
+                    decision: ClientActivationDecision::Completed(
+                        ClientActivationSource::MouseClick
+                    ),
+                }]
+            );
+            assert!(
+                close_frame(
+                    &ctx,
+                    &mut owner,
+                    1.3,
+                    Vec::new(),
+                    &scope,
+                    ClientActivationAvailability::Available,
+                    false
+                )
+                .is_empty()
+            );
+            assert!(owner.drain_decisions().is_empty());
         }
     }
 
@@ -3777,7 +3847,7 @@ mod tests {
     }
 
     #[test]
-    fn held_mouse_waits_for_release_and_egui_rejects_an_out_and_back_drag() {
+    fn held_mouse_and_out_and_back_drag_wait_for_release() {
         for drag in [false, true] {
             let ctx = Context::default();
             let mut owner = DeferredClientActivationGesture::default();
@@ -3798,14 +3868,7 @@ mod tests {
                 );
             }
             let completed = available(&ctx, &mut owner, 1.02, vec![primary(pos, false)]);
-            assert_eq!(
-                completed,
-                if drag {
-                    vec![]
-                } else {
-                    vec![ClientActivationSource::MouseClick]
-                }
-            );
+            assert_eq!(completed, vec![ClientActivationSource::MouseClick]);
         }
     }
 
@@ -3863,7 +3926,7 @@ mod tests {
     }
 
     #[test]
-    fn touch_drag_and_multiple_contacts_do_not_activate_and_fresh_tap_still_works() {
+    fn touch_drag_completes_but_multiple_contacts_cancel_and_fresh_tap_works() {
         for multiple in [false, true] {
             let ctx = Context::default();
             let mut owner = DeferredClientActivationGesture::default();
@@ -3891,7 +3954,14 @@ mod tests {
                 primary(end, false),
                 Event::PointerGone,
             ]);
-            assert!(available(&ctx, &mut owner, 1.0, events).is_empty());
+            assert_eq!(
+                available(&ctx, &mut owner, 1.0, events),
+                if multiple {
+                    vec![]
+                } else {
+                    vec![ClientActivationSource::TouchTap]
+                }
+            );
             assert_eq!(
                 available(&ctx, &mut owner, 1.1, tap(3, pos)),
                 [ClientActivationSource::TouchTap]

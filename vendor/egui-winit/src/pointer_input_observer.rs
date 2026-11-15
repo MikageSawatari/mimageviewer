@@ -232,23 +232,180 @@ mod tests {
     // directly. on_window_event supplies this scale from the actual Window.
     fn dispatch(state: &mut State, event: &WindowEvent) -> Vec<Event> {
         let before = state.egui_input.events.len();
-        match event {
-            WindowEvent::MouseInput {
-                state: phase,
-                button,
-                ..
-            } => state.on_mouse_button_input(*phase, *button),
-            WindowEvent::Touch(touch) => state.on_touch(touch, 2.0),
-            _ => {}
-        }
-        observe(
-            &state.egui_ctx,
-            state.viewport_id,
-            event,
-            &mut state.egui_input.events,
-            before,
-        );
+        state.on_pointer_event(event, 2.0);
         state.egui_input.events[before..].to_vec()
+    }
+
+    fn moved(x: f64, y: f64) -> WindowEvent {
+        WindowEvent::CursorMoved {
+            device_id: DeviceId::dummy(),
+            position: PhysicalPosition::new(x, y),
+        }
+    }
+
+    fn left() -> WindowEvent {
+        WindowEvent::CursorLeft {
+            device_id: DeviceId::dummy(),
+        }
+    }
+
+    fn entered() -> WindowEvent {
+        WindowEvent::CursorEntered {
+            device_id: DeviceId::dummy(),
+        }
+    }
+
+    fn primary_position(events: &[Event]) -> Option<egui::Pos2> {
+        events.iter().find_map(|event| match event {
+            Event::PointerButton {
+                pos,
+                pressed: true,
+                button: PointerButton::Primary,
+                ..
+            } => Some(*pos),
+            _ => None,
+        })
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn realmachine55_cursor_reentry_at_same_position_restores_press_and_observer() {
+        let (mut state, observed) = fixture();
+        dispatch(&mut state, &moved(40.0, 60.0));
+        assert_eq!(dispatch(&mut state, &left()), vec![Event::PointerGone]);
+        assert_eq!(state.pointer_pos_in_points, None);
+        assert_eq!(
+            dispatch(&mut state, &entered()),
+            vec![Event::PointerMoved(egui::pos2(20.0, 30.0))]
+        );
+        assert_eq!(
+            primary_position(&dispatch(&mut state, &mouse(true, MouseButton::Left))),
+            Some(egui::pos2(20.0, 30.0))
+        );
+        assert_eq!(
+            phases(&observed),
+            vec![NormalizedPointerInput::Pressed(PointerInputSource::Mouse)]
+        );
+    }
+
+    #[test]
+    fn realmachine55_cursor_reentry_new_moved_overwrites_restored_position() {
+        let (mut state, _) = fixture();
+        dispatch(&mut state, &moved(40.0, 60.0));
+        dispatch(&mut state, &left());
+        dispatch(&mut state, &entered());
+        dispatch(&mut state, &moved(80.0, 100.0));
+        assert_eq!(
+            primary_position(&dispatch(&mut state, &mouse(true, MouseButton::Left))),
+            Some(egui::pos2(40.0, 50.0))
+        );
+    }
+
+    #[test]
+    fn realmachine55_cursor_reentry_without_history_does_not_invent_position() {
+        let (mut state, observed) = fixture();
+        assert!(dispatch(&mut state, &entered()).is_empty());
+        assert!(dispatch(&mut state, &mouse(true, MouseButton::Left)).is_empty());
+        assert!(phases(&observed).is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn realmachine55_cursor_reentry_uses_current_effective_pixels_per_point() {
+        let (mut state, observed) = fixture();
+        dispatch(&mut state, &moved(40.0, 60.0));
+        dispatch(&mut state, &left());
+        state.on_pointer_event(&entered(), 4.0);
+        assert_eq!(
+            primary_position(&dispatch(&mut state, &mouse(true, MouseButton::Left))),
+            Some(egui::pos2(10.0, 15.0))
+        );
+        assert_eq!(phases(&observed).len(), 1);
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn realmachine55_cursor_history_survives_touch_end_and_cancel() {
+        for phase in [
+            winit::event::TouchPhase::Ended,
+            winit::event::TouchPhase::Cancelled,
+        ] {
+            let (mut state, _) = fixture();
+            dispatch(&mut state, &moved(40.0, 60.0));
+            dispatch(&mut state, &touch(1, winit::event::TouchPhase::Started));
+            dispatch(&mut state, &touch(1, phase));
+            assert_eq!(state.pointer_pos_in_points, None);
+            dispatch(&mut state, &entered());
+            assert_eq!(
+                primary_position(&dispatch(&mut state, &mouse(true, MouseButton::Left))),
+                Some(egui::pos2(20.0, 30.0))
+            );
+        }
+    }
+
+    #[test]
+    fn realmachine55_recreated_state_does_not_inherit_cursor_history() {
+        let (mut old, _) = fixture();
+        dispatch(&mut old, &moved(40.0, 60.0));
+        let mut new = State::new(
+            old.egui_ctx.clone(),
+            old.viewport_id,
+            &NoDisplay,
+            None,
+            None,
+            None,
+        );
+        assert!(dispatch(&mut new, &entered()).is_empty());
+        assert!(dispatch(&mut new, &mouse(true, MouseButton::Left)).is_empty());
+    }
+
+    #[test]
+    fn realmachine55_pointer_adapter_ignores_other_events_without_mutation() {
+        let (mut state, observed) = fixture();
+        assert!(
+            state
+                .on_pointer_event(&WindowEvent::Focused(true), 2.0)
+                .is_none()
+        );
+        assert!(state.egui_input.events.is_empty());
+        assert!(phases(&observed).is_empty());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn realmachine55_cursor_history_is_owned_by_each_root_and_child_state() {
+        let (mut root, observed) = fixture();
+        let child_id = ViewportId::from_hash_of("rm55-cursor-child");
+        let mut child = State::new(
+            root.egui_ctx.clone(),
+            child_id,
+            &NoDisplay,
+            None,
+            None,
+            None,
+        );
+        dispatch(&mut root, &moved(40.0, 60.0));
+        dispatch(&mut child, &moved(80.0, 100.0));
+        for (state, expected) in [
+            (&mut root, egui::pos2(20.0, 30.0)),
+            (&mut child, egui::pos2(40.0, 50.0)),
+        ] {
+            dispatch(state, &left());
+            dispatch(state, &entered());
+            assert_eq!(
+                primary_position(&dispatch(state, &mouse(true, MouseButton::Left))),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            observed
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![ViewportId::ROOT, child_id]
+        );
     }
 
     fn phases(observed: &Observed) -> Vec<NormalizedPointerInput> {

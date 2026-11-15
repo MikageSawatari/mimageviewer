@@ -119,6 +119,13 @@ pub struct State {
     modifiers: egui::Modifiers,
 
     pointer_pos_in_points: Option<egui::Pos2>,
+    // winit 0.30.13 keeps Windows MouseState::last_position across CursorLeft
+    // and touch cleanup. On reentry it omits CursorMoved when this same physical
+    // position is unchanged. CursorMoved keeps these caches equal; CursorEntered
+    // restores only that observed position, using the current effective scale.
+    // A new State belongs to a new native allocation and starts without history.
+    #[cfg(target_os = "windows")]
+    last_cursor_position_in_pixels: Option<winit::dpi::PhysicalPosition<f64>>,
     any_pointer_button_down: bool,
     current_cursor_icon: Option<egui::CursorIcon>,
 
@@ -199,6 +206,8 @@ impl State {
             egui_input,
             modifiers: egui::Modifiers::default(),
             pointer_pos_in_points: None,
+            #[cfg(target_os = "windows")]
+            last_cursor_position_in_pixels: None,
             any_pointer_button_down: false,
             current_cursor_icon: None,
             current_custom_cursor: None,
@@ -364,6 +373,88 @@ impl State {
         self.egui_input.take()
     }
 
+    /// Convert one native pointer event without requiring a `Window`.
+    ///
+    /// `pixels_per_point` is the current effective native scale multiplied by
+    /// egui zoom, just as [`pixels_per_point`] supplies for `on_window_event`.
+    /// This owns conversion and the normalized observer exactly once. Other
+    /// event kinds return `None` without modifying input. Window integrations
+    /// should use `on_window_event`, which also handles AccessKit and tracing.
+    pub fn on_pointer_event(
+        &mut self,
+        event: &winit::event::WindowEvent,
+        pixels_per_point: f32,
+    ) -> Option<EventResponse> {
+        let before = self.egui_input.events.len();
+        let response = self.on_pointer_event_inner(event, pixels_per_point)?;
+        pointer_input_observer::observe(
+            &self.egui_ctx,
+            self.viewport_id,
+            event,
+            &mut self.egui_input.events,
+            before,
+        );
+        Some(response)
+    }
+
+    fn on_pointer_event_inner(
+        &mut self,
+        event: &winit::event::WindowEvent,
+        pixels_per_point: f32,
+    ) -> Option<EventResponse> {
+        use winit::event::WindowEvent;
+        Some(match event {
+            WindowEvent::MouseInput { state, button, .. } => {
+                self.on_mouse_button_input(*state, *button);
+                EventResponse {
+                    repaint: true,
+                    consumed: self.egui_ctx.egui_wants_pointer_input(),
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.on_cursor_moved(*position, pixels_per_point);
+                EventResponse {
+                    repaint: true,
+                    consumed: self.egui_ctx.egui_is_using_pointer(),
+                }
+            }
+            WindowEvent::CursorEntered { .. } => {
+                #[cfg(target_os = "windows")]
+                if let Some(position) = self.last_cursor_position_in_pixels {
+                    self.on_cursor_moved(position, pixels_per_point);
+                }
+                EventResponse {
+                    repaint: true,
+                    consumed: false,
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.pointer_pos_in_points = None;
+                self.egui_input.events.push(egui::Event::PointerGone);
+                EventResponse {
+                    repaint: true,
+                    consumed: false,
+                }
+            }
+            WindowEvent::Touch(touch) => {
+                self.on_touch(touch, pixels_per_point);
+                let consumed = match touch.phase {
+                    winit::event::TouchPhase::Started
+                    | winit::event::TouchPhase::Ended
+                    | winit::event::TouchPhase::Cancelled => {
+                        self.egui_ctx.egui_wants_pointer_input()
+                    }
+                    winit::event::TouchPhase::Moved => self.egui_ctx.egui_is_using_pointer(),
+                };
+                EventResponse {
+                    repaint: true,
+                    consumed,
+                }
+            }
+            _ => return None,
+        })
+    }
+
     /// Call this when there is a new event.
     ///
     /// The result can be found in [`Self::egui_input`] and be extracted with [`Self::take_egui_input`].
@@ -431,13 +522,13 @@ impl State {
                     consumed: false,
                 }
             }
-            WindowEvent::MouseInput { state, button, .. } => {
-                self.on_mouse_button_input(*state, *button);
-                EventResponse {
-                    repaint: true,
-                    consumed: self.egui_ctx.egui_wants_pointer_input(),
-                }
-            }
+            WindowEvent::MouseInput { .. }
+            | WindowEvent::CursorMoved { .. }
+            | WindowEvent::CursorEntered { .. }
+            | WindowEvent::CursorLeft { .. }
+            | WindowEvent::Touch(_) => self
+                .on_pointer_event_inner(event, pixels_per_point(&self.egui_ctx, window))
+                .expect("matched pointer event"),
             WindowEvent::MouseWheel { delta, phase, .. } => {
                 self.on_mouse_wheel(window, *delta, *phase);
                 EventResponse {
@@ -445,38 +536,6 @@ impl State {
                     consumed: self.egui_ctx.egui_wants_pointer_input(),
                 }
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                self.on_cursor_moved(window, *position);
-                EventResponse {
-                    repaint: true,
-                    consumed: self.egui_ctx.egui_is_using_pointer(),
-                }
-            }
-            WindowEvent::CursorLeft { .. } => {
-                self.pointer_pos_in_points = None;
-                self.egui_input.events.push(egui::Event::PointerGone);
-                EventResponse {
-                    repaint: true,
-                    consumed: false,
-                }
-            }
-            // WindowEvent::TouchpadPressure {device_id, pressure, stage, ..  } => {} // TODO(emilk)
-            WindowEvent::Touch(touch) => {
-                self.on_touch(touch, pixels_per_point(&self.egui_ctx, window));
-                let consumed = match touch.phase {
-                    winit::event::TouchPhase::Started
-                    | winit::event::TouchPhase::Ended
-                    | winit::event::TouchPhase::Cancelled => {
-                        self.egui_ctx.egui_wants_pointer_input()
-                    }
-                    winit::event::TouchPhase::Moved => self.egui_ctx.egui_is_using_pointer(),
-                };
-                EventResponse {
-                    repaint: true,
-                    consumed,
-                }
-            }
-
             WindowEvent::Ime(ime) => {
                 self.on_ime(ime);
 
@@ -584,7 +643,6 @@ impl State {
 
             // Things that may require repaint:
             WindowEvent::RedrawRequested
-            | WindowEvent::CursorEntered { .. }
             | WindowEvent::Destroyed
             | WindowEvent::Occluded(_)
             | WindowEvent::Resized(_)
@@ -885,11 +943,13 @@ impl State {
 
     fn on_cursor_moved(
         &mut self,
-        window: &Window,
         pos_in_pixels: winit::dpi::PhysicalPosition<f64>,
+        pixels_per_point: f32,
     ) {
-        let pixels_per_point = pixels_per_point(&self.egui_ctx, window);
-
+        #[cfg(target_os = "windows")]
+        {
+            self.last_cursor_position_in_pixels = Some(pos_in_pixels);
+        }
         let pos_in_points = egui::pos2(
             pos_in_pixels.x as f32 / pixels_per_point,
             pos_in_pixels.y as f32 / pixels_per_point,

@@ -233,6 +233,11 @@ impl App {
             let wake = ctx.clone();
             targets.push(NativeDetachedInputTarget {
                 registration,
+                kind: if request.expected_state == DetachedActivationTargetState::ParkedLive {
+                    NativeDetachedInputTargetKind::ParkedLive
+                } else {
+                    NativeDetachedInputTargetKind::Parked
+                },
                 availability: if blocked {
                     NativeTargetAvailability::Blocked
                 } else {
@@ -273,8 +278,15 @@ impl App {
                             }
                             shared.feed_native_activation_boundary(origin, boundary);
                         }
-                        NativeDetachedInputEventKind::NonClient(outcome) => {
+                        NativeDetachedInputEventKind::NonClient(outcome)
+                        | NativeDetachedInputEventKind::NativeMediaTouch(outcome) => {
                             let mut request = request.clone();
+                            if matches!(
+                                event.kind,
+                                NativeDetachedInputEventKind::NativeMediaTouch(_)
+                            ) {
+                                request.source = DetachedActivationSource::NativeMedia;
+                            }
                             request.registration = Some(event.source.registration);
                             request.allocation = Some(event.source.epoch);
                             let decision = match outcome {
@@ -413,14 +425,16 @@ mod tests {
     #[test]
     fn realmachine55_parked_live_caption_button_and_doubleclick_resume_same_context() {
         use windows::Win32::UI::WindowsAndMessaging::{
-            HTCAPTION, HTMAXBUTTON, WM_CAPTURECHANGED, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
-            WM_NCLBUTTONUP,
+            HTCAPTION, HTLEFT, HTMAXBUTTON, WM_CAPTURECHANGED, WM_MOVING, WM_NCLBUTTONDBLCLK,
+            WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_SIZING,
         };
         let _input = crate::key_input::lock_test_input();
-        for (start, hit) in [
-            (WM_NCLBUTTONDOWN, HTCAPTION),
-            (WM_NCLBUTTONDOWN, HTMAXBUTTON),
-            (WM_NCLBUTTONDBLCLK, HTCAPTION),
+        for (start, hit, movement) in [
+            (WM_NCLBUTTONDOWN, HTCAPTION, None),
+            (WM_NCLBUTTONDOWN, HTMAXBUTTON, None),
+            (WM_NCLBUTTONDBLCLK, HTCAPTION, None),
+            (WM_NCLBUTTONDOWN, HTCAPTION, Some(WM_MOVING)),
+            (WM_NCLBUTTONDOWN, HTLEFT, Some(WM_SIZING)),
         ] {
             let (mut app, ctx, id) = realmachine55_parked_media_fixture();
             let context = app.locate_window_context(id).unwrap().0;
@@ -431,6 +445,15 @@ mod tests {
                 crate::key_input::register_test_native_input_allocation(registration, 0x7554);
             app.sync_detached_native_input_targets(&ctx);
             allocation.native_message_for_test(start, hit as usize, 0);
+            if let Some(movement) = movement {
+                let mut rect = windows::Win32::Foundation::RECT {
+                    left: -800,
+                    top: -700,
+                    right: 1000,
+                    bottom: 900,
+                };
+                allocation.native_message_for_test(movement, 0, (&mut rect as *mut _) as isize);
+            }
             if hit == HTMAXBUTTON {
                 allocation.native_message_for_test(WM_NCLBUTTONUP, hit as usize, 0);
             } else {
@@ -478,6 +501,79 @@ mod tests {
             app.detached_activation_admission(&ctx, &request),
             DetachedActivationDecision::NotParked
         );
+    }
+
+    #[test]
+    fn realmachine55_parked_live_native_canvas_touch_drag_resumes_original_context_once() {
+        use crate::video::native_touch::NativeTouchOwnership;
+        use crate::video::native_window::{
+            NativeVideoTouchEvent, NativeVideoTouchPhase as Phase, NativeVideoWindowEventSink,
+            NativeVideoWindowSource as Source, native_window_event_route,
+        };
+        let _input = crate::key_input::lock_test_input();
+        let (mut app, ctx, id) = realmachine55_parked_media_fixture();
+        let context = app.locate_window_context(id).unwrap().0;
+        let registration = ctx
+            .viewport_registration(App::detached_image_window_viewport_id(id))
+            .unwrap();
+        let _allocation =
+            crate::key_input::register_test_native_input_allocation(registration, 0x7559);
+        app.sync_detached_native_input_targets(&ctx);
+        let fault = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (pump, _pump_rx) = native_window_event_route(16, Arc::clone(&fault));
+        pump.publish_native_input_epoch(31);
+        let (render, render_rx) = native_window_event_route(16, fault);
+        let sink = NativeVideoWindowEventSink::new(31, 31, Source::Presenter, pump, render)
+            .with_detached_activation_host(
+                0x7559,
+                Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
+        let mut ownership = NativeTouchOwnership::default();
+        for (phase, x, y) in [
+            (Phase::Start, 100, 200),
+            (Phase::Move, 900, 800),
+            (Phase::End, 1000, 900),
+        ] {
+            sink.owned_touch_for_test(
+                &mut ownership,
+                NativeVideoTouchEvent {
+                    source: Source::Presenter,
+                    pointer_id: 7,
+                    x,
+                    y,
+                    phase,
+                    suppress_widget_primary: false,
+                },
+            );
+        }
+        let shared = Arc::clone(&app.deferred_detached_image_window_views[&id]);
+        let events = shared.drain_events();
+        assert_eq!(
+            events.len(),
+            1,
+            "native canvas End must complete one captured ParkedLive activation"
+        );
+        assert!(
+            render_rx.drain().is_empty(),
+            "ActivateOnly cannot reach normal touch commands"
+        );
+        for event in events {
+            let DeferredDetachedImageWindowEvent::Activation { request } = &event else {
+                panic!("native canvas completion must use the existing activation transport");
+            };
+            assert_eq!(request.source, DetachedActivationSource::NativeMedia);
+            assert_eq!(
+                request.expected_state,
+                DetachedActivationTargetState::ParkedLive
+            );
+            shared.push_event(event);
+        }
+        app.service_deferred_detached_window_events(&ctx);
+        assert!(app.commit_pending_deferred_detached_window_activation(&ctx));
+        assert_eq!(app.active_detached_window_id(), Some(id));
+        assert_eq!(app.active_viewer_context_id(), Some(context));
+        assert!(!app.commit_pending_deferred_detached_window_activation(&ctx));
     }
 
     #[test]

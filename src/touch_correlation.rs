@@ -50,7 +50,7 @@ pub(crate) struct TouchFrame {
     commands: Vec<TouchCommand>,
     command_event_indices: Vec<usize>,
     tap_completion_event_indices: Vec<usize>,
-    stationary_press_completion_event_indices: Vec<usize>,
+    single_contact_completion_event_indices: Vec<usize>,
     gesture_events: Vec<CorrelatedTouchGestureEvent>,
     primary_events: Vec<CorrelatedPrimary>,
     owner: TouchOwner,
@@ -94,7 +94,7 @@ impl TouchFrame {
             commands: Vec::new(),
             command_event_indices: Vec::new(),
             tap_completion_event_indices: Vec::new(),
-            stationary_press_completion_event_indices: Vec::new(),
+            single_contact_completion_event_indices: Vec::new(),
             gesture_events: self.gesture_events.clone(),
             primary_events: self.primary_events.clone(),
             owner: self.owner,
@@ -108,7 +108,7 @@ impl TouchFrame {
     fn suppress_execution(&mut self) {
         self.suppress_commands();
         self.tap_completion_event_indices.clear();
-        self.stationary_press_completion_event_indices.clear();
+        self.single_contact_completion_event_indices.clear();
     }
 
     /// A callback may still own an ordinary completed click while the optional
@@ -143,19 +143,19 @@ impl TouchFrame {
         self.tap_completion_event_indices.contains(&index)
     }
 
-    /// Exact completed single-contact press, with the ordinary drag distance
-    /// but no tap-duration requirement. Only the parked activation owner uses
-    /// this fact; it never authorizes a normal touch command.
-    pub(crate) fn completed_stationary_press_at(&self, index: usize) -> bool {
-        self.stationary_press_completion_event_indices
+    /// Exact completed single-contact operation, independent of tap distance
+    /// and duration. Only the parked activation owner uses this fact; it never
+    /// authorizes a normal touch command.
+    pub(crate) fn completed_single_contact_at(&self, index: usize) -> bool {
+        self.single_contact_completion_event_indices
             .contains(&index)
     }
 
-    /// The raw End was stationary. Its exact synthetic tail may still be
-    /// pending, so this observation alone must not complete an activation.
-    pub(crate) fn stationary_press_ended_at(&self, index: usize) -> bool {
+    /// The raw single-contact End was accepted. Its exact synthetic tail may
+    /// still be pending, so this observation alone cannot complete activation.
+    pub(crate) fn single_contact_ended_at(&self, index: usize) -> bool {
         self.gesture_events.iter().any(|event| {
-            event.index == index && event.kind == TouchGestureEventKind::StationaryPressEnd
+            event.index == index && event.kind == TouchGestureEventKind::SingleContactEnd
         })
     }
 
@@ -207,7 +207,7 @@ impl TouchFrame {
         self.commands.clear();
         self.command_event_indices.clear();
         self.tap_completion_event_indices.clear();
-        self.stationary_press_completion_event_indices.clear();
+        self.single_contact_completion_event_indices.clear();
         self.gesture_events.clear();
         self.scope = CommandScope::Retired;
         self.owner = TouchOwner::Undecided;
@@ -400,14 +400,14 @@ impl TouchCorrelationState {
                     accepted_grid_tap: touch.accepted_grid_tap,
                 });
                 frame.commands.extend(touch.commands);
-                if touch.stationary_press_completed {
+                if touch.single_contact_completed {
                     frame
-                        .stationary_press_completion_event_indices
+                        .single_contact_completion_event_indices
                         .push(event_index);
                 }
                 self.transport.pending = Some(PendingSignature::EndGone(PendingTouch {
                     commands: Vec::new(),
-                    stationary_press_completed: false,
+                    single_contact_completed: false,
                     ..touch
                 }));
                 true
@@ -415,9 +415,9 @@ impl TouchCorrelationState {
             PendingSignature::EndGone(touch) => {
                 if matches!(event, Event::PointerGone) {
                     frame.commands.extend(touch.commands);
-                    if touch.stationary_press_completed {
+                    if touch.single_contact_completed {
                         frame
-                            .stationary_press_completion_event_indices
+                            .single_contact_completion_event_indices
                             .push(event_index);
                     }
                     true
@@ -460,7 +460,7 @@ enum TouchGestureEventKind {
     ContinuingStart,
     ActiveAfter,
     Ended(TouchOwner),
-    StationaryPressEnd,
+    SingleContactEnd,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -482,7 +482,7 @@ struct PendingTouch {
     commands: Vec<TouchCommand>,
     should_suppress: bool,
     accepted_grid_tap: bool,
-    stationary_press_completed: bool,
+    single_contact_completed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -650,7 +650,7 @@ impl Default for TouchCorrelationState {
 struct FrameBuilder {
     commands: Vec<TouchCommand>,
     command_event_indices: Vec<usize>,
-    stationary_press_completion_event_indices: Vec<usize>,
+    single_contact_completion_event_indices: Vec<usize>,
     gesture_events: Vec<CorrelatedTouchGestureEvent>,
     primary_events: Vec<CorrelatedPrimary>,
     ambiguous: bool,
@@ -731,8 +731,8 @@ impl FrameBuilder {
                 commands: self.commands,
                 command_event_indices: self.command_event_indices,
                 tap_completion_event_indices,
-                stationary_press_completion_event_indices: self
-                    .stationary_press_completion_event_indices,
+                single_contact_completion_event_indices: self
+                    .single_contact_completion_event_indices,
                 gesture_events: self.gesture_events,
                 primary_events: self.primary_events,
                 owner,
@@ -770,11 +770,11 @@ impl TouchCorrelationState {
                     touch.commands.clear();
                     touch.ownership = PrimaryOwnership::Retired;
                     touch.accepted_grid_tap = false;
-                    touch.stationary_press_completed = false;
+                    touch.single_contact_completed = false;
                 }
                 PendingSignature::EndGone(touch) => {
                     touch.commands.clear();
-                    touch.stationary_press_completed = false;
+                    touch.single_contact_completed = false;
                 }
                 PendingSignature::CancelGone => {}
             }
@@ -833,11 +833,11 @@ impl TouchCorrelationState {
                     touch.commands.clear();
                     touch.ownership = PrimaryOwnership::Retired;
                     touch.accepted_grid_tap = false;
-                    touch.stationary_press_completed = false;
+                    touch.single_contact_completed = false;
                 }
                 PendingSignature::EndGone(touch) => {
                     touch.commands.clear();
-                    touch.stationary_press_completed = false;
+                    touch.single_contact_completed = false;
                 }
                 PendingSignature::CancelGone => {}
             }
@@ -1054,12 +1054,12 @@ impl TouchCorrelationState {
         let accepted_grid_tap = geometry.behavior == crate::touch_input::TouchSurfaceBehavior::Grid
             && accepted
             && self.recognizer().accepts_grid_tap_end(sample);
-        let stationary_press_completed =
-            accepted && self.recognizer().accepts_stationary_press_end(sample);
-        if stationary_press_completed {
+        let single_contact_completed =
+            accepted && self.recognizer().accepts_single_contact_end(sample);
+        if single_contact_completed {
             frame.gesture_events.push(CorrelatedTouchGestureEvent {
                 index: event_index,
-                kind: TouchGestureEventKind::StationaryPressEnd,
+                kind: TouchGestureEventKind::SingleContactEnd,
             });
         }
         let recognizer_was_active = self.recognizer().is_active();
@@ -1082,7 +1082,7 @@ impl TouchCorrelationState {
                 PrimaryOwnership::Retired
             },
             accepted_grid_tap,
-            stationary_press_completed,
+            single_contact_completed,
             commands,
             // This is sampled only after the raw touch event has updated the
             // recognizer. It is never consulted for an uncorrelated primary.
@@ -1093,9 +1093,9 @@ impl TouchCorrelationState {
             // A different contact has no synthetic pointer events while the
             // egui-winit pointer touch id remains occupied.
             frame.commands.extend(pending.commands);
-            if pending.stationary_press_completed {
+            if pending.single_contact_completed {
                 frame
-                    .stationary_press_completion_event_indices
+                    .single_contact_completion_event_indices
                     .push(event_index);
             }
             return;
@@ -1894,7 +1894,7 @@ mod tests {
     }
 
     #[test]
-    fn realmachine55_stationary_press_fact_preserves_normal_long_press_commands() {
+    fn realmachine55_single_contact_fact_preserves_normal_long_press_commands() {
         let pos = pos2(500.0, 400.0);
         let mut state = TouchCorrelationState::default();
         let start = [
@@ -1905,11 +1905,11 @@ mod tests {
         let first = process(&mut state, &start, 100);
         assert!(first.commands().is_empty());
         let raw_end = process(&mut state, &[touch(1, egui::TouchPhase::End, pos)], 1600);
-        assert!(raw_end.stationary_press_ended_at(0));
-        assert!(raw_end.stationary_press_completion_event_indices.is_empty());
+        assert!(raw_end.single_contact_ended_at(0));
+        assert!(raw_end.single_contact_completion_event_indices.is_empty());
         assert!(raw_end.commands().is_empty());
         let release = process(&mut state, &[primary(pos, false), Event::PointerGone], 1601);
-        assert!(release.completed_stationary_press_at(0));
+        assert!(release.completed_single_contact_at(0));
         assert!(
             release.commands().is_empty(),
             "long press must not become a normal viewer command"
@@ -1918,13 +1918,57 @@ mod tests {
         assert!(
             !release
                 .replay_for_later_passes()
-                .completed_stationary_press_at(0)
+                .completed_single_contact_at(0)
         );
-        assert!(!process(&mut state, &[], 1700).completed_stationary_press_at(0));
+        assert!(!process(&mut state, &[], 1700).completed_single_contact_at(0));
     }
 
     #[test]
-    fn realmachine55_stationary_press_fact_requires_exact_release_and_enabled_owner() {
+    fn realmachine55_drag_completion_waits_for_its_exact_tail_and_never_authorizes_commands() {
+        let start = pos2(100.0, 100.0);
+        let moved = pos2(300.0, 180.0);
+        let mut state = TouchCorrelationState::default();
+        process(
+            &mut state,
+            &[
+                touch(1, egui::TouchPhase::Start, start),
+                Event::PointerMoved(start),
+                primary(start, true),
+            ],
+            100,
+        );
+        let motion = process(
+            &mut state,
+            &[
+                touch(1, egui::TouchPhase::Move, moved),
+                Event::PointerMoved(moved),
+            ],
+            200,
+        );
+        assert!(motion.commands().is_empty());
+        assert!(motion.single_contact_completion_event_indices.is_empty());
+        let raw_end = process(&mut state, &[touch(1, egui::TouchPhase::End, moved)], 1600);
+        assert!(raw_end.single_contact_ended_at(0));
+        assert!(raw_end.single_contact_completion_event_indices.is_empty());
+        assert!(raw_end.commands().is_empty());
+        let release = process(
+            &mut state,
+            &[primary(moved, false), Event::PointerGone],
+            1601,
+        );
+        assert!(release.completed_single_contact_at(0));
+        assert!(!release.completed_tap_at(0));
+        assert!(release.commands().is_empty());
+        assert!(
+            !release
+                .replay_for_later_passes()
+                .completed_single_contact_at(0)
+        );
+        assert!(!process(&mut state, &[], 1700).completed_single_contact_at(0));
+    }
+
+    #[test]
+    fn realmachine55_single_contact_fact_requires_exact_release_and_enabled_owner() {
         let pos = pos2(500.0, 400.0);
         for enabled in [false, true] {
             let mut state = TouchCorrelationState::default();
@@ -1938,7 +1982,7 @@ mod tests {
             state.process_frame(&geometry(), &raw_end, 1600, enabled);
             let wrong = [primary(pos2(100.0, 100.0), false), Event::PointerGone];
             let frame = state.process_frame(&geometry(), &wrong, 1601, enabled);
-            assert!(frame.stationary_press_completion_event_indices.is_empty());
+            assert!(frame.single_contact_completion_event_indices.is_empty());
             assert!(frame.commands().is_empty());
             let mut state = TouchCorrelationState::default();
             state.process_frame(&geometry(), &start, 100, enabled);
@@ -1948,7 +1992,7 @@ mod tests {
                 Event::PointerGone,
             ];
             let frame = state.process_frame(&geometry(), &end, 1600, enabled);
-            assert_eq!(frame.completed_stationary_press_at(1), enabled);
+            assert_eq!(frame.completed_single_contact_at(1), enabled);
             assert!(frame.commands().is_empty());
         }
     }

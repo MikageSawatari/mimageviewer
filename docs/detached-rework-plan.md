@@ -1460,7 +1460,15 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ### 2026-11-15: §1.767 サブPC依頼55 — caption／長押し／ParkedLiveと入力入口の診断
 
-設計担当の指定と独立設計レビュー（Sol / xhigh）の構造合意に従い、captionの同期native操作終端、
+同日の追加決定「案1」を反映し、通常canvasのprimary／単指touchとcaption／resizeのdragは
+操作終端で復帰し、その入力でページ／パンを動かさない。移動量の取消・不要なrect捕捉と閾値を撤去し、
+caption buttonのhit対象外取消とCloseOwnedは維持する。Aはwinitとのcursor位置寿命不一致を
+ソース・赤テストで確認し、Windows全viewportのStateがCursorMovedの物理位置を保持してEnteredで復元する。
+touch／State再生成の寿命もwinit／native allocationへ揃え、前回の診断を残す。
+独立設計レビュー（Sol / xhigh）は根本の入力owner／終端の修正として合意した（BA-7主・BA-1関連）。
+実機のイベント列との対応／part3の座標差は未確認。[追加実装記録 §5.7](depth-parallax-realmachine50-investigation.md#57-利用者決定案1とaの追加修正2026-11-15)を参照。
+
+初回の記録（追加決定前）: 設計担当の指定と独立設計レビュー（Sol / xhigh）の構造合意に従い、captionの同期native操作終端、
 復帰専用の時間に依存しないclick／単指完了、ParkedLiveのNonClient transportと生成時のtyped期待状態を
 既存ownerへ揃える（BA-7主、BA-1関連）。drag取消は今回維持する。Aの反復停止後の入力消失は
 headlessで再現した原因とはせず、App／両backend／Stateの反復対照と押下時の型付き破棄診断を追加し、

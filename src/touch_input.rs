@@ -443,27 +443,19 @@ impl TouchRecognizer {
             })
     }
 
-    /// Input evidence for a parked owner's activation, independent of the
-    /// duration policy for normal viewer commands. This does not change owner,
-    /// suppression, or commands; the adapter must still prove exact transport.
-    pub(crate) fn accepts_stationary_press_end(&self, sample: TouchSample) -> bool {
-        if sample.phase != TouchPhase::End
-            || self.contacts.len() != 1
-            || !matches!(
+    /// Input evidence for a parked owner's activation, independent of normal
+    /// tap distance and duration. This does not change owner, suppression, or
+    /// commands; the adapter must still prove exact transport.
+    pub(crate) fn accepts_single_contact_end(&self, sample: TouchSample) -> bool {
+        sample.phase == TouchPhase::End
+            && self.contacts.len() == 1
+            && matches!(
                 self.owner,
-                TouchOwner::Undecided | TouchOwner::WidgetPassthrough
+                TouchOwner::Undecided
+                    | TouchOwner::WidgetPassthrough
+                    | TouchOwner::ViewerPointerPassthrough
             )
-        {
-            return false;
-        }
-        self.contacts
-            .iter()
-            .find(|contact| contact.id == sample.id)
-            .is_some_and(|contact| {
-                let mut contact = *contact;
-                contact.update(sample.pos);
-                contact.is_stationary_press()
-            })
+            && self.has_contact(sample.id)
     }
 
     fn handle_end(&mut self, geom: &TapZoneGeometry, sample: TouchSample) -> Vec<TouchCommand> {

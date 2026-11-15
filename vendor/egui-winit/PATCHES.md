@@ -120,3 +120,29 @@ Stateにpointer位置がない場合は `PointerPositionUnavailable`、raw押下
 Context共有observerが未設置なら `ObserverNotInstalled`。viewportと現在registrationを併記する。
 入力生成・配送・cursor寿命は変更せず、位置のOS再探索、observerの再設置、retryはしない。
 上流移植時は観測と対処を分け、この診断の代わりに位置推定や入力再生を導入しないこと。
+
+## 依頼55 A: Windowsの同座標再入とpointer位置の寿命（2026-11-15）
+
+winit 0.30.13のWindows backendはWM_MOUSELEAVEでCursorLeftを出すが、
+MouseState::last_positionを保持する。再入時のWM_MOUSEMOVEはCursorEnteredを出しても、
+同client座標ならCursorMovedを省略する。egui-winitがLeftでlogical位置を消した後、
+Enteredで復元しなかったためMouseInputからPointerButtonを作れなかった。
+
+- Windowsの各Stateは最後のCursorMovedの物理位置を保持する。
+  winitのlast_positionと保持位置はCursorMovedごとに一致する。Leftでは従来どおり
+  pointer_pos_in_pointsをNoneにしてPointerGoneを出し、物理位置は保持する。
+  Enteredは保持した値を現在の実効pixels_per_point（native scale×egui zoom）へ変換し、
+  通常のon_cursor_movedと同じPointerMoved生成を通す。後続の別位置Movedはそれを上書きする。
+- Touch End／Cancelのlogical位置清掃では物理mouse位置を消さない（winitも消さない）。
+  新規StateはNoneで始める。Windows eframeのState再作成はnative window再生成と同じ寿命で、
+  別allocation／兄弟Stateへ履歴を引き継がない。根拠範囲に合わせ、Entered復元はWindowsだけとする。
+- `State::on_pointer_event` はWindow不要のpointer-only変換API。
+  normal WindowEvent経路と同じprivate変換helperを使い、normalized observerを一度だけ呼ぶ。
+  normal経路のAccessKit／IME traceとouter observerの位置は維持する。
+  非pointer eventはNone／無変更。Appのheadless反復試験もこの正規変換で実observer／proofを通す。
+
+回帰は同座標Left→Entered→Down、別Movedの上書き、履歴なし、倍率変更、touch終端後、
+root／child分離、新Stateの履歴なし、observer一回を検査する。
+実機の依頼55との対応とpart3の座標差は未観測で、原因機構の証明とは区別する。
+上流へ戻す際はwinitのlast_position／Entered／Movedの契約を再確認し、
+入力の位置推定・OS照会・rect探索・次frameの再送へ置換しないこと。

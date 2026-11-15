@@ -652,7 +652,11 @@ App の host cache は backend lease の撤去で失効する Weak owner を参�
 依頼50 Aのclient復帰は、egui-winitが実際にraw inputを追加する時点のParked input ownerへ結び付く。
 Active時に蓄積した入力を新deferred callbackへ再所属させないため、opaqueなproof IDを非操作の
 `Event::PointerInputProvenance`としてStartと同じ列に置く。callbackのgesture ownerだけが同ID／scopeを照合し、
-完了したclick／tapをactivation intentへ送る。State再生成時の保留RawInput・IME終端は一括clearせず保持する。
+完了したprimary click／long press／drag・単指touchをactivation intentへ送る。
+復帰操作は終端まで消費してページ送り／パンへ再配送しない。State再生成時の保留RawInput・IME終端は一括clearせず保持する。
+Windowsのegui-winit Stateは最後のCursorMovedの物理位置を保持し、CursorLeftではlogical位置だけを消す。
+同座標再入でwinitがCursorMovedを省略しても、CursorEnteredで現在の実効倍率へ戻す。
+新native allocationのStateは履歴なしで始まり、touchのlogical位置清掃や兄弟viewportと履歴を共有しない。
 logical targetはその窓のregistrationの終端／Manager dropで退役し、native allocationの再生成では維持する。
 既に egui に渡した synthetic Primary は通常入力境界で対象 button / widget の所有だけを一度取り消し、通常の click / drag 完了を発生させない。
 synthetic keyもlogical registration／key単位で終端権限を持ち、physical Downへの移譲後は旧repeat／Upで保持を再取得・解除しない。

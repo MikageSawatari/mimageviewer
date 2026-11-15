@@ -7,7 +7,7 @@
 //! registered `ViewportId` before it enters the queue.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -20,12 +20,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    HTCAPTION, HTCLOSE, HTHELP, HTMAXBUTTON, HTMINBUTTON, SC_CLOSE, WM_CANCELMODE,
+    HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLOSE, HTGROWBOX, HTHELP, HTLEFT,
+    HTMAXBUTTON, HTMINBUTTON, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, SC_CLOSE, WM_CANCELMODE,
     WM_CAPTURECHANGED, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOVING, WM_NCDESTROY, WM_NCLBUTTONDBLCLK,
-    WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSEMOVE, WM_NCPOINTERDOWN, WM_NCPOINTERUP,
-    WM_NCPOINTERUPDATE, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE,
-    WM_SIZING, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN,
+    WM_NCLBUTTONUP, WM_NCMOUSEMOVE, WM_NCPOINTERDOWN, WM_NCPOINTERUP, WM_NCPOINTERUPDATE,
+    WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_SYSCOMMAND,
+    WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 const MAX_PENDING_EVENTS: usize = 256;
@@ -1436,7 +1437,6 @@ impl NativeInputAllocationWitness {
                 wparam,
                 lparam,
                 true,
-                Some([10, 10, 410, 310]),
                 NativeMouseOrigin::Ordinary,
             );
             dispatch_native_detached_input();
@@ -1476,6 +1476,19 @@ pub(crate) fn native_input_allocation_witness(
     })
 }
 
+pub(crate) fn native_input_allocation_witness_for_hwnd(
+    hwnd: u64,
+) -> Option<NativeInputAllocationWitness> {
+    let guard = state().lock().ok()?;
+    let entry = guard.installed_hwnds.registration(hwnd)?;
+    Some(NativeInputAllocationWitness {
+        hwnd,
+        epoch: Arc::downgrade(&entry.subclass_owner),
+        #[cfg(test)]
+        registration: entry.logical_registration?,
+    })
+}
+
 /// Attach once during App creation. The canonical producer runs immediately
 /// after egui-winit appends a physical input to the owning State's RawInput.
 /// RootEnter may park that viewport before its callback receives the batch;
@@ -1498,7 +1511,7 @@ pub(crate) fn install_normalized_pointer_input_observer(ctx: &egui::Context) {
     );
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum NormalizedPointerDiscardReason {
     MissingViewportRegistration,
     RegistrationNotInstalled,
@@ -1563,7 +1576,7 @@ fn observe_normalized_pointer_input(
                 registration.viewport_id(),
                 Some(registration),
                 input,
-                NormalizedPointerDiscardReason::GestureOwned(*gesture),
+                NormalizedPointerDiscardReason::GestureOwned(gesture.clone()),
             );
         }
         let pointer_source = match input {
@@ -1723,7 +1736,7 @@ pub(crate) enum NativeInputCancelReason {
     CancelMode,
     FocusLost,
     Escape,
-    Drag,
+    CaptionButtonOutside,
     RetiredRegistration,
 }
 
@@ -1761,6 +1774,7 @@ pub(crate) struct NativeDetachedInputSource {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NativeDetachedInputEventKind {
     NonClient(NativeNonClientOutcome),
+    NativeMediaTouch(NativeNonClientOutcome),
     ClientBoundary(NativeClientInputBoundary),
 }
 
@@ -1774,9 +1788,72 @@ pub(crate) struct NativeDetachedInputEvent {
 #[derive(Clone)]
 pub(crate) struct NativeDetachedInputTarget {
     pub(crate) registration: egui::ViewportRegistration,
+    pub(crate) kind: NativeDetachedInputTargetKind,
     pub(crate) availability: NativeTargetAvailability,
     // Only enqueue into the existing transport. This callback must not enter App.
     pub(crate) sink: Arc<dyn Fn(NativeDetachedInputEvent) + Send + Sync>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeDetachedInputTargetKind {
+    Parked,
+    ParkedLive,
+}
+
+/// Captured at native ingress. A later park, source switch or HWND reuse can
+/// never assign the tail of this physical contact to a new activation owner.
+#[derive(Clone, Debug)]
+pub(crate) struct NativeMediaTouchToken {
+    allocation: NativeInputAllocationWitness,
+    operation: egui::Id,
+    contact: egui::Id,
+    scope: NativeMediaTouchScope,
+}
+
+#[derive(Clone, Debug)]
+struct NativeMediaTouchScope {
+    source_epoch: Arc<AtomicU64>,
+    expected_source_epoch: u64,
+    input_epoch: Arc<AtomicU64>,
+    expected_input_epoch: u64,
+    output_cancel: Arc<AtomicBool>,
+}
+
+impl NativeMediaTouchScope {
+    fn is_current(&self) -> bool {
+        self.source_epoch.load(Ordering::Acquire) == self.expected_source_epoch
+            && self.input_epoch.load(Ordering::Acquire) == self.expected_input_epoch
+            && !self.output_cancel.load(Ordering::Acquire)
+    }
+}
+
+impl PartialEq for NativeMediaTouchScope {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.source_epoch, &other.source_epoch)
+            && self.expected_source_epoch == other.expected_source_epoch
+            && Arc::ptr_eq(&self.input_epoch, &other.input_epoch)
+            && self.expected_input_epoch == other.expected_input_epoch
+            && Arc::ptr_eq(&self.output_cancel, &other.output_cancel)
+    }
+}
+
+impl Eq for NativeMediaTouchScope {}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) enum NativeMediaTouchRoute {
+    #[default]
+    Unstarted,
+    Regular,
+    CommandOwned(NativeMediaTouchToken),
+    ActivateOnly(NativeMediaTouchToken),
+    Suppressed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeMediaTouchPhase {
+    ActivateOnly,
+    CommandOwned,
+    Cancelled(NativeInputCancelReason),
 }
 
 impl std::fmt::Debug for NativeDetachedInputTarget {
@@ -1817,7 +1894,6 @@ enum NativeMouseOrigin {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct NativeNonClientPressTarget {
     hit: u32,
-    screen_position: [i32; 2],
 }
 
 impl NativeNonClientPressTarget {
@@ -1825,15 +1901,24 @@ impl NativeNonClientPressTarget {
         matches!(self.hit, HTMINBUTTON | HTMAXBUTTON | HTHELP)
     }
 
-    fn contains_click(self, location: Self) -> bool {
-        let dx = i64::from(location.screen_position[0]) - i64::from(self.screen_position[0]);
-        let dy = i64::from(location.screen_position[1]) - i64::from(self.screen_position[1]);
-        location.hit == self.hit
-            && dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy)) <= 8 * 8
+    fn is_move_or_resize(self) -> bool {
+        matches!(
+            self.hit,
+            HTCAPTION
+                | HTGROWBOX
+                | HTLEFT
+                | HTRIGHT
+                | HTTOP
+                | HTTOPLEFT
+                | HTTOPRIGHT
+                | HTBOTTOM
+                | HTBOTTOMLEFT
+                | HTBOTTOMRIGHT
+        )
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 enum NativeDetachedGesture {
     #[default]
     Idle,
@@ -1850,7 +1935,12 @@ enum NativeDetachedGesture {
         press_target: NativeNonClientPressTarget,
         phase: NativeNonClientPhase,
         scope: NativeNonClientScope,
-        initial_rect: Option<[i32; 4]>,
+    },
+    NativeMediaTouch {
+        operation: egui::Id,
+        contacts: Vec<egui::Id>,
+        phase: NativeMediaTouchPhase,
+        scope: NativeMediaTouchScope,
     },
 }
 
@@ -1942,6 +2032,18 @@ impl NativeDetachedInputBinding {
         let Self::Bound { gesture, .. } = self else {
             return None;
         };
+        if let NativeDetachedGesture::NativeMediaTouch { phase, .. } = gesture {
+            // Keep all contacts until their native tails drain. In particular,
+            // closing a modal must not revive an older multi-contact stream.
+            return if *phase == NativeMediaTouchPhase::ActivateOnly {
+                *phase = NativeMediaTouchPhase::Cancelled(reason);
+                Some(NativeDetachedInputEventKind::NativeMediaTouch(
+                    NativeNonClientOutcome::Cancelled(reason),
+                ))
+            } else {
+                None
+            };
+        }
         match std::mem::take(gesture) {
             NativeDetachedGesture::Idle => None,
             NativeDetachedGesture::ClientPressed { operation, .. }
@@ -1957,6 +2059,7 @@ impl NativeDetachedInputBinding {
             NativeDetachedGesture::NonClient { .. } => Some(
                 NativeDetachedInputEventKind::NonClient(NativeNonClientOutcome::Cancelled(reason)),
             ),
+            NativeDetachedGesture::NativeMediaTouch { .. } => unreachable!(),
         }
     }
 }
@@ -4664,7 +4767,7 @@ fn native_window_input_failures() -> &'static Mutex<Vec<String>> {
     FAILURES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn report_native_window_input_failure(error: String) {
+pub(crate) fn report_native_window_input_failure(error: String) {
     crate::logger::log(format!("key-input: {error}"));
     if let Ok(mut failures) = native_window_input_failures().lock() {
         failures.push(error);
@@ -5248,7 +5351,7 @@ pub(crate) fn set_native_detached_input_targets(targets: Vec<NativeDetachedInput
             });
             let same_owner = matches!((&entry.native_detached, &target),
                 (NativeDetachedInputBinding::Bound { target: old, .. }, Some(new))
-                    if old.registration == new.registration);
+                    if old.registration == new.registration && old.kind == new.kind);
             if !same_owner
                 || target
                     .as_ref()
@@ -5389,30 +5492,264 @@ fn dispatch_native_detached_input() {
     }
 }
 
-fn native_rect_exceeds_drag(initial: [i32; 4], current: [i32; 4]) -> bool {
-    // Same physical 8 px limit as the removed title-bar polling recognizer.
-    // These rectangles measure this HWND's operation, never identify a HWND.
-    [(0, 1), (2, 3)].into_iter().any(|(x, y)| {
-        let dx = i64::from(current[x]) - i64::from(initial[x]);
-        let dy = i64::from(current[y]) - i64::from(initial[y]);
-        dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy)) > 8 * 8
-    })
+/// Claims only a native presenter canvas contact. HUD contacts join the same
+/// physical group as command owners, so another finger cannot resume a parked
+/// window after the original activation contact has ended.
+pub(crate) fn begin_native_media_touch(
+    allocation: &NativeInputAllocationWitness,
+    contact: egui::Id,
+    source_epoch: Arc<AtomicU64>,
+    input_epoch: Arc<AtomicU64>,
+    expected_input_epoch: u64,
+    output_cancel: Arc<AtomicBool>,
+    canvas: bool,
+    only_contact_in_receiver: bool,
+) -> NativeMediaTouchRoute {
+    let mut route = NativeMediaTouchRoute::Regular;
+    let host = allocation.hwnd;
+    let scope = NativeMediaTouchScope {
+        expected_source_epoch: source_epoch.load(Ordering::Acquire),
+        source_epoch,
+        input_epoch,
+        expected_input_epoch,
+        output_cancel,
+    };
+    if !scope.is_current() {
+        return NativeMediaTouchRoute::Suppressed;
+    }
+    if let Ok(mut guard) = state().lock() {
+        let latest = guard.native_detached_targets.clone();
+        let Some(entry) = guard.installed_hwnds.entries.iter_mut().find(|entry| {
+            entry.hwnd_raw == host
+                && Weak::ptr_eq(&allocation.epoch, &Arc::downgrade(&entry.subclass_owner))
+        }) else {
+            return if canvas {
+                NativeMediaTouchRoute::Suppressed
+            } else {
+                route
+            };
+        };
+        let mut deliveries = Vec::new();
+        let mut retired = Vec::new();
+        if matches!(&entry.native_detached, NativeDetachedInputBinding::Bound {
+            gesture: NativeDetachedGesture::NativeMediaTouch { scope: old, .. }, ..
+        } if !old.is_current())
+        {
+            let kind = entry
+                .native_detached
+                .cancel(NativeInputCancelReason::RetiredRegistration);
+            if let Some(delivery) = kind.and_then(|kind| {
+                entry
+                    .native_detached
+                    .delivery(host, &entry.subclass_owner, kind)
+            }) {
+                deliveries.push(NativeDetachedInputEffect::Deliver(delivery));
+            }
+            if let NativeDetachedInputBinding::Bound { target, gesture } =
+                &mut entry.native_detached
+            {
+                *gesture = NativeDetachedGesture::Idle;
+                if let Some(current) = latest
+                    .iter()
+                    .find(|current| current.registration == target.registration)
+                {
+                    retired.push(NativeDetachedInputEffect::RetireTarget(std::mem::replace(
+                        target,
+                        current.clone(),
+                    )));
+                }
+            }
+        }
+        let NativeDetachedInputBinding::Bound { target, gesture } = &mut entry.native_detached
+        else {
+            return route;
+        };
+        if target.kind != NativeDetachedInputTargetKind::ParkedLive {
+            return route;
+        }
+        let mut kind = None;
+        if *gesture == NativeDetachedGesture::Idle {
+            *gesture = NativeDetachedGesture::NativeMediaTouch {
+                operation: egui::Id::new(("native-media-touch", native_input_sequence())),
+                contacts: Vec::new(),
+                phase: if target.availability == NativeTargetAvailability::Blocked {
+                    NativeMediaTouchPhase::Cancelled(NativeInputCancelReason::ModalOwned)
+                } else if canvas && only_contact_in_receiver {
+                    NativeMediaTouchPhase::ActivateOnly
+                } else {
+                    NativeMediaTouchPhase::CommandOwned
+                },
+                scope: scope.clone(),
+            };
+        }
+        if let NativeDetachedGesture::NativeMediaTouch {
+            operation,
+            contacts,
+            phase,
+            ..
+        } = gesture
+        {
+            if !contacts.contains(&contact) {
+                if !contacts.is_empty() && *phase == NativeMediaTouchPhase::ActivateOnly {
+                    *phase =
+                        NativeMediaTouchPhase::Cancelled(NativeInputCancelReason::PointerCancelled);
+                    kind = Some(NativeDetachedInputEventKind::NativeMediaTouch(
+                        NativeNonClientOutcome::Cancelled(
+                            NativeInputCancelReason::PointerCancelled,
+                        ),
+                    ));
+                }
+                contacts.push(contact);
+            }
+            let token = NativeMediaTouchToken {
+                allocation: allocation.clone(),
+                operation: *operation,
+                contact,
+                scope,
+            };
+            route = if canvas {
+                NativeMediaTouchRoute::ActivateOnly(token)
+            } else {
+                NativeMediaTouchRoute::CommandOwned(token)
+            };
+        } else if canvas {
+            route = NativeMediaTouchRoute::Suppressed;
+        }
+        let delivery = kind.and_then(|kind| {
+            entry
+                .native_detached
+                .delivery(host, &entry.subclass_owner, kind)
+        });
+        if let Some(delivery) = delivery {
+            deliveries.push(NativeDetachedInputEffect::Deliver(delivery));
+        }
+        guard.native_detached_effects.extend(deliveries);
+        guard.native_detached_effects.extend(retired);
+    } else {
+        report_native_window_input_failure(
+            "native canvas touch owner state unavailable".to_string(),
+        );
+        route = NativeMediaTouchRoute::Suppressed;
+    }
+    dispatch_native_detached_input();
+    route
 }
 
-fn native_window_rect(hwnd: u64) -> Option<[i32; 4]> {
-    let mut rect = windows::Win32::Foundation::RECT::default();
-    let result = unsafe {
-        windows::Win32::UI::WindowsAndMessaging::GetWindowRect(HWND(hwnd as *mut _), &mut rect)
-    };
-    match result {
-        Ok(()) => Some([rect.left, rect.top, rect.right, rect.bottom]),
-        Err(error) => {
-            report_native_window_input_failure(format!(
-                "non-client operation GetWindowRect failed hwnd=0x{hwnd:x}: {error}"
-            ));
-            None
+#[derive(Clone, Copy)]
+enum NativeMediaTouchBoundary {
+    Cancel(NativeInputCancelReason),
+    End,
+    Drop,
+}
+
+pub(crate) fn cancel_native_media_touch(
+    token: &NativeMediaTouchToken,
+    reason: NativeInputCancelReason,
+) {
+    transition_native_media_touch(token, NativeMediaTouchBoundary::Cancel(reason));
+}
+
+pub(crate) fn end_native_media_touch(token: &NativeMediaTouchToken, cancelled: bool) {
+    transition_native_media_touch(
+        token,
+        if cancelled {
+            NativeMediaTouchBoundary::Drop
+        } else {
+            NativeMediaTouchBoundary::End
+        },
+    );
+}
+
+fn transition_native_media_touch(
+    token: &NativeMediaTouchToken,
+    boundary: NativeMediaTouchBoundary,
+) {
+    if let Ok(mut guard) = state().lock() {
+        let targets = guard.native_detached_targets.clone();
+        let Some(entry) = guard.installed_hwnds.entries.iter_mut().find(|entry| {
+            entry.hwnd_raw == token.allocation.hwnd
+                && Weak::ptr_eq(
+                    &token.allocation.epoch,
+                    &Arc::downgrade(&entry.subclass_owner),
+                )
+        }) else {
+            return;
+        };
+        let NativeDetachedInputBinding::Bound { gesture, .. } = &mut entry.native_detached else {
+            return;
+        };
+        let NativeDetachedGesture::NativeMediaTouch {
+            operation,
+            contacts,
+            phase,
+            ..
+        } = gesture
+        else {
+            return;
+        };
+        if *operation != token.operation || !contacts.contains(&token.contact) {
+            return;
         }
+        let reason = match boundary {
+            NativeMediaTouchBoundary::Cancel(reason) => Some(reason),
+            NativeMediaTouchBoundary::Drop => Some(NativeInputCancelReason::PointerCancelled),
+            NativeMediaTouchBoundary::End if !token.scope.is_current() => {
+                Some(NativeInputCancelReason::RetiredRegistration)
+            }
+            NativeMediaTouchBoundary::End => None,
+        };
+        let mut kind = None;
+        if let Some(reason) = reason
+            && *phase == NativeMediaTouchPhase::ActivateOnly
+        {
+            *phase = NativeMediaTouchPhase::Cancelled(reason);
+            kind = Some(NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Cancelled(reason),
+            ));
+        }
+        if !matches!(boundary, NativeMediaTouchBoundary::Cancel(_)) {
+            contacts.retain(|contact| *contact != token.contact);
+            if contacts.is_empty() {
+                if *phase == NativeMediaTouchPhase::ActivateOnly {
+                    kind = Some(NativeDetachedInputEventKind::NativeMediaTouch(
+                        NativeNonClientOutcome::Completed,
+                    ));
+                }
+                *gesture = NativeDetachedGesture::Idle;
+            }
+        }
+        let delivery = kind.and_then(|kind| {
+            entry
+                .native_detached
+                .delivery(entry.hwnd_raw, &entry.subclass_owner, kind)
+        });
+        let retired = if let NativeDetachedInputBinding::Bound {
+            target,
+            gesture: NativeDetachedGesture::Idle,
+        } = &mut entry.native_detached
+            && let Some(latest) = targets
+                .iter()
+                .find(|latest| latest.registration == target.registration)
+        {
+            Some(NativeDetachedInputEffect::RetireTarget(std::mem::replace(
+                target,
+                latest.clone(),
+            )))
+        } else {
+            None
+        };
+        if let Some(delivery) = delivery {
+            guard
+                .native_detached_effects
+                .push(NativeDetachedInputEffect::Deliver(delivery));
+        }
+        guard.native_detached_effects.extend(retired);
+    } else {
+        report_native_window_input_failure(
+            "native canvas touch terminal owner state unavailable".to_string(),
+        );
     }
+    dispatch_native_detached_input();
 }
 
 fn native_pointer_cancelled(message: u32, wparam: usize) -> bool {
@@ -5440,7 +5777,7 @@ pub(crate) fn observe_native_detached_message(
     if !native_detached_message_interesting(message) {
         return;
     }
-    native_detached_message(hwnd, None, message, wparam, lparam, false, None);
+    native_detached_message(hwnd, None, message, wparam, lparam, false);
     dispatch_native_detached_input();
 }
 
@@ -5468,8 +5805,6 @@ fn native_detached_message_interesting(message: u32) -> bool {
             | WM_KEYDOWN
             | WM_SYSKEYDOWN
             | WM_CAPTURECHANGED
-            | WM_MOVING
-            | WM_SIZING
             | WM_EXITSIZEMOVE
     )
 }
@@ -5586,10 +5921,7 @@ fn native_non_client_location(
             }
         }
     };
-    Some(NativeNonClientPressTarget {
-        hit,
-        screen_position,
-    })
+    Some(NativeNonClientPressTarget { hit })
 }
 
 fn native_non_client_button_location(
@@ -5633,7 +5965,6 @@ fn native_detached_message(
     wparam: usize,
     lparam: isize,
     dispatching: bool,
-    initial_rect: Option<[i32; 4]>,
 ) {
     native_detached_message_with_origin(
         hwnd,
@@ -5642,7 +5973,6 @@ fn native_detached_message(
         wparam,
         lparam,
         dispatching,
-        initial_rect,
         native_mouse_origin(message),
     );
 }
@@ -5654,7 +5984,6 @@ fn native_detached_message_with_origin(
     wparam: usize,
     lparam: isize,
     dispatching: bool,
-    initial_rect: Option<[i32; 4]>,
     origin: NativeMouseOrigin,
 ) {
     if origin == NativeMouseOrigin::PointerPromotion {
@@ -5732,12 +6061,11 @@ fn native_detached_message_with_origin(
         && *source == observed_source
     {
         // Motion and Up share this owner and the ordered native transcript.
-        // Once outside/dragged, coming back or duplicate hook/subclass delivery
-        // cannot turn this operation into an activation. Caption/resize retain
-        // their existing WM_MOVING/SIZING rectangle rule; close stays OS-owned.
-        if !location.is_some_and(|location| press_target.contains_click(location)) {
+        // The OS button hit-test owns cancellation. Distance within the same
+        // target is immaterial; leaving it is terminal even after returning.
+        if !location.is_some_and(|location| press_target.hit == location.hit) {
             *phase = NativeNonClientPhase::Cancelled(if location.is_some() {
-                NativeInputCancelReason::Drag
+                NativeInputCancelReason::CaptionButtonOutside
             } else {
                 NativeInputCancelReason::CancelMode
             });
@@ -5754,20 +6082,14 @@ fn native_detached_message_with_origin(
             NativeNonClientPhase::CloseOwned
         } else if target.availability == NativeTargetAvailability::Blocked {
             NativeNonClientPhase::Cancelled(NativeInputCancelReason::ModalOwned)
-        } else if initial_rect.is_some() {
-            NativeNonClientPhase::Pressed
         } else {
-            NativeNonClientPhase::Cancelled(NativeInputCancelReason::CancelMode)
+            NativeNonClientPhase::Pressed
         };
         *gesture = NativeDetachedGesture::NonClient {
             source,
-            press_target: NativeNonClientPressTarget {
-                hit,
-                screen_position: native_message_position(lparam),
-            },
+            press_target: NativeNonClientPressTarget { hit },
             phase,
             scope: NativeNonClientScope::InNativeCall,
-            initial_rect,
         };
     } else if let Some(released) = native_pointer_release(message, wparam) {
         match gesture {
@@ -5807,10 +6129,11 @@ fn native_detached_message_with_origin(
         }
     } else if message == WM_EXITSIZEMOVE {
         if let NativeDetachedGesture::NonClient {
-            press_target: NativeNonClientPressTarget { hit: HTCAPTION, .. },
+            press_target,
             phase: phase @ NativeNonClientPhase::Pressed,
             ..
         } = gesture
+            && press_target.is_move_or_resize()
         {
             // The OS modal loop can consume Up without forwarding it through
             // the subclass or PM_REMOVE hook. Its explicit end is conclusive.
@@ -5852,10 +6175,10 @@ fn native_detached_message_with_origin(
                     gesture,
                     NativeDetachedGesture::NonClient {
                         source: NativePointerSource::Mouse,
-                        press_target: NativeNonClientPressTarget { hit: HTCAPTION, .. },
+                        press_target,
                         scope: NativeNonClientScope::InNativeCall,
                         ..
-                    }
+                    } if press_target.is_move_or_resize()
                 ))
             && matches!(
                 gesture,
@@ -5870,18 +6193,6 @@ fn native_detached_message_with_origin(
             )
         {
             Some(NativeInputCancelReason::CaptureLost)
-        } else if dispatching && matches!(message, WM_MOVING | WM_SIZING) && lparam != 0 {
-            if let NativeDetachedGesture::NonClient {
-                initial_rect: Some(initial),
-                ..
-            } = gesture
-            {
-                let rect = unsafe { &*(lparam as *const windows::Win32::Foundation::RECT) };
-                native_rect_exceeds_drag(*initial, [rect.left, rect.top, rect.right, rect.bottom])
-                    .then_some(NativeInputCancelReason::Drag)
-            } else {
-                None
-            }
         } else {
             None
         };
@@ -5902,6 +6213,14 @@ fn native_detached_message_with_origin(
                     kinds.push(native_client_input(
                         operation,
                         NativeClientBoundary::Cancelled(reason),
+                    ));
+                }
+                NativeDetachedGesture::NativeMediaTouch { phase, .. }
+                    if *phase == NativeMediaTouchPhase::ActivateOnly =>
+                {
+                    *phase = NativeMediaTouchPhase::Cancelled(reason);
+                    kinds.push(NativeDetachedInputEventKind::NativeMediaTouch(
+                        NativeNonClientOutcome::Cancelled(reason),
                     ));
                 }
                 _ => {}
@@ -5951,10 +6270,10 @@ fn finish_native_detached_dispatch(hwnd: u64, subclass_id: usize, message: u32) 
         } && *scope == NativeNonClientScope::InNativeCall;
         if native_call_returned
             && *source == NativePointerSource::Mouse
-            && press_target.hit == HTCAPTION
+            && press_target.is_move_or_resize()
             && *phase == NativeNonClientPhase::Pressed
         {
-            // Mouse caption Down/DoubleClick owns the synchronous native
+            // Mouse caption/resize Down/DoubleClick owns the synchronous native
             // operation until DefSubclassProc returns. No later Up is owed.
             *phase = NativeNonClientPhase::Released;
         }
@@ -5964,7 +6283,7 @@ fn finish_native_detached_dispatch(hwnd: u64, subclass_id: usize, message: u32) 
                     NativePointerSource::Mouse => matches!(message, WM_LBUTTONUP | WM_NCLBUTTONUP),
                     NativePointerSource::Pointer(_) => {
                         matches!(message, WM_POINTERUP | WM_NCPOINTERUP)
-                            || (message == WM_EXITSIZEMOVE && press_target.hit == HTCAPTION)
+                            || (message == WM_EXITSIZEMOVE && press_target.is_move_or_resize())
                     }
                 },
                 NativeNonClientPhase::Cancelled(_) | NativeNonClientPhase::CloseOwned => true,
@@ -6092,12 +6411,6 @@ unsafe extern "system" fn main_key_input_subclass_proc(
     let native_interesting = native_detached_message_interesting(msg);
     let native_origin = native_mouse_origin(msg);
     if native_interesting {
-        let initial_rect = matches!(
-            msg,
-            WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK | WM_NCPOINTERDOWN
-        )
-        .then(|| native_window_rect(hwnd_raw))
-        .flatten();
         native_detached_message_with_origin(
             hwnd_raw,
             Some(id),
@@ -6105,7 +6418,6 @@ unsafe extern "system" fn main_key_input_subclass_proc(
             wparam.0,
             lparam.0,
             true,
-            initial_rect,
             native_origin,
         );
         dispatch_native_detached_input();
@@ -6144,8 +6456,8 @@ mod native_detached_tests {
     use super::*;
     use egui_winit::pointer_input_observer::{NormalizedPointerInput, PointerInputSource};
     use windows::Win32::UI::WindowsAndMessaging::{
-        HTCAPTION, HTMAXBUTTON, HTMINBUTTON, SC_MAXIMIZE, WM_NCMOUSEMOVE, WM_NCPOINTERDOWN,
-        WM_NCPOINTERUP,
+        HTCAPTION, HTMAXBUTTON, HTMINBUTTON, SC_MAXIMIZE, WM_MOVING, WM_NCMOUSEMOVE,
+        WM_NCPOINTERDOWN, WM_NCPOINTERUP, WM_SIZING,
     };
 
     struct Fixture {
@@ -6167,6 +6479,7 @@ mod native_detached_tests {
             let captured = Arc::clone(&events);
             let target = NativeDetachedInputTarget {
                 registration,
+                kind: NativeDetachedInputTargetKind::Parked,
                 availability: NativeTargetAvailability::Enabled,
                 sink: Arc::new(move |event| {
                     // Delivery must be outside the input state lock.
@@ -6209,7 +6522,6 @@ mod native_detached_tests {
                 wparam,
                 lparam,
                 true,
-                Some([10, 10, 410, 310]),
                 NativeMouseOrigin::Ordinary,
             );
             dispatch_native_detached_input();
@@ -6223,7 +6535,6 @@ mod native_detached_tests {
                 HTCAPTION as usize,
                 0,
                 true,
-                Some([10, 10, 410, 310]),
                 NativeMouseOrigin::PointerPromotion,
             );
             dispatch_native_detached_input();
@@ -6261,6 +6572,480 @@ mod native_detached_tests {
                 .map(|event| event.kind)
                 .collect()
         }
+
+        fn media(&mut self) {
+            self.target.kind = NativeDetachedInputTargetKind::ParkedLive;
+            let targets = {
+                let guard = state().lock().unwrap();
+                guard
+                    .native_detached_targets
+                    .iter()
+                    .map(|target| {
+                        if target.registration == self.target.registration {
+                            self.target.clone()
+                        } else {
+                            target.clone()
+                        }
+                    })
+                    .collect()
+            };
+            set_native_detached_input_targets(targets);
+        }
+    }
+
+    struct MediaTouchReceivers {
+        _pump: crate::video::native_window::NativeWindowEventReceiver,
+        render: crate::video::native_window::NativeWindowEventReceiver,
+    }
+
+    impl MediaTouchReceivers {
+        fn drain(&self) -> Vec<crate::video::native_window::NativeVideoWindowEventEnvelope> {
+            self.render.drain()
+        }
+    }
+
+    fn media_touch_sink(
+        f: &Fixture,
+        source: crate::video::native_window::NativeVideoWindowSource,
+        epoch: Arc<AtomicU64>,
+    ) -> (
+        crate::video::native_window::NativeVideoWindowEventSink,
+        MediaTouchReceivers,
+    ) {
+        media_touch_sink_for_output(f, source, epoch, Arc::new(AtomicBool::new(false)))
+    }
+
+    fn media_touch_sink_for_output(
+        f: &Fixture,
+        source: crate::video::native_window::NativeVideoWindowSource,
+        epoch: Arc<AtomicU64>,
+        cancel: Arc<AtomicBool>,
+    ) -> (
+        crate::video::native_window::NativeVideoWindowEventSink,
+        MediaTouchReceivers,
+    ) {
+        use crate::video::native_window::*;
+        let fault = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (pump, pump_rx) = native_window_event_route(32, Arc::clone(&fault));
+        pump.publish_native_input_epoch(41);
+        let (render, render_rx) = native_window_event_route(32, fault);
+        (
+            NativeVideoWindowEventSink::new(41, 41, source, pump, render)
+                .with_detached_activation_host(f.hwnd, epoch, cancel),
+            MediaTouchReceivers {
+                _pump: pump_rx,
+                render: render_rx,
+            },
+        )
+    }
+
+    fn media_touch(
+        sink: &crate::video::native_window::NativeVideoWindowEventSink,
+        ownership: &mut crate::video::native_touch::NativeTouchOwnership,
+        source: crate::video::native_window::NativeVideoWindowSource,
+        id: u32,
+        phase: crate::video::native_window::NativeVideoTouchPhase,
+    ) {
+        sink.owned_touch_for_test(
+            ownership,
+            crate::video::native_window::NativeVideoTouchEvent {
+                source,
+                pointer_id: id,
+                x: if phase == crate::video::native_window::NativeVideoTouchPhase::Start {
+                    100
+                } else {
+                    900
+                },
+                y: 400,
+                phase,
+                suppress_widget_primary: false,
+            },
+        );
+    }
+
+    #[test]
+    fn realmachine55_native_canvas_touch_captures_parked_owner_at_start_and_preserves_next_input() {
+        use crate::video::native_touch::NativeTouchOwnership;
+        use crate::video::native_window::{
+            NativeVideoTouchPhase as Phase, NativeVideoWindowSource as Source,
+        };
+        let _serial = lock_test_input();
+        let mut f = Fixture::new("rm55-media-touch-start-owner", 0x7560);
+        let (sink, raw) = media_touch_sink(&f, Source::Presenter, Arc::new(AtomicU64::new(1)));
+        let mut ownership = NativeTouchOwnership::default();
+        media_touch(&sink, &mut ownership, Source::Presenter, 7, Phase::Start);
+        f.media();
+        media_touch(&sink, &mut ownership, Source::Presenter, 7, Phase::Move);
+        media_touch(&sink, &mut ownership, Source::Presenter, 7, Phase::End);
+        assert!(
+            f.take().is_empty(),
+            "a later park cannot relabel an active contact"
+        );
+        assert_eq!(
+            raw.drain().len(),
+            3,
+            "the original regular stream keeps its normal commands"
+        );
+        for phase in [Phase::Start, Phase::Move, Phase::End, Phase::End] {
+            media_touch(&sink, &mut ownership, Source::Presenter, 8, phase);
+        }
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+        assert!(
+            raw.drain().is_empty(),
+            "only the parked canvas stream is consumed"
+        );
+    }
+
+    #[test]
+    fn realmachine55_native_canvas_touch_multi_contact_stays_cancelled_until_all_native_ends() {
+        use crate::video::native_touch::NativeTouchOwnership;
+        use crate::video::native_window::{
+            NativeVideoTouchPhase as Phase, NativeVideoWindowSource as Source,
+        };
+        let _serial = lock_test_input();
+        let mut f = Fixture::new("rm55-media-touch-multi", 0x7561);
+        f.media();
+        let epoch = Arc::new(AtomicU64::new(1));
+        let (canvas, raw_canvas) = media_touch_sink(&f, Source::Presenter, Arc::clone(&epoch));
+        let (hud, raw_hud) = media_touch_sink(&f, Source::Hud, epoch);
+        let mut canvas_owner = NativeTouchOwnership::default();
+        let mut hud_owner = NativeTouchOwnership::default();
+        media_touch(
+            &canvas,
+            &mut canvas_owner,
+            Source::Presenter,
+            7,
+            Phase::Start,
+        );
+        media_touch(&hud, &mut hud_owner, Source::Hud, 8, Phase::Start);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::PointerCancelled)
+            )]
+        );
+        media_touch(&canvas, &mut canvas_owner, Source::Presenter, 7, Phase::End);
+        for phase in [Phase::Start, Phase::End] {
+            media_touch(&canvas, &mut canvas_owner, Source::Presenter, 9, phase);
+        }
+        media_touch(&hud, &mut hud_owner, Source::Hud, 8, Phase::End);
+        assert!(
+            f.take().is_empty(),
+            "remaining HUD contact prevents a third finger from reviving activation"
+        );
+        assert_eq!(
+            raw_hud.drain().len(),
+            2,
+            "existing HUD owner still receives its stream"
+        );
+        assert!(raw_canvas.drain().is_empty());
+        for phase in [Phase::Start, Phase::End] {
+            media_touch(&canvas, &mut canvas_owner, Source::Presenter, 10, phase);
+        }
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+    }
+
+    #[test]
+    fn realmachine55_native_canvas_touch_modal_and_os_cancel_do_not_revive_on_late_end() {
+        use crate::video::native_touch::NativeTouchOwnership;
+        use crate::video::native_window::{
+            NativeVideoTouchPhase as Phase, NativeVideoWindowSource as Source,
+        };
+        let _serial = lock_test_input();
+        let mut f = Fixture::new("rm55-media-touch-cancel", 0x7562);
+        f.media();
+        let (sink, _) = media_touch_sink(&f, Source::Presenter, Arc::new(AtomicU64::new(1)));
+        let mut ownership = NativeTouchOwnership::default();
+        for reason in [
+            NativeInputCancelReason::ModalOwned,
+            NativeInputCancelReason::CancelMode,
+            NativeInputCancelReason::CaptureLost,
+            NativeInputCancelReason::FocusLost,
+            NativeInputCancelReason::Escape,
+        ] {
+            media_touch(&sink, &mut ownership, Source::Presenter, 7, Phase::Start);
+            if reason == NativeInputCancelReason::ModalOwned {
+                let mut blocked = f.target.clone();
+                blocked.availability = NativeTargetAvailability::Blocked;
+                set_native_detached_input_targets(vec![blocked]);
+                set_native_detached_input_targets(vec![f.target.clone()]);
+            } else {
+                ownership.cancel_detached_activation(reason);
+            }
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                    NativeNonClientOutcome::Cancelled(reason)
+                )]
+            );
+            media_touch(&sink, &mut ownership, Source::Presenter, 7, Phase::End);
+            assert!(f.take().is_empty());
+        }
+        for phase in [Phase::Start, Phase::End] {
+            media_touch(&sink, &mut ownership, Source::Presenter, 8, phase);
+        }
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+    }
+
+    #[test]
+    fn realmachine55_native_canvas_touch_source_swap_and_native_drop_preserve_fresh_contact() {
+        use crate::video::native_touch::NativeTouchOwnership;
+        use crate::video::native_window::{
+            NativeVideoTouchPhase as Phase, NativeVideoWindowSource as Source,
+        };
+        let _serial = lock_test_input();
+        let mut f = Fixture::new("rm55-media-touch-source", 0x7563);
+        f.media();
+        let epoch = Arc::new(AtomicU64::new(1));
+        let (sink, _) = media_touch_sink(&f, Source::Presenter, Arc::clone(&epoch));
+        let mut ownership = NativeTouchOwnership::default();
+        media_touch(&sink, &mut ownership, Source::Presenter, 7, Phase::Start);
+        epoch.store(2, Ordering::Release);
+        media_touch(&sink, &mut ownership, Source::Presenter, 7, Phase::End);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::RetiredRegistration)
+            )]
+        );
+        media_touch(&sink, &mut ownership, Source::Presenter, 8, Phase::Start);
+        ownership.clear();
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::PointerCancelled)
+            )]
+        );
+        for phase in [Phase::Start, Phase::End] {
+            media_touch(&sink, &mut ownership, Source::Presenter, 9, phase);
+        }
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+    }
+
+    #[test]
+    fn realmachine55_native_canvas_touch_retired_allocation_cannot_finish_reused_host_or_sibling() {
+        use crate::video::native_touch::NativeTouchOwnership;
+        use crate::video::native_window::{
+            NativeVideoTouchPhase as Phase, NativeVideoWindowSource as Source,
+        };
+        let _serial = lock_test_input();
+        let mut f = Fixture::new("rm55-media-touch-retired", 0x7564);
+        let mut sibling = Fixture::new("rm55-media-touch-retired-sibling", 0x7565);
+        f.media();
+        sibling.media();
+        let (sink, _) = media_touch_sink(&f, Source::Presenter, Arc::new(AtomicU64::new(1)));
+        let (other, _) = media_touch_sink(&sibling, Source::Presenter, Arc::new(AtomicU64::new(1)));
+        let mut old = NativeTouchOwnership::default();
+        let mut fresh = NativeTouchOwnership::default();
+        let mut other_owner = NativeTouchOwnership::default();
+        media_touch(&sink, &mut old, Source::Presenter, 7, Phase::Start);
+        media_touch(&other, &mut other_owner, Source::Presenter, 7, Phase::Start);
+        retire_native_detached_input_target(f.target.registration);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::RetiredRegistration)
+            )]
+        );
+        state()
+            .lock()
+            .unwrap()
+            .unregister_subclass(f.hwnd, f.subclass);
+        dispatch_native_detached_input();
+        let _replacement = register_test_native_input_allocation(f.target.registration, f.hwnd);
+        set_native_detached_input_targets(vec![f.target.clone(), sibling.target.clone()]);
+        let (replacement_sink, _) =
+            media_touch_sink(&f, Source::Presenter, Arc::new(AtomicU64::new(1)));
+        media_touch(
+            &replacement_sink,
+            &mut fresh,
+            Source::Presenter,
+            8,
+            Phase::Start,
+        );
+        media_touch(&sink, &mut old, Source::Presenter, 7, Phase::End);
+        for phase in [Phase::Start, Phase::End] {
+            media_touch(&sink, &mut old, Source::Presenter, 9, phase);
+        }
+        assert!(f.take().is_empty());
+        assert!(sibling.take().is_empty());
+        media_touch(
+            &replacement_sink,
+            &mut fresh,
+            Source::Presenter,
+            8,
+            Phase::End,
+        );
+        media_touch(&other, &mut other_owner, Source::Presenter, 7, Phase::End);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+        assert_eq!(
+            sibling.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+    }
+
+    #[test]
+    fn realmachine55_native_canvas_touch_uses_published_child_epoch_and_preserves_fresh_child() {
+        use crate::video::native_touch::NativeTouchOwnership;
+        use crate::video::native_window::{
+            NativeVideoTouchPhase as Phase, NativeVideoWindowSource as Source,
+        };
+        let _serial = lock_test_input();
+        let mut f = Fixture::new("rm55-media-touch-child-epoch", 0x7566);
+        let mut sibling = Fixture::new("rm55-media-touch-child-epoch-sibling", 0x7567);
+        f.media();
+        sibling.media();
+        let source = Arc::new(AtomicU64::new(1));
+        let (old_sink, _) = media_touch_sink(&f, Source::Presenter, Arc::clone(&source));
+        let (other, _) = media_touch_sink(&sibling, Source::Presenter, Arc::new(AtomicU64::new(1)));
+        let new_sink = old_sink.replacement_input_epoch_for_test(42);
+        let mut old = NativeTouchOwnership::default();
+        let mut new = NativeTouchOwnership::default();
+        let mut other_owner = NativeTouchOwnership::default();
+        for phase in [Phase::Start, Phase::End] {
+            media_touch(&new_sink, &mut new, Source::Presenter, 1, phase);
+        }
+        assert!(
+            f.take().is_empty(),
+            "a candidate child cannot activate before its pump publish"
+        );
+        media_touch(&old_sink, &mut old, Source::Presenter, 2, Phase::Start);
+        media_touch(&other, &mut other_owner, Source::Presenter, 2, Phase::Start);
+        old_sink.publish_input_epoch_for_test(42);
+        for phase in [Phase::Start, Phase::End] {
+            media_touch(&old_sink, &mut old, Source::Presenter, 3, phase);
+        }
+        assert!(
+            f.take().is_empty(),
+            "retired child cannot claim a new native contact"
+        );
+        media_touch(&new_sink, &mut new, Source::Presenter, 4, Phase::Start);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::RetiredRegistration)
+            )]
+        );
+        media_touch(&old_sink, &mut old, Source::Presenter, 2, Phase::End);
+        assert!(
+            f.take().is_empty(),
+            "old child tail cannot finish the new child's operation"
+        );
+        media_touch(&new_sink, &mut new, Source::Presenter, 4, Phase::End);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+        assert!(sibling.take().is_empty());
+        media_touch(&other, &mut other_owner, Source::Presenter, 2, Phase::End);
+        assert_eq!(
+            sibling.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+        media_touch(&new_sink, &mut new, Source::Presenter, 5, Phase::Start);
+        new_sink.publish_input_epoch_for_test(0);
+        media_touch(&new_sink, &mut new, Source::Presenter, 5, Phase::End);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::RetiredRegistration)
+            )]
+        );
+    }
+
+    #[test]
+    fn realmachine55_native_canvas_touch_output_retirement_rejects_old_ingress_and_preserves_fresh_output()
+     {
+        use crate::video::native_touch::NativeTouchOwnership;
+        use crate::video::native_window::{
+            NativeVideoTouchPhase as Phase, NativeVideoWindowSource as Source,
+        };
+        let _serial = lock_test_input();
+        let mut f = Fixture::new("rm55-media-touch-output-retired", 0x7568);
+        let mut sibling = Fixture::new("rm55-media-touch-output-retired-sibling", 0x7569);
+        f.media();
+        sibling.media();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (old_sink, _) = media_touch_sink_for_output(
+            &f,
+            Source::Presenter,
+            Arc::new(AtomicU64::new(1)),
+            Arc::clone(&cancelled),
+        );
+        let (fresh_sink, _) = media_touch_sink(&f, Source::Presenter, Arc::new(AtomicU64::new(2)));
+        let (other, _) = media_touch_sink(&sibling, Source::Presenter, Arc::new(AtomicU64::new(1)));
+        let mut old = NativeTouchOwnership::default();
+        let mut fresh = NativeTouchOwnership::default();
+        let mut other_owner = NativeTouchOwnership::default();
+        media_touch(&old_sink, &mut old, Source::Presenter, 1, Phase::Start);
+        media_touch(&other, &mut other_owner, Source::Presenter, 1, Phase::Start);
+        cancelled.store(true, Ordering::Release);
+        for phase in [Phase::Start, Phase::End] {
+            media_touch(&old_sink, &mut old, Source::Presenter, 2, phase);
+        }
+        assert!(
+            f.take().is_empty(),
+            "output cancellation is authoritative before the next pump tick"
+        );
+        media_touch(&old_sink, &mut old, Source::Presenter, 1, Phase::End);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::RetiredRegistration)
+            )]
+        );
+        media_touch(&fresh_sink, &mut fresh, Source::Presenter, 3, Phase::Start);
+        media_touch(&old_sink, &mut old, Source::Presenter, 1, Phase::End);
+        assert!(
+            f.take().is_empty(),
+            "the retired output's held End cannot finish its successor"
+        );
+        media_touch(&fresh_sink, &mut fresh, Source::Presenter, 3, Phase::End);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+        assert!(sibling.take().is_empty());
+        media_touch(&other, &mut other_owner, Source::Presenter, 1, Phase::End);
+        assert_eq!(
+            sibling.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Completed
+            )]
+        );
     }
 
     #[test]
@@ -6319,7 +7104,7 @@ mod native_detached_tests {
     }
 
     #[test]
-    fn realmachine55_caption_modal_drag_stays_cancelled_at_native_return() {
+    fn realmachine55_caption_modal_drag_completes_at_native_return() {
         use windows::Win32::UI::WindowsAndMessaging::WM_EXITSIZEMOVE;
         let _serial = lock_test_input();
         let f = Fixture::new("rm55-caption-drag", 0x7552);
@@ -6337,9 +7122,134 @@ mod native_detached_tests {
         assert_eq!(
             f.take(),
             vec![NativeDetachedInputEventKind::NonClient(
-                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::Drag)
+                NativeNonClientOutcome::Completed
             )]
         );
+    }
+
+    #[test]
+    fn realmachine55_raw_caption_drag_completes_on_exit_without_up_and_is_not_replayed() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm55-raw-caption-drag", 0x7555);
+        let sibling = Fixture::new("rm55-raw-caption-drag-sibling", 0x7556);
+        let down = (HTCAPTION as usize) << 16 | 7;
+        for moving in [WM_MOVING, WM_SIZING] {
+            f.message(WM_NCPOINTERDOWN, down, 0);
+            sibling.message(WM_NCPOINTERDOWN, down, 0);
+            f.finish(WM_NCPOINTERDOWN);
+            assert!(f.take().is_empty());
+            let mut rect = windows::Win32::Foundation::RECT {
+                left: -800,
+                top: -700,
+                right: 1000,
+                bottom: 900,
+            };
+            f.message(moving, 0, (&mut rect as *mut _) as isize);
+            f.message(WM_EXITSIZEMOVE, 0, 0);
+            f.finish(WM_EXITSIZEMOVE);
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Completed
+                )],
+                "native drag completion retains its original allocation owner"
+            );
+            assert!(sibling.take().is_empty());
+            f.message(WM_NCPOINTERUP, 7, 0);
+            f.finish(WM_NCPOINTERUP);
+            f.finish(WM_EXITSIZEMOVE);
+            assert!(
+                f.take().is_empty(),
+                "late native boundaries cannot replay completion"
+            );
+            sibling.message(WM_NCPOINTERUP, 7, 0);
+            sibling.finish(WM_NCPOINTERDOWN);
+            assert_eq!(
+                sibling.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Completed
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn realmachine55_caption_drag_retains_actual_native_cancellation() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm55-caption-drag-cancel", 0x7557);
+        for (message, wparam, lparam, reason) in [
+            (
+                WM_CAPTURECHANGED,
+                0,
+                0x777,
+                NativeInputCancelReason::CaptureLost,
+            ),
+            (WM_CANCELMODE, 0, 0, NativeInputCancelReason::CancelMode),
+            (WM_KILLFOCUS, 0, 0, NativeInputCancelReason::FocusLost),
+            (WM_KEYDOWN, 0x1b, 0, NativeInputCancelReason::Escape),
+        ] {
+            f.message(WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+            let mut rect = windows::Win32::Foundation::RECT {
+                left: -400,
+                top: -300,
+                right: 1200,
+                bottom: 1000,
+            };
+            f.message(WM_MOVING, 0, (&mut rect as *mut _) as isize);
+            f.message(message, wparam, lparam);
+            f.finish(message);
+            f.finish(WM_NCLBUTTONDOWN);
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Cancelled(reason)
+                )]
+            );
+            f.message(WM_NCLBUTTONUP, HTCAPTION as usize, 0);
+            f.finish(WM_NCLBUTTONUP);
+            assert!(f.take().is_empty());
+        }
+    }
+
+    #[test]
+    fn realmachine55_resize_native_return_and_raw_exit_complete_once() {
+        use windows::Win32::UI::WindowsAndMessaging::HTLEFT;
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm55-native-resize", 0x7558);
+        for start in [WM_NCLBUTTONDOWN, WM_NCPOINTERDOWN] {
+            let hit = if start == WM_NCPOINTERDOWN {
+                (HTLEFT as usize) << 16 | 7
+            } else {
+                HTLEFT as usize
+            };
+            f.message(start, hit, 0);
+            let mut rect = windows::Win32::Foundation::RECT {
+                left: -400,
+                top: 10,
+                right: 410,
+                bottom: 310,
+            };
+            f.message(WM_SIZING, 0, (&mut rect as *mut _) as isize);
+            if start == WM_NCPOINTERDOWN {
+                f.finish(start);
+                assert!(f.take().is_empty());
+                f.message(WM_EXITSIZEMOVE, 0, 0);
+                f.finish(WM_EXITSIZEMOVE);
+            } else {
+                observe_native_detached_message(f.hwnd, WM_CAPTURECHANGED, 0, 0);
+                f.finish(start);
+            }
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Completed
+                )]
+            );
+            f.message(WM_NCPOINTERUP, 7, 0);
+            f.finish(WM_NCPOINTERUP);
+            f.finish(WM_EXITSIZEMOVE);
+            assert!(f.take().is_empty());
+        }
     }
 
     #[test]
@@ -6429,7 +7339,7 @@ mod native_detached_tests {
         assert_eq!(
             f.take(),
             vec![NativeDetachedInputEventKind::NonClient(
-                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::Drag)
+                NativeNonClientOutcome::Completed
             )]
         );
 
@@ -6479,7 +7389,9 @@ mod native_detached_tests {
             assert_eq!(
                 f.take(),
                 vec![NativeDetachedInputEventKind::NonClient(
-                    NativeNonClientOutcome::Cancelled(NativeInputCancelReason::Drag)
+                    NativeNonClientOutcome::Cancelled(
+                        NativeInputCancelReason::CaptionButtonOutside
+                    )
                 )],
                 "release on a different hit-test target must not resume"
             );
@@ -6508,7 +7420,7 @@ mod native_detached_tests {
         assert_eq!(
             f.take(),
             vec![NativeDetachedInputEventKind::NonClient(
-                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::Drag)
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::CaptionButtonOutside)
             )]
         );
         f.message(WM_NCLBUTTONUP, HTMAXBUTTON as usize, point);
@@ -6537,7 +7449,7 @@ mod native_detached_tests {
     }
 
     #[test]
-    fn native_detached_caption_button_far_motion_cancels_inside_same_target() {
+    fn native_detached_caption_button_far_motion_completes_inside_same_target() {
         let _serial = lock_test_input();
         let f = Fixture::new("native-button-far-motion", 0x723);
         f.message(
@@ -6561,7 +7473,7 @@ mod native_detached_tests {
         assert_eq!(
             f.take(),
             vec![NativeDetachedInputEventKind::NonClient(
-                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::Drag)
+                NativeNonClientOutcome::Completed
             )]
         );
     }
@@ -6590,7 +7502,7 @@ mod native_detached_tests {
         assert_eq!(
             f.take(),
             vec![NativeDetachedInputEventKind::NonClient(
-                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::Drag)
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::CaptionButtonOutside)
             )]
         );
         f.message(WM_NCPOINTERDOWN, pointer(HTMINBUTTON, 7), point);
@@ -6599,7 +7511,7 @@ mod native_detached_tests {
         assert_eq!(
             f.take(),
             vec![NativeDetachedInputEventKind::NonClient(
-                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::Drag)
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::CaptionButtonOutside)
             )]
         );
 
