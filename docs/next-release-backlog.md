@@ -49,9 +49,9 @@ skip sample / pre-skip が適用された音声サンプルと frame PTS の関�
 
 ### 1.785 MPEG-TS / PS の seek が keyframe の手前に着地しない — コード調査 (2026-11-14)
 
-- 状態: **実装済み・レビュー待ち**。第4版の [keyframe 確認付き seek 設計](mpeg-keyframe-seek-plan.md) に沿って
-    共通 seek owner・保持列・各 worker の接続・TS/PS の TimeGrid を実装。
-    [実装の検証記録](mpeg-keyframe-seek-verification.md)。独立レビューと設計担当の検収は未完了。
+- 状態: **実装済み・独立レビュー ACCEPT (2026-11-16、gpt-6.1-sol / xhigh、2 巡)・実機確認待ち**。ブランチ `fix-785-mpeg-seek`。
+    第4版の [keyframe 確認付き seek 設計](mpeg-keyframe-seek-plan.md) に沿って共通 seek owner・保持列・各 worker の接続・
+    TS/PS の TimeGrid を実装。[実装の検証記録](mpeg-keyframe-seek-verification.md)。本体 lib 全件と実機 (サブ PC) の確認は未実施。
   時刻原点の補正とは独立した既存不具合で、
   [動画の時刻原点の修正](video-timeline-origin-plan.md) の対象外とする (2026-11-14 設計担当決定)。
 - 観測は同梱 FFmpeg DLL を使った headless probe。製品アプリの起動・実画面確認はしていない。

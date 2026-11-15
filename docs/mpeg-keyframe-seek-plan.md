@@ -1,6 +1,7 @@
 # MPEG-TS / PS の keyframe 確認付き seek (§1.785)
 
 状態: 設計 第 4 版・実装前レビュー ACCEPT WITH CHANGES (P3 2 件を反映済み) (2026-11-15、設計担当 ClaudeCode Opus)。
+実装済み・実装の独立レビュー ACCEPT (2026-11-16、[検証記録](mpeg-keyframe-seek-verification.md))。
 第 1〜3 版は実装前の独立レビュー (gpt-6.1-sol / xhigh) で REJECT になり、その指摘 (§8) を反映した。対象は v5.3.0。経緯は [バックログ §1.785](next-release-backlog.md)、
 時刻の契約は [動画の時刻原点](video-timeline-origin-plan.md)。
 
