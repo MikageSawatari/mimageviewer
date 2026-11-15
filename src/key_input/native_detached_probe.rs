@@ -58,6 +58,7 @@ impl MessageTrace {
         message: u32,
         parameters: Option<(usize, isize)>,
         phase: &'static str,
+        detail: &str,
     ) -> Self {
         let active = trace_sink()
             .lock()
@@ -73,7 +74,7 @@ impl MessageTrace {
                 None => "parameters=not-captured".into(),
             };
             emit(format!(
-                "boundary={phase}.before hwnd=0x{hwnd:x} message=0x{message:04x} {parameters} {}",
+                "boundary={phase}.before hwnd=0x{hwnd:x} message=0x{message:04x} {parameters} {detail} {}",
                 snapshot(hwnd)
             ));
         }

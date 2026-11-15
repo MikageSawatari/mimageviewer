@@ -1558,7 +1558,7 @@ sequence 7のcaption clickはCompleted。表示倍率125%／snap一覧の有無�
 
 **確定点と終端。** HTMINBUTTON／HTMAXBUTTON／HTHELPは、同じ押下のnative call中に
 subclassでdispatchされた一致WM_SYSCOMMANDだけを選択の事実とする。
-押下のDefSubclassProc返却だけで終端し、一致SCがあればCompleted、無ければ
+開始を所有した押下のDefSubclassProc返却（後述のcall tokenで照合）だけで終端し、一致SCがあればCompleted、無ければ
 Cancelled(CaptionButtonOutside)とする。このreasonは「OSがボタンを選択しなかった」の意味になる。
 Upの位置・有無、CaptureLost／FocusLost／CancelMode／Escapeはボタンの採否に使わない。
 targetのblock／retireは既存bindingの取消として維持し、後続SCで復活させない。
@@ -1571,16 +1571,17 @@ hit-test注入用のproduction seamとprobeのrelease_hit traceを撤去する�
 ボタンはReleasedにもAwaitingReleaseにも移らない。これらの共用enum variantは
 caption／resizeなどの非ボタン操作が使うため残す。
 
-**touch／pen。** WM_NCPOINTERDOWNも同じ一致SCだけを採用し、その押下call返却で完結させる。
+**touch／pen（列は未採取）。** WM_NCPOINTERDOWNも同じ一致SCだけを採用し、その押下call返却で完結させる。
 押下返却後のUpやSCを待つ状態は作らない。raw pointerがOSの追跡を同期実行するのか、
 昇格mouseで実行するのかは実機未確認。昇格mouseを別ownerにしない既存規則は維持する。
 
 **probe。** §5.10のautoの事前WM_NCHITTEST確認は本節で置き換える。
-TITLEBARINFOEXの最大化ボタン矩形と送信直前のWindowFromPoint=自窓だけを確認して入力し、
+初回実装ではTITLEBARINFOEXの最大化ボタン矩形と送信直前のWindowFromPoint=自窓だけを確認して入力し、
 実際のWM_NCLBUTTONDOWNのwParamがHTMAXBUTTONであることを観測した後だけWM_SIZEを採用する。
 不一致なら失敗終了し、追加clickは送らない。最大化→復元を各1回、手動／autoの起動方法は§5.10と同じ。
 コピー用 `target/rm56-native-detached-probe/` はexeだけ更新し、DLLは変更しない。
 現在のtraceにはrelease_hitは無く、SC dispatchと押下finish、outcomeを読む。
+送信条件は下記独立レビューP2-4の追加検査を含む。
 
 通知列の新しい判定は次のとおり。hookだけのSCは確定の事実にしない。
 
@@ -1660,6 +1661,111 @@ build出力とのhash一致と6 DLLの旧manifest hash一致を検査した。ex
 
 未確認は実OSでの修正後のmouse／pointer列と、pointerからmouseへの昇格、実機での再開。
 依頼55で1回成功した条件の違いは未解明。全件gate／build-dev／製品起動／probe起動／commit／pushは行わない。
+
+#### 依頼57の独立レビュー指摘への対応（2026-11-15）
+
+基点は `e81ac0d94`。別会話の独立レビュー（Sol / xhigh）はREJECT、OSの確定点へ揃える
+方針には構造的修正として合意した。前節の実装時source reviewのACCEPTは履歴であり、
+この独立レビューの不合格を置き換えない。設計担当の決定に従いP2-1／P2-4を修正し、
+P2-2／P2-3は下記の未確認・既知の残りとして扱う。
+
+**P2-1: callの所有。** message番号だけでは同じHWNDの再入したDown／Upの返却を区別できなかった。
+buttonだけでなくcaption／resizeのDown返却、raw pointerのAwaitingRelease後のUpにも
+同じ欠陥を確認した。subclassがinvocationごとに `NativeDetachedCall`（一意sequence、message、
+wParam）を生成し、既存scopeの `InNativeCall(call)` が開始したcallを所有する。
+finishへ同じtokenを渡し、完全一致する返却だけを採用する。pointer DownではIDも照合する。
+製品側のstack／App field／時間窓は追加しない。一意番号は既存のsequence発行元を使う。
+
+非buttonでDown返却後にUpを待つ場合は、同sourceの実dispatchが `InReleaseCall(call)` を所有する。
+hookが既にReleasedを記録していてもclaimし、入れ子のUpはscopeを上書きしない。
+WM_EXITSIZEMOVEも同じ規則とする。Down内で観測したUpは元Downのscopeを維持する。
+取消済み／CloseOwnedのAwaitingReleaseにおける既存の終端は維持する。
+tokenは「どのnative callの返却か」を証明し、一致SCの採用期間は元Downの動的call期間とする。
+別の物理操作のSCの由来まで新たに推測する仕組みは作らない。
+
+**P2-4: autoの送信前条件。** TITLEBARINFOEXの矩形／WindowFromPointに加え、送信直前に
+GetForegroundWindow=自窓、その前面threadのGetGUIThreadInfo成功かつcaptureが空または自窓、
+Left／Right／Middle／X1／X2のGetAsyncKeyStateのhigh bitがすべて未押下であることを要求する。
+検出可能なAPI失敗も入力せずerrorで終了する。snapshotの採否は純関数に分離して検査する。
+GetAsyncKeyStateの0は未押下とAPI失敗を区別できないというWin32 API固有の限界は残る
+（[Microsoft仕様](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getasynckeystate)で失敗時0、high bitが現在の押下を示すことを確認）。
+これを時間窓や再試行で補わない。検査とSendInput間のOS状態の原子的な固定を保証するものではない。
+
+**P2-2: pointerの前提は未立証、今回は規則を変更しない。** mouseの実測をpointerの実測と扱わない。
+Microsoftの[NCPOINTERDOWN](https://learn.microsoft.com/en-us/windows/win32/inputmsg/wm-ncpointerdown)／
+[NCPOINTERUP](https://learn.microsoft.com/en-us/windows/win32/inputmsg/wm-ncpointerup)は両方の既定処理で
+system actionが起こり得るとしており、Down内での同期完結の証拠にはならない。
+旧Upのhit再照会へは戻さない。同じ再照会の信頼性が実測で否定されたためである。
+次回の実機確認では、メインPCのtouch panelで道具の手動モードを使い、最大化／復元の
+tap、外で離す取消、caption操作を採取する（この作業中は起動しない）。penが使える場合は別logにする。
+
+```powershell
+Set-Location G:\home\mimageviewer-767s2\target\rm56-native-detached-probe
+.\native_detached_probe.exe --log .\main-touch.log
+$LASTEXITCODE
+# penは別runで --log .\main-pen.log。終了は道具自身へのEscまたは×。
+```
+
+| 採取したいpointer列（いずれも未採取） | 現行結果 |
+| --- | --- |
+| NCPOINTERDOWN内で一致SCをdispatchし、そのDownが返却 | Completed |
+| Down返却後、NCPOINTERUP内で一致SCをdispatch | Down返却でCaptionButtonOutside。後のSCでは復活しない |
+| 昇格mouse内で一致SCをdispatch | raw Down call内なら一致SCを採用、raw Down返却後なら取消済みで再開しない。昇格NC mouse自体は別ownerにしない |
+
+probeのwndproc／PM_REMOVE hookは全messageを記録し、NCPOINTERDOWN／UPDATE／UPの
+high-word hitとlow-word pointer ID、POINTERCAPTURECHANGEDのIDを明示する。
+GetCurrentInputMessageSourceのdevice／originまたはAPI errorを記録し、shared reducerのtraceも
+実際に判定したNativeMouseOrigin、dispatch token、返却tokenを記録する。
+pointerのUp／昇格mouseがどのcall期間でSCを起こしたかを照合する。採取成功の実機証拠はまだ無い。
+
+**P2-3: 既知の残り。** 押下を伴わないAlt+Spaceの最大化、Win+Z等からのsnap選択には
+再開の入口が無い。主差分以前からの入口不足であり、案1で列挙したmouse／touch操作とは別に
+利用者の決定が必要なため、設計担当が別途相談する。この回ではコードを変更しない。
+
+**再入の赤テスト。** 旧製品コード `e81ac0d94` に4件を追加し、すべて失敗を確認した。
+commandは `cargo nextest run -p mimageviewer --lib -E 'test(/realmachine57_reentrant/)' --no-fail-fast --test-threads 6`、
+nextest／run-heavy exit 100、証跡は `target/rm57r-red.log`。
+pointerの別ID Down、mouseの同message Down、caption／resize Down、AwaitingReleaseの別ID Upで、
+いずれも入れ子側の返却直後の「結果なし」という期待を破った。
+修正後の最初の焦点は18実行／18成功、exit 0（`target/rm57r-focused.log`）。
+最終版では4件が明示tokenを保存して返却する。さらにUpのhook先行有無×同ID／別ID、
+ExitSizeMoveの同message再入も検査する。既存test seamの互換stackはtest-onlyであり、製品には無い。
+独立source再レビュー（Sol / xhigh）は、P2-1／P2-4への追加P1・P2なし、ACCEPT。
+P2-2／P2-3の見送りを解消済みとは扱わない。
+
+最終gateは指定run-heavy、Owner `codex/767-rm57-review`、gate同士は直列。
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/realmachine57_|caption_button|native_detached_cancel_ends/)' --no-fail-fast --test-threads 6
+cargo nextest run -p mimageviewer --lib -E 'test(/native_detached|non_client|caption|detached_activation|realmachine55_|realmachine57_|parked|native_video/)' --no-fail-fast --test-threads 6
+cargo test -p mimageviewer --features dev-tools --bin native_detached_probe -- --test-threads 6
+cargo build -p mimageviewer --features dev-tools --bin native_detached_probe
+cargo check -p mimageviewer --bin mimageviewer-core
+cargo fmt
+```
+
+| 検証 | 件数／exit code | 証跡 |
+| --- | --- | --- |
+| 旧コードでの再入赤テスト | 4実行／4失敗、exit 100 | `target/rm57r-red.log` |
+| 最終焦点 | 19実行／19成功、exit 0 | `target/rm57r-focused-final.log` |
+| 指定回帰 | 669実行／669成功、exit 0 | `target/rm57r-regression.log` |
+| probe pure unit | 7実行／7成功、exit 0 | `target/rm57r-probe-unit.log` |
+| probe build | 1 exe、exit 0 | `target/rm57r-probe-build.log` |
+| core check | 1 core対象、exit 0 | `target/rm57r-check.log` |
+| 最後の引数なしfmt | exit 0 | `target/rm57r-fmt.log` |
+
+run-heavyはlock領域／G: TEMPへの書込不可の警告に従い、低優先度・6並列で続行した。
+コピー用 `target/rm56-native-detached-probe/native_detached_probe.exe` を新buildへ差替えた。
+33,461,248 bytes、SHA256 `7409a7c8a52a5ccb3cb4bf3b39cecb746b27c4f5687df02e48a802a55b3e4cea`。
+build出力とのhash一致、6 DLLが旧manifestのhashのままであることを確認した。
+exe＋DLLは151,274,512 bytes。PE／hash記録は `target/rm57r-pe-imports.json` と
+同梱 `PE-IMPORTS.json`、READMEも更新した。DLL本体は変更しない。
+
+変更ファイルは `src/key_input.rs`（scope／subclass／test driverと再入回帰）、
+`src/key_input/native_detached_probe.rs`（共有trace）、`src/bin/native_detached_probe.rs`（preflightとpointer trace／unit）、
+本書と `docs/detached-rework-plan.md` の5件。vendor／App field／通常配布物は変更しない。
+未確認はpointerの実列・昇格、修正後の実OS動作とautoの実行。P2-3のkeyboard入口は未対応。
+製品／probe／auto起動、全件gate、build-dev、commit／pushは行わない。
 
 ## 6. 診断（初回調査の案、A実装で導入）
 

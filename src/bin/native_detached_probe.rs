@@ -56,10 +56,14 @@ mod host {
                 HiDpi::{
                     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
                 },
-                Input::KeyboardAndMouse::{
-                    INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
-                    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT,
-                    SendInput,
+                Input::{
+                    GetCurrentInputMessageSource, INPUT_MESSAGE_SOURCE,
+                    KeyboardAndMouse::{
+                        GetAsyncKeyState, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE,
+                        MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE,
+                        MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, SendInput, VK_LBUTTON, VK_MBUTTON,
+                        VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
+                    },
                 },
                 WindowsAndMessaging::*,
             },
@@ -158,19 +162,84 @@ mod host {
             | WM_NCRBUTTONDOWN | WM_NCRBUTTONUP | WM_NCMBUTTONDOWN | WM_NCMBUTTONUP => {
                 Some(wp as isize)
             }
+            WM_NCPOINTERDOWN | WM_NCPOINTERUPDATE | WM_NCPOINTERUP => {
+                Some(((wp >> 16) & 0xffff) as isize)
+            }
             // Captured client messages can be outside the client area. They
             // carry no hit payload; button selection is witnessed by matching SC.
             _ => None,
         }
     }
 
+    fn pointer_id(message: u32, wp: usize) -> Option<u16> {
+        match message {
+            WM_NCPOINTERDOWN
+            | WM_NCPOINTERUPDATE
+            | WM_NCPOINTERUP
+            | WM_POINTERDOWN
+            | WM_POINTERUPDATE
+            | WM_POINTERUP
+            | WM_POINTERCAPTURECHANGED
+            | WM_POINTERENTER
+            | WM_POINTERLEAVE => Some((wp & 0xffff) as u16),
+            _ => None,
+        }
+    }
+
+    fn input_trace(message: u32, wp: usize) -> String {
+        let pointer = pointer_id(message, wp);
+        let mouse = matches!(
+            message,
+            WM_MOUSEMOVE
+                | WM_LBUTTONDOWN
+                | WM_LBUTTONUP
+                | WM_LBUTTONDBLCLK
+                | WM_RBUTTONDOWN
+                | WM_RBUTTONUP
+                | WM_RBUTTONDBLCLK
+                | WM_MBUTTONDOWN
+                | WM_MBUTTONUP
+                | WM_MBUTTONDBLCLK
+                | WM_XBUTTONDOWN
+                | WM_XBUTTONUP
+                | WM_XBUTTONDBLCLK
+                | WM_NCMOUSEMOVE
+                | WM_NCLBUTTONDOWN
+                | WM_NCLBUTTONUP
+                | WM_NCLBUTTONDBLCLK
+                | WM_NCRBUTTONDOWN
+                | WM_NCRBUTTONUP
+                | WM_NCRBUTTONDBLCLK
+                | WM_NCMBUTTONDOWN
+                | WM_NCMBUTTONUP
+                | WM_NCMBUTTONDBLCLK
+                | WM_NCXBUTTONDOWN
+                | WM_NCXBUTTONUP
+                | WM_NCXBUTTONDBLCLK
+        );
+        if pointer.is_none() && !mouse {
+            return String::new();
+        }
+        // Diagnostic source data only: the production subclass remains the sole
+        // gesture recognizer and decides whether a mouse message is promoted.
+        let mut source = INPUT_MESSAGE_SOURCE::default();
+        match unsafe { GetCurrentInputMessageSource(&mut source) } {
+            Ok(()) => format!(
+                " pointer_id={pointer:?} source_device={} source_origin={}",
+                source.deviceType.0, source.originId.0
+            ),
+            Err(error) => format!(" pointer_id={pointer:?} input_source_error={error}"),
+        }
+    }
+
     unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         record(format!(
-            "source=wndproc hwnd=0x{:x} msg=0x{msg:04x} wparam=0x{:x} lparam=0x{:x} hit={:?}",
+            "source=wndproc hwnd=0x{:x} msg=0x{msg:04x} wparam=0x{:x} lparam=0x{:x} hit={:?}{}",
             hwnd.0 as usize,
             wp.0,
             lp.0,
-            message_hit(msg, wp.0)
+            message_hit(msg, wp.0),
+            input_trace(msg, wp.0)
         ));
         let current = phase();
         let next = current.pressed(msg, wp.0);
@@ -216,13 +285,14 @@ mod host {
         if code == HC_ACTION as i32 && wp.0 == PM_REMOVE.0 as usize && lp.0 != 0 {
             let msg = unsafe { &*(lp.0 as *const MSG) };
             record(format!(
-                "source=hook_removed hwnd=0x{:x} msg=0x{:04x} wparam=0x{:x} lparam=0x{:x} message_time={} hit={:?}",
+                "source=hook_removed hwnd=0x{:x} msg=0x{:04x} wparam=0x{:x} lparam=0x{:x} message_time={} hit={:?}{}",
                 msg.hwnd.0 as usize,
                 msg.message,
                 msg.wParam.0,
                 msg.lParam.0,
                 msg.time,
-                message_hit(msg.message, msg.wParam.0)
+                message_hit(msg.message, msg.wParam.0),
+                input_trace(msg.message, msg.wParam.0)
             ));
             observe_removed_message(
                 msg.hwnd.0 as usize as u64,
@@ -265,6 +335,59 @@ mod host {
         )
     }
 
+    #[derive(Clone, Copy)]
+    struct AutoInputSnapshot {
+        foreground_window: usize,
+        foreground_capture: Result<usize, ()>,
+        point_window: usize,
+        mouse_buttons: [i16; 5],
+    }
+
+    fn auto_input_preflight(own: usize, snapshot: AutoInputSnapshot) -> Result<(), &'static str> {
+        if own == 0 || snapshot.foreground_window != own {
+            return Err("probe is not the foreground window; no input sent");
+        }
+        let capture = snapshot
+            .foreground_capture
+            .map_err(|()| "foreground thread capture query failed; no input sent")?;
+        if capture != 0 && capture != own {
+            return Err("another window owns foreground mouse capture; no input sent");
+        }
+        if snapshot.point_window != own {
+            return Err("maximize/restore point is covered by another window; no input sent");
+        }
+        if snapshot.mouse_buttons.into_iter().any(|level| level < 0) {
+            return Err("a mouse button is already held; no input sent");
+        }
+        Ok(())
+    }
+
+    fn check_auto_input(hwnd: HWND, point: POINT) -> Result<(), String> {
+        unsafe {
+            let foreground = GetForegroundWindow();
+            let thread = GetWindowThreadProcessId(foreground, None);
+            let mut info = GUITHREADINFO {
+                cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+                ..Default::default()
+            };
+            let capture = if thread == 0 || GetGUIThreadInfo(thread, &mut info).is_err() {
+                Err(())
+            } else {
+                Ok(info.hwndCapture.0 as usize)
+            };
+            let snapshot = AutoInputSnapshot {
+                foreground_window: foreground.0 as usize,
+                foreground_capture: capture,
+                point_window: WindowFromPoint(point).0 as usize,
+                // The high bit is the current physical level. The low bit is
+                // historical and must not reject a button that is now released.
+                mouse_buttons: [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2]
+                    .map(|button| GetAsyncKeyState(i32::from(button.0))),
+            };
+            auto_input_preflight(hwnd.0 as usize, snapshot).map_err(str::to_owned)
+        }
+    }
+
     fn click_maximize_button(hwnd: HWND) -> Result<(), String> {
         unsafe {
             let mut info = TITLEBARINFOEX {
@@ -295,16 +418,6 @@ mod host {
                 GetSystemMetrics(SM_YVIRTUALSCREEN),
                 GetSystemMetrics(SM_CYVIRTUALSCREEN),
             )?;
-            // Check immediately before input. Never click through another window.
-            if WindowFromPoint(point) != hwnd {
-                return Err(
-                    "maximize/restore point is covered by another window; no input sent".into(),
-                );
-            }
-            record(format!(
-                "source=auto send_click x={} y={} hwnd=0x{:x} hit=await_actual_press",
-                point.x, point.y, hwnd.0 as usize
-            ));
             let mouse = |flags| INPUT {
                 r#type: INPUT_MOUSE,
                 Anonymous: INPUT_0 {
@@ -321,6 +434,13 @@ mod host {
                 mouse(MOUSEEVENTF_LEFTDOWN),
                 mouse(MOUSEEVENTF_LEFTUP),
             ];
+            // Keep all OS ownership/physical-level checks immediately before the
+            // single batch. On rejection there is no press, retry, or cleanup up.
+            check_auto_input(hwnd, point)?;
+            record(format!(
+                "source=auto send_click x={} y={} hwnd=0x{:x} hit=await_actual_press",
+                point.x, point.y, hwnd.0 as usize
+            ));
             let sent = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
             if sent != inputs.len() as u32 {
                 return Err(format!(
@@ -504,6 +624,113 @@ mod host {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn auto_preflight_allows_only_own_foreground_capture_and_unheld_buttons() {
+            let own = 0x1234;
+            let allowed = AutoInputSnapshot {
+                foreground_window: own,
+                foreground_capture: Ok(0),
+                point_window: own,
+                mouse_buttons: [0; 5],
+            };
+            assert_eq!(auto_input_preflight(own, allowed), Ok(()));
+            assert_eq!(
+                auto_input_preflight(
+                    own,
+                    AutoInputSnapshot {
+                        foreground_capture: Ok(own),
+                        ..allowed
+                    }
+                ),
+                Ok(())
+            );
+            // GetAsyncKeyState's historical transition bit is not a held level.
+            assert_eq!(
+                auto_input_preflight(
+                    own,
+                    AutoInputSnapshot {
+                        mouse_buttons: [1; 5],
+                        ..allowed
+                    }
+                ),
+                Ok(())
+            );
+            assert!(auto_input_preflight(0, allowed).is_err());
+            for foreground_window in [0, own + 1] {
+                assert!(
+                    auto_input_preflight(
+                        own,
+                        AutoInputSnapshot {
+                            foreground_window,
+                            ..allowed
+                        }
+                    )
+                    .is_err()
+                );
+            }
+            for foreground_capture in [Err(()), Ok(own + 1)] {
+                assert!(
+                    auto_input_preflight(
+                        own,
+                        AutoInputSnapshot {
+                            foreground_capture,
+                            ..allowed
+                        }
+                    )
+                    .is_err()
+                );
+            }
+            for point_window in [0, own + 1] {
+                assert!(
+                    auto_input_preflight(
+                        own,
+                        AutoInputSnapshot {
+                            point_window,
+                            ..allowed
+                        }
+                    )
+                    .is_err()
+                );
+            }
+            for index in 0..5 {
+                for held in [i16::MIN, -1] {
+                    let mut mouse_buttons = [0; 5];
+                    mouse_buttons[index] = held;
+                    assert!(
+                        auto_input_preflight(
+                            own,
+                            AutoInputSnapshot {
+                                mouse_buttons,
+                                ..allowed
+                            }
+                        )
+                        .is_err(),
+                        "mouse button index {index} with level {held}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn pointer_trace_uses_id_and_non_client_hit_payloads() {
+            let id = 42;
+            let wp = ((HTMAXBUTTON as usize) << 16) | id;
+            for message in [WM_NCPOINTERDOWN, WM_NCPOINTERUPDATE, WM_NCPOINTERUP] {
+                assert_eq!(message_hit(message, wp), Some(HTMAXBUTTON as isize));
+                assert_eq!(pointer_id(message, wp), Some(id as u16));
+            }
+            for message in [
+                WM_POINTERDOWN,
+                WM_POINTERUPDATE,
+                WM_POINTERUP,
+                WM_POINTERCAPTURECHANGED,
+            ] {
+                assert_eq!(message_hit(message, wp), None);
+                assert_eq!(pointer_id(message, wp), Some(id as u16));
+            }
+            assert_eq!(pointer_id(WM_NCLBUTTONDOWN, HTMAXBUTTON as usize), None);
+        }
 
         #[test]
         fn auto_requires_confirmed_size_transitions() {

@@ -1441,7 +1441,9 @@ impl NativeInputAllocationWitness {
                 message,
                 wparam,
                 lparam,
-                true,
+                NativeDetachedDispatch::Subclass(test_native_call(
+                    self.hwnd, subclass, message, wparam,
+                )),
                 NativeMouseOrigin::Ordinary,
             );
             dispatch_native_detached_input();
@@ -1458,8 +1460,10 @@ impl NativeInputAllocationWitness {
             .filter(|entry| Weak::ptr_eq(&self.epoch, &Arc::downgrade(&entry.subclass_owner)))
             .map(InstalledHwnd::subclass_id);
         if let Some(subclass) = subclass {
-            finish_native_detached_dispatch(self.hwnd, subclass, message);
-            dispatch_native_detached_input();
+            if let Some(call) = test_take_native_call(self.hwnd, subclass, message) {
+                finish_native_detached_dispatch(self.hwnd, subclass, call);
+                dispatch_native_detached_input();
+            }
         }
     }
 }
@@ -1882,8 +1886,61 @@ enum NativeNonClientPhase {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeNonClientScope {
-    InNativeCall,
+    InNativeCall(NativeDetachedCall),
     AwaitingRelease,
+    InReleaseCall(NativeDetachedCall),
+}
+
+/// Identity belongs to the subclass invocation, not its message number or hit.
+/// The same HWND and message can synchronously reenter with a different call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeDetachedCall {
+    sequence: u64,
+    message: u32,
+    wparam: usize,
+}
+
+impl NativeDetachedCall {
+    fn new(message: u32, wparam: usize) -> Self {
+        Self {
+            sequence: native_input_sequence(),
+            message,
+            wparam,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NativeDetachedDispatch {
+    Hook,
+    Subclass(NativeDetachedCall),
+}
+
+#[cfg(test)]
+thread_local! {
+    // Compatibility for older fake native drivers that dispatch and return in
+    // separate steps. Reentrancy regressions use the explicit token directly.
+    static TEST_NATIVE_CALLS: std::cell::RefCell<Vec<(u64, usize, NativeDetachedCall)>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+#[cfg(test)]
+fn test_native_call(hwnd: u64, subclass: usize, message: u32, wparam: usize) -> NativeDetachedCall {
+    let call = NativeDetachedCall::new(message, wparam);
+    TEST_NATIVE_CALLS.with(|calls| calls.borrow_mut().push((hwnd, subclass, call)));
+    call
+}
+
+#[cfg(test)]
+fn test_take_native_call(hwnd: u64, subclass: usize, message: u32) -> Option<NativeDetachedCall> {
+    TEST_NATIVE_CALLS.with(|calls| {
+        let mut calls = calls.borrow_mut();
+        let index = calls
+            .iter()
+            .rposition(|(h, s, call)| *h == hwnd && *s == subclass && call.message == message)?;
+        Some(calls.remove(index).2)
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5794,7 +5851,14 @@ pub(crate) fn observe_native_detached_message(
     if !native_detached_message_interesting(message) {
         return;
     }
-    native_detached_message(hwnd, None, message, wparam, lparam, false);
+    native_detached_message(
+        hwnd,
+        None,
+        message,
+        wparam,
+        lparam,
+        NativeDetachedDispatch::Hook,
+    );
     dispatch_native_detached_input();
 }
 
@@ -5884,7 +5948,7 @@ fn native_detached_message(
     message: u32,
     wparam: usize,
     lparam: isize,
-    dispatching: bool,
+    dispatch: NativeDetachedDispatch,
 ) {
     native_detached_message_with_origin(
         hwnd,
@@ -5892,7 +5956,7 @@ fn native_detached_message(
         message,
         wparam,
         lparam,
-        dispatching,
+        dispatch,
         native_mouse_origin(message),
     );
 }
@@ -5903,7 +5967,7 @@ fn native_detached_message_with_origin(
     message: u32,
     wparam: usize,
     lparam: isize,
-    dispatching: bool,
+    dispatch: NativeDetachedDispatch,
     origin: NativeMouseOrigin,
 ) {
     #[cfg(feature = "dev-tools")]
@@ -5911,7 +5975,12 @@ fn native_detached_message_with_origin(
         hwnd,
         message,
         Some((wparam, lparam)),
-        if dispatching { "dispatch" } else { "hook" },
+        if matches!(dispatch, NativeDetachedDispatch::Subclass(_)) {
+            "dispatch"
+        } else {
+            "hook"
+        },
+        &format!("dispatch={dispatch:?} origin={origin:?}"),
     );
     if origin == NativeMouseOrigin::PointerPromotion {
         // The raw pointer owner receives its own Up/cancellation. None of a
@@ -5919,9 +5988,11 @@ fn native_detached_message_with_origin(
         return;
     }
     let pointer_cancelled = native_pointer_cancelled(message, wparam);
-    let non_client_start = dispatching
-        .then(|| native_non_client_start(message, wparam, origin))
-        .flatten();
+    let call = match dispatch {
+        NativeDetachedDispatch::Subclass(call) => Some(call),
+        NativeDetachedDispatch::Hook => None,
+    };
+    let non_client_start = call.and_then(|_| native_non_client_start(message, wparam, origin));
     let Ok(mut guard) = state().lock() else {
         return;
     };
@@ -5992,7 +6063,9 @@ fn native_detached_message_with_origin(
             source,
             press_target: NativeNonClientPressTarget { hit },
             phase,
-            scope: NativeNonClientScope::InNativeCall,
+            scope: NativeNonClientScope::InNativeCall(
+                call.expect("a start belongs to a subclass invocation"),
+            ),
         };
     } else if let Some(released) = native_pointer_release(message, wparam) {
         match gesture {
@@ -6016,14 +6089,23 @@ fn native_detached_message_with_origin(
             NativeDetachedGesture::NonClient {
                 source,
                 press_target,
-                phase: phase @ NativeNonClientPhase::Pressed,
-                ..
+                phase: phase @ (NativeNonClientPhase::Pressed | NativeNonClientPhase::Released),
+                scope,
             } if *source == released && !press_target.is_button() => {
-                *phase = if pointer_cancelled {
-                    NativeNonClientPhase::Cancelled(NativeInputCancelReason::PointerCancelled)
-                } else {
-                    NativeNonClientPhase::Released
-                };
+                if *scope == NativeNonClientScope::AwaitingRelease
+                    && let Some(call) = call
+                {
+                    // The hook may already have seen this Up. Its actual dispatch
+                    // claims the release call once; nested returns cannot replace it.
+                    *scope = NativeNonClientScope::InReleaseCall(call);
+                }
+                if *phase == NativeNonClientPhase::Pressed {
+                    *phase = if pointer_cancelled {
+                        NativeNonClientPhase::Cancelled(NativeInputCancelReason::PointerCancelled)
+                    } else {
+                        NativeNonClientPhase::Released
+                    };
+                }
             }
             _ => {}
         }
@@ -6038,10 +6120,10 @@ fn native_detached_message_with_origin(
             let command = wparam as u32 & 0xfff0;
             if command == SC_CLOSE && !press_target.is_button() {
                 *phase = NativeNonClientPhase::CloseOwned;
-            } else if dispatching
+            } else if call.is_some()
                 && press_target.matches_button_command(command)
                 && *phase == NativeNonClientPhase::Pressed
-                && *scope == NativeNonClientScope::InNativeCall
+                && matches!(scope, NativeNonClientScope::InNativeCall(_))
             {
                 // A matching system action is the native button loop's own
                 // selection fact, including when it consumed Up internally.
@@ -6053,7 +6135,8 @@ fn native_detached_message_with_origin(
     } else if message == WM_EXITSIZEMOVE {
         if let NativeDetachedGesture::NonClient {
             press_target,
-            phase: phase @ NativeNonClientPhase::Pressed,
+            phase: phase @ (NativeNonClientPhase::Pressed | NativeNonClientPhase::Released),
+            scope,
             ..
         } = gesture
             && press_target.is_move_or_resize()
@@ -6061,6 +6144,11 @@ fn native_detached_message_with_origin(
             // The OS modal loop can consume Up without forwarding it through
             // the subclass or PM_REMOVE hook. Its explicit end is conclusive.
             *phase = NativeNonClientPhase::Released;
+            if *scope == NativeNonClientScope::AwaitingRelease
+                && let Some(call) = call
+            {
+                *scope = NativeNonClientScope::InReleaseCall(call);
+            }
         }
     } else {
         let pointer_owner_matches = match *gesture {
@@ -6099,7 +6187,7 @@ fn native_detached_message_with_origin(
                     NativeDetachedGesture::NonClient {
                         source: NativePointerSource::Mouse,
                         press_target,
-                        scope: NativeNonClientScope::InNativeCall,
+                        scope: NativeNonClientScope::InNativeCall(_),
                         ..
                     } if press_target.is_move_or_resize()
                 ))
@@ -6167,9 +6255,16 @@ fn native_detached_message_with_origin(
     guard.native_detached_effects.extend(retired);
 }
 
-fn finish_native_detached_dispatch(hwnd: u64, subclass_id: usize, message: u32) {
+fn finish_native_detached_dispatch(hwnd: u64, subclass_id: usize, call: NativeDetachedCall) {
+    let message = call.message;
     #[cfg(feature = "dev-tools")]
-    let _probe_trace = native_detached_probe::MessageTrace::begin(hwnd, message, None, "finish");
+    let _probe_trace = native_detached_probe::MessageTrace::begin(
+        hwnd,
+        message,
+        None,
+        "finish",
+        &format!("returned_call={call:?}"),
+    );
     let Ok(mut guard) = state().lock() else {
         return;
     };
@@ -6193,10 +6288,15 @@ fn finish_native_detached_dispatch(hwnd: u64, subclass_id: usize, message: u32) 
         ..
     } = gesture
     {
-        let native_call_returned = match source {
-            NativePointerSource::Mouse => matches!(message, WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK),
-            NativePointerSource::Pointer(_) => message == WM_NCPOINTERDOWN,
-        } && *scope == NativeNonClientScope::InNativeCall;
+        let native_call_returned = *scope == NativeNonClientScope::InNativeCall(call)
+            && match source {
+                NativePointerSource::Mouse => {
+                    matches!(message, WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK)
+                }
+                NativePointerSource::Pointer(id) => {
+                    message == WM_NCPOINTERDOWN && *id == (call.wparam & 0xffff) as u64
+                }
+            };
         if press_target.is_button() {
             // The OS button tracking call owns selection and cancellation.
             // Up/hit re-queries and focus/capture side effects are not evidence
@@ -6219,22 +6319,14 @@ fn finish_native_detached_dispatch(hwnd: u64, subclass_id: usize, message: u32) 
                 // operation until DefSubclassProc returns. No later Up is owed.
                 *phase = NativeNonClientPhase::Released;
             }
-            let awaited_release_returned = *scope == NativeNonClientScope::AwaitingRelease
-                && match phase {
-                    NativeNonClientPhase::Released => match source {
-                        NativePointerSource::Mouse => {
-                            matches!(message, WM_LBUTTONUP | WM_NCLBUTTONUP)
-                        }
-                        NativePointerSource::Pointer(_) => {
-                            matches!(message, WM_POINTERUP | WM_NCPOINTERUP)
-                                || (message == WM_EXITSIZEMOVE && press_target.is_move_or_resize())
-                        }
-                    },
-                    NativeNonClientPhase::Cancelled(_) | NativeNonClientPhase::CloseOwned => true,
-                    NativeNonClientPhase::Pressed | NativeNonClientPhase::ButtonActionCommitted => {
-                        false
-                    }
-                };
+            let awaited_release_returned = match *scope {
+                NativeNonClientScope::InReleaseCall(owner) => owner == call,
+                NativeNonClientScope::AwaitingRelease => matches!(
+                    phase,
+                    NativeNonClientPhase::Cancelled(_) | NativeNonClientPhase::CloseOwned
+                ),
+                NativeNonClientScope::InNativeCall(_) => false,
+            };
             if !native_call_returned && !awaited_release_returned {
                 return;
             }
@@ -6355,6 +6447,7 @@ unsafe extern "system" fn main_key_input_subclass_proc(
     _ref_data: usize,
 ) -> LRESULT {
     let hwnd_raw = hwnd.0 as u64;
+    let call = NativeDetachedCall::new(msg, wparam.0);
     let native_interesting = native_detached_message_interesting(msg);
     let native_origin = native_mouse_origin(msg);
     if native_interesting {
@@ -6364,7 +6457,7 @@ unsafe extern "system" fn main_key_input_subclass_proc(
             msg,
             wparam.0,
             lparam.0,
-            true,
+            NativeDetachedDispatch::Subclass(call),
             native_origin,
         );
         dispatch_native_detached_input();
@@ -6392,7 +6485,7 @@ unsafe extern "system" fn main_key_input_subclass_proc(
     if (native_interesting && native_origin != NativeMouseOrigin::PointerPromotion)
         || msg == WM_NCDESTROY
     {
-        finish_native_detached_dispatch(hwnd_raw, id, msg);
+        finish_native_detached_dispatch(hwnd_raw, id, call);
         dispatch_native_detached_input();
     }
     result
@@ -6461,17 +6554,19 @@ mod native_detached_tests {
             }
         }
 
-        fn message(&self, message: u32, wparam: usize, lparam: isize) {
+        fn message(&self, message: u32, wparam: usize, lparam: isize) -> NativeDetachedCall {
+            let call = test_native_call(self.hwnd, self.subclass, message, wparam);
             native_detached_message_with_origin(
                 self.hwnd,
                 Some(self.subclass),
                 message,
                 wparam,
                 lparam,
-                true,
+                NativeDetachedDispatch::Subclass(call),
                 NativeMouseOrigin::Ordinary,
             );
             dispatch_native_detached_input();
+            call
         }
 
         fn promoted_mouse(&self, message: u32) {
@@ -6481,7 +6576,12 @@ mod native_detached_tests {
                 message,
                 HTCAPTION as usize,
                 0,
-                true,
+                NativeDetachedDispatch::Subclass(test_native_call(
+                    self.hwnd,
+                    self.subclass,
+                    message,
+                    HTCAPTION as usize,
+                )),
                 NativeMouseOrigin::PointerPromotion,
             );
             dispatch_native_detached_input();
@@ -6509,7 +6609,14 @@ mod native_detached_tests {
         }
 
         fn finish(&self, message: u32) {
-            finish_native_detached_dispatch(self.hwnd, self.subclass, message);
+            if let Some(call) = test_take_native_call(self.hwnd, self.subclass, message) {
+                self.finish_call(call);
+            }
+        }
+
+        fn finish_call(&self, call: NativeDetachedCall) {
+            TEST_NATIVE_CALLS.with(|calls| calls.borrow_mut().retain(|(_, _, held)| *held != call));
+            finish_native_detached_dispatch(self.hwnd, self.subclass, call);
             dispatch_native_detached_input();
         }
 
@@ -7323,6 +7430,124 @@ mod native_detached_tests {
 
     fn screen_point(x: i16, y: i16) -> isize {
         (u32::from(x as u16) | (u32::from(y as u16) << 16)) as isize
+    }
+
+    #[test]
+    fn realmachine57_reentrant_pointer_down_returns_only_its_own_call() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm57-nested-pointer", 0x7857);
+        let outer = f.message(WM_NCPOINTERDOWN, (HTMAXBUTTON as usize) << 16 | 7, 0);
+        let nested = f.message(WM_NCPOINTERDOWN, (HTCAPTION as usize) << 16 | 8, 0);
+        f.finish_call(nested);
+        assert!(
+            f.take().is_empty(),
+            "contact 8 did not start contact 7's operation"
+        );
+        f.message(WM_SYSCOMMAND, SC_MAXIMIZE as usize, 0);
+        f.finish(WM_SYSCOMMAND);
+        assert!(f.take().is_empty());
+        f.finish_call(outer);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+    }
+
+    #[test]
+    fn realmachine57_reentrant_mouse_down_returns_only_its_own_call() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm57-nested-mouse", 0x7858);
+        let outer = f.message(WM_NCLBUTTONDOWN, HTMAXBUTTON as usize, 0);
+        let nested = f.message(WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+        f.finish_call(nested);
+        assert!(
+            f.take().is_empty(),
+            "a nested Down cannot return the outer Down"
+        );
+        f.message(WM_SYSCOMMAND, SC_MAXIMIZE as usize, 0);
+        f.finish(WM_SYSCOMMAND);
+        f.finish_call(outer);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+    }
+
+    #[test]
+    fn realmachine57_reentrant_caption_and_resize_return_only_their_own_call() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm57-nested-caption", 0x7859);
+        for hit in [HTCAPTION, HTLEFT] {
+            let outer = f.message(WM_NCLBUTTONDOWN, hit as usize, 0);
+            let nested = f.message(WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+            f.finish_call(nested);
+            assert!(
+                f.take().is_empty(),
+                "caption/resize belongs to the outer call too"
+            );
+            f.finish_call(outer);
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Completed
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn realmachine57_reentrant_pointer_release_returns_only_its_own_call() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm57-nested-up", 0x7860);
+        for hook_first in [false, true] {
+            for nested_id in [7, 8] {
+                let down = f.message(WM_NCPOINTERDOWN, (HTCAPTION as usize) << 16 | 7, 0);
+                f.finish_call(down);
+                assert!(f.take().is_empty());
+                if hook_first {
+                    observe_native_detached_message(f.hwnd, WM_NCPOINTERUP, 7, 0);
+                }
+                let own_up = f.message(WM_NCPOINTERUP, 7, 0);
+                let nested_up = f.message(WM_NCPOINTERUP, nested_id, 0);
+                f.finish_call(nested_up);
+                assert!(
+                    f.take().is_empty(),
+                    "even the same contact cannot return another call"
+                );
+                f.finish_call(own_up);
+                assert_eq!(
+                    f.take(),
+                    vec![NativeDetachedInputEventKind::NonClient(
+                        NativeNonClientOutcome::Completed
+                    )]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn realmachine57_reentrant_exit_size_move_returns_only_its_own_call() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm57-nested-exit", 0x7861);
+        let down = f.message(WM_NCPOINTERDOWN, (HTCAPTION as usize) << 16 | 7, 0);
+        f.finish_call(down);
+        assert!(f.take().is_empty());
+        observe_native_detached_message(f.hwnd, WM_EXITSIZEMOVE, 0, 0);
+        let own_exit = f.message(WM_EXITSIZEMOVE, 0, 0);
+        let nested_exit = f.message(WM_EXITSIZEMOVE, 0, 0);
+        f.finish_call(nested_exit);
+        assert!(f.take().is_empty());
+        f.finish_call(own_exit);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Completed
+            )]
+        );
     }
 
     #[test]

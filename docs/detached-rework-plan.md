@@ -1460,6 +1460,12 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ### 2026-11-15: §1.767 サブPC依頼57 — caption buttonの確定点を一致SCに統一
 
+独立レビュー（e81ac0d94基準、Sol / xhigh、REJECT）のP2-1／P2-4を反映。
+既存native scopeがsubclass invocation tokenを所有し、開始したDown／claimしたUp・ExitSizeMoveの
+返却だけを終端にする（button／caption／resizeの再入を同じ所有で解決、BA-7）。
+probe autoは送信直前のforeground／前面thread capture／全mouse button未押下も要求する。
+pointer列の未採取とkeyboard最大化の入口不足は設計担当決定により未対応として記録する。
+
 依頼57の実OS列で、release位置のWM_NCHITTESTがOSのbutton選択と一致しないことを確認した
 （観測者: サブPC担当）。MIN／MAX／HELPは同じ押下native call内の一致WM_SYSCOMMANDだけで確定し、
 押下call返却だけで終端する。buttonの位置照合とrelease待ちを撤去し、block／retireと
