@@ -1482,65 +1482,6 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.small("行数を増やすと長い名前を折り返して表示します。収まらない部分は省略します。");
     });
     ui.add_space(12.0);
-    anchored(ui, state, "thumbnail/favorite-view-state", |ui, state| {
-        ui.checkbox(
-            &mut state.settings.remember_favorite_view_state,
-            "お気に入りごとに表示状態を記憶する",
-        );
-        ui.small(
-            "お気に入り配下で、サムネイル／詳細、サムネイルサイズと比率、一覧の並べ方とソート、単ページ／見開き、連結方式を自動で記憶します。",
-        );
-        ui.small(
-            "ツールチップの表示項目と、詳細一覧の列設定・選択列はすべての場所で共通です。OFF にしても保存済みの状態は残ります。",
-        );
-        favorite_standard_settings_notice(ui, state);
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    state.favorite_view_state_entry_count > 0,
-                    egui::Button::new("保存済みの表示状態をすべてクリア…"),
-                )
-                .clicked()
-            {
-                state.favorite_view_state_clear_confirm_open = true;
-            }
-            ui.weak(format!(
-                "保存済み: {} 件",
-                state.favorite_view_state_entry_count
-            ));
-        });
-        if let Some(message) = state.favorite_view_state_clear_result.as_deref() {
-            ui.small(message);
-        }
-    });
-
-    if state.favorite_view_state_clear_confirm_open {
-        let mut clear = false;
-        let mut cancel = false;
-        let response = egui::Modal::new(egui::Id::unique("favorite_view_state_clear_confirm"))
-            .show(ui.ctx(), |ui| {
-                ui.set_min_width(420.0);
-                ui.heading("お気に入りの表示状態をすべてクリアしますか？");
-                ui.label("お気に入り本体は削除されません。次回入ったときに改めて記憶します。");
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("すべてクリア").clicked() {
-                        clear = true;
-                    }
-                    if ui.button("キャンセル").clicked() {
-                        cancel = true;
-                    }
-                });
-            });
-        if clear {
-            state.favorite_view_state_clear_requested = true;
-            state.favorite_view_state_clear_confirm_open = false;
-        } else if cancel || response.should_close() {
-            state.favorite_view_state_clear_confirm_open = false;
-        }
-    }
-
-    ui.add_space(12.0);
     ui.separator();
     ui.add_space(8.0);
     anchored(ui, state, "thumbnail/rating-sort-unrated", |ui, state| {
@@ -1568,11 +1509,13 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.separator();
     ui.add_space(8.0);
     anchored(ui, state, "thumbnail/category-order", |ui, state| {
-        let s = &mut state.settings;
         ui.label(egui::RichText::new("グリッドのカテゴリ表示順").strong());
         ui.small(
         "各カテゴリを表示する行を選びます。同じ行のカテゴリは、現在のソート順で混ぜて表示します。空の行は表示時に詰められます。",
     );
+        // このページで唯一お気に入りごとに記憶する項目 (FavoriteViewState::grid_display_order)。
+        favorite_standard_settings_notice(ui, state);
+        let s = &mut state.settings;
         ui.add_space(4.0);
         egui::Grid::new("grid_category_display_order")
             .num_columns(5)
@@ -1749,6 +1692,77 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
             "閲覧履歴: 閲覧位置",
         );
     });
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
+    draw_favorite_view_state_section(ui, state);
+}
+
+/// サムネイルページ末尾の「お気に入りごとの表示状態」の区切り。
+///
+/// お気に入りごとに記憶するのは `settings::FavoriteViewState` の項目だけで、このページの
+/// ほかの設定は含まない。名前・アイコンの設定のすぐ後に見出しなしで置いていた時期に、
+/// 上に並んだ設定まで切り替わると読まれた (2026-11-15) ため、独立した見出しの下に置き、
+/// 記憶する項目と共通の項目を区切りの中で書き分ける。記憶する項目を変えたら説明も直す。
+pub(super) fn draw_favorite_view_state_section(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    anchored(ui, state, "thumbnail/favorite-view-state", |ui, state| {
+        ui.label(egui::RichText::new("お気に入りごとの表示状態").strong());
+        ui.checkbox(
+            &mut state.settings.remember_favorite_view_state,
+            "お気に入りごとに表示状態を記憶する",
+        );
+        ui.small(
+            "お気に入り配下で、次の項目だけをその場所専用に自動で記憶します: サムネイル／詳細、サムネイルサイズと比率、グリッドのカテゴリ表示順、ソート、単ページ／見開き、連結方式、指定サイズの幅・高さ。",
+        );
+        ui.small(
+            "このページのほかの設定 (種類アイコン、表表紙の自動切り出し、名前の表示、ツールチップの項目など) と、詳細一覧の列設定・選択列は、すべての場所で共通です。OFF にしても保存済みの状態は残ります。",
+        );
+        favorite_standard_settings_notice(ui, state);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    state.favorite_view_state_entry_count > 0,
+                    egui::Button::new("保存済みの表示状態をすべてクリア…"),
+                )
+                .clicked()
+            {
+                state.favorite_view_state_clear_confirm_open = true;
+            }
+            ui.weak(format!(
+                "保存済み: {} 件",
+                state.favorite_view_state_entry_count
+            ));
+        });
+        if let Some(message) = state.favorite_view_state_clear_result.as_deref() {
+            ui.small(message);
+        }
+    });
+
+    if state.favorite_view_state_clear_confirm_open {
+        let mut clear = false;
+        let mut cancel = false;
+        let response = egui::Modal::new(egui::Id::unique("favorite_view_state_clear_confirm"))
+            .show(ui.ctx(), |ui| {
+                ui.set_min_width(420.0);
+                ui.heading("お気に入りの表示状態をすべてクリアしますか？");
+                ui.label("お気に入り本体は削除されません。次回入ったときに改めて記憶します。");
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("すべてクリア").clicked() {
+                        clear = true;
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if clear {
+            state.favorite_view_state_clear_requested = true;
+            state.favorite_view_state_clear_confirm_open = false;
+        } else if cancel || response.should_close() {
+            state.favorite_view_state_clear_confirm_open = false;
+        }
+    }
 }
 
 pub(super) fn draw_book_resume_meter_settings(
