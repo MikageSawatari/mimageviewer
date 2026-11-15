@@ -3043,10 +3043,11 @@ viewport へ切り替わる間に新 viewport がフォーカスを取るまで�
 音楽ビューの左は「ジャンプ / 文字起こし」の2タブ。Appがnative動画と同じsnapshotを作り、
 共通一覧rendererへ渡す。tab/follow/scrollはviewer contextとsourceに属する現在のmusic panel sessionが持ち、
 閉鎖・動画とのmode遷移で破棄する。右情報にも同snapshotの状態1行を出す。
-文字起こしの時刻はコンテナ開始を0とし、`video::transcript_time` だけでraw再生秒への `T + container_start` と逆を行う。
-原点はdecoderが既に開くInputからVideoInfoへ渡し、UI再probeはしない。未知の間は行のseekを禁止する。
-既存seekの `[0, duration_secs - 0.1]` 制限は、原点が非0のTS等で末尾へ移れない既存の再生側の問題として維持する。
-文字起こし専用のclampや迂回は設けない（[ASR計画 §8.3](local-asr-transcript-plan.md#83-時刻の精度)）。
+文字起こしの保存時刻は再生側と同じメディア時刻。抽出のInputに属する `MediaTimeline` が原点を処理し、
+表示の強調と行からのseekは保存時刻を直接使う。UIでの再probe・原点待ち・表示側の加減算は不要。
+TS/PSはO_eff基準、正の開始時刻を持つMKVも再生側と同じ原点0を使い、音声の先頭遅延を保持する。
+既存seekの `[0, duration_secs - 0.1]` 制限を共用し、文字起こし専用のclampや迂回は設けない
+（[ASR計画 §8.3](local-asr-transcript-plan.md#83-時刻の精度)）。
 
 音声ファイル (`GridItem::Audio`) の再生と、動画再生中に映像をカットして音声だけ聴く
 「動画→音声モード」は、どちらも同じ再生エンジンを使い、映像面を egui の音楽ビュー overlay

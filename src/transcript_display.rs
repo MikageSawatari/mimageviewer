@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use crate::transcript_db::{TranscriptSegment, TranscriptStatus};
 use crate::transcript_display_cache::TranscriptDisplayValue;
-use crate::video::transcript_time::TranscriptTimeMapping;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum TranscriptDataState {
@@ -34,7 +33,6 @@ pub(crate) struct TranscriptSnapshot {
     pub used_audio_stream: Option<usize>,
     pub applied_audio_stream: Option<usize>,
     pub created_at: Option<i64>,
-    pub time_mapping: TranscriptTimeMapping,
 }
 
 impl TranscriptSnapshot {
@@ -56,7 +54,6 @@ impl TranscriptSnapshot {
             && self.used_audio_stream == other.used_audio_stream
             && self.applied_audio_stream == other.applied_audio_stream
             && self.created_at == other.created_at
-            && self.time_mapping == other.time_mapping
     }
 
     pub fn notice(&self) -> Option<String> {
@@ -114,20 +111,18 @@ impl TranscriptSnapshot {
     }
 }
 
-/// snapshot 作成の正本。呼出側は現在のキー、cache値、job所属、applied、時刻原点だけを渡す。
+/// snapshot 作成の正本。保存時刻はメディア時刻なので、再生metadataの原点を必要としない。
 pub(crate) fn build_transcript_snapshot(
     key: String,
     value: Option<&TranscriptDisplayValue>,
     activity: TranscriptActivity,
     applied_audio_stream: Option<usize>,
-    time_mapping: TranscriptTimeMapping,
 ) -> TranscriptSnapshot {
     let mut snapshot = TranscriptSnapshot {
         key,
         state: TranscriptDataState::Loading,
         activity,
         applied_audio_stream,
-        time_mapping,
         ..Default::default()
     };
     let Some(value) = value else {

@@ -8477,7 +8477,6 @@ pub(crate) mod tests {
                     (10000,14000,"行の時刻を押すと、その言葉の少し前から再生します。".into()),
                 ]),
                 used_audio_stream:Some(1),applied_audio_stream:Some(2),
-                time_mapping:crate::video::transcript_time::TranscriptTimeMapping::raw_pts(10.0),
                 ..Default::default()
             }
         };
@@ -8493,7 +8492,7 @@ pub(crate) mod tests {
                 let main_text_color = ctx.global_style().visuals.text_color();
                 // native の独立した暗色 Context を、実 window を作らず同じ描画関数で再現する。
                 crate::os_theme::with_dark_context_style(&ctx,|| {
-                    draw_native_video_left_panel(&ctx,650.0,64.0,11.5,&[],&HashMap::new(),None,&mut None,&mut None,
+                    draw_native_video_left_panel(&ctx,650.0,64.0,1.5,&[],&HashMap::new(),None,&mut None,&mut None,
                         &mut NativeVideoLeftPanelTab::Transcript,&snapshot,state,&mut NativeVideoAdjustmentTab::ColorTone,
                         &mut crate::creative_lut::VideoAdjustments::default(),&mut crate::settings::VideoScaleFilter::OsDefault,
                         &mut 0,None,&mut crate::video::anime4k_policy::VideoAnime4kBudgetPreset::default(),

@@ -89,7 +89,6 @@ mod transcript_session_tests {
                     (10000,14000,"一覧を手で送った後は、再生位置へ戻るボタンで自動送りを再開できます。".into()),
                 ]),
                 used_audio_stream:Some(0),applied_audio_stream:Some(0),
-                time_mapping:crate::video::transcript_time::TranscriptTimeMapping::raw_pts(10.0),
                 ..Default::default()
             }
         };
@@ -153,7 +152,7 @@ mod transcript_session_tests {
                         crate::transcript_panel::draw_transcript_panel_body(
                             &mut body_ui,
                             &snapshot,
-                            11.5,
+                            1.5,
                             &mut session.transcript,
                         );
                         let mut right_ui = root_ui.new_child(
@@ -278,7 +277,6 @@ mod transcript_session_tests {
                     .map(|row| (row * 2000, row * 2000 + 1000, format!("発話{row}")))
                     .collect(),
             ),
-            time_mapping: crate::video::transcript_time::TranscriptTimeMapping::raw_pts(10.0),
             ..Default::default()
         };
         let mut harness = crate::test_ui::builder()
@@ -312,14 +310,14 @@ mod transcript_session_tests {
                         );
                     }
                 },
-                (MusicTranscriptPanelSession::default(), snapshot, 129.5),
+                (MusicTranscriptPanelSession::default(), snapshot, 119.5),
             );
         harness.run_steps(4);
         for boundary in 0..3 {
             if boundary == 1 {
                 // パネルのclose/hideは既存のsession境界で破棄する。
                 harness.state_mut().0.reset();
-                harness.state_mut().2 = 409.5;
+                harness.state_mut().2 = 399.5;
             } else if boundary == 2 {
                 harness.state_mut().1.key = "next.flac".into();
             }

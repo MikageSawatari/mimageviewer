@@ -179,31 +179,146 @@ fn saved_second_track_decodes_at_its_playback_timestamp() {
 }
 
 #[test]
-fn nonzero_container_origin_matches_the_zero_origin_pcm() {
+fn transcript_positive_mkv_keeps_leading_silence_and_delayed_track_on_media_axis() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ai/transcript_audio");
-    let saved = SavedAudioTrackChoice {
-        stream_index: 1,
-        codec: "flac".into(),
-        language: None,
-        channels: Some(1),
-        title: Some("delayed".into()),
+    for stream_index in [0, 1] {
+        let saved = SavedAudioTrackChoice {
+            stream_index,
+            codec: "flac".into(),
+            language: None,
+            channels: Some(1),
+            title: None,
+        };
+        let mut outputs = Vec::new();
+        for (name, duration) in [("delayed_tracks.mka", 4), ("offset_tracks.mka", 14)] {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let prepared = prepare_with_saved(&root.join(name), Some(&saved), cancel.clone())
+                .unwrap()
+                .unwrap();
+            assert_eq!(prepared.stream_index, stream_index);
+            let mut bytes = Vec::new();
+            let stats = prepared
+                .extract(&cancel, |chunk| {
+                    bytes.extend_from_slice(chunk);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(stats.pcm_samples, duration * 16_000, "{name}");
+            outputs.push(bytes);
+        }
+        let leading = 10 * 16_000 * 2;
+        assert!(outputs[1][..leading].iter().all(|b| *b == 0));
+        assert_eq!(outputs[0], outputs[1][leading..]);
+        let delayed = if stream_index == 1 { 3 } else { 0 };
+        let onset = (10 + delayed) * 16_000 * 2;
+        assert!(outputs[1][..onset].iter().all(|b| *b == 0));
+        assert!(outputs[1][onset..].iter().any(|b| *b != 0));
+    }
+}
+
+#[test]
+fn transcript_negative_media_samples_are_trimmed_at_zero() {
+    crate::audio_decode::ensure_ffmpeg_init();
+    let cancel = AtomicBool::new(false);
+    let mut pcm = Vec::new();
+    let mut sink = PcmSink {
+        callback: |bytes: &[u8]| {
+            pcm.extend_from_slice(bytes);
+            Ok(())
+        },
+        cancel: &cancel,
+        bytes: Vec::new(),
+        samples: 0,
     };
-    let mut outputs = Vec::new();
-    for name in ["delayed_tracks.mka", "offset_tracks.mka"] {
+    let mut frame = Audio::new(
+        Sample::I16(Type::Packed),
+        16_000,
+        ffmpeg::ChannelLayoutMask::MONO,
+    );
+    frame.set_rate(16_000);
+    frame.set_pts(Some(-8000));
+    frame.plane_mut::<i16>(0).fill(1200);
+    let mut graph = make_graph(&frame, ffmpeg::Rational(1, 16_000)).unwrap();
+    graph.get("in").unwrap().source().add(&frame).unwrap();
+    graph.get("in").unwrap().source().flush().unwrap();
+    pull_pcm(&mut graph, &mut sink).unwrap();
+    sink.flush().unwrap();
+    assert_eq!(sink.samples, 8000);
+    drop(sink);
+    assert!(
+        pcm.chunks_exact(2)
+            .all(|b| i16::from_le_bytes([b[0], b[1]]) == 1200)
+    );
+}
+
+#[test]
+fn transcript_extracted_pulses_match_playback_media_seconds_for_ts_ps_and_mkv() {
+    use crate::video::screenshot::timeline_test_support::{VIDEO_FIXTURES, fixture};
+    for (name, content_start) in VIDEO_FIXTURES.iter().copied() {
+        let path = fixture(name);
         let cancel = Arc::new(AtomicBool::new(false));
-        let prepared = prepare_with_saved(&root.join(name), Some(&saved), cancel.clone())
+        let prepared = prepare_with_saved(&path, None, cancel.clone())
             .unwrap()
             .unwrap();
-        assert_eq!(prepared.stream_index, 1);
+        let stream = prepared.stream_index;
         let mut bytes = Vec::new();
-        let stats = prepared
+        prepared
             .extract(&cancel, |chunk| {
                 bytes.extend_from_slice(chunk);
                 Ok(())
             })
             .unwrap();
-        assert_eq!(stats.pcm_samples, 4 * 16_000, "{name}");
-        outputs.push(bytes);
+        let samples: Vec<_> = bytes
+            .chunks_exact(2)
+            .map(|b| f64::from(i16::from_le_bytes([b[0], b[1]])) / 32768.0)
+            .collect();
+        let mut playback = crate::audio_decode::AudioRangeDecoder::open(&path, stream).unwrap();
+        // 発話の代わりに同じ人工pulseの位置を比較する。ASR推論は時刻の基準を変えない。
+        for pulse in [2.0, 6.0, 10.0] {
+            let position = content_start + pulse;
+            let rms = |from: f64, to: f64| {
+                let range = &samples[(from * 16_000.0) as usize..(to * 16_000.0) as usize];
+                (range.iter().map(|v| v * v).sum::<f64>() / range.len() as f64).sqrt()
+            };
+            assert!(
+                rms(position + 0.04, position + 0.08) > 0.1,
+                "{name}: pulse at {position}"
+            );
+            assert!(
+                rms(position - 0.20, position - 0.10) < 0.01,
+                "{name}: before {position}"
+            );
+            let reference = playback
+                .decode_range_to_stereo_f32(position - 0.25, position + 0.50, &|| false)
+                .unwrap();
+            let part = &reference.stereo_samples
+                [(0.29 * 48_000.0) as usize * 2..(0.33 * 48_000.0) as usize * 2];
+            let reference_rms = (part.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>()
+                / part.len() as f64)
+                .sqrt();
+            assert!(reference_rms > 0.1, "{name}: playback pulse at {position}");
+        }
     }
-    assert_eq!(outputs[0], outputs[1]);
+}
+
+#[test]
+fn transcript_original_ts_fixture_starts_on_media_zero() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("testdata/timeline-origin/transcript-origin-video.ts");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let prepared = prepare_with_saved(&path, None, cancel.clone())
+        .unwrap()
+        .unwrap();
+    let mut bytes = Vec::new();
+    prepared
+        .extract(&cancel, |chunk| {
+            bytes.extend_from_slice(chunk);
+            Ok(())
+        })
+        .unwrap();
+    let first = bytes
+        .chunks_exact(2)
+        .position(|b| i16::from_le_bytes([b[0], b[1]]).unsigned_abs() > 64)
+        .unwrap();
+    assert!(first < 16_000 / 20, "tone onset: {first} samples");
 }

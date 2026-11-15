@@ -90,7 +90,6 @@ pub mod tile_thumb_cache;
 pub mod tile_thumbnails;
 #[cfg(all(windows, test))]
 mod transcript_display_tests;
-pub(crate) mod transcript_time;
 pub mod upscale;
 #[allow(dead_code)]
 pub(crate) mod window_host_contract;
@@ -9193,7 +9192,6 @@ impl VideoPlayer {
             player.native_output = Some(NativeVideoOutput::disconnected_for_test());
         }
         player.info = Some(VideoInfo {
-            container_start_secs: 0.0,
             lyrics_embedded: None,
             width: 640,
             height: 360,
@@ -12180,13 +12178,6 @@ impl VideoPlayer {
             .lock()
             .unwrap()
             .clone()
-    }
-
-    pub(crate) fn transcript_time_mapping(&self) -> transcript_time::TranscriptTimeMapping {
-        self.info
-            .as_ref()
-            .map(|info| transcript_time::TranscriptTimeMapping::raw_pts(info.container_start_secs))
-            .unwrap_or_default()
     }
 
     #[cfg(windows)]

@@ -109,6 +109,21 @@ fn present(result: TranscriptReadResult) -> TranscriptPage {
 }
 
 #[test]
+fn transcript_media_seconds_are_returned_and_filtered_without_origin_conversion() {
+    let fixture = Fixture::new();
+    set_transcripts(true);
+    let path = media(&fixture, "offset.mkv");
+    // MKVの先頭10秒と第2音声の遅延3秒を含む保存時刻。そのまま再生位置と一致する。
+    save_segments(&path, vec![(13_000, 14_000, "遅れて始まる音声".into())]);
+    let page = present(read(&fixture, item(&path), Some(13.5), None).unwrap());
+    assert_eq!(page.segments.len(), 1);
+    assert_eq!(page.segments[0].start_secs, 13.0);
+    assert_eq!(page.segments[0].end_secs, 14.0);
+    let page = present(read(&fixture, item(&path), Some(14.0), None).unwrap());
+    assert!(page.segments.is_empty());
+}
+
+#[test]
 fn transcript_off_rejects_admission_and_direct_handler_before_opening_corrupt_db() {
     let mut fixture = Fixture::new();
     let path = media(&fixture, "voice.mp4");

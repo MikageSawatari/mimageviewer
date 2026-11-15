@@ -1776,9 +1776,6 @@ pub struct VideoInfo {
     pub width: u32,
     pub height: u32,
     pub duration_secs: f64,
-    /// コンテナ全体の開始 PTS。文字起こしとの時刻変換専用で、再生時計は変えない。
-    /// NOPTS は 0、負の開始 PTS はそのまま保持する。音声 stream の開始とは別の値。
-    pub container_start_secs: f64,
     /// Effective origin; diagnostics and legacy resume migration only.
     pub timeline_origin_secs: f64,
     /// Stream codec id name (h264 / hevc / av1 / vp9 ...).
@@ -2766,8 +2763,6 @@ fn run_decoder(
 
     // ── 動画情報を通知 ──
     let duration_secs = duration_to_secs(input.duration());
-    // 既に開いた Input の情報だけを使い、UI 側からファイルを再調査しない。
-    let container_start_secs = container_start_to_secs(unsafe { (*input.as_ptr()).start_time });
     #[cfg(windows)]
     let gpu_path_active = gpu_video_device.is_some();
     #[cfg(not(windows))]
@@ -2840,7 +2835,6 @@ fn run_decoder(
         width: vi_width,
         height: vi_height,
         duration_secs,
-        container_start_secs,
         timeline_origin_secs: timeline.origin_secs(),
         video_codec: vi_video_codec,
         video_decoder: vi_video_decoder,
@@ -9001,14 +8995,6 @@ fn duration_to_secs(dur: i64) -> f64 {
     dur as f64 / 1_000_000.0
 }
 
-fn container_start_to_secs(start: i64) -> f64 {
-    if start == ffmpeg_the_third::ffi::AV_NOPTS_VALUE {
-        0.0
-    } else {
-        start as f64 / f64::from(ffmpeg_the_third::ffi::AV_TIME_BASE)
-    }
-}
-
 /// AVFormatContext のグローバル metadata から、与えられたキー候補を順番に試して
 /// 最初に値が取れたもの (空文字でない) を返す。Phase 5.4 の埋め込みメタ抽出用。
 fn read_embedded_lyrics(input: &ffmpeg_the_third::format::context::Input) -> Option<String> {
@@ -10444,30 +10430,12 @@ pub(in crate::video) mod audio_track_fixture_tests {
     }
 
     #[test]
-    fn container_start_conversion_keeps_negative_origin_and_maps_nopts_to_zero() {
-        use crate::video::transcript_time::TranscriptTimeMapping;
-        assert_eq!(super::container_start_to_secs(10_000_000), 10.0);
-        assert_eq!(super::container_start_to_secs(-10_000_000), -10.0);
-        let absent = super::container_start_to_secs(ffmpeg_the_third::ffi::AV_NOPTS_VALUE);
-        assert_eq!(absent, 0.0);
-        assert_eq!(
-            TranscriptTimeMapping::raw_pts(absent).to_playback(3.0),
-            Some(3.0)
-        );
-        assert_eq!(
-            TranscriptTimeMapping::raw_pts(-10.0).to_playback(13.0),
-            Some(3.0)
-        );
-    }
-
-    #[test]
-    fn transcript_time_uses_container_origin_across_real_audio_track_switches() {
+    fn transcript_media_time_is_unchanged_across_real_audio_track_switches() {
         use crate::video::audio_track_selection::AudioTrackSelectionDisplayState as Display;
-        use crate::video::transcript_time::TranscriptTimeMapping;
         let path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ai/transcript_audio/offset_tracks.mka");
         let session = SwitchSession::new_at(path, 0);
-        assert_eq!(session.info.container_start_secs, 10.0);
+        assert_eq!(session.info.timeline_origin_secs, 0.0);
         let delayed = session
             .info
             .audio_tracks
@@ -10475,29 +10443,15 @@ pub(in crate::video) mod audio_track_fixture_tests {
             .find(|track| track.stream_index == 1)
             .unwrap();
         assert_eq!(delayed.start_secs, Some(13.0));
-        let mapping = TranscriptTimeMapping::raw_pts(session.info.container_start_secs);
-        assert_eq!(mapping.to_playback(3.0), Some(13.0));
-        assert_eq!(mapping.to_transcript(13.0), Some(3.0));
-        let normalized = TranscriptTimeMapping::container_relative();
-        assert_eq!(normalized.to_playback(3.0), Some(3.0));
-        assert_eq!(normalized.to_transcript(3.0), Some(3.0));
-
-        // 実際の decoder 選択を往復しても、表示変換は stream の開始に付け替えない。
-        session.request(1, 13.0);
+        let saved_start_secs = 13_000_u64 as f64 / 1000.0;
+        session.request(1, saved_start_secs);
         session.wait_display_state(Display::Applied);
         assert_eq!(session.selection.snapshot().applied.stream_index, 1);
-        assert_eq!(session.info.container_start_secs, 10.0);
-        assert_eq!(
-            TranscriptTimeMapping::raw_pts(session.info.container_start_secs),
-            mapping
-        );
+        assert_eq!(session.info.timeline_origin_secs, 0.0);
         session.request(0, 10.0);
         session.wait_display_state(Display::Applied);
         assert_eq!(session.selection.snapshot().applied.stream_index, 0);
-        assert_eq!(
-            TranscriptTimeMapping::raw_pts(session.info.container_start_secs).to_transcript(13.0),
-            Some(3.0)
-        );
+        assert_eq!(saved_start_secs, 13.0);
     }
 
     #[test]

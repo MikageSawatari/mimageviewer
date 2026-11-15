@@ -15,9 +15,16 @@ test checks the exact boundary and value with constant s16 input.
 
 `offset_tracks.mka` is a remux of the same fixture with every stream timestamp
 shifted ten seconds. The container start is 10s and the second track starts at
-13s. The regression compares all extracted PCM bytes with the zero-origin
-fixture, including its three seconds of silence.
+13s. Matroska has effective origin zero, so extraction preserves ten leading
+seconds of digital silence on the playback media axis. The regression compares
+the remaining PCM bytes with the zero-origin fixture. Track 1 still starts three
+seconds after track 0: at media time 13s rather than 10s. Extraction is 14s long.
 
 ```powershell
 ffmpeg -nostdin -hide_banner -loglevel error -i src/ai/transcript_audio/delayed_tracks.mka -map 0 -c copy -output_ts_offset 10 -y src/ai/transcript_audio/offset_tracks.mka
 ```
+
+The shared TS/PS/MKV pulse fixtures in `testdata/timeline-origin/` also feed the
+extractor tests. Their pulse positions are checked against the playback
+`AudioRangeDecoder` on the same media axis. Synthetic pulses represent speech
+timing here; these tests do not run Whisper or assess recognition quality.

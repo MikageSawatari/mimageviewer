@@ -46,7 +46,7 @@ pub struct PreparedAudio {
     cancel: Arc<AtomicBool>,
     decoder: ffmpeg::decoder::Audio,
     time_base: ffmpeg::Rational,
-    timestamp_origin: i64,
+    timeline: crate::video::media_timeline::MediaTimeline,
     pub stream_index: usize,
     /// Playback/container duration (zero if unknown); actual PCM length is in stats.
     pub duration_secs: f64,
@@ -129,24 +129,6 @@ pub fn prepare_with_saved(
         .stream(stream_index)
         .ok_or_else(|| AudioError::Ffmpeg("selected stream missing".into()))?
         .time_base();
-    let start = unsafe { (*input.as_ptr()).start_time };
-    let timestamp_origin = if start == ffmpeg::ffi::AV_NOPTS_VALUE {
-        0
-    } else {
-        unsafe {
-            ffmpeg::ffi::av_rescale_q(
-                start,
-                ffmpeg::ffi::AVRational {
-                    num: 1,
-                    den: ffmpeg::ffi::AV_TIME_BASE,
-                },
-                ffmpeg::ffi::AVRational {
-                    num: time_base.numerator(),
-                    den: time_base.denominator(),
-                },
-            )
-        }
-    };
     let duration_secs = input.duration() as f64 / f64::from(ffmpeg::ffi::AV_TIME_BASE);
     let duration_secs = if duration_secs.is_finite() && duration_secs > 0.0 {
         duration_secs
@@ -161,7 +143,7 @@ pub fn prepare_with_saved(
         cancel,
         decoder,
         time_base,
-        timestamp_origin,
+        timeline,
         stream_index,
         duration_secs,
     }))
@@ -187,7 +169,7 @@ fn make_graph(
     );
     graph.add(&source, "in", &args)?;
     graph.add(&sink, "out", "")?;
-    // Exact evaluation alignment: prepend silence / trim negative timestamps at time zero.
+    // メディア時刻0から埋め、0より前のsampleは捨てる。
     graph.output("in", 0)?.input("out", 0)?.parse(
         "aresample=16000:async=1:first_pts=0,aformat=sample_fmts=s16:channel_layouts=mono",
     )?;
@@ -256,7 +238,7 @@ fn receive_decoded<F: FnMut(&[u8]) -> Result<(), AudioError>>(
     decoder: &mut ffmpeg::decoder::Audio,
     graph: &mut Option<ffmpeg::filter::Graph>,
     time_base: ffmpeg::Rational,
-    timestamp_origin: i64,
+    timeline: crate::video::media_timeline::MediaTimeline,
     sink: &mut PcmSink<'_, F>,
 ) -> Result<(), AudioError> {
     loop {
@@ -266,13 +248,13 @@ fn receive_decoded<F: FnMut(&[u8]) -> Result<(), AudioError>>(
             Ok(()) => {
                 let layout = crate::audio_decode::normalize_layout(frame.ch_layout());
                 frame.set_ch_layout(layout);
-                // Match evaluation's ffmpeg CLI without -copyts: container start is zero,
-                // while the selected track's delay relative to the container is preserved.
+                // 再生と同じメディア時刻。選択したトラックの開始へ原点を付け替えない。
                 let pts = frame
                     .timestamp()
                     .or_else(|| frame.pts())
                     .map(|pts| {
-                        pts.checked_sub(timestamp_origin)
+                        timeline
+                            .raw_stream_ticks_to_media(pts, time_base)
                             .ok_or_else(|| AudioError::Ffmpeg("timestamp overflow".into()))
                     })
                     .transpose()?;
@@ -325,7 +307,7 @@ impl PreparedAudio {
                     &mut self.decoder,
                     &mut graph,
                     self.time_base,
-                    self.timestamp_origin,
+                    self.timeline,
                     &mut sink,
                 )?;
             }
@@ -334,7 +316,7 @@ impl PreparedAudio {
                 &mut self.decoder,
                 &mut graph,
                 self.time_base,
-                self.timestamp_origin,
+                self.timeline,
                 &mut sink,
             )?;
             if let Some(graph) = graph.as_mut() {

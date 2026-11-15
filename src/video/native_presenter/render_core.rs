@@ -16207,7 +16207,6 @@ mod chrome_suppression_interaction_tests {
                         .map(|row| (row * 2000, row * 2000 + 1000, format!("発話{row}")))
                         .collect(),
                 ),
-                time_mapping: crate::video::transcript_time::TranscriptTimeMapping::raw_pts(0.0),
                 ..Default::default()
             };
             overlay.set_side_panel_state(

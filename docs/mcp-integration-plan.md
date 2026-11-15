@@ -1193,7 +1193,8 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
 | `get_transcript` | 1本の保存済み文字起こし。`item`、`start_secs?`、`cursor?`。区間・モデル・作成日・音声track・古さを返す | `transcript.db`のread-only取得＋rev/epoch付きcursor。応答worker上のみ |
 
 `get_transcript`（T1区切り4）は `item:{path,subresource?}`、`start_secs?`（既定0）、`cursor?` を受ける。
-時刻は保存済みのコンテナ開始=0秒で、開始秒より後まで続く区間（開始秒に重なる区間も含む）を返す。
+時刻は保存済みのメディア秒（mIVに表示される再生時刻）で、開始秒より後まで続く区間
+（開始秒に重なる区間も含む）を返す。抽出側と再生側で共通のMediaTimelineを使い、MCPで原点を加減算しない。
 続きは同じitemを指定し、開始秒は省略または初回と同じ値にする。動画/音声の実ファイルのみ対象。
 本文の取得・要約は `agent-read-worker` 上のread-only DB操作で、UI描画や作成ジョブに処理を送らない。
 

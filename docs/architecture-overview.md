@@ -13,7 +13,8 @@ FFmpegの逐次抽出・ASR pipeの並列送受信・後処理・署名再確認
 単一readerがDB/署名を読み、世代照合後のArc区間を共通snapshotにまとめる。
 native動画の左3タブ、音楽ビューの左2タブは `transcript_panel` の全文折返し一覧を共有し、右には状態1行だけを出す。
 本文とjob案内は別に保持し、実再生のapplied trackから別trackを導く。panelのscroll/followは各sessionが所有する。
-`video::transcript_time` がコンテナ相対秒とraw PTS秒を双方向に変換する。既存seekの範囲制限は維持する。
+抽出は自身のInputの `MediaTimeline` でメディア時刻0へそろえ、保存・強調・seekで同じ時刻を使う。
+表示側の原点変換や原点待ちは持たず、既存seekの範囲制限を共用する。
 MCP・検索は後続。
 [計画](local-asr-transcript-plan.md)、[区切り1](local-asr-t1-chunk1-report.md)、
 [区切り2](local-asr-t1-chunk2-report.md)、[区切り3](local-asr-t1-chunk3-report.md) を参照。

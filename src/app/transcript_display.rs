@@ -33,7 +33,6 @@ impl App {
         let path = player.path().clone();
         let key = crate::path_key::normalize_keep_drive(&path);
         let applied = player.applied_audio_stream_index();
-        let mapping = player.transcript_time_mapping();
         #[cfg(windows)]
         let activity = self
             .transcript_job
@@ -60,7 +59,6 @@ impl App {
             self.transcript_display.get(&key),
             activity,
             applied,
-            mapping,
         )
     }
 

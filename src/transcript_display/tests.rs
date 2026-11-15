@@ -43,13 +43,7 @@ fn snapshot(
     activity: TranscriptActivity,
     applied: Option<usize>,
 ) -> TranscriptSnapshot {
-    build_transcript_snapshot(
-        "source-a".into(),
-        value,
-        activity,
-        applied,
-        TranscriptTimeMapping::container_relative(),
-    )
+    build_transcript_snapshot("source-a".into(), value, activity, applied)
 }
 
 #[test]
@@ -229,13 +223,8 @@ fn snapshot_switching_source_during_load_keeps_new_key_and_empty_text() {
     let saved = value();
     let loaded_a = snapshot(Some(&saved), TranscriptActivity::None, Some(1));
     let loading_a = snapshot(None, TranscriptActivity::Running, Some(1));
-    let loading_b = build_transcript_snapshot(
-        "source-b".into(),
-        None,
-        TranscriptActivity::None,
-        Some(2),
-        TranscriptTimeMapping::raw_pts(10.0),
-    );
+    let loading_b =
+        build_transcript_snapshot("source-b".into(), None, TranscriptActivity::None, Some(2));
     assert_eq!(loaded_a.key, "source-a");
     assert!(!loaded_a.segments.is_empty());
     assert_eq!(loading_a.state, TranscriptDataState::Loading);
@@ -303,9 +292,7 @@ fn same_presentation_detects_metadata_changes_even_when_text_arc_is_unchanged() 
     applied.applied_audio_stream = Some(2);
     let mut date = base.clone();
     date.created_at = Some(2000);
-    let mut mapping = base.clone();
-    mapping.time_mapping = TranscriptTimeMapping::raw_pts(10.0);
-    for changed in [key, state, activity, used, applied, date, mapping] {
+    for changed in [key, state, activity, used, applied, date] {
         assert!(Arc::ptr_eq(&base.segments, &changed.segments));
         assert!(!base.same_presentation(&changed));
     }
@@ -353,35 +340,13 @@ fn snapshot_summary_formats_a_fixed_local_date_and_state_notices() {
 }
 
 #[test]
-fn snapshot_retains_unknown_and_nonzero_time_mapping_without_double_adjustment() {
+fn snapshot_media_segments_are_independent_of_playback_metadata_arrival() {
     let saved = value();
-    let unknown = build_transcript_snapshot(
-        "source-a".into(),
-        Some(&saved),
-        TranscriptActivity::None,
-        Some(1),
-        TranscriptTimeMapping::default(),
-    );
-    assert_eq!(unknown.state, TranscriptDataState::Available);
-    assert_eq!(unknown.time_mapping.to_playback(3.0), None);
-    assert_eq!(unknown.time_mapping.to_transcript(13.0), None);
-    let raw = build_transcript_snapshot(
-        "source-a".into(),
-        Some(&saved),
-        TranscriptActivity::None,
-        Some(1),
-        TranscriptTimeMapping::raw_pts(10.0),
-    );
-    assert_eq!(
-        raw.time_mapping
-            .to_playback(raw.segments[0].0 as f64 / 1000.0),
-        Some(13.0)
-    );
-    assert_eq!(raw.time_mapping.to_transcript(13.0), Some(3.0));
-    let normalized = snapshot(Some(&saved), TranscriptActivity::None, Some(1));
-    assert_eq!(normalized.time_mapping.to_playback(3.0), Some(3.0));
-    assert_eq!(normalized.time_mapping.to_transcript(3.0), Some(3.0));
-    assert!(Arc::ptr_eq(&raw.segments, &unknown.segments));
-    assert!(!raw.same_presentation(&unknown));
-    assert!(!raw.same_presentation(&normalized));
+    let before = snapshot(Some(&saved), TranscriptActivity::None, None);
+    let after = snapshot(Some(&saved), TranscriptActivity::None, Some(1));
+    assert_eq!(before.segments[0].0, 3000);
+    assert_eq!(after.segments[0].0, 3000);
+    assert!(Arc::ptr_eq(&before.segments, &after.segments));
+    assert_eq!(before.state, TranscriptDataState::Available);
+    assert!(!before.same_presentation(&after));
 }

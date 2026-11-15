@@ -1,4 +1,5 @@
 //! 保存済み文字起こしのworker専用read。行snapshotは要求内だけで保持する。
+//! 保存値・start_secs・返す区間は、すべてmIVの再生位置と同じメディア時刻。
 use super::*;
 use crate::transcript_db::{FileSignature, TranscriptDb, TranscriptStatus};
 

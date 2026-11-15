@@ -140,8 +140,8 @@ impl TranscriptPanelState {
     }
 }
 
-fn active_row(segments: &[TranscriptSegment], position: Option<f64>) -> Option<usize> {
-    let millis = position.filter(|value| value.is_finite() && *value >= 0.0)? * 1000.0;
+fn active_row(segments: &[TranscriptSegment], position: f64) -> Option<usize> {
+    let millis = (position.is_finite() && position >= 0.0).then_some(position)? * 1000.0;
     let index = segments
         .partition_point(|row| row.0 as f64 <= millis)
         .checked_sub(1)?;
@@ -150,8 +150,8 @@ fn active_row(segments: &[TranscriptSegment], position: Option<f64>) -> Option<u
 
 /// 発話の隙間も現在位置の直前の行へ送る。強調は active_row の区間内だけに限る。
 /// 最初の発話より前は先頭、最後の発話より後は末尾を表示する。
-fn follow_row(segments: &[TranscriptSegment], position: Option<f64>) -> Option<usize> {
-    let millis = position.filter(|value| value.is_finite() && *value >= 0.0)? * 1000.0;
+fn follow_row(segments: &[TranscriptSegment], position: f64) -> Option<usize> {
+    let millis = (position.is_finite() && position >= 0.0).then_some(position)? * 1000.0;
     (!segments.is_empty()).then(|| {
         segments
             .partition_point(|row| row.0 as f64 <= millis)
@@ -204,7 +204,7 @@ fn manual_scroll_input<R>(
 pub(crate) fn draw_transcript_panel_body(
     ui: &mut egui::Ui,
     snapshot: &TranscriptSnapshot,
-    raw_position_secs: f64,
+    position_secs: f64,
     state: &mut TranscriptPanelState,
 ) -> Option<f64> {
     let started = crate::perf::is_enabled().then(std::time::Instant::now);
@@ -218,9 +218,8 @@ pub(crate) fn draw_transcript_panel_body(
     if snapshot.segments.is_empty() {
         return None;
     }
-    let position = snapshot.time_mapping.to_transcript(raw_position_secs);
-    let active = active_row(&snapshot.segments, position);
-    let following_row = active.or_else(|| follow_row(&snapshot.segments, position));
+    let active = active_row(&snapshot.segments, position_secs);
+    let following_row = active.or_else(|| follow_row(&snapshot.segments, position_secs));
     let mut resumed = false;
     ui.horizontal(|ui| {
         if ui
@@ -321,7 +320,6 @@ pub(crate) fn draw_transcript_panel_body(
                         egui::pos2(ui.max_rect().left(), top + state.heights.prefix(row)),
                         egui::vec2(ui.available_width(), state.heights.values[row]),
                     );
-                    let enabled = snapshot.time_mapping.to_playback(*start_ms as f64 / 1000.0);
                     let response = ui.interact(
                         row_rect,
                         ui.id().with(("transcript_row", row)),
@@ -348,12 +346,12 @@ pub(crate) fn draw_transcript_panel_body(
                         ui.visuals().text_color(),
                     );
                     if response.clicked() {
-                        seek = enabled;
+                        seek = Some(*start_ms as f64 / 1000.0);
                     }
                     response.widget_info(|| {
                         egui::WidgetInfo::labeled(
                             egui::WidgetType::Button,
-                            enabled.is_some(),
+                            true,
                             format!(
                                 "{} {}",
                                 crate::ui_helpers::format_hms(*start_ms as f64 / 1000.0),
@@ -436,30 +434,30 @@ mod tests {
     #[test]
     fn transcript_active_row_uses_ranges_and_leaves_gaps_unhighlighted() {
         let rows = vec![(1000, 2000, "a".into()), (4000, 6000, "b".into())];
-        assert_eq!(active_row(&rows, Some(1.5)), Some(0));
-        assert_eq!(active_row(&rows, Some(3.0)), None);
-        assert_eq!(active_row(&rows, None), None);
+        assert_eq!(active_row(&rows, 1.5), Some(0));
+        assert_eq!(active_row(&rows, 3.0), None);
+        assert_eq!(active_row(&rows, f64::NAN), None);
     }
 
     #[test]
     fn transcript_follow_row_covers_gaps_and_edges_without_highlighting_silence() {
         let rows = vec![(1000, 2000, "a".into()), (4000, 6000, "b".into())];
         for (position, expected) in [(0.0, 0), (1.5, 0), (2.0, 0), (3.0, 0), (4.0, 1), (9.0, 1)] {
-            assert_eq!(follow_row(&rows, Some(position)), Some(expected));
+            assert_eq!(follow_row(&rows, position), Some(expected));
         }
-        for position in [None, Some(-1.0), Some(f64::NAN), Some(f64::INFINITY)] {
+        for position in [-1.0, f64::NAN, f64::INFINITY] {
             assert_eq!(follow_row(&rows, position), None);
         }
-        assert_eq!(follow_row(&[], Some(3.0)), None);
-        assert_eq!(active_row(&rows, Some(0.0)), None);
-        assert_eq!(active_row(&rows, Some(3.0)), None);
-        assert_eq!(active_row(&rows, Some(9.0)), None);
+        assert_eq!(follow_row(&[], 3.0), None);
+        assert_eq!(active_row(&rows, 0.0), None);
+        assert_eq!(active_row(&rows, 3.0), None);
+        assert_eq!(active_row(&rows, 9.0), None);
     }
 
     fn fixture(count: usize) -> TranscriptSnapshot {
         TranscriptSnapshot {key:"sample.mp4".into(),state:crate::transcript_display::TranscriptDataState::Available,
             segments:Arc::new((0..count).map(|index| ((index as u64+1)*1000,(index as u64+2)*1000,format!("行{index}：幅に合わせて折り返す日本語の文字起こしです。長い文章も全文を表示します。"))).collect()),
-            time_mapping:crate::video::transcript_time::TranscriptTimeMapping::raw_pts(10.0),..Default::default()}
+            ..Default::default()}
     }
     struct View {
         snapshot: TranscriptSnapshot,
@@ -486,40 +484,40 @@ mod tests {
                     snapshot: fixture(count),
                     state: Default::default(),
                     seek: None,
-                    position: 11.5,
+                    position: 1.5,
                 },
             )
     }
 
     #[test]
-    fn transcript_panel_gap_follow_on_source_change_reset_and_origin_arrival() {
+    fn transcript_panel_gap_follow_on_source_change_reopen_and_text_arrival() {
         let mut harness = harness(300);
         harness.state_mut().snapshot.segments = Arc::new(
             (0..300)
                 .map(|row| (row * 2000, row * 2000 + 1000, format!("発話{row}")))
                 .collect(),
         );
-        // 再生側原点10秒を含む現在位置。保存時刻119.5秒は発話の隙間。
-        harness.state_mut().position = 129.5;
+        // 保存も再生も119.5秒。発話の隙間は直前の行へ送る。
+        harness.state_mut().position = 119.5;
         harness.run_steps(6);
         assert!(harness.state().state.last_scroll.unwrap().offset.y > 1000.0);
         // 同じegui contextの別ファイルへ移動。古いManual/offsetを引き継がない。
         harness.state_mut().state.mode = ScrollMode::Manual(Anchor::default());
         harness.state_mut().snapshot.key = "next.mp4".into();
-        harness.state_mut().position = 409.5;
+        harness.state_mut().position = 399.5;
         harness.run_steps(1);
         assert!(matches!(
             harness.state().state.mode,
             ScrollMode::Following(_)
         ));
         assert!(harness.state().state.last_scroll.unwrap().offset.y > 5000.0);
-        // hide/closeのセッション境界と、原点が後から届く場合。
+        // hide/closeのセッション境界と、本文が後から届く場合も現在位置から送る。
         harness.state_mut().state.reset();
-        harness.state_mut().snapshot.time_mapping = Default::default();
+        let segments = Arc::clone(&harness.state().snapshot.segments);
+        harness.state_mut().snapshot.segments = Arc::default();
         harness.run_steps(1);
-        assert_eq!(harness.state().state.last_scroll.unwrap().offset.y, 0.0);
-        harness.state_mut().snapshot.time_mapping =
-            crate::video::transcript_time::TranscriptTimeMapping::raw_pts(10.0);
+        assert!(harness.state().state.last_scroll.is_none());
+        harness.state_mut().snapshot.segments = segments;
         harness.run_steps(1);
         assert!(harness.state().state.last_scroll.unwrap().offset.y > 5000.0);
     }
@@ -553,7 +551,7 @@ mod tests {
         // 初回のfont/layout準備を含む記録と、準備後の連続表示を分けて報告する。
         crate::perf::event("transcript", "display_warmup_end", None, 0, &[]);
         for frame in 0..120 {
-            harness.state_mut().position = 11.5 + ((frame * 41) % 4999) as f64;
+            harness.state_mut().position = 1.5 + ((frame * 41) % 4999) as f64;
             harness.run_steps(1);
         }
         // test threadだけでwriterの完了を待つ。通常のUI用flushは非同期のため使わない。
@@ -599,17 +597,14 @@ mod tests {
         );
     }
     #[test]
-    fn transcript_panel_row_click_returns_existing_playback_time_and_unknown_mapping_disables_seek()
-    {
-        for known in [true, false] {
+    fn transcript_panel_row_click_returns_saved_media_time_without_metadata() {
+        for applied in [None, Some(0)] {
             let mut harness = harness(3);
-            if !known {
-                harness.state_mut().snapshot.time_mapping = Default::default();
-            }
+            harness.state_mut().snapshot.applied_audio_stream = applied;
             harness.run_steps(6);
             harness.get_by_label("00:01 行0：幅に合わせて折り返す日本語の文字起こしです。長い文章も全文を表示します。").click();
             harness.run_steps(2);
-            assert_eq!(harness.state().seek, known.then_some(11.0));
+            assert_eq!(harness.state().seek, Some(1.0));
         }
     }
     #[test]
@@ -626,7 +621,7 @@ mod tests {
         });
         harness.run_steps(3);
         assert!(matches!(harness.state().state.mode, ScrollMode::Manual(_)));
-        harness.state_mut().position = 4011.5;
+        harness.state_mut().position = 4001.5;
         harness.run_steps(2);
         assert!(matches!(harness.state().state.mode, ScrollMode::Manual(_)));
         harness.get_by_label("再生位置へ戻る").click();
@@ -700,7 +695,7 @@ mod tests {
                         snapshot: fixture(5000),
                         state: Default::default(),
                         seek: None,
-                        position: 11.5,
+                        position: 1.5,
                     },
                     outside: egui::Rect::NOTHING,
                     outside_id: egui::Id::NULL,
@@ -912,7 +907,7 @@ mod tests {
                                 crate::os_theme::ResolvedTheme::Light
                             },
                         );
-                        draw_transcript_panel_body(ui, &snapshot, 11.5, state);
+                        draw_transcript_panel_body(ui, &snapshot, 1.5, state);
                     },
                     TranscriptPanelState::default(),
                 );

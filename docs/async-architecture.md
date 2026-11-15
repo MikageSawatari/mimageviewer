@@ -29,8 +29,9 @@ UIのイベント採用は1pass最大64件。上限まで処理してownerが残
 
 `transcript_job_worker` はprobe・署名・DB参照と保存を所有する。同じ入力のPCM抽出・pipe書込みは
 scoped thread、窓の受信・後処理は実行役で並行する。joinするのは背景の実行役だけで、UIでは待たない。
-FFmpegは既存のdecoder-open・音声一覧と選択関数を共用し、コンテナ原点を引いた後に
-`aresample=async=1:first_pts=0` で先頭遅延を無音で埋める。tempfileは作らない。
+FFmpegは既存のdecoder-open・音声一覧と選択関数を共用する。自身のInputから作る `MediaTimeline` が
+音声PTSをメディア時刻へ変換し、`aresample=async=1:first_pts=0` で0からの先頭遅延を無音で埋め、
+負のsampleを捨てる。正の開始時刻を持つMKVは原点0のためその先頭遅延を保持する。tempfileは作らない。
 保存は `BEGIN IMMEDIATE` 内で署名を取り直してから行う。失敗で既存okを上書きしない。
 
 `transcript.db` のtriggerがrev・indexed・削除印を管理する。STORESの表示cache記述から
@@ -38,7 +39,8 @@ FFmpegは既存のdecoder-open・音声一覧と選択関数を共用し、コ�
 App共通の `TranscriptDisplayCache` がこの印で失効する。遅延起動する単一readerが短いread-only SELECTとstatを行い、
 rootはtry_recvとepoch/要求世代の照合だけを行う。clear/invalidate後は旧Arcを外してLoadingを配信する。
 読み取り表示の再入場refreshだけでは既存値を消さず、兄弟panelの本文を維持する。cacheは32entry上限、joinはしない。
-共通snapshotは保存本文、job所属、applied track、作成日、時刻mappingをまとめる。
+共通snapshotは保存本文、job所属、applied track、作成日をまとめる。区間・再生位置・seekは同じメディア時刻で、
+snapshotに原点や原点待ちの状態は持たせない。
 nativeのlatest-value commandはmarker同期から独立し、同じ値なら再送しない。
 source swapで空にし、F12のrender core再生成ではsource側のsnapshotを復元する。
 musicは同じbuilderとrendererを使い、panelの一時状態をnativeと共有しない。索引への反映はT2で接続する。

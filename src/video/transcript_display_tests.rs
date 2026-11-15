@@ -2,55 +2,43 @@ use super::*;
 use crate::transcript_display::{TranscriptDataState, TranscriptSnapshot};
 
 #[test]
-fn transcript_origin_is_applied_once_before_existing_seek_and_inverse_highlight() {
-    let mut player = VideoPlayer::stream_ready_disconnected_for_test("offset.mka".into());
-    player.info.as_mut().unwrap().container_start_secs = 10.0;
-    let mapping = player.transcript_time_mapping();
-    let target = mapping.to_playback(3.0).unwrap();
-    player.seek(target, SeekOrigin::User);
-    assert_eq!(player.clock.take_seek_request().unwrap().target_secs, 13.0);
-    player.set_position_for_test(13.0);
-    assert_eq!(mapping.to_transcript(player.position()), Some(3.0));
-    player.info.as_mut().unwrap().opened_audio_stream_index = Some(2);
-    assert_eq!(player.transcript_time_mapping(), mapping);
-    assert_eq!(
-        player.transcript_time_mapping().to_playback(3.0),
-        Some(13.0)
-    );
-    // player の既存範囲制限はこの機能で拡張しない。helperの往復とは区別する。
-    assert_eq!(player.clamp_seek_target(-7.0), 0.0);
-    assert_eq!(player.clamp_seek_target(1000.0), 29.9);
+fn transcript_saved_media_time_is_used_before_metadata_and_across_track_changes() {
+    for stream in [Some(1), Some(2), None] {
+        let mut player = VideoPlayer::stream_ready_disconnected_for_test("offset.mka".into());
+        if let Some(stream) = stream {
+            player.info.as_mut().unwrap().opened_audio_stream_index = Some(stream);
+        } else {
+            player.info = None;
+        }
+        let saved_ms = 3000;
+        player.seek(saved_ms as f64 / 1000.0, SeekOrigin::User);
+        assert_eq!(player.clock.take_seek_request().unwrap().target_secs, 3.0);
+        assert_eq!(player.position(), 3.0);
+        assert_eq!(player.clamp_seek_target(-7.0), 0.0);
+    }
 }
 
 #[test]
-fn transcript_nonzero_ts_origin_uses_existing_player_seek_clamp_without_bypass() {
+fn transcript_nonzero_ts_origin_uses_saved_media_seconds_and_normal_player_clamp() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("src/video/transcript_time/fixtures/origin-video.ts");
-    // 同梱 decoder が実際の TS を開いて公表した metadata を使う。
-    // 再生器のテスト用 transport は窓・音声 device・製品 exe を起動しない。
+        .join("testdata/timeline-origin/transcript-origin-video.ts");
     let info = decoder::audio_track_fixture_tests::open_fixture_info_path(path.clone());
-    assert!((info.container_start_secs - 1.578667).abs() < 0.000001);
+    assert!((info.timeline_origin_secs - 1.578667).abs() < 0.000001);
     assert!((info.duration_secs - 4.021333).abs() < 0.000001);
     let duration_secs = info.duration_secs;
-    let mut player = VideoPlayer::stream_ready_disconnected_for_test(path);
-    player.info = Some(info);
-    let mapping = player.transcript_time_mapping();
-    let raw_target = mapping.to_playback(3.0).unwrap();
-    assert!((raw_target - 4.578667).abs() < 0.000001);
-    assert!((mapping.to_transcript(raw_target).unwrap() - 3.0).abs() < 0.000001);
-
-    player.seek(raw_target, SeekOrigin::User);
-    let issued = player.clock.take_seek_request().unwrap();
-    assert!((issued.target_secs - 3.921333).abs() < 0.000001);
-    assert!((issued.target_secs - (duration_secs - 0.1)).abs() < 0.000001);
-    assert_eq!(issued.target_secs, player.clamp_seek_target(raw_target));
-    assert_eq!(player.info().unwrap().duration_secs, duration_secs);
-    // 既存の seek target override も同じ clamp 済み秒を公開する。
-    let transcript_position = mapping.to_transcript(player.position()).unwrap();
-    assert!((transcript_position - 2.342666).abs() < 0.000001);
-    assert!(transcript_position < 3.0);
-    // T1 では専用の clamp や duration への原点加算を足さない。
-    // この既存制約はシークバー・ブックマーク・チャプターと共通のまま残す。
+    // 各行の初回seekを独立に検査する。連続入力のcoalescingはplayerの既存契約のまま。
+    for (saved_secs, expected) in [
+        (3000_u64 as f64 / 1000.0, 3.0),
+        (1000.0, duration_secs - 0.1),
+    ] {
+        let mut player = VideoPlayer::stream_ready_disconnected_for_test(path.clone());
+        player.info = Some(info.clone());
+        player.seek(saved_secs, SeekOrigin::User);
+        let issued = player.clock.take_seek_request().unwrap();
+        assert_eq!(issued.target_secs, player.clamp_seek_target(saved_secs));
+        assert!((issued.target_secs - expected).abs() < 0.000001);
+        assert!((player.position() - expected).abs() < 0.000001);
+    }
 }
 
 #[test]
