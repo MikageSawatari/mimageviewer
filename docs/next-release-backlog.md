@@ -157,7 +157,12 @@ skip sample / pre-skip が適用された音声サンプルと frame PTS の関�
 - 状態: **未着手・次の版以降。v5.2.0 は既知として出荷 (利用者決定 2026-11-13)**。
 - 観測 (ReleaseChecks の記録、隔離した診断ポータブル版): v5.2.0 の run `release-checks-20261113-050011-2e1435fd` の first-ai で、`open_fullscreen` 直後の全画面 viewport の 2 コマ目が `immediate_viewport total=489.9ms run=487.1` (段別 `fullscreen_viewport_ms` 490ms)、`ui-frame-gap 492.7ms`。AI の action を送る前の段階。10-29 の run `release-checks-20261029-161208-c3ed5627` でも同じ場所で `total=543.6ms`。今回の版の変更によるものではない。
 - これまで見つからなかった理由: first-ai は §1.483 の台本の不具合で全画面を開いた直後に落ちており、v5.2.0 で台本を直して初めて最後まで走った。ほかの ReleaseChecks のケースは全画面を開かない。
-- 次にすること: `run=487ms` の中身 (全画面 viewport の初回の描画・surface の作成・`[fullscreen] virtual desktop synced` 前後の処理) を計装で特定する。原因が分かるまで、ReleaseChecks の分類 (known-*) に足して黙らせない。
+- 調査 (2026-11-15、ブランチ `inv-776-fs-first-frame`、コミット 9859ea9b9):
+  - 既存ログ (上の v5.2.0 run の `perf_events.jsonl`): 止まったフレーム 490ms のうち 477ms が同じフレームの `gpu/lanczos_regenerate` (`regeneration_count=1`、884x444→3840x1928 の upscale、`encode_submit_cpu_ms=477.4`)。§1.87・§1.279 と同じ形。
+  - コード: `src/gpu_lanczos.rs` の `generate_with_source` が、セッション初回だけ UI スレッドで `Lanczos3Resampler::new` を呼ぶ。シェーダー 4 本とレンダーパイプライン 6 本 (縮小 2・可視範囲拡大 2・NIS・ピクセルアート) をまとめて同期で作る。DX12 + FXC。既定 (`PostFilter::None`) の拡大で使うのは可視範囲拡大の 2 本だけで、NIS は「くっきり拡大」(`UpscaleSharp`) を選んだときだけ使う。
+  - 計測 (実 GPU テスト `measure_776`、製品と同じ DX12 + FXC、RTX 4090、`dev-runtime` プロファイル = opt-level 2、3 回。観測者: ClaudeCode がテストを実行): 初回の作成 652〜1,444ms のうち NIS のパイプライン作成が 577〜1,267ms (88〜89%)。NIS のシェーダーモジュール作成は 3ms。ほかの 5 本は 1 本 13〜41ms で、既定の拡大で使う 2 本の合計は 26〜63ms。同じデバイスで 2 回目の作成は 5〜12ms。初回の拡大 job の prepare / encode / submit は合計 3〜4ms (1 回目の run だけ encode 264ms)。最適化なしの test プロファイルでは NIS が 5.6〜7.8 秒。
+  - 製品 (release) での内訳は未計測。perf event に区間別のフィールド (`resampler_create_breakdown` など) を足したので、次に ReleaseChecks の first-ai か perf smoke を流すと製品での値が出る。NIS のパイプライン作成の中身 (naga の HLSL 変換と FXC のどちらか) は分けて測っていない。動画側では NIS の FXC コンパイルが 2.1 秒かかっていた前例がある (§1.122、build.rs で DXBC 化して解消)。
+  - Anime4K (アニメ拡大を選んだときだけ) の初回作成も 587〜1,517ms で、同じ型。
 - 関連: §1.483、[ReleaseChecks 自動化計画](release-check-automation-plan.md)。規模 / 優先度: 調査から / P2。
 
 ### 1.775 SNS 分割書き出しの枚数の上限を 4 から 20 へ — X の仕様変更への追従 (2026-11-13)
