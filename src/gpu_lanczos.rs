@@ -22,7 +22,10 @@ use crate::{
     source_coverage::SourceCoverage,
 };
 use crate::{
-    gpu_anime4k::{Anime4kJob, Anime4kPlan, Anime4kResampler, STILL_IMAGE_ANIME4K_VARIANT},
+    gpu_anime4k::{
+        Anime4kCreationTimings, Anime4kJob, Anime4kPlan, Anime4kResampler,
+        STILL_IMAGE_ANIME4K_VARIANT,
+    },
     settings::AnimeUpscaleSourceLimit,
 };
 
@@ -1866,10 +1869,136 @@ pub(crate) struct LanczosGenerationStats {
     pub(crate) blur_factor: f32,
     pub(crate) texture_fetches: u64,
     pub(crate) encode_submit_cpu_ms: f64,
+    timings: LanczosGenerationTimings,
     pub(crate) regeneration_count: u64,
     pub(crate) scale_branch: FullscreenPaintScaleBranch,
     /// Source-pixel origin and size when an upscale was generated from the visible region.
     pub(crate) visible_source_region: Option<[f32; 4]>,
+}
+
+/// CPU wall times only: these do not attribute time inside the driver to compilation.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+struct LanczosCreationTimings {
+    bind_group_layout_ms: f64,
+    pipeline_layout_ms: f64,
+    lanczos3_shader_module_ms: f64,
+    visible_upscale_shader_module_ms: f64,
+    nis_shader_module_ms: f64,
+    pixel_aa_shader_module_ms: f64,
+    vertical_pipeline_ms: f64,
+    horizontal_pipeline_ms: f64,
+    visible_upscale_vertical_pipeline_ms: f64,
+    visible_upscale_horizontal_pipeline_ms: f64,
+    nis_upscale_pipeline_ms: f64,
+    pixel_aa_pipeline_ms: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ResamplerCreationTimings {
+    Lanczos3(LanczosCreationTimings),
+    Anime4k(Anime4kCreationTimings),
+}
+
+impl ResamplerCreationTimings {
+    fn perf_value(self) -> serde_json::Value {
+        match self {
+            Self::Lanczos3(timings) => serde_json::json!({
+                "kind": "lanczos3", "steps": timings,
+            }),
+            Self::Anime4k(timings) => serde_json::json!({
+                "kind": "anime4k", "steps": timings.perf_value(),
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LanczosGenerationTimings {
+    resampler_create_ms: f64,
+    creation: Option<ResamplerCreationTimings>,
+    prepare_job_ms: f64,
+    register_texture_ms: f64,
+    encode_ms: f64,
+    submit_ms: f64,
+}
+
+impl LanczosGenerationTimings {
+    fn accounted_ms(self) -> f64 {
+        self.resampler_create_ms
+            + self.prepare_job_ms
+            + self.register_texture_ms
+            + self.encode_ms
+            + self.submit_ms
+    }
+}
+
+// The recorder itself only reads Instant and stores a scalar; the measured work is unchanged.
+pub(crate) fn measure_resampler_cpu_ms<T>(elapsed_ms: &mut f64, run: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let result = run();
+    *elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    result
+}
+
+fn get_or_create_resampler<'a, T>(
+    slot: &'a mut Option<T>,
+    timings: &mut LanczosGenerationTimings,
+    create: impl FnOnce() -> (T, ResamplerCreationTimings),
+) -> &'a mut T {
+    slot.get_or_insert_with(|| {
+        measure_resampler_cpu_ms(&mut timings.resampler_create_ms, || {
+            let (resampler, creation) = create();
+            timings.creation = Some(creation);
+            resampler
+        })
+    })
+}
+
+impl LanczosGenerationStats {
+    /// One shared field builder for the production event and headless regression tests.
+    pub(crate) fn perf_fields(&self) -> Vec<(&'static str, serde_json::Value)> {
+        let region = |axis: usize| {
+            self.visible_source_region
+                .map(|region| region[axis].into())
+                .unwrap_or(serde_json::Value::Null)
+        };
+        let mut fields = vec![
+            ("source_w", self.source_size[0].into()),
+            ("source_h", self.source_size[1].into()),
+            ("target_w", self.target_size[0].into()),
+            ("target_h", self.target_size[1].into()),
+            ("scale_branch", self.scale_branch.as_str().into()),
+            ("visible_source_x", region(0)),
+            ("visible_source_y", region(1)),
+            ("visible_source_w", region(2)),
+            ("visible_source_h", region(3)),
+            ("smoothing_percent", self.smoothing_percent.into()),
+            ("blur_factor", f64::from(self.blur_factor).into()),
+            ("texture_fetches", self.texture_fetches.into()),
+            ("encode_submit_cpu_ms", self.encode_submit_cpu_ms.into()),
+            ("regeneration_count", self.regeneration_count.into()),
+            ("resampler_created", self.timings.creation.is_some().into()),
+            (
+                "resampler_create_ms",
+                self.timings.resampler_create_ms.into(),
+            ),
+            ("prepare_job_ms", self.timings.prepare_job_ms.into()),
+            (
+                "register_texture_ms",
+                self.timings.register_texture_ms.into(),
+            ),
+            ("encode_ms", self.timings.encode_ms.into()),
+            ("submit_ms", self.timings.submit_ms.into()),
+            (
+                "unaccounted_ms",
+                (self.encode_submit_cpu_ms - self.timings.accounted_ms()).into(),
+            ),
+        ];
+        if let Some(creation) = self.timings.creation {
+            fields.push(("resampler_create_breakdown", creation.perf_value()));
+        }
+        fields
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2272,19 +2401,32 @@ impl GpuLanczosCache {
         source_texture: &wgpu::Texture,
     ) -> (FullscreenPaintResource, Option<LanczosPerfEvent>) {
         let started = Instant::now();
+        let mut timings = LanczosGenerationTimings::default();
         let job = match plan {
-            LanczosWorkPlan::AnimeUpscale(plan) => self
-                .anime_resampler
-                .get_or_insert_with(|| {
-                    Anime4kResampler::new(&render_state.device, STILL_IMAGE_ANIME4K_VARIANT)
+            LanczosWorkPlan::AnimeUpscale(plan) => {
+                let resampler =
+                    get_or_create_resampler(&mut self.anime_resampler, &mut timings, || {
+                        let resampler = Anime4kResampler::new(
+                            &render_state.device,
+                            STILL_IMAGE_ANIME4K_VARIANT,
+                        );
+                        let creation =
+                            ResamplerCreationTimings::Anime4k(resampler.creation_timings);
+                        (resampler, creation)
+                    });
+                measure_resampler_cpu_ms(&mut timings.prepare_job_ms, || {
+                    resampler
+                        .prepare_job(&render_state.device, source_texture, plan)
+                        .map(LanczosWorkJob::AnimeUpscale)
                 })
-                .prepare_job(&render_state.device, source_texture, plan)
-                .map(LanczosWorkJob::AnimeUpscale),
+            }
             plan => {
-                let resampler = self
-                    .resampler
-                    .get_or_insert_with(|| Lanczos3Resampler::new(&render_state.device));
-                match plan {
+                let resampler = get_or_create_resampler(&mut self.resampler, &mut timings, || {
+                    let resampler = Lanczos3Resampler::new(&render_state.device);
+                    let creation = ResamplerCreationTimings::Lanczos3(resampler.creation_timings);
+                    (resampler, creation)
+                });
+                measure_resampler_cpu_ms(&mut timings.prepare_job_ms, || match plan {
                     LanczosWorkPlan::Full(plan) => resampler
                         .prepare_job(&render_state.device, source_texture, plan)
                         .map(LanczosWorkJob::Full),
@@ -2298,19 +2440,30 @@ impl GpuLanczosCache {
                         .prepare_pixel_aa_job(&render_state.device, source_texture, plan)
                         .map(LanczosWorkJob::PixelArtUpscale),
                     LanczosWorkPlan::AnimeUpscale(_) => unreachable!(),
-                }
+                })
             }
         };
         let job = match job {
             Ok(job) => job,
             Err(_) => return (resource.original_resampleable(), None),
         };
-        let texture_id = render_state.renderer.write().register_native_texture(
-            &render_state.device,
-            job.output_view(),
-            wgpu::FilterMode::Linear,
-        );
-        self.submit_job(render_state, resource, key, plan, job, texture_id, started)
+        let texture_id = measure_resampler_cpu_ms(&mut timings.register_texture_ms, || {
+            render_state.renderer.write().register_native_texture(
+                &render_state.device,
+                job.output_view(),
+                wgpu::FilterMode::Linear,
+            )
+        });
+        self.submit_job(
+            render_state,
+            resource,
+            key,
+            plan,
+            job,
+            texture_id,
+            started,
+            timings,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2323,8 +2476,9 @@ impl GpuLanczosCache {
         job: LanczosWorkJob,
         texture_id: egui::TextureId,
         started: Instant,
+        timings: LanczosGenerationTimings,
     ) -> (FullscreenPaintResource, Option<LanczosPerfEvent>) {
-        self.encode_and_finish(rs, resource, key, plan, job, texture_id, started)
+        self.encode_and_finish(rs, resource, key, plan, job, texture_id, started, timings)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2337,7 +2491,10 @@ impl GpuLanczosCache {
         job: LanczosWorkJob,
         texture_id: egui::TextureId,
         started: Instant,
+        timings: LanczosGenerationTimings,
     ) -> (FullscreenPaintResource, Option<LanczosPerfEvent>) {
+        let mut timings = timings;
+        let encoded = Instant::now();
         let mut encoder = rs.device.create_command_encoder(&Default::default());
         match &job {
             LanczosWorkJob::Full(job) => {
@@ -2368,7 +2525,10 @@ impl GpuLanczosCache {
                     .encode(&mut encoder, job);
             }
         }
-        rs.queue.submit(Some(encoder.finish()));
+        // Command-buffer finish belongs to encode, not queue.submit.
+        let commands = encoder.finish();
+        timings.encode_ms = encoded.elapsed().as_secs_f64() * 1000.0;
+        measure_resampler_cpu_ms(&mut timings.submit_ms, || rs.queue.submit(Some(commands)));
         let output_texture = job.into_output_texture();
         let output = Arc::new(LanczosOutput::new(
             texture_id,
@@ -2376,9 +2536,10 @@ impl GpuLanczosCache {
             output_texture,
             rs.clone(),
         ));
-        self.finish_generation(resource, key, plan, output, started)
+        self.finish_generation(resource, key, plan, output, started, timings)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish_generation(
         &mut self,
         resource: &FullscreenPaintResource,
@@ -2386,6 +2547,7 @@ impl GpuLanczosCache {
         plan: LanczosWorkPlan,
         output: Arc<LanczosOutput>,
         started: Instant,
+        timings: LanczosGenerationTimings,
     ) -> (FullscreenPaintResource, Option<LanczosPerfEvent>) {
         self.regeneration_count = self.regeneration_count.wrapping_add(1);
         let stats = LanczosGenerationStats {
@@ -2395,6 +2557,7 @@ impl GpuLanczosCache {
             blur_factor: plan.blur_factor(),
             texture_fetches: plan.texture_fetches(),
             encode_submit_cpu_ms: started.elapsed().as_secs_f64() * 1000.0,
+            timings,
             regeneration_count: self.regeneration_count,
             scale_branch: key.scale_branch,
             visible_source_region: plan.visible_source_region(),
@@ -3140,6 +3303,7 @@ fn axis_fetch_count_region(
 }
 
 struct Lanczos3Resampler {
+    creation_timings: LanczosCreationTimings,
     bind_group_layout: wgpu::BindGroupLayout,
     vertical_pipeline: wgpu::RenderPipeline,
     horizontal_pipeline: wgpu::RenderPipeline,
@@ -3151,96 +3315,149 @@ struct Lanczos3Resampler {
 
 impl Lanczos3Resampler {
     fn new(device: &wgpu::Device) -> Self {
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
+        let mut creation_timings = LanczosCreationTimings::default();
+        let bind_group_layout =
+            measure_resampler_cpu_ms(&mut creation_timings.bind_group_layout_ms, || {
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: None,
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                multisampled: false,
+                                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                })
+            });
+        let layout = measure_resampler_cpu_ms(&mut creation_timings.pipeline_layout_ms, || {
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(&bind_group_layout)],
+                immediate_size: 0,
+            })
         });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: None,
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(LANCZOS3_SHADER)),
-        });
-        let visible_upscale_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: None,
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(VISIBLE_UPSCALE_LANCZOS3_SHADER)),
-        });
-        let nis_upscale_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: None,
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(NIS_UPSCALE_SHADER)),
-        });
-        let pixel_aa_upscale_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: None,
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(PIXEL_AA_UPSCALE_SHADER)),
-        });
+        let shader =
+            measure_resampler_cpu_ms(&mut creation_timings.lanczos3_shader_module_ms, || {
+                device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: None,
+                    source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(LANCZOS3_SHADER)),
+                })
+            });
+        let visible_upscale_shader = measure_resampler_cpu_ms(
+            &mut creation_timings.visible_upscale_shader_module_ms,
+            || {
+                device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: None,
+                    source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(
+                        VISIBLE_UPSCALE_LANCZOS3_SHADER,
+                    )),
+                })
+            },
+        );
+        let nis_upscale_shader =
+            measure_resampler_cpu_ms(&mut creation_timings.nis_shader_module_ms, || {
+                device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: None,
+                    source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(NIS_UPSCALE_SHADER)),
+                })
+            });
+        let pixel_aa_upscale_shader =
+            measure_resampler_cpu_ms(&mut creation_timings.pixel_aa_shader_module_ms, || {
+                device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: None,
+                    source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(PIXEL_AA_UPSCALE_SHADER)),
+                })
+            });
         Self {
-            vertical_pipeline: create_pipeline(
-                device,
-                &layout,
-                &shader,
-                "fs_vertical",
-                wgpu::TextureFormat::Rgba16Float,
+            vertical_pipeline: measure_resampler_cpu_ms(
+                &mut creation_timings.vertical_pipeline_ms,
+                || {
+                    create_pipeline(
+                        device,
+                        &layout,
+                        &shader,
+                        "fs_vertical",
+                        wgpu::TextureFormat::Rgba16Float,
+                    )
+                },
             ),
-            horizontal_pipeline: create_pipeline(
-                device,
-                &layout,
-                &shader,
-                "fs_horizontal",
-                wgpu::TextureFormat::Rgba8Unorm,
+            horizontal_pipeline: measure_resampler_cpu_ms(
+                &mut creation_timings.horizontal_pipeline_ms,
+                || {
+                    create_pipeline(
+                        device,
+                        &layout,
+                        &shader,
+                        "fs_horizontal",
+                        wgpu::TextureFormat::Rgba8Unorm,
+                    )
+                },
             ),
-            visible_upscale_vertical_pipeline: create_pipeline(
-                device,
-                &layout,
-                &visible_upscale_shader,
-                "fs_vertical",
-                wgpu::TextureFormat::Rgba16Float,
+            visible_upscale_vertical_pipeline: measure_resampler_cpu_ms(
+                &mut creation_timings.visible_upscale_vertical_pipeline_ms,
+                || {
+                    create_pipeline(
+                        device,
+                        &layout,
+                        &visible_upscale_shader,
+                        "fs_vertical",
+                        wgpu::TextureFormat::Rgba16Float,
+                    )
+                },
             ),
-            visible_upscale_horizontal_pipeline: create_pipeline(
-                device,
-                &layout,
-                &visible_upscale_shader,
-                "fs_horizontal",
-                wgpu::TextureFormat::Rgba8Unorm,
+            visible_upscale_horizontal_pipeline: measure_resampler_cpu_ms(
+                &mut creation_timings.visible_upscale_horizontal_pipeline_ms,
+                || {
+                    create_pipeline(
+                        device,
+                        &layout,
+                        &visible_upscale_shader,
+                        "fs_horizontal",
+                        wgpu::TextureFormat::Rgba8Unorm,
+                    )
+                },
             ),
-            nis_upscale_pipeline: create_pipeline(
-                device,
-                &layout,
-                &nis_upscale_shader,
-                "fs_nis",
-                wgpu::TextureFormat::Rgba8Unorm,
+            nis_upscale_pipeline: measure_resampler_cpu_ms(
+                &mut creation_timings.nis_upscale_pipeline_ms,
+                || {
+                    create_pipeline(
+                        device,
+                        &layout,
+                        &nis_upscale_shader,
+                        "fs_nis",
+                        wgpu::TextureFormat::Rgba8Unorm,
+                    )
+                },
             ),
-            pixel_aa_pipeline: create_pipeline(
-                device,
-                &layout,
-                &pixel_aa_upscale_shader,
-                "fs_pixel_aa",
-                wgpu::TextureFormat::Rgba8Unorm,
+            pixel_aa_pipeline: measure_resampler_cpu_ms(
+                &mut creation_timings.pixel_aa_pipeline_ms,
+                || {
+                    create_pipeline(
+                        device,
+                        &layout,
+                        &pixel_aa_upscale_shader,
+                        "fs_pixel_aa",
+                        wgpu::TextureFormat::Rgba8Unorm,
+                    )
+                },
             ),
             bind_group_layout,
+            creation_timings,
         }
     }
 
@@ -3711,6 +3928,10 @@ fn create_pipeline(
 #[cfg(test)]
 #[path = "gpu_lanczos/prewarm_tests.rs"]
 mod prewarm_tests;
+
+#[cfg(test)]
+#[path = "gpu_lanczos/measurement_tests.rs"]
+mod measurement_tests;
 
 #[cfg(test)]
 mod tests {

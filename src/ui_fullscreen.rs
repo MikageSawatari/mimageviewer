@@ -12163,46 +12163,7 @@ impl App {
                         "lanczos_regenerate",
                         key.as_deref(),
                         self.input_seq,
-                        &[
-                            ("source_w", stats.source_size[0].into()),
-                            ("source_h", stats.source_size[1].into()),
-                            ("target_w", stats.target_size[0].into()),
-                            ("target_h", stats.target_size[1].into()),
-                            ("scale_branch", stats.scale_branch.as_str().into()),
-                            (
-                                "visible_source_x",
-                                stats
-                                    .visible_source_region
-                                    .map(|region| region[0].into())
-                                    .unwrap_or(serde_json::Value::Null),
-                            ),
-                            (
-                                "visible_source_y",
-                                stats
-                                    .visible_source_region
-                                    .map(|region| region[1].into())
-                                    .unwrap_or(serde_json::Value::Null),
-                            ),
-                            (
-                                "visible_source_w",
-                                stats
-                                    .visible_source_region
-                                    .map(|region| region[2].into())
-                                    .unwrap_or(serde_json::Value::Null),
-                            ),
-                            (
-                                "visible_source_h",
-                                stats
-                                    .visible_source_region
-                                    .map(|region| region[3].into())
-                                    .unwrap_or(serde_json::Value::Null),
-                            ),
-                            ("smoothing_percent", stats.smoothing_percent.into()),
-                            ("blur_factor", f64::from(stats.blur_factor).into()),
-                            ("texture_fetches", stats.texture_fetches.into()),
-                            ("encode_submit_cpu_ms", stats.encode_submit_cpu_ms.into()),
-                            ("regeneration_count", stats.regeneration_count.into()),
-                        ],
+                        &stats.perf_fields(),
                     );
                 }
                 crate::gpu_lanczos::LanczosPerfEvent::UpscaleLimitFallback(stats) => {

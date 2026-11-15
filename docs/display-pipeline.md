@@ -2310,7 +2310,9 @@ backstop/frozenの全typed paint入口が共通helperを使う。callback内で�
 総画素 4096×4096 相当の 2 枚分を追加上限として古い entry を落とし、縮小 cache の保持規則は変えない。
 perf log の
 `gpu/lanczos_regenerate` に source / target、smoothing percent / blur、推定 fetch 数、
-encode + submit CPU 時間、累積再生成回数、拡大 / 縮小の別を記録する。Lanczos3 / NIS /
+encode + submit CPU 時間、累積再生成回数、拡大 / 縮小の別を記録する。
+`resampler_created` / `resampler_create_ms`、`prepare_job_ms` / `register_texture_ms` / `encode_ms`（encoder 作成・finish 含む）/ `submit_ms` と、既存合計との差 `unaccounted_ms` は排他的な CPU 壁時計時間。
+作成した回だけ `resampler_create_breakdown` に kind（lanczos3 / anime4k）と layout・各 shader module・各 pipeline の内訳を載せる（作成時間の内数。driver 内部の原因や GPU 実行時間は未特定）。Lanczos3 / NIS /
 Anime4K / pixel-AA は event 名を共用し、`scale_branch`
 (`upscale` / `upscale_nis` / `upscale_anime` / `upscale_pixel_art`)
 で区別する。拡大時はさらに、
