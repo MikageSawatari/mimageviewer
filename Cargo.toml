@@ -97,6 +97,13 @@ bench = false
 # Development-only helpers.  Keeping these behind one feature prevents normal
 # application builds and integration tests from compiling every helper binary.
 [[bin]]
+name = "native_detached_probe"
+path = "src/bin/native_detached_probe.rs"
+test = true
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
 name = "bench_ai"
 path = "src/bin/bench_ai.rs"
 test = false

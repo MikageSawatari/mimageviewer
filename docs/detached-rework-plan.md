@@ -1458,6 +1458,16 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-15: §1.767 サブPC依頼56 — 最大化buttonの理由付き診断と独立probe
+
+BA-7のnative操作終端を調査。通常最大化／復元の取消理由を一つに確定できないため、
+認識規則は変えず、NonClient／NativeMediaTouchのnormalizedへ既存のtyped reasonを追加した。
+dev-tools限定probeは自分で作ったWin32 HWNDへ製品のsubclass／PM_REMOVE観測／dispatch／finishと
+allocation leaseを共有し、App／GPU／実設定を初期化しない。rectによるHWND同定、時間窓、retry、
+App pendingは追加しない。独立review（Sol / xhigh）は、同じownerの診断を用いる構造であり
+症状パッチではないと合意、sourceはACCEPT。根拠・候補表・使用手順・検証／未確認は
+[依頼56記録 §5.10](depth-parallax-realmachine50-investigation.md#510-依頼56-最大化復元ボタンの取消理由と実os順序の採取2026-11-15)へ記録する。
+
 ### 2026-11-15: §1.767 サブPC依頼55 — caption／長押し／ParkedLiveと入力入口の診断
 
 再レビューの位置なし終端の認可分離を反映（BA-7）。eguiのcanonical release位置を正本にし、

@@ -77,7 +77,7 @@ impl PartialEq for DetachedActivationRequest {
 
 impl DetachedActivationRequest {
     pub(crate) fn log(&self, boundary: &str, decision: DetachedActivationDecision) {
-        self.log_with_client_reason(boundary, decision, None);
+        crate::logger::log(self.diagnostic_line(boundary, decision, None));
     }
 
     pub(crate) fn log_client_cancelled(
@@ -86,22 +86,46 @@ impl DetachedActivationRequest {
         decision: DetachedActivationDecision,
         reason: super::detached_activation_gesture::ClientActivationCancelReason,
     ) {
-        self.log_with_client_reason(boundary, decision, Some(reason));
+        crate::logger::log(self.diagnostic_line(boundary, decision, Some(&reason)));
     }
 
-    fn log_with_client_reason(
+    fn diagnostic_line(
         &self,
         boundary: &str,
         decision: DetachedActivationDecision,
-        reason: Option<super::detached_activation_gesture::ClientActivationCancelReason>,
-    ) {
+        reason: Option<&dyn std::fmt::Debug>,
+    ) -> String {
         let reason = reason
             .map(|reason| format!(" reason={reason:?}"))
             .unwrap_or_default();
-        crate::logger::log(format!(
+        format!(
             "[detached-activation] boundary={boundary} source={:?} decision={decision:?}{reason} window={} registration={:?} context={:?} expected_state={:?}",
             self.source, self.window_id, self.registration, self.context_id, self.expected_state,
-        ));
+        )
+    }
+
+    fn native_outcome_diagnostic(
+        &self,
+        boundary: &str,
+        outcome: crate::key_input::NativeNonClientOutcome,
+    ) -> (DetachedActivationDecision, String) {
+        use crate::key_input::{
+            NativeInputCancelReason as Reason, NativeNonClientOutcome as Outcome,
+        };
+        let decision = match outcome {
+            Outcome::Completed => DetachedActivationDecision::Accepted,
+            Outcome::CloseOwned => DetachedActivationDecision::CloseOwned,
+            Outcome::Cancelled(Reason::ModalOwned) => DetachedActivationDecision::ModalOwned,
+            Outcome::Cancelled(Reason::RetiredRegistration) => {
+                DetachedActivationDecision::RetiredRegistration
+            }
+            Outcome::Cancelled(_) => DetachedActivationDecision::GestureCancelled,
+        };
+        let line = match outcome {
+            Outcome::Cancelled(reason) => self.diagnostic_line(boundary, decision, Some(&reason)),
+            _ => self.diagnostic_line(boundary, decision, Some(&None::<Reason>)),
+        };
+        (decision, line)
     }
 }
 
@@ -289,24 +313,9 @@ impl App {
                             }
                             request.registration = Some(event.source.registration);
                             request.allocation = Some(event.source.epoch);
-                            let decision = match outcome {
-                                NativeNonClientOutcome::Completed => {
-                                    DetachedActivationDecision::Accepted
-                                }
-                                NativeNonClientOutcome::CloseOwned => {
-                                    DetachedActivationDecision::CloseOwned
-                                }
-                                NativeNonClientOutcome::Cancelled(
-                                    NativeInputCancelReason::ModalOwned,
-                                ) => DetachedActivationDecision::ModalOwned,
-                                NativeNonClientOutcome::Cancelled(
-                                    NativeInputCancelReason::RetiredRegistration,
-                                ) => DetachedActivationDecision::RetiredRegistration,
-                                NativeNonClientOutcome::Cancelled(_) => {
-                                    DetachedActivationDecision::GestureCancelled
-                                }
-                            };
-                            request.log("normalized", decision);
+                            let (decision, line) =
+                                request.native_outcome_diagnostic("normalized", outcome);
+                            crate::logger::log(line);
                             if decision == DetachedActivationDecision::Accepted {
                                 shared.push_event(DeferredDetachedImageWindowEvent::Activation {
                                     request,
@@ -327,6 +336,71 @@ impl App {
 mod tests {
     use super::super::detached_activation_gesture::*;
     use super::*;
+
+    #[test]
+    fn native_detached_normalized_diagnostic_keeps_cancel_reason_and_owner() {
+        use crate::key_input::{
+            NativeInputCancelReason as Reason, NativeNonClientOutcome as Outcome,
+        };
+        for source in [
+            DetachedActivationSource::NonClientClick,
+            DetachedActivationSource::NativeMedia,
+        ] {
+            let request = DetachedActivationRequest {
+                window_id: 56,
+                registration: None,
+                context_id: Some(ViewerContextId::for_test(7)),
+                source,
+                expected_state: DetachedActivationTargetState::ParkedLive,
+                allocation: None,
+            };
+            for reason in [
+                Reason::ModalOwned,
+                Reason::CaptureLost,
+                Reason::PointerCancelled,
+                Reason::CancelMode,
+                Reason::FocusLost,
+                Reason::Escape,
+                Reason::CaptionButtonOutside,
+                Reason::RetiredRegistration,
+            ] {
+                let (decision, line) =
+                    request.native_outcome_diagnostic("normalized", Outcome::Cancelled(reason));
+                assert_eq!(
+                    decision,
+                    match reason {
+                        Reason::ModalOwned => DetachedActivationDecision::ModalOwned,
+                        Reason::RetiredRegistration =>
+                            DetachedActivationDecision::RetiredRegistration,
+                        _ => DetachedActivationDecision::GestureCancelled,
+                    }
+                );
+                assert!(
+                    line.contains(&format!(
+                        "source={source:?} decision={decision:?} reason={reason:?}"
+                    )),
+                    "{line}"
+                );
+                assert!(
+                    line.contains("boundary=normalized") && line.contains("window=56"),
+                    "{line}"
+                );
+                assert!(
+                    line.contains("context=Some(ViewerContextId(7))")
+                        && line.contains("expected_state=ParkedLive"),
+                    "{line}"
+                );
+            }
+            for (outcome, expected) in [
+                (Outcome::Completed, DetachedActivationDecision::Accepted),
+                (Outcome::CloseOwned, DetachedActivationDecision::CloseOwned),
+            ] {
+                let (decision, line) = request.native_outcome_diagnostic("normalized", outcome);
+                assert_eq!(decision, expected);
+                assert!(line.contains("reason=None"), "{line}");
+            }
+        }
+    }
 
     fn realmachine55_parked_media_fixture() -> (
         super::super::tests::phase_c_support::AppTestEnv,

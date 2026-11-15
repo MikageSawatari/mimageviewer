@@ -11,6 +11,11 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
+/// Standalone development probe; it uses the production input owner and never
+/// creates an App or enables the test-script input contract.
+#[cfg(feature = "dev-tools")]
+pub mod native_detached_probe;
+
 #[cfg(all(windows, any(test, feature = "test-script")))]
 use std::sync::mpsc;
 
@@ -5898,6 +5903,8 @@ fn native_non_client_location(
                 if !unsafe { windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut point) }
                     .as_bool()
                 {
+                    #[cfg(feature = "dev-tools")]
+                    native_detached_probe::release_hit(hwnd.0 as u64, message, None);
                     report_native_window_input_failure(format!(
                         "non-client button ClientToScreen failed hwnd={hwnd:?}"
                     ));
@@ -5922,6 +5929,8 @@ fn native_non_client_location(
             }
         }
     };
+    #[cfg(feature = "dev-tools")]
+    native_detached_probe::release_hit(hwnd, message, Some(hit));
     Some(NativeNonClientPressTarget { hit })
 }
 
@@ -6005,6 +6014,13 @@ fn native_detached_message_with_hit_test(
     origin: NativeMouseOrigin,
     hit_test: impl FnOnce(u64, u32, usize, isize) -> Option<NativeNonClientPressTarget>,
 ) {
+    #[cfg(feature = "dev-tools")]
+    let _probe_trace = native_detached_probe::MessageTrace::begin(
+        hwnd,
+        message,
+        Some((wparam, lparam)),
+        if dispatching { "dispatch" } else { "hook" },
+    );
     if origin == NativeMouseOrigin::PointerPromotion {
         // The raw pointer owner receives its own Up/cancellation. None of a
         // promoted NC mouse sequence may mutate an independent mouse owner.
@@ -6279,6 +6295,8 @@ fn native_detached_message_with_hit_test(
 }
 
 fn finish_native_detached_dispatch(hwnd: u64, subclass_id: usize, message: u32) {
+    #[cfg(feature = "dev-tools")]
+    let _probe_trace = native_detached_probe::MessageTrace::begin(hwnd, message, None, "finish");
     let Ok(mut guard) = state().lock() else {
         return;
     };

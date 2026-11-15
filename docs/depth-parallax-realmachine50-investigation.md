@@ -1358,6 +1358,190 @@ cargo nextest run --manifest-path vendor/eframe/Cargo.toml --no-default-features
 実機確認の代わりとは扱わない。描画・layout・UI文字列の変更はなく、ui_snapshotは実施しない。
 全件gate・build-dev・製品起動・commit／pushは指示に従い実施しない。
 
+### 5.10 依頼56: 最大化／復元ボタンの取消理由と実OS順序の採取（2026-11-15）
+
+基点はHEAD `3f35452ef`（製品 `81406ab92`）。`git log -3` とclean treeを確認した。
+**原因は未確定であり、今回、認識規則・phase遷移・finish条件を変更しない。**
+理由付き診断と、同じ製品実装を使う独立Win32 probeを追加して次の実機採取へ渡す。
+BA-7（操作の所有と確定点）の確認であり、待機・再試行・時間窓・rectによるHWND推定・App pendingは追加しない。
+
+#### 観測と確定できる範囲
+
+依頼時は結果未着だったが、作業中に `C:/miv-subpc/results-56-767/notes.md` とlogsが到着し照合した。
+観測者はすべてサブPC担当。part1の399.720／449.983／460.359sではParkedLiveのwindow8、
+part3の215.394／243.527／254.718／269.121／279.313／288.589sではParkedのwindow1について、
+OSの最大化／復元は行われるが `normalized NonClientClick GestureCancelled` だけが残る。
+依頼55の通常最大化173.365sはcommit。依頼56のcaption click／drag／double clickは成功し、
+button外releaseはOS動作も再開もなく、×はCloseOwnedだった。ERROR／WARN／panic／HWND conflictは0件。
+報告中の「戻ってから離す」は画面操作ツールの制約により未実施であり、成功確認へ含めない。
+
+既存ログにはraw message列とreasonがないため、上の事実だけで先行取消の原因は決められない。
+`GestureCancelled` はModalOwned／RetiredRegistrationと別decisionなので、target更新に伴う
+その2理由を当該行の直接原因とは扱わない。NC開始時の別操作のCancelModeは、その元操作の種類で配送される。
+同じNC操作を理由なしにtarget更新でCancelModeへ替える経路は確認できなかった。
+
+#### 製品の診断
+
+`DetachedActivationRequest::native_outcome_diagnostic` をNonClient／NativeMediaTouchの共通sinkで呼び、
+既存decision mappingを変えず、通常の `logger::log` へ1行を渡す。
+取消は `reason=CaptureLost`／`FocusLost`／`CancelMode`／`CaptionButtonOutside`等、
+Completed／CloseOwnedは `reason=None`。window／registration／context／expected_stateは従来どおり。
+判定・破棄のイベント境界だけで出し、毎frameのログは追加しない。
+
+```text
+[detached-activation] boundary=normalized source=NonClientClick decision=GestureCancelled reason=CaptureLost window=... registration=... context=... expected_state=Parked
+```
+
+本体loggerへ直接渡すため、dependencyのInfo targetを開ける必要はない。
+NativeMediaTouchも同じformatterを通り、sourceは既存どおりNativeMediaとする。
+
+#### 通知列ごとの現行結果（ソース上の判定表、実機列の断定ではない）
+
+以下は通常mouseでHTMAXBUTTONを押した場合。D＝subclassのNC Down、U＝所有Up、
+C＝一致するSC_MAXIMIZE／SC_RESTOREのdispatch、F(D)＝外側DefSubclassProc(D)の返却。
+hookはPM_REMOVEだけを観測し、自身は開始producerにならない。
+
+| 通知列／境界 | 現行結果 | 決定する事実 |
+| --- | --- | --- |
+| D → 内側U → C → F(D) | Completed | Released → ButtonActionCommitted |
+| D → C → capture／focus／CancelMode → F(D) | Completed | 確定後の通常取消はphaseを巻き戻さない |
+| D → 内側U → capture解放 → C → F(D) | Completed | CaptureLostの対象はPressedだけ |
+| D → CaptureChanged → U／C → F(D) | Cancelled(CaptureLost) | buttonにはcaptionのlParam=0例外がない。先行取消からCで復活しない |
+| D → KillFocus → U／C → F(D) | Cancelled(FocusLost) | C前のPressed／Releasedで取消 |
+| D → CancelMode → U／C → F(D) | Cancelled(CancelMode) | 同上 |
+| D → Escape → U／C → F(D) | Cancelled(Escape) | 同上 |
+| D → 異なるhitのU → C → F(D) | Cancelled(CaptionButtonOutside) | releaseのhitが押したbuttonと一致しない |
+| D → Uの位置変換失敗 → C → F(D) | Cancelled(CancelMode) | ClientToScreen失敗。既存failure通知も出る |
+| D → 内側U → Cはhookだけ／不一致command → KillFocus → F(D) | Cancelled(FocusLost) | dispatch中の一致commandでなければ確定しない |
+| D → F(D) → C（Pressed／AwaitingRelease、Uなし）→ CaptureChanged | Cancelled(CaptureLost) | そのscopeのPressedは一致SCだけでは確定せず、後のcapture取消が残る |
+| raw NC pointerでC前にpointer cancel／capture changed | Cancelled(PointerCancelled) | pointer ID一致が必要。普通mouseの直接理由ではない |
+| D → C → target block／retire | Cancelled(ModalOwned／RetiredRegistration) | bindingの取消は確定後も有効。ログdecisionはGestureCancelledではない |
+| D → F(D)、U／Cなし | 未完了・AwaitingRelease | buttonはcaptionと異なりDown returnだけでは完了しない |
+| HTCLOSEの操作 | CloseOwned | 再開へ変換しない |
+
+参照関数は `key_input.rs` の `native_non_client_location`／`native_non_client_button_location`、
+`native_detached_message_with_hit_test`、`finish_native_detached_dispatch`、`set_native_detached_input_targets`。
+`e9c909f56` と `81406ab92` を比較し、依頼55の `25f3f9e41` も照合した。
+旧版にもPressed時CaptureLost、KillFocus／CancelMode、release座標変換＋NCHITTESTは存在する。
+新側はmotionでの取消と8px距離判定を撤去し、一致SCの確定を足す方向で、
+同一message列・同一ownerから「旧Completed、新Cancelled」となる単一の新条件は見つからなかった。
+`PointerButtonReleased` はegui client経路であり、このNC reducerへ直接入力しない。
+到着した全logsで `ClientToScreen`／`non-client button` のfailure記録は見つからなかった。
+変換失敗の経路には独立した通常logがあるため、単にWARNが0という事実より強い反証となるが、
+実際のcancel理由は新reasonで確かめる。
+
+[MicrosoftのWM_CAPTURECHANGED仕様](https://learn.microsoft.com/en-us/windows/win32/inputdev/wm-capturechanged)は、
+自身のReleaseCaptureでも通知を受けることを規定する。
+[WM_LBUTTONUP仕様](https://learn.microsoft.com/en-us/windows/win32/inputdev/wm-lbuttonup)の座標はclient相対で、
+現行のClientToScreenはその契約に従う。
+[ReactOSのThemeHandleButton](https://github.com/reactos/reactos/blob/master/dll/win32/uxtheme/nonclient.c#L663)は、
+GetMessageでUpを内部消費し、ReleaseCapture後に一致SCをSendMessageする。
+これはWindows 11の実列の証拠ではなく、hookがUpを観測できれば現行でCompletedになる列の参考である。
+「ReleaseCaptureがSCより先だから今回だけ失敗」とは断定しない。
+
+#### 独立probeの共有境界と寿命
+
+`src/bin/native_detached_probe.rs` を `dev-tools` 必須の補助binとして登録し、通常配布のgraphへ含めない。
+自身で標準枠付きtop-level窓を1つ作り、App／renderer／backend／設定／本体loggerを初期化しない。
+headless egui Contextはlogical registrationだけを所有する。
+`key_input::native_detached_probe::ProbeSession` が実HWNDへ製品の `install_window_input` と
+`NativeKeyInputLease` を接続し、Parked相当のtargetを登録する。reducer／subclass／hit testの写しはない。
+UIthreadのWH_GETMESSAGEはHC_ACTION＋PM_REMOVEだけを製品の `observe_native_detached_message` へ渡す。
+実subclassは従来どおりDefSubclassProcを呼び、製品のdispatch／finishを通す。
+probeのoutcomeは記録だけに使い、targetをActiveへ変更しないので続けて複数操作を比較できる。
+
+dev-tools限定traceはdispatch／hookの前後binding、実release_hit、native finish前後を出す。
+scopeはinput mutexより前に作り、後にdropするのでsnapshot／sink呼出しはowner lock外。
+sinkのファイルI/Oは専用writerへ配送し、stdoutとファイルに同じ順序で1行ずつ保存する。
+製品の通常featureではこのtraceはコンパイルされない。
+scope unwind時はlease退役 → hook解放 → 自窓破棄、すべてのtrace sender解放後にwriterをjoinする。
+×等で先にWM_NCDESTROYとなった場合も、その既存terminal処理とleaseの明示退役を重複実行しない。
+finishの引数は元関数が保持しないため `parameters=not-captured` とし、架空のwParam／lParam=0を記録しない。
+
+#### PowerShellでのビルドとサブPCでの使用
+
+ビルドは本体の配布buildとは別。エージェントはビルドとheadless testだけを実行し、probeも起動しない。
+
+```powershell
+# リポジトリroot（実際の検証では指定run-heavy.ps1経由）
+cargo build -p mimageviewer --features dev-tools --bin native_detached_probe
+# 出力: G:\home\mimageviewer-767s2\target\debug\native_detached_probe.exe
+```
+
+コピー用の専用フォルダは `G:/home/mimageviewer-767s2/target/rm56-native-detached-probe/`。
+**このフォルダ全体**をサブPCの `C:/miv-test-v5/native-input-probe/` へコピーする。
+内部exeは `native_detached_probe.exe`（33,454,080 bytes、約33.5 MB）。実装共有によりPE importに
+FFmpegの `avcodec-61.dll`／`avfilter-10.dll`／`avformat-61.dll`／`avutil-59.dll`／
+`swresample-5.dll`／`swscale-8.dll` が残るため、同じvendorの6 DLLを隣へ配置した。
+実行ファイル＋6 DLLは計151,267,344 bytes。`FFmpeg-LICENSE.txt`、README、PE-IMPORTS.jsonも同梱する。
+DLLの推移依存は同梱DLLまたはWindowsのsystem DLL／API setに解決することを静的に照合した。
+この静的確認を起動確認とは扱わない。製品の配布ディレクトリへは追加していない。
+
+```powershell
+Set-Location C:\miv-test-v5\native-input-probe
+# manualが既定。自分の窓で最大化→復元、caption click／drag／double click、
+# buttonの外でrelease／外へ出て戻ってreleaseを行い、最後にEscか×で終了。
+.\native_detached_probe.exe --log .\manual.log
+$LASTEXITCODE
+
+# autoは明示したときだけ。自窓の最大化→復元を各1clickし、終了する。
+.\native_detached_probe.exe --auto --log .\auto.log
+$LASTEXITCODE
+```
+
+logは起動ごとに上書きするため、比較するrunには別名を指定する。
+
+autoはOSのTITLEBARINFOEXのbutton矩形から点を取り、WM_NCHITTEST=HTMAXBUTTON、
+WindowFromPoint=自HWNDを送信直前に確認する。異なる窓・不明な矩形・不一致hitなら入力せずerrorで終了する。
+1段階につきSendInputはmove／down／upの1 batchだけ。WM_SIZEの最大化／復元完了を受け、
+外側DispatchMessageが返った後に次の段階へ進む。modal loop中へ次のclickを入れない。
+待機timer／retryはなく、OSの完了通知が来なければEsc／×で中断する（auto未完了はexit 1）。
+手動時は入力を合成しない。ツールが書くのは指定logだけで、mIVの通常profileには触れない。
+
+#### 出力の読み方と次の判断
+
+- `t_us` はtool開始からの時刻。`source=hook_removed` は除去済みMSGのtimeも持つ。
+- `source=wndproc` は自窓のmessage／wParam／lParam。NCのhitはpayload、NCHITTESTは実返値を記録する。
+  client messageにはhit payloadがないためNoneとし、HTCLIENTを推測しない。
+- `source=shared boundary=hook/dispatch.before/after` で同じHWNDのbinding、Pressed／Released／Committed／Cancelledとscopeを追う。
+- `boundary=release_hit` で実Upのhit照合を確認する。`hit=None` は変換失敗であり位置の推定は行わない。
+- `boundary=finish` は各messageのDefSubclassProc返却後。特に外側NC Downのfinishと、
+  内側のUp／SC等のfinishをmessage番号で区別し、`boundary=outcome` の最終Completed／Cancelledとreasonを読む。
+- 先行取消、内側Uの有無、SCのdispatch/hook別、hitの変化を上表と照合する。
+  probeで再現しなければ、それ自体をmIVの改善証明にせず、製品の新reasonとhost差を比較する。
+
+**最終検証記録。** 指定run-heavy、Owner `codex/767-rm56` で直列。
+
+```powershell
+cargo build -p mimageviewer --features dev-tools --bin native_detached_probe
+cargo test -p mimageviewer --features dev-tools --bin native_detached_probe -- --test-threads 6
+cargo nextest run -p mimageviewer --lib -E 'test(/native_detached_normalized_diagnostic|native_detached_caption|native_detached_raw_caption|non_client|realmachine55_parked_live_native_non_client/)' --no-fail-fast --test-threads 6
+cargo nextest run -p mimageviewer --lib -E 'test(/native_detached|non_client|caption|detached_activation|realmachine55_|parked|native_video/)' --no-fail-fast --test-threads 6
+cargo check -p mimageviewer --bin mimageviewer-core
+cargo fmt
+```
+
+| 検証 | 件数／exit code | 証跡 |
+| --- | --- | --- |
+| probe build | 1 exe、exit 0 | `target/rm56-probe-build.log` |
+| probe pure unit | 3実行／3成功／0失敗、exit 0 | `target/rm56-probe-unit.log` |
+| 本体焦点 | 6実行／6成功／0失敗、exit 0 | `target/rm56-focused.log` |
+| 本体回帰 | 663実行／663成功／0失敗、exit 0 | `target/rm56-regression.log` |
+| core check | 1 core対象、exit 0 | `target/rm56-check.log` |
+| 最後の引数なしfmt | exit 0 | `target/rm56-fmt.log` |
+| `python scripts/check_ui_glyphs.py` | 危険glyph 0、exit 0 | 最終sourceで実行 |
+| `git diff --check` | whitespace異常0、exit 0 | 最終文書更新後 |
+
+PE import／exeサイズ・SHA256は `target/rm56-pe-imports.json` に採取した。
+exe SHA256: `5769572b5d2caa20f348925d97e237f3a164d7652e89f92b1ae287bab9da1ba5`。
+共有full lock（他作業の配布build）が解放されるまで待機し、開始後はlock領域／G: TEMPへの
+書込不可の警告に従い低優先度・6並列で実行した。他作業のprocess／lockは変更していない。
+変更ファイルは `Cargo.toml`、`src/app/detached_activation.rs`、`src/key_input.rs`、
+`src/key_input/native_detached_probe.rs`、`src/bin/native_detached_probe.rs`、本書、`docs/detached-rework-plan.md` の7件。
+独立source review（Sol / xhigh）は、認識規則を変えない診断と同じownerを使うprobeを
+症状パッチではない構造としてACCEPT。実API compileと実機順序の確認をその判定へ代用しない。
+未確認は実OS列、native theme／mIV host差、手動・auto実行、実機reason。製品起動・全件gate・build-dev・commit／pushは実施しない。
+
 ## 6. 診断（初回調査の案、A実装で導入）
 
 初回調査では案だけを記録した。依頼50 Aでは、以下の入力診断を製品の通常ログへ実装した。
