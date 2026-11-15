@@ -1460,6 +1460,16 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ### 2026-11-15: §1.767 サブPC依頼57 — caption buttonの確定点を一致SCに統一
 
+タッチ・最小化の独立レビュー（基点9c69805bd、Sol / xhigh、REJECT）は構造修正に合意。
+P2-2は昇格mouseのbutton開始をDown／DBLCLKへそろえ、既存の一致SCと本人call返却を共用する（BA-7）。
+P2-1は設計担当の判断でraw／昇格の相関pendingを作らない。利用者touch.logの4tapの
+開始座標／hit一致と、仮定の交差hitによる二重outcomeのApp受理境界の検査を、調査書§5.11末尾へ記録する。
+App field／caption／resize／×／clientの経路は変更しない。
+2026-11-16のPC reset後は中断前logを根拠にせず、4並列で焦点28件・回帰679件・probe単体7件を再実行し全成功。
+仮定の二重outcomeはParked／ParkedLiveとも同batchではCommandOwned、commit後はNotParkedで、
+実commitは1回・ページ不変を確認した。probe build／core check／最後の引数なしfmtもexit 0。
+コマンド・証跡・実測4tapの行番号と未確認の限界は調査書§5.11末尾を参照。
+
 依頼58の利用者決定で最小化は再開しない例外へ変更。HTMINBUTTON＋一致SC_MINIMIZEの
 結果を既存native確定相の閉じたpayloadへ保持し、同call返却でMinimizeOwnedを出す。
 Appのnormalized decisionもMinimizeOwnedとし、既存のAccepted限定輸送へ入れないため

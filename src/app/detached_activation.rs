@@ -457,6 +457,169 @@ mod tests {
         (app, ctx, id)
     }
 
+    fn realmachine58_parked_fixture(
+        live: bool,
+    ) -> (
+        super::super::tests::phase_c_support::AppTestEnv,
+        egui::Context,
+        u64,
+    ) {
+        if live {
+            realmachine55_parked_media_fixture()
+        } else {
+            use super::super::detached_media_exchange_tests as media;
+            let mut app = super::super::tests::phase_c_support::setup_app();
+            let ctx = egui::Context::default();
+            ctx.set_embed_viewports(false);
+            let root = app.tmp.path().to_path_buf();
+            media::install_items(&mut app, &ctx, &root, false);
+            app.current_folder = Some(root);
+            app.settings.detached_viewer_enabled = true;
+            app.settings.detached_viewer_open_images_in_window = true;
+            media::open_grid(&mut app, &ctx, 2);
+            let id = app.active_detached_window_id().unwrap();
+            let owner = app.locate_window_context(id).unwrap().0;
+            assert_ne!(owner, app.viewer_context_main());
+            app.with_viewer_context(owner, |viewer| {
+                // The fresh physical context has its own cache generation.
+                // Supply its canonical displayed source before grid handoff,
+                // as the full viewport scenario harness does before pause.
+                let idx = viewer.fullscreen_idx.unwrap();
+                super::super::source_texture_test_support::seed(viewer, &ctx, idx);
+                assert!(
+                    viewer
+                        .build_active_detached_image_window_snapshot(Some(&ctx))
+                        .is_some()
+                );
+            })
+            .unwrap();
+            media::open_grid(&mut app, &ctx, 3);
+            assert_eq!(
+                app.detached_window_state(id),
+                Some(DetachedWindowState::Parked)
+            );
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                app.render_detached_image_windows(ui.ctx())
+            })
+            .drop_without_applying_deltas();
+            (app, ctx, id)
+        }
+    }
+
+    #[test]
+    fn realmachine58_review_cross_hit_results_apply_activation_once_without_turning_page() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            HTCAPTION, HTMAXBUTTON, SC_MAXIMIZE, WM_NCLBUTTONDOWN, WM_NCPOINTERDOWN,
+            WM_NCPOINTERUP, WM_SYSCOMMAND,
+        };
+        let _input = crate::key_input::lock_test_input();
+        for live in [false, true] {
+            for after_commit in [false, true] {
+                let (mut app, ctx, id) = realmachine58_parked_fixture(live);
+                let owner = app.locate_window_context(id).unwrap().0;
+                let page_before = app
+                    .with_viewer_context_ref(owner, |viewer| viewer.fullscreen_idx())
+                    .unwrap();
+                assert!(
+                    page_before.is_some(),
+                    "the parked context retains its actual current page"
+                );
+                let registration = ctx
+                    .viewport_registration(App::detached_image_window_viewport_id(id))
+                    .unwrap();
+                let allocation = crate::key_input::register_test_native_input_allocation(
+                    registration,
+                    0x8160 + u64::from(live) * 2 + u64::from(after_commit),
+                );
+                app.sync_detached_native_input_targets(&ctx);
+                let shared = Arc::clone(&app.deferred_detached_image_window_views[&id]);
+                // Deliberately hypothetical: the promoted hit differs from raw
+                // press hit. Both outcomes are made before target sync/commit.
+                allocation.native_message_for_test(
+                    WM_NCPOINTERDOWN,
+                    (HTCAPTION as usize) << 16 | 7,
+                    0,
+                );
+                allocation.finish_native_dispatch_for_test(WM_NCPOINTERDOWN);
+                allocation.native_message_for_test(
+                    WM_NCPOINTERUP,
+                    (HTMAXBUTTON as usize) << 16 | 7,
+                    0,
+                );
+                allocation.finish_native_dispatch_for_test(WM_NCPOINTERUP);
+                allocation.native_promoted_message_for_test(
+                    WM_NCLBUTTONDOWN,
+                    HTMAXBUTTON as usize,
+                    0,
+                );
+                allocation.native_message_for_test(WM_SYSCOMMAND, SC_MAXIMIZE as usize, 0);
+                allocation.finish_native_dispatch_for_test(WM_SYSCOMMAND);
+                allocation.finish_native_dispatch_for_test(WM_NCLBUTTONDOWN);
+                let requests: Vec<_> = shared
+                    .drain_events()
+                    .into_iter()
+                    .map(|event| match event {
+                        DeferredDetachedImageWindowEvent::Activation { request } => request,
+                        other => panic!("only activation requests are expected: {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(
+                    requests.len(),
+                    2,
+                    "the hypothetical native stream really produces two outcomes"
+                );
+                let mut requests = requests.into_iter();
+                let first = requests.next().unwrap();
+                let second = requests.next().unwrap();
+                assert_eq!(
+                    first, second,
+                    "both carry the same window/context/allocation ownership"
+                );
+                if after_commit {
+                    assert_eq!(
+                        app.accept_discrete_detached_activation(&ctx, first),
+                        DetachedActivationDecision::Accepted
+                    );
+                } else {
+                    // Return the inspected native-produced events to their
+                    // actual transport and let the real batch handler drain it.
+                    shared.push_event(DeferredDetachedImageWindowEvent::Activation {
+                        request: first,
+                    });
+                    shared.push_event(DeferredDetachedImageWindowEvent::Activation {
+                        request: second.clone(),
+                    });
+                    app.service_deferred_detached_window_events(&ctx);
+                    assert!(app.detached_window_deferred_activation_pending(id));
+                    assert_eq!(
+                        app.accept_discrete_detached_activation(&ctx, second.clone()),
+                        DetachedActivationDecision::CommandOwned
+                    );
+                }
+                assert!(app.commit_pending_deferred_detached_window_activation(&ctx));
+                assert_eq!(app.active_viewer_context_id(), Some(owner));
+                assert_eq!(app.active_detached_window_id(), Some(id));
+                if after_commit {
+                    // The request has already been taken from its old transport.
+                    // Deliver it to the same App acceptance boundary after commit.
+                    assert_eq!(
+                        app.accept_discrete_detached_activation(&ctx, second),
+                        DetachedActivationDecision::NotParked
+                    );
+                }
+                assert!(!app.commit_pending_deferred_detached_window_activation(&ctx));
+                assert_eq!(
+                    app.with_viewer_context_ref(owner, |viewer| viewer.fullscreen_idx())
+                        .unwrap(),
+                    page_before
+                );
+                assert_eq!(app.active_viewer_context_id(), Some(owner));
+                assert_eq!(app.active_detached_window_id(), Some(id));
+                assert!(!app.detached_window_deferred_activation_pending(id));
+            }
+        }
+    }
+
     #[test]
     fn realmachine58_minimize_outcome_keeps_parked_owner_and_emits_no_restore_or_focus() {
         use windows::Win32::UI::WindowsAndMessaging::{
@@ -464,30 +627,7 @@ mod tests {
         };
         let _input = crate::key_input::lock_test_input();
         for live in [false, true] {
-            let (mut app, ctx, id) = if live {
-                realmachine55_parked_media_fixture()
-            } else {
-                use super::super::detached_media_exchange_tests as media;
-                let mut app = super::super::tests::phase_c_support::setup_app();
-                let ctx = egui::Context::default();
-                ctx.set_embed_viewports(false);
-                let root = app.tmp.path().to_path_buf();
-                media::install_items(&mut app, &ctx, &root, false);
-                app.settings.detached_viewer_enabled = true;
-                app.settings.detached_viewer_open_images_in_window = true;
-                media::open_grid(&mut app, &ctx, 2);
-                let id = app.active_detached_window_id().unwrap();
-                media::open_grid(&mut app, &ctx, 3);
-                assert_eq!(
-                    app.detached_window_state(id),
-                    Some(DetachedWindowState::Parked)
-                );
-                ctx.run_ui(egui::RawInput::default(), |ui| {
-                    app.render_detached_image_windows(ui.ctx())
-                })
-                .drop_without_applying_deltas();
-                (app, ctx, id)
-            };
+            let (mut app, ctx, id) = realmachine58_parked_fixture(live);
             let active_before = app.active_viewer_context_id();
             let window_before = app.active_detached_window_id();
             let owner_before = app.locate_window_context(id);

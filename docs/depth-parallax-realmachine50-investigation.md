@@ -1797,12 +1797,14 @@ raw NCPOINTERDOWNの既定処理内のNCHITTESTもHTCAPTIONを返しており、
   native callから戻った時点の入力元を再取得しない。
 - raw Upはhitだけで除外しない。captionで始め、button上で離した場合も、既存pointer IDのownerへ終端を返す。
 - caption／resize／×はraw ownerを維持し、昇格mouseのDown／DoubleClick／Move／Upは別producerにしない。
-  buttonの昇格でも許可する開始はNCLBUTTONDOWNだけ。clientの経路は変更しない。
+  この初回実装ではbuttonの昇格で許可する開始をNCLBUTTONDOWNだけにした。
+  後述の独立レビュー対応で通常mouseと同じNCLBUTTONDBLCLKも許可する。clientの経路は変更しない。
 - 昇格が無ければbuttonのgesture自体が無い。rawと昇格を結ぶpending、相関、時間窓、retry、App fieldは追加しない。
 
 「昇格mouseは別producerにならない」という従来規則のbuttonだけを、
 「OSがbuttonを選ぶ唯一のcallが所有する」へ置き換えた（BA-7）。
-mouseとtouchのbuttonが同じ既存owner／確定点を使うので、raw／昇格の二重完了や待合せを作らない。
+mouseとtouchのbuttonは同じ既存owner／確定点を使い、raw／昇格を待ち合わせない。
+開始hitが交差する仮定の列での二重outcomeとApp側の扱いは、後述の独立レビュー対応を参照。
 ペンは未採取で、タッチと同じ昇格経路を使うと仮定して同じ規則を適用する。
 タッチの修正後の実機確認も未実施。keyboard最大化の入口不足（P2-3）は従来どおり別件のまま残す。
 
@@ -1968,6 +1970,107 @@ exe＋6 DLLは151,279,632 bytes。PE記録は `target/rm58-pe-imports.json`、�
 App field／vendor／通常配布物は変更しない。修正後の最小化の実機動作、修正後touch、penの列は未確認。
 元touch操作の目視報告は未着。タスクバー復元§1.790は対象外。
 全件gate、build-dev、製品／道具／auto起動、commit／pushはこの作業から実行していない。
+
+#### タッチ・最小化の独立レビューへの対応（2026-11-15着手）
+
+基点は `9c69805bd`（タッチ `c22de91e4`、最小化 `9c69805bd`）。別会話の独立レビュー
+（Sol / xhigh）はREJECT、OSが選ぶcallへの所有移動とMinimizeOwnedには構造修正として合意。
+設計担当の決定でP2-2の昇格DBLCLKを修正し、P2-1のraw／昇格hit交差は追加状態を作らず
+観測とAppの既存所有境界で扱う。以前の実装時source reviewのACCEPTは、このREJECTを置き換えない。
+
+**P2-2。** 通常mouseはbuttonのDown／DBLCLKを所有する一方、昇格mouseの入口はDownだけだった。
+raw buttonはownerを作らないため、昇格DBLCLK内にSCが来ても両方から取り残される。
+昇格mouseもbutton hitの場合だけDown／DBLCLKを同じ所有判定へ通す。
+既存のmouse owner、一致SC、captured originを含む本人call token返却を共用し、
+SC_MAXIMIZE／SC_RESTOREはCompleted、SC_MINIMIZEはMinimizeOwnedを維持する。
+button以外の昇格、raw buttonの除外、modal／retire、caption／resize／close／clientは変更しない。
+rawと昇格を結ぶpending、時間窓、retry、App fieldは追加しない（BA-7）。
+
+**P2-1の観測根拠。** 観測者は利用者、根拠は元の `target/rm56-native-detached-probe/touch.log`。
+4tapのraw Downと昇格Downはすべて同HWND `0x12c193a`、同lParam、同hitだった。
+以下は1始まりのwndproc行番号。全ペアはsource_device=4（touch）／source_origin=1。
+
+| 操作 | raw NCPOINTERDOWN行 | 昇格NCLBUTTONDOWN行 | 共通lParam | 共通hit |
+| --- | --- | --- | --- | --- |
+| 最大化 | 4152 | 4241 | `0x7211bcb` | 9 |
+| 復元 | 4301 | 4339 | `0x5f41e8b` | 9 |
+| caption | 6146 | 6288 | `0x71b1aa2` | 2 |
+| close | 6321 | 6455 | `0x7001c1c` | 20 |
+
+対応するPM_REMOVE hook行は順に4147→4236、4296→4334、6141→6283、6316→6450。
+raw CAPTION→昇格MAXのhit差、昇格DBLCLK、penの列はこの記録には無い。
+これを全OS列の一般保証とは扱わず、設計担当は実測の開始点／hit一致とAppの既存排他を根拠に
+raw／昇格の相関pendingを追加しないと決めた。
+
+反例は `raw Down(CAPTION) → Down返却 → raw Up(MAX) → Up返却=Completed →
+昇格Down(MAX) → SC_MAXIMIZE → 本人返却=Completed`。target同期を挟まなければnativeは2つの
+outcomeを作り得る。これを無条件のnative producer唯一性と表現しない。
+実handlerテストでは、同batchの2件目は既存Discrete intentによりCommandOwned、
+最初のcommit後の取り出し済みrequestは期待Parked／ParkedLiveと現在stateの不一致でNotParkedとなった。
+commit後に新たなnative入力を開始する場合はtarget同期でbindingが解除されるため、追加outcome自体が無い。
+`realmachine58_review_cross_hit_results_apply_activation_once_without_turning_page` は
+Parked／ParkedLive × 同batch／commit後の4組で、実native→sink→sharedから2requestが生成されること、
+同じwindow／context／allocationを持つこと、commit成功が1回だけで次commitは無いこと、
+owner／window／ページが維持されることを確認した。同batchは実serviceを通し、commit後は
+取り出し済みrequestを実accept境界へ渡す。Appで問題は見つからず、設計担当の見送り判断を維持する。
+
+**検証のやり直し（2026-11-16）。**
+01:05頃のPC停止・resetを受け、前回の `target/rm58r-*.log` は今回の検証結果に採用しない。
+焦点・回帰はrun-heavy経由の直列、nextestの `--test-threads 4` で流し直す。
+全件／FullTest、製品／probe／auto起動、build-dev、commit／pushは実施しない。
+
+App fixtureは通常の物理still openを通すため実current_folderを設定し、非main Cへのbindingをassertする。
+独立Cには既存 `source_texture_test_support::seed` でcanonical表示sourceを準備し、
+snapshot構築可能と現在ページ保持をhandoff前にassertしてから、通常grid openでParkedへ移す。
+Parked・binding・activationの直接生成や、製品側の対処は追加しない。
+検証結果・コマンド・件数・exit codeは以下へ記録する。
+
+旧判定へ一時的に戻した赤確認は
+`cargo nextest run -p mimageviewer --lib -E 'test(/realmachine58_review/)' --no-fail-fast --test-threads 4`。
+3件／1成功／2失敗、exit 100（`target/rm58r2-red-valid.log`）。新DBLCLKの2件は
+期待Completed／MinimizeOwnedに対し実outcomeが空で失敗し、Appの上記4組は成功した。
+その後、共通開始判定をDOWN／DBLCLKへ戻して検証する。
+最初の起動で `-j 1` と `--test-threads 4` がnextestの同一optionとして衝突し、実行0件／exit 2
+（`target/rm58r2-red.log`）。余分な `-j` を外して上記を実行し、件数には含めない。
+
+**修正後の検証（2026-11-16、reset後の再実行だけを採用）。**
+すべて `C:/Users/mikag/AppData/Local/miv-locks/run-heavy.ps1`、
+Owner `codex/767-rm58-review`、WorkDir `G:/home/mimageviewer-767s2` 経由で直列。
+nextest／probe単体testは4並列。CARGO_INCREMENTAL=0、MSBUILDDISABLENODEREUSE=1。
+runnerのlock／G: TEMP書込不可の警告時は、既定の低優先度・CARGO_BUILD_JOBS=6／既定TEMPで継続した。
+本担当からFullTestや全件gateは実行しない。最後のCargo操作は引数なしのfmt。
+
+| コマンド | 件数／結果 | exit | 証跡 |
+| --- | --- | --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/realmachine57_\|realmachine58_\|caption_button/)' --no-fail-fast --test-threads 4` | 28／全成功 | 0 | `target/rm58r2-focus.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/native_detached\|non_client\|caption\|detached_activation\|realmachine55_\|realmachine57_\|realmachine58_\|parked\|native_video/)' --no-fail-fast --test-threads 4` | 679／全成功 | 0 | `target/rm58r2-regression.log` |
+| `cargo test -p mimageviewer --features dev-tools --bin native_detached_probe -- --test-threads 4` | 7／全成功 | 0 | `target/rm58r2-probe-test.log` |
+| `cargo build -p mimageviewer --features dev-tools --bin native_detached_probe` | build成功 | 0 | `target/rm58r2-probe-build.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | check成功 | 0 | `target/rm58r2-check.log` |
+| `cargo fmt` | 整形成功 | 0 | `target/rm58r2-fmt.log` |
+
+新規testは `realmachine58_review_promoted_button_doubleclick_maximize_completes_once`、
+`realmachine58_review_promoted_button_doubleclick_minimize_keeps_os_owner`、上記cross_hitの3件。
+既存minimize testは同じowner別fixtureを共用し、Parked／ParkedLiveで再開・復元・focusが出ない検査を維持した。
+既存の期待をDBLCLK修正のために弱めていない。製品App／vendorは変更しない。
+変更ファイルは `src/key_input.rs`、`src/app/detached_activation.rs`（testのみ）、本書、
+`docs/detached-rework-plan.md` の4件。
+
+コピー用 `target/rm56-native-detached-probe/native_detached_probe.exe` を新buildへ差し替えた。
+33,443,840 bytes、SHA-256 `5d251af30bc998aa05805916a2a5d444a20a9683023409b6df96d6794f874a51`。
+build出力とのhash一致、既存6 DLLのhash不変、元touch.log（6,488行、SHA-256
+`cd4e888c2f7c82978cda37769786fb0a5b08f15ed4528a25f0db4815f49cd857`）の不変を確認した。
+exe＋DLLは151,257,104 bytes。`target/rm58r2-pe-imports.json`、同梱PE-IMPORTS.json／README.txtを更新した。
+配布物・DLL・元logは変更せず、道具は起動していない。
+
+未確認は修正後の実機動作、実際のtouch／penの昇格DBLCLK列とpenの昇格自体。
+P2-1の交差hit列も実測されておらず、上記4tapの一致を一般保証とは扱わない。
+従来のkeyboard最大化入口とタスクバー復元§1.790は今回の対象外。
+製品／probe／auto起動、全件gate、build-dev、commit／pushは行っていない。
+
+実装担当内の別contextによる最終追レビュー（Sol / xhigh、2026-11-16）はACCEPT、追加P1／P2なし。
+最終差分とreset後の上記証跡を照合し、Cargo／GUIの再実行はしていない。
+これは今回の追補の確認であり、設計担当による受入判断の代替とはしない。
 
 ## 6. 診断（初回調査の案、A実装で導入）
 

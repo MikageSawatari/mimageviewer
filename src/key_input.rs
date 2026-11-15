@@ -1427,6 +1427,37 @@ impl NativeInputAllocationWitness {
 
     #[cfg(test)]
     pub(crate) fn native_message_for_test(&self, message: u32, wparam: usize, lparam: isize) {
+        self.native_message_with_origin_for_test(
+            message,
+            wparam,
+            lparam,
+            NativeMouseOrigin::Ordinary,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn native_promoted_message_for_test(
+        &self,
+        message: u32,
+        wparam: usize,
+        lparam: isize,
+    ) {
+        self.native_message_with_origin_for_test(
+            message,
+            wparam,
+            lparam,
+            NativeMouseOrigin::PointerPromotion,
+        );
+    }
+
+    #[cfg(test)]
+    fn native_message_with_origin_for_test(
+        &self,
+        message: u32,
+        wparam: usize,
+        lparam: isize,
+        origin: NativeMouseOrigin,
+    ) {
         let subclass = state()
             .lock()
             .unwrap()
@@ -1442,13 +1473,9 @@ impl NativeInputAllocationWitness {
                 wparam,
                 lparam,
                 NativeDetachedDispatch::Subclass(test_native_call(
-                    self.hwnd,
-                    subclass,
-                    message,
-                    wparam,
-                    NativeMouseOrigin::Ordinary,
+                    self.hwnd, subclass, message, wparam, origin,
                 )),
-                NativeMouseOrigin::Ordinary,
+                origin,
             );
             dispatch_native_detached_input();
         }
@@ -5937,8 +5964,10 @@ fn native_mouse_origin(message: u32) -> NativeMouseOrigin {
 }
 
 /// Raw pointers own caption/resize/close. For buttons the OS instead selects
-/// the action in its promoted mouse Down call (observed in touch.log). That
-/// call is the only button producer; no raw-to-promoted correlation is needed.
+/// the action in its promoted mouse Down/DoubleClick call (Down observed in
+/// touch.log). Button calls share the ordinary mouse owner; raw button calls
+/// create no owner. App admission owns duplicate requests if start hits differ;
+/// no raw-to-promoted correlation is needed (investigation §5.11).
 fn native_detached_message_is_owned(
     message: u32,
     wparam: usize,
@@ -5949,7 +5978,7 @@ fn native_detached_message_is_owned(
             hit: ((wparam >> 16) & 0xffff) as u32,
         }
         .is_button(),
-        (WM_NCLBUTTONDOWN, NativeMouseOrigin::PointerPromotion) => {
+        (WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK, NativeMouseOrigin::PointerPromotion) => {
             NativeNonClientPressTarget { hit: wparam as u32 }.is_button()
         }
         (_, NativeMouseOrigin::PointerPromotion) => false,
@@ -6087,7 +6116,8 @@ fn native_detached_message_with_origin(
     };
 
     // The admission above chooses raw pointers for non-buttons and the OS's
-    // promoted mouse Down for buttons. They never both own the same operation.
+    // promoted mouse Down/DoubleClick for buttons. Each start uses its own hit;
+    // raw/promoted requests are not correlated across differing start hits.
     if let Some((source, hit)) = non_client_start {
         if matches!(gesture, NativeDetachedGesture::NonClient { .. }) {
             return;
@@ -7489,6 +7519,68 @@ mod native_detached_tests {
 
     fn screen_point(x: i16, y: i16) -> isize {
         (u32::from(x as u16) | (u32::from(y as u16) << 16)) as isize
+    }
+
+    #[test]
+    fn realmachine58_review_promoted_button_doubleclick_maximize_completes_once() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm58-review-dbl-max", 0x8158);
+        let raw_down = f.message(WM_NCPOINTERDOWN, (HTMAXBUTTON as usize) << 16 | 2, 0);
+        f.finish_call(raw_down);
+        assert!(f.take().is_empty());
+        let raw_up = f.message(WM_NCPOINTERUP, (HTMAXBUTTON as usize) << 16 | 2, 0);
+        f.finish_call(raw_up);
+        assert!(f.take().is_empty());
+        let double = f.message_with_origin(
+            WM_NCLBUTTONDBLCLK,
+            HTMAXBUTTON as usize,
+            0,
+            NativeMouseOrigin::PointerPromotion,
+        );
+        let sc = f.message(WM_SYSCOMMAND, SC_MAXIMIZE as usize, 0);
+        f.finish_call(sc);
+        assert!(
+            f.take().is_empty(),
+            "SC return cannot end the owning double-click call"
+        );
+        f.finish_promoted_call(double);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+        f.finish_promoted_call(double);
+        assert!(f.take().is_empty(), "one call can complete only once");
+    }
+
+    #[test]
+    fn realmachine58_review_promoted_button_doubleclick_minimize_keeps_os_owner() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm58-review-dbl-min", 0x8159);
+        let raw_down = f.message(WM_NCPOINTERDOWN, (HTMINBUTTON as usize) << 16 | 3, 0);
+        f.finish_call(raw_down);
+        let raw_up = f.message(WM_NCPOINTERUP, (HTMINBUTTON as usize) << 16 | 3, 0);
+        f.finish_call(raw_up);
+        assert!(f.take().is_empty());
+        let double = f.message_with_origin(
+            WM_NCLBUTTONDBLCLK,
+            HTMINBUTTON as usize,
+            0,
+            NativeMouseOrigin::PointerPromotion,
+        );
+        let sc = f.message(WM_SYSCOMMAND, SC_MINIMIZE as usize | 2, 0);
+        f.message(WM_KILLFOCUS, 0, 0);
+        f.message(WM_CAPTURECHANGED, 0, 0);
+        f.finish_call(sc);
+        assert!(f.take().is_empty());
+        f.finish_promoted_call(double);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::MinimizeOwned
+            )]
+        );
     }
 
     #[test]
