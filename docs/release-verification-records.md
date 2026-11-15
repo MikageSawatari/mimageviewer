@@ -24,7 +24,7 @@
 - **署名・成果物**: `build-dist.ps1 -SkipVst3Bridge` (署名あり)。単体exe・setup.exe・ポータブル版の mimageviewer.exe を `signtool verify /pa /v` で確認 (Open Source Developer Taku Sano、タイムスタンプあり、exit 0)。ポータブル版の PE 26 個がすべて有効な署名。全 PE / VC runtime gate 通過。sha256: 単体exe `0dbc1f26bd665f67eeae232e343b1fad7acc59bcf58e39cd118875dfb891cc73` (593,026,136 bytes)、setup.exe `566786871773da089683733064c808ab9fa6cbf6032654da62b08c34550ccea4` (269,412,344 bytes)、portable zip `866e8c6d794f49a2de78692fc507903c6ccc878f4abbdfaacda165571e4eba9a` (318,032,253 bytes)、Vector zip `964558b37668fd9a63429d816d459ee1c74c9643abe9b87603dd5a80f50b297a` (268,981,905 bytes)。
 - **配布ビルドで止まった点**: (1) 利用者の確認用の dev core が普段のデータで動いていた (利用者が終了)。(2) 新しい worktree で release の 5 本が無く、全体テストの launcher build が止まった (`build-release.ps1` で先に作った)。(3) 上の結合テスト。
 - **インストーラ**: AI アプリが MCP を使っている間は、インストーラが「AI アプリを終了してから」で止まる (仕様)。利用者は Claude を再起動して入れた。AI 連携中でも更新できるようにする設計を別セッションで検討中。
-- **公開後 (2026-11-15 夜)**: GitHub Release v5.2.1 (タグ・main = `be26f0088`、main は 403725b81 から fast-forward)、資産 4 点の sha256 が手元と一致・latest。mikage.to 反映 11 ファイル (sitemap.xml を含む)、verify-site 390/391 (`.htaccess` の 403 のみ)、DL 3 点 200・サイズ一致。v5.2.1 の worktree は htdocs が CRLF で checkout されていて、そのままでは中身の同じページまで差分になった。前回反映したファイル (C:\home\mimageviewer の作業ツリー) と同じ bytes に揃えてから上げた。
+- **公開後 (2026-11-15 夜)**: GitHub Release v5.2.1 (タグ・main = `be26f0088`、main は 403725b81 から fast-forward)、資産 4 点の sha256 が手元と一致・latest。mikage.to 反映 11 ファイル (sitemap.xml を含む)、verify-site 390/391 (`.htaccess` の 403 のみ)、DL 3 点 200・サイズ一致。v5.2.1 の worktree は htdocs が CRLF で checkout されていて、そのままでは中身の同じページまで差分になった。前回反映したファイル (C:\home\mimageviewer の作業ツリー) と同じ bytes に揃えてから上げた。 Vector 申請・X 告知 (2 件のスレッド) は利用者が実施。MS Store は v5.2.0 がまだ審査中のため今回は更新しない (利用者判断)。
 
 ## v5.2.0 (2026-11-13)
 
