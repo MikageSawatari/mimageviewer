@@ -27,6 +27,23 @@ Production breakdown: **1426 API call sites** plus **187 raw-event/ordered-proje
 
 C: shared click adjudication requires a real click; `click=None` cannot activate it. Independent keyboard/accessibility/touch activation remains valid. H: terminate an existing hold/drag or save its already edited value. R: ordered terminal/ordinal/cancellation/input stripping transport; never synthesizes a position. F: conflated hold termination with operation completion; fixed in this change. T: test/fixture, excluded from production sites. Definitions belong to the shared producer/API review.
 
+## 既知の残り: raw click の batch 集約 (第 3 回独立レビュー、2026-11-15、未修正)
+
+次の consumer は、frame 全体の `button_clicked` / `primary_clicked` / `any_click` と、frame の最後の `interact_pos` による hit-test を
+組み合わせている。下の表では C としているが、C の判定は不十分である。
+- `src/ui_page_overview.rs:226` `primary_click_in_drawn_rect`
+- `src/ui_fullscreen/page_overview.rs:226` `draw_page_overview_window_close`
+- `vendor/egui/src/response.rs:289` `clicked_elsewhere`、`:389` `container_clicked`、`:399` `container_secondary_clicked`
+
+入力列 (ソースでの照合で、実機では未観測): 前の frame で操作の無い位置 H を押す → 次の同じ batch で `Up(H)` → 別の位置で `Down` → 窓の外 →
+`CursorLeft` → 位置なしの Up → `Move(T)`。H のクリックの資格が、後に来た位置 T のページ選択や × に流用される。
+
+位置ありの Up でも同じ形 (同じ batch の中で `Up(H)` → `Down` → `Up(Y)`) が成り立つので、位置なしの終端に固有の問題ではない。
+上流 egui の raw click の使い方 (frame 単位の集約) に由来する既存の問題である。直し方は、クリックの資格と、そのクリック自身の解放点での hit-test を結び付けること。
+この版 (依頼 55 の対応) では直さず、別項目としてバックログに残す (設計担当の判断)。
+理由: 1 つの batch の中で、押す・離す・窓の外へ出る・戻る、が全部起きる必要がある。これは UI スレッドが長く止まったときにしか起き得ない。
+また、直すには位置なしの終端とは別の所有境界 (raw click の集約) を設計し直す必要がある。
+
 ## Exhaustive production source sites
 
 Each file/family row lists every matching line and API. Repeated lines represent distinct occurrences on the same line. The action audit below refines mixed H/F and R paths.
