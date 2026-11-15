@@ -2311,12 +2311,18 @@ backstop/frozenの全typed paint入口が共通helperを使う。callback内で�
 perf log の
 `gpu/lanczos_regenerate` に source / target、smoothing percent / blur、推定 fetch 数、
 encode + submit CPU 時間、累積再生成回数、拡大 / 縮小の別を記録する。
-`resampler_created` / `resampler_create_ms`、`prepare_job_ms` / `register_texture_ms` / `encode_ms`（encoder 作成・finish 含む）/ `submit_ms` と、既存合計との差 `unaccounted_ms` は排他的な CPU 壁時計時間。
-作成した回だけ `resampler_create_breakdown` に kind（lanczos3 / anime4k）と layout・各 shader module・各 pipeline の内訳を載せる（作成時間の内数。driver 内部の原因や GPU 実行時間は未特定）。Lanczos3 / NIS /
+`resampler_created` / `resampler_create_ms` は resampler 本体の作成、`pipeline_created` / `pipeline_create_ms` は Lanczos3Resampler の4枝のうち今回初めて使う枝の shader・pipeline 作成を表す（Anime4K は従来どおり本体作成時間に内包）。後者を除いた資源準備の `prepare_job_ms` / `register_texture_ms` / `encode_ms`（encoder 作成・finish 含む）/ `submit_ms` と合わせて排他的な CPU 壁時計時間で、既存合計との差を `unaccounted_ms` に記録する。
+本体または枝を作成した回だけ `resampler_create_breakdown` を出す。kind（lanczos3 / anime4k）、本体の `steps`、新規枝の `branch`（枝名と shader・pipeline の `steps`）を名前付きで載せ、作っていない項目は省略する。枝だけ初作成なら `resampler_created=false` でも内訳を出す。内訳は各作成時間の内数であり、driver 内部の原因や GPU 実行時間は未特定。Lanczos3 / NIS /
 Anime4K / pixel-AA は event 名を共用し、`scale_branch`
 (`upscale` / `upscale_nis` / `upscale_anime` / `upscale_pixel_art`)
 で区別する。拡大時はさらに、
 生成元となった source pixel 領域の x / y / width / height を記録する。
+
+同じ作成フラグ・区間時間・内訳を既存の `fs/final_prepare_native_submitted` にも出す。prewarm が初回作成を済ませた後に通常経路が cache hit しても、作成時の計測を失わない。既存の合計時間や prewarm の metadata は維持する。
+
+§1.776 案 A は、layout 2 個だけを `Lanczos3Resampler::new` に残し、縮小・可視範囲拡大・NIS・ピクセルアートの独立した `OnceCell` を各 prepare の初回に完成させる。shader、entry point、format、uniform、texture、cache key は変更しない。初期化は従来と同じ UI スレッド上の prepare 呼出し中で、非同期化・新しい prewarm・worker 移動（案 B）は採らない。待機や supersession を管理する新しい状態も不要である。Anime4K は従来のまま。
+
+通常の `resolve → resolve_key → generate` と、既存 `execute_prewarm → execute_prewarm_with_policy`（Ordinary / NoRemoval）は `generate_with_source` に合流する。`query_prewarm`・cache hit・admission/claim 拒否では枝を作らず、clear/retain・context 退避/交換も既存の cache 所有を維持する。4 枝の prepare は作成済み pipeline ハンドルを非 optional な job フィールドへ保持し、encode は job だけを受け取る。したがって cache の `Option` / 未作成の枝を encode 時に調べる経路はなく、resampler がなくても job のハンドルで encode できる。製品（release）での効果は未計測。
 
 静止画の最終フィット矩形は `fullscreen_media_rect_with_geometry` が所有する。
 active CentralPanelの `ui.max_rect()` から一度解決した `StillSeekGeometry` の
