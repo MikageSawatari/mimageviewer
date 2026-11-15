@@ -1,7 +1,7 @@
 # MPEG-TS / PS の keyframe 確認付き seek (§1.785)
 
-状態: 設計 第 4 版 (2026-11-15、設計担当 ClaudeCode Opus)。第 1〜3 版は実装前の独立レビュー (gpt-6.1-sol / xhigh)
-で REJECT になり、その指摘 (§8) を反映した。対象は v5.3.0。経緯は [バックログ §1.785](next-release-backlog.md)、
+状態: 設計 第 4 版・実装前レビュー ACCEPT WITH CHANGES (P3 2 件を反映済み) (2026-11-15、設計担当 ClaudeCode Opus)。
+第 1〜3 版は実装前の独立レビュー (gpt-6.1-sol / xhigh) で REJECT になり、その指摘 (§8) を反映した。対象は v5.3.0。経緯は [バックログ §1.785](next-release-backlog.md)、
 時刻の契約は [動画の時刻原点](video-timeline-origin-plan.md)。
 
 ## 1. 観測と原因
@@ -82,7 +82,11 @@ B = 映像の codec が MPEG-1 / MPEG-2 video であり、かつ J の key が�
   pts <= target の key の表示時刻以下。K1 が pts 不明でもよい。
 - **B の根拠 (MPEG-1 / MPEG-2 に限る)**: MPEG-1 / MPEG-2 の並べ替えは「I / P (anchor) の表示は次の anchor の復号の時」で、
   K1 の表示時刻 = K1 の次の anchor の dts <= K2 の dts <= target (K2 も anchor)。これは codec の規格の並べ替えの規則で、
-  GOP の長さや B frame の数によらない。H.264 / HEVC は B frame の階層などでこの規則が成り立たないので、pts 不明の key だけ
+  GOP の長さや B frame の数によらない (ITU-T H.222.0 §2.4.3.7。等式は low_delay でなく、時刻の不連続が無い区間で成り立つ。
+  low_delay では pts(K1) = dts(K1) <= target で、やはり成り立つ。途中の時刻の不連続は §5 のとおり対象外)。
+  FFmpeg 7.1 の dts の補間 (`demux.c`) と MPEG-1/2 decoder の anchor を 1 つ遅らせる出力 (`mpeg12dec.c`) とも整合し、
+  レビュー担当の probe では PS 素材で B を通った 51 の窓すべてで、最初の key の復号画像が先頭からの復号と一致し、その
+  表示時刻が target 以下だった。H.264 / HEVC は B frame の階層などでこの規則が成り立たないので、pts 不明の key だけ
   では成功にしない (次の back へ進み、最後は Unverified = 今の seek)。
 - J に pts の分かる key が 1 つでもあれば B は使わない。pts の分かる key がすべて target より後なら、key の数によらず失敗
   (pts と dts の差が大きい stream で、key の数から成功にしない)。
@@ -187,6 +191,8 @@ TS / PS の `AVIndexEntry` は `mpegts_get_dts` などが探索中に登録し�
   (まれな失敗は割り切り)。
 - FFmpeg の 1 回の呼び出しの中の長い読み取り (映像の無い長い区間など異常な stream) は止められない (§2)。
 - H.264 の recovery point・intra refresh は範囲外 (§2 の key の判定)。
+- 途中に時刻の不連続 (PCR / SCR の飛び、つなぎ合わせた録画) がある stream は範囲外。FFmpeg の timestamp seek 自体が
+  単調な時刻を前提にしており、不連続をまたぐ seek は今と同じ動きになる (33 bit の折り返しは FFmpeg の unwrap 後なので対象)。
 - 確認の走査中の読み取りエラーは「その back では窓の終わり」として扱い、回復処理は足さない。
 
 ## 6. テスト
@@ -203,7 +209,9 @@ TS / PS の `AVIndexEntry` は `mpegts_get_dts` などが探索中に登録し�
   - TS: H.264 + AAC、GOP 0.5 秒、小さな原点
   - TS: MPEG-2 + MP2、GOP 0.5 秒、open GOP、`-output_ts_offset 36000`
   - TS: HEVC + AAC、open GOP (CRA と RASL を含む)
-  - PS: MPEG-2 + MP2、GOP 0.5 秒 (pts の無い key を含むことを生成時に検査する)
+  - PS: MPEG-2 + MP2、GOP 0.5 秒 (pts の無い key を含むこと、および「J の key がすべて pts 不明で |J| >= 2」になる目標が
+    あることを生成時に検査し、その目標を正解表に載せる。単体試験はその目標で B を通り、最初の key の画と表示時刻を正解表と
+    照合する)
   - 録画の途中から始まる TS と PS (先頭が GOP の途中。既存の素材の先頭を切る)
   - 長い GOP の TS: GOP 6 秒・60 fps (back を 2 回以上倍にする経路、スクリーンショットの 240 を超える preroll)
   - 反例: pts だけを 2 秒遅らせた MPEG-2 TS (`setts`。key が 2 つ以上でも pts > target なら失敗すること)、key の間隔が
@@ -272,3 +280,5 @@ TS / PS の `AVIndexEntry` は `mpegts_get_dts` などが探索中に登録し�
 - P2 窓の終わりの packet と判定の集合の区別 → J を「dts が分かり dts <= target の key」と定義し、終わりの packet は保持だけ (§2)。
 - P2 音声 backpressure → Verified では保持列の映像を先に `pending_video_packets` へ入れる (§2)。§6 の回帰の状態を指定。
 - §6 に追加: pts を遅らせた反例素材、key の間隔が短い (3 frame) 箇所を持つ MPEG-2 TS。
+
+第 4 版への判定は ACCEPT WITH CHANGES。P3 2 件 (B の根拠の適用条件と出典、B を実際に通る素材と目標) を §2・§5・§6 に反映した。
