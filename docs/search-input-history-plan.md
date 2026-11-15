@@ -176,6 +176,13 @@ egui は既定 (`SurrenderFocusOn::Clicks`) で、フォーカス中の TextEdit
 
 #### 4.2 Esc
 
+§1.768 の単一行右クリックメニューは履歴と同じ下位の egui/native key claim を使う。
+メニューが既に開いていた pass の Esc はメニューだけを閉じ、履歴や検索終了へ渡さない。
+`dialog_escape_pressed` とメニュー描画前が参照する popup の所有判定は viewport / pass 単位の snapshot とする。
+同じ RawInput の右クリック release と Esc で初めて開いて閉じたメニューは claim せず、親の従来の Esc 処理を保つ。
+履歴の修飾なし限定と IME 優先は変更しない。メニューの Esc claim では入力欄の focus / recovery / draft を終了しない。
+次の新しい Esc、別 viewport、次 delivery frame の入力を奪わない。
+
 - egui は `begin_pass` で、フォーカス中の widget の filter に Esc が無ければフォーカスを外す。部品は、
   **一覧が開いていて入力欄がフォーカスを持つ pass では、IME helper の呼び出しの後に
   `memory.set_focus_lock_filter(id, <helper と同じ filter に escape: true を足したもの>)`** を設定する

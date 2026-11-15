@@ -157,6 +157,88 @@ pub(crate) fn popup_owns_keyboard(ctx: &egui::Context) -> bool {
     egui::Popup::is_any_open(ctx) || ctx.any_popup_open()
 }
 
+#[derive(Clone, Copy)]
+enum EscapeOwner {
+    Parent,
+    Popup,
+}
+
+#[derive(Clone, Copy)]
+struct PassEscapeOwner {
+    pass: u64,
+    owner: EscapeOwner,
+}
+
+/// Capture before a parent reads Escape or a text menu draws. A newly opened
+/// and immediately dismissed menu must not change that parent's same-pass key.
+/// The viewport/pass stamp prevents this decision from suppressing a later Esc.
+pub(crate) fn app_escape_allowed(ctx: &egui::Context) -> bool {
+    let pass = ctx.cumulative_pass_nr();
+    let id = egui::Id::unique(("popup_escape_owner", ctx.viewport_id()));
+    let cached = ctx.data(|data| data.get_temp::<PassEscapeOwner>(id));
+    let owner = cached.filter(|cached| cached.pass == pass).map_or_else(
+        || {
+            let owner = if popup_owns_keyboard(ctx) {
+                EscapeOwner::Popup
+            } else {
+                EscapeOwner::Parent
+            };
+            ctx.data_mut(|data| data.insert_temp(id, PassEscapeOwner { pass, owner }));
+            owner
+        },
+        |cached| cached.owner,
+    );
+    matches!(owner, EscapeOwner::Parent)
+}
+
+/// The menu receives the egui copy; native-only deliveries use the same local
+/// close action. IME owns its Escape and must retain both copies.
+pub(crate) fn popup_escape_pressed(ctx: &egui::Context) -> bool {
+    if crate::ime_focus::ime_input_active(ctx) {
+        return false;
+    }
+    if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+        return true;
+    }
+    #[cfg(windows)]
+    return crate::key_input::pressed_key_down(ctx.viewport_id(), |edge| edge.virtual_key == 0x1B);
+    #[cfg(not(windows))]
+    false
+}
+
+/// A local history/menu action claims the same delivery in both input systems.
+/// History accepts plain chords; egui context-menu dismissal accepts any Esc.
+fn claim_local_key(ctx: &egui::Context, key: egui::Key, plain_only: bool) {
+    ctx.input_mut(|input| {
+        input.events.retain(|event| {
+            !matches!(event, egui::Event::Key { key: pressed, pressed: true, modifiers, .. }
+                if *pressed == key && (!plain_only || modifiers.is_none()))
+        });
+    });
+    #[cfg(windows)]
+    {
+        let virtual_key = match key {
+            egui::Key::ArrowDown => 0x28,
+            egui::Key::ArrowUp => 0x26,
+            egui::Key::Enter => 0x0D,
+            egui::Key::Escape => 0x1B,
+            _ => unreachable!("local claims only handle history keys and popup Escape"),
+        };
+        crate::key_input::consume_key_edges(ctx.viewport_id(), |edge| {
+            edge.virtual_key == virtual_key
+                && (!plain_only || (!edge.ctrl && !edge.shift && !edge.alt))
+        });
+    }
+}
+
+pub(crate) fn claim_history_key(ctx: &egui::Context, key: egui::Key) {
+    claim_local_key(ctx, key, true);
+}
+
+pub(crate) fn claim_popup_escape(ctx: &egui::Context) {
+    claim_local_key(ctx, egui::Key::Escape, false);
+}
+
 /// Why a viewport pass may dispatch discrete keyboard input.
 ///
 /// Focus is only one possible proof. On Windows a key edge already stamped

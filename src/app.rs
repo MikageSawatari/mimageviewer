@@ -24164,7 +24164,9 @@ impl App {
 
     /// ダイアログキャンセル用の Escape が押されたか。IME 変換中は常に false を返す。
     pub(crate) fn dialog_escape_pressed(&self, ctx: &egui::Context) -> bool {
-        !self.ime_input_active(ctx) && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        !self.ime_input_active(ctx)
+            && crate::keyboard_input::app_escape_allowed(ctx)
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
     }
 
     /// いずれかのモーダルダイアログが開いているか。

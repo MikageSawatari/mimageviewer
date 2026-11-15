@@ -420,6 +420,7 @@ pub mod tag_write_worker;
 pub mod tags_db;
 pub mod thumb_loader;
 pub mod thumb_overlay_layout;
+mod thumbnail_cache_key;
 mod touch_correlation;
 mod touch_debug;
 pub(crate) mod touch_input;

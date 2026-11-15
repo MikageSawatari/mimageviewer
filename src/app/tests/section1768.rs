@@ -1,4 +1,4 @@
-//! Stage A: actual search renderers and Escape routing, without product changes.
+//! Actual search renderers and Escape routing, including the Stage-A regressions.
 use super::*;
 use crate::ui_pinned_search::PinnedSearchKind as Kind;
 use egui::{Event, Key, Modifiers, PointerButton, Pos2};
@@ -213,3 +213,5 @@ fn section1768_ctrl_g_composing_escape_keeps_temporary_search() {
     fixture.escape();
     assert!(fixture.env.global_search.active);
 }
+
+mod extended;

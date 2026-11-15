@@ -243,7 +243,15 @@ S2c-2 の派生データは EPUB について `(世代 ID, 世代 PDF サイズ)
 表示用属性に保つ。タイルとページの UI 要求は worker 解決印を持ち、worker は同一 `ReadTarget` で
 cache hit 判定、PDFium 描画、保存を行う。auto-aspect の初期 seed は EPUB の元属性から
 hit させず、worker サムネイル結果で比率を集める。ピンの EPUB source ID は worker が固定世代を
-付けて確定する。内容同定は論理パスの EPUB 種別を使い、固定済みなら世代表の元サイズ・時刻・
+付けて確定する。通常フォルダ inventory の掃除と pin 更新 materialization は共通の pure helper で、
+同じ pending pin identity に対応する解決済み世代行を保持する (§1.742)。緩和するのは
+`folderthumb:` / `pdfthumb:` の直接 PDF leaf、または正規 SHA256 route hash を持つ cascade のみで、
+末尾 pending pair 直後の標準十進 i64 世代 suffix 一段に限る。ZIP entry / ZipDir の literal 名が
+suffix を模倣しても完全一致以外で保持しない。crop・policy・pin 変更や解除後は不一致となり掃除される。
+保持は読取許可ではなく、lookup は固定世代の完全一致キーと stamp を使い、旧世代へ fallback しない。
+通常再生成は別世代を消さないため存続 pin の旧世代行は残り得る。形式変更や migration は行わない。
+詳細な保持条件・容量の代償・掃除入口は [catalog 設計](catalog-design.md#epub-pin-の存続照合-1742) を参照。
+内容同定は論理パスの EPUB 種別を使い、固定済みなら世代表の元サイズ・時刻・
 ハッシュを読み、未固定なら元 EPUB を読む。非同期 backfill は分岐時の来歴を保存し、
 本ごとの固定ロック内で固定状態と元ファイル状態を再照合して台帳を書き込む。
 stage-0 検出と復元時の台帳更新も同じ境界を使う。復元候補は検出時の未固定元状態を保持し、

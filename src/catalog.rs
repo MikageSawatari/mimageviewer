@@ -2074,7 +2074,8 @@ impl CatalogDb {
         Ok(true)
     }
 
-    /// `existing` に含まれないファイル名の行を削除する（削除済みファイルの掃除）。
+    /// 存続 inventory に対応しない行を両表から削除する。EPUB pin は pending identity
+    /// に対応する解決済み世代も保持するが、読取キー・stamp の完全一致は変えない。
     pub fn delete_missing(&self, existing: &HashSet<String>) -> rusqlite::Result<()> {
         let conn = self.phase()?;
         let tx = conn.unchecked_transaction()?;
@@ -2086,7 +2087,7 @@ impl CatalogDb {
                 stmt.query_map([], |r| r.get(0))?.flatten().collect()
             };
             for name in db_names {
-                if !existing.contains(&name) {
+                if !crate::thumbnail_cache_key::inventory_retains_key(existing, &name) {
                     tx.execute(
                         &format!("DELETE FROM {table} WHERE filename = ?1"),
                         params![name],
@@ -6310,6 +6311,124 @@ mod tests {
         let map = db.load_all().unwrap();
         assert_eq!(map.len(), 1);
         assert!(map.contains_key("keep.jpg"));
+    }
+
+    #[test]
+    fn catalog_delete_missing_retains_epub_pin_generations_in_both_tables() {
+        let db = open_in_memory();
+        let pending = "folderthumb:auto-v2:numeric:d3:child#pin:pdfpage|book.epub|-|2|generation-pending|generation-pending";
+        let first = format!("{pending}|generation:17:4096");
+        let second = format!("{pending}|generation:18:8192");
+        let changed_pin = first.replace("|-|2|", "|-|3|");
+        let zip_stem = "zipdir:dir/#pin:pdfpage|literal|generation-pending|generation-pending";
+        let zip_mimic = format!("{zip_stem}|generation:17:4096");
+        let audio = "audioart:scope:v1:album.mp3";
+        for key in [
+            first.as_str(),
+            second.as_str(),
+            changed_pin.as_str(),
+            zip_mimic.as_str(),
+            "sibling.jpg",
+            audio,
+        ] {
+            db.save(
+                key,
+                1,
+                2,
+                8,
+                12,
+                Some((800, 1200)),
+                b"opaque pixels",
+                &CoverIdentity::Legacy,
+                AutoMaterial::NotAutomatic,
+            )
+            .unwrap();
+            db.save_page_dims(key, 1, 2, Some((1600, 2400)), None)
+                .unwrap();
+        }
+        db.delete_missing(&HashSet::from([
+            pending.into(),
+            zip_stem.into(),
+            "sibling.jpg".into(),
+        ]))
+        .unwrap();
+        for table in ["thumbnails", "page_dims"] {
+            let names = |db: &CatalogDb| -> HashSet<String> {
+                let conn = db.conn.lock().unwrap();
+                let mut stmt = conn
+                    .prepare(&format!("SELECT filename FROM {table}"))
+                    .unwrap();
+                let names = stmt
+                    .query_map([], |row| row.get(0))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                names
+            };
+            assert_eq!(
+                names(&db),
+                HashSet::from([
+                    first.clone(),
+                    second.clone(),
+                    "sibling.jpg".into(),
+                    audio.into()
+                ]),
+                "{table} must use the same retention rule and leave audio scope alone"
+            );
+        }
+        db.delete_missing(&HashSet::new()).unwrap();
+        for table in ["thumbnails", "page_dims"] {
+            let count: i64 = db
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                count, 1,
+                "empty inventory must leave only audio-art in {table}"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_epub_pin_generations_still_require_exact_lookup_and_stamp() {
+        let db = open_in_memory();
+        let pending = "pdfthumb:book.epub#pin:pdfpage||-|2|generation-pending|generation-pending";
+        let first = format!("{pending}|generation:17:4096");
+        let second = format!("{pending}|generation:18:8192");
+        for (key, mtime, size, pixels) in [
+            (&first, 17, 4096, b"first".as_slice()),
+            (&second, 18, 8192, b"second".as_slice()),
+        ] {
+            db.save(
+                key,
+                mtime,
+                size,
+                8,
+                12,
+                Some((800, 1200)),
+                pixels,
+                &CoverIdentity::Legacy,
+                AutoMaterial::NotAutomatic,
+            )
+            .unwrap();
+        }
+        db.delete_missing(&HashSet::from([pending.into()])).unwrap();
+        assert_eq!(db.load_one(&first).unwrap().unwrap().jpeg_data, b"first");
+        assert_eq!(db.load_one(&second).unwrap().unwrap().jpeg_data, b"second");
+        assert!(db.load_one(pending).unwrap().is_none());
+        assert!(
+            db.load_one(&format!("{pending}|generation:19:16384"))
+                .unwrap()
+                .is_none()
+        );
+        let first_dims = db.load_source_dims_matching(17, 4096).unwrap();
+        assert!(first_dims.contains_key(&first));
+        assert!(!first_dims.contains_key(&second));
+        assert!(db.load_source_dims_matching(17, 8192).unwrap().is_empty());
     }
 
     #[test]
