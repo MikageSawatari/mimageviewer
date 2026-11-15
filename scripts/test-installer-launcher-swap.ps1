@@ -15,6 +15,8 @@ $installDir = Join-Path $runRoot 'install'
 $launcherName = 'miv-swap-test.exe'
 $launcherPath = Join-Path $installDir $launcherName
 $processes = New-Object 'System.Collections.Generic.List[System.Diagnostics.Process]'
+$rmFailures = New-Object 'System.Collections.Generic.List[string]'
+$excludedRmVerified = $false
 $mutex = $null
 $lockStream = $null
 $savedTemp = $env:TEMP
@@ -104,10 +106,27 @@ function Build-TestInstaller([string] $Source, [string] $Name, [string] $Extra =
 function Install-Version([string] $Installer, [string] $Label, [bool] $Success = $true) {
     $log = Join-Path $runRoot ("$Label.log")
     $result = Invoke-TestProcess $Installer @('/VERYSILENT', '/SUPPRESSMSGBOXES',
-        '/NORESTART', "/DIR=`"$installDir`"", "/LOG=`"$log`"") $Label
+        '/NORESTART', '/LOGCLOSEAPPLICATIONS', "/DIR=`"$installDir`"", "/LOG=`"$log`"") $Label
     if ($Success) { Assert-True ($result -eq 0) "$Label failed; see $log" }
     else { Assert-True ($result -ne 0) "$Label unexpectedly succeeded; see $log" }
     return $log
+}
+
+function Get-VerifiedRmLog([string] $Path) {
+    $text = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+    Assert-True ($text.Contains('Swap test: RestartManager session started')) `
+        "RestartManager session unavailable; exclusion is unverified; see $Path"
+    Assert-True ($text.Contains("Calling RestartManager's RmGetList.") -and
+        $text.Contains('RmGetList finished successfully.')) `
+        "RestartManager query did not succeed; exclusion is unverified; see $Path"
+    return $text
+}
+
+function Assert-RmResource([string] $Text, [string] $Path, [bool] $Expected) {
+    $pattern = '(?m)Found a file to register with RestartManager: ' +
+        [regex]::Escape($Path) + '\r?$'
+    Assert-True (($Text -match $pattern) -eq $Expected) `
+        "Unexpected RestartManager resource registration (expected=$Expected): $Path"
 }
 
 function Assert-Launcher([string] $Source) {
@@ -167,6 +186,7 @@ try {
     $v2 = Build-TestInstaller $sources[1] 'v2'
     $v3 = Build-TestInstaller $sources[2] 'v3'
     $fail = Build-TestInstaller $sources[2] 'fail' '/DFailAfterLauncher'
+    $noExclusion = Build-TestInstaller $sources[1] 'no-exclusion' '/DTestDisableLauncherRmExclusion'
 
     # Updates (including fresh installs) must ignore the MCP mutex entirely.
     $mutex = New-Object System.Threading.Mutex($false, "Local\miv-swap-test-mcp-$token")
@@ -182,14 +202,23 @@ try {
     Write-Host 'PASS 2: idle update'
 
     $running = Start-TestLauncher
-    Install-Version $v3 '3-running-update' | Out-Null
+    $log = Install-Version $v3 '3-running-update'
     Assert-Running $running
     Assert-Launcher $sources[2]
     Assert-OldCount 1
     $old = @(Get-ChildItem -LiteralPath $installDir -Filter "$launcherName.*.old" -File)
     Assert-True ((Get-FileHash -LiteralPath $old[0].FullName).Hash -eq
         (Get-FileHash -LiteralPath $sources[1]).Hash) 'Wrong running backup content'
-    Write-Host 'PASS 3: running update and Restart Manager exclusion'
+    Write-Host 'PASS 3 swap: running launcher preserved and content updated'
+    try {
+        $rmText = Get-VerifiedRmLog $log
+        Assert-RmResource $rmText (Join-Path $installDir 'rm-probe.dll') $true
+        Assert-RmResource $rmText $launcherPath $false
+        $excludedRmVerified = $true
+    } catch {
+        $rmFailures.Add("Excluded update: $($_.Exception.Message)")
+        Write-Host ("FAIL RM 3: {0}" -f $_.Exception.Message)
+    }
 
     Install-Version $v1 '4-second-update' | Out-Null
     Assert-Running $running
@@ -243,6 +272,28 @@ try {
     Assert-True (-not (Test-Path -LiteralPath $launcherPath)) 'Uninstall left launcher'
     Assert-True (-not (Test-Path -LiteralPath ($launcherPath + '.unused.old'))) 'Uninstall left old file'
     Write-Host 'PASS 6b: uninstall removed launcher and unused backup'
+
+    # Negative control uses the same swap code and differs only in the RM filter.
+    # The design lead's logs showed no user of the vacated original path, so RM did not close the launcher.
+    # Exclusion also guards a future pre-rename RM query; compare registration, not detection or exit.
+    Install-Version $v1 '3-control-seed' | Out-Null
+    $controlRunning = Start-TestLauncher
+    try {
+        $log = Install-Version $noExclusion '3-no-exclusion-control'
+        $rmText = Get-VerifiedRmLog $log
+        Assert-RmResource $rmText $launcherPath $true
+        Assert-RmResource $rmText (Join-Path $installDir 'rm-probe.dll') $true
+        Assert-Launcher $sources[1]
+        Write-Host 'PASS 3 control: RestartManager registered the original launcher path without exclusion'
+        if ($excludedRmVerified) {
+            Write-Host 'PASS 3 RM exclusion: session/query verified and registration differs with exclusion'
+        }
+    } catch {
+        $rmFailures.Add("No-exclusion control: $($_.Exception.Message)")
+        Write-Host ("FAIL RM control: {0}" -f $_.Exception.Message)
+    } finally { Stop-TestLauncher $controlRunning }
+
+    Assert-True ($rmFailures.Count -eq 0) ("RM exclusion verification failed: " + ($rmFailures -join '; '))
     $exitCode = 0
 } catch {
     Write-Host ("FAIL: {0}" -f $_.Exception.Message)

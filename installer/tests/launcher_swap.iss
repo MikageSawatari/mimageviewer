@@ -15,6 +15,9 @@
 #define ShutdownEventName "Local\miv-swap-test-shutdown-" + TestToken
 #define AppMutexName "Local\miv-swap-test-instance-" + TestToken
 #define McpMutexName "Local\miv-swap-test-mcp-" + TestToken
+#ifdef TestDisableLauncherRmExclusion
+  #define LauncherCloseApplicationsFilterExcludes ""
+#endif
 #include "..\launcher_swap.iss"
 
 [Setup]
@@ -37,12 +40,24 @@ WizardStyle=classic
 
 [Files]
 Source: "{#LauncherSource}"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion; AfterInstall: TestLauncherWritten
+; Keep one unused resource eligible for RM even when the launcher is excluded.
+; This is a data copy of PING, never loaded or executed as a DLL.
+Source: "{#LauncherSource}"; DestDir: "{app}"; DestName: "rm-probe.dll"; Flags: ignoreversion
 #ifdef FailAfterLauncher
 ; An unavailable external file fails only after the new launcher was installed.
 Source: "{#TestRoot}\missing-external-file"; DestDir: "{app}"; Flags: external ignoreversion; ExternalSize: 1
 #endif
 
 [Code]
+function InitializeSetup(): Boolean;
+begin
+  if RmSessionStarted then
+    Log('Swap test: RestartManager session started')
+  else
+    Log('Swap test: RestartManager session unavailable');
+  Result := True;
+end;
+
 procedure TestLauncherWritten();
 begin
   Log('Swap test: installed launcher SHA256=' +

@@ -12,10 +12,17 @@
 #ifndef McpMutexName
   #define McpMutexName "Global\mImageViewerMcp_v1"
 #endif
+#ifndef LauncherCloseApplicationsFilterExcludes
+  #define LauncherCloseApplicationsFilterExcludes MyAppExeName
+#endif
 
 [Setup]
 ; mIV 本体は終了の合図で閉じ、AI アプリの launcher は改名して残す。
-CloseApplicationsFilterExcludes={#MyAppExeName}
+; 隔離試験のログでは退避後の正規名を RM に登録しても使用者が見つからず、launcher は閉じられなかった。
+; 除外は、退避より前に RM が動く構成へ変わった場合などの二重の守りとして残す。
+#if LauncherCloseApplicationsFilterExcludes != ""
+CloseApplicationsFilterExcludes={#LauncherCloseApplicationsFilterExcludes}
+#endif
 
 [UninstallDelete]
 Type: files; Name: "{app}\{#MyAppExeName}.*.old"
