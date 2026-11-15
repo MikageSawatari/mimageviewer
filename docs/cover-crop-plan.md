@@ -1878,7 +1878,7 @@ lib全件・build-dev・製品起動・独立レビュー・コミットは行�
 
 ## 29. 本文の保存回転による自動切り出しの作り直し (§1.773 続編、v5.3.0)
 
-設計日: 2026-11-15。確認対象は `68101a56e`。**設計案・独立設計レビュー前、実装は未着手。**
+設計日: 2026-11-15。確認対象は `68101a56e`。**独立設計レビューのREVISE 3件を反映、再レビュー前・実装は未着手。**
 本節は§28.3の「作り直さない」という制約を解消する次段の設計であり、§28.3の出荷記録は残す。
 判定の式・標本の選択・4方向の結果・手動範囲の座標系は変えない。
 
@@ -1892,6 +1892,7 @@ lib全件・build-dev・製品起動・独立レビュー・コミットは行�
 | --- | --- |
 | 素材に最大8ページのキー・角度を持たせる | 成立。samplerは既にlookup callbackへviewerキーを渡す。`AutoMaterial` は `CacheEntry` → `ThumbPixels` → `ThumbnailState::Loaded` →保持一覧へ運ばれ、K2も同じ素材をコピーする。ここへ一体化すれば別の依存管理ownerは要らない。 |
 | workerの読取照合で遅いDB書戻し・再起動を処理する | 成立。ただしDB行だけでなく、`cache_map` のhit、K2の子行、provisional seedを含む全ての素材の入口で照合する必要がある。 |
+| K2のmissを既存の次候補探索だけで処理する | 不成立。`resolve_folder_thumb_image_inner` はZIP/PDFの完成済み行が無いと次候補へ進み、生成しない。回転で素材が古くても子の選択は変えず、選ばれた子の生成を同じ要求のworker内へ接続する（§29.5）。 |
 | 既存の退避・取消だけで遅い結果も処理する | 一部成立。既知のLoadedを退避して `requested.remove` した場合はrequest IDで遅着を拒否できる。しかし初回生成中は依存がまだ不明で、回転通知で取り消せない。従って結果採用直前のメモリ照合を1か所追加する。 |
 | 表紙の回転は依存に入れない | 成立。`sample_indices` は代表自身を除外しており、表紙の角度だけを変える場合は4方向の既存結果を描画時に選び直せばよい。 |
 
@@ -1969,8 +1970,10 @@ schema世代・RO handleの列再検出には新しい分岐を足さない。
   `representative_auto_crop_key_parts` とidentityのsuffix helperへ集約する。
   EPUBのgeneration、#pin位置、ZIP内の文字との境界は既存の規則を保つ。OFF/手動/通常ページのキーは変更しない。
 - K2の出荷済みv1専用互換は維持する。`legacy_auto_child_keys` の現在キーの入口をv4へ更新し、
-  現行v4が無いときだけ同方向→逆方向のv1を署名一致まで探す。v3へのfallbackや綴じ方向をまたいだ現行v4の流用はしない。
+  現行v4が無いときだけ同方向→逆方向のv1を署名一致まで探す。v3の画素の流用や綴じ方向をまたいだ現行v4の流用はしない。
   `LegacyV1` は本文比率を参照しない旧画素であり、架空の本文依存を付けない。子自身はv4で生成する既存方針を保つ。
+  v4/v1の使える行が無い自動対象の子は、v3の有無によらず「素材未生成」とし、子のv4 writerキーで生成する（§29.5）。
+  とくにv3しか無い更新直後も、子のタイルを一度表示することを前提にしない。
 
 同じv3キーで依存欠落をmissにする案も可能だが、旧形式と新形式の意味を同一identityへ重ねるより、
 既存の版更新の経路で切り替える方が単純。再生成可能なキャッシュだけを対象とし、回転DB・pin・手動範囲の移行は行わない。
@@ -1988,7 +1991,7 @@ workerは `SampleRotations` を要求内で遅延作成し、automaticの依存�
 | --- | --- |
 | `process_load_request_with_provider` の通常hit | `cache_map` とlazy catalogの候補について、stamp・既存folder proofの検査と同じhit確定境界で照合する。WebP decode/send、PDF meta catch-up、Parent memory昇格より前。不一致は通常のmiss。memory候補を外す位置は `observe_parent_stamp` / provider解決より前にし、Parentの通常missの観測を省略させない。 |
 | Fixed catalogの `load_all` から作ったmemory | preload自体を検証済みとはしない。個々の要求が取り出す上記の入口で同じ照合を通す。UI側のload_allに回転SQLを足さない。 |
-| `FolderResolveContext::cached_candidate` | 子の署名・folder proof確認後、K2の勝者にする前に照合。不一致ならその候補を使わず既存の次候補/画像auto-pickへ進む。K2で子をdecode/判定し直す処理は追加しない。 |
+| `FolderResolveContext::cached_candidate` | 候補の選択と素材の鮮度を分ける。自動対象の子について、署名・folder proof・本文proofの不一致や現行行の欠落は `NeedsMaterial(selected_child)` を返す。候補を外して次候補へ進めず、§29.5でその子を生成する。 |
 | K2の親行/seed/provisional hit | 親自身がauto判定しない場合も素材のproofを検査する。`send_pinned_child_folder_cached`、drive-listのprefix seed等、通常hitより前の送信経路も同じ入口helperへ通す。previewとfinalの同一性比較にも素材全体を含める。 |
 | 色フィルター・レーティング・Remote等 | catalogからのseedは検証済みと見なさず、共通workerの採用入口で照合する。別実装のrotation読取/判定式を増やさない。 |
 
@@ -2005,11 +2008,98 @@ source生成を許す場合だけ§29.2の0°・非永続の結果で完了す�
 読取照合の直後に回転する競合はUIの採用照合で扱う。headlessの一要求の照合完了後の変更について、
 送信全体を回転DBのtransactionで拘束しない。次の要求では必ず再照合する。
 
-### 29.5 K2・結果の運搬
+### 29.5 K2の選択・選ばれた子の生成・結果の運搬
+
+#### 候補の選択と素材の鮮度を分ける
+
+現行 `resolve_folder_thumb_image_inner` の子の枝（6194行付近）は完成行の読取しか行わず、
+`cached_candidate` がNoneなら次候補へ進む。これを回転の不一致にそのまま使う案を撤回する。
+優先の子Aを回転不一致で外してBを保存すると、Aの本文回転を元に戻してもBだけのproofからは復帰を検出できない。
+従って**本文回転は候補の適格性・順序を変えず、選ばれた子の素材を古くするだけ**とする。
+
+既存の種類表示・pin・代表順・直下画像の優先・探索深さによって選ぶ順序は保つ。
+自動対象の本の子は、完成行の有無/本文回転の一致を選択条件にせず、選択後の素材取得で扱う。
+`FolderThumbResolution` と `cached_candidate` 周辺のOptionだけの戻りを、次の責務の型へ分ける（型名は実装案）。
+
+```rust
+enum ChildMaterialResolution {
+    Ready(CachedPinnedFolderThumb),
+    NeedsMaterial(SelectedChildCover),
+    Ineligible,
+}
+```
+
+`SelectedChildCover` は選ばれた論理コンテナ、既存pinの解決結果、writerキー、stamp/generation、
+探索深さ/ZIP prefix等、その子自身の要求を組み立てる事実を持つ要求内の値であり、常駐ownerではない。
+本の現物が対象外・表示policyで除外・選択がpinの現状と合わない等の場合だけ `Ineligible` として既存の次候補へ進む。
+自動対象の子では、現行行が無い・旧v3だけ・署名が古い・本文proofが古い場合は `NeedsMaterial`。
+先頭の適格なAが未生成でも、後ろに完成済みBがあることを理由にBを優先しない。
+これにより、親が持つ本文proofを勝者だけに限定できる。自動OFFや自動対象外の子の既存cache-only選択、
+出荷済みv1の明示的な互換規則は変えず、これらを一般的なcold source生成の対象には広げない。
+
+#### 既存worker内の一要求で子を生成する
+
+```text
+親のprocess_load_request_with_provider（通常のsource miss）
+  → resolve_read_after_cache_miss / フォルダの既存解決
+  → 選ばれたAの NeedsMaterial（ここではdecodeしない）
+  → 同じworkerのcall stackでA自身の素材を生成
+  → Aのwriterキー・Aのcatalogへ通常policyで保存
+  → 生成後の選択proofを確定し、Aの完成素材を親のK2枝へ渡す
+  → 親の行/画素へコピーし、親の元のrequest IDでだけUIへ送る
+```
+
+- `process_load_request_with_provider` / `load_one_cached` の既存source生成のうち、
+  **解決済みleafのdecode・解析・4方向の結果・保存用素材を作る部分**をworker内で呼べる共通helperへ分離する。
+  通常の子タイルとK2の両方が同じhelperを呼び、JPEG/PDF decodeや判定をK2用に複製しない。
+  `NeedsMaterial` を消費する場所は既存の親のsource処理であり、resolver自体へ無条件のdecode副作用を入れない。
+  通常経路の画像送信→encode/保存という既存の順序は保ち、K2内部では親へ結果を返す前に子の保存判断まで完了する。
+- 子の要求は、K2が参照する**子のdirectory catalogと、通常その一覧にある子タイルのwriterキー**を使う。
+  親のfolderthumbキーやCollection/Parentの外側の保存先を、子の保存先へ流用しない。
+  pin・手動範囲・綴じ方向・種類policy・EPUB generation等も、子の通常要求と同じbuilder/解決helperを通す。
+  子の元ソースから生成するのであり、v3の画素へ新しいproofだけを付けてv4として保存しない。
+- 親のcancel/admission・source policy・優先度・I/O予算を継承する。既に取得したI/O permitを再取得せず、
+  同じthumbnail poolへ子jobをenqueueして待たない。子用の `ThumbnailRequests` 登録やUIのrequest IDは作らない。
+  sourceを許す親の通常workerだけで完結し、CacheOnly/drive-listのcache-only seedは `CacheOnlyMiss` のまま。
+  常駐job・channel・pending集合・完了をUIで待つ経路は追加しない。
+- PDF/EPUBのlease・password・render validityは、親ではなく**選ばれた子の論理ソース**に結び付ける。
+  子のPageSizesとrenderは同じReadTarget/passwordを使う。必要な設定・既存 `PdfPasswordStore` 等は
+  `BookCoverEnv` と同様にUIでは値/handleを捕捉するだけとし、復号・source解決・I/Oはworkerで行う。
+  K2から新たなパスワード待ちUIを起こすことはしない。生成できない場合は既存の失敗通知で完了する。
+- source/保存helperは、完成画素・CoverIdentity・AutoMaterial・元寸法/描画寸法・利用できればencoded bytesを返す。
+  子catalogへの保存がpolicy上不要/無効でも、生成した素材を直接親へ渡せるようにする。
+  「保存後の子行を再読取できたこと」を親の表示の条件にせず、Off/Autoで無理に子をforce-saveしない。
+  親で行うのは既存K2と同じ素材の転送・必要なencode/保存であり、親として再sampling/再判定しない。
+- ネストした子フォルダでも同じ選択/素材取得を使い、既存の深さ・pin連鎖の上限と取消を保つ。
+  子のwriterキーに必要な設定深さと、現在の探索のremaining depthを区別し、再入場で上限をリセットしない。
+  `resolve_book_cover` 等の読取専用consumerには選ばれた子の識別を渡し、従来のchild resolveへつなぐ。
+  範囲画面を開いただけで親catalogを書いたり、他contextを退避したりしない。
+
+#### 子の保存と親の選択proofの確定順
+
+子行を保存すると、そのdirectory catalogのrevisionも変わる。
+生成前の `FolderResolveContext.dependencies` をそのまま親へ保存すると、自分の子保存だけで親proofが古くなる。
+逆に、生成前の選択を使ったままrevisionだけを最新へ書き換えると、途中の別の選択変更を隠す。
+従って生成前の選択proofは最終proofにせず、**子の保存後に、既存の選択passを新しいcontextで一度通して確定する**。
+
+この確定passでは、要求内にある完成した子素材をwriterキー・stamp・選択事実・本文proofの一致で再利用する。
+保存policyで子行を作らなかった場合も同じで、最初から再decodeしない。
+`ReadUnavailable` は当該要求だけの0° fallbackとして一回使い、proof不一致による再生成へ戻さない。
+catalog revision / pin store / winner stampはこのpassで通常どおり観測し、親の結果・proofと一緒に返す。
+親へ持ち上げたネスト先でも、自分が起こした子保存より前の証明を使い回さない。
+これは生成に伴う選択の確定であり、読取失敗のretry loopではない。
+確定中にさらに内容/pin/本文回転が変わって再び素材生成が必要になった場合は、その要求内で待合せ・再生成を繰り返さず、
+既存のstale/cancel終端へ戻す。通常demandが新しい要求を出す。回転だけを理由にBへ選択し直したproofは作らない。
+source/DBのまれな失敗はログ・通知で完了し、Aを古いという理由で外したBの親行を永続化しない。
+`ReadUnavailable` の0°・非永続の扱いは§29.2のまま。
+
+#### 結果の運搬
 
 `CachedPinnedFolderThumb.auto_material`、K2の親への `save_auto_folder_bytes`、`CacheEntry`、
 `ThumbPixels`、`ThumbnailState::Loaded`、snapshotのcloneは同じproofを運ぶ。
 K2で複数候補を調べても、**勝者の素材に属する最大8組だけ**を継承する。他候補や親の標本をunionしない。
+この規則は、回転不一致を候補の除外理由にせず選ばれた子を生成する上記の規則と一組である。
+例えばAのP=0°の素材→P=90°→Aを再生成→P=0°に戻す、の全てで勝者はAのまま、親もAのproofで再生成する。
 既存のfolder選択proof（catalog revision / pin store / winner stamp）と、本文回転proofは別の入力を証明する。
 前者を流用してrotationのglobal revisionを載せたり、相互に代替したりしない。
 
@@ -2040,9 +2130,31 @@ snapshot内の `saved_thumbnails` / `list_view_thumbnails` やSmartの退避一�
 **再び表示可能になる前に**、既存 `reconcile_restored_cover_thumbnails` に同じproofのメモリ照合を追加し、
 一致するものだけを残す。休眠配列を通知ごとに再帰走査したり、そのためだけにcontextをmountしたりしない。
 snapshotのrestore/list-view切替、Smart復元、registryのdirect-source復元は既にこの入口を持つ。
+ただし**入口を呼んでいるだけでは十分でなく、復元先の状態の代入が全て終わってから照合する**。
+特にSmartは現行コードで照合の後に退避していた `auto_aspect` を代入しており、順序を改める。
 同一handler内のZIP階層切替の保持texture移送とrating membershipのcloneも監査し、
 復元元が現在の検証済みLoadedであることを固定する。非同期に保存した配列から移す経路なら同じ再照合を必須にする。
 read-onlyなopen/closeは、他contextへの変更通知として発行しない。
+
+#### 復元の順序とauto-aspectの監査（独立設計レビュー P2）
+
+復元の共通契約は「items・thumbnails・metas・generation・auto_aspectを含む表示/所有状態を代入
+→ 古い素材を照合/退避 → 最終Loadedからsamplesを整合 → 通常の描画/要求受付」とする。
+照合の後から退避snapshotのsamplesを再代入しない。復元handlerの途中だけでなく、**終了後のsamples**を契約にする。
+
+| 復元入口 | `68101a56e` での確認と必要な順序 |
+| --- | --- |
+| `restore_prepared_smart_folder_session` (`smart_folder.rs:8624–8628`) | 現行は `reconcile_restored_cover_thumbnails` → generationを合わせた `self.auto_aspect = auto_aspect` の順で、取り除いた寄与が戻る。退避stateの代入を先に済ませ、pin map・色cache・view種別等も復元先のものへそろえてから照合する。照合後の古いstate再代入をなくす。 |
+| `deactivate_snapshot` のat-origin枝 (`snapshot_ops.rs:1502`) | merged thumbnailsを代入してから照合し、その後に退避auto_aspectの代入は無い。後続の `restore_snapshot_viewing_state` は見開き/閲覧の状態で、auto_aspectを持たない。ただし新idxへの復元に古いsamplesを残さないよう、復元先の表示状態をそろえた最終境界でsamplesを整合する。 |
+| `snapshot_return_to_list_view` (`snapshot_ops.rs:1634`) | listのitems/thumbnailsを代入してから照合し、その後のauto_aspect再代入は無い。subsetのidxへ切り替わるので、別の一覧のsamplesを残さず、最終Loadedから同じ整合を行う。 |
+| registryのdirect-source復元 (`viewer_context_registry.rs:4768`) | saved items/thumbnailsと新generationを設定して照合し、その後のauto_aspect再代入は無い。保持するmetadata/閲覧状態を確定してから同じ整合を行い、復元先のownerだけを変更する。 |
+
+復元では既存 `rebuild_auto_aspect_samples_from_loaded` を用い、古いproofのLoadedを退避した後の一覧からsamplesを作り直す。
+これはidx配置が替わるその復元先だけのsamplesの整合であり、全contextの一括リセットではない。
+通常の回転通知では従来の設計どおり該当idxの寄与だけを除く。
+どちらも失効した寄与に基づく `streak` は破棄し、古い標本数による `cached_sample_gate` で新しい集計を止めない。
+`current`・scroll・selection・無変更の兄弟contextのstateはこの修正で一括初期化しない。
+後続のcache seedも§29.7のメモリpredicateを通し、古い比率を再注入しない。
 
 ### 29.7 遅い結果の採用照合が必要な理由と位置
 
@@ -2077,8 +2189,8 @@ read-onlyなopen/closeは、他contextへの変更通知として発行しない
   触る可能性があるのは `viewer_context_registry.rs` の既存素材退避と、同じbundleの保持/復元境界だけ。
   これは同一データのcurrentnessをownerごとに保つ変更であり、windowの状態から推測して症状を隠す修正ではない。
   `docs/detached-rework-plan.md` §2（特に所有境界・時刻の一致・追加bool禁止）に沿う。
-  **実装前に設計担当と独立レビュー側がこの構造的な理由へ合意し、実装時に同計画§11へ範囲と判断を記録する。**
-  本設計だけでその合意や実装完了を宣言しない。
+  **今回の独立設計レビューでレビュー担当がこの範囲を構造的修正とすることに合意し、設計担当（ClaudeCode）も合意した
+  （2026-11-15）。実装時に同計画§11へ触った範囲と判断を記録する。** 実装完了を意味する合意ではない。
 
 ### 29.9 触るファイルと関数（実装時の範囲）
 
@@ -2088,13 +2200,13 @@ read-onlyなopen/closeは、他contextへの変更通知として発行しない
 | `src/cover_auto_material.rs` | Automaticの素材型・proofのcodec・借用する描画helper。判定の数学は変更しない。 |
 | `src/cover_auto_crop.rs` | identityのv4/v4f更新だけ。detectorの `AutoCropResults` と判定規則は維持。 |
 | `src/catalog.rs` / `src/cover_identity.rs` | 既存 `auto_crops` の単一codecのdrive文脈、全reader/writer/copyでの運搬と不正値miss。schema追加なし。ページキーcodecは既存規則を共用する。 |
-| `src/thumb_loader.rs` | `process_load_request_with_provider` のmemory/DB hit、`FolderResolveContext::cached_candidate`、seed/send各入口、生成結果とK2保存、auto-key helperとv1互換入口。 |
+| `src/thumb_loader.rs` | `process_load_request_with_provider` のmemory/DB hit、`FolderResolveContext::cached_candidate` / `resolve_folder_thumb_image_inner` の選択と鮮度の分離、選ばれた子を同じworkerで生成する共通source/material helper（`load_one_cached` 周辺から分離）、生成後の選択proof確定、seed/send各入口、K2保存、auto-key helperとv1互換入口。 |
 | `src/grid_item.rs` 等の素材consumer | `ThumbnailState::Loaded` の一体的な保持、Copyから借用/cloneへの型変更。描画時のDB参照なし。 |
 | `src/app.rs` / `src/app/cover_rotation.rs` | `rotation_page_owner_changed`、`evict_thumbnail_for_reload`、`reconcile_restored_cover_thumbnails`、`poll_thumbnails`、auto-aspectのcache seed/寄与の除去。 |
 | `src/app/viewer_context_registry.rs` | 既存Legacyと並ぶowner単位の素材退避。contextの作成/移譲/退役は変更しない。 |
-| `src/app/snapshot_ops.rs` / `src/app/smart_folder.rs` / `src/app/rating_membership_ops.rs` | 保持/復元/clone入口の共通predicate適用の監査と、必要な復元境界だけの接続。 |
+| `src/app/snapshot_ops.rs` / `src/app/smart_folder.rs` / `src/app/rating_membership_ops.rs` | 保持/復元/clone入口の共通predicate適用。Smartのauto_aspect代入を含め全復元状態をそろえてから照合し、handler終了後のsamplesまで整合する。 |
 | `src/app/color_filter.rs` / `src/rating_view.rs` | 新版identity・共通workerへの接続、素材の型変更とmain-only失効の検証。独自判定を追加しない。 |
-| `src/ui_dialogs/cover_crop.rs` / `src/cover_auto_crop/evaluation*` | 新しいsampler戻り値と共通素材型への接続。ダイアログは従来どおり開くたびworkerで判定、本文変更への専用live追従は追加しない。 |
+| `src/app/book_cover.rs` / `src/ui_dialogs/cover_crop.rs` / `src/cover_auto_crop/evaluation*` | 新しいsampler戻り値と共通素材型への接続。子生成に必要なpassword等の既存値/handleのworker環境への捕捉、K2の選ばれた子の識別を既存のchild resolveへ接続。ダイアログは従来どおり開くたびworkerで判定し、専用live追従や読取専用openでのcatalog更新は追加しない。 |
 | `src/remote_ipc/thumbnail.rs` | 共通workerを経由する検査、必要な借用/cloneの型追従だけ。auto対象やwireを拡張しない。 |
 | `docs/display-pipeline.md` / `docs/virtual-folders.md` / `docs/ui-responsiveness.md` | 新版identity・読取/採用/復元照合・worker限定SQLを更新する（現行文書に残るv2表記も実コードの版と揃える）。 |
 | `htdocs/mimageviewer/manual/known-issues.html` / `manual/grid.html` | 実装・回帰確認後に本文回転の既知問題のh3/pを削除し、gridの「前の判定が残るため手動で指定し直す」という制約を外す。表紙は4方向の結果を選び、本文は必要な本だけ再判定する説明に揃える。 |
@@ -2125,9 +2237,19 @@ read-onlyなopen/closeは、他contextへの変更通知として発行しない
 7. **複数context**: 同じ本を持つmounted/AtRestの両方だけが退避され、別の本の兄弟contextのrequest ID・queue・
    pixels・items generation・色scanは不変。主一覧がparkedの場合もmain-only色失効を維持する。
 8. **保持一覧**: snapshotのsaved/list-view、Smart、direct-source復元で古いproofを表示前に除く。
+   退避したauto_aspectに旧比率を意図的に入れ、各復元handlerが終わった後の `samples` にそのidxの旧寄与が無いこと、
+   新しく受信した素材でだけ寄与が戻ることを検査する。Smartは代入後の照合を必ず通し、
+   他の3経路もidxの入替え・subset・Loadedのmergeと組み合わせ、streak/gateから旧寄与が復活しないことを固定する。
    同じ一覧の同期的な再利用・read-onlyなopen/closeは、無変更の兄弟に失効を発行しない。
 9. **K2**: 子のproofと全方向の結果を親まで一致させ、本文変更で両方が古くなること、親で再判定しないこと、
-   staleな子を勝者にしないこと、v1の同方向優先/署名不一致時の逆方向探索を維持することを検査する。
+   staleな画素を使わず**選ばれた同じ子を生成すること**、v1の同方向優先/署名不一致時の逆方向探索を維持することを検査する。
+   ZIPだけ/PDFだけを含み直下にも子フォルダにも画像の無い親で、v3行のみ→親だけを要求→子v4生成→親の代表採用まで終わることを固定する。
+   子タイルの表示・子の独立job受付を行わず、別contextで本文回転→親だけを再要求した場合にも同じ終端まで進むことを検査する。
+   優先AのP=0°の素材と、使用可能な後続Bを用意し、P=90°でAを生成して親へ渡し、P=0°へ戻してもう一度Aを生成する。
+   全段階で勝者がA、親proofがその時点のAのproofであり、回転だけでBを選んだ親行が保存されないことを検査する。
+   子保存で変わったcatalog revisionを親の最終proofへ反映し、直後の親読取が自己生成だけで再missにならないこと、
+   Off/Autoで子行を保存しなくても生成素材で親の表示を完了できること、CacheOnlyでは子生成しないことを固定する。
+   確定pass中に別の更新をbarrierで入れた場合も、古いproofの採用や無限の同一要求内再生成をせず、既存stale終端へ戻す。
 10. **Remoteと補助consumer**: 共通workerを経由するreaderに古い依存付き素材をseedし、stampだけではhitにならないことを検査。
     現行Remoteのauto OFFと通常page keyを変えず、色フィルター/レーティングも同じ照合を通す。
 11. **障害**: 読取失敗はログ・通知と0°の非永続結果で完了し、再要求ループ・DB再作成・既存行削除を起こさない。
@@ -2147,5 +2269,8 @@ snapshot_ops / K2 / color_filter / Remote関連）、coreのcheck、fmt、diff c
 - **writerのcurrentness保証・保存barrier**: 読取照合で遅い行を無害にできる。既存の取消後保存/投資回収を壊してまで保証しない。
 - **requestへ全ownerのsnapshot・変更履歴を載せる**: proofは標本決定後にしか分からず、採用時のboundedなメモリ照合で足りるため不採用。
 - **全休眠snapshotの通知時の再帰走査と逆引き登録**: 既存の復元境界で同じ照合を掛ければ足り、登録/解除/dropの別管理が不要。
+- **K2の回転不一致を候補除外にする**: 親の代表が消えるだけでなく、Aを外してBを保存するとAの回転が戻ったことをBのproofから検出できない。選ばれたAの生成へ進める。
+- **K2の子生成を別jobへ投げて待つ**: pool/I/O permitの入れ子待ちや新しい完了ownerを要する。同じworkerの共通素材生成helperで済ませる。
+- **復元の照合をitems/thumbnailsの代入直後だけに置く**: 後で退避auto_aspectを代入すると旧寄与が戻る。復元先全体をそろえた後の照合・samples整合を完了条件にする。
 - **一覧全体を閉じて開き直す**: 同じcontextの無関係な選択・scroll・要求まで動かす。既存のidx単位退避の方が小さい。
 - **回転DBや判定をUIで読み直す**: 在メモリownerで採用を判定でき、§4の応答性規則に反するため不採用。
