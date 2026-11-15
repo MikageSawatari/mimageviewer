@@ -154,7 +154,7 @@ skip sample / pre-skip が適用された音声サンプルと frame PTS の関�
 
 ### 1.776 最初に全画面を開いたとき、全画面の 2 コマ目で約 0.5 秒止まる — ReleaseChecks の first-ai から (2026-11-13)
 
-- 状態: **案 A 実装済み・独立レビュー前（v5.3.0 の承認済み計画）。製品（release）での効果は未計測**。v5.2.0 は既知として出荷した (利用者決定 2026-11-13)。
+- 状態: **案 A 実装済み・独立レビュー ACCEPT (Sol xhigh、2026-11-16、指摘なし)・本体 lib 全件は未実行 (GPU テストの同時実行数を絞る変更の取り込み待ち)（v5.3.0 の承認済み計画）。製品（release）での効果は未計測**。v5.2.0 は既知として出荷した (利用者決定 2026-11-13)。
 - 観測 (ReleaseChecks の記録、隔離した診断ポータブル版): v5.2.0 の run `release-checks-20261113-050011-2e1435fd` の first-ai で、`open_fullscreen` 直後の全画面 viewport の 2 コマ目が `immediate_viewport total=489.9ms run=487.1` (段別 `fullscreen_viewport_ms` 490ms)、`ui-frame-gap 492.7ms`。AI の action を送る前の段階。10-29 の run `release-checks-20261029-161208-c3ed5627` でも同じ場所で `total=543.6ms`。今回の版の変更によるものではない。
 - これまで見つからなかった理由: first-ai は §1.483 の台本の不具合で全画面を開いた直後に落ちており、v5.2.0 で台本を直して初めて最後まで走った。ほかの ReleaseChecks のケースは全画面を開かない。
 - 調査 (2026-11-15、ブランチ `inv-776-fs-first-frame`、コミット 9859ea9b9):
@@ -164,6 +164,8 @@ skip sample / pre-skip が適用された音声サンプルと frame PTS の関�
   - 製品 (release) での内訳は未計測。perf event に区間別のフィールド (`resampler_create_breakdown` など) を足したので、次に ReleaseChecks の first-ai か perf smoke を流すと製品での値が出る。NIS のパイプライン作成の中身 (naga の HLSL 変換と FXC のどちらか) は分けて測っていない。動画側では NIS の FXC コンパイルが 2.1 秒かかっていた前例がある (§1.122、build.rs で DXBC 化して解消)。
   - Anime4K (アニメ拡大を選んだときだけ) の初回作成も 587〜1,517ms で、同じ型。
 - 案 A の実装: layout 2 個は本体作成時、shader と pipeline は縮小・可視範囲拡大・NIS・ピクセルアートの枝ごとの初回 prepare 時に作る。prepare で確定した pipeline を job が保持し、通常と既存 prewarm は同じ型で encode する。作るスレッド・各枝の出力・cache key は維持。非同期化・新しい prewarm（案 B）と Anime4K の変更は今回含めない。[表示パイプライン](display-pipeline.md#241-フルスクリーン静止画の-gpu-lanczos3-縮小標準拡大と選択式拡大)。製品（release）での効果は未計測。
+- 案 A の後の計測 (`measure_776`、同じ条件 = DX12 + FXC・RTX 4090・`dev-runtime`・3 回、コミット db5bd3626。観測者: ClaudeCode がテストを実行): 枝ごとの初回の作成は、既定の拡大 (可視範囲拡大) 25〜30ms (案 A の前は resampler 全体で 652〜1,444ms)、縮小 22〜28ms、ピクセルアート 14〜17ms、NIS 445〜797ms。既定の拡大の 2 回目は作成なし (0.3ms)。Anime4K の初回作成は 492〜539ms (変更なし)。別の枝を初めて使うとき (例: 縮小しか使っていなかった後に拡大) は、その枝の分だけ止まる (数十 ms)。
+- 残り (案 B、今回は入れない・統括決定 2026-11-16): NIS (「くっきり拡大」) と Anime4K (アニメ拡大) を選んだ人の初回の止まり (上の計測で約 0.45〜0.8 秒と約 0.5 秒) は残る。直すなら、ビルド時にコンパイルしたシェーダーを渡す (wgpu で使えるかの確認が要る) か、裏で先に作る (処理中の状態が増える)。製品での値は次の ReleaseChecks / perf smoke の新しいフィールドで確かめてから決める。
 - 関連: §1.483、[ReleaseChecks 自動化計画](release-check-automation-plan.md)。規模 / 優先度: 調査から / P2。
 
 ### 1.775 SNS 分割書き出しの枚数の上限を 4 から 20 へ — X の仕様変更への追従 (2026-11-13)
