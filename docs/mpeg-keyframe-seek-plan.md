@@ -1,7 +1,7 @@
 # MPEG-TS / PS の keyframe 確認付き seek (§1.785)
 
-状態: 設計 第 2 版 (2026-11-15、設計担当 ClaudeCode Opus)。第 1 版は実装前の独立レビュー (gpt-6.1-sol / xhigh) で
-REJECT になり、その指摘 (§8) を反映した。対象は v5.3.0。経緯は [バックログ §1.785](next-release-backlog.md)、
+状態: 設計 第 3 版 (2026-11-15、設計担当 ClaudeCode Opus)。第 1 版・第 2 版は実装前の独立レビュー (gpt-6.1-sol / xhigh)
+で REJECT になり、その指摘 (§8) を反映した。対象は v5.3.0。経緯は [バックログ §1.785](next-release-backlog.md)、
 時刻の契約は [動画の時刻原点](video-timeline-origin-plan.md)。
 
 ## 1. 観測と原因
@@ -30,55 +30,69 @@ REJECT になり、その指摘 (§8) を反映した。対象は v5.3.0。経�
 
 ## 2. 方針: 手前で確かめ、確かめた packet 列をそのまま渡す
 
-目標より手前で seek し、そこから読んだ packet だけで「最初に読める映像 key が目標以前か」を確かめる。確かめられたら
-**seek し直さず**、確認の走査で読んだ packet を後段へそのまま渡し、その後は同じ Input の続きを読ませる。復号は行わず、
-FFmpeg の索引も書き換えない。
+目標より手前で seek し、そこから読んだ packet だけで「最初に読める映像 key から目標までを復号できるか」を確かめる。
+確かめられたら **seek し直さず**、確認の走査で読んだ packet (全 stream、映像の非 key packet も含む) を後段へそのまま渡し、
+その後は同じ Input の続きを読ませる。復号は行わず、FFmpeg の索引も書き換えない。
 
 ```
-target: 求める時刻 (映像 stream の time base の raw tick)
-head:   先頭へ戻すときの seek = av_seek_frame(input, -1, 0, AVSEEK_FLAG_BYTE)  (TS / PS とも file 先頭は packet の境界)
+target:  求める時刻 (呼び出し側の locator を映像 stream の time base の raw tick へ整数で換算したもの)
+head:    先頭へ戻すときの seek = av_seek_frame(input, -1, 0, AVSEEK_FLAG_BYTE)
+         (TS / PS とも demuxer が file 先頭から再同期する。録画の途中から始まる TS / PS でも最初に読める key へ戻ることを
+         レビュー担当が probe で確認)
 stream_start: 映像 stream の start_time (無ければ format の start_time を換算。どちらも無ければ確認なし = Direct と同じ)
-              録画の途中から始まる TS では先頭の key より前のことがあるが、その場合も下の back で先頭へ戻る
 target <= stream_start → head へ seek して返す (StartOfStream)
 for back in [1, 2, 4, 8, 16, 32] 秒:
     s = target - back
     s <= stream_start → head へ seek して返す (StartOfStream)
     av_seek_frame(input, video_stream, s, BACKWARD)   (失敗したら次の back へ)
-    packet を 1 つずつ読む (読むたびに取消と予算を確かめる):
-        映像以外の packet           → 保持する
-        映像の非 key packet         → 捨てる (key より前は復号に使えない)。dts > target なら この back では失敗
-        映像の最初の key packet     → 判定 (下)。成功なら保持して終わり、失敗ならこの back では失敗
-        EOF / 読み取りエラー        → この back では失敗
-    成功: 保持した packet 列を返す (Verified)。呼び出し側は decoder を flush した後、この列を先に読み、続けて Input を読む
-32 秒・予算で確かめられない → 今までと同じ av_seek_frame(-1, target, BACKWARD) を呼び、ログに出して返す (Unverified)
+    窓 = 着地点から「映像 packet の dts > target」まで。packet を 1 つずつ読み (読むたびに取消と予算を確かめる)、
+        全 stream の packet を順に保持し、窓の中の映像 key packet を記録する
+        EOF / 読み取りエラー → 窓はそこまで
+    判定 (下) が成り立つ → 保持した列 (窓の終わりで読んだ dts > target の映像 packet も含む) を返す (Verified)
+    成り立たない → 保持した列を捨てて次の back へ (失敗した back の packet は後段へ混ぜない)
+32 秒・予算で確かめられない → 呼び出し側の元の seek (同じ stream index・同じ単位の locator) を 1 回呼び、ログに出して返す (Unverified)
 取消 → 何も返さずに止める (Aborted)。Input の位置は不定で、呼び出し側は次の要求で seek し直す
 ```
 
+- 後段は decoder を flush した後、保持した列を先頭から読み、尽きたら Input を読む。復号は着地点の後の最初の key から始まる。
+  最初の key より前の映像 packet も渡す (SPS / PPS・SEI・extradata の更新を含み得るので、codec ごとに捨てる判定をしない)。
+  表示の抑制は既存の「目標より前の frame を出さない」処理が受け持つ。
+- 保持した列は Input から読んだ packet と同じ順・同じ中身 (side data を含む) で、後段の配送 (decoder の demux thread の
+  backpressure・`pending_video_packets` の処理を含む) は Input から読んだ packet と区別しない。
+
 ### key の判定
 
-FFmpeg の key の印は「復号を始められる候補」で、表示時刻の保証ではない。判定は次の 2 段にする。
+FFmpeg の key の印は「復号を始められる位置の候補」で、表示時刻の保証ではない。窓の中の映像 key について:
 
-- pts がある key: `pts <= target` で成功。
-- pts が無い key (PS で多い): dts は表示時刻ではない (B frame があれば pts > dts)。`dts + reorder <= target` で成功とする。
-  `reorder` = `codecpar.video_delay` (無ければ 2) × 1 frame の時間 (`avg_frame_rate`、無ければ `r_frame_rate`、
-  どちらも無ければ 1/25 秒)。満たさなければこの back では失敗 (次の back で前の GOP から読む)。
+- **pts が分かる key が窓にあり、その pts <= target** → 成功。窓の最初の key は、それ以前の GOP の key なので表示時刻も
+  それ以下で、そこから目標まで復号できる。
+- **窓に key が 2 つ以上ある** → 成功 (pts が無くてもよい)。最初の key K1 の表示時刻 pts(K1) は、次の key K2 の dts 以下で、
+  K2 の dts は窓の中なので target 以下。根拠: decoder の並べ替えの深さ (B frame の数) が GOP の frame 数より小さければ、
+  K1 は K2 の復号より前に表示される。これは MPEG-2 / H.264 / HEVC の実用の stream の構造で成り立つ (GOP が並べ替えの
+  深さ以下の stream は想定しない)。
+- どちらでもない (pts の無い key が 1 つだけ、key が無い、pts > target の key だけ) → この back では失敗。pts の無い key の
+  表示時刻を dts や `video_delay` から推定しない (MPEG-2 の `video_delay` は B frame の数ではなく、推定は表示時刻の上限に
+  ならない。レビュー担当が PS 素材で確認)。
 - MPEG-2 の open GOP の B frame と HEVC の CRA の後の RASL は、key より pts が小さく、復号されないか捨てられる。
-  pts >= key の pts の frame は復号できるので、key の pts <= target ならば目標の frame までは復号できる。
-- H.264 の recovery point (`recovery_frame_cnt > 0`) や intra refresh の stream は、key の印の後の数 frame が出ない。
-  packet だけでは確かめられないので割り切る (§5)。その場合の症状は「最初の frame が目標より少し後ろ」で、今より悪くはならない。
+  pts >= key の pts の frame は復号できる。
+- **対象外 (この修正では保証しない)**: H.264 の recovery point で `recovery_frame_cnt > 0` のもの、intra refresh の stream。
+  FFmpeg はこれらにも key の印を付けるが、印の後の数 frame は出力されない。packet だけでは見分けられず、mIV が扱う
+  `.mpg` (中身は主に MPEG-2、または IDR を持つ H.264) では稀なので、設計担当の判断で範囲外にする。症状は「最初の frame が
+  目標より数 frame 後ろ」で、今の動き (次の GOP、または frame が出ない) より悪くはならない。
 
 ### 予算と取消
 
-- **予算** (全 back の合計): 読んだ packet の byte 数の合計 64 MiB、または packet 数 20,000 を超えたら Unverified に戻す。
-  時間ではなく量で決める (同じファイル・同じ目標なら結果が同じになるように。ディスクの速さで動きを変えない)。
-  映像 packet が長く途切れる・時刻が欠ける・音声だけの長い区間でも、この予算で必ず止まる。保持する packet 列も
-  この予算の中に収まる (映像の非 key packet は保持しないので、実際は音声などの数百 KB)。
+- **保持の予算**: 保持する packet の大きさの合計 64 MiB。**読み取りの予算**: `AVIOContext.bytes_read` の増分の合計
+  (全 back) 128 MiB。どちらかを超えたら Unverified に戻す。時間ではなく量で決める (同じファイル・同じ目標なら結果が
+  同じになるように。ディスクの速さで動きを変えない)。
+- 予算は「mIV が呼ぶ 1 回の `av_seek_frame` / `av_read_frame` の後」に確かめる。FFmpeg の 1 回の呼び出しの中の読み取り
+  (binary search の探索、TS で packet が完成するまでの読み取り、null packet だけの区間) は mIV からは止められず、今の
+  seek と同じ。映像の無い長い区間などの異常な stream ではそこが長くなり得るが、まれな stream の異常として割り切る。
 - 通常の GOP (0.5〜2 秒) では 1〜2 回目で確かめられ、読む量は数 MB。back は確認に失敗したときだけ倍にする
-  (固定秒数の preroll ではない)。全ファイル走査はしない。
-- **取消**: 呼び出し側から「この要求はもう要らないか」を問う関数を受け取り、packet を読むたびと seek の前に確かめる。
-  FFmpeg の 1 回の `av_seek_frame` (binary search) や 1 回の read の途中では止められない (今の seek と同じ)。
-- 復号の量: 復号は保持した key から目標まで、最大で `back` 秒 + 1 GOP。目標より前の frame を表示しない既存の処理
-  (`drop_before_secs` など) が受け持つ。
+  (固定秒数の preroll ではない)。窓は back 秒分で、ファイル全体を走査することはない。
+- **取消**: 呼び出し側から「この要求はもう要らないか」を問う関数を受け取り、各 seek の前と各 packet の読み取りの後に
+  確かめる。取消の遅れは、最大で FFmpeg の 1 回の呼び出しの長さ。
+- 復号の量: 復号は保持した列の最初の key から目標まで、最大で `back` 秒 + 1 GOP。
 
 ### 対象の demuxer
 
@@ -94,14 +108,14 @@ FFmpeg の key の印は「復号を始められる候補」で、表示時刻�
 一手に持つ。状態は seek 1 回分の保持 packet 列だけで、Input をまたいだキャッシュや共有の状態は持たない
 (worker ごとに自分の Input と自分の読み口を持ち、互いに影響しない)。
 
-- 入口: 「目標 (raw locator)」「映像 stream index」「取消の問い合わせ」を受け取り、結果
+- 入口: 「呼び出し側の元の seek の引数 (stream index と locator)」「映像 stream index」「取消の問い合わせ」を受け取り、結果
   (`Direct` / `Verified { back, held_packets }` / `StartOfStream` / `Unverified` / `Aborted` / seek 失敗) を返す。
-  時刻の変換は `MediaTimeline` に任せ、この module では原点を扱わない。対象外の demuxer の `Direct` は今の呼び出しと
-  まったく同じ引数で seek する。
+  時刻の変換は `MediaTimeline` に任せ、この module では原点を扱わない (元の locator は呼び出し側が今と同じ方法で作る)。
+  対象外の demuxer の `Direct` と `Unverified` の fallback は、元の引数のまま seek する。
 - 読み口: 各 worker の packet の読み取り (`input.packets()`) を、「保持した列を先に返し、尽きたら Input を読む」読み口へ
   置き換える。保持した列は次の seek・flush・取消で捨てる。読み口の型を 1 つにし、保持した列を読み飛ばす経路を作らない。
-- 呼び出し側の後処理の契約: seek の後の decoder flush、目標より前を捨てる処理、frame step の `seek_start` / `base` は、
-  **要求したメディア時刻** のまま (helper の back の位置を渡さない)。
+- 呼び出し側の後処理の契約: seek の後の decoder flush、目標より前を捨てる処理、frame step の `seek_start` / `base`、
+  `audio_adoption_start` は、**要求したメディア時刻** のまま (helper の back の位置や保持列の先頭の時刻を渡さない)。
 - `Aborted` は seek 失敗とは別に扱い、forward での再試行をしない (§3.1)。
 - 結果・試行回数・読んだ packet 数と byte 数・時間を `crate::logger` と `perf::event` (cat=`video`) に出す
   ([UI 応答性](ui-responsiveness.md) の計装)。すべて worker / demux thread の中で起き、UI スレッドは通らない。
@@ -110,7 +124,8 @@ FFmpeg の key の印は「復号を始められる候補」で、表示時刻�
 
 - seek 要求の処理 (`src/video/decoder.rs` の demux thread、シークバーのクリック・キー・ホイール・frame step・
   続きから再生・チャプター・ブックマーク・ループ・A-B ループ・音声トラック切り替えがここへ集まる) の `backward` を
-  helper に置き換える。取消の問い合わせは「より新しい seek 要求が来ている」か「停止」。
+  helper に置き換える。取消の問い合わせは「より新しい seek 要求が来ている、または処理中の serial と現在の serial が
+  違う」か「停止」。
 - `Aborted` (より新しい seek 要求): 古い要求のために準備した音声トラックの setup と保持 packet 列を捨て、古い要求を
   失敗として通知せず採用もせず (`SeekCompleted` も送らない)、最新の要求の処理へ戻る。forward 再試行はしない。
   停止なら終了へ進む。serial が要求の公開より先に進む区間、音声トラック切り替え中の supersede も含めて、既存の
@@ -121,22 +136,24 @@ FFmpeg の key の印は「復号を始められる候補」で、表示時刻�
 
 | 経路 | 場所 | 取消 | 後処理で直すこと |
 | --- | --- | --- | --- |
-| 再生の seek | `src/video/decoder.rs` demux thread (§3.1) | 新しい seek 要求・停止 | なし |
-| hover / サムネイル | `src/video/thumbnail.rs` | `cancel` と request の supersede | なし (既存の許容秒数の規則は今のまま) |
-| タイル | `src/video/tile_thumbnails.rs` | 既存の取消 | なし |
+| 再生の seek | `src/video/decoder.rs` demux thread (§3.1) | 新しい seek 要求・serial の不一致・停止 | なし |
+| hover / サムネイル | `src/video/thumbnail.rs` | `cancel` と request の supersede | EOF で decoder を drain する (下)。既存の許容秒数の規則は今のまま |
+| タイル | `src/video/tile_thumbnails.rs` | 既存の取消 | EOF で decoder を drain する (下) |
 | シークストリップの枠 | `src/video/seek_strip_thumbs.rs` | 既存の取消 | なし (keyframe-only の先行と許容範囲の規則は今のまま) |
 | スクリーンショット | `src/video/screenshot.rs` | なし (1 回きり) | 240 packet / frame の上限 (下) |
-| upscale の切り出し | `src/video/upscale/job.rs` `seek_input_to_source_pts` | 既存の取消 | frame 番号の起点 (下) |
 | Remote の配信 (時計なし transcode) | `src/video/clockless_transcode.rs` | 既存の取消 | なし |
 
-- **スクリーンショット**: 今は映像 packet 240 個で打ち切り、手前の frame を返し得る。60 fps・GOP 6 秒では正常な
-  preroll だけで 240 を超える。打ち切りを「目標に届いた」「EOF まで drain した」「予算切れ」に分け、予算は
-  helper が使った back + 1 GOP 分を処理できる量にする。予算切れでは手前の画を成功として返さず、失敗にする。
-  EOF (目標が最後の frame より後ろ) では最後の frame が正しい結果。
-- **upscale**: 今は seek 後の最初の復号 frame を `planned.seek_start_frame` と見なして番号を数える。helper は計画の
-  key より前の key から読ませることがあるので、**pts が `planned.seek_start_pts` より前の復号 frame を番号を振らずに
-  捨て**、seek_start_pts の frame から数え始める。manifest の raw locator に `MediaTimeline` の原点を足さない。
-  forward fallback (`input.seek`) は別の入口として今のまま残す。
+- **EOF の drain (サムネイル・タイル)**: 今は EOF で decoder を drain せず、それまでの最後の frame を返す。最後の key より
+  後ろの目標では、遅延して出る最後の数 frame が要るので、EOF で `send_eof` して残りの frame を受け取ってから採用規則を当てる。
+- **スクリーンショット**: 今は映像 packet 240 個で打ち切り、手前の frame を返し得る (60 fps・GOP 6 秒では正常な preroll
+  だけで 240 を超える)。packet 数の上限を外し、「目標に届いた」「EOF まで drain した (目標が最後の frame より後ろなら
+  最後の frame が正しい結果)」「読み取りエラー」で終える。復号を始める位置は seek owner が目標から有界な手前に決めるので、
+  上限を外しても復号の量は有界 (MP4 などの Direct では今と同じく目標の直前の key から)。
+- **upscale は今回は対象外** (`src/video/upscale/job.rs` は今の seek のまま)。upscale の分割は、key の packet 順の番号
+  (`KeyframePoint.frame`) と復号後の表示順の番号を同じものとして扱っていて、open GOP の stream では境界の frame が
+  ずれ得る (レビュー担当の probe で MPEG-2 TS の 2 個目の key が packet 順 13 番・表示順 15 番)。これは seek の着地とは
+  別の upscale の番号付けの問題で、seek だけを差し替えても直らないので、バックログ §1.791 に分けて扱う。今回の変更で
+  upscale の動きは変わらない。
 - `src/video/seek_strip.rs` の warmup (索引を作るための捨てシーク) は置き換えない (§4)。
 - `src/audio_decode.rs` (音声の範囲 decode) は音声 stream の seek で、音声 packet はすべて key なので対象外。
 - music video editor の seek は PCM 再生、Remote の crate は IPC で、FFmpeg の seek を持たない (レビュー担当の確認)。
@@ -153,55 +170,78 @@ TS / PS の `AVIndexEntry` は `mpegts_get_dts` などが探索中に登録し�
 
 - 32 秒を超える GOP・key の印が無い stream・予算切れ・seek の失敗は、今までと同じ seek に戻してログに出す
   (まれな失敗は割り切り)。
-- H.264 の recovery point (`recovery_frame_cnt > 0`)・intra refresh の stream は packet だけでは確かめず、最初の frame が
-  目標より少し後ろになることがある (今の動きより悪くはならない)。
-- 確認の走査中の読み取りエラーは「その back では失敗」として扱い、回復処理は足さない。
+- FFmpeg の 1 回の呼び出しの中の長い読み取り (映像の無い長い区間など異常な stream) は止められない (§2)。
+- H.264 の recovery point・intra refresh は範囲外 (§2 の key の判定)。
+- 確認の走査中の読み取りエラーは「その back では窓の終わり」として扱い、回復処理は足さない。
 
 ## 6. テスト
 
 素材は新しい `testdata/mpeg-keyframe-seek/` に、システムの `ffmpeg` と lavfi だけで作る (生成スクリプトは
 `scripts/ui-smoke/generate_mpeg_keyframe_seek_fixture.py`、既存の `generate_timeline_origin_fixture.py` と同じ流儀)。
-**frame ごとに番号を読み取れる映像** (例: `geq` で frame 番号を数個の単色ブロックへ符号化し、圧縮後も読み取れる段差に
-する) で、通常の GOP を持つもの:
 
-- TS (H.264 + AAC、GOP 0.5 秒、B frame あり、小さな原点)
-- TS (MPEG-2 + MP2、GOP 0.5 秒、B frame あり、`-output_ts_offset 36000`)
-- PS (MPEG-2 + MP2、GOP 0.5 秒、B frame あり。pts の無い key を含むことを生成時に検査する)
-- 長い GOP の TS (GOP 6 秒・60 fps、back を 2 回以上倍にする経路、スクリーンショットの 240 を超える preroll)
-- 対照の MP4 (同じ映像) — 動きが変わらないこと
+- 映像は **frame ごとに表示順の番号を画素から読み取れる** もの (例: `geq` で番号を数個の単色ブロックへ 2 進で符号化し、
+  圧縮後も読み取れる段差にする)。
+- **正解表は実装と独立に作る**: 生成スクリプトが、全 frame を先頭から復号した結果 (表示順の番号・`best_effort_timestamp`)
+  と全映像 packet (key の印・pts・dts) を JSON にして素材と一緒に置く。テストは seek の結果をこの表と画素の番号で判定し、
+  実装と同じ推定を正解に使わない。
+- 素材 (通常の GOP、B frame あり):
+  - TS: H.264 + AAC、GOP 0.5 秒、小さな原点
+  - TS: MPEG-2 + MP2、GOP 0.5 秒、open GOP、`-output_ts_offset 36000`
+  - TS: HEVC + AAC、open GOP (CRA と RASL を含む)
+  - PS: MPEG-2 + MP2、GOP 0.5 秒 (pts の無い key を含むことを生成時に検査する)
+  - 録画の途中から始まる TS と PS (先頭が GOP の途中。既存の素材の先頭を切る)
+  - 長い GOP の TS: GOP 6 秒・60 fps (back を 2 回以上倍にする経路、スクリーンショットの 240 を超える preroll)
+  - 対照の MP4 (同じ映像) — 動きが変わらないこと
 
-受入条件 (時刻は frame の番号と実 frame の pts で判定する。1 秒ごとの色では 0.5 秒のずれを見逃すので使わない):
+受入条件 (frame は表示順の番号で判定する。1 秒ごとの色では 0.5 秒のずれを見逃すので使わない):
 
-- `keyframe_seek` の単体 (実素材): 目標を 0.1 秒刻み・各 key の pts ちょうど・各 key の dts ちょうど・先頭 GOP の中・
-  先頭より前・最後の key より後ろ・D 以後に置き、読み口から最初に読める映像 key の pts (無ければ推定) <= 目標
-  (先頭 GOP 以前は StartOfStream で先頭の key から読める)。長い GOP で back が倍になる。予算を小さくすると Unverified に
-  なり、今の seek と同じ着地になる。取消で `Aborted`。MP4 は `Direct` で今と同じ着地。保持した非映像 packet が読み口から
-  順に出る。
-- 復号 (worker 層): サムネイル・スクリーンショット・タイル・ストリップの枠で、時刻 t を求めて返る frame の番号が、各 worker の
-  既存の採用規則 (許容秒数・keyframe-only の先行) で期待される番号になる。最後の key より後ろ・最後の遅延 frame の drain
-  (D − 1 frame) でも画が返る。スクリーンショットは 240 を超える preroll でも t の frame を返し、予算切れでは失敗を返す。
-- 再生 decoder: TS / PS で seek(t) の後の最初の表示 frame の番号と pts が t。frame step の前後、D − 0.3 秒への seek の後の
-  最初の frame と EOF の時刻。連続した seek の supersede (`Aborted`) で古い要求の `SeekCompleted` が出ず、最新の要求が
-  採用される。音声トラック切り替え中の supersede。
-- upscale: TS の segment 境界で frame の重複・欠落が無い (番号の連続)、再開・結合の後も同じ。
+- `keyframe_seek` の単体 (実素材): 目標を 0.1 秒刻み・各 key の pts ちょうど・各 key の dts ちょうど・pts の無い key の直前と
+  直後・先頭 GOP の中・先頭より前・最後の key より後ろ・D 以後に置き、読み口から順に復号したとき、正解表で「目標の時刻に
+  表示される frame」(表示時刻が目標以下の最後の frame) が出力される。先頭 GOP 以前は StartOfStream で、正解表の最初に
+  復号できる frame から出る。長い GOP で back が倍になる。予算を小さくすると Unverified になり、元の seek と同じ着地
+  (大きな原点の 90 kHz 素材で、元の要求位置) になる。取消で `Aborted`。MP4 は `Direct` で今と同じ着地。読み口の列が、
+  成功した back の着地点からの Input の packet 列と同じ (失敗した back の packet が混ざらない、side data を含む)。
+- 復号 (worker 層): サムネイル・スクリーンショット・タイル・ストリップの枠で、時刻 t を求めて返る frame の番号が、正解表と
+  各 worker の既存の採用規則 (許容秒数・keyframe-only の先行) から決まる期待値になる。最後の key より後ろ・最後の遅延
+  frame (D − 1 frame) でも画が返る。スクリーンショットは 240 を超える preroll でも t の frame を返す。
+- 再生 decoder: TS / PS / HEVC で seek(t) の後の最初の表示 frame の番号が正解表の期待値。最初に採用される音声 sample の
+  時刻が今の採用規則どおりで、その後の音声が途切れない。frame step の前後、D − 0.3 秒への seek の後の最初の frame と
+  EOF の時刻。音声 queue が詰まった状態 (Buffering 中の音声 backpressure) でも保持列の映像が届いて表示が進む。
+  連続した seek の supersede (`Aborted`) で古い要求の `SeekCompleted` が出ず、最新の要求が採用される。音声トラック
+  切り替え中の supersede。
 - シークストリップ: TS / PS の軸が `TimeGrid` になり、枠が空にならない。MP4 の軸の判定は今と同じ。
-- Remote: 開始位置 t の transcode で、最初の segment の最初の映像が t の frame。
+- Remote: 開始位置 t の transcode で、最初の segment の最初の映像が正解表の期待値。
 - 複数の Input を同時に開いても、互いの seek・保持列に影響しない。
-- 既存の `testdata/timeline-origin/` の試験 (全 intra) は変えずに通る。
+- 計装: 各素材で seek 1 回の試行回数・読んだ量・時間を log に出し、取消から `Aborted` までの遅れを記録する (受入値は置かず、
+  結果を完了報告に書く)。
+- 既存の `testdata/timeline-origin/` の試験 (全 intra) は変えずに通る。upscale の既存の試験は変えずに通る。
 
 ## 7. 文書
 
 - `docs/video-architecture.md` に「TS / PS の seek」の節を足す (§2 の契約、§3 の所有と読み口、対象 demuxer、割り切り)。
-- `docs/next-release-backlog.md` §1.785 の状態を更新する。公開文書 (マニュアル・製品ページ) は、seek が正しくなるだけなので
-  変えない。更新履歴は公開作業で書く。
+- `docs/next-release-backlog.md` §1.785 の状態を更新し、upscale の分割の番号付けを §1.791 として起票する。
+  公開文書 (マニュアル・製品ページ) は、seek が正しくなるだけなので変えない。更新履歴は公開作業で書く。
 
 ## 8. 実装前レビューの記録
 
-第 1 版 (d08acc5d7) への gpt-6.1-sol / xhigh の指摘と、この版での扱い:
+第 1 版 (d08acc5d7) への gpt-6.1-sol / xhigh の指摘と、第 2 版での扱い:
 
 - P1 先頭: `stream.start_time` (pts) への seek は先頭の key を飛ばす → 先頭へは byte 0 の seek (§2)。
-- P1 upscale の番号: 前の key から読むと番号がずれる → seek_start_pts より前の frame を捨てる (§3.2)。
+- P1 upscale の番号: 前の key から読むと番号がずれる → (第 3 版で対象外へ。下)
 - P1 同じ引数で seek し直す方式は、走査で増えた索引で着地が変わり得る → seek し直さず、確認で読んだ packet を渡す (§2・§3)。
-- P1 key の印は表示時刻の保証ではない → pts の無い key は reorder 分を足して判定、recovery point は割り切り (§2・§5)。
+- P1 key の印は表示時刻の保証ではない → (第 3 版で判定を改めた。下)
 - P2 上限: 量の予算と packet ごとの取消 (§2)。時間の予算は、ディスクの速さで結果が変わるので採らない。
 - P2 `Aborted` の遷移 (§3.1)。P2 スクリーンショットの 240 上限 (§3.2)。P2 受入条件を既存の採用規則と frame 番号へ (§6)。
+
+第 2 版 (a1946f41c) への指摘と、第 3 版での扱い:
+
+- P1 pts の無い key の reorder 推定は表示時刻の上限にならない → 推定をやめ、「pts の分かる key が target 以下」か
+  「窓に key が 2 つ以上」で判定 (§2)。recovery point・intra refresh は設計担当の判断で範囲外と明記。
+- P1 upscale は packet 順と表示順の番号の問題が残る → seek の着地とは別の問題として今回の対象から外し、§1.791 へ (§3.2)。
+- P1 映像の非 key packet を捨てるのは安全でない → 窓の packet は全部保持して渡す (§2)。
+- P2 保持列の音声が映像を塞ぐ → 保持列は Input の packet と同じ配送に乗せる (§2)。backpressure の回帰を §6 へ。
+- P2 予算が FFmpeg 内部の読み取りを制限しない → 保持と読み取り (`bytes_read`) の予算に分け、1 回の呼び出しの中は
+  止められないことを明記 (§2)。取消の遅れを計装 (§6)。
+- P2 fallback の時刻の単位 → 元の seek の引数のまま呼ぶ (§3)。
+- P2 サムネイル・タイルの EOF drain とスクリーンショットの予算 → §3.2。
+- P2 推定を正解にする検査 → 正解表を生成時の全復号から作る (§6)。§3.1 の取消に serial の不一致を足した。
