@@ -560,6 +560,7 @@ mod detached_page_overview;
 mod detached_placement;
 #[cfg(windows)]
 mod detached_window_manager;
+mod epub_saved_metadata;
 #[cfg(windows)]
 pub(crate) use detached_page_overview::DetachedPageOverviewInputProvenance;
 mod facet_name_filter;

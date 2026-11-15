@@ -8,8 +8,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub(crate) use egui_ime::{
     focused_text_input, ime_composing_with_pending_events, ime_input_active_in_viewport,
-    install_ime_input_policy, recovering_text_input,
+    recovering_text_input,
 };
+
+/// Install the shared pre-input ownership policies before the context's first pass.
+/// Both plugins are idempotent by type, including repeated test setup calls.
+pub(crate) fn install_ime_input_policy(ctx: &egui::Context) {
+    egui_ime::install_ime_input_policy(ctx);
+    crate::keyboard_input::install_popup_escape_policy(ctx);
+}
 
 const TEXT_INPUT_KEY_DIAGNOSTIC_ID: &str = "miv_text_input_key_diagnostic";
 const TEXT_INPUT_KEY_DIAGNOSTIC_STARTED_ID: &str = "miv_text_input_key_diagnostic_started";

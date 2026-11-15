@@ -20,6 +20,10 @@ struct MenuFixture {
     raw_permit_before: bool,
     parent_open: bool,
     escape_allowed_after: bool,
+    after_capture: Option<fn(&egui::Context, egui::Id)>,
+    prime_parent_before_mutation: bool,
+    parent_before: bool,
+    parent_after: bool,
 }
 
 impl MenuFixture {
@@ -50,6 +54,10 @@ impl MenuFixture {
             raw_permit_before: false,
             parent_open: true,
             escape_allowed_after: true,
+            after_capture: None,
+            prime_parent_before_mutation: false,
+            parent_before: false,
+            parent_after: false,
         };
         for _ in 0..3 {
             fixture.frame(vec![]);
@@ -95,6 +103,15 @@ impl MenuFixture {
                 app.update_ime_state(&ctx);
                 let owner = app.keyboard_owner_for_pass(&ctx);
                 self.raw_permit_before = owner.fullscreen_raw_key_permit().is_some();
+                if self.prime_parent_before_mutation {
+                    assert!(app.dialog_escape_pressed(&ctx));
+                }
+                if passes == 1
+                    && let Some(change) = self.after_capture
+                {
+                    change(&ctx, self.id);
+                }
+                self.parent_before = app.dialog_escape_pressed(&ctx);
                 match self.surface {
                     Surface::OpenFolder => {
                         assert!(app.show_open_folder_dialog_window(&ctx).is_none());
@@ -142,6 +159,7 @@ impl MenuFixture {
                     }
                 }
                 self.escape_after = ctx.input(|input| input.key_pressed(Key::Escape));
+                self.parent_after = app.dialog_escape_pressed(&ctx);
                 self.escape_allowed_after = crate::keyboard_input::app_escape_allowed(&ctx);
                 if self.retry && passes == 1 {
                     ctx.request_discard("section1768 menu Escape retry");
@@ -470,4 +488,95 @@ fn section1768_root_menu_claim_does_not_block_drawn_sibling_viewport_escape() {
     assert!(crate::key_input::pressed_key_down(sibling, |edge| edge
         .virtual_key
         == 0x1B));
+}
+
+// Open a real Memory-backed popup after the input hook has selected the Escape
+// owner. Suppress Escape only while setting its pointer anchor, then give the
+// untouched input back to the production parent/menu handlers under test.
+fn open_menu_after_capture(ctx: &egui::Context, field: egui::Id) {
+    let events = ctx.input_mut(|input| std::mem::take(&mut input.events));
+    egui::Popup::new(
+        field.with("popup"),
+        ctx.clone(),
+        Pos2::ZERO,
+        egui::LayerId::background(),
+    )
+    .at_pointer_fixed()
+    .open_memory(Some(egui::SetOpenCommand::Bool(true)))
+    .show(|ui| {
+        ui.label("programmatic open before the field draws");
+    });
+    ctx.input_mut(|input| input.events = events);
+}
+
+#[test]
+fn section1768_late_open_cannot_claim_parent_escape_in_either_read_order() {
+    let _input = crate::key_input::lock_test_input();
+    for parent_first in [false, true] {
+        let mut fixture = MenuFixture::new(Surface::Field);
+        fixture
+            .ctx
+            .options_mut(|options| options.max_passes = std::num::NonZeroUsize::new(1).unwrap());
+        let pos = fixture.ctx.read_response(fixture.id).unwrap().rect.center();
+        fixture.frame(vec![Event::PointerMoved(pos)]);
+        fixture.prime_parent_before_mutation = parent_first;
+        fixture.after_capture = Some(open_menu_after_capture);
+        fixture.frame(vec![key(Key::Escape, true, Modifiers::NONE)]);
+        assert_eq!(fixture.passes, 1);
+        assert!(
+            fixture.parent_before,
+            "fresh popup must not change predraw parent eligibility"
+        );
+        assert!(
+            fixture.parent_after,
+            "fresh popup must not claim postdraw parent Escape"
+        );
+        assert!(fixture.escape_after);
+        assert!(!fixture.menu_open());
+    }
+}
+
+#[test]
+fn section1768_late_close_does_not_release_retained_escape_to_parent() {
+    let _input = crate::key_input::lock_test_input();
+    let mut fixture = MenuFixture::new(Surface::Field);
+    fixture.open_menu();
+    fixture
+        .ctx
+        .options_mut(|options| options.max_passes = std::num::NonZeroUsize::new(1).unwrap());
+    fixture.after_capture = Some(|ctx, field| egui::Popup::close_id(ctx, field.with("popup")));
+    fixture.frame(vec![key(Key::Escape, true, Modifiers::NONE)]);
+    assert_eq!(fixture.passes, 1);
+    assert!(!fixture.parent_before);
+    assert!(!fixture.parent_after);
+    assert!(!fixture.menu_open());
+}
+
+#[test]
+fn section1768_replacement_menu_does_not_inherit_the_retained_menu_claim() {
+    let _input = crate::key_input::lock_test_input();
+    let mut fixture = MenuFixture::new(Surface::Field);
+    fixture.open_menu();
+    let original = fixture.id;
+    fixture.id = egui::Id::unique("replacement-field");
+    fixture
+        .ctx
+        .options_mut(|options| options.max_passes = std::num::NonZeroUsize::new(1).unwrap());
+    fixture.after_capture = Some(open_menu_after_capture);
+    fixture.frame(vec![key(Key::Escape, true, Modifiers::NONE)]);
+    assert_eq!(fixture.passes, 1);
+    assert!(
+        !fixture.parent_before,
+        "the original menu still owns this pass"
+    );
+    assert!(!fixture.parent_after);
+    assert!(
+        fixture.escape_after,
+        "the replacement must not claim the original menu's Escape"
+    );
+    assert!(!fixture.menu_open());
+    assert!(!egui::Popup::is_id_open(
+        &fixture.ctx,
+        original.with("popup")
+    ));
 }

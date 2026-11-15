@@ -1070,6 +1070,20 @@ session またぎの retained final AI は残す。
 下位入力として保持する。生成中または stale 中は下位入力を表示し、完了後に
 `local_adjust_cache` へ差し替える。
 
+### EPUB の明示 PDF 保存後の採用 (§1.761、段階 D R4)
+
+単発・一括で共通の保存 worker が、公開後のコピー直後に保存先 PDF の exact / `root::` scope の
+回転・補正・部分補正・消しゴム・隠蔽・注釈・切り取りの存在と確定角度を readonly で読み返す。
+マスク bitmap や注釈 JSON 本文は UI へ運ばず、report の存在集合・角度を open / reload 前に scope 置換する。
+非存在・0°の旧 owner 値は削除し、兄弟の scope と `root/` は保持する。回転は既存の
+`update_rotation_page_owner`、read-once の回転・注釈 cache と編集 preview は content-identity の
+scoped cache 失効を使う。caption の完了印は `apply_content_identity_store_mutations` で通知・表示失効する。
+親セルの `thumb_edit_preview_keys` は 7 family の存在と独立しているため、空の読み返し結果でも保存先 scope の preview を失効する。
+読み返しに失敗してもコピー自体で確定した caption の通知・表示失効は適用し、7 family の owner は変更しない。
+読返しが失敗した場合は owner の集合を変えず、ログと一部引継ぎ失敗の通知を出す。
+最後のコピー・読返し中に受信先が無くなった場合の RAM 反映遅れは、利用者判断により次回起動まで割り切る。
+順序制御用の新しい channel / epoch / 取消待ちは作らず、既存の全体 snapshot との競合は別件として残す。
+
 ### 4.0.1 補正レイヤー文書の所有権と保存
 
 補正レイヤー文書 (`Vec<LocalAdjustmentLayer>`) は 1 レイヤーごとに画像原寸の

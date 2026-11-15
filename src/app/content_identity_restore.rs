@@ -487,7 +487,7 @@ impl App {
     /// Worker が直接更新した destination page について、DB の miss まで materialize する
     /// read-once cache だけを page key 単位で失効させる。idx-keyed page state と rating / tags
     /// は後続の `finish_book_page_edit_mapping` が既存の ownership 境界で処理する。
-    fn invalidate_content_restore_destination_caches(
+    pub(crate) fn invalidate_content_restore_destination_caches(
         &mut self,
         presence: &crate::content_identity::RestorePresence,
     ) {

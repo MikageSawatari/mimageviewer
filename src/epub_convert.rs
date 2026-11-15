@@ -110,6 +110,27 @@ pub struct SavedPdf {
     pub path: PathBuf,
     pub reused_cache: bool,
     pub user_data_errors: Vec<String>,
+    pub(crate) metadata: SavedPdfMetadata,
+}
+
+/// The post-publication worker tail's authoritative destination state. An error is
+/// deliberately distinct from an empty scope, so UI owners never erase on read failure.
+#[derive(Clone, Debug)]
+pub(crate) struct SavedPdfMetadata {
+    pub(crate) destination_root: String,
+    pub(crate) presence: Result<crate::content_identity::RestorePresence, String>,
+    pub(crate) store_mutations: crate::rename_key_migration::StoreMutationEffects,
+}
+
+#[cfg(test)]
+impl Default for SavedPdfMetadata {
+    fn default() -> Self {
+        Self {
+            destination_root: String::new(),
+            presence: Ok(Default::default()),
+            store_mutations: Default::default(),
+        }
+    }
 }
 
 /// A finished PDF in the parent-owned work directory. The verifier accepts this
@@ -760,19 +781,60 @@ pub fn save_sibling_at<S: WorkerSpawner>(
     }
     publish?;
     drop(guard);
+    Ok(copy_saved_pdf_metadata(
+        context.data_dir,
+        source,
+        destination,
+        reused_cache,
+    ))
+}
+
+/// Shared by single/batch saves after publication and source guard release.
+/// Cancellation remains immediate at the existing boundaries; this committed tail has no wait.
+pub(crate) fn copy_saved_pdf_metadata(
+    data_dir: &Path,
+    source: &Path,
+    destination: PathBuf,
+    reused_cache: bool,
+) -> SavedPdf {
     let mappings = [
         crate::rename_key_migration::StoreCopyPathMapping::exact(source, &destination),
         crate::rename_key_migration::StoreCopyPathMapping::virtual_prefix(source, &destination),
     ];
-    let copied = crate::rename_key_migration::copy_restore_stores_without_identity_at(
-        context.data_dir,
-        &mappings,
-    );
-    Ok(SavedPdf {
+    let copied =
+        crate::rename_key_migration::copy_restore_stores_without_identity_at(data_dir, &mappings);
+    let presence = crate::content_identity::load_container_restore_presence(data_dir, &destination);
+    let mut user_data_errors = copied.errors;
+    if let Err(error) = &presence {
+        let message = format!(
+            "EPUB→PDF saved metadata readback {}: {error}",
+            destination.display()
+        );
+        crate::logger::log(message.clone());
+        user_data_errors.push(message);
+    }
+    let metadata = SavedPdfMetadata {
+        destination_root: crate::path_key::normalize_keep_drive(&destination),
+        presence,
+        store_mutations: copied.store_mutations,
+    };
+    SavedPdf {
         path: destination,
         reused_cache,
-        user_data_errors: copied.errors,
-    })
+        user_data_errors,
+        metadata,
+    }
+}
+
+pub(crate) fn log_saved_pdf_completion_not_received(path: &Path) {
+    crate::logger::log(saved_pdf_completion_not_received_message(path));
+}
+
+pub(crate) fn saved_pdf_completion_not_received_message(path: &Path) -> String {
+    format!(
+        "EPUB→PDF 保存後の設定の表示反映は次回起動時に行われます: {}",
+        path.display()
+    )
 }
 
 fn copy_cached_pdf(

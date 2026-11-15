@@ -3924,7 +3924,11 @@ fn epub_batch_completion_refreshes_grid_and_applies_same_name_pdf_priority() {
     app.epub_batch_convert = Some(
         crate::ui_dialogs::epub_batch_convert::EpubBatchPending::completed_for_test(
             epub.clone(),
-            crate::ui_dialogs::epub_batch_convert::EpubBatchResult::Saved(pdf.clone(), vec![]),
+            crate::ui_dialogs::epub_batch_convert::EpubBatchResult::Saved(
+                pdf.clone(),
+                vec![],
+                Default::default(),
+            ),
         ),
     );
     app.poll_epub_batch_convert();
@@ -23358,6 +23362,7 @@ mod phase_c_folder_nav_history_tests {
                 path: pdf.clone(),
                 reused_cache: false,
                 user_data_errors: Vec::new(),
+                metadata: Default::default(),
             },
             old_state.surface_generation,
             old_state.smart_transition_sequence,

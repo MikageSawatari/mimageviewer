@@ -681,10 +681,16 @@ fn query_family_rows(
     mut visit: impl FnMut(&rusqlite::Row<'_>) -> Result<(), String>,
 ) -> Result<usize, String> {
     let path = data_dir.join(file);
-    if !path.exists() || families.is_empty() {
+    if families.is_empty()
+        || !path
+            .try_exists()
+            .map_err(|error| format!("{}: {error}", path.display()))?
+    {
         return Ok(0);
     }
-    let conn = rusqlite::Connection::open(&path).map_err(|error| error.to_string())?;
+    let conn =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|error| error.to_string())?;
     let select = format!("SELECT {key_column}, {selected_columns} FROM {table}");
@@ -722,6 +728,78 @@ fn query_family_rows(
         }
     }
     Ok(1)
+}
+
+/// Worker-only, data-only snapshot of one container's exact key and virtual pages.
+/// Reuse the restore query's indexed exact/prefix boundary without loading edit payloads.
+pub(crate) fn load_container_restore_presence(
+    data_dir: &Path,
+    destination: &Path,
+) -> Result<RestorePresence, String> {
+    let families = [DestinationEditFamily {
+        base_path: destination.to_path_buf(),
+        base_key: crate::path_key::normalize_keep_drive(destination),
+    }];
+    let mut presence = RestorePresence::default();
+    for (file, table, key_column, keys) in [
+        (
+            "adjustment.db",
+            "page_params",
+            "page_path",
+            &mut presence.adjusted,
+        ),
+        ("mask.db", "masks", "path", &mut presence.masks),
+        (
+            "conceal.db",
+            "conceal_entries",
+            "page_path",
+            &mut presence.conceals,
+        ),
+        (
+            "local_adjust.db",
+            "local_adjust_pages",
+            "page_path",
+            &mut presence.local_adjustments,
+        ),
+        (
+            "comic.db",
+            "comic_entries",
+            "page_path",
+            &mut presence.comics,
+        ),
+        (
+            "export_crop.db",
+            "export_crop_pages",
+            "page_path",
+            &mut presence.crops,
+        ),
+    ] {
+        query_family_rows(data_dir, file, table, key_column, "1", &families, |row| {
+            let key: String = row.get(0).map_err(|error| error.to_string())?;
+            keys.insert(key.clone());
+            presence.page_edits.insert(key);
+            Ok(())
+        })?;
+    }
+    query_family_rows(
+        data_dir,
+        "rotation.db",
+        "rotations",
+        "path",
+        "angle",
+        &families,
+        |row| {
+            let key: String = row.get(0).map_err(|error| error.to_string())?;
+            let angle = crate::rotation_db::Rotation::from_degrees(
+                row.get(1).map_err(|error| error.to_string())?,
+            );
+            if !angle.is_none() {
+                presence.rotations.insert(key, angle);
+            }
+            Ok(())
+        },
+    )?;
+    Ok(presence)
 }
 
 fn sidecar_mask_from_row(

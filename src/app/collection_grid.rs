@@ -9502,6 +9502,7 @@ mod tests {
                 path: pdf.clone(),
                 reused_cache: false,
                 user_data_errors: Vec::new(),
+                metadata: Default::default(),
             },
             original.surface_generation,
             original.smart_transition_sequence,

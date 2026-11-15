@@ -142,8 +142,9 @@ toggle を Enter に割り当てると Confirm との競合を表示し、実行
 
 単一行入力の右クリックメニュー（§1.768）は、既に開いていたメニューを Esc で閉じた場合、
 その viewport・delivery frame の egui / native Esc を共有 claim する。背面の検索終了や親 dialog の取消へ渡さない。
-親の Esc 読取とメニュー描画前には `keyboard_input::app_escape_allowed` が
-`popup_owns_keyboard` に基づく所有判定を viewport / pass 単位で捕捉する。
+IME と共通の Context pre-input 境界で、RawInput の viewport・pass・Memory が保持する popup ID を一度捕捉する。
+親の `app_escape_allowed` は所有者の有無、メニューの claim は同じ snapshot と対象 popup ID の一致を読む。
+helper 到達時の Memory や `any_popup_open()` は再観測せず、途中の open / close / 別メニューへの切替で所有者を変えない。
 同じ RawInput の右クリック release と Esc で初めて開いて閉じたメニューは claim せず、親が Esc を扱う。
 この pass 内の描画によって親の先読み判断を変更せず、次の pass の新しい Esc は通常経路へ戻す。
 IME 変換中はメニューの追加 claim を行わず、IME / TextEdit の処理を優先する。

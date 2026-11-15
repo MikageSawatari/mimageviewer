@@ -176,7 +176,8 @@ IME helperが予約を描画前の実フォーカスへ渡し、本体facadeが�
 非同期結果の到着や個々の欄の lost_focus では記録しない。ログ・Remote・MCPの出力境界には履歴を公開しない。
 詳細は [入力履歴の設計](search-input-history-plan.md)。
 
-§1.768 の単一行編集メニューは、親の Esc 読取／メニュー描画前に捕捉する viewport / pass の popup 所有 snapshot を共用する。
+§1.768 の単一行編集メニューは、IME と同じ Context pre-input 境界で捕捉した viewport / pass / retained popup ID を共用する。
+親の eligibility と対象メニューの claim は同じ snapshot を読み、helper 到達時の Memory や描画済み popup から所有者を再推測しない。
 既に開いていたメニューを Esc で閉じた場合だけ、履歴と共通の下位処理で egui/native の対応キーを claim する。
 同フレームに開いて閉じたメニューは親へ Esc を残し、次 pass へ所有状態を持ち越さない。
 App の pending field、worker、永続設定は追加しない。

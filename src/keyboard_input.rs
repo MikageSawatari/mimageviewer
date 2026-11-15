@@ -158,37 +158,58 @@ pub(crate) fn popup_owns_keyboard(ctx: &egui::Context) -> bool {
 }
 
 #[derive(Clone, Copy)]
-enum EscapeOwner {
-    Parent,
-    Popup,
-}
-
-#[derive(Clone, Copy)]
 struct PassEscapeOwner {
     pass: u64,
-    owner: EscapeOwner,
+    popup_id: Option<egui::Id>,
 }
 
-/// Capture before a parent reads Escape or a text menu draws. A newly opened
-/// and immediately dismissed menu must not change that parent's same-pass key.
-/// The viewport/pass stamp prevents this decision from suppressing a later Esc.
-pub(crate) fn app_escape_allowed(ctx: &egui::Context) -> bool {
+fn escape_owner_id(viewport: egui::ViewportId) -> egui::Id {
+    egui::Id::unique(("popup_escape_owner", viewport))
+}
+
+struct PopupEscapeInputPolicy;
+
+impl egui::Plugin for PopupEscapeInputPolicy {
+    fn debug_name(&self) -> &'static str {
+        "miv_popup_escape_ownership"
+    }
+
+    fn input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        // The input hook runs before Memory switches to the incoming viewport.
+        // Observe that viewport explicitly, before any widget can open/close a menu.
+        let viewport = input.viewport_id;
+        let snapshot = PassEscapeOwner {
+            pass: ctx.cumulative_pass_nr_for(viewport),
+            popup_id: egui::Popup::current_open_id_for(ctx, viewport),
+        };
+        ctx.data_mut(|data| data.insert_temp(escape_owner_id(viewport), snapshot));
+    }
+}
+
+pub(crate) fn install_popup_escape_policy(ctx: &egui::Context) {
+    ctx.add_plugin(PopupEscapeInputPolicy);
+}
+
+fn retained_escape_popup(ctx: &egui::Context) -> Option<egui::Id> {
     let pass = ctx.cumulative_pass_nr();
-    let id = egui::Id::unique(("popup_escape_owner", ctx.viewport_id()));
-    let cached = ctx.data(|data| data.get_temp::<PassEscapeOwner>(id));
-    let owner = cached.filter(|cached| cached.pass == pass).map_or_else(
-        || {
-            let owner = if popup_owns_keyboard(ctx) {
-                EscapeOwner::Popup
-            } else {
-                EscapeOwner::Parent
-            };
-            ctx.data_mut(|data| data.insert_temp(id, PassEscapeOwner { pass, owner }));
-            owner
-        },
-        |cached| cached.owner,
-    );
-    matches!(owner, EscapeOwner::Parent)
+    let id = escape_owner_id(ctx.viewport_id());
+    ctx.data(|data| {
+        data.get_temp::<PassEscapeOwner>(id)
+            .filter(|snapshot| snapshot.pass == pass)
+            .and_then(|snapshot| snapshot.popup_id)
+    })
+}
+
+/// Both parents and menus read the same pre-input snapshot. No live Memory or
+/// pass-local popup query is allowed here: a fresh open+close must keep its Esc
+/// for the parent. Production installs the policy alongside IME before pass 0;
+/// an uninstalled context has no retained Escape owner.
+pub(crate) fn app_escape_allowed(ctx: &egui::Context) -> bool {
+    retained_escape_popup(ctx).is_none()
+}
+
+pub(crate) fn popup_owned_escape_at_pass_start(ctx: &egui::Context, popup_id: egui::Id) -> bool {
+    retained_escape_popup(ctx) == Some(popup_id)
 }
 
 /// The menu receives the egui copy; native-only deliveries use the same local
@@ -741,6 +762,10 @@ pub(crate) fn keymap_owner_blocks_shortcuts(ctx: &egui::Context) -> bool {
         // fail-closed instead of falling back to another egui ownership read.
         .unwrap_or(true)
 }
+
+#[cfg(test)]
+#[path = "keyboard_input/popup_escape_tests.rs"]
+mod popup_escape_tests;
 
 #[cfg(test)]
 mod tests {

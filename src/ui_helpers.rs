@@ -1592,10 +1592,12 @@ pub(crate) fn singleline_text_edit_context_menu(
     let state = output.state.clone();
     let char_count = text.chars().count();
     let target_id = id.with("miv_singleline_context_menu_target");
-    // Freeze the parent's eligibility before Popup::show can register a menu
-    // first opened in this pass. Existing menus own Esc; a fresh open+Esc does not.
-    let _ = crate::keyboard_input::app_escape_allowed(&output.response.ctx);
-    let retained_menu = output.response.context_menu_opened();
+    // Use the same pre-input owner as the parent, even if another widget changed
+    // Memory before this field drew. A fresh menu cannot inherit another menu's Esc.
+    let retained_menu = crate::keyboard_input::popup_owned_escape_at_pass_start(
+        &output.response.ctx,
+        egui::Popup::default_response_id(&output.response),
+    );
     let escape = crate::keyboard_input::popup_escape_pressed(&output.response.ctx);
     // Popup::context_menu uses secondary_clicked() to open/reopen this popup,
     // including when it is already open at another pointer position.
