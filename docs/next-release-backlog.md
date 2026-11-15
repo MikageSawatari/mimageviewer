@@ -114,53 +114,69 @@ skip sample / pre-skip が適用された音声サンプルと frame PTS の関�
 - 関連: ローカル文字起こし T1 (feat-asr-t1)。規模 / 優先度: 調査から / P2。
 
 - 追記 (2026-11-14、サブ PC の依頼 53、サブ PC 担当と利用者が開いたセッションの観測): 出荷済みの tool でも同じことが起きる。Claude Code 2.1.72 (デスクトップアプリのセッション) で、セッションの途中に「縮小画像」を ON にしても `get_thumbnail` は出ず、許可の範囲を「整理まで」に上げても書き込み系の tool は出なかった (一覧は 9 件のまま、list_changed の通知も届かなかった)。新しく始めたセッションでは 18 件 (get_thumbnail・書き込み系・open_in_viewer を含む) が見えた。Claude Desktop のチャット・ChatGPT Codex は未確認。
-### 1.789 AI アプリが MCP を使っている間も、インストーラで更新できるようにする — v5.2.1 の公開作業から (2026-11-15)
+### 1.789 AI アプリが MCP を使っている間も更新でき、更新の後もそのまま使い続けられるようにする — v5.2.1 の公開作業から (2026-11-15)
 
-- 状態: **設計済み・利用者の判断待ち (下の「決めてもらう点」)。独立レビュー (gpt-6.1-sol / xhigh、read-only、2 巡) で ACCEPT。実装は未着手。**
-  v5.2.1 の公開作業中、インストーラが「AI アプリ (Claude・ChatGPT など) が mImageViewer を使っています」で止まり、利用者はインストーラ版を確かめられなかった (利用者の観測)。利用者は AI アプリを止めずに更新できる形を望んでいる。
+- 状態: **設計済み・利用者の判断待ち (下の「決めてもらう点」)。独立レビュー (gpt-6.1-sol / xhigh、read-only、3 巡) を通した。実装は未着手。**
+  v5.2.1 の公開作業中、インストーラが「AI アプリ (Claude・ChatGPT など) が mImageViewer を使っています」で止まり、利用者はインストーラ版を確かめられなかった (利用者の観測)。
+  要件 (利用者、2026-11-15、統括経由の原文):「MCPですが、新しいバージョンにさしかえたあとも、AIツールからそのまま使い続けられるようにしたいです。難しいでしょうか？」 = AI アプリを止めずに更新でき、IPC の版が変わる更新 (3 → 4 など) の後も AI アプリを再起動せずに使い続けたい。
 - 現状 (コード参照): AI アプリは `C:\Program Files\mImageViewer\mimageviewer.exe --mcp` (launcher) を起動し、launcher は `%APPDATA%\mimageviewer\runtime\<版>\mimageviewer-mcp.exe` (adapter) を子にして、子が終わるまで動き続ける (`crates/launcher/src/mcp_launch.rs`)。インストール先で使用中になるのは launcher 1 本だけ ([Files] の exe は launcher のみ)。adapter は版ごとのフォルダなので新しい版と衝突しない。`installer/mimageviewer.iss` の `CheckMcpStopped` は `Global\mImageViewerMcp_v1` があると更新もアンインストールも止める。
 - 確かめた事実:
   - adapter はツールの呼び出しごとに pipe へつなぎ直し、Hello で版を厳密一致で照合する (`crates/mcp-server/src/pipe.rs` 227 行付近)。
   - **pipe 名に `AGENT_PROTOCOL_VERSION` が入る** (`crates/agent-ipc/src/lib.rs` 498 行)。版が違う adapter と core は Hello まで届かず、「mIV が起動していません。mIV を起動して…」になり、tools/list は `miv_status` だけになる (`crates/mcp-server/src/lib.rs` 172 行)。`check_version` の「版が違います」は実際には出ない。[MCP 連携の計画](mcp-integration-plan.md) §G はこれを「AI アプリを再起動すると直る」と割り切っていたが、古い adapter が残るのは手で置き換える単体 exe 版とポータブル版だけという前提だった。
+  - 版 3 → 4 (ブランチ feat-asr-t1、9576a84dc) の agent-ipc の差分は追加だけ: `Command::GetTranscript`、`Payload::Transcript`、`PermissionSnapshot.transcripts`、`ItemInfo.transcript`。既存の行の型・enum・`ErrorCode` は変わらず、§1.786 の拒否も既存の `Disabled` を使う (レビュー担当がコードで確認)。`ai_captions` は以前、版を上げずに足している。
+  - agent-ipc の型に `deny_unknown_fields` は無く、adapter は core の応答を型付きで読み直して structuredContent を作る (JSON を素通ししない。`crates/mcp-server/src/lib.rs` 1146・1205 行、レビュー担当が確認)。よって古い adapter は新しい core の追加項目を読み捨て、古い outputSchema の形のまま返す。
+  - MCP 2026-07-28 版は initialize が無く、要求ごとに `_meta` へ版とクライアントの capability を載せる (`crates/mcp-server/src/lib.rs` 470〜540 行)。resources・購読・sampling・elicitation は adapter に無い。
+  - cursor は core が出す。共通の `Cursor` は版と `permission_epoch` を含み、`permission_epoch` は process 内の数で起動時に初めから数え直す (`src/agent_ipc/mod.rs` 1218・1271 行、`src/settings_db.rs` 292・702 行)。`list_folder` は別の `FolderCursor` で一覧の digest も照合する (`src/agent_ipc/folder.rs` 552・605 行)。
   - 動いている exe は削除できないが、名前は変えられ、空いた名前に新しいファイルを置ける。元の process は動き続け、名前を変えたファイルは終了後に消せる (ClaudeCode が製品ではない exe の複製で確かめた。製品の exe では未確認)。
-  - Inno Setup 6: `PrepareToInstall` は Restart Manager の使用中ファイルの確認より前に呼ばれる (公式ヘルプ)。ただし Restart Manager は名前を変えた後も [Files] の元の宛先名を登録する (レビュー担当が Inno 6.5.4 のソースで確認)。`[Code]` の `RenameFile` はロールバックに記録されない。
+  - Inno Setup 6: `PrepareToInstall` は Restart Manager の使用中ファイルの確認より前に呼ばれる (公式ヘルプ)。ただし Restart Manager は名前を変えた後も [Files] の元の宛先名を登録する。`[Code]` の `RenameFile` はロールバックに記録されない。取消・失敗の後の `DeinitializeSetup` は Inno のロールバックの後に呼ばれる (レビュー担当が Inno 6.5.4 のソースで確認)。
   - launcher は約 593 MB。通常の利用者は `C:\Program Files\mImageViewer` に書き込めないので、古いファイルを mIV の起動時に消すことはできない。消せるのは installer と uninstaller だけ。
-  - §1.786 のとおり、`notifications/tools/list_changed` で tools/list を取り直さない AI アプリがある。tools/list の中身を変えて状態を伝える方法は当てにできない。
-- **推奨: 案 A (動いている launcher の名前を変えてから新しい launcher を置く) + A-2 (版違いを正しく伝える)。**
+  - §1.786 のとおり、少なくとも Claude Code 2.1.72 は会話の途中で tool の一覧が増えても取り直さない。
+- **推奨: A-1 (インストーラで使用中の launcher を退避) + A-2 (新しい core が古い adapter を「追加だけの互換」で受け付ける)。中継は作らない。** 統括の候補 (2) を、N-1 だけでなく「最小の版から今の版まで」の範囲で採る形。
   - A-1 installer (更新):
     - mutex で分岐しない。`PrepareToInstall` で mIV 本体を終了させた後 (既存の `SignalAppShutdown`)、`{app}\mimageviewer.exe` が**有れば** `{app}\mimageviewer.exe.<一意の値>.old` へ `RenameFile` し、無ければ何もしない (新規インストール)。名前を変えられなければ、今の「AI アプリを終了してから」で止める。mutex は単体 exe 版の MCP でも立つ共通の名前で、mutex で分岐すると新規インストールまで止めてしまう (レビュー指摘)。
     - 退避したファイルは成功が確定するまで消さない。`CurStepChanged(ssPostInstall)` の先頭で成功の印を立て、その後で `{app}\mimageviewer.exe.*.old` を消してみる (使用中のものは残る。失敗は無視)。
-    - 取消・失敗のとき (通常の操作で起こるので構造で扱う。レビュー指摘): `DeinitializeSetup` で、成功の印が無く、今回退避したファイルがあり、`{app}\mimageviewer.exe` が無ければ、元の名前へ戻す。Inno のロールバックの後に呼ばれる (レビュー担当がソースで確認)。戻せなければ「インストールをやり直してください」と出して終える (割り切り)。`[InstallDelete]` は使わない。
-    - `CloseApplicationsFilterExcludes=mimageviewer.exe` で launcher を Restart Manager の対象から外す。mIV 本体は既存の終了の合図で閉じ、AI アプリの launcher は退避で扱う。`CloseApplications=no` は `/CLOSEAPPLICATIONS` で上書きされるので選ばない (レビュー指摘 P3)。
-    - アンインストールは今のまま (mutex があれば止める) にする。消すための操作なので、AI アプリの終了を頼むのは妥当。加えて `[UninstallDelete] Type: files; Name: "{app}\mimageviewer.exe.*.old"`。
-    - 再起動時の削除予約 (`RestartReplace`) は作らない。
-  - A-2 adapter と core の版違い:
-    - pipe 名から版を外す (計画書 §4.2 の元の意図)。SID・data dir の hash と、最初の `FILE_FLAG_FIRST_PIPE_INSTANCE` はそのまま。
-    - 握手の形を業務 IPC の型とは別に固定する: 4 byte little-endian の本文長、UTF-8 JSON、握手 frame の上限、要求は `id`・`command.type = "hello"`・`command.version` だけを読む、応答は `{"id":1,"result":{"Ok":{"type":"hello","data":{"version":N}}}}` の形 (大文字の `Ok` を含む)。core は版が違っても自分の版を入れた Hello を返し、照合は adapter が行う。どちらの側も、版が違う接続では業務の要求を送らず、実行しない。今の core は業務用の `Request` 全体を読んでから版を見る (`src/agent_ipc/pipe.rs` 165 行) ので、最初の握手はこの経路を通さない。
-    - テスト: 出荷時の握手 frame のバイト列を fixture に固定し、旧 adapter → 新 core と新 adapter → 旧 core の両方向で、版違いの判定と業務要求が実行されないことを確かめる。
-    - 文言は向きによらない形にする: 「mIV と AI 連携の版が違います。mIV を終了して起動し直し、AI アプリを再起動 (Claude Code は MCP の再接続) してください。直らない時は、AI アプリを終了してから mIV のファイルを置き換え直してください」。
-    - tools/list は版違いのときも backend の結果に依存せず全件を返し (§1.786 の方針と同じ)、版違いは各 tool の error で伝える。今の実装では版違いの error で一覧の取得そのものが失敗する (`crates/mcp-server/src/lib.rs` 374 行)。
-    - 配布済みの版 3 の adapter (v5.0〜v5.2.x) は版入りの旧い名前を探すので、版 4 の core とつながらない。この 1 回だけは「起動していません」が出る。旧い名前の listener は作らず、更新履歴とマニュアルで「更新の後に AI が『mIV が起動していません』と言う時は AI アプリを再起動」と案内して割り切る。
-- AI アプリから見える形 (案ごと):
-  - 今: 更新できない。AI アプリを終了するまでインストーラが止まる。
-  - 案 A: 古い launcher と adapter は動き続ける。IPC の版が変わらない更新では、利用者が新しい mIV を起動すれば、AI アプリは再起動なしで新しい core を使い続ける (新しい tool と説明は、MCP を起動し直すまで見えない)。IPC の版が変わる更新では、A-2 の後なら各 tool が上の文言の error を返し、AI アプリを再起動すれば直る。A-2 の前 (と版 3 → 4 の 1 回) は「起動していません」になる。
-  - 案 B: 中継 exe が adapter を作り直せれば、IPC の版が変わる更新でも再起動が要らない。ただし下のとおり、新しい serverInfo・capabilities・tool の増減を AI アプリへ伝える手段が無い。
-- 案 B (版によらない固定の中継 exe、利用者の提案) を推さない理由:
-  - 中継 exe もインストール先で動き続ける。「中継 exe を直す版だけ AI アプリの終了を頼む」か、結局 A の名前の変更が要る。
-  - 中継 exe が adapter を起動するには、runtime の展開・利用 lease・展開 lock が要る。`runtime_locks` は共通化できるが、配布物と契約が 1 つ増え、維持の費用がかかる。中継 exe が launcher を子にすると、その launcher がまたインストール先で動き続ける。
-  - 会話を切らずに移るには、中継 exe が JSON-RPC を読み、保存した `initialize` を新しい adapter へ送り直して応答を捨て、処理中の要求を error で閉じる必要がある。今の adapter は initialize のやり直しを拒み (`crates/mcp-server/src/lib.rs` 470 行)、MCP には initialize のやり直しが無い。新しい版の serverInfo・instructions・capabilities・交渉済みの MCP の版を伝えられず、tool の増減は list_changed でしか伝えられない (当てにできない)。中継 exe が MCP の版の変化に合わせて変わることになり、固定にならない。
-  - 登録先が変わる。mIV の「登録する」で書いた設定は書き換えられるが、手で書いた登録や `claude mcp add` などの CLI で入れた登録は移せない。launcher の `--mcp` も残すことになり、窓口が 2 つになる。移行の後にも AI アプリの再起動が 1 回要る。
-  - 利点は、IPC の版が変わる更新で再起動を省けることと、中継 exe が小さければ残るファイルの容量が減ること。会話の状態が再起動で完全に保たれるかは、このリポジトリからは保証できない。
-  - 部分案 (MCP 用の小さな launcher を分け、その exe に A を当てる。透過的な切り替えはしない) は成り立つ。残る容量は小さくなるが、登録の移行と旧入口が増えるので、今回は A のまま判断事項として示す。
-- 単体 exe 版・ポータブル版: 同じ問題がある (単体 exe 版は launcher、ポータブル版は同梱の `mimageviewer-mcp.exe` を直接登録し、使用中は置き換えられない)。インストーラが無いので A-1 は効かない。readme の「AI アプリを終了してから置き換えて」の契約を続ける。ポータブル版で使用中の adapter の置き換えをスキップすると、古い adapter が残り、AI アプリを再起動しても版違いが直らない。A-2 の文言の後半 (置き換え直し) で案内する。
-- 状態の組み合わせ: A-1 は installer の「止める」の 1 か所を「名前を変えて続ける」に変え、名前を変えられなければ今と同じに止める。増える状態は「古い launcher が動いたまま新しい core が動く」だけで、これは単体 exe 版とポータブル版で既に起こり得る (§G の割り切り)。A-2 はその文言を正す。まれな失敗 (名前を変えた後の書き込み失敗、名前を変えてから新しいファイルを置くまでの間に AI アプリが MCP を起動し直して失敗する) は割り切る (インストーラの再実行と AI アプリの再起動)。
-- 検証の計画: 製品ではない小さな exe (一定時間待つだけのもの) と実際の Inno 6 で試験用の installer を作り、使用中の更新・2 回続けての更新・インストール中の取消・新規インストールで、退避・削除・復元と、使用中の process が閉じられないことを確かめる (エージェントが実行してよい。製品の exe は起動しない)。製品のインストーラでの確かめは利用者へ頼む (AI アプリで MCP を使ったまま更新する手順)。
-- 独立レビュー (gpt-6.1-sol / xhigh、read-only、thread `01a1deba`): 1 巡目は ACCEPT WITH CHANGES (P2 が 4 件: 取消で launcher が失われる、mutex で分岐すると新規インストールまで止まる、Restart Manager は元の宛先名を登録する、握手の契約を frame と外側の JSON まで固定する。P3: 案 B の理由の言い過ぎ)。すべて受け入れて上に反映した。2 巡目は ACCEPT (P3: `CloseApplicationsFilterExcludes` を選ぶ)。
+    - 取消・失敗のとき (通常の操作で起こるので構造で扱う。レビュー指摘): `DeinitializeSetup` で、成功の印が無く、今回退避したファイルがあり、`{app}\mimageviewer.exe` が無ければ、元の名前へ戻す。戻せなければ「インストールをやり直してください」と出して終える (割り切り)。`[InstallDelete]` は使わない。
+    - `CloseApplicationsFilterExcludes=mimageviewer.exe` で launcher を Restart Manager の対象から外す。mIV 本体は既存の終了の合図で閉じ、AI アプリの launcher は退避で扱う。`CloseApplications=no` は `/CLOSEAPPLICATIONS` で上書きされるので選ばない。
+    - アンインストールは今のまま (mutex があれば止める) にする。消すための操作なので、AI アプリの終了を頼むのは妥当。加えて `[UninstallDelete] Type: files; Name: "{app}\mimageviewer.exe.*.old"`。再起動時の削除予約 (`RestartReplace`) は作らない。
+    - 古い adapter を使い続けるので、AI アプリが動いている間は、その launcher の退避ファイルも残り続ける (版ごとに約 593 MB。Claude Code のように会話ごとに MCP を起動するクライアントでは、動いている版の数だけ残り得る)。
+  - A-2 新しい core が古い adapter を受け付ける:
+    - **pipe 名を今の `mimageviewer-agent-v3-<SID>-<hash>` に固定する**。名前の "v3" は `AGENT_PROTOCOL_VERSION` から切り離した、名前空間の固定の識別子にする。SID・正規化した data dir の hash、最初の `FILE_FLAG_FIRST_PIPE_INSTANCE` はそのまま。これで配布済みの v5.2.x の adapter (版 3) も新しい core に届く。
+    - Hello で版を取り決める: core は `[MIN_ADAPTER_VERSION, AGENT_PROTOCOL_VERSION]` を受け付ける (最初は MIN = 3)。範囲内なら **adapter が送った版をそのまま返す** (版 3 の adapter は厳密一致で 3 を期待しているので、それで通る)。範囲外なら自分の版を返し、その接続では業務の要求を受け付けない。adapter (版 4 以降) は、返った版が自分の版と同じ時だけ続け、違えば下の中立の文言を各 tool の error にする。**core は古い adapter を受けるが、adapter は古い core を受けない** (向きを 1 つにする。古い core + 新しい adapter は版を戻した時などに限られる)。今の core は厳密一致で 3 を拒むので (`src/agent_ipc/mod.rs` 388 行、feat-asr-t1)、ここを変える。
+    - 握手の形を業務 IPC の型とは別に固定する: 4 byte little-endian の本文長、UTF-8 JSON、握手 frame の上限、要求は `id`・`command.type = "hello"`・`command.version` だけを読む、応答は `{"id":1,"result":{"Ok":{"type":"hello","data":{"version":N}}}}` の形 (大文字の `Ok` を含む)。今の core は業務用の `Request` 全体を読んでから版を見る (`src/agent_ipc/pipe.rs` 165 行) ので、最初の握手はこの経路を通さない。
+    - 互換の契約 (`crates/agent-ipc` の先頭に書き、テストで固定する):
+      - wire の変更は追加だけにする。新しい Command、新しい Payload (古い adapter が送らない Command の応答だけに使う)、新しい項目。既存の項目の削除・名前の変更・型や意味の変更はしない。「古い要求を新しい core が読むための省略時の default」と「新しい応答の未知の項目を古い adapter が無視すること」は分けて書く (応答だけに足す項目に default は要らない)。
+      - **古い adapter が受け取り得る enum に値を足さない** (`ErrorCode`、行の中の種類など)。足すなら、core が接続ごとの adapter の版を見て、古い adapter には既存の値へ読み替える。
+      - 古い adapter が受ける応答では、frame・画像・行・ページの上限も保つ (古い adapter は読めた後にも文字数や画像の大きさを検査する。`crates/mcp-server/src/lib.rs` 1179 行、`crates/agent-ipc/src/folder_types.rs` 89 行)。
+      - adapter は IPC の値を型付きで読み、structuredContent を自分の型から作る (今の作りを契約として残す)。
+      - テスト: 出荷した各版 (3 から) の adapter の型と要求の frame を fixture に残し、新しい core の応答が古い型で読めることに加え、古い adapter の structuredContent の生成と出力の検査を通ることまで確かめる。
+      - 互換を壊す変更が避けられない時だけ MIN を上げる。これは計画した仕様の変更として、その版の設計で判断して記録する (まれな障害の扱いではない)。そのとき古い adapter には中立の文言が出て、AI アプリの再起動が要る。
+    - 中立の文言 (版 4 以降の adapter): 「mIV と AI 連携の版が違います。mIV を終了して起動し直し、AI アプリを再起動 (Claude Code は MCP の再接続) してください。直らない時は、AI アプリを終了してから mIV のファイルを置き換え直してください」。版 3 の adapter には古い文言「登録し直してください」が出るが、MIN を上げる時だけなので割り切る。
+- AI アプリから見える形 (推奨の場合):
+  - 更新の間 (インストーラが mIV 本体を終了させてから、利用者が新しい mIV を起動するまで) は、今と同じく「mIV が起動していません」。進行中の要求は、mIV の終了で今と同じ切断の error になる。自動の再送はしない (書き込みは「処理済みだが応答を受け取れなかった」場合がある。レビュー指摘)。
+  - 新しい mIV が起動すれば、古い adapter で**それまで使えていた tool をそのまま使い続けられる**。AI アプリの再起動は要らない。
+  - cursor は形を保つが、mIV の再起動・許可の変更・一覧の変更で「最初からやり直してください」になることがある (`permission_epoch` は起動時に数え直すため。通常の更新で起こり得る)。AI アプリの再起動は要らず、一覧を取り直せば続けられる。cursor を続けるための永続化や回復の仕組みは作らない。
+  - 古い adapter の作りはそのまま残る。版 3 の adapter は許可で一覧を絞り、mIV が起動していない時は `miv_status` だけを返す (§1.786 の「常に全部出す」は新しい adapter から)。古い adapter の不具合も、AI アプリが MCP を起動し直すまで残る。
+  - **新しい版で増えた tool (例: `get_transcript`) は、新しい adapter へつなぎ直す (AI アプリの再起動か MCP の再接続) まで使えない**。Claude Code の新しいセッションだけで足りるかは、そのとき古い adapter の process が新しいものに置き換わることを確かめてから案内する (§1.786 の「新しいセッションで 18 件見えた」は、新しい adapter が起動した証拠ではない。レビュー指摘)。
+  - **配布済みの v5.2.x からの最初の更新でも、再起動は要らない** (インストーラは新しい版の A-1 で通り、pipe 名が同じで core が版 3 を受けるため)。v5.0・v5.1 (版 2 以前) の adapter は対象外で、再起動が要る。
+- 統括の候補 (1) 中継を作らない理由:
+  - 中継の処理 (initialize の流し直し、切り替えの間の要求の扱い、握手版と 2026-07-28 版の両方) は、AI アプリが起動した時点の古いコードで動くので、後から直せない。配布済みの launcher には中継の処理が無く、v5.2.x からの最初の更新は救えない。
+  - クライアントは古い adapter の outputSchema を覚えている。新しい adapter が行に項目を足していると (outputSchema は `additionalProperties: false`)、検証するクライアントでは結果が通らない恐れがある。古い adapter を使い続ける方が、クライアントの覚えた内容と一致する。
+  - 中継の利点は、一覧を取り直すクライアントなら増えた tool も再起動なしで使えること、adapter の不具合の直しがすぐ効くこと、MIN を上げる時にも再起動が要らないこと。Claude Code は一覧を取り直さない (他のクライアントは未確認)。初回の更新から効くことと、覚えた schema との一致を優先して (2) を採る。
+  - 候補 (3) (中継と互換の組み合わせ) も同じ理由で作らない。互換の範囲を N-1 だけにすると、2 回更新した時点で残っている adapter を切ることになるので、最小の版から今の版までにする (追加だけの契約なら、版ごとの分岐は原則要らない)。
+- 案 B (版によらない固定の中継 exe、利用者の初めの提案) の評価は変わらない: 中継 exe もインストール先で動き続ける。中継 exe が adapter を起動するには runtime の展開・利用 lease・展開 lock が要り、配布物と契約が 1 つ増える。MCP には initialize のやり直しが無く、新しい版の serverInfo・capabilities・tool の増減を伝えられない。登録先が変わり、手で書いた登録や `claude mcp add` で入れた登録は移せず、launcher の `--mcp` も残すことになる。加えて上の中継の理由がそのまま当てはまる。部分案 (MCP 用の小さな launcher を分けて A-1 を当てる) は退避ファイルの容量を減らせるが、登録の移行と旧入口が増える。
+- 単体 exe 版・ポータブル版: 同じ問題がある (単体 exe 版は launcher、ポータブル版は同梱の `mimageviewer-mcp.exe` を直接登録し、使用中は置き換えられない)。インストーラが無いので A-1 は効かない。readme の「AI アプリを終了してから置き換えて」の契約を続ける。A-2 によって、置き換えられなかった古い adapter も MIN の範囲内なら新しい core で動き続ける。
+- 状態の組み合わせ: A-1 は installer の「止める」の 1 か所を「名前を変えて続ける」に変え、名前を変えられなければ今と同じに止める。A-2 で増えるのは「古い adapter × 新しい core」の 1 方向だけで、追加だけの契約と fixture のテストで閉じる。adapter の交換・要求の再送・initialize の流し直しは作らない。まれな失敗 (名前を変えた後の書き込み失敗、名前を変えてから新しいファイルを置くまでの間に AI アプリが MCP を起動し直して失敗する) は割り切る (インストーラの再実行と AI アプリの再起動)。
+- 検証の計画: A-1 は、製品ではない小さな exe (一定時間待つだけのもの) と実際の Inno 6 で試験用の installer を作り、使用中の更新・2 回続けての更新・インストール中の取消・新規インストールで、退避・削除・復元と、使用中の process が閉じられないことを確かめる (エージェントが実行してよい)。A-2 は上の fixture のテスト。製品のインストーラで、AI アプリで MCP を使ったまま更新し、そのまま tool を呼べることは利用者へ頼む。
+- 独立レビュー (gpt-6.1-sol / xhigh、read-only、thread `01a1deba`):
+  - 1 巡目 (要件の追加の前): ACCEPT WITH CHANGES。P2 が 4 件 (取消で launcher が失われる、mutex で分岐すると新規インストールまで止まる、Restart Manager は元の宛先名を登録する、握手の契約を frame と外側の JSON まで固定する)。P3 が 1 件 (案 B の理由の言い過ぎ)。すべて受け入れた。
+  - 2 巡目: ACCEPT。P3 が 1 件 (`CloseApplicationsFilterExcludes` を選ぶ)。
+  - 3 巡目 (要件の追加の後、中継を作らず互換で受ける案): ACCEPT WITH CHANGES。P1 は無し。P2 が 1 件 (cursor は形を保っても続けられる保証にならない。`permission_epoch` と `FolderCursor`)。P3 が 2 件 (互換の契約に古い adapter の上限を含める、古い adapter に残る制約と「新しいセッションで新しい tool が使える」の保証を分ける)。どれも保証の書き方と契約の項目の直しで、設計の構造は変えないため、上に反映して 4 巡目は回していない。中継を作らない判断と、範囲を「最小の版から今の版まで」にすることは、レビュー担当も支持した。
 - **利用者に決めてもらう点**:
-  1. 案 A を採り、案 B (と部分案の小さな MCP 用 launcher) は採らないこと。
-  2. 古い launcher (約 593 MB) は、AI アプリが MCP を終えた後の次の更新か、アンインストールのときに消える。それまで残ってよいか (再起動時の削除予約は作らない案)。
-  3. A-2 を IPC の版 3 → 4 (文字起こし T1、v5.3.0 の予定) と同じ版に入れるか。入れないと、次の版上げでも「起動していません」が出る。A-1 は先に単独で出してもよい。
-- 実装の時に直す文書: [MCP 連携の計画](mcp-integration-plan.md) の §4.2 (pipe 名)・§15.8 (インストーラ)・§G、`installer/readme.txt` と `installer/readme_portable.txt`、マニュアルの「AI アプリとの連携」。規模 / 優先度: Medium / P2。
+  1. 推奨の形 (更新の後も、それまで使えていた tool はそのまま使える。**新しい版で増えた tool は、AI アプリの再起動か MCP の再接続まで使えない**) で要望に足りるか。増えた tool まで再起動なしで使いたいなら中継が要るが、Claude Code は一覧を取り直さないので、中継を作っても Claude Code では見えない。
+  2. 候補 (1) 中継・(3) 組み合わせ・案 B と、部分案 (MCP 用の小さな launcher) は作らないこと。
+  3. 古い launcher の退避ファイル (版ごとに約 593 MB) が、AI アプリが MCP を終えた後の次の更新かアンインストールまで残ってよいか (再起動時の削除予約は作らない案)。
+  4. A-2 を IPC の版 3 → 4 (文字起こし T1、v5.3.0 の予定) と同じ版に入れるか。入れないと、v5.3.0 への更新で版 3 の adapter が新しい core とつながらず、AI アプリの再起動が要る。A-1 は先に単独で出してもよい。
+- 実装の時に直す文書: [MCP 連携の計画](mcp-integration-plan.md) の §4.2 (pipe 名と版)・§15.8 (インストーラ)・§G、`installer/readme.txt` と `installer/readme_portable.txt`、マニュアルの「AI アプリとの連携」。規模 / 優先度: Medium / P2。
 
 ### 1.783 SNS 分割で Instagram の比率の検査が先頭の枠しか見ていない (2026-11-14)
 
