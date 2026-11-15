@@ -26,6 +26,8 @@ fn catalog_db_full_lifecycle() {
         Some((4000, 3000)),
         b"webp_data_1",
         &CoverIdentity::Page(adjustment_db::normalize_path(&folder.join("img1.jpg"))),
+        // AutoMaterial::NotAutomatic (the module is crate-private).
+        Default::default(),
     )
     .unwrap();
     db.save(
@@ -37,6 +39,8 @@ fn catalog_db_full_lifecycle() {
         None,
         b"webp_data_2",
         &CoverIdentity::Page(adjustment_db::normalize_path(&folder.join("img2.png"))),
+        // AutoMaterial::NotAutomatic (the module is crate-private).
+        Default::default(),
     )
     .unwrap();
 
@@ -63,6 +67,8 @@ fn catalog_db_full_lifecycle() {
         Some((4000, 3000)),
         b"updated",
         &CoverIdentity::Page(adjustment_db::normalize_path(&folder.join("img1.jpg"))),
+        // AutoMaterial::NotAutomatic (the module is crate-private).
+        Default::default(),
     )
     .unwrap();
     let map = db.load_all().unwrap();
@@ -149,6 +155,8 @@ fn reopen_db_preserves_data() {
             Some((1920, 1080)),
             b"persistent_data",
             &CoverIdentity::Page(adjustment_db::normalize_path(&folder.join("photo.jpg"))),
+            // AutoMaterial::NotAutomatic (the module is crate-private).
+            Default::default(),
         )
         .unwrap();
     }
