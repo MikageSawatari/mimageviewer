@@ -49,8 +49,10 @@
 Get-ChildItem 'C:\Program Files\mImageViewer' -Filter 'mimageviewer.exe*' | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Length = $_.Length; SHA256 = (Get-FileHash $_.FullName -Algorithm SHA256).Hash } }
 Get-Process mimageviewer, mimageviewer-mcp, mimageviewer-core -ErrorAction SilentlyContinue | Select-Object Id, ProcessName, StartTime, Path, @{ n = 'Version'; e = { $_.MainModule.FileVersionInfo.ProductVersion } }
 ```
-`Path` は観測として書くだけで、合否には使わない (改名の後も、起動した時の名前が出ることがある)。合否は、process の Id が同じまま動いていること、
-正規の `mimageviewer.exe` のハッシュ、`.old` のハッシュで決める。
+launcher (`mimageviewer.exe`) の `Path` は観測として書くだけで、合否には使わない (改名の後も、起動した時の名前が出ることがある)。launcher の合否は、
+process の Id が同じまま動いていること、正規の `mimageviewer.exe` のハッシュ、`.old` のハッシュで決める。
+MCP の adapter (`mimageviewer-mcp.exe`) には版の情報が埋め込まれていないので `Version` は空になる。adapter は改名されないので、版は `Path` の
+`runtime\<版>\mimageviewer-mcp.exe` の `<版>` と、Id・開始時刻で見分ける。
 
 ## 第 1 部: A-1 (インストーラ)
 
@@ -75,7 +77,8 @@ Get-Process mimageviewer, mimageviewer-mcp, mimageviewer-core -ErrorAction Silen
    - 確かめる: 「AI アプリ (Claude・ChatGPT など) が mImageViewer を使っています」と出て止まる。止まったら閉じる。
 6. **残ったファイルの掃除**: Claude Code のセッションを閉じ、MCP の launcher の process が無くなったことを確かめる。新しいインストーラをもう一度実行して最後まで進める。
    - 確かめる: 状態を記録し、`mimageviewer.exe.*.old` が無くなっている。
-7. 片付けを兼ねたアンインストール: もう一度 2 のように MCP を使い、4 のように更新して `.old` を作ってから、セッションを閉じ、アンインストールする
+7. 片付けを兼ねたアンインストール: もう一度 2 のように MCP を使い、状態を記録して正規の `mimageviewer.exe` のハッシュを控える。新しいインストーラで
+   もう一度更新して `.old` を作り (今回の `.old` のハッシュは、ここで控えた値と同じになる。手順 1 の旧版とは比べない)、セッションを閉じ、アンインストールする
    (最後の「設定ファイルとキャッシュを削除しますか？」は「いいえ」。表示された場所を記録する)。
    - 確かめる: `C:\Program Files\mImageViewer` に `mimageviewer.exe` と `.old` が残らない。
 
@@ -91,8 +94,9 @@ Get-Process mimageviewer, mimageviewer-mcp, mimageviewer-core -ErrorAction Silen
    - 確かめる: どれも成功する。「mIV が起動していません」や「版が違います」が出ない。
    - 1 で控えた cursor で続きを取ってみる。成功するか、「最初からやり直してください」になるかを記録する (どちらでもよい。後者のあと、cursor 無しでは成功すること)。
    - tool の一覧に `get_transcript` はまだ無い (想定どおり) ことを書く。
-4. Claude Code の新しいセッションを開き、tool の一覧と、そのセッションの MCP の adapter の process (`mimageviewer-mcp`) の版を記録する。
-   - 確かめる: 新しい版の adapter が動いていて、`get_transcript` が一覧にある。
+4. Claude Code の新しいセッションを開き、tool の一覧と、状態の記録 (adapter の `mimageviewer-mcp` の Id・開始時刻・Path) を書く。
+   - 確かめる: Path が新しい版の `runtime\<版>\mimageviewer-mcp.exe` の adapter が新しく動いていて、`get_transcript` が一覧にある。
+     古いセッションの adapter (1 の時から動いている Id) は、古い版の Path のまま残っていてよい。
 5. 古いセッションと新しいセッションを閉じ、アンインストールして片付ける (削除の質問は「いいえ」)。
 
 ## 片付け
