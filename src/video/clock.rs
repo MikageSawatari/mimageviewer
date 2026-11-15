@@ -104,6 +104,22 @@ enum VideoEos {
     Complete(u64),
 }
 
+#[cfg(test)]
+type DecoderTestGate<T> = Mutex<
+    Option<(
+        std::sync::mpsc::SyncSender<T>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
+>;
+
+#[cfg(test)]
+pub(super) struct DemuxSeekObservation {
+    pub serial: u64,
+    pub pending_video_packets: usize,
+    pub audio_packet_queue_len: usize,
+    pub outcome: Option<super::keyframe_seek::SeekOutcome>,
+}
+
 /// 動画再生用 AV マスタークロック (facade)。
 ///
 /// Phase 2b: 内部状態は `MasterClock` (anchor 部分) と `AudioBookkeeping`
@@ -152,6 +168,12 @@ pub struct AvClock {
             std::sync::mpsc::Receiver<()>,
         )>,
     >,
+    #[cfg(test)]
+    audio_full_output_gate: DecoderTestGate<()>,
+    #[cfg(test)]
+    demux_audio_backpressure_gate: DecoderTestGate<usize>,
+    #[cfg(test)]
+    demux_seek_observer: Mutex<Option<std::sync::mpsc::SyncSender<DemuxSeekObservation>>>,
     #[cfg(test)]
     fail_next_audio_setup: AtomicBool,
     #[cfg(test)]
@@ -322,6 +344,12 @@ impl AvClock {
             fail_next_demux_seek: AtomicBool::new(false),
             #[cfg(test)]
             demux_seek_gate: Mutex::new(None),
+            #[cfg(test)]
+            audio_full_output_gate: Mutex::new(None),
+            #[cfg(test)]
+            demux_audio_backpressure_gate: Mutex::new(None),
+            #[cfg(test)]
+            demux_seek_observer: Mutex::new(None),
             #[cfg(test)]
             fail_next_audio_setup: AtomicBool::new(false),
             #[cfg(test)]
@@ -804,6 +832,78 @@ impl AvClock {
             let _ = entered_tx.send(());
             let _ = release_rx.recv();
         }
+    }
+
+    /// Hold the real audio worker at its full PCM output, without replacing any
+    /// production channel or decoder. Release/disconnect always unblocks it.
+    #[cfg(test)]
+    pub(super) fn gate_full_audio_output_for_test(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        *self.audio_full_output_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub(super) fn wait_at_full_audio_output_for_test(&self) {
+        let gate = self.audio_full_output_gate.lock().unwrap().take();
+        if let Some((entered, release)) = gate {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
+    }
+
+    /// Stop demux only once its old video overflow is empty and audio sending
+    /// really timed out. This lets the test publish seek at that exact boundary.
+    #[cfg(test)]
+    pub(super) fn gate_demux_audio_backpressure_for_test(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<usize>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        *self.demux_audio_backpressure_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub(super) fn wait_at_demux_audio_backpressure_for_test(&self, pending_video_packets: usize) {
+        if pending_video_packets != 0 {
+            return;
+        }
+        let gate = self.demux_audio_backpressure_gate.lock().unwrap().take();
+        if let Some((entered, release)) = gate {
+            let _ = entered.send(pending_video_packets);
+            let _ = release.recv();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn observe_next_demux_seek_for_test(
+        &self,
+    ) -> std::sync::mpsc::Receiver<DemuxSeekObservation> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        *self.demux_seek_observer.lock().unwrap() = Some(tx);
+        rx
+    }
+
+    #[cfg(test)]
+    pub(super) fn record_demux_seek_for_test(&self, observation: DemuxSeekObservation) {
+        if let Some(tx) = self.demux_seek_observer.lock().unwrap().take() {
+            let _ = tx.try_send(observation);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn seek_serial_for_test(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.seek_serial)
     }
 
     #[cfg(test)]

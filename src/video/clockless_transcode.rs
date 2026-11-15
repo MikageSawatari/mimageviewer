@@ -1200,6 +1200,61 @@ fn timed_packet(
     })
 }
 
+const MAX_STARTUP_INVALID_AUDIO_PACKETS: u8 = 3;
+
+enum AudioDecodeStartup {
+    AwaitingFirstFrame { skipped_invalid_packets: u8 },
+    Strict,
+}
+
+impl AudioDecodeStartup {
+    fn new(demuxer: &str) -> Self {
+        if super::keyframe_seek::needs_verification(demuxer) {
+            Self::AwaitingFirstFrame {
+                skipped_invalid_packets: 0,
+            }
+        } else {
+            Self::Strict
+        }
+    }
+
+    fn skip_invalid_packet(&mut self, error: ffmpeg::Error) -> bool {
+        // TS/PS can resynchronize in the middle of an audio PES after seek, so
+        // their first packets can be incomplete. That evidence does not cover
+        // other containers. Allow only a few before the first decoded frame; corruption
+        // later in the stream (or in other containers) must still fail the job.
+        if let Self::AwaitingFirstFrame {
+            skipped_invalid_packets,
+        } = self
+            && matches!(error, ffmpeg::Error::InvalidData)
+            && *skipped_invalid_packets < MAX_STARTUP_INVALID_AUDIO_PACKETS
+        {
+            *skipped_invalid_packets += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn received_frame(&mut self) {
+        // Decoding preroll already establishes synchronization, even when that
+        // frame is before the requested origin or the resampler emits no chunk.
+        *self = Self::Strict;
+    }
+
+    fn finish(&self) -> Result<(), String> {
+        if let Self::AwaitingFirstFrame {
+            skipped_invalid_packets: 1..,
+        } = self
+        {
+            return Err(
+                "audio startup ended without a decoded frame after invalid packets".to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
 struct AudioPath {
     timeline: super::media_timeline::MediaTimeline,
     decoder: ffmpeg::decoder::Audio,
@@ -2369,6 +2424,7 @@ fn run_clockless_stream_inner(
     });
     let mut next_video_pts = source_origin_secs;
     let mut packet_reader = super::keyframe_seek::PacketReader::default();
+    let mut audio_startup = AudioDecodeStartup::new(input.format().name());
     if source_origin_secs > source_start_secs + f64::EPSILON {
         let target =
             (media_timeline.media_to_raw_secs(source_origin_secs) * 1_000_000.0).round() as i64;
@@ -2459,14 +2515,16 @@ fn run_clockless_stream_inner(
                 .expect("index exists only with audio path");
             state.checkpoint()?;
             let send_started = Instant::now();
+            #[cfg(test)]
+            let send_result = tests::injected_audio_send_result()
+                .unwrap_or_else(|| path.decoder.send_packet(&packet));
+            #[cfg(not(test))]
             let send_result = path.decoder.send_packet(&packet);
             state.times.audio_decode_resample_secs += send_started.elapsed().as_secs_f64();
             if let Err(error) = send_result {
-                if matches!(error, ffmpeg::Error::InvalidData) {
-                    // PS seek can expose a partial first MP2 packet. As in the
-                    // playback audio decoder, log it and decode the next packet.
+                if audio_startup.skip_invalid_packet(error) {
                     crate::logger::log(format!(
-                        "remote-stream clockless audio send_packet: {error}; skipping invalid packet"
+                        "remote-stream clockless audio send_packet: {error}; skipping incomplete TS/PS startup packet"
                     ));
                     continue;
                 }
@@ -2479,6 +2537,9 @@ fn run_clockless_stream_inner(
                 state.times.audio_decode_resample_secs += receive_started.elapsed().as_secs_f64();
                 match received {
                     Ok(()) => {
+                        audio_startup.received_frame();
+                        #[cfg(test)]
+                        tests::audio_frame_received_for_injection(&frame, path, source_origin_secs);
                         let convert_started = Instant::now();
                         let chunk = path.frame_to_chunk(&mut frame)?;
                         state.times.audio_decode_resample_secs +=
@@ -2550,6 +2611,9 @@ fn run_clockless_stream_inner(
                 let mut frame = Audio::empty();
                 match path.decoder.receive_frame(&mut frame) {
                     Ok(()) => {
+                        audio_startup.received_frame();
+                        #[cfg(test)]
+                        tests::audio_frame_received_for_injection(&frame, path, source_origin_secs);
                         if let Some(chunk) = path.frame_to_chunk(&mut frame)?
                             && chunk.audible_pts_secs + chunk.duration_secs >= source_origin_secs
                         {
@@ -2568,6 +2632,7 @@ fn run_clockless_stream_inner(
         }
     }
 
+    audio_startup.finish()?;
     finish_transcode(
         state,
         audio_path.as_mut(),
@@ -2752,6 +2817,7 @@ fn selected_frame_rate(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::path::Path;
     use std::sync::atomic::{AtomicU32, AtomicUsize};
     use std::sync::mpsc;
@@ -2759,6 +2825,79 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    // This driver runs synchronously on the calling thread. Keep injected send
+    // results local to that thread so concurrent transcode tests are unaffected.
+    enum AudioSendFault {
+        Errors { remaining: u8, error: ffmpeg::Error },
+        AfterFirstFrame(ffmpeg::Error),
+        NoDecodedFrames { invalid_remaining: u8 },
+    }
+
+    thread_local! {
+        static AUDIO_SEND_FAULT: RefCell<Option<AudioSendFault>> = const { RefCell::new(None) };
+    }
+
+    struct AudioSendFaultGuard;
+
+    impl AudioSendFaultGuard {
+        fn install(fault: AudioSendFault) -> Self {
+            AUDIO_SEND_FAULT.with(|slot| {
+                assert!(slot.borrow_mut().replace(fault).is_none());
+            });
+            Self
+        }
+    }
+
+    impl Drop for AudioSendFaultGuard {
+        fn drop(&mut self) {
+            AUDIO_SEND_FAULT.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn injected_audio_send_result() -> Option<Result<(), ffmpeg::Error>> {
+        AUDIO_SEND_FAULT.with(|slot| match slot.borrow_mut().as_mut()? {
+            AudioSendFault::Errors { remaining, error } if *remaining > 0 => {
+                *remaining -= 1;
+                Some(Err(*error))
+            }
+            AudioSendFault::NoDecodedFrames { invalid_remaining } => {
+                if *invalid_remaining > 0 {
+                    *invalid_remaining -= 1;
+                    Some(Err(ffmpeg::Error::InvalidData))
+                } else {
+                    // Consume this finite fixture to real demux EOF without
+                    // feeding more audio, exercising the no-frame terminal path.
+                    Some(Ok(()))
+                }
+            }
+            _ => None,
+        })
+    }
+
+    pub(super) fn audio_frame_received_for_injection(
+        frame: &Audio,
+        path: &AudioPath,
+        source_origin_secs: f64,
+    ) {
+        AUDIO_SEND_FAULT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if let Some(AudioSendFault::AfterFirstFrame(error)) = slot.as_ref() {
+                let pts_secs = frame
+                    .pts()
+                    .map(|pts| path.timeline.raw_to_media_secs(pts as f64 * path.time_base_secs))
+                    .expect("first injected-fault fixture frame has a timestamp");
+                assert!(
+                    pts_secs < source_origin_secs,
+                    "the fault must follow a decoded preroll frame: {pts_secs} >= {source_origin_secs}",
+                );
+                *slot = Some(AudioSendFault::Errors {
+                    remaining: 1,
+                    error: *error,
+                });
+            }
+        });
+    }
 
     struct FakeVstProcessor {
         sample_rate: u32,
@@ -4617,6 +4756,134 @@ mod tests {
                 &format!("Remote first segment {name} origin={requested}"),
             );
         }
+    }
+
+    fn run_remote_audio_send_fault(
+        fixture_name: &str,
+        fault: AudioSendFault,
+    ) -> (
+        Result<ClocklessTranscodeReport, String>,
+        ClocklessStreamOutput,
+    ) {
+        use crate::video::keyframe_seek_test_support::Fixture;
+
+        let fixture = Fixture::load(fixture_name);
+        let requested = fixture.frames[fixture.frames.len() - 7].media_secs - 0.003;
+        let mut options = ClocklessTranscodeOptions::benchmark(fixture.path, 1);
+        options.hw_decode = false;
+        options.encoder =
+            EncoderPreference::Encoder(super::super::stream::encoder::H264EncoderKind::OpenH264);
+        options.quality = ClocklessQuality::Minimum;
+        options.source_origin_secs = requested;
+        options.max_source_secs = None;
+        options.segment_capacity = 4;
+        let control = ClocklessTranscodeControl::auto_releasing(4).unwrap();
+        let output = ClocklessStreamOutput::new(4, requested).unwrap();
+        let _fault = AudioSendFaultGuard::install(fault);
+        let result = run_clockless_stream(
+            &options,
+            &control,
+            output.clone(),
+            ClocklessAudioProcessing::default(),
+            |_| {},
+        );
+        (result, output)
+    }
+
+    fn assert_audio_send_fault_is_fatal(
+        fixture_name: &str,
+        fault: AudioSendFault,
+        error: ffmpeg::Error,
+    ) {
+        let (result, output) = run_remote_audio_send_fault(fixture_name, fault);
+        assert_eq!(result.unwrap_err(), format!("audio send_packet: {error}"));
+        let metrics = output.metrics();
+        assert!(
+            !metrics.ended,
+            "an audio decode failure must not publish success"
+        );
+        assert_eq!(
+            metrics.generated_end_secs, metrics.source_origin_secs,
+            "startup/preroll errors must not advance the published watermark",
+        );
+    }
+
+    #[test]
+    fn remote_mpeg_audio_startup_recovers_within_three_invalid_packets() {
+        let (result, output) = run_remote_audio_send_fault(
+            "h264-small.ts",
+            AudioSendFault::Errors {
+                remaining: 3,
+                error: ffmpeg::Error::InvalidData,
+            },
+        );
+        let report = result.unwrap();
+        assert!(report.audio_frames > 0);
+        let metrics = output.metrics();
+        assert!(metrics.ended);
+        assert!(metrics.generated_end_secs > metrics.source_origin_secs);
+    }
+
+    #[test]
+    fn remote_mpeg_audio_startup_fourth_invalid_packet_is_fatal() {
+        assert_audio_send_fault_is_fatal(
+            "h264-small.ts",
+            AudioSendFault::Errors {
+                remaining: 4,
+                error: ffmpeg::Error::InvalidData,
+            },
+            ffmpeg::Error::InvalidData,
+        );
+    }
+
+    #[test]
+    fn remote_mpeg_audio_invalid_packet_after_first_preroll_frame_is_fatal() {
+        // The verified seek starts before this tail request. The hook arms on
+        // receive_frame, before origin filtering, rather than on encoded audio.
+        assert_audio_send_fault_is_fatal(
+            "h264-small.ts",
+            AudioSendFault::AfterFirstFrame(ffmpeg::Error::InvalidData),
+            ffmpeg::Error::InvalidData,
+        );
+    }
+
+    #[test]
+    fn remote_non_mpeg_audio_invalid_startup_packet_is_fatal() {
+        assert_audio_send_fault_is_fatal(
+            "control.mp4",
+            AudioSendFault::Errors {
+                remaining: 1,
+                error: ffmpeg::Error::InvalidData,
+            },
+            ffmpeg::Error::InvalidData,
+        );
+    }
+
+    #[test]
+    fn remote_mpeg_audio_other_startup_error_is_fatal() {
+        assert_audio_send_fault_is_fatal(
+            "h264-small.ts",
+            AudioSendFault::Errors {
+                remaining: 1,
+                error: ffmpeg::Error::Bug,
+            },
+            ffmpeg::Error::Bug,
+        );
+    }
+
+    #[test]
+    fn remote_mpeg_audio_eof_after_invalid_packets_without_decoded_frame_is_fatal() {
+        let (result, output) = run_remote_audio_send_fault(
+            "h264-small.ts",
+            AudioSendFault::NoDecodedFrames {
+                invalid_remaining: 3,
+            },
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            "audio startup ended without a decoded frame after invalid packets",
+        );
+        assert!(!output.metrics().ended);
     }
 
     #[test]

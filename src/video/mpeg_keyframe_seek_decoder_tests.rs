@@ -262,165 +262,84 @@ fn assert_video(frame: &VideoFrame, expected: &OracleFrame, name: &str) {
 
 #[test]
 fn mpeg_keyframe_seek_held_video_decodes_target_before_buffering_audio_can_drain() {
-    use ffmpeg_the_third as ffmpeg;
-    let fixture = Fixture::load("h264-small.ts");
-    let target = 5.4;
-    let expected = fixture.first_at_or_after(target - VIDEO_PREROLL_TRIM_TOLERANCE_SECS);
-    let expected_id = expected.frame_id;
-    let expected_pts = expected.media_secs;
-    let mut input = ffmpeg::format::input(&fixture.path).unwrap();
-    let stream = input.streams().best(ffmpeg::media::Type::Video).unwrap();
-    let video_index = stream.index();
-    let tb = stream.time_base();
-    let seconds_per_tick = tb.numerator() as f64 / tb.denominator() as f64;
-    let mut decoder = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
-        .unwrap()
-        .decoder()
-        .video()
-        .unwrap();
-    let audio_index = input
-        .streams()
-        .best(ffmpeg::media::Type::Audio)
-        .unwrap()
-        .index();
-    let timeline = MediaTimeline::from_input(&input);
-    let raw_target = timeline.media_to_stream_ticks(target, tb);
-    let mut reader = super::super::keyframe_seek::PacketReader::default();
-    assert!(matches!(
-        reader
-            .seek(
-                &mut input,
-                -1,
-                timeline.media_to_av_time_base(target),
-                Some(video_index),
-                || false
-            )
-            .unwrap(),
-        super::super::keyframe_seek::SeekOutcome::Verified { .. }
-    ));
-    // Inspect/reconstitute the actual verified window through the one reading
-    // mouth. The target video really follows held audio, with no old overflow.
-    let mut held = VecDeque::new();
-    loop {
-        let (index, packet) = reader.next(&mut input).unwrap().unwrap();
-        let end = index == video_index && packet.dts().is_some_and(|dts| dts > raw_target);
-        held.push_back(packet);
-        if end {
-            break;
-        }
-    }
-    let first_audio = held.iter().position(|p| p.stream() == audio_index).unwrap();
-    let target_video = held
-        .iter()
-        .position(|p| p.stream() == video_index && p.pts().is_some_and(|pts| pts >= raw_target))
-        .unwrap();
-    assert!(first_audio < target_video);
-    let mut reader = super::super::keyframe_seek::PacketReader::from_held_for_test(held);
+    // Use the real demux, both real decoders and their normal queue capacities.
+    // Pausing the audio worker at an actually-full PCM output models Buffering
+    // backpressure/scheduling: it cannot consume old audio packets during seek.
+    // No test code calls queue_held_seek_video or injects/reorders source packets.
+    let fixture = Fixture::load("long-gop.ts");
+    let target = 17.4;
     let clock = clock();
-    clock.request_seek(target);
-    let serial = clock.take_seek_request().unwrap().serial;
-    let cancel = AtomicBool::new(false);
-    let (video_tx, video_rx) = bounded(1);
-    let (audio_tx, audio_rx) = bounded(1);
-    let (video_ctl, video_control_rx) = bounded(1);
-    let mut demux_serial = DemuxSerial(0);
-    assert_eq!(
-        demux_serial.send_seek_flushes(
-            serial,
-            Some((
-                &video_ctl,
-                VideoControlMsg::Flush {
-                    serial,
-                    trim_before_secs: Some(target),
-                    frame_step: None
-                }
-            )),
-            None,
-            &cancel,
-            false
-        ),
-        SeekFlushResult::Accepted
-    );
-    assert!(matches!(
-        video_control_rx.recv().unwrap(),
-        VideoControlMsg::Flush { .. }
-    ));
-    decoder.flush();
-    let mut pending = VecDeque::new();
-    let mut pending_bytes = 0;
-    assert!(pending.is_empty());
-    queue_held_seek_video(
-        &mut reader,
-        video_index,
-        serial,
-        timeline,
-        seconds_per_tick,
-        &mut pending,
-        &mut pending_bytes,
-    );
-    let (index, packet) = reader.next(&mut input).unwrap().unwrap();
-    assert_eq!(index, audio_index);
-    audio_tx
-        .send(AudioPacketMsg::Packet {
-            serial,
-            packet: ffmpeg::Packet::copy(&[0]),
-        })
-        .unwrap();
-    let video_clock = Arc::clone(&clock);
+    let (audio_full, resume_audio) = clock.gate_full_audio_output_for_test();
+    let (demux_blocked, resume_demux) = clock.gate_demux_audio_backpressure_for_test();
+    let session = Session::open(fixture.path.clone(), clock);
+    let (first_frame_tx, first_frame_rx) = bounded(1);
+    let video_rx = session.handles.video_rx.clone();
+    let consumer_cancel = Arc::clone(&session.cancel);
     let consumer = std::thread::spawn(move || {
-        'decode: loop {
-            let VideoPacketMsg::Packet {
-                serial: received,
-                packet,
-            } = video_rx.recv_timeout(Duration::from_secs(10)).unwrap()
-            else {
-                panic!("expected held video");
-            };
-            assert_eq!(received, serial);
-            if decoder.send_packet(&packet).is_err() {
-                continue;
-            }
-            let mut frame = ffmpeg::util::frame::video::Video::empty();
-            while decoder.receive_frame(&mut frame).is_ok() {
-                let ts = video_frame_timestamp(&frame).unwrap();
-                let pts = timeline.raw_to_media_secs(ts as f64 * seconds_per_tick);
-                if pts < target - VIDEO_PREROLL_TRIM_TOLERANCE_SECS {
-                    continue;
+        while !consumer_cancel.load(Ordering::Acquire) {
+            match video_rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(frame) if frame.seek_serial != 0 => {
+                    let _ = first_frame_tx.try_send(frame);
                 }
-                let mut frame_id = 0;
-                for bit in 0..16 {
-                    if frame.data(0)[16 * frame.stride(0) + 4 + 6 * bit] >= 128 {
-                        frame_id |= 1 << bit;
-                    }
-                }
-                assert_eq!(frame_id, expected_id);
-                assert!((pts - expected_pts).abs() < 1.0e-6);
-                // Headless equivalent of accepting the first display frame.
-                video_clock.clear_seek_target_override(serial);
-                break 'decode;
+                Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
         }
-        // Until the target frame was decoded/adopted, audio stays FULL.
-        audio_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        audio_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     });
-    assert!(matches!(
-        send_audio_packet_with_video_drain(
-            &audio_tx,
-            AudioPacketMsg::Packet { serial, packet },
-            &clock,
-            &cancel,
-            &mut pending,
-            &mut pending_bytes,
-            &video_tx
-        ),
-        DemuxPacketSend::Sent
-    ));
-    consumer.join().unwrap();
+    audio_full.recv_timeout(Duration::from_secs(10)).unwrap();
     assert!(
-        !clock.is_seeking(),
+        session.handles.audio_rx.is_full(),
+        "PCM output must remain full"
+    );
+    assert_eq!(
+        demux_blocked.recv_timeout(Duration::from_secs(10)).unwrap(),
+        0
+    );
+    let seek_observation = session.clock.observe_next_demux_seek_for_test();
+    session.clock.request_seek(target);
+    let serial = session.clock.current_seek_serial();
+    resume_demux.send(()).unwrap();
+    let observed = seek_observation
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(observed.serial, serial);
+    assert_eq!(
+        observed.pending_video_packets, 0,
+        "old overflow must not rescue video"
+    );
+    assert_eq!(observed.audio_packet_queue_len, AUDIO_PACKET_QUEUE_CAP);
+    assert!(matches!(
+        observed.outcome,
+        Some(super::super::keyframe_seek::SeekOutcome::Verified { .. })
+    ));
+    // Audio has not been received/released anywhere. Only production preload
+    // can expose the retained video behind the full old audio packet queue.
+    let frame = first_frame_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("real demux did not deliver target video while PCM output stayed full");
+    assert_eq!(frame.seek_serial, serial);
+    assert_video(
+        &frame,
+        fixture.first_at_or_after(target - VIDEO_PREROLL_TRIM_TOLERANCE_SECS),
+        &fixture.name,
+    );
+    assert!(session.handles.audio_rx.is_full());
+    session.clock.clear_seek_target_override(serial);
+    assert!(
+        !session.clock.is_seeking(),
         "target display adoption did not progress"
     );
+    session.cancel.store(true, Ordering::Release);
+    // Unblock the deliberately parked worker before observing real demux cleanup.
+    drop(resume_audio);
+    assert!(matches!(
+        session
+            .handles
+            .info_rx
+            .recv_timeout(Duration::from_secs(10)),
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+    ));
+    consumer.join().unwrap();
 }
 
 fn assert_audio(audio: &[AudioFrame], target: f64, stream_index: usize, name: &str) {
@@ -445,6 +364,146 @@ fn assert_audio(audio: &[AudioFrame], target: f64, stream_index: usize, name: &s
     }
 }
 
+/// Finish the actual decoded tail through VideoPlayer's headless tick/EOF path.
+/// PCM and video were consumed by Session::drain instead of a device/presenter;
+/// acknowledge those tails, then inspect the production published EOF position.
+fn assert_tail_eof_position(
+    session: &mut Session,
+    fixture: &Fixture,
+    video: &[VideoFrame],
+    audio: &[AudioFrame],
+) {
+    use crate::video::engine::{actor::EngineActor, state::AudioEvent};
+    let serial = session.clock.current_seek_serial();
+    let oracle: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            fixture
+                .path
+                .with_file_name(format!("{}.json", fixture.name)),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let expected_duration = oracle["format"]["duration_us"].as_i64().unwrap() as f64 / 1_000_000.0;
+    assert!((session.info.duration_secs - expected_duration).abs() < 0.00001);
+    let mut player = crate::video::VideoPlayer::disconnected_for_test(fixture.path.clone(), 0.0);
+    player.clock = Arc::clone(&session.clock);
+    player.cancel = Arc::clone(&session.cancel);
+    player.decode = std::mem::replace(&mut session.handles, crate::video::dummy_decode_handles());
+    player.info = Some(session.info.clone());
+    let mut engine = EngineActor::new(
+        crate::video::OpenOptions {
+            autoplay: true,
+            ..Default::default()
+        },
+        session.clock.seek_serial_for_test(),
+        Arc::clone(&session.clock),
+    );
+    engine.begin_loading();
+    engine.handle_decoder_event(DecoderEvent::InfoReceived {
+        epoch: serial,
+        duration_secs: session.info.duration_secs,
+        has_audio: true,
+        has_video: true,
+    });
+    engine.handle_decoder_event(DecoderEvent::SeekCompleted {
+        epoch: serial,
+        actual_pts: audio[0].pts_secs,
+    });
+    engine.handle_decoder_event(DecoderEvent::FirstFrameReady {
+        epoch: serial,
+        pts: video[0].pts_secs,
+    });
+    engine.handle_audio_event(AudioEvent::BufferReady {
+        epoch: serial,
+        pts: audio[0].pts_secs,
+        wall_now: Instant::now(),
+    });
+    engine.handle_audio_event(AudioEvent::AudioRendered {
+        epoch: serial,
+        pts: audio.last().unwrap().pts_secs + audio.last().unwrap().duration_secs,
+        wall_now: Instant::now(),
+    });
+    assert_eq!(engine.published_state_code(), state_code::PLAYING);
+    player.engine_state_atomic = engine.published_state_handle();
+    player.engine = Arc::new(std::sync::Mutex::new(engine));
+    player.last_seen_seek_serial = serial;
+    player.set_last_displayed_pts_for_test(video.last().unwrap().pts_secs);
+    session.clock.clear_seek_target_override(serial);
+    session.clock.reset_audio_bookkeeping_only();
+    assert!(session.clock.complete_video_tail(serial));
+    assert!(session.clock.begin_audio_tail(serial));
+    assert!(session.clock.complete_audio_tail(serial));
+    assert!(player.decode.video_rx.is_empty() && player.decode.audio_rx.is_empty());
+    let ctx = egui::Context::default();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while player.engine_state_code() != state_code::EOF {
+        assert!(
+            Instant::now() < deadline,
+            "{} did not publish EOF",
+            fixture.name
+        );
+        player.tick(&ctx);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(!player.is_playing());
+    assert_eq!(session.clock.current_seek_serial(), serial);
+    assert!(
+        (player.position() - expected_duration).abs() < 0.00001,
+        "{} EOF position {} != media duration {}",
+        fixture.name,
+        player.position(),
+        expected_duration
+    );
+    assert!((session.clock.now_secs() - expected_duration).abs() < 0.00001);
+}
+
+#[test]
+fn mpeg_keyframe_seek_playback_stop_during_verification_aborts_and_joins_workers() {
+    for name in ["h264-small.ts", "mpeg2-missing-pts.mpg"] {
+        let fixture = Fixture::load(name);
+        let clock = clock();
+        let observation = clock.observe_next_demux_seek_for_test();
+        let (entered, release) = clock.gate_demux_seek_for_test(3);
+        clock.request_seek(5.4);
+        let serial = clock.current_seek_serial();
+        let session = Session::open(fixture.path, clock);
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        session.cancel.store(true, Ordering::Release);
+        release.send(()).unwrap();
+        let observed = observation.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(observed.serial, serial);
+        assert_eq!(
+            observed.outcome,
+            Some(super::super::keyframe_seek::SeekOutcome::Aborted)
+        );
+        // info_tx's last owner goes away only after run_decoder's cleanup joins
+        // both real workers. Merely setting cancel is not sufficient evidence.
+        assert!(matches!(
+            session
+                .handles
+                .info_rx
+                .recv_timeout(Duration::from_secs(10)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+        ));
+        assert!(session.clock.audio_worker_exited());
+        assert!(session.handles.video_rx.is_empty());
+        assert!(session.handles.audio_rx.is_empty());
+        assert!(matches!(
+            session.handles.video_rx.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected)
+        ));
+        assert!(matches!(
+            session.handles.audio_rx.try_recv(),
+            Err(crossbeam_channel::TryRecvError::Disconnected)
+        ));
+        assert!(!session.clock.is_demux_exhausted());
+        assert!(!session.clock.video_decoded_eos(serial));
+        assert!(!session.clock.audio_decoded_eos(serial));
+        assert!(!session.events.try_iter().any(|event| matches!(event, EngineEvent::Decoder(DecoderEvent::SeekCompleted { epoch, .. }) if epoch == serial)));
+    }
+}
+
 #[test]
 fn mpeg_keyframe_seek_playback_frame_ids_audio_trim_and_tail_eof() {
     for name in [
@@ -457,7 +516,7 @@ fn mpeg_keyframe_seek_playback_frame_ids_audio_trim_and_tail_eof() {
         let clock = clock();
         let target = fixture.frames[129].media_secs - 0.007;
         clock.request_seek(target);
-        let session = Session::open(fixture.path.clone(), clock);
+        let mut session = Session::open(fixture.path.clone(), clock);
         let serial = session.clock.current_seek_serial();
         let (video, audio) = session.drain(serial);
         let expected = fixture.first_at_or_after(target - VIDEO_PREROLL_TRIM_TOLERANCE_SECS);
@@ -486,6 +545,7 @@ fn mpeg_keyframe_seek_playback_frame_ids_audio_trim_and_tail_eof() {
             session.info.opened_audio_stream_index.unwrap(),
             name,
         );
+        assert_tail_eof_position(&mut session, &fixture, &video, &audio);
     }
 }
 

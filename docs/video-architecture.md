@@ -138,9 +138,11 @@ thumbnail / tile は EOF で decoder を drain し、screenshot は packet/frame
 目標到達・EOF drain・読み取りエラーを区別する。TS/PS の strip 軸は探索点の索引を読まず
 `TimeGrid` にし、索引 warmup も省く。upscale の分割は packet 順と表示順の番号付けの別問題
 (バックログ §1.795) があるため今回変更しない。
-PS の seek 直後には先頭の MP2 packet が不完全になることがある。Remote の音声 decoder は
-`InvalidData` だけをログに出して次 packet へ進める (再生 decoder と同じ扱い)。他のエラーは
-従来どおり終了し、音声の採用時刻・DSP・resampler・trim は変更しない。
+TS/PS の seek 直後は音声 PES の途中から再同期し、先頭の音声 packet が不完全になることがある。
+Remote の音声 decoder は対象3 demuxerの開始時だけ、`InvalidData` を最大3 packet記録して読み進める。
+最初の音声 frame が復号できた時点（採用前のprerollを含む）で許可を閉じ、以降のエラー、
+他形式、上限超過、他のエラーは従来どおり終了する。読み飛ばした後、音声 frame が一つも復号できず
+終端に達した場合も成功にしない。音声の採用時刻・DSP・resampler・trim は変更しない。
 契約・割り切りと受入条件の正本は [MPEG keyframe seek の設計](mpeg-keyframe-seek-plan.md)。
 
 ## 採用アーキテクチャ: native presenter (独立 HWND + D3D11 swap chain) 必須

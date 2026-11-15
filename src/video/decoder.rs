@@ -393,6 +393,8 @@ fn send_audio_packet_with_video_drain(
                     }
                 }
 
+                #[cfg(test)]
+                clock.wait_at_demux_audio_backpressure_for_test(pending_video_packets.len());
                 let now = std::time::Instant::now();
                 let waited = now.duration_since(wait_started);
                 if waited >= std::time::Duration::from_millis(250)
@@ -3487,6 +3489,13 @@ fn run_decoder(
                         || clock.current_seek_serial() != serial
                 })
             };
+            #[cfg(test)]
+            clock.record_demux_seek_for_test(super::clock::DemuxSeekObservation {
+                serial,
+                pending_video_packets: pending_video_packets.len(),
+                audio_packet_queue_len: audio_pkt_tx.len(),
+                outcome: seek_result.as_ref().ok().copied(),
+            });
             // Supersession is not a seek failure. In particular, do not retry
             // forward, apply the prepared audio setup, flush/adopt this serial,
             // or send its SeekCompleted. Locals drop the obsolete setup here.
@@ -7190,6 +7199,10 @@ fn emit_audio_samples(
         let frame = pending_frame
             .take()
             .expect("pending audio frame should exist before send_timeout");
+        #[cfg(test)]
+        if audio_tx.is_full() {
+            clock.wait_at_full_audio_output_for_test();
+        }
         match audio_tx.send_timeout(frame, send_wait) {
             Ok(()) => break,
             Err(crossbeam_channel::SendTimeoutError::Timeout(frame)) => {

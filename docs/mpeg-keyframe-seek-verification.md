@@ -5,6 +5,10 @@
 2026-11-15〜16、製品アプリは起動せず、headlessのFFmpeg復号で検証した。
 独立実装レビューと実機確認は未実施。コミットは設計担当が行う。
 
+2026-11-16追補: 初回実装は設計担当が`4dbe921fa`としてコミットした（利用者報告）。
+独立レビューのREJECT（P2: Remote音声エラーの無期限読み飛ばし、P3: backpressure試験が本番preloadに依存しない）
+への修正・検証は末尾の「独立レビューへの修正」を参照。以下の初回検証記録は履歴として残す。
+
 ## 変更ファイル
 
 | ファイル | 変更 |
@@ -116,7 +120,7 @@ runnerがロックを書けない場合の警告と低優先度・6並列への�
 | `cargo check -p mimageviewer --bin mimageviewer-core --features dev-tools` | 成功、2分41秒。ログ`check-dev-tools.log` |
 | `python scripts/check_ui_glyphs.py` | 不足字形0 |
 | `cargo fmt` / `cargo fmt --check` | 成功（引数なしfmtを実行後にcheck） |
-| `.\scripts\build-dev.ps1 -PreserveRuntime` | 他worktreeのnative build終了後、通常構成で初回ビルド中 |
+| `.\scripts\build-dev.ps1 -PreserveRuntime` | この実行は01:05頃のPCフリーズ・再起動で中断。利用者報告では設計担当がrunner経由で再実行し08:05成功（4dbe921fa）。以下のレビュー修正では再ビルドしない |
 
 最初の新規試験実行は28件中26件成功、2件失敗（不正stream indexによるアクセス違反、
 Remote PS音声のInvalidData）。上記の修正後に28件すべて成功した。
@@ -148,3 +152,53 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe
 同じ末尾付近のhover / stripの枠が空にならないことも確認対象とする。
 0.1秒刻み・key境界・各worker・Remoteの画像ID照合は上記の自動試験で実施済み。
 今回の実装作業ではアプリの起動・実機UI入力は行っていない。
+
+## 独立レビューへの修正（2026-11-16）
+
+対象は`4dbe921fa`からの未コミット差分。build-devは08:05に設計担当が完了したという利用者報告を受け、
+再実行しない。本体lib全件（-FullTest）はPCフリーズ原因の切り分け終了まで禁止という統括指示に従い、
+実行しない。製品バイナリの起動・コミットも行わない。
+
+- P2: `clockless_transcode.rs`の読み飛ばしを、TS/PSに限定した型付きの開始状態にまとめた。
+  根拠はseek後のPES再同期による不完全packetなので、対象demuxerは`needs_verification`と同じ3つとする。
+  `InvalidData`は最大3 packet、最初の`receive_frame`成功で許可を閉じる（preroll・resampler採用前も含む）。
+  上限超過・途中のエラー・他形式・他のエラーは失敗し、読み飛ばした後にframeが一つも復号できない終端も失敗する。
+  既存の実PS回復試験に加え、実際のtranscodeで先頭3回からの回復、4回目、preroll復号後、MP4、他のエラー、
+  音声未復号のEOFを検査する。エラー時は成功終端や音声watermarkを公開しないことも検査する。
+- P3: 直接`queue_held_seek_video`を呼んでいた「実復号」試験を、本番`Session`のdemux・両decoder・通常容量の
+  queueを使う試験に置き換えた。実PCM出力が満杯になった送信待ちで音声workerを一時停止し、古い音声packet
+  queueが満杯かつ映像pendingが0のdemux境界からseekを発行する。テストは音声出力を一つも受信せず、
+  本番経路から届く目標映像の画像ID・PTSとseek overrideの解除を検査する。
+  `clock.rs` / `decoder.rs`の追加観測・停止点はすべてcfg(test)で、製品の動作・容量は変更しない。
+- D−0.3秒の実復号後、消費済みのvideo/audio tailをackし、headlessの`VideoPlayer::tick`で公開EOFへ遷移するまで
+  通す。公開位置・凍結clockが独立正解JSONのformat durationと一致し、raw originを足さないことを検査する。
+- seekの検査中（実際のpacket read後）の停止では、helperが`Aborted`を返し、`SeekCompleted`・新frame・EOFを
+  公開せず、demuxのcleanupが両workerをjoinして全出力をdisconnectすることをTS / PSで検査する。
+
+preloadのmutation: 本番`run_decoder`内の`queue_held_seek_video(...)`呼出し1箇所だけを一時除去し、
+`test(mpeg_keyframe_seek_held_video_decodes_target_before_buffering_audio_can_drain)`をrunner経由で実行した。
+準備条件（PCM出力full、古いpending=0、音声packet queue=通常容量64、helper=Verified）を通過後、
+`real demux did not deliver target video while PCM output stayed full: Timeout`で意図どおり失敗した。
+1件実行・成功0・失敗1、試験2.169秒（全体2.288秒）、nextest/runner exit=100。
+run IDは`2c3bf776-ad9d-4621-9130-3d0956ee9b2f`、ログは`target/785-review/mutation.log`。
+呼出しは結果取得直後に保存した元のコードで復元した。最終差分にpreload除去は含まない。
+
+復元後の焦点テストは次のとおり（いずれも上記runner、Owner=`fix-785`、通常feature / test profile、
+nextest default、retryなし、2並列）。新規試験も含まれるため、前回28件と同じfilterの今回の一致数は35件。
+二つの実行には重複がある。追加の実装レビューと実機UI確認は未実施。
+
+| 対象 | コマンド（共通引数は下記） | 結果 |
+| --- | --- | --- |
+| 変更に関係するRemote全体・実demux回帰 | `cargo nextest run -p mimageviewer --lib -E 'test(/video::clockless_transcode::\|video::decoder::mpeg_keyframe_seek_decoder_tests::/)'` | 57件成功・失敗0、7.317秒。compile 2分48秒 |
+| 前回の新規28件と同じfilter | `cargo nextest run -p mimageviewer --lib -E 'test(/keyframe_seek\|mpeg_strip\|mpeg_timestamp\|remote_mpeg/)'` | 35件成功・失敗0、9.070秒。compile確認1.75秒 |
+
+共通引数: `--test-threads 2 --ignore-default-filter --run-ignored default --retries 0 --no-tests fail --no-fail-fast --failure-output immediate`。
+実行scriptは`target/785-review/final-focused.ps1`、ログは同directoryの`affected.log` / `prior-filter.log`。
+run IDはそれぞれ`5ebdb91d-129d-4f22-b0b1-1630bfd4ce02`、`eedcade9-4fdd-46e3-99d2-537042c1232f`。
+本番preloadを除去したmutationだけが意図した失敗で、復元後は両filterとも失敗なし。
+EOF時刻と停止中Abortedの追加検査もこの成功に含む。
+
+最終`cargo fmt`（引数なし）と`cargo fmt --check`はrunner内で成功し、runnerは08:33:08にexit=0で終了した。
+`git diff --check`も成功、`python scripts/check_ui_glyphs.py`は不足字形0。
+最終ソースのSHA-256は`target/785-review/source-snapshot.json`に保存した。
+build-dev・全件lib・製品バイナリ起動・コミットはいずれもこの修正では実施していない。
